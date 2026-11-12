@@ -1,0 +1,192 @@
+// The executor's own SQLite database. It never opens a legacy runtime file:
+// the entry point gives it a dedicated data directory (plan 1, 6.3).
+import { DatabaseSync } from 'node:sqlite';
+import { createHash } from 'node:crypto';
+import { statSync } from 'node:fs';
+import { performance } from 'node:perf_hooks';
+
+export interface Migration { version: number; name: string; sql: string }
+
+// Append only. A released migration is never edited: its SQL hash is stored
+// and a mismatch stops the process instead of running on a drifted schema.
+export const MIGRATIONS: readonly Migration[] = Object.freeze([{
+  version: 1,
+  name: 'executor-core',
+  sql: `
+CREATE TABLE accounts (account_key TEXT PRIMARY KEY, venue TEXT NOT NULL, environment TEXT NOT NULL, account_id TEXT NOT NULL,
+  account_mode TEXT NOT NULL, credential_version INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE UNIQUE INDEX accounts_venue ON accounts(venue, environment);
+CREATE TABLE writer (id INTEGER PRIMARY KEY CHECK (id = 1), owner TEXT NOT NULL, generation INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+CREATE TABLE previews (id TEXT PRIMARY KEY, session TEXT NOT NULL, expires_at INTEGER NOT NULL, consumed_job TEXT, json TEXT NOT NULL);
+CREATE TABLE commands (request_id TEXT PRIMARY KEY, kind TEXT NOT NULL, digest TEXT NOT NULL, session TEXT NOT NULL, job_id TEXT NOT NULL, accepted_at INTEGER NOT NULL);
+CREATE TABLE jobs (id TEXT PRIMARY KEY, status TEXT NOT NULL, final INTEGER NOT NULL, version INTEGER NOT NULL,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE INDEX jobs_unfinished ON jobs(created_at) WHERE final = 0;
+CREATE TABLE operations (id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), leg INTEGER NOT NULL, venue TEXT NOT NULL,
+  client_order_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, settled INTEGER NOT NULL, version INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE INDEX operations_job ON operations(job_id, leg);
+CREATE TABLE locks (resource TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id));
+CREATE TABLE stop_requests (job_id TEXT PRIMARY KEY REFERENCES jobs(id), request_id TEXT NOT NULL, requested_at INTEGER NOT NULL);
+CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT, type TEXT NOT NULL, at INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE INDEX events_job ON events(job_id, seq);
+`,
+}, {
+  version: 2,
+  name: 'history-retention',
+  sql: `
+CREATE INDEX events_at ON events(at);
+CREATE INDEX commands_accepted ON commands(accepted_at);
+CREATE INDEX previews_consumed ON previews(expires_at) WHERE consumed_job IS NOT NULL;
+`,
+}, {
+  version: 3,
+  name: 'aster-transfers',
+  sql: `
+CREATE TABLE transfer_pairs (id TEXT PRIMARY KEY, enabled INTEGER NOT NULL, version INTEGER NOT NULL, updated_at INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE TABLE transfers (id TEXT PRIMARY KEY, pair_id TEXT NOT NULL REFERENCES transfer_pairs(id), state TEXT NOT NULL, settled INTEGER NOT NULL,
+  created_at INTEGER NOT NULL, version INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE INDEX transfers_unsettled ON transfers(created_at) WHERE settled = 0;
+CREATE INDEX transfers_pair ON transfers(pair_id, created_at);
+`,
+}, {
+  version: 4,
+  name: 'aster-adl',
+  sql: `
+CREATE TABLE adl_pairs (pair_id TEXT PRIMARY KEY REFERENCES transfer_pairs(id), version INTEGER NOT NULL, updated_at INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE TABLE adl_evidence (key TEXT PRIMARY KEY, pair_id TEXT NOT NULL REFERENCES transfer_pairs(id), pending INTEGER NOT NULL, updated_at INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE INDEX adl_evidence_pending ON adl_evidence(pair_id) WHERE pending = 1;
+CREATE INDEX adl_evidence_pair ON adl_evidence(pair_id, updated_at);
+CREATE TABLE adl_incidents (id TEXT PRIMARY KEY, pair_id TEXT NOT NULL REFERENCES transfer_pairs(id), status TEXT NOT NULL, final INTEGER NOT NULL,
+  created_at INTEGER NOT NULL, version INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE UNIQUE INDEX adl_incidents_open ON adl_incidents(pair_id) WHERE final = 0;
+CREATE INDEX adl_incidents_pair ON adl_incidents(pair_id, created_at);
+CREATE INDEX adl_incidents_created ON adl_incidents(created_at);
+CREATE TABLE adl_batches (id TEXT PRIMARY KEY, incident_id TEXT NOT NULL REFERENCES adl_incidents(id), pair_id TEXT NOT NULL, client_order_id TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL, settled INTEGER NOT NULL, created_at INTEGER NOT NULL, version INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE INDEX adl_batches_incident ON adl_batches(incident_id, created_at);
+CREATE INDEX adl_batches_open ON adl_batches(pair_id) WHERE settled = 0;
+CREATE INDEX adl_batches_pair ON adl_batches(pair_id, created_at);
+`,
+}]);
+export const sqlHash = (sql: string): string => createHash('sha256').update(sql).digest('hex');
+
+export class StoreError extends Error {
+  readonly code: string;
+  constructor(code: string, message: string) { super(message); this.code = code; }
+}
+
+export const WAIT_BUCKETS_MS = [1, 10, 100, 1000, 5000] as const;
+export const WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024;
+/** Above this the owner truncates the WAL itself; automatic checkpoints alone never reset it while some reader is always active. */
+export const WAL_RESET_BYTES = 16 * 1024 * 1024;
+/** Longest one lock wait of a WAL reset. The reset holds the write lock while it waits, so this also bounds what it adds to a write. */
+export const WAL_RESET_WAIT_MS = 250;
+const WAL_RESET_RETRY_MS = 1_000, WAL_RESET_RETRY_MAX_MS = 60_000;
+const SAMPLE_LIMIT = 20_000;
+export interface WriteStats { transactions: number; busy: number; waitBuckets: number[]; maxWaitMs: number; maxHoldMs: number; waits: number[]; holds: number[] }
+/** `reset`: WAL truncated. `busy`: a reader or writer outlasted the wait, retried later with a growing delay. `waiting`: inside that delay. */
+export interface WalMaintenance { action: 'idle' | 'reset' | 'busy' | 'waiting'; walBytes: number; ms: number }
+
+export interface Store {
+  readonly db: DatabaseSync;
+  readonly file: string;
+  schemaVersion(): number;
+  /** Short IMMEDIATE transaction. The callback must be synchronous: no network or timers inside. */
+  tx<T>(operation: () => T): T;
+  stats(): WriteStats;
+  walBytes(): number;
+  /** Call periodically from the owning process, outside any transaction. Synchronous: blocks the caller for at most a few lock waits plus the copy. */
+  maintainWal(now?: number): WalMaintenance;
+  close(): void;
+}
+
+const isBusy = (error: unknown): boolean => (error as { code?: string; errcode?: number })?.code === 'ERR_SQLITE_ERROR' && (((error as { errcode?: number }).errcode ?? 0) & 0xff) === 5;
+
+export interface StoreOptions { busyTimeoutMs?: number; walResetBytes?: number; walResetWaitMs?: number }
+
+export function openStore(file: string, { busyTimeoutMs = 5000, walResetBytes = WAL_RESET_BYTES, walResetWaitMs = WAL_RESET_WAIT_MS }: StoreOptions = {}): Store {
+  const db = new DatabaseSync(file);
+  const stats: WriteStats = { transactions: 0, busy: 0, waitBuckets: Array(WAIT_BUCKETS_MS.length + 1).fill(0), maxWaitMs: 0, maxHoldMs: 0, waits: [], holds: [] };
+  const sample = (list: number[], value: number) => { if (list.length >= SAMPLE_LIMIT) list.splice(0, list.length - SAMPLE_LIMIT + 1); list.push(value); };
+  try {
+    const mode = (db.prepare('PRAGMA journal_mode=WAL').get() as { journal_mode: string }).journal_mode;
+    if (mode !== 'wal') throw new StoreError('journal_mode', `数据库未能进入 WAL 模式：${mode}`);
+    // journal_size_limit truncates the WAL back to 64 MiB after a checkpoint; it does not cap a WAL that readers keep from being reset (see maintainWal).
+    db.exec(`PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=${Math.trunc(busyTimeoutMs)}; PRAGMA journal_size_limit=${WAL_SIZE_LIMIT_BYTES};`);
+  } catch (error) { db.close(); throw error; }
+
+  function tx<T>(operation: () => T): T {
+    if (db.isTransaction) throw new StoreError('nested_transaction', '不允许嵌套事务');
+    const requested = performance.now();
+    try { db.exec('BEGIN IMMEDIATE'); }
+    catch (error) { if (isBusy(error)) stats.busy++; throw error; }
+    const acquired = performance.now(), wait = acquired - requested;
+    stats.transactions++;
+    const bucket = WAIT_BUCKETS_MS.findIndex(limit => wait < limit);
+    stats.waitBuckets[bucket < 0 ? WAIT_BUCKETS_MS.length : bucket]++;
+    stats.maxWaitMs = Math.max(stats.maxWaitMs, wait); sample(stats.waits, wait);
+    try {
+      const result = operation();
+      if (result && typeof (result as { then?: unknown }).then === 'function') throw new StoreError('async_transaction', '事务回调不能是异步函数');
+      db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      if (db.isTransaction) db.exec('ROLLBACK');
+      throw error;
+    } finally {
+      const hold = performance.now() - acquired;
+      stats.maxHoldMs = Math.max(stats.maxHoldMs, hold); sample(stats.holds, hold);
+    }
+  }
+
+  const walBytes = (): number => statSync(`${file}-wal`, { throwIfNoEntry: false })?.size ?? 0;
+  let walRetryAt = 0, walRetryMs = WAL_RESET_RETRY_MS;
+  function maintainWal(now = performance.now()): WalMaintenance {
+    const size = walBytes();
+    if (size <= walResetBytes) { walRetryAt = 0; walRetryMs = WAL_RESET_RETRY_MS; return { action: 'idle', walBytes: size, ms: 0 }; }
+    if (db.isTransaction || now < walRetryAt) return { action: 'waiting', walBytes: size, ms: 0 };
+    const started = performance.now();
+    let busy = true;
+    // TRUNCATE waits for readers on older snapshots while holding the write lock, so the wait is kept short and restored afterwards.
+    db.exec(`PRAGMA busy_timeout=${Math.trunc(walResetWaitMs)}`);
+    try { busy = (db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy: number }).busy !== 0; }
+    catch (error) { if (!isBusy(error)) throw error; }
+    finally {
+      db.exec(`PRAGMA busy_timeout=${Math.trunc(busyTimeoutMs)}`);
+      // Any failure, not only a busy one, is retried with the growing delay.
+      if (busy) { walRetryAt = now + walRetryMs; walRetryMs = Math.min(walRetryMs * 2, WAL_RESET_RETRY_MAX_MS); }
+      else { walRetryAt = 0; walRetryMs = WAL_RESET_RETRY_MS; }
+    }
+    return { action: busy ? 'busy' : 'reset', walBytes: walBytes(), ms: performance.now() - started };
+  }
+
+  try { migrate(db, tx); } catch (error) { db.close(); throw error; }
+  return {
+    db, file,
+    schemaVersion: () => (db.prepare('SELECT IFNULL(MAX(version), 0) AS version FROM schema_migrations').get() as { version: number }).version,
+    tx, walBytes, maintainWal,
+    stats: () => ({ ...stats, waitBuckets: [...stats.waitBuckets], waits: [...stats.waits], holds: [...stats.holds] }),
+    close: () => { if (db.isOpen) db.close(); },
+  };
+}
+
+function migrate(db: DatabaseSync, tx: <T>(operation: () => T) => T): void {
+  db.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, sql_sha256 TEXT NOT NULL, applied_at INTEGER NOT NULL)');
+  const known = new Map(MIGRATIONS.map(migration => [migration.version, migration]));
+  const applied = db.prepare('SELECT version, name, sql_sha256 FROM schema_migrations ORDER BY version').all() as { version: number; name: string; sql_sha256: string }[];
+  for (const row of applied) {
+    const migration = known.get(row.version);
+    if (!migration) throw new StoreError('newer_schema', `数据库结构版本 ${row.version} 比本程序更新，拒绝打开`);
+    if (migration.name !== row.name || sqlHash(migration.sql) !== row.sql_sha256) throw new StoreError('schema_drift', `数据库结构版本 ${row.version} 与本程序记录的定义不一致`);
+  }
+  const done = new Set(applied.map(row => row.version));
+  for (const migration of MIGRATIONS) {
+    if (done.has(migration.version)) continue;
+    if (migration.version !== Math.max(0, ...done) + 1) throw new StoreError('migration_gap', `迁移版本不连续：${migration.version}`);
+    tx(() => {
+      db.exec(migration.sql);
+      db.prepare('INSERT INTO schema_migrations(version, name, sql_sha256, applied_at) VALUES (?, ?, ?, ?)').run(migration.version, migration.name, sqlHash(migration.sql), Date.now());
+    });
+    done.add(migration.version);
+  }
+}

@@ -1,0 +1,283 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { request as httpRequest } from 'node:http';
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import type { AddressInfo } from 'node:net';
+import { createExecutorServer, sessionCookieName } from '../src/http.ts';
+import { assertDedicatedDataDir, writeAccessUrl } from '../src/main.ts';
+import { SIM_TRANSFER_PAIR } from '../src/simulation.ts';
+import { bindAccounts, chaseIntent, createHarness, openIntent, settle } from './harness.ts';
+
+const TOKEN = 'http-access-token-0001';
+const SESSION = 'http-session-value-0001';
+
+async function startServer(h: ReturnType<typeof createHarness>, accessToken = TOKEN, session = SESSION) {
+  const server = createExecutorServer({ executor: h.ex, accessToken, session });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as AddressInfo).port;
+  return { server, port, base: `http://127.0.0.1:${port}` };
+}
+/** Logs in through /login and returns the cookie pair the browser would send back. */
+async function login(base: string, token = TOKEN): Promise<string> {
+  const response = await fetch(`${base}/login?token=${encodeURIComponent(token)}`, { redirect: 'manual' });
+  assert.equal(response.status, 303);
+  return (response.headers.get('set-cookie') ?? '').split(';')[0];
+}
+async function withServer(run: (base: string, cookie: string, h: ReturnType<typeof createHarness>) => Promise<void>) {
+  const h = createHarness();
+  bindAccounts(h.ex);
+  const { server, base } = await startServer(h);
+  try { await run(base, await login(base), h); }
+  finally { await new Promise(resolve => server.close(resolve)); h.dispose(); }
+}
+const post = (base: string, path: string, body: unknown, headers: Record<string, string>) =>
+  fetch(base + path, { method: 'POST', headers: { 'content-type': 'application/json', 'x-pa-executor': '1', ...headers }, body: typeof body === 'string' ? body : JSON.stringify(body) });
+
+test('HTTP：无会话的页面请求返回 401 且不下发 cookie；错误或缺失令牌 401 且不回显', () => withServer(async base => {
+  const page = await fetch(base + '/');
+  assert.equal(page.status, 401);
+  assert.equal(page.headers.get('set-cookie'), null);
+  assert.match(await page.text(), /access-url/);
+  assert.match(page.headers.get('content-security-policy') ?? '', /frame-ancestors 'none'/);
+  assert.equal(page.headers.get('x-frame-options'), 'DENY');
+  for (const path of ['/login', '/login?token=', '/login?token=wrong-guess-XYZ', `/login?token=${TOKEN}x`, `/login?token=${SESSION}`]) {
+    const response = await fetch(base + path, { redirect: 'manual' });
+    assert.equal(response.status, 401, path);
+    assert.equal(response.headers.get('set-cookie'), null, path);
+    assert.doesNotMatch(await response.text(), /wrong-guess|http-access|http-session/, path);
+  }
+  assert.equal((await fetch(base + '/', { headers: { cookie: `${sessionCookieName(Number(new URL(base).port))}=${TOKEN}` } })).status, 401, '令牌本身不是会话值');
+}));
+
+test('HTTP：正确令牌 303 下发按端口命名的会话 cookie；登录后可打开页面；缺请求标记、非本机 Host 均被拒绝', () => withServer(async (base, cookie) => {
+  const port = Number(new URL(base).port);
+  const loginResponse = await fetch(`${base}/login?token=${TOKEN}`, { redirect: 'manual' });
+  assert.equal(loginResponse.status, 303);
+  assert.equal(loginResponse.headers.get('location'), '/');
+  assert.equal(loginResponse.headers.get('referrer-policy'), 'no-referrer');
+  assert.equal(loginResponse.headers.get('cache-control'), 'no-store');
+  const setCookie = loginResponse.headers.get('set-cookie') ?? '';
+  assert.ok(setCookie.startsWith(`pa_executor_session_${port}=${SESSION};`), setCookie);
+  assert.match(setCookie, /; HttpOnly; SameSite=Strict; Path=\//);
+  assert.doesNotMatch(setCookie, new RegExp(TOKEN));
+  assert.equal(cookie, `pa_executor_session_${port}=${SESSION}`);
+  const page = await fetch(base + '/', { headers: { cookie } });
+  assert.equal(page.status, 200);
+  assert.equal(page.headers.get('set-cookie'), null);
+  assert.match(page.headers.get('content-type') ?? '', /text\/html/);
+  assert.match(page.headers.get('content-security-policy') ?? '', /frame-ancestors 'none'/);
+  assert.equal(page.headers.get('x-frame-options'), 'DENY');
+  assert.equal((await fetch(base + '/api/state', { headers: { cookie: `pa_executor_session=${SESSION}` } })).status, 401, '不带端口的旧名称不再通用');
+  assert.equal((await fetch(base + '/api/state')).status, 401);
+  assert.equal((await fetch(base + '/api/preview', { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: '{}' })).status, 403);
+  assert.equal((await fetch(base + '/api/preview', { method: 'POST', headers: { cookie, 'x-pa-executor': '1', 'content-type': 'text/plain' }, body: '{}' })).status, 403);
+  const status = await new Promise<number>((resolve, fail) => {
+    const url = new URL(base);
+    const req = httpRequest({ host: url.hostname, port: url.port, path: '/api/state', headers: { host: 'evil.example', cookie } }, res => { res.resume(); resolve(res.statusCode ?? 0); });
+    req.on('error', fail); req.end();
+  });
+  assert.equal(status, 421);
+  assert.equal((await post(base, '/api/preview', 'x'.repeat(17 * 1024), { cookie })).status, 413);
+  assert.equal((await post(base, '/api/preview', '{bad', { cookie })).status, 400);
+}));
+
+test('HTTP：预览、确认、重复确认返回原任务；状态页只显示脱敏账户；ANT 仅 Binance 可读', () => withServer(async (base, cookie, h) => {
+  const previewText = await (await post(base, '/api/preview', openIntent(), { cookie })).text();
+  assert.doesNotMatch(previewText, /BN1001|BY2002|accountKey/);
+  const preview = JSON.parse(previewText) as { id: string; legs: { accountId: string }[] };
+  assert.ok(preview.legs.every(leg => leg.accountId.startsWith('***')));
+  const body = { previewId: preview.id, requestId: randomUUID(), confirmLive: true };
+  const first = await (await post(base, '/api/confirm', body, { cookie })).json() as { job: { id: string }; duplicate: boolean };
+  const again = await (await post(base, '/api/confirm', body, { cookie })).json() as { job: { id: string }; duplicate: boolean };
+  assert.equal(again.duplicate, true);
+  assert.equal(again.job.id, first.job.id);
+  await settle(h, first.job.id);
+  const state = await (await fetch(base + '/api/state', { headers: { cookie } })).json() as { jobs: { id: string; status: string }[]; accounts: { accountId: string }[] };
+  assert.equal(state.jobs[0].status, 'completed');
+  assert.ok(state.accounts.every(account => account.accountId.startsWith('***')));
+  assert.doesNotMatch(JSON.stringify(state), /BN1001|BY2002/);
+  assert.equal((await fetch(base + '/api/observe?venue=bybit&symbol=ANTHROPICUSDT', { headers: { cookie } })).status, 400);
+  assert.equal((await fetch(base + '/api/observe?venue=binance&symbol=ANTHROPICUSDT', { headers: { cookie } })).status, 200);
+  const stale = await post(base, '/api/confirm', { ...body, requestId: randomUUID() }, { cookie });
+  assert.equal(stale.status, 409);
+  assert.equal(((await stale.json()) as { code: string }).code, 'preview_invalid');
+}));
+
+test('HTTP：追价策略认领与确认未创建接口沿用会话与请求标记，参数与状态错误映射为 4xx', () => withServer(async (base, cookie, h) => {
+  h.bybit.inject({ operation: 'strategy-place', mode: 'lost-response' });
+  const preview = await (await post(base, '/api/preview', chaseIntent(), { cookie })).json() as { id: string };
+  const { job } = await (await post(base, '/api/confirm', { previewId: preview.id, requestId: randomUUID(), confirmLive: true }, { cookie })).json() as { job: { id: string } };
+  await h.ex.tick();
+  const path = `/api/jobs/${job.id}`;
+  const codeOf = async (response: Response) => [response.status, ((await response.json()) as { code: string }).code];
+  assert.equal((await fetch(base + path + '/adopt-strategy', { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: '{}' })).status, 403);
+  assert.equal((await post(base, path + '/adopt-strategy', { requestId: randomUUID(), strategyId: 'x' }, {})).status, 401);
+  assert.deepEqual(await codeOf(await post(base, path + '/adopt-strategy', { requestId: randomUUID(), strategyId: 'x', more: 1 }, { cookie })), [400, 'unknown_field']);
+  assert.deepEqual(await codeOf(await post(base, path + '/adopt-strategy', { requestId: randomUUID(), strategyId: randomUUID() }, { cookie })), [409, 'strategy_not_found']);
+  assert.deepEqual(await codeOf(await post(base, path + '/confirm-not-created', { requestId: randomUUID() }, { cookie })), [409, 'create_window']);
+  assert.deepEqual(await codeOf(await post(base, path + '/ACKNOWLEDGE', { requestId: randomUUID() }, { cookie })), [409, 'strategy_unresolved']);
+  assert.equal((await post(base, path + '/STOP', { requestId: randomUUID() }, { cookie })).status, 200, '大小写不同的动作仍按原动作处理');
+  const state = await (await fetch(base + '/api/state', { headers: { cookie } })).json() as { jobs: { strategyPending: boolean }[] };
+  assert.equal(state.jobs[0].strategyPending, true);
+  const [real] = h.bybit.strategiesOf('BY2002');
+  const adopted = await post(base, path + '/adopt-strategy', { requestId: randomUUID(), strategyId: real.strategyId }, { cookie });
+  assert.equal(adopted.status, 200);
+  const body = await adopted.json() as { strategyPending: boolean; legs: { operation: { remoteId: string; state: string } }[] };
+  assert.deepEqual([body.strategyPending, body.legs[0].operation.remoteId, body.legs[0].operation.state], [false, real.strategyId, 'filled']);
+  assert.deepEqual(await codeOf(await post(base, path + '/confirm-not-created', { requestId: randomUUID() }, { cookie })), [409, 'no_pending_strategy']);
+  const page = await (await fetch(base + '/', { headers: { cookie } })).text();
+  assert.match(page, /认领策略/);
+  assert.match(page, /确认未创建/);
+}));
+
+test('HTTP：追价强制释放须 acknowledgeRisk 严格为 true，释放后可确认人工处理；页面有强制释放按钮', () => withServer(async (base, cookie, h) => {
+  h.bybit.inject({ operation: 'strategy-place', mode: 'lost-response' });
+  const preview = await (await post(base, '/api/preview', chaseIntent(), { cookie })).json() as { id: string };
+  const { job } = await (await post(base, '/api/confirm', { previewId: preview.id, requestId: randomUUID(), confirmLive: true }, { cookie })).json() as { job: { id: string } };
+  await h.ex.tick();
+  const path = `/api/jobs/${job.id}`;
+  const codeOf = async (response: Response) => [response.status, ((await response.json()) as { code: string }).code];
+  assert.equal((await post(base, path + '/release-strategy', { requestId: randomUUID(), acknowledgeRisk: true }, {})).status, 401);
+  assert.deepEqual(await codeOf(await post(base, path + '/release-strategy', { requestId: randomUUID() }, { cookie })), [400, 'acknowledge_risk']);
+  assert.deepEqual(await codeOf(await post(base, path + '/release-strategy', { requestId: randomUUID(), acknowledgeRisk: 'true' }, { cookie })), [400, 'acknowledge_risk']);
+  assert.deepEqual(await codeOf(await post(base, path + '/release-strategy', { requestId: randomUUID(), acknowledgeRisk: true, jobId: job.id }, { cookie })), [400, 'unknown_field']);
+  assert.deepEqual(await codeOf(await post(base, path + '/acknowledge', { requestId: randomUUID() }, { cookie })), [409, 'strategy_unresolved']);
+  const requestId = randomUUID();
+  const released = await post(base, path + '/release-strategy', { requestId, acknowledgeRisk: true }, { cookie });
+  assert.equal(released.status, 200);
+  const body = await released.json() as { strategyPending: boolean; legs: { operation: { state: string; releasedAt: number | null } }[] };
+  assert.deepEqual([body.strategyPending, body.legs[0].operation.state, typeof body.legs[0].operation.releasedAt], [false, 'unknown', 'number']);
+  assert.equal((await post(base, path + '/release-strategy', { requestId, acknowledgeRisk: true }, { cookie })).status, 200, '同一请求编号重试返回原结果');
+  assert.deepEqual(await codeOf(await post(base, path + '/release-strategy', { requestId: randomUUID(), acknowledgeRisk: true }, { cookie })), [409, 'no_pending_strategy']);
+  assert.equal((await post(base, path + '/acknowledge', { requestId: randomUUID() }, { cookie })).status, 200);
+  const page = await (await fetch(base + '/', { headers: { cookie } })).text();
+  assert.match(page, /强制释放（策略可能已成交）/);
+  assert.match(page, /manualRequestId/);
+}));
+test('入口：拒绝相对路径与工作台数据目录', () => {
+  const h = createHarness();
+  try {
+    assert.throws(() => assertDedicatedDataDir('relative/dir'), /绝对路径/);
+    const legacy = join(h.dir, 'legacy');
+    mkdirSync(legacy);
+    writeFileSync(join(legacy, 'hub.sqlite'), '');
+    assert.throws(() => assertDedicatedDataDir(legacy), /hub\.sqlite/);
+    assert.throws(() => assertDedicatedDataDir(join(legacy, 'executor')), /hub\.sqlite/, '工作台数据目录的子目录也拒绝');
+    assert.throws(() => assertDedicatedDataDir(join(legacy, 'a', 'b')), /hub\.sqlite/);
+    const upper = join(h.dir, 'upper');
+    mkdirSync(upper);
+    writeFileSync(join(upper, 'Credentials.KEY'), '');
+    assert.throws(() => assertDedicatedDataDir(upper), /Credentials\.KEY/, '名称不区分大小写');
+    assert.equal(assertDedicatedDataDir(join(h.dir, 'fresh')), join(h.dir, 'fresh'));
+  } finally { h.dispose(); }
+});
+
+test('HTTP：状态含划转配对与最近划转；启停走会话、请求标记与请求编号幂等，重放旧请求不改变当前开关', () => withServer(async (base, cookie, h) => {
+  h.ex.registerTransferPair(SIM_TRANSFER_PAIR);
+  const state = async () => (await (await fetch(base + '/api/state', { headers: { cookie } })).json()) as { transfers: { pairs: { id: string; enabled: boolean; long: string }[]; recent: { state: string; basis: string; amount: string }[] } };
+  assert.deepEqual((await state()).transfers, { pairs: [{ ...(await state()).transfers.pairs[0], id: SIM_TRANSFER_PAIR.id, enabled: false, long: '***bbbb' }], corruptPairs: [], recent: [] });
+  const path = `/api/transfer-pairs/${SIM_TRANSFER_PAIR.id}`;
+  assert.equal((await fetch(base + path + '/enable', { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: '{}' })).status, 403);
+  assert.equal((await post(base, path + '/enable', { requestId: randomUUID() }, {})).status, 401);
+  assert.equal((await post(base, path + '/enable', { requestId: 'not-a-uuid' }, { cookie })).status, 400);
+  assert.equal((await post(base, path + '/enable', { requestId: randomUUID(), enabled: false }, { cookie })).status, 400);
+  assert.equal((await post(base, '/api/transfer-pairs/unknown/enable', { requestId: randomUUID() }, { cookie })).status, 404);
+  assert.equal((await post(base, path + '/toggle', { requestId: randomUUID() }, { cookie })).status, 404);
+  const requestId = randomUUID();
+  const enabled = await post(base, path + '/enable', { requestId }, { cookie });
+  assert.equal(enabled.status, 200);
+  assert.equal(((await enabled.json()) as { enabled: boolean }).enabled, true);
+  await h.ex.tick();
+  const after = await state();
+  assert.deepEqual(after.transfers.recent.map(item => [item.state, item.basis, item.amount]), [['confirmed', 'acknowledged', '100']]);
+  assert.equal(((await (await post(base, path + '/disable', { requestId: randomUUID() }, { cookie })).json()) as { enabled: boolean }).enabled, false);
+  const replay = await post(base, path + '/enable', { requestId }, { cookie });
+  assert.equal(replay.status, 200);
+  assert.equal(((await replay.json()) as { enabled: boolean }).enabled, false);
+  assert.equal((await post(base, path + '/disable', { requestId }, { cookie })).status, 409);
+  const page = await (await fetch(base + '/', { headers: { cookie } })).text();
+  assert.match(page, /ASTER 保证金平衡（模拟）/);
+}));
+
+test('HTTP：配对记录损坏时状态接口照常返回，其余配对列出并继续划转，损坏的按编号计入 corruptPairs', () => withServer(async (base, cookie, h) => {
+  const { mainAccountId, long } = SIM_TRANSFER_PAIR;
+  h.ex.registerTransferPair(SIM_TRANSFER_PAIR);
+  h.ex.registerTransferPair({ id: 'broken', mainAccountId, long, short: `0x${'d'.repeat(40)}` });
+  h.ex.registerTransferPair({ id: 'shapeless', mainAccountId, long, short: `0x${'e'.repeat(40)}` });
+  h.store.db.prepare("UPDATE transfer_pairs SET enabled = 1, json = '{' WHERE id = 'broken'").run();
+  h.store.db.prepare("UPDATE transfer_pairs SET enabled = 1, json = ? WHERE id = 'shapeless'").run(JSON.stringify({ id: 'shapeless', long }));
+  await h.ex.setTransferEnabled({ pairId: SIM_TRANSFER_PAIR.id, enabled: true, requestId: randomUUID() }, SESSION);
+  await h.ex.tick();
+  const response = await fetch(base + '/api/state', { headers: { cookie } });
+  assert.equal(response.status, 200);
+  const { transfers } = (await response.json()) as { transfers: { pairs: { id: string }[]; corruptPairs: string[]; recent: { pairId: string; state: string }[] } };
+  assert.deepEqual([transfers.pairs.map(pair => pair.id), transfers.corruptPairs], [[SIM_TRANSFER_PAIR.id], ['broken', 'shapeless']]);
+  assert.deepEqual(transfers.recent.map(item => [item.pairId, item.state]), [[SIM_TRANSFER_PAIR.id, 'confirmed']]);
+  assert.equal((h.store.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'transfer-tick-failed'").get() as { n: number }).n, 0);
+}));
+
+test('HTTP：启用时子账户归属读不到返回 502，归属不符返回 409，配对保持停用', () => withServer(async (base, cookie, h) => {
+  h.ex.registerTransferPair(SIM_TRANSFER_PAIR);
+  const enable = () => post(base, `/api/transfer-pairs/${SIM_TRANSFER_PAIR.id}/enable`, { requestId: randomUUID() }, { cookie });
+  h.aster.inject({ operation: 'sub-accounts', mode: 'read-fail' });
+  const unreadable = await enable();
+  assert.deepEqual([unreadable.status, ((await unreadable.json()) as { code: string }).code], [502, 'venue_read_failed']);
+  h.aster.reassign(SIM_TRANSFER_PAIR.short, `0x${'f'.repeat(40)}`);
+  const foreign = await enable();
+  assert.deepEqual([foreign.status, ((await foreign.json()) as { code: string }).code], [409, 'sub_account_missing']);
+  assert.equal(h.ex.transferPairs()[0].enabled, false);
+}));
+
+test('HTTP：不同端口的实例 cookie 名不同，会话互不通用', async () => {
+  const a = createHarness(), b = createHarness();
+  bindAccounts(a.ex); bindAccounts(b.ex);
+  const one = await startServer(a, 'token-instance-a', 'session-instance-a');
+  const two = await startServer(b, 'token-instance-b', 'session-instance-b');
+  try {
+    const cookieA = await login(one.base, 'token-instance-a'), cookieB = await login(two.base, 'token-instance-b');
+    assert.notEqual(cookieA.split('=')[0], cookieB.split('=')[0]);
+    assert.equal(cookieA.split('=')[0], sessionCookieName(one.port));
+    assert.equal((await fetch(one.base + '/api/state', { headers: { cookie: cookieA } })).status, 200);
+    assert.equal((await fetch(two.base + '/api/state', { headers: { cookie: cookieA } })).status, 401);
+    assert.equal((await fetch(two.base + '/', { headers: { cookie: cookieA } })).status, 401);
+    assert.equal((await fetch(two.base + '/api/state', { headers: { cookie: `${sessionCookieName(two.port)}=session-instance-a` } })).status, 401);
+    assert.equal((await fetch(`${two.base}/login?token=token-instance-a`, { redirect: 'manual' })).status, 401);
+    assert.equal((await fetch(two.base + '/api/state', { headers: { cookie: `${cookieA}; ${cookieB}` } })).status, 200, '同一浏览器同时持有两个实例的 cookie 时各取各的');
+  } finally {
+    await new Promise(resolve => one.server.close(resolve)); await new Promise(resolve => two.server.close(resolve));
+    a.dispose(); b.dispose();
+  }
+});
+
+test('HTTP：会话值不能与访问令牌相同，访问令牌不能为空', () => {
+  const h = createHarness();
+  try {
+    assert.throws(() => createExecutorServer({ executor: h.ex, accessToken: 'same-value', session: 'same-value' }), /不能与访问令牌相同/);
+    assert.throws(() => createExecutorServer({ executor: h.ex, accessToken: '' }), /访问令牌/);
+  } finally { h.dispose(); }
+});
+
+test('入口：登录链接写入 access-url，覆盖旧文件、不留临时文件、不经 stdout/stderr', () => {
+  const h = createHarness();
+  const dir = join(h.dir, 'data');
+  mkdirSync(dir);
+  writeFileSync(join(dir, 'access-url'), 'stale');
+  const written: string[] = [];
+  const out = process.stdout.write, err = process.stderr.write;
+  const capture = ((chunk: unknown) => { written.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  process.stdout.write = capture; process.stderr.write = capture;
+  let path: string;
+  try { path = writeAccessUrl(dir, 4711, 'tok_ABC-123'); }
+  finally { process.stdout.write = out; process.stderr.write = err; }
+  try {
+    assert.equal(path, join(dir, 'access-url'));
+    assert.equal(readFileSync(path, 'utf8'), 'http://127.0.0.1:4711/login?token=tok_ABC-123\n');
+    assert.deepEqual(written, []);
+    assert.deepEqual(readdirSync(dir), ['access-url']);
+    if (process.platform !== 'win32') assert.equal(statSync(path).mode & 0o777, 0o600);
+    writeAccessUrl(dir, 4711, 'tok_second');
+    assert.equal(readFileSync(path, 'utf8'), 'http://127.0.0.1:4711/login?token=tok_second\n');
+  } finally { h.dispose(); }
+});

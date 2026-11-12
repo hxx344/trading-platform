@@ -105,6 +105,7 @@ test('同配对互斥：ADL 减仓单在途时划转本轮不发，减仓单有�
   await h.ex.tickTransfers();
   assert.equal(h.aster.calls.transfer, 0);
   assert.match(transferNote(h), /ADL 减仓单正在发送或挂单，本轮不划转/);
+  assert.equal(h.ex.transferPairs().find(pair => pair.id === PAIR)!.noteIdle, true, 'ADL 期间不按这条说明告警');
 
   // Released, the send answers nothing usable: the batch turns unknown and is no longer on the wire.
   h.asterTrading.releaseHung();
@@ -173,6 +174,7 @@ test('同配对互斥：划转读取余额途中 ADL 开始发送减仓单，落
   await within(transferPass, '划转轮次');
   assert.equal(h.aster.calls.transfer, 0);
   assert.match(transferNote(h), /ADL 减仓单正在发送或挂单，本次不划转/);
+  assert.equal(h.ex.transferPairs().find(pair => pair.id === PAIR)!.noteIdle, true);
   h.asterTrading.releaseHung();
   await within(adlPass, 'ADL 轮次');
 }));

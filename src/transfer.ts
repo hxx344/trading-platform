@@ -53,10 +53,17 @@ export interface PairRecord extends TransferPairInput {
   usedReceipts: { tranId: string; at: number }[];
   /** A transfer touching one of this pair's accounts was settled then; only balances received later are planned from. */
   freshAfter?: number;
+  /**
+   * The stored balances describe the margin now only if read after this (shown as balancesFresh, for the alerts). It
+   * follows freshAfter, except that the balances read after an acknowledgement already reflect that transfer.
+   */
+  balancesAfter?: number;
   /** Sends in a row that never left this process; each one doubles the wait before the next try. */
   notSentStreak?: number;
   balances: Record<PairSide, TransferBalance> | null;
   note: string | null;
+  /** The note only says why this check had nothing to send (the plan's own reason), not that something is wrong. */
+  noteIdle?: boolean;
 }
 export interface Transfer {
   /** Request id: one per transfer, never reused for a second send. */
@@ -231,12 +238,14 @@ export function createTransfers({ db, now, budgets, connector, control, write, a
   function requireNewBalances(transfer: Transfer, at: number, owner: PairRecord | null, receipt: string | null, sharedCooldownUntil = 0): void {
     if (owner) {
       owner.freshAfter = Math.max(owner.freshAfter ?? 0, at);
+      owner.balancesAfter = Math.max(owner.balancesAfter ?? 0, at);
       if (receipt) useReceipt(owner, receipt, at);
     }
     for (const { json } of db.prepare('SELECT json FROM transfer_pairs WHERE id != ?').all(transfer.pairId) as { json: string }[]) {
       const other = parsePairRow(json);
       if (!other || ![other.long, other.short].some(account => account === transfer.source || account === transfer.destination)) continue;
       other.freshAfter = Math.max(other.freshAfter ?? 0, at);
+      other.balancesAfter = Math.max(other.balancesAfter ?? 0, at);
       // A pair that never sends would otherwise only collect them. One with an open transfer keeps all: its label read may come later than the window.
       if (!db.prepare('SELECT 1 FROM transfers WHERE pair_id = ? AND settled = 0').get(other.id)) other.usedReceipts = other.usedReceipts.filter(item => item.at + usedReceiptWindowMs > at);
       if (receipt) useReceipt(other, receipt, at);
@@ -352,12 +361,16 @@ export function createTransfers({ db, now, budgets, connector, control, write, a
   }
 
   // ---- planning and sending ----------------------------------------------------
-  /** Records why nothing was sent and waits one check interval. A pair re-registered meanwhile is left alone. */
-  function defer(pair: PairRecord, note: string, balances?: Record<PairSide, TransferBalance>): void {
+  /**
+   * Records why nothing was sent and waits one check interval. A pair re-registered meanwhile is left alone.
+   * idle: the plan found nothing worth sending (the gap within the threshold and the like); the alerts judge the gap
+   * from the balances themselves, so such a note is not a problem in its own right.
+   */
+  function defer(pair: PairRecord, note: string, balances?: Record<PairSide, TransferBalance>, idle = false): void {
     write(() => {
       const current = readPair(pair.id);
       if (!current || current.identity !== pair.identity) return;
-      current.nextCheckAt = Math.max(current.nextCheckAt, now() + current.config.checkIntervalMs); current.note = note.slice(0, 300);
+      current.nextCheckAt = Math.max(current.nextCheckAt, now() + current.config.checkIntervalMs); current.note = note.slice(0, 300); current.noteIdle = idle;
       if (balances) current.balances = balances;
       savePair(current);
     });
@@ -366,14 +379,15 @@ export function createTransfers({ db, now, budgets, connector, control, write, a
     const pair = readPair(pairId), at = now();
     if (!pair || !pair.enabled || at < pair.cooldownUntil || at < pair.nextCheckAt || blockedBy(pair)) return;
     const reducing = adlSending?.(pair.id);
-    if (reducing) { defer(pair, `${reducing}，本轮不划转`); return; }
+    // ADL owns the pair while it reduces and reports on its own; the margin gap still speaks for itself.
+    if (reducing) { defer(pair, `${reducing}，本轮不划转`, undefined, true); return; }
     let balances: Record<PairSide, TransferBalance>;
     try { balances = await readBalances(pair); }
     catch (error) { defer(pair, `余额读取失败，未划转：${why(error)}`); return; }
     let stale = staleness(pair, balances);
     if (stale) { defer(pair, `${stale}，未划转`); return; }
     const outlook = planTransfer(balances, pair.config);
-    if ('reason' in outlook) { defer(pair, outlook.reason, balances); return; }
+    if ('reason' in outlook) { defer(pair, outlook.reason, balances, true); return; }
     // The plan above only decided that it is worth doing. The balances the send goes by are read last, after the
     // waits for ownership and the receipt snapshot, so nothing slow sits between them and the send.
     let before: Partial<Record<PairSide, TransferReceipt[]>>;
@@ -382,7 +396,7 @@ export function createTransfers({ db, now, budgets, connector, control, write, a
     stale = staleness(pair, balances);
     if (stale) { defer(pair, `发送前重读：${stale}，未划转`); return; }
     const plan = planTransfer(balances, pair.config);
-    if ('reason' in plan) { defer(pair, `发送前重读后不再划转：${plan.reason}`, balances); return; }
+    if ('reason' in plan) { defer(pair, `发送前重读后不再划转：${plan.reason}`, balances, true); return; }
     const accounts = { source: pair[plan.source], destination: pair[plan.destination] };
     const beforeReceipts: Transfer['beforeReceipts'] = {};
     for (const role of ROLES) {
@@ -399,21 +413,24 @@ export function createTransfers({ db, now, budgets, connector, control, write, a
   }
   async function send(pair: PairRecord, transfer: Transfer, balances: Record<PairSide, TransferBalance>): Promise<void> {
     const target = venue();
-    const refusal = write(() => {
+    // idle: the pair moved on under this evaluation (switched off, a shared account's cooldown, new settings, ADL), not a fault.
+    const refusal = write((): { note: string; idle: boolean } | null => {
       const current = readPair(pair.id);
-      if (!current || !current.enabled || current.identity !== transfer.identity || now() < current.cooldownUntil) return '配对状态已变化，本次不划转';
+      if (!current || !current.enabled || current.identity !== transfer.identity || now() < current.cooldownUntil) return { note: '配对状态已变化，本次不划转', idle: true };
       // The amount was planned under the settings read when this evaluation began.
-      if (JSON.stringify(current.config) !== JSON.stringify(pair.config)) return '配对配置在评估途中已更改，本次不划转，下一轮按新配置规划';
-      const blocked = blockedBy(current) ?? staleness(current, balances) ?? adlSending?.(current.id);
-      if (blocked) return `${blocked}，本次不划转`;
+      if (JSON.stringify(current.config) !== JSON.stringify(pair.config)) return { note: '配对配置在评估途中已更改，本次不划转，下一轮按新配置规划', idle: true };
+      const blocked = blockedBy(current) ?? staleness(current, balances);
+      if (blocked) return { note: `${blocked}，本次不划转`, idle: false };
+      const reducing = adlSending?.(current.id);
+      if (reducing) return { note: `${reducing}，本次不划转`, idle: true };
       const at = now();
       current.usedReceipts = current.usedReceipts.filter(item => item.at + usedReceiptWindowMs > at);
       db.prepare('INSERT INTO transfers(id, pair_id, state, settled, created_at, version, json) VALUES (?, ?, ?, 0, ?, 1, ?)').run(transfer.id, transfer.pairId, transfer.state, transfer.preparedAt, JSON.stringify(transfer));
-      current.balances = balances; current.note = null; savePair(current);
+      current.balances = balances; current.note = null; current.noteIdle = false; savePair(current);
       event(null, 'transfer-prepared', { pair: pair.id, transfer: transfer.id, sourceSide: transfer.sourceSide, amount: transfer.amount });
       return null;
     });
-    if (refusal) { defer(pair, refusal); return; }
+    if (refusal) { defer(pair, refusal.note, undefined, refusal.idle); return; }
     let registered: WriterOperation | null = null;
     if (control) {
       try { registered = control.prepareTransfer({ id: transfer.id, mainAccountId: transfer.mainAccountId, source: transfer.source, destination: transfer.destination, amount: transfer.amount }); }
@@ -492,7 +509,10 @@ export function createTransfers({ db, now, budgets, connector, control, write, a
         label: { basis: 'acknowledged', ...(current.tranId ? { receipt: current.tranId } : {}), note: notes.join('；') || null } });
       saveTransfer(current);
       const owner = readPair(current.pairId);
+      const shownAfter = owner?.balancesAfter ?? 0;
       requireNewBalances(current, at, owner, current.tranId);
+      // The refreshed balances were read after the acknowledgement (checked above), so they already show this transfer.
+      if (owner && balances && owner.identity === current.identity) owner.balancesAfter = Math.max(shownAfter, ackAt);
       if (owner) {
         owner.cooldownUntil = Math.max(owner.cooldownUntil, (current.sentAt ?? ackAt) + owner.config.cooldownMs);
         if (owner.identity === current.identity) owner.balances = !balances ? null : current.sourceSide === 'long' ? { long: balances.source, short: balances.destination } : { long: balances.destination, short: balances.source };
@@ -683,7 +703,9 @@ export function createTransfers({ db, now, budgets, connector, control, write, a
     return {
       id: pair.id, mainAccountId: maskId(pair.mainAccountId), long: maskId(pair.long), short: maskId(pair.short), config: pair.config, enabled: pair.enabled,
       cooldownUntil: pair.cooldownUntil, nextCheckAt: pair.nextCheckAt, balances: pair.balances ? { long: balance(pair.balances.long), short: balance(pair.balances.short) } : null,
-      blocked: pair.enabled ? blockedBy(pair) : null, note: pair.note, current,
+      blocked: pair.enabled ? blockedBy(pair) : null, note: pair.note, noteIdle: pair.note !== null && pair.noteIdle === true, current,
+      // The shown balances were read after the last settled transfer on these accounts, so they still describe the margin now.
+      balancesFresh: pair.balances !== null && Math.min(pair.balances.long.receivedAt, pair.balances.short.receivedAt) >= (pair.balancesAfter ?? pair.freshAfter ?? 0),
     };
   }
 
@@ -705,7 +727,7 @@ export function createTransfers({ db, now, budgets, connector, control, write, a
         const changed = existing.identity !== identity;
         const reason = changed ? busy?.(parsed.id) ?? null : null;
         if (reason) reject('adl_incident_open', reason, 409);
-        Object.assign(existing, parsed, { identity }, changed ? { enabled: false, balances: null, note: '配对账户已更换，已停用；核对后重新启用' } : {});
+        Object.assign(existing, parsed, { identity }, changed ? { enabled: false, balances: null, note: '配对账户已更换，已停用；核对后重新启用', noteIdle: false } : {});
         savePair(existing);
       }
       event(null, 'transfer-pair-registered', { pair: parsed.id });
@@ -740,7 +762,7 @@ export function createTransfers({ db, now, budgets, connector, control, write, a
       db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(requestId, 'transfer-enable', payload, session, pairId, now());
       const switchedOn = enabled && !current.enabled;
       current.enabled = enabled;
-      if (enabled) { current.nextCheckAt = 0; current.note = null; }
+      if (enabled) { current.nextCheckAt = 0; current.note = null; current.noteIdle = false; }
       if (switchedOn) onEnabled?.(current, checksFrom);
       savePair(current);
       event(null, 'transfer-pair-switched', { pair: pairId, enabled, requestId });

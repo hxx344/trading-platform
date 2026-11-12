@@ -153,7 +153,7 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
       file: join(dir, 'notify.sqlite'), feishu: secrets.feishu, ...(notifyFetch ? { fetchImpl: notifyFetch } : {}),
       events: (after, limit) => store.db.prepare('SELECT seq, type, at, json FROM events WHERE seq > ? ORDER BY seq LIMIT ?').all(after, limit) as unknown as EventRow[],
       latestSeq: () => (store.db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events').get() as { seq: number }).seq,
-      pairs: () => executor.transferPairs().map(pair => ({ id: pair.id, enabled: pair.enabled, blocked: pair.blocked, note: pair.note })),
+      pairs: () => executor.transferPairs().map(pair => ({ id: pair.id, enabled: pair.enabled, blocked: pair.blocked, note: pair.note, noteIdle: pair.noteIdle, balances: pair.balances, balancesFresh: pair.balancesFresh, threshold: pair.config.threshold })),
       incidentPair: id => { try { return executor.adlIncident(id).pairId; } catch { return null; } },
     });
   } catch (error) { executor.close(); store.close(); locks.release(); throw error; }

@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ContractError, DEFAULT_TRANSFER_CONFIG, parseTransferConfig } from '../src/contracts.ts';
@@ -12,10 +13,16 @@ import { openStore } from '../src/store.ts';
 import { AsterClient, RequestBudget } from '../src/aster/client.ts';
 import { assertDistinctSigners, pairWeightPerMinute, parseServiceConfig, parseServiceSecrets, type ServiceConfig, type ServiceSecrets } from '../src/service/config.ts';
 import { createTakeoverGuard, TAKEOVER_WINDOW_MS } from '../src/service/takeover.ts';
-import { STUCK_AFTER_MS, createNotifier, describeEvent, feishuSign, type EventRow, type PairState } from '../src/service/feishu.ts';
+import { FAULT_AFTER_MS, FAULT_REPEAT_MS, createNotifier, marginProblem, describeEvent, feishuSign, type EventRow, type PairState } from '../src/service/feishu.ts';
 import { runUserStream, STREAM_BASE, type SocketLike } from '../src/service/stream.ts';
 import { wireService } from '../src/service/main.ts';
 import { FakeAster, LONG, MAIN, SHORT, json } from './aster-fake.ts';
+
+/** A switched-on pair with fresh balances read at `at`, threshold 1000, nothing blocked. */
+const margin = (long: string, short: string, at: number): PairState => ({
+  id: 'p', enabled: true, blocked: null, note: null, noteIdle: false,
+  balances: { long: { available: long, receivedAt: at }, short: { available: short, receivedAt: at } }, balancesFresh: true, threshold: '1000',
+});
 
 const tempDir = () => mkdtempSync(join(tmpdir(), 'tp-service-'));
 const secretsRaw = { accounts: { main: MAIN, a: LONG, b: SHORT } };
@@ -143,7 +150,7 @@ test('飞书告警：事件转消息，同一持续问题 30 分钟内只发一�
     add('transfer-settled', { pair: 'p1', transfer: 'old', basis: 'nonce_expired_unreadable' });
     const posts: { url: string; body: Record<string, unknown> }[] = [];
     let failing = true;
-    let pairs: PairState[] = [{ id: 'p1', enabled: true, blocked: null, note: null }];
+    let pairs: PairState[] = [{ ...margin('0', '0', clock), id: 'p1' }];
     const lines: string[] = [];
     const notifier = createNotifier({
       file: join(dir, 'notify.sqlite'), events: (after, limit) => log.filter(row => row.seq > after).slice(0, limit), latestSeq: () => seq,
@@ -186,19 +193,84 @@ test('飞书告警：事件转消息，同一持续问题 30 分钟内只发一�
     notifier.poll();
     assert.equal(notifier.pending(), 1);
 
-    // A switched-on pair that cannot balance for 10 minutes is reported once, and its recovery too.
-    pairs = [{ id: 'p1', enabled: true, blocked: null, note: '低于最小划转额' }];
+    // An idle note with the gap within the threshold is normal: nothing, however long it lasts (the false alarm of v0.4.3).
+    const texts = () => (db => { try { return (db.prepare('SELECT text FROM outbox ORDER BY id').all() as { text: string }[]).map(row => row.text); } finally { db.close(); } })(new DatabaseSync(join(dir, 'notify.sqlite')));
+    const pair = (long: string, short: string, over: Partial<PairState> = {}): PairState[] => [{ ...margin(long, short, clock), id: 'p1', ...over }];
+    const before = notifier.pending();
+    pairs = pair('2000', '1284.3', { note: '两侧可用余额差 715.7 USD1 未超过划转门槛 1000 USD1（须严格大于）', noteIdle: true });
     notifier.poll();
-    clock += STUCK_AFTER_MS;
+    clock += 30 * 60_000;
+    notifier.poll();
+    assert.equal(notifier.pending(), before, '差额未超过门槛不告警');
+
+    // Gap above the threshold: reported after 60 s with both balances, the gap and the threshold; repeated every 2 minutes.
+    pairs = pair('3000', '1000');
+    notifier.poll();
+    clock += FAULT_AFTER_MS - 1;
+    notifier.poll();
+    assert.equal(notifier.pending(), before, '未满 60 秒不告警');
+    clock += 1;
     notifier.poll(); notifier.poll();
-    assert.equal(notifier.pending(), 2);
-    pairs = [{ id: 'p1', enabled: true, blocked: null, note: null }];
+    assert.equal(notifier.pending(), before + 1);
+    assert.match(texts().at(-1)!, /【保证金平衡异常】配对 p1 已持续 60 秒：两侧可用余额差 2000 USD1 超过划转门槛 1000 USD1。两侧可用余额 多 3000 \/ 空 1000 USD1，差额 2000 USD1，划转门槛 1000 USD1（\d\d:\d\d:\d\d 读取）/);
+    clock += FAULT_REPEAT_MS - 1;
     notifier.poll();
-    assert.equal(notifier.pending(), 3);
+    assert.equal(notifier.pending(), before + 1);
+    clock += 1;
+    notifier.poll();
+    assert.equal(notifier.pending(), before + 2);
+    assert.match(texts().at(-1)!, /【保证金平衡仍异常】配对 p1 已持续 3 分钟/);
+    // Balances from before the last settlement, or none at all, neither end nor restart the report.
+    pairs = pair('2000', '1500', { balancesFresh: false });
+    notifier.poll();
+    pairs = pair('2000', '1500', { balances: null, balancesFresh: false });
+    notifier.poll();
+    assert.equal(notifier.pending(), before + 2, '余额未知不算恢复');
+    // Recovery once, with the whole duration.
+    pairs = pair('2000', '1500');
+    notifier.poll(); notifier.poll();
+    assert.equal(notifier.pending(), before + 3);
+    assert.match(texts().at(-1)!, /【保证金平衡恢复】配对 p1，异常共约 3 分钟：两侧可用余额 多 2000 \/ 空 1500 USD1，差额 500 USD1/);
+
+    // A confirmed transfer is progress: the 60 s wait restarts, so a pair balancing in steps is not reported; a transfer
+    // that did not go through (expired, rejected) is no progress.
+    pairs = pair('9000', '1000', { blocked: '本配对有未结清的划转' });
+    notifier.poll();
+    clock += 50_000;
+    add('transfer-settled', { pair: 'p1', transfer: 'step1', state: 'confirmed', basis: 'acknowledged' });
+    notifier.poll();
+    clock += 50_000;
+    add('transfer-settled', { pair: 'p1', transfer: 'step2', state: 'expired-unverified', basis: 'nonce_expired_unreadable' });
+    notifier.poll();
+    assert.equal(notifier.pending(), before + 3 + 1, '有划转成功，重新计时（另有结清依据的事件通知）');
+    clock += 10_000;
+    notifier.poll();
+    assert.equal(notifier.pending(), before + 5);
+    assert.match(texts().at(-1)!, /【保证金平衡异常】配对 p1 已持续 110 秒：本配对有未结清的划转/);
+    // An idle note does not hide a gap above the threshold; a switched-off pair is dropped without a recovery notice.
+    pairs = pair('9000', '1000', { note: 'ADL 减仓单正在发送或挂单，本轮不划转', noteIdle: true });
+    clock += FAULT_REPEAT_MS;
+    notifier.poll();
+    assert.equal(notifier.pending(), before + 6);
+    assert.match(texts().at(-1)!, /仍异常[\s\S]*超过划转门槛 1000 USD1；ADL 减仓单/);
+    pairs = [{ ...pairs[0]!, enabled: false }];
+    notifier.poll();
+    assert.equal(notifier.pending(), before + 6);
     await notifier.flush();
-    assert.match((posts.at(-1)!.body as { content: { text: string } }).content.text, /保证金平衡受阻[\s\S]*保证金平衡恢复/);
     notifier.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('保证金告警判定：受阻、非空闲说明、差额超过门槛（严格大于）才算异常；余额缺失、过期或读不出时不判定', () => {
+  const base = (long: string, short: string, over: Partial<PairState> = {}) => ({ ...margin(long, short, 1), threshold: '10', ...over });
+  assert.equal(marginProblem(base('15', '5')), null, '差额等于门槛不算');
+  assert.match(String(marginProblem(base('5', '15.01'))), /差 10\.01 USD1 超过划转门槛 10 USD1/);
+  assert.equal(marginProblem(base('1', '2', { note: '低于最小划转额', noteIdle: true })), null);
+  assert.equal(marginProblem(base('1', '2', { note: '余额读取失败' })), '余额读取失败');
+  assert.equal(marginProblem(base('1', '1', { blocked: '本配对有未结清的划转' })), '本配对有未结清的划转');
+  assert.equal(marginProblem(base('x', '1')), 'unknown');
+  assert.equal(marginProblem(base('100', '1', { balancesFresh: false })), 'unknown', '早于最近一笔结算的余额不判定');
+  assert.equal(marginProblem(base('1', '1', { balances: null, balancesFresh: false })), 'unknown');
 });
 
 test('飞书告警：未配置机器人时只写日志；事件说明覆盖结算依据与 ADL 结束', () => {

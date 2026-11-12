@@ -6,6 +6,7 @@ import { createHmac } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { FeishuSecret } from './config.ts';
 import { HEDGE_TOLERANCE_BPS } from '../adl-contracts.ts';
+import { cmp, sub } from '../decimal.ts';
 
 const SEND_TIMEOUT_MS = 10_000;
 const RETRY_BASE_MS = 5_000;
@@ -17,11 +18,46 @@ const LINES_PER_POST = 10;
 const MAX_TEXT = 1_500;
 /** Repeats of one ongoing problem are posted at most this often. */
 const REPEAT_MS = 30 * 60_000;
-/** A switched-on pair that cannot balance for this long is reported. */
-export const STUCK_AFTER_MS = 10 * 60_000;
+/** A switched-on pair whose margin stays out of balance (or whose transfers stay stuck) this long is reported, as the workbench did. */
+export const FAULT_AFTER_MS = 60_000;
+/** While it lasts, the report is repeated this often; its end is reported once. */
+export const FAULT_REPEAT_MS = 120_000;
 
 export interface EventRow { seq: number; type: string; at: number; json: string }
-export interface PairState { id: string; enabled: boolean; blocked: string | null; note: string | null }
+export interface PairState {
+  id: string; enabled: boolean; blocked: string | null; note: string | null;
+  /** The note only explains why the last check had nothing to send; the gap below decides whether that is a problem. */
+  noteIdle: boolean;
+  balances: { long: { available: string; receivedAt: number }; short: { available: string; receivedAt: number } } | null;
+  /** The balances were read after the last settled transfer on these accounts; older ones say nothing about the margin now. */
+  balancesFresh: boolean;
+  threshold: string;
+}
+
+/**
+ * Why the pair's margin is not in order: stuck transfers, a failed check, a gap above the threshold (strictly, as the
+ * transfer rule). null: in order. 'unknown': no current balances to judge the gap by (right after a transfer settled,
+ * before the next read), which neither starts nor ends a report, as the workbench did.
+ */
+export function marginProblem(pair: PairState): string | null | 'unknown' {
+  if (pair.blocked) return pair.blocked;
+  if (pair.note && !pair.noteIdle) return pair.note;
+  const gap = pair.balancesFresh ? marginGap(pair) : null;
+  if (gap === null) return 'unknown';
+  return cmp(gap, pair.threshold) > 0 ? `两侧可用余额差 ${gap} USD1 超过划转门槛 ${pair.threshold} USD1${pair.note ? `；${pair.note}` : ''}` : null;
+}
+function marginGap(pair: PairState): string | null {
+  if (!pair.balances) return null;
+  try { const delta = sub(pair.balances.long.available, pair.balances.short.available); return cmp(delta, '0') < 0 ? sub('0', delta) : delta; }
+  catch { return null; }
+}
+const balanceLine = (pair: PairState): string => {
+  const gap = marginGap(pair);
+  if (!pair.balances || gap === null) return '两侧可用余额尚未读取';
+  const readAt = new Date(Math.min(pair.balances.long.receivedAt, pair.balances.short.receivedAt) + 8 * 3600_000).toISOString().slice(11, 19);
+  return `两侧可用余额 多 ${clip(pair.balances.long.available, 40)} / 空 ${clip(pair.balances.short.available, 40)} USD1，差额 ${gap} USD1，划转门槛 ${clip(pair.threshold, 40)} USD1（${readAt} 读取${pair.balancesFresh ? '' : '，早于最近一笔划转结算'}）`;
+};
+const lasted = (ms: number): string => ms < 120_000 ? `${Math.round(ms / 1000)} 秒` : `${Math.round(ms / 60_000)} 分钟`;
 export interface NotifierOptions {
   file: string;
   /** Reads events after a sequence number, oldest first. */
@@ -126,8 +162,11 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, f
     db.prepare('INSERT INTO repeats(key, at) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET at = excluded.at').run(key, at);
     return true;
   };
-  /** In memory: since when each switched-on pair has been unable to balance, and whether that was reported. */
-  const stuck = new Map<string, { since: number; reported: boolean }>();
+  /**
+   * In memory, per switched-on pair out of order: since when it waits (restarted by a confirmed transfer), when the trouble
+   * first began (for the duration in the messages), and when it was last reported (null: not yet).
+   */
+  const stuck = new Map<string, { since: number; began: number; sentAt: number | null }>();
 
   function poll(): void {
     const at = now();
@@ -139,6 +178,14 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, f
         for (const row of rows) {
           const message = describeEvent(row, incidentPair);
           if (message && (!message.repeatKey || fresh(message.repeatKey, at))) insert(message.text, at);
+          // A transfer that went through is progress: the wait restarts, as the workbench did, so a pair balancing in
+          // steps (each capped by the per-transfer limit) is not reported while it keeps moving.
+          if (row.type === 'transfer-settled') {
+            let detail: { pair?: unknown; state?: unknown } = {};
+            try { detail = JSON.parse(row.json) as typeof detail; } catch { /* not progress */ }
+            const entry = typeof detail.pair === 'string' && detail.state === 'confirmed' ? stuck.get(detail.pair) : undefined;
+            if (entry) entry.since = at;
+          }
         }
         db.prepare('UPDATE cursor SET seq = ? WHERE id = 1').run(rows.at(-1)!.seq);
       });
@@ -148,17 +195,22 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, f
     for (const pair of pairs()) {
       if (!pair.enabled) continue;
       seen.add(pair.id);
-      const problem = pair.blocked ?? pair.note;
+      const problem = marginProblem(pair);
       const entry = stuck.get(pair.id);
+      if (problem === 'unknown') continue;
       if (!problem) {
-        if (entry?.reported) tx(() => insert(`【保证金平衡恢复】配对 ${pair.id} 已恢复正常划转检查`, at));
+        if (entry?.sentAt != null) tx(() => insert(`【保证金平衡恢复】配对 ${pair.id}，异常共约 ${lasted(at - entry.began)}：${balanceLine(pair)}`, at));
         stuck.delete(pair.id);
         continue;
       }
-      if (!entry) { stuck.set(pair.id, { since: at, reported: false }); continue; }
-      if (!entry.reported && at - entry.since >= STUCK_AFTER_MS) {
-        entry.reported = true;
-        tx(() => insert(`【保证金平衡受阻】配对 ${pair.id} 已持续 ${Math.round((at - entry.since) / 60_000)} 分钟无法划转：${clip(problem)}`, at));
+      if (!entry) { stuck.set(pair.id, { since: at, began: at, sentAt: null }); continue; }
+      if (at - entry.since < FAULT_AFTER_MS) continue;
+      if (entry.sentAt === null) {
+        entry.sentAt = at;
+        tx(() => insert(`【保证金平衡异常】配对 ${pair.id} 已持续 ${lasted(at - entry.began)}：${clip(problem)}。${balanceLine(pair)}。持续 ${FAULT_AFTER_MS / 1000} 秒告警，未恢复每 ${FAULT_REPEAT_MS / 1000} 秒重复提醒，恢复后通知一次`, at));
+      } else if (at - entry.sentAt >= FAULT_REPEAT_MS) {
+        entry.sentAt = at;
+        tx(() => insert(`【保证金平衡仍异常】配对 ${pair.id} 已持续 ${lasted(at - entry.began)}：${clip(problem)}。${balanceLine(pair)}`, at));
       }
     }
     for (const id of [...stuck.keys()]) if (!seen.has(id)) stuck.delete(id);

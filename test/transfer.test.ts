@@ -96,6 +96,17 @@ async function sendUnknown(h: Harness, mode: 'lost-response' | 'lost-request' | 
   return transfer;
 }
 
+test('划转：回执后重读的余额已反映本笔，结算时钟走过读取时刻也仍算当前余额（告警按它判定）', () => withHarness(async h => {
+  await start(h);
+  const read = h.aster.balance.bind(h.aster);
+  // Each read takes 7 ms of wall clock, so the settlement comes after the refreshed balances were received.
+  h.aster.balance = async (...args) => { const value = await read(...args); h.clock.now += 7; return value; };
+  await h.ex.tick();
+  assert.deepEqual([last(h).state, last(h).basis], ['confirmed', 'acknowledged']);
+  const pair = pairOf(h);
+  assert.deepEqual([pair.balances!.long.available, pair.balances!.short.available, pair.balancesFresh], ['500', '500', true]);
+}));
+
 test('划转：多侧富余时把差额一半划给空侧，回执后重读两侧余额才记为已执行；平衡后不再划转', () => withHarness(async h => {
   await start(h);
   assert.equal(pairOf(h).enabled, true);
@@ -112,6 +123,8 @@ test('划转：多侧富余时把差额一半划给空侧，回执后重读两�
   await run(h, 60_000);
   assert.equal(h.aster.calls.transfer, 1);
   assert.match(pairOf(h).note ?? '', /未超过划转门槛/);
+  assert.equal(pairOf(h).noteIdle, true, '只是无需划转的说明，告警不据此报警');
+  assert.equal(pairOf(h).balancesFresh, true, '结算后重新读到的余额');
 }));
 
 test('划转：停止排空开始后不再发出新的划转，记为未发送', () => withHarness(async h => {
@@ -226,6 +239,7 @@ test('未知划转：回报丢失但已到账，到期前不重发也不新发�
   assert.deepEqual([settled.id, settled.state, settled.basis, settled.receipt], [sent.id, 'confirmed', 'late_receipt_confirmed', h.aster.ledger[0].tranId]);
   assert.match(settled.labelNote!, /无原交易编号，按金额与时间归属，可能误认其他同额划转$/);
   assert.equal(pairOf(h).cooldownUntil, settled.settledAt! + 300_000, '无原交易编号的确认用长冷却');
+  assert.deepEqual([pairOf(h).balances !== null, pairOf(h).balancesFresh], [true, false], '划转前的余额留作展示，告警不再按它判定差额');
   assert.deepEqual(used(h), [h.aster.ledger[0].tranId]);
   await run(h, 295_000);
   assert.equal(h.aster.calls.transfer, 1);
@@ -1170,6 +1184,7 @@ test('划转：子账户列表缺一侧而余额可读时，发送前的归属�
   await h.ex.tick();
   assert.deepEqual([h.aster.calls.balance, h.aster.calls['sub-accounts'], h.aster.calls.transfer, transfers(h).length], [2, 2, 0, 0], '余额读到了，归属在列表上被拒');
   assert.equal(pairOf(h).note, '发送前复核失败，未划转：空侧子账户不在主账户的子账户列表中，无法确认归属');
+  assert.equal(pairOf(h).noteIdle, false, '失败说明照常告警');
   await flip(h, false);
   await assert.rejects(flip(h, true), code('sub_account_missing'));
   h.aster.unlist(SHORT, false);

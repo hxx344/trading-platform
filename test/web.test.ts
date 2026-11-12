@@ -1,0 +1,161 @@
+// The built page: what the loader accepts and refuses, how the server hands it out, and the page's request-id rule.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { AddressInfo } from 'node:net';
+import { createExecutorServer } from '../src/http.ts';
+import { UUID } from '../src/contracts.ts';
+import { WEB_DIST, checkIndexHtml, loadWebApp } from '../src/web-assets.ts';
+import { RequestIds, newRequestId } from '../web/src/request-ids.ts';
+import { ApiError, api } from '../web/src/api.ts';
+import { bindAccounts, createHarness } from './harness.ts';
+
+const INDEX = '<!doctype html><title>t</title><script type="module" crossorigin src="/assets/index-a1.js"></script><link rel="stylesheet" crossorigin href="/assets/index-b2.css">';
+
+function fixture(edit?: (dir: string) => void): string {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-web-'));
+  mkdirSync(join(dir, 'assets'));
+  writeFileSync(join(dir, 'index.html'), INDEX);
+  writeFileSync(join(dir, 'assets', 'index-a1.js'), 'console.info(1);');
+  writeFileSync(join(dir, 'assets', 'index-b2.css'), 'body{margin:0}');
+  edit?.(dir);
+  return dir;
+}
+function refused(edit: (dir: string) => void, pattern: RegExp): void {
+  const dir = fixture(edit);
+  try { assert.throws(() => loadWebApp(dir), pattern); } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+test('页面文件：加载构建产物，按扩展名给出类型', () => {
+  const dir = fixture();
+  try {
+    const app = loadWebApp(dir);
+    assert.equal(app.index.toString('utf8'), INDEX);
+    assert.deepEqual([...app.assets].map(([name, asset]) => [name, asset.type]), [['index-a1.js', 'text/javascript; charset=utf-8'], ['index-b2.css', 'text/css; charset=utf-8']]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('页面文件：缺失、内联脚本或样式、引用缺失、非普通文件与未知类型都拒绝', () => {
+  refused(dir => rmSync(join(dir, 'index.html')), /页面文件缺失：index\.html（先运行 pnpm build:web）/);
+  refused(dir => writeFileSync(join(dir, 'index.html'), `${INDEX}<script>alert(1)</script>`), /内联脚本/);
+  refused(dir => writeFileSync(join(dir, 'index.html'), `${INDEX}<style>body{}</style>`), /内联样式/);
+  refused(dir => writeFileSync(join(dir, 'index.html'), `${INDEX}<div style="color:red"></div>`), /内联样式属性或事件处理/);
+  refused(dir => writeFileSync(join(dir, 'index.html'), `${INDEX}<img src="x" onerror="alert(1)">`), /内联样式属性或事件处理/);
+  refused(dir => rmSync(join(dir, 'assets', 'index-b2.css')), /页面引用的文件缺失：assets\/index-b2\.css/);
+  refused(dir => symlinkSync(join(dir, 'index.html'), join(dir, 'assets', 'link.js')), /不是普通文件：assets\/link\.js/);
+  refused(dir => mkdirSync(join(dir, 'assets', 'nested.js')), /不是普通文件：assets\/nested\.js/);
+  refused(dir => writeFileSync(join(dir, 'assets', 'page.html'), ''), /名或类型不受支持：assets\/page\.html/);
+  refused(dir => writeFileSync(join(dir, 'assets', 'js'), ''), /名或类型不受支持：assets\/js/);
+  refused(dir => writeFileSync(join(dir, 'assets', 'x.constructor'), ''), /名或类型不受支持：assets\/x\.constructor/);
+  refused(dir => { rmSync(join(dir, 'index.html')); symlinkSync(join(dir, 'assets', 'index-a1.js'), join(dir, 'index.html')); }, /不是普通文件：index\.html/);
+});
+
+test('页面文件：仓库里的构建产物能通过同一检查', { skip: existsSync(join(WEB_DIST, 'index.html')) ? false : '未构建（pnpm build:web）' }, () => {
+  const app = loadWebApp();
+  assert.ok(app.assets.size >= 2, '至少一个脚本和一个样式');
+  assert.doesNotThrow(() => checkIndexHtml(app.index.toString('utf8')));
+});
+
+test('HTTP：构建出的页面与 /assets 须登录，页面 CSP 不放行内联脚本和样式', async () => {
+  const dir = fixture();
+  const h = createHarness();
+  bindAccounts(h.ex);
+  const server = createExecutorServer({ executor: h.ex, accessToken: 'web-access-token-0001', session: 'web-session-value-0001', app: loadWebApp(dir) });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    assert.equal((await fetch(`${base}/`)).status, 401);
+    const anonymous = await fetch(`${base}/assets/index-a1.js`);
+    assert.equal(anonymous.status, 401);
+    assert.doesNotMatch(await anonymous.text(), /console/);
+    const login = await fetch(`${base}/login?token=web-access-token-0001`, { redirect: 'manual' });
+    const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0]!;
+
+    const page = await fetch(`${base}/`, { headers: { cookie } });
+    assert.equal(page.status, 200);
+    assert.equal(await page.text(), INDEX);
+    const csp = page.headers.get('content-security-policy') ?? '';
+    assert.match(csp, /script-src 'self';/);
+    assert.match(csp, /style-src 'self';/);
+    assert.match(csp, /base-uri 'none'/);
+    assert.doesNotMatch(csp, /unsafe-inline/);
+    assert.equal(page.headers.get('cache-control'), 'no-store');
+    assert.equal(page.headers.get('x-frame-options'), 'DENY');
+
+    const script = await fetch(`${base}/assets/index-a1.js`, { headers: { cookie } });
+    assert.equal(script.status, 200);
+    assert.equal(await script.text(), 'console.info(1);');
+    assert.equal(script.headers.get('content-type'), 'text/javascript; charset=utf-8');
+    assert.equal(script.headers.get('cache-control'), 'private, max-age=31536000, immutable');
+    assert.equal(script.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal((await fetch(`${base}/assets/missing.js`, { headers: { cookie } })).status, 404);
+    assert.equal((await fetch(`${base}/assets/%2e%2e%2findex.html`, { headers: { cookie } })).status, 404);
+    assert.equal((await fetch(`${base}/assets/x/index-a1.js`, { headers: { cookie } })).status, 404);
+    assert.equal((await fetch(`${base}/assets/index-a1.js`, { method: 'POST', headers: { cookie } })).status, 404);
+    // The JSON API is unchanged.
+    assert.equal((await fetch(`${base}/api/state`, { headers: { cookie } })).status, 200);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    h.dispose();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('页面请求号：应答前重试沿用同一编号；有应答（含拒绝）或输入变化后换新编号；格式是服务端接受的 UUID', async () => {
+  const ids = new Set(Array.from({ length: 200 }, () => newRequestId()));
+  assert.equal(ids.size, 200);
+  for (const id of ids) assert.match(id, UUID);
+
+  const requests = new RequestIds();
+  const first = requests.idFor('p1:1');
+  assert.equal(requests.idFor('p1:1'), first, '没有应答时沿用');
+  assert.notEqual(requests.idFor('p1:0'), first, '另一个动作另起编号');
+  const config = requests.idFor('config:p1', '{"batchNotional":"100"}');
+  assert.notEqual(requests.idFor('config:p1', '{"batchNotional":"200"}'), config, '输入变化另起编号');
+
+  const seen: string[] = [];
+  const lost = new Error('网络中断');
+  await assert.rejects(requests.run('restart:x', '', async id => { seen.push(id); throw lost; }));
+  await assert.rejects(requests.run('restart:x', '', async id => { seen.push(id); throw Object.assign(new Error('拒绝'), { status: 409 }); }));
+  await requests.run('restart:x', '', async id => { seen.push(id); });
+  await requests.run('restart:x', '', async id => { seen.push(id); });
+  assert.equal(seen[0], seen[1], '结果未知（无状态码）后重试沿用同一编号');
+  assert.notEqual(seen[2], seen[1], '收到拒绝后下一次是新请求');
+  assert.notEqual(seen[3], seen[2], '成功后下一次是新请求');
+});
+
+test('页面请求层：网络错误、超时与读响应体时中断都不带状态码（结果未知）；拒绝带状态码；成功但响应体不可读仍算成功', async () => {
+  const original = globalThis.fetch;
+  const seen: { url: string; init: RequestInit }[] = [];
+  const reply = (handler: (init: RequestInit) => Promise<Response>) => { globalThis.fetch = (async (url: string, init: RequestInit) => { seen.push({ url, init }); return handler(init); }) as typeof fetch; };
+  const hang = (init: RequestInit) => new Promise<never>((_, reject) => init.signal!.addEventListener('abort', () => reject(init.signal!.reason)));
+  const statusOf = (error: unknown) => (error as { status?: unknown }).status;
+  try {
+    reply(async () => { throw new TypeError('Failed to fetch'); });
+    await assert.rejects(api('/api/x', { body: {} }), (error: unknown) => statusOf(error) === undefined && /Failed to fetch/.test((error as Error).message));
+
+    reply(hang);
+    await assert.rejects(api('/api/x', { body: {}, timeoutMs: 20 }), (error: unknown) => statusOf(error) === undefined && /请求超时，结果未知/.test((error as Error).message));
+
+    // Headers arrived, the body did not before the timeout.
+    reply(async init => new Response(new ReadableStream({ start(controller) { init.signal!.addEventListener('abort', () => controller.error(init.signal!.reason)); } }), { status: 200 }));
+    await assert.rejects(api('/api/x', { body: {}, timeoutMs: 20 }), (error: unknown) => statusOf(error) === undefined);
+
+    reply(async () => Response.json({ code: 'takeover_refused', message: '两侧持仓不对冲' }, { status: 409 }));
+    await assert.rejects(api('/api/x', { body: {} }), (error: unknown) => error instanceof ApiError && error.status === 409 && error.code === 'takeover_refused' && error.message === '两侧持仓不对冲');
+    reply(async () => new Response('<html>bad gateway</html>', { status: 502 }));
+    await assert.rejects(api('/api/x', { body: {} }), (error: unknown) => error instanceof ApiError && error.status === 502 && /HTTP 502/.test(error.message));
+
+    reply(async () => new Response('not json', { status: 200 }));
+    assert.deepEqual(await api('/api/x', { body: {} }), {}, '写入成功但响应体不可读仍算成功');
+    await assert.rejects(api('/api/state'), (error: unknown) => statusOf(error) === undefined && /响应无法解析/.test((error as Error).message), '读取没有结果，按读取失败处理');
+    reply(async () => Response.json({ ok: 1 }));
+    assert.deepEqual(await api('/api/state'), { ok: 1 });
+    const [write, read] = [seen.at(-3)!.init, seen.at(-1)!.init];
+    assert.equal(write.method, 'POST');
+    assert.equal((write.headers as Record<string, string>)['x-pa-executor'], '1');
+    assert.equal(read.method, undefined);
+  } finally { globalThis.fetch = original; }
+});

@@ -1,13 +1,15 @@
 {
   "name": "trading-platform",
-  "version": "0.4.4",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "description": "统一交易平台：ASTER 配对保证金平衡划转与 ADL 应急处理（第一阶段）",
   "engines": { "node": ">=24.15.0" },
   "packageManager": "pnpm@11.25.0",
   "scripts": {
-    "check": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json && tsc -p web/tsconfig.json",
+    "build:web": "vite build --config web/vite.config.ts",
+    "dev:web": "vite --config web/vite.config.ts --host 127.0.0.1",
     "test": "node --test --test-reporter=dot test/*.test.ts",
     "start": "node src/main.ts",
     "service": "node src/service/main.ts",
@@ -15,7 +17,14 @@
   },
   "devDependencies": {
     "@types/node": "24.12.0",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.2",
     "ethers": "6.17.0",
-    "typescript": "5.9.3"
+    "lucide-react": "1.31.0",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "typescript": "5.9.3",
+    "vite": "8.2.2"
   }
 }

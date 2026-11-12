@@ -7,6 +7,7 @@ import type { Executor } from './executor.ts';
 import { createExecutorServer, type ImportChannel } from './http.ts';
 import { SESSION_LIFETIME_MS, writeAccessUrl } from './data-dir.ts';
 import type { PasswordHash } from './login-password.ts';
+import type { WebApp } from './web-assets.ts';
 
 const TICK_MS = 1_000;
 const WAL_CHECK_MS = 1_000;
@@ -37,6 +38,8 @@ export interface RunOptions {
    */
   listenRetry?: { firstMs: number; maxMs: number };
   page?: string;
+  /** The built page; takes the place of page. */
+  app?: WebApp;
   /** A session (cookie value) kept across restarts, so the open page stays logged in; random per start when absent. */
   session?: string;
   imports?: ImportChannel;
@@ -59,7 +62,7 @@ export interface RunOptions {
 
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
-export function runExecutor({ executor, store, dir, port, listen, password, listenRetry = { firstMs: 2_000, maxMs: 30_000 }, page, session, imports, passes = ['jobs', 'transfers', 'adl'], startedMessage, background, onStopping, onStopped, log = line => process.stderr.write(`${line}\n`), drainMs = 0 }: RunOptions): { shutdown(reason?: string, detail?: string): Promise<void>; done: Promise<void> } {
+export function runExecutor({ executor, store, dir, port, listen, password, listenRetry = { firstMs: 2_000, maxMs: 30_000 }, page, app, session, imports, passes = ['jobs', 'transfers', 'adl'], startedMessage, background, onStopping, onStopped, log = line => process.stderr.write(`${line}\n`), drainMs = 0 }: RunOptions): { shutdown(reason?: string, detail?: string): Promise<void>; done: Promise<void> } {
   let stopping = false;
   let finished!: () => void;
   const done = new Promise<void>(resolve => { finished = resolve; });
@@ -106,7 +109,7 @@ export function runExecutor({ executor, store, dir, port, listen, password, list
     if (!stopping) { process.exitCode = 1; void shutdown(executor.retired ? 'lease-lost' : 'pass-failed', executor.retired ? '写入租约已失去' : `${label}连续失败：${last}`); }
   })();
   const accessToken = randomBytes(32).toString('base64url');
-  const server = createExecutorServer({ executor, accessToken, log, ...(listen ? { host: listen.urlHost } : {}), ...(password ? { password } : {}), ...(page ? { page } : {}), ...(session ? { session, sessionMaxAgeS: SESSION_MAX_AGE_S } : {}), ...(imports ? { imports } : {}) });
+  const server = createExecutorServer({ executor, accessToken, log, ...(listen ? { host: listen.urlHost } : {}), ...(password ? { password } : {}), ...(page ? { page } : {}), ...(app ? { app } : {}), ...(session ? { session, sessionMaxAgeS: SESSION_MAX_AGE_S } : {}), ...(imports ? { imports } : {}) });
   // The chosen address feeds the same HTTP server, so both share one session, one login throttle and one Host check.
   const extra = listen ? createNetServer(socket => { server.emit('connection', socket); }) : null;
   server.on('error', error => {

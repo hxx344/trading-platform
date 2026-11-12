@@ -23,6 +23,7 @@ const margin = (long: string, short: string, at: number): PairState => ({
   id: 'p', enabled: true, blocked: null, note: null, noteIdle: false,
   balances: { long: { available: long, receivedAt: at }, short: { available: short, receivedAt: at } }, balancesFresh: true, threshold: '1000',
 });
+const APP = { index: Buffer.from('<!doctype html><title>统一交易平台 · ASTER</title><script type="module" src="/assets/app-1.js"></script>'), assets: new Map([['app-1.js', { body: Buffer.from('void 0;'), type: 'text/javascript; charset=utf-8' }]]) };
 
 const tempDir = () => mkdtempSync(join(tmpdir(), 'tp-service-'));
 const secretsRaw = { accounts: { main: MAIN, a: LONG, b: SHORT } };
@@ -458,7 +459,7 @@ test('服务进程：本机页面只含 ASTER 部分，状态接口可读，用�
   try {
     const run = await startService({
       config: parseServiceConfig(configRaw()), secrets: { accounts: new Map([['main', MAIN], ['a', LONG], ['b', SHORT]]), feishu: null },
-      dir: join(dir, 'data'), port, fetchImpl: fake.fetch,
+      dir: join(dir, 'data'), port, fetchImpl: fake.fetch, app: APP,
       connect: url => { const socket = new FakeSocket(url); sockets.push(socket); queueMicrotask(() => socket.emit('open')); return socket; },
     });
     let link = '';
@@ -467,9 +468,7 @@ test('服务进程：本机页面只含 ASTER 部分，状态接口可读，用�
     const login = await fetch(link, { redirect: 'manual' });
     const cookie = login.headers.get('set-cookie')!.split(';')[0]!;
     const page = await (await fetch(`http://127.0.0.1:${port}/`, { headers: { cookie } })).text();
-    assert.match(page, /<title>统一交易平台 · ASTER<\/title>/);
-    assert.match(page, /const SHOW_ANT = false;/);
-    assert.doesNotMatch(page, /ANTHROPICUSDT<\/h2>/);
+    assert.equal(page, APP.index.toString('utf8'), '服务托管构建出的页面');
     const state = await (await fetch(`http://127.0.0.1:${port}/api/state`, { headers: { cookie } })).json() as { transport: string; transfers: { pairs: { id: string; enabled: boolean }[] } };
     assert.equal(state.transport, 'live');
     assert.deepEqual(state.transfers.pairs.map(pair => [pair.id, pair.enabled]), [['p1', false]]);
@@ -490,7 +489,7 @@ test('服务进程：没有配对也启动，页面导入接口可用；重启�
   const { mkdirSync, readFileSync, rmSync: remove } = await import('node:fs');
   const importDir = join(dir, 'import');
   mkdirSync(importDir);
-  const start = () => startService({ config: parseServiceConfig(configRaw([])), secrets: { accounts: new Map(), feishu: null }, dir: join(dir, 'data'), port, fetchImpl: fake.fetch, importDir });
+  const start = () => startService({ config: parseServiceConfig(configRaw([])), secrets: { accounts: new Map(), feishu: null }, dir: join(dir, 'data'), port, fetchImpl: fake.fetch, importDir, app: APP });
   const link = async () => {
     let value = '';
     for (let i = 0; i < 100 && !value; i++) { try { value = readFileSync(join(dir, 'data', 'access-url'), 'utf8').trim(); } catch { await new Promise(resolve => setTimeout(resolve, 20)); } }

@@ -13,9 +13,12 @@
 
 ```bash
 pnpm install
-pnpm check   # 类型检查
-pnpm test    # 全部离线测试，不连任何交易所
+pnpm check       # 类型检查（服务端与页面）
+pnpm build:web   # 构建服务页面到 web/dist（发布包与服务启动都需要）
+pnpm test        # 全部离线测试，不连任何交易所
 ```
+
+页面开发：服务照常运行（默认 http://127.0.0.1:4720），另开 `pnpm dev:web`，打开 http://127.0.0.1:5173 先登录，`/api` 由开发服务器转发（目标用 `TP_DEV_TARGET` 改）。页面源码在 `web/src`，规划见 [docs/frontend.md](docs/frontend.md)。
 
 本地模拟运行（只用模拟交易所）：`node src/main.ts --data-dir ./.data --port 4711`，浏览器打开 `http://127.0.0.1:4711`。
 

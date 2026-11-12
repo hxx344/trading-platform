@@ -17,10 +17,13 @@ run() { bash "$install_sh" "$@" >"$tmp/out" 2>&1; }
 bash "$root/deploy/package.sh" "$tmp/a" >/dev/null
 bash "$root/deploy/package.sh" "$tmp/a2" >/dev/null
 check '同一源码打出的包校验和相同' 'cmp -s "$tmp/a/SHA256SUMS" "$tmp/a2/SHA256SUMS"'
+tar -tzf "$tmp/a/trading-platform.tar.gz" >"$tmp/a.list"
+check '发布包含构建好的页面' 'grep -q "/web/dist/index.html$" "$tmp/a.list" && grep -q "/web/dist/assets/.*\.js$" "$tmp/a.list"'
 
 # A second package with different contents, for the upgrade.
 mkdir -p "$tmp/src-b/deploy"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-b/"
+mkdir -p "$tmp/src-b/web" && cp -R "$root/web/dist" "$tmp/src-b/web/"
 cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-b/deploy/"
 printf '\n升级测试\n' >>"$tmp/src-b/README.md"
 bash "$tmp/src-b/deploy/package.sh" "$tmp/b" >/dev/null
@@ -49,6 +52,7 @@ chmod 644 "$TP_CONF_DIR/config.json" "$TP_CONF_DIR/secrets.json"
 run --package "$tmp/a" && status=0 || status=$?
 check '写好配置后执行成功' '[[ $status -eq 0 ]]'
 check '配置经新程序校验' 'grep -q "配置有效：1 个配对（pair-1），3 个账户，端口 4720，飞书未配置" "$tmp/out"'
+check '配置检查同时载入页面' 'grep -Eq "页面 [1-9][0-9]* 个文件" "$tmp/out"'
 check '配置与密钥改为 600' '[[ "$(stat -c %a "$TP_CONF_DIR/config.json")" == 600 && "$(stat -c %a "$TP_CONF_DIR/secrets.json")" == 600 ]]'
 check '输出 SSH 隧道说明' 'grep -q "ssh -N -L 4720:127.0.0.1:4720" "$tmp/out"'
 
@@ -97,6 +101,7 @@ mkdir -p "$tmp/wb/data/modules/aster"
 # A program whose config check fails: the imported files are put back, the old release stays current.
 mkdir -p "$tmp/src-c/deploy"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-c/"
+mkdir -p "$tmp/src-c/web" && cp -R "$root/web/dist" "$tmp/src-c/web/"
 cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-c/deploy/"
 sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { throw new Error('测试：配置检查失败');|" "$tmp/src-c/src/service/main.ts"
 bash "$tmp/src-c/deploy/package.sh" "$tmp/c" >/dev/null
@@ -108,6 +113,7 @@ check '导入后检查失败时仍是原版本' '[[ "$(readlink -f "$TP_APP_DIR/
 # Stopped by a signal while the new program checks the imported files: they are put back all the same.
 mkdir -p "$tmp/src-d/deploy"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-d/"
+mkdir -p "$tmp/src-d/web" && cp -R "$root/web/dist" "$tmp/src-d/web/"
 cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-d/deploy/"
 sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { (await import('node:fs')).writeFileSync(process.env.TP_TEST_MARK, ''); await new Promise(resolve => setTimeout(resolve, 1500));|" "$tmp/src-d/src/service/main.ts"
 bash "$tmp/src-d/deploy/package.sh" "$tmp/d" >/dev/null

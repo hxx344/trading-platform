@@ -10,8 +10,11 @@ commit=$(git -C "$root" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 pkg="$stage/trading-platform"
-mkdir -p "$pkg/deploy" "$out"
+# The page is built beforehand (pnpm build:web); a package without it would fail its config check on the server.
+[[ -f "$root/web/dist/index.html" ]] || { echo "缺少 web/dist/index.html：先运行 pnpm build:web" >&2; exit 1; }
+mkdir -p "$pkg/deploy" "$pkg/web" "$out"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$pkg/"
+cp -R "$root/web/dist" "$pkg/web/"
 cp "$root/deploy/trading-platform.service" "$root/deploy/trading-platform-import.service" "$root/deploy/trading-platform-import.path" "$root/deploy/config.example.json" "$root/deploy/secrets.example.json" "$pkg/deploy/"
 printf 'v%s %s\n' "$version" "$commit" >"$pkg/VERSION"
 tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner --mode='u+rwX,go+rX,go-w' -C "$stage" -cf - trading-platform \

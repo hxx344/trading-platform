@@ -8,6 +8,7 @@ import { ContractError, VENUES, exactKeys, type Venue } from './contracts.ts';
 import type { Executor } from './executor.ts';
 import { LIVE_PAGE, PAGE } from './page.ts';
 import { LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash } from './login-password.ts';
+import type { WebApp } from './web-assets.ts';
 
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_LOGIN_BYTES = 4 * 1024;
@@ -22,6 +23,14 @@ const PAGE_HEADERS = {
   'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer',
   'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'",
 };
+// The built page (the ASTER service): its script and style come from /assets only, nothing inline runs.
+const APP_HEADERS = {
+  ...PAGE_HEADERS,
+  'content-security-policy': "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+};
+// Names carry a content hash, so a cached copy never goes stale; private, since only a logged-in browser fetches them.
+const ASSET_HEADERS = { 'cache-control': 'private, max-age=31536000, immutable', 'x-content-type-options': 'nosniff', 'cross-origin-resource-policy': 'same-origin' };
+const ASSET_PATH = /^\/assets\/([^/]{1,128})$/;
 const LOGIN_REQUIRED = '<!doctype html><meta charset="utf-8"><title>需要登录</title><p>请使用数据目录 access-url 中的登录链接打开（用 sudo bash install.sh --set-password 设置登录密码后可直接输入密码）。</p>';
 const loginForm = (notice: string): string => '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>登录</title>'
   + '<style>body{font:15px/1.5 system-ui,sans-serif;max-width:22rem;margin:4rem auto;padding:0 1rem}input,button{font:inherit;padding:.45rem .6rem;width:100%;box-sizing:border-box;margin:.3rem 0}.notice{color:#b42318}</style>'
@@ -43,6 +52,8 @@ export interface HttpOptions {
   sessionMaxAgeS?: number;
   /** Page served at /; defaults by environment. */
   page?: string;
+  /** The built page with its files under /assets; takes the place of page. */
+  app?: WebApp;
   imports?: ImportChannel;
   /** The login password's digest; without one only the access token logs in. */
   password?: PasswordHash;
@@ -57,7 +68,7 @@ export interface HttpOptions {
 const sameSecret = (given: string, expected: string): boolean =>
   timingSafeEqual(createHash('sha256').update(given).digest(), createHash('sha256').update(expected).digest());
 
-export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, imports, password, host, throttle = new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
+export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, app, imports, password, host, throttle = new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
   if (!accessToken) throw new Error('需要访问令牌');
   if (sameSecret(session, accessToken)) throw new Error('会话值不能与访问令牌相同');
   // The executor records which session asked for each command; it gets a digest, so the stored rows never hold the cookie.
@@ -163,8 +174,18 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     }
     if (request.method === 'GET' && url.pathname === '/') {
       if (!authorized(request)) return loginPage(response, 401);
+      if (app) { response.writeHead(200, APP_HEADERS); response.end(app.index); return; }
       response.writeHead(200, PAGE_HEADERS);
       response.end(page ?? (executor.environment === 'mainnet' ? LIVE_PAGE : PAGE));
+      return;
+    }
+    const assetPath = app && request.method === 'GET' ? ASSET_PATH.exec(url.pathname) : null;
+    if (assetPath) {
+      if (!authorized(request)) return send(response, 401, { code: 'session', message: '需要登录' });
+      const asset = app!.assets.get(assetPath[1]!);
+      if (!asset) return send(response, 404, { code: 'not_found', message: '不存在' });
+      response.writeHead(200, { ...ASSET_HEADERS, 'content-type': asset.type, 'content-length': String(asset.body.length) });
+      response.end(asset.body);
       return;
     }
     if (!url.pathname.startsWith('/api/')) return send(response, 404, { code: 'not_found', message: '不存在' });

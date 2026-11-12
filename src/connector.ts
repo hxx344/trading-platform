@@ -189,7 +189,7 @@ export const supportsChase = (connector: VenueConnector): connector is ChaseConn
 
 // ---- transfers --------------------------------------------------------------
 export interface TransferCapabilities {
-  transport: 'simulated';
+  transport: 'simulated' | 'live';
   /** The transfer endpoint takes no client id and no idempotency token: a send without a usable answer can never be retried or queried by identity. */
   clientTransferId: false;
   /** After this long past the send attempt the venue no longer accepts the signed request (nonce window plus clock skew). */

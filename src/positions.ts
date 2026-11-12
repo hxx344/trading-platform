@@ -28,7 +28,7 @@ export const MAX_ANSWER_ROWS = 10_000;
 /** Every call is made with the named sub-account's own read authority. */
 export interface AsterPositionsConnector {
   readonly venue: 'aster';
-  readonly capabilities: { transport: 'simulated' };
+  readonly capabilities: { transport: 'simulated' | 'live' };
   /** All position rows of the sub-account, zero rows allowed. */
   positions(accountId: string, options: CallOptions): Promise<unknown>;
 }

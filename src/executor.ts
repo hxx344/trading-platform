@@ -269,9 +269,11 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (venues.has(connector.venue)) throw new ContractError(500, 'duplicate_connector', `重复的 ${connector.venue} 连接器`);
     venues.set(connector.venue, connector);
   }
-  if (transferConnector && (transferConnector.capabilities.transport !== 'simulated' || environment !== 'simulated')) throw new ContractError(500, 'live_transport_refused', 'ASTER 划转、ADL 与持仓展示只接模拟传输（实盘留到阶段 3.3）');
-  if (adlConnector && (adlConnector.capabilities.transport !== 'simulated' || environment !== 'simulated')) throw new ContractError(500, 'live_transport_refused', 'ASTER 划转、ADL 与持仓展示只接模拟传输（实盘留到阶段 3.3）');
-  if (positionsConnector && (positionsConnector.capabilities.transport !== 'simulated' || environment !== 'simulated')) throw new ContractError(500, 'live_transport_refused', 'ASTER 划转、ADL 与持仓展示只接模拟传输（实盘留到阶段 3.3）');
+  // Same rule as the order venues: the mainnet reaches only the real ASTER connectors, a simulation only simulated ones.
+  const asterTransport = environment === 'mainnet' ? 'live' : 'simulated';
+  for (const [name, connector] of [['划转', transferConnector], ['ADL', adlConnector], ['持仓展示', positionsConnector]] as const) {
+    if (connector && connector.capabilities.transport !== asterTransport) throw new ContractError(500, 'live_transport_refused', environment === 'mainnet' ? `实盘环境的 ASTER ${name}只接受真实连接器` : `模拟环境的 ASTER ${name}只接受模拟传输`);
+  }
   const db = store.db;
   const owner = randomUUID();
   let generation = 0, held = false, retired = false, closed = false, heldSince = 0;

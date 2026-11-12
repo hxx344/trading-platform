@@ -149,7 +149,7 @@ export const evidenceDirection = (row: Pick<AdlEvidenceRow, 'side'>): Direction 
 
 // ---- connector -------------------------------------------------------------------
 export interface AdlCapabilities {
-  transport: 'simulated';
+  transport: 'simulated' | 'live';
   /** The force-order history answers at most this many rows per page; a full page proves nothing about coverage. */
   historyPageLimit: number;
 }

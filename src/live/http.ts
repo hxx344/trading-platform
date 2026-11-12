@@ -7,7 +7,7 @@ export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 
 export const MAX_BODY_BYTES = 2 * 1024 * 1024;
 /** Venue ids are 64-bit integers on the wire; they are kept as their exact digits, never as a rounded double. */
-const ID_KEYS = new Set(['orderId', 'algoId', 'uid', 'userID', 'lastUpdateId']);
+const ID_KEYS = new Set(['orderId', 'algoId', 'uid', 'userID', 'lastUpdateId', 'tranId', 'accountId']);
 function idReviver(key: string, value: unknown, context?: { source?: string }): unknown {
   if (!ID_KEYS.has(key) || typeof value !== 'number') return value;
   if (context?.source !== undefined && /^\d{1,30}$/.test(context.source)) return context.source;
@@ -17,7 +17,7 @@ function idReviver(key: string, value: unknown, context?: { source?: string }): 
 
 export interface HttpRequest {
   url: string;
-  method: 'GET' | 'POST' | 'DELETE';
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE';
   headers?: Record<string, string>;
   body?: string;
   maxBytes?: number;

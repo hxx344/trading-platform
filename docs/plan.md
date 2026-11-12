@@ -75,7 +75,7 @@ trading-platform/
 | 步 | 内容 | 验证 |
 | --- | --- | --- |
 | 0 | 建仓：执行器与探测脚本迁入，去掉工作台路径依赖，原有测试全绿 | `pnpm check`、`pnpm test` |
-| 1 | 真实 ASTER 连接器：签名、请求预算、`TransferConnector`、`AdlConnector`、持仓；用户推送 | 替身 ASTER 服务器上的契约测试；签名与 Python `eth_account` 交叉向量；与 Python 结果分类逐项对照 |
+| 1 | 真实 ASTER 连接器：签名、请求预算、`TransferConnector`、`AdlConnector`、持仓（已完成：`src/aster/`）；用户推送的 WebSocket 连接放到第 2 步，连接器已提供 `push()` 入口 | 替身 ASTER 服务器上的契约测试；签名与 Python `eth_account` 交叉向量；与 Python 结果分类逐项对照 |
 | 2 | 服务入口：配置与密钥、启用检查、绝对保留额、飞书发件箱、页面启停 | 端到端：替身 ASTER 上跑完划转、未知结清、ADL 发现到完成、重启接管 |
 | 3 | 部署：`deploy/install.sh`（root 运行、幂等、无变化快速结束、保留配置和数据）、systemd 单元、CI、发布流程（tag → GitHub Release 包） | CI 绿；本机以非 root 跑安装器的检查路径 |
 | 4 | 独立审查（R3），修完 P0/P1 后发布 v0.1.0 | 审查记录在 `docs/reviews/` |
@@ -83,7 +83,14 @@ trading-platform/
 
 ## 6 尚待实测（接真实账户时确认）
 
+- 子账户列表行是否带钱包地址（2.6b 实测能核实归属，但未记录字段）；不带时按各子账户自己的 `accountId` 对应。
+- `positionRisk` 的零仓位行是否带 `updateTime`（缺失时按 0 处理，执行器视为未证明已反映）。
+
 - nonce 有效窗口按 120 s 计（ASTER 文档 ±60 s，未实测）。
 - ADL 减仓单回报的 `updateTime` 是否不晚于持仓 `updateTime`（若晚于，每批多等 120 s）。
 - `forceOrders` 查询跨度上限。
 - 高负载下流水入账延迟（2.6b 实测 50–206 ms，仅 2 个样本）。
+
+## 7 已知限制
+
+- EIP-712 签名（`src/aster/eip712.ts`）是本仓库的零依赖实现，已与 ethers 及 Python `eth_account` 逐字节对照，并在 2.6b 真实划转中用过；它不是常量时间实现（私钥只在本机签名，远端观察不到时序）。以后如引入运行时依赖，换成经过审计的库（如 `@noble/curves`）。

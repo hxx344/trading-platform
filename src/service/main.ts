@@ -75,12 +75,25 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
       await executor.setTransferEnabled({ pairId: pair.id, enabled: false, requestId: randomUUID() }, CONFIG_SESSION);
       log(`配对 ${pair.id} 已不在配置中，已停用`);
     }
+    const known = new Set(executor.transferPairs().map(pair => pair.id));
     for (const pair of config.pairs) {
       // A new pair starts switched off; changing its accounts switches it off; changed settings apply at once.
-      try { executor.registerTransferPair({ id: pair.id, mainAccountId: address(pair.main), long: address(pair.long), short: address(pair.short), config: pair.transfer }); }
-      catch (error) {
+      // Its ADL settings from the config are only a starting value: after the first registration the page owns them.
+      try {
+        executor.registerTransferPair({ id: pair.id, mainAccountId: address(pair.main), long: address(pair.long), short: address(pair.short), config: pair.transfer });
+      } catch (error) {
         const text = `配对 ${pair.id} 登记失败，保持原记录：${error instanceof Error ? error.message : String(error)}`;
         log(text); warnings.push(text);
+        continue;
+      }
+      // The workbench's settings may have turned automatic reduction off; a pair already known keeps the page's.
+      if (pair.adl && !known.has(pair.id)) {
+        try { executor.setAdlConfig({ pairId: pair.id, requestId: randomUUID(), ...pair.adl }, CONFIG_SESSION); }
+        catch (error) {
+          // Not retried at the next start (the pair is known by then), so the operator sets it in the page.
+          const text = `配对 ${pair.id} 已登记，但配置里的 ADL 初始值未写入（${error instanceof Error ? error.message : String(error)}），当前为自动减仓开、单批 1000；请在页面设置`;
+          log(text); warnings.push(text);
+        }
       }
     }
   } catch (error) { executor.close(); throw error; }

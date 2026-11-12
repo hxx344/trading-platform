@@ -4,6 +4,8 @@
 #   curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/install.sh && sudo bash install.sh
 #   sudo bash install.sh --version v0.1.0     安装指定版本（也用于回退）
 #   sudo bash install.sh --package <目录>     从本地目录安装（含 trading-platform.tar.gz 与 SHA256SUMS）
+#   sudo bash install.sh --import-workbench   从本机工作台导入已开启保证金平衡的配对与凭据并启动（可加 --pairs id,id 只导入指定配对，
+#                                             --workbench-data <目录> 指定工作台数据目录）；已有配置只追加新配对，导入的配对登记为停用
 #
 # 首次安装只放好程序和示例配置；按示例写好 /etc/trading-platform/config.json 与 secrets.json 后再执行一次即启动。
 # 之后每次执行：先只下载校验清单，程序包、Node.js、systemd 单元、配置都没变且服务在运行时直接结束；
@@ -24,16 +26,35 @@ UNIT_FILE=${TP_UNIT_FILE:-/etc/systemd/system/$SERVICE.service}
 RELEASE_BASE=${TP_RELEASE_BASE:-https://github.com/$REPO/releases}
 # 测试模式：不要求 root、不建系统账号、不改属主、不调用 systemctl；只用于仓库自带的安装测试。
 TEST_MODE=${TP_TEST_MODE:-0}
+WORKBENCH_ENV=${TP_WORKBENCH_ENV:-/etc/project-aggregation.env}
 
 log() { printf '%s\n' "$*"; }
 join() { local out='' item; for item in "$@"; do out+="${out:+、}$item"; done; printf '%s' "$out"; }
-fail() { printf '安装失败：%s\n' "$*" >&2; exit 1; }
-usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+fail() { restore_import; printf '安装失败：%s\n' "$*" >&2; exit 1; }
+# Set while config.json and its key file hold what an import wrote and the service has not run on them yet: any failure
+# from then on puts the files back as they were, so neither the old program nor a rollback is left with them.
+import_backup=''
+restore_import() {
+  [[ -n "$import_backup" ]] || return 0
+  local name
+  while IFS= read -r name; do
+    if [[ -f "$import_backup/$name" ]]; then cp -p "$import_backup/$name" "$CONF_DIR/$name"; else rm -f "$CONF_DIR/$name"; fi
+  done <"$import_backup/.files"
+  import_backup=''
+  log '已恢复导入前的配置文件。'
+}
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 version=''
 package_dir=''
+import_workbench=0
+workbench_data=''
+import_pairs=''
 while (($#)); do
   case "$1" in
+    --import-workbench) import_workbench=1; shift ;;
+    --workbench-data) [[ $# -ge 2 ]] || usage 2; workbench_data=$2; shift 2 ;;
+    --pairs) [[ $# -ge 2 ]] || usage 2; import_pairs=$2; shift 2 ;;
     --version) [[ $# -ge 2 ]] || usage 2; version=$2; shift 2 ;;
     --package) [[ $# -ge 2 ]] || usage 2; package_dir=$2; shift 2 ;;
     -h|--help) usage 0 ;;
@@ -42,6 +63,7 @@ while (($#)); do
 done
 [[ -z "$version" || "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail '--version 须形如 v0.1.0'
 [[ -z "$version" || -z "$package_dir" ]] || fail '--version 与 --package 只能二选一'
+((import_workbench)) || [[ -z "$workbench_data$import_pairs" ]] || fail '--workbench-data 与 --pairs 须和 --import-workbench 一起使用'
 
 [[ "$(uname -s)" == Linux ]] || fail '只支持 Linux。'
 if [[ "$TEST_MODE" != 1 ]]; then
@@ -66,7 +88,8 @@ as_root_dir "$APP_DIR" 755
 exec 9>"$APP_DIR/.install.lock"
 flock -n 9 || fail '另一个安装进程正在运行。'
 work_dir=$(mktemp -d)
-trap 'rm -rf "$work_dir"' EXIT
+# An exit that bypasses fail (set -e, Ctrl-C) still puts imported files back before the backup goes with work_dir.
+trap 'rc=$?; ((rc == 0)) || restore_import; rm -rf "$work_dir"' EXIT
 
 # ---- 1. 校验清单与程序包 ----------------------------------------------------------
 if [[ -n "$package_dir" ]]; then
@@ -152,6 +175,27 @@ for name in config secrets; do
   example="$release_dir/deploy/$name.example.json"
   if ! cmp -s "$example" "$CONF_DIR/$name.example.json"; then install -m 644 "$example" "$CONF_DIR/$name.example.json"; fi
 done
+# Run as root: it reads the workbench's database and environment, and writes both files as root 600; the takeover
+# below then hands them to the service account. A failed import writes nothing and stops the install.
+if ((import_workbench)); then
+  [[ -f "$release_dir/src/service/import-workbench.ts" ]] || fail "版本 $new_version 不支持 --import-workbench，请用最新版本导入"
+  # The files the import may write: config.json and the key file it names (always in this directory).
+  mkdir "$work_dir/conf-before"
+  {
+    printf '%s\n' config.json secrets.json
+    if [[ -f "$CONF_DIR/config.json" ]]; then
+      "$NODE_BIN" -e 'try { const v = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).secretsFile; const p = require("path"); if (typeof v === "string" && p.dirname(p.resolve(v)) === p.resolve(process.argv[2])) process.stdout.write(p.basename(v) + "\n"); } catch {}' "$CONF_DIR/config.json" "$CONF_DIR"
+    fi
+  } | sort -u >"$work_dir/conf-before/.files"
+  while IFS= read -r name; do
+    if [[ -f "$CONF_DIR/$name" ]]; then cp -p "$CONF_DIR/$name" "$work_dir/conf-before/$name"; fi
+  done <"$work_dir/conf-before/.files"
+  import_backup="$work_dir/conf-before"
+  import_args=(--config "$CONF_DIR/config.json" --workbench-env "$WORKBENCH_ENV")
+  [[ -z "$workbench_data" ]] || import_args+=(--workbench-data "$workbench_data")
+  [[ -z "$import_pairs" ]] || import_args+=(--pairs "$import_pairs")
+  (cd / && "$NODE_BIN" "$release_dir/src/service/import-workbench.ts" "${import_args[@]}") || fail '从工作台导入配置失败'
+fi
 configured=0
 if [[ -f "$CONF_DIR/config.json" ]]; then
   configured=1
@@ -261,6 +305,13 @@ else
       changes+=("服务已$([[ $action == start ]] && echo 启动 || echo 重启)")
     else
       log '服务没有正常启动，最近日志：'; journal_tail
+      imported=0
+      if [[ -n "$import_backup" ]]; then restore_import; imported=1; fi
+      # A first setup by import leaves no config once undone: nothing to run, so the unit is not left to fail at boot.
+      if ((imported)) && [[ ! -f "$CONF_DIR/config.json" ]]; then
+        systemctl disable --now --quiet "$SERVICE" 2>/dev/null || true
+        fail '导入的配置启动失败，已撤销导入（尚无 config.json），服务已停止并取消开机自启；请按上面的日志处理后重新执行本脚本'
+      fi
       if ((program_changed)) && [[ -n "$previous_dir" && -d "$previous_dir" ]]; then
         previous_version=$(head -n1 "$previous_dir/VERSION" 2>/dev/null || echo 上一版本)
         switch_to "$previous_dir"
@@ -276,10 +327,19 @@ else
         log '回退后服务仍未正常运行，最近日志：'; journal_tail
         fail "新版本 $new_version 启动失败，已切回 $previous_version，但服务仍未正常运行；请按日志处理后重新执行本脚本"
       fi
+      if ((imported)); then
+        marker=$(date +%s)
+        systemctl reset-failed "$SERVICE" 2>/dev/null || true
+        if systemctl restart "$SERVICE" && healthy "$marker"; then fail '导入的配置启动失败，已恢复导入前的配置并确认服务运行正常；请按上面的日志处理'; fi
+        fail '导入的配置启动失败，已恢复导入前的配置，但服务仍未正常运行；请按日志处理后重新执行本脚本'
+      fi
       fail '服务启动失败；请按上面的日志检查配置后重新执行本脚本'
     fi
   fi
 fi
+
+# The service runs on the imported files (or, in test mode, they passed the check): nothing to put back any more.
+import_backup=''
 
 # ---- 7. 清理旧版本 -------------------------------------------------------------------
 current_dir=$(readlink -f "$APP_DIR/current")

@@ -193,6 +193,8 @@ export interface AdlDeps {
   isWriterLost(error: unknown): boolean;
   /** Current, readable margin-balance pairs. */
   pairs(): PairRecord[];
+  /** Pairs whose ADL settings may be changed (default: `pairs`); a pair outside `pairs` keeps them but is not watched. */
+  configurablePairs?(): PairRecord[];
   /** True while a margin transfer of the pair is being sent; no batch is sent meanwhile (one pair, one lock, as in the legacy system). */
   transferSending?(pairId: string): boolean;
 }
@@ -225,7 +227,7 @@ export function adlRegistryOutcome(state: BatchState): 'confirmed' | 'rejected' 
   return null;
 }
 
-export function createAdl({ db, now, budgets, connector, control, write, assertWriter, callVenue, event, isWriterLost, pairs, transferSending }: AdlDeps) {
+export function createAdl({ db, now, budgets, connector, control, write, assertWriter, callVenue, event, isWriterLost, pairs, configurablePairs = pairs, transferSending }: AdlDeps) {
   checkBudgets(budgets, connector);
   const tolerance = budgets.futureToleranceMs;
   /** Batches whose send or cancel runs in this process; any other prepared or sending row was interrupted. */
@@ -1038,7 +1040,7 @@ export function createAdl({ db, now, budgets, connector, control, write, assertW
     const config = parseAdlConfig({ autoReduce: raw.autoReduce, batchNotional: raw.batchNotional });
     const payload = digest({ kind: 'adl-config', pairId, config });
     return write(() => {
-      const pair = pairs().find(item => item.id === pairId) ?? reject('pair_missing', '划转配对不存在', 404);
+      const pair = configurablePairs().find(item => item.id === pairId) ?? reject('pair_missing', '划转配对不存在', 404);
       if (!commandReplayed(requestId, payload, session)) {
         const record = installPair(pair);
         db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(requestId, 'adl-config', payload, session, pairId, now());

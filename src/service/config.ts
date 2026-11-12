@@ -5,6 +5,7 @@ import { isAbsolute } from 'node:path';
 import { ContractError, PAIR_ID, exactKeys, integer, parseTransferConfig, type TransferConfig } from '../contracts.ts';
 import { IP_CEILING, parseAsterCredentials, type AsterCredentials } from '../aster/client.ts';
 import { DEFAULT_ADL_BUDGETS } from '../adl.ts';
+import { parseAdlConfig, type AdlConfig } from '../adl-contracts.ts';
 import { DEFAULT_POSITIONS_BUDGETS } from '../positions.ts';
 import { parsePrivateJson, readPrivateFile } from '../live/setup.ts';
 
@@ -13,7 +14,8 @@ const FEISHU_HOOK = /^https:\/\/open\.(feishu\.cn|larksuite\.com)\/open-apis\/bo
 export const DEFAULT_PORT = 4720;
 export const MAX_PAIRS = 20;
 
-export interface ServicePair { id: string; main: string; long: string; short: string; transfer: TransferConfig }
+/** `adl` seeds the pair's ADL settings when it is first registered; afterwards the page owns them. */
+export interface ServicePair { id: string; main: string; long: string; short: string; transfer: TransferConfig; adl?: AdlConfig }
 export interface ServiceConfig {
   port: number;
   budget: { limitPerMinute: number; adlReserve: number };
@@ -40,13 +42,16 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   const budgetRaw = exactKeys(value.budget ?? {}, [], ['limitPerMinute', 'adlReserve']);
   if (!Array.isArray(value.pairs) || value.pairs.length < 1 || value.pairs.length > MAX_PAIRS) throw new Error(`pairs 须列出 1–${MAX_PAIRS} 个配对`);
   const pairs = value.pairs.map((item, index) => {
-    const pair = exactKeys(item, ['id', 'main', 'long', 'short'], ['transfer']);
+    const pair = exactKeys(item, ['id', 'main', 'long', 'short'], ['transfer', 'adl']);
     const name = (key: 'main' | 'long' | 'short'): string => {
       if (typeof pair[key] !== 'string' || !ACCOUNT_NAME.test(pair[key])) throw new Error(`第 ${index + 1} 个配对的 ${key} 须为账户名（字母、数字、_ 或 -）`);
       return pair[key];
     };
     if (typeof pair.id !== 'string' || !PAIR_ID.test(pair.id)) throw new Error(`第 ${index + 1} 个配对的 id 无效`);
     const result: ServicePair = { id: pair.id, main: name('main'), long: name('long'), short: name('short'), transfer: parseTransferConfig(pair.transfer) };
+    if (pair.adl !== undefined) {
+      try { result.adl = parseAdlConfig(pair.adl); } catch (error) { throw new Error(`配对 ${result.id} 的 adl 无效：${error instanceof Error ? error.message : '格式错误'}`); }
+    }
     if (new Set([result.main, result.long, result.short]).size !== 3) throw new Error(`配对 ${result.id} 的主账户、多侧与空侧须是三个不同的账户`);
     return result;
   });

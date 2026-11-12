@@ -429,6 +429,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     ...(adlOnlyEnabledPairs ? { onEnabled: (pair: PairRecord, from: number) => adl.watchFrom(pair, from) } : {}) });
   const adl: Adl = createAdl({ db, now, budgets, connector: adlConnector ?? null, control, write, assertWriter: assertSendable, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
     pairs: adlOnlyEnabledPairs ? () => transfers.records().filter(pair => pair.enabled || adl.busy(pair.id) !== null) : transfers.records,
+    // A pair switched off can still be given its ADL settings (the config's starting value) before it is taken over.
+    configurablePairs: transfers.records,
     transferSending: pairId => transfers.sending(pairId) });
   const positions = createPositions({ connector: positionsConnector ?? null, now, budgets, pairs: transfers.records, callVenue });
   const readFailure = (error: unknown): never => {

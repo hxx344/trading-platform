@@ -74,6 +74,43 @@ run --package "$tmp/a" && status=0 || status=$?
 check '目录外的密钥文件不改权限' '[[ "$(stat -c %a "$tmp/outside/secrets.json")" == 640 ]] && grep -q "未调整属主与权限" "$tmp/out"'
 sed -i "s|$tmp/outside/secrets.json|$TP_CONF_DIR/secrets.json|" "$TP_CONF_DIR/config.json"
 
+# Importing from a workbench on the same machine: its enabled pair is added beside pair-1, the main account is
+# matched to the existing entry by wallet, and the result passes the new program's config check.
+mkdir -p "$tmp/wb/data/modules/aster"
+(cd "$root" && node --input-type=module -e '
+  const { DatabaseSync } = await import("node:sqlite");
+  const { addressOf } = await import("./src/aster/eip712.ts");
+  const { MAIN } = await import("./test/aster-fake.ts");
+  const [dir] = process.argv.slice(1);
+  const wallet = (user, byte) => { const privateKey = "0x" + byte.repeat(32); return { user, signer: addressOf(privateKey), privateKey }; };
+  const db = new DatabaseSync(dir + "/data/modules/aster/trading.sqlite3");
+  db.exec("CREATE TABLE accounts (id TEXT PRIMARY KEY, data TEXT NOT NULL); CREATE TABLE pairs (id TEXT PRIMARY KEY, data TEXT NOT NULL)");
+  for (const [id, prefix] of [["l9", "WB_L9"], ["s9", "WB_S9"]]) db.prepare("INSERT INTO accounts VALUES (?, ?)").run(id, JSON.stringify({ id, name: id, mode: "live", env_prefix: prefix, enabled: false }));
+  db.prepare("INSERT INTO pairs VALUES (?, ?)").run("wb-gold", JSON.stringify({ id: "wb-gold", name: "gold", long_account_id: "l9", short_account_id: "s9", margin: { enabled: true, master_env_prefix: "WB_MAIN" } }));
+  db.close();
+  const line = (prefix, w) => `${prefix}_USER=${w.user}\n${prefix}_SIGNER=${w.signer}\n${prefix}_PRIVATE_KEY=${w.privateKey}\n`;
+  process.stdout.write(`DATA_DIR=${dir}/data\n` + line("WB_MAIN", MAIN) + line("WB_L9", wallet("0x" + "4d".repeat(20), "24")) + line("WB_S9", wallet("0x" + "5e".repeat(20), "25")));
+' "$tmp/wb") >"$tmp/wb/workbench.env"
+# A program whose config check fails: the imported files are put back, the old release stays current.
+mkdir -p "$tmp/src-c/deploy"
+cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-c/"
+cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,config.example.json,secrets.example.json} "$tmp/src-c/deploy/"
+sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { throw new Error('测试：配置检查失败');|" "$tmp/src-c/src/service/main.ts"
+bash "$tmp/src-c/deploy/package.sh" "$tmp/c" >/dev/null
+cp -p "$TP_CONF_DIR/config.json" "$tmp/config.before"; cp -p "$TP_CONF_DIR/secrets.json" "$tmp/secrets.before"
+current_before=$(readlink -f "$TP_APP_DIR/current")
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/c" --import-workbench && status=0 || status=$?
+check '导入后检查失败时恢复导入前的配置' '[[ $status -ne 0 ]] && grep -q "导入配对 wb-gold" "$tmp/out" && grep -q "已恢复导入前的配置文件" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json" && cmp -s "$tmp/secrets.before" "$TP_CONF_DIR/secrets.json" && [[ "$(stat -c %a "$TP_CONF_DIR/secrets.json")" == 600 ]]'
+check '导入后检查失败时仍是原版本' '[[ "$(readlink -f "$TP_APP_DIR/current")" == "$current_before" ]]'
+
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench && status=0 || status=$?
+check '从工作台导入并通过配置检查' '[[ $status -eq 0 ]] && grep -q "导入配对 wb-gold（gold）" "$tmp/out" && grep -q "配置有效：2 个配对（pair-1、wb-gold），5 个账户" "$tmp/out"'
+check '导入后配置与密钥仍为 600' '[[ "$(stat -c %a "$TP_CONF_DIR/config.json")" == 600 && "$(stat -c %a "$TP_CONF_DIR/secrets.json")" == 600 ]] && grep -q "\"main\": \"main\"" "$TP_CONF_DIR/config.json"'
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench && status=0 || status=$?
+check '重复导入不改动配置' '[[ $status -eq 0 ]] && grep -q "没有新的配对，配置未改动" "$tmp/out" && grep -q "无变化" "$tmp/out"'
+run --package "$tmp/a" --pairs wb-gold && status=0 || status=$?
+check '--pairs 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -q "须和 --import-workbench 一起使用" "$tmp/out"'
+
 # No current link (data and config left from an earlier install): installs and points current at the release.
 rm "$TP_APP_DIR/current"
 run --package "$tmp/b" && status=0 || status=$?

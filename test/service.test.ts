@@ -394,3 +394,22 @@ test('服务进程：本机页面只含 ASTER 部分，状态接口可读，用�
     assert.ok(sockets.every(socket => socket.closed));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('服务装配：配置里的 ADL 设置只在配对首次登记时作为初始值，之后以页面为准', async () => {
+  const dir = tempDir();
+  const store = openStore(join(dir, 'executor-live.sqlite'));
+  const fake = new FakeAster();
+  const adlConfig = (id: string) => (JSON.parse((store.db.prepare('SELECT json FROM adl_pairs WHERE pair_id = ?').get(id) as { json: string }).json) as { config: unknown }).config;
+  try {
+    const config = parseServiceConfig(configRaw([{ id: 'p1', main: 'main', long: 'a', short: 'b', adl: { autoReduce: false, batchNotional: '500' } }]));
+    let { executor } = await wired(fake, store, config);
+    assert.equal(executor.transferPairs()[0]!.enabled, false);
+    assert.deepEqual(adlConfig('p1'), { autoReduce: false, batchNotional: '500' });
+    executor.setAdlConfig({ pairId: 'p1', requestId: randomUUID(), autoReduce: true, batchNotional: '800' }, 's');
+    executor.close();
+    ({ executor } = await wired(fake, store, config));
+    assert.deepEqual(adlConfig('p1'), { autoReduce: true, batchNotional: '800' }, '重启后保留页面上的修改');
+    executor.close();
+    assert.throws(() => parseServiceConfig(configRaw([{ id: 'p1', main: 'main', long: 'a', short: 'b', adl: { autoReduce: 'yes', batchNotional: '1' } }])), /配对 p1 的 adl 无效/);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});

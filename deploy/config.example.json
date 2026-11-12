@@ -1,0 +1,23 @@
+{
+  "secretsFile": "/etc/trading-platform/secrets.json",
+  "port": 4720,
+  "budget": { "limitPerMinute": 600, "adlReserve": 100 },
+  "pairs": [
+    {
+      "id": "pair-1",
+      "main": "main",
+      "long": "long-1",
+      "short": "short-1",
+      "transfer": {
+        "threshold": "10",
+        "minTransfer": "1",
+        "maxTransfer": "1000",
+        "bufferRatio": "0.05",
+        "longReserve": "0",
+        "shortReserve": "0",
+        "cooldownMs": 30000,
+        "checkIntervalMs": 5000
+      }
+    }
+  ]
+}

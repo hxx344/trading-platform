@@ -1,0 +1,42 @@
+# Installed by deploy/install.sh, which fills in the paths. Local changes are overwritten on the next install:
+# put overrides in `systemctl edit trading-platform` and extra environment in @CONF_DIR@/environment.
+[Unit]
+Description=统一交易平台（ASTER 保证金平衡划转与 ADL 应急处理）
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=20
+
+[Service]
+Type=simple
+User=trading-platform
+Group=trading-platform
+EnvironmentFile=-@CONF_DIR@/environment
+ExecStart=@NODE@ @APP_DIR@/current/src/service/main.ts --config @CONF_DIR@/config.json --data-dir @DATA_DIR@
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=@DATA_DIR@
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -63,7 +63,7 @@ trading-platform/
 切换一个配对：
 
 1. 在工作台暂停并删除该配对，确认工作台“账户写入”里这三个账户没有未结清的划转。
-2. 在本项目配置里加入该配对（默认停用），重启服务。
+2. 在本项目 `config.json` 里加入该配对（登记后默认停用），执行 `sudo bash install.sh` 使配置生效。
 3. 页面点“启用”。启用前检查以下各项，任一不满足就拒绝并说明原因：
    - 凭据：三个账户凭据有效，主账户能列出两个子账户，且子账户未冻结。
    - 外部划转：两个子账户最近 10 分钟的流水里没有不属于本项目的 `SUBUSER_ASSET_TRANSFER`。这是检测工作台配对是否仍在运行的旁证。
@@ -82,7 +82,7 @@ trading-platform/
 | 0 | 建仓：执行器与探测脚本迁入，去掉工作台路径依赖，原有测试全绿 | `pnpm check`、`pnpm test` |
 | 1 | 真实 ASTER 连接器：签名、请求预算、`TransferConnector`、`AdlConnector`、持仓（已完成：`src/aster/`） | 替身 ASTER 服务器上的契约测试；签名与 Python `eth_account` 交叉向量；与 Python 结果分类逐项对照 |
 | 2 | 服务入口：配置与密钥、启用检查、绝对保留额、飞书发件箱、用户推送、页面启停（已完成：`src/service/`，入口 `pnpm service -- --config … --data-dir …`） | 端到端：替身 ASTER 上跑完划转、未知结清、ADL 发现到完成、重启接管 |
-| 3 | 部署：`deploy/install.sh`（root 运行、幂等、无变化快速结束、保留配置和数据）、systemd 单元、CI、发布流程（tag → GitHub Release 包） | CI 绿；本机以非 root 跑安装器的检查路径 |
+| 3 | 部署：`deploy/install.sh`（root 运行、幂等、无变化快速结束、保留配置和数据、先校验配置再切换、启动失败自动回退）、systemd 单元、CI、发布流程（tag → GitHub Release 包）（已完成：`deploy/`、`.github/workflows/release.yml`） | CI 绿；本机以非 root 跑安装器的检查路径 |
 | 4 | 独立审查（R3），修完 P0/P1 后发布 v0.1.0 | 审查记录在 `docs/reviews/` |
 | 5 | 实盘：用户授权后切换第一个配对，先用最小门槛观察 | 用户当次授权；结果回填本文件 |
 

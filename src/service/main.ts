@@ -126,12 +126,17 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
 }
 
 async function main(): Promise<void> {
-  const { values } = parseArgs({ options: { config: { type: 'string' }, 'data-dir': { type: 'string' } } });
+  const { values } = parseArgs({ options: { config: { type: 'string' }, 'data-dir': { type: 'string' }, 'check-config': { type: 'boolean' } } });
   if (!values.config) throw new Error('需要 --config <服务配置文件的绝对路径>');
-  if (!values['data-dir']) throw new Error('需要 --data-dir <独立目录的绝对路径>');
-  const dir = assertDedicatedDataDir(values['data-dir']);
   const config = loadServiceConfig(values.config);
   const secrets = loadServiceSecrets(config);
+  if (values['check-config']) {
+    // Read and validated offline (keys must derive their signers); nothing is sent anywhere.
+    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、')}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}\n`);
+    return;
+  }
+  if (!values['data-dir']) throw new Error('需要 --data-dir <独立目录的绝对路径>');
+  const dir = assertDedicatedDataDir(values['data-dir']);
   // One process per account on this host; the kernel drops the locks on exit.
   await holdAccountLocks([...new Set(config.pairs.flatMap(pair => [pair.main, pair.long, pair.short]))].map(name => ({ venue: 'aster', accountId: secrets.accounts.get(name)!.user })));
   await startService({ config, secrets, dir });

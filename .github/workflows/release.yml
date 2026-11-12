@@ -1,0 +1,51 @@
+name: release
+on:
+  push:
+    tags: ['v*.*.*']
+permissions:
+  contents: write
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: 标签与 package.json 版本一致，且提交在 main 上
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "标签 $GITHUB_REF_NAME 与 package.json 版本 v$version 不一致"; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo '标签提交不在 main 上'; exit 1; }
+      - run: pnpm check
+      - run: pnpm test
+      - run: shellcheck deploy/*.sh
+      - run: bash deploy/test-install.sh
+      - run: bash deploy/package.sh dist
+      - name: 发布 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          previous=$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || true)
+          range=${previous:+$previous..}$GITHUB_REF_NAME
+          {
+            echo '## 更新说明'
+            git log --no-merges --format=%B "$range" | sed -n 's/^更新说明：/- /p'
+            echo
+            echo '## 安装或升级'
+            echo
+            echo '```bash'
+            echo 'curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/install.sh && sudo bash install.sh'
+            echo '```'
+          } >dist/NOTES.md
+          gh release create "$GITHUB_REF_NAME" dist/trading-platform.tar.gz dist/install.sh dist/SHA256SUMS \
+            --title "$GITHUB_REF_NAME" --notes-file dist/NOTES.md --verify-tag

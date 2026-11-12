@@ -1,7 +1,7 @@
 // ASTER ADL contracts: the trading connector a pair's two sub-accounts are read
 // and reduced through, and the checks every value from it passes. ASTER is not a
 // Venue; this surface exists only for the ADL emergency handling (plan 2.3b).
-import { cmp, isZero, sub } from './decimal.ts';
+import { cmp, fromUnits, isZero, sub, units } from './decimal.ts';
 import { exactKeys, integer, oneOf, reject, decimalField, text } from './contracts.ts';
 import type { CallOptions, SendOptions } from './connector.ts';
 
@@ -14,6 +14,22 @@ export const ADL_ORDER_ID = /^adl-[0-9a-f]{28}$/;
 export type AdlPositionSide = 'LONG' | 'SHORT' | 'BOTH';
 export type Direction = 'long' | 'short';
 export const DIRECTION_NAMES: Record<Direction, string> = { long: '多', short: '空' };
+
+/**
+ * The two sides of a pair are hedged when, per symbol, the long and short totals (both sub-accounts together) differ by
+ * at most 0.5 % of the larger total (user decision 2026-11-12). It applies to the takeover check, the positions verdict
+ * and the start of ADL reduction; once a reduction has begun it goes on to equal totals.
+ */
+export const HEDGE_TOLERANCE_BPS = 50;
+export function hedgeGap(rows: readonly { symbol: string; direction: Direction | null; quantity: string }[], symbol: string): { long: string; short: string; tolerated: boolean; percent: string } {
+  let long = 0n, short = 0n;
+  for (const row of rows) if (row.symbol === symbol && row.direction) { if (row.direction === 'long') long += units(row.quantity); else short += units(row.quantity); }
+  const gap = long > short ? long - short : short - long, larger = long > short ? long : short;
+  // The gap as a percentage of the larger total, to three decimals (rounded up, so a shown 0.500% is never really above it).
+  const thousandths = larger === 0n ? 0n : (gap * 100_000n + larger - 1n) / larger;
+  const percent = `${thousandths / 1000n}.${String(thousandths % 1000n).padStart(3, '0')}`;
+  return { long: fromUnits(long), short: fromUnits(short), tolerated: gap * 10_000n <= larger * BigInt(HEDGE_TOLERANCE_BPS), percent };
+}
 
 // ---- per-pair settings ---------------------------------------------------------
 export interface AdlConfig {

@@ -704,6 +704,24 @@ test('规划：多出方向按持仓量从大到小选择，数量取差额、�
   assert.deepEqual([missing.plan, missing.progress[SYMBOL].status], [null, 'blocked']);
 });
 
+test('规划：偏差不超过较大一侧 0.5% 时不减仓、记为残差；本事件已对该合约减过仓则继续减到相等', () => {
+  const rule = { symbol: SYMBOL, quantityStep: '0.001', minQuantity: '0.001', maxMarketQuantity: '0.01', tradable: true, quoteAsset: 'USDT' };
+  const position = (quantity: string, direction: 'long' | 'short', positionSide: 'LONG' | 'SHORT') => ({ symbol: SYMBOL, positionSide, direction, quantity, markPrice: '60000', updateTime: 1 });
+  const scene = (short: string) => ({ long: [position('1', 'long', 'LONG')], short: [position(short, 'short', 'SHORT')] });
+  const rules = new Map([[SYMBOL, rule]]);
+  const within = planReductions(scene('0.996'), [SYMBOL], rules, '1000');
+  assert.equal(within.plan, null);
+  assert.deepEqual([within.progress[SYMBOL].status, within.progress[SYMBOL].residual, within.progress[SYMBOL].direction], ['residual', '0.004', 'long']);
+  assert.match(within.progress[SYMBOL].reason ?? '', /偏差 0.400% 不超过 0.5%/);
+  assert.equal(planReductions(scene('0.995'), [SYMBOL], rules, '1000').plan, null, '恰好 0.5% 仍在容差内');
+  // Rules are not needed for a symbol inside the tolerance.
+  assert.equal(planReductions(scene('0.996'), [SYMBOL], new Map([[SYMBOL, '读取失败']]), '1000').progress[SYMBOL].status, 'residual');
+  const beyond = planReductions(scene('0.99'), [SYMBOL], rules, '1000');
+  assert.deepEqual(beyond.plan && [beyond.plan.direction, beyond.plan.quantity], ['long', '0.01']);
+  const continued = planReductions(scene('0.996'), [SYMBOL], rules, '1000', new Set([SYMBOL]));
+  assert.deepEqual(continued.plan && [continued.plan.direction, continued.plan.quantity], ['long', '0.004'], '已开始减仓的合约减到相等');
+});
+
 test('HTTP：ADL 设置与重新开始走会话和请求标记；状态接口带 ADL 配对与最近事件，账户打码', () => withAdl(async h => {
   const server = createExecutorServer({ executor: h.ex, accessToken: 'adl-access-token-0001', session: SESSION });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -769,4 +787,31 @@ test('边界：ADL 连接器不是模拟传输，或环境不是模拟时拒绝�
   assert.throws(() => createExecutor({ store: h.store, connectors: [], environment: 'mainnet', adl: h.asterTrading }), code('live_transport_refused'));
   assert.throws(() => createExecutor({ store: h.store, connectors: [], adl: new SimulatedAsterTrading(() => h.clock.now, { historyPageLimit: 1 }) }), code('budget'));
   assert.throws(() => createExecutor({ store: h.store, connectors: [], adl: h.asterTrading, budgets: { adlMaxBatches: 0 } }), code('budget'));
+}));
+
+test('ADL：偏差不超过 0.5% 时不下单、记残差完成；超出 0.5% 开始减仓后一路减到两侧相等', () => withAdl(async h => {
+  h.asterTrading.setPosition(LONG, SYMBOL, 'LONG', '10');
+  h.asterTrading.setPosition(SHORT, SYMBOL, 'SHORT', '-10');
+  // A rule that cannot be parsed (minimum above maximum) does not matter for a symbol inside the tolerance.
+  h.asterTrading.setRule(SYMBOL, { minQuantity: '200', maxMarketQuantity: '100' });
+  h.advance(1_000);
+  h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.04');
+  await h.ex.tick();
+  await untilClosed(h);
+  const [small] = recent(h);
+  assert.equal(small.status, 'completed');
+  assert.equal(h.asterTrading.calls.place, 0, '容差内不下单');
+  assert.deepEqual(small.residuals, [{ symbol: SYMBOL, quantity: '0.04', direction: 'short' }]);
+  assert.match(small.reason ?? '', /多空总量已在容差内/);
+  h.asterTrading.setRule(SYMBOL, { minQuantity: '0.001', maxMarketQuantity: '100' });
+  // A second ADL takes the gap to 1.4 %: reduction starts and does not stop when the gap falls back inside 0.5 %.
+  h.advance(1_000);
+  h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.1');
+  await h.ex.tick();
+  await untilClosed(h, 60);
+  const [large] = recent(h);
+  assert.equal(large.status, 'completed');
+  assert.deepEqual(large.residuals, []);
+  assert.ok(balanced(h), '减到两侧相等');
+  assert.ok(large.batches.length >= 8, '多批减仓，跨过 0.5% 后仍继续');
 }));

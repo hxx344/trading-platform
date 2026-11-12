@@ -65,7 +65,7 @@ test('持仓展示：首轮前为尚未读取，读取后两侧最新并按合�
   assert.equal(view.long.sampledAt, h.clock.now);
   assert.deepEqual(view.long.positions.map(item => [item.symbol, item.direction, item.quantity]), [['BTCUSDT', 'long', '0.05']]);
   assert.deepEqual(view.short.positions.map(item => [item.direction, item.quantity]), [['short', '0.05']]);
-  assert.deepEqual(view.totals, [{ symbol: 'BTCUSDT', long: '0.05', short: '-0.05', total: '0', balanced: true }]);
+  assert.deepEqual(view.totals, [{ symbol: 'BTCUSDT', long: '0.05', short: '-0.05', total: '0', gapPercent: '0.000', balanced: true }]);
   // Read-only: nothing reached the venue's order path.
   assert.deepEqual(h.asterTrading.arrived, { place: 0, cancel: 0 });
 }));
@@ -75,7 +75,7 @@ test('持仓展示：ADL 后一侧变少，两侧最新时判为不一致；未�
   h.asterTrading.adl(LONG, 'BTCUSDT', 'LONG', '0.02', { push: false });
   await h.ex.refreshPositions();
   const view = pairView(h);
-  assert.deepEqual(view.totals, [{ symbol: 'BTCUSDT', long: '0.03', short: '-0.05', total: '-0.02', balanced: false }]);
+  assert.deepEqual(view.totals, [{ symbol: 'BTCUSDT', long: '0.03', short: '-0.05', total: '-0.02', gapPercent: '40.000', balanced: false }]);
   assert.equal(view.long.positions[0].unrealizedProfit, '30');
   assert.equal(view.short.positions[0].unrealizedProfit, '-50');
 }));
@@ -143,7 +143,7 @@ test('持仓展示：两侧都最新但采样相隔超过一次读取时限时�
   assert.equal(view.long.state, 'fresh');
   assert.equal(view.short.state, 'fresh');
   assert.equal(view.verdictNote, '两侧采样相隔过久');
-  assert.deepEqual(view.totals, [{ symbol: 'BTCUSDT', long: '0.05', short: '-0.05', total: '0', balanced: null }]);
+  assert.deepEqual(view.totals, [{ symbol: 'BTCUSDT', long: '0.05', short: '-0.05', total: '0', gapPercent: '0.000', balanced: null }]);
 }, { positionsConcurrency: 1 }));
 
 test('持仓展示：本机时钟回退后不再把旧结果当有效', () => withPositions(async h => {

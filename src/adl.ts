@@ -15,7 +15,7 @@ import { ContractError, PAIR_ID, UUID, exactKeys, reject, text, type PairSide } 
 import { VenueError } from './connector.ts';
 import { ADL_CANCEL_OPERATION_PREFIX, ADL_OPERATION_PREFIX, ControlRefusal, parseAdlOperationId, type AccountControl, type WriterOperation } from './account-control.ts';
 import {
-  DEFAULT_ADL_CONFIG, DIRECTION_NAMES, TERMINAL_ADL_ORDER, evidenceDirection, parseAdlAccount, parseAdlConfig, parseAdlEvidence, parseAdlOrderReport, parseAdlRule,
+  DEFAULT_ADL_CONFIG, DIRECTION_NAMES, HEDGE_TOLERANCE_BPS, TERMINAL_ADL_ORDER, evidenceDirection, hedgeGap, parseAdlAccount, parseAdlConfig, parseAdlEvidence, parseAdlOrderReport, parseAdlRule,
   type AdlAccountSnapshot, type AdlConfig, type AdlConnector, type AdlEvidenceRow, type AdlOrderReport, type AdlOrderRequest, type AdlPositionSide, type AdlRule, type Direction,
 } from './adl-contracts.ts';
 import type { PairRecord } from './transfer.ts';
@@ -137,9 +137,11 @@ const abs = (value: string): string => cmp(value, '0') < 0 ? sub('0', value) : v
  * Plans every symbol on its own and returns at most one batch, for the first symbol (by name) that has a legal one.
  * The excess side's largest position is reduced by min(excess, position, market max, notional cap ÷ mark), floored to the step;
  * a batch is never enlarged to the minimum. An excess below the minimum quantity is a residual and counts as balanced
- * (user decision 2026-11-11); a notional cap that cannot buy one lot keeps the symbol blocked.
+ * (user decision 2026-11-11); a notional cap that cannot buy one lot keeps the symbol blocked. A gap within the hedge
+ * tolerance (0.5 % of the larger total) is a residual too, unless this incident already reduced that symbol: a reduction
+ * once begun goes on to equal totals (user decision 2026-11-12).
  */
-export function planReductions(positions: Record<PairSide, readonly AdlAccountSnapshot['positions'][number][]>, symbols: readonly string[], rules: ReadonlyMap<string, AdlRule | string>, batchNotional: string): { plan: AdlPlan | null; progress: Record<string, SymbolProgress> } {
+export function planReductions(positions: Record<PairSide, readonly AdlAccountSnapshot['positions'][number][]>, symbols: readonly string[], rules: ReadonlyMap<string, AdlRule | string>, batchNotional: string, reduced: ReadonlySet<string> = new Set()): { plan: AdlPlan | null; progress: Record<string, SymbolProgress> } {
   let plan: AdlPlan | null = null;
   const progress: Record<string, SymbolProgress> = {};
   const all = SIDES.flatMap(side => positions[side].map(row => ({ side, row })));
@@ -148,6 +150,8 @@ export function planReductions(positions: Record<PairSide, readonly AdlAccountSn
     if (isZero(excess)) { progress[symbol] = { status: 'balanced', residual: '0', direction: null }; continue; }
     const direction: Direction = cmp(excess, '0') > 0 ? 'long' : 'short', amount = abs(excess);
     const entry = (status: ProgressStatus, reason?: string): SymbolProgress => ({ status, residual: amount, direction, ...(reason ? { reason } : {}) });
+    const gap = hedgeGap(all.map(item => item.row), symbol);
+    if (gap.tolerated && !reduced.has(symbol)) { progress[symbol] = entry('residual', `偏差 ${gap.percent}% 不超过 ${HEDGE_TOLERANCE_BPS / 100}%，不减仓`); continue; }
     const rule = rules.get(symbol);
     if (rule === undefined || typeof rule === 'string') { progress[symbol] = entry('blocked', rule ?? `${symbol} 交易规则不可用`); continue; }
     if (cmp(floorToStep(amount, rule.quantityStep), rule.minQuantity) < 0) { progress[symbol] = entry('residual'); continue; }
@@ -259,6 +263,19 @@ export function createAdl({ db, now, budgets, connector, control, write, assertW
     return row ? JSON.parse(row.json) as Incident : null;
   };
   const requireIncident = (id: string): Incident => readIncident(id) ?? reject('adl_incident_missing', 'ADL 事件不存在', 404);
+  /**
+   * Symbols this incident or the incidents it continues (parentId) have sent batches for: a reduction once begun goes on
+   * to equal totals, also when a late fill of an earlier incident's batch overshoots into a new one.
+   */
+  const reducedSymbols = (id: string): Set<string> => {
+    const symbols = new Set<string>();
+    let current: string | null = id;
+    for (let depth = 0; current && depth < 100; depth++) {
+      for (const batch of batchesOf(current)) symbols.add(batch.symbol);
+      current = readIncident(current)?.parentId ?? null;
+    }
+    return symbols;
+  };
   const incidentVersion = (id: string): number => (db.prepare('SELECT version FROM adl_incidents WHERE id = ?').get(id) as { version: number } | undefined)?.version ?? -1;
   const openIncident = (pairId: string): Incident | null => {
     const row = db.prepare('SELECT json FROM adl_incidents WHERE pair_id = ? AND final = 0').get(pairId) as { json: string } | undefined;
@@ -733,9 +750,11 @@ export function createAdl({ db, now, budgets, connector, control, write, assertW
       requireReflected(pair.id, incident, snapshots);
       const busy = SIDES.flatMap(side => snapshots[side].openOrders.filter(order => symbols.includes(order.symbol)).map(order => `${SIDE_NAMES[side]} ${order.symbol}`));
       if (busy.length) throw new Hold(`事件合约有未完成挂单（${busy.join('、')}），等待挂单结束后再减仓`);
-      const imbalanced = symbols.filter(symbol => !isZero(net([...snapshots.long.positions, ...snapshots.short.positions], symbol)));
+      // Rules are read only for symbols that may get a batch: one inside the tolerance and not yet reduced needs none.
+      const all = [...snapshots.long.positions, ...snapshots.short.positions], reduced = reducedSymbols(incidentId);
+      const imbalanced = symbols.filter(symbol => !isZero(net(all, symbol)) && (reduced.has(symbol) || !hedgeGap(all, symbol).tolerated));
       const config = ensurePair(pair).config;
-      const { plan, progress } = planReductions({ long: snapshots.long.positions, short: snapshots.short.positions }, symbols, await readRules(imbalanced), config.batchNotional);
+      const { plan, progress } = planReductions({ long: snapshots.long.positions, short: snapshots.short.positions }, symbols, await readRules(imbalanced), config.batchNotional, reduced);
       const scene = sceneOf(snapshots);
       if (Object.values(progress).every(entry => entry.status === 'balanced' || entry.status === 'residual')) { complete(pair, incidentId, version, signature, scene, progress); return; }
       if (!config.autoReduce) {
@@ -877,16 +896,16 @@ export function createAdl({ db, now, budgets, connector, control, write, assertW
       incident.before ??= scene;
       incident.after = scene; incident.progress = progress; incident.completedAt = at; incident.haltReason = null;
       incident.residuals = Object.entries(progress).filter(([, entry]) => entry.status === 'residual' && entry.direction).map(([symbol, entry]) => ({ symbol, quantity: entry.residual, direction: entry.direction as Direction }));
-      const residualText = incident.residuals.length ? `；残差 ${incident.residuals.map(item => `${item.symbol} 多出${DIRECTION_NAMES[item.direction]}仓 ${item.quantity}`).join('、')}（小于最小下单量，记为完成）` : '';
+      const residualText = incident.residuals.length ? `；残差 ${incident.residuals.map(item => `${item.symbol} 多出${DIRECTION_NAMES[item.direction]}仓 ${item.quantity}`).join('、')}（偏差在 ${HEDGE_TOLERANCE_BPS / 100}% 内或小于最小下单量，记为完成）` : '';
       const unknown = openBatches(pair.id).filter(batch => batch.state === 'unknown-verified');
       const until = unknown.length ? Math.max(...unknown.map(batch => batch.lastPossibleSendAt ?? batch.sentAt ?? batch.preparedAt)) + budgets.adlWatchMs : null;
       event(null, 'adl-incident-completed', { incident: incidentId, residuals: incident.residuals, unknown: unknown.length });
       if (until !== null && until > at) {
         transition(incident, 'watching');
         incident.watchUntil = until; incident.retryAt = at + budgets.adlWatchSceneMs;
-        incident.reason = `多空总量已一致${residualText}；${unknown.length} 笔结果未知的减仓单继续观察到 ${new Date(until).toISOString()}，期间再现净差即开新事件`;
+        incident.reason = `${incident.residuals.length ? '多空总量已在容差内' : '多空总量已一致'}${residualText}；${unknown.length} 笔结果未知的减仓单继续观察到 ${new Date(until).toISOString()}，期间再现净差即开新事件`;
         saveIncident(incident);
-      } else close(incident, `多空总量已一致${residualText}`, false);
+      } else close(incident, `${incident.residuals.length ? '多空总量已在容差内' : '多空总量已一致'}${residualText}`, false);
     });
   }
 

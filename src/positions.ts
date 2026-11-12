@@ -6,7 +6,7 @@
 import { ContractError, decimalField, exactKeys, integer, oneOf, reject, text } from './contracts.ts';
 import { add, cmp, isZero, mul, sub } from './decimal.ts';
 import type { CallOptions } from './connector.ts';
-import { ADL_SYMBOL, type AdlPositionSide, type Direction } from './adl-contracts.ts';
+import { ADL_SYMBOL, hedgeGap, type AdlPositionSide, type Direction } from './adl-contracts.ts';
 import type { PairRecord } from './transfer.ts';
 
 export interface PositionsBudgets {
@@ -155,14 +155,15 @@ export function createPositions({ connector, now, budgets, pairs, callVenue }: P
     if (Math.abs(long.sampledAt! - short.sampledAt!) > budgets.positionsReadTimeoutMs) return '两侧采样相隔过久';
     return null;
   }
-  /** Per symbol: the signed net of each side and their sum, with the same arithmetic as the ADL balance check. */
+  /** Per symbol: the signed net of each side, their sum, and whether the totals are hedged within the ADL tolerance. */
   function totals(long: ReturnType<typeof sideView>, short: ReturnType<typeof sideView>, note: string | null) {
     if (long.state === 'pending' || long.state === 'unavailable' || short.state === 'pending' || short.state === 'unavailable') return null;
     const symbols = [...new Set([...long.positions, ...short.positions].map(row => row.symbol))].sort();
     const net = (rows: AsterPosition[], symbol: string) => add('0', ...rows.filter(row => row.symbol === symbol).map(signed));
     return symbols.map(symbol => {
       const longNet = net(long.positions, symbol), shortNet = net(short.positions, symbol), total = add(longNet, shortNet);
-      return { symbol, long: longNet, short: shortNet, total, balanced: note ? null : isZero(total) };
+      const gap = hedgeGap([...long.positions, ...short.positions], symbol);
+      return { symbol, long: longNet, short: shortNet, total, gapPercent: gap.percent, balanced: note ? null : gap.tolerated };
     });
   }
 

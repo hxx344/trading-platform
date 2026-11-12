@@ -35,10 +35,10 @@ table{border-collapse:collapse;width:100%} td,th{border-bottom:1px solid #eaeef2
 <p class="muted">在配对的多侧与空侧子账户之间划转 USD1。结果未知的划转不重发，原请求过期后核对两侧流水并自动结算。</p>
 <div id="pairs" class="muted">—</div><div id="transfers"></div>
 <h2>ASTER 账户持仓（模拟，只读）</h2>
-<p class="muted">定时读取每个配对多侧与空侧子账户的全部持仓，只展示，不下单。某次读取失败时继续显示上次结果并注明，超过有效期后不再显示；两侧最新读取都成功时才判断多空总量是否一致。</p>
+<p class="muted">定时读取每个配对多侧与空侧子账户的全部持仓，只展示，不下单。某次读取失败时继续显示上次结果并注明，超过有效期后不再显示；两侧最新读取都成功时才判断多空总量是否一致（偏差不超过较大一侧的 0.5% 算一致）。</p>
 <div id="positionsNotice"></div><div id="positions" class="muted">—</div>
 <h2>ASTER ADL 应急处理（模拟）</h2>
-<p class="muted">交易所自动减仓使配对两侧多空总量不一致时，按只减仓市价单分批减少多出的一侧，直到总量一致后自动结束。结果未知的减仓单不重发，有界核对后按新现场继续；不足最小下单量的残差记为完成。</p>
+<p class="muted">交易所自动减仓后，配对两侧多空总量偏差超过较大一侧的 0.5% 时，按只减仓市价单分批减少多出的一侧，直到两侧相等后自动结束；偏差在 0.5% 内不减仓、直接完成。结果未知的减仓单不重发，有界核对后按新现场继续；不足最小下单量的残差记为完成。</p>
 <div id="adlPairs" class="muted">—</div><div id="adlRecent"></div>
 <h2>ANT 只读（Binance ANTHROPICUSDT）</h2><div id="ant" class="muted">—</div>
 <script>
@@ -77,7 +77,7 @@ const TRANSFER_STATE = { prepared: '已落盘', sending: '发送中', acknowledg
 // A switch keeps its requestId only while no answer arrived, so a lost response is replayed safely; any answer, refusals included, ends that request.
 const pairRequests = {};
 const ADL_STATUS = { active: '处理中', blocked: '受阻（保留现场）', halted: '已停止自动减仓', watching: '已平衡，观察未知原单', completed: '已结束' };
-const ADL_PROGRESS = { balanced: '已平衡', residual: '残差（记为完成）', reducing: '本批减仓', pending: '待减仓', blocked: '受阻', held: '暂停', manual: '待手工平衡' };
+const ADL_PROGRESS = { balanced: '已平衡', residual: '残差（容差内或不足一手，记为完成）', reducing: '本批减仓', pending: '待减仓', blocked: '受阻', held: '暂停', manual: '待手工平衡' };
 const ADL_BATCH = { prepared: '已落盘', sending: '发送中', open: '交易所挂单中', unknown: '结果未知，核对中', 'unknown-verified': '多次核对无回执，观察中', done: '已结束', rejected: '被拒绝', 'not-sent': '未发送', 'unknown-closed': '观察期满，结果未知' };
 const DIRECTION = { long: '多', short: '空' };
 // Typed ADL settings survive the periodic re-render; a request keeps its id until an answer arrives, like the pair switch.
@@ -123,7 +123,7 @@ function positionTotals(pair) {
   if (!pair.totals) return '<span class="muted">两侧持仓都有效时才汇总</span>';
   if (!pair.totals.length) return '<span class="muted">两侧均无持仓</span>';
   return '<table><tr><th>合约</th><th>多侧账户净持仓</th><th>空侧账户净持仓</th><th>两侧合计</th><th>多空总量</th></tr>' + pair.totals.map(row => '<tr><td>' + esc(row.symbol) + '</td><td>' + esc(row.long) + '</td><td>' + esc(row.short) + '</td><td>' + esc(row.total) + '</td><td>'
-    + (row.balanced === null ? '<span class="muted">未判断（' + esc(pair.verdictNote) + '）</span>' : row.balanced ? '<span class="ok">一致</span>' : '<span class="err">不一致</span>') + '</td></tr>').join('') + '</table>';
+    + (row.balanced === null ? '<span class="muted">未判断（' + esc(pair.verdictNote) + '）</span>' : row.balanced ? '<span class="ok">' + (Number(row.total) === 0 ? '一致' : '偏差 ' + esc(row.gapPercent) + '%，在 0.5% 内') + '</span>' : '<span class="err">偏差 ' + esc(row.gapPercent) + '%，超过 0.5%</span>') + '</td></tr>').join('') + '</table>';
 }
 function positionsHtml(view) {
   if (!view.available) return '未接入 ASTER 持仓读取';

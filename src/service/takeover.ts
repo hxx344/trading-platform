@@ -3,8 +3,8 @@
 // service did not make within the window, a workbench ADL reduction order still resting), and for a hedge that is
 // already off: ADL history is only scanned from the takeover on, so an ADL in the gap shows here instead.
 import { ContractError, type PairSide } from '../contracts.ts';
-import { add, cmp, sub } from '../decimal.ts';
-import { parseAsterPositions } from '../positions.ts';
+import { HEDGE_TOLERANCE_BPS, hedgeGap } from '../adl-contracts.ts';
+import { parseAsterPositions, type AsterPosition } from '../positions.ts';
 import type { PairRecord } from '../transfer.ts';
 import type { AsterTransferConnector } from '../aster/transfer.ts';
 import type { AsterTradingConnector } from '../aster/trading.ts';
@@ -44,15 +44,15 @@ export function createTakeoverGuard({ transfers, trading, now = Date.now, timeou
       const adl = orders.filter(order => ADL_ORDER.test(order.clientOrderId));
       if (adl.length) refuse(`${SIDE_NAMES[side]}有未结束的 ADL 减仓挂单（${[...new Set(adl.map(order => order.symbol))].join('、')}），工作台可能仍在处理 ADL；结束后再启用`);
     }
-    // Both sides together must hold no net position in any symbol, as after any completed ADL handling.
-    const totals = new Map<string, string>();
+    // Per symbol, both sides together must be hedged within the tolerance, as after any completed ADL handling.
+    const rows: AsterPosition[] = [];
     for (const side of ['long', 'short'] as const) {
       let snapshot;
       try { snapshot = parseAsterPositions(await trading.positions(pair[side], { signal }), pair[side], now(), CLOCK_TOLERANCE_MS); }
       catch (error) { return refuse(`接管检查无法读取${SIDE_NAMES[side]}持仓：${error instanceof Error ? error.message.slice(0, 120) : '未知错误'}；稍后重试`); }
-      for (const row of snapshot.positions) totals.set(row.symbol, (row.direction === 'long' ? add : sub)(totals.get(row.symbol) ?? '0', row.quantity));
+      rows.push(...snapshot.positions);
     }
-    const off = [...totals].filter(([, value]) => cmp(value, '0') !== 0).sort(([a], [b]) => a < b ? -1 : 1);
-    if (off.length) refuse(`两侧持仓不对冲：${off.slice(0, 5).map(([symbol, value]) => `${symbol} 净${cmp(value, '0') > 0 ? '多' : '空'} ${value.replace(/^-/, '')}`).join('、')}。可能在停用工作台后发生过 ADL，请先人工处理到两侧一致再启用`);
+    const off = [...new Set(rows.map(row => row.symbol))].sort().map(symbol => ({ symbol, gap: hedgeGap(rows, symbol) })).filter(item => !item.gap.tolerated);
+    if (off.length) refuse(`两侧持仓偏差超过 ${HEDGE_TOLERANCE_BPS / 100}%：${off.slice(0, 5).map(({ symbol, gap }) => `${symbol} 多 ${gap.long} / 空 ${gap.short}，差 ${gap.percent}%`).join('、')}。可能在停用工作台后发生过 ADL，请先人工处理到偏差不超过 ${HEDGE_TOLERANCE_BPS / 100}% 再启用`);
   };
 }

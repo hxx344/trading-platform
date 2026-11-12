@@ -5,6 +5,7 @@
 import { createHmac } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { FeishuSecret } from './config.ts';
+import { HEDGE_TOLERANCE_BPS } from '../adl-contracts.ts';
 
 const SEND_TIMEOUT_MS = 10_000;
 const RETRY_BASE_MS = 5_000;
@@ -37,6 +38,15 @@ export interface NotifierOptions {
 
 const short = (value: unknown): string => typeof value === 'string' ? value.slice(0, 8) : '?';
 const clip = (value: unknown, length = 300): string => (typeof value === 'string' ? value : JSON.stringify(value ?? '')).slice(0, length);
+/** Residuals left by a completed ADL incident (inside the 0.5 % tolerance or below one lot): they are not hedged, so they are listed. */
+const residualNote = (value: unknown): string => {
+  if (!Array.isArray(value) || value.length === 0) return '';
+  const items = value.slice(0, 5).map(item => {
+    const row = (item ?? {}) as Record<string, unknown>;
+    return `${clip(row.symbol, 64)} 多出${row.direction === 'long' ? '多' : row.direction === 'short' ? '空' : '?'}仓 ${clip(row.quantity, 32)}`;
+  });
+  return `剩余残差（偏差在 ${HEDGE_TOLERANCE_BPS / 100}% 容差内或不足一手，记为完成）：${items.join('、')}${value.length > 5 ? ` 等 ${value.length} 个合约` : ''}`;
+};
 const SETTLE_TEXT: Record<string, string> = {
   late_receipt_confirmed: '核对流水后确认已执行', nonce_expired_no_receipt: '请求过期且两侧流水都没有，确认未执行',
   nonce_expired_partial_receipt: '只在一侧流水找到记录，结果存疑', nonce_expired_ambiguous_receipt: '流水中有多条可能对应的记录，结果存疑',
@@ -71,7 +81,7 @@ export function describeEvent(row: EventRow, incidentPair: (id: string) => strin
     case 'adl-incident-halted':
       return { text: `【ADL 已暂停，需人工处理】配对 ${pair}：${clip(detail.reason)}；处理后在页面重新开始` };
     case 'adl-incident-completed':
-      return { text: `【ADL 已平衡】配对 ${pair} 事件 ${short(detail.incident)} 两侧已一致${Number(detail.unknown) > 0 ? `；有 ${clip(detail.unknown, 8)} 笔减仓单结果未知，进入观察期` : ''}` };
+      return { text: `【ADL 已平衡】配对 ${pair} 事件 ${short(detail.incident)} ${residualNote(detail.residuals) || '两侧已一致'}${Number(detail.unknown) > 0 ? `；有 ${clip(detail.unknown, 8)} 笔减仓单结果未知，进入观察期` : ''}` };
     case 'adl-incident-restarted':
       return { text: `【ADL 重新开始】配对 ${pair} 事件 ${short(detail.incident)} 已由人工重新开始` };
     case 'adl-batch-stuck':

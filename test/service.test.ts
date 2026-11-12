@@ -114,11 +114,21 @@ test('接管检查：近 10 分钟有非本平台划转、流水不完整、有 
   fake.openOrders.set(LONG.user, [{ symbol: 'ETHUSDT', clientOrderId: 'manual-1', orderId: 2 }]);
   await guard(pair);
 
-  // Both sides together must be flat in every symbol.
-  fake.risk.set(LONG.user, [{ symbol: 'BTCUSDT', positionSide: 'LONG', positionAmt: '0.004', entryPrice: '50000', markPrice: '50000', unRealizedProfit: '0', updateTime: now - 1_000 }]);
-  await assert.rejects(guard(pair), refusedWith(/两侧持仓不对冲：BTCUSDT 净多 0.004/));
-  fake.risk.set(SHORT.user, [{ symbol: 'BTCUSDT', positionSide: 'SHORT', positionAmt: '-0.004', entryPrice: '50000', markPrice: '50000', unRealizedProfit: '0', updateTime: now - 1_000 }]);
+  // Both sides together must be hedged within 0.5 % of the larger total in every symbol.
+  const risk = (user: string, positionSide: 'LONG' | 'SHORT', positionAmt: string) => fake.risk.set(user, [{ symbol: 'BTCUSDT', positionSide, positionAmt, entryPrice: '50000', markPrice: '50000', unRealizedProfit: '0', updateTime: now - 1_000 }]);
+  risk(LONG.user, 'LONG', '0.004');
+  await assert.rejects(guard(pair), refusedWith(/两侧持仓偏差超过 0.5%：BTCUSDT 多 0.004 \/ 空 0，差 100.000%/));
+  risk(SHORT.user, 'SHORT', '-0.004');
   await guard(pair);
+  risk(LONG.user, 'LONG', '1');
+  risk(SHORT.user, 'SHORT', '-0.995');
+  await guard(pair);
+  risk(SHORT.user, 'SHORT', '-0.994');
+  await assert.rejects(guard(pair), refusedWith(/BTCUSDT 多 1 \/ 空 0.994，差 0.600%/));
+  risk(SHORT.user, 'SHORT', '-1.004');
+  await guard(pair);
+  risk(LONG.user, 'LONG', '0.004');
+  risk(SHORT.user, 'SHORT', '-0.004');
 
   fake.script('GET /fapi/v3/income', () => json({ code: -1001, msg: 'disconnected' }, 500));
   await assert.rejects(guard(pair), refusedWith(/无法读取多侧划转流水/));
@@ -205,6 +215,7 @@ test('飞书告警：未配置机器人时只写日志；事件说明覆盖结�
   assert.equal(describeEvent(row('transfer-settled', { pair: 'p', transfer: 't', basis: 'acknowledged' }), () => null), null);
   assert.match(describeEvent(row('transfer-settled', { pair: 'p', transfer: 't', basis: 'nonce_expired_partial_receipt' }), () => null)!.text, /人工核对/);
   assert.match(describeEvent(row('adl-incident-completed', { incident: 'i', unknown: 1 }), () => 'p9')!.text, /配对 p9.*1 笔减仓单结果未知/);
+  assert.match(describeEvent(row('adl-incident-completed', { incident: 'i', unknown: 0, residuals: [{ symbol: 'XAGUSD1', quantity: '16.61', direction: 'long' }] }), () => 'p9')!.text, /容差内或不足一手，记为完成）：XAGUSD1 多出多仓 16.61/);
   assert.equal(describeEvent(row('history-pruned', {}), () => null), null);
   // A transfer that was on the wire at the last stop is announced at start, not only when it settles.
   assert.match(describeEvent(row('transfer-recovered', { pair: 'p', transfer: 't', state: 'unknown' }), () => null)!.text, /划转结果未知.*上次停止时正在发送/);
@@ -294,7 +305,7 @@ test('服务装配：配对登记为停用，启用前做接管检查（含两�
     fake.income.set(LONG.user, [{ asset: 'USD1', incomeType: 'TRANSFER', income: '-3', tranId: 991, time: now - 30_000 }]);
     await assert.rejects(executor.setTransferEnabled({ pairId: 'p1', enabled: true, requestId: randomUUID() }, 's'), refusedWith(/多侧近 10 分钟/));
     fake.income.delete(LONG.user);
-    await assert.rejects(executor.setTransferEnabled({ pairId: 'p1', enabled: true, requestId: randomUUID() }, 's'), refusedWith(/两侧持仓不对冲：BTCUSDT 净多 0.004/));
+    await assert.rejects(executor.setTransferEnabled({ pairId: 'p1', enabled: true, requestId: randomUUID() }, 's'), refusedWith(/两侧持仓偏差超过 0.5%：BTCUSDT 多 0.004 \/ 空 0/));
     assert.equal(executor.transferPairs()[0]!.enabled, false);
     fake.risk.set(SHORT.user, risk('-0.004', 'SHORT', now - 1_000));
     fake.accounts.get(SHORT.user)!.positions = [{ symbol: 'BTCUSDT', positionSide: 'SHORT', positionAmt: '-0.004' }];

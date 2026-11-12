@@ -1,15 +1,16 @@
-// Local HTTP surface for the minimal page. It binds to loopback only, checks
-// the Host header against DNS rebinding, hands the session cookie out only in
-// exchange for the access token written to the data directory, and requires that
-// cookie plus a custom header on every write, so neither another site nor another
-// local process that merely reaches the port can drive it.
+// Local HTTP surface for the minimal page. It binds to loopback, or to one address the operator chose (a Tailscale IP),
+// checks the Host header against DNS rebinding, hands the session cookie out only in exchange for the access token
+// written to the data directory or for the login password, and requires that cookie plus a custom header on every
+// write, so neither another site nor another process that merely reaches the port can drive it.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { ContractError, VENUES, exactKeys, type Venue } from './contracts.ts';
 import type { Executor } from './executor.ts';
 import { LIVE_PAGE, PAGE } from './page.ts';
+import { LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash } from './login-password.ts';
 
 const MAX_BODY_BYTES = 16 * 1024;
+const MAX_LOGIN_BYTES = 4 * 1024;
 const LOOPBACK = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/;
 const UUID_PATH = /^\/api\/jobs\/([0-9a-f-]{36})(?:\/(stop|acknowledge|adopt-strategy|confirm-not-created|release-strategy))?$/i;
 
@@ -19,9 +20,13 @@ const ADL_RESTART_PATH = /^\/api\/adl\/incidents\/([0-9a-f-]{36})\/restart$/;
 
 const PAGE_HEADERS = {
   'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer',
-  'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+  'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'",
 };
-const LOGIN_REQUIRED = '<!doctype html><meta charset="utf-8"><title>需要登录</title><p>请使用数据目录 access-url 中的登录链接打开。</p>';
+const LOGIN_REQUIRED = '<!doctype html><meta charset="utf-8"><title>需要登录</title><p>请使用数据目录 access-url 中的登录链接打开（用 sudo bash install.sh --set-password 设置登录密码后可直接输入密码）。</p>';
+const loginForm = (notice: string): string => '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>登录</title>'
+  + '<style>body{font:15px/1.5 system-ui,sans-serif;max-width:22rem;margin:4rem auto;padding:0 1rem}input,button{font:inherit;padding:.45rem .6rem;width:100%;box-sizing:border-box;margin:.3rem 0}.notice{color:#b42318}</style>'
+  + '<h1>统一交易平台</h1><form method="post" action="/login"><label>登录密码<input type="password" name="password" autocomplete="current-password" required autofocus maxlength="' + 2 * MAX_PASSWORD_LENGTH + '"></label><button>登录</button></form>'
+  + (notice ? `<p class="notice">${notice}</p>` : '');
 
 /** Instances on different ports of one host share the browser cookie jar for 127.0.0.1, so the name carries the port. */
 export const sessionCookieName = (port: number): string => `pa_executor_session_${port}`;
@@ -39,13 +44,20 @@ export interface HttpOptions {
   /** Page served at /; defaults by environment. */
   page?: string;
   imports?: ImportChannel;
+  /** The login password's digest; without one only the access token logs in. */
+  password?: PasswordHash;
+  /** The address listened on besides loopback, as written in a URL (an IPv6 one in brackets); accepted in Host. */
+  host?: string;
+  /** Tests set the clock; one throttle per server otherwise. */
+  throttle?: LoginThrottle;
+  log?: (line: string) => void;
 }
 
 // Hashing first gives equal-length inputs, so the comparison does not leak the token length either.
 const sameSecret = (given: string, expected: string): boolean =>
   timingSafeEqual(createHash('sha256').update(given).digest(), createHash('sha256').update(expected).digest());
 
-export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, imports }: HttpOptions): Server {
+export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, imports, password, host, throttle = new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
   if (!accessToken) throw new Error('需要访问令牌');
   if (sameSecret(session, accessToken)) throw new Error('会话值不能与访问令牌相同');
   // The executor records which session asked for each command; it gets a digest, so the stored rows never hold the cookie.
@@ -57,6 +69,65 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     const value = (request.headers.cookie ?? '').split(';').map(part => part.trim()).find(part => part.startsWith(`${name}=`))?.slice(name.length + 1);
     return value !== undefined && sameSecret(value, session);
   };
+  // Loopback by any port (a tunnel may map it), the chosen address by itself or with a port.
+  const allowedHost = (value: string): boolean => LOOPBACK.test(value) || (host !== undefined && (value === host || (value.startsWith(`${host}:`) && /^\d{1,5}$/.test(value.slice(host.length + 1)))));
+  const sessionCookie = (request: IncomingMessage): string => `${cookieName(request)}=${session}; HttpOnly; SameSite=Strict; Path=/${sessionMaxAgeS ? `; Max-Age=${sessionMaxAgeS}` : ''}`;
+  // The form's own page sends its real Origin with the post (no-referrer would make it "null", as sandboxed pages send).
+  const loginPage = (response: ServerResponse, status: number, notice = '') => {
+    response.writeHead(status, { ...PAGE_HEADERS, 'referrer-policy': 'same-origin' });
+    response.end(password ? loginForm(notice) : LOGIN_REQUIRED);
+  };
+  let verifying = false;
+  const readForm = (request: IncomingMessage): Promise<URLSearchParams | 'too-large' | null> => new Promise((resolve, fail) => {
+    let size = 0; const chunks: Buffer[] = [];
+    const onData = (chunk: Buffer) => {
+      size += chunk.length;
+      if (size <= MAX_LOGIN_BYTES) { chunks.push(chunk); return; }
+      request.off('data', onData); resolve('too-large');
+    };
+    request.on('data', onData);
+    request.on('end', () => { if (size <= MAX_LOGIN_BYTES) resolve(new URLSearchParams(Buffer.concat(chunks).toString('utf8'))); });
+    // A client gone before the end leaves nothing to check; resolving twice is a no-op.
+    request.on('close', () => resolve(null));
+    request.on('error', fail);
+  });
+  // The form posts from this page only. Browsers name the fetch site on every post; an older one without it still names
+  // the origin, which must be this one ("null" comes from sandboxed and data: pages). No Origin at all is not a browser.
+  const sameOrigin = (request: IncomingMessage): boolean => {
+    const origin = request.headers.origin, site = request.headers['sec-fetch-site'];
+    if (site !== undefined) return site === 'same-origin' || site === 'none';
+    return origin === undefined || origin === `http://${request.headers.host}`;
+  };
+  async function passwordLogin(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!password) { request.resume(); return loginPage(response, 401); }
+    if (!sameOrigin(request) || !String(request.headers['content-type'] ?? '').startsWith('application/x-www-form-urlencoded')) { request.resume(); return loginPage(response, 403, '请从登录页提交'); }
+    const busy = () => loginPage(response, 429, `尝试次数过多，请 ${Math.max(1, Math.ceil(throttle.waitMs() / 1000))} 秒后再试`);
+    if (throttle.waitMs() > 0) { request.resume(); return busy(); }
+    // The body is read before taking the check, so a client that sends it slowly holds up nobody else.
+    const form = await readForm(request);
+    if (response.writableEnded || request.socket.destroyed) return;
+    if (form === 'too-large') {
+      response.writeHead(413, { ...PAGE_HEADERS, connection: 'close' });
+      response.end('请求体过大', () => request.socket.destroy());
+      return;
+    }
+    // One check at a time, so parallel guesses cannot outrun the counter.
+    if (throttle.waitMs() > 0 || verifying) return busy();
+    verifying = true;
+    let ok: boolean;
+    try { ok = form !== null && await verifyPassword(form.get('password') ?? '', password); }
+    finally { verifying = false; }
+    if (!ok) {
+      throttle.failed();
+      const locked = throttle.waitMs();
+      log(`页面登录密码错误（来自 ${request.socket.remoteAddress ?? '未知地址'}）${locked ? `，已锁定 ${Math.ceil(locked / 1000)} 秒` : ''}`);
+      return loginPage(response, 401, locked ? `密码错误，已锁定 ${Math.ceil(locked / 1000)} 秒` : '密码错误');
+    }
+    throttle.succeeded();
+    log(`页面密码登录成功（来自 ${request.socket.remoteAddress ?? '未知地址'}）`);
+    response.writeHead(303, { ...PAGE_HEADERS, location: '/', 'set-cookie': sessionCookie(request) });
+    response.end();
+  }
   const send = (response: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) => {
     const payload = JSON.stringify(body);
     response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...headers });
@@ -77,22 +148,27 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
   });
 
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
-    if (!LOOPBACK.test(request.headers.host ?? '')) return send(response, 421, { code: 'host', message: '只接受本机访问' });
+    if (!allowedHost(request.headers.host ?? '')) return send(response, 421, { code: 'host', message: '访问地址不在允许范围内' });
     const url = new URL(request.url ?? '/', 'http://localhost');
+    if (request.method === 'POST' && url.pathname === '/login') return passwordLogin(request, response);
     if (request.method === 'GET' && url.pathname === '/login') {
-      if (!sameSecret(url.searchParams.get('token') ?? '', accessToken)) { response.writeHead(401, PAGE_HEADERS); response.end(LOGIN_REQUIRED); return; }
-      response.writeHead(303, { ...PAGE_HEADERS, location: '/', 'set-cookie': `${cookieName(request)}=${session}; HttpOnly; SameSite=Strict; Path=/${sessionMaxAgeS ? `; Max-Age=${sessionMaxAgeS}` : ''}` });
+      const token = url.searchParams.get('token');
+      // Without a token it is the password form (or the access-url notice when no password is set).
+      if (token === null || !sameSecret(token, accessToken)) return loginPage(response, token === null && password ? 200 : 401, token === null ? '' : '登录链接无效或已过期');
+      // Whoever reads access-url may lift a lockout a guesser left.
+      throttle.succeeded();
+      response.writeHead(303, { ...PAGE_HEADERS, location: '/', 'set-cookie': sessionCookie(request) });
       response.end();
       return;
     }
     if (request.method === 'GET' && url.pathname === '/') {
-      const ok = authorized(request);
-      response.writeHead(ok ? 200 : 401, PAGE_HEADERS);
-      response.end(ok ? (page ?? (executor.environment === 'mainnet' ? LIVE_PAGE : PAGE)) : LOGIN_REQUIRED);
+      if (!authorized(request)) return loginPage(response, 401);
+      response.writeHead(200, PAGE_HEADERS);
+      response.end(page ?? (executor.environment === 'mainnet' ? LIVE_PAGE : PAGE));
       return;
     }
     if (!url.pathname.startsWith('/api/')) return send(response, 404, { code: 'not_found', message: '不存在' });
-    if (!authorized(request)) return send(response, 401, { code: 'session', message: '会话无效，请使用数据目录 access-url 中的登录链接重新打开' });
+    if (!authorized(request)) return send(response, 401, { code: 'session', message: password ? '会话无效，请刷新页面重新登录' : '会话无效，请使用数据目录 access-url 中的登录链接重新打开' });
     if (request.method === 'POST' && (request.headers['x-pa-executor'] !== '1' || !String(request.headers['content-type'] ?? '').startsWith('application/json'))) return send(response, 403, { code: 'csrf', message: '缺少本页面请求标记' });
 
     if (request.method === 'GET' && url.pathname === '/api/state') {

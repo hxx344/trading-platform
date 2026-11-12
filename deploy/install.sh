@@ -6,6 +6,11 @@
 #   sudo bash install.sh --package <目录>     从本地目录安装（含 trading-platform.tar.gz 与 SHA256SUMS）
 #   sudo bash install.sh --import-workbench   命令行方式从本机工作台导入已开启保证金平衡的配对与凭据并启动（可加 --pairs id,id
 #                                             只导入指定配对，--workbench-data <目录> 指定工作台数据目录）；页面上也能导入，见下
+#   sudo bash install.sh --set-password       设置或更换页面登录密码（输入两次，不回显；只存 scrypt 摘要，已登录的页面须重新登录；
+#                                             沿用当前已装版本，不联网升级；脚本化时加 --password-stdin 从标准输入读一行）
+#
+# 页面总在 127.0.0.1 监听（用 SSH 隧道打开）；在 config.json 写 "host": "<本机 Tailscale IP>" 后也在该地址监听，直接打开。
+# 删除 /etc/trading-platform/login-password 再执行本脚本即取消密码，只能用数据目录 access-url 里的链接登录。
 #
 # 首次安装写入不含配对的空配置并启动服务；之后在本机页面「从工作台导入配对」里选择导入（由随本脚本安装的 root 导入助手
 # trading-platform-import.path/.service 执行，写好配置后自动重启服务）。已有配置只追加新配对，导入的配对登记为停用。
@@ -42,6 +47,8 @@ fail() { restore_import; printf '安装失败：%s\n' "$*" >&2; exit 1; }
 # Set while config.json and its key file hold what an import wrote and the service has not run on them yet: any failure
 # from then on puts the files back as they were, so neither the old program nor a rollback is left with them.
 import_backup=''
+# What the backup undoes, for the messages: 导入, 设置密码 or both.
+backup_what=''
 interrupted=0
 restore_import() {
   [[ -n "$import_backup" ]] || return 0
@@ -51,21 +58,25 @@ restore_import() {
     else rm -f "$CONF_DIR/$name" || failed+=("$name"); fi
   done <"$import_backup/.files"
   import_backup=''
-  if ((${#failed[@]} == 0)); then log '已恢复导入前的配置文件。'
-  else printf '恢复导入前的配置失败：%s 可能仍是导入后的内容，请检查后手工改回\n' "$(join "${failed[@]}")" >&2; fi
+  if ((${#failed[@]} == 0)); then log "已恢复${backup_what}前的配置文件。"
+  else printf '恢复%s前的配置失败：%s 可能仍是%s后的内容，请检查后手工改回\n' "$backup_what" "$(join "${failed[@]}")" "$backup_what" >&2; fi
 }
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 version=''
 package_dir=''
 import_workbench=0
 workbench_data=''
 import_pairs=''
+set_password=0
+password_stdin=0
 while (($#)); do
   case "$1" in
     --import-workbench) import_workbench=1; shift ;;
     --workbench-data) [[ $# -ge 2 ]] || usage 2; workbench_data=$2; shift 2 ;;
     --pairs) [[ $# -ge 2 ]] || usage 2; import_pairs=$2; shift 2 ;;
+    --set-password) set_password=1; shift ;;
+    --password-stdin) password_stdin=1; shift ;;
     --version) [[ $# -ge 2 ]] || usage 2; version=$2; shift 2 ;;
     --package) [[ $# -ge 2 ]] || usage 2; package_dir=$2; shift 2 ;;
     -h|--help) usage 0 ;;
@@ -75,6 +86,7 @@ done
 [[ -z "$version" || "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail '--version 须形如 v0.1.0'
 [[ -z "$version" || -z "$package_dir" ]] || fail '--version 与 --package 只能二选一'
 ((import_workbench)) || [[ -z "$workbench_data$import_pairs" ]] || fail '--workbench-data 与 --pairs 须和 --import-workbench 一起使用'
+((set_password || !password_stdin)) || fail '--password-stdin 须和 --set-password 一起使用'
 
 [[ "$(uname -s)" == Linux ]] || fail '只支持 Linux。'
 if [[ "$TEST_MODE" != 1 ]]; then
@@ -82,6 +94,27 @@ if [[ "$TEST_MODE" != 1 ]]; then
   for cmd in systemctl useradd getent runuser; do command -v "$cmd" >/dev/null || fail "缺少命令 $cmd"; done
 fi
 for cmd in curl tar gzip sha256sum awk flock stat; do command -v "$cmd" >/dev/null || fail "缺少命令 $cmd"; done
+
+# Asked before anything is downloaded. A terminal gets two hidden prompts; anything else must say --password-stdin,
+# so `curl … | sudo bash -s -- --set-password` cannot take the script's own next line as the password.
+new_password=''
+if ((set_password)); then
+  if ((password_stdin)); then
+    # A script read from stdin itself (curl … | bash -s) would give its own next line as the password.
+    [[ -f "$0" ]] || fail '脚本本身从标准输入读入时不能用 --password-stdin：先下载 install.sh 再执行'
+    IFS= read -r new_password || [[ -n "$new_password" ]] || fail '--password-stdin 没有从标准输入读到密码'
+  elif [[ -t 0 ]]; then
+    IFS= read -rs -p '新的页面登录密码（至少 8 个字符）：' new_password; printf '\n' >&2
+    IFS= read -rs -p '再输入一次：' again; printf '\n' >&2
+    [[ "$new_password" == "$again" ]] || fail '两次输入的密码不一致'
+    unset again
+  else
+    [[ -f "$0" ]] || fail '标准输入不是终端：请先下载 install.sh，再在终端里执行 sudo bash install.sh --set-password'
+    fail '标准输入不是终端：请在终端里执行，或加 --password-stdin 从标准输入读一行密码'
+  fi
+  ((${#new_password} >= 8)) || fail '密码至少 8 个字符'
+fi
+
 
 as_root_dir() { # path mode [owner group]
   if [[ "$TEST_MODE" == 1 ]]; then install -d -m "$2" "$1"; else install -d -m "$2" -o "${3:-root}" -g "${4:-root}" "$1"; fi
@@ -105,7 +138,13 @@ trap 'trap "" INT TERM HUP; restore_import; rm -rf "$work_dir"' EXIT
 trap 'exit 130' INT TERM HUP
 
 # ---- 1. 校验清单与程序包 ----------------------------------------------------------
-if [[ -n "$package_dir" ]]; then
+# Changing only the password keeps the installed release: nothing is downloaded and the program does not change.
+installed_sha=$(cat "$APP_DIR/current/.package-sha256" 2>/dev/null || true)
+if ((set_password)) && [[ -z "$version$package_dir" && "$installed_sha" =~ ^[a-f0-9]{64}$ ]]; then
+  printf '%s  trading-platform.tar.gz\n' "$installed_sha" >"$work_dir/SHA256SUMS"
+  source_label='当前已装版本'
+  [[ "$(cat "$APP_DIR/releases/${installed_sha:0:16}/.package-sha256" 2>/dev/null)" == "$installed_sha" ]] || fail '找不到当前已装版本的目录，请加 --version 或 --package 指定要用的版本'
+elif [[ -n "$package_dir" ]]; then
   [[ -f "$package_dir/SHA256SUMS" && -f "$package_dir/trading-platform.tar.gz" ]] || fail "$package_dir 里缺少 SHA256SUMS 或 trading-platform.tar.gz"
   cp "$package_dir/SHA256SUMS" "$work_dir/SHA256SUMS"
   source_label="本地目录 $package_dir"
@@ -205,6 +244,7 @@ if ((import_workbench)); then
     if [[ -f "$CONF_DIR/$name" ]]; then cp -p "$CONF_DIR/$name" "$work_dir/conf-before/$name"; fi
   done <"$work_dir/conf-before/.files"
   import_backup="$work_dir/conf-before"
+  backup_what='导入'
   import_args=(--config "$CONF_DIR/config.json" --workbench-env "$WORKBENCH_ENV")
   [[ -z "$workbench_data" ]] || import_args+=(--workbench-data "$workbench_data")
   [[ -z "$import_pairs" ]] || import_args+=(--pairs "$import_pairs")
@@ -241,7 +281,26 @@ if [[ -f "$CONF_DIR/config.json" ]]; then
       secrets_file=''
     fi
   fi
-  for file in "$CONF_DIR/config.json" ${secrets_file:+"$secrets_file"}; do
+  # The login password's digest is written below when asked for; set the hard way, it is taken over the same.
+  if ((set_password)); then
+    grep -q "'hash-password'" "$release_dir/src/service/main.ts" || fail "所选版本 $new_version 不支持 --set-password：先执行 sudo bash install.sh 升级（或加 --version 指定 v0.4.0 及以后的版本）再设置"
+    password_hash=$(printf '%s\n' "$new_password" | as_service "$NODE_BIN" "$release_dir/src/service/main.ts" --hash-password) || fail '无法生成密码摘要'
+    new_password=''
+    [[ "$password_hash" == scrypt:* ]] || fail '密码摘要格式不对'
+    # Undone like an import until the service runs on it: a failed check or start puts the old password back.
+    if [[ ! -d "$work_dir/conf-before" ]]; then mkdir "$work_dir/conf-before"; : >"$work_dir/conf-before/.files"; fi
+    if ! grep -qx login-password "$work_dir/conf-before/.files"; then
+      if [[ -f "$CONF_DIR/login-password" ]]; then cp -p "$CONF_DIR/login-password" "$work_dir/conf-before/login-password"; fi
+      printf 'login-password\n' >>"$work_dir/conf-before/.files"
+    fi
+    import_backup="$work_dir/conf-before"
+    backup_what=${backup_what:+$backup_what与}设置密码
+    ( umask 077; printf '%s\n' "$password_hash" >"$CONF_DIR/.login-password.tmp" ) || fail '无法写入登录密码'
+    [[ "$TEST_MODE" == 1 ]] || chown "$SERVICE_USER:$SERVICE_USER" "$CONF_DIR/.login-password.tmp"
+    mv -f "$CONF_DIR/.login-password.tmp" "$CONF_DIR/login-password"
+    changes+=('登录密码（已打开的页面须重新登录）')
+  fi
+  for file in "$CONF_DIR/config.json" ${secrets_file:+"$secrets_file"} "$CONF_DIR/login-password"; do
     [[ -f "$file" && ! -L "$file" ]] || continue
     if [[ "$TEST_MODE" == 1 ]]; then wanted="$(id -un) 600"; else wanted="$SERVICE_USER 600"; fi
     if [[ "$(stat -c '%U %a' "$file")" != "$wanted" ]]; then
@@ -252,10 +311,14 @@ if [[ -f "$CONF_DIR/config.json" ]]; then
   done
 fi
 
+((configured || !set_password)) || fail "尚无 $CONF_DIR/config.json，无法设置登录密码"
+
 # ---- 4. 校验配置 ----------------------------------------------------------------------
 config_hash() {
   "$NODE_BIN" -e 'const fs = require("fs"), hash = require("crypto").createHash("sha256"); const text = fs.readFileSync(process.argv[1]); hash.update(text);
-    try { const s = JSON.parse(text).secretsFile; if (typeof s === "string") hash.update(fs.readFileSync(s)); } catch {} process.stdout.write(hash.digest("hex"));' "$CONF_DIR/config.json"
+    try { const s = JSON.parse(text).secretsFile; if (typeof s === "string") hash.update(fs.readFileSync(s)); } catch {}
+    try { const p = require("path").join(require("path").dirname(process.argv[1]), "login-password"); hash.update("login-password"); hash.update(fs.readFileSync(p)); } catch {}
+    process.stdout.write(hash.digest("hex"));' "$CONF_DIR/config.json"
 }
 switch_to() {
   ln -sfn "$1" "$APP_DIR/.current.tmp"
@@ -266,6 +329,8 @@ if ((configured)); then
     fail "配置检查未通过，服务保持原版本：$check"
   fi
   log "$check"
+  # Pages logged in before (perhaps with the old password) are logged out: the restart below makes a new session.
+  if ((set_password)); then rm -f "$DATA_DIR/http-session"; fi
 fi
 
 # ---- 5. systemd 单元、切换版本 ---------------------------------------------------------
@@ -387,10 +452,14 @@ else
       # A first setup by import leaves no config once undone: nothing to run, so the unit is not left to fail at boot.
       if ((imported)) && [[ ! -f "$CONF_DIR/config.json" ]]; then
         steady systemctl disable --now --quiet "$SERVICE" 2>/dev/null || true
-        fail '导入的配置启动失败，已撤销导入（尚无 config.json），服务已停止并取消开机自启；请按上面的日志处理后重新执行本脚本'
+        fail "${backup_what}后的配置启动失败，已撤销${backup_what}（尚无 config.json），服务已停止并取消开机自启；请按上面的日志处理后重新执行本脚本"
       fi
       if ((program_changed)) && [[ -n "$previous_dir" && -d "$previous_dir" ]]; then
         previous_version=$(head -n1 "$previous_dir/VERSION" 2>/dev/null || echo 上一版本)
+        # A config only the new version reads (say "host") would leave the old one unable to start: stay instead.
+        if ! previous_check=$(as_service "$NODE_BIN" "$previous_dir/src/service/main.ts" --config "$CONF_DIR/config.json" --check-config 2>&1); then
+          fail "新版本 $new_version 启动失败；上一版本 $previous_version 不接受当前配置（$previous_check），未回退。请按上面的日志处理后重新执行本脚本；要回退，先删去 config.json 里新版本才有的字段（如 host）再执行 --version"
+        fi
         ( trap '' INT TERM HUP; switch_to "$previous_dir" )
         rollback_unit=0
         ( trap '' INT TERM HUP; write_unit "$previous_dir" ) || rollback_unit=$?
@@ -407,8 +476,8 @@ else
       if ((imported)); then
         printf -v marker '%(%s)T' -1
         steady systemctl reset-failed "$SERVICE" 2>/dev/null || true
-        if steady systemctl restart "$SERVICE" && healthy "$marker"; then fail '导入的配置启动失败，已恢复导入前的配置并确认服务运行正常；请按上面的日志处理'; fi
-        fail '导入的配置启动失败，已恢复导入前的配置，但服务仍未正常运行；请按日志处理后重新执行本脚本'
+        if steady systemctl restart "$SERVICE" && healthy "$marker"; then fail "${backup_what}后的配置启动失败，已恢复${backup_what}前的配置并确认服务运行正常；请按上面的日志处理"; fi
+        fail "${backup_what}后的配置启动失败，已恢复${backup_what}前的配置，但服务仍未正常运行；请按日志处理后重新执行本脚本"
       fi
       fail '服务启动失败；请按上面的日志检查配置后重新执行本脚本'
     fi
@@ -438,7 +507,13 @@ if ((${#skipped[@]})); then log "跳过：$(join "${skipped[@]}")"; fi
 if ((!configured)); then
   log "下一步：参照 $CONF_DIR/config.example.json 与 secrets.example.json 写好 $CONF_DIR/config.json 与 secrets.json，再执行一次本脚本。"
 else
-  port=$("$NODE_BIN" -e 'try { const p = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).port; process.stdout.write(String(p ?? 4720)); } catch { process.stdout.write("4720"); }' "$CONF_DIR/config.json")
-  log "本机页面：在自己电脑上执行 ssh -N -L $port:127.0.0.1:$port <服务器>，再打开 sudo cat $DATA_DIR/access-url 里的登录链接。"
+  read -r port host < <("$NODE_BIN" -e 'let c = {}; try { c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); } catch {}
+    const h = typeof c.host === "string" ? c.host : ""; process.stdout.write(String(c.port ?? 4720) + " " + (h.includes(":") ? "[" + h + "]" : h) + "\n");' "$CONF_DIR/config.json")
+  if [[ -f "$CONF_DIR/login-password" ]]; then login_hint='用登录密码登录'; else login_hint="用 sudo cat $DATA_DIR/access-url 里的链接登录（设置登录密码：sudo bash install.sh --set-password）"; fi
+  if [[ -n "$host" ]]; then
+    log "页面：http://$host:$port/ ，$login_hint（Tailscale 不通时：ssh -N -L $port:127.0.0.1:$port <服务器> 后打开 http://127.0.0.1:$port/）。"
+  else
+    log "本机页面：在自己电脑上执行 ssh -N -L $port:127.0.0.1:$port <服务器>，再打开 http://127.0.0.1:$port/ ，$login_hint；在 config.json 写 \"host\": \"<Tailscale IP>\" 可免隧道。"
+  fi
   [[ "${check:-}" != 配置有效：0\ 个配对* ]] || log "下一步：在页面「从工作台导入配对」里点「读取工作台」，勾选配对后导入；导入后在旧工作台删除该配对，再在页面启用。"
 fi

@@ -268,7 +268,7 @@ async function importRequest(body, label) {
       let result;
       try { result = (await api('/api/import')).result; }
       catch (error) {
-        if (error.status === 401) throw new Error('会话已失效（服务重启时更换了会话），请用数据目录 access-url 里的登录链接重新打开；导入结果可稍后点「读取工作台」核对');
+        if (error.status === 401) throw new Error('会话已失效（服务重启时更换了会话），请刷新页面重新登录（或用数据目录 access-url 里的登录链接）；导入结果可稍后点「读取工作台」核对');
         if (restarting || error.status === undefined || error.status >= 500) { $('importMsg').innerHTML = '服务重启中…'; continue; }
         throw error;
       }

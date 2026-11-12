@@ -2,7 +2,9 @@
 # put overrides in `systemctl edit trading-platform` and extra environment in @CONF_DIR@/environment.
 [Unit]
 Description=统一交易平台（ASTER 保证金平衡划转与 ADL 应急处理）
-After=network-online.target
+# tailscaled only orders the start when it exists (config.host may be its address); the service still waits for the
+# address itself, since tailscaled being up does not mean the address is.
+After=network-online.target tailscaled.service
 Wants=network-online.target
 # Never give up restarting: a stopped unit leaves the enabled pairs with neither balancing nor ADL handling. The
 # service waits out a crashed instance's lease itself, so restarts do not spin.

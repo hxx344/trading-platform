@@ -1,6 +1,7 @@
-// The service's two operator files. config.json chooses the port, the request budget and the pairs by account name;
+// The service's two operator files. config.json chooses the listen address and port, the request budget and the pairs by account name;
 // secrets.json holds each account's wallet triple and the Feishu robot. Both are read through the same owner-and-mode
 // check as the live canary files, and no message built here carries a key or a webhook.
+import { isIP } from 'node:net';
 import { isAbsolute } from 'node:path';
 import { ContractError, PAIR_ID, exactKeys, integer, parseTransferConfig, type TransferConfig } from '../contracts.ts';
 import { IP_CEILING, parseAsterCredentials, type AsterCredentials } from '../aster/client.ts';
@@ -18,6 +19,8 @@ export const MAX_PAIRS = 20;
 export interface ServicePair { id: string; main: string; long: string; short: string; transfer: TransferConfig; adl?: AdlConfig }
 export interface ServiceConfig {
   port: number;
+  /** One more address listened on besides 127.0.0.1 (say the server's Tailscale IP); null for loopback only. */
+  host: string | null;
   budget: { limitPerMinute: number; adlReserve: number };
   secretsFile: string;
   pairs: ServicePair[];
@@ -33,12 +36,31 @@ export function pairWeightPerMinute(pair: ServicePair): number {
 /** Room above the idle use for takeover checks, transfers and catch-up history pages. */
 const BUDGET_HEADROOM = 100;
 
+/**
+ * One specific address of this server, normalised as a URL writes it (so it matches the browser's Host header). The
+ * wildcard addresses are refused: the page would then answer on every interface, the public one included.
+ */
+export function parseListenHost(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string' || isIP(value) === 0) throw new Error('host 须为本机的一个 IP 地址（例如 Tailscale 的 100.x.y.z），不能是域名');
+  const v6 = isIP(value) === 6;
+  const hostname = new URL(`http://${v6 ? `[${value}]` : value}/`).hostname;
+  const normalised = v6 ? hostname.slice(1, -1) : hostname;
+  if (/^0\./.test(normalised) || normalised === '::' || normalised === '::ffff:0:0' || normalised === '255.255.255.255') throw new Error('host 不能是 0.0.0.0、:: 等通配地址，须写本机的一个具体 IP');
+  // 127.0.0.1 is always listened on: the same port again would never bind.
+  if (/^127\./.test(normalised) || normalised === '::1' || /^::ffff:7f[0-9a-f]{2}:/.test(normalised)) throw new Error('host 不用写回环地址（总会监听 127.0.0.1），须写 Tailscale 等其它本机 IP');
+  return normalised;
+}
+/** The listen address as written in a URL or a Host header. */
+export const urlHost = (host: string): string => isIP(host) === 6 ? `[${host}]` : host;
+
 const fail = (name: string, error: unknown): Error => new Error(`${name}无效：${error instanceof ContractError || error instanceof Error ? error.message : '格式错误'}`);
 
 export function parseServiceConfig(raw: unknown): ServiceConfig {
-  const value = exactKeys(raw, ['secretsFile', 'pairs'], ['port', 'budget']);
+  const value = exactKeys(raw, ['secretsFile', 'pairs'], ['port', 'host', 'budget']);
   if (typeof value.secretsFile !== 'string' || !isAbsolute(value.secretsFile)) throw new Error('secretsFile 必须是绝对路径');
   const port = value.port === undefined ? DEFAULT_PORT : integer(value.port, 1_024, 65_535, '端口');
+  const host = parseListenHost(value.host);
   const budgetRaw = exactKeys(value.budget ?? {}, [], ['limitPerMinute', 'adlReserve']);
   // No pair at all is a valid start: the page is up, and pairs come in from the workbench import there.
   if (!Array.isArray(value.pairs) || value.pairs.length > MAX_PAIRS) throw new Error(`pairs 须为列表，最多 ${MAX_PAIRS} 个配对`);
@@ -66,7 +88,7 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   if (limitPerMinute > IP_CEILING) throw new Error(`${pairs.length} 个配对每分钟约需请求权重 ${needed}，加两成余量为 ${limitPerMinute}，超过本服务可用的 ${IP_CEILING}；请减少配对或调大 checkIntervalMs`);
   const adlReserve = budgetRaw.adlReserve === undefined ? Math.floor(limitPerMinute / 6) : integer(budgetRaw.adlReserve, 0, limitPerMinute - 50, 'ADL 预留权重');
   if (limitPerMinute - adlReserve < needed) throw new Error(`${pairs.length} 个配对每分钟约需请求权重 ${needed}，而每分钟上限 ${limitPerMinute} 减去 ADL 预留 ${adlReserve} 只剩 ${limitPerMinute - adlReserve}；请调大 budget.limitPerMinute 或去掉 budget 使用自动值`);
-  return { port, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs };
+  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs };
 }
 
 export function parseServiceSecrets(raw: unknown, needed: readonly string[]): ServiceSecrets {

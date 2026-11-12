@@ -87,11 +87,13 @@ export function keptSession(dir: string, now = Date.now()): string {
  * reaches stdout or logs; whoever can read the data directory can log in. The
  * temporary file plus rename keeps a reader from seeing a half-written link.
  */
-export function writeAccessUrl(dir: string, port: number, token: string): string {
+export function writeAccessUrl(dir: string, port: number, token: string, host?: string): string {
   const target = join(dir, 'access-url');
   const temp = join(dir, `.access-url.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
   try {
-    writeFileSync(temp, `http://127.0.0.1:${port}/login?token=${token}\n`, { mode: 0o600, flag: 'wx' });
+    // With a chosen address its link comes first; the loopback one always works (through an SSH tunnel).
+    const links = [...(host ? [host] : []), '127.0.0.1'].map(name => `http://${name}:${port}/login?token=${token}\n`).join('');
+    writeFileSync(temp, links, { mode: 0o600, flag: 'wx' });
     renameSync(temp, target);
   } catch (error) { rmSync(temp, { force: true }); throw error; }
   return target;

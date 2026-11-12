@@ -1,10 +1,11 @@
 // The ASTER service entry: margin-balance transfers and ADL emergency handling of the configured pairs on mainnet.
-// It owns a dedicated data directory, listens on loopback only and takes no pair over by itself: a configured pair is
+// It owns a dedicated data directory, listens on loopback (and on the one address config.host names) and takes no pair over by itself: a configured pair is
 // registered switched off, and only switching it on in the page (after the takeover checks) hands its accounts to this
 // service. Pairs dropped from the config are switched off at start.
 import { randomUUID } from 'node:crypto';
+import { networkInterfaces } from 'node:os';
 import { mkdirSync } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { openStore } from '../store.ts';
 import { createExecutor, type Executor } from '../executor.ts';
@@ -15,7 +16,8 @@ import { AsterTransferConnector } from '../aster/transfer.ts';
 import { AsterTradingConnector } from '../aster/trading.ts';
 import { ASTER_PAGE } from '../page.ts';
 import { runExecutor } from '../runtime.ts';
-import { assertDistinctSigners, loadServiceConfig, loadServiceSecrets, type ServiceConfig, type ServiceSecrets } from './config.ts';
+import { assertDistinctSigners, loadServiceConfig, loadServiceSecrets, urlHost, type ServiceConfig, type ServiceSecrets } from './config.ts';
+import { PASSWORD_FILE, hashPassword, loadPasswordHash, type PasswordHash } from '../login-password.ts';
 import { createTakeoverGuard } from './takeover.ts';
 import { createNotifier, type EventRow, type Notifier } from './feishu.ts';
 import { runUserStream, type SocketLike } from './stream.ts';
@@ -126,10 +128,11 @@ export interface StartOptions {
   leaseWaitMs?: number;
   /** The hand-off directory of the root import helper (install.sh sets it up); without it the page offers no import. */
   importDir?: string;
+  password?: PasswordHash;
 }
 
 /** Opens the data directory, wires the executor and runs it with the alerts and the user streams until shutdown. */
-export async function startService({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir }: StartOptions): Promise<ReturnType<typeof runExecutor>> {
+export async function startService({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password }: StartOptions): Promise<ReturnType<typeof runExecutor>> {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   claimDataDirEnvironment(dir, 'mainnet');
   const session = keptSession(dir);
@@ -161,7 +164,8 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
   } catch (error) { notifier.close(); executor.close(); store.close(); locks.release(); throw error; }
 
   return runExecutor({
-    executor, store, dir, port, page: ASTER_PAGE, session, passes: ['transfers', 'adl'], drainMs: DRAIN_MS,
+    executor, store, dir, port, page: ASTER_PAGE, session,
+    ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: ['transfers', 'adl'], drainMs: DRAIN_MS,
     ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir) } } : {}),
     startedMessage: `ASTER 服务已启动（${config.pairs.length} 个配对，已启用 ${enabled} 个）`,
     background: context => [
@@ -189,20 +193,32 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
 }
 
 async function main(): Promise<void> {
-  const { values } = parseArgs({ options: { config: { type: 'string' }, 'data-dir': { type: 'string' }, 'import-dir': { type: 'string' }, 'check-config': { type: 'boolean' } } });
+  const { values } = parseArgs({ options: { config: { type: 'string' }, 'data-dir': { type: 'string' }, 'import-dir': { type: 'string' }, 'check-config': { type: 'boolean' }, 'hash-password': { type: 'boolean' } } });
+  if (values['hash-password']) {
+    // install.sh --set-password: the password arrives on stdin (one line), only the digest leaves on stdout.
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+    process.stdout.write(`${await hashPassword(Buffer.concat(chunks).toString('utf8').replace(/\r?\n$/, ''))}\n`);
+    return;
+  }
   if (!values.config) throw new Error('需要 --config <服务配置文件的绝对路径>');
   const config = loadServiceConfig(values.config);
   const secrets = loadServiceSecrets(config);
+  // Next to the config, written by install.sh --set-password; no file means no password.
+  const password = loadPasswordHash(join(dirname(values.config), PASSWORD_FILE));
   if (values['check-config']) {
     // Read and validated offline (keys must derive their signers); nothing is sent anywhere.
-    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、') || '尚未导入'}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}\n`);
+    // Only noted, not refused: at boot or with Tailscale logged out the address is missing, and 127.0.0.1 still serves.
+    const local = config.host === null || Object.values(networkInterfaces()).flat().some(item => item?.address === config.host);
+    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、') || '尚未导入'}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}，监听 127.0.0.1${config.host ? ` 与 ${urlHost(config.host)}` : ''}，登录密码${password ? '已设置' : '未设置'}\n`);
+    if (!local) process.stdout.write(`注意：${config.host} 现在不在本机网卡上（地址写错，或 Tailscale 尚未连接）；服务会持续重试，在此之前页面只能经 127.0.0.1 打开\n`);
     return;
   }
   if (!values['data-dir']) throw new Error('需要 --data-dir <独立目录的绝对路径>');
   const dir = assertDedicatedDataDir(values['data-dir']);
   const importDir = values['import-dir'];
   if (importDir !== undefined && !isAbsolute(importDir)) throw new Error('--import-dir 必须是绝对路径');
-  await startService({ config, secrets, dir, ...(importDir ? { importDir } : {}) });
+  await startService({ config, secrets, dir, ...(importDir ? { importDir } : {}), ...(password ? { password } : {}) });
 }
 
 if (import.meta.main) main().catch(error => { process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; });

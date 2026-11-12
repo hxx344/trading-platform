@@ -4,10 +4,11 @@
 #   curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/install.sh && sudo bash install.sh
 #   sudo bash install.sh --version v0.1.0     安装指定版本（也用于回退）
 #   sudo bash install.sh --package <目录>     从本地目录安装（含 trading-platform.tar.gz 与 SHA256SUMS）
-#   sudo bash install.sh --import-workbench   从本机工作台导入已开启保证金平衡的配对与凭据并启动（可加 --pairs id,id 只导入指定配对，
-#                                             --workbench-data <目录> 指定工作台数据目录）；已有配置只追加新配对，导入的配对登记为停用
+#   sudo bash install.sh --import-workbench   命令行方式从本机工作台导入已开启保证金平衡的配对与凭据并启动（可加 --pairs id,id
+#                                             只导入指定配对，--workbench-data <目录> 指定工作台数据目录）；页面上也能导入，见下
 #
-# 首次安装只放好程序和示例配置；按示例写好 /etc/trading-platform/config.json 与 secrets.json 后再执行一次即启动。
+# 首次安装写入不含配对的空配置并启动服务；之后在本机页面「从工作台导入配对」里选择导入（由随本脚本安装的 root 导入助手
+# trading-platform-import.path/.service 执行，写好配置后自动重启服务）。已有配置只追加新配对，导入的配对登记为停用。
 # 之后每次执行：先只下载校验清单，程序包、Node.js、systemd 单元、配置都没变且服务在运行时直接结束；
 # 有变化时先用新程序校验配置，校验不过就保持原版本；重启后 90 秒内没有正常监听就自动回退到上一版本。
 set -euo pipefail
@@ -27,6 +28,10 @@ RELEASE_BASE=${TP_RELEASE_BASE:-https://github.com/$REPO/releases}
 # 测试模式：不要求 root、不建系统账号、不改属主、不调用 systemctl；只用于仓库自带的安装测试。
 TEST_MODE=${TP_TEST_MODE:-0}
 WORKBENCH_ENV=${TP_WORKBENCH_ENV:-/etc/project-aggregation.env}
+# The page's import requests: root owns it, the service's group writes requests, the root helper writes results.
+IMPORT_DIR=${TP_IMPORT_DIR:-/var/lib/trading-platform-import}
+UNIT_DIR=$(dirname "$UNIT_FILE")
+IMPORT_UNITS=("$SERVICE-import.path" "$SERVICE-import.service")
 
 # Never fails: a closed terminal (SSH gone) or pipe must not end the script half way through a start.
 log() { printf '%s\n' "$*" 2>/dev/null || true; }
@@ -179,6 +184,7 @@ if [[ "$TEST_MODE" != 1 ]] && ! getent passwd "$SERVICE_USER" >/dev/null; then
 fi
 as_root_dir "$CONF_DIR" 750 root "$SERVICE_USER"
 as_root_dir "$DATA_DIR" 700 "$SERVICE_USER" "$SERVICE_USER"
+as_root_dir "$IMPORT_DIR" 770 root "$SERVICE_USER"
 for name in config secrets; do
   example="$release_dir/deploy/$name.example.json"
   if ! cmp -s "$example" "$CONF_DIR/$name.example.json"; then install -m 644 "$example" "$CONF_DIR/$name.example.json"; fi
@@ -203,6 +209,23 @@ if ((import_workbench)); then
   [[ -z "$workbench_data" ]] || import_args+=(--workbench-data "$workbench_data")
   [[ -z "$import_pairs" ]] || import_args+=(--pairs "$import_pairs")
   (cd / && "$NODE_BIN" "$release_dir/src/service/import-workbench.ts" "${import_args[@]}" 9>&-) || fail '从工作台导入配置失败'
+fi
+# A first setup without an import starts on a config with no pairs, so the page is up to import them from.
+if [[ ! -e "$CONF_DIR/config.json" && ! -L "$CONF_DIR/config.json" ]]; then
+  if [[ -e "$CONF_DIR/secrets.json" || -L "$CONF_DIR/secrets.json" ]]; then
+    log "$CONF_DIR/secrets.json 已存在但没有 config.json，未生成空配置；请先确认它的内容。"
+  elif compgen -G "$DATA_DIR/executor*.sqlite" >/dev/null; then
+    # A service that ran before and lost its config would start with no pairs and disable every pair it knew.
+    log "$DATA_DIR 里已有运行记录但没有 config.json，未生成空配置；请恢复原配置，或在确认后手动写入空配置。"
+  else
+    # Both or neither: a key file left without a config would need a manual look on the next run.
+    "$NODE_BIN" -e 'const fs = require("fs"), [config, secrets] = process.argv.slice(1);
+      fs.writeFileSync(secrets, JSON.stringify({ accounts: {} }, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+      try { fs.writeFileSync(config, JSON.stringify({ secretsFile: secrets, pairs: [] }, null, 2) + "\n", { mode: 0o600, flag: "wx" }); }
+      catch (error) { fs.rmSync(secrets, { force: true }); throw error; }' \
+      "$CONF_DIR/config.json" "$CONF_DIR/secrets.json" || fail '无法生成空配置'
+    changes+=('空配置（在页面导入配对）')
+  fi
 fi
 configured=0
 if [[ -f "$CONF_DIR/config.json" ]]; then
@@ -247,14 +270,24 @@ fi
 
 # ---- 5. systemd 单元、切换版本 ---------------------------------------------------------
 # Written only after the config check passed, so a failed run never leaves a new unit that systemd was not reloaded for.
-write_unit() { # $1：取单元模板的版本目录；有变化并已写入返回 0，未变化返回 1，模板缺失或无法生成返回 2（不动现有单元）
-  [[ -f "$1/deploy/trading-platform.service" ]] || return 2
+render_to() { # 模板 输出；模板缺失或无法生成时失败
+  [[ -f "$1" ]] || return 1
   sed -e "s|@NODE@|$NODE_BIN|g" -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@CONF_DIR@|$CONF_DIR|g" -e "s|@DATA_DIR@|$DATA_DIR|g" \
-    "$1/deploy/trading-platform.service" >"$work_dir/unit" || return 2
-  [[ -s "$work_dir/unit" ]] || return 2
-  cmp -s "$work_dir/unit" "$UNIT_FILE" && return 1
-  install -m 644 "$work_dir/unit" "$UNIT_FILE"
+    -e "s|@IMPORT_DIR@|$IMPORT_DIR|g" -e "s|@FLOCK@|$FLOCK_BIN|g" -e "s|@WORKBENCH_ENV@|$WORKBENCH_ENV|g" "$1" >"$2" || return 1
+  [[ -s "$2" ]]
 }
+render_unit() { # 模板 目标；有变化并已写入返回 0，未变化返回 1，模板缺失或无法生成返回 2（不动现有单元）
+  render_to "$1" "$work_dir/unit" || return 2
+  cmp -s "$work_dir/unit" "$2" && return 1
+  install -m 644 "$work_dir/unit" "$2"
+}
+write_unit() { render_unit "$1/deploy/trading-platform.service" "$UNIT_FILE"; } # $1：取单元模板的版本目录
+FLOCK_BIN=$(command -v flock)
+# The page's import helper. A release without its templates (older than v0.3.0) leaves any installed units as they are.
+# Rendered before any unit is written, so a failure here leaves every installed unit untouched.
+for unit in "${IMPORT_UNITS[@]}"; do
+  if [[ -f "$release_dir/deploy/$unit" ]]; then render_to "$release_dir/deploy/$unit" "$work_dir/$unit" || fail "无法生成 $unit，未切换版本。"; fi
+done
 unit_changed=0
 unit_status=0
 write_unit "$release_dir" || unit_status=$?
@@ -263,8 +296,24 @@ case $unit_status in
   1) skipped+=('systemd 单元（未变化）') ;;
   *) fail '无法从程序包生成 systemd 单元，未切换版本。' ;;
 esac
-# An earlier run may have written the unit and stopped before reloading.
-needs_reload() { ((unit_changed)) || [[ "$TEST_MODE" != 1 && "$(systemctl show -p NeedDaemonReload --value "$SERVICE" 2>/dev/null)" == yes ]]; }
+import_units_changed=0
+for unit in "${IMPORT_UNITS[@]}"; do
+  [[ -f "$work_dir/$unit" ]] || continue
+  cmp -s "$work_dir/$unit" "$UNIT_DIR/$unit" && continue
+  install -m 644 "$work_dir/$unit" "$UNIT_DIR/$unit"
+  import_units_changed=1
+done
+if ((import_units_changed)); then changes+=('页面导入助手单元'); fi
+# An earlier run may have written a unit and stopped before reloading.
+needs_reload() {
+  ((unit_changed || import_units_changed)) && return 0
+  [[ "$TEST_MODE" != 1 ]] || return 1
+  local unit
+  for unit in "$SERVICE" "${IMPORT_UNITS[@]}"; do
+    [[ "$(systemctl show -p NeedDaemonReload --value "$unit" 2>/dev/null)" != yes ]] || return 0
+  done
+  return 1
+}
 program_changed=0
 if [[ "$previous_dir" != "$release_dir" ]]; then switch_to "$release_dir"; program_changed=1; changes+=("程序 $new_version"); fi
 applied_file="$APP_DIR/.applied-config"
@@ -275,6 +324,17 @@ if ((configured)); then
 fi
 
 # ---- 6. 启动或重启 ------------------------------------------------------------------
+# Failing to arm the import helper does not fail the install: the service runs, only the page's import waits for it.
+ensure_import_path() {
+  [[ -f "$UNIT_DIR/$SERVICE-import.path" ]] || return 0
+  local unit="$SERVICE-import.path"
+  if ! systemctl is-enabled --quiet "$unit"; then
+    if systemctl enable --quiet "$unit"; then changes+=('页面导入助手'); else log "无法设置 $unit 开机自启，页面导入暂不可用"; return 0; fi
+  fi
+  if ((import_units_changed)) || ! systemctl is-active --quiet "$unit"; then
+    systemctl restart "$unit" || log "无法启动 $unit，页面导入暂不可用"
+  fi
+}
 journal_tail() { steady journalctl -u "$SERVICE" -n 30 --no-pager -o cat 2>/dev/null || true; }
 healthy() { # marker：重启前的时间（秒）；服务写出新的登录链接文件说明已完成装配并在本机监听
   local marker=$1 waited=0 restarts
@@ -294,9 +354,11 @@ if [[ "$TEST_MODE" == 1 ]]; then
   ((configured)) && printf '%s\n' "$applied" >"$applied_file"
 elif ((!configured)); then
   if needs_reload; then systemctl daemon-reload; fi
+  ensure_import_path
   skipped+=('启动服务（尚无 config.json）')
 else
   if needs_reload; then systemctl daemon-reload; fi
+  ensure_import_path
   if ! systemctl is-enabled --quiet "$SERVICE"; then systemctl enable --quiet "$SERVICE"; changes+=('开机自启'); fi
   action=''
   if ! systemctl is-active --quiet "$SERVICE"; then action=start
@@ -378,4 +440,5 @@ if ((!configured)); then
 else
   port=$("$NODE_BIN" -e 'try { const p = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).port; process.stdout.write(String(p ?? 4720)); } catch { process.stdout.write("4720"); }' "$CONF_DIR/config.json")
   log "本机页面：在自己电脑上执行 ssh -N -L $port:127.0.0.1:$port <服务器>，再打开 sudo cat $DATA_DIR/access-url 里的登录链接。"
+  [[ "${check:-}" != 配置有效：0\ 个配对* ]] || log "下一步：在页面「从工作台导入配对」里点「读取工作台」，勾选配对后导入；导入后在旧工作台删除该配对，再在页面启用。"
 fi

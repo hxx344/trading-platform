@@ -40,7 +40,8 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   if (typeof value.secretsFile !== 'string' || !isAbsolute(value.secretsFile)) throw new Error('secretsFile 必须是绝对路径');
   const port = value.port === undefined ? DEFAULT_PORT : integer(value.port, 1_024, 65_535, '端口');
   const budgetRaw = exactKeys(value.budget ?? {}, [], ['limitPerMinute', 'adlReserve']);
-  if (!Array.isArray(value.pairs) || value.pairs.length < 1 || value.pairs.length > MAX_PAIRS) throw new Error(`pairs 须列出 1–${MAX_PAIRS} 个配对`);
+  // No pair at all is a valid start: the page is up, and pairs come in from the workbench import there.
+  if (!Array.isArray(value.pairs) || value.pairs.length > MAX_PAIRS) throw new Error(`pairs 须为列表，最多 ${MAX_PAIRS} 个配对`);
   const pairs = value.pairs.map((item, index) => {
     const pair = exactKeys(item, ['id', 'main', 'long', 'short'], ['transfer', 'adl']);
     const name = (key: 'main' | 'long' | 'short'): string => {

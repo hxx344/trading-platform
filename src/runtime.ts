@@ -3,13 +3,15 @@
 import { randomBytes } from 'node:crypto';
 import { WAL_SIZE_LIMIT_BYTES, type Store } from './store.ts';
 import type { Executor } from './executor.ts';
-import { createExecutorServer } from './http.ts';
-import { writeAccessUrl } from './data-dir.ts';
+import { createExecutorServer, type ImportChannel } from './http.ts';
+import { SESSION_LIFETIME_MS, writeAccessUrl } from './data-dir.ts';
 
 const TICK_MS = 1_000;
 const WAL_CHECK_MS = 1_000;
 /** Consecutive failed passes before the entry gives up the lease and exits, so another instance can take over. */
 const MAX_TICK_FAILURES = 5;
+/** A kept session's cookie lasts this long in the browser; logging in again with access-url renews it. */
+const SESSION_MAX_AGE_S = SESSION_LIFETIME_MS / 1000;
 
 export interface RunContext {
   /** True once shutdown has begun or the lease is gone. */
@@ -24,6 +26,9 @@ export interface RunOptions {
   dir: string;
   port: number;
   page?: string;
+  /** A session (cookie value) kept across restarts, so the open page stays logged in; random per start when absent. */
+  session?: string;
+  imports?: ImportChannel;
   /** Which passes run; the service has no two-leg jobs. */
   passes?: readonly ('jobs' | 'transfers' | 'adl')[];
   startedMessage: string;
@@ -43,7 +48,7 @@ export interface RunOptions {
 
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
-export function runExecutor({ executor, store, dir, port, page, passes = ['jobs', 'transfers', 'adl'], startedMessage, background, onStopping, onStopped, log = line => process.stderr.write(`${line}\n`), drainMs = 0 }: RunOptions): { shutdown(reason?: string, detail?: string): Promise<void>; done: Promise<void> } {
+export function runExecutor({ executor, store, dir, port, page, session, imports, passes = ['jobs', 'transfers', 'adl'], startedMessage, background, onStopping, onStopped, log = line => process.stderr.write(`${line}\n`), drainMs = 0 }: RunOptions): { shutdown(reason?: string, detail?: string): Promise<void>; done: Promise<void> } {
   let stopping = false;
   let finished!: () => void;
   const done = new Promise<void>(resolve => { finished = resolve; });
@@ -90,7 +95,7 @@ export function runExecutor({ executor, store, dir, port, page, passes = ['jobs'
     if (!stopping) { process.exitCode = 1; void shutdown(executor.retired ? 'lease-lost' : 'pass-failed', executor.retired ? '写入租约已失去' : `${label}连续失败：${last}`); }
   })();
   const accessToken = randomBytes(32).toString('base64url');
-  const server = createExecutorServer({ executor, accessToken, ...(page ? { page } : {}) });
+  const server = createExecutorServer({ executor, accessToken, ...(page ? { page } : {}), ...(session ? { session, sessionMaxAgeS: SESSION_MAX_AGE_S } : {}), ...(imports ? { imports } : {}) });
   server.on('error', error => { log(`HTTP 监听失败：${error.message}`); process.exitCode = 1; void shutdown('listen-failed', error.message); });
   server.listen(port, '127.0.0.1', () => {
     try { process.stdout.write(`${startedMessage}，登录链接已写入 ${writeAccessUrl(dir, port, accessToken)}\n`); }

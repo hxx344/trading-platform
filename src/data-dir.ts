@@ -1,7 +1,7 @@
 // The executor data directory: the dedicated-directory check, the login link, the environment marker and the database
 // names, shared by the entries (main.ts, service/main.ts) and the workbench-driven live canary (live/canary.ts).
 import { randomBytes } from 'node:crypto';
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import type { Environment } from './contracts.ts';
 
@@ -56,6 +56,30 @@ export function assertDedicatedDataDir(dir: string): string {
     if (dirname(current) === current) break;
   }
   return path;
+}
+
+/** How long a kept page session lasts: the cookie's Max-Age, and the age at which the file is replaced. */
+export const SESSION_LIFETIME_MS = 30 * 24 * 3600 * 1000;
+
+/**
+ * The page session kept in <dir>/http-session, so a restart (an upgrade, the page's own import) does not log the open
+ * page out. Made once, private to the data directory's account; an unreadable or malformed one is replaced, which only
+ * logs the browser out.
+ */
+export function keptSession(dir: string, now = Date.now()): string {
+  const path = join(dir, 'http-session');
+  try {
+    const value = readFileSync(path, 'utf8').trim();
+    // Replaced after the cookie's own 30 days, so a copied cookie stops working on the first start after that.
+    if (/^[A-Za-z0-9_-]{43}$/.test(value) && now - statSync(path).mtimeMs < SESSION_LIFETIME_MS) return value;
+  } catch { /* missing or unreadable: replaced below; a path that cannot be replaced fails there */ }
+  const value = randomBytes(32).toString('base64url');
+  const temp = join(dir, `.http-session.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
+  try {
+    writeFileSync(temp, `${value}\n`, { mode: 0o600, flag: 'wx' });
+    renameSync(temp, path);
+  } catch (error) { rmSync(temp, { force: true }); throw error; }
+  return value;
 }
 
 /**

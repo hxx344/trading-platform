@@ -1,3 +1,4 @@
+import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { request as httpRequest } from 'node:http';
@@ -94,6 +95,13 @@ test('HTTP：预览、确认、重复确认返回原任务；状态页只显示�
   assert.equal(again.duplicate, true);
   assert.equal(again.job.id, first.job.id);
   await settle(h, first.job.id);
+  // The store records a digest of the session, never the cookie itself.
+  const recorded = new DatabaseSync(h.file, { readOnly: true });
+  try {
+    const rows = [...recorded.prepare('SELECT session FROM previews').all(), ...recorded.prepare('SELECT session FROM commands').all()] as { session: string }[];
+    assert.ok(rows.length >= 2);
+    assert.ok(rows.every(row => row.session !== SESSION && /^[A-Za-z0-9_-]{43}$/.test(row.session)));
+  } finally { recorded.close(); }
   const state = await (await fetch(base + '/api/state', { headers: { cookie } })).json() as { jobs: { id: string; status: string }[]; accounts: { accountId: string }[] };
   assert.equal(state.jobs[0].status, 'completed');
   assert.ok(state.accounts.every(account => account.accountId.startsWith('***')));
@@ -280,4 +288,58 @@ test('入口：登录链接写入 access-url，覆盖旧文件、不留临时文
     writeAccessUrl(dir, 4711, 'tok_second');
     assert.equal(readFileSync(path, 'utf8'), 'http://127.0.0.1:4711/login?token=tok_second\n');
   } finally { h.dispose(); }
+});
+
+test('HTTP：页面导入只在服务提供时开放，读写都要会话与请求标记；保留的会话带有效期，重启后旧 cookie 仍有效', async () => {
+  const h = createHarness();
+  const submitted: unknown[] = [];
+  const imports = { submit: (body: unknown) => { submitted.push(body); return { id: 'req-1', at: 1 }; }, latest: () => ({ id: 'req-1', phase: 'done' }) };
+  const open = async () => {
+    const server = createExecutorServer({ executor: h.ex, accessToken: randomUUID(), session: SESSION, sessionMaxAgeS: 600, imports });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    return server;
+  };
+  const plain = await startServer(h);
+  let server = await open();
+  try {
+    const plainCookie = await login(plain.base);
+    assert.equal((await fetch(plain.base + '/api/import', { headers: { cookie: plainCookie } })).status, 404, '没有导入通道时不开放');
+
+    const port = (server.address() as AddressInfo).port, base = `http://127.0.0.1:${port}`, cookie = `${sessionCookieName(port)}=${SESSION}`;
+    assert.equal((await fetch(base + '/api/import')).status, 401);
+    assert.deepEqual(await (await fetch(base + '/api/import', { headers: { cookie } })).json(), { result: { id: 'req-1', phase: 'done' } });
+    assert.equal((await fetch(base + '/api/import', { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: '{}' })).status, 403);
+    assert.deepEqual(await (await post(base, '/api/import', { action: 'preview' }, { cookie })).json(), { id: 'req-1', at: 1 });
+    assert.deepEqual(submitted, [{ action: 'preview' }]);
+
+    // A restart brings a new access token but the same kept session: the open page's cookie still works.
+    await new Promise(resolve => server.close(resolve));
+    server = await open();
+    const again = (server.address() as AddressInfo).port;
+    const response = await fetch(`http://127.0.0.1:${again}/api/state`, { headers: { cookie: `${sessionCookieName(again)}=${SESSION}` } });
+    assert.equal(response.status, 200);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    await new Promise(resolve => plain.server.close(resolve));
+    h.dispose();
+  }
+});
+
+test('HTTP：保留会话的登录 cookie 带 Max-Age，随机会话的不带', async () => {
+  const h = createHarness();
+  const token = 'kept-token-000001';
+  const server = createExecutorServer({ executor: h.ex, accessToken: token, session: SESSION, sessionMaxAgeS: 2_592_000 });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const plain = await startServer(h);
+  try {
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const kept = await fetch(`${base}/login?token=${token}`, { redirect: 'manual' });
+    assert.match(kept.headers.get('set-cookie') ?? '', /; Max-Age=2592000$/);
+    const random = await fetch(`${plain.base}/login?token=${TOKEN}`, { redirect: 'manual' });
+    assert.doesNotMatch(random.headers.get('set-cookie') ?? '', /Max-Age/);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    await new Promise(resolve => plain.server.close(resolve));
+    h.dispose();
+  }
 });

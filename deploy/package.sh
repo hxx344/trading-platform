@@ -12,7 +12,7 @@ trap 'rm -rf "$stage"' EXIT
 pkg="$stage/trading-platform"
 mkdir -p "$pkg/deploy" "$out"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$pkg/"
-cp "$root/deploy/trading-platform.service" "$root/deploy/config.example.json" "$root/deploy/secrets.example.json" "$pkg/deploy/"
+cp "$root/deploy/trading-platform.service" "$root/deploy/trading-platform-import.service" "$root/deploy/trading-platform-import.path" "$root/deploy/config.example.json" "$root/deploy/secrets.example.json" "$pkg/deploy/"
 printf 'v%s %s\n' "$version" "$commit" >"$pkg/VERSION"
 tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner --mode='u+rwX,go+rX,go-w' -C "$stage" -cf - trading-platform \
   | gzip -n -9 >"$out/trading-platform.tar.gz"

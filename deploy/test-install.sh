@@ -7,7 +7,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-export TP_TEST_MODE=1 TP_NODE_BIN TP_APP_DIR="$tmp/opt" TP_CONF_DIR="$tmp/etc" TP_DATA_DIR="$tmp/var" TP_UNIT_FILE="$tmp/unit.service"
+export TP_TEST_MODE=1 TP_NODE_BIN TP_APP_DIR="$tmp/opt" TP_CONF_DIR="$tmp/etc" TP_DATA_DIR="$tmp/var" TP_UNIT_FILE="$tmp/unit.service" TP_IMPORT_DIR="$tmp/import"
 TP_NODE_BIN=$(command -v node)
 install_sh="$root/deploy/install.sh"
 failures=0
@@ -21,17 +21,20 @@ check '同一源码打出的包校验和相同' 'cmp -s "$tmp/a/SHA256SUMS" "$tm
 # A second package with different contents, for the upgrade.
 mkdir -p "$tmp/src-b/deploy"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-b/"
-cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,config.example.json,secrets.example.json} "$tmp/src-b/deploy/"
+cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-b/deploy/"
 printf '\n升级测试\n' >>"$tmp/src-b/README.md"
 bash "$tmp/src-b/deploy/package.sh" "$tmp/b" >/dev/null
 
 run --package "$tmp/a" && status=0 || status=$?
 check '首次安装成功' '[[ $status -eq 0 ]]'
-check '首次安装提示先写配置' 'grep -q "下一步" "$tmp/out"'
+check '首次安装生成空配置并通过检查' 'grep -q "\"pairs\": \[\]" "$TP_CONF_DIR/config.json" && [[ "$(stat -c %a "$TP_CONF_DIR/config.json")" == 600 && "$(stat -c %a "$TP_CONF_DIR/secrets.json")" == 600 ]] && grep -q "配置有效：0 个配对（尚未导入）" "$tmp/out"'
+check '首次安装提示在页面导入' 'grep -q "下一步：在页面「从工作台导入配对」" "$tmp/out"'
+check '导入目录权限 770' '[[ "$(stat -c %a "$TP_IMPORT_DIR")" == 770 ]]'
+check '导入助手单元已填入路径' '! grep -q "@" "$tmp/trading-platform-import.service" "$tmp/trading-platform-import.path" && grep -q "PathChanged=$TP_IMPORT_DIR/request.json" "$tmp/trading-platform-import.path" && grep -q "ExecStart=$(command -v flock) -w 100 $TP_APP_DIR/.install.lock $TP_NODE_BIN $TP_APP_DIR/current/src/service/import-helper.ts --dir $TP_IMPORT_DIR --config $TP_CONF_DIR/config.json --data-dir $TP_DATA_DIR" "$tmp/trading-platform-import.service" && grep -q "ExecStopPost=$(command -v flock) -w 60 $TP_APP_DIR/.install.lock $TP_NODE_BIN $TP_APP_DIR/current/src/service/import-helper.ts --recover --dir $TP_IMPORT_DIR" "$tmp/trading-platform-import.service"'
 check '当前版本指向新包' '[[ -f "$TP_APP_DIR/current/src/service/main.ts" ]]'
 check '示例配置已放入' '[[ -f "$TP_CONF_DIR/config.example.json" && -f "$TP_CONF_DIR/secrets.example.json" ]]'
 check '数据目录权限 700' '[[ "$(stat -c %a "$TP_DATA_DIR")" == 700 ]]'
-check 'systemd 单元已填入路径' '! grep -q "@" "$TP_UNIT_FILE" && grep -q "ExecStart=$TP_NODE_BIN $TP_APP_DIR/current/src/service/main.ts --config $TP_CONF_DIR/config.json --data-dir $TP_DATA_DIR" "$TP_UNIT_FILE"'
+check 'systemd 单元已填入路径' '! grep -q "@" "$TP_UNIT_FILE" && grep -q "ExecStart=$TP_NODE_BIN $TP_APP_DIR/current/src/service/main.ts --config $TP_CONF_DIR/config.json --data-dir $TP_DATA_DIR --import-dir $TP_IMPORT_DIR" "$TP_UNIT_FILE" && grep -q "ReadWritePaths=$TP_DATA_DIR -$TP_IMPORT_DIR" "$TP_UNIT_FILE"'
 first=$(readlink -f "$TP_APP_DIR/current")
 
 run --package "$tmp/a"
@@ -94,7 +97,7 @@ mkdir -p "$tmp/wb/data/modules/aster"
 # A program whose config check fails: the imported files are put back, the old release stays current.
 mkdir -p "$tmp/src-c/deploy"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-c/"
-cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,config.example.json,secrets.example.json} "$tmp/src-c/deploy/"
+cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-c/deploy/"
 sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { throw new Error('测试：配置检查失败');|" "$tmp/src-c/src/service/main.ts"
 bash "$tmp/src-c/deploy/package.sh" "$tmp/c" >/dev/null
 cp -p "$TP_CONF_DIR/config.json" "$tmp/config.before"; cp -p "$TP_CONF_DIR/secrets.json" "$tmp/secrets.before"
@@ -105,7 +108,7 @@ check '导入后检查失败时仍是原版本' '[[ "$(readlink -f "$TP_APP_DIR/
 # Stopped by a signal while the new program checks the imported files: they are put back all the same.
 mkdir -p "$tmp/src-d/deploy"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-d/"
-cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,config.example.json,secrets.example.json} "$tmp/src-d/deploy/"
+cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-d/deploy/"
 sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { (await import('node:fs')).writeFileSync(process.env.TP_TEST_MARK, ''); await new Promise(resolve => setTimeout(resolve, 1500));|" "$tmp/src-d/src/service/main.ts"
 bash "$tmp/src-d/deploy/package.sh" "$tmp/d" >/dev/null
 rm -f "$tmp/mark"
@@ -128,6 +131,11 @@ check '--pairs 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep
 rm "$TP_APP_DIR/current"
 run --package "$tmp/b" && status=0 || status=$?
 check '没有 current 链接时重新安装' '[[ $status -eq 0 && -L "$TP_APP_DIR/current" && "$(readlink "$TP_APP_DIR/current")" == "$TP_APP_DIR/releases/"* ]]'
+
+# A data directory that already ran the service, with its config gone: no empty config is made up for it.
+mkdir -p "$tmp/var2" && : >"$tmp/var2/executor-live.sqlite"
+TP_CONF_DIR="$tmp/etc2" TP_DATA_DIR="$tmp/var2" run --package "$tmp/b" && status=0 || status=$?
+check '已有运行记录时不生成空配置' '[[ $status -eq 0 && ! -e "$tmp/etc2/config.json" ]] && grep -q "已有运行记录但没有 config.json" "$tmp/out"'
 
 if ((failures)); then printf '%d 项失败；最后一次输出：\n' "$failures"; cat "$tmp/out"; exit 1; fi
 printf '安装测试全部通过\n'

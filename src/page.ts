@@ -14,6 +14,10 @@ table{border-collapse:collapse;width:100%} td,th{border-bottom:1px solid #eaeef2
 <h1>统一平台执行器原型 · 原油跨所双腿</h1>
 <p class="banner">模拟传输：不会访问任何真实交易所，也不持有真实账户执行权。模拟交易所状态在进程退出后丢失。</p>
 <p id="status" class="muted">加载中…</p>
+<div id="importBox" hidden><h2>从工作台导入配对</h2>
+<p class="muted">读取本机旧工作台的保证金平衡配对：划转设置、ADL 设置、主账户与子账户凭据、飞书机器人，写入本服务配置后自动重启本服务（约半分钟，期间已启用配对的划转与 ADL 暂停）。导入的配对登记为停用：先在旧工作台删除该配对，再到下方「启用」。</p>
+<button id="importPreviewBtn">读取工作台</button> <span id="importMsg"></span>
+<div id="importList"></div></div>
 <fieldset><legend>下单预览</legend>
 <label>合约 <select id="symbol"><option>CLUSDT</option><option>BZUSDT</option></select></label>
 <label>操作 <select id="action"><option value="open">开仓</option><option value="close">平仓</option></select></label>
@@ -235,6 +239,77 @@ document.addEventListener('click', async event => {
   }
   catch (error) { alert(error.message); }
 });
+// The workbench import: the page leaves a request, a root helper on the host answers it (and restarts this service
+// for an import); the answer is polled by request id, and polling carries on while the service restarts.
+// The helper waits up to 100 s for a running install.sh and drops requests older than 2 minutes; an import that fails
+// on start puts the files back and restarts again, all within its 12-minute limit.
+const IMPORT_WAIT_MS = 760000, IMPORT_PICKUP_MS = 135000, IMPORT_SLOW_MS = 10000;
+let importWaiting = false;
+function importItemsHtml(result) {
+  if (result.action === 'preview') {
+    const rows = (result.preview || []).map(item => '<tr><td><input type="checkbox" data-import-pick="' + esc(item.id) + '"' + (item.importable ? '' : ' disabled') + (item.importable && item.marginEnabled ? ' checked' : '') + ' style="width:auto"></td><td>' + esc(item.id) + (item.name ? '<br><span class="muted">' + esc(item.name) + '</span>' : '') + '</td><td>' + (item.marginEnabled ? '已开启' : '未开启') + '</td><td class="' + (item.importable ? 'ok' : 'muted') + '">' + (item.importable ? '可导入：' : '不能导入：') + esc(item.detail) + '</td></tr>').join('');
+    return (rows ? '<table><tr><th></th><th>工作台配对</th><th>工作台保证金平衡</th><th>说明</th></tr>' + rows + '</table><p><button id="importRunBtn">导入所选并重启服务</button></p>' : '')
+      + (result.notes || []).map(note => '<p class="muted">' + esc(note) + '</p>').join('') + (result.database ? '<p class="muted">读取自 ' + esc(result.database) + '（只读）</p>' : '');
+  }
+  const rows = (result.imported || []).map(item => '<tr><td>' + esc(item.id) + '</td><td class="' + (item.status === 'added' ? 'ok' : 'err') + '">' + (item.status === 'added' ? '已导入：' : '未导入：') + esc(item.detail) + '</td></tr>').join('');
+  return (rows ? '<table><tr><th>配对</th><th>结果</th></tr>' + rows + '</table>' : '') + (result.notes || []).map(note => '<p class="muted">' + esc(note) + '</p>').join('');
+}
+async function importRequest(body, label) {
+  if (importWaiting) return;
+  importWaiting = true; $('importPreviewBtn').disabled = true;
+  const runBtn = $('importRunBtn'); if (runBtn) runBtn.disabled = true;
+  const started = Date.now();
+  try {
+    const { id, at } = await api('/api/import', body);
+    $('importMsg').innerHTML = esc(label) + '…';
+    let picked = false, restarting = false;
+    while (Date.now() - started < IMPORT_WAIT_MS) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      let result;
+      try { result = (await api('/api/import')).result; }
+      catch (error) {
+        if (error.status === 401) throw new Error('会话已失效（服务重启时更换了会话），请用数据目录 access-url 里的登录链接重新打开；导入结果可稍后点「读取工作台」核对');
+        if (restarting || error.status === undefined || error.status >= 500) { $('importMsg').innerHTML = '服务重启中…'; continue; }
+        throw error;
+      }
+      // An unreadable request is answered without an id; notices about an earlier, interrupted import carry that one's id.
+      if (!picked && result && result.id === null && result.action === null && result.at >= at) throw new Error(result.message);
+      if (!result || result.id !== id) {
+        if (picked) continue;
+        if (Date.now() - started > IMPORT_PICKUP_MS) throw new Error('导入助手没有响应，请求已作废：请确认已用 sudo bash install.sh 安装本版本（systemctl status trading-platform-import.path）');
+        if (Date.now() - started > IMPORT_SLOW_MS) $('importMsg').innerHTML = esc(label) + '…（等待导入助手接手；安装脚本正在运行时最多等 2 分钟）';
+        continue;
+      }
+      picked = true;
+      if (result.phase === 'running' || result.phase === 'restarting') {
+        restarting = result.phase === 'restarting';
+        $('importMsg').innerHTML = esc(result.message) + '…';
+        if (restarting) $('importList').innerHTML = importItemsHtml(result);
+        continue;
+      }
+      $('importMsg').innerHTML = '<span class="' + (result.phase === 'done' ? 'ok' : 'err') + '">' + esc(result.message) + '</span>';
+      $('importList').innerHTML = importItemsHtml(result);
+      if (result.action === 'import') refresh();
+      return;
+    }
+    throw new Error('等待超时：结果未知，请稍后点「读取工作台」查看配置是否已导入');
+  } catch (error) {
+    $('importMsg').innerHTML = '<span class="err">' + esc(error.message) + '</span>';
+  } finally {
+    importWaiting = false; $('importPreviewBtn').disabled = false;
+    const again = $('importRunBtn'); if (again) again.disabled = false;
+  }
+}
+$('importPreviewBtn').onclick = () => importRequest({ action: 'preview' }, '正在读取工作台');
+document.addEventListener('click', event => {
+  if (event.target.id !== 'importRunBtn') return;
+  const pairs = [...document.querySelectorAll('[data-import-pick]')].filter(box => box.checked).map(box => box.dataset.importPick);
+  if (!pairs.length) { alert('请先勾选要导入的配对'); return; }
+  if (!confirm('导入 ' + pairs.join('、') + ' 并重启本服务？重启约半分钟，期间已启用配对的划转与 ADL 暂停。导入的配对登记为停用。')) return;
+  importRequest({ action: 'import', pairs }, '正在导入');
+});
+// Shown only where the service offers it (the ASTER service with the helper's directory); elsewhere the route is 404.
+api('/api/import').then(() => { $('importBox').hidden = false; }).catch(() => {});
 async function refresh() {
   // Set once this refresh has rendered the positions, so a later failure in the same refresh does not call them stale.
   positionsCurrent = false;

@@ -33,6 +33,9 @@ test('服务配置：默认值、预留额度与配对校验；密钥文件须�
   assert.throws(() => parseServiceConfig(configRaw([{ id: 'p1', main: 'main', long: 'a', short: 'b' }, { id: 'p1', main: 'main', long: 'c', short: 'd' }])), /重复/);
   assert.throws(() => parseServiceConfig({ ...configRaw(), budget: { limitPerMinute: 600, adlReserve: 580 } }), /ADL 预留权重/);
   assert.throws(() => parseServiceConfig({ ...configRaw(), extra: 1 }), /不支持的字段/);
+  // A first setup starts with no pair (the page imports them); past the limit is refused.
+  assert.deepEqual(parseServiceConfig(configRaw([])).pairs, []);
+  assert.throws(() => parseServiceConfig({ ...configRaw(), pairs: {} }), /pairs 须为列表/);
   // The budget follows the pairs: idle use (balances, display, ADL scans) must fit under the limit less the ADL reserve.
   const many = (count: number, transfer?: unknown) => configRaw(Array.from({ length: count }, (_, i) => ({ id: `p${i}`, main: 'main', long: `l${i}`, short: `s${i}`, ...(transfer ? { transfer } : {}) })));
   assert.equal(pairWeightPerMinute(config.pairs[0]!), 260);
@@ -393,6 +396,43 @@ test('服务进程：本机页面只含 ASTER 部分，状态接口可读，用�
     await run.done;
     assert.ok(sockets.every(socket => socket.closed));
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('服务进程：没有配对也启动，页面导入接口可用；重启后沿用同一页面会话', async () => {
+  const dir = tempDir();
+  const fake = new FakeAster();
+  const { createServer } = await import('node:net');
+  const port = await new Promise<number>(resolve => { const probe = createServer().listen(0, '127.0.0.1', () => { const { port } = probe.address() as { port: number }; probe.close(() => resolve(port)); }); });
+  const { startService } = await import('../src/service/main.ts');
+  const { mkdirSync, readFileSync, rmSync: remove } = await import('node:fs');
+  const importDir = join(dir, 'import');
+  mkdirSync(importDir);
+  const start = () => startService({ config: parseServiceConfig(configRaw([])), secrets: { accounts: new Map(), feishu: null }, dir: join(dir, 'data'), port, fetchImpl: fake.fetch, importDir });
+  const link = async () => {
+    let value = '';
+    for (let i = 0; i < 100 && !value; i++) { try { value = readFileSync(join(dir, 'data', 'access-url'), 'utf8').trim(); } catch { await new Promise(resolve => setTimeout(resolve, 20)); } }
+    return value;
+  };
+  try {
+    let run = await start();
+    const cookie = (await fetch(await link(), { redirect: 'manual' })).headers.get('set-cookie')!.split(';')[0]!;
+    const state = await (await fetch(`http://127.0.0.1:${port}/api/state`, { headers: { cookie } })).json() as { transfers: { pairs: unknown[] } };
+    assert.deepEqual(state.transfers.pairs, []);
+    assert.deepEqual(await (await fetch(`http://127.0.0.1:${port}/api/import`, { headers: { cookie } })).json(), { result: null });
+    const submitted = await fetch(`http://127.0.0.1:${port}/api/import`, { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }, body: JSON.stringify({ action: 'preview' }) });
+    assert.equal(submitted.status, 200);
+    const request = JSON.parse(readFileSync(join(importDir, 'request.json'), 'utf8')) as { id: string; action: string };
+    assert.deepEqual(request, { ...request, id: ((await submitted.json()) as { id: string }).id, action: 'preview' });
+    await run.shutdown(); await run.done;
+    remove(join(dir, 'data', 'access-url'));
+    run = await start();
+    await link();
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/state`, { headers: { cookie } })).status, 200, '重启后原 cookie 仍有效');
+    await run.shutdown(); await run.done;
+  } finally {
+    process.removeAllListeners('SIGINT'); process.removeAllListeners('SIGTERM');
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('服务装配：配置里的 ADL 设置只在配对首次登记时作为初始值，之后以页面为准', async () => {

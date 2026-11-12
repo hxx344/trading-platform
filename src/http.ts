@@ -26,16 +26,30 @@ const LOGIN_REQUIRED = '<!doctype html><meta charset="utf-8"><title>需要登录
 /** Instances on different ports of one host share the browser cookie jar for 127.0.0.1, so the name carries the port. */
 export const sessionCookieName = (port: number): string => `pa_executor_session_${port}`;
 
+/** The page's workbench import (the ASTER service only): leaves a request for the root helper and reads its answer. */
+export interface ImportChannel { submit(body: unknown): { id: string; at: number }; latest(): unknown }
+
 /** accessToken is exchanged once per browser at /login; session is the cookie value and the executor session id. */
-export interface HttpOptions { executor: Executor; accessToken: string; session?: string; /** Page served at /; defaults by environment. */ page?: string }
+export interface HttpOptions {
+  executor: Executor;
+  accessToken: string;
+  session?: string;
+  /** Set with a session that outlives restarts: the cookie then outlives the browser session too. */
+  sessionMaxAgeS?: number;
+  /** Page served at /; defaults by environment. */
+  page?: string;
+  imports?: ImportChannel;
+}
 
 // Hashing first gives equal-length inputs, so the comparison does not leak the token length either.
 const sameSecret = (given: string, expected: string): boolean =>
   timingSafeEqual(createHash('sha256').update(given).digest(), createHash('sha256').update(expected).digest());
 
-export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), page }: HttpOptions): Server {
+export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, imports }: HttpOptions): Server {
   if (!accessToken) throw new Error('需要访问令牌');
   if (sameSecret(session, accessToken)) throw new Error('会话值不能与访问令牌相同');
+  // The executor records which session asked for each command; it gets a digest, so the stored rows never hold the cookie.
+  const sessionId = createHash('sha256').update(`executor-session:${session}`).digest('base64url');
   // The name follows the port actually bound, which is only known once listening (port 0 in tests).
   const cookieName = (request: IncomingMessage) => sessionCookieName(request.socket.localPort ?? 0);
   const authorized = (request: IncomingMessage): boolean => {
@@ -67,7 +81,7 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     const url = new URL(request.url ?? '/', 'http://localhost');
     if (request.method === 'GET' && url.pathname === '/login') {
       if (!sameSecret(url.searchParams.get('token') ?? '', accessToken)) { response.writeHead(401, PAGE_HEADERS); response.end(LOGIN_REQUIRED); return; }
-      response.writeHead(303, { ...PAGE_HEADERS, location: '/', 'set-cookie': `${cookieName(request)}=${session}; HttpOnly; SameSite=Strict; Path=/` });
+      response.writeHead(303, { ...PAGE_HEADERS, location: '/', 'set-cookie': `${cookieName(request)}=${session}; HttpOnly; SameSite=Strict; Path=/${sessionMaxAgeS ? `; Max-Age=${sessionMaxAgeS}` : ''}` });
       response.end();
       return;
     }
@@ -86,27 +100,32 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
         transfers: { pairs: executor.transferPairs(), corruptPairs: executor.corruptTransferPairs(), recent: executor.recentTransfers(20) },
         adl: { pairs: executor.adlPairs(), recent: executor.recentAdlIncidents(10) }, positions: executor.asterPositions() });
     }
+    if (url.pathname === '/api/import') {
+      if (!imports) return send(response, 404, { code: 'not_found', message: '本服务没有开启页面导入' });
+      if (request.method === 'GET') return send(response, 200, { result: imports.latest() });
+      if (request.method === 'POST') return send(response, 200, imports.submit(await readJson(request)));
+    }
     if (request.method === 'GET' && url.pathname === '/api/observe') {
       const venue = url.searchParams.get('venue') ?? '', symbol = url.searchParams.get('symbol') ?? '';
       if (!(VENUES as readonly string[]).includes(venue)) return send(response, 400, { code: 'venue', message: '交易所无效' });
       return send(response, 200, await executor.observe(venue as Venue, symbol));
     }
-    if (request.method === 'POST' && url.pathname === '/api/preview') return send(response, 200, executor.publicPreview(await executor.preview(await readJson(request), session)));
-    if (request.method === 'POST' && url.pathname === '/api/confirm') return send(response, 200, executor.confirm(await readJson(request), session));
+    if (request.method === 'POST' && url.pathname === '/api/preview') return send(response, 200, executor.publicPreview(await executor.preview(await readJson(request), sessionId)));
+    if (request.method === 'POST' && url.pathname === '/api/confirm') return send(response, 200, executor.confirm(await readJson(request), sessionId));
     const pair = request.method === 'POST' ? PAIR_PATH.exec(url.pathname) : null;
     if (pair) {
       const body = exactKeys(await readJson(request), ['requestId']);
-      return send(response, 200, await executor.setTransferEnabled({ pairId: pair[1], enabled: pair[2] === 'enable', requestId: body.requestId }, session));
+      return send(response, 200, await executor.setTransferEnabled({ pairId: pair[1], enabled: pair[2] === 'enable', requestId: body.requestId }, sessionId));
     }
     const adlConfig = request.method === 'POST' ? ADL_CONFIG_PATH.exec(url.pathname) : null;
     if (adlConfig) {
       const body = exactKeys(await readJson(request), ['requestId', 'autoReduce', 'batchNotional']);
-      return send(response, 200, executor.setAdlConfig({ pairId: adlConfig[1], ...body }, session));
+      return send(response, 200, executor.setAdlConfig({ pairId: adlConfig[1], ...body }, sessionId));
     }
     const adlRestart = request.method === 'POST' ? ADL_RESTART_PATH.exec(url.pathname) : null;
     if (adlRestart) {
       const body = exactKeys(await readJson(request), ['requestId']);
-      return send(response, 200, executor.restartAdl({ incidentId: adlRestart[1], requestId: body.requestId }, session));
+      return send(response, 200, executor.restartAdl({ incidentId: adlRestart[1], requestId: body.requestId }, sessionId));
     }
     const match = UUID_PATH.exec(url.pathname);
     // The path match is case-insensitive, so the action is compared lowercased; otherwise /STOP would fall through to acknowledge.
@@ -114,20 +133,20 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (match && request.method === 'GET' && !action) return send(response, 200, executor.jobView(match[1]));
     if (match && request.method === 'POST' && action === 'adopt-strategy') {
       const body = exactKeys(await readJson(request), ['requestId', 'strategyId']);
-      return send(response, 200, await executor.adoptStrategy({ jobId: match[1], requestId: body.requestId, strategyId: body.strategyId }, session));
+      return send(response, 200, await executor.adoptStrategy({ jobId: match[1], requestId: body.requestId, strategyId: body.strategyId }, sessionId));
     }
     if (match && request.method === 'POST' && action === 'confirm-not-created') {
       const body = exactKeys(await readJson(request), ['requestId']);
-      return send(response, 200, await executor.confirmNotCreated({ jobId: match[1], requestId: body.requestId }, session));
+      return send(response, 200, await executor.confirmNotCreated({ jobId: match[1], requestId: body.requestId }, sessionId));
     }
     if (match && request.method === 'POST' && action === 'release-strategy') {
       const body = exactKeys(await readJson(request), ['requestId'], ['acknowledgeRisk']);
-      return send(response, 200, executor.releaseStrategy({ jobId: match[1], requestId: body.requestId, acknowledgeRisk: body.acknowledgeRisk }, session));
+      return send(response, 200, executor.releaseStrategy({ jobId: match[1], requestId: body.requestId, acknowledgeRisk: body.acknowledgeRisk }, sessionId));
     }
     if (match && request.method === 'POST' && (action === 'stop' || action === 'acknowledge')) {
       const body = await readJson(request) as { requestId?: unknown } | null;
       const requestId = typeof body?.requestId === 'string' ? body.requestId : '';
-      return send(response, 200, action === 'stop' ? executor.requestStop(match[1], requestId, session) : executor.acknowledge(match[1], requestId, session));
+      return send(response, 200, action === 'stop' ? executor.requestStop(match[1], requestId, sessionId) : executor.acknowledge(match[1], requestId, sessionId));
     }
     return send(response, 404, { code: 'not_found', message: '不存在' });
   }

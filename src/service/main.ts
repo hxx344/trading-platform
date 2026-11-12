@@ -4,11 +4,11 @@
 // service. Pairs dropped from the config are switched off at start.
 import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { openStore } from '../store.ts';
 import { createExecutor, type Executor } from '../executor.ts';
-import { DATABASE_FILES, assertDedicatedDataDir, claimDataDirEnvironment } from '../data-dir.ts';
+import { DATABASE_FILES, assertDedicatedDataDir, claimDataDirEnvironment, keptSession } from '../data-dir.ts';
 import { holdAccountLocks } from '../live/setup.ts';
 import { AsterClient, RequestBudget, type AsterCredentials } from '../aster/client.ts';
 import { AsterTransferConnector } from '../aster/transfer.ts';
@@ -19,6 +19,7 @@ import { assertDistinctSigners, loadServiceConfig, loadServiceSecrets, type Serv
 import { createTakeoverGuard } from './takeover.ts';
 import { createNotifier, type EventRow, type Notifier } from './feishu.ts';
 import { runUserStream, type SocketLike } from './stream.ts';
+import { readImportResult, submitImportRequest } from './import-channel.ts';
 
 const NOTIFY_MS = 2_000;
 const FINAL_FLUSH_MS = 5_000;
@@ -123,12 +124,15 @@ export interface StartOptions {
   notifyFetch?: (url: string, init: RequestInit) => Promise<Response>;
   port?: number;
   leaseWaitMs?: number;
+  /** The hand-off directory of the root import helper (install.sh sets it up); without it the page offers no import. */
+  importDir?: string;
 }
 
 /** Opens the data directory, wires the executor and runs it with the alerts and the user streams until shutdown. */
-export async function startService({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs }: StartOptions): Promise<ReturnType<typeof runExecutor>> {
+export async function startService({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir }: StartOptions): Promise<ReturnType<typeof runExecutor>> {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   claimDataDirEnvironment(dir, 'mainnet');
+  const session = keptSession(dir);
   const store = openStore(join(dir, DATABASE_FILES.mainnet));
   let wiring: ServiceWiring;
   try { wiring = await wireService(config, secrets, store, { ...(fetchImpl ? { fetchImpl } : {}), ...(leaseWaitMs === undefined ? {} : { leaseWaitMs }) }); }
@@ -157,7 +161,8 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
   } catch (error) { notifier.close(); executor.close(); store.close(); locks.release(); throw error; }
 
   return runExecutor({
-    executor, store, dir, port, page: ASTER_PAGE, passes: ['transfers', 'adl'], drainMs: DRAIN_MS,
+    executor, store, dir, port, page: ASTER_PAGE, session, passes: ['transfers', 'adl'], drainMs: DRAIN_MS,
+    ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir) } } : {}),
     startedMessage: `ASTER 服务已启动（${config.pairs.length} 个配对，已启用 ${enabled} 个）`,
     background: context => [
       (async () => {
@@ -184,18 +189,20 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
 }
 
 async function main(): Promise<void> {
-  const { values } = parseArgs({ options: { config: { type: 'string' }, 'data-dir': { type: 'string' }, 'check-config': { type: 'boolean' } } });
+  const { values } = parseArgs({ options: { config: { type: 'string' }, 'data-dir': { type: 'string' }, 'import-dir': { type: 'string' }, 'check-config': { type: 'boolean' } } });
   if (!values.config) throw new Error('需要 --config <服务配置文件的绝对路径>');
   const config = loadServiceConfig(values.config);
   const secrets = loadServiceSecrets(config);
   if (values['check-config']) {
     // Read and validated offline (keys must derive their signers); nothing is sent anywhere.
-    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、')}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}\n`);
+    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、') || '尚未导入'}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}\n`);
     return;
   }
   if (!values['data-dir']) throw new Error('需要 --data-dir <独立目录的绝对路径>');
   const dir = assertDedicatedDataDir(values['data-dir']);
-  await startService({ config, secrets, dir });
+  const importDir = values['import-dir'];
+  if (importDir !== undefined && !isAbsolute(importDir)) throw new Error('--import-dir 必须是绝对路径');
+  await startService({ config, secrets, dir, ...(importDir ? { importDir } : {}) });
 }
 
 if (import.meta.main) main().catch(error => { process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; });

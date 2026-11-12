@@ -1,0 +1,10 @@
+# Installed by deploy/install.sh. Starts the import helper when the service's page leaves a request.
+[Unit]
+Description=统一交易平台：等待页面的工作台导入请求
+
+[Path]
+PathChanged=@IMPORT_DIR@/request.json
+Unit=trading-platform-import.service
+
+[Install]
+WantedBy=paths.target

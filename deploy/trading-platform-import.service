@@ -1,0 +1,19 @@
+# Installed by deploy/install.sh, which fills in the paths; started by trading-platform-import.path.
+# Runs as root: it reads the workbench's environment (root 600) and database (as the database's owner), writes the
+# service's config.json and secrets.json, and restarts the service. It takes the install lock, so it never runs while
+# install.sh does. The lock wait stays under a request's 2-minute life (an older request is answered as expired, not
+# run); the start limit covers the lock wait, a recovery restart, a 60 s window for taking requests and a last import
+# with its config check (60 s) and two restarts (about 125 s each). If it is still cut short, ExecStopPost settles an
+# import it left unsettled and answers the page.
+[Unit]
+Description=统一交易平台：从工作台导入配对（页面请求）
+
+[Service]
+Type=oneshot
+ExecStart=@FLOCK@ -w 100 @APP_DIR@/.install.lock @NODE@ @APP_DIR@/current/src/service/import-helper.ts --dir @IMPORT_DIR@ --config @CONF_DIR@/config.json --data-dir @DATA_DIR@ --workbench-env @WORKBENCH_ENV@ --unit trading-platform.service
+ExecStopPost=@FLOCK@ -w 60 @APP_DIR@/.install.lock @NODE@ @APP_DIR@/current/src/service/import-helper.ts --recover --dir @IMPORT_DIR@ --config @CONF_DIR@/config.json --data-dir @DATA_DIR@ --unit trading-platform.service
+TimeoutStartSec=720
+UMask=0077
+PrivateTmp=yes
+ProtectHome=read-only
+NoNewPrivileges=yes

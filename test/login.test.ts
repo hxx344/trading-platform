@@ -296,3 +296,15 @@ test('运行循环：配置的地址在重试等待中时停止服务，干净�
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('页面：不依赖只在 HTTPS 或 localhost 才有的 crypto.randomUUID，请求号仍是服务端接受的 UUID', async () => {
+  const { PAGE, LIVE_PAGE, ASTER_PAGE } = await import('../src/page.ts');
+  const { UUID } = await import('../src/contracts.ts');
+  for (const page of [PAGE, LIVE_PAGE, ASTER_PAGE]) assert.ok(!page.includes('randomUUID('), '页面脚本不能调用 randomUUID');
+  const line = PAGE.split('\n').find(text => text.startsWith('const newRequestId = '));
+  assert.ok(line, '页面应有 newRequestId');
+  const newRequestId = new Function('crypto', `${line}; return newRequestId;`)({ getRandomValues: (b: Uint8Array) => globalThis.crypto.getRandomValues(b) }) as () => string;
+  const ids = new Set(Array.from({ length: 200 }, () => newRequestId()));
+  assert.equal(ids.size, 200);
+  for (const id of ids) assert.match(id, UUID);
+});

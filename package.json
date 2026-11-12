@@ -1,6 +1,6 @@
 {
   "name": "trading-platform",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "type": "module",
   "description": "统一交易平台：ASTER 配对保证金平衡划转与 ADL 应急处理（第一阶段）",

@@ -44,6 +44,8 @@ table{border-collapse:collapse;width:100%} td,th{border-bottom:1px solid #eaeef2
 <script>
 const SHOW_ANT = true;
 const $ = id => document.getElementById(id);
+// crypto.randomUUID exists only on HTTPS or localhost; the page is also opened over plain http on a Tailscale address.
+const newRequestId = () => { const b = crypto.getRandomValues(new Uint8Array(16)); b[6] = (b[6] & 15) | 64; b[8] = (b[8] & 63) | 128; const h = Array.from(b, x => x.toString(16).padStart(2, '0')).join(''); return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20); };
 let previewValue = null, pendingConfirm = null, acceptedJob = null;
 // Typed strategy ids survive the periodic re-render.
 const strategyInputs = {};
@@ -51,7 +53,7 @@ const strategyInputs = {};
 const manualRequests = {};
 function manualRequestId(jobId, kind, input) {
   const key = jobId + ':' + kind, saved = manualRequests[key];
-  if (!saved || saved.input !== input) manualRequests[key] = { input, requestId: crypto.randomUUID() };
+  if (!saved || saved.input !== input) manualRequests[key] = { input, requestId: newRequestId() };
   return manualRequests[key].requestId;
 }
 const STRATEGY_STATUS = { working: '运行中', paused: '已暂停', terminal: '已结束' };
@@ -80,7 +82,7 @@ const ADL_BATCH = { prepared: '已落盘', sending: '发送中', open: '交易�
 const DIRECTION = { long: '多', short: '空' };
 // Typed ADL settings survive the periodic re-render; a request keeps its id until an answer arrives, like the pair switch.
 const adlInputs = {}, adlRequests = {};
-const adlRequestId = (key, input) => { const saved = adlRequests[key]; if (!saved || saved.input !== input) adlRequests[key] = { input, requestId: crypto.randomUUID() }; return adlRequests[key].requestId; };
+const adlRequestId = (key, input) => { const saved = adlRequests[key]; if (!saved || saved.input !== input) adlRequests[key] = { input, requestId: newRequestId() }; return adlRequests[key].requestId; };
 function adlProgress(incident) {
   const rows = Object.entries(incident.progress || {});
   return rows.length ? rows.map(([symbol, entry]) => esc(symbol) + ' ' + esc(ADL_PROGRESS[entry.status] || entry.status) + (entry.direction ? ' · 多出' + esc(DIRECTION[entry.direction]) + '仓 ' + esc(entry.residual) : '') + (entry.reason ? '<br><span class="muted">' + esc(entry.reason) + '</span>' : '')).join('<br>') : '<span class="muted">尚未读取现场</span>';
@@ -164,7 +166,7 @@ $('previewBtn').onclick = async () => {
 };
 async function confirmPreview() {
   // A lost response is retried with the same requestId so the executor returns the original job.
-  if (!pendingConfirm || pendingConfirm.previewId !== previewValue.id) pendingConfirm = { previewId: previewValue.id, requestId: crypto.randomUUID(), confirmLive: true };
+  if (!pendingConfirm || pendingConfirm.previewId !== previewValue.id) pendingConfirm = { previewId: previewValue.id, requestId: newRequestId(), confirmLive: true };
   try {
     const result = await api('/api/confirm', pendingConfirm);
     acceptedJob = result.job;
@@ -209,7 +211,7 @@ document.addEventListener('click', async event => {
   if (!pair) return;
   const key = pair + ':' + enable;
   try {
-    await api('/api/transfer-pairs/' + pair + (enable === '1' ? '/enable' : '/disable'), { requestId: pairRequests[key] || (pairRequests[key] = crypto.randomUUID()) });
+    await api('/api/transfer-pairs/' + pair + (enable === '1' ? '/enable' : '/disable'), { requestId: pairRequests[key] || (pairRequests[key] = newRequestId()) });
     delete pairRequests[key];
     refresh();
   } catch (error) {
@@ -234,7 +236,7 @@ document.addEventListener('click', async event => {
       if (!confirm('强制释放：本次追价策略可能已在交易所创建并成交，执行器将不再认领、核对或停止它，敞口与仍在运行的策略须由你在交易所自行处理。确定释放？')) return;
       await api('/api/jobs/' + release + '/release-strategy', { requestId: manualRequestId(release, 'release', ''), acknowledgeRisk: true });
       delete manualRequests[release + ':release'];
-    } else await api('/api/jobs/' + (stop || ack) + (stop ? '/stop' : '/acknowledge'), { requestId: crypto.randomUUID() });
+    } else await api('/api/jobs/' + (stop || ack) + (stop ? '/stop' : '/acknowledge'), { requestId: newRequestId() });
     refresh();
   }
   catch (error) { alert(error.message); }

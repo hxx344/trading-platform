@@ -119,6 +119,8 @@ export interface TransferDeps {
    * The service uses it to refuse taking over accounts that another writer has touched recently.
    */
   enableGuard?(pair: Readonly<PairRecord>): Promise<void>;
+  /** Runs inside the write that switches a disabled pair on; `from` is when the enable checks began. */
+  onEnabled?(pair: Readonly<PairRecord>, from: number): void;
 }
 
 export type TransferPlan = { source: PairSide; destination: PairSide; amount: string };
@@ -177,7 +179,7 @@ export function transferRegistryOutcome(state: TransferState): 'confirmed' | 're
   return null;
 }
 
-export function createTransfers({ db, now, budgets, connector, control, write, assertWriter, callVenue, event, isWriterLost, busy, adlSending, enableGuard }: TransferDeps) {
+export function createTransfers({ db, now, budgets, connector, control, write, assertWriter, callVenue, event, isWriterLost, busy, adlSending, enableGuard, onEnabled }: TransferDeps) {
   checkBudgets(budgets, connector);
   /** Transfers whose send is running in this process; any other prepared or sending row was interrupted. */
   const inFlight = new Set<string>();
@@ -725,6 +727,8 @@ export function createTransfers({ db, now, budgets, connector, control, write, a
     };
     if (replayed()) return pairView(requirePair(pairId));
     const pair = requirePair(pairId);
+    // Taken before the checks read anything, so whatever they did not see is still ahead of the ADL watch.
+    const checksFrom = now();
     if (enabled) {
       await verifyOwnership(pair);
       await enableGuard?.(pair);
@@ -734,8 +738,10 @@ export function createTransfers({ db, now, budgets, connector, control, write, a
       const current = requirePair(pairId);
       if (enabled && current.identity !== pair.identity) reject('pair_changed', '配对账户已变化，请重新启用', 409);
       db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(requestId, 'transfer-enable', payload, session, pairId, now());
+      const switchedOn = enabled && !current.enabled;
       current.enabled = enabled;
       if (enabled) { current.nextCheckAt = 0; current.note = null; }
+      if (switchedOn) onEnabled?.(current, checksFrom);
       savePair(current);
       event(null, 'transfer-pair-switched', { pair: pairId, enabled, requestId });
       return pairView(current);

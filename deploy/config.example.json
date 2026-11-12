@@ -1,7 +1,6 @@
 {
   "secretsFile": "/etc/trading-platform/secrets.json",
   "port": 4720,
-  "budget": { "limitPerMinute": 600, "adlReserve": 100 },
   "pairs": [
     {
       "id": "pair-1",

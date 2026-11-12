@@ -15,7 +15,7 @@ import { AsterTransferConnector } from '../aster/transfer.ts';
 import { AsterTradingConnector } from '../aster/trading.ts';
 import { ASTER_PAGE } from '../page.ts';
 import { runExecutor } from '../runtime.ts';
-import { loadServiceConfig, loadServiceSecrets, type ServiceConfig, type ServiceSecrets } from './config.ts';
+import { assertDistinctSigners, loadServiceConfig, loadServiceSecrets, type ServiceConfig, type ServiceSecrets } from './config.ts';
 import { createTakeoverGuard } from './takeover.ts';
 import { createNotifier, type EventRow, type Notifier } from './feishu.ts';
 import { runUserStream, type SocketLike } from './stream.ts';
@@ -23,6 +23,10 @@ import { runUserStream, type SocketLike } from './stream.ts';
 const NOTIFY_MS = 2_000;
 const FINAL_FLUSH_MS = 5_000;
 const CONFIG_SESSION = 'service-config';
+/** Under systemd's TimeoutStopSec (30 s), leaving time for the final alert flush. */
+const DRAIN_MS = 20_000;
+/** Longer than the lease a crashed instance leaves behind (60 s). */
+const LEASE_WAIT_MS = 65_000;
 
 export interface ServiceWiring {
   executor: Executor;
@@ -32,10 +36,15 @@ export interface ServiceWiring {
   byAddress: Map<string, AsterCredentials>;
   /** Sub-account addresses with a user stream. */
   streamed: string[];
+  /** Accounts of the configured pairs and of left-over pairs that may still write (enabled or ADL open); all locked. */
+  writable: string[];
+  /** Config changes that did not apply, for the operator. */
+  warnings: string[];
 }
 
 /** Builds the connectors and the executor on an open store and brings the registered pairs in line with the config. */
-export async function wireService(config: ServiceConfig, secrets: ServiceSecrets, store: ReturnType<typeof openStore>, { fetchImpl, now = Date.now, log = (line: string) => process.stderr.write(`${line}\n`) }: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; now?: () => number; log?: (line: string) => void } = {}): Promise<ServiceWiring> {
+export async function wireService(config: ServiceConfig, secrets: ServiceSecrets, store: ReturnType<typeof openStore>, { fetchImpl, now = Date.now, log = (line: string) => process.stderr.write(`${line}\n`), leaseWaitMs = LEASE_WAIT_MS }: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; now?: () => number; log?: (line: string) => void; leaseWaitMs?: number } = {}): Promise<ServiceWiring> {
+  assertDistinctSigners(config, secrets);
   const address = (name: string): string => secrets.accounts.get(name)!.user;
   const byAddress = new Map([...secrets.accounts.values()].map(item => [item.user, item]));
   const credentials = (accountId: string): AsterCredentials => {
@@ -50,8 +59,16 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
   const trading = new AsterTradingConnector({ client, credentials, now });
   const enableGuard = createTakeoverGuard({ transfers, trading, now });
   const executor = createExecutor({ store, connectors: [], environment: 'mainnet', now, transfers, adl: trading, positions: trading, enableGuard, adlOnlyEnabledPairs: true });
+  const warnings: string[] = [];
   try {
-    if (!executor.acquire()) throw new Error('另一个实例持有写入租约；等待其租约过期后再启动');
+    // A crashed instance leaves its lease for up to a minute; wait it out here rather than crash-looping under systemd.
+    const deadline = Date.now() + leaseWaitMs;
+    let waiting = false;
+    while (!executor.acquire()) {
+      if (Date.now() >= deadline) throw new Error('另一个实例持有写入租约，等待后仍未释放；请确认没有其他实例在运行');
+      if (!waiting) { log('上一实例的写入租约尚未过期，等待中'); waiting = true; }
+      await new Promise(resolve => setTimeout(resolve, 2_000));
+    }
     const configured = new Set(config.pairs.map(pair => pair.id));
     for (const pair of executor.transferPairs()) {
       if (configured.has(pair.id) || !pair.enabled) continue;
@@ -61,10 +78,15 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
     for (const pair of config.pairs) {
       // A new pair starts switched off; changing its accounts switches it off; changed settings apply at once.
       try { executor.registerTransferPair({ id: pair.id, mainAccountId: address(pair.main), long: address(pair.long), short: address(pair.short), config: pair.transfer }); }
-      catch (error) { log(`配对 ${pair.id} 登记失败，保持原记录：${error instanceof Error ? error.message : String(error)}`); }
+      catch (error) {
+        const text = `配对 ${pair.id} 登记失败，保持原记录：${error instanceof Error ? error.message : String(error)}`;
+        log(text); warnings.push(text);
+      }
     }
   } catch (error) { executor.close(); throw error; }
-  return { executor, trading, client, byAddress, streamed: subAccounts };
+  // transferPairs() masks the accounts; the locks need the real addresses.
+  const writable = [...new Set([...config.pairs.flatMap(pair => [address(pair.main), address(pair.long), address(pair.short)]), ...executor.writableAccounts()])];
+  return { executor, trading, client, byAddress, streamed: subAccounts, writable, warnings };
 }
 
 export interface StartOptions {
@@ -76,17 +98,23 @@ export interface StartOptions {
   connect?: (url: string) => SocketLike;
   notifyFetch?: (url: string, init: RequestInit) => Promise<Response>;
   port?: number;
+  leaseWaitMs?: number;
 }
 
 /** Opens the data directory, wires the executor and runs it with the alerts and the user streams until shutdown. */
-export async function startService({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port }: StartOptions): Promise<ReturnType<typeof runExecutor>> {
+export async function startService({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs }: StartOptions): Promise<ReturnType<typeof runExecutor>> {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   claimDataDirEnvironment(dir, 'mainnet');
   const store = openStore(join(dir, DATABASE_FILES.mainnet));
   let wiring: ServiceWiring;
-  try { wiring = await wireService(config, secrets, store, fetchImpl ? { fetchImpl } : {}); }
+  try { wiring = await wireService(config, secrets, store, { ...(fetchImpl ? { fetchImpl } : {}), ...(leaseWaitMs === undefined ? {} : { leaseWaitMs }) }); }
   catch (error) { store.close(); throw error; }
-  const { executor, trading, client, byAddress, streamed } = wiring;
+  const { executor, trading, client, byAddress, streamed, writable, warnings } = wiring;
+  // One process per account on this host, covering pairs left in the database as well as configured ones; the kernel
+  // drops the locks on exit.
+  let locks: { release(): void };
+  try { locks = await holdAccountLocks(writable.map(accountId => ({ venue: 'aster', accountId }))); }
+  catch (error) { executor.close(); store.close(); throw error; }
 
   let notifier: Notifier;
   try {
@@ -97,12 +125,15 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
       pairs: () => executor.transferPairs().map(pair => ({ id: pair.id, enabled: pair.enabled, blocked: pair.blocked, note: pair.note })),
       incidentPair: id => { try { return executor.adlIncident(id).pairId; } catch { return null; } },
     });
-  } catch (error) { executor.close(); store.close(); throw error; }
+  } catch (error) { executor.close(); store.close(); locks.release(); throw error; }
   const enabled = executor.transferPairs().filter(pair => pair.enabled).length;
-  notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个`);
+  try {
+    notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个`);
+    for (const text of warnings) notifier.notify(`【配置未生效】${text}`);
+  } catch (error) { notifier.close(); executor.close(); store.close(); locks.release(); throw error; }
 
   return runExecutor({
-    executor, store, dir, port, page: ASTER_PAGE, passes: ['transfers', 'adl'],
+    executor, store, dir, port, page: ASTER_PAGE, passes: ['transfers', 'adl'], drainMs: DRAIN_MS,
     startedMessage: `ASTER 服务已启动（${config.pairs.length} 个配对，已启用 ${enabled} 个）`,
     background: context => [
       (async () => {
@@ -115,12 +146,15 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
       ...streamed.map(accountId => runUserStream({ client, credentials: byAddress.get(accountId)!, accountId, push: (id, event) => trading.push(id, event), stopped: context.stopped, pause: context.pause, ...(connect ? { connect } : {}) })),
     ],
     onStopping: (reason, detail) => {
-      const text = reason === 'signal' ? '【服务停止】收到停止信号，正常退出' : `【服务异常停止】${detail || reason}；systemd 会自动重启，请查看日志`;
+      const text = reason === 'signal' ? '【服务停止】收到停止信号，正常退出' : `【服务异常停止】${detail || reason}；systemd 会在 5 秒后自动重启，请查看日志`;
       try { notifier.poll(); notifier.notify(text); } catch { /* best effort */ }
     },
     onStopped: async () => {
+      // Events from the drain (an unknown transfer, an ADL batch) go out now rather than at the next start.
+      try { notifier.poll(); } catch { /* best effort */ }
       await Promise.race([notifier.flush(), new Promise(resolve => setTimeout(resolve, FINAL_FLUSH_MS).unref())]);
       notifier.close();
+      locks.release();
     },
   });
 }
@@ -137,8 +171,6 @@ async function main(): Promise<void> {
   }
   if (!values['data-dir']) throw new Error('需要 --data-dir <独立目录的绝对路径>');
   const dir = assertDedicatedDataDir(values['data-dir']);
-  // One process per account on this host; the kernel drops the locks on exit.
-  await holdAccountLocks([...new Set(config.pairs.flatMap(pair => [pair.main, pair.long, pair.short]))].map(name => ({ venue: 'aster', accountId: secrets.accounts.get(name)!.user })));
   await startService({ config, secrets, dir });
 }
 

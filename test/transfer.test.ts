@@ -114,6 +114,15 @@ test('划转：多侧富余时把差额一半划给空侧，回执后重读两�
   assert.match(pairOf(h).note ?? '', /未超过划转门槛/);
 }));
 
+test('划转：停止排空开始后不再发出新的划转，记为未发送', () => withHarness(async h => {
+  await start(h);
+  h.ex.stopSending();
+  await h.ex.tick();
+  assert.deepEqual(h.aster.ledger, []);
+  assert.equal(last(h).state, 'not-sent');
+  assert.match(last(h).note ?? '', /正在停止/);
+}));
+
 test('划转：回执不带交易编号也在刷新余额后记为已执行，并注明缺少编号', () => withHarness(async h => {
   h.aster.inject({ operation: 'transfer', mode: 'ack-without-tranId' });
   await start(h);

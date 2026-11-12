@@ -83,7 +83,7 @@ trading-platform/
 | 1 | 真实 ASTER 连接器：签名、请求预算、`TransferConnector`、`AdlConnector`、持仓（已完成：`src/aster/`） | 替身 ASTER 服务器上的契约测试；签名与 Python `eth_account` 交叉向量；与 Python 结果分类逐项对照 |
 | 2 | 服务入口：配置与密钥、启用检查、绝对保留额、飞书发件箱、用户推送、页面启停（已完成：`src/service/`，入口 `pnpm service -- --config … --data-dir …`） | 端到端：替身 ASTER 上跑完划转、未知结清、ADL 发现到完成、重启接管 |
 | 3 | 部署：`deploy/install.sh`（root 运行、幂等、无变化快速结束、保留配置和数据、先校验配置再切换、启动失败自动回退）、systemd 单元、CI、发布流程（tag → GitHub Release 包）（已完成：`deploy/`、`.github/workflows/release.yml`） | CI 绿；本机以非 root 跑安装器的检查路径 |
-| 4 | 独立审查（R3），修完 P0/P1 后发布 v0.1.0 | 审查记录在 `docs/reviews/` |
+| 4 | 独立审查（R3），修完 P0/P1 后发布 v0.1.0（审查与修复完成：`docs/reviews/2026-11-12-step4-r3.md`） | 审查记录在 `docs/reviews/` |
 | 5 | 实盘：用户授权后切换第一个配对，先用最小门槛观察 | 用户当次授权；结果回填本文件 |
 
 ## 6 尚待实测（接真实账户时确认）
@@ -93,10 +93,14 @@ trading-platform/
 
 - nonce 有效窗口按 120 s 计（ASTER 文档 ±60 s，未实测）。
 - ADL 减仓单回报的 `updateTime` 是否不晚于持仓 `updateTime`（若晚于，每批多等 120 s）。
-- `forceOrders` 查询跨度上限。
+- `forceOrders` 查询跨度上限（重新启用时扫描从启用时刻开始，正常运行窗口约 2 分钟，不依赖长跨度）。
+- 网关拒绝（HTML 429/403）与 `X-MBX-USED-WEIGHT-1M` 响应头的真实表现（替身已覆盖）。
 - 本服务为同一子账户申请 listenKey 是否会让工作台已有的推送失效（工作台停用该配对后已不依赖，但同账户其他用途需留意）。
 - 高负载下流水入账延迟（2.6b 实测 50–206 ms，仅 2 个样本）。
 
 ## 7 已知限制
+
+- 请求额度：每个配对空闲时每分钟约 260 权重（两侧余额每 5 s、持仓显示每 15 s、ADL 历史每分钟）；未配置 `budget` 时按配对数自动取值，最多约 6 个默认配对，再多需调大 `checkIntervalMs`。
+- 停用配对即停止该配对新的 ADL 检测；停用期间发生的 ADL 不处理，重新启用前接管检查要求两侧每个标的净持仓为 0。
 
 - EIP-712 签名（`src/aster/eip712.ts`）是本仓库的零依赖实现，已与 ethers 及 Python `eth_account` 逐字节对照，并在 2.6b 真实划转中用过；它不是常量时间实现（私钥只在本机签名，远端观察不到时序）。以后如引入运行时依赖，换成经过审计的库（如 `@noble/curves`）。

@@ -2,10 +2,10 @@
 // request budget, answer classification as in the Python client, and every value passing the executor's own parsers.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AsterClient, RequestBudget, classify, parseAsterCredentials, TRANSFER_REJECTIONS } from '../src/aster/client.ts';
+import { AsterClient, RequestBudget, classify, parseAsterCredentials, ORDER_REJECTIONS, TRANSFER_REJECTIONS } from '../src/aster/client.ts';
 import { pythonUrlencode, signAsterMessage } from '../src/aster/eip712.ts';
 import { AsterTransferConnector, INCOME_PAGE_ROWS } from '../src/aster/transfer.ts';
-import { AsterTradingConnector, streamEvidence } from '../src/aster/trading.ts';
+import { AsterTradingConnector, marketRule, streamEvidence } from '../src/aster/trading.ts';
 import { VenueError } from '../src/connector.ts';
 import { parseSubAccountList, parseTransferBalance, parseTransferHistory, ContractError } from '../src/contracts.ts';
 import { parseAdlAccount, parseAdlEvidence, parseAdlOrderReport, parseAdlRule, type AdlOrderRequest } from '../src/adl-contracts.ts';
@@ -93,8 +93,56 @@ test('ASTER 应答分类：与 Python 客户端的拒绝码、未知码与网关
   assert.equal(verdict(400, { code: -2013, msg: 'Order does not exist.' }), 'not-found');
   assert.equal(verdict(200, { code: -1102, msg: 'bad' }), 'rejected');
   assert.equal(budget.state().coolingUntil, null);
-  assert.equal(verdict(418, { code: -1003 }), 'rejected');
+  assert.equal(verdict(418, { code: -1003 }), 'unknown');
   assert.equal(budget.state().coolingUntil, NOW + 86_400_000);
+  // Rate limits are never a rejection, so an ADL order that met one is checked, not halted on.
+  const fresh = new RequestBudget({ limitPerMinute: 600, adlReserve: 0, now: () => NOW });
+  assert.equal(classify({ status: 400, data: { code: -1015, msg: 'Too many new orders' } }, ORDER_REJECTIONS, fresh, 'o')?.kind, 'unknown');
+  assert.equal(classify({ status: 429, data: { code: -2019 } }, TRANSFER_REJECTIONS, fresh, 'o')?.kind, 'unknown');
+});
+
+test('ASTER 请求保护：无 JSON 的网关拒绝也冷却，按交易所上报的 IP 用量让出，已取消的请求不扣额度，扫描不用 ADL 保留额', async () => {
+  const { fake, budget, transfers, trading, tick } = setup({ limit: 600, reserve: 100 });
+  // An HTML 429 from a gateway: the back-off starts although the body cannot be read.
+  fake.script('GET /fapi/v3/accountWithJoinMargin', () => new Response('<html>Too Many Requests</html>', { status: 429, headers: { 'Retry-After': '240' } }));
+  await assert.rejects(transfers.balance(MAIN.user, LONG.user, { signal: signal() }));
+  assert.equal(budget.state().coolingUntil, NOW + 240_000);
+  tick(240_001);
+
+  // The exit IP is near its limit through the workbench: routine reads wait, ADL keeps the last part.
+  fake.script('GET /fapi/v3/accountWithJoinMargin', call => { void call; return json({ ...fake.accounts.get(LONG.user) }, 200, { 'X-MBX-USED-WEIGHT-1M': '2098' }); });
+  await transfers.balance(MAIN.user, LONG.user, { signal: signal() }).catch(() => undefined);
+  await assert.rejects(transfers.balance(MAIN.user, LONG.user, { signal: signal() }), (error: unknown) => /出口 IP/.test((error as Error).message));
+  fake.risk.set(LONG.user, []); fake.accounts.get(LONG.user)!.positions = [];
+  await trading.account(LONG.user, ['BTCUSDT'], { signal: signal() });
+  tick(60_001);
+
+  const used = budget.state().usedLastMinute;
+  const aborted = new AbortController(); aborted.abort();
+  await assert.rejects(transfers.balance(MAIN.user, LONG.user, { signal: aborted.signal }), kind('read-failed'));
+  assert.equal(budget.state().usedLastMinute, used);
+
+  // 100 balance reads would pass the normal ceiling; the history scan is a routine read and is refused with them.
+  const tight = setup({ limit: 100, reserve: 40 });
+  for (let i = 0; i < 12; i++) await tight.transfers.balance(MAIN.user, LONG.user, { signal: signal() });
+  await assert.rejects(tight.trading.adlHistory(SHORT.user, { from: NOW - 60_000, to: NOW }, 100, { signal: signal() }), (error: unknown) => /额度已用完/.test((error as Error).message));
+});
+
+test('ASTER 现场与规则：快照时间取第一次读取之前；市价数量上下限之间没有步进时规则不可用；交易所文本脱敏', async () => {
+  const { fake, trading, tick } = setup();
+  fake.risk.set(LONG.user, []); fake.accounts.get(LONG.user)!.positions = [];
+  fake.script('GET /fapi/v3/positionRisk', () => { tick(3_000); return json([]); });
+  const scene = await trading.account(LONG.user, ['BTCUSDT'], { signal: signal() }) as { receivedAt: number };
+  assert.equal(scene.receivedAt, NOW);
+
+  const lot = (filterType: string, stepSize: string, minQty: string, maxQty: string) => ({ filterType, stepSize, minQty, maxQty });
+  assert.deepEqual(marketRule({ filters: [lot('LOT_SIZE', '0.2', '0.2', '100'), lot('MARKET_LOT_SIZE', '0.3', '0.3', '1.2')] }), { quantityStep: '0.6', minQuantity: '0.6', maxMarketQuantity: '1.2' });
+  assert.throws(() => marketRule({ filters: [lot('LOT_SIZE', '0.2', '0.2', '100'), lot('MARKET_LOT_SIZE', '0.3', '0.3', '0.5')] }), /没有有效步进/);
+
+  const budget = new RequestBudget({ limitPerMinute: 600, adlReserve: 0, now: () => NOW });
+  const failure = classify({ status: 400, data: { code: -2019, msg: `bad\u0007 user 0x${'ab'.repeat(20)} see https://x.example/a?k=1 sig ${'A'.repeat(40)}` } }, TRANSFER_REJECTIONS, budget, 't')!;
+  assert.equal(failure.kind, 'rejected');
+  assert.doesNotMatch(failure.message, /abab|https|AAAA|\u0007/);
 });
 
 test('ASTER 划转：主账户 API 钱包签名、不带 user、表单正文；回执 200/success 才算已确认', async () => {

@@ -114,6 +114,9 @@ export function marketRule(row: Record<string, unknown>): { quantityStep: string
   const quantityStep = commonStep(steps);
   const minQuantity = [...minimums, quantityStep].reduce((a, b) => cmp(a, b) >= 0 ? a : b);
   const maxMarketQuantity = maximums.reduce((a, b) => cmp(a, b) <= 0 ? a : b);
+  // Python exchange.py: the first whole step at or above the minimum must still be within the maximum.
+  const unit = toUnits(quantityStep), firstLot = (toUnits(minQuantity) + unit - 1n) / unit * unit;
+  if (firstLot > toUnits(maxMarketQuantity)) throw new ShapeError('市价数量上下限之间没有有效步进');
   return { quantityStep, minQuantity, maxMarketQuantity };
 }
 const SCALE = 18;
@@ -186,6 +189,8 @@ export class AsterTradingConnector implements AdlConnector, AsterPositionsConnec
   /** Positions from positionRisk cross-checked against the account's own position list, plus canTrade and open orders. */
   async account(accountId: string, symbols: readonly string[], { signal }: CallOptions): Promise<unknown> {
     const wanted = new Set(symbols);
+    // The oldest read owns the scene's freshness (Python: started), not the last one.
+    const startedAt = this.now();
     const account = await this.read(accountId, '/fapi/v3/accountWithJoinMargin', {}, 5, signal, 'adl');
     const risk = await this.read(accountId, '/fapi/v3/positionRisk', {}, 5, signal, 'adl');
     const orders = await this.openOrders(accountId, [...wanted], signal);
@@ -212,7 +217,7 @@ export class AsterTradingConnector implements AdlConnector, AsterPositionsConnec
       if (own.size !== seen.size || [...seen].some(([key, amount]) => own.get(key) === undefined || cmp(own.get(key)!, amount) !== 0)) throw new ShapeError('账户与持仓接口的非零仓位尚未同步');
       const openOrders = orders.map(item => { const row = record(item, '挂单行'); return { symbol: row.symbol, clientOrderId: row.clientOrderId }; })
         .filter(row => wanted.has(String(row.symbol)));
-      return { accountId, canTrade: info.canTrade, positions, openOrders, receivedAt: this.now() };
+      return { accountId, canTrade: info.canTrade, positions, openOrders, receivedAt: startedAt };
     }, false);
   }
 
@@ -282,10 +287,10 @@ export class AsterTradingConnector implements AdlConnector, AsterPositionsConnec
     return this.shaped(() => orderReport(reply.data), true);
   }
 
-  /** One forceOrders page (autoCloseType=ADL), oldest update first. */
+  /** One forceOrders page (autoCloseType=ADL), oldest update first. A routine scan, so it never spends the ADL reserve. */
   async adlHistory(accountId: string, { from, to }: { from: number; to: number }, limit: number, { signal }: CallOptions): Promise<unknown[]> {
     const size = Math.min(Math.max(1, Math.floor(limit)), FORCE_ORDER_PAGE);
-    const data = await this.read(accountId, '/fapi/v3/forceOrders', { autoCloseType: 'ADL', startTime: String(from), endTime: String(to), limit: String(size) }, 50, signal, 'adl');
+    const data = await this.read(accountId, '/fapi/v3/forceOrders', { autoCloseType: 'ADL', startTime: String(from), endTime: String(to), limit: String(size) }, 50, signal, 'normal');
     return this.shaped(() => list(data, 'ADL 历史', size).map(restEvidence).sort((a, b) => (a.updateTime as number) - (b.updateTime as number)), false);
   }
 

@@ -34,11 +34,16 @@ export interface RunOptions {
   /** Runs after the executor is closed and before the store is. */
   onStopped?: () => Promise<void> | void;
   log?: (line: string) => void;
+  /**
+   * How long a stop waits, still renewing the lease, for running passes to finish before closing the executor.
+   * 0 closes at once: a write in flight then ends unknown and the next instance checks it.
+   */
+  drainMs?: number;
 }
 
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
-export function runExecutor({ executor, store, dir, port, page, passes = ['jobs', 'transfers', 'adl'], startedMessage, background, onStopping, onStopped, log = line => process.stderr.write(`${line}\n`) }: RunOptions): { shutdown(reason?: string, detail?: string): Promise<void>; done: Promise<void> } {
+export function runExecutor({ executor, store, dir, port, page, passes = ['jobs', 'transfers', 'adl'], startedMessage, background, onStopping, onStopped, log = line => process.stderr.write(`${line}\n`), drainMs = 0 }: RunOptions): { shutdown(reason?: string, detail?: string): Promise<void>; done: Promise<void> } {
   let stopping = false;
   let finished!: () => void;
   const done = new Promise<void>(resolve => { finished = resolve; });
@@ -62,6 +67,7 @@ export function runExecutor({ executor, store, dir, port, page, passes = ['jobs'
   let loops: Promise<void>[] = [];
   const sleepers = new Set<() => void>();
   const pause = (ms: number) => new Promise<void>(resolve => {
+    if (stopping) { resolve(); return; }
     const wake = () => { clearTimeout(timer); sleepers.delete(wake); resolve(); };
     const timer = setTimeout(wake, ms);
     sleepers.add(wake);
@@ -92,6 +98,8 @@ export function runExecutor({ executor, store, dir, port, page, passes = ['jobs'
   });
   const passFns = { jobs: ['两腿任务循环', executor.tickJobs], transfers: ['划转循环', executor.tickTransfers], adl: ['ADL 循环', executor.tickAdl] } as const;
   loops = passes.map(name => passLoop(passFns[name][0], passFns[name][1]));
+  // The jobs pass prunes history; a process without it prunes on its own schedule.
+  if (!passes.includes('jobs')) loops.push(passLoop('历史清理', async () => { executor.maintain(); }));
   // The position display reads on its own schedule, so a slow read neither waits for the passes nor holds them up (L049).
   loops.push((async () => {
     while (!context.stopped()) {
@@ -108,11 +116,19 @@ export function runExecutor({ executor, store, dir, port, page, passes = ['jobs'
     if (stopping) return done;
     stopping = true;
     try { onStopping?.(reason, detail); } catch (error) { log(`停止通知失败：${message(error)}`); }
-    clearInterval(heartbeat);
     clearInterval(walCheck);
-    executor.close();
     server.close();
     for (const wake of [...sleepers]) wake();
+    if (drainMs > 0 && !executor.retired) {
+      // Sends already out finish and are written; nothing new goes out meanwhile.
+      executor.stopSending();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const drained = await Promise.race([Promise.all(loops).then(() => true), new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), drainMs); })]);
+      clearTimeout(timer);
+      if (!drained) log(`停止时等待 ${drainMs / 1000} 秒后仍有循环未结束，直接关闭；进行中的写入由下次启动核对`);
+    }
+    clearInterval(heartbeat);
+    executor.close();
     await Promise.all(loops);
     try { await onStopped?.(); } catch (error) { log(`停止收尾失败：${message(error)}`); }
     store.close();

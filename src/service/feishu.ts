@@ -53,6 +53,8 @@ export function describeEvent(row: EventRow, incidentPair: (id: string) => strin
       if (detail.state === 'unknown') return { text: `【划转结果未知】配对 ${pair} 划转 ${short(detail.transfer)} 结果未知，不会重发；原请求过期后核对两侧流水自动结算，期间该配对暂停划转` };
       if (detail.state === 'rejected') return { text: `【划转被拒】配对 ${pair} 划转 ${short(detail.transfer)} 被交易所拒绝`, repeatKey: `rejected:${pair}` };
       return null;
+    case 'transfer-recovered':
+      return detail.state === 'unknown' ? { text: `【划转结果未知】配对 ${pair} 划转 ${short(detail.transfer)} 在上次停止时正在发送，结果未知，不会重发；原请求过期后核对两侧流水自动结算` } : null;
     case 'transfer-settled':
       if (detail.basis === 'acknowledged' || typeof detail.basis !== 'string') return null;
       return { text: `【未知划转已结算】配对 ${pair} 划转 ${short(detail.transfer)}：${SETTLE_TEXT[detail.basis] ?? detail.basis}${detail.basis.includes('partial') || detail.basis.includes('ambiguous') || detail.basis.includes('unreadable') ? '，请人工核对两侧余额' : ''}` };
@@ -61,7 +63,7 @@ export function describeEvent(row: EventRow, incidentPair: (id: string) => strin
     case 'transfer-tick-failed':
       return { text: `【划转循环出错】${clip(detail.reason)}`, repeatKey: `transfer-tick:${clip(detail.reason, 80)}` };
     case 'transfer-pair-switched':
-      return { text: `【配对${detail.enabled ? '已启用' : '已停用'}】配对 ${pair}${detail.enabled ? '：本平台开始负责保证金平衡与 ADL 应急处理' : '：不再划转（未结束的 ADL 事件仍会处理完）'}` };
+      return { text: `【配对${detail.enabled ? '已启用' : '已停用'}】配对 ${pair}${detail.enabled ? '：本平台开始负责保证金平衡与 ADL 应急处理' : '：划转与新的 ADL 检测都已停止（未结束的 ADL 事件仍会处理完）；停用期间发生的 ADL 不会被处理'}` };
     case 'adl-incident-opened':
       return { text: `【ADL】配对 ${pair} 检测到两侧不一致：${Array.isArray(detail.symbols) ? detail.symbols.map(String).join('、') : '?'}，开始处理（事件 ${short(detail.incident)}）` };
     case 'adl-incident-blocked':
@@ -80,7 +82,7 @@ export function describeEvent(row: EventRow, incidentPair: (id: string) => strin
     case 'adl-tick-failed':
       return { text: `【ADL 循环出错】${clip(detail.reason)}`, repeatKey: `adl-tick:${clip(detail.reason, 80)}` };
     case 'adl-push-dropped':
-      return { text: `【ADL 推送丢弃】用户推送积压，部分 ADL 成交推送被丢弃，改由历史扫描补齐`, repeatKey: 'push-dropped' };
+      return { text: `【ADL 推送丢弃】${Number(detail.overflow) > 0 ? `用户推送积压，丢弃 ${clip(detail.overflow, 8)} 条` : ''}${Number(detail.overflow) > 0 && Number(detail.invalid) > 0 ? '；' : ''}${Number(detail.invalid) > 0 ? `${clip(detail.invalid, 8)} 条 ADL 成交推送格式无效` : ''}；改由历史扫描补齐`, repeatKey: 'push-dropped' };
     default:
       return null;
   }

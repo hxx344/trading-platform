@@ -2,19 +2,21 @@ name: release
 on:
   push:
     tags: ['v*.*.*']
+# Install, tests and packaging run with a read-only token; only the last job, which runs no project code, can write.
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: release
   cancel-in-progress: false
 jobs:
-  release:
+  build:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -31,9 +33,7 @@ jobs:
       - run: shellcheck deploy/*.sh
       - run: bash deploy/test-install.sh
       - run: bash deploy/package.sh dist
-      - name: 发布 GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: 更新说明
         run: |
           previous=$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || true)
           range=${previous:+$previous..}$GITHUB_REF_NAME
@@ -47,5 +47,25 @@ jobs:
             echo 'curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/install.sh && sudo bash install.sh'
             echo '```'
           } >dist/NOTES.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/
+          retention-days: 7
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: dist
+      - name: 发布 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
           gh release create "$GITHUB_REF_NAME" dist/trading-platform.tar.gz dist/install.sh dist/SHA256SUMS \
-            --title "$GITHUB_REF_NAME" --notes-file dist/NOTES.md --verify-tag
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes-file dist/NOTES.md --verify-tag

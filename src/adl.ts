@@ -296,6 +296,8 @@ export function createAdl({ db, now, budgets, connector, control, write, assertW
   const activeElapsed = (incident: Incident): number => incident.activeMs + (incident.activeSince !== null ? Math.max(0, now() - incident.activeSince) : 0);
 
   // ---- pairs and evidence --------------------------------------------------------
+  /** How far before the enable checks a switched-on pair is watched, covering position reads that lag a fill. */
+  const WATCH_MARGIN_MS = 10_000;
   function newScan(accountId: string, previous: AdlPairRecord | null): Scan {
     const kept = previous ? SIDES.map(side => previous.scans[side]).find(scan => scan.accountId === accountId) : undefined;
     return kept ?? { accountId, since: now(), coveredUntil: now(), windows: [], nextAt: now() + budgets.adlScanIntervalMs, note: null };
@@ -310,6 +312,18 @@ export function createAdl({ db, now, budgets, connector, control, write, assertW
     saveAdlPair(record);
     event(null, current ? 'adl-pair-accounts-changed' : 'adl-pair-installed', { pair: pair.id });
     return record;
+  }
+  /**
+   * Inside a write. A pair switched on is watched from `from`, a margin before its enable checks began: ADL before that
+   * is not looked for (the checks proved both sides hedged), so a long pause never leaves a scan window the venue will
+   * not answer, and one between the checks and the switch is still found. A pair with an open incident keeps its windows.
+   */
+  function watchFrom(pair: PairRecord, from: number): void {
+    if (busy(pair.id) !== null) return;
+    const record = installPair(pair);
+    const since = Math.min(from, now()) - WATCH_MARGIN_MS;
+    for (const side of SIDES) record.scans[side] = { ...record.scans[side], since, coveredUntil: since, windows: [], nextAt: now() + budgets.adlScanIntervalMs, note: null };
+    saveAdlPair(record);
   }
   function ensurePair(pair: PairRecord): AdlPairRecord {
     const existing = readAdlPair(pair.id);
@@ -1093,7 +1107,7 @@ export function createAdl({ db, now, budgets, connector, control, write, assertW
   }
 
   return {
-    recover, tick, busy, setConfig, restart,
+    recover, tick, busy, setConfig, restart, watchFrom,
     /** Why a batch of the pair is on the wire (persisted for sending, sent or resting), or null; the pair's transfers wait for it. */
     sending: (pairId: string): string | null => db.prepare("SELECT 1 FROM adl_batches WHERE pair_id = ? AND settled = 0 AND state IN ('prepared', 'sending', 'open') LIMIT 1").get(pairId) ? 'ADL 减仓单正在发送或挂单' : null,
     pairs: () => { const list = pairs(); return list.map(pair => pairView(pair, list)); },

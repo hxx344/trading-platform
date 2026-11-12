@@ -10,7 +10,7 @@ import { ContractError, DEFAULT_TRANSFER_CONFIG, parseTransferConfig } from '../
 import { planTransfer } from '../src/transfer.ts';
 import { openStore } from '../src/store.ts';
 import { AsterClient, RequestBudget } from '../src/aster/client.ts';
-import { parseServiceConfig, parseServiceSecrets, type ServiceConfig, type ServiceSecrets } from '../src/service/config.ts';
+import { assertDistinctSigners, pairWeightPerMinute, parseServiceConfig, parseServiceSecrets, type ServiceConfig, type ServiceSecrets } from '../src/service/config.ts';
 import { createTakeoverGuard, TAKEOVER_WINDOW_MS } from '../src/service/takeover.ts';
 import { STUCK_AFTER_MS, createNotifier, describeEvent, feishuSign, type EventRow, type PairState } from '../src/service/feishu.ts';
 import { runUserStream, STREAM_BASE, type SocketLike } from '../src/service/stream.ts';
@@ -33,6 +33,14 @@ test('服务配置：默认值、预留额度与配对校验；密钥文件须�
   assert.throws(() => parseServiceConfig(configRaw([{ id: 'p1', main: 'main', long: 'a', short: 'b' }, { id: 'p1', main: 'main', long: 'c', short: 'd' }])), /重复/);
   assert.throws(() => parseServiceConfig({ ...configRaw(), budget: { limitPerMinute: 600, adlReserve: 580 } }), /ADL 预留权重/);
   assert.throws(() => parseServiceConfig({ ...configRaw(), extra: 1 }), /不支持的字段/);
+  // The budget follows the pairs: idle use (balances, display, ADL scans) must fit under the limit less the ADL reserve.
+  const many = (count: number, transfer?: unknown) => configRaw(Array.from({ length: count }, (_, i) => ({ id: `p${i}`, main: 'main', long: `l${i}`, short: `s${i}`, ...(transfer ? { transfer } : {}) })));
+  assert.equal(pairWeightPerMinute(config.pairs[0]!), 260);
+  const three = parseServiceConfig(many(3));
+  assert.ok(three.budget.limitPerMinute - three.budget.adlReserve >= 3 * 260 + 100, JSON.stringify(three.budget));
+  assert.throws(() => parseServiceConfig({ ...many(3), budget: { limitPerMinute: 600 } }), /约需请求权重 880/);
+  assert.throws(() => parseServiceConfig(many(8)), /超过本服务可用的 2100/);
+  assert.equal(parseServiceConfig(many(8, { checkIntervalMs: 30_000 })).pairs.length, 8);
 
   const secrets = parseServiceSecrets({ ...secretsRaw, feishu: { webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/abcdef12-3456', secret: 's3cret' } }, ['main', 'a', 'b']);
   assert.equal(secrets.accounts.get('a')!.user, LONG.user);
@@ -43,6 +51,10 @@ test('服务配置：默认值、预留额度与配对校验；密钥文件须�
   // A key that does not derive the signer is named by account, never quoted.
   const wrong = { ...LONG, signer: SHORT.signer };
   assert.throws(() => parseServiceSecrets({ accounts: { a: wrong } }, []), (error: unknown) => error instanceof Error && /账户 a/.test(error.message) && !error.message.includes(LONG.privateKey.slice(2, 12)));
+  // A transfer carries no user, so the main account's API wallet must not also sign for a sub-account.
+  const sharedWallet = parseServiceSecrets({ accounts: { main: { user: MAIN.user, signer: LONG.signer, privateKey: LONG.privateKey }, a: LONG, b: SHORT } }, ['main', 'a', 'b']);
+  assert.throws(() => assertDistinctSigners(config, sharedWallet), /主账户 main 与子账户 a 使用同一个 API 钱包/);
+  assertDistinctSigners(config, secrets);
 });
 
 test('固定保留额：取比例保留与该侧固定额中较大者', () => {
@@ -191,6 +203,14 @@ test('飞书告警：未配置机器人时只写日志；事件说明覆盖结�
   assert.match(describeEvent(row('transfer-settled', { pair: 'p', transfer: 't', basis: 'nonce_expired_partial_receipt' }), () => null)!.text, /人工核对/);
   assert.match(describeEvent(row('adl-incident-completed', { incident: 'i', unknown: 1 }), () => 'p9')!.text, /配对 p9.*1 笔减仓单结果未知/);
   assert.equal(describeEvent(row('history-pruned', {}), () => null), null);
+  // A transfer that was on the wire at the last stop is announced at start, not only when it settles.
+  assert.match(describeEvent(row('transfer-recovered', { pair: 'p', transfer: 't', state: 'unknown' }), () => null)!.text, /划转结果未知.*上次停止时正在发送/);
+  assert.equal(describeEvent(row('transfer-recovered', { pair: 'p', transfer: 't', state: 'acknowledged' }), () => null), null);
+  // Invalid pushes are not called a backlog.
+  const invalidOnly = describeEvent(row('adl-push-dropped', { invalid: 2, overflow: 0 }), () => null)!.text;
+  assert.match(invalidOnly, /2 条 ADL 成交推送格式无效/);
+  assert.doesNotMatch(invalidOnly, /积压/);
+  assert.match(describeEvent(row('adl-push-dropped', { invalid: 0, overflow: 5 }), () => null)!.text, /积压，丢弃 5 条；改由历史扫描补齐/);
 });
 
 class FakeSocket implements SocketLike {
@@ -247,7 +267,8 @@ test('服务装配：配对登记为停用，启用前做接管检查（含两�
   const store = openStore(join(dir, 'executor-live.sqlite'));
   const fake = new FakeAster();
   try {
-    const config = parseServiceConfig(configRaw([{ id: 'p1', main: 'main', long: 'a', short: 'b', transfer: { longReserve: '5' } }]));
+    // Four takeover checks in a row (each reads open orders, income and positions of both sides) need more than the default.
+    const config = parseServiceConfig({ ...configRaw([{ id: 'p1', main: 'main', long: 'a', short: 'b', transfer: { longReserve: '5' } }]), budget: { limitPerMinute: 1200 } });
     let { executor, trading } = await wired(fake, store, config);
     assert.equal(executor.environment, 'mainnet');
     const [pair] = executor.transferPairs();
@@ -277,6 +298,24 @@ test('服务装配：配对登记为停用，启用前做接管检查（含两�
     await executor.setTransferEnabled({ pairId: 'p1', enabled: true, requestId: randomUUID() }, 's');
     assert.equal(executor.transferPairs()[0]!.enabled, true);
 
+    // Switched off and on again: the ADL watch starts afresh at the second switch, not from the first one.
+    await executor.tickAdl();
+    const firstWatch = executor.adlPairs()[0]!.scans!.long!.coveredUntil;
+    await executor.setTransferEnabled({ pairId: 'p1', enabled: false, requestId: randomUUID() }, 's');
+    assert.equal(executor.adlPairs().length, 0);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    const checksFrom = Date.now();
+    await executor.setTransferEnabled({ pairId: 'p1', enabled: true, requestId: randomUUID() }, 's');
+    const rewatch = executor.adlPairs()[0]!.scans!;
+    assert.ok(rewatch.long!.coveredUntil >= firstWatch + 30 && rewatch.short!.coveredUntil === rewatch.long!.coveredUntil, JSON.stringify(rewatch));
+    // The watch starts a margin before the enable checks read anything, so an ADL during the checks is still found.
+    // (50 ms for the moment between this clock read and the executor's own, far below the guard's reads.)
+    assert.ok(rewatch.long!.coveredUntil <= checksFrom - 10_000 + 50, JSON.stringify(rewatch));
+    assert.equal(rewatch.long!.pendingWindows, 0);
+    // Enabling a pair that is already on (a repeated click) leaves its watch alone.
+    await executor.setTransferEnabled({ pairId: 'p1', enabled: true, requestId: randomUUID() }, 's');
+    assert.equal(executor.adlPairs()[0]!.scans!.long!.coveredUntil, rewatch.long!.coveredUntil);
+
     // Taken over: the transfer pass balances USD1 (long 120.5 vs short 80) with the main account's signature.
     await executor.tickTransfers();
     const sent = fake.calls.filter(call => call.path === '/fapi/v3/subAccountTransfer');
@@ -301,11 +340,23 @@ test('服务装配：配对登记为停用，启用前做接管检查（含两�
     // Dropped from the config: switched off at the next start.
     executor.close();
     const lines: string[] = [];
-    ({ executor } = await wired(fake, store, parseServiceConfig(configRaw([{ id: 'p2', main: 'main', long: 'a', short: 'b' }])), lines));
+    const again = await wired(fake, store, parseServiceConfig(configRaw([{ id: 'p2', main: 'main', long: 'a', short: 'b' }])), lines);
+    executor = again.executor;
     assert.equal(executor.transferPairs().find(item => item.id === 'p1')!.enabled, false);
     assert.ok(lines.some(line => /p1 已不在配置中，已停用/.test(line)));
-    // p2 reuses p1's sub-accounts, which the executor refuses; the old record stays.
+    // p2 reuses p1's sub-accounts, which the executor refuses; the old record stays, and the operator is told by alert.
     assert.ok(lines.some(line => /p2 登记失败/.test(line)));
+    assert.ok(again.warnings.some(line => /p2 登记失败/.test(line)));
+    // The left-over p1 (its ADL incident still open) keeps its accounts locked by this process.
+    assert.deepEqual(new Set(again.writable), new Set([MAIN.user, LONG.user, SHORT.user]));
+
+    // A second instance waits for the lease, then gives up while the first one still holds it.
+    const secrets: ServiceSecrets = { accounts: new Map([['main', MAIN], ['a', LONG], ['b', SHORT]]), feishu: null };
+    const waited: string[] = [];
+    const started = Date.now();
+    await assert.rejects(wireService(config, secrets, store, { fetchImpl: fake.fetch, log: line => waited.push(line), leaseWaitMs: 300 }), /等待后仍未释放/);
+    assert.ok(Date.now() - started >= 300);
+    assert.ok(waited.some(line => /租约尚未过期，等待中/.test(line)));
     executor.close();
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });

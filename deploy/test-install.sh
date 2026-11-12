@@ -66,5 +66,18 @@ check '可装回上一版本' '[[ $status -eq 0 && "$(readlink -f "$TP_APP_DIR/c
 run --version 0.1.0 && status=0 || status=$?
 check '版本号格式校验' '[[ $status -ne 0 ]] && grep -q "须形如 v0.1.0" "$tmp/out"'
 
+# A secretsFile outside the config directory is never taken over (P3-1 of the step 4 review).
+mkdir -p "$tmp/outside"
+cp "$TP_CONF_DIR/secrets.json" "$tmp/outside/secrets.json"; chmod 640 "$tmp/outside/secrets.json"
+sed -i "s|$TP_CONF_DIR/secrets.json|$tmp/outside/secrets.json|" "$TP_CONF_DIR/config.json"
+run --package "$tmp/a" && status=0 || status=$?
+check '目录外的密钥文件不改权限' '[[ "$(stat -c %a "$tmp/outside/secrets.json")" == 640 ]] && grep -q "未调整属主与权限" "$tmp/out"'
+sed -i "s|$tmp/outside/secrets.json|$TP_CONF_DIR/secrets.json|" "$TP_CONF_DIR/config.json"
+
+# No current link (data and config left from an earlier install): installs and points current at the release.
+rm "$TP_APP_DIR/current"
+run --package "$tmp/b" && status=0 || status=$?
+check '没有 current 链接时重新安装' '[[ $status -eq 0 && -L "$TP_APP_DIR/current" && "$(readlink "$TP_APP_DIR/current")" == "$TP_APP_DIR/releases/"* ]]'
+
 if ((failures)); then printf '%d 项失败；最后一次输出：\n' "$failures"; cat "$tmp/out"; exit 1; fi
 printf '安装测试全部通过\n'

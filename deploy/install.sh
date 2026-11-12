@@ -81,7 +81,12 @@ expected=$(awk '$2 == "trading-platform.tar.gz" { print $1 }' "$work_dir/SHA256S
 [[ "$expected" =~ ^[a-f0-9]{64}$ ]] || fail '校验清单里没有程序包的 SHA-256。'
 release_dir="$APP_DIR/releases/${expected:0:16}"
 current_sha=$(cat "$APP_DIR/current/.package-sha256" 2>/dev/null || true)
-previous_dir=$(readlink -f "$APP_DIR/current" 2>/dev/null || true)
+# The release `current` points at, if it is one of ours; a missing link or anything else is no version to roll back to.
+previous_dir=''
+if [[ -L "$APP_DIR/current" ]]; then
+  target=$(readlink "$APP_DIR/current")
+  [[ "$target" == "$APP_DIR/releases/"* && -d "$target" ]] && previous_dir=$target
+fi
 
 as_root_dir "$APP_DIR/releases" 755
 if [[ -f "$release_dir/.package-sha256" && "$(cat "$release_dir/.package-sha256")" == "$expected" ]]; then
@@ -152,25 +157,27 @@ if [[ -f "$CONF_DIR/config.json" ]]; then
   configured=1
   # The service reads both files only when they belong to its account and nobody else can read them.
   secrets_file=$("$NODE_BIN" -e 'try { const v = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).secretsFile; if (typeof v === "string") process.stdout.write(v); } catch {}' "$CONF_DIR/config.json")
+  # Only files of this directory are taken over: a secretsFile pointing elsewhere (say the workbench's own key file)
+  # is left as it is, and the service refuses it unless it already belongs to the service account with mode 600.
+  if [[ -n "$secrets_file" ]]; then
+    conf_real=$(readlink -f "$CONF_DIR")
+    if [[ -L "$secrets_file" || ! -f "$secrets_file" || "$(readlink -f "$secrets_file")" != "$conf_real/"* ]]; then
+      log "密钥文件 $secrets_file 不是 $CONF_DIR 下的普通文件，未调整属主与权限；请自行确认它只归服务账户所有且为 600。"
+      secrets_file=''
+    fi
+  fi
   for file in "$CONF_DIR/config.json" ${secrets_file:+"$secrets_file"}; do
-    [[ -f "$file" ]] || continue
+    [[ -f "$file" && ! -L "$file" ]] || continue
     if [[ "$TEST_MODE" == 1 ]]; then wanted="$(id -un) 600"; else wanted="$SERVICE_USER 600"; fi
     if [[ "$(stat -c '%U %a' "$file")" != "$wanted" ]]; then
-      [[ "$TEST_MODE" == 1 ]] || chown "$SERVICE_USER:$SERVICE_USER" "$file"
+      [[ "$TEST_MODE" == 1 ]] || chown -h "$SERVICE_USER:$SERVICE_USER" "$file"
       chmod 600 "$file"
       changes+=("$file 改为仅 ${wanted%% *} 可读写（600）")
     fi
   done
 fi
 
-# ---- 4. systemd 单元 ----------------------------------------------------------------
-sed -e "s|@NODE@|$NODE_BIN|g" -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@CONF_DIR@|$CONF_DIR|g" -e "s|@DATA_DIR@|$DATA_DIR|g" \
-  "$release_dir/deploy/trading-platform.service" >"$work_dir/unit"
-unit_changed=0
-if cmp -s "$work_dir/unit" "$UNIT_FILE"; then skipped+=('systemd 单元（未变化）')
-else install -m 644 "$work_dir/unit" "$UNIT_FILE"; unit_changed=1; changes+=('systemd 单元'); fi
-
-# ---- 5. 校验配置、切换版本 ------------------------------------------------------------
+# ---- 4. 校验配置 ----------------------------------------------------------------------
 config_hash() {
   "$NODE_BIN" -e 'const fs = require("fs"), hash = require("crypto").createHash("sha256"); const text = fs.readFileSync(process.argv[1]); hash.update(text);
     try { const s = JSON.parse(text).secretsFile; if (typeof s === "string") hash.update(fs.readFileSync(s)); } catch {} process.stdout.write(hash.digest("hex"));' "$CONF_DIR/config.json"
@@ -185,6 +192,27 @@ if ((configured)); then
   fi
   log "$check"
 fi
+
+# ---- 5. systemd 单元、切换版本 ---------------------------------------------------------
+# Written only after the config check passed, so a failed run never leaves a new unit that systemd was not reloaded for.
+write_unit() { # $1：取单元模板的版本目录；有变化并已写入返回 0，未变化返回 1，模板缺失或无法生成返回 2（不动现有单元）
+  [[ -f "$1/deploy/trading-platform.service" ]] || return 2
+  sed -e "s|@NODE@|$NODE_BIN|g" -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@CONF_DIR@|$CONF_DIR|g" -e "s|@DATA_DIR@|$DATA_DIR|g" \
+    "$1/deploy/trading-platform.service" >"$work_dir/unit" || return 2
+  [[ -s "$work_dir/unit" ]] || return 2
+  cmp -s "$work_dir/unit" "$UNIT_FILE" && return 1
+  install -m 644 "$work_dir/unit" "$UNIT_FILE"
+}
+unit_changed=0
+unit_status=0
+write_unit "$release_dir" || unit_status=$?
+case $unit_status in
+  0) unit_changed=1; changes+=('systemd 单元') ;;
+  1) skipped+=('systemd 单元（未变化）') ;;
+  *) fail '无法从程序包生成 systemd 单元，未切换版本。' ;;
+esac
+# An earlier run may have written the unit and stopped before reloading.
+needs_reload() { ((unit_changed)) || [[ "$TEST_MODE" != 1 && "$(systemctl show -p NeedDaemonReload --value "$SERVICE" 2>/dev/null)" == yes ]]; }
 program_changed=0
 if [[ "$previous_dir" != "$release_dir" ]]; then switch_to "$release_dir"; program_changed=1; changes+=("程序 $new_version"); fi
 applied_file="$APP_DIR/.applied-config"
@@ -213,10 +241,10 @@ if [[ "$TEST_MODE" == 1 ]]; then
   skipped+=('systemctl（测试模式）')
   ((configured)) && printf '%s\n' "$applied" >"$applied_file"
 elif ((!configured)); then
-  ((unit_changed)) && systemctl daemon-reload
+  if needs_reload; then systemctl daemon-reload; fi
   skipped+=('启动服务（尚无 config.json）')
 else
-  ((unit_changed)) && systemctl daemon-reload
+  if needs_reload; then systemctl daemon-reload; fi
   if ! systemctl is-enabled --quiet "$SERVICE"; then systemctl enable --quiet "$SERVICE"; changes+=('开机自启'); fi
   action=''
   if ! systemctl is-active --quiet "$SERVICE"; then action=start
@@ -224,16 +252,29 @@ else
   else skipped+=('服务（运行中，无需重启）'); fi
   if [[ -n "$action" ]]; then
     marker=$(date +%s)
-    systemctl "$action" "$SERVICE"
-    if healthy "$marker"; then
+    # A unit stuck in failed (start limit) refuses start; clear it, and a refused start is a failed start, not an exit.
+    systemctl reset-failed "$SERVICE" 2>/dev/null || true
+    started=1
+    systemctl "$action" "$SERVICE" || started=0
+    if ((started)) && healthy "$marker"; then
       printf '%s\n' "$applied" >"$applied_file"; chmod 600 "$applied_file"
       changes+=("服务已$([[ $action == start ]] && echo 启动 || echo 重启)")
     else
       log '服务没有正常启动，最近日志：'; journal_tail
       if ((program_changed)) && [[ -n "$previous_dir" && -d "$previous_dir" ]]; then
+        previous_version=$(head -n1 "$previous_dir/VERSION" 2>/dev/null || echo 上一版本)
         switch_to "$previous_dir"
-        systemctl restart "$SERVICE" || true
-        fail "新版本 $new_version 启动失败，已回退到 $(head -n1 "$previous_dir/VERSION" 2>/dev/null || echo 上一版本)；请按上面的日志处理"
+        rollback_unit=0
+        write_unit "$previous_dir" || rollback_unit=$?
+        ((rollback_unit < 2)) || log "上一版本目录里没有可用的单元模板，保留当前单元文件。"
+        systemctl daemon-reload
+        systemctl reset-failed "$SERVICE" 2>/dev/null || true
+        marker=$(date +%s)
+        if systemctl restart "$SERVICE" && healthy "$marker"; then
+          fail "新版本 $new_version 启动失败，已回退到 $previous_version 并确认运行正常；请按上面的日志处理"
+        fi
+        log '回退后服务仍未正常运行，最近日志：'; journal_tail
+        fail "新版本 $new_version 启动失败，已切回 $previous_version，但服务仍未正常运行；请按日志处理后重新执行本脚本"
       fi
       fail '服务启动失败；请按上面的日志检查配置后重新执行本脚本'
     fi

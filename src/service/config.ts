@@ -3,7 +3,9 @@
 // check as the live canary files, and no message built here carries a key or a webhook.
 import { isAbsolute } from 'node:path';
 import { ContractError, PAIR_ID, exactKeys, integer, parseTransferConfig, type TransferConfig } from '../contracts.ts';
-import { parseAsterCredentials, type AsterCredentials } from '../aster/client.ts';
+import { IP_CEILING, parseAsterCredentials, type AsterCredentials } from '../aster/client.ts';
+import { DEFAULT_ADL_BUDGETS } from '../adl.ts';
+import { DEFAULT_POSITIONS_BUDGETS } from '../positions.ts';
 import { parsePrivateJson, readPrivateFile } from '../live/setup.ts';
 
 const ACCOUNT_NAME = /^[0-9A-Za-z_-]{1,64}$/;
@@ -21,6 +23,14 @@ export interface ServiceConfig {
 export interface FeishuSecret { webhook: string; secret: string | null }
 export interface ServiceSecrets { accounts: Map<string, AsterCredentials>; feishu: FeishuSecret | null }
 
+/** Weight one pair spends a minute when idle: both balances every check, both position displays, both ADL history scans. */
+export function pairWeightPerMinute(pair: ServicePair): number {
+  const perMinute = (ms: number): number => Math.ceil(60_000 / ms);
+  return 2 * 5 * perMinute(pair.transfer.checkIntervalMs) + 2 * 5 * perMinute(DEFAULT_POSITIONS_BUDGETS.positionsRefreshMs) + 2 * 50 * perMinute(DEFAULT_ADL_BUDGETS.adlScanIntervalMs);
+}
+/** Room above the idle use for takeover checks, transfers and catch-up history pages. */
+const BUDGET_HEADROOM = 100;
+
 const fail = (name: string, error: unknown): Error => new Error(`${name}无效：${error instanceof ContractError || error instanceof Error ? error.message : '格式错误'}`);
 
 export function parseServiceConfig(raw: unknown): ServiceConfig {
@@ -28,8 +38,6 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   if (typeof value.secretsFile !== 'string' || !isAbsolute(value.secretsFile)) throw new Error('secretsFile 必须是绝对路径');
   const port = value.port === undefined ? DEFAULT_PORT : integer(value.port, 1_024, 65_535, '端口');
   const budgetRaw = exactKeys(value.budget ?? {}, [], ['limitPerMinute', 'adlReserve']);
-  const limitPerMinute = budgetRaw.limitPerMinute === undefined ? 600 : integer(budgetRaw.limitPerMinute, 100, 2_400, '每分钟请求权重上限');
-  const adlReserve = budgetRaw.adlReserve === undefined ? Math.floor(limitPerMinute / 6) : integer(budgetRaw.adlReserve, 0, limitPerMinute - 50, 'ADL 预留权重');
   if (!Array.isArray(value.pairs) || value.pairs.length < 1 || value.pairs.length > MAX_PAIRS) throw new Error(`pairs 须列出 1–${MAX_PAIRS} 个配对`);
   const pairs = value.pairs.map((item, index) => {
     const pair = exactKeys(item, ['id', 'main', 'long', 'short'], ['transfer']);
@@ -46,6 +54,12 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   // One sub-account in two pairs would have two balancers moving its money.
   const subs = pairs.flatMap(pair => [pair.long, pair.short]);
   if (new Set(subs).size !== subs.length) throw new Error('同一子账户不能出现在两个配对或同一配对两侧');
+  // The routine reads must fit under the limit less the ADL reserve, or balance reads and scans are refused all the time.
+  const needed = pairs.reduce((sum, pair) => sum + pairWeightPerMinute(pair), BUDGET_HEADROOM);
+  const limitPerMinute = budgetRaw.limitPerMinute === undefined ? Math.max(600, Math.ceil(needed * 6 / 5)) : integer(budgetRaw.limitPerMinute, 100, IP_CEILING, '每分钟请求权重上限');
+  if (limitPerMinute > IP_CEILING) throw new Error(`${pairs.length} 个配对每分钟约需请求权重 ${needed}，超过本服务可用的 ${IP_CEILING}；请减少配对或调大 checkIntervalMs`);
+  const adlReserve = budgetRaw.adlReserve === undefined ? Math.floor(limitPerMinute / 6) : integer(budgetRaw.adlReserve, 0, limitPerMinute - 50, 'ADL 预留权重');
+  if (limitPerMinute - adlReserve < needed) throw new Error(`${pairs.length} 个配对每分钟约需请求权重 ${needed}，而每分钟上限 ${limitPerMinute} 减去 ADL 预留 ${adlReserve} 只剩 ${limitPerMinute - adlReserve}；请调大 budget.limitPerMinute 或去掉 budget 使用自动值`);
   return { port, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs };
 }
 
@@ -75,9 +89,25 @@ export function loadServiceConfig(path: string): ServiceConfig {
   try { return parseServiceConfig(raw); } catch (error) { throw fail('服务配置文件', error); }
 }
 
+/**
+ * A transfer is signed by the main account's API wallet without a user, so the venue knows the account only by that
+ * signer: it must not also sign for a sub-account (Python margin_balance refuses the same).
+ */
+export function assertDistinctSigners(config: ServiceConfig, secrets: ServiceSecrets): void {
+  const signer = (name: string): string => secrets.accounts.get(name)!.signer.toLowerCase();
+  const subSigners = new Map(config.pairs.flatMap(pair => [pair.long, pair.short]).map(name => [signer(name), name]));
+  for (const pair of config.pairs) {
+    const shared = subSigners.get(signer(pair.main));
+    if (shared !== undefined) throw new Error(`主账户 ${pair.main} 与子账户 ${shared} 使用同一个 API 钱包；划转不带 user，必须为主账户单独配置 API 钱包`);
+  }
+}
+
 export function loadServiceSecrets(config: ServiceConfig): ServiceSecrets {
   const raw = parsePrivateJson(readPrivateFile(config.secretsFile, '密钥文件'), '密钥文件');
   // parseAsterCredentials never quotes a key; other messages name only account names and fields.
-  try { return parseServiceSecrets(raw, [...new Set(config.pairs.flatMap(pair => [pair.main, pair.long, pair.short]))]); }
-  catch (error) { throw fail('密钥文件', error); }
+  try {
+    const secrets = parseServiceSecrets(raw, [...new Set(config.pairs.flatMap(pair => [pair.main, pair.long, pair.short]))]);
+    assertDistinctSigners(config, secrets);
+    return secrets;
+  } catch (error) { throw fail('密钥文件', error); }
 }

@@ -4,8 +4,9 @@
 Description=统一交易平台（ASTER 保证金平衡划转与 ADL 应急处理）
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=600
-StartLimitBurst=20
+# Never give up restarting: a stopped unit leaves the enabled pairs with neither balancing nor ADL handling. The
+# service waits out a crashed instance's lease itself, so restarts do not spin.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

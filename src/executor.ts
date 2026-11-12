@@ -12,7 +12,7 @@ import {
   type ChaseConnector, type ChaseRequest, type OrderReport, type OrderRequest, type StrategyIdentity, type StrategyReport, type StrategyStatus, type TransferConnector, type VenueConnector,
 } from './connector.ts';
 import type { Store } from './store.ts';
-import { createTransfers, type TransferDeps } from './transfer.ts';
+import { createTransfers, type PairRecord, type TransferDeps } from './transfer.ts';
 import { DEFAULT_ADL_BUDGETS, createAdl, type Adl, type AdlBudgets } from './adl.ts';
 import type { AdlConnector } from './adl-contracts.ts';
 import { DEFAULT_POSITIONS_BUDGETS, createPositions, type AsterPositionsConnector, type PositionsBudgets } from './positions.ts';
@@ -420,9 +420,14 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     try { return await Promise.race([operation(controller.signal), deadline]); }
     finally { clearTimeout(timer); }
   }
-  const transfers = createTransfers({ db, now, budgets, connector: transferConnector ?? null, control, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
-    busy: pairId => adl.busy(pairId), adlSending: pairId => adl.sending(pairId), enableGuard });
-  const adl: Adl = createAdl({ db, now, budgets, connector: adlConnector ?? null, control, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
+  // Transfers and ADL use this only as their send guard: the writer check, and no new send once a stop is draining.
+  let draining = false;
+  const assertSendable = (): void => { assertWriter(); if (draining) throw new Error('服务正在停止，不再发出新的请求'); };
+  const transfers = createTransfers({ db, now, budgets, connector: transferConnector ?? null, control, write, assertWriter: assertSendable, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
+    busy: pairId => adl.busy(pairId), adlSending: pairId => adl.sending(pairId), enableGuard,
+    // Only enabled pairs are watched for ADL here, so switching one on starts its watch afresh rather than catching up the pause.
+    ...(adlOnlyEnabledPairs ? { onEnabled: (pair: PairRecord, from: number) => adl.watchFrom(pair, from) } : {}) });
+  const adl: Adl = createAdl({ db, now, budgets, connector: adlConnector ?? null, control, write, assertWriter: assertSendable, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
     pairs: adlOnlyEnabledPairs ? () => transfers.records().filter(pair => pair.enabled || adl.busy(pair.id) !== null) : transfers.records,
     transferSending: pairId => transfers.sending(pairId) });
   const positions = createPositions({ connector: positionsConnector ?? null, now, budgets, pairs: transfers.records, callVenue });
@@ -1407,14 +1412,19 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     return op.state === 'open' && op.cancelRequestedAt !== null && op.openCheckedFrom != null && op.openCheckedFrom >= cancelSettledAt(op) ? 'rejected' : null;
   }
 
+  /** History pruning at most once per pruneIntervalMs; runs from the jobs pass or, without it, its own loop. */
+  function maintain(): void {
+    if (now() - prunedAt < budgets.pruneIntervalMs) return;
+    prunedAt = now();
+    try { prune(); } catch (error) { if (error instanceof WriterLostError) throw error; }
+  }
+
   /** Two-leg jobs: reconcile, hedge, cancel and release registry entries. Transfers and ADL run in passes of their own. */
+
   async function runJobs(): Promise<void> {
     if (!acquire()) return;
     settleControl();
-    if (now() - prunedAt >= budgets.pruneIntervalMs) {
-      prunedAt = now();
-      try { prune(); } catch (error) { if (error instanceof WriterLostError) throw error; }
-    }
+    maintain();
     for (const job of unfinishedJobs()) {
       try { await progress(job); }
       catch (error) {
@@ -1514,6 +1524,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     budgets,
     acquire,
     prune,
+    maintain,
     registerAccount,
     preview,
     publicPreview,
@@ -1532,6 +1543,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     registerTransferPair: transfers.registerPair,
     setTransferEnabled: transfers.setEnabled,
     transferPairs: transfers.pairs,
+    /** Unmasked accounts of the pairs that may still write: enabled, or with an ADL incident not yet finished. */
+    writableAccounts: (): string[] => [...new Set(transfers.records().filter(pair => pair.enabled || adl.busy(pair.id) !== null).flatMap(pair => [pair.mainAccountId, pair.long, pair.short]))],
     corruptTransferPairs: transfers.corruptPairs,
     recentTransfers: transfers.recent,
     adlPairs: adl.pairs,
@@ -1554,6 +1567,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
      * Stops writing and hands the lease back so a clean restart need not wait for expiry.
      * A write still in flight then fails the fence; its operation stays sending and the next writer recovers it as unknown.
      */
+    /** Starts a drain: transfers and ADL send nothing new (not-sent), while results of sends already out are still written. */
+    stopSending(): void { draining = true; },
     close() {
       if (closed) return;
       closed = true;

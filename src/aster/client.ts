@@ -45,8 +45,17 @@ export interface BudgetOptions {
  * process stays under its own limit and stops sending entirely while the venue asks it to back off. A request the
  * budget refuses never leaves the process.
  */
+/**
+ * The venue's per-IP limit is 2400 a minute; the workbench stops at 1800 by its own count of the same header, so this
+ * process yields once the shared IP nears the limit, keeping the last part for ADL.
+ */
+export const IP_CEILING = 2_100;
+const IP_CEILING_ADL = 2_350;
+
 export class RequestBudget {
   private readonly spent: { at: number; weight: number }[] = [];
+  /** The exit IP's weight this minute as the venue last reported it (X-MBX-USED-WEIGHT-1M), workbench use included. */
+  private reported: { minute: number; weight: number } | null = null;
   private coolUntil = 0;
   private coolReason = '';
   readonly limitPerMinute: number;
@@ -67,8 +76,18 @@ export class RequestBudget {
     if (at < this.coolUntil) return `ASTER 接口冷却中（${this.coolReason}），约 ${Math.ceil((this.coolUntil - at) / 1000)} 秒后恢复`;
     const ceiling = priority === 'adl' ? this.limitPerMinute : this.limitPerMinute - this.adlReserve;
     if (this.used(at) + weight > ceiling) return `本进程 ASTER 请求额度已用完（每分钟 ${ceiling}），稍后重试`;
+    const shared = this.reported && this.reported.minute === Math.floor(at / 60_000) ? this.reported.weight : 0;
+    const ipCeiling = priority === 'adl' ? IP_CEILING_ADL : IP_CEILING;
+    if (shared + weight > ipCeiling) return `出口 IP 本分钟 ASTER 请求权重已用 ${shared}（含工作台），超过 ${ipCeiling}，稍后重试`;
     this.spent.push({ at, weight });
     return null;
+  }
+  /** Records the IP's usage the venue reported with an answer; within a minute the highest report counts (answers arrive out of order). */
+  observe(weight: number): void {
+    if (!Number.isSafeInteger(weight) || weight < 0) return;
+    const minute = Math.floor(this.now() / 60_000);
+    if (this.reported?.minute === minute && this.reported.weight >= weight) return;
+    this.reported = { minute, weight };
   }
   cooldown(ms: number, reason: string): void {
     const until = this.now() + ms;
@@ -92,6 +111,11 @@ export const NOT_FOUND_CODE = -2013;
 const RATE_LIMIT_CODES = new Set([-1003, -1015]);
 const GATEWAY_COOLDOWN_MS: Record<number, number> = { 403: 30_000, 429: 180_000, 418: 86_400_000 };
 
+/** Venue text for notes and alerts: no control characters, addresses, signatures, long tokens or links. */
+export function venueText(text: string): string {
+  return text.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/https?:\/\/\S+/gi, '[链接]').replace(/0x[0-9a-f]{6,}/gi, '0x…').replace(/[A-Za-z0-9+/=_-]{32,}/g, '…').slice(0, 120);
+}
+
 export type Failure = { kind: 'not-found' | 'rejected' | 'unknown'; code: number | null; message: string };
 
 function retryAfterMs(reply: HttpReply & { retryAfter?: string | null }): number {
@@ -109,8 +133,11 @@ export function classify(reply: HttpReply & { retryAfter?: string | null }, reje
   const gateway = GATEWAY_COOLDOWN_MS[reply.status];
   if (gateway !== undefined) budget.cooldown(Math.max(gateway, retryAfterMs(reply)), `${label} HTTP ${reply.status}`);
   if (code !== null && RATE_LIMIT_CODES.has(code)) budget.cooldown(Math.max(180_000, retryAfterMs(reply)), `${label} 错误码 ${code}`);
-  const detail = isRecord(data) && typeof data.msg === 'string' ? `：${data.msg.slice(0, 120)}` : '';
+  const detail = isRecord(data) && typeof data.msg === 'string' ? `：${venueText(data.msg)}` : '';
   const message = `ASTER HTTP ${reply.status}${code === null ? '' : ` 错误码 ${code}`}${detail}`;
+  // A gateway refusal or rate limit, whatever body comes with it, is classed before the code as the Python client does
+  // for 429/418: a rate-limited write stays unknown and is checked rather than ending the ADL incident as rejected.
+  if (gateway !== undefined || (code !== null && RATE_LIMIT_CODES.has(code))) return { kind: 'unknown', code, message };
   if (code === NOT_FOUND_CODE && (reply.status === 400 || reply.status === 404 || reply.status === 200)) return { kind: 'not-found', code, message };
   if (reply.status >= 500 || reply.status === 408 || code === null || !negative) return { kind: 'unknown', code, message };
   return { kind: rejections.has(code) ? 'rejected' : 'unknown', code, message };
@@ -168,6 +195,7 @@ export class AsterClient {
 
   async signed(credentials: AsterCredentials, request: SignedRequest, { signal, beforeSend }: { signal: AbortSignal; beforeSend?: () => void }): Promise<HttpReply & { retryAfter: string | null }> {
     const mutation = beforeSend !== undefined;
+    if (signal.aborted) throw new VenueError(mutation ? 'not-sent' : 'read-failed', '请求已取消，未发送');
     const refused = this.budget.take(request.weight, request.priority);
     if (refused) throw new VenueError(mutation ? 'not-sent' : 'read-failed', refused);
     let params: Record<string, string>;
@@ -182,6 +210,7 @@ export class AsterClient {
   }
 
   async public(path: string, params: Record<string, string>, weight: number, priority: Priority, signal: AbortSignal): Promise<HttpReply & { retryAfter: string | null }> {
+    if (signal.aborted) throw new VenueError('read-failed', '请求已取消，未发送');
     const refused = this.budget.take(weight, priority);
     if (refused) throw new VenueError('read-failed', refused);
     const query = pythonUrlencode(params);
@@ -190,8 +219,16 @@ export class AsterClient {
 
   private async send(request: { url: string; method: SignedRequest['method']; headers?: Record<string, string>; body?: string }, options: { signal: AbortSignal; beforeSend?: () => void }): Promise<HttpReply & { retryAfter: string | null }> {
     let retryAfter: string | null = null;
-    // Captures Retry-After without giving up the shared bounded reader.
-    const fetchImpl: FetchLike = async (url, init) => { const response = await this.fetchImpl(url, init); retryAfter = response.headers.get('retry-after'); return response; };
+    // Reads the headers before the body: a gateway refusal often has no JSON, and its back-off must start regardless.
+    const fetchImpl: FetchLike = async (url, init) => {
+      const response = await this.fetchImpl(url, init);
+      retryAfter = response.headers.get('retry-after');
+      const used = response.headers.get('x-mbx-used-weight-1m');
+      if (used !== null && /^[0-9]{1,9}$/.test(used)) this.budget.observe(Number(used));
+      const gateway = GATEWAY_COOLDOWN_MS[response.status];
+      if (gateway !== undefined) this.budget.cooldown(Math.max(gateway, retryAfterMs({ status: response.status, data: null, retryAfter })), `HTTP ${response.status}`);
+      return response;
+    };
     const reply = await exchange(fetchImpl, this.timeoutMs, request, options);
     return { ...reply, retryAfter };
   }

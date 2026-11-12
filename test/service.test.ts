@@ -407,8 +407,13 @@ test('服务装配：配置里的 ADL 设置只在配对首次登记时作为初
     assert.deepEqual(adlConfig('p1'), { autoReduce: false, batchNotional: '500' });
     executor.setAdlConfig({ pairId: 'p1', requestId: randomUUID(), autoReduce: true, batchNotional: '800' }, 's');
     executor.close();
-    ({ executor } = await wired(fake, store, config));
+    const lines: string[] = [];
+    let warnings: string[];
+    ({ executor, warnings } = await wired(fake, store, config, lines));
     assert.deepEqual(adlConfig('p1'), { autoReduce: true, batchNotional: '800' }, '重启后保留页面上的修改');
+    // The operator is told the config line no longer applies, in the log only (it would repeat at every start).
+    assert.ok(lines.some(line => /p1 配置里的 adl 只在首次登记时作为初始值，页面当前为自动减仓开、单批 800/.test(line)), lines.join('\n'));
+    assert.deepEqual(warnings, []);
     executor.close();
     assert.throws(() => parseServiceConfig(configRaw([{ id: 'p1', main: 'main', long: 'a', short: 'b', adl: { autoReduce: 'yes', batchNotional: '1' } }])), /配对 p1 的 adl 无效/);
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }

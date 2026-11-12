@@ -94,6 +94,17 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
           const text = `配对 ${pair.id} 已登记，但配置里的 ADL 初始值未写入（${error instanceof Error ? error.message : String(error)}），当前为自动减仓开、单批 1000；请在页面设置`;
           log(text); warnings.push(text);
         }
+      } else if (pair.adl) {
+        // Logged only (not an alert): it holds at every start until the config line is removed or matches the page.
+        // Only a hint: an unreadable record is the ADL pass's to report, never a reason not to start.
+        let saved: { autoReduce?: boolean; batchNotional?: string } | undefined;
+        try {
+          const row = store.db.prepare('SELECT json FROM adl_pairs WHERE pair_id = ?').get(pair.id) as { json: string } | undefined;
+          saved = row ? (JSON.parse(row.json) as { config?: typeof saved }).config : undefined;
+        } catch { saved = undefined; }
+        if (saved && (saved.autoReduce !== pair.adl.autoReduce || saved.batchNotional !== pair.adl.batchNotional)) {
+          log(`配对 ${pair.id} 配置里的 adl 只在首次登记时作为初始值，页面当前为自动减仓${saved.autoReduce ? '开' : '关'}、单批 ${saved.batchNotional}，以页面为准`);
+        }
       }
     }
   } catch (error) { executor.close(); throw error; }

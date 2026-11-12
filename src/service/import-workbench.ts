@@ -1,5 +1,5 @@
 // Brings the workbench's ASTER margin-balance pairs over into this service's two operator files, so a switch does not
-// start from hand-copied settings. It only reads: the workbench's trading.sqlite3 (opened read-only) and the
+// start from hand-copied settings. It only reads: the workbench's trading.sqlite3 (opened read-only, as its owner) and the
 // environment it runs with (/etc/project-aggregation.env, then <data>/modules/aster/.env, which wins as it does in the
 // workbench). Imported pairs are registered switched off like any configured pair; taking one over still needs the
 // workbench pair deleted and the takeover checks passed in the page. Nothing is sent to ASTER or to the workbench.
@@ -9,7 +9,8 @@
 //
 // An existing config.json is extended: its pairs, accounts and robot stay as they are, and only pairs it does not have
 // yet are added. Output names pairs and account names only; keys and webhooks never appear in it.
-import { closeSync, existsSync, fsyncSync, linkSync, lstatSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { closeSync, existsSync, fchownSync, fsyncSync, linkSync, lstatSync, openSync, readFileSync, renameSync, rmSync, statSync, writeSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parseArgs, parseEnv } from 'node:util';
@@ -28,7 +29,17 @@ const MARGIN_DEFAULTS = { enabled: false, master_env_prefix: '', check_interval_
 const ADL_DEFAULTS = { enabled: true, batch_notional: '1000' };
 
 type Json = Record<string, unknown>;
-export interface WorkbenchSource { pairs: Json[]; accounts: Json[]; env: Record<string, string | undefined> }
+
+/** Workbench names go to a root terminal: control and format characters are dropped. */
+const printable = (text: string): string => text.replace(/[\p{Cc}\p{Cf}]/gu, '');
+
+export interface WorkbenchSource {
+  pairs: Json[];
+  accounts: Json[];
+  env: Record<string, string | undefined>;
+  /** Pair rows whose JSON did not parse; they cannot be imported. */
+  unreadablePairs?: number;
+}
 export interface ImportPlan {
   config: Json;
   secrets: Json;
@@ -70,18 +81,36 @@ export function planImport(source: WorkbenchSource, existing: { config: Json; se
   const byId = new Map(source.accounts.filter(isRecord).map(account => [account.id, account]));
   const usedSubs = new Set(pairs.flatMap(pair => [pair.long, pair.short]));
   const wanted = options.only ? new Set(options.only) : null;
-  if (wanted) for (const id of wanted) if (!source.pairs.some(pair => pair.id === id)) throw new Error(`工作台里没有配对 ${id}`);
+  const unreadable = source.unreadablePairs ?? 0;
+  if (wanted) for (const id of wanted) {
+    if (!source.pairs.some(pair => pair.id === id)) throw new Error(`工作台里没有配对 ${printable(id)}${unreadable ? `（另有 ${unreadable} 条配对记录无法解析，可能就是它）` : ''}`);
+  }
+  if (unreadable) notes.push(`工作台有 ${unreadable} 条配对记录无法解析，未导入`);
+
+  // The existing keys are checked once (every signer derived, about 20 ms a key); the per-candidate checks below and
+  // the wallet matching use these normalised entries.
+  let known: Map<string, AsterCredentials>;
+  try { known = new Map(parseServiceSecrets(secrets, []).accounts); }
+  catch (error) { throw new Error(`现有密钥文件未通过检查，先修好再导入：${error instanceof Error ? error.message : String(error)}`); }
+  /** Throws when this service would not start on these files: its config checks, with the signers already in hand. */
+  const fits = (candidate: Json): void => {
+    const parsed = parseServiceConfig(candidate);
+    for (const name of parsed.pairs.flatMap(pair => [pair.main, pair.long, pair.short])) if (!known.has(name)) throw new Error(`缺少账户 ${name} 的密钥`);
+    assertDistinctSigners(parsed, { accounts: known, feishu: null });
+  };
+  // Every pair is checked against what is there already; a config the service rejects now is not extended.
+  if (pairs.length > 0) {
+    try { fits(config); } catch (error) { throw new Error(`现有配置未通过检查，先修好再导入：${error instanceof Error ? error.message : String(error)}`); }
+  }
 
   /** The account name for a wallet: the existing entry with that address, else the workbench prefix. */
   const nameFor = (prefix: string, credentials: AsterCredentials): string | null => {
-    for (const [name, entry] of Object.entries(accounts)) {
-      if (typeof entry?.user === 'string' && entry.user.toLowerCase() === credentials.user) return name;
-    }
-    return accounts[prefix] === undefined ? prefix : null;
+    for (const [name, entry] of known) if (entry.user === credentials.user) return name;
+    return known.has(prefix) || accounts[prefix] !== undefined ? null : prefix;
   };
 
   for (const pair of source.pairs) {
-    const id = String(pair.id), label = typeof pair.name === 'string' ? `${id}（${pair.name}）` : id;
+    const id = String(pair.id), label = printable(typeof pair.name === 'string' ? `${id}（${pair.name}）` : id);
     const margin = { ...MARGIN_DEFAULTS, ...(isRecord(pair.margin) ? pair.margin : {}) };
     if (wanted ? !wanted.has(id) : margin.enabled !== true) {
       if (!wanted) skipped.push(`${label}：工作台未开启保证金平衡`);
@@ -116,10 +145,22 @@ export function planImport(source: WorkbenchSource, existing: { config: Json; se
     // One pair this service would not accept is skipped with its reason rather than failing the whole import.
     try { parseTransferConfig(transfer); parseAdlConfig(adl); } catch (error) { skipped.push(`${label}：设置无法沿用（${error instanceof Error ? error.message : '格式错误'}）`); continue; }
 
-    for (const [name, credentials] of [[mainName, mainCreds], [longName, longCreds], [shortName, shortCreds]] as const) {
-      if (accounts[name] === undefined) accounts[name] = { user: credentials!.user, signer: credentials!.signer, privateKey: credentials!.privateKey };
+    const entry = { id, main: mainName, long: longName, short: shortName, transfer, adl };
+    const fresh = ([[mainName, mainCreds], [longName, longCreds], [shortName, shortCreds]] as const).filter(([name]) => !known.has(name));
+    for (const [name, credentials] of fresh) known.set(name, credentials!);
+    // Limits over the whole file (the request budget, MAX_PAIRS, a main wallet that signs for another pair's
+    // sub-account) skip the pair that crosses them, so the rest still come over.
+    try { fits({ ...config, pairs: [...pairs, entry] }); }
+    catch (error) {
+      for (const [name] of fresh) known.delete(name);
+      const message = error instanceof Error ? error.message : '格式错误';
+      // With no pair yet the rest of an existing config.json was never checked, and may be what fails; only a budget
+      // overrun is helped by bringing pairs over in batches.
+      const hint = existing && pairs.length === 0 ? '；若每个配对都如此，先检查现有 config.json 的其它字段' : /请求权重/.test(message) ? '；可用 --pairs 分批迁移' : '';
+      skipped.push(`${label}：加入后本服务不接受（${message}）${hint}`); continue;
     }
-    pairs.push({ id, main: mainName, long: longName, short: shortName, transfer, adl });
+    for (const [name, credentials] of fresh) accounts[name] = { user: credentials!.user, signer: credentials!.signer, privateKey: credentials!.privateKey };
+    pairs.push(entry);
     usedSubs.add(longName); usedSubs.add(shortName);
     added.push(`${label}：主账户 ${mainName}（${tail(mainCreds!.user)}），多侧 ${longName}（${tail(longCreds!.user)}），空侧 ${shortName}（${tail(shortCreds!.user)}）`);
   }
@@ -133,11 +174,24 @@ export function planImport(source: WorkbenchSource, existing: { config: Json; se
     } else notes.push('工作台没有配置飞书机器人，告警只写日志');
   }
 
-  // The service must accept the result, else nothing is written. With nothing to import and no config yet, the caller reports.
-  if (pairs.length === 0) return { config, secrets, added, skipped, notes };
-  const parsed = parseServiceConfig(config);
-  assertDistinctSigners(parsed, parseServiceSecrets(secrets, [...new Set(parsed.pairs.flatMap(pair => [pair.main, pair.long, pair.short]))]));
+  // Each added pair passed the checks with everything before it, and every key was derived once, so the result passes.
   return { config, secrets, added, skipped, notes };
+}
+
+/** Prints the raw data column of both tables; run with no environment, as the database's owner when that matters. */
+const DUMP_ROWS = `import { DatabaseSync } from 'node:sqlite';
+try {
+  const db = new DatabaseSync(process.argv[1], { readOnly: true });
+  try {
+    db.exec('PRAGMA busy_timeout = 5000');
+    const rows = table => db.prepare('SELECT data FROM ' + table + ' ORDER BY id').all().map(row => String(row.data));
+    process.stdout.write(JSON.stringify({ pairs: rows('pairs'), accounts: rows('accounts') }));
+  } finally { db.close(); }
+} catch (error) { process.stderr.write(String(error && error.message || error).split('\\n')[0]); process.exitCode = 1; }`;
+
+/** Root reads as the owner of the database (so any file SQLite adds is the workbench's); anyone else reads as itself. */
+export function readerIdentity(owner: { uid: number; gid: number }, uid: number | undefined): { uid: number; gid: number } | Record<string, never> {
+  return uid === 0 && owner.uid !== 0 ? { uid: owner.uid, gid: owner.gid } : {};
 }
 
 /** Reads the workbench's ASTER pairs and accounts without writing to its database. */
@@ -149,20 +203,39 @@ export function readWorkbench(envFile: string, dataDir: string | undefined): Wor
   const env = { ...base, ...(existsSync(moduleEnv) ? parseEnv(readFileSync(moduleEnv, 'utf8')) : {}) };
   const database = join(data, 'modules', 'aster', 'trading.sqlite3');
   if (!existsSync(database)) throw new Error(`没有找到工作台的 ASTER 数据库 ${database}；工作台数据目录不在默认位置时用 --workbench-data 指定`);
-  const db = new DatabaseSync(database, { readOnly: true });
-  try {
-    db.exec('PRAGMA busy_timeout = 5000');
-    const rows = (table: string): Json[] => (db.prepare(`SELECT data FROM ${table} ORDER BY id`).all() as { data: string }[])
-      .map(row => { try { return JSON.parse(row.data) as unknown; } catch { return null; } }).filter(isRecord);
-    return { pairs: rows('pairs'), accounts: rows('accounts'), env, database };
-  } finally { db.close(); }
+  // A read-only connection still creates -wal and -shm when it is the first one on a WAL database (the workbench opens
+  // and closes one per operation, so that is the usual state). Made by root they would leave the workbench unable to
+  // write, so a root import reads as the database's owner, in a child process that only prints the rows.
+  // A link could point root's read at another file: only the plain file is read, and a root-owned one in a directory
+  // someone else owns (the workbench account could have swapped it in) is refused.
+  const owner = lstatSync(database);
+  if (!owner.isFile()) throw new Error(`工作台的 ASTER 数据库 ${database} 不是普通文件（符号链接等），不读取`);
+  if (process.getuid?.() === 0 && owner.uid === 0 && statSync(dirname(database)).uid !== 0) throw new Error(`${database} 归 root，但所在目录归其他账户，不读取；请确认文件来源`);
+  const identity = readerIdentity(owner, process.getuid?.());
+  const read = spawnSync(process.execPath, ['--input-type=module', '-e', DUMP_ROWS, '--', database], {
+    cwd: '/', env: {}, encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024 * 1024, ...identity,
+  });
+  if (read.error || read.status !== 0) {
+    const reason = printable(read.error?.message ?? (read.stderr.trim() || `退出码 ${read.status ?? read.signal}`)).slice(0, 200);
+    const as = 'uid' in identity ? `（以数据库属主 uid ${identity.uid} 读取，不带附加组）` : '';
+    throw new Error(`读取工作台数据库 ${database} 失败${as}：${reason}`);
+  }
+  const dumped = JSON.parse(read.stdout) as { pairs: string[]; accounts: string[] };
+  const parse = (rows: string[]): unknown[] => rows.map(row => { try { return JSON.parse(row) as unknown; } catch { return null; } });
+  const pairs = parse(dumped.pairs);
+  return { pairs: pairs.filter(isRecord), accounts: parse(dumped.accounts).filter(isRecord), env, database, unreadablePairs: pairs.filter(item => !isRecord(item)).length };
 }
 
 /** A synced private temporary file next to `path`, to be renamed over it. */
 function stage(path: string, value: Json): string {
   const temporary = `${path}.import.${process.pid}`;
+  // Run as root on its own, the file keeps the owner of the one it replaces (or of the directory), not root's.
+  const reference = statSync(present(path) ? path : dirname(path));
   const fd = openSync(temporary, 'wx', 0o600);
-  try { writeSync(fd, JSON.stringify(value, null, 2) + '\n'); fsyncSync(fd); } catch (error) { closeSync(fd); rmSync(temporary, { force: true }); throw error; }
+  try {
+    if (process.getuid?.() === 0) fchownSync(fd, reference.uid, reference.gid);
+    writeSync(fd, JSON.stringify(value, null, 2) + '\n'); fsyncSync(fd);
+  } catch (error) { closeSync(fd); rmSync(temporary, { force: true }); throw error; }
   closeSync(fd);
   return temporary;
 }

@@ -62,7 +62,7 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   // The routine reads must fit under the limit less the ADL reserve, or balance reads and scans are refused all the time.
   const needed = pairs.reduce((sum, pair) => sum + pairWeightPerMinute(pair), BUDGET_HEADROOM);
   const limitPerMinute = budgetRaw.limitPerMinute === undefined ? Math.max(600, Math.ceil(needed * 6 / 5)) : integer(budgetRaw.limitPerMinute, 100, IP_CEILING, '每分钟请求权重上限');
-  if (limitPerMinute > IP_CEILING) throw new Error(`${pairs.length} 个配对每分钟约需请求权重 ${needed}，超过本服务可用的 ${IP_CEILING}；请减少配对或调大 checkIntervalMs`);
+  if (limitPerMinute > IP_CEILING) throw new Error(`${pairs.length} 个配对每分钟约需请求权重 ${needed}，加两成余量为 ${limitPerMinute}，超过本服务可用的 ${IP_CEILING}；请减少配对或调大 checkIntervalMs`);
   const adlReserve = budgetRaw.adlReserve === undefined ? Math.floor(limitPerMinute / 6) : integer(budgetRaw.adlReserve, 0, limitPerMinute - 50, 'ADL 预留权重');
   if (limitPerMinute - adlReserve < needed) throw new Error(`${pairs.length} 个配对每分钟约需请求权重 ${needed}，而每分钟上限 ${limitPerMinute} 减去 ADL 预留 ${adlReserve} 只剩 ${limitPerMinute - adlReserve}；请调大 budget.limitPerMinute 或去掉 budget 使用自动值`);
   return { port, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs };

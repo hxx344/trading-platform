@@ -102,6 +102,19 @@ current_before=$(readlink -f "$TP_APP_DIR/current")
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/c" --import-workbench && status=0 || status=$?
 check '导入后检查失败时恢复导入前的配置' '[[ $status -ne 0 ]] && grep -q "导入配对 wb-gold" "$tmp/out" && grep -q "已恢复导入前的配置文件" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json" && cmp -s "$tmp/secrets.before" "$TP_CONF_DIR/secrets.json" && [[ "$(stat -c %a "$TP_CONF_DIR/secrets.json")" == 600 ]]'
 check '导入后检查失败时仍是原版本' '[[ "$(readlink -f "$TP_APP_DIR/current")" == "$current_before" ]]'
+# Stopped by a signal while the new program checks the imported files: they are put back all the same.
+mkdir -p "$tmp/src-d/deploy"
+cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-d/"
+cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,config.example.json,secrets.example.json} "$tmp/src-d/deploy/"
+sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { (await import('node:fs')).writeFileSync(process.env.TP_TEST_MARK, ''); await new Promise(resolve => setTimeout(resolve, 1500));|" "$tmp/src-d/src/service/main.ts"
+bash "$tmp/src-d/deploy/package.sh" "$tmp/d" >/dev/null
+rm -f "$tmp/mark"
+TP_TEST_MARK="$tmp/mark" TP_WORKBENCH_ENV="$tmp/wb/workbench.env" bash "$install_sh" --package "$tmp/d" --import-workbench >"$tmp/out" 2>&1 &
+pid=$!
+for _ in $(seq 100); do [[ -e "$tmp/mark" ]] && break; sleep 0.1; done
+kill -TERM "$pid"; wait "$pid" && status=0 || status=$?
+check '导入后收到停止信号时恢复导入前的配置' '[[ -e "$tmp/mark" && $status -eq 130 ]] && grep -q "导入配对 wb-gold" "$tmp/out" && grep -q "已恢复导入前的配置文件" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json" && cmp -s "$tmp/secrets.before" "$TP_CONF_DIR/secrets.json"'
+check '收到停止信号时仍是原版本' '[[ "$(readlink -f "$TP_APP_DIR/current")" == "$current_before" ]]'
 
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench && status=0 || status=$?
 check '从工作台导入并通过配置检查' '[[ $status -eq 0 ]] && grep -q "导入配对 wb-gold（gold）" "$tmp/out" && grep -q "配置有效：2 个配对（pair-1、wb-gold），5 个账户" "$tmp/out"'

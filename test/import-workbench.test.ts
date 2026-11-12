@@ -3,11 +3,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { planImport, readWorkbench } from '../src/service/import-workbench.ts';
+import { parseEnv } from 'node:util';
+import { planImport, readWorkbench, readerIdentity } from '../src/service/import-workbench.ts';
 import { parseServiceConfig } from '../src/service/config.ts';
 import { LONG, MAIN, SHORT } from './aster-fake.ts';
 import { addressOf } from '../src/aster/eip712.ts';
@@ -77,6 +78,77 @@ test('导入工作台：逐项沿用保证金与 ADL 设置，跳过未开启、
     assert.match(odd.skipped.join('\n'), /gold.*设置无法沿用/);
     assert.throws(() => planImport(source, null, { secretsFile: '/x/secrets.json', only: ['nope'] }), /工作台里没有配对 nope/);
   } finally { rmSync(wb.root, { recursive: true, force: true }); }
+});
+
+test('导入工作台：root 以数据库属主身份读库，工作台运行中时读到尚未写回主文件的记录', () => {
+  // SQLite may add -wal/-shm on a read; made by the database's owner they never stop the workbench writing.
+  assert.deepEqual(readerIdentity({ uid: 990, gid: 991 }, 0), { uid: 990, gid: 991 });
+  assert.deepEqual(readerIdentity({ uid: 0, gid: 0 }, 0), {});
+  assert.deepEqual(readerIdentity({ uid: 990, gid: 991 }, 1000), {});
+  const wb = workbench();
+  try {
+    const dir = join(wb.data, 'modules', 'aster'), file = join(dir, 'trading.sqlite3');
+    const list = () => readdirSync(dir).sort();
+    const owner = statSync(file).uid;
+    readWorkbench(wb.envFile, undefined);
+    for (const name of list()) assert.equal(statSync(join(dir, name)).uid, owner, name);
+
+    // Running: the write sits in the WAL only; the side files are the workbench's and stay as they were.
+    const writer = new DatabaseSync(file);
+    try {
+      writer.exec('PRAGMA wal_autocheckpoint = 0');
+      writer.prepare('INSERT INTO pairs VALUES (?, ?)').run('fresh', JSON.stringify({ id: 'fresh', long_account_id: 'l2', short_account_id: 's2' }));
+      writer.prepare('INSERT INTO pairs VALUES (?, ?)').run('zz-broken', '{not json');
+      const running = list(), modes = running.map(name => statSync(join(dir, name)).mode);
+      assert.ok(running.includes('trading.sqlite3-wal'));
+      const source = readWorkbench(wb.envFile, undefined);
+      assert.ok(source.pairs.some(pair => pair.id === 'fresh'));
+      assert.equal(source.unreadablePairs, 1);
+      assert.deepEqual(list(), running);
+      assert.deepEqual(running.map(name => statSync(join(dir, name)).mode), modes);
+      // A pair whose row cannot be read is reported, and naming it says why it is not found.
+      assert.match(planImport(source, null, { secretsFile: '/x/secrets.json' }).notes.join('\n'), /1 条配对记录无法解析/);
+      assert.throws(() => planImport(source, null, { secretsFile: '/x/secrets.json', only: ['zz-broken'] }), /另有 1 条配对记录无法解析/);
+    } finally { writer.close(); }
+    // A database without the tables is reported as a read failure, not as an empty workbench.
+    rmSync(file); for (const name of list()) if (name.startsWith('trading.sqlite3')) rmSync(join(dir, name));
+    new DatabaseSync(join(dir, 'other.sqlite3')).close();
+    // A link is never followed (as root it could point the read at another file).
+    symlinkSync(join(dir, 'other.sqlite3'), file);
+    assert.throws(() => readWorkbench(wb.envFile, undefined), /不是普通文件/);
+    rmSync(file); renameSync(join(dir, 'other.sqlite3'), file);
+    assert.throws(() => readWorkbench(wb.envFile, undefined), /读取工作台数据库 .* 失败：.*no such table: pairs/);
+    // Existing keys the service would reject stop the import before any pair is weighed.
+    assert.throws(() => planImport({ pairs: [], accounts: [], env: {} }, { config: { secretsFile: '/x/secrets.json', pairs: [] }, secrets: { accounts: { old: { user: '0x' + '11'.repeat(20) } } } }, { secretsFile: '/x/secrets.json' }), /现有密钥文件未通过检查/);
+  } finally { rmSync(wb.root, { recursive: true, force: true }); }
+});
+
+test('导入工作台：超出请求预算或主账户签名与别的配对子账户相同时只跳过该配对，名称里的控制字符不输出', () => {
+  // Three pairs checking every second need more than the service's share of the IP limit: the third is skipped.
+  const wallet = (index: number) => { const privateKey = key((0x30 + index).toString(16)); return { user: '0x' + (0x60 + index).toString(16).repeat(20), signer: addressOf(privateKey), privateKey }; };
+  const lines: string[] = [env('PM', MAIN)];
+  const accounts: Record<string, unknown>[] = [], pairs: Record<string, unknown>[] = [];
+  for (const index of [1, 2, 3]) {
+    for (const side of ['L', 'S']) {
+      const id = `${side}${index}`;
+      accounts.push({ id, mode: 'live', env_prefix: `P_${id}` });
+      lines.push(env(`P_${id}`, wallet(index * 2 + (side === 'L' ? 0 : 1))));
+    }
+    pairs.push({ id: `fast-${index}`, name: index === 1 ? '快\u001b[31m速‎' : 'fast', long_account_id: `L${index}`, short_account_id: `S${index}`, margin: { enabled: true, master_env_prefix: 'PM', check_interval_seconds: 1 } });
+  }
+  // Its main account is pair fast-1's long side, whose API wallet is a sub-account signer.
+  accounts.push({ id: 'L9', mode: 'live', env_prefix: 'P_L9' }, { id: 'S9', mode: 'live', env_prefix: 'P_S9' });
+  lines.push(env('P_L9', wallet(20)), env('P_S9', wallet(21)));
+  pairs.push({ id: 'cross', long_account_id: 'L9', short_account_id: 'S9', margin: { enabled: true, master_env_prefix: 'P_L1' } });
+  const source = { pairs, accounts, env: parseEnv(lines.join('')) };
+  const plan = planImport(source, null, { secretsFile: '/x/secrets.json' });
+  assert.deepEqual((plan.config.pairs as { id: string }[]).map(pair => pair.id), ['fast-1', 'fast-2']);
+  assert.match(plan.skipped.join('\n'), /fast-3.*加入后本服务不接受.*每分钟约需请求权重.*加两成余量.*--pairs 分批迁移/);
+  const cross = planImport(source, null, { secretsFile: '/x/secrets.json', only: ['fast-1', 'cross'] });
+  assert.match(cross.skipped.join('\n'), /cross.*加入后本服务不接受.*同一个 API 钱包/);
+  assert.equal(parseServiceConfig(plan.config).pairs.length, 2);
+  assert.ok(plan.added[0]!.startsWith('fast-1（快[31m速）'), plan.added[0]);
+  assert.doesNotMatch([...plan.added, ...plan.skipped].join(' | '), /[\u0000-\u001f\u200e]/);
 });
 
 test('导入工作台：已有配置只追加新配对，同一钱包沿用现有账户名，重复导入不改动', () => {
@@ -152,7 +224,7 @@ test('导入工作台：坏的密钥文件报错不带原文，符号链接、�
     writeFileSync(join(conf, 'secrets.json'), '{"accounts": {"x": {"privateKey": deadbeefcafe0123456789}}}', { mode: 0o600 });
     let result = run();
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /有 secrets|已存在但没有 config.json/);
+    assert.match(result.stderr, /已存在但没有 config.json/);
     config(join(conf, 'secrets.json'));
     result = run();
     assert.equal(result.status, 1);

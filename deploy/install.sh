@@ -28,20 +28,26 @@ RELEASE_BASE=${TP_RELEASE_BASE:-https://github.com/$REPO/releases}
 TEST_MODE=${TP_TEST_MODE:-0}
 WORKBENCH_ENV=${TP_WORKBENCH_ENV:-/etc/project-aggregation.env}
 
-log() { printf '%s\n' "$*"; }
+# Never fails: a closed terminal (SSH gone) or pipe must not end the script half way through a start.
+log() { printf '%s\n' "$*" 2>/dev/null || true; }
+# Runs a command a signal must not cut short (Ctrl-C reaches the whole foreground group); ignored signals survive exec.
+steady() { ( trap '' INT TERM HUP; exec "$@" ); }
 join() { local out='' item; for item in "$@"; do out+="${out:+、}$item"; done; printf '%s' "$out"; }
 fail() { restore_import; printf '安装失败：%s\n' "$*" >&2; exit 1; }
 # Set while config.json and its key file hold what an import wrote and the service has not run on them yet: any failure
 # from then on puts the files back as they were, so neither the old program nor a rollback is left with them.
 import_backup=''
+interrupted=0
 restore_import() {
   [[ -n "$import_backup" ]] || return 0
-  local name
+  local name failed=()
   while IFS= read -r name; do
-    if [[ -f "$import_backup/$name" ]]; then cp -p "$import_backup/$name" "$CONF_DIR/$name"; else rm -f "$CONF_DIR/$name"; fi
+    if [[ -f "$import_backup/$name" ]]; then cp -p "$import_backup/$name" "$CONF_DIR/$name" || failed+=("$name")
+    else rm -f "$CONF_DIR/$name" || failed+=("$name"); fi
   done <"$import_backup/.files"
   import_backup=''
-  log '已恢复导入前的配置文件。'
+  if ((${#failed[@]} == 0)); then log '已恢复导入前的配置文件。'
+  else printf '恢复导入前的配置失败：%s 可能仍是导入后的内容，请检查后手工改回\n' "$(join "${failed[@]}")" >&2; fi
 }
 usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
@@ -88,8 +94,10 @@ as_root_dir "$APP_DIR" 755
 exec 9>"$APP_DIR/.install.lock"
 flock -n 9 || fail '另一个安装进程正在运行。'
 work_dir=$(mktemp -d)
-# An exit that bypasses fail (set -e, Ctrl-C) still puts imported files back before the backup goes with work_dir.
-trap 'rc=$?; ((rc == 0)) || restore_import; rm -rf "$work_dir"' EXIT
+# An exit that bypasses fail (set -e, a signal) still puts imported files back before the backup goes with work_dir;
+# the backup is cleared only once the service runs on them. A signal becomes an exit, so the EXIT trap runs.
+trap 'trap "" INT TERM HUP; restore_import; rm -rf "$work_dir"' EXIT
+trap 'exit 130' INT TERM HUP
 
 # ---- 1. 校验清单与程序包 ----------------------------------------------------------
 if [[ -n "$package_dir" ]]; then
@@ -194,7 +202,7 @@ if ((import_workbench)); then
   import_args=(--config "$CONF_DIR/config.json" --workbench-env "$WORKBENCH_ENV")
   [[ -z "$workbench_data" ]] || import_args+=(--workbench-data "$workbench_data")
   [[ -z "$import_pairs" ]] || import_args+=(--pairs "$import_pairs")
-  (cd / && "$NODE_BIN" "$release_dir/src/service/import-workbench.ts" "${import_args[@]}") || fail '从工作台导入配置失败'
+  (cd / && "$NODE_BIN" "$release_dir/src/service/import-workbench.ts" "${import_args[@]}" 9>&-) || fail '从工作台导入配置失败'
 fi
 configured=0
 if [[ -f "$CONF_DIR/config.json" ]]; then
@@ -267,16 +275,16 @@ if ((configured)); then
 fi
 
 # ---- 6. 启动或重启 ------------------------------------------------------------------
-journal_tail() { journalctl -u "$SERVICE" -n 30 --no-pager -o cat 2>/dev/null || true; }
+journal_tail() { steady journalctl -u "$SERVICE" -n 30 --no-pager -o cat 2>/dev/null || true; }
 healthy() { # marker：重启前的时间（秒）；服务写出新的登录链接文件说明已完成装配并在本机监听
   local marker=$1 waited=0 restarts
   while ((waited < HEALTH_WAIT_S * 2)); do
-    sleep 0.5; waited=$((waited + 1))
-    [[ "$(systemctl show -p ActiveState --value "$SERVICE")" == active ]] || continue
+    steady sleep 0.5; waited=$((waited + 1))
+    [[ "$(steady systemctl show -p ActiveState --value "$SERVICE")" == active ]] || continue
     [[ -f "$DATA_DIR/access-url" && "$(stat -c %Y "$DATA_DIR/access-url")" -ge "$marker" ]] || continue
-    restarts=$(systemctl show -p NRestarts --value "$SERVICE")
-    sleep 5
-    [[ "$(systemctl show -p ActiveState --value "$SERVICE")" == active && "$(systemctl show -p NRestarts --value "$SERVICE")" == "$restarts" ]] && return 0
+    restarts=$(steady systemctl show -p NRestarts --value "$SERVICE")
+    steady sleep 5
+    [[ "$(steady systemctl show -p ActiveState --value "$SERVICE")" == active && "$(steady systemctl show -p NRestarts --value "$SERVICE")" == "$restarts" ]] && return 0
     return 1
   done
   return 1
@@ -295,12 +303,19 @@ else
   elif ((program_changed || unit_changed || config_changed)); then action=restart
   else skipped+=('服务（运行中，无需重启）'); fi
   if [[ -n "$action" ]]; then
-    marker=$(date +%s)
+    # Once systemctl has run, the service may be on the new files: a signal now would put them back under a running
+    # service. It waits for the health check instead, whose success or failure branch leaves things consistent.
+    # The commands below run through steady, so the check is never cut short either; a closed pipe only fails a write.
+    trap 'interrupted=1; log "收到停止信号：服务正在启动，检查结束后再退出"' INT TERM HUP
+    trap '' PIPE
+    printf -v marker '%(%s)T' -1
     # A unit stuck in failed (start limit) refuses start; clear it, and a refused start is a failed start, not an exit.
-    systemctl reset-failed "$SERVICE" 2>/dev/null || true
+    steady systemctl reset-failed "$SERVICE" 2>/dev/null || true
     started=1
-    systemctl "$action" "$SERVICE" || started=0
+    steady systemctl "$action" "$SERVICE" || started=0
     if ((started)) && healthy "$marker"; then
+      # Running on the new files from here: nothing that fails below may put them back.
+      import_backup=''
       printf '%s\n' "$applied" >"$applied_file"; chmod 600 "$applied_file"
       changes+=("服务已$([[ $action == start ]] && echo 启动 || echo 重启)")
     else
@@ -309,28 +324,28 @@ else
       if [[ -n "$import_backup" ]]; then restore_import; imported=1; fi
       # A first setup by import leaves no config once undone: nothing to run, so the unit is not left to fail at boot.
       if ((imported)) && [[ ! -f "$CONF_DIR/config.json" ]]; then
-        systemctl disable --now --quiet "$SERVICE" 2>/dev/null || true
+        steady systemctl disable --now --quiet "$SERVICE" 2>/dev/null || true
         fail '导入的配置启动失败，已撤销导入（尚无 config.json），服务已停止并取消开机自启；请按上面的日志处理后重新执行本脚本'
       fi
       if ((program_changed)) && [[ -n "$previous_dir" && -d "$previous_dir" ]]; then
         previous_version=$(head -n1 "$previous_dir/VERSION" 2>/dev/null || echo 上一版本)
-        switch_to "$previous_dir"
+        ( trap '' INT TERM HUP; switch_to "$previous_dir" )
         rollback_unit=0
-        write_unit "$previous_dir" || rollback_unit=$?
+        ( trap '' INT TERM HUP; write_unit "$previous_dir" ) || rollback_unit=$?
         ((rollback_unit < 2)) || log "上一版本目录里没有可用的单元模板，保留当前单元文件。"
-        systemctl daemon-reload
-        systemctl reset-failed "$SERVICE" 2>/dev/null || true
-        marker=$(date +%s)
-        if systemctl restart "$SERVICE" && healthy "$marker"; then
+        steady systemctl daemon-reload
+        steady systemctl reset-failed "$SERVICE" 2>/dev/null || true
+        printf -v marker '%(%s)T' -1
+        if steady systemctl restart "$SERVICE" && healthy "$marker"; then
           fail "新版本 $new_version 启动失败，已回退到 $previous_version 并确认运行正常；请按上面的日志处理"
         fi
         log '回退后服务仍未正常运行，最近日志：'; journal_tail
         fail "新版本 $new_version 启动失败，已切回 $previous_version，但服务仍未正常运行；请按日志处理后重新执行本脚本"
       fi
       if ((imported)); then
-        marker=$(date +%s)
-        systemctl reset-failed "$SERVICE" 2>/dev/null || true
-        if systemctl restart "$SERVICE" && healthy "$marker"; then fail '导入的配置启动失败，已恢复导入前的配置并确认服务运行正常；请按上面的日志处理'; fi
+        printf -v marker '%(%s)T' -1
+        steady systemctl reset-failed "$SERVICE" 2>/dev/null || true
+        if steady systemctl restart "$SERVICE" && healthy "$marker"; then fail '导入的配置启动失败，已恢复导入前的配置并确认服务运行正常；请按上面的日志处理'; fi
         fail '导入的配置启动失败，已恢复导入前的配置，但服务仍未正常运行；请按日志处理后重新执行本脚本'
       fi
       fail '服务启动失败；请按上面的日志检查配置后重新执行本脚本'
@@ -340,6 +355,9 @@ fi
 
 # The service runs on the imported files (or, in test mode, they passed the check): nothing to put back any more.
 import_backup=''
+trap 'exit 130' INT TERM HUP
+trap - PIPE
+if ((interrupted)); then log '已收到停止信号；服务已正常运行，安装已完成。'; fi
 
 # ---- 7. 清理旧版本 -------------------------------------------------------------------
 current_dir=$(readlink -f "$APP_DIR/current")

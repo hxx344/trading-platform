@@ -261,14 +261,17 @@ export interface TransferConfig {
   maxTransfer: string;
   /** Share of the source's equity that stays there as cash. */
   bufferRatio: string;
+  /** Fixed USD1 that stays on the long side whatever its equity; the larger of this and the ratio share applies. */
+  longReserve: string;
+  shortReserve: string;
   cooldownMs: number;
   checkIntervalMs: number;
 }
 /** Legacy defaults (modules/aster/trading/margin_balance.py DEFAULT_MARGIN). */
-export const DEFAULT_TRANSFER_CONFIG: Readonly<TransferConfig> = Object.freeze({ threshold: '10', minTransfer: '1', maxTransfer: '1000', bufferRatio: '0.05', cooldownMs: 30_000, checkIntervalMs: 5_000 });
+export const DEFAULT_TRANSFER_CONFIG: Readonly<TransferConfig> = Object.freeze({ threshold: '10', minTransfer: '1', maxTransfer: '1000', bufferRatio: '0.05', longReserve: '0', shortReserve: '0', cooldownMs: 30_000, checkIntervalMs: 5_000 });
 export function parseTransferConfig(value: unknown): TransferConfig {
-  const raw = exactKeys(value ?? {}, [], ['threshold', 'minTransfer', 'maxTransfer', 'bufferRatio', 'cooldownMs', 'checkIntervalMs']);
-  const amount = (key: 'threshold' | 'minTransfer' | 'maxTransfer' | 'bufferRatio', name: string, sign: 'positive' | 'nonnegative'): string => {
+  const raw = exactKeys(value ?? {}, [], ['threshold', 'minTransfer', 'maxTransfer', 'bufferRatio', 'longReserve', 'shortReserve', 'cooldownMs', 'checkIntervalMs']);
+  const amount = (key: 'threshold' | 'minTransfer' | 'maxTransfer' | 'bufferRatio' | 'longReserve' | 'shortReserve', name: string, sign: 'positive' | 'nonnegative'): string => {
     const parsed = decimalField(raw[key] ?? DEFAULT_TRANSFER_CONFIG[key], name, sign);
     return cmp(parsed, TRANSFER_AMOUNT_LIMIT) > 0 ? reject('invalid_value', `${name}超出范围`) : parsed;
   };
@@ -277,6 +280,8 @@ export function parseTransferConfig(value: unknown): TransferConfig {
     minTransfer: amount('minTransfer', '最小划转额', 'positive'),
     maxTransfer: amount('maxTransfer', '单次划转上限', 'positive'),
     bufferRatio: amount('bufferRatio', '现金保留比例', 'nonnegative'),
+    longReserve: amount('longReserve', '多侧固定保留额', 'nonnegative'),
+    shortReserve: amount('shortReserve', '空侧固定保留额', 'nonnegative'),
     cooldownMs: integer(raw.cooldownMs ?? DEFAULT_TRANSFER_CONFIG.cooldownMs, 1_000, 86_400_000, '划转冷却毫秒数'),
     checkIntervalMs: integer(raw.checkIntervalMs ?? DEFAULT_TRANSFER_CONFIG.checkIntervalMs, 1_000, 3_600_000, '检查间隔毫秒数'),
   };

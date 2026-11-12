@@ -10,6 +10,7 @@
     "check": "tsc -p tsconfig.json",
     "test": "node --test --test-reporter=dot test/*.test.ts",
     "start": "node src/main.ts",
+    "service": "node src/service/main.ts",
     "measure": "node scripts/measure.ts"
   },
   "devDependencies": {

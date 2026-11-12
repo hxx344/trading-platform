@@ -148,6 +148,8 @@ export class FakeAster {
         return json((this.forceOrders.get(this.owner(call)) ?? []).filter(row => (row.updateTime as number) >= from && (row.updateTime as number) <= to).slice(0, Number(params.limit)));
       }
       case 'GET /fapi/v3/exchangeInfo': return json({ symbols: this.info });
+      case 'POST /fapi/v3/listenKey': this.owner(call); return json({ listenKey: `key${this.count('/fapi/v3/listenKey')}` });
+      case 'PUT /fapi/v3/listenKey': this.owner(call); return json({});
       default: return json({ code: -1000, msg: `no route ${method} ${path}` }, 404);
     }
   }

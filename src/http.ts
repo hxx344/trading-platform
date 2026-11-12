@@ -27,13 +27,13 @@ const LOGIN_REQUIRED = '<!doctype html><meta charset="utf-8"><title>需要登录
 export const sessionCookieName = (port: number): string => `pa_executor_session_${port}`;
 
 /** accessToken is exchanged once per browser at /login; session is the cookie value and the executor session id. */
-export interface HttpOptions { executor: Executor; accessToken: string; session?: string }
+export interface HttpOptions { executor: Executor; accessToken: string; session?: string; /** Page served at /; defaults by environment. */ page?: string }
 
 // Hashing first gives equal-length inputs, so the comparison does not leak the token length either.
 const sameSecret = (given: string, expected: string): boolean =>
   timingSafeEqual(createHash('sha256').update(given).digest(), createHash('sha256').update(expected).digest());
 
-export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url') }: HttpOptions): Server {
+export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), page }: HttpOptions): Server {
   if (!accessToken) throw new Error('需要访问令牌');
   if (sameSecret(session, accessToken)) throw new Error('会话值不能与访问令牌相同');
   // The name follows the port actually bound, which is only known once listening (port 0 in tests).
@@ -74,7 +74,7 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'GET' && url.pathname === '/') {
       const ok = authorized(request);
       response.writeHead(ok ? 200 : 401, PAGE_HEADERS);
-      response.end(ok ? (executor.environment === 'mainnet' ? LIVE_PAGE : PAGE) : LOGIN_REQUIRED);
+      response.end(ok ? (page ?? (executor.environment === 'mainnet' ? LIVE_PAGE : PAGE)) : LOGIN_REQUIRED);
       return;
     }
     if (!url.pathname.startsWith('/api/')) return send(response, 404, { code: 'not_found', message: '不存在' });

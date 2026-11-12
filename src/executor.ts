@@ -12,7 +12,7 @@ import {
   type ChaseConnector, type ChaseRequest, type OrderReport, type OrderRequest, type StrategyIdentity, type StrategyReport, type StrategyStatus, type TransferConnector, type VenueConnector,
 } from './connector.ts';
 import type { Store } from './store.ts';
-import { createTransfers } from './transfer.ts';
+import { createTransfers, type TransferDeps } from './transfer.ts';
 import { DEFAULT_ADL_BUDGETS, createAdl, type Adl, type AdlBudgets } from './adl.ts';
 import type { AdlConnector } from './adl-contracts.ts';
 import { DEFAULT_POSITIONS_BUDGETS, createPositions, type AsterPositionsConnector, type PositionsBudgets } from './positions.ts';
@@ -228,6 +228,13 @@ export interface ExecutorOptions {
   positions?: AsterPositionsConnector;
   /** Hard notional caps checked at preview and again inside the confirm transaction; required on mainnet. */
   notionalLimits?: NotionalLimits;
+  /** Extra checks before a transfer pair is switched on (after ownership is proven); throws a ContractError to refuse. */
+  enableGuard?: TransferDeps['enableGuard'];
+  /**
+   * ADL acts only on pairs whose transfers are switched on, plus any pair it still has unfinished work on. The service
+   * sets it: a configured pair is not taken over from the workbench until it is enabled here.
+   */
+  adlOnlyEnabledPairs?: boolean;
 }
 
 const digest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -246,7 +253,7 @@ const jobNotional = (legs: readonly PlannedLeg[]): string => maxOf(...legs.map(l
 /** `pa1-` + 24 hex + `-` + leg index, plus `r` + attempt for a resumed hedge (at most two digits). */
 const CLIENT_ORDER_ID_LENGTH = 33;
 
-export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions, transfers: transferConnector, adl: adlConnector, positions: positionsConnector, notionalLimits }: ExecutorOptions) {
+export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions, transfers: transferConnector, adl: adlConnector, positions: positionsConnector, notionalLimits, enableGuard, adlOnlyEnabledPairs = false }: ExecutorOptions) {
   // Jobs never run on a real account without hard caps; a malformed cap stops the start instead of being ignored.
   if (environment === 'mainnet' && connectors.length > 0 && !notionalLimits) throw new ContractError(500, 'notional_limits_required', '真实账户执行必须配置单笔与累计名义金额上限');
   const limits = notionalLimits ? parseNotionalLimits(notionalLimits) : null;
@@ -414,8 +421,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     finally { clearTimeout(timer); }
   }
   const transfers = createTransfers({ db, now, budgets, connector: transferConnector ?? null, control, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
-    busy: pairId => adl.busy(pairId), adlSending: pairId => adl.sending(pairId) });
-  const adl: Adl = createAdl({ db, now, budgets, connector: adlConnector ?? null, control, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError, pairs: transfers.records,
+    busy: pairId => adl.busy(pairId), adlSending: pairId => adl.sending(pairId), enableGuard });
+  const adl: Adl = createAdl({ db, now, budgets, connector: adlConnector ?? null, control, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
+    pairs: adlOnlyEnabledPairs ? () => transfers.records().filter(pair => pair.enabled || adl.busy(pair.id) !== null) : transfers.records,
     transferSending: pairId => transfers.sending(pairId) });
   const positions = createPositions({ connector: positionsConnector ?? null, now, budgets, pairs: transfers.records, callVenue });
   const readFailure = (error: unknown): never => {

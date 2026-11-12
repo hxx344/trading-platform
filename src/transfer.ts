@@ -114,13 +114,19 @@ export interface TransferDeps {
    * meanwhile: the legacy system ran margin balance and ADL of one pair under one lock (inventory 6.5).
    */
   adlSending?(pairId: string): string | null;
+  /**
+   * Extra checks before a pair is switched on, after ownership is proven; a refusal is thrown as a ContractError.
+   * The service uses it to refuse taking over accounts that another writer has touched recently.
+   */
+  enableGuard?(pair: Readonly<PairRecord>): Promise<void>;
 }
 
 export type TransferPlan = { source: PairSide; destination: PairSide; amount: string };
 const SCALE = 10n ** 18n;
 /**
  * Half the gap in available balance goes from the richer side to the poorer one, capped by the per-transfer limit,
- * the venue's withdrawal limit and what is left after the cash reserve, rounded down to the transfer unit.
+ * the venue's withdrawal limit and what is left after the cash reserve (the larger of the equity share and the side's
+ * fixed reserve), rounded down to the transfer unit.
  * A negative available balance counts in the gap as it is and leaves nothing to take from that side.
  */
 export function planTransfer(balances: Record<PairSide, TransferBalance>, config: TransferConfig): TransferPlan | { reason: string } {
@@ -130,7 +136,10 @@ export function planTransfer(balances: Record<PairSide, TransferBalance>, config
   if (cmp(half, config.minTransfer) < 0) return { reason: `两侧可用余额差 ${gap} USD1 的一半取整为 ${half} USD1，低于最小划转额 ${config.minTransfer} USD1` };
   const source: PairSide = cmp(delta, '0') > 0 ? 'long' : 'short', from = balances[source];
   // Rounded up, so truncation can never leave less cash behind than the configured share.
-  const reserve = cmp(from.equity, '0') > 0 ? fromUnits((units(from.equity) * units(config.bufferRatio) + SCALE - 1n) / SCALE) : '0';
+  const share = cmp(from.equity, '0') > 0 ? fromUnits((units(from.equity) * units(config.bufferRatio) + SCALE - 1n) / SCALE) : '0';
+  // Pair records stored before the fixed reserves existed have none.
+  const fixed = (source === 'long' ? config.longReserve : config.shortReserve) ?? '0';
+  const reserve = cmp(fixed, share) > 0 ? fixed : share;
   const limit = [config.maxTransfer, from.maxWithdraw, sub(from.available, reserve)].reduce(min, half);
   const amount = cmp(limit, '0') > 0 ? floorToStep(limit, TRANSFER_UNIT) : '0';
   if (cmp(amount, config.minTransfer) < 0) return { reason: `转出侧${SIDE_NAMES[source]}按单次上限、可划上限与现金保留 ${reserve} USD1 约束后可划 ${amount} USD1，低于最小划转额 ${config.minTransfer} USD1` };
@@ -168,7 +177,7 @@ export function transferRegistryOutcome(state: TransferState): 'confirmed' | 're
   return null;
 }
 
-export function createTransfers({ db, now, budgets, connector, control, write, assertWriter, callVenue, event, isWriterLost, busy, adlSending }: TransferDeps) {
+export function createTransfers({ db, now, budgets, connector, control, write, assertWriter, callVenue, event, isWriterLost, busy, adlSending, enableGuard }: TransferDeps) {
   checkBudgets(budgets, connector);
   /** Transfers whose send is running in this process; any other prepared or sending row was interrupted. */
   const inFlight = new Set<string>();
@@ -718,6 +727,7 @@ export function createTransfers({ db, now, budgets, connector, control, write, a
     const pair = requirePair(pairId);
     if (enabled) {
       await verifyOwnership(pair);
+      await enableGuard?.(pair);
     }
     return write(() => {
       if (replayed()) return pairView(requirePair(pairId));

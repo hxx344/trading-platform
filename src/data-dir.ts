@@ -1,7 +1,8 @@
-// The executor data directory's environment marker and database names, shared by the entry (main.ts) and the
-// workbench-driven live canary (live/canary.ts).
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, writeSync } from 'node:fs';
-import { join } from 'node:path';
+// The executor data directory: the dedicated-directory check, the login link, the environment marker and the database
+// names, shared by the entries (main.ts, service/main.ts) and the workbench-driven live canary (live/canary.ts).
+import { randomBytes } from 'node:crypto';
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import type { Environment } from './contracts.ts';
 
 const ENVIRONMENT_MARKER = 'environment';
@@ -33,4 +34,41 @@ export function claimDataDirEnvironment(dir: string, environment: Environment): 
   try { writeSync(fd, `${environment}\n`); fsyncSync(fd); } finally { closeSync(fd); }
   const dirFd = openSync(dir, 'r');
   try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+}
+
+const LEGACY_MARKERS = ['hub.sqlite', 'execution-control.sqlite', 'credentials.key', 'modules'];
+
+/**
+ * The directory and every ancestor are checked after resolving links, so neither a
+ * subdirectory of the workbench data directory nor a link into it is accepted.
+ * Names compare case-insensitively because Windows and macOS file systems do.
+ */
+export function assertDedicatedDataDir(dir: string): string {
+  if (!isAbsolute(dir)) throw new Error('--data-dir 必须是绝对路径');
+  const path = resolve(dir);
+  let existing = path;
+  while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing);
+  for (let current = realpathSync.native(existing); ; current = dirname(current)) {
+    let names: string[] = [];
+    try { names = readdirSync(current); } catch { /* an unreadable ancestor cannot be the workbench data directory of this user */ }
+    const found = names.find(name => LEGACY_MARKERS.includes(name.toLowerCase()));
+    if (found) throw new Error(`拒绝使用工作台数据目录（${current} 含 ${found}）；执行器必须使用独立数据目录，且不能位于工作台代码或数据目录之下`);
+    if (dirname(current) === current) break;
+  }
+  return path;
+}
+
+/**
+ * Writes the login link to <dir>/access-url and returns that path. The token never
+ * reaches stdout or logs; whoever can read the data directory can log in. The
+ * temporary file plus rename keeps a reader from seeing a half-written link.
+ */
+export function writeAccessUrl(dir: string, port: number, token: string): string {
+  const target = join(dir, 'access-url');
+  const temp = join(dir, `.access-url.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
+  try {
+    writeFileSync(temp, `http://127.0.0.1:${port}/login?token=${token}\n`, { mode: 0o600, flag: 'wx' });
+    renameSync(temp, target);
+  } catch (error) { rmSync(temp, { force: true }); throw error; }
+  return target;
 }

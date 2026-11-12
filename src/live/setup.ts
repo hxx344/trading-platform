@@ -18,7 +18,7 @@ const PREFLIGHT_TIMEOUT_MS = 30_000;
 export interface LiveConfig { notionalLimits: NotionalLimits; credentialsFile: string; accounts: AccountBinding[] }
 
 /** Reads a small regular file this user owns and nobody else can read or write; the open descriptor is checked, not the path. */
-function readPrivateFile(path: string, name: string): string {
+export function readPrivateFile(path: string, name: string): string {
   if (!isAbsolute(path)) throw new Error(`${name}必须是绝对路径`);
   if (process.platform !== 'linux' || typeof process.getuid !== 'function') throw new Error('实盘模式只在 Linux 上运行（需要检查文件属主与权限、按账户加进程锁）');
   let fd: number;
@@ -38,7 +38,7 @@ function readPrivateFile(path: string, name: string): string {
   } finally { closeSync(fd); }
 }
 /** JSON.parse messages quote the text around the error, so they never reach the operator for a file that may hold keys. */
-function parsePrivateJson(text: string, name: string): unknown {
+export function parsePrivateJson(text: string, name: string): unknown {
   try { return JSON.parse(text); } catch { throw new Error(`${name}不是有效的 JSON`); }
 }
 const explain = (error: unknown, name: string): Error => new Error(`${name}无效：${error instanceof ContractError ? error.message : describe(error)}`);
@@ -85,7 +85,7 @@ export function loadLiveCredentials(path: string): Map<Venue, LiveCredentials> {
  * notional total and treat the other's orders as foreign. The lock is a Linux abstract socket, released by the kernel
  * when the process ends, so a crash leaves no stale lock.
  */
-export async function holdAccountLocks(accounts: readonly AccountBinding[]): Promise<{ release(): void }> {
+export async function holdAccountLocks(accounts: readonly { venue: string; accountId: string }[]): Promise<{ release(): void }> {
   if (process.platform !== 'linux') throw new Error('实盘模式只在 Linux 上运行（按账户加进程锁）');
   const servers: ReturnType<typeof createServer>[] = [];
   const release = () => { for (const server of servers) server.close(); };

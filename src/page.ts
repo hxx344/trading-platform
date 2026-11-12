@@ -38,6 +38,7 @@ table{border-collapse:collapse;width:100%} td,th{border-bottom:1px solid #eaeef2
 <div id="adlPairs" class="muted">—</div><div id="adlRecent"></div>
 <h2>ANT 只读（Binance ANTHROPICUSDT）</h2><div id="ant" class="muted">—</div>
 <script>
+const SHOW_ANT = true;
 const $ = id => document.getElementById(id);
 let previewValue = null, pendingConfirm = null, acceptedJob = null;
 // Typed strategy ids survive the periodic re-render.
@@ -260,7 +261,7 @@ async function refresh() {
     // The rows below stay, but must not read as current.
     if (positionsShownAt && !positionsCurrent) $('positionsNotice').innerHTML = '<span class="err">页面刷新失败，下方持仓停留在 ' + esc(clock(positionsShownAt)) + ' 的结果，不代表当前</span>';
   }
-  try {
+  if (SHOW_ANT) try {
     const ant = await api('/api/observe?venue=binance&symbol=ANTHROPICUSDT');
     $('ant').textContent = '买一 ' + ant.quote.bid + ' / 卖一 ' + ant.quote.ask + ' · 年龄 ' + ant.ageMs + ' 毫秒 · 持仓 多 ' + (ant.position?.long ?? '—') + ' 空 ' + (ant.position?.short ?? '—') + ' · 只读，不可执行';
   } catch (error) { $('ant').innerHTML = '<span class="err">' + esc(error.message) + '</span>'; }
@@ -278,7 +279,25 @@ export const LIVE_PAGE = ([
   ['<h2>ASTER 账户持仓（模拟，只读）</h2>', '<h2>ASTER 账户持仓（实盘未接入）</h2>'],
   ['<h2>ASTER ADL 应急处理（模拟）</h2>', '<h2>ASTER ADL 应急处理（实盘未接入）</h2>'],
   ['确认执行（模拟）', '确认执行（实盘）'],
-] as const).reduce((page, [from, to]) => {
-  if (page.split(from).length !== 2) throw new Error(`实盘页面替换项不唯一或缺失：${from}`);
+] as const).reduce(replaceOnce, PAGE);
+
+function replaceOnce(page: string, [from, to]: readonly [string, string]): string {
+  if (page.split(from).length !== 2) throw new Error(`页面替换项不唯一或缺失：${from}`);
   return page.replace(from, to);
-}, PAGE);
+}
+
+/** The ASTER service page: margin balance, positions and ADL of the live pairs; the two-leg jobs and ANT are hidden. */
+export const ASTER_PAGE = ([
+  ['<title>执行器原型（模拟）</title>', '<title>统一交易平台 · ASTER</title>'],
+  ['<h1>统一平台执行器原型 · 原油跨所双腿</h1>', '<h1>统一交易平台 · ASTER 保证金平衡与 ADL</h1>'],
+  ['<p class="banner">模拟传输：不会访问任何真实交易所，也不持有真实账户执行权。模拟交易所状态在进程退出后丢失。</p>',
+    '<p class="banner" style="background:#ffebe9;border-color:#cf222e">实盘：启用的配对会在真实 ASTER 子账户之间划转 USD1；ADL 导致两侧不一致时按只减仓市价单自动减仓。启用前请先在工作台停用并删除同一配对。</p>'],
+  ['<fieldset><legend>下单预览</legend>', '<fieldset hidden><legend>下单预览</legend>'],
+  ['<h2>本次受理任务</h2>', '<div hidden><h2>本次受理任务</h2>'],
+  ['<h2>最近任务</h2><div id="jobs"></div>', '<h2>最近任务</h2><div id="jobs"></div></div>'],
+  ['<h2>ASTER 保证金平衡（模拟）</h2>', '<h2>ASTER 保证金平衡</h2>'],
+  ['<h2>ASTER 账户持仓（模拟，只读）</h2>', '<h2>ASTER 账户持仓（只读）</h2>'],
+  ['<h2>ASTER ADL 应急处理（模拟）</h2>', '<h2>ASTER ADL 应急处理</h2>'],
+  ['<h2>ANT 只读（Binance ANTHROPICUSDT）</h2><div id="ant" class="muted">—</div>', ''],
+  ['const SHOW_ANT = true;', 'const SHOW_ANT = false;'],
+] as const).reduce(replaceOnce, PAGE);

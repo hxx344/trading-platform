@@ -160,9 +160,9 @@ export class AsterTradingConnector implements AdlConnector, AsterPositionsConnec
     }
   }
 
-  private async openOrders(accountId: string, symbols: readonly string[], signal: AbortSignal): Promise<unknown[]> {
-    if (symbols.length > PER_SYMBOL_ORDER_READS) {
-      const all = await this.read(accountId, '/fapi/v3/openOrders', {}, 40, signal, 'adl');
+  private async openOrders(accountId: string, symbols: readonly string[] | 'all', signal: AbortSignal, priority: Priority = 'adl'): Promise<unknown[]> {
+    if (symbols === 'all' || symbols.length > PER_SYMBOL_ORDER_READS) {
+      const all = await this.read(accountId, '/fapi/v3/openOrders', {}, 40, signal, priority);
       return this.shaped(() => list(all, '挂单列表', 10_000), false);
     }
     const rows: unknown[] = [];
@@ -171,6 +171,16 @@ export class AsterTradingConnector implements AdlConnector, AsterPositionsConnec
       rows.push(...this.shaped(() => list(answer, '挂单列表', 10_000), false));
     }
     return rows;
+  }
+
+  /** Every open order of the account (one all-symbols read, weight 40), for the takeover check. */
+  async allOpenOrders(accountId: string, { signal }: CallOptions): Promise<{ symbol: string; clientOrderId: string }[]> {
+    const rows = await this.openOrders(accountId, 'all', signal, 'normal');
+    return this.shaped(() => rows.map(row => {
+      const item = record(row, '挂单');
+      if (typeof item.symbol !== 'string' || typeof item.clientOrderId !== 'string') throw new ShapeError('挂单缺少合约或客户订单号');
+      return { symbol: item.symbol, clientOrderId: item.clientOrderId };
+    }), false);
   }
 
   /** Positions from positionRisk cross-checked against the account's own position list, plus canTrade and open orders. */

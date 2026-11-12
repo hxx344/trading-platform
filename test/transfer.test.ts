@@ -671,7 +671,7 @@ test('契约：aster 不是交易场所，交易意图与账户绑定都拒绝�
   for (const config of [{ bufferRatio: '1' }, { minTransfer: '0.000000001' }, { minTransfer: '5', maxTransfer: '4' }, { threshold: '-1' }, { cooldownMs: 999 }, { checkIntervalMs: 3_600_001 }, { maxTransfer: 30 }, { reserve: '1' }]) {
     assert.throws(register({}, config), ContractError, JSON.stringify(config));
   }
-  assert.deepEqual(h.ex.registerTransferPair(SIM_TRANSFER_PAIR).config, { threshold: '10', minTransfer: '1', maxTransfer: '1000', bufferRatio: '0.05', cooldownMs: 30_000, checkIntervalMs: 5_000 });
+  assert.deepEqual(h.ex.registerTransferPair(SIM_TRANSFER_PAIR).config, { threshold: '10', minTransfer: '1', maxTransfer: '1000', bufferRatio: '0.05', longReserve: '0', shortReserve: '0', cooldownMs: 30_000, checkIntervalMs: 5_000 });
   assert.equal(pairOf(h).enabled, false, '新配对默认停用');
   // The same two sub-accounts under the same main account, whichever side each is on.
   assert.throws(() => h.ex.registerTransferPair({ id: 'same', mainAccountId: MAIN, long: LONG, short: SHORT }), code('pair_duplicate'));

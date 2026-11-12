@@ -7,7 +7,8 @@ import type { CallOptions, SendOptions } from './connector.ts';
 
 /** The venue's own client id on every order it closes by auto-deleveraging; a marker only, never a dedup key. */
 export const ADL_CLIENT_ID = 'adl_autoclose';
-export const ADL_SYMBOL = /^[A-Z0-9_]{1,64}$/;
+/** ASTER lists contracts such as 币安人生USDT and B-MONEYUSDT; any name without control or space characters is taken. */
+export const ADL_SYMBOL = /^[^\p{C}\p{Z}]{1,64}$/u;
 /** `adl-` + 28 hex: unique per batch, under the 36-character client id limit of Binance-style venues. */
 export const ADL_ORDER_ID = /^adl-[0-9a-f]{28}$/;
 export type AdlPositionSide = 'LONG' | 'SHORT' | 'BOTH';

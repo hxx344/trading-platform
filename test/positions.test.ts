@@ -177,3 +177,11 @@ test('持仓预算：有效期须大于刷新间隔加读取时限，非模拟�
     assert.throws(() => createExecutor({ store, connectors: [], now: h.now, positions: live }), code('live_transport_refused'));
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('持仓契约：ASTER 的中文与带连字符的合约名照常解析，含空白或控制字符的仍拒绝', () => {
+  const parse = (positions: unknown[]) => parseAsterPositions({ accountId: LONG, receivedAt: NOW, positions }, LONG, NOW, 1_000);
+  const zero = ['币安人生USDT', '我踏马来了USDT', 'B-MONEYUSDT'].map(symbol => row({ symbol, amount: '0', entryPrice: '0', markPrice: '0', unrealizedProfit: '0' }));
+  const parsed = parse([...zero, row({ symbol: '龙虾USDT' })]);
+  assert.deepEqual(parsed.positions.map(item => item.symbol), ['龙虾USDT']);
+  for (const symbol of ['BTC USDT', 'BTC\nUSDT', '', 'A'.repeat(65)]) assert.throws(() => parse([row({ symbol })]), ContractError, JSON.stringify(symbol));
+});

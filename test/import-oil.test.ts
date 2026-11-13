@@ -26,10 +26,12 @@ const encrypt = (key: Buffer, value: unknown): string => {
 };
 
 interface Row { exchange: string; revision?: number; credentials?: unknown; mode?: string; identity?: string | null; foreignKey?: boolean }
-interface Rule { enabled?: boolean; market?: string; exchange?: string; name?: string; mode?: string; raw?: string }
+interface Rule { enabled?: boolean; market?: string; exchange?: string; name?: string; mode?: string; phase?: string; raw?: string }
+/** A workbench execution job row: `raw` is stored as is; otherwise legs on the given exchanges. */
+interface Job { status?: string; exchanges?: string[]; raw?: string }
 
 /** A workbench data directory with hub.sqlite and credentials.key, the way the workbench writes them. */
-function hub(rows: Row[], rules: Rule[] = []) {
+function hub(rows: Row[], rules: Rule[] = [], jobs?: Job[]) {
   const root = mkdtempSync(join(tmpdir(), 'tp-oil-import-'));
   const data = join(root, 'data');
   mkdirSync(data);
@@ -47,8 +49,12 @@ function hub(rows: Row[], rules: Rule[] = []) {
   }
   rules.forEach((rule, index) => {
     const config = rule.raw ?? JSON.stringify({ name: rule.name ?? '', market: rule.market ?? 'oil', exchange: rule.exchange ?? 'binance' });
-    db.prepare('INSERT INTO execution_auto_rules VALUES (?, 0, ?, ?, ?, ?)').run(`r${index}`, rule.enabled === false ? 0 : 1, `2026-11-0${index + 1}T00:00:00Z`, config, JSON.stringify({ mode: rule.mode ?? 'live' }));
+    db.prepare('INSERT INTO execution_auto_rules VALUES (?, 0, ?, ?, ?, ?)').run(`r${index}`, rule.enabled === false ? 0 : 1, `2026-11-0${index + 1}T00:00:00Z`, config, JSON.stringify({ mode: rule.mode ?? 'live', phase: rule.phase ?? 'idle' }));
   });
+  if (jobs) {
+    db.exec('CREATE TABLE execution_jobs (id TEXT PRIMARY KEY, json TEXT NOT NULL)');
+    jobs.forEach((job, index) => db.prepare('INSERT INTO execution_jobs VALUES (?, ?)').run(`job-${index}-0000`, job.raw ?? JSON.stringify({ status: job.status ?? 'running', plan: { legs: (job.exchanges ?? ['binance']).map(exchange => ({ exchange, symbol: 'CLUSDT' })) } })));
+  }
   db.close();
   return { root, data };
 }
@@ -129,6 +135,30 @@ test('原油导入：实盘启用的原油自动规则拒绝导入该交易所�
   assert.match(unknown.oil[0]!.detail, /1 条自动规则无法解析.*先在工作台停用原油自动规则/);
 });
 
+test('原油导入：已停用但任务仍在执行或待核对的原油规则、工作台未结束的执行任务（任一品种）都拦对应交易所；已完成与已停止的任务不拦，无法解析的任务全部拦', () => {
+  const plan = (rules: Rule[], jobs: Job[]) => {
+    const wb = hub([{ exchange: 'binance' }, { exchange: 'bybit' }], rules, jobs);
+    try { return planImport({ pairs: [], accounts: [], env: {} }, null, { secretsFile: '/x/secrets.json', only: [], oil: readWorkbenchOil(wb.data) }); }
+    finally { rmSync(wb.root, { recursive: true, force: true }); }
+  };
+  const statuses = (result: ReturnType<typeof plan>) => result.oil.map(item => item.status);
+  for (const phase of ['opening', 'closing', 'review']) {
+    const disabled = plan([{ exchange: 'bybit', name: '停用中', enabled: false, phase }], []);
+    assert.deepEqual(statuses(disabled), ['added', 'skipped'], phase);
+    assert.match(disabled.oil[1]!.detail, /停用原油自动规则（停用中），并等它执行中的任务结束/);
+  }
+  assert.deepEqual(statuses(plan([{ exchange: 'bybit', enabled: false, phase: 'holding' }], [])), ['added', 'added'], '已停用、只持仓的规则不再下单');
+
+  const manual = plan([], [{ status: 'running', exchanges: ['binance'] }, { status: 'attention', exchanges: ['binance', 'okx'] }]);
+  assert.deepEqual(statuses(manual), ['skipped', 'added']);
+  assert.match(manual.oil[0]!.detail, /工作台还有未结束的执行任务在用该账户（job-0-00 running、job-1-00 attention）/);
+  assert.deepEqual(statuses(plan([], [{ status: 'completed' }, { status: 'stopped', exchanges: ['bybit'] }])), ['added', 'added']);
+  const broken = plan([], [{ raw: '{not json' }, { status: 'completed' }]);
+  assert.deepEqual(statuses(broken), ['skipped', 'skipped']);
+  assert.match(broken.oil[0]!.detail, /1 个执行任务无法解析/);
+  assert.deepEqual(statuses(plan([], [{ raw: JSON.stringify({ status: 'queued', plan: {} }) }])), ['skipped', 'skipped'], '看不出交易所的任务按无法解析处理');
+});
+
 test('原油导入：已有 oil 配置的交易所保留现有设置与上限，只补新交易所；未登记账户的同名密钥不覆盖', () => {
   const wb = hub([{ exchange: 'binance' }, { exchange: 'bybit' }]);
   try {
@@ -185,6 +215,11 @@ test('原油导入：未完成的回滚日志、工作台未运行时的未合�
       writer.prepare("INSERT INTO execution_accounts (exchange, revision, credentials, account_mode, identity) VALUES ('bybit', 1, NULL, 'unified', '1')").run();
       assert.ok(statSync(`${hubFile}-wal`).size > 0);
       assert.deepEqual(readWorkbenchOil(wb.data).accounts.map(item => [item.venue, item.problem]), [['binance', null], ['bybit', '工作台未连接该执行账户']]);
+      // Right after the workbench's TRUNCATE checkpoint: an empty WAL beside -shm still means a live writer, read normally.
+      writer.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+      assert.equal(statSync(`${hubFile}-wal`).size, 0);
+      assert.ok(statSync(`${hubFile}-shm`).size > 0);
+      assert.equal(readWorkbenchOil(wb.data).accounts.length, 2);
     } finally { writer.close(); }
   } finally { rmSync(wb.root, { recursive: true, force: true }); }
 });

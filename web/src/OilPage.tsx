@@ -148,11 +148,14 @@ function OrderPanel({ state, onAccepted }: { state: OilState; onAccepted: (job: 
   const [message, setMessage] = useState<{ tone: 'ok' | 'err' | 'muted'; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const ids = useRef(new RequestIds());
+  // Bumped on every form change: a preview answered for an older form is dropped, never shown beside the new one.
+  const formVersion = useRef(0);
+  const changed = (): void => { formVersion.current++; setPreview(null); };
   const cross = venues.length === 2;
   // A venue that is no longer configured, or cross venue without both venues, falls back to what is possible.
   useEffect(() => {
-    if (venues.length && !venues.includes(form.venue)) setForm(current => ({ ...current, venue: venues[0]! }));
-    if (!cross && form.preset === 'cross-exchange') setForm(current => ({ ...current, preset: 'same-exchange' }));
+    if (venues.length && !venues.includes(form.venue)) { setForm(current => ({ ...current, venue: venues[0]! })); changed(); }
+    if (!cross && form.preset === 'cross-exchange') { setForm(current => ({ ...current, preset: 'same-exchange' })); changed(); }
   }, [venues, cross, form.venue, form.preset]);
   const set = <K extends keyof OilForm>(key: K, value: OilForm[K]) => {
     setForm(current => {
@@ -161,7 +164,7 @@ function OrderPanel({ state, onAccepted }: { state: OilState; onAccepted: (job: 
       if (next.venue !== 'bybit') next.leadOrderType = 'market';
       return next;
     });
-    setPreview(null);
+    changed();
   };
   const leadVenue = form.venue, hedgeVenue: OilVenue = form.venue === 'binance' ? 'bybit' : 'binance';
 
@@ -169,10 +172,12 @@ function OrderPanel({ state, onAccepted }: { state: OilState; onAccepted: (job: 
     const built = formToIntent(form);
     if ('error' in built) { setMessage({ tone: 'err', text: built.error }); setPreview(null); return; }
     setBusy(true); setMessage({ tone: 'muted', text: '预览中…' }); setPreview(null);
+    const asked = formVersion.current;
+    const stale = (): boolean => asked !== formVersion.current && (setMessage({ tone: 'muted', text: '表单在预览期间改过，请重新预览' }), true);
     try {
       const result = await api<OilPreview>('/api/preview', { body: built.intent });
-      setPreview(result); setMessage(null);
-    } catch (error) { setMessage({ tone: 'err', text: errorText(error) }); }
+      if (!stale()) { setPreview(result); setMessage(null); }
+    } catch (error) { if (!stale()) setMessage({ tone: 'err', text: errorText(error) }); }
     finally { setBusy(false); }
   }
 

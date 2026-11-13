@@ -41,7 +41,6 @@ export function registerOilAccounts(oil: OilRuntime, executor: Executor): void {
   for (const account of oil.config.accounts) executor.registerAccount(account);
 }
 
-/** The page's two oil reads: the books and spreads, and the accounts, venue positions, jobs and cap use. */
 /**
  * Oil jobs still open while oil, or one of their venues, is no longer configured: no loop drives or reconciles them and the
  * page cannot show them, so the operator hears it (log and Feishu) at every start until oil is configured again.
@@ -56,6 +55,7 @@ export function strandedOilJobs(executor: Pick<Executor, 'unfinished' | 'jobView
   });
 }
 
+/** The page's two oil reads: the books and spreads, and the accounts, venue positions, jobs and cap use. */
 export function oilViews(oil: OilRuntime, executor: Executor) {
   return {
     market: () => oil.market.view(),

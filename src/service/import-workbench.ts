@@ -62,8 +62,11 @@ export interface OilCandidate {
   problem: string | null;
 }
 /** A workbench auto rule, reduced to what decides whether it trades oil on its own right now. */
-export interface OilRule { name: string; venue: string | null; oil: boolean; live: boolean }
-export interface OilSource { hub: string; accounts: OilCandidate[]; rules: OilRule[]; unreadableRules: number }
+/** `active`: the rule has a job running or awaiting review (phase opening / closing / review), enabled or not. */
+export interface OilRule { name: string; venue: string | null; oil: boolean; live: boolean; active: boolean }
+/** A workbench execution job not yet completed or stopped, with the venues its legs use. */
+export interface WorkbenchJob { id: string; status: string; venues: string[] }
+export interface OilSource { hub: string; accounts: OilCandidate[]; rules: OilRule[]; unreadableRules: number; jobs: WorkbenchJob[]; unreadableJobs: number }
 /** What the plan did with one oil account; only the masked account id leaves this file. */
 export interface OilItem { venue: Venue; accountMode: string | null; accountId: string | null; blockedBy: string[]; status: 'added' | 'skipped'; detail: string }
 /** One workbench pair the plan looked at; `detail` is the reason it was skipped or the accounts it brings. */
@@ -227,8 +230,9 @@ const mask = (id: string | null): string | null => id === null ? null : `***${id
 
 /**
  * Adds the workbench's oil execution accounts to `config` / `secrets` in place. A venue config.json already names keeps
- * its settings; the caps are written only with the oil block itself. An account an enabled live oil rule of the
- * workbench trades with is refused: both programs would then send orders on it.
+ * its settings; the caps are written only with the oil block itself. An account the workbench still trades with is
+ * refused: an enabled live oil rule, an oil rule whose job is still running or awaiting review (disabling a rule leaves
+ * its job running), or any unfinished workbench execution job on that venue. Both programs would then send orders on it.
  */
 function planOil(source: OilSource, config: Json, secrets: Json, fits: (candidate: Json) => void, notes: string[]): OilItem[] {
   const items: OilItem[] = [];
@@ -238,13 +242,16 @@ function planOil(source: OilSource, config: Json, secrets: Json, fits: (candidat
   if (source.accounts.length === 0) notes.push('工作台没有连接 Binance / Bybit 执行账户，没有原油执行账户可导入');
   for (const candidate of source.accounts) {
     // A rule whose venue cannot be read could be on this one; any unreadable rule could be a live oil rule.
-    const blockedBy = source.rules.filter(rule => rule.oil && rule.live && (rule.venue === candidate.venue || rule.venue === null)).map(rule => rule.name);
+    const blockedBy = source.rules.filter(rule => rule.oil && (rule.live || rule.active) && (rule.venue === candidate.venue || rule.venue === null)).map(rule => rule.name);
+    const busy = source.jobs.filter(job => job.venues.includes(candidate.venue));
     const item: OilItem = { venue: candidate.venue, accountMode: candidate.accountMode, accountId: mask(candidate.accountId), blockedBy, status: 'skipped', detail: '' };
     items.push(item);
     if (configured.has(candidate.venue)) { item.detail = '已在本项目配置中，保留现有设置'; continue; }
     if (candidate.problem !== null || !candidate.credentials || candidate.accountId === null || candidate.credentialVersion === null || candidate.accountMode === null) { item.detail = candidate.problem ?? '未能判断'; continue; }
     if (source.unreadableRules > 0) { item.detail = `工作台有 ${source.unreadableRules} 条自动规则无法解析，无法确认没有实盘启用的原油自动规则；先在工作台停用原油自动规则`; continue; }
-    if (blockedBy.length) { item.detail = `先在工作台停用原油自动规则（${blockedBy.join('、')}），两边同时下单会抢同一个账户`; continue; }
+    if (blockedBy.length) { item.detail = `先在工作台停用原油自动规则（${blockedBy.join('、')}），并等它执行中的任务结束、待核对的处理完，两边同时下单会抢同一个账户`; continue; }
+    if (source.unreadableJobs > 0) { item.detail = `工作台有 ${source.unreadableJobs} 个执行任务无法解析，无法确认该账户上没有进行中的任务；先在工作台执行进度里核对`; continue; }
+    if (busy.length) { item.detail = `工作台还有未结束的执行任务在用该账户（${busy.slice(0, 3).map(job => `${job.id.slice(0, 8)} ${job.status}`).join('、')}${busy.length > 3 ? ` 等 ${busy.length} 个` : ''}）；先在工作台执行进度里让它们完成或停止再导入`; continue; }
     if (secrets[candidate.venue] !== undefined) { item.detail = `现有密钥文件里已有 ${candidate.venue} 的密钥但 config.json 没有对应账户，不覆盖；请先确认并移走它`; continue; }
     fresh.push({ item, credentials: candidate.credentials, binding: { venue: candidate.venue, accountId: candidate.accountId, accountMode: candidate.accountMode, credentialVersion: candidate.credentialVersion } });
   }
@@ -358,14 +365,16 @@ const [hub, keyFile] = process.argv.slice(1);
 const out = value => process.stdout.write(JSON.stringify(value));
 const size = suffix => { try { return statSync(hub + suffix).size; } catch (error) { if (error && error.code === 'ENOENT') return null; throw error; } };
 try {
-  const pending = Boolean(size('-wal'));
+  const pending = Boolean(size('-wal')), shared = size('-shm') !== null;
   if (size('-journal')) out({ refused: 'journal' });
-  else if (pending && size('-shm') === null) out({ refused: 'wal' });
+  else if (pending && !shared) out({ refused: 'wal' });
   else {
     const key = readFileSync(keyFile);
     if (key.length !== 32) out({ refused: 'key' });
     else {
-      const db = new DatabaseSync(pending ? hub : pathToFileURL(hub).href + '?immutable=1', { readOnly: true });
+      // immutable (no locking, no change detection) only when nothing can be writing: no WAL content and no -shm. A
+      // running workbench keeps -shm even right after a checkpoint empties the WAL; then a normal read-only open.
+      const db = new DatabaseSync(pending || shared ? hub : pathToFileURL(hub).href + '?immutable=1', { readOnly: true });
       try {
         db.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=750');
         const has = name => db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name) !== undefined;
@@ -373,7 +382,11 @@ try {
           .map(row => ({ exchange: row.exchange, revision: row.revision, credentials: row.credentials ?? null, account_mode: row.account_mode, identity: row.identity ?? null })) : [];
         const rules = has('execution_auto_rules') ? db.prepare('SELECT enabled, config, state FROM execution_auto_rules ORDER BY created_at, rowid').all()
           .map(row => ({ enabled: row.enabled, config: row.config, state: row.state })) : [];
-        out({ key: key.toString('base64'), accounts, rules });
+        // Unfinished jobs only (the workbench's FINAL_EXECUTION: completed, stopped); a row that is not JSON is kept so
+        // it counts as unreadable. CASE keeps json_extract off invalid rows.
+        const jobs = has('execution_jobs') ? db.prepare("SELECT id, json FROM execution_jobs WHERE CASE WHEN json_valid(json) THEN coalesce(json_extract(json,'$.status'),'') NOT IN ('completed','stopped') ELSE 1 END ORDER BY rowid").all()
+          .map(row => ({ id: row.id, json: row.json })) : [];
+        out({ key: key.toString('base64'), accounts, rules, jobs });
       } finally { db.close(); }
     }
   }
@@ -436,9 +449,25 @@ export function oilRules(rows: readonly unknown[]): { rules: OilRule[]; unreadab
     if (!isRecord(row) || !isRecord(config) || !isRecord(state)) { unreadable++; continue; }
     const venue = typeof config.exchange === 'string' ? config.exchange : null;
     const title = typeof config.name === 'string' && config.name.trim() ? config.name.trim() : `${venue ?? '未知交易所'} 原油价差`;
-    rules.push({ name: printable(title).slice(0, 60), venue, oil: config.market === 'oil', live: state.mode !== 'observe' && Boolean(row.enabled) });
+    rules.push({ name: printable(title).slice(0, 60), venue, oil: config.market === 'oil', live: state.mode !== 'observe' && Boolean(row.enabled), active: ['opening', 'closing', 'review'].includes(state.phase as string) });
   }
   return { rules, unreadable };
+}
+
+/** Unfinished workbench jobs (trading-execution.mjs: plan.legs[] and totals[] carry `exchange`); a job without any is unreadable. */
+export function workbenchJobs(rows: readonly unknown[]): { jobs: WorkbenchJob[]; unreadable: number } {
+  const jobs: WorkbenchJob[] = [];
+  let unreadable = 0;
+  for (const row of rows) {
+    let job: unknown;
+    try { if (!isRecord(row)) throw new Error(); job = JSON.parse(String(row.json)); } catch { unreadable++; continue; }
+    if (!isRecord(row) || !isRecord(job)) { unreadable++; continue; }
+    const legs = [...(isRecord(job.plan) && Array.isArray(job.plan.legs) ? job.plan.legs : []), ...(Array.isArray(job.totals) ? job.totals : [])];
+    const venues = [...new Set(legs.filter(isRecord).map(leg => leg.exchange).filter((venue): venue is string => typeof venue === 'string'))];
+    if (!venues.length) { unreadable++; continue; }
+    jobs.push({ id: printable(String(row.id)).slice(0, 64), status: typeof job.status === 'string' ? printable(job.status).slice(0, 20) : '未知状态', venues });
+  }
+  return { jobs, unreadable };
 }
 
 /** Reads the workbench's execution accounts and auto rules without writing to hub.sqlite; the key never leaves this call. */
@@ -460,16 +489,17 @@ export function readWorkbenchOil(data: string): OilSource {
     const reason = printable(read.error?.message ?? (read.stderr.trim() || `退出码 ${read.status ?? read.signal}`)).slice(0, 200);
     throw new Error(`读取工作台执行账户 ${hub} 失败${as}：${reason}`);
   }
-  let dumped: { refused?: string; key?: string; accounts?: unknown[]; rules?: unknown[] };
+  let dumped: { refused?: string; key?: string; accounts?: unknown[]; rules?: unknown[]; jobs?: unknown[] };
   try { dumped = JSON.parse(read.stdout) as typeof dumped; } catch { throw new Error(`读取工作台执行账户 ${hub} 失败${as}：输出无法解析`); }
   if (dumped.refused === 'journal') throw new Error(`${hub} 有未完成的回滚日志（-journal），不读取；等工作台写完（或重启工作台）后再导入`);
   if (dumped.refused === 'wal') throw new Error(`${hub} 有未合并的 WAL 而工作台未在运行，不读取；先启动工作台（它会合并 WAL）再导入`);
   if (dumped.refused === 'key') throw new Error(`${keyFile} 长度不是 32 字节，不是工作台的凭据密钥`);
-  if (typeof dumped.key !== 'string' || !Array.isArray(dumped.accounts) || !Array.isArray(dumped.rules)) throw new Error(`读取工作台执行账户 ${hub} 失败${as}：输出格式错误`);
+  if (typeof dumped.key !== 'string' || !Array.isArray(dumped.accounts) || !Array.isArray(dumped.rules) || !Array.isArray(dumped.jobs)) throw new Error(`读取工作台执行账户 ${hub} 失败${as}：输出格式错误`);
   const key = Buffer.from(dumped.key, 'base64');
   try {
     const { rules, unreadable } = oilRules(dumped.rules);
-    return { hub, accounts: oilCandidates(key, dumped.accounts), rules, unreadableRules: unreadable };
+    const { jobs, unreadable: unreadableJobs } = workbenchJobs(dumped.jobs);
+    return { hub, accounts: oilCandidates(key, dumped.accounts), rules, unreadableRules: unreadable, jobs, unreadableJobs };
   } finally { key.fill(0); }
 }
 

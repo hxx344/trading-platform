@@ -39,7 +39,7 @@ import { MODULE_KEYS, assertDistinctSigners, parseServiceConfig, parseServiceSec
 import { parseOilSecrets } from './oil-config.ts';
 import { planOptions, readWorkbenchOptions, resolveOptionsAccount, type OptionsItem, type OptionsSource } from './import-options.ts';
 import { ASSET_OWNER } from './import-channel.ts';
-import { planAsset, planMonitor, readWorkbenchAsset, readWorkbenchMonitor, writeLedgerAsService, type AssetItem, type AssetSource, type LedgerWrite, type MonitorItem, type MonitorSource } from './import-modules.ts';
+import { connectionLines, planAsset, planMonitor, readWorkbenchAsset, readWorkbenchMonitor, writeLedgerAsService, type AssetItem, type AssetSource, type LedgerWrite, type MonitorItem, type MonitorSource } from './import-modules.ts';
 
 export const WORKBENCH_ENV = '/etc/project-aggregation.env';
 export const WORKBENCH_DATA = '/var/lib/project-aggregation';
@@ -701,8 +701,9 @@ async function main(): Promise<void> {
   if (values['dry-run']) { out('试运行：未写入任何文件'); return; }
   // The ledger first: when it fails nothing is changed; once written it is whole and stays, whatever becomes of the config.
   if (plan.ledger) {
-    const last = writeLedgerAsService(dataDir!, plan.ledger);
+    const last = await writeLedgerAsService(dataDir!, plan.ledger);
     out(`已写入资产账本 ${join(dataDir!, 'asset.sqlite')}：用户 ${last.owner}，资产 ${last.assets} 条、快照 ${last.snapshots} 条`);
+    for (const line of connectionLines(last.connections)) out(line);
   }
   if (filesUnchanged(plan, existing)) {
     out('配置未改动（资产账本已启用，只重新导入了账本；服务无需重启，页面下次读取即是新账本）');

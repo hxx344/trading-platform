@@ -202,6 +202,15 @@
 - 样式：`.form-grid`（含 `.checkbox-label`）、`.form-actions`、`.row-actions`、`.kpi-edit`、`.button.primary` 与两条宽度媒体查询复制自工作台 `globals.css`（`0014655`），加 `.asset-desk ` 前缀，放在 `asset.css` 写入表单一节；原位面板、表单里的 `select` 与勾选框里的输入框、资金流面板里的缩小字号、“已保存”提示写在文件末尾的本服务规则。
 - 验证：`scripts/asset-demo.ts` 假数据上无头浏览器 1280 与 390 宽度走过全部写入；390 宽度无横向溢出（出金表在表格容器内横向滚动，同工作台）；无页面错误。本机无头浏览器没有中文字体，截图只用来看版式。
 
+## 资产页同步与交易所连接（Asset A-3/A-4，v0.19.0）
+
+**对照的工作台页面**：`modules/asset/app`（提交 `0014655`）`dashboard.tsx` 的“刷新资产”按钮与 `startRefreshLoop`（`lib/refresh-loop.ts`）、侧栏“数据连接”、“交易所连接”视图与连接弹窗，`aster-accounts-panel.tsx` 的 Aster 多账号。行为与接口见 [asset.md](asset.md) 的 A-3。
+
+- 同步：页面打开、可见且联网时每 60 秒 `POST /api/asset/sync`，回到前台、重新联网时立即同步一次（`web/src/asset-refresh-loop.ts` 原样复制工作台 `refresh-loop.ts`）。同步占用页面唯一的写入名额：期间表单按钮禁用；自动同步遇到写入进行中直接跳过，页面隐藏时中止；自动同步的 409（账本正被另一次同步或导入占用）等下一分钟，不提示。手动“刷新资产”成功后提示“已完成刷新，更新状态见资产明细”，失败在提醒条显示“同步失败”。超时：同步 80 秒，连接与 Aster 账号 60 秒，其它写入 20 秒（同工作台）。
+- 连接视图：新增“交易所连接”标签（未连接数显示为“N 待连接”），卡片、说明、按钮文案与工作台相同。连接弹窗改为视图顶部整行展开的面板（`.connect-panel`），字段按交易所区分：Var 填 vr-token，Hyperliquid、Lighter RH 填地址，其余 API Key + Secret，OKX 加 Passphrase，Bybit 加账户地区（原生 `select`）。Aster 新增 / 更新 / 移除确认改为账号卡片内的原位面板。差异：Var 的“测试访问”诊断未移植；面板多一个“取消”按钮；Aster 新账号 id 用 `newRequestId()`（页面走 http 时没有 `crypto.randomUUID`）。
+- 总览：侧栏由 A-1 的“分交易所合计”恢复为工作台的“数据连接”（每行点开对应连接，Aster 跳到连接视图），交易所资产 KPI 显示“N 个账户待连接 / 账户已连接”，汇率面板文案恢复工作台原文，页脚加各视图说明。
+- 样式：`.connections-grid`、`.connection-card*`、`.aster-*`、`.loading-spin`、`.section-note`、`.exchange-mark.virtual` 复制自工作台 `globals.css`（`0014655`，行号见 `asset.css` 注释），规则与先后次序不改，加 `.asset-desk ` 前缀；连接面板整行展开与 Aster 卡片内面板的规则写在 `asset.css` 末尾。
+
 ## 期权页（v0.11.0）
 
 **对照的工作台页面**：工作台期权模块 `modules/greeks/app/static/index.html`、`app.js`、`style.css`（提交 `2f0593d`）。页面 `web/src/OptionsPage.tsx`，表单与计算在不依赖 DOM 的 `web/src/options-form.ts`（有单元测试）。顶部「期权」标签只在 `GET /api/options/state` 有应答时出现。

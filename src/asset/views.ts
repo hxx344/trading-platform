@@ -10,7 +10,8 @@ import { cashFlowEvidence, type CashFlowEvidence, type CashFlowRecord } from './
 import type { DailyChangeReport } from './daily-changes.ts';
 
 /** Kept in the `import-info` setting by import.ts. */
-export type ImportInfo = { importedAt: string; file: string; owner: string; assets: number; snapshots: number; settings: string[] };
+/** `importId` is random per import, so two imports in the same millisecond still differ (sync-lock.ts compares the raw value). */
+export type ImportInfo = { importedAt: string; importId?: string; file: string; owner: string; assets: number; snapshots: number; settings: string[] };
 export type Imported = { imported: boolean; importedAt: string | null };
 export type Valuation = { total: number; missingValues: number; partial: boolean };
 
@@ -60,7 +61,9 @@ export function ledgerView(ledger: Ledger, today: string): Pick<AssetLedgerView,
   });
   const valuation = sumKnownValues(ledger.assets);
   return {
-    ledger: current,
+    // Since A-4 the saved Aster accounts carry their wallet address (the duplicate checks use it); the page shows the
+    // account's `label` (the last four) only, so the address stays on the server.
+    ledger: { ...current, asterAccounts: current.asterAccounts.map(({ walletAddress: _wallet, ...account }) => account) },
     rows: assetDisplayRows(ledger.assets, ledger.withdrawals, today).sort((a, b) => (b.value ?? 0) - (a.value ?? 0)),
     summary: {
       valuation, exchanges: sumKnownValues(exchangeRows),

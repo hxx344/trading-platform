@@ -30,7 +30,11 @@ const MONITOR_PATHS = new Set(['/api/monitor/state', '/api/monitor/anthropic/quo
 const MONITOR_MAX_DAYS = ANTHROPIC_RETENTION_DAYS;
 const ASSET_READS = { '/api/asset/state': 'state', '/api/asset/ledger': 'ledger', '/api/asset/history': 'history', '/api/asset/daily-changes': 'dailyChanges', '/api/asset/withdrawals': 'withdrawals', '/api/asset/cash-flows': 'cashFlows' } as const;
 const ASSET_PERIOD_ID = /^[0-9A-Za-z-]{1,80}$/;
-const ASSET_WRITES = { '/api/asset/assets/edit': 'edit', '/api/asset/fx': 'fx', '/api/asset/withdrawals/add': 'add', '/api/asset/withdrawals/edit': 'change', '/api/asset/withdrawals/delete': 'delete', '/api/asset/cash-flows': 'cashFlow' } as const;
+const ASSET_WRITES = { '/api/asset/assets/edit': 'edit', '/api/asset/fx': 'fx', '/api/asset/withdrawals/add': 'add', '/api/asset/withdrawals/edit': 'change', '/api/asset/withdrawals/delete': 'delete', '/api/asset/cash-flows': 'cashFlow',
+  // A-3/A-4: the sync and the connections.
+  '/api/asset/sync': 'sync', '/api/asset/connections': 'connect', '/api/asset/connections/delete': 'disconnect',
+  '/api/asset/aster-accounts/add': 'asterAdd', '/api/asset/aster-accounts/edit': 'asterEdit', '/api/asset/aster-accounts/delete': 'asterDelete',
+} as const;
 /** The workbench's database and network failures (modules/asset/lib/api.ts failure at 0014655). */
 const ASSET_UNAVAILABLE = /D1_|SQLITE|decrypt|OperationError|fetch failed|network|aborted|timeout/i;
 /**
@@ -310,6 +314,12 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
           case 'change': return send(response, 200, await asset.saveWithdrawal(body, true));
           case 'delete': return send(response, 200, await asset.deleteWithdrawal(body));
           case 'cashFlow': return send(response, 200, await asset.saveCashFlow(body));
+          case 'sync': return send(response, 200, await asset.sync(body));
+          case 'connect': return send(response, 200, await asset.connect(body));
+          case 'disconnect': return send(response, 200, await asset.disconnect(body));
+          case 'asterAdd': return send(response, 200, await asset.saveAsterAccount(body, false));
+          case 'asterEdit': return send(response, 200, await asset.saveAsterAccount(body, true));
+          case 'asterDelete': return send(response, 200, await asset.deleteAsterAccount(body));
         }
       } catch (error) { throw assetWriteError(error); }
     }

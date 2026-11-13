@@ -20,7 +20,7 @@ import { editValue, type EditInput, type WithdrawalInput } from './validation.ts
 type Database = Pick<AssetDb, 'prepare'>;
 export const WITHDRAWAL_LIMIT = 2000;
 
-const saveSetting = (database: Database, key: string, value: unknown) =>
+export const saveSetting = (database: Database, key: string, value: unknown) =>
   database.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').bind(key, typeof value === 'string' ? value : JSON.stringify(value)).run();
 
 /** The daily snapshot the workbench's snapshot() stores for this ledger at `at`; the ledger's assets as readLedger returns them. */
@@ -30,7 +30,7 @@ export function dailySnapshot(ledger: Pick<Ledger, 'assets' | 'fx' | 'fxStatus' 
   const date = chinaDay(new Date(at)), updatedAt = new Date(at).toISOString();
   return { date, data: { id: 'daily-' + date, date, total, fx: ledger.fx, fxStatus: ledger.fxStatus, cny: total * ledger.fx, future: false, difference: 0, partial, missingValues, withdrawn: embeddedWithdrawals(assets), updatedAt, assets } };
 }
-function saveSnapshot(database: Database, ledger: Pick<Ledger, 'assets' | 'fx' | 'fxStatus' | 'connections'>, at: number) {
+export function saveSnapshot(database: Database, ledger: Pick<Ledger, 'assets' | 'fx' | 'fxStatus' | 'connections'>, at: number) {
   const { date, data } = dailySnapshot(ledger, at);
   database.prepare('INSERT INTO snapshots(date,data) VALUES(?,?) ON CONFLICT(date) DO UPDATE SET data=excluded.data').bind(date, JSON.stringify(data)).run();
 }

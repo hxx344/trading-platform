@@ -38,7 +38,7 @@ test('资产导入：只取指定用户，设置按白名单复制并去掉钱�
     const summary = importLedger({ from: w.from, owner: OWNER, dataDir: w.dataDir, now: () => NOW });
     assert.deepEqual([summary.owner, summary.file, summary.assets, summary.snapshots, summary.importedAt], [OWNER, 'ledger.sqlite', 6, 10, new Date(NOW).toISOString()]);
     const saved = contents(w.target);
-    assert.deepEqual(saved.tables, ['assets', 'settings', 'snapshots', 'sync_locks'], '没有 connections 表；sync_locks 是 A-2 的同步锁（单行）');
+    assert.deepEqual(saved.tables, ['assets', 'connections', 'settings', 'snapshots', 'sync_locks'], 'connections 是 A-3 的连接表（命令行导入不带连接，为空）；sync_locks 是 A-2 的同步锁（单行）');
     assert.equal(saved.assets.length, 6);
     assert.equal(saved.snapshots.length, 10, '9 个日快照与 1 条导入前记录');
     const keys = Object.keys(saved.settings).sort();

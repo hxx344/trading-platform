@@ -68,7 +68,7 @@ test('资产读取：导入后各接口按工作台口径给出账本、历史�
     assert.equal(summary.withdrawals.total, 500);
     assert.equal(ledger.ledger!.fx, 7.1);
     assert.equal(ledger.ledger!.withdrawals.length, 1);
-    assert.ok(Object.values(ledger.ledger!.connections).every(connection => connection.configured === false && !('label' in connection)), '本服务不保存凭据，连接一律显示未配置');
+    assert.ok(Object.values(ledger.ledger!.connections).every(connection => connection.configured === false && connection.label === undefined), '命令行导入不带连接，连接一律显示未配置、没有尾号');
     assert.equal(ledger.ledger!.asterAccounts.length, 1);
     assert.ok(!('walletAddress' in ledger.ledger!.asterAccounts[0]!));
 

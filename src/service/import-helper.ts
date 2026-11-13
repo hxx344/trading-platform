@@ -22,7 +22,7 @@ import { fileText, filesUnchanged, planImport, previewImport, readExisting, read
 import { VENUE_NAMES } from '../contracts.ts';
 import type { FetchLike } from '../live/http.ts';
 import { readWorkbenchOptions, resolveOptionsAccount, type OptionsSource } from './import-options.ts';
-import { readWorkbenchAsset, readWorkbenchMonitor, writeLedgerAsService, type AssetSource, type LastImport, type LedgerWrite } from './import-modules.ts';
+import { connectionLines, readWorkbenchAsset, readWorkbenchMonitor, writeLedgerAsService, type AssetSource, type LedgerWrite, type WrittenLedger } from './import-modules.ts';
 
 /** Requests handled in one start; one that arrives while the last is handled is still taken. */
 const MAX_PER_START = 5;
@@ -50,7 +50,7 @@ export interface HelperOptions {
   /** Tests: where the running workbench Greeks module is looked for (default /proc). */
   procDir?: string;
   /** Writes the asset ledger rows into asset.sqlite (tests); import-writer.ts as the data directory's owner by default. */
-  writeLedger?: (dataDir: string, write: LedgerWrite) => LastImport;
+  writeLedger?: (dataDir: string, write: LedgerWrite) => Promise<WrittenLedger> | WrittenLedger;
   now?: () => number;
   log?: (line: string) => void;
 }
@@ -274,9 +274,11 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
   let ledgerLine = '';
   if (plan.ledger) {
     try {
-      const last = (options.writeLedger ?? writeLedgerAsService)(options.dataDir, plan.ledger);
-      ledgerLine = `资产账本（用户 ${last.owner}，资产 ${last.assets} 条、快照 ${last.snapshots} 条）`;
+      const last = await (options.writeLedger ?? writeLedgerAsService)(options.dataDir, plan.ledger);
+      ledgerLine = `资产账本（用户 ${last.owner}，资产 ${last.assets} 条、快照 ${last.snapshots} 条${last.connections.imported.length ? `、连接 ${last.connections.imported.length} 个` : ''}）`;
       log(`已写入${ledgerLine}`);
+      // Names and reasons only; the page shows them with the other notes.
+      for (const line of connectionLines(last.connections)) { notes.push(line); log(line); }
     } catch (error) { answer({ phase: 'failed', message: `${message(error)}；配置未改动，本次没有导入任何内容，可重试`, ...report }); return; }
   }
   if (filesUnchanged(plan, files.existing)) {

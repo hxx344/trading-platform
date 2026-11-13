@@ -316,6 +316,40 @@
 .asset-desk .kpi-edit:hover { color: var(--primary) }
 @media (max-width: 600px) { .asset-desk .form-grid input { font-size: 16px } }
 @media (min-width: 601px) { .asset-desk .holdings .row-actions .icon-button { width: 28px; height: 28px } }
+/* A-3 交易所连接：复制自工作台 modules/asset/app/globals.css（0014655）第 108（.loading-spin，@keyframes spin 沿用 styles.css）、109、117、137、212、280（.virtual）、330–338、354、357 行，规则与先后次序不改，加 .asset-desk 前缀 */
+.asset-desk .loading-spin { animation: spin 1s linear infinite }
+.asset-desk .section-note { margin-top: 18px }
+.asset-desk .connection-row > svg { color: var(--muted-foreground) }
+.asset-desk .connections-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px }
+.asset-desk .connection-card { padding: 18px }
+.asset-desk .connection-card-title { display: flex; align-items: center; gap: 12px; margin-bottom: 14px }
+.asset-desk .connection-card-title .status { margin-left: auto }
+@media (max-width: 800px) { .asset-desk .connections-grid { grid-template-columns: 1fr } .asset-desk .connection-card { padding: 16px } }
+.asset-desk .aster-accounts-panel { grid-column: 1 / -1 }
+.asset-desk .aster-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap }
+.asset-desk .aster-heading .connection-card-title { margin-bottom: 0 }
+.asset-desk .aster-accounts-panel > .help { margin-top: 18px }
+.asset-desk .aster-account-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 310px), 1fr)); gap: 12px; margin-top: 16px }
+.asset-desk .aster-account { border: 1px solid var(--border); border-radius: 8px; padding: 14px; min-width: 0 }
+.asset-desk .aster-account h3 { font-size: 1rem; font-weight: 600; overflow-wrap: anywhere; margin: 0 }
+.asset-desk .aster-account-value { display: block; font-size: 1.375rem; margin: 10px 0 6px; font-family: var(--font-number); font-variant-numeric: tabular-nums }
+.asset-desk .aster-account-value small { font-size: .75rem; color: var(--muted-foreground); font-weight: 400; font-family: var(--font-ui) }
+.asset-desk .aster-account .error-text { margin: 10px 0; overflow-wrap: anywhere }
+.asset-desk .aster-account .form-actions { flex-wrap: wrap; justify-content: flex-start; margin-top: 16px }
+.asset-desk .connections-grid > * { min-width: 0 }
+@media (max-width: 600px) { .asset-desk .connection-card-title { flex-wrap: wrap } }
+.asset-desk .exchange-mark.virtual { background: #221a2f; color: #a78bfa }
+.asset-desk .connections-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; align-items: start }
+.asset-desk .connection-card { padding: 12px 14px }
+.asset-desk .connection-card-title { gap: 10px; margin-bottom: 8px }
+.asset-desk .connection-card-title h2 { font-size: 14px }
+.asset-desk .connection-card .help { font-size: 12px; line-height: 1.6 }
+.asset-desk .connection-card .sync-time { margin-top: 8px; color: var(--subtle-foreground) }
+.asset-desk .connection-card .form-actions { justify-content: flex-start }
+.asset-desk .aster-accounts-panel { grid-column: auto }
+.asset-desk .aster-account-list { grid-template-columns: 1fr }
+@media (max-width: 1100px) { .asset-desk .connections-grid { grid-template-columns: repeat(2, minmax(0, 1fr)) } }
+@media (max-width: 800px) { .asset-desk .connections-grid { grid-template-columns: 1fr } }
 
 /* 本服务自己的规则 */
 .asset-desk .import-command { display: block; max-width: 100%; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--secondary); color: var(--foreground); font-family: var(--font-number); font-size: 12px; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere }
@@ -350,3 +384,7 @@
 .asset-desk .cash-flows .edit-panel { margin: 8px 0; font-size: 12px }
 .asset-desk .cash-flows .edit-panel .form-grid label { font-size: 12px }
 .asset-desk .notice.saved-notice { border-color: color-mix(in srgb, var(--positive) 35%, transparent); background: color-mix(in srgb, var(--positive) 12%, transparent); color: var(--positive) }
+/* A-3：连接表单在连接视图顶部整行展开；Aster 的新增、移除面板放在账号卡片内 */
+.asset-desk .connections-grid > .connect-panel { grid-column: 1 / -1; margin-bottom: 0 }
+.asset-desk .aster-accounts-panel .edit-panel { margin: 14px 0 0; padding: 12px 0 0; border-top: 1px solid var(--border) }
+.asset-desk .aster-accounts-panel .edit-panel h3 { font-size: 14px; font-weight: 600; margin: 0 0 4px }

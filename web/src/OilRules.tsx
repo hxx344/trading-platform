@@ -41,8 +41,9 @@ const RuleFormView = memo(function RuleFormView({ initial, editing, venues, disa
       <p className="execution-help">按可成交价判断：卖出价差取 BZ 买一价与 CL 卖一价，买入价差取 BZ 卖一价与 CL 买一价。每次读到新盘口并满足条件计一次，达到连续次数记录一条信号。当前只提供观察：只记录条件信号，不下单；每腿桶数与每日最多开仓次数留给以后转实盘使用。</p>
       {!editing ? <div className="auto-rule-confirm"><label className="execution-checkbox"><input type="checkbox" checked={observe} onChange={event => setObserve(event.target.checked)} />保存后开始只观察</label></div> : null}
       {error ? <p className="execution-warning" role="alert">{error}</p> : null}
-      <div className="execution-actions"><button className="button primary" type="submit">{editing ? '保存修改' : observe ? '保存并观察' : '保存规则'}</button><button className="button secondary" type="button" onClick={onCancel}>取消</button></div>
     </fieldset>
+    {/* Cancel stays usable while reads fail, so the form can always be closed. */}
+    <div className="execution-actions"><button className="button primary" type="submit" disabled={disabled}>{editing ? '保存修改' : observe ? '保存并观察' : '保存规则'}</button><button className="button secondary" type="button" onClick={onCancel}>取消</button></div>
   </form>;
 });
 
@@ -100,9 +101,17 @@ export function OilRules({ onExpired }: { onExpired: () => void }) {
       if (error instanceof ApiError && error.status === 401) { onExpired(); return '会话已过期'; }
       // Without a definite answer the write may have been saved: re-read before anything is retried.
       const unknown = !(error instanceof ApiError) || error.status >= 500;
+      const stale = unknown || (error instanceof ApiError && error.status === 409);
       const message = `${error instanceof Error ? error.message : '操作未完成'}${unknown ? ' 结果未确认，已重新读取规则列表，请核对后再操作。' : ''}`;
-      if (!inline || unknown) setWriteError(message);
-      if (unknown || (error instanceof ApiError && error.status === 409)) { setUncertain(true); void live.refresh().finally(() => setUncertain(false)); }
+      // The open form holds the revision (or a create) it was opened with: after a conflict or an unknown result it is
+      // closed, so a retry starts from the re-read list instead of repeating the stale revision or the same create.
+      // Other 409s (too many rules, already observing) leave the form open with its input.
+      if (inline && (unknown || (error instanceof ApiError && error.code === 'stale_revision'))) {
+        setEditor(null);
+        setWriteError(`${unknown ? `${error instanceof Error ? error.message : '操作未完成'} 结果未确认` : '规则已在别处更新'}，已重新读取规则列表；表单已关闭，请核对后重新打开。`);
+      }
+      else if (!inline || unknown) setWriteError(message);
+      if (stale) { setUncertain(true); void live.refresh().finally(() => setUncertain(false)); }
       return message;
     } finally { setBusy(false); }
   }

@@ -92,6 +92,21 @@ export function parseRuleConfig(value: unknown, venues: readonly Venue[]): RuleC
   };
 }
 
+/** A complete stand-in for stored settings that no longer parse: each field kept only when it has the right type. */
+function placeholderConfig(text: string): RuleConfig {
+  let raw: Record<string, unknown> = {};
+  try { const value: unknown = JSON.parse(text); if (value && typeof value === 'object' && !Array.isArray(value)) raw = value as Record<string, unknown>; } catch { /* nothing to keep */ }
+  const text24 = (value: unknown) => typeof value === 'string' && value.length <= 24 ? value : '';
+  const whole = (value: unknown) => Number.isSafeInteger(value) ? value as number : 0;
+  return {
+    name: typeof raw.name === 'string' && raw.name.length <= 40 && !CONTROL.test(raw.name) ? raw.name : '',
+    venue: (VENUES as readonly unknown[]).includes(raw.venue) ? raw.venue as Venue : 'binance',
+    direction: raw.direction === 'long' ? 'long' : 'short',
+    openThreshold: text24(raw.openThreshold), closeThreshold: text24(raw.closeThreshold), barrels: text24(raw.barrels),
+    confirmSamples: whole(raw.confirmSamples), maxOpensPerDay: whole(raw.maxOpensPerDay),
+  };
+}
+
 export const ruleTitle = (config: RuleConfig): string => config.name || `${VENUE_NAMES[config.venue]} 原油${config.direction === 'short' ? '做空' : '做多'}价差`;
 
 /**
@@ -124,7 +139,11 @@ function openDatabase(file: string): DatabaseSync {
     if (mode !== 'wal') throw new Error(`未能进入 WAL 模式：${mode}`);
     const version = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
     if (version > RULES_SCHEMA_VERSION) throw new Error(`库版本 ${version} 比本版本能读的 ${RULES_SCHEMA_VERSION} 新`);
-    db.exec(`PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS rules (id TEXT PRIMARY KEY, revision INTEGER NOT NULL, created_at INTEGER NOT NULL, config TEXT NOT NULL, state TEXT NOT NULL); PRAGMA user_version=${RULES_SCHEMA_VERSION}`);
+    db.exec('PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS rules (id TEXT PRIMARY KEY, revision INTEGER NOT NULL, created_at INTEGER NOT NULL, config TEXT NOT NULL, state TEXT NOT NULL)');
+    // A table left by something else is refused before the version is stamped on it.
+    const columns = (db.prepare('PRAGMA table_info(rules)').all() as { name: string }[]).map(column => column.name).join(',');
+    if (columns !== 'id,revision,created_at,config,state') throw new Error(`rules 表结构不符：${columns}`);
+    db.exec(`PRAGMA user_version=${RULES_SCHEMA_VERSION}`);
   } catch (error) { db.close(); throw error; }
   return db;
 }
@@ -144,6 +163,10 @@ export interface OilRulesOptions {
  */
 export function createOilRules({ file, venues, books, now = Date.now }: OilRulesOptions) {
   const db = openDatabase(file);
+  try { return rulesOn(db, venues, books, now); } catch (error) { db.close(); throw error; }
+}
+
+function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readonly BookRow[], now: () => number) {
   const selectAll = db.prepare('SELECT id, revision, created_at AS createdAt, config, state FROM rules ORDER BY created_at, rowid');
   const selectOne = db.prepare('SELECT id, revision, created_at AS createdAt, config, state FROM rules WHERE id = ?');
   const insert = db.prepare('INSERT INTO rules (id, revision, created_at, config, state) VALUES (?, ?, ?, ?, ?)');
@@ -164,7 +187,7 @@ export function createOilRules({ file, venues, books, now = Date.now }: OilRules
     try { config = parseRuleConfig(JSON.parse(row.config), VENUES); invalid.delete(row.id); }
     catch (error) {
       invalid.set(row.id, `规则参数无法读取：${error instanceof Error ? error.message.slice(0, 120) : String(error)}；请修改或删除`);
-      try { config = JSON.parse(row.config) as RuleConfig; } catch { config = { name: '', venue: 'binance', direction: 'short', openThreshold: '0', closeThreshold: '0', barrels: '0', confirmSamples: 1, maxOpensPerDay: 1 }; }
+      config = placeholderConfig(row.config);
     }
     return { id: row.id, revision: Number(row.revision), createdAt: Number(row.createdAt), config, state: { mode: 'observe', observing: state.observing === true, events: Array.isArray(state.events) ? state.events : [], observations: Array.isArray(state.observations) ? state.observations : [] } };
   };
@@ -188,12 +211,10 @@ export function createOilRules({ file, venues, books, now = Date.now }: OilRules
 
   /** Clears the counts with a reason; the same reason in a row is recorded once. */
   function resetObservation(rule: Rule, message: string): void {
-    const previous = observed.get(rule.id);
+    // Saved before memory changes: a failed write records the reason again next round instead of dropping it.
+    if (observed.get(rule.id)?.note !== message) { observation(rule.state, `${message}；连续次数清零`); save(rule); }
     observed.set(rule.id, { note: message });
     freshAfter.set(rule.id, now());
-    if (previous?.note === message) return;
-    observation(rule.state, `${message}；连续次数清零`);
-    save(rule);
   }
   function observe(rule: Rule, current: readonly BookRow[]): void {
     if (invalid.has(rule.id)) { observed.set(rule.id, { note: invalid.get(rule.id)! }); return; }
@@ -219,15 +240,20 @@ export function createOilRules({ file, venues, books, now = Date.now }: OilRules
         recorded = true;
       }
     }
-    observed.set(rule.id, next);
     if (recorded) save(rule);
+    observed.set(rule.id, next);
   }
 
   /** Judges every observing rule on the books just read; called after each market round. */
   function tick(): void {
     const current = books(), observing = rows().filter(rule => rule.state.observing);
-    for (const rule of observing) observe(rule, current);
+    // One rule's failure (say a write) does not stop the others; the failures are thrown together for the loop's log.
+    const failed: string[] = [];
+    for (const rule of observing) {
+      try { observe(rule, current); } catch (error) { failed.push(`${ruleTitle(rule.config)}（${rule.id}）：${error instanceof Error ? error.message : String(error)}`); }
+    }
     for (const id of observed.keys()) if (!observing.some(rule => rule.id === id)) observed.delete(id);
+    if (failed.length) throw new Error(failed.join('；'));
   }
 
   function readingView(reading: Counted | undefined, time: number) {

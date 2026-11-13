@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ContractError } from '../src/contracts.ts';
+import { oilLoops, openOilRules, type OilRuntime } from '../src/service/oil.ts';
 import { createOilRules, evaluateRule, parseRuleConfig, MAX_RULES, type BookRow, type RuleConfig } from '../src/oil/rules.ts';
 
 const code = (expected: string) => (error: unknown) => error instanceof ContractError && error.code === expected;
@@ -122,7 +123,28 @@ test('观察：读取失败、盘口过期、两次读数间隔超过 10 秒都�
   r.now += 11_000; r.set(['74.10', '74.12'], ['70.00', '70.05']);
   rules.tick();
   assert.equal(first(rules.view()).observation!.note, '盘口更新间隔超过 10 秒');
+  r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']);
+  rules.tick();
+  assert.equal(first(rules.view()).observation!.open!.hits, 1, '间隔清零后下一份新盘口从 1 计');
+  // Books that stop updating: the stale reason is recorded once however many rounds see it.
+  r.now += 11_000; rules.tick(); r.now += 3_000; rules.tick();
+  assert.equal(first(rules.view()).observations.filter(item => item.message === 'BZUSDT 盘口已过期；连续次数清零').length, 1);
   assert.equal(signals(rules.view()).length, 0);
+}));
+
+test('观察：一条规则写库失败不影响同一轮的其它规则，失败汇总抛给循环记日志；写库恢复后补记信号', () => withRules(({ r, rules, file }) => {
+  rules.create({ config: settings({ name: '甲', confirmSamples: 1 }), observing: true });
+  rules.create({ config: settings({ name: '乙', confirmSamples: 1 }), observing: true });
+  const [a, b] = (rules.view() as View).rules;
+  const db = new DatabaseSync(file);
+  db.exec(`CREATE TRIGGER refuse BEFORE UPDATE ON rules WHEN NEW.id = '${a!.id}' BEGIN SELECT RAISE(ABORT, '写入被拒'); END`);
+  r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']);
+  assert.throws(() => rules.tick(), /甲.*写入被拒/);
+  const after = () => new Map((rules.view() as View).rules.map(rule => [rule.title, rule.observations.filter(item => item.kind === 'signal').length]));
+  assert.deepEqual([...after()], [['甲', 0], ['乙', 1]]);
+  db.exec('DROP TRIGGER refuse'); db.close();
+  rules.tick();
+  assert.deepEqual([...after()], [['甲', 1], ['乙', 1]], '没写进库的信号下一轮补记，已记的不重复');
 }));
 
 test('观察：重启、修改与停止都清零；修订号不一致返回 409；最多 12 条；停止后不再计数', () => withRules(({ r, rules: initial, reopen }) => {
@@ -174,10 +196,47 @@ test('库：版本比本版本新时拒绝打开；参数读不了的规则保�
     assert.throws(() => again.act(view.id, 'start', { revision: view.revision + 1 }), code('invalid_rule'));
     again.update(view.id, { revision: view.revision + 1, config: settings() });
     assert.equal(first(again.view()).problem, null);
+    // Settings that are valid JSON but not an object still show (with a complete stand-in) and can be deleted.
+    const raw = new DatabaseSync(file);
+    raw.exec(`UPDATE rules SET config = 'null'`);
+    raw.close();
+    const broken = first(again.view()) as View['rules'][number] & { config: RuleConfig };
+    assert.equal(broken.title, 'Binance 原油做空价差');
+    assert.deepEqual(broken.config, { name: '', venue: 'binance', direction: 'short', openThreshold: '', closeThreshold: '', barrels: '', confirmSamples: 0, maxOpensPerDay: 0 });
+    assert.match(broken.problem!, /^规则参数无法读取/);
+    again.act(broken.id, 'delete', { revision: broken.revision });
     again.close();
     const newer = new DatabaseSync(file);
     newer.exec('PRAGMA user_version = 2');
     newer.close();
     assert.throws(open, /库版本 2 比本版本能读的 1 新/);
+    // A rules table of another shape is refused and the version is not stamped on it.
+    const other = join(dir, 'other.sqlite'), foreign = new DatabaseSync(other);
+    foreign.exec('CREATE TABLE rules (id TEXT)');
+    foreign.close();
+    assert.throws(() => createOilRules({ file: other, venues: ['binance'], books: () => r.books, now: () => r.now }), /rules 表结构不符/);
+    const check = new DatabaseSync(other);
+    assert.equal((check.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 0);
+    check.close();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('服务接线：规则库打不开时只读出原因、写入 503；每轮读完盘口判断规则，判断失败只记日志、循环继续', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-oil-rules-'));
+  try {
+    const logs: string[] = [];
+    const oil = { config: { notionalLimits: { perJob: '1', openPer24h: '1' }, accounts: [{ venue: 'binance' }] }, market: { view: () => ({ books: [] }), refreshQuotes: async () => {}, refreshPositions: async () => {} } } as unknown as OilRuntime;
+    const stub = openOilRules(oil, join(dir, 'missing', 'deeper'), { log: line => logs.push(line) });
+    assert.deepEqual(Object.keys(stub.view() as object), ['available', 'error', 'rules']);
+    assert.equal((stub.view() as { available: boolean }).available, false);
+    assert.throws(() => stub.create({}), code('rules_unavailable'));
+    assert.throws(() => stub.act('x', 'start', {}), (error: unknown) => error instanceof ContractError && error.status === 503);
+    assert.match(logs[0]!, /原油自动规则库无法打开/);
+    let ticks = 0, rounds = 0;
+    const rules = { ...stub, tick: () => { ticks++; throw new Error('坏了'); } };
+    const context = { stopped: () => rounds >= 3, pause: async () => { rounds++; } };
+    await Promise.all(oilLoops(oil, context, line => logs.push(line), rules));
+    assert.ok(ticks >= 2, '判断失败后盘口循环继续下一轮');
+    assert.ok(logs.includes('原油自动规则判断失败：坏了'));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

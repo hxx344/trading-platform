@@ -93,3 +93,9 @@
 - 浏览器：替身 ASTER 上改一项参数并看到下一轮按新值规划；非法值与权重超限的提示；导入入口在设置页可用；手机宽度不溢出。
 
 **回滚**：`sudo bash install.sh --version v0.6.0`。主库不变；旧版本启动时会用 `config.json` 的 `transfer` 覆盖页面改过的参数，回退前把页面上的值抄回 `config.json`。安装脚本自动回退到 v0.7.0 之前的版本同样会用 `config.json` 的 `transfer` 覆盖页面改过的参数，配对保持启用；建议页面改完后同步写回 `config.json`。
+
+## 原油页样式（v0.8.1）
+
+原油页（`web/src/OilPage.tsx`）按旧工作台原油交易页（`OilTradingPage` / `TradingSpread` / `TradingExecution`）的结构排版：价差与持仓并排，下面是额度、任务和下单表单，确认前在表单上方显示预览卡片。样式从工作台复制到 `web/src/trading.css`，来源是 `src/trading.css`（提交 `a12e583`）和 `src/trading-execution.css`（提交 `1d06abd`），只保留原油页用到的规则，规则内容不改。本服务另需的样式写在 `styles.css` 末尾的原油页一节。数据读取、请求编号和确认逻辑都没改。
+
+**回滚**：`sudo bash install.sh --version v0.8.0`。只改页面，不改接口、数据库和配置。

@@ -126,6 +126,19 @@ test('页面请求号：应答前重试沿用同一编号；有应答（含拒�
   assert.notEqual(seen[3], seen[2], '成功后下一次是新请求');
 });
 
+test('页面请求号：传入 settles 时只有它认可的拒绝才换编号（原油确认：结果未知后 401/5xx/编号被占用都沿用原编号）', async () => {
+  const requests = new RequestIds();
+  const seen: string[] = [];
+  const refused = (status: number, code?: string) => Object.assign(new Error('拒绝'), { status, code });
+  const settles = (error: unknown) => { const { status, code } = error as { status?: number; code?: string }; return (status === 400 || status === 409) && code !== 'request_reused'; };
+  for (const error of [new Error('网络中断'), refused(503), refused(401), refused(409, 'request_reused'), refused(409, 'preview_invalid')]) {
+    await assert.rejects(requests.run('confirm', 'p1', async id => { seen.push(id); throw error; }, settles));
+  }
+  await requests.run('confirm', 'p1', async id => { seen.push(id); }, settles);
+  assert.equal(new Set(seen.slice(0, 5)).size, 1, '确认流程自己的拒绝之前一直沿用同一编号');
+  assert.notEqual(seen[5], seen[4], '确认流程拒绝后下一次是新请求');
+});
+
 test('页面请求层：网络错误、超时与读响应体时中断都不带状态码（结果未知）；拒绝带状态码；成功但响应体不可读仍算成功', async () => {
   const original = globalThis.fetch;
   const seen: { url: string; init: RequestInit }[] = [];

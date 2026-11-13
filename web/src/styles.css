@@ -195,17 +195,20 @@ details>summary{cursor:pointer}
 .svg-plot-tick{fill:var(--text-tertiary);font-size:11px}
 .svg-plot-tooltip{position:absolute;top:4px;z-index:2;padding:8px 10px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);background:var(--surface-3);box-shadow:var(--shadow-md);pointer-events:none}
 table.data.history{min-width:0}
-/* The oil page. */
-.oil-form{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px 12px;align-items:end}
-.oil-field{display:flex;flex-direction:column;gap:4px;min-width:0;color:var(--text-secondary);font-size:.75rem}
-.oil-field select,.oil-field input,.oil-strategy{width:100%;min-width:0;height:32px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);padding:4px 8px;color:var(--text-primary);background:var(--surface-1);font-variant-numeric:tabular-nums;box-sizing:border-box}
-.oil-hint{grid-column:1/-1}
-.oil-limits{flex-direction:row;flex-wrap:wrap;align-items:center;gap:8px 20px}
-.oil-meter{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}
-.oil-meter meter{width:120px;max-width:100%}
-.oil-preview,.oil-detail{display:flex;flex-direction:column;gap:8px;min-width:0;border-top:1px solid var(--surface-4);padding-top:10px}
-.oil-preview .table-wrap,.oil-detail .table-wrap{margin:0}
-.oil-notes,.oil-events{margin:0;padding-left:18px;color:var(--text-secondary);font-size:.75rem;line-height:1.65;overflow-wrap:anywhere}
-.oil-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.oil-strategy{width:200px;max-width:100%}
-table.data tr.selected td{background:var(--surface-3)}
+/* The oil page: what the copied workbench trading styles (trading.css) leave to the page itself. */
+.visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.oil-page>.callout{margin-bottom:12px}
+.execution-presets.oil-presets{grid-template-columns:repeat(2,minmax(0,1fr))}
+.execution-presets.oil-presets button:disabled{opacity:.55;cursor:not-allowed}
+.execution-review-settings.oil-limits{margin:0 16px;border-top:0}
+.oil-ok{color:var(--emerald);font-size:12px;line-height:1.8}
+.oil-review-message{margin-bottom:10px}
+.oil-tracking-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}
+.oil-tracking-heading h3{font-size:14px;color:var(--text-primary)}
+.oil-leg-role{font-size:11px;color:var(--execution-muted)}
+.oil-direction-name{flex-basis:100%;font-size:13px;font-weight:600;color:var(--text-primary)}
+.oil-danger{color:var(--error)}
+.execution-panel .execution-job>footer{flex-wrap:wrap}
+@media(max-width:760px){.oil-page .spread-table caption{display:block;width:auto}.execution-review-settings.oil-limits{margin-inline:18px}.execution-presets.oil-presets{grid-template-columns:minmax(0,1fr)}}
+.spread-markets.oil-spread-markets{grid-template-columns:minmax(0,1fr)}
+.oil-page .execution-leg-input .execution-market-note{max-width:440px}

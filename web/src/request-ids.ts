@@ -24,15 +24,18 @@ export class RequestIds {
   }
   /** An answer arrived (success or a refusal): the next attempt is a new request. */
   answered(key: string): void { this.saved.delete(key); }
-  /** Runs one write: an error with an HTTP status is an answer; one without (network, timeout) keeps the id for the retry. */
-  async run<T>(key: string, input: string, send: (requestId: string) => Promise<T>): Promise<T> {
+  /** Runs one write: an error with an HTTP status is an answer; one without (network, timeout) keeps the id for the retry.
+   * `settles` narrows which errors count as an answer, for a write whose earlier attempt may still be unanswered. */
+  async run<T>(key: string, input: string, send: (requestId: string) => Promise<T>, settles: (error: unknown) => boolean = hasStatus): Promise<T> {
     try {
       const result = await send(this.idFor(key, input));
       this.answered(key);
       return result;
     } catch (error) {
-      if (typeof (error as { status?: unknown } | null)?.status === 'number') this.answered(key);
+      if (settles(error)) this.answered(key);
       throw error;
     }
   }
 }
+
+const hasStatus = (error: unknown): boolean => typeof (error as { status?: unknown } | null)?.status === 'number';

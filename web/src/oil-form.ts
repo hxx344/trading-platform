@@ -60,19 +60,26 @@ export function formToIntent(form: OilForm): { intent: OilIntent } | { error: st
   if (bps !== '' && (!INTEGER.test(bps) || Number(bps) > 1000)) return { error: '价格保护须为 1–1000 的整数基点，或留空用默认值' };
   if (form.leadOrderType === 'chase' && form.venue !== 'bybit') return { error: '追价策略只有 Bybit 支持；Binance 首腿请选市价' };
   const common = { market: 'oil' as const, action: form.action, timeoutMs: Number(seconds) * 1000, ...(bps ? { maxSlippageBps: Number(bps) } : {}) };
+  const legs = draftLegs({ ...form, barrels });
+  return { intent: form.preset === 'same-exchange' ? { ...common, preset: 'same-exchange', legs } : { ...common, preset: 'cross-exchange', symbol: form.symbol, legs } };
+}
+
+/** The two legs this form describes, first leg first, whatever the fields hold; the page shows them while the form is filled. */
+export function draftLegs(form: OilForm): [OilLegIntent, OilLegIntent] {
+  const barrels = form.barrels;
   if (form.preset === 'same-exchange') {
     // Long the spread: long BZ, short CL. The first leg is whichever contract was picked to go first.
     const sideOf = (symbol: OilSymbol): OilSide => (symbol === 'BZUSDT') === (form.spread === 'long') ? 'long' : 'short';
     const hedge = other(form.leadSymbol, ['CLUSDT', 'BZUSDT'] as const);
-    return { intent: { ...common, preset: 'same-exchange', legs: [
+    return [
       { venue: form.venue, symbol: form.leadSymbol, side: sideOf(form.leadSymbol), orderType: form.leadOrderType, barrels },
       { venue: form.venue, symbol: hedge, side: sideOf(hedge), orderType: 'market', barrels },
-    ] } };
+    ];
   }
-  return { intent: { ...common, preset: 'cross-exchange', symbol: form.symbol, legs: [
+  return [
     { venue: form.venue, side: form.leadSide, orderType: form.leadOrderType, barrels },
     { venue: other(form.venue, ['binance', 'bybit'] as const), side: opposite(form.leadSide), orderType: 'market', barrels },
-  ] } };
+  ];
 }
 
 /** One line for the confirm dialog and the preview heading, e.g. "开仓 Binance 做多价差：多 BZ / 空 CL". */

@@ -102,7 +102,9 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
         if (!stored) return undefined;
         try { parseTransferConfig(stored, { strict: true }); return stored; }
         catch (error) {
-          const text = `配对 ${pair.id} 库里的划转参数不符合当前规则（${error instanceof Error ? error.message : String(error)}），已改用 config.json 的 transfer；请在设置页核对`;
+          // Sent to Feishu at startup with the other warnings, so the operator sees what the page values were replaced with.
+          const changed = TRANSFER_CONFIG_KEYS.filter(key => String(stored[key]) !== String(pair.transfer[key])).map(key => `${key} ${String(stored[key]).slice(0, 40)} → ${pair.transfer[key]}`);
+          const text = `配对 ${pair.id} 库里的划转参数不符合当前规则（${error instanceof Error ? error.message : String(error)}），已改用 config.json 的 transfer${changed.length ? `（${changed.join('、')}）` : ''}；请在设置页核对`;
           log(text); warnings.push(text);
           return undefined;
         }

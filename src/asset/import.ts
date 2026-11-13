@@ -18,7 +18,12 @@ export const IMPORTED_SETTINGS: readonly string[] = ['initialized', 'fx', 'fx-st
 const ASTER_ACCOUNT_FIELDS = ['id', 'name', 'value', 'details', 'updatedAt', 'includeSpot', 'configured', 'lastSync', 'error', 'scope'] as const;
 const STATUS_FIELDS = ['configured', 'lastSync', 'error', 'scope'] as const;
 /** Key names that only credentials or account identifiers use; any of them left after the allow-list refuses the import. */
-const CREDENTIAL_KEYS = new Set(['apikey', 'apisecret', 'secret', 'privatekey', 'passphrase', 'vrtoken', 'walletaddress', 'encrypted', 'credential', 'credentials', 'signer']);
+const CREDENTIAL_KEYS = new Set(['apikey', 'apisecret', 'apisecretkey', 'secret', 'secretkey', 'privatekey', 'passphrase', 'password', 'mnemonic', 'seedphrase', 'vrtoken', 'accesstoken', 'authtoken', 'walletaddress', 'encrypted', 'credential', 'credentials', 'signer']);
+/** A wallet address or a 64-digit hex string (a private key or a transaction hash) inside an exchange's error text. */
+const IDENTIFIER_TEXT = /\b(?:0x)?[0-9a-fA-F]{64}\b|\b0x[0-9a-fA-F]{40}\b/g;
+/** Exchange error text is free-form and can quote the account it was about; the identifier is cut out, the rest kept. */
+export const redactError = <T extends Record<string, unknown>>(value: T): T =>
+  typeof value.error === 'string' ? { ...value, error: value.error.replace(IDENTIFIER_TEXT, '（已隐去）') } : value;
 
 export interface ImportOptions { from: string; owner: string; dataDir: string; now?: () => number }
 export type ImportSummary = ImportInfo;
@@ -39,7 +44,8 @@ export function assertNoCredentials(value: unknown, where: string): void {
     if (Array.isArray(item)) { stack.push(...item); continue; }
     if (!isRecord(item)) continue;
     for (const [key, child] of Object.entries(item)) {
-      if (CREDENTIAL_KEYS.has(key.toLowerCase())) throw new Error(`${where}含有凭据或账户标识字段 ${key}，已拒绝导入`);
+      // Separators are dropped first, so api_key and vr-token read as apiKey and vrToken.
+      if (CREDENTIAL_KEYS.has(key.toLowerCase().replace(/[^a-z0-9]/g, ''))) throw new Error(`${where}含有凭据或账户标识字段 ${key}，已拒绝导入`);
       stack.push(child);
     }
   }
@@ -56,10 +62,10 @@ function cleanSetting(key: string, value: string): string {
   let cleaned: unknown = parsed;
   if (key === 'aster-accounts') {
     if (!Array.isArray(parsed) || !parsed.every(isRecord)) throw new Error('设置 aster-accounts 不是账号列表');
-    cleaned = parsed.map(account => pick(account, ASTER_ACCOUNT_FIELDS));
+    cleaned = parsed.map(account => redactError(pick(account, ASTER_ACCOUNT_FIELDS)));
   } else if (key.endsWith('-status') && key !== 'fx-status') {
     if (!isRecord(parsed)) throw new Error(`设置 ${key} 格式无效`);
-    cleaned = pick(parsed, STATUS_FIELDS);
+    cleaned = redactError(pick(parsed, STATUS_FIELDS));
   } else if (key === 'withdrawals') {
     if (!Array.isArray(parsed)) throw new Error('设置 withdrawals 不是列表');
   } else if (key === 'cash-flow-audit-v1') {

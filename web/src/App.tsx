@@ -10,6 +10,7 @@ import { StatusPage } from './StatusPage.tsx';
 import { Callout, StatePanel } from './StateViews.tsx';
 import { clock } from './labels.ts';
 import { useLiveResource } from './use-live-resource.ts';
+import { ApiError } from './api.ts';
 import type { ServiceState } from './types.ts';
 import type { OilState } from './oil-types.ts';
 import type { AssetState } from '../../src/asset/views.ts';
@@ -34,7 +35,7 @@ const TABS: Tab[] = [
 /** Shown only where /api/oil/state answers: a service without oil returns 404 there. */
 const OIL_TAB: Tab = { pages: ['oil'], href: '#/oil', text: '原油' };
 const OIL_CHECK_MS = 60_000;
-/** Shown only where /api/asset/state answers: a service without asset returns 404 there. */
+/** Hidden only where /api/asset/state answers 404 (a service without asset); a ledger that cannot be read keeps the tab, and the page says why. */
 const ASSET_TAB: Tab = { pages: ['asset'], href: '#/asset', text: '资产' };
 const ASSET_CHECK_MS = 60_000;
 
@@ -48,7 +49,7 @@ export function App() {
   const oil = useLiveResource<OilState>(OIL_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: OIL_READ_TIMEOUT_MS, onExpired });
   // The asset page reads the same path at the same pace and timeout (the shared read keeps the first subscriber's).
   const asset = useLiveResource<AssetState>(ASSET_STATE_PATH, { intervalMs: ASSET_CHECK_MS, timeoutMs: ASSET_READ_TIMEOUT_MS, onExpired });
-  const tabs = [...TABS, ...(oil.data !== null ? [OIL_TAB] : []), ...(asset.data !== null ? [ASSET_TAB] : [])];
+  const tabs = [...TABS, ...(oil.data !== null ? [OIL_TAB] : []), ...(asset.data !== null || (asset.error instanceof ApiError && asset.error.status === 500) ? [ASSET_TAB] : [])];
   // A read that succeeds again (after logging in from another tab) clears the notice.
   useEffect(() => { if (status === 'ready') setExpired(false); }, [status]);
   const changed = useCallback(() => { void refresh(); }, [refresh]);

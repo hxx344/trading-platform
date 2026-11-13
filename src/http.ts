@@ -232,7 +232,11 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       // A database that cannot be read answers with its reason rather than the generic internal error.
       const read = async <T>(run: () => Promise<T>): Promise<T> => {
         try { return await run(); }
-        catch (error) { throw new ContractError(500, 'asset_unreadable', `资产账本读取失败：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`); }
+        catch (error) {
+          // A JSON parse error quotes the text it failed on; the stored data stays out of the answer.
+          const reason = error instanceof SyntaxError ? '库里有一项数据格式无效，请重新导入' : error instanceof Error ? error.message.slice(0, 200) : String(error);
+          throw new ContractError(500, 'asset_unreadable', `资产账本读取失败：${reason}`);
+        }
       };
       if (url.pathname === '/api/asset/period') {
         const id = url.searchParams.get('id') ?? '';

@@ -39,7 +39,7 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
 
 - 以只读方式打开工作台的库，把指定用户的 `assets`、`snapshots` 和页面用到的 `settings` 复制进 `asset.sqlite`，一个事务内整体替换（三张表先清空再写入，别的用户、源库里已删掉的设置都不会残留）。复制的设置按白名单：`source-ledger`（原表数据：起始快照与原表各期次，账本、历史与日变化都以它为基准，**缺了就拒绝导入**）、`initialized`、`fx`、`fx-status`、`withdrawals`、`cash-flow-audit-v1`、`aster-accounts`、各交易所的 `-status`、`last-attempt`。凭据（`connections`）不读也不导入。
 - 账户标识不导入：`aster-accounts` 只留 `id`、`name`、`value`、`details`、`updatedAt`、`includeSpot`、`configured`、`lastSync`、`error`、`scope`（去掉钱包地址 `walletAddress` 与密钥尾号 `label`）；各交易所 `-status` 只留 `configured`、`lastSync`、`error`、`scope`（去掉 `label`）。
-- 写入前先把要导入的内容全部读出并校验：JSON 能解析、资产与快照的基本字段、`fx` 为正数、`cash-flow-audit-v1` 按工作台的审计规则校验、`source-ledger` 有起始快照；资产、快照与设置里任何一层出现凭据类字段名（`apiKey`、`apiSecret`、`secret`、`privateKey`、`passphrase`、`vrToken`、`walletAddress`、`encrypted`、`credential(s)`、`signer`，不分大小写）就拒绝导入，报错只写字段名、不带内容。任何一项不通过都不动已有的 `asset.sqlite`，命令输出“导入失败，未改动已有数据：<原因>”并以 1 退出。
+- 写入前先把要导入的内容全部读出并校验：JSON 能解析、资产与快照的基本字段、`fx` 为正数、`cash-flow-audit-v1` 按工作台的审计规则校验、`source-ledger` 有起始快照；资产、快照与设置里任何一层出现凭据类字段名（`apiKey`、`apiSecret`、`secret`、`privateKey`、`passphrase`、`vrToken`、`walletAddress`、`encrypted`、`credential(s)`、`signer`、`apiSecretKey`、`secretKey`、`password`、`mnemonic`、`seedPhrase`、`accessToken`、`authToken`，不分大小写，也不管中间的下划线与连字符）就拒绝导入，报错只写字段名、不带内容。各交易所状态与 Aster 账号的报错原文（`error`）里的钱包地址与 64 位十六进制串导入时隐去。资产行、快照、出金备注与资金流记录里的文字（包括自己填的“账户标识”）原样导入，页面显示的内容与工作台相同。任何一项不通过都不动已有的 `asset.sqlite`，命令输出“导入失败，未改动已有数据：<原因>”并以 1 退出。
 - `--data-dir` 须是绝对路径，按服务同样的规则拒绝工作台数据目录；`--from` 不能是本服务自己的 `asset.sqlite`。
 - 重复执行以最新一次为准；导入时刻、源文件名、用户与条数记在 `settings` 的 `import-info`。成功时输出资产、快照与设置的条数。
 - 服务运行中也可以执行（WAL），页面下次读取就是新数据，不用重启。
@@ -68,7 +68,7 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
 - `GET /api/asset/period?id=<期次编号>`：一份记录的资产明细（对照 `app/api/history/route.ts` 带 `id` 的读取）；编号格式不对 400，没有这份记录 404。
 - `GET /api/asset/daily-changes`：近 90 天的日变化归因（对照 `app/api/daily-changes/route.ts`）。
 - `GET /api/asset/withdrawals`、`GET /api/asset/cash-flows`：只读列表（资金流含有效记录、全部审计版本与作废记录）。
-- 还没导入时这些接口返回 200 与空数据并标明 `imported: false`，不报错。库读取出错时返回 500 `asset_unreadable` 并带原因。
+- 还没导入时这些接口返回 200 与空数据并标明 `imported: false`，不报错。库读取出错时返回 500 `asset_unreadable` 并带原因（库内数据格式无效时只说明需要重新导入，不带内容）；这时“资产”标签照常显示。审查记录见 [reviews/2026-11-13-asset-a1.md](reviews/2026-11-13-asset-a1.md)。
 
 **页面**
 

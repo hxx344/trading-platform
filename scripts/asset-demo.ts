@@ -2,7 +2,7 @@
 // it with src/asset/import.ts and serves the built page beside simulated venues, the way src/main.ts runs them.
 //   pnpm build:web; node scripts/asset-demo.ts --data-dir <absolute empty directory> [--port 4730]
 // The login link is written to <data-dir>/access-url. Nothing here touches a real ledger or exchange.
-import { mkdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { openStore } from '../src/store.ts';
@@ -21,7 +21,11 @@ if (!values['data-dir']) throw new Error('需要 --data-dir <独立目录的绝�
 const dir = assertDedicatedDataDir(values['data-dir']);
 const port = Number(values.port);
 if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('--port 无效');
+// The import below replaces asset.sqlite, so only an empty directory or one this script made is accepted.
+const DEMO_MARKER = 'asset-demo';
+if (existsSync(dir) && readdirSync(dir).length > 0 && !existsSync(join(dir, DEMO_MARKER))) throw new Error(`${dir} 不是空目录，也不是本脚本建的示例目录；请换一个空目录`);
 mkdirSync(dir, { recursive: true, mode: 0o700 });
+writeFileSync(join(dir, DEMO_MARKER), '资产页示例数据目录，可以整个删除\n');
 
 const source = join(dir, 'demo-workbench-ledger.sqlite');
 // Rewritten on every start so the dates stay around today.

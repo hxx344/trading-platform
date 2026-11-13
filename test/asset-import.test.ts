@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { ASSET_DB_FILE } from '../src/asset/db.ts';
-import { IMPORTED_SETTINGS, assertNoCredentials, importLedger } from '../src/asset/import.ts';
+import { IMPORTED_SETTINGS, assertNoCredentials, importLedger, redactError } from '../src/asset/import.ts';
 import { CIPHERTEXT, KEY_TAIL, OTHER_OWNER, OWNER, WALLET, WORKBENCH_ONLY_KEYS, writeWorkbenchLedger } from './asset-fixture.ts';
 
 const NOW = Date.parse('2026-11-10T04:00:00Z');
@@ -112,8 +112,15 @@ test('资产导入：校验失败时已有数据原样保留，报错只说字�
 
 test('资产导入：凭据字段检查覆盖嵌套对象与数组，不分大小写', () => {
   assert.doesNotThrow(() => assertNoCredentials({ assets: [{ id: 'row-1', details: [{ coin: 'USDT', account: '统一账户' }] }], positions: { scopes: [{ generation: 'abc', account: 'acc' }] } }, '快照'));
-  for (const key of ['apiKey', 'APISECRET', 'walletAddress', 'vrToken', 'passphrase', 'encrypted'])
+  for (const key of ['apiKey', 'APISECRET', 'walletAddress', 'vrToken', 'passphrase', 'encrypted', 'api_key', 'private-key', 'Secret_Key', 'vr-token', 'apiSecretKey', 'mnemonic'])
     assert.throws(() => assertNoCredentials({ a: [{ b: { [key]: 'x' } }] }, '快照 '), new RegExp(`快照 含有凭据或账户标识字段 ${key}`));
+});
+
+test('资产导入：交易所报错原文里的钱包地址与 64 位十六进制串被隐去，其余文字保留', () => {
+  const wallet = '0x' + 'aB12'.repeat(10), key = 'c3'.repeat(32);
+  assert.deepEqual(redactError({ configured: true, error: `account ${wallet} rejected, key ${key}, tx 0x${key}, code -2015` }),
+    { configured: true, error: 'account （已隐去） rejected, key （已隐去）, tx （已隐去）, code -2015' });
+  assert.deepEqual(redactError({ error: null, scope: 'spot' }), { error: null, scope: 'spot' });
 });
 
 test('资产导入命令：成功输出条数，失败说明未改动已有数据并以 1 退出', () => {

@@ -1,7 +1,7 @@
 // The service's reads of asset.sqlite. The file is opened read-only on first use and only if it exists, so a service
 // started before the first import serves "not imported" and picks the data up once import.ts has written it (WAL lets
 // the import commit while this connection stays open). Nothing here writes.
-import { existsSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { openAssetDb, type AssetDb } from './db.ts';
 import type { QueryDatabase } from './query.ts';
 import type { Asset, Connection, Ledger } from './types.ts';
@@ -92,13 +92,21 @@ export interface AssetReader {
 }
 
 export function createAssetReader(file: string, { now = Date.now }: { now?: () => number } = {}): AssetReader {
-  let handle: AssetDb | null = null;
+  let handle: AssetDb | null = null, opened = '';
+  /** Which file is at the path: a file deleted and imported again is a new one, and the open handle would keep reading the deleted one. */
+  const identity = (): string | null => {
+    try { const stat = statSync(file, { bigint: true }); return `${stat.dev}:${stat.ino}`; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
+  };
   const today = (): string => chinaDay(new Date(now()));
   /** The open file and its import record; null until an import has committed. */
   async function current(): Promise<{ database: AssetDb; info: ImportInfo } | null> {
+    const present = identity();
+    if (handle && present !== opened) { handle.close(); handle = null; }
     if (!handle) {
-      if (!existsSync(file)) return null;
+      if (present === null) return null;
       handle = openAssetDb(file, { readOnly: true });
+      opened = present;
     }
     let row: { value: string } | null;
     // An import creating the file has the tables only once it commits.

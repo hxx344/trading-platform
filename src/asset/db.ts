@@ -45,7 +45,11 @@ export function openAssetDb(file: string, { readOnly = false }: { readOnly?: boo
     replace(write) {
       connection.exec('BEGIN IMMEDIATE');
       try { write(); connection.exec('COMMIT'); }
-      catch (error) { connection.exec('ROLLBACK'); throw error; }
+      catch (error) {
+        // SQLite may have rolled back already; the first error is the one to report.
+        try { connection.exec('ROLLBACK'); } catch { /* nothing left to roll back */ }
+        throw error;
+      }
     },
     close: () => connection.close(),
   };

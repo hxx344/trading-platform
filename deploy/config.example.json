@@ -18,5 +18,25 @@
         "checkIntervalMs": 5000
       }
     }
-  ]
+  ],
+  "oil": {
+    "notionalLimits": {
+      "perJob": "200",
+      "openPer24h": "1000"
+    },
+    "accounts": [
+      {
+        "venue": "binance",
+        "accountId": "Binance UID",
+        "accountMode": "standard",
+        "credentialVersion": 1
+      },
+      {
+        "venue": "bybit",
+        "accountId": "Bybit UID",
+        "accountMode": "unified",
+        "credentialVersion": 1
+      }
+    ]
+  }
 }

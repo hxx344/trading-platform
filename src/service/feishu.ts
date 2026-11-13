@@ -25,7 +25,17 @@ export const FAULT_AFTER_MS = 60_000;
 /** While it lasts, the report is repeated this often; its end is reported once. */
 export const FAULT_REPEAT_MS = 120_000;
 
-export interface EventRow { seq: number; type: string; at: number; json: string }
+/** jobId: the event's job (two-leg job events only); older callers leave it out. */
+export interface EventRow { seq: number; type: string; at: number; json: string; jobId?: string | null }
+/** What an oil job message needs, in the shape of the executor's job view. */
+export interface JobSummary {
+  id: string;
+  preset: 'same-exchange' | 'cross-exchange';
+  action: 'open' | 'close';
+  status: string;
+  reason: string | null;
+  legs: { venue: string; symbol: string; side: 'long' | 'short'; orderSide: 'buy' | 'sell'; plannedBarrels: string; filledBarrels: string; averagePrice: string | null; previewQuote: { bid: string; ask: string } }[];
+}
 export interface PairState {
   id: string; enabled: boolean; blocked: string | null; note: string | null;
   /** The note only explains why the last check had nothing to send; the gap below decides whether that is a problem. */
@@ -68,6 +78,8 @@ export interface NotifierOptions {
   pairs(): PairState[];
   /** The pair an ADL incident belongs to, or null when it cannot be read. */
   incidentPair(id: string): string | null;
+  /** An oil job's view for its messages, or null when it cannot be read; absent where the service runs no jobs. */
+  job?(id: string): JobSummary | null;
   feishu: FeishuSecret | null;
   now?: () => number;
   fetchImpl?: (url: string, init: RequestInit) => Promise<Response>;
@@ -106,8 +118,50 @@ function configChanges(before: unknown, after: unknown): string {
   return lines.length ? lines.join('；') : '没有字段变化';
 }
 
-/** A message for the event, with a key that suppresses repeats of an ongoing problem, or null for routine events. */
-export function describeEvent(row: EventRow, incidentPair: (id: string) => string | null): { text: string; repeatKey?: string } | null {
+const VENUE_TEXT: Record<string, string> = { binance: 'Binance', bybit: 'Bybit' };
+const JOB_TITLES: Record<string, string> = { accepted: '原油任务已确认发出', completed: '原油任务完成', attention: '原油任务转人工', failed: '原油任务失败', stopped: '原油任务已停止' };
+/** Prices to at most 4 decimals, truncated: messages are read, not reconciled. */
+const price = (value: string): string => { const [whole, fraction = ''] = value.split('.'); return fraction ? `${whole}.${fraction.slice(0, 4).replace(/0+$/, '')}`.replace(/\.$/, '') : whole!; };
+const minus = (left: string, right: string): string | null => { try { return price(sub(left, right)); } catch { return null; } };
+/**
+ * One line per oil job state: venue, contracts and sides, barrels, then the fills' average prices and their spread (USDT per
+ * barrel) once filled, or the preview's executable spread when the job was confirmed. Same venue: BZ − CL; across venues:
+ * first leg's venue − second leg's venue.
+ */
+export function describeJob(summary: JobSummary | null, jobId: string, status: string, reason: string | null): string {
+  const title = JOB_TITLES[status] ?? `原油任务${status}`;
+  const tail = reason ? `：${clip(reason, 240)}` : '';
+  if (!summary || summary.legs.length !== 2) return `【${title}】任务 ${short(jobId)}（详情读取失败）${tail}`;
+  const [a, b] = summary.legs as [JobSummary['legs'][0], JobSummary['legs'][0]];
+  const sideText = (side: string) => side === 'long' ? '多' : '空';
+  const action = summary.action === 'open' ? '开仓' : '平仓';
+  const same = summary.preset === 'same-exchange';
+  const bz = same ? (a.symbol === 'BZUSDT' ? a : b) : null, cl = same ? (a.symbol === 'BZUSDT' ? b : a) : null;
+  const where = same
+    ? `${VENUE_TEXT[a.venue] ?? a.venue} 同所 ${action} ${bz!.side === 'long' ? '做多价差' : '做空价差'}（${sideText(bz!.side)} BZUSDT、${sideText(cl!.side)} CLUSDT）`
+    : `${a.symbol} 跨所 ${action}（${VENUE_TEXT[a.venue] ?? a.venue} ${sideText(a.side)}、${VENUE_TEXT[b.venue] ?? b.venue} ${sideText(b.side)}）`;
+  const spreadName = same ? 'BZ−CL' : `${VENUE_TEXT[a.venue] ?? a.venue}−${VENUE_TEXT[b.venue] ?? b.venue}`;
+  const [high, low] = same ? [bz!, cl!] : [a, b];
+  let numbers: string;
+  if (status === 'accepted') {
+    // The book side each leg trades against at the preview: a buy lifts the ask, a sell hits the bid.
+    const at = (leg: typeof a) => leg.orderSide === 'buy' ? leg.previewQuote.ask : leg.previewQuote.bid;
+    const spread = minus(at(high), at(low));
+    numbers = `每腿 ${clip(a.plannedBarrels, 24)} 桶；预览可成交价 ${high.symbol === low.symbol ? VENUE_TEXT[high.venue] : high.symbol} ${price(at(high))} / ${high.symbol === low.symbol ? VENUE_TEXT[low.venue] : low.symbol} ${price(at(low))}${spread === null ? '' : `，价差 ${spreadName} ${spread} USDT/桶`}`;
+  } else {
+    const label = (leg: typeof a) => same ? leg.symbol : VENUE_TEXT[leg.venue] ?? leg.venue;
+    const fills = [high, low].map(leg => `${label(leg)} ${clip(leg.filledBarrels, 24)} 桶${leg.averagePrice ? ` 均价 ${price(leg.averagePrice)}` : ''}`).join('、');
+    const spread = high.averagePrice && low.averagePrice ? minus(high.averagePrice, low.averagePrice) : null;
+    numbers = `计划每腿 ${clip(a.plannedBarrels, 24)} 桶；成交 ${fills}${spread === null ? '' : `；成交价差 ${spreadName} ${spread} USDT/桶`}`;
+  }
+  return `【${title}】${where}，${numbers}（任务 ${short(jobId)}）${tail}`;
+}
+
+/**
+ * A message for the event, with a key that suppresses repeats of an ongoing problem (repeatKey), or one that lets a message
+ * out only once ever (onceKey: one per job and state), or null for routine events.
+ */
+export function describeEvent(row: EventRow, incidentPair: (id: string) => string | null, job?: (id: string) => JobSummary | null): { text: string; repeatKey?: string; onceKey?: string } | null {
   let detail: Record<string, unknown>;
   try { detail = JSON.parse(row.json) as Record<string, unknown>; } catch { detail = {}; }
   const pair = typeof detail.pair === 'string' ? detail.pair : typeof detail.incident === 'string' ? incidentPair(detail.incident) ?? '?' : '?';
@@ -144,6 +198,14 @@ export function describeEvent(row: EventRow, incidentPair: (id: string) => strin
       return { text: `【ADL 减仓单结果未知】配对 ${pair} 批次 ${short(detail.batch)}，不会重发；按新现场继续核对`, repeatKey: `batch:${clip(detail.batch, 64)}` };
     case 'adl-pair-failed':
       return { text: `【ADL 读取失败】配对 ${pair}：${clip(detail.reason)}`, repeatKey: `adl-pair:${pair}:${clip(detail.reason, 80)}` };
+    case 'job-accepted':
+    case 'job-finished': {
+      if (!job || typeof row.jobId !== 'string') return null;
+      const status = row.type === 'job-accepted' ? 'accepted' : typeof detail.status === 'string' ? detail.status : '?';
+      let summary: JobSummary | null;
+      try { summary = job(row.jobId); } catch { summary = null; }
+      return { text: describeJob(summary, row.jobId, status, row.type === 'job-finished' && typeof detail.reason === 'string' ? detail.reason : null), onceKey: `job:${row.jobId}:${status}` };
+    }
     case 'adl-tick-failed':
       return { text: `【ADL 循环出错】${clip(detail.reason)}`, repeatKey: `adl-tick:${clip(detail.reason, 80)}` };
     case 'adl-push-dropped':
@@ -156,14 +218,15 @@ export function describeEvent(row: EventRow, incidentPair: (id: string) => strin
 /** Feishu custom robot signature: base64 HMAC-SHA256 keyed by "timestamp\nsecret" over an empty message. */
 export const feishuSign = (timestampSeconds: number, secret: string): string => createHmac('sha256', `${timestampSeconds}\n${secret}`).update('').digest('base64');
 
-export function createNotifier({ file, events, latestSeq, pairs, incidentPair, feishu, now = Date.now, fetchImpl = (url, init) => fetch(url, init), log = line => process.stderr.write(`${line}\n`) }: NotifierOptions) {
+export function createNotifier({ file, events, latestSeq, pairs, incidentPair, job, feishu, now = Date.now, fetchImpl = (url, init) => fetch(url, init), log = line => process.stderr.write(`${line}\n`) }: NotifierOptions) {
   const db = new DatabaseSync(file);
   db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=2000;
     CREATE TABLE IF NOT EXISTS cursor (id INTEGER PRIMARY KEY CHECK (id = 1), seq INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL, text TEXT NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL, sent_at INTEGER, last_error TEXT);
     CREATE INDEX IF NOT EXISTS outbox_due ON outbox(sent_at, next_at);
-    CREATE TABLE IF NOT EXISTS repeats (key TEXT PRIMARY KEY, at INTEGER NOT NULL);`);
+    CREATE TABLE IF NOT EXISTS repeats (key TEXT PRIMARY KEY, at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS once (key TEXT PRIMARY KEY, at INTEGER NOT NULL);`);
   // A fresh outbox starts at the current end of the log: history from before the notifier existed is not replayed.
   if (!db.prepare('SELECT 1 FROM cursor').get()) db.prepare('INSERT INTO cursor(id, seq) VALUES (1, ?)').run(latestSeq());
   const tx = <T>(operation: () => T): T => {
@@ -181,6 +244,8 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, f
     db.prepare('INSERT INTO repeats(key, at) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET at = excluded.at').run(key, at);
     return true;
   };
+  /** False when a message with this key was already queued (kept for the outbox retention period). */
+  const first = (key: string, at: number): boolean => Number(db.prepare('INSERT OR IGNORE INTO once(key, at) VALUES (?, ?)').run(key, at).changes) > 0;
   /**
    * In memory, per switched-on pair out of order: since when it waits (restarted by a confirmed transfer), when the trouble
    * first began (for the duration in the messages), and when it was last reported (null: not yet).
@@ -195,8 +260,8 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, f
       if (!rows.length) break;
       tx(() => {
         for (const row of rows) {
-          const message = describeEvent(row, incidentPair);
-          if (message && (!message.repeatKey || fresh(message.repeatKey, at))) insert(message.text, at);
+          const message = describeEvent(row, incidentPair, job);
+          if (message && (!message.repeatKey || fresh(message.repeatKey, at)) && (!message.onceKey || first(message.onceKey, at))) insert(message.text, at);
           // A transfer that went through is progress: the wait restarts, as the workbench did, so a pair balancing in
           // steps (each capped by the per-transfer limit) is not reported while it keeps moving.
           if (row.type === 'transfer-settled') {
@@ -258,6 +323,7 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, f
       const at = now();
       db.prepare('DELETE FROM outbox WHERE created_at < ?').run(at - RETENTION_MS);
       db.prepare('DELETE FROM repeats WHERE at < ?').run(at - RETENTION_MS);
+      db.prepare('DELETE FROM once WHERE at < ?').run(at - RETENTION_MS);
       const due = db.prepare('SELECT id, text, attempts FROM outbox WHERE sent_at IS NULL AND next_at <= ? ORDER BY id LIMIT ?').all(at, LINES_PER_POST) as { id: number; text: string; attempts: number }[];
       if (!due.length) return;
       const ids = due.map(row => row.id);

@@ -4,14 +4,15 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { add, bandEdge, cmp, floorToStep, isMultiple, isZero, mul, sub, units, fromUnits } from './decimal.ts';
 import {
-  ContractError, MAX_SLIPPAGE_BPS, UUID, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, exactKeys, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseInstrument, parseIntent, parseNotionalLimits, parseQuote, positionOf, reject, text,
-  type AccountBinding, type NotionalLimits, type AccountSnapshot, type Action, type Environment, type Instrument, type Intent, type LegOrderType, type OrderSide, type PositionSide, type Quote, type TransferConfig, type Venue,
+  ContractError, MAX_SLIPPAGE_BPS, UUID, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, exactKeys, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseExecutorNotionalLimits, parseInstrument, parseIntent, parseQuote, positionOf, reject, text,
+  type AccountBinding, type ExecutorNotionalLimits, type AccountSnapshot, type Action, type Environment, type Instrument, type Intent, type LegOrderType, type OrderSide, type PositionSide, type Quote, type TransferConfig, type Venue,
 } from './contracts.ts';
 import {
   STRATEGY_ID, VenueError, parseOrderReport, parseStrategyAck, parseStrategyReport, strategyRequestOf, supportsChase,
   type ChaseConnector, type ChaseRequest, type OrderReport, type OrderRequest, type StrategyIdentity, type StrategyReport, type StrategyStatus, type TransferConnector, type VenueConnector,
 } from './connector.ts';
 import type { Store } from './store.ts';
+import { nearestBarrels, quantityForBarrels } from './barrels.ts';
 import { createTransfers, type PairRecord, type TransferDeps } from './transfer.ts';
 import { DEFAULT_ADL_BUDGETS, createAdl, type Adl, type AdlBudgets } from './adl.ts';
 import type { AdlConnector } from './adl-contracts.ts';
@@ -125,6 +126,8 @@ export interface Preview {
   legs: [PlannedLeg, PlannedLeg];
   /** USDT, as counted against the notional limits; recomputed from the legs at confirm, never trusted from here. */
   notional: string;
+  /** Barrels per leg (quantity × contract size, equal on both legs). Absent in previews written before it existed. */
+  barrels?: string;
   notes: string[];
 }
 export interface Job {
@@ -226,8 +229,11 @@ export interface ExecutorOptions {
   adl?: AdlConnector;
   /** Read-only display of the pairs' ASTER positions; read by `refreshPositions`, which the entry schedules apart from the other passes. */
   positions?: AsterPositionsConnector;
-  /** Hard notional caps checked at preview and again inside the confirm transaction; required on mainnet. */
-  notionalLimits?: NotionalLimits;
+  /**
+   * Hard notional caps checked at preview and again inside the confirm transaction; required on mainnet. totalOpen counts
+   * every opening job ever accepted (the live canary); openPer24h only those confirmed within the last 24 hours (oil service).
+   */
+  notionalLimits?: ExecutorNotionalLimits;
   /** Extra checks before a transfer pair is switched on (after ownership is proven); throws a ContractError to refuse. */
   enableGuard?: TransferDeps['enableGuard'];
   /** Checks a transfer pair's new settings from the page before they are stored; throws a ContractError to refuse. */
@@ -251,14 +257,30 @@ const maxOf = (...values: string[]): string => values.reduce((top, value) => cmp
 const legNotional = (leg: Pick<PlannedLeg, 'quantity' | 'instrument' | 'priceBound' | 'quote' | 'limitPrice'>): string =>
   mul(exposure(leg.quantity, leg.instrument), maxOf(leg.priceBound ?? '0', leg.quote.ask, leg.limitPrice ?? '0'));
 /** Both legs carry the same barrels, so the job's notional is the dearer leg, not their sum. */
+/** The rolling window of openPer24h, counted from each job's confirm. */
+export const OPEN_WINDOW_MS = 24 * 3_600_000;
+/** Legs are told apart by venue across venues and by contract on one venue. */
+const legLabel = (legs: readonly Pick<PlannedLeg, 'venue' | 'symbol'>[], index: number): string => {
+  const leg = legs[index]!;
+  return legs[0]!.venue === legs[1]!.venue ? `${VENUE_NAMES[leg.venue]} ${leg.symbol}` : VENUE_NAMES[leg.venue];
+};
 const jobNotional = (legs: readonly PlannedLeg[]): string => maxOf(...legs.map(legNotional));
+/** Fill-weighted average price over a leg's orders, truncated at 18 digits; null before any fill. */
+const averageOf = (ops: readonly Pick<Operation, 'filledQuantity' | 'averagePrice'>[]): string | null => {
+  let weight = 0n, total = 0n;
+  for (const op of ops) {
+    if (op.averagePrice === null || isZero(op.filledQuantity)) continue;
+    weight += units(op.filledQuantity); total += units(op.filledQuantity) * units(op.averagePrice);
+  }
+  return weight === 0n ? null : fromUnits(total / weight);
+};
 /** `pa1-` + 24 hex + `-` + leg index, plus `r` + attempt for a resumed hedge (at most two digits). */
 const CLIENT_ORDER_ID_LENGTH = 33;
 
 export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions, transfers: transferConnector, adl: adlConnector, positions: positionsConnector, notionalLimits, enableGuard, transferConfigGuard, adlOnlyEnabledPairs = false }: ExecutorOptions) {
   // Jobs never run on a real account without hard caps; a malformed cap stops the start instead of being ignored.
   if (environment === 'mainnet' && connectors.length > 0 && !notionalLimits) throw new ContractError(500, 'notional_limits_required', '真实账户执行必须配置单笔与累计名义金额上限');
-  const limits = notionalLimits ? parseNotionalLimits(notionalLimits) : null;
+  const limits = notionalLimits ? parseExecutorNotionalLimits(notionalLimits) : null;
   // An override passed as undefined keeps the default instead of turning the budget into NaN arithmetic.
   const budgets: Budgets = { ...DEFAULT_BUDGETS, ...Object.fromEntries(Object.entries(overrides).filter(([, value]) => value !== undefined)) };
   // The client order id reserves two digits for the resume index, and the band must stay strictly inside the book.
@@ -475,20 +497,33 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   /**
    * Notional of every opening job accepted so far, priced like at its preview. A job counts from its confirm on and is never
    * given back by fills, cancels or a close; only a job that ended without any order leaving this process (every operation
-   * not-sent, or none) is left out. Jobs are never pruned, so the sum survives restarts and cap changes.
+   * not-sent, or none) is left out. Jobs are never pruned, so the sum survives restarts and cap changes. With `since` only
+   * jobs confirmed at or after it count (openPer24h); the confirm time is the job's createdAt.
    */
-  function openNotionalUsed(): string {
-    const rows = db.prepare(`SELECT json FROM jobs WHERE json_extract(json, '$.action') = 'open'
-      AND NOT (final = 1 AND NOT EXISTS (SELECT 1 FROM operations WHERE operations.job_id = jobs.id AND operations.state <> 'not-sent'))`).all() as { json: string }[];
-    return add('0', ...rows.map(row => jobNotional((JSON.parse(row.json) as Job).legs)));
+  function countedOpenJobs(since: number | null): { createdAt: number; notional: string }[] {
+    const rows = db.prepare(`SELECT created_at, json FROM jobs WHERE json_extract(json, '$.action') = 'open' AND created_at >= ?
+      AND NOT (final = 1 AND NOT EXISTS (SELECT 1 FROM operations WHERE operations.job_id = jobs.id AND operations.state <> 'not-sent'))`).all(since ?? Number.MIN_SAFE_INTEGER) as { created_at: number; json: string }[];
+    return rows.map(row => ({ createdAt: row.created_at, notional: jobNotional((JSON.parse(row.json) as Job).legs) }));
   }
+  const windowStart = (): number | null => limits?.openPer24h !== undefined ? now() - OPEN_WINDOW_MS + 1 : null;
+  const openNotionalUsed = (): string => add('0', ...countedOpenJobs(windowStart()).map(row => row.notional));
   /** Closing jobs only meet the per-job cap: the running total bounds new exposure, and closing must stay possible. */
   function checkNotional(notional: string, action: Action): void {
     if (!limits) return;
     if (cmp(notional, limits.perJob) > 0) reject('notional_job_cap', `本任务名义金额 ${notional} USDT 超过单笔上限 ${limits.perJob} USDT`, 409);
     if (action !== 'open') return;
     const used = openNotionalUsed();
-    if (cmp(add(used, notional), limits.totalOpen) > 0) reject('notional_total_cap', `累计开仓名义金额已用 ${used} USDT，加上本任务 ${notional} USDT 超过累计上限 ${limits.totalOpen} USDT`, 409);
+    if (limits.openPer24h !== undefined) {
+      if (cmp(add(used, notional), limits.openPer24h) > 0) reject('notional_24h_cap', `最近 24 小时开仓名义金额已用 ${used} USDT，加上本任务 ${notional} USDT 超过 24 小时上限 ${limits.openPer24h} USDT`, 409);
+    } else if (cmp(add(used, notional), limits.totalOpen) > 0) reject('notional_total_cap', `累计开仓名义金额已用 ${used} USDT，加上本任务 ${notional} USDT 超过累计上限 ${limits.totalOpen} USDT`, 409);
+  }
+  /** The caps with what is used; the 24-hour form also says when the oldest counted job leaves the window. */
+  function notionalView() {
+    if (!limits) return null;
+    if (limits.openPer24h === undefined) return { perJob: limits.perJob, totalOpen: limits.totalOpen, openUsed: openNotionalUsed() };
+    const counted = countedOpenJobs(windowStart());
+    const oldest = counted.reduce<number | null>((first, row) => first === null || row.createdAt < first ? row.createdAt : first, null);
+    return { perJob: limits.perJob, openPer24h: limits.openPer24h, openUsed: add('0', ...counted.map(row => row.notional)), windowMs: OPEN_WINDOW_MS, nextReleaseAt: oldest === null ? null : oldest + OPEN_WINDOW_MS };
   }
 
   async function preview(input: unknown, session: string): Promise<Preview> {
@@ -498,12 +533,20 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const accounts = intent.legs.map(leg => accountFor(leg.venue) ?? reject('account_missing', `${VENUE_NAMES[leg.venue]} 尚未绑定已核验的账户`, 409));
     for (const leg of intent.legs) if (connectorFor(leg.venue).capabilities.maxClientOrderIdLength < CLIENT_ORDER_ID_LENGTH) reject('client_order_id', `${VENUE_NAMES[leg.venue]} 客户订单号长度上限不足`, 409);
     for (const leg of intent.legs) if (leg.orderType === 'chase') chaseConnector(leg.venue);
-    for (const row of accounts) if (db.prepare('SELECT 1 FROM locks WHERE resource = ?').get(`${row.account_key}:${intent.symbol}`)) reject('symbol_locked', '所选合约已有未结束任务', 409);
+    intent.legs.forEach((leg, index) => { if (db.prepare('SELECT 1 FROM locks WHERE resource = ?').get(`${accounts[index].account_key}:${leg.symbol}`)) reject('symbol_locked', '所选合约已有未结束任务', 409); });
     const reads = await Promise.all(intent.legs.map(async (leg, index) => {
       const binding = bindingOf(accounts[index]);
-      const [instrument, quote, snapshot] = await Promise.all([readInstrument(leg.venue, intent.symbol), readQuote(leg.venue, intent.symbol), readAccount(binding, intent.symbol)]);
+      const [instrument, quote, snapshot] = await Promise.all([readInstrument(leg.venue, leg.symbol), readQuote(leg.venue, leg.symbol), readAccount(binding, leg.symbol)]);
       return { binding, instrument, quote, snapshot };
     }));
+    // Barrels become each leg's native quantity here, from the contract rules just read; a count that is not a whole number
+    // of every leg's steps is refused with the nearest counts both legs can take.
+    const quantities = intent.legs.map((leg, index) => leg.quantity ?? quantityForBarrels(leg.barrels as string, reads[index].instrument));
+    if (quantities.some(quantity => quantity === null)) {
+      const barrels = intent.legs[0].barrels as string, [low, high] = nearestBarrels(barrels, reads.map(read => read.instrument));
+      const rules = intent.legs.map((leg, index) => `${VENUE_NAMES[leg.venue]} ${leg.symbol} 每步 ${mul(reads[index].instrument.quantityStep, reads[index].instrument.contractSize)} 桶`).join('、');
+      reject('barrels_step', `${barrels} 桶换算不成整数倍的下单数量（${rules}）；最近的可用桶数为 ${low} 或 ${high}`);
+    }
     const at = now();
     for (const { quote } of reads) checkQuoteFresh(quote, at, budgets.previewQuoteMaxAgeMs, budgets.futureToleranceMs);
     if (Math.abs(reads[0].quote.receivedAt - reads[1].quote.receivedAt) > budgets.pairQuoteWindowMs) reject('quote_window', `两腿盘口接收时间相差超过 ${budgets.pairQuoteWindowMs} 毫秒，请重新预览`, 409);
@@ -514,10 +557,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       // A selling chase has only a floor: it may chase the price up for the whole job, past what the caps counted.
       if (limits && leg.orderType === 'chase' && orderSide === 'sell') reject('notional_chase_sell', '已配置名义金额上限时，卖出方向的追价首腿没有价格上限，不能使用；请改用市价或限价', 409);
       const priceBound = orderSide === 'buy' ? bandEdge(quote.ask, slippageBps, 'up', instrument.tickSize) : bandEdge(quote.bid, slippageBps, 'down', instrument.tickSize);
-      const planned = { venue: leg.venue, symbol: intent.symbol, side: leg.side, quantity: leg.quantity, orderType: leg.orderType, limitPrice: leg.limitPrice };
+      const planned = { venue: leg.venue, symbol: leg.symbol, side: leg.side, quantity: quantities[index] as string, orderType: leg.orderType, limitPrice: leg.limitPrice };
       checkQuantity(planned, instrument, quote, intent.action);
       // A marketable limit beyond the band would fill past the protection the plan promises (L100).
-      if (planned.limitPrice !== null && (orderSide === 'buy' ? cmp(planned.limitPrice, priceBound) > 0 : cmp(planned.limitPrice, priceBound) < 0)) reject('limit_beyond_bound', `${VENUE_NAMES[leg.venue]} ${intent.symbol} 限价 ${planned.limitPrice} 越过价格保护界限 ${priceBound}`, 409);
+      if (planned.limitPrice !== null && (orderSide === 'buy' ? cmp(planned.limitPrice, priceBound) > 0 : cmp(planned.limitPrice, priceBound) < 0)) reject('limit_beyond_bound', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 限价 ${planned.limitPrice} 越过价格保护界限 ${priceBound}`, 409);
       const { baseline, positionMode } = checkLegAccount(planned, snapshot, intent.action);
       const result: PlannedLeg = {
         ...planned, index: index as 0 | 1, orderSide, reduceOnly: intent.action === 'close', priceBound,
@@ -531,17 +574,20 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (a !== b) reject('unbalanced', `两腿桶数不相等：${fromUnits(a)} 与 ${fromUnits(b)}`);
     const notional = jobNotional(legs);
     checkNotional(notional, intent.action);
+    const capNote = !limits ? null : limits.openPer24h !== undefined
+      ? `名义金额按价格保护界限计 ${notional} USDT；单笔上限 ${limits.perJob} USDT，最近 24 小时开仓上限 ${limits.openPer24h} USDT（按确认时刻滚动计；平仓只受单笔上限；确认时按当时用量再核一次，超限拒绝；对冲腿市价成交可能高于此估算）。`
+      : `名义金额按价格保护界限计 ${notional} USDT；单笔上限 ${limits.perJob} USDT，累计开仓上限 ${limits.totalOpen} USDT（确认时按当时累计再核一次，超限拒绝；对冲腿市价成交可能高于此估算）。`;
     const value: Preview = {
-      id: randomUUID(), expiresAt: at + budgets.previewTtlMs, writerGeneration: generation, intent, legs, notional,
+      id: randomUUID(), expiresAt: at + budgets.previewTtlMs, writerGeneration: generation, intent, legs, notional, barrels: fromUnits(a),
       notes: [
-        `先发送 ${VENUE_NAMES[legs[0].venue]} 腿，成交确认后按其成交量发送 ${VENUE_NAMES[legs[1].venue]} 对冲腿。`,
+        `先发送 ${legLabel(legs, 0)} 腿，成交确认后按其成交量发送 ${legLabel(legs, 1)} 对冲腿。`,
         legs[0].orderType === 'market'
           ? `价格保护 ${slippageBps} 基点：首腿以 IOC 限价 ${legs[0].priceBound} 发送，未即时成交的部分由交易所撤销；发送前任一腿盘口越过界限（对冲腿界限 ${legs[1].priceBound}）即不发送。`
           : legs[0].orderType === 'chase'
             ? `首腿以 ${VENUE_NAMES[legs[0].venue]} 原生追价策略发送，${legs[0].orderSide === 'buy' ? '最高' : '最低'}追价为 ${slippageBps} 基点界限 ${legs[0].priceBound}；发送前任一腿盘口越过界限（对冲腿界限 ${legs[1].priceBound}）即不发送；截止、停止或策略被交易所暂停时停止策略，按停止后重查的实际成交对冲。追价策略不接受客户编号：交易所回报的策略编号须经查询核对身份后才会被停止；创建结果不明时不重发、不自动核对，任务转人工，需填写策略编号认领、在观察窗后确认未创建，或强制释放（策略可能已成交，由人工在交易所处理）。`
             : `首腿按限价 ${legs[0].limitPrice} 挂单；发送前任一腿盘口越过 ${slippageBps} 基点界限即不发送。`,
         '对冲腿按市价发送；首腿成交后，包括服务重启接管后，按已落盘成交量补发对冲腿，补发不设价格限制。',
-        ...(limits ? [`名义金额按价格保护界限计 ${notional} USDT；单笔上限 ${limits.perJob} USDT，累计开仓上限 ${limits.totalOpen} USDT（确认时按当时累计再核一次，超限拒绝；对冲腿市价成交可能高于此估算）。`] : []),
+        ...(capNote ? [capNote] : []),
         environment === 'mainnet' ? '实盘传输：确认后委托会发送到真实交易所账户。' : '模拟传输：不会访问任何真实交易所。',
       ],
     };
@@ -1325,7 +1371,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const gap = sub(leadExposure, hedgeExposure);
     if (isZero(gap)) { finish(job, 'completed', null); return; }
     const why = refused?.state === 'rejected' ? `对冲腿被交易所拒绝（${(refused.note ?? '').slice(0, 80)}），不再补发；` : stopRequested(job.id) ? '已请求停止，不再补发对冲腿；' : '';
-    finish(job, 'attention', `${why}两腿成交不平衡：${VENUE_NAMES[job.legs[0].venue]} ${filled(0)}，${VENUE_NAMES[job.legs[1].venue]} ${filled(1)}，未对冲 ${gap} 桶；敞口保留，需人工处理`);
+    finish(job, 'attention', `${why}两腿成交不平衡：${legLabel(job.legs, 0)} ${filled(0)}，${legLabel(job.legs, 1)} ${filled(1)}，未对冲 ${gap} 桶；敞口保留，需人工处理`);
   }
 
   // ---- retention ---------------------------------------------------------------
@@ -1506,14 +1552,16 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const job = readJob(id), ops = opsOf(id);
     const events = (db.prepare('SELECT type, at, json FROM events WHERE job_id = ? ORDER BY seq DESC LIMIT 40').all(id) as { type: string; at: number; json: string }[]).reverse().map(row => ({ type: row.type, at: row.at, ...JSON.parse(row.json) }));
     return {
-      id: job.id, action: job.action, status: job.status, reason: job.reason, stopRequested: stopRequested(id), createdAt: job.createdAt, deadlineAt: job.deadlineAt, holdNewSends: job.holdNewSends,
+      id: job.id, preset: job.legs[0].venue === job.legs[1].venue ? 'same-exchange' as const : 'cross-exchange' as const, action: job.action, status: job.status, reason: job.reason, stopRequested: stopRequested(id), createdAt: job.createdAt, deadlineAt: job.deadlineAt, holdNewSends: job.holdNewSends,
       locked: !!db.prepare('SELECT 1 FROM locks WHERE job_id = ? LIMIT 1').get(id), acknowledgedAt: job.acknowledgedAt,
       /** A strategy create without an answer waits for adoption, a confirmation of not-created or a release. */
       strategyPending: ops.some(isOrphanStrategy),
       legs: job.legs.map(leg => {
-        const mine = ops.filter(item => item.leg === leg.index).sort((a, b) => attemptOf(a) - attemptOf(b)), op = mine.at(-1);
+        const mine = ops.filter(item => item.leg === leg.index).sort((a, b) => attemptOf(a) - attemptOf(b)), op = mine.at(-1), filledQuantity = add('0', ...mine.map(item => item.filledQuantity));
         return { venue: leg.venue, symbol: leg.symbol, side: leg.side, orderSide: leg.orderSide, orderType: leg.orderType, plannedQuantity: leg.quantity, accountId: maskId(leg.accountId), priceBound: leg.priceBound ?? null,
-          attempts: mine.length, filledQuantity: add('0', ...mine.map(item => item.filledQuantity)),
+          contractSize: leg.instrument.contractSize, plannedBarrels: exposure(leg.quantity, leg.instrument), filledBarrels: exposure(filledQuantity, leg.instrument), averagePrice: averageOf(mine),
+          previewQuote: { bid: leg.quote.bid, ask: leg.quote.ask },
+          attempts: mine.length, filledQuantity,
           operation: op ? { kind: op.kind ?? 'order', clientOrderId: op.clientOrderId, state: op.state, quantity: op.request.quantity, filledQuantity: op.filledQuantity, averagePrice: op.averagePrice, remoteId: op.remoteId,
             strategyStatus: op.strategyStatus ?? null, childrenSettled: op.childrenSettled ?? null, adoptedAt: op.adoptedAt ?? null, releasedAt: op.releasedAt ?? null, ackStrategyId: op.ackStrategyId ?? null, note: op.note } : null };
       }),
@@ -1567,7 +1615,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     unfinished: () => unfinishedJobs().map(job => job.id),
     /** null when no caps are configured. */
     environment,
-    notionalLimits: () => limits ? { ...limits, openUsed: openNotionalUsed() } : null,
+    notionalLimits: notionalView,
     recentJobs: (limit = 20) => (db.prepare('SELECT id FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?').all(Math.min(Math.max(1, Math.trunc(limit)), 100)) as { id: string }[]).map(row => jobView(row.id)),
     /** Principal ids are masked: the page needs to tell accounts apart, not to see who they are. */
     accounts: () => (db.prepare('SELECT * FROM accounts WHERE environment = ? ORDER BY venue').all(environment) as unknown as AccountRow[])

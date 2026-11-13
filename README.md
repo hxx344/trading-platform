@@ -5,6 +5,8 @@
 - 保证金平衡划转：同一主账户下两个子账户之间按可用余额差额划转 USD1。
 - ADL 应急处理：发现自动减仓后，两账户合计多空偏差超过较大一侧的 0.5% 时，对多出的一侧分批下只减仓市价单，直到两边相等；偏差在 0.5% 内不减仓。
 
+第二个模块“原油双腿”（Binance/Bybit 的 BZUSDT、CLUSDT，同所或跨所两腿）正在接入，方案与进度见 [docs/oil.md](docs/oil.md)；`config.json` 里没有 `oil` 时服务仍只服务 ASTER，行为与之前相同。
+
 方案、决策与进度见 [docs/plan.md](docs/plan.md)；执行器的状态机语义、回滚与已知限制见 [docs/executor.md](docs/executor.md)。
 
 ## 开发

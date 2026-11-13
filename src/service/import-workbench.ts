@@ -15,7 +15,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parseArgs, parseEnv } from 'node:util';
 import { parseAsterCredentials, type AsterCredentials } from '../aster/client.ts';
-import { parseTransferConfig } from '../contracts.ts';
+import { parseTransferConfig, type Venue } from '../contracts.ts';
 import { parseAdlConfig } from '../adl-contracts.ts';
 import { parsePrivateJson } from '../live/setup.ts';
 import { assertDistinctSigners, parseServiceConfig, parseServiceSecrets } from './config.ts';
@@ -79,6 +79,8 @@ function feishuOf(env: WorkbenchSource['env']): Json | null {
 export function planImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; only?: readonly string[]; known?: ReadonlyMap<string, AsterCredentials>; requireMargin?: boolean }): ImportPlan {
   const config: Json = existing ? structuredClone(existing.config) : { secretsFile: options.secretsFile, pairs: [] };
   const secrets: Json = existing ? structuredClone(existing.secrets) : { accounts: {} };
+  // An oil-only config has no pairs yet; its oil block and the oil keys are carried over untouched.
+  if (existing && config.pairs === undefined && config.oil !== undefined) config.pairs = [];
   if (!Array.isArray(config.pairs)) throw new Error('现有 config.json 的 pairs 不是列表');
   if (!isRecord(secrets.accounts)) throw new Error('现有密钥文件的 accounts 不是对象');
   const pairs = config.pairs as Json[], accounts = secrets.accounts as Record<string, Json>;
@@ -97,7 +99,11 @@ export function planImport(source: WorkbenchSource, existing: { config: Json; se
   // the wallet matching use these normalised entries.
   // A caller planning many times (the page's preview, one pair at a time) passes them in, already checked.
   let known: Map<string, AsterCredentials>;
-  try { known = new Map(options.known ?? parseServiceSecrets(secrets, []).accounts); }
+  // The oil venues' keys are allowed in the key file only when config.json names oil accounts (an invalid oil block is the
+  // existing-config check's to report below).
+  let oilVenues: Venue[] = [];
+  try { oilVenues = parseServiceConfig(config).oil?.accounts.map(account => account.venue) ?? []; } catch { oilVenues = []; }
+  try { known = new Map(options.known ?? parseServiceSecrets(secrets, [], oilVenues).accounts); }
   catch (error) { throw new Error(`现有密钥文件未通过检查，先修好再导入：${error instanceof Error ? error.message : String(error)}`); }
   /** Throws when this service would not start on these files: its config checks, with the signers already in hand. */
   const fits = (candidate: Json): void => {
@@ -195,7 +201,7 @@ export function planImport(source: WorkbenchSource, existing: { config: Json; se
  */
 export function previewImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string }): { items: PreviewItem[]; notes: string[] } {
   const base = planImport(source, existing, { secretsFile: options.secretsFile, only: [], requireMargin: true });
-  const known = new Map(parseServiceSecrets(base.secrets, []).accounts);
+  const known = new Map(parseServiceSecrets(base.secrets, [], parseServiceConfig(base.config).oil?.accounts.map(account => account.venue) ?? []).accounts);
   const items = source.pairs.map((pair): PreviewItem => {
     const id = String(pair.id);
     const name = typeof pair.name === 'string' ? printable(pair.name).slice(0, 80) : null;

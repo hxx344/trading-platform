@@ -25,6 +25,8 @@ import { createNotifier, type EventRow, type Notifier } from './feishu.ts';
 import { createStreamStatus, runUserStream, type SocketLike } from './stream.ts';
 import { balanceWindow, createBalanceSamples, type BalanceSamples } from './balance-samples.ts';
 import { readImportResult, submitImportRequest } from './import-channel.ts';
+import { oilLoops, oilViews, prepareOil, registerOilAccounts, type OilRuntime } from './oil.ts';
+import { oilSummary } from './oil-config.ts';
 
 const NOTIFY_MS = 2_000;
 /** How often the stored balances are looked at for the trend chart; a pair gets at most one sample a minute. */
@@ -51,7 +53,7 @@ export interface ServiceWiring {
 }
 
 /** Builds the connectors and the executor on an open store and brings the registered pairs in line with the config. */
-export async function wireService(config: ServiceConfig, secrets: ServiceSecrets, store: ReturnType<typeof openStore>, { fetchImpl, now = Date.now, log = (line: string) => process.stderr.write(`${line}\n`), leaseWaitMs = LEASE_WAIT_MS }: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; now?: () => number; log?: (line: string) => void; leaseWaitMs?: number } = {}): Promise<ServiceWiring> {
+export async function wireService(config: ServiceConfig, secrets: ServiceSecrets, store: ReturnType<typeof openStore>, { fetchImpl, now = Date.now, log = (line: string) => process.stderr.write(`${line}\n`), leaseWaitMs = LEASE_WAIT_MS, oil }: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; now?: () => number; log?: (line: string) => void; leaseWaitMs?: number; oil?: OilRuntime } = {}): Promise<ServiceWiring> {
   assertDistinctSigners(config, secrets);
   const address = (name: string): string => secrets.accounts.get(name)!.user;
   const byAddress = new Map([...secrets.accounts.values()].map(item => [item.user, item]));
@@ -75,7 +77,8 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
   };
   // A new check interval from the page must fit the request budget, like the config's do at start.
   const transferConfigGuard = (pairId: string, next: Readonly<TransferConfig>, pairs: readonly { id: string; enabled: boolean; config: TransferConfig }[]): void => checkIntervalBudget(config, pairs, pairId, next.checkIntervalMs);
-  const executor: Executor = createExecutor({ store, connectors: [], environment: 'mainnet', now, transfers, adl: trading, positions: trading, enableGuard, transferConfigGuard, adlOnlyEnabledPairs: true });
+  // With oil, the Binance/Bybit connectors and the oil caps; without it, no order venue at all, as before.
+  const executor: Executor = createExecutor({ store, connectors: oil?.connectors ?? [], ...(oil ? { notionalLimits: oil.config.notionalLimits } : {}), environment: 'mainnet', now, transfers, adl: trading, positions: trading, enableGuard, transferConfigGuard, adlOnlyEnabledPairs: true });
   const warnings: string[] = [];
   try {
     // A crashed instance leaves its lease for up to a minute; wait it out here rather than crash-looping under systemd.
@@ -86,6 +89,7 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
       if (!waiting) { log('上一实例的写入租约尚未过期，等待中'); waiting = true; }
       await new Promise(resolve => setTimeout(resolve, 2_000));
     }
+    if (oil) registerOilAccounts(oil, executor);
     for (const pair of executor.transferPairs()) {
       if (configured.has(pair.id) || !pair.enabled) continue;
       await executor.setTransferEnabled({ pairId: pair.id, enabled: false, requestId: randomUUID() }, CONFIG_SESSION);
@@ -164,48 +168,56 @@ export interface StartOptions {
   password?: PasswordHash;
   /** The built page (loadWebApp); main reads it before the config check, so a release without it never switches in. */
   app: WebApp;
+  /** Tests stand in for Binance/Bybit (only with config.oil). */
+  oilFetch?: (url: string, init: RequestInit) => Promise<Response>;
 }
 
 /** Opens the data directory, wires the executor and runs it with the alerts and the user streams until shutdown. */
-export async function startService({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password, app }: StartOptions): Promise<ReturnType<typeof runExecutor>> {
+export async function startService({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password, app, oilFetch }: StartOptions): Promise<ReturnType<typeof runExecutor>> {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   claimDataDirEnvironment(dir, 'mainnet');
   const session = keptSession(dir);
-  const store = openStore(join(dir, DATABASE_FILES.mainnet));
+  // Oil accounts are locked and checked before the store opens: a failed check refuses start (oil.ts).
+  const oil = config.oil ? await prepareOil(config.oil, secrets.exchanges, oilFetch ? { fetchImpl: oilFetch } : {}) : undefined;
+  const releaseOil = () => oil?.locks.release();
+  let store: ReturnType<typeof openStore>;
+  try { store = openStore(join(dir, DATABASE_FILES.mainnet)); } catch (error) { releaseOil(); throw error; }
   let wiring: ServiceWiring;
-  try { wiring = await wireService(config, secrets, store, { ...(fetchImpl ? { fetchImpl } : {}), ...(leaseWaitMs === undefined ? {} : { leaseWaitMs }) }); }
-  catch (error) { store.close(); throw error; }
+  try { wiring = await wireService(config, secrets, store, { ...(fetchImpl ? { fetchImpl } : {}), ...(leaseWaitMs === undefined ? {} : { leaseWaitMs }), ...(oil ? { oil } : {}) }); }
+  catch (error) { store.close(); releaseOil(); throw error; }
   const { executor, trading, client, byAddress, streamed, writable, warnings } = wiring;
   // One process per account on this host, covering pairs left in the database as well as configured ones; the kernel
   // drops the locks on exit.
   let locks: { release(): void };
   try { locks = await holdAccountLocks(writable.map(accountId => ({ venue: 'aster', accountId }))); }
-  catch (error) { executor.close(); store.close(); throw error; }
+  catch (error) { executor.close(); store.close(); releaseOil(); throw error; }
 
   let notifier: Notifier;
   try {
     notifier = createNotifier({
       file: join(dir, 'notify.sqlite'), feishu: secrets.feishu, ...(notifyFetch ? { fetchImpl: notifyFetch } : {}),
-      events: (after, limit) => store.db.prepare('SELECT seq, type, at, json FROM events WHERE seq > ? ORDER BY seq LIMIT ?').all(after, limit) as unknown as EventRow[],
+      events: (after, limit) => store.db.prepare('SELECT seq, type, at, json, job_id AS jobId FROM events WHERE seq > ? ORDER BY seq LIMIT ?').all(after, limit) as unknown as EventRow[],
       latestSeq: () => (store.db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events').get() as { seq: number }).seq,
       pairs: () => executor.transferPairs().map(pair => ({ id: pair.id, enabled: pair.enabled, blocked: pair.blocked, note: pair.note, noteIdle: pair.noteIdle, balances: pair.balances, balancesFresh: pair.balancesFresh, threshold: pair.config.threshold })),
       incidentPair: id => { try { return executor.adlIncident(id).pairId; } catch { return null; } },
+      ...(oil ? { job: (id: string) => executor.jobView(id) } : {}),
     });
-  } catch (error) { executor.close(); store.close(); locks.release(); throw error; }
+  } catch (error) { executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
   // Only the trend chart depends on it: a file that cannot be opened is reported on the status page, the service runs on.
   let samples: BalanceSamples | null = null, samplesError: string | null = null;
   try { samples = createBalanceSamples({ file: join(dir, 'samples.sqlite') }); }
   catch (error) { samplesError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`余额采样库无法打开，走势图不可用：${samplesError}\n`); }
   const streams = createStreamStatus(streamed);
   const enabled = executor.transferPairs().filter(pair => pair.enabled).length;
+  const oilText = oil ? `；原油执行账户 ${oil.config.accounts.length} 个` : '';
   try {
-    notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个`);
+    notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}`);
     for (const text of warnings) notifier.notify(`【配置未生效】${text}`);
-  } catch (error) { samples?.close(); notifier.close(); executor.close(); store.close(); locks.release(); throw error; }
+  } catch (error) { samples?.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
 
   return runExecutor({
     executor, store, dir, port, app, session,
-    ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: ['transfers', 'adl'], drainMs: DRAIN_MS,
+    ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: oil ? ['jobs', 'transfers', 'adl'] : ['transfers', 'adl'], drainMs: DRAIN_MS,
     views: {
       status: () => ({ budget: client.requestBudget.state(), idleWeight: idleWeight(config, executor.transferPairSettings()), streams: streams.view(), feishu: notifier.status(), samples: { available: samples !== null, error: samplesError } }),
       balanceHistory: (pairId, range) => {
@@ -213,9 +225,10 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
         const window = balanceWindow(range, Date.now());
         return window && { pairId, range, ...window, points: [], unavailable: `余额采样库无法打开，走势图不可用：${samplesError ?? '未知原因'}（不影响划转与 ADL）` };
       },
+      ...(oil ? { oil: oilViews(oil, executor) } : {}),
     },
     ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir) } } : {}),
-    startedMessage: `ASTER 服务已启动（${config.pairs.length} 个配对，已启用 ${enabled} 个）`,
+    startedMessage: `ASTER 服务已启动（${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}）`,
     background: context => [
       (async () => {
         while (!context.stopped()) {
@@ -235,6 +248,7 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
         client, credentials: byAddress.get(accountId)!, accountId, stopped: context.stopped, pause: context.pause, ...(connect ? { connect } : {}),
         push: (id, event) => { streams.onMessage(id); trading.push(id, event); }, onState: (connected, reason) => streams.onState(accountId, connected, reason),
       })),
+      ...(oil ? oilLoops(oil, context, line => process.stderr.write(`${line}\n`)) : []),
     ],
     onStopping: (reason, detail) => {
       const text = reason === 'signal' ? '【服务停止】收到停止信号，正常退出' : `【服务异常停止】${detail || reason}；systemd 会在 5 秒后自动重启，请查看日志`;
@@ -247,6 +261,7 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
       notifier.close();
       samples?.close();
       locks.release();
+      releaseOil();
     },
   });
 }
@@ -271,7 +286,7 @@ async function main(): Promise<void> {
     // Read and validated offline (keys must derive their signers); nothing is sent anywhere.
     // Only noted, not refused: at boot or with Tailscale logged out the address is missing, and 127.0.0.1 still serves.
     const local = config.host === null || Object.values(networkInterfaces()).flat().some(item => item?.address === config.host);
-    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、') || '尚未导入'}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}，监听 127.0.0.1${config.host ? ` 与 ${urlHost(config.host)}` : ''}，登录密码${password ? '已设置' : '未设置'}，页面 ${app.assets.size} 个文件\n`);
+    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、') || '尚未导入'}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}，监听 127.0.0.1${config.host ? ` 与 ${urlHost(config.host)}` : ''}，登录密码${password ? '已设置' : '未设置'}，页面 ${app.assets.size} 个文件${oilSummary(config.oil)}\n`);
     if (!local) process.stdout.write(`注意：${config.host} 现在不在本机网卡上（地址写错，或 Tailscale 尚未连接）；服务会持续重试，在此之前页面只能经 127.0.0.1 打开\n`);
     return;
   }

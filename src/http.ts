@@ -52,6 +52,8 @@ export interface ServiceViews {
   status?(): Record<string, unknown>;
   /** null for an unknown range. */
   balanceHistory?(pairId: string, range: string): unknown;
+  /** The oil module's reads (books and spreads; accounts, positions, jobs, caps); absent when the service runs no oil. */
+  oil?: { market(): unknown; state(): unknown };
 }
 
 /** accessToken is exchanged once per browser at /login; session is the cookie value and the executor session id. */
@@ -212,6 +214,10 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'GET' && url.pathname === '/api/status') {
       if (!views?.status) return send(response, 404, { code: 'not_found', message: '本服务没有运行状态' });
       return send(response, 200, views.status());
+    }
+    if (request.method === 'GET' && (url.pathname === '/api/oil/market' || url.pathname === '/api/oil/state')) {
+      if (!views?.oil) return send(response, 404, { code: 'not_found', message: '本服务没有配置原油执行' });
+      return send(response, 200, url.pathname === '/api/oil/market' ? views.oil.market() : views.oil.state());
     }
     const pairRead = request.method === 'GET' ? PAIR_READ_PATH.exec(url.pathname) : null;
     if (pairRead?.[2] === 'history') {

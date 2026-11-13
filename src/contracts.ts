@@ -190,34 +190,59 @@ export type LegOrderType = OrderType | 'chase';
 export type Action = 'open' | 'close';
 export const orderSideOf = (action: Action, side: PositionSide): OrderSide => (action === 'open') === (side === 'long') ? 'buy' : 'sell';
 
-export interface LegIntent { venue: Venue; side: PositionSide; quantity: string; orderType: LegOrderType; limitPrice: string | null }
-/** maxSlippageBps: how far either book may move against the preview before the lead is sent; null uses the executor default. */
-export interface Intent { market: 'oil'; preset: 'cross-exchange'; symbol: string; action: Action; timeoutMs: number; maxSlippageBps: number | null; legs: [LegIntent, LegIntent] }
+/**
+ * One leg as asked. Exactly one of quantity (native contract quantity) and barrels is set; barrels are converted to the
+ * leg's native quantity at preview from the venue's contract size and step, so the page never has to know either.
+ */
+export interface LegIntent { venue: Venue; symbol: string; side: PositionSide; quantity: string | null; barrels: string | null; orderType: LegOrderType; limitPrice: string | null }
+/**
+ * cross-exchange: one contract (the top-level symbol), two venues, opposite sides. same-exchange: one venue, one BZUSDT and
+ * one CLUSDT leg, opposite sides; each leg names its contract and there is no top-level symbol (null here).
+ * maxSlippageBps: how far either book may move against the preview before the lead is sent; null uses the executor default.
+ */
+export const PRESETS = ['cross-exchange', 'same-exchange'] as const;
+export type Preset = typeof PRESETS[number];
+export interface Intent { market: 'oil'; preset: Preset; symbol: string | null; action: Action; timeoutMs: number; maxSlippageBps: number | null; legs: [LegIntent, LegIntent] }
 export const MAX_SLIPPAGE_BPS = 1_000;
-/** First execution slice: one oil contract, two venues, opposite sides. */
+/** Two oil legs with opposite sides: one contract on two venues, or BZ against CL on one venue. */
 export function parseIntent(value: unknown): Intent {
-  const raw = exactKeys(value, ['market', 'preset', 'symbol', 'action', 'timeoutMs', 'legs'], ['maxSlippageBps']);
+  const raw = exactKeys(value, ['market', 'preset', 'action', 'timeoutMs', 'legs'], ['symbol', 'maxSlippageBps']);
   oneOf(raw.market, ['oil'] as const, '品种');
-  oneOf(raw.preset, ['cross-exchange'] as const, '交易预设');
-  const symbol = oneOf(raw.symbol, OIL_SYMBOLS, '原油合约');
+  const preset = oneOf(raw.preset, PRESETS, '交易预设'), same = preset === 'same-exchange';
+  // The cross-exchange body keeps its required top-level symbol; a same-exchange one names its contracts on the legs.
+  if (!same && !Object.hasOwn(raw, 'symbol')) reject('missing_field', '缺少字段：symbol');
+  if (same && raw.symbol !== undefined) reject('unknown_field', '同所预设的合约写在每条腿上，不设顶层 symbol');
+  const symbol = same ? null : oneOf(raw.symbol, OIL_SYMBOLS, '原油合约');
   const action = oneOf(raw.action, ['open', 'close'] as const, '开平仓操作');
-  if (!Array.isArray(raw.legs) || raw.legs.length !== 2) reject('leg_count', '跨所双腿需要正好两条腿');
+  if (!Array.isArray(raw.legs) || raw.legs.length !== 2) reject('leg_count', same ? '同所双腿需要正好两条腿' : '跨所双腿需要正好两条腿');
   const legs = (raw.legs as unknown[]).map(item => {
-    const leg = exactKeys(item, ['venue', 'side', 'quantity', 'orderType'], ['limitPrice']);
+    const leg = exactKeys(item, same ? ['venue', 'symbol', 'side', 'orderType'] : ['venue', 'side', 'orderType'], ['quantity', 'barrels', 'limitPrice']);
     const venue = oneOf(leg.venue, VENUES, '交易所');
-    if (!VENUE_EXECUTION_SYMBOLS[venue].includes(symbol)) reject('venue_symbol', `${VENUE_NAMES[venue]} 不支持 ${symbol} 执行`);
+    const legSymbol = symbol ?? oneOf(leg.symbol, OIL_SYMBOLS, '原油合约');
+    if (!VENUE_EXECUTION_SYMBOLS[venue].includes(legSymbol)) reject('venue_symbol', `${VENUE_NAMES[venue]} 不支持 ${legSymbol} 执行`);
+    if (leg.quantity === undefined && leg.barrels === undefined) reject('missing_field', '缺少字段：quantity（或按桶数下单的 barrels）');
+    if (leg.quantity !== undefined && leg.barrels !== undefined) reject('quantity_or_barrels', '每腿数量与桶数只能填一个');
     const orderType = oneOf(leg.orderType, ['market', 'limit', 'chase'] as const, '下单方式');
     const limitPrice = leg.limitPrice === undefined || leg.limitPrice === null ? null : decimalField(leg.limitPrice, '限价');
     if ((orderType === 'limit') !== (limitPrice !== null)) reject('limit_price', orderType === 'limit' ? '限价单需要限价' : orderType === 'chase' ? '追价策略不设限价（最高追价取预览的价格保护界限）' : '市价单不设限价');
-    return { venue, side: oneOf(leg.side, ['long', 'short'] as const, '仓位方向'), quantity: decimalField(leg.quantity, '每腿数量'), orderType, limitPrice };
+    return {
+      venue, symbol: legSymbol, side: oneOf(leg.side, ['long', 'short'] as const, '仓位方向'),
+      quantity: leg.quantity === undefined ? null : decimalField(leg.quantity, '每腿数量'), barrels: leg.barrels === undefined ? null : decimalField(leg.barrels, '每腿桶数'),
+      orderType, limitPrice,
+    };
   }) as [LegIntent, LegIntent];
-  if (legs[0].venue === legs[1].venue) reject('same_venue', '跨所双腿须选择两个不同交易所');
+  if (same) {
+    if (legs[0].venue !== legs[1].venue) reject('cross_venue', '同所双腿须选择同一个交易所');
+    if (legs[0].symbol === legs[1].symbol) reject('same_symbol', '同所双腿须一腿 BZUSDT、一腿 CLUSDT');
+  } else if (legs[0].venue === legs[1].venue) reject('same_venue', '跨所双腿须选择两个不同交易所');
   if (legs[0].side === legs[1].side) reject('same_side', '双腿方向必须相反');
+  if ((legs[0].barrels === null) !== (legs[1].barrels === null)) reject('quantity_mode', '两腿须同时按数量或同时按桶数下单');
+  if (legs[0].barrels !== null && cmp(legs[0].barrels, legs[1].barrels as string) !== 0) reject('unbalanced', `两腿桶数不相等：${legs[0].barrels} 与 ${legs[1].barrels}`);
   // The hedge must go out at once for whatever the lead filled; a strategy that may rest or pause cannot do that.
   if (legs[1].orderType === 'chase') reject('chase_unsupported', '追价策略只能用于首腿，对冲腿按市价发送');
   if (legs[0].orderType === 'chase' && legs[0].venue !== 'bybit') reject('chase_unsupported', '只有 Bybit 支持原生追价策略');
   const maxSlippageBps = raw.maxSlippageBps === undefined || raw.maxSlippageBps === null ? null : integer(raw.maxSlippageBps, 1, MAX_SLIPPAGE_BPS, '价格保护基点');
-  return { market: 'oil', preset: 'cross-exchange', symbol, action, timeoutMs: integer(raw.timeoutMs, 30_000, 3_600_000, '最长执行毫秒数'), maxSlippageBps, legs };
+  return { market: 'oil', preset, symbol, action, timeoutMs: integer(raw.timeoutMs, 30_000, 3_600_000, '最长执行毫秒数'), maxSlippageBps, legs };
 }
 
 /** Confirmation body; confirmLive in the prototype authorizes only the simulated transport. */
@@ -232,14 +257,33 @@ export function parseConfirm(value: unknown): Confirm {
  * Hard notional caps in USDT for jobs on real accounts (plan 7, 3.0). perJob bounds one job; totalOpen bounds the sum over
  * every opening job this data directory has accepted. Both are fixed at startup; nothing on the page or the API changes them.
  */
-export interface NotionalLimits { perJob: string; totalOpen: string }
+export interface NotionalLimits { perJob: string; totalOpen: string; openPer24h?: undefined }
+/** The oil module's caps: openPer24h bounds the opening jobs confirmed within the last 24 hours instead of the lifetime sum. */
+export interface RollingNotionalLimits { perJob: string; openPer24h: string; totalOpen?: undefined }
+export type ExecutorNotionalLimits = NotionalLimits | RollingNotionalLimits;
 const NOTIONAL_LIMIT_CEILING = '1000000000';
+/** The live canary's caps: perJob and the lifetime totalOpen, nothing else. */
 export function parseNotionalLimits(value: unknown): NotionalLimits {
   const raw = exactKeys(value, ['perJob', 'totalOpen']);
   const limits: NotionalLimits = { perJob: decimalField(raw.perJob, '单笔名义金额上限'), totalOpen: decimalField(raw.totalOpen, '累计开仓名义金额上限') };
   if (cmp(limits.totalOpen, NOTIONAL_LIMIT_CEILING) > 0) reject('invalid_value', '累计开仓名义金额上限超出范围');
   if (cmp(limits.perJob, limits.totalOpen) > 0) reject('invalid_value', '单笔名义金额上限不得大于累计开仓名义金额上限');
   return limits;
+}
+/** The 24-hour form only: perJob and openPer24h. */
+export function parseRollingNotionalLimits(value: unknown): RollingNotionalLimits {
+  const raw = exactKeys(value, ['perJob', 'openPer24h']);
+  const limits: RollingNotionalLimits = { perJob: decimalField(raw.perJob, '单笔名义金额上限'), openPer24h: decimalField(raw.openPer24h, '24 小时开仓名义金额上限') };
+  if (cmp(limits.openPer24h, NOTIONAL_LIMIT_CEILING) > 0) reject('invalid_value', '24 小时开仓名义金额上限超出范围');
+  if (cmp(limits.perJob, limits.openPer24h) > 0) reject('invalid_value', '单笔名义金额上限不得大于 24 小时开仓名义金额上限');
+  return limits;
+}
+/** What the executor accepts: perJob with exactly one of totalOpen and openPer24h. */
+export function parseExecutorNotionalLimits(value: unknown): ExecutorNotionalLimits {
+  const raw = exactKeys(value, ['perJob'], ['totalOpen', 'openPer24h']);
+  if (raw.totalOpen !== undefined && raw.openPer24h !== undefined) reject('invalid_value', '累计开仓上限 totalOpen 与 24 小时开仓上限 openPer24h 只能设一个');
+  if (raw.totalOpen === undefined && raw.openPer24h === undefined) reject('missing_field', '缺少字段：totalOpen 或 openPer24h');
+  return raw.openPer24h === undefined ? parseNotionalLimits(raw) : parseRollingNotionalLimits(raw);
 }
 
 // ---- ASTER margin-balance transfers ---------------------------------------------

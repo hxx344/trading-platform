@@ -220,14 +220,14 @@ export function parseIntent(value: unknown): Intent {
     const venue = oneOf(leg.venue, VENUES, '交易所');
     const legSymbol = symbol ?? oneOf(leg.symbol, OIL_SYMBOLS, '原油合约');
     if (!VENUE_EXECUTION_SYMBOLS[venue].includes(legSymbol)) reject('venue_symbol', `${VENUE_NAMES[venue]} 不支持 ${legSymbol} 执行`);
-    if (leg.quantity === undefined && leg.barrels === undefined) reject('missing_field', '缺少字段：quantity（或按桶数下单的 barrels）');
-    if (leg.quantity !== undefined && leg.barrels !== undefined) reject('quantity_or_barrels', '每腿数量与桶数只能填一个');
+    if (leg.quantity == null && leg.barrels == null) reject('missing_field', '缺少字段：quantity（或按桶数下单的 barrels）');
+    if (leg.quantity != null && leg.barrels != null) reject('quantity_or_barrels', '每腿数量与桶数只能填一个');
     const orderType = oneOf(leg.orderType, ['market', 'limit', 'chase'] as const, '下单方式');
     const limitPrice = leg.limitPrice === undefined || leg.limitPrice === null ? null : decimalField(leg.limitPrice, '限价');
     if ((orderType === 'limit') !== (limitPrice !== null)) reject('limit_price', orderType === 'limit' ? '限价单需要限价' : orderType === 'chase' ? '追价策略不设限价（最高追价取预览的价格保护界限）' : '市价单不设限价');
     return {
       venue, symbol: legSymbol, side: oneOf(leg.side, ['long', 'short'] as const, '仓位方向'),
-      quantity: leg.quantity === undefined ? null : decimalField(leg.quantity, '每腿数量'), barrels: leg.barrels === undefined ? null : decimalField(leg.barrels, '每腿桶数'),
+      quantity: leg.quantity == null ? null : decimalField(leg.quantity, '每腿数量'), barrels: leg.barrels == null ? null : decimalField(leg.barrels, '每腿桶数'),
       orderType, limitPrice,
     };
   }) as [LegIntent, LegIntent];

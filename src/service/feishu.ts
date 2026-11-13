@@ -119,9 +119,13 @@ function configChanges(before: unknown, after: unknown): string {
 }
 
 const VENUE_TEXT: Record<string, string> = { binance: 'Binance', bybit: 'Bybit' };
-const JOB_TITLES: Record<string, string> = { accepted: '原油任务已确认发出', completed: '原油任务完成', attention: '原油任务转人工', failed: '原油任务失败', stopped: '原油任务已停止' };
+const JOB_TITLES: Record<string, string> = { accepted: '原油任务已确认', completed: '原油任务完成', attention: '原油任务转人工', failed: '原油任务失败', stopped: '原油任务已停止' };
 /** Prices to at most 4 decimals, truncated: messages are read, not reconciled. */
-const price = (value: string): string => { const [whole, fraction = ''] = value.split('.'); return fraction ? `${whole}.${fraction.slice(0, 4).replace(/0+$/, '')}`.replace(/\.$/, '') : whole!; };
+const price = (value: string): string => {
+  const [whole, fraction = ''] = value.split('.');
+  const shown = fraction ? `${whole}.${fraction.slice(0, 4).replace(/0+$/, '')}`.replace(/\.$/, '') : whole!;
+  return shown === '-0' ? '0' : shown;
+};
 const minus = (left: string, right: string): string | null => { try { return price(sub(left, right)); } catch { return null; } };
 /**
  * One line per oil job state: venue, contracts and sides, barrels, then the fills' average prices and their spread (USDT per

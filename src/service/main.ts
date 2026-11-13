@@ -25,7 +25,7 @@ import { createNotifier, type EventRow, type Notifier } from './feishu.ts';
 import { createStreamStatus, runUserStream, type SocketLike } from './stream.ts';
 import { balanceWindow, createBalanceSamples, type BalanceSamples } from './balance-samples.ts';
 import { readImportResult, submitImportRequest } from './import-channel.ts';
-import { oilLoops, oilViews, prepareOil, registerOilAccounts, type OilRuntime } from './oil.ts';
+import { oilLoops, oilViews, prepareOil, registerOilAccounts, strandedOilJobs, type OilRuntime } from './oil.ts';
 import { oilSummary } from './oil-config.ts';
 
 const NOTIFY_MS = 2_000;
@@ -90,6 +90,7 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
       await new Promise(resolve => setTimeout(resolve, 2_000));
     }
     if (oil) registerOilAccounts(oil, executor);
+    for (const text of strandedOilJobs(executor, oil?.config)) { log(text); warnings.push(text); }
     for (const pair of executor.transferPairs()) {
       if (configured.has(pair.id) || !pair.enabled) continue;
       await executor.setTransferEnabled({ pairId: pair.id, enabled: false, requestId: randomUUID() }, CONFIG_SESSION);

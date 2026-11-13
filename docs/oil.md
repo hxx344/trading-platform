@@ -24,6 +24,8 @@
 - 数量：页面输入每腿桶数，服务端按各腿合约乘数换算原生数量，须是该合约下单步长的整数倍，否则拒绝并给出最近的两个可用桶数；两腿桶数必须相等（现有校验保留）。
   - 意图里每腿填 `quantity`（原生数量，原写法）或 `barrels`（桶数）其一，两腿须同一种；用桶数时两腿桶数须相等（`unbalanced`）。
   - 换算在预览里读到各腿合约规则之后做：桶数 ÷（步长 × 合约乘数）须为整数，否则返回 `barrels_step`，消息给出两腿都能用的两个最近桶数（各腿“每步桶数”的最小公倍数网格上、不低于各腿最小数量，取请求值以下一个与以上一个）。任务记录仍只存原生数量，预览多一个 `barrels` 字段。
+  - 建议的两个桶数只按步长与最小数量算，不看最小名义金额与数量上限；用建议值再预览仍可能被这两条拒绝。
+  - 同所两腿步长不同时，首腿部分成交后对冲腿按自身步长取整，可能留下不超过一个对冲腿步长的两腿差额；任务按现有规则转为待处理（attention），由人工平掉差额。
 - 下单方式：首腿市价或 Bybit 原生追价（现有限制不变）；对冲腿市价。首腿是意图 `legs` 的第一项；同所预设下首腿默认 CL（流动性更好），由页面排在第一项，可换。
 - 价差口径：同所 BZ−CL 可成交价差，单位 USDT/桶：卖出价差 = BZ 买一 − CL 卖一，买入价差 = BZ 卖一 − CL 买一；跨所为同一合约两所买卖一之差。价格本身按每桶报（名义金额 = 数量 × 合约乘数 × 价格），两价直接相减；两所连接器目前都按合约乘数 1 列出原油合约。
 - 名义金额上限（`config.json` 的 `oil.notionalLimits`，页面与接口不能改）：
@@ -39,6 +41,7 @@
 - 配置 `config.json` 新增可选 `oil`：`{ notionalLimits: { perJob, openPer24h }, accounts: [{ venue, accountId, accountMode, credentialVersion }] }`，Binance、Bybit 各至多一个；没有 `oil` 时服务与现在完全相同（不建连接器、不开任务循环、页面不显示原油页）。`pairs` 与 `oil` 可以只有其一。
 - 密钥 `secrets.json` 新增可选 `binance`、`bybit`：`{ apiKey, apiSecret }`；同样 600、64 KiB 上限、报错不回显内容。
 - 启动：配置了 `oil` 时按账户取进程锁（与金丝雀同名 `pa-executor-live/<交易所>/<账户>`，二者不能同时操作同一账户），逐个账户 `preflightLive`（30 s 上限），失败拒绝启动（安装时自动回退旧版本）；`registerAccount`；`passes` 加 `jobs`。
+- 库里有未结束的原油任务、但它的交易所（或整个 `oil`）已不在配置里时，启动照常，日志与飞书【配置未生效】逐条提示该任务不会被推进或核对。
 - 行情：服务端每 3 s 读一次已配置交易所的 BZ、CL 盘口（单次 3 s 超时、失败保留上次结果并标注时刻，不重试），只供页面显示；预览与执行照旧自己读盘口。
 - 新增接口（须登录，未配置 `oil` 时 404）：`GET /api/oil/market`（`books` 各所各合约买一卖一与读取/失败时刻，`sameExchange` 各所 `sell`/`buy` 价差，`crossExchange` 各合约 `binanceOverBybit`/`bybitOverBinance`）；`GET /api/oil/state`（`accounts`、`positions`（每 15 s 读一次各账户 BZ/CL 多空持仓与挂单数，单次 10 s 超时、不重试，失败保留上次结果）、`jobs`（最近 20 个，含 `preset` 与每腿计划/成交桶数、成交均价、预览盘口）、`notionalLimits`（`perJob`、`openPer24h`、`openUsed`、`windowMs`、`nextReleaseAt`））；预览、确认、任务操作沿用现有 `/api/preview`、`/api/confirm`、`/api/jobs/<编号>/…`。
 - 飞书：任务确认发出、完成、转人工（不平衡/结果未知）、失败、停止各一条，带交易所、合约、方向、桶数、成交均价与价差；同一任务同一状态只发一次。沿用事件表 → 发件箱：`job-accepted` / `job-finished` 事件转成消息，`notify.sqlite` 新表 `once` 按“任务 + 状态”去重（随发件箱保留期清理）；确认时给预览可成交价差，结束时给成交均价差。

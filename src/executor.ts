@@ -545,7 +545,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (quantities.some(quantity => quantity === null)) {
       const barrels = intent.legs[0].barrels as string, [low, high] = nearestBarrels(barrels, reads.map(read => read.instrument));
       const rules = intent.legs.map((leg, index) => `${VENUE_NAMES[leg.venue]} ${leg.symbol} 每步 ${mul(reads[index].instrument.quantityStep, reads[index].instrument.contractSize)} 桶`).join('、');
-      reject('barrels_step', `${barrels} 桶换算不成整数倍的下单数量（${rules}）；最近的可用桶数为 ${low} 或 ${high}`);
+      reject('barrels_step', `${barrels} 桶换算不成整数倍的下单数量（${rules}）；按步长最近的桶数为 ${low} 或 ${high}（仍须满足最小名义金额与数量上限）`);
     }
     const at = now();
     for (const { quote } of reads) checkQuoteFresh(quote, at, budgets.previewQuoteMaxAgeMs, budgets.futureToleranceMs);

@@ -11,13 +11,14 @@ import { createExecutor, OPEN_WINDOW_MS } from '../src/executor.ts';
 import { SIM_ACCOUNTS } from '../src/simulation.ts';
 import { nearestBarrels, quantityForBarrels } from '../src/barrels.ts';
 import { parseServiceConfig, parseServiceSecrets } from '../src/service/config.ts';
-import { oilSummary } from '../src/service/oil-config.ts';
+import { oilSummary, type OilConfig } from '../src/service/oil-config.ts';
+import { strandedOilJobs } from '../src/service/oil.ts';
 import { createNotifier, describeJob } from '../src/service/feishu.ts';
 import { SESSION, bindAccounts, createHarness, openIntent, previewAndConfirm, settle, type Harness } from './harness.ts';
 import { FakeBinance, KEY, SECRET, symbolInfo } from './live-fake-binance.ts';
 
 const code = (expected: string) => (error: unknown) => error instanceof ContractError && error.code === expected;
-const leg = (venue: string, symbol: string, side: 'long' | 'short', amount: { quantity?: string; barrels?: string }) => ({ venue, symbol, side, orderType: 'market', ...amount });
+const leg = (venue: string, symbol: string, side: 'long' | 'short', amount: { quantity?: string | null; barrels?: string | null }) => ({ venue, symbol, side, orderType: 'market', ...amount });
 /** Short the spread on one venue: sell BZ, buy CL. */
 const sameIntent = ({ venue = 'binance', barrels = '1', action = 'open' }: { venue?: string; barrels?: string; action?: 'open' | 'close' } = {}) => ({
   market: 'oil', preset: 'same-exchange', action, timeoutMs: 60_000,
@@ -44,6 +45,10 @@ test('意图：同所双腿须同一交易所、一腿 BZ 一腿 CL、方向相�
   assert.throws(() => parseIntent({ ...base, legs: [leg('binance', 'BZUSDT', 'short', { quantity: '1' }), base.legs[1]] }), code('quantity_mode'));
   assert.throws(() => parseIntent({ ...base, legs: [base.legs[0], leg('binance', 'CLUSDT', 'long', { barrels: '2' })] }), code('unbalanced'));
   assert.throws(() => parseIntent({ ...base, legs: [{ venue: 'binance', side: 'short', orderType: 'market', barrels: '1' }, base.legs[1]] }), code('missing_field'));
+  // null is the same as leaving the field out, so a form that sends both keys still parses.
+  const nulls = parseIntent({ ...base, legs: [leg('binance', 'BZUSDT', 'short', { barrels: '1', quantity: null }), leg('binance', 'CLUSDT', 'long', { barrels: '1', quantity: null })] });
+  assert.deepEqual(nulls.legs.map(item => [item.quantity, item.barrels]), [[null, '1'], [null, '1']]);
+  assert.throws(() => parseIntent({ ...base, legs: [leg('binance', 'BZUSDT', 'short', { barrels: null, quantity: null }), base.legs[1]] }), code('missing_field'));
   // Cross-exchange keeps one top-level symbol and legs without one.
   const { symbol: _symbol, ...noSymbol } = openIntent();
   assert.throws(() => parseIntent(noSymbol), code('missing_field'));
@@ -62,7 +67,7 @@ test('桶数换算：按合约乘数与步长换成下单数量；换不成整�
     bindAccounts(h.ex);
     // Binance steps 0.01, Bybit 0.1: across venues 0.15 barrels fits Binance only.
     const barrelsCross = (barrels: string) => ({ ...openIntent(), legs: openIntent().legs.map(({ quantity: _quantity, ...rest }) => ({ ...rest, barrels })) });
-    await assert.rejects(h.ex.preview(barrelsCross('0.15'), SESSION), (error: unknown) => code('barrels_step')(error) && /0\.15 桶.*最近的可用桶数为 0\.1 或 0\.2/.test((error as Error).message));
+    await assert.rejects(h.ex.preview(barrelsCross('0.15'), SESSION), (error: unknown) => code('barrels_step')(error) && /0\.15 桶.*按步长最近的桶数为 0\.1 或 0\.2/.test((error as Error).message));
     const preview = await h.ex.preview(barrelsCross('2'), SESSION);
     assert.deepEqual(preview.legs.map(item => [item.venue, item.symbol, item.quantity]), [['binance', 'CLUSDT', '2'], ['bybit', 'CLUSDT', '2']]);
     assert.equal(preview.barrels, '2');
@@ -161,7 +166,7 @@ test('飞书：原油任务的确认、完成各发一次，同一任务同一�
     notifier.poll();
     const sent = texts();
     assert.equal(sent.length, 2, sent.join('\n'));
-    assert.match(sent[0]!, /【原油任务已确认发出】Binance 同所 开仓 做空价差（空 BZUSDT、多 CLUSDT），每腿 2 桶；预览可成交价 BZUSDT 74\.1 \/ CLUSDT 70\.02，价差 BZ−CL 4\.08 USDT\/桶/);
+    assert.match(sent[0]!, /【原油任务已确认】Binance 同所 开仓 做空价差（空 BZUSDT、多 CLUSDT），每腿 2 桶；预览可成交价 BZUSDT 74\.1 \/ CLUSDT 70\.02，价差 BZ−CL 4\.08 USDT\/桶/);
     assert.match(sent[1]!, /【原油任务完成】Binance 同所 开仓 做空价差.*成交 BZUSDT 2 桶 均价 [\d.]+、CLUSDT 2 桶 均价 [\d.]+；成交价差 BZ−CL [\d.-]+ USDT\/桶/);
     // Without the job reader (the service with no oil) these events say nothing.
     assert.equal(describeJob(null, 'abcdef123456', 'failed', '对冲腿未成交').includes('详情读取失败'), true);
@@ -261,4 +266,18 @@ test('导入工作台：已有只含 oil 的配置时追加 ASTER 配对，oil �
   assert.deepEqual(previewImport({ pairs: [], accounts: [], env: {} }, existing, { secretsFile: '/x/secrets.json' }).items, []);
   // Exchange keys without oil accounts in config.json stay refused, as before.
   assert.throws(() => planImport({ pairs: [], accounts: [], env: {} }, { config: { secretsFile: '/x/secrets.json', pairs: [] }, secrets: existing.secrets }, { secretsFile: '/x/secrets.json' }), /现有密钥文件未通过检查/);
+});
+
+test('启动提示：未结束的原油任务所在交易所不在配置里（或整个 oil 已删）时逐条告警，配置齐全时不提示', () => {
+  const jobs: Record<string, string[]> = { 'job-same': ['binance', 'binance'], 'job-cross': ['binance', 'bybit'] };
+  const executor = { unfinished: () => Object.keys(jobs), jobView: (id: string) => ({ legs: jobs[id]!.map(venue => ({ venue })) }) } as unknown as Parameters<typeof strandedOilJobs>[0];
+  const account = (venue: string) => ({ venue, accountId: '1', accountMode: 'standard', credentialVersion: 1 });
+  const config = (venues: string[]) => ({ notionalLimits: { perJob: '1', openPer24h: '1' }, accounts: venues.map(account) }) as unknown as OilConfig;
+  assert.deepEqual(strandedOilJobs(executor, config(['binance', 'bybit'])), []);
+  const onlyBinance = strandedOilJobs(executor, config(['binance']));
+  assert.equal(onlyBinance.length, 1);
+  assert.match(onlyBinance[0]!, /原油任务 job-cross 尚未结束，但配置里没有 Bybit 执行账户/);
+  const none = strandedOilJobs(executor, undefined);
+  assert.equal(none.length, 2);
+  assert.ok(none.every(line => /配置里已没有 oil/.test(line)), none.join('\n'));
 });

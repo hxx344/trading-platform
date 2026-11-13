@@ -2,7 +2,7 @@
 // that block is there; the service without it runs exactly as before. Before anything is opened the accounts are locked
 // on this host and every account passes its venue's key and identity check, so a bad key or a second process refuses start.
 import type { VenueConnector } from '../connector.ts';
-import type { Venue } from '../contracts.ts';
+import { VENUE_NAMES, type Venue } from '../contracts.ts';
 import type { Executor } from '../executor.ts';
 import { createLiveConnectors, holdAccountLocks, preflightLive } from '../live/setup.ts';
 import type { FetchLike } from '../live/http.ts';
@@ -42,6 +42,20 @@ export function registerOilAccounts(oil: OilRuntime, executor: Executor): void {
 }
 
 /** The page's two oil reads: the books and spreads, and the accounts, venue positions, jobs and cap use. */
+/**
+ * Oil jobs still open while oil, or one of their venues, is no longer configured: no loop drives or reconciles them and the
+ * page cannot show them, so the operator hears it (log and Feishu) at every start until oil is configured again.
+ */
+export function strandedOilJobs(executor: Pick<Executor, 'unfinished' | 'jobView'>, config: OilConfig | undefined): string[] {
+  const configured = new Set<Venue>(config?.accounts.map(account => account.venue) ?? []);
+  return executor.unfinished().flatMap(id => {
+    const missing = [...new Set(executor.jobView(id).legs.map(leg => leg.venue))].filter(venue => !configured.has(venue));
+    if (!missing.length) return [];
+    const where = config ? `没有 ${missing.map(venue => VENUE_NAMES[venue]).join('、')} 执行账户` : '已没有 oil';
+    return [`原油任务 ${id} 尚未结束，但配置里${where}：本服务不再推进或核对它，交易所上可能仍有敞口；请把配置加回后重启，处理完再删除`];
+  });
+}
+
 export function oilViews(oil: OilRuntime, executor: Executor) {
   return {
     market: () => oil.market.view(),

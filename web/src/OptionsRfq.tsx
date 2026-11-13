@@ -26,6 +26,7 @@ const errorText = (error: unknown): string => error instanceof Error ? error.mes
 const signed = (value: number | null, digits = 4): string => value === null ? '--' : `${value >= 0 ? '+' : ''}${value.toFixed(digits)}`;
 const diffClass = (value: number | null): string => value === null ? '' : value >= 0 ? 'rfq-diff-positive' : 'rfq-diff-negative';
 const sideText = (side: 'Buy' | 'Sell'): string => side === 'Sell' ? '卖出' : '买入';
+const rfqKey = (rfq: { linkId: string; status: string }): string => `${rfq.linkId}|${rfq.status}`;
 const SENT_TEXT: Partial<Record<RfqStatus, string>> = { Filled: '已成交', PendingFill: '等待成交', ExecutionUnknown: '执行结果待核对' };
 
 interface Selected { rfqId: string; quote: RfqQuote; fingerprint: string }
@@ -105,7 +106,12 @@ export function RfqPane({ strategy, quantity, onExpired, onChanged }: { strategy
   const [selected, setSelected] = useState<Selected | null>(null);
   const [changed, setChanged] = useState(false);
   const [dialogError, setDialogError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
+  // A notice describes one RFQ state (an answer's, or the one shown when it was set); a later state replaces it.
+  const statusKey = rfq ? rfqKey(rfq) : '';
+  const shownKey = useRef(statusKey);
+  shownKey.current = statusKey;
+  const [notice, setNoticeState] = useState<{ tone: 'info' | 'error'; text: string; key: string } | null>(null);
+  const setNotice = (next: { tone: 'info' | 'error'; text: string; key?: string } | null) => setNoticeState(next && { ...next, key: next.key ?? shownKey.current });
 
   // Keep the open confirmation on the quote as the server now shows it; a sent or vanished quote closes it.
   useEffect(() => {
@@ -123,10 +129,8 @@ export function RfqPane({ strategy, quantity, onExpired, onChanged }: { strategy
     if (fingerprint !== selected.fingerprint) { setSelected({ rfqId: selected.rfqId, quote: current, fingerprint }); setChanged(true); }
     else if (current !== selected.quote) setSelected({ ...selected, quote: current });
   }, [view, selected, sending]);
-  // A status change replaces the last action's notice: the panel then says what happened.
-  const statusKey = rfq ? `${rfq.linkId}|${rfq.status}` : '';
-  const lastKey = useRef(statusKey);
-  useEffect(() => { if (lastKey.current !== statusKey) { lastKey.current = statusKey; setNotice(null); } }, [statusKey]);
+  // A status other than the one the notice describes replaces it: the panel then says what happened.
+  useEffect(() => { setNoticeState(current => current && current.key !== statusKey ? null : current); }, [statusKey]);
 
   const createProblem = rfqCreateProblem(view, quantity) ?? (creating ? '提交中' : null);
   const open = rfqOpen(rfq);
@@ -138,9 +142,10 @@ export function RfqPane({ strategy, quantity, onExpired, onChanged }: { strategy
     try {
       // The RFQ shown now is part of the input: after it is gone, the same choice is a new request, not a replay of the old one.
       const accepted = await ids.current.run('rfq-create', `${quantity}|${strategy}|${rfq?.linkId ?? ''}`, requestId => api<RfqAccepted>(RFQ_PATH, { body: { ...rfqCreateBody(quantity, strategy), requestId }, timeoutMs: WRITE_TIMEOUT_MS }), startRefused);
-      setNotice(accepted.status === 'Active' ? { tone: 'info', text: '询价已发出，等待做市商报价。' }
-        : accepted.status === 'CreationUnknown' ? { tone: 'error', text: accepted.error ?? '询价创建结果待核对，状态以本页为准。' }
-        : { tone: 'error', text: `询价未生效（${accepted.status}）${accepted.error ? `：${accepted.error}` : ''}` });
+      const key = rfqKey(accepted);
+      setNotice(accepted.status === 'Active' ? { tone: 'info', text: '询价已发出，等待做市商报价。', key }
+        : accepted.status === 'CreationUnknown' ? { tone: 'error', text: accepted.error ?? '询价创建结果待核对，状态以本页为准。', key }
+        : { tone: 'error', text: `询价未生效（${accepted.status}）${accepted.error ? `：${accepted.error}` : ''}`, key });
     } catch (error) {
       setNotice({ tone: 'error', text: startRefused(error) ? `服务拒绝：${errorText(error)}` : `${UNKNOWN_CREATE}（${errorText(error)}）` });
       if (error instanceof ApiError && error.status === 401) onExpired();
@@ -151,7 +156,7 @@ export function RfqPane({ strategy, quantity, onExpired, onChanged }: { strategy
     setCanceling(true); setNotice(null);
     try {
       const answer = await api<RfqAccepted>(`${RFQ_PATH}/cancel`, { body: { rfqId: rfq.rfqId }, timeoutMs: WRITE_TIMEOUT_MS });
-      setNotice(answer.status === 'Active' ? { tone: 'error', text: answer.error ?? '取消未生效' } : { tone: 'info', text: '取消已提交，等待交易所确认。' });
+      setNotice(answer.status === 'Active' ? { tone: 'error', text: answer.error ?? '取消未生效', key: rfqKey(answer) } : { tone: 'info', text: '取消已提交，等待交易所确认。', key: rfqKey(answer) });
     } catch (error) {
       setNotice({ tone: 'error', text: `取消请求未确认：${errorText(error)}；页面会继续核对状态` });
       if (error instanceof ApiError && error.status === 401) onExpired();
@@ -162,8 +167,8 @@ export function RfqPane({ strategy, quantity, onExpired, onChanged }: { strategy
     try {
       const answer = await api<RfqAccepted>(`${RFQ_PATH}/execute`, { body: rfqExecuteBody(choice.rfqId, choice.quote.quoteId), timeoutMs: WRITE_TIMEOUT_MS });
       setSelected(null);
-      if (answer.status === 'Active') setNotice({ tone: 'error', text: `报价未成交：${answer.error ?? '交易所未接受'}；可以选择其它报价。` });
-      else setNotice({ tone: answer.status === 'ExecutionUnknown' ? 'error' : 'info', text: `报价已提交（${SENT_TEXT[answer.status] ?? answer.status}），成交后按开仓组合跟踪。` });
+      if (answer.status === 'Active') setNotice({ tone: 'error', text: `报价未成交：${answer.error ?? '交易所未接受'}；可以选择其它报价。`, key: rfqKey(answer) });
+      else setNotice({ tone: answer.status === 'ExecutionUnknown' ? 'error' : 'info', text: `报价已提交（${SENT_TEXT[answer.status] ?? answer.status}），成交后按开仓组合跟踪。`, key: rfqKey(answer) });
     } catch (error) {
       setDialogError(startRefused(error) ? `服务拒绝：${errorText(error)}` : `${UNKNOWN_EXECUTE}（${errorText(error)}）`);
       if (error instanceof ApiError && error.status === 401) onExpired();

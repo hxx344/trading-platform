@@ -27,6 +27,10 @@ export const redactError = <T extends Record<string, unknown>>(value: T): T =>
 
 export interface ImportOptions { from: string; owner: string; dataDir: string; now?: () => number }
 export type ImportSummary = ImportInfo;
+/** One owner's rows of the three workbench tables, as read (the import helper gets them as JSON from a reader process). */
+export interface SourceRows { assets: { id: string; data: string }[]; snapshots: { date: string; data: string }[]; settings: { key: string; value: string }[] }
+/** The rows checked and cleaned, ready to replace asset.sqlite, with the import record written beside them. */
+export interface PreparedLedger { assets: { id: string; data: string }[]; snapshots: { date: string; data: string }[]; settings: { key: string; value: string }[]; info: ImportInfo }
 
 const pick = (value: Record<string, unknown>, fields: readonly string[]): Record<string, unknown> =>
   Object.fromEntries(fields.filter(field => Object.hasOwn(value, field)).map(field => [field, value[field]]));
@@ -79,16 +83,17 @@ function cleanSetting(key: string, value: string): string {
   return JSON.stringify(cleaned);
 }
 
-interface SourceRows { assets: { id: string; data: string }[]; snapshots: { date: string; data: string }[]; settings: { key: string; value: string }[] }
+const missingLedger = (owner: string): Error => new Error(`工作台库里没有用户 ${owner} 的账本（缺少原表数据），请确认用户名，或先在工作台打开一次资产页`);
 
-function readSource(from: string, owner: string): SourceRows {
+/** One owner's rows of a workbench ledger.sqlite, opened read-only; the connections table is never read. */
+export function readLedgerRows(from: string, owner: string): SourceRows {
   const source = new DatabaseSync(from, { readOnly: true });
   try {
     const tables = new Set((source.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[]).map(row => row.name));
     for (const table of ['assets', 'settings', 'snapshots']) if (!tables.has(table)) throw new Error(`${basename(from)} 不是工作台的资产库（缺少 ${table} 表）`);
     const placeholders = IMPORTED_SETTINGS.map(() => '?').join(', ');
     const settings = source.prepare(`SELECT key, value FROM settings WHERE owner = ? AND key IN (${placeholders}) ORDER BY key`).all(owner, ...IMPORTED_SETTINGS) as { key: string; value: string }[];
-    if (!settings.some(row => row.key === 'source-ledger')) throw new Error(`工作台库里没有用户 ${owner} 的账本（缺少原表数据），请确认用户名，或先在工作台打开一次资产页`);
+    if (!settings.some(row => row.key === 'source-ledger')) throw missingLedger(owner);
     return {
       settings,
       assets: source.prepare('SELECT id, data FROM assets WHERE owner = ? ORDER BY id').all(owner) as { id: string; data: string }[],
@@ -97,12 +102,23 @@ function readSource(from: string, owner: string): SourceRows {
   } finally { source.close(); }
 }
 
-export function importLedger({ from, owner, dataDir, now = Date.now }: ImportOptions): ImportSummary {
-  if (!owner) throw new Error('需要 --owner <工作台用户名>');
-  const sourcePath = resolve(from), target = resolve(dataDir, ASSET_DB_FILE);
-  if (!existsSync(sourcePath)) throw new Error(`找不到工作台的库文件 ${sourcePath}`);
-  if (existsSync(target) && realpathSync(sourcePath) === realpathSync(target)) throw new Error('--from 不能是本服务自己的 asset.sqlite');
-  const rows = readSource(sourcePath, owner);
+const isText = (value: unknown): value is string => typeof value === 'string';
+/** Rows that came through JSON are checked for shape first: two text columns each, settings only of the allow-list, each once. */
+function assertRows(rows: unknown): asserts rows is SourceRows {
+  const list = (value: unknown, a: string, b: string): boolean => Array.isArray(value) && value.every(row => isRecord(row) && Object.keys(row).length === 2 && isText(row[a]) && isText(row[b]));
+  if (!isRecord(rows) || !list(rows.assets, 'id', 'data') || !list(rows.snapshots, 'date', 'data') || !list(rows.settings, 'key', 'value')) throw new Error('工作台账本的行格式无效');
+  const keys = (rows.settings as { key: string }[]).map(row => row.key);
+  if (keys.some(key => !IMPORTED_SETTINGS.includes(key)) || new Set(keys).size !== keys.length) throw new Error('工作台账本的设置不在导入范围内或有重复');
+  for (const [name, field] of [['assets', 'id'], ['snapshots', 'date']] as const) {
+    const ids = (rows[name] as Record<string, string>[]).map(row => row[field]);
+    if (new Set(ids).size !== ids.length) throw new Error('工作台账本的行有重复');
+  }
+}
+
+/** Checks and cleans one owner's rows; throws naming the row or setting (never its content). Nothing is written. */
+export function prepareLedger(rows: unknown, { file, owner, now = Date.now }: { file: string; owner: string; now?: () => number }): PreparedLedger {
+  assertRows(rows);
+  if (!rows.settings.some(row => row.key === 'source-ledger')) throw missingLedger(owner);
   const assets = rows.assets.map(row => {
     const data = parseJson(row.data, `资产 ${row.id} `);
     if (!isRecord(data) || data.id !== row.id || typeof data.project !== 'string') throw new Error(`资产 ${row.id} 格式无效`);
@@ -116,19 +132,32 @@ export function importLedger({ from, owner, dataDir, now = Date.now }: ImportOpt
     return { date: row.date, data: row.data };
   });
   const settings = rows.settings.map(row => ({ key: row.key, value: cleanSetting(row.key, row.value) }));
-  const info: ImportInfo = { importedAt: new Date(now()).toISOString(), file: basename(sourcePath), owner, assets: assets.length, snapshots: snapshots.length, settings: settings.map(row => row.key) };
+  const info: ImportInfo = { importedAt: new Date(now()).toISOString(), file, owner, assets: assets.length, snapshots: snapshots.length, settings: settings.map(row => row.key) };
+  return { assets, snapshots, settings, info };
+}
+
+/** Replaces the three tables of <dataDir>/asset.sqlite in one transaction, with the import record. */
+export function writeLedger(dataDir: string, ledger: PreparedLedger): ImportInfo {
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-  const database = openAssetDb(target);
+  const database = openAssetDb(resolve(dataDir, ASSET_DB_FILE));
   try {
     database.replace(() => {
       for (const table of ['assets', 'settings', 'snapshots']) database.prepare(`DELETE FROM ${table}`).run();
-      for (const row of assets) database.prepare('INSERT INTO assets (id, data) VALUES (?, ?)').bind(row.id, row.data).run();
-      for (const row of snapshots) database.prepare('INSERT INTO snapshots (date, data) VALUES (?, ?)').bind(row.date, row.data).run();
-      for (const row of settings) database.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').bind(row.key, row.value).run();
-      database.prepare("INSERT INTO settings (key, value) VALUES ('import-info', ?)").bind(JSON.stringify(info)).run();
+      for (const row of ledger.assets) database.prepare('INSERT INTO assets (id, data) VALUES (?, ?)').bind(row.id, row.data).run();
+      for (const row of ledger.snapshots) database.prepare('INSERT INTO snapshots (date, data) VALUES (?, ?)').bind(row.date, row.data).run();
+      for (const row of ledger.settings) database.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').bind(row.key, row.value).run();
+      database.prepare("INSERT INTO settings (key, value) VALUES ('import-info', ?)").bind(JSON.stringify(ledger.info)).run();
     });
   } finally { database.close(); }
-  return info;
+  return ledger.info;
+}
+
+export function importLedger({ from, owner, dataDir, now = Date.now }: ImportOptions): ImportSummary {
+  if (!owner) throw new Error('需要 --owner <工作台用户名>');
+  const sourcePath = resolve(from), target = resolve(dataDir, ASSET_DB_FILE);
+  if (!existsSync(sourcePath)) throw new Error(`找不到工作台的库文件 ${sourcePath}`);
+  if (existsSync(target) && realpathSync(sourcePath) === realpathSync(target)) throw new Error('--from 不能是本服务自己的 asset.sqlite');
+  return writeLedger(dataDir, prepareLedger(readLedgerRows(sourcePath, owner), { file: basename(sourcePath), owner, now }));
 }
 
 function main(): void {

@@ -49,7 +49,8 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
     ? <StatePanel kind="error" title="读取资产账本失败" detail={state.error?.message ?? '网络离线'} />
     : <StatePanel kind="loading" title="加载中…" />}</div></div>;
   if (!state.data.imported) return <div className="asset-desk"><div className="page">
-    <StatePanel kind="empty" title="尚未导入资产账本" detail="本服务的资产页只读，数据来自工作台资产账本的一次导入。在服务器上运行下面的命令（参数见 README 的 asset 一节），导入完成后本页一分钟内显示。">
+    <StatePanel kind="empty" title="尚未导入资产账本" detail="本服务的资产页只读，数据来自工作台资产账本的一次导入。到「设置」页的「从工作台导入」点「读取工作台」，勾选「导入资产账本」并选择工作台用户即可（不重启服务）；导入完成后本页一分钟内显示。也可在服务器上运行下面的命令（参数见 README 的 asset 一节）。">
+      <p><a className="button secondary" href="#/settings">打开设置页导入</a></p>
       <code className="import-command">{IMPORT_COMMAND}</code>
     </StatePanel>
   </div></div>;

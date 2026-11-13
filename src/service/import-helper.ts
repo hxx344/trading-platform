@@ -18,10 +18,11 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
 import { REQUEST_STALE_MS, readImportResult, takeImportRequest, writeImportResult, type ImportRequest, type ImportResult } from './import-channel.ts';
-import { fileText, planImport, previewImport, readExisting, readWorkbench, readWorkbenchOil, readerIdentity, replaceOne, restoreFiles, writeBoth, WORKBENCH_ENV, type FileOwner, type OilSource } from './import-workbench.ts';
+import { fileText, filesUnchanged, planImport, previewImport, readExisting, readWorkbench, readWorkbenchOil, readerIdentity, replaceOne, restoreFiles, writeBoth, WORKBENCH_ENV, type FileOwner, type OilSource } from './import-workbench.ts';
 import { VENUE_NAMES } from '../contracts.ts';
 import type { FetchLike } from '../live/http.ts';
 import { readWorkbenchOptions, resolveOptionsAccount, type OptionsSource } from './import-options.ts';
+import { readWorkbenchAsset, readWorkbenchMonitor, writeLedgerAsService, type AssetSource, type LastImport, type LedgerWrite } from './import-modules.ts';
 
 /** Requests handled in one start; one that arrives while the last is handled is still taken. */
 const MAX_PER_START = 5;
@@ -48,6 +49,8 @@ export interface HelperOptions {
   optionsFetch?: FetchLike;
   /** Tests: where the running workbench Greeks module is looked for (default /proc). */
   procDir?: string;
+  /** Writes the asset ledger rows into asset.sqlite (tests); import-writer.ts as the data directory's owner by default. */
+  writeLedger?: (dataDir: string, write: LedgerWrite) => LastImport;
   now?: () => number;
   log?: (line: string) => void;
 }
@@ -125,6 +128,10 @@ export function recoverInterrupted(configFile: string, owner: FileOwner, check: 
 }
 
 /** Temporary files a stopped helper (or import) left next to the config: they may hold keys. */
+/** Interruption answers cannot know whether a ledger was chosen; they say so. */
+const LEDGER_NOTE = '（若勾选了资产账本，账本可能已写入并保留，请在资产页核对）';
+
+/** Temporary files a stopped helper (or import) left next to the config: they may hold keys. */
 function sweepLeftovers(configFile: string, log: (line: string) => void): void {
   const conf = dirname(resolve(configFile));
   for (const name of readdirSync(conf)) {
@@ -168,7 +175,7 @@ export async function runImportHelper(options: HelperOptions): Promise<number> {
     log(recovered.message);
     const healthy = !recovered.restored || await options.restart();
     // Answered under the interrupted request's id: a page waiting on a newer request is not told it failed.
-    safeAnswer(dir, { id: recovered.requestId, action: 'import', at: now(), phase: recovered.kept ? 'done' : 'failed', message: `${recovered.message}${!recovered.restored ? '' : healthy ? '并重启了服务' : '，但服务重启后仍未正常运行；请查看 journalctl -u trading-platform'}` }, owner, log);
+    safeAnswer(dir, { id: recovered.requestId, action: 'import', at: now(), phase: recovered.kept ? 'done' : 'failed', message: `${recovered.message}${LEDGER_NOTE}${!recovered.restored ? '' : healthy ? '并重启了服务' : '，但服务重启后仍未正常运行；请查看 journalctl -u trading-platform'}` }, owner, log);
   }
   let handled = 0;
   for (; handled < MAX_PER_START && now() - started < TAKE_WINDOW_MS; handled++) {
@@ -202,10 +209,12 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
   // A preview always shows the oil and options accounts too; an import reads them only when they were ticked.
   const wantsOil = request.action === 'preview' || request.oil === true;
   const wantsOptions = request.action === 'preview' || request.options === true;
+  const wantsMonitor = request.action === 'preview' || request.monitor === true;
+  const wantsAsset = request.action === 'preview' || request.asset === true;
   const pairsWanted = request.action === 'preview' || (request.pairs?.length ?? 0) > 0;
   let source: ReturnType<typeof readWorkbench>, files: ReturnType<typeof readExisting>;
   try {
-    source = readWorkbench(options.workbenchEnv, options.workbenchData, { asterOptional: wantsOil || wantsOptions });
+    source = readWorkbench(options.workbenchEnv, options.workbenchData, { asterOptional: wantsOil || wantsOptions || wantsMonitor || wantsAsset });
     files = readExisting(options.configFile);
   } catch (error) { answer({ phase: 'failed', message: message(error) }); return; }
   // The oil accounts' read failing does not hold the pairs back: the page shows why next to the oil choice.
@@ -217,42 +226,69 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
     try { optionsSource = await resolveOptionsAccount(readWorkbenchOptions(options.workbenchEnv, source.data, options.procDir), options.optionsFetch ? { fetchImpl: options.optionsFetch } : {}); }
     catch (error) { optionsError = message(error); }
   }
-  const oilReport = { ...(oilError !== undefined ? { oilError } : {}), ...(optionsError !== undefined ? { optionsError } : {}) };
-  const withOptions = optionsSource ? { options: optionsSource } : {};
+  // The ledger likewise; the monitor needs nothing read.
+  const monitor = wantsMonitor ? readWorkbenchMonitor(source.data) : undefined;
+  let asset: AssetSource | undefined, assetError: string | undefined;
+  if (wantsAsset) { try { asset = readWorkbenchAsset(source.data, options.dataDir, request.assetOwner === undefined ? {} : { owner: request.assetOwner }); } catch (error) { assetError = message(error); } }
+  const oilReport = { ...(oilError !== undefined ? { oilError } : {}), ...(optionsError !== undefined ? { optionsError } : {}), ...(assetError !== undefined ? { assetError } : {}) };
+  const withOptions = { ...(optionsSource ? { options: optionsSource } : {}), ...(monitor ? { monitor } : {}), ...(asset ? { asset } : {}) };
   if (request.action === 'preview') {
     try {
-      const { items, oil: oilItems, options: optionsItem, notes } = previewImport(source, files.existing, { secretsFile: files.secretsFile, ...(oil ? { oil } : {}), ...withOptions });
+      const { items, oil: oilItems, options: optionsItem, monitor: monitorItem, asset: assetItem, notes } = previewImport(source, files.existing, { secretsFile: files.secretsFile, ...(oil ? { oil } : {}), ...withOptions });
       const pairsLine = items.length ? `工作台有 ${items.length} 个配对，其中 ${items.filter(item => item.importable).length} 个可以导入` : '工作台里没有 ASTER 保证金平衡配对';
       const oilLine = oil ? `；原油执行账户 ${oilItems.length} 个，其中 ${oilItems.filter(item => item.status === 'added').length} 个可以导入` : '';
       const optionsLine = optionsItem ? `；期权账户${optionsItem.status === 'added' ? '可以导入' : '不能导入'}` : '';
-      answer({ phase: 'done', message: pairsLine + oilLine + optionsLine, database: source.database, preview: items, ...(oil ? { oil: oilItems } : {}), ...(optionsItem ? { options: optionsItem } : {}), ...oilReport, notes });
+      const monitorLine = monitorItem ? `；行情监控${monitorItem.status === 'added' ? '可以启用' : monitorItem.enabled ? '已启用' : '不能启用'}` : '';
+      const ready = assetItem?.owners.filter(item => item.importable).length ?? 0;
+      const assetLine = assetItem ? `；资产账本${ready ? `可以导入（${ready} 个用户）` : '不能导入'}` : '';
+      answer({ phase: 'done', message: pairsLine + oilLine + optionsLine + monitorLine + assetLine, database: source.database, preview: items, ...(oil ? { oil: oilItems } : {}), ...(optionsItem ? { options: optionsItem } : {}),
+        ...(monitorItem ? { monitor: monitorItem } : {}), ...(assetItem ? { asset: assetItem } : {}), ...oilReport, notes });
     } catch (error) { answer({ phase: 'failed', message: message(error), ...oilReport }); }
     return;
   }
   // Nothing to plan: no pair chosen and none of the ticked modules could be read.
-  if (!pairsWanted && !oil && !optionsSource) {
-    const unread = [oilError !== undefined ? `原油执行账户（${oilError}）` : '', optionsError !== undefined ? `期权账户（${optionsError}）` : ''].filter(Boolean).join('；');
+  if (!pairsWanted && !oil && !optionsSource && !monitor && !asset) {
+    const unread = [oilError !== undefined ? `原油执行账户（${oilError}）` : '', optionsError !== undefined ? `期权账户（${optionsError}）` : '', assetError !== undefined ? `资产账本（${assetError}）` : ''].filter(Boolean).join('；');
     answer({ phase: 'failed', message: `无法读取工作台的${unread || '所选内容'}，配置未改动` }); return;
   }
   let plan: ReturnType<typeof planImport>;
-  try { plan = planImport(source, files.existing, { secretsFile: files.secretsFile, only: request.pairs ?? [], requireMargin: true, ...(oil ? { oil } : {}), ...withOptions }); }
+  try { plan = planImport(source, files.existing, { secretsFile: files.secretsFile, only: request.pairs ?? [], requireMargin: true, ...(oil ? { oil } : {}), ...withOptions, ...(request.assetOwner === undefined ? {} : { assetOwner: request.assetOwner }) }); }
   catch (error) { answer({ phase: 'failed', message: message(error), ...oilReport }); return; }
   const oilAdded = plan.oil.filter(item => item.status === 'added').map(item => VENUE_NAMES[item.venue]);
-  const optionsAdded = plan.options?.status === 'added';
-  const notes = [...plan.notes, ...(oilError !== undefined ? [`原油执行账户未导入：${oilError}`] : []), ...(optionsError !== undefined ? [`期权账户未导入：${optionsError}`] : [])];
-  const report = { database: source.database, imported: plan.items, ...(request.oil ? { oil: plan.oil } : {}), ...(request.options && plan.options ? { options: plan.options } : {}), ...oilReport, notes };
-  if (plan.added.length === 0 && oilAdded.length === 0 && !optionsAdded) {
-    const chosen = [pairsWanted ? '所选配对' : '', request.oil ? '原油执行账户' : '', request.options ? '期权账户' : ''].filter(Boolean);
+  const optionsAdded = plan.options?.status === 'added', monitorAdded = plan.monitor?.status === 'added', assetAdded = plan.asset?.status === 'added';
+  const assetBefore = files.existing?.config.asset !== undefined;
+  const notes = [...plan.notes, ...(oilError !== undefined ? [`原油执行账户未导入：${oilError}`] : []), ...(optionsError !== undefined ? [`期权账户未导入：${optionsError}`] : []), ...(assetError !== undefined ? [`资产账本未导入：${assetError}`] : [])];
+  const report = { database: source.database, imported: plan.items, ...(request.oil ? { oil: plan.oil } : {}), ...(request.options && plan.options ? { options: plan.options } : {}),
+    ...(request.monitor && plan.monitor ? { monitor: plan.monitor } : {}), ...(request.asset && plan.asset ? { asset: plan.asset } : {}), ...oilReport, notes };
+  if (plan.added.length === 0 && oilAdded.length === 0 && !optionsAdded && !monitorAdded && !assetAdded) {
+    const chosen = [pairsWanted ? '所选配对' : '', request.oil ? '原油执行账户' : '', request.options ? '期权账户' : '', request.monitor ? '行情监控' : '', request.asset ? '资产账本' : ''].filter(Boolean);
     answer({ phase: 'failed', message: `${chosen.join('与')}${chosen.length > 1 || pairsWanted ? '都' : ''}不能导入，配置未改动`, ...report });
     return;
   }
-  const what = [plan.added.length ? `${plan.added.length} 个配对` : '', oilAdded.length ? `原油执行账户（${oilAdded.join('、')}）` : '', optionsAdded ? `期权账户（Bybit ${plan.options?.accountId ?? ''}）` : ''].filter(Boolean).join('与');
-  const after = [plan.added.length ? '配对登记为停用：先在旧工作台删除该配对，再在本页面启用' : '', oilAdded.length ? '原油执行账户已生效，页面出现「原油」标签' : '', optionsAdded ? '期权账户已生效，页面出现「期权」标签' : ''].filter(Boolean).join('；');
+  const what = [plan.added.length ? `${plan.added.length} 个配对` : '', oilAdded.length ? `原油执行账户（${oilAdded.join('、')}）` : '', optionsAdded ? `期权账户（Bybit ${plan.options?.accountId ?? ''}）` : '',
+    monitorAdded ? '行情监控' : '', assetAdded ? `资产账本（用户 ${plan.asset?.owner ?? ''}）` : ''].filter(Boolean).join('与');
+  const after = [plan.added.length ? '配对登记为停用：先在旧工作台删除该配对，再在本页面启用' : '', oilAdded.length ? '原油执行账户已生效，页面出现「原油」标签' : '', optionsAdded ? '期权账户已生效，页面出现「期权」标签' : '',
+    monitorAdded ? '行情监控已生效，页面出现「行情监控」标签' : '', assetAdded && !assetBefore ? '资产账本已生效，页面出现「资产」标签' : ''].filter(Boolean).join('；');
+  // The ledger first (docs/module-import.md §3): when it fails nothing has changed; once written it is whole, and stays
+  // whatever becomes of the config (without `asset` the service does not read it).
+  let ledgerLine = '';
+  if (plan.ledger) {
+    try {
+      const last = (options.writeLedger ?? writeLedgerAsService)(options.dataDir, plan.ledger);
+      ledgerLine = `资产账本（用户 ${last.owner}，资产 ${last.assets} 条、快照 ${last.snapshots} 条）`;
+      log(`已写入${ledgerLine}`);
+    } catch (error) { answer({ phase: 'failed', message: `${message(error)}；配置未改动，本次没有导入任何内容，可重试`, ...report }); return; }
+  }
+  if (filesUnchanged(plan, files.existing)) {
+    answer({ phase: 'done', message: `已重新导入${ledgerLine}；配置未改动，未重启服务，资产页下次读取即是新账本`, ...report });
+    return;
+  }
+  const kept = plan.ledger ? '。资产账本已写入并保留（配置已恢复时服务按原配置运行），重新勾选导入即可' : '';
   const undo = undoFile(files.configFile);
   const written = { config: fileText(plan.config), secrets: fileText(plan.secrets) };
   const record: Undo = { requestId: request.id, bootId: bootId(), at: now(), configFile: resolve(files.configFile), secretsFile: resolve(files.secretsFile), text: files.text, written: { config: sha256(written.config), secrets: sha256(written.secrets) } };
   try { replaceOne(undo, JSON.stringify(record)); }
-  catch (error) { answer({ phase: 'failed', message: `无法记录导入前的配置，配置未改动：${message(error)}`, ...report }); return; }
+  catch (error) { answer({ phase: 'failed', message: `无法记录导入前的配置，配置未改动：${message(error)}${kept}`, ...report }); return; }
   // A record left behind would undo this import on the next stop; one that cannot be removed is at least emptied of
   // its meaning by renaming it.
   let unsettled = false;
@@ -267,13 +303,13 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
   try { writeBoth(files.secretsFile, written.secrets, files.configFile, written.config, owner); }
   catch (error) {
     const failed = putBack();
-    answer({ phase: 'failed', message: failed ? `写入配置失败（${message(error)}），恢复导入前的配置也失败了（${failed}），请手动检查 ${files.configFile}` : `写入配置失败，已保持导入前的配置：${message(error)}`, ...report });
+    answer({ phase: 'failed', message: (failed ? `写入配置失败（${message(error)}），恢复导入前的配置也失败了（${failed}），请手动检查 ${files.configFile}` : `写入配置失败，已保持导入前的配置：${message(error)}`) + kept, ...report });
     return;
   }
   try { (options.checkConfig ?? checkAsService)(files.configFile, owner); }
   catch (error) {
     const failed = putBack();
-    answer({ phase: 'failed', message: `导入后的配置未通过服务检查（${message(error)}），${failed ? `恢复导入前的配置也失败了（${failed}），请手动检查 ${files.configFile}` : '已恢复导入前的配置'}`, ...report });
+    answer({ phase: 'failed', message: `导入后的配置未通过服务检查（${message(error)}），${failed ? `恢复导入前的配置也失败了（${failed}），请手动检查 ${files.configFile}` : '已恢复导入前的配置'}${kept}`, ...report });
     return;
   }
   log(`已导入 ${what}，重启服务`);
@@ -284,9 +320,9 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
     return;
   }
   const failed = putBack();
-  if (failed) { answer({ phase: 'failed', message: `服务在导入后的配置上没有正常启动，恢复导入前的配置也失败了（${failed}）；请查看 journalctl -u trading-platform 并手动检查 ${files.configFile}`, ...report }); return; }
+  if (failed) { answer({ phase: 'failed', message: `服务在导入后的配置上没有正常启动，恢复导入前的配置也失败了（${failed}）；请查看 journalctl -u trading-platform 并手动检查 ${files.configFile}${kept}`, ...report }); return; }
   const back = await options.restart();
-  answer({ phase: 'failed', message: back ? '服务在导入后的配置上没有正常启动，已恢复导入前的配置并确认服务运行正常；请查看 journalctl -u trading-platform' : '服务在导入后的配置上没有正常启动，已恢复导入前的配置，但服务仍未正常运行；请查看 journalctl -u trading-platform', ...report });
+  answer({ phase: 'failed', message: (back ? '服务在导入后的配置上没有正常启动，已恢复导入前的配置并确认服务运行正常；请查看 journalctl -u trading-platform' : '服务在导入后的配置上没有正常启动，已恢复导入前的配置，但服务仍未正常运行；请查看 journalctl -u trading-platform') + kept, ...report });
 }
 
 /** systemctl restart, then the same health rule as install.sh: active, a new login link, and no restart for 5 s. */
@@ -332,10 +368,10 @@ async function main(): Promise<void> {
     if (done) {
       log(done.message);
       if (done.restored) spawnSync('systemctl', ['restart', '--no-block', unit], { timeout: 30_000 });
-      safeAnswer(values.dir, { id: done.requestId, action: 'import', at: Date.now(), phase: done.kept ? 'done' : 'failed', message: `${done.message}${done.restored ? '，正在重启服务；请稍后刷新页面' : ''}` }, owner, log);
+      safeAnswer(values.dir, { id: done.requestId, action: 'import', at: Date.now(), phase: done.kept ? 'done' : 'failed', message: `${done.message}${LEDGER_NOTE}${done.restored ? '，正在重启服务；请稍后刷新页面' : ''}` }, owner, log);
     } else if (latest && (latest.phase === 'running' || latest.phase === 'restarting')) {
       // Cut short with nothing to put back (a stuck read, or the restart after putting the files back).
-      safeAnswer(values.dir, { ...latest, at: Date.now(), phase: 'failed', message: latest.phase === 'restarting' ? '导入助手在重启服务时被中断，导入可能已生效，也可能已恢复；请点「读取工作台」核对，并查看 journalctl -u trading-platform' : '导入助手处理超时被中断，配置未改动；请稍后重试' }, owner, log);
+      safeAnswer(values.dir, { ...latest, at: Date.now(), phase: 'failed', message: latest.phase === 'restarting' ? '导入助手在重启服务时被中断，导入可能已生效，也可能已恢复；请点「读取工作台」核对，并查看 journalctl -u trading-platform' : '导入助手处理超时被中断，配置未改动（若勾选了资产账本，账本可能已写入并保留，请在资产页核对）；请稍后重试' }, owner, log);
     }
     sweepLeftovers(values.config, log);
     return;

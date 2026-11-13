@@ -27,6 +27,9 @@ import { balanceWindow, createBalanceSamples, type BalanceSamples } from './bala
 import { readImportResult, submitImportRequest } from './import-channel.ts';
 import { oilLoops, oilViews, prepareOil, registerOilAccounts, strandedOilJobs, type OilRuntime } from './oil.ts';
 import { oilSummary } from './oil-config.ts';
+import { createEngineFor, optionsLoops, optionsViews, prepareOptions, type OptionsRuntime } from './options.ts';
+import { optionsSummary } from './options-config.ts';
+import type { OptionsEngine } from '../options/engine.ts';
 import { createServiceLog, teeStream, type ServiceLog } from './service-log.ts';
 import { createSummary, type Summary, type SummaryInput } from './summary.ts';
 
@@ -174,6 +177,9 @@ export interface StartOptions {
   app: WebApp;
   /** Tests stand in for Binance/Bybit (only with config.oil). */
   oilFetch?: (url: string, init: RequestInit) => Promise<Response>;
+  /** Tests stand in for Bybit's options API and shorten the start check. */
+  optionsFetch?: (url: string, init: RequestInit) => Promise<Response>;
+  optionsPreflightMs?: number;
 }
 
 /** Opens the data directory, wires the executor and runs it with the alerts and the user streams until shutdown. */
@@ -194,11 +200,18 @@ export async function startService(options: StartOptions): Promise<ReturnType<ty
   catch (error) { closeLogs(); throw error; }
 }
 
-async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password, app, oilFetch }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
+async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password, app, oilFetch, optionsFetch, optionsPreflightMs }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
   const session = keptSession(dir);
   // Oil accounts are locked and checked before the store opens: a failed check refuses start (oil.ts).
   const oil = config.oil ? await prepareOil(config.oil, secrets.exchanges, oilFetch ? { fetchImpl: oilFetch } : {}) : undefined;
-  const releaseOil = () => oil?.locks.release();
+  // The options account likewise: locked and checked, and its own state database opened, before the main store (options.ts).
+  let options: OptionsRuntime | undefined;
+  try { options = config.options ? await prepareOptions(config.options, secrets.bybitOptions, dir, { ...(optionsFetch ? { fetchImpl: optionsFetch } : {}), ...(optionsPreflightMs === undefined ? {} : { preflightTimeoutMs: optionsPreflightMs }) }) : undefined; }
+  catch (error) { oil?.locks.release(); throw error; }
+  const releaseOil = () => {
+    oil?.locks.release();
+    if (options) { try { options.store.close(); } catch { /* best effort */ } options.locks.release(); }
+  };
   let store: ReturnType<typeof openStore>;
   try { store = openStore(join(dir, DATABASE_FILES.mainnet)); } catch (error) { releaseOil(); throw error; }
   let wiring: ServiceWiring;
@@ -250,7 +263,11 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   try { samples = createBalanceSamples({ file: join(dir, 'samples.sqlite') }); }
   catch (error) { samplesError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`余额采样库无法打开，走势图不可用：${samplesError}\n`); }
   const enabled = executor.transferPairs().filter(pair => pair.enabled).length;
-  const oilText = oil ? `；原油执行账户 ${oil.config.accounts.length} 个` : '';
+  // The options engine needs the notifier for its task messages; a state document it cannot read refuses start.
+  let engine: OptionsEngine | undefined;
+  try { engine = options ? createEngineFor(options, { notify: text => notifier.notify(`【期权】${text}`), log: line => process.stderr.write(`${line}\n`) }) : undefined; }
+  catch (error) { samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw new Error(`期权状态无法恢复，拒绝启动：${error instanceof Error ? error.message : String(error)}`); }
+  const oilText = `${oil ? `；原油执行账户 ${oil.config.accounts.length} 个` : ''}${options ? '；期权账户 1 个' : ''}`;
   try {
     notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}`);
     for (const text of warnings) notifier.notify(`【配置未生效】${text}`);
@@ -268,6 +285,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       },
       ...(oil ? { oil: oilViews(oil, executor) } : {}),
       summary: { setInterval: (minutes: number) => summary.setInterval(minutes), sendNow: () => summary.sendNow() },
+      ...(engine ? { options: optionsViews(engine) } : {}),
       ...(logs ? { logs: (filter: 'all' | 'problems', before: number | null, limit: number) => logs.page({ filter, before, limit }) } : {}),
     },
     ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir) } } : {}),
@@ -299,6 +317,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
         push: (id, event) => { streams.onMessage(id); trading.push(id, event); }, onState: (connected, reason) => streams.onState(accountId, connected, reason),
       })),
       ...(oil ? oilLoops(oil, context, line => process.stderr.write(`${line}\n`)) : []),
+      ...(options && engine ? optionsLoops(options, engine, context, line => process.stderr.write(`${line}\n`)) : []),
     ],
     onStopping: (reason, detail) => {
       const text = reason === 'signal' ? '【服务停止】收到停止信号，正常退出' : `【服务异常停止】${detail || reason}；systemd 会在 5 秒后自动重启，请查看日志`;
@@ -338,7 +357,7 @@ async function main(): Promise<void> {
     // Read and validated offline (keys must derive their signers); nothing is sent anywhere.
     // Only noted, not refused: at boot or with Tailscale logged out the address is missing, and 127.0.0.1 still serves.
     const local = config.host === null || Object.values(networkInterfaces()).flat().some(item => item?.address === config.host);
-    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、') || '尚未导入'}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}，监听 127.0.0.1${config.host ? ` 与 ${urlHost(config.host)}` : ''}，登录密码${password ? '已设置' : '未设置'}，页面 ${app.assets.size} 个文件${oilSummary(config.oil)}\n`);
+    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、') || '尚未导入'}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}，监听 127.0.0.1${config.host ? ` 与 ${urlHost(config.host)}` : ''}，登录密码${password ? '已设置' : '未设置'}，页面 ${app.assets.size} 个文件${oilSummary(config.oil)}${optionsSummary(config.options)}\n`);
     if (!local) process.stdout.write(`注意：${config.host} 现在不在本机网卡上（地址写错，或 Tailscale 尚未连接）；服务会持续重试，在此之前页面只能经 127.0.0.1 打开\n`);
     return;
   }

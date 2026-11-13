@@ -2,6 +2,8 @@ import { Layers3, RefreshCw } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { OIL_READ_TIMEOUT_MS, OIL_STATE_PATH, OilPage } from './OilPage.tsx';
 import { LogsPage } from './LogsPage.tsx';
+import { OPTIONS_READ_TIMEOUT_MS, OPTIONS_STATE_PATH, OptionsPage } from './OptionsPage.tsx';
+import type { OptionsState } from './options-types.ts';
 import { PairsWorkspace } from './PairsWorkspace.tsx';
 import { useRoute, type Route } from './route.ts';
 import { SettingsPage } from './SettingsPage.tsx';
@@ -32,6 +34,8 @@ const TABS: Tab[] = [
 /** Shown only where /api/oil/state answers: a service without oil returns 404 there. */
 const OIL_TAB: Tab = { pages: ['oil'], href: '#/oil', text: '原油' };
 const OIL_CHECK_MS = 60_000;
+/** Shown only where /api/options/state answers, like the oil tab. */
+const OPTIONS_TAB: Tab = { pages: ['options'], href: '#/options', text: '期权' };
 
 export function App() {
   const route = useRoute();
@@ -41,7 +45,8 @@ export function App() {
   const { data: state, status, error, receivedAt, refresh } = live;
   // The oil page reads the same path faster while it is open; here it only decides whether the tab shows.
   const oil = useLiveResource<OilState>(OIL_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: OIL_READ_TIMEOUT_MS, onExpired });
-  const tabs = oil.data !== null ? [...TABS, OIL_TAB] : TABS;
+  const options = useLiveResource<OptionsState>(OPTIONS_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: OPTIONS_READ_TIMEOUT_MS, onExpired });
+  const tabs = [...TABS, ...(oil.data !== null ? [OIL_TAB] : []), ...(options.data !== null ? [OPTIONS_TAB] : [])];
   // A read that succeeds again (after logging in from another tab) clears the notice.
   useEffect(() => { if (status === 'ready') setExpired(false); }, [status]);
   const changed = useCallback(() => { void refresh(); }, [refresh]);
@@ -53,11 +58,11 @@ export function App() {
   const stale = state !== null && (status === 'error' || status === 'offline' || status === 'paused' || (status === 'loading' && (error !== null || old)));
   const failed = status === 'error' || status === 'offline';
   const limits = state ? limitsText(state) : null;
-  const aster = route.page !== 'oil';
+  const aster = route.page !== 'oil' && route.page !== 'options';
   return <div className="aster-desk">
     <main className="desk focused-desk">
       <header className="topbar">
-        <div className="brand"><Layers3 size={22} aria-hidden="true" /><span>统一交易平台<span className="brand-separator">/</span><small>ASTER 保证金平衡 · 原油</small></span></div>
+        <div className="brand"><Layers3 size={22} aria-hidden="true" /><span>统一交易平台<span className="brand-separator">/</span><small>ASTER 保证金平衡 · 原油 · 期权</small></span></div>
       </header>
       <div className="workspace">
         <div className="page-heading">
@@ -99,7 +104,7 @@ export function App() {
                   ? <StatePanel kind="error" title="读取服务状态失败" detail={error?.message ?? '网络离线'} />
                   : <StatePanel kind="loading" title="加载中…" />)
                   : <PairsWorkspace state={state} pairId={route.page === 'pair' ? route.pairId : null} stale={stale} onChanged={changed} onExpired={onExpired} />}
-            </div> : <OilPage onExpired={onExpired} />}
+            </div> : route.page === 'options' ? <OptionsPage tab={route.tab} onExpired={onExpired} /> : <OilPage onExpired={onExpired} />}
           </div>
         </div>
       </div>

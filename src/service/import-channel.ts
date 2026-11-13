@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { ContractError, PAIR_ID, exactKeys } from '../contracts.ts';
 import { MAX_PAIRS } from './config.ts';
 import type { ImportItem, OilItem, PreviewItem } from './import-workbench.ts';
+import type { OptionsItem } from './import-options.ts';
 
 export const REQUEST_FILE = 'request.json';
 export const RESULT_FILE = 'result.json';
@@ -20,7 +21,7 @@ export const RUNNING_STALE_MS = 750_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export type ImportAction = 'preview' | 'import';
-export interface ImportRequest { id: string; action: ImportAction; pairs?: string[]; oil?: true; at: number }
+export interface ImportRequest { id: string; action: ImportAction; pairs?: string[]; oil?: true; options?: true; at: number }
 export interface ImportResult {
   /** The request answered; null when the request file itself could not be read. */
   id: string | null;
@@ -36,29 +37,34 @@ export interface ImportResult {
   oil?: OilItem[];
   /** Why the oil accounts could not be read (the pairs are still answered). */
   oilError?: string;
+  /** The workbench's options account: previewed, or what the import did with it. */
+  options?: OptionsItem;
+  /** Why the options account could not be read. */
+  optionsError?: string;
   notes?: string[];
 }
 
-/** What the page may ask for: a preview of every workbench pair and oil account, or importing the chosen ones. */
-export function parseImportBody(raw: unknown): { action: ImportAction; pairs?: string[]; oil?: true } {
-  const value = exactKeys(raw, ['action'], ['pairs', 'oil']);
+/** What the page may ask for: a preview of every workbench pair, oil and options account, or importing the chosen ones. */
+export function parseImportBody(raw: unknown): { action: ImportAction; pairs?: string[]; oil?: true; options?: true } {
+  const value = exactKeys(raw, ['action'], ['pairs', 'oil', 'options']);
   if (value.action === 'preview') {
-    if (value.pairs !== undefined || value.oil !== undefined) throw new ContractError(400, 'import_pairs', '预览不选配对');
+    if (value.pairs !== undefined || value.oil !== undefined || value.options !== undefined) throw new ContractError(400, 'import_pairs', '预览不选配对');
     return { action: 'preview' };
   }
   if (value.action !== 'import') throw new ContractError(400, 'import_action', '导入操作无效');
   if (value.oil !== undefined && value.oil !== true) throw new ContractError(400, 'import_oil', 'oil 只能是 true');
-  const oil = value.oil === true;
-  // The oil accounts may come over on their own; then no pair is chosen.
-  const pairs = value.pairs ?? (oil ? [] : undefined);
-  if (!Array.isArray(pairs) || pairs.length < (oil ? 0 : 1) || pairs.length > MAX_PAIRS) throw new ContractError(400, 'import_pairs', oil ? `配对至多 ${MAX_PAIRS} 个` : `请选择 1–${MAX_PAIRS} 个配对，或勾选导入原油执行账户`);
+  if (value.options !== undefined && value.options !== true) throw new ContractError(400, 'import_options', 'options 只能是 true');
+  const oil = value.oil === true, options = value.options === true, module = oil || options;
+  // The oil or options account may come over on its own; then no pair is chosen.
+  const pairs = value.pairs ?? (module ? [] : undefined);
+  if (!Array.isArray(pairs) || pairs.length < (module ? 0 : 1) || pairs.length > MAX_PAIRS) throw new ContractError(400, 'import_pairs', module ? `配对至多 ${MAX_PAIRS} 个` : `请选择 1–${MAX_PAIRS} 个配对，或勾选导入原油执行账户 / 期权账户`);
   if (!pairs.every(id => typeof id === 'string' && PAIR_ID.test(id))) throw new ContractError(400, 'import_pairs', '配对 id 无效');
   if (new Set(pairs).size !== pairs.length) throw new ContractError(400, 'import_pairs', '配对重复');
-  return { action: 'import', pairs: pairs as string[], ...(oil ? { oil: true as const } : {}) };
+  return { action: 'import', pairs: pairs as string[], ...(oil ? { oil: true as const } : {}), ...(options ? { options: true as const } : {}) };
 }
 
 export function parseImportRequest(raw: unknown): ImportRequest {
-  const value = exactKeys(raw, ['id', 'action', 'at'], ['pairs', 'oil']);
+  const value = exactKeys(raw, ['id', 'action', 'at'], ['pairs', 'oil', 'options']);
   if (typeof value.id !== 'string' || !UUID.test(value.id)) throw new Error('请求编号无效');
   if (typeof value.at !== 'number' || !Number.isSafeInteger(value.at)) throw new Error('请求时间无效');
   const { id: _id, at: _at, ...rest } = value;

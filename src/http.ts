@@ -54,6 +54,15 @@ export interface ServiceViews {
   balanceHistory?(pairId: string, range: string): unknown;
   /** The oil module's reads (books and spreads; accounts, positions, jobs, caps); absent when the service runs no oil. */
   oil?: { market(): unknown; state(): unknown };
+  /** The options module's reads and writes (service/options.ts); absent when the service runs no options module. */
+  options?: {
+    market(expiry: string | null): unknown;
+    preview(quantity: string | null, mode: string | null): unknown;
+    state(): unknown;
+    plan(body: unknown): Promise<unknown>;
+    start(body: unknown): Promise<unknown>;
+    stop(taskId: string, body: unknown): unknown;
+  };
   /** The service's log lines, newest first (service-log.ts); `before` is the last id of the previous page. */
   logs?(filter: 'all' | 'problems', before: number | null, limit: number): unknown;
   /** The scheduled summary card (summary.ts): the page's interval and a card now; both answer with its status. */
@@ -222,6 +231,18 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'GET' && (url.pathname === '/api/oil/market' || url.pathname === '/api/oil/state')) {
       if (!views?.oil) return send(response, 404, { code: 'not_found', message: '本服务没有配置原油执行' });
       return send(response, 200, url.pathname === '/api/oil/market' ? views.oil.market() : views.oil.state());
+    }
+    if (url.pathname.startsWith('/api/options/')) {
+      if (!views?.options) return send(response, 404, { code: 'not_found', message: '本服务没有配置期权模块' });
+      const options = views.options, path = url.pathname.slice('/api/options/'.length);
+      if (request.method === 'GET' && path === 'market') return send(response, 200, options.market(url.searchParams.get('expiry')));
+      if (request.method === 'GET' && path === 'preview') return send(response, 200, options.preview(url.searchParams.get('quantity'), url.searchParams.get('mode')));
+      if (request.method === 'GET' && path === 'state') return send(response, 200, options.state());
+      if (request.method === 'POST' && path === 'plans') return send(response, 200, await options.plan(await readJson(request)));
+      if (request.method === 'POST' && path === 'tasks') return send(response, 200, await options.start(await readJson(request)));
+      const stop = request.method === 'POST' ? /^tasks\/([0-9a-f]{16})\/stop$/.exec(path) : null;
+      if (stop) return send(response, 200, options.stop(stop[1]!, await readJson(request)));
+      return send(response, 404, { code: 'not_found', message: '不存在' });
     }
     if (request.method === 'GET' && (url.pathname === '/api/logs' || url.pathname === '/api/logs/problems')) {
       if (!views?.logs) return send(response, 404, { code: 'not_found', message: '本服务没有页面日志' });

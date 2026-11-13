@@ -154,6 +154,12 @@ check '--oil 导入原油执行账户并通过配置检查' '[[ $status -eq 0 ]]
 check '导入原油账户的输出不含密钥' '! grep -q "kkkkkkkk\|ssssssss" "$tmp/out"'
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --oil && status=0 || status=$?
 check '重复导入原油账户保留现有设置' '[[ $status -eq 0 ]] && grep -q "已在本项目配置中，保留现有设置" "$tmp/out" && grep -q "没有新的原油执行账户，配置未改动" "$tmp/out"'
+run --package "$tmp/a" --options && status=0 || status=$?
+check '--options 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -q -- "--options 须和 --import-workbench 一起使用" "$tmp/out"'
+# The workbench here has no options key: the account is skipped with the reason and nothing else changes.
+cp "$TP_CONF_DIR/config.json" "$tmp/config.before"
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --options && status=0 || status=$?
+check '--options 在工作台没有期权密钥时跳过且不改配置' '[[ $status -eq 0 ]] && grep -q "跳过期权账户：工作台期权模块没有配置 Bybit 密钥" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json"'
 
 # No current link (data and config left from an earlier install): installs and points current at the release.
 rm "$TP_APP_DIR/current"

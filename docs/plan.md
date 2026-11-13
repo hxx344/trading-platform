@@ -5,7 +5,7 @@
 1. ASTER 配对的保证金平衡划转；
 2. ASTER 配对的 ADL 应急处理。
 
-其他功能（原油双腿、ANT、期权、Aero 等）以后按需在本仓库逐个验证接入，第一阶段不接线。2026-11-13 起原油双腿作为第二个模块接入（[oil.md](oil.md)），只在 `config.json` 配置了 `oil` 时启用；未配置时服务仍只服务 ASTER。各模块的页面统一按 [frontend.md](frontend.md)《页面开发规则》开发。
+其他功能（原油双腿、ANT、期权、Aero 等）以后按需在本仓库逐个验证接入，第一阶段不接线。2026-11-13 起原油双腿作为第二个模块接入（[oil.md](oil.md)），只在 `config.json` 配置了 `oil` 时启用；未配置时服务仍只服务 ASTER。同日期权 Greeks 作为第三个模块接入（[options.md](options.md)），只在配置了 `options` 时启用。各模块的页面统一按 [frontend.md](frontend.md)《页面开发规则》开发。
 
 ## 1 已定决策
 

@@ -10,6 +10,7 @@
 | 新模块接入、范围与决策 | [docs/plan.md](docs/plan.md) |
 | 执行器、划转、ADL 语义 | [docs/executor.md](docs/executor.md) |
 | 原油双腿 | [docs/oil.md](docs/oil.md) |
+| 期权 Greeks | [docs/options.md](docs/options.md) |
 
 新模块的页面和后端一样按文档开发：先在文档里写清范围、对照的工作台页面与回滚版本，再动手；做完把实际做法回填到对应文档。
 

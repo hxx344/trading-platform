@@ -20,6 +20,8 @@ import { parseArgs } from 'node:util';
 import { REQUEST_STALE_MS, readImportResult, takeImportRequest, writeImportResult, type ImportRequest, type ImportResult } from './import-channel.ts';
 import { fileText, planImport, previewImport, readExisting, readWorkbench, readWorkbenchOil, readerIdentity, replaceOne, restoreFiles, writeBoth, WORKBENCH_ENV, type FileOwner, type OilSource } from './import-workbench.ts';
 import { VENUE_NAMES } from '../contracts.ts';
+import type { FetchLike } from '../live/http.ts';
+import { readWorkbenchOptions, resolveOptionsAccount, type OptionsSource } from './import-options.ts';
 
 /** Requests handled in one start; one that arrives while the last is handled is still taken. */
 const MAX_PER_START = 5;
@@ -42,6 +44,10 @@ export interface HelperOptions {
   restart: () => Promise<boolean>;
   /** Checks the written files as the service account would at start; throws with the reason. */
   checkConfig?: (configFile: string, owner: { uid: number; gid: number }) => string;
+  /** The Bybit requests of the options account read (tests); the network by default. */
+  optionsFetch?: FetchLike;
+  /** Tests: where the running workbench Greeks module is looked for (default /proc). */
+  procDir?: string;
   now?: () => number;
   log?: (line: string) => void;
 }
@@ -193,40 +199,55 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
   const base = { id: request.id, action: request.action };
   const answer = (result: Omit<ImportResult, 'id' | 'action' | 'at'>): void => safeAnswer(dir, { ...base, at: now(), ...result }, owner, log);
   answer({ phase: 'running', message: '正在读取工作台' });
-  // A preview always shows the oil accounts too; an import reads them only when they were ticked.
+  // A preview always shows the oil and options accounts too; an import reads them only when they were ticked.
   const wantsOil = request.action === 'preview' || request.oil === true;
+  const wantsOptions = request.action === 'preview' || request.options === true;
   const pairsWanted = request.action === 'preview' || (request.pairs?.length ?? 0) > 0;
   let source: ReturnType<typeof readWorkbench>, files: ReturnType<typeof readExisting>;
   try {
-    source = readWorkbench(options.workbenchEnv, options.workbenchData, { asterOptional: wantsOil });
+    source = readWorkbench(options.workbenchEnv, options.workbenchData, { asterOptional: wantsOil || wantsOptions });
     files = readExisting(options.configFile);
   } catch (error) { answer({ phase: 'failed', message: message(error) }); return; }
   // The oil accounts' read failing does not hold the pairs back: the page shows why next to the oil choice.
   let oil: OilSource | undefined, oilError: string | undefined;
   if (wantsOil) { try { oil = readWorkbenchOil(source.data); } catch (error) { oilError = message(error); } }
-  const oilReport = { ...(oilError !== undefined ? { oilError } : {}) };
+  // Likewise the options account (its files, then one Bybit read of the key's UID).
+  let optionsSource: OptionsSource | undefined, optionsError: string | undefined;
+  if (wantsOptions) {
+    try { optionsSource = await resolveOptionsAccount(readWorkbenchOptions(options.workbenchEnv, source.data, options.procDir), options.optionsFetch ? { fetchImpl: options.optionsFetch } : {}); }
+    catch (error) { optionsError = message(error); }
+  }
+  const oilReport = { ...(oilError !== undefined ? { oilError } : {}), ...(optionsError !== undefined ? { optionsError } : {}) };
+  const withOptions = optionsSource ? { options: optionsSource } : {};
   if (request.action === 'preview') {
     try {
-      const { items, oil: oilItems, notes } = previewImport(source, files.existing, { secretsFile: files.secretsFile, ...(oil ? { oil } : {}) });
+      const { items, oil: oilItems, options: optionsItem, notes } = previewImport(source, files.existing, { secretsFile: files.secretsFile, ...(oil ? { oil } : {}), ...withOptions });
       const pairsLine = items.length ? `工作台有 ${items.length} 个配对，其中 ${items.filter(item => item.importable).length} 个可以导入` : '工作台里没有 ASTER 保证金平衡配对';
       const oilLine = oil ? `；原油执行账户 ${oilItems.length} 个，其中 ${oilItems.filter(item => item.status === 'added').length} 个可以导入` : '';
-      answer({ phase: 'done', message: pairsLine + oilLine, database: source.database, preview: items, ...(oil ? { oil: oilItems } : {}), ...oilReport, notes });
+      const optionsLine = optionsItem ? `；期权账户${optionsItem.status === 'added' ? '可以导入' : '不能导入'}` : '';
+      answer({ phase: 'done', message: pairsLine + oilLine + optionsLine, database: source.database, preview: items, ...(oil ? { oil: oilItems } : {}), ...(optionsItem ? { options: optionsItem } : {}), ...oilReport, notes });
     } catch (error) { answer({ phase: 'failed', message: message(error), ...oilReport }); }
     return;
   }
-  if (!pairsWanted && !oil) { answer({ phase: 'failed', message: `无法读取工作台的原油执行账户，配置未改动：${oilError ?? '未知原因'}` }); return; }
+  // Nothing to plan: no pair chosen and none of the ticked modules could be read.
+  if (!pairsWanted && !oil && !optionsSource) {
+    const unread = [oilError !== undefined ? `原油执行账户（${oilError}）` : '', optionsError !== undefined ? `期权账户（${optionsError}）` : ''].filter(Boolean).join('；');
+    answer({ phase: 'failed', message: `无法读取工作台的${unread || '所选内容'}，配置未改动` }); return;
+  }
   let plan: ReturnType<typeof planImport>;
-  try { plan = planImport(source, files.existing, { secretsFile: files.secretsFile, only: request.pairs ?? [], requireMargin: true, ...(oil ? { oil } : {}) }); }
+  try { plan = planImport(source, files.existing, { secretsFile: files.secretsFile, only: request.pairs ?? [], requireMargin: true, ...(oil ? { oil } : {}), ...withOptions }); }
   catch (error) { answer({ phase: 'failed', message: message(error), ...oilReport }); return; }
   const oilAdded = plan.oil.filter(item => item.status === 'added').map(item => VENUE_NAMES[item.venue]);
-  const notes = oilError !== undefined ? [...plan.notes, `原油执行账户未导入：${oilError}`] : plan.notes;
-  const report = { database: source.database, imported: plan.items, ...(request.oil ? { oil: plan.oil } : {}), ...oilReport, notes };
-  if (plan.added.length === 0 && oilAdded.length === 0) {
-    answer({ phase: 'failed', message: request.oil ? (pairsWanted ? '所选配对与原油执行账户都不能导入，配置未改动' : '原油执行账户不能导入，配置未改动') : '所选配对都不能导入，配置未改动', ...report });
+  const optionsAdded = plan.options?.status === 'added';
+  const notes = [...plan.notes, ...(oilError !== undefined ? [`原油执行账户未导入：${oilError}`] : []), ...(optionsError !== undefined ? [`期权账户未导入：${optionsError}`] : [])];
+  const report = { database: source.database, imported: plan.items, ...(request.oil ? { oil: plan.oil } : {}), ...(request.options && plan.options ? { options: plan.options } : {}), ...oilReport, notes };
+  if (plan.added.length === 0 && oilAdded.length === 0 && !optionsAdded) {
+    const chosen = [pairsWanted ? '所选配对' : '', request.oil ? '原油执行账户' : '', request.options ? '期权账户' : ''].filter(Boolean);
+    answer({ phase: 'failed', message: `${chosen.join('与')}${chosen.length > 1 || pairsWanted ? '都' : ''}不能导入，配置未改动`, ...report });
     return;
   }
-  const what = [plan.added.length ? `${plan.added.length} 个配对` : '', oilAdded.length ? `原油执行账户（${oilAdded.join('、')}）` : ''].filter(Boolean).join('与');
-  const after = [plan.added.length ? '配对登记为停用：先在旧工作台删除该配对，再在本页面启用' : '', oilAdded.length ? '原油执行账户已生效，页面出现「原油」标签' : ''].filter(Boolean).join('；');
+  const what = [plan.added.length ? `${plan.added.length} 个配对` : '', oilAdded.length ? `原油执行账户（${oilAdded.join('、')}）` : '', optionsAdded ? `期权账户（Bybit ${plan.options?.accountId ?? ''}）` : ''].filter(Boolean).join('与');
+  const after = [plan.added.length ? '配对登记为停用：先在旧工作台删除该配对，再在本页面启用' : '', oilAdded.length ? '原油执行账户已生效，页面出现「原油」标签' : '', optionsAdded ? '期权账户已生效，页面出现「期权」标签' : ''].filter(Boolean).join('；');
   const undo = undoFile(files.configFile);
   const written = { config: fileText(plan.config), secrets: fileText(plan.secrets) };
   const record: Undo = { requestId: request.id, bootId: bootId(), at: now(), configFile: resolve(files.configFile), secretsFile: resolve(files.secretsFile), text: files.text, written: { config: sha256(written.config), secrets: sha256(written.secrets) } };

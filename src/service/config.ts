@@ -12,6 +12,7 @@ import { parsePrivateJson, readPrivateFile } from '../live/setup.ts';
 import type { Venue } from '../contracts.ts';
 import type { LiveCredentials } from '../live/values.ts';
 import { parseOilConfig, parseOilSecrets, type OilConfig } from './oil-config.ts';
+import { parseOptionsConfig, parseOptionsSecrets, type OptionsConfig } from './options-config.ts';
 
 const ACCOUNT_NAME = /^[0-9A-Za-z_-]{1,64}$/;
 const FEISHU_HOOK = /^https:\/\/open\.(feishu\.cn|larksuite\.com)\/open-apis\/bot\/v2\/hook\/[0-9A-Za-z_-]{8,128}$/;
@@ -29,6 +30,8 @@ export interface ServiceConfig {
   pairs: ServicePair[];
   /** The oil module's Binance/Bybit execution accounts and caps; absent means the service runs as before (oil-config.ts). */
   oil?: OilConfig;
+  /** The options module's Bybit account and limits; absent means no options module (options-config.ts). */
+  options?: OptionsConfig;
   /** The scheduled ASTER summary card (summary.ts); absent: every 60 minutes. 0 turns it off. */
   summary?: { intervalMinutes: number };
 }
@@ -38,6 +41,7 @@ export interface ServiceSecrets {
   /** The robot for the scheduled summary (the workbench's 定时 channel); without one the summary goes to `feishu`. */
   feishuScheduled?: FeishuSecret | null;
   /** Keys of the oil accounts' venues; only with oil configured. */ exchanges?: Map<Venue, LiveCredentials>;
+  /** The options module's Bybit key; only with options configured. */ bybitOptions?: LiveCredentials;
 }
 
 const perMinute = (ms: number): number => Math.ceil(60_000 / ms);
@@ -123,11 +127,13 @@ export const urlHost = (host: string): string => isIP(host) === 6 ? `[${host}]` 
 const fail = (name: string, error: unknown): Error => new Error(`${name}无效：${error instanceof ContractError || error instanceof Error ? error.message : '格式错误'}`);
 
 export function parseServiceConfig(raw: unknown): ServiceConfig {
-  // pairs may be left out only when oil is there: one of the two modules must be configured.
-  const hasOil = raw !== null && typeof raw === 'object' && Object.hasOwn(raw, 'oil');
-  const value = exactKeys(raw, hasOil ? ['secretsFile'] : ['secretsFile', 'pairs'], ['port', 'host', 'budget', 'summary', ...(hasOil ? ['pairs', 'oil'] : [])]);
+  // pairs may be left out only when oil or options is there: one of the modules must be configured.
+  const has = (key: string): boolean => raw !== null && typeof raw === 'object' && Object.hasOwn(raw, key);
+  const hasOil = has('oil'), hasOptions = has('options'), other = hasOil || hasOptions;
+  const value = exactKeys(raw, other ? ['secretsFile'] : ['secretsFile', 'pairs'], ['port', 'host', 'budget', 'summary', ...(other ? ['pairs'] : []), ...(hasOil ? ['oil'] : []), ...(hasOptions ? ['options'] : [])]);
   const oil = hasOil ? parseOilConfig(value.oil) : undefined;
-  const pairsInput: unknown = oil && value.pairs === undefined ? [] : value.pairs;
+  const options = hasOptions ? parseOptionsConfig(value.options) : undefined;
+  const pairsInput: unknown = other && value.pairs === undefined ? [] : value.pairs;
   if (typeof value.secretsFile !== 'string' || !isAbsolute(value.secretsFile)) throw new Error('secretsFile 必须是绝对路径');
   const port = value.port === undefined ? DEFAULT_PORT : integer(value.port, 1_024, 65_535, '端口');
   const host = parseListenHost(value.host);
@@ -159,11 +165,11 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   const adlReserve = budgetRaw.adlReserve === undefined ? Math.floor(limitPerMinute / 6) : integer(budgetRaw.adlReserve, 0, limitPerMinute - 50, 'ADL 预留权重');
   if (limitPerMinute - adlReserve < needed) throw new Error(`${pairs.length} 个配对每分钟约需请求权重 ${needed}，而每分钟上限 ${limitPerMinute} 减去 ADL 预留 ${adlReserve} 只剩 ${limitPerMinute - adlReserve}；请调大 budget.limitPerMinute 或去掉 budget 使用自动值`);
   const summary = value.summary === undefined ? undefined : { intervalMinutes: integer(exactKeys(value.summary, ['intervalMinutes'], []).intervalMinutes, 0, 1_440, '定时摘要间隔（分钟，0 为关闭）') };
-  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs, ...(oil ? { oil } : {}), ...(summary ? { summary } : {}) };
+  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs, ...(oil ? { oil } : {}), ...(options ? { options } : {}), ...(summary ? { summary } : {}) };
 }
 
-export function parseServiceSecrets(raw: unknown, needed: readonly string[], oilVenues: readonly Venue[] = []): ServiceSecrets {
-  const value = exactKeys(raw, ['accounts'], ['feishu', 'feishuScheduled', ...(oilVenues.length ? ['binance', 'bybit'] : [])]);
+export function parseServiceSecrets(raw: unknown, needed: readonly string[], oilVenues: readonly Venue[] = [], options = false): ServiceSecrets {
+  const value = exactKeys(raw, ['accounts'], ['feishu', 'feishuScheduled', ...(oilVenues.length ? ['binance', 'bybit'] : []), ...(options ? ['bybitOptions'] : [])]);
   if (value.accounts === null || typeof value.accounts !== 'object' || Array.isArray(value.accounts)) throw new Error('accounts 须为 { 账户名: { user, signer, privateKey } }');
   const accounts = new Map<string, AsterCredentials>();
   for (const [name, item] of Object.entries(value.accounts as Record<string, unknown>)) {
@@ -175,7 +181,7 @@ export function parseServiceSecrets(raw: unknown, needed: readonly string[], oil
   if (new Set(users).size !== users.length) throw new Error('两个账户名指向同一个钱包地址');
   const feishu = parseFeishu(value.feishu, 'feishu');
   const feishuScheduled = parseFeishu(value.feishuScheduled, 'feishuScheduled');
-  return { accounts, feishu, ...(feishuScheduled ? { feishuScheduled } : {}), ...(oilVenues.length ? { exchanges: parseOilSecrets(value, oilVenues) } : {}) };
+  return { accounts, feishu, ...(feishuScheduled ? { feishuScheduled } : {}), ...(oilVenues.length ? { exchanges: parseOilSecrets(value, oilVenues) } : {}), ...(options ? { bybitOptions: parseOptionsSecrets(value) } : {}) };
 }
 
 function parseFeishu(raw: unknown, name: string): FeishuSecret | null {
@@ -208,7 +214,7 @@ export function loadServiceSecrets(config: ServiceConfig): ServiceSecrets {
   const raw = parsePrivateJson(readPrivateFile(config.secretsFile, '密钥文件'), '密钥文件');
   // parseAsterCredentials never quotes a key; other messages name only account names and fields.
   try {
-    const secrets = parseServiceSecrets(raw, [...new Set(config.pairs.flatMap(pair => [pair.main, pair.long, pair.short]))], config.oil?.accounts.map(account => account.venue) ?? []);
+    const secrets = parseServiceSecrets(raw, [...new Set(config.pairs.flatMap(pair => [pair.main, pair.long, pair.short]))], config.oil?.accounts.map(account => account.venue) ?? [], config.options !== undefined);
     assertDistinctSigners(config, secrets);
     return secrets;
   } catch (error) { throw fail('密钥文件', error); }

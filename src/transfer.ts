@@ -8,7 +8,7 @@ import { performance } from 'node:perf_hooks';
 import type { DatabaseSync } from 'node:sqlite';
 import { cmp, floorToStep, fromUnits, min, sub, units } from './decimal.ts';
 import {
-  ContractError, PAIR_ID, TRANSFER_ASSET, TRANSFER_UNIT, UUID, exactKeys, parseSubAccountList, parseTransferBalance, parseTransferHistory, parseTransferPair, pageCursor, reject, text,
+  ContractError, PAIR_ID, TRANSFER_ASSET, TRANSFER_CONFIG_KEYS, TRANSFER_UNIT, UUID, exactKeys, parseSubAccountList, parseTransferBalance, parseTransferConfig, parseTransferHistory, parseTransferPair, pageCursor, reject, text,
   type PageCursor, type PairSide, type TransferBalance, type TransferConfig, type TransferPairInput, type TransferReceipt,
 } from './contracts.ts';
 import { VenueError, parseTransferAck, type TransferAck, type TransferConnector } from './connector.ts';
@@ -128,6 +128,11 @@ export interface TransferDeps {
   enableGuard?(pair: Readonly<PairRecord>): Promise<void>;
   /** Runs inside the write that switches a disabled pair on; `from` is when the enable checks began. */
   onEnabled?(pair: Readonly<PairRecord>, from: number): void;
+  /**
+   * Runs inside the write that changes a pair's settings, before anything is stored, with every readable pair as it is
+   * now; a refusal is thrown as a ContractError. The service checks the request budget of the new check interval.
+   */
+  configGuard?(pairId: string, next: Readonly<TransferConfig>, pairs: readonly Readonly<PairRecord>[]): void;
 }
 
 export type TransferPlan = { source: PairSide; destination: PairSide; amount: string };
@@ -186,7 +191,7 @@ export function transferRegistryOutcome(state: TransferState): 'confirmed' | 're
   return null;
 }
 
-export function createTransfers({ db, now, budgets, connector, control, write, assertWriter, callVenue, event, isWriterLost, busy, adlSending, enableGuard, onEnabled }: TransferDeps) {
+export function createTransfers({ db, now, budgets, connector, control, write, assertWriter, callVenue, event, isWriterLost, busy, adlSending, enableGuard, onEnabled, configGuard }: TransferDeps) {
   checkBudgets(budgets, connector);
   /** Transfers whose send is running in this process; any other prepared or sending row was interrupted. */
   const inFlight = new Set<string>();
@@ -770,6 +775,36 @@ export function createTransfers({ db, now, budgets, connector, control, write, a
     });
   }
 
+  /**
+   * Durable, idempotent change of a pair's settings from the page; every field is required, so a missing one is never
+   * filled with a default. It applies from the next evaluation: one already running sees the change in its send
+   * transaction and gives up that round. A transfer already sent is not affected, and the switch stays as it is.
+   */
+  function setConfig(input: unknown, session: string): ReturnType<typeof pairView> {
+    const raw = exactKeys(input, ['pairId', 'requestId', 'config']);
+    const pairId = text(raw.pairId, '配对编号', PAIR_ID), requestId = raw.requestId;
+    if (typeof requestId !== 'string' || !UUID.test(requestId)) return reject('request_id', '请求编号无效');
+    const config = parseTransferConfig(exactKeys(raw.config, TRANSFER_CONFIG_KEYS));
+    const payload = createHash('sha256').update(JSON.stringify({ kind: 'transfer-config', pairId, config })).digest('hex');
+    return write(() => {
+      const existing = db.prepare('SELECT digest, session FROM commands WHERE request_id = ?').get(requestId) as { digest: string; session: string } | undefined;
+      if (existing && (existing.digest !== payload || existing.session !== session)) reject('request_reused', '请求编号已用于其他内容', 409);
+      if (existing) return pairView(requirePair(pairId));
+      const current = requirePair(pairId);
+      configGuard?.(pairId, config, listPairs().pairs);
+      db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(requestId, 'transfer-config', payload, session, pairId, now());
+      const before = current.config;
+      if (JSON.stringify(before) !== JSON.stringify(config)) {
+        current.config = config;
+        // A shorter interval takes effect now rather than after the wait the old one scheduled.
+        current.nextCheckAt = Math.min(current.nextCheckAt, now() + config.checkIntervalMs);
+        savePair(current);
+        event(null, 'transfer-pair-config', { pair: pairId, before, after: config, requestId });
+      }
+      return pairView(current);
+    });
+  }
+
   /** Rows that are not usable pair records are left out and named, so one of them does not fail the whole listing. */
   function listPairs(): { pairs: PairRecord[]; corrupt: string[] } {
     const pairs: PairRecord[] = [], corrupt: string[] = [];
@@ -781,7 +816,7 @@ export function createTransfers({ db, now, budgets, connector, control, write, a
   }
 
   return {
-    recover, tick, registerPair, setEnabled,
+    recover, tick, registerPair, setEnabled, setConfig,
     /** True while a transfer of the pair is persisted for sending or on the wire; the pair's ADL batches wait for it. */
     sending: (pairId: string): boolean => !!db.prepare("SELECT 1 FROM transfers WHERE pair_id = ? AND settled = 0 AND state IN ('prepared', 'sending') LIMIT 1").get(pairId),
     pairs: () => listPairs().pairs.map(pairView),

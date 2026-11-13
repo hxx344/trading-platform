@@ -3,7 +3,7 @@
 // check as the live canary files, and no message built here carries a key or a webhook.
 import { isIP } from 'node:net';
 import { isAbsolute } from 'node:path';
-import { ContractError, PAIR_ID, exactKeys, integer, parseTransferConfig, type TransferConfig } from '../contracts.ts';
+import { ContractError, PAIR_ID, exactKeys, integer, parseTransferConfig, reject, type TransferConfig } from '../contracts.ts';
 import { IP_CEILING, parseAsterCredentials, type AsterCredentials } from '../aster/client.ts';
 import { DEFAULT_ADL_BUDGETS } from '../adl.ts';
 import { parseAdlConfig, type AdlConfig } from '../adl-contracts.ts';
@@ -28,13 +28,51 @@ export interface ServiceConfig {
 export interface FeishuSecret { webhook: string; secret: string | null }
 export interface ServiceSecrets { accounts: Map<string, AsterCredentials>; feishu: FeishuSecret | null }
 
+const perMinute = (ms: number): number => Math.ceil(60_000 / ms);
+/** The part of a pair's idle weight that does not depend on its check interval: both position displays, both ADL history scans. */
+const FIXED_PAIR_WEIGHT = 2 * 5 * perMinute(DEFAULT_POSITIONS_BUDGETS.positionsRefreshMs) + 2 * 50 * perMinute(DEFAULT_ADL_BUDGETS.adlScanIntervalMs);
+/** Both balances (weight 5 each) at every check. */
+const checkWeight = (checkIntervalMs: number): number => 2 * 5 * perMinute(checkIntervalMs);
 /** Weight one pair spends a minute when idle: both balances every check, both position displays, both ADL history scans. */
 export function pairWeightPerMinute(pair: ServicePair): number {
-  const perMinute = (ms: number): number => Math.ceil(60_000 / ms);
-  return 2 * 5 * perMinute(pair.transfer.checkIntervalMs) + 2 * 5 * perMinute(DEFAULT_POSITIONS_BUDGETS.positionsRefreshMs) + 2 * 50 * perMinute(DEFAULT_ADL_BUDGETS.adlScanIntervalMs);
+  return checkWeight(pair.transfer.checkIntervalMs) + FIXED_PAIR_WEIGHT;
 }
 /** Room above the idle use for takeover checks, transfers and catch-up history pages. */
 const BUDGET_HEADROOM = 100;
+
+/** A registered pair as far as the budget is concerned (a pair view or a stored record). */
+export interface BudgetedPair { id: string; enabled: boolean; config: { checkIntervalMs: number } }
+export interface IdleWeight { needed: number; available: number; limitPerMinute: number; adlReserve: number }
+/**
+ * The idle weight of the pairs at their stored check intervals, against the limit less the ADL reserve. Counted are
+ * the configured pairs (what the budget was sized for at start) and any other registered pair still switched on.
+ * `change` puts one pair at another interval.
+ */
+export function idleWeight(config: ServiceConfig, pairs: readonly BudgetedPair[], change?: { pairId: string; checkIntervalMs: number }): IdleWeight {
+  const stored = new Map(pairs.map(pair => [pair.id, pair]));
+  const intervals = new Map(config.pairs.map(pair => [pair.id, stored.get(pair.id)?.config.checkIntervalMs ?? pair.transfer.checkIntervalMs]));
+  for (const pair of pairs) if (pair.enabled && !intervals.has(pair.id)) intervals.set(pair.id, pair.config.checkIntervalMs);
+  if (change && intervals.has(change.pairId)) intervals.set(change.pairId, change.checkIntervalMs);
+  let needed = BUDGET_HEADROOM;
+  for (const ms of intervals.values()) needed += checkWeight(ms) + FIXED_PAIR_WEIGHT;
+  return { needed, available: config.budget.limitPerMinute - config.budget.adlReserve, limitPerMinute: config.budget.limitPerMinute, adlReserve: config.budget.adlReserve };
+}
+/**
+ * Refuses a check interval that would push the idle weight over the limit less the ADL reserve, naming the shortest
+ * interval that fits. A change that adds nothing (the same or a longer interval) always passes, so a database whose
+ * intervals already overrun the budget at start still takes edits.
+ */
+export function checkIntervalBudget(config: ServiceConfig, pairs: readonly BudgetedPair[], pairId: string, checkIntervalMs: number): void {
+  const before = idleWeight(config, pairs), after = idleWeight(config, pairs, { pairId, checkIntervalMs });
+  if (after.needed <= after.available || after.needed <= before.needed) return;
+  const current = pairs.find(pair => pair.id === pairId)?.config.checkIntervalMs ?? checkIntervalMs;
+  // The others' use stays; what is left buys this many balance checks a minute.
+  const checks = Math.floor((after.available - (before.needed - checkWeight(current))) / 10);
+  const limit = `每分钟上限 ${after.limitPerMinute} 减去 ADL 预留 ${after.adlReserve} 后的 ${after.available}`;
+  if (checks < 1) reject('budget_exceeded', `检查间隔 ${checkIntervalMs} 毫秒会使空闲请求权重约为每分钟 ${after.needed}，超过${limit}；其余配对已用满，任何间隔都放不下，请调大 config.json 的 budget.limitPerMinute`, 409);
+  const shortest = Math.max(1_000, Math.ceil(60_000 / checks));
+  reject('budget_exceeded', `检查间隔 ${checkIntervalMs} 毫秒会使空闲请求权重约为每分钟 ${after.needed}，超过${limit}；当前最短可用 ${shortest} 毫秒（约 ${Math.ceil(shortest / 100) / 10} 秒）`, 409);
+}
 
 /**
  * One specific address of this server, normalised as a URL writes it (so it matches the browser's Host header). The

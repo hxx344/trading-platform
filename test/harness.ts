@@ -43,7 +43,7 @@ DELETE FROM commands WHERE kind IN ('adl-config', 'adl-restart');
 DELETE FROM schema_migrations WHERE version = 4;`;
 
 /** control is called once per executor instance, so each restart gets its own registry writer. */
-export function createHarness({ budgets = {}, control, notionalLimits }: { budgets?: Partial<Budgets>; control?: (clock: { now: number }) => ExecutorOptions['control']; notionalLimits?: ExecutorOptions['notionalLimits'] } = {}): Harness {
+export function createHarness({ budgets = {}, control, notionalLimits, transferConfigGuard }: { budgets?: Partial<Budgets>; control?: (clock: { now: number }) => ExecutorOptions['control']; notionalLimits?: ExecutorOptions['notionalLimits']; transferConfigGuard?: ExecutorOptions['transferConfigGuard'] } = {}): Harness {
   const dir = mkdtempSync(join(tmpdir(), 'pa-executor-'));
   const file = join(dir, 'executor.sqlite');
   const clock = { now: START };
@@ -53,7 +53,7 @@ export function createHarness({ budgets = {}, control, notionalLimits }: { budge
   const make = (extra: Partial<Budgets> = {}) => {
     const store = openStore(file);
     stores.push(store);
-    return { store, ex: createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, positions: asterTrading, now, budgets: { ...FAST, ...budgets, ...extra }, control: control?.(clock), notionalLimits }) };
+    return { store, ex: createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, positions: asterTrading, now, budgets: { ...FAST, ...budgets, ...extra }, control: control?.(clock), notionalLimits, transferConfigGuard }) };
   };
   const first = make();
   first.ex.acquire();

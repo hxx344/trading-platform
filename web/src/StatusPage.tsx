@@ -32,10 +32,11 @@ function Health({ health }: { health: ServiceStatus['health'] }) {
   </div>;
 }
 
-function Budget({ budget, now }: { budget: NonNullable<ServiceStatus['budget']>; now: number }) {
+function Budget({ budget, idle, now }: { budget: NonNullable<ServiceStatus['budget']>; idle: ServiceStatus['idleWeight']; now: number }) {
   const cooling = budget.coolingUntil !== null && budget.coolingUntil > now;
   return <div className="panel-body"><dl className="facts">
     <dt>本服务用量</dt><dd>近一分钟 {budget.usedLastMinute} / {budget.limitPerMinute}（其中 {budget.adlReserve} 留给 ADL）</dd>
+    {idle ? <><dt>空闲用量估算</dt><dd className={idle.needed > idle.available ? 'err' : undefined}>每分钟约 {idle.needed} / 可用 {idle.available}{idle.needed > idle.available ? '（按设置页的检查间隔已超出，超出部分会被限速器拒绝）' : ''}</dd></> : null}
     <dt>出口 IP 本分钟</dt><dd>{budget.ipUsedThisMinute === null ? <span className="muted">本分钟尚无交易所报告</span> : <span className={budget.ipUsedThisMinute >= budget.ipCeiling ? 'err' : undefined}>{budget.ipUsedThisMinute}</span>}
       <span className="muted">（交易所报告，含同一 IP 上其他程序；达到 {budget.ipCeiling} 时暂停普通请求，{budget.ipCeilingAdl} 时连 ADL 也暂停）</span></dd>
     <dt>冷却</dt><dd>{cooling ? <span className="err">冷却至 {stamp(budget.coolingUntil)}{budget.reason ? `：${budget.reason}` : ''}</span> : '无'}</dd>
@@ -86,7 +87,7 @@ export function StatusPage({ onExpired }: { onExpired: () => void }) {
     </section>
     {data.budget ? <section className="panel">
       <div className="panel-heading"><h2><Gauge size={16} aria-hidden="true" />ASTER 请求权重</h2></div>
-      <Budget budget={data.budget} now={now} />
+      <Budget budget={data.budget} idle={data.idleWeight} now={now} />
     </section> : null}
     {data.streams ? <section className="panel">
       <div className="panel-heading"><h2><Radio size={16} aria-hidden="true" />账户推送连接</h2></div>

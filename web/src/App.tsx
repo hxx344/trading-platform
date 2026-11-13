@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
-import { ImportPanel } from './ImportPanel.tsx';
 import { AdlPanel } from './AdlPanel.tsx';
 import { PairDetail } from './PairDetail.tsx';
 import { PairsPanel } from './PairsPanel.tsx';
 import { PositionsPanel } from './PositionsPanel.tsx';
 import { useRoute, type Route } from './route.ts';
+import { SettingsPage } from './SettingsPage.tsx';
 import { StatusPage } from './StatusPage.tsx';
 import { Callout, StatePanel } from './StateViews.tsx';
 import { clock } from './labels.ts';
@@ -23,6 +23,7 @@ function statusLine(state: ServiceState): string {
 
 const TABS: { page: Route['page']; href: string; text: string }[] = [
   { page: 'overview', href: '#/', text: '总览' }, { page: 'pair', href: '#/pair', text: '配对详情' }, { page: 'status', href: '#/status', text: '运行状态' },
+  { page: 'settings', href: '#/settings', text: '设置' },
 ];
 
 export function App() {
@@ -57,10 +58,10 @@ export function App() {
       {TABS.map(tab => <a key={tab.page} href={tab.href} className={tab.page === route.page ? 'tab active' : 'tab'} aria-current={tab.page === route.page ? 'page' : undefined}>{tab.text}</a>)}
     </nav>
     {route.page === 'status' ? <StatusPage onExpired={onExpired} /> : <>
-    {route.page === 'overview' ? <ImportPanel onImported={changed} /> : null}
     {!state ? (status === 'error' || status === 'offline'
       ? <StatePanel kind="error" title="读取服务状态失败" detail={error?.message ?? '网络离线'} />
-      : <StatePanel kind="loading" title="加载中…" />) : route.page === 'pair' ? <PairDetail state={state} pairId={route.pairId} stale={stale} onExpired={onExpired} /> : <>
+      : <StatePanel kind="loading" title="加载中…" />) : route.page === 'pair' ? <PairDetail state={state} pairId={route.pairId} stale={stale} onExpired={onExpired} />
+      : route.page === 'settings' ? <SettingsPage state={state} stale={stale} onChanged={changed} onExpired={onExpired} /> : <>
       <PairsPanel state={state} onChanged={changed} />
       <PositionsPanel view={state.positions} stale={stale} shownAt={state.positions.checkedAt} />
       <AdlPanel state={state} onChanged={changed} />

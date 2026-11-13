@@ -207,7 +207,7 @@ DROP INDEX IF EXISTS transfers_unsettled;
 DROP INDEX IF EXISTS transfers_pair;
 DROP TABLE IF EXISTS transfers;
 DROP TABLE IF EXISTS transfer_pairs;
-DELETE FROM commands WHERE kind = 'transfer-enable';
+DELETE FROM commands WHERE kind IN ('transfer-enable', 'transfer-config');
 DELETE FROM schema_migrations WHERE version = 3;
 ```
 

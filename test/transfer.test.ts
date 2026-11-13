@@ -836,6 +836,7 @@ test('划转：连续未发送按检查间隔指数退避，上限为配置冷�
 
 test('保留期：已结清的划转记录与启停命令超过保留期后删除，未结清的保留；已用流水不随记录删除', () => withHarness(async h => {
   await start(h, { maxTransfer: '30', cooldownMs: 1_000 });
+  h.ex.setTransferConfig({ pairId: PAIR, requestId: randomUUID(), config: pairOf(h).config }, SESSION);
   await h.ex.tick();
   const first = last(h);
   assert.equal(first.state, 'confirmed');
@@ -845,7 +846,7 @@ test('保留期：已结清的划转记录与启停命令超过保留期后删�
   assert.equal(open.state, 'unknown');
   h.advance(61_000);
   const removed = h.ex.prune();
-  assert.deepEqual([removed.transfers, removed.commands], [1, 1]);
+  assert.deepEqual([removed.transfers, removed.commands], [1, 2]);
   assert.deepEqual(transfers(h).map(item => [item.id, item.state]), [[open.id, 'unknown']]);
   assert.equal((h.store.db.prepare("SELECT COUNT(*) AS n FROM commands WHERE kind = 'transfer-enable'").get() as { n: number }).n, 0);
   assert.deepEqual(used(h), [first.receipt]);
@@ -1199,7 +1200,7 @@ DROP INDEX IF EXISTS transfers_unsettled;
 DROP INDEX IF EXISTS transfers_pair;
 DROP TABLE IF EXISTS transfers;
 DROP TABLE IF EXISTS transfer_pairs;
-DELETE FROM commands WHERE kind = 'transfer-enable';
+DELETE FROM commands WHERE kind IN ('transfer-enable', 'transfer-config');
 DELETE FROM schema_migrations WHERE version = 3;`;
 
 test('存储：已有 v2 库升级到 v3 只新增划转的两张表与两个索引，原有数据保留；回滚语句退回 v2', () => withHarness(async h => {
@@ -1224,7 +1225,7 @@ test('存储：已有 v2 库升级到 v3 只新增划转的两张表与两个索
     assert.deepEqual(names(store.db), [...before, ...added].sort());
     assert.equal((store.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'legacy'").get() as { n: number }).n, 1);
     assert.equal((store.db.prepare('SELECT COUNT(*) AS n FROM accounts').get() as { n: number }).n, 1);
-    store.db.prepare("INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES ('r1', 'transfer-enable', 'd', 's', 'sim-pair', 1)").run();
+    store.db.prepare("INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES ('r1', 'transfer-enable', 'd', 's', 'sim-pair', 1), ('r2', 'transfer-config', 'd', 's', 'sim-pair', 1)").run();
     store.db.exec(ROLLBACK_SQL);
     assert.equal(store.schemaVersion(), 2);
     assert.deepEqual(names(store.db), before);
@@ -1301,3 +1302,91 @@ test('划转历史：按配对逐页列出，新的在前，游标接续不重�
   assert.equal(newest.basis, 'acknowledged');
   assert.deepEqual(h.ex.transferHistory('other-pair', { before: null, limit: 5 }), { items: [], next: null });
 }));
+
+const FULL_CONFIG = { threshold: '10', minTransfer: '1', maxTransfer: '1000', bufferRatio: '0.05', longReserve: '0', shortReserve: '0', cooldownMs: 30_000, checkIntervalMs: 5_000 };
+const setConfig = (h: Harness, config: Record<string, unknown>, requestId = randomUUID(), session = SESSION) => h.ex.setTransferConfig({ pairId: PAIR, requestId, config: { ...FULL_CONFIG, ...config } }, session);
+const configEvents = (h: Harness) => (h.store.db.prepare("SELECT json FROM events WHERE type = 'transfer-pair-config' ORDER BY seq").all() as { json: string }[]).map(row => JSON.parse(row.json) as { pair: string; before: Record<string, unknown>; after: Record<string, unknown>; requestId: string });
+
+test('划转参数：页面修改按 parseTransferConfig 校验，须给全部字段；写入后下一轮按新值规划，记改前与改后；开关与冷却不变', () => withHarness(async h => {
+  await start(h);
+  await h.ex.tick();
+  assert.deepEqual([last(h).state, last(h).amount], ['confirmed', '100']);
+  for (const config of [{ bufferRatio: '1' }, { minTransfer: '5', maxTransfer: '4' }, { threshold: '-1' }, { cooldownMs: 999 }, { checkIntervalMs: 3_600_001 }, { maxTransfer: 30 }, { reserve: '1' }]) {
+    assert.throws(() => setConfig(h, config), (error: unknown) => error instanceof ContractError && error.status === 400, JSON.stringify(config));
+  }
+  const { checkIntervalMs: _omitted, ...partial } = FULL_CONFIG;
+  assert.throws(() => h.ex.setTransferConfig({ pairId: PAIR, requestId: randomUUID(), config: partial }, SESSION), code('missing_field'));
+  assert.throws(() => h.ex.setTransferConfig({ pairId: PAIR, requestId: 'x', config: FULL_CONFIG }, SESSION), code('request_id'));
+  assert.throws(() => h.ex.setTransferConfig({ pairId: 'no-such-pair', requestId: randomUUID(), config: FULL_CONFIG }, SESSION), code('pair_missing'));
+  assert.equal(configEvents(h).length, 0, '被拒的修改不留记录');
+  const cooldown = pairOf(h).cooldownUntil;
+  const requestId = randomUUID();
+  const view = setConfig(h, { maxTransfer: '40', cooldownMs: 1_000 }, requestId);
+  assert.deepEqual([view.config.maxTransfer, view.config.cooldownMs, view.enabled, view.cooldownUntil], ['40', 1_000, true, cooldown]);
+  assert.deepEqual(configEvents(h), [{ pair: PAIR, before: FULL_CONFIG, after: { ...FULL_CONFIG, maxTransfer: '40', cooldownMs: 1_000 }, requestId }]);
+  // The cooldown already running was set by the old settings; the next plan uses the new cap.
+  h.aster.setBalance(LONG, { available: '700', equity: '700' });
+  await run(h, 30_000);
+  assert.equal(transfers(h)[1]?.amount, '40');
+}));
+
+test('划转参数：同一请求编号重放返回当前结果、不重复记录；编号用于别的内容或别的会话时拒绝', () => withHarness(async h => {
+  h.ex.registerTransferPair(SIM_TRANSFER_PAIR);
+  const requestId = randomUUID();
+  setConfig(h, { threshold: '20' }, requestId);
+  setConfig(h, { threshold: '30' });
+  const replay = setConfig(h, { threshold: '20' }, requestId);
+  assert.equal(replay.config.threshold, '30', '重放不撤销之后的修改');
+  assert.equal(configEvents(h).length, 2);
+  assert.throws(() => setConfig(h, { threshold: '25' }, requestId), code('request_reused'));
+  assert.throws(() => setConfig(h, { threshold: '20' }, requestId, 'another-session'), code('request_reused'));
+  // Another write's id cannot be reused here either.
+  const enableId = randomUUID();
+  await h.ex.setTransferEnabled({ pairId: PAIR, enabled: false, requestId: enableId }, SESSION);
+  assert.throws(() => setConfig(h, { threshold: '20' }, enableId), code('request_reused'));
+  // The same values again are accepted and recorded as a command, without an event.
+  setConfig(h, { threshold: '30' });
+  assert.equal(configEvents(h).length, 2);
+}));
+
+test('划转参数：评估途中经页面修改时本轮不发送，下一轮按新值规划', () => withHarness(async h => {
+  await start(h);
+  const subAccounts = h.aster.subAccounts.bind(h.aster);
+  let changed = false;
+  h.aster.subAccounts = async (...args) => {
+    if (!changed) { changed = true; setConfig(h, { maxTransfer: '30' }); }
+    return subAccounts(...args);
+  };
+  await h.ex.tick();
+  assert.deepEqual([changed, h.aster.calls.transfer, transfers(h).length], [true, 0, 0]);
+  assert.match(pairOf(h).note ?? '', /配置在评估途中已更改/);
+  await run(h, 5_000);
+  assert.deepEqual([last(h).state, last(h).amount, h.aster.calls.transfer], ['confirmed', '30', 1]);
+}));
+
+test('划转参数：缩短检查间隔立即生效；注入的校验在写入前拿到新参数与全部配对，拒绝时不写入', async () => {
+  const seen: { pairId: string; interval: number; pairs: string[] }[] = [];
+  let refuse = false;
+  const h = createHarness({ transferConfigGuard: (pairId, next, pairs) => {
+    seen.push({ pairId, interval: next.checkIntervalMs, pairs: pairs.map(pair => pair.id) });
+    if (refuse) throw new ContractError(409, 'budget_exceeded', '超过请求权重');
+  } });
+  try {
+    await start(h, { checkIntervalMs: 3_600_000 });
+    await h.ex.tick();
+    // Balanced after the first transfer: the next check is an hour away.
+    await run(h, 35_000);
+    assert.equal(transfers(h).length, 1);
+    assert.ok(stored(h).nextCheckAt >= h.clock.now + 3_000_000);
+    h.aster.setBalance(LONG, { available: '700', equity: '700' });
+    setConfig(h, { checkIntervalMs: 5_000, cooldownMs: 1_000 });
+    assert.equal(stored(h).nextCheckAt, h.clock.now + 5_000);
+    assert.deepEqual(seen, [{ pairId: PAIR, interval: 5_000, pairs: [PAIR] }]);
+    refuse = true;
+    assert.throws(() => setConfig(h, { checkIntervalMs: 1_000 }), code('budget_exceeded'));
+    assert.equal(stored(h).config.checkIntervalMs, 5_000);
+    assert.equal(configEvents(h).length, 1);
+    await run(h, 5_000);
+    assert.equal(transfers(h).length, 2);
+  } finally { h.aster.releaseHung(); h.dispose(); }
+});

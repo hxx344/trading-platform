@@ -269,8 +269,9 @@ export interface TransferConfig {
 }
 /** Legacy defaults (modules/aster/trading/margin_balance.py DEFAULT_MARGIN). */
 export const DEFAULT_TRANSFER_CONFIG: Readonly<TransferConfig> = Object.freeze({ threshold: '10', minTransfer: '1', maxTransfer: '1000', bufferRatio: '0.05', longReserve: '0', shortReserve: '0', cooldownMs: 30_000, checkIntervalMs: 5_000 });
+export const TRANSFER_CONFIG_KEYS = ['threshold', 'minTransfer', 'maxTransfer', 'bufferRatio', 'longReserve', 'shortReserve', 'cooldownMs', 'checkIntervalMs'] as const satisfies readonly (keyof TransferConfig)[];
 export function parseTransferConfig(value: unknown): TransferConfig {
-  const raw = exactKeys(value ?? {}, [], ['threshold', 'minTransfer', 'maxTransfer', 'bufferRatio', 'longReserve', 'shortReserve', 'cooldownMs', 'checkIntervalMs']);
+  const raw = exactKeys(value ?? {}, [], TRANSFER_CONFIG_KEYS);
   const amount = (key: 'threshold' | 'minTransfer' | 'maxTransfer' | 'bufferRatio' | 'longReserve' | 'shortReserve', name: string, sign: 'positive' | 'nonnegative'): string => {
     const parsed = decimalField(raw[key] ?? DEFAULT_TRANSFER_CONFIG[key], name, sign);
     return cmp(parsed, TRANSFER_AMOUNT_LIMIT) > 0 ? reject('invalid_value', `${name}超出范围`) : parsed;

@@ -6,9 +6,8 @@ import { TableEmpty } from './StateViews.tsx';
 import { ADL_BATCH, ADL_PROGRESS, ADL_STATUS, DIRECTION, SIDE, clock, label, seconds } from './labels.ts';
 import type { AdlIncident, AdlPairView, ServiceState } from './types.ts';
 
-// A request keeps its id until an answer arrives; a changed setting is a new request.
+// A restart keeps its request id until an answer arrives.
 const requests = new RequestIds();
-type Draft = { autoReduce: boolean; batchNotional: string };
 
 export function Progress({ incident }: { incident: AdlIncident }) {
   const rows = Object.entries(incident.progress || {});
@@ -64,30 +63,15 @@ function Incident({ incident, onChanged }: { incident: AdlIncident; onChanged: (
   </div>;
 }
 
-function PairRow({ pair, draft, setDraft, onChanged }: { pair: AdlPairView; draft: Draft | undefined; setDraft: (value: Draft | undefined) => void; onChanged: () => void }) {
-  const [busy, setBusy] = useState(false);
-  // What the operator typed survives the periodic refresh until it is saved.
-  const input = draft ?? { autoReduce: pair.config.autoReduce, batchNotional: pair.config.batchNotional };
-  const save = async () => {
-    const body = { autoReduce: input.autoReduce, batchNotional: input.batchNotional.trim() };
-    setBusy(true);
-    try {
-      await requests.run(`config:${pair.pairId}`, JSON.stringify(body), requestId => api(`/api/adl/pairs/${encodeURIComponent(pair.pairId)}/config`, { body: { requestId, ...body } }));
-      setDraft(undefined);
-      onChanged();
-    } catch (error) { alert(error instanceof Error ? error.message : String(error)); }
-    finally { setBusy(false); }
-  };
+function PairRow({ pair, onChanged }: { pair: AdlPairView; onChanged: () => void }) {
   const scan = pair.scans ? (['long', 'short'] as const).map(side => <div key={side}>
     {label(SIDE, side)} 已查至 {clock(pair.scans![side].coveredUntil)}{pair.scans![side].pendingWindows ? ` 待查 ${pair.scans![side].pendingWindows} 段` : ''}
     {pair.scans![side].note ? <> <span className="err">{pair.scans![side].note}</span></> : null}
   </div>) : '尚未开始';
   return <tr data-adl-pair={pair.pairId}>
     <td>{pair.pairId}<br /><span className="muted">多 {pair.long} / 空 {pair.short}</span>{pair.shared ? <><br /><span className="err">{pair.shared}</span></> : null}</td>
-    <td className="adl-settings">
-      <label className="check"><input type="checkbox" data-adl-auto={pair.pairId} checked={input.autoReduce} onChange={event => setDraft({ ...input, autoReduce: event.target.checked })} /> 自动减仓</label>
-      <label className="inline-field">单批上限 <input data-adl-notional={pair.pairId} inputMode="decimal" value={input.batchNotional} onChange={event => setDraft({ ...input, batchNotional: event.target.value })} /> USDT</label>
-      <button type="button" className="button secondary" data-adl-save={pair.pairId} disabled={busy} onClick={save}>保存</button>
+    <td data-adl-config={pair.pairId}>
+      自动减仓{pair.config.autoReduce ? '开' : <span className="err">关</span>}<br />单批上限 {pair.config.batchNotional} USDT<br /><a href="#/settings">在设置页修改</a>
     </td>
     <td>{scan}</td>
     <td>{pair.incident ? <Incident incident={pair.incident} onChanged={onChanged} /> : <span className="muted">无进行中的 ADL 事件</span>}</td>
@@ -95,19 +79,13 @@ function PairRow({ pair, draft, setDraft, onChanged }: { pair: AdlPairView; draf
 }
 
 export function AdlPanel({ state, onChanged }: { state: ServiceState; onChanged: () => void }) {
-  const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const finished = state.adl.recent.filter(incident => incident.status === 'completed');
-  const setDraft = (pairId: string) => (value: Draft | undefined) => setDrafts(current => {
-    const next = { ...current };
-    if (value) next[pairId] = value; else delete next[pairId];
-    return next;
-  });
   return <section className="panel">
     <div className="panel-heading"><h2><ShieldAlert size={16} aria-hidden="true" />ASTER ADL 应急处理</h2></div>
     <p className="panel-note">交易所自动减仓后，配对两侧多空总量偏差超过较大一侧的 0.5% 时，按只减仓市价单分批减少多出的一侧，直到两侧相等后自动结束；偏差在 0.5% 内不减仓、直接完成。结果未知的减仓单不重发，有界核对后按新现场继续；不足最小下单量的残差记为完成。</p>
     {state.adl.pairs.length ? <div className="table-wrap"><table className="data">
       <thead><tr><th>配对</th><th>设置</th><th>ADL 历史扫描</th><th>当前事件</th></tr></thead>
-      <tbody>{state.adl.pairs.map(pair => <PairRow key={pair.pairId} pair={pair} draft={drafts[pair.pairId]} setDraft={setDraft(pair.pairId)} onChanged={onChanged} />)}</tbody>
+      <tbody>{state.adl.pairs.map(pair => <PairRow key={pair.pairId} pair={pair} onChanged={onChanged} />)}</tbody>
     </table></div> : <TableEmpty>没有划转配对</TableEmpty>}
     {finished.length ? <>
       <h3 className="panel-subheading">最近结束的 ADL 事件</h3>

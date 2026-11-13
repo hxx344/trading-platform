@@ -16,7 +16,8 @@ import { AsterTransferConnector } from '../aster/transfer.ts';
 import { AsterTradingConnector } from '../aster/trading.ts';
 import { loadWebApp, type WebApp } from '../web-assets.ts';
 import { runExecutor } from '../runtime.ts';
-import { assertDistinctSigners, loadServiceConfig, loadServiceSecrets, urlHost, type ServiceConfig, type ServiceSecrets } from './config.ts';
+import { assertDistinctSigners, checkIntervalBudget, idleWeight, loadServiceConfig, loadServiceSecrets, urlHost, type ServiceConfig, type ServiceSecrets } from './config.ts';
+import { TRANSFER_CONFIG_KEYS, type TransferConfig } from '../contracts.ts';
 import { PASSWORD_FILE, hashPassword, loadPasswordHash, type PasswordHash } from '../login-password.ts';
 import { createTakeoverGuard } from './takeover.ts';
 import { createNotifier, type EventRow, type Notifier } from './feishu.ts';
@@ -64,7 +65,9 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
   const transfers = new AsterTransferConnector({ client, credentials, knownAccounts: () => subAccounts, now });
   const trading = new AsterTradingConnector({ client, credentials, now });
   const enableGuard = createTakeoverGuard({ transfers, trading, now });
-  const executor = createExecutor({ store, connectors: [], environment: 'mainnet', now, transfers, adl: trading, positions: trading, enableGuard, adlOnlyEnabledPairs: true });
+  // A new check interval from the page must fit the request budget, like the config's do at start.
+  const transferConfigGuard = (pairId: string, next: Readonly<TransferConfig>, pairs: readonly { id: string; enabled: boolean; config: TransferConfig }[]): void => checkIntervalBudget(config, pairs, pairId, next.checkIntervalMs);
+  const executor = createExecutor({ store, connectors: [], environment: 'mainnet', now, transfers, adl: trading, positions: trading, enableGuard, transferConfigGuard, adlOnlyEnabledPairs: true });
   const warnings: string[] = [];
   try {
     // A crashed instance leaves its lease for up to a minute; wait it out here rather than crash-looping under systemd.
@@ -81,17 +84,23 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
       await executor.setTransferEnabled({ pairId: pair.id, enabled: false, requestId: randomUUID() }, CONFIG_SESSION);
       log(`配对 ${pair.id} 已不在配置中，已停用`);
     }
-    const known = new Set(executor.transferPairs().map(pair => pair.id));
+    // transferPairs() masks only the accounts; the settings are the stored ones.
+    const known = new Map(executor.transferPairs().map(pair => [pair.id, pair.config]));
     for (const pair of config.pairs) {
-      // A new pair starts switched off; changing its accounts switches it off; changed settings apply at once.
-      // Its ADL settings from the config are only a starting value: after the first registration the page owns them.
+      // A new pair starts switched off; changing its accounts switches it off.
+      // Its transfer and ADL settings from the config are only a starting value: after the first registration the page
+      // owns them, so a known pair is registered with what is stored (a pair dropped and added back keeps them too).
+      const saved = known.get(pair.id);
       try {
-        executor.registerTransferPair({ id: pair.id, mainAccountId: address(pair.main), long: address(pair.long), short: address(pair.short), config: pair.transfer });
+        executor.registerTransferPair({ id: pair.id, mainAccountId: address(pair.main), long: address(pair.long), short: address(pair.short), config: saved ?? pair.transfer });
       } catch (error) {
         const text = `配对 ${pair.id} 登记失败，保持原记录：${error instanceof Error ? error.message : String(error)}`;
         log(text); warnings.push(text);
         continue;
       }
+      // Logged only, like the ADL line below: it holds at every start until the config matches the page.
+      const differs = saved ? TRANSFER_CONFIG_KEYS.filter(key => saved[key] !== pair.transfer[key]) : [];
+      if (saved && differs.length) log(`配对 ${pair.id} 配置里的 transfer 只在首次登记时作为初始值，页面当前为 ${differs.map(key => `${key}=${saved[key]}`).join('、')}，以页面为准`);
       // The workbench's settings may have turned automatic reduction off; a pair already known keeps the page's.
       if (pair.adl && !known.has(pair.id)) {
         try { executor.setAdlConfig({ pairId: pair.id, requestId: randomUUID(), ...pair.adl }, CONFIG_SESSION); }
@@ -113,6 +122,9 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
         }
       }
     }
+    // The stored intervals may need more than the config's did; the limiter still refuses the excess, so the service starts.
+    const weight = idleWeight(config, executor.transferPairs());
+    if (weight.needed > weight.available) log(`按页面上的检查间隔，配对空闲时每分钟约需请求权重 ${weight.needed}，超过每分钟上限 ${weight.limitPerMinute} 减去 ADL 预留 ${weight.adlReserve} 后的 ${weight.available}；超出部分的请求会被限速器拒绝，请在设置页调大检查间隔或调大 budget.limitPerMinute`);
   } catch (error) { executor.close(); throw error; }
   // transferPairs() masks the accounts; the locks need the real addresses.
   const writable = [...new Set([...config.pairs.flatMap(pair => [address(pair.main), address(pair.long), address(pair.short)]), ...executor.writableAccounts()])];
@@ -177,7 +189,7 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
     executor, store, dir, port, app, session,
     ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: ['transfers', 'adl'], drainMs: DRAIN_MS,
     views: {
-      status: () => ({ budget: client.requestBudget.state(), streams: streams.view(), feishu: notifier.status(), samples: { available: samples !== null, error: samplesError } }),
+      status: () => ({ budget: client.requestBudget.state(), idleWeight: idleWeight(config, executor.transferPairs()), streams: streams.view(), feishu: notifier.status(), samples: { available: samples !== null, error: samplesError } }),
       balanceHistory: (pairId, range) => {
         if (samples) return samples.history(pairId, range);
         const window = balanceWindow(range, Date.now());

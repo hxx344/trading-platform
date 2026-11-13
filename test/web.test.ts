@@ -160,11 +160,13 @@ test('页面请求层：网络错误、超时与读响应体时中断都不带�
   } finally { globalThis.fetch = original; }
 });
 
-test('页面地址：#/pair/<配对> 与 #/status 分别打开详情与运行状态；配对编号不合规或无法解码时不选配对；其他都回到总览', async () => {
+test('页面地址：#/pair/<配对>、#/status 与 #/settings 分别打开详情、运行状态与设置；配对编号不合规或无法解码时不选配对；其他都回到总览', async () => {
   const { parseRoute, pairHref } = await import('../web/src/route-parse.ts');
   assert.deepEqual(parseRoute(''), { page: 'overview' });
   assert.deepEqual(parseRoute('#/'), { page: 'overview' });
   assert.deepEqual(parseRoute('#/status'), { page: 'status' });
+  assert.deepEqual(parseRoute('#/settings'), { page: 'settings' });
+  assert.deepEqual(parseRoute('#/settings/x'), { page: 'overview' });
   assert.deepEqual(parseRoute('#/pair'), { page: 'pair', pairId: null });
   assert.deepEqual(parseRoute(pairHref('p_1-a')), { page: 'pair', pairId: 'p_1-a' });
   assert.deepEqual(parseRoute('#/pair/%E0%A4%A'), { page: 'pair', pairId: null });
@@ -192,4 +194,19 @@ test('历史列表合并：滑出最新页的记录保留；加载过更早页�
   // The live page is the whole list: no gap is possible, nothing is dropped.
   const whole = mergeLive(view, { items: [{ id: 'k' }], next: null });
   assert.deepEqual(ids(whole), ['i', 'j', 'k']);
+});
+
+test('设置页划转表单：秒与毫秒互换，非法秒数在本地拦下，其余原样交服务端校验；改动项列出改前改后；默认值与服务端一致', async () => {
+  const { TRANSFER_DEFAULTS, TRANSFER_FIELDS, defaultText, transferBody, transferChanges, transferDraft } = await import('../web/src/transfer-form.ts');
+  const { DEFAULT_TRANSFER_CONFIG, TRANSFER_CONFIG_KEYS } = await import('../src/contracts.ts');
+  assert.deepEqual(TRANSFER_DEFAULTS, DEFAULT_TRANSFER_CONFIG);
+  assert.deepEqual(TRANSFER_FIELDS.map(field => field.key), [...TRANSFER_CONFIG_KEYS]);
+  const config = { ...DEFAULT_TRANSFER_CONFIG, checkIntervalMs: 2_500 };
+  const draft = transferDraft(config);
+  assert.deepEqual([draft.cooldownMs, draft.checkIntervalMs, draft.threshold, defaultText('checkIntervalMs')], ['30', '2.5', '10', '5']);
+  assert.deepEqual(transferBody(draft), { config });
+  assert.deepEqual(transferBody({ ...draft, threshold: ' abc ', cooldownMs: '1.25' }), { config: { ...config, threshold: 'abc', cooldownMs: 1_250 } });
+  for (const bad of ['', '-1', '1e3', '0.0001', '五']) assert.match((transferBody({ ...draft, checkIntervalMs: bad }) as { error: string }).error, /检查间隔须为秒数/, bad);
+  assert.deepEqual(transferChanges(config, { ...config, threshold: '20', checkIntervalMs: 10_000 }), ['差额门槛 10 → 20 USD1', '检查间隔 2.5 → 10 秒']);
+  assert.deepEqual(transferChanges(config, config), []);
 });

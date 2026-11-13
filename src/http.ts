@@ -4,7 +4,7 @@
 // write, so neither another site nor another process that merely reaches the port can drive it.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { ContractError, VENUES, exactKeys, parsePage, type Venue } from './contracts.ts';
+import { ContractError, TRANSFER_CONFIG_KEYS, VENUES, exactKeys, parsePage, type Venue } from './contracts.ts';
 import type { Executor } from './executor.ts';
 import { LIVE_PAGE, PAGE } from './page.ts';
 import { LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash } from './login-password.ts';
@@ -16,6 +16,7 @@ const LOOPBACK = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/;
 const UUID_PATH = /^\/api\/jobs\/([0-9a-f-]{36})(?:\/(stop|acknowledge|adopt-strategy|confirm-not-created|release-strategy))?$/i;
 
 const PAIR_PATH = /^\/api\/transfer-pairs\/([0-9A-Za-z_-]{1,64})\/(enable|disable)$/;
+const PAIR_CONFIG_PATH = /^\/api\/transfer-pairs\/([0-9A-Za-z_-]{1,64})\/config$/;
 const ADL_CONFIG_PATH = /^\/api\/adl\/pairs\/([0-9A-Za-z_-]{1,64})\/config$/;
 const ADL_RESTART_PATH = /^\/api\/adl\/incidents\/([0-9a-f-]{36})\/restart$/;
 const PAIR_READ_PATH = /^\/api\/transfer-pairs\/([0-9A-Za-z_-]{1,64})\/(balances|history)$/;
@@ -239,6 +240,11 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (pair) {
       const body = exactKeys(await readJson(request), ['requestId']);
       return send(response, 200, await executor.setTransferEnabled({ pairId: pair[1], enabled: pair[2] === 'enable', requestId: body.requestId }, sessionId));
+    }
+    const pairConfig = request.method === 'POST' ? PAIR_CONFIG_PATH.exec(url.pathname) : null;
+    if (pairConfig) {
+      const { requestId, ...config } = exactKeys(await readJson(request), ['requestId', ...TRANSFER_CONFIG_KEYS]);
+      return send(response, 200, executor.setTransferConfig({ pairId: pairConfig[1], requestId, config }, sessionId));
     }
     const adlConfig = request.method === 'POST' ? ADL_CONFIG_PATH.exec(url.pathname) : null;
     if (adlConfig) {

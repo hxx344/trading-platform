@@ -230,6 +230,8 @@ export interface ExecutorOptions {
   notionalLimits?: NotionalLimits;
   /** Extra checks before a transfer pair is switched on (after ownership is proven); throws a ContractError to refuse. */
   enableGuard?: TransferDeps['enableGuard'];
+  /** Checks a transfer pair's new settings from the page before they are stored; throws a ContractError to refuse. */
+  transferConfigGuard?: TransferDeps['configGuard'];
   /**
    * ADL acts only on pairs whose transfers are switched on, plus any pair it still has unfinished work on. The service
    * sets it: a configured pair is not taken over from the workbench until it is enabled here.
@@ -253,7 +255,7 @@ const jobNotional = (legs: readonly PlannedLeg[]): string => maxOf(...legs.map(l
 /** `pa1-` + 24 hex + `-` + leg index, plus `r` + attempt for a resumed hedge (at most two digits). */
 const CLIENT_ORDER_ID_LENGTH = 33;
 
-export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions, transfers: transferConnector, adl: adlConnector, positions: positionsConnector, notionalLimits, enableGuard, adlOnlyEnabledPairs = false }: ExecutorOptions) {
+export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions, transfers: transferConnector, adl: adlConnector, positions: positionsConnector, notionalLimits, enableGuard, transferConfigGuard, adlOnlyEnabledPairs = false }: ExecutorOptions) {
   // Jobs never run on a real account without hard caps; a malformed cap stops the start instead of being ignored.
   if (environment === 'mainnet' && connectors.length > 0 && !notionalLimits) throw new ContractError(500, 'notional_limits_required', '真实账户执行必须配置单笔与累计名义金额上限');
   const limits = notionalLimits ? parseNotionalLimits(notionalLimits) : null;
@@ -424,7 +426,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   let draining = false;
   const assertSendable = (): void => { assertWriter(); if (draining) throw new Error('服务正在停止，不再发出新的请求'); };
   const transfers = createTransfers({ db, now, budgets, connector: transferConnector ?? null, control, write, assertWriter: assertSendable, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
-    busy: pairId => adl.busy(pairId), adlSending: pairId => adl.sending(pairId), enableGuard,
+    busy: pairId => adl.busy(pairId), adlSending: pairId => adl.sending(pairId), enableGuard, configGuard: transferConfigGuard,
     // Only enabled pairs are watched for ADL here, so switching one on starts its watch afresh rather than catching up the pause.
     ...(adlOnlyEnabledPairs ? { onEnabled: (pair: PairRecord, from: number) => adl.watchFrom(pair, from) } : {}) });
   const adl: Adl = createAdl({ db, now, budgets, connector: adlConnector ?? null, control, write, assertWriter: assertSendable, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
@@ -1339,7 +1341,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     return write(() => {
       const events = Number(db.prepare(`DELETE FROM events WHERE seq IN (SELECT seq FROM events WHERE at < ? AND (job_id IS NULL OR job_id IN (${DONE_JOB})) ORDER BY seq LIMIT ?)`).run(cutoff, cutoff, limit).changes);
       // Pair switches name a pair, not a job; past the retention period their request ids need no replay protection.
-      const commands = Number(db.prepare(`DELETE FROM commands WHERE request_id IN (SELECT request_id FROM commands WHERE accepted_at < ? AND (kind IN ('transfer-enable', 'adl-config', 'adl-restart') OR job_id IN (${DONE_JOB})) LIMIT ?)`).run(cutoff, cutoff, limit).changes);
+      const commands = Number(db.prepare(`DELETE FROM commands WHERE request_id IN (SELECT request_id FROM commands WHERE accepted_at < ? AND (kind IN ('transfer-enable', 'transfer-config', 'adl-config', 'adl-restart') OR job_id IN (${DONE_JOB})) LIMIT ?)`).run(cutoff, cutoff, limit).changes);
       const previews = Number(db.prepare(`DELETE FROM previews WHERE id IN (SELECT id FROM previews WHERE expires_at < ? AND (consumed_job IS NULL OR consumed_job IN (${DONE_JOB})) LIMIT ?)`).run(cutoff, cutoff, limit).changes);
       // A settled transfer is only history: used receipts, cooldown and pacing live on the pair, which is kept.
       const transfers = Number(db.prepare('DELETE FROM transfers WHERE id IN (SELECT id FROM transfers WHERE settled = 1 AND created_at < ? ORDER BY created_at LIMIT ?)').run(cutoff, limit).changes);
@@ -1544,6 +1546,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     jobView,
     registerTransferPair: transfers.registerPair,
     setTransferEnabled: transfers.setEnabled,
+    setTransferConfig: transfers.setConfig,
     transferPairs: transfers.pairs,
     /** Unmasked accounts of the pairs that may still write: enabled, or with an ADL incident not yet finished. */
     writableAccounts: (): string[] => [...new Set(transfers.records().filter(pair => pair.enabled || adl.busy(pair.id) !== null).flatMap(pair => [pair.mainAccountId, pair.long, pair.short]))],

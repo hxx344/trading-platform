@@ -156,6 +156,16 @@ table.data td.num{font-family:var(--font-mono);font-variant-numeric:tabular-nums
 .adl-settings label{display:flex;align-items:center;gap:6px;margin-bottom:6px;color:var(--text-secondary)}
 .adl-settings input[type=text],.adl-settings input:not([type]){width:90px;height:30px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);padding:4px 8px;color:var(--text-primary);background:var(--surface-1);font-variant-numeric:tabular-nums}
 input[type=checkbox]{accent-color:var(--accent)}
+.settings-pair{display:flex;flex-direction:column;gap:6px;padding:12px 14px;border-top:1px solid var(--surface-4)}
+.settings-pair h3{font-size:.875rem;display:flex;gap:8px;align-items:baseline}
+.settings-pair h3 span{font-size:.75rem;font-weight:400}
+.settings-block{display:flex;flex-direction:column;gap:10px}
+.settings-block>.panel-subheading{padding:6px 0 0}
+.settings-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px 14px}
+.settings-field{display:flex;flex-direction:column;gap:4px;min-width:0;font-size:.75rem}
+.settings-label{color:var(--text-secondary)}
+.settings-field input{height:30px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);padding:4px 8px;color:var(--text-primary);background:var(--surface-1);font-variant-numeric:tabular-nums;min-width:0}
+.settings-field small{line-height:1.5}
 @media(max-width:720px){body{padding:16px}.wb-heading{flex-direction:column}}
 .tabs{display:flex;gap:4px;border-bottom:1px solid var(--surface-4);overflow-x:auto}
 .tab{padding:8px 14px;color:var(--text-secondary);border-bottom:2px solid transparent;white-space:nowrap;font-weight:500}

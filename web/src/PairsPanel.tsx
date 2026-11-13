@@ -48,7 +48,7 @@ export function PairsPanel({ state, onChanged }: { state: ServiceState; onChange
     {pairs.length ? <div className="table-wrap"><table className="data">
       <thead><tr><th>配对</th><th>开关</th><th>两侧余额（USD1）</th><th>当前划转</th><th>说明</th><th></th></tr></thead>
       <tbody>{pairs.map(pair => <PairRow key={pair.id} pair={pair} onChanged={onChanged} />)}</tbody>
-    </table></div> : <TableEmpty>没有划转配对</TableEmpty>}
+    </table></div> : <TableEmpty>没有划转配对；可在「设置」页从工作台导入</TableEmpty>}
     {corruptPairs.length ? <p className="panel-note err">配对记录损坏，未列出也不会划转，需人工处置：{corruptPairs.join('，')}</p> : null}
     {recent.length ? <>
       <h3 className="panel-subheading">最近划转</h3>

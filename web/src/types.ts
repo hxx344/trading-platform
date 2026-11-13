@@ -64,6 +64,8 @@ export interface ServiceStatus {
     writes: { transactions: number; busy: number; waitBucketsMs: number[]; waitBuckets: number[]; maxWaitMs: number; maxHoldMs: number };
     loops: LoopStatus[];
   };
+  /** The pairs' idle weight at their stored check intervals against the limit less the ADL reserve. */
+  idleWeight?: { needed: number; available: number; limitPerMinute: number; adlReserve: number };
   budget?: { usedLastMinute: number; limitPerMinute: number; adlReserve: number; ipUsedThisMinute: number | null; ipCeiling: number; ipCeilingAdl: number; coolingUntil: number | null; reason: string | null };
   streams?: StreamStatus[];
   feishu?: { configured: boolean; pending: number; retrying: number; lastSentAt: number | null; lastError: string | null; nextRetryAt: number | null; retentionMs: number; recent: OutboxRow[] };

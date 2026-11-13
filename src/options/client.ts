@@ -23,6 +23,10 @@ const TRADE_REFUSALS: Record<string, readonly number[]> = {
   '/v5/order/create': [...ORDER_PRICE, ...TRADING_CLOSED, 110004, 110006, 110007, 110012, 110044, 110045, 110017, 110094, 110020, 110021, 110023, 110042, 110032, 110040],
   '/v5/order/amend': [...ORDER_STATE, ...ORDER_PRICE, ...TRADING_CLOSED, 110022, 110064],
   '/v5/order/cancel': ORDER_STATE,
+  // RFQ codes from Bybit's RFQ error table that refuse the request before anything is created, executed or canceled.
+  '/v5/rfq/create-rfq': [110302, 110303, 110308, 110309, 110310, 110311, 110313, 110314, 110315, 110316, 110317, 110318, 110319, 110321],
+  '/v5/rfq/execute-quote': [110300, 110301, 110302, 110304, 110312],
+  '/v5/rfq/cancel-rfq': [110300],
 };
 export const isRefusal = (code: number, path: string): boolean => COMMON_REFUSALS.includes(code) || (TRADE_REFUSALS[path] ?? []).includes(code);
 
@@ -68,6 +72,18 @@ export interface OptionsClient {
   closedPositions(symbol: string, startMs: number, endMs: number, signal: AbortSignal): Promise<Row[]>;
   /** A limit order: GTC (the default) follows the book; IOC is the bounded fallback for an opening leg's remainder. */
   create(order: { symbol: string; side: 'Buy' | 'Sell'; qty: string; price: string; link: string; reduceOnly: boolean; timeInForce?: 'GTC' | 'IOC' }, signal: AbortSignal): Promise<Row>;
+  /** An order's fills by its id: a block trade (RFQ) leg has no orderLinkId of ours. */
+  executionsByOrder(orderId: string, signal: AbortSignal): Promise<Row[]>;
+  // ---- RFQ (G2c): this account as the requester -------------------------------------------------------------------
+  rfqConfig(signal: AbortSignal): Promise<Row>;
+  createRfq(request: { rfqLinkId: string; strategyType: string; counterparties: readonly string[]; legs: readonly { symbol: string; side: 'Buy' | 'Sell'; qty: string }[] }, signal: AbortSignal): Promise<Row>;
+  /** The live list, or the history when `history`; by id when known, else by our link id. */
+  rfqs(by: { rfqId: string } | { rfqLinkId: string }, history: boolean, signal: AbortSignal): Promise<Row[]>;
+  quotes(rfqId: string, signal: AbortSignal): Promise<Row[]>;
+  /** quoteSide Sell: each leg trades in the direction the RFQ asked for (the docs: for the taker, a Sell quote executes as the legs say). */
+  executeQuote(rfqId: string, quoteId: string, signal: AbortSignal): Promise<Row>;
+  cancelRfq(rfqId: string, signal: AbortSignal): Promise<Row>;
+  rfqTrades(rfqId: string, signal: AbortSignal): Promise<Row[]>;
   amend(symbol: string, link: string, price: string, signal: AbortSignal): Promise<Row>;
   cancel(symbol: string, link: string, signal: AbortSignal): Promise<Row>;
 }
@@ -102,7 +118,7 @@ export function createOptionsClient({ credentials, fetchImpl = (url, init) => fe
     offset = next;
   }
 
-  async function signed(method: 'GET' | 'POST', path: string, params: Record<string, string | boolean>, signal: AbortSignal): Promise<Row> {
+  async function signed(method: 'GET' | 'POST', path: string, params: Record<string, unknown>, signal: AbortSignal): Promise<Row> {
     const write = method === 'POST';
     const query = write ? '' : new URLSearchParams(params as Record<string, string>).toString();
     const body = write ? JSON.stringify(params) : undefined;
@@ -211,5 +227,14 @@ export function createOptionsClient({ credentials, fetchImpl = (url, init) => fe
     create: ({ symbol, side, qty, price, link, reduceOnly, timeInForce = 'GTC' }, signal) => signed('POST', '/v5/order/create', { category: 'option', symbol, side, orderType: 'Limit', qty, price, timeInForce, orderLinkId: link, reduceOnly }, signal),
     amend: (symbol, link, price, signal) => signed('POST', '/v5/order/amend', { category: 'option', symbol, orderLinkId: link, price }, signal),
     cancel: (symbol, link, signal) => signed('POST', '/v5/order/cancel', { category: 'option', symbol, orderLinkId: link }, signal),
+    executionsByOrder: (orderId, signal) => pages('/v5/execution/list', { category: 'option', orderId, limit: '50' }, ['execId'], signal),
+    rfqConfig: signal => signed('GET', '/v5/rfq/config', {}, signal),
+    createRfq: ({ rfqLinkId, strategyType, counterparties, legs }, signal) => signed('POST', '/v5/rfq/create-rfq', { counterparties, rfqLinkId, strategyType, list: legs.map(leg => ({ category: 'option', symbol: leg.symbol, side: leg.side, qty: leg.qty })) }, signal),
+    // One RFQ per query (by id or link): no paging.
+    rfqs: async (by, history, signal) => listOf(await signed('GET', history ? '/v5/rfq/rfq-list' : '/v5/rfq/rfq-realtime', { traderType: 'request', ...by }, signal), '询价'),
+    quotes: async (rfqId, signal) => listOf(await signed('GET', '/v5/rfq/quote-realtime', { traderType: 'request', rfqId }, signal), '询价报价'),
+    executeQuote: (rfqId, quoteId, signal) => signed('POST', '/v5/rfq/execute-quote', { rfqId, quoteId, quoteSide: 'Sell' }, signal),
+    cancelRfq: (rfqId, signal) => signed('POST', '/v5/rfq/cancel-rfq', { rfqId }, signal),
+    rfqTrades: async (rfqId, signal) => listOf(await signed('GET', '/v5/rfq/trade-list', { traderType: 'request', rfqId }, signal), '询价成交'),
   };
 }

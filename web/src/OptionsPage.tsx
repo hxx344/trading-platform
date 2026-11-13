@@ -8,12 +8,13 @@ import type { ChainRow, GreekName, OptionsMarket, OptionsState, Plan, Preview, P
 import { RequestIds } from './request-ids.ts';
 import { useLiveResource } from './use-live-resource.ts';
 import { PerformancePane, type PerformanceChoice } from './OptionsPerformance.tsx';
+import { RfqPane } from './OptionsRfq.tsx';
 
 // The options page follows the workbench Greeks desk (modules/greeks/app/static/index.html and app.js, 2f0593d): the
-// page header, four tabs (执行台, 持仓, 组合执行, 收益 in OptionsPerformance.tsx), the alert strip, then the desk grid — strategy figures, the chain, the
+// page header, five tabs (执行台, 持仓, 组合执行, 收益 in OptionsPerformance.tsx, 组合询价 in OptionsRfq.tsx), the alert strip, then the desk grid — strategy figures, the chain, the
 // legs with the expiry payoff, the Greeks of the positions, the execution control and the account health. A trade is
 // planned on the server, checked in the confirmation dialog and started with a request id kept until an answer arrives.
-// The workbench's 组合询价 tab is not part of this service (docs/options.md, G2).
+// 组合询价 asks for this desk selection (strategy and quantity) and is executed per quote (docs/options.md, G2c).
 
 export const OPTIONS_STATE_PATH = '/api/options/state';
 export const OPTIONS_READ_TIMEOUT_MS = 10_000;
@@ -21,10 +22,10 @@ const ACTIVE_MS = 1_000;
 const IDLE_MS = 5_000;
 const MARKET_MS = 10_000;
 const WRITE_TIMEOUT_MS = 30_000;
-export type OptionsTab = 'desk' | 'positions' | 'orders' | 'performance';
+export type OptionsTab = 'desk' | 'positions' | 'orders' | 'performance' | 'rfq';
 const TABS: { tab: OptionsTab; href: string; text: string }[] = [
   { tab: 'desk', href: '#/options', text: '执行台' }, { tab: 'positions', href: '#/options/positions', text: '持仓' }, { tab: 'orders', href: '#/options/orders', text: '组合执行' },
-  { tab: 'performance', href: '#/options/performance', text: '收益' },
+  { tab: 'performance', href: '#/options/performance', text: '收益' }, { tab: 'rfq', href: '#/options/rfq', text: '组合询价' },
 ];
 const STOP_CONFIRM = '停止只撤未成交委托，已成交部分保留。确认停止？';
 const UNKNOWN_START = '提交结果未知：请求可能已被受理。不要换方案重下；再点“确认”会用同一请求编号向服务核对。';
@@ -182,7 +183,7 @@ function TaskCard({ task, state, stopping, onStop }: { task: Task; state: Option
   const unknown = summary.legs.some(leg => leg.unknown);
   const message = task.error ?? (task.netBlocked ? '净价限制已触发，未成交委托已停止。' : task.riskBlocked ? '组合风险超出上限，未成交委托已停止。' : null);
   return <article className="execution-card" data-active={String(active)}>
-    <div className="execution-card-head"><div><h3>{task.scheduled ? <span className="lock-badge scheduled-tag">定时</span> : null}{task.type === 'close' ? '平仓组合' : '开仓组合'} · {strategyName(task.mode)}</h3><span className="execution-status">{STATUS_TEXT[task.status]}{unknown ? ' · 成交待核对' : ''}</span></div>
+    <div className="execution-card-head"><div><h3>{task.scheduled ? <span className="lock-badge scheduled-tag">定时</span> : null}{task.rfq ? <span className="lock-badge scheduled-tag" title={`询价 ${task.rfq.rfqId} · 报价 ${task.rfq.quoteId}`}>询价 · {task.rfq.deskCode || '做市商'}</span> : null}{task.type === 'close' ? '平仓组合' : '开仓组合'} · {strategyName(task.mode)}</h3><span className="execution-status">{STATUS_TEXT[task.status]}{unknown ? ' · 成交待核对' : ''}</span></div>
       <span>耗时 {Math.floor(elapsed / 60)}分 {elapsed % 60}秒</span>
       {active ? <button type="button" className="button stop-execution" disabled={stopped || stopping} onClick={() => onStop(task)}>{stopped ? '已请求停止 · 等待终态' : stopping ? '停止请求待核对…' : '停止执行'}</button> : null}</div>
     <div className="execution-progress"><span>完成 {summary.completedLegs} / {summary.totalLegs} 腿</span><span>{summary.ratio === null ? '进度待核对' : `${Math.round(summary.ratio * 100)}%`}</span><progress max={1} value={summary.ratio ?? undefined} aria-label="组合成交进度" /></div>
@@ -195,7 +196,7 @@ function TaskCard({ task, state, stopping, onStop }: { task: Task; state: Option
       <div className="execution-leg-quantity"><span>已成 <b>{quantityText(leg.filled)}</b></span><span>目标 <b>{quantityText(leg.target)}</b></span><span>剩余 <b>{quantityText(leg.remaining)}</b> BTC</span><span className={leg.unknown ? 'loss' : leg.complete ? 'profit' : 'muted'}>{leg.unknown ? '待核对' : leg.complete ? '已完成' : '未完成'}</span></div>
       <details><summary>委托详情 · {leg.orders.length} 笔</summary><div className="orders-table-wrap"><table className="orders-table" aria-label="本腿委托明细"><tbody>{leg.orders.map(order => { const phase = orderState(order, task); return <tr key={order.link}>
         <td data-label="合约 / 订单标识" className="order-contract"><strong>{order.symbol}</strong><small>关联 {order.link}</small><small>交易所 {order.orderId || '--'}</small></td>
-        <td data-label="执行"><div className="order-operation">{task.type === 'close' ? '平仓' : '开仓'} <span>{order.kind === 'ioc' ? 'IOC' : 'BBO'}</span></div><span className={`order-side ${order.side === 'Buy' ? 'buy' : 'sell'}`}>{order.side === 'Buy' ? '买入' : '卖出'}</span></td>
+        <td data-label="执行"><div className="order-operation">{task.type === 'close' ? '平仓' : '开仓'} <span>{order.kind === 'ioc' ? 'IOC' : order.kind === 'rfq' ? 'RFQ' : 'BBO'}</span></div><span className={`order-side ${order.side === 'Buy' ? 'buy' : 'sell'}`}>{order.side === 'Buy' ? '买入' : '卖出'}</span></td>
         <td data-label="价格 · USD"><div className="order-values"><span><small>最近</small><b>{order.price ?? '--'}</b></span></div></td>
         <td data-label="数量 · BTC"><div className="order-values"><span><small>委托</small><b>{quantityText(order.qty)}</b></span><span><small>累计成交</small><b>{quantityText(order.filledQty)}</b></span></div></td>
         <td data-label="状态阶段"><span className="order-phase" data-tone={phase.tone}>{phase.label}</span>{order.message ? <small className="order-exchange-status">{order.message}</small> : null}</td>
@@ -365,7 +366,7 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
       <div className="ph-actions"><span className="update-state"><i data-stale={String(marketStale)} />{marketAt ? `行情 ${utcTime(marketAt).slice(6)} UTC${marketStale ? ' · 已过期' : ''}` : '行情同步中'}</span><button type="button" className="button ghost" onClick={refresh}>立即刷新</button></div>
     </header>
     <nav className="subnav" aria-label="期权页面">
-      {TABS.map(item => <a key={item.tab} className={`tab${item.tab === tab ? ' active' : ''}`} href={item.href} aria-current={item.tab === tab ? 'page' : undefined}>{item.text}{item.tab === 'positions' && positionsCount ? <span className="count">{positionsCount}</span> : null}{item.tab === 'orders' && activeTasks.length ? <span className="count">{activeTasks.length}</span> : null}</a>)}
+      {TABS.map(item => <a key={item.tab} className={`tab${item.tab === tab ? ' active' : ''}`} href={item.href} aria-current={item.tab === tab ? 'page' : undefined}>{item.text}{item.tab === 'positions' && positionsCount ? <span className="count">{positionsCount}</span> : null}{item.tab === 'orders' && activeTasks.length ? <span className="count">{activeTasks.length}</span> : null}{item.tab === 'rfq' && data?.rfqActive ? <span className="count">进行中</span> : null}</a>)}
     </nav>
     <div className="strip">
       {data?.reconciliation.pendingOrders ? <span className="item strip-count">{data.reconciliation.pendingOrders} 笔订单未结束</span> : null}
@@ -428,7 +429,7 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
           <div className="subhead log-title">成交与手续费<span>FILLS</span></div>
           {data?.executions.length ? <div className="executions">{data.executions.map(item => <div className="execution-row" key={item.execId}><strong>{item.symbol}</strong><span>{item.side} {item.execQty.toFixed(4)} · {money(item.execPrice)}{item.chainPrice !== null ? ` · 链基准 ${item.chainPrice.toFixed(4)}` : ''} · {utcTime(item.execTime)}</span><span className="exec-fee">-{item.execFee.toFixed(6)} {item.feeCurrency}</span></div>)}</div> : <div className="executions empty">暂无成交记录</div>}
         </section>
-      </div></div> : tab === 'performance' ? <div className="tab-pane"><PerformancePane onExpired={onExpired} choice={performanceChoice} onChoice={setPerformanceChoice} /></div> : <div className="tab-pane">
+      </div></div> : tab === 'performance' ? <div className="tab-pane"><PerformancePane onExpired={onExpired} choice={performanceChoice} onChoice={setPerformanceChoice} /></div> : tab === 'rfq' ? <RfqPane strategy={strategy} quantity={quantity} onExpired={onExpired} onChanged={() => void state.refresh()} /> : <div className="tab-pane">
         <section className="panel orders-panel" aria-label="组合执行" data-state={state.error ? 'stale' : 'ready'}>
           <div className="panel-h"><h2>组合执行<span className="heading-detail">当前进度与净额</span></h2><span className="source-tag" id="ordersSyncState">{state.error ? '刷新失败' : state.receivedAt ? `已同步 ${utcTime(state.receivedAt).slice(6)}` : '等待同步'}</span></div>
           <div className="orders-toolbar"><span>执行中 {activeTasks.length} 组 · 最近结束 {history.length} 组</span><span>前台每 {busy ? 1 : 5} 秒</span></div>

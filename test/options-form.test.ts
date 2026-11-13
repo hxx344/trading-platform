@@ -5,8 +5,8 @@ import assert from 'node:assert/strict';
 import { ContractError } from '../src/contracts.ts';
 import type { OptionsEngine } from '../src/options/engine.ts';
 import { optionsViews } from '../src/service/options.ts';
-import { autoOpenConfirm, chainLines, coverageLine, groupLabel, markedRows, performanceStatus, plotRows, plotTick, utcMinute, selectedSeries, orderState, parseQuantity, payoffCurve, planBody, scheduleTime, startBody, startRefused, taskSummary } from '../web/src/options-form.ts';
-import type { ChainRow, Execution, OrderRow, PerformanceGroup, PerformanceView, Plan, PreviewLeg, Task } from '../web/src/options-types.ts';
+import { autoOpenConfirm, chainLines, quoteFingerprint, quoteSecondsLeft, rfqCreateBody, rfqCreateProblem, rfqExecuteBody, rfqOpen, coverageLine, groupLabel, markedRows, performanceStatus, plotRows, plotTick, utcMinute, selectedSeries, orderState, parseQuantity, payoffCurve, planBody, scheduleTime, startBody, startRefused, taskSummary } from '../web/src/options-form.ts';
+import type { ChainRow, Execution, OrderRow, PerformanceGroup, PerformanceView, Plan, PreviewLeg, RfqQuote, Task } from '../web/src/options-types.ts';
 
 const PLAN: Plan = {
   planId: 'a'.repeat(32), operation: 'open', mode: 'iron_condor', createdAt: 0, expiresAt: 30_000, legs: [], estimatedGrossUsd: 100, estimatedFeeUsd: 2,
@@ -154,4 +154,35 @@ test('期权收益页：时间刻度跨一天改显示日期；无时间显示 -
   assert.ok(marked.length <= 82, String(marked.length));
   assert.deepEqual([marked[0], marked.includes(101), marked.at(-1)], [0, true, 199]);
   assert.deepEqual(markedRows(rows.slice(0, 5)).map(row => row.time), [0, 1, 2, 3, 4]);
+});
+
+test('组合询价表单：创建与执行请求体通过服务端校验；创建前提按顺序说明原因；报价内容任一变化都换确认指纹', async () => {
+  const calls: unknown[] = [];
+  const engine = { createRfq: async (request: unknown) => { calls.push(request); return {}; }, executeQuote: async (request: unknown) => { calls.push(request); return {}; } } as unknown as OptionsEngine;
+  const views = optionsViews(engine);
+  await views.rfqCreate({ ...rfqCreateBody('0.5', 'short_strangle'), requestId: 'req-0000-0009' });
+  await views.rfqExecute(rfqExecuteBody('rfq-1', 'quote-1'));
+  assert.deepEqual(calls, [{ requestId: 'req-0000-0009', confirmLive: true, quantity: '0.5', mode: 'short_strangle' }, { rfqId: 'rfq-1', quoteId: 'quote-1', confirmLive: true }]);
+
+  const ready = { finished: true, blocked: null, market: { at: 1, stale: false } };
+  assert.equal(rfqCreateProblem(null, '1'), '等待询价状态同步');
+  assert.equal(rfqCreateProblem({ ...ready, finished: false }, '1'), '上一笔询价尚未结束');
+  assert.equal(rfqCreateProblem({ ...ready, blocked: '先平掉跟踪中的策略再询价开仓' }, '1'), '先平掉跟踪中的策略再询价开仓');
+  assert.match(rfqCreateProblem(ready, null) ?? '', /正数/);
+  assert.match(rfqCreateProblem({ ...ready, market: { at: 1, stale: true } }, '1') ?? '', /行情已过期/);
+  assert.equal(rfqCreateProblem(ready, '1'), null);
+
+  assert.equal(rfqOpen({ rfqId: 'r', status: 'Active', selectedQuoteId: null }), true);
+  for (const rfq of [null, { rfqId: null, status: 'Active' as const, selectedQuoteId: null }, { rfqId: 'r', status: 'Active' as const, selectedQuoteId: 'q' }, { rfqId: 'r', status: 'CancelUnknown' as const, selectedQuoteId: null }]) assert.equal(rfqOpen(rfq), false);
+
+  const quote: RfqQuote = {
+    quoteId: 'q1', deskCode: 'D', status: 'Active', expiresAt: 60_000, covered: 1, total: 1, netUsd: 10, chainNetUsd: 9, diffUsd: 1, feeUsd: 0.5, problem: null,
+    legs: [{ symbol: 'BTC-1', side: 'Sell', qty: '1', price: 10, chain: 9, diff: 1 }],
+  };
+  const base = quoteFingerprint('r', quote);
+  assert.equal(quoteFingerprint('r', { ...quote, problem: 'x', diffUsd: 3 } as RfqQuote), base, '只看报价本身，不看链价与提示');
+  for (const other of [{ ...quote, expiresAt: 61_000 }, { ...quote, quoteId: 'q2' }, { ...quote, legs: [{ ...quote.legs[0]!, price: 11 }] }, { ...quote, legs: [{ ...quote.legs[0]!, qty: '2' }] }]) assert.notEqual(quoteFingerprint('r', other), base);
+  assert.notEqual(quoteFingerprint('r2', quote), base);
+  assert.equal(quoteSecondsLeft(quote, 50_500), 9);
+  assert.equal(quoteSecondsLeft(quote, 70_000), 0);
 });

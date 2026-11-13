@@ -2,6 +2,7 @@ import { Layers3, RefreshCw } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { OIL_READ_TIMEOUT_MS, OIL_STATE_PATH, OilPage } from './OilPage.tsx';
 import { LogsPage } from './LogsPage.tsx';
+import { MONITOR_READ_TIMEOUT_MS, MONITOR_STATE_PATH, MonitorPage, parseMonitorState, type MonitorState } from './MonitorPage.tsx';
 import { PairsWorkspace } from './PairsWorkspace.tsx';
 import { useRoute, type Route } from './route.ts';
 import { SettingsPage } from './SettingsPage.tsx';
@@ -14,7 +15,7 @@ import type { OilState } from './oil-types.ts';
 
 // The page shell follows the workbench's ASTER desk (modules/aster/dashboard/app/page.tsx, b2fae14): the top bar with
 // the brand, the page heading with the connection state, then line tabs. The ASTER pages sit in .aster-module, which
-// carries the workbench's element styles; the oil page keeps its own.
+// carries the workbench's element styles; the oil and monitor pages keep their own.
 
 const REFRESH_MS = 2_000;
 const READ_TIMEOUT_MS = 10_000;
@@ -32,6 +33,8 @@ const TABS: Tab[] = [
 /** Shown only where /api/oil/state answers: a service without oil returns 404 there. */
 const OIL_TAB: Tab = { pages: ['oil'], href: '#/oil', text: '原油' };
 const OIL_CHECK_MS = 60_000;
+/** Likewise for /api/monitor/state: without config.monitor (or its database) the service answers 404. */
+const MONITOR_TAB: Tab = { pages: ['monitor'], href: '#/monitor', text: '行情监控' };
 
 export function App() {
   const route = useRoute();
@@ -41,7 +44,8 @@ export function App() {
   const { data: state, status, error, receivedAt, refresh } = live;
   // The oil page reads the same path faster while it is open; here it only decides whether the tab shows.
   const oil = useLiveResource<OilState>(OIL_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: OIL_READ_TIMEOUT_MS, onExpired });
-  const tabs = oil.data !== null ? [...TABS, OIL_TAB] : TABS;
+  const monitor = useLiveResource<MonitorState>(MONITOR_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: MONITOR_READ_TIMEOUT_MS, parse: parseMonitorState, onExpired });
+  const tabs = [...TABS, ...(oil.data !== null ? [OIL_TAB] : []), ...(monitor.data !== null ? [MONITOR_TAB] : [])];
   // A read that succeeds again (after logging in from another tab) clears the notice.
   useEffect(() => { if (status === 'ready') setExpired(false); }, [status]);
   const changed = useCallback(() => { void refresh(); }, [refresh]);
@@ -53,7 +57,7 @@ export function App() {
   const stale = state !== null && (status === 'error' || status === 'offline' || status === 'paused' || (status === 'loading' && (error !== null || old)));
   const failed = status === 'error' || status === 'offline';
   const limits = state ? limitsText(state) : null;
-  const aster = route.page !== 'oil';
+  const aster = route.page !== 'oil' && route.page !== 'monitor';
   return <div className="aster-desk">
     <main className="desk focused-desk">
       <header className="topbar">
@@ -99,7 +103,7 @@ export function App() {
                   ? <StatePanel kind="error" title="读取服务状态失败" detail={error?.message ?? '网络离线'} />
                   : <StatePanel kind="loading" title="加载中…" />)
                   : <PairsWorkspace state={state} pairId={route.page === 'pair' ? route.pairId : null} stale={stale} onChanged={changed} onExpired={onExpired} />}
-            </div> : <OilPage onExpired={onExpired} />}
+            </div> : route.page === 'oil' ? <OilPage onExpired={onExpired} /> : <MonitorPage onExpired={onExpired} />}
           </div>
         </div>
       </div>

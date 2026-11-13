@@ -9,6 +9,7 @@ import type { Executor } from './executor.ts';
 import { LIVE_PAGE, PAGE } from './page.ts';
 import { LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash } from './login-password.ts';
 import type { WebApp } from './web-assets.ts';
+import { ANTHROPIC_RETENTION_DAYS } from './vendor/anthropic-market.mjs';
 
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_LOGIN_BYTES = 4 * 1024;
@@ -22,6 +23,8 @@ const ADL_RESTART_PATH = /^\/api\/adl\/incidents\/([0-9a-f-]{36})\/restart$/;
 const PAIR_READ_PATH = /^\/api\/transfer-pairs\/([0-9A-Za-z_-]{1,64})\/(balances|history)$/;
 const ADL_HISTORY_PATH = /^\/api\/adl\/pairs\/([0-9A-Za-z_-]{1,64})\/incidents$/;
 const TRANSFER_PAGE_MAX = 50, ADL_PAGE_MAX = 20;
+const MONITOR_PATHS = new Set(['/api/monitor/state', '/api/monitor/anthropic/quote', '/api/monitor/anthropic/candles']);
+const MONITOR_MAX_DAYS = ANTHROPIC_RETENTION_DAYS;
 
 const PAGE_HEADERS = {
   'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer',
@@ -54,6 +57,8 @@ export interface ServiceViews {
   balanceHistory?(pairId: string, range: string): unknown;
   /** The oil module's reads (books and spreads; accounts, positions, jobs, caps); absent when the service runs no oil. */
   oil?: { market(): unknown; state(): unknown };
+  /** The read-only market monitors; the two Anthropic reads give null until there is data. Absent without config.monitor. */
+  monitor?: { state(): unknown; anthropicQuote(): unknown; anthropicCandles(days: number | null): unknown };
   /** The service's log lines, newest first (service-log.ts); `before` is the last id of the previous page. */
   logs?(filter: 'all' | 'problems', before: number | null, limit: number): unknown;
 }
@@ -220,6 +225,18 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'GET' && (url.pathname === '/api/oil/market' || url.pathname === '/api/oil/state')) {
       if (!views?.oil) return send(response, 404, { code: 'not_found', message: '本服务没有配置原油执行' });
       return send(response, 200, url.pathname === '/api/oil/market' ? views.oil.market() : views.oil.state());
+    }
+    if (request.method === 'GET' && MONITOR_PATHS.has(url.pathname)) {
+      if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
+      if (url.pathname === '/api/monitor/state') return send(response, 200, views.monitor.state());
+      if (url.pathname === '/api/monitor/anthropic/quote') {
+        const quote = views.monitor.anthropicQuote();
+        return quote === null ? send(response, 503, { code: 'not_ready', message: '尚未取得 Anthropic 报价，后台正在采集' }) : send(response, 200, quote);
+      }
+      const days = url.searchParams.get('days');
+      if (days !== null && (!/^[1-9]\d{0,2}$/.test(days) || Number(days) > MONITOR_MAX_DAYS)) return send(response, 400, { code: 'invalid_days', message: `days 须为 1–${MONITOR_MAX_DAYS} 的整数` });
+      const candles = views.monitor.anthropicCandles(days === null ? null : Number(days));
+      return candles === null ? send(response, 503, { code: 'not_ready', message: '尚未取得 Anthropic K 线，后台正在采集' }) : send(response, 200, candles);
     }
     if (request.method === 'GET' && (url.pathname === '/api/logs' || url.pathname === '/api/logs/problems')) {
       if (!views?.logs) return send(response, 404, { code: 'not_found', message: '本服务没有页面日志' });

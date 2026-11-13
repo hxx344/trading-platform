@@ -1,0 +1,105 @@
+// A stand-in for the four public venues the Anthropic monitor reads (Binance, Hyperliquid xyz/io, Lighter RH), shared by
+// monitor.test.ts and scripts/dev-monitor.ts. Prices follow a slow wave around ~95 USD per share so the chart has shape.
+import type { AnthropicLegKey } from '../src/vendor/anthropic-market.mjs';
+
+const BAR = 900_000, DAY = 86_400_000;
+const ok = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+const fail = (status: number) => new Response('{}', { status });
+
+/** Native price of a leg at `time`: per-share price times the leg's shares per unit (12.7, 1, 16.7, 16.7). */
+export function fakeAnthropicPrice(leg: AnthropicLegKey, time: number): number {
+  const share = 95 + 4 * Math.sin(time / (5 * DAY));
+  const premium = 0.02 + 0.015 * Math.sin(time / (2 * DAY) + (leg === 'io' ? 1 : leg === 'rh' ? 2 : 0));
+  const value = leg === 'binance' ? share * 12.7 : share / (1 + premium) * (leg === 'xyz' ? 1 : 16.7);
+  return Math.round(value * 100) / 100;
+}
+
+const wait = (ms: number, signal: AbortSignal | null | undefined) => new Promise<void>((resolve, reject) => {
+  if (signal?.aborted) { reject(signal.reason); return; }
+  const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, ms);
+  const abort = () => { clearTimeout(timer); reject(signal!.reason); };
+  signal?.addEventListener('abort', abort, { once: true });
+});
+
+const held = (hold: Promise<void>, signal: AbortSignal | null | undefined) => new Promise<void>((resolve, reject) => {
+  if (signal?.aborted) { reject(signal.reason); return; }
+  const abort = () => reject(signal!.reason);
+  signal?.addEventListener('abort', abort, { once: true });
+  void hold.then(() => { signal?.removeEventListener('abort', abort); resolve(); });
+});
+
+export interface FakeVenueOptions {
+  /** The venues' clock; candles end at the last completed bar before it. */
+  now?: () => number;
+  /** First bar each leg has (default: 60 days before the first request; Lighter RH 20 days). */
+  listedAt?: Partial<Record<AnthropicLegKey, number>>;
+}
+
+export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenueOptions = {}) {
+  const start = now();
+  const listed = (leg: AnthropicLegKey) => listedAt[leg] ?? start - (leg === 'rh' ? 20 : 60) * DAY;
+  const state = {
+    /** Legs answering HTTP 500. */
+    down: new Set<AnthropicLegKey>(),
+    /** Delay before every answer; aborting the request ends the wait. */
+    delayMs: 0,
+    /** While set, every request waits for it (or its abort). */
+    hold: null as Promise<void> | null,
+    /** Requests by kind ('quote:binance', 'candles:xyz', ...), and the most of one kind in flight at once. */
+    requests: new Map<string, number>(),
+    maxInFlight: new Map<string, number>(),
+  };
+  const inFlight = new Map<string, number>();
+  const bars = (leg: AnthropicLegKey, from: number, to: number) => {
+    const out: number[] = [];
+    for (let t = Math.ceil(Math.max(from, listed(leg)) / BAR) * BAR; t < to && t <= now(); t += BAR) out.push(t);
+    return out;
+  };
+  const answer = (leg: AnthropicLegKey, url: URL, body: Record<string, any> | null): Response => {
+    if (state.down.has(leg)) return fail(500);
+    if (leg === 'binance') {
+      if (url.pathname === '/fapi/v1/premiumIndex') return ok({ symbol: 'ANTHROPICUSDT', markPrice: String(fakeAnthropicPrice('binance', now())), lastFundingRate: '0.0001', nextFundingTime: Math.ceil(now() / 28_800_000) * 28_800_000 });
+      const from = Number(url.searchParams.get('startTime')), to = Number(url.searchParams.get('endTime')), limit = Number(url.searchParams.get('limit'));
+      return ok(bars(leg, from, to + 1).slice(0, limit).map(t => [t, '1', '1', '1', String(fakeAnthropicPrice(leg, t)), '1', t + BAR - 1]));
+    }
+    if (leg === 'xyz' || leg === 'io') {
+      const name = leg === 'xyz' ? 'xyz:ANT' : 'io:ANTH';
+      if (body!.type === 'metaAndAssetCtxs') return ok([{ universe: [{ name: 'other' }, { name }] }, [{ markPx: '1' }, { markPx: String(fakeAnthropicPrice(leg, now())), funding: '0.0000125', oraclePx: String(fakeAnthropicPrice(leg, now())) }]]);
+      // Hyperliquid serves only its latest 5000 candles.
+      return ok(bars(leg, body!.req.startTime, body!.req.endTime + 1).slice(-5000).map(t => ({ t, T: t + BAR - 1, s: name, i: '15m', o: '1', h: '1', l: '1', c: String(fakeAnthropicPrice(leg, t)), v: '1', n: 1 })));
+    }
+    const row = () => ({ symbol: 'ANTHROPIC', market_id: 38, market_type: 'perp', status: 'active', mark_price: String(fakeAnthropicPrice('rh', now())), index_price: String(fakeAnthropicPrice('rh', now())), created_at: String(listed('rh')) });
+    if (url.pathname === '/api/v1/orderBookDetails') {
+      const market = url.searchParams.get('market_id');
+      if (market === null) return ok({ code: 200, order_book_details: [{ symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', mark_price: '1' }, row()] });
+      return market === '38' ? ok({ code: 200, order_book_details: [row()] }) : ok({ code: 21602, message: 'invalid market index' }, 400);
+    }
+    if (url.pathname === '/api/v1/candles') {
+      const end = Number(url.searchParams.get('end_timestamp')), count = Number(url.searchParams.get('count_back'));
+      return ok({ code: 200, r: '15m', c: bars(leg, end - count * BAR, end).slice(-500).map(t => ({ t, o: 1, h: 1, l: 1, c: fakeAnthropicPrice('rh', t), v: 1, V: 1, i: t })) });
+    }
+    return fail(404);
+  };
+  const fetch = async (href: string, init: RequestInit = {}): Promise<Response> => {
+    const url = new URL(href);
+    let leg: AnthropicLegKey, kind: string, body: Record<string, any> | null = null;
+    if (url.hostname === 'fapi.binance.com') { leg = 'binance'; kind = url.pathname === '/fapi/v1/premiumIndex' ? 'quote' : 'candles'; }
+    else if (url.hostname === 'api.hyperliquid.xyz') {
+      body = JSON.parse(String(init.body)) as Record<string, any>;
+      leg = body.type === 'metaAndAssetCtxs' ? (body.dex === 'xyz' ? 'xyz' : 'io') : (body.req.coin === 'xyz:ANT' ? 'xyz' : 'io');
+      kind = body.type === 'metaAndAssetCtxs' ? 'quote' : 'candles';
+    } else if (url.hostname === 'api.rh.lighter.xyz') { leg = 'rh'; kind = url.pathname === '/api/v1/candles' ? 'candles' : 'quote'; }
+    else throw new Error(`unexpected request ${href}`);
+    const key = `${kind}:${leg}`;
+    state.requests.set(key, (state.requests.get(key) ?? 0) + 1);
+    inFlight.set(key, (inFlight.get(key) ?? 0) + 1);
+    state.maxInFlight.set(key, Math.max(state.maxInFlight.get(key) ?? 0, inFlight.get(key)!));
+    try {
+      if (state.hold) await held(state.hold, init.signal);
+      if (state.delayMs) await wait(state.delayMs, init.signal);
+      return answer(leg, url, body);
+    } finally { inFlight.set(key, inFlight.get(key)! - 1); }
+  };
+  return Object.assign(state, { fetch });
+}
+export type FakeAnthropicVenues = ReturnType<typeof fakeAnthropicVenues>;

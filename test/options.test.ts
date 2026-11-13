@@ -8,7 +8,7 @@ import { ContractError } from '../src/contracts.ts';
 import { createExecutorServer } from '../src/http.ts';
 import { bybitPermissionProblem } from '../src/live/permissions.ts';
 import { createOptionsClient } from '../src/options/client.ts';
-import { createOptionsEngine, type OptionsEngine, type TaskStatus } from '../src/options/engine.ts';
+import { createOptionsEngine, isoWeek, type AutoOpenSettings, type OptionsEngine, type TaskStatus } from '../src/options/engine.ts';
 import { createOptionMarket } from '../src/options/market.ts';
 import { openOptionsStore, type OptionsStore } from '../src/options/store.ts';
 import { DEFAULT_ESTIMATES, type StrategyMode } from '../src/options/strategy.ts';
@@ -21,11 +21,14 @@ import { FRIDAY, FakeOptions, UID, symbolOf, type FillMode } from './options-fak
 const CREDENTIALS = { apiKey: 'options-test-key', apiSecret: 'options-test-secret' };
 const TERMINAL: TaskStatus[] = ['completed', 'partial', 'stopped', 'failed'];
 
-interface Setup { fake: FakeOptions; market: ReturnType<typeof createOptionMarket>; engine: OptionsEngine; store: OptionsStore; notes: string[]; logs: string[]; dir: string; now: () => number; make(store: OptionsStore): OptionsEngine; dispose(): void }
+interface Setup { fake: FakeOptions; market: ReturnType<typeof createOptionMarket>; engine: OptionsEngine; store: OptionsStore; notes: string[]; logs: string[]; dir: string; now: () => number; make(store: OptionsStore): OptionsEngine; dispose(): void;
+  /** skewMs moves the engine's clock; onNote runs inside notify (synchronously, as the engine sends). */
+  hooks: { skewMs: number; onNote?: (text: string) => void } }
 
-function setup({ mode = 'iron_condor', fill = 'fill', maxRiskUsd = 50_000, maxMarginUsd = 50_000, orderTimeoutMs = 600, base = FRIDAY, missingSettleMs }: { mode?: StrategyMode; fill?: FillMode; maxRiskUsd?: number; maxMarginUsd?: number; orderTimeoutMs?: number; base?: number; missingSettleMs?: number } = {}): Setup {
+function setup({ mode = 'iron_condor', fill = 'fill', maxRiskUsd = 50_000, maxMarginUsd = 50_000, orderTimeoutMs = 600, base = FRIDAY, missingSettleMs, autoOpen, marketFallback }: { mode?: StrategyMode; fill?: FillMode; maxRiskUsd?: number; maxMarginUsd?: number; orderTimeoutMs?: number; base?: number; missingSettleMs?: number; autoOpen?: AutoOpenSettings; marketFallback?: boolean } = {}): Setup {
   const started = Date.now();
-  const now = () => base + (Date.now() - started);
+  const hooks: Setup['hooks'] = { skewMs: 0 };
+  const now = () => base + (Date.now() - started) + hooks.skewMs;
   const fake = new FakeOptions(now);
   fake.fillMode = fill;
   const client = createOptionsClient({ credentials: CREDENTIALS, fetchImpl: fake.fetch });
@@ -34,12 +37,12 @@ function setup({ mode = 'iron_condor', fill = 'fill', maxRiskUsd = 50_000, maxMa
   const store = openOptionsStore(join(dir, 'options.sqlite'));
   const notes: string[] = [], logs: string[] = [];
   const make = (target: OptionsStore) => createOptionsEngine({
-    client, market, store: target, uid: UID, now, notify: text => notes.push(text), log: line => logs.push(line),
+    client, market, store: target, uid: UID, now, notify: text => { notes.push(text); hooks.onNote?.(text); }, log: line => logs.push(line),
     sleep: () => new Promise(resolve => setTimeout(resolve, 2)), pollMs: 20, sampleMs: 40, ...(missingSettleMs === undefined ? {} : { missingSettleMs }),
-    settings: { maxRiskUsd, maxMarginUsd, legQty: '1', strategyMode: mode, orderTimeoutMs, estimates: DEFAULT_ESTIMATES },
+    settings: { maxRiskUsd, maxMarginUsd, legQty: '1', strategyMode: mode, orderTimeoutMs, estimates: DEFAULT_ESTIMATES, ...(autoOpen ? { autoOpen } : {}), ...(marketFallback ? { marketFallback } : {}) },
   });
   const engine = make(store);
-  return { fake, market, engine, store, notes, logs, dir, now, make, dispose: () => { try { store.close(); } catch { /* closed */ } rmSync(dir, { recursive: true, force: true }); } };
+  return { fake, market, engine, store, notes, logs, dir, now, make, hooks, dispose: () => { try { store.close(); } catch { /* closed */ } rmSync(dir, { recursive: true, force: true }); } };
 }
 
 async function until(check: () => boolean, ms = 8_000): Promise<void> {
@@ -132,6 +135,268 @@ test('期权：一腿部分成交，超时撤单后任务为部分成交，跟�
     assert.equal(s.engine.state().tracked.sizes[`${symbolOf(102000, 'C')}|Sell`], '0.5');
     assert.equal([...s.fake.orders.values()].find(order => order.symbol === symbolOf(102000, 'C'))!.status, 'PartiallyFilledCanceled');
   } finally { s.dispose(); }
+});
+
+test('期权 IOC 兜底：买翼超时未成交，剩余数量发一次 IOC 补齐后才下卖腿，任务完成', async () => {
+  const s = setup({ marketFallback: true });
+  s.fake.modes.set(symbolOf(116000, 'C'), 'rest');
+  try {
+    const plan = await s.engine.createPlan({ operation: 'open' });
+    // Crossing the spread costs more than the passive estimate: the confirmed net limit must leave room for it.
+    const started = await s.engine.startTask({ planId: plan.planId, requestId: 'req-ioc-0001', confirmLive: true, minNetIncomeUsd: plan.estimatedNetUsd - 500 });
+    await finished(s, started.taskId);
+    const task = s.engine.state().tasks[started.taskId]!;
+    assert.equal(task.status, 'completed', task.error ?? '');
+    const wing = [...s.fake.orders.values()].filter(order => order.symbol === symbolOf(116000, 'C'));
+    assert.deepEqual(wing.map(order => [order.link.startsWith('tpo-ioc-'), order.status]), [[false, 'Cancelled'], [true, 'Filled']]);
+    // The IOC buys at ask 1, the fake's mark + 10.
+    assert.equal(wing[1]!.price, String(Number(s.fake.quote(symbolOf(116000, 'C')).ask1Price)));
+    const ioc = Object.entries(s.engine.state().journal).find(([link]) => link.startsWith('tpo-ioc-'))!;
+    assert.deepEqual([ioc[1].kind, ioc[1].qty, ioc[1].filledQty, ioc[1].taskId], ['ioc', '1', '1', started.taskId]);
+    assert.equal(s.engine.state().tracked.sizes[`${symbolOf(116000, 'C')}|Buy`], '1');
+    assert.equal([...s.fake.orders.values()].filter(order => order.side === 'Sell').length, 2);
+    await until(() => s.engine.state().executions.some(item => item.orderLinkId.startsWith('tpo-ioc-')));
+  } finally { s.dispose(); }
+});
+
+test('期权 IOC 兜底：部分成交只补剩余数量；默认净价限制挡住 IOC，卖腿不下', async () => {
+  const partial = setup({ marketFallback: true });
+  partial.fake.modes.set(symbolOf(84000, 'P'), 'partial');
+  try {
+    const plan = await partial.engine.createPlan({ operation: 'open' });
+    const started = await partial.engine.startTask({ planId: plan.planId, requestId: 'req-ioc-0002', confirmLive: true, minNetIncomeUsd: plan.estimatedNetUsd - 500 });
+    await finished(partial, started.taskId);
+    assert.equal(partial.engine.state().tasks[started.taskId]!.status, 'completed');
+    const ioc = [...partial.fake.orders.values()].find(order => order.link.startsWith('tpo-ioc-'))!;
+    assert.deepEqual([ioc.symbol, ioc.qty, ioc.status], [symbolOf(84000, 'P'), '0.5', 'Filled']);
+  } finally { partial.dispose(); }
+
+  // The IOC itself only half fills: the leg ends partial and no sell goes out.
+  const half = setup({ marketFallback: true });
+  half.fake.modes.set(symbolOf(116000, 'C'), 'rest');
+  half.fake.iocMode = 'partial';
+  try {
+    const plan = await half.engine.createPlan({ operation: 'open' });
+    const started = await half.engine.startTask({ planId: plan.planId, requestId: 'req-ioc-0003', confirmLive: true, minNetIncomeUsd: plan.estimatedNetUsd - 5_000 });
+    await finished(half, started.taskId);
+    assert.equal(half.engine.state().tasks[started.taskId]!.status, 'partial');
+    assert.equal(half.engine.state().tracked.sizes[`${symbolOf(116000, 'C')}|Buy`], '0.5');
+    assert.ok([...half.fake.orders.values()].every(order => order.side === 'Buy'));
+  } finally { half.dispose(); }
+
+  const tight = setup({ marketFallback: true });
+  tight.fake.modes.set(symbolOf(116000, 'C'), 'rest');
+  try {
+    const { started } = await open(tight);
+    await finished(tight, started.taskId);
+    const task = tight.engine.state().tasks[started.taskId]!;
+    assert.equal(task.status, 'partial');
+    assert.equal(task.netBlocked, true);
+    assert.match(task.error ?? '', /净价限制/);
+    assert.ok([...tight.fake.orders.values()].every(order => order.side === 'Buy' && !order.link.startsWith('tpo-ioc-')));
+  } finally { tight.dispose(); }
+});
+
+test('期权 IOC 兜底：IOC 应答丢失且读不到时卖腿不下、转待核对；重启后对账结算 IOC，跟踪数量计入其成交，不补发卖腿', async () => {
+  const s = setup({ marketFallback: true });
+  s.fake.modes.set(symbolOf(116000, 'C'), 'rest');
+  s.fake.iocMode = 'lost';
+  const second = openOptionsStore(join(s.dir, 'second.sqlite'));
+  try {
+    const plan = await s.engine.createPlan({ operation: 'open' });
+    const started = await s.engine.startTask({ planId: plan.planId, requestId: 'req-ioc-0004', confirmLive: true, minNetIncomeUsd: plan.estimatedNetUsd - 500 });
+    await finished(s, started.taskId);
+    assert.equal(s.engine.state().tasks[started.taskId]!.status, 'recovery_needed');
+    const [link, entry] = Object.entries(s.engine.state().journal).find(([key]) => key.startsWith('tpo-ioc-'))!;
+    assert.deepEqual([entry.terminal, entry.status], [false, 'unknown']);
+    assert.ok([...s.fake.orders.values()].every(order => order.side === 'Buy'));
+    const creates = s.fake.creates;
+    // The process dies with the IOC unresolved; the next one restores it and reconciliation reads it back.
+    second.save(structuredClone(s.store.load()));
+    const restarted = s.make(second);
+    await assert.rejects(restarted.createPlan({ operation: 'open' }), refused('orders_unresolved'));
+    s.fake.orders.get(link)!.visible = true;
+    await restarted.reconcileOnce();
+    const settled = restarted.state().journal[link]!;
+    assert.deepEqual([settled.terminal, settled.status, settled.filledQty], [true, 'filled', '1']);
+    assert.equal(restarted.state().tasks[started.taskId]!.status, 'partial');
+    assert.equal(restarted.state().tracked.sizes[`${symbolOf(116000, 'C')}|Buy`], '1');
+    assert.equal(s.fake.creates, creates);
+    assert.ok([...s.fake.orders.values()].every(order => order.side === 'Buy'));
+  } finally { second.close(); s.dispose(); }
+});
+
+test('期权 IOC 兜底：兜底等待期间停止不发 IOC；兜底前读不到原单时原单保持终态、不发 IOC', async () => {
+  const wingOf = (s: Setup) => Object.entries(s.engine.state().journal).find(([, entry]) => entry.symbol === symbolOf(116000, 'C') && entry.kind !== 'ioc');
+  const iocSent = (s: Setup) => [...s.fake.orders.values()].some(order => order.link.startsWith('tpo-ioc-')) || Object.keys(s.engine.state().journal).some(link => link.startsWith('tpo-ioc-'));
+
+  const stopped = setup({ marketFallback: true });
+  stopped.fake.modes.set(symbolOf(116000, 'C'), 'rest');
+  try {
+    const plan = await stopped.engine.createPlan({ operation: 'open' });
+    const started = await stopped.engine.startTask({ planId: plan.planId, requestId: 'req-ioc-0005', confirmLive: true, minNetIncomeUsd: plan.estimatedNetUsd - 500 });
+    // The wing timed out; the fallback is in its 0.8 s pause.
+    await until(() => wingOf(stopped)?.[1].terminal === true);
+    stopped.engine.stopTask(started.taskId);
+    await finished(stopped, started.taskId);
+    // The other wing filled, so the stopped task ends partial; nothing more went out.
+    const task = stopped.engine.state().tasks[started.taskId]!;
+    assert.deepEqual([task.status, task.stopRequested], ['partial', true]);
+    assert.match(task.error ?? '', /IOC 兜底中断/);
+    assert.equal(iocSent(stopped), false);
+    assert.ok([...stopped.fake.orders.values()].every(order => order.side === 'Buy'));
+  } finally { stopped.dispose(); }
+
+  const blind = setup({ marketFallback: true });
+  blind.fake.modes.set(symbolOf(116000, 'C'), 'rest');
+  try {
+    const plan = await blind.engine.createPlan({ operation: 'open' });
+    const started = await blind.engine.startTask({ planId: plan.planId, requestId: 'req-ioc-0006', confirmLive: true, minNetIncomeUsd: plan.estimatedNetUsd - 500 });
+    await until(() => wingOf(blind)?.[1].terminal === true);
+    const [link] = wingOf(blind)!;
+    blind.fake.orders.get(link)!.visible = false;
+    await finished(blind, started.taskId);
+    const task = blind.engine.state().tasks[started.taskId]!;
+    assert.deepEqual([blind.engine.state().journal[link]!.terminal, blind.engine.state().journal[link]!.status], [true, 'timeout_cancelled']);
+    assert.equal(task.status, 'partial');
+    assert.match(task.error ?? '', /兜底前未能再次读到原订单/);
+    assert.equal(iocSent(blind), false);
+    assert.ok([...blind.fake.orders.values()].every(order => order.side === 'Buy'));
+  } finally { blind.dispose(); }
+});
+
+/** Friday 2026-11-13 21:00 UTC (the default opening time), plus offsetMs. */
+const OPENING = (offsetMs = 0) => Date.UTC(2026, 10, 13, 21) + offsetMs;
+const AUTO = (enabled: boolean, windowSeconds = 60): AutoOpenSettings => ({ enabled, hourUtc: 21, minuteUtc: 0, windowSeconds });
+
+test('期权定时开仓：窗口内每周只开一次，请求编号 scheduled-<周>，结果与飞书消息标明定时；窗口外不动', async () => {
+  assert.deepEqual([isoWeek(Date.UTC(2026, 10, 13)), isoWeek(Date.UTC(2027, 0, 1)), isoWeek(Date.UTC(2026, 0, 1)), isoWeek(Date.UTC(2024, 11, 30))], ['2026-W46', '2026-W53', '2026-W01', '2025-W01']);
+  const s = setup({ base: OPENING(5_000), autoOpen: AUTO(true) });
+  try {
+    assert.deepEqual([s.engine.stateView().schedule.inWindow, s.engine.stateView().schedule.waiting], [true, true]);
+    await s.engine.autoOpenTick();
+    const tasks = Object.values(s.engine.state().tasks);
+    assert.equal(tasks.length, 1);
+    assert.deepEqual([tasks[0]!.requestId, tasks[0]!.scheduled, s.engine.state().schedule.lastOpenWeek], ['scheduled-2026-W46', true, '2026-W46']);
+    await finished(s, tasks[0]!.id);
+    assert.equal(s.engine.state().tasks[tasks[0]!.id]!.status, 'completed');
+    assert.ok(s.notes.some(text => text.startsWith('期权定时开仓任务') && text.includes('已确认')));
+    await s.engine.autoOpenTick();
+    assert.equal(Object.keys(s.engine.state().tasks).length, 1);
+    assert.equal(s.engine.stateView().schedule.waiting, false);
+    // The next window is next Friday's.
+    assert.equal(s.engine.stateView().schedule.nextAt, OPENING(7 * 86_400_000));
+  } finally { s.dispose(); }
+
+  const outside = setup({ autoOpen: AUTO(true) });
+  try {
+    await outside.engine.autoOpenTick();
+    assert.deepEqual([Object.keys(outside.engine.state().tasks).length, outside.engine.state().schedule.attemptWeek], [0, null]);
+    assert.equal(outside.engine.stateView().schedule.nextAt, OPENING());
+  } finally { outside.dispose(); }
+});
+
+test('期权定时开仓：受理后重启不会再开；窗口里没跑过检查也提醒一次，页面在窗口后才打开的不提醒', async () => {
+  const s = setup({ base: OPENING(5_000), autoOpen: AUTO(true) });
+  try {
+    await s.engine.autoOpenTick();
+    const [task] = Object.values(s.engine.state().tasks);
+    await finished(s, task!.id);
+    const reopened = s.make(s.store);
+    await reopened.autoOpenTick();
+    assert.deepEqual([Object.keys(reopened.state().tasks).length, reopened.state().schedule.attemptWeek], [1, null]);
+  } finally { s.dispose(); }
+
+  const missed = setup({ base: OPENING(120_000), autoOpen: AUTO(true) });
+  try {
+    // The scheduler ran before (it opened last week); this week's window passed while the service was down.
+    const document = structuredClone(missed.engine.state());
+    Object.assign(document.schedule, { lastOpenWeek: '2026-W45', notifiedWeek: null });
+    missed.store.save(document);
+    const engine = missed.make(missed.store);
+    await engine.autoOpenTick();
+    await engine.autoOpenTick();
+    assert.deepEqual(missed.notes.filter(text => text.includes('定时开仓未执行')), ['期权定时开仓未执行（2026-W46）：窗口内没有执行检查（服务没在运行，或窗口短于 5 秒的检查间隔）']);
+    assert.equal(engine.stateView().schedule.lastError, null);
+  } finally { missed.dispose(); }
+
+  // A first deploy with config.json's switch on, after this week's window: nothing ran before it, so no reminder.
+  const fresh = setup({ base: OPENING(120_000), autoOpen: AUTO(true) });
+  try {
+    await fresh.engine.autoOpenTick();
+    assert.equal(fresh.notes.filter(text => text.includes('定时开仓未执行')).length, 0);
+  } finally { fresh.dispose(); }
+
+  const late = setup({ base: OPENING(120_000), autoOpen: AUTO(false) });
+  try {
+    late.engine.setAutoOpen(true);
+    await late.engine.autoOpenTick();
+    assert.equal(late.notes.filter(text => text.includes('定时开仓未执行')).length, 0);
+    assert.equal(late.engine.stateView().schedule.nextAt, OPENING(7 * 86_400_000));
+  } finally { late.dispose(); }
+});
+
+test('期权定时开仓：页面开关覆盖配置并在重启后保留；关闭时窗口内也不开仓', async () => {
+  const s = setup({ base: OPENING(1_000), autoOpen: AUTO(false) });
+  try {
+    await s.engine.autoOpenTick();
+    assert.equal(Object.keys(s.engine.state().tasks).length, 0);
+    const view = s.engine.setAutoOpen(true);
+    assert.deepEqual([view.enabled, view.source, view.configEnabled], [true, 'page', false]);
+    const reopened = s.make(s.store);
+    assert.deepEqual([reopened.stateView().schedule.enabled, reopened.stateView().schedule.source], [true, 'page']);
+    await s.engine.autoOpenTick();
+    assert.equal(Object.keys(s.engine.state().tasks).length, 1);
+    assert.equal(s.engine.setAutoOpen(false).enabled, false);
+  } finally { s.dispose(); }
+});
+
+test('期权定时开仓：被拒绝时窗口内重试、同一原因只记一次日志；窗口结束发一次飞书', async () => {
+  const s = setup({ base: OPENING(100), autoOpen: AUTO(true, 1), maxRiskUsd: 1_000 });
+  try {
+    await s.engine.autoOpenTick();
+    await s.engine.autoOpenTick();
+    const schedule = s.engine.state().schedule;
+    assert.equal(schedule.attemptWeek, '2026-W46');
+    assert.equal(schedule.lastOpenWeek, null);
+    assert.match(schedule.lastError ?? '', /上限/);
+    assert.equal(s.logs.filter(line => line.startsWith('期权定时开仓未执行')).length, 1);
+    assert.equal(s.engine.stateView().schedule.lastError?.week, '2026-W46');
+    await until(() => s.now() >= OPENING(1_000));
+    await s.engine.autoOpenTick();
+    await s.engine.autoOpenTick();
+    assert.deepEqual(s.notes.filter(text => text.includes('定时开仓未执行')).map(text => text.split('：')[0]), ['期权定时开仓未执行（2026-W46）']);
+    assert.equal(Object.keys(s.engine.state().tasks).length, 0);
+  } finally { s.dispose(); }
+});
+
+test('期权定时开仓：窗口已过或停服时不受理；受理后窗口在下单前结束则不下单，本周不再开', async () => {
+  const s = setup({ base: OPENING(5_000), autoOpen: AUTO(true, 10) });
+  try {
+    const plan = await s.engine.createPlan({ operation: 'open' });
+    s.hooks.skewMs = 6_000;
+    await assert.rejects(s.engine.startTask({ planId: plan.planId, requestId: 'scheduled-2026-W46', confirmLive: true }, { scheduled: true }), refused('window_closed'));
+    assert.deepEqual([Object.keys(s.engine.state().tasks).length, s.engine.state().schedule.lastOpenWeek], [0, null]);
+    s.hooks.skewMs = 0;
+    // Admitted inside the window; the clock passes the window's end as the admission is announced, before any order.
+    s.hooks.onNote = text => { if (text.includes('已确认')) s.hooks.skewMs = 6_000; };
+    await s.engine.autoOpenTick();
+    const [task] = Object.values(s.engine.state().tasks);
+    await finished(s, task!.id);
+    assert.equal(s.engine.state().tasks[task!.id]!.status, 'failed');
+    assert.match(s.engine.state().tasks[task!.id]!.error ?? '', /窗口在下单前已结束/);
+    assert.equal(s.fake.creates, 0);
+    assert.equal(s.engine.state().schedule.lastOpenWeek, '2026-W46');
+  } finally { s.dispose(); }
+
+  const closing = setup({ base: OPENING(1_000), autoOpen: AUTO(true) });
+  try {
+    const plan = await closing.engine.createPlan({ operation: 'open' });
+    await closing.engine.close();
+    await assert.rejects(closing.engine.startTask({ planId: plan.planId, requestId: 'scheduled-2026-W46', confirmLive: true }, { scheduled: true }), (error: unknown) => error instanceof ContractError);
+    await closing.engine.autoOpenTick();
+    assert.deepEqual([Object.keys(closing.engine.state().tasks).length, closing.engine.state().schedule.lastOpenWeek, closing.engine.state().schedule.attemptWeek], [0, null, null]);
+  } finally { closing.dispose(); }
 });
 
 test('期权：执行中停止，挂单全部撤销，任务为已停止', async () => {
@@ -328,8 +593,13 @@ test('期权：启动检查要求期权交易权限、绑定 IP、UID 一致，�
 
 test('期权：配置缺省值与校验；只配 options 时 pairs 可省略，密钥须有 bybitOptions', () => {
   const config = parseOptionsConfig({ accountId: UID, limits: { maxRiskUsd: 500, maxMarginUsd: 1_000 } });
-  assert.deepEqual({ ...config, limits: undefined }, { accountId: UID, limits: undefined, legQty: '1', strategyMode: 'iron_condor', marginMode: 'REGULAR_MARGIN', orderTimeoutSeconds: 600, feeRate: 0.0003, marginBufferPct: 0.10 });
-  assert.match(optionsSummary(config), /期权账户 Bybit \*\*\*5678/);
+  assert.deepEqual({ ...config, limits: undefined }, { accountId: UID, limits: undefined, legQty: '1', strategyMode: 'iron_condor', marginMode: 'REGULAR_MARGIN', orderTimeoutSeconds: 600, feeRate: 0.0003, marginBufferPct: 0.10, autoOpen: false, openHourUtc: 21, openMinuteUtc: 0, openWindowSeconds: 60, marketFallback: false });
+  assert.match(optionsSummary(config), /期权账户 Bybit \*\*\*5678.*定时开仓配置关）$/);
+  const scheduled = parseOptionsConfig({ accountId: UID, limits: { maxRiskUsd: 500, maxMarginUsd: 1_000 }, autoOpen: true, openHourUtc: 20, openMinuteUtc: 5, openWindowSeconds: 300, marketFallback: true });
+  assert.match(optionsSummary(scheduled), /定时开仓配置开（周五 20:05 UTC），IOC 兜底开）$/);
+  for (const [field, value] of [['autoOpen', 'yes'], ['openHourUtc', 24], ['openMinuteUtc', 1.5], ['openWindowSeconds', 0], ['openWindowSeconds', 301], ['marketFallback', 1]] as const) {
+    assert.throws(() => parseOptionsConfig({ accountId: UID, limits: { maxRiskUsd: 1, maxMarginUsd: 1 }, [field]: value }), new RegExp(field));
+  }
   assert.equal(optionsSummary(undefined), '');
   assert.throws(() => parseOptionsConfig({ accountId: 'abc', limits: { maxRiskUsd: 500, maxMarginUsd: 1_000 } }), /UID/);
   assert.throws(() => parseOptionsConfig({ accountId: UID, limits: { maxRiskUsd: 0, maxMarginUsd: 1_000 } }), /maxRiskUsd/);
@@ -367,6 +637,11 @@ test('期权：接口未配置时 404；配置后可读状态、校验请求体�
     assert.equal((await post(wired!, '/api/options/tasks', { planId: 'x', requestId: 'req-http-0001', confirmLive: true })).status, 400);
     assert.equal((await post(wired!, '/api/options/tasks/0123456789abcdef/stop', {})).status, 409);
     assert.equal((await get(wired!, '/api/options/unknown')).status, 404);
+    assert.equal((await post(wired!, '/api/options/auto-open', { enabled: 'yes' })).status, 400);
+    assert.equal((await post(wired!, '/api/options/auto-open', { enabled: true, extra: 1 })).status, 400);
+    const switched = await post(wired!, '/api/options/auto-open', { enabled: true });
+    assert.equal(switched.status, 200);
+    assert.deepEqual(((await switched.json()) as { enabled: boolean; source: string }), { ...(s.engine.stateView().schedule), enabled: true, source: 'page' });
     await s.market.refresh();
     const market = (await (await get(wired!, '/api/options/market')).json()) as { rows: unknown[]; expiry: number };
     assert.ok(market.rows.length > 0 && market.expiry > 0);

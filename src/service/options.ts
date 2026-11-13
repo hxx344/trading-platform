@@ -9,7 +9,7 @@ import type { FetchLike } from '../live/http.ts';
 import { bybitAccountProblem, bybitIpProblem, bybitPermissionProblem } from '../live/permissions.ts';
 import { describe, type LiveCredentials } from '../live/values.ts';
 import { createOptionsClient, type OptionsClient } from '../options/client.ts';
-import { createOptionsEngine, type OptionsEngine } from '../options/engine.ts';
+import { SCHEDULE_TICK_MS, createOptionsEngine, type OptionsEngine } from '../options/engine.ts';
 import { MARKET_REFRESH_MS, createOptionMarket, type OptionMarket } from '../options/market.ts';
 import { openOptionsStore, type OptionsStore } from '../options/store.ts';
 import { DEFAULT_ESTIMATES, STRATEGY_MODES, type StrategyMode } from '../options/strategy.ts';
@@ -77,6 +77,8 @@ export function createEngineFor(runtime: OptionsRuntime, { notify, log, now = Da
     settings: {
       maxRiskUsd: config.limits.maxRiskUsd, maxMarginUsd: config.limits.maxMarginUsd, legQty: config.legQty, strategyMode: config.strategyMode,
       orderTimeoutMs: config.orderTimeoutSeconds * 1000, estimates: { ...DEFAULT_ESTIMATES, feeRate: config.feeRate, marginBufferPct: config.marginBufferPct, marginMode: config.marginMode },
+      autoOpen: { enabled: config.autoOpen, hourUtc: config.openHourUtc, minuteUtc: config.openMinuteUtc, windowSeconds: config.openWindowSeconds },
+      marketFallback: config.marketFallback,
     },
   });
 }
@@ -120,12 +122,17 @@ export function optionsViews(engine: OptionsEngine) {
       return engine.startTask({ planId: value.planId as string, requestId: value.requestId as string, confirmLive: value.confirmLive as boolean, ...(min === undefined ? {} : { minNetIncomeUsd: min }), ...(max === undefined ? {} : { maxNetCostUsd: max }) });
     },
     stop: (taskId: string, body: unknown) => { exactKeys(body ?? {}, []); return engine.stopTask(taskId); },
+    autoOpen: (body: unknown) => {
+      const value = exactKeys(body, ['enabled']);
+      if (typeof value.enabled !== 'boolean') reject('invalid_value', 'enabled 须为 true / false');
+      return engine.setAutoOpen(value.enabled as boolean);
+    },
   };
 }
 export type OptionsViews = ReturnType<typeof optionsViews>;
 
 /**
- * The chain every 10 s, reconciliation every 15 s and account health every 15 s; each round's reads carry their own
+ * The chain every 10 s, reconciliation every 15 s, account health every 15 s and the Friday scheduler every 5 s; each round's reads carry their own
  * timeout and a failure only marks the view. On stop, running tasks are stopped and their orders cancelled and read back.
  */
 export function optionsLoops(runtime: OptionsRuntime, engine: OptionsEngine, context: { stopped(): boolean; pause(ms: number): Promise<void> }, log: (line: string) => void): Promise<void>[] {
@@ -141,6 +148,7 @@ export function optionsLoops(runtime: OptionsRuntime, engine: OptionsEngine, con
     every(MARKET_REFRESH_MS, '行情刷新', () => runtime.market.refresh()),
     every(RECONCILE_MS, '对账', engine.reconcileOnce),
     every(HEALTH_MS, '账户健康度读取', engine.refreshHealth),
+    every(SCHEDULE_TICK_MS, '定时开仓', engine.autoOpenTick),
     (async () => {
       while (!context.stopped()) await context.pause(IDLE_MS);
       await engine.close();

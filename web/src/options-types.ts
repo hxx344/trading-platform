@@ -40,10 +40,11 @@ export interface Task {
   mode: StrategyMode; legs: Record<string, PlanLeg & { chainPrice: number }>; links: string[];
   minNetIncomeUsd: number | null; maxNetCostUsd: number | null; netBlocked: boolean; riskBlocked: boolean;
   openingGroup: string | null; strategyStatus: 'open' | 'closed' | null; closedAt: number | null; closeReason: string | null; error: string | null;
+  scheduled?: boolean;
 }
 export interface OrderRow {
   link: string; taskId: string; symbol: string; side: Side; qty: string; reduceOnly: boolean; status: string; terminal: boolean;
-  filledQty: string; orderId: string; createdAt: number; updatedAt: number; message?: string; price?: string;
+  filledQty: string; orderId: string; createdAt: number; updatedAt: number; message?: string; price?: string; kind?: 'ioc';
 }
 export interface Position { symbol: string; side: Side; size: string; avgPrice: number; markPrice: number; unrealisedPnl: number }
 export interface Execution {
@@ -65,6 +66,11 @@ export interface AccountHealth {
   initialMarginRate?: number | null; maintenanceMarginRate?: number | null; marginMode?: string | null;
   portfolioMargin?: PortfolioMargin | null; portfolioMarginMessage?: string;
 }
+export interface ScheduleView {
+  enabled: boolean; source: 'config' | 'page'; configEnabled: boolean; hourUtc: number; minuteUtc: number; windowSeconds: number;
+  marketFallback: boolean; nextAt: number; inWindow: boolean; waiting: boolean; lastOpenWeek: string | null;
+  lastError: { week: string; message: string | null; at: number | null } | null;
+}
 export interface OptionsState {
   settings: { maxRiskUsd: number; maxMarginUsd: number; legQty: string; strategyMode: StrategyMode; orderTimeoutSeconds: number; feeRate: number; marginBufferPct: number; marginMode: string };
   account: string; busy: boolean; tasks: Task[]; orders: OrderRow[];
@@ -73,4 +79,6 @@ export interface OptionsState {
   greeks: GreeksSummary; health: AccountHealth | null;
   reconciliation: { error: string | null; lastSuccessAt: number | null; pendingOrders: number };
   executions: Execution[]; market: { at: number | null; stale: boolean; error: string | null };
+  /** Absent from a pre-G2a service (a page left open across a rollback). */
+  schedule?: ScheduleView;
 }

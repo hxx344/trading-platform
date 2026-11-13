@@ -39,6 +39,8 @@ export class FakeOptions {
   marginMode = 'REGULAR_MARGIN';
   calls: { method: string; path: string; params: URLSearchParams; body: Row | null }[] = [];
   creates = 0;
+  /** How an IOC (the fallback) fares: fill, partial, rest (cancelled at once, nothing filled) or lost (fills, but the answer is a 5xx and the order cannot be read). */
+  iocMode: 'fill' | 'partial' | 'rest' | 'lost' = 'fill';
   private seq = 0;
   /** Returns the fake's clock (ms); the tests shift it to a Friday. */
   private readonly clock: () => number;
@@ -112,6 +114,13 @@ export class FakeOptions {
         if (mode === 'dropped') return fail(10016, 503);
         const order: FakeOrder = { symbol: String(body!.symbol), side: body!.side as 'Buy' | 'Sell', qty: String(body!.qty), price: String(body!.price), link: String(body!.orderLinkId), reduceOnly: body!.reduceOnly === true, orderId: `o${++this.seq}`, status: 'New', cumExecQty: '0', visible: mode !== 'invisible' };
         this.orders.set(order.link, order);
+        if (body!.timeInForce === 'IOC') {
+          if (this.iocMode === 'fill' || this.iocMode === 'lost') { this.fill(order, Number(order.qty)); order.status = 'Filled'; }
+          else if (this.iocMode === 'partial') { this.fill(order, Number(order.qty) / 2); order.status = 'PartiallyFilledCanceled'; }
+          else order.status = 'Cancelled';
+          if (this.iocMode === 'lost') { order.visible = false; return fail(10016, 503); }
+          return ok({ orderId: order.orderId, orderLinkId: order.link });
+        }
         if (mode === 'fill') { this.fill(order, Number(order.qty)); order.status = 'Filled'; }
         if (mode === 'partial') { this.fill(order, Number(order.qty) / 2); order.status = 'PartiallyFilled'; }
         if (mode === 'lost-create') return fail(10016, 503);

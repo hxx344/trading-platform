@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { api, ApiError } from './api.ts';
 import {
-  chainLines, isActive, money, orderState, payoffAt, payoffCurve, planBody, planLimit, parseQuantity, quantityText, QUANTITY_PRESETS,
-  signedMoney, startBody, startRefused, STATUS_TEXT, strategyName, taskSummary, utcDate, utcTime,
+  autoOpenConfirm, chainLines, isActive, money, orderState, payoffAt, payoffCurve, planBody, planLimit, parseQuantity, quantityText, QUANTITY_PRESETS,
+  signedMoney, startBody, startRefused, STATUS_TEXT, scheduleTime, strategyName, taskSummary, utcDate, utcTime,
 } from './options-form.ts';
 import type { ChainRow, GreekName, OptionsMarket, OptionsState, Plan, Preview, PreviewView, StrategyMode, Task, TaskAccepted } from './options-types.ts';
 import { RequestIds } from './request-ids.ts';
@@ -180,7 +180,7 @@ function TaskCard({ task, state, stopping, onStop }: { task: Task; state: Option
   const unknown = summary.legs.some(leg => leg.unknown);
   const message = task.error ?? (task.netBlocked ? '净价限制已触发，未成交委托已停止。' : task.riskBlocked ? '组合风险超出上限，未成交委托已停止。' : null);
   return <article className="execution-card" data-active={String(active)}>
-    <div className="execution-card-head"><div><h3>{task.type === 'close' ? '平仓组合' : '开仓组合'} · {strategyName(task.mode)}</h3><span className="execution-status">{STATUS_TEXT[task.status]}{unknown ? ' · 成交待核对' : ''}</span></div>
+    <div className="execution-card-head"><div><h3>{task.scheduled ? <span className="lock-badge scheduled-tag">定时</span> : null}{task.type === 'close' ? '平仓组合' : '开仓组合'} · {strategyName(task.mode)}</h3><span className="execution-status">{STATUS_TEXT[task.status]}{unknown ? ' · 成交待核对' : ''}</span></div>
       <span>耗时 {Math.floor(elapsed / 60)}分 {elapsed % 60}秒</span>
       {active ? <button type="button" className="button stop-execution" disabled={stopped || stopping} onClick={() => onStop(task)}>{stopped ? '已请求停止 · 等待终态' : stopping ? '停止请求待核对…' : '停止执行'}</button> : null}</div>
     <div className="execution-progress"><span>完成 {summary.completedLegs} / {summary.totalLegs} 腿</span><span>{summary.ratio === null ? '进度待核对' : `${Math.round(summary.ratio * 100)}%`}</span><progress max={1} value={summary.ratio ?? undefined} aria-label="组合成交进度" /></div>
@@ -193,7 +193,7 @@ function TaskCard({ task, state, stopping, onStop }: { task: Task; state: Option
       <div className="execution-leg-quantity"><span>已成 <b>{quantityText(leg.filled)}</b></span><span>目标 <b>{quantityText(leg.target)}</b></span><span>剩余 <b>{quantityText(leg.remaining)}</b> BTC</span><span className={leg.unknown ? 'loss' : leg.complete ? 'profit' : 'muted'}>{leg.unknown ? '待核对' : leg.complete ? '已完成' : '未完成'}</span></div>
       <details><summary>委托详情 · {leg.orders.length} 笔</summary><div className="orders-table-wrap"><table className="orders-table" aria-label="本腿委托明细"><tbody>{leg.orders.map(order => { const phase = orderState(order, task); return <tr key={order.link}>
         <td data-label="合约 / 订单标识" className="order-contract"><strong>{order.symbol}</strong><small>关联 {order.link}</small><small>交易所 {order.orderId || '--'}</small></td>
-        <td data-label="执行"><div className="order-operation">{task.type === 'close' ? '平仓' : '开仓'} <span>BBO</span></div><span className={`order-side ${order.side === 'Buy' ? 'buy' : 'sell'}`}>{order.side === 'Buy' ? '买入' : '卖出'}</span></td>
+        <td data-label="执行"><div className="order-operation">{task.type === 'close' ? '平仓' : '开仓'} <span>{order.kind === 'ioc' ? 'IOC' : 'BBO'}</span></div><span className={`order-side ${order.side === 'Buy' ? 'buy' : 'sell'}`}>{order.side === 'Buy' ? '买入' : '卖出'}</span></td>
         <td data-label="价格 · USD"><div className="order-values"><span><small>最近</small><b>{order.price ?? '--'}</b></span></div></td>
         <td data-label="数量 · BTC"><div className="order-values"><span><small>委托</small><b>{quantityText(order.qty)}</b></span><span><small>累计成交</small><b>{quantityText(order.filledQty)}</b></span></div></td>
         <td data-label="状态阶段"><span className="order-phase" data-tone={phase.tone}>{phase.label}</span>{order.message ? <small className="order-exchange-status">{order.message}</small> : null}</td>
@@ -205,7 +205,7 @@ function TaskCard({ task, state, stopping, onStop }: { task: Task; state: Option
 }
 
 /** pending: the last start's answer was lost; re-sending the same request id only asks the service, so expiry does not lock it. */
-function PlanDialog({ plan, error, sending, pending, onClose, onSubmit }: { plan: Plan | null; error: string | null; sending: boolean; pending: boolean; onClose: () => void; onSubmit: (limit: string) => void }) {
+function PlanDialog({ plan, error, sending, pending, fallback, onClose, onSubmit }: { plan: Plan | null; error: string | null; sending: boolean; pending: boolean; fallback: boolean; onClose: () => void; onSubmit: (limit: string) => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [limit, setLimit] = useState('');
   const [confirmed, setConfirmed] = useState(false);
@@ -241,7 +241,7 @@ function PlanDialog({ plan, error, sending, pending, onClose, onSubmit }: { plan
       <div className="plan-amounts"><div><span>预估成交净额（未扣费）</span><strong>{signedMoney(plan.estimatedGrossUsd)}</strong></div><div><span>预估手续费</span><strong>{money(plan.estimatedFeeUsd)}</strong></div><div><span>预估成交净额（含费）</span><strong>{signedMoney(plan.estimatedNetUsd)}</strong></div><div><span>预估保证金</span><strong>{money(plan.estimatedMarginUsd)}</strong></div></div>
       <label id="planNetLabel" htmlFor="planNetLimit">{closing ? '最多接受的平仓净支出（含预估手续费）· USD' : '最低接受的开仓净收入（扣预估手续费）· USD'}</label>
       <input id="planNetLimit" type="text" inputMode="decimal" autoComplete="off" value={limit} readOnly={pending} onChange={event => setLimit(event.target.value)} aria-describedby="planRisk planError" />
-      <p id="planRisk" className="execution-caveat">{plan.unboundedLoss && !closing ? '无保护腿，亏损无上限。' : ''}各腿分别执行；净价限制不等于部分成交时已实现的净额。停止仅撤未成交委托，已成交部分保留。{closing ? '净支出为负数表示平仓应取得净收入。' : ''}</p>
+      <p id="planRisk" className="execution-caveat">{plan.unboundedLoss && !closing ? '无保护腿，亏损无上限。' : ''}各腿分别执行；净价限制不等于部分成交时已实现的净额。停止仅撤未成交委托，已成交部分保留。{closing ? '净支出为负数表示平仓应取得净收入。' : ''}{!closing && fallback ? 'IOC 兜底已打开：超时未成交的腿会按对手价补发一次 IOC，价格仍受上面的最低净收入限制。' : ''}</p>
       <p id="planError" className="loss" role="status">{error ?? ''}</p>
       <label className="confirm"><input type="checkbox" checked={confirmed} disabled={expired} onChange={event => setConfirmed(event.target.checked)} /><span>{closing ? '我确认按以上合约、方向和实际剩余数量平仓。' : `我确认以上固定合约、方向、数量与净价限制${plan.unboundedLoss ? '，并了解无保护腿、亏损无上限' : '及组合风险'}。`}</span></label>
       <button className="button primary" type="button" disabled={!confirmed || sending || expired} data-busy={sending ? '' : undefined} onClick={() => onSubmit(limit)}>{sending ? '提交中…' : `确认并${closing ? '平仓' : '开仓'}`}</button>
@@ -262,6 +262,7 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
   const [preparing, setPreparing] = useState<'open' | 'close' | null>(null);
   const [notice, setNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
   const [stops, setStops] = useState<Set<string>>(() => new Set());
+  const [toggling, setToggling] = useState(false);
   const ids = useRef(new RequestIds());
   const busyRef = useRef(false);
   const state = useLiveResource<OptionsState>(OPTIONS_STATE_PATH, { intervalMs: busyRef.current ? ACTIVE_MS : IDLE_MS, timeoutMs: OPTIONS_READ_TIMEOUT_MS, onExpired });
@@ -314,6 +315,20 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
       if (error instanceof ApiError && error.status === 401) onExpired();
     } finally { setSending(false); }
   }
+  async function toggleAutoOpen(enabled: boolean) {
+    if (!data?.schedule) return;
+    if (enabled && !confirm(autoOpenConfirm(data.settings, data.schedule))) return;
+    setToggling(true);
+    try {
+      await api('/api/options/auto-open', { body: { enabled }, timeoutMs: WRITE_TIMEOUT_MS });
+      const running = data.tasks.some(task => task.scheduled && isActive(task));
+      setNotice({ tone: 'info', text: enabled ? `定时开仓已打开：${scheduleTime(data.schedule)}。` : running ? '定时开仓已关闭；已受理的定时任务仍在执行，要停下请在“组合执行”里停止。' : '定时开仓已关闭。' });
+      void state.refresh();
+    } catch (error) {
+      setNotice({ tone: 'error', text: `定时开仓开关未确认：${errorText(error)}；请刷新核对后再试` });
+      if (error instanceof ApiError && error.status === 401) onExpired();
+    } finally { setToggling(false); }
+  }
   async function stop(task: Task) {
     if (!confirm(STOP_CONFIRM)) return;
     setStops(current => new Set(current).add(task.id));
@@ -333,6 +348,9 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
   if (data?.positionsError) strip.push(`持仓：${data.positionsError}`);
   if (data?.health && !data.health.available) strip.push(`账户：${data.health.message ?? '读取失败'}`);
   if (state.error) strip.push(`刷新失败：${state.error.message}`);
+  const missed = data?.schedule?.lastError;
+  if (missed) strip.push(`本周定时开仓未执行（${missed.week}）：${missed.message ?? '原因未知'}`);
+  const schedule = data?.schedule ?? null;
   const canOpen = !busy && riskChecked && preview !== null && !riskProblem && quantity !== null && preparing === null && !(data?.tracked.legs.length);
   const canClose = !busy && preparing === null && (data?.tracked.legs.length ?? 0) > 0;
   return <div className="options-desk">
@@ -349,7 +367,7 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
     <div className="strip">
       {data?.reconciliation.pendingOrders ? <span className="item strip-count">{data.reconciliation.pendingOrders} 笔订单未结束</span> : null}
       {strip.map(text => <span key={text} className="item strip-alert">{text}</span>)}
-      <span className="item">只手动开仓 · 每腿 {data?.settings.legQty ?? '--'} BTC · 最大亏损上限 {data ? money(data.settings.maxRiskUsd) : '--'} · 保证金上限 {data ? money(data.settings.maxMarginUsd) : '--'}</span>
+      <span className="item">{schedule?.enabled ? `定时开仓 ${scheduleTime(schedule)}` : '只手动开仓'}{schedule?.marketFallback ? ' + IOC 兜底' : ''} · 每腿 {data?.settings.legQty ?? '--'} BTC · 最大亏损上限 {data ? money(data.settings.maxRiskUsd) : '--'} · 保证金上限 {data ? money(data.settings.maxMarginUsd) : '--'}</span>
     </div>
     <main className="shell">
       {notice ? <p className={`orders-notice${notice.tone === 'error' ? ' loss' : ''}`} role="status">{notice.text}</p> : null}
@@ -370,7 +388,7 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
           </div>
           <div className="stack desk-side">
             <aside className="panel execution" aria-label="执行控制">
-              <div className="panel-h"><h2>执行控制</h2><span className="lock-badge">LIMIT / BBO</span></div>
+              <div className="panel-h"><h2>执行控制</h2><span className="lock-badge">{schedule?.marketFallback ? 'LIMIT / BBO + IOC' : 'LIMIT / BBO'}</span></div>
               <div className="execution-body">
                 <div className="mode-box" data-mode="live"><span className="mode-icon" aria-hidden="true">!</span><div><strong>主网实盘</strong><p>确认后向 Bybit 发送真实期权限价单，按盘口最优价跟价。</p></div></div>
                 <div className="execution-inputs">
@@ -388,7 +406,9 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
                 <button type="button" className="button close-button" disabled={!canClose} data-busy={preparing === 'close' ? '' : undefined} onClick={() => void prepare('close')}>{preparing === 'close' ? '正在生成方案…' : '实盘平仓已跟踪持仓'}</button>
                 <p className="microcopy">{busy ? '有任务或订单未结束，结束前不能开始新的开仓或平仓。' : data?.tracked.legs.length ? '已有跟踪中的策略：先平仓或在交易所平掉后，才能再开仓。' : '开仓与平仓先核对固定方案，再独立确认提交。实盘开仓只在周五（UTC）。'}</p>
               </div>
-              <div className="schedule"><span>计划开仓 <small>本服务不自动开仓</small></span><strong>周五 · 手动</strong></div>
+              <div className="schedule"><span>计划开仓 <small>{!schedule ? '读取中' : schedule.enabled ? schedule.waiting ? schedule.lastError ? '窗口中 · 本周未能开仓' : '窗口中 · 正在开仓' : `下次 ${utcTime(schedule.nextAt)} UTC` : schedule.source === 'page' && schedule.configEnabled ? '已在页面关闭（覆盖配置）' : '定时开仓已关闭'}</small></span>
+                <span className="schedule-side"><strong>{schedule?.enabled ? `${scheduleTime(schedule)} · 自动` : '周五 · 手动'}</strong>
+                  <button type="button" className="link-button" disabled={!schedule || toggling} data-busy={toggling ? '' : undefined} onClick={() => void toggleAutoOpen(!schedule?.enabled)}>{toggling ? '提交中…' : schedule?.enabled ? '关闭定时' : '打开定时'}</button></span></div>
             </aside>
             <HealthPanel state={data} />
           </div>
@@ -420,7 +440,7 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
         </section>
       </div>}
     </main>
-    <PlanDialog plan={plan} error={planError} sending={sending} pending={plan !== null && unanswered === plan.planId} onClose={() => {
+    <PlanDialog plan={plan} error={planError} sending={sending} pending={plan !== null && unanswered === plan.planId} fallback={data?.schedule?.marketFallback ?? false} onClose={() => {
       if (sending || (unanswered === plan?.planId && !confirm(LEAVE_UNANSWERED))) return;
       setPlan(null); setPlanError(null); setUnanswered(null); void state.refresh();
     }} onSubmit={limit => void submit(limit)} />

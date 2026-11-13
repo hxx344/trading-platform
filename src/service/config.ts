@@ -12,12 +12,16 @@ import { parsePrivateJson, readPrivateFile } from '../live/setup.ts';
 import type { Venue } from '../contracts.ts';
 import type { LiveCredentials } from '../live/values.ts';
 import { parseOilConfig, parseOilSecrets, type OilConfig } from './oil-config.ts';
+import { parseMonitorConfig, type MonitorConfig } from './monitor-config.ts';
+import { parseAssetConfig, type AssetConfig } from './asset-config.ts';
 import { parseOptionsConfig, parseOptionsSecrets, type OptionsConfig } from './options-config.ts';
 
 const ACCOUNT_NAME = /^[0-9A-Za-z_-]{1,64}$/;
 const FEISHU_HOOK = /^https:\/\/open\.(feishu\.cn|larksuite\.com)\/open-apis\/bot\/v2\/hook\/[0-9A-Za-z_-]{8,128}$/;
 export const DEFAULT_PORT = 4720;
 export const MAX_PAIRS = 20;
+/** Top-level blocks of modules besides the ASTER pairs; with any of them configured, pairs may be left out. */
+export const MODULE_KEYS = ['oil', 'options', 'monitor', 'asset'] as const;
 
 /** `adl` seeds the pair's ADL settings when it is first registered; afterwards the page owns them. */
 export interface ServicePair { id: string; main: string; long: string; short: string; transfer: TransferConfig; adl?: AdlConfig }
@@ -30,6 +34,10 @@ export interface ServiceConfig {
   pairs: ServicePair[];
   /** The oil module's Binance/Bybit execution accounts and caps; absent means the service runs as before (oil-config.ts). */
   oil?: OilConfig;
+  /** The read-only market monitors (monitor-config.ts); absent means no monitor page. */
+  monitor?: MonitorConfig;
+  /** The read-only asset ledger (asset-config.ts); absent means no asset page and no /api/asset reads. */
+  asset?: AssetConfig;
   /** The options module's Bybit account and limits; absent means no options module (options-config.ts). */
   options?: OptionsConfig;
   /** The scheduled ASTER summary card (summary.ts); absent: every 60 minutes. 0 turns it off. */
@@ -127,13 +135,15 @@ export const urlHost = (host: string): string => isIP(host) === 6 ? `[${host}]` 
 const fail = (name: string, error: unknown): Error => new Error(`${name}无效：${error instanceof ContractError || error instanceof Error ? error.message : '格式错误'}`);
 
 export function parseServiceConfig(raw: unknown): ServiceConfig {
-  // pairs may be left out only when oil or options is there: one of the modules must be configured.
-  const has = (key: string): boolean => raw !== null && typeof raw === 'object' && Object.hasOwn(raw, key);
-  const hasOil = has('oil'), hasOptions = has('options'), other = hasOil || hasOptions;
-  const value = exactKeys(raw, other ? ['secretsFile'] : ['secretsFile', 'pairs'], ['port', 'host', 'budget', 'summary', ...(other ? ['pairs'] : []), ...(hasOil ? ['oil'] : []), ...(hasOptions ? ['options'] : [])]);
-  const oil = hasOil ? parseOilConfig(value.oil) : undefined;
-  const options = hasOptions ? parseOptionsConfig(value.options) : undefined;
-  const pairsInput: unknown = other && value.pairs === undefined ? [] : value.pairs;
+  // pairs may be left out only when another module is there: at least one module must be configured.
+  const modules = raw !== null && typeof raw === 'object' ? MODULE_KEYS.filter(key => Object.hasOwn(raw, key)) : [];
+  const hasModule = modules.length > 0;
+  const value = exactKeys(raw, hasModule ? ['secretsFile'] : ['secretsFile', 'pairs'], ['port', 'host', 'budget', 'summary', ...(hasModule ? ['pairs', ...modules] : [])]);
+  const oil = modules.includes('oil') ? parseOilConfig(value.oil) : undefined;
+  const options = modules.includes('options') ? parseOptionsConfig(value.options) : undefined;
+  const monitor = modules.includes('monitor') ? parseMonitorConfig(value.monitor) : undefined;
+  const asset = modules.includes('asset') ? parseAssetConfig(value.asset) : undefined;
+  const pairsInput: unknown = hasModule && value.pairs === undefined ? [] : value.pairs;
   if (typeof value.secretsFile !== 'string' || !isAbsolute(value.secretsFile)) throw new Error('secretsFile 必须是绝对路径');
   const port = value.port === undefined ? DEFAULT_PORT : integer(value.port, 1_024, 65_535, '端口');
   const host = parseListenHost(value.host);
@@ -165,7 +175,7 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   const adlReserve = budgetRaw.adlReserve === undefined ? Math.floor(limitPerMinute / 6) : integer(budgetRaw.adlReserve, 0, limitPerMinute - 50, 'ADL 预留权重');
   if (limitPerMinute - adlReserve < needed) throw new Error(`${pairs.length} 个配对每分钟约需请求权重 ${needed}，而每分钟上限 ${limitPerMinute} 减去 ADL 预留 ${adlReserve} 只剩 ${limitPerMinute - adlReserve}；请调大 budget.limitPerMinute 或去掉 budget 使用自动值`);
   const summary = value.summary === undefined ? undefined : { intervalMinutes: integer(exactKeys(value.summary, ['intervalMinutes'], []).intervalMinutes, 0, 1_440, '定时摘要间隔（分钟，0 为关闭）') };
-  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs, ...(oil ? { oil } : {}), ...(options ? { options } : {}), ...(summary ? { summary } : {}) };
+  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs, ...(oil ? { oil } : {}), ...(options ? { options } : {}), ...(monitor ? { monitor } : {}), ...(asset ? { asset } : {}), ...(summary ? { summary } : {}) };
 }
 
 export function parseServiceSecrets(raw: unknown, needed: readonly string[], oilVenues: readonly Venue[] = [], options = false): ServiceSecrets {

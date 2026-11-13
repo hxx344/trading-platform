@@ -1,0 +1,365 @@
+/* The market monitor page (MonitorPage.tsx). Copied from the project-aggregation workbench, modules/monitor/app:
+   the tokens from design-tokens.css (9ca6f68), the rules the Anthropic detail uses from globals.css (77f3cf2: the base
+   page, the hub's embedded overrides, the detail toolbar and the chart group, the SVG chart), in their order and with
+   their values, every selector put under .monitor-desk. Changed: `body` is .monitor-desk itself, `main` is .monitor-main
+   (the page sits inside the service's own <main>), the .hub-content and .monitor-detail ancestors are dropped, rules for
+   parts this page does not render are left out, and @keyframes spin is the identical one in styles.css. */
+
+/* design-tokens.css */
+.monitor-desk {
+  color-scheme: dark;
+  --surface-0: #0a0d11;
+  --surface-1: #0e1217;
+  --surface-2: #10141a;
+  --surface-3: #161b22;
+  --surface-4: #212831;
+  --surface-5: #2e3640;
+  --surface-6: #3a4450;
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  --font-number: "Cascadia Mono", "JetBrains Mono", "SF Mono", Consolas, monospace;
+  --background: var(--surface-0);
+  --foreground: #e6eaf0;
+  --card: var(--surface-2);
+  --card-foreground: var(--foreground);
+  --popover: var(--surface-3);
+  --popover-foreground: var(--foreground);
+  --primary: #38bdf8;
+  --primary-hover: #0ea5e9;
+  --primary-foreground: var(--surface-0);
+  --primary-border: rgba(56, 189, 248, .45);
+  --active-surface: rgba(56, 189, 248, .12);
+  --surface-hover: var(--surface-3);
+  --secondary: var(--surface-3);
+  --secondary-foreground: var(--foreground);
+  --muted: var(--surface-3);
+  --muted-foreground: #a3adb9;
+  --subtle-foreground: #7a8591;
+  --accent: var(--active-surface);
+  --accent-foreground: var(--primary);
+  --positive: #2dbe87;
+  --positive-surface: rgba(45, 190, 135, .13);
+  --negative: #f2626b;
+  --negative-surface: rgba(242, 98, 107, .13);
+  --negative-border: rgba(242, 98, 107, .3);
+  --destructive: var(--negative);
+  --warning: #f0b03f;
+  --warning-surface: rgba(240, 176, 63, .13);
+  --warning-border: rgba(240, 176, 63, .3);
+  --info: #6ea8fe;
+  --border: var(--surface-4);
+  --input: var(--surface-5);
+  --ring: var(--primary);
+  --shadow-color: #00000066;
+  --radius: .5rem;
+  --chart-1: var(--primary);
+  --chart-2: var(--info);
+  --chart-3: var(--warning);
+  --chart-4: var(--negative);
+  --chart-5: #c4a2f5;
+}
+
+/* The workbench page also has Tailwind's preflight under these rules; the parts its markup relies on. */
+.monitor-desk *,.monitor-desk *::before,.monitor-desk *::after{margin:0;padding:0;border:0 solid var(--border)}
+.monitor-desk button{background-color:transparent;border-radius:0;color:inherit}
+.monitor-desk h1,.monitor-desk h2,.monitor-desk h3{font-size:inherit;font-weight:inherit}
+.monitor-desk table{text-indent:0;border-color:inherit}
+
+/* globals.css */.monitor-desk *{box-sizing:border-box}
+.monitor-desk{margin:0;background:var(--background);color:var(--foreground);font-family:var(--font-ui);font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased}
+.monitor-desk button,.monitor-desk a{-webkit-tap-highlight-color:transparent}
+.monitor-desk button{font:inherit;cursor:pointer}
+.monitor-desk button:disabled{cursor:wait;opacity:.55}
+.monitor-desk a{color:inherit;text-decoration:none}
+.monitor-desk button:focus-visible,.monitor-desk a:focus-visible{outline:2px solid var(--positive);outline-offset:4px}
+.monitor-desk button{transition:background .15s,color .15s,border-color .15s}
+.monitor-desk button:hover{color:var(--foreground)}
+.monitor-desk .site-shell{min-height:100vh}
+.monitor-desk .monitor-main{max-width:1512px;padding:38px 4.2% 0;margin:auto}
+.monitor-desk .page-heading{display:flex;align-items:center;justify-content:space-between;margin-bottom:26px;gap:20px}
+.monitor-desk .eyebrow{font-size:12px;letter-spacing:.12em;font-weight:650;color:var(--muted-foreground)}
+.monitor-desk .eyebrow span{color:var(--muted-foreground);margin:0 10px}
+.monitor-desk h1{font-size:30px;font-weight:650;letter-spacing:-.035em;margin:8px 0 8px;display:flex;align-items:center;gap:16px}
+.monitor-desk .small-tag{font-size:12px;font-weight:500;letter-spacing:0;color:var(--muted-foreground);border:1px solid var(--border);padding:3px 8px;border-radius:5px}
+.monitor-desk p{margin:0}
+.monitor-desk .page-heading p{font-size:14px;color:var(--muted-foreground)}
+.monitor-desk .refresh-button{display:flex;align-items:center;gap:8px;border:1px solid var(--border);background:var(--card);border-radius:7px;padding:10px 15px;font-size:14px;color:var(--foreground);flex:none}
+.monitor-desk .refresh-button:hover{background:var(--active-surface)}
+.monitor-desk .data-status{display:flex;align-items:center;justify-content:space-between;font-size:12px;color:var(--muted-foreground);margin-bottom:16px;gap:10px}
+.monitor-desk .status-left{display:flex;align-items:center;gap:7px}
+.monitor-desk .status-right{color:var(--muted-foreground)}
+.monitor-desk .metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:24px}
+.monitor-desk .metric{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:22px 22px 20px;min-width:0}
+.monitor-desk .primary-metric{border-color:var(--border);background:var(--active-surface)}
+.monitor-desk .metric-label{font-size:14px;color:var(--muted-foreground);display:flex;align-items:center;gap:7px}
+.monitor-desk .metric-label>svg{margin-left:auto;color:var(--positive)}
+.monitor-desk .metric-value{font-size:33px;line-height:1.3;font-weight:550;letter-spacing:-.035em;font-variant-numeric:tabular-nums;margin:13px 0 10px}
+.monitor-desk .positive{color:var(--positive)}
+.monitor-desk .negative{color:var(--negative)}
+.monitor-desk .metric-foot{font-size:12px;color:var(--muted-foreground);font-variant-numeric:tabular-nums;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.monitor-desk .metric-foot b{font-weight:500}
+.monitor-desk .metric-foot>span{color:var(--muted-foreground)}
+.monitor-desk .ticker{font:12px ui-monospace,Consolas,monospace;letter-spacing:.02em;color:var(--muted-foreground);padding:3px 5px;background:var(--card);border-radius:3px;margin-left:auto}
+.monitor-desk .legend-dot{display:inline-block;width:7px;height:7px;border-radius:50%;flex:none}
+.monitor-desk .adr{background:var(--chart-2)}
+.monitor-desk .ordinary{background:var(--warning)}
+.monitor-desk .premium{background:var(--positive)}
+.monitor-desk .chart-panel,.monitor-desk .table-panel,.monitor-desk .method-panel{border:1px solid var(--border);border-radius:10px;background:var(--background);overflow:hidden}
+.monitor-desk .chart-heading{display:flex;justify-content:space-between;align-items:center;padding:24px 25px 20px}
+.monitor-desk .section-kicker{font-size:12px;letter-spacing:.15em;color:var(--muted-foreground);font-weight:650;margin-bottom:5px}
+.monitor-desk h2{font-size:17px;font-weight:600;margin:0;letter-spacing:.01em}
+.monitor-desk .segmented{display:flex;gap:3px;border:1px solid var(--border);padding:4px;background:var(--background);border-radius:7px}
+.monitor-desk .segmented button{background:transparent;border:0;padding:6px 15px;border-radius:4px;font-size:14px;color:var(--muted-foreground)}
+.monitor-desk .segmented button.active{background:var(--active-surface);color:var(--foreground)}
+.monitor-desk .chart-toolbar{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);padding:0 25px;gap:15px}
+.monitor-desk .chart-tabs{display:flex;gap:25px}
+.monitor-desk .chart-tabs button{background:none;border:0;border-bottom:2px solid transparent;font-size:14px;color:var(--muted-foreground);padding:0 0 13px}
+.monitor-desk .chart-tabs button.active{color:var(--foreground);border-color:var(--positive)}
+.monitor-desk .chart-unit{font-size:12px;color:var(--muted-foreground);padding-bottom:13px}
+.monitor-desk .chart-container{height:326px;padding:8px 13px 0 19px}
+.monitor-desk .chart-caption{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:15px 25px 19px;font-size:12px;color:var(--muted-foreground)}
+.monitor-desk .chart-caption>span{display:flex;gap:8px;align-items:center}
+.monitor-desk .chart-caption>span .ordinary{margin-left:12px}
+.monitor-desk .zero-line{width:16px;border-top:1px dashed var(--border);margin-left:16px}
+.monitor-desk .chart-tooltip{border:1px solid var(--border);background:var(--card);border-radius:8px;padding:14px 17px;min-width:225px;box-shadow:0 8px 20px var(--shadow-color);font-size:14px}
+.monitor-desk .chart-tooltip>strong{font-weight:500;color:var(--muted-foreground);display:block;margin-bottom:12px;font-size:12px}
+.monitor-desk .chart-tooltip>div{display:flex;justify-content:space-between;gap:25px;margin-top:8px}
+.monitor-desk .chart-tooltip span{color:var(--muted-foreground)}
+.monitor-desk .chart-tooltip b{font-weight:550;font-variant-numeric:tabular-nums}
+.monitor-desk .bottom-grid{display:grid;grid-template-columns:minmax(0,1.75fr) minmax(310px,1fr);gap:22px;margin-top:24px}
+.monitor-desk .section-heading{display:flex;justify-content:space-between;align-items:center;padding:23px 23px 20px;gap:12px}
+.monitor-desk .section-heading>span{font-size:12px;color:var(--muted-foreground)}
+.monitor-desk .table-scroll{overflow-x:auto}
+.monitor-desk table{width:100%;border-collapse:collapse;text-align:right;font-size:14px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.monitor-desk th{font-weight:400;color:var(--muted-foreground);font-size:12px;background:var(--card);padding:10px 19px}
+.monitor-desk th:first-child,.monitor-desk td:first-child{text-align:left;padding-left:24px}
+.monitor-desk td{padding:12px 19px;border-bottom:1px solid var(--border);color:var(--foreground)}
+.monitor-desk td small{font-size:12px;color:var(--muted-foreground);margin-left:9px}
+.monitor-desk tr:last-child td{border:0}
+.monitor-desk .premium-pill{display:inline-flex;align-items:center;gap:3px;padding:3px 7px;border-radius:4px;background:var(--active-surface);font-size:12px}
+.monitor-desk .premium-pill.negative{background:var(--negative-surface)}
+.monitor-desk .conversion{display:flex;align-items:center;justify-content:space-between;background:var(--card);border:1px solid var(--border);border-radius:7px;margin:0 23px;padding:17px 20px;gap:12px}
+.monitor-desk .conversion>div{display:flex;flex-direction:column;gap:3px}
+.monitor-desk .conversion>svg{color:var(--muted-foreground)}
+.monitor-desk .conversion strong{font-size:27px;font-weight:550;line-height:1.7}
+.monitor-desk .conversion strong small{font-size:14px;font-weight:400;color:var(--muted-foreground)}
+.monitor-desk .conversion div>span:last-child{font-size:12px;color:var(--muted-foreground)}
+.monitor-desk .instrument-label{font-size:14px;color:var(--muted-foreground)}
+.monitor-desk .formula{padding:19px 23px 0;display:flex;flex-direction:column;gap:7px}
+.monitor-desk .formula>span{font-size:12px;color:var(--muted-foreground)}
+.monitor-desk .formula code{font:12px/1.6 "Segoe UI","Microsoft YaHei",sans-serif;color:var(--foreground)}
+.monitor-desk .method-note{font-size:14px;line-height:1.85;color:var(--muted-foreground);padding:13px 23px 17px}
+.monitor-desk .listing-note{display:flex;justify-content:space-between;font-size:12px;padding:13px 23px;border-top:1px solid var(--border);color:var(--muted-foreground)}
+.monitor-desk .listing-note b{font-weight:400;color:var(--muted-foreground)}
+.monitor-desk .source-panel{border-top:1px solid var(--border);border-bottom:1px solid var(--border);margin-top:25px}
+.monitor-desk .source-toggle{display:flex;justify-content:space-between;align-items:center;width:100%;padding:18px 0;background:none;border:0;color:var(--muted-foreground);font-size:14px}
+.monitor-desk .source-toggle>span{display:flex;align-items:center;gap:8px}
+.monitor-desk .source-toggle>svg{transition:transform .2s}
+.monitor-desk .rotated{transform:rotate(180deg)}
+.monitor-desk .source-content{display:grid;grid-template-columns:1fr 1fr;gap:35px;padding:3px 0 24px;font-size:14px;color:var(--muted-foreground);line-height:1.9}
+.monitor-desk .source-content h3{font-size:16px;font-weight:500;color:var(--foreground);margin:0 0 7px}
+.monitor-desk .source-content a{display:inline-flex;align-items:center;gap:4px;color:var(--chart-2);margin-top:10px}
+.monitor-desk .source-content a:hover{color:var(--foreground)}
+.monitor-desk .second-source{margin-left:16px}
+.monitor-desk .notice{display:flex;align-items:center;gap:8px;border:1px solid var(--border);background:var(--warning-surface);color:var(--warning);border-radius:7px;padding:10px 14px;font-size:14px;margin-bottom:16px}
+.monitor-desk .notice>svg{flex:none}
+.monitor-desk .notice.error{border-color:var(--border);background:var(--negative-surface);color:var(--negative)}
+.monitor-desk .empty-chart{height:100%;display:flex;flex-direction:column;justify-content:center;align-items:center;color:var(--muted-foreground);gap:12px}
+.monitor-desk .empty-chart p{color:var(--muted-foreground);font-size:16px}
+.monitor-desk .empty-chart span{font-size:14px}
+.monitor-desk .empty-table{text-align:center!important;padding:30px!important;color:var(--muted-foreground)}
+.monitor-desk footer{padding:22px 0 26px;display:flex;justify-content:space-between;gap:20px;font-size:12px;color:var(--muted-foreground)}
+.monitor-desk .footer-divider{margin:0 10px;color:var(--muted-foreground)}
+.monitor-desk .spinning{animation:spin 1.2s linear infinite}
+@media(min-width:1600px){
+  .monitor-desk .monitor-main{padding-left:30px;padding-right:30px}
+  .monitor-desk .chart-container{height:360px}
+}
+@media(max-width:1100px){
+  .monitor-desk .metric{padding:18px 15px}
+  .monitor-desk .metric-value{font-size:29px}
+  .monitor-desk .metrics{gap:10px}
+  .monitor-desk .ticker{display:none}
+  .monitor-desk .bottom-grid{grid-template-columns:1.4fr 1fr;gap:15px}
+  .monitor-desk td,.monitor-desk th{padding-left:12px;padding-right:12px}
+  .monitor-desk td small{display:none}
+  .monitor-desk .conversion{padding:12px}
+}
+@media(max-width:780px){
+  .monitor-desk .monitor-main{padding:28px 20px 0}
+  .monitor-desk .page-heading{align-items:flex-start;gap:10px}
+  .monitor-desk h1{font-size:25px;gap:9px}
+  .monitor-desk .refresh-button{padding:8px 10px;margin-top:28px}
+  .monitor-desk .status-right{display:none}
+  .monitor-desk .metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+  .monitor-desk .metric{padding:18px}
+  .monitor-desk .metric-value{font-size:29px}
+  .monitor-desk .chart-heading{padding:20px}
+  .monitor-desk .segmented button{padding:5px 11px}
+  .monitor-desk .chart-toolbar{padding:0 20px}
+  .monitor-desk .chart-tabs{gap:18px}
+  .monitor-desk .chart-container{height:300px;padding-left:5px;padding-right:0}
+  .monitor-desk .chart-caption{padding:15px 20px;align-items:flex-start;flex-direction:column;gap:9px}
+  .monitor-desk .bottom-grid{grid-template-columns:1fr}
+  .monitor-desk .section-heading{padding:21px}
+  .monitor-desk .method-panel .conversion{justify-content:space-evenly}
+  .monitor-desk .source-content{grid-template-columns:1fr;gap:24px}
+  .monitor-desk footer{flex-direction:column;gap:8px}
+}
+@media(max-width:440px){
+  .monitor-desk .monitor-main{padding:24px 14px 0}
+  .monitor-desk h1{font-size:22px}
+  .monitor-desk .small-tag{display:none}
+  .monitor-desk .metric{padding:16px 12px}
+  .monitor-desk .metric-label{font-size:14px}
+  .monitor-desk .metric-value{font-size:28px}
+  .monitor-desk .chart-unit{display:none}
+  .monitor-desk .section-heading{flex-wrap:wrap}
+  .monitor-desk .section-heading h2{font-size:16px}
+  .monitor-desk td,.monitor-desk th{padding:12px 9px}
+  .monitor-desk th:first-child,.monitor-desk td:first-child{padding-left:15px}
+  .monitor-desk .premium-pill{padding:3px 4px}
+  .monitor-desk .chart-container{height:275px}
+  .monitor-desk .refresh-button{font-size:12px;padding:8px}
+  .monitor-desk .chart-heading{padding:18px 15px}
+  .monitor-desk .segmented button{padding:6px 8px}
+  .monitor-desk .section-kicker{letter-spacing:.07em}
+  .monitor-desk .data-status .status-left{align-items:flex-start}
+  .monitor-desk .status-left svg{flex:none;margin-top:3px}
+}
+.monitor-desk .history-timestamp{font-size:12px;color:var(--muted-foreground);margin-top:7px;line-height:1.6}
+@media(prefers-reduced-motion:reduce){
+  .monitor-desk *,.monitor-desk *::before,.monitor-desk *::after{animation:none!important;transition:none!important}
+}
+.monitor-desk .refresh-area{display:flex;flex-direction:column;align-items:flex-end;gap:7px;flex:none}
+.monitor-desk .refresh-area>span{font-size:12px;color:var(--muted-foreground)}
+@media(max-width:780px){
+  .monitor-desk .refresh-area{padding-top:26px}
+  .monitor-desk .refresh-area .refresh-button{margin-top:0}
+  .monitor-desk .refresh-area>span{font-size:12px}
+}
+.monitor-desk .site-shell{min-height:0}
+.monitor-desk .monitor-main{padding-top:30px}
+.monitor-desk h1{font-size:25px}
+.monitor-desk .site-shell footer{margin-top:28px}
+.monitor-desk .notice{margin:26px 4.2%}
+.monitor-desk .site-shell .notice{margin:0 0 16px}
+@media(max-width:640px){
+  .monitor-desk h1{font-size:23px}
+}
+.monitor-desk{font-variant-numeric:tabular-nums}
+.monitor-desk button{min-height:40px}
+.monitor-desk button:hover{color:var(--foreground)}
+.monitor-desk button:disabled{cursor:default}
+.monitor-desk :is(button, a, input, select, textarea, summary):focus-visible{outline:2px solid var(--primary);outline-offset:3px}
+.monitor-desk input[type=checkbox],.monitor-desk input[type=radio]{accent-color:var(--primary)}
+.monitor-desk .monitor-main{max-width:1560px}
+.monitor-desk .monitor-main{padding-inline:32px}
+.monitor-desk .eyebrow,.monitor-desk .section-kicker{letter-spacing:.04em;color:var(--muted-foreground)}
+.monitor-desk .positive{color:var(--positive)}
+.monitor-desk .negative{color:var(--negative)}
+.monitor-desk .monitor-main{padding-top:24px}
+.monitor-desk .metric,.monitor-desk .chart-panel,.monitor-desk .table-panel,.monitor-desk .method-panel{background:var(--card);border-color:var(--border);border-radius:10px}
+.monitor-desk .primary-metric{background:var(--active-surface);border-color:var(--primary-border)}
+.monitor-desk .metric-value{font-size:32px}
+.monitor-desk .metric-label > svg,.monitor-desk .chart-tabs button.active{color:var(--primary)}
+.monitor-desk .chart-tabs button.active{border-color:var(--primary)}
+.monitor-desk .segmented,.monitor-desk .conversion{background:var(--background)}
+.monitor-desk .segmented button.active{color:var(--primary);background:var(--active-surface);border-color:var(--primary-border)}
+.monitor-desk .refresh-button{border-radius:7px;background:var(--card);color:var(--foreground)}
+.monitor-desk .refresh-button:hover{background:var(--active-surface);border-color:var(--primary-border)}
+.monitor-desk th{background:var(--muted);color:var(--muted-foreground)}
+.monitor-desk td{color:var(--foreground)}
+.monitor-desk .chart-tooltip{background:var(--card);color:var(--foreground);border-color:var(--border);box-shadow:0 8px 24px var(--shadow-color)}
+.monitor-desk .notice{background:var(--warning-surface);border-color:var(--warning-border);color:var(--warning)}
+.monitor-desk .notice.error{background:var(--negative-surface);border-color:var(--negative-border);color:var(--negative)}
+.monitor-desk .notice{margin-inline:32px}
+.monitor-desk .adr{background:var(--chart-2)}
+.monitor-desk .ordinary{background:var(--chart-3)}
+.monitor-desk .premium{background:var(--chart-1)}
+@media(max-width: 700px){
+  .monitor-desk .monitor-main{padding-inline:16px}
+  .monitor-desk .notice{margin-inline:16px}
+  .monitor-desk .page-heading{flex-wrap:wrap}
+  .monitor-desk .refresh-area{padding-top:0}
+  .monitor-desk .page-heading .refresh-button{margin-top:0}
+  .monitor-desk .metric-value{font-size:28px}
+}
+.monitor-desk .metric-value,.monitor-desk .conversion strong{font-family:var(--font-number);font-variant-numeric:tabular-nums;letter-spacing:0}
+.monitor-desk .monitor-main{padding-top:16px}
+.monitor-desk h1,.monitor-desk .page-heading h1{font-size:20px;letter-spacing:0;margin:4px 0}
+.monitor-desk .page-heading{margin-bottom:14px}
+.monitor-desk .page-heading p{font-size:13px}
+.monitor-desk .refresh-button{border-radius:6px;padding:8px 12px;font-size:13px}
+.monitor-desk .metrics{gap:12px;margin-bottom:16px}
+.monitor-desk .metric{padding:14px 16px}
+.monitor-desk .metric-label{font-size:13px}
+.monitor-desk .metric-value{font-size:24px;margin:8px 0 6px}
+.monitor-desk .metric,.monitor-desk .chart-panel,.monitor-desk .table-panel,.monitor-desk .method-panel{border-radius:8px}
+.monitor-desk .chart-heading{padding:14px 16px 12px}
+.monitor-desk .chart-toolbar{padding:0 16px}
+.monitor-desk .chart-caption{padding:10px 16px 12px}
+.monitor-desk .bottom-grid{gap:16px;margin-top:16px}
+.monitor-desk .section-heading{padding:14px 16px 12px}
+.monitor-desk h2{font-size:15px}
+@media(min-width: 1101px){
+  .monitor-desk th{padding:7px 16px}
+  .monitor-desk td{padding:8px 16px}
+  .monitor-desk th:first-child,.monitor-desk td:first-child{padding-left:16px}
+}
+.monitor-desk .conversion{margin:0 16px;padding:12px 16px;border-radius:6px}
+.monitor-desk .conversion strong{font-size:22px}
+.monitor-desk .formula{padding:14px 16px 0}
+.monitor-desk .method-note{font-size:13px;padding:10px 16px 12px}
+.monitor-desk .listing-note{padding:10px 16px}
+.monitor-desk .source-panel{margin-top:16px}
+.monitor-desk .source-toggle{padding:12px 0;font-size:13px}
+.monitor-desk .source-content{font-size:13px;line-height:1.75}
+.monitor-desk .notice{border-radius:6px;padding:8px 12px;font-size:13px}
+.monitor-desk .chart-tooltip{border-radius:6px;box-shadow:0 4px 12px var(--shadow-color)}
+.monitor-desk footer{padding:16px 0 20px}
+@media(max-width: 700px){
+  .monitor-desk .metric-value{font-size:22px}
+  .monitor-desk .metric{padding:12px}
+}
+.monitor-desk .monitor-main{max-width:none}
+.monitor-desk .monitor-main{padding:0;margin:0}
+.monitor-desk .notice{margin-inline:0}
+.monitor-desk .site-shell .page-heading.detail-toolbar{margin-bottom:8px;align-items:center}
+.monitor-desk .site-shell .page-heading.detail-toolbar h1{font-size:16px;margin:2px 0}
+.monitor-desk .site-shell .page-heading.detail-toolbar p{font-size:12px;margin:0}
+.monitor-desk .site-shell .refresh-area{flex-direction:row;align-items:center;gap:10px;padding-top:0}
+.monitor-desk .site-shell .data-status{margin-bottom:8px}
+.monitor-desk .hynix-chart-group{display:flex;flex-direction:column;min-width:0;margin-bottom:12px;border:1px solid var(--border);border-radius:8px;background:var(--card);overflow:hidden}
+.monitor-desk .hynix-chart-group .metrics.readout{margin:0;gap:0;border-bottom:1px solid var(--border)}
+.monitor-desk .hynix-chart-group .readout .metric{border:0;border-radius:0;background:transparent;padding:10px 14px}
+.monitor-desk .hynix-chart-group .readout .metric + .metric{border-left:1px solid var(--border)}
+.monitor-desk .hynix-chart-group .readout .metric-value{font-size:20px;margin:4px 0 2px}
+.monitor-desk .hynix-chart-group .chart-panel{border:0;border-radius:0;margin:0}
+.monitor-desk .hynix-chart-group .chart-footnote{display:flex;align-items:center;gap:6px;margin:0;padding:8px 14px;border-top:1px solid var(--border);font-size:12px;color:var(--muted-foreground)}
+@media (max-width: 1100px){
+  .monitor-desk .hynix-chart-group .metrics.readout{grid-template-columns:repeat(2, minmax(0, 1fr))}
+  .monitor-desk .hynix-chart-group .readout .metric:nth-child(3){border-left:0}
+  .monitor-desk .hynix-chart-group .readout .metric:nth-child(n+3){border-top:1px solid var(--border)}
+}
+@media (max-width: 700px){
+  .monitor-desk [data-monitor="anthropic"] .detail-toolbar{flex-wrap:wrap}
+  .monitor-desk [data-monitor="anthropic"] .refresh-area{flex:1 1 100%;flex-wrap:wrap}
+}
+.monitor-desk .svg-plot{height:100%;width:100%;position:relative}
+.monitor-desk .svg-plot-surface{display:block;overflow:visible;touch-action:pan-y;outline:none}
+.monitor-desk .svg-plot-surface:focus-visible{outline:2px solid var(--ring,var(--primary));outline-offset:2px}
+.monitor-desk .svg-plot-tick{fill:var(--muted-foreground);font-size:12px;font-variant-numeric:tabular-nums}
+.monitor-desk .svg-plot-tooltip{position:absolute;top:4px;z-index:2;max-width:calc(100% - 8px);pointer-events:none}
+.monitor-desk .svg-plot-tooltip .chart-tooltip{max-width:100%}
+
+/* This page sits inside the ASTER shell (.aster-desk .focused-desk), whose .page-heading rules in aster.css also match
+   the toolbar, and styles.css gives .svg-plot the service's own colours and tooltip box. Put back what globals.css gives. */
+.monitor-desk .site-shell .page-heading.detail-toolbar{gap:20px;flex-direction:row;flex-wrap:nowrap}
+@media(max-width:780px){
+  .monitor-desk .site-shell .page-heading.detail-toolbar{gap:10px}
+}
+@media(max-width:700px){
+  .monitor-desk .site-shell .page-heading.detail-toolbar{flex-wrap:wrap}
+}
+.monitor-desk .svg-plot{--muted-foreground:inherit;--card:inherit}
+.monitor-desk .svg-plot-tooltip{padding:0;border:0;border-radius:0;background:none;box-shadow:none}

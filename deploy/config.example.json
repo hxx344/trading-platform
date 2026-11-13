@@ -38,5 +38,10 @@
         "credentialVersion": 1
       }
     ]
+  },
+  "monitor": {
+    "anthropic": {
+      "shares": { "outstanding": 12.7, "diluted": 16.7 }
+    }
   }
 }

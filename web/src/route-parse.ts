@@ -1,6 +1,6 @@
-// The page's views live in the address hash (#/pair/<pair>, #/status, #/logs, #/settings, #/oil, #/options[/positions|/orders]), so a reload or a shared
+// The page's views live in the address hash (#/pair/<pair>, #/status, #/logs, #/settings, #/oil, #/options[/positions|/orders], #/monitor, #/asset), so a reload or a shared
 // link opens the same view. Kept free of the DOM so the server-side tests can import it.
-export type Route = { page: 'overview' } | { page: 'pair'; pairId: string | null } | { page: 'status' } | { page: 'logs' } | { page: 'settings' } | { page: 'oil' } | { page: 'options'; tab: 'desk' | 'positions' | 'orders' };
+export type Route = { page: 'overview' } | { page: 'pair'; pairId: string | null } | { page: 'status' } | { page: 'logs' } | { page: 'settings' } | { page: 'oil' } | { page: 'options'; tab: 'desk' | 'positions' | 'orders' } | { page: 'monitor' } | { page: 'asset' };
 const PAIR_ID = /^[0-9A-Za-z_-]{1,64}$/;
 
 export function parseRoute(hash: string): Route {
@@ -8,6 +8,8 @@ export function parseRoute(hash: string): Route {
   if (hash === '#/logs') return { page: 'logs' };
   if (hash === '#/settings') return { page: 'settings' };
   if (hash === '#/oil') return { page: 'oil' };
+  if (hash === '#/monitor') return { page: 'monitor' };
+  if (hash === '#/asset') return { page: 'asset' };
   if (hash === '#/options') return { page: 'options', tab: 'desk' };
   if (hash === '#/options/positions') return { page: 'options', tab: 'positions' };
   if (hash === '#/options/orders') return { page: 'options', tab: 'orders' };

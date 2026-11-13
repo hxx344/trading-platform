@@ -29,7 +29,7 @@ import { ACCOUNT_MODES, VENUES, VENUE_NAMES, parseTransferConfig, type Venue } f
 import { parseAdlConfig } from '../adl-contracts.ts';
 import { parsePrivateJson } from '../live/setup.ts';
 import { validCredentials, type LiveCredentials } from '../live/values.ts';
-import { assertDistinctSigners, parseServiceConfig, parseServiceSecrets } from './config.ts';
+import { MODULE_KEYS, assertDistinctSigners, parseServiceConfig, parseServiceSecrets } from './config.ts';
 import { parseOilSecrets } from './oil-config.ts';
 import { planOptions, readWorkbenchOptions, resolveOptionsAccount, type OptionsItem, type OptionsSource } from './import-options.ts';
 
@@ -124,8 +124,8 @@ function feishuOf(env: WorkbenchSource['env'], channel: 'EVENT' | 'SCHEDULED' = 
 export function planImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; only?: readonly string[]; known?: ReadonlyMap<string, AsterCredentials>; requireMargin?: boolean; oil?: OilSource; options?: OptionsSource }): ImportPlan {
   const config: Json = existing ? structuredClone(existing.config) : { secretsFile: options.secretsFile, pairs: [] };
   const secrets: Json = existing ? structuredClone(existing.secrets) : { accounts: {} };
-  // An oil-only or options-only config has no pairs yet; its module blocks and their keys are carried over untouched.
-  if (existing && config.pairs === undefined && (config.oil !== undefined || config.options !== undefined)) config.pairs = [];
+  // A config of other modules only (oil, options, monitor, asset) has no pairs yet; those blocks and their keys are carried over untouched.
+  if (existing && config.pairs === undefined && MODULE_KEYS.some(key => config[key] !== undefined)) config.pairs = [];
   if (!Array.isArray(config.pairs)) throw new Error('现有 config.json 的 pairs 不是列表');
   if (!isRecord(secrets.accounts)) throw new Error('现有密钥文件的 accounts 不是对象');
   const pairs = config.pairs as Json[], accounts = secrets.accounts as Record<string, Json>;

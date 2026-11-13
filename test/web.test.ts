@@ -183,6 +183,10 @@ test('页面地址：#/pair/<配对>、#/status 与 #/settings 分别打开详�
   assert.deepEqual(parseRoute('#/settings/x'), { page: 'overview' });
   assert.deepEqual(parseRoute('#/oil'), { page: 'oil' });
   assert.deepEqual(parseRoute('#/oil/x'), { page: 'overview' });
+  assert.deepEqual(parseRoute('#/monitor'), { page: 'monitor' });
+  assert.deepEqual(parseRoute('#/monitor/x'), { page: 'overview' });
+  assert.deepEqual(parseRoute('#/asset'), { page: 'asset' });
+  assert.deepEqual(parseRoute('#/asset/x'), { page: 'overview' });
   assert.deepEqual(parseRoute('#/options'), { page: 'options', tab: 'desk' });
   assert.deepEqual(parseRoute('#/options/positions'), { page: 'options', tab: 'positions' });
   assert.deepEqual(parseRoute('#/options/orders'), { page: 'options', tab: 'orders' });

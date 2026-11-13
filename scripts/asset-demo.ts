@@ -13,7 +13,7 @@ import { runExecutor } from '../src/runtime.ts';
 import { loadWebApp } from '../src/web-assets.ts';
 import { ASSET_DB_FILE } from '../src/asset/db.ts';
 import { importLedger } from '../src/asset/import.ts';
-import { createAssetReader } from '../src/asset/store.ts';
+import { createAssetStore } from '../src/asset/store.ts';
 import { OWNER, writeWorkbenchLedger } from '../test/asset-fixture.ts';
 
 const { values } = parseArgs({ options: { 'data-dir': { type: 'string' }, port: { type: 'string', default: '4730' } } });
@@ -35,7 +35,7 @@ const imported = importLedger({ from: source, owner: OWNER, dataDir: dir });
 process.stdout.write(`示例账本已导入：资产 ${imported.assets} 条，快照 ${imported.snapshots} 条\n`);
 
 const app = loadWebApp();
-const asset = createAssetReader(join(dir, ASSET_DB_FILE));
+const asset = createAssetStore(join(dir, ASSET_DB_FILE));
 // The environment marker is left out: its directory fsync is refused on Windows, and this directory only ever holds the demo.
 const store = openStore(join(dir, DATABASE_FILES.simulated));
 const { binance, bybit, aster, asterTrading } = createSimulatedVenues(Date.now);

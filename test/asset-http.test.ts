@@ -9,7 +9,7 @@ import type { AddressInfo } from 'node:net';
 import { createExecutorServer, type ServiceViews } from '../src/http.ts';
 import { ASSET_DB_FILE } from '../src/asset/db.ts';
 import { importLedger } from '../src/asset/import.ts';
-import { createAssetReader } from '../src/asset/store.ts';
+import { createAssetStore } from '../src/asset/store.ts';
 import { parseServiceConfig } from '../src/service/config.ts';
 import { bindAccounts, createHarness } from './harness.ts';
 import { FakeAster } from './aster-fake.ts';
@@ -38,7 +38,7 @@ function imported() {
   const from = join(root, 'ledger.sqlite'), dataDir = join(root, 'data');
   writeWorkbenchLedger(from, { now: NOW });
   importLedger({ from, owner: OWNER, dataDir, now: () => NOW });
-  const reader = createAssetReader(join(dataDir, ASSET_DB_FILE), { now: () => NOW });
+  const reader = createAssetStore(join(dataDir, ASSET_DB_FILE), { now: () => NOW });
   return { reader, done: () => { reader.close(); rmSync(root, { recursive: true, force: true }); } };
 }
 
@@ -53,7 +53,7 @@ test('资产接口：须登录；服务没有 asset 时 404', () => withServer(u
 
 test('资产接口：未导入时 200 与空数据，导入后给出账本；期次编号无效 400、不存在 404', async () => {
   const root = mkdtempSync(join(tmpdir(), 'tp-asset-http-empty-'));
-  const empty = createAssetReader(join(root, ASSET_DB_FILE), { now: () => NOW });
+  const empty = createAssetStore(join(root, ASSET_DB_FILE), { now: () => NOW });
   try {
     await withServer({ asset: empty }, async get => {
       for (const path of PATHS) {
@@ -80,7 +80,7 @@ test('资产接口：未导入时 200 与空数据，导入后给出账本；期
 });
 
 test('资产接口：读取失败时 500 asset_unreadable 并带原因', async () => {
-  const failing = { ...createAssetReader(join(tmpdir(), 'tp-asset-none', ASSET_DB_FILE)), ledger: async () => { throw new Error('database disk image is malformed'); } };
+  const failing = { ...createAssetStore(join(tmpdir(), 'tp-asset-none', ASSET_DB_FILE)), ledger: async () => { throw new Error('database disk image is malformed'); } };
   await withServer({ asset: failing }, async get => {
     const response = await get('/api/asset/ledger');
     assert.equal(response.status, 500);

@@ -1,9 +1,11 @@
 // Copied from project_aggregation modules/asset/tests/withdrawals.test.ts at 0014655; the expectations are unchanged.
-// Changes: imports point at src/asset; the withdrawalSchema (zod) case is left out, its chinaDay checks kept as their own case.
+// Changes: imports point at src/asset; withdrawalSchema (zod) is parseWithdrawal (src/asset/validation.ts, no zod):
+// parse() is parseWithdrawal, safeParse().success === false is a throw.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { assetMeasures, assetDisplayRows, assetTrend, embeddedWithdrawals, chinaDay, periodMeasures } from '../src/asset/withdrawals.ts';
 import type { Asset, Period, Withdrawal } from '../src/asset/types.ts';
+import { parseWithdrawal } from '../src/asset/validation.ts';
 
 const withdrawal = (date: string, amount: number): Withdrawal => ({ id: crypto.randomUUID(), date, amount, note: '', createdAt: date, updatedAt: date });
 const period = (id: string, date: string, total: number, withdrawn = 0): Period => ({ id, date, total, withdrawn, fx: 7, cny: total * 7, difference: 0, future: false });
@@ -113,7 +115,12 @@ test('same-day new withdrawals apply to live daily values but not the original b
   assert.equal(periodMeasures(period('daily-2026-09-19', '2026-09-19', 900), ledger).adjusted, 1000);
 });
 
-test('withdrawal dates use Beijing midnight', () => {
+test('withdrawal validation rejects invalid dates, precision and amounts; dates use Beijing midnight', () => {
+  const input = { id: crypto.randomUUID(), date: '2026-09-19', amount: 12.34, note: ' test ' };
+  assert.equal(parseWithdrawal(input).note, 'test');
+  for (const changes of [{ date: '2026-02-30' }, { amount: 0 }, { amount: -1 }, { amount: Infinity }, { amount: 0.001 }, { amount: 0.00001 }, { amount: 1e13 }, { id: 'row-1' }, { note: 'x'.repeat(201) }, { owner: 'someone-else' }]) {
+    assert.throws(() => parseWithdrawal({ ...input, ...changes }));
+  }
   assert.equal(chinaDay(new Date('2026-09-18T15:59:59Z')), '2026-09-18');
   assert.equal(chinaDay(new Date('2026-09-18T16:00:00Z')), '2026-09-19');
 });

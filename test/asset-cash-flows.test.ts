@@ -1,11 +1,15 @@
 // Copied from project_aggregation modules/asset/tests/cash-flows.test.ts at 0014655; the expectations are unchanged.
-// Changes: imports point at src/asset; the first case replays its revisions through amendCashFlows and settings instead of saveCashFlow.
+// Changes: imports point at src/asset; no owner (the check of another owner's empty list is left out); the first case
+// saves through the sync lock and writes.saveCashFlow, the steps of the workbench saveCashFlow (cash-flow-store.ts) that
+// the store (store.ts) runs: parse, take the lock, load, amend and store, release.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { openAssetDb, type AssetDb } from '../src/asset/db.ts';
-import { CASH_FLOW_KEY, amendCashFlows, cashFlowEvidence, intervalCashFlows, parseCashFlow, type CashFlowInput } from '../src/asset/cash-flows.ts';
+import { amendCashFlows, cashFlowEvidence, intervalCashFlows, parseCashFlow, type CashFlowInput } from '../src/asset/cash-flows.ts';
 import { loadCashFlows } from '../src/asset/store.ts';
+import { acquireSyncLock } from '../src/asset/sync-lock.ts';
+import * as writes from '../src/asset/writes.ts';
 
 const now = Date.parse('2026-11-10T12:00:00Z');
 const input = (extra: Partial<CashFlowInput> = {}): CashFlowInput => ({ id: randomUUID(), revision: 0, date: '2026-11-10', account: 'account-a', currency: 'USD', amount: '100',
@@ -13,11 +17,11 @@ const input = (extra: Partial<CashFlowInput> = {}): CashFlowInput => ({ id: rand
 
 test('cash flow amendments preserve original versions, reject stale edits and make identical lost-response retries idempotent', async t => {
   const database = openAssetDb(':memory:'); t.after(() => database.close());
-  // What saveCashFlow does in the workbench (cash-flow-store.ts), without its sync lock and owner: parse, amend, store.
+  // The lock needs an imported ledger.
+  database.prepare("INSERT INTO settings(key,value) VALUES('import-info','{}')").run();
   const saveCashFlow = async (database: AssetDb, value: unknown, now: number) => {
-    const next = amendCashFlows(await loadCashFlows(database), parseCashFlow(value, now), now);
-    database.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').bind(CASH_FLOW_KEY, JSON.stringify(next)).run();
-    return next;
+    const input = parseCashFlow(value, now), lease = await acquireSyncLock(database, { now: () => now });
+    try { return writes.saveCashFlow(database, lease, await loadCashFlows(database), input, now); } finally { await lease.release(); }
   };
   const original = input();
   const first = await saveCashFlow(database, original, now);

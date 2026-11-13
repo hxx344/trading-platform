@@ -194,6 +194,14 @@
 
 **回滚**：`sudo bash install.sh --version v0.11.0`，回退前先删掉 `config.json` 里的 `asset`。
 
+## 资产页写入（Asset A-2，v0.16.0）
+
+**对照的工作台页面**：`modules/asset/app`（提交 `0014655`）`dashboard.tsx` 的编辑弹窗与汇率弹窗、KPI 里的 `kpi-edit` 按钮、资产表的编辑按钮，`withdrawals-panel.tsx` 的登记 / 修改 / 删除，`cash-flows-panel.tsx` 的登记与修改 / 作废表单。行为与接口见 [asset.md](asset.md) 的 A-2。
+
+- 弹窗改为原位面板（`.edit-panel`），字段、文案、按钮与工作台相同。差异：汇率说明（自动更新未接入）与只读文案的删改（见 asset.md）；编辑与汇率面板保存时按钮显示“正在保存”、取消按钮禁用；汇率输入加 `max=1000`、资金流日期加 `max`（今天），与服务端校验一致；资金流表单打开时隐藏“登记资金流”按钮；工作台弹窗是模态的，本页几个面板可同时展开，所以报错只显示在发起写入的那个面板里。
+- 样式：`.form-grid`（含 `.checkbox-label`）、`.form-actions`、`.row-actions`、`.kpi-edit`、`.button.primary` 与两条宽度媒体查询复制自工作台 `globals.css`（`0014655`），加 `.asset-desk ` 前缀，放在 `asset.css` 写入表单一节；原位面板、表单里的 `select` 与勾选框里的输入框、资金流面板里的缩小字号、“已保存”提示写在文件末尾的本服务规则。
+- 验证：`scripts/asset-demo.ts` 假数据上无头浏览器 1280 与 390 宽度走过全部写入；390 宽度无横向溢出（出金表在表格容器内横向滚动，同工作台）；无页面错误。本机无头浏览器没有中文字体，截图只用来看版式。
+
 ## 期权页（v0.11.0）
 
 **对照的工作台页面**：工作台期权模块 `modules/greeks/app/static/index.html`、`app.js`、`style.css`（提交 `2f0593d`）。页面 `web/src/OptionsPage.tsx`，表单与计算在不依赖 DOM 的 `web/src/options-form.ts`（有单元测试）。顶部「期权」标签只在 `GET /api/options/state` 有应答时出现。

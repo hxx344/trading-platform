@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { ASSET_DB_FILE } from '../src/asset/db.ts';
 import { importLedger } from '../src/asset/import.ts';
-import { createAssetReader, parseImportInfo } from '../src/asset/store.ts';
+import { createAssetStore, parseImportInfo } from '../src/asset/store.ts';
 import { notImported } from '../src/asset/views.ts';
 import { parseServiceConfig } from '../src/service/config.ts';
 import { assetSummary } from '../src/service/asset-config.ts';
@@ -21,7 +21,7 @@ function workspace() {
   const root = mkdtempSync(join(tmpdir(), 'tp-asset-store-'));
   const from = join(root, 'ledger.sqlite'), dataDir = join(root, 'data');
   writeWorkbenchLedger(from, { now: NOW });
-  const reader = createAssetReader(join(dataDir, ASSET_DB_FILE), { now: () => NOW });
+  const reader = createAssetStore(join(dataDir, ASSET_DB_FILE), { now: () => NOW });
   const load = (owner = OWNER) => importLedger({ from, owner, dataDir, now: () => NOW });
   return { root, from, dataDir, reader, load, done: () => { reader.close(); rmSync(root, { recursive: true, force: true }); } };
 }
@@ -39,7 +39,7 @@ test('资产读取：未导入时每个接口都给空数据并标明 imported:f
     // An empty file of a crashed first import (no tables yet) reads as not imported too.
     const empty = mkdtempSync(join(tmpdir(), 'tp-asset-empty-'));
     new DatabaseSync(join(empty, ASSET_DB_FILE)).close();
-    const reader = createAssetReader(join(empty, ASSET_DB_FILE), { now: () => NOW });
+    const reader = createAssetStore(join(empty, ASSET_DB_FILE), { now: () => NOW });
     try { assert.equal((await reader.state()).imported, false); } finally { reader.close(); rmSync(empty, { recursive: true, force: true }); }
   } finally { w.done(); }
 });

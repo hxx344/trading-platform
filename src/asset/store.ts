@@ -1,8 +1,11 @@
-// The service's reads of asset.sqlite. The file is opened read-only on first use and only if it exists, so a service
+// The service's reads and writes of asset.sqlite. The file is opened on first use and only if it exists, so a service
 // started before the first import serves "not imported" and picks the data up once import.ts has written it (WAL lets
-// the import commit while this connection stays open). Nothing here writes.
+// the import commit while this connection stays open). Since A-2 it is opened read-write (one connection, so a write
+// shows in the next read) and falls back to read-only when the service cannot write it; the writes (writes.ts) run under
+// the sync lock (sync-lock.ts).
 import { statSync } from 'node:fs';
-import { openAssetDb, type AssetDb } from './db.ts';
+import { dirname } from 'node:path';
+import { assertOwnFiles, openAssetDb, type AssetDb } from './db.ts';
 import type { QueryDatabase } from './query.ts';
 import type { Asset, Connection, Ledger } from './types.ts';
 import { seedLedger, type SourceLedger } from './seed.ts';
@@ -11,7 +14,10 @@ import { readSnapshotHistory } from './snapshot-history.ts';
 import { readAsterAccounts } from './aster-accounts.ts';
 import { knownAssetValue } from './asset-values.ts';
 import { chinaDay } from './withdrawals.ts';
-import { CASH_FLOW_KEY, readCashFlowAudit, type CashFlowRecord } from './cash-flows.ts';
+import { CASH_FLOW_KEY, parseCashFlow, readCashFlowAudit, type CashFlowRecord } from './cash-flows.ts';
+import { acquireSyncLock, AssetConflict, LOCK_BUSY, NOT_IMPORTED, type SyncLease } from './sync-lock.ts';
+import { parseEdit, parseFx, parseWithdrawal, parseWithdrawalId } from './validation.ts';
+import * as writes from './writes.ts';
 import { DAILY_CHANGE_DAYS, readDailyChanges, shiftDay } from './daily-changes.ts';
 import {
   cashFlowsView, historyView, ledgerView, notImported, withdrawalsView,
@@ -79,7 +85,8 @@ export function parseImportInfo(value: string): ImportInfo {
   return { importedAt: info.importedAt, file: info.file, owner: info.owner, assets: Number(info.assets) || 0, snapshots: Number(info.snapshots) || 0, settings: Array.isArray(info.settings) ? info.settings.filter(key => typeof key === 'string') : [] };
 }
 
-export interface AssetReader {
+
+export interface AssetStore {
   state(): Promise<AssetState>;
   ledger(): Promise<AssetLedgerView>;
   history(): Promise<AssetHistoryView>;
@@ -88,33 +95,88 @@ export interface AssetReader {
   cashFlows(): Promise<AssetCashFlowsView>;
   /** null: imported, but no such period. */
   period(id: string): Promise<AssetPeriodView | null>;
+  /**
+   * The writes (A-2) take the request body as it came: invalid input throws AssetInputError, a refusal because of the
+   * ledger's state (not imported, read-only file, lock busy or lost, imported again) AssetConflict, a refused edit a
+   * plain Error with the workbench's message. Each answers with the view the page shows next.
+   */
+  editAsset(body: unknown): Promise<AssetLedgerView>;
+  editFx(body: unknown): Promise<AssetLedgerView>;
+  saveWithdrawal(body: unknown, editing: boolean): Promise<AssetLedgerView>;
+  deleteWithdrawal(body: unknown): Promise<AssetLedgerView>;
+  saveCashFlow(body: unknown): Promise<AssetCashFlowsView>;
   close(): void;
 }
+/** A write refused because the service may not write the file (opened read-only). */
+export const READ_ONLY = '资产库不可写：asset.sqlite 或其 -wal/-shm 不归服务账户或没有写权限，请把它们改回服务账户所有（chown）并可写后重试';
+/** SQLite's answers for a file this account may not write: READONLY, PERM, CANTOPEN (primary result codes). */
+const NOT_WRITABLE_CODES = new Set([8, 3, 14]);
+const sqliteCode = (error: unknown): number | undefined => { const code = (error as { errcode?: unknown } | null)?.errcode; return typeof code === 'number' ? code & 0xff : undefined; };
 
-export function createAssetReader(file: string, { now = Date.now }: { now?: () => number } = {}): AssetReader {
-  let handle: AssetDb | null = null, opened = '';
+export function createAssetStore(file: string, { now = Date.now }: { now?: () => number } = {}): AssetStore {
+  // Why the open handle is read-only: the files are not the service's to write, or another writer held the file too long.
+  let handle: AssetDb | null = null, opened = '', writable = false, busy = false;
   /** Which file is at the path: a file deleted and imported again is a new one, and the open handle would keep reading the deleted one. */
   const identity = (): string | null => {
     try { const stat = statSync(file, { bigint: true }); return `${stat.dev}:${stat.ino}`; }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
   };
   const today = (): string => chinaDay(new Date(now()));
+  const drop = () => { handle?.close(); handle = null; writable = false; busy = false; };
+  /** Read-write when the service owns the files and can write them; otherwise read-only, so the reads still work. */
+  function open(present: string) {
+    try { assertOwnFiles(dirname(file)); }
+    catch { handle = openAssetDb(file, { readOnly: true }); writable = false; opened = present; return; }
+    try { handle = openAssetDb(file, { mode: 'service' }); writable = true; }
+    catch (error) {
+      const code = sqliteCode(error);
+      // Only a file SQLite cannot write is read-only; busy (an import mid-transaction) keeps the reads and says so on a write.
+      if (code === undefined || !(NOT_WRITABLE_CODES.has(code) || code === 5)) throw error;
+      handle = openAssetDb(file, { readOnly: true }); writable = false; busy = code === 5;
+    }
+    opened = present;
+  }
   /** The open file and its import record; null until an import has committed. */
   async function current(): Promise<{ database: AssetDb; info: ImportInfo } | null> {
     const present = identity();
-    if (handle && present !== opened) { handle.close(); handle = null; }
+    if (handle && present !== opened) drop();
     if (!handle) {
       if (present === null) return null;
-      handle = openAssetDb(file, { readOnly: true });
-      opened = present;
+      open(present);
     }
     let row: { value: string } | null;
     // An import creating the file has the tables only once it commits.
-    try { row = await handle.prepare("SELECT value FROM settings WHERE key = 'import-info'").first<{ value: string }>(); }
+    try { row = await handle!.prepare("SELECT value FROM settings WHERE key = 'import-info'").first<{ value: string }>(); }
     catch (error) { if (error instanceof Error && /no such table/.test(error.message)) return null; throw error; }
-    return row ? { database: handle, info: parseImportInfo(row.value) } : null;
+    return row ? { database: handle!, info: parseImportInfo(row.value) } : null;
+  }
+  /** The file for a write; a read-only handle is opened again once (its owner may have been fixed since). */
+  async function forWrite(): Promise<AssetDb> {
+    if (handle && !writable) drop();
+    const found = await current();
+    if (!found) throw new AssetConflict('not_imported', NOT_IMPORTED);
+    if (!writable) throw busy ? new AssetConflict('busy', LOCK_BUSY) : new AssetConflict('read_only', READ_ONLY);
+    return found.database;
+  }
+  /** Serialize ledger changes (store.ts withLock): the lease is released however the change ends. */
+  async function locked<T>(change: (database: AssetDb, lease: SyncLease) => Promise<T>): Promise<T> {
+    const database = await forWrite();
+    const lease = await acquireSyncLock(database, { now });
+    try { return await change(database, lease); }
+    // A failed release must not turn a saved change into an error; the lock then runs out after its TTL.
+    finally { await lease.release().catch(() => undefined); }
   }
   const stamp = (info: ImportInfo) => ({ imported: true, importedAt: info.importedAt });
+  async function ledger(): Promise<AssetLedgerView> {
+    const found = await current(), day = today();
+    if (!found) return notImported.ledger(day);
+    return { ...stamp(found.info), today: day, ...ledgerView(await readLedger(found.database, false), day) };
+  }
+  async function cashFlows(): Promise<AssetCashFlowsView> {
+    const found = await current();
+    if (!found) return notImported.cashFlows();
+    return { ...stamp(found.info), ...cashFlowsView(await loadCashFlows(found.database)) };
+  }
   return {
     async state() {
       const found = await current();
@@ -133,11 +195,7 @@ export function createAssetReader(file: string, { now = Date.now }: { now?: () =
         snapshots: { count: Number(daily?.count ?? 0), first: daily?.first ?? null, last: daily?.last ?? null, archived: Number(archived?.count ?? 0) },
       };
     },
-    async ledger() {
-      const found = await current(), day = today();
-      if (!found) return notImported.ledger(day);
-      return { ...stamp(found.info), today: day, ...ledgerView(await readLedger(found.database, false), day) };
-    },
+    ledger,
     async history() {
       const found = await current(), day = today();
       if (!found) return notImported.history(day);
@@ -156,17 +214,39 @@ export function createAssetReader(file: string, { now = Date.now }: { now?: () =
       if (!found) return notImported.withdrawals();
       return { ...stamp(found.info), ...withdrawalsView(await readLedger(found.database, false)) };
     },
-    async cashFlows() {
-      const found = await current();
-      if (!found) return notImported.cashFlows();
-      return { ...stamp(found.info), ...cashFlowsView(await loadCashFlows(found.database)) };
-    },
+    cashFlows,
     async period(id) {
       const found = await current();
       if (!found) return { imported: false, importedAt: null, rows: [] };
       const rows = await readPeriodRows(found.database, id);
       return rows === null ? null : { ...stamp(found.info), rows };
     },
-    close() { handle?.close(); handle = null; },
+    async editAsset(body) {
+      const input = parseEdit(body);
+      await locked(async (database, lease) => writes.editAsset(database, lease, await readLedger(database, false), input, now()));
+      return ledger();
+    },
+    async editFx(body) {
+      const fx = parseFx(body);
+      await locked(async (database, lease) => writes.editFx(database, lease, await readLedger(database, false), fx, now()));
+      return ledger();
+    },
+    async saveWithdrawal(body, editing) {
+      const input = parseWithdrawal(body);
+      await locked(async (database, lease) => writes.saveWithdrawal(database, lease, await readLedger(database, false), input, editing, now()));
+      return ledger();
+    },
+    async deleteWithdrawal(body) {
+      const id = parseWithdrawalId(body);
+      await locked(async (database, lease) => writes.deleteWithdrawal(database, lease, await readLedger(database, false), id, now()));
+      return ledger();
+    },
+    async saveCashFlow(body) {
+      // The workbench parses before taking the lock (cash-flow-store.ts); its messages are business errors (400).
+      const input = parseCashFlow(body, now());
+      await locked(async (database, lease) => writes.saveCashFlow(database, lease, await loadCashFlows(database), input, now()));
+      return cashFlows();
+    },
+    close() { drop(); },
   };
 }

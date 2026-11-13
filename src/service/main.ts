@@ -31,7 +31,7 @@ import { closeMonitor, monitorLoops, monitorViews, openMonitor, stopMonitor, typ
 import { monitorSummary } from './monitor-config.ts';
 import { assetSummary } from './asset-config.ts';
 import { ASSET_DB_FILE } from '../asset/db.ts';
-import { createAssetReader } from '../asset/store.ts';
+import { createAssetStore } from '../asset/store.ts';
 import { createEngineFor, optionsLoops, optionsViews, prepareOptions, type OptionsRuntime } from './options.ts';
 import { optionsSummary } from './options-config.ts';
 import type { OptionsEngine } from '../options/engine.ts';
@@ -276,8 +276,8 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
     catch (error) { monitorError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`行情监控库无法打开，行情监控页不可用：${monitorError}\n`); }
   }
   const closeMonitorStore = () => { if (monitor) closeMonitor(monitor); };
-  // Opened lazily and read-only by the reader: a missing or not yet imported asset.sqlite answers "not imported".
-  const asset = config.asset ? createAssetReader(join(dir, ASSET_DB_FILE)) : null;
+  // Opened lazily by the store (read-write, read-only when the service cannot write it): a missing or not yet imported asset.sqlite answers "not imported".
+  const asset = config.asset ? createAssetStore(join(dir, ASSET_DB_FILE)) : null;
   const enabled = executor.transferPairs().filter(pair => pair.enabled).length;
   // The options engine needs the notifier for its task messages; a state document it cannot read refuses start.
   let engine: OptionsEngine | undefined;

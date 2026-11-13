@@ -70,5 +70,9 @@ export interface ServiceStatus {
   budget?: { usedLastMinute: number; limitPerMinute: number; adlReserve: number; ipUsedThisMinute: number | null; ipCeiling: number; ipCeilingAdl: number; coolingUntil: number | null; reason: string | null };
   streams?: StreamStatus[];
   feishu?: { configured: boolean; pending: number; retrying: number; lastSentAt: number | null; lastError: string | null; nextRetryAt: number | null; retentionMs: number; recent: OutboxRow[] };
+  summary?: { enabled: boolean; intervalMinutes: number; robot: 'scheduled' | 'event' | null; nextDueAt: number | null; lastSentAt: number | null; lastError: string | null; lastErrorAt: number | null };
   samples?: { available: boolean; error: string | null };
 }
+
+/** One line of the service log (GET /api/logs). */
+export interface LogLine { id: string; at: number; level: 'alert' | 'problem' | 'info'; text: string }

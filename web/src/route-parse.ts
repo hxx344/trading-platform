@@ -1,10 +1,11 @@
-// The page's views live in the address hash (#/pair/<pair>, #/status, #/settings, #/oil), so a reload or a shared
+// The page's views live in the address hash (#/pair/<pair>, #/status, #/logs, #/settings, #/oil), so a reload or a shared
 // link opens the same view. Kept free of the DOM so the server-side tests can import it.
-export type Route = { page: 'overview' } | { page: 'pair'; pairId: string | null } | { page: 'status' } | { page: 'settings' } | { page: 'oil' };
+export type Route = { page: 'overview' } | { page: 'pair'; pairId: string | null } | { page: 'status' } | { page: 'logs' } | { page: 'settings' } | { page: 'oil' };
 const PAIR_ID = /^[0-9A-Za-z_-]{1,64}$/;
 
 export function parseRoute(hash: string): Route {
   if (hash === '#/status') return { page: 'status' };
+  if (hash === '#/logs') return { page: 'logs' };
   if (hash === '#/settings') return { page: 'settings' };
   if (hash === '#/oil') return { page: 'oil' };
   if (hash === '#/pair' || hash === '#/pair/') return { page: 'pair', pairId: null };

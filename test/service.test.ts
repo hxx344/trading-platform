@@ -1,6 +1,6 @@
 // The ASTER service: operator files, the takeover checks, fixed reserves, the Feishu outbox, the user stream and the
 // wired executor on the ASTER stand-in.
-import { test } from 'node:test';
+import { mock, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
@@ -301,14 +301,76 @@ test('飞书告警：未配置机器人时只写日志；事件说明覆盖结�
 });
 
 class FakeSocket implements SocketLike {
-  listeners: Record<string, ((event: { data: unknown }) => void)[]> = {};
+  listeners: Record<string, ((event: any) => void)[]> = {};
   closed = false;
+  sent: string[] = [];
   readonly url: string;
   constructor(url: string) { this.url = url; }
-  addEventListener(type: string, listener: (event: { data: unknown }) => void): void { (this.listeners[type] ??= []).push(listener); }
-  emit(type: string, data?: unknown): void { for (const listener of this.listeners[type] ?? []) listener({ data }); }
-  close(): void { if (!this.closed) { this.closed = true; this.emit('close'); } }
+  addEventListener(type: string, listener: (event: any) => void): void { (this.listeners[type] ??= []).push(listener); }
+  emit(type: string, data?: unknown, extra: Record<string, unknown> = {}): void { for (const listener of this.listeners[type] ?? []) listener({ data, ...extra }); }
+  send(data: string): void { this.sent.push(data); }
+  close(): void { if (!this.closed) { this.closed = true; this.emit('close', undefined, { code: 1000, reason: '' }); } }
 }
+
+test('用户推送：每 30 秒发保活请求，应答过后 95 秒无消息即重连；断开原因记下关闭码、错误与连接时长', async () => {
+  mock.timers.enable({ apis: ['setInterval', 'setTimeout'] });
+  try {
+    const { client } = setup();
+    const sockets: FakeSocket[] = [], lines: string[] = [], states: (string | null | undefined)[] = [];
+    let clock = 1_000_000, stop = false;
+    const waiters: (() => void)[] = [];
+    const done = runUserStream({
+      client, credentials: LONG, accountId: LONG.user, push: () => undefined, now: () => clock,
+      stopped: () => stop, pause: async () => { await new Promise(resolve => setImmediate(resolve)); },
+      connect: url => { const socket = new FakeSocket(url); sockets.push(socket); queueMicrotask(() => { socket.emit('open'); waiters.shift()?.(); }); return socket; },
+      log: line => lines.push(line), onState: (connected, reason) => { if (!connected) states.push(reason); },
+    });
+    const opened = () => new Promise<void>(resolve => waiters.push(resolve));
+    const advance = (seconds: number) => { for (let i = 0; i < seconds; i++) { clock += 1000; mock.timers.tick(1000); } };
+    await opened();
+    // No answer yet: silence is normal, heartbeats keep going and nothing reconnects.
+    advance(120);
+    assert.equal(sockets.length, 1);
+    assert.deepEqual(sockets[0]!.sent.map(text => JSON.parse(text)), [1, 2, 3, 4].map(id => ({ method: 'LIST_SUBSCRIPTIONS', id })));
+    // An answer is not an event for the connector, and arms the silence check.
+    sockets[0]!.emit('message', JSON.stringify({ id: 4, result: [] }));
+    assert.equal(sockets[0]!.closed, false);
+    // An answer in another shape (an error object without an id) keeps the connection and is noted once.
+    sockets[0]!.emit('message', JSON.stringify({ code: -1, msg: 'unknown method' }));
+    sockets[0]!.emit('message', JSON.stringify({ code: -1, msg: 'unknown method' }));
+    assert.equal(sockets[0]!.closed, false);
+    assert.equal(lines.filter(line => /保活应答格式不同：\{"code":-1/.test(line)).length, 1);
+    let next = opened();
+    advance(95);
+    await next;
+    assert.equal(sockets.length, 2);
+    assert.match(states[0]!, /^连接无响应（95 秒没有收到消息，已连接 215 秒）$/);
+    // An error waits for the close that carries the code.
+    next = opened();
+    advance(362);
+    sockets[1]!.emit('error', undefined, { message: 'Received network error' });
+    sockets[1]!.emit('close', undefined, { code: 1006, reason: '' });
+    await next;
+    assert.match(states[1]!, /^连接出错（代码 1006，Received network error，已连接 362 秒）$/);
+    // A close from the venue after the connection opened is a disconnect, not a clean end.
+    next = opened();
+    sockets[2]!.emit('close', undefined, { code: 1000, reason: 'Bye' });
+    await next;
+    assert.match(states[2]!, /^连接被关闭（代码 1000 Bye，已连接 0 秒）$/);
+    // An error without a close still ends the connection after the grace period.
+    next = opened();
+    sockets[3]!.emit('error', undefined, {});
+    advance(3);
+    await next;
+    assert.match(states[3]!, /^连接出错（已连接 3 秒）$/);
+    assert.ok(lines.every(line => line.startsWith(`用户推送 ***${LONG.user.slice(-4)} `)));
+    stop = true;
+    advance(1);
+    await done;
+    assert.equal(states.length, 5, '停止是正常收尾');
+    assert.equal(states[4], null);
+  } finally { mock.timers.reset(); }
+});
 
 test('用户推送：签名创建推送密钥，消息转给连接器，密钥过期即重连，停止后退出', async () => {
   const { fake, client } = setup();
@@ -475,7 +537,19 @@ test('服务进程：本机页面只含 ASTER 部分，状态接口可读，用�
     for (let i = 0; i < 100 && sockets.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 20));
     assert.equal(sockets.length, 2, '每个子账户一条用户推送');
     const get = async (path: string, headers: Record<string, string> = { cookie }) => { const response = await fetch(`http://127.0.0.1:${port}${path}`, { headers }); return { status: response.status, body: await response.json() as Record<string, any> }; };
-    for (const path of ['/api/status', '/api/transfer-pairs/p1/balances', '/api/transfer-pairs/p1/history', '/api/adl/pairs/p1/incidents']) assert.equal((await get(path, {})).status, 401, `${path} 须登录`);
+    for (const path of ['/api/status', '/api/transfer-pairs/p1/balances', '/api/transfer-pairs/p1/history', '/api/adl/pairs/p1/incidents', '/api/logs', '/api/logs/problems']) assert.equal((await get(path, {})).status, 401, `${path} 须登录`);
+    // What the service writes (stdout and stderr) shows up on the log tab. Here the test runner shares stdout for its own
+    // frames, so the startup line may follow one of them on the same row; on the server stdout carries whole lines only.
+    let logs: { items: { text: string; level: string }[] } = { items: [] };
+    for (let i = 0; i < 50 && !logs.items.some(row => row.text.includes('ASTER 服务已启动')); i++) {
+      logs = (await get('/api/logs?limit=50')).body as typeof logs;
+      if (!logs.items) break;
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    assert.ok(logs.items?.some(row => row.text.includes('ASTER 服务已启动')), `启动日志进入页面日志：${JSON.stringify(logs).slice(0, 300)}`);
+    assert.ok((await get('/api/logs/problems')).body.items.every((row: { level: string }) => row.level !== 'info'));
+    assert.equal((await get('/api/logs?before=abc')).status, 400);
+    assert.equal((await get('/api/logs?limit=201')).status, 400);
     const status = (await get('/api/status')).body;
     assert.equal(status.health.schemaVersion, 4, '主库结构不变');
     assert.deepEqual(status.health.loops.map((loop: { name: string }) => loop.name).sort(), ['ADL 循环', '划转循环', '历史清理', '持仓读取'].sort());

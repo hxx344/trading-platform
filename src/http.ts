@@ -54,6 +54,8 @@ export interface ServiceViews {
   balanceHistory?(pairId: string, range: string): unknown;
   /** The oil module's reads (books and spreads; accounts, positions, jobs, caps); absent when the service runs no oil. */
   oil?: { market(): unknown; state(): unknown };
+  /** The service's log lines, newest first (service-log.ts); `before` is the last id of the previous page. */
+  logs?(filter: 'all' | 'problems', before: number | null, limit: number): unknown;
 }
 
 /** accessToken is exchanged once per browser at /login; session is the cookie value and the executor session id. */
@@ -218,6 +220,13 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'GET' && (url.pathname === '/api/oil/market' || url.pathname === '/api/oil/state')) {
       if (!views?.oil) return send(response, 404, { code: 'not_found', message: '本服务没有配置原油执行' });
       return send(response, 200, url.pathname === '/api/oil/market' ? views.oil.market() : views.oil.state());
+    }
+    if (request.method === 'GET' && (url.pathname === '/api/logs' || url.pathname === '/api/logs/problems')) {
+      if (!views?.logs) return send(response, 404, { code: 'not_found', message: '本服务没有页面日志' });
+      const before = url.searchParams.get('before'), limit = url.searchParams.get('limit');
+      if (before !== null && !/^[1-9]\d{0,14}$/.test(before)) return send(response, 400, { code: 'invalid_cursor', message: '翻页位置无效' });
+      if (limit !== null && (!/^\d{1,3}$/.test(limit) || Number(limit) < 1 || Number(limit) > 200)) return send(response, 400, { code: 'invalid_limit', message: '每页条数须为 1–200' });
+      return send(response, 200, views.logs(url.pathname === '/api/logs' ? 'all' : 'problems', before === null ? null : Number(before), limit === null ? 100 : Number(limit)));
     }
     const pairRead = request.method === 'GET' ? PAIR_READ_PATH.exec(url.pathname) : null;
     if (pairRead?.[2] === 'history') {

@@ -73,6 +73,16 @@ function Feishu({ feishu }: { feishu: NonNullable<ServiceStatus['feishu']> }) {
   </>;
 }
 
+function Summary({ summary }: { summary: NonNullable<ServiceStatus['summary']> }) {
+  const where = summary.robot === 'scheduled' ? '定时机器人' : '告警机器人（密钥文件没有 feishuScheduled）';
+  return <div className="panel-body"><dl className="facts">
+    <dt>状态</dt><dd>{summary.enabled ? `每 ${summary.intervalMinutes} 分钟一张，发往${where}` : summary.intervalMinutes === 0 ? <span className="muted">已关闭（config.json 的 summary.intervalMinutes 为 0）</span> : <span className="muted">未配置飞书机器人，不发送</span>}</dd>
+    {summary.enabled ? <><dt>下次</dt><dd>{stamp(summary.nextDueAt)}</dd></> : null}
+    <dt>最近成功</dt><dd>{stamp(summary.lastSentAt)}</dd>
+    <dt>最近错误</dt><dd className={summary.lastError ? 'err' : undefined}>{summary.lastError ? `${summary.lastError}（${stamp(summary.lastErrorAt)}）` : '无'}</dd>
+  </dl></div>;
+}
+
 /** The service's own health: background loops, the database, the request budget, user streams and the alert outbox. */
 export function StatusPage({ onExpired }: { onExpired: () => void }) {
   const { data, status, error } = useLiveResource<ServiceStatus>('/api/status', { intervalMs: REFRESH_MS, onExpired });
@@ -96,6 +106,11 @@ export function StatusPage({ onExpired }: { onExpired: () => void }) {
     {data.feishu ? <section className="panel">
       <div className="section-head"><h2>飞书告警发件箱</h2></div>
       <Feishu feishu={data.feishu} />
+    </section> : null}
+    {data.summary ? <section className="panel">
+      <div className="section-head"><h2>飞书定时运行摘要</h2></div>
+      <p className="panel-note">照工作台的「ASTER 运行摘要」卡片：合计浮盈亏、各配对两侧可用保证金与占用率、持仓、划转与 ADL 状态，需要处理的配对排在前面。</p>
+      <Summary summary={data.summary} />
     </section> : null}
     {data.samples ? <p className={data.samples.available ? 'status-line' : 'status-line err'}>余额采样：{data.samples.available ? '正常（每分钟一次，保留 30 天）' : `不可用：${data.samples.error ?? '未知原因'}（不影响划转与 ADL）`}</p> : null}
   </>;

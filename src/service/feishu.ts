@@ -222,6 +222,20 @@ export function describeEvent(row: EventRow, incidentPair: (id: string) => strin
 /** Feishu custom robot signature: base64 HMAC-SHA256 keyed by "timestamp\nsecret" over an empty message. */
 export const feishuSign = (timestampSeconds: number, secret: string): string => createHmac('sha256', `${timestampSeconds}\n${secret}`).update('').digest('base64');
 
+/**
+ * One signed post to a custom robot (10-second timeout, no retry here: the caller decides). Throws on an HTTP error or a
+ * non-zero robot code, with both in the message.
+ */
+export async function sendFeishu(feishu: FeishuSecret, message: Record<string, unknown>, { fetchImpl = (url, init) => fetch(url, init), now = Date.now }: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; now?: () => number } = {}): Promise<void> {
+  const timestamp = Math.floor(now() / 1000);
+  const body = { ...(feishu.secret ? { timestamp: String(timestamp), sign: feishuSign(timestamp, feishu.secret) } : {}), ...message };
+  const response = await fetchImpl(feishu.webhook, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(SEND_TIMEOUT_MS) });
+  let answer: { code?: unknown; StatusCode?: unknown; msg?: unknown } = {};
+  try { answer = await response.json() as typeof answer; } catch { /* judged by status below */ }
+  const code = answer.code ?? answer.StatusCode;
+  if (!response.ok || (code !== undefined && code !== 0)) throw new Error(`飞书返回 HTTP ${response.status}${code !== undefined ? ` code ${String(code).slice(0, 12)}` : ''}${typeof answer.msg === 'string' ? ` ${answer.msg.slice(0, 80)}` : ''}`);
+}
+
 export function createNotifier({ file, events, latestSeq, pairs, incidentPair, job, feishu, now = Date.now, fetchImpl = (url, init) => fetch(url, init), log = line => process.stderr.write(`${line}\n`) }: NotifierOptions) {
   const db = new DatabaseSync(file);
   db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=2000;
@@ -309,13 +323,7 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
 
   async function post(text: string): Promise<void> {
     if (!feishu) return;
-    const timestamp = Math.floor(now() / 1000);
-    const body = { ...(feishu.secret ? { timestamp: String(timestamp), sign: feishuSign(timestamp, feishu.secret) } : {}), msg_type: 'text', content: { text } };
-    const response = await fetchImpl(feishu.webhook, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(SEND_TIMEOUT_MS) });
-    let answer: { code?: unknown; StatusCode?: unknown; msg?: unknown } = {};
-    try { answer = await response.json() as typeof answer; } catch { /* judged by status below */ }
-    const code = answer.code ?? answer.StatusCode;
-    if (!response.ok || (code !== undefined && code !== 0)) throw new Error(`飞书返回 HTTP ${response.status}${code !== undefined ? ` code ${String(code).slice(0, 12)}` : ''}${typeof answer.msg === 'string' ? ` ${answer.msg.slice(0, 80)}` : ''}`);
+    await sendFeishu(feishu, { msg_type: 'text', content: { text } }, { fetchImpl, now });
   }
 
   let sending = false;

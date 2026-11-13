@@ -29,9 +29,16 @@ export interface ServiceConfig {
   pairs: ServicePair[];
   /** The oil module's Binance/Bybit execution accounts and caps; absent means the service runs as before (oil-config.ts). */
   oil?: OilConfig;
+  /** The scheduled ASTER summary card (summary.ts); absent: every 60 minutes. 0 turns it off. */
+  summary?: { intervalMinutes: number };
 }
 export interface FeishuSecret { webhook: string; secret: string | null }
-export interface ServiceSecrets { accounts: Map<string, AsterCredentials>; feishu: FeishuSecret | null; /** Keys of the oil accounts' venues; only with oil configured. */ exchanges?: Map<Venue, LiveCredentials> }
+export interface ServiceSecrets {
+  accounts: Map<string, AsterCredentials>; feishu: FeishuSecret | null;
+  /** The robot for the scheduled summary (the workbench's 定时 channel); without one the summary goes to `feishu`. */
+  feishuScheduled?: FeishuSecret | null;
+  /** Keys of the oil accounts' venues; only with oil configured. */ exchanges?: Map<Venue, LiveCredentials>;
+}
 
 const perMinute = (ms: number): number => Math.ceil(60_000 / ms);
 /** The part of a pair's idle weight that does not depend on its check interval: both position displays, both ADL history scans. */
@@ -118,7 +125,7 @@ const fail = (name: string, error: unknown): Error => new Error(`${name}无效�
 export function parseServiceConfig(raw: unknown): ServiceConfig {
   // pairs may be left out only when oil is there: one of the two modules must be configured.
   const hasOil = raw !== null && typeof raw === 'object' && Object.hasOwn(raw, 'oil');
-  const value = exactKeys(raw, hasOil ? ['secretsFile'] : ['secretsFile', 'pairs'], ['port', 'host', 'budget', ...(hasOil ? ['pairs', 'oil'] : [])]);
+  const value = exactKeys(raw, hasOil ? ['secretsFile'] : ['secretsFile', 'pairs'], ['port', 'host', 'budget', 'summary', ...(hasOil ? ['pairs', 'oil'] : [])]);
   const oil = hasOil ? parseOilConfig(value.oil) : undefined;
   const pairsInput: unknown = oil && value.pairs === undefined ? [] : value.pairs;
   if (typeof value.secretsFile !== 'string' || !isAbsolute(value.secretsFile)) throw new Error('secretsFile 必须是绝对路径');
@@ -151,11 +158,12 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   if (limitPerMinute > IP_CEILING) throw new Error(`${pairs.length} 个配对每分钟约需请求权重 ${needed}，加两成余量为 ${limitPerMinute}，超过本服务可用的 ${IP_CEILING}；请减少配对或调大 checkIntervalMs`);
   const adlReserve = budgetRaw.adlReserve === undefined ? Math.floor(limitPerMinute / 6) : integer(budgetRaw.adlReserve, 0, limitPerMinute - 50, 'ADL 预留权重');
   if (limitPerMinute - adlReserve < needed) throw new Error(`${pairs.length} 个配对每分钟约需请求权重 ${needed}，而每分钟上限 ${limitPerMinute} 减去 ADL 预留 ${adlReserve} 只剩 ${limitPerMinute - adlReserve}；请调大 budget.limitPerMinute 或去掉 budget 使用自动值`);
-  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs, ...(oil ? { oil } : {}) };
+  const summary = value.summary === undefined ? undefined : { intervalMinutes: integer(exactKeys(value.summary, ['intervalMinutes'], []).intervalMinutes, 0, 1_440, '定时摘要间隔（分钟，0 为关闭）') };
+  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs, ...(oil ? { oil } : {}), ...(summary ? { summary } : {}) };
 }
 
 export function parseServiceSecrets(raw: unknown, needed: readonly string[], oilVenues: readonly Venue[] = []): ServiceSecrets {
-  const value = exactKeys(raw, ['accounts'], ['feishu', ...(oilVenues.length ? ['binance', 'bybit'] : [])]);
+  const value = exactKeys(raw, ['accounts'], ['feishu', 'feishuScheduled', ...(oilVenues.length ? ['binance', 'bybit'] : [])]);
   if (value.accounts === null || typeof value.accounts !== 'object' || Array.isArray(value.accounts)) throw new Error('accounts 须为 { 账户名: { user, signer, privateKey } }');
   const accounts = new Map<string, AsterCredentials>();
   for (const [name, item] of Object.entries(value.accounts as Record<string, unknown>)) {
@@ -165,14 +173,17 @@ export function parseServiceSecrets(raw: unknown, needed: readonly string[], oil
   for (const name of needed) if (!accounts.has(name)) throw new Error(`缺少账户 ${name} 的密钥`);
   const users = [...accounts.values()].map(item => item.user);
   if (new Set(users).size !== users.length) throw new Error('两个账户名指向同一个钱包地址');
-  let feishu: FeishuSecret | null = null;
-  if (value.feishu !== undefined && value.feishu !== null) {
-    const hook = exactKeys(value.feishu, ['webhook'], ['secret']);
-    if (typeof hook.webhook !== 'string' || !FEISHU_HOOK.test(hook.webhook)) throw new Error('feishu.webhook 须为飞书或 Lark 自定义机器人的 https 地址');
-    if (hook.secret !== undefined && hook.secret !== null && (typeof hook.secret !== 'string' || !/^[\x21-\x7e]{1,128}$/.test(hook.secret))) throw new Error('feishu.secret 格式无效');
-    feishu = { webhook: hook.webhook, secret: typeof hook.secret === 'string' ? hook.secret : null };
-  }
-  return { accounts, feishu, ...(oilVenues.length ? { exchanges: parseOilSecrets(value, oilVenues) } : {}) };
+  const feishu = parseFeishu(value.feishu, 'feishu');
+  const feishuScheduled = parseFeishu(value.feishuScheduled, 'feishuScheduled');
+  return { accounts, feishu, ...(feishuScheduled ? { feishuScheduled } : {}), ...(oilVenues.length ? { exchanges: parseOilSecrets(value, oilVenues) } : {}) };
+}
+
+function parseFeishu(raw: unknown, name: string): FeishuSecret | null {
+  if (raw === undefined || raw === null) return null;
+  const hook = exactKeys(raw, ['webhook'], ['secret']);
+  if (typeof hook.webhook !== 'string' || !FEISHU_HOOK.test(hook.webhook)) throw new Error(`${name}.webhook 须为飞书或 Lark 自定义机器人的 https 地址`);
+  if (hook.secret !== undefined && hook.secret !== null && (typeof hook.secret !== 'string' || !/^[\x21-\x7e]{1,128}$/.test(hook.secret))) throw new Error(`${name}.secret 格式无效`);
+  return { webhook: hook.webhook, secret: typeof hook.secret === 'string' ? hook.secret : null };
 }
 
 export function loadServiceConfig(path: string): ServiceConfig {

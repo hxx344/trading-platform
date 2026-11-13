@@ -42,7 +42,7 @@ function workbench() {
   // The server environment holds the main account and the legacy robot; the module's own file holds the sub-accounts
   // and the split robot, and wins as it does in the workbench.
   writeFileSync(join(root, 'workbench.env'), `DATA_DIR=${data}\n${env('ASTER_MAIN', MAIN)}FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/legacy999\n`);
-  writeFileSync(join(module, '.env'), `${env('ASTER_L1', LONG)}${env('ASTER_S1', SHORT)}${env('ASTER_L2', LONG)}FEISHU_EVENT_WEBHOOK_URL=${HOOK}\nFEISHU_EVENT_SIGN_SECRET=sig\n`);
+  writeFileSync(join(module, '.env'), `${env('ASTER_L1', LONG)}${env('ASTER_S1', SHORT)}${env('ASTER_L2', LONG)}FEISHU_EVENT_WEBHOOK_URL=${HOOK}\nFEISHU_EVENT_SIGN_SECRET=sig\nFEISHU_SCHEDULED_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/timed1234\n`);
   return { root, data, envFile: join(root, 'workbench.env') };
 }
 
@@ -59,6 +59,7 @@ test('导入工作台：逐项沿用保证金与 ADL 设置，跳过未开启、
     assert.equal(parseServiceConfig(plan.config).pairs[0]!.adl!.batchNotional, '500');
     assert.deepEqual(Object.keys(plan.secrets.accounts as object).sort(), ['ASTER_L1', 'ASTER_MAIN', 'ASTER_S1']);
     assert.deepEqual(plan.secrets.feishu, { webhook: HOOK, secret: 'sig' });
+    assert.deepEqual(plan.secrets.feishuScheduled, { webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/timed1234' }, '定时摘要沿用工作台的定时机器人');
     assert.ok(plan.skipped.some(line => /^idle.*未开启保证金平衡/.test(line)));
     assert.ok(plan.skipped.some(line => /^paper.*不是实盘模式/.test(line)));
 
@@ -210,9 +211,10 @@ test('导入工作台：只有旧式飞书变量时用它，模块 .env 覆盖�
   try {
     // The module file drops the split robot and overrides the main account with a wallet that is not a sub-account.
     const module = join(wb.data, 'modules', 'aster', '.env');
-    writeFileSync(module, readFileSync(module, 'utf8').replace(/FEISHU_EVENT_[^\n]*\n/g, '') + env('ASTER_MAIN', S2));
+    writeFileSync(module, readFileSync(module, 'utf8').replace(/FEISHU_(EVENT|SCHEDULED)_[^\n]*\n/g, '') + env('ASTER_MAIN', S2));
     const plan = planImport(readWorkbench(wb.envFile, undefined), null, { secretsFile: '/x/secrets.json' });
     assert.deepEqual(plan.secrets.feishu, { webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/legacy999' });
+    assert.equal(plan.secrets.feishuScheduled, undefined, '单机器人模式下定时摘要与告警同一机器人');
     assert.equal((plan.secrets.accounts as Record<string, { user: string }>).ASTER_MAIN!.user, S2.user);
   } finally { rmSync(wb.root, { recursive: true, force: true }); }
 });

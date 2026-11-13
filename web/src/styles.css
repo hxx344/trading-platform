@@ -166,6 +166,9 @@ details>summary{cursor:pointer}
 .swatch.short{background:var(--warning)}
 .chart-tip{display:flex;flex-direction:column;gap:2px;font-size:.75rem;white-space:nowrap}
 .outbox-text{white-space:pre-wrap;max-width:560px}
+/* Log tab: long lines wrap inside the cell; on phones the table keeps the page width instead of scrolling sideways. */
+table.data.log-table td.log-text{white-space:pre-wrap;word-break:break-word;font-family:var(--font-mono)}
+@media (max-width:720px){table.data.log-table{min-width:0}table.data.log-table td.num{white-space:normal}}
 /* The chart copied from the workbench names its colours after the workbench's tokens. */
 .svg-plot{height:100%;width:100%;position:relative;--muted-foreground:var(--text-tertiary);--card:var(--surface-2)}
 .svg-plot-surface{display:block;overflow:visible;touch-action:pan-y;outline:none}

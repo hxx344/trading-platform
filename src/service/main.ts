@@ -27,8 +27,11 @@ import { balanceWindow, createBalanceSamples, type BalanceSamples } from './bala
 import { readImportResult, submitImportRequest } from './import-channel.ts';
 import { oilLoops, oilViews, prepareOil, registerOilAccounts, strandedOilJobs, type OilRuntime } from './oil.ts';
 import { oilSummary } from './oil-config.ts';
+import { createServiceLog, teeStream, type ServiceLog } from './service-log.ts';
+import { createSummary, type Summary, type SummaryInput } from './summary.ts';
 
 const NOTIFY_MS = 2_000;
+const SUMMARY_TICK_MS = 5_000;
 /** How often the stored balances are looked at for the trend chart; a pair gets at most one sample a minute. */
 const SAMPLE_MS = 30_000;
 const FINAL_FLUSH_MS = 5_000;
@@ -174,9 +177,24 @@ export interface StartOptions {
 }
 
 /** Opens the data directory, wires the executor and runs it with the alerts and the user streams until shutdown. */
-export async function startService({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password, app, oilFetch }: StartOptions): Promise<ReturnType<typeof runExecutor>> {
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  claimDataDirEnvironment(dir, 'mainnet');
+export async function startService(options: StartOptions): Promise<ReturnType<typeof runExecutor>> {
+  mkdirSync(options.dir, { recursive: true, mode: 0o700 });
+  claimDataDirEnvironment(options.dir, 'mainnet');
+  // From here on, what the service writes to stdout and stderr (both go to the journal) also lands in the page's log tab.
+  // A file that cannot be opened only costs the tab: the journal still has every line.
+  let logs: ServiceLog | null = null, untee: () => void = () => undefined;
+  try {
+    const opened = logs = createServiceLog({ file: join(options.dir, 'logs.sqlite') });
+    const undo = [teeStream(process.stdout, opened), teeStream(process.stderr, opened)];
+    untee = () => { for (const step of undo) step(); };
+  }
+  catch (error) { process.stderr.write(`页面日志库无法打开，日志页不可用：${error instanceof Error ? error.message.slice(0, 200) : String(error)}\n`); }
+  const closeLogs = () => { untee(); try { logs?.close(); } catch { /* best effort */ } };
+  try { return await startWired(options, logs, closeLogs); }
+  catch (error) { closeLogs(); throw error; }
+}
+
+async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password, app, oilFetch }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
   const session = keptSession(dir);
   // Oil accounts are locked and checked before the store opens: a failed check refuses start (oil.ts).
   const oil = config.oil ? await prepareOil(config.oil, secrets.exchanges, oilFetch ? { fetchImpl: oilFetch } : {}) : undefined;
@@ -204,29 +222,51 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
       ...(oil ? { job: (id: string) => executor.jobView(id) } : {}),
     });
   } catch (error) { executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
+  const streams = createStreamStatus(streamed);
+  // The scheduled summary card: the workbench's 定时 robot when imported, else the alert robot.
+  const names = new Map(config.pairs.map(pair => [pair.id, { long: pair.long, short: pair.short }]));
+  const intervalMinutes = config.summary?.intervalMinutes ?? 60;
+  const collect = (): SummaryInput => {
+    const positions = new Map(executor.asterPositions().pairs.map(pair => [pair.pairId, pair]));
+    const adl = new Map(executor.adlPairs().map(pair => [pair.pairId, pair]));
+    const budget = client.requestBudget.state();
+    return {
+      intervalMinutes, streams: streams.view(), budget: { usedLastMinute: budget.usedLastMinute, limitPerMinute: budget.limitPerMinute, coolingUntil: budget.coolingUntil, reason: budget.reason },
+      pairs: executor.transferPairs().map(pair => ({
+        id: pair.id, enabled: pair.enabled, blocked: pair.blocked, note: pair.note, noteIdle: pair.noteIdle, cooldownUntil: pair.cooldownUntil, checkIntervalMs: pair.config.checkIntervalMs,
+        names: names.get(pair.id) ?? { long: pair.long, short: pair.short }, balances: pair.balances, balancesFresh: pair.balancesFresh, current: pair.current,
+        positions: positions.get(pair.id) ?? null, adl: adl.get(pair.id) ?? null,
+      })),
+    };
+  };
+  let summary: Summary;
+  try {
+    const robot = secrets.feishuScheduled ? { secret: secrets.feishuScheduled, kind: 'scheduled' as const } : secrets.feishu ? { secret: secrets.feishu, kind: 'event' as const } : null;
+    summary = createSummary({ file: join(dir, 'notify.sqlite'), intervalMinutes, robot, collect, ...(notifyFetch ? { fetchImpl: notifyFetch } : {}) });
+  } catch (error) { notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
   // Only the trend chart depends on it: a file that cannot be opened is reported on the status page, the service runs on.
   let samples: BalanceSamples | null = null, samplesError: string | null = null;
   try { samples = createBalanceSamples({ file: join(dir, 'samples.sqlite') }); }
   catch (error) { samplesError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`余额采样库无法打开，走势图不可用：${samplesError}\n`); }
-  const streams = createStreamStatus(streamed);
   const enabled = executor.transferPairs().filter(pair => pair.enabled).length;
   const oilText = oil ? `；原油执行账户 ${oil.config.accounts.length} 个` : '';
   try {
     notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}`);
     for (const text of warnings) notifier.notify(`【配置未生效】${text}`);
-  } catch (error) { samples?.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
+  } catch (error) { samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
 
   return runExecutor({
     executor, store, dir, port, app, session,
     ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: oil ? ['jobs', 'transfers', 'adl'] : ['transfers', 'adl'], drainMs: DRAIN_MS,
     views: {
-      status: () => ({ budget: client.requestBudget.state(), idleWeight: idleWeight(config, executor.transferPairSettings()), streams: streams.view(), feishu: notifier.status(), samples: { available: samples !== null, error: samplesError } }),
+      status: () => ({ budget: client.requestBudget.state(), idleWeight: idleWeight(config, executor.transferPairSettings()), streams: streams.view(), feishu: notifier.status(), summary: summary.status(), samples: { available: samples !== null, error: samplesError } }),
       balanceHistory: (pairId, range) => {
         if (samples) return samples.history(pairId, range);
         const window = balanceWindow(range, Date.now());
         return window && { pairId, range, ...window, points: [], unavailable: `余额采样库无法打开，走势图不可用：${samplesError ?? '未知原因'}（不影响划转与 ADL）` };
       },
       ...(oil ? { oil: oilViews(oil, executor) } : {}),
+      ...(logs ? { logs: (filter: 'all' | 'problems', before: number | null, limit: number) => logs.page({ filter, before, limit }) } : {}),
     },
     ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir) } } : {}),
     startedMessage: `ASTER 服务已启动（${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}）`,
@@ -236,6 +276,13 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
           try { notifier.poll(); await notifier.flush(); }
           catch (error) { process.stderr.write(`告警处理失败：${error instanceof Error ? error.message : String(error)}\n`); }
           await context.pause(NOTIFY_MS);
+        }
+      })(),
+      (async () => {
+        while (!context.stopped()) {
+          try { await summary.tick(); }
+          catch (error) { process.stderr.write(`定时运行摘要出错：${error instanceof Error ? error.message : String(error)}\n`); }
+          await context.pause(SUMMARY_TICK_MS);
         }
       })(),
       (async () => {
@@ -260,9 +307,11 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
       try { notifier.poll(); } catch { /* best effort */ }
       await Promise.race([notifier.flush(), new Promise(resolve => setTimeout(resolve, FINAL_FLUSH_MS).unref())]);
       notifier.close();
+      summary.close();
       samples?.close();
       locks.release();
       releaseOil();
+      closeLogs();
     },
   });
 }

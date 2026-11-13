@@ -97,10 +97,15 @@ function credentialsFor(env: WorkbenchSource['env'], prefix: string): AsterCrede
   try { return parseAsterCredentials({ user, signer, privateKey }, prefix); } catch (error) { return error instanceof Error ? error.message : `${prefix} 凭据无效`; }
 }
 
-/** The robot the workbench's ASTER module sends events with: the split event channel when configured, else the legacy one. */
-function feishuOf(env: WorkbenchSource['env']): Json | null {
-  const split = ['EVENT', 'SCHEDULED'].some(channel => env[`FEISHU_${channel}_WEBHOOK_URL`] !== undefined || env[`FEISHU_${channel}_SIGN_SECRET`] !== undefined);
-  const [hook, sign] = split ? ['FEISHU_EVENT_WEBHOOK_URL', 'FEISHU_EVENT_SIGN_SECRET'] : ['FEISHU_WEBHOOK_URL', 'FEISHU_SIGN_SECRET'];
+/**
+ * The robot the workbench's ASTER module sends with: events go to the split event channel when configured, else the
+ * legacy one; the scheduled summary has its own robot only in split mode (in legacy mode it shares the one robot, which
+ * is what this service does without `feishuScheduled`).
+ */
+function feishuOf(env: WorkbenchSource['env'], channel: 'EVENT' | 'SCHEDULED' = 'EVENT'): Json | null {
+  const split = ['EVENT', 'SCHEDULED'].some(name => env[`FEISHU_${name}_WEBHOOK_URL`] !== undefined || env[`FEISHU_${name}_SIGN_SECRET`] !== undefined);
+  if (!split && channel === 'SCHEDULED') return null;
+  const [hook, sign] = split ? [`FEISHU_${channel}_WEBHOOK_URL`, `FEISHU_${channel}_SIGN_SECRET`] : ['FEISHU_WEBHOOK_URL', 'FEISHU_SIGN_SECRET'];
   const webhook = env[hook]?.trim(), secret = env[sign]?.trim();
   return webhook ? { webhook, ...(secret ? { secret } : {}) } : null;
 }
@@ -221,6 +226,13 @@ export function planImport(source: WorkbenchSource, existing: { config: Json; se
       try { parseServiceSecrets({ accounts: {}, feishu }, []); secrets.feishu = feishu; notes.push('飞书机器人沿用工作台 ASTER 事件通知的机器人'); }
       catch { notes.push('工作台的飞书机器人地址不是自定义机器人的 https 地址，未导入；需要告警时请在密钥文件里自行填写 feishu'); }
     } else notes.push('工作台没有配置飞书机器人，告警只写日志');
+  }
+  if (added.length > 0 && (secrets.feishuScheduled === undefined || secrets.feishuScheduled === null)) {
+    const scheduled = feishuOf(source.env, 'SCHEDULED');
+    if (scheduled) {
+      try { parseServiceSecrets({ accounts: {}, feishuScheduled: scheduled }, []); secrets.feishuScheduled = scheduled; notes.push('定时运行摘要沿用工作台 ASTER 定时通知的机器人'); }
+      catch { notes.push('工作台的定时通知机器人地址不是自定义机器人的 https 地址，未导入；定时摘要改发告警机器人'); }
+    }
   }
 
   const oil = options.oil ? planOil(options.oil, config, secrets, fits, notes) : [];

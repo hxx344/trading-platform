@@ -1,6 +1,7 @@
 import { Layers3, RefreshCw } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { OIL_READ_TIMEOUT_MS, OIL_STATE_PATH, OilPage } from './OilPage.tsx';
+import { LogsPage } from './LogsPage.tsx';
 import { PairsWorkspace } from './PairsWorkspace.tsx';
 import { useRoute, type Route } from './route.ts';
 import { SettingsPage } from './SettingsPage.tsx';
@@ -26,7 +27,7 @@ function limitsText(state: ServiceState): string | null {
 
 type Tab = { pages: Route['page'][]; href: string; text: string };
 const TABS: Tab[] = [
-  { pages: ['overview', 'pair'], href: '#/', text: '配对组' }, { pages: ['status'], href: '#/status', text: '运行状态' }, { pages: ['settings'], href: '#/settings', text: '设置' },
+  { pages: ['overview', 'pair'], href: '#/', text: '配对组' }, { pages: ['status'], href: '#/status', text: '运行状态' }, { pages: ['logs'], href: '#/logs', text: '日志' }, { pages: ['settings'], href: '#/settings', text: '设置' },
 ];
 /** Shown only where /api/oil/state answers: a service without oil returns 404 there. */
 const OIL_TAB: Tab = { pages: ['oil'], href: '#/oil', text: '原油' };
@@ -91,7 +92,7 @@ export function App() {
               })}
             </nav>
             {aster ? <div className="aster-module">
-              {route.page === 'status' ? <StatusPage onExpired={onExpired} /> : route.page === 'settings'
+              {route.page === 'status' ? <StatusPage onExpired={onExpired} /> : route.page === 'logs' ? <LogsPage onExpired={onExpired} /> : route.page === 'settings'
                 // The import does not need the state: it stays usable when the state cannot be read (the way to add the first pair).
                 ? <SettingsPage onChanged={changed} onExpired={onExpired} />
                 : !state ? (failed

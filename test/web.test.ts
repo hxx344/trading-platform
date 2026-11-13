@@ -178,6 +178,7 @@ test('页面地址：#/pair/<配对>、#/status 与 #/settings 分别打开详�
   assert.deepEqual(parseRoute(''), { page: 'overview' });
   assert.deepEqual(parseRoute('#/'), { page: 'overview' });
   assert.deepEqual(parseRoute('#/status'), { page: 'status' });
+  assert.deepEqual(parseRoute('#/logs'), { page: 'logs' });
   assert.deepEqual(parseRoute('#/settings'), { page: 'settings' });
   assert.deepEqual(parseRoute('#/settings/x'), { page: 'overview' });
   assert.deepEqual(parseRoute('#/oil'), { page: 'oil' });

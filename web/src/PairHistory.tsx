@@ -51,7 +51,7 @@ function TransferDetail({ item }: { item: TransferView }) {
   </details>;
 }
 
-function More({ more, loading, error, onMore }: { more: boolean; loading: boolean; error: string | null; onMore: () => void }) {
+export function More({ more, loading, error, onMore }: { more: boolean; loading: boolean; error: string | null; onMore: () => void }) {
   if (!more && !error) return null;
   return <div className="form-actions">
     {more ? <button type="button" className="button secondary" data-slot="button" disabled={loading} onClick={onMore}>{loading ? '读取中…' : '加载更早的记录'}</button> : null}

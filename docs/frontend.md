@@ -147,3 +147,24 @@
 **样式**：只在 `styles.css` 加两条 `table.data.log-table` 规则：内容列换行显示（等宽字体），手机宽度表格不设最小宽度，避免日志表横向滚动。
 
 **回滚**：`sudo bash install.sh --version v0.9.0`（先按 README 删掉 `config.json` 的 `summary` 与 `secrets.json` 的 `feishuScheduled`；页面导入配对时会自动写入 `feishuScheduled`，自己没写过也要检查）。
+
+## 资产页（Asset A-1）
+
+**对照的工作台页面**：`modules/asset/app`（提交 `0014655`）的 `dashboard.tsx`（页头、标签、六格汇总、资产明细表与交易所分项、分交易所合计、历史记录与出金记录）、`asset-trend.tsx`（资产变化走势、年化与上月指标、每月表现）、`daily-changes.tsx`（每日波动）、`withdrawals-panel.tsx`、`cash-flows-panel.tsx`。方案与接口见 [asset.md](asset.md)。
+
+**页面**
+
+- 标签“资产”（`#/asset`），只在 `/api/asset/state` 有应答（服务配置了 `asset`）时显示。页面放在 `.aster-module` 之外，外层是 `.asset-desk`；三个子页“资产总览 / 历史记录 / 出金记录”照工作台的标签排。
+- 只读：工作台的同步、添加资产、改汇率、记出金、登记资金流、连接交易所等入口都不显示；顶部固定提示数据停留在导入时刻。没导入时显示空状态与导入命令。
+- 与工作台不同：历史记录的“查看明细”在表格上方原位展开面板（工作台是弹窗，本页没有复制弹窗组件）；每日波动展开时才读取 `/api/asset/daily-changes`；资金流面板只有记录列表、审计历史和作废记录，没有登记表单。
+- 文案与格式化（金额、过期标签、汇率状态、历史来源、交易所分项说明、每日波动排序、资金流行）照工作台写在不依赖 DOM 的 `web/src/asset-format.ts`，由 `test/asset-format.test.ts` 覆盖；合计与指标由服务端用复制来的工作台函数算好（`src/asset/views.ts`），页面不重算。
+- 读取用 `use-live-resource.ts`：状态、账本与历史每 60 秒重读（总览的走势也用历史），出金记录只在出金子页读取；资金流随总览读一次、每日波动展开时读一次，都不定时重读（导入后数据只在重新导入时变）。走势图用 `svg-plot.tsx`。
+
+**样式**
+
+- `web/src/asset.css` 复制自工作台 `modules/asset/app/globals.css`（提交 `0014655`），只取上述页面用到的规则，规则内容不改；每条选择器前加 `.asset-desk ` 限定范围；`:root` 调色板与字体移到 `.asset-desk`（工作台的 `--card`、`--primary`、`--border` 等与 `styles.css`、`aster.css` 同名，在资产页内按工作台取值）；工作台内嵌模式（`.hub-embedded`）下的页头与页面留白规则直接作为本页规则。`main.tsx` 里排在 `aster.css` 之后。
+- 工作台这些页面的表格与标签来自 shadcn（`components/ui/table.tsx`、`tabs.tsx`）。本服务不引入 Tailwind，按其类名换算成普通 CSS 写在 `asset.css` 末尾并注明；本页另需的少量规则（原位明细面板、导入命令、资金流列表、走势浮层边框）写在最后一节。与 `aster.css` 一样放在模块自己的 CSS 文件末尾，而不是 `styles.css`，因为它们都限定在 `.asset-desk` 内。
+
+**验证**：`node scripts/asset-demo.ts` 的假数据上，无头浏览器 1440 与 390 宽度走过总览（明细展开、每日波动展开）、历史记录（查看明细）、出金记录；无页面错误，390 宽度三页都没有横向溢出。未与工作台同页面并排截图对比（本机没有运行中的工作台资产页）。
+
+**回滚**：`sudo bash install.sh --version v0.10.0`，回退前先删掉 `config.json` 里的 `asset`。

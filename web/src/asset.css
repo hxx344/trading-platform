@@ -1,0 +1,327 @@
+/* 复制自 project-aggregation 工作台 modules/asset/app/globals.css（提交 0014655），只保留资产页用到的规则，规则内容不改。
+   改动：每条选择器前加 ".asset-desk " 限定范围；:root 调色板与字体移到 .asset-desk（与 styles.css、aster.css 同名的
+   --card、--primary、--border、--warning 等在资产页内按工作台取值）；body 的字体与字号放到 .asset-desk 本身；工作台
+   在 hub 内嵌（.hub-embedded）时的 .ledger-head、.page 规则直接作为资产页的规则，并去掉左右留白（外层 .workspace 已留）；
+   本文件在 main.tsx 里排在 aster.css 之后，同优先级的 ".aster-desk .panel" 等由这里覆盖。
+   末尾两节分别是 shadcn 表格、标签组件（components/ui/table.tsx、tabs.tsx）的 Tailwind 类名换算成的普通 CSS，以及
+   本服务只读版本自己加的少量规则（弹窗改为原位展开的面板、导入命令、资金流列表）。 */
+
+/* :root 调色板 */
+.asset-desk {
+  color-scheme: dark;
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  /* CJK fallbacks keep Chinese text inside numeric cells off the system monospace font. */
+  --font-number: "Cascadia Mono", "JetBrains Mono", "SF Mono", Consolas, "Microsoft YaHei UI", "Microsoft YaHei", monospace;
+  --background: #0a0d11;
+  --foreground: #e6eaf0;
+  --card: #10141a;
+  --card-foreground: var(--foreground);
+  --primary: #38bdf8;
+  --primary-hover: #0ea5e9;
+  --primary-foreground: #0a0d11;
+  --primary-border: rgba(56, 189, 248, 0.35);
+  --secondary: #161b22;
+  --secondary-foreground: var(--foreground);
+  --muted: var(--secondary);
+  --muted-foreground: #a3adb9;
+  --subtle-foreground: #7a8591;
+  --accent: rgba(56, 189, 248, 0.12);
+  --accent-foreground: var(--primary);
+  --destructive: #f2626b;
+  --positive: #2dbe87;
+  --positive-surface: rgba(45, 190, 135, 0.13);
+  --positive-border: rgba(45, 190, 135, 0.3);
+  --warning: #f0b03f;
+  --warning-surface: rgba(240, 176, 63, 0.13);
+  --warning-border: rgba(240, 176, 63, 0.3);
+  --info: #6ea8fe;
+  --purple: #c4a2f5;
+  --purple-surface: rgba(196, 162, 245, 0.13);
+  --border: #212831;
+  --input: #2e3640;
+  --ring: var(--primary);
+  --chart-1: var(--primary);
+  --chart-2: #a3adb9;
+  --chart-3: var(--info);
+  --chart-4: var(--warning);
+  --chart-5: var(--destructive);
+  --shadow-color: #00000066;
+  --radius: 0.5rem;
+}
+
+/* body 与基础元素 */
+.asset-desk { min-width: 0; color: var(--foreground); font-family: var(--font-ui); font-size: 13px; line-height: 1.5; font-variant-numeric: tabular-nums }
+.asset-desk button:disabled { cursor: wait; opacity: .6 }
+.asset-desk button:focus-visible, .asset-desk a:focus-visible, .asset-desk summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px }
+.asset-desk h2 { font-size: .9375rem; font-weight: 650 }
+.asset-desk .button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--card); color: var(--foreground); padding: 8px 14px; font-size: .8125rem; font-weight: 550; min-height: 36px }
+.asset-desk .button:hover { filter: brightness(.96) }
+.asset-desk .button:disabled { cursor: not-allowed }
+.asset-desk .status { font-size: .75rem; background: var(--secondary); color: var(--muted-foreground); border-radius: 4px; padding: 3px 6px; display: inline-block; white-space: nowrap }
+.asset-desk .status.amber { color: var(--warning); background: var(--warning-surface) }
+.asset-desk .status.live { color: var(--positive); background: var(--positive-surface) }
+.asset-desk .panel { background: var(--card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; min-width: 0 }
+.asset-desk .chart { height: 235px; margin: 8px 12px 0 0 }
+.asset-desk .chart-note { font-size: .75rem; color: var(--muted-foreground); padding: 5px 16px 14px }
+.asset-desk .connection-row { display: flex; align-items: center; gap: 12px; margin: 0 16px; padding: 9px 0; border-bottom: 1px solid var(--border); width: calc(100% - 32px); text-align: left }
+.asset-desk .exchange-mark { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 6px; background: var(--secondary); color: var(--chart-3); font-weight: 700 }
+.asset-desk .connection-row > div:nth-child(2) { flex: 1 }
+.asset-desk .connection-row strong { font-size: .875rem; font-weight: 600 }
+.asset-desk .connection-row small { font-size: .75rem; color: var(--muted-foreground); display: block; margin-top: 3px }
+.asset-desk .holdings-heading { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; gap: 12px }
+.asset-desk .holdings-heading h2 span { font-size: .75rem; font-weight: 500; color: var(--muted-foreground); margin-left: 8px }
+.asset-desk .holdings [data-slot=table-head] { background: var(--secondary); color: var(--muted-foreground); font-size: .75rem; font-weight: 500; height: 34px; padding: 7px 16px }
+.asset-desk .holdings [data-slot=table-cell] { padding: 8px 16px; font-size: .8125rem }
+.asset-desk .holdings [data-slot=table-row] { border-color: var(--border) }
+.asset-desk .numeric { text-align: right !important; font-variant-numeric: tabular-nums }
+.asset-desk [data-slot=table-cell].numeric { font-family: var(--font-number) }
+.asset-desk .asset-name { font-weight: 600 }
+.asset-desk .asset-value { font-weight: 600 }
+.asset-desk .ticker { font-size: .6875rem; color: var(--muted-foreground); display: block; margin-top: 3px }
+.asset-desk .kind { font-size: .75rem; color: var(--muted-foreground) }
+.asset-desk .icon-button { width: 34px; height: 34px; display: inline-grid; place-items: center; border: 1px solid var(--border); border-radius: 6px; color: var(--muted-foreground); background: var(--card) }
+.asset-desk .icon-button:hover { background: var(--accent); color: var(--primary) }
+.asset-desk .page-footer { text-align: center; font-size: .75rem; color: var(--muted-foreground); padding: 16px 0 }
+.asset-desk .help { font-size: .8125rem; color: var(--muted-foreground); line-height: 1.8 }
+.asset-desk .notice { padding: 10px 14px; border: 1px solid var(--warning-border); border-radius: 6px; background: var(--warning-surface); color: var(--warning); font-size: .8125rem; line-height: 1.65; margin-bottom: 14px }
+.asset-desk .error-text { color: var(--destructive); font-size: .8125rem }
+.asset-desk .good-text { color: var(--positive) }
+.asset-desk .empty-state { padding: 50px; text-align: center; color: var(--muted-foreground) }
+@media (max-width: 900px) { .asset-desk .holdings-heading { align-items: flex-start; flex-direction: column } }
+@media (max-width: 480px) { .asset-desk .chart-note { padding: 6px 16px 18px } .asset-desk .holdings-heading { padding: 18px 16px } .asset-desk .chart { height: 220px } }
+.asset-desk .text-button { display: inline-flex; gap: 5px; align-items: center; color: var(--primary); font-size: .8125rem; margin-left: 8px; border: 0; background: none; min-height: 26px }
+.asset-desk .chart-note .text-button { font-size: .75rem }
+.asset-desk .import-notice { display: flex; justify-content: space-between; align-items: center; gap: 16px }
+@media (max-width: 600px) { .asset-desk .import-notice { align-items: flex-start; flex-direction: column } }
+.asset-desk .trend-summary { padding: 12px 16px 4px; display: flex; justify-content: space-between; align-items: flex-end; gap: 12px }
+.asset-desk .trend-summary span, .asset-desk .trend-summary p { color: var(--muted-foreground); font-size: .75rem }
+.asset-desk .trend-summary strong { display: block; font-size: 1.25rem; font-weight: 600; font-family: var(--font-number); font-variant-numeric: tabular-nums; margin-top: 4px }
+.asset-desk .trend-key { display: flex; flex-wrap: wrap; gap: 10px 20px; padding: 10px 16px 0; font-size: .75rem; color: var(--muted-foreground) }
+.asset-desk .trend-key span { display: flex; align-items: center; gap: 7px }
+.asset-desk .trend-key i { width: 23px; border-top: 3px solid var(--primary) }
+.asset-desk .trend-key .held-line { border-color: var(--chart-2); border-top-style: dashed }
+.asset-desk .trend-tooltip { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; font-size: .8125rem; line-height: 1.85; box-shadow: 0 4px 16px var(--shadow-color) }
+.asset-desk .trend-tooltip p { color: var(--warning) }
+.asset-desk .withdrawal-note { max-width: 400px; white-space: normal; overflow-wrap: anywhere }
+.asset-desk .trend-panel .chart-note { line-height: 1.8 }
+@media (max-width: 600px) { .asset-desk .trend-summary { padding: 14px 16px 4px; align-items: flex-start; flex-direction: column; gap: 5px } .asset-desk .trend-key { padding-left: 16px; padding-right: 16px } .asset-desk .withdrawal-note { min-width: 100px } }
+.asset-desk .icon-button { width: 32px; height: 32px }
+.asset-desk .text-button { min-height: 32px }
+
+/* 资产变化指标 */
+.asset-desk .trend-panel .performance-metrics { margin: 12px 16px 8px; padding: 14px; background: var(--secondary); border: 1px solid var(--border); border-radius: 8px; min-width: 0 }
+.asset-desk .performance-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-bottom: 14px }
+.asset-desk .performance-heading h3 { margin: 0; font-size: .875rem; font-weight: 600 }
+.asset-desk .performance-heading > span { font-size: .6875rem; color: var(--muted-foreground) }
+.asset-desk .performance-annualized { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px }
+.asset-desk .performance-card { min-width: 0; padding: 12px; background: var(--card); border: 1px solid var(--border); border-radius: 6px }
+.asset-desk .performance-label { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--muted-foreground); font-size: .75rem }
+.asset-desk .performance-label small { font-size: .6875rem }
+.asset-desk .performance-card strong { display: block; margin: 6px 0; font-size: 1.375rem; font-family: var(--font-number); font-weight: 600; letter-spacing: -.025em; font-variant-numeric: tabular-nums; overflow-wrap: anywhere }
+.asset-desk .performance-card p, .asset-desk .performance-note { font-size: .6875rem; line-height: 1.7; overflow-wrap: anywhere }
+.asset-desk .performance-card p, .asset-desk .performance-note { color: var(--muted-foreground) }
+.asset-desk .performance-note { margin-top: 12px }
+.asset-desk .performance-positive { color: var(--positive) }
+.asset-desk .performance-negative { color: var(--destructive) }
+.asset-desk .performance-neutral { color: var(--muted-foreground) }
+.asset-desk .performance-monthly { margin-top: 12px; border-top: 1px solid var(--border) }
+.asset-desk .performance-monthly summary { min-height: 44px; padding: 12px 0; font-size: .8125rem; font-weight: 500; cursor: pointer; list-style-position: inside }
+.asset-desk .performance-monthly summary > span { color: var(--muted-foreground); font-weight: 400 }
+.asset-desk .performance-monthly summary:hover { color: var(--primary) }
+.asset-desk .performance-monthly summary:focus-visible, .asset-desk .performance-table-scroll:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px }
+.asset-desk .performance-table-scroll { max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain }
+.asset-desk .performance-table { width: 100%; border-collapse: collapse; font-size: .75rem; font-variant-numeric: tabular-nums }
+.asset-desk .performance-table caption { text-align: left; font-size: .6875rem; color: var(--muted-foreground); padding: 0 0 12px; line-height: 1.7 }
+.asset-desk .performance-table th, .asset-desk .performance-table td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap }
+.asset-desk .performance-table thead th { font-weight: 500; color: var(--muted-foreground); font-size: .6875rem }
+.asset-desk .performance-table th:first-child { text-align: left; padding-left: 0 }
+.asset-desk .performance-table tbody th { font-weight: 500 }
+.asset-desk .performance-table tbody th small { display: block; font-size: .625rem; font-weight: 400; color: var(--muted-foreground); margin-top: 4px }
+.asset-desk .performance-table tr > *:last-child { padding-right: 0 }
+.asset-desk .performance-table tbody tr:last-child > * { border-bottom: 0 }
+.asset-desk .performance-table tbody tr:hover { background: var(--card) }
+.asset-desk .performance-month-state { display: inline-block; margin-left: 8px; color: var(--muted-foreground); font-size: .625rem; font-weight: 400 }
+@media (max-width: 600px) { .asset-desk .trend-panel .performance-metrics { margin: 14px 16px 8px; padding: 14px } .asset-desk .performance-annualized { grid-template-columns: 1fr } .asset-desk .performance-card strong { font-size: 1.25rem } .asset-desk .performance-table th, .asset-desk .performance-table td { padding: 10px 8px } }
+.asset-desk .holdings [data-slot=table-row]:hover { background: var(--secondary) }
+.asset-desk [data-slot=tabs-list] { background: var(--secondary); border-radius: 7px }
+.asset-desk [data-slot=tabs-trigger] { min-height: 36px }
+.asset-desk [data-slot=tabs-trigger][data-state=active] { background: var(--card); color: var(--primary) }
+@media (max-width: 600px) { .asset-desk .button, .asset-desk .icon-button, .asset-desk .text-button { min-height: 40px } .asset-desk .icon-button { width: 40px; height: 40px } }
+
+/* 工作台改版：标签栏、提醒条、六格 KPI、明细与走势并排 */
+.asset-desk .ledger-head { display: flex; align-items: center; gap: 16px; min-height: 41px; margin: 0; padding: 0; border-bottom: 1px solid var(--border); background: var(--background) }
+.asset-desk .ledger-tabs { display: flex; align-self: stretch; gap: 2px; min-width: 0; overflow-x: auto; scrollbar-width: none }
+.asset-desk .ledger-tabs::-webkit-scrollbar { display: none }
+.asset-desk .ledger-tabs button { display: flex; align-items: center; gap: 7px; height: 40px; padding: 0 12px; margin-bottom: -1px; flex-shrink: 0; border: 0; border-bottom: 2px solid transparent; background: none; color: var(--muted-foreground); font-size: 13px; white-space: nowrap }
+.asset-desk .ledger-tabs button:hover { color: var(--foreground) }
+.asset-desk .ledger-tabs button[aria-current=page] { color: var(--foreground); border-bottom-color: var(--primary); font-weight: 550 }
+.asset-desk .ledger-tabs button:focus-visible { outline-offset: -2px }
+.asset-desk .count-chip { display: inline-flex; align-items: center; height: 18px; padding: 0 6px; border-radius: 4px; background: #1d232b; color: var(--muted-foreground); font-size: 11px; font-weight: 500; font-family: var(--font-ui); vertical-align: 1px }
+.asset-desk .ledger-head-meta { display: flex; align-items: center; gap: 12px; margin-left: auto; flex-shrink: 0; font-size: 12px; color: var(--subtle-foreground) }
+.asset-desk .ledger-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 8px 16px; border-bottom: 1px solid var(--border); background: var(--card); font-size: 12px; line-height: 1.5; color: var(--muted-foreground) }
+.asset-desk .strip-title { display: inline-flex; align-items: center; gap: 6px; color: var(--warning); font-weight: 550; white-space: nowrap }
+.asset-desk .strip-item { padding-left: 12px; border-left: 1px solid var(--input); overflow-wrap: anywhere }
+.asset-desk .strip-item.error { color: #ff8d95 }
+.asset-desk .page { max-width: none; padding: 14px 0 8px }
+.asset-desk .notice { display: flex; align-items: flex-start; gap: 10px; padding: 9px 12px; font-size: 12px; line-height: 1.6; color: #f3cb7c }
+.asset-desk .notice.info { border-color: rgba(110, 168, 254, .28); background: rgba(110, 168, 254, .13); color: #a9c8ff }
+.asset-desk .notice > svg { flex: none; margin-top: 2px }
+.asset-desk .import-notice { align-items: center }
+.asset-desk .import-notice > div { flex: 1; min-width: 0 }
+.asset-desk .import-notice strong { color: var(--foreground); font-weight: 600 }
+.asset-desk .ledger-kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); margin-bottom: 14px; container-type: inline-size }
+.asset-desk .kpi { min-width: 0; padding: 12px 16px; border-right: 1px solid var(--border) }
+.asset-desk .kpi:last-child { border-right: 0 }
+.asset-desk .kpi.hero { background: linear-gradient(180deg, rgba(56, 189, 248, .06), transparent) }
+.asset-desk .kpi-label { display: flex; align-items: center; gap: 6px; min-height: 20px; font-size: 12px; color: var(--subtle-foreground); white-space: nowrap }
+.asset-desk .kpi-label > span { color: var(--subtle-foreground); opacity: .85 }
+.asset-desk .kpi-value { margin-top: 3px; font-family: var(--font-number); font-size: clamp(16px, 1.65cqi, 21px); font-weight: 600; letter-spacing: -.02em; line-height: 1.3; font-variant-numeric: tabular-nums; overflow-wrap: anywhere }
+.asset-desk .kpi-value .cur { margin-right: 3px; font-family: var(--font-ui); font-size: 12px; font-weight: 500; color: var(--subtle-foreground) }
+.asset-desk .kpi-sub { margin-top: 2px; font-size: 11px; line-height: 1.45; color: var(--subtle-foreground) }
+.asset-desk .kpi-sub .text-button { margin: 0; min-height: 20px; gap: 3px; font-size: 12px }
+.asset-desk .old { display: inline-block; margin-left: 5px; padding: 0 3px; border: 1px solid rgba(240, 176, 63, .45); border-radius: 3px; font-family: var(--font-ui); font-size: 10px; font-weight: 500; line-height: 14px; letter-spacing: 0; color: var(--warning); vertical-align: 3px }
+.asset-desk .warn-text { color: var(--warning) }
+.asset-desk .overview-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 14px; align-items: start }
+.asset-desk .overview-main, .asset-desk .overview-side { display: flex; flex-direction: column; gap: 14px; min-width: 0 }
+.asset-desk .panel-h, .asset-desk .holdings-heading { display: flex; align-items: center; gap: 10px; min-height: 42px; padding: 6px 14px; border-bottom: 1px solid var(--border) }
+.asset-desk .panel-h h2, .asset-desk .holdings-heading h2 { font-size: 13px; font-weight: 600 }
+.asset-desk .panel-h-right { margin-left: auto; font-size: 12px; color: var(--subtle-foreground); white-space: nowrap }
+.asset-desk .holdings-heading { justify-content: flex-start; flex-wrap: wrap }
+.asset-desk .holdings-heading h2 .count-chip { margin-left: 6px }
+.asset-desk .holdings-heading .help { font-size: 12px; line-height: 1.5 }
+.asset-desk .holdings-heading > .button { margin-left: auto; min-height: 28px; padding: 0 10px; font-size: 12px }
+.asset-desk .holdings-heading [data-slot=tabs-list] { height: 30px; padding: 2px }
+.asset-desk .holdings-heading [data-slot=tabs-trigger] { min-height: 24px; height: 24px; padding: 0 10px; font-size: 12px }
+.asset-desk .panel-foot { margin-top: auto; padding: 9px 14px; border-top: 1px solid var(--border); font-size: 12px; line-height: 1.6; color: var(--subtle-foreground) }
+.asset-desk .panel-foot .text-button { min-height: 20px; font-size: 12px }
+.asset-desk .holdings [data-slot=table-head] { height: 32px; padding: 0 12px; background: var(--card); color: var(--subtle-foreground); font-size: 12px; border-bottom: 1px solid var(--border) }
+.asset-desk .holdings [data-slot=table-cell] { padding: 6px 12px; font-size: 12px }
+.asset-desk .holdings .status { font-size: 11px; padding: 1px 6px }
+.asset-desk .holdings .stale-row [data-slot=table-cell] { color: var(--subtle-foreground) }
+.asset-desk .asset-cell { display: flex; align-items: center; gap: 10px }
+.asset-desk .asset-cell .exchange-mark, .asset-desk .sync-panel .exchange-mark { width: 24px; height: 24px; flex: none; border-radius: 6px; font-size: 11px }
+.asset-desk .exchange-mark.bybit { background: #2a2410; color: #f7a600 } .asset-desk .exchange-mark.binance { background: #2a2508; color: #f0b90b } .asset-desk .exchange-mark.okx { background: #1f2328; color: #e6eaf0 } .asset-desk .exchange-mark.gate { background: #0f2a22; color: #2dbe87 } .asset-desk .exchange-mark.aster { background: #2a1a10; color: #f08a3f } .asset-desk .exchange-mark.variational { background: #17202f; color: #6ea8fe } .asset-desk .exchange-mark.hyperliquid { background: #0d2624; color: #50d2c1 } .asset-desk .exchange-mark.rh-lighter { background: #1a1f2e; color: #c3c9f5 }
+.asset-desk .sync-panel .connection-row { margin: 0; width: 100%; gap: 10px; padding: 8px 14px; border: 0; border-bottom: 1px solid var(--border); background: none; color: inherit; font-size: 12px }
+.asset-desk .sync-panel .connection-row:last-of-type { border-bottom: 0 }
+.asset-desk .sync-panel .connection-row strong { font-size: 13px }
+.asset-desk .sync-panel .connection-row small { margin-top: 1px; font-size: 11px; color: var(--subtle-foreground) }
+.asset-desk .trend-panel .trend-summary { display: block; padding: 10px 14px 0 }
+.asset-desk .trend-panel .trend-summary span { font-size: 12px; color: var(--subtle-foreground) }
+.asset-desk .trend-panel .trend-summary strong { margin-top: 3px; font-size: 20px }
+.asset-desk .trend-panel .trend-summary p { font-size: 11px; color: var(--subtle-foreground) }
+.asset-desk .trend-panel .trend-key { padding: 8px 14px 0; gap: 6px 14px; font-size: 12px }
+.asset-desk .trend-panel .trend-key i { width: 14px; border-top-width: 2px }
+.asset-desk .trend-panel .chart { height: 220px; margin: 4px 6px 0 0 }
+.asset-desk .trend-panel .performance-metrics { margin: 0; padding: 0; background: none; border: 0; border-top: 1px solid var(--border); border-radius: 0 }
+.asset-desk .trend-panel .performance-annualized { gap: 0 }
+.asset-desk .trend-panel .performance-card { padding: 10px 14px; background: none; border: 0; border-radius: 0 }
+.asset-desk .trend-panel .performance-card + .performance-card { border-left: 1px solid var(--border) }
+.asset-desk .trend-panel .performance-label { font-size: 11px; color: var(--subtle-foreground) }
+.asset-desk .trend-panel .performance-card strong { margin: 2px 0; font-size: 16px }
+.asset-desk .trend-panel .performance-card p { color: var(--subtle-foreground) }
+.asset-desk .trend-panel .performance-annualized + .performance-note { margin: 0; padding: 0 14px 10px; color: var(--subtle-foreground) }
+.asset-desk .trend-panel .performance-monthly { margin: 0 }
+.asset-desk .trend-panel .performance-monthly summary { min-height: 38px; padding: 9px 14px; font-size: 12px; color: var(--muted-foreground) }
+.asset-desk .performance-monthly-body { padding: 0 14px 12px }
+.asset-desk .performance-monthly-body .performance-heading { margin-bottom: 6px }
+.asset-desk .performance-monthly-body .performance-note { margin: 0 0 12px }
+.asset-desk .trend-panel .chart-note { margin-top: 0 }
+.asset-desk .daily-change-list { max-height: 420px; overflow-y: auto; overscroll-behavior: contain; margin: 0; padding: 0; list-style: none; font-variant-numeric: tabular-nums }
+.asset-desk .daily-change-list > li { padding: 8px 0; border-bottom: 1px solid var(--border) }
+.asset-desk .daily-change-list > li:last-child { border-bottom: 0 }
+.asset-desk .daily-change-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 12px }
+.asset-desk .daily-change-head > span { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 8px; min-width: 0 }
+.asset-desk .daily-change-head > span:last-child { flex: none; font-family: var(--font-number); font-weight: 600 }
+.asset-desk .daily-change-head small { font-size: 11px; font-weight: 400; color: var(--subtle-foreground) }
+.asset-desk .daily-sources { display: flex; flex-wrap: wrap; gap: 2px 12px; margin: 4px 0 0; padding: 0; list-style: none; font-size: 11px; color: var(--muted-foreground) }
+.asset-desk .daily-sources li { display: flex; gap: 4px; min-width: 0 }
+.asset-desk .daily-sources b { font-weight: 500; font-family: var(--font-number) }
+.asset-desk .daily-sources.expanded { display: grid; gap: 3px }
+.asset-desk .daily-sources.expanded li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px }
+.asset-desk .daily-sources.expanded small { color: var(--subtle-foreground) }
+.asset-desk .daily-source-label { overflow-wrap: anywhere }
+.asset-desk .daily-change-list .text-button { margin: 2px 0 0; min-height: 22px; font-size: 11px }
+.asset-desk .daily-changes .error-text .text-button { margin-left: 6px }
+.asset-desk .daily-sources.expanded .daily-details { grid-column: 1 / -1; margin: 0 0 2px 10px; padding-left: 8px; border-left: 1px solid var(--border) }
+.asset-desk .daily-combos { display: flex; flex-wrap: wrap; gap: 2px 12px; margin: 4px 0 0; padding: 0; list-style: none; font-size: 12px }
+.asset-desk .daily-combos li { display: flex; align-items: baseline; gap: 4px }
+.asset-desk .daily-combos b { font-family: var(--font-number); font-weight: 600 }
+.asset-desk .daily-combos small.daily-partial { font-size: 11px; color: var(--warning) }
+.asset-desk .daily-combos-note { margin: 4px 0 0; font-size: 11px; color: var(--subtle-foreground) }
+.asset-desk .trend-panel .chart-note .text-button { margin-left: 6px }
+.asset-desk .page-footer { padding: 12px 0 4px }
+@media (min-width: 601px) { .asset-desk .ledger-head-meta .button { min-height: 30px; padding: 0 12px } .asset-desk .holdings .icon-button { width: 28px; height: 28px } }
+@media (max-width: 1100px) {
+  .asset-desk .workspace-date { display: none }
+  .asset-desk .ledger-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)) }
+  .asset-desk .kpi:nth-child(3n) { border-right: 0 }
+  .asset-desk .kpi:nth-child(-n+3) { border-bottom: 1px solid var(--border) }
+  .asset-desk .kpi-value { font-size: 20px }
+  .asset-desk .overview-grid { grid-template-columns: minmax(0, 1fr) 320px }
+}
+@media (max-width: 900px) { .asset-desk .overview-grid { grid-template-columns: 1fr } }
+@media (max-width: 600px) {
+  .asset-desk .ledger-head { flex-wrap: wrap; gap: 0; padding: 0 }
+  .asset-desk .ledger-head-meta { order: 1; width: 100%; padding: 10px 0 4px; justify-content: flex-start }
+  .asset-desk .ledger-head-meta .button { margin-left: auto }
+  .asset-desk .ledger-tabs { order: 2; width: 100% }
+  .asset-desk .ledger-strip { padding: 8px 12px }
+  .asset-desk .page { padding: 12px 0 }
+  .asset-desk .ledger-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)) }
+  .asset-desk .kpi, .asset-desk .kpi:nth-child(3n) { border-right: 1px solid var(--border); border-bottom: 1px solid var(--border) }
+  .asset-desk .kpi:nth-child(2n) { border-right: 0 }
+  .asset-desk .kpi:nth-last-child(-n+2) { border-bottom: 0 }
+  .asset-desk .kpi-value { font-size: 18px }
+  .asset-desk .import-notice { flex-wrap: wrap }
+  .asset-desk .holdings-heading { padding: 8px 14px }
+  .asset-desk .holdings-heading .panel-h-right { margin-left: 0; white-space: normal }
+  .asset-desk .holdings-heading [data-slot=tabs-trigger] { min-height: 34px; height: 34px }
+  .asset-desk .holdings-heading [data-slot=tabs-list] { height: 40px }
+  .asset-desk .trend-panel .performance-annualized { grid-template-columns: 1fr 1fr }
+}
+
+/* components/ui/table.tsx：容器 "relative w-full overflow-x-auto"，Table "w-full caption-bottom text-sm"，TableHeader
+   "[&_tr]:border-b"，TableBody "[&_tr:last-child]:border-0"，TableRow "border-b transition-colors hover:bg-muted/50
+   has-aria-expanded:bg-muted/50"，TableHead "h-10 px-2 text-left align-middle font-medium whitespace-nowrap text-foreground"，
+   TableCell "p-2 align-middle whitespace-nowrap"（字号、内边距与颜色被上面 .holdings 的规则覆盖）。
+   components/ui/tabs.tsx 默认变体：TabsList "inline-flex w-fit items-center justify-center rounded-lg p-[3px] h-9
+   text-muted-foreground bg-muted"，TabsTrigger "relative inline-flex flex-1 items-center justify-center gap-1.5 rounded-md
+   border border-transparent px-2 py-1 text-sm font-medium whitespace-nowrap text-muted-foreground hover:text-foreground"，
+   选中时 "border-input bg-input/30 text-foreground"（底色与颜色被上面 [data-state=active] 的规则覆盖）。 */
+.asset-desk [data-slot=table-container] { position: relative; width: 100%; overflow-x: auto }
+.asset-desk [data-slot=table] { width: 100%; caption-side: bottom; border-collapse: collapse; font-size: .875rem }
+.asset-desk [data-slot=table-row] { border-bottom: 1px solid var(--border); transition: background-color .15s }
+.asset-desk [data-slot=table-body] [data-slot=table-row]:last-child { border-bottom: 0 }
+.asset-desk [data-slot=table-row]:hover, .asset-desk [data-slot=table-row]:has([aria-expanded=true]) { background: color-mix(in oklch, var(--muted) 50%, transparent) }
+.asset-desk [data-slot=table-head] { height: 40px; padding: 0 8px; text-align: left; vertical-align: middle; font-weight: 500; white-space: nowrap; color: var(--foreground) }
+.asset-desk [data-slot=table-cell] { padding: 8px; vertical-align: middle; white-space: nowrap }
+.asset-desk [data-slot=tabs-list] { display: inline-flex; width: fit-content; align-items: center; justify-content: center; padding: 3px; height: 36px; color: var(--muted-foreground) }
+.asset-desk .holdings-heading [data-slot=tabs-list] { height: 30px; padding: 2px }
+.asset-desk [data-slot=tabs-trigger] { position: relative; display: inline-flex; flex: 1; align-items: center; justify-content: center; gap: 6px; border: 1px solid transparent; border-radius: 6px; background: none; padding: 4px 8px; font-size: .875rem; font-weight: 500; white-space: nowrap; color: var(--muted-foreground); transition: all .15s }
+.asset-desk [data-slot=tabs-trigger]:hover { color: var(--foreground) }
+.asset-desk [data-slot=tabs-trigger][data-state=active] { border-color: var(--input); background: var(--card); color: var(--primary) }
+.asset-desk .holdings-heading [data-slot=tabs-trigger] { min-height: 24px; height: 24px; padding: 0 10px; font-size: 12px }
+
+/* 本服务只读版本自己的规则 */
+.asset-desk .import-command { display: block; max-width: 100%; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--secondary); color: var(--foreground); font-family: var(--font-number); font-size: 12px; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere }
+.asset-desk .exchange-total { margin-left: auto; text-align: right; font-family: var(--font-number); font-size: 12px; font-weight: 600; white-space: nowrap }
+.asset-desk .exchange-total small { display: block; font-family: var(--font-ui); font-weight: 400 }
+.asset-desk .exchange-empty { padding: 10px 14px }
+.asset-desk .holdings .detail-row:hover { background: none }
+.asset-desk .holdings .detail-row > [data-slot=table-cell] { padding: 0 12px 12px; white-space: normal }
+.asset-desk .account-detail { padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--background) }
+.asset-desk .account-detail h3 { font-size: 13px; font-weight: 600 }
+.asset-desk .account-detail .help { font-size: 12px; line-height: 1.7 }
+.asset-desk .period-detail { margin-bottom: 14px }
+.asset-desk .period-detail > .notice { margin: 10px 14px }
+.asset-desk .period-state { padding: 10px 14px }
+.asset-desk .cash-flows { margin-bottom: 12px }
+.asset-desk .cash-flows h4 { margin: 0; font-size: 12px; font-weight: 600 }
+.asset-desk .cash-flows ol, .asset-desk .cash-flows ul { margin: 6px 0 0; padding-left: 20px; font-size: 11px; color: var(--muted-foreground); overflow-wrap: anywhere }
+.asset-desk .cash-flows li { padding: 2px 0 }
+.asset-desk .cash-flows p { font-size: 11px }
+.asset-desk .cash-flow-pages { margin-top: 6px; color: var(--muted-foreground) }
+.asset-desk .daily-change-list details { margin-top: 4px; font-size: 11px; color: var(--muted-foreground) }
+.asset-desk .daily-change-list details ul { margin: 4px 0 0; padding-left: 18px }
+/* The copied SvgPlot wraps its tooltip in a box of its own; the workbench's trend tooltip carries the frame here. */
+.asset-desk .svg-plot-tooltip { padding: 0; border: 0; background: none; box-shadow: none }

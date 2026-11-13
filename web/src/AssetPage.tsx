@@ -5,7 +5,7 @@
 // the connections view are left out; dialogs became panels opened in place; the connections side panel lists the
 // exchange totals instead.
 import { Eye, Info, RefreshCw, TriangleAlert, X } from 'lucide-react';
-import { Fragment, useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useRef, useState, type ReactNode } from 'react';
 import { api } from './api.ts';
 import { StatePanel } from './StateViews.tsx';
 import { useLiveResource } from './use-live-resource.ts';
@@ -16,7 +16,6 @@ import {
   IMPORT_COMMAND, badge, detailHeads, detailLine, detailNote, detailSubtitle, detailTitle, fullStamp, fxView, money, periodFxTitle, periodKind, periodSource,
   priceText, quantityText, stamp, staleRow, statusTone, zhMoney,
 } from './asset-format.ts';
-import './asset.css';
 
 export const ASSET_STATE_PATH = '/api/asset/state';
 export const ASSET_READ_TIMEOUT_MS = 10_000;
@@ -93,7 +92,7 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
 
 type LoadedLedger = AssetLedgerView & { ledger: NonNullable<AssetLedgerView['ledger']>; summary: NonNullable<AssetLedgerView['summary']> };
 
-function Overview({ data, history, historyError, version, example, onHistory, onWithdrawals, onExpired }: { data: LoadedLedger; history: AssetHistoryView | null; historyError: string | null; version: string; example: React.ReactNode; onHistory: () => void; onWithdrawals: () => void; onExpired: () => void }) {
+function Overview({ data, history, historyError, version, example, onHistory, onWithdrawals, onExpired }: { data: LoadedLedger; history: AssetHistoryView | null; historyError: string | null; version: string; example: ReactNode; onHistory: () => void; onWithdrawals: () => void; onExpired: () => void }) {
   const [filter, setFilter] = useState<Filter>('all');
   const { ledger, summary } = data, { measures, valuation } = summary;
   const now = Date.now(), fx = fxView(ledger.fxStatus, now);

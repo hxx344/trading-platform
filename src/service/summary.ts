@@ -3,10 +3,12 @@
 // sub-accounts' available margin and margin usage, positions, transfer and ADL state; pairs that need a person first.
 // It goes to the scheduled robot (secrets.feishuScheduled), or the alert robot when there is none, as the workbench's
 // single-robot mode did. The schedule is kept in notify.sqlite: a restart keeps the next due time, missed periods are
-// skipped rather than sent in a burst, and a send that keeps failing gives up on its period after three tries.
+// skipped rather than sent in a burst, and a send that keeps failing gives up on its period after three tries. The
+// interval comes from config.json until it is set on the 设置 page, which then wins; the page can also ask for a card now.
 import { DatabaseSync } from 'node:sqlite';
 import type { FeishuSecret } from './config.ts';
 import { sendFeishu } from './feishu.ts';
+import { reject } from '../contracts.ts';
 import { add, cmp, decimal, sub } from '../decimal.ts';
 
 /** The first card after a fresh start, once balances and positions have been read. */
@@ -175,7 +177,7 @@ export function summaryCard(input: SummaryInput, now: number): Record<string, un
 export interface SummaryOptions {
   /** notify.sqlite: the schedule sits next to the alert outbox. */
   file: string;
-  /** 0: off. */
+  /** config.json's value: used until the page sets one. 0: off. */
   intervalMinutes: number;
   robot: { secret: FeishuSecret; kind: 'scheduled' | 'event' } | null;
   collect(): SummaryInput;
@@ -184,64 +186,114 @@ export interface SummaryOptions {
   log?: (line: string) => void;
 }
 
+export const MAX_SUMMARY_MINUTES = 1_440;
+const ROBOT_NAME = { scheduled: '定时机器人', event: '告警机器人' } as const;
+
 export function createSummary({ file, intervalMinutes, robot, collect, now = Date.now, fetchImpl, log = line => process.stderr.write(`${line}\n`) }: SummaryOptions) {
   const db = new DatabaseSync(file);
   db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=2000;
     CREATE TABLE IF NOT EXISTS summary_schedule (id INTEGER PRIMARY KEY CHECK (id = 1), next_due_at INTEGER NOT NULL, interval_ms INTEGER NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER, last_sent_at INTEGER, last_error TEXT, last_error_at INTEGER);`);
-  const interval = intervalMinutes * 60_000;
-  type Row = { nextDueAt: number; intervalMs: number; attempts: number; retryAt: number | null; lastSentAt: number | null; lastError: string | null; lastErrorAt: number | null };
-  const read = (): Row | undefined => db.prepare('SELECT next_due_at AS nextDueAt, interval_ms AS intervalMs, attempts, retry_at AS retryAt, last_sent_at AS lastSentAt, last_error AS lastError, last_error_at AS lastErrorAt FROM summary_schedule WHERE id = 1').get() as Row | undefined;
-  const active = interval > 0 && robot !== null;
-  // A fresh schedule sends its first card soon after start; a changed interval starts over one interval from now.
-  if (active) {
-    const row = read();
-    if (!row) db.prepare('INSERT INTO summary_schedule (id, next_due_at, interval_ms) VALUES (1, ?, ?)').run(now() + Math.min(FIRST_SUMMARY_MS, interval), interval);
-    else if (row.intervalMs !== interval) db.prepare('UPDATE summary_schedule SET next_due_at = ?, interval_ms = ?, attempts = 0, retry_at = NULL WHERE id = 1').run(now() + interval, interval);
+  // Added in v0.10.1, after the table: the page's interval (null: follow config.json), the robot the schedule was made
+  // for and the one the last card went to. v0.10.0 names its columns and ignores these.
+  const columns = new Set((db.prepare('PRAGMA table_info(summary_schedule)').all() as { name: string }[]).map(column => column.name));
+  for (const [name, type] of [['page_interval_ms', 'INTEGER'], ['robot', 'TEXT'], ['last_sent_robot', 'TEXT']] as const) {
+    if (!columns.has(name)) db.exec(`ALTER TABLE summary_schedule ADD COLUMN ${name} ${type}`);
+  }
+  const configInterval = intervalMinutes * 60_000;
+  type Row = { nextDueAt: number; intervalMs: number; pageIntervalMs: number | null; attempts: number; retryAt: number | null; lastSentAt: number | null; lastSentRobot: 'scheduled' | 'event' | null; robot: string | null; lastError: string | null; lastErrorAt: number | null };
+  const read = (): Row => db.prepare(`SELECT next_due_at AS nextDueAt, interval_ms AS intervalMs, page_interval_ms AS pageIntervalMs, attempts, retry_at AS retryAt,
+    last_sent_at AS lastSentAt, last_sent_robot AS lastSentRobot, robot, last_error AS lastError, last_error_at AS lastErrorAt FROM summary_schedule WHERE id = 1`).get() as Row;
+  const intervalOf = (row: Row): number => row.pageIntervalMs ?? configInterval;
+  const first = (interval: number): number => Math.min(FIRST_SUMMARY_MS, interval);
+  const startedAt = now();
+  // The first minutes after a start (a clock set back before the start does not stretch them).
+  const warming = (at: number, interval: number): boolean => at >= startedAt && at < startedAt + first(interval);
+  // A fresh schedule sends its first card soon after start, and so does one whose robot changed (a card to the new group
+  // instead of waiting a whole period); a changed interval starts over one interval from now.
+  {
+    const existing = db.prepare('SELECT 1 FROM summary_schedule WHERE id = 1').get();
+    if (!existing) db.prepare('INSERT INTO summary_schedule (id, next_due_at, interval_ms, robot) VALUES (1, ?, ?, ?)').run(startedAt + first(configInterval), configInterval, robot?.kind ?? null);
+    else {
+      const row = read(), interval = intervalOf(row);
+      // A new robot, or a schedule that was off, starts like a fresh one (also when the interval changed with it).
+      const fresh = interval > 0 && ((robot !== null && row.robot !== robot.kind) || row.intervalMs <= 0);
+      if (fresh || row.intervalMs !== interval) db.prepare('UPDATE summary_schedule SET next_due_at = ?, interval_ms = ?, attempts = 0, retry_at = NULL WHERE id = 1').run(startedAt + (fresh ? first(interval) : interval), interval);
+      db.prepare('UPDATE summary_schedule SET robot = ? WHERE id = 1').run(robot?.kind ?? null);
+    }
   }
   let sending = false;
-  // Right after a start the positions and balances are still being read: a period that fell due while the service was
-  // down waits as long as a fresh schedule would, so the card on the way back carries numbers rather than 待同步.
-  const firstAt = now() + Math.min(FIRST_SUMMARY_MS, interval);
 
   async function tick(): Promise<void> {
-    if (!active || sending) return;
+    if (!robot || sending) return;
     const at = now();
-    const row = read()!;
+    const row = read();
+    const interval = intervalOf(row);
+    if (interval <= 0) return;
     // A clock that ran ahead and came back would push the next card out by the jump; start the grid over from now.
     if (row.nextDueAt - at > interval) { db.prepare('UPDATE summary_schedule SET next_due_at = ?, retry_at = NULL WHERE id = 1').run(at + interval); return; }
-    if (at < firstAt || at < row.nextDueAt || (row.retryAt !== null && at < row.retryAt)) return;
+    // Right after a start the positions and balances are still being read: a period that fell due while the service was
+    // down waits as long as a fresh schedule would, so the card on the way back carries numbers rather than 待同步.
+    if (warming(at, interval) || at < row.nextDueAt || (row.retryAt !== null && at < row.retryAt)) return;
     // The period this send belongs to; the ones missed while the service was down are skipped.
     const periodAt = row.nextDueAt + Math.floor((at - row.nextDueAt) / interval) * interval;
     const boundary = periodAt + interval;
+    // The schedule moves on only if the page did not change it while the card was on its way.
+    const advance = (sql: string, ...values: (number | string | null)[]) =>
+      db.prepare(`UPDATE summary_schedule SET ${sql} WHERE id = 1 AND next_due_at = ? AND interval_ms = ?`).run(...values, row.nextDueAt, row.intervalMs);
     sending = true;
     try {
       const input = collect();
       // A service that runs oil only has nothing for an ASTER card: the period passes without a post.
-      if (!input.pairs.length) { db.prepare('UPDATE summary_schedule SET next_due_at = ?, attempts = 0, retry_at = NULL WHERE id = 1').run(boundary); return; }
-      await sendFeishu(robot!.secret, { msg_type: 'interactive', card: summaryCard(input, at) }, { now, ...(fetchImpl ? { fetchImpl } : {}) });
-      db.prepare('UPDATE summary_schedule SET next_due_at = ?, attempts = 0, retry_at = NULL, last_sent_at = ? WHERE id = 1').run(boundary, now());
-      log(`定时运行摘要已发送（${input.pairs.length} 个配对，${robot!.kind === 'scheduled' ? '定时机器人' : '告警机器人'}）`);
+      if (!input.pairs.length) { advance('next_due_at = ?, attempts = 0, retry_at = NULL', boundary); return; }
+      await sendFeishu(robot.secret, { msg_type: 'interactive', card: summaryCard({ ...input, intervalMinutes: interval / 60_000 }, at) }, { now, ...(fetchImpl ? { fetchImpl } : {}) });
+      db.prepare('UPDATE summary_schedule SET last_sent_at = ?, last_sent_robot = ? WHERE id = 1').run(now(), robot.kind);
+      advance('next_due_at = ?, attempts = 0, retry_at = NULL', boundary);
+      log(`定时运行摘要已发送（${input.pairs.length} 个配对，${ROBOT_NAME[robot.kind]}）`);
     } catch (error) {
       const reason = error instanceof Error ? error.message.slice(0, 200) : '未知错误';
       const attempts = row.attempts + 1;
       const giveUp = attempts >= TRIES;
-      if (giveUp) db.prepare('UPDATE summary_schedule SET next_due_at = ?, attempts = 0, retry_at = NULL, last_error = ?, last_error_at = ? WHERE id = 1').run(boundary, reason, now());
-      else db.prepare('UPDATE summary_schedule SET attempts = ?, retry_at = ?, last_error = ?, last_error_at = ? WHERE id = 1').run(attempts, now() + RETRY_MS, reason, now());
+      db.prepare('UPDATE summary_schedule SET last_error = ?, last_error_at = ? WHERE id = 1').run(reason, now());
+      if (giveUp) advance('next_due_at = ?, attempts = 0, retry_at = NULL', boundary);
+      else advance('attempts = ?, retry_at = ?', attempts, now() + RETRY_MS);
       log(`定时运行摘要发送失败（第 ${attempts} 次）：${reason}${giveUp ? '；本期不再重试，下期照常' : `；${RETRY_MS / 1000} 秒后重试`}`);
     } finally { sending = false; }
   }
 
+  function status() {
+    const row = read(), interval = intervalOf(row);
+    const enabled = robot !== null && interval > 0;
+    return {
+      enabled, intervalMinutes: interval / 60_000, configIntervalMinutes: intervalMinutes, fromPage: row.pageIntervalMs !== null,
+      robot: robot?.kind ?? null,
+      nextDueAt: enabled ? Math.max(row.nextDueAt, row.retryAt ?? 0, warming(now(), interval) ? startedAt + first(interval) : 0) : null,
+      lastSentAt: row.lastSentAt, lastSentRobot: row.lastSentRobot,
+      lastError: row.lastError, lastErrorAt: row.lastErrorAt,
+    };
+  }
+
   return {
     tick,
-    /** For the status page. */
-    status() {
-      const row = active ? read() : undefined;
-      return {
-        enabled: active, intervalMinutes, robot: robot?.kind ?? null,
-        nextDueAt: row ? Math.max(row.nextDueAt, row.retryAt ?? 0) : null, lastSentAt: row?.lastSentAt ?? null,
-        lastError: row?.lastError ?? null, lastErrorAt: row?.lastErrorAt ?? null,
-      };
+    /** For the status and settings pages. */
+    status,
+    /** The page's interval, kept over config.json from now on; the next card comes one interval from now (0: off). */
+    setInterval(minutes: number) {
+      if (!Number.isInteger(minutes) || minutes < 0 || minutes > MAX_SUMMARY_MINUTES) reject('summary_interval', `间隔须为 0–${MAX_SUMMARY_MINUTES} 的整数分钟（0 关闭）`);
+      const interval = minutes * 60_000;
+      db.prepare('UPDATE summary_schedule SET page_interval_ms = ?, interval_ms = ?, next_due_at = ?, attempts = 0, retry_at = NULL WHERE id = 1').run(interval, interval, now() + interval);
+      log(`定时运行摘要间隔已在页面改为${minutes ? ` ${minutes} 分钟` : '关闭'}`);
+      return status();
+    },
+    /** One card as soon as the loop next looks (within seconds); the periods then count from it. A card already on its
+     * way or already due is that card: asking again does not add a second. */
+    sendNow() {
+      const row = read();
+      if (!robot) reject('summary_no_robot', '未配置飞书机器人，无法发送');
+      if (intervalOf(row) <= 0) reject('summary_off', '定时运行摘要已关闭，先设置间隔');
+      if (sending || (row.nextDueAt <= now() && row.retryAt === null)) return status();
+      db.prepare('UPDATE summary_schedule SET next_due_at = ?, attempts = 0, retry_at = NULL WHERE id = 1').run(now());
+      return status();
     },
     close: (): void => db.close(),
   };

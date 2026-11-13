@@ -73,12 +73,15 @@ function Feishu({ feishu }: { feishu: NonNullable<ServiceStatus['feishu']> }) {
   </>;
 }
 
+const ROBOT = { scheduled: '定时机器人', event: '告警机器人' } as const;
+
 function Summary({ summary }: { summary: NonNullable<ServiceStatus['summary']> }) {
   const where = summary.robot === 'scheduled' ? '定时机器人' : '告警机器人（密钥文件没有 feishuScheduled）';
+  const source = summary.fromPage ? '页面设置' : 'config.json';
   return <div className="panel-body"><dl className="facts">
-    <dt>状态</dt><dd>{summary.enabled ? `每 ${summary.intervalMinutes} 分钟一张，发往${where}` : summary.intervalMinutes === 0 ? <span className="muted">已关闭（config.json 的 summary.intervalMinutes 为 0）</span> : <span className="muted">未配置飞书机器人，不发送</span>}</dd>
+    <dt>状态</dt><dd>{summary.enabled ? `每 ${summary.intervalMinutes} 分钟一张（${source}），发往${where}` : summary.robot === null ? <span className="muted">未配置飞书机器人，不发送</span> : <span className="muted">已关闭（{source}；在「设置」页修改）</span>}</dd>
     {summary.enabled ? <><dt>下次</dt><dd>{stamp(summary.nextDueAt)}</dd></> : null}
-    <dt>最近成功</dt><dd>{stamp(summary.lastSentAt)}</dd>
+    <dt>最近成功</dt><dd>{stamp(summary.lastSentAt)}{summary.lastSentAt !== null && summary.lastSentRobot ? `，${ROBOT[summary.lastSentRobot]}` : ''}</dd>
     <dt>最近错误</dt><dd className={summary.lastError ? 'err' : undefined}>{summary.lastError ? `${summary.lastError}（${stamp(summary.lastErrorAt)}）` : '无'}</dd>
   </dl></div>;
 }

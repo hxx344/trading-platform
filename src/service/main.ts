@@ -226,6 +226,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   // The scheduled summary card: the workbench's 定时 robot when imported, else the alert robot.
   const names = new Map(config.pairs.map(pair => [pair.id, { long: pair.long, short: pair.short }]));
   const intervalMinutes = config.summary?.intervalMinutes ?? 60;
+  // The card's interval is replaced by the one in effect (the page's, once set) when the card is made.
   const collect = (): SummaryInput => {
     const positions = new Map(executor.asterPositions().pairs.map(pair => [pair.pairId, pair]));
     const adl = new Map(executor.adlPairs().map(pair => [pair.pairId, pair]));
@@ -266,6 +267,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
         return window && { pairId, range, ...window, points: [], unavailable: `余额采样库无法打开，走势图不可用：${samplesError ?? '未知原因'}（不影响划转与 ADL）` };
       },
       ...(oil ? { oil: oilViews(oil, executor) } : {}),
+      summary: { setInterval: (minutes: number) => summary.setInterval(minutes), sendNow: () => summary.sendNow() },
       ...(logs ? { logs: (filter: 'all' | 'problems', before: number | null, limit: number) => logs.page({ filter, before, limit }) } : {}),
     },
     ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir) } } : {}),

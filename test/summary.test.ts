@@ -124,3 +124,114 @@ test('定时摘要排程：启动后约 2 分钟第一张，之后按间隔；�
     summary.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('定时摘要排程：页面设置的间隔优先于 config.json 并在重启后保留；立即发送一张；换机器人后约 2 分钟先发一张；v0.10.0 的表照常升级', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-summary-page-'));
+  const file = join(dir, 'notify.sqlite');
+  let clock = NOW;
+  const posts: string[] = [], lines: string[] = [];
+  const fetchImpl = async (url: string) => { posts.push(url); return new Response(JSON.stringify({ code: 0 }), { status: 200 }); };
+  const robotOf = (kind: 'scheduled' | 'event') => ({ secret: { webhook: `https://open.feishu.cn/open-apis/bot/v2/hook/${kind}1234`, secret: null }, kind });
+  const open = (minutes: number, kind: 'scheduled' | 'event' | null) => createSummary({ file, intervalMinutes: minutes, robot: kind ? robotOf(kind) : null, collect: () => input([pair('xau')]), now: () => clock, fetchImpl, log: line => lines.push(line) });
+  try {
+    // A v0.10.0 table (without the new columns) with a card sent through the alert robot.
+    const { DatabaseSync } = await import('node:sqlite');
+    const old = new DatabaseSync(file);
+    old.exec(`CREATE TABLE summary_schedule (id INTEGER PRIMARY KEY CHECK (id = 1), next_due_at INTEGER NOT NULL, interval_ms INTEGER NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0, retry_at INTEGER, last_sent_at INTEGER, last_error TEXT, last_error_at INTEGER);
+      INSERT INTO summary_schedule (id, next_due_at, interval_ms, last_sent_at) VALUES (1, ${NOW + 3_000_000}, 3600000, ${NOW - 600_000});`);
+    old.close();
+    // The scheduled robot is new to this schedule: a card about 2 minutes after the start rather than at the old due time.
+    let summary = open(60, 'scheduled');
+    assert.equal(summary.status().nextDueAt, NOW + FIRST_SUMMARY_MS);
+    clock += FIRST_SUMMARY_MS;
+    await summary.tick();
+    assert.deepEqual(posts, ['https://open.feishu.cn/open-apis/bot/v2/hook/scheduled1234']);
+    assert.equal(summary.status().lastSentRobot, 'scheduled');
+    // The page's interval: next card one interval from now, kept over config.json after a restart.
+    assert.throws(() => summary.setInterval(1441), /0–1440/);
+    assert.throws(() => summary.setInterval(1.5), /整数/);
+    let status = summary.setInterval(15);
+    assert.deepEqual([status.intervalMinutes, status.fromPage, status.configIntervalMinutes, status.nextDueAt], [15, true, 60, clock + 15 * 60_000]);
+    assert.ok(lines.some(line => line.includes('页面改为 15 分钟')));
+    summary.close();
+    clock += 60_000;
+    summary = open(60, 'scheduled');
+    status = summary.status();
+    assert.deepEqual([status.intervalMinutes, status.fromPage, status.nextDueAt], [15, true, clock + 14 * 60_000]);
+    // A card now: sent on the next look once the start-up minutes are over; the periods count from it.
+    clock += FIRST_SUMMARY_MS;
+    summary.sendNow();
+    await summary.tick();
+    assert.equal(posts.length, 2);
+    assert.equal(summary.status().nextDueAt, clock + 15 * 60_000);
+    // Off from the page: nothing is sent, and a card on demand is refused.
+    summary.setInterval(0);
+    assert.equal(summary.status().enabled, false);
+    assert.throws(() => summary.sendNow(), /已关闭/);
+    clock += 24 * 3_600_000;
+    await summary.tick();
+    assert.equal(posts.length, 2);
+    summary.close();
+    // Without a robot a card on demand is refused too.
+    summary = open(60, null);
+    assert.throws(() => summary.sendNow(), /未配置飞书机器人/);
+    summary.close();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('定时摘要排程：发送途中页面改间隔不被覆盖、再点立即发送不重复；卡片写实际间隔；从关闭或换机器人启用时约 2 分钟先发一张', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-summary-race-'));
+  const file = join(dir, 'notify.sqlite');
+  let clock = NOW;
+  const bodies: string[] = [];
+  let release: (() => void) | null = null;
+  const fetchImpl = async (_url: string, init: RequestInit) => {
+    bodies.push(String(init.body));
+    if (bodies.length === 1) await new Promise<void>(resolve => { release = resolve; });
+    return new Response(JSON.stringify({ code: 0 }), { status: 200 });
+  };
+  const robot = (kind: 'scheduled' | 'event') => ({ secret: { webhook: `https://open.feishu.cn/open-apis/bot/v2/hook/${kind}1234`, secret: null }, kind });
+  const open = (minutes: number, kind: 'scheduled' | 'event' = 'scheduled') => createSummary({ file, intervalMinutes: minutes, robot: robot(kind), collect: () => input([pair('xau')]), now: () => clock, fetchImpl, log: () => undefined });
+  try {
+    let summary = open(60);
+    clock += FIRST_SUMMARY_MS;
+    const sending = summary.tick();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(bodies.length, 1);
+    // While the first card is on its way: the page's interval and a second "send now" that is the same card.
+    summary.setInterval(20);
+    const asked = summary.sendNow();
+    assert.equal(asked.nextDueAt, clock + 20 * 60_000, '发送途中再点立即发送不另排一张');
+    release!();
+    await sending;
+    let status = summary.status();
+    assert.deepEqual([status.intervalMinutes, status.nextDueAt, status.lastSentAt, status.lastSentRobot], [20, clock + 20 * 60_000, clock, 'scheduled'], '发送结束不覆盖页面改的排期');
+    // The card names the interval in effect.
+    summary.sendNow();
+    summary.sendNow();
+    await summary.tick();
+    await summary.tick();
+    assert.equal(bodies.length, 2, '连点两次只发一张');
+    assert.match(bodies[1]!, /每 20 分钟/);
+    // Off, then on again through config.json with a new robot after a restart: like a fresh schedule.
+    summary.setInterval(0);
+    summary.close();
+    summary = createSummary({ file, intervalMinutes: 60, robot: robot('event'), collect: () => input([pair('xau')]), now: () => clock, fetchImpl });
+    status = summary.status();
+    assert.deepEqual([status.enabled, status.fromPage], [false, true], '页面关闭后以页面为准');
+    summary.close();
+    // A schedule stored as off (config 0 before) that config.json now turns on starts about 2 minutes after the start.
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(file);
+    db.exec('UPDATE summary_schedule SET page_interval_ms = NULL, interval_ms = 0');
+    db.close();
+    summary = open(60, 'event');
+    assert.equal(summary.status().nextDueAt, clock + FIRST_SUMMARY_MS);
+    summary.close();
+    // A new robot together with a new interval also starts about 2 minutes after the start.
+    summary = open(30, 'scheduled');
+    assert.equal(summary.status().nextDueAt, clock + FIRST_SUMMARY_MS);
+    summary.close();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

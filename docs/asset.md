@@ -9,9 +9,9 @@
 | 批次 | 内容 | 风险 | 状态 |
 | --- | --- | --- | --- |
 | A-1 | 只读账本与计算口径：库结构、每日快照、账本读取、资产走势（A10）、日变化归因（A12）、出金与现金流的只读展示；从工作台导入历史数据的命令 | R2 | 完成（Linux CI 通过），随 v0.12.0 发布 |
-| A-2 | 本地写入：手工资产（A06）、汇率（A07）、出金（A09）、现金流（A11）、同步锁 | R3 | 未开始 |
-| A-3 | 凭据与中心化交易所余额同步（A01、A02：Binance、Bybit、OKX、Gate） | R3 | 未开始 |
-| A-4 | 其余数据源（Aster 多账户 A03、Hyperliquid、Lighter RH、Variational A15） | R3 | 未开始 |
+| A-2 | 本地写入：手工资产（A06）、汇率（A07）、出金（A09）、现金流（A11）、同步锁 | R3 | v0.16.0（见下文 A-2） |
+| A-3 | 凭据与中心化交易所余额同步（A01、A02：Binance、Bybit、OKX、Gate）、行情与汇率自动更新 | R3 | 方案见下文 A-3/A-4，A-2 发布后实施 |
+| A-4 | 其余数据源（Aster 多账户 A03、Hyperliquid、Lighter RH、Variational A15） | R3 | 与 A-3 同批 |
 | A-5 | 持仓与成交（A04、A05） | R2 | 未开始 |
 | A-6 | 交易凭据导出（A14）、原表导入（A08） | R3 | 未开始 |
 
@@ -89,7 +89,51 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
 
 **回滚**：`sudo bash install.sh --version v0.11.0`，回退前先删掉 `config.json` 里的 `asset`（旧版本不认识这个字段，配置检查会失败）。主库不变；`asset.sqlite` 留在数据目录里，旧版本不读它。工作台的库只被只读打开，不受影响。
 
-## 后续批次要先定的事
+## A-2：本地写入（编辑、汇率、出金、资金流）
 
-- A-3：工作台的凭据用 `<ASSET_DATA_DIR>/config.json` 里的 `credentialKey` 加密存在库里。本服务的做法（密钥放进 `secrets.json`，还是明文凭据直接写在 `secrets.json`）在 A-3 开工前定。
-- A-6：凭据导出涉及执行账户绑定，按 R3 走安全审查。
+2026-11-13 用户要求：资产页做到与工作台一样的交易所同步、行情与汇率更新、编辑与出金登记。分两次发布：A-2（本节，本地写入）先发，A-3/A-4（下一节，凭据与同步）随后。
+
+- 等级 R3（账本写入、并发锁、与导入的竞争）。回滚版本 v0.15.0：本批不改 `config.json` 格式；`asset.sqlite` 只新增 `sync_locks` 表与新的设置值，v0.15.0 只读 `assets`、`settings`、`snapshots`，回退后照常读取（回退后页面看到的是本批写入后的数据，不会回到导入时刻）。
+- 影响面：`src/asset/`（库打开方式、新增写入与锁）、`src/http.ts`（资产写接口）、`src/service/main.ts`（装配）、资产页与其样式、文档与测试。划转、ADL、原油、期权、行情监控不变。
+
+**对照的工作台代码**（`modules/asset`，`0014655`）：`lib/store.ts` 的 `withLock`、`snapshot`、`editAsset`、`editFx`、`saveWithdrawal`、`deleteWithdrawal`；`lib/sync-lock.ts`；`lib/cash-flow-store.ts` 的 `saveCashFlow`；`lib/validation.ts` 的 `editSchema`、`fxSchema`、`withdrawalSchema`、`withdrawalIdSchema`、`editValue`；`app/api/ledger|withdrawals|cash-flows/route.ts`；页面 `app/dashboard.tsx` 的编辑与汇率弹窗、`withdrawals-panel.tsx`、`cash-flows-panel.tsx` 的登记表单。
+
+**库与锁**
+
+- 服务改为读写打开 `asset.sqlite`（仍是首次用到且文件存在时才打开；文件不存在 = 未导入，写接口回 409“尚未导入资产账本”）。打开时 `CREATE TABLE IF NOT EXISTS sync_locks(id INTEGER PRIMARY KEY CHECK(id = 1), expires INTEGER NOT NULL, token TEXT NOT NULL)`（单用户，去掉 `owner` 列，固定一行）。库文件或其 `-wal`/`-shm` 不归服务账户、SQLite 报不可写（READONLY / PERM / CANTOPEN）时，读接口照常（退回只读打开），写接口回 409 并说明“资产库不可写……请把它们改回服务账户所有（chown）并可写后重试”；打开时碰上导入正在写（BUSY）同样只读打开，但写接口报“资产正在更新，请稍后重试”，下一次写入重新打开。服务连接的 `busy_timeout` 为 1 秒（node:sqlite 同步等待，会挡住同进程的 ADL 与划转），导入连接仍为 5 秒。
+- 同步锁照搬工作台 `sync-lock.ts`：每次取锁一个随机令牌，TTL 120 s、每 30 s 续期、最长持有 600 s；忙时报“资产正在更新，请稍后重试”（409）；每次写入在一个 `BEGIN IMMEDIATE` 事务里先核对令牌未过期才写，否则报“资产更新超时或已被其他操作接替，本次结果未保存”。随机数用 `node:crypto`。
+- **与导入的竞争**（工作台没有这一情形）：取锁时记下 `settings.import-info` 的原值，每次写入事务里同时核对它没变；导入在锁持有期间整体替换了账本时，本次写入作废并报“资产账本刚被重新导入，本次修改未保存，请刷新后重试”。导入本身不取锁（导入写入是单个事务，替换后旧锁令牌照常过期）。
+- 每次写入后照工作台 `snapshot()` 写当天（北京时间）的日快照 `snapshots(date='YYYY-MM-DD')`，口径用已复制的 `snapshotValues`、`configuredExchanges`、`embeddedWithdrawals`；本服务没有持仓缓存（A-5），快照不带 `positions`。
+
+**写接口**（都要登录；沿用现有 POST 的页面请求标记与 JSON 检查；本服务只有 POST，删除与修改也用 POST；输入严格校验、拒绝未知字段，规则与工作台 zod 规则逐条相同，不引入 zod；成功都返回新的 `/api/asset/ledger` 应答）：
+
+| 接口 | 工作台对照 | 输入 |
+| --- | --- | --- |
+| `POST /api/asset/assets/edit` | `PATCH /api/ledger`（编辑资产） | `{id:'row-<n>', quantity:0–1e15, price:0–1e9 或 null}`；交易所行拒绝（“交易所资产由只读接口维护”）；`market` 行只改数量；数量大于 0 时须有单价 |
+| `POST /api/asset/fx` | `PATCH /api/ledger`（汇率） | `{fx: 0 < fx ≤ 1000}`，状态记为手动 |
+| `POST /api/asset/withdrawals/add`、`/edit` | `POST`/`PATCH /api/withdrawals` | `{id:UUID, date:'YYYY-MM-DD', amount: >0、≤1e12、最多两位小数, note: ≤200 字}`；日期不早于原表基准日、不晚于北京时间今天；重复提交同一编号同内容视为成功；上限 2000 条 |
+| `POST /api/asset/withdrawals/delete` | `DELETE /api/withdrawals` | `{id:UUID}` |
+| `POST /api/asset/cash-flows` | `POST /api/cash-flows` | 工作台 `parseCashFlow` 的输入（已复制在 `cash-flows.ts`），返回资金流列表 |
+
+- 报错照工作台 `api.ts` 的 `failure`：校验错误 400“输入格式不正确，请检查数值和连接信息”；业务错误原文 400；锁忙 / 被接替 / 被导入替换 409；库错误 503“服务暂时不可用，已保留上次数据，请稍后重试”，不回显 SQL。
+- 写入成功后 `GET` 读接口立刻反映（同一连接）。
+
+**页面**（照 `dashboard.tsx`、`withdrawals-panel.tsx`、`cash-flows-panel.tsx` 排版，样式从工作台 `globals.css` 复制，规则同 [frontend.md](frontend.md)）
+
+- 去掉“只读”提示；非交易所行（手动维护、`market`）的“编辑”笔形按钮（“新增出金记录”行点了跳到出金子页）、USD / CNY 格的笔形按钮、出金子页的“登记出金”与每行编辑 / 删除、每日波动里资金流面板的“登记资金流”与每条“修改/作废”，均照工作台。工作台是弹窗，本页用原位展开面板（同 A-1 的做法）：编辑面板在资产明细表上方，汇率面板在汇总格下方，出金的登记与删除确认在出金表上方，资金流表单在资金流列表上方。
+- 全页同一时间只发一笔写入（照工作台 `mutate()`）：写入时各写入按钮禁用；成功后面板关闭、页面顶部显示“已保存”4 秒，账本应答直接成为当前值，状态、历史、出金、每日波动与资金流随即重读；失败原位显示原因、输入保留；409 或结果未知（超时、断网、5xx）、以及成功但应答无法解析时，账本也重读一遍，让页面显示库里实际的数据；401 转登录。写入超时 20 秒（锁内写入比读取慢）。
+- 出金与资金流的编号在打开表单时生成（`newRequestId()`，页面在 http 下没有 `crypto.randomUUID`），重试沿用同一编号，应答丢失后再点保存不会记两笔。
+- 汇率面板说明改为“汇率自动更新尚未接入，这里设置的值会一直使用”（工作台写的是“下一次自动获取成功后会覆盖”）；按钮“使用此汇率”。
+- 交易所行在本批仍显示导入时的估值（同步属 A-3），顶部提示、交易所合计与出金页脚注相应说明；提示还写明重新导入会覆盖本页做过的修改。
+
+**测试**：校验规则逐条（边界与未知字段）、锁（忙、过期接替后写入作废、续期、释放只删自己的锁）、导入替换后写入作废、各写接口的成功与失败（含 CSRF 标记缺失 403、未导入 409、库只读 409）、日快照内容。工作台 `tests` 里覆盖这些函数的用例搬过来，期望值不改。页面表单没有单元测试（工作台对应面板也没有），靠无头浏览器走查：编辑（含“数量大于零时，请填写单价”的报错）、汇率（含越界 400）、出金登记 / 修改 / 删除、资金流登记与作废。
+
+## A-3/A-4：凭据、交易所同步、行情与汇率（方案）
+
+- 等级 R3（凭据存放、外部调用、导入凭据）。回滚版本：A-2 发布的版本；新增的 `connections` 表与密钥文件旧版本不读。
+- **数据源**（全部只读，照工作台 `lib/exchanges.ts`、`okx.ts`、`gate.ts`、`hyperliquid.ts`、`rh-lighter.ts`、`variational*.ts`、`fx.ts`）：Binance、Bybit、OKX、Gate、Aster（最多 10 个 API Pro 钱包账号，可选含现货）、Hyperliquid 与 Lighter RH（只填钱包地址）、Variational（vr-token，经 `python3 -I` 标准库脚本读取，本机没有 python3 时该源报“客户端不可用”）；行情 CoinGecko（VIRTUAL/USDT/USDC，失败退 Coinbase），人民币汇率 Coinbase（失败退 Frankfurter ECB，7 天内）。每次请求 12 s 超时、不重试（下一分钟再读）；失败只标该行“同步失败 · 保留旧值”。签名复用 `src/vendor` 的 Binance、Bybit 传输层，补拷工作台 `server/exchange-transport` 的 OKX、Gate；Aster 签名用本仓库 `src/aster/eip712.ts`，不引入 ethers 运行时依赖。
+- **同步**：`POST /api/asset/sync` 照 `refresh()`：30 s 内重复请求直接返回当前账本；取锁后各源并行，凭据在读取期间被换掉的源不写结果；最后写日快照。页面打开且可见时每 60 s 触发一次（照 `refresh-loop.ts`），另有“同步”按钮；服务端不定时同步（与工作台一致，页面不开就不读外部接口）。
+- **凭据存放**：AES-256-GCM 加密存在 `asset.sqlite` 的 `connections(exchange, encrypted, updated_at)`，附加数据为连接名（如 `binance`、`aster:<账号编号>`）；密钥是数据目录里的 `asset-credential.key`（64 位十六进制，600，服务账户），服务第一次保存连接或导入连接时生成。与工作台相同，密钥与库在同一台机器的同一账户下，防的是库文件单独外泄；接口与日志只给出连接名与密钥尾号，不回显凭据。
+- **连接管理**：`POST /api/asset/connections`（连接 / 更新，先实测读取成功才保存，失败什么都不改）、`/connections/delete`（断开，保留旧值）、`/aster-accounts/add|edit|delete`，规则照工作台 `connect`、`disconnect`、`connectAsterAccount`、`deleteAsterAccount`。
+- **从工作台导入连接**：导入资产账本时，读取子进程（以工作台库属主身份）同时读工作台 `<DATA_DIR>/modules/asset/config.json` 的 `credentialKey` 与该用户的 `connections`，解密后经管道交给写入子进程，以本服务的密钥重新加密写入；预览只列有连接的交易所名。工作台密钥缺失或解密失败时只导入账本、不导入连接，并在结果里写明。重新导入时连接以工作台为准整体替换。
+- 未纳入：Variational 连接诊断（`/api/connections/variational-test`）、持仓与成交（A-5）、交易凭据导出与原表导入（A-6）。

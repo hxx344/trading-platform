@@ -10,7 +10,9 @@ import { LIVE_PAGE, PAGE } from './page.ts';
 import { LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash } from './login-password.ts';
 import type { WebApp } from './web-assets.ts';
 import { ANTHROPIC_RETENTION_DAYS } from './vendor/anthropic-market.mjs';
-import type { AssetReader } from './asset/store.ts';
+import type { AssetStore } from './asset/store.ts';
+import { AssetConflict } from './asset/sync-lock.ts';
+import { AssetInputError, INPUT_INVALID } from './asset/validation.ts';
 
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_LOGIN_BYTES = 4 * 1024;
@@ -28,6 +30,23 @@ const MONITOR_PATHS = new Set(['/api/monitor/state', '/api/monitor/anthropic/quo
 const MONITOR_MAX_DAYS = ANTHROPIC_RETENTION_DAYS;
 const ASSET_READS = { '/api/asset/state': 'state', '/api/asset/ledger': 'ledger', '/api/asset/history': 'history', '/api/asset/daily-changes': 'dailyChanges', '/api/asset/withdrawals': 'withdrawals', '/api/asset/cash-flows': 'cashFlows' } as const;
 const ASSET_PERIOD_ID = /^[0-9A-Za-z-]{1,80}$/;
+const ASSET_WRITES = { '/api/asset/assets/edit': 'edit', '/api/asset/fx': 'fx', '/api/asset/withdrawals/add': 'add', '/api/asset/withdrawals/edit': 'change', '/api/asset/withdrawals/delete': 'delete', '/api/asset/cash-flows': 'cashFlow' } as const;
+/** The workbench's database and network failures (modules/asset/lib/api.ts failure at 0014655). */
+const ASSET_UNAVAILABLE = /D1_|SQLITE|decrypt|OperationError|fetch failed|network|aborted|timeout/i;
+/**
+ * A failed asset write as the workbench answers it (lib/api.ts failure), with this service's codes: invalid input 400
+ * with one fixed text, a refusal because of the ledger's state 409, a database error 503 without its SQL or text, an
+ * edit refused by a ledger rule 400 with its message. Stored data that no longer parses is 500 like the reads.
+ */
+function assetWriteError(error: unknown): ContractError {
+  if (error instanceof AssetInputError) return new ContractError(400, 'invalid_input', INPUT_INVALID);
+  if (error instanceof AssetConflict) return new ContractError(409, error.code, error.message);
+  if (error instanceof Error && ((error as NodeJS.ErrnoException).code === 'ERR_SQLITE_ERROR' || ASSET_UNAVAILABLE.test(error.message))) return new ContractError(503, 'asset_unavailable', '服务暂时不可用，已保留上次数据，请稍后重试');
+  if (error instanceof SyntaxError) return new ContractError(500, 'asset_unreadable', '资产账本读取失败：库里有一项数据格式无效，请重新导入');
+  // Only the ledger rules throw plain Errors; anything else (a TypeError) is a defect and stays the generic 500.
+  if (error instanceof Error && error.constructor === Error) return new ContractError(400, 'asset_rejected', error.message.slice(0, 200));
+  return new ContractError(500, 'internal', '执行器内部错误');
+}
 
 const PAGE_HEADERS = {
   'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer',
@@ -83,8 +102,8 @@ export interface ServiceViews {
   logs?(filter: 'all' | 'problems', before: number | null, limit: number): unknown;
   /** The scheduled summary card (summary.ts): the page's interval and a card now; both answer with its status. */
   summary?: { setInterval(minutes: number): unknown; sendNow(): unknown };
-  /** The asset ledger's reads (asset/store.ts); absent when the service runs without asset. */
-  asset?: Omit<AssetReader, 'close'>;
+  /** The asset ledger's reads and writes (asset/store.ts); absent when the service runs without asset. */
+  asset?: Omit<AssetStore, 'close'>;
 }
 
 /** accessToken is exchanged once per browser at /login; session is the cookie value and the executor session id. */
@@ -283,6 +302,21 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       const view = Object.hasOwn(ASSET_READS, url.pathname) ? ASSET_READS[url.pathname as keyof typeof ASSET_READS] : null;
       if (!view) return send(response, 404, { code: 'not_found', message: '不存在' });
       return send(response, 200, await read<unknown>(() => asset[view]()));
+    }
+    if (request.method === 'POST' && Object.hasOwn(ASSET_WRITES, url.pathname)) {
+      const asset = views?.asset;
+      if (!asset) return send(response, 404, { code: 'not_found', message: '本服务没有配置资产账本' });
+      const body = await readJson(request);
+      try {
+        switch (ASSET_WRITES[url.pathname as keyof typeof ASSET_WRITES]) {
+          case 'edit': return send(response, 200, await asset.editAsset(body));
+          case 'fx': return send(response, 200, await asset.editFx(body));
+          case 'add': return send(response, 200, await asset.saveWithdrawal(body, false));
+          case 'change': return send(response, 200, await asset.saveWithdrawal(body, true));
+          case 'delete': return send(response, 200, await asset.deleteWithdrawal(body));
+          case 'cashFlow': return send(response, 200, await asset.saveCashFlow(body));
+        }
+      } catch (error) { throw assetWriteError(error); }
     }
     if (url.pathname.startsWith('/api/options/')) {
       if (!views?.options) return send(response, 404, { code: 'not_found', message: '本服务没有配置期权模块' });

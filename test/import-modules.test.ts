@@ -1,0 +1,299 @@
+// The monitor and asset parts of the workbench import (src/service/import-modules.ts, docs/module-import.md): the plan of
+// each, reading the workbench ledger and its users, the writer run as the data directory's owner, the page request body,
+// the import helper's order (ledger first, no restart when only the ledger changes, the ledger kept when the config is
+// put back) and the command line.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { ASSET_DB_FILE } from '../src/asset/db.ts';
+import { ledgerOwner, planAsset, planMonitor, readLastImport, readWorkbenchAsset, readWorkbenchLedger, writeLedgerAsService, type AssetSource } from '../src/service/import-modules.ts';
+import { fileText, filesUnchanged, planImport, previewImport } from '../src/service/import-workbench.ts';
+import { parseImportBody, parseImportRequest, readImportResult, submitImportRequest } from '../src/service/import-channel.ts';
+import { runImportHelper } from '../src/service/import-helper.ts';
+import { CIPHERTEXT, KEY_TAIL, OTHER_OWNER, OWNER, WALLET, writeWorkbenchLedger } from './asset-fixture.ts';
+
+const NOW = Date.parse('2026-11-10T04:00:00Z');
+
+function workspace() {
+  const root = mkdtempSync(join(tmpdir(), 'tp-modules-import-'));
+  const wb = join(root, 'wb'), svc = join(root, 'svc'), assetDir = join(wb, 'modules', 'asset');
+  for (const path of [assetDir, svc]) mkdirSync(path, { recursive: true });
+  const ledger = join(assetDir, 'ledger.sqlite');
+  writeWorkbenchLedger(ledger, { now: NOW });
+  return { root, wb, svc, ledger, target: join(svc, ASSET_DB_FILE), done: () => rmSync(root, { recursive: true, force: true }) };
+}
+const importInfo = (file: string): { owner: string; assets: number } => {
+  const db = new DatabaseSync(file, { readOnly: true });
+  try { return JSON.parse((db.prepare("SELECT value FROM settings WHERE key = 'import-info'").get() as { value: string }).value) as { owner: string; assets: number }; }
+  finally { db.close(); }
+};
+const noLedgerContent = (text: string): void => {
+  for (const secret of [CIPHERTEXT, WALLET, KEY_TAIL, '冷钱包']) assert.ok(!text.includes(secret), `输出含 ${secret.slice(0, 8)}…`);
+};
+const fits = (): void => undefined;
+
+test('行情监控导入：没有 monitor 时写默认股数，已有时原样保留', () => {
+  const config: Record<string, unknown> = { secretsFile: '/x/secrets.json', pairs: [] }, notes: string[] = [];
+  const item = planMonitor({ workbench: true }, config, fits, notes);
+  assert.deepEqual([item.status, item.enabled, item.shares], ['added', false, { outstanding: 12.7, diluted: 16.7 }]);
+  assert.deepEqual(config.monitor, { anthropic: {} });
+  assert.match(notes.join(), /股数设置只存在浏览器里/);
+  assert.match(notes.join(), /本地行情记录不导入/);
+  const tuned = { secretsFile: '/x/secrets.json', monitor: { anthropic: { shares: { outstanding: 13, diluted: 17 } } } };
+  const kept = planMonitor({ workbench: false }, tuned, fits, []);
+  assert.deepEqual([kept.status, kept.enabled, kept.shares], ['skipped', true, { outstanding: 13, diluted: 17 }]);
+  assert.match(kept.detail, /已启用.*保留现有设置/);
+  assert.deepEqual(tuned.monitor, { anthropic: { shares: { outstanding: 13, diluted: 17 } } });
+  const refused = planMonitor({ workbench: false }, { pairs: [] }, () => { throw new Error('检查失败'); }, []);
+  assert.deepEqual([refused.status, refused.detail], ['skipped', '加入后本服务不接受（检查失败）']);
+});
+
+test('资产账本读取：列出有账本的用户与条数，逐个按导入规则校验；读不了时逐项说明原因', () => {
+  const w = workspace();
+  try {
+    const source = readWorkbenchLedger(w.wb);
+    assert.equal(source.problem, null);
+    assert.deepEqual(source.owners.map(item => [item.owner, item.importable, item.assets, item.snapshots]), [[OWNER, true, 6, 10], [OTHER_OWNER, true, 1, 1]]);
+    assert.match(source.owners[0]!.detail, /资产 6 条、快照 10 条，最近的日快照 \d{4}-\d{2}-\d{2}/);
+    assert.equal(source.more, 0);
+    noLedgerContent(JSON.stringify(source.owners));
+    // One user asked for: only that user's rows.
+    const one = readWorkbenchLedger(w.wb, { owner: OTHER_OWNER });
+    assert.deepEqual([...one.rows.keys()], [OTHER_OWNER]);
+
+    // A broken row of one user: that user cannot come over, the reason names the row only.
+    const db = new DatabaseSync(w.ledger);
+    db.prepare("UPDATE assets SET data = '{oops' WHERE owner = ? AND id = 'row-2'").run(OWNER);
+    db.prepare("INSERT INTO settings VALUES ('bad name', 'source-ledger', (SELECT value FROM settings WHERE owner = ? AND key = 'source-ledger'))").run(OTHER_OWNER);
+    db.close();
+    const spoilt = readWorkbenchLedger(w.wb);
+    const byName = new Map(spoilt.owners.map(item => [item.owner, item]));
+    assert.deepEqual([byName.get(OWNER)?.importable, byName.get(OWNER)?.detail], [false, '资产 row-2 不是有效的 JSON']);
+    assert.equal(byName.get(OTHER_OWNER)?.importable, true);
+    assert.equal(byName.get('bad name')?.importable, false);
+    assert.match(byName.get('bad name')!.detail, /用户名含页面不支持的字符/);
+
+    assert.match(readWorkbenchLedger(join(w.root, 'nowhere')).problem ?? '', /没有找到工作台的资产账本/);
+    const dirLedger = join(w.root, 'dir-ledger');
+    mkdirSync(join(dirLedger, 'modules', 'asset', 'ledger.sqlite'), { recursive: true });
+    assert.match(readWorkbenchLedger(dirLedger).problem ?? '', /不是普通文件/);
+    const empty = join(w.root, 'empty');
+    mkdirSync(join(empty, 'modules', 'asset'), { recursive: true });
+    new DatabaseSync(join(empty, 'modules', 'asset', 'ledger.sqlite')).close();
+    assert.match(readWorkbenchLedger(empty).problem ?? '', /不是工作台的资产库（缺少 assets 表）/);
+    const nobody = join(w.root, 'nobody');
+    mkdirSync(join(nobody, 'modules', 'asset'), { recursive: true });
+    const blank = new DatabaseSync(join(nobody, 'modules', 'asset', 'ledger.sqlite'));
+    blank.exec('CREATE TABLE assets (owner TEXT, id TEXT, data TEXT); CREATE TABLE settings (owner TEXT, key TEXT, value TEXT); CREATE TABLE snapshots (owner TEXT, date TEXT, data TEXT);');
+    blank.close();
+    assert.match(readWorkbenchLedger(nobody).problem ?? '', /没有任何用户的账本/);
+    assert.throws(() => readWorkbenchLedger('relative'), /绝对路径/);
+  } finally { w.done(); }
+});
+
+test('资产账本计划：多个用户须选一个；选中后启用 asset 并交出要写的行；已启用时保留配置、整体替换', () => {
+  const w = workspace();
+  try {
+    const source: AssetSource = readWorkbenchAsset(w.wb, w.svc);
+    assert.deepEqual([source.last, source.lastProblem], [null, null]);
+    const config: Record<string, unknown> = { secretsFile: '/x/secrets.json', pairs: [] };
+    const unnamed = planAsset(source, config, fits, undefined, []);
+    assert.deepEqual([unnamed.item.status, unnamed.write], ['skipped', null]);
+    assert.match(unnamed.item.detail, /有 2 个用户，导入时须选择其中一个/);
+    assert.equal(config.asset, undefined);
+    assert.match(planAsset(source, config, fits, 'carol', []).item.detail, /没有用户 carol 的账本/);
+
+    const chosen = planAsset(source, config, fits, OTHER_OWNER, []);
+    assert.deepEqual([chosen.item.status, chosen.item.owner, chosen.write?.owner, chosen.write?.file], ['added', OTHER_OWNER, OTHER_OWNER, 'ledger.sqlite']);
+    assert.deepEqual(config.asset, {});
+    noLedgerContent(JSON.stringify(chosen.item));
+    assert.ok(!('rows' in chosen.item), '计划结果不带账本行');
+
+    const again = planAsset(source, config, fits, OWNER, []);
+    assert.equal(again.item.status, 'added');
+    assert.match(again.item.detail, /已启用资产账本，整体替换已有账本/);
+
+    // A ledger of one user needs no choice.
+    const single: AssetSource = { ...source, owners: source.owners.slice(0, 1), rows: new Map([[OWNER, source.rows.get(OWNER)!]]) };
+    assert.equal(planAsset(single, { pairs: [] }, fits, undefined, []).write?.owner, OWNER);
+    assert.equal(planAsset({ ...source, problem: '读不了' }, { pairs: [] }, fits, OWNER, []).item.detail, '读不了');
+
+    // A single user whose name has control characters: the reason, not "no such user".
+    const weird = 'ali\x07ce';
+    const odd: AssetSource = { ...source, owners: [ledgerOwner(weird, source.rows.get(OWNER)!)], rows: new Map([[weird, source.rows.get(OWNER)!]]), more: 0 };
+    const picked = planAsset(odd, { pairs: [] }, fits, undefined, []);
+    assert.deepEqual([picked.item.status, picked.write], ['skipped', null]);
+    assert.match(picked.item.detail, /页面不支持的字符/);
+  } finally { w.done(); }
+});
+
+test('资产账本写入：以数据目录属主的子进程整体替换 asset.sqlite；校验不过时已有账本不变；上次导入记录可读', () => {
+  const w = workspace();
+  try {
+    const source = readWorkbenchAsset(w.wb, w.svc);
+    const plan = planAsset(source, { pairs: [] }, fits, OWNER, []);
+    const last = writeLedgerAsService(w.svc, plan.write!);
+    assert.deepEqual([last.owner, last.assets, last.snapshots], [OWNER, 6, 10]);
+    assert.deepEqual([importInfo(w.target).owner, importInfo(w.target).assets], [OWNER, 6]);
+    const raw = readFileSync(w.target).toString('latin1');
+    for (const secret of [CIPHERTEXT, WALLET, KEY_TAIL]) assert.ok(!raw.includes(secret), '库里没有凭据与账户标识');
+    assert.deepEqual(readLastImport(w.svc).last && [readLastImport(w.svc).last!.owner, readLastImport(w.svc).last!.assets], [OWNER, 6]);
+    assert.equal(readWorkbenchAsset(w.wb, w.svc).last?.owner, OWNER);
+
+    // Rows the writer's own check refuses: nothing is replaced.
+    const spoilt = { ...plan.write!, rows: { ...plan.write!.rows, settings: [...plan.write!.rows.settings, { key: 'sync-state', value: '{}' }] } };
+    assert.throws(() => writeLedgerAsService(w.svc, spoilt), /^Error: 写入资产账本失败，已有账本未改动：工作台账本的设置不在导入范围内/);
+    assert.equal(importInfo(w.target).owner, OWNER);
+    assert.throws(() => writeLedgerAsService(w.svc, { ...plan.write!, rows: { ...plan.write!.rows, assets: [{ id: 'x', data: '{}' }] } }), /资产 x 格式无效/);
+    assert.equal(importInfo(w.target).assets, 6);
+  } finally { w.done(); }
+});
+
+test('页面请求：monitor、asset 只能是 true，asset 须带合规的用户名；只勾这两项也可以；预览不能带', () => {
+  assert.deepEqual(parseImportBody({ action: 'import', monitor: true }), { action: 'import', pairs: [], monitor: true });
+  assert.deepEqual(parseImportBody({ action: 'import', asset: true, assetOwner: 'alice.w@x-1' }), { action: 'import', pairs: [], asset: true, assetOwner: 'alice.w@x-1' });
+  assert.deepEqual(parseImportBody({ action: 'import', pairs: ['p1'], monitor: true, asset: true, assetOwner: 'a' }), { action: 'import', pairs: ['p1'], monitor: true, asset: true, assetOwner: 'a' });
+  assert.throws(() => parseImportBody({ action: 'import', monitor: false }), /monitor 只能是 true/);
+  assert.throws(() => parseImportBody({ action: 'import', asset: 'yes', assetOwner: 'a' }), /asset 只能是 true/);
+  assert.throws(() => parseImportBody({ action: 'import', asset: true }), /须选择一个工作台用户/);
+  for (const owner of ['', '.alice', 'a b', 'a/b', '../x', 'a'.repeat(65), 7, null]) assert.throws(() => parseImportBody({ action: 'import', asset: true, assetOwner: owner }), /须选择一个工作台用户/, String(owner));
+  assert.ok(parseImportBody({ action: 'import', asset: true, assetOwner: 'a'.repeat(64) }).assetOwner);
+  assert.throws(() => parseImportBody({ action: 'import', assetOwner: 'alice' }), /assetOwner 须和 asset 一起使用/);
+  for (const extra of [{ monitor: true }, { asset: true }, { assetOwner: 'alice' }]) assert.throws(() => parseImportBody({ action: 'preview', ...extra }), /预览不选配对/);
+  assert.throws(() => parseImportBody({ action: 'import', path: '/etc/shadow', asset: true, assetOwner: 'a' }), /path/);
+  // The earlier messages stay as they were.
+  assert.throws(() => parseImportBody({ action: 'import' }), /请选择 1–20 个配对，或勾选导入原油执行账户/);
+  const request = parseImportRequest({ id: '00000000-0000-4000-8000-000000000000', action: 'import', at: 1, monitor: true, asset: true, assetOwner: 'bob' });
+  assert.deepEqual([request.monitor, request.asset, request.assetOwner], [true, true, 'bob']);
+});
+
+test('planImport：只启用行情监控与资产账本时不要配对；配置只有模块时重新导入账本不算改动', () => {
+  const w = workspace();
+  try {
+    const asset = readWorkbenchAsset(w.wb, w.svc);
+    const plan = planImport({ pairs: [], accounts: [], env: {} }, null, { secretsFile: '/x/secrets.json', only: [], monitor: { workbench: false }, asset, assetOwner: OWNER });
+    assert.deepEqual([plan.monitor?.status, plan.asset?.status, plan.ledger?.owner], ['added', 'added', OWNER]);
+    assert.deepEqual([plan.config.monitor, plan.config.asset, plan.config.pairs], [{ anthropic: {} }, {}, []]);
+    assert.equal(filesUnchanged(plan, null), false);
+    const existing = { config: { secretsFile: '/x/secrets.json', asset: {} }, secrets: { accounts: {} } };
+    const again = planImport({ pairs: [], accounts: [], env: {} }, existing, { secretsFile: '/x/secrets.json', only: [], asset, assetOwner: OTHER_OWNER });
+    assert.deepEqual([again.asset?.status, again.ledger?.owner], ['added', OTHER_OWNER]);
+    assert.ok(filesUnchanged(again, existing), '只重新导入账本，配置不变');
+    const preview = previewImport({ pairs: [], accounts: [], env: {} }, existing, { secretsFile: '/x/secrets.json', monitor: { workbench: true }, asset });
+    assert.deepEqual([preview.monitor?.status, preview.asset?.enabled, preview.asset?.owners.length], ['added', true, 2]);
+    assert.equal(previewImport({ pairs: [], accounts: [], env: {} }, existing, { secretsFile: '/x/secrets.json' }).asset, undefined);
+  } finally { w.done(); }
+});
+
+test('导入助手：预览列出行情监控与资产账本；先写账本再写配置；只重导账本不重启；账本失败什么都不改；配置恢复时账本保留', async () => {
+  const w = workspace();
+  try {
+    const conf = join(w.root, 'conf'), dir = join(w.root, 'import');
+    for (const path of [conf, dir]) mkdirSync(path, { recursive: true });
+    writeFileSync(join(w.root, 'workbench.env'), `DATA_DIR=${w.wb}\n`);
+    mkdirSync(join(w.root, 'proc'));
+    const configFile = join(conf, 'config.json'), secretsFile = join(conf, 'secrets.json');
+    const first = fileText({ secretsFile, pairs: [] });
+    writeFileSync(secretsFile, fileText({ accounts: {} }), { mode: 0o600 });
+    writeFileSync(configFile, first, { mode: 0o600 });
+    const restarts: string[] = [];
+    let check: () => string = () => 'ok';
+    const base = { dir, configFile, dataDir: w.svc, workbenchEnv: join(w.root, 'workbench.env'), log: () => undefined, checkConfig: () => check(), procDir: join(w.root, 'proc'),
+      restart: async () => { restarts.push(readFileSync(configFile, 'utf8')); return true; } };
+    const run = async (body: unknown, options: Partial<Parameters<typeof runImportHelper>[0]> = {}) => {
+      submitImportRequest(dir, body);
+      await runImportHelper({ ...base, ...options });
+      return readImportResult(dir)!;
+    };
+
+    const shown = await run({ action: 'preview' });
+    assert.equal(shown.phase, 'done', shown.message);
+    assert.match(shown.message, /行情监控可以启用；资产账本可以导入（2 个用户）/);
+    assert.deepEqual([shown.monitor?.status, shown.asset?.owners.map(item => item.owner)], ['added', [OWNER, OTHER_OWNER]]);
+    assert.equal(readFileSync(configFile, 'utf8'), first, '预览不写文件');
+    noLedgerContent(readFileSync(join(dir, 'result.json'), 'utf8'));
+
+    // The ledger fails: neither the config nor asset.sqlite changes, no restart.
+    const failed = await run({ action: 'import', monitor: true, asset: true, assetOwner: OWNER }, { writeLedger: () => { throw new Error('写入资产账本失败，已有账本未改动：库被占用'); } });
+    assert.equal(failed.phase, 'failed');
+    assert.match(failed.message, /库被占用；配置未改动，本次没有导入任何内容/);
+    assert.equal(readFileSync(configFile, 'utf8'), first);
+    assert.equal(restarts.length, 0);
+
+    const done = await run({ action: 'import', monitor: true, asset: true, assetOwner: OWNER });
+    assert.equal(done.phase, 'done', done.message);
+    assert.match(done.message, /已导入 行情监控与资产账本（用户 alice），服务已重启/);
+    assert.equal(restarts.length, 1);
+    const config = JSON.parse(readFileSync(configFile, 'utf8')) as Record<string, unknown>;
+    assert.deepEqual([config.monitor, config.asset], [{ anthropic: {} }, {}]);
+    assert.equal(importInfo(w.target).owner, OWNER);
+    assert.equal(done.asset?.status, 'added');
+    noLedgerContent(readFileSync(join(dir, 'result.json'), 'utf8'));
+
+    // The ledger again, another user: written, the config untouched, no restart.
+    const written = readFileSync(configFile, 'utf8');
+    const again = await run({ action: 'import', asset: true, assetOwner: OTHER_OWNER });
+    assert.equal(again.phase, 'done', again.message);
+    assert.match(again.message, /已重新导入资产账本（用户 bob，资产 1 条、快照 1 条）；配置未改动，未重启服务/);
+    assert.equal(readFileSync(configFile, 'utf8'), written);
+    assert.equal(restarts.length, 1);
+    assert.equal(importInfo(w.target).owner, OTHER_OWNER);
+    // Monitor already on: nothing to do.
+    assert.match((await run({ action: 'import', monitor: true })).message, /行情监控不能导入，配置未改动/);
+
+    // The config check fails: the config goes back, the ledger written first stays and the message says so.
+    writeFileSync(configFile, first, { mode: 0o600 });
+    check = () => { throw new Error('配置检查失败'); };
+    const restored = await run({ action: 'import', asset: true, assetOwner: OWNER });
+    assert.equal(restored.phase, 'failed');
+    assert.match(restored.message, /未通过服务检查（配置检查失败），已恢复导入前的配置。资产账本已写入并保留/);
+    assert.equal(readFileSync(configFile, 'utf8'), first);
+    assert.equal(importInfo(w.target).owner, OWNER);
+    assert.equal(restarts.length, 1);
+  } finally { w.done(); }
+});
+
+test('命令行：--monitor --asset 启用行情监控并导入指定用户的账本；多个用户不指定时报错列出、不改文件；参数须成对', () => {
+  const w = workspace();
+  try {
+    const conf = join(w.root, 'conf');
+    mkdirSync(conf);
+    const configFile = join(conf, 'config.json'), secretsFile = join(conf, 'secrets.json');
+    writeFileSync(secretsFile, fileText({ accounts: {} }), { mode: 0o600 });
+    writeFileSync(configFile, fileText({ secretsFile, pairs: [] }), { mode: 0o600 });
+    const cli = (...args: string[]) => spawnSync(process.execPath, ['src/service/import-workbench.ts', '--config', configFile, '--workbench-env', join(w.root, 'none.env'), '--workbench-data', w.wb, ...args], { encoding: 'utf8' });
+
+    const ambiguous = cli('--monitor', '--asset', '--data-dir', w.svc);
+    assert.equal(ambiguous.status, 1);
+    assert.match(ambiguous.stderr, /有多个用户（alice、bob），请用 --asset-owner <用户> 指定，未改动任何文件/);
+    assert.equal(readFileSync(configFile, 'utf8'), fileText({ secretsFile, pairs: [] }));
+
+    const dry = cli('--monitor', '--asset', '--asset-owner', OWNER, '--data-dir', w.svc, '--dry-run');
+    assert.equal(dry.status, 0, dry.stderr);
+    assert.match(dry.stdout, /试运行：未写入任何文件/);
+    assert.throws(() => readFileSync(w.target));
+
+    const ok = cli('--monitor', '--asset', '--asset-owner', OWNER, '--data-dir', w.svc);
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.match(ok.stdout, /工作台资产账本：.*ledger\.sqlite（只读）/);
+    assert.match(ok.stdout, /启用行情监控 Anthropic 价差/);
+    assert.match(ok.stdout, /已写入资产账本 .*asset\.sqlite：用户 alice，资产 6 条、快照 10 条/);
+    assert.match(ok.stdout, /行情监控已写入.*资产账本已启用/);
+    noLedgerContent(ok.stdout);
+    const config = JSON.parse(readFileSync(configFile, 'utf8')) as Record<string, unknown>;
+    assert.deepEqual([config.monitor, config.asset], [{ anthropic: {} }, {}]);
+
+    const again = cli('--asset', '--asset-owner', OTHER_OWNER, '--data-dir', w.svc);
+    assert.equal(again.status, 0, again.stderr);
+    assert.match(again.stdout, /配置未改动（资产账本已启用，只重新导入了账本/);
+    assert.equal(importInfo(w.target).owner, OTHER_OWNER);
+
+    assert.match(cli('--asset-owner', OWNER).stderr, /--asset-owner 须和 --asset 一起使用/);
+    assert.match(cli('--asset', '--asset-owner', '../x', '--data-dir', w.svc).stderr, /--asset-owner 须为工作台资产用户名/);
+    assert.match(cli('--asset').stderr, /--asset 需要 --data-dir/);
+  } finally { w.done(); }
+});

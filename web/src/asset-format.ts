@@ -8,8 +8,8 @@ import type { CashFlowEvidence, CashFlowRecord } from '../../src/asset/cash-flow
 import { MIN_MONTHLY_SPAN_DAYS, formatReturnRate, type MonthlyPerformance } from '../../src/asset/performance-metrics.ts';
 import { isExchangeMode, type TrendPoint } from '../../src/asset/views.ts';
 
-/** The command that fills asset.sqlite; README describes the arguments. */
-export const IMPORT_COMMAND = 'node src/asset/import.ts --from <工作台数据目录>/ledger.sqlite --owner <工作台用户名> --data-dir <本服务数据目录>';
+/** The command that fills asset.sqlite outside the page's import; README describes the arguments. */
+export const IMPORT_COMMAND = 'node src/asset/import.ts --from <工作台数据目录>/modules/asset/ledger.sqlite --owner <工作台用户名> --data-dir <本服务数据目录>';
 
 export const money = (n: number, d = 2): string => n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
 /** asset-trend.tsx, daily-changes.tsx and withdrawals-panel.tsx format with zh-CN; null is an unknown value. */

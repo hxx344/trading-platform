@@ -9,6 +9,7 @@ import { ContractError, PAIR_ID, exactKeys } from '../contracts.ts';
 import { MAX_PAIRS } from './config.ts';
 import type { ImportItem, OilItem, PreviewItem } from './import-workbench.ts';
 import type { OptionsItem } from './import-options.ts';
+import type { AssetItem, MonitorItem } from './import-modules.ts';
 
 export const REQUEST_FILE = 'request.json';
 export const RESULT_FILE = 'result.json';
@@ -19,9 +20,11 @@ export const REQUEST_STALE_MS = 120_000;
 /** The helper's own limit (TimeoutStartSec=720 in its unit): a result still "running" past it was cut short. */
 export const RUNNING_STALE_MS = 750_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** The workbench asset user names the page and install.sh --asset-owner accept. */
+export const ASSET_OWNER = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$/;
 
 export type ImportAction = 'preview' | 'import';
-export interface ImportRequest { id: string; action: ImportAction; pairs?: string[]; oil?: true; options?: true; at: number }
+export interface ImportRequest { id: string; action: ImportAction; pairs?: string[]; oil?: true; options?: true; monitor?: true; asset?: true; assetOwner?: string; at: number }
 export interface ImportResult {
   /** The request answered; null when the request file itself could not be read. */
   id: string | null;
@@ -41,30 +44,47 @@ export interface ImportResult {
   options?: OptionsItem;
   /** Why the options account could not be read. */
   optionsError?: string;
+  /** The market monitor: previewed, or what the import did with it. */
+  monitor?: MonitorItem;
+  /** The workbench's asset ledger and its users: previewed, or what the import did with it. */
+  asset?: AssetItem;
+  /** Why the asset ledger could not be read. */
+  assetError?: string;
   notes?: string[];
 }
 
-/** What the page may ask for: a preview of every workbench pair, oil and options account, or importing the chosen ones. */
-export function parseImportBody(raw: unknown): { action: ImportAction; pairs?: string[]; oil?: true; options?: true } {
-  const value = exactKeys(raw, ['action'], ['pairs', 'oil', 'options']);
+type ImportBody = { action: ImportAction; pairs?: string[]; oil?: true; options?: true; monitor?: true; asset?: true; assetOwner?: string };
+const OPTIONAL_KEYS = ['pairs', 'oil', 'options', 'monitor', 'asset', 'assetOwner'];
+
+/** What the page may ask for: a preview of everything the workbench has, or importing the chosen parts. */
+export function parseImportBody(raw: unknown): ImportBody {
+  const value = exactKeys(raw, ['action'], OPTIONAL_KEYS);
   if (value.action === 'preview') {
-    if (value.pairs !== undefined || value.oil !== undefined || value.options !== undefined) throw new ContractError(400, 'import_pairs', '预览不选配对');
+    if (OPTIONAL_KEYS.some(key => value[key] !== undefined)) throw new ContractError(400, 'import_pairs', '预览不选配对');
     return { action: 'preview' };
   }
   if (value.action !== 'import') throw new ContractError(400, 'import_action', '导入操作无效');
   if (value.oil !== undefined && value.oil !== true) throw new ContractError(400, 'import_oil', 'oil 只能是 true');
   if (value.options !== undefined && value.options !== true) throw new ContractError(400, 'import_options', 'options 只能是 true');
-  const oil = value.oil === true, options = value.options === true, module = oil || options;
-  // The oil or options account may come over on its own; then no pair is chosen.
+  if (value.monitor !== undefined && value.monitor !== true) throw new ContractError(400, 'import_monitor', 'monitor 只能是 true');
+  if (value.asset !== undefined && value.asset !== true) throw new ContractError(400, 'import_asset', 'asset 只能是 true');
+  const asset = value.asset === true;
+  if (!asset && value.assetOwner !== undefined) throw new ContractError(400, 'import_asset', 'assetOwner 须和 asset 一起使用');
+  if (asset && (typeof value.assetOwner !== 'string' || !ASSET_OWNER.test(value.assetOwner))) throw new ContractError(400, 'import_asset', '导入资产账本须选择一个工作台用户（1–64 个字符，字母、数字或 . _ @ -，以字母或数字开头）');
+  const oil = value.oil === true, options = value.options === true, monitor = value.monitor === true, module = oil || options || monitor || asset;
+  // A module may come over on its own; then no pair is chosen.
   const pairs = value.pairs ?? (module ? [] : undefined);
-  if (!Array.isArray(pairs) || pairs.length < (module ? 0 : 1) || pairs.length > MAX_PAIRS) throw new ContractError(400, 'import_pairs', module ? `配对至多 ${MAX_PAIRS} 个` : `请选择 1–${MAX_PAIRS} 个配对，或勾选导入原油执行账户 / 期权账户`);
+  if (!Array.isArray(pairs) || pairs.length < (module ? 0 : 1) || pairs.length > MAX_PAIRS) throw new ContractError(400, 'import_pairs', module ? `配对至多 ${MAX_PAIRS} 个` : `请选择 1–${MAX_PAIRS} 个配对，或勾选导入原油执行账户 / 期权账户 / 行情监控 / 资产账本`);
   if (!pairs.every(id => typeof id === 'string' && PAIR_ID.test(id))) throw new ContractError(400, 'import_pairs', '配对 id 无效');
   if (new Set(pairs).size !== pairs.length) throw new ContractError(400, 'import_pairs', '配对重复');
-  return { action: 'import', pairs: pairs as string[], ...(oil ? { oil: true as const } : {}), ...(options ? { options: true as const } : {}) };
+  return {
+    action: 'import', pairs: pairs as string[], ...(oil ? { oil: true as const } : {}), ...(options ? { options: true as const } : {}),
+    ...(monitor ? { monitor: true as const } : {}), ...(asset ? { asset: true as const, assetOwner: value.assetOwner as string } : {}),
+  };
 }
 
 export function parseImportRequest(raw: unknown): ImportRequest {
-  const value = exactKeys(raw, ['id', 'action', 'at'], ['pairs', 'oil', 'options']);
+  const value = exactKeys(raw, ['id', 'action', 'at'], OPTIONAL_KEYS);
   if (typeof value.id !== 'string' || !UUID.test(value.id)) throw new Error('请求编号无效');
   if (typeof value.at !== 'number' || !Number.isSafeInteger(value.at)) throw new Error('请求时间无效');
   const { id: _id, at: _at, ...rest } = value;

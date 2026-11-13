@@ -161,6 +161,27 @@ check '--options 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && gr
 cp "$TP_CONF_DIR/config.json" "$tmp/config.before"
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --options && status=0 || status=$?
 check '--options 在工作台没有期权密钥时跳过且不改配置' '[[ $status -eq 0 ]] && grep -q "跳过期权账户：工作台期权模块没有配置 Bybit 密钥" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json"'
+run --package "$tmp/a" --monitor && status=0 || status=$?
+check '--monitor 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -q -- "--monitor 须和 --import-workbench 一起使用" "$tmp/out"'
+run --package "$tmp/a" --asset && status=0 || status=$?
+check '--asset 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -q -- "--asset 须和 --import-workbench 一起使用" "$tmp/out"'
+run --package "$tmp/a" --import-workbench --asset-owner alice && status=0 || status=$?
+check '--asset-owner 须和 --asset 一起用' '[[ $status -ne 0 ]] && grep -q -- "--asset-owner 须和 --asset 一起使用" "$tmp/out"'
+# The workbench's asset ledger with two users (alice and bob); the import copies one of them into the data directory.
+# Enabling the monitor here is safe: only --check-config runs in test mode, which reads no market data.
+mkdir -p "$tmp/wb/data/modules/asset"
+(cd "$root" && node --input-type=module -e '
+  const { writeWorkbenchLedger } = await import("./test/asset-fixture.ts");
+  writeWorkbenchLedger(process.argv[1]);
+' "$tmp/wb/data/modules/asset/ledger.sqlite")
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor --asset && status=0 || status=$?
+check '账本有多个用户时须指定 --asset-owner，不改任何文件' '[[ $status -ne 0 && ! -e "$TP_DATA_DIR/asset.sqlite" ]] && grep -q "有多个用户（alice、bob），请用 --asset-owner <用户> 指定，未改动任何文件" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json"'
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor --asset --asset-owner alice && status=0 || status=$?
+check '--monitor --asset 启用行情监控、导入资产账本并通过配置检查' '[[ $status -eq 0 ]] && grep -q "启用行情监控 Anthropic 价差" "$tmp/out" && grep -q "已写入资产账本 $TP_DATA_DIR/asset.sqlite：用户 alice" "$tmp/out" && grep -q "行情监控 Anthropic 价差（流通股 12.7 十亿" "$tmp/out" && grep -q "资产账本已启用" "$tmp/out"'
+check '导入的资产账本仅服务账户可读写且不含凭据' '[[ "$(stat -c %a "$TP_DATA_DIR/asset.sqlite")" == 600 ]] && ! grep -q "ciphertext-\|tail-k3y9" "$TP_DATA_DIR/asset.sqlite" "$tmp/out"'
+cp "$TP_CONF_DIR/config.json" "$tmp/config.before"
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor --asset --asset-owner bob && status=0 || status=$?
+check '重复导入只替换资产账本、保留配置' '[[ $status -eq 0 ]] && grep -q "已写入资产账本 $TP_DATA_DIR/asset.sqlite：用户 bob" "$tmp/out" && grep -q "配置未改动（资产账本已启用，只重新导入了账本" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json"'
 
 # No current link (data and config left from an earlier install): installs and points current at the release.
 rm "$TP_APP_DIR/current"

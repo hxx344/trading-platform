@@ -377,7 +377,7 @@ test('页面导入：预览逐个列出工作台配对能否导入；导入写�
     assert.equal(existsSync(join(conf, 'secrets.json.import.99999')), false, '残留的临时文件被清理');
     assert.equal(restarts.length, 1);
     assert.deepEqual([readImportResult(dir)!.id, readImportResult(dir)!.phase], ['r-old', 'failed']);
-    assert.match(readImportResult(dir)!.message, /上一次页面导入被中断，已恢复导入前的配置并重启了服务/);
+    assert.match(readImportResult(dir)!.message, /上一次页面导入被中断，已恢复导入前的配置（若勾选了资产账本，账本可能已写入并保留，请在资产页核对）并重启了服务/);
     // Files changed since the import (install.sh, by hand): kept, and the record dropped.
     const edited = fileText({ secretsFile, pairs: [{ id: 'edited-later' }] });
     leave({}); writeFileSync(configFile, edited);

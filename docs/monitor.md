@@ -26,6 +26,7 @@
 - `monitor.anthropic` 可带 `shares: { "outstanding": 12.7, "diluted": 16.7 }`（十亿股）；不写用这两个默认值。校验与工作台一致：`1 ≤ outstanding ≤ diluted ≤ 100`。
 - 配置了 `monitor`（或 `oil`、`asset`）时 `pairs` 可以省略。
 - 不需要任何密钥。
+- 启用方式：在设置页「从工作台导入」里点「读取工作台」，勾选「启用行情监控」后导入（命令行：`sudo bash install.sh --import-workbench --monitor`），写入的就是上面这一段（默认股数），已启用时保留现有设置；方案见 [module-import.md](module-import.md)。手写 `config.json` 后执行 `sudo bash install.sh` 仍可用，作为备选；改股数仍在 `shares` 里改。
 
 **代码**
 

@@ -33,8 +33,12 @@
 
 **从工作台导入历史数据**
 
+推荐在设置页「从工作台导入」里点「读取工作台」，勾选「导入资产账本」并选择工作台用户后导入：一次完成启用 `asset` 与导入账本，不用手改 `config.json`，也不用处理文件权限；命令行为 `sudo bash install.sh --import-workbench --asset [--asset-owner <用户>]`。方案（读取与写入身份、顺序与失败行为）见 [module-import.md](module-import.md)。两种方式都按下面的导入规则执行。
+
+备选：手工运行导入命令（工作台账本在 `<工作台数据目录>/modules/asset/ledger.sqlite`）：
+
 ```
-sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts --from <工作台 ledger.sqlite 的路径> --owner <工作台用户名> --data-dir /var/lib/trading-platform
+sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts --from <工作台数据目录>/modules/asset/ledger.sqlite --owner <工作台用户名> --data-dir /var/lib/trading-platform
 ```
 
 - 以只读方式打开工作台的库，把指定用户的 `assets`、`snapshots` 和页面用到的 `settings` 复制进 `asset.sqlite`，一个事务内整体替换（三张表先清空再写入，别的用户、源库里已删掉的设置都不会残留）。复制的设置按白名单：`source-ledger`（原表数据：起始快照与原表各期次，账本、历史与日变化都以它为基准，**缺了就拒绝导入**）、`initialized`、`fx`、`fx-status`、`withdrawals`、`cash-flow-audit-v1`、`aster-accounts`、各交易所的 `-status`、`last-attempt`。凭据（`connections`）不读也不导入。
@@ -43,7 +47,7 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
 - `--data-dir` 须是绝对路径，按服务同样的规则拒绝工作台数据目录；`--from` 不能是本服务自己的 `asset.sqlite`。
 - 重复执行以最新一次为准；导入时刻、源文件名、用户与条数记在 `settings` 的 `import-info`。成功时输出资产、快照与设置的条数。
 - 服务运行中也可以执行（WAL），页面下次读取就是新数据，不用重启。
-- 需要运行命令的账号（`trading-platform`）能读到工作台的库文件；读不到时由 root 把 `ledger.sqlite`（连同同目录的 `ledger.sqlite-wal`，有的话）复制到该账号能读的位置再导入。
+- 手工运行命令时，需要运行命令的账号（`trading-platform`）能读到工作台的库文件（经设置页或 `install.sh` 导入时由 root 导入器以库的属主身份读取，不受此限）；读不到时由 root 把 `ledger.sqlite`（连同同目录的 `ledger.sqlite-wal`，有的话）复制到该账号能读的位置再导入。
 - 留在快照里的 `positions`（持仓记录）不去掉：其中 `scopes[].generation` 是工作台对凭据密文算的单向摘要（只用来判断凭据是否换过，不能还原凭据），`account` 是工作台给账户起的编号，`accountName` 是页面上显示的账户名，都不是凭据；日变化的持仓影响要用到它们。
 
 **计算口径**

@@ -11,8 +11,11 @@
 | 执行器、划转、ADL 语义 | [docs/executor.md](docs/executor.md) |
 | 原油双腿 | [docs/oil.md](docs/oil.md) |
 | 期权 Greeks | [docs/options.md](docs/options.md) |
+| 新模块的启用与数据迁移、从工作台导入 | [docs/module-import.md](docs/module-import.md) |
 
 新模块的页面和后端一样按文档开发：先在文档里写清范围、对照的工作台页面与回滚版本，再动手；做完把实际做法回填到对应文档。
+
+新增模块的启用与数据迁移一律做进设置页「从工作台导入」面板及其命令行（`install.sh --import-workbench` 的对应参数），不要求用户手改 `config.json`；手写配置与单独的迁移命令只作备选。做法照 [docs/module-import.md](docs/module-import.md)。
 
 ## 检查
 

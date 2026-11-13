@@ -27,6 +27,9 @@ import { balanceWindow, createBalanceSamples, type BalanceSamples } from './bala
 import { readImportResult, submitImportRequest } from './import-channel.ts';
 import { oilLoops, oilViews, prepareOil, registerOilAccounts, strandedOilJobs, type OilRuntime } from './oil.ts';
 import { oilSummary } from './oil-config.ts';
+import { assetSummary } from './asset-config.ts';
+import { ASSET_DB_FILE } from '../asset/db.ts';
+import { createAssetReader } from '../asset/store.ts';
 import { createServiceLog, teeStream, type ServiceLog } from './service-log.ts';
 import { createSummary, type Summary, type SummaryInput } from './summary.ts';
 
@@ -248,12 +251,14 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   let samples: BalanceSamples | null = null, samplesError: string | null = null;
   try { samples = createBalanceSamples({ file: join(dir, 'samples.sqlite') }); }
   catch (error) { samplesError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`余额采样库无法打开，走势图不可用：${samplesError}\n`); }
+  // Opened lazily and read-only by the reader: a missing or not yet imported asset.sqlite answers "not imported".
+  const asset = config.asset ? createAssetReader(join(dir, ASSET_DB_FILE)) : null;
   const enabled = executor.transferPairs().filter(pair => pair.enabled).length;
   const oilText = oil ? `；原油执行账户 ${oil.config.accounts.length} 个` : '';
   try {
     notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}`);
     for (const text of warnings) notifier.notify(`【配置未生效】${text}`);
-  } catch (error) { samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
+  } catch (error) { asset?.close(); samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
 
   return runExecutor({
     executor, store, dir, port, app, session,
@@ -266,6 +271,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
         return window && { pairId, range, ...window, points: [], unavailable: `余额采样库无法打开，走势图不可用：${samplesError ?? '未知原因'}（不影响划转与 ADL）` };
       },
       ...(oil ? { oil: oilViews(oil, executor) } : {}),
+      ...(asset ? { asset } : {}),
       ...(logs ? { logs: (filter: 'all' | 'problems', before: number | null, limit: number) => logs.page({ filter, before, limit }) } : {}),
     },
     ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir) } } : {}),
@@ -309,6 +315,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       notifier.close();
       summary.close();
       samples?.close();
+      asset?.close();
       locks.release();
       releaseOil();
       closeLogs();
@@ -336,7 +343,7 @@ async function main(): Promise<void> {
     // Read and validated offline (keys must derive their signers); nothing is sent anywhere.
     // Only noted, not refused: at boot or with Tailscale logged out the address is missing, and 127.0.0.1 still serves.
     const local = config.host === null || Object.values(networkInterfaces()).flat().some(item => item?.address === config.host);
-    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、') || '尚未导入'}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}，监听 127.0.0.1${config.host ? ` 与 ${urlHost(config.host)}` : ''}，登录密码${password ? '已设置' : '未设置'}，页面 ${app.assets.size} 个文件${oilSummary(config.oil)}\n`);
+    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、') || '尚未导入'}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}，监听 127.0.0.1${config.host ? ` 与 ${urlHost(config.host)}` : ''}，登录密码${password ? '已设置' : '未设置'}，页面 ${app.assets.size} 个文件${oilSummary(config.oil)}${assetSummary(config.asset)}\n`);
     if (!local) process.stdout.write(`注意：${config.host} 现在不在本机网卡上（地址写错，或 Tailscale 尚未连接）；服务会持续重试，在此之前页面只能经 127.0.0.1 打开\n`);
     return;
   }

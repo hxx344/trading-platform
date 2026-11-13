@@ -7,12 +7,13 @@ import {
 import type { ChainRow, GreekName, OptionsMarket, OptionsState, Plan, Preview, PreviewView, StrategyMode, Task, TaskAccepted } from './options-types.ts';
 import { RequestIds } from './request-ids.ts';
 import { useLiveResource } from './use-live-resource.ts';
+import { PerformancePane, type PerformanceChoice } from './OptionsPerformance.tsx';
 
 // The options page follows the workbench Greeks desk (modules/greeks/app/static/index.html and app.js, 2f0593d): the
-// page header, three tabs (执行台, 持仓, 组合执行), the alert strip, then the desk grid — strategy figures, the chain, the
+// page header, four tabs (执行台, 持仓, 组合执行, 收益 in OptionsPerformance.tsx), the alert strip, then the desk grid — strategy figures, the chain, the
 // legs with the expiry payoff, the Greeks of the positions, the execution control and the account health. A trade is
 // planned on the server, checked in the confirmation dialog and started with a request id kept until an answer arrives.
-// The workbench's 收益 and 组合询价 tabs are not part of this service (docs/options.md, G2).
+// The workbench's 组合询价 tab is not part of this service (docs/options.md, G2).
 
 export const OPTIONS_STATE_PATH = '/api/options/state';
 export const OPTIONS_READ_TIMEOUT_MS = 10_000;
@@ -20,9 +21,10 @@ const ACTIVE_MS = 1_000;
 const IDLE_MS = 5_000;
 const MARKET_MS = 10_000;
 const WRITE_TIMEOUT_MS = 30_000;
-export type OptionsTab = 'desk' | 'positions' | 'orders';
+export type OptionsTab = 'desk' | 'positions' | 'orders' | 'performance';
 const TABS: { tab: OptionsTab; href: string; text: string }[] = [
   { tab: 'desk', href: '#/options', text: '执行台' }, { tab: 'positions', href: '#/options/positions', text: '持仓' }, { tab: 'orders', href: '#/options/orders', text: '组合执行' },
+  { tab: 'performance', href: '#/options/performance', text: '收益' },
 ];
 const STOP_CONFIRM = '停止只撤未成交委托，已成交部分保留。确认停止？';
 const UNKNOWN_START = '提交结果未知：请求可能已被受理。不要换方案重下；再点“确认”会用同一请求编号向服务核对。';
@@ -262,6 +264,7 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
   const [preparing, setPreparing] = useState<'open' | 'close' | null>(null);
   const [notice, setNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null);
   const [stops, setStops] = useState<Set<string>>(() => new Set());
+  const [performanceChoice, setPerformanceChoice] = useState<PerformanceChoice>(() => ({ currency: null, expanded: new Set() }));
   const [toggling, setToggling] = useState(false);
   const ids = useRef(new RequestIds());
   const busyRef = useRef(false);
@@ -425,7 +428,7 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
           <div className="subhead log-title">成交与手续费<span>FILLS</span></div>
           {data?.executions.length ? <div className="executions">{data.executions.map(item => <div className="execution-row" key={item.execId}><strong>{item.symbol}</strong><span>{item.side} {item.execQty.toFixed(4)} · {money(item.execPrice)}{item.chainPrice !== null ? ` · 链基准 ${item.chainPrice.toFixed(4)}` : ''} · {utcTime(item.execTime)}</span><span className="exec-fee">-{item.execFee.toFixed(6)} {item.feeCurrency}</span></div>)}</div> : <div className="executions empty">暂无成交记录</div>}
         </section>
-      </div></div> : <div className="tab-pane">
+      </div></div> : tab === 'performance' ? <div className="tab-pane"><PerformancePane onExpired={onExpired} choice={performanceChoice} onChoice={setPerformanceChoice} /></div> : <div className="tab-pane">
         <section className="panel orders-panel" aria-label="组合执行" data-state={state.error ? 'stale' : 'ready'}>
           <div className="panel-h"><h2>组合执行<span className="heading-detail">当前进度与净额</span></h2><span className="source-tag" id="ordersSyncState">{state.error ? '刷新失败' : state.receivedAt ? `已同步 ${utcTime(state.receivedAt).slice(6)}` : '等待同步'}</span></div>
           <div className="orders-toolbar"><span>执行中 {activeTasks.length} 组 · 最近结束 {history.length} 组</span><span>前台每 {busy ? 1 : 5} 秒</span></div>

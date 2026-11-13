@@ -1,6 +1,6 @@
 // The options engine: plans, execution tasks, the order journal, the tracked strategy and reconciliation. Ported from the
 // workbench (modules/greeks/app trade_tasks.py, engine.py, reconciliation.py, commit 160e932) without its demo mode or
-// RFQ (docs/options.md §1); the Friday auto-open and the IOC fallback came in G2a. One lock serializes plans, task runs and
+// RFQ (docs/options.md §1); the Friday auto-open and the IOC fallback came in G2a, the fills ledger and the 收益 samples in G2b. One lock serializes plans, task runs and
 // reconciliation as the workbench's engine lock does; a stop never waits for it. Every change to the state document is
 // written before it is acted on, so a restart finds every order the service could have sent.
 import { ContractError } from '../contracts.ts';
@@ -10,6 +10,7 @@ import { parseExecution, parsePositions, pmMetrics, readAccountHealth, summarize
 import type { OptionsClient, Row } from './client.ts';
 import { QUOTE_STALE_MS, isSunday, type ChainSnapshot, type OptionMarket, type OptionRow, type OptionType } from './market.ts';
 import { followOrder, iocOrder, reconcileOrder, roundToTick, type OrderOutcome, type OrderStatus } from './orders.ts';
+import { amountText, buildPerformance, exact, thinPoints, type PerformanceInput, type Sample } from './performance.ts';
 import type { OptionsStore } from './store.ts';
 import { StrategyError, buildStrategy, maximumLoss, reserveShortMargin, validateStructure, type Estimates, type MarginContext, type Preview, type RiskLeg, type Side, type StrategyMode } from './strategy.ts';
 
@@ -29,6 +30,19 @@ const RETIRE_BUDGET_MS = 120_000;
 const READ_MS = 25_000;
 const EXECUTIONS_KEPT = 100;
 const EPSILON = 1e-9;
+/** 收益 (G2b): one sample a minute per holding (the workbench's default), only on positions read within the last minute. */
+export const PERFORMANCE_SAMPLE_MS = 60_000;
+const POSITIONS_FRESH_MS = 60_000;
+/** A gap longer than three intervals breaks the line. */
+const SAMPLE_GAP_MS = 3 * PERFORMANCE_SAMPLE_MS;
+/** Orders whose recorded fill the ledger lacks, read again per round; each at most every 5 min, within Bybit's 7 days. */
+const BACKFILL_PER_ROUND = 10;
+const BACKFILL_RETRY_MS = 5 * 60_000;
+const BACKFILL_WINDOW_MS = 7 * 86_400_000;
+const GROUP_POINTS = 300;
+const SERIES_POINTS = 1_500;
+/** The closed-position amounts kept with the retirement evidence for the 收益 page (G2b). */
+const EVIDENCE_AMOUNTS = ['totalPnl', 'totalOpenFee', 'totalCloseFee', 'deliveryFee', 'avgEntryPrice'] as const;
 
 export type TaskStatus = 'accepted' | 'running' | 'stopping' | 'recovering' | 'recovery_needed' | 'completed' | 'partial' | 'stopped' | 'failed';
 export const ACTIVE_STATUSES: readonly TaskStatus[] = ['accepted', 'running', 'stopping', 'recovering', 'recovery_needed'];
@@ -150,6 +164,13 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
   let tail: Promise<void> = Promise.resolve();
 
   const save = () => store.save(state);
+  // The fills ledger and the samples (G2b) live in their own tables; v0.14's first start copies in the recent fills.
+  const ledger = new Map(store.executions().map(record => [record.execId, record]));
+  const unarchived = state.executions.filter(record => !ledger.has(record.execId));
+  if (unarchived.length) { store.saveExecutions(unarchived); for (const record of unarchived) ledger.set(record.execId, record); }
+  const samples = store.samples();
+  const backfillAt = new Map<string, number>();
+  let performanceError: string | null = null;
   const autoOpen = settings.autoOpen ?? DEFAULT_AUTO_OPEN;
   const autoOpenEnabled = (): boolean => state.schedule.enabled ?? autoOpen.enabled;
   /** This day's opening time; the window is [start, start + windowSeconds) on a Friday (UTC) and never runs past midnight. */
@@ -359,7 +380,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
         const identity = `${openTime}|${closeTime}`;
         if (seen.has(identity) || !(since <= openTime && openTime <= closeTime && closeTime <= end)) continue;
         seen.add(identity);
-        matched.push({ symbol, side, qty: row.qty, openTime: row.openTime, closeTime: row.closeTime });
+        matched.push({ symbol, side, qty: row.qty, openTime: row.openTime, closeTime: row.closeTime, ...Object.fromEntries(EVIDENCE_AMOUNTS.filter(key => row[key] !== undefined).map(key => [key, row[key]])) });
         total += amount;
       }
       if (total + EPSILON >= required) evidence.set(key, matched);
@@ -796,12 +817,14 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     } catch (error) { log(`开仓前组合保证金基线读取失败：${describe(error)}`); }
   }
 
-  async function loadExecutions(links: readonly string[]): Promise<void> {
+  /** Reads the fills of the given orders into the ledger and the recent list; answers how many reads failed. */
+  async function loadExecutions(links: readonly string[]): Promise<number> {
     const signal = AbortSignal.timeout(READ_MS);
     const groups = await Promise.allSettled([...new Set(links)].map(link => client.executions(link, signal)));
     const records: ExecutionRecord[] = [];
+    let failed = 0;
     for (const group of groups) {
-      if (group.status === 'rejected') { log(`部分期权成交明细读取失败，保留已有记录：${describe(group.reason)}`); continue; }
+      if (group.status === 'rejected') { failed += 1; log(`部分期权成交明细读取失败，保留已有记录：${describe(group.reason)}`); continue; }
       for (const row of group.value) {
         const record = parseExecution(row);
         const owner = Object.hasOwn(state.journal, record.orderLinkId) ? state.journal[record.orderLinkId] : undefined;
@@ -813,13 +836,59 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
         records.push({ ...record, reduceOnly, taskId: task?.id ?? null, openingGroup: task?.openingGroup ?? null, chainPrice, chainPriceDiff });
       }
     }
-    if (!records.length) return;
+    if (!records.length) return failed;
+    const changed = records.filter(record => sortedJson(ledger.get(record.execId)) !== sortedJson(record));
+    if (changed.length) { store.saveExecutions(changed); for (const record of changed) ledger.set(record.execId, record); }
     const merged = new Map(state.executions.map(item => [item.execId, item]));
     for (const record of records) merged.set(record.execId, record);
     const next = [...merged.values()].sort((a, b) => b.execTime - a.execTime).slice(0, EXECUTIONS_KEPT);
-    if (sortedJson(next) === sortedJson(state.executions)) return;
+    if (sortedJson(next) === sortedJson(state.executions)) return failed;
     state.executions = next;
     save();
+    return failed;
+  }
+
+  // ---- 收益 (G2b) ------------------------------------------------------------------------------------------------
+  function performanceInput(at: number): PerformanceInput {
+    const fresh = positions !== null && at - positions.at >= 0 && at - positions.at <= POSITIONS_FRESH_MS ? positions.rows : null;
+    return { groups: state.tasks, executions: [...ledger.values()], journal: state.journal, positions: fresh, samples, sampleSeconds: PERFORMANCE_SAMPLE_MS / 1000 };
+  }
+
+  /**
+   * Every 15 s: reads again the fills of finished orders the ledger lacks (a restart or a recovery ended them without a
+   * read), then records one mark-to-market sample a minute for each valued holding before its expiry. A failed read or
+   * an unvalued holding records nothing; the chart shows the gap.
+   */
+  async function performanceTick(): Promise<void> {
+    if (shutdown) return;
+    const errors: string[] = [];
+    try {
+      const archived = new Map<string, bigint>();
+      for (const record of ledger.values()) archived.set(record.orderLinkId, (archived.get(record.orderLinkId) ?? 0n) + exact(record.execQty));
+      const at = now();
+      const missing = Object.entries(state.journal)
+        .filter(([link, entry]) => entry.terminal && at - entry.createdAt <= BACKFILL_WINDOW_MS && at - (backfillAt.get(link) ?? -Infinity) >= BACKFILL_RETRY_MS && exact(entry.filledQty) > (archived.get(link) ?? 0n))
+        .sort(([, a], [, b]) => b.createdAt - a.createdAt).slice(0, BACKFILL_PER_ROUND).map(([link]) => link);
+      for (const link of missing) backfillAt.set(link, at);
+      if (missing.length && await loadExecutions(missing)) errors.push('部分订单的成交明细补读失败，下次再读');
+    } catch (error) { errors.push(`成交明细补读失败：${describe(error)}`); }
+    try {
+      const at = now();
+      // Status, value and expiry do not depend on the samples, so this build skips them; its cost stays flat as they grow.
+      for (const row of buildPerformance({ ...performanceInput(at), samples: new Map() }).groups) {
+        if (row.status !== 'open' || row.markToMarketPnl === null || row.expiry === null || at >= row.expiry) continue;
+        const history = samples.get(row.id) ?? [];
+        const last = history.at(-1);
+        if (last && at - last.time < PERFORMANCE_SAMPLE_MS) continue;
+        const sample: Sample = { time: at, pnl: amountText(exact(row.markToMarketPnl)) };
+        store.addSample(row.id, sample);
+        history.push(sample);
+        samples.set(row.id, history);
+      }
+    } catch (error) { errors.push(`持仓盈亏采样失败，保留已有采样：${describe(error)}`); }
+    const message = errors.length ? errors.join('；') : null;
+    if (message && message !== performanceError) log(`期权收益：${message}`);
+    performanceError = message;
   }
 
   // ---- reconciliation --------------------------------------------------------------------------------------------
@@ -942,6 +1011,21 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     };
   }
 
-  return { createPlan, startTask, stopTask, reconcileOnce, refreshHealth, autoOpenTick, setAutoOpen, close, marketView, previewView, stateView, state: () => state };
+  /** The 收益 page: every opening with its amounts, samples and fills, and the per-currency curve of those held to expiry. */
+  function performanceView() {
+    const at = now();
+    const report = buildPerformance(performanceInput(at));
+    let firstAt: number | null = null;
+    for (const record of ledger.values()) if (firstAt === null || record.execTime < firstAt) firstAt = record.execTime;
+    return {
+      account: `***${uid.slice(-4)}`, sampleSeconds: PERFORMANCE_SAMPLE_MS / 1000, unassignedCloses: report.unassignedCloses,
+      groups: report.groups.map(group => ({ ...group, samples: thinPoints(group.samples, GROUP_POINTS, SAMPLE_GAP_MS, point => point.pnl) })),
+      series: report.series.map(series => ({ ...series, points: thinPoints(series.points, SERIES_POINTS, SAMPLE_GAP_MS, point => point.cumulative) })),
+      ledger: { count: ledger.size, firstAt },
+      positionsAt: positions?.at ?? null, error: performanceError,
+    };
+  }
+
+  return { createPlan, startTask, stopTask, reconcileOnce, refreshHealth, autoOpenTick, setAutoOpen, performanceTick, close, marketView, previewView, stateView, performanceView, state: () => state };
 }
 export type OptionsEngine = ReturnType<typeof createOptionsEngine>;

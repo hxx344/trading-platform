@@ -19,6 +19,7 @@ export const OPTIONS_DATABASE = 'options.sqlite';
 const PREFLIGHT_MS = 30_000;
 const RECONCILE_MS = 15_000;
 const HEALTH_MS = 15_000;
+const PERFORMANCE_TICK_MS = 15_000;
 /** The shortest gap between two rounds, so a round that took its whole timeout does not start the next at once. */
 const MIN_GAP_MS = 500;
 /** How long a stopping service waits between looks at shutdown; the pause is woken by the stop itself. */
@@ -106,6 +107,7 @@ export function optionsViews(engine: OptionsEngine) {
     market: (expiry: string | null) => engine.marketView(expiry !== null && /^\d{13}$/.test(expiry) ? Number(expiry) : null),
     preview: (qty: string | null, strategy: string | null) => engine.previewView(quantity(qty ?? undefined) ?? null, mode(strategy ?? undefined) ?? null),
     state: () => engine.stateView(),
+    performance: () => engine.performanceView(),
     plan: async (body: unknown) => {
       const value = exactKeys(body, ['operation'], ['quantity', 'mode']);
       if (value.operation !== 'open' && value.operation !== 'close') reject('invalid_value', 'operation 须为 open 或 close');
@@ -132,7 +134,7 @@ export function optionsViews(engine: OptionsEngine) {
 export type OptionsViews = ReturnType<typeof optionsViews>;
 
 /**
- * The chain every 10 s, reconciliation every 15 s, account health every 15 s and the Friday scheduler every 5 s; each round's reads carry their own
+ * The chain every 10 s, reconciliation every 15 s, account health every 15 s, the Friday scheduler every 5 s and the 收益 ledger and samples every 15 s; each round's reads carry their own
  * timeout and a failure only marks the view. On stop, running tasks are stopped and their orders cancelled and read back.
  */
 export function optionsLoops(runtime: OptionsRuntime, engine: OptionsEngine, context: { stopped(): boolean; pause(ms: number): Promise<void> }, log: (line: string) => void): Promise<void>[] {
@@ -149,6 +151,7 @@ export function optionsLoops(runtime: OptionsRuntime, engine: OptionsEngine, con
     every(RECONCILE_MS, '对账', engine.reconcileOnce),
     every(HEALTH_MS, '账户健康度读取', engine.refreshHealth),
     every(SCHEDULE_TICK_MS, '定时开仓', engine.autoOpenTick),
+    every(PERFORMANCE_TICK_MS, '收益采样', engine.performanceTick),
     (async () => {
       while (!context.stopped()) await context.pause(IDLE_MS);
       await engine.close();

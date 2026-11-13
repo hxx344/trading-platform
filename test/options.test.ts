@@ -16,7 +16,7 @@ import { parseServiceConfig, parseServiceSecrets } from '../src/service/config.t
 import { optionsSummary, parseOptionsConfig } from '../src/service/options-config.ts';
 import { optionsViews, preflightOptions } from '../src/service/options.ts';
 import { bindAccounts, createHarness } from './harness.ts';
-import { FRIDAY, FakeOptions, UID, symbolOf, type FillMode } from './options-fake.ts';
+import { EXPIRY, FRIDAY, FakeOptions, UID, symbolOf, type FillMode } from './options-fake.ts';
 
 const CREDENTIALS = { apiKey: 'options-test-key', apiSecret: 'options-test-secret' };
 const TERMINAL: TaskStatus[] = ['completed', 'partial', 'stopped', 'failed'];
@@ -556,6 +556,130 @@ test('期权：持仓消失须有平仓历史且再读仍不在才退役；只�
     assert.equal(state.tasks[started.taskId]!.strategyStatus, 'closed');
     assert.equal(state.tasks[started.taskId]!.closeReason, 'exchange_closed_position_history');
     assert.equal(s.engine.stateView().reconciliation.error, null);
+  } finally { s.dispose(); }
+});
+
+type PerformanceGroupView = { id: string; status: string; sampleCount: number; netPnl: number | null; markToMarketPnl: number | null; eligible: boolean; closureKind: string | null; issues: string[] };
+type PerformanceView = { groups: PerformanceGroupView[]; series: { currency: string; closedCount: number; totalPnl: number; points: unknown[] }[]; ledger: { count: number; firstAt: number | null }; error: string | null };
+const performance = (engine: OptionsEngine) => engine.performanceView() as unknown as PerformanceView;
+
+test('期权收益：持仓每分钟一个采样，持仓数据过期时不采；到期交割证据带金额时纳入综合曲线', async () => {
+  const s = setup();
+  try {
+    const { started } = await open(s);
+    await finished(s, started.taskId);
+    await s.engine.reconcileOnce();
+    await s.engine.performanceTick();
+    await s.engine.performanceTick();
+    let group = performance(s.engine).groups.find(row => row.id === started.taskId)!;
+    assert.equal(group.status, 'open');
+    assert.notEqual(group.markToMarketPnl, null);
+    assert.equal(group.sampleCount, 1);
+    // A minute later without a fresh position read: nothing is sampled, the chart shows the gap.
+    s.hooks.skewMs += 61_000;
+    await s.engine.performanceTick();
+    assert.equal(performance(s.engine).groups.find(row => row.id === started.taskId)!.sampleCount, 1);
+    await s.engine.reconcileOnce();
+    await s.engine.performanceTick();
+    assert.equal(performance(s.engine).groups.find(row => row.id === started.taskId)!.sampleCount, 2);
+    // Delivered at expiry: the venue's closed-position rows carry the amounts, and the retire keeps them.
+    s.hooks.skewMs += EXPIRY - s.now() + 60_000;
+    const acceptedAt = s.engine.state().tasks[started.taskId]!.acceptedAt;
+    for (const position of [...s.fake.positions.values()]) {
+      s.fake.closed.push({ symbol: position.symbol, side: position.side, qty: String(position.size), openTime: String(acceptedAt + 1), closeTime: String(EXPIRY), avgEntryPrice: '100', totalPnl: position.side === 'Sell' ? '3' : '-1', totalOpenFee: '0.5', totalCloseFee: '0', deliveryFee: '0.2' });
+    }
+    s.fake.positions.clear();
+    await s.engine.reconcileOnce();
+    assert.equal(s.engine.state().tasks[started.taskId]!.strategyStatus, 'closed');
+    await s.engine.performanceTick();
+    const view = performance(s.engine);
+    group = view.groups.find(row => row.id === started.taskId)!;
+    assert.deepEqual([group.status, group.closureKind, group.eligible, group.netPnl, group.sampleCount], ['closed', 'expiry', true, 4, 2]);
+    assert.equal(view.series.length, 1);
+    assert.deepEqual([view.series[0]!.currency, view.series[0]!.closedCount, view.series[0]!.totalPnl, view.series[0]!.points.length], ['USDC', 1, 4, 3]);
+  } finally { s.dispose(); }
+});
+
+test('期权收益：成交明细读取失败时按订单补读（5 分钟内不重读）；台账超过 100 条且重启后保留', async () => {
+  const s = setup();
+  try {
+    s.fake.failExecutions = true;
+    const { started } = await open(s);
+    await finished(s, started.taskId);
+    assert.equal(s.engine.state().tasks[started.taskId]!.status, 'completed');
+    assert.equal(performance(s.engine).ledger.count, 0);
+    // One leg was filled in 125 pieces; the venue answers again only after the first backfill try.
+    const link = Object.keys(s.engine.state().journal)[0]!;
+    const piece = s.fake.executions.find(row => row.orderLinkId === link)!;
+    s.fake.executions = s.fake.executions.filter(row => row !== piece);
+    for (let index = 0; index < 125; index += 1) s.fake.executions.push({ ...piece, execId: `split-${index}`, execQty: '0.008', execFee: '0.004' });
+    await s.engine.performanceTick();
+    assert.match(String(performance(s.engine).error), /补读失败/);
+    s.fake.failExecutions = false;
+    await s.engine.performanceTick();
+    assert.equal(performance(s.engine).ledger.count, 0);
+    s.hooks.skewMs += 5 * 60_000;
+    await s.engine.performanceTick();
+    const view = performance(s.engine);
+    assert.equal(view.ledger.count, 128);
+    assert.equal(view.error, null);
+    assert.equal(s.engine.state().executions.length, 100);
+    const before = view.groups.find(row => row.id === started.taskId)!;
+    assert.equal(before.issues.length, 0);
+    // A restart reads the whole ledger from its table, not the capped recent list.
+    await s.engine.close();
+    const reopened = openOptionsStore(join(s.dir, 'options.sqlite'));
+    try {
+      const restarted = s.make(reopened);
+      const after = performance(restarted);
+      assert.equal(after.ledger.count, 128);
+      // Compared as JSON: a -0 price difference comes back from the table as 0.
+      assert.equal(JSON.stringify(after.groups.find(row => row.id === started.taskId)), JSON.stringify(before));
+    } finally { reopened.close(); }
+  } finally { s.dispose(); }
+});
+
+test('期权收益：到期后或平仓成交待确认时不再采样（持仓数据仍新鲜）', async () => {
+  for (const when of ['expiry', 'closing'] as const) {
+    const s = setup();
+    try {
+      const { started } = await open(s);
+      await finished(s, started.taskId);
+      await s.engine.reconcileOnce();
+      await s.engine.performanceTick();
+      s.hooks.skewMs += when === 'expiry' ? EXPIRY - s.now() + 1_000 : 61_000;
+      await s.engine.reconcileOnce();
+      if (when === 'closing') {
+        s.fake.fillMode = 'rest';
+        const plan = await s.engine.createPlan({ operation: 'close' });
+        await s.engine.startTask({ planId: plan.planId, requestId: 'req-close-0001', confirmLive: true });
+      }
+      await s.engine.performanceTick();
+      const group = performance(s.engine).groups.find(row => row.id === started.taskId)!;
+      assert.equal(group.sampleCount, 1, when);
+      if (when === 'closing') assert.equal(group.status, 'pending');
+    } finally { s.dispose(); }
+  }
+});
+
+test('期权收益：v0.13 状态里的成交在首次启动时转入台账', async () => {
+  const s = setup();
+  try {
+    const { started } = await open(s);
+    await finished(s, started.taskId);
+    const saved = s.engine.state();
+    assert.ok(saved.executions.length > 0);
+    await s.engine.close();
+    // A v0.13 database: the state document only, no ledger rows.
+    const old = openOptionsStore(join(s.dir, 'v013.sqlite'));
+    try {
+      old.save(JSON.parse(JSON.stringify(saved)));
+      const upgraded = s.make(old);
+      const view = performance(upgraded);
+      assert.equal(view.ledger.count, saved.executions.length);
+      assert.deepEqual(view.groups.find(row => row.id === started.taskId)!.issues, []);
+      assert.equal(old.executions().length, saved.executions.length);
+    } finally { old.close(); }
   } finally { s.dispose(); }
 });
 

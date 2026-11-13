@@ -2,7 +2,7 @@
 // start bodies, the net limit typed in the confirmation, the expiry payoff curve, the chain rows around the index and the
 // per-task progress and amounts. Rules and wording follow the workbench Greeks page (modules/greeks/app/static/app.js,
 // 2f0593d).
-import type { ChainRow, Execution, OptionsState, OrderRow, Plan, Preview, ScheduleView, StrategyMode, Task, TaskStatus } from './options-types.ts';
+import type { ChainRow, Execution, OptionsState, OrderRow, PerformanceGroup, PerformancePoint, PerformanceSeries, PerformanceView, Plan, Preview, ScheduleView, StrategyMode, Task, TaskStatus } from './options-types.ts';
 
 export const ACTIVE_STATUSES: readonly TaskStatus[] = ['accepted', 'running', 'stopping', 'recovering', 'recovery_needed'];
 export const isActive = (task: Pick<Task, 'status'>): boolean => ACTIVE_STATUSES.includes(task.status);
@@ -147,3 +147,66 @@ export function autoOpenConfirm(settings: OptionsState['settings'], schedule: Sc
     '有未结束的任务、跟踪中的策略或超出上限时，窗口内每 5 秒重试；整个窗口都不满足则本周不开仓，窗口结束后发一次飞书提醒。关闭定时不会停止已受理的定时任务。确定打开定时开仓？',
   ].join('\n');
 }
+
+// ---- 收益 (G2b): wording and selection follow the workbench performance.js (renderPerformance, performanceChart), 0c5a219.
+export const PERFORMANCE_PATH = '/api/options/performance';
+/** "YYYY-MM-DD HH:MM" in UTC, as the workbench's per-group dates. */
+export const utcMinute = (value: number | null | undefined): string => value === null || value === undefined ? '--' : new Date(value).toISOString().slice(0, 16).replace('T', ' ');
+
+/** The settlement currencies on the page; the curve and the list show one at a time. */
+export function performanceCurrencies(view: Pick<PerformanceView, 'series' | 'groups'>): string[] {
+  return [...new Set([...view.series.map(item => item.currency), ...view.groups.map(item => item.currency)])];
+}
+
+/** The curve of one currency, only when every point belongs to an eligible group (as the workbench checks). */
+export function selectedSeries(view: Pick<PerformanceView, 'series' | 'groups'>, currency: string): PerformanceSeries {
+  const eligible = new Set(view.groups.filter(group => group.eligible).map(group => group.id));
+  return view.series.find(item => item.currency === currency && item.points.every(point => eligible.has(point.groupId)))
+    ?? { currency, points: [], totalPnl: 0, closedCount: 0, wins: 0, maxDrawdown: 0, sampleSeconds: 60, sampledCount: 0, unsampledCount: 0 };
+}
+
+export function groupLabel(group: Pick<PerformanceGroup, 'status' | 'closureKind'>): string {
+  if (group.status === 'pending') return '待核对';
+  if (group.status === 'open') return group.closureKind === 'early' ? '提前减仓 · 持仓中' : '持仓中';
+  return group.closureKind === 'expiry' ? '到期结束' : group.closureKind === 'early' ? '提前平仓' : '结束待验证';
+}
+
+export function coverageLine(groups: readonly Pick<PerformanceGroup, 'eligible' | 'closureKind' | 'status'>[], unassignedCloses: number): string {
+  const pending = groups.filter(group => group.status === 'pending').length;
+  return `${groups.length} 次组合开仓 · ${groups.filter(group => group.eligible).length} 组到期纳入 · ${groups.filter(group => group.closureKind === 'early').length} 组提前平仓排除 · ${pending} 组待核对${unassignedCloses ? ` · ${unassignedCloses} 笔平仓尚未可靠归属` : ''}`;
+}
+
+/** The toolbar line: the service's error, else the ledger's reach (the workbench shows its sync cursor instead). */
+export function performanceStatus(view: Pick<PerformanceView, 'error' | 'ledger'> | null, readError: string | null): { text: string; warning: boolean } {
+  if (!view) return { text: readError ? `收益台账读取失败：${readError}` : '正在同步收益台账…', warning: readError !== null };
+  if (readError) return { text: '收益台账同步失败，等待重试；下方为上次快照。', warning: true };
+  if (view.error) return { text: view.error, warning: true };
+  const from = view.ledger.firstAt === null ? '--' : new Date(view.ledger.firstAt).toISOString().slice(0, 10);
+  return { text: `台账起始 ${from} UTC · ${view.ledger.count} 笔成交 · 按订单同步成交与手续费`, warning: false };
+}
+
+export interface PlotRow { time: number; value: number | null; point: PerformancePoint | null }
+/**
+ * The rows the chart draws: a break row (no value) before each point the service marks as after a gap, so the line
+ * stops there instead of bridging hours without samples. Also counts the gaps and the real (non-terminal) samples.
+ */
+export function plotRows<T extends PerformancePoint>(points: readonly T[], value: (point: T) => number): { rows: PlotRow[]; hover: PlotRow[]; gaps: number; sampled: number } {
+  const rows: PlotRow[] = [], hover: PlotRow[] = [];
+  let gaps = 0, sampled = 0;
+  for (const point of points) {
+    if (point.gapBefore && rows.length) { rows.push({ time: point.time, value: null, point: null }); gaps += 1; }
+    const row = { time: point.time, value: value(point), point };
+    rows.push(row); hover.push(row);
+    if (!point.terminal) sampled += 1;
+  }
+  return { rows, hover, gaps, sampled };
+}
+
+/** The points that get a marker, as the workbench chart: every ceil(n / 80)-th, the last and each final result. */
+export function markedRows(rows: readonly PlotRow[]): PlotRow[] {
+  const step = Math.max(1, Math.ceil(rows.length / 80));
+  return rows.filter((row, index) => index % step === 0 || index === rows.length - 1 || row.point?.terminal === true);
+}
+
+/** Axis labels: hours and minutes within a day, else month and day (UTC), as the workbench chart. */
+export const plotTick = (span: number) => (time: number): string => new Date(time).toISOString().slice(span < 86_400_000 ? 11 : 5, span < 86_400_000 ? 16 : 10);

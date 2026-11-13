@@ -1,0 +1,1234 @@
+/* 复制自 project-aggregation 工作台 modules/aster/dashboard/app/globals.css（提交 b2fae14），只保留 ASTER 页面用到的规则，
+   规则内容不改。每条选择器前加 ".aster-desk " 限定范围（类名与 styles.css 同名的不会改到其它页面）；调色板从 :root 移到
+   .aster-desk；body、标题、链接与表格的基础规则只作用在 ASTER 页面内容 .aster-module 里，不影响原油页。
+   末尾一节是 shadcn 表格组件（components/ui/table.tsx）的 Tailwind 类名换算成的普通 CSS。 */
+
+/* :root 调色板与 @theme inline 的字体 */
+.aster-desk {
+  color-scheme: dark;
+  --background: #0a0d11;
+  --foreground: #e6eaf0;
+  --card: #10141a;
+  --surface-muted: #161b22;
+  --secondary: var(--surface-muted);
+  --primary: #38bdf8;
+  --primary-hover: #0ea5e9;
+  --primary-foreground: #0a0d11;
+  --primary-subtle: rgba(56, 189, 248, 0.12);
+  --muted-foreground: #a3adb9;
+  --subtle-foreground: #7a8591;
+  --border: #212831;
+  --input-border: #2e3640;
+  --positive: #2dbe87;
+  --positive-subtle: rgba(45, 190, 135, 0.13);
+  --positive-border: rgba(45, 190, 135, 0.3);
+  --danger: #f2626b;
+  --danger-subtle: rgba(242, 98, 107, 0.13);
+  --danger-border: rgba(242, 98, 107, 0.35);
+  --warning: #f0b03f;
+  --warning-subtle: rgba(240, 176, 63, 0.13);
+  --warning-border: rgba(240, 176, 63, 0.3);
+  --info: #6ea8fe;
+  --chart-blue: var(--info);
+  --radius: 8px;
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  /* CJK fallbacks keep Chinese text inside numeric fields off the system monospace font. */
+  --font-mono: "Cascadia Mono", "JetBrains Mono", "SF Mono", Consolas, "Microsoft YaHei UI", "Microsoft YaHei", monospace;
+}
+
+/* body（外边距由页面外壳负责）与基础元素 */
+.aster-desk {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+.aster-desk button:focus-visible,
+.aster-desk summary:focus-visible,
+.aster-desk a:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 3px;
+}
+.aster-desk [data-slot='button'],
+.aster-desk [data-slot='input'],
+.aster-desk [data-slot='select-trigger'] {
+  min-height: 32px;
+}
+.aster-desk [data-slot='input'],
+.aster-desk [data-slot='select-trigger'] {
+  background: var(--card);
+  border-color: var(--input-border);
+}
+.aster-desk a {
+  color: inherit;
+  text-decoration: none;
+}
+.aster-desk h1 {
+  font-size: 20px;
+  margin: 0;
+  font-weight: 550;
+}
+.aster-module h2 {
+  font-size: 15px;
+  font-weight: 550;
+  margin: 0;
+}
+.aster-module h3 {
+  font-size: 16px;
+  margin: 10px 0 4px;
+}
+.aster-module table {
+  font-size: 12px !important;
+  white-space: nowrap;
+}
+.aster-module th {
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  color: var(--subtle-foreground) !important;
+  height: 32px !important;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+}
+.aster-module td {
+  height: 38px;
+}
+.aster-module th:first-child,
+.aster-module td:first-child {
+  padding-left: 14px;
+}
+.aster-module th:last-child,
+.aster-module td:last-child {
+  padding-right: 14px;
+}
+
+/* 页面规则 */
+.aster-desk .number {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.aster-desk .number {
+  text-align: right;
+}
+.aster-desk .mint {
+  color: var(--positive);
+}
+.aster-desk .danger,
+.aster-desk .connection.danger {
+  color: var(--danger);
+}
+.aster-desk .muted {
+  color: var(--muted-foreground);
+  font-size: 14px;
+  line-height: 1.65;
+}
+.aster-desk .amber,
+.aster-desk .small-note.amber {
+  color: var(--warning);
+}
+.aster-desk .topbar {
+  height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  padding: 0 max(24px, calc((100vw - 1512px) / 2));
+  background: var(--card);
+}
+.aster-desk .brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  letter-spacing: 0.09em;
+  font-weight: 650;
+  font-size: 16px;
+}
+.aster-desk .brand > svg {
+  color: var(--primary);
+}
+.aster-desk .brand small {
+  letter-spacing: 0;
+  font-size: 13px;
+  font-weight: 450;
+  color: var(--muted-foreground);
+}
+.aster-desk .brand-separator {
+  margin: 0 10px;
+  color: var(--border);
+  font-weight: 300;
+}
+.aster-desk .account-controls {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+}
+.aster-desk .connection {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted-foreground);
+}
+.aster-desk .connection i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.aster-desk .workspace {
+  max-width: 1560px;
+  margin: auto;
+  padding: 20px 24px;
+}
+.aster-desk .page-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+  margin-bottom: 16px;
+}
+.aster-desk .panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.aster-desk .section-head {
+  padding: 14px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+}
+.aster-desk .section-head p {
+  font-size: 13px;
+  color: var(--muted-foreground);
+  margin: 7px 0 0;
+}
+.aster-desk .small-note {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  line-height: 1.6;
+}
+.aster-desk .table-scroll {
+  overflow: auto;
+}
+.aster-desk .count {
+  font-size: 12px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--surface-muted);
+  margin-left: 5px;
+}
+.aster-desk .direction {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  margin-top: 6px;
+}
+.aster-desk .position-market {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.aster-desk .pair-account-positions {
+  min-width: 0;
+}
+.aster-desk .pair-account-positions .section-head,
+.aster-desk .pair-account-positions .section-head h2 {
+  flex-wrap: wrap;
+}
+.aster-desk .pair-positions-empty {
+  margin: 0;
+  padding: 0 14px 14px;
+  font-size: 13px;
+  color: var(--muted-foreground);
+}
+.aster-desk .message {
+  padding: 10px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.6;
+  margin-bottom: 14px;
+  background: var(--positive-subtle);
+  border: 1px solid var(--positive-border);
+}
+.aster-desk .message-error {
+  background: var(--danger-subtle);
+  border-color: var(--danger-border);
+  color: var(--danger);
+}
+@media (max-width: 1250px) {
+  .aster-desk .workspace {
+    padding: 20px 24px;
+  }
+  .aster-desk .topbar {
+    padding: 0 24px;
+  }
+  .aster-desk .small-note {
+    max-width: 175px;
+    text-align: right;
+  }
+}
+@media (max-width: 640px) {
+  .aster-desk .topbar {
+    height: 52px;
+    padding: 0 16px;
+  }
+  .aster-desk .brand {
+    font-size: 15px;
+    gap: 9px;
+  }
+  .aster-desk .brand-separator {
+    margin: 0 10px;
+  }
+  .aster-desk .brand small {
+    font-size: 13px;
+  }
+  .aster-desk .workspace {
+    padding: 16px 12px;
+  }
+  .aster-desk .page-heading {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+  }
+  .aster-desk .account-controls {
+    width: 100%;
+  }
+  .aster-desk .section-head {
+    padding: 12px 16px;
+  }
+}
+.aster-desk .message {
+  display: block;
+}
+.aster-desk .focused-desk .workspace {
+  max-width: 1560px;
+  padding-top: 20px;
+}
+.aster-desk .focused-desk .topbar {
+  height: 52px;
+}
+.aster-desk .focused-desk .page-heading {
+  margin-bottom: 14px;
+}
+.aster-desk .focused-desk h1 {
+  font-size: 20px;
+  font-weight: 650;
+}
+.aster-desk .account-run-actions,
+.aster-desk .run-indicator {
+  display: flex;
+  align-items: center;
+}
+.aster-desk .run-indicator {
+  gap: 9px;
+  font-size: 14px;
+  font-weight: 550;
+}
+.aster-desk .run-indicator i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.aster-desk .account-run-actions {
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.aster-desk .workspace-tabs {
+  gap: 16px;
+}
+.aster-desk .workspace-tabs > [data-slot='tabs-content'][hidden] {
+  display: none;
+}
+.aster-desk .workspace-navigation {
+  width: 100%;
+  justify-content: flex-start;
+  gap: 4px !important;
+  height: 40px !important;
+  padding: 0 !important;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.aster-desk .workspace-navigation [data-slot='tabs-trigger'] {
+  flex: none;
+  height: 38px;
+  padding: 0 14px;
+  font-size: 13px;
+  color: var(--muted-foreground);
+  border-radius: 6px 6px 0 0;
+}
+.aster-desk .workspace-navigation [data-slot='tabs-trigger']:hover {
+  background: var(--surface-muted);
+  color: var(--primary);
+}
+.aster-desk .workspace-navigation [data-slot='tabs-trigger']::after {
+  bottom: -1px;
+  background: var(--primary);
+}
+.aster-desk .workspace-navigation [data-active] {
+  color: var(--primary);
+  background: var(--primary-subtle);
+}
+.aster-desk .feature-stack {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 18px;
+}
+.aster-desk .pair-workspace-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.aster-desk .pair-workspace-heading h2 {
+  margin: 0;
+  font-size: 15px;
+}
+.aster-desk .pair-workspace-heading p {
+  margin: 7px 0 0;
+  font-size: 12px;
+}
+.aster-desk .pair-adl-panel p {
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.aster-desk .pair-adl-panel > :not(.section-head) {
+  margin-left: 14px;
+  margin-right: 14px;
+}
+.aster-desk .pair-adl-panel > .pair-adl-notification {
+  margin-bottom: 18px;
+}
+.aster-desk .pair-adl-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  gap: 16px;
+  margin: 16px 0;
+}
+.aster-desk .pair-adl-summary > div {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.aster-desk .pair-adl-incident {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  margin-top: 12px;
+}
+.aster-desk .pair-adl-notification {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+@media (max-width: 640px) {
+  .aster-desk .pair-adl-panel > :not(.section-head) {
+    margin-left: 16px;
+    margin-right: 16px;
+  }
+  .aster-desk .pair-workspace-heading .account-controls {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .aster-desk .pair-workspace-heading button {
+    min-height: 44px;
+  }
+}
+.aster-desk .focused-desk .panel {
+  border-radius: 8px;
+}
+.aster-desk .focused-desk .section-head {
+  padding: 14px 14px;
+}
+.aster-desk .focused-desk .section-head h2 {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.aster-desk .focused-desk .section-head p {
+  margin-top: 6px;
+  font-size: 12px;
+}
+.aster-desk .disclosure > summary {
+  cursor: pointer;
+  padding: 14px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.6;
+  color: var(--foreground);
+}
+.aster-desk .disclosure > summary::marker {
+  color: var(--muted-foreground);
+}
+.aster-desk .disclosure > summary:hover {
+  color: var(--primary);
+}
+.aster-desk .disclosure > summary:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -3px;
+  border-radius: 4px;
+}
+.aster-desk .disclosure[open] > summary {
+  color: var(--primary);
+}
+.aster-desk .disclosure .disclosure > summary {
+  padding-left: 0;
+  padding-right: 0;
+}
+.aster-desk .disclosure > .panel {
+  border: 0;
+  border-radius: 0;
+}
+.aster-desk .execution-live-state {
+  padding: 0 14px 8px;
+}
+.aster-desk .execution-live-state p {
+  margin: 0 0 9px;
+  line-height: 1.65;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.aster-desk .saved-settings dt {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.aster-desk .saved-settings {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px 18px;
+  margin: 0;
+  padding: 0 14px 14px;
+}
+.aster-desk .saved-settings dd {
+  margin: 7px 0 0;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.aster-desk .saved-settings small {
+  display: block;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  margin-top: 3px;
+}
+.aster-desk .settings-lock {
+  padding: 0 14px;
+  margin: 0 0 12px;
+}
+@media (max-width: 640px) {
+  .aster-desk .focused-desk .workspace {
+    padding: 16px 12px;
+  }
+  .aster-desk .focused-desk .page-heading {
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+  .aster-desk .focused-desk h1 {
+    font-size: 18px;
+  }
+  .aster-desk .account-controls {
+    gap: 8px;
+  }
+  .aster-desk .account-controls > [data-slot='select-trigger'] {
+    width: auto;
+  }
+  .aster-desk .account-run-actions {
+    width: 100%;
+  }
+  .aster-desk .account-run-actions > button {
+    min-height: 44px;
+    flex: 1;
+  }
+  .aster-desk .workspace-tabs {
+    gap: 16px;
+  }
+  .aster-desk .workspace-navigation {
+    gap: 4px !important;
+    justify-content: flex-start;
+  }
+  .aster-desk .workspace-navigation {
+    height: 44px !important;
+  }
+  .aster-desk .workspace-navigation [data-slot='tabs-trigger'] {
+    height: 42px;
+    font-size: 13px;
+    padding: 0 12px;
+  }
+  .aster-desk .focused-desk .section-head {
+    padding: 12px 16px;
+    flex-wrap: wrap;
+  }
+  .aster-desk .disclosure > summary {
+    padding: 14px 16px;
+    min-height: 44px;
+  }
+  .aster-desk .execution-live-state {
+    padding: 0 16px 6px;
+  }
+  .aster-desk .saved-settings {
+    padding: 0 16px 20px;
+  }
+  .aster-desk .settings-lock {
+    padding: 0 16px;
+  }
+}
+.aster-desk .workspace,
+.aster-desk .focused-desk .workspace {
+  padding: 14px 20px 20px;
+}
+.aster-desk .page-heading,
+.aster-desk .focused-desk .page-heading {
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.aster-desk .page-title {
+  min-width: 0;
+}
+.aster-desk .page-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.aster-desk .focused-desk h1 {
+  font-size: 17px;
+  font-weight: 650;
+}
+.aster-desk .page-title-row .connection {
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  background: var(--surface-muted);
+}
+.aster-desk .page-title-row .connection.mint {
+  color: var(--positive);
+  background: var(--positive-subtle);
+}
+.aster-desk .page-title-row .connection.danger {
+  background: var(--danger-subtle);
+}
+.aster-desk .page-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--subtle-foreground);
+}
+.aster-desk .page-meta > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.aster-desk .page-heading .account-controls {
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.aster-desk .workspace-tabs {
+  gap: 12px;
+}
+.aster-desk .section-head,
+.aster-desk .focused-desk .section-head {
+  padding: 10px 14px;
+  min-height: 42px;
+}
+.aster-desk .focused-desk .section-head h2 {
+  font-size: 13px;
+  font-weight: 600;
+}
+.aster-desk .section-head [data-slot='button'] {
+  min-height: 28px;
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+.aster-desk .disclosure-hint {
+  margin-left: 8px;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--subtle-foreground);
+}
+.aster-desk .stale-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 3px;
+  border: 1px solid rgba(240, 176, 63, 0.45);
+  border-radius: 3px;
+  color: var(--warning);
+  font-family: var(--font-sans);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 14px;
+  letter-spacing: 0;
+  vertical-align: 2px;
+}
+.aster-desk .stale-row td {
+  color: var(--subtle-foreground);
+}
+.aster-desk .pair-workspace {
+  gap: 12px;
+}
+.aster-desk .pair-workspace-heading > div:first-child {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+.aster-desk .pair-workspace-heading p {
+  margin: 0;
+}
+.aster-desk .pair-workspace-heading .account-controls {
+  gap: 8px;
+}
+.aster-desk .pair-status-panel .section-head {
+  align-items: flex-start;
+}
+.aster-desk .pair-status-panel .section-head p {
+  margin-top: 2px;
+}
+.aster-desk .pair-status-panel .run-indicator {
+  font-size: 13px;
+  font-weight: 600;
+}
+.aster-desk .pair-status-panel .run-indicator.mint i {
+  box-shadow: 0 0 0 3px rgba(45, 190, 135, 0.18);
+}
+.aster-desk .pair-status-panel .account-run-actions {
+  gap: 6px;
+  justify-content: flex-end;
+}
+.aster-desk .pair-status-panel > .execution-live-state {
+  padding: 12px 14px 4px;
+  border-top: 1px solid var(--border);
+}
+.aster-desk .pair-status-panel .execution-live-state p {
+  font-size: 12px;
+}
+.aster-desk .pair-kpis {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) minmax(0, 2fr);
+  border-top: 1px solid var(--border);
+}
+.aster-desk .pair-kpis.margin-only {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.aster-desk .pair-kpi-side {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-width: 0;
+}
+.aster-desk .pair-kpi {
+  min-width: 0;
+  padding: 12px 16px;
+  border-right: 1px solid var(--border);
+}
+.aster-desk .pair-kpis > :last-child > .pair-kpi:last-child {
+  border-right: 0;
+}
+.aster-desk .pair-kpi-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--subtle-foreground);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.aster-desk .pair-kpi-label span {
+  color: var(--subtle-foreground);
+  opacity: 0.8;
+}
+.aster-desk .pair-kpi-value {
+  margin-top: 3px;
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow-wrap: anywhere;
+}
+.aster-desk .pair-kpi-sub {
+  margin-top: 2px;
+  color: var(--subtle-foreground);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.aster-desk .pair-kpi-sub.amber {
+  color: var(--warning);
+}
+.aster-desk .pair-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 380px;
+  gap: 14px;
+  align-items: start;
+}
+.aster-desk .pair-main,
+.aster-desk .pair-aside {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+.aster-desk .pair-layout .panel > .section-head {
+  border-bottom: 1px solid var(--border);
+}
+.aster-desk .pair-positions-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  min-width: 0;
+}
+.aster-desk .pair-positions-title .muted {
+  font-size: 12px;
+  line-height: 1.4;
+}
+.aster-desk .pair-positions-title .count {
+  margin-left: 0;
+  font-size: 11px;
+}
+.aster-desk .pair-positions-notes {
+  padding: 8px 14px 0;
+  font-size: 12px;
+  color: var(--subtle-foreground);
+}
+.aster-desk .pair-positions-notes p {
+  margin: 0 0 6px;
+  overflow-wrap: anywhere;
+}
+.aster-desk .pair-positions-notes p.amber {
+  color: var(--warning);
+}
+.aster-desk .pair-account-positions .pair-positions-empty {
+  padding: 4px 14px 14px;
+  font-size: 12px;
+}
+.aster-desk .pair-discs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+.aster-desk .pair-discs > details[open] {
+  grid-column: 1 / -1;
+}
+.aster-desk .pair-discs > .disclosure > summary {
+  padding: 11px 14px;
+  font-weight: 600;
+}
+.aster-desk .pair-aside .pair-adl-panel .section-head > div:first-child {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+}
+.aster-desk .pair-aside .pair-adl-panel .section-head > div:first-child > p {
+  margin: 0;
+  padding: 1px 7px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.6;
+  background: var(--positive-subtle);
+  color: var(--positive);
+}
+.aster-desk .pair-aside .pair-adl-panel .section-head > div:first-child > p.amber {
+  background: var(--warning-subtle);
+  color: var(--warning);
+}
+.aster-desk .pair-aside .pair-adl-panel > :not(.section-head) {
+  margin-left: 14px;
+  margin-right: 14px;
+  font-size: 12px;
+}
+.aster-desk .pair-aside .pair-adl-summary {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0 0 10px;
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+  border-bottom: 1px solid var(--border);
+  background: var(--border);
+}
+.aster-desk .pair-aside .pair-adl-summary > div {
+  gap: 2px;
+  padding: 10px 14px;
+  background: var(--card);
+}
+.aster-desk .pair-aside .pair-adl-summary span {
+  font-size: 11px;
+  line-height: 1.4;
+}
+.aster-desk .pair-aside .pair-adl-summary strong {
+  font-size: 13px;
+}
+.aster-desk .pair-aside .pair-adl-panel p {
+  margin-top: 0;
+  margin-bottom: 8px;
+  line-height: 1.6;
+}
+.aster-desk .pair-aside .pair-adl-panel > .pair-adl-notification {
+  margin-bottom: 12px;
+}
+.aster-desk .pair-aside .execution-live-state {
+  padding: 10px 14px 2px;
+}
+.aster-desk .pair-aside .execution-live-state p {
+  font-size: 12px;
+}
+.aster-desk .pair-aside .saved-settings {
+  gap: 1px;
+  padding: 0;
+  border-top: 1px solid var(--border);
+  background: var(--border);
+}
+.aster-desk .pair-aside .saved-settings > div {
+  min-width: 0;
+  padding: 10px 14px;
+  background: var(--card);
+}
+.aster-desk .pair-aside .saved-settings dt {
+  font-size: 11px;
+  color: var(--subtle-foreground);
+}
+.aster-desk .pair-aside .saved-settings dd {
+  margin-top: 2px;
+  font-size: 13px;
+  font-weight: 600;
+}
+@media (max-width: 1180px) {
+  .aster-desk .pair-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .aster-desk .pair-main {
+    display: contents;
+  }
+  .aster-desk .pair-discs {
+    order: 1;
+  }
+}
+@media (max-width: 760px) {
+  .aster-desk .workspace,
+  .aster-desk .focused-desk .workspace {
+    padding: 12px;
+  }
+  .aster-desk .pair-status-panel .section-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .aster-desk .pair-status-panel .account-run-actions {
+    justify-content: flex-start;
+  }
+  .aster-desk .pair-kpis,
+  .aster-desk .pair-kpis.margin-only {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .aster-desk .pair-kpi-side {
+    border-bottom: 1px solid var(--border);
+  }
+  .aster-desk .pair-kpis > :last-child {
+    border-bottom: 0;
+  }
+  .aster-desk .pair-kpi-side > .pair-kpi:last-child {
+    border-right: 0;
+  }
+  .aster-desk .pair-kpi-label,
+  .aster-desk .pair-kpi-value {
+    white-space: normal;
+  }
+  .aster-desk .pair-discs {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .aster-desk .pair-layout .section-head {
+    flex-wrap: wrap;
+  }
+  .aster-desk .pair-aside .pair-adl-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* components/ui/table.tsx：Table "w-full caption-bottom text-sm"，TableHeader "[&_tr]:border-b"，
+   TableBody "[&_tr:last-child]:border-0"，TableRow "hover:bg-muted/50 border-b transition-colors"，
+   TableHead "text-foreground h-10 px-2 text-left align-middle font-medium whitespace-nowrap"，
+   TableCell "p-2 align-middle whitespace-nowrap"（字号、表头高度与颜色被上面的基础规则覆盖）。 */
+.aster-module table {
+  width: 100%;
+  caption-side: bottom;
+  border-collapse: collapse;
+}
+.aster-module tr {
+  border-bottom: 1px solid var(--border);
+  transition: background-color 0.15s;
+}
+.aster-module tbody tr:last-child {
+  border-bottom: 0;
+}
+.aster-module tbody tr:hover {
+  background: color-mix(in oklch, var(--surface-muted) 50%, transparent);
+}
+.aster-module th {
+  padding: 0 8px;
+  text-align: left;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.aster-module td {
+  padding: 8px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+/* components/ui/tabs.tsx 的 line 变体：TabsList "inline-flex w-fit items-center justify-center p-[3px] gap-1 bg-transparent
+   rounded-none"；TabsTrigger "relative inline-flex flex-1 items-center justify-center gap-1.5 rounded-md border border-transparent
+   px-1.5 py-0.5 text-sm font-medium whitespace-nowrap transition-all"，下划线 "after:absolute after:inset-x-0 after:bottom-[-5px]
+   after:h-0.5 after:opacity-0"，选中时 "after:opacity-100"（尺寸、颜色与位置被上面 .workspace-navigation 的规则覆盖）。 */
+/* Tabs 根元素 "flex gap-2 data-horizontal:flex-col"（gap 被上面 .workspace-tabs 的规则覆盖）。 */
+.aster-desk .workspace-tabs {
+  display: flex;
+  flex-direction: column;
+}
+.aster-desk .workspace-navigation {
+  display: flex;
+  align-items: center;
+}
+.aster-desk .workspace-navigation [data-slot='tabs-trigger'] {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid transparent;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+.aster-desk .workspace-navigation [data-slot='tabs-trigger']::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.aster-desk .workspace-navigation [data-active]::after {
+  opacity: 1;
+}
+
+/* 配对设置表单（globals.css 同一提交） */
+.aster-module label {
+  font-size: 14px;
+  display: block;
+}
+.aster-module label > span {
+  float: right;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.aster-module label input {
+  margin-top: 8px;
+  margin-bottom: 15px;
+  height: 40px !important;
+}
+.aster-desk .settings-panel form {
+  padding: 0 14px 20px;
+}
+.aster-desk .settings-panel label [data-slot='select-trigger'] {
+  margin-top: 8px;
+  margin-bottom: 15px;
+  height: 40px !important;
+}
+.aster-desk .settings-panel .muted {
+  font-size: 12px;
+  margin: 0 0 16px;
+}
+.aster-desk .full-width {
+  width: 100%;
+}
+.aster-desk .settings-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.aster-desk .form-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.aster-desk .form-stack p {
+  margin: 0 0 5px;
+}
+.aster-desk .form-stack label input {
+  margin-bottom: 0;
+}
+.aster-desk .pair-config .pair-settings-form {
+  padding: 0 14px 14px;
+}
+.aster-desk .pair-settings-form {
+  gap: 20px;
+}
+.aster-desk .pair-settings-form fieldset {
+  min-width: 0;
+}
+.aster-desk .pair-settings-form legend {
+  margin-bottom: 14px;
+  padding: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.aster-desk .pair-settings-form small {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted-foreground);
+}
+@media (max-width: 640px) {
+  .aster-desk .pair-config .pair-settings-form {
+    padding: 0 16px 18px;
+  }
+  .aster-desk .pair-settings-form .settings-form-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .aster-desk .pair-settings-form .form-actions {
+    flex-wrap: wrap;
+  }
+  .aster-desk .pair-settings-form .form-actions > button {
+    min-height: 44px;
+  }
+}
+.aster-desk .focused-desk .settings-panel .settings-lock {
+  font-size: 12px;
+}
+.aster-desk .settings-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  min-width: 0;
+}
+.aster-desk .settings-form-grid .settings-toggle,
+.aster-desk .settings-form-grid > p {
+  grid-column: 1 / -1;
+}
+.aster-desk .settings-form-grid > label {
+  margin: 0;
+  min-width: 0;
+}
+.aster-desk .settings-form-grid input {
+  margin-bottom: 0;
+}
+.aster-desk .settings-form-grid label {
+  font-size: 12px;
+}
+.aster-desk .form-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+.aster-desk .form-actions .full-width {
+  width: auto;
+  flex: 1;
+}
+
+/* shadcn 输入框与开关（components/ui/input.tsx、switch.tsx 深色模式）的 Tailwind 类名换算 */
+.aster-desk [data-slot='input'] {
+  box-sizing: border-box;
+  height: 32px;
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--input-border);
+  border-radius: var(--radius);
+  padding: 4px 10px;
+  color: inherit;
+  font: inherit;
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.aster-desk [data-slot='input']::placeholder {
+  color: var(--muted-foreground);
+}
+.aster-desk [data-slot='input']:focus-visible {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 50%, transparent);
+}
+.aster-desk [data-slot='input']:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.aster-desk [data-slot='input'][aria-invalid='true'] {
+  border-color: color-mix(in srgb, var(--danger) 50%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 40%, transparent);
+}
+.aster-desk [data-slot='switch'] {
+  appearance: none;
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  width: 32px;
+  height: 18.4px;
+  margin: 0;
+  border: 1px solid transparent;
+  border-radius: 9999px;
+  background: color-mix(in srgb, var(--input-border) 80%, transparent);
+  cursor: pointer;
+  outline: none;
+  transition: background-color 0.15s;
+}
+.aster-desk [data-slot='switch']::before {
+  content: '';
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: var(--foreground);
+  transition: transform 0.15s;
+}
+.aster-desk [data-slot='switch']:checked {
+  background: var(--primary);
+}
+.aster-desk [data-slot='switch']:checked::before {
+  background: var(--primary-foreground);
+  transform: translateX(calc(100% - 2px));
+}
+.aster-desk [data-slot='switch']:focus-visible {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 50%, transparent);
+}
+.aster-desk [data-slot='switch']:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+/* components/ui/select.tsx 的 SelectTrigger（"h-8 rounded-lg border border-input py-2 pr-2 pl-2.5 text-sm"），这里是原生 select。 */
+.aster-desk select[data-slot='select-trigger'] {
+  height: 32px;
+  max-width: 100%;
+  border: 1px solid var(--input-border);
+  border-radius: var(--radius);
+  padding: 0 8px 0 10px;
+  color: inherit;
+  font: inherit;
+  font-size: 14px;
+  outline: none;
+}
+.aster-desk select[data-slot='select-trigger']:focus-visible {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 50%, transparent);
+}

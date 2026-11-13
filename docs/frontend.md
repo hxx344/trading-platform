@@ -112,3 +112,25 @@
 原油页（`web/src/OilPage.tsx`）按旧工作台原油交易页（`OilTradingPage` / `TradingSpread` / `TradingExecution`）的结构排版：价差与持仓并排，下面是额度、任务和下单表单，确认前在表单上方显示预览卡片。样式从工作台复制到 `web/src/trading.css`，来源是 `src/trading.css`（提交 `a12e583`）和 `src/trading-execution.css`（提交 `1d06abd`），只保留原油页用到的规则，规则内容不改。本服务另需的样式写在 `styles.css` 末尾的原油页一节。数据读取、请求编号和确认逻辑都没改。
 
 **回滚**：`sudo bash install.sh --version v0.8.0`。只改页面，不改接口、数据库和配置。
+
+## ASTER 页面按工作台重排（F4）
+
+2026-11-13 按《页面开发规则》第 2 条返工：F1–F3 的 ASTER 页面是照本仓库旧的手写页迁移的，没有照工作台 ASTER 模块排版。只改页面，不改接口、执行逻辑、数据库和配置。
+
+**对照的工作台页面**：`modules/aster/dashboard`（提交 `b2fae14`）的 `app/page.tsx`（顶栏、页头、功能标签）、`components/pairs-workspace.tsx`（配对组）、`pair-adl-panel.tsx`、`pair-account-positions.tsx`、`account-positions-table.tsx`。
+
+**页面结构**
+
+- 外壳照工作台 ASTER 页：顶栏品牌、页头（标题、连接状态、写者代次与更新时刻）、下划线式功能标签：配对组、运行状态、设置，配了原油时加“原油”。实盘提示条保留。
+- 配对组（`#/`、`#/pair/<配对>`，原“总览”和“配对详情”合并）：标题行带配对选择；配对状态面板（运行指示、启用 / 停用、A/B 两侧权益与可用四格、当前划转与说明）；下面左右两栏——左栏 A、B 账户持仓（工作台持仓表的列，本服务没有的杠杆、占用保证金、强平价不显示）、两侧多空核对、余额走势，以及折叠的划转记录、ADL 事件记录、配对设置（划转参数与 ADL 设置，从设置页移来）；右栏 ADL 应急处理（已保存配置、单批上限、最近补查、当前事件与“重新开始自动减仓”）和保证金平衡（说明、最后划转、最近检查、触发差额与单次范围、转出侧保留）。
+- 设置页只剩“从工作台导入”与请求权重说明；运行状态页内容不变，改用同一套面板样式。
+
+**样式**
+
+- `web/src/aster.css` 复制自工作台 `modules/aster/dashboard/app/globals.css`（提交 `b2fae14`）：只取上述页面用到的规则，规则内容不改；每条选择器前加 `.aster-desk ` 限定范围（工作台的 `.panel`、`.muted` 等类名与 `styles.css` 同名，不限定会改到原油页）；调色板从 `:root` 移到 `.aster-desk`；`body` 规则作用在 `.aster-desk`，标题、表格、表单元素（`h2`、`table`、`label` 等）的基础规则只作用在包住 ASTER 页内容的 `.aster-module` 内，原油页在它外面。
+- 工作台 ASTER 页的按钮、下拉、表格单元格来自 shadcn（Tailwind）。本服务不引入 Tailwind：按钮沿用已复制的工作台主界面 `.button`，标签页照工作台标签的 `data-slot`/`data-active` 写法套用复制来的 `.workspace-navigation` 规则，表格单元格、输入框、开关、下拉按 `components/ui/table.tsx`、`input.tsx`、`switch.tsx`、`select.tsx` 的类名换算成普通 CSS 写在 `aster.css` 末尾并注明（开关是带 `role="switch"` 的复选框，下拉用原生 `select`）。
+- 划转记录、ADL 事件记录只在展开时挂载，折叠时不轮询；配对设置第一次展开后保持挂载，点“ADL 设置”会展开它并聚焦单批上限。
+
+**验证**：替身 ASTER 上配对组、运行状态、设置三页与原油页各走一遍；1280 与 390 宽度和工作台同页面截图对比；无 CSP 报错、手机宽度无横向溢出；启用 / 停用、保存划转参数与 ADL 设置、导入入口照常可用。
+
+**回滚**：`sudo bash install.sh --version v0.8.1`。只改页面。

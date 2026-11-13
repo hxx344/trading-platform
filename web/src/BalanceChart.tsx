@@ -40,9 +40,9 @@ function Tooltip({ point }: { point: BalancePoint | null }) {
   const gap = Number(point.long.available) - Number(point.short.available);
   return <div className="chart-tip">
     <div>{stamp(point.at)}{point.fresh ? '' : <span className="err">（读取时余额已过期）</span>}</div>
-    <div><span className="swatch long" />多侧 可用 {point.long.available} / 权益 {point.long.equity}</div>
-    <div><span className="swatch short" />空侧 可用 {point.short.available} / 权益 {point.short.equity}</div>
-    <div className="muted">可用差（多 − 空）{Number.isFinite(gap) ? gap.toFixed(2) : '—'}</div>
+    <div><span className="swatch long" />A 多侧 可用 {point.long.available} / 权益 {point.long.equity}</div>
+    <div><span className="swatch short" />B 空侧 可用 {point.short.available} / 权益 {point.short.equity}</div>
+    <div className="muted">可用差（A − B）{Number.isFinite(gap) ? gap.toFixed(2) : '—'}</div>
   </div>;
 }
 
@@ -63,7 +63,7 @@ export function BalanceChart({ pairId, onExpired }: { pairId: string; onExpired:
   else if (history.unavailable) body = <Callout tone="warning">{history.unavailable}</Callout>;
   else if (!history.points.length) body = <p className="muted">这个范围内还没有采样：本服务每分钟记一次两侧余额（升级到本版本后开始记录，保留 30 天）。</p>;
   else body = <>
-    <div className="chart-legend"><span><span className="swatch long" />多侧可用</span><span><span className="swatch short" />空侧可用</span>
+    <div className="chart-legend"><span><span className="swatch long" />A 多侧可用</span><span><span className="swatch short" />B 空侧可用</span>
       <span className="muted">{history.bucketMs > history.sampleEveryMs ? `每 ${Math.round(history.bucketMs / 60_000)} 分钟取最后一次采样` : '每分钟一次采样'}；中断处断线</span></div>
     <div className="balance-chart">
       <SvgPlot rows={rows} hoverRows={hoverRows} xDomain={[history.from, history.to]} yDomain={axis.domain} yTicks={axis.ticks} yTick={amount} xTick={xTick}

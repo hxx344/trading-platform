@@ -439,7 +439,7 @@ export function OilPage({ onExpired }: { onExpired: () => void }) {
   const refreshMs = active ? ACTIVE_MS : IDLE_MS;
   const { stale, text } = staleness(state, refreshMs);
   const missing = state.error && statusOf(state.error) === 404;
-  if (missing) return <StatePanel kind="empty" title="本服务没有配置原油执行" detail="在 config.json 写入 oil（或在总览「从工作台导入」勾选原油执行账户）后重启服务。" />;
+  if (missing) return <StatePanel kind="empty" title="本服务没有配置原油执行" detail="在 config.json 写入 oil（或在「设置」页「从工作台导入」勾选原油执行账户）后重启服务。" />;
   return <div className="trading-page oil-page">
     <Callout tone="error" role="status">实盘：确认执行会在真实 Binance / Bybit 账户下单。首腿成交后对冲腿按市价跟上；任务受单笔与 24 小时开仓名义金额上限约束。同一账户请勿同时在工作台下原油单或开启原油自动规则。</Callout>
     <div className="trading-trade-top">

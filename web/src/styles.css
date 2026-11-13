@@ -126,12 +126,14 @@ small{font-size:.75rem}
 .wb-state{display:inline-flex;align-items:center;gap:7px;font-size:.8125rem;font-weight:600;color:var(--text-primary)}
 
 /* ========== 本服务 ========== */
-body{padding:24px 16px}
-.wb-page{max-width:1280px;margin:0 auto}
+/* ASTER 页面外壳与内容样式在 aster.css；这里留本服务自己的规则。 */
+.aster-desk{min-height:100vh}
+.aster-desk .disclosure-body{padding:0 14px 14px}
+.aster-desk .disclosure-body>p{margin:0 0 10px}
+.aster-desk .feature-stack>.callout{margin:0}
 .panel-note{padding:10px 14px 0;color:var(--text-tertiary);font-size:.75rem;line-height:1.65}
 .panel-note.err{color:var(--error)}
 .panel-body{display:flex;flex-direction:column;gap:10px;padding:12px 14px}
-.panel-subheading{padding:14px 14px 0;font-size:.8125rem}
 .status-line{color:var(--text-secondary);font-size:.75rem;overflow-wrap:anywhere}
 .toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .table-wrap{overflow-x:auto;margin:10px 0 0;-webkit-overflow-scrolling:touch}
@@ -146,31 +148,7 @@ table.data td.num{font-family:var(--font-mono);font-variant-numeric:tabular-nums
 .mono{font-family:var(--font-mono)}
 .ok{color:var(--emerald)}
 .err{color:var(--error)}
-.position-pair{display:flex;flex-direction:column;gap:6px;padding:10px 0;border-top:1px solid var(--surface-4)}
-.position-pair:first-of-type{border-top:0}
-.position-pair h3{font-size:.8125rem}
-.position-side{display:flex;flex-direction:column;gap:2px}
-.adl-incident{display:flex;flex-direction:column;gap:4px;min-width:280px}
-.adl-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:4px 0}
-.adl-settings{min-width:220px}
-.adl-settings label{display:flex;align-items:center;gap:6px;margin-bottom:6px;color:var(--text-secondary)}
-.adl-settings input[type=text],.adl-settings input:not([type]){width:90px;height:30px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);padding:4px 8px;color:var(--text-primary);background:var(--surface-1);font-variant-numeric:tabular-nums}
 input[type=checkbox]{accent-color:var(--accent)}
-.settings-pair{display:flex;flex-direction:column;gap:6px;padding:12px 14px;border-top:1px solid var(--surface-4)}
-.settings-pair h3{font-size:.875rem;display:flex;gap:8px;align-items:baseline}
-.settings-pair h3 span{font-size:.75rem;font-weight:400}
-.settings-block{display:flex;flex-direction:column;gap:10px}
-.settings-block>.panel-subheading{padding:6px 0 0}
-.settings-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px 14px}
-.settings-field{display:flex;flex-direction:column;gap:4px;min-width:0;font-size:.75rem}
-.settings-label{color:var(--text-secondary)}
-.settings-field input{height:30px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);padding:4px 8px;color:var(--text-primary);background:var(--surface-1);font-variant-numeric:tabular-nums;min-width:0}
-.settings-field small{line-height:1.5}
-@media(max-width:720px){body{padding:16px}.wb-heading{flex-direction:column}}
-.tabs{display:flex;gap:4px;border-bottom:1px solid var(--surface-4);overflow-x:auto}
-.tab{padding:8px 14px;color:var(--text-secondary);border-bottom:2px solid transparent;white-space:nowrap;font-weight:500}
-.tab:hover{color:var(--text-primary)}
-.tab.active{color:var(--text-primary);border-bottom-color:var(--accent)}
 table.data td a,.panel-body a{color:var(--accent)}
 .pair-pick{display:flex;align-items:center;gap:8px;color:var(--text-secondary)}
 .pair-pick select{height:32px;min-width:180px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);padding:4px 8px;color:var(--text-primary);background:var(--surface-1)}
@@ -212,3 +190,8 @@ table.data.history{min-width:0}
 @media(max-width:760px){.oil-page .spread-table caption{display:block;width:auto}.execution-review-settings.oil-limits{margin-inline:18px}.execution-presets.oil-presets{grid-template-columns:minmax(0,1fr)}}
 .spread-markets.oil-spread-markets{grid-template-columns:minmax(0,1fr)}
 .oil-page .execution-leg-input .execution-market-note{max-width:440px}
+.aster-desk .form-actions{align-items:center;flex-wrap:wrap}
+/* 运行状态页与导入面板仍用本服务的 panel-body 排版：说明文字保持 12px，面板之间留间距。 */
+.aster-module{display:flex;flex-direction:column;gap:16px;min-width:0}
+.aster-desk .panel-body .muted,.aster-desk .panel-body p{font-size:.75rem}
+.aster-desk .section-head+.panel-body{padding-top:0}

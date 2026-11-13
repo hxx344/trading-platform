@@ -1,4 +1,3 @@
-import { Activity, BellRing, Gauge, Radio } from 'lucide-react';
 import { StatePanel, TableEmpty } from './StateViews.tsx';
 import { ago, stamp } from './labels.ts';
 import { useLiveResource } from './use-live-resource.ts';
@@ -82,20 +81,20 @@ export function StatusPage({ onExpired }: { onExpired: () => void }) {
   return <>
     {error ? <p className="status-line err">刷新失败：{error.message}（显示的是 {stamp(now)} 的结果）</p> : null}
     <section className="panel">
-      <div className="panel-heading"><h2><Activity size={16} aria-hidden="true" />服务健康</h2></div>
+      <div className="section-head"><h2>服务健康</h2></div>
       <Health health={data.health} />
     </section>
     {data.budget ? <section className="panel">
-      <div className="panel-heading"><h2><Gauge size={16} aria-hidden="true" />ASTER 请求权重</h2></div>
+      <div className="section-head"><h2>ASTER 请求权重</h2></div>
       <Budget budget={data.budget} idle={data.idleWeight} now={now} />
     </section> : null}
     {data.streams ? <section className="panel">
-      <div className="panel-heading"><h2><Radio size={16} aria-hidden="true" />账户推送连接</h2></div>
+      <div className="section-head"><h2>账户推送连接</h2></div>
       <p className="panel-note">推送只用来更快拿到 ADL 证据；断开时 ADL 照常按定时读取的成交历史判断，只是慢一些。</p>
       <Streams streams={data.streams} now={now} />
     </section> : null}
     {data.feishu ? <section className="panel">
-      <div className="panel-heading"><h2><BellRing size={16} aria-hidden="true" />飞书告警发件箱</h2></div>
+      <div className="section-head"><h2>飞书告警发件箱</h2></div>
       <Feishu feishu={data.feishu} />
     </section> : null}
     {data.samples ? <p className={data.samples.available ? 'status-line' : 'status-line err'}>余额采样：{data.samples.available ? '正常（每分钟一次，保留 30 天）' : `不可用：${data.samples.error ?? '未知原因'}（不影响划转与 ADL）`}</p> : null}

@@ -1,4 +1,3 @@
-import { Download } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { api } from './api.ts';
 
@@ -164,9 +163,9 @@ export function ImportPanel({ onImported }: { onImported: () => void }) {
 
   if (!offered) return null;
   return <section className="panel" id="importBox">
-    <div className="panel-heading"><h2><Download size={16} aria-hidden="true" />从工作台导入</h2></div>
+    <div className="section-head"><h2>从工作台导入</h2></div>
     <div className="panel-body">
-      <p className="muted">读取本机旧工作台的保证金平衡配对：划转设置、ADL 设置、主账户与子账户凭据、飞书机器人，写入本服务配置后自动重启本服务（约半分钟，期间已启用配对的划转与 ADL 暂停）。导入的配对登记为停用：先在旧工作台删除该配对，再到「总览」点「启用」。也可勾选导入工作台的原油执行账户（Binance / Bybit）；工作台有实盘启用的原油自动规则时，先在工作台停用。</p>
+      <p className="muted">读取本机旧工作台的保证金平衡配对：划转设置、ADL 设置、主账户与子账户凭据、飞书机器人，写入本服务配置后自动重启本服务（约半分钟，期间已启用配对的划转与 ADL 暂停）。导入的配对登记为停用：先在旧工作台删除该配对，再到「配对组」点「启用配对」。也可勾选导入工作台的原油执行账户（Binance / Bybit）；工作台有实盘启用的原油自动规则时，先在工作台停用。</p>
       <div className="toolbar">
         <button type="button" id="importPreviewBtn" className="button secondary" disabled={busy} onClick={() => void request({ action: 'preview' }, '正在读取工作台')}>读取工作台</button>
         {message ? <span className={message.tone} role="status">{message.text}</span> : null}

@@ -1,7 +1,7 @@
 // Oil module O1a: same-venue BZ/CL jobs, barrels, the rolling 24-hour open cap, the service's oil wiring and job alerts.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -243,6 +243,19 @@ test('服务进程：配置 oil 时启动检查失败则拒绝启动并释放账
       assert.equal(previewed.status, 200, JSON.stringify(preview));
       assert.deepEqual(preview.legs.map(item => [item.venue, item.symbol, item.quantity, item.accountId]), [['binance', 'BZUSDT', '1', '***6789'], ['binance', 'CLUSDT', '1', '***6789']]);
       assert.equal(preview.barrels, '1');
+      // Spread rules (observe mode): their own file, revision-checked writes.
+      const post = async (path: string, body: unknown) => { const response = await fetch(`http://127.0.0.1:${port}${path}`, { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }, body: JSON.stringify(body) }); return { status: response.status, body: await response.json() as Record<string, unknown> }; };
+      assert.deepEqual((await get('/api/oil/rules')).body.rules, []);
+      const rule = { name: '', venue: 'binance', direction: 'short', openThreshold: '-1', closeThreshold: '-2', barrels: '1', confirmSamples: 1, maxOpensPerDay: 1 };
+      assert.equal((await post('/api/oil/rules', { config: { ...rule, venue: 'bybit' }, observing: true })).body.code, 'venue_not_configured');
+      const created = await post('/api/oil/rules', { config: rule, observing: true });
+      assert.equal(created.status, 200, JSON.stringify(created.body));
+      const saved = (created.body.rules as { id: string; revision: number; observing: boolean; title: string }[])[0]!;
+      assert.deepEqual([saved.observing, saved.title], [true, 'Binance 原油做空价差']);
+      assert.ok(existsSync(join(dir, 'data', 'oil-rules.sqlite')));
+      assert.equal((await post(`/api/oil/rules/${saved.id}/stop`, { revision: saved.revision + 1 })).status, 409);
+      assert.equal((await post(`/api/oil/rules/${saved.id}/live`, { revision: saved.revision })).status, 404);
+      assert.equal((await post(`/api/oil/rules/${saved.id}/stop`, { revision: saved.revision })).status, 200);
       const health = (await get('/api/status')).body.health as { loops: { name: string }[] };
       assert.ok(health.loops.some(loop => loop.name === '两腿任务循环'), JSON.stringify(health.loops));
       assert.ok(!health.loops.some(loop => loop.name === '历史清理'), '两腿任务循环自带历史清理');

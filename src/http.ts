@@ -78,7 +78,11 @@ export interface ServiceViews {
   /** null for an unknown range. */
   balanceHistory?(pairId: string, range: string): unknown;
   /** The oil module's reads (books and spreads; accounts, positions, jobs, caps); absent when the service runs no oil. */
-  oil?: { market(): unknown; state(): unknown };
+  oil?: {
+    market(): unknown; state(): unknown;
+    /** The spread rules (docs/oil.md section 7); a store that could not open answers its reason and refuses writes. */
+    rules?: { view(): unknown; create(body: unknown): unknown; update(id: string, body: unknown): unknown; act(id: string, action: string, body: unknown): unknown };
+  };
   /** The read-only market monitors; the two Anthropic reads give null until there is data. Absent without config.monitor. */
   monitor?: { state(): unknown; anthropicQuote(): unknown; anthropicCandles(days: number | null): unknown };
   /** The options module's reads and writes (service/options.ts); absent when the service runs no options module. */
@@ -268,6 +272,18 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'GET' && (url.pathname === '/api/oil/market' || url.pathname === '/api/oil/state')) {
       if (!views?.oil) return send(response, 404, { code: 'not_found', message: '本服务没有配置原油执行' });
       return send(response, 200, url.pathname === '/api/oil/market' ? views.oil.market() : views.oil.state());
+    }
+    if (url.pathname === '/api/oil/rules' || url.pathname.startsWith('/api/oil/rules/')) {
+      if (!views?.oil?.rules) return send(response, 404, { code: 'not_found', message: '本服务没有配置原油执行' });
+      const rules = views.oil.rules;
+      if (url.pathname === '/api/oil/rules') {
+        if (request.method === 'GET') return send(response, 200, rules.view());
+        if (request.method === 'POST') return send(response, 200, rules.create(await readJson(request)));
+      }
+      const target = request.method === 'POST' ? /^\/api\/oil\/rules\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/(update|start|stop|delete)$/.exec(url.pathname) : null;
+      if (!target) return send(response, 404, { code: 'not_found', message: '不存在' });
+      const body = await readJson(request);
+      return send(response, 200, target[2] === 'update' ? rules.update(target[1]!, body) : rules.act(target[1]!, target[2]!, body));
     }
     if (request.method === 'GET' && MONITOR_PATHS.has(url.pathname)) {
       if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });

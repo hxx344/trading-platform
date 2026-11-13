@@ -83,6 +83,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 | 回退到早于 | 回退前要做的事 | 说明 | 详见 |
 | --- | --- | --- | --- |
+| v0.18.0 | 不用改配置 | 原油自动规则存在单独的 `oil-rules.sqlite`，旧版本不读；观察规则不下单，回退后不再记录信号，再升级回来时规则还在，原来在观察的继续观察（连续次数从零开始） | [docs/oil.md](docs/oil.md) 第 7 节 |
 | v0.17.0 | 不用改配置。先在期权页「组合询价」确认没有未结束的询价（标签上不显示「进行中」；已成交但还没转成跟踪的也算未结束） | 旧版本不读询价记录，也不会因它拦下交易；询价成交的开仓组合照常跟踪与平仓，收益页该组在旧版本显示待核对 | [docs/options.md](docs/options.md) 第 4 节 |
 | v0.16.0 | 不用改配置 | `asset.sqlite` 新增的 `sync_locks` 表旧版本不读；资产页回到只读，显示的是页面写入后的数据，不会回到导入时刻 | [docs/asset.md](docs/asset.md) A-2 |
 | v0.15.0 | 不用改配置 | 配置与 `asset.sqlite` 照常可用，只是导入面板没有行情监控与资产账本两项，改用手写配置与单独的账本导入命令 | [docs/module-import.md](docs/module-import.md) 第 8 节 |

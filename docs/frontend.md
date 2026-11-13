@@ -246,3 +246,11 @@
 设置页「从工作台导入」预览多两块：行情监控（本项目是否已启用、工作台有无 Monitor、股数取默认值的说明）与资产账本（本项目是否已启用与上次导入、工作台账本路径、每个用户的条数与能否导入，多个用户时单选）；勾选「启用行情监控」「导入资产账本」后随导入一起写入，默认不勾选，只勾这两项也可以。只重新导入资产账本时按钮为「导入所选」（不重启服务）。请求体、按钮文案与确认文案在不依赖 DOM 的 `web/src/import-form.ts`，由 `test/import-form.test.ts` 覆盖。方案见 [module-import.md](module-import.md)。
 
 **回滚**：见 [module-import.md](module-import.md) 第 8 节（配置格式与库结构都没变，回退后改用备选方式）。
+
+## 原油自动规则区块（O2a）
+
+原油页下单表单下方新增「自动开平仓」区块（`web/src/OilRules.tsx`），结构与文案照工作台 `src/TradingAutoRules.tsx`，样式从工作台 `src/trading-execution.css` 第 287–311 行（提交 `1d06abd`）原样复制到 `trading.css` 末尾。差异：只有观察模式，表单没有“保存后立即启用实盘”与实盘确认；卡片的“每日最多开仓”注明转实盘后生效。读取每 3 秒一次（`/api/oil/rules`），读失败或数据超过 16 秒未更新时停用写按钮；写请求返回后直接用应答里的新视图，应答不确定或修订号冲突（409）时重新读取。表单到请求体的换算与校验在不依赖 DOM 的 `web/src/oil-rules-form.ts`，由 `test/oil-rules-form.test.ts` 覆盖。规则语义见 [oil.md](oil.md) 第 7 节。
+
+**验证**：替身 Binance / Bybit 上新建只观察规则，晃动 BZ 盘口后按连续次数记录信号；1280 与 390 宽度无横向溢出、无 CSP 报错。
+
+**回滚**：`sudo bash install.sh --version v0.17.0`。不用改配置；`oil-rules.sqlite` 留在数据目录，旧版本不读。

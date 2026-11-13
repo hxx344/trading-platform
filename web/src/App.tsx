@@ -69,7 +69,7 @@ export function App() {
   return <div className="aster-desk">
     <main className="desk focused-desk">
       <header className="topbar">
-        <div className="brand"><Layers3 size={22} aria-hidden="true" /><span>统一交易平台<span className="brand-separator">/</span><small>ASTER 保证金平衡 · 原油 · 资产</small></span></div>
+        <div className="brand"><Layers3 size={22} aria-hidden="true" /><span>统一交易平台<span className="brand-separator">/</span><small>ASTER 保证金平衡 · 原油 · 行情监控 · 资产</small></span></div>
       </header>
       <div className="workspace">
         <div className="page-heading">

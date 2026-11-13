@@ -310,11 +310,14 @@ async function freePort(): Promise<number> {
   const { createServer } = await import('node:net');
   return new Promise<number>(resolve => { const probe = createServer().listen(0, '127.0.0.1', () => { const { port } = probe.address() as { port: number }; probe.close(() => resolve(port)); }); });
 }
+// Every start gets its own connections: a kept-alive one to the previous start, on the same port, may only be seen
+// closed after the next request has gone out on it.
+const FRESH = { connection: 'close' };
 async function login(dir: string, port: number) {
   let link = '';
   for (let i = 0; i < 100 && !link; i++) { try { link = readFileSync(join(dir, 'access-url'), 'utf8').trim(); } catch { await sleep(20); } }
-  const cookie = (await fetch(link, { redirect: 'manual' })).headers.get('set-cookie')!.split(';')[0]!;
-  return async (path: string) => { const response = await fetch(`http://127.0.0.1:${port}${path}`, { headers: { cookie } }); return { status: response.status, body: await response.json() as Record<string, any> }; };
+  const cookie = (await fetch(link, { redirect: 'manual', headers: FRESH })).headers.get('set-cookie')!.split(';')[0]!;
+  return async (path: string) => { const response = await fetch(`http://127.0.0.1:${port}${path}`, { headers: { cookie, ...FRESH } }); return { status: response.status, body: await response.json() as Record<string, any> }; };
 }
 
 test('服务进程：配置 monitor 时提供三个只读接口与状态；未登录 401、days 不合法 400、尚无数据 503；重启后读回为快照', async () => {
@@ -331,7 +334,7 @@ test('服务进程：配置 monitor 时提供三个只读接口与状态；未�
     let run = await start();
     try {
       const get = await login(data, port);
-      assert.equal((await fetch(`http://127.0.0.1:${port}/api/monitor/state`)).status, 401);
+      assert.equal((await fetch(`http://127.0.0.1:${port}/api/monitor/state`, { headers: FRESH })).status, 401);
       assert.deepEqual(await get('/api/monitor/state'), { status: 200, body: { markets: ['anthropic'], anthropic: { shares: { outstanding: 13, diluted: 17 } } } });
       assert.deepEqual((await get('/api/monitor/anthropic/quote')).status, 503);
       assert.equal((await get('/api/monitor/anthropic/quote')).body.code, 'not_ready');
@@ -352,7 +355,7 @@ test('服务进程：配置 monitor 时提供三个只读接口与状态；未�
       assert.equal((await get('/api/monitor/anthropic/candles?days=400')).status, 200);
       const status = (await get('/api/status')).body;
       assert.deepEqual([status.monitor.available, status.monitor.error, status.monitor.anthropic.quoteAt, status.monitor.anthropic.candleRows], [true, null, quote.fetchedAt, all.metadata.rows]);
-    } finally { await run.shutdown(); await run.done; }
+    } finally { await run.shutdown(); await run.done; rmSync(join(data, 'access-url'), { force: true }); }
 
     // The venues stop answering: what was saved is served at once, marked as a snapshot, and shutdown does not wait.
     venues.hold = new Promise(() => undefined);
@@ -388,7 +391,7 @@ test('服务进程：monitor.sqlite 打不开时服务照常启动，行情监�
       assert.equal(status.monitor.available, false);
       assert.ok(status.monitor.error);
       assert.equal(status.monitor.anthropic, null);
-    } finally { await run.shutdown(); await run.done; }
+    } finally { await run.shutdown(); await run.done; rmSync(join(data, 'access-url'), { force: true }); }
     run = await start({ secretsFile: '/etc/tp/secrets.json', pairs: [] });
     try {
       const get = await login(data, port);

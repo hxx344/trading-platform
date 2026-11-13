@@ -147,6 +147,21 @@ test('观察：一条规则写库失败不影响同一轮的其它规则，失�
   assert.deepEqual([...after()], [['甲', 1], ['乙', 1]], '没写进库的信号下一轮补记，已记的不重复');
 }));
 
+test('观察：清零原因写库失败时连续次数照样清零，恢复后从 1 重新计、不凭旧次数出信号', () => withRules(({ r, rules, file }) => {
+  rules.create({ config: settings({ confirmSamples: 3 }), observing: true });
+  const id = first(rules.view()).id;
+  for (let i = 0; i < 2; i++) { r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']); rules.tick(); }
+  assert.equal(first(rules.view()).observation!.open!.hits, 2);
+  const db = new DatabaseSync(file);
+  db.exec(`CREATE TRIGGER refuse BEFORE UPDATE ON rules WHEN NEW.id = '${id}' BEGIN SELECT RAISE(ABORT, '写入被拒'); END`);
+  r.now += 3_000; r.books = [{ ...r.books[0]!, error: 'timeout' }, r.books[1]!];
+  assert.throws(() => rules.tick(), /写入被拒/);
+  db.exec('DROP TRIGGER refuse'); db.close();
+  r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']); rules.tick();
+  assert.equal(first(rules.view()).observation!.open!.hits, 1);
+  assert.equal(signals(rules.view()).length, 0);
+}));
+
 test('观察：重启、修改与停止都清零；修订号不一致返回 409；最多 12 条；停止后不再计数', () => withRules(({ r, rules: initial, reopen }) => {
   initial.create({ config: settings({ confirmSamples: 3 }), observing: true });
   for (let i = 0; i < 2; i++) { r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']); initial.tick(); }
@@ -193,17 +208,22 @@ test('库：版本比本版本新时拒绝打开；参数读不了的规则保�
     assert.equal(signals(again.view()).length, 0);
     assert.throws(() => again.act(view.id, 'start', { revision: view.revision }), code('already_observing'));
     again.act(view.id, 'stop', { revision: view.revision });
+    const stored = new DatabaseSync(file);
+    assert.equal((stored.prepare('SELECT config FROM rules').get() as { config: string }).config, '{"venue":"binance"}', '停止不改写库里的原始参数');
+    stored.close();
     assert.throws(() => again.act(view.id, 'start', { revision: view.revision + 1 }), code('invalid_rule'));
     again.update(view.id, { revision: view.revision + 1, config: settings() });
     assert.equal(first(again.view()).problem, null);
     // Settings that are valid JSON but not an object still show (with a complete stand-in) and can be deleted.
     const raw = new DatabaseSync(file);
-    raw.exec(`UPDATE rules SET config = 'null'`);
+    raw.exec(`UPDATE rules SET config = 'null', state = 'null'`);
     raw.close();
     const broken = first(again.view()) as View['rules'][number] & { config: RuleConfig };
     assert.equal(broken.title, 'Binance 原油做空价差');
     assert.deepEqual(broken.config, { name: '', venue: 'binance', direction: 'short', openThreshold: '', closeThreshold: '', barrels: '', confirmSamples: 0, maxOpensPerDay: 0 });
     assert.match(broken.problem!, /^规则参数无法读取/);
+    assert.equal(broken.observing, false);
+    assert.deepEqual([broken.events, broken.observations], [[], []]);
     again.act(broken.id, 'delete', { revision: broken.revision });
     again.close();
     const newer = new DatabaseSync(file);

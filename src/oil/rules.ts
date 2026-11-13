@@ -107,6 +107,14 @@ function placeholderConfig(text: string): RuleConfig {
   };
 }
 
+/** Stored state read defensively: anything that is not the expected shape becomes a stopped rule with the records it can keep. */
+function stateOf(text: string): RuleState {
+  let raw: Record<string, unknown> = {};
+  try { const value: unknown = JSON.parse(text); if (value && typeof value === 'object' && !Array.isArray(value)) raw = value as Record<string, unknown>; } catch { /* nothing to keep */ }
+  const records = (value: unknown): RuleEvent[] => Array.isArray(value) ? value.filter((item): item is RuleEvent => !!item && typeof item === 'object' && Number.isFinite((item as RuleEvent).at) && typeof (item as RuleEvent).message === 'string').slice(-MAX_EVENTS) : [];
+  return { mode: 'observe', observing: raw.observing === true, events: records(raw.events), observations: records(raw.observations) };
+}
+
 export const ruleTitle = (config: RuleConfig): string => config.name || `${VENUE_NAMES[config.venue]} 原油${config.direction === 'short' ? '做空' : '做多'}价差`;
 
 /**
@@ -172,6 +180,8 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
   const insert = db.prepare('INSERT INTO rules (id, revision, created_at, config, state) VALUES (?, ?, ?, ?, ?)');
   const write = db.prepare('UPDATE rules SET revision = ?, config = ?, state = ? WHERE id = ?');
   const writeState = db.prepare('UPDATE rules SET state = ? WHERE id = ?');
+  // Start and stop leave the stored settings as they are (a rule whose settings no longer parse keeps the original text).
+  const writeRevision = db.prepare('UPDATE rules SET revision = ?, state = ? WHERE id = ?');
   const remove = db.prepare('DELETE FROM rules WHERE id = ?');
   const count = db.prepare('SELECT COUNT(*) AS n FROM rules');
   const observed = new Map<string, Observed>();
@@ -183,13 +193,13 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
   const parse = (row: Row | undefined): Rule | null => {
     if (!row) return null;
     let config: RuleConfig, state: RuleState;
-    try { state = JSON.parse(row.state) as RuleState; } catch { state = { mode: 'observe', observing: false, events: [], observations: [] }; }
+    state = stateOf(row.state);
     try { config = parseRuleConfig(JSON.parse(row.config), VENUES); invalid.delete(row.id); }
     catch (error) {
       invalid.set(row.id, `规则参数无法读取：${error instanceof Error ? error.message.slice(0, 120) : String(error)}；请修改或删除`);
       config = placeholderConfig(row.config);
     }
-    return { id: row.id, revision: Number(row.revision), createdAt: Number(row.createdAt), config, state: { mode: 'observe', observing: state.observing === true, events: Array.isArray(state.events) ? state.events : [], observations: Array.isArray(state.observations) ? state.observations : [] } };
+    return { id: row.id, revision: Number(row.revision), createdAt: Number(row.createdAt), config, state };
   };
   const rows = (): Rule[] => (selectAll.all() as Row[]).map(row => parse(row)!);
   const ruleFor = (id: string): Rule => {
@@ -211,10 +221,13 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
 
   /** Clears the counts with a reason; the same reason in a row is recorded once. */
   function resetObservation(rule: Rule, message: string): void {
-    // Saved before memory changes: a failed write records the reason again next round instead of dropping it.
-    if (observed.get(rule.id)?.note !== message) { observation(rule.state, `${message}；连续次数清零`); save(rule); }
-    observed.set(rule.id, { note: message });
+    const recorded = observed.get(rule.id)?.note === message;
+    // The counts are cleared first, whatever the write does; the reason only counts as recorded once it is saved, so a
+    // failed write tries it again next round.
+    observed.set(rule.id, { note: null });
     freshAfter.set(rule.id, now());
+    if (!recorded) { observation(rule.state, `${message}；连续次数清零`); save(rule); }
+    observed.set(rule.id, { note: message });
   }
   function observe(rule: Rule, current: readonly BookRow[]): void {
     if (invalid.has(rule.id)) { observed.set(rule.id, { note: invalid.get(rule.id)! }); return; }
@@ -321,7 +334,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
       event(rule.state, '已停止观察');
       observation(rule.state, '观察已停止，连续次数已清零');
     } else throw new ContractError(404, 'not_found', '自动规则操作不存在');
-    write.run(rule.revision + 1, JSON.stringify(rule.config), JSON.stringify(rule.state), id);
+    writeRevision.run(rule.revision + 1, JSON.stringify(rule.state), id);
     restart(id);
     return view();
   }

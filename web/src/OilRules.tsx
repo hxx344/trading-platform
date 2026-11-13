@@ -101,14 +101,16 @@ export function OilRules({ onExpired }: { onExpired: () => void }) {
       if (error instanceof ApiError && error.status === 401) { onExpired(); return '会话已过期'; }
       // Without a definite answer the write may have been saved: re-read before anything is retried.
       const unknown = !(error instanceof ApiError) || error.status >= 500;
-      const stale = unknown || (error instanceof ApiError && error.status === 409);
+      // A changed revision or a rule deleted meanwhile: the list on screen is out of date.
+      const gone = error instanceof ApiError && (error.code === 'stale_revision' || error.code === 'not_found');
+      const stale = unknown || gone || (error instanceof ApiError && error.status === 409);
       const message = `${error instanceof Error ? error.message : '操作未完成'}${unknown ? ' 结果未确认，已重新读取规则列表，请核对后再操作。' : ''}`;
       // The open form holds the revision (or a create) it was opened with: after a conflict or an unknown result it is
       // closed, so a retry starts from the re-read list instead of repeating the stale revision or the same create.
       // Other 409s (too many rules, already observing) leave the form open with its input.
-      if (inline && (unknown || (error instanceof ApiError && error.code === 'stale_revision'))) {
+      if (inline && (unknown || gone)) {
         setEditor(null);
-        setWriteError(`${unknown ? `${error instanceof Error ? error.message : '操作未完成'} 结果未确认` : '规则已在别处更新'}，已重新读取规则列表；表单已关闭，请核对后重新打开。`);
+        setWriteError(`${unknown ? `${error instanceof Error ? error.message : '操作未完成'} 结果未确认` : '规则已被更新或删除'}，已重新读取规则列表；表单已关闭，请核对后重新打开。`);
       }
       else if (!inline || unknown) setWriteError(message);
       if (stale) { setUncertain(true); void live.refresh().finally(() => setUncertain(false)); }

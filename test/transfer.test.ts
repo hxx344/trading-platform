@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
-import { ContractError } from '../src/contracts.ts';
+import { ContractError, parseTransferConfig } from '../src/contracts.ts';
 import { DEFAULT_BUDGETS, WriterLostError, createExecutor, type Budgets } from '../src/executor.ts';
 import { MIGRATIONS, openStore, sqlHash } from '../src/store.ts';
 import { SimulatedAster } from '../src/sim-aster.ts';
@@ -836,7 +836,7 @@ test('划转：连续未发送按检查间隔指数退避，上限为配置冷�
 
 test('保留期：已结清的划转记录与启停命令超过保留期后删除，未结清的保留；已用流水不随记录删除', () => withHarness(async h => {
   await start(h, { maxTransfer: '30', cooldownMs: 1_000 });
-  h.ex.setTransferConfig({ pairId: PAIR, requestId: randomUUID(), config: pairOf(h).config }, SESSION);
+  h.ex.setTransferConfig({ pairId: PAIR, requestId: randomUUID(), expected: pairOf(h).config, config: pairOf(h).config }, SESSION);
   await h.ex.tick();
   const first = last(h);
   assert.equal(first.state, 'confirmed');
@@ -1304,7 +1304,8 @@ test('划转历史：按配对逐页列出，新的在前，游标接续不重�
 }));
 
 const FULL_CONFIG = { threshold: '10', minTransfer: '1', maxTransfer: '1000', bufferRatio: '0.05', longReserve: '0', shortReserve: '0', cooldownMs: 30_000, checkIntervalMs: 5_000 };
-const setConfig = (h: Harness, config: Record<string, unknown>, requestId = randomUUID(), session = SESSION) => h.ex.setTransferConfig({ pairId: PAIR, requestId, config: { ...FULL_CONFIG, ...config } }, session);
+/** Sent as the page does: `expected` defaults to what is stored now, as a draft started from a fresh read. */
+const setConfig = (h: Harness, config: Record<string, unknown>, requestId = randomUUID(), session = SESSION, expected: unknown = stored(h).config) => h.ex.setTransferConfig({ pairId: PAIR, requestId, expected, config: { ...FULL_CONFIG, ...config } }, session);
 const configEvents = (h: Harness) => (h.store.db.prepare("SELECT json FROM events WHERE type = 'transfer-pair-config' ORDER BY seq").all() as { json: string }[]).map(row => JSON.parse(row.json) as { pair: string; before: Record<string, unknown>; after: Record<string, unknown>; requestId: string });
 
 test('划转参数：页面修改按 parseTransferConfig 校验，须给全部字段；写入后下一轮按新值规划，记改前与改后；开关与冷却不变', () => withHarness(async h => {
@@ -1314,10 +1315,17 @@ test('划转参数：页面修改按 parseTransferConfig 校验，须给全部�
   for (const config of [{ bufferRatio: '1' }, { minTransfer: '5', maxTransfer: '4' }, { threshold: '-1' }, { cooldownMs: 999 }, { checkIntervalMs: 3_600_001 }, { maxTransfer: 30 }, { reserve: '1' }]) {
     assert.throws(() => setConfig(h, config), (error: unknown) => error instanceof ContractError && error.status === 400, JSON.stringify(config));
   }
+  // A null (or any non-value) is refused, never taken as "use the default": the config file's parse would take it.
+  for (const key of Object.keys(FULL_CONFIG)) {
+    for (const value of [null, {}, [], true]) assert.throws(() => setConfig(h, { [key]: value }), code('invalid_value'), `${key}=${JSON.stringify(value)}`);
+  }
+  assert.equal(parseTransferConfig({ ...FULL_CONFIG, threshold: null, cooldownMs: null }).threshold, '10', 'config.json 的宽松解析不变');
   const { checkIntervalMs: _omitted, ...partial } = FULL_CONFIG;
-  assert.throws(() => h.ex.setTransferConfig({ pairId: PAIR, requestId: randomUUID(), config: partial }, SESSION), code('missing_field'));
-  assert.throws(() => h.ex.setTransferConfig({ pairId: PAIR, requestId: 'x', config: FULL_CONFIG }, SESSION), code('request_id'));
-  assert.throws(() => h.ex.setTransferConfig({ pairId: 'no-such-pair', requestId: randomUUID(), config: FULL_CONFIG }, SESSION), code('pair_missing'));
+  assert.throws(() => h.ex.setTransferConfig({ pairId: PAIR, requestId: randomUUID(), expected: FULL_CONFIG, config: partial }, SESSION), code('missing_field'));
+  assert.throws(() => h.ex.setTransferConfig({ pairId: PAIR, requestId: randomUUID(), config: FULL_CONFIG }, SESSION), code('missing_field'));
+  assert.throws(() => h.ex.setTransferConfig({ pairId: PAIR, requestId: randomUUID(), expected: partial, config: FULL_CONFIG }, SESSION), code('missing_field'));
+  assert.throws(() => h.ex.setTransferConfig({ pairId: PAIR, requestId: 'x', expected: FULL_CONFIG, config: FULL_CONFIG }, SESSION), code('request_id'));
+  assert.throws(() => h.ex.setTransferConfig({ pairId: 'no-such-pair', requestId: randomUUID(), expected: FULL_CONFIG, config: FULL_CONFIG }, SESSION), code('pair_missing'));
   assert.equal(configEvents(h).length, 0, '被拒的修改不留记录');
   const cooldown = pairOf(h).cooldownUntil;
   const requestId = randomUUID();
@@ -1333,13 +1341,15 @@ test('划转参数：页面修改按 parseTransferConfig 校验，须给全部�
 test('划转参数：同一请求编号重放返回当前结果、不重复记录；编号用于别的内容或别的会话时拒绝', () => withHarness(async h => {
   h.ex.registerTransferPair(SIM_TRANSFER_PAIR);
   const requestId = randomUUID();
-  setConfig(h, { threshold: '20' }, requestId);
+  setConfig(h, { threshold: '20' }, requestId, SESSION, FULL_CONFIG);
   setConfig(h, { threshold: '30' });
-  const replay = setConfig(h, { threshold: '20' }, requestId);
+  // The replay carries the same starting settings as the first send, which no longer match: still the first outcome.
+  const replay = setConfig(h, { threshold: '20' }, requestId, SESSION, FULL_CONFIG);
   assert.equal(replay.config.threshold, '30', '重放不撤销之后的修改');
   assert.equal(configEvents(h).length, 2);
-  assert.throws(() => setConfig(h, { threshold: '25' }, requestId), code('request_reused'));
-  assert.throws(() => setConfig(h, { threshold: '20' }, requestId, 'another-session'), code('request_reused'));
+  assert.throws(() => setConfig(h, { threshold: '25' }, requestId, SESSION, FULL_CONFIG), code('request_reused'));
+  assert.throws(() => setConfig(h, { threshold: '20' }, requestId, SESSION, { ...FULL_CONFIG, threshold: '30' }), code('request_reused'), '起始参数不同也是别的内容');
+  assert.throws(() => setConfig(h, { threshold: '20' }, requestId, 'another-session', FULL_CONFIG), code('request_reused'));
   // Another write's id cannot be reused here either.
   const enableId = randomUUID();
   await h.ex.setTransferEnabled({ pairId: PAIR, enabled: false, requestId: enableId }, SESSION);
@@ -1390,3 +1400,34 @@ test('划转参数：缩短检查间隔立即生效；注入的校验在写入�
     assert.equal(transfers(h).length, 2);
   } finally { h.aster.releaseHung(); h.dispose(); }
 });
+
+test('划转参数：两个页面基于同一份参数先后保存，后到的因起始参数已变被拒（config_changed），不覆盖先到的；起始参数按数值比较', () => withHarness(async h => {
+  h.ex.registerTransferPair(SIM_TRANSFER_PAIR);
+  const start = stored(h).config;
+  setConfig(h, { maxTransfer: '40' }, randomUUID(), SESSION, start);
+  assert.throws(() => setConfig(h, { threshold: '25' }, randomUUID(), SESSION, start), (error: unknown) => error instanceof ContractError && error.status === 409
+    && error.code === 'config_changed' && error.message === '参数已被其他页面修改，请重新载入后再改');
+  assert.deepEqual([stored(h).config.maxTransfer, stored(h).config.threshold], ['40', '10']);
+  assert.equal(configEvents(h).length, 1);
+  // The same settings written differently ("40.0", "0.050") are the same starting point.
+  const reloaded = { ...stored(h).config, maxTransfer: '40.0', bufferRatio: '0.050' };
+  assert.equal(setConfig(h, { maxTransfer: '40', threshold: '25' }, randomUUID(), SESSION, reloaded).config.threshold, '25');
+  assert.throws(() => setConfig(h, { threshold: '26' }, randomUUID(), SESSION, { ...stored(h).config, threshold: null }), code('config_changed'));
+}));
+
+test('划转参数：只有改短检查间隔才提前下一次检查；改其他字段或改长间隔不动退避排好的时间', () => withHarness(async h => {
+  // Three sends that never left: the backoff puts the next check four intervals (20 s) out.
+  h.aster.inject({ operation: 'transfer', mode: 'not-sent', times: 3 });
+  await start(h, { maxTransfer: '30' });
+  await h.ex.tick();
+  await run(h, 15_000);
+  assert.equal(h.aster.calls.transfer, 3);
+  const scheduled = stored(h).nextCheckAt;
+  assert.equal(scheduled, h.clock.now + 20_000);
+  setConfig(h, { maxTransfer: '30', threshold: '20' });
+  assert.equal(stored(h).nextCheckAt, scheduled, '改别的字段不提前退避');
+  setConfig(h, { maxTransfer: '30', threshold: '20', checkIntervalMs: 10_000 });
+  assert.equal(stored(h).nextCheckAt, scheduled, '改长不动');
+  setConfig(h, { maxTransfer: '30', threshold: '20', checkIntervalMs: 2_000 });
+  assert.equal(stored(h).nextCheckAt, h.clock.now + 2_000, '改短提前');
+}));

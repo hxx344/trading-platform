@@ -91,6 +91,21 @@ const SETTLE_TEXT: Record<string, string> = {
   nonce_expired_unreadable: '流水无法完整读取，结果存疑', identity_changed: '配对账户已更换，按存疑处理',
 };
 
+/** The transfer settings as the settings page names them; the two times are shown in seconds. */
+const CONFIG_FIELDS: readonly { key: string; label: string; unit: string; seconds?: true }[] = [
+  { key: 'threshold', label: '差额门槛', unit: ' USD1' }, { key: 'minTransfer', label: '最小划转额', unit: ' USD1' }, { key: 'maxTransfer', label: '单次划转上限', unit: ' USD1' },
+  { key: 'bufferRatio', label: '现金保留比例', unit: '' }, { key: 'longReserve', label: '多侧固定保留额', unit: ' USD1' }, { key: 'shortReserve', label: '空侧固定保留额', unit: ' USD1' },
+  { key: 'cooldownMs', label: '划转冷却', unit: ' 秒', seconds: true }, { key: 'checkIntervalMs', label: '检查间隔', unit: ' 秒', seconds: true },
+];
+/** "label before → after unit" for each changed setting; the event carries no account. */
+function configChanges(before: unknown, after: unknown): string {
+  const old = (before ?? {}) as Record<string, unknown>, next = (after ?? {}) as Record<string, unknown>;
+  const shown = (value: unknown, seconds?: true): string => seconds ? (typeof value === 'number' ? String(value / 1000) : '?') : clip(value, 40);
+  const lines = CONFIG_FIELDS.filter(field => JSON.stringify(old[field.key]) !== JSON.stringify(next[field.key]))
+    .map(field => `${field.label} ${shown(old[field.key], field.seconds)} → ${shown(next[field.key], field.seconds)}${field.unit}`);
+  return lines.length ? lines.join('；') : '没有字段变化';
+}
+
 /** A message for the event, with a key that suppresses repeats of an ongoing problem, or null for routine events. */
 export function describeEvent(row: EventRow, incidentPair: (id: string) => string | null): { text: string; repeatKey?: string } | null {
   let detail: Record<string, unknown>;
@@ -110,6 +125,8 @@ export function describeEvent(row: EventRow, incidentPair: (id: string) => strin
       return { text: `【划转结算失败】配对 ${pair} 划转 ${short(detail.transfer)} 已连续 ${clip(detail.failures, 8)} 次无法结算：${clip(detail.reason)}`, repeatKey: `settle:${clip(detail.transfer, 64)}` };
     case 'transfer-tick-failed':
       return { text: `【划转循环出错】${clip(detail.reason)}`, repeatKey: `transfer-tick:${clip(detail.reason, 80)}` };
+    case 'transfer-pair-config':
+      return { text: `【划转参数已修改】配对 ${pair}：${configChanges(detail.before, detail.after)}` };
     case 'transfer-pair-switched':
       return { text: `【配对${detail.enabled ? '已启用' : '已停用'}】配对 ${pair}${detail.enabled ? '：本平台开始负责保证金平衡与 ADL 应急处理' : '：划转与新的 ADL 检测都已停止（未结束的 ADL 事件仍会处理完）；停用期间发生的 ADL 不会被处理'}` };
     case 'adl-incident-opened':

@@ -270,10 +270,19 @@ export interface TransferConfig {
 /** Legacy defaults (modules/aster/trading/margin_balance.py DEFAULT_MARGIN). */
 export const DEFAULT_TRANSFER_CONFIG: Readonly<TransferConfig> = Object.freeze({ threshold: '10', minTransfer: '1', maxTransfer: '1000', bufferRatio: '0.05', longReserve: '0', shortReserve: '0', cooldownMs: 30_000, checkIntervalMs: 5_000 });
 export const TRANSFER_CONFIG_KEYS = ['threshold', 'minTransfer', 'maxTransfer', 'bufferRatio', 'longReserve', 'shortReserve', 'cooldownMs', 'checkIntervalMs'] as const satisfies readonly (keyof TransferConfig)[];
-export function parseTransferConfig(value: unknown): TransferConfig {
-  const raw = exactKeys(value ?? {}, [], TRANSFER_CONFIG_KEYS);
+/**
+ * The config file's form fills a missing or null field with its default. `strict` (the page's settings) needs every
+ * field and takes no null, object, list or boolean as a value, so nothing is ever silently replaced by a default.
+ */
+export function parseTransferConfig(value: unknown, { strict = false }: { strict?: boolean } = {}): TransferConfig {
+  const raw = strict ? exactKeys(value, TRANSFER_CONFIG_KEYS) : exactKeys(value ?? {}, [], TRANSFER_CONFIG_KEYS);
+  const field = <K extends keyof TransferConfig>(key: K, name: string): unknown => {
+    const given = raw[key];
+    if (!strict) return given ?? DEFAULT_TRANSFER_CONFIG[key];
+    return typeof given === 'string' || typeof given === 'number' ? given : reject('invalid_value', `${name}须填写数值，不能为空值、对象、列表或布尔值`);
+  };
   const amount = (key: 'threshold' | 'minTransfer' | 'maxTransfer' | 'bufferRatio' | 'longReserve' | 'shortReserve', name: string, sign: 'positive' | 'nonnegative'): string => {
-    const parsed = decimalField(raw[key] ?? DEFAULT_TRANSFER_CONFIG[key], name, sign);
+    const parsed = decimalField(field(key, name), name, sign);
     return cmp(parsed, TRANSFER_AMOUNT_LIMIT) > 0 ? reject('invalid_value', `${name}超出范围`) : parsed;
   };
   const config: TransferConfig = {
@@ -283,8 +292,8 @@ export function parseTransferConfig(value: unknown): TransferConfig {
     bufferRatio: amount('bufferRatio', '现金保留比例', 'nonnegative'),
     longReserve: amount('longReserve', '多侧固定保留额', 'nonnegative'),
     shortReserve: amount('shortReserve', '空侧固定保留额', 'nonnegative'),
-    cooldownMs: integer(raw.cooldownMs ?? DEFAULT_TRANSFER_CONFIG.cooldownMs, 1_000, 86_400_000, '划转冷却毫秒数'),
-    checkIntervalMs: integer(raw.checkIntervalMs ?? DEFAULT_TRANSFER_CONFIG.checkIntervalMs, 1_000, 3_600_000, '检查间隔毫秒数'),
+    cooldownMs: integer(field('cooldownMs', '划转冷却毫秒数'), 1_000, 86_400_000, '划转冷却毫秒数'),
+    checkIntervalMs: integer(field('checkIntervalMs', '检查间隔毫秒数'), 1_000, 3_600_000, '检查间隔毫秒数'),
   };
   if (cmp(config.bufferRatio, '1') >= 0) reject('invalid_value', '现金保留比例须小于 1');
   if (cmp(config.minTransfer, TRANSFER_UNIT) < 0 || cmp(config.maxTransfer, config.minTransfer) < 0) reject('invalid_value', `最小划转额至少为 ${TRANSFER_UNIT} USD1，且不得大于单次划转上限`);

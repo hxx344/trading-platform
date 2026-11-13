@@ -191,6 +191,15 @@ export function transferRegistryOutcome(state: TransferState): 'confirmed' | 're
   return null;
 }
 
+/**
+ * Settings in one comparable form: parsed (so "10" and "10.0" are equal) and in a fixed key order; settings that no
+ * longer parse are compared as given, field by field.
+ */
+function canonicalConfig(value: object): string {
+  try { return JSON.stringify(parseTransferConfig(value, { strict: true })); }
+  catch { return JSON.stringify(TRANSFER_CONFIG_KEYS.map(key => (value as Record<string, unknown>)[key] ?? null)); }
+}
+
 export function createTransfers({ db, now, budgets, connector, control, write, assertWriter, callVenue, event, isWriterLost, busy, adlSending, enableGuard, onEnabled, configGuard }: TransferDeps) {
   checkBudgets(budgets, connector);
   /** Transfers whose send is running in this process; any other prepared or sending row was interrupted. */
@@ -776,28 +785,33 @@ export function createTransfers({ db, now, budgets, connector, control, write, a
   }
 
   /**
-   * Durable, idempotent change of a pair's settings from the page; every field is required, so a missing one is never
-   * filled with a default. It applies from the next evaluation: one already running sees the change in its send
-   * transaction and gives up that round. A transfer already sent is not affected, and the switch stays as it is.
+   * Durable, idempotent change of a pair's settings from the page; every field is required and none may be null, so a
+   * missing one is never filled with a default. `expected` is the stored settings the page's draft started from: when
+   * they no longer match (another page saved in between) the change is refused rather than overwriting that one.
+   * It applies from the next evaluation: one already running sees the change in its send transaction and gives up that
+   * round. A transfer already sent is not affected, and the switch stays as it is.
    */
   function setConfig(input: unknown, session: string): ReturnType<typeof pairView> {
-    const raw = exactKeys(input, ['pairId', 'requestId', 'config']);
+    const raw = exactKeys(input, ['pairId', 'requestId', 'expected', 'config']);
     const pairId = text(raw.pairId, '配对编号', PAIR_ID), requestId = raw.requestId;
     if (typeof requestId !== 'string' || !UUID.test(requestId)) return reject('request_id', '请求编号无效');
-    const config = parseTransferConfig(exactKeys(raw.config, TRANSFER_CONFIG_KEYS));
-    const payload = createHash('sha256').update(JSON.stringify({ kind: 'transfer-config', pairId, config })).digest('hex');
+    const config = parseTransferConfig(raw.config, { strict: true });
+    const expected = canonicalConfig(exactKeys(raw.expected, TRANSFER_CONFIG_KEYS));
+    const payload = createHash('sha256').update(JSON.stringify({ kind: 'transfer-config', pairId, expected, config })).digest('hex');
     return write(() => {
       const existing = db.prepare('SELECT digest, session FROM commands WHERE request_id = ?').get(requestId) as { digest: string; session: string } | undefined;
       if (existing && (existing.digest !== payload || existing.session !== session)) reject('request_reused', '请求编号已用于其他内容', 409);
       if (existing) return pairView(requirePair(pairId));
       const current = requirePair(pairId);
+      if (canonicalConfig(current.config) !== expected) reject('config_changed', '参数已被其他页面修改，请重新载入后再改', 409);
       configGuard?.(pairId, config, listPairs().pairs);
       db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(requestId, 'transfer-config', payload, session, pairId, now());
       const before = current.config;
       if (JSON.stringify(before) !== JSON.stringify(config)) {
         current.config = config;
-        // A shorter interval takes effect now rather than after the wait the old one scheduled.
-        current.nextCheckAt = Math.min(current.nextCheckAt, now() + config.checkIntervalMs);
+        // Only a shorter interval moves the next check: it takes effect now rather than after the wait the old one
+        // scheduled. Any other change leaves the schedule alone.
+        if (config.checkIntervalMs < before.checkIntervalMs) current.nextCheckAt = Math.min(current.nextCheckAt, now() + config.checkIntervalMs);
         savePair(current);
         event(null, 'transfer-pair-config', { pair: pairId, before, after: config, requestId });
       }

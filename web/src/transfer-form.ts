@@ -21,7 +21,9 @@ export const TRANSFER_FIELDS: readonly TransferField[] = [
   { key: 'checkIntervalMs', label: '检查间隔', unit: '秒', hint: '多久读一次两侧余额；越短占用的请求权重越多' },
 ];
 
-const TIME_KEYS = new Set<TransferKey>(['cooldownMs', 'checkIntervalMs']);
+/** The two times, typed in seconds; the ranges are the server's (parseTransferConfig) in seconds. */
+const TIME_RANGES: Partial<Record<TransferKey, { min: number; max: number }>> = { cooldownMs: { min: 1, max: 86_400 }, checkIntervalMs: { min: 1, max: 3_600 } };
+const TIME_KEYS = new Set<TransferKey>(Object.keys(TIME_RANGES) as TransferKey[]);
 const SECONDS = /^\d+(\.\d{1,3})?$/;
 
 const shown = (key: TransferKey, value: string | number): string => TIME_KEYS.has(key) ? String(Number(value) / 1000) : String(value);
@@ -34,14 +36,18 @@ export function transferDraft(config: TransferConfig): TransferDraft {
 /** The default as the form shows it. */
 export const defaultText = (key: TransferKey): string => shown(key, TRANSFER_DEFAULTS[key]);
 
-/** The request body, or why the input cannot be sent (only the seconds are checked here; the server checks the rest). */
+/** The settings to send, or why the input cannot be sent (only the seconds are checked here; the server checks the rest). */
 export function transferBody(draft: TransferDraft): { config: TransferConfig } | { error: string } {
   const config = {} as Record<TransferKey, string | number>;
   for (const { key, label } of TRANSFER_FIELDS) {
     const value = draft[key].trim();
-    if (TIME_KEYS.has(key)) {
+    const range = TIME_RANGES[key];
+    if (range) {
       if (!SECONDS.test(value)) return { error: `${label}须为秒数（最多三位小数）` };
-      config[key] = Math.round(Number(value) * 1000);
+      const ms = Math.round(Number(value) * 1000);
+      // A huge number of seconds would lose precision in milliseconds; it is out of range either way.
+      if (!Number.isSafeInteger(ms) || ms < range.min * 1000 || ms > range.max * 1000) return { error: `${label}须在 ${range.min} 至 ${range.max} 秒之间` };
+      config[key] = ms;
     } else config[key] = value;
   }
   return { config: config as unknown as TransferConfig };

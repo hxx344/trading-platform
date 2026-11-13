@@ -196,7 +196,7 @@ test('历史列表合并：滑出最新页的记录保留；加载过更早页�
   assert.deepEqual(ids(whole), ['i', 'j', 'k']);
 });
 
-test('设置页划转表单：秒与毫秒互换，非法秒数在本地拦下，其余原样交服务端校验；改动项列出改前改后；默认值与服务端一致', async () => {
+test('设置页划转表单：秒与毫秒互换，非法或超出范围的秒数在本地拦下（按秒提示），其余原样交服务端校验；改动项列出改前改后；默认值与服务端一致', async () => {
   const { TRANSFER_DEFAULTS, TRANSFER_FIELDS, defaultText, transferBody, transferChanges, transferDraft } = await import('../web/src/transfer-form.ts');
   const { DEFAULT_TRANSFER_CONFIG, TRANSFER_CONFIG_KEYS } = await import('../src/contracts.ts');
   assert.deepEqual(TRANSFER_DEFAULTS, DEFAULT_TRANSFER_CONFIG);
@@ -207,6 +207,10 @@ test('设置页划转表单：秒与毫秒互换，非法秒数在本地拦下�
   assert.deepEqual(transferBody(draft), { config });
   assert.deepEqual(transferBody({ ...draft, threshold: ' abc ', cooldownMs: '1.25' }), { config: { ...config, threshold: 'abc', cooldownMs: 1_250 } });
   for (const bad of ['', '-1', '1e3', '0.0001', '五']) assert.match((transferBody({ ...draft, checkIntervalMs: bad }) as { error: string }).error, /检查间隔须为秒数/, bad);
+  // Out of range in seconds, a number too large to be exact in milliseconds included, is stopped here with second units.
+  for (const bad of ['0', '0.999', '3600.001', '9'.repeat(16), '9'.repeat(400)]) assert.equal((transferBody({ ...draft, checkIntervalMs: bad }) as { error: string }).error, '检查间隔须在 1 至 3600 秒之间', bad);
+  for (const bad of ['0.5', '86401']) assert.equal((transferBody({ ...draft, cooldownMs: bad }) as { error: string }).error, '划转冷却须在 1 至 86400 秒之间', bad);
+  assert.deepEqual(transferBody({ ...draft, cooldownMs: '86400', checkIntervalMs: '3600' }), { config: { ...config, cooldownMs: 86_400_000, checkIntervalMs: 3_600_000 } });
   assert.deepEqual(transferChanges(config, { ...config, threshold: '20', checkIntervalMs: 10_000 }), ['差额门槛 10 → 20 USD1', '检查间隔 2.5 → 10 秒']);
   assert.deepEqual(transferChanges(config, config), []);
 });

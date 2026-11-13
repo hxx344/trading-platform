@@ -5,7 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { add, bandEdge, cmp, floorToStep, isMultiple, isZero, mul, sub, units, fromUnits } from './decimal.ts';
 import {
   ContractError, MAX_SLIPPAGE_BPS, UUID, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, exactKeys, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseInstrument, parseIntent, parseNotionalLimits, parseQuote, positionOf, reject, text,
-  type AccountBinding, type NotionalLimits, type AccountSnapshot, type Action, type Environment, type Instrument, type Intent, type LegOrderType, type OrderSide, type PositionSide, type Quote, type Venue,
+  type AccountBinding, type NotionalLimits, type AccountSnapshot, type Action, type Environment, type Instrument, type Intent, type LegOrderType, type OrderSide, type PositionSide, type Quote, type TransferConfig, type Venue,
 } from './contracts.ts';
 import {
   STRATEGY_ID, VenueError, parseOrderReport, parseStrategyAck, parseStrategyReport, strategyRequestOf, supportsChase,
@@ -1548,6 +1548,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     setTransferEnabled: transfers.setEnabled,
     setTransferConfig: transfers.setConfig,
     transferPairs: transfers.pairs,
+    /** Each readable pair's switch and stored settings only, without the balances, open transfer or blocks of a pair view. */
+    transferPairSettings: (): { id: string; enabled: boolean; config: TransferConfig }[] => transfers.records().map(pair => ({ id: pair.id, enabled: pair.enabled, config: pair.config })),
     /** Unmasked accounts of the pairs that may still write: enabled, or with an ADL incident not yet finished. */
     writableAccounts: (): string[] => [...new Set(transfers.records().filter(pair => pair.enabled || adl.busy(pair.id) !== null).flatMap(pair => [pair.mainAccountId, pair.long, pair.short]))],
     corruptTransferPairs: transfers.corruptPairs,

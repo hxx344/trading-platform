@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { AdlPanel } from './AdlPanel.tsx';
+import { ImportPanel } from './ImportPanel.tsx';
 import { PairDetail } from './PairDetail.tsx';
 import { PairsPanel } from './PairsPanel.tsx';
 import { PositionsPanel } from './PositionsPanel.tsx';
@@ -66,6 +67,8 @@ export function App() {
       <PositionsPanel view={state.positions} stale={stale} shownAt={state.positions.checkedAt} />
       <AdlPanel state={state} onChanged={changed} />
     </>}
+    {/* The import does not need the state: it stays usable when the state cannot be read (the way to add the first pair). */}
+    {route.page === 'settings' ? <ImportPanel onImported={changed} /> : null}
     </>}
   </main>;
 }

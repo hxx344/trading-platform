@@ -104,7 +104,7 @@ export function PairDetail({ state, pairId, stale, onExpired }: { state: Service
   const pair = pairs.find(item => item.id === id) ?? null;
   const positions = state.positions.pairs.find(item => item.pairId === id) ?? null;
   const pick = useCallback((next: string) => { location.hash = pairHref(next); }, []);
-  if (!pairs.length) return <StatePanel kind="empty" title="还没有配对" detail="在「总览」导入或登记配对后，这里显示每个配对的详情。" />;
+  if (!pairs.length) return <StatePanel kind="empty" title="还没有配对" detail="在「设置」页导入或登记配对后，这里显示每个配对的详情。" />;
   return <>
     <div className="toolbar">
       <label className="pair-pick">配对 <select value={id ?? ''} onChange={event => pick(event.target.value)}>

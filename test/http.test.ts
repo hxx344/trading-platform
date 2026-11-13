@@ -344,30 +344,36 @@ test('HTTP：保留会话的登录 cookie 带 Max-Age，随机会话的不带', 
   }
 });
 
-test('HTTP：划转参数接口须会话与请求标记，字段须齐全；同一编号重放返回当前结果，编号用于别的内容 409', () => withServer(async (base, cookie, h) => {
-  h.ex.registerTransferPair(SIM_TRANSFER_PAIR);
+test('HTTP：划转参数接口须会话与请求标记，字段须齐全且带起始参数；同一编号重放返回当前结果，编号用于别的内容 409；起始参数已变 409', () => withServer(async (base, cookie, h) => {
+  const registered = h.ex.registerTransferPair(SIM_TRANSFER_PAIR).config;
   const path = `/api/transfer-pairs/${SIM_TRANSFER_PAIR.id}/config`;
   const config = { threshold: '20', minTransfer: '1', maxTransfer: '500', bufferRatio: '0.1', longReserve: '5', shortReserve: '0', cooldownMs: 60_000, checkIntervalMs: 10_000 };
-  assert.equal((await post(base, path, { requestId: randomUUID(), ...config }, {})).status, 401);
-  assert.equal((await fetch(base + path, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ requestId: randomUUID(), ...config }) })).status, 403);
-  assert.equal((await fetch(base + path, { method: 'POST', headers: { cookie, 'x-pa-executor': '1', 'content-type': 'text/plain' }, body: JSON.stringify({ requestId: randomUUID(), ...config }) })).status, 403);
-  const { checkIntervalMs: _omitted, ...partial } = config;
-  for (const body of [partial, { ...config, pairId: 'x' }, { ...config, threshold: 'abc' }, { ...config, checkIntervalMs: 500 }, { ...config, requestId: undefined }]) {
+  const first = { expected: registered, ...config };
+  assert.equal((await post(base, path, { requestId: randomUUID(), ...first }, {})).status, 401);
+  assert.equal((await fetch(base + path, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ requestId: randomUUID(), ...first }) })).status, 403);
+  assert.equal((await fetch(base + path, { method: 'POST', headers: { cookie, 'x-pa-executor': '1', 'content-type': 'text/plain' }, body: JSON.stringify({ requestId: randomUUID(), ...first }) })).status, 403);
+  const { checkIntervalMs: _omitted, ...partial } = first;
+  const { checkIntervalMs: _alsoOmitted, ...partialExpected } = registered;
+  for (const body of [partial, config, { ...first, expected: partialExpected }, { ...first, expected: null }, { ...first, threshold: null }, { ...first, pairId: 'x' }, { ...first, threshold: 'abc' }, { ...first, checkIntervalMs: 500 }, { ...first, requestId: undefined }]) {
     const response = await post(base, path, { requestId: randomUUID(), ...body }, { cookie });
     assert.equal(response.status, 400, JSON.stringify(body));
   }
-  assert.equal((await post(base, '/api/transfer-pairs/unknown/config', { requestId: randomUUID(), ...config }, { cookie })).status, 404);
+  assert.equal((await post(base, '/api/transfer-pairs/unknown/config', { requestId: randomUUID(), ...first }, { cookie })).status, 404);
   assert.equal((await fetch(base + path, { headers: { cookie } })).status, 404, '只接受 POST');
   const requestId = randomUUID();
-  const saved = await post(base, path, { requestId, ...config }, { cookie });
+  const saved = await post(base, path, { requestId, ...first }, { cookie });
   assert.equal(saved.status, 200);
   assert.deepEqual(((await saved.json()) as { config: unknown }).config, config);
-  await post(base, path, { requestId: randomUUID(), ...config, threshold: '30' }, { cookie });
-  const replay = await post(base, path, { requestId, ...config }, { cookie });
+  assert.equal((await post(base, path, { requestId: randomUUID(), expected: config, ...config, threshold: '30' }, { cookie })).status, 200);
+  const replay = await post(base, path, { requestId, ...first }, { cookie });
   assert.equal(replay.status, 200);
   assert.equal(((await replay.json()) as { config: { threshold: string } }).config.threshold, '30');
-  const reused = await post(base, path, { requestId, ...config, threshold: '40' }, { cookie });
+  const reused = await post(base, path, { requestId, ...first, threshold: '40' }, { cookie });
   assert.deepEqual([reused.status, ((await reused.json()) as { code: string }).code], [409, 'request_reused']);
+  // A second page still holding the settings from before the change above is refused, not allowed to overwrite it.
+  const behind = await post(base, path, { requestId: randomUUID(), expected: config, ...config, threshold: '40' }, { cookie });
+  const refusal = (await behind.json()) as { code: string; message: string };
+  assert.deepEqual([behind.status, refusal.code, refusal.message], [409, 'config_changed', '参数已被其他页面修改，请重新载入后再改']);
   const state = (await (await fetch(base + '/api/state', { headers: { cookie } })).json()) as { transfers: { pairs: { config: { threshold: string } }[] } };
   assert.equal(state.transfers.pairs[0]!.config.threshold, '30');
 }));

@@ -243,8 +243,9 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     }
     const pairConfig = request.method === 'POST' ? PAIR_CONFIG_PATH.exec(url.pathname) : null;
     if (pairConfig) {
-      const { requestId, ...config } = exactKeys(await readJson(request), ['requestId', ...TRANSFER_CONFIG_KEYS]);
-      return send(response, 200, executor.setTransferConfig({ pairId: pairConfig[1], requestId, config }, sessionId));
+      // `expected` is the stored settings the page's draft started from; a mismatch is refused as changed elsewhere.
+      const { requestId, expected, ...config } = exactKeys(await readJson(request), ['requestId', 'expected', ...TRANSFER_CONFIG_KEYS]);
+      return send(response, 200, executor.setTransferConfig({ pairId: pairConfig[1], requestId, expected, config }, sessionId));
     }
     const adlConfig = request.method === 'POST' ? ADL_CONFIG_PATH.exec(url.pathname) : null;
     if (adlConfig) {

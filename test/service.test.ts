@@ -578,7 +578,7 @@ test('服务装配：配置里的 transfer 只在配对首次登记时作为初�
     const config = parseServiceConfig({ ...configRaw([pair]), budget: { limitPerMinute: 600, adlReserve: 100 } });
     let { executor } = await wired(fake, store, config);
     assert.equal(executor.transferPairs()[0]!.config.threshold, '20', '首次登记用配置里的初始值');
-    executor.setTransferConfig({ pairId: 'p1', requestId: randomUUID(), config: { ...executor.transferPairs()[0]!.config, threshold: '35', cooldownMs: 60_000 } }, 's');
+    executor.setTransferConfig({ pairId: 'p1', requestId: randomUUID(), expected: executor.transferPairs()[0]!.config, config: { ...executor.transferPairs()[0]!.config, threshold: '35', cooldownMs: 60_000 } }, 's');
     executor.close();
 
     // The config still says 20 (and a new maxTransfer): the page's values stay, and the log says so.
@@ -608,7 +608,7 @@ test('服务装配：页面改短检查间隔时按全部配对重算空闲请�
     // One pair at 5 s: 100 headroom + 120 balance checks + 140 positions and scans = 360 of the 500 left after the reserve.
     const config = parseServiceConfig({ ...configRaw(), budget: { limitPerMinute: 600, adlReserve: 100 } });
     let { executor } = await wired(fake, store, config);
-    const set = (checkIntervalMs: number) => executor.setTransferConfig({ pairId: 'p1', requestId: randomUUID(), config: { ...executor.transferPairs()[0]!.config, checkIntervalMs } }, 's');
+    const set = (checkIntervalMs: number) => executor.setTransferConfig({ pairId: 'p1', requestId: randomUUID(), expected: executor.transferPairs()[0]!.config, config: { ...executor.transferPairs()[0]!.config, checkIntervalMs } }, 's');
     assert.throws(() => set(1_000), (error: unknown) => error instanceof ContractError && error.status === 409 && error.code === 'budget_exceeded'
       && /约为每分钟 840，超过每分钟上限 600 减去 ADL 预留 100 后的 500；当前最短可用 2308 毫秒（约 2.4 秒）/.test(error.message));
     assert.equal(executor.transferPairs()[0]!.config.checkIntervalMs, 5_000);
@@ -623,9 +623,102 @@ test('服务装配：页面改短检查间隔时按全部配对重算空闲请�
     const lines: string[] = [];
     ({ executor } = await wired(fake, store, tight, lines));
     assert.ok(lines.some(line => /每分钟约需请求权重 500，超过每分钟上限 400 减去 ADL 预留 40 后的 360/.test(line)), lines.join('\n'));
-    // Changes that add nothing still go through; a shorter interval is refused, and with nothing left none fits.
-    assert.equal(executor.setTransferConfig({ pairId: 'p1', requestId: randomUUID(), config: { ...executor.transferPairs()[0]!.config, threshold: '15' } }, 's').config.threshold, '15');
-    assert.throws(() => executor.setTransferConfig({ pairId: 'p1', requestId: randomUUID(), config: { ...executor.transferPairs()[0]!.config, checkIntervalMs: 2_000 } }, 's'), /当前最短可用 5000 毫秒/);
+    // Changes that add nothing still go through; a shorter interval is refused. What is left would buy a 5 s interval,
+    // but the stored 2.3 s already passes (it adds nothing), so that is the shortest named.
+    assert.equal(executor.setTransferConfig({ pairId: 'p1', requestId: randomUUID(), expected: executor.transferPairs()[0]!.config, config: { ...executor.transferPairs()[0]!.config, threshold: '15' } }, 's').config.threshold, '15');
+    assert.throws(() => executor.setTransferConfig({ pairId: 'p1', requestId: randomUUID(), expected: executor.transferPairs()[0]!.config, config: { ...executor.transferPairs()[0]!.config, checkIntervalMs: 2_000 } }, 's'), /当前最短可用 2308 毫秒/);
+    executor.close();
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('服务装配：其余配对已用满请求权重时，改短检查间隔的提示为不得短于当前间隔', async () => {
+  const dir = tempDir();
+  const store = openStore(join(dir, 'executor-live.sqlite'));
+  const fake = new FakeAster();
+  try {
+    // Only registered, never read at the venue: two more addresses are enough for the second pair.
+    const OTHER_LONG = { ...LONG, user: '0x' + '4d'.repeat(20) }, OTHER_SHORT = { ...SHORT, user: '0x' + '5e'.repeat(20) };
+    const pairs = [{ id: 'p1', main: 'main', long: 'a', short: 'b' }, { id: 'p2', main: 'main', long: 'a2', short: 'b2' }];
+    const secrets: ServiceSecrets = { accounts: new Map([['main', MAIN], ['a', LONG], ['b', SHORT], ['a2', OTHER_LONG], ['b2', OTHER_SHORT]]), feishu: null };
+    const wire = (config: ServiceConfig) => wireService(config, secrets, store, { fetchImpl: fake.fetch, log: () => {} });
+    let { executor } = await wire(parseServiceConfig({ ...configRaw(pairs), budget: { limitPerMinute: 2000, adlReserve: 100 } }));
+    const p2 = executor.transferPairs().find(pair => pair.id === 'p2')!.config;
+    executor.setTransferConfig({ pairId: 'p2', requestId: randomUUID(), expected: p2, config: { ...p2, checkIntervalMs: 1_000 } }, 's');
+    executor.close();
+    // Sized for both at 5 s (620); p2 at 1 s now needs 1100 on its own share, leaving p1 nothing to shorten into.
+    ({ executor } = await wire(parseServiceConfig({ ...configRaw(pairs), budget: { limitPerMinute: 720, adlReserve: 100 } })));
+    const p1 = executor.transferPairs().find(pair => pair.id === 'p1')!.config;
+    assert.throws(() => executor.setTransferConfig({ pairId: 'p1', requestId: randomUUID(), expected: p1, config: { ...p1, checkIntervalMs: 4_000 } }, 's'),
+      (error: unknown) => error instanceof ContractError && error.code === 'budget_exceeded' && /其余配对已用满，不得短于当前的 5000 毫秒（约 5 秒）/.test(error.message), '');
+    executor.close();
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('服务装配：不在 config.json 里的配对从页面启用时，计入后超过请求权重即拒绝并说明；额度够才进入接管检查', async () => {
+  const dir = tempDir();
+  const store = openStore(join(dir, 'executor-live.sqlite'));
+  const fake = new FakeAster();
+  try {
+    let { executor } = await wired(fake, store, parseServiceConfig(configRaw()));
+    executor.close();
+    // Dropped from the config: left in the database switched off, and the budget is sized for no pair at all.
+    ({ executor } = await wired(fake, store, parseServiceConfig({ ...configRaw([]), budget: { limitPerMinute: 300, adlReserve: 100 } })));
+    assert.equal(executor.transferPairs()[0]!.enabled, false);
+    const before = fake.calls.length;
+    await assert.rejects(executor.setTransferEnabled({ pairId: 'p1', enabled: true, requestId: randomUUID() }, 's'), (error: unknown) => error instanceof ContractError
+      && error.status === 409 && error.code === 'budget_exceeded' && /配对 p1 不在 config.json 中，启用后按它的检查间隔 5000 毫秒计入，配对空闲时每分钟约需请求权重 360，超过每分钟上限 300 减去 ADL 预留 100 后的 200/.test(error.message));
+    // Refused before the takeover checks spent any weight (only the ownership listing ran).
+    assert.ok(fake.calls.slice(before).every(call => !/openOrders|income|positionRisk/.test(call.path)), JSON.stringify(fake.calls.slice(before).map(call => call.path)));
+    assert.equal(executor.transferPairs()[0]!.enabled, false);
+    executor.close();
+    // With room for it, the switch goes through the takeover checks as for a configured pair.
+    ({ executor } = await wired(fake, store, parseServiceConfig({ ...configRaw([]), budget: { limitPerMinute: 600, adlReserve: 100 } })));
+    await executor.setTransferEnabled({ pairId: 'p1', enabled: true, requestId: randomUUID() }, 's');
+    assert.equal(executor.transferPairs()[0]!.enabled, true);
+    executor.close();
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('服务装配：库里的划转参数通不过当前规则时改用 config.json 的 transfer 并告警，登记照常（换账户不失效）', async () => {
+  const dir = tempDir();
+  const store = openStore(join(dir, 'executor-live.sqlite'));
+  const fake = new FakeAster();
+  try {
+    const config = parseServiceConfig(configRaw([{ id: 'p1', main: 'main', long: 'a', short: 'b', transfer: { threshold: '20' } }]));
+    let { executor } = await wired(fake, store, config);
+    executor.close();
+    // A record written under older rules: a ratio the current parse refuses.
+    const row = store.db.prepare("SELECT json FROM transfer_pairs WHERE id = 'p1'").get() as { json: string };
+    const record = JSON.parse(row.json) as { config: Record<string, unknown>; long: string };
+    record.config.bufferRatio = '1.5';
+    store.db.prepare("UPDATE transfer_pairs SET json = ? WHERE id = 'p1'").run(JSON.stringify(record));
+    const lines: string[] = [];
+    let warnings: string[];
+    // The long and short accounts swapped in the config: an account change that must still be registered.
+    ({ executor, warnings } = await wired(fake, store, parseServiceConfig(configRaw([{ id: 'p1', main: 'main', long: 'b', short: 'a', transfer: { threshold: '20' } }])), lines));
+    const [pair] = executor.transferPairs();
+    assert.deepEqual([pair!.config.threshold, pair!.config.bufferRatio, pair!.long.slice(-4)], ['20', '0.05', SHORT.user.slice(-4)]);
+    assert.ok(warnings.some(line => /配对 p1 库里的划转参数不符合当前规则（现金保留比例须小于 1），已改用 config.json 的 transfer/.test(line)), warnings.join('\n'));
+    assert.ok(!lines.some(line => /登记失败/.test(line)), lines.join('\n'));
+    executor.close();
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('飞书告警：页面修改划转参数发一条通知，只列改动字段（中文名与单位，冷却与间隔为秒），不含账户', async () => {
+  const dir = tempDir();
+  const store = openStore(join(dir, 'executor-live.sqlite'));
+  const fake = new FakeAster();
+  try {
+    const { executor } = await wired(fake, store, parseServiceConfig(configRaw()));
+    const config = executor.transferPairs()[0]!.config;
+    executor.setTransferConfig({ pairId: 'p1', requestId: randomUUID(), expected: config, config: { ...config, maxTransfer: '500', cooldownMs: 90_000, checkIntervalMs: 10_000 } }, 's');
+    // The same values again change nothing and leave no event.
+    executor.setTransferConfig({ pairId: 'p1', requestId: randomUUID(), expected: executor.transferPairs()[0]!.config, config: executor.transferPairs()[0]!.config }, 's');
+    const rows = store.db.prepare("SELECT seq, type, at, json FROM events WHERE type = 'transfer-pair-config'").all() as unknown as EventRow[];
+    assert.equal(rows.length, 1);
+    const text = describeEvent(rows[0]!, () => null)!.text;
+    assert.equal(text, '【划转参数已修改】配对 p1：单次划转上限 1000 → 500 USD1；划转冷却 30 → 90 秒；检查间隔 5 → 10 秒');
+    for (const account of [MAIN.user, LONG.user, SHORT.user]) assert.ok(!text.toLowerCase().includes(account.toLowerCase().slice(2, 10)));
     executor.close();
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });

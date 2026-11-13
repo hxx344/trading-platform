@@ -60,7 +60,8 @@ export function idleWeight(config: ServiceConfig, pairs: readonly BudgetedPair[]
 /**
  * Refuses a check interval that would push the idle weight over the limit less the ADL reserve, naming the shortest
  * interval that fits. A change that adds nothing (the same or a longer interval) always passes, so a database whose
- * intervals already overrun the budget at start still takes edits.
+ * intervals already overrun the budget at start still takes edits; the pair's current interval is therefore always
+ * usable, and the shortest named is never longer than it.
  */
 export function checkIntervalBudget(config: ServiceConfig, pairs: readonly BudgetedPair[], pairId: string, checkIntervalMs: number): void {
   const before = idleWeight(config, pairs), after = idleWeight(config, pairs, { pairId, checkIntervalMs });
@@ -69,9 +70,24 @@ export function checkIntervalBudget(config: ServiceConfig, pairs: readonly Budge
   // The others' use stays; what is left buys this many balance checks a minute.
   const checks = Math.floor((after.available - (before.needed - checkWeight(current))) / 10);
   const limit = `每分钟上限 ${after.limitPerMinute} 减去 ADL 预留 ${after.adlReserve} 后的 ${after.available}`;
-  if (checks < 1) reject('budget_exceeded', `检查间隔 ${checkIntervalMs} 毫秒会使空闲请求权重约为每分钟 ${after.needed}，超过${limit}；其余配对已用满，任何间隔都放不下，请调大 config.json 的 budget.limitPerMinute`, 409);
-  const shortest = Math.max(1_000, Math.ceil(60_000 / checks));
-  reject('budget_exceeded', `检查间隔 ${checkIntervalMs} 毫秒会使空闲请求权重约为每分钟 ${after.needed}，超过${limit}；当前最短可用 ${shortest} 毫秒（约 ${Math.ceil(shortest / 100) / 10} 秒）`, 409);
+  const over = `检查间隔 ${checkIntervalMs} 毫秒会使空闲请求权重约为每分钟 ${after.needed}，超过${limit}`;
+  if (checks < 1) reject('budget_exceeded', `${over}；其余配对已用满，不得短于当前的 ${current} 毫秒（约 ${seconds(current)} 秒）；要更短请调大 config.json 的 budget.limitPerMinute`, 409);
+  const shortest = Math.min(current, Math.max(1_000, Math.ceil(60_000 / checks)));
+  reject('budget_exceeded', `${over}；当前最短可用 ${shortest} 毫秒（约 ${seconds(shortest)} 秒）`, 409);
+}
+const seconds = (ms: number): number => Math.ceil(ms / 100) / 10;
+
+/**
+ * Refuses to switch on a pair that is not in config.json when its idle use would push the weight over the limit less
+ * the ADL reserve: the budget was sized for the configured pairs only, and an enabled left-over pair is counted on top.
+ * A pair already counted (configured, or already on) adds nothing and passes.
+ */
+export function enableBudget(config: ServiceConfig, pairs: readonly BudgetedPair[], pairId: string): void {
+  const pair = pairs.find(item => item.id === pairId);
+  if (!pair) return;
+  const before = idleWeight(config, pairs), after = idleWeight(config, pairs.map(item => item.id === pairId ? { ...item, enabled: true } : item));
+  if (after.needed <= after.available || after.needed <= before.needed) return;
+  reject('budget_exceeded', `配对 ${pairId} 不在 config.json 中，启用后按它的检查间隔 ${pair.config.checkIntervalMs} 毫秒计入，配对空闲时每分钟约需请求权重 ${after.needed}，超过每分钟上限 ${after.limitPerMinute} 减去 ADL 预留 ${after.adlReserve} 后的 ${after.available}；请先在设置页调大它的检查间隔，或把它写进 config.json 并调大 budget.limitPerMinute`, 409);
 }
 
 /**

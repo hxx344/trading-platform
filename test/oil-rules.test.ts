@@ -224,6 +224,18 @@ test('库：版本比本版本新时拒绝打开；参数读不了的规则保�
     assert.match(broken.problem!, /^规则参数无法读取/);
     assert.equal(broken.observing, false);
     assert.deepEqual([broken.events, broken.observations], [[], []]);
+    // Records read back keep only well-formed items, at most 30; text that is not JSON reads as a stopped rule.
+    const good = { at: 1, kind: 'reset', message: '好' }, signal = { at: 2, kind: 'signal', message: '信号', value: '4', threshold: '4', hits: 2, bzAt: 1, clAt: 1 };
+    const mixed = [null, { at: 'x', kind: 'note', message: '坏' }, { at: 1, message: '缺类型' }, { ...signal, bzAt: undefined }, signal, ...Array.from({ length: 31 }, () => good)];
+    const patch = new DatabaseSync(file);
+    patch.prepare('UPDATE rules SET state = ?').run(JSON.stringify({ observing: false, events: mixed, observations: [signal, { ...signal, kind: 'other' }] }));
+    const filtered = first(again.view());
+    assert.equal(filtered.events.length, 30);
+    assert.ok(filtered.events.every(item => item.message === '好'));
+    assert.deepEqual(filtered.observations.map(item => item.message), ['信号']);
+    patch.exec(`UPDATE rules SET state = '{not json'`);
+    patch.close();
+    assert.deepEqual([first(again.view()).observing, first(again.view()).events], [false, []]);
     again.act(broken.id, 'delete', { revision: broken.revision });
     again.close();
     const newer = new DatabaseSync(file);

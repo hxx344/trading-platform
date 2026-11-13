@@ -111,7 +111,14 @@ function placeholderConfig(text: string): RuleConfig {
 function stateOf(text: string): RuleState {
   let raw: Record<string, unknown> = {};
   try { const value: unknown = JSON.parse(text); if (value && typeof value === 'object' && !Array.isArray(value)) raw = value as Record<string, unknown>; } catch { /* nothing to keep */ }
-  const records = (value: unknown): RuleEvent[] => Array.isArray(value) ? value.filter((item): item is RuleEvent => !!item && typeof item === 'object' && Number.isFinite((item as RuleEvent).at) && typeof (item as RuleEvent).message === 'string').slice(-MAX_EVENTS) : [];
+  const valid = (item: unknown): item is RuleEvent => {
+    if (!item || typeof item !== 'object') return false;
+    const record = item as Record<string, unknown>;
+    if (!Number.isFinite(record.at) || typeof record.message !== 'string' || !['signal', 'reset', 'note'].includes(record.kind as string)) return false;
+    // A signal is shown with its value, threshold, count and both book times.
+    return record.kind !== 'signal' || (typeof record.value === 'string' && typeof record.threshold === 'string' && ['hits', 'bzAt', 'clAt'].every(key => Number.isFinite(record[key])));
+  };
+  const records = (value: unknown): RuleEvent[] => Array.isArray(value) ? value.filter(valid).slice(-MAX_EVENTS) : [];
   return { mode: 'observe', observing: raw.observing === true, events: records(raw.events), observations: records(raw.observations) };
 }
 

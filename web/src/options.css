@@ -481,3 +481,6 @@
   .options-desk .pstat > div:nth-child(n+3) { border-top: 1px solid var(--line); }
   .options-desk .desk-side .health-values { grid-template-columns: minmax(0, 1fr); }
 }
+.options-desk .schedule-side { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+.options-desk .schedule-side .link-button { font-size: 10px; }
+.options-desk .scheduled-tag { margin-right: 8px; color: var(--accent); border-color: var(--accent); vertical-align: middle; }

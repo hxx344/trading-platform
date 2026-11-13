@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { ContractError } from '../src/contracts.ts';
 import type { OptionsEngine } from '../src/options/engine.ts';
 import { optionsViews } from '../src/service/options.ts';
-import { chainLines, orderState, parseQuantity, payoffCurve, planBody, startBody, startRefused, taskSummary } from '../web/src/options-form.ts';
+import { autoOpenConfirm, chainLines, orderState, parseQuantity, payoffCurve, planBody, scheduleTime, startBody, startRefused, taskSummary } from '../web/src/options-form.ts';
 import type { ChainRow, Execution, OrderRow, Plan, PreviewLeg, Task } from '../web/src/options-types.ts';
 
 const PLAN: Plan = {
@@ -95,4 +95,17 @@ test('期权页面：组合进度按委托成交数量，金额只在各腿成�
   assert.equal(orderState(orders[1]!, ended).label, '状态未知 · 待核对');
   assert.equal(orderState(order('A', '0.3', true, 'timeout_cancelled'), ended).label, '部分成交 · 已结束');
   assert.equal(orderState(order('A', '0', true, 'timeout_cancelled'), ended).label, '已撤单');
+});
+
+test('the auto-open confirmation names the window, the strategy, the limits and what IOC can and cannot do', () => {
+  const settings = { maxRiskUsd: 1500, maxMarginUsd: 8000, legQty: '0.05', strategyMode: 'iron_condor' as const, orderTimeoutSeconds: 60, feeRate: 0.0003, marginBufferPct: 10, marginMode: 'PORTFOLIO_MARGIN' };
+  const schedule = { enabled: false, source: 'config' as const, configEnabled: false, hourUtc: 8, minuteUtc: 5, windowSeconds: 60, marketFallback: false, nextAt: 0, inWindow: false, waiting: false, lastOpenWeek: null, lastError: null };
+  assert.equal(scheduleTime(schedule), '周五 08:05 UTC');
+  const text = autoOpenConfirm(settings, schedule);
+  assert.match(text, /每周五 08:05 UTC 起 60 秒内/);
+  assert.match(text, /四腿铁鹰，每腿 0\.05 BTC，最大亏损上限 \$1,500，保证金上限 \$8,000/);
+  assert.match(text, /不补单/);
+  assert.doesNotMatch(text, /5 秒内就会实盘开仓/);
+  assert.match(autoOpenConfirm(settings, { ...schedule, waiting: true }).split('\n')[0]!, /确认后约 5 秒内就会实盘开仓/);
+  assert.match(autoOpenConfirm(settings, { ...schedule, marketFallback: true }), /补发一次 IOC.*通常会把 IOC 拦下/);
 });

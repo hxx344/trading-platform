@@ -66,7 +66,8 @@ export interface OptionsClient {
   order(symbol: string, link: string, signal: AbortSignal): Promise<Row | null>;
   executions(link: string, signal: AbortSignal): Promise<Row[]>;
   closedPositions(symbol: string, startMs: number, endMs: number, signal: AbortSignal): Promise<Row[]>;
-  create(order: { symbol: string; side: 'Buy' | 'Sell'; qty: string; price: string; link: string; reduceOnly: boolean }, signal: AbortSignal): Promise<Row>;
+  /** A limit order: GTC (the default) follows the book; IOC is the bounded fallback for an opening leg's remainder. */
+  create(order: { symbol: string; side: 'Buy' | 'Sell'; qty: string; price: string; link: string; reduceOnly: boolean; timeInForce?: 'GTC' | 'IOC' }, signal: AbortSignal): Promise<Row>;
   amend(symbol: string, link: string, price: string, signal: AbortSignal): Promise<Row>;
   cancel(symbol: string, link: string, signal: AbortSignal): Promise<Row>;
 }
@@ -207,7 +208,7 @@ export function createOptionsClient({ credentials, fetchImpl = (url, init) => fe
       }
       return rows;
     },
-    create: ({ symbol, side, qty, price, link, reduceOnly }, signal) => signed('POST', '/v5/order/create', { category: 'option', symbol, side, orderType: 'Limit', qty, price, timeInForce: 'GTC', orderLinkId: link, reduceOnly }, signal),
+    create: ({ symbol, side, qty, price, link, reduceOnly, timeInForce = 'GTC' }, signal) => signed('POST', '/v5/order/create', { category: 'option', symbol, side, orderType: 'Limit', qty, price, timeInForce, orderLinkId: link, reduceOnly }, signal),
     amend: (symbol, link, price, signal) => signed('POST', '/v5/order/amend', { category: 'option', symbol, orderLinkId: link, price }, signal),
     cancel: (symbol, link, signal) => signed('POST', '/v5/order/cancel', { category: 'option', symbol, orderLinkId: link }, signal),
   };

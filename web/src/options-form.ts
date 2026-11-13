@@ -2,7 +2,7 @@
 // start bodies, the net limit typed in the confirmation, the expiry payoff curve, the chain rows around the index and the
 // per-task progress and amounts. Rules and wording follow the workbench Greeks page (modules/greeks/app/static/app.js,
 // 2f0593d).
-import type { ChainRow, Execution, OrderRow, Plan, Preview, StrategyMode, Task, TaskStatus } from './options-types.ts';
+import type { ChainRow, Execution, OptionsState, OrderRow, Plan, Preview, ScheduleView, StrategyMode, Task, TaskStatus } from './options-types.ts';
 
 export const ACTIVE_STATUSES: readonly TaskStatus[] = ['accepted', 'running', 'stopping', 'recovering', 'recovery_needed'];
 export const isActive = (task: Pick<Task, 'status'>): boolean => ACTIVE_STATUSES.includes(task.status);
@@ -132,3 +132,18 @@ export const signedMoney = (value: number | null | undefined, currency = 'USD'):
 export const quantityText = (value: number | string): string => { const number = Number(value); return Number.isFinite(number) && number >= 0 ? number.toLocaleString('en-US', { maximumFractionDigits: 8 }) : '--'; };
 export const utcTime = (value: number | null | undefined): string => value === null || value === undefined ? '--' : new Date(value).toISOString().slice(5, 19).replace('T', ' ');
 export const utcDate = (value: number | null | undefined): string => value === null || value === undefined ? '--' : new Date(value).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+
+const pad2 = (value: number): string => String(value).padStart(2, '0');
+/** "周五 21:00 UTC" for the configured auto-open window. */
+export const scheduleTime = (schedule: Pick<ScheduleView, 'hourUtc' | 'minuteUtc'>): string => `周五 ${pad2(schedule.hourUtc)}:${pad2(schedule.minuteUtc)} UTC`;
+
+/** What turning auto-open on commits to, for the confirm() before the switch is sent. */
+export function autoOpenConfirm(settings: OptionsState['settings'], schedule: ScheduleView): string {
+  return [
+    ...(schedule.waiting ? ['现在正处于本周的开仓窗口，本周还没开过：确认后约 5 秒内就会实盘开仓。'] : []),
+    `打开后，每周${scheduleTime(schedule).slice(1)} 起 ${schedule.windowSeconds} 秒内，本服务每周最多自动实盘开仓一次：`,
+    `${strategyName(settings.strategyMode)}，每腿 ${settings.legQty} BTC，最大亏损上限 ${money(settings.maxRiskUsd)}，保证金上限 ${money(settings.maxMarginUsd)}；最低净收入按当时方案的估算。`,
+    schedule.marketFallback ? '超时未成交的开仓腿会按对手价补发一次 IOC，但价格仍受最低净收入限制，按估算的限制通常会把 IOC 拦下。' : '超时未成交的腿撤单后不补单（IOC 兜底未打开）。',
+    '有未结束的任务、跟踪中的策略或超出上限时，窗口内每 5 秒重试；整个窗口都不满足则本周不开仓，窗口结束后发一次飞书提醒。关闭定时不会停止已受理的定时任务。确定打开定时开仓？',
+  ].join('\n');
+}

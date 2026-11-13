@@ -61,8 +61,10 @@ export interface OilCandidate {
   credentials: LiveCredentials | null;
   problem: string | null;
 }
-/** A workbench auto rule, reduced to what decides whether it trades oil on its own right now. */
-/** `active`: the rule has a job running or awaiting review (phase opening / closing / review), enabled or not. */
+/**
+ * A workbench auto rule, reduced to what decides whether it trades oil on its own right now. `active`: the rule has a job
+ * running or awaiting review (phase opening / closing / review), enabled or not.
+ */
 export interface OilRule { name: string; venue: string | null; oil: boolean; live: boolean; active: boolean }
 /** A workbench execution job not yet completed or stopped, with the venues its legs use. */
 export interface WorkbenchJob { id: string; status: string; venues: string[] }

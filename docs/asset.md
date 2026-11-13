@@ -8,7 +8,7 @@
 
 | 批次 | 内容 | 风险 | 状态 |
 | --- | --- | --- | --- |
-| A-1 | 只读账本与计算口径：库结构、每日快照、账本读取、资产走势（A10）、日变化归因（A12）、出金与现金流的只读展示；从工作台导入历史数据的命令 | R2 | 完成（Linux CI 通过），随 v0.11.0 发布 |
+| A-1 | 只读账本与计算口径：库结构、每日快照、账本读取、资产走势（A10）、日变化归因（A12）、出金与现金流的只读展示；从工作台导入历史数据的命令 | R2 | 完成（Linux CI 通过），随 v0.12.0 发布 |
 | A-2 | 本地写入：手工资产（A06）、汇率（A07）、出金（A09）、现金流（A11）、同步锁 | R3 | 未开始 |
 | A-3 | 凭据与中心化交易所余额同步（A01、A02：Binance、Bybit、OKX、Gate） | R3 | 未开始 |
 | A-4 | 其余数据源（Aster 多账户 A03、Hyperliquid、Lighter RH、Variational A15） | R3 | 未开始 |
@@ -83,7 +83,7 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
 - 搬来的口径用例（见上）。新增：`asset-import`（只取指定用户、白名单与去掉标识、整体替换与换用户、校验失败不改动且报错不带内容、凭据字段检查、命令行退出码）、`asset-store`（未导入的空应答、导入后各接口的内容、服务先启动后导入与再次导入、导入记录损坏、`asset` 配置解析）、`asset-http`（未登录 401、没配置 404、未导入与导入后的应答、期次 400 / 404、读取失败 500；服务进程装配一例只在 Linux 上运行）、`asset-format`（页面文案规则），`web.test.ts` 补 `#/asset` 路由。测试用的工作台库由 `test/asset-fixture.ts` 生成（假数据）。
 - 本地看页面：`pnpm build:web` 后执行 `node scripts/asset-demo.ts --data-dir <空目录的绝对路径> [--port 4730]`，它用同一份假数据生成工作台库、导入，再以模拟交易所起服务；登录链接在 `<数据目录>/access-url`，打开 `http://127.0.0.1:4730/#/asset`。
 
-**回滚**：`sudo bash install.sh --version v0.10.1`，回退前先删掉 `config.json` 里的 `asset`（旧版本不认识这个字段，配置检查会失败）。主库不变；`asset.sqlite` 留在数据目录里，旧版本不读它。工作台的库只被只读打开，不受影响。
+**回滚**：`sudo bash install.sh --version v0.11.0`，回退前先删掉 `config.json` 里的 `asset`（旧版本不认识这个字段，配置检查会失败）。主库不变；`asset.sqlite` 留在数据目录里，旧版本不读它。工作台的库只被只读打开，不受影响。
 
 ## 后续批次要先定的事
 

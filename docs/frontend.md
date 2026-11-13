@@ -158,7 +158,7 @@
 
 **验证**：`scripts/dev-monitor.ts` 替身行情下在浏览器里切换对比合约、图表标签、时间范围、展开来源、悬停提示；DOM 内只有 `svg-plot` 提示框的 CSSOM 定位。
 
-**回滚**：`sudo bash install.sh --version v0.10.1`（先删掉 `config.json` 的 `monitor`）。
+**回滚**：`sudo bash install.sh --version v0.11.0`（先删掉 `config.json` 的 `monitor`）。
 ## 定时摘要间隔在设置页修改（v0.10.1）
 
 **对照的工作台页面**：工作台的定时通知间隔只在环境变量里改；表单照本服务「配对设置」的写法（`pair-settings-form form-stack` + `settings-form-grid`、字段下方 `small` 提示、错误在按钮上方、成功在按钮旁），外层用 `execution-live-state` 留边距。
@@ -192,7 +192,7 @@
 
 **验证**：`node scripts/asset-demo.ts` 的假数据上，无头浏览器 1440 与 390 宽度走过总览（明细展开、每日波动展开）、历史记录（查看明细）、出金记录；无页面错误，390 宽度三页都没有横向溢出。未与工作台同页面并排截图对比（本机没有运行中的工作台资产页）。
 
-**回滚**：`sudo bash install.sh --version v0.10.1`，回退前先删掉 `config.json` 里的 `asset`。
+**回滚**：`sudo bash install.sh --version v0.11.0`，回退前先删掉 `config.json` 里的 `asset`。
 
 ## 期权页（v0.11.0）
 

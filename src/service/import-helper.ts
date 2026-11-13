@@ -18,7 +18,8 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
 import { REQUEST_STALE_MS, readImportResult, takeImportRequest, writeImportResult, type ImportRequest, type ImportResult } from './import-channel.ts';
-import { fileText, planImport, previewImport, readExisting, readWorkbench, readerIdentity, replaceOne, restoreFiles, writeBoth, WORKBENCH_ENV, type FileOwner } from './import-workbench.ts';
+import { fileText, planImport, previewImport, readExisting, readWorkbench, readWorkbenchOil, readerIdentity, replaceOne, restoreFiles, writeBoth, WORKBENCH_ENV, type FileOwner, type OilSource } from './import-workbench.ts';
+import { VENUE_NAMES } from '../contracts.ts';
 
 /** Requests handled in one start; one that arrives while the last is handled is still taken. */
 const MAX_PER_START = 5;
@@ -192,26 +193,40 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
   const base = { id: request.id, action: request.action };
   const answer = (result: Omit<ImportResult, 'id' | 'action' | 'at'>): void => safeAnswer(dir, { ...base, at: now(), ...result }, owner, log);
   answer({ phase: 'running', message: '正在读取工作台' });
+  // A preview always shows the oil accounts too; an import reads them only when they were ticked.
+  const wantsOil = request.action === 'preview' || request.oil === true;
+  const pairsWanted = request.action === 'preview' || (request.pairs?.length ?? 0) > 0;
   let source: ReturnType<typeof readWorkbench>, files: ReturnType<typeof readExisting>;
   try {
-    source = readWorkbench(options.workbenchEnv, options.workbenchData);
+    source = readWorkbench(options.workbenchEnv, options.workbenchData, { asterOptional: wantsOil });
     files = readExisting(options.configFile);
   } catch (error) { answer({ phase: 'failed', message: message(error) }); return; }
-
+  // The oil accounts' read failing does not hold the pairs back: the page shows why next to the oil choice.
+  let oil: OilSource | undefined, oilError: string | undefined;
+  if (wantsOil) { try { oil = readWorkbenchOil(source.data); } catch (error) { oilError = message(error); } }
+  const oilReport = { ...(oilError !== undefined ? { oilError } : {}) };
   if (request.action === 'preview') {
     try {
-      const { items, notes } = previewImport(source, files.existing, { secretsFile: files.secretsFile });
-      answer({ phase: 'done', message: items.length ? `工作台有 ${items.length} 个配对，其中 ${items.filter(item => item.importable).length} 个可以导入` : '工作台里没有 ASTER 保证金平衡配对', database: source.database, preview: items, notes });
-    } catch (error) { answer({ phase: 'failed', message: message(error) }); }
+      const { items, oil: oilItems, notes } = previewImport(source, files.existing, { secretsFile: files.secretsFile, ...(oil ? { oil } : {}) });
+      const pairsLine = items.length ? `工作台有 ${items.length} 个配对，其中 ${items.filter(item => item.importable).length} 个可以导入` : '工作台里没有 ASTER 保证金平衡配对';
+      const oilLine = oil ? `；原油执行账户 ${oilItems.length} 个，其中 ${oilItems.filter(item => item.status === 'added').length} 个可以导入` : '';
+      answer({ phase: 'done', message: pairsLine + oilLine, database: source.database, preview: items, ...(oil ? { oil: oilItems } : {}), ...oilReport, notes });
+    } catch (error) { answer({ phase: 'failed', message: message(error), ...oilReport }); }
     return;
   }
-
+  if (!pairsWanted && !oil) { answer({ phase: 'failed', message: `无法读取工作台的原油执行账户，配置未改动：${oilError ?? '未知原因'}` }); return; }
   let plan: ReturnType<typeof planImport>;
-  try { plan = planImport(source, files.existing, { secretsFile: files.secretsFile, ...(request.pairs ? { only: request.pairs } : {}), requireMargin: true }); }
-  catch (error) { answer({ phase: 'failed', message: message(error) }); return; }
-  const report = { database: source.database, imported: plan.items, notes: plan.notes };
-  if (plan.added.length === 0) { answer({ phase: 'failed', message: '所选配对都不能导入，配置未改动', ...report }); return; }
-
+  try { plan = planImport(source, files.existing, { secretsFile: files.secretsFile, only: request.pairs ?? [], requireMargin: true, ...(oil ? { oil } : {}) }); }
+  catch (error) { answer({ phase: 'failed', message: message(error), ...oilReport }); return; }
+  const oilAdded = plan.oil.filter(item => item.status === 'added').map(item => VENUE_NAMES[item.venue]);
+  const notes = oilError !== undefined ? [...plan.notes, `原油执行账户未导入：${oilError}`] : plan.notes;
+  const report = { database: source.database, imported: plan.items, ...(request.oil ? { oil: plan.oil } : {}), ...oilReport, notes };
+  if (plan.added.length === 0 && oilAdded.length === 0) {
+    answer({ phase: 'failed', message: request.oil ? (pairsWanted ? '所选配对与原油执行账户都不能导入，配置未改动' : '原油执行账户不能导入，配置未改动') : '所选配对都不能导入，配置未改动', ...report });
+    return;
+  }
+  const what = [plan.added.length ? `${plan.added.length} 个配对` : '', oilAdded.length ? `原油执行账户（${oilAdded.join('、')}）` : ''].filter(Boolean).join('与');
+  const after = [plan.added.length ? '配对登记为停用：先在旧工作台删除该配对，再在本页面启用' : '', oilAdded.length ? '原油执行账户已生效，页面出现「原油」标签' : ''].filter(Boolean).join('；');
   const undo = undoFile(files.configFile);
   const written = { config: fileText(plan.config), secrets: fileText(plan.secrets) };
   const record: Undo = { requestId: request.id, bootId: bootId(), at: now(), configFile: resolve(files.configFile), secretsFile: resolve(files.secretsFile), text: files.text, written: { config: sha256(written.config), secrets: sha256(written.secrets) } };
@@ -240,11 +255,11 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
     answer({ phase: 'failed', message: `导入后的配置未通过服务检查（${message(error)}），${failed ? `恢复导入前的配置也失败了（${failed}），请手动检查 ${files.configFile}` : '已恢复导入前的配置'}`, ...report });
     return;
   }
-  log(`已导入 ${plan.added.length} 个配对，重启服务`);
-  answer({ phase: 'restarting', message: `已写入 ${plan.added.length} 个配对，正在重启服务`, ...report });
+  log(`已导入 ${what}，重启服务`);
+  answer({ phase: 'restarting', message: `已写入 ${what}，正在重启服务`, ...report });
   if (await options.restart()) {
     settle();
-    answer({ phase: 'done', message: `已导入 ${plan.added.length} 个配对，服务已重启。配对登记为停用：先在旧工作台删除该配对，再在本页面启用${unsettled ? `。注意：撤销记录 ${undo} 无法删除，请手动删除，否则助手下次停止时会撤销本次导入` : ''}`, ...report });
+    answer({ phase: 'done', message: `已导入 ${what}，服务已重启。${after}${unsettled ? `。注意：撤销记录 ${undo} 无法删除，请手动删除，否则助手下次停止时会撤销本次导入` : ''}`, ...report });
     return;
   }
   const failed = putBack();

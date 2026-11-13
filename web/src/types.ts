@@ -42,7 +42,8 @@ export interface AdlPairView {
 
 export interface ServiceState {
   generation: number; retired: boolean; transport: string; accounts: Account[];
-  notionalLimits: { perJob: string; openUsed: string; totalOpen: string } | null;
+  /** The lifetime form without oil; the rolling 24-hour form when oil is configured. */
+  notionalLimits: { perJob: string; openUsed: string; totalOpen: string } | { perJob: string; openUsed: string; openPer24h: string; windowMs: number; nextReleaseAt: number | null } | null;
   transfers: { pairs: PairView[]; corruptPairs: string[]; recent: TransferView[] };
   adl: { pairs: AdlPairView[]; recent: AdlIncident[] };
   positions: PositionsView;

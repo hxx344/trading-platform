@@ -4,21 +4,29 @@
 // workbench). Imported pairs are registered switched off like any configured pair; taking one over still needs the
 // workbench pair deleted and the takeover checks passed in the page. Nothing is sent to ASTER or to the workbench.
 //
+// With --oil it also brings the workbench's Binance/Bybit execution accounts over for the oil module: <data>/hub.sqlite
+// execution_accounts, decrypted with <data>/credentials.key (read the same way, as the database's owner). Only then: --oil
+// alone imports the oil accounts only, --oil --pairs id,id both.
+//
 //   node import-workbench.ts --config /etc/trading-platform/config.json [--workbench-env FILE] [--workbench-data DIR]
-//                            [--pairs id,id] [--dry-run]
+//                            [--pairs id,id] [--oil] [--dry-run]
 //
 // An existing config.json is extended: its pairs, accounts and robot stay as they are, and only pairs it does not have
-// yet are added. Output names pairs and account names only; keys and webhooks never appear in it.
+// yet are added; an oil venue it already names keeps its settings. Output names pairs, account names and masked account
+// ids only; keys, ciphertext and webhooks never appear in it.
 import { spawnSync } from 'node:child_process';
+import { createDecipheriv } from 'node:crypto';
 import { closeSync, existsSync, fchownSync, fsyncSync, linkSync, lstatSync, openSync, readFileSync, renameSync, rmSync, statSync, writeSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parseArgs, parseEnv } from 'node:util';
 import { parseAsterCredentials, type AsterCredentials } from '../aster/client.ts';
-import { parseTransferConfig, type Venue } from '../contracts.ts';
+import { ACCOUNT_MODES, VENUES, VENUE_NAMES, parseTransferConfig, type Venue } from '../contracts.ts';
 import { parseAdlConfig } from '../adl-contracts.ts';
 import { parsePrivateJson } from '../live/setup.ts';
+import { validCredentials, type LiveCredentials } from '../live/values.ts';
 import { assertDistinctSigners, parseServiceConfig, parseServiceSecrets } from './config.ts';
+import { parseOilSecrets } from './oil-config.ts';
 
 export const WORKBENCH_ENV = '/etc/project-aggregation.env';
 export const WORKBENCH_DATA = '/var/lib/project-aggregation';
@@ -40,6 +48,24 @@ export interface WorkbenchSource {
   /** Pair rows whose JSON did not parse; they cannot be imported. */
   unreadablePairs?: number;
 }
+
+/** The caps written with the first oil account; the operator raises them in config.json. */
+export const OIL_DEFAULT_LIMITS = { perJob: '200', openPer24h: '1000' } as const;
+/** One workbench execution account of a venue this service trades oil on; `problem` says why it cannot come over. */
+export interface OilCandidate {
+  venue: Venue;
+  accountMode: string | null;
+  /** The workbench's verified identity (Binance UID, Bybit userID), unmasked: it becomes accountId. */
+  accountId: string | null;
+  credentialVersion: number | null;
+  credentials: LiveCredentials | null;
+  problem: string | null;
+}
+/** A workbench auto rule, reduced to what decides whether it trades oil on its own right now. */
+export interface OilRule { name: string; venue: string | null; oil: boolean; live: boolean }
+export interface OilSource { hub: string; accounts: OilCandidate[]; rules: OilRule[]; unreadableRules: number }
+/** What the plan did with one oil account; only the masked account id leaves this file. */
+export interface OilItem { venue: Venue; accountMode: string | null; accountId: string | null; blockedBy: string[]; status: 'added' | 'skipped'; detail: string }
 /** One workbench pair the plan looked at; `detail` is the reason it was skipped or the accounts it brings. */
 export interface ImportItem { id: string; status: 'added' | 'skipped'; detail: string }
 export interface ImportPlan {
@@ -49,6 +75,8 @@ export interface ImportPlan {
   added: string[];
   skipped: string[];
   items: ImportItem[];
+  /** The oil accounts looked at (empty without options.oil). */
+  oil: OilItem[];
   notes: string[];
 }
 /** What the page shows for each workbench pair before anything is written: whether it could come over on its own. */
@@ -76,7 +104,7 @@ function feishuOf(env: WorkbenchSource['env']): Json | null {
  * Works out the files after the import. `existing` is the current config.json and secrets.json (raw JSON), or null on a
  * first setup. Throws when the result would not load: the caller then writes nothing.
  */
-export function planImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; only?: readonly string[]; known?: ReadonlyMap<string, AsterCredentials>; requireMargin?: boolean }): ImportPlan {
+export function planImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; only?: readonly string[]; known?: ReadonlyMap<string, AsterCredentials>; requireMargin?: boolean; oil?: OilSource }): ImportPlan {
   const config: Json = existing ? structuredClone(existing.config) : { secretsFile: options.secretsFile, pairs: [] };
   const secrets: Json = existing ? structuredClone(existing.secrets) : { accounts: {} };
   // An oil-only config has no pairs yet; its oil block and the oil keys are carried over untouched.
@@ -190,8 +218,58 @@ export function planImport(source: WorkbenchSource, existing: { config: Json; se
     } else notes.push('工作台没有配置飞书机器人，告警只写日志');
   }
 
+  const oil = options.oil ? planOil(options.oil, config, secrets, fits, notes) : [];
   // Each added pair passed the checks with everything before it, and every key was derived once, so the result passes.
-  return { config, secrets, added, skipped, items, notes };
+  return { config, secrets, added, skipped, items, oil, notes };
+}
+
+const mask = (id: string | null): string | null => id === null ? null : `***${id.slice(-4)}`;
+
+/**
+ * Adds the workbench's oil execution accounts to `config` / `secrets` in place. A venue config.json already names keeps
+ * its settings; the caps are written only with the oil block itself. An account an enabled live oil rule of the
+ * workbench trades with is refused: both programs would then send orders on it.
+ */
+function planOil(source: OilSource, config: Json, secrets: Json, fits: (candidate: Json) => void, notes: string[]): OilItem[] {
+  const items: OilItem[] = [];
+  const current = isRecord(config.oil) ? config.oil : null;
+  const configured = new Set(current && Array.isArray(current.accounts) ? current.accounts.filter(isRecord).map(account => account.venue) : []);
+  const fresh: { item: OilItem; binding: Json; credentials: LiveCredentials }[] = [];
+  if (source.accounts.length === 0) notes.push('工作台没有连接 Binance / Bybit 执行账户，没有原油执行账户可导入');
+  for (const candidate of source.accounts) {
+    // A rule whose venue cannot be read could be on this one; any unreadable rule could be a live oil rule.
+    const blockedBy = source.rules.filter(rule => rule.oil && rule.live && (rule.venue === candidate.venue || rule.venue === null)).map(rule => rule.name);
+    const item: OilItem = { venue: candidate.venue, accountMode: candidate.accountMode, accountId: mask(candidate.accountId), blockedBy, status: 'skipped', detail: '' };
+    items.push(item);
+    if (configured.has(candidate.venue)) { item.detail = '已在本项目配置中，保留现有设置'; continue; }
+    if (candidate.problem !== null || !candidate.credentials || candidate.accountId === null || candidate.credentialVersion === null || candidate.accountMode === null) { item.detail = candidate.problem ?? '未能判断'; continue; }
+    if (source.unreadableRules > 0) { item.detail = `工作台有 ${source.unreadableRules} 条自动规则无法解析，无法确认没有实盘启用的原油自动规则；先在工作台停用原油自动规则`; continue; }
+    if (blockedBy.length) { item.detail = `先在工作台停用原油自动规则（${blockedBy.join('、')}），两边同时下单会抢同一个账户`; continue; }
+    if (secrets[candidate.venue] !== undefined) { item.detail = `现有密钥文件里已有 ${candidate.venue} 的密钥但 config.json 没有对应账户，不覆盖；请先确认并移走它`; continue; }
+    fresh.push({ item, credentials: candidate.credentials, binding: { venue: candidate.venue, accountId: candidate.accountId, accountMode: candidate.accountMode, credentialVersion: candidate.credentialVersion } });
+  }
+  if (fresh.length === 0) return items;
+  const accounts = [...(current && Array.isArray(current.accounts) ? current.accounts : []), ...fresh.map(entry => entry.binding)];
+  const oil = current ? { ...current, accounts } : { notionalLimits: { ...OIL_DEFAULT_LIMITS }, accounts };
+  const keys: Json = { ...secrets };
+  for (const entry of fresh) keys[entry.item.venue] = { apiKey: entry.credentials.apiKey, apiSecret: entry.credentials.apiSecret };
+  try {
+    fits({ ...config, oil });
+    parseOilSecrets(keys, accounts.filter(isRecord).map(account => account.venue as Venue));
+  } catch (error) {
+    // Messages built by these checks never carry a key (oil-config.ts).
+    const reason = `加入后本服务不接受（${error instanceof Error ? error.message : '格式错误'}）`;
+    for (const entry of fresh) entry.item.detail = reason;
+    return items;
+  }
+  config.oil = oil;
+  for (const entry of fresh) {
+    secrets[entry.item.venue] = keys[entry.item.venue];
+    entry.item.status = 'added';
+    entry.item.detail = `${VENUE_NAMES[entry.item.venue]} ${entry.binding.accountMode} 账户 ${entry.item.accountId}，凭据版本 ${String(entry.binding.credentialVersion)}`;
+  }
+  if (!current) notes.push(`首次写入原油配置，名义金额上限取默认值：单笔 ${OIL_DEFAULT_LIMITS.perJob} USDT、24 小时开仓 ${OIL_DEFAULT_LIMITS.openPer24h} USDT；要调整请改 config.json 的 oil.notionalLimits 后执行 sudo bash install.sh`);
+  return items;
 }
 
 /**
@@ -199,8 +277,9 @@ export function planImport(source: WorkbenchSource, existing: { config: Json; se
  * and why the others cannot. Pairs that only fit one at a time (the request budget) show up when the selection is
  * imported. Throws when the existing files fail their checks: nothing could be imported then.
  */
-export function previewImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string }): { items: PreviewItem[]; notes: string[] } {
-  const base = planImport(source, existing, { secretsFile: options.secretsFile, only: [], requireMargin: true });
+export function previewImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; oil?: OilSource }): { items: PreviewItem[]; oil: OilItem[]; notes: string[] } {
+  // The oil accounts are planned once, with no pair: the page imports them together or on their own.
+  const base = planImport(source, existing, { secretsFile: options.secretsFile, only: [], requireMargin: true, ...(options.oil ? { oil: options.oil } : {}) });
   const known = new Map(parseServiceSecrets(base.secrets, [], parseServiceConfig(base.config).oil?.accounts.map(account => account.venue) ?? []).accounts);
   const items = source.pairs.map((pair): PreviewItem => {
     const id = String(pair.id);
@@ -211,7 +290,7 @@ export function previewImport(source: WorkbenchSource, existing: { config: Json;
     catch (error) { item = { id, status: 'skipped', detail: error instanceof Error ? error.message : String(error) }; }
     return { id: printable(id).slice(0, 64), name, marginEnabled, importable: item?.status === 'added', detail: printable(item?.detail ?? '未能判断').slice(0, 300) };
   });
-  return { items, notes: base.notes };
+  return { items, oil: base.oil, notes: base.notes };
 }
 
 /** Prints the raw data column of both tables; run with no environment, as the database's owner when that matters. */
@@ -231,14 +310,18 @@ export function readerIdentity(owner: { uid: number; gid: number }, uid: number 
 }
 
 /** Reads the workbench's ASTER pairs and accounts without writing to its database. */
-export function readWorkbench(envFile: string, dataDir: string | undefined): WorkbenchSource & { database: string } {
+export function readWorkbench(envFile: string, dataDir: string | undefined, options: { asterOptional?: boolean } = {}): WorkbenchSource & { database: string; data: string } {
   const base = existsSync(envFile) ? parseEnv(readFileSync(envFile, 'utf8')) : {};
   const data = dataDir ?? base.DATA_DIR ?? WORKBENCH_DATA;
   if (!isAbsolute(data)) throw new Error(`工作台数据目录须为绝对路径：${data}`);
   const moduleEnv = join(data, 'modules', 'aster', '.env');
   const env = { ...base, ...(existsSync(moduleEnv) ? parseEnv(readFileSync(moduleEnv, 'utf8')) : {}) };
   const database = join(data, 'modules', 'aster', 'trading.sqlite3');
-  if (!existsSync(database)) throw new Error(`没有找到工作台的 ASTER 数据库 ${database}；工作台数据目录不在默认位置时用 --workbench-data 指定`);
+  if (!existsSync(database)) {
+    // An oil import does not need the ASTER module: a workbench that never ran it has no pairs to bring.
+    if (options.asterOptional && existsSync(join(data, 'hub.sqlite'))) return { pairs: [], accounts: [], env, database, data };
+    throw new Error(`没有找到工作台的 ASTER 数据库 ${database}；工作台数据目录不在默认位置时用 --workbench-data 指定`);
+  }
   // A read-only connection still creates -wal and -shm when it is the first one on a WAL database (the workbench opens
   // and closes one per operation, so that is the usual state). Made by root they would leave the workbench unable to
   // write, so a root import reads as the database's owner, in a child process that only prints the rows.
@@ -259,7 +342,135 @@ export function readWorkbench(envFile: string, dataDir: string | undefined): Wor
   const dumped = JSON.parse(read.stdout) as { pairs: string[]; accounts: string[] };
   const parse = (rows: string[]): unknown[] => rows.map(row => { try { return JSON.parse(row) as unknown; } catch { return null; } });
   const pairs = parse(dumped.pairs);
-  return { pairs: pairs.filter(isRecord), accounts: parse(dumped.accounts).filter(isRecord), env, database, unreadablePairs: pairs.filter(item => !isRecord(item)).length };
+  return { pairs: pairs.filter(isRecord), accounts: parse(dumped.accounts).filter(isRecord), env, database, data, unreadablePairs: pairs.filter(item => !isRecord(item)).length };
+}
+
+/**
+ * Prints the credential key and the rows of the two tables the oil import needs; run with no environment, as the
+ * database's owner. The workbench's own rule for reading hub.sqlite from outside (contract-probes workbench-accounts.ts,
+ * LESSONS L063): an unfinished rollback journal is refused; pending WAL pages are read only while the workbench runs (its
+ * -shm is there, so nothing new is created), and without them the file is opened immutable. A refusal is a code on stdout.
+ */
+const DUMP_HUB = `import { DatabaseSync } from 'node:sqlite';
+import { readFileSync, statSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+const [hub, keyFile] = process.argv.slice(1);
+const out = value => process.stdout.write(JSON.stringify(value));
+const size = suffix => { try { return statSync(hub + suffix).size; } catch (error) { if (error && error.code === 'ENOENT') return null; throw error; } };
+try {
+  const pending = Boolean(size('-wal'));
+  if (size('-journal')) out({ refused: 'journal' });
+  else if (pending && size('-shm') === null) out({ refused: 'wal' });
+  else {
+    const key = readFileSync(keyFile);
+    if (key.length !== 32) out({ refused: 'key' });
+    else {
+      const db = new DatabaseSync(pending ? hub : pathToFileURL(hub).href + '?immutable=1', { readOnly: true });
+      try {
+        db.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=750');
+        const has = name => db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name) !== undefined;
+        const accounts = has('execution_accounts') ? db.prepare('SELECT * FROM execution_accounts ORDER BY exchange').all()
+          .map(row => ({ exchange: row.exchange, revision: row.revision, credentials: row.credentials ?? null, account_mode: row.account_mode, identity: row.identity ?? null })) : [];
+        const rules = has('execution_auto_rules') ? db.prepare('SELECT enabled, config, state FROM execution_auto_rules ORDER BY created_at, rowid').all()
+          .map(row => ({ enabled: row.enabled, config: row.config, state: row.state })) : [];
+        out({ key: key.toString('base64'), accounts, rules });
+      } finally { db.close(); }
+    }
+  }
+} catch (error) { process.stderr.write(String(error && error.message || error).split('\\n')[0]); process.exitCode = 1; }`;
+
+const DECRYPT_FAILED = 'decrypt_failed';
+/**
+ * The workbench's credential cipher (server/runtime/credentials.mjs): base64 of iv(12) + tag(16) + AES-256-GCM ciphertext
+ * of a JSON value. Any failure is one fixed error, so nothing of the ciphertext or the plaintext reaches a message.
+ */
+export function decryptCredential(key: Buffer, blob: string): unknown {
+  try {
+    const buffer = Buffer.from(blob, 'base64');
+    if (key.length !== 32 || buffer.length < 29) throw new Error(DECRYPT_FAILED);
+    const decipher = createDecipheriv('aes-256-gcm', key, buffer.subarray(0, 12), { authTagLength: 16 });
+    decipher.setAuthTag(buffer.subarray(12, 28));
+    return JSON.parse(Buffer.concat([decipher.update(buffer.subarray(28)), decipher.final()]).toString('utf8')) as unknown;
+  } catch { throw new Error(DECRYPT_FAILED); }
+}
+
+const ACCOUNT_ID = /^[0-9A-Za-z_-]{1,64}$/;
+const MODE_TEXT = /^[a-z][a-z0-9-]{0,31}$/;
+
+/** The Binance/Bybit rows of execution_accounts as import candidates; other venues (OKX) are not this service's. */
+export function oilCandidates(key: Buffer, rows: readonly unknown[]): OilCandidate[] {
+  const candidates: OilCandidate[] = [];
+  for (const row of rows) {
+    if (!isRecord(row) || typeof row.exchange !== 'string' || !(VENUES as readonly string[]).includes(row.exchange)) continue;
+    const venue = row.exchange as Venue;
+    const accountMode = typeof row.account_mode === 'string' && MODE_TEXT.test(row.account_mode) ? row.account_mode : null;
+    const accountId = typeof row.identity === 'string' && ACCOUNT_ID.test(row.identity) ? row.identity : null;
+    const credentialVersion = typeof row.revision === 'number' && Number.isSafeInteger(row.revision) && row.revision >= 1 ? row.revision : null;
+    const base = { venue, accountMode, accountId, credentialVersion };
+    const refuse = (problem: string): void => { candidates.push({ ...base, credentials: null, problem }); };
+    if (row.credentials === null || row.credentials === '') { refuse('工作台未连接该执行账户'); continue; }
+    if (typeof row.credentials !== 'string') { refuse('工作台的凭据记录格式错误'); continue; }
+    let value: unknown;
+    try { value = decryptCredential(key, row.credentials); } catch { refuse('凭据无法解密（credentials.key 与 hub.sqlite 不匹配，或记录已损坏）'); continue; }
+    if (!isRecord(value) || value.purpose !== 'execution') { refuse('凭据用途不是执行账户（purpose 须为 execution），不导入'); continue; }
+    if (value.exchange !== venue) { refuse('凭据所属交易所与记录不一致，不导入'); continue; }
+    const credentials = { apiKey: value.apiKey, apiSecret: value.apiSecret } as LiveCredentials;
+    if (!validCredentials(credentials)) { refuse('凭据里的 API 密钥不完整或格式无效'); continue; }
+    if (credentialVersion === null) { refuse('工作台记录的凭据版本无效（须为正整数）'); continue; }
+    if (accountMode === null || !ACCOUNT_MODES[venue].includes(accountMode)) {
+      refuse(`账户模式${accountMode ? ` ${accountMode} ` : '未知，'}不支持：Binance 只支持 standard / portfolio-margin，Bybit 只支持 unified`); continue;
+    }
+    if (accountId === null) { refuse('工作台没有记录该账户的身份（UID），须先在工作台重新验证该执行账户再导入'); continue; }
+    candidates.push({ ...base, credentials: { apiKey: credentials.apiKey, apiSecret: credentials.apiSecret }, problem: null });
+  }
+  return candidates;
+}
+
+/** The auto rules as the workbench reads them (trading-auto.mjs parse): live unless state.mode is observe, enabled only then. */
+export function oilRules(rows: readonly unknown[]): { rules: OilRule[]; unreadable: number } {
+  const rules: OilRule[] = [];
+  let unreadable = 0;
+  for (const row of rows) {
+    let config: unknown, state: unknown;
+    try { if (!isRecord(row)) throw new Error(); config = JSON.parse(String(row.config)); state = JSON.parse(String(row.state)); } catch { unreadable++; continue; }
+    if (!isRecord(row) || !isRecord(config) || !isRecord(state)) { unreadable++; continue; }
+    const venue = typeof config.exchange === 'string' ? config.exchange : null;
+    const title = typeof config.name === 'string' && config.name.trim() ? config.name.trim() : `${venue ?? '未知交易所'} 原油价差`;
+    rules.push({ name: printable(title).slice(0, 60), venue, oil: config.market === 'oil', live: state.mode !== 'observe' && Boolean(row.enabled) });
+  }
+  return { rules, unreadable };
+}
+
+/** Reads the workbench's execution accounts and auto rules without writing to hub.sqlite; the key never leaves this call. */
+export function readWorkbenchOil(data: string): OilSource {
+  if (!isAbsolute(data)) throw new Error(`工作台数据目录须为绝对路径：${data}`);
+  const hub = join(data, 'hub.sqlite'), keyFile = join(data, 'credentials.key');
+  for (const [path, name] of [[hub, '数据库'], [keyFile, '凭据密钥']] as const) {
+    let stat;
+    try { stat = lstatSync(path); } catch { throw new Error(`没有找到工作台的${name} ${path}；工作台数据目录不在默认位置时用 --workbench-data 指定`); }
+    if (!stat.isFile()) throw new Error(`工作台的${name} ${path} 不是普通文件（符号链接等），不读取`);
+    if (process.getuid?.() === 0 && stat.uid === 0 && statSync(dirname(path)).uid !== 0) throw new Error(`${path} 归 root，但所在目录归其他账户，不读取；请确认文件来源`);
+  }
+  const identity = readerIdentity(lstatSync(hub), process.getuid?.());
+  const read = spawnSync(process.execPath, ['--input-type=module', '-e', DUMP_HUB, '--', hub, keyFile], {
+    cwd: '/', env: {}, encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024, ...identity,
+  });
+  const as = 'uid' in identity ? `（以数据库属主 uid ${identity.uid} 读取，不带附加组）` : '';
+  if (read.error || read.status !== 0) {
+    const reason = printable(read.error?.message ?? (read.stderr.trim() || `退出码 ${read.status ?? read.signal}`)).slice(0, 200);
+    throw new Error(`读取工作台执行账户 ${hub} 失败${as}：${reason}`);
+  }
+  let dumped: { refused?: string; key?: string; accounts?: unknown[]; rules?: unknown[] };
+  try { dumped = JSON.parse(read.stdout) as typeof dumped; } catch { throw new Error(`读取工作台执行账户 ${hub} 失败${as}：输出无法解析`); }
+  if (dumped.refused === 'journal') throw new Error(`${hub} 有未完成的回滚日志（-journal），不读取；等工作台写完（或重启工作台）后再导入`);
+  if (dumped.refused === 'wal') throw new Error(`${hub} 有未合并的 WAL 而工作台未在运行，不读取；先启动工作台（它会合并 WAL）再导入`);
+  if (dumped.refused === 'key') throw new Error(`${keyFile} 长度不是 32 字节，不是工作台的凭据密钥`);
+  if (typeof dumped.key !== 'string' || !Array.isArray(dumped.accounts) || !Array.isArray(dumped.rules)) throw new Error(`读取工作台执行账户 ${hub} 失败${as}：输出格式错误`);
+  const key = Buffer.from(dumped.key, 'base64');
+  try {
+    const { rules, unreadable } = oilRules(dumped.rules);
+    return { hub, accounts: oilCandidates(key, dumped.accounts), rules, unreadableRules: unreadable };
+  } finally { key.fill(0); }
 }
 
 /** A synced private temporary file next to `path`, to be renamed over it. */
@@ -361,27 +572,34 @@ export function readExisting(configPath: string): ExistingFiles {
 
 function main(): void {
   const { values } = parseArgs({ options: {
-    config: { type: 'string' }, 'workbench-env': { type: 'string' }, 'workbench-data': { type: 'string' }, pairs: { type: 'string' }, 'dry-run': { type: 'boolean' },
+    config: { type: 'string' }, 'workbench-env': { type: 'string' }, 'workbench-data': { type: 'string' }, pairs: { type: 'string' }, oil: { type: 'boolean' }, 'dry-run': { type: 'boolean' },
   } });
-  const only = values.pairs ? values.pairs.split(',').map(item => item.trim()).filter(Boolean) : undefined;
-  const source = readWorkbench(values['workbench-env'] ?? WORKBENCH_ENV, values['workbench-data']);
+  const withOil = values.oil === true;
+  // --oil alone brings the oil accounts only; pairs come along when named.
+  const only = values.pairs ? values.pairs.split(',').map(item => item.trim()).filter(Boolean) : withOil ? [] : undefined;
+  const source = readWorkbench(values['workbench-env'] ?? WORKBENCH_ENV, values['workbench-data'], { asterOptional: withOil && (only?.length ?? 0) === 0 });
+  const oilSource = withOil ? readWorkbenchOil(source.data) : undefined;
   const { configFile, secretsFile, existing } = readExisting(values.config ?? '');
 
-  const plan = planImport(source, existing, { secretsFile, ...(only ? { only } : {}) });
+  const plan = planImport(source, existing, { secretsFile, ...(only ? { only } : {}), ...(oilSource ? { oil: oilSource } : {}) });
   const out = (line: string): void => { process.stdout.write(line + '\n'); };
-  out(`工作台数据库：${source.database}（只读）`);
+  if (!withOil || (only?.length ?? 0) > 0) out(`工作台数据库：${source.database}（只读）`);
+  if (oilSource) out(`工作台执行账户：${oilSource.hub}（只读）`);
   for (const line of plan.added) out(`导入配对 ${line}`);
   for (const line of plan.skipped) out(`跳过 ${line}`);
+  for (const item of plan.oil) out(item.status === 'added' ? `导入原油执行账户 ${item.detail}` : `跳过原油执行账户 ${VENUE_NAMES[item.venue]}${item.accountId ? ` ${item.accountId}` : ''}：${item.detail}`);
   for (const line of plan.notes) out(line);
-  if (plan.added.length === 0) {
-    if (!existing) throw new Error('工作台里没有可导入的配对（需开启保证金平衡、配好主账户凭据前缀且凭据齐全），未生成配置');
-    out('没有新的配对，配置未改动');
+  const oilAdded = plan.oil.filter(item => item.status === 'added').length;
+  if (plan.added.length === 0 && oilAdded === 0) {
+    if (!existing) throw new Error(withOil && !only?.length ? '工作台里没有可导入的原油执行账户，未生成配置' : '工作台里没有可导入的配对（需开启保证金平衡、配好主账户凭据前缀且凭据齐全），未生成配置');
+    out(withOil && !only?.length ? '没有新的原油执行账户，配置未改动' : '没有新的配对，配置未改动');
     return;
   }
   if (values['dry-run']) { out('试运行：未写入任何文件'); return; }
   // Keys first, so the config never names a key file that lacks its accounts.
   writeBoth(secretsFile, fileText(plan.secrets), configFile, fileText(plan.config));
-  out(`已写入 ${configFile} 与 ${secretsFile}；导入的配对登记为停用，在工作台删除该配对后到本项目页面启用`);
+  const what = [plan.added.length ? '导入的配对登记为停用，在工作台删除该配对后到本项目页面启用' : '', oilAdded ? '原油执行账户已写入，服务启动后页面出现「原油」标签' : ''].filter(Boolean).join('；');
+  out(`已写入 ${configFile} 与 ${secretsFile}；${what}`);
 }
 
 if (import.meta.main) {

@@ -6,6 +6,9 @@
 #   sudo bash install.sh --package <目录>     从本地目录安装（含 trading-platform.tar.gz 与 SHA256SUMS）
 #   sudo bash install.sh --import-workbench   命令行方式从本机工作台导入已开启保证金平衡的配对与凭据并启动（可加 --pairs id,id
 #                                             只导入指定配对，--workbench-data <目录> 指定工作台数据目录）；页面上也能导入，见下
+#   sudo bash install.sh --import-workbench --oil
+#                                             只导入工作台的原油执行账户（Binance / Bybit，hub.sqlite 解密）；同时导入配对时
+#                                             再加 --pairs id,id。工作台有实盘启用的原油自动规则时拒绝导入该交易所账户
 #   sudo bash install.sh --set-password       设置或更换页面登录密码（输入两次，不回显；只存 scrypt 摘要，已登录的页面须重新登录；
 #                                             沿用当前已装版本，不联网升级；脚本化时加 --password-stdin 从标准输入读一行）
 #
@@ -61,13 +64,14 @@ restore_import() {
   if ((${#failed[@]} == 0)); then log "已恢复${backup_what}前的配置文件。"
   else printf '恢复%s前的配置失败：%s 可能仍是%s后的内容，请检查后手工改回\n' "$backup_what" "$(join "${failed[@]}")" "$backup_what" >&2; fi
 }
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 version=''
 package_dir=''
 import_workbench=0
 workbench_data=''
 import_pairs=''
+import_oil=0
 set_password=0
 password_stdin=0
 while (($#)); do
@@ -75,6 +79,7 @@ while (($#)); do
     --import-workbench) import_workbench=1; shift ;;
     --workbench-data) [[ $# -ge 2 ]] || usage 2; workbench_data=$2; shift 2 ;;
     --pairs) [[ $# -ge 2 ]] || usage 2; import_pairs=$2; shift 2 ;;
+    --oil) import_oil=1; shift ;;
     --set-password) set_password=1; shift ;;
     --password-stdin) password_stdin=1; shift ;;
     --version) [[ $# -ge 2 ]] || usage 2; version=$2; shift 2 ;;
@@ -86,6 +91,7 @@ done
 [[ -z "$version" || "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail '--version 须形如 v0.1.0'
 [[ -z "$version" || -z "$package_dir" ]] || fail '--version 与 --package 只能二选一'
 ((import_workbench)) || [[ -z "$workbench_data$import_pairs" ]] || fail '--workbench-data 与 --pairs 须和 --import-workbench 一起使用'
+((import_workbench || !import_oil)) || fail '--oil 须和 --import-workbench 一起使用'
 ((set_password || !password_stdin)) || fail '--password-stdin 须和 --set-password 一起使用'
 
 [[ "$(uname -s)" == Linux ]] || fail '只支持 Linux。'
@@ -232,6 +238,7 @@ done
 # below then hands them to the service account. A failed import writes nothing and stops the install.
 if ((import_workbench)); then
   [[ -f "$release_dir/src/service/import-workbench.ts" ]] || fail "版本 $new_version 不支持 --import-workbench，请用最新版本导入"
+  if ((import_oil)); then grep -q 'readWorkbenchOil' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --oil，请用最新版本导入"; fi
   # The files the import may write: config.json and the key file it names (always in this directory).
   mkdir "$work_dir/conf-before"
   {
@@ -248,6 +255,7 @@ if ((import_workbench)); then
   import_args=(--config "$CONF_DIR/config.json" --workbench-env "$WORKBENCH_ENV")
   [[ -z "$workbench_data" ]] || import_args+=(--workbench-data "$workbench_data")
   [[ -z "$import_pairs" ]] || import_args+=(--pairs "$import_pairs")
+  ((!import_oil)) || import_args+=(--oil)
   (cd / && "$NODE_BIN" "$release_dir/src/service/import-workbench.ts" "${import_args[@]}" 9>&-) || fail '从工作台导入配置失败'
 fi
 # A first setup without an import starts on a config with no pairs, so the page is up to import them from.

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { AdlPanel } from './AdlPanel.tsx';
 import { ImportPanel } from './ImportPanel.tsx';
 import { PairDetail } from './PairDetail.tsx';
+import { OIL_READ_TIMEOUT_MS, OIL_STATE_PATH, OilPage } from './OilPage.tsx';
 import { PairsPanel } from './PairsPanel.tsx';
 import { PositionsPanel } from './PositionsPanel.tsx';
 import { useRoute, type Route } from './route.ts';
@@ -11,6 +12,7 @@ import { Callout, StatePanel } from './StateViews.tsx';
 import { clock } from './labels.ts';
 import { useLiveResource } from './use-live-resource.ts';
 import type { ServiceState } from './types.ts';
+import type { OilState } from './oil-types.ts';
 
 const REFRESH_MS = 2_000;
 const READ_TIMEOUT_MS = 10_000;
@@ -19,13 +21,17 @@ function statusLine(state: ServiceState): string {
   // The ASTER service registers no trading connector accounts; the part is left out rather than shown empty.
   return `写者代次 ${state.generation}${state.retired ? '（已失去写入权，请重启）' : ''} · 传输 ${state.transport}`
     + (state.accounts.length ? ` · 账户 ${state.accounts.map(a => `${a.venue} ${a.accountMode} ${a.accountId} v${a.credentialVersion}`).join('，')}` : '')
-    + (state.notionalLimits ? ` · 名义金额上限 单笔 ${state.notionalLimits.perJob} USDT，累计开仓 ${state.notionalLimits.openUsed} / ${state.notionalLimits.totalOpen} USDT` : '');
+    + (state.notionalLimits ? ` · 名义金额上限 单笔 ${state.notionalLimits.perJob} USDT，${'openPer24h' in state.notionalLimits
+      ? `24 小时开仓 ${state.notionalLimits.openUsed} / ${state.notionalLimits.openPer24h}` : `累计开仓 ${state.notionalLimits.openUsed} / ${state.notionalLimits.totalOpen}`} USDT` : '');
 }
 
 const TABS: { page: Route['page']; href: string; text: string }[] = [
   { page: 'overview', href: '#/', text: '总览' }, { page: 'pair', href: '#/pair', text: '配对详情' }, { page: 'status', href: '#/status', text: '运行状态' },
   { page: 'settings', href: '#/settings', text: '设置' },
 ];
+/** Shown only where /api/oil/state answers: a service without oil returns 404 there. */
+const OIL_TAB = { page: 'oil' as const, href: '#/oil', text: '原油' };
+const OIL_CHECK_MS = 60_000;
 
 export function App() {
   const route = useRoute();
@@ -33,6 +39,9 @@ export function App() {
   const onExpired = useCallback(() => setExpired(true), []);
   const live = useLiveResource<ServiceState>('/api/state', { intervalMs: REFRESH_MS, timeoutMs: READ_TIMEOUT_MS, onExpired });
   const { data: state, status, error, receivedAt, refresh } = live;
+  // The oil page reads the same path faster while it is open; here it only decides whether the tab shows.
+  const oil = useLiveResource<OilState>(OIL_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: OIL_READ_TIMEOUT_MS, onExpired });
+  const tabs = oil.data !== null ? [...TABS, OIL_TAB] : TABS;
   // A read that succeeds again (after logging in from another tab) clears the notice.
   useEffect(() => { if (status === 'ready') setExpired(false); }, [status]);
   const changed = useCallback(() => { void refresh(); }, [refresh]);
@@ -56,9 +65,9 @@ export function App() {
       {stale ? <span className="err">{status === 'paused' ? ` · 页面在后台，已暂停刷新（停留在 ${clock(receivedAt)}）` : status === 'offline' ? ` · 网络离线（停留在 ${clock(receivedAt)}）` : error ? ` · 刷新失败：${error.message}（停留在 ${clock(receivedAt)}）` : ` · 正在刷新，下方仍是 ${clock(receivedAt)} 的结果`}</span> : null}
     </p> : null}
     <nav className="tabs" aria-label="页面">
-      {TABS.map(tab => <a key={tab.page} href={tab.href} className={tab.page === route.page ? 'tab active' : 'tab'} aria-current={tab.page === route.page ? 'page' : undefined}>{tab.text}</a>)}
+      {tabs.map(tab => <a key={tab.page} href={tab.href} className={tab.page === route.page ? 'tab active' : 'tab'} aria-current={tab.page === route.page ? 'page' : undefined}>{tab.text}</a>)}
     </nav>
-    {route.page === 'status' ? <StatusPage onExpired={onExpired} /> : <>
+    {route.page === 'oil' ? <OilPage onExpired={onExpired} /> : route.page === 'status' ? <StatusPage onExpired={onExpired} /> : <>
     {!state ? (status === 'error' || status === 'offline'
       ? <StatePanel kind="error" title="读取服务状态失败" detail={error?.message ?? '网络离线'} />
       : <StatePanel kind="loading" title="加载中…" />) : route.page === 'pair' ? <PairDetail state={state} pairId={route.pairId} stale={stale} onExpired={onExpired} />

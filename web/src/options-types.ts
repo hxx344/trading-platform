@@ -1,5 +1,5 @@
-// The shapes of the options reads (GET /api/options/market, /preview, /state) and writes (POST /api/options/plans,
-// /tasks), as the options page reads them; the server side is src/options/engine.ts.
+// The shapes of the options reads (GET /api/options/market, /preview, /state, /rfq) and writes (POST /api/options/plans,
+// /tasks, /rfq), as the options page reads them; the server side is src/options/engine.ts and src/options/rfq.ts.
 
 export type Side = 'Buy' | 'Sell';
 export type OptionType = 'Call' | 'Put';
@@ -41,10 +41,12 @@ export interface Task {
   minNetIncomeUsd: number | null; maxNetCostUsd: number | null; netBlocked: boolean; riskBlocked: boolean;
   openingGroup: string | null; strategyStatus: 'open' | 'closed' | null; closedAt: number | null; closeReason: string | null; error: string | null;
   scheduled?: boolean;
+  /** An opening filled by an RFQ quote (G2c); absent on ordinary tasks. */
+  rfq?: { rfqId: string; quoteId: string; deskCode: string };
 }
 export interface OrderRow {
   link: string; taskId: string; symbol: string; side: Side; qty: string; reduceOnly: boolean; status: string; terminal: boolean;
-  filledQty: string; orderId: string; createdAt: number; updatedAt: number; message?: string; price?: string; kind?: 'ioc';
+  filledQty: string; orderId: string; createdAt: number; updatedAt: number; message?: string; price?: string; kind?: 'ioc' | 'rfq';
 }
 export interface Position { symbol: string; side: Side; size: string; avgPrice: number; markPrice: number; unrealisedPnl: number }
 export interface Execution {
@@ -81,7 +83,28 @@ export interface OptionsState {
   executions: Execution[]; market: { at: number | null; stale: boolean; error: string | null };
   /** Absent from a pre-G2a service (a page left open across a rollback). */
   schedule?: ScheduleView;
+  /** An RFQ not yet settled (G2c); absent from a pre-G2c service. */
+  rfqActive?: boolean;
 }
+
+// GET /api/options/rfq and the RFQ writes (G2c 组合询价).
+export type RfqStatus = 'CreationUnknown' | 'ExecutionUnknown' | 'CancelUnknown' | 'Active' | 'PendingFill' | 'Filled' | 'Canceled' | 'Expired' | 'Failed';
+export interface RfqRecord {
+  taskId: string; linkId: string; rfqId: string | null; status: RfqStatus; mode: StrategyMode; strategyType: string; counterparties: string[]; legs: PlanLeg[];
+  createdAt: number; updatedAt: number; expiresAt: number | null; selectedQuoteId: string | null; selectedDesk: string | null; selectedPrices: Record<string, number> | null;
+  executionStartedAt: number | null; executionResolved: boolean; trackingApplied: boolean; error: string | null;
+  feeContext: { index: number; feeRate: number; feeCapPct: number };
+}
+export interface RfqQuoteLeg { symbol: string; side: Side; qty: string; price: number | null; chain: number | null; diff: number | null }
+export interface RfqQuote {
+  quoteId: string; deskCode: string; status: string; expiresAt: number; covered: number; total: number;
+  netUsd: number | null; chainNetUsd: number | null; diffUsd: number | null; feeUsd: number | null; legs: RfqQuoteLeg[]; problem: string | null;
+}
+export interface RfqView {
+  rfq: RfqRecord | null; statusName: string | null; finished: boolean; readError: string | null; quotes: RfqQuote[]; quotesAt: number | null; blocked: string | null;
+  settings: { legQty: string; strategyMode: StrategyMode; maxRiskUsd: number; maxMarginUsd: number }; market: { at: number | null; stale: boolean }; now: number;
+}
+export interface RfqAccepted { rfqId: string | null; linkId: string; status: RfqStatus; taskId: string; error: string | null }
 
 // GET /api/options/performance (G2b 收益); amounts are in the group's settlement currency, times in ms.
 export interface PerformancePoint { time: number; pnl: number; terminal?: true; gapBefore?: true }

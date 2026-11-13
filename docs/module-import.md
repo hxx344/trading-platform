@@ -2,6 +2,7 @@
 
 2026-11-13 用户决定：模块的启用与数据迁移一律做进设置页「从工作台导入」面板（及对应的命令行），不要求用户手改 `config.json`。本文是行情监控（[monitor.md](monitor.md)）与资产账本（[asset.md](asset.md)）接入面板的方案，接法照期权账户（[options.md](options.md) §3「导入」）。以后的新模块照本文做。
 
+- 状态：已实施，随 v0.15.0 发布；审查记录 [reviews/2026-11-14-module-import.md](reviews/2026-11-14-module-import.md)。
 - 等级：R3（root 导入助手、配置写入、服务重启、往数据目录写库）。
 - 回滚版本：v0.12.0（`sudo bash install.sh --version v0.12.0`）。本批不改配置格式（`monitor`、`asset` 两段与 v0.12.0 相同）、不改 `asset.sqlite` 结构，回退后已写入的配置与账本 v0.12.0 照常读取，无需先删字段。
 - 影响面：`src/service/import-workbench.ts`（计划与命令行，新增 `filesUnchanged` 判断配置是否有变化）、新增 `src/service/import-modules.ts`（两个模块的读取与计划）、`src/service/import-channel.ts`（页面请求字段与用户名规则 `ASSET_OWNER`，服务进程只加载这个轻量文件）、`src/service/import-helper.ts`（导入顺序）、`src/asset/import.ts`（拆成读 / 校验 / 写三步，规则不变）、新增 `src/asset/import-writer.ts`（以数据目录属主身份运行的写账本子进程）、`deploy/install.sh`（`--monitor`、`--asset`、`--asset-owner`）、`web/src/ImportPanel.tsx` 与新增 `web/src/import-form.ts`、资产页空状态、文档。划转、ADL、原油、期权逻辑不变。

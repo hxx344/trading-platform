@@ -15,6 +15,21 @@
 7. **验证**：浏览器在替身后端上把新页面走一遍，截 1280 和 390 两种宽度与工作台同页面对比，不能比工作台难看；确认无 CSP 报错、手机宽度无横向溢出（表格在自己的框内横向滚动）。表单到请求的转换放在不依赖 DOM 的 `*-form.ts` 里写单元测试。
 8. **文档**：新模块在本文件末尾加一节，写清对照的工作台页面与提交、复制了哪些样式、回滚版本。
 
+## 页面一览
+
+| 页面 | 地址 | 何时显示 | 本文小节 |
+| --- | --- | --- | --- |
+| 配对组 | `#/`、`#/pair/<配对>` | 总是 | F1–F3、《ASTER 页面按工作台重排（F4）》 |
+| 运行状态 | `#/status` | 总是 | F2、《日志页与定时摘要状态》 |
+| 日志 | `#/logs` | 总是 | 《日志页与定时摘要状态》 |
+| 设置 | `#/settings` | 总是 | F3、《定时摘要间隔在设置页修改》、《导入面板：行情监控与资产账本》 |
+| 原油 | `#/oil` | `GET /api/oil/state` 有应答（配置了 `oil`） | 《原油页样式》，页面内容见 [oil.md](oil.md) 第 3 节 |
+| 期权 | `#/options`，子页 `#/options/positions`、`#/options/orders`、`#/options/performance`、`#/options/rfq` | `GET /api/options/state` 有应答（配置了 `options`） | 《期权页》 |
+| 行情监控 | `#/monitor` | `GET /api/monitor/state` 有应答（配置了 `monitor`） | 《行情监控页》 |
+| 资产 | `#/asset` | `GET /api/asset/state` 不是 404（配置了 `asset`；账本读取失败时也显示） | 《资产页》《资产页写入》 |
+
+下面各节按接入批次记录当时的做法；后一批改掉前一批的地方以后一批为准（例如 F4 把总览与配对详情合并成配对组，A-2 去掉了 A-1 的只读提示）。
+
 ## 范围与批次
 
 | 批次 | 内容 | 风险 |
@@ -148,17 +163,6 @@
 
 **回滚**：`sudo bash install.sh --version v0.9.0`（先按 README 删掉 `config.json` 的 `summary` 与 `secrets.json` 的 `feishuScheduled`；页面导入配对时会自动写入 `feishuScheduled`，自己没写过也要检查）。
 
-## 行情监控页（Monitor M-1）
-
-**对照的工作台页面**：`modules/monitor/app/anthropic-panel.tsx`（提交 `35ebb94`）与 `spread-chart.tsx`（`4be9aa4`），按它在工作台 Hub 里嵌入显示的样子（不显示工作台顶栏）。数据规则复制自 `lib/anthropic-history.ts`（`35ebb94`）、`lib/market.ts` 与 `lib/chart-ranges.ts`（`8470785`）、`lib/chart-sampling.ts`（`7581e78`），放在 `web/src/monitor-history.ts`；走势图用已复制的 `svg-plot.tsx`。
-
-**页面**：新标签「行情监控」（`#/monitor`，只在 `/api/monitor/state` 有应答时显示，与原油页一样在 `.aster-module` 外）：工具栏（对比合约 xyz:ANT / io:ANTH / Lighter RH、刷新）、状态行、股数说明、各类错误与快照提示、四格读数、走势图（溢价率 / 每股价差 / 每股价格，1 周 / 1 月 / 全部）、近期观察、如何比较、数据来源与覆盖范围。文案沿用工作台，股数说明改为“服务配置股数”。没做成交标记、技术指标、股数同步。
-
-**样式**：`web/src/monitor.css`，来源是工作台 `modules/monitor/app/design-tokens.css`（`9ca6f68`，令牌放在 `.monitor-desk` 上）与 `globals.css`（`77f3cf2`，本页用到的规则，顺序与数值不改，选择器加 `.monitor-desk ` 前缀）；另有 preflight 的几条与 ASTER 外壳泄漏规则的复位，取法见 [docs/monitor.md](monitor.md) 的 M-1 实施记录。不引入 Tailwind，无内联样式（图表提示框位置沿用 `svg-plot.tsx` 的 CSSOM 写法）。
-
-**验证**：`scripts/dev-monitor.ts` 替身行情下在浏览器里切换对比合约、图表标签、时间范围、展开来源、悬停提示；DOM 内只有 `svg-plot` 提示框的 CSSOM 定位。
-
-**回滚**：`sudo bash install.sh --version v0.11.0`（先删掉 `config.json` 的 `monitor`）。
 ## 定时摘要间隔在设置页修改（v0.10.1）
 
 **对照的工作台页面**：工作台的定时通知间隔只在环境变量里改；表单照本服务「配对设置」的写法（`pair-settings-form form-stack` + `settings-form-grid`、字段下方 `small` 提示、错误在按钮上方、成功在按钮旁），外层用 `execution-live-state` 留边距。
@@ -172,6 +176,41 @@
 **接口**：`POST /api/summary/interval`（`{"intervalMinutes": n}`，0–1440 整数）、`POST /api/summary/send`（`{}`），都要登录与页面请求标记，返回摘要状态。
 
 **回滚**：`sudo bash install.sh --version v0.10.0`。页面设置的间隔存在 `notify.sqlite` 新加的列里，v0.10.0 不读，回滚后按 `config.json` 的间隔发送。
+
+## 期权页（v0.11.0）
+
+**对照的工作台页面**：工作台期权模块 `modules/greeks/app/static/index.html`、`app.js`、`style.css`（提交 `2f0593d`）。页面 `web/src/OptionsPage.tsx`，表单与计算在不依赖 DOM 的 `web/src/options-form.ts`（有单元测试）。顶部「期权」标签只在 `GET /api/options/state` 有应答时出现。
+
+**页面**：执行台（指标行、期权链、策略腿与到期收益图、Greeks 汇总、执行控制、账户保证金健康度）、持仓（持仓、近期成交）、组合执行（进行中 / 历史任务卡片）。开平仓先生成计划，再在确认对话框核对腿、金额与净价限制并勾选后提交；请求编号沿用 `RequestIds`。RFQ 与收益统计不在本批（G2）。
+
+**样式**
+
+- 工作台样式复制到 `web/src/options.css`，每条规则加 `.options-desk ` 前缀，文件头写明来源与提交号；只保留本页用到的规则，规则内容不改。
+- 在 `main.tsx` 里排在 `styles.css`、`aster.css` 之后引入。外壳根元素是 `.aster-desk`，`aster.css` 里 `.aster-desk .muted / .panel / .button / .count` 的规则会盖过期权页样式，所以 `styles.css` 末尾的期权页一节用 `.aster-desk .options-desk` 前缀把行高、溢出、按钮换行和计数边距恢复成工作台的样子。
+- CSP 不允许行内样式：到期收益图与进度条用 SVG 画，不用 canvas 和 `style` 宽度；策略腿表在窄屏横向滚动（`.strategy-body .legs`）。
+- 确认对话框的计划倒计时按收到计划时的本机时间加上计划有效期计算，不用服务器时间戳相减，避免本机与服务器时钟偏差；到期后取消勾选并禁用提交。
+
+**导入面板**：预览列出工作台期权账户（打码 UID、能否导入及原因），勾选「导入期权账户」后随导入一起写入（默认不勾选）。
+
+**回滚**：`sudo bash install.sh --version v0.10.1`（先按 [options.md](options.md) 第 4 节删掉 `options` 与 `bybitOptions`）。
+
+**G2a（v0.13.0）**：执行控制底部“计划开仓”一行改为定时开仓状态（下次时间 / 窗口中 / 已关闭）和“打开定时 / 关闭定时”按钮，打开前 `confirm()` 列出时间、策略、数量、上限与 IOC 设置（文字在 `options-form.ts` 的 `autoOpenConfirm`）；提示条与“LIMIT / BBO”标记随 IOC 设置变化；委托明细执行列区分 BBO / IOC；定时任务卡片标题前加“定时”标签。工作台的定时开仓开关在环境文件里，这里是页面新增的。
+
+**G2b 收益（v0.14.0）**：对照工作台 `modules/greeks/app/static/index.html` 的 `pane-perf`、`performance.js` 与 `style.css` 的 `performance-*` 规则（提交 0c5a219）。第四个标签“收益”（`#/options/performance`）：标题“策略实盘收益 · 按每次组合开仓累计”，工具条（同步状态、结算币种选择、刷新），四个统计数（到期组合综合净收益、纳入统计的到期组合、胜率、采样最大回撤），综合曲线，“每次开仓收益详情”与覆盖说明，每组一个可展开的 `<details>`（金额六项、说明、待核对原因、该组持仓盈亏采样曲线、逐笔成交），页脚口径说明。差异：曲线用本服务的 `SvgPlot`（工作台手画 SVG 三次曲线），断开位置由接口的 `gapBefore` 给出（抽稀后的点距不能再用来判断缺口）；每组采样曲线只在展开时画；曲线上的圆点约每 ⌈n/80⌉ 个点画一个（另加最后一点与结束点，结束点放大），采样数显示接口抽稀前的真实采样数。读取每 30 s 一次，只在本标签打开时读；读失败保留上次结果并在状态行说明。还没有数据时币种显示 USDC；所选币种与展开的组合由期权页保存，切换标签再回来不丢。样式按原规则复制到 `options.css`，加 `.options-desk ` 前缀；曲线容器的高度（280px，窄屏 240px）是本服务自己的规则 `.performance-plot`（SvgPlot 需要容器给高度）。回滚：`sudo bash install.sh --version v0.13.0`。
+
+**G2c 组合询价（v0.17.0）**：对照工作台 `modules/greeks/app/static/index.html` 的 `pane-rfq`（第 153–176 行）、`app.js` 的 `renderRfq` / `quoteLegComparison` 与 `style.css` 的 `rfq-*` 规则（提交 2f0593d）。第五个标签“组合询价”（`#/options/rfq`，组件 `web/src/OptionsRfq.tsx`）：标题与状态标签，说明行加“创建 RFQ ↗”“取消询价”，询价 ID / 类型 / 有效期 / 报价数，每家报价一张卡（做市商与覆盖腿数、到期与剩余秒数、报价净额、链净额差、预估手续费、执行按钮、不能执行的原因，逐腿对比），执行确认对话框沿用 `trade-dialog`（腿与价格、三项金额、风险说明、勾选后提交）。差异：创建用执行台当前的策略与数量，发起前 `confirm()`；报价是否可执行、净额与手续费由服务算好，页面不自己算；确认绑定报价内容指纹（`quoteFingerprint`），报价更新后取消勾选并提示，报价消失或已提交时自动关闭；剩余秒数按服务时钟换算。读取在询价未结束时每 2 s、否则每 5 s，切走本标签即停。创建沿用 RequestIds，应答丢失时再点用同一请求编号核对。纯函数在 `options-form.ts`（`rfqCreateBody`、`rfqExecuteBody`、`rfqCreateProblem`、`rfqOpen`、`quoteFingerprint`、`quoteSecondsLeft`）。样式按原规则复制到 `options.css`，多选择器规则只取 rfq 部分，加 `.options-desk ` 前缀。回滚：先确认没有未结束的询价，再 `sudo bash install.sh --version v0.16.0`。
+
+## 行情监控页（Monitor M-1）
+
+**对照的工作台页面**：`modules/monitor/app/anthropic-panel.tsx`（提交 `35ebb94`）与 `spread-chart.tsx`（`4be9aa4`），按它在工作台 Hub 里嵌入显示的样子（不显示工作台顶栏）。数据规则复制自 `lib/anthropic-history.ts`（`35ebb94`）、`lib/market.ts` 与 `lib/chart-ranges.ts`（`8470785`）、`lib/chart-sampling.ts`（`7581e78`），放在 `web/src/monitor-history.ts`；走势图用已复制的 `svg-plot.tsx`。
+
+**页面**：新标签「行情监控」（`#/monitor`，只在 `/api/monitor/state` 有应答时显示，与原油页一样在 `.aster-module` 外）：工具栏（对比合约 xyz:ANT / io:ANTH / Lighter RH、刷新）、状态行、股数说明、各类错误与快照提示、四格读数、走势图（溢价率 / 每股价差 / 每股价格，1 周 / 1 月 / 全部）、近期观察、如何比较、数据来源与覆盖范围。文案沿用工作台，股数说明改为“服务配置股数”。没做成交标记、技术指标、股数同步。
+
+**样式**：`web/src/monitor.css`，来源是工作台 `modules/monitor/app/design-tokens.css`（`9ca6f68`，令牌放在 `.monitor-desk` 上）与 `globals.css`（`77f3cf2`，本页用到的规则，顺序与数值不改，选择器加 `.monitor-desk ` 前缀）；另有 preflight 的几条与 ASTER 外壳泄漏规则的复位，取法见 [docs/monitor.md](monitor.md) 的 M-1 实施记录。不引入 Tailwind，无内联样式（图表提示框位置沿用 `svg-plot.tsx` 的 CSSOM 写法）。
+
+**验证**：`scripts/dev-monitor.ts` 替身行情下在浏览器里切换对比合约、图表标签、时间范围、展开来源、悬停提示；DOM 内只有 `svg-plot` 提示框的 CSSOM 定位。
+
+**回滚**：`sudo bash install.sh --version v0.11.0`（先删掉 `config.json` 的 `monitor`）。
 
 ## 资产页（Asset A-1）
 
@@ -211,27 +250,16 @@
 - 总览：侧栏由 A-1 的“分交易所合计”恢复为工作台的“数据连接”（每行点开对应连接，Aster 跳到连接视图），交易所资产 KPI 显示“N 个账户待连接 / 账户已连接”，汇率面板文案恢复工作台原文，页脚加各视图说明。
 - 样式：`.connections-grid`、`.connection-card*`、`.aster-*`、`.loading-spin`、`.section-note`、`.exchange-mark.virtual` 复制自工作台 `globals.css`（`0014655`，行号见 `asset.css` 注释），规则与先后次序不改，加 `.asset-desk ` 前缀；连接面板整行展开与 Aster 卡片内面板的规则写在 `asset.css` 末尾。
 
-## 期权页（v0.11.0）
-
-**对照的工作台页面**：工作台期权模块 `modules/greeks/app/static/index.html`、`app.js`、`style.css`（提交 `2f0593d`）。页面 `web/src/OptionsPage.tsx`，表单与计算在不依赖 DOM 的 `web/src/options-form.ts`（有单元测试）。顶部「期权」标签只在 `GET /api/options/state` 有应答时出现。
-
-**页面**：执行台（指标行、期权链、策略腿与到期收益图、Greeks 汇总、执行控制、账户保证金健康度）、持仓（持仓、近期成交）、组合执行（进行中 / 历史任务卡片）。开平仓先生成计划，再在确认对话框核对腿、金额与净价限制并勾选后提交；请求编号沿用 `RequestIds`。RFQ 与收益统计不在本批（G2）。
-
-**样式**
-
-- 工作台样式复制到 `web/src/options.css`，每条规则加 `.options-desk ` 前缀，文件头写明来源与提交号；只保留本页用到的规则，规则内容不改。
-- 在 `main.tsx` 里排在 `styles.css`、`aster.css` 之后引入。外壳根元素是 `.aster-desk`，`aster.css` 里 `.aster-desk .muted / .panel / .button / .count` 的规则会盖过期权页样式，所以 `styles.css` 末尾的期权页一节用 `.aster-desk .options-desk` 前缀把行高、溢出、按钮换行和计数边距恢复成工作台的样子。
-- CSP 不允许行内样式：到期收益图与进度条用 SVG 画，不用 canvas 和 `style` 宽度；策略腿表在窄屏横向滚动（`.strategy-body .legs`）。
-- 确认对话框的计划倒计时按收到计划时的本机时间加上计划有效期计算，不用服务器时间戳相减，避免本机与服务器时钟偏差；到期后取消勾选并禁用提交。
-
-**导入面板**：预览列出工作台期权账户（打码 UID、能否导入及原因），勾选「导入期权账户」后随导入一起写入（默认不勾选）。
-
 ## 导入面板：行情监控与资产账本
 
 设置页「从工作台导入」预览多两块：行情监控（本项目是否已启用、工作台有无 Monitor、股数取默认值的说明）与资产账本（本项目是否已启用与上次导入、工作台账本路径、每个用户的条数与能否导入，多个用户时单选）；勾选「启用行情监控」「导入资产账本」后随导入一起写入，默认不勾选，只勾这两项也可以。只重新导入资产账本时按钮为「导入所选」（不重启服务）。请求体、按钮文案与确认文案在不依赖 DOM 的 `web/src/import-form.ts`，由 `test/import-form.test.ts` 覆盖。方案见 [module-import.md](module-import.md)。
 
-**回滚**：`sudo bash install.sh --version v0.10.1`（先按 [options.md](options.md) 第 4 节删掉 `options` 与 `bybitOptions`）。
+**回滚**：见 [module-import.md](module-import.md) 第 8 节（配置格式与库结构都没变，回退后改用备选方式）。
 
-**G2a（v0.13.0）**：执行控制底部“计划开仓”一行改为定时开仓状态（下次时间 / 窗口中 / 已关闭）和“打开定时 / 关闭定时”按钮，打开前 `confirm()` 列出时间、策略、数量、上限与 IOC 设置（文字在 `options-form.ts` 的 `autoOpenConfirm`）；提示条与“LIMIT / BBO”标记随 IOC 设置变化；委托明细执行列区分 BBO / IOC；定时任务卡片标题前加“定时”标签。工作台的定时开仓开关在环境文件里，这里是页面新增的。
+## 原油自动规则区块（O2a）
 
-**G2b 收益（v0.14.0）**：对照工作台 `modules/greeks/app/static/index.html` 的 `pane-perf`、`performance.js` 与 `style.css` 的 `performance-*` 规则（提交 0c5a219）。第四个标签“收益”（`#/options/performance`）：标题“策略实盘收益 · 按每次组合开仓累计”，工具条（同步状态、结算币种选择、刷新），四个统计数（到期组合综合净收益、纳入统计的到期组合、胜率、采样最大回撤），综合曲线，“每次开仓收益详情”与覆盖说明，每组一个可展开的 `<details>`（金额六项、说明、待核对原因、该组持仓盈亏采样曲线、逐笔成交），页脚口径说明。差异：曲线用本服务的 `SvgPlot`（工作台手画 SVG 三次曲线），断开位置由接口的 `gapBefore` 给出（抽稀后的点距不能再用来判断缺口）；每组采样曲线只在展开时画；曲线上的圆点约每 ⌈n/80⌉ 个点画一个（另加最后一点与结束点，结束点放大），采样数显示接口抽稀前的真实采样数。读取每 30 s 一次，只在本标签打开时读；读失败保留上次结果并在状态行说明。还没有数据时币种显示 USDC；所选币种与展开的组合由期权页保存，切换标签再回来不丢。样式按原规则复制到 `options.css`，加 `.options-desk ` 前缀；曲线容器的高度（280px，窄屏 240px）是本服务自己的规则 `.performance-plot`（SvgPlot 需要容器给高度）。回滚：`sudo bash install.sh --version v0.13.0`。
+原油页下单表单下方新增「自动开平仓」区块（`web/src/OilRules.tsx`），结构与文案照工作台 `src/TradingAutoRules.tsx`，样式从工作台 `src/trading-execution.css` 第 287–311 行（提交 `1d06abd`）原样复制到 `trading.css` 末尾。差异：只有观察模式，表单没有“保存后立即启用实盘”与实盘确认；卡片的“每日最多开仓”注明转实盘后生效。读取每 3 秒一次（`/api/oil/rules`），读失败或数据超过 16 秒未更新时停用写按钮；写请求返回后直接用应答里的新视图，应答不确定或修订号冲突（409）时重新读取。表单到请求体的换算与校验在不依赖 DOM 的 `web/src/oil-rules-form.ts`，由 `test/oil-rules-form.test.ts` 覆盖。规则语义见 [oil.md](oil.md) 第 7 节。
+
+**验证**：替身 Binance / Bybit 上新建只观察规则，晃动 BZ 盘口后按连续次数记录信号；1280 与 390 宽度无横向溢出、无 CSP 报错。
+
+**回滚**：`sudo bash install.sh --version v0.17.0`。不用改配置；`oil-rules.sqlite` 留在数据目录，旧版本不读。

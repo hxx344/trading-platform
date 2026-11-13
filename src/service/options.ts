@@ -20,6 +20,8 @@ const PREFLIGHT_MS = 30_000;
 const RECONCILE_MS = 15_000;
 const HEALTH_MS = 15_000;
 const PERFORMANCE_TICK_MS = 15_000;
+/** An unfinished RFQ (G2c) is read every 3 s, as the workbench page polls it. */
+const RFQ_TICK_MS = 3_000;
 /** The shortest gap between two rounds, so a round that took its whole timeout does not start the next at once. */
 const MIN_GAP_MS = 500;
 /** How long a stopping service waits between looks at shutdown; the pause is woken by the stop itself. */
@@ -129,12 +131,32 @@ export function optionsViews(engine: OptionsEngine) {
       if (typeof value.enabled !== 'boolean') reject('invalid_value', 'enabled 须为 true / false');
       return engine.setAutoOpen(value.enabled as boolean);
     },
+    // 组合询价 (G2c)
+    rfq: () => engine.rfqView(),
+    rfqCreate: async (body: unknown) => {
+      const value = exactKeys(body, ['requestId', 'confirmLive'], ['quantity', 'mode']);
+      if (typeof value.requestId !== 'string' || !/^[\w-]{8,80}$/.test(value.requestId)) reject('invalid_value', 'requestId 无效');
+      if (typeof value.confirmLive !== 'boolean') reject('invalid_value', 'confirmLive 须为 true / false');
+      const qty = quantity(value.quantity), strategy = mode(value.mode);
+      return engine.createRfq({ requestId: value.requestId as string, confirmLive: value.confirmLive as boolean, ...(qty ? { quantity: qty } : {}), ...(strategy ? { mode: strategy } : {}) });
+    },
+    rfqExecute: async (body: unknown) => {
+      const value = exactKeys(body, ['rfqId', 'quoteId', 'confirmLive']);
+      for (const key of ['rfqId', 'quoteId'] as const) if (typeof value[key] !== 'string' || !/^[\w-]{1,80}$/.test(value[key] as string)) reject('invalid_value', `${key} 无效`);
+      if (typeof value.confirmLive !== 'boolean') reject('invalid_value', 'confirmLive 须为 true / false');
+      return engine.executeQuote({ rfqId: value.rfqId as string, quoteId: value.quoteId as string, confirmLive: value.confirmLive as boolean });
+    },
+    rfqCancel: async (body: unknown) => {
+      const value = exactKeys(body, ['rfqId']);
+      if (typeof value.rfqId !== 'string' || !/^[\w-]{1,80}$/.test(value.rfqId)) reject('invalid_value', 'rfqId 无效');
+      return engine.cancelRfq({ rfqId: value.rfqId as string });
+    },
   };
 }
 export type OptionsViews = ReturnType<typeof optionsViews>;
 
 /**
- * The chain every 10 s, reconciliation every 15 s, account health every 15 s, the Friday scheduler every 5 s and the 收益 ledger and samples every 15 s; each round's reads carry their own
+ * The chain every 10 s, reconciliation every 15 s, account health every 15 s, the Friday scheduler every 5 s, the 收益 ledger and samples every 15 s and an unfinished RFQ every 3 s; each round's reads carry their own
  * timeout and a failure only marks the view. On stop, running tasks are stopped and their orders cancelled and read back.
  */
 export function optionsLoops(runtime: OptionsRuntime, engine: OptionsEngine, context: { stopped(): boolean; pause(ms: number): Promise<void> }, log: (line: string) => void): Promise<void>[] {
@@ -152,6 +174,7 @@ export function optionsLoops(runtime: OptionsRuntime, engine: OptionsEngine, con
     every(HEALTH_MS, '账户健康度读取', engine.refreshHealth),
     every(SCHEDULE_TICK_MS, '定时开仓', engine.autoOpenTick),
     every(PERFORMANCE_TICK_MS, '收益采样', engine.performanceTick),
+    every(RFQ_TICK_MS, '询价核对', engine.rfqTick),
     (async () => {
       while (!context.stopped()) await context.pause(IDLE_MS);
       await engine.close();

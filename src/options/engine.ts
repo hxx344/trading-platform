@@ -3,6 +3,7 @@
 // RFQ (docs/options.md §1); the Friday auto-open and the IOC fallback came in G2a, the fills ledger and the 收益 samples in G2b. One lock serializes plans, task runs and
 // reconciliation as the workbench's engine lock does; a stop never waits for it. Every change to the state document is
 // written before it is acted on, so a restart finds every order the service could have sent.
+import { VenueError } from '../connector.ts';
 import { ContractError } from '../contracts.ts';
 import { add, cmp, decimal, isMultiple, isZero, min as minDecimal, sub } from '../decimal.ts';
 import { describe } from '../live/values.ts';
@@ -11,6 +12,7 @@ import type { OptionsClient, Row } from './client.ts';
 import { QUOTE_STALE_MS, isSunday, type ChainSnapshot, type OptionMarket, type OptionRow, type OptionType } from './market.ts';
 import { followOrder, iocOrder, reconcileOrder, roundToTick, type OrderOutcome, type OrderStatus } from './orders.ts';
 import { amountText, buildPerformance, exact, thinPoints, type PerformanceInput, type Sample } from './performance.ts';
+import { RFQ_STATUS_NAMES, chainFor, counterpartiesFrom, filledOrders, isTerminal, observe, parseQuotes, parseRfqRow, quoteProblem, quoteView, rfqFinished, sortQuotes, strategyTypeFor, validRfq, type RfqObservation, type RfqQuote, type RfqRecord } from './rfq.ts';
 import type { OptionsStore } from './store.ts';
 import { StrategyError, buildStrategy, maximumLoss, reserveShortMargin, validateStructure, type Estimates, type MarginContext, type Preview, type RiskLeg, type Side, type StrategyMode } from './strategy.ts';
 
@@ -28,6 +30,8 @@ export const FALLBACK_DELAY_MS = 800;
 const HISTORY_LIMIT_MS = 180 * 86_400_000;
 const RETIRE_BUDGET_MS = 120_000;
 const READ_MS = 25_000;
+/** A filled RFQ is tracked from its saved structure once its trade list has not matched for this long (G2c). */
+const RFQ_TRADE_WAIT_MS = 120_000;
 const EXECUTIONS_KEPT = 100;
 const EPSILON = 1e-9;
 /** 收益 (G2b): one sample a minute per holding (the workbench's default), only on positions read within the last minute. */
@@ -51,7 +55,7 @@ export type Operation = 'open' | 'close';
 
 export interface PlanLeg { symbol: string; side: Side; qty: string; expiry: number; strike: number; optionType: OptionType; referencePrice: number }
 interface NetLeg extends PlanLeg { priceBound: number; feePriceCeiling?: number }
-interface FeeContext { index: number; feeRate: number; feeCapPct: number }
+export interface FeeContext { index: number; feeRate: number; feeCapPct: number }
 export interface Plan {
   planId: string; operation: Operation; mode: StrategyMode; createdAt: number; expiresAt: number; legs: PlanLeg[];
   estimatedGrossUsd: number; estimatedFeeUsd: number; estimatedNetUsd: number; estimatedMarginUsd: number; unboundedLoss: boolean;
@@ -70,12 +74,14 @@ export interface Task {
   closureEvidence: Record<string, Row[]>; error: string | null; notified: string[];
   /** Admitted by the Friday scheduler: it dispatches only inside the opening window. */
   scheduled?: boolean;
+  /** An opening filled through 组合询价 (G2c): the RFQ and the market maker's quote. */
+  rfq?: { rfqId: string; quoteId: string; deskCode: string };
 }
 export interface JournalEntry {
   taskId: string; symbol: string; side: Side; qty: string; reduceOnly: boolean; tick: string;
   status: OrderStatus; terminal: boolean; filledQty: string; orderId: string; createdAt: number; updatedAt: number; message?: string; price?: string;
-  /** An IOC fallback for a leg's remainder; absent for the book-following order. */
-  kind?: 'ioc';
+  /** An IOC fallback for a leg's remainder, or a leg of a filled RFQ (G2c, read by orderId); absent for the book-following order. */
+  kind?: 'ioc' | 'rfq';
 }
 /**
  * The Friday auto-open: enabled is the page's switch (null: config.json decides); lastOpenWeek the ISO week a scheduled
@@ -88,6 +94,8 @@ export interface OptionsState {
   tracked: { groupId: string | null; sizes: Record<string, string> }; pmBaseline: PmBaseline | null; executions: ExecutionRecord[];
   /** Added in v0.13 (G2a); a document without it starts with the defaults. */
   schedule: Schedule;
+  /** 组合询价 (G2c, v0.17): the latest RFQ; null or absent when there has been none. */
+  rfq: RfqRecord | null;
 }
 
 export interface AutoOpenSettings { enabled: boolean; hourUtc: number; minuteUtc: number; windowSeconds: number }
@@ -134,7 +142,7 @@ export function isoWeek(ms: number): string {
 
 /** Restores the saved document; a missing one starts empty, another account's refuses start. */
 function restore(raw: unknown, uid: string): OptionsState {
-  if (raw === null) return { uid, tasks: {}, journal: {}, tracked: { groupId: null, sizes: {} }, pmBaseline: null, executions: [], schedule: emptySchedule() };
+  if (raw === null) return { uid, tasks: {}, journal: {}, tracked: { groupId: null, sizes: {} }, pmBaseline: null, executions: [], schedule: emptySchedule(), rfq: null };
   const value = raw as Partial<OptionsState>;
   const record = (item: unknown) => typeof item === 'object' && item !== null && !Array.isArray(item);
   if (!record(value) || typeof value.uid !== 'string' || !record(value.tasks) || !record(value.journal) || !record(value.tracked) || !record(value.tracked!.sizes) || !Array.isArray(value.executions)) throw new Error('期权状态库内容不完整');
@@ -148,6 +156,8 @@ function restore(raw: unknown, uid: string): OptionsState {
     if (![null, true, false].includes(schedule.enabled as boolean | null) || !['lastOpenWeek', 'attemptWeek', 'lastError', 'notifiedWeek'].every(text) || !['enabledAt', 'lastAttemptAt'].every(time)) throw new Error('期权状态库的定时开仓记录不完整');
     value.schedule = schedule as unknown as Schedule;
   }
+  if (value.rfq === undefined) value.rfq = null;
+  else if (value.rfq !== null && !validRfq(value.rfq)) throw new Error('期权状态库的询价记录不完整');
   return value as OptionsState;
 }
 
@@ -217,13 +227,15 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
   }
 
   // ---- admission ------------------------------------------------------------------------------------------------
-  function requireIdle(): void {
+  /** rfq: false only for the RFQ's own execute and cancel, which act on the unfinished RFQ itself. */
+  function requireIdle(rfq = true): void {
     if (shutdown) conflict('shutting_down', '服务正在停止');
     if (Object.values(state.journal).some(entry => !entry.terminal)) conflict('orders_unresolved', '仍有未确认的期权订单，等对账核对后再交易');
     if (admitting || held || Object.values(state.tasks).some(task => isActive(task.status))) conflict('operation_active', '另一个期权交易操作正在进行或等待核对');
+    if (rfq && !rfqFinished(state.rfq)) conflict('rfq_active', '还有未结束的组合询价（等待报价、执行或核对中），等它成交、取消或过期后再交易');
   }
-  async function admitted<T>(work: () => Promise<T>): Promise<T> {
-    requireIdle();
+  async function admitted<T>(work: () => Promise<T>, rfq = true): Promise<T> {
+    requireIdle(rfq);
     // No await separates the check from this claim.
     admitting = true;
     try { return await locked(work); } finally { admitting = false; }
@@ -536,6 +548,303 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     });
   }
 
+  // ---- 组合询价 RFQ (G2c) ------------------------------------------------------------------------------------------
+  // One RFQ at a time, opening only. Every write (create, execute, cancel) is saved as "unknown" before it is sent, so a
+  // restart or a lost answer leaves trading blocked until the 3 s tick reads the outcome back. A filled RFQ becomes an
+  // opening task with one journal entry per leg, so tracking, closing, retirement and 收益 treat it as any other opening.
+  /** Bumped by every local write to the RFQ: a tick whose reads started before one discards what it read. */
+  let rfqVersion = 0, rfqTicking = false;
+  let rfqQuotes: { rfqId: string; quotes: RfqQuote[]; at: number } | null = null;
+  let rfqReadError: string | null = null;
+  /** When this process first saw the RFQ filled and untracked: the trade-list wait counts from here (a restart waits anew). */
+  let rfqFilledSeen: { rfqId: string; at: number } | null = null;
+  /** The venue answered and the write did not happen (as orders.ts reads a refusal). */
+  const definite = (error: unknown): boolean => error instanceof VenueError && (error.kind === 'rejected' || error.kind === 'not-sent');
+  const rfqResponse = (rfq: RfqRecord) => ({ rfqId: rfq.rfqId, linkId: rfq.linkId, status: rfq.status, taskId: rfq.taskId, error: rfq.error });
+  function touchRfq(rfq: RfqRecord): void { rfq.updatedAt = now(); rfqVersion += 1; save(); }
+
+  interface RfqRequest { requestId: string; confirmLive: boolean; quantity?: string; mode?: StrategyMode }
+  /** Sends this week's structure (quantity and mode as the desk's preview) to every listed market maker. */
+  async function createRfq(request: RfqRequest) {
+    const fingerprint = sortedJson([request.requestId, request.confirmLive, request.quantity ?? null, request.mode ?? null]);
+    if (state.rfq?.requestId === request.requestId) {
+      if (state.rfq.fingerprint !== fingerprint) conflict('request_reused', '这个请求编号已用于不同的参数');
+      return rfqResponse(state.rfq);
+    }
+    if (request.confirmLive !== true) invalid('confirm_required', '发起实盘询价需要明确确认');
+    return admitted(async () => {
+      if (Object.keys(state.tracked.sizes).length) await syncPositions();
+      if (Object.keys(state.tracked.sizes).length) conflict('strategy_open', '先平掉跟踪中的策略再询价开仓');
+      await market.refresh();
+      const view = preview(request.quantity ?? settings.legQty, request.mode ?? settings.strategyMode);
+      validateRisk(view);
+      validateCalendar(view.expiry);
+      const legs = view.legs.map(leg => planLeg(leg.symbol, leg.side, leg.qty));
+      if (legs.some(leg => leg.expiry !== view.expiry)) conflict('instrument_changed', '预览的到期日与合约不一致了');
+      const risk = initialRisk(view), fees = feeContext();
+      let config: Row;
+      try { config = await client.rfqConfig(AbortSignal.timeout(READ_MS)); } catch (error) { return conflict('rfq_unavailable', `询价配置读取失败：${describe(error)}`); }
+      let counterparties: string[];
+      try { counterparties = counterpartiesFrom(config); } catch (error) { return conflict('rfq_unavailable', describe(error)); }
+      if (shutdown) conflict('shutting_down', '服务正在停止');
+      freshSnapshot();
+      const id = newId().replace(/[^0-9a-zA-Z]/g, '').slice(0, 16), created = now();
+      if (id.length < 8) throw new Error('询价编号生成失败');
+      const rfq: RfqRecord = {
+        requestId: request.requestId, fingerprint, taskId: id, linkId: `tporfq${id}`, rfqId: null, status: 'CreationUnknown',
+        mode: view.mode, strategyType: strategyTypeFor(view.mode, config), counterparties, legs, risk, feeContext: fees,
+        createdAt: created, updatedAt: created, expiresAt: null, selectedQuoteId: null, selectedDesk: null, selectedPrices: null, executionChain: null,
+        executionStartedAt: null, executionResolved: false, trackingApplied: false, error: null,
+      };
+      state.rfq = rfq;
+      rfqQuotes = null;
+      touchRfq(rfq); // Durable before it is sent.
+      log(`期权询价 ${rfq.linkId} 发送中：${legs.map(leg => `${leg.side} ${leg.qty} ${leg.symbol}`).join('、')}`);
+      try {
+        const reply = await client.createRfq({ rfqLinkId: rfq.linkId, strategyType: rfq.strategyType, counterparties, legs }, AbortSignal.timeout(READ_MS));
+        observe(rfq, parseRfqRow({ ...reply, rfqLinkId: reply.rfqLinkId ?? rfq.linkId, status: reply.status ?? 'Active' }), now());
+      } catch (error) {
+        if (definite(error) && rfq.status === 'CreationUnknown') Object.assign(rfq, { status: 'Failed', error: `询价未创建：${describe(error)}` });
+        else if (rfq.status === 'CreationUnknown') rfq.error = `询价创建结果未知，正在向交易所核对：${describe(error)}`;
+      }
+      touchRfq(rfq);
+      return rfqResponse(rfq);
+    });
+  }
+
+  interface ExecuteRequest { rfqId: string; quoteId: string; confirmLive: boolean }
+  /** Executes one market maker's quote after checking it again against the RFQ, the chain, the calendar and the risk limits. */
+  async function executeQuote(request: ExecuteRequest) {
+    const rfq = state.rfq;
+    if (!rfq || rfq.rfqId === null || rfq.rfqId !== request.rfqId) return conflict('rfq_missing', '询价不存在或已被新的询价替换');
+    if (rfq.selectedQuoteId !== null && rfq.selectedQuoteId === request.quoteId) return rfqResponse(rfq);
+    if (request.confirmLive !== true) invalid('confirm_required', '执行报价会实盘成交，需要明确确认');
+    const rfqId = rfq.rfqId;
+    return admitted(async () => {
+      const executable = () => { if (state.rfq !== rfq || rfq.status !== 'Active' || rfq.selectedQuoteId !== null) conflict('rfq_state', '询价已不在可执行状态'); };
+      executable();
+      if (Object.keys(state.tracked.sizes).length) conflict('strategy_open', '已有跟踪中的策略，不能再执行询价开仓');
+      let quote: RfqQuote | undefined;
+      try { quote = parseQuotes(await client.quotes(rfqId, AbortSignal.timeout(READ_MS)), rfqId).find(item => item.quoteId === request.quoteId); }
+      catch (error) { return conflict('quote_unavailable', `报价读取失败：${describe(error)}`); }
+      if (!quote) return conflict('quote_missing', '这条报价已不存在或已撤回');
+      const chosen = quote;
+      await market.refresh();
+      const prices = Object.fromEntries(chosen.sell.map(leg => [leg.symbol, leg.price]));
+      const check = () => {
+        executable();
+        const problem = quoteProblem(rfq, chosen, now());
+        if (problem) conflict('quote_invalid', problem);
+        freshSnapshot();
+        for (const leg of rfq.legs) {
+          const row = rowOf(leg.symbol);
+          if (!row || row.expiry !== leg.expiry || row.strike !== leg.strike || row.optionType !== leg.optionType) conflict('instrument_changed', `合约 ${leg.symbol} 已不在期权链里或参数变了`);
+        }
+        validateCalendar(rfq.legs[0]!.expiry);
+        try { return proposedRisk({ risk: rfq.risk, mode: rfq.mode } as Task, prices); }
+        catch (error) { return conflict('risk_limit', `按报价价格：${describe(error)}`); }
+      };
+      check();
+      const priorRisk = rfq.risk, priorBaseline = state.pmBaseline;
+      await capturePmBaseline('rfq_open');
+      let risk: ReturnType<typeof check>;
+      try {
+        risk = check(); // The baseline read awaited: the quote, the RFQ and the chain are checked again.
+        if (shutdown) conflict('shutting_down', '服务正在停止');
+      } catch (error) {
+        state.pmBaseline = priorBaseline; // Nothing was sent: the baseline of this attempt goes with it.
+        save();
+        throw error;
+      }
+      const executionChain = Object.fromEntries(rfq.legs.map(leg => [leg.symbol, chainFor(leg.side, rowOf(leg.symbol)) ?? leg.referencePrice]));
+      Object.assign(rfq, {
+        status: 'ExecutionUnknown', selectedQuoteId: chosen.quoteId, selectedDesk: chosen.deskCode, selectedPrices: prices, executionChain,
+        executionStartedAt: now(), executionResolved: false, error: null, risk: { ...rfq.risk, ...risk },
+      });
+      touchRfq(rfq); // Durable before it is sent.
+      log(`期权询价 ${rfqId} 执行报价 ${chosen.quoteId}（${chosen.deskCode || '做市商'}）`);
+      // Nothing executed: the RFQ waits for another quote, with the risk and the margin baseline it had before this one.
+      const revert = (message: string) => {
+        Object.assign(rfq, { status: 'Active', selectedQuoteId: null, selectedDesk: null, selectedPrices: null, executionChain: null, executionStartedAt: null, error: message, risk: priorRisk });
+        state.pmBaseline = priorBaseline;
+      };
+      try {
+        const reply = await client.executeQuote(rfqId, chosen.quoteId, AbortSignal.timeout(READ_MS));
+        // An answer naming another RFQ or quote proves nothing about this one: it stays unknown for the loop to settle.
+        const foreign = (reply.rfqId !== undefined && reply.rfqId !== rfqId) || (reply.quoteId !== undefined && reply.quoteId !== chosen.quoteId);
+        if (rfq.status !== 'ExecutionUnknown') { /* the loop settled it meanwhile */ }
+        else if (foreign) rfq.error = '报价执行应答与所选报价不符，正在向交易所核对';
+        else if (reply.status === 'PendingFill') rfq.status = 'PendingFill';
+        else if (reply.status === 'Failed') revert('交易所回复报价执行失败，没有成交；可以选择其它报价');
+      } catch (error) {
+        if (definite(error) && rfq.status === 'ExecutionUnknown') revert(`报价执行被拒绝：${describe(error)}`);
+        else if (rfq.status === 'ExecutionUnknown') rfq.error = `报价执行结果未知，正在向交易所核对：${describe(error)}`;
+      }
+      touchRfq(rfq);
+      return rfqResponse(rfq);
+    }, false);
+  }
+
+  async function cancelRfq(request: { rfqId: string }) {
+    const rfq = state.rfq;
+    if (!rfq || rfq.rfqId === null || rfq.rfqId !== request.rfqId) return conflict('rfq_missing', '询价不存在或已被新的询价替换');
+    if (rfq.status === 'CancelUnknown' || rfq.status === 'Canceled') return rfqResponse(rfq);
+    const rfqId = rfq.rfqId;
+    return admitted(async () => {
+      if (state.rfq !== rfq || rfq.status !== 'Active' || rfq.selectedQuoteId !== null) conflict('rfq_state', '询价已不能取消');
+      Object.assign(rfq, { status: 'CancelUnknown', error: null });
+      touchRfq(rfq);
+      try { await client.cancelRfq(rfqId, AbortSignal.timeout(READ_MS)); }
+      catch (error) {
+        if (definite(error) && rfq.status === 'CancelUnknown') Object.assign(rfq, { status: 'Active', error: `取消被拒绝：${describe(error)}` });
+        else if (rfq.status === 'CancelUnknown') rfq.error = `取消结果未知，正在向交易所核对：${describe(error)}`;
+      }
+      touchRfq(rfq);
+      return rfqResponse(rfq);
+    }, false);
+  }
+
+  /**
+   * The filled RFQ as an opening task: legs at the quote, one filled journal entry per leg, and the tracked strategy.
+   * A strategy already tracked (only a person's change can bring one in while the RFQ holds trading) is never replaced:
+   * the RFQ is finished without a task and a person reconciles it (null).
+   */
+  function adoptRfq(rfq: RfqRecord, orders: Record<string, { orderId: string; price: number }>): Task | null {
+    const id = rfq.taskId, at = now(), started = rfq.executionStartedAt ?? rfq.createdAt;
+    if (Object.keys(state.tracked.sizes).length && state.tracked.groupId !== id) {
+      Object.assign(rfq, { trackingApplied: true, error: '询价已成交，但已有跟踪中的策略，没有接管跟踪；请先关闭定时开仓，再到 Bybit 核对这笔询价的持仓' });
+      return null;
+    }
+    const priceOf = (symbol: string) => orders[symbol]!.price > 0 ? orders[symbol]!.price : rfq.selectedPrices?.[symbol] ?? 0;
+    const task: Task = {
+      id, type: 'open', status: 'completed', planId: `rfq:${rfq.rfqId}`, requestId: rfq.requestId, fingerprint: rfq.fingerprint,
+      acceptedAt: rfq.createdAt, startedAt: started, finishedAt: at, stopRequested: false, stopRequestedAt: null, mode: rfq.mode,
+      legs: Object.fromEntries(rfq.legs.map(leg => [leg.symbol, { ...leg, chainPrice: rfq.executionChain?.[leg.symbol] ?? leg.referencePrice }])),
+      links: rfq.legs.map((_, index) => `tpo-rfq-${id}-${index}`),
+      netLegs: Object.fromEntries(rfq.legs.map(leg => [leg.symbol, { ...leg, priceBound: priceOf(leg.symbol) }])), feeContext: rfq.feeContext,
+      minNetIncomeUsd: null, maxNetCostUsd: null, netBlocked: false, reserved: null, risk: rfq.risk, riskBlocked: false,
+      openingGroup: null, strategyStatus: 'open', closedAt: null, closeReason: null, closureEvidence: {}, error: null, notified: [],
+      rfq: { rfqId: rfq.rfqId!, quoteId: rfq.selectedQuoteId ?? '', deskCode: rfq.selectedDesk ?? '' },
+    };
+    rfq.legs.forEach((leg, index) => {
+      state.journal[task.links[index]!] = {
+        taskId: id, symbol: leg.symbol, side: leg.side, qty: leg.qty, reduceOnly: false, tick: rowOf(leg.symbol)?.tick ?? '0', status: 'filled', terminal: true,
+        filledQty: leg.qty, orderId: orders[leg.symbol]!.orderId, createdAt: started, updatedAt: at, price: String(priceOf(leg.symbol)), kind: 'rfq',
+      };
+    });
+    state.tasks[id] = task;
+    state.tracked = { groupId: id, sizes: Object.fromEntries(rfq.legs.map(leg => [`${leg.symbol}|${leg.side}`, leg.qty])) };
+    Object.assign(rfq, { trackingApplied: true, error: null });
+    return task;
+  }
+
+  /**
+   * Every 3 s while the RFQ is unfinished: its state (live list first, history when the live list lacks it or lags a
+   * write), the quotes while it waits for one, and the trade once filled. Nothing read is applied when a local write
+   * happened meanwhile. A creation the venue never shows within missingSettleMs is taken as not created (no funds move
+   * without an execution); a chosen quote or a cancel the venue never shows stays blocked for a person.
+   */
+  async function rfqTick(): Promise<void> {
+    const rfq = state.rfq;
+    if (shutdown || rfqTicking || !rfq || rfqFinished(rfq)) return;
+    rfqTicking = true;
+    const version = rfqVersion;
+    try {
+      const signal = AbortSignal.timeout(READ_MS);
+      const by = rfq.rfqId ? { rfqId: rfq.rfqId } : { rfqLinkId: rfq.linkId };
+      const find = (rows: Row[]): RfqObservation | null => {
+        for (const row of rows) if (row.rfqLinkId === rfq.linkId) return parseRfqRow(row);
+        return null;
+      };
+      // A filled RFQ not yet tracked only needs its trade. After a write, a live row still Active may lag the history.
+      let seen: RfqObservation | null = null;
+      if (!isTerminal(rfq.status)) {
+        seen = find(await client.rfqs(by, false, signal));
+        if (!seen || (seen.status === 'Active' && rfq.status !== 'Active' && rfq.status !== 'CreationUnknown')) seen = find(await client.rfqs(by, true, signal)) ?? seen;
+      }
+      const next: RfqRecord = structuredClone(rfq);
+      if (seen) observe(next, seen, now());
+      const quotes = next.status === 'Active' && next.selectedQuoteId === null && next.rfqId ? parseQuotes(await client.quotes(next.rfqId, signal), next.rfqId) : null;
+      // A trade list that cannot be read counts like one that lacks the trade: Filled alone is the evidence (see below).
+      let tradeReadError: string | null = null;
+      const trades = next.status === 'Filled' && !next.trackingApplied && next.rfqId
+        ? await client.rfqTrades(next.rfqId, signal).catch((error: unknown) => { tradeReadError = describe(error); return [] as Row[]; }) : null;
+      if (rfqVersion !== version || state.rfq !== rfq) return;
+      rfqReadError = null;
+      if (quotes) rfqQuotes = { rfqId: next.rfqId!, quotes, at: now() };
+      else if (next.status !== 'Active') rfqQuotes = null;
+      if (!seen && !isTerminal(rfq.status) && rfq.status === 'CreationUnknown' && now() - rfq.createdAt >= missingSettleMs) {
+        Object.assign(rfq, { status: 'Failed', error: '交易所查不到这个询价，按未创建处理' });
+        touchRfq(rfq);
+        log(`期权询价 ${rfq.linkId} 未在交易所出现，按未创建处理`);
+        return;
+      }
+      if (!seen && !isTerminal(rfq.status)) { rfqReadError = rfq.status === 'CreationUnknown' ? '交易所还查不到这个询价，继续核对' : '交易所查不到这个询价，交易保持锁定，请到 Bybit 核对'; return; }
+      const changed = sortedJson(next) !== sortedJson(rfq);
+      if (changed) Object.assign(rfq, next);
+      if (trades) {
+        // Filled is the venue's answer that the saved structure traded (the workbench tracks on it alone). The trade list
+        // adds the order ids; when it still lacks or contradicts the RFQ after RFQ_TRADE_WAIT_MS the structure is tracked
+        // without them and a person checks the fills.
+        let orders: ReturnType<typeof filledOrders>, mismatch: string | null = tradeReadError === null ? null : `成交记录读取失败：${tradeReadError}`;
+        try { orders = mismatch === null ? filledOrders(rfq, trades) : null; }
+        catch (error) { orders = null; mismatch = describe(error); }
+        if (rfqFilledSeen?.rfqId !== rfq.rfqId) rfqFilledSeen = { rfqId: rfq.rfqId!, at: now() };
+        const legsText = rfq.legs.map(leg => `${leg.side} ${leg.qty} ${leg.symbol}`).join('、');
+        let fallback = false;
+        if (!orders) {
+          if (now() - rfqFilledSeen.at < RFQ_TRADE_WAIT_MS) {
+            rfqReadError = tradeReadError !== null ? `询价已成交，${mismatch}，继续核对` : mismatch ? `询价已成交，成交记录与询价暂不一致，继续核对：${mismatch}` : '询价已成交，等待成交记录';
+            if (changed) touchRfq(rfq);
+            return;
+          }
+          orders = Object.fromEntries(rfq.legs.map(leg => [leg.symbol, { orderId: '', price: rfq.selectedPrices?.[leg.symbol] ?? 0 }]));
+          fallback = true;
+        }
+        const task = adoptRfq(rfq, orders);
+        if (task && fallback) rfq.error = `询价已成交，但没有拿到与询价一致的成交记录，已按询价结构跟踪；成交明细与收益待人工核对${mismatch ? `：${mismatch}` : ''}`;
+        touchRfq(rfq);
+        if (!task) {
+          if (mismatch) rfq.error = `${rfq.error}（成交记录：${mismatch}）`;
+          touchRfq(rfq);
+          log(`期权${rfq.error}`);
+          try { notify(`期权${rfq.error}：${legsText}`); } catch (error) { log(`期权飞书通知未能写入：${describe(error)}`); }
+          return;
+        }
+        log(`期权询价 ${rfq.rfqId} 已成交，开仓任务 ${task.id} 开始跟踪${fallback ? '（按询价结构，成交明细待核对）' : ''}`);
+        try { notify(fallback ? `期权${rfq.error}：${legsText}` : `期权询价开仓已成交（${rfq.selectedDesk || '做市商'}）：${legsText}`); } catch (error) { log(`期权飞书通知未能写入：${describe(error)}`); }
+        void loadExecutions(task.links).catch(error => log(`期权成交明细刷新失败：${describe(error)}`));
+        return;
+      }
+      if (!changed) return;
+      touchRfq(rfq);
+      log(`期权询价 ${rfq.rfqId ?? rfq.linkId}：${RFQ_STATUS_NAMES[rfq.status]}`);
+      if (isTerminal(rfq.status) && rfq.status !== 'Filled' && rfq.selectedQuoteId !== null) {
+        try { notify(`期权询价 ${rfq.rfqId} 选中的报价没有成交：${RFQ_STATUS_NAMES[rfq.status]}`); } catch (error) { log(`期权飞书通知未能写入：${describe(error)}`); }
+      }
+    } catch (error) {
+      if (rfqVersion === version) rfqReadError = `询价状态读取失败，稍后重试：${describe(error)}`;
+    } finally { rfqTicking = false; }
+  }
+
+  /** Why a new RFQ cannot be sent now; null when it can. */
+  function rfqBlocked(): string | null {
+    try { requireIdle(); } catch (error) { return describe(error); }
+    if (Object.keys(state.tracked.sizes).length) return '先平掉跟踪中的策略再询价开仓';
+    return null;
+  }
+  function rfqView() {
+    const rfq = state.rfq, at = now(), snapshot = market.snapshot();
+    const chain = new Map((snapshot?.rows ?? []).map(row => [row.symbol, { bid: row.bid, ask: row.ask, mark: row.mark }]));
+    const current = rfq && rfqQuotes && rfqQuotes.rfqId === rfq.rfqId ? rfqQuotes : null;
+    return {
+      rfq, statusName: rfq ? RFQ_STATUS_NAMES[rfq.status] : null, finished: rfqFinished(rfq), readError: rfqFinished(rfq) ? null : rfqReadError,
+      quotes: rfq && current ? sortQuotes(current.quotes.map(quote => quoteView(rfq, quote, chain, at))) : [], quotesAt: current?.at ?? null,
+      blocked: rfqFinished(rfq) ? rfqBlocked() : null, settings: { legQty: settings.legQty, strategyMode: settings.strategyMode, maxRiskUsd: settings.maxRiskUsd, maxMarginUsd: settings.maxMarginUsd },
+      market: { at: snapshot?.at ?? null, stale: !snapshot || at - snapshot.at > QUOTE_STALE_MS }, now: at,
+    };
+  }
+
   function stopTask(id: string) {
     const task = state.tasks[id];
     if (!task) return conflict('task_missing', '期权任务不存在');
@@ -820,13 +1129,18 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
   /** Reads the fills of the given orders into the ledger and the recent list; answers how many reads failed. */
   async function loadExecutions(links: readonly string[]): Promise<number> {
     const signal = AbortSignal.timeout(READ_MS);
-    const groups = await Promise.allSettled([...new Set(links)].map(link => client.executions(link, signal)));
+    // An RFQ leg (G2c) is a block trade without our orderLinkId: it is read by its order id and filed under its journal link.
+    const targets = [...new Set(links)].map(link => ({ link, rfq: Object.hasOwn(state.journal, link) && state.journal[link]!.kind === 'rfq' ? state.journal[link]!.orderId : null }));
+    const groups = await Promise.allSettled(targets.map(({ link, rfq }) => rfq === null ? client.executions(link, signal) : rfq ? client.executionsByOrder(rfq, signal) : Promise.resolve([]))); // An RFQ tracked without order ids has no fills to read.
     const records: ExecutionRecord[] = [];
     let failed = 0;
-    for (const group of groups) {
+    for (const [index, group] of groups.entries()) {
       if (group.status === 'rejected') { failed += 1; log(`部分期权成交明细读取失败，保留已有记录：${describe(group.reason)}`); continue; }
+      const target = targets[index]!;
       for (const row of group.value) {
-        const record = parseExecution(row);
+        const parsed = parseExecution(row);
+        if (target.rfq !== null && parsed.orderId !== target.rfq) continue;
+        const record = target.rfq === null ? parsed : { ...parsed, orderLinkId: target.link };
         const owner = Object.hasOwn(state.journal, record.orderLinkId) ? state.journal[record.orderLinkId] : undefined;
         const task = owner ? state.tasks[owner.taskId] : undefined;
         const reduceOnly = task?.type === 'close' || record.orderLinkId.startsWith('tpo-close-');
@@ -999,7 +1313,8 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     return {
       settings: { maxRiskUsd: settings.maxRiskUsd, maxMarginUsd: settings.maxMarginUsd, legQty: settings.legQty, strategyMode: settings.strategyMode, orderTimeoutSeconds: settings.orderTimeoutMs / 1000, feeRate: settings.estimates.feeRate, marginBufferPct: settings.estimates.marginBufferPct, marginMode: settings.estimates.marginMode },
       account: `***${uid.slice(-4)}`,
-      busy: admitting || held || Object.values(state.tasks).some(task => isActive(task.status)),
+      busy: admitting || held || Object.values(state.tasks).some(task => isActive(task.status)) || !rfqFinished(state.rfq),
+      rfqActive: !rfqFinished(state.rfq),
       tasks, orders, schedule: scheduleView(),
       tracked: { groupId: state.tracked.groupId, legs: Object.entries(state.tracked.sizes).map(([key, size]) => ({ symbol: key.slice(0, key.lastIndexOf('|')), side: key.slice(key.lastIndexOf('|') + 1), size })), mode: state.tracked.groupId ? state.tasks[state.tracked.groupId]?.mode ?? null : null },
       positions: positions ? { rows: positions.rows, at: positions.at } : null, positionsError,
@@ -1026,6 +1341,6 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     };
   }
 
-  return { createPlan, startTask, stopTask, reconcileOnce, refreshHealth, autoOpenTick, setAutoOpen, performanceTick, close, marketView, previewView, stateView, performanceView, state: () => state };
+  return { createPlan, startTask, stopTask, createRfq, executeQuote, cancelRfq, rfqTick, reconcileOnce, refreshHealth, autoOpenTick, setAutoOpen, performanceTick, close, marketView, previewView, stateView, performanceView, rfqView, state: () => state };
 }
 export type OptionsEngine = ReturnType<typeof createOptionsEngine>;

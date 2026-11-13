@@ -302,7 +302,22 @@
 .asset-desk [data-slot=tabs-trigger][data-state=active] { border-color: var(--input); background: var(--card); color: var(--primary) }
 .asset-desk .holdings-heading [data-slot=tabs-trigger] { min-height: 24px; height: 24px; padding: 0 10px; font-size: 12px }
 
-/* 本服务只读版本自己的规则 */
+/* A-2 写入表单：复制自工作台 modules/asset/app/globals.css（0014655）第 108、109、110、115、178、207、256–257、345 行，规则不改，加 .asset-desk 前缀 */
+.asset-desk .form-grid .checkbox-label { display: flex; align-items: center; gap: 10px; min-height: 36px }
+.asset-desk .button.primary { background: var(--primary); border-color: var(--primary); color: var(--primary-foreground) }
+.asset-desk .form-grid { display: grid; gap: 14px }
+.asset-desk .form-grid label { font-size: .875rem; display: grid; gap: 8px }
+.asset-desk .form-grid input { width: 100%; border: 1px solid var(--input); padding: 8px 12px; border-radius: 6px; background: var(--card); min-height: 40px }
+.asset-desk .form-grid input:disabled { background: var(--muted); color: var(--muted-foreground) }
+.asset-desk .form-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 8px; flex-wrap: wrap }
+.asset-desk .row-actions { display: flex; gap: 8px }
+.asset-desk .row-actions .icon-button { width: 44px; height: 44px }
+.asset-desk .kpi-edit { display: inline-grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 1px solid var(--input); border-radius: 5px; background: var(--secondary); color: var(--muted-foreground) }
+.asset-desk .kpi-edit:hover { color: var(--primary) }
+@media (max-width: 600px) { .asset-desk .form-grid input { font-size: 16px } }
+@media (min-width: 601px) { .asset-desk .holdings .row-actions .icon-button { width: 28px; height: 28px } }
+
+/* 本服务自己的规则 */
 .asset-desk .import-command { display: block; max-width: 100%; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--secondary); color: var(--foreground); font-family: var(--font-number); font-size: 12px; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere }
 .asset-desk .exchange-total { margin-left: auto; text-align: right; font-family: var(--font-number); font-size: 12px; font-weight: 600; white-space: nowrap }
 .asset-desk .exchange-total small { display: block; font-family: var(--font-ui); font-weight: 400 }
@@ -325,3 +340,13 @@
 .asset-desk .daily-change-list details ul { margin: 4px 0 0; padding-left: 18px }
 /* The copied SvgPlot wraps its tooltip in a box of its own; the workbench's trend tooltip carries the frame here. */
 .asset-desk .svg-plot-tooltip { padding: 0; border: 0; background: none; box-shadow: none }
+/* A-2：工作台的弹窗在本页改为原位展开的面板 */
+.asset-desk .edit-panel { margin-bottom: 14px; padding: 14px 16px }
+.asset-desk .edit-panel h2 { margin-bottom: 4px }
+.asset-desk .edit-panel > .help { margin-bottom: 12px }
+.asset-desk .edit-panel .form-grid { max-width: 560px }
+.asset-desk .form-grid select { width: 100%; border: 1px solid var(--input); padding: 8px 12px; border-radius: 6px; background: var(--card); min-height: 40px }
+.asset-desk .form-grid .checkbox-label input { width: auto; min-height: 0 }
+.asset-desk .cash-flows .edit-panel { margin: 8px 0; font-size: 12px }
+.asset-desk .cash-flows .edit-panel .form-grid label { font-size: 12px }
+.asset-desk .notice.saved-notice { border-color: color-mix(in srgb, var(--positive) 35%, transparent); background: color-mix(in srgb, var(--positive) 12%, transparent); color: var(--positive) }

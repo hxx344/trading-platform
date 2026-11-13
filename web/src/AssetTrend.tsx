@@ -1,8 +1,8 @@
 // The trend panel of the asset page, after AssetTrend, DailyChanges and CashFlowsPanel in project_aggregation
 // modules/asset/app (asset-trend.tsx, daily-changes.tsx, cash-flows-panel.tsx at 0014655). Changes: the curve, the
 // monthly figures and the annualized returns come computed from /api/asset/history; the chart is the service's SvgPlot
-// instead of recharts; daily changes and cash flows are read from /api/asset/*; the cash flow form and its edit and void
-// buttons are left out (read-only batch).
+// instead of recharts; daily changes and cash flows are read from /api/asset/*; the cash flow form is a panel above the
+// list and saves through the page's one writer (AssetPage.tsx useWriter).
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { SvgPlot, type PlotLayer } from './svg-plot.tsx';
 import { niceAxis } from './svg-plot-geometry.ts';
@@ -10,7 +10,9 @@ import { useLiveResource } from './use-live-resource.ts';
 import { MIN_MONTHLY_SPAN_DAYS, formatGain, formatReturnRate, performanceTone } from '../../src/asset/performance-metrics.ts';
 import { DAILY_CHANGE_DAYS } from '../../src/asset/daily-changes.ts';
 import type { PositionAnalysis } from '../../src/asset/daily-positions.ts';
-import type { CashFlowRecord } from '../../src/asset/cash-flows.ts';
+import { businessDay, type CashFlowInput, type CashFlowRecord } from '../../src/asset/cash-flows.ts';
+import { newRequestId } from './request-ids.ts';
+import type { Writer } from './AssetPage.tsx';
 import type { AssetCashFlowsView, AssetDailyChangesView, AssetHistoryView, TrendPoint } from '../../src/asset/views.ts';
 import { CASH_FLOW_PAGE, amountTick, auditLine, dailyItems, dayTick, evidenceStatus, monthlyHint, signed, trendSummary, zhMoney } from './asset-format.ts';
 
@@ -31,7 +33,7 @@ function TrendTip({ point }: { point: TrendPoint }) {
     {point.difference ? <p>原表合计差异：$ {zhMoney(point.difference)}</p> : null}</div>;
 }
 
-export const AssetTrend = memo(function AssetTrend({ history, version, onHistory, onExpired }: { history: AssetHistoryView; version: string; onHistory: () => void; onExpired: () => void }) {
+export const AssetTrend = memo(function AssetTrend({ history, version, writer, onHistory, onExpired }: { history: AssetHistoryView; version: string; writer: Writer; onHistory: () => void; onExpired: () => void }) {
   const { trend, monthly, annualized, today } = history;
   const { first, last, change, incomplete } = trendSummary(trend);
   const axis = useMemo(() => { const values = trend.flatMap(point => [point.adjusted, point.held]); return niceAxis(Math.min(...values), Math.max(...values)); }, [trend]);
@@ -89,7 +91,7 @@ export const AssetTrend = memo(function AssetTrend({ history, version, onHistory
         </div>
       </details>
     </section> : null}
-    {trend.length >= 2 ? <DailyChanges version={version} onExpired={onExpired} /> : null}
+    {trend.length >= 2 ? <DailyChanges version={version} writer={writer} onExpired={onExpired} /> : null}
     <p className="panel-foot chart-note">调整后资产 = 实际持有资产 + 累计出金；仅计已登记出金，入金未剔除。缺失估值的快照仅含已知金额，首末快照估值不完整时不计算变化。连线仅连接已有记录，不代表缺失日期的估值。<button type="button" className="text-button" onClick={onHistory}>查看记录</button></p>
   </section>;
 });
@@ -102,18 +104,19 @@ function Holdings({ positions }: { positions: PositionAnalysis }) {
   </li>)}</ul>;
 }
 
-/** Read only while expanded; read again when a new import lands while it is open. */
-function DailyChanges({ version, onExpired }: { version: string; onExpired: () => void }) {
+/** Read only while expanded; read again when the ledger changes (a new import or a write here), at once while open or on the next opening. */
+function DailyChanges({ version, writer, onExpired }: { version: string; writer: Writer; onExpired: () => void }) {
   const [open, setOpen] = useState(false), [expanded, setExpanded] = useState<string | null>(null);
   const { data: report, error, status, refresh } = useLiveResource<AssetDailyChangesView>(DAILY_CHANGES_PATH, { intervalMs: null, timeoutMs: DAILY_TIMEOUT_MS, enabled: open, onExpired });
   const seen = useRef(version);
-  useEffect(() => { if (seen.current === version) return; seen.current = version; if (open) void refresh(); }, [version, open, refresh]);
+  // A change while closed is read when the report opens again.
+  useEffect(() => { if (!open || seen.current === version) return; seen.current = version; void refresh(); }, [version, open, refresh]);
   const loading = open && status === 'loading';
   const days = report?.days ?? [];
   return <details className="performance-monthly daily-changes" onToggle={event => setOpen(event.currentTarget.open)}>
     <summary>每日波动 <span>（近 {DAILY_CHANGE_DAYS} 天{report ? ' · ' + days.length + ' 日' : ''}）</span>与来源</summary>
     <div className="performance-monthly-body">
-      {open ? <CashFlows version={version} onExpired={onExpired} /> : null}
+      {open ? <CashFlows version={version} writer={writer} onExpired={onExpired} /> : null}
       <p className="performance-note">逐日对比上一份已有快照，缺失日期不补造。来源为各资产行估值变化，展开可看交易所按账户、币种的分项；出金单列并加回，与“剔除出金影响”口径一致。入金未剔除，资产变化不等于投资收益。</p>
       <p className="performance-note">持仓影响分原油套利、海力士套利、ANT 套利和其他持仓四项，每项 = 两份快照间的浮盈亏变化 + 本轮已实现盈亏、手续费、资金费的变化，按快照内的稳定币价格折成 USD，是近似值。ANT 仅统计资产快照已记录的持仓，当前不含 Hyperliquid。持仓随快照记录，此前的日期没有持仓数据；当天已平仓、本轮统计不可比或只有浮盈亏的仓位使该项标为“部分”，无法计算时显示“—”。</p>
       {open && error && !loading ? <p className="error-text" role="alert">{error.message}{report ? '，当前显示上次读取结果' : null} <button type="button" className="text-button" onClick={() => void refresh()}>重试</button></p> : null}
@@ -154,22 +157,44 @@ function AuditTrail({ id, audit }: { id: string; audit: readonly CashFlowRecord[
   return <details><summary>完整审计历史</summary><ul>{audit.filter(item => item.id === id).map(item => <li key={item.revision}>{auditLine(item)}</li>)}</ul></details>;
 }
 
-/** The workbench's 净资金流标注 list without its form: the imported audit, newest business day first, 20 a page. */
-function CashFlows({ version, onExpired }: { version: string; onExpired: () => void }) {
-  const { data, error, status, refresh } = useLiveResource<AssetCashFlowsView>(CASH_FLOWS_PATH, { intervalMs: null, timeoutMs: READ_TIMEOUT_MS, onExpired });
-  const [page, setPage] = useState(0);
+/** The workbench's 净资金流标注 (cash-flows-panel.tsx at 0014655): the audit, newest business day first, 20 a page. */
+function CashFlows({ version, writer, onExpired }: { version: string; writer: Writer; onExpired: () => void }) {
+  const { data, error, status, refresh, commit } = useLiveResource<AssetCashFlowsView>(CASH_FLOWS_PATH, { intervalMs: null, timeoutMs: READ_TIMEOUT_MS, onExpired });
+  const [page, setPage] = useState(0), [draft, setDraft] = useState<CashFlowInput | null>(null);
   const seen = useRef(version);
   useEffect(() => { if (seen.current === version) return; seen.current = version; void refresh(); }, [version, refresh]);
   const rows = data?.evidence ?? [], audit = data?.audit ?? [], voided = data?.voided ?? [];
   const lastPage = Math.max(0, Math.ceil(rows.length / CASH_FLOW_PAGE) - 1), current = Math.min(page, lastPage);
+  const edit = (value: Partial<CashFlowInput>) => setDraft(previous => previous ? { ...previous, ...value } : previous);
+  const open = (next: CashFlowInput) => { writer.clear(); setDraft(next); };
+  const save = () => { if (draft) void writer.run<AssetCashFlowsView>(CASH_FLOWS_PATH, draft, result => { if (result && 'audit' in result) commit(result); setDraft(null); }); };
   return <section className="cash-flows" aria-label="净资金流标注">
-    <h4>净资金流标注</h4><p className="performance-note">账户用稳定、可辨认的标识；日期按北京时间。正数为流入、负数为流出。仅标注已有凭证，不会转账或修改余额。内部转账使用相同配对编号，单侧、重复候选或跨日保持待配对。旧出金登记独立保留。本页只读，登记、修改与作废尚未接入。</p>
+    <h4>净资金流标注</h4><p className="performance-note">账户用稳定、可辨认的标识；日期按北京时间。正数为流入、负数为流出。仅标注已有凭证，不会转账或修改余额。内部转账使用相同配对编号，单侧、重复候选或跨日保持待配对。旧出金登记独立保留。</p>
     {error && status !== 'loading' ? <p role="alert" className="error-text">{error.message} <button type="button" className="text-button" onClick={() => void refresh()}>重新读取</button></p> : null}
+    {!draft ? <p><button type="button" className="button" disabled={writer.busy || !data} onClick={() => open({ id: newRequestId(), revision: 0, date: businessDay(Date.now()), account: '', currency: 'USD', amount: '', kind: 'external', transferId: null, usdRate: null, rateAt: null, reference: '', reason: '', void: false })}>登记资金流</button></p> : null}
+    {draft ? <div className="panel edit-panel" role="group" aria-label={draft.revision > 0 ? '修改资金流标注' : '登记资金流'}>
+      <form className="form-grid" onSubmit={event => { event.preventDefault(); save(); }}>
+        <label>业务日期<input type="date" required max={businessDay(Date.now())} value={draft.date} onChange={event => edit({ date: event.target.value })} /></label>
+        <label>账户标识<input maxLength={80} required value={draft.account} onChange={event => edit({ account: event.target.value })} /></label>
+        <label>币种<input maxLength={20} required value={draft.currency} onChange={event => edit({ currency: event.target.value.toUpperCase(), usdRate: null, rateAt: null })} /></label>
+        <label>原币金额（流出为负）<input inputMode="decimal" maxLength={35} required value={draft.amount} onChange={event => edit({ amount: event.target.value })} /></label>
+        <label>类型<select value={draft.kind} onChange={event => edit({ kind: event.target.value as CashFlowInput['kind'], transferId: event.target.value === 'internal' ? '' : null })}><option value="external">外部入出金</option><option value="internal">内部转账</option></select></label>
+        {draft.kind === 'internal' ? <label>内部转账配对编号<input required maxLength={80} value={draft.transferId ?? ''} onChange={event => edit({ transferId: event.target.value })} /></label> : null}
+        {draft.currency !== 'USD' ? <><label>每单位币种折 USD（未知留空）<input inputMode="decimal" value={draft.usdRate ?? ''} onChange={event => edit({ usdRate: event.target.value || null, rateAt: event.target.value ? draft.rateAt ?? new Date().toISOString() : null })} /></label>
+          <label>汇率证据时间（ISO，含时区）<input value={draft.rateAt ?? ''} onChange={event => edit({ rateAt: event.target.value || null })} /></label></> : null}
+        <label>原始凭证引用<input required maxLength={200} value={draft.reference} onChange={event => edit({ reference: event.target.value })} /></label>
+        <label>登记或修改原因<input required maxLength={200} value={draft.reason} onChange={event => edit({ reason: event.target.value })} /></label>
+        {draft.revision > 0 ? <label className="checkbox-label"><input type="checkbox" checked={draft.void} onChange={event => edit({ void: event.target.checked })} />作废本条（保留历史）</label> : null}
+        {writer.errorOf(CASH_FLOWS_PATH) ? <p className="error-text" role="alert">{writer.errorOf(CASH_FLOWS_PATH)}</p> : null}
+        <div className="form-actions"><button type="button" className="button" disabled={writer.busy} onClick={() => setDraft(null)}>取消</button><button className="button primary" disabled={writer.busy}>{writer.busy ? '保存中…' : '保存标注'}</button></div>
+      </form>
+    </div> : null}
     {!data && !error ? <p className="help" role="status">读取资金流标注…</p> : null}
-    {data && !rows.length ? <p className="help">导入的账本没有资金流标注。</p> : null}
+    {data && !rows.length ? <p className="help">还没有资金流标注。</p> : null}
     <ol start={current * CASH_FLOW_PAGE + 1}>{rows.slice(current * CASH_FLOW_PAGE, (current + 1) * CASH_FLOW_PAGE).map(row => <li key={row.id}>
       {row.date} · {row.account} · {row.amount} {row.currency} · {evidenceStatus(row)} · {row.reference}
       {row.note ? <p>{row.note}</p> : null}
+      <button type="button" className="text-button" disabled={writer.busy} onClick={() => { const { status: _status, usdValue: _usd, note: _note, recordedAt: _at, ...input } = row; open({ ...input, reason: '' }); }}>修改/作废</button>
       <AuditTrail id={row.id} audit={audit} />
     </li>)}</ol>
     {lastPage ? <p className="cash-flow-pages"><button type="button" className="text-button" disabled={current === 0} onClick={() => setPage(current - 1)}>上一页</button> {current + 1}/{lastPage + 1} <button type="button" className="text-button" disabled={current === lastPage} onClick={() => setPage(current + 1)}>下一页</button></p> : null}

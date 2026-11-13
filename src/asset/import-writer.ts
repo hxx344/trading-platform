@@ -8,7 +8,7 @@
 import { lstatSync, readSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
-import { ASSET_DB_FILE, openAssetDb } from './db.ts';
+import { ASSET_DB_FILE, assertOwnFiles, openAssetDb } from './db.ts';
 import { prepareLedger, writeLedger } from './import.ts';
 import { parseImportInfo } from './store.ts';
 import { assertDedicatedDataDir } from '../data-dir.ts';
@@ -29,17 +29,6 @@ function readStdin(limit: number): string {
     chunks.push(Buffer.from(buffer.subarray(0, read)));
   }
   return Buffer.concat(chunks).toString('utf8');
-}
-
-/** asset.sqlite and its side files must be plain files of this account: one left by root (a hand import) is not taken over. */
-export function assertOwnFiles(dataDir: string, uid = process.getuid?.()): void {
-  for (const suffix of ['', '-wal', '-shm', '-journal']) {
-    const path = join(dataDir, ASSET_DB_FILE + suffix);
-    let stat;
-    try { stat = lstatSync(path); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
-    if (!stat.isFile()) throw new Error(`${path} 不是普通文件，未改动`);
-    if (uid !== undefined && stat.uid !== uid) throw new Error(`${path} 归 uid ${stat.uid}，不归服务账户（uid ${uid}），未改动；请把它改回服务账户所有（chown）后重试`);
-  }
 }
 
 /** The record of the last import in <dataDir>/asset.sqlite; null when nothing was imported yet. */

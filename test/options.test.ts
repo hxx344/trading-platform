@@ -16,7 +16,7 @@ import { parseServiceConfig, parseServiceSecrets } from '../src/service/config.t
 import { optionsSummary, parseOptionsConfig } from '../src/service/options-config.ts';
 import { optionsViews, preflightOptions } from '../src/service/options.ts';
 import { bindAccounts, createHarness } from './harness.ts';
-import { EXPIRY, FRIDAY, FakeOptions, UID, symbolOf, type FillMode } from './options-fake.ts';
+import { EXPIRY, FRIDAY, FakeOptions, UID, symbolOf, type FillMode, type Row } from './options-fake.ts';
 
 const CREDENTIALS = { apiKey: 'options-test-key', apiSecret: 'options-test-secret' };
 const TERMINAL: TaskStatus[] = ['completed', 'partial', 'stopped', 'failed'];
@@ -766,6 +766,15 @@ test('期权：接口未配置时 404；配置后可读状态、校验请求体�
     const switched = await post(wired!, '/api/options/auto-open', { enabled: true });
     assert.equal(switched.status, 200);
     assert.deepEqual(((await switched.json()) as { enabled: boolean; source: string }), { ...(s.engine.stateView().schedule), enabled: true, source: 'page' });
+    // 组合询价 (G2c): bodies are checked before the engine; the read answers without an RFQ.
+    assert.equal((await post(wired!, '/api/options/rfq', { requestId: 'req-rfq-0001', confirmLive: true, extra: 1 })).status, 400);
+    assert.equal((await post(wired!, '/api/options/rfq', { requestId: 'x', confirmLive: true })).status, 400);
+    assert.equal((await post(wired!, '/api/options/rfq/execute', { rfqId: 'r1', quoteId: 'q 1', confirmLive: true })).status, 400);
+    assert.equal((await post(wired!, '/api/options/rfq/execute', { rfqId: 'r1', quoteId: 'q1', confirmLive: true })).status, 409);
+    assert.equal((await post(wired!, '/api/options/rfq/cancel', { rfqId: 'r1' })).status, 409);
+    const rfqRead = (await (await get(wired!, '/api/options/rfq')).json()) as { rfq: unknown; finished: boolean };
+    assert.equal(rfqRead.rfq, null);
+    assert.equal(rfqRead.finished, true);
     await s.market.refresh();
     const market = (await (await get(wired!, '/api/options/market')).json()) as { rows: unknown[]; expiry: number };
     assert.ok(market.rows.length > 0 && market.expiry > 0);
@@ -777,4 +786,285 @@ test('期权：接口未配置时 404；配置后可读状态、校验请求体�
     h.dispose();
     s.dispose();
   }
+});
+
+// ---- 组合询价 RFQ (G2c) ------------------------------------------------------------------------------------------
+let rfqSeq = 0;
+const rfqRequest = () => ({ requestId: `rfq-${String(++rfqSeq).padStart(8, '0')}`, confirmLive: true });
+async function activeRfq(s: Setup) {
+  const created = await s.engine.createRfq(rfqRequest());
+  assert.equal(created.status, 'Active');
+  return created.rfqId!;
+}
+
+test('询价：创建发给做市商、交易被锁定；执行报价成交后成为跟踪中的开仓任务，成交明细按订单号归到该任务', async () => {
+  const s = setup();
+  try {
+    const request = rfqRequest();
+    const created = await s.engine.createRfq(request);
+    assert.equal(created.status, 'Active');
+    assert.deepEqual(await s.engine.createRfq(request), created, '同一请求编号幂等');
+    await assert.rejects(s.engine.createRfq({ ...request, quantity: '2' }), refused('request_reused'));
+    const sent = s.fake.calls.find(call => call.path === '/v5/rfq/create-rfq')!.body!;
+    assert.deepEqual(sent.counterparties, ['DESK1', 'DESK2'], '最多 maxLP 家');
+    assert.equal(sent.strategyType, 'Iron_Condor');
+    assert.equal((sent.list as Row[]).length, 4);
+    assert.ok(/^tporfq[0-9a-f]{16}$/.test(String(sent.rfqLinkId)));
+    await assert.rejects(s.engine.createPlan({ operation: 'open' }), refused('rfq_active'));
+    await assert.rejects(s.engine.createRfq(rfqRequest()), refused('rfq_active'));
+    s.fake.addQuote({ quoteId: 'low', shift: -20 });
+    s.fake.addQuote({ quoteId: 'high', deskCode: 'DESK2', shift: 5 });
+    s.fake.addQuote({ quoteId: 'part', drop: symbolOf(84000, 'P') });
+    await s.engine.rfqTick();
+    const view = s.engine.rfqView();
+    assert.deepEqual(view.quotes.map(quote => quote.quoteId), ['high', 'low', 'part'], '全覆盖在前、净收入高的在前');
+    assert.equal(view.quotes[2]!.netUsd, null);
+    assert.ok(view.quotes[2]!.problem);
+    assert.equal(view.quotes[0]!.problem, null);
+    assert.ok(view.quotes[0]!.feeUsd! > 0 && view.quotes[0]!.netUsd! > view.quotes[1]!.netUsd!);
+    await assert.rejects(s.engine.executeQuote({ rfqId: created.rfqId!, quoteId: 'high', confirmLive: false }), refused('confirm_required'));
+    await assert.rejects(s.engine.executeQuote({ rfqId: created.rfqId!, quoteId: 'part', confirmLive: true }), refused('quote_invalid'));
+    const executed = await s.engine.executeQuote({ rfqId: created.rfqId!, quoteId: 'high', confirmLive: true });
+    assert.equal(executed.status, 'PendingFill');
+    assert.deepEqual(await s.engine.executeQuote({ rfqId: created.rfqId!, quoteId: 'high', confirmLive: true }), executed, '同一报价重试幂等');
+    await s.engine.rfqTick();
+    const state = s.engine.state(), task = state.tasks[created.taskId]!;
+    assert.equal(state.rfq!.status, 'Filled');
+    assert.equal(state.rfq!.trackingApplied, true);
+    assert.equal(task.status, 'completed');
+    assert.deepEqual(task.rfq, { rfqId: created.rfqId, quoteId: 'high', deskCode: 'DESK2' });
+    assert.equal(state.tracked.groupId, task.id);
+    assert.deepEqual(Object.values(state.tracked.sizes), ['1', '1', '1', '1']);
+    const entries = Object.entries(state.journal).filter(([, entry]) => entry.taskId === task.id);
+    assert.equal(entries.length, 4);
+    assert.ok(entries.every(([link, entry]) => link.startsWith('tpo-rfq-') && entry.kind === 'rfq' && entry.terminal && entry.filledQty === '1' && entry.orderId.startsWith('b')));
+    assert.ok(s.notes.some(note => note.includes('询价开仓已成交')));
+    await until(() => s.engine.state().executions.filter(record => record.taskId === task.id).length === 4);
+    assert.ok(s.engine.state().executions.every(record => record.taskId !== task.id || record.orderLinkId.startsWith('tpo-rfq-')));
+    const group = s.engine.performanceView().groups.find(row => row.id === task.id)!;
+    assert.ok(group, '收益页有这次询价开仓');
+    // Trading is free again; the tracked strategy blocks another RFQ, and closes as usual.
+    await assert.rejects(s.engine.createRfq(rfqRequest()), refused('strategy_open'));
+    const close = await s.engine.createPlan({ operation: 'close' });
+    assert.equal(close.legs.length, 4);
+  } finally { s.dispose(); }
+});
+
+test('询价：创建应答丢失时按链接编号核对；被拒绝即失败不锁定；交易所始终查不到的按未创建结算', async () => {
+  const lost = setup();
+  try {
+    lost.fake.rfqWrite = 'lost';
+    const created = await lost.engine.createRfq(rfqRequest());
+    assert.equal(created.status, 'CreationUnknown');
+    assert.equal(lost.engine.rfqView().finished, false);
+    await lost.engine.rfqTick();
+    assert.equal(lost.engine.state().rfq!.status, 'Active');
+    assert.equal(lost.engine.state().rfq!.rfqId, lost.fake.rfq!.rfqId);
+  } finally { lost.dispose(); }
+  const refusedCreate = setup();
+  try {
+    refusedCreate.fake.rfqWrite = 'refused';
+    const created = await refusedCreate.engine.createRfq(rfqRequest());
+    assert.equal(created.status, 'Failed');
+    assert.equal(refusedCreate.engine.rfqView().finished, true);
+    await refusedCreate.engine.createPlan({ operation: 'open' });
+  } finally { refusedCreate.dispose(); }
+  const dropped = setup({ missingSettleMs: 50 });
+  try {
+    dropped.fake.rfqWrite = 'dropped';
+    assert.equal((await dropped.engine.createRfq(rfqRequest())).status, 'CreationUnknown');
+    await dropped.engine.rfqTick();
+    assert.equal(dropped.engine.state().rfq!.status, 'CreationUnknown', '未到结算时间仍锁定');
+    dropped.hooks.skewMs = 100;
+    await dropped.engine.rfqTick();
+    assert.equal(dropped.engine.state().rfq!.status, 'Failed');
+    assert.equal(dropped.engine.rfqView().finished, true);
+  } finally { dropped.dispose(); }
+});
+
+test('询价：执行结果未知跨重启保持锁定，滞后的 Active 不会让询价重新可执行；成交或过期后才解除', async () => {
+  const s = setup();
+  try {
+    const rfqId = await activeRfq(s);
+    s.fake.addQuote({ quoteId: 'a' });
+    s.fake.addQuote({ quoteId: 'b' });
+    s.fake.rfqWrite = 'dropped';
+    const executed = await s.engine.executeQuote({ rfqId, quoteId: 'a', confirmLive: true });
+    assert.equal(executed.status, 'ExecutionUnknown');
+    s.fake.rfqWrite = 'ok';
+    const restarted = s.make(s.store);
+    assert.equal(restarted.state().rfq!.status, 'ExecutionUnknown');
+    await assert.rejects(restarted.createPlan({ operation: 'open' }), refused('rfq_active'));
+    await restarted.rfqTick();
+    assert.equal(restarted.state().rfq!.status, 'ExecutionUnknown', '交易所仍显示 Active');
+    await assert.rejects(restarted.executeQuote({ rfqId, quoteId: 'b', confirmLive: true }), refused('rfq_state'));
+    await assert.rejects(restarted.cancelRfq({ rfqId }), refused('rfq_state'));
+    s.fake.rfq!.status = 'Expired';
+    await restarted.rfqTick();
+    const rfq = restarted.state().rfq!;
+    assert.equal(rfq.status, 'Expired');
+    assert.equal(rfq.executionResolved, true);
+    assert.ok(s.notes.some(note => note.includes('没有成交')));
+    await restarted.createPlan({ operation: 'open' });
+  } finally { s.dispose(); }
+  const pending = setup();
+  try {
+    const rfqId = await activeRfq(pending);
+    pending.fake.addQuote({ quoteId: 'a' });
+    pending.fake.executeOutcome = 'pending';
+    pending.fake.rfqWrite = 'lost';
+    assert.equal((await pending.engine.executeQuote({ rfqId, quoteId: 'a', confirmLive: true })).status, 'ExecutionUnknown');
+    pending.fake.rfqWrite = 'ok';
+    await pending.engine.rfqTick();
+    assert.equal(pending.engine.state().rfq!.status, 'PendingFill');
+    pending.fake.tradeMode = 'empty';
+    pending.fake.settleRfq('a');
+    await pending.engine.rfqTick();
+    assert.equal(pending.engine.state().rfq!.status, 'Filled');
+    assert.equal(pending.engine.rfqView().finished, false, '成交记录到达前仍锁定');
+    pending.fake.tradeMode = 'ok';
+    await pending.engine.rfqTick();
+    assert.equal(pending.engine.state().tracked.groupId, pending.engine.state().rfq!.taskId);
+    assert.equal(pending.engine.rfqView().finished, true);
+  } finally { pending.dispose(); }
+});
+
+test('询价：执行前复核报价覆盖、数量、有效期、风险上限与日历；执行被拒或回复失败可换报价', async () => {
+  const s = setup({ maxRiskUsd: 20_000 });
+  try {
+    const rfqId = await activeRfq(s);
+    const legs = s.fake.rfq!.legs.map(leg => String(leg.symbol));
+    s.fake.addQuote({ quoteId: 'soon', expiresInMs: 1_000 });
+    s.fake.addQuote({ quoteId: 'cheap', prices: Object.fromEntries(legs.map(symbol => [symbol, s.fake.rfq!.legs.find(leg => leg.symbol === symbol)!.side === 'Sell' ? 1 : 5_000])) });
+    s.fake.addQuote({ quoteId: 'good' });
+    s.fake.rfqQuotes.push({ ...s.fake.rfqQuotes.at(-1)!, quoteId: 'qty', quoteSellList: (s.fake.rfqQuotes.at(-1)!.quoteSellList as Row[]).map((leg, index) => index === 0 ? { ...leg, qty: '2' } : leg) });
+    await assert.rejects(s.engine.executeQuote({ rfqId, quoteId: 'soon', confirmLive: true }), refused('quote_invalid'));
+    await assert.rejects(s.engine.executeQuote({ rfqId, quoteId: 'qty', confirmLive: true }), refused('quote_invalid'));
+    await assert.rejects(s.engine.executeQuote({ rfqId, quoteId: 'cheap', confirmLive: true }), refused('risk_limit'));
+    await assert.rejects(s.engine.executeQuote({ rfqId, quoteId: 'none', confirmLive: true }), refused('quote_missing'));
+    // A Saturday execution of an RFQ (and quote) still live is refused by the calendar.
+    s.fake.rfq!.expiresAt += 2 * 86_400_000;
+    s.fake.addQuote({ quoteId: 'late', expiresInMs: 2 * 86_400_000 });
+    await s.engine.rfqTick();
+    s.hooks.skewMs = 86_400_000;
+    await assert.rejects(s.engine.executeQuote({ rfqId, quoteId: 'late', confirmLive: true }), refused('calendar'));
+    s.hooks.skewMs = 0;
+    s.fake.rfqWrite = 'refused';
+    const riskBefore = structuredClone(s.engine.state().rfq!.risk), baselineBefore = structuredClone(s.engine.state().pmBaseline);
+    const refusedRun = await s.engine.executeQuote({ rfqId, quoteId: 'good', confirmLive: true });
+    assert.equal(refusedRun.status, 'Active');
+    assert.ok(refusedRun.error?.includes('拒绝'));
+    assert.deepEqual(s.engine.state().rfq!.risk, riskBefore, '被拒的报价不留下它的风险');
+    assert.deepEqual(s.engine.state().pmBaseline, baselineBefore, '被拒的报价不留下它的保证金基线');
+    s.fake.rfqRefusalCode = 110304; // RFQ-specific refusal (quote no longer executable): definite, not unknown.
+    assert.equal((await s.engine.executeQuote({ rfqId, quoteId: 'good', confirmLive: true })).status, 'Active');
+    s.fake.rfqRefusalCode = 10001;
+    s.fake.rfqWrite = 'ok';
+    s.fake.executeOutcome = 'fail';
+    const failed = await s.engine.executeQuote({ rfqId, quoteId: 'good', confirmLive: true });
+    assert.equal(failed.status, 'Active');
+    assert.equal(s.engine.state().rfq!.selectedQuoteId, null);
+    s.fake.executeOutcome = 'fill';
+    assert.equal((await s.engine.executeQuote({ rfqId, quoteId: 'good', confirmLive: true })).status, 'PendingFill');
+    await s.engine.rfqTick();
+    assert.equal(s.engine.state().rfq!.trackingApplied, true);
+    const adopted = s.engine.state().tasks[s.engine.state().rfq!.taskId]!;
+    assert.equal(adopted.acceptedAt, s.engine.state().rfq!.createdAt, '受理时间是询价创建时间');
+    assert.equal(adopted.startedAt, s.engine.state().rfq!.executionStartedAt);
+    assert.equal(s.fake.calls.filter(call => call.path === '/v5/order/create').length, 0, '询价不下普通订单');
+  } finally { s.dispose(); }
+});
+
+test('询价：取消先记为待确认，交易所确认后结束；取消被拒绝恢复等待报价；成交记录两分钟对不上时按询价结构跟踪并通知一次', async () => {
+  const s = setup();
+  try {
+    const rfqId = await activeRfq(s);
+    s.fake.rfqWrite = 'refused';
+    const refusedCancel = await s.engine.cancelRfq({ rfqId });
+    assert.equal(refusedCancel.status, 'Active');
+    s.fake.rfqWrite = 'ok';
+    assert.equal((await s.engine.cancelRfq({ rfqId })).status, 'CancelUnknown');
+    await s.engine.rfqTick();
+    assert.equal(s.engine.state().rfq!.status, 'Canceled');
+    assert.equal(s.engine.rfqView().finished, true);
+  } finally { s.dispose(); }
+  const bad = setup();
+  try {
+    const rfqId = await activeRfq(bad);
+    bad.fake.addQuote({ quoteId: 'a' });
+    bad.fake.tradeMode = 'mismatch';
+    await bad.engine.executeQuote({ rfqId, quoteId: 'a', confirmLive: true });
+    await bad.engine.rfqTick();
+    await bad.engine.rfqTick();
+    const rfq = bad.engine.state().rfq!;
+    assert.equal(rfq.status, 'Filled');
+    assert.equal(rfq.trackingApplied, false, '两分钟内成交记录对不上：继续核对，交易保持锁定');
+    assert.ok(bad.engine.rfqView().readError?.includes('不一致'));
+    assert.equal(Object.keys(bad.engine.state().tracked.sizes).length, 0);
+    await assert.rejects(bad.engine.createPlan({ operation: 'open' }), refused('rfq_active'));
+    bad.hooks.skewMs = 120_000;
+    await bad.engine.rfqTick();
+    await bad.engine.rfqTick();
+    assert.equal(rfq.trackingApplied, true);
+    assert.ok(rfq.error?.includes('待人工核对'));
+    assert.equal(bad.notes.filter(note => note.includes('待人工核对')).length, 1);
+    assert.equal(bad.engine.state().tracked.groupId, rfq.taskId);
+    assert.deepEqual(Object.values(bad.engine.state().tracked.sizes), rfq.legs.map(leg => leg.qty));
+    const links = bad.engine.state().tasks[rfq.taskId]!.links;
+    assert.ok(links.every(link => bad.engine.state().journal[link]!.orderId === ''), '没有成交记录就不编订单号');
+    assert.equal(bad.engine.rfqView().finished, true);
+  } finally { bad.dispose(); }
+  const unread = setup();
+  try {
+    // A trade list that never answers counts like one that lacks the trade; the wait starts when this process first sees
+    // the fill (here long after the execution was sent), so a late first look never tracks without waiting.
+    const rfqId = await activeRfq(unread);
+    unread.fake.addQuote({ quoteId: 'a' });
+    unread.fake.executeOutcome = 'pending';
+    await unread.engine.executeQuote({ rfqId, quoteId: 'a', confirmLive: true });
+    unread.hooks.skewMs = 300_000;
+    unread.fake.tradeMode = 'error';
+    unread.fake.settleRfq('a');
+    await unread.engine.rfqTick();
+    const rfq = unread.engine.state().rfq!;
+    assert.equal(rfq.status, 'Filled');
+    assert.equal(rfq.trackingApplied, false, '首次看到成交时不立即兜底');
+    assert.ok(unread.engine.rfqView().readError?.includes('读取失败'));
+    unread.hooks.skewMs = 420_000;
+    await unread.engine.rfqTick();
+    assert.equal(rfq.trackingApplied, true);
+    assert.ok(rfq.error?.includes('读取失败'));
+    assert.equal(unread.notes.filter(note => note.includes('待人工核对')).length, 1);
+  } finally { unread.dispose(); }
+  const held = setup();
+  try {
+    // A strategy tracked meanwhile (only a person's change can do that) is never replaced by the RFQ.
+    const rfqId = await activeRfq(held);
+    held.fake.addQuote({ quoteId: 'a' });
+    await held.engine.executeQuote({ rfqId, quoteId: 'a', confirmLive: true });
+    const before = { groupId: 'other', sizes: { 'X|Buy': '1' } };
+    held.engine.state().tracked = structuredClone(before);
+    await held.engine.rfqTick();
+    const rfq = held.engine.state().rfq!;
+    assert.equal(rfq.trackingApplied, true);
+    assert.ok(rfq.error?.includes('已有跟踪中的策略'));
+    assert.deepEqual(held.engine.state().tracked, before);
+    assert.equal(held.engine.state().tasks[rfq.taskId], undefined);
+    assert.equal(held.notes.filter(note => note.includes('已有跟踪中的策略')).length, 1);
+    await held.engine.rfqTick();
+    assert.equal(held.notes.filter(note => note.includes('已有跟踪中的策略')).length, 1);
+  } finally { held.dispose(); }
+  const foreign = setup();
+  try {
+    // An answer naming another RFQ proves nothing: the execution stays unknown (and trading locked) for the loop.
+    const rfqId = await activeRfq(foreign);
+    foreign.fake.addQuote({ quoteId: 'a' });
+    foreign.fake.executeOutcome = 'foreign';
+    const answer = await foreign.engine.executeQuote({ rfqId, quoteId: 'a', confirmLive: true });
+    assert.equal(answer.status, 'ExecutionUnknown');
+    assert.ok(answer.error?.includes('不符'));
+    await foreign.engine.rfqTick();
+    assert.equal(foreign.engine.state().rfq!.status, 'ExecutionUnknown');
+    assert.equal(foreign.engine.rfqView().finished, false);
+  } finally { foreign.dispose(); }
 });

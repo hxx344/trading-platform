@@ -553,3 +553,33 @@
 @media (max-width: 600px) {
   .options-desk .performance-plot { height: 240px; padding: 10px 8px 0; }
 }
+/* 组合询价（G2c）：复制自工作台 modules/greeks/app/static/style.css（提交 2f0593d）第 345–364、415（580px 断点）、570、606、619、622、719 行，按原顺序；
+   多选择器规则只取 rfq 部分，规则内容不改，每条选择器前加 .options-desk。 */
+.options-desk .rfq-panel { margin-top: 22px; }
+.options-desk .rfq-controls { display: flex; gap: 10px; align-items: center; }
+.options-desk .rfq-controls p { color: var(--text-secondary); font-size: 12px; margin: 0 auto 0 0; }
+.options-desk .rfq-controls p span { display: block; color: var(--quiet); font-size: 10px; margin-top: 5px; }
+.options-desk .rfq-controls .button { width: auto; margin-top: 0; }
+.options-desk .rfq-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 18px 30px; margin: 22px 0 16px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--quiet); font-size: 10px; }
+.options-desk .rfq-meta b { font: 10px var(--mono); color: var(--text-primary); margin-left: 6px; overflow-wrap: anywhere; }
+.options-desk .rfq-quotes.empty { padding: 26px; }
+.options-desk .rfq-quote { border: 1px solid var(--line); border-radius: 9px; padding: 18px; margin-top: 12px; }
+.options-desk .rfq-quote>div:first-child { display: flex; justify-content: space-between; gap: 15px; font-size: 12px; }
+.options-desk .rfq-quote>div:first-child span { font-size: 10px; color: var(--quiet); }
+.options-desk .rfq-quote-values { display: flex; align-items: center; flex-wrap: wrap; gap: 20px; margin-top: 20px; color: var(--text-secondary); font-size: 12px; }
+.options-desk .rfq-execute { margin-left: auto; }
+.options-desk .rfq-fee { color: var(--warning); }.options-desk .rfq-fee small { display: block; font-size: 9px; color: var(--quiet); margin-top: 5px; }
+.options-desk .rfq-compare-title { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--quiet); font-size: 10px; }
+.options-desk .rfq-leg-compare { display: grid; gap: 10px; margin-top: 12px; }
+.options-desk .rfq-leg-row { display: grid; grid-template-columns: minmax(0, 1.7fr) 1fr .7fr .7fr; gap: 12px; align-items: center; color: var(--text-secondary); font-size: 11px; }
+.options-desk .rfq-leg-row strong { font: 10px var(--mono); overflow-wrap: anywhere; }
+.options-desk .rfq-leg-row>span:nth-child(3) { color: var(--quiet); }
+.options-desk .rfq-diff-positive { color: var(--positive); }.options-desk .rfq-diff-negative { color: var(--negative); }
+@media (max-width: 580px) {
+  .options-desk .rfq-panel { margin-top: 18px; }.options-desk .rfq-controls { flex-wrap: wrap; }.options-desk .rfq-controls p { width: 100%; margin-bottom: 10px; font-size: 11px; }.options-desk .rfq-controls .button { flex: 1; }.options-desk .rfq-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }.options-desk .rfq-meta>span { min-width: 0; }.options-desk .rfq-meta b { display: block; margin: 4px 0 0; font-size: 9px; }.options-desk .rfq-quote { padding: 14px; }.options-desk .rfq-quote>div:first-child { flex-direction: column; gap: 6px; }.options-desk .rfq-quote-values { gap: 14px; font-size: 11px; }.options-desk .rfq-execute { width: 100%; }.options-desk .rfq-leg-row { grid-template-columns: 1fr 1fr; gap: 6px; font-size: 10px; }.options-desk .rfq-leg-row strong { grid-column: 1/-1; }
+}
+.options-desk #rfqConfirmSummary { font-size: 12px; line-height: 1.8; }
+.options-desk .rfq-panel { margin-top: 14px; }
+.options-desk .rfq-quote { border-radius: 6px; }
+.options-desk .rfq-quote { padding: 14px; }
+.options-desk .rfq-panel { margin-top: 0; }

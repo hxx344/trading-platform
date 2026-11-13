@@ -73,6 +73,11 @@ export interface ServiceViews {
     start(body: unknown): Promise<unknown>;
     stop(taskId: string, body: unknown): unknown;
     autoOpen(body: unknown): unknown;
+    /** 组合询价 (G2c): the RFQ with its quotes; create, execute one quote, cancel. */
+    rfq(): unknown;
+    rfqCreate(body: unknown): Promise<unknown>;
+    rfqExecute(body: unknown): Promise<unknown>;
+    rfqCancel(body: unknown): Promise<unknown>;
   };
   /** The service's log lines, newest first (service-log.ts); `before` is the last id of the previous page. */
   logs?(filter: 'all' | 'problems', before: number | null, limit: number): unknown;
@@ -291,6 +296,10 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       const stop = request.method === 'POST' ? /^tasks\/([0-9a-f]{16})\/stop$/.exec(path) : null;
       if (stop) return send(response, 200, options.stop(stop[1]!, await readJson(request)));
       if (request.method === 'POST' && path === 'auto-open') return send(response, 200, options.autoOpen(await readJson(request)));
+      if (request.method === 'GET' && path === 'rfq') return send(response, 200, options.rfq());
+      if (request.method === 'POST' && path === 'rfq') return send(response, 200, await options.rfqCreate(await readJson(request)));
+      if (request.method === 'POST' && path === 'rfq/execute') return send(response, 200, await options.rfqExecute(await readJson(request)));
+      if (request.method === 'POST' && path === 'rfq/cancel') return send(response, 200, await options.rfqCancel(await readJson(request)));
       return send(response, 404, { code: 'not_found', message: '不存在' });
     }
     if (request.method === 'GET' && (url.pathname === '/api/logs' || url.pathname === '/api/logs/problems')) {

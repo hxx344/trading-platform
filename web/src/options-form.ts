@@ -2,7 +2,7 @@
 // start bodies, the net limit typed in the confirmation, the expiry payoff curve, the chain rows around the index and the
 // per-task progress and amounts. Rules and wording follow the workbench Greeks page (modules/greeks/app/static/app.js,
 // 2f0593d).
-import type { ChainRow, Execution, OptionsState, OrderRow, PerformanceGroup, PerformancePoint, PerformanceSeries, PerformanceView, Plan, Preview, ScheduleView, StrategyMode, Task, TaskStatus } from './options-types.ts';
+import type { ChainRow, Execution, OptionsState, OrderRow, PerformanceGroup, PerformancePoint, PerformanceSeries, PerformanceView, Plan, Preview, ScheduleView, StrategyMode, Task, TaskStatus, RfqQuote, RfqRecord, RfqView } from './options-types.ts';
 
 export const ACTIVE_STATUSES: readonly TaskStatus[] = ['accepted', 'running', 'stopping', 'recovering', 'recovery_needed'];
 export const isActive = (task: Pick<Task, 'status'>): boolean => ACTIVE_STATUSES.includes(task.status);
@@ -210,3 +210,26 @@ export function markedRows(rows: readonly PlotRow[]): PlotRow[] {
 
 /** Axis labels: hours and minutes within a day, else month and day (UTC), as the workbench chart. */
 export const plotTick = (span: number) => (time: number): string => new Date(time).toISOString().slice(span < 86_400_000 ? 11 : 5, span < 86_400_000 ? 16 : 10);
+
+// ---- 组合询价 (G2c; GET/POST /api/options/rfq, server side src/options/rfq.ts) ----
+export const RFQ_PATH = '/api/options/rfq';
+/** The create body; the page adds the request id it keeps until an answer arrives. */
+export const rfqCreateBody = (quantity: string, mode: StrategyMode): Record<string, unknown> => ({ confirmLive: true, quantity, mode });
+export const rfqExecuteBody = (rfqId: string, quoteId: string): Record<string, unknown> => ({ rfqId, quoteId, confirmLive: true });
+export const rfqStrategyLabel = (mode: StrategyMode): string => mode === 'short_strangle' ? '双腿卖出 · 无保护腿，亏损无上限' : '四腿铁鹰';
+/** Why the page cannot send a new RFQ now; null when it can (the server checks again). */
+export function rfqCreateProblem(view: Pick<RfqView, 'finished' | 'blocked' | 'market'> | null, quantity: string | null): string | null {
+  if (!view) return '等待询价状态同步';
+  if (!view.finished) return '上一笔询价尚未结束';
+  if (view.blocked) return view.blocked;
+  if (quantity === null) return '每腿数量须为正数（最多 8 位小数）';
+  if (view.market.stale) return '行情已过期，等行情恢复后再询价';
+  return null;
+}
+/** The RFQ can still execute a quote or be canceled: open on the venue with nothing sent. */
+export const rfqOpen = (rfq: Pick<RfqRecord, 'status' | 'selectedQuoteId' | 'rfqId'> | null): boolean => rfq !== null && rfq.rfqId !== null && rfq.status === 'Active' && rfq.selectedQuoteId === null;
+/** What the confirmation is bound to: a change of any of these (a re-quote) asks for the confirmation again, as the workbench. */
+export const quoteFingerprint = (rfqId: string, quote: Pick<RfqQuote, 'quoteId' | 'expiresAt' | 'legs'>): string =>
+  JSON.stringify([rfqId, quote.quoteId, quote.expiresAt, quote.legs.map(leg => [leg.symbol, leg.side, leg.qty, leg.price])]);
+/** Seconds a quote has left on the server clock, from the view's own `now`. */
+export const quoteSecondsLeft = (quote: Pick<RfqQuote, 'expiresAt'>, viewNow: number): number => Math.max(0, Math.floor((quote.expiresAt - viewNow) / 1000));

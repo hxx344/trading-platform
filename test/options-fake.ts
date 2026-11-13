@@ -43,6 +43,21 @@ export class FakeOptions {
   creates = 0;
   /** How an IOC (the fallback) fares: fill, partial, rest (cancelled at once, nothing filled) or lost (fills, but the answer is a 5xx and the order cannot be read). */
   iocMode: 'fill' | 'partial' | 'rest' | 'lost' = 'fill';
+  /** 组合询价 (G2c): the one RFQ, its quotes and trades. */
+  rfq: { rfqId: string; rfqLinkId: string; status: string; expiresAt: number; legs: Row[] } | null = null;
+  rfqQuotes: Row[] = [];
+  rfqTrades: Row[] = [];
+  /** How the next RFQ write fares: ok, refused (10001), lost (done, but the answer is a 503) or dropped (a 503, not done). */
+  rfqWrite: 'ok' | 'refused' | 'lost' | 'dropped' = 'ok';
+  /** The retCode a 'refused' RFQ write answers with (a common refusal unless a path-specific one is tested). */
+  rfqRefusalCode = 10001;
+  /** How an executed quote ends: filled at once, left PendingFill (settleRfq fills it), or answered Failed. */
+  executeOutcome: 'fill' | 'pending' | 'fail' | 'foreign' = 'fill';
+  /** The live list and the history can lag (hide the RFQ). */
+  rfqLive = true;
+  rfqHistory = true;
+  /** The trade list lags (empty) or disagrees (a leg's qty halved). */
+  tradeMode: 'ok' | 'empty' | 'mismatch' | 'error' = 'ok';
   private seq = 0;
   /** Returns the fake's clock (ms); the tests shift it to a Friday. */
   private readonly clock: () => number;
@@ -68,10 +83,10 @@ export class FakeOptions {
     return { symbol, markPrice: String(mark), bid1Price: String(mark - 10), ask1Price: String(mark + 10), bid1Size: '5', ask1Size: '5', delta: String(delta), gamma: '0.00001', vega: '20', theta: '-30', markIv: '0.5', volume24h: '10', openInterest: '100' };
   }
 
-  private fill(order: FakeOrder, qty: number): void {
+  private fill(order: FakeOrder, qty: number, execType = 'Trade'): void {
     const done = Number(order.cumExecQty) + qty;
     order.cumExecQty = String(Number(done.toFixed(8)));
-    this.executions.push({ execId: `e${++this.seq}`, symbol: order.symbol, side: order.side, orderId: order.orderId, orderLinkId: order.link, execFee: '0.5', feeCurrency: order.symbol.endsWith('-USDT') ? 'USDT' : 'USDC', execPrice: order.price, execQty: String(qty), execTime: String(this.clock()), feeRate: '0.0003', closedSize: '', execType: 'Trade' });
+    this.executions.push({ execId: `e${++this.seq}`, symbol: order.symbol, side: order.side, orderId: order.orderId, orderLinkId: order.link, execFee: '0.5', feeCurrency: order.symbol.endsWith('-USDT') ? 'USDT' : 'USDC', execPrice: order.price, execQty: String(qty), execTime: String(this.clock()), feeRate: '0.0003', closedSize: '', execType });
     const side = order.reduceOnly ? (order.side === 'Buy' ? 'Sell' : 'Buy') : order.side, key = `${order.symbol}|${side}`;
     const position = this.positions.get(key) ?? { symbol: order.symbol, side, size: 0 };
     position.size = Number((position.size + (order.reduceOnly ? -qty : qty)).toFixed(8));
@@ -79,6 +94,32 @@ export class FakeOptions {
       this.positions.delete(key);
       this.closed.push({ symbol: order.symbol, side, qty: order.qty, openTime: String(this.clock() - 1_000), closeTime: String(this.clock()), avgEntryPrice: '100', totalPnl: '1', totalOpenFee: '0.5', totalCloseFee: '0.5', deliveryFee: '0' });
     } else this.positions.set(key, position);
+  }
+
+  /** A market maker's quote on every leg of the RFQ, at the mark plus shift unless prices are given. */
+  /** shift moves the short legs only (a better or worse credit). */
+  addQuote({ quoteId = `q${this.rfqQuotes.length + 1}`, deskCode = 'DESK1', shift = 0, prices = {}, expiresInMs = 60_000, drop = null }: { quoteId?: string; deskCode?: string; shift?: number; prices?: Record<string, number>; expiresInMs?: number; drop?: string | null } = {}): string {
+    const rfq = this.rfq!;
+    const sell = rfq.legs.filter(leg => leg.symbol !== drop).map(leg => ({ symbol: leg.symbol, qty: leg.qty, price: String(prices[leg.symbol as string] ?? Number(this.quote(leg.symbol as string).markPrice) + (leg.side === 'Sell' ? shift : 0)) }));
+    this.rfqQuotes.push({ rfqId: rfq.rfqId, rfqLinkId: rfq.rfqLinkId, quoteId, deskCode, status: 'Active', expiresAt: String(this.clock() + expiresInMs), quoteSellList: sell, quoteBuyList: [] });
+    return quoteId;
+  }
+  /** Fills the RFQ at the chosen quote: one block-trade order per leg, without our orderLinkId. */
+  settleRfq(quoteId: string): void {
+    const rfq = this.rfq!, quote = this.rfqQuotes.find(item => item.quoteId === quoteId)!;
+    const legs = (quote.quoteSellList as Row[]).map(item => {
+      const leg = rfq.legs.find(candidate => candidate.symbol === item.symbol)!;
+      const order: FakeOrder = { symbol: String(item.symbol), side: leg.side as 'Buy' | 'Sell', qty: String(item.qty), price: String(item.price), link: '', reduceOnly: false, orderId: `b${++this.seq}`, status: 'Filled', cumExecQty: '0', visible: false };
+      this.fill(order, Number(order.qty), 'BlockTrade');
+      return { orderId: order.orderId, symbol: order.symbol, side: order.side, price: order.price, qty: this.tradeMode === 'mismatch' ? String(Number(order.qty) / 2) : order.qty, execFee: '0.5', execId: `x${this.seq}`, resultCode: 0, resultMessage: '', rejectParty: '' };
+    });
+    rfq.status = 'Filled';
+    this.rfqTrades.push({ rfqId: rfq.rfqId, rfqLinkId: rfq.rfqLinkId, quoteId, quoteSide: 'Sell', strategyType: 'custom', status: 'Filled', legs });
+  }
+  private rfqWriteFails(): Response | null {
+    if (this.rfqWrite === 'refused') return fail(this.rfqRefusalCode);
+    if (this.rfqWrite === 'dropped') return fail(10016, 503);
+    return null;
   }
 
   fetch = async (url: string, init: RequestInit): Promise<Response> => {
@@ -105,7 +146,44 @@ export class FakeOptions {
         const show = order && order.visible && (path === '/v5/order/realtime' ? open : !open);
         return list(show ? [{ symbol: order.symbol, side: order.side, qty: order.qty, orderLinkId: order.link, orderId: order.orderId, orderStatus: order.status, cumExecQty: order.cumExecQty, price: order.price }] : []);
       }
-      case '/v5/execution/list': if (this.failExecutions) return fail(10016, 503); return list(this.executions.filter(row => row.orderLinkId === params.get('orderLinkId')));
+      case '/v5/execution/list': if (this.failExecutions) return fail(10016, 503); return list(this.executions.filter(row => params.has('orderId') ? row.orderId === params.get('orderId') : row.orderLinkId === params.get('orderLinkId')));
+      case '/v5/rfq/config': return ok({ deskCode: 'ME', maxLegs: 25, maxLP: 2, maxProviders: 25, counterparties: [{ traderName: 'a', deskCode: 'DESK1', type: 'LP' }, { traderName: 'b', deskCode: 'DESK2', type: 'LP' }, { traderName: 'c', deskCode: 'DESK3', type: 'LP' }], strategyTypes: [{ strategyName: 'Iron_Condor' }, { strategyName: 'Strangle' }] });
+      case '/v5/rfq/create-rfq': {
+        const refused = this.rfqWriteFails();
+        if (refused) return refused;
+        this.rfq = { rfqId: `rfq${++this.seq}`, rfqLinkId: String(body!.rfqLinkId), status: 'Active', expiresAt: this.clock() + 300_000, legs: (body!.list as Row[]).map(leg => ({ ...leg })) };
+        this.rfqQuotes = [];
+        if (this.rfqWrite === 'lost') return fail(10016, 503);
+        return ok({ rfqId: this.rfq.rfqId, rfqLinkId: this.rfq.rfqLinkId, status: 'Active', expiresAt: String(this.rfq.expiresAt), deskCode: 'ME' });
+      }
+      case '/v5/rfq/rfq-realtime': case '/v5/rfq/rfq-list': {
+        const rfq = this.rfq, live = path === '/v5/rfq/rfq-realtime';
+        const matches = rfq && (params.get('rfqId') === rfq.rfqId || params.get('rfqLinkId') === rfq.rfqLinkId) && (live ? this.rfqLive && ['Active', 'PendingFill'].includes(rfq.status) : this.rfqHistory);
+        return list(matches ? [{ rfqId: rfq.rfqId, rfqLinkId: rfq.rfqLinkId, status: rfq.status, expiresAt: String(rfq.expiresAt), legs: rfq.legs }] : []);
+      }
+      case '/v5/rfq/quote-realtime': return list(this.rfqQuotes.filter(row => row.rfqId === params.get('rfqId') && row.status === 'Active'));
+      case '/v5/rfq/execute-quote': {
+        const refused = this.rfqWriteFails();
+        if (refused) return refused;
+        const rfq = this.rfq;
+        if (!rfq || rfq.rfqId !== body!.rfqId || rfq.status !== 'Active') return fail(10001);
+        if (this.executeOutcome === 'fail') return ok({ rfqId: rfq.rfqId, rfqLinkId: rfq.rfqLinkId, status: 'Failed' });
+        if (this.executeOutcome === 'foreign') return ok({ rfqId: 'other', rfqLinkId: rfq.rfqLinkId, status: 'Failed' });
+        rfq.status = 'PendingFill';
+        if (this.executeOutcome === 'fill') this.settleRfq(String(body!.quoteId));
+        if (this.rfqWrite === 'lost') return fail(10016, 503);
+        return ok({ rfqId: rfq.rfqId, rfqLinkId: rfq.rfqLinkId, status: 'PendingFill' });
+      }
+      case '/v5/rfq/cancel-rfq': {
+        const refused = this.rfqWriteFails();
+        if (refused) return refused;
+        const rfq = this.rfq;
+        if (!rfq || rfq.rfqId !== body!.rfqId || rfq.status !== 'Active') return fail(10001);
+        rfq.status = 'Canceled';
+        if (this.rfqWrite === 'lost') return fail(10016, 503);
+        return ok({ rfqId: rfq.rfqId, rfqLinkId: rfq.rfqLinkId });
+      }
+      case '/v5/rfq/trade-list': if (this.tradeMode === 'error') return fail(10016, 503); return list(this.tradeMode === 'empty' ? [] : this.rfqTrades.filter(row => row.rfqId === params.get('rfqId')));
       case '/v5/position/get-closed-positions': {
         const start = Number(params.get('startTime')), end = Number(params.get('endTime'));
         return list(this.closed.filter(row => row.symbol === params.get('symbol') && Number(row.closeTime) >= start && Number(row.closeTime) <= end));

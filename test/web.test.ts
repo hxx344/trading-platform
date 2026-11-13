@@ -190,6 +190,7 @@ test('页面地址：#/pair/<配对>、#/status 与 #/settings 分别打开详�
   assert.deepEqual(parseRoute('#/options'), { page: 'options', tab: 'desk' });
   assert.deepEqual(parseRoute('#/options/positions'), { page: 'options', tab: 'positions' });
   assert.deepEqual(parseRoute('#/options/orders'), { page: 'options', tab: 'orders' });
+  assert.deepEqual(parseRoute('#/options/performance'), { page: 'options', tab: 'performance' });
   assert.deepEqual(parseRoute('#/options/x'), { page: 'overview' });
   assert.deepEqual(parseRoute('#/pair'), { page: 'pair', pairId: null });
   assert.deepEqual(parseRoute(pairHref('p_1-a')), { page: 'pair', pairId: 'p_1-a' });

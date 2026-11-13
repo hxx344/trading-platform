@@ -82,3 +82,23 @@ export interface OptionsState {
   /** Absent from a pre-G2a service (a page left open across a rollback). */
   schedule?: ScheduleView;
 }
+
+// GET /api/options/performance (G2b 收益); amounts are in the group's settlement currency, times in ms.
+export interface PerformancePoint { time: number; pnl: number; terminal?: true; gapBefore?: true }
+export interface PerformanceSeriesPoint extends PerformancePoint { groupId: string; cumulative: number }
+export interface PerformanceFill extends Execution { openingGroup: string | null }
+export interface PerformanceGroup {
+  id: string; openedAt: number | null; strategyMode: StrategyMode | null; closedAt: number | null; currency: string; status: 'open' | 'closed' | 'pending'; issues: string[];
+  legCount: number; openPremium: number | null; openFee: number | null; closeFee: number | null; deliveryFee: number;
+  netPnl: number | null; floatingPnl: number | null; markToMarketPnl: number | null; expiry: number | null; eligible: boolean;
+  closureKind: 'early' | 'expiry' | 'unknown' | 'holding'; exclusionReason: string; remainingQty: number; source: 'executions' | 'exchange_closed_positions';
+  fills: PerformanceFill[]; samples: PerformancePoint[]; sampleCount: number;
+}
+export interface PerformanceSeries {
+  currency: string; points: PerformanceSeriesPoint[]; totalPnl: number; closedCount: number; wins: number; maxDrawdown: number;
+  sampleSeconds: number; sampledCount: number; unsampledCount: number;
+}
+export interface PerformanceView {
+  account: string; sampleSeconds: number; unassignedCloses: number; groups: PerformanceGroup[]; series: PerformanceSeries[];
+  ledger: { count: number; firstAt: number | null }; positionsAt: number | null; error: string | null;
+}

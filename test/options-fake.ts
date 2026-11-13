@@ -33,6 +33,8 @@ export class FakeOptions {
   closed: Row[] = [];
   /** Positions hidden from the list (a transient empty read). */
   hidePositions = false;
+  /** The fills endpoint refuses every read (a lost read the 收益 backfill has to repeat). */
+  failExecutions = false;
   permissions: Row = { ContractTrade: [], Derivatives: [], Wallet: [], Spot: [], Options: ['OptionsTrade'] };
   ips: unknown = ['203.0.113.7'];
   uid: unknown = Number(UID);
@@ -69,13 +71,13 @@ export class FakeOptions {
   private fill(order: FakeOrder, qty: number): void {
     const done = Number(order.cumExecQty) + qty;
     order.cumExecQty = String(Number(done.toFixed(8)));
-    this.executions.push({ execId: `e${++this.seq}`, symbol: order.symbol, side: order.side, orderId: order.orderId, orderLinkId: order.link, execFee: '0.5', feeCurrency: 'USDT', execPrice: order.price, execQty: String(qty), execTime: String(this.clock()), feeRate: '0.0003', closedSize: '', execType: 'Trade' });
+    this.executions.push({ execId: `e${++this.seq}`, symbol: order.symbol, side: order.side, orderId: order.orderId, orderLinkId: order.link, execFee: '0.5', feeCurrency: order.symbol.endsWith('-USDT') ? 'USDT' : 'USDC', execPrice: order.price, execQty: String(qty), execTime: String(this.clock()), feeRate: '0.0003', closedSize: '', execType: 'Trade' });
     const side = order.reduceOnly ? (order.side === 'Buy' ? 'Sell' : 'Buy') : order.side, key = `${order.symbol}|${side}`;
     const position = this.positions.get(key) ?? { symbol: order.symbol, side, size: 0 };
     position.size = Number((position.size + (order.reduceOnly ? -qty : qty)).toFixed(8));
     if (position.size <= 0) {
       this.positions.delete(key);
-      this.closed.push({ symbol: order.symbol, side, qty: order.qty, openTime: String(this.clock() - 1_000), closeTime: String(this.clock()) });
+      this.closed.push({ symbol: order.symbol, side, qty: order.qty, openTime: String(this.clock() - 1_000), closeTime: String(this.clock()), avgEntryPrice: '100', totalPnl: '1', totalOpenFee: '0.5', totalCloseFee: '0.5', deliveryFee: '0' });
     } else this.positions.set(key, position);
   }
 
@@ -103,7 +105,7 @@ export class FakeOptions {
         const show = order && order.visible && (path === '/v5/order/realtime' ? open : !open);
         return list(show ? [{ symbol: order.symbol, side: order.side, qty: order.qty, orderLinkId: order.link, orderId: order.orderId, orderStatus: order.status, cumExecQty: order.cumExecQty, price: order.price }] : []);
       }
-      case '/v5/execution/list': return list(this.executions.filter(row => row.orderLinkId === params.get('orderLinkId')));
+      case '/v5/execution/list': if (this.failExecutions) return fail(10016, 503); return list(this.executions.filter(row => row.orderLinkId === params.get('orderLinkId')));
       case '/v5/position/get-closed-positions': {
         const start = Number(params.get('startTime')), end = Number(params.get('endTime'));
         return list(this.closed.filter(row => row.symbol === params.get('symbol') && Number(row.closeTime) >= start && Number(row.closeTime) <= end));

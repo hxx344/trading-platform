@@ -5,8 +5,8 @@ import assert from 'node:assert/strict';
 import { ContractError } from '../src/contracts.ts';
 import type { OptionsEngine } from '../src/options/engine.ts';
 import { optionsViews } from '../src/service/options.ts';
-import { autoOpenConfirm, chainLines, orderState, parseQuantity, payoffCurve, planBody, scheduleTime, startBody, startRefused, taskSummary } from '../web/src/options-form.ts';
-import type { ChainRow, Execution, OrderRow, Plan, PreviewLeg, Task } from '../web/src/options-types.ts';
+import { autoOpenConfirm, chainLines, coverageLine, groupLabel, markedRows, performanceStatus, plotRows, plotTick, utcMinute, selectedSeries, orderState, parseQuantity, payoffCurve, planBody, scheduleTime, startBody, startRefused, taskSummary } from '../web/src/options-form.ts';
+import type { ChainRow, Execution, OrderRow, PerformanceGroup, PerformanceView, Plan, PreviewLeg, Task } from '../web/src/options-types.ts';
 
 const PLAN: Plan = {
   planId: 'a'.repeat(32), operation: 'open', mode: 'iron_condor', createdAt: 0, expiresAt: 30_000, legs: [], estimatedGrossUsd: 100, estimatedFeeUsd: 2,
@@ -108,4 +108,50 @@ test('the auto-open confirmation names the window, the strategy, the limits and 
   assert.doesNotMatch(text, /5 秒内就会实盘开仓/);
   assert.match(autoOpenConfirm(settings, { ...schedule, waiting: true }).split('\n')[0]!, /确认后约 5 秒内就会实盘开仓/);
   assert.match(autoOpenConfirm(settings, { ...schedule, marketFallback: true }), /补发一次 IOC.*通常会把 IOC 拦下/);
+});
+
+// The page reads the engine's view with these types; a field renamed on either side fails the type check here.
+const _performanceViewMatches = (engine: OptionsEngine): PerformanceView => engine.performanceView();
+void _performanceViewMatches;
+
+test('期权收益页：缺口前插入断开行，鼠标只落在真实点上；结束点不算采样', () => {
+  const { rows, hover, gaps, sampled } = plotRows([{ time: 0, pnl: 1, gapBefore: true }, { time: 60_000, pnl: 2 }, { time: 600_000, pnl: 3, gapBefore: true }, { time: 660_000, pnl: 4, terminal: true }], point => point.pnl);
+  // A leading gap flag has nothing before it to break from.
+  assert.deepEqual(rows.map(row => row.value), [1, 2, null, 3, 4]);
+  assert.deepEqual(hover.map(row => row.value), [1, 2, 3, 4]);
+  assert.deepEqual([gaps, sampled], [1, 3]);
+});
+
+test('期权收益页：综合曲线只取全部点属于纳入组合的币种曲线；状态与覆盖说明同工作台', () => {
+  const group = (id: string, value: Partial<PerformanceGroup>) => ({ id, currency: 'USDC', eligible: false, status: 'closed', closureKind: 'early', ...value }) as PerformanceGroup;
+  const series = { currency: 'USDC', points: [{ time: 1, pnl: 2, cumulative: 2, groupId: 'a', terminal: true as const }], totalPnl: 2, closedCount: 1, wins: 1, maxDrawdown: 0, sampleSeconds: 60, sampledCount: 0, unsampledCount: 1 };
+  const groups = [group('a', { eligible: true, closureKind: 'expiry' }), group('b', { status: 'pending', closureKind: 'unknown' }), group('c', { status: 'open', closureKind: 'early' })];
+  assert.equal(selectedSeries({ series: [series], groups }, 'USDC').totalPnl, 2);
+  assert.equal(selectedSeries({ series: [series], groups: groups.slice(1) }, 'USDC').closedCount, 0);
+  assert.equal(selectedSeries({ series: [series], groups }, 'USDT').points.length, 0);
+  assert.deepEqual(groups.map(groupLabel), ['到期结束', '待核对', '提前减仓 · 持仓中']);
+  assert.equal(coverageLine(groups, 0), '3 次组合开仓 · 1 组到期纳入 · 1 组提前平仓排除 · 1 组待核对');
+  assert.match(coverageLine(groups, 2), /2 笔平仓尚未可靠归属$/);
+  const view = { error: null, ledger: { count: 4, firstAt: Date.UTC(2026, 10, 13, 10) } };
+  assert.deepEqual(performanceStatus(view, null), { text: '台账起始 2026-11-13 UTC · 4 笔成交 · 按订单同步成交与手续费', warning: false });
+  assert.equal(performanceStatus(view, '超时').warning, true);
+  assert.deepEqual(performanceStatus({ ...view, error: '部分订单的成交明细补读失败，下次再读' }, null).warning, true);
+  assert.equal(performanceStatus(null, null).text, '正在同步收益台账…');
+  assert.deepEqual(performanceStatus(null, '超时'), { text: '收益台账读取失败：超时', warning: true });
+  assert.deepEqual(performanceStatus(view, '超时').text, '收益台账同步失败，等待重试；下方为上次快照。');
+  const more = [group('d', { status: 'open', closureKind: 'unknown' }), group('e', {}), group('f', { closureKind: 'unknown' })];
+  assert.deepEqual(more.map(groupLabel), ['持仓中', '提前平仓', '结束待验证']);
+});
+
+test('期权收益页：时间刻度跨一天改显示日期；无时间显示 --；圆点约 80 个且保留最后与结束点', () => {
+  const at = Date.UTC(2026, 10, 13, 9, 5);
+  assert.equal(plotTick(86_400_000 - 1)(at), '09:05');
+  assert.equal(plotTick(86_400_000)(at), '11-13');
+  assert.equal(utcMinute(null), '--');
+  assert.equal(utcMinute(at), '2026-11-13 09:05');
+  const rows = Array.from({ length: 200 }, (_, index) => ({ time: index, value: index, point: index === 101 ? { time: index, pnl: index, terminal: true as const } : { time: index, pnl: index } }));
+  const marked = markedRows(rows).map(row => row.time);
+  assert.ok(marked.length <= 82, String(marked.length));
+  assert.deepEqual([marked[0], marked.includes(101), marked.at(-1)], [0, true, 199]);
+  assert.deepEqual(markedRows(rows.slice(0, 5)).map(row => row.time), [0, 1, 2, 3, 4]);
 });

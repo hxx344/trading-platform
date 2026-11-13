@@ -53,7 +53,6 @@ const MAX_STATE_BYTES = 64 * 1024 * 1024;
 const FIXED_SETTINGS: Record<string, number | boolean> = {
   option_mm_factor: 0.03, option_max_im_factor: 0.10, option_min_im_factor: 0.05, option_liquidation_fee_rate: 0.002,
   option_fee_cap_pct: 0.07, quote_stale_seconds: 30, max_spread_bps: 0, target_dte_days: 2, bbo_poll_seconds: 1,
-  allow_market_fallback: false,
 };
 const own = (value: Json, key: string): boolean => Object.hasOwn(value, key);
 const text = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
@@ -137,6 +136,12 @@ export function optionsCandidate(environment: Record<string, string>, stateText:
     if (timeout !== undefined) settings.orderTimeoutSeconds = timeout;
     if (fee !== undefined) settings.feeRate = fee;
     if (buffer !== undefined) settings.marginBufferPct = buffer;
+    // The opening time comes over; the switch does not (AUTO_OPEN is off by the time an import is allowed).
+    const hour = number(env, 'open_hour_utc'), minute = number(env, 'open_minute_utc'), window = number(env, 'open_window_seconds');
+    if (hour !== undefined) settings.openHourUtc = hour;
+    if (minute !== undefined) settings.openMinuteUtc = minute;
+    if (window !== undefined) settings.openWindowSeconds = window;
+    if (flag(env, 'allow_market_fallback', false)) settings.marketFallback = true;
     const ignored = Object.entries(FIXED_SETTINGS).filter(([name, ours]) => {
       const value = env[name];
       if (value === undefined) return false;
@@ -258,7 +263,8 @@ export function planOptions(source: OptionsSource, config: Json, secrets: Json, 
   secrets.bybitOptions = key;
   item.status = 'added';
   item.detail = `Bybit 账户 ${item.accountId}（${parsed.strategyMode === 'iron_condor' ? '四腿铁鹰' : '双腿卖出'}，每腿 ${parsed.legQty} BTC，最大亏损上限 ${parsed.limits.maxRiskUsd} / 保证金上限 ${parsed.limits.maxMarginUsd} USD）`;
-  notes.push('期权只手动开仓；导入后工作台期权模块不能再用这个 Bybit 账户下期权单');
+  const time = `${String(parsed.openHourUtc).padStart(2, '0')}:${String(parsed.openMinuteUtc).padStart(2, '0')}`;
+  notes.push(`期权定时开仓在配置里是关闭的（时间沿用周五 ${time} UTC），要用时在期权页打开；数据目录里若留有本服务以前的期权状态（options.sqlite）且当时在页面打开过定时开仓，会沿用那次的页面设置，导入后请先在期权页核对${parsed.marketFallback ? '；IOC 兜底已按工作台打开' : ''}；导入后工作台期权模块不能再用这个 Bybit 账户下期权单`);
   if (source.ignored?.length) notes.push(`工作台改过的这些期权参数本服务不导入，仍按本服务的默认值估算与下单：${source.ignored.join('、')}`);
   return item;
 }

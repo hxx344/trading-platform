@@ -67,9 +67,12 @@ export interface ServiceViews {
     market(expiry: string | null): unknown;
     preview(quantity: string | null, mode: string | null): unknown;
     state(): unknown;
+    /** The 收益 page (G2b). */
+    performance(): unknown;
     plan(body: unknown): Promise<unknown>;
     start(body: unknown): Promise<unknown>;
     stop(taskId: string, body: unknown): unknown;
+    autoOpen(body: unknown): unknown;
   };
   /** The service's log lines, newest first (service-log.ts); `before` is the last id of the previous page. */
   logs?(filter: 'all' | 'problems', before: number | null, limit: number): unknown;
@@ -282,10 +285,12 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       if (request.method === 'GET' && path === 'market') return send(response, 200, options.market(url.searchParams.get('expiry')));
       if (request.method === 'GET' && path === 'preview') return send(response, 200, options.preview(url.searchParams.get('quantity'), url.searchParams.get('mode')));
       if (request.method === 'GET' && path === 'state') return send(response, 200, options.state());
+      if (request.method === 'GET' && path === 'performance') return send(response, 200, options.performance());
       if (request.method === 'POST' && path === 'plans') return send(response, 200, await options.plan(await readJson(request)));
       if (request.method === 'POST' && path === 'tasks') return send(response, 200, await options.start(await readJson(request)));
       const stop = request.method === 'POST' ? /^tasks\/([0-9a-f]{16})\/stop$/.exec(path) : null;
       if (stop) return send(response, 200, options.stop(stop[1]!, await readJson(request)));
+      if (request.method === 'POST' && path === 'auto-open') return send(response, 200, options.autoOpen(await readJson(request)));
       return send(response, 404, { code: 'not_found', message: '不存在' });
     }
     if (request.method === 'GET' && (url.pathname === '/api/logs' || url.pathname === '/api/logs/problems')) {

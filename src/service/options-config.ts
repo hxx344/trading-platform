@@ -15,6 +15,13 @@ export interface OptionsConfig {
   orderTimeoutSeconds: number;
   feeRate: number;
   marginBufferPct: number;
+  /** The Friday auto-open (off unless set; the options page's switch overrides enabled) and its window. */
+  autoOpen: boolean;
+  openHourUtc: number;
+  openMinuteUtc: number;
+  openWindowSeconds: number;
+  /** One bounded IOC for an opening leg's timed-out remainder (the workbench's ALLOW_MARKET_FALLBACK). */
+  marketFallback: boolean;
 }
 
 const reason = (error: unknown): string => error instanceof ContractError || error instanceof Error ? error.message : '格式错误';
@@ -25,7 +32,7 @@ function bounded(value: unknown, low: number, high: number, name: string, { inte
 
 export function parseOptionsConfig(value: unknown): OptionsConfig {
   let raw: Record<string, unknown>, limits: Record<string, unknown>;
-  try { raw = exactKeys(value, ['accountId', 'limits'], ['legQty', 'strategyMode', 'marginMode', 'orderTimeoutSeconds', 'feeRate', 'marginBufferPct']); } catch (error) { throw new Error(`options 无效：${reason(error)}`); }
+  try { raw = exactKeys(value, ['accountId', 'limits'], ['legQty', 'strategyMode', 'marginMode', 'orderTimeoutSeconds', 'feeRate', 'marginBufferPct', 'autoOpen', 'openHourUtc', 'openMinuteUtc', 'openWindowSeconds', 'marketFallback']); } catch (error) { throw new Error(`options 无效：${reason(error)}`); }
   if (typeof raw.accountId !== 'string' || !/^[1-9]\d{0,19}$/.test(raw.accountId)) throw new Error('options.accountId 须为 Bybit 账户 UID（数字字符串）');
   try { limits = exactKeys(raw.limits, ['maxRiskUsd', 'maxMarginUsd']); } catch (error) { throw new Error(`options.limits 无效（须为 { maxRiskUsd, maxMarginUsd }）：${reason(error)}`); }
   let legQty = '1';
@@ -37,6 +44,7 @@ export function parseOptionsConfig(value: unknown): OptionsConfig {
   if (!STRATEGY_MODES.includes(strategyMode as StrategyMode)) throw new Error('options.strategyMode 须为 iron_condor 或 short_strangle');
   const marginMode = raw.marginMode ?? 'REGULAR_MARGIN';
   if (marginMode !== 'REGULAR_MARGIN' && marginMode !== 'PORTFOLIO_MARGIN') throw new Error('options.marginMode 须为 REGULAR_MARGIN 或 PORTFOLIO_MARGIN');
+  for (const name of ['autoOpen', 'marketFallback'] as const) if (raw[name] !== undefined && typeof raw[name] !== 'boolean') throw new Error(`options.${name} 须为 true / false`);
   return {
     accountId: raw.accountId,
     limits: { maxRiskUsd: bounded(limits.maxRiskUsd, 0, 10_000_000, 'limits.maxRiskUsd', { open: true }), maxMarginUsd: bounded(limits.maxMarginUsd, 0, 10_000_000, 'limits.maxMarginUsd', { open: true }) },
@@ -44,6 +52,11 @@ export function parseOptionsConfig(value: unknown): OptionsConfig {
     orderTimeoutSeconds: raw.orderTimeoutSeconds === undefined ? 600 : bounded(raw.orderTimeoutSeconds, 60, 1_800, 'orderTimeoutSeconds', { integer: true }),
     feeRate: raw.feeRate === undefined ? 0.0003 : bounded(raw.feeRate, 0, 0.01, 'feeRate'),
     marginBufferPct: raw.marginBufferPct === undefined ? 0.10 : bounded(raw.marginBufferPct, 0, 1, 'marginBufferPct'),
+    autoOpen: raw.autoOpen === true,
+    openHourUtc: raw.openHourUtc === undefined ? 21 : bounded(raw.openHourUtc, 0, 23, 'openHourUtc', { integer: true }),
+    openMinuteUtc: raw.openMinuteUtc === undefined ? 0 : bounded(raw.openMinuteUtc, 0, 59, 'openMinuteUtc', { integer: true }),
+    openWindowSeconds: raw.openWindowSeconds === undefined ? 60 : bounded(raw.openWindowSeconds, 1, 300, 'openWindowSeconds', { integer: true }),
+    marketFallback: raw.marketFallback === true,
   };
 }
 
@@ -61,5 +74,6 @@ export function parseOptionsSecrets(value: Record<string, unknown>): LiveCredent
 export function optionsSummary(options: OptionsConfig | undefined): string {
   if (!options) return '';
   const mode = options.strategyMode === 'iron_condor' ? '铁鹰' : '卖出宽跨';
-  return `，期权账户 Bybit ***${options.accountId.slice(-4)}（${mode}，每腿 ${options.legQty}，最大亏损上限 ${options.limits.maxRiskUsd} / 保证金上限 ${options.limits.maxMarginUsd} USD）`;
+  const time = `${String(options.openHourUtc).padStart(2, '0')}:${String(options.openMinuteUtc).padStart(2, '0')}`;
+  return `，期权账户 Bybit ***${options.accountId.slice(-4)}（${mode}，每腿 ${options.legQty}，最大亏损上限 ${options.limits.maxRiskUsd} / 保证金上限 ${options.limits.maxMarginUsd} USD，定时开仓配置${options.autoOpen ? `开（周五 ${time} UTC）` : '关'}${options.marketFallback ? '，IOC 兜底开' : ''}）`;
 }

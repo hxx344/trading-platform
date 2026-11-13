@@ -1,6 +1,6 @@
 // The options engine: plans, execution tasks, the order journal, the tracked strategy and reconciliation. Ported from the
-// workbench (modules/greeks/app trade_tasks.py, engine.py, reconciliation.py, commit 160e932) without its demo mode,
-// RFQ, scheduled auto-open or market fallback (docs/options.md §1). One lock serializes plans, task runs and
+// workbench (modules/greeks/app trade_tasks.py, engine.py, reconciliation.py, commit 160e932) without its demo mode or
+// RFQ (docs/options.md §1); the Friday auto-open and the IOC fallback came in G2a, the fills ledger and the 收益 samples in G2b. One lock serializes plans, task runs and
 // reconciliation as the workbench's engine lock does; a stop never waits for it. Every change to the state document is
 // written before it is acted on, so a restart finds every order the service could have sent.
 import { ContractError } from '../contracts.ts';
@@ -9,7 +9,8 @@ import { describe } from '../live/values.ts';
 import { parseExecution, parsePositions, pmMetrics, readAccountHealth, summarizeGreeks, type AccountHealth, type ExecutionRecord, type PmBaseline, type Position } from './account.ts';
 import type { OptionsClient, Row } from './client.ts';
 import { QUOTE_STALE_MS, isSunday, type ChainSnapshot, type OptionMarket, type OptionRow, type OptionType } from './market.ts';
-import { followOrder, reconcileOrder, roundToTick, type OrderOutcome, type OrderStatus } from './orders.ts';
+import { followOrder, iocOrder, reconcileOrder, roundToTick, type OrderOutcome, type OrderStatus } from './orders.ts';
+import { amountText, buildPerformance, exact, thinPoints, type PerformanceInput, type Sample } from './performance.ts';
 import type { OptionsStore } from './store.ts';
 import { StrategyError, buildStrategy, maximumLoss, reserveShortMargin, validateStructure, type Estimates, type MarginContext, type Preview, type RiskLeg, type Side, type StrategyMode } from './strategy.ts';
 
@@ -20,11 +21,28 @@ export const SAMPLE_MS = 3_000;
 export const MISSING_SETTLE_MS = 120_000;
 /** Past this age "not found" proves nothing (order history is read for the last 7 days by default): it stays unknown. */
 export const MISSING_SETTLE_MAX_AGE_MS = 6 * 24 * 3_600_000;
+/** How often the scheduler looks at the Friday window (the workbench's scheduler loop). */
+export const SCHEDULE_TICK_MS = 5_000;
+/** The workbench's failed_leg_retry_delay_seconds before an IOC fallback. */
+export const FALLBACK_DELAY_MS = 800;
 const HISTORY_LIMIT_MS = 180 * 86_400_000;
 const RETIRE_BUDGET_MS = 120_000;
 const READ_MS = 25_000;
 const EXECUTIONS_KEPT = 100;
 const EPSILON = 1e-9;
+/** 收益 (G2b): one sample a minute per holding (the workbench's default), only on positions read within the last minute. */
+export const PERFORMANCE_SAMPLE_MS = 60_000;
+const POSITIONS_FRESH_MS = 60_000;
+/** A gap longer than three intervals breaks the line. */
+const SAMPLE_GAP_MS = 3 * PERFORMANCE_SAMPLE_MS;
+/** Orders whose recorded fill the ledger lacks, read again per round; each at most every 5 min, within Bybit's 7 days. */
+const BACKFILL_PER_ROUND = 10;
+const BACKFILL_RETRY_MS = 5 * 60_000;
+const BACKFILL_WINDOW_MS = 7 * 86_400_000;
+const GROUP_POINTS = 300;
+const SERIES_POINTS = 1_500;
+/** The closed-position amounts kept with the retirement evidence for the 收益 page (G2b). */
+const EVIDENCE_AMOUNTS = ['totalPnl', 'totalOpenFee', 'totalCloseFee', 'deliveryFee', 'avgEntryPrice'] as const;
 
 export type TaskStatus = 'accepted' | 'running' | 'stopping' | 'recovering' | 'recovery_needed' | 'completed' | 'partial' | 'stopped' | 'failed';
 export const ACTIVE_STATUSES: readonly TaskStatus[] = ['accepted', 'running', 'stopping', 'recovering', 'recovery_needed'];
@@ -50,17 +68,38 @@ export interface Task {
   risk: { legs: Record<string, RiskLeg>; context: MarginContext; budgetUsd: number; reservedUsd: number } | null; riskBlocked: boolean;
   openingGroup: string | null; strategyStatus: 'open' | 'closed' | null; closedAt: number | null; closeReason: string | null;
   closureEvidence: Record<string, Row[]>; error: string | null; notified: string[];
+  /** Admitted by the Friday scheduler: it dispatches only inside the opening window. */
+  scheduled?: boolean;
 }
 export interface JournalEntry {
   taskId: string; symbol: string; side: Side; qty: string; reduceOnly: boolean; tick: string;
   status: OrderStatus; terminal: boolean; filledQty: string; orderId: string; createdAt: number; updatedAt: number; message?: string; price?: string;
+  /** An IOC fallback for a leg's remainder; absent for the book-following order. */
+  kind?: 'ioc';
 }
+/**
+ * The Friday auto-open: enabled is the page's switch (null: config.json decides); lastOpenWeek the ISO week a scheduled
+ * opening was admitted in (once per week); attemptWeek / lastError the last refused attempt, notifiedWeek the week whose
+ * missed opening was sent to Feishu.
+ */
+export interface Schedule { enabled: boolean | null; /** When the page last turned it on (null: config or off). */ enabledAt: number | null; lastOpenWeek: string | null; attemptWeek: string | null; lastError: string | null; lastAttemptAt: number | null; notifiedWeek: string | null }
 export interface OptionsState {
   uid: string; tasks: Record<string, Task>; journal: Record<string, JournalEntry>;
   tracked: { groupId: string | null; sizes: Record<string, string> }; pmBaseline: PmBaseline | null; executions: ExecutionRecord[];
+  /** Added in v0.13 (G2a); a document without it starts with the defaults. */
+  schedule: Schedule;
 }
 
-export interface EngineSettings { maxRiskUsd: number; maxMarginUsd: number; legQty: string; strategyMode: StrategyMode; orderTimeoutMs: number; estimates: Estimates }
+export interface AutoOpenSettings { enabled: boolean; hourUtc: number; minuteUtc: number; windowSeconds: number }
+/** The workbench's defaults: off, Friday 21:00 UTC, a 60 s window. */
+export const DEFAULT_AUTO_OPEN: AutoOpenSettings = { enabled: false, hourUtc: 21, minuteUtc: 0, windowSeconds: 60 };
+export interface EngineSettings {
+  maxRiskUsd: number; maxMarginUsd: number; legQty: string; strategyMode: StrategyMode; orderTimeoutMs: number; estimates: Estimates;
+  /** config.json's auto-open (the page's switch overrides enabled); absent: DEFAULT_AUTO_OPEN. */
+  autoOpen?: AutoOpenSettings;
+  /** The workbench's allow_market_fallback: an opening leg's timed-out remainder gets one bounded IOC. Off by default. */
+  marketFallback?: boolean;
+}
 export interface EngineOptions {
   client: OptionsClient; market: OptionMarket; store: OptionsStore; uid: string; settings: EngineSettings;
   now?: () => number; log?: (line: string) => void; notify?: (text: string) => void;
@@ -83,13 +122,32 @@ export const STATUS_NAMES: Record<TaskStatus, string> = {
 const sortedJson = (value: unknown): string => JSON.stringify(value);
 const legIdentity = (legs: readonly PlanLeg[]): string => sortedJson(legs.map(leg => [leg.symbol, leg.side, leg.qty, leg.expiry, leg.strike, leg.optionType]).sort((a, b) => String(a[0]).localeCompare(String(b[0])) || String(a[1]).localeCompare(String(b[1]))));
 
+const emptySchedule = (): Schedule => ({ enabled: null, enabledAt: null, lastOpenWeek: null, attemptWeek: null, lastError: null, lastAttemptAt: null, notifiedWeek: null });
+
+/** The ISO 8601 week of a UTC time, as the workbench's strftime("%G-W%V"). */
+export function isoWeek(ms: number): string {
+  const date = new Date(ms);
+  const thursday = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 4 - (date.getUTCDay() || 7));
+  const year = new Date(thursday).getUTCFullYear();
+  return `${year}-W${String(Math.floor((thursday - Date.UTC(year, 0, 1)) / 86_400_000 / 7) + 1).padStart(2, '0')}`;
+}
+
 /** Restores the saved document; a missing one starts empty, another account's refuses start. */
 function restore(raw: unknown, uid: string): OptionsState {
-  if (raw === null) return { uid, tasks: {}, journal: {}, tracked: { groupId: null, sizes: {} }, pmBaseline: null, executions: [] };
+  if (raw === null) return { uid, tasks: {}, journal: {}, tracked: { groupId: null, sizes: {} }, pmBaseline: null, executions: [], schedule: emptySchedule() };
   const value = raw as Partial<OptionsState>;
   const record = (item: unknown) => typeof item === 'object' && item !== null && !Array.isArray(item);
   if (!record(value) || typeof value.uid !== 'string' || !record(value.tasks) || !record(value.journal) || !record(value.tracked) || !record(value.tracked!.sizes) || !Array.isArray(value.executions)) throw new Error('期权状态库内容不完整');
   if (value.uid !== uid) throw new Error(`期权状态库属于另一个 Bybit 账户（***${value.uid.slice(-4)}），拒绝启动`);
+  if (value.schedule === undefined) value.schedule = emptySchedule();
+  else {
+    if (!record(value.schedule)) throw new Error('期权状态库的定时开仓记录不完整');
+    const schedule = { ...emptySchedule(), ...value.schedule } as Record<string, unknown>;
+    const text = (key: string) => schedule[key] === null || typeof schedule[key] === 'string';
+    const time = (key: string) => schedule[key] === null || Number.isFinite(schedule[key]);
+    if (![null, true, false].includes(schedule.enabled as boolean | null) || !['lastOpenWeek', 'attemptWeek', 'lastError', 'notifiedWeek'].every(text) || !['enabledAt', 'lastAttemptAt'].every(time)) throw new Error('期权状态库的定时开仓记录不完整');
+    value.schedule = schedule as unknown as Schedule;
+  }
   return value as OptionsState;
 }
 
@@ -106,6 +164,39 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
   let tail: Promise<void> = Promise.resolve();
 
   const save = () => store.save(state);
+  // The fills ledger and the samples (G2b) live in their own tables; v0.14's first start copies in the recent fills.
+  const ledger = new Map(store.executions().map(record => [record.execId, record]));
+  const unarchived = state.executions.filter(record => !ledger.has(record.execId));
+  if (unarchived.length) { store.saveExecutions(unarchived); for (const record of unarchived) ledger.set(record.execId, record); }
+  const samples = store.samples();
+  const backfillAt = new Map<string, number>();
+  let performanceError: string | null = null;
+  const autoOpen = settings.autoOpen ?? DEFAULT_AUTO_OPEN;
+  const autoOpenEnabled = (): boolean => state.schedule.enabled ?? autoOpen.enabled;
+  /** This day's opening time; the window is [start, start + windowSeconds) on a Friday (UTC) and never runs past midnight. */
+  const windowStart = (at: number): number => { const day = new Date(at); return Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), autoOpen.hourUtc, autoOpen.minuteUtc); };
+  const inOpenWindow = (at = now()): boolean => new Date(at).getUTCDay() === 5 && at - windowStart(at) >= 0 && at - windowStart(at) < autoOpen.windowSeconds * 1000;
+  /** The next window start this week's opening has not used yet. */
+  function nextOpenAt(at = now()): number {
+    const day = new Date(at), friday = Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate() + ((5 - day.getUTCDay() + 7) % 7), autoOpen.hourUtc, autoOpen.minuteUtc);
+    const used = state.schedule.lastOpenWeek === isoWeek(friday) || at >= friday + autoOpen.windowSeconds * 1000;
+    return used ? friday + 7 * 86_400_000 : friday;
+  }
+  /** The latest Friday window that has started by `at`, and when it ends (never past that midnight). */
+  function lastWindow(at = now()): { start: number; end: number } {
+    const day = new Date(at), back = (day.getUTCDay() + 2) % 7;
+    let start = Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate() - back, autoOpen.hourUtc, autoOpen.minuteUtc);
+    if (start > at) start -= 7 * 86_400_000;
+    const friday = new Date(start), midnight = Date.UTC(friday.getUTCFullYear(), friday.getUTCMonth(), friday.getUTCDate() + 1);
+    return { start, end: Math.min(start + autoOpen.windowSeconds * 1000, midnight) };
+  }
+  // A state that never ran the scheduler (a first deploy with config.json's autoOpen on) owes no reminder for a window
+  // that had already ended before it existed; a window still open at start is reminded as usual.
+  if (state.schedule.enabled === null && autoOpen.enabled && state.schedule.lastOpenWeek === null && state.schedule.attemptWeek === null && state.schedule.notifiedWeek === null) {
+    const passed = lastWindow();
+    if (now() >= passed.end) state.schedule.notifiedWeek = isoWeek(passed.start);
+  }
+  if (state.schedule.enabled === true) log(`期权定时开仓按页面设置打开（周五 ${String(autoOpen.hourUtc).padStart(2, '0')}:${String(autoOpen.minuteUtc).padStart(2, '0')} UTC）`);
 
   // A restart cannot know where a task stopped: it is stopped, and reconciliation cancels and reads back its orders.
   let restarted = false;
@@ -289,7 +380,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
         const identity = `${openTime}|${closeTime}`;
         if (seen.has(identity) || !(since <= openTime && openTime <= closeTime && closeTime <= end)) continue;
         seen.add(identity);
-        matched.push({ symbol, side, qty: row.qty, openTime: row.openTime, closeTime: row.closeTime });
+        matched.push({ symbol, side, qty: row.qty, openTime: row.openTime, closeTime: row.closeTime, ...Object.fromEntries(EVIDENCE_AMOUNTS.filter(key => row[key] !== undefined).map(key => [key, row[key]])) });
         total += amount;
       }
       if (total + EPSILON >= required) evidence.set(key, matched);
@@ -372,7 +463,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
 
   const taskResponse = (task: Task) => ({ taskId: task.id, status: task.status, operation: task.type, planId: task.planId });
 
-  async function startTask(request: TaskRequest) {
+  async function startTask(request: TaskRequest, { scheduled = false }: { scheduled?: boolean } = {}) {
     const fingerprint = sortedJson([request.planId, request.requestId, request.confirmLive, request.minNetIncomeUsd ?? null, request.maxNetCostUsd ?? null]);
     for (const task of Object.values(state.tasks)) {
       if (task.requestId !== request.requestId) continue;
@@ -417,6 +508,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
         if (final !== legIdentity(plan.legs)) conflict('strategy_changed', '选中的合约变了，请重新生成并确认计划');
       }
       for (const leg of plan.legs) if (legIdentity([planLeg(leg.symbol, leg.side, leg.qty)]) !== legIdentity([leg])) conflict('instrument_changed', '已确认合约的参数变了，请重新生成计划');
+      if (scheduled && (shutdown || plan.operation !== 'open' || !inOpenWindow())) conflict('window_closed', shutdown ? '服务正在停止，本次定时开仓不受理' : '定时开仓窗口已结束');
       freshSnapshot();
       const id = newId().slice(0, 16), accepted = now();
       const task: Task = {
@@ -431,8 +523,11 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
         netBlocked: false, reserved: null, risk, riskBlocked: false,
         openingGroup: plan.operation === 'close' ? state.tracked.groupId : null, strategyStatus: plan.operation === 'open' ? 'open' : null,
         closedAt: null, closeReason: null, closureEvidence: {}, error: null, notified: [],
+        ...(scheduled ? { scheduled: true } : {}),
       };
       state.tasks[id] = task;
+      // The week is used in the same write that admits the task: a restart never opens twice in one week.
+      if (scheduled) Object.assign(state.schedule, { lastOpenWeek: isoWeek(accepted), lastError: null });
       save(); // Durable admission precedes dispatch.
       announce(task);
       const worker = locked(() => runTask(id)).finally(() => workers.delete(id));
@@ -573,6 +668,8 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     save();
   }
 
+  const linksOf = (task: Task): string[] => [...new Set([...task.links, ...Object.entries(state.journal).filter(([, entry]) => entry.taskId === task.id).map(([link]) => link)])];
+
   async function runLeg(task: Task, leg: PlanLeg, link: string): Promise<OrderOutcome> {
     checkStop(task);
     const row = rowOf(leg.symbol);
@@ -591,6 +688,48 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     });
   }
 
+  /**
+   * The workbench's _market_fallback for an opening leg whose order ended partly filled or unfilled: after a short delay
+   * the original is read again without cancelling (a late fill counts first), and only a terminal one's remainder, if it
+   * meets the lot limits, gets one IOC at the far side of the book, reserved against the net and risk limits like every
+   * price. A closing, a stopped task or a blocked one never falls back. The leg's combined outcome is returned.
+   */
+  async function legWithFallback(task: Task, leg: PlanLeg, link: string, index: number): Promise<OrderOutcome> {
+    const outcome = await runLeg(task, leg, link);
+    if (!settings.marketFallback || task.type !== 'open' || (outcome.status !== 'partial' && outcome.status !== 'timeout_cancelled')) return outcome;
+    const entry = state.journal[link]!;
+    try {
+      if (task.netBlocked || task.riskBlocked) return outcome;
+      await pause(task, FALLBACK_DELAY_MS);
+      const previous: OrderOutcome = { orderId: entry.orderId, status: entry.status, terminal: entry.terminal, filledQty: entry.filledQty, ...(entry.price ? { price: entry.price } : {}) };
+      const confirmed = await reconcileOrder(client, { ...entry, link }, previous, false, { record: item => recordOrder(link, item), sleep, log });
+      // A read that failed proves nothing new: the order stays as it ended, and nothing more is sent.
+      if (!confirmed.terminal) return { ...outcome, message: '兜底前未能再次读到原订单，未发 IOC 兜底' };
+      recordOrder(link, confirmed);
+      const remaining = sub(leg.qty, confirmed.filledQty);
+      if (cmp(remaining, '0') <= 0) return confirmed;
+      const row = rowOf(leg.symbol);
+      if (!row) return { ...confirmed, message: `合约 ${leg.symbol} 已不在最新行情里，未发 IOC 兜底` };
+      if (cmp(remaining, row.minQty) < 0 || cmp(remaining, row.maxQty) > 0 || !isMultiple(sub(remaining, row.minQty), row.qtyStep)) return { ...confirmed, message: '剩余数量不符合交易所下单步长，未发 IOC 兜底' };
+      checkStop(task);
+      const iocLink = `tpo-ioc-${task.id}-${index}`;
+      if (state.journal[iocLink]) throw new Error('IOC 订单编号已用过，只能核对不能重发');
+      const created = now();
+      state.journal[iocLink] = { taskId: task.id, symbol: leg.symbol, side: leg.side, qty: remaining, reduceOnly: false, tick: row.tick, status: 'unknown', terminal: false, filledQty: '0', orderId: '', createdAt: created, updatedAt: created, kind: 'ioc' };
+      save();
+      log(`期权任务 ${task.id}：${leg.symbol} 剩余 ${remaining}，尝试 IOC 兜底（先核对净价与风险限制）`);
+      const ioc = await iocOrder(client, { symbol: leg.symbol, side: leg.side, qty: remaining, link: iocLink, reduceOnly: false, tick: row.tick }, {
+        checkStop: () => checkStop(task),
+        checkPrice: price => reservePrice(task, iocLink, leg.symbol, price),
+        record: item => recordOrder(iocLink, item),
+        sleep, log,
+      });
+      const filled = add(confirmed.filledQty, ioc.filledQty);
+      const status: OrderStatus = !ioc.terminal ? 'unknown' : cmp(filled, leg.qty) === 0 ? 'filled' : isZero(filled) ? 'timeout_cancelled' : 'partial';
+      return { orderId: confirmed.orderId, status, terminal: ioc.terminal, filledQty: filled, ...(ioc.message ? { message: `IOC 兜底：${ioc.message}` } : {}) };
+    } catch (error) { return { ...outcome, message: `IOC 兜底中断：${describe(error)}` }; }
+  }
+
   async function runTask(id: string): Promise<void> {
     const task = state.tasks[id]!;
     let error: string | null = null, done = false;
@@ -600,27 +739,28 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
         checkStop(task);
         Object.assign(task, { status: 'running', startedAt: now() });
         save();
+        if (task.scheduled && !inOpenWindow()) throw new Error('定时开仓窗口在下单前已结束，未下单');
         freshSnapshot();
         const legs = Object.values(task.legs);
         sampler = (async () => {
           while (!done) {
             await new Promise<void>(resolve => { const timer = setTimeout(resolve, sampleMs); timer.unref?.(); });
             if (done) break;
-            try { await loadExecutions(task.links); } catch (failure) { log(`期权成交明细刷新失败：${describe(failure)}`); }
+            try { await loadExecutions(linksOf(task)); } catch (failure) { log(`期权成交明细刷新失败：${describe(failure)}`); }
           }
         })();
         // Buys before sells: an opening's wings fill before its short legs go out, a closing buys its shorts back before
         // selling the wings, so a stop, a limit or a timeout can never leave a short leg without its wing. A sell goes
         // out only when every buy filled in full; a short strangle (sells only) or its closing (buys only) is one round.
-        const indexed = legs.map((leg, index) => ({ leg, link: task.links[index]! }));
-        const round = (side: 'Buy' | 'Sell') => Promise.allSettled(indexed.filter(item => item.leg.side === side).map(item => runLeg(task, item.leg, item.link)));
+        const indexed = legs.map((leg, index) => ({ leg, link: task.links[index]!, index }));
+        const round = (side: 'Buy' | 'Sell') => Promise.allSettled(indexed.filter(item => item.leg.side === side).map(item => legWithFallback(task, item.leg, item.link, item.index)));
         const results = await round('Buy');
         const errors: string[] = [];
         if (results.every(result => result.status === 'fulfilled' && result.value.status === 'filled')) results.push(...await round('Sell'));
         else if (indexed.some(item => item.leg.side === 'Sell')) errors.push('买入腿未全部成交，卖出腿未下单（避免留下无保护的卖出）');
         errors.unshift(...results.flatMap(result => result.status === 'rejected' ? [describe(result.reason)] : result.value.message && result.value.status !== 'filled' ? [result.value.message] : []));
         if (errors.length) error = [...new Set(errors)].join('；');
-        try { await loadExecutions(task.links); } catch (failure) { log(`期权成交明细刷新失败：${describe(failure)}`); }
+        try { await loadExecutions(linksOf(task)); } catch (failure) { log(`期权成交明细刷新失败：${describe(failure)}`); }
       } catch (failure) {
         error = describe(failure);
         log(`期权任务 ${id}：${error}`);
@@ -660,7 +800,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
   function announce(task: Task): void {
     const tag = task.status;
     if (task.notified.includes(tag) || !['accepted', 'recovery_needed', 'completed', 'partial', 'stopped', 'failed'].includes(tag)) return;
-    const what = `期权${OPERATION_NAMES[task.type]}任务 ${task.id}`;
+    const what = `期权${task.scheduled ? '定时' : ''}${OPERATION_NAMES[task.type]}任务 ${task.id}`;
     const text = tag === 'accepted' ? `${what} 已确认：${Object.keys(task.legs).join('、')}`
       : tag === 'recovery_needed' ? `${what} 有订单状态未确认，已停止自动重试，对账循环会继续核对；请到交易所核对订单`
       : `${what} 结束：${STATUS_NAMES[tag]}${task.error ? `（${task.error}）` : ''}`;
@@ -677,12 +817,14 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     } catch (error) { log(`开仓前组合保证金基线读取失败：${describe(error)}`); }
   }
 
-  async function loadExecutions(links: readonly string[]): Promise<void> {
+  /** Reads the fills of the given orders into the ledger and the recent list; answers how many reads failed. */
+  async function loadExecutions(links: readonly string[]): Promise<number> {
     const signal = AbortSignal.timeout(READ_MS);
     const groups = await Promise.allSettled([...new Set(links)].map(link => client.executions(link, signal)));
     const records: ExecutionRecord[] = [];
+    let failed = 0;
     for (const group of groups) {
-      if (group.status === 'rejected') { log(`部分期权成交明细读取失败，保留已有记录：${describe(group.reason)}`); continue; }
+      if (group.status === 'rejected') { failed += 1; log(`部分期权成交明细读取失败，保留已有记录：${describe(group.reason)}`); continue; }
       for (const row of group.value) {
         const record = parseExecution(row);
         const owner = Object.hasOwn(state.journal, record.orderLinkId) ? state.journal[record.orderLinkId] : undefined;
@@ -694,13 +836,59 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
         records.push({ ...record, reduceOnly, taskId: task?.id ?? null, openingGroup: task?.openingGroup ?? null, chainPrice, chainPriceDiff });
       }
     }
-    if (!records.length) return;
+    if (!records.length) return failed;
+    const changed = records.filter(record => sortedJson(ledger.get(record.execId)) !== sortedJson(record));
+    if (changed.length) { store.saveExecutions(changed); for (const record of changed) ledger.set(record.execId, record); }
     const merged = new Map(state.executions.map(item => [item.execId, item]));
     for (const record of records) merged.set(record.execId, record);
     const next = [...merged.values()].sort((a, b) => b.execTime - a.execTime).slice(0, EXECUTIONS_KEPT);
-    if (sortedJson(next) === sortedJson(state.executions)) return;
+    if (sortedJson(next) === sortedJson(state.executions)) return failed;
     state.executions = next;
     save();
+    return failed;
+  }
+
+  // ---- 收益 (G2b) ------------------------------------------------------------------------------------------------
+  function performanceInput(at: number): PerformanceInput {
+    const fresh = positions !== null && at - positions.at >= 0 && at - positions.at <= POSITIONS_FRESH_MS ? positions.rows : null;
+    return { groups: state.tasks, executions: [...ledger.values()], journal: state.journal, positions: fresh, samples, sampleSeconds: PERFORMANCE_SAMPLE_MS / 1000 };
+  }
+
+  /**
+   * Every 15 s: reads again the fills of finished orders the ledger lacks (a restart or a recovery ended them without a
+   * read), then records one mark-to-market sample a minute for each valued holding before its expiry. A failed read or
+   * an unvalued holding records nothing; the chart shows the gap.
+   */
+  async function performanceTick(): Promise<void> {
+    if (shutdown) return;
+    const errors: string[] = [];
+    try {
+      const archived = new Map<string, bigint>();
+      for (const record of ledger.values()) archived.set(record.orderLinkId, (archived.get(record.orderLinkId) ?? 0n) + exact(record.execQty));
+      const at = now();
+      const missing = Object.entries(state.journal)
+        .filter(([link, entry]) => entry.terminal && at - entry.createdAt <= BACKFILL_WINDOW_MS && at - (backfillAt.get(link) ?? -Infinity) >= BACKFILL_RETRY_MS && exact(entry.filledQty) > (archived.get(link) ?? 0n))
+        .sort(([, a], [, b]) => b.createdAt - a.createdAt).slice(0, BACKFILL_PER_ROUND).map(([link]) => link);
+      for (const link of missing) backfillAt.set(link, at);
+      if (missing.length && await loadExecutions(missing)) errors.push('部分订单的成交明细补读失败，下次再读');
+    } catch (error) { errors.push(`成交明细补读失败：${describe(error)}`); }
+    try {
+      const at = now();
+      // Status, value and expiry do not depend on the samples, so this build skips them; its cost stays flat as they grow.
+      for (const row of buildPerformance({ ...performanceInput(at), samples: new Map() }).groups) {
+        if (row.status !== 'open' || row.markToMarketPnl === null || row.expiry === null || at >= row.expiry) continue;
+        const history = samples.get(row.id) ?? [];
+        const last = history.at(-1);
+        if (last && at - last.time < PERFORMANCE_SAMPLE_MS) continue;
+        const sample: Sample = { time: at, pnl: amountText(exact(row.markToMarketPnl)) };
+        store.addSample(row.id, sample);
+        history.push(sample);
+        samples.set(row.id, history);
+      }
+    } catch (error) { errors.push(`持仓盈亏采样失败，保留已有采样：${describe(error)}`); }
+    const message = errors.length ? errors.join('；') : null;
+    if (message && message !== performanceError) log(`期权收益：${message}`);
+    performanceError = message;
   }
 
   // ---- reconciliation --------------------------------------------------------------------------------------------
@@ -722,6 +910,58 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
       if (positionsError) errors.push(positionsError);
       reconciliation = { error: errors.length ? [...new Set(errors)].join('；') : null, lastSuccessAt: errors.length ? reconciliation.lastSuccessAt : now() };
     });
+  }
+
+  // ---- Friday auto-open -------------------------------------------------------------------------------------------
+  /**
+   * The workbench's scheduler: inside the Friday window, once per ISO week, a plan with the configured quantity and
+   * structure and its default net limit is confirmed under request id scheduled-<week>. A refusal (a task or order still
+   * open, a tracked strategy, a stale market, a limit) is tried again on the next tick while the window lasts; a week
+   * whose window passed without an admitted opening sends one Feishu message.
+   */
+  async function autoOpenTick(): Promise<void> {
+    const at = now(), week = isoWeek(at), schedule = state.schedule;
+    if (autoOpenEnabled() && !shutdown && inOpenWindow(at) && schedule.lastOpenWeek !== week) {
+      try {
+        const plan = await createPlan({ operation: 'open' });
+        await startTask({ planId: plan.planId, requestId: `scheduled-${week}`, confirmLive: true }, { scheduled: true });
+        log(`期权定时开仓已确认（${week}）`);
+      } catch (error) {
+        const message = describe(error);
+        if (schedule.attemptWeek !== week || schedule.lastError !== message) log(`期权定时开仓未执行（${week}）：${message}`);
+        Object.assign(schedule, { attemptWeek: week, lastError: message, lastAttemptAt: now() });
+        save();
+      }
+      return;
+    }
+    // Once per missed week, whether or not a check ran in the window (the service down, a window shorter than a tick);
+    // not for a week whose window had passed before the page turned it on.
+    const last = lastWindow(at), missed = isoWeek(last.start);
+    if (autoOpenEnabled() && at >= last.end && schedule.lastOpenWeek !== missed && schedule.notifiedWeek !== missed && ((schedule.enabledAt ?? -Infinity) <= last.start || schedule.attemptWeek === missed)) {
+      try {
+        notify(`期权定时开仓未执行（${missed}）：${schedule.attemptWeek === missed ? schedule.lastError ?? '原因未知' : '窗口内没有执行检查（服务没在运行，或窗口短于 5 秒的检查间隔）'}`);
+        schedule.notifiedWeek = missed;
+        save();
+      } catch (error) { log(`期权飞书通知未能写入：${describe(error)}`); }
+    }
+  }
+
+  /** The page's switch; it outlives restarts and overrides config.json until changed again. */
+  function setAutoOpen(enabled: boolean) {
+    state.schedule.enabled = enabled;
+    state.schedule.enabledAt = enabled ? now() : null;
+    save();
+    log(`期权定时开仓已在页面${enabled ? '开启' : '关闭'}`);
+    return scheduleView();
+  }
+  function scheduleView() {
+    const schedule = state.schedule;
+    return {
+      enabled: autoOpenEnabled(), source: schedule.enabled === null ? 'config' as const : 'page' as const, configEnabled: autoOpen.enabled,
+      hourUtc: autoOpen.hourUtc, minuteUtc: autoOpen.minuteUtc, windowSeconds: autoOpen.windowSeconds, marketFallback: settings.marketFallback ?? false,
+      nextAt: nextOpenAt(), inWindow: inOpenWindow(), waiting: inOpenWindow() && schedule.lastOpenWeek !== isoWeek(now()), lastOpenWeek: schedule.lastOpenWeek,
+      lastError: schedule.attemptWeek === isoWeek(now()) && schedule.attemptWeek !== schedule.lastOpenWeek ? { week: schedule.attemptWeek, message: schedule.lastError, at: schedule.lastAttemptAt } : null,
+    };
   }
 
   async function refreshHealth(): Promise<void> {
@@ -760,7 +1000,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
       settings: { maxRiskUsd: settings.maxRiskUsd, maxMarginUsd: settings.maxMarginUsd, legQty: settings.legQty, strategyMode: settings.strategyMode, orderTimeoutSeconds: settings.orderTimeoutMs / 1000, feeRate: settings.estimates.feeRate, marginBufferPct: settings.estimates.marginBufferPct, marginMode: settings.estimates.marginMode },
       account: `***${uid.slice(-4)}`,
       busy: admitting || held || Object.values(state.tasks).some(task => isActive(task.status)),
-      tasks, orders,
+      tasks, orders, schedule: scheduleView(),
       tracked: { groupId: state.tracked.groupId, legs: Object.entries(state.tracked.sizes).map(([key, size]) => ({ symbol: key.slice(0, key.lastIndexOf('|')), side: key.slice(key.lastIndexOf('|') + 1), size })), mode: state.tracked.groupId ? state.tasks[state.tracked.groupId]?.mode ?? null : null },
       positions: positions ? { rows: positions.rows, at: positions.at } : null, positionsError,
       greeks: summarizeGreeks(positions?.rows ?? null, snapshot?.greeks ?? new Map(), { marketAt: snapshot?.at ?? null, now: now(), staleMs: QUOTE_STALE_MS }),
@@ -771,6 +1011,21 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     };
   }
 
-  return { createPlan, startTask, stopTask, reconcileOnce, refreshHealth, close, marketView, previewView, stateView, state: () => state };
+  /** The 收益 page: every opening with its amounts, samples and fills, and the per-currency curve of those held to expiry. */
+  function performanceView() {
+    const at = now();
+    const report = buildPerformance(performanceInput(at));
+    let firstAt: number | null = null;
+    for (const record of ledger.values()) if (firstAt === null || record.execTime < firstAt) firstAt = record.execTime;
+    return {
+      account: `***${uid.slice(-4)}`, sampleSeconds: PERFORMANCE_SAMPLE_MS / 1000, unassignedCloses: report.unassignedCloses,
+      groups: report.groups.map(group => ({ ...group, samples: thinPoints(group.samples, GROUP_POINTS, SAMPLE_GAP_MS, point => point.pnl) })),
+      series: report.series.map(series => ({ ...series, points: thinPoints(series.points, SERIES_POINTS, SAMPLE_GAP_MS, point => point.cumulative) })),
+      ledger: { count: ledger.size, firstAt },
+      positionsAt: positions?.at ?? null, error: performanceError,
+    };
+  }
+
+  return { createPlan, startTask, stopTask, reconcileOnce, refreshHealth, autoOpenTick, setAutoOpen, performanceTick, close, marketView, previewView, stateView, performanceView, state: () => state };
 }
 export type OptionsEngine = ReturnType<typeof createOptionsEngine>;

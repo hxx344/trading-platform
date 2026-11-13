@@ -2,7 +2,7 @@
 // from the workbench's OrderExecutor (orders.py, commit 160e932): a GTC limit at bid 1 for a buy and ask 1 for a sell,
 // rounded half up to the tick, amended whenever that price moves, looked at every poll; at the deadline, on a stop or on
 // any error the order is cancelled and read back up to five times. An order neither list knows stays unknown, unless the
-// caller says it may settle: see reconcileOrder.
+// caller says it may settle: see reconcileOrder. iocOrder is the optional bounded fallback for an opening leg's remainder.
 import { VenueError } from '../connector.ts';
 import { cmp, decimal, fromUnits, units } from '../decimal.ts';
 import { describe } from '../live/values.ts';
@@ -26,6 +26,16 @@ export function roundToTick(value: unknown, tick: string): string | null {
   const unit = units(tick);
   if (unit <= 0n) return null;
   const steps = (price * 2n + unit) / (2n * unit);
+  return steps > 0n ? fromUnits(steps * unit) : null;
+}
+
+/** Down (a buy's IOC at ask 1) or up (a sell's at bid 1) to the tick, never past the book; null as roundToTick. */
+export function toTick(value: unknown, tick: string, direction: 'down' | 'up'): string | null {
+  let price: bigint;
+  try { price = units(decimal(typeof value === 'number' ? String(value) : value, 'positive')); } catch { return null; }
+  const unit = units(tick);
+  if (unit <= 0n) return null;
+  const steps = direction === 'down' ? price / unit : (price + unit - 1n) / unit;
   return steps > 0n ? fromUnits(steps * unit) : null;
 }
 
@@ -139,6 +149,52 @@ export async function followOrder(client: OptionsClient, spec: OrderSpec, hooks:
     else if (!attempted) outcome = { ...outcome, status: 'not_submitted', terminal: true, message: '没有可用的盘口价，未下单' };
   } catch (error) {
     hooks.log(`期权订单 ${spec.link} 执行中断：${describe(error)}`);
+    outcome = attempted ? await reconcileOrder(client, spec, outcome, true, hooks) : { ...outcome, status: 'not_submitted', terminal: true };
+    outcome = { ...outcome, message: describe(error) };
+  }
+  hooks.record(outcome);
+  return outcome;
+}
+
+export interface IocHooks extends ReconcileHooks {
+  checkStop(): void;
+  /** Reserves the IOC price against the task's limits; a throw sends nothing. */
+  checkPrice(price: number): void;
+}
+
+/**
+ * The workbench's bounded IOC fallback (orders.py, market=True): one limit IOC at ask 1 (a buy, rounded down to the tick)
+ * or bid 1 (a sell, rounded up), reserved against the task's limits first, then read back without cancelling and, if
+ * still open, cancelled and read back. Never re-sent.
+ */
+export async function iocOrder(client: OptionsClient, spec: OrderSpec, hooks: IocHooks): Promise<OrderOutcome> {
+  let outcome: OrderOutcome = { orderId: '', status: 'unknown', terminal: false, filledQty: '0' };
+  let attempted = false;
+  try {
+    hooks.checkStop();
+    const ticker = await client.ticker(spec.symbol, AbortSignal.timeout(CALL_MS));
+    hooks.checkStop();
+    const price = toTick(spec.side === 'Buy' ? ticker?.ask1Price : ticker?.bid1Price, spec.tick, spec.side === 'Buy' ? 'down' : 'up');
+    if (price === null) outcome = { ...outcome, status: 'not_submitted', terminal: true, message: '没有可用的对手价，未发 IOC 兜底' };
+    else {
+      hooks.checkPrice(Number(price));
+      hooks.checkStop();
+      // Set before the create is awaited: a lost answer can hide an accepted order.
+      attempted = true;
+      try {
+        const answer = await client.create({ symbol: spec.symbol, side: spec.side, qty: spec.qty, price, link: spec.link, reduceOnly: spec.reduceOnly, timeInForce: 'IOC' }, AbortSignal.timeout(CALL_MS));
+        if (typeof answer.orderId === 'string') outcome.orderId = answer.orderId;
+      } catch (error) {
+        if (error instanceof VenueError && (error.kind === 'rejected' || error.kind === 'not-sent')) attempted = false;
+        throw error;
+      }
+      outcome.price = price;
+      hooks.record(outcome);
+      outcome = await reconcileOrder(client, spec, outcome, false, hooks);
+      if (!outcome.terminal) outcome = await reconcileOrder(client, spec, outcome, true, hooks);
+    }
+  } catch (error) {
+    hooks.log(`期权 IOC 兜底 ${spec.link} 中断：${describe(error)}`);
     outcome = attempted ? await reconcileOrder(client, spec, outcome, true, hooks) : { ...outcome, status: 'not_submitted', terminal: true };
     outcome = { ...outcome, message: describe(error) };
   }

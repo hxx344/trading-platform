@@ -146,11 +146,15 @@ test('planOptions adds the account once and never overwrites', () => {
   noSecrets(JSON.stringify(item));
 
   // Workbench settings with no counterpart here are named in the notes when they differ from ours.
-  const tuned = ready(optionsCandidate({ ...LIVE, OPTION_MAX_IM_FACTOR: '0.15', OPTION_MM_FACTOR: '0.03', ALLOW_MARKET_FALLBACK: 'true' }, state()));
-  const tunedNotes: string[] = [];
-  planOptions(tuned, { pairs: [] }, { accounts: {} }, () => undefined, tunedNotes);
-  assert.match(tunedNotes.join(), /不导入.*OPTION_MAX_IM_FACTOR=0.15、ALLOW_MARKET_FALLBACK=true$/);
-  assert.doesNotMatch(tunedNotes.join(), /OPTION_MM_FACTOR/);
+  // The opening time and the IOC fallback come over (G2a); the auto-open switch never does.
+  const tuned = ready(optionsCandidate({ ...LIVE, OPTION_MAX_IM_FACTOR: '0.15', OPTION_MM_FACTOR: '0.03', ALLOW_MARKET_FALLBACK: 'true', OPEN_HOUR_UTC: '20', OPEN_MINUTE_UTC: '30', OPEN_WINDOW_SECONDS: '120' }, state()));
+  const tunedNotes: string[] = [], tunedConfig: Record<string, unknown> = { pairs: [] };
+  planOptions(tuned, tunedConfig, { accounts: {} }, () => undefined, tunedNotes);
+  assert.match(tunedNotes.join(), /不导入.*OPTION_MAX_IM_FACTOR=0.15$/);
+  assert.doesNotMatch(tunedNotes.join(), /OPTION_MM_FACTOR|ALLOW_MARKET_FALLBACK=/);
+  assert.match(tunedNotes.join(), /定时开仓在配置里是关闭的（时间沿用周五 20:30 UTC）.*沿用那次的页面设置.*IOC 兜底已按工作台打开/);
+  assert.deepEqual(tunedConfig.options, { accountId: UID, limits: { maxRiskUsd: 2500, maxMarginUsd: 2500 }, openHourUtc: 20, openMinuteUtc: 30, openWindowSeconds: 120, marketFallback: true });
+  assert.match(ready(optionsCandidate({ ...LIVE, OPEN_HOUR_UTC: '24' }, state())).problem ?? '', /openHourUtc/);
 
   const again = planOptions(source, config, secrets, () => undefined, []);
   assert.deepEqual([again.status, again.detail], ['skipped', '已在本项目配置中，保留现有设置']);

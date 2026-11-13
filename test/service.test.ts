@@ -550,12 +550,25 @@ test('服务进程：本机页面只含 ASTER 部分，状态接口可读，用�
     assert.ok((await get('/api/logs/problems')).body.items.every((row: { level: string }) => row.level !== 'info'));
     assert.equal((await get('/api/logs?before=abc')).status, 400);
     assert.equal((await get('/api/logs?limit=201')).status, 400);
+    // The summary interval from the page: login and the page's header required, the value checked, kept in the status.
+    const post = async (path: string, body: unknown, headers: Record<string, string> = { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }) => {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, { method: 'POST', headers, body: JSON.stringify(body) });
+      return { status: response.status, body: await response.json() as Record<string, unknown> };
+    };
+    assert.equal((await post('/api/summary/interval', { intervalMinutes: 30 }, { 'content-type': 'application/json', 'x-pa-executor': '1' })).status, 401);
+    assert.equal((await post('/api/summary/interval', { intervalMinutes: 30 }, { cookie, 'content-type': 'application/json' })).status, 403);
+    assert.equal((await post('/api/summary/interval', { intervalMinutes: '30' })).status, 400);
+    assert.equal((await post('/api/summary/interval', { intervalMinutes: 30, extra: 1 })).status, 400);
+    const saved = await post('/api/summary/interval', { intervalMinutes: 30 });
+    assert.deepEqual([saved.status, saved.body.intervalMinutes, saved.body.fromPage, saved.body.enabled], [200, 30, true, false], '没有机器人时保存间隔但不发送');
+    assert.deepEqual([(await post('/api/summary/send', {})).status, (await post('/api/summary/send', {})).body.code], [400, 'summary_no_robot']);
     const status = (await get('/api/status')).body;
     assert.equal(status.health.schemaVersion, 4, '主库结构不变');
     assert.deepEqual(status.health.loops.map((loop: { name: string }) => loop.name).sort(), ['ADL 循环', '划转循环', '历史清理', '持仓读取'].sort());
     assert.equal(status.budget.limitPerMinute, parseServiceConfig(configRaw()).budget.limitPerMinute);
     assert.deepEqual(status.streams.map((row: { account: string; connected: boolean }) => [row.account, row.connected]), [[`***${LONG.user.slice(-4)}`, true], [`***${SHORT.user.slice(-4)}`, true]]);
     assert.deepEqual([status.feishu.configured, status.samples], [false, { available: true, error: null }]);
+    assert.deepEqual([status.summary.intervalMinutes, status.summary.fromPage, status.summary.robot], [30, true, null]);
     assert.doesNotMatch(JSON.stringify(status), new RegExp(LONG.user.slice(2, 20), 'i'), '状态里不出现完整账户地址');
     const balances = await get('/api/transfer-pairs/p1/balances?range=6h');
     assert.deepEqual([balances.status, balances.body.range, balances.body.points], [200, '6h', []]);

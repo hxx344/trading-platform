@@ -159,3 +159,16 @@
 **验证**：`scripts/dev-monitor.ts` 替身行情下在浏览器里切换对比合约、图表标签、时间范围、展开来源、悬停提示；DOM 内只有 `svg-plot` 提示框的 CSSOM 定位。
 
 **回滚**：`sudo bash install.sh --version v0.10.0`（先删掉 `config.json` 的 `monitor`）。
+## 定时摘要间隔在设置页修改（v0.10.1）
+
+**对照的工作台页面**：工作台的定时通知间隔只在环境变量里改；表单照本服务「配对设置」的写法（`pair-settings-form form-stack` + `settings-form-grid`、字段下方 `small` 提示、错误在按钮上方、成功在按钮旁），外层用 `execution-live-state` 留边距。
+
+**页面**
+
+- 设置页在「从工作台导入」下加「飞书定时运行摘要」：间隔（分钟，0 关闭）、「保存间隔」（没改不可点）、「立即发送一张」（未配置机器人或已关闭时不可点）、「撤销修改」。右上角写发往定时机器人还是告警机器人。
+- 保存后页面的值优先于 `config.json` 的 `summary.intervalMinutes`，重启后保留；下一张在一个间隔之后。立即发送在几秒内发出（服务刚启动约 2 分钟内会等持仓与余额读到），之后按间隔继续。
+- 运行状态页的摘要面板写出间隔来自页面还是 `config.json`，「最近成功」后写发到了哪个机器人。
+
+**接口**：`POST /api/summary/interval`（`{"intervalMinutes": n}`，0–1440 整数）、`POST /api/summary/send`（`{}`），都要登录与页面请求标记，返回摘要状态。
+
+**回滚**：`sudo bash install.sh --version v0.10.0`。页面设置的间隔存在 `notify.sqlite` 新加的列里，v0.10.0 不读，回滚后按 `config.json` 的间隔发送。

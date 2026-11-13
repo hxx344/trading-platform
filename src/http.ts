@@ -61,6 +61,8 @@ export interface ServiceViews {
   monitor?: { state(): unknown; anthropicQuote(): unknown; anthropicCandles(days: number | null): unknown };
   /** The service's log lines, newest first (service-log.ts); `before` is the last id of the previous page. */
   logs?(filter: 'all' | 'problems', before: number | null, limit: number): unknown;
+  /** The scheduled summary card (summary.ts): the page's interval and a card now; both answer with its status. */
+  summary?: { setInterval(minutes: number): unknown; sendNow(): unknown };
 }
 
 /** accessToken is exchanged once per browser at /login; session is the cookie value and the executor session id. */
@@ -256,6 +258,13 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     }
     const adlHistory = request.method === 'GET' ? ADL_HISTORY_PATH.exec(url.pathname) : null;
     if (adlHistory) return send(response, 200, executor.adlHistory(adlHistory[1]!, parsePage(url.searchParams.get('before'), url.searchParams.get('limit'), ADL_PAGE_MAX, 10)));
+    if (request.method === 'POST' && (url.pathname === '/api/summary/interval' || url.pathname === '/api/summary/send')) {
+      if (!views?.summary) return send(response, 404, { code: 'not_found', message: '本服务没有定时运行摘要' });
+      if (url.pathname === '/api/summary/send') { exactKeys(await readJson(request), []); return send(response, 200, views.summary.sendNow()); }
+      const { intervalMinutes } = exactKeys(await readJson(request), ['intervalMinutes']);
+      if (typeof intervalMinutes !== 'number') return send(response, 400, { code: 'summary_interval', message: '间隔须为整数分钟' });
+      return send(response, 200, views.summary.setInterval(intervalMinutes));
+    }
     if (url.pathname === '/api/import') {
       if (!imports) return send(response, 404, { code: 'not_found', message: '本服务没有开启页面导入' });
       if (request.method === 'GET') return send(response, 200, { result: imports.latest() });

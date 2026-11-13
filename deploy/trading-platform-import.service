@@ -10,6 +10,8 @@ Description=统一交易平台：从工作台导入配对（页面请求）
 
 [Service]
 Type=oneshot
+# The same proxy settings as the service: importing the options account reads its Bybit account once.
+EnvironmentFile=-@CONF_DIR@/environment
 ExecStart=@FLOCK@ -w 100 @APP_DIR@/.install.lock @NODE@ @APP_DIR@/current/src/service/import-helper.ts --dir @IMPORT_DIR@ --config @CONF_DIR@/config.json --data-dir @DATA_DIR@ --workbench-env @WORKBENCH_ENV@ --unit trading-platform.service
 ExecStopPost=@FLOCK@ -w 60 @APP_DIR@/.install.lock @NODE@ @APP_DIR@/current/src/service/import-helper.ts --recover --dir @IMPORT_DIR@ --config @CONF_DIR@/config.json --data-dir @DATA_DIR@ --unit trading-platform.service
 TimeoutStartSec=720

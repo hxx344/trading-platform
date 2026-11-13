@@ -8,8 +8,12 @@
 // execution_accounts, decrypted with <data>/credentials.key (read the same way, as the database's owner). Only then: --oil
 // alone imports the oil accounts only, --oil --pairs id,id both.
 //
+// With --options it also brings the workbench Greeks module's Bybit key and risk settings over (import-options.ts); it
+// reads the module's .env and engine_state.json and asks Bybit once for the key's account UID. Like --oil, alone it
+// imports no pair.
+//
 //   node import-workbench.ts --config /etc/trading-platform/config.json [--workbench-env FILE] [--workbench-data DIR]
-//                            [--pairs id,id] [--oil] [--dry-run]
+//                            [--pairs id,id] [--oil] [--options] [--dry-run]
 //
 // An existing config.json is extended: its pairs, accounts and robot stay as they are, and only pairs it does not have
 // yet are added; an oil venue it already names keeps its settings. Output names pairs, account names and masked account
@@ -27,6 +31,7 @@ import { parsePrivateJson } from '../live/setup.ts';
 import { validCredentials, type LiveCredentials } from '../live/values.ts';
 import { MODULE_KEYS, assertDistinctSigners, parseServiceConfig, parseServiceSecrets } from './config.ts';
 import { parseOilSecrets } from './oil-config.ts';
+import { planOptions, readWorkbenchOptions, resolveOptionsAccount, type OptionsItem, type OptionsSource } from './import-options.ts';
 
 export const WORKBENCH_ENV = '/etc/project-aggregation.env';
 export const WORKBENCH_DATA = '/var/lib/project-aggregation';
@@ -82,6 +87,8 @@ export interface ImportPlan {
   items: ImportItem[];
   /** The oil accounts looked at (empty without options.oil). */
   oil: OilItem[];
+  /** The options account looked at (null without options.options). */
+  options: OptionsItem | null;
   notes: string[];
 }
 /** What the page shows for each workbench pair before anything is written: whether it could come over on its own. */
@@ -114,10 +121,10 @@ function feishuOf(env: WorkbenchSource['env'], channel: 'EVENT' | 'SCHEDULED' = 
  * Works out the files after the import. `existing` is the current config.json and secrets.json (raw JSON), or null on a
  * first setup. Throws when the result would not load: the caller then writes nothing.
  */
-export function planImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; only?: readonly string[]; known?: ReadonlyMap<string, AsterCredentials>; requireMargin?: boolean; oil?: OilSource }): ImportPlan {
+export function planImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; only?: readonly string[]; known?: ReadonlyMap<string, AsterCredentials>; requireMargin?: boolean; oil?: OilSource; options?: OptionsSource }): ImportPlan {
   const config: Json = existing ? structuredClone(existing.config) : { secretsFile: options.secretsFile, pairs: [] };
   const secrets: Json = existing ? structuredClone(existing.secrets) : { accounts: {} };
-  // A config of other modules only (oil, monitor) has no pairs yet; those blocks and the oil keys are carried over untouched.
+  // A config of other modules only (oil, options, monitor, asset) has no pairs yet; those blocks and their keys are carried over untouched.
   if (existing && config.pairs === undefined && MODULE_KEYS.some(key => config[key] !== undefined)) config.pairs = [];
   if (!Array.isArray(config.pairs)) throw new Error('现有 config.json 的 pairs 不是列表');
   if (!isRecord(secrets.accounts)) throw new Error('现有密钥文件的 accounts 不是对象');
@@ -139,9 +146,9 @@ export function planImport(source: WorkbenchSource, existing: { config: Json; se
   let known: Map<string, AsterCredentials>;
   // The oil venues' keys are allowed in the key file only when config.json names oil accounts (an invalid oil block is the
   // existing-config check's to report below).
-  let oilVenues: Venue[] = [];
-  try { oilVenues = parseServiceConfig(config).oil?.accounts.map(account => account.venue) ?? []; } catch { oilVenues = []; }
-  try { known = new Map(options.known ?? parseServiceSecrets(secrets, [], oilVenues).accounts); }
+  let oilVenues: Venue[] = [], hasOptions = false;
+  try { const parsed = parseServiceConfig(config); oilVenues = parsed.oil?.accounts.map(account => account.venue) ?? []; hasOptions = parsed.options !== undefined; } catch { oilVenues = []; }
+  try { known = new Map(options.known ?? parseServiceSecrets(secrets, [], oilVenues, hasOptions).accounts); }
   catch (error) { throw new Error(`现有密钥文件未通过检查，先修好再导入：${error instanceof Error ? error.message : String(error)}`); }
   /** Throws when this service would not start on these files: its config checks, with the signers already in hand. */
   const fits = (candidate: Json): void => {
@@ -236,8 +243,9 @@ export function planImport(source: WorkbenchSource, existing: { config: Json; se
   }
 
   const oil = options.oil ? planOil(options.oil, config, secrets, fits, notes) : [];
+  const optionsItem = options.options ? planOptions(options.options, config, secrets, fits, notes) : null;
   // Each added pair passed the checks with everything before it, and every key was derived once, so the result passes.
-  return { config, secrets, added, skipped, items, oil, notes };
+  return { config, secrets, added, skipped, items, oil, options: optionsItem, notes };
 }
 
 const mask = (id: string | null): string | null => id === null ? null : `***${id.slice(-4)}`;
@@ -298,10 +306,11 @@ function planOil(source: OilSource, config: Json, secrets: Json, fits: (candidat
  * and why the others cannot. Pairs that only fit one at a time (the request budget) show up when the selection is
  * imported. Throws when the existing files fail their checks: nothing could be imported then.
  */
-export function previewImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; oil?: OilSource }): { items: PreviewItem[]; oil: OilItem[]; notes: string[] } {
-  // The oil accounts are planned once, with no pair: the page imports them together or on their own.
-  const base = planImport(source, existing, { secretsFile: options.secretsFile, only: [], requireMargin: true, ...(options.oil ? { oil: options.oil } : {}) });
-  const known = new Map(parseServiceSecrets(base.secrets, [], parseServiceConfig(base.config).oil?.accounts.map(account => account.venue) ?? []).accounts);
+export function previewImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; oil?: OilSource; options?: OptionsSource }): { items: PreviewItem[]; oil: OilItem[]; options: OptionsItem | null; notes: string[] } {
+  // The oil and options accounts are planned once, with no pair: the page imports them together or on their own.
+  const base = planImport(source, existing, { secretsFile: options.secretsFile, only: [], requireMargin: true, ...(options.oil ? { oil: options.oil } : {}), ...(options.options ? { options: options.options } : {}) });
+  const parsedBase = parseServiceConfig(base.config);
+  const known = new Map(parseServiceSecrets(base.secrets, [], parsedBase.oil?.accounts.map(account => account.venue) ?? [], parsedBase.options !== undefined).accounts);
   const items = source.pairs.map((pair): PreviewItem => {
     const id = String(pair.id);
     const name = typeof pair.name === 'string' ? printable(pair.name).slice(0, 80) : null;
@@ -311,7 +320,7 @@ export function previewImport(source: WorkbenchSource, existing: { config: Json;
     catch (error) { item = { id, status: 'skipped', detail: error instanceof Error ? error.message : String(error) }; }
     return { id: printable(id).slice(0, 64), name, marginEnabled, importable: item?.status === 'added', detail: printable(item?.detail ?? '未能判断').slice(0, 300) };
   });
-  return { items, oil: base.oil, notes: base.notes };
+  return { items, oil: base.oil, options: base.options, notes: base.notes };
 }
 
 /** Prints the raw data column of both tables; run with no environment, as the database's owner when that matters. */
@@ -339,8 +348,8 @@ export function readWorkbench(envFile: string, dataDir: string | undefined, opti
   const env = { ...base, ...(existsSync(moduleEnv) ? parseEnv(readFileSync(moduleEnv, 'utf8')) : {}) };
   const database = join(data, 'modules', 'aster', 'trading.sqlite3');
   if (!existsSync(database)) {
-    // An oil import does not need the ASTER module: a workbench that never ran it has no pairs to bring.
-    if (options.asterOptional && existsSync(join(data, 'hub.sqlite'))) return { pairs: [], accounts: [], env, database, data };
+    // An oil or options import does not need the ASTER module: a workbench that never ran it has no pairs to bring.
+    if (options.asterOptional && (existsSync(join(data, 'hub.sqlite')) || existsSync(join(data, 'modules', 'greeks')))) return { pairs: [], accounts: [], env, database, data };
     throw new Error(`没有找到工作台的 ASTER 数据库 ${database}；工作台数据目录不在默认位置时用 --workbench-data 指定`);
   }
   // A read-only connection still creates -wal and -shm when it is the first one on a WAL database (the workbench opens
@@ -614,38 +623,43 @@ export function readExisting(configPath: string): ExistingFiles {
   return { configFile, secretsFile, existing: null, text: { config: null, secrets: null } };
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const { values } = parseArgs({ options: {
-    config: { type: 'string' }, 'workbench-env': { type: 'string' }, 'workbench-data': { type: 'string' }, pairs: { type: 'string' }, oil: { type: 'boolean' }, 'dry-run': { type: 'boolean' },
+    config: { type: 'string' }, 'workbench-env': { type: 'string' }, 'workbench-data': { type: 'string' }, pairs: { type: 'string' }, oil: { type: 'boolean' }, options: { type: 'boolean' }, 'dry-run': { type: 'boolean' },
   } });
-  const withOil = values.oil === true;
-  // --oil alone brings the oil accounts only; pairs come along when named.
-  const only = values.pairs ? values.pairs.split(',').map(item => item.trim()).filter(Boolean) : withOil ? [] : undefined;
-  const source = readWorkbench(values['workbench-env'] ?? WORKBENCH_ENV, values['workbench-data'], { asterOptional: withOil && (only?.length ?? 0) === 0 });
+  const withOil = values.oil === true, withOptions = values.options === true, modules = withOil || withOptions;
+  // --oil / --options alone bring their accounts only; pairs come along when named.
+  const only = values.pairs ? values.pairs.split(',').map(item => item.trim()).filter(Boolean) : modules ? [] : undefined;
+  const envFile = values['workbench-env'] ?? WORKBENCH_ENV;
+  const source = readWorkbench(envFile, values['workbench-data'], { asterOptional: modules && (only?.length ?? 0) === 0 });
   const oilSource = withOil ? readWorkbenchOil(source.data) : undefined;
+  const optionsSource = withOptions ? await resolveOptionsAccount(readWorkbenchOptions(envFile, source.data)) : undefined;
   const { configFile, secretsFile, existing } = readExisting(values.config ?? '');
 
-  const plan = planImport(source, existing, { secretsFile, ...(only ? { only } : {}), ...(oilSource ? { oil: oilSource } : {}) });
+  const plan = planImport(source, existing, { secretsFile, ...(only ? { only } : {}), ...(oilSource ? { oil: oilSource } : {}), ...(optionsSource ? { options: optionsSource } : {}) });
   const out = (line: string): void => { process.stdout.write(line + '\n'); };
-  if (!withOil || (only?.length ?? 0) > 0) out(`工作台数据库：${source.database}（只读）`);
+  if (!modules || (only?.length ?? 0) > 0) out(`工作台数据库：${source.database}（只读）`);
   if (oilSource) out(`工作台执行账户：${oilSource.hub}（只读）`);
+  if (optionsSource) out(`工作台期权状态：${optionsSource.stateFile}（只读）`);
   for (const line of plan.added) out(`导入配对 ${line}`);
   for (const line of plan.skipped) out(`跳过 ${line}`);
   for (const item of plan.oil) out(item.status === 'added' ? `导入原油执行账户 ${item.detail}` : `跳过原油执行账户 ${VENUE_NAMES[item.venue]}${item.accountId ? ` ${item.accountId}` : ''}：${item.detail}`);
+  if (plan.options) out(plan.options.status === 'added' ? `导入期权账户 ${plan.options.detail}` : `跳过期权账户${plan.options.accountId ? ` ${plan.options.accountId}` : ''}：${plan.options.detail}`);
   for (const line of plan.notes) out(line);
-  const oilAdded = plan.oil.filter(item => item.status === 'added').length;
-  if (plan.added.length === 0 && oilAdded === 0) {
-    if (!existing) throw new Error(withOil && !only?.length ? '工作台里没有可导入的原油执行账户，未生成配置' : '工作台里没有可导入的配对（需开启保证金平衡、配好主账户凭据前缀且凭据齐全），未生成配置');
-    out(withOil && !only?.length ? '没有新的原油执行账户，配置未改动' : '没有新的配对，配置未改动');
+  const oilAdded = plan.oil.filter(item => item.status === 'added').length, optionsAdded = plan.options?.status === 'added';
+  if (plan.added.length === 0 && oilAdded === 0 && !optionsAdded) {
+    const what = only?.length || !modules ? '配对' : [withOil ? '原油执行账户' : '', withOptions ? '期权账户' : ''].filter(Boolean).join('或');
+    if (!existing) throw new Error(only?.length || !modules ? '工作台里没有可导入的配对（需开启保证金平衡、配好主账户凭据前缀且凭据齐全），未生成配置' : `工作台里没有可导入的${what}，未生成配置`);
+    out(`没有新的${what}，配置未改动`);
     return;
   }
   if (values['dry-run']) { out('试运行：未写入任何文件'); return; }
   // Keys first, so the config never names a key file that lacks its accounts.
   writeBoth(secretsFile, fileText(plan.secrets), configFile, fileText(plan.config));
-  const what = [plan.added.length ? '导入的配对登记为停用，在工作台删除该配对后到本项目页面启用' : '', oilAdded ? '原油执行账户已写入，服务启动后页面出现「原油」标签' : ''].filter(Boolean).join('；');
+  const what = [plan.added.length ? '导入的配对登记为停用，在工作台删除该配对后到本项目页面启用' : '', oilAdded ? '原油执行账户已写入，服务启动后页面出现「原油」标签' : '', optionsAdded ? '期权账户已写入，服务启动后页面出现「期权」标签' : ''].filter(Boolean).join('；');
   out(`已写入 ${configFile} 与 ${secretsFile}；${what}`);
 }
 
 if (import.meta.main) {
-  try { main(); } catch (error) { process.stderr.write(`导入失败：${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; }
+  main().catch((error: unknown) => { process.stderr.write(`导入失败：${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; });
 }

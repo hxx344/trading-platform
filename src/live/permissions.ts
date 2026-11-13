@@ -44,19 +44,23 @@ export function binancePermissionProblem(info: Record<string, unknown>, accountM
 }
 
 /** What to change on a Bybit key (query-api answer), or null when it may trade contracts and nothing else. */
-export function bybitPermissionProblem(info: Record<string, unknown>): string | null {
-  if (info.readOnly !== 0) return '密钥为只读，请改为读写并开启合约交易（订单、持仓）';
+/**
+ * What to change on a Bybit key (query-api answer). The futures key needs ContractTrade Order; the options module's key
+ * (`options`) needs Options OptionsTrade instead and may keep the futures scopes. Anything else must be off.
+ */
+export function bybitPermissionProblem(info: Record<string, unknown>, { options = false }: { options?: boolean } = {}): string | null {
+  if (info.readOnly !== 0) return options ? '密钥为只读，请改为读写并开启期权交易' : '密钥为只读，请改为读写并开启合约交易（订单、持仓）';
   const scopes = info.permissions;
   if (typeof scopes !== 'object' || scopes === null || Array.isArray(scopes)) return 'Bybit 未返回密钥权限清单';
   const table = scopes as Record<string, unknown>;
   // Missing Wallet/Spot/Options cannot prove absence, so each one must be listed.
   for (const name of Object.keys(BYBIT_SCOPES)) if (!Array.isArray(table[name])) return `Bybit 未返回「${BYBIT_SCOPES[name]}」权限状态`;
   for (const values of Object.values(table)) if (!Array.isArray(values) || values.some(value => typeof value !== 'string')) return 'Bybit 权限清单格式无效';
-  if (!(table.ContractTrade as string[]).includes('Order')) return '请开启：合约交易 - 订单';
+  if (options ? !(table.Options as string[]).includes('OptionsTrade') : !(table.ContractTrade as string[]).includes('Order')) return options ? '请开启：期权 - 期权交易' : '请开启：合约交易 - 订单';
   for (const [name, values] of Object.entries(table) as [string, string[]][]) {
     // ContractTrade is documented as [Order, Position]; DerivativesTrade is the unified-account scope. Everything else
     // (transfers and withdrawals included) must be off.
-    const allowed = name === 'ContractTrade' ? ['Order', 'Position'] : name === 'Derivatives' ? ['DerivativesTrade'] : [];
+    const allowed = name === 'ContractTrade' ? ['Order', 'Position'] : name === 'Derivatives' ? ['DerivativesTrade'] : name === 'Options' && options ? ['OptionsTrade'] : [];
     const extra = values.filter(value => !allowed.includes(value));
     if (extra.length) return `请关闭：${labelOf(BYBIT_SCOPES, name)} - ${extra.map(value => labelOf({}, value)).join('、')}`;
   }

@@ -193,3 +193,20 @@
 **验证**：`node scripts/asset-demo.ts` 的假数据上，无头浏览器 1440 与 390 宽度走过总览（明细展开、每日波动展开）、历史记录（查看明细）、出金记录；无页面错误，390 宽度三页都没有横向溢出。未与工作台同页面并排截图对比（本机没有运行中的工作台资产页）。
 
 **回滚**：`sudo bash install.sh --version v0.10.1`，回退前先删掉 `config.json` 里的 `asset`。
+
+## 期权页（v0.11.0）
+
+**对照的工作台页面**：工作台期权模块 `modules/greeks/app/static/index.html`、`app.js`、`style.css`（提交 `2f0593d`）。页面 `web/src/OptionsPage.tsx`，表单与计算在不依赖 DOM 的 `web/src/options-form.ts`（有单元测试）。顶部「期权」标签只在 `GET /api/options/state` 有应答时出现。
+
+**页面**：执行台（指标行、期权链、策略腿与到期收益图、Greeks 汇总、执行控制、账户保证金健康度）、持仓（持仓、近期成交）、组合执行（进行中 / 历史任务卡片）。开平仓先生成计划，再在确认对话框核对腿、金额与净价限制并勾选后提交；请求编号沿用 `RequestIds`。RFQ 与收益统计不在本批（G2）。
+
+**样式**
+
+- 工作台样式复制到 `web/src/options.css`，每条规则加 `.options-desk ` 前缀，文件头写明来源与提交号；只保留本页用到的规则，规则内容不改。
+- 在 `main.tsx` 里排在 `styles.css`、`aster.css` 之后引入。外壳根元素是 `.aster-desk`，`aster.css` 里 `.aster-desk .muted / .panel / .button / .count` 的规则会盖过期权页样式，所以 `styles.css` 末尾的期权页一节用 `.aster-desk .options-desk` 前缀把行高、溢出、按钮换行和计数边距恢复成工作台的样子。
+- CSP 不允许行内样式：到期收益图与进度条用 SVG 画，不用 canvas 和 `style` 宽度；策略腿表在窄屏横向滚动（`.strategy-body .legs`）。
+- 确认对话框的计划倒计时按收到计划时的本机时间加上计划有效期计算，不用服务器时间戳相减，避免本机与服务器时钟偏差；到期后取消勾选并禁用提交。
+
+**导入面板**：预览列出工作台期权账户（打码 UID、能否导入及原因），勾选「导入期权账户」后随导入一起写入（默认不勾选）。
+
+**回滚**：`sudo bash install.sh --version v0.10.1`（先按 [options.md](options.md) 第 4 节删掉 `options` 与 `bybitOptions`）。

@@ -85,7 +85,8 @@ export function loadLiveCredentials(path: string): Map<Venue, LiveCredentials> {
  * notional total and treat the other's orders as foreign. The lock is a Linux abstract socket, released by the kernel
  * when the process ends, so a crash leaves no stale lock.
  */
-export async function holdAccountLocks(accounts: readonly { venue: string; accountId: string }[]): Promise<{ release(): void }> {
+/** `prefix` names the lock family: the futures executor's, or another module's (the options module locks pa-options/...). */
+export async function holdAccountLocks(accounts: readonly { venue: string; accountId: string }[], prefix = 'pa-executor-live'): Promise<{ release(): void }> {
   if (process.platform !== 'linux') throw new Error('实盘模式只在 Linux 上运行（按账户加进程锁）');
   const servers: ReturnType<typeof createServer>[] = [];
   const release = () => { for (const server of servers) server.close(); };
@@ -94,7 +95,7 @@ export async function holdAccountLocks(accounts: readonly { venue: string; accou
       const server = createServer(socket => socket.destroy());
       await new Promise<void>((resolve, reject) => {
         server.once('error', error => reject((error as NodeJS.ErrnoException).code === 'EADDRINUSE' ? new Error(`${account.venue} 账户 ${account.accountId} 已被本机另一个实盘执行器占用`) : error));
-        server.listen(`\0pa-executor-live/${account.venue}/${account.accountId}`, () => resolve());
+        server.listen(`\0${prefix}/${account.venue}/${account.accountId}`, () => resolve());
       });
       server.unref();
       servers.push(server);

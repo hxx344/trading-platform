@@ -8,7 +8,7 @@
 
 | 批次 | 内容 | 风险 | 状态 |
 | --- | --- | --- | --- |
-| M-1 | Anthropic 价差（M03）：Binance、Hyperliquid（xyz:ANT、io:ANTH）、Lighter RH 四条腿的报价与 15 分钟 K 线，每股口径溢价；只读公开接口，无凭据、无告警 | R2 | 代码完成，未发布（整服务用例待 Linux CI） |
+| M-1 | Anthropic 价差（M03）：Binance、Hyperliquid（xyz:ANT、io:ANTH）、Lighter RH 四条腿的报价与 15 分钟 K 线，每股口径溢价；只读公开接口，无凭据、无告警 | R2 | 完成（Linux CI 通过），随 v0.11.0 发布 |
 | M-2 | 原油价差与海力士行情（M01、M02），Var 腿先降级为“未接入” | R2 | 未开始 |
 | M-3 | 告警规则、飞书通知、监控开关、Var 会话 token（M09–M12） | R3 | 未开始 |
 | M-4 | 永续全市场报价（M04：11 家交易所公共 WS、SSE 增量） | R2 | 未开始 |
@@ -76,7 +76,7 @@
 - **K 线的新鲜度**：除报价外，K 线接口的 `status` 也会标 `snapshot`：启动时从库里读回、最近一轮 K 线整轮失败，或最近一次成功的 K 线轮距今超过 615 秒（工作台已存 K 线的时限，约十轮）。
 - **库打不开**：`monitor.sqlite` 打不开时服务照常启动，stderr 记一行原因，不注册行情监控的读取，三个接口与没配置时一样 404，页面不显示入口；运行状态接口多一个 `monitor` 段（`available`、`error`、`anthropic` 的最近取数时刻与错误）。`--check-config` 的输出列出 monitor 配置摘要。
 - **`days` 参数**：只认 `1–400` 的十进制整数（上限即保留期 `ANTHROPIC_RETENTION_DAYS`），其余 400 `invalid_days`。
-- **导入**：`src/service/import-workbench.ts` 写配置时，“有别的模块就可以不写 `pairs`”改为按 `MODULE_KEYS`（`oil`、`monitor`、`asset`）判断，导入不会删掉已有的 `monitor` 段。
+- **导入**：`src/service/import-workbench.ts` 写配置时，“有别的模块就可以不写 `pairs`”改为按 `MODULE_KEYS`（`oil`、`options`、`monitor`、`asset`）判断，导入不会删掉已有的 `monitor` 段。
 - **页面读取**：报价每 10 秒、K 线每 60 秒，都走 `useLiveResource`；K 线按所选范围加 21 天读（`days=28`、`days=51`，“全部”不带 `days`），与工作台相同；切换范围时，已读到且覆盖新范围的数据先留在图上。尚无数据的 503 按“正在获取”显示，不当作失败。读取超时：报价 10 秒，K 线 30 秒（完整 400 天约几 MB）。
 - **页面外观**：照工作台 Hub 里嵌入显示的 Anthropic 详情，所以不渲染工作台的顶栏（工作台 `.hub-content .topbar { display: none }`），外层用本服务的顶栏与标签；工作台的 `<main>` 换成 `.monitor-main`（页面本身在服务的 `<main>` 里）。图表切换、范围、对比合约、来源展开都用页面内状态，不存浏览器偏好（工作台存在 localStorage）。
 - **样式**：`web/src/monitor.css` 是按规则编号从工作台 `globals.css` 取出、加前缀生成的（规则顺序、数值不改）：`body` 规则作用在 `.monitor-desk` 本身；`.hub-content`、`.monitor-detail` 祖先去掉；本页不渲染的部分（顶栏、资金费、告警、交易所对比等）不取；`@keyframes spin` 与 `styles.css` 里的完全相同，不重复。另加三处：`design-tokens.css`（`9ca6f68`）的令牌放在 `.monitor-desk` 上；工作台页面靠 Tailwind preflight 的几条（清零外边距、按钮透明背景、标题继承字号）；本页在 ASTER 外壳（`.aster-desk .focused-desk`）里，`aster.css` 的 `.page-heading` 规则和 `styles.css` 的 `.svg-plot` 颜色、提示框边框也会命中，文件末尾按工作台的值复位。

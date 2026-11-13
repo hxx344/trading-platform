@@ -9,6 +9,9 @@
 #   sudo bash install.sh --import-workbench --oil
 #                                             只导入工作台的原油执行账户（Binance / Bybit，hub.sqlite 解密）；同时导入配对时
 #                                             再加 --pairs id,id。工作台有实盘启用的原油自动规则时拒绝导入该交易所账户
+#   sudo bash install.sh --import-workbench --options
+#                                             导入工作台期权模块（Greeks）的 Bybit 密钥与风险上限（可与 --oil、--pairs 同用）；
+#                                             工作台开着自动开仓、不是实盘主网，或还有未结束的订单 / 任务 / RFQ / 跟踪策略时拒绝
 #   sudo bash install.sh --set-password       设置或更换页面登录密码（输入两次，不回显；只存 scrypt 摘要，已登录的页面须重新登录；
 #                                             沿用当前已装版本，不联网升级；脚本化时加 --password-stdin 从标准输入读一行）
 #
@@ -72,6 +75,7 @@ import_workbench=0
 workbench_data=''
 import_pairs=''
 import_oil=0
+import_options=0
 set_password=0
 password_stdin=0
 while (($#)); do
@@ -80,6 +84,7 @@ while (($#)); do
     --workbench-data) [[ $# -ge 2 ]] || usage 2; workbench_data=$2; shift 2 ;;
     --pairs) [[ $# -ge 2 ]] || usage 2; import_pairs=$2; shift 2 ;;
     --oil) import_oil=1; shift ;;
+    --options) import_options=1; shift ;;
     --set-password) set_password=1; shift ;;
     --password-stdin) password_stdin=1; shift ;;
     --version) [[ $# -ge 2 ]] || usage 2; version=$2; shift 2 ;;
@@ -92,6 +97,7 @@ done
 [[ -z "$version" || -z "$package_dir" ]] || fail '--version 与 --package 只能二选一'
 ((import_workbench)) || [[ -z "$workbench_data$import_pairs" ]] || fail '--workbench-data 与 --pairs 须和 --import-workbench 一起使用'
 ((import_workbench || !import_oil)) || fail '--oil 须和 --import-workbench 一起使用'
+((import_workbench || !import_options)) || fail '--options 须和 --import-workbench 一起使用'
 ((set_password || !password_stdin)) || fail '--password-stdin 须和 --set-password 一起使用'
 
 [[ "$(uname -s)" == Linux ]] || fail '只支持 Linux。'
@@ -239,6 +245,7 @@ done
 if ((import_workbench)); then
   [[ -f "$release_dir/src/service/import-workbench.ts" ]] || fail "版本 $new_version 不支持 --import-workbench，请用最新版本导入"
   if ((import_oil)); then grep -q 'readWorkbenchOil' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --oil，请用最新版本导入"; fi
+  if ((import_options)); then grep -q 'readWorkbenchOptions' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --options，请用最新版本导入"; fi
   # The files the import may write: config.json and the key file it names (always in this directory).
   mkdir "$work_dir/conf-before"
   {
@@ -256,7 +263,19 @@ if ((import_workbench)); then
   [[ -z "$workbench_data" ]] || import_args+=(--workbench-data "$workbench_data")
   [[ -z "$import_pairs" ]] || import_args+=(--pairs "$import_pairs")
   ((!import_oil)) || import_args+=(--oil)
-  (cd / && "$NODE_BIN" "$release_dir/src/service/import-workbench.ts" "${import_args[@]}" 9>&-) || fail '从工作台导入配置失败'
+  ((!import_options)) || import_args+=(--options)
+  # The service's proxy settings (KEY=VALUE lines, as systemd reads them): importing the options account reads Bybit once.
+  import_env=()
+  if [[ -f "$CONF_DIR/environment" ]]; then
+    while IFS= read -r env_line || [[ -n "$env_line" ]]; do
+      env_line=${env_line%$'\r'}
+      [[ "$env_line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+      env_key=${BASH_REMATCH[1]} env_value=${BASH_REMATCH[2]}
+      if [[ "$env_value" =~ ^\"(.*)\"$ || "$env_value" =~ ^\'(.*)\'$ ]]; then env_value=${BASH_REMATCH[1]}; fi
+      import_env+=("$env_key=$env_value")
+    done <"$CONF_DIR/environment"
+  fi
+  (cd / && env ${import_env[@]+"${import_env[@]}"} "$NODE_BIN" "$release_dir/src/service/import-workbench.ts" "${import_args[@]}" 9>&-) || fail '从工作台导入配置失败'
 fi
 # A first setup without an import starts on a config with no pairs, so the page is up to import them from.
 if [[ ! -e "$CONF_DIR/config.json" && ! -L "$CONF_DIR/config.json" ]]; then

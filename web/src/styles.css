@@ -198,3 +198,35 @@ table.data.history{min-width:0}
 .aster-module{display:flex;flex-direction:column;gap:16px;min-width:0}
 .aster-desk .panel-body .muted,.aster-desk .panel-body p{font-size:.75rem}
 .aster-desk .section-head+.panel-body{padding-top:0}
+/* The options page (OptionsPage.tsx): what the copied workbench Greeks styles (options.css) leave to the page itself. The
+   workbench sets bar widths with style attributes and draws the payoff on a canvas; under this page's CSP the bars are
+   SVG rects and the payoff is an SVG, coloured with the same tokens the workbench canvas uses. */
+.options-desk .delta-track svg,.options-desk .progress svg{display:block;width:100%;height:100%}
+.options-desk .delta-track rect{fill:var(--text-tertiary)}
+.options-desk .progress rect{fill:var(--accent)}
+.options-desk .progress.danger rect{fill:var(--warning)}
+.options-desk .payoff-svg{display:block;width:100%;height:100%}
+.options-desk .payoff-svg .grid{stroke:var(--surface-4)}
+.options-desk .payoff-svg .axis{fill:var(--text-tertiary);font-size:10px}
+.options-desk .payoff-svg .zero{stroke:var(--text-tertiary);stroke-dasharray:4 4}
+.options-desk .payoff-svg .profit-fill{fill:var(--emerald-soft)}
+.options-desk .payoff-svg .loss-fill{fill:var(--error-soft)}
+.options-desk .payoff-svg .curve{fill:none;stroke:var(--accent);stroke-width:2.4}
+.options-desk .payoff-svg .strike{stroke:var(--surface-6);stroke-dasharray:2 4}
+.options-desk .payoff-svg .strike-label{fill:var(--text-secondary);font-size:10px;text-anchor:middle}
+.options-desk .payoff-svg .spot{stroke:var(--warning);stroke-dasharray:5 3}
+.options-desk .payoff-svg .spot-label{fill:var(--warning);font-size:10px;text-anchor:middle}
+.options-desk .mode-icon{font-weight:700}
+.options-desk .orders-notice.loss{color:var(--negative)}
+.options-desk .update-state i[data-stale="true"]{background:var(--warning)}
+/* The workbench drops its legs table into the two-column .legs grid meant for the old leg cards, so the table squeezes
+   into half a cell and runs under the payoff chart; here the table takes the whole column and scrolls when narrow. */
+.options-desk .strategy-body .legs{display:block;min-width:0;overflow-x:auto}
+/* The page sits inside the shell's .aster-desk, and aster.css plus the shared rules above give some class names the
+   options page also uses (muted, panel, count, button, primary) properties the workbench copy never sets; put back the
+   workbench values (prefixed with .aster-desk to outrank aster.css, which loads after this file). */
+.aster-desk .options-desk .muted{line-height:inherit}
+.aster-desk .options-desk .panel:not(.kpi-panel){overflow:visible}
+.aster-desk .options-desk .subnav .count{margin-left:0}
+.aster-desk .options-desk .button{line-height:inherit;white-space:normal}
+.aster-desk .options-desk .button.primary:disabled:hover{background:var(--accent);border-color:transparent}

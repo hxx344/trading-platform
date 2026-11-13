@@ -86,14 +86,16 @@ trading-platform/
 | 3 | 部署：`deploy/install.sh`（root 运行、幂等、无变化快速结束、保留配置和数据、先校验配置再切换、启动失败自动回退）、systemd 单元、CI、发布流程（tag → GitHub Release 包）（已完成：`deploy/`、`.github/workflows/release.yml`） | CI 绿；本机以非 root 跑安装器的检查路径 |
 | 4 | 独立审查（R3），修完 P0/P1 后发布 v0.1.0（审查与修复完成：`docs/reviews/2026-11-12-step4-r3.md`） | 审查记录在 `docs/reviews/` |
 | 4a | 从工作台导入：`install.sh --import-workbench`（v0.2）；页面导入经 root 导入助手（`trading-platform-import.path`），首次安装即以空配置启动（v0.3，审查：`docs/reviews/2026-11-12-page-import.md`） | 助手端到端测试（预览、导入、检查失败与启动失败逐字节恢复）；安装测试；浏览器走完预览 → 导入 → 重启 |
-| 5 | 实盘：用户授权后切换第一个配对，先用最小门槛观察 | 用户当次授权；结果回填本文件 |
+| 5 | 实盘：用户授权后切换第一个配对，先用最小门槛观察（已完成：2026-11-13 配对 `xau` 实盘运行，见 [live-results.md](live-results.md)） | 用户当次授权；结果回填本文件 |
 
 ## 6 尚待实测（接真实账户时确认）
 
 - 子账户列表行是否带钱包地址（2.6b 实测能核实归属，但未记录字段）；不带时按各子账户自己的 `accountId` 对应。
 - `positionRisk` 的零仓位行是否带 `updateTime`（缺失时按 0 处理，执行器视为未证明已反映）。
 
-- nonce 有效窗口按 120 s 计（ASTER 文档 ±60 s，未实测）。
+2026-11-13 第一次实盘（[live-results.md](live-results.md)）已核实：划转回执都不带交易编号，93 笔全部按回执结清，没有出现结果未知；连续约 16 小时没有限流（429/403）或权重超限；ADL 历史扫描按正常窗口连续运行无错误。新发现：用户推送约每 6 分钟断开一次（日志只有“连接出错”），原因待查，不影响划转，ADL 退回定时读取。以下仍未实测：
+
+- nonce 有效窗口按 120 s 计（ASTER 文档 ±60 s，未实测；第一次实盘没有结果未知的划转）。
 - ADL 减仓单回报的 `updateTime` 是否不晚于持仓 `updateTime`（若晚于，每批多等 120 s）。
 - `forceOrders` 查询跨度上限（重新启用时扫描从启用时刻开始，正常运行窗口约 2 分钟，不依赖长跨度）。
 - 网关拒绝（HTML 429/403）与 `X-MBX-USED-WEIGHT-1M` 响应头的真实表现（替身已覆盖）。

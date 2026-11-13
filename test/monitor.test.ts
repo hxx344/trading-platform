@@ -234,7 +234,7 @@ test('采集循环：报价与 K 线两类轮次各自不重叠，停止后循�
 });
 
 test('服务配置：monitor 段的默认股数与校验；只配 monitor 时 pairs 可以省略', async () => {
-  assert.deepEqual(MODULE_KEYS, ['oil', 'monitor']);
+  assert.deepEqual(MODULE_KEYS, ['oil', 'monitor', 'asset']);
   const secretsFile = '/etc/tp/secrets.json';
   const config = parseServiceConfig({ secretsFile, monitor: { anthropic: {} } });
   assert.deepEqual(config.pairs, []);

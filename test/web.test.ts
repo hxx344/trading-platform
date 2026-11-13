@@ -185,6 +185,8 @@ test('页面地址：#/pair/<配对>、#/status 与 #/settings 分别打开详�
   assert.deepEqual(parseRoute('#/oil/x'), { page: 'overview' });
   assert.deepEqual(parseRoute('#/monitor'), { page: 'monitor' });
   assert.deepEqual(parseRoute('#/monitor/x'), { page: 'overview' });
+  assert.deepEqual(parseRoute('#/asset'), { page: 'asset' });
+  assert.deepEqual(parseRoute('#/asset/x'), { page: 'overview' });
   assert.deepEqual(parseRoute('#/pair'), { page: 'pair', pairId: null });
   assert.deepEqual(parseRoute(pairHref('p_1-a')), { page: 'pair', pairId: 'p_1-a' });
   assert.deepEqual(parseRoute('#/pair/%E0%A4%A'), { page: 'pair', pairId: null });

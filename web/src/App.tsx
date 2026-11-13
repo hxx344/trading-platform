@@ -1,6 +1,7 @@
 import { Layers3, RefreshCw } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { OIL_READ_TIMEOUT_MS, OIL_STATE_PATH, OilPage } from './OilPage.tsx';
+import { ASSET_READ_TIMEOUT_MS, ASSET_STATE_PATH, AssetPage } from './AssetPage.tsx';
 import { LogsPage } from './LogsPage.tsx';
 import { MONITOR_READ_TIMEOUT_MS, MONITOR_STATE_PATH, MonitorPage, parseMonitorState, type MonitorState } from './MonitorPage.tsx';
 import { PairsWorkspace } from './PairsWorkspace.tsx';
@@ -10,12 +11,14 @@ import { StatusPage } from './StatusPage.tsx';
 import { Callout, StatePanel } from './StateViews.tsx';
 import { clock } from './labels.ts';
 import { useLiveResource } from './use-live-resource.ts';
+import { ApiError } from './api.ts';
 import type { ServiceState } from './types.ts';
 import type { OilState } from './oil-types.ts';
+import type { AssetState } from '../../src/asset/views.ts';
 
 // The page shell follows the workbench's ASTER desk (modules/aster/dashboard/app/page.tsx, b2fae14): the top bar with
 // the brand, the page heading with the connection state, then line tabs. The ASTER pages sit in .aster-module, which
-// carries the workbench's element styles; the oil and monitor pages keep their own.
+// carries the workbench's element styles; the oil, monitor and asset pages keep their own.
 
 const REFRESH_MS = 2_000;
 const READ_TIMEOUT_MS = 10_000;
@@ -35,6 +38,9 @@ const OIL_TAB: Tab = { pages: ['oil'], href: '#/oil', text: '原油' };
 const OIL_CHECK_MS = 60_000;
 /** Likewise for /api/monitor/state: without config.monitor (or its database) the service answers 404. */
 const MONITOR_TAB: Tab = { pages: ['monitor'], href: '#/monitor', text: '行情监控' };
+/** Hidden only where /api/asset/state answers 404 (a service without asset); a ledger that cannot be read keeps the tab, and the page says why. */
+const ASSET_TAB: Tab = { pages: ['asset'], href: '#/asset', text: '资产' };
+const ASSET_CHECK_MS = 60_000;
 
 export function App() {
   const route = useRoute();
@@ -45,7 +51,9 @@ export function App() {
   // The oil page reads the same path faster while it is open; here it only decides whether the tab shows.
   const oil = useLiveResource<OilState>(OIL_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: OIL_READ_TIMEOUT_MS, onExpired });
   const monitor = useLiveResource<MonitorState>(MONITOR_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: MONITOR_READ_TIMEOUT_MS, parse: parseMonitorState, onExpired });
-  const tabs = [...TABS, ...(oil.data !== null ? [OIL_TAB] : []), ...(monitor.data !== null ? [MONITOR_TAB] : [])];
+  // The asset page reads the same path at the same pace and timeout (the shared read keeps the first subscriber's).
+  const asset = useLiveResource<AssetState>(ASSET_STATE_PATH, { intervalMs: ASSET_CHECK_MS, timeoutMs: ASSET_READ_TIMEOUT_MS, onExpired });
+  const tabs = [...TABS, ...(oil.data !== null ? [OIL_TAB] : []), ...(monitor.data !== null ? [MONITOR_TAB] : []), ...(asset.data !== null || (asset.error instanceof ApiError && asset.error.status === 500) ? [ASSET_TAB] : [])];
   // A read that succeeds again (after logging in from another tab) clears the notice.
   useEffect(() => { if (status === 'ready') setExpired(false); }, [status]);
   const changed = useCallback(() => { void refresh(); }, [refresh]);
@@ -57,11 +65,11 @@ export function App() {
   const stale = state !== null && (status === 'error' || status === 'offline' || status === 'paused' || (status === 'loading' && (error !== null || old)));
   const failed = status === 'error' || status === 'offline';
   const limits = state ? limitsText(state) : null;
-  const aster = route.page !== 'oil' && route.page !== 'monitor';
+  const aster = route.page !== 'oil' && route.page !== 'monitor' && route.page !== 'asset';
   return <div className="aster-desk">
     <main className="desk focused-desk">
       <header className="topbar">
-        <div className="brand"><Layers3 size={22} aria-hidden="true" /><span>统一交易平台<span className="brand-separator">/</span><small>ASTER 保证金平衡 · 原油</small></span></div>
+        <div className="brand"><Layers3 size={22} aria-hidden="true" /><span>统一交易平台<span className="brand-separator">/</span><small>ASTER 保证金平衡 · 原油 · 资产</small></span></div>
       </header>
       <div className="workspace">
         <div className="page-heading">
@@ -103,7 +111,7 @@ export function App() {
                   ? <StatePanel kind="error" title="读取服务状态失败" detail={error?.message ?? '网络离线'} />
                   : <StatePanel kind="loading" title="加载中…" />)
                   : <PairsWorkspace state={state} pairId={route.page === 'pair' ? route.pairId : null} stale={stale} onChanged={changed} onExpired={onExpired} />}
-            </div> : route.page === 'oil' ? <OilPage onExpired={onExpired} /> : <MonitorPage onExpired={onExpired} />}
+            </div> : route.page === 'oil' ? <OilPage onExpired={onExpired} /> : route.page === 'monitor' ? <MonitorPage onExpired={onExpired} /> : <AssetPage onExpired={onExpired} />}
           </div>
         </div>
       </div>

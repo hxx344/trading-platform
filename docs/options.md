@@ -4,6 +4,13 @@
 
 同日用户决定跳过 G1d 实盘测试，继续做第二批 G2，分三次发布：G2a 周五定时开仓与 IOC 兜底，G2b “收益”页盈亏台账与采样，G2c 组合询价 RFQ。
 
+## 当前状态（v0.17.0）
+
+- 已发布：G1 v0.11.0，G2a v0.13.0，G2b v0.14.0，G2c v0.17.0。
+- 已有：手动开平仓（先买后卖）、周五定时开仓（默认关）、IOC 兜底（默认关）、收益页、组合询价、从工作台导入期权账户。
+- 实盘：G1d 用户跳过，本文没有真实账户上的期权实盘记录；待实测项见第 6 节。
+- 不做：旧版无订单跟踪策略的成交回溯恢复、演示模式、导入工作台的历史收益台账与采样（第 1 节）。
+
 ## 1 范围
 
 | 第一批 G1（v0.11.0） | 第二批 G2 |
@@ -59,10 +66,36 @@
 - 循环：期权链每 10 s（单次 10 s 超时、失败保留上次结果并记日志）；定时开仓每 5 s（G2a）；对账每 15 s（核对未结束订单 → 结束已恢复的任务 → 同步持仓与退役）；账户健康每 15 s；收益每 15 s（补读成交、采样，G2b）；询价核对每 3 s（读询价状态、报价与成交列表，G2c）。
 - 外部调用：每个 HTTP 请求 10 s 超时；只读请求不重试（下一轮再读），签名写请求只在时间戳被拒（10002，证明未执行）时同步时钟后重发一次。
 - 结果未知的订单：对账撤单后读实时与历史订单。下单应答丢失、从未拿到订单号，发出已超过 2 分钟（Bybit 接收窗口 5 s）且不到 6 天（历史订单默认只查最近 7 天）、每次读取都明确查无此单时，按未下单（成交 0）结算；有订单号的始终保持未知、转人工。订单编号前缀为 `tpo-`（工作台为 `ic-`），回退后工作台不会把本服务的成交认成自己的。
-- 接口（须登录，未配置 `options` 时 404）：`GET /api/options/market?expiry=`（期权链、到期日列表、指数、新鲜度）、`GET /api/options/preview?quantity=&mode=`（策略预览）、`GET /api/options/state`（任务、订单、跟踪策略、持仓与 Greeks、账户健康、对账状态、近期成交、参数）、`POST /api/options/plans`、`POST /api/options/tasks`、`POST /api/options/tasks/<任务>/stop`、`POST /api/options/auto-open`（`{ enabled: boolean }`，G2a；状态里的 `schedule` 给出开关、来源、时间、下次时间、窗口状态与本周未执行原因）、`GET /api/options/performance`（G2b：各组合收益与采样、按币种的综合曲线与统计、未归属平仓数、采样间隔、台账条数与最早成交时间、最近一次补读或采样错误）、`GET /api/options/rfq`（G2c：询价记录与状态名、是否结束、排序后的报价及与盘口的对比、能否新建及原因、行情新鲜度）、`POST /api/options/rfq`（`{ requestId, confirmLive: true, quantity?, mode? }`，请求编号幂等）、`POST /api/options/rfq/execute`（`{ rfqId, quoteId, confirmLive: true }`）、`POST /api/options/rfq/cancel`（`{ rfqId }`）。
+- 接口（须登录，未配置 `options` 时 404）：
+  - `GET /api/options/market?expiry=`（期权链、到期日列表、指数、新鲜度）
+  - `GET /api/options/preview?quantity=&mode=`（策略预览）
+  - `GET /api/options/state`（任务、订单、跟踪策略、持仓与 Greeks、账户健康、对账状态、近期成交、参数）
+  - `POST /api/options/plans`、`POST /api/options/tasks`、`POST /api/options/tasks/<任务>/stop`
+  - `POST /api/options/auto-open`（`{ enabled: boolean }`，G2a；状态里的 `schedule` 给出开关、来源、时间、下次时间、窗口状态与本周未执行原因）
+  - `GET /api/options/performance`（G2b：各组合收益与采样、按币种的综合曲线与统计、未归属平仓数、采样间隔、台账条数与最早成交时间、最近一次补读或采样错误）
+  - `GET /api/options/rfq`（G2c：询价记录与状态名、是否结束、排序后的报价及与盘口的对比、能否新建及原因、行情新鲜度）
+  - `POST /api/options/rfq`（`{ requestId, confirmLive: true, quantity?, mode? }`，请求编号幂等）
+  - `POST /api/options/rfq/execute`（`{ rfqId, quoteId, confirmLive: true }`）
+  - `POST /api/options/rfq/cancel`（`{ rfqId }`）。
 - 飞书：任务确认、结束、转人工各一条（同一任务同一状态只发一次，经 `notify.sqlite` 发件箱）；定时任务标题写“期权定时开仓任务”；本周定时开仓未执行一条（每周最多一次）。
-- 页面：顶部“期权”标签只在 `GET /api/options/state` 有应答时出现。排版照工作台 `modules/greeks/app/static/index.html`：执行台（指标行、期权链、策略腿与到期收益图、Greeks 汇总、执行控制、账户保证金健康度）、持仓（持仓、近期成交）、组合执行（进行中 / 历史任务卡片）。样式复制自工作台 `modules/greeks/app/static/style.css`，加 `.options-desk ` 前缀。确认对话框：腿、金额、净价限制输入、风险说明、勾选确认后提交；请求编号沿用 RequestIds。表单到请求的转换在不依赖 DOM 的 `web/src/options-form.ts`。G2a：执行控制底部“计划开仓”一行显示定时状态与下次时间，带打开 / 关闭按钮；顶部提示条显示“定时开仓 周五 HH:MM UTC”或“只手动开仓”（打开 IOC 时加“+ IOC 兜底”），本周未执行时显示原因；委托明细里 IOC 单标“IOC”，定时任务卡片标“定时”。G2b：第四个标签“收益”（`#/options/performance`），照工作台 `pane-perf`：四个统计数、综合曲线、每次开仓的可展开详情（金额、说明、待核对原因、该组采样曲线、逐笔成交）。G2c：第五个标签“组合询价”（`#/options/rfq`），照工作台 `pane-rfq`：状态、创建 / 取消、询价 ID / 类型 / 有效期 / 报价数、每家报价与盘口的逐腿对比和预估手续费、执行确认对话框（报价内容一变就须重新勾选）；询价成交的任务卡片标“询价 · 做市商”，委托明细标“RFQ”。
-- 导入：读工作台 `DATA_DIR/modules/greeks/.env`（叠加 `/etc/project-aggregation.env`，键名不分大小写）取 `BYBIT_API_KEY`、`BYBIT_API_SECRET` 与 `MAX_RISK_USD`、`MAX_MARGIN_USD`、`LEG_QTY`、`STRATEGY_MODE`、`MARGIN_MODE`、`BBO_ORDER_TIMEOUT_SECONDS`、`ESTIMATED_TAKER_FEE_RATE`、`PORTFOLIO_MARGIN_BUFFER_PCT`；读 `engine_state.json`。拒绝条件：工作台 `AUTO_OPEN` 开着（环境文件里，或运行中的模块进程环境里：以 `app.main:app` 运行、`STATE_FILE` 指向该状态文件的进程，读 `/proc/<pid>/environ`，读不到即拒绝；改了文件没重启模块同样拒绝）、不是实盘主网（`TRADING_MODE`/`LIVE_TRADING`/`BYBIT_TESTNET`）、有未结束订单、有进行中任务、有未完成 RFQ、有跟踪中的策略、状态文件无法解析。UID 导入时用密钥读一次 `query-api` 取得（与启动检查同一套权限 / IP / 统一账户检查，15 s 上限，失败即不导入）。已有 `options` 时不覆盖；`secrets.json` 已有 `bybitOptions` 而配置没有 `options` 时也不覆盖。实现：`src/service/import-options.ts`，接入 `import-workbench.ts`（命令行 `--options`）、`import-helper.ts` 与 `import-channel.ts`（页面勾选「导入期权账户」）；安装脚本 `sudo bash install.sh --import-workbench --options`。只输出打码 UID、参数与原因，不输出密钥。工作台的其余估算参数（`OPTION_*_FACTOR`、`OPTION_LIQUIDATION_FEE_RATE`、`OPTION_FEE_CAP_PCT`、`QUOTE_STALE_SECONDS`、`MAX_SPREAD_BPS`、`TARGET_DTE_DAYS`、`BBO_POLL_SECONDS`）本服务不导入、按自己的默认值，改过的会列在导入提示里。G2a 起导入 `OPEN_HOUR_UTC`、`OPEN_MINUTE_UTC`、`OPEN_WINDOW_SECONDS`（定时开仓时间）与 `ALLOW_MARKET_FALLBACK`（IOC 兜底）；定时开仓本身导入后总是关闭（工作台必须先关自动开仓才能导入），要用时在期权页打开。导入助手与命令行导入沿用 `/etc/trading-platform/environment` 的代理设置。
+- 页面：顶部“期权”标签只在 `GET /api/options/state` 有应答时出现。
+  - 排版照工作台 `modules/greeks/app/static/index.html`：执行台（指标行、期权链、策略腿与到期收益图、Greeks 汇总、执行控制、账户保证金健康度）、持仓（持仓、近期成交）、组合执行（进行中 / 历史任务卡片）。
+  - 样式复制自工作台 `modules/greeks/app/static/style.css`，加 `.options-desk ` 前缀。
+  - 确认对话框：腿、金额、净价限制输入、风险说明、勾选确认后提交；请求编号沿用 RequestIds。
+  - 表单到请求的转换在不依赖 DOM 的 `web/src/options-form.ts`。
+  - G2a：执行控制底部“计划开仓”一行显示定时状态与下次时间，带打开 / 关闭按钮；顶部提示条显示“定时开仓 周五 HH:MM UTC”或“只手动开仓”（打开 IOC 时加“+ IOC 兜底”），本周未执行时显示原因；委托明细里 IOC 单标“IOC”，定时任务卡片标“定时”。
+  - G2b：第四个标签“收益”（`#/options/performance`），照工作台 `pane-perf`：四个统计数、综合曲线、每次开仓的可展开详情（金额、说明、待核对原因、该组采样曲线、逐笔成交）。
+  - G2c：第五个标签“组合询价”（`#/options/rfq`），照工作台 `pane-rfq`：状态、创建 / 取消、询价 ID / 类型 / 有效期 / 报价数、每家报价与盘口的逐腿对比和预估手续费、执行确认对话框（报价内容一变就须重新勾选）；询价成交的任务卡片标“询价 · 做市商”，委托明细标“RFQ”。
+- 导入：
+  - 读工作台 `DATA_DIR/modules/greeks/.env`（叠加 `/etc/project-aggregation.env`，键名不分大小写）取 `BYBIT_API_KEY`、`BYBIT_API_SECRET` 与 `MAX_RISK_USD`、`MAX_MARGIN_USD`、`LEG_QTY`、`STRATEGY_MODE`、`MARGIN_MODE`、`BBO_ORDER_TIMEOUT_SECONDS`、`ESTIMATED_TAKER_FEE_RATE`、`PORTFOLIO_MARGIN_BUFFER_PCT`；读 `engine_state.json`。
+  - 拒绝条件：工作台 `AUTO_OPEN` 开着（环境文件里，或运行中的模块进程环境里：以 `app.main:app` 运行、`STATE_FILE` 指向该状态文件的进程，读 `/proc/<pid>/environ`，读不到即拒绝；改了文件没重启模块同样拒绝）、不是实盘主网（`TRADING_MODE`/`LIVE_TRADING`/`BYBIT_TESTNET`）、有未结束订单、有进行中任务、有未完成 RFQ、有跟踪中的策略、状态文件无法解析。
+  - UID 导入时用密钥读一次 `query-api` 取得（与启动检查同一套权限 / IP / 统一账户检查，15 s 上限，失败即不导入）。
+  - 已有 `options` 时不覆盖；`secrets.json` 已有 `bybitOptions` 而配置没有 `options` 时也不覆盖。
+  - 实现：`src/service/import-options.ts`，接入 `import-workbench.ts`（命令行 `--options`）、`import-helper.ts` 与 `import-channel.ts`（页面勾选「导入期权账户」）；安装脚本 `sudo bash install.sh --import-workbench --options`。
+  - 只输出打码 UID、参数与原因，不输出密钥。
+  - 工作台的其余估算参数（`OPTION_*_FACTOR`、`OPTION_LIQUIDATION_FEE_RATE`、`OPTION_FEE_CAP_PCT`、`QUOTE_STALE_SECONDS`、`MAX_SPREAD_BPS`、`TARGET_DTE_DAYS`、`BBO_POLL_SECONDS`）本服务不导入、按自己的默认值，改过的会列在导入提示里。
+  - G2a 起导入 `OPEN_HOUR_UTC`、`OPEN_MINUTE_UTC`、`OPEN_WINDOW_SECONDS`（定时开仓时间）与 `ALLOW_MARKET_FALLBACK`（IOC 兜底）；定时开仓本身导入写入的配置里总是关闭（工作台必须先关自动开仓才能导入），要用时在期权页打开；数据目录里留有以前的 `options.sqlite`、且当时在页面打开过定时开仓时，沿用页面上的开关，导入后先在期权页确认（页面开关存在 `options.sqlite`，优先于配置，见第 4 节）。
+  - 导入助手与命令行导入沿用 `/etc/trading-platform/environment` 的代理设置。
 
 ## 4 切换与回退
 

@@ -147,3 +147,15 @@
 **样式**：只在 `styles.css` 加两条 `table.data.log-table` 规则：内容列换行显示（等宽字体），手机宽度表格不设最小宽度，避免日志表横向滚动。
 
 **回滚**：`sudo bash install.sh --version v0.9.0`（先按 README 删掉 `config.json` 的 `summary` 与 `secrets.json` 的 `feishuScheduled`；页面导入配对时会自动写入 `feishuScheduled`，自己没写过也要检查）。
+
+## 行情监控页（Monitor M-1）
+
+**对照的工作台页面**：`modules/monitor/app/anthropic-panel.tsx`（提交 `35ebb94`）与 `spread-chart.tsx`（`4be9aa4`），按它在工作台 Hub 里嵌入显示的样子（不显示工作台顶栏）。数据规则复制自 `lib/anthropic-history.ts`（`35ebb94`）、`lib/market.ts` 与 `lib/chart-ranges.ts`（`8470785`）、`lib/chart-sampling.ts`（`7581e78`），放在 `web/src/monitor-history.ts`；走势图用已复制的 `svg-plot.tsx`。
+
+**页面**：新标签「行情监控」（`#/monitor`，只在 `/api/monitor/state` 有应答时显示，与原油页一样在 `.aster-module` 外）：工具栏（对比合约 xyz:ANT / io:ANTH / Lighter RH、刷新）、状态行、股数说明、各类错误与快照提示、四格读数、走势图（溢价率 / 每股价差 / 每股价格，1 周 / 1 月 / 全部）、近期观察、如何比较、数据来源与覆盖范围。文案沿用工作台，股数说明改为“服务配置股数”。没做成交标记、技术指标、股数同步。
+
+**样式**：`web/src/monitor.css`，来源是工作台 `modules/monitor/app/design-tokens.css`（`9ca6f68`，令牌放在 `.monitor-desk` 上）与 `globals.css`（`77f3cf2`，本页用到的规则，顺序与数值不改，选择器加 `.monitor-desk ` 前缀）；另有 preflight 的几条与 ASTER 外壳泄漏规则的复位，取法见 [docs/monitor.md](monitor.md) 的 M-1 实施记录。不引入 Tailwind，无内联样式（图表提示框位置沿用 `svg-plot.tsx` 的 CSSOM 写法）。
+
+**验证**：`scripts/dev-monitor.ts` 替身行情下在浏览器里切换对比合约、图表标签、时间范围、展开来源、悬停提示；DOM 内只有 `svg-plot` 提示框的 CSSOM 定位。
+
+**回滚**：`sudo bash install.sh --version v0.10.0`（先删掉 `config.json` 的 `monitor`）。

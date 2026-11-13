@@ -47,8 +47,9 @@ check '重复执行无变化' 'grep -q "无变化" "$tmp/out" && grep -q "程序
 (cd "$root" && node --input-type=module -e '
   const { MAIN, LONG, SHORT } = await import("./test/aster-fake.ts");
   process.stdout.write(JSON.stringify({ accounts: { main: MAIN, "long-1": LONG, "short-1": SHORT } }));') >"$TP_CONF_DIR/secrets.json"
-# The example's ASTER part only: its oil block needs Binance/Bybit keys, which the ASTER-only checks below do not cover.
-node -e 'const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); delete c.oil; c.secretsFile = process.argv[2]; process.stdout.write(JSON.stringify(c, null, 2));' "$root/deploy/config.example.json" "$TP_CONF_DIR/secrets.json" >"$TP_CONF_DIR/config.json"
+# The example's ASTER part only: its oil block needs Binance/Bybit keys, which the ASTER-only checks below do not cover;
+# its monitor block would read the exchanges' public market data during the test.
+node -e 'const c = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); delete c.oil; delete c.monitor; c.secretsFile = process.argv[2]; process.stdout.write(JSON.stringify(c, null, 2));' "$root/deploy/config.example.json" "$TP_CONF_DIR/secrets.json" >"$TP_CONF_DIR/config.json"
 chmod 644 "$TP_CONF_DIR/config.json" "$TP_CONF_DIR/secrets.json"
 run --package "$tmp/a" && status=0 || status=$?
 check '写好配置后执行成功' '[[ $status -eq 0 ]]'

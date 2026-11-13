@@ -38,7 +38,7 @@ function fetcher({ binance, hl, rh = () => fail(500) }: { binance: (url: URL) =>
  * unknown market id answers HTTP 400, and candles return the latest `count_back` bars opening before
  * `end_timestamp` (at most 500), as measured against api.rh.lighter.xyz.
  */
-function rhVenue({ id = 38, mark = '1503.5', status = 'active', symbol = 'ANTHROPIC', listedAt = NOW - 400 * DAY, close = (_t: number) => 1503 } = {}) {
+function rhVenue({ id = 38, mark = '1503.5', status = 'active', symbol = 'ANTHROPIC', listedAt = NOW - 400 * DAY, close = (_t: number): number => 1503 } = {}) {
   const row = () => ({ symbol, market_id: id, market_type: 'perp', status, mark_price: mark, index_price: '1502.5', last_trade_price: 1504.1, created_at: String(listedAt) });
   return (url: URL) => {
     if (url.pathname === '/api/v1/orderBookDetails') {
@@ -230,7 +230,7 @@ test('Lighter RH code 23000, as HTTP 400 or inside a 200 body, cools down like a
 
 test('a Lighter RH response over 2 MiB is refused, whether announced by Content-Length or only seen while streaming', async () => {
   const binance = () => ok({ symbol: 'ANTHROPICUSDT', markPrice: '1270' });
-  const padded = (size: number) => async (url: URL) => { const body = await rhVenue()(url).json(); return ok({ ...body, pad: 'x'.repeat(size) }); };
+  const padded = (size: number) => async (url: URL) => { const body = await rhVenue()(url).json() as Record<string, unknown>; return ok({ ...body, pad: 'x'.repeat(size) }); };
   const read = (rh: (url: URL) => Response | Promise<Response>) => fetchAnthropicQuote({ now: NOW, fetcher: fetcher({ binance, hl: () => fail(500), rh }), rh: createRhLighterState(), gate: createBinanceGate(), clock: () => NOW });
   const small = await read(padded(1024 * 1024));
   assert.equal(small.errors.rh, undefined, 'a valid 1 MiB catalog is read');

@@ -7,7 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createMonitorStore, MONITOR_FILE, type MonitorStore } from '../src/monitor/store.ts';
-import { CANDLE_STALE_MS, QUOTE_KEY, QUOTE_STALE_MS, createAnthropicMonitor } from '../src/monitor/anthropic.ts';
+import { CANDLE_STALE_MS, MAX_REPLY_BYTES, QUOTE_KEY, QUOTE_STALE_MS, boundedReply, createAnthropicMonitor } from '../src/monitor/anthropic.ts';
 import { MODULE_KEYS, parseServiceConfig } from '../src/service/config.ts';
 import { monitorSummary } from '../src/service/monitor-config.ts';
 import { ANTHROPIC_LEG_KEYS, type AnthropicCandleRow } from '../src/vendor/anthropic-market.mjs';
@@ -399,4 +399,14 @@ test('服务进程：monitor.sqlite 打不开时服务照常启动，行情监�
     process.removeAllListeners('SIGINT'); process.removeAllListeners('SIGTERM');
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('交易所应答超过 8 MiB：按读取失败处理，不整体解析；上限内的应答原样可读', async () => {
+  const body = (bytes: number) => new Response(new ReadableStream<Uint8Array>({
+    start(controller) { for (let left = bytes; left > 0; left -= 65_536) controller.enqueue(new Uint8Array(Math.min(65_536, left))); controller.close(); },
+  }));
+  assert.equal((await boundedReply(body(MAX_REPLY_BYTES)).arrayBuffer()).byteLength, MAX_REPLY_BYTES);
+  await assert.rejects(boundedReply(body(MAX_REPLY_BYTES + 1)).arrayBuffer(), /超过大小上限/);
+  assert.throws(() => boundedReply(new Response('{}', { headers: { 'content-length': String(MAX_REPLY_BYTES + 1) } })), /超过大小上限/);
+  assert.deepEqual(await boundedReply(Response.json({ ok: 1 }, { status: 429 })).json(), { ok: 1 });
 });

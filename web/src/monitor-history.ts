@@ -19,7 +19,7 @@ export const ANTHROPIC_WARMUP_DAYS = 21;
 /** The quote as the service sends it: the venues' marks, and whether the service still counts them as current. */
 export function anthropicQuote(input: unknown): AnthropicQuote {
   const quote = validateAnthropicQuote(input);
-  return { ...quote, status: (input as { status?: unknown }).status === 'snapshot' ? 'snapshot' : 'live' };
+  return { ...quote, status: (input as { status?: unknown }).status === 'live' ? 'live' : 'snapshot' };
 }
 
 export function anthropicHistory(input: unknown): AnthropicHistory {

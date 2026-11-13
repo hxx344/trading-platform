@@ -54,7 +54,9 @@ test('chart rows are per share with the configured shares and match the quote pr
 test('the quote keeps only the service\'s snapshot mark beside the validated marks', () => {
   const raw = { fetchedAt: new Date(START).toISOString(), binance: { markPx: 1270, fundingRate: 0.0001, nextFundingTime: null }, xyz: null, io: null, rh: null, errors: { xyz: '响应无效或网络失败' } };
   assert.equal(anthropicQuote({ ...raw, status: 'snapshot' }).status, 'snapshot');
-  assert.equal(anthropicQuote({ ...raw, status: 'whatever' }).status, 'live');
+  assert.equal(anthropicQuote({ ...raw, status: 'live' }).status, 'live');
+  assert.equal(anthropicQuote({ ...raw, status: 'whatever' }).status, 'snapshot', 'anything but live is shown as stale');
+  assert.equal(anthropicQuote(raw).status, 'snapshot');
   assert.throws(() => anthropicQuote({ ...raw, fetchedAt: 'never' }));
 });
 

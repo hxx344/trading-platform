@@ -7,7 +7,7 @@
 
 第二个模块“原油双腿”（Binance/Bybit 的 BZUSDT、CLUSDT，同所或跨所两腿）自 v0.8.0 起可用（尚未在真实账户上下过单），方案与进度见 [docs/oil.md](docs/oil.md)；`config.json` 里没有 `oil` 时服务仍只服务 ASTER，行为与之前相同。
 
-第三个模块“行情监控”（工作台 Monitor 分批接入，方案与进度见 [docs/monitor.md](docs/monitor.md)）第一批是 Anthropic 价差：Binance、Hyperliquid（xyz:ANT、io:ANTH）、Lighter RH 的报价与 15 分钟 K 线，按每股口径算溢价，只读公开行情，不需要密钥。在 `config.json` 写 `"monitor": { "anthropic": {} }` 启用（可加 `"shares": { "outstanding": 12.7, "diluted": 16.7 }`，十亿股，不写用这两个默认值，须满足 1 ≤ 流通 ≤ 完全稀释 ≤ 100）；只配 `monitor` 时 `pairs` 可以省略。没有 `monitor` 时不采集、不显示页面，行为与之前相同。
+第三个模块“行情监控”（工作台 Monitor 分批接入，方案与进度见 [docs/monitor.md](docs/monitor.md)）第一批是 Anthropic 价差：Binance、Hyperliquid（xyz:ANT、io:ANTH）、Lighter RH 的报价与 15 分钟 K 线，按每股口径算溢价，只读公开行情，不需要密钥。在 `config.json` 写 `"monitor": { "anthropic": {} }` 启用（可加 `"shares": { "outstanding": 12.7, "diluted": 16.7 }`，十亿股，不写用这两个默认值，须满足 1 ≤ 流通 ≤ 完全稀释 ≤ 100）；只配 `monitor` 时 `pairs` 可以省略。没有 `monitor` 时不采集、不显示页面，行为与之前相同。启用后服务器会定时访问 Binance、Hyperliquid、Lighter RH 的公开行情接口（`deploy/config.example.json` 带了这一项，安装脚本生成的配置不带）；服务器所在地区被某家交易所限制时，那一家读不到，页面显示为快照或暂无数据，其余功能不受影响。
 
 方案、决策与进度见 [docs/plan.md](docs/plan.md)；执行器的状态机语义、回滚与已知限制见 [docs/executor.md](docs/executor.md)。
 

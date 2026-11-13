@@ -26,6 +26,24 @@ export interface AnthropicQuoteView extends AnthropicQuote {
 export type AnthropicCandleView = AnthropicCandleWindow & { coverage: AnthropicCandleCoverage; lastAttemptAt: string | null; lastError: string | null };
 export interface LoopContext { stopped(): boolean; pause(ms: number): Promise<void> }
 
+/** The largest reply read from a venue: a full candle page is well under 1 MiB, and the vendor module only limits Lighter RH itself. */
+export const MAX_REPLY_BYTES = 8 * 1024 * 1024;
+/** The reply with its body cut off (as a read error) once it passes MAX_REPLY_BYTES, so an oversized answer is never parsed whole in the trading process. */
+export function boundedReply(response: Response): Response {
+  const length = Number(response.headers.get('content-length'));
+  if (length > MAX_REPLY_BYTES) { void response.body?.cancel().catch(() => undefined); throw new Error('交易所应答超过大小上限'); }
+  if (!response.body) return response;
+  let size = 0;
+  const counted = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      size += chunk.byteLength;
+      if (size > MAX_REPLY_BYTES) controller.error(new Error('交易所应答超过大小上限'));
+      else controller.enqueue(chunk);
+    },
+  }));
+  return new Response(counted, { status: response.status, statusText: response.statusText, headers: response.headers });
+}
+
 const iso = (ms: number | null): string | null => ms === null ? null : new Date(ms).toISOString();
 const detail = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 200);
 
@@ -34,7 +52,7 @@ export function createAnthropicMonitor({ store, fetchImpl = fetch, now = Date.no
 }) {
   const stopping = new AbortController();
   // The vendor module puts its own timeout on every request; the stop signal is added so a shutdown does not wait one out.
-  const fetcher: AnthropicFetcher = (url, init) => fetchImpl(url, { ...init, signal: init.signal ? AbortSignal.any([init.signal, stopping.signal]) : stopping.signal });
+  const fetcher: AnthropicFetcher = async (url, init) => boundedReply(await fetchImpl(url, { ...init, signal: init.signal ? AbortSignal.any([init.signal, stopping.signal]) : stopping.signal }));
   // Per instance rather than the module's shared ones: the cooldowns and the Lighter RH market id belong to this service.
   const gate = createBinanceGate(), rh = createRhLighterState();
 
@@ -42,6 +60,7 @@ export function createAnthropicMonitor({ store, fetchImpl = fetch, now = Date.no
   let candles: AnthropicCandles | null = null, candlesRestored = false, candleAttemptAt: number | null = null, candleError: string | null = null;
   // The stored rows could not be read back: the next successful round rewrites the table instead of adding to it.
   let replaceCandles = false;
+  const windows = new Map<number | null, { source: AnthropicCandles; stale: boolean; value: AnthropicCandles | AnthropicCandleWindow }>();
 
   try {
     const saved = store.readState(QUOTE_KEY);
@@ -80,6 +99,8 @@ export function createAnthropicMonitor({ store, fetchImpl = fetch, now = Date.no
       quoteReport.failed(quoteError, detail(error));
       return;
     }
+    // A stop that cut some legs short still returns the others: such a round is dropped, not stored over a complete one.
+    if (stopping.signal.aborted) return;
     quote = next; quoteRestored = false; quoteError = null;
     quoteReport.recovered();
     try { store.writeState(QUOTE_KEY, next); quoteSave.recovered(); }
@@ -97,6 +118,7 @@ export function createAnthropicMonitor({ store, fetchImpl = fetch, now = Date.no
       candleReport.failed(candleError, detail(error));
       return;
     }
+    if (stopping.signal.aborted) return;
     candleReport.recovered();
     const previous = new Map((candles?.data ?? []).map(row => [row.time, row]));
     const changed = replaceCandles ? next.data : next.data.filter(row => {
@@ -130,8 +152,14 @@ export function createAnthropicMonitor({ store, fetchImpl = fetch, now = Date.no
       const stale = candlesRestored || candleError !== null || now() - Date.parse(candles.metadata.fetchedAt) > CANDLE_STALE_MS;
       const snapshot: AnthropicCandles = { ...candles, status: stale ? 'snapshot' : 'live' };
       const { firstObservation, lastObservation, rows } = snapshot.metadata;
-      const window = days === null ? snapshot : anthropicCandleWindow(snapshot, days);
-      return { coverage: { firstObservation, lastObservation, rows }, ...window, lastAttemptAt: iso(candleAttemptAt), lastError: candleError };
+      // Cutting a window validates every stored row; it is redone only when a round stored new candles or the freshness changed.
+      let window = windows.get(days);
+      if (!window || window.source !== candles || window.stale !== stale) {
+        window = { source: candles, stale, value: days === null ? snapshot : anthropicCandleWindow(snapshot, days) };
+        if (windows.size >= 8) windows.clear();
+        windows.set(days, window);
+      }
+      return { coverage: { firstObservation, lastObservation, rows }, ...window.value, lastAttemptAt: iso(candleAttemptAt), lastError: candleError };
     },
     /** For the status page. */
     status() {

@@ -20,10 +20,13 @@ import { assertDistinctSigners, loadServiceConfig, loadServiceSecrets, urlHost, 
 import { PASSWORD_FILE, hashPassword, loadPasswordHash, type PasswordHash } from '../login-password.ts';
 import { createTakeoverGuard } from './takeover.ts';
 import { createNotifier, type EventRow, type Notifier } from './feishu.ts';
-import { runUserStream, type SocketLike } from './stream.ts';
+import { createStreamStatus, runUserStream, type SocketLike } from './stream.ts';
+import { balanceWindow, createBalanceSamples, type BalanceSamples } from './balance-samples.ts';
 import { readImportResult, submitImportRequest } from './import-channel.ts';
 
 const NOTIFY_MS = 2_000;
+/** How often the stored balances are looked at for the trend chart; a pair gets at most one sample a minute. */
+const SAMPLE_MS = 30_000;
 const FINAL_FLUSH_MS = 5_000;
 const CONFIG_SESSION = 'service-config';
 /** Under systemd's TimeoutStopSec (30 s), leaving time for the final alert flush. */
@@ -159,15 +162,28 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
       incidentPair: id => { try { return executor.adlIncident(id).pairId; } catch { return null; } },
     });
   } catch (error) { executor.close(); store.close(); locks.release(); throw error; }
+  // Only the trend chart depends on it: a file that cannot be opened is reported on the status page, the service runs on.
+  let samples: BalanceSamples | null = null, samplesError: string | null = null;
+  try { samples = createBalanceSamples({ file: join(dir, 'samples.sqlite') }); }
+  catch (error) { samplesError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`余额采样库无法打开，走势图不可用：${samplesError}\n`); }
+  const streams = createStreamStatus(streamed);
   const enabled = executor.transferPairs().filter(pair => pair.enabled).length;
   try {
     notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个`);
     for (const text of warnings) notifier.notify(`【配置未生效】${text}`);
-  } catch (error) { notifier.close(); executor.close(); store.close(); locks.release(); throw error; }
+  } catch (error) { samples?.close(); notifier.close(); executor.close(); store.close(); locks.release(); throw error; }
 
   return runExecutor({
     executor, store, dir, port, app, session,
     ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: ['transfers', 'adl'], drainMs: DRAIN_MS,
+    views: {
+      status: () => ({ budget: client.requestBudget.state(), streams: streams.view(), feishu: notifier.status(), samples: { available: samples !== null, error: samplesError } }),
+      balanceHistory: (pairId, range) => {
+        if (samples) return samples.history(pairId, range);
+        const window = balanceWindow(range, Date.now());
+        return window && { pairId, range, ...window, points: [], unavailable: `余额采样库无法打开，走势图不可用：${samplesError ?? '未知原因'}（不影响划转与 ADL）` };
+      },
+    },
     ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir) } } : {}),
     startedMessage: `ASTER 服务已启动（${config.pairs.length} 个配对，已启用 ${enabled} 个）`,
     background: context => [
@@ -178,7 +194,17 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
           await context.pause(NOTIFY_MS);
         }
       })(),
-      ...streamed.map(accountId => runUserStream({ client, credentials: byAddress.get(accountId)!, accountId, push: (id, event) => trading.push(id, event), stopped: context.stopped, pause: context.pause, ...(connect ? { connect } : {}) })),
+      (async () => {
+        while (!context.stopped() && samples) {
+          try { samples.record(executor.transferPairs()); samples.prune(); }
+          catch (error) { process.stderr.write(`余额采样失败：${error instanceof Error ? error.message : String(error)}\n`); }
+          await context.pause(SAMPLE_MS);
+        }
+      })(),
+      ...streamed.map(accountId => runUserStream({
+        client, credentials: byAddress.get(accountId)!, accountId, stopped: context.stopped, pause: context.pause, ...(connect ? { connect } : {}),
+        push: (id, event) => { streams.onMessage(id); trading.push(id, event); }, onState: (connected, reason) => streams.onState(accountId, connected, reason),
+      })),
     ],
     onStopping: (reason, detail) => {
       const text = reason === 'signal' ? '【服务停止】收到停止信号，正常退出' : `【服务异常停止】${detail || reason}；systemd 会在 5 秒后自动重启，请查看日志`;
@@ -189,6 +215,7 @@ export async function startService({ config, secrets, dir, fetchImpl, connect, n
       try { notifier.poll(); } catch { /* best effort */ }
       await Promise.race([notifier.flush(), new Promise(resolve => setTimeout(resolve, FINAL_FLUSH_MS).unref())]);
       notifier.close();
+      samples?.close();
       locks.release();
     },
   });

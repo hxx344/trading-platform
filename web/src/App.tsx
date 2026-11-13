@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
 import { ImportPanel } from './ImportPanel.tsx';
 import { AdlPanel } from './AdlPanel.tsx';
+import { PairDetail } from './PairDetail.tsx';
 import { PairsPanel } from './PairsPanel.tsx';
 import { PositionsPanel } from './PositionsPanel.tsx';
+import { useRoute, type Route } from './route.ts';
+import { StatusPage } from './StatusPage.tsx';
 import { Callout, StatePanel } from './StateViews.tsx';
 import { clock } from './labels.ts';
 import { useLiveResource } from './use-live-resource.ts';
@@ -18,7 +21,12 @@ function statusLine(state: ServiceState): string {
     + (state.notionalLimits ? ` · 名义金额上限 单笔 ${state.notionalLimits.perJob} USDT，累计开仓 ${state.notionalLimits.openUsed} / ${state.notionalLimits.totalOpen} USDT` : '');
 }
 
+const TABS: { page: Route['page']; href: string; text: string }[] = [
+  { page: 'overview', href: '#/', text: '总览' }, { page: 'pair', href: '#/pair', text: '配对详情' }, { page: 'status', href: '#/status', text: '运行状态' },
+];
+
 export function App() {
+  const route = useRoute();
   const [expired, setExpired] = useState(false);
   const onExpired = useCallback(() => setExpired(true), []);
   const live = useLiveResource<ServiceState>('/api/state', { intervalMs: REFRESH_MS, timeoutMs: READ_TIMEOUT_MS, onExpired });
@@ -45,13 +53,18 @@ export function App() {
       {statusLine(state)}
       {stale ? <span className="err">{status === 'paused' ? ` · 页面在后台，已暂停刷新（停留在 ${clock(receivedAt)}）` : status === 'offline' ? ` · 网络离线（停留在 ${clock(receivedAt)}）` : error ? ` · 刷新失败：${error.message}（停留在 ${clock(receivedAt)}）` : ` · 正在刷新，下方仍是 ${clock(receivedAt)} 的结果`}</span> : null}
     </p> : null}
-    <ImportPanel onImported={changed} />
+    <nav className="tabs" aria-label="页面">
+      {TABS.map(tab => <a key={tab.page} href={tab.href} className={tab.page === route.page ? 'tab active' : 'tab'} aria-current={tab.page === route.page ? 'page' : undefined}>{tab.text}</a>)}
+    </nav>
+    {route.page === 'status' ? <StatusPage onExpired={onExpired} /> : <>
+    {route.page === 'overview' ? <ImportPanel onImported={changed} /> : null}
     {!state ? (status === 'error' || status === 'offline'
       ? <StatePanel kind="error" title="读取服务状态失败" detail={error?.message ?? '网络离线'} />
-      : <StatePanel kind="loading" title="加载中…" />) : <>
+      : <StatePanel kind="loading" title="加载中…" />) : route.page === 'pair' ? <PairDetail state={state} pairId={route.pairId} stale={stale} onExpired={onExpired} /> : <>
       <PairsPanel state={state} onChanged={changed} />
       <PositionsPanel view={state.positions} stale={stale} shownAt={state.positions.checkedAt} />
       <AdlPanel state={state} onChanged={changed} />
+    </>}
     </>}
   </main>;
 }

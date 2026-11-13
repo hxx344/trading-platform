@@ -11,7 +11,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import type { DatabaseSync } from 'node:sqlite';
 import { cmp, floorToStep, fromUnits, isZero, min, sub, add, units } from './decimal.ts';
-import { ContractError, PAIR_ID, UUID, exactKeys, reject, text, type PairSide } from './contracts.ts';
+import { ContractError, PAIR_ID, UUID, exactKeys, pageCursor, reject, text, type PageCursor, type PairSide } from './contracts.ts';
 import { VenueError } from './connector.ts';
 import { ADL_CANCEL_OPERATION_PREFIX, ADL_OPERATION_PREFIX, ControlRefusal, parseAdlOperationId, type AccountControl, type WriterOperation } from './account-control.ts';
 import {
@@ -1133,6 +1133,15 @@ export function createAdl({ db, now, budgets, connector, control, write, assertW
     sending: (pairId: string): string | null => db.prepare("SELECT 1 FROM adl_batches WHERE pair_id = ? AND settled = 0 AND state IN ('prepared', 'sending', 'open') LIMIT 1").get(pairId) ? 'ADL 减仓单正在发送或挂单' : null,
     pairs: () => { const list = pairs(); return list.map(pair => pairView(pair, list)); },
     incident: (id: string) => incidentView(requireIncident(id)),
+    /** One page of a pair's incidents, newest first; next is where the following page starts, null after the oldest. */
+    history(pairId: string, page: { before: PageCursor | null; limit: number }) {
+      const rows = (page.before
+        ? db.prepare('SELECT id, created_at, json FROM adl_incidents WHERE pair_id = ? AND (created_at < ? OR (created_at = ? AND id < ?)) ORDER BY created_at DESC, id DESC LIMIT ?').all(pairId, page.before.at, page.before.at, page.before.id, page.limit + 1)
+        : db.prepare('SELECT id, created_at, json FROM adl_incidents WHERE pair_id = ? ORDER BY created_at DESC, id DESC LIMIT ?').all(pairId, page.limit + 1)) as { id: string; created_at: number; json: string }[];
+      const shown = rows.slice(0, page.limit), last = shown.at(-1);
+      const items = shown.map(row => { try { return incidentView(JSON.parse(row.json) as Incident); } catch { return { id: row.id, pairId, unreadable: true as const, createdAt: row.created_at }; } });
+      return { items, next: rows.length > page.limit && last ? pageCursor(last.created_at, last.id) : null };
+    },
     recent: (limit = 10) => (db.prepare('SELECT json FROM adl_incidents ORDER BY created_at DESC, rowid DESC LIMIT ?').all(Math.min(Math.max(1, Math.trunc(limit)), 50)) as { json: string }[])
       .map(row => incidentView(JSON.parse(row.json) as Incident)),
     close: () => { unsubscribe?.(); },

@@ -364,3 +364,21 @@ export function parseTransferHistory(value: unknown, accountId: string): Transfe
   });
   return { accountId, rows, complete: raw.complete };
 }
+
+// ---- history pages ---------------------------------------------------------------
+/** Where the next page starts: the creation time and id of the last row shown, newest first. */
+export interface PageCursor { at: number; id: string }
+const CURSOR = /^(\d{1,15})\.([0-9a-f-]{36})$/;
+export const pageCursor = (at: number, id: string): string => `${at}.${id}`;
+/** The `before` and `limit` query parameters of a history page; absent ones start at the newest with the default size. */
+export function parsePage(before: string | null, limit: string | null, max: number, fallback: number): { before: PageCursor | null; limit: number } {
+  let cursor: PageCursor | null = null;
+  if (before !== null) {
+    const match = CURSOR.exec(before);
+    if (!match || !UUID.test(match[2]!)) return reject('invalid_cursor', '翻页位置无效');
+    cursor = { at: Number(match[1]), id: match[2]! };
+  }
+  if (limit === null) return { before: cursor, limit: fallback };
+  if (!/^\d{1,3}$/.test(limit) || Number(limit) < 1 || Number(limit) > max) return reject('invalid_limit', `每页条数须为 1–${max}`);
+  return { before: cursor, limit: Number(limit) };
+}

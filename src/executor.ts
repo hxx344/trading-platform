@@ -1549,9 +1549,11 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     writableAccounts: (): string[] => [...new Set(transfers.records().filter(pair => pair.enabled || adl.busy(pair.id) !== null).flatMap(pair => [pair.mainAccountId, pair.long, pair.short]))],
     corruptTransferPairs: transfers.corruptPairs,
     recentTransfers: transfers.recent,
+    transferHistory: transfers.history,
     adlPairs: adl.pairs,
     adlIncident: adl.incident,
     recentAdlIncidents: adl.recent,
+    adlHistory: adl.history,
     setAdlConfig: adl.setConfig,
     restartAdl: adl.restart,
     /** One read round of every paired ASTER account; never part of tick(), so a slow read cannot hold up the jobs, transfers or ADL. */

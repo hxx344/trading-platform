@@ -10,7 +10,7 @@ import type { AdlIncident, AdlPairView, ServiceState } from './types.ts';
 const requests = new RequestIds();
 type Draft = { autoReduce: boolean; batchNotional: string };
 
-function Progress({ incident }: { incident: AdlIncident }) {
+export function Progress({ incident }: { incident: AdlIncident }) {
   const rows = Object.entries(incident.progress || {});
   if (!rows.length) return <span className="muted">尚未读取现场</span>;
   return <>{rows.map(([symbol, entry]) => <div key={symbol}>
@@ -19,7 +19,7 @@ function Progress({ incident }: { incident: AdlIncident }) {
   </div>)}</>;
 }
 
-function Batches({ incident }: { incident: AdlIncident }) {
+export function Batches({ incident }: { incident: AdlIncident }) {
   if (!incident.batches.length) return <span className="muted">没有减仓批次</span>;
   return <div className="table-wrap"><table className="data">
     <thead><tr><th>时间</th><th>侧</th><th>合约</th><th>减仓</th><th>成交</th><th>状态</th><th>备注</th></tr></thead>

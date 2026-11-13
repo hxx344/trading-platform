@@ -8,8 +8,8 @@ import { performance } from 'node:perf_hooks';
 import type { DatabaseSync } from 'node:sqlite';
 import { cmp, floorToStep, fromUnits, min, sub, units } from './decimal.ts';
 import {
-  ContractError, PAIR_ID, TRANSFER_ASSET, TRANSFER_UNIT, UUID, exactKeys, parseSubAccountList, parseTransferBalance, parseTransferHistory, parseTransferPair, reject, text,
-  type PairSide, type TransferBalance, type TransferConfig, type TransferPairInput, type TransferReceipt,
+  ContractError, PAIR_ID, TRANSFER_ASSET, TRANSFER_UNIT, UUID, exactKeys, parseSubAccountList, parseTransferBalance, parseTransferHistory, parseTransferPair, pageCursor, reject, text,
+  type PageCursor, type PairSide, type TransferBalance, type TransferConfig, type TransferPairInput, type TransferReceipt,
 } from './contracts.ts';
 import { VenueError, parseTransferAck, type TransferAck, type TransferConnector } from './connector.ts';
 import { ControlRefusal, TRANSFER_OPERATION_PREFIX, type AccountControl, type WriteOutcome, type WriterOperation } from './account-control.ts';
@@ -788,6 +788,16 @@ export function createTransfers({ db, now, budgets, connector, control, write, a
     /** Readable pair records, for the ADL handling of the same sub-accounts. */
     records: () => listPairs().pairs,
     corruptPairs: () => listPairs().corrupt,
+    /** One page of a pair's transfers, newest first; next is where the following page starts, null after the oldest. */
+    history(pairId: string, page: { before: PageCursor | null; limit: number }) {
+      const rows = (page.before
+        ? db.prepare('SELECT id, created_at, json FROM transfers WHERE pair_id = ? AND (created_at < ? OR (created_at = ? AND id < ?)) ORDER BY created_at DESC, id DESC LIMIT ?').all(pairId, page.before.at, page.before.at, page.before.id, page.limit + 1)
+        : db.prepare('SELECT id, created_at, json FROM transfers WHERE pair_id = ? ORDER BY created_at DESC, id DESC LIMIT ?').all(pairId, page.limit + 1)) as { id: string; created_at: number; json: string }[];
+      const shown = rows.slice(0, page.limit), last = shown.at(-1);
+      // An unreadable row keeps its place in the paging and is shown as such rather than dropped.
+      const items = shown.map(row => { try { return transferView(JSON.parse(row.json) as Transfer); } catch { return { id: row.id, pairId, unreadable: true as const, preparedAt: row.created_at }; } });
+      return { items, next: rows.length > page.limit && last ? pageCursor(last.created_at, last.id) : null };
+    },
     recent: (limit = 20) => (db.prepare('SELECT json FROM transfers ORDER BY created_at DESC, rowid DESC LIMIT ?').all(Math.min(Math.max(1, Math.trunc(limit)), 100)) as { json: string }[])
       .flatMap(row => { try { return [transferView(JSON.parse(row.json) as Transfer)]; } catch { return []; } }),
   };

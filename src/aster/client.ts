@@ -93,9 +93,14 @@ export class RequestBudget {
     const until = this.now() + ms;
     if (until > this.coolUntil) { this.coolUntil = until; this.coolReason = reason; }
   }
-  state(): { usedLastMinute: number; limitPerMinute: number; coolingUntil: number | null; reason: string | null } {
+  /** ipUsedThisMinute: the venue's last report for the current minute (workbench use included), null without one. */
+  state(): { usedLastMinute: number; limitPerMinute: number; adlReserve: number; ipUsedThisMinute: number | null; ipCeiling: number; ipCeilingAdl: number; coolingUntil: number | null; reason: string | null } {
     const at = this.now();
-    return { usedLastMinute: this.used(at), limitPerMinute: this.limitPerMinute, coolingUntil: at < this.coolUntil ? this.coolUntil : null, reason: at < this.coolUntil ? this.coolReason : null };
+    return {
+      usedLastMinute: this.used(at), limitPerMinute: this.limitPerMinute, adlReserve: this.adlReserve,
+      ipUsedThisMinute: this.reported && this.reported.minute === Math.floor(at / 60_000) ? this.reported.weight : null, ipCeiling: IP_CEILING, ipCeilingAdl: IP_CEILING_ADL,
+      coolingUntil: at < this.coolUntil ? this.coolUntil : null, reason: at < this.coolUntil ? this.coolReason : null,
+    };
   }
 }
 

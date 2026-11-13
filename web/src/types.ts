@@ -3,14 +3,19 @@ export type Side = 'long' | 'short';
 export type Direction = 'long' | 'short';
 
 export interface Account { venue: string; accountMode: string; accountId: string; credentialVersion: number | string }
-export interface Balance { available: string; equity: string; maxWithdraw: string }
+export interface Balance { available: string; equity: string; maxWithdraw: string; receivedAt: number }
 export interface TransferView {
   id: string; pairId: string; sourceSide: Side; destinationSide: Side; amount: string; asset: string; state: string;
   readyAt: number | null; recovered: boolean; preparedAt: number; basis: string | null; receipt: string | null; labelNote: string | null; note: string | null;
+  sentAt: number | null; ackAt: number | null; tranId: string | null; evidence: number; baseline: ('source' | 'destination')[]; settledAt: number | null; balancesRefreshedAt: number | null;
 }
 export interface PairView {
   id: string; mainAccountId: string; enabled: boolean; long: string; short: string; balances: Record<Side, Balance> | null;
   blocked: string | null; cooldownUntil: number; note: string | null; current: TransferView | null;
+  config: TransferConfig; nextCheckAt: number; noteIdle: boolean; balancesFresh: boolean;
+}
+export interface TransferConfig {
+  threshold: string; minTransfer: string; maxTransfer: string; bufferRatio: string; longReserve: string; shortReserve: string; cooldownMs: number; checkIntervalMs: number;
 }
 export interface PositionRow { symbol: string; direction: Direction; positionSide: string; quantity: string; entryPrice: string; markPrice: string; notional: string; unrealizedProfit: string; updateTime: number }
 export interface PositionSideView { account: string; state: 'pending' | 'fresh' | 'retained' | 'unavailable'; sampledAt: number | null; ageMs: number; note: string | null; positions: PositionRow[] }
@@ -41,4 +46,26 @@ export interface ServiceState {
   transfers: { pairs: PairView[]; corruptPairs: string[]; recent: TransferView[] };
   adl: { pairs: AdlPairView[]; recent: AdlIncident[] };
   positions: PositionsView;
+}
+
+// ---- the read-only detail endpoints -------------------------------------------------
+/** A row the server could not parse keeps its place in the paging. */
+export interface Unreadable { id: string; pairId: string; unreadable: true; preparedAt?: number; createdAt?: number }
+export interface HistoryPage<T> { items: (T | Unreadable)[]; next: string | null }
+export interface BalancePoint { at: number; long: { available: string; equity: string }; short: { available: string; equity: string }; fresh: boolean }
+export interface BalanceHistory { pairId: string; range: string; from: number; to: number; bucketMs: number; sampleEveryMs: number; points: BalancePoint[]; unavailable?: string }
+
+export interface LoopStatus { name: string; lastOkAt: number | null; failures: number; lastError: string | null; lastErrorAt: number | null }
+export interface StreamStatus { account: string; connected: boolean; since: number | null; lastMessageAt: number | null; disconnects: number; lastError: string | null; lastErrorAt: number | null }
+export interface OutboxRow { id: number; createdAt: number; text: string; attempts: number; nextAt: number; sentAt: number | null; lastError: string | null }
+export interface ServiceStatus {
+  health: {
+    startedAt: number; now: number; generation: number; retired: boolean; schemaVersion: number; walBytes: number; walLimitBytes: number;
+    writes: { transactions: number; busy: number; waitBucketsMs: number[]; waitBuckets: number[]; maxWaitMs: number; maxHoldMs: number };
+    loops: LoopStatus[];
+  };
+  budget?: { usedLastMinute: number; limitPerMinute: number; adlReserve: number; ipUsedThisMinute: number | null; ipCeiling: number; ipCeilingAdl: number; coolingUntil: number | null; reason: string | null };
+  streams?: StreamStatus[];
+  feishu?: { configured: boolean; pending: number; retrying: number; lastSentAt: number | null; lastError: string | null; nextRetryAt: number | null; retentionMs: number; recent: OutboxRow[] };
+  samples?: { available: boolean; error: string | null };
 }

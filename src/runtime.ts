@@ -2,9 +2,9 @@
 // their own schedules, the position reads, the loopback page and an orderly shutdown.
 import { randomBytes } from 'node:crypto';
 import { createServer as createNetServer, type AddressInfo } from 'node:net';
-import { WAL_SIZE_LIMIT_BYTES, type Store } from './store.ts';
+import { WAIT_BUCKETS_MS, WAL_SIZE_LIMIT_BYTES, type Store } from './store.ts';
 import type { Executor } from './executor.ts';
-import { createExecutorServer, type ImportChannel } from './http.ts';
+import { createExecutorServer, type ImportChannel, type ServiceViews } from './http.ts';
 import { SESSION_LIFETIME_MS, writeAccessUrl } from './data-dir.ts';
 import type { PasswordHash } from './login-password.ts';
 import type { WebApp } from './web-assets.ts';
@@ -43,6 +43,8 @@ export interface RunOptions {
   /** A session (cookie value) kept across restarts, so the open page stays logged in; random per start when absent. */
   session?: string;
   imports?: ImportChannel;
+  /** The service's own read-only views; the status one is shown under the run's health (start, database, loops). */
+  views?: ServiceViews;
   /** Which passes run; the service has no two-leg jobs. */
   passes?: readonly ('jobs' | 'transfers' | 'adl')[];
   startedMessage: string;
@@ -62,7 +64,7 @@ export interface RunOptions {
 
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
-export function runExecutor({ executor, store, dir, port, listen, password, listenRetry = { firstMs: 2_000, maxMs: 30_000 }, page, app, session, imports, passes = ['jobs', 'transfers', 'adl'], startedMessage, background, onStopping, onStopped, log = line => process.stderr.write(`${line}\n`), drainMs = 0 }: RunOptions): { shutdown(reason?: string, detail?: string): Promise<void>; done: Promise<void> } {
+export function runExecutor({ executor, store, dir, port, listen, password, listenRetry = { firstMs: 2_000, maxMs: 30_000 }, page, app, session, imports, views, passes = ['jobs', 'transfers', 'adl'], startedMessage, background, onStopping, onStopped, log = line => process.stderr.write(`${line}\n`), drainMs = 0 }: RunOptions): { shutdown(reason?: string, detail?: string): Promise<void>; done: Promise<void> } {
   let stopping = false;
   let finished!: () => void;
   const done = new Promise<void>(resolve => { finished = resolve; });
@@ -92,14 +94,21 @@ export function runExecutor({ executor, store, dir, port, listen, password, list
     sleepers.add(wake);
   });
   const context: RunContext = { stopped: () => stopping || executor.retired, pause };
+  const startedAt = Date.now();
+  /** Per loop, for the status page: its last good round and its failures in a row. */
+  const loopStatus = new Map<string, { lastOkAt: number | null; failures: number; lastError: string | null; lastErrorAt: number | null }>();
+  const loopOk = (label: string) => { const row = loopStatus.get(label); if (row) { row.lastOkAt = Date.now(); row.failures = 0; } };
+  const loopFailed = (label: string, error: string) => { const row = loopStatus.get(label); if (row) { row.failures += 1; row.lastError = error.slice(0, 300); row.lastErrorAt = Date.now(); } };
+  const loopTracked = (label: string) => { loopStatus.set(label, { lastOkAt: null, failures: 0, lastError: null, lastErrorAt: null }); };
   // Each pass runs on its own schedule, so a venue that answers slowly holds up only its own loop (2.4a).
   // A loop that no longer runs must not keep the lease alive: exit and let another instance take over.
   const passLoop = (label: string, pass: () => Promise<void>) => (async () => {
     let failures = 0, last = '';
+    loopTracked(label);
     while (!context.stopped()) {
-      try { await pass(); failures = 0; }
+      try { await pass(); failures = 0; loopOk(label); }
       catch (error) {
-        failures += 1; last = message(error);
+        failures += 1; last = message(error); loopFailed(label, last);
         log(`${label}失败（${failures}/${MAX_TICK_FAILURES}）：${last}`);
         if (executor.retired || failures >= MAX_TICK_FAILURES) break;
       }
@@ -109,7 +118,18 @@ export function runExecutor({ executor, store, dir, port, listen, password, list
     if (!stopping) { process.exitCode = 1; void shutdown(executor.retired ? 'lease-lost' : 'pass-failed', executor.retired ? '写入租约已失去' : `${label}连续失败：${last}`); }
   })();
   const accessToken = randomBytes(32).toString('base64url');
-  const server = createExecutorServer({ executor, accessToken, log, ...(listen ? { host: listen.urlHost } : {}), ...(password ? { password } : {}), ...(page ? { page } : {}), ...(app ? { app } : {}), ...(session ? { session, sessionMaxAgeS: SESSION_MAX_AGE_S } : {}), ...(imports ? { imports } : {}) });
+  const status = (): Record<string, unknown> => {
+    const writes = store.stats();
+    return {
+      health: {
+        startedAt, now: Date.now(), generation: executor.generation, retired: executor.retired, schemaVersion: store.schemaVersion(), walBytes: store.walBytes(), walLimitBytes: WAL_SIZE_LIMIT_BYTES,
+        writes: { transactions: writes.transactions, busy: writes.busy, waitBucketsMs: [...WAIT_BUCKETS_MS], waitBuckets: writes.waitBuckets, maxWaitMs: writes.maxWaitMs, maxHoldMs: writes.maxHoldMs },
+        loops: [...loopStatus].map(([name, row]) => ({ name, ...row })),
+      },
+      ...(views?.status?.() ?? {}),
+    };
+  };
+  const server = createExecutorServer({ executor, accessToken, log, ...(listen ? { host: listen.urlHost } : {}), ...(password ? { password } : {}), ...(page ? { page } : {}), ...(app ? { app } : {}), ...(session ? { session, sessionMaxAgeS: SESSION_MAX_AGE_S } : {}), ...(imports ? { imports } : {}), views: { ...views, status } });
   // The chosen address feeds the same HTTP server, so both share one session, one login throttle and one Host check.
   const extra = listen ? createNetServer(socket => { server.emit('connection', socket); }) : null;
   server.on('error', error => {
@@ -144,11 +164,12 @@ export function runExecutor({ executor, store, dir, port, listen, password, list
   // The jobs pass prunes history; a process without it prunes on its own schedule.
   if (!passes.includes('jobs')) loops.push(passLoop('历史清理', async () => { executor.maintain(); }));
   // The position display reads on its own schedule, so a slow read neither waits for the passes nor holds them up (L049).
+  loopTracked('持仓读取');
   loops.push((async () => {
     while (!context.stopped()) {
       const started = Date.now();
-      try { await executor.refreshPositions(); }
-      catch (error) { log(`持仓读取轮失败：${message(error)}`); }
+      try { await executor.refreshPositions(); loopOk('持仓读取'); }
+      catch (error) { log(`持仓读取轮失败：${message(error)}`); loopFailed('持仓读取', message(error)); }
       if (context.stopped()) break;
       await pause(Math.max(TICK_MS, executor.budgets.positionsRefreshMs - (Date.now() - started)));
     }

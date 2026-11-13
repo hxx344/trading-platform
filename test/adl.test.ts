@@ -815,3 +815,43 @@ test('ADL：偏差不超过 0.5% 时不下单、记残差完成；超出 0.5% �
   assert.ok(balanced(h), '减到两侧相等');
   assert.ok(large.batches.length >= 8, '多批减仓，跨过 0.5% 后仍继续');
 }));
+
+test('ADL 历史：按配对逐页列出事件，新的在前，游标接续不重不漏；其他配对与非法游标', () => withAdl(async h => {
+  for (let round = 0; round < 3; round++) {
+    h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.002');
+    await h.ex.tick();
+    await untilClosed(h);
+    await run(h, 120_000, 10_000);
+  }
+  const all = h.ex.recentAdlIncidents(10).map(item => item.id);
+  assert.equal(all.length, 3);
+  const seen: string[] = [];
+  let before: { at: number; id: string } | null = null;
+  for (let page = 0; page < 5; page++) {
+    const result = h.ex.adlHistory(PAIR, { before, limit: 2 });
+    seen.push(...result.items.map(item => item.id));
+    if (!result.next) break;
+    const [at, id] = result.next.split('.');
+    before = { at: Number(at), id: id! };
+  }
+  assert.deepEqual(seen, all, '逐页拼起来与最近列表一致');
+  const first = h.ex.adlHistory(PAIR, { before: null, limit: 2 });
+  assert.equal(first.items.length, 2);
+  assert.ok('batches' in first.items[0]! && Array.isArray(first.items[0].batches), '每个事件带批次');
+  assert.deepEqual(h.ex.adlHistory('other-pair', { before: null, limit: 2 }), { items: [], next: null });
+  // The same millisecond for all three, and one row that cannot be parsed: the id breaks the tie, the bad row keeps its place.
+  h.store.db.prepare('UPDATE adl_incidents SET created_at = 1000 WHERE pair_id = ?').run(PAIR);
+  const broken = all[1]!;
+  h.store.db.prepare("UPDATE adl_incidents SET json = '{' WHERE id = ?").run(broken);
+  const tied: { id: string; unreadable?: boolean }[] = [];
+  let cursor: { at: number; id: string } | null = null;
+  for (let page = 0; page < 5; page++) {
+    const result = h.ex.adlHistory(PAIR, { before: cursor, limit: 1 });
+    tied.push(...result.items.map(item => ({ id: item.id, ...('unreadable' in item ? { unreadable: item.unreadable } : {}) })));
+    if (!result.next) break;
+    const [at, id] = result.next.split('.');
+    cursor = { at: Number(at), id: id! };
+  }
+  assert.deepEqual(tied.map(item => item.id), [...all].sort().reverse(), '同一毫秒按编号降序，不重不漏');
+  assert.deepEqual(tied.filter(item => item.unreadable).map(item => item.id), [broken]);
+}));

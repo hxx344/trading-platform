@@ -4,7 +4,7 @@
 // write, so neither another site nor another process that merely reaches the port can drive it.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { ContractError, VENUES, exactKeys, type Venue } from './contracts.ts';
+import { ContractError, VENUES, exactKeys, parsePage, type Venue } from './contracts.ts';
 import type { Executor } from './executor.ts';
 import { LIVE_PAGE, PAGE } from './page.ts';
 import { LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash } from './login-password.ts';
@@ -18,6 +18,9 @@ const UUID_PATH = /^\/api\/jobs\/([0-9a-f-]{36})(?:\/(stop|acknowledge|adopt-str
 const PAIR_PATH = /^\/api\/transfer-pairs\/([0-9A-Za-z_-]{1,64})\/(enable|disable)$/;
 const ADL_CONFIG_PATH = /^\/api\/adl\/pairs\/([0-9A-Za-z_-]{1,64})\/config$/;
 const ADL_RESTART_PATH = /^\/api\/adl\/incidents\/([0-9a-f-]{36})\/restart$/;
+const PAIR_READ_PATH = /^\/api\/transfer-pairs\/([0-9A-Za-z_-]{1,64})\/(balances|history)$/;
+const ADL_HISTORY_PATH = /^\/api\/adl\/pairs\/([0-9A-Za-z_-]{1,64})\/incidents$/;
+const TRANSFER_PAGE_MAX = 50, ADL_PAGE_MAX = 20;
 
 const PAGE_HEADERS = {
   'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer',
@@ -43,6 +46,13 @@ export const sessionCookieName = (port: number): string => `pa_executor_session_
 /** The page's workbench import (the ASTER service only): leaves a request for the root helper and reads its answer. */
 export interface ImportChannel { submit(body: unknown): { id: string; at: number }; latest(): unknown }
 
+/** Read-only views a service adds to the page: its run status and its balance history. */
+export interface ServiceViews {
+  status?(): Record<string, unknown>;
+  /** null for an unknown range. */
+  balanceHistory?(pairId: string, range: string): unknown;
+}
+
 /** accessToken is exchanged once per browser at /login; session is the cookie value and the executor session id. */
 export interface HttpOptions {
   executor: Executor;
@@ -55,6 +65,7 @@ export interface HttpOptions {
   /** The built page with its files under /assets; takes the place of page. */
   app?: WebApp;
   imports?: ImportChannel;
+  views?: ServiceViews;
   /** The login password's digest; without one only the access token logs in. */
   password?: PasswordHash;
   /** The address listened on besides loopback, as written in a URL (an IPv6 one in brackets); accepted in Host. */
@@ -68,7 +79,7 @@ export interface HttpOptions {
 const sameSecret = (given: string, expected: string): boolean =>
   timingSafeEqual(createHash('sha256').update(given).digest(), createHash('sha256').update(expected).digest());
 
-export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, app, imports, password, host, throttle = new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
+export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, app, imports, views, password, host, throttle = new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
   if (!accessToken) throw new Error('需要访问令牌');
   if (sameSecret(session, accessToken)) throw new Error('会话值不能与访问令牌相同');
   // The executor records which session asked for each command; it gets a digest, so the stored rows never hold the cookie.
@@ -197,6 +208,21 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
         transfers: { pairs: executor.transferPairs(), corruptPairs: executor.corruptTransferPairs(), recent: executor.recentTransfers(20) },
         adl: { pairs: executor.adlPairs(), recent: executor.recentAdlIncidents(10) }, positions: executor.asterPositions() });
     }
+    if (request.method === 'GET' && url.pathname === '/api/status') {
+      if (!views?.status) return send(response, 404, { code: 'not_found', message: '本服务没有运行状态' });
+      return send(response, 200, views.status());
+    }
+    const pairRead = request.method === 'GET' ? PAIR_READ_PATH.exec(url.pathname) : null;
+    if (pairRead?.[2] === 'history') {
+      return send(response, 200, executor.transferHistory(pairRead[1]!, parsePage(url.searchParams.get('before'), url.searchParams.get('limit'), TRANSFER_PAGE_MAX, 20)));
+    }
+    if (pairRead?.[2] === 'balances') {
+      if (!views?.balanceHistory) return send(response, 404, { code: 'not_found', message: '本服务没有余额走势' });
+      const history = views.balanceHistory(pairRead[1]!, url.searchParams.get('range') ?? '24h');
+      return history === null ? send(response, 400, { code: 'invalid_range', message: '时间范围无效' }) : send(response, 200, history);
+    }
+    const adlHistory = request.method === 'GET' ? ADL_HISTORY_PATH.exec(url.pathname) : null;
+    if (adlHistory) return send(response, 200, executor.adlHistory(adlHistory[1]!, parsePage(url.searchParams.get('before'), url.searchParams.get('limit'), ADL_PAGE_MAX, 10)));
     if (url.pathname === '/api/import') {
       if (!imports) return send(response, 404, { code: 'not_found', message: '本服务没有开启页面导入' });
       if (request.method === 'GET') return send(response, 200, { result: imports.latest() });

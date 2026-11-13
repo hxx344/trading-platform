@@ -35,7 +35,8 @@ export interface StreamOptions {
   connect?: (url: string) => SocketLike;
   now?: () => number;
   log?: (line: string) => void;
-  onState?: (connected: boolean) => void;
+  /** Connected, or disconnected with why (null after a clean end: shutdown or a planned renewal). */
+  onState?: (connected: boolean, reason?: string | null) => void;
 }
 
 const mask = (id: string): string => `***${id.slice(-4)}`;
@@ -50,6 +51,7 @@ export async function runUserStream({ client, credentials, accountId, push, stop
   let retry = RETRY_INITIAL_MS;
   while (!stopped()) {
     const opened: { at: number | null } = { at: null };
+    let reason: string | null = null;
     try {
       const answer = await call('POST') as { listenKey?: unknown } | null;
       const key = answer && typeof answer === 'object' ? answer.listenKey : undefined;
@@ -57,9 +59,10 @@ export async function runUserStream({ client, credentials, accountId, push, stop
       if (stopped()) return;
       await session(key, opened);
     } catch (error) {
-      log(`用户推送 ${mask(accountId)} 断开：${error instanceof Error ? error.message.slice(0, 160) : '未知错误'}`);
+      reason = error instanceof Error ? error.message.slice(0, 160) : '未知错误';
+      log(`用户推送 ${mask(accountId)} 断开：${reason}`);
     }
-    onState?.(false);
+    onState?.(false, reason);
     if (stopped()) return;
     if (opened.at !== null && now() - opened.at >= STABLE_MS) retry = RETRY_INITIAL_MS;
     await pause(retry);
@@ -83,7 +86,7 @@ export async function runUserStream({ client, credentials, accountId, push, stop
       const timer = setInterval(() => {
         if (stopped()) return finish();
         if (openedAt === null || renewing) return;
-        if (now() - openedAt >= RECONNECT_MS) return finish(new Error('计划重连'));
+        if (now() - openedAt >= RECONNECT_MS) return finish();
         if (now() - renewedAt >= KEEPALIVE_MS) {
           renewing = true;
           call('PUT').then(answer => {
@@ -107,4 +110,21 @@ export async function runUserStream({ client, credentials, accountId, push, stop
       });
     });
   }
+}
+
+/** What the status page shows of each user stream: connected or not, since when, its last message and its last failure. */
+export function createStreamStatus(accounts: readonly string[], now: () => number = Date.now) {
+  const rows = new Map(accounts.map(accountId => [accountId, { connected: false, since: null as number | null, lastMessageAt: null as number | null, disconnects: 0, lastError: null as string | null, lastErrorAt: null as number | null }]));
+  return {
+    onState(accountId: string, connected: boolean, reason?: string | null): void {
+      const row = rows.get(accountId);
+      if (!row) return;
+      if (connected) { row.connected = true; row.since = now(); return; }
+      if (row.connected) row.disconnects += 1;
+      row.connected = false; row.since = now();
+      if (reason) { row.lastError = reason; row.lastErrorAt = now(); }
+    },
+    onMessage(accountId: string): void { const row = rows.get(accountId); if (row) row.lastMessageAt = now(); },
+    view: () => [...rows].map(([accountId, row]) => ({ account: mask(accountId), ...row })),
+  };
 }

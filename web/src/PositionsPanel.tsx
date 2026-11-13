@@ -3,7 +3,7 @@ import { Callout, TableEmpty } from './StateViews.tsx';
 import { DIRECTION, POSITION_STATE, SIDE, clock, label, seconds } from './labels.ts';
 import type { PositionSideView, PositionsPair, PositionsView } from './types.ts';
 
-function SideBlock({ name, side }: { name: 'long' | 'short'; side: PositionSideView }) {
+export function SideBlock({ name, side }: { name: 'long' | 'short'; side: PositionSideView }) {
   const tone = side.state === 'fresh' ? 'ok' : side.state === 'pending' ? 'muted' : 'err';
   return <div className="position-side">
     <div>{label(SIDE, name)} {side.account} · <span className={tone}>{label(POSITION_STATE, side.state)}</span>
@@ -19,7 +19,7 @@ function SideBlock({ name, side }: { name: 'long' | 'short'; side: PositionSideV
   </div>;
 }
 
-function Totals({ pair }: { pair: PositionsPair }) {
+export function Totals({ pair }: { pair: PositionsPair }) {
   if (!pair.totals) return <span className="muted">两侧持仓都有效时才汇总</span>;
   if (!pair.totals.length) return <span className="muted">两侧均无持仓</span>;
   return <div className="table-wrap"><table className="data">

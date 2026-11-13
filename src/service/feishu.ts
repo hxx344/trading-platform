@@ -16,6 +16,8 @@ const EVENTS_PER_POLL = 500;
 /** Messages joined into one robot post; the robot allows a few posts per second at most. */
 const LINES_PER_POST = 10;
 const MAX_TEXT = 1_500;
+/** Newest outbox messages shown on the status page. */
+const STATUS_RECENT = 20;
 /** Repeats of one ongoing problem are posted at most this often. */
 const REPEAT_MS = 30 * 60_000;
 /** A switched-on pair whose margin stays out of balance (or whose transfers stay stuck) this long is reported, as the workbench did. */
@@ -256,6 +258,15 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, f
   return {
     poll, notify, flush,
     pending: (): number => (db.prepare('SELECT COUNT(*) AS n FROM outbox WHERE sent_at IS NULL').get() as { n: number }).n,
+    /** For the status page: the outbox's counts, its last delivery and failure, and its newest messages. */
+    status() {
+      const counts = db.prepare('SELECT COUNT(*) AS pending, COALESCE(SUM(attempts > 0), 0) AS retrying FROM outbox WHERE sent_at IS NULL').get() as { pending: number; retrying: number };
+      const sent = db.prepare('SELECT MAX(sent_at) AS at FROM outbox').get() as { at: number | null };
+      const failed = db.prepare('SELECT last_error AS error, next_at AS nextAt FROM outbox WHERE sent_at IS NULL AND last_error IS NOT NULL ORDER BY id DESC LIMIT 1').get() as { error: string; nextAt: number } | undefined;
+      const recent = (db.prepare(`SELECT id, created_at AS createdAt, text, attempts, next_at AS nextAt, sent_at AS sentAt, last_error AS lastError FROM outbox ORDER BY id DESC LIMIT ${STATUS_RECENT}`).all() as unknown as
+        { id: number; createdAt: number; text: string; attempts: number; nextAt: number; sentAt: number | null; lastError: string | null }[]);
+      return { configured: feishu !== null, pending: counts.pending, retrying: counts.retrying, lastSentAt: sent.at, lastError: failed?.error ?? null, nextRetryAt: failed?.nextAt ?? null, retentionMs: RETENTION_MS, recent };
+    },
     close: (): void => db.close(),
   };
 }

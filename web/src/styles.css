@@ -157,3 +157,31 @@ table.data td.num{font-family:var(--font-mono);font-variant-numeric:tabular-nums
 .adl-settings input[type=text],.adl-settings input:not([type]){width:90px;height:30px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);padding:4px 8px;color:var(--text-primary);background:var(--surface-1);font-variant-numeric:tabular-nums}
 input[type=checkbox]{accent-color:var(--accent)}
 @media(max-width:720px){body{padding:16px}.wb-heading{flex-direction:column}}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--surface-4);overflow-x:auto}
+.tab{padding:8px 14px;color:var(--text-secondary);border-bottom:2px solid transparent;white-space:nowrap;font-weight:500}
+.tab:hover{color:var(--text-primary)}
+.tab.active{color:var(--text-primary);border-bottom-color:var(--accent)}
+table.data td a,.panel-body a{color:var(--accent)}
+.pair-pick{display:flex;align-items:center;gap:8px;color:var(--text-secondary)}
+.pair-pick select{height:32px;min-width:180px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);padding:4px 8px;color:var(--text-primary);background:var(--surface-1)}
+.facts{display:grid;grid-template-columns:max-content 1fr;gap:6px 14px;margin:0;font-size:.75rem}
+.facts dt{color:var(--text-tertiary)}
+.facts dd{margin:0;min-width:0;overflow-wrap:anywhere}
+.facts.small{margin:6px 0 4px 14px}
+@media(max-width:720px){.facts{grid-template-columns:1fr;gap:2px}.facts dd{margin-bottom:6px}}
+details>summary{cursor:pointer}
+.history-more{padding:0 14px 12px}
+.balance-chart{height:240px}
+.chart-legend{display:flex;align-items:center;gap:14px;flex-wrap:wrap;font-size:.75rem;color:var(--text-secondary)}
+.swatch{display:inline-block;width:10px;height:3px;border-radius:2px;margin-right:6px;vertical-align:middle}
+.swatch.long{background:var(--accent)}
+.swatch.short{background:var(--warning)}
+.chart-tip{display:flex;flex-direction:column;gap:2px;font-size:.75rem;white-space:nowrap}
+.outbox-text{white-space:pre-wrap;max-width:560px}
+/* The chart copied from the workbench names its colours after the workbench's tokens. */
+.svg-plot{height:100%;width:100%;position:relative;--muted-foreground:var(--text-tertiary);--card:var(--surface-2)}
+.svg-plot-surface{display:block;overflow:visible;touch-action:pan-y;outline:none}
+.svg-plot-surface:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.svg-plot-tick{fill:var(--text-tertiary);font-size:11px}
+.svg-plot-tooltip{position:absolute;top:4px;z-index:2;padding:8px 10px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);background:var(--surface-3);box-shadow:var(--shadow-md);pointer-events:none}
+table.data.history{min-width:0}

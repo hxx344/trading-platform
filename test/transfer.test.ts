@@ -1274,3 +1274,30 @@ test('未知划转：本次已到账，转出侧另有一笔同额转出给别�
   assert.match(settled.labelNote!, /同额候选流水 2\/1 笔/);
   assert.equal(pairOf(h).cooldownUntil, settled.settledAt! + 300_000);
 }));
+
+test('划转历史：按配对逐页列出，新的在前，游标接续不重不漏，带结算依据；其他配对为空', () => withHarness(async h => {
+  h.aster.setBalance(LONG, { available: '100000', equity: '100000' });
+  await start(h, { maxTransfer: '30', cooldownMs: 1_000, checkIntervalMs: 1_000 });
+  await run(h, 12_000, 1_000);
+  const all = h.ex.recentTransfers(100).map(item => item.id);
+  assert.ok(all.length >= 5, String(all.length));
+  const seen: string[] = [];
+  let before: { at: number; id: string } | null = null;
+  for (let page = 0; page < 50; page++) {
+    const result = h.ex.transferHistory(PAIR, { before, limit: 2 });
+    assert.ok(result.items.length <= 2);
+    seen.push(...result.items.map(item => item.id));
+    if (!result.next) break;
+    const [at, id] = result.next.split('.');
+    before = { at: Number(at), id: id! };
+  }
+  assert.deepEqual([...seen].sort(), [...all].sort(), '逐页拼起来是全部划转');
+  assert.equal(new Set(seen).size, seen.length, '不重复');
+  const preparedAt = h.ex.transferHistory(PAIR, { before: null, limit: 50 }).items.map(item => item.preparedAt);
+  assert.deepEqual(preparedAt, [...preparedAt].sort((a, b) => b - a), '新的在前');
+  const [newest] = h.ex.transferHistory(PAIR, { before: null, limit: 1 }).items;
+  assert.ok(newest && !('unreadable' in newest));
+  assert.equal(newest.state, 'confirmed');
+  assert.equal(newest.basis, 'acknowledged');
+  assert.deepEqual(h.ex.transferHistory('other-pair', { before: null, limit: 5 }), { items: [], next: null });
+}));

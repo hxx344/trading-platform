@@ -159,3 +159,37 @@ test('页面请求层：网络错误、超时与读响应体时中断都不带�
     assert.equal(read.method, undefined);
   } finally { globalThis.fetch = original; }
 });
+
+test('页面地址：#/pair/<配对> 与 #/status 分别打开详情与运行状态；配对编号不合规或无法解码时不选配对；其他都回到总览', async () => {
+  const { parseRoute, pairHref } = await import('../web/src/route-parse.ts');
+  assert.deepEqual(parseRoute(''), { page: 'overview' });
+  assert.deepEqual(parseRoute('#/'), { page: 'overview' });
+  assert.deepEqual(parseRoute('#/status'), { page: 'status' });
+  assert.deepEqual(parseRoute('#/pair'), { page: 'pair', pairId: null });
+  assert.deepEqual(parseRoute(pairHref('p_1-a')), { page: 'pair', pairId: 'p_1-a' });
+  assert.deepEqual(parseRoute('#/pair/%E0%A4%A'), { page: 'pair', pairId: null });
+  assert.deepEqual(parseRoute('#/pair/a%2Fb'), { page: 'pair', pairId: null });
+  assert.deepEqual(parseRoute(`#/pair/${'x'.repeat(65)}`), { page: 'pair', pairId: null });
+  assert.deepEqual(parseRoute('#/other'), { page: 'overview' });
+});
+
+test('历史列表合并：滑出最新页的记录保留；加载过更早页后最新页与已显示的没有交集且后面还有记录时，从最新页重新开始', async () => {
+  const { emptyHistory, mergeLive, mergeOlder } = await import('../web/src/history-merge.ts');
+  type R = { id: string; v?: number };
+  const ids = (view: { rows: Map<string, R> }) => [...view.rows.keys()].sort();
+  let view = mergeLive(emptyHistory<R>(), { items: [{ id: 'e' }, { id: 'd' }], next: 'c1' });
+  assert.equal(view.next, 'c1');
+  view = mergeOlder(view, 'c1', { items: [{ id: 'c' }, { id: 'b' }], next: 'b1' });
+  assert.deepEqual([ids(view), view.next, view.olderLoaded], [['b', 'c', 'd', 'e'], 'b1', true]);
+  // One new row: d slides off the live page but stays; "load older" still continues from the older pages.
+  view = mergeLive(view, { items: [{ id: 'f' }, { id: 'e', v: 2 }], next: 'e1' });
+  assert.deepEqual([ids(view), view.next, view.rows.get('e')!.v], [['b', 'c', 'd', 'e', 'f'], 'b1', 2]);
+  // A late older page, read from a cursor the list has left, is dropped.
+  assert.equal(mergeOlder(view, 'c1', { items: [{ id: 'z' }], next: null }), view);
+  // More than a page of new rows (after the page sat in the background): rows between were never read.
+  view = mergeLive(view, { items: [{ id: 'j' }, { id: 'i' }], next: 'i1' });
+  assert.deepEqual([ids(view), view.next, view.olderLoaded], [['i', 'j'], 'i1', false]);
+  // The live page is the whole list: no gap is possible, nothing is dropped.
+  const whole = mergeLive(view, { items: [{ id: 'k' }], next: null });
+  assert.deepEqual(ids(whole), ['i', 'j', 'k']);
+});

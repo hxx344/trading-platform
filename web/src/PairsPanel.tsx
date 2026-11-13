@@ -9,7 +9,7 @@ import type { PairView, ServiceState, TransferView } from './types.ts';
 // A switch keeps its requestId only while no answer arrived, so a lost response is replayed safely.
 const switches = new RequestIds();
 
-function transferText(item: TransferView): string {
+export function transferText(item: TransferView): string {
   return `${label(SIDE, item.sourceSide)} → ${label(SIDE, item.destinationSide)} ${item.amount} ${item.asset} · ${label(TRANSFER_STATE, item.state)}`
     + (item.readyAt ? `（${clock(item.readyAt)} 后结算）` : '') + (item.recovered ? '（接管恢复）' : '');
 }
@@ -31,7 +31,7 @@ function PairRow({ pair, onChanged }: { pair: PairView; onChanged: () => void })
     finally { setBusy(false); }
   };
   return <tr data-pair-row={pair.id}>
-    <td>{pair.id}<br /><span className="muted">主 {pair.mainAccountId}</span></td>
+    <td><a href={`#/pair/${encodeURIComponent(pair.id)}`}>{pair.id}</a><br /><span className="muted">主 {pair.mainAccountId}</span></td>
     <td className={pair.enabled ? 'ok' : 'muted'}>{pair.enabled ? '已启用' : '已停用'}</td>
     <td>多侧 {pair.long}：{side('long')}<br />空侧 {pair.short}：{side('short')}</td>
     <td>{pair.current ? transferText(pair.current) : '无未结清划转'}</td>

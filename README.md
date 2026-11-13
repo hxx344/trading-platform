@@ -37,6 +37,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
   - **Tailscale（推荐）**：在 `/etc/trading-platform/config.json` 加一行 `"host": "<服务器的 Tailscale IP>"`（`tailscale ip -4` 查看，只能填本机的具体 IP，不能填 `0.0.0.0`），再执行一次 `sudo bash install.sh`，之后直接打开 `http://<Tailscale IP>:4720/`。该地址绑不上时（开机 Tailscale 还没连上、节点已登出）服务照常运行，持续重试，间隔最长 30 秒；配置检查会提示地址不在本机网卡上。
   - **SSH 隧道**：服务总在 `127.0.0.1:4720` 监听，写不写 `host` 都能用。在自己电脑上执行 `ssh -N -L 4720:127.0.0.1:4720 <服务器>` 后打开 `http://127.0.0.1:4720/`。
   - **登录**：`sudo bash install.sh --set-password` 设置登录密码（输入两次、不回显，只保存 scrypt 摘要到 `/etc/trading-platform/login-password`；沿用当前已装版本，不联网升级；脚本化时加 `--password-stdin` 从标准输入读一行；更换密码同样执行，已登录的浏览器须重新登录），之后页面输入密码即可。连续输错 5 次后锁定 30 秒，每再错一次锁定时间加倍，最长 15 分钟；一小时没有输错就重新计数。`sudo cat /var/lib/trading-platform/access-url` 里的登录链接始终可用（也会解除锁定）；删除 `login-password` 再执行一次安装脚本即取消密码。登录状态保留 30 天，服务重启（升级、页面导入）后不用重新登录。
+  - 页面分三页：「总览」（配对开关、持仓、ADL 处理）、「配对详情」（两侧余额走势、划转与 ADL 历史、结算依据）、「运行状态」（后台循环、数据库、请求权重、推送连接、飞书发件箱）。余额走势来自数据目录里的 `samples.sqlite`（每分钟一条，保留 30 天；删掉只丢走势图）。
   - 回退到 v0.4.0 之前的版本前，先从 `config.json` 删掉 `host`（旧版本不认识这个字段，配置检查会失败）。升级后启动失败时，安装脚本会先用上一版本校验当前配置，不通过就不自动回退并说明原因。
 - 需要代理时写 `/etc/trading-platform/environment`，例如 `NODE_USE_ENV_PROXY=1` 与 `HTTPS_PROXY=…`。
 - 只校验配置、不启动（`node` 用 `systemctl cat trading-platform` 里 ExecStart 的那个）：`sudo -u trading-platform node /opt/trading-platform/current/src/service/main.ts --config /etc/trading-platform/config.json --check-config`。

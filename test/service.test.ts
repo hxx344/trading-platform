@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -474,6 +474,25 @@ test('服务进程：本机页面只含 ASTER 部分，状态接口可读，用�
     assert.deepEqual(state.transfers.pairs.map(pair => [pair.id, pair.enabled]), [['p1', false]]);
     for (let i = 0; i < 100 && sockets.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 20));
     assert.equal(sockets.length, 2, '每个子账户一条用户推送');
+    const get = async (path: string, headers: Record<string, string> = { cookie }) => { const response = await fetch(`http://127.0.0.1:${port}${path}`, { headers }); return { status: response.status, body: await response.json() as Record<string, any> }; };
+    for (const path of ['/api/status', '/api/transfer-pairs/p1/balances', '/api/transfer-pairs/p1/history', '/api/adl/pairs/p1/incidents']) assert.equal((await get(path, {})).status, 401, `${path} 须登录`);
+    const status = (await get('/api/status')).body;
+    assert.equal(status.health.schemaVersion, 4, '主库结构不变');
+    assert.deepEqual(status.health.loops.map((loop: { name: string }) => loop.name).sort(), ['ADL 循环', '划转循环', '历史清理', '持仓读取'].sort());
+    assert.equal(status.budget.limitPerMinute, parseServiceConfig(configRaw()).budget.limitPerMinute);
+    assert.deepEqual(status.streams.map((row: { account: string; connected: boolean }) => [row.account, row.connected]), [[`***${LONG.user.slice(-4)}`, true], [`***${SHORT.user.slice(-4)}`, true]]);
+    assert.deepEqual([status.feishu.configured, status.samples], [false, { available: true, error: null }]);
+    assert.doesNotMatch(JSON.stringify(status), new RegExp(LONG.user.slice(2, 20), 'i'), '状态里不出现完整账户地址');
+    const balances = await get('/api/transfer-pairs/p1/balances?range=6h');
+    assert.deepEqual([balances.status, balances.body.range, balances.body.points], [200, '6h', []]);
+    assert.equal((await get('/api/transfer-pairs/p1/balances?range=1y')).status, 400);
+    assert.deepEqual((await get('/api/transfer-pairs/p1/history?limit=5')).body, { items: [], next: null });
+    assert.equal((await get('/api/transfer-pairs/p1/history?limit=51')).status, 400);
+    assert.equal((await get('/api/transfer-pairs/p1/history?before=x')).body.code, 'invalid_cursor');
+    assert.deepEqual((await get('/api/adl/pairs/p1/incidents')).body, { items: [], next: null });
+    assert.equal((await get('/api/adl/pairs/p1/incidents?limit=21')).status, 400);
+    assert.equal((await get('/api/transfer-pairs/bad%20id/history')).status, 404);
+    assert.ok(existsSync(join(dir, 'data', 'samples.sqlite')), '余额采样在独立库文件里');
     await run.shutdown();
     await run.done;
     assert.ok(sockets.every(socket => socket.closed));
@@ -495,11 +514,20 @@ test('服务进程：没有配对也启动，页面导入接口可用；重启�
     for (let i = 0; i < 100 && !value; i++) { try { value = readFileSync(join(dir, 'data', 'access-url'), 'utf8').trim(); } catch { await new Promise(resolve => setTimeout(resolve, 20)); } }
     return value;
   };
+  // A directory where the sample file belongs: the file cannot be opened, the service starts anyway.
+  mkdirSync(join(dir, 'data', 'samples.sqlite'), { recursive: true });
   try {
     let run = await start();
     const cookie = (await fetch(await link(), { redirect: 'manual' })).headers.get('set-cookie')!.split(';')[0]!;
     const state = await (await fetch(`http://127.0.0.1:${port}/api/state`, { headers: { cookie } })).json() as { transfers: { pairs: unknown[] } };
     assert.deepEqual(state.transfers.pairs, []);
+    const status = await (await fetch(`http://127.0.0.1:${port}/api/status`, { headers: { cookie } })).json() as { samples: { available: boolean; error: string | null } };
+    assert.equal(status.samples.available, false);
+    assert.ok(status.samples.error);
+    const trend = await (await fetch(`http://127.0.0.1:${port}/api/transfer-pairs/p1/balances?range=7d`, { headers: { cookie } })).json() as Record<string, unknown>;
+    assert.deepEqual([trend.pairId, trend.range, trend.points, trend.bucketMs], ['p1', '7d', [], 840_000], '采样库不可用时仍给出完整结构');
+    assert.match(String(trend.unavailable), /余额采样库无法打开/);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/transfer-pairs/p1/balances?range=1y`, { headers: { cookie } })).status, 400);
     assert.deepEqual(await (await fetch(`http://127.0.0.1:${port}/api/import`, { headers: { cookie } })).json(), { result: null });
     const submitted = await fetch(`http://127.0.0.1:${port}/api/import`, { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }, body: JSON.stringify({ action: 'preview' }) });
     assert.equal(submitted.status, 200);

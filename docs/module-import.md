@@ -37,6 +37,7 @@
 
 - **行情监控**：`config.json` 没有 `monitor` 时写入 `"monitor": { "anthropic": {} }`（默认股数）；已有时原样保留，不覆盖用户改过的股数，该项显示“已启用，保留现有设置”。
 - **资产账本**：`config.json` 没有 `asset` 时写入 `"asset": {}`；已有时保留。账本按 `src/asset/import.ts` 的规则（只读打开来源库、写入前全部读出并校验、凭据表不读、设置白名单、钱包地址与密钥尾号去掉、一个事务整体替换）写入数据目录的 `asset.sqlite`。已启用 `asset` 时再勾选等于“重新导入最新账本”。
+- **交易所连接（v0.19.0）**：预览在每个用户后列出其工作台连接名（如 `binance`、`aster:<账号编号>`），不含内容；工作台资产模块 `config.json` 缺失或没有有效 `credentialKey` 时预览写明“只导入账本”。写入时另起一个子进程，以 `ledger.sqlite` 属主身份、空环境读出该用户的 `connections` 并用工作台密钥解密（AES-GCM，附加数据 `<用户>:<连接名>`），输出直接接到写入子进程的标准输入，助手进程本身不经手明文；写入子进程用本服务密钥（数据目录 `asset-credential.key`，第一次需要时生成，600）重新加密，与账本在同一事务里整体替换 `connections`。解不开的单个连接按名字列在结果里跳过；密钥缺失或连接表读不出时只导入账本、不导入连接，并在结果里写明。命令行 `src/asset/import.ts` 不带连接，导入后已保存的连接清空，需要在页面重新连接。
 - `importLedger` 拆成三步，规则与报错不变：`readLedgerRows`（读来源库）、`prepareLedger`（校验与清洗，另对传回的行补做类型与设置白名单检查）、`writeLedger`（整体替换）；`importLedger` 仍是三步连用，命令行 `src/asset/import.ts` 不变。
 - **身份与属主**：导入助手以 root 运行（`trading-platform-import.service`，`UMask=0077`）。数据目录 `/var/lib/trading-platform` 归服务账户、700，root 不在服务账户可写的目录里直接写文件（服务账户可以事先放符号链接），所以 `asset.sqlite` 由助手起的子进程（`src/asset/import-writer.ts write`，账本行经标准输入以 JSON 传入，`umask 077`）以数据目录属主（服务账户）的身份、空环境写入，与 `checkAsService` 以服务账户跑配置检查相同；新建的 `asset.sqlite` 及 `-wal`/`-shm` 归服务账户、600，服务照常只读打开。已有的 `asset.sqlite`（及 `-wal`/`-shm`/`-journal`）若归别的账户（例如曾以 root 手工导入）或不是普通文件，写入失败、不改动，提示改回属主后重试。命令行 `install.sh --import-workbench --asset` 同样以服务账户写入。上次导入信息也以服务账户读取，root 不打开数据目录里的库。
 

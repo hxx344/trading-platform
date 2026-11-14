@@ -1,6 +1,6 @@
 // The monitor and asset parts of the workbench import (docs/module-import.md). The market monitor needs nothing from
-// the workbench: importing it writes config.json `monitor` with the default share counts (the workbench keeps its share
-// setting in the browser only). The asset ledger comes from the workbench's <data>/modules/asset/ledger.sqlite: one
+// the workbench: importing it writes config.json `monitor` with every market, the Anthropic one with the default share
+// counts (the workbench keeps its share setting in the browser only); an enabled monitor only gains the markets it lacks. The asset ledger comes from the workbench's <data>/modules/asset/ledger.sqlite: one
 // user's rows are read as the file's owner (as the ASTER database is), checked here with the rules of
 // src/asset/import.ts, and written into this service's asset.sqlite by src/asset/import-writer.ts run as the owner of
 // this service's data directory. Only user names, counts, dates, paths and reasons leave this file; ledger content and
@@ -16,7 +16,7 @@ import { IMPORTED_SETTINGS, prepareLedger, type SourceRows } from '../asset/impo
 import type { ConnectionImport } from '../asset/import-writer.ts';
 import type { ImportInfo } from '../asset/views.ts';
 import { ANTHROPIC_SHARES } from '../vendor/anthropic-market.mjs';
-import { parseMonitorConfig } from './monitor-config.ts';
+import { MONITOR_LABELS, MONITOR_MARKETS, monitorMarkets, parseMonitorConfig, type MonitorConfig } from './monitor-config.ts';
 import { readerIdentity } from './import-workbench.ts';
 import { ASSET_OWNER } from './import-channel.ts';
 
@@ -39,28 +39,46 @@ export interface MonitorItem {
   enabled: boolean;
   /** The share counts in use (already enabled) or written (the defaults). */
   shares: { outstanding: number; diluted: number };
+  /** The markets that run after this import (MONITOR_MARKETS names). */
+  markets: string[];
   workbench: boolean;
   detail: string;
 }
 
 export const readWorkbenchMonitor = (data: string): MonitorSource => ({ workbench: existsSync(join(data, 'modules', 'monitor')) });
 
-/** Adds config.json `monitor` with the default share counts in place, or says why not; one already there is kept. */
+/**
+ * Adds config.json `monitor` with every market in place (Anthropic with the default share counts), or the markets an enabled
+ * monitor lacks; the settings already there are kept. Says why not when the result would not be accepted.
+ */
 export function planMonitor(source: MonitorSource, config: Json, fits: (candidate: Json) => void, notes: string[]): MonitorItem {
   const defaults = { outstanding: ANTHROPIC_SHARES.outstanding, diluted: ANTHROPIC_SHARES.diluted };
-  const item: MonitorItem = { status: 'skipped', enabled: config.monitor !== undefined, shares: defaults, workbench: source.workbench, detail: '' };
+  const item: MonitorItem = { status: 'skipped', enabled: config.monitor !== undefined, shares: defaults, markets: [], workbench: source.workbench, detail: '' };
+  let current: Json = {};
   if (item.enabled) {
-    try { item.shares = { ...parseMonitorConfig(config.monitor).anthropic.shares }; } catch { /* the existing-config check reports it */ }
-    item.detail = `已启用（流通 ${item.shares.outstanding} / 完全稀释 ${item.shares.diluted} 十亿股），保留现有设置`;
+    let parsed: MonitorConfig;
+    try { parsed = parseMonitorConfig(config.monitor); } catch (error) { item.detail = `现有设置无效，未改动（${reason(error)}）`; return item; }
+    if (parsed.anthropic) item.shares = { ...parsed.anthropic.shares };
+    item.markets = monitorMarkets(parsed);
+    current = config.monitor as Json;
+  }
+  const missing = MONITOR_MARKETS.filter(market => current[market] === undefined);
+  const names = (markets: readonly string[]) => markets.map(market => MONITOR_LABELS[market as keyof typeof MONITOR_LABELS]).join('、');
+  if (!missing.length) {
+    item.detail = `已启用（${names(item.markets)}；流通 ${item.shares.outstanding} / 完全稀释 ${item.shares.diluted} 十亿股），保留现有设置`;
     return item;
   }
-  const monitor = { anthropic: {} };
+  const monitor: Json = { ...current, ...Object.fromEntries(missing.map(market => [market, {}])) };
   try { fits({ ...config, monitor }); } catch (error) { item.detail = `加入后本服务不接受（${reason(error)}）`; return item; }
   config.monitor = monitor;
   item.status = 'added';
-  item.detail = `Anthropic 价差，股数取默认值（流通 ${defaults.outstanding} / 完全稀释 ${defaults.diluted} 十亿股）；不需要密钥，服务器每 10 秒读报价、每 60 秒读 K 线（Binance、Hyperliquid、Lighter RH 的公开行情）`;
-  notes.push('行情监控的股数取默认值：工作台的股数设置只存在浏览器里，没有带过来；要改股数请改 config.json 的 monitor.anthropic.shares 后执行 sudo bash install.sh');
-  if (source.workbench) notes.push('工作台 Monitor 模块的本地行情记录不导入；本服务启用后从交易所回补最近约 50 天的 K 线');
+  item.markets = monitorMarkets(parseMonitorConfig(monitor));
+  const reads = missing.map(market => market === 'anthropic'
+    ? `Anthropic 价差（股数取默认值：流通 ${defaults.outstanding} / 完全稀释 ${defaults.diluted} 十亿股；每 10 秒读报价、每 60 秒读 K 线，Binance、Hyperliquid、Lighter RH 的公开行情）`
+    : '原油价差（每 10 秒读报价、每 60 秒读 K 线，Binance 的公开行情）');
+  item.detail = `${item.enabled ? `补上 ${reads.join('、')}，已有的${names(MONITOR_MARKETS.filter(market => !missing.includes(market)))}保留现有设置` : reads.join('、')}；不需要密钥`;
+  if (missing.includes('anthropic')) notes.push('行情监控的股数取默认值：工作台的股数设置只存在浏览器里，没有带过来；要改股数请改 config.json 的 monitor.anthropic.shares 后执行 sudo bash install.sh');
+  if (source.workbench) notes.push('工作台 Monitor 模块的本地行情记录不导入；本服务启用后从交易所回补（Anthropic 最近约 50 天，原油从 2026-04-01 起）');
   return item;
 }
 

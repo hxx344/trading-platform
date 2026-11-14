@@ -5,7 +5,7 @@
 import {
   ANTHROPIC_CANDLE_REFRESH_MS, ANTHROPIC_INITIAL_DAYS, ANTHROPIC_LEG_KEYS, ANTHROPIC_QUOTE_REFRESH_MS, ANTHROPIC_RETENTION_DAYS,
   anthropicCandleWindow, createAnthropicCandles, createBinanceGate, createRhLighterState, fetchAnthropicCandles, fetchAnthropicQuote, legError, validateAnthropicQuote,
-  type AnthropicCandleCoverage, type AnthropicCandles, type AnthropicCandleWindow, type AnthropicFetcher, type AnthropicQuote,
+  type AnthropicCandleCoverage, type AnthropicCandles, type BinanceGate, type AnthropicCandleWindow, type AnthropicFetcher, type AnthropicQuote,
 } from '../vendor/anthropic-market.mjs';
 import type { MonitorStore } from './store.ts';
 
@@ -47,14 +47,17 @@ export function boundedReply(response: Response): Response {
 const iso = (ms: number | null): string | null => ms === null ? null : new Date(ms).toISOString();
 const detail = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 200);
 
-export function createAnthropicMonitor({ store, fetchImpl = fetch, now = Date.now, log = line => process.stderr.write(`${line}\n`) }: {
-  store: MonitorStore; fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void;
+export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetchImpl = fetch, now = Date.now, log = line => process.stderr.write(`${line}\n`) }: {
+  store: MonitorStore;
+  /** The Binance cooldown; the service passes the one it shares with the oil monitor (same address, same limits). */
+  gate?: BinanceGate;
+  fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void;
 }) {
   const stopping = new AbortController();
   // The vendor module puts its own timeout on every request; the stop signal is added so a shutdown does not wait one out.
   const fetcher: AnthropicFetcher = async (url, init) => boundedReply(await fetchImpl(url, { ...init, signal: init.signal ? AbortSignal.any([init.signal, stopping.signal]) : stopping.signal }));
-  // Per instance rather than the module's shared ones: the cooldowns and the Lighter RH market id belong to this service.
-  const gate = createBinanceGate(), rh = createRhLighterState();
+  // Per service rather than the module's shared ones: the cooldowns and the Lighter RH market id belong to this service.
+  const rh = createRhLighterState();
 
   let quote: AnthropicQuote | null = null, quoteRestored = false, quoteAttemptAt: number | null = null, quoteError: string | null = null;
   let candles: AnthropicCandles | null = null, candlesRestored = false, candleAttemptAt: number | null = null, candleError: string | null = null;

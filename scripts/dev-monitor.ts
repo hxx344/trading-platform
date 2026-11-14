@@ -1,5 +1,5 @@
 // A local preview of the monitor page on the stand-in venues of test/monitor-fake.ts: a simulated executor, the built
-// page and the Anthropic collector in a throwaway data directory, removed on exit. Nothing goes to the network. Unlike the
+// page and the Anthropic and oil collectors in a throwaway data directory, removed on exit. Nothing goes to the network. Unlike the
 // service it takes no account locks and writes no environment marker, so it also runs on Windows.
 //   pnpm build:web; node scripts/dev-monitor.ts [--port 4731]
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -12,7 +12,7 @@ import { createSimulatedVenues } from '../src/simulation.ts';
 import { runExecutor } from '../src/runtime.ts';
 import { loadWebApp } from '../src/web-assets.ts';
 import { parseMonitorConfig } from '../src/service/monitor-config.ts';
-import { closeMonitor, monitorLoops, monitorViews, openMonitor, stopMonitor } from '../src/service/monitor.ts';
+import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, stopMonitor } from '../src/service/monitor.ts';
 import { fakeAnthropicVenues } from '../test/monitor-fake.ts';
 
 const { values } = parseArgs({ options: { port: { type: 'string', default: '4731' } } });
@@ -21,7 +21,7 @@ if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('--por
 const app = loadWebApp();
 const dir = mkdtempSync(join(tmpdir(), 'tp-dev-monitor-'));
 const venues = fakeAnthropicVenues();
-const monitor = openMonitor(parseMonitorConfig({ anthropic: {} }), dir, { fetchImpl: venues.fetch });
+const monitor = openMonitor(parseMonitorConfig({ anthropic: {}, oil: {} }), dir, { fetchImpl: venues.fetch });
 const store = openStore(join(dir, 'executor.sqlite'));
 const { binance, bybit, aster, asterTrading } = createSimulatedVenues(Date.now);
 const executor = createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, positions: asterTrading });
@@ -29,7 +29,7 @@ if (!executor.acquire()) throw new Error('写入租约被占用');
 
 const run = runExecutor({
   executor, store, dir, port, app, passes: [],
-  views: { monitor: monitorViews(monitor), status: () => ({ monitor: { available: true, error: null, anthropic: monitor.anthropic.status() } }) },
+  views: { monitor: monitorViews(monitor), status: () => ({ monitor: { available: true, error: null, ...monitorStatus(monitor) } }) },
   startedMessage: `行情监控预览（替身行情）已启动，数据目录 ${dir}`,
   background: context => monitorLoops(monitor, context),
   onStopping: () => stopMonitor(monitor),

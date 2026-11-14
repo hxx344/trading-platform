@@ -363,3 +363,23 @@
 }
 .monitor-desk .svg-plot{--muted-foreground:inherit;--card:inherit}
 .monitor-desk .svg-plot-tooltip{padding:0;border:0;border-radius:0;background:none;box-shadow:none}
+/* The market tabs (shown when more than one market is configured): the hub's tab row from globals.css (77f3cf2, lines
+   121-147, 229-230, 255-257, 343-344), values unchanged. Changed: the shadcn Tabs markup is plain buttons, so `[data-slot]`
+   is dropped from the selectors and `[data-state=active]` is set by the page; the row sits inside .monitor-main, whose
+   padding already gives the side margins the hub row had, so its inline margin is 0. */
+.monitor-desk .hub-market-nav{display:flex;justify-content:flex-start;width:auto;height:auto;margin:0 32px 20px;padding:0;gap:24px;background:transparent;border-bottom:1px solid var(--border);border-radius:0}
+.monitor-desk .hub-market-tab{flex:0 0 auto;min-height:44px;padding:10px 4px;border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;color:var(--muted-foreground);font-size:14px;font-weight:600;box-shadow:none}
+.monitor-desk .hub-market-tab[data-state=active]{color:var(--primary);border-bottom-color:var(--primary);background:transparent}
+.monitor-desk .hub-market-tab:hover{color:var(--primary-hover);background:transparent}
+@media(max-width:700px){
+  .monitor-desk .hub-market-nav{margin-inline:16px;gap:22px;overflow-x:auto}
+  .monitor-desk .hub-market-tab{font-size:13px;white-space:nowrap}
+}
+.monitor-desk .hub-nav-row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:0 32px 16px;border-bottom:1px solid var(--border);min-width:0}
+.monitor-desk .hub-nav-row .hub-market-nav{flex:1 1 auto;min-width:0;margin:0;border-bottom:0}
+.monitor-desk .hub-market-tab{min-height:40px;padding:8px 2px;font-size:13px}
+@media(max-width:700px){
+  .monitor-desk .hub-nav-row{margin-inline:16px;gap:12px}
+  .monitor-desk .hub-nav-row .hub-market-nav{overflow-x:auto}
+}
+.monitor-desk .monitor-main .hub-nav-row{margin-inline:0}

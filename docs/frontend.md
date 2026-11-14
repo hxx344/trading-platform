@@ -263,3 +263,15 @@
 **验证**：替身 Binance / Bybit 上新建只观察规则，晃动 BZ 盘口后按连续次数记录信号；1280 与 390 宽度无横向溢出、无 CSP 报错。
 
 **回滚**：`sudo bash install.sh --version v0.17.0`。不用改配置；`oil-rules.sqlite` 留在数据目录，旧版本不读。
+
+## 行情监控页：原油价差（Monitor M-2a，v0.20.0）
+
+**对照的工作台页面**：`modules/monitor/app/oil-panel.tsx`（提交 `9c652bc`）按它在 Hub 里嵌入显示的样子（不显示顶栏），走势图同 M-1 的 `spread-chart.tsx`（`4be9aa4`）；数据规则复制自 `lib/oil-history.ts` 与 `lib/oil-chart-config.ts`（`89f26e5`），放在 `web/src/monitor-oil.ts`；市场标签照 `app/monitor-hub.tsx`（`77f3cf2`）的 `hub-market-nav`。
+
+**页面**：「行情监控」页配了两个以上市场时顶部显示市场标签（Anthropic / 原油），选中的记在浏览器里。原油面板（`web/src/MonitorOil.tsx`）：工具栏、状态行、错误与快照提示、缺口提示、四格读数（当前价差、布伦特、WTI、区间平均价差）、走势图（价差 / 价格对比，1 周 / 1 月 / 全部）、近期观察、如何比较、数据来源与覆盖范围，文案沿用工作台，来源说明按本服务的采集方式改写。走势图从 `MonitorPage.tsx` 移到共用的 `web/src/MonitorChart.tsx`，标签由各市场图表配置的 `modes` 给出。没做：多空资金费图（M-2d）、指标（M-2e）、成交标记、Hub 概览卡片。
+
+**样式**：市场标签的规则取自工作台 `globals.css`（`77f3cf2`），追加在 `web/src/monitor.css` 末尾（去掉 shadcn 的 `[data-slot]`，标签行在 `.monitor-main` 内，左右外边距为 0）；原油面板与 Anthropic 用同一组规则。无内联样式。
+
+**验证**：`scripts/dev-monitor.ts` 替身行情下 1280 与 390 宽度切换市场、图表标签、时间范围，悬停提示，刷新后记住所选市场；无横向溢出、无 CSP 报错（控制台只有未配置模块的入口探测 404）。
+
+**回滚**：`sudo bash install.sh --version v0.19.0`（先删掉 `config.json` 的 `monitor.oil`）。

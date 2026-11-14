@@ -1,5 +1,6 @@
-// A stand-in for the four public venues the Anthropic monitor reads (Binance, Hyperliquid xyz/io, Lighter RH), shared by
-// monitor.test.ts and scripts/dev-monitor.ts. Prices follow a slow wave around ~95 USD per share so the chart has shape.
+// A stand-in for the four public venues the Anthropic monitor reads (Binance, Hyperliquid xyz/io, Lighter RH) and the two
+// Binance oil contracts (BZUSDT, CLUSDT), shared by monitor.test.ts and scripts/dev-monitor.ts. Prices follow slow waves
+// (~95 USD per share, Brent ~74 and WTI ~70 USDT per barrel) so the charts have shape.
 import type { AnthropicLegKey } from '../src/vendor/anthropic-market.mjs';
 
 const BAR = 900_000, DAY = 86_400_000;
@@ -12,6 +13,14 @@ export function fakeAnthropicPrice(leg: AnthropicLegKey, time: number): number {
   const premium = 0.02 + 0.015 * Math.sin(time / (2 * DAY) + (leg === 'io' ? 1 : leg === 'rh' ? 2 : 0));
   const value = leg === 'binance' ? share * 12.7 : share / (1 + premium) * (leg === 'xyz' ? 1 : 16.7);
   return Math.round(value * 100) / 100;
+}
+
+export type FakeOilLeg = 'brent' | 'wti';
+const OIL_SYMBOLS: Record<string, FakeOilLeg> = { BZUSDT: 'brent', CLUSDT: 'wti' };
+/** Oil mark or close at `time`, on the 0.01 tick: the spread wanders between about 2.5 and 5.5 USDT. */
+export function fakeOilPrice(leg: FakeOilLeg, time: number): number {
+  const wti = 70 + 3 * Math.sin(time / (6 * DAY)), spread = 4 + 1.5 * Math.sin(time / (3 * DAY) + 0.5);
+  return Math.round((leg === 'wti' ? wti : wti + spread) * 100) / 100;
 }
 
 const wait = (ms: number, signal: AbortSignal | null | undefined) => new Promise<void>((resolve, reject) => {
@@ -31,16 +40,18 @@ const held = (hold: Promise<void>, signal: AbortSignal | null | undefined) => ne
 export interface FakeVenueOptions {
   /** The venues' clock; candles end at the last completed bar before it. */
   now?: () => number;
-  /** First bar each leg has (default: 60 days before the first request; Lighter RH 20 days). */
-  listedAt?: Partial<Record<AnthropicLegKey, number>>;
+  /** First bar each leg has (default: 60 days before the first request; Lighter RH 20 days; oil 2026-04-01 09:00 UTC or 30 days, the later). */
+  listedAt?: Partial<Record<AnthropicLegKey | FakeOilLeg, number>>;
 }
 
 export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenueOptions = {}) {
   const start = now();
-  const listed = (leg: AnthropicLegKey) => listedAt[leg] ?? start - (leg === 'rh' ? 20 : 60) * DAY;
+  const listed = (leg: AnthropicLegKey | FakeOilLeg) => listedAt[leg] ?? (leg === 'brent' || leg === 'wti' ? Math.max(Date.UTC(2026, 3, 1, 9), start - 30 * DAY) : start - (leg === 'rh' ? 20 : 60) * DAY);
   const state = {
-    /** Legs answering HTTP 500. */
-    down: new Set<AnthropicLegKey>(),
+    /** Legs answering HTTP 500 ('funding': the oil funding terms). */
+    down: new Set<AnthropicLegKey | FakeOilLeg | 'funding'>(),
+    /** HTTP status the oil legs answer instead (429, 418, ...); null: normal answers. */
+    oilStatus: null as number | null,
     /** Delay before every answer; aborting the request ends the wait. */
     delayMs: 0,
     /** While set, every request waits for it (or its abort). */
@@ -50,10 +61,19 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
     maxInFlight: new Map<string, number>(),
   };
   const inFlight = new Map<string, number>();
-  const bars = (leg: AnthropicLegKey, from: number, to: number) => {
+  const bars = (leg: AnthropicLegKey | FakeOilLeg, from: number, to: number) => {
     const out: number[] = [];
     for (let t = Math.ceil(Math.max(from, listed(leg)) / BAR) * BAR; t < to && t <= now(); t += BAR) out.push(t);
     return out;
+  };
+  const oil = (leg: FakeOilLeg | 'funding', url: URL): Response => {
+    if (state.down.has(leg)) return fail(500);
+    if (state.oilStatus !== null) return fail(state.oilStatus);
+    if (leg === 'funding') return ok([{ symbol: 'BTCUSDT', fundingIntervalHours: 8 }, { symbol: 'BZUSDT', fundingIntervalHours: 4 }, { symbol: 'CLUSDT', fundingIntervalHours: 4 }]);
+    const symbol = leg === 'brent' ? 'BZUSDT' : 'CLUSDT';
+    if (url.pathname === '/fapi/v1/premiumIndex') return ok({ symbol, markPrice: String(fakeOilPrice(leg, now())), lastFundingRate: leg === 'brent' ? '0.00005' : '-0.00002', nextFundingTime: Math.ceil(now() / 14_400_000) * 14_400_000, time: now() });
+    const from = Number(url.searchParams.get('startTime')), to = Number(url.searchParams.get('endTime')), limit = Number(url.searchParams.get('limit'));
+    return ok(bars(leg, from, to + 1).slice(0, limit).map(t => [t, '1', '1', '1', String(fakeOilPrice(leg, t)), '1', t + BAR - 1]));
   };
   const answer = (leg: AnthropicLegKey, url: URL, body: Record<string, any> | null): Response => {
     if (state.down.has(leg)) return fail(500);
@@ -83,6 +103,14 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
   const fetch = async (href: string, init: RequestInit = {}): Promise<Response> => {
     const url = new URL(href);
     let leg: AnthropicLegKey, kind: string, body: Record<string, any> | null = null;
+    const oilLeg = url.hostname === 'fapi.binance.com' ? url.pathname === '/fapi/v1/fundingInfo' ? 'funding' as const : OIL_SYMBOLS[url.searchParams.get('symbol') ?? ''] : undefined;
+    if (oilLeg) {
+      const key = `${url.pathname === '/fapi/v1/klines' ? 'candles' : 'quote'}:${oilLeg}`;
+      state.requests.set(key, (state.requests.get(key) ?? 0) + 1);
+      if (state.hold) await held(state.hold, init.signal);
+      if (state.delayMs) await wait(state.delayMs, init.signal);
+      return oil(oilLeg, url);
+    }
     if (url.hostname === 'fapi.binance.com') { leg = 'binance'; kind = url.pathname === '/fapi/v1/premiumIndex' ? 'quote' : 'candles'; }
     else if (url.hostname === 'api.hyperliquid.xyz') {
       body = JSON.parse(String(init.body)) as Record<string, any>;

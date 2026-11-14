@@ -91,17 +91,20 @@ export function sampleChartPoints<T extends object>(points: readonly T[], keys: 
 }
 
 export type ChartMode = 'premium' | 'spread' | 'price';
-export const CHART_MODES: readonly ChartMode[] = ['premium', 'spread', 'price'];
-/** The workbench SpreadChartConfig, keeping only what the chart without fills and indicators reads. */
-export type AnthropicChartConfig = {
+/** Labels for each chart tab; a market without a percentage view (oil) has no `premium`. */
+export type ModeLabels<T> = Record<'spread' | 'price', T> & Partial<Record<'premium', T>>;
+/** The workbench SpreadChartConfig (app/spread-chart.tsx, 4be9aa4), keeping only what the chart without fills and indicators reads. */
+export type SpreadChartConfig = {
   intervalMs: number;
   kicker: string;
   bar: string;
   span: (count: number) => string;
   checkCadence: string;
-  tabs: Record<ChartMode, string>;
-  units: Record<ChartMode, string>;
-  premiumName: string;
+  /** The tabs in order; the first one is shown first. */
+  modes: readonly ChartMode[];
+  tabs: ModeLabels<string>;
+  units: ModeLabels<string>;
+  premiumName?: string;
   spreadName: string;
   legs: readonly [string, string];
   zeroLabel: string;
@@ -109,16 +112,16 @@ export type AnthropicChartConfig = {
   domainStep: number;
   digits: number;
   price: (value: number) => string;
-  tick: Record<ChartMode, (value: number) => string>;
+  tick: ModeLabels<(value: number) => string>;
   emptyText: { loading: string; hint: string };
 };
 const usd = (v: number) => `$${v.toFixed(2)}`;
 /** Per-share premium chart of Binance against the selected comparison contract. */
-export function anthropicChartConfig(leg: AnthropicComparisonLeg): AnthropicChartConfig {
+export function anthropicChartConfig(leg: AnthropicComparisonLeg): SpreadChartConfig {
   const { name, label } = ANTHROPIC_LEGS[leg];
   return {
     intervalMs: ANTHROPIC_CANDLE_MS, kicker: 'PREMIUM MONITOR', bar: '15 分钟',
-    span: count => `${(count / 4).toLocaleString()} 小时`, checkCadence: '每分钟检查更新',
+    span: count => `${(count / 4).toLocaleString()} 小时`, checkCadence: '每分钟检查更新', modes: ['premium', 'spread', 'price'],
     tabs: { premium: '溢价率', spread: '每股价差', price: '每股价格' }, units: { premium: `% · Binance 相对 ${name}`, spread: 'USD / 股', price: 'USD / 股' },
     premiumName: 'Binance 溢价率', spreadName: '每股价差', legs: ['Binance', name], zeroLabel: '0 = 同价', domainStep: 1, digits: 2, price: usd,
     tick: { premium: v => `${Number(v.toFixed(2))}%`, spread: v => `$${Number(v.toFixed(2))}`, price: v => `$${Number(v.toFixed(1))}` },

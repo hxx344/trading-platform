@@ -243,7 +243,7 @@ test('服务配置：monitor 段的默认股数与校验；只配 monitor 时 pa
   assert.equal(monitorSummary(config.monitor), '，行情监控 Anthropic 价差（流通股 12.7 十亿、完全稀释 16.7 十亿股）');
   assert.equal(monitorSummary(undefined), '');
   for (const shares of [{ outstanding: 13, diluted: 13 }, { outstanding: 1, diluted: 100 }]) {
-    assert.deepEqual(parseServiceConfig({ secretsFile, monitor: { anthropic: { shares } } }).monitor!.anthropic.shares, shares);
+    assert.deepEqual(parseServiceConfig({ secretsFile, monitor: { anthropic: { shares } } }).monitor!.anthropic!.shares, shares);
   }
   const paired = parseServiceConfig({ secretsFile, pairs: [{ id: 'p1', main: 'main', long: 'a', short: 'b' }], monitor: { anthropic: {} } });
   assert.deepEqual(paired.pairs.map(pair => pair.id), ['p1']);
@@ -287,8 +287,8 @@ test('HTTP：行情监控三个接口未登录 401、未配置 404、尚无数�
       const bad = await get(`/api/monitor/anthropic/candles?days=${days}`);
       assert.deepEqual([bad.status, bad.body.code], [400, 'invalid_days'], days);
     }
-    await runtime.anthropic.refreshQuote();
-    await runtime.anthropic.refreshCandles();
+    await runtime.anthropic!.refreshQuote();
+    await runtime.anthropic!.refreshCandles();
     const quote = await get('/api/monitor/anthropic/quote');
     assert.deepEqual([quote.status, quote.body.status, quote.body.lastError], [200, 'live', null]);
     const all = (await get('/api/monitor/anthropic/candles')).body;

@@ -1,9 +1,10 @@
 // A stand-in for the four public venues the Anthropic monitor reads (Binance, Hyperliquid xyz/io, Lighter RH) and the two
-// Binance oil contracts (BZUSDT, CLUSDT), shared by monitor.test.ts and scripts/dev-monitor.ts. Prices follow slow waves
-// (~95 USD per share, Brent ~74 and WTI ~70 USDT per barrel) so the charts have shape.
+// Binance oil contracts (BZUSDT, CLUSDT) and the Hyperliquid Hynix pair (xyz:SKHY, xyz:SKHX), shared by the monitor tests and
+// scripts/dev-monitor.ts. Prices follow slow waves (~95 USD per share, Brent ~74 and WTI ~70 USDT per barrel, SKHX ~230 USD
+// with the ADR 2–8 % above a tenth of it) so the charts have shape.
 import type { AnthropicLegKey } from '../src/vendor/anthropic-market.mjs';
 
-const BAR = 900_000, DAY = 86_400_000;
+const BAR = 900_000, HOUR = 3_600_000, DAY = 86_400_000;
 const ok = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 const fail = (status: number) => new Response('{}', { status });
 
@@ -23,6 +24,14 @@ export function fakeOilPrice(leg: FakeOilLeg, time: number): number {
   return Math.round((leg === 'wti' ? wti : wti + spread) * 100) / 100;
 }
 
+export type FakeHynixLeg = 'skhy' | 'skhx';
+const HYNIX_COINS: Record<string, FakeHynixLeg> = { 'xyz:SKHY': 'skhy', 'xyz:SKHX': 'skhx' };
+/** Hynix mid or close at `time`, on the cent: SKHX near 230 USD, the ADR 2–8 % above SKHX ÷ 10. */
+export function fakeHynixPrice(leg: FakeHynixLeg, time: number): number {
+  const ordinary = 230 + 15 * Math.sin(time / (7 * DAY)), premium = 0.05 + 0.03 * Math.sin(time / (2 * DAY) + 1);
+  return Math.round((leg === 'skhx' ? ordinary : ordinary / 10 * (1 + premium)) * 100) / 100;
+}
+
 const wait = (ms: number, signal: AbortSignal | null | undefined) => new Promise<void>((resolve, reject) => {
   if (signal?.aborted) { reject(signal.reason); return; }
   const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, ms);
@@ -40,18 +49,22 @@ const held = (hold: Promise<void>, signal: AbortSignal | null | undefined) => ne
 export interface FakeVenueOptions {
   /** The venues' clock; candles end at the last completed bar before it. */
   now?: () => number;
-  /** First bar each leg has (default: 60 days before the first request; Lighter RH 20 days; oil 2026-04-01 09:00 UTC or 30 days, the later). */
-  listedAt?: Partial<Record<AnthropicLegKey | FakeOilLeg, number>>;
+  /** First bar each leg has (default: 60 days before the first request; Lighter RH 20 days; oil 2026-04-01 09:00 UTC or 30 days, the later; Hynix 30 days). */
+  listedAt?: Partial<Record<AnthropicLegKey | FakeOilLeg | FakeHynixLeg, number>>;
 }
 
 export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenueOptions = {}) {
   const start = now();
-  const listed = (leg: AnthropicLegKey | FakeOilLeg) => listedAt[leg] ?? (leg === 'brent' || leg === 'wti' ? Math.max(Date.UTC(2026, 3, 1, 9), start - 30 * DAY) : start - (leg === 'rh' ? 20 : 60) * DAY);
+  const listed = (leg: AnthropicLegKey | FakeOilLeg | FakeHynixLeg) => listedAt[leg] ?? (leg === 'brent' || leg === 'wti' ? Math.max(Date.UTC(2026, 3, 1, 9), start - 30 * DAY) : leg === 'skhy' || leg === 'skhx' ? Math.ceil((start - 30 * DAY) / HOUR) * HOUR : start - (leg === 'rh' ? 20 : 60) * DAY);
   const state = {
     /** Legs answering HTTP 500 ('funding': the oil funding terms). */
-    down: new Set<AnthropicLegKey | FakeOilLeg | 'funding'>(),
+    down: new Set<AnthropicLegKey | FakeOilLeg | FakeHynixLeg | 'funding'>(),
     /** HTTP status the oil legs answer instead (429, 418, ...); null: normal answers. */
     oilStatus: null as number | null,
+    /** HTTP status the Hynix reads (mids and candles) answer instead; null: normal answers. */
+    hynixStatus: null as number | null,
+    /** Hours neither Hynix leg has a candle for (no trades). */
+    hynixMissing: new Set<number>(),
     /** Delay before every answer; aborting the request ends the wait. */
     delayMs: 0,
     /** While set, every request waits for it (or its abort). */
@@ -74,6 +87,19 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
     if (url.pathname === '/fapi/v1/premiumIndex') return ok({ symbol, markPrice: String(fakeOilPrice(leg, now())), lastFundingRate: leg === 'brent' ? '0.00005' : '-0.00002', nextFundingTime: Math.ceil(now() / 14_400_000) * 14_400_000, time: now() });
     const from = Number(url.searchParams.get('startTime')), to = Number(url.searchParams.get('endTime')), limit = Number(url.searchParams.get('limit'));
     return ok(bars(leg, from, to + 1).slice(0, limit).map(t => [t, '1', '1', '1', String(fakeOilPrice(leg, t)), '1', t + BAR - 1]));
+  };
+  const hynix = (body: Record<string, any>): Response => {
+    if (state.hynixStatus !== null) return fail(state.hynixStatus);
+    if (body.type === 'allMids') {
+      if (state.down.has('skhy') || state.down.has('skhx')) return fail(500);
+      return ok({ 'xyz:ANT': '95', 'xyz:SKHY': String(fakeHynixPrice('skhy', now())), 'xyz:SKHX': String(fakeHynixPrice('skhx', now())) });
+    }
+    const leg = HYNIX_COINS[body.req.coin]!;
+    if (state.down.has(leg)) return fail(500);
+    const out: number[] = [];
+    for (let t = Math.ceil(Math.max(body.req.startTime, listed(leg)) / HOUR) * HOUR; t <= body.req.endTime && t <= now(); t += HOUR) if (!state.hynixMissing.has(t)) out.push(t);
+    // Hyperliquid serves only its latest 5000 candles; the open hour comes with them.
+    return ok(out.slice(-5000).map(t => ({ t, T: t + HOUR - 1, s: body.req.coin, i: '1h', o: '1', h: '1', l: '1', c: String(fakeHynixPrice(leg, t)), v: '1', n: 1 })));
   };
   const answer = (leg: AnthropicLegKey, url: URL, body: Record<string, any> | null): Response => {
     if (state.down.has(leg)) return fail(500);
@@ -114,6 +140,13 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
     if (url.hostname === 'fapi.binance.com') { leg = 'binance'; kind = url.pathname === '/fapi/v1/premiumIndex' ? 'quote' : 'candles'; }
     else if (url.hostname === 'api.hyperliquid.xyz') {
       body = JSON.parse(String(init.body)) as Record<string, any>;
+      if (body.type === 'allMids' || HYNIX_COINS[body.req?.coin]) {
+        const key = body.type === 'allMids' ? 'quote:hynix' : `candles:${HYNIX_COINS[body.req.coin]}`;
+        state.requests.set(key, (state.requests.get(key) ?? 0) + 1);
+        if (state.hold) await held(state.hold, init.signal);
+        if (state.delayMs) await wait(state.delayMs, init.signal);
+        return hynix(body);
+      }
       leg = body.type === 'metaAndAssetCtxs' ? (body.dex === 'xyz' ? 'xyz' : 'io') : (body.req.coin === 'xyz:ANT' ? 'xyz' : 'io');
       kind = body.type === 'metaAndAssetCtxs' ? 'quote' : 'candles';
     } else if (url.hostname === 'api.rh.lighter.xyz') { leg = 'rh'; kind = url.pathname === '/api/v1/candles' ? 'candles' : 'quote'; }

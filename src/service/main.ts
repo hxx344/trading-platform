@@ -296,7 +296,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
     ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: oil ? ['jobs', 'transfers', 'adl'] : ['transfers', 'adl'], drainMs: DRAIN_MS,
     views: {
       status: () => ({ budget: client.requestBudget.state(), idleWeight: idleWeight(config, executor.transferPairSettings()), streams: streams.view(), feishu: notifier.status(), summary: summary.status(), samples: { available: samples !== null, error: samplesError },
-        ...(config.monitor ? { monitor: { available: monitor !== null, error: monitorError, ...(monitor ? monitorStatus(monitor) : { anthropic: null, oil: null }) } } : {}) }),
+        ...(config.monitor ? { monitor: { available: monitor !== null, error: monitorError, ...(monitor ? monitorStatus(monitor) : { anthropic: null, oil: null, hynix: null }) } } : {}) }),
       balanceHistory: (pairId, range) => {
         if (samples) return samples.history(pairId, range);
         const window = balanceWindow(range, Date.now());

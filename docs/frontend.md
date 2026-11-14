@@ -275,3 +275,15 @@
 **验证**：`scripts/dev-monitor.ts` 替身行情下 1280 与 390 宽度切换市场、图表标签、时间范围，悬停提示，刷新后记住所选市场；无横向溢出、无 CSP 报错（控制台只有未配置模块的入口探测 404）。
 
 **回滚**：`sudo bash install.sh --version v0.19.0`（先删掉 `config.json` 的 `monitor.oil`）。
+
+## 行情监控页：海力士溢价（Monitor M-2b，v0.21.0）
+
+**对照的工作台页面**：`modules/monitor/app/dashboard.tsx`（提交 `9c652bc`）按它在 Hub 里嵌入显示的样子（不显示顶栏），走势图同 M-1 的 `spread-chart.tsx`（`4be9aa4`，`HYNIX_SPREAD_CHART` 去掉指标周期、填充与成交标记）；历史提示复制自 `lib/market-service.ts` 的 `describeMarket`（`8470785`），放在 `web/src/monitor-hynix.ts`。
+
+**页面**：市场标签多一个“海力士”。海力士面板（`web/src/MonitorHynix.tsx`）：工具栏、状态行、错误与快照提示、缺口与过时提示、四格读数（当前 ADR 溢价率、ADR、正股 ÷ 10、区间平均溢价率）、走势图（溢价率 / 美元价差 / 价格对比，1 周 / 1 月 / 全部，默认全部）、近期观察、如何比较、数据来源与覆盖范围，文案沿用工作台，来源说明按本服务的采集方式改写。没做：多空资金费图（M-2d）、指标（M-2e）、成交标记、Hub 概览卡片。
+
+**样式**：与 Anthropic、原油面板用同一组规则，没有新增。无内联样式。
+
+**验证**：`scripts/dev-monitor.ts` 替身行情下 1280 与 390 宽度切换到海力士、三个图表标签，刷新后记住所选市场；无横向溢出（390 宽度近期观察表在表格容器内横向滚动，同原油），控制台只有未配置模块的入口探测 404。
+
+**回滚**：`sudo bash install.sh --version v0.20.0`（先删掉 `config.json` 的 `monitor.hynix`）。

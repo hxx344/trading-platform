@@ -173,10 +173,10 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
     candleAttemptAt = at;
     const cutoff = at - OIL_RETENTION_DAYS * DAY_MS;
     let next: OilIntraday;
+    const full = !candles || at >= gapRetryAt;
     try {
       // Between gap re-reads, the reader sees only the rows from the first paired one in the last day; the older rows are
       // put back after it (the fetched rows take precedence where they overlap).
-      const full = !candles || at >= gapRetryAt;
       let base = candles, head: OilCandleRow[] = [];
       if (candles && !full) {
         const from = candles.data.at(-1)!.time - RESUME_MS;
@@ -189,13 +189,13 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
         for (const row of next.data) merged.set(row.time, row);
         next = createIntradaySnapshot([...merged.values()].sort((a, b) => a.time - b.time), next.metadata.fetchedAt);
       }
-      if (full) gapRetryAt = at + OIL_GAP_RETRY_MS;
       // The kept history ends at the retention cut in memory as in the file.
       if (next.data[0]!.time < cutoff) next = createIntradaySnapshot(next.data.filter(row => row.time >= cutoff), next.metadata.fetchedAt);
     } catch (error) {
       if (stopping.signal.aborted) return;
-      candleError = `K 线读取失败：${oilError(error)}`;
-      candleReport.failed(candleError, detail(error));
+      const reason = oilError(error);
+      candleError = `K 线读取失败：${reason}`;
+      candleReport.failed(reason, detail(error));
       return;
     }
     if (stopping.signal.aborted) return;
@@ -213,6 +213,8 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
       candleSave.failed('monitor.sqlite 写入失败', detail(error));
       return;
     }
+    // The gaps count as re-read only once the round is stored; a failed write re-reads them next round.
+    if (full) gapRetryAt = at + OIL_GAP_RETRY_MS;
     candleSave.recovered();
     candles = next; candlesRestored = false; candleError = null; replaceCandles = false;
   }

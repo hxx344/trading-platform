@@ -40,25 +40,25 @@ const fits = (): void => undefined;
 test('行情监控导入：没有 monitor 时写入全部市场（默认股数），已有时保留现有设置、只补缺少的市场', () => {
   const config: Record<string, unknown> = { secretsFile: '/x/secrets.json', pairs: [] }, notes: string[] = [];
   const item = planMonitor({ workbench: true }, config, fits, notes);
-  assert.deepEqual([item.status, item.enabled, item.shares, item.markets], ['added', false, { outstanding: 12.7, diluted: 16.7 }, ['anthropic', 'oil']]);
-  assert.deepEqual(config.monitor, { anthropic: {}, oil: {} });
-  assert.match(item.detail, /Anthropic 价差（股数取默认值.*原油价差（每 10 秒读报价.*不需要密钥/);
+  assert.deepEqual([item.status, item.enabled, item.shares, item.markets], ['added', false, { outstanding: 12.7, diluted: 16.7 }, ['anthropic', 'oil', 'hynix']]);
+  assert.deepEqual(config.monitor, { anthropic: {}, oil: {}, hynix: {} });
+  assert.match(item.detail, /Anthropic 价差（股数取默认值.*原油价差（每 10 秒读报价.*海力士溢价（每 10 秒读报价.*不需要密钥/);
   assert.match(notes.join(), /股数设置只存在浏览器里/);
   assert.match(notes.join(), /本地行情记录不导入/);
-  // M-1 enabled the Anthropic premium only: its shares stay, the oil spread is added.
+  // M-1 enabled the Anthropic premium only: its shares stay, the oil spread and the Hynix premium are added.
   const tuned = { secretsFile: '/x/secrets.json', monitor: { anthropic: { shares: { outstanding: 13, diluted: 17 } } } }, tunedNotes: string[] = [];
   const grown = planMonitor({ workbench: false }, tuned, fits, tunedNotes);
-  assert.deepEqual([grown.status, grown.enabled, grown.shares, grown.markets], ['added', true, { outstanding: 13, diluted: 17 }, ['anthropic', 'oil']]);
-  assert.match(grown.detail, /^补上 原油价差.*已有的Anthropic 价差保留现有设置/);
-  assert.deepEqual(tuned.monitor, { anthropic: { shares: { outstanding: 13, diluted: 17 } }, oil: {} });
+  assert.deepEqual([grown.status, grown.enabled, grown.shares, grown.markets], ['added', true, { outstanding: 13, diluted: 17 }, ['anthropic', 'oil', 'hynix']]);
+  assert.match(grown.detail, /^补上 原油价差（.*、海力士溢价（.*已有的Anthropic 价差保留现有设置/);
+  assert.deepEqual(tuned.monitor, { anthropic: { shares: { outstanding: 13, diluted: 17 } }, oil: {}, hynix: {} });
   assert.deepEqual(tunedNotes, [], '没有补 Anthropic 时不提默认股数');
   const kept = planMonitor({ workbench: false }, tuned, fits, []);
   assert.deepEqual([kept.status, kept.enabled, kept.shares], ['skipped', true, { outstanding: 13, diluted: 17 }]);
-  assert.match(kept.detail, /已启用（Anthropic 价差、原油价差.*保留现有设置/);
+  assert.match(kept.detail, /已启用（Anthropic 价差、原油价差、海力士溢价.*保留现有设置/);
   // Only the oil spread configured: the Anthropic premium comes with the default shares.
   const oilOnly = { secretsFile: '/x/secrets.json', monitor: { oil: {} } };
   assert.equal(planMonitor({ workbench: false }, oilOnly, fits, []).status, 'added');
-  assert.deepEqual(oilOnly.monitor, { oil: {}, anthropic: {} });
+  assert.deepEqual(oilOnly.monitor, { oil: {}, anthropic: {}, hynix: {} });
   const broken = { secretsFile: '/x/secrets.json', monitor: { oil: { x: 1 } } };
   const refusedOld = planMonitor({ workbench: false }, broken, fits, []);
   assert.deepEqual([refusedOld.status, broken.monitor], ['skipped', { oil: { x: 1 } }]);
@@ -273,7 +273,7 @@ test('planImport：只启用行情监控与资产账本时不要配对；配置�
     const asset = readWorkbenchAsset(w.wb, w.svc);
     const plan = planImport({ pairs: [], accounts: [], env: {} }, null, { secretsFile: '/x/secrets.json', only: [], monitor: { workbench: false }, asset, assetOwner: OWNER });
     assert.deepEqual([plan.monitor?.status, plan.asset?.status, plan.ledger?.owner], ['added', 'added', OWNER]);
-    assert.deepEqual([plan.config.monitor, plan.config.asset, plan.config.pairs], [{ anthropic: {}, oil: {} }, {}, []]);
+    assert.deepEqual([plan.config.monitor, plan.config.asset, plan.config.pairs], [{ anthropic: {}, oil: {}, hynix: {} }, {}, []]);
     assert.equal(filesUnchanged(plan, null), false);
     const existing = { config: { secretsFile: '/x/secrets.json', asset: {} }, secrets: { accounts: {} } };
     const again = planImport({ pairs: [], accounts: [], env: {} }, existing, { secretsFile: '/x/secrets.json', only: [], asset, assetOwner: OTHER_OWNER });
@@ -325,7 +325,7 @@ test('导入助手：预览列出行情监控与资产账本；先写账本再�
     assert.match(done.message, /已导入 行情监控与资产账本（用户 alice），服务已重启/);
     assert.equal(restarts.length, 1);
     const config = JSON.parse(readFileSync(configFile, 'utf8')) as Record<string, unknown>;
-    assert.deepEqual([config.monitor, config.asset], [{ anthropic: {}, oil: {} }, {}]);
+    assert.deepEqual([config.monitor, config.asset], [{ anthropic: {}, oil: {}, hynix: {} }, {}]);
     assert.equal(importInfo(w.target).owner, OWNER);
     assert.equal(done.asset?.status, 'added');
     noLedgerContent(readFileSync(join(dir, 'result.json'), 'utf8'));
@@ -381,7 +381,7 @@ test('命令行：--monitor --asset 启用行情监控并导入指定用户的�
     assert.match(ok.stdout, /行情监控已写入.*资产账本已启用/);
     noLedgerContent(ok.stdout);
     const config = JSON.parse(readFileSync(configFile, 'utf8')) as Record<string, unknown>;
-    assert.deepEqual([config.monitor, config.asset], [{ anthropic: {}, oil: {} }, {}]);
+    assert.deepEqual([config.monitor, config.asset], [{ anthropic: {}, oil: {}, hynix: {} }, {}]);
 
     const again = cli('--asset', '--asset-owner', OTHER_OWNER, '--data-dir', w.svc);
     assert.equal(again.status, 0, again.stderr);

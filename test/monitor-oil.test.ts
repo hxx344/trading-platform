@@ -318,7 +318,7 @@ test('配置与接口：monitor.oil 不带设置；只配原油时 Anthropic 接
     assert.deepEqual([quote.status, quote.body.status, quote.body.brent.coin, quote.body.staleAfterMs], [200, 'live', 'BZUSDT', QUOTE_STALE_MS]);
     const all = (await get('/api/monitor/oil/candles')).body, week = (await get('/api/monitor/oil/candles?days=7')).body;
     assert.deepEqual([all.status, all.windowDays, week.windowDays, week.coverage.pairedObservationRows], ['live', undefined, 7, all.metadata.pairedObservationRows]);
-    assert.deepEqual(Object.keys(monitorStatus(runtime)), ['anthropic', 'oil']);
+    assert.deepEqual(Object.keys(monitorStatus(runtime)), ['anthropic', 'oil', 'hynix']);
     assert.equal(monitorStatus(runtime).anthropic, null);
     assert.equal(monitorStatus(runtime).oil!.candleRows, all.data.length);
   } finally {

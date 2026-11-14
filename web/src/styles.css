@@ -233,3 +233,14 @@ table.data.history{min-width:0}
    here it sits on the right of the market tab row, so it drops that card's margin and top rule. */
 .monitor-desk .hub-nav-row .hub-monitor-controls{margin:0;border-top:0;min-height:44px}
 .monitor-desk .monitor-main>.hub-control-notice{margin:0 0 12px}
+/* The side navigation (shell.css, docs/frontend.md《导航按工作区组织》): the pages keep the ASTER desk's colours, so
+   that content area fills the height beside the sidebar; the entries are links to the hash routes, not buttons. */
+.app-shell>.workspace>main.aster-desk{flex:1;min-width:0}
+.app-shell>.sidebar a.nav-item:focus-visible{outline-offset:-2px}
+/* The options page's fixed notice (options.css, z-index 20) comes later in the DOM and would cover the open drawer. */
+/* The element selectors outrank shell.css's own z-index rules, which load later. */
+@media(max-width:760px){.app-shell>aside.sidebar{z-index:22}.app-shell>button.nav-backdrop{z-index:21}}
+/* The monitor page's breakpoints count the whole window; beside the 212px side navigation the detail toolbar's refresh area
+   needs to shrink into the rest of the row and wrap inside (as monitor.css lets it below 700px) up to 912px, or it runs past
+   the edge. The toolbar itself does not wrap (monitor.css keeps .detail-toolbar nowrap inside .site-shell). */
+@media(min-width:761px) and (max-width:912px){.monitor-desk .site-shell .refresh-area{flex:1 1 auto;flex-wrap:wrap;justify-content:flex-end}}

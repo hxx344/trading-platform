@@ -1,0 +1,44 @@
+/* 复制自 project-aggregation 工作台 src/styles.css（提交 31242e0）第 98–99、108–113、140–153、166–170、209–210 行与
+   760px 媒体查询里的侧栏、抽屉、顶栏与面包屑规则：工作台主界面的侧栏导航（按统一平台工作区分组，docs/frontend.md
+   《导航按工作区组织》）。规则内容不改，令牌在 styles.css。
+   改动：选择器加 .app-shell 限定；.workspace、.topbar 与 aster.css 同名、.icon-button 与 asset.css 同名，所以外壳这一层用子选择器
+   （.app-shell > .workspace、> .topbar），不会改到页面里的同名元素；760px 下的 .workspace 去掉给底部快捷栏留的
+   padding-bottom:58px（本服务不做底部快捷栏）。 */
+.app-shell > .workspace > .topbar .icon-button{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:0;border-radius:var(--radius-sm);background:transparent;color:var(--text-secondary);flex-shrink:0;transition:background-color .15s ease,color .15s ease}
+.app-shell > .workspace > .topbar .icon-button:hover{background:var(--surface-3);color:var(--text-primary)}
+.app-shell > .sidebar .brand{display:flex;align-items:center;gap:10px;color:var(--text-primary);font-size:.9375rem;font-weight:650;letter-spacing:.04em}
+.app-shell > .sidebar .brand>span:last-child{display:flex;align-items:baseline;gap:8px}
+.app-shell > .sidebar .brand small{color:var(--text-tertiary);font-size:.6875rem;font-weight:400;letter-spacing:.02em}
+.app-shell > .sidebar .brand-mark{width:20px;height:20px;display:grid;grid-template-columns:1fr 1fr;gap:3px;flex-shrink:0}
+.app-shell > .sidebar .brand-mark i{border-radius:2px;background:var(--accent)}
+.app-shell > .sidebar .brand-mark i:last-child{background:var(--emerald)}
+.app-shell{display:flex;min-height:100vh;background:var(--surface-0)}
+.app-shell > .sidebar{position:fixed;inset:0 auto 0 0;width:var(--sidebar-width);background:var(--surface-1);color:var(--text-secondary);display:flex;flex-direction:column;z-index:20;border-right:1px solid var(--surface-4)}
+.app-shell > .sidebar>.brand{height:var(--topbar-height);flex-shrink:0;padding:0 16px;border-bottom:1px solid var(--surface-4)}
+.app-shell > .sidebar nav{flex:1;min-height:0;padding:8px;overflow-y:auto}
+.app-shell > .sidebar .nav-group{margin-top:14px}
+.app-shell > .sidebar .nav-label{font-size:.6875rem;margin:0 10px 4px;color:var(--text-tertiary);font-weight:500;letter-spacing:.06em}
+.app-shell > .sidebar .nav-item{position:relative;display:flex;align-items:center;gap:10px;width:100%;min-height:32px;padding:6px 10px;color:var(--text-secondary);font-size:.8125rem;border:0;background:none;border-radius:var(--radius-sm);text-align:left;margin-bottom:1px;transition:background-color .15s ease,color .15s ease}
+.app-shell > .sidebar .nav-item:hover{background:var(--surface-3);color:var(--text-primary)}
+.app-shell > .sidebar .nav-item.active{background:var(--accent-subtle);color:var(--text-primary);font-weight:500}
+.app-shell > .sidebar .nav-item.active::before{content:"";position:absolute;left:-8px;top:7px;bottom:7px;width:3px;border-radius:0 3px 3px 0;background:var(--accent)}
+.app-shell > .sidebar .nav-item.active>svg{color:var(--accent)}
+.app-shell > .sidebar .nav-item>svg{color:var(--text-tertiary)}
+.app-shell > .sidebar .nav-item:hover>svg{color:var(--text-secondary)}
+.app-shell > .sidebar .nav-text{flex:1}
+.app-shell > .workspace{margin-left:var(--sidebar-width);width:calc(100% - var(--sidebar-width));display:flex;flex-direction:column;background:var(--surface-0)}
+.app-shell > .workspace > .topbar{min-height:var(--topbar-height);background:var(--surface-0);border-bottom:1px solid var(--surface-4);display:flex;align-items:center;justify-content:space-between;padding:0 20px;gap:12px;flex-wrap:wrap}
+.app-shell > .workspace > .topbar .breadcrumb{display:flex;align-items:center;gap:6px;font-size:.8125rem;color:var(--text-tertiary);min-width:0}
+.app-shell > .workspace > .topbar .breadcrumb>svg{color:var(--text-tertiary)}
+.app-shell > .workspace > .topbar .breadcrumb strong{font-weight:500;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.app-shell > .workspace > .topbar .mobile-menu{display:none}
+.app-shell > .nav-backdrop{display:none}
+@media(max-width:760px){
+  .app-shell > .sidebar{transform:translateX(-100%);transition:transform .2s;width:248px;visibility:hidden}
+  .app-shell > .sidebar.open{transform:translateX(0);visibility:visible}
+  .app-shell > .workspace{margin-left:0;width:100%}
+  .app-shell > .nav-backdrop{display:block;position:fixed;inset:0;background:rgba(3,5,8,0.7);border:0;z-index:19}
+  .app-shell > .workspace > .topbar .mobile-menu{display:flex;margin-left:-6px}
+  .app-shell > .workspace > .topbar{min-height:52px;padding:6px 12px;gap:8px}
+  .app-shell > .workspace > .topbar .breadcrumb{flex:1}.app-shell > .workspace > .topbar .breadcrumb>span,.app-shell > .workspace > .topbar .breadcrumb>svg{display:none}
+}

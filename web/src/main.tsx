@@ -2,10 +2,11 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from './App.tsx';
 import './styles.css';
+import './shell.css';
 import './aster.css';
 // After aster.css: the asset page's rules replace the ASTER ones of equal weight (.aster-desk .panel and the like).
 import './asset.css';
-// After aster.css: the whole shell sits in .aster-desk, so on equal specificity the options page's own copy must win.
+// After aster.css: every page sits in .aster-desk, so on equal specificity the options page's own copy must win.
 import './options.css';
 
 createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>);

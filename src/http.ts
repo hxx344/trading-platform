@@ -26,7 +26,8 @@ const ADL_RESTART_PATH = /^\/api\/adl\/incidents\/([0-9a-f-]{36})\/restart$/;
 const PAIR_READ_PATH = /^\/api\/transfer-pairs\/([0-9A-Za-z_-]{1,64})\/(balances|history)$/;
 const ADL_HISTORY_PATH = /^\/api\/adl\/pairs\/([0-9A-Za-z_-]{1,64})\/incidents$/;
 const TRANSFER_PAGE_MAX = 50, ADL_PAGE_MAX = 20;
-const MONITOR_PATHS = new Set(['/api/monitor/state', '/api/monitor/anthropic/quote', '/api/monitor/anthropic/candles']);
+const MONITOR_PATHS = new Set(['/api/monitor/state', '/api/monitor/anthropic/quote', '/api/monitor/anthropic/candles', '/api/monitor/oil/quote', '/api/monitor/oil/candles']);
+const MONITOR_NAMES = { anthropic: 'Anthropic', oil: '原油' } as const;
 const MONITOR_MAX_DAYS = ANTHROPIC_RETENTION_DAYS;
 const ASSET_READS = { '/api/asset/state': 'state', '/api/asset/ledger': 'ledger', '/api/asset/history': 'history', '/api/asset/daily-changes': 'dailyChanges', '/api/asset/withdrawals': 'withdrawals', '/api/asset/cash-flows': 'cashFlows' } as const;
 const ASSET_PERIOD_ID = /^[0-9A-Za-z-]{1,80}$/;
@@ -87,8 +88,8 @@ export interface ServiceViews {
     /** The spread rules (docs/oil.md section 7); a store that could not open answers its reason and refuses writes. */
     rules?: { view(): unknown; create(body: unknown): unknown; update(id: string, body: unknown): unknown; act(id: string, action: string, body: unknown): unknown };
   };
-  /** The read-only market monitors; the two Anthropic reads give null until there is data. Absent without config.monitor. */
-  monitor?: { state(): unknown; anthropicQuote(): unknown; anthropicCandles(days: number | null): unknown };
+  /** The read-only market monitors; a market's reads give undefined when it is not configured and null until there is data. Absent without config.monitor. */
+  monitor?: { state(): unknown; quote(market: keyof typeof MONITOR_NAMES): unknown; candles(market: keyof typeof MONITOR_NAMES, days: number | null): unknown };
   /** The options module's reads and writes (service/options.ts); absent when the service runs no options module. */
   options?: {
     market(expiry: string | null): unknown;
@@ -292,14 +293,18 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'GET' && MONITOR_PATHS.has(url.pathname)) {
       if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
       if (url.pathname === '/api/monitor/state') return send(response, 200, views.monitor.state());
-      if (url.pathname === '/api/monitor/anthropic/quote') {
-        const quote = views.monitor.anthropicQuote();
-        return quote === null ? send(response, 503, { code: 'not_ready', message: '尚未取得 Anthropic 报价，后台正在采集' }) : send(response, 200, quote);
+      const [, , , market, read] = url.pathname.split('/') as [string, string, string, keyof typeof MONITOR_NAMES, 'quote' | 'candles'];
+      const name = MONITOR_NAMES[market];
+      if (read === 'quote') {
+        const quote = views.monitor.quote(market);
+        if (quote === undefined) return send(response, 404, { code: 'not_found', message: `本服务没有配置${name}行情监控` });
+        return quote === null ? send(response, 503, { code: 'not_ready', message: `尚未取得${name}报价，后台正在采集` }) : send(response, 200, quote);
       }
       const days = url.searchParams.get('days');
       if (days !== null && (!/^[1-9]\d{0,2}$/.test(days) || Number(days) > MONITOR_MAX_DAYS)) return send(response, 400, { code: 'invalid_days', message: `days 须为 1–${MONITOR_MAX_DAYS} 的整数` });
-      const candles = views.monitor.anthropicCandles(days === null ? null : Number(days));
-      return candles === null ? send(response, 503, { code: 'not_ready', message: '尚未取得 Anthropic K 线，后台正在采集' }) : send(response, 200, candles);
+      const candles = views.monitor.candles(market, days === null ? null : Number(days));
+      if (candles === undefined) return send(response, 404, { code: 'not_found', message: `本服务没有配置${name}行情监控` });
+      return candles === null ? send(response, 503, { code: 'not_ready', message: `尚未取得${name} K 线，后台正在采集` }) : send(response, 200, candles);
     }
     if (request.method === 'GET' && url.pathname.startsWith('/api/asset/')) {
       const asset = views?.asset;

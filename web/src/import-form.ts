@@ -3,7 +3,7 @@
 // src/service/import-modules.ts, restated here because the page does not build against node modules.
 
 /** The market monitor in the helper's answer. */
-export interface MonitorItem { status: 'added' | 'skipped'; enabled: boolean; shares: { outstanding: number; diluted: number }; workbench: boolean; detail: string }
+export interface MonitorItem { status: 'added' | 'skipped'; enabled: boolean; shares: { outstanding: number; diluted: number }; markets?: string[]; workbench: boolean; detail: string }
 /** One workbench user with an asset ledger. */
 export interface LedgerOwner { owner: string; assets: number; snapshots: number; lastDaily: string | null; importable: boolean; detail: string }
 /** The asset ledger in the helper's answer: the workbench's users and this service's last import. */

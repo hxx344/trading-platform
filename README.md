@@ -9,7 +9,7 @@
 
 第三个模块“期权 Greeks”（Bybit BTC 期权铁鹰 / 卖出宽跨：手动开平仓、周五定时开仓、收益页、组合询价）自 v0.11.0 起可用，方案与进度见 [docs/options.md](docs/options.md)；只在 `config.json` 有 `options` 时启用，启用在设置页「从工作台导入」里完成（见下文部署一节）。
 
-第四个模块“行情监控”（工作台 Monitor 分批接入，方案与进度见 [docs/monitor.md](docs/monitor.md)）第一批是 Anthropic 价差：Binance、Hyperliquid（xyz:ANT、io:ANTH）、Lighter RH 的报价与 15 分钟 K 线，按每股口径算溢价，只读公开行情，不需要密钥。在设置页「从工作台导入」里勾选「启用行情监控」即可启用（命令行 `sudo bash install.sh --import-workbench --monitor`，见下文部署一节），写入的是 `"monitor": { "anthropic": {} }`；也可以手写这一段（可加 `"shares": { "outstanding": 12.7, "diluted": 16.7 }`，十亿股，不写用这两个默认值，须满足 1 ≤ 流通 ≤ 完全稀释 ≤ 100）；只配 `monitor` 时 `pairs` 可以省略。没有 `monitor` 时不采集、不显示页面，行为与之前相同。启用后服务器会定时访问 Binance、Hyperliquid、Lighter RH 的公开行情接口（`deploy/config.example.json` 带了这一项，安装脚本生成的配置不带）；服务器所在地区被某家交易所限制时，那一家读不到，页面显示为快照或暂无数据，其余功能不受影响。
+第四个模块“行情监控”（工作台 Monitor 分批接入，方案与进度见 [docs/monitor.md](docs/monitor.md)）第一批是 Anthropic 价差：Binance、Hyperliquid（xyz:ANT、io:ANTH）、Lighter RH 的报价与 15 分钟 K 线，按每股口径算溢价，只读公开行情，不需要密钥。在设置页「从工作台导入」里勾选「启用行情监控」即可启用（命令行 `sudo bash install.sh --import-workbench --monitor`，见下文部署一节），写入的是 `"monitor": { "anthropic": {} }`；也可以手写这一段（可加 `"shares": { "outstanding": 12.7, "diluted": 16.7 }`，十亿股，不写用这两个默认值，须满足 1 ≤ 流通 ≤ 完全稀释 ≤ 100）；只配 `monitor` 时 `pairs` 可以省略。第二批起加了原油价差（Binance BZUSDT / CLUSDT 标记价与 15 分钟 K 线，布伦特 − WTI，USDT / 桶），配置写 `"oil": {}`，导入时随「启用行情监控」一起写入，已启用的配置会补上缺的市场。没有 `monitor` 时不采集、不显示页面，行为与之前相同。启用后服务器会定时访问 Binance、Hyperliquid、Lighter RH 的公开行情接口（`deploy/config.example.json` 带了这一项，安装脚本生成的配置不带）；服务器所在地区被某家交易所限制时，那一家读不到，页面显示为快照或暂无数据，其余功能不受影响。
 
 第五个模块“资产账本”（工作台 Asset）分批接入：第一批（v0.12.0）是从工作台导入的账本、资产走势、日变化归因、出金与资金流的只读展示，第二批（v0.16.0）可在页面编辑手动资产、修改汇率、登记出金与资金流，第三批（v0.19.0）连接交易所并在页面打开时每 60 秒同步余额、行情与人民币汇率（凭据加密保存在数据目录）。方案与进度见 [docs/asset.md](docs/asset.md)；只在 `config.json` 有 `asset` 时启用，启用与导入账本都在设置页「从工作台导入」里完成（见下文部署一节）。
 
@@ -66,7 +66,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
     - 「设置」（每个配对的划转参数与 ADL 设置、从工作台导入）
     - 配置了原油执行账户时多一个「原油」页（价差与盘口、持仓、额度、下单预览与实盘确认、任务与人工处理）
     - 配置了 `options` 时多一个「期权」页（执行台、持仓、组合执行、收益、组合询价，见 [docs/options.md](docs/options.md)）
-    - 配置了 `monitor` 时多一个「行情监控」页（Anthropic 价差：对比合约切换、当前溢价与两边每股价、溢价率 / 每股价差 / 每股价格走势、近期观察、换算说明）。行情由服务后台采集（报价每 10 秒、K 线每 60 秒），K 线历史在数据目录的 `monitor.sqlite`（最多保留 400 天；删掉只丢历史，重启后从交易所回补最近约 50 天），这个文件打不开时只是不显示行情监控页，其余功能照常。
+    - 配置了 `monitor` 时多一个「行情监控」页（Anthropic 价差：对比合约切换、当前溢价与两边每股价、溢价率 / 每股价差 / 每股价格走势、近期观察、换算说明；配置了原油时多一个「原油」标签：当前价差与两腿标记价、价差 / 价格对比走势、近期观察）。行情由服务后台采集（报价每 10 秒、K 线每 60 秒），K 线历史在数据目录的 `monitor.sqlite`（最多保留 400 天；删掉只丢历史，重启后从交易所回补最近约 50 天），这个文件打不开时只是不显示行情监控页，其余功能照常。
     - 配置了 `asset` 时多一个「资产」页（资产总览、历史记录、出金记录；交易所连接；可编辑手动资产、修改汇率、登记出金与资金流；页面打开时每 60 秒同步交易所余额、行情与汇率，服务端不定时同步）。
   - 划转参数与 ADL 设置保存在数据库里，`config.json` 里的 `transfer` 与 `adl` 只在配对第一次登记时作为初始值，之后以页面为准（两边不一致时启动日志会列出页面当前值）；改短检查间隔使空闲请求权重超出「每分钟上限减 ADL 预留」时会被拒绝，并给出能用的最短间隔。
   - 余额走势来自数据目录里的 `samples.sqlite`（每分钟一条，保留 30 天；删掉只丢走势图）。
@@ -83,6 +83,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 | 回退到早于 | 回退前要做的事 | 说明 | 详见 |
 | --- | --- | --- | --- |
+| v0.20.0 | 从 `config.json` 删掉 `monitor.oil`（只配了原油时删掉整个 `monitor`） | 旧版本不认识 `oil` 市场；`monitor.sqlite` 里的原油 K 线旧版本不读，再升级回来照常续用 | [docs/monitor.md](docs/monitor.md) M-2a |
 | v0.19.0 | 不用改配置 | `asset.sqlite` 新增的 `connections` 表与数据目录的 `asset-credential.key` 旧版本不读；回退期间资产页不同步，交易所行停在最后一次同步的值，再升级回来连接照常可用 | [docs/asset.md](docs/asset.md) A-3/A-4 |
 | v0.18.0 | 不用改配置 | 原油自动规则存在单独的 `oil-rules.sqlite`，旧版本不读；观察规则不下单，回退后不再记录信号，再升级回来时规则还在，原来在观察的继续观察（连续次数从零开始） | [docs/oil.md](docs/oil.md) 第 7 节 |
 | v0.17.0 | 不用改配置。先在期权页「组合询价」确认没有未结束的询价（标签上不显示「进行中」；已成交但还没转成跟踪的也算未结束） | 旧版本不读询价记录，也不会因它拦下交易；询价成交的开仓组合照常跟踪与平仓，收益页该组在旧版本显示待核对 | [docs/options.md](docs/options.md) 第 4 节 |

@@ -21,7 +21,7 @@ if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('--por
 const app = loadWebApp();
 const dir = mkdtempSync(join(tmpdir(), 'tp-dev-monitor-'));
 const venues = fakeAnthropicVenues();
-const monitor = openMonitor(parseMonitorConfig({ anthropic: {}, oil: {}, hynix: {} }), dir, { fetchImpl: venues.fetch });
+const monitor = openMonitor(parseMonitorConfig({ anthropic: {}, oil: {}, hynix: {} }), dir, { fetchImpl: venues.fetch, WebSocketImpl: venues.WebSocket });
 const store = openStore(join(dir, 'executor.sqlite'));
 const { binance, bybit, aster, asterTrading } = createSimulatedVenues(Date.now);
 const executor = createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, positions: asterTrading });

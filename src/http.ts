@@ -10,6 +10,7 @@ import { LIVE_PAGE, PAGE } from './page.ts';
 import { LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash } from './login-password.ts';
 import type { WebApp } from './web-assets.ts';
 import { ANTHROPIC_RETENTION_DAYS } from './vendor/anthropic-market.mjs';
+import { supportsExchange, type Exchange } from './vendor/exchange-comparison.mjs';
 import type { AssetStore } from './asset/store.ts';
 import { AssetConflict } from './asset/sync-lock.ts';
 import { AssetInputError, INPUT_INVALID } from './asset/validation.ts';
@@ -89,7 +90,11 @@ export interface ServiceViews {
     rules?: { view(): unknown; create(body: unknown): unknown; update(id: string, body: unknown): unknown; act(id: string, action: string, body: unknown): unknown };
   };
   /** The read-only market monitors; a market's reads give undefined when it is not configured and null until there is data. Absent without config.monitor. */
-  monitor?: { state(): { markets: readonly string[] }; quote(market: keyof typeof MONITOR_NAMES): unknown; candles(market: keyof typeof MONITOR_NAMES, days: number | null): unknown };
+  monitor?: {
+    state(): { markets: readonly string[] }; quote(market: keyof typeof MONITOR_NAMES): unknown; candles(market: keyof typeof MONITOR_NAMES, days: number | null): unknown;
+    /** M-2c: one exchange's comparison row, read on demand; undefined when the market is not configured; rejects with the page's reason. */
+    exchange?(market: 'oil' | 'hynix', exchange: Exchange): Promise<unknown> | undefined;
+  };
   /** The options module's reads and writes (service/options.ts); absent when the service runs no options module. */
   options?: {
     market(expiry: string | null): unknown;
@@ -289,6 +294,18 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       if (!target) return send(response, 404, { code: 'not_found', message: '不存在' });
       const body = await readJson(request);
       return send(response, 200, target[2] === 'update' ? rules.update(target[1]!, body) : rules.act(target[1]!, target[2]!, body));
+    }
+    const exchangeRoute = request.method === 'GET' ? /^\/api\/monitor\/(oil|hynix)\/exchanges\/([a-z]{1,20})$/.exec(url.pathname) : null;
+    if (exchangeRoute) {
+      const market = exchangeRoute[1] as 'oil' | 'hynix', exchange = exchangeRoute[2]!, name = MONITOR_NAMES[market];
+      if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
+      if (!views.monitor.state().markets.includes(market)) return send(response, 404, { code: 'not_found', message: `本服务没有配置${name}行情监控` });
+      if (!supportsExchange(market, exchange)) return send(response, 404, { code: 'not_found', message: `${name}交易所对比不支持 ${exchange}` });
+      const read = views.monitor.exchange?.(market, exchange as Exchange);
+      if (read === undefined) return send(response, 404, { code: 'not_found', message: `本服务没有配置${name}行情监控` });
+      try { return send(response, 200, await read); }
+      // The reader's reasons are short Chinese texts that never carry upstream content.
+      catch (error) { return send(response, 503, { code: 'exchange_unavailable', message: error instanceof Error ? error.message : '交易所行情暂不可用' }); }
     }
     if (request.method === 'GET' && MONITOR_PATHS.has(url.pathname)) {
       if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });

@@ -1,6 +1,7 @@
 // A stand-in for the four public venues the Anthropic monitor reads (Binance, Hyperliquid xyz/io, Lighter RH) and the two
 // Binance oil contracts (BZUSDT, CLUSDT) and the Hyperliquid Hynix pair (xyz:SKHY, xyz:SKHX), shared by the monitor tests and
-// scripts/dev-monitor.ts. Prices follow slow waves (~95 USD per share, Brent ~74 and WTI ~70 USDT per barrel, SKHX ~230 USD
+// scripts/dev-monitor.ts, plus the comparison venues of M-2c (Bybit, OKX, Bitget, Gate, Lighter REST and its market_stats
+// socket, Binance SKHY/SKHYNIX, Hyperliquid xyz oil and Hynix contexts), each a few cents off. Prices follow slow waves (~95 USD per share, Brent ~74 and WTI ~70 USDT per barrel, SKHX ~230 USD
 // with the ADR 2–8 % above a tenth of it) so the charts have shape.
 import type { AnthropicLegKey } from '../src/vendor/anthropic-market.mjs';
 
@@ -30,6 +31,22 @@ const HYNIX_COINS: Record<string, FakeHynixLeg> = { 'xyz:SKHY': 'skhy', 'xyz:SKH
 export function fakeHynixPrice(leg: FakeHynixLeg, time: number): number {
   const ordinary = 230 + 15 * Math.sin(time / (7 * DAY)), premium = 0.05 + 0.03 * Math.sin(time / (2 * DAY) + 1);
   return Math.round((leg === 'skhx' ? ordinary : ordinary / 10 * (1 + premium)) * 100) / 100;
+}
+
+const COMPARISON_HOSTS: Record<string, string> = { 'api.bybit.com': 'bybit', 'www.okx.com': 'okx', 'api.bitget.com': 'bitget', 'api.gateio.ws': 'gate', 'mainnet.zklighter.elliot.ai': 'lighter' };
+const HYNIX_BINANCE = ['SKHYUSDT', 'SKHYNIXUSDT'];
+const LIGHTER_MARKETS = [{ symbol: 'BRENTOIL', market_id: 91 }, { symbol: 'WTI', market_id: 92 }];
+const XYZ_EXTRA = ['xyz:BRENTOIL', 'xyz:CL', 'xyz:SKHY', 'xyz:SKHX'];
+const VENUE_OFFSET: Record<string, number> = { hyperliquid: 0.004, bybit: -0.002, binance: 0, lighter: 0.003, okx: -0.001, bitget: 0.002, gate: -0.003 };
+/** A comparison venue's mark for a contract base (BZ, CL, SKHY, SKHYNIX) at `time`: the shared wave, a few tenths of a percent off. */
+export function venuePrice(venue: string, base: string, time: number): number {
+  const value = base === 'BZ' ? fakeOilPrice('brent', time) : base === 'CL' ? fakeOilPrice('wti', time) : base === 'SKHY' ? fakeHynixPrice('skhy', time) : fakeHynixPrice('skhx', time);
+  return Math.round(value * (1 + (VENUE_OFFSET[venue] ?? 0) * (base === 'CL' || base === 'SKHYNIX' ? -1 : 1)) * 1000) / 1000;
+}
+function xyzContext(coin: string, time: number) {
+  const base = coin === 'xyz:BRENTOIL' ? 'BZ' : coin === 'xyz:CL' ? 'CL' : coin === 'xyz:SKHY' ? 'SKHY' : 'SKHYNIX';
+  const price = String(venuePrice('hyperliquid', base, time));
+  return { markPx: price, oraclePx: price, funding: base === 'BZ' || base === 'SKHY' ? '0.0000125' : '-0.000005' };
 }
 
 const wait = (ms: number, signal: AbortSignal | null | undefined) => new Promise<void>((resolve, reject) => {
@@ -65,6 +82,10 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
     hynixStatus: null as number | null,
     /** Hours neither Hynix leg has a candle for (no trades). */
     hynixMissing: new Set<number>(),
+    /** Comparison venues answering HTTP 500 ('hyperliquid': the xyz oil and Hynix contracts are missing from the contexts). */
+    exchangeDown: new Set<string>(),
+    /** How the Lighter socket behaves: answers, stays silent (the read times out), or rejects the subscription. */
+    lighterMode: 'normal' as 'normal' | 'silent' | 'reject',
     /** Delay before every answer; aborting the request ends the wait. */
     delayMs: 0,
     /** While set, every request waits for it (or its abort). */
@@ -82,7 +103,7 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
   const oil = (leg: FakeOilLeg | 'funding', url: URL): Response => {
     if (state.down.has(leg)) return fail(500);
     if (state.oilStatus !== null) return fail(state.oilStatus);
-    if (leg === 'funding') return ok([{ symbol: 'BTCUSDT', fundingIntervalHours: 8 }, { symbol: 'BZUSDT', fundingIntervalHours: 4 }, { symbol: 'CLUSDT', fundingIntervalHours: 4 }]);
+    if (leg === 'funding') return ok([{ symbol: 'BTCUSDT', fundingIntervalHours: 8 }, { symbol: 'BZUSDT', fundingIntervalHours: 4 }, { symbol: 'CLUSDT', fundingIntervalHours: 4 }, { symbol: 'SKHYUSDT', fundingIntervalHours: 4 }, { symbol: 'SKHYNIXUSDT', fundingIntervalHours: 4 }]);
     const symbol = leg === 'brent' ? 'BZUSDT' : 'CLUSDT';
     if (url.pathname === '/fapi/v1/premiumIndex') return ok({ symbol, markPrice: String(fakeOilPrice(leg, now())), lastFundingRate: leg === 'brent' ? '0.00005' : '-0.00002', nextFundingTime: Math.ceil(now() / 14_400_000) * 14_400_000, time: now() });
     const from = Number(url.searchParams.get('startTime')), to = Number(url.searchParams.get('endTime')), limit = Number(url.searchParams.get('limit'));
@@ -110,7 +131,13 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
     }
     if (leg === 'xyz' || leg === 'io') {
       const name = leg === 'xyz' ? 'xyz:ANT' : 'io:ANTH';
-      if (body!.type === 'metaAndAssetCtxs') return ok([{ universe: [{ name: 'other' }, { name }] }, [{ markPx: '1' }, { markPx: String(fakeAnthropicPrice(leg, now())), funding: '0.0000125', oraclePx: String(fakeAnthropicPrice(leg, now())) }]]);
+      if (body!.type === 'metaAndAssetCtxs') {
+        const own = { markPx: String(fakeAnthropicPrice(leg, now())), funding: '0.0000125', oraclePx: String(fakeAnthropicPrice(leg, now())) };
+        if (leg === 'io') return ok([{ universe: [{ name: 'other' }, { name }] }, [{ markPx: '1' }, own]]);
+        // The xyz dex also lists the oil and Hynix contracts the comparison reads.
+        const extra = state.exchangeDown.has('hyperliquid') ? [] : XYZ_EXTRA;
+        return ok([{ universe: [{ name: 'other' }, { name }, ...extra.map(coin => ({ name: coin }))] }, [{ markPx: '1' }, own, ...extra.map(coin => xyzContext(coin, now()))]]);
+      }
       // Hyperliquid serves only its latest 5000 candles.
       return ok(bars(leg, body!.req.startTime, body!.req.endTime + 1).slice(-5000).map(t => ({ t, T: t + BAR - 1, s: name, i: '15m', o: '1', h: '1', l: '1', c: String(fakeAnthropicPrice(leg, t)), v: '1', n: 1 })));
     }
@@ -126,9 +153,63 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
     }
     return fail(404);
   };
+  const settle = (hours: number) => Math.ceil((now() + 1) / (hours * HOUR)) * hours * HOUR;
+  /** The comparison venues' official envelopes for one symbol's request. */
+  const comparison = (venue: string, url: URL): Response => {
+    const t = now(), symbol = url.searchParams.get('symbol') ?? url.searchParams.get('instId') ?? url.pathname.split('/').at(-1)!;
+    const base = symbol.replace(/(-USDT-SWAP|_USDT|USDT)$/, '');
+    const mark = String(venuePrice(venue, base, t));
+    if (venue === 'binance') return ok({ symbol, markPrice: mark, lastFundingRate: '0.00004', nextFundingTime: settle(4), time: t });
+    if (venue === 'bybit') {
+      if (url.pathname.endsWith('/instruments-info')) return ok({ retCode: 0, time: t, result: { category: 'linear', list: [{ symbol, status: 'Trading', contractType: 'LinearPerpetual', baseCoin: base, quoteCoin: 'USDT', settleCoin: 'USDT', fundingInterval: 480 }], nextPageCursor: '' } });
+      return ok({ retCode: 0, time: t, result: { category: 'linear', list: [{ symbol, markPrice: mark, fundingRate: base === 'BZ' || base === 'SKHY' ? '0.0001' : '0.00002', nextFundingTime: String(settle(8)) }] } });
+    }
+    if (venue === 'okx') {
+      if (url.pathname.endsWith('/instruments')) return ok({ code: '0', data: [{ instId: symbol, instType: 'SWAP', state: 'live', ctType: 'linear', settleCcy: 'USDT', ctValCcy: base, instFamily: `${base}-USDT`, uly: `${base}-USDT`, ruleType: 'normal' }] });
+      if (url.pathname.endsWith('/mark-price')) return ok({ code: '0', data: [{ instId: symbol, instType: 'SWAP', markPx: mark, ts: String(t) }] });
+      return ok({ code: '0', data: [{ instId: symbol, instType: 'SWAP', method: 'current_period', fundingRate: '0.00008', fundingTime: String(settle(8)), nextFundingTime: String(settle(8) + 8 * HOUR), ts: String(t) }] });
+    }
+    if (venue === 'bitget') {
+      if (url.pathname.endsWith('/contracts')) return ok({ code: '00000', requestTime: t, data: [{ symbol, symbolStatus: 'normal', symbolType: 'perpetual', baseCoin: base, quoteCoin: 'USDT', supportMarginCoins: ['USDT'] }] });
+      if (url.pathname.endsWith('/ticker')) return ok({ code: '00000', requestTime: t, data: [{ symbol, markPrice: mark, ts: String(t) }] });
+      return ok({ code: '00000', requestTime: t, data: [{ symbol, fundingRate: '-0.00003', fundingRateInterval: '8', nextUpdate: String(settle(8)) }] });
+    }
+    if (venue === 'gate') return ok({ name: symbol, status: 'trading', in_delisting: false, type: 'direct', mark_price: mark, funding_rate: '0.00005', funding_interval: 28_800, funding_next_apply: settle(8) / 1000 });
+    // Lighter's catalog.
+    return ok({ code: 200, order_book_details: [{ symbol: 'ETH', market_id: 0, market_type: 'perp', status: 'active', multiplier: 1 }, ...LIGHTER_MARKETS.map(row => ({ ...row, market_type: 'perp', status: 'active', multiplier: 1 }))] });
+  };
+  /** A stand-in for Lighter's read-only stream: answers each market_stats subscription with one snapshot. */
+  class FakeSocket {
+    onopen: (() => void) | null = null; onmessage: ((event: { data: string }) => void) | null = null; onerror: (() => void) | null = null; onclose: (() => void) | null = null;
+    readonly url: string;
+    constructor(url: string) {
+      this.url = url;
+      state.requests.set('exchange:lighter-socket', (state.requests.get('exchange:lighter-socket') ?? 0) + 1);
+      setTimeout(() => this.onopen?.(), 0);
+    }
+    send(text: string): void {
+      const message = JSON.parse(text) as { type: string; channel?: string };
+      if (message.type !== 'subscribe' || state.lighterMode === 'silent') return;
+      setTimeout(() => {
+        if (state.lighterMode === 'reject') { this.onmessage?.({ data: JSON.stringify({ type: 'error', error: 'denied' }) }); return; }
+        const id = Number(message.channel!.split('/')[1]), market = LIGHTER_MARKETS.find(row => row.market_id === id)!;
+        const price = venuePrice('lighter', market.symbol === 'BRENTOIL' ? 'BZ' : 'CL', now());
+        this.onmessage?.({ data: JSON.stringify({ type: 'ping' }) });
+        this.onmessage?.({ data: JSON.stringify({ type: 'subscribed/market_stats', channel: `market_stats:${id}`, timestamp: now(), market_stats: { symbol: market.symbol, market_id: id, mark_price: String(price), index_price: String(price), current_funding_rate: '0.0012' } }) });
+      }, 0);
+    }
+    close(): void { /* nothing to release */ }
+  }
   const fetch = async (href: string, init: RequestInit = {}): Promise<Response> => {
     const url = new URL(href);
     let leg: AnthropicLegKey, kind: string, body: Record<string, any> | null = null;
+    if (url.hostname === 'fapi.binance.com' && HYNIX_BINANCE.includes(url.searchParams.get('symbol') ?? '')) {
+      state.requests.set('exchange:binance', (state.requests.get('exchange:binance') ?? 0) + 1);
+      if (state.hold) await held(state.hold, init.signal);
+      if (state.delayMs) await wait(state.delayMs, init.signal);
+      if (state.oilStatus !== null) return fail(state.oilStatus);
+      return state.exchangeDown.has('binance') ? fail(500) : comparison('binance', url);
+    }
     const oilLeg = url.hostname === 'fapi.binance.com' ? url.pathname === '/fapi/v1/fundingInfo' ? 'funding' as const : OIL_SYMBOLS[url.searchParams.get('symbol') ?? ''] : undefined;
     if (oilLeg) {
       const key = `${url.pathname === '/fapi/v1/klines' ? 'candles' : 'quote'}:${oilLeg}`;
@@ -150,7 +231,15 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
       leg = body.type === 'metaAndAssetCtxs' ? (body.dex === 'xyz' ? 'xyz' : 'io') : (body.req.coin === 'xyz:ANT' ? 'xyz' : 'io');
       kind = body.type === 'metaAndAssetCtxs' ? 'quote' : 'candles';
     } else if (url.hostname === 'api.rh.lighter.xyz') { leg = 'rh'; kind = url.pathname === '/api/v1/candles' ? 'candles' : 'quote'; }
-    else throw new Error(`unexpected request ${href}`);
+    else {
+      const venue = COMPARISON_HOSTS[url.hostname];
+      if (!venue) throw new Error(`unexpected request ${href}`);
+      const key = `exchange:${venue}`;
+      state.requests.set(key, (state.requests.get(key) ?? 0) + 1);
+      if (state.hold) await held(state.hold, init.signal);
+      if (state.delayMs) await wait(state.delayMs, init.signal);
+      return state.exchangeDown.has(venue) ? fail(500) : comparison(venue, url);
+    }
     const key = `${kind}:${leg}`;
     state.requests.set(key, (state.requests.get(key) ?? 0) + 1);
     inFlight.set(key, (inFlight.get(key) ?? 0) + 1);
@@ -161,6 +250,6 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
       return answer(leg, url, body);
     } finally { inFlight.set(key, inFlight.get(key)! - 1); }
   };
-  return Object.assign(state, { fetch });
+  return Object.assign(state, { fetch, WebSocket: FakeSocket as unknown as typeof WebSocket });
 }
 export type FakeAnthropicVenues = ReturnType<typeof fakeAnthropicVenues>;

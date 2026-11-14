@@ -5,13 +5,13 @@ import { bybitAuthHeaders } from '../vendor/bybit.mjs';
 import { createHash } from 'node:crypto';
 import { VENUE_EXECUTION_SYMBOLS, accountKey, type AccountBinding, type AccountSnapshot, type Instrument, type OpenOrder, type Position, type PositionSide, type Quote } from '../contracts.ts';
 import {
-  STRATEGY_ID, VenueError, type CallOptions, type ChaseConnector, type ConnectorCapabilities, type OrderReport, type OrderRequest, type OrderStatus, type SendOptions,
+  STRATEGY_ID, VenueError, type CallOptions, type ChaseConnector, type ConnectorCapabilities, type LedgerEntry, type OrderReport, type PnlPosition, type PnlSnapshot, type OrderRequest, type OrderStatus, type SendOptions,
   type StrategyAck, type StrategyReport, type StrategyRequest,
 } from '../connector.ts';
-import { add, cmp, isZero } from '../decimal.ts';
+import { add, cmp, isZero, sub } from '../decimal.ts';
 import { exchange, type FetchLike, type HttpReply } from './http.ts';
 import { PreflightError, bybitAccountProblem, bybitIpProblem, bybitPermissionProblem } from './permissions.ts';
-import { ShapeError, amount, describe, hedgeClose, identifier, list, millis, optionalPrice, record, validCredentials, type LiveCredentials } from './values.ts';
+import { ShapeError, amount, cashAmount, describe, hedgeClose, identifier, list, millis, optionalPrice, record, validCredentials, type LiveCredentials } from './values.ts';
 
 export interface BybitConnectorOptions {
   /** Resolves the key for one binding; a throw refuses the call before anything is sent. */
@@ -51,6 +51,15 @@ const KNOWN_REJECTIONS = new Set([
   60063, 60064, 60066, 60067, 60069, 60070, 60075, 60077, 60078, 60079, 60081,
 ]);
 const TIMESTAMP_CODE = 10002;
+
+/**
+ * Transaction-log reads (docs/oil.md section 9): the venue answers at most 7 days per query, 50 rows a page. Types copied
+ * from the workbench ledgers (PR #345); any other type on an oil contract is refused by name, never left out.
+ */
+const LEDGER_SEGMENT_MS = 7 * 86_400_000 - 2_000;
+const LEDGER_MAX_PAGES = 200;
+const LEDGER_TYPES = new Set(['SETTLEMENT', 'TRADE', 'LIQUIDATION', 'ADL']);
+const BASE_COINS: Record<string, string> = { BZUSDT: 'BZ', CLUSDT: 'CL' };
 
 type Mode = 'one-way' | 'hedge';
 type Failure = { kind: 'timestamp' | 'rejected' | 'unknown'; message: string };
@@ -322,6 +331,70 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
   return {
     venue: 'bybit',
     capabilities,
+
+    pnlPositions: (binding: AccountBinding, symbols: readonly string[], { signal }: CallOptions) => reading(async (): Promise<PnlSnapshot> => {
+      if (symbols.length === 0 || symbols.some(symbol => !VENUE_EXECUTION_SYMBOLS.bybit.includes(symbol))) throw new VenueError('read-failed', '盈亏持仓的合约无效');
+      const accountId = await readIdentity(binding, signal), positions: PnlPosition[] = [];
+      for (const symbol of symbols) {
+        const result = await signed(binding, 'GET', '/v5/position/list', { category: 'linear', symbol, limit: '200' }, { signal });
+        if (result.category !== 'linear') throw new ShapeError('持仓分类与请求不一致');
+        const indices = new Set<unknown>();
+        for (const item of list(result.list, '持仓', 200)) {
+          const row = record(item, '持仓');
+          if (row.symbol !== symbol || indices.has(row.positionIdx)) throw new ShapeError('持仓合约与请求不一致或方向编号重复');
+          indices.add(row.positionIdx);
+          const quantity = amount(row.size, '持仓数量', 'nonnegative');
+          if (isZero(quantity)) continue;
+          positions.push({ symbol, side: sideOf(row.side) === 'buy' ? 'long' : 'short', quantity, entryPrice: optionalPrice(row.avgPrice, '开仓均价'), markPrice: optionalPrice(row.markPrice, '标记价格'),
+            unrealizedPnl: cashAmount(row.unrealisedPnl, '未实现盈亏') });
+        }
+      }
+      return { venue: 'bybit', accountId, positions, receivedAt: now() };
+    }),
+
+    ledger: (binding: AccountBinding, symbol: string, window: { from: number; to: number }, { signal }: CallOptions) => reading(async (): Promise<LedgerEntry[]> => {
+      const baseCoin = BASE_COINS[symbol];
+      if (!baseCoin || !Number.isSafeInteger(window.from) || !Number.isSafeInteger(window.to) || window.from < 0 || window.to <= window.from) throw new VenueError('read-failed', '账单读取的合约或时间窗无效');
+      const entries = new Map<string, LedgerEntry>();
+      // Absent or empty means none: a trade row carries no funding, a settlement no fee.
+      const cash = (value: unknown, name: string): string => value === undefined || value === null || value === '' ? '0' : cashAmount(value, name);
+      for (let from = window.from; from < window.to; from += LEDGER_SEGMENT_MS) {
+        const to = Math.min(window.to, from + LEDGER_SEGMENT_MS), cursors = new Set<string>();
+        let cursor = '', page = 0;
+        do {
+          if (++page > LEDGER_MAX_PAGES) throw new ShapeError(`账单超过 ${LEDGER_MAX_PAGES} 页仍未读完`);
+          const result = await signed(binding, 'GET', '/v5/account/transaction-log', { accountType: 'UNIFIED', category: 'linear', baseCoin, currency: 'USDT', startTime: String(from), endTime: String(to), limit: String(PAGE_SIZE), ...(cursor ? { cursor } : {}) }, { signal });
+          const rows = list(result.list, '账单', PAGE_SIZE);
+          for (const item of rows) {
+            const row = record(item, '账单');
+            // The base coin filter may list another contract of the same coin; only this symbol's rows count here.
+            if (row.symbol !== symbol) continue;
+            const time = millis(row.transactionTime, '账单时间');
+            // endTime may or may not include its own millisecond; a row at the end is read again by the next segment (same id).
+            if (time < from || time > to) throw new ShapeError('账单时间超出请求时间窗');
+            if (row.category !== 'linear') throw new ShapeError('账单分类与请求不一致');
+            const type = typeof row.type === 'string' && /^[A-Z_]{1,40}$/.test(row.type) ? row.type : null;
+            if (type === null || !LEDGER_TYPES.has(type)) throw new ShapeError(`账单类型 ${type ?? '无效'} 无法归类，暂不计入`);
+            if (row.currency !== 'USDT') throw new ShapeError('账单币种不是 USDT，无法计入');
+            const id = typeof row.id === 'string' && /^[\x21-\x7e]{1,100}$/.test(row.id) ? row.id : identifier(row.id, '账单编号');
+            // Unified account: change = cashFlow + funding − fee; a row that does not add up is not read with a guessed sign.
+            const realized = cash(row.cashFlow, '平仓盈亏'), funding = cash(row.funding, '资金费'), fee = sub('0', cash(row.fee, '手续费'));
+            if (row.change !== undefined && row.change !== '' && cmp(cash(row.change, '变动'), add(realized, funding, fee)) !== 0) throw new ShapeError('账单变动与平仓盈亏、资金费、手续费之和不一致');
+            for (const [kind, value] of [['realized', realized], ['funding', funding], ['fee', fee]] as const) {
+              if (isZero(value)) continue;
+              const entry: LedgerEntry = { id: `${id}:${kind}`, time, symbol, kind, amount: value }, previous = entries.get(entry.id);
+              if (previous && (previous.time !== time || cmp(previous.amount, value) !== 0)) throw new ShapeError('同一账单编号出现不同内容');
+              entries.set(entry.id, entry);
+            }
+          }
+          const next = result.nextPageCursor;
+          if (next === undefined || next === null || next === '') cursor = '';
+          else if (typeof next !== 'string' || next.length > 2000 || /[\r\n\0]/.test(next) || cursors.has(next)) throw new ShapeError('账单分页游标无效或重复');
+          else { cursors.add(next); cursor = next; }
+        } while (cursor);
+      }
+      return [...entries.values()].sort((a, b) => a.time - b.time || a.id.localeCompare(b.id));
+    }),
 
     preflight: (binding: AccountBinding, { signal }: CallOptions) => reading(async () => {
       const info = await signed(binding, 'GET', '/v5/user/query-api', {}, { signal });

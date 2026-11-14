@@ -82,6 +82,7 @@ export class FakeBinance {
       const symbol = call.params.get('symbol')!, size = this.net.get(symbol) ?? 0;
       return json([{ symbol, positionSide: 'BOTH', positionAmt: size.toFixed(3), marginAsset: 'USDT', entryPrice: size === 0 ? '0' : '70.11' }]);
     }
+    if (call.path.endsWith('/income')) return json([]);
     if (call.path.endsWith('/order')) return this.order(call);
     return json({ code: -1100, msg: 'unknown path' }, 404);
   };

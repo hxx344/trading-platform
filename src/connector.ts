@@ -187,7 +187,25 @@ export interface VenueConnector {
    * the account can trade, and it belongs to binding.accountId. Any throw refuses the start.
    */
   preflight?(binding: AccountBinding, options: CallOptions): Promise<void>;
+  /** Read only (docs/oil.md section 9): the open positions of the symbols with entry, mark and unrealized PnL, for the PnL page. */
+  pnlPositions?(binding: AccountBinding, symbols: readonly string[], options: CallOptions): Promise<PnlSnapshot>;
+  /**
+   * Read only: every funding, realized-PnL and fee entry of one symbol with venue time in [from, to); rows at exactly `to` may
+   * be included too (the next window reads them again under the same id). The answer is complete (every page read, every
+   * row understood); anything less throws a read failure, never part of the window.
+   */
+  ledger?(binding: AccountBinding, symbol: string, window: { from: number; to: number }, options: CallOptions): Promise<LedgerEntry[]>;
 }
+
+/** One open position as the venue values it; unrealizedPnl in USDT, signed (a gain is positive). */
+export interface PnlPosition { symbol: string; side: PositionSide; quantity: string; entryPrice: string | null; markPrice: string | null; unrealizedPnl: string }
+export interface PnlSnapshot { venue: Venue; accountId: string; positions: PnlPosition[]; receivedAt: number }
+/**
+ * funding: a settled funding payment; realized: closing PnL; fee: trading fee (charged negative, rebate positive).
+ * amount is the signed USDT cash flow into the account. id is unique per account on the venue and stable across reads.
+ */
+export type LedgerKind = 'funding' | 'realized' | 'fee';
+export interface LedgerEntry { id: string; time: number; symbol: string; kind: LedgerKind; amount: string }
 export type ChaseConnector = VenueConnector & Required<Pick<VenueConnector, 'placeChase' | 'queryStrategy' | 'stopStrategy' | 'listStrategies'>>;
 export const supportsChase = (connector: VenueConnector): connector is ChaseConnector => connector.capabilities.chase === true
   && typeof connector.placeChase === 'function' && typeof connector.queryStrategy === 'function' && typeof connector.stopStrategy === 'function' && typeof connector.listStrategies === 'function';

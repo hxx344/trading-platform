@@ -88,6 +88,8 @@ export interface ServiceViews {
     market(): unknown; state(): unknown;
     /** The spread rules (docs/oil.md section 7); a store that could not open answers its reason and refuses writes. */
     rules?: { view(): unknown; create(body: unknown): unknown; update(id: string, body: unknown): unknown; act(id: string, action: string, body: unknown): unknown };
+    /** PnL, funding and ledgers (docs/oil.md section 9); null for an unknown range. */
+    pnl?(range: string, page: number): unknown;
   };
   /** The read-only market monitors; a market's reads give undefined when it is not configured and null until there is data. Absent without config.monitor. */
   monitor?: {
@@ -286,6 +288,13 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'GET' && (url.pathname === '/api/oil/market' || url.pathname === '/api/oil/state')) {
       if (!views?.oil) return send(response, 404, { code: 'not_found', message: '本服务没有配置原油执行' });
       return send(response, 200, url.pathname === '/api/oil/market' ? views.oil.market() : views.oil.state());
+    }
+    if (request.method === 'GET' && url.pathname === '/api/oil/pnl') {
+      if (!views?.oil?.pnl) return send(response, 404, { code: 'not_found', message: '本服务没有配置原油执行' });
+      const page = Number(url.searchParams.get('page') ?? '0');
+      const result = Number.isSafeInteger(page) && page >= 0 && page <= 100_000 ? views.oil.pnl(url.searchParams.get('range') ?? '7d', page) : null;
+      if (result === null) return send(response, 400, { code: 'invalid_query', message: '区间或页码无效' });
+      return send(response, 200, result);
     }
     if (url.pathname === '/api/oil/rules' || url.pathname.startsWith('/api/oil/rules/')) {
       if (!views?.oil?.rules) return send(response, 404, { code: 'not_found', message: '本服务没有配置原油执行' });

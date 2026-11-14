@@ -22,6 +22,19 @@ export function optionalPrice(value: unknown, name: string): string | null {
   const parsed = amount(value, name, 'nonnegative');
   return parsed === '0' ? null : parsed;
 }
+/**
+ * A signed amount that may be written in exponent form ("-1.2e-05", as Bybit writes small cash flows), moved to plain
+ * decimal as text, never through a double. Copied from the workbench bybitFundingAmount.
+ */
+export function cashAmount(value: unknown, name: string): string {
+  if (typeof value !== 'string' || value.length > 100) return shape(`${name}缺失或无效`);
+  const match = /^([+-]?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d{1,3}))?$/.exec(value);
+  if (!match) return shape(`${name}无效`);
+  const exponent = Number(match[4] ?? 0), digits = match[2]! + (match[3] ?? ''), point = match[2]!.length + exponent;
+  const integer = (point <= 0 ? '0' : digits.slice(0, point).padEnd(point, '0')).replace(/^0+(?=\d)/, '');
+  const fraction = (point <= 0 ? '0'.repeat(-point) + digits : digits.slice(point)).replace(/0+$/, '');
+  try { return decimal(`${match[1] === '-' ? '-' : ''}${integer}${fraction ? `.${fraction}` : ''}`, 'any'); } catch { return shape(`${name}无效`); }
+}
 export function millis(value: unknown, name: string): number {
   const parsed = typeof value === 'string' && /^\d{1,16}$/.test(value) ? Number(value) : value;
   return typeof parsed === 'number' && Number.isSafeInteger(parsed) && parsed > 0 && parsed < 8_640_000_000_000_000 ? parsed : shape(`${name}无效`);

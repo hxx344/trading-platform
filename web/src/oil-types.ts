@@ -46,3 +46,21 @@ export interface OilPreviewLeg {
 /** batches: the lead quantity of each batch, when the intent asked for more than one. */
 export interface OilPreview { id: string; expiresAt: number; intent: OilIntent; legs: OilPreviewLeg[]; notional: string; barrels?: string; batches?: string[]; notes: string[] }
 export interface OilConfirmResult { accepted: boolean; duplicate: boolean; job: OilJob }
+
+/** GET /api/oil/pnl (docs/oil.md section 9): amounts are USDT decimal strings; null where the ledgers do not reach. */
+export interface OilPnlPoint { time: number; unrealizedPnl: string | null; fundingPnl: string | null; realizedPnl: string | null; feePnl: string | null; totalPnl: string | null }
+export interface OilPnlAccount {
+  venue: string; accountId: string; accountMode: string;
+  positions: { rows: { symbol: string; side: string; quantity: string; entryPrice: string | null; markPrice: string | null; unrealizedPnl: string }[] | null; receivedAt: number | null; failedAt: number | null; error: string | null };
+  ledger: { start: number | null; coveredUntil: number | null; syncedAt: number | null; failedAt: number | null; error: string | null };
+  symbols: { symbol: string; funding: string; realized: string; fee: string; unrealized: string | null }[];
+}
+export interface OilPnlView {
+  currency: 'USDT'; range: string; ranges: string[]; now: number; requestedStart: number; start: number; intervalMs: number; sampledAt: number | null;
+  status: 'collecting' | 'incomplete' | 'ready'; recordingStartedAt: number | null; pointCount: number; points: OilPnlPoint[]; latest: OilPnlPoint | null;
+  totals: { funding: string; realized: string; fee: string } | null;
+  accounts: OilPnlAccount[];
+  entries: { page: number; pages: number; total: number; pageSize: number; rows: { venue: string | null; id: string; time: number; symbol: string; kind: 'funding' | 'realized' | 'fee'; amount: string }[] };
+}
+/** The PnL store could not open: the reason, nothing else. */
+export interface OilPnlUnavailable { available: false; error: string }

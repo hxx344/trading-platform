@@ -3,7 +3,7 @@
 import { createHash } from 'node:crypto';
 import { binanceSignedQuery } from '../vendor/binance.mjs';
 import { VENUE_EXECUTION_SYMBOLS, VENUE_READ_SYMBOLS, accountKey, type AccountBinding, type AccountSnapshot, type Instrument, type OpenOrder, type Position, type Quote } from '../contracts.ts';
-import { VenueError, type CallOptions, type ConnectorCapabilities, type OrderReport, type OrderRequest, type OrderStatus, type SendOptions, type VenueConnector } from '../connector.ts';
+import { VenueError, type CallOptions, type ConnectorCapabilities, type LedgerEntry, type LedgerKind, type OrderReport, type OrderRequest, type OrderStatus, type PnlPosition, type PnlSnapshot, type SendOptions, type VenueConnector } from '../connector.ts';
 import { cmp, isZero, sub } from '../decimal.ts';
 import { exchange, type FetchLike, type HttpReply } from './http.ts';
 import { PreflightError, binanceIpProblem, binancePermissionProblem } from './permissions.ts';
@@ -44,6 +44,17 @@ const NOT_FOUND_CODE = -2013;
 /** GTX is the venue's post-only: one that would take liquidity is refused with -5022 (a known rejection) and never rests. */
 const timeInForceOf = (request: OrderRequest): string => request.timeInForce === 'ioc' ? 'IOC' : request.timeInForce === 'gtx' ? 'GTX' : 'GTC';
 
+/**
+ * Income types of one oil symbol (docs/oil.md section 9), copied from the workbench trades and funding ledgers (PR #345).
+ * Any other type is refused by name rather than left out, so a ledger never reads as complete while missing cash flows.
+ */
+const INCOME_KINDS: Record<string, LedgerKind> = {
+  FUNDING_FEE: 'funding', REALIZED_PNL: 'realized', COMMISSION: 'fee', INSURANCE_CLEAR: 'fee', COMMISSION_REBATE: 'fee', API_REBATE: 'fee',
+};
+const INCOME_LIMIT = 1000;
+/** Requests one ledger read may make: a full page halves its window, so this bounds a window with very many rows. */
+const INCOME_REQUESTS = 64;
+
 type Mode = 'one-way' | 'hedge';
 interface Endpoint { host: string; path: string; method: 'GET' | 'POST' | 'DELETE' }
 function endpoints(accountMode: string) {
@@ -60,6 +71,7 @@ function endpoints(accountMode: string) {
     place: at(`${prefix}/order`, 'POST'),
     query: at(`${prefix}/order`),
     cancel: at(`${prefix}/order`, 'DELETE'),
+    income: at(`${prefix}/income`),
   };
 }
 
@@ -254,6 +266,63 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
   return {
     venue: 'binance',
     capabilities,
+
+    pnlPositions: (binding: AccountBinding, symbols: readonly string[], { signal }: CallOptions) => reading(async (): Promise<PnlSnapshot> => {
+      if (symbols.length === 0 || symbols.some(symbol => !VENUE_EXECUTION_SYMBOLS.binance.includes(symbol))) throw new VenueError('read-failed', '盈亏持仓的合约无效');
+      const routes = endpoints(binding.accountMode), accountId = await readIdentity(binding, signal), positions: PnlPosition[] = [];
+      for (const symbol of symbols) {
+        const seen = new Set<string>();
+        for (const item of list(await signed(binding, routes.positions, { symbol }, { signal }), '持仓', 20)) {
+          const row = record(item, '持仓');
+          if (row.symbol !== symbol || (Object.hasOwn(row, 'marginAsset') && row.marginAsset !== 'USDT')) throw new ShapeError('持仓合约或保证金币种与请求不一致');
+          const positionSide = row.positionSide;
+          if ((positionSide !== 'BOTH' && positionSide !== 'LONG' && positionSide !== 'SHORT') || seen.has(positionSide)) throw new ShapeError('持仓方向无效或重复');
+          seen.add(positionSide);
+          const signedAmount = amount(row.positionAmt, '持仓数量', 'any');
+          if (isZero(signedAmount)) continue;
+          const long = cmp(signedAmount, '0') > 0;
+          if ((positionSide === 'LONG' && !long) || (positionSide === 'SHORT' && long)) throw new ShapeError('持仓数量符号与方向不一致');
+          positions.push({ symbol, side: long ? 'long' : 'short', quantity: long ? signedAmount : sub('0', signedAmount), entryPrice: optionalPrice(row.entryPrice, '开仓均价'),
+            markPrice: optionalPrice(row.markPrice, '标记价格'), unrealizedPnl: amount(row.unRealizedProfit, '未实现盈亏', 'any') });
+        }
+      }
+      return { venue: 'binance', accountId, positions, receivedAt: now() };
+    }),
+
+    ledger: (binding: AccountBinding, symbol: string, window: { from: number; to: number }, { signal }: CallOptions) => reading(async (): Promise<LedgerEntry[]> => {
+      if (!VENUE_EXECUTION_SYMBOLS.binance.includes(symbol) || !Number.isSafeInteger(window.from) || !Number.isSafeInteger(window.to) || window.from < 0 || window.to <= window.from) throw new VenueError('read-failed', '账单读取的合约或时间窗无效');
+      const route = endpoints(binding.accountMode).income, entries = new Map<string, LedgerEntry>();
+      let requests = 0;
+      // A full page may have left rows out whatever order the venue lists them in, so it is thrown away and its window
+      // read again as two halves sharing the midpoint (endTime may or may not include its own millisecond; L093), the same
+      // row read twice kept once; a window of at most 2 ms that still fills a page cannot be read in full.
+      const read = async (from: number, to: number): Promise<void> => {
+        if (++requests > INCOME_REQUESTS) throw new ShapeError(`账单超过 ${INCOME_REQUESTS} 次请求仍未读完`);
+        const rows = list(await signed(binding, route, { symbol, startTime: String(from), endTime: String(to), limit: String(INCOME_LIMIT) }, { signal }), '账单', INCOME_LIMIT);
+        if (rows.length === INCOME_LIMIT) {
+          if (to - from <= 2) throw new ShapeError('2 毫秒内的账单超过一页，无法读全');
+          const middle = from + Math.floor((to - from) / 2);
+          await read(from, middle); await read(middle, to);
+          return;
+        }
+        for (const item of rows) {
+          const row = record(item, '账单');
+          if (row.symbol !== symbol) throw new ShapeError('账单合约与请求不一致');
+          const time = millis(row.time, '账单时间');
+          if (time < from || time > to) throw new ShapeError('账单时间超出请求时间窗');
+          const type = typeof row.incomeType === 'string' && /^[A-Z_]{1,40}$/.test(row.incomeType) ? row.incomeType : null;
+          const kind = type === null ? undefined : INCOME_KINDS[type];
+          if (!kind) throw new ShapeError(`账单类型 ${type ?? '无效'} 无法归类，暂不计入`);
+          if (row.asset !== 'USDT') throw new ShapeError(`账单币种 ${typeof row.asset === 'string' ? row.asset.slice(0, 12) : '无效'} 不是 USDT（例如 BNB 抵扣手续费），无法计入`);
+          const entry: LedgerEntry = { id: `${symbol}:${type}:${identifier(row.tranId, '账单编号')}`, time, symbol, kind, amount: amount(row.income, '账单金额', 'any') };
+          const previous = entries.get(entry.id);
+          if (previous && (previous.time !== entry.time || cmp(previous.amount, entry.amount) !== 0)) throw new ShapeError('同一账单编号出现不同内容');
+          entries.set(entry.id, entry);
+        }
+      };
+      await read(window.from, window.to);
+      return [...entries.values()].sort((a, b) => a.time - b.time || a.id.localeCompare(b.id));
+    }),
 
     preflight: (binding: AccountBinding, { signal }: CallOptions) => reading(async () => {
       const routes = endpoints(binding.accountMode);

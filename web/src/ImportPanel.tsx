@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from './api.ts';
 import { fullStamp } from './asset-format.ts';
-import { alertsAvailable, assetAvailable, confirmText, defaultAssetOwner, importBody, monitorAvailable, restarts, type AssetItem, type ImportBody, type ImportChoices, type MonitorAlertsItem, type MonitorItem } from './import-form.ts';
+import { alertsAvailable, assetAvailable, confirmText, defaultAssetOwner, importBody, monitorAvailable, restarts, variationalAvailable, type AssetItem, type ImportBody, type ImportChoices, type MonitorAlertsItem, type MonitorItem, type MonitorVariationalItem } from './import-form.ts';
 
 // The workbench import: the page leaves a request, a root helper on the host answers it (and restarts this service
 // for an import); the answer is polled by request id, and polling carries on while the service restarts.
@@ -18,7 +18,7 @@ interface OptionsItem { accountId: string | null; status: 'added' | 'skipped'; d
 interface ImportResult {
   id: string | null; action: 'preview' | 'import' | null; at: number; phase?: string; message: string;
   preview?: PreviewItem[]; imported?: ImportedItem[]; oil?: OilItem[]; oilError?: string; options?: OptionsItem; optionsError?: string;
-  monitor?: MonitorItem; monitorAlerts?: MonitorAlertsItem; monitorAlertsError?: string; asset?: AssetItem; assetError?: string; notes?: string[]; database?: string;
+  monitor?: MonitorItem; monitorAlerts?: MonitorAlertsItem; monitorAlertsError?: string; monitorVariational?: MonitorVariationalItem; monitorVariationalError?: string; asset?: AssetItem; assetError?: string; notes?: string[]; database?: string;
 }
 const VENUE: Record<string, string> = { binance: 'Binance', bybit: 'Bybit' };
 
@@ -69,6 +69,22 @@ function AlertsRows({ item, preview }: { item: MonitorAlertsItem; preview: boole
     {item.status === 'skipped' ? <p className={preview ? 'muted' : 'err'}>{preview ? '' : '未导入：'}{item.detail}</p> : null}
   </>;
 }
+/** The token's declared expiry as the helper gives it (UTC, like its reasons and the comparison table). */
+const utcStamp = (iso: string): string => `${iso.slice(0, 19).replace('T', ' ')} UTC`;
+/** The workbench's Var token against this service's (M-3d-2): expiries and reasons only, never the token. */
+function VariationalRow({ item, preview }: { item: MonitorVariationalItem; preview: boolean }) {
+  const current = item.current === null ? (item.status === 'added' ? '读不出（写入时再判断）' : '—') : item.current.configured ? `声明到期 ${utcStamp(item.current.expiresAt ?? '')}${item.current.problem ? `（${item.current.problem}）` : ''}` : item.current.problem ?? '尚未配置';
+  const verdict = item.status === 'added' ? `${preview ? '可导入' : '已导入'}${item.replaces ? '，替换本服务现有的' : ''}` : `${preview ? '不导入' : '未导入'}：${item.detail}`;
+  return <div className="table-wrap"><table className="data" id="importVariationalTable">
+    <thead><tr><th>Var token</th><th>工作台</th><th>{preview ? '本服务现有' : '导入前本服务'}</th><th>{preview ? '说明' : '结果'}</th></tr></thead>
+    <tbody><tr>
+      <td>Variational 会话</td>
+      <td>{item.workbenchExpiresAt ? `声明到期 ${utcStamp(item.workbenchExpiresAt)}` : item.problem ?? '—'}</td>
+      <td>{current}</td>
+      <td className={item.status === 'added' ? 'ok' : preview ? 'muted' : 'err'}>{verdict}</td>
+    </tr></tbody>
+  </table></div>;
+}
 /** The workbench's ledger users; in a preview, the one to import is picked here. */
 function AssetRows({ item, preview, owner, setOwner }: { item: AssetItem; preview: boolean; owner?: string | null; setOwner?: (value: string) => void }) {
   const last = item.last ? `上次导入：用户 ${item.last.owner}，${fullStamp(item.last.importedAt)}，资产 ${item.last.assets} 条、快照 ${item.last.snapshots} 条` : '尚未导入过账本';
@@ -89,7 +105,7 @@ function AssetRows({ item, preview, owner, setOwner }: { item: AssetItem; previe
 }
 type Message = { tone: 'ok' | 'err' | 'muted'; text: string } | null;
 /** The module choices of the preview (live accounts and modules are never ticked by default). */
-interface ModulePicks { oil: boolean; options: boolean; monitor: boolean; monitorAlerts: boolean; asset: boolean; assetOwner: string | null }
+interface ModulePicks { oil: boolean; options: boolean; monitor: boolean; monitorAlerts: boolean; monitorVariational: boolean; asset: boolean; assetOwner: string | null }
 
 function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { result: ImportResult; picked: Set<string>; setPicked: (value: Set<string>) => void; picks: ModulePicks; setPicks: (value: ModulePicks) => void; onRun: () => void; busy: boolean }) {
   const notes = (result.notes || []).map((note, index) => <p key={index} className="muted">{note}</p>);
@@ -97,6 +113,7 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
   const optionsError = result.optionsError ? <p className="err">期权账户无法读取：{result.optionsError}</p> : null;
   const assetError = result.assetError ? <p className="err">资产账本无法读取：{result.assetError}</p> : null;
   const alertsError = result.monitorAlertsError ? <p className="err">行情告警设置无法读取：{result.monitorAlertsError}</p> : null;
+  const variationalError = result.monitorVariationalError ? <p className="err">Var token 无法读取：{result.monitorVariationalError}</p> : null;
   if (result.action === 'preview') {
     const rows = result.preview || [], oil = result.oil || [], options = result.options ?? null, monitor = result.monitor ?? null, asset = result.asset ?? null;
     const oilImportable = oil.some(item => item.status === 'added'), optionsImportable = options?.status === 'added';
@@ -104,6 +121,8 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
     const setOilPicked = (value: boolean) => setPicks({ ...picks, oil: value }), setOptionsPicked = (value: boolean) => setPicks({ ...picks, options: value });
     const monitorImportable = monitorAvailable(monitor), assetImportable = assetAvailable(asset);
     const alerts = result.monitorAlerts ?? null, alertsImportable = alertsAvailable(alerts, monitor, picks.monitor);
+    const variational = result.monitorVariational ?? null, variationalImportable = variationalAvailable(variational, monitor, picks.monitor);
+    const monitorNeed = monitor ? (monitorAvailable(monitor) ? (monitor.enabled ? '须同时勾选补全行情监控' : '须同时勾选启用行情监控') : monitor.enabled ? '行情监控已启用' : '须先在本服务启用行情监控') : '';
     return <>
       {rows.length ? <>
         <div className="table-wrap"><table className="data">
@@ -132,13 +151,18 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
       {optionsError}
       {monitor ? <>
         <MonitorRow item={monitor} preview />
-        <label className="pair-pick"><input type="checkbox" id="importMonitorPick" disabled={!monitorImportable} checked={picks.monitor && monitorImportable} onChange={event => setPicks({ ...picks, monitor: event.target.checked, ...(event.target.checked ? {} : { monitorAlerts: false }) })} />启用行情监控（Anthropic 价差，只读公开行情，不需要密钥；股数取默认值，本项目已启用时保留现有设置）</label>
+        <label className="pair-pick"><input type="checkbox" id="importMonitorPick" disabled={!monitorImportable} checked={picks.monitor && monitorImportable} onChange={event => setPicks({ ...picks, monitor: event.target.checked, ...(event.target.checked ? {} : { monitorAlerts: false, monitorVariational: false }) })} />启用行情监控（Anthropic 价差，只读公开行情，不需要密钥；股数取默认值，本项目已启用时保留现有设置）</label>
         {alerts ? <>
           <AlertsRows item={alerts} preview />
-          <label className="pair-pick"><input type="checkbox" id="importAlertsPick" disabled={!alertsImportable} checked={picks.monitorAlerts && alertsImportable} onChange={event => setPicks({ ...picks, monitorAlerts: event.target.checked })} />同时导入告警档位与机器人（替换本服务现有的原油 / 海力士档位；{monitorAvailable(monitor) ? (monitor.enabled ? '须同时勾选补全行情监控' : '须同时勾选启用行情监控') : monitor.enabled ? '行情监控已启用' : '须先在本服务启用行情监控'}）</label>
+          <label className="pair-pick"><input type="checkbox" id="importAlertsPick" disabled={!alertsImportable} checked={picks.monitorAlerts && alertsImportable} onChange={event => setPicks({ ...picks, monitorAlerts: event.target.checked })} />同时导入告警档位与机器人（替换本服务现有的原油 / 海力士档位；{monitorNeed}）</label>
+        </> : null}
+        {variational ? <>
+          <VariationalRow item={variational} preview />
+          <label className="pair-pick"><input type="checkbox" id="importVariationalPick" disabled={!variationalImportable} checked={picks.monitorVariational && variationalImportable} onChange={event => setPicks({ ...picks, monitorVariational: event.target.checked })} />同时导入 Var token（原油对比表 Variational 行的认证行情；本服务的 token 到期不早于工作台的时保留本服务的，不重启服务；{monitorNeed}）</label>
         </> : null}
       </> : null}
       {alertsError}
+      {variationalError}
       {asset ? <>
         <AssetRows item={asset} preview owner={picks.assetOwner} setOwner={owner => setPicks({ ...picks, assetOwner: owner, asset: true })} />
         <label className="pair-pick"><input type="checkbox" id="importAssetPick" disabled={!assetImportable} checked={picks.asset && assetImportable} onChange={event => setPicks({ ...picks, asset: event.target.checked })} />导入资产账本（所选用户的账本整体替换本项目现有账本；本项目已启用资产账本时只重新导入、不重启服务）</label>
@@ -162,6 +186,8 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
     {result.monitor ? <MonitorRow item={result.monitor} preview={false} /> : null}
     {result.monitorAlerts ? <AlertsRows item={result.monitorAlerts} preview={false} /> : null}
     {alertsError}
+    {result.monitorVariational ? <VariationalRow item={result.monitorVariational} preview={false} /> : null}
+    {variationalError}
     {result.asset ? <AssetRows item={result.asset} preview={false} /> : null}
     {assetError}
     {notes}
@@ -177,9 +203,11 @@ function choicesOf(result: ImportResult | null, picked: Set<string>, picks: Modu
   const alerts = result?.monitorAlerts;
   const monitorAlerts = picks.monitorAlerts && alerts && alertsAvailable(alerts, result?.monitor, picks.monitor)
     ? { tiers: alerts.markets.filter(entry => entry.problem === null).length, robot: alerts.robot.imported, robotChanges: alerts.robot.changes } : null;
-  return { pairs, oil, options, monitor: picks.monitor && monitorAvailable(result?.monitor), monitorAlerts, assetOwner: owner };
+  const variational = result?.monitorVariational;
+  const monitorVariational = picks.monitorVariational && variational && variationalAvailable(variational, result?.monitor, picks.monitor) ? { replaces: variational.replaces } : null;
+  return { pairs, oil, options, monitor: picks.monitor && monitorAvailable(result?.monitor), monitorAlerts, monitorVariational, assetOwner: owner };
 }
-const NO_PICKS: ModulePicks = { oil: false, options: false, monitor: false, monitorAlerts: false, asset: false, assetOwner: null };
+const NO_PICKS: ModulePicks = { oil: false, options: false, monitor: false, monitorAlerts: false, monitorVariational: false, asset: false, assetOwner: null };
 
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const statusOf = (error: unknown): number | undefined => {

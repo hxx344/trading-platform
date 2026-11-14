@@ -11,6 +11,7 @@ import type { ImportItem, OilItem, PreviewItem } from './import-workbench.ts';
 import type { OptionsItem } from './import-options.ts';
 import type { AssetItem, MonitorItem } from './import-modules.ts';
 import type { MonitorAlertsItem } from './import-monitor-alerts.ts';
+import type { MonitorVariationalItem } from './import-monitor-variational.ts';
 
 export const REQUEST_FILE = 'request.json';
 export const RESULT_FILE = 'result.json';
@@ -25,7 +26,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 export const ASSET_OWNER = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$/;
 
 export type ImportAction = 'preview' | 'import';
-export interface ImportRequest { id: string; action: ImportAction; pairs?: string[]; oil?: true; options?: true; monitor?: true; monitorAlerts?: true; asset?: true; assetOwner?: string; at: number }
+export interface ImportRequest { id: string; action: ImportAction; pairs?: string[]; oil?: true; options?: true; monitor?: true; monitorAlerts?: true; monitorVariational?: true; asset?: true; assetOwner?: string; at: number }
 export interface ImportResult {
   /** The request answered; null when the request file itself could not be read. */
   id: string | null;
@@ -51,6 +52,10 @@ export interface ImportResult {
   monitorAlerts?: MonitorAlertsItem;
   /** Why the workbench's alert settings could not be read. */
   monitorAlertsError?: string;
+  /** The workbench's Var token (M-3d-2): previewed, or what the import did with it; never the token. */
+  monitorVariational?: MonitorVariationalItem;
+  /** Why the workbench's Var token could not be read. */
+  monitorVariationalError?: string;
   /** The workbench's asset ledger and its users: previewed, or what the import did with it. */
   asset?: AssetItem;
   /** Why the asset ledger could not be read. */
@@ -58,8 +63,8 @@ export interface ImportResult {
   notes?: string[];
 }
 
-type ImportBody = { action: ImportAction; pairs?: string[]; oil?: true; options?: true; monitor?: true; monitorAlerts?: true; asset?: true; assetOwner?: string };
-const OPTIONAL_KEYS = ['pairs', 'oil', 'options', 'monitor', 'monitorAlerts', 'asset', 'assetOwner'];
+type ImportBody = { action: ImportAction; pairs?: string[]; oil?: true; options?: true; monitor?: true; monitorAlerts?: true; monitorVariational?: true; asset?: true; assetOwner?: string };
+const OPTIONAL_KEYS = ['pairs', 'oil', 'options', 'monitor', 'monitorAlerts', 'monitorVariational', 'asset', 'assetOwner'];
 
 /** What the page may ask for: a preview of everything the workbench has, or importing the chosen parts. */
 export function parseImportBody(raw: unknown): ImportBody {
@@ -73,6 +78,7 @@ export function parseImportBody(raw: unknown): ImportBody {
   if (value.options !== undefined && value.options !== true) throw new ContractError(400, 'import_options', 'options 只能是 true');
   if (value.monitor !== undefined && value.monitor !== true) throw new ContractError(400, 'import_monitor', 'monitor 只能是 true');
   if (value.monitorAlerts !== undefined && (value.monitorAlerts !== true || value.monitor !== true)) throw new ContractError(400, 'import_monitor', 'monitorAlerts 只能是 true，且须和 monitor 一起使用');
+  if (value.monitorVariational !== undefined && (value.monitorVariational !== true || value.monitor !== true)) throw new ContractError(400, 'import_monitor', 'monitorVariational 只能是 true，且须和 monitor 一起使用');
   if (value.asset !== undefined && value.asset !== true) throw new ContractError(400, 'import_asset', 'asset 只能是 true');
   const asset = value.asset === true;
   if (!asset && value.assetOwner !== undefined) throw new ContractError(400, 'import_asset', 'assetOwner 须和 asset 一起使用');
@@ -85,7 +91,7 @@ export function parseImportBody(raw: unknown): ImportBody {
   if (new Set(pairs).size !== pairs.length) throw new ContractError(400, 'import_pairs', '配对重复');
   return {
     action: 'import', pairs: pairs as string[], ...(oil ? { oil: true as const } : {}), ...(options ? { options: true as const } : {}),
-    ...(monitor ? { monitor: true as const } : {}), ...(value.monitorAlerts === true ? { monitorAlerts: true as const } : {}), ...(asset ? { asset: true as const, assetOwner: value.assetOwner as string } : {}),
+    ...(monitor ? { monitor: true as const } : {}), ...(value.monitorAlerts === true ? { monitorAlerts: true as const } : {}), ...(value.monitorVariational === true ? { monitorVariational: true as const } : {}), ...(asset ? { asset: true as const, assetOwner: value.assetOwner as string } : {}),
   };
 }
 

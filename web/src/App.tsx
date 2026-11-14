@@ -99,7 +99,6 @@ export function App() {
           </div>
         </div>
         <div className="feature-stack">
-          <Callout tone="error" role="status">实盘：启用的配对会在真实 ASTER 子账户之间划转 USD1；ADL 导致两侧不一致时按只减仓市价单自动减仓。启用前请先在工作台停用并删除同一配对。停用后该配对的划转与新的 ADL 检测都会停止。</Callout>
           {expired ? <Callout tone="warning" action={{ label: '刷新页面', onClick: () => location.reload() }}>会话已失效，请刷新页面重新登录（或用数据目录 access-url 里的登录链接）。</Callout> : null}
           <div className="workspace-tabs">
             <nav className="workspace-navigation" data-slot="tabs-list" aria-label="页面">

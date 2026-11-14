@@ -114,11 +114,11 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, l
       const merged = new Map(rows.map(row => [row.time, row]));
       for (const row of fetched) merged.set(row.time, row);
       next = [...merged.values()].filter(row => row.time >= cutoff).sort((a, b) => a.time - b.time);
-      if (full) gapRetryAt = at + HYNIX_GAP_RETRY_MS;
     } catch (error) {
       if (stopping.signal.aborted) return;
-      candleError = `K 线读取失败：${hynixError(error)}`;
-      candleReport.failed(candleError, detail(error));
+      const reason = hynixError(error);
+      candleError = `K 线读取失败：${reason}`;
+      candleReport.failed(reason, detail(error));
       return;
     }
     if (stopping.signal.aborted) return;
@@ -138,6 +138,8 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, l
       return;
     }
     candleSave.recovered();
+    // The gaps count as re-read only once the round is stored; a failed write re-reads them next round.
+    if (full) gapRetryAt = at + HYNIX_GAP_RETRY_MS;
     rows = next; fetchedAt = stamp; candlesRestored = false; candleError = null; replaceCandles = false;
   }
 

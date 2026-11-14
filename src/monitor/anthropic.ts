@@ -117,8 +117,9 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
     try { next = await fetchAnthropicCandles(candles, { fetcher, now: at, gate, rh, clock: now }); }
     catch (error) {
       if (stopping.signal.aborted) return;
-      candleError = `K 线读取失败：${legError(error)}`;
-      candleReport.failed(candleError, detail(error));
+      const reason = legError(error);
+      candleError = `K 线读取失败：${reason}`;
+      candleReport.failed(reason, detail(error));
       return;
     }
     if (stopping.signal.aborted) return;

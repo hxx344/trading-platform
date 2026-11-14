@@ -29,7 +29,7 @@ test('报价与换算：ADR 对正股 ÷ 10 的价差与溢价率；缺腿、非
   const quote = parseHynixMids({ 'xyz:SKHY': '24.15', 'xyz:SKHX': '230', other: '1' }, Date.UTC(2026, 10, 13));
   assert.deepEqual([quote.source, quote.adr, quote.ordinary, quote.equivalent, quote.fetchedAt], ['Hyperliquid', 24.15, 230, 23, '2026-11-13T00:00:00.000Z']);
   close(quote.spread, 1.15); close(quote.premium, 5);
-  for (const bad of [null, [], 'x', { 'xyz:SKHY': '24' }, { 'xyz:SKHY': '0', 'xyz:SKHX': '230' }, { 'xyz:SKHY': 'NaN', 'xyz:SKHX': '230' }, { 'xyz:SKHY': '-1', 'xyz:SKHX': '230' }]) assert.throws(() => parseHynixMids(bad, 0), JSON.stringify(bad));
+  for (const bad of [null, [], 'x', { 'xyz:SKHY': '24' }, { 'xyz:SKHY': 24.15, 'xyz:SKHX': '230' }, { 'xyz:SKHY': true, 'xyz:SKHX': '230' }, { 'xyz:SKHY': '0', 'xyz:SKHX': '230' }, { 'xyz:SKHY': 'NaN', 'xyz:SKHX': '230' }, { 'xyz:SKHY': '-1', 'xyz:SKHX': '230' }]) assert.throws(() => parseHynixMids(bad, 0), JSON.stringify(bad));
   assert.deepEqual(validateHynixQuote({ ...quote, spread: 99, premium: 99 }), quote, '换算字段按价格重算');
   for (const bad of [{ ...quote, source: 'Binance' }, { ...quote, fetchedAt: 'x' }, { ...quote, adr: '24.15' }, { ...quote, ordinary: 0 }]) assert.throws(() => validateHynixQuote(bad));
 });
@@ -40,6 +40,8 @@ test('K 线配对与续读起点：只配同一已收盘整点，上市首个整
   const adr = [-1, 0, 2, 3, 4, 5].map(i => candle('xyz:SKHY', t0 + i * HOUR, 24 + i));
   assert.deepEqual(alignHynixCandles(ordinary, adr, now), [0, 2, 4].map(i => ({ time: t0 + i * HOUR, adr: 24 + i, ordinary: 230 + i })), '缺腿、上市前、未收盘的整点都不收');
   assert.deepEqual(alignHynixCandles([candle('xyz:SKHX', t0 + 1, 230)], [candle('xyz:SKHY', t0 + 1, 24)], now), [], '非整点不收');
+  const early = (coin: string, t: number) => ({ ...candle(coin, t, 230), T: t + 60_000 });
+  assert.deepEqual(alignHynixCandles([early('xyz:SKHX', t0 + 5 * HOUR)], [early('xyz:SKHY', t0 + 5 * HOUR)], now), [], '收盘时刻提前也要等整点过完');
 
   const rows = [0, 1, 3, 4, 100].map(i => ({ time: t0 + i * HOUR, adr: 24, ordinary: 230 }));
   const at = t0 + 101 * HOUR + 5;
@@ -50,9 +52,16 @@ test('K 线配对与续读起点：只配同一已收盘整点，上市首个整
   const late = t0 + 6000 * HOUR + 5;
   assert.equal(hynixCandleStart([], late, true), t0 + 1001 * HOUR, '不早于最近 5000 根');
   assert.equal(hynixCandleStart(rows, late, true), t0 + 1001 * HOUR);
+  const recent = [1001, 1002, 1100].map(i => ({ time: t0 + i * HOUR, adr: 24, ordinary: 230 }));
+  assert.equal(hynixCandleStart([rows[0]!, ...recent], late, true), t0 + 1003 * HOUR, '下限之前的缺口读不回来，只在下限之后找缺口');
 
-  const reply = (body: unknown) => async () => Response.json(body);
-  for (const bad of [[], [{ ...candle('xyz:SKHX', t0, 230), i: '15m' }], [candle('xyz:SKHY', t0, 230)], [{ ...candle('xyz:SKHX', t0, 230), T: t0 + HOUR }], [candle('xyz:SKHX', t0, 0)], {}]) {
+  // The ADR leg answers correctly; only the ordinary leg's reply is broken, so each rule is what rejects it.
+  const reply = (bad: unknown) => async (_url: string, init: RequestInit) => {
+    const coin = (JSON.parse(String(init.body)) as { req: { coin: string } }).req.coin;
+    return Response.json(coin === 'xyz:SKHY' ? [candle('xyz:SKHY', t0, 24)] : bad);
+  };
+  assert.deepEqual(await fetchHynixCandles(t0, { fetcher: reply([candle('xyz:SKHX', t0, 230)]), now }), [{ time: t0, adr: 24, ordinary: 230 }]);
+  for (const bad of [[], [{ ...candle('xyz:SKHX', t0, 230), i: '15m' }], [candle('xyz:SKHY', t0, 230)], [{ ...candle('xyz:SKHX', t0, 230), T: t0 + HOUR }], [{ ...candle('xyz:SKHX', t0, 230), T: t0 - 1 }], [candle('xyz:SKHX', t0, 0)], [candle('xyz:SKHX', t0, Number.NaN)], {}]) {
     await assert.rejects(fetchHynixCandles(t0, { fetcher: reply(bad), now }), /Unexpected candle response/, JSON.stringify(bad));
   }
   let call = 0;
@@ -146,6 +155,7 @@ test('采集失败：报价失败本轮作废并说明原因（日志只记一�
     assert.deepEqual([monitor.quote()!.status, monitor.quote()!.lastError, monitor.candles(null)!.status, monitor.candles(null)!.lastError], ['live', null, 'live', null]);
     assert.equal(env.logs.filter(line => line === '海力士报价读取已恢复').length, 1);
     assert.ok(env.logs.includes('海力士K 线读取已恢复'));
+    assert.ok(env.logs.includes('海力士K 线读取失败：接口返回 HTTP 500（Hyperliquid HTTP 500）'), '日志不重复“K 线读取失败”');
     assert.deepEqual(monitor.status(), { quoteAt: monitor.quote()!.fetchedAt, quoteError: null, candlesAt: monitor.candles(null)!.fetchedAt, candleRows: rows, candleError: null });
   } finally { env.dispose(); }
 });
@@ -180,12 +190,17 @@ test('读回与写入失败：库里的报价无法解析时等新报价；K 线
     assert.equal(rows.length, before + 2, '下一轮把没存下的 K 线一起写入');
     assert.deepEqual(plain(env.store.hynixCandles()), plain(rows));
 
-    env.store.writeState(HYNIX_CANDLE_KEY, {});
+    // A row the stand-in never serves (it lists 30 days back) and a changed price: only a full rewrite removes both.
+    const [first, ...rest] = env.store.hynixCandles();
+    env.store.writeHynixCandles({ rows: [{ time: FIRST_FULL_HOUR, adr: 1, ordinary: 1 }, { ...first!, adr: first!.adr + 1 }], cutoff: FIRST_FULL_HOUR, replace: false, state: { key: HYNIX_CANDLE_KEY, value: {} } });
+    assert.equal(env.store.hynixCandles().length, rest.length + 2);
     const reread = env.monitor();
     assert.equal(reread.candles(null), null);
     assert.ok(env.logs.some(line => /海力士 K 线历史无法读回，将重新回补/.test(line)));
     await reread.refreshCandles();
     assert.deepEqual(plain(env.store.hynixCandles()), plain(reread.candles(null)!.rows));
+    assert.ok(!env.store.hynixCandles().some(row => row.time === FIRST_FULL_HOUR), '库里多出的行被整表重写清掉');
+    assert.equal(env.store.hynixCandles()[0]!.adr, first!.adr, '改过的价格被覆盖');
     assert.equal(reread.candles(null)!.status, 'live');
   } finally { env.dispose(); }
 });
@@ -212,6 +227,29 @@ test('永久缺口：没有成交的整点不让每轮都从缺口处读起，�
     await collector.refreshCandles();
     const after = collector.candles(null)!.rows.at(-1)!.time;
     assert.deepEqual(env.starts, [after - 48 * HOUR, after - 48 * HOUR]);
+  } finally { env.dispose(); }
+});
+
+test('永久缺口：补读那一轮写入失败时，下一轮照样从缺口补读', async () => {
+  const env = hynixEnv(FIRST_FULL_HOUR);
+  try {
+    const gap = Math.floor(env.clock / HOUR) * HOUR - 10 * DAY;
+    env.venues.hynixMissing.add(gap);
+    let failing = false;
+    const flaky = { ...env.store, writeHynixCandles: (write: Parameters<MonitorStore['writeHynixCandles']>[0]) => { if (failing) throw new Error('disk I/O error'); return env.store.writeHynixCandles(write); } } as MonitorStore;
+    const collector = env.monitor({ store: flaky });
+    await collector.refreshCandles();
+    env.clock += HYNIX_GAP_RETRY_MS;
+    failing = true;
+    env.starts.length = 0;
+    await collector.refreshCandles();
+    assert.deepEqual(env.starts, [gap, gap]);
+    failing = false;
+    env.starts.length = 0;
+    env.clock += 60_000;
+    await collector.refreshCandles();
+    assert.deepEqual(env.starts, [gap, gap], '没存下的补读轮不算数');
+    assert.equal(collector.status().candleError, null);
   } finally { env.dispose(); }
 });
 

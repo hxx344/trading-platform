@@ -4,7 +4,9 @@
 // - K 线只存两腿收盘价（time、adr、ordinary），正股折算价、价差、溢价率在读取时由 hynixPrices 算出；
 // - 请求函数接收 fetcher / timeout / 起止时刻（原文件写死 fetch 与 Date.now），工作台随包附带的 archive.json 基线不带，
 //   首次从上市首个整点回补，起点不早于接口保留的最近 5000 根；
-// - 续读起点多一个 full 开关：工作台每轮都从最早的缺口读起，这里只在 full 时这样做（采集器每小时一次）；
+// - 续读起点多一个 full 开关：工作台每轮都从最早的缺口读起，这里只在 full 时这样做（采集器每小时一次），且只在
+//   接口仍保留的最近 5000 根里找缺口；配对时另要求整点已过（t + 1 小时 ≤ now），与读回校验同一口径；
+// - allMids 两腿价格须为字符串（接口原样返回字符串）；
 // - 资金费（metaAndAssetCtxs）不读，随 M-2d。
 const HYPERLIQUID_API_URL = 'https://api.hyperliquid.xyz/info';
 
@@ -49,7 +51,9 @@ export async function requestInfo(payload, { fetcher = fetch, timeout = 10_000 }
 /** The xyz dex's allMids reply as a quote; allMids has no exchange time, so `fetchedAt` is when the pair was received. */
 export function parseHynixMids(mids, receivedAt) {
   if (!mids || typeof mids !== 'object' || Array.isArray(mids)) throw new Error('Invalid quote response');
-  const ordinary = Number(mids[HYNIX_LEGS.ordinary]), adr = Number(mids[HYNIX_LEGS.adr]);
+  const raw = [mids[HYNIX_LEGS.ordinary], mids[HYNIX_LEGS.adr]];
+  if (!raw.every(v => typeof v === 'string')) throw new Error('Incomplete quote pair');
+  const [ordinary, adr] = raw.map(Number);
   if (![ordinary, adr].every(v => Number.isFinite(v) && v > 0)) throw new Error('Incomplete quote pair');
   return { source: SOURCE, fetchedAt: new Date(receivedAt).toISOString(), ...hynixPrices(adr, ordinary) };
 }
@@ -72,7 +76,7 @@ function validCandles(result, coin) {
 
 /** Identical completed UTC hours of both legs; a missing quote is never forward-filled. */
 export function alignHynixCandles(ordinary, adr, now) {
-  const valid = c => Number.isSafeInteger(c.t) && c.t >= FIRST_FULL_HOUR && c.t % HYNIX_CANDLE_MS === 0 && c.T < now && Number.isFinite(Number(c.c)) && Number(c.c) > 0;
+  const valid = c => Number.isSafeInteger(c.t) && c.t >= FIRST_FULL_HOUR && c.t % HYNIX_CANDLE_MS === 0 && c.T < now && c.t + HYNIX_CANDLE_MS <= now && Number.isFinite(Number(c.c)) && Number(c.c) > 0;
   const byTime = new Map(ordinary.filter(valid).map(c => [c.t, Number(c.c)]));
   return [...new Map(adr.filter(valid).flatMap(c => {
     const base = byTime.get(c.t);
@@ -82,15 +86,17 @@ export function alignHynixCandles(ordinary, adr, now) {
 
 /**
  * Where a round starts reading: 48 hours before the last stored hour, or (when `full`) the first missing hour if earlier;
- * never before the first full hour or the oldest of the 5000 candles Hyperliquid still serves.
+ * never before the first full hour or the oldest of the 5000 candles Hyperliquid still serves. Gaps are looked for only
+ * from that floor on: hours older than it cannot be read again.
  */
 export function hynixCandleStart(rows, now, full) {
   const floor = Math.max(FIRST_FULL_HOUR, Math.floor(now / HYNIX_CANDLE_MS) * HYNIX_CANDLE_MS - (HYNIX_MAX_CANDLES - 1) * HYNIX_CANDLE_MS);
   if (!rows.length) return floor;
   let start = rows.at(-1).time - HYNIX_RESUME_MS;
   if (full) {
-    let expected = FIRST_FULL_HOUR;
+    let expected = floor;
     for (const row of rows) {
+      if (row.time < floor) continue;
       if (row.time > expected) { start = Math.min(start, expected); break; }
       expected = row.time + HYNIX_CANDLE_MS;
     }

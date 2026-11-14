@@ -1,4 +1,4 @@
-// 复制自 decimal.js 10.6.0 的 decimal.d.ts（MIT），未改动。
+// 复制自 decimal.js 10.6.0 的 decimal.d.ts（MIT），未改动；为 decimal.mjs（转出 src/vendor/decimal.mjs）提供类型。
 // Type definitions for decimal.js >=7.0.0
 // Project: https://github.com/MikeMcl/decimal.js
 // Definitions by: Michael Mclaughlin <https://github.com/MikeMcl>

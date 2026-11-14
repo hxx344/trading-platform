@@ -1,6 +1,7 @@
 // CrossEx endpoints of this service. The workbench module served /api/state, /api/bootstrap, /api/settings and
 // /api/live/*; here they sit under /api/crossex/ with the same bodies. Every request goes through api.ts (session
-// cookie, x-pa-executor on writes, { code, message } errors), so there is no CSRF token and no PUT/DELETE.
+// cookie, x-pa-executor on writes, { code, message } errors), so there is no CSRF token. Writes are POST except the
+// settings save (PUT); there is no DELETE.
 import { ApiError } from '../api.ts';
 
 export const CROSSEX_API = '/api/crossex';

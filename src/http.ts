@@ -125,7 +125,7 @@ export interface ServiceViews {
   summary?: { setInterval(minutes: number): unknown; sendNow(): unknown };
   /** The asset ledger's reads and writes (asset/store.ts); absent when the service runs without asset. */
   asset?: Omit<AssetStore, 'close'>;
-  /** The Gate CrossEx module's reads and writes (service/crossex.ts); absent when the service runs without crossex. */
+  /** The Gate CrossEx module's reads and writes (service/crossex.ts); absent when the service runs without crossex, 503 while it has not started. */
   crossex?: CrossexViews;
 }
 
@@ -451,10 +451,9 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       } catch (error) {
         if (error instanceof ContractError) throw error;
         const failure = crossex.failure(error);
-        // Anything not raised as the runtime's own error is not shown: it may carry internals.
-        if (failure) return send(response, failure.status, failure.body);
-        process.stderr.write(`CrossEx 接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}\n`);
-        return send(response, 500, { code: 'crossex', message: '操作未完成，请检查服务状态' });
+        // Anything not raised as the runtime's own error is answered with a fixed text (it may carry internals) and logged.
+        if (failure.internal) process.stderr.write(`CrossEx 接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}\n`);
+        return send(response, failure.status, failure.body);
       }
       return send(response, 404, { code: 'not_found', message: '不存在' });
     }

@@ -40,3 +40,20 @@ test('导入面板：只重新导入已启用的资产账本时不重启，确�
   assert.match(mixed, /^导入 p1、p2 与 原油执行账户（Binance \*\*\*1234） 与 行情监控 并重启本服务？/);
   assert.match(mixed, /导入的配对登记为停用。.*名义金额上限.*公开行情（不需要密钥）/);
 });
+
+test('导入面板：CrossEx 账户单独或与其他项一起导入时请求带 crossex，需要重启，确认文字说明导入后在工作台断开', () => {
+  const only = { ...NONE, crossex: 'Gate ***5678' };
+  const body = importBody(only)!;
+  assert.deepEqual(body, { action: 'import', pairs: [], crossex: true });
+  assert.deepEqual(parseImportBody(body), body);
+  assert.equal(importBody({ ...NONE, crossex: null }), null);
+  assert.equal(restarts(only, true), true);
+  assert.equal(restarts({ ...NONE, assetOwner: 'alice', crossex: 'Gate ***5678' }, true), true, '已启用账本的重新导入带上 CrossEx 时仍要重启');
+  const text = confirmText(only, false);
+  assert.match(text, /^导入 CrossEx 账户（Gate \*\*\*5678） 并重启本服务？/);
+  assert.match(text, /「CrossEx」页面实盘手动下单.*在工作台 CrossEx 设置页断开账户/);
+  const mixed = importBody({ ...NONE, monitor: true, crossex: 'Gate ***5678' })!;
+  assert.deepEqual(mixed, { action: 'import', pairs: [], monitor: true, crossex: true });
+  assert.deepEqual(parseImportBody(mixed), mixed);
+  assert.match(confirmText({ ...NONE, monitor: true, crossex: 'Gate ***5678' }, false), /^导入 行情监控 与 CrossEx 账户（Gate \*\*\*5678） 并重启本服务？/);
+});

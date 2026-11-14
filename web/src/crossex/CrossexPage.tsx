@@ -1,7 +1,9 @@
 // 改编自 project-aggregation 工作台 modules/crossex/src/App.tsx（提交 7745181）。差异：没有工作台外壳（hub-bridge），
 // 读取只在页面可见且在线时进行；没有 Monitor 跳转按钮与行情来源标记，也不接收 Monitor 导入的机会；接口改为
 // /api/crossex/*，经 api.ts 发出（x-pa-executor 头，没有 CSRF 令牌），请求编号用 request-ids.ts；
-// 设置页不填写或移除 API 密钥。子页面地址为 #/crossex[/trade|/hedge|/orders|/settings]。
+// 设置页不填写或移除 API 密钥，未连接账户时顶部按钮是「账户设置」；内容区是 div.crossex-main（外壳已有 <main>）；页脚「源代码」
+// 指向本仓库（运行版本的源代码）；写入只在服务明确拒绝时换请求编号（write-outcome.ts），401 立即提示重新登录。
+// 子页面地址为 #/crossex[/trade|/hedge|/orders|/settings]。
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertCircle, AlertTriangle, ArrowLeftRight, RefreshCw, LayoutDashboard, CandlestickChart, ListOrdered, Settings2 } from 'lucide-react';
 import { api } from '../api.ts';
@@ -16,7 +18,8 @@ import { time } from './display.ts';
 import { executionStatus, liveStatus, orderIsTerminal, stateIsUncertain } from './live-display.ts';
 import { readPendingRequest, readRequestStatus, requestStorageKey, resolveRequestStatus, writePendingRequest } from './live-requests.ts';
 import type { PendingRequest } from './live-requests.ts';
-import { CROSSEX_API, CROSSEX_BOOTSTRAP_PATH, CROSSEX_SETTINGS_PATH, sessionExpired, writeNotSubmitted } from './crossex-api.ts';
+import { CROSSEX_API, CROSSEX_BOOTSTRAP_PATH, CROSSEX_SETTINGS_PATH, sessionExpired } from './crossex-api.ts';
+import { writeOutcome, writeResultState } from './write-outcome.ts';
 import AccountOverview from './AccountOverview.tsx';
 import PortfolioPanel from './PortfolioPanel.tsx';
 import TradingTerminal from './TradingTerminal.tsx';
@@ -140,21 +143,21 @@ export function CrossexPage({ tab, onExpired }: { tab: CrossexTab; onExpired: ()
         if (!rememberPending(pending)) { setError('此浏览器无法保存待确认请求，委托尚未发送。请允许会话存储后重试。'); return null; }
       }
       writeNotSent.current = false;
-      let data: T & { execution?: { state?: string; status?: string }; order?: { id?: string; status?: string }; state?: string; status?: string };
+      type Answer = T & { execution?: { state?: string; status?: string }; order?: { id?: string; status?: string }; state?: string; status?: string };
+      const send = (requestId?: string) => api<Answer>(route, { body: { ...input, ...(requestId ? { requestId } : {}) }, timeoutMs: 30_000, ...(administrative ? { method: 'PUT' as const } : {}) });
+      let data: Answer;
       try {
-        data = await api<typeof data>(route, { body: { ...input, ...(id ? { requestId: id } : {}) }, timeoutMs: 30_000, ...(administrative ? { method: 'PUT' as const } : {}) });
+        // Only an explicit refusal ends the request id; an unknown result (5xx, 401, timeout, lost answer) keeps it for the retry.
+        data = actionKey ? await requests.current.run(actionKey, '', send, cause => writeOutcome({ ok: false, error: cause }).retireRequestId) : await send();
       } catch (cause) {
-        // Any answer from the server ends this request id; a lost answer keeps it for the status query.
-        if (actionKey && typeof (cause as { status?: unknown }).status === 'number') requests.current.answered(actionKey);
-        if (actionKey && writeNotSubmitted(cause)) { writeNotSent.current = true; rememberPending(null); setError(cause instanceof Error && cause.message ? cause.message : '委托未提交，请重新预览。'); return null; }
+        const outcome = writeOutcome({ ok: false, error: cause });
+        if (outcome.expired) expired.current();
+        if (actionKey && outcome.keepReview) { writeNotSent.current = true; rememberPending(null); setError(cause instanceof Error && cause.message ? cause.message : '委托未提交，请重新预览。'); return null; }
         throw cause;
       }
-      if (actionKey) requests.current.answered(actionKey);
       if (id) {
-        const result = data.execution || data;
         if (data.order?.id && pendingRef.current) rememberPending({ ...pendingRef.current, orderId: data.order.id });
-        const resultState = result.state || data.order?.status || result.status;
-        if (resultState && !stateIsUncertain(resultState)) rememberPending(null);
+        if (writeOutcome({ ok: true, state: writeResultState(data) }).clearPending) rememberPending(null);
       }
       if (administrative) setOnline(false);
       return data as T;
@@ -190,7 +193,7 @@ export function CrossexPage({ tab, onExpired }: { tab: CrossexTab; onExpired: ()
       try { await api(`${CROSSEX_API}/refresh`, { body: {}, timeoutMs: 30_000 }); }
       catch (cause) { throw cause instanceof Error && cause.message ? cause : new Error('账户查询未完成，请继续查询。'); }
       setNotice(message);
-    } catch (cause) { setError(cause instanceof Error ? cause.message : '状态查询未完成，待确认请求已保留。'); }
+    } catch (cause) { if (sessionExpired(cause)) expired.current(); setError(cause instanceof Error ? cause.message : '状态查询未完成，待确认请求已保留。'); }
     finally {
       lifecycle.current.mutating = false;
       try {
@@ -240,8 +243,8 @@ export function CrossexPage({ tab, onExpired }: { tab: CrossexTab; onExpired: ()
 
   return <div className="crossex-page"><div className="app hub-embedded"><header className="topbar"><a className="brand" href={crossexHref('positions')}><span className="brand-icon"><ArrowLeftRight size={21}/></span><span>Gate <strong>CrossEx</strong></span><span className="tag live-tag">LIVE</span></a>
     <nav aria-label="模块功能">{tabs.map(([id, label, Icon]) => <button key={id} type="button" aria-current={tab === id ? 'page' : undefined} onClick={() => go(id)}><Icon size={15}/>{label}{counts[id] != null && <span className="count" aria-hidden="true">{counts[id]}</span>}</button>)}</nav>
-    <div className="header-actions"><span className={'connection-badge ' + (!accountStale && live?.connection.connected ? 'positive' : 'warning')}><i className={'status-dot ' + (!accountStale && live?.connection.connected ? 'live' : '')}/>{!connectionInfo ? '读取连接信息' : !connectionInfo.connection.configured ? '未连接账户' : accountStale ? '待同步' : '账户已连接'}</span><button type="button" className="icon-button" disabled={busy} onClick={() => { if (tab === 'settings') void refreshBootstrap(); else void refresh(true); }} aria-label="刷新页面状态"><RefreshCw size={15}/></button><button type="button" className="primary small" onClick={() => go('settings')}>{connectionInfo?.connection.configured ? '管理账户' : '连接账户'}</button></div>
-  </header><main>
+    <div className="header-actions"><span className={'connection-badge ' + (!accountStale && live?.connection.connected ? 'positive' : 'warning')}><i className={'status-dot ' + (!accountStale && live?.connection.connected ? 'live' : '')}/>{!connectionInfo ? '读取连接信息' : !connectionInfo.connection.configured ? '未连接账户' : accountStale ? '待同步' : '账户已连接'}</span><button type="button" className="icon-button" disabled={busy} onClick={() => { if (tab === 'settings') void refreshBootstrap(); else void refresh(true); }} aria-label="刷新页面状态"><RefreshCw size={15}/></button><button type="button" className="primary small" onClick={() => go('settings')}>{connectionInfo?.connection.configured ? '管理账户' : '账户设置'}</button></div>
+  </header><div className="crossex-main">
     {(error || tab !== 'settings' && readError) && <div className="notice error" role="alert"><AlertCircle size={16}/><span>{error || readError}</span>{error && !pendingRequest && <button type="button" onClick={() => setError('')} aria-label="关闭操作提示">×</button>}</div>}
     {pendingRequest && <div className="notice warning" role="status"><span>存在结果待确认的操作，新的交易暂不可用。请求 {pendingRequest.id}</span><button type="button" disabled={busy} onClick={() => void queryAccount()}>查询最新状态</button></div>}
     {notice && <div className="notice success" role="status"><span>{notice}</span><button type="button" aria-label="关闭状态提示" onClick={() => setNotice('')}>×</button></div>}
@@ -256,8 +259,8 @@ export function CrossexPage({ tab, onExpired }: { tab: CrossexTab; onExpired: ()
       {tab === 'orders' && <><HistoryPanel live={live} disabled={tradingDisabled} querying={busy} query={() => void queryAccount()} cancel={setCancelOrder}/></>}
 
     </>}
-    <footer className="app-footer"><span><i className="status-dot"/>手动实盘 · 北京时间 · 2 秒状态刷新</span><span><a href="https://github.com/hxx344/gate-crossex-arbitrage" target="_blank" rel="noreferrer">源代码</a><b>·</b><a href="https://github.com/your-quantguy/gate-crossex" target="_blank" rel="noreferrer">参考 your-quantguy/gate-crossex</a><b>·</b><a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noreferrer">AGPL-3.0-only</a></span></footer>
-  </main>
+    <footer className="app-footer"><span><i className="status-dot"/>手动实盘 · 北京时间 · 2 秒状态刷新</span><span><a href="https://github.com/hxx344/trading-platform" target="_blank" rel="noreferrer">源代码</a><b>·</b><a href="https://github.com/your-quantguy/gate-crossex" target="_blank" rel="noreferrer">参考 your-quantguy/gate-crossex</a><b>·</b><a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noreferrer">AGPL-3.0-only</a></span></footer>
+  </div>
   {preview && <TradeReview key={preview.id} preview={preview} now={now} busy={busy} disabled={positionPreviewInvalid || (preview.legs.some(leg => !leg.reduceOnly) ? openingDisabled : tradingDisabled)} invalidReason={positionPreviewInvalid ? '持仓数量、方向或账户已变化，请关闭并重新预览。' : undefined} error={error} rejected={confirmRejected} close={closePreview} confirm={() => void confirmOrder()} repreview={live && String(live.connection.version) === String(preview.connectionVersion) ? () => void repreviewOrder() : undefined}/>}
   {cancelOrder && <CancelReview order={cancelOrder} busy={busy} disabled={tradingDisabled} close={() => setCancelOrder(null)} confirm={() => void confirmCancel()}/>}
   </div></div>;

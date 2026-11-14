@@ -62,9 +62,11 @@ export function App() {
   const monitor = useLiveResource<MonitorState>(MONITOR_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: MONITOR_READ_TIMEOUT_MS, parse: parseMonitorState, onExpired });
   // The asset page reads the same path at the same pace and timeout (the shared read keeps the first subscriber's).
   const asset = useLiveResource<AssetState>(ASSET_STATE_PATH, { intervalMs: ASSET_CHECK_MS, timeoutMs: ASSET_READ_TIMEOUT_MS, onExpired });
-  // The CrossEx page reads its state on its own (tab-specific paths, paused around writes); this only decides whether the tab shows.
-  const crossex = useLiveResource<unknown>(CROSSEX_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: CROSSEX_READ_TIMEOUT_MS, onExpired });
-  const tabs = [...TABS, ...(oil.data !== null ? [OIL_TAB] : []), ...(options.data !== null ? [OPTIONS_TAB] : []), ...(monitor.data !== null ? [MONITOR_TAB] : []), ...(asset.data !== null || (asset.error instanceof ApiError && asset.error.status === 500) ? [ASSET_TAB] : []), ...(crossex.data !== null ? [CROSSEX_TAB] : [])];
+  // The CrossEx page reads its state on its own (tab-specific paths, paused around writes); this only decides whether the tab
+  // shows, so it asks for the light view without the opportunity list. A 503 (configured but not started, retrying) shows
+  // the tab too, so the page can say why.
+  const crossex = useLiveResource<unknown>(`${CROSSEX_STATE_PATH}?opportunities=0`, { intervalMs: OIL_CHECK_MS, timeoutMs: CROSSEX_READ_TIMEOUT_MS, onExpired });
+  const tabs = [...TABS, ...(oil.data !== null ? [OIL_TAB] : []), ...(options.data !== null ? [OPTIONS_TAB] : []), ...(monitor.data !== null ? [MONITOR_TAB] : []), ...(asset.data !== null || (asset.error instanceof ApiError && asset.error.status === 500) ? [ASSET_TAB] : []), ...(crossex.data !== null || (crossex.error instanceof ApiError && crossex.error.status === 503) ? [CROSSEX_TAB] : [])];
   // A read that succeeds again (after logging in from another tab) clears the notice.
   useEffect(() => { if (status === 'ready') setExpired(false); }, [status]);
   const changed = useCallback(() => { void refresh(); }, [refresh]);

@@ -341,22 +341,28 @@
 
 ## CrossEx 页
 
-**对照的工作台页面**：工作台 `modules/crossex/src/`（提交 `7745181`），按它嵌在 Hub 里显示的样子（`hub-embedded`，不显示模块自己的顶栏）。代码在 `web/src/crossex/`，每个文件头写明来源与差异；没有改动的文件只换了导入路径。顶部「CrossEx」标签只在 `GET /api/crossex/state` 有应答时出现。
+**对照的工作台页面**：工作台 `modules/crossex/src/`（提交 `7745181`），按它嵌在 Hub 里显示的样子（`hub-embedded`，不显示模块自己的顶栏）。代码在 `web/src/crossex/`，每个文件头写明来源与差异；没有改动的文件只换了导入路径。顶部「CrossEx」标签只在 `GET /api/crossex/state?opportunities=0` 有应答，或返回 503（已配置但未启动、后台重试中，页面显示服务给的原因）时出现（外壳每 60 秒探测一次，用不带机会列表的轻量视图）。
 
-**页面**：五个子页照工作台：持仓（账户概览、持仓组与指标、ADL、历史与成交）、手动委托（行情、K 线、盘口、下单）、跨所对冲（两腿选择、价差、开仓额度、预览确认）、订单（委托查询与撤单、执行记录）、设置。读取沿用工作台的 `createLatestRead` 轮询、服务时钟与按子页决定的读取路径，没有改成 `use-live-resource`（外壳只用它判断要不要显示标签）。写入走 `api.ts`，带 `x-pa-executor`；下单与撤单沿用 `RequestIds`，结果未知的请求存在 sessionStorage，查清之前不能再下单。
+**页面**：五个子页照工作台：持仓（账户概览、持仓组与指标、ADL、历史与成交）、手动委托（行情、K 线、盘口、下单）、跨所对冲（两腿选择、价差、开仓额度、预览确认）、订单（委托查询与撤单、执行记录）、设置。读取沿用工作台的 `createLatestRead` 轮询、服务时钟与按子页决定的读取路径，没有改成 `use-live-resource`（外壳只用它判断要不要显示标签）；浏览器标签页隐藏或离线时完全停止读取（`page-activity.ts`），回到前台立即读一次，工作台独立打开时在后台仍按 30 秒一次继续读。写入走 `api.ts`，带 `x-pa-executor`；下单与撤单经 `RequestIds.run` 发出，写入应答后的处理集中在 `write-outcome.ts`（有单元测试）：
+  - 请求编号：成功或服务明确拒绝（`not_submitted`，或 401、408 以外的 4xx）才换编号；500/503、超时、断网与 401 结果未知，沿用原编号，查清后对同一订单重试仍是同一编号（规则 5）。工作台是同一预览或订单的编号一直保留到连接变化。
+  - 待确认请求（sessionStorage）与确认框照工作台：发送前先存待确认请求，存不下就不发；成功且状态已定、或服务证明未提交时清掉，其余情况保留，查清之前不能再下单（「查询最新状态」按请求编号向服务查询）；只有服务证明未提交（或请求没发出浏览器）时确认框留着，显示「重新预览」，其余情况关闭确认框转到订单页。
+  - 写入、账户刷新与原请求查询遇到 401 立即显示外壳的重新登录提示。
 
 **与工作台的差异**
 
 - 地址改为 `/api/crossex/*`；bootstrap 是 `{ now, config, connection, limits }`，没有 csrfToken 与 Monitor 密码标志。
-- 设置页的连接区块只读：显示 UID、API Key 尾号、连接状态、读取 / 交易权限、持仓模式、最近校验和 `config.json` 的硬上限（`crossex.limits`），不填写、不断开密钥（密钥在 secrets.json，经「设置 → 从工作台导入」或配置文件管理）。额度表单字段与文案不变，用 `PUT /api/crossex/settings` 保存，服务以超过硬上限为由拒绝时显示服务的提示。
-- 去掉 Hub 桥接、Monitor ↗ 按钮、Market Monitor 地址与密码；对冲页的机会列表与「从 Monitor 导入」删掉，改为提示「机会列表待行情监控 M-4 接入，可直接在上方选择合约。」，手动选择两腿照常可用。
-- recharts 换成 `svg-plot.tsx`；收益曲线（ProfitChart）没有迁移。进度条、盘口深度条与数量对比条改用 SVG（`FillBar.tsx`），因为 CSP 不允许 `style` 宽度。`decimal.js` 换成本仓库的 `src/vendor/decimal.mjs`。
+- 设置页的连接区块只读：显示 UID、API Key 尾号、连接状态、读取 / 交易权限、持仓模式、最近校验和 `config.json` 的硬上限（`crossex.limits`），不填写、不断开密钥（密钥在 secrets.json，经「设置 → 从工作台导入」或配置文件管理）。额度表单的字段与字段文案不变；因为去掉了行情连接，区块标题与 aria-label 由「行情与额度设置」改为「手动开仓额度与检查」，保存按钮为「保存额度设置」。用 `PUT /api/crossex/settings` 保存，服务以超过硬上限为由拒绝时显示服务的提示。
+- 顶栏：去掉工作台的「行情实时 / 行情陈旧」标记（它指 Monitor 行情来源，本服务没有）；未连接账户时右上按钮是「账户设置」（工作台「连接账户」，本页不能连接，只能查看设置）。页面内容区是 `div.crossex-main`（工作台是 `<main>`，这里外壳已有 `<main>`，不再嵌套）。页脚「源代码」指向本仓库 https://github.com/hxx344/trading-platform（AGPL 要求提供运行版本的源代码），参考项目与许可链接不变。
+- 去掉 Hub 桥接、Monitor ↗ 按钮、Market Monitor 地址与密码；对冲页的机会列表与「从 Monitor 导入」删掉，改为提示「机会列表与持有情景待行情监控 M-4 接入，可直接在上方选择合约。」，手动选择两腿照常可用。
+- 等行情监控 M-4（C5）的部分：Monitor 机会列表与对冲页的「持有情景」。持有情景要用机会里的资金费，本服务的 state 没有这份数据（`fundingOpportunities` 为空），所以暂不显示；组件与判断照工作台保留，接入后自动出现。
+- recharts 换成 `svg-plot.tsx`；收益曲线（ProfitChart）没有迁移。进度条、盘口深度条与数量对比条改用 SVG（`FillBar.tsx`），因为 CSP 不允许 `style` 宽度。`decimal.js` 用本仓库的 `src/vendor/decimal.mjs`：`web/src/crossex/decimal.mjs` 只是转出它的两行文件，旁边的 `decimal.d.mts`（decimal.js 10.6.0 的类型定义原样复制）提供类型，因为 `src/vendor` 里没有这份声明。
 
 **样式**
 
 - 工作台的 12 个样式文件（account-history、adl-indicator、base-currency-picker、dark-theme、design-tokens、hedge-leg-selector、holding-scenario、open-capacity、position-actions、position-metrics、relayout、styles）原样复制到 `web/src/crossex/`，文件头写明来源与提交号，只删掉本页没用到的规则（Monitor 与机会列表、资金费表、连接表单等）。
 - 隔离：每个文件整份包在 `.aster-desk .crossex-page { … }` 里，`:root` 与 `body` 改成 `&`；Vite 构建时把嵌套展开成带前缀的普通选择器。页面根是 `<div class="crossex-page"><div class="app hub-embedded">`，工作台 `.hub-embedded …` 的规则照样生效。
-- `web/src/crossex/crossex.css` 按工作台的引入顺序汇总这些文件，在 `main.tsx` 里排在 `aster.css` 之后引入：前缀同样是两个类，同等权重时 CrossEx 的规则在后、胜出。`styles.css` 末尾的 CrossEx 一节是本服务自己的规则：FillBar 的尺寸与颜色、设置页硬上限列表占满一行。
+- 工作台规则里的 `main` 选择器改为 `.crossex-main`（styles.css 4 处、relayout.css 1 处），对应页面内容区不再是 `<main>`；所有这类规则一起多一个类，彼此的先后不变。
+- `web/src/crossex/crossex.css` 按工作台的引入顺序汇总这些文件，在 `main.tsx` 里排在 `aster.css` 之后引入：CrossEx 的规则多一个 `.crossex-page` 类，权重总比外壳的 `.aster-desk .xxx` 高。`styles.css` 末尾的 CrossEx 一节是本服务自己的规则：FillBar 的尺寸与颜色、设置页硬上限列表占满一行。
 
 **验证**：`node --test --test-reporter=dot 'web/test/crossex/*.test.mjs'`（工作台界面测试迁移版）。浏览器：`scripts/dev-monitor.ts` 提供真实外壳与 CSP，Playwright 拦截 `/api/crossex/*` 返回替身数据（取自工作台 `tests/crossex-position-metrics.browser.mjs`），五个子页在 1280 与 390 宽度下没有 CSP 报错、没有横向溢出；设置页超过硬上限时显示服务的拒绝提示，保存成功显示「已保存」。
 

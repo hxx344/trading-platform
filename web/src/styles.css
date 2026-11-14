@@ -242,3 +242,7 @@ table.data.history{min-width:0}
 .aster-desk .crossex-page .position-quantity-comparison>div:nth-child(2) .position-quantity-track .fill-bar rect{fill:var(--amber)}
 /* The read-only hard caps sit in the settings disconnect-row (a wrapping flex row); take the full width like its label. */
 .aster-desk .crossex-page .disconnect-row>.ticket-details{width:100%}
+/* aster.css gives .count a 5px left margin the workbench copy never sets (it pushed the tab and filter counts 5px right);
+   put back the workbench value. Its other leaks into CrossEx are invisible: .topbar justify-content (the actions sit at
+   margin-left:auto) and .brand font-weight (the brand is hidden under .hub-embedded); .panel's are all overridden. */
+.aster-desk .crossex-page .count{margin-left:0}

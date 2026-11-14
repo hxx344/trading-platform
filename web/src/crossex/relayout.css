@@ -1,8 +1,9 @@
 /* 复制自 project-aggregation 工作台 modules/crossex/src/relayout.css（提交 7745181）。规则内容不改；只保留本页用到的规则，
-   整份包在 .aster-desk .crossex-page 里（:root / body 改为 &），只作用于 CrossEx 页。 */
+   整份包在 .aster-desk .crossex-page 里（:root / body 改为 &），只作用于 CrossEx 页。
+   页面内容区是 <div class="crossex-main">（外壳已有 <main>，不嵌套第二个），原 `main` 选择器相应改为 `.crossex-main`。 */
 .aster-desk .crossex-page {
 /* Workbench relayout: compact subnav, alert strip, KPI row and flat position table. */
-.hub-embedded main{max-width:none}
+.hub-embedded .crossex-main{max-width:none}
 .topbar nav button{font-size:13px;color:var(--text-secondary)}
 .topbar nav button>svg{display:none}
 .topbar nav .count{min-width:18px;height:16px;padding:0 5px;font-size:10px;font-weight:500}

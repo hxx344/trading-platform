@@ -193,6 +193,10 @@ test('页面地址：#/pair/<配对>、#/status 与 #/settings 分别打开详�
   assert.deepEqual(parseRoute('#/options/performance'), { page: 'options', tab: 'performance' });
   assert.deepEqual(parseRoute('#/options/rfq'), { page: 'options', tab: 'rfq' });
   assert.deepEqual(parseRoute('#/options/x'), { page: 'overview' });
+  assert.deepEqual(parseRoute('#/crossex'), { page: 'crossex', tab: 'positions' });
+  for (const tab of ['trade', 'hedge', 'orders', 'settings'] as const) assert.deepEqual(parseRoute(`#/crossex/${tab}`), { page: 'crossex', tab });
+  // The positions view is #/crossex itself; an unknown or nested sub-page falls back to the overview like the other pages.
+  for (const hash of ['#/crossex/positions', '#/crossex/', '#/crossex/x', '#/crossex/trade/x', '#/crossexx']) assert.deepEqual(parseRoute(hash), { page: 'overview' }, hash);
   assert.deepEqual(parseRoute('#/pair'), { page: 'pair', pairId: null });
   assert.deepEqual(parseRoute(pairHref('p_1-a')), { page: 'pair', pairId: 'p_1-a' });
   assert.deepEqual(parseRoute('#/pair/%E0%A4%A'), { page: 'pair', pairId: null });

@@ -10,6 +10,8 @@ export interface CrossexMarket {
   refreshCatalog(): Promise<unknown>;
   instruments(): Promise<unknown>;
   settings(input: unknown): unknown;
+  /** Held legs (raw Gate positions) valued in USDT at mark price and the live FX rates; throws when one cannot be valued. */
+  positionsNotional(positions: readonly unknown[]): Promise<string>;
   stop(): Promise<void>;
   [method: string]: unknown;
 }

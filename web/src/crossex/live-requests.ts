@@ -1,4 +1,6 @@
-// 改编自工作台 modules/crossex/src/live-requests.ts（提交 7745181）：查询地址改为 /api/crossex/requests/<编号>，错误文字取本服务的 message 字段。
+// 改编自工作台 modules/crossex/src/live-requests.ts（提交 7745181）：查询地址改为 /api/crossex/requests/<编号>，错误文字取本服务的 message 字段；
+// 失败应答抛出带状态码的 ApiError，401 时页面直接提示重新登录。
+import { ApiError } from '../api.ts';
 import { orderIsTerminal } from './live-display.ts';
 import { CROSSEX_API } from './crossex-api.ts';
 
@@ -32,7 +34,8 @@ export function writePendingRequest(storage: RequestStorage | null, key: string,
 export async function readRequestStatus(pending: PendingRequest, fetcher: typeof fetch = fetch): Promise<unknown> {
   const response = await fetcher(`${CROSSEX_API}/requests/` + encodeURIComponent(pending.id), { method: 'GET', cache: 'no-store', credentials: 'same-origin', signal: AbortSignal.timeout(30_000) });
   const data: unknown = await response.json();
-  if (!response.ok) throw new Error(record(data) && typeof data.message === 'string' ? data.message : record(data) && typeof data.error === 'string' ? data.error : '原请求状态查询未完成，请继续查询。');
+  if (!response.ok) throw new ApiError(record(data) && typeof data.message === 'string' ? data.message : record(data) && typeof data.error === 'string' ? data.error : '原请求状态查询未完成，请继续查询。',
+    response.status, record(data) && typeof data.code === 'string' ? data.code : undefined, data);
   return data;
 }
 

@@ -12,7 +12,7 @@ import {
 } from '../src/vendor/oil-market.mjs';
 import { createMonitorStore, MONITOR_FILE, type MonitorStore } from '../src/monitor/store.ts';
 import { CANDLE_STALE_MS, QUOTE_STALE_MS } from '../src/monitor/anthropic.ts';
-import { OIL_QUOTE_KEY, createOilMonitor, oilError, parseOilQuote } from '../src/monitor/oil.ts';
+import { OIL_CANDLE_KEY, OIL_GAP_RETRY_MS, OIL_QUOTE_KEY, createOilMonitor, oilError, parseOilQuote } from '../src/monitor/oil.ts';
 import { createBinanceGate } from '../src/vendor/anthropic-market.mjs';
 import { parseServiceConfig } from '../src/service/config.ts';
 import { monitorSummary } from '../src/service/monitor-config.ts';
@@ -24,6 +24,7 @@ import { fakeAnthropicVenues, fakeOilPrice } from './monitor-fake.ts';
 const START = HISTORY_START, DAY = 86_400_000;
 const candle = (time: number, close: number) => [time, String(close), String(close), String(close), String(close), '1', time + BAR - 1];
 const json = (body: unknown) => Response.json(body);
+const plain = (rows: readonly { time: number; brent: number | null; wti: number | null }[]) => rows.map(({ time, brent, wti }) => ({ time, brent, wti }));
 
 function referenceDecimalDifference(left: number, right: number): number {
   const parts = (value: number) => {
@@ -215,21 +216,74 @@ test('采集失败：报价任一腿失败本轮作废并说明原因；资金�
   } finally { env.dispose(); }
 });
 
-test('读回与写入失败：库里的报价无法解析时等新报价；K 线写入失败时内存不前进，下一轮重写', async () => {
+test('读回与写入失败：库里的报价无法解析时等新报价；K 线写入失败时内存不前进，下一轮重写；K 线读回失败时下一轮整表重写', async () => {
   const env = oilEnv();
   try {
     env.store.writeState(OIL_QUOTE_KEY, { source: 'Binance' });
     const monitor = env.monitor();
     assert.equal(monitor.quote(), null);
     assert.ok(env.logs.some(line => /原油上次报价无法读回/.test(line)));
-    const failing = { ...env.store, writeOilCandles: () => { throw new Error('disk I/O error'); }, writeState: () => { throw new Error('disk I/O error'); } } as MonitorStore;
-    const broken = env.monitor({ store: failing });
-    await broken.refreshQuote();
-    await broken.refreshCandles();
-    assert.equal(broken.quote()!.status, 'live', '报价照常可读，只是没存下');
-    assert.equal(broken.candles(null), null);
-    assert.equal(broken.status().candleError, 'K 线保存失败：monitor.sqlite 写入失败');
+    let failing = false;
+    const flaky = { ...env.store,
+      writeOilCandles: (write: Parameters<MonitorStore['writeOilCandles']>[0]) => { if (failing) throw new Error('disk I/O error'); return env.store.writeOilCandles(write); },
+      writeState: (key: string, value: unknown) => { if (failing) throw new Error('disk I/O error'); return env.store.writeState(key, value); },
+    } as MonitorStore;
+    const collector = env.monitor({ store: flaky });
+    await collector.refreshCandles();
+    const before = collector.candles(null)!.data.length;
+    env.clock += 45 * 60_000;
+    failing = true;
+    await collector.refreshQuote();
+    await collector.refreshCandles();
+    assert.equal(collector.quote()!.status, 'live', '报价照常可读，只是没存下');
+    assert.equal(collector.candles(null)!.data.length, before, '写入失败：内存不前进');
+    assert.equal(collector.status().candleError, 'K 线保存失败：monitor.sqlite 写入失败');
     assert.ok(env.logs.some(line => /原油报价保存失败：monitor\.sqlite 写入失败（disk I\/O error）/.test(line)));
+    failing = false;
+    env.clock += 60_000;
+    await collector.refreshCandles();
+    const rows = collector.candles(null)!.data;
+    assert.equal(rows.length, before + 3, '下一轮把没存下的 K 线一起写入');
+    assert.deepEqual(plain(env.store.oilCandles()), plain(rows));
+
+    env.store.writeState(OIL_CANDLE_KEY, {});
+    const reread = env.monitor();
+    assert.equal(reread.candles(null), null);
+    assert.ok(env.logs.some(line => /原油 K 线历史无法读回，将从 2026-04-01 重新回补/.test(line)));
+    await reread.refreshCandles();
+    assert.deepEqual(plain(env.store.oilCandles()), plain(reread.candles(null)!.data));
+    assert.equal(reread.candles(null)!.status, 'live');
+  } finally { env.dispose(); }
+});
+
+test('永久缺口：交易所始终不给的 K 线不让每轮都从缺口处翻页，每小时补读一次', async () => {
+  const env = oilEnv();
+  try {
+    const gap = Math.ceil((env.clock - 10 * DAY) / BAR) * BAR, starts: number[] = [];
+    const collector = createOilMonitor({ store: env.store, gate: env.gate, now: () => env.clock, log: () => undefined, fetchImpl: async (url, init) => {
+      const params = new URL(url).searchParams;
+      if (!url.includes('/klines')) return env.venues.fetch(url, init);
+      starts.push(Number(params.get('startTime')));
+      const rows = await (await env.venues.fetch(url, init)).json() as unknown[][];
+      return Response.json(rows.filter(row => row[0] !== gap));
+    } });
+    await collector.refreshCandles();
+    const first = collector.candles(null)!;
+    assert.equal(first.metadata.missingObservationRows, 1);
+    const read = () => { const seen = [...new Set(starts)]; starts.length = 0; return seen; };
+    read();
+    env.clock += 60_000;
+    await collector.refreshCandles();
+    assert.deepEqual(read(), [first.data.at(-1)!.time - 96 * BAR], '一小时内只从最后一天续读');
+    assert.deepEqual([collector.candles(null)!.data[0], collector.candles(null)!.metadata.missingObservationRows], [first.data[0], 1], '更早的行原样保留');
+    assert.deepEqual(plain(env.store.oilCandles()), plain(collector.candles(null)!.data));
+    env.clock += OIL_GAP_RETRY_MS;
+    await collector.refreshCandles();
+    assert.deepEqual(read(), [gap], '满一小时从缺口处补读');
+    const afterRetry = collector.candles(null)!.data.at(-1)!.time;
+    env.clock += 60_000;
+    await collector.refreshCandles();
+    assert.deepEqual(read(), [afterRetry - 96 * BAR], '补读之后又是一小时只续读最后一天');
   } finally { env.dispose(); }
 });
 
@@ -253,7 +307,7 @@ test('配置与接口：monitor.oil 不带设置；只配原油时 Anthropic 接
     const get = async (path: string) => { const response = await fetch(base + path, { headers: { cookie } }); return { status: response.status, body: await response.json() as Record<string, any> }; };
     assert.equal((await fetch(`${base}/api/monitor/oil/quote`)).status, 401);
     assert.deepEqual(await get('/api/monitor/state'), { status: 200, body: { markets: ['oil'], anthropic: null } });
-    for (const path of ['/api/monitor/anthropic/quote', '/api/monitor/anthropic/candles']) assert.deepEqual([(await get(path)).status, (await get(path)).body.message], [404, '本服务没有配置Anthropic行情监控'], path);
+    for (const path of ['/api/monitor/anthropic/quote', '/api/monitor/anthropic/candles', '/api/monitor/anthropic/candles?days=x']) assert.deepEqual([(await get(path)).status, (await get(path)).body.message], [404, '本服务没有配置Anthropic行情监控'], path);
     assert.deepEqual([(await get('/api/monitor/oil/quote')).status, (await get('/api/monitor/oil/quote')).body.message], [503, '尚未取得原油报价，后台正在采集']);
     assert.equal((await get('/api/monitor/oil/candles?days=7')).status, 503);
     for (const days of ['0', 'x', '401', '007', '']) assert.equal((await get(`/api/monitor/oil/candles?days=${days}`)).body.code, 'invalid_days', days);

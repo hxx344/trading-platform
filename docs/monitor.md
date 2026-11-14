@@ -133,7 +133,7 @@
 | 项 | 间隔 | 单次请求超时 | 失败行为 |
 | --- | --- | --- | --- |
 | 报价 | 10 秒一轮：两个 `premiumIndex` 与一个 `fundingInfo` 并发 | 10 秒 | 任一价格请求失败本轮作废，保留上次报价（超过 35 秒标为快照）并记原因；`fundingInfo` 失败只让资金费为空；不在轮内重试 |
-| K 线 | 60 秒一轮，从最后一根已存 K 线往前 96 根（1 天）处续读，并补读已存历史里的缺口；首次从 2026-04-01 09:00 UTC 回补（每腿约 15 页，每页 1500 根） | 15 秒 | 任一腿失败本轮作废，保留已存的 K 线并记原因 |
+| K 线 | 60 秒一轮，从最后一根已存 K 线往前 96 根（1 天）处续读；更早的缺口每小时补读一次（启动后第一轮也补读）；首次从 2026-04-01 09:00 UTC 回补（每腿约 15 页，每页 1500 根） | 15 秒 | 任一腿失败本轮作废，保留已存的 K 线并记原因 |
 
 - 限流：与 Anthropic 共用同一个 Binance 冷却（429 后 60 秒、418 后 120 秒内两边都不发 Binance 请求）。原油报价每分钟 18 个请求（权重各 1）、K 线每分钟 2 个（首次回补约 30 个、权重各 10），与 Anthropic 合计仍远低于每分钟 2400 权重。
 - 保留 400 天（同 Anthropic），超出的行每轮写入时删除；响应大小上限同 M-1（8 MiB）。
@@ -146,15 +146,16 @@
 ### M-2a 实施记录（与上文不同或补充的地方）
 
 - **配置**：`monitor` 改为按市场分段，`{ "anthropic": {…}, "oil": {} }` 任配其一或都配；`oil` 不带设置（写别的键或非对象时配置检查报“monitor.oil 无效（不带设置，写 {}）”），一个市场都不写时报“monitor 须至少配置一个市场”。M-1 的 `{ "anthropic": {} }` 照常可用。
-- **接口**：`/api/monitor/state` 返回 `{ markets, anthropic }`（只配原油时 `anthropic` 为 `null`）；`/api/monitor/oil/quote`、`/api/monitor/oil/candles?days=` 规则同 Anthropic（未配置 404 “本服务没有配置原油行情监控”、尚无数据 503、`days` 只认 1–400）。报价应答比工作台多 `status`、`staleAfterMs`、`lastAttemptAt`、`lastError`；K 线应答多 `lastAttemptAt`、`lastError`，窗口读取带 `windowDays` 与完整历史的 `coverage`。运行状态的 `monitor` 段多一个 `oil`（报价与 K 线的最近时刻、行数与错误），没配的市场为 `null`。
+- **接口**：`/api/monitor/state` 返回 `{ markets, anthropic }`（只配原油时 `anthropic` 为 `null`）；`/api/monitor/oil/quote`、`/api/monitor/oil/candles?days=` 规则同 Anthropic（未配置 404 “本服务没有配置原油行情监控”，先于参数检查；尚无数据 503；`days` 只认 1–400）。报价应答比工作台多 `status`、`staleAfterMs`、`lastAttemptAt`、`lastError`；K 线应答多 `lastAttemptAt`、`lastError`，窗口读取带 `windowDays` 与完整历史的 `coverage`。运行状态的 `monitor` 段多一个 `oil`（报价与 K 线的最近时刻、行数与错误），没配的市场为 `null`。
 - **报价时刻**：`fetchedAt` 用两腿源时刻中较早的一个（工作台用读取完成的本机时刻），新鲜度按它算，页面状态行显示的也是它。
 - **限流共用**：`openMonitor` 建一个 Binance 冷却交给两个采集器；`createAnthropicMonitor` 多一个可选的 `gate` 参数，不传时照旧自建。
+- **旧缺口每小时补读一次**：工作台的读取每轮都从最早的缺口读起，交易所始终不给的 K 线（维护停摆等）会让每轮从那里翻页到现在（一年后每腿约 26 页、权重各 10）。这里除启动后第一轮和每满一小时的一轮外，只把最后一天的行交给读取函数，更早的行原样接回（`OIL_GAP_RETRY_MS`）。
 - **K 线写入**：只写与内存相比新增或变化的行；读回失败（行在、轮次记录缺失或校验不过）时下一轮成功后整表重写。保留期裁剪在内存里同样做，内存与库保持一致；写入失败时内存不前进，下一轮重读重写。
 - **导入**：「启用行情监控」现在写入所有市场 `{ "anthropic": {}, "oil": {} }`；已启用的配置缺市场时补上缺的（已有市场的设置原样保留，预览写“补上 原油价差，已有的…保留现有设置”），都齐了才显示“已启用，保留现有设置”；现有 `monitor` 段无效时不改动并在预览里说明。导入面板该行列出写入后的市场。
 - **页面**：配置了两个以上市场时，页面顶部显示市场标签（照工作台 Hub 的 `hub-market-nav`），只挂载当前市场的面板（切换时新面板立即读取，范围与图表标签回到默认）；选中的市场记在浏览器 `localStorage`（`monitor:market:v1`，读写失败时只是不记），其余页面状态仍不存偏好。原油面板的报价快照提示与 K 线快照提示附带服务最近一次失败的原因。走势图与 Anthropic 共用 `web/src/MonitorChart.tsx`，图表配置多一个 `modes`（Anthropic 三个标签，原油只有价差 / 价格对比），没有溢价率标签的市场提示框也不显示溢价率。K 线同样按所选范围加 21 天读，为 M-2e 的指标预热留好窗口。
 - **样式**：市场标签的规则取自工作台 `globals.css`（`77f3cf2`）的 Hub 标签部分，追加在 `monitor.css` 末尾；原油面板其余部分与 Anthropic 用同一组规则，没有新增。
 - **本地预览**：`scripts/dev-monitor.ts` 同时启用两个市场；替身行情（`test/monitor-fake.ts`）新增 BZUSDT / CLUSDT 的 `premiumIndex`、`fundingInfo` 与 15 分钟 K 线（上市 30 天，价差在 2.5–5.5 之间缓慢摆动），可让单腿、资金费或整体返回 429 / 500。
-- **测试**：新增 `test/monitor-oil.test.ts`（9 个：vendor 价差精度、K 线配对 / 分页 / 续读补缺口 / 窗口，报价解析，采集的快照标记、续读起点、失败与恢复、Binance 冷却与 Anthropic 共用，读回与写入失败，配置与接口）；`test/monitor-web.test.ts` 加 3 个原油页面数据规则；`test/import-modules.test.ts` 改写行情监控导入用例（全新、补市场、已齐、只有原油、无效配置、超出大小）。
+- **测试**：新增 `test/monitor-oil.test.ts`（10 个：vendor 价差精度、K 线配对 / 分页 / 续读补缺口 / 窗口，报价解析，采集的快照标记、续读起点、失败与恢复、Binance 冷却与 Anthropic 共用，读回失败整表重写与写入失败下一轮补写，永久缺口每小时补读，配置与接口）；`test/monitor-web.test.ts` 加 3 个原油页面数据规则；`test/import-modules.test.ts` 改写行情监控导入用例（全新、补市场、已齐、只有原油、无效配置、超出大小）。
 
 **本批没做**：多交易所对比（M-2b/M-2c）、多空资金费（M-2d）、指标（M-2e）、成交标记、概览卡片与告警（M-3）。`deploy/config.example.json` 仍只带 `anthropic`。
 

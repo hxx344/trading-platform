@@ -89,7 +89,7 @@ export interface ServiceViews {
     rules?: { view(): unknown; create(body: unknown): unknown; update(id: string, body: unknown): unknown; act(id: string, action: string, body: unknown): unknown };
   };
   /** The read-only market monitors; a market's reads give undefined when it is not configured and null until there is data. Absent without config.monitor. */
-  monitor?: { state(): unknown; quote(market: keyof typeof MONITOR_NAMES): unknown; candles(market: keyof typeof MONITOR_NAMES, days: number | null): unknown };
+  monitor?: { state(): { markets: readonly string[] }; quote(market: keyof typeof MONITOR_NAMES): unknown; candles(market: keyof typeof MONITOR_NAMES, days: number | null): unknown };
   /** The options module's reads and writes (service/options.ts); absent when the service runs no options module. */
   options?: {
     market(expiry: string | null): unknown;
@@ -295,6 +295,8 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       if (url.pathname === '/api/monitor/state') return send(response, 200, views.monitor.state());
       const [, , , market, read] = url.pathname.split('/') as [string, string, string, keyof typeof MONITOR_NAMES, 'quote' | 'candles'];
       const name = MONITOR_NAMES[market];
+      // A market this service does not run answers 404 before its parameters are checked.
+      if (!views.monitor.state().markets.includes(market)) return send(response, 404, { code: 'not_found', message: `本服务没有配置${name}行情监控` });
       if (read === 'quote') {
         const quote = views.monitor.quote(market);
         if (quote === undefined) return send(response, 404, { code: 'not_found', message: `本服务没有配置${name}行情监控` });

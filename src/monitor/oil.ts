@@ -3,8 +3,8 @@
 // own timeout and is never retried within a round; a failed round keeps what was there and says why. The last quote and the
 // candles are kept in monitor.sqlite and read back at start, marked as a snapshot until a round succeeds.
 import {
-  ASSETS, OIL_CANDLE_REFRESH_MS, createIntradaySnapshot, fetchIntradaySnapshot, intradayWindow, requestBinance, validateMarket,
-  type OilCoverage, type OilFetcher, type OilIntraday, type OilIntradayWindow, type OilMarket,
+  ASSETS, OIL_CANDLE_MS, OIL_CANDLE_REFRESH_MS, createIntradaySnapshot, fetchIntradaySnapshot, intradayWindow, requestBinance, validateMarket,
+  type OilCandleRow, type OilCoverage, type OilFetcher, type OilIntraday, type OilIntradayWindow, type OilMarket,
 } from '../vendor/oil-market.mjs';
 import type { BinanceGate } from '../vendor/anthropic-market.mjs';
 import { CANDLE_STALE_MS, QUOTE_STALE_MS, boundedReply, type LoopContext } from './anthropic.ts';
@@ -15,6 +15,12 @@ export const OIL_RETENTION_DAYS = 400;
 export const OIL_QUOTE_KEY = 'oil.quote';
 export const OIL_CANDLE_KEY = 'oil.candles';
 const QUOTE_TIMEOUT_MS = 10_000, CANDLE_TIMEOUT_MS = 15_000, DAY_MS = 86_400_000;
+/**
+ * How often a round also re-reads the gaps older than the last day. The vendored reader starts every round at the earliest
+ * gap; a bar Binance never returns would make each round page from there to now (about 26 pages per leg after a year).
+ */
+export const OIL_GAP_RETRY_MS = 3_600_000;
+const RESUME_MS = 96 * OIL_CANDLE_MS;
 /** The workbench's limits (lib/exchange-service.ts parseBinanceQuote): a mark's source time near this clock, both legs close together. */
 const SOURCE_PAST_MS = 120_000, SOURCE_FUTURE_MS = 60_000, LEG_SKEW_MS = 15_000;
 
@@ -106,6 +112,8 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
   let candles: OilIntraday | null = null, candlesRestored = false, candleAttemptAt: number | null = null, candleError: string | null = null;
   // The stored rows could not be read back: the next successful round rewrites the table instead of adding to it.
   let replaceCandles = false;
+  // Until this time, rounds read on from the last day only; the first round after a start reads every gap.
+  let gapRetryAt = 0;
   const windows = new Map<number | null, { source: OilIntraday; stale: boolean; value: OilIntraday | OilIntradayWindow }>();
 
   try {
@@ -166,7 +174,22 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
     const cutoff = at - OIL_RETENTION_DAYS * DAY_MS;
     let next: OilIntraday;
     try {
-      next = await fetchIntradaySnapshot(candles, { fetcher, now: at, timeout: CANDLE_TIMEOUT_MS });
+      // Between gap re-reads, the reader sees only the rows from the first paired one in the last day; the older rows are
+      // put back after it (the fetched rows take precedence where they overlap).
+      const full = !candles || at >= gapRetryAt;
+      let base = candles, head: OilCandleRow[] = [];
+      if (candles && !full) {
+        const from = candles.data.at(-1)!.time - RESUME_MS;
+        const start = candles.data.findIndex(row => row.time >= from && row.brent !== null && row.wti !== null);
+        if (start > 0) { head = candles.data.slice(0, start); base = createIntradaySnapshot(candles.data.slice(start), candles.metadata.fetchedAt); }
+      }
+      next = await fetchIntradaySnapshot(base, { fetcher, now: at, timeout: CANDLE_TIMEOUT_MS });
+      if (head.length) {
+        const merged = new Map(head.map(row => [row.time, row]));
+        for (const row of next.data) merged.set(row.time, row);
+        next = createIntradaySnapshot([...merged.values()].sort((a, b) => a.time - b.time), next.metadata.fetchedAt);
+      }
+      if (full) gapRetryAt = at + OIL_GAP_RETRY_MS;
       // The kept history ends at the retention cut in memory as in the file.
       if (next.data[0]!.time < cutoff) next = createIntradaySnapshot(next.data.filter(row => row.time >= cutoff), next.metadata.fetchedAt);
     } catch (error) {

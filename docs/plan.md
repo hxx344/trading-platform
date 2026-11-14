@@ -20,6 +20,7 @@
 | 期权 Greeks | `options` | v0.11.0 | G1、G2a（v0.13.0）、G2b（v0.14.0）、G2c（v0.17.0）已发布；实盘测试 G1d 用户跳过 | [options.md](options.md) |
 | 行情监控 | `monitor` | v0.12.0 | M-1（Anthropic 价差）完成，M-2a（原油价差，v0.20.0）、M-2b（海力士溢价，v0.21.0）、M-2c（多交易所对比，v0.23.0）、M-2d（已结算资金费，v0.24.0）、M-2e（技术指标，v0.25.0）、M-2d-3（对比表结算历史，v0.27.0）完成，M-3 至 M-6 未开始 | [monitor.md](monitor.md) |
 | 资产账本 | `asset` | v0.12.0 | A-1 只读、A-2 本地写入（v0.16.0）完成；A-3/A-4 只有方案，A-5、A-6 未开始 | [asset.md](asset.md) |
+| Gate CrossEx 跨所 | `crossex` | 未发布 | 方案 v1.0，C1–C4 待实施，机会列表 C5 待行情监控 M-4 | [crossex.md](crossex.md) |
 | 从工作台导入 | 无 | v0.2.0 命令行、v0.3.0 页面 | 可导入配对、原油执行账户（v0.8.0）、期权账户（v0.11.0）、行情监控与资产账本（v0.15.0） | [module-import.md](module-import.md) |
 
 页面与地址见 [frontend.md](frontend.md)《页面一览》；回退到旧版本前要做的事见 [README](../README.md)《回退到旧版本》。下面第 1–7 节是第一阶段（ASTER）的方案与记录（第 3 节的目录树已含后续模块）。

@@ -1,20 +1,20 @@
 // The import panel's choices as the page request and the question before it (web/src/import-form.ts).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { alertsAvailable, assetAvailable, confirmText, defaultAssetOwner, importBody, monitorAvailable, restarts, type AssetItem, type ImportChoices, type MonitorAlertsItem, type MonitorItem } from '../web/src/import-form.ts';
+import { alertsAvailable, assetAvailable, confirmText, defaultAssetOwner, importBody, monitorAvailable, restarts, variationalAvailable, type AssetItem, type ImportChoices, type MonitorAlertsItem, type MonitorItem } from '../web/src/import-form.ts';
 import { parseImportBody } from '../src/service/import-channel.ts';
 
-const NONE: ImportChoices = { pairs: [], oil: [], options: null, monitor: false, monitorAlerts: null, assetOwner: null };
+const NONE: ImportChoices = { pairs: [], oil: [], options: null, monitor: false, monitorAlerts: null, monitorVariational: null, assetOwner: null };
 const owner = (name: string, importable = true) => ({ owner: name, assets: 1, snapshots: 1, lastDaily: null, importable, detail: '' });
 const asset = (owners: ReturnType<typeof owner>[], enabled = false): AssetItem => ({ status: 'skipped', enabled, owner: null, ledger: '/wb/modules/asset/ledger.sqlite', owners, more: 0, last: null, lastProblem: null, detail: '' });
 
 test('导入面板：勾选项转成页面请求，服务端校验照单接受；什么都没勾时不发', () => {
   assert.equal(importBody(NONE), null);
-  const all: ImportChoices = { pairs: ['p1'], oil: ['Binance ***1234'], options: 'Bybit ***9999', monitor: true, monitorAlerts: { tiers: 2, robot: true, robotChanges: true }, assetOwner: 'alice' };
+  const all: ImportChoices = { pairs: ['p1'], oil: ['Binance ***1234'], options: 'Bybit ***9999', monitor: true, monitorAlerts: { tiers: 2, robot: true, robotChanges: true }, monitorVariational: { replaces: false }, assetOwner: 'alice' };
   const body = importBody(all)!;
-  assert.deepEqual(body, { action: 'import', pairs: ['p1'], oil: true, options: true, monitor: true, monitorAlerts: true, asset: true, assetOwner: 'alice' });
+  assert.deepEqual(body, { action: 'import', pairs: ['p1'], oil: true, options: true, monitor: true, monitorAlerts: true, monitorVariational: true, asset: true, assetOwner: 'alice' });
   assert.deepEqual(parseImportBody(body), body);
-  for (const only of [{ monitor: true }, { assetOwner: 'bob' }, { monitorAlerts: { tiers: 1, robot: false, robotChanges: false } }] as Partial<ImportChoices>[]) {
+  for (const only of [{ monitor: true }, { assetOwner: 'bob' }, { monitorAlerts: { tiers: 1, robot: false, robotChanges: false } }, { monitorVariational: { replaces: true } }] as Partial<ImportChoices>[]) {
     const single = importBody({ ...NONE, ...only })!;
     assert.deepEqual(parseImportBody(single), single, JSON.stringify(only));
   }
@@ -68,4 +68,26 @@ test('导入面板：只导入档位（机器人不变）时不重启；机器�
   assert.match(text, /^导入 行情告警与机器人 并重启本服务？/);
   assert.match(text, /改发工作台行情监控的机器人（secrets\.json 的 feishuMonitor）/);
   assert.doesNotMatch(text, /替换本服务现有的原油/, '没有档位时不提档位');
+});
+
+test('导入面板：Var token 须随行情监控一起发，只导入 token 时不重启服务', () => {
+  const tokenOnly: ImportChoices = { ...NONE, monitorVariational: { replaces: true } };
+  assert.deepEqual(importBody(tokenOnly), { action: 'import', pairs: [], monitor: true, monitorVariational: true });
+  assert.equal(restarts(tokenOnly, false), false);
+  assert.match(confirmText(tokenOnly, false), /^导入 Var token？工作台的 Var token 写入本服务，替换现有的，行情监控下一次读取即用它。配置不变，不重启服务。$/);
+  assert.match(confirmText({ ...NONE, monitorVariational: { replaces: false } }, false), /^导入 Var token？工作台的 Var token 写入本服务，行情监控下一次读取即用它。配置不变，不重启服务。$/);
+  assert.match(confirmText({ ...tokenOnly, assetOwner: 'alice' }, true), /^重新导入资产账本（用户 alice），并导入 Var token？整体替换/);
+  // The page's copy of the helper's item stays the same shape.
+  const bound: import('../web/src/import-form.ts').MonitorVariationalItem = {} as import('../src/service/import-monitor-variational.ts').MonitorVariationalItem;
+  void bound;
+  assert.match(confirmText({ ...tokenOnly, monitor: true }, false), /^导入 行情监控 与 Var token 并重启本服务？/);
+  assert.throws(() => parseImportBody({ action: 'import', monitorVariational: true }), /须和 monitor 一起使用/);
+  assert.throws(() => parseImportBody({ action: 'import', monitor: true, monitorVariational: false }), /只能是 true/);
+  const item = { status: 'added' as const, workbenchExpiresAt: '2026-12-01T00:00:00.000Z', problem: null, current: null, replaces: false, detail: '' };
+  const enabled = { status: 'skipped' as const, enabled: true, shares: { outstanding: 12.7, diluted: 16.7 }, workbench: true, detail: '' };
+  const fresh = { ...enabled, status: 'added' as const, enabled: false };
+  assert.equal(variationalAvailable(item, enabled, false), true);
+  assert.equal(variationalAvailable(item, fresh, false), false);
+  assert.equal(variationalAvailable(item, fresh, true), true);
+  assert.equal(variationalAvailable({ ...item, status: 'skipped' }, enabled, true), false);
 });

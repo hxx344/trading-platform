@@ -55,15 +55,18 @@
 
 **告警档位与机器人（M-3b，v0.30.0）**：勾选「同时导入告警档位与机器人」时，读工作台 `modules/monitor` 的三个告警文件，档位在账本之后、配置之前写入 `monitor.sqlite` 的待应用键，机器人写入 `secrets.json` 的 `feishuMonitor`；只换档位时不重启。规则、顺序与回滚见 [monitor.md](monitor.md) 的 M-3b。
 
+**Var token（M-3d-2，v0.34.0）**：勾选「同时导入 Var token」时，读工作台 `modules/monitor/variational-session.json`（只读取权限为 600、16 KiB 以内的普通文件，只校验格式与到期，不联网），在档位之后、配置之前由写入子进程写本服务的 `monitor-variational-session.json`；本服务的 token 是同一个或到期不早于工作台的时保留本服务的。只写 token 时不改配置、不重启，运行中的行情监控下一次读取即换上。规则与回滚见 [monitor.md](monitor.md) 的 M-3d-2。
+
 ## 4 页面请求
 
-`POST /api/import` 的导入请求新增三个字段，逐项严格校验（与 `oil`、`options` 同一写法，`exactKeys` 拒绝未知字段）：
+`POST /api/import` 的导入请求新增以下字段，逐项严格校验（与 `oil`、`options` 同一写法，`exactKeys` 拒绝未知字段）：
 
 - `monitor`：只能是 `true`。
 - `monitorAlerts`（v0.30.0）：只能是 `true`，且须和 `monitor: true` 一起发；预览总是带上告警一项。
+- `monitorVariational`（v0.34.0）：只能是 `true`，且须和 `monitor: true` 一起发；预览总是带上 Var token 一项（只有到期时间与原因，不含 token）。
 - `asset`：只能是 `true`；须同时带 `assetOwner`。
 - `assetOwner`：只在 `asset` 为 `true` 时允许；字符串，1–64 个字符，只允许字母、数字和 `.`、`_`、`@`、`-`，首字符须是字母或数字。助手另外核对它在工作台账本的用户列表里。
-- 预览请求不能带这三个字段。请求文件仍限 4 KiB。页面不能指定任何文件路径：来源库路径由助手按工作台数据目录推出，目标是服务的数据目录。
+- 预览请求不能带以上字段。请求文件仍限 4 KiB。页面不能指定任何文件路径：来源库路径由助手按工作台数据目录推出，目标是服务的数据目录。
 
 ## 5 命令行
 
@@ -75,6 +78,7 @@ sudo bash install.sh --import-workbench --monitor --asset [--asset-owner <用户
 - `--asset` 不带 `--asset-owner` 时，工作台账本只有一个用户就用它，多个用户时报错并列出用户名；`--asset-owner` 须和 `--asset` 一起用，用户名规则同页面。
 - 导入器新增 `--monitor`、`--asset`、`--asset-owner`、`--data-dir`（安装脚本传入本服务数据目录）。账本先写、再写配置；之后安装脚本照旧检查配置、重启，失败时恢复导入前的配置（账本保留，同 §3 第 4 步）。
 - 旧版本包不支持时安装脚本报“版本 … 不支持 --monitor / --asset”。
+- `--monitor-alerts`（v0.30.0）、`--monitor-variational`（v0.34.0）同时启用行情监控，并分别导入告警与 Var token；两者都需要 `--data-dir`，可同用。
 
 ## 6 备选方式（保留）
 

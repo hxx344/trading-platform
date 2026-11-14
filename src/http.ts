@@ -96,6 +96,8 @@ export interface ServiceViews {
     funding?(market: 'oil' | 'hynix'): unknown;
     /** M-2c: one exchange's comparison row, read on demand; undefined when the market is not configured; rejects with the page's reason. */
     exchange?(market: 'oil' | 'hynix', exchange: Exchange): Promise<unknown> | undefined;
+    /** M-2d-3: one exchange's settled funding history (60 days, both legs); undefined when the market is not configured; rejects with the page's reason. */
+    fundingHistory?(market: 'oil' | 'hynix', exchange: Exchange): Promise<unknown> | undefined;
   };
   /** The options module's reads and writes (service/options.ts); absent when the service runs no options module. */
   options?: {
@@ -308,6 +310,18 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       try { return send(response, 200, await read); }
       // The reader's reasons are short Chinese texts that never carry upstream content.
       catch (error) { return send(response, 503, { code: 'exchange_unavailable', message: error instanceof Error ? error.message : '交易所行情暂不可用' }); }
+    }
+    const historyRoute = request.method === 'GET' ? /^\/api\/monitor\/(oil|hynix)\/exchanges\/([a-z]{1,20})\/funding-history$/.exec(url.pathname) : null;
+    if (historyRoute) {
+      const market = historyRoute[1] as 'oil' | 'hynix', exchange = historyRoute[2]!, name = MONITOR_NAMES[market];
+      if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
+      if (!views.monitor.state().markets.includes(market)) return send(response, 404, { code: 'not_found', message: `本服务没有配置${name}行情监控` });
+      if (!supportsExchange(market, exchange)) return send(response, 404, { code: 'not_found', message: `${name}结算历史不支持 ${exchange}` });
+      const read = views.monitor.fundingHistory?.(market, exchange as Exchange);
+      if (read === undefined) return send(response, 404, { code: 'not_found', message: `本服务没有配置${name}行情监控` });
+      try { return send(response, 200, await read); }
+      // The reader's reasons are short Chinese texts that never carry upstream content.
+      catch (error) { return send(response, 503, { code: 'funding_history_unavailable', message: error instanceof Error ? error.message : '历史结算暂不可用' }); }
     }
     const fundingRoute = request.method === 'GET' ? /^\/api\/monitor\/(oil|hynix)\/funding$/.exec(url.pathname) : null;
     if (fundingRoute) {

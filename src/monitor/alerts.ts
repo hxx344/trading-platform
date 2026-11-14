@@ -154,7 +154,7 @@ const fixed = (value: number, digits: number): string => value.toFixed(digits);
 const sign = (operator: 'gte' | 'lte'): string => operator === 'gte' ? '≥' : '≤';
 /** The outbox keeps 1500 characters of a message (feishu.ts MAX_TEXT); the tiers line leaves room for the quote line. */
 export const ALERT_TEXT_MAX = 1_500;
-/** The first line within the limit (minus `reserve` for the quote line): tiers that do not fit are counted as 另有 N 档. */
+/** The first line within the limit (minus `reserve`: the quote line and its line break): tiers that do not fit are counted as 另有 N 档. */
 function fit(title: string, tiers: readonly string[], reserve: number): string {
   const budget = ALERT_TEXT_MAX - reserve;
   let line = title, shown = 0;
@@ -170,11 +170,11 @@ export function alertMessage(market: AlertMarket, due: readonly { rule: AlertRul
   const spec = ALERT_SPECS[market];
   const crossing = (rule: AlertRule, operator: 'gte' | 'lte') => rule.operator === 'both' ? (operator === 'gte' ? '（向上穿越）' : '（向下穿越）') : '';
   if (market === 'oil') {
-    const tiers = fit('【原油阈值告警】', due.map(({ rule, operator, value }) => `${rule.label}${crossing(rule, operator)}：${spec.metrics[rule.metric]!.label} ${fixed(value, 4)} ${sign(operator)} ${rule.threshold} USDT/桶`), 120);
-    return `${tiers}\n布伦特 ${fixed(quote.brent!, 4)} · WTI ${fixed(quote.wti!, 4)} · 价差 ${fixed(quote.spread!, 4)} USDT/桶（Binance BZUSDT / CLUSDT 标记价，报价时刻 ${fetchedAt}）`;
+    const line = `布伦特 ${fixed(quote.brent!, 4)} · WTI ${fixed(quote.wti!, 4)} · 价差 ${fixed(quote.spread!, 4)} USDT/桶（Binance BZUSDT / CLUSDT 标记价，报价时刻 ${fetchedAt}）`;
+    return `${fit('【原油阈值告警】', due.map(({ rule, operator, value }) => `${rule.label}${crossing(rule, operator)}：${spec.metrics[rule.metric]!.label} ${fixed(value, 4)} ${sign(operator)} ${rule.threshold} USDT/桶`), line.length + 1)}\n${line}`;
   }
-  const tiers = fit('【海力士价差告警】', due.map(({ rule, operator, value }) => `${rule.label}${crossing(rule, operator)}：ADR 溢价率 ${fixed(value, 2)}% ${sign(operator)} ${rule.threshold}%`), 120);
-  return `${tiers}\nADR $${fixed(quote.adr!, 2)} · 正股 ÷ 10 $${fixed(quote.equivalent!, 2)} · 每份价差 $${fixed(quote.spread!, 2)}（Hyperliquid xyz:SKHY / xyz:SKHX，获取时刻 ${fetchedAt}）`;
+  const line = `ADR $${fixed(quote.adr!, 2)} · 正股 ÷ 10 $${fixed(quote.equivalent!, 2)} · 每份价差 $${fixed(quote.spread!, 2)}（Hyperliquid xyz:SKHY / xyz:SKHX，获取时刻 ${fetchedAt}）`;
+  return `${fit('【海力士价差告警】', due.map(({ rule, operator, value }) => `${rule.label}${crossing(rule, operator)}：ADR 溢价率 ${fixed(value, 2)}% ${sign(operator)} ${rule.threshold}%`), line.length + 1)}\n${line}`;
 }
 
 const validSide = (value: unknown): value is Side => !!value && typeof (value as Side).active === 'boolean' && typeof (value as Side).alerted === 'boolean';
@@ -302,7 +302,8 @@ export function createAlertService({ market, store, quote, hooks, gate, now = Da
       return;
     }
     // Nothing left to send (the crossing ended or the alerts were switched off): a queue failure no longer applies.
-    if (!due.length || !saved.config.enabled) { queueError = null; queueRetryAt = 0; }
+    // Cleared without a log line: the outbox has not been shown to work again.
+    if (queueError && (!due.length || !saved.config.enabled)) { queueError = null; queueRetryAt = 0; lastLogged = null; }
     if (!queueError) note(null);
     if (changed) write();
   }
@@ -360,7 +361,7 @@ export function createAlertService({ market, store, quote, hooks, gate, now = Da
       return view();
     },
     /** For the status page. */
-    status: () => ({ enabled: saved.config.enabled, rules: saved.config.rules.filter(rule => rule.enabled).length, checkedAt: checkedAt === null ? null : new Date(checkedAt).toISOString(), error: storageError ?? queueError ?? quoteReason }),
+    status: () => ({ enabled: saved.config.enabled, rules: saved.config.rules.filter(rule => rule.enabled).length, checkedAt: checkedAt === null ? null : new Date(checkedAt).toISOString(), error: storageError ?? restoreError ?? queueError ?? quoteReason }),
   };
 }
 export type AlertService = ReturnType<typeof createAlertService>;

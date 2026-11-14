@@ -224,6 +224,7 @@ test('服务：写库失败时不重复提醒、暂停新提醒，写成功后�
     service.check();
     assert.equal(f.sent.length, 2);
     assert.match(f.sent[1]!, /^【原油阈值告警】价差 5：/);
+    assert.equal(f.logs.filter(line => line.includes('恢复提醒')).length, 1);
     assert.equal(service.view().error, null);
   } finally { f.close(); }
 });
@@ -278,8 +279,15 @@ test('读取已保存的值：格式不对时按默认启动并提示，后台�
     broken.check();
     await broken.test();
     assert.equal((f.store.readState('alerts.oil')!.value as { revision: number }).revision, 7);
+    assert.match(broken.status().error ?? '', /无法读取/);
+    f.writeFails.on = true;
+    assert.throws(() => enable(broken, [rule()]), (error: unknown) => error instanceof ContractError && error.status === 503);
+    assert.match(broken.view().error ?? '', /无法读取/, '保存失败后提示仍在');
+    f.writeFails.on = false;
     const saved = enable(broken, [rule()]);
     assert.equal(saved.error, null);
+    const file = f.store.readState('alerts.oil')!.value as { revision: number; config: { enabled: boolean } };
+    assert.deepEqual([file.revision, file.config.enabled], [9, true], '保存才覆盖原值');
     f.store.writeState('alerts.oil', { version: 1, revision: 9, config: { enabled: true, rules: [rule()] }, states: { r1: { active: 'yes' }, gone: { active: true, alerted: true, lastSentAt: null } }, events: [{ nope: 1 }] });
     const restored = f.service();
     assert.equal(restored.view().history.length, 0);
@@ -404,5 +412,18 @@ test('入队失败后越线结束：提示清除，不误记“已恢复”', ()
     f.clock.now += 10_000; f.quote.value = oilQuote(65.8, 62, f.clock.now);
     service.check();
     assert.equal(service.view().error, null);
+    assert.equal(f.logs.filter(line => line.includes('已恢复')).length, 0, '队列并未证实恢复，不记“已恢复”');
+  } finally { f.close(); }
+});
+
+test('消息：价格位数很大时报价行仍完整', () => {
+  const f = fixture();
+  try {
+    const service = f.service();
+    enable(service, Array.from({ length: 50 }, (_, i) => rule({ id: `g${i}`, metric: 'brent', label: `布伦特梯度档位 ${'档'.repeat(40)} ${i}`, threshold: i + 1 })));
+    f.quote.value = oilQuote(9.99e20, 62, f.clock.now);
+    service.check();
+    assert.ok(f.sent[0]!.length <= ALERT_TEXT_MAX, `长度 ${f.sent[0]!.length}`);
+    assert.match(f.sent[0]!.split('\n')[1]!, /报价时刻 2026-11-14T08:00:00\.000Z）$/);
   } finally { f.close(); }
 });

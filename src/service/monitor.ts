@@ -3,25 +3,33 @@
 // opened costs only the monitor page.
 import { join } from 'node:path';
 import { createAnthropicMonitor, type AnthropicMonitor, type LoopContext } from '../monitor/anthropic.ts';
+import { createExchangeReader, type ExchangeReader } from '../monitor/exchanges.ts';
 import { createHynixMonitor, type HynixMonitor } from '../monitor/hynix.ts';
 import { createOilMonitor, type OilMonitor } from '../monitor/oil.ts';
 import { MONITOR_FILE, createMonitorStore, type MonitorStore } from '../monitor/store.ts';
 import { createBinanceGate, type AnthropicFetcher } from '../vendor/anthropic-market.mjs';
+import type { Exchange } from '../vendor/exchange-comparison.mjs';
 import { monitorMarkets, type MonitorConfig, type MonitorMarket } from './monitor-config.ts';
 
-export interface MonitorRuntime { config: MonitorConfig; store: MonitorStore; anthropic: AnthropicMonitor | null; oil: OilMonitor | null; hynix: HynixMonitor | null }
+export interface MonitorRuntime {
+  config: MonitorConfig; store: MonitorStore; anthropic: AnthropicMonitor | null; oil: OilMonitor | null; hynix: HynixMonitor | null;
+  /** The on-demand multi-exchange comparison (M-2c); present when oil or Hynix runs. */
+  exchanges: ExchangeReader | null;
+}
 
 /** Opens monitor.sqlite and reads the saved history back; throws when the file cannot be opened. */
-export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now, log }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void } = {}): MonitorRuntime {
+export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now, log, WebSocketImpl }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void; WebSocketImpl?: typeof WebSocket } = {}): MonitorRuntime {
   const store = createMonitorStore({ file: join(dir, MONITOR_FILE), ...(now ? { now } : {}) });
   try {
     const base = { store, ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}) };
-    // One Binance cooldown for the two markets that read Binance from the same address; Hynix reads Hyperliquid only.
-    const options = { ...base, gate: createBinanceGate() };
-    return {
-      config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil: config.oil ? createOilMonitor(options) : null,
-      hynix: config.hynix ? createHynixMonitor(base) : null,
-    };
+    // One Binance cooldown for everything that reads Binance from the same address; the Hynix collector reads Hyperliquid only.
+    const gate = createBinanceGate(), options = { ...base, gate };
+    const oil = config.oil ? createOilMonitor(options) : null, hynix = config.hynix ? createHynixMonitor(base) : null;
+    const exchanges = oil || hynix ? createExchangeReader({
+      gate, oilQuote: () => oil?.quote() ?? null, hynixQuote: () => hynix?.quote() ?? null,
+      ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}), ...(WebSocketImpl ? { WebSocketImpl } : {}),
+    }) : null;
+    return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, hynix, exchanges };
   } catch (error) { store.close(); throw error; }
 }
 
@@ -35,6 +43,9 @@ export function monitorViews(monitor: MonitorRuntime) {
     state: () => ({ markets: monitorMarkets(monitor.config), anthropic: monitor.config.anthropic ? { shares: monitor.config.anthropic.shares } : null }),
     quote: (market: MonitorMarket): unknown => collector(market)?.quote(),
     candles: (market: MonitorMarket, days: number | null): unknown => collector(market)?.candles(days),
+    /** One exchange's comparison row; undefined when the market is not configured. Rejects with the page's reason. */
+    exchange: (market: 'oil' | 'hynix', exchange: Exchange): Promise<unknown> | undefined =>
+      monitor.exchanges && monitor.config[market] ? monitor.exchanges.quote(market, exchange) : undefined,
   };
 }
 
@@ -44,5 +55,5 @@ export const monitorStatus = (monitor: MonitorRuntime) => ({ anthropic: monitor.
 export const monitorLoops = (monitor: MonitorRuntime, context: LoopContext): Promise<void>[] => [...monitor.anthropic?.loops(context) ?? [], ...monitor.oil?.loops(context) ?? [], ...monitor.hynix?.loops(context) ?? []];
 
 /** Ends the requests in flight (at stopping), so the loops finish within the drain. */
-export const stopMonitor = (monitor: MonitorRuntime): void => { monitor.anthropic?.stop(); monitor.oil?.stop(); monitor.hynix?.stop(); };
+export const stopMonitor = (monitor: MonitorRuntime): void => { monitor.anthropic?.stop(); monitor.oil?.stop(); monitor.hynix?.stop(); monitor.exchanges?.stop(); };
 export const closeMonitor = (monitor: MonitorRuntime): void => { try { monitor.store.close(); } catch { /* best effort */ } };

@@ -4,10 +4,10 @@
 
 对照的工作台代码：`modules/monitor`（工作台提交 `7745181` 时的内容）。工作台 Monitor 的功能编号 M01–M14 沿用。
 
-## 当前状态（v0.21.0）
+## 当前状态（v0.23.0）
 
-- 已发布：M-1（Anthropic 价差）随 v0.12.0；v0.15.0 起在设置页「从工作台导入」里启用。M-2a（原油价差）随 v0.20.0。M-2b（海力士溢价）随 v0.21.0。
-- 进行中：M-2（原油价差与海力士行情），下一小批 M-2c（原油多交易所对比），方案见下文《M-2》。
+- 已发布：M-1（Anthropic 价差）随 v0.12.0；v0.15.0 起在设置页「从工作台导入」里启用。M-2a（原油价差）随 v0.20.0。M-2b（海力士溢价）随 v0.21.0。M-2c（多交易所对比）随 v0.23.0。
+- 进行中：M-2（原油价差与海力士行情），下一小批 M-2d（资金费），方案见下文《M-2》。
 - 未开始：M-3 至 M-6（见下表）。
 - M-1 没做：成交标记、均线 / 布林带 / Z-score、股数从交易中心同步、概览卡片与告警。
 
@@ -16,7 +16,7 @@
 | 批次 | 内容 | 风险 | 状态 |
 | --- | --- | --- | --- |
 | M-1 | Anthropic 价差（M03）：Binance、Hyperliquid（xyz:ANT、io:ANTH）、Lighter RH 四条腿的报价与 15 分钟 K 线，每股口径溢价；只读公开接口，无凭据、无告警 | R2 | 完成（Linux CI 通过），随 v0.12.0 发布 |
-| M-2 | 原油价差与海力士行情（M01、M02），分 M-2a–M-2e 五小批（见下文），Var 腿先降级为“未接入” | R2 | M-2a 已发布（v0.20.0），M-2b 已发布（v0.21.0），M-2c 起未开始 |
+| M-2 | 原油价差与海力士行情（M01、M02），分 M-2a–M-2e 五小批（见下文），Var 腿先降级为“未接入” | R2 | M-2a 已发布（v0.20.0），M-2b 已发布（v0.21.0），M-2c 已发布（v0.23.0），M-2d 起未开始 |
 | M-3 | 告警规则、飞书通知、监控开关、Var 会话 token（M09–M12） | R3 | 未开始 |
 | M-4 | 永续全市场报价（M04：11 家交易所公共 WS、SSE 增量） | R2 | 未开始 |
 | M-5 | 依赖 M04 的页面（M05–M08） | R2 | 未开始 |
@@ -102,7 +102,7 @@
 | --- | --- | --- |
 | M-2a | 原油价差：Binance BZUSDT / CLUSDT 标记价报价与 15 分钟 K 线、详情页（价差 / 价格对比） | 已发布（v0.20.0） |
 | M-2b | 海力士溢价：Hyperliquid xyz:SKHY（ADR）/ xyz:SKHX（普通股）报价与 1 小时 K 线、详情页（溢价率 / 美元价差 / 价格对比） | 已发布（v0.21.0） |
-| M-2c | 原油的多交易所对比（OKX、Bitget、Gate、Bybit、Hyperliquid、Lighter；Var 先显示“未接入”，会话 token 随 M-3） | 未开始 |
+| M-2c | 多交易所对比：原油（Hyperliquid、Bybit、Binance、Lighter、OKX、Bitget；Variational 显示“未接入”）与海力士（Hyperliquid、Bybit、Binance、OKX、Bitget、Gate）的同所两腿价差与资金费年化 | 已发布（v0.23.0） |
 | M-2d | 资金费：原油 Binance 已结算资金费（4 小时）与海力士 Hyperliquid 小时资金费历史、多空资金费图 | 未开始 |
 | M-2e | 技术指标：7 日均线、20 日布林带、Z-score（Anthropic、原油、海力士三个市场一起补） | 未开始 |
 
@@ -200,3 +200,41 @@
 **本批没做**：多交易所对比（M-2c）、资金费（M-2d）、指标（M-2e）、成交标记、概览卡片与告警（M-3）。`deploy/config.example.json` 仍只带 `anthropic`。
 
 **回滚**：`sudo bash install.sh --version v0.20.0`，回退前从 `config.json` 删掉 `monitor.hynix`（只配了海力士时删掉整个 `monitor`）；`hynix_candles` 表旧版本不读。
+
+### M-2c：多交易所对比
+
+对照：`modules/monitor` 的 `lib/exchange-service.ts`（`c4c7910`）、`lib/exchange-quotes.ts`（`568a20d`）、`lib/oil-cex.ts`（`1fdb6e8`）、`lib/oil-dex.ts`（`8470785`）、`modules/oil/hyperliquid.mjs`（`c534894`）、`app/exchange-comparison.tsx`（`568a20d`）、`hooks/use-exchange-quotes.ts`（`8470785`）。工作台的原油与海力士都有这张表（海力士的对比交易所带 Gate、不带 Lighter），这一批两个市场一起做；批次表原写的“原油含 Gate”按工作台更正为 Gate 只在海力士。
+
+**做法：按需读取，不后台轮询**（同工作台）。页面打开对比表时每个交易所各自每 15 秒请求一次服务；服务收到请求才去读那一家，结果 5 秒内各页面共用，同一结果同时只有一个请求在途。没人看页面时不发任何请求。
+
+**接口**：`GET /api/monitor/<oil|hynix>/exchanges/<交易所>`，返回该交易所一行（两腿价格、币种、口径、资金费率与周期、下次结算、时间口径）；未配置该市场或该市场不支持这家时 404，读取失败 503（`code: exchange_unavailable`，`message` 是固定中文原因，不带上游内容）。
+
+**各交易所来源**
+
+| 交易所 | 原油 | 海力士 | 请求（每次读取） |
+| --- | --- | --- | --- |
+| Hyperliquid | xyz:BRENTOIL / xyz:CL 的 `metaAndAssetCtxs`（xyz） | 采集器的 `allMids` 报价 + `metaAndAssetCtxs` 资金费（只接实时报价） | 1 个（两个市场共用 5 秒） |
+| Binance | 采集器的报价（不额外请求） | SKHYUSDT / SKHYNIXUSDT `premiumIndex` + `fundingInfo`（15 秒） | 0 / 2–3 个 |
+| Bybit | BZUSDT / CLUSDT | SKHYUSDT / SKHYNIXUSDT | 合约信息 2 个（60 秒） + `tickers` 2 个 |
+| OKX | BZ / CL-USDT-SWAP | SKHY / SKHYNIX-USDT-SWAP | 合约 2（60 秒）+ 标记价 2 + 资金费 2（15 秒） |
+| Bitget | BZUSDT / CLUSDT | SKHYUSDT / SKHYNIXUSDT | 合约 2（60 秒）+ 行情 2 + 资金费 2（15 秒） |
+| Lighter | `orderBookDetails` 目录（60 秒）+ 只读 WebSocket `market_stats` 快照 | — | 目录 0–1 个 + 1 个连接（最长 9 秒） |
+| Gate | — | `contracts/<合约>` 2 个 | 2 个 |
+| Variational | “未接入”（需要登录会话） | — | 不请求 |
+
+**超时、重试与失败**：每个 HTTP 请求 10 秒超时，不重试；失败的结果不缓存，下一次请求重新读。合约目录 60 秒有效，过期后重读失败时 10 分钟内沿用旧目录。资金费读不到时只缺资金费（年化显示“—”并标“资金费缺失”），价格照常。Binance 与采集器共用同一个 429/418 冷却（60 / 120 秒），冷却内不发请求。应答大于 8 MiB 时放弃。服务停止时在途请求与 Lighter 连接立即中止。
+
+**页面**：原油与海力士详情页图表下方各一张“交易所实时对比”表，布局照工作台；时间按 UTC 显示。
+
+### M-2c 实施记录（与上文不同或补充的地方）
+
+- **代码**：`src/vendor/exchange-comparison.mjs`（附 `.d.mts`）复制上面各文件的合约表、各所解析与校验、价差与资金费年化、Lighter 快照订阅，页面与服务共用，与原文件的差别写在文件头；`src/monitor/exchanges.ts` 是读取与缓存；`src/service/monitor.ts` 在配置了原油或海力士时建读取器，与采集器共用 Binance 冷却，停止时一起停。
+- **与工作台的差别**：按合约逐个请求，不拉整个市场的列表（工作台读 Bybit、OKX、Bitget 全市场，单次几百 KB），Bybit 两次 `tickers` 应答的时间差超过 15 秒视为不同步；Binance 海力士不读 `exchangeInfo`（合约状态以 `premiumIndex` 能否返回为准）；Hyperliquid 两个市场用同一个校验，下次结算按下一个整点推算并标“推算”；原油 Hyperliquid 行情没有源时刻，用收到应答的时刻（页面标“采集时间”）。
+- **日志**：每个交易所的失败按原因去重记一次，恢复记一次；采集器还没有报价（“尚未取得…报价，后台正在采集”）不记失败。
+- **页面**：年化是纯文本，不能点开结算历史（随 M-2d）；四腿对冲模拟和 Hub 摘要不做；Variational 行固定“未接入”。
+- **本地预览**：替身行情新增 Bybit、OKX、Bitget、Gate、Lighter（含 WebSocket 替身，可设为无应答或拒绝）的应答，各交易所价格在同一走势上加小幅偏移；xyz `metaAndAssetCtxs` 带原油与海力士合约。
+- **测试**：新增 `test/monitor-exchanges.test.ts`（10 个：各交易所解析与页面校验、5 秒缓存与并发去重、失败不缓存与日志去重、合约目录沿用与 10 分钟上限、Binance 冷却与资金费缺失、采集器来源与未就绪、Hyperliquid 资金费缺失与快照、Lighter 拒绝 / 超时 / 停止、停止中止在途请求、原因文本不带上游内容、接口 401 / 404 / 503 / 200）。
+
+**本批没做**：资金费历史与多空资金费图（M-2d）、指标（M-2e）、Variational、告警（M-3）。真实交易所未验证（本机访问部分交易所受地区限制）。
+
+**回滚**：`sudo bash install.sh --version v0.22.0`，不用改配置（没有新配置字段、没有新表）。

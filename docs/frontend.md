@@ -297,3 +297,13 @@
 **验证**：`scripts/dev-monitor.ts` 替身行情下 1280 与 390 宽度，原油 7 行、海力士 6 行齐全，展开说明、点刷新正常，无横向溢出（390 宽度按工作台改为卡片式行）；控制台只有未配置模块的入口探测 404。
 
 **回滚**：`sudo bash install.sh --version v0.22.0`，不用改配置。
+
+## 行情监控页：多空价差资金费（Monitor M-2d，v0.24.0）
+
+**对照的工作台页面**：`modules/monitor/app/settled-funding-panel.tsx`（提交 `8bc3bee`），配置照 `app/oil-funding-panel.tsx` 与 `app/hynix-funding-panel.tsx`，放在原油、海力士详情的交易所对比表之后。样式复制自 `app/globals.css`（`77f3cf2`）的资金费面板规则（第 90–93、210–211、247、308–315、473 行），全部加 `.monitor-desk` 前缀，追加在 `web/src/monitor.css` 末尾。
+
+**页面**：`web/src/MonitorFunding.tsx`（`OilFundingPanel`、`HynixFundingPanel`）与 `web/src/monitor-funding.ts`（接口校验、区间终点）：区间累计年化与累计资金费读数、小时费率 / 累计资金费 / 累计年化曲线（`SvgPlot`，悬停显示该结算时点的费率、累计与年化）、覆盖说明、状态与刷新按钮、可展开的计算口径与数据来源。时间范围与上方价差图共用同一组按钮的值。`useLiveResource` 每 5 分钟读一次（超时 30 秒），503 `not_ready` 当作载入中，503 `funding_unavailable` 显示服务给的原因；接口标 `complete: false`（分段回补中）时状态行写“正在分段回补，已到 …”，区间终点取已有的最后一次结算；“全部”的起点不早于服务的 400 天保留期。原油面板多“当前预估”（等数量 / 等名义，选择存 `localStorage` 的 `monitor:oil:basis:v1`，读写包在 try/catch 里）。
+
+**验证**：`scripts/dev-monitor.ts` 替身行情下 1280 与 390 宽度，原油、海力士面板读数、覆盖说明、区间切换（1 周 / 1 月）、曲线切换、等名义口径、悬停提示与展开说明正常，海力士分段回补中（已到 09-08）的状态行与可点的刷新按钮正常，无横向溢出，控制台只有未配置模块的入口探测 404。
+
+**回滚**：`sudo bash install.sh --version v0.23.0`，不用改配置。

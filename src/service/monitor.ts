@@ -43,6 +43,12 @@ export function monitorViews(monitor: MonitorRuntime) {
     state: () => ({ markets: monitorMarkets(monitor.config), anthropic: monitor.config.anthropic ? { shares: monitor.config.anthropic.shares } : null }),
     quote: (market: MonitorMarket): unknown => collector(market)?.quote(),
     candles: (market: MonitorMarket, days: number | null): unknown => collector(market)?.candles(days),
+    /** The settled funding history (M-2d); undefined when the market is not configured; before any settlement
+     * `{ notReady }` with why the last round failed (null while the first round has not failed). */
+    funding: (market: 'oil' | 'hynix'): unknown => {
+      const collector = monitor[market];
+      return collector ? collector.funding() ?? { notReady: collector.status().fundingError } : undefined;
+    },
     /** One exchange's comparison row; undefined when the market is not configured. Rejects with the page's reason. */
     exchange: (market: 'oil' | 'hynix', exchange: Exchange): Promise<unknown> | undefined =>
       monitor.exchanges && monitor.config[market] ? monitor.exchanges.quote(market, exchange) : undefined,

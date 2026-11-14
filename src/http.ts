@@ -92,6 +92,8 @@ export interface ServiceViews {
   /** The read-only market monitors; a market's reads give undefined when it is not configured and null until there is data. Absent without config.monitor. */
   monitor?: {
     state(): { markets: readonly string[] }; quote(market: keyof typeof MONITOR_NAMES): unknown; candles(market: keyof typeof MONITOR_NAMES, days: number | null): unknown;
+    /** The settled funding history of oil or Hynix (M-2d); before any settlement `{ notReady: <reason> | null }`. */
+    funding?(market: 'oil' | 'hynix'): unknown;
     /** M-2c: one exchange's comparison row, read on demand; undefined when the market is not configured; rejects with the page's reason. */
     exchange?(market: 'oil' | 'hynix', exchange: Exchange): Promise<unknown> | undefined;
   };
@@ -306,6 +308,19 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       try { return send(response, 200, await read); }
       // The reader's reasons are short Chinese texts that never carry upstream content.
       catch (error) { return send(response, 503, { code: 'exchange_unavailable', message: error instanceof Error ? error.message : '交易所行情暂不可用' }); }
+    }
+    const fundingRoute = request.method === 'GET' ? /^\/api\/monitor\/(oil|hynix)\/funding$/.exec(url.pathname) : null;
+    if (fundingRoute) {
+      const market = fundingRoute[1] as 'oil' | 'hynix', name = MONITOR_NAMES[market];
+      if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
+      const funding = views.monitor.state().markets.includes(market) ? views.monitor.funding?.(market) : undefined;
+      if (funding === undefined) return send(response, 404, { code: 'not_found', message: `本服务没有配置${name}行情监控` });
+      const notReady = funding === null ? null : (funding as { notReady?: unknown }).notReady;
+      if (funding !== null && notReady === undefined) return send(response, 200, funding);
+      // The reason is the collector's short Chinese text, never upstream content.
+      return typeof notReady === 'string'
+        ? send(response, 503, { code: 'funding_unavailable', message: `尚未取得${name}历史资金费（${notReady}），下一轮自动重试` })
+        : send(response, 503, { code: 'not_ready', message: `尚未取得${name}历史资金费，后台正在回补` });
     }
     if (request.method === 'GET' && MONITOR_PATHS.has(url.pathname)) {
       if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });

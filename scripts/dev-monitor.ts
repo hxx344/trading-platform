@@ -20,7 +20,8 @@ const port = Number(values.port);
 if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('--port 无效');
 const app = loadWebApp();
 const dir = mkdtempSync(join(tmpdir(), 'tp-dev-monitor-'));
-const venues = fakeAnthropicVenues();
+// Hynix listed as on the real venues (first settlement 2026-07-10 15:00), so the settled funding backfills in 60-day segments.
+const venues = fakeAnthropicVenues({ listedAt: { skhy: Date.UTC(2026, 6, 10, 14), skhx: Date.UTC(2026, 6, 10, 14) } });
 const monitor = openMonitor(parseMonitorConfig({ anthropic: {}, oil: {}, hynix: {} }), dir, { fetchImpl: venues.fetch, WebSocketImpl: venues.WebSocket });
 const store = openStore(join(dir, 'executor.sqlite'));
 const { binance, bybit, aster, asterTrading } = createSimulatedVenues(Date.now);

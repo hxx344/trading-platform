@@ -629,6 +629,18 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     });
   }
 
+  /**
+   * Read-only lookup of the job a confirm of this preview with this request id created for this session, or null when none
+   * was written; the same match as confirm's duplicate check. Used by callers that must not confirm again (say a disabled
+   * rule) but may hold a confirm whose answer they never saw.
+   */
+  function confirmedJob(requestId: string, previewId: string, session: string): string | null {
+    const existing = db.prepare('SELECT kind, digest, session, job_id FROM commands WHERE request_id = ?').get(requestId) as { kind: string; digest: string; session: string; job_id: string } | undefined;
+    if (!existing) return null;
+    if (existing.kind !== 'confirm' || existing.digest !== digest({ kind: 'confirm', previewId, confirmLive: true }) || existing.session !== session) reject('request_reused', '请求编号已用于其他内容', 409);
+    return existing.job_id;
+  }
+
   /** Durable, idempotent stop. It stops new sends; orders already sent keep being reconciled. */
   function requestStop(jobId: string, requestId: string, session: string): ReturnType<typeof jobView> {
     if (!UUID.test(requestId)) reject('request_id', '请求编号无效');
@@ -1581,6 +1593,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     preview,
     publicPreview,
     confirm,
+    confirmedJob,
     requestStop,
     acknowledge,
     adoptStrategy,

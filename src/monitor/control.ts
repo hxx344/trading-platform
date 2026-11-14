@@ -27,7 +27,7 @@ export function createMonitorControl({ store, markets, log = () => undefined }: 
       state.set(market, { ...(saved ? parseSaved(saved.value) : { enabled: true, revision: 0 }), error: null });
     } catch (error) {
       // Collection is read-only: an unreadable switch runs the market rather than leaving it silently off.
-      const message = `${NAMES[market]}监控开关无法读取（${reason(error)}），按开启运行；在页面重新切换一次即可覆盖`;
+      const message = `${NAMES[market]}监控开关无法读取（${reason(error)}），按开启运行；在页面点一次开关会保存为关闭并覆盖坏记录，需要运行时再点一次开启`;
       log(message);
       state.set(market, { enabled: true, revision: 0, error: message });
     }

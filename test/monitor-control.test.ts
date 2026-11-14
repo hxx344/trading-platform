@@ -96,13 +96,14 @@ test('循环：关闭时启动不跑首轮；运行中关闭后本轮结束即�
   try {
     const control = createMonitorControl({ store, markets: ['oil', 'hynix'] });
     control.update('oil', { enabled: false, revision: 0 });
-    const rounds = { oil: 0, hynix: 0 }, checks = { oil: 0, hynix: 0 };
+    const rounds = { oil: 0, hynix: 0 }, checks = { oil: 0, hynix: 0 }, pendings = { oil: 0, hynix: 0 };
+    const logs: string[] = [];
     const collector = (market: 'oil' | 'hynix') => ({ loops: (context: LoopContext) => [(async () => { while (!context.stopped()) { rounds[market]++; await context.pause(60_000); } })()] });
-    const runtime = { control, anthropic: null, oil: collector('oil'), hynix: collector('hynix'), alerts: { oil: { check: () => { checks.oil++; } }, hynix: { check: () => { checks.hynix++; } } } } as unknown as MonitorRuntime;
+    const runtime = { control, anthropic: null, oil: collector('oil'), hynix: collector('hynix'), alerts: { oil: { check: () => { checks.oil++; }, applyPending: () => { pendings.oil++; } }, hynix: { check: () => { checks.hynix++; }, applyPending: () => { pendings.hynix++; } } } } as unknown as MonitorRuntime;
     const { context, stop } = fastContext();
-    const loops = monitorLoops(runtime, context, () => undefined);
-    await until(() => rounds.hynix >= 3 && checks.hynix >= 3, '海力士运行');
-    assert.deepEqual([rounds.oil, checks.oil], [0, 0], '原油关闭：不跑首轮也不检查告警');
+    const loops = monitorLoops(runtime, context, line => logs.push(line));
+    await until(() => rounds.hynix >= 3 && checks.hynix >= 3 && pendings.oil >= 3, '海力士运行');
+    assert.deepEqual([rounds.oil, checks.oil, pendings.hynix], [0, 0, 0], '原油关闭：不跑首轮、不判断告警，只换上待应用的导入档位');
     control.update('oil', { enabled: true, revision: 1 });
     await until(() => rounds.oil >= 2 && checks.oil >= 2, '原油开启后恢复');
     control.update('hynix', { enabled: false, revision: 0 });
@@ -113,6 +114,7 @@ test('循环：关闭时启动不跑首轮；运行中关闭后本轮结束即�
     assert.ok(rounds.oil > 2, '原油照常');
     stop();
     await Promise.all(loops);
+    assert.deepEqual(logs, []);
   } finally { store.close(); dispose(); }
 });
 

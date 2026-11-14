@@ -93,7 +93,7 @@ function fixture(): Fixture {
   const hooks = {
     notify: (text: string) => { if (f.notifyFails.on) throw new Error('SQLITE_FULL'); if (!f.robot.on) return null; f.sent.push(text); return f.sent.length; },
     delivery: (ids: readonly number[]) => new Map([...f.delivery].filter(([id]) => ids.includes(id))),
-    robot: () => f.robot.on,
+    robot: () => f.robot.on ? 'feishu' as const : null,
     test: async (text: string) => { if (f.testFails.on) throw new Error('飞书返回 HTTP 200 code 19021'); f.tests.push(text); },
   };
   f.service = (market = 'oil') => createAlertService({ market, store, quote: () => f.quote.value, hooks, gate, now: () => clock.now, log: line => f.logs.push(line) });
@@ -324,7 +324,7 @@ test('接口：读取、保存（409 / 400）、测试消息；须带页面请�
   const config = parseServiceConfig({ secretsFile: '/etc/tp/secrets.json', monitor: { oil: {} } });
   const tests: string[] = [];
   const runtime = openMonitor(config.monitor!, dir, { fetchImpl: venues.fetch, WebSocketImpl: venues.WebSocket, log: () => undefined,
-    alertHooks: { notify: () => 1, delivery: () => new Map(), robot: () => true, test: async text => { tests.push(text); } } });
+    alertHooks: { notify: () => 1, delivery: () => new Map(), robot: () => 'feishu' as const, test: async text => { tests.push(text); } } });
   const h = createHarness();
   const server = createExecutorServer({ executor: h.ex, accessToken: 'monitor-token-0006', views: { monitor: monitorViews(runtime) } });
   try {
@@ -340,7 +340,7 @@ test('接口：读取、保存（409 / 400）、测试消息；须带页面请�
     const view = await call('/api/monitor/oil/alerts');
     assert.equal(view.status, 200);
     assert.deepEqual([view.body.revision, view.body.robotConfigured, view.body.config.rules.length], [0, true, 3]);
-    assert.deepEqual(Object.keys(view.body).sort(), ['checkedAt', 'config', 'error', 'history', 'lastValidAt', 'market', 'notice', 'revision', 'robotConfigured', 'values'], '只返回有无机器人，不返回地址');
+    assert.deepEqual(Object.keys(view.body).sort(), ['checkedAt', 'config', 'error', 'history', 'lastValidAt', 'market', 'notice', 'revision', 'robot', 'robotConfigured', 'values'], '只返回有无机器人及其名称，不返回地址');
     assert.equal((await call('/api/monitor/oil/alerts', { revision: 0, config: { enabled: true, rules: [] } }, { 'content-type': 'application/json' })).status, 403);
     const saved = await call('/api/monitor/oil/alerts', { revision: 0, config: { enabled: true, rules: [rule()] } });
     assert.deepEqual([saved.status, saved.body.revision, saved.body.config.enabled], [200, 1, true]);

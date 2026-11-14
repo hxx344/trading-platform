@@ -103,7 +103,7 @@ export function AlertSettings({ market, onExpired }: { market: AlertMarket; onEx
       <p className="alert-help">持续满足阈值只提醒一次；再次提醒须同时满足重新越过阈值和冷却结束。{spec.example}</p>
       <p className="alert-help">双向穿越：向上穿过阈值或向下穿过阈值都会提醒。保存后需先离开阈值超过回差，才开始判断穿越，不会因为当前已在阈值某一侧而立即提醒。</p>
       {!view ? <p className="alert-help" role="status">{readError || '正在连接告警后台…'}</p> : <>
-        <p className="alert-help">{view.robotConfigured ? '使用 secrets.json 的 feishu 告警机器人（与运行通知共用）。' : '尚未配置飞书告警机器人，可先保存梯度。'}关闭网页后，后台仍会检查并发送告警；发送失败时自动重试，最多保留 7 天。</p>
+        <p className="alert-help">{view.robot === 'feishuMonitor' ? '使用 secrets.json 的 feishuMonitor 行情告警机器人（从工作台导入，原油与海力士共用）。' : view.robot === 'feishu' ? '使用 secrets.json 的 feishu 告警机器人（与运行通知共用）。' : '尚未配置飞书告警机器人，可先保存梯度。'}关闭网页后，后台仍会检查并发送告警；发送失败时自动重试，最多保留 7 天。</p>
         {view.notice && <p className="alert-feedback failure" role="status">{view.notice}</p>}
         {/* Outside the save form: unapplied generator inputs must not block saving the draft. */}
         <fieldset disabled={busy} className="alert-fields">
@@ -159,7 +159,7 @@ export function AlertSettings({ market, onExpired }: { market: AlertMarket; onEx
         <div className="alert-monitor"><span>最近后台检查：{time(view.checkedAt)}</span><span>最近有效报价：{time(view.lastValidAt)}</span></div>
         <p className="alert-help alert-server-market">{spec.market(view.values)}</p>
         {view.error && <p className="alert-feedback failure" role="alert">{view.error}</p>}
-        <details className="monitor-alert-history"><summary>最近发送记录（{view.history.length} 条）</summary>{view.history.length ? view.history.map(item => <div key={item.id}><div><time>{time(item.time)}</time><strong className={item.status === 'sent' ? 'positive' : item.status === 'failed' || item.status === 'retrying' || item.status === 'unqueued' ? 'negative' : ''}>{STATUS_LABELS[item.status]}</strong></div><p>{historyText(market, item)}{item.error && ` · ${item.error}`}</p></div>) : <p className="alert-help">尚无发送记录。</p>}</details>
+        <details className="monitor-alert-history"><summary>最近发送记录（{view.history.length} 条）</summary>{view.history.length ? view.history.map(item => <div key={item.id}><div><time>{time(item.time)}</time><strong className={item.status === 'sent' || item.status === 'applied' ? 'positive' : item.status === 'failed' || item.status === 'retrying' || item.status === 'unqueued' ? 'negative' : ''}>{STATUS_LABELS[item.status]}</strong></div><p>{historyText(market, item)}{item.error && ` · ${item.error}`}</p></div>) : <p className="alert-help">尚无发送记录。</p>}</details>
       </>}
     </div>}
   </section>;

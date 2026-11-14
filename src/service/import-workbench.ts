@@ -39,6 +39,9 @@ import { MODULE_KEYS, assertDistinctSigners, parseServiceConfig, parseServiceSec
 import { parseOilSecrets } from './oil-config.ts';
 import { planOptions, readWorkbenchOptions, resolveOptionsAccount, type OptionsItem, type OptionsSource } from './import-options.ts';
 import { ASSET_OWNER } from './import-channel.ts';
+import { alertsLine, planMonitorAlerts, readWorkbenchAlerts, writeMonitorAlertsAsService, type MonitorAlertsItem, type MonitorAlertsSource } from './import-monitor-alerts.ts';
+import type { AlertImport } from '../monitor/alert-import.ts';
+import { ALERT_SPECS } from '../monitor/alerts.ts';
 import { connectionLines, planAsset, planMonitor, readWorkbenchAsset, readWorkbenchMonitor, writeLedgerAsService, type AssetItem, type AssetSource, type LedgerWrite, type MonitorItem, type MonitorSource } from './import-modules.ts';
 
 export const WORKBENCH_ENV = '/etc/project-aggregation.env';
@@ -103,6 +106,10 @@ export interface ImportPlan {
   asset: AssetItem | null;
   /** The ledger rows to write into asset.sqlite, before the files; null when none come over. */
   ledger: LedgerWrite | null;
+  /** The monitor's alert tiers and robot looked at (null without options.monitorAlerts). */
+  monitorAlerts: MonitorAlertsItem | null;
+  /** The tiers to write into monitor.sqlite (after the ledger, before the files); null when none come over. */
+  alertWrite: AlertImport | null;
   notes: string[];
 }
 /** What the page shows for each workbench pair before anything is written: whether it could come over on its own. */
@@ -135,7 +142,7 @@ function feishuOf(env: WorkbenchSource['env'], channel: 'EVENT' | 'SCHEDULED' = 
  * Works out the files after the import. `existing` is the current config.json and secrets.json (raw JSON), or null on a
  * first setup. Throws when the result would not load: the caller then writes nothing.
  */
-export function planImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; only?: readonly string[]; known?: ReadonlyMap<string, AsterCredentials>; requireMargin?: boolean; oil?: OilSource; options?: OptionsSource; monitor?: MonitorSource; asset?: AssetSource; assetOwner?: string }): ImportPlan {
+export function planImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; only?: readonly string[]; known?: ReadonlyMap<string, AsterCredentials>; requireMargin?: boolean; oil?: OilSource; options?: OptionsSource; monitor?: MonitorSource; monitorAlerts?: MonitorAlertsSource; asset?: AssetSource; assetOwner?: string }): ImportPlan {
   const config: Json = existing ? structuredClone(existing.config) : { secretsFile: options.secretsFile, pairs: [] };
   const secrets: Json = existing ? structuredClone(existing.secrets) : { accounts: {} };
   // A config of other modules only (oil, options, monitor, asset) has no pairs yet; those blocks and their keys are carried over untouched.
@@ -259,9 +266,11 @@ export function planImport(source: WorkbenchSource, existing: { config: Json; se
   const oil = options.oil ? planOil(options.oil, config, secrets, fits, notes) : [];
   const optionsItem = options.options ? planOptions(options.options, config, secrets, fits, notes) : null;
   const monitorItem = options.monitor ? planMonitor(options.monitor, config, fits, notes) : null;
+  // After the monitor's own plan: the tiers come over only to a config that runs the monitor.
+  const alerts = options.monitorAlerts ? planMonitorAlerts(options.monitorAlerts, config, secrets, notes) : null;
   const asset = options.asset ? planAsset(options.asset, config, fits, options.assetOwner, notes) : null;
   // Each added pair passed the checks with everything before it, and every key was derived once, so the result passes.
-  return { config, secrets, added, skipped, items, oil, options: optionsItem, monitor: monitorItem, asset: asset?.item ?? null, ledger: asset?.write ?? null, notes };
+  return { config, secrets, added, skipped, items, oil, options: optionsItem, monitor: monitorItem, asset: asset?.item ?? null, ledger: asset?.write ?? null, monitorAlerts: alerts?.item ?? null, alertWrite: alerts?.write ?? null, notes };
 }
 
 /**
@@ -332,11 +341,11 @@ function planOil(source: OilSource, config: Json, secrets: Json, fits: (candidat
  * and why the others cannot. Pairs that only fit one at a time (the request budget) show up when the selection is
  * imported. Throws when the existing files fail their checks: nothing could be imported then.
  */
-export function previewImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; oil?: OilSource; options?: OptionsSource; monitor?: MonitorSource; asset?: AssetSource }): { items: PreviewItem[]; oil: OilItem[]; options: OptionsItem | null; monitor?: MonitorItem; asset?: AssetItem; notes: string[] } {
+export function previewImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; oil?: OilSource; options?: OptionsSource; monitor?: MonitorSource; monitorAlerts?: MonitorAlertsSource; asset?: AssetSource }): { items: PreviewItem[]; oil: OilItem[]; options: OptionsItem | null; monitor?: MonitorItem; monitorAlerts?: MonitorAlertsItem; asset?: AssetItem; notes: string[] } {
   // The oil and options accounts, the monitor and the ledger are planned once, with no pair: the page imports them
   // together or on their own.
   const base = planImport(source, existing, { secretsFile: options.secretsFile, only: [], requireMargin: true, ...(options.oil ? { oil: options.oil } : {}), ...(options.options ? { options: options.options } : {}),
-    ...(options.monitor ? { monitor: options.monitor } : {}), ...(options.asset ? { asset: options.asset } : {}) });
+    ...(options.monitor ? { monitor: options.monitor } : {}), ...(options.monitorAlerts ? { monitorAlerts: options.monitorAlerts } : {}), ...(options.asset ? { asset: options.asset } : {}) });
   const parsedBase = parseServiceConfig(base.config);
   const known = new Map(parseServiceSecrets(base.secrets, [], parsedBase.oil?.accounts.map(account => account.venue) ?? [], parsedBase.options !== undefined).accounts);
   const items = source.pairs.map((pair): PreviewItem => {
@@ -348,7 +357,7 @@ export function previewImport(source: WorkbenchSource, existing: { config: Json;
     catch (error) { item = { id, status: 'skipped', detail: error instanceof Error ? error.message : String(error) }; }
     return { id: printable(id).slice(0, 64), name, marginEnabled, importable: item?.status === 'added', detail: printable(item?.detail ?? '未能判断').slice(0, 300) };
   });
-  return { items, oil: base.oil, options: base.options, ...(base.monitor ? { monitor: base.monitor } : {}), ...(base.asset ? { asset: base.asset } : {}), notes: base.notes };
+  return { items, oil: base.oil, options: base.options, ...(base.monitor ? { monitor: base.monitor } : {}), ...(base.monitorAlerts ? { monitorAlerts: base.monitorAlerts } : {}), ...(base.asset ? { asset: base.asset } : {}), notes: base.notes };
 }
 
 /** Prints the raw data column of both tables; run with no environment, as the database's owner when that matters. */
@@ -654,14 +663,17 @@ export function readExisting(configPath: string): ExistingFiles {
 async function main(): Promise<void> {
   const { values } = parseArgs({ options: {
     config: { type: 'string' }, 'workbench-env': { type: 'string' }, 'workbench-data': { type: 'string' }, pairs: { type: 'string' }, oil: { type: 'boolean' }, options: { type: 'boolean' },
-    monitor: { type: 'boolean' }, asset: { type: 'boolean' }, 'asset-owner': { type: 'string' }, 'data-dir': { type: 'string' }, 'dry-run': { type: 'boolean' },
+    monitor: { type: 'boolean' }, 'monitor-alerts': { type: 'boolean' }, asset: { type: 'boolean' }, 'asset-owner': { type: 'string' }, 'data-dir': { type: 'string' }, 'dry-run': { type: 'boolean' },
   } });
-  const withOil = values.oil === true, withOptions = values.options === true, withMonitor = values.monitor === true, withAsset = values.asset === true;
+  // --monitor-alerts brings the monitor along: the tiers only run with it.
+  const withAlerts = values['monitor-alerts'] === true;
+  const withOil = values.oil === true, withOptions = values.options === true, withMonitor = values.monitor === true || withAlerts, withAsset = values.asset === true;
   const modules = withOil || withOptions || withMonitor || withAsset;
   const assetOwner = values['asset-owner'], dataDir = values['data-dir'];
   if (assetOwner !== undefined && !withAsset) throw new Error('--asset-owner 须和 --asset 一起使用');
   if (assetOwner !== undefined && !ASSET_OWNER.test(assetOwner)) throw new Error('--asset-owner 须为工作台资产用户名（1–64 个字符，字母、数字或 . _ @ -，以字母或数字开头）');
   if (withAsset && (dataDir === undefined || !isAbsolute(dataDir))) throw new Error('--asset 需要 --data-dir <本服务数据目录的绝对路径>');
+  if (withAlerts && (dataDir === undefined || !isAbsolute(dataDir))) throw new Error('--monitor-alerts 需要 --data-dir <本服务数据目录的绝对路径>');
   // --oil / --options / --monitor / --asset alone bring their part only; pairs come along when named.
   const only = values.pairs ? values.pairs.split(',').map(item => item.trim()).filter(Boolean) : modules ? [] : undefined;
   const envFile = values['workbench-env'] ?? WORKBENCH_ENV;
@@ -669,11 +681,12 @@ async function main(): Promise<void> {
   const oilSource = withOil ? readWorkbenchOil(source.data) : undefined;
   const optionsSource = withOptions ? await resolveOptionsAccount(readWorkbenchOptions(envFile, source.data)) : undefined;
   const monitorSource = withMonitor ? readWorkbenchMonitor(source.data) : undefined;
+  const alertsSource = withAlerts ? readWorkbenchAlerts(source.data) : undefined;
   const assetSource = withAsset ? readWorkbenchAsset(source.data, dataDir!, assetOwner === undefined ? {} : { owner: assetOwner }) : undefined;
   const { configFile, secretsFile, existing } = readExisting(values.config ?? '');
 
   const plan = planImport(source, existing, { secretsFile, ...(only ? { only } : {}), ...(oilSource ? { oil: oilSource } : {}), ...(optionsSource ? { options: optionsSource } : {}),
-    ...(monitorSource ? { monitor: monitorSource } : {}), ...(assetSource ? { asset: assetSource } : {}), ...(assetOwner === undefined ? {} : { assetOwner }) });
+    ...(monitorSource ? { monitor: monitorSource } : {}), ...(alertsSource ? { monitorAlerts: alertsSource } : {}), ...(assetSource ? { asset: assetSource } : {}), ...(assetOwner === undefined ? {} : { assetOwner }) });
   const out = (line: string): void => { process.stdout.write(line + '\n'); };
   if (!modules || (only?.length ?? 0) > 0) out(`工作台数据库：${source.database}（只读）`);
   if (oilSource) out(`工作台执行账户：${oilSource.hub}（只读）`);
@@ -684,6 +697,11 @@ async function main(): Promise<void> {
   for (const item of plan.oil) out(item.status === 'added' ? `导入原油执行账户 ${item.detail}` : `跳过原油执行账户 ${VENUE_NAMES[item.venue]}${item.accountId ? ` ${item.accountId}` : ''}：${item.detail}`);
   if (plan.options) out(plan.options.status === 'added' ? `导入期权账户 ${plan.options.detail}` : `跳过期权账户${plan.options.accountId ? ` ${plan.options.accountId}` : ''}：${plan.options.detail}`);
   if (plan.monitor) out(plan.monitor.status === 'added' ? `启用行情监控 ${plan.monitor.detail}` : `跳过行情监控：${plan.monitor.detail}`);
+  if (plan.monitorAlerts) {
+    out(plan.monitorAlerts.status === 'added' ? `导入行情告警：${plan.monitorAlerts.detail}` : `跳过行情告警：${plan.monitorAlerts.detail}`);
+    for (const entry of plan.monitorAlerts.markets) for (const line of entry.problem ? [`未导入：${entry.problem}`] : entry.notes) out(`  ${ALERT_SPECS[entry.market].title}告警 ${line}`);
+    if (plan.monitorAlerts.robot.problem && !plan.monitorAlerts.robot.imported) out(`  机器人未导入：${plan.monitorAlerts.robot.problem}`);
+  }
   if (plan.asset) {
     out(plan.asset.status === 'added' ? `导入资产账本 ${plan.asset.detail}` : `跳过资产账本：${plan.asset.detail}`);
     // Which user's ledger is not guessed: nothing is written until one is named.
@@ -691,9 +709,9 @@ async function main(): Promise<void> {
   }
   for (const line of plan.notes) out(line);
   const oilAdded = plan.oil.filter(item => item.status === 'added').length, optionsAdded = plan.options?.status === 'added';
-  const monitorAdded = plan.monitor?.status === 'added', assetAdded = plan.asset?.status === 'added';
-  if (plan.added.length === 0 && oilAdded === 0 && !optionsAdded && !monitorAdded && !assetAdded) {
-    const what = only?.length || !modules ? '配对' : [withOil ? '原油执行账户' : '', withOptions ? '期权账户' : '', withMonitor ? '行情监控' : '', withAsset ? '资产账本' : ''].filter(Boolean).join('或');
+  const monitorAdded = plan.monitor?.status === 'added', assetAdded = plan.asset?.status === 'added', alertsAdded = plan.monitorAlerts?.status === 'added';
+  if (plan.added.length === 0 && oilAdded === 0 && !optionsAdded && !monitorAdded && !assetAdded && !alertsAdded) {
+    const what = only?.length || !modules ? '配对' : [withOil ? '原油执行账户' : '', withOptions ? '期权账户' : '', withMonitor ? withAlerts ? '行情监控与告警' : '行情监控' : '', withAsset ? '资产账本' : ''].filter(Boolean).join('或');
     if (!existing) throw new Error(only?.length || !modules ? '工作台里没有可导入的配对（需开启保证金平衡、配好主账户凭据前缀且凭据齐全），未生成配置' : `工作台里没有可导入的${what}，未生成配置`);
     out(`没有新的${what}，配置未改动`);
     return;
@@ -705,14 +723,17 @@ async function main(): Promise<void> {
     out(`已写入资产账本 ${join(dataDir!, 'asset.sqlite')}：用户 ${last.owner}，资产 ${last.assets} 条、快照 ${last.snapshots} 条`);
     for (const line of connectionLines(last.connections)) out(line);
   }
+  // Then the tiers, likewise before the files: the running service applies them within 10 s, a restarted one at start.
+  if (plan.alertWrite) out(`已写入${alertsLine(writeMonitorAlertsAsService(dataDir!, plan.alertWrite))}，行情监控运行后 10 秒内生效`);
   if (filesUnchanged(plan, existing)) {
-    out('配置未改动（资产账本已启用，只重新导入了账本；服务无需重启，页面下次读取即是新账本）');
+    out(plan.ledger ? '配置未改动（资产账本已启用，只重新导入了账本；服务无需重启，页面下次读取即是新账本）' : '配置未改动，服务无需重启');
     return;
   }
   // Keys first, so the config never names a key file that lacks its accounts.
   writeBoth(secretsFile, fileText(plan.secrets), configFile, fileText(plan.config));
   const what = [plan.added.length ? '导入的配对登记为停用，在工作台删除该配对后到本项目页面启用' : '', oilAdded ? '原油执行账户已写入，服务启动后页面出现「原油」标签' : '', optionsAdded ? '期权账户已写入，服务启动后页面出现「期权」标签' : '',
-    monitorAdded ? '行情监控已写入，服务启动后页面出现「行情监控」标签' : '', assetAdded && existing?.config.asset === undefined ? '资产账本已启用，服务启动后页面出现「资产」标签' : ''].filter(Boolean).join('；');
+    monitorAdded ? '行情监控已写入，服务启动后页面出现「行情监控」标签' : '', assetAdded && existing?.config.asset === undefined ? '资产账本已启用，服务启动后页面出现「资产」标签' : '',
+    plan.monitorAlerts?.robot.changes ? '行情告警机器人已写入 secrets.json 的 feishuMonitor，服务重启后生效' : ''].filter(Boolean).join('；');
   out(`已写入 ${configFile} 与 ${secretsFile}；${what}`);
 }
 

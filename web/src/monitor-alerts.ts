@@ -6,10 +6,13 @@ export type AlertMarket = 'oil' | 'hynix';
 export type AlertOperator = 'gte' | 'lte' | 'both';
 export interface AlertRule { id: string; label: string; metric: string; operator: AlertOperator; threshold: number; cooldownMinutes: number; hysteresis: number; enabled: boolean }
 export interface AlertConfig { enabled: boolean; rules: AlertRule[] }
-export type AlertStatus = 'sent' | 'failed' | 'queued' | 'retrying' | 'expired' | 'unqueued' | 'unknown';
-export interface AlertHistoryItem { id: string; time: string; kind: 'alert' | 'test'; status: AlertStatus; rules: { label: string; metric: string; operator: 'gte' | 'lte'; threshold: number; value: number }[]; error: string }
+export type AlertStatus = 'sent' | 'failed' | 'queued' | 'retrying' | 'expired' | 'unqueued' | 'unknown' | 'applied';
+/** One history line; an `import` (M-3b) carries the tiers imported (count) and the master switch they came with. */
+export interface AlertHistoryItem { id: string; time: string; kind: 'alert' | 'test' | 'import'; status: AlertStatus; rules: { label: string; metric: string; operator: 'gte' | 'lte'; threshold: number; value: number }[]; error: string; count?: number; enabled?: boolean }
+/** secrets.json's robot the alerts go to (M-3b): the monitor's own `feishuMonitor`, else the ASTER robot `feishu`. */
+export type AlertRobot = 'feishuMonitor' | 'feishu';
 export interface AlertView {
-  market: AlertMarket; revision: number; config: AlertConfig; robotConfigured: boolean; checkedAt: string | null; lastValidAt: string | null;
+  market: AlertMarket; revision: number; config: AlertConfig; robotConfigured: boolean; robot: AlertRobot | null; checkedAt: string | null; lastValidAt: string | null;
   values: Record<string, number> | null; error: string | null; notice: string | null; history: AlertHistoryItem[];
 }
 
@@ -51,7 +54,7 @@ export const newRule = (market: AlertMarket, config: AlertConfig): AlertRule => 
   return { id: newRuleId(), label: `档位 ${config.rules.length + 1}`, metric: spec.metrics[0]!.id, operator: 'gte', threshold: Number.NaN, ...spec.defaults, enabled: true };
 };
 
-const STATUSES: readonly AlertStatus[] = ['sent', 'failed', 'queued', 'retrying', 'expired', 'unqueued', 'unknown'];
+const STATUSES: readonly AlertStatus[] = ['sent', 'failed', 'queued', 'retrying', 'expired', 'unqueued', 'unknown', 'applied'];
 const bad = (): never => { throw new Error('告警状态格式无法识别，稍后自动重试'); };
 const object = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : bad();
 const finite = (value: unknown): number => typeof value === 'number' && Number.isFinite(value) ? value : bad();
@@ -70,16 +73,21 @@ export function alertView(raw: unknown): AlertView {
   const view = object(raw), config = object(view.config);
   const market = view.market === 'oil' || view.market === 'hynix' ? view.market : bad();
   if (!Number.isSafeInteger(view.revision) || typeof config.enabled !== 'boolean' || !Array.isArray(config.rules) || typeof view.robotConfigured !== 'boolean' || !Array.isArray(view.history)) bad();
+  // Absent from a service before M-3b: the robot it had was `feishu`.
+  const robot = view.robot === undefined ? (view.robotConfigured ? 'feishu' : null) : view.robot === null || view.robot === 'feishu' || view.robot === 'feishuMonitor' ? view.robot : bad();
+  if ((robot !== null) !== view.robotConfigured) bad();
   const values = view.values === null ? null : Object.fromEntries(Object.entries(object(view.values)).map(([key, value]) => [key, finite(value)]));
   return {
-    market, revision: view.revision as number, config: { enabled: config.enabled as boolean, rules: (config.rules as unknown[]).map(rule) }, robotConfigured: view.robotConfigured as boolean,
+    market, revision: view.revision as number, config: { enabled: config.enabled as boolean, rules: (config.rules as unknown[]).map(rule) }, robotConfigured: view.robotConfigured as boolean, robot,
     checkedAt: nullableText(view.checkedAt), lastValidAt: nullableText(view.lastValidAt), values, error: nullableText(view.error), notice: nullableText(view.notice),
     history: (view.history as unknown[]).map(raw => {
       const item = object(raw);
       const status = STATUSES.includes(item.status as AlertStatus) ? item.status as AlertStatus : bad();
-      const kind = item.kind === 'alert' || item.kind === 'test' ? item.kind : bad();
+      const kind = item.kind === 'alert' || item.kind === 'test' || item.kind === 'import' ? item.kind : bad();
+      if ((kind === 'import') !== (status === 'applied')) bad();
+      const imported = kind === 'import' ? { count: finite(item.count), enabled: typeof item.enabled === 'boolean' ? item.enabled : bad() } : {};
       const rules = Array.isArray(item.rules) ? item.rules.map(raw => { const r = object(raw); return { label: text(r.label), metric: text(r.metric), operator: r.operator === 'lte' || r.operator === 'gte' ? r.operator as 'gte' | 'lte' : bad(), threshold: finite(r.threshold), value: finite(r.value) }; }) : bad();
-      return { id: text(item.id), time: text(item.time), kind, status, rules, error: typeof item.error === 'string' ? item.error : '' };
+      return { id: text(item.id), time: text(item.time), kind, status, rules, error: typeof item.error === 'string' ? item.error : '', ...imported };
     }),
   };
 }
@@ -90,11 +98,12 @@ export const alertViewFor = (market: AlertMarket) => (raw: unknown): AlertView =
   return view.market === market ? view : bad();
 };
 
-export const STATUS_LABELS: Record<AlertStatus, string> = { sent: '已发送', failed: '发送失败', queued: '排队待发', retrying: '发送失败，自动重试中', expired: '已超出队列保留期（7 天）', unqueued: '未进入队列', unknown: '发送状态读取失败' };
+export const STATUS_LABELS: Record<AlertStatus, string> = { sent: '已发送', failed: '发送失败', queued: '排队待发', retrying: '发送失败，自动重试中', expired: '已超出队列保留期（7 天）', unqueued: '未进入队列', unknown: '发送状态读取失败', applied: '已导入' };
 
 /** One history line: the tiers reached with the values judged. */
 export function historyText(market: AlertMarket, item: AlertHistoryItem): string {
   if (item.kind === 'test') return '测试消息';
+  if (item.kind === 'import') return `从工作台导入 ${item.count ?? 0} 档（总开关${item.enabled ? '开' : '关'}），替换了原有档位`;
   const metrics = ALERT_MARKETS[market].metrics;
   return item.rules.map(r => {
     const metric = metrics.find(m => m.id === r.metric);

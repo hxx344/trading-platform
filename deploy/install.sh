@@ -15,6 +15,9 @@
 #   sudo bash install.sh --import-workbench --monitor --asset [--asset-owner <用户>]
 #                                             启用行情监控（股数取默认值），并把工作台资产账本导入本服务数据目录（账本有多个
 #                                             用户时用 --asset-owner 指定）；两项可分开用，也可与 --oil、--options、--pairs 同用
+#   sudo bash install.sh --import-workbench --monitor-alerts
+#                                             同时启用行情监控，并导入工作台行情监控的原油 / 海力士告警档位（替换本服务现有档位）
+#                                             与飞书机器人（写入 secrets.json 的 feishuMonitor）；回滚到 v0.29.x 前须先删掉 feishuMonitor
 #   sudo bash install.sh --set-password       设置或更换页面登录密码（输入两次，不回显；只存 scrypt 摘要，已登录的页面须重新登录；
 #                                             沿用当前已装版本，不联网升级；脚本化时加 --password-stdin 从标准输入读一行）
 #
@@ -80,6 +83,7 @@ import_pairs=''
 import_oil=0
 import_options=0
 import_monitor=0
+import_monitor_alerts=0
 import_asset=0
 asset_owner=''
 set_password=0
@@ -92,6 +96,7 @@ while (($#)); do
     --oil) import_oil=1; shift ;;
     --options) import_options=1; shift ;;
     --monitor) import_monitor=1; shift ;;
+    --monitor-alerts) import_monitor_alerts=1; shift ;;
     --asset) import_asset=1; shift ;;
     --asset-owner) [[ $# -ge 2 ]] || usage 2; asset_owner=$2; shift 2 ;;
     --set-password) set_password=1; shift ;;
@@ -108,6 +113,7 @@ done
 ((import_workbench || !import_oil)) || fail '--oil 须和 --import-workbench 一起使用'
 ((import_workbench || !import_options)) || fail '--options 须和 --import-workbench 一起使用'
 ((import_workbench || !import_monitor)) || fail '--monitor 须和 --import-workbench 一起使用'
+((import_workbench || !import_monitor_alerts)) || fail '--monitor-alerts 须和 --import-workbench 一起使用'
 ((import_workbench || !import_asset)) || fail '--asset 须和 --import-workbench 一起使用'
 ((import_asset)) || [[ -z "$asset_owner" ]] || fail '--asset-owner 须和 --asset 一起使用'
 ((set_password || !password_stdin)) || fail '--password-stdin 须和 --set-password 一起使用'
@@ -259,6 +265,7 @@ if ((import_workbench)); then
   if ((import_oil)); then grep -q 'readWorkbenchOil' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --oil，请用最新版本导入"; fi
   if ((import_options)); then grep -q 'readWorkbenchOptions' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --options，请用最新版本导入"; fi
   if ((import_monitor)); then grep -q 'readWorkbenchMonitor' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --monitor，请用最新版本导入"; fi
+  if ((import_monitor_alerts)); then grep -q 'readWorkbenchAlerts' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --monitor-alerts，请用最新版本导入"; fi
   if ((import_asset)); then grep -q 'readWorkbenchAsset' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --asset，请用最新版本导入"; fi
   # The files the import may write: config.json and the key file it names (always in this directory).
   mkdir "$work_dir/conf-before"
@@ -279,8 +286,10 @@ if ((import_workbench)); then
   ((!import_oil)) || import_args+=(--oil)
   ((!import_options)) || import_args+=(--options)
   ((!import_monitor)) || import_args+=(--monitor)
-  # The ledger goes into the service's data directory, written by the importer as that directory's owner.
-  ((!import_asset)) || import_args+=(--asset --data-dir "$DATA_DIR")
+  ((!import_monitor_alerts)) || import_args+=(--monitor-alerts)
+  # The ledger and the alert tiers go into the service's data directory, written by the importer as that directory's owner.
+  ((!import_asset)) || import_args+=(--asset)
+  ((!import_asset && !import_monitor_alerts)) || import_args+=(--data-dir "$DATA_DIR")
   [[ -z "$asset_owner" ]] || import_args+=(--asset-owner "$asset_owner")
   # The service's proxy settings (KEY=VALUE lines, as systemd reads them): importing the options account reads Bybit once.
   import_env=()

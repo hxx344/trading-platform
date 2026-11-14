@@ -23,6 +23,9 @@ import { VENUE_NAMES } from '../contracts.ts';
 import type { FetchLike } from '../live/http.ts';
 import { readWorkbenchOptions, resolveOptionsAccount, type OptionsSource } from './import-options.ts';
 import { connectionLines, readWorkbenchAsset, readWorkbenchMonitor, writeLedgerAsService, type AssetSource, type LedgerWrite, type WrittenLedger } from './import-modules.ts';
+import { alertsLine, readWorkbenchAlerts, writeMonitorAlertsAsService, type MonitorAlertsSource } from './import-monitor-alerts.ts';
+import type { AlertImport } from '../monitor/alert-import.ts';
+import type { AlertMarket } from '../monitor/alerts.ts';
 
 /** Requests handled in one start; one that arrives while the last is handled is still taken. */
 const MAX_PER_START = 5;
@@ -51,6 +54,8 @@ export interface HelperOptions {
   procDir?: string;
   /** Writes the asset ledger rows into asset.sqlite (tests); import-writer.ts as the data directory's owner by default. */
   writeLedger?: (dataDir: string, write: LedgerWrite) => Promise<WrittenLedger> | WrittenLedger;
+  /** Writes the alert tiers into monitor.sqlite (tests); import-writer.ts as the data directory's owner by default. */
+  writeAlerts?: (dataDir: string, write: AlertImport) => Promise<{ market: AlertMarket; rules: number; enabled: boolean }[]> | { market: AlertMarket; rules: number; enabled: boolean }[];
   now?: () => number;
   log?: (line: string) => void;
 }
@@ -211,6 +216,7 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
   const wantsOptions = request.action === 'preview' || request.options === true;
   const wantsMonitor = request.action === 'preview' || request.monitor === true;
   const wantsAsset = request.action === 'preview' || request.asset === true;
+  const wantsAlerts = request.action === 'preview' || request.monitorAlerts === true;
   const pairsWanted = request.action === 'preview' || (request.pairs?.length ?? 0) > 0;
   let source: ReturnType<typeof readWorkbench>, files: ReturnType<typeof readExisting>;
   try {
@@ -230,19 +236,23 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
   const monitor = wantsMonitor ? readWorkbenchMonitor(source.data) : undefined;
   let asset: AssetSource | undefined, assetError: string | undefined;
   if (wantsAsset) { try { asset = readWorkbenchAsset(source.data, options.dataDir, request.assetOwner === undefined ? {} : { owner: request.assetOwner }); } catch (error) { assetError = message(error); } }
-  const oilReport = { ...(oilError !== undefined ? { oilError } : {}), ...(optionsError !== undefined ? { optionsError } : {}), ...(assetError !== undefined ? { assetError } : {}) };
-  const withOptions = { ...(optionsSource ? { options: optionsSource } : {}), ...(monitor ? { monitor } : {}), ...(asset ? { asset } : {}) };
+  // The alert files likewise (only names, counts and reasons reach the answer).
+  let alerts: MonitorAlertsSource | undefined, monitorAlertsError: string | undefined;
+  if (wantsAlerts) { try { alerts = readWorkbenchAlerts(source.data); } catch (error) { monitorAlertsError = message(error); } }
+  const oilReport = { ...(oilError !== undefined ? { oilError } : {}), ...(optionsError !== undefined ? { optionsError } : {}), ...(assetError !== undefined ? { assetError } : {}), ...(monitorAlertsError !== undefined ? { monitorAlertsError } : {}) };
+  const withOptions = { ...(optionsSource ? { options: optionsSource } : {}), ...(monitor ? { monitor } : {}), ...(alerts ? { monitorAlerts: alerts } : {}), ...(asset ? { asset } : {}) };
   if (request.action === 'preview') {
     try {
-      const { items, oil: oilItems, options: optionsItem, monitor: monitorItem, asset: assetItem, notes } = previewImport(source, files.existing, { secretsFile: files.secretsFile, ...(oil ? { oil } : {}), ...withOptions });
+      const { items, oil: oilItems, options: optionsItem, monitor: monitorItem, monitorAlerts: alertsItem, asset: assetItem, notes } = previewImport(source, files.existing, { secretsFile: files.secretsFile, ...(oil ? { oil } : {}), ...withOptions });
       const pairsLine = items.length ? `工作台有 ${items.length} 个配对，其中 ${items.filter(item => item.importable).length} 个可以导入` : '工作台里没有 ASTER 保证金平衡配对';
       const oilLine = oil ? `；原油执行账户 ${oilItems.length} 个，其中 ${oilItems.filter(item => item.status === 'added').length} 个可以导入` : '';
       const optionsLine = optionsItem ? `；期权账户${optionsItem.status === 'added' ? '可以导入' : '不能导入'}` : '';
       const monitorLine = monitorItem ? `；行情监控${monitorItem.status === 'added' ? '可以启用' : monitorItem.enabled ? '已启用' : '不能启用'}` : '';
+      const alertsLinePreview = alertsItem ? `；行情告警${alertsItem.status === 'added' ? '可以导入' : '不能导入'}` : '';
       const ready = assetItem?.owners.filter(item => item.importable).length ?? 0;
       const assetLine = assetItem ? `；资产账本${ready ? `可以导入（${ready} 个用户）` : '不能导入'}` : '';
-      answer({ phase: 'done', message: pairsLine + oilLine + optionsLine + monitorLine + assetLine, database: source.database, preview: items, ...(oil ? { oil: oilItems } : {}), ...(optionsItem ? { options: optionsItem } : {}),
-        ...(monitorItem ? { monitor: monitorItem } : {}), ...(assetItem ? { asset: assetItem } : {}), ...oilReport, notes });
+      answer({ phase: 'done', message: pairsLine + oilLine + optionsLine + monitorLine + alertsLinePreview + assetLine, database: source.database, preview: items, ...(oil ? { oil: oilItems } : {}), ...(optionsItem ? { options: optionsItem } : {}),
+        ...(monitorItem ? { monitor: monitorItem } : {}), ...(alertsItem ? { monitorAlerts: alertsItem } : {}), ...(assetItem ? { asset: assetItem } : {}), ...oilReport, notes });
     } catch (error) { answer({ phase: 'failed', message: message(error), ...oilReport }); }
     return;
   }
@@ -255,20 +265,20 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
   try { plan = planImport(source, files.existing, { secretsFile: files.secretsFile, only: request.pairs ?? [], requireMargin: true, ...(oil ? { oil } : {}), ...withOptions, ...(request.assetOwner === undefined ? {} : { assetOwner: request.assetOwner }) }); }
   catch (error) { answer({ phase: 'failed', message: message(error), ...oilReport }); return; }
   const oilAdded = plan.oil.filter(item => item.status === 'added').map(item => VENUE_NAMES[item.venue]);
-  const optionsAdded = plan.options?.status === 'added', monitorAdded = plan.monitor?.status === 'added', assetAdded = plan.asset?.status === 'added';
+  const optionsAdded = plan.options?.status === 'added', monitorAdded = plan.monitor?.status === 'added', assetAdded = plan.asset?.status === 'added', alertsAdded = plan.monitorAlerts?.status === 'added';
   const assetBefore = files.existing?.config.asset !== undefined;
-  const notes = [...plan.notes, ...(oilError !== undefined ? [`原油执行账户未导入：${oilError}`] : []), ...(optionsError !== undefined ? [`期权账户未导入：${optionsError}`] : []), ...(assetError !== undefined ? [`资产账本未导入：${assetError}`] : [])];
+  const notes = [...plan.notes, ...(oilError !== undefined ? [`原油执行账户未导入：${oilError}`] : []), ...(optionsError !== undefined ? [`期权账户未导入：${optionsError}`] : []), ...(assetError !== undefined ? [`资产账本未导入：${assetError}`] : []), ...(monitorAlertsError !== undefined ? [`行情告警未导入：${monitorAlertsError}`] : [])];
   const report = { database: source.database, imported: plan.items, ...(request.oil ? { oil: plan.oil } : {}), ...(request.options && plan.options ? { options: plan.options } : {}),
-    ...(request.monitor && plan.monitor ? { monitor: plan.monitor } : {}), ...(request.asset && plan.asset ? { asset: plan.asset } : {}), ...oilReport, notes };
-  if (plan.added.length === 0 && oilAdded.length === 0 && !optionsAdded && !monitorAdded && !assetAdded) {
-    const chosen = [pairsWanted ? '所选配对' : '', request.oil ? '原油执行账户' : '', request.options ? '期权账户' : '', request.monitor ? '行情监控' : '', request.asset ? '资产账本' : ''].filter(Boolean);
+    ...(request.monitor && plan.monitor ? { monitor: plan.monitor } : {}), ...(request.monitorAlerts && plan.monitorAlerts ? { monitorAlerts: plan.monitorAlerts } : {}), ...(request.asset && plan.asset ? { asset: plan.asset } : {}), ...oilReport, notes };
+  if (plan.added.length === 0 && oilAdded.length === 0 && !optionsAdded && !monitorAdded && !alertsAdded && !assetAdded) {
+    const chosen = [pairsWanted ? '所选配对' : '', request.oil ? '原油执行账户' : '', request.options ? '期权账户' : '', request.monitor ? '行情监控' : '', request.monitorAlerts ? '行情告警' : '', request.asset ? '资产账本' : ''].filter(Boolean);
     answer({ phase: 'failed', message: `${chosen.join('与')}${chosen.length > 1 || pairsWanted ? '都' : ''}不能导入，配置未改动`, ...report });
     return;
   }
   const what = [plan.added.length ? `${plan.added.length} 个配对` : '', oilAdded.length ? `原油执行账户（${oilAdded.join('、')}）` : '', optionsAdded ? `期权账户（Bybit ${plan.options?.accountId ?? ''}）` : '',
-    monitorAdded ? '行情监控' : '', assetAdded ? `资产账本（用户 ${plan.asset?.owner ?? ''}）` : ''].filter(Boolean).join('与');
+    monitorAdded ? '行情监控' : '', alertsAdded ? (plan.alertWrite ? (plan.monitorAlerts?.robot.changes ? '行情告警档位与机器人' : '行情告警档位') : plan.monitorAlerts?.robot.changes ? '行情告警机器人' : '') : '', assetAdded ? `资产账本（用户 ${plan.asset?.owner ?? ''}）` : ''].filter(Boolean).join('与');
   const after = [plan.added.length ? '配对登记为停用：先在旧工作台删除该配对，再在本页面启用' : '', oilAdded.length ? '原油执行账户已生效，页面出现「原油」标签' : '', optionsAdded ? '期权账户已生效，页面出现「期权」标签' : '',
-    monitorAdded ? '行情监控已生效，页面出现「行情监控」标签' : '', assetAdded && !assetBefore ? '资产账本已生效，页面出现「资产」标签' : ''].filter(Boolean).join('；');
+    monitorAdded ? '行情监控已生效，页面出现「行情监控」标签' : '', plan.alertWrite ? '行情监控 10 秒内换上导入的告警档位' : '', assetAdded && !assetBefore ? '资产账本已生效，页面出现「资产」标签' : ''].filter(Boolean).join('；');
   // The ledger first (docs/module-import.md §3): when it fails nothing has changed; once written it is whole, and stays
   // whatever becomes of the config (without `asset` the service does not read it).
   let ledgerLine = '';
@@ -281,11 +291,23 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
       for (const line of connectionLines(last.connections)) { notes.push(line); log(line); }
     } catch (error) { answer({ phase: 'failed', message: `${message(error)}；配置未改动，本次没有导入任何内容，可重试`, ...report }); return; }
   }
+  // Then the tiers: they wait in monitor.sqlite as alerts.<market>.import and the monitor takes them on its next check
+  // (src/monitor/alerts.ts applyPending), so a running service picks them up without a restart and nothing it saves
+  // can overwrite them. When they fail, the ledger written above stays and the config is left as it is.
+  let tiersLine = '';
+  if (plan.alertWrite) {
+    try {
+      tiersLine = alertsLine(await (options.writeAlerts ?? writeMonitorAlertsAsService)(options.dataDir, plan.alertWrite));
+      log(`已写入${tiersLine}`);
+    } catch (error) { answer({ phase: 'failed', message: `${message(error)}；配置未改动${ledgerLine ? `（${ledgerLine}已写入并保留）` : '，本次没有导入任何内容'}，可重试`, ...report }); return; }
+  }
   if (filesUnchanged(plan, files.existing)) {
-    answer({ phase: 'done', message: `已重新导入${ledgerLine}；配置未改动，未重启服务，资产页下次读取即是新账本`, ...report });
+    const doneWhat = [ledgerLine, tiersLine].filter(Boolean).join('与');
+    const effect = [ledgerLine ? '资产页下次读取即是新账本' : '', tiersLine ? '行情监控 10 秒内换上新档位' : ''].filter(Boolean).join('，');
+    answer({ phase: 'done', message: doneWhat ? `已重新导入${doneWhat}；配置未改动，未重启服务，${effect}` : '工作台的行情告警机器人已在本服务配置中，配置未改动，未重启服务', ...report });
     return;
   }
-  const kept = plan.ledger ? '。资产账本已写入并保留（配置已恢复时服务按原配置运行），重新勾选导入即可' : '';
+  const kept = [plan.ledger ? '资产账本已写入并保留（配置已恢复时服务按原配置运行），重新勾选导入即可' : '', tiersLine ? `${tiersLine}已写入，行情监控运行时换上` : ''].filter(Boolean).map(line => `。${line}`).join('');
   const undo = undoFile(files.configFile);
   const written = { config: fileText(plan.config), secrets: fileText(plan.secrets) };
   const record: Undo = { requestId: request.id, bootId: bootId(), at: now(), configFile: resolve(files.configFile), secretsFile: resolve(files.secretsFile), text: files.text, written: { config: sha256(written.config), secrets: sha256(written.secrets) } };

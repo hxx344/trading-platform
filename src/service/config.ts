@@ -48,6 +48,8 @@ export interface ServiceSecrets {
   accounts: Map<string, AsterCredentials>; feishu: FeishuSecret | null;
   /** The robot for the scheduled summary (the workbench's 定时 channel); without one the summary goes to `feishu`. */
   feishuScheduled?: FeishuSecret | null;
+  /** The robot for the market monitor's threshold alerts (the workbench's 统一飞书告警 robot); without one they go to `feishu`. */
+  feishuMonitor?: FeishuSecret | null;
   /** Keys of the oil accounts' venues; only with oil configured. */ exchanges?: Map<Venue, LiveCredentials>;
   /** The options module's Bybit key; only with options configured. */ bybitOptions?: LiveCredentials;
 }
@@ -179,7 +181,7 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
 }
 
 export function parseServiceSecrets(raw: unknown, needed: readonly string[], oilVenues: readonly Venue[] = [], options = false): ServiceSecrets {
-  const value = exactKeys(raw, ['accounts'], ['feishu', 'feishuScheduled', ...(oilVenues.length ? ['binance', 'bybit'] : []), ...(options ? ['bybitOptions'] : [])]);
+  const value = exactKeys(raw, ['accounts'], ['feishu', 'feishuScheduled', 'feishuMonitor', ...(oilVenues.length ? ['binance', 'bybit'] : []), ...(options ? ['bybitOptions'] : [])]);
   if (value.accounts === null || typeof value.accounts !== 'object' || Array.isArray(value.accounts)) throw new Error('accounts 须为 { 账户名: { user, signer, privateKey } }');
   const accounts = new Map<string, AsterCredentials>();
   for (const [name, item] of Object.entries(value.accounts as Record<string, unknown>)) {
@@ -191,7 +193,8 @@ export function parseServiceSecrets(raw: unknown, needed: readonly string[], oil
   if (new Set(users).size !== users.length) throw new Error('两个账户名指向同一个钱包地址');
   const feishu = parseFeishu(value.feishu, 'feishu');
   const feishuScheduled = parseFeishu(value.feishuScheduled, 'feishuScheduled');
-  return { accounts, feishu, ...(feishuScheduled ? { feishuScheduled } : {}), ...(oilVenues.length ? { exchanges: parseOilSecrets(value, oilVenues) } : {}), ...(options ? { bybitOptions: parseOptionsSecrets(value) } : {}) };
+  const feishuMonitor = parseFeishu(value.feishuMonitor, 'feishuMonitor');
+  return { accounts, feishu, ...(feishuScheduled ? { feishuScheduled } : {}), ...(feishuMonitor ? { feishuMonitor } : {}), ...(oilVenues.length ? { exchanges: parseOilSecrets(value, oilVenues) } : {}), ...(options ? { bybitOptions: parseOptionsSecrets(value) } : {}) };
 }
 
 function parseFeishu(raw: unknown, name: string): FeishuSecret | null {

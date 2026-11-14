@@ -308,7 +308,7 @@ test('导入助手：预览列出行情监控与资产账本；先写账本再�
 
     const shown = await run({ action: 'preview' });
     assert.equal(shown.phase, 'done', shown.message);
-    assert.match(shown.message, /行情监控可以启用；资产账本可以导入（2 个用户）/);
+    assert.match(shown.message, /行情监控可以启用；行情告警不能导入；资产账本可以导入（2 个用户）/);
     assert.deepEqual([shown.monitor?.status, shown.asset?.owners.map(item => item.owner)], ['added', [OWNER, OTHER_OWNER]]);
     assert.equal(readFileSync(configFile, 'utf8'), first, '预览不写文件');
     noLedgerContent(readFileSync(join(dir, 'result.json'), 'utf8'));

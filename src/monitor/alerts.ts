@@ -3,6 +3,8 @@
 // then delivers it with its own retries. The rules are the workbench's oil rules (server/oil/config.mjs at 31242e0), shared by
 // both markets: one alert per crossing, a hysteresis band before the next one, a cooldown across crossings, and two-way tiers
 // that report crossings only. Config, crossing states and the recent history sit in monitor.sqlite's key-value table.
+// M-3b: tiers imported from the workbench wait under `alerts.<market>.import` (written by import-writer.ts as the service
+// account); the running service applies them on its next check and removes the key in the same transaction.
 import { randomUUID } from 'node:crypto';
 import { ContractError } from '../contracts.ts';
 import { oilSpread } from '../vendor/oil-market.mjs';
@@ -15,10 +17,16 @@ export interface AlertConfig { enabled: boolean; rules: AlertRule[] }
 interface Side { active: boolean; alerted: boolean }
 export interface RuleState { active: boolean; alerted: boolean; lastSentAt: number | null; sides?: { gte: Side; lte: Side } }
 export interface AlertEventRule { label: string; metric: string; operator: 'gte' | 'lte'; threshold: number; value: number }
+/** secrets.json's robot the market alerts go to: `feishuMonitor` (its own outbox) when set, else the ASTER robot `feishu`. */
+export type AlertRobot = 'feishuMonitor' | 'feishu';
 export interface AlertEvent {
-  id: string; time: string; kind: 'alert' | 'test';
+  id: string; time: string; kind: 'alert' | 'test' | 'import';
   /** alert: the tiers sent and the outbox message (null: no robot at the time, only logged). */
   rules?: AlertEventRule[]; outboxId?: number | null;
+  /** alert: the outbox the message went to; absent for `feishu` (and every event written before M-3b). */
+  robot?: 'feishuMonitor';
+  /** import: the tiers that came over and the master switch they brought. */
+  count?: number; enabled?: boolean;
   /** test: sent directly, so its result is known at once. */
   status?: 'sent' | 'failed'; error?: string;
 }
@@ -191,17 +199,35 @@ function restoreStates(config: AlertConfig, states: Record<string, unknown>): Re
 }
 const validEvent = (value: unknown): value is AlertEvent => {
   const event = value as AlertEvent | null;
-  return !!event && typeof event.id === 'string' && typeof event.time === 'string' && (event.kind === 'test' || (event.kind === 'alert' && Array.isArray(event.rules) && (event.outboxId === null || Number.isSafeInteger(event.outboxId))));
+  return !!event && typeof event.id === 'string' && typeof event.time === 'string' && (event.kind === 'test'
+    || (event.kind === 'import' && Number.isSafeInteger(event.count) && typeof event.enabled === 'boolean')
+    || (event.kind === 'alert' && Array.isArray(event.rules) && (event.outboxId === null || Number.isSafeInteger(event.outboxId)) && (event.robot === undefined || event.robot === 'feishuMonitor')));
 };
+
+/** The key an imported config waits under until the service applies it. */
+export const pendingImportKey = (market: AlertMarket): string => `alerts.${market}.import`;
+/**
+ * A waiting import older than this is dropped, not applied: the running service takes one within 10 s and a restart in
+ * the same import within a minute, so an older one was left by an import whose config change failed or by a market not
+ * running then, and must not overwrite tiers saved since when the market starts later.
+ */
+export const PENDING_IMPORT_MAX_AGE_MS = 10 * 60_000;
+export interface PendingImport { version: 1; importedAt: string; source: 'workbench'; config: AlertConfig }
+/** A waiting import as written by import-writer.ts; throws when it is not one. */
+export function parsePendingImport(market: AlertMarket, value: unknown): PendingImport {
+  const raw = value as Partial<PendingImport> | null;
+  if (!raw || typeof raw !== 'object' || raw.version !== 1 || raw.source !== 'workbench' || typeof raw.importedAt !== 'string' || !Number.isFinite(Date.parse(raw.importedAt))) throw new Error('导入记录格式无效');
+  return { version: 1, importedAt: raw.importedAt, source: 'workbench', config: validateAlertConfig(market, raw.config) };
+}
 
 export interface AlertDelivery { sentAt: number | null; attempts: number; lastError: string | null; nextAt: number }
 export interface AlertHooks {
-  /** Queues the text in the Feishu outbox; its id, or null without a robot. Throws when the outbox cannot be written. */
+  /** Queues the text in the current robot's outbox; its id, or null without a robot. Throws when the outbox cannot be written. */
   notify(text: string): number | null;
-  /** Delivery of queued messages by id; a missing id has left the outbox. */
-  delivery(ids: readonly number[]): Map<number, AlertDelivery>;
-  /** Whether a robot is configured. */
-  robot(): boolean;
+  /** Delivery of queued messages by id in that robot's outbox; a missing id has left the outbox. */
+  delivery(ids: readonly number[], robot: AlertRobot): Map<number, AlertDelivery>;
+  /** The robot alerts go to, or null without one. */
+  robot(): AlertRobot | null;
   /** Posts a test message directly (not queued); rejects with the robot's answer. */
   test(text: string): Promise<void>;
 }
@@ -247,6 +273,41 @@ export function createAlertService({ market, store, quote, hooks, gate, now = Da
   let storageError: string | null = null;
   let lastLogged: string | null = null;
   const note = (reason: string | null) => { if (reason !== lastLogged) { if (reason) log(`${spec.title}告警：${reason}`); else if (lastLogged) log(`${spec.title}告警：已恢复`); lastLogged = reason; } };
+  /** Set while a waiting import cannot be applied (logged once); retried every check. */
+  let importError: string | null = null;
+
+  /**
+   * Applies tiers imported from the workbench: they replace the saved config like a page save from scratch (every crossing
+   * state starts over, two-way tiers as already reported), the history keeps its entries plus one for the import, and the
+   * saved value and the removal of the waiting key are one transaction, so an import is applied exactly once. A waiting
+   * value that does not parse is removed with a log line; one that cannot be written stays for the next check.
+   */
+  function applyPending(): void {
+    const name = pendingImportKey(market);
+    let pending: PendingImport;
+    try {
+      const value = store.readState(name)?.value ?? null;
+      if (value === null) return;
+      pending = parsePendingImport(market, value);
+      if (now() - Date.parse(pending.importedAt) > PENDING_IMPORT_MAX_AGE_MS) throw new Error(`导入于 ${pending.importedAt}，已超过 10 分钟未应用`);
+    } catch (error) {
+      log(`${spec.title}告警：从工作台导入的档位未应用，已丢弃：${brief(error)}`);
+      try { store.commitStates([], [name]); } catch { /* retried next check */ }
+      return;
+    }
+    const event: AlertEvent = { id: randomUUID(), time: new Date(now()).toISOString(), kind: 'import', count: pending.config.rules.length, enabled: pending.config.enabled };
+    const next: Saved = { version: 1, revision: saved.revision + 1, config: pending.config, states: {}, events: [event, ...saved.events].slice(0, EVENTS_KEPT) };
+    try { store.commitStates([[key, next]], [name]); }
+    catch (error) {
+      if (!importError) log(`${spec.title}告警：从工作台导入的档位暂未应用（monitor.sqlite 写入失败：${brief(error)}），每轮重试`);
+      importError = '从工作台导入的档位暂未应用：monitor.sqlite 写入失败，每轮重试';
+      return;
+    }
+    saved = next; restoreError = null; importError = null;
+    if (storageError) log(`${spec.title}告警：monitor.sqlite 已可写入，恢复提醒`);
+    storageError = null; queueError = null; queueRetryAt = 0;
+    log(`${spec.title}告警：已应用从工作台导入的档位（${pending.config.rules.length} 档，总开关${pending.config.enabled ? '开' : '关'}）`);
+  }
 
   const persist = (): boolean => {
     try {
@@ -266,6 +327,7 @@ export function createAlertService({ market, store, quote, hooks, gate, now = Da
   const record = (event: AlertEvent) => { saved.events = [event, ...saved.events].slice(0, EVENTS_KEPT); };
 
   function check(): void {
+    applyPending();
     const at = now();
     checkedAt = at;
     // A failed write is retried first; until it succeeds nothing new is queued, so a lost state cannot repeat an alert.
@@ -286,6 +348,7 @@ export function createAlertService({ market, store, quote, hooks, gate, now = Da
     saved.states = states;
     if (due.length && saved.config.enabled && hooks.robot() && at >= queueRetryAt) {
       let outboxId: number | null;
+      const robot = hooks.robot();
       try { outboxId = hooks.notify(alertMessage(market, due, read.quote, read.fetchedAt)); }
       catch (error) {
         queueError = '告警写入飞书队列失败，60 秒后重试';
@@ -296,7 +359,7 @@ export function createAlertService({ market, store, quote, hooks, gate, now = Da
       }
       queueError = null; queueRetryAt = 0;
       for (const item of due) markAlerted(states[item.rule.id]!, item.operator, at);
-      record({ id: randomUUID(), time: new Date(at).toISOString(), kind: 'alert', outboxId, rules: due.map(({ rule, operator, value }) => ({ label: rule.label, metric: rule.metric, operator, threshold: rule.threshold, value })) });
+      record({ id: randomUUID(), time: new Date(at).toISOString(), kind: 'alert', outboxId, ...(robot === 'feishuMonitor' && outboxId !== null ? { robot } : {}), rules: due.map(({ rule, operator, value }) => ({ label: rule.label, metric: rule.metric, operator, threshold: rule.threshold, value })) });
       write();
       note(null);
       return;
@@ -308,23 +371,32 @@ export function createAlertService({ market, store, quote, hooks, gate, now = Da
     if (changed) write();
   }
 
-  const robotNotice = () => hooks.robot() ? null : '尚未配置飞书机器人（secrets.json 的 feishu），档位可先保存，配置后才会发送';
+  const robotNotice = () => hooks.robot() ? null : '尚未配置飞书机器人（secrets.json 的 feishuMonitor 或 feishu），档位可先保存，配置后才会发送';
   function view() {
-    const ids = saved.events.flatMap(event => event.kind === 'alert' && typeof event.outboxId === 'number' ? [event.outboxId] : []);
-    let delivery: Map<number, AlertDelivery> | null = null;
-    try { delivery = hooks.delivery(ids); } catch { /* shown as unknown below */ }
+    const deliveries = new Map<AlertRobot, Map<number, AlertDelivery> | null>();
+    for (const robot of ['feishu', 'feishuMonitor'] as const) {
+      const ids = saved.events.flatMap(event => event.kind === 'alert' && typeof event.outboxId === 'number' && (event.robot ?? 'feishu') === robot ? [event.outboxId] : []);
+      if (!ids.length) continue;
+      try { deliveries.set(robot, hooks.delivery(ids, robot)); } catch { deliveries.set(robot, null); /* shown as unknown below */ }
+    }
+    const robot = hooks.robot();
     return {
-      market, revision: saved.revision, config: saved.config, robotConfigured: hooks.robot(),
+      market, revision: saved.revision, config: saved.config, robotConfigured: robot !== null, robot,
       checkedAt: checkedAt === null ? null : new Date(checkedAt).toISOString(), lastValidAt, values: lastValues,
-      error: storageError ?? restoreError ?? queueError ?? quoteReason, notice: robotNotice(),
+      error: storageError ?? importError ?? restoreError ?? queueError ?? quoteReason, notice: robotNotice(),
       history: saved.events.map(event => {
         if (event.kind === 'test') return { id: event.id, time: event.time, kind: 'test' as const, status: event.status ?? 'failed', rules: [], error: event.error ?? '' };
+        if (event.kind === 'import') return { id: event.id, time: event.time, kind: 'import' as const, status: 'applied' as const, rules: [], error: '', count: event.count ?? 0, enabled: event.enabled ?? false };
+        const delivery = deliveries.get(event.robot ?? 'feishu') ?? null;
         const sent = typeof event.outboxId === 'number' ? delivery?.get(event.outboxId) : undefined;
         const status = event.outboxId === null ? 'unqueued' : !delivery ? 'unknown' : !sent ? 'expired' : sent.sentAt !== null ? 'sent' : sent.attempts > 0 ? 'retrying' : 'queued';
         return { id: event.id, time: event.time, kind: 'alert' as const, status, rules: event.rules ?? [], error: status === 'retrying' ? sent?.lastError ?? '' : '' };
       }),
     };
   }
+
+  // An import that waited while the monitor was off is applied before the first view.
+  applyPending();
 
   return {
     check,
@@ -349,11 +421,11 @@ export function createAlertService({ market, store, quote, hooks, gate, now = Da
     },
     /** Posts a test message straight to the robot (POST /alerts/test). */
     async test() {
-      if (!hooks.robot()) throw new ContractError(400, 'robot_missing', '尚未配置飞书机器人：请在 secrets.json 填写 feishu 后重启服务');
+      if (!hooks.robot()) throw new ContractError(400, 'robot_missing', '尚未配置飞书机器人：请在 secrets.json 填写 feishuMonitor（或 feishu）后重启服务，也可从工作台导入');
       gate.take();
       const at = now(), time = new Date(at).toISOString();
       let failure: string | null = null;
-      try { await hooks.test(`【行情监控】飞书连接测试：原油 / 海力士阈值告警使用此机器人。${time}`); }
+      try { await hooks.test(`【行情监控】飞书连接测试：原油 / 海力士阈值告警使用此机器人（secrets.json 的 ${hooks.robot()}）。${time}`); }
       catch (error) { failure = brief(error); }
       record({ id: randomUUID(), time, kind: 'test', status: failure ? 'failed' : 'sent', ...(failure ? { error: failure } : {}) });
       write();
@@ -361,7 +433,7 @@ export function createAlertService({ market, store, quote, hooks, gate, now = Da
       return view();
     },
     /** For the status page. */
-    status: () => ({ enabled: saved.config.enabled, rules: saved.config.rules.filter(rule => rule.enabled).length, checkedAt: checkedAt === null ? null : new Date(checkedAt).toISOString(), error: storageError ?? restoreError ?? queueError ?? quoteReason }),
+    status: () => ({ enabled: saved.config.enabled, rules: saved.config.rules.filter(rule => rule.enabled).length, checkedAt: checkedAt === null ? null : new Date(checkedAt).toISOString(), error: storageError ?? importError ?? restoreError ?? queueError ?? quoteReason }),
   };
 }
 export type AlertService = ReturnType<typeof createAlertService>;

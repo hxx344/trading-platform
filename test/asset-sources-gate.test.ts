@@ -1,4 +1,4 @@
-// Copied from project_aggregation modules/asset/tests/gate.test.ts at 0014655; imports point at src/asset/sources, expectations unchanged; the connection-schema test (A-3 connection management, not this layer) is left out.
+// Copied from project_aggregation modules/asset/tests/gate.test.ts at 0014655; imports point at src/asset/sources; expectations unchanged except the unlisted-label diagnostics (see src/asset/sources/gate.ts); the connection-schema test (A-3 connection management, not this layer) is left out.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
@@ -421,7 +421,7 @@ test('Gate maps official request, currency and account labels on HTTP 400 withou
 });
 
 test('Gate distinguishes unknown codes from absent or malformed JSON labels using fixed safe diagnostics', async () => {
-  for (const label of ['FUTURE_GATE_ERROR', 'constructor', '__proto__', 'toString', 'forbidden', 'FORBIDDEN ', 'INVALID_SIGNATURE\n', sensitive]) {
+  for (const label of ['GATE_ERROR_2', 'A1B2C3D4E5F60718293A4B5C6D7E8F90', 'AB', 'A'.repeat(41), '_LEADING', 'TRAILING_', 'DOUBLE__UNDERSCORE', 'Mixed_Case', 'API_CODE_MISSING', 'RESPONSE_HTML', 'constructor', '__proto__', 'toString', 'forbidden', 'FORBIDDEN ', 'INVALID_SIGNATURE\n', sensitive]) {
     await assert.rejects(syncGate(credential, async () => Response.json({ label, message: sensitive, detail: sensitive }, { status: 400 })), error => {
       diagnostic(error, [/HTTP 400/, /API_CODE_UNKNOWN/, /错误码/]);
       assert.equal((error as Error).message.includes(label), false);
@@ -436,6 +436,28 @@ test('Gate distinguishes unknown codes from absent or malformed JSON labels usin
     await assert.rejects(syncGate(credential, async () => new Response(body, { status: 400 })),
       error => diagnostic(error, [/HTTP 400/, /API_CODE_MISSING/]));
   }
+});
+
+test('Gate names an unlisted label only when it is a plain upper-case identifier and tells 5xx callers to retry', async () => {
+  for (const label of ['FUTURE_GATE_ERROR', 'PANIC', 'A'.repeat(40)]) {
+    for (const [status, reason] of [[400, /尚未收录/], [401, /认证/], [403, /访问被拒绝/], [429, /限流/], [500, /暂时不可用，请稍后重试/], [503, /暂时不可用，请稍后重试/]] as const) {
+      await assert.rejects(syncGate(credential, async () => Response.json({ label, message: sensitive, detail: sensitive }, { status })), error => {
+        diagnostic(error, [new RegExp(`HTTP ${status} · ${label}）`), new RegExp(`尚未收录的错误码 ${label}，`), reason]);
+        assert.doesNotMatch((error as Error).message, /API_CODE_UNKNOWN/);
+        return true;
+      });
+    }
+  }
+  await assert.rejects(syncGate(credential, response({ ...valuation(), label: 'FUTURE_GATE_ERROR', message: sensitive })),
+    error => diagnostic(error, [/HTTP 200 · FUTURE_GATE_ERROR）/]));
+  for (const [label, reason] of [['SERVER_TIMEOUT', /超时/], ['FAILED_RETRIEVE_ASSETS', /账户资产/]] as const) {
+    await assert.rejects(syncGate(credential, async () => Response.json({ label, message: sensitive }, { status: 500 })),
+      error => diagnostic(error, [new RegExp(`HTTP 500 · ${label}）`), reason, /稍后重试/]));
+  }
+  await assert.rejects(syncGate(credential, async () => Response.json({ label: 'lower_case', message: sensitive }, { status: 500 })),
+    error => diagnostic(error, [/HTTP 500 · API_CODE_UNKNOWN）/, /暂时不可用，请稍后重试/]));
+  await assert.rejects(syncGate(credential, async () => new Response(null, { status: 502 })),
+    error => diagnostic(error, [/HTTP 502 · RESPONSE_EMPTY）/, /暂时不可用；收到空错误响应/]) && (error as Error).message.match(/重试/g)?.length === 1);
 });
 
 test('Gate recognizes known JSON error labels even when the response media type is absent, incorrect or malicious', async () => {

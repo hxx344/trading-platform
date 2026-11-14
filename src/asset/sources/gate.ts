@@ -1,5 +1,7 @@
 // Copied from project_aggregation modules/asset/lib/gate.ts at 0014655.
-// Changes: imports point at src/vendor and ../types.ts. Logic, host, error diagnostics, the 12 s timeout, body limits and messages are unchanged.
+// Changes: imports point at src/vendor and ../types.ts. Host, the 12 s timeout, body limits and balance logic are unchanged.
+// Error diagnostics differ from the workbench: SERVER_TIMEOUT and FAILED_RETRIEVE_ASSETS are listed, an unlisted label
+// that is a plain upper-case identifier is shown so it can be reported, and 5xx diagnostics without a listed label say to retry.
 import { gateAuthHeaders } from '../../vendor/gate.mjs';
 import type { Balance } from '../types.ts';
 import { ExchangeResponseError, readJsonResponse } from '../../vendor/response.mjs';
@@ -58,6 +60,8 @@ const ERROR_HINTS = {
   INTERNAL: 'Gate 服务内部异常；请稍后重试',
   SERVER_ERROR: 'Gate 服务内部异常；请稍后重试',
   INTERNAL_SERVER_ERROR: 'Gate 服务内部异常；请稍后重试',
+  SERVER_TIMEOUT: 'Gate 服务处理超时；请稍后重试',
+  FAILED_RETRIEVE_ASSETS: 'Gate 未能读取账户资产；请稍后重试，持续出现时联系 Gate 支持',
 } as const;
 type ErrorLabel = keyof typeof ERROR_HINTS;
 const RESPONSE_HINTS = {
@@ -70,9 +74,12 @@ const RESPONSE_HINTS = {
   RESPONSE_READ_FAILED: '错误响应读取中断，无法取得完整错误码；请检查服务器网络或代理后重试',
 } as const;
 type ResponseCode = keyof typeof RESPONSE_HINTS;
-type ErrorResponse = { kind: 'known'; label: ErrorLabel } | { kind: 'response'; code: ResponseCode };
+type ErrorResponse = { kind: 'known'; label: ErrorLabel } | { kind: 'unlisted'; label: string } | { kind: 'response'; code: ResponseCode };
+// Gate labels are upper-case words joined by underscores. Letters only and at most 40 characters: a key, signature,
+// address, URL or sentence cannot take this shape, so such a label may be shown without reflecting anything else.
+const UNLISTED_LABEL = /^(?=.{3,40}$)[A-Z]+(?:_[A-Z]+)*$/;
 
-function readFailure(reason: string, status?: number, label?: ErrorLabel | ResponseCode): Error {
+function readFailure(reason: string, status?: number, label?: string): Error {
   const parts = [typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599 ? `HTTP ${status}` : '', label].filter(Boolean);
   return new Error(`Gate 读取失败${parts.length ? `（${parts.join(' · ')}）` : ''}：${reason}；本次未更新资产数据`);
 }
@@ -80,20 +87,22 @@ function readFailure(reason: string, status?: number, label?: ErrorLabel | Respo
 function classifyError(data: unknown): ErrorResponse {
   if (isObject(data) && Object.hasOwn(data, 'label') && typeof data.label === 'string' && data.label.trim()) {
     if (Object.hasOwn(ERROR_HINTS, data.label)) return { kind: 'known', label: data.label as ErrorLabel };
+    if (UNLISTED_LABEL.test(data.label) && !Object.hasOwn(RESPONSE_HINTS, data.label)) return { kind: 'unlisted', label: data.label };
     return { kind: 'response', code: 'API_CODE_UNKNOWN' };
   }
   return { kind: 'response', code: 'API_CODE_MISSING' };
 }
 
 function apiFailure(status: number, error: ErrorResponse): Error {
-  // Only exact, code-owned API labels or response classifications may reach the UI.
+  // Only code-owned API labels, response classifications or a label of the UNLISTED_LABEL shape may reach the UI.
   if (error.kind === 'known') return readFailure(ERROR_HINTS[error.label], status, error.label);
-  const detail = RESPONSE_HINTS[error.code];
-  if (status === 401) return readFailure(`身份认证未通过；${detail}`, status, error.code);
-  if (status === 403) return readFailure(`访问被拒绝；${detail}`, status, error.code);
-  if (status === 429) return readFailure(`请求受到限流；请稍后重试并减少手动刷新次数；${detail}`, status, error.code);
-  if (status >= 500 && status <= 599) return readFailure(`Gate 或其网关服务暂时不可用；${detail}`, status, error.code);
-  return readFailure(detail, status, error.code);
+  const code = error.kind === 'unlisted' ? error.label : error.code;
+  const detail = error.kind === 'unlisted' ? `Gate 返回了尚未收录的错误码 ${error.label}，暂不能确定具体原因；持续出现时请反馈此错误码` : RESPONSE_HINTS[error.code];
+  if (status === 401) return readFailure(`身份认证未通过；${detail}`, status, code);
+  if (status === 403) return readFailure(`访问被拒绝；${detail}`, status, code);
+  if (status === 429) return readFailure(`请求受到限流；请稍后重试并减少手动刷新次数；${detail}`, status, code);
+  if (status >= 500 && status <= 599) return readFailure(`Gate 或其网关服务暂时不可用${detail.includes('重试') ? '' : '，请稍后重试'}；${detail}`, status, code);
+  return readFailure(detail, status, code);
 }
 
 function transportFailure(error: unknown, signal?: AbortSignal): Error {

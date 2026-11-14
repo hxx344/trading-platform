@@ -4,15 +4,16 @@
 
 对照的工作台代码：`modules/monitor`（工作台提交 `7745181` 时的内容）。工作台 Monitor 的功能编号 M01–M14 沿用。
 
-## 当前状态（v0.33.0）
+## 当前状态（v0.36.0）
 
 - 已发布：M-1（Anthropic 价差）随 v0.12.0；v0.15.0 起在设置页「从工作台导入」里启用。M-2a（原油价差）随 v0.20.0。M-2b（海力士溢价）随 v0.21.0。M-2c（多交易所对比）随 v0.23.0。M-2d（已结算资金费历史与多空资金费图）随 v0.24.0。M-2e（技术指标）随 v0.25.0。M-2d-3（对比表各交易所的结算历史）随 v0.27.0，M-2 完成。
 - M-3a（原油与海力士阈值告警、飞书出站队列、页面告警面板与测试消息）随 v0.29.0；替身后端与替身机器人验证，未接真实飞书。
 - M-3b（从工作台导入告警档位与行情告警机器人 `feishuMonitor`）随 v0.30.0；替身文件与替身机器人验证，未接真实工作台与飞书。
 - M-3c（各市场的监控开关：关闭后停采集、停告警，保留配置与历史）随 v0.31.0；替身行情验证。
 - M-3d-1（Var 行：公开行情与预测资金费、页面保存的会话 token 与认证标记价）随 v0.33.0；替身 Variational 验证，未接真实账户。
-- 已完成：M-3d-2（从工作台导入 Var token，v0.34.0）。
-- 未开始：M-4 至 M-6（见下表）。
+- M-3d-2（从工作台导入 Var token）随 v0.34.0；替身文件验证，未接真实工作台。M-3 完成。
+- M-4a（合约价差采集器：11 家交易所永续合约公开盘口，SSE 增量，只在内存）随 v0.36.0；替身交易所验证，并在开发机上对真实交易所做过 20 秒冒烟（见 M-4a 实施记录）。尚无页面，从工作台导入暂不启用它（M-4b 随页面加入）。
+- 未开始：M-4b、M-5、M-6（见下表）。
 - M-1 没做：成交标记、股数从交易中心同步、概览卡片与告警（均线 / 布林带 / Z-score 随 M-2e 补上）。
 
 ## 批次
@@ -21,8 +22,8 @@
 | --- | --- | --- | --- |
 | M-1 | Anthropic 价差（M03）：Binance、Hyperliquid（xyz:ANT、io:ANTH）、Lighter RH 四条腿的报价与 15 分钟 K 线，每股口径溢价；只读公开接口，无凭据、无告警 | R2 | 完成（Linux CI 通过），随 v0.12.0 发布 |
 | M-2 | 原油价差与海力士行情（M01、M02），分 M-2a–M-2e 五小批（见下文），Var 腿先降级为“未接入” | R2 | M-2a 已发布（v0.20.0），M-2b 已发布（v0.21.0），M-2c 已发布（v0.23.0），M-2d 已发布（v0.24.0），M-2e 已发布（v0.25.0），M-2d-3 已发布（v0.27.0） |
-| M-3 | 告警规则、飞书通知、监控开关、Var 会话 token（M09–M12），分 M-3a–M-3d 四小批（见下文） | R3 | M-3a 完成（v0.29.0），M-3b 完成（v0.30.0），M-3c 完成（v0.31.0），M-3d-1 完成（v0.33.0） |
-| M-4 | 永续全市场报价（M04：11 家交易所公共 WS、SSE 增量） | R2 | 未开始 |
+| M-3 | 告警规则、飞书通知、监控开关、Var 会话 token（M09–M12），分 M-3a–M-3d 四小批（见下文） | R3 | M-3a 完成（v0.29.0），M-3b 完成（v0.30.0），M-3c 完成（v0.31.0），M-3d-1 完成（v0.33.0），M-3d-2 完成（v0.34.0） |
+| M-4 | 永续全市场报价（M04：11 家交易所公共 WS、SSE 增量），分 M-4a（采集器与接口）、M-4b（页面与导入） | R2 | M-4a 完成（v0.36.0），M-4b 未开始 |
 | M-5 | 依赖 M04 的页面（M05–M08） | R2 | 未开始 |
 | M-6 | 其余（M13、M14；M14 原靠 iframe 桥接宿主，需重新设计） | 待定 | 未开始 |
 
@@ -545,3 +546,48 @@ CEX 最多 32 页。
 **测试计划**：来源读取（缺失、权限不是 600、过大、符号链接、坏 JSON、过期）；取舍规则（无 token、同一个、本服务更新、本服务过期）；写入子进程（复核、拒写符号链接与他人文件、版本 + 1、600）；会话按文件变化重读（导入后换上、无效文件不换、页面保存不重读）；导入助手与命令行的接线、请求校验；`deploy/test-install.sh` 的参数检查；页面勾选与请求体。
 
 **实施记录（v0.34.0）**：照上文实现。页面：导入面板行情监控一节下加 Var token 表（`#importVariationalTable`）与勾选项（`#importVariationalPick`），版式照同一面板的告警档位表，时间按 UTC 显示（与原因文字、对比表一致）；勾选 token 时请求体自动带上 `monitor: true`。独立审查（后端、页面两路）无 P0/P1，P2 与 P3 的处理见 `docs/reviews/2026-11-14-monitor-m3d2.md`。剩余已知限制：写入子进程的“改名前复核”与改名之间仍有微秒级窗口，没有跨进程锁；落在这个窗口里时，页面刚保存的 token 会被导入的盖掉（日志里有两次写入，重新保存即可）。
+
+## M-4：合约价差（永续全市场报价）
+
+对照工作台 `modules/monitor/server/perpetual-service.mjs`、`modules/monitor/modules/perpetual/`（交易所适配、采集策略）与 `app/perpetual-panel.tsx`（工作台提交 `c84ba27`）。工作台的 M04 是其后 M05–M08（质量、机会、纸面、告警等）的数据源，这里只搬报价本身，其余留给 M-5。
+
+### M-4a：采集器与接口
+
+**范围**：`config.json` 的 `monitor.perpetual: {}`（不带设置）启用。服务端采集器 `src/monitor/perpetual.ts` 移植 `createPerpetualService` 的核心：
+- 每 5 分钟按交易所发现一次合约目录（失败 30 秒后重试，同一家的重试不叠加；失败只在首次记一行日志，恢复前不再重复，恢复时记一行）。目录签名变化时（合约身份、乘数、频道）换一代订阅：旧一代的连接与重连计时一起作废，身份变了的旧报价剔除；只有下架、费率、分类字段变化时不重订阅，只更新报价上的元数据。
+- 每份订阅计划一条 WebSocket：20 秒连接超时，断线指数退避重连（5 秒起、最长 60 秒，加抖动），心跳，看门狗（45 秒没有消息或只有心跳就重连），同一主机的辅助请求共享每分钟预算（Hyperliquid 遇错误时退避），带 `snapshot` 的计划另按间隔走 REST 盘口快照（8 秒超时）。
+- 解析结果按字段各自的时间合并为每合约一条报价（`mergePerpetualQuote`，资金费更新不会刷新旧盘口），每秒提交一次。
+- 每秒对所有读者广播一帧增量（`createPerpetualChangedPatch`，帧带 `baseSequence`），只含变化的合约；读者积压时下一帧改发全量，积压超过 4 MB 断开。
+
+交易所适配原样复制到 `src/vendor/`：`perpetual-exchanges.mjs`、`perpetual-kraken.mjs`、`perpetual-additional-exchanges.mjs`、`perpetual-collection-policy.mjs`、`asset-identity.mjs`，以及摘自 `perpetual-service.mjs` 的合并与增量函数 `perpetual-stream.mjs`。每个文件头注明来源提交；类型声明另写在 `.d.mts`。共 11 家：Binance、Bybit、OKX、Bitget、Gate、Kraken、Hyperliquid、Lighter、Aster、Lighter RH、Entropy。
+
+**接口**（GET，只校验登录 cookie）：
+- `/api/monitor/perpetual/quote`：整张表，同工作台 `quote`（`{ schemaVersion, monitorId: 'perpetual', streamId, sequence, status, generatedAt, staleAfterMs, exchanges, quotes, storageError: null }`）。
+- `/api/monitor/perpetual/summary`：概要，同工作台 `summary`（含 `available: true`），多一个 `running`，没有 CrossEx 过滤。
+- `/api/monitor/perpetual/stream`：SSE。首帧为 `retry: 5000` 加全量（已有读者时取共享基线），之后每秒一帧 `{ type: 'patch', baseSequence, patches, removed, … }`；请求头带 `Accept-Encoding: gzip` 时整条流 gzip（同步刷新）。帧格式与工作台相同，M-4b 的页面照搬工作台的 `lib/perpetual-feed.ts` 消费。
+
+未配置时 404。M-3c 开关同样适用：`POST /api/monitor/perpetual/control`；关闭后上面三个接口返回 423，提示“合约价差监控已关闭，行情采集已暂停；开启后重新采集”。状态页 `monitor.perpetual` 给出运行状态、报价数、读者数、连接数、各交易所状态与重连次数，并附 `summary`。
+
+**开关与生命周期**：采集器不按“轮”跑，而是由自己的计时器和连接驱动。`monitorLoops` 为它起一个循环，每秒看一次开关：开启时 `start()`，关闭时 `stop()`。`stop()` 结束所有读者的流、关闭连接、清空报价，并换新的流编号，再次开启时从空表开始采集，不显示几小时前的价格。服务停止时同样 `stop()`。
+
+**与工作台的差异**：
+- 不持久化。工作台把报价存进 `market.sqlite`，重启后先显示旧报价；本服务只放在内存里，重启或关闭开关后从空表开始。因此不建库、不改库结构，`storageError` 恒为 null。
+- 不搬：质量采样、资金费与价格历史、市场指标、扫描器数据、机会列表（v1/v2）、CrossEx 过滤、合约告警、纸面交易、深度与平仓估算、汇率、诊断指标。这些属于 M05–M08，留给 M-5。
+- WebSocket 用 Node 自带的（支持自定义请求头，例如 Gate 的 `X-Gate-Size-Decimal`），不用 `ws` 包。它与 `fetch` 共用全局 dispatcher：服务环境设了 `NODE_USE_ENV_PROXY=1` 加 `HTTPS_PROXY` 时，REST 与 WebSocket 一起走代理（开发机上比对过连接去向：直连 443 的连接减少、代理端口的连接相应增加）；没设时直连。工作台用的是 `ws` 加 `https-proxy-agent`。
+- 日志写标准错误（进 journal），只记合约列表失败与恢复：每家首次失败记一行，恢复前不重复记（旧一代连接照常出报价时也不重复），恢复记一行。连接断开、协议错误与重连次数不进日志（重连频繁，会刷屏），看状态页 `monitor.perpetual` 各交易所的 `error`、`lastProtocolError` 与重连次数。
+- `perpetual-exchanges.mjs` 有两处修正：OKX 改连 443 端口；OKX 推送的 `notice` 消息（例如“8443 端口即将停用”）不再当作订阅失败。工作台 c84ba27 会因此不断重建 OKX 连接，始终拿不到 OKX 行情。
+
+**影响面（R2）**：新增只读的公开行情采集，以及 `/api/monitor/perpetual/*` 接口。启用后常驻约 20 条 WebSocket，有持续的网络流量和 CPU 占用。没有凭据，不碰交易、划转、告警、`monitor.sqlite` 的结构与配置里的其他字段。未配置 `monitor.perpetual` 时什么都不启动。
+
+**回滚**：`sudo bash install.sh --version v0.35.0`。如果配置里写了 `monitor.perpetual`，回滚前要先删掉这一项（只配了合约价差时删掉整个 `monitor`），否则 v0.35.0 会因为不认识这个键而拒绝 `monitor` 配置。开关记录 `control.perpetual` 留在 `monitor.sqlite`，旧版本会忽略它。
+
+**测试计划**：替身交易所加替身 WebSocket（`test/monitor-perpetual.test.ts`），覆盖：发现与订阅；合并为每合约一条；控制消息回复；请求头与二进制类型；在线状态与概要；断线退避重连；消息无效时重连；合约列表失败；目录换代时剔除旧报价并重新订阅；停止后清空、不再重连、换流编号，再启动；停止时还在进行的合约发现在重启后才返回时丢弃（两种返回顺序）；旧一代断线后挂着的重连计时作废；合约列表失败只记首次与恢复；接口方面覆盖整表、概要、SSE 首帧与增量（序号连续，带 gzip 与不带；先到的与中途加入的读者按工作台 feed 规则拼回的表与服务端一致，含目录换代后的 `removed`；积压读者跳过增量、可写后发全量，超过 4 MB 断开；未运行时流立即结束；`Accept-Encoding` 的 `q=0`），未配置 404，关闭后 423 并结束读者的流，重新开启；配置解析与 `--check-config` 摘要；导入不补上 perpetual。交易所适配本身的解析正确性沿用工作台的测试，不在本仓库重复。
+
+**本批没做**：页面（M-4b）；从工作台导入时启用（M-4b，随页面一起，避免导入后有采集却看不到）；持久化；M05–M08。只配了 `monitor.perpetual` 时，行情页现有的提示把它当作“没有配置行情监控”，M-4b 加标签时一并改。
+
+### M-4a 实施记录（v0.36.0）
+
+照上文实现。启用方式暂时只能手写配置：在 `config.json` 的 `monitor` 里加 `"perpetual": {}`，然后执行 `sudo bash install.sh`。M-4b 起改为在「从工作台导入」里启用。
+
+在开发机上对真实交易所做过 20 秒冒烟。OKX、Gate、Bitget、Kraken、Aster、Hyperliquid、Lighter RH、Entropy 都能实时采集，每家报价数基本等于合约数（Hyperliquid 179 个合约中取到 81 条）。Binance（HTTP 451）、Bybit（403）、Lighter WebSocket（400，restricted jurisdiction）被开发机出口所在地区封锁，部署机能否连通取决于所在地区。
+

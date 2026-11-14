@@ -7,6 +7,7 @@ import { createAnthropicMonitor, type AnthropicMonitor, type LoopContext } from 
 import { createExchangeReader, type ExchangeReader } from '../monitor/exchanges.ts';
 import { createHynixMonitor, type HynixMonitor } from '../monitor/hynix.ts';
 import { createOilMonitor, type OilMonitor } from '../monitor/oil.ts';
+import { createPerpetualMonitor, type PerpetualMonitor, type PerpetualOptions } from '../monitor/perpetual.ts';
 import { createMonitorControl, type MonitorControl } from '../monitor/control.ts';
 import { MONITOR_FILE, createMonitorStore, type MonitorStore } from '../monitor/store.ts';
 import { createVariationalSession, type VariationalSession } from '../monitor/variational-session.ts';
@@ -26,12 +27,16 @@ export interface MonitorRuntime {
   control: MonitorControl;
   /** M-3d: the Variational token the page saves; present when oil runs. */
   variational: VariationalSession | null;
+  /** M-4a: every venue's perpetual quotes, in memory only; present when `perpetual` is configured. */
+  perpetual: PerpetualMonitor | null;
 }
 
 /** Opens monitor.sqlite and reads the saved history back; throws when the file cannot be opened. */
-export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now, log, WebSocketImpl, alertHooks, variationalFetch }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void; WebSocketImpl?: typeof WebSocket; alertHooks?: AlertHooks;
+export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now, log, WebSocketImpl, alertHooks, variationalFetch, perpetualOptions }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void; WebSocketImpl?: typeof WebSocket; alertHooks?: AlertHooks;
   /** The transport to omni.variational.io; python3 and scripts/variational-request.py unless given (tests, the local preview). */
-  variationalFetch?: VariationalFetcher } = {}): MonitorRuntime {
+  variationalFetch?: VariationalFetcher;
+  /** Stand-ins for the perpetual collector's venues (tests, the local preview). */
+  perpetualOptions?: PerpetualOptions } = {}): MonitorRuntime {
   const store = createMonitorStore({ file: join(dir, MONITOR_FILE), ...(now ? { now } : {}) });
   try {
     const base = { store, ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}) };
@@ -52,7 +57,9 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
       if (hynix) alerts.hynix = createAlertService({ ...common, market: 'hynix', quote: () => hynix.quote() });
     }
     const control = createMonitorControl({ store, markets: monitorMarkets(config), ...(log ? { log } : {}) });
-    return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, hynix, exchanges, alerts, control, variational };
+    // Built here, started by its loop once the switch is on (monitorLoops).
+    const perpetual = config.perpetual ? createPerpetualMonitor({ ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}), ...perpetualOptions }) : null;
+    return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, hynix, exchanges, alerts, control, variational, perpetual };
   } catch (error) { store.close(); throw error; }
 }
 
@@ -61,14 +68,16 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
  * (the endpoint answers 404); one without data yet gives null (503).
  */
 export function monitorViews(monitor: MonitorRuntime) {
-  const collector = (market: MonitorMarket) => monitor[market];
+  const collector = (market: CandleMarket) => monitor[market];
   return {
     state: () => ({ markets: monitorMarkets(monitor.config), anthropic: monitor.config.anthropic ? { shares: monitor.config.anthropic.shares } : null, controls: monitor.control.views() }),
     /** M-3c: whether a configured market runs (its reads answer 423 while it is off), and the page's switch. */
     enabled: (market: MonitorMarket): boolean => monitor.control.enabled(market),
     setControl: (market: MonitorMarket, body: unknown): unknown => monitor.control.update(market, body),
-    quote: (market: MonitorMarket): unknown => collector(market)?.quote(),
-    candles: (market: MonitorMarket, days: number | null): unknown => collector(market)?.candles(days),
+    quote: (market: CandleMarket): unknown => collector(market)?.quote(),
+    candles: (market: CandleMarket, days: number | null): unknown => collector(market)?.candles(days),
+    /** M-4a: the perpetual collector (snapshot, summary, the SSE stream); undefined when it is not configured. */
+    perpetual: (): PerpetualMonitor | undefined => monitor.perpetual ?? undefined,
     /** The settled funding history (M-2d); undefined when the market is not configured; before any settlement
      * `{ notReady }` with why the last round failed (null while the first round has not failed). */
     funding: (market: 'oil' | 'hynix'): unknown => {
@@ -88,8 +97,12 @@ export function monitorViews(monitor: MonitorRuntime) {
   };
 }
 
+/** The markets with a quote and candles of their own (the perpetual collector has its own reads). */
+type CandleMarket = Exclude<MonitorMarket, 'perpetual'>;
+
 /** For the status page: each configured market's last reads and errors, and the alerts when the service runs them. */
-export const monitorStatus = (monitor: MonitorRuntime) => ({ anthropic: monitor.anthropic?.status() ?? null, oil: monitor.oil?.status() ?? null, hynix: monitor.hynix?.status() ?? null, controls: monitor.control.views(),
+export const monitorStatus = (monitor: MonitorRuntime) => ({ anthropic: monitor.anthropic?.status() ?? null, oil: monitor.oil?.status() ?? null, hynix: monitor.hynix?.status() ?? null,
+  perpetual: monitor.perpetual ? { ...monitor.perpetual.status(), summary: monitor.perpetual.summary() } : null, controls: monitor.control.views(),
   ...(Object.keys(monitor.alerts).length ? { alerts: { oil: monitor.alerts.oil?.status() ?? null, hynix: monitor.alerts.hynix?.status() ?? null } } : {}) });
 
 /** How often a switched-off market looks at its switch again: a market turned back on resumes within this. */
@@ -132,6 +145,20 @@ function alertLoop(service: AlertService, context: LoopContext, on: () => boolea
   })();
 }
 
+/**
+ * The perpetual collector runs on its own timers and sockets rather than rounds: this loop starts it while the switch is on
+ * and stops it (connections closed, quotes dropped) within CONTROL_POLL_MS of being turned off, and at stopping.
+ */
+function perpetualLoop(perpetual: PerpetualMonitor, context: LoopContext, on: () => boolean): Promise<void> {
+  return (async () => {
+    while (!context.stopped()) {
+      if (on()) perpetual.start(); else perpetual.stop();
+      await context.pause(CONTROL_POLL_MS);
+    }
+    perpetual.stop();
+  })();
+}
+
 export const monitorLoops = (monitor: MonitorRuntime, context: LoopContext, log: (line: string) => void = line => process.stderr.write(`${line}\n`)): Promise<void>[] => {
   const on = (market: MonitorMarket) => () => monitor.control.enabled(market);
   return [
@@ -140,9 +167,10 @@ export const monitorLoops = (monitor: MonitorRuntime, context: LoopContext, log:
       return collector ? [marketLoops(loopContext => collector.loops(loopContext), context, on(market), log)] : [];
     }),
     ...(Object.entries(monitor.alerts) as [AlertMarket, AlertService][]).map(([market, service]) => alertLoop(service, context, on(market), log)),
+    ...(monitor.perpetual ? [perpetualLoop(monitor.perpetual, context, on('perpetual')).catch(error => { log(`合约价差循环异常退出：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`); })] : []),
   ];
 };
 
 /** Ends the requests in flight (at stopping), so the loops finish within the drain. */
-export const stopMonitor = (monitor: MonitorRuntime): void => { monitor.anthropic?.stop(); monitor.oil?.stop(); monitor.hynix?.stop(); monitor.exchanges?.stop(); monitor.variational?.stop(); };
+export const stopMonitor = (monitor: MonitorRuntime): void => { monitor.anthropic?.stop(); monitor.oil?.stop(); monitor.hynix?.stop(); monitor.exchanges?.stop(); monitor.variational?.stop(); monitor.perpetual?.stop(); };
 export const closeMonitor = (monitor: MonitorRuntime): void => { try { monitor.store.close(); } catch { /* best effort */ } };

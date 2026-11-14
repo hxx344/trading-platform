@@ -35,9 +35,11 @@ export function switchLabel(control: MonitorControl | undefined, pending: boolea
   return control.enabled ? '已开启' : '已关闭';
 }
 
-const NAMES: Record<string, string> = { anthropic: 'Anthropic', oil: '原油', hynix: '海力士' };
+const NAMES: Record<string, string> = { anthropic: 'Anthropic', oil: '原油', hynix: '海力士', perpetual: '合约价差' };
 /** Shown in place of the market's panel while it is off. Anthropic has no automatic alerts. */
 export function disabledNotice(market: string): string {
+  // The perpetual quotes live in memory only (M-4a): nothing is kept while it is off.
+  if (market === 'perpetual') return '合约价差监控已关闭，行情采集已暂停。报价只在内存中，不保留；可通过上方开关重新开启，开启后重新采集。';
   const paused = market === 'anthropic' ? '行情采集已暂停' : '行情采集、自动告警已暂停';
   return `${NAMES[market] ?? market}监控已关闭，${paused}。配置和历史数据已保留，可通过上方开关重新开启。`;
 }

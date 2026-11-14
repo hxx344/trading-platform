@@ -14,9 +14,10 @@ pkg="$stage/trading-platform"
 [[ -f "$root/web/dist/index.html" ]] || { echo "缺少 web/dist/index.html：先运行 pnpm build:web" >&2; exit 1; }
 mkdir -p "$pkg/deploy" "$pkg/web" "$pkg/scripts" "$out"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$pkg/"
-# The Var balance helper runs as `python3 -I -B <release>/scripts/variational-balance.py` (src/asset/sources/variational-python.ts
-# finds it relative to its own file); the other scripts are development tools and stay out of the package.
-cp "$root/scripts/variational-balance.py" "$pkg/scripts/"
+# The Var helpers run as `python3 -I -B <release>/scripts/variational-*.py` (src/asset/sources/variational-python.ts and
+# src/monitor/variational-transport.ts find them relative to their own files); the other scripts are development tools and
+# stay out of the package.
+cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$pkg/scripts/"
 cp -R "$root/web/dist" "$pkg/web/"
 cp "$root/deploy/trading-platform.service" "$root/deploy/trading-platform-import.service" "$root/deploy/trading-platform-import.path" "$root/deploy/config.example.json" "$root/deploy/secrets.example.json" "$pkg/deploy/"
 printf 'v%s %s\n' "$version" "$commit" >"$pkg/VERSION"

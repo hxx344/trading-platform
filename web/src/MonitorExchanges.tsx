@@ -1,17 +1,20 @@
 import { ChevronDown, RefreshCw } from 'lucide-react';
-import { useCallback, useEffect, useId, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useId, useRef, useState } from 'react';
 import {
   DISPLAY_EXCHANGES, EXCHANGE_CONTRACTS, EXCHANGE_NAMES, EXCHANGE_REFRESH_MS, calculateExchangeSpread, exchangeDefinition, externalQuoteStale,
   supportsExchange, validateExchangeQuote, type Exchange, type ExchangeLeg, type ExchangeQuote, type SpreadMarket,
 } from '../../src/vendor/exchange-comparison.mjs';
+import { supportsFundingHistory } from '../../src/vendor/exchange-funding-history.mjs';
 import { FundingHistoryPanel, utc, type FundingHistorySelection } from './MonitorFundingHistory.tsx';
+import { VariationalSessionForm } from './MonitorVariationalSession.tsx';
 import { useLiveResource } from './use-live-resource.ts';
 
 // The multi-exchange comparison under the oil and Hynix charts, laid out as the workbench's modules/monitor/app/
 // exchange-comparison.tsx (568a20d) with its hook hooks/use-exchange-quotes.ts (8470785): every exchange is read on its own every 15 s
 // (20 s timeout: a cold Lighter read is a catalog and a stream snapshot in turn) from the service, which reads the venue on demand. Changed: times are UTC like the rest of this page;
-// Variational needs a login session and shows as 未接入, without a settlement history; the four-leg hedge simulation and the
-// hub summary hand-off are left out. The annualized figures open the settlement history (MonitorFundingHistory.tsx, M-2d-3).
+// the four-leg hedge simulation and the hub summary hand-off are left out. The annualized figures open the settlement history
+// (MonitorFundingHistory.tsx, M-2d-3), except Variational's (M-3d-1), which has no settlement record to check: its row reads
+// like the others and carries the workbench's 更新 Var token form (MonitorVariationalSession.tsx) on the row below it.
 const READ_TIMEOUT_MS = 20_000;
 type RowState = { quote: ExchangeQuote | null; error: string };
 
@@ -55,22 +58,21 @@ export function ExchangeComparison({ market, onExpired }: { market: SpreadMarket
     <div className="exchange-heading"><div><h2>交易所实时对比</h2><p>{oil ? '布伦特 − WTI · 资金费按等桶数' : 'ADR − 正股 ÷ 10 · 10 份 ADR 对 1 股正股'}</p></div><div><span>各平台每 15 秒更新 · 结果 5 秒内共用</span><button type="button" className="refresh-button" onClick={refresh} disabled={refreshing} aria-label={`刷新${oil ? '原油' : '海力士'}交易所报价`}><RefreshCw size={14} className={refreshing ? 'spinning' : ''} aria-hidden="true" />{refreshing ? '更新中' : '刷新'}</button></div></div>
     <table className="exchange-table">
       <thead><tr><th>交易所 / 报价口径</th><th>{contracts.leftLabel} / {rightHeading}</th><th>{oil ? '价差 (USDT/桶)' : '价差'}</th>{!oil && <th>ADR 溢价率</th>}<th>做空价差年化</th><th>做多价差年化</th></tr></thead>
-      <tbody>{exchanges.map(exchange => supportsExchange(market, exchange)
-        ? <ExchangeRow key={exchange} market={market} exchange={exchange} now={now} onExpired={onExpired} onReport={report} onRegister={register} history={historySelection?.exchange === exchange ? historySelection.direction : null} historyId={historyId} onHistory={selectHistory} />
-        : <UnconnectedRow key={exchange} market={market} exchange={exchange} />)}</tbody>
+      <tbody>{exchanges.filter(exchange => supportsExchange(market, exchange)).map(exchange => <ExchangeRow key={exchange} market={market} exchange={exchange} now={now} onExpired={onExpired} onReport={report} onRegister={register} history={historySelection?.exchange === exchange ? historySelection.direction : null} historyId={historyId} onHistory={selectHistory} />)}</tbody>
     </table>
-    <p className="exchange-caption">正值收款，负值付款；按当前费率简单年化，以两腿总名义金额为分母。{oil ? '做空：空布伦特、多 WTI；做多反向。' : '做空：空 ADR、多正股；做多反向。'}点击年化可查看最近实际结算。</p>
+    <p className="exchange-caption">正值收款，负值付款；按当前费率简单年化，以两腿总名义金额为分母。{oil ? '做空：空布伦特、多 WTI；做多反向。' : '做空：空 ADR、多正股；做多反向。'}点击年化可查看最近实际结算{oil ? '（Variational 无可核实的结算记录，不提供）' : ''}。</p>
     {historySelection && <FundingHistoryPanel key={market} id={historyId} market={market} selection={historySelection} now={now} onClose={closeHistory} onExpired={onExpired} />}
     <details className="exchange-details"><summary>资金费周期与计算口径</summary><div className="exchange-details-body">
       {exchanges.map(exchange => {
-        if (!supportsExchange(market, exchange)) return <article key={exchange}><strong>{EXCHANGE_NAMES[exchange]}</strong><p>需要登录会话读取标记价格，本服务暂未接入。</p></article>;
+        if (!supportsExchange(market, exchange)) return null;
         const { quote, error } = states[exchange] ?? { quote: null, error: '' };
-        return <article key={exchange}><strong>{EXCHANGE_NAMES[exchange]}</strong>{quote ? <><p>{quote.left.symbol}：{rate(quote.left.fundingRate)} / {quote.left.fundingIntervalHours ?? '—'} 小时；{quote.right.symbol}：{rate(quote.right.fundingRate)} / {quote.right.fundingIntervalHours ?? '—'} 小时。</p>{quote.fundingFetchedAt && <p>资金费名义金额使用{fundingPriceLabels[quote.fundingPriceBasis]}。</p>}{quote.fundingFetchedAt && <p>资金费采集：{utc(quote.fundingFetchedAt)}。</p>}<p>下次结算：{contracts.leftLabel} {settlement(quote.left)}；{contracts.rightLabel} {settlement(quote.right)}。</p>{quote.fundingError && <p className="exchange-stale">{quote.fundingError}</p>}</> : <p>尚未取得有效报价。</p>}{error && <p className="exchange-stale">{error}</p>}</article>;
+        return <article key={exchange}><strong>{EXCHANGE_NAMES[exchange]}</strong>{quote ? <><p>{quote.left.symbol}：{rate(quote.left.fundingRate)} / {quote.left.fundingIntervalHours ?? '—'} 小时；{quote.right.symbol}：{rate(quote.right.fundingRate)} / {quote.right.fundingIntervalHours ?? '—'} 小时。</p>{quote.fundingFetchedAt && <p>资金费名义金额使用{fundingPriceLabels[quote.fundingPriceBasis]}。</p>}{quote.fundingFetchedAt && <p>资金费采集：{utc(quote.fundingFetchedAt)}。</p>}<p>下次结算：{contracts.leftLabel} {settlement(quote.left)}；{contracts.rightLabel} {settlement(quote.right)}。</p>{quote.fundingError && <p className="exchange-stale">{quote.fundingError}</p>}</> : <p>尚未取得有效报价。</p>}{exchange === 'variational' && <p>公开标记价与预测资金费无需 token；保存有效 token 后改用认证报价（带行情时间）。无可核实的历史结算。</p>}{error && <p className="exchange-stale">{error}</p>}</article>;
       })}
       <p>净年化 =（空腿名义 × 空腿费率 ÷ 空腿周期小时 − 多腿名义 × 多腿费率 ÷ 多腿周期小时）÷ 两腿总名义 × 8,760。各腿按各自周期换算；费率或周期缺失时显示“—”，不按零费率计算。Hyperliquid 与 Lighter 每小时结算，下次结算时间按下一个整点推算。</p>
       <p>{oil ? '原油价差 = 布伦特价格 − WTI 价格，按各平台报价币种每桶计。USD、USDT 与 USDC 分别标注，不假定彼此严格等值。' : 'ADR 溢价率 =（ADR 价格 ÷（正股价格 ÷ 10）− 1）× 100%。USDT 接口报价已完成币种换算，不额外换算韩元；USD 与 USDT 不假定严格等值。'}各行只计算同一交易所内的两腿。{oil ? 'Hyperliquid 接口不带行情时间，显示服务收到应答的时间。' : 'Hyperliquid 沿用当前中间价，其余平台使用标记价；Gate 未提供行情时间戳，显示采集时间。'}</p>
+      {oil && states.variational?.quote?.fundingFetchedAt ? <p>Variational 按当前标记价估算两腿名义金额；展示为当前费率预估，并非实际结算金额。</p> : null}
       <p>本区为当前费率预估，实际结算费率可能变化。上方历史图表使用 {oil ? 'Binance' : 'Hyperliquid'}。</p>
-      <div className="exchange-source-links"><a href="https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding" target="_blank" rel="noreferrer">Hyperliquid 规则 ↗</a><a href="https://www.bybit.com/en/help-center/article/Funding-fee-calculation" target="_blank" rel="noreferrer">Bybit 规则 ↗</a><a href="https://www.binance.com/en/support/faq/detail/360033525031" target="_blank" rel="noreferrer">Binance 规则 ↗</a>{oil && <a href="https://docs.lighter.xyz/trading/funding" target="_blank" rel="noreferrer">Lighter 规则 ↗</a>}<a href="https://www.okx.com/docs-v5/en/#public-data-rest-api-get-funding-rate" target="_blank" rel="noreferrer">OKX 资金费接口 ↗</a><a href="https://www.bitget.com/docs/catalog/classic-contract-market/classic-contract-market" target="_blank" rel="noreferrer">Bitget 资金费接口 ↗</a>{!oil && <a href="https://www.gate.com/docs/developers/apiv4/en/futures/" target="_blank" rel="noreferrer">Gate 资金费接口 ↗</a>}</div>
+      <div className="exchange-source-links"><a href="https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding" target="_blank" rel="noreferrer">Hyperliquid 规则 ↗</a><a href="https://www.bybit.com/en/help-center/article/Funding-fee-calculation" target="_blank" rel="noreferrer">Bybit 规则 ↗</a><a href="https://www.binance.com/en/support/faq/detail/360033525031" target="_blank" rel="noreferrer">Binance 规则 ↗</a>{oil && <><a href="https://docs.lighter.xyz/trading/funding" target="_blank" rel="noreferrer">Lighter 规则 ↗</a><a href="https://docs.variational.io/technical-documentation/api" target="_blank" rel="noreferrer">Variational 接口说明 ↗</a></>}<a href="https://www.okx.com/docs-v5/en/#public-data-rest-api-get-funding-rate" target="_blank" rel="noreferrer">OKX 资金费接口 ↗</a><a href="https://www.bitget.com/docs/catalog/classic-contract-market/classic-contract-market" target="_blank" rel="noreferrer">Bitget 资金费接口 ↗</a>{!oil && <a href="https://www.gate.com/docs/developers/apiv4/en/futures/" target="_blank" rel="noreferrer">Gate 资金费接口 ↗</a>}</div>
     </div></details>
   </section></div>;
 }
@@ -94,26 +96,25 @@ function ExchangeRow({ market, exchange, now, onExpired, onReport, onRegister, h
   const stale = Boolean(quote && (error || externalQuoteStale(quote, now)));
   const status = !quote ? error ? '暂不可用' : '等待首次采集' : stale ? '保留数据 · 待更新' : quote.fundingError ? '价格已更新 · 资金费缺失' : '已更新';
   const pairLabel = `${contracts.leftLabel} / ${oil ? 'WTI' : '正股 ÷ 10'}`;
-  return <tr data-exchange={exchange} data-stale={stale}>
-    <td className="exchange-identity"><strong>{EXCHANGE_NAMES[exchange]}</strong><span>{quote?.currency ?? definition.currency} · {(quote?.priceBasis ?? definition.priceBasis) === 'mid' ? '中间价' : '标记价'}</span><small className={stale || !quote || quote.fundingError ? 'exchange-stale' : ''}>{status}</small>{stale && quote ? <small className="exchange-old" title="报价超过有效期，仅供核对"><b>旧</b>{age(quote.fetchedAt, now)}</small> : null}{quote && <time dateTime={quote.fetchedAt}>{quote.timestampBasis === 'received' ? '采集时间：' : ''}{utc(quote.fetchedAt)}</time>}{quote?.timestampBasis === 'received' && <small>源未提供行情时间戳</small>}{quote?.fundingError && <small className="exchange-stale">{quote.fundingError}</small>}</td>
+  // Variational: the token form opens on the row below; its annualized figures are plain text (no settlement history).
+  const hasSession = oil && exchange === 'variational', settled = supportsFundingHistory(market, exchange);
+  const [sessionOpen, setSessionOpen] = useState(false);
+  const sessionId = useId();
+  const sessionTrigger = useRef<HTMLButtonElement | null>(null);
+  const closeSession = useCallback(() => { setSessionOpen(false); if (!document.hidden) sessionTrigger.current?.focus({ preventScroll: true }); }, []);
+  const saved = useCallback(() => { void refresh(); }, [refresh]);
+  const annualized = (direction: FundingHistorySelection['direction'], value: number | null | undefined) => {
+    const text = signed(value == null ? null : value * 100, 2, '%');
+    if (!settled) return <strong className={tone(value)}>{text}</strong>;
+    const name = direction === 'short' ? '做空' : '做多';
+    return <button type="button" className={`exchange-funding-trigger ${tone(value)}`} onClick={event => onHistory(exchange, direction, event.currentTarget)} aria-label={`查看 ${EXCHANGE_NAMES[exchange]} ${name}价差的资金费结算历史`} aria-expanded={history === direction} aria-controls={historyId}><strong>{text}</strong><ChevronDown size={13} aria-hidden="true" /></button>;
+  };
+  return <Fragment><tr data-exchange={exchange} data-stale={stale}>
+    <td className="exchange-identity"><strong>{EXCHANGE_NAMES[exchange]}</strong><span>{quote?.currency ?? definition.currency} · {(quote?.priceBasis ?? definition.priceBasis) === 'mid' ? '中间价' : '标记价'}</span><small className={stale || !quote || quote.fundingError ? 'exchange-stale' : ''}>{status}</small>{stale && quote ? <small className="exchange-old" title="报价超过有效期，仅供核对"><b>旧</b>{age(quote.fetchedAt, now)}</small> : null}{quote && <time dateTime={quote.fetchedAt}>{quote.timestampBasis === 'received' ? '采集时间：' : ''}{utc(quote.fetchedAt)}</time>}{quote?.timestampBasis === 'received' && <small>源未提供行情时间戳</small>}{quote?.fundingError && <small className="exchange-stale">{quote.fundingError}</small>}{hasSession && <button ref={sessionTrigger} type="button" className="variational-session-trigger" onClick={() => setSessionOpen(open => !open)} aria-expanded={sessionOpen} aria-controls={sessionId}>更新 Var token<ChevronDown size={13} aria-hidden="true" /></button>}</td>
     <td data-label={pairLabel}><span className="exchange-prices"><span>{price(quote?.left.price, oil ? 3 : 2)}</span><span className="exchange-separator" aria-hidden="true">/</span><span>{price(metrics?.equivalent, oil ? 3 : 2)}</span></span><small className="exchange-pair-symbols">{quote ? `${quote.left.symbol} / ${quote.right.symbol}` : `${definition.left} / ${definition.right}`}</small></td>
     <td data-label={oil ? '价差 (USDT/桶)' : '价差'}><strong className={tone(metrics?.spread)}>{signed(metrics?.spread, oil ? 3 : 2, '')}</strong></td>
     {!oil && <td data-label="ADR 溢价率"><strong className={tone(metrics?.premium)}>{signed(metrics?.premium, 2, '%')}</strong></td>}
-    <td data-label="做空价差年化"><button type="button" className={`exchange-funding-trigger ${tone(metrics?.shortAnnualized)}`} onClick={event => onHistory(exchange, 'short', event.currentTarget)} aria-label={`查看 ${EXCHANGE_NAMES[exchange]} 做空价差的资金费结算历史`} aria-expanded={history === 'short'} aria-controls={historyId}><strong>{signed(metrics?.shortAnnualized == null ? null : metrics.shortAnnualized * 100, 2, '%')}</strong><ChevronDown size={13} aria-hidden="true" /></button></td>
-    <td data-label="做多价差年化"><button type="button" className={`exchange-funding-trigger ${tone(metrics?.longAnnualized)}`} onClick={event => onHistory(exchange, 'long', event.currentTarget)} aria-label={`查看 ${EXCHANGE_NAMES[exchange]} 做多价差的资金费结算历史`} aria-expanded={history === 'long'} aria-controls={historyId}><strong>{signed(metrics?.longAnnualized == null ? null : metrics.longAnnualized * 100, 2, '%')}</strong><ChevronDown size={13} aria-hidden="true" /></button></td>
-  </tr>;
-}
-
-/** Variational: listed like the workbench, without a read. */
-function UnconnectedRow({ market, exchange }: { market: SpreadMarket; exchange: Exchange }) {
-  const definition = exchangeDefinition(exchange, market), contracts = EXCHANGE_CONTRACTS[market];
-  const pairLabel = `${contracts.leftLabel} / ${market === 'oil' ? 'WTI' : '正股 ÷ 10'}`;
-  return <tr data-exchange={exchange} data-stale="false">
-    <td className="exchange-identity"><strong>{EXCHANGE_NAMES[exchange]}</strong><span>{definition.currency} · 标记价</span><small className="exchange-stale">未接入</small><small>需要登录会话，本服务暂不读取</small></td>
-    <td data-label={pairLabel}><span className="exchange-prices"><span>—</span><span className="exchange-separator" aria-hidden="true">/</span><span>—</span></span><small className="exchange-pair-symbols">{definition.left} / {definition.right}</small></td>
-    <td data-label={market === 'oil' ? '价差 (USDT/桶)' : '价差'}><strong>—</strong></td>
-    {market !== 'oil' && <td data-label="ADR 溢价率"><strong>—</strong></td>}
-    <td data-label="做空价差年化"><strong>—</strong></td>
-    <td data-label="做多价差年化"><strong>—</strong></td>
-  </tr>;
+    <td data-label="做空价差年化">{annualized('short', metrics?.shortAnnualized)}</td>
+    <td data-label="做多价差年化">{annualized('long', metrics?.longAnnualized)}</td>
+  </tr>{hasSession && sessionOpen && <tr className="variational-session-row"><td colSpan={5}><VariationalSessionForm id={sessionId} now={now} onClose={closeSession} onSaved={saved} onExpired={onExpired} /></td></tr>}</Fragment>;
 }

@@ -11,6 +11,7 @@ import { LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash }
 import type { WebApp } from './web-assets.ts';
 import { ANTHROPIC_RETENTION_DAYS } from './vendor/anthropic-market.mjs';
 import { supportsExchange, type Exchange } from './vendor/exchange-comparison.mjs';
+import { supportsFundingHistory } from './vendor/exchange-funding-history.mjs';
 import type { AssetStore } from './asset/store.ts';
 import { AssetConflict } from './asset/sync-lock.ts';
 import { AssetInputError, INPUT_INVALID } from './asset/validation.ts';
@@ -105,6 +106,8 @@ export interface ServiceViews {
     /** M-3c: false for a configured market switched off (its reads answer 423); the page's switch. */
     enabled?(market: keyof typeof MONITOR_NAMES): boolean;
     setControl?(market: keyof typeof MONITOR_NAMES, body: unknown): unknown;
+    /** M-3d: the saved Variational token (state without the token, and the page's save); undefined when oil is not configured. */
+    variationalSession?(): { view(): unknown; update(body: unknown): Promise<unknown> } | undefined;
   };
   /** The options module's reads and writes (service/options.ts); absent when the service runs no options module. */
   options?: {
@@ -337,6 +340,14 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       exactKeys(body, []);
       return send(response, 200, await alerts.test());
     }
+    // M-3d: the Variational token. The state never carries the token; a save is checked with Variational before it replaces the old one.
+    if (url.pathname === '/api/monitor/oil/exchanges/variational/session' && (request.method === 'GET' || request.method === 'POST')) {
+      if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
+      const session = views.monitor.state().markets.includes('oil') ? views.monitor.variationalSession?.() : undefined;
+      if (!session) return send(response, 404, { code: 'not_found', message: '本服务没有配置原油行情监控' });
+      if (request.method === 'GET') return send(response, 200, session.view());
+      return send(response, 200, await session.update(await readJson(request)));
+    }
     const exchangeRoute = request.method === 'GET' ? /^\/api\/monitor\/(oil|hynix)\/exchanges\/([a-z]{1,20})$/.exec(url.pathname) : null;
     if (exchangeRoute) {
       const market = exchangeRoute[1] as 'oil' | 'hynix', exchange = exchangeRoute[2]!, name = MONITOR_NAMES[market];
@@ -354,7 +365,7 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       const market = historyRoute[1] as 'oil' | 'hynix', exchange = historyRoute[2]!, name = MONITOR_NAMES[market];
       if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
       if (!views.monitor.state().markets.includes(market)) return send(response, 404, { code: 'not_found', message: `本服务没有配置${name}行情监控` });
-      if (!supportsExchange(market, exchange)) return send(response, 404, { code: 'not_found', message: `${name}结算历史不支持 ${exchange}` });
+      if (!supportsFundingHistory(market, exchange)) return send(response, 404, { code: 'not_found', message: `${name}结算历史不支持 ${exchange}` });
       const read = views.monitor.fundingHistory?.(market, exchange as Exchange);
       if (read === undefined) return send(response, 404, { code: 'not_found', message: `本服务没有配置${name}行情监控` });
       try { return send(response, 200, await read); }

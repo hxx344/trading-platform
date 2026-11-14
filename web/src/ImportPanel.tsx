@@ -53,7 +53,7 @@ function CrossexRow({ item, preview }: { item: CrossexItem; preview: boolean }) 
     </tr></tbody>
   </table></div>;
 }
-const MARKET_NAMES: Record<string, string> = { anthropic: 'Anthropic 价差', oil: '原油价差', hynix: '海力士溢价' };
+const MARKET_NAMES: Record<string, string> = { anthropic: 'Anthropic 价差', oil: '原油价差', hynix: '海力士溢价', perpetual: '合约价差' };
 function MonitorRow({ item, preview }: { item: MonitorItem; preview: boolean }) {
   return <div className="table-wrap"><table className="data" id="importMonitorTable">
     <thead><tr><th>行情监控</th><th>本项目</th><th>工作台 Monitor</th><th>{preview ? '说明' : '结果'}</th></tr></thead>

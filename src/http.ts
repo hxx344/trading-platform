@@ -30,7 +30,8 @@ const PAIR_READ_PATH = /^\/api\/transfer-pairs\/([0-9A-Za-z_-]{1,64})\/(balances
 const ADL_HISTORY_PATH = /^\/api\/adl\/pairs\/([0-9A-Za-z_-]{1,64})\/incidents$/;
 const TRANSFER_PAGE_MAX = 50, ADL_PAGE_MAX = 20;
 const MONITOR_PATHS = new Set(['/api/monitor/state', '/api/monitor/anthropic/quote', '/api/monitor/anthropic/candles', '/api/monitor/oil/quote', '/api/monitor/oil/candles', '/api/monitor/hynix/quote', '/api/monitor/hynix/candles']);
-const MONITOR_NAMES = { anthropic: 'Anthropic', oil: '原油', hynix: '海力士' } as const;
+const MONITOR_NAMES = { anthropic: 'Anthropic', oil: '原油', hynix: '海力士', perpetual: '合约价差' } as const;
+type CandleMarket = Exclude<keyof typeof MONITOR_NAMES, 'perpetual'>;
 const MONITOR_MAX_DAYS = ANTHROPIC_RETENTION_DAYS;
 const ASSET_READS = { '/api/asset/state': 'state', '/api/asset/ledger': 'ledger', '/api/asset/history': 'history', '/api/asset/daily-changes': 'dailyChanges', '/api/asset/withdrawals': 'withdrawals', '/api/asset/cash-flows': 'cashFlows' } as const;
 const ASSET_PERIOD_ID = /^[0-9A-Za-z-]{1,80}$/;
@@ -95,7 +96,7 @@ export interface ServiceViews {
   };
   /** The read-only market monitors; a market's reads give undefined when it is not configured and null until there is data. Absent without config.monitor. */
   monitor?: {
-    state(): { markets: readonly string[] }; quote(market: keyof typeof MONITOR_NAMES): unknown; candles(market: keyof typeof MONITOR_NAMES, days: number | null): unknown;
+    state(): { markets: readonly string[] }; quote(market: CandleMarket): unknown; candles(market: CandleMarket, days: number | null): unknown;
     /** The settled funding history of oil or Hynix (M-2d); before any settlement `{ notReady: <reason> | null }`. */
     funding?(market: 'oil' | 'hynix'): unknown;
     /** M-2c: one exchange's comparison row, read on demand; undefined when the market is not configured; rejects with the page's reason. */
@@ -109,6 +110,8 @@ export interface ServiceViews {
     setControl?(market: keyof typeof MONITOR_NAMES, body: unknown): unknown;
     /** M-3d: the saved Variational token (state without the token, and the page's save); undefined when oil is not configured. */
     variationalSession?(): { view(): unknown; update(body: unknown): Promise<unknown> } | undefined;
+    /** M-4a: the perpetual collector's table, summary and SSE stream; undefined when it is not configured. */
+    perpetual?(): { snapshot(): unknown; summary(): unknown; stream(request: IncomingMessage, response: ServerResponse): void } | undefined;
   };
   /** The options module's reads and writes (service/options.ts); absent when the service runs no options module. */
   options?: {
@@ -320,16 +323,25 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       return send(response, 200, target[2] === 'update' ? rules.update(target[1]!, body) : rules.act(target[1]!, target[2]!, body));
     }
     // M-3c: the market's switch, and the reads of a market switched off (its data is kept, nothing is collected).
-    const controlRoute = request.method === 'POST' ? /^\/api\/monitor\/(anthropic|oil|hynix)\/control$/.exec(url.pathname) : null;
+    const controlRoute = request.method === 'POST' ? /^\/api\/monitor\/(anthropic|oil|hynix|perpetual)\/control$/.exec(url.pathname) : null;
     if (controlRoute) {
       const market = controlRoute[1] as keyof typeof MONITOR_NAMES;
       if (!views?.monitor?.setControl) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
       if (!views.monitor.state().markets.includes(market)) return send(response, 404, { code: 'not_found', message: `本服务没有配置${MONITOR_NAMES[market]}行情监控` });
       return send(response, 200, views.monitor.setControl(market, await readJson(request)));
     }
-    const marketRead = /^\/api\/monitor\/(anthropic|oil|hynix)\//.exec(url.pathname)?.[1] as keyof typeof MONITOR_NAMES | undefined;
+    const marketRead = /^\/api\/monitor\/(anthropic|oil|hynix|perpetual)\//.exec(url.pathname)?.[1] as keyof typeof MONITOR_NAMES | undefined;
     if (marketRead && views?.monitor?.enabled && views.monitor.state().markets.includes(marketRead) && !views.monitor.enabled(marketRead)) {
-      return send(response, 423, { code: 'monitor_disabled', message: `${MONITOR_NAMES[marketRead]}监控已关闭，行情采集与自动告警已暂停；开启后恢复` });
+      return send(response, 423, { code: 'monitor_disabled', message: marketRead === 'perpetual' ? '合约价差监控已关闭，行情采集已暂停；开启后重新采集' : `${MONITOR_NAMES[marketRead]}监控已关闭，行情采集与自动告警已暂停；开启后恢复` });
+    }
+    // M-4a: the perpetual table (whole), its summary, and the SSE stream of patches (frames as the workbench's).
+    const perpetualRoute = request.method === 'GET' ? /^\/api\/monitor\/perpetual\/(quote|summary|stream)$/.exec(url.pathname)?.[1] : undefined;
+    if (perpetualRoute) {
+      if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
+      const perpetual = views.monitor.state().markets.includes('perpetual') ? views.monitor.perpetual?.() : undefined;
+      if (!perpetual) return send(response, 404, { code: 'not_found', message: '本服务没有配置合约价差行情监控' });
+      if (perpetualRoute === 'stream') return perpetual.stream(request, response);
+      return send(response, 200, perpetualRoute === 'quote' ? perpetual.snapshot() : perpetual.summary());
     }
     const alertRoute = /^\/api\/monitor\/(oil|hynix)\/alerts(\/test)?$/.exec(url.pathname);
     if (alertRoute && (request.method === 'GET' ? !alertRoute[2] : request.method === 'POST')) {
@@ -391,7 +403,7 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'GET' && MONITOR_PATHS.has(url.pathname)) {
       if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
       if (url.pathname === '/api/monitor/state') return send(response, 200, views.monitor.state());
-      const [, , , market, read] = url.pathname.split('/') as [string, string, string, keyof typeof MONITOR_NAMES, 'quote' | 'candles'];
+      const [, , , market, read] = url.pathname.split('/') as [string, string, string, CandleMarket, 'quote' | 'candles'];
       const name = MONITOR_NAMES[market];
       // A market this service does not run answers 404 before its parameters are checked.
       if (!views.monitor.state().markets.includes(market)) return send(response, 404, { code: 'not_found', message: `本服务没有配置${name}行情监控` });

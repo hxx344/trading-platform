@@ -57,6 +57,8 @@
 
 **Var token（M-3d-2，v0.34.0）**：勾选「同时导入 Var token」时，读工作台 `modules/monitor/variational-session.json`（只读取权限为 600、16 KiB 以内的普通文件，只校验格式与到期，不联网），在档位之后、配置之前由写入子进程写本服务的 `monitor-variational-session.json`；本服务的 token 是同一个或到期不早于工作台的时保留本服务的。只写 token 时不改配置、不重启，运行中的行情监控下一次读取即换上。规则与回滚见 [monitor.md](monitor.md) 的 M-3d-2。
 
+**合约价差（M-4a，v0.36.0）**：`monitor.perpetual` 暂不由导入补上。已有配置里写了它时原样保留，预览列出“合约价差”。M-4b 起随页面一起加入导入（补上缺的市场时一并补上）。在那之前只能手写配置启用，见 [monitor.md](monitor.md) 的 M-4a 实施记录。
+
 ## 4 页面请求
 
 `POST /api/import` 的导入请求新增以下字段，逐项严格校验（与 `oil`、`options` 同一写法，`exactKeys` 拒绝未知字段）：

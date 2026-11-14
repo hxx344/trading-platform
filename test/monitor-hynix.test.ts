@@ -286,7 +286,7 @@ test('配置与接口：monitor.hynix 不带设置；只配海力士时其他市
     assert.equal(hynixHistory(all).points.length, all.rows.length);
     assert.equal(hynixHistory(week).windowDays, 7);
     assert.equal(hynixQuote(quote.body).status, 'live');
-    assert.deepEqual(Object.keys(monitorStatus(runtime)), ['anthropic', 'oil', 'hynix', 'controls']);
+    assert.deepEqual(Object.keys(monitorStatus(runtime)), ['anthropic', 'oil', 'hynix', 'perpetual', 'controls']);
     assert.deepEqual([monitorStatus(runtime).oil, monitorStatus(runtime).hynix!.candleRows], [null, all.rows.length]);
   } finally {
     await new Promise(resolve => server.close(resolve));

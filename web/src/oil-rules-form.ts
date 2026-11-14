@@ -8,12 +8,21 @@ export interface OilRuleConfig {
 }
 export interface OilRuleReading { value: string; met: boolean; side: 'sell' | 'buy'; hits: number; signaled: boolean; at: number; stale: boolean }
 export interface OilRuleEvent { at: number; kind: 'signal' | 'reset' | 'note'; message: string; action?: 'open' | 'close'; value?: string; threshold?: string; hits?: number; bzAt?: number; clAt?: number }
+export type RulePhase = 'idle' | 'opening' | 'holding' | 'closing' | 'review';
+export interface OilRuleLive {
+  enabled: boolean; phase: RulePhase; phaseName: string;
+  held: { symbol: 'CLUSDT' | 'BZUSDT'; side: 'long' | 'short'; quantity: string; barrels: string }[] | null;
+  pending: { action: 'open' | 'close'; at: number } | null; job: { id: string; action: 'open' | 'close'; at: number } | null;
+  opensToday: number; failures: number; retryAt: number | null; reason: string | null;
+}
 export interface OilRule {
-  id: string; revision: number; createdAt: number; title: string; mode: 'observe'; observing: boolean; config: OilRuleConfig; problem: string | null;
+  id: string; revision: number; createdAt: number; title: string; mode: 'observe' | 'live'; observing: boolean; config: OilRuleConfig; problem: string | null;
   observation: { open: OilRuleReading | null; close: OilRuleReading | null; note: string | null } | null;
+  /** Live mode only (docs/oil.md 7.3). */
+  live: OilRuleLive | null;
   observations: OilRuleEvent[]; events: OilRuleEvent[];
 }
-export type OilRulesView = { available: true; now: number; maxRules: number; quoteMaxAgeMs: number; venues: RuleVenue[]; rules: OilRule[] } | { available: false; error: string; rules: [] };
+export type OilRulesView = { available: true; liveAvailable: boolean; now: number; maxRules: number; quoteMaxAgeMs: number; failureLimit: number; venues: RuleVenue[]; rules: OilRule[] } | { available: false; error: string; rules: [] };
 
 export interface RuleForm { name: string; venue: RuleVenue; direction: RuleDirection; openThreshold: string; closeThreshold: string; barrels: string; confirmSamples: string; maxOpensPerDay: string }
 export const emptyRuleForm = (venue: RuleVenue): RuleForm => ({ name: '', venue, direction: 'short', openThreshold: '', closeThreshold: '', barrels: '', confirmSamples: '3', maxOpensPerDay: '3' });
@@ -50,4 +59,37 @@ export const directionText = (direction: RuleDirection): string => direction ===
 export function conditionText(config: OilRuleConfig): string {
   const short = config.direction === 'short';
   return `开仓：价差 ${short ? '≥' : '≤'} ${config.openThreshold} USDT/桶 · 平仓：价差 ${short ? '≤' : '≥'} ${config.closeThreshold} USDT/桶`;
+}
+
+export type RuleAction = 'start' | 'stop' | 'live' | 'enable' | 'disable' | 'observe' | 'reset' | 'delete';
+/** A live rule with an order on the way: it cannot be edited, deleted or reset until the job ends. */
+export const ruleBusy = (live: OilRuleLive): boolean => live.phase === 'opening' || live.phase === 'closing' || live.pending !== null || live.job !== null;
+/** The actions the service would accept now (src/oil/rules.ts act), so the page offers only those. */
+export function ruleActions(rule: OilRule, liveAvailable: boolean): { actions: RuleAction[]; edit: boolean; lockSides: boolean } {
+  const live = rule.live;
+  if (rule.mode === 'observe' || !live) {
+    // A rule whose settings cannot be read can still be stopped, but not started.
+    const actions: RuleAction[] = rule.observing ? ['stop'] : rule.problem ? [] : ['start'];
+    if (liveAvailable && !rule.problem) actions.push('live');
+    actions.push('delete');
+    return { actions, edit: true, lockSides: false };
+  }
+  const busy = ruleBusy(live), actions: RuleAction[] = [];
+  if (live.enabled) actions.push('disable');
+  else if (live.phase !== 'review' && liveAvailable && !rule.problem) actions.push('enable');
+  if ((live.phase === 'review' || live.phase === 'holding') && !busy) actions.push('reset');
+  if (!live.enabled && live.phase === 'idle' && !live.held && !busy) actions.push('observe');
+  if (live.phase === 'idle' && !live.held && !busy) actions.push('delete');
+  // An enabled rule is disabled before an edit, so new sizes and thresholds go through the enable confirmation again.
+  return { actions, edit: !busy && !live.enabled, lockSides: live.phase !== 'idle' };
+}
+
+const sideText = (side: 'long' | 'short') => side === 'long' ? '多' : '空';
+export const heldText = (held: NonNullable<OilRuleLive['held']>): string => `${held.map(leg => `${leg.symbol === 'CLUSDT' ? 'CL' : 'BZ'} ${sideText(leg.side)} ${leg.quantity}`).join(' · ')}（每腿 ${held[0]?.barrels ?? '0'} 桶）`;
+
+/** The browser confirmation before a rule may send orders, or before its record of a position is dropped. */
+export function liveConfirmText(rule: OilRule, action: 'live' | 'enable' | 'reset', venueName: string): string {
+  const { config } = rule;
+  if (action === 'reset') return `确认已在交易所核对并处理「${rule.title}」的仓位？\n重置后规则不再记录之前的持仓${rule.live?.held ? `（${heldText(rule.live.held)}）` : ''}，回到等待开仓、未启用；不会向交易所发送任何委托。`;
+  return `${action === 'live' ? `将「${rule.title}」转为实盘并启用？` : `启用实盘规则「${rule.title}」？`}\n条件连续满足 ${config.confirmSamples} 次后，服务器会在 ${venueName} 自动下单：开仓每腿 ${config.barrels} 桶（CL 首腿 IOC 市价带价格保护，BZ 对冲腿市价），平仓按规则自己的持有量；每日最多开仓 ${config.maxOpensPerDay} 次。\n名义金额上限、账户核对与价格保护照常生效。关闭页面不影响，停用前会一直运行。`;
 }

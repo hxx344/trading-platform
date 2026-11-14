@@ -285,7 +285,7 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
         if (request.method === 'GET') return send(response, 200, rules.view());
         if (request.method === 'POST') return send(response, 200, rules.create(await readJson(request)));
       }
-      const target = request.method === 'POST' ? /^\/api\/oil\/rules\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/(update|start|stop|delete)$/.exec(url.pathname) : null;
+      const target = request.method === 'POST' ? /^\/api\/oil\/rules\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/(update|start|stop|delete|live|enable|disable|observe|reset)$/.exec(url.pathname) : null;
       if (!target) return send(response, 404, { code: 'not_found', message: '不存在' });
       const body = await readJson(request);
       return send(response, 200, target[2] === 'update' ? rules.update(target[1]!, body) : rules.act(target[1]!, target[2]!, body));

@@ -30,6 +30,20 @@ test('正常双腿：预览不下单，确认后先发首腿，按成交量对�
   assert.deepEqual([h.binance.arrived.place, h.bybit.arrived.place], [1, 1]);
 }));
 
+test('只读查询确认过的任务：查到原任务、没确认过为空且不建任务；换会话、换预览或别的命令占用都拒绝', () => withHarness(async h => {
+  bindAccounts(h.ex);
+  const { preview, requestId, jobId } = await previewAndConfirm(h);
+  assert.equal(h.ex.confirmedJob(requestId, preview.id, SESSION), jobId);
+  assert.equal(h.ex.confirmedJob(randomUUID(), preview.id, SESSION), null);
+  assert.equal(h.ex.recentJobs(20).length, 1, '查询不建任务');
+  assert.throws(() => h.ex.confirmedJob(requestId, preview.id, 'other-session-01'), code('request_reused'));
+  assert.throws(() => h.ex.confirmedJob(requestId, randomUUID(), SESSION), code('request_reused'));
+  const stopId = randomUUID();
+  h.ex.requestStop(jobId, stopId, SESSION);
+  assert.throws(() => h.ex.confirmedJob(stopId, preview.id, SESSION), code('request_reused'));
+  await settle(h, jobId);
+}));
+
 test('C03 重复确认只返回同一任务；换会话、换载荷、已消费或过期的预览都被拒绝', () => withHarness(async h => {
   bindAccounts(h.ex);
   const { preview, requestId, jobId } = await previewAndConfirm(h);

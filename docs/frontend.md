@@ -292,7 +292,7 @@
 
 **对照的工作台页面**：`modules/monitor/app/exchange-comparison.tsx`（提交 `568a20d`）与 `hooks/use-exchange-quotes.ts`（`8470785`），放在原油、海力士详情的图表组之后、近期观察之前（同工作台 `app/oil-panel.tsx` 的 `children` 位置）。样式复制自 `app/globals.css`（`77f3cf2`）的交易所对比规则与“旧”标签，全部加 `.monitor-desk` 前缀，追加在 `web/src/monitor.css` 末尾，去掉了资金费面板与 Hub 卡片的规则。
 
-**页面**：`web/src/MonitorExchanges.tsx`：标题与刷新按钮、对比表（交易所 / 报价口径、两腿价格、价差、海力士多一列 ADR 溢价率、做空 / 做多价差年化）、说明、可展开的资金费周期与计算口径。每个交易所一行，各自用 `useLiveResource` 每 15 秒读一次（超时 20 秒，Lighter 冷启动要先读目录再取快照），某一家失败只影响那一行（保留上次数据并标“保留数据 · 待更新”与“旧”）。时间按 UTC 显示。年化不可点（结算历史随 M-2d）；Variational 一行固定“未接入”。
+**页面**：`web/src/MonitorExchanges.tsx`：标题与刷新按钮、对比表（交易所 / 报价口径、两腿价格、价差、海力士多一列 ADR 溢价率、做空 / 做多价差年化）、说明、可展开的资金费周期与计算口径。每个交易所一行，各自用 `useLiveResource` 每 15 秒读一次（超时 20 秒，Lighter 冷启动要先读目录再取快照），某一家失败只影响那一行（保留上次数据并标“保留数据 · 待更新”与“旧”）。时间按 UTC 显示。年化当时不可点（M-2d-3 起可点开结算历史）；Variational 一行固定“未接入”。
 
 **验证**：`scripts/dev-monitor.ts` 替身行情下 1280 与 390 宽度，原油 7 行、海力士 6 行齐全，展开说明、点刷新正常，无横向溢出（390 宽度按工作台改为卡片式行）；控制台只有未配置模块的入口探测 404。
 
@@ -317,3 +317,13 @@
 **验证**：见 [docs/reviews/2026-11-14-monitor-m2e.md](reviews/2026-11-14-monitor-m2e.md) 的浏览器验收一节。
 
 **回滚**：`sudo bash install.sh --version v0.24.0`，不用改配置。
+
+## 行情监控页：对比表结算历史（Monitor M-2d-3，v0.27.0）
+
+**对照的工作台页面**：`modules/monitor/app/exchange-funding-history.tsx`（提交 `7896143`）与 `app/exchange-comparison.tsx` 的年化按钮，规则复制自 `lib/exchange-funding-*.ts`（在 `src/vendor/exchange-funding-history.mjs`）。样式复制自 `app/globals.css`（`77f3cf2`）第 7–10 行，全部加 `.monitor-desk` 前缀，追加在 `web/src/monitor.css` 末尾；累计读数用等宽数字。
+
+**页面**：`web/src/MonitorExchanges.tsx` 的做空 / 做多年化改为按钮（`aria-expanded` / `aria-controls`，带展开箭头），同一时间只展开一家一个方向；表说明多一句“点击年化可查看最近实际结算。”。面板 `web/src/MonitorFundingHistory.tsx`：标题与刷新、收起按钮、说明、状态行（已更新 / 部分记录待更新 / 保留历史 · 待更新与采集时间、服务给的原因）、快捷区间与自定义 UTC 区间（`datetime-local`，校验无效时间与 60 天上限）、两腿各自的累计读数、覆盖说明、结算明细表与翻页。`useLiveResource` 每 5 分钟读一次，超时 75 秒（首次回补 60 天可能要十几秒），没有数据且出错时每 30 秒重试；收起时焦点回到点开它的按钮。时间全部按 UTC（工作台是北京时间）。
+
+**验证**：见 [docs/reviews/2026-11-14-monitor-m2d3.md](reviews/2026-11-14-monitor-m2d3.md) 的浏览器验收一节。
+
+**回滚**：`sudo bash install.sh --version v0.26.0`，不用改配置。

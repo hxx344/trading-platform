@@ -1,17 +1,17 @@
-import { RefreshCw } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { ChevronDown, RefreshCw } from 'lucide-react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import {
   DISPLAY_EXCHANGES, EXCHANGE_CONTRACTS, EXCHANGE_NAMES, EXCHANGE_REFRESH_MS, calculateExchangeSpread, exchangeDefinition, externalQuoteStale,
   supportsExchange, validateExchangeQuote, type Exchange, type ExchangeLeg, type ExchangeQuote, type SpreadMarket,
 } from '../../src/vendor/exchange-comparison.mjs';
-import { date } from './MonitorChart.tsx';
+import { FundingHistoryPanel, utc, type FundingHistorySelection } from './MonitorFundingHistory.tsx';
 import { useLiveResource } from './use-live-resource.ts';
 
 // The multi-exchange comparison under the oil and Hynix charts, laid out as the workbench's modules/monitor/app/
 // exchange-comparison.tsx (568a20d) with its hook hooks/use-exchange-quotes.ts (8470785): every exchange is read on its own every 15 s
-// (20 s timeout: a cold Lighter read is a catalog and a stream snapshot in turn) from the service, which reads the venue on demand. Changed: times are UTC like the rest of this page; the
-// annualized figures are plain text, since the settlement history behind them comes with M-2d; Variational needs a login
-// session and shows as 未接入; the four-leg hedge simulation and the hub summary hand-off are left out.
+// (20 s timeout: a cold Lighter read is a catalog and a stream snapshot in turn) from the service, which reads the venue on demand. Changed: times are UTC like the rest of this page;
+// Variational needs a login session and shows as 未接入, without a settlement history; the four-leg hedge simulation and the
+// hub summary hand-off are left out. The annualized figures open the settlement history (MonitorFundingHistory.tsx, M-2d-3).
 const READ_TIMEOUT_MS = 20_000;
 type RowState = { quote: ExchangeQuote | null; error: string };
 
@@ -21,7 +21,6 @@ const price = (value: number | undefined, digits: number) => value === undefined
 const rate = (value: number | null) => signed(value === null ? null : value * 100, 5, '%');
 const fundingPriceLabels = { oracle: '预言机价格', index: '指数价格', mark: '标记价格' } as const;
 const age = (fetchedAt: string, now: number) => { const seconds = Math.max(0, Math.round((now - Date.parse(fetchedAt)) / 1000)); return !Number.isFinite(seconds) ? '' : seconds < 60 ? `${seconds} 秒前` : seconds < 3600 ? `${Math.floor(seconds / 60)} 分钟前` : `${Math.floor(seconds / 3600)} 小时前`; };
-const utc = (value: string) => `${date(value, true)} ${new Date(value).toISOString().slice(11, 19)} UTC`;
 const settlement = (leg: ExchangeLeg) => leg.nextFundingAt ? `${utc(leg.nextFundingAt)}${leg.nextFundingEstimated ? '（推算）' : ''}` : '—';
 const readable = (error: Error | null, kept: boolean) => !error ? '' : /[一-鿿]/.test(error.message) ? error.message : kept ? '本轮更新失败，保留上次数据' : '读取失败，稍后自动重试';
 
@@ -30,6 +29,18 @@ export function ExchangeComparison({ market, onExpired }: { market: SpreadMarket
   const [states, setStates] = useState<Partial<Record<Exchange, RowState>>>({});
   const [refreshing, setRefreshing] = useState(false);
   const refreshers = useRef(new Map<Exchange, () => Promise<void>>());
+  const [historySelection, setHistorySelection] = useState<FundingHistorySelection | null>(null);
+  const historyId = useId();
+  const historyTrigger = useRef<HTMLButtonElement | null>(null);
+  const selectHistory = useCallback((exchange: Exchange, direction: FundingHistorySelection['direction'], trigger: HTMLButtonElement) => {
+    historyTrigger.current = trigger;
+    setHistorySelection(current => current?.exchange === exchange && current.direction === direction ? null : { exchange, direction });
+  }, []);
+  const closeHistory = () => {
+    setHistorySelection(null);
+    historyTrigger.current?.focus({ preventScroll: true });
+    historyTrigger.current?.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+  };
   useEffect(() => { const timer = setInterval(() => setNow(Date.now()), 5000); return () => clearInterval(timer); }, []);
   const report = useCallback((exchange: Exchange, state: RowState) => setStates(previous => ({ ...previous, [exchange]: state })), []);
   const register = useCallback((exchange: Exchange, refresh: (() => Promise<void>) | null) => { if (refresh) refreshers.current.set(exchange, refresh); else refreshers.current.delete(exchange); }, []);
@@ -45,10 +56,11 @@ export function ExchangeComparison({ market, onExpired }: { market: SpreadMarket
     <table className="exchange-table">
       <thead><tr><th>交易所 / 报价口径</th><th>{contracts.leftLabel} / {rightHeading}</th><th>{oil ? '价差 (USDT/桶)' : '价差'}</th>{!oil && <th>ADR 溢价率</th>}<th>做空价差年化</th><th>做多价差年化</th></tr></thead>
       <tbody>{exchanges.map(exchange => supportsExchange(market, exchange)
-        ? <ExchangeRow key={exchange} market={market} exchange={exchange} now={now} onExpired={onExpired} onReport={report} onRegister={register} />
+        ? <ExchangeRow key={exchange} market={market} exchange={exchange} now={now} onExpired={onExpired} onReport={report} onRegister={register} history={historySelection?.exchange === exchange ? historySelection.direction : null} historyId={historyId} onHistory={selectHistory} />
         : <UnconnectedRow key={exchange} market={market} exchange={exchange} />)}</tbody>
     </table>
-    <p className="exchange-caption">正值收款，负值付款；按当前费率简单年化，以两腿总名义金额为分母。{oil ? '做空：空布伦特、多 WTI；做多反向。' : '做空：空 ADR、多正股；做多反向。'}</p>
+    <p className="exchange-caption">正值收款，负值付款；按当前费率简单年化，以两腿总名义金额为分母。{oil ? '做空：空布伦特、多 WTI；做多反向。' : '做空：空 ADR、多正股；做多反向。'}点击年化可查看最近实际结算。</p>
+    {historySelection && <FundingHistoryPanel key={market} id={historyId} market={market} selection={historySelection} now={now} onClose={closeHistory} onExpired={onExpired} />}
     <details className="exchange-details"><summary>资金费周期与计算口径</summary><div className="exchange-details-body">
       {exchanges.map(exchange => {
         if (!supportsExchange(market, exchange)) return <article key={exchange}><strong>{EXCHANGE_NAMES[exchange]}</strong><p>需要登录会话读取标记价格，本服务暂未接入。</p></article>;
@@ -63,9 +75,12 @@ export function ExchangeComparison({ market, onExpired }: { market: SpreadMarket
   </section></div>;
 }
 
-function ExchangeRow({ market, exchange, now, onExpired, onReport, onRegister }: {
+function ExchangeRow({ market, exchange, now, onExpired, onReport, onRegister, history, historyId, onHistory }: {
   market: SpreadMarket; exchange: Exchange; now: number; onExpired: () => void;
   onReport: (exchange: Exchange, state: RowState) => void; onRegister: (exchange: Exchange, refresh: (() => Promise<void>) | null) => void;
+  /** The direction whose settlement history is open for this exchange, if any. */
+  history: FundingHistorySelection['direction'] | null; historyId: string;
+  onHistory: (exchange: Exchange, direction: FundingHistorySelection['direction'], trigger: HTMLButtonElement) => void;
 }) {
   const parse = useCallback((raw: unknown) => validateExchangeQuote(raw, exchange, market), [exchange, market]);
   const live = useLiveResource<ExchangeQuote>(`/api/monitor/${market}/exchanges/${exchange}`, { intervalMs: EXCHANGE_REFRESH_MS, timeoutMs: READ_TIMEOUT_MS, parse, onExpired });
@@ -84,8 +99,8 @@ function ExchangeRow({ market, exchange, now, onExpired, onReport, onRegister }:
     <td data-label={pairLabel}><span className="exchange-prices"><span>{price(quote?.left.price, oil ? 3 : 2)}</span><span className="exchange-separator" aria-hidden="true">/</span><span>{price(metrics?.equivalent, oil ? 3 : 2)}</span></span><small className="exchange-pair-symbols">{quote ? `${quote.left.symbol} / ${quote.right.symbol}` : `${definition.left} / ${definition.right}`}</small></td>
     <td data-label={oil ? '价差 (USDT/桶)' : '价差'}><strong className={tone(metrics?.spread)}>{signed(metrics?.spread, oil ? 3 : 2, '')}</strong></td>
     {!oil && <td data-label="ADR 溢价率"><strong className={tone(metrics?.premium)}>{signed(metrics?.premium, 2, '%')}</strong></td>}
-    <td data-label="做空价差年化"><strong className={tone(metrics?.shortAnnualized)}>{signed(metrics?.shortAnnualized == null ? null : metrics.shortAnnualized * 100, 2, '%')}</strong></td>
-    <td data-label="做多价差年化"><strong className={tone(metrics?.longAnnualized)}>{signed(metrics?.longAnnualized == null ? null : metrics.longAnnualized * 100, 2, '%')}</strong></td>
+    <td data-label="做空价差年化"><button type="button" className={`exchange-funding-trigger ${tone(metrics?.shortAnnualized)}`} onClick={event => onHistory(exchange, 'short', event.currentTarget)} aria-label={`查看 ${EXCHANGE_NAMES[exchange]} 做空价差的资金费结算历史`} aria-expanded={history === 'short'} aria-controls={historyId}><strong>{signed(metrics?.shortAnnualized == null ? null : metrics.shortAnnualized * 100, 2, '%')}</strong><ChevronDown size={13} aria-hidden="true" /></button></td>
+    <td data-label="做多价差年化"><button type="button" className={`exchange-funding-trigger ${tone(metrics?.longAnnualized)}`} onClick={event => onHistory(exchange, 'long', event.currentTarget)} aria-label={`查看 ${EXCHANGE_NAMES[exchange]} 做多价差的资金费结算历史`} aria-expanded={history === 'long'} aria-controls={historyId}><strong>{signed(metrics?.longAnnualized == null ? null : metrics.longAnnualized * 100, 2, '%')}</strong><ChevronDown size={13} aria-hidden="true" /></button></td>
   </tr>;
 }
 

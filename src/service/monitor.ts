@@ -52,6 +52,9 @@ export function monitorViews(monitor: MonitorRuntime) {
     /** One exchange's comparison row; undefined when the market is not configured. Rejects with the page's reason. */
     exchange: (market: 'oil' | 'hynix', exchange: Exchange): Promise<unknown> | undefined =>
       monitor.exchanges && monitor.config[market] ? monitor.exchanges.quote(market, exchange) : undefined,
+    /** One exchange's settled funding history (M-2d-3); undefined when the market is not configured. Rejects with the page's reason. */
+    fundingHistory: (market: 'oil' | 'hynix', exchange: Exchange): Promise<unknown> | undefined =>
+      monitor.exchanges && monitor.config[market] ? monitor.exchanges.fundingHistory(market, exchange) : undefined,
   };
 }
 

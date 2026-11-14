@@ -11,12 +11,16 @@ import type { Asset, Connection, Ledger } from './types.ts';
 import { seedLedger, type SourceLedger } from './seed.ts';
 import { EXAMPLE_SOURCE } from './source-ledger.ts';
 import { readSnapshotHistory } from './snapshot-history.ts';
-import { readAsterAccounts } from './aster-accounts.ts';
+import { aggregateAster, readAsterAccounts } from './aster-accounts.ts';
 import { knownAssetValue } from './asset-values.ts';
 import { chinaDay } from './withdrawals.ts';
 import { CASH_FLOW_KEY, parseCashFlow, readCashFlowAudit, type CashFlowRecord } from './cash-flows.ts';
 import { acquireSyncLock, AssetConflict, LOCK_BUSY, NOT_IMPORTED, type SyncLease } from './sync-lock.ts';
-import { parseEdit, parseFx, parseWithdrawal, parseWithdrawalId } from './validation.ts';
+import { parseAsterAccount, parseAsterAccountDelete, parseConnection, parseDisconnect, parseEdit, parseFx, parseWithdrawal, parseWithdrawalId } from './validation.ts';
+import { dataDirVault } from './credentials.ts';
+import * as sync from './sync.ts';
+import { liveSources, type AssetSources, type SyncContext } from './sync.ts';
+import type { Fetcher } from './sources/http.ts';
 import * as writes from './writes.ts';
 import { DAILY_CHANGE_DAYS, readDailyChanges, shiftDay } from './daily-changes.ts';
 import {
@@ -27,34 +31,57 @@ import {
 const EXCHANGES = ['bybit', 'aster', 'binance', 'okx', 'gate', 'variational', 'hyperliquid', 'rh-lighter'] as const;
 const DAILY_KEY = "date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'";
 
+type LedgerRows = { assets: { data: string }[]; settings: { key: string; value: string }[]; connections: string[]; snapshots: Ledger['history'] };
+
 /**
  * Adapted from readLedger in project_aggregation modules/asset/lib/store.ts (0014655). Changes: no owner and no
  * initialize() (the data comes from the import); the source ledger must be there instead of falling back to example
- * data; no credentials are kept here, so every connection and Aster account reads as not configured (the workbench
- * takes `configured` from its connections table); the Aster connection keeps its imported status instead of being
- * re-aggregated over the accounts (that aggregate only feeds the connections view, which this batch does not show).
+ * data; the clock is passed in (the Aster aggregate's time). Since A-3 `configured` comes from the connections table as
+ * in the workbench, and saved Aster accounts are aggregated into the Aster connection the same way.
  */
-export async function readLedger(database: QueryDatabase, includeHistory: boolean): Promise<Ledger> {
-  const [rows, settings, snapshotRows] = await Promise.all([
-    database.prepare('SELECT data FROM assets').all<{ data: string }>(),
-    database.prepare('SELECT key,value FROM settings').all<{ key: string; value: string }>(),
-    includeHistory ? readSnapshotHistory(database) : Promise.resolve([]),
-  ]);
-  const source = settings.results.find(s => s.key === 'source-ledger');
+function assembleLedger(rows: LedgerRows, includeHistory: boolean, at: number): Ledger {
+  const { settings, connections } = rows;
+  const source = settings.find(s => s.key === 'source-ledger');
   if (!source) throw new Error('资产库缺少原表数据（source-ledger），请重新导入');
   const ledger = seedLedger(JSON.parse(source.value) as SourceLedger, includeHistory);
-  ledger.assets = rows.results.map(r => { const asset = JSON.parse(r.data) as Asset; return { ...asset, value: knownAssetValue(asset) }; }).sort((a, b) => Number(a.id.slice(4)) - Number(b.id.slice(4)));
-  ledger.fx = Number(settings.results.find(s => s.key === 'fx')?.value ?? ledger.fx);
-  ledger.fxStatus = JSON.parse(settings.results.find(s => s.key === 'fx-status')?.value ?? 'null') ?? ledger.fxStatus;
+  ledger.assets = rows.assets.map(r => { const asset = JSON.parse(r.data) as Asset; return { ...asset, value: knownAssetValue(asset) }; }).sort((a, b) => Number(a.id.slice(4)) - Number(b.id.slice(4)));
+  ledger.fx = Number(settings.find(s => s.key === 'fx')?.value ?? ledger.fx);
+  ledger.fxStatus = JSON.parse(settings.find(s => s.key === 'fx-status')?.value ?? 'null') ?? ledger.fxStatus;
   for (const name of EXCHANGES) {
-    const meta = settings.results.find(s => s.key === name + '-status');
-    ledger.connections[name] = { ...ledger.connections[name], ...(meta ? JSON.parse(meta.value) : {}), configured: false } as Connection;
+    const meta = settings.find(s => s.key === name + '-status');
+    ledger.connections[name] = { ...ledger.connections[name], ...(meta ? JSON.parse(meta.value) : {}), configured: connections.includes(name) } as Connection;
   }
-  const savedAccounts = settings.results.find(s => s.key === 'aster-accounts')?.value;
-  ledger.asterAccounts = readAsterAccounts(savedAccounts, [], ledger.assets.find(a => a.mode === 'aster'), ledger.connections.aster);
-  ledger.history.push(...snapshotRows);
-  ledger.withdrawals = JSON.parse(settings.results.find(s => s.key === 'withdrawals')?.value ?? '[]');
+  const savedAccounts = settings.find(s => s.key === 'aster-accounts')?.value;
+  const asterAsset = ledger.assets.find(a => a.mode === 'aster');
+  ledger.asterAccounts = readAsterAccounts(savedAccounts, connections, asterAsset, ledger.connections.aster);
+  if (savedAccounts !== undefined && asterAsset) ledger.connections.aster = aggregateAster(ledger.asterAccounts, asterAsset, new Date(at).toISOString()).connection;
+  ledger.history.push(...rows.snapshots);
+  ledger.withdrawals = JSON.parse(settings.find(s => s.key === 'withdrawals')?.value ?? '[]');
   return ledger;
+}
+/** A file imported before A-3 and opened read-only has no connections table: nothing is connected. */
+const noConnectionsTable = (error: unknown): string[] => { if (error instanceof Error && /no such table: connections/.test(error.message)) return []; throw error; };
+const CONNECTION_NAMES = 'SELECT exchange FROM connections';
+
+export async function readLedger(database: QueryDatabase, includeHistory: boolean, at = Date.now()): Promise<Ledger> {
+  const [rows, settings, connections, snapshotRows] = await Promise.all([
+    database.prepare('SELECT data FROM assets').all<{ data: string }>(),
+    database.prepare('SELECT key,value FROM settings').all<{ key: string; value: string }>(),
+    database.prepare(CONNECTION_NAMES).all<{ exchange: string }>().then(found => found.results.map(row => row.exchange), noConnectionsTable),
+    includeHistory ? readSnapshotHistory(database) : Promise.resolve([]),
+  ]);
+  return assembleLedger({ assets: rows.results, settings: settings.results, connections, snapshots: snapshotRows }, includeHistory, at);
+}
+
+/** readLedger without history, synchronously: for a write that reads the ledger inside its transaction. */
+export function currentLedger(database: Pick<AssetDb, 'prepare'>, at: number): Ledger {
+  let connections: string[];
+  try { connections = database.prepare(CONNECTION_NAMES).rows<{ exchange: string }>().map(row => row.exchange); } catch (error) { connections = noConnectionsTable(error); }
+  return assembleLedger({
+    assets: database.prepare('SELECT data FROM assets').rows<{ data: string }>(),
+    settings: database.prepare('SELECT key,value FROM settings').rows<{ key: string; value: string }>(),
+    connections, snapshots: [],
+  }, false, at);
 }
 
 /** Adapted from loadCashFlows in project_aggregation modules/asset/lib/cash-flow-store.ts (0014655): no owner. */
@@ -105,6 +132,16 @@ export interface AssetStore {
   saveWithdrawal(body: unknown, editing: boolean): Promise<AssetLedgerView>;
   deleteWithdrawal(body: unknown): Promise<AssetLedgerView>;
   saveCashFlow(body: unknown): Promise<AssetCashFlowsView>;
+  /**
+   * The connection writes and the sync (A-3/A-4), same contract. A failed exchange verification is a plain Error with the
+   * exchange's message (nothing saved); a credential that cannot be opened, the network and the database are errors the
+   * HTTP layer answers with 503. The sync answers the ledger as it is when the last attempt was less than 30 s ago.
+   */
+  sync(body: unknown): Promise<AssetLedgerView>;
+  connect(body: unknown): Promise<AssetLedgerView>;
+  disconnect(body: unknown): Promise<AssetLedgerView>;
+  saveAsterAccount(body: unknown, editing: boolean): Promise<AssetLedgerView>;
+  deleteAsterAccount(body: unknown): Promise<AssetLedgerView>;
   close(): void;
 }
 /** A write refused because the service may not write the file (opened read-only). */
@@ -113,7 +150,17 @@ export const READ_ONLY = '资产库不可写：asset.sqlite 或其 -wal/-shm 不
 const NOT_WRITABLE_CODES = new Set([8, 3, 14]);
 const sqliteCode = (error: unknown): number | undefined => { const code = (error as { errcode?: unknown } | null)?.errcode; return typeof code === 'number' ? code & 0xff : undefined; };
 
-export function createAssetStore(file: string, { now = Date.now }: { now?: () => number } = {}): AssetStore {
+export interface AssetStoreOptions {
+  now?: () => number;
+  /** The fetch every external read goes through (tests pass a fake one). */
+  fetch?: Fetcher;
+  /** Replaces single external readers (tests). */
+  sources?: Partial<AssetSources>;
+}
+export function createAssetStore(file: string, { now = Date.now, fetch: fetcher = fetch, sources: replaced = {} }: AssetStoreOptions = {}): AssetStore {
+  const sources: AssetSources = { ...liveSources(fetcher), ...replaced };
+  const vault = dataDirVault(dirname(file));
+  const context = (database: AssetDb, lease: SyncLease): SyncContext => ({ database, lease, vault, sources, now });
   // Why the open handle is read-only: the files are not the service's to write, or another writer held the file too long.
   let handle: AssetDb | null = null, opened = '', writable = false, busy = false;
   /** Which file is at the path: a file deleted and imported again is a new one, and the open handle would keep reading the deleted one. */
@@ -229,6 +276,30 @@ export function createAssetStore(file: string, { now = Date.now }: { now?: () =>
     async editFx(body) {
       const fx = parseFx(body);
       await locked(async (database, lease) => writes.editFx(database, lease, await readLedger(database, false), fx, now()));
+      return ledger();
+    },
+    async sync() {
+      await locked(async (database, lease) => { await sync.refresh(context(database, lease)); });
+      return ledger();
+    },
+    async connect(body) {
+      const input = parseConnection(body);
+      await locked((database, lease) => sync.connect(context(database, lease), input));
+      return ledger();
+    },
+    async disconnect(body) {
+      const exchange = parseDisconnect(body);
+      await locked((database, lease) => sync.disconnect(context(database, lease), exchange));
+      return ledger();
+    },
+    async saveAsterAccount(body, editing) {
+      const input = parseAsterAccount(body);
+      await locked((database, lease) => sync.connectAsterAccount(context(database, lease), input, editing));
+      return ledger();
+    },
+    async deleteAsterAccount(body) {
+      const { id, action } = parseAsterAccountDelete(body);
+      await locked((database, lease) => sync.deleteAsterAccount(context(database, lease), id, action));
       return ledger();
     },
     async saveWithdrawal(body, editing) {

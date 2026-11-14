@@ -1,16 +1,18 @@
 // The asset page: the workbench ledger's overview, history and withdrawals views (project_aggregation
 // modules/asset/app/dashboard.tsx and withdrawals-panel.tsx at 0014655). Changes: the data is what src/asset/import.ts
 // imported and the service computes the figures (/api/asset/*); the edit, fx and withdrawal writes go to this service's
-// ledger (A-2, docs/asset.md); nothing syncs or refreshes prices or rates yet, so the refresh button, the connection
-// dialogs, the import dialog and the connections view are left out; dialogs became panels opened in place; the
-// connections side panel lists the exchange totals instead; the "已保存" toast is a status line under the alerts.
-import { Check, Eye, Info, Pencil, Plus, RefreshCw, Trash2, TriangleAlert, X } from 'lucide-react';
+// ledger (A-2, docs/asset.md); the sync and the connections view are A-3 (AssetConnections.tsx); the import dialog is
+// left out (the settings page imports); dialogs became panels opened in place; the toasts are a status line under the
+// alerts.
+import { Check, ChevronRight, Eye, Info, Pencil, Plus, RefreshCw, ShieldCheck, Trash2, TriangleAlert, X } from 'lucide-react';
 import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { api, ApiError } from './api.ts';
 import { newRequestId } from './request-ids.ts';
 import { StatePanel } from './StateViews.tsx';
 import { useLiveResource } from './use-live-resource.ts';
 import { AssetTrend } from './AssetTrend.tsx';
+import { CONNECTIONS_PATH, ConnectionsView, SIDE_EXCHANGES, pendingText, type CardExchange } from './AssetConnections.tsx';
+import { startRefreshLoop } from './asset-refresh-loop.ts';
 import { isExchangeMode, EXCHANGE_NAMES, type AssetHistoryView, type AssetLedgerView, type AssetPeriodView, type AssetState, type AssetWithdrawalsView, type HistoryRow } from '../../src/asset/views.ts';
 import type { Asset, Withdrawal } from '../../src/asset/types.ts';
 import {
@@ -24,6 +26,10 @@ export const ASSET_READ_TIMEOUT_MS = 10_000;
 const REFRESH_MS = 60_000;
 /** A write waits longer than a read: it runs under the ledger's sync lock (docs/asset.md A-2). */
 export const ASSET_WRITE_TIMEOUT_MS = 20_000;
+/** The workbench's limits (dashboard.tsx api()): a sync reads every exchange, a connection is verified with one first. */
+const SYNC_PATH = '/api/asset/sync';
+const SYNC_TIMEOUT_MS = 80_000, CONNECT_TIMEOUT_MS = 60_000;
+const writeTimeout = (path: string): number => path.startsWith(CONNECTIONS_PATH) || path.startsWith('/api/asset/aster-accounts/') ? CONNECT_TIMEOUT_MS : ASSET_WRITE_TIMEOUT_MS;
 
 /**
  * One write at a time for the whole page, like the workbench's mutate(): busy blocks the other forms, the error stays in
@@ -31,13 +37,15 @@ export const ASSET_WRITE_TIMEOUT_MS = 20_000;
  */
 export type Writer = { busy: boolean; writes: number; errorOf: (...paths: string[]) => string; clear: () => void; run: <T>(path: string, body: unknown, done: (result: T) => void) => Promise<void> };
 
-type View = 'overview' | 'history' | 'withdrawals';
-const VIEWS: { id: View; label: string }[] = [{ id: 'overview', label: '资产总览' }, { id: 'history', label: '历史记录' }, { id: 'withdrawals', label: '出金记录' }];
+type View = 'overview' | 'history' | 'withdrawals' | 'connections';
+const VIEWS: { id: View; label: string }[] = [{ id: 'overview', label: '资产总览' }, { id: 'history', label: '历史记录' }, { id: 'withdrawals', label: '出金记录' }, { id: 'connections', label: '交易所连接' }];
+const VIEW_DESCRIPTIONS: Record<View, string> = { overview: '实时估值与手动资产，统一记录', history: '保留原表记录；每天保存最近一次更新', withdrawals: '登记出金，观察剔除提款影响后的资产变化', connections: '通过读取接口获取账户资产，连接凭据仅加密保存在服务端' };
 type Filter = 'all' | 'auto' | 'manual';
 const FILTERS: { id: Filter; label: string }[] = [{ id: 'all', label: '全部资产' }, { id: 'auto', label: '自动更新' }, { id: 'manual', label: '手动维护' }];
 
 export function AssetPage({ onExpired }: { onExpired: () => void }) {
   const [view, setView] = useState<View>('overview');
+  const [connecting, setConnecting] = useState<CardExchange | null>(null);
   const state = useLiveResource<AssetState>(ASSET_STATE_PATH, { intervalMs: REFRESH_MS, timeoutMs: ASSET_READ_TIMEOUT_MS, onExpired });
   const imported = state.data?.imported === true;
   const ledger = useLiveResource<AssetLedgerView>('/api/asset/ledger', { intervalMs: REFRESH_MS, timeoutMs: ASSET_READ_TIMEOUT_MS, enabled: imported, onExpired });
@@ -53,6 +61,14 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
     void refreshLedger(); void refreshHistory(); void refreshWithdrawals();
   }, [version, refreshLedger, refreshHistory, refreshWithdrawals]);
   const writer = useWriter({ onExpired, onLedger: ledger.commit, onWritten: useCallback((committed: boolean) => { void state.refresh(); if (!committed) void refreshLedger(); void refreshHistory(); void refreshWithdrawals(); }, [state.refresh, refreshLedger, refreshHistory, refreshWithdrawals]) });
+  // The workbench's startRefreshLoop: a sync every minute while the page is shown and online, and one when it comes back.
+  const sync = useRef(writer.sync), stopSync = useRef(writer.stopSync);
+  useEffect(() => { sync.current = writer.sync; stopSync.current = writer.stopSync; });
+  useEffect(() => {
+    if (!imported) return;
+    const loop = startRefreshLoop({ page: document, view: window, enabled: () => !document.hidden && navigator.onLine, onActivity: active => { if (!active) stopSync.current(); }, refresh: () => void sync.current(false) });
+    return () => loop.stop();
+  }, [imported]);
 
   const failed = (status: string) => status === 'error' || status === 'offline';
   if (!state.data) return <div className="asset-desk"><div className="page">{failed(state.status)
@@ -66,11 +82,13 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
   </div></div>;
 
   const info = state.data, data = ledger.data?.imported ? ledger.data : null;
-  const refresh = () => { void state.refresh(); void ledger.refresh(); if (view !== 'withdrawals') void history.refresh(); else void withdrawals.refresh(); };
-  const navigate = (next: View) => { setView(next); window.scrollTo({ top: 0 }); };
-  const counts: Partial<Record<View, string>> = { history: history.data?.imported ? String(history.data.periods.length) : undefined, withdrawals: data?.ledger ? String(data.ledger.withdrawals.length) : undefined };
+  const navigate = (next: View) => { setView(next); if (next !== 'connections') setConnecting(null); window.scrollTo({ top: 0 }); };
+  const connect = (exchange: CardExchange | 'aster') => { writer.clear(); setView('connections'); setConnecting(exchange === 'aster' ? null : exchange); window.scrollTo({ top: 0 }); };
+  const pending = data?.ledger ? Object.values(data.ledger.connections).filter(item => !item.configured).length : 0;
+  const counts: Partial<Record<View, string>> = { history: history.data?.imported ? String(history.data.periods.length) : undefined, withdrawals: data?.ledger ? String(data.ledger.withdrawals.length) : undefined, connections: pending ? pending + ' 待连接' : undefined };
   const readErrors = [state, ledger, view === 'withdrawals' ? withdrawals : history].filter(item => failed(item.status) && item.error).map(item => item.error!.message);
   const alerts: { key: string; role: 'alert' | 'status'; text: string; tone: 'error' | 'warn' }[] = [
+    ...(writer.syncError ? [{ key: 'sync', role: 'alert' as const, text: '同步失败：' + writer.syncError + '。当前显示上次同步的数据。', tone: 'error' as const }] : []),
     ...[...new Set(readErrors)].map(text => ({ key: 'read:' + text, role: 'alert' as const, text: '读取失败：' + text + '。当前显示上次读取的数据。', tone: 'error' as const })),
     ...(data?.ledger?.fxStatus.error ? [{ key: 'fx', role: 'status' as const, text: data.ledger.fxStatus.error + '，人民币折算暂用 1 USD = ' + money(data.ledger.fx, 4) + ' CNY。', tone: 'warn' as const }] : []),
     ...(data?.summary?.valuation.partial ? [{ key: 'valuation', role: 'status' as const, text: data.summary.valuation.missingValues + ' 项资产估值缺失，汇总仅包含已知金额，当前为部分估值。', tone: 'warn' as const }] : []),
@@ -83,20 +101,21 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
       <nav className="ledger-tabs" aria-label="资产账本">{VIEWS.map(({ id, label }) => <button type="button" key={id} aria-current={view === id ? 'page' : undefined} onClick={() => navigate(id)}>{label}{counts[id] ? <span className="count-chip">{counts[id]}</span> : null}</button>)}</nav>
       <div className="ledger-head-meta">
         <span className="workspace-date">导入于 {fullStamp(info.importedAt)} · 北京时间</span>
-        <button type="button" className="button" onClick={refresh}><RefreshCw size={15} aria-hidden="true" />重新读取</button>
+        <button type="button" className="button primary" disabled={writer.busy} onClick={() => void writer.sync(true)}><RefreshCw size={15} className={writer.syncing ? 'loading-spin' : undefined} aria-hidden="true" />{writer.syncing ? '正在更新' : '刷新资产'}</button>
       </div>
     </div>
     {alerts.length ? <div className="ledger-strip"><span className="strip-title"><TriangleAlert size={14} aria-hidden="true" />{alerts.length} 项提醒</span>{alerts.map(item => <span key={item.key} className={'strip-item ' + item.tone} role={item.role}>{item.text}</span>)}</div> : null}
     <div className="page">
-      <div className="notice info" role="status"><Info size={15} aria-hidden="true" /><div>账本于 {fullStamp(info.importedAt)} 从工作台导入（工作台用户 {info.source?.owner ?? '—'}，资产 {info.assets} 行、日快照 {info.snapshots.count} 份）。手动资产编辑、汇率与出金登记保存在本服务的账本；交易所同步与行情、汇率的自动更新尚未接入，交易所行停留在导入时的估值。重新导入会整体替换本服务的账本，本页做过的修改一并被覆盖。</div></div>
+      <div className="notice info" role="status"><Info size={15} aria-hidden="true" /><div>账本于 {fullStamp(info.importedAt)} 从工作台导入（工作台用户 {info.source?.owner ?? '—'}，资产 {info.assets} 行、日快照 {info.snapshots.count} 份）。页面打开时每 60 秒同步交易所余额、行情单价与人民币汇率；编辑、出金与资金流登记保存在本服务的账本。重新导入会整体替换本服务的账本，本页做过的修改一并被覆盖。</div></div>
       {writer.saved ? <p className="notice saved-notice" role="status"><Check size={15} aria-hidden="true" />{writer.saved}</p> : null}
       {!data?.ledger || !data.summary ? (failed(ledger.status) ? <StatePanel kind="error" title="读取资产明细失败" detail={ledger.error?.message ?? '网络离线'} /> : <StatePanel kind="loading" title="加载中…" />)
         : <>
           {view !== 'overview' ? example : null}
-          {view === 'overview' ? <Overview data={data as LoadedLedger} history={history.data?.imported ? history.data : null} historyError={failed(history.status) ? history.error?.message ?? '网络离线' : null} version={version} example={example} writer={writer} onHistory={() => navigate('history')} onWithdrawals={() => navigate('withdrawals')} onExpired={onExpired} />
+          {view === 'overview' ? <Overview data={data as LoadedLedger} history={history.data?.imported ? history.data : null} historyError={failed(history.status) ? history.error?.message ?? '网络离线' : null} version={version} example={example} writer={writer} onHistory={() => navigate('history')} onWithdrawals={() => navigate('withdrawals')} onConnect={connect} onExpired={onExpired} />
             : view === 'history' ? <History history={history.data?.imported ? history.data : null} error={failed(history.status) ? history.error?.message ?? '网络离线' : null} />
-            : <Withdrawals view={withdrawals.data?.imported ? withdrawals.data : null} today={data.today} error={failed(withdrawals.status) ? withdrawals.error?.message ?? '网络离线' : null} writer={writer} />}
-          <footer className="page-footer">{data.ledger.dataKind === 'example' ? '示例账本 · 尚未导入原表' : '源自《资产统计.xlsx》'} · 起始持仓 {data.ledger.baselineDate} · 自 {data.ledger.startedAt} 开始更新 · 交易所同步尚未接入</footer>
+            : view === 'withdrawals' ? <Withdrawals view={withdrawals.data?.imported ? withdrawals.data : null} today={data.today} error={failed(withdrawals.status) ? withdrawals.error?.message ?? '网络离线' : null} writer={writer} />
+            : <ConnectionsView connections={data.ledger.connections} accounts={data.ledger.asterAccounts} now={Date.now()} writer={writer} opened={connecting} onOpen={setConnecting} />}
+          <footer className="page-footer">{VIEW_DESCRIPTIONS[view]} · {data.ledger.dataKind === 'example' ? '示例账本 · 尚未导入原表' : '源自《资产统计.xlsx》'} · 起始持仓 {data.ledger.baselineDate} · 自 {data.ledger.startedAt} 开始更新</footer>
         </>}
     </div>
   </div>;
@@ -107,24 +126,28 @@ type LoadedLedger = AssetLedgerView & { ledger: NonNullable<AssetLedgerView['led
 const SAVED_MS = 4_000;
 const isLedgerView = (value: unknown): value is AssetLedgerView => !!value && typeof value === 'object' && 'imported' in value && 'ledger' in value;
 
-function useWriter({ onExpired, onLedger, onWritten }: { onExpired: () => void; onLedger: (view: AssetLedgerView) => void; onWritten: (committed: boolean) => void }): Writer & { saved: string } {
+type PageWriter = Writer & { saved: string; syncing: boolean; syncError: string; sync: (manual: boolean) => Promise<void>; stopSync: () => void };
+
+function useWriter({ onExpired, onLedger, onWritten }: { onExpired: () => void; onLedger: (view: AssetLedgerView) => void; onWritten: (committed: boolean) => void }): PageWriter {
   // The error belongs to the form whose path failed, so another open form does not show it too.
   const [busy, setBusy] = useState(false), [error, setError] = useState<{ path: string; text: string } | null>(null), [saved, setSaved] = useState(''), [writes, setWrites] = useState(0);
-  const running = useRef(false), mounted = useRef(true), timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  useEffect(() => { mounted.current = true; return () => { mounted.current = false; clearTimeout(timer.current); }; }, []);
+  const [syncing, setSyncing] = useState(false), [syncError, setSyncError] = useState('');
+  const running = useRef(false), mounted = useRef(true), timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined), syncRequest = useRef<AbortController | null>(null);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; clearTimeout(timer.current); syncRequest.current?.abort(); }; }, []);
+  const flash = useCallback((text: string) => { setSaved(text); clearTimeout(timer.current); timer.current = setTimeout(() => { if (mounted.current) setSaved(''); }, SAVED_MS); }, []);
   const clear = useCallback(() => setError(null), []);
   const errorOf = useCallback((...paths: string[]) => error && paths.includes(error.path) ? error.text : '', [error]);
   const run = useCallback(async <T,>(path: string, body: unknown, done: (result: T) => void) => {
     if (running.current) return;
     running.current = true; setBusy(true); setError(null); setSaved('');
     try {
-      const result = await api<T>(path, { body, timeoutMs: ASSET_WRITE_TIMEOUT_MS });
+      const result = await api<T>(path, { body, timeoutMs: writeTimeout(path) });
       if (!mounted.current) return;
       // A success without a readable body (api.ts answers {}) went through; the ledger is read again instead.
       const committed = isLedgerView(result);
       if (committed) onLedger(result);
       onWritten(committed); setWrites(count => count + 1); done(result);
-      setSaved('已保存'); clearTimeout(timer.current); timer.current = setTimeout(() => { if (mounted.current) setSaved(''); }, SAVED_MS);
+      flash('已保存');
     } catch (reason) {
       if (!mounted.current) return;
       if (reason instanceof ApiError && reason.status === 401) { onExpired(); return; }
@@ -135,8 +158,37 @@ function useWriter({ onExpired, onLedger, onWritten }: { onExpired: () => void; 
       running.current = false;
       if (mounted.current) setBusy(false);
     }
-  }, [onExpired, onLedger, onWritten]);
-  return { busy, errorOf, writes, saved, clear, run };
+  }, [onExpired, onLedger, onWritten, flash]);
+  /**
+   * The workbench's refresh(): one sync of every connection, prices and the rate, taking the writer's turn so no form
+   * writes meanwhile. An automatic one skips while a write runs and is dropped when the page is hidden; its 409 (the
+   * ledger busy with another sync or an import) waits for the next minute instead of showing an error.
+   */
+  const sync = useCallback(async (manual: boolean) => {
+    if (running.current) return;
+    running.current = true; setBusy(true); setSyncing(true);
+    if (manual) { setError(null); setSaved(''); }
+    const request = new AbortController(); syncRequest.current = request;
+    try {
+      const result = await api<unknown>(SYNC_PATH, { body: {}, timeoutMs: SYNC_TIMEOUT_MS, signal: request.signal });
+      if (!mounted.current || request.signal.aborted) return;
+      const committed = isLedgerView(result);
+      if (committed) onLedger(result);
+      setSyncError(''); onWritten(committed); setWrites(count => count + 1);
+      if (manual) flash('已完成刷新，更新状态见资产明细');
+    } catch (reason) {
+      if (!mounted.current || request.signal.aborted) return;
+      if (reason instanceof ApiError && reason.status === 401) { onExpired(); return; }
+      if (manual || !(reason instanceof ApiError && reason.status === 409)) setSyncError(reason instanceof Error ? reason.message : '更新失败');
+      onWritten(false);
+    } finally {
+      if (syncRequest.current === request) syncRequest.current = null;
+      running.current = false;
+      if (mounted.current) { setBusy(false); setSyncing(false); }
+    }
+  }, [onExpired, onLedger, onWritten, flash]);
+  const stopSync = useCallback(() => syncRequest.current?.abort(), []);
+  return { busy, errorOf, writes, saved, clear, run, syncing, syncError, sync, stopSync };
 }
 
 /** The workbench's 编辑 dialog as a panel: quantity, price (fixed for market rows) and the value it gives. */
@@ -159,24 +211,24 @@ function EditPanel({ asset, writer, onClose }: { asset: Asset; writer: Writer; o
   </section>;
 }
 
-/** The workbench's 人民币换算汇率 dialog as a panel. Until sync lands nothing fetches a rate, so the value set here stays. */
+/** The workbench's 人民币换算汇率 dialog as a panel: the value set here holds until the next sync fetches a rate. */
 function FxPanel({ ledger, writer, source, onClose }: { ledger: LoadedLedger['ledger']; writer: Writer; source: string; onClose: () => void }) {
   const [fx, setFx] = useState(String(ledger.fx));
   const panel = useRef<HTMLElement | null>(null);
   useEffect(() => { panel.current?.scrollIntoView({ block: 'nearest' }); }, []);
   return <section ref={panel} className="panel edit-panel" aria-label="人民币换算汇率">
     <h2>人民币换算汇率</h2>
-    <p className="help">汇率自动更新尚未接入，这里设置的值会一直使用，直到自动获取接入后被覆盖；历史快照保留当时汇率。</p>
+    <p className="help">每 60 秒随资产自动更新。可临时设置备用值，下一次自动获取成功后会覆盖；历史快照保留当时汇率。</p>
     <p className="help">当前来源：{source}<br />{ledger.fxStatus.rateDate ? '报价日期：' + ledger.fxStatus.rateDate : '获取时间：' + stamp(ledger.fxStatus.fetchedAt)}<br />来源未提供逐笔报价时间时，展示获取时间。</p>
     <form className="form-grid" onSubmit={event => { event.preventDefault(); void writer.run('/api/asset/fx', { fx: Number(fx) }, onClose); }}>
       <label>1 USD 折合 CNY<input type="number" min="0.001" max="1000" step="any" required value={fx} onChange={event => setFx(event.target.value)} /></label>
       {writer.errorOf('/api/asset/fx') ? <p className="error-text" role="alert">{writer.errorOf('/api/asset/fx')}</p> : null}
-      <div className="form-actions"><button type="button" className="button" disabled={writer.busy} onClick={onClose}>取消</button><button className="button primary" disabled={writer.busy}>{writer.busy ? '正在保存' : '使用此汇率'}</button></div>
+      <div className="form-actions"><button type="button" className="button" disabled={writer.busy} onClick={onClose}>取消</button><button className="button primary" disabled={writer.busy}>{writer.busy ? '正在保存' : '临时使用此汇率'}</button></div>
     </form>
   </section>;
 }
 
-function Overview({ data, history, historyError, version, example, writer, onHistory, onWithdrawals, onExpired }: { data: LoadedLedger; history: AssetHistoryView | null; historyError: string | null; version: string; example: ReactNode; writer: Writer; onHistory: () => void; onWithdrawals: () => void; onExpired: () => void }) {
+function Overview({ data, history, historyError, version, example, writer, onHistory, onWithdrawals, onConnect, onExpired }: { data: LoadedLedger; history: AssetHistoryView | null; historyError: string | null; version: string; example: ReactNode; writer: Writer; onHistory: () => void; onWithdrawals: () => void; onConnect: (exchange: CardExchange | 'aster') => void; onExpired: () => void }) {
   const [filter, setFilter] = useState<Filter>('all');
   const [editing, setEditing] = useState<string | null>(null), [fxOpen, setFxOpen] = useState(false);
   // The original row: the table shows recorded withdrawals merged in, the edit changes what the ledger stores.
@@ -187,13 +239,14 @@ function Overview({ data, history, historyError, version, example, writer, onHis
   };
   const { ledger, summary } = data, { measures, valuation } = summary;
   const now = Date.now(), fx = fxView(ledger.fxStatus, now);
+  const pending = Object.values(ledger.connections).filter(item => !item.configured).length;
   const rows = data.rows.filter(asset => filter === 'all' || (filter === 'manual' ? asset.mode === 'manual' : asset.mode !== 'manual'));
   return <>
     <section className="panel ledger-kpis" aria-label="资产汇总">
       <div className="kpi hero"><div className="kpi-label">表内总额 <span>USD · 含累计出金{valuation.partial ? ' · 部分估值' : ''}</span></div><div className="kpi-value"><span className="cur">$</span>{money(measures.adjusted)}</div><p className="kpi-sub">= 剔除出金影响（实际持有资产 + 累计出金）· 折合人民币 ¥ {money(measures.adjusted * ledger.fx)}</p></div>
       <div className="kpi"><div className="kpi-label">实际持有资产 <span>USD{valuation.partial ? ' · 部分估值' : ''}</span></div><div className="kpi-value"><span className="cur">$</span>{money(measures.held)}</div><p className="kpi-sub">表内总额减去累计出金</p></div>
       <div className="kpi"><div className="kpi-label">累计出金 <span>USD{summary.withdrawals.partial ? ' · 部分金额' : ''}</span></div><div className="kpi-value"><span className="cur">$</span>{money(measures.withdrawn)}</div><p className="kpi-sub"><button type="button" className="text-button" onClick={onWithdrawals}>管理出金记录</button></p></div>
-      <div className="kpi"><div className="kpi-label">交易所资产{summary.exchanges.partial ? <span>部分估值</span> : null}</div><div className="kpi-value"><span className="cur">$</span>{money(summary.exchanges.total)}</div><p className="kpi-sub">折合人民币 ¥ {money(summary.exchanges.total * ledger.fx)} · <span className="warn-text">导入时的估值，同步尚未接入</span></p></div>
+      <div className="kpi"><div className="kpi-label">交易所资产{summary.exchanges.partial ? <span>部分估值</span> : null}</div><div className="kpi-value"><span className="cur">$</span>{money(summary.exchanges.total)}</div><p className="kpi-sub">折合人民币 ¥ {money(summary.exchanges.total * ledger.fx)} · <span className={pending ? 'warn-text' : 'good-text'}>{pending ? pending + ' 个账户待连接' : '账户已连接'}</span></p></div>
       <div className="kpi"><div className="kpi-label">积分预估价值{summary.points.partial ? <span>部分估值</span> : null}</div><div className="kpi-value"><span className="cur">$</span>{money(summary.points.total)}</div><p className="kpi-sub">折合人民币 ¥ {money(summary.points.total * ledger.fx)} · 沿用表格估值，可手动编辑</p></div>
       <div className="kpi"><div className="kpi-label">USD / CNY <button type="button" className="kpi-edit" aria-label="人民币汇率详情与备用设置" aria-expanded={fxOpen} disabled={writer.busy} onClick={() => { writer.clear(); setEditing(null); setFxOpen(true); }}><Pencil size={11} aria-hidden="true" /></button></div><div className="kpi-value">{money(ledger.fx, 4)}{fx.stale ? <span className="old" title="汇率未在 5 分钟内更新">旧</span> : null}</div><p className="kpi-sub"><span className={fx.stale ? 'warn-text' : 'good-text'}>1 USD = {money(ledger.fx, 4)} CNY · {fx.state}</span><br />{fx.source} · {fx.when}</p></div>
     </section>
@@ -213,14 +266,15 @@ function Overview({ data, history, historyError, version, example, writer, onHis
         </section>
       </div>
       <div className="overview-side">
-        <section className="panel sync-panel"><div className="panel-h"><h2>分交易所合计</h2><span className="panel-h-right">USD</span></div>
-          {summary.byExchange.length ? summary.byExchange.map(item => {
-            const connection = ledger.connections[item.mode];
-            return <div className="connection-row" key={item.mode}><div className={'exchange-mark ' + item.mode} aria-hidden="true">{EXCHANGE_NAMES[item.mode][0]}</div>
-              <div><strong>{item.name}</strong><small>{item.rows} 行 · 最近同步 {stamp(connection.lastSync)}{connection.error ? <span className="warn-text"> · 同步失败</span> : null}</small></div>
-              <span className="exchange-total">$ {money(item.total)}{item.partial ? <small className="warn-text">部分估值</small> : null}</span></div>;
-          }) : <p className="help exchange-empty">导入的账本没有交易所资产行。</p>}
-          <p className="panel-foot">交易所资产合计 $ {money(summary.exchanges.total)}{summary.exchanges.partial ? '（部分估值）' : ''} · 估值停留在导入时刻 · 交易所连接与同步尚未接入</p>
+        <section className="panel sync-panel"><div className="panel-h"><h2>数据连接</h2><ShieldCheck size={16} aria-hidden="true" /></div>
+          {SIDE_EXCHANGES.map(name => {
+            const connection = ledger.connections[name];
+            return <button type="button" className="connection-row" key={name} onClick={() => onConnect(name)}><div className={'exchange-mark ' + name} aria-hidden="true">{EXCHANGE_NAMES[name][0]}</div>
+              <div><strong>{EXCHANGE_NAMES[name]}</strong><small>{connection.configured ? '已连接 · ' + stamp(connection.lastSync) : pendingText(name)}{connection.error ? <span className="warn-text"> · 同步失败</span> : null}</small></div>
+              <ChevronRight size={16} aria-hidden="true" /></button>;
+          })}
+          <div className="connection-row"><div className="exchange-mark virtual" aria-hidden="true">V</div><div><strong>Virtual</strong><small>实时单价 · 数量手动</small></div></div>
+          <p className="panel-foot">页面打开时每 60 秒刷新 · USD/CNY 随刷新自动更新 · {fx.source}</p>
         </section>
       </div>
     </div>

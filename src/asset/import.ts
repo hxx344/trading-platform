@@ -1,12 +1,16 @@
 // Copies one workbench user's ledger into asset.sqlite: node src/asset/import.ts --from <ledger.sqlite> --owner <user> --data-dir <dir>.
 // The workbench file is opened read-only and only read; everything is read and checked before the target is touched,
 // and the target is replaced in one transaction, so a failed import leaves the previous data as it was. Credentials
-// (the connections table) are never read, and the settings are copied by an allow-list with the account identifiers
-// dropped: Aster wallet addresses, and the key or wallet tails (`label`) the accounts and exchange statuses show.
+// (the connections table) are never read here, and the settings are copied by an allow-list with the account identifiers
+// dropped: Aster wallet addresses, and the key or wallet tails (`label`) the accounts and exchange statuses show. Every
+// import replaces this service's connections too (A-3): this command brings none, so the saved connections are cleared
+// and the exchanges are connected again on the page; the page's and install.sh's import (src/service/import-modules.ts)
+// brings them over re-sealed with this service's key (import-writer.ts).
 import { existsSync, mkdirSync, realpathSync } from 'node:fs';
 import { basename, isAbsolute, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
 import { ASSET_DB_FILE, openAssetDb } from './db.ts';
 import { readCashFlowAudit } from './cash-flows.ts';
 import { assertDedicatedDataDir } from '../data-dir.ts';
@@ -132,17 +136,20 @@ export function prepareLedger(rows: unknown, { file, owner, now = Date.now }: { 
     return { date: row.date, data: row.data };
   });
   const settings = rows.settings.map(row => ({ key: row.key, value: cleanSetting(row.key, row.value) }));
-  const info: ImportInfo = { importedAt: new Date(now()).toISOString(), file, owner, assets: assets.length, snapshots: snapshots.length, settings: settings.map(row => row.key) };
+  const info: ImportInfo = { importedAt: new Date(now()).toISOString(), importId: randomUUID(), file, owner, assets: assets.length, snapshots: snapshots.length, settings: settings.map(row => row.key) };
   return { assets, snapshots, settings, info };
 }
 
-/** Replaces the three tables of <dataDir>/asset.sqlite in one transaction, with the import record. */
-export function writeLedger(dataDir: string, ledger: PreparedLedger): ImportInfo {
+/** A connection sealed with this data directory's key (credentials.ts), as the connections table stores it. */
+export interface SealedConnection { exchange: string; encrypted: string }
+/** Replaces the ledger tables and the connections of <dataDir>/asset.sqlite in one transaction, with the import record. */
+export function writeLedger(dataDir: string, ledger: PreparedLedger, connections: readonly SealedConnection[] = [], at = Date.parse(ledger.info.importedAt)): ImportInfo {
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const database = openAssetDb(resolve(dataDir, ASSET_DB_FILE));
   try {
     database.replace(() => {
-      for (const table of ['assets', 'settings', 'snapshots']) database.prepare(`DELETE FROM ${table}`).run();
+      for (const table of ['assets', 'settings', 'snapshots', 'connections']) database.prepare(`DELETE FROM ${table}`).run();
+      for (const row of connections) database.prepare('INSERT INTO connections (exchange, encrypted, updated_at) VALUES (?, ?, ?)').bind(row.exchange, row.encrypted, new Date(at).toISOString()).run();
       for (const row of ledger.assets) database.prepare('INSERT INTO assets (id, data) VALUES (?, ?)').bind(row.id, row.data).run();
       for (const row of ledger.snapshots) database.prepare('INSERT INTO snapshots (date, data) VALUES (?, ?)').bind(row.date, row.data).run();
       for (const row of ledger.settings) database.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').bind(row.key, row.value).run();

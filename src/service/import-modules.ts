@@ -4,11 +4,16 @@
 // user's rows are read as the file's owner (as the ASTER database is), checked here with the rules of
 // src/asset/import.ts, and written into this service's asset.sqlite by src/asset/import-writer.ts run as the owner of
 // this service's data directory. Only user names, counts, dates, paths and reasons leave this file; ledger content and
-// credentials never do (the connections table is not read).
-import { spawnSync } from 'node:child_process';
+// credentials never do. Since A-3 the user's connections come along: the preview lists their names only; at the write
+// the connection reader (DUMP_CONNECTIONS, as the ledger's owner) decrypts them with the workbench's config.json
+// credentialKey and writes them straight into the writer's stdin, so this process (root in the helper) never holds the
+// plaintext; the writer seals them again with this service's key in the transaction that replaces the ledger.
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import type { Writable } from 'node:stream';
 import { existsSync, lstatSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import { IMPORTED_SETTINGS, prepareLedger, type SourceRows } from '../asset/import.ts';
+import type { ConnectionImport } from '../asset/import-writer.ts';
 import type { ImportInfo } from '../asset/views.ts';
 import { ANTHROPIC_SHARES } from '../vendor/anthropic-market.mjs';
 import { parseMonitorConfig } from './monitor-config.ts';
@@ -60,7 +65,11 @@ export function planMonitor(source: MonitorSource, config: Json, fits: (candidat
 }
 
 /** One workbench user with a ledger, as the page lists it. */
-export interface LedgerOwner { owner: string; assets: number; snapshots: number; lastDaily: string | null; importable: boolean; detail: string }
+export interface LedgerOwner {
+  owner: string; assets: number; snapshots: number; lastDaily: string | null; importable: boolean; detail: string;
+  /** The names of the user's saved workbench connections ('binance', 'aster:<id>'); never their content. */
+  connections: string[];
+}
 /** The import record of this service's asset.sqlite, without the settings list. */
 export interface LastImport { importedAt: string; owner: string; assets: number; snapshots: number }
 export interface AssetSource {
@@ -70,6 +79,8 @@ export interface AssetSource {
   owners: LedgerOwner[];
   /** Users with a ledger beyond those listed. */
   more: number;
+  /** Why the workbench's connections cannot be decrypted (config.json missing, no valid credentialKey), or null. */
+  connectionProblem: string | null;
   /** The rows read, by user (only the users listed); they stay in the helper. */
   rows: Map<string, SourceRows>;
   last: LastImport | null;
@@ -86,7 +97,13 @@ export interface AssetItem extends Omit<AssetSource, 'rows' | 'problem'> {
   detail: string;
 }
 /** The rows to write into asset.sqlite before the config is written. */
-export interface LedgerWrite { owner: string; file: string; rows: SourceRows }
+export interface LedgerWrite {
+  owner: string; file: string; rows: SourceRows;
+  /** The workbench ledger.sqlite, whose owner's connections the connection reader decrypts (config.json beside it). */
+  ledger: string;
+}
+/** A finished import: the record, and which connections came over. */
+export type WrittenLedger = LastImport & { connections: ConnectionImport };
 
 /**
  * Prints the users with a ledger and the rows of the wanted one (or of the first users), in one read transaction; run
@@ -94,8 +111,15 @@ export interface LedgerWrite { owner: string; file: string; rows: SourceRows }
  * normal read-only open: pending WAL pages are read. A missing table is a code on stdout.
  */
 const DUMP_LEDGER = `import { DatabaseSync } from 'node:sqlite';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 const [file, keysText, limitText, wanted] = process.argv.slice(1);
 const out = value => process.stdout.write(JSON.stringify(value));
+let key = 'ok';
+try {
+  const raw = JSON.parse(readFileSync(join(dirname(file), 'config.json'), 'utf8'));
+  if (!raw || typeof raw.credentialKey !== 'string' || !/^[0-9a-f]{64}$/i.test(raw.credentialKey)) key = 'invalid';
+} catch (error) { key = error && error.code === 'ENOENT' ? 'missing' : 'unreadable'; }
 try {
   const db = new DatabaseSync(file, { readOnly: true });
   try {
@@ -108,17 +132,64 @@ try {
       const owners = db.prepare("SELECT owner FROM settings WHERE key = 'source-ledger' GROUP BY owner ORDER BY owner").all().map(row => String(row.owner));
       const picked = wanted ? owners.filter(owner => owner === wanted) : owners.slice(0, Number(limitText));
       const text = value => typeof value === 'string' ? value : null;
-      const rows = {};
+      const rows = {}, names = {};
+      const listed = tables.has('connections') ? db.prepare('SELECT exchange FROM connections WHERE owner = ? ORDER BY exchange') : null;
+      for (const owner of picked) names[owner] = listed ? listed.all(owner).map(row => text(row.exchange)) : [];
       for (const owner of picked) rows[owner] = {
         assets: db.prepare('SELECT id, data FROM assets WHERE owner = ? ORDER BY id').all(owner).map(row => ({ id: text(row.id), data: text(row.data) })),
         snapshots: db.prepare('SELECT date, data FROM snapshots WHERE owner = ? ORDER BY date').all(owner).map(row => ({ date: text(row.date), data: text(row.data) })),
         settings: db.prepare('SELECT key, value FROM settings WHERE owner = ? AND key IN (' + marks + ') ORDER BY key').all(owner, ...keys).map(row => ({ key: text(row.key), value: text(row.value) })),
       };
       db.exec('COMMIT');
-      out({ owners, rows });
+      out({ owners, rows, connections: names, key });
     }
   } finally { db.close(); }
 } catch (error) { process.stderr.write(String(error && error.message || error).split('\\n')[0]); process.exitCode = 1; }`;
+
+/**
+ * One user's connections decrypted with the workbench's key (modules/asset/lib/vault.ts: AES-GCM, additional data
+ * owner + ':' + name), written as JSON to stdout, which is the writer's stdin. Run with no environment as the ledger's
+ * owner. A connection that does not open is listed by name; without a usable key, or when the table cannot be read, the
+ * output says why and carries no connection. Nothing is written to stderr but the first line of an unexpected error,
+ * which never comes from a decrypted value.
+ */
+const DUMP_CONNECTIONS = `import { DatabaseSync } from 'node:sqlite';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+const [file, owner] = process.argv.slice(1);
+const result = { connections: [], skipped: [], problem: null };
+let raw;
+try { raw = JSON.parse(readFileSync(join(dirname(file), 'config.json'), 'utf8')).credentialKey; }
+catch (error) { result.problem = error && error.code === 'ENOENT' ? 'missing' : 'unreadable'; }
+if (!result.problem && (typeof raw !== 'string' || !/^[0-9a-f]{64}$/i.test(raw))) result.problem = 'invalid';
+let rows = [];
+if (!result.problem) {
+  try {
+    const db = new DatabaseSync(file, { readOnly: true });
+    try {
+      db.exec('PRAGMA busy_timeout = 5000');
+      const present = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'connections'").get();
+      rows = present ? db.prepare('SELECT exchange, encrypted FROM connections WHERE owner = ? ORDER BY exchange').all(owner) : [];
+    } finally { db.close(); }
+  } catch { result.problem = 'read'; }
+}
+if (!result.problem) {
+  const key = await crypto.subtle.importKey('raw', Buffer.from(raw, 'hex'), 'AES-GCM', false, ['decrypt']);
+  for (const row of rows) {
+    const exchange = String(row.exchange);
+    try {
+      const data = JSON.parse(String(row.encrypted));
+      const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(data.iv), additionalData: new TextEncoder().encode(owner + ':' + exchange) }, key, new Uint8Array(data.cipher));
+      result.connections.push({ exchange, credential: JSON.parse(new TextDecoder().decode(plain)) });
+    } catch { result.skipped.push({ exchange }); }
+  }
+}
+process.stdout.write(JSON.stringify(result));`;
+const KEY_PROBLEMS: Record<string, string> = {
+  missing: '工作台资产模块没有 config.json',
+  unreadable: '工作台资产模块的 config.json 读不出',
+  invalid: '工作台资产模块的 config.json 没有有效的 credentialKey',
+};
 
 const countOf = (rows: unknown, name: 'assets' | 'snapshots'): number => {
   const list = rows !== null && typeof rows === 'object' ? (rows as Record<string, unknown>)[name] : null;
@@ -127,23 +198,24 @@ const countOf = (rows: unknown, name: 'assets' | 'snapshots'): number => {
 const lastDailyOf = (rows: SourceRows): string | null => rows.snapshots.map(row => row.date).filter(date => typeof date === 'string' && DAILY.test(date)).sort().at(-1) ?? null;
 
 /** One user's rows judged by the import's own checks; the reason names a row or setting, never its content. */
-export function ledgerOwner(owner: string, rows: SourceRows): LedgerOwner {
-  const entry: LedgerOwner = { owner: printable(owner).slice(0, 64), assets: countOf(rows, 'assets'), snapshots: countOf(rows, 'snapshots'), lastDaily: null, importable: false, detail: '' };
+export function ledgerOwner(owner: string, rows: SourceRows, connections: readonly string[] = []): LedgerOwner {
+  const names = connections.filter(name => typeof name === 'string').map(name => printable(name).slice(0, 48)).slice(0, 40);
+  const entry: LedgerOwner = { owner: printable(owner).slice(0, 64), assets: countOf(rows, 'assets'), snapshots: countOf(rows, 'snapshots'), lastDaily: null, importable: false, detail: '', connections: names };
   try {
     const prepared = prepareLedger(rows, { file: LEDGER_FILE, owner });
     entry.assets = prepared.assets.length; entry.snapshots = prepared.snapshots.length; entry.lastDaily = lastDailyOf(rows);
   } catch (error) { entry.detail = printable(reason(error)).slice(0, 300); return entry; }
   if (!ASSET_OWNER.test(owner)) { entry.detail = '用户名含页面不支持的字符（只允许字母、数字和 . _ @ -，以字母或数字开头，至多 64 个字符）；请用 src/asset/import.ts 单独导入'; return entry; }
   entry.importable = true;
-  entry.detail = `资产 ${entry.assets} 条、快照 ${entry.snapshots} 条${entry.lastDaily ? `，最近的日快照 ${entry.lastDaily}` : ''}`;
+  entry.detail = `资产 ${entry.assets} 条、快照 ${entry.snapshots} 条${entry.lastDaily ? `，最近的日快照 ${entry.lastDaily}` : ''}${names.length ? `，连接 ${names.length} 个（${names.join('、')}）` : ''}`;
   return entry;
 }
 
 /** The workbench's ledger users and the rows of `owner` (or of the first users); a ledger that cannot be read is the problem. */
-export function readWorkbenchLedger(data: string, { owner }: { owner?: string } = {}): Pick<AssetSource, 'ledger' | 'problem' | 'owners' | 'more' | 'rows'> {
+export function readWorkbenchLedger(data: string, { owner }: { owner?: string } = {}): Pick<AssetSource, 'ledger' | 'problem' | 'owners' | 'more' | 'rows' | 'connectionProblem'> {
   if (!isAbsolute(data)) throw new Error(`工作台数据目录须为绝对路径：${data}`);
   const ledger = join(data, 'modules', 'asset', LEDGER_FILE);
-  const refused = (problem: string) => ({ ledger, problem, owners: [], more: 0, rows: new Map<string, SourceRows>() });
+  const refused = (problem: string) => ({ ledger, problem, owners: [], more: 0, rows: new Map<string, SourceRows>(), connectionProblem: null });
   let stat;
   try { stat = lstatSync(ledger); } catch { return refused(`没有找到工作台的资产账本 ${ledger}（工作台没有用过资产模块，或数据目录不在默认位置）`); }
   if (!stat.isFile()) return refused(`工作台的资产账本 ${ledger} 不是普通文件（符号链接等），不读取`);
@@ -154,7 +226,7 @@ export function readWorkbenchLedger(data: string, { owner }: { owner?: string } 
     cwd: '/', env: {}, encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024 * 1024, ...identity,
   });
   if (read.error || read.status !== 0) return refused(`读取工作台资产账本 ${ledger} 失败${as}：${printable(read.error?.message ?? (read.stderr.trim() || `退出码 ${read.status ?? read.signal}`)).slice(0, 200)}`);
-  let dumped: { missing?: string; owners?: unknown; rows?: unknown };
+  let dumped: { missing?: string; owners?: unknown; rows?: unknown; connections?: unknown; key?: unknown };
   try { dumped = JSON.parse(read.stdout) as typeof dumped; } catch { return refused(`读取工作台资产账本 ${ledger} 失败${as}：输出无法解析`); }
   if (typeof dumped.missing === 'string') return refused(`${ledger} 不是工作台的资产库（缺少 ${printable(dumped.missing).slice(0, 40)} 表）`);
   if (!Array.isArray(dumped.owners) || !dumped.owners.every(name => typeof name === 'string') || dumped.rows === null || typeof dumped.rows !== 'object') return refused(`读取工作台资产账本 ${ledger} 失败${as}：输出格式错误`);
@@ -162,7 +234,14 @@ export function readWorkbenchLedger(data: string, { owner }: { owner?: string } 
   if (!names.length) return refused('工作台资产账本里没有任何用户的账本（没有原表数据）；先在工作台打开一次资产页');
   const rows = new Map(Object.entries(dumped.rows as Record<string, SourceRows>).filter(([name]) => names.includes(name)));
   const listed = owner === undefined ? names.slice(0, MAX_LEDGER_OWNERS) : names.filter(name => name === owner);
-  return { ledger, problem: null, owners: listed.map(name => ledgerOwner(name, rows.get(name) ?? { assets: [], snapshots: [], settings: [] })), more: names.length - listed.length, rows };
+  const connections = dumped.connections !== null && typeof dumped.connections === 'object' ? dumped.connections as Record<string, unknown> : {};
+  const namesOf = (name: string): string[] => { const list = Object.hasOwn(connections, name) ? connections[name] : null; return Array.isArray(list) ? list.filter((item): item is string => typeof item === 'string') : []; };
+  const keyProblem = typeof dumped.key === 'string' && dumped.key !== 'ok' ? KEY_PROBLEMS[dumped.key] ?? KEY_PROBLEMS.unreadable! : null;
+  return {
+    ledger, problem: null, more: names.length - listed.length, rows,
+    owners: listed.map(name => ledgerOwner(name, rows.get(name) ?? { assets: [], snapshots: [], settings: [] }, namesOf(name))),
+    connectionProblem: keyProblem && listed.some(name => namesOf(name).length) ? `${keyProblem}，已保存的连接无法解密，导入时只导入账本、不带连接，导入后在资产页重新连接` : null,
+  };
 }
 
 const writerIdentity = (dataDir: string) => readerIdentity(statSync(dataDir), process.getuid?.());
@@ -194,13 +273,72 @@ export function readWorkbenchAsset(data: string, dataDir: string, options: { own
   return { ...readWorkbenchLedger(data, options), ...readLastImport(dataDir) };
 }
 
-/** Replaces asset.sqlite with the planned rows, as the data directory's owner; throws with the reason (nothing changed then). */
-export function writeLedgerAsService(dataDir: string, write: LedgerWrite): LastImport {
-  let answer: { info?: ImportInfo };
-  try { answer = runWriter(dataDir, ['write', '--owner', write.owner, '--file', write.file], JSON.stringify(write.rows)) as { info?: ImportInfo }; }
-  catch (error) { throw new Error(`写入资产账本失败，已有账本未改动：${reason(error)}`); }
-  if (!answer?.info) throw new Error('写入资产账本后没有拿到导入记录，请在资产页核对');
-  return lastOf(answer.info);
+/** The first line of a child's stderr, bounded, as printable text. */
+const firstLine = (chunks: Buffer[]): string => printable(Buffer.concat(chunks).toString('utf8').trim().split('\n')[0] ?? '').slice(0, 300);
+const collect = (child: ChildProcess, name: 'stdout' | 'stderr', limit: number): Buffer[] => {
+  const chunks: Buffer[] = []; let size = 0;
+  child[name]?.on('data', (chunk: Buffer) => { size += chunk.length; if (size <= limit) chunks.push(chunk); });
+  return chunks;
+};
+const finished = (child: ChildProcess): Promise<{ code: number | null; signal: NodeJS.Signals | null; error?: Error }> => new Promise(resolve => {
+  let error: Error | undefined;
+  child.once('error', failure => { error = failure; if (child.pid === undefined) resolve({ code: null, signal: null, error }); });
+  child.once('close', (code, signal) => resolve({ code, signal, error }));
+});
+
+/**
+ * Replaces asset.sqlite with the planned rows and the user's workbench connections, as the data directory's owner;
+ * throws with the reason (nothing changed then). The writer gets the rows on fd 3 from here and the connections on its
+ * stdin straight from the connection reader: this process passes the writer's stdin to the reader and closes its own
+ * end before the reader starts writing, and never reads it.
+ */
+export async function writeLedgerAsService(dataDir: string, write: LedgerWrite): Promise<WrittenLedger> {
+  const fail = (detail: string) => new Error(`写入资产账本失败，已有账本未改动：${detail}`);
+  const identity = writerIdentity(dataDir), as = 'uid' in identity ? `（以数据目录属主 uid ${identity.uid} 运行）` : '';
+  const writer = spawn(process.execPath, [WRITER, 'write', '--owner', write.owner, '--file', write.file, '--data-dir', dataDir], { cwd: '/', env: {}, stdio: ['pipe', 'pipe', 'pipe', 'pipe'], ...identity });
+  const writerDone = finished(writer), out = collect(writer, 'stdout', 1024 * 1024), err = collect(writer, 'stderr', 64 * 1024);
+  let reader: ChildProcess | null = null, readerDone: ReturnType<typeof finished> | null = null, readerErr: Buffer[] = [];
+  let refusedReader: string | null = null;
+  try {
+    let stat;
+    try { stat = lstatSync(write.ledger); } catch { stat = null; }
+    // The preview's rule again (readWorkbenchLedger): the file may have been swapped since.
+    if (stat?.isFile() && process.getuid?.() === 0 && stat.uid === 0) {
+      let dirUid: number | null = null;
+      try { dirUid = statSync(dirname(write.ledger)).uid; } catch { /* unreadable directory: refused below */ }
+      if (dirUid !== 0) { refusedReader = `${write.ledger} 归 root，但所在目录归其他账户，连接未导入（账本照常导入）；请确认文件来源`; stat = null; }
+    }
+    // A ledger that is gone or no longer a plain file gives no connections: the writer reads end of file and says so.
+    if (stat?.isFile() && writer.stdin) {
+      reader = spawn(process.execPath, ['--input-type=module', '-e', DUMP_CONNECTIONS, '--', write.ledger, write.owner], { cwd: '/', env: {}, stdio: ['ignore', writer.stdin, 'pipe'], ...readerIdentity(stat, process.getuid?.()) });
+      readerDone = finished(reader); readerErr = collect(reader, 'stderr', 16 * 1024);
+    }
+  } finally { writer.stdin?.destroy(); }
+  const timer = setTimeout(() => { writer.kill('SIGKILL'); reader?.kill('SIGKILL'); }, WRITE_TIMEOUT_MS);
+  try {
+    const rows = writer.stdio[3] as Writable | null;
+    rows?.on('error', () => undefined);
+    rows?.end(JSON.stringify(write.rows));
+    const [result, readResult] = await Promise.all([writerDone, readerDone]);
+    if (result.error || result.code !== 0) throw fail(`${printable(result.error?.message ?? (firstLine(err) || `退出码 ${result.code ?? result.signal}`)).slice(0, 300)}${as}`);
+    let answer: { info?: ImportInfo; connections?: ConnectionImport };
+    try { answer = JSON.parse(Buffer.concat(out).toString('utf8')) as typeof answer; } catch { throw fail(`输出无法解析${as}`); }
+    if (!answer?.info) throw new Error('写入资产账本后没有拿到导入记录，请在资产页核对');
+    const report: ConnectionImport = answer.connections ?? { imported: [], skipped: [], problem: null };
+    if (refusedReader) report.problem = refusedReader;
+    if (readResult && (readResult.error || readResult.code !== 0) && !report.imported.length)
+      report.problem = `读取工作台的连接失败，连接未导入（账本照常导入），请在资产页重新连接：${printable(readResult.error?.message ?? (firstLine(readerErr) || `退出码 ${readResult.code ?? readResult.signal}`)).slice(0, 200)}`;
+    return { ...lastOf(answer.info), connections: report };
+  } finally { clearTimeout(timer); }
+}
+
+/** The lines a finished import adds for its connections. */
+export function connectionLines(report: ConnectionImport): string[] {
+  const lines: string[] = [];
+  if (report.imported.length) lines.push(`已导入连接 ${report.imported.length} 个（${report.imported.map(name => printable(name)).join('、')}），已用本服务的密钥重新加密`);
+  if (report.skipped.length) lines.push(`未导入的连接：${report.skipped.map(item => `${printable(item.exchange) || '（名称无效）'}（${printable(item.reason)}）`).join('、')}；请在资产页重新连接`);
+  if (report.problem) lines.push(printable(report.problem));
+  return lines;
 }
 
 /**
@@ -208,7 +346,7 @@ export function writeLedgerAsService(dataDir: string, write: LedgerWrite): LastI
  * Without `owner`, a ledger of one user is that user's; with several, the caller must name one.
  */
 export function planAsset(source: AssetSource, config: Json, fits: (candidate: Json) => void, owner: string | undefined, notes: string[]): { item: AssetItem; write: LedgerWrite | null } {
-  const { rows: _rows, problem, ...shown } = source;
+  const { rows: _rows, problem, ...shown } = source, { connectionProblem } = source;
   const item: AssetItem = { ...shown, status: 'skipped', enabled: config.asset !== undefined, owner: owner === undefined ? null : printable(owner).slice(0, 64), detail: '' };
   const skip = (detail: string) => { item.detail = detail; return { item, write: null }; };
   if (problem !== null) return skip(problem);
@@ -229,6 +367,7 @@ export function planAsset(source: AssetSource, config: Json, fits: (candidate: J
   }
   item.status = 'added';
   item.detail = `用户 ${entry.owner}：${entry.detail}${item.enabled ? '；本服务已启用资产账本，整体替换已有账本' : ''}`;
-  if (source.last) notes.push(`本服务资产库上次导入：用户 ${source.last.owner}，${source.last.importedAt}；再次导入整体替换`);
-  return { item, write: { owner: chosen!, file: LEDGER_FILE, rows } };
+  if (source.last) notes.push(`本服务资产库上次导入：用户 ${source.last.owner}，${source.last.importedAt}；再次导入整体替换（含已保存的连接）`);
+  if (entry.connections.length) notes.push(connectionProblem ?? `资产账本的连接（${entry.connections.join('、')}）一并导入：由工作台账本属主解密后直接交给写入进程，用本服务的密钥重新加密；解密失败的单个连接不导入，导入后在资产页重新连接`);
+  return { item, write: { owner: chosen!, file: LEDGER_FILE, rows, ledger: source.ledger } };
 }

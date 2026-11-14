@@ -11,7 +11,7 @@
 
 第四个模块“行情监控”（工作台 Monitor 分批接入，方案与进度见 [docs/monitor.md](docs/monitor.md)）第一批是 Anthropic 价差：Binance、Hyperliquid（xyz:ANT、io:ANTH）、Lighter RH 的报价与 15 分钟 K 线，按每股口径算溢价，只读公开行情，不需要密钥。在设置页「从工作台导入」里勾选「启用行情监控」即可启用（命令行 `sudo bash install.sh --import-workbench --monitor`，见下文部署一节），写入的是 `"monitor": { "anthropic": {} }`；也可以手写这一段（可加 `"shares": { "outstanding": 12.7, "diluted": 16.7 }`，十亿股，不写用这两个默认值，须满足 1 ≤ 流通 ≤ 完全稀释 ≤ 100）；只配 `monitor` 时 `pairs` 可以省略。没有 `monitor` 时不采集、不显示页面，行为与之前相同。启用后服务器会定时访问 Binance、Hyperliquid、Lighter RH 的公开行情接口（`deploy/config.example.json` 带了这一项，安装脚本生成的配置不带）；服务器所在地区被某家交易所限制时，那一家读不到，页面显示为快照或暂无数据，其余功能不受影响。
 
-第五个模块“资产账本”（工作台 Asset）分批接入：第一批（v0.12.0）是从工作台导入的账本、资产走势、日变化归因、出金与资金流的只读展示，第二批（v0.16.0）可在页面编辑手动资产、修改汇率、登记出金与资金流；交易所同步与行情、汇率自动更新尚未接入。方案与进度见 [docs/asset.md](docs/asset.md)；只在 `config.json` 有 `asset` 时启用，启用与导入账本都在设置页「从工作台导入」里完成（见下文部署一节）。
+第五个模块“资产账本”（工作台 Asset）分批接入：第一批（v0.12.0）是从工作台导入的账本、资产走势、日变化归因、出金与资金流的只读展示，第二批（v0.16.0）可在页面编辑手动资产、修改汇率、登记出金与资金流，第三批（v0.19.0）连接交易所并在页面打开时每 60 秒同步余额、行情与人民币汇率（凭据加密保存在数据目录）。方案与进度见 [docs/asset.md](docs/asset.md)；只在 `config.json` 有 `asset` 时启用，启用与导入账本都在设置页「从工作台导入」里完成（见下文部署一节）。
 
 新增模块的启用与数据迁移一律做进「从工作台导入」面板及其命令行，不要求手改 `config.json`，见 [docs/module-import.md](docs/module-import.md)。
 
@@ -49,7 +49,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
   - 行情监控写入默认股数（流通 12.7、完全稀释 16.7 十亿股；工作台的股数设置只存在浏览器里，带不过来），已启用时保留现有设置。
   - 资产账本先写入数据目录的 `asset.sqlite`（以服务账户身份写入，600），再写配置并重启；账本写入失败时什么都不改；配置检查或启动失败时恢复导入前的配置，已写入的账本保留，重新勾选导入即可。
   - 已启用 `asset` 时再导入只整体替换账本、不重启服务，页面下次读取就是新数据。
-  - 账本导入只读工作台的库，不读凭据，也不带钱包地址与密钥尾号（规则见 [docs/asset.md](docs/asset.md)）；资产页可编辑手动资产、修改汇率、登记出金与资金流（v0.16.0），重新导入会覆盖页面上做过的修改，交易所同步尚未接入。
+  - 账本行不带凭据、钱包地址与密钥尾号；工作台保存的交易所连接（v0.19.0 起）由以工作台库属主身份运行的子进程用工作台资产模块 `config.json` 的 `credentialKey` 解开，经管道直接交给写入子进程，用本服务的密钥（数据目录 `asset-credential.key`）重新加密，与账本在同一事务写入；预览与结果只列连接名，工作台密钥缺失或解不开时只导入账本并写明原因（规则见 [docs/asset.md](docs/asset.md) A-3/A-4）。重新导入会整体替换账本与已保存的连接，页面上做过的修改一并被覆盖。
   - 备选：手写 `config.json` 的 `monitor` / `asset` 段后执行 `sudo bash install.sh`，账本用 `sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts --from <工作台数据目录>/modules/asset/ledger.sqlite --owner <工作台用户名> --data-dir /var/lib/trading-platform` 单独导入（`trading-platform` 账户须能读到工作台的库）。
 - 期权账户（工作台期权模块 Greeks 的 Bybit 密钥与风险上限，见 [docs/options.md](docs/options.md)）：页面「从工作台导入」的预览同时列出工作台期权账户（打码 UID、能否导入及原因），勾选「导入期权账户」后随导入一起写入；命令行为 `sudo bash install.sh --import-workbench --options`（可与 `--oil`、`--pairs` 同用）。工作台开着自动开仓（`AUTO_OPEN`）、不是实盘主网、还有未结束的订单 / 执行任务 / RFQ，或还在跟踪一组策略时拒绝导入；导入时用密钥读一次 Bybit 账户 UID 并检查权限、绑定 IP 与统一账户。已配置 `options` 时不覆盖。导入后页面出现「期权」标签，导入写入的配置里定时开仓为关闭（要用时在期权页打开；数据目录里留有以前的 `options.sqlite`、且当时在页面打开过定时开仓时，沿用页面上的开关，导入后先在期权页确认），工作台期权模块此后不能再用这个账户下期权单。
 - 首次执行放好程序（`/opt/trading-platform`）、系统账号 `trading-platform`、数据目录 `/var/lib/trading-platform`、导入交接目录 `/var/lib/trading-platform-import`、示例配置和不含配对的空配置，并启动 systemd 服务 `trading-platform`。也可以按 `/etc/trading-platform/config.example.json` 与 `secrets.example.json` 手写配置后再执行一次。
@@ -67,7 +67,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
     - 配置了原油执行账户时多一个「原油」页（价差与盘口、持仓、额度、下单预览与实盘确认、任务与人工处理）
     - 配置了 `options` 时多一个「期权」页（执行台、持仓、组合执行、收益、组合询价，见 [docs/options.md](docs/options.md)）
     - 配置了 `monitor` 时多一个「行情监控」页（Anthropic 价差：对比合约切换、当前溢价与两边每股价、溢价率 / 每股价差 / 每股价格走势、近期观察、换算说明）。行情由服务后台采集（报价每 10 秒、K 线每 60 秒），K 线历史在数据目录的 `monitor.sqlite`（最多保留 400 天；删掉只丢历史，重启后从交易所回补最近约 50 天），这个文件打不开时只是不显示行情监控页，其余功能照常。
-    - 配置了 `asset` 时多一个「资产」页（资产总览、历史记录、出金记录；可编辑手动资产、修改汇率、登记出金与资金流，交易所同步尚未接入）。
+    - 配置了 `asset` 时多一个「资产」页（资产总览、历史记录、出金记录；交易所连接；可编辑手动资产、修改汇率、登记出金与资金流；页面打开时每 60 秒同步交易所余额、行情与汇率，服务端不定时同步）。
   - 划转参数与 ADL 设置保存在数据库里，`config.json` 里的 `transfer` 与 `adl` 只在配对第一次登记时作为初始值，之后以页面为准（两边不一致时启动日志会列出页面当前值）；改短检查间隔使空闲请求权重超出「每分钟上限减 ADL 预留」时会被拒绝，并给出能用的最短间隔。
   - 余额走势来自数据目录里的 `samples.sqlite`（每分钟一条，保留 30 天；删掉只丢走势图）。
 - 需要代理时写 `/etc/trading-platform/environment`，例如 `NODE_USE_ENV_PROXY=1` 与 `HTTPS_PROXY=…`。
@@ -83,6 +83,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 | 回退到早于 | 回退前要做的事 | 说明 | 详见 |
 | --- | --- | --- | --- |
+| v0.19.0 | 不用改配置 | `asset.sqlite` 新增的 `connections` 表与数据目录的 `asset-credential.key` 旧版本不读；回退期间资产页不同步，交易所行停在最后一次同步的值，再升级回来连接照常可用 | [docs/asset.md](docs/asset.md) A-3/A-4 |
 | v0.18.0 | 不用改配置 | 原油自动规则存在单独的 `oil-rules.sqlite`，旧版本不读；观察规则不下单，回退后不再记录信号，再升级回来时规则还在，原来在观察的继续观察（连续次数从零开始） | [docs/oil.md](docs/oil.md) 第 7 节 |
 | v0.17.0 | 不用改配置。先在期权页「组合询价」确认没有未结束的询价（标签上不显示「进行中」；已成交但还没转成跟踪的也算未结束） | 旧版本不读询价记录，也不会因它拦下交易；询价成交的开仓组合照常跟踪与平仓，收益页该组在旧版本显示待核对 | [docs/options.md](docs/options.md) 第 4 节 |
 | v0.16.0 | 不用改配置 | `asset.sqlite` 新增的 `sync_locks` 表旧版本不读；资产页回到只读，显示的是页面写入后的数据，不会回到导入时刻 | [docs/asset.md](docs/asset.md) A-2 |

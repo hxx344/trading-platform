@@ -4,10 +4,9 @@
 
 对照的工作台代码：`modules/asset`（最后修改提交 `0014655`）。工作台 Asset 的功能编号 A01–A15 沿用。
 
-## 当前状态（v0.17.0）
+## 当前状态（v0.19.0）
 
-- 已发布：A-1 只读账本随 v0.12.0；v0.15.0 起在设置页「从工作台导入」里启用并导入账本；A-2 本地写入（编辑手动资产、汇率、出金、资金流）随 v0.16.0。
-- 只有方案：A-3/A-4（凭据、交易所同步、行情与汇率自动更新）。交易所行仍显示导入时的估值。
+- 已发布：A-1 只读账本随 v0.12.0；v0.15.0 起在设置页「从工作台导入」里启用并导入账本；A-2 本地写入（编辑手动资产、汇率、出金、资金流）随 v0.16.0；A-3/A-4（凭据加密存放、交易所连接与同步、行情与汇率自动更新、从工作台导入连接）随 v0.19.0，尚未用真实交易所账户读取过。
 - 未开始：A-5（持仓与成交）、A-6（交易凭据导出、原表导入）。
 - 下文 A-1 一节是当时只读批次的记录；写入入口、去掉只读提示等以 A-2 一节为准。
 
@@ -17,8 +16,8 @@
 | --- | --- | --- | --- |
 | A-1 | 只读账本与计算口径：库结构、每日快照、账本读取、资产走势（A10）、日变化归因（A12）、出金与现金流的只读展示；从工作台导入历史数据的命令 | R2 | 完成（Linux CI 通过），随 v0.12.0 发布 |
 | A-2 | 本地写入：手工资产（A06）、汇率（A07）、出金（A09）、现金流（A11）、同步锁 | R3 | 完成，随 v0.16.0 发布（见下文 A-2） |
-| A-3 | 凭据与中心化交易所余额同步（A01、A02：Binance、Bybit、OKX、Gate）、行情与汇率自动更新 | R3 | 方案见下文 A-3/A-4，尚未实施 |
-| A-4 | 其余数据源（Aster 多账户 A03、Hyperliquid、Lighter RH、Variational A15） | R3 | 与 A-3 同批 |
+| A-3 | 凭据与中心化交易所余额同步（A01、A02：Binance、Bybit、OKX、Gate）、行情与汇率自动更新 | R3 | 完成，随 v0.19.0 发布（见下文 A-3/A-4） |
+| A-4 | 其余数据源（Aster 多账户 A03、Hyperliquid、Lighter RH、Variational A15） | R3 | 与 A-3 同批，v0.19.0 |
 | A-5 | 持仓与成交（A04、A05） | R2 | 未开始 |
 | A-6 | 交易凭据导出（A14）、原表导入（A08） | R3 | 未开始 |
 
@@ -135,12 +134,15 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
 
 **测试**：校验规则逐条（边界与未知字段）、锁（忙、过期接替后写入作废、续期、释放只删自己的锁）、导入替换后写入作废、各写接口的成功与失败（含 CSRF 标记缺失 403、未导入 409、库只读 409）、日快照内容。工作台 `tests` 里覆盖这些函数的用例搬过来，期望值不改。页面表单没有单元测试（工作台对应面板也没有），靠无头浏览器走查：编辑（含“数量大于零时，请填写单价”的报错）、汇率（含越界 400）、出金登记 / 修改 / 删除、资金流登记与作废。
 
-## A-3/A-4：凭据、交易所同步、行情与汇率（方案）
+## A-3/A-4：凭据、交易所同步、行情与汇率（v0.19.0）
 
 - 等级 R3（凭据存放、外部调用、导入凭据）。回滚版本：A-2 发布的版本；新增的 `connections` 表与密钥文件旧版本不读。
-- **数据源**（全部只读，照工作台 `lib/exchanges.ts`、`okx.ts`、`gate.ts`、`hyperliquid.ts`、`rh-lighter.ts`、`variational*.ts`、`fx.ts`）：Binance、Bybit、OKX、Gate、Aster（最多 10 个 API Pro 钱包账号，可选含现货）、Hyperliquid 与 Lighter RH（只填钱包地址）、Variational（vr-token，经 `python3 -I` 标准库脚本读取，本机没有 python3 时该源报“客户端不可用”）；行情 CoinGecko（VIRTUAL/USDT/USDC，失败退 Coinbase），人民币汇率 Coinbase（失败退 Frankfurter ECB，7 天内）。每次请求 12 s 超时、不重试（下一分钟再读）；失败只标该行“同步失败 · 保留旧值”。签名复用 `src/vendor` 的 Binance、Bybit 传输层，补拷工作台 `server/exchange-transport` 的 OKX、Gate；Aster 签名用本仓库 `src/aster/eip712.ts`，不引入 ethers 运行时依赖。
-- **同步**：`POST /api/asset/sync` 照 `refresh()`：30 s 内重复请求直接返回当前账本；取锁后各源并行，凭据在读取期间被换掉的源不写结果；最后写日快照。页面打开且可见时每 60 s 触发一次（照 `refresh-loop.ts`），另有“同步”按钮；服务端不定时同步（与工作台一致，页面不开就不读外部接口）。
+- **数据源**（全部只读，照工作台 `lib/exchanges.ts`、`okx.ts`、`gate.ts`、`hyperliquid.ts`、`rh-lighter.ts`、`variational*.ts`、`fx.ts`）：Binance、Bybit、OKX、Gate、Aster（最多 10 个 API Pro 钱包账号，可选含现货）、Hyperliquid 与 Lighter RH（只填钱包地址）、Variational（vr-token，经 `python3 -I` 标准库脚本读取，本机没有 python3 时该源报“客户端不可用”）；行情 CoinGecko（VIRTUAL/USDT/USDC，失败退 Coinbase），人民币汇率 Coinbase（失败退 Frankfurter ECB，7 天内）。每次请求 12 s 超时（Var 经 python3 读取为 20 s，子进程整体 23 s）、不重试（下一分钟再读）；失败只标该行“同步失败 · 保留旧值”。签名复用 `src/vendor` 的 Binance、Bybit 传输层，补拷工作台 `server/exchange-transport` 的 OKX、Gate；Aster 签名用本仓库 `src/aster/eip712.ts`，不引入 ethers 运行时依赖。
+- **同步**：`POST /api/asset/sync` 照 `refresh()`：30 s 内重复请求直接返回当前账本；取锁后各源并行，凭据在读取期间被换掉的源不写结果；最后写日快照。页面打开且可见时每 60 s 触发一次（照 `refresh-loop.ts`），另有“刷新资产”按钮。页面等待同步 80 s（同工作台）；极慢的网络下服务端同步可能更久（例如 10 个 Aster 账号分 4 轮），页面先报“同步失败”，服务端随后照常写入，期间再点刷新得到 409（正在同步），下一分钟的自动同步会读到结果；服务端不定时同步（与工作台一致，页面不开就不读外部接口）。
 - **凭据存放**：AES-256-GCM 加密存在 `asset.sqlite` 的 `connections(exchange, encrypted, updated_at)`，附加数据为连接名（如 `binance`、`aster:<账号编号>`）；密钥是数据目录里的 `asset-credential.key`（64 位十六进制，600，服务账户），服务第一次保存连接或导入连接时生成。与工作台相同，密钥与库在同一台机器的同一账户下，防的是库文件单独外泄；接口与日志只给出连接名与密钥尾号，不回显凭据。
 - **连接管理**：`POST /api/asset/connections`（连接 / 更新，先实测读取成功才保存，失败什么都不改）、`/connections/delete`（断开，保留旧值）、`/aster-accounts/add|edit|delete`，规则照工作台 `connect`、`disconnect`、`connectAsterAccount`、`deleteAsterAccount`。
 - **从工作台导入连接**：导入资产账本时，读取子进程（以工作台库属主身份）同时读工作台 `<DATA_DIR>/modules/asset/config.json` 的 `credentialKey` 与该用户的 `connections`，解密后经管道交给写入子进程，以本服务的密钥重新加密写入；预览只列有连接的交易所名。工作台密钥缺失或解密失败时只导入账本、不导入连接，并在结果里写明。重新导入时连接以工作台为准整体替换。
+- **重新导入的识别**：`import-info` 带每次导入随机生成的 `importId`；同步与连接写入在租约事务里比对整段 `import-info`，读取外部接口期间账本被重新导入时，旧同步什么都不写、返回 409（`reimported`）。只比对导入时刻时，同一毫秒内的两次导入无法区分。
+- **代码**：`src/asset/sync.ts`（连接、断开、Aster 账号、同步，照工作台 `store.ts`）、`src/asset/credentials.ts`（密钥文件与 AES-GCM）、`src/asset/sources/*`（数据源读取）；页面 `web/src/AssetConnections.tsx`、`web/src/asset-refresh-loop.ts`，做法见 [frontend.md](frontend.md)《资产页同步与交易所连接》。测试 `test/asset-sync.test.ts`、`test/asset-credentials.test.ts`、`test/asset-sources-*.test.ts`，外部读取全部替换，不连网。
+- **回滚**：`sudo bash install.sh --version v0.18.0`，配置不用改；`connections` 表与 `asset-credential.key` 旧版本不读，回退期间资产页不同步，再升级回来连接照常可用；v0.19.0 同步时写进 `aster-accounts` 的钱包地址（不是凭据）在旧版本的账本接口里会原样返回给页面。
 - 未纳入：Variational 连接诊断（`/api/connections/variational-test`）、持仓与成交（A-5）、交易凭据导出与原表导入（A-6）。

@@ -5,11 +5,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { ASSET_DB_FILE } from '../src/asset/db.ts';
+import { CREDENTIAL_KEY_FILE, credentialKey, unseal } from '../src/asset/credentials.ts';
 import { ledgerOwner, planAsset, planMonitor, readLastImport, readWorkbenchAsset, readWorkbenchLedger, writeLedgerAsService, type AssetSource } from '../src/service/import-modules.ts';
 import { fileText, filesUnchanged, planImport, previewImport } from '../src/service/import-workbench.ts';
 import { parseImportBody, parseImportRequest, readImportResult, submitImportRequest } from '../src/service/import-channel.ts';
@@ -131,13 +132,16 @@ test('资产账本计划：多个用户须选一个；选中后启用 asset 并�
   } finally { w.done(); }
 });
 
-test('资产账本写入：以数据目录属主的子进程整体替换 asset.sqlite；校验不过时已有账本不变；上次导入记录可读', () => {
+test('资产账本写入：以数据目录属主的子进程整体替换 asset.sqlite；校验不过时已有账本不变；上次导入记录可读', async () => {
   const w = workspace();
   try {
     const source = readWorkbenchAsset(w.wb, w.svc);
     const plan = planAsset(source, { pairs: [] }, fits, OWNER, []);
-    const last = writeLedgerAsService(w.svc, plan.write!);
+    const last = await writeLedgerAsService(w.svc, plan.write!);
     assert.deepEqual([last.owner, last.assets, last.snapshots], [OWNER, 6, 10]);
+    // The fixture workbench has no config.json: the ledger comes over without its connection.
+    assert.deepEqual([last.connections.imported, last.connections.skipped], [[], []]);
+    assert.match(last.connections.problem ?? '', /config\.json 不存在，连接未导入（账本照常导入）/);
     assert.deepEqual([importInfo(w.target).owner, importInfo(w.target).assets], [OWNER, 6]);
     const raw = readFileSync(w.target).toString('latin1');
     for (const secret of [CIPHERTEXT, WALLET, KEY_TAIL]) assert.ok(!raw.includes(secret), '库里没有凭据与账户标识');
@@ -146,10 +150,88 @@ test('资产账本写入：以数据目录属主的子进程整体替换 asset.s
 
     // Rows the writer's own check refuses: nothing is replaced.
     const spoilt = { ...plan.write!, rows: { ...plan.write!.rows, settings: [...plan.write!.rows.settings, { key: 'sync-state', value: '{}' }] } };
-    assert.throws(() => writeLedgerAsService(w.svc, spoilt), /^Error: 写入资产账本失败，已有账本未改动：工作台账本的设置不在导入范围内/);
+    await assert.rejects(writeLedgerAsService(w.svc, spoilt), /^Error: 写入资产账本失败，已有账本未改动：工作台账本的设置不在导入范围内/);
     assert.equal(importInfo(w.target).owner, OWNER);
-    assert.throws(() => writeLedgerAsService(w.svc, { ...plan.write!, rows: { ...plan.write!.rows, assets: [{ id: 'x', data: '{}' }] } }), /资产 x 格式无效/);
+    await assert.rejects(writeLedgerAsService(w.svc, { ...plan.write!, rows: { ...plan.write!.rows, assets: [{ id: 'x', data: '{}' }] } }), /资产 x 格式无效/);
     assert.equal(importInfo(w.target).assets, 6);
+  } finally { w.done(); }
+});
+
+/** A value sealed as the workbench's vault does (WebCrypto AES-GCM, additional data owner:name). */
+async function workbenchSeal(value: unknown, aad: string, keyHex: string): Promise<string> {
+  const key = await crypto.subtle.importKey('raw', Buffer.from(keyHex, 'hex'), 'AES-GCM', false, ['encrypt']);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(aad) }, key, new TextEncoder().encode(JSON.stringify(value)));
+  return JSON.stringify({ iv: Array.from(iv), cipher: Array.from(new Uint8Array(cipher)) });
+}
+
+test('资产账本写入：工作台连接由属主解密后直交写入进程，用本服务密钥重新加密并与账本同一事务写入；单个解密失败只跳过该连接', async () => {
+  const w = workspace();
+  try {
+    const WB_KEY = 'a1'.repeat(32), ACCOUNT = '3f2a1b0c-9d8e-4f7a-8b6c-5d4e3f2a1b0c';
+    const binance = { exchange: 'binance', apiKey: 'binance-key-B1N4', apiSecret: 'binance-secret-' + 'S'.repeat(20) };
+    const aster = { exchange: 'aster', walletAddress: '0x' + 'cd'.repeat(18) + 'e5f6', privateKey: '0x' + '7'.repeat(64), includeSpot: true };
+    writeFileSync(join(w.wb, 'modules', 'asset', 'config.json'), JSON.stringify({ credentialKey: WB_KEY, sessionSecret: 'b2'.repeat(32), passwordHash: 'c3'.repeat(16) + ':' + 'd4'.repeat(32) }));
+    const db = new DatabaseSync(w.ledger);
+    const add = (name: string, encrypted: string) => db.prepare('INSERT INTO connections VALUES (?, ?, ?, ?)').run(OWNER, name, encrypted, new Date(NOW).toISOString());
+    add('binance', await workbenchSeal(binance, `${OWNER}:binance`, WB_KEY));
+    add(`aster:${ACCOUNT}`, await workbenchSeal(aster, `${OWNER}:aster:${ACCOUNT}`, WB_KEY));
+    // Sealed for another user: does not open with this user's additional data.
+    add('okx', await workbenchSeal({ exchange: 'okx', apiKey: 'okx-key-0001', apiSecret: 'okx-secret-0001', passphrase: 'pass' }, `${OTHER_OWNER}:okx`, WB_KEY));
+    add('mystery', await workbenchSeal({ apiKey: 'x' }, `${OWNER}:mystery`, WB_KEY));
+    // A valid Aster connection whose account is not in the ledger: skipped, it could not be managed on the page.
+    const ORPHAN = '9e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b';
+    add(`aster:${ORPHAN}`, await workbenchSeal({ ...aster, walletAddress: '0x' + 'ab'.repeat(20) }, `${OWNER}:aster:${ORPHAN}`, WB_KEY));
+    db.prepare("UPDATE settings SET value = ? WHERE owner = ? AND key = 'aster-accounts'").run(JSON.stringify([{ id: ACCOUNT, name: '主号', value: 6_200, details: [], updatedAt: new Date(NOW).toISOString(), includeSpot: true, configured: true, lastSync: null, error: null, scope: 'API Pro · 合约 + 现货', walletAddress: aster.walletAddress, label: 'e5f6' }]), OWNER);
+    db.close();
+
+    // The preview names the connections only.
+    const source = readWorkbenchAsset(w.wb, w.svc);
+    const owner = source.owners.find(item => item.owner === OWNER)!;
+    assert.deepEqual(owner.connections, [`aster:${ACCOUNT}`, `aster:${ORPHAN}`, 'binance', 'bybit', 'mystery', 'okx']);
+    assert.match(owner.detail, /连接 6 个（aster:3f2a1b0c-9d8e-4f7a-8b6c-5d4e3f2a1b0c、aster:9e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b、binance、bybit、mystery、okx）/);
+    assert.equal(source.connectionProblem, null);
+    const notes: string[] = [];
+    const plan = planAsset(source, { pairs: [] }, fits, OWNER, notes);
+    assert.equal(plan.write?.ledger, w.ledger);
+    assert.match(notes.join(), /连接（.*）一并导入/);
+    const preview = JSON.stringify({ source: { ...source, rows: undefined }, item: plan.item, notes });
+    for (const secret of [binance.apiSecret, aster.privateKey, aster.walletAddress]) assert.ok(!preview.includes(secret), '预览不带凭据');
+
+    const last = await writeLedgerAsService(w.svc, plan.write!);
+    assert.deepEqual(last.connections.imported, ['aster:3f2a1b0c-9d8e-4f7a-8b6c-5d4e3f2a1b0c', 'binance']);
+    assert.deepEqual(last.connections.skipped.map(item => item.exchange).sort(), [`aster:${ORPHAN}`, 'bybit', 'mystery', 'okx']);
+    assert.match(last.connections.skipped.find(item => item.exchange === `aster:${ORPHAN}`)!.reason, /没有对应的 Aster 账号/);
+    assert.equal(last.connections.problem, null);
+    const report = JSON.stringify(last);
+    for (const secret of [binance.apiSecret, binance.apiKey, aster.privateKey, aster.walletAddress]) assert.ok(!report.includes(secret), '结果不带凭据');
+
+    // Sealed again with this service's key, the additional data the name alone; the key file is the service's, 0600.
+    const keyFile = join(w.svc, CREDENTIAL_KEY_FILE);
+    assert.equal(statSync(keyFile).mode & 0o777, 0o600);
+    const target = new DatabaseSync(w.target, { readOnly: true });
+    const rows = target.prepare('SELECT exchange, encrypted FROM connections ORDER BY exchange').all() as { exchange: string; encrypted: string }[];
+    const settings = new Map((target.prepare('SELECT key, value FROM settings').all() as { key: string; value: string }[]).map(row => [row.key, row.value]));
+    target.close();
+    const key = credentialKey(w.svc);
+    assert.deepEqual(rows.map(row => [row.exchange, unseal(row.encrypted, row.exchange, key)]), [[`aster:${ACCOUNT}`, aster], ['binance', binance]]);
+    assert.throws(() => unseal(rows[1]!.encrypted, `${OWNER}:binance`, key), /decrypt failed/);
+    // The tails come back from the credentials; wallet addresses stay out of the settings.
+    assert.equal(JSON.parse(settings.get('aster-accounts')!)[0].label, 'e5f6');
+    assert.ok(!settings.get('aster-accounts')!.includes(aster.walletAddress));
+    assert.equal(JSON.parse(settings.get('bybit-status')!).label, undefined, '没导入的连接不补尾号');
+    const raw = readFileSync(w.target).toString('latin1');
+    for (const secret of [binance.apiSecret, aster.privateKey, aster.walletAddress, CIPHERTEXT]) assert.ok(!raw.includes(secret), '库里只有本服务密钥加密后的连接');
+
+    // Importing again replaces the connections with the workbench's current ones; a workbench key gone means none.
+    rmSync(join(w.wb, 'modules', 'asset', 'config.json'));
+    const missing = readWorkbenchAsset(w.wb, w.svc);
+    assert.match(missing.connectionProblem ?? '', /没有 config\.json，已保存的连接无法解密，导入时只导入账本、不带连接/);
+    const again = await writeLedgerAsService(w.svc, planAsset(missing, { pairs: [] }, fits, OWNER, []).write!);
+    assert.deepEqual(again.connections.imported, []);
+    const after = new DatabaseSync(w.target, { readOnly: true });
+    assert.equal((after.prepare('SELECT COUNT(*) AS n FROM connections').get() as { n: number }).n, 0);
+    after.close();
   } finally { w.done(); }
 });
 

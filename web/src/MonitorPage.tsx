@@ -1,5 +1,5 @@
 import { Activity, ArrowDownRight, ArrowUpRight, ChevronDown, Clock3, Info, MoveRight, RefreshCw } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ANTHROPIC_COMPARISON_LEGS, ANTHROPIC_LEGS, anthropicPremium, anthropicSharesPerUnit, perShare, type AnthropicComparisonLeg, type AnthropicShares } from '../../src/vendor/anthropic-market.mjs';
 import { api, ApiError } from './api.ts';
 import { ANTHROPIC_WARMUP_DAYS, anthropicChartConfig, anthropicHistory, anthropicPoints, anthropicQuote, coversAnthropicRange, dailyPoints, ranges, selectRange, type AnthropicHistory, type AnthropicQuote, type ChartMode, type Point } from './monitor-history.ts';
@@ -57,6 +57,9 @@ export function MonitorPage({ onExpired }: { onExpired: () => void }) {
   const [pending, setPending] = useState<string | null>(null);
   const [switchError, setSwitchError] = useState<{ market: string; text: string } | null>(null);
   const { data: current, commit, refresh } = state;
+  // The answer is merged into the latest state, not the one at the click: a state read landing meanwhile keeps the other markets.
+  const latest = useRef(current);
+  latest.current = current;
   const toggle = useCallback(async (market: string) => {
     const control = current?.controls?.[market];
     if (!current || !control || pending) return;
@@ -64,7 +67,8 @@ export function MonitorPage({ onExpired }: { onExpired: () => void }) {
     try {
       const view = parseControl(await api<unknown>(`/api/monitor/${market}/control`, { body: toggleBody(control), timeoutMs: CONTROL_TIMEOUT_MS }));
       // The answer is the saved switch: it shows at once, without waiting for the next minute's read.
-      commit({ ...current, controls: { ...current.controls, [market]: view } });
+      const base = latest.current ?? current;
+      commit({ ...base, controls: { ...base.controls, [market]: view } });
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) { onExpired(); return; }
       const answered = error instanceof ApiError;

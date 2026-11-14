@@ -12,6 +12,7 @@ import { controlKey, createMonitorControl } from '../src/monitor/control.ts';
 import { createMonitorStore, MONITOR_FILE } from '../src/monitor/store.ts';
 import type { LoopContext } from '../src/monitor/anthropic.ts';
 import { parseServiceConfig } from '../src/service/config.ts';
+import { pendingImportKey } from '../src/monitor/alerts.ts';
 import { monitorLoops, monitorStatus, monitorViews, openMonitor, type MonitorRuntime } from '../src/service/monitor.ts';
 import { createExecutorServer } from '../src/http.ts';
 import { disabledNotice, parseControl, parseControls, switchFailure, switchLabel, toggleBody } from '../web/src/monitor-control.ts';
@@ -195,4 +196,30 @@ test('页面：解析开关、旧服务没有开关、按钮文字、切换请�
   assert.match(switchFailure(null, undefined, null), /结果未知/);
   assert.match(switchFailure(409, 'control_conflict', '开关已被其他页面修改'), /已重新读取最新状态/);
   assert.equal(switchFailure(503, 'control_unsaved', '监控开关未保存'), '监控开关未保存');
+});
+
+test('循环：真实原油采集器关闭期间不发任何上游请求，开启后恢复；关闭时从工作台导入的告警档位照常换上', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-control-real-'));
+  const venues = fakeAnthropicVenues();
+  let requests = 0;
+  const fetchImpl = ((...args: Parameters<typeof venues.fetch>) => { requests++; return venues.fetch(...args); }) as typeof venues.fetch;
+  const config = parseServiceConfig({ secretsFile: '/etc/tp/secrets.json', monitor: { oil: {} } }).monitor!;
+  const hooks = { notify: () => 1, delivery: () => new Map(), robot: () => 'feishu' as const, test: async () => undefined };
+  const runtime = openMonitor(config, dir, { fetchImpl, WebSocketImpl: venues.WebSocket, log: () => undefined, alertHooks: hooks });
+  try {
+    runtime.control.update('oil', { enabled: false, revision: 0 });
+    const before = runtime.alerts.oil!.view().revision;
+    runtime.store.writeState(pendingImportKey('oil'), { version: 1, importedAt: new Date().toISOString(), source: 'workbench', config: { enabled: false, rules: [] } });
+    const { context, stop } = fastContext();
+    const loops = monitorLoops(runtime, context, () => undefined);
+    await until(() => runtime.store.readState(pendingImportKey('oil')) === null, '关闭时导入照常换上');
+    assert.equal(runtime.alerts.oil!.view().revision, before + 1);
+    await sleep(40);
+    assert.equal(requests, 0, '关闭期间没有上游请求');
+    runtime.control.update('oil', { enabled: true, revision: 1 });
+    await until(() => requests > 0, '开启后恢复采集');
+    stop();
+    runtime.oil?.stop();
+    await Promise.all(loops);
+  } finally { runtime.store.close(); rmSync(dir, { recursive: true, force: true }); }
 });

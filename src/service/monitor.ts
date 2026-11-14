@@ -106,11 +106,14 @@ function marketLoops(start: (context: LoopContext) => Promise<void>[], context: 
   })();
 }
 
-/** Every 10 s each market's alerts check the collector's latest quote (no request of their own); skipped while the market is off. */
+/**
+ * Every 10 s each market's alerts check the collector's latest quote (no request of their own). While the market is off
+ * only a tier import waiting from the workbench is applied (it would otherwise expire after 10 minutes); no threshold is judged.
+ */
 function alertLoop(service: AlertService, context: LoopContext, on: () => boolean, log: (line: string) => void): Promise<void> {
   return (async () => {
     while (!context.stopped()) {
-      if (on()) try { service.check(); } catch (error) { log(`告警检查出错：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`); }
+      try { if (on()) service.check(); else service.applyPending(); } catch (error) { log(`告警检查出错：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`); }
       if (context.stopped()) break;
       await context.pause(ALERT_CHECK_MS);
     }

@@ -16,7 +16,7 @@ import { parseServiceConfig } from '../src/service/config.ts';
 import { monitorSummary } from '../src/service/monitor-config.ts';
 import { monitorStatus, monitorViews, openMonitor } from '../src/service/monitor.ts';
 import { createExecutorServer } from '../src/http.ts';
-import { HYNIX_SPREAD_CHART, coversHynixRange, hynixHistory, hynixQuote } from '../web/src/monitor-hynix.ts';
+import { HYNIX_SPREAD_CHART, coversHynixRange, hynixHistory, hynixQuote, hynixWarnings } from '../web/src/monitor-hynix.ts';
 import { createHarness } from './harness.ts';
 import { fakeAnthropicVenues, fakeHynixPrice } from './monitor-fake.ts';
 
@@ -300,10 +300,15 @@ test('页面数据规则：K 线换算为溢价率与价差；缺口与过时提
   const t0 = FIRST_FULL_HOUR, fetchedAt = new Date(t0 + 10 * HOUR).toISOString();
   const rows = [0, 1, 4].map(i => ({ time: t0 + i * HOUR, adr: 24.15, ordinary: 230 + i * 0 }));
   const coverage = { firstObservation: new Date(t0).toISOString(), lastObservation: new Date(t0 + 4 * HOUR).toISOString(), rows: 3 };
-  const history = hynixHistory({ rows, fetchedAt, status: 'live', coverage, lastError: null }, t0 + 5 * HOUR);
-  assert.deepEqual([history.points.length, history.points[0]!.equivalent, history.status, history.windowDays, history.warnings], [3, 23, 'live', null, ['历史行情存在 1 处缺口，图表保留断点；区间均值仅基于可用时段。']]);
-  close(history.points[0]!.premium, 5); close(history.points[0]!.spread, 1.15);
-  assert.deepEqual(hynixHistory({ rows, fetchedAt, status: 'snapshot', coverage, lastError: 'K 线读取失败：请求超时' }, t0 + 8 * HOUR).warnings.at(-1), '最近一个共同小时距今超过 2 小时，请留意行情时间。');
+  const history = hynixHistory({ rows, fetchedAt, status: 'live', coverage, lastError: null });
+  const { points } = history;
+  assert.deepEqual([points.length, points[0]!.equivalent, history.status, history.windowDays], [3, 23, 'live', null]);
+  assert.deepEqual(hynixWarnings(points, points, t0 + 5 * HOUR), ['历史行情存在 1 处缺口，图表保留断点；区间均值仅基于可用时段。']);
+  // Only the hours the range shows count: a gap in the indicator warmup read before the range is not a gap of the range.
+  assert.deepEqual(hynixWarnings(points.slice(2), points, t0 + 5 * HOUR), []);
+  close(points[0]!.premium, 5); close(points[0]!.spread, 1.15);
+  assert.deepEqual(hynixWarnings(points.slice(2), points, t0 + 8 * HOUR), ['最近一个共同小时距今超过 2 小时，请留意行情时间。']);
+  assert.deepEqual(hynixWarnings(points.slice(0, 1), points, t0 + 5 * HOUR), [], 'staleness looks at the last hour read, not the last hour shown');
   assert.equal(hynixHistory({ rows, fetchedAt, status: 'snapshot', coverage, lastError: 'K 线读取失败：请求超时' }).lastError, 'K 线读取失败：请求超时');
   for (const bad of [
     { rows, fetchedAt, coverage: { ...coverage, rows: 4 } },

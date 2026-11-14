@@ -13,8 +13,11 @@ export type AnthropicQuote = ReturnType<typeof validateAnthropicQuote> & { statu
 export type AnthropicHistory = { rows: AnthropicRow[]; status: 'live' | 'snapshot'; fetchedAt: string; windowDays: number | null; coverage: Coverage; errors: Snapshot['metadata']['errors'] };
 
 export const ranges = [{ label: '1 周', days: 7 }, { label: '1 月', days: 30 }, { label: '全部', days: null }] as const;
-/** The workbench reads its widest indicator window (20 days) and one more day before a range; kept so the same reads cover the same ranges. */
-export const ANTHROPIC_WARMUP_DAYS = 21;
+/** The widest Anthropic indicator window (Bollinger bands and Z-score), as in the workbench's lib/anthropic-history.ts. */
+export const ANTHROPIC_BANDS_DAYS = 20;
+/** Days read before a selected range so its first bar has the full indicator window, plus one day of margin. */
+export const ANTHROPIC_WARMUP_DAYS = ANTHROPIC_BANDS_DAYS + 1;
+const ANTHROPIC_BARS_PER_DAY = 86_400_000 / ANTHROPIC_CANDLE_MS;
 
 /** The quote as the service sends it: the venues' marks, and whether the service still counts them as current. */
 export function anthropicQuote(input: unknown): AnthropicQuote {
@@ -47,6 +50,29 @@ export function selectRange<T extends Point>(points: T[], days: number | null): 
   if (!days || !points.length) return points;
   const start = points.at(-1)!.time - days * 86_400_000;
   return points.filter(p => p.time >= start);
+}
+
+/**
+ * The breaks between consecutive bars and how many bars they miss, counted on the rows a range shows: a windowed read
+ * also carries the indicator warmup before the range, which its notices must not count.
+ */
+export function rangeGaps(points: readonly { time: number }[], intervalMs: number): { gaps: number; missing: number } {
+  let gaps = 0, missing = 0;
+  for (let i = 1; i < points.length; i++) {
+    const step = points[i]!.time - points[i - 1]!.time;
+    if (step > intervalMs) { gaps++; missing += Math.round(step / intervalMs) - 1; }
+  }
+  return { gaps, missing };
+}
+
+export type IndicatorToggles = { sma: boolean; bands: boolean; zscore: boolean };
+/** The chart's saved indicator toggles under `key`; anything missing or unreadable is on, as the workbench's defaults. */
+export function savedToggles(key: string): IndicatorToggles {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) ?? 'null') as Partial<Record<keyof IndicatorToggles, unknown>> | null;
+    if (!value || typeof value !== 'object') return { sma: true, bands: true, zscore: true };
+    return { sma: value.sma !== false, bands: value.bands !== false, zscore: value.zscore !== false };
+  } catch { return { sma: true, bands: true, zscore: true }; }
 }
 
 export function dailyPoints(points: Point[]): Point[] {
@@ -93,12 +119,20 @@ export function sampleChartPoints<T extends object>(points: readonly T[], keys: 
 export type ChartMode = 'premium' | 'spread' | 'price';
 /** Labels for each chart tab; a market without a percentage view (oil) has no `premium`. */
 export type ModeLabels<T> = Record<'spread' | 'price', T> & Partial<Record<'premium', T>>;
-/** The workbench SpreadChartConfig (app/spread-chart.tsx, 4be9aa4), keeping only what the chart without fills and indicators reads. */
+/** The workbench SpreadChartConfig (app/spread-chart.tsx, 4be9aa4) without the fill and trade-marker fields. */
 export type SpreadChartConfig = {
   intervalMs: number;
+  /** Indicator windows in bars: 7 days and 20 days of `intervalMs`. */
+  periods: { sma: number; bands: number };
+  /** Where the indicator toggles are remembered (the workbench keys them by market too). */
+  preferenceKey: string;
   kicker: string;
+  /** "小时" or "15 分钟": names one bar. */
   bar: string;
+  /** Reads a bar count, e.g. "168 小时". */
   span: (count: number) => string;
+  /** Reads a consecutive bar count, e.g. "480 个连续小时". */
+  bars: (count: number) => string;
   checkCadence: string;
   /** The tabs in order; the first one is shown first. */
   modes: readonly ChartMode[];
@@ -120,8 +154,8 @@ const usd = (v: number) => `$${v.toFixed(2)}`;
 export function anthropicChartConfig(leg: AnthropicComparisonLeg): SpreadChartConfig {
   const { name, label } = ANTHROPIC_LEGS[leg];
   return {
-    intervalMs: ANTHROPIC_CANDLE_MS, kicker: 'PREMIUM MONITOR', bar: '15 分钟',
-    span: count => `${(count / 4).toLocaleString()} 小时`, checkCadence: '每分钟检查更新', modes: ['premium', 'spread', 'price'],
+    intervalMs: ANTHROPIC_CANDLE_MS, periods: { sma: 7 * ANTHROPIC_BARS_PER_DAY, bands: ANTHROPIC_BANDS_DAYS * ANTHROPIC_BARS_PER_DAY }, preferenceKey: 'monitor:chart:anthropic:v1',
+    kicker: 'PREMIUM MONITOR', bar: '15 分钟', span: count => `${(count / 4).toLocaleString()} 小时`, bars: count => `${count.toLocaleString()} 根连续 15 分钟 K 线`, checkCadence: '每分钟检查更新', modes: ['premium', 'spread', 'price'],
     tabs: { premium: '溢价率', spread: '每股价差', price: '每股价格' }, units: { premium: `% · Binance 相对 ${name}`, spread: 'USD / 股', price: 'USD / 股' },
     premiumName: 'Binance 溢价率', spreadName: '每股价差', legs: ['Binance', name], zeroLabel: '0 = 同价', domainStep: 1, digits: 2, price: usd,
     tick: { premium: v => `${Number(v.toFixed(2))}%`, spread: v => `$${Number(v.toFixed(2))}`, price: v => `$${Number(v.toFixed(1))}` },

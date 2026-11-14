@@ -3,14 +3,14 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ApiError } from './api.ts';
 import { SpreadChart, date, stamp } from './MonitorChart.tsx';
 import { dailyPoints, ranges, selectRange, type ChartMode, type Point } from './monitor-history.ts';
-import { HYNIX_SPREAD_CHART, HYNIX_WARMUP_DAYS, coversHynixRange, hynixHistory, hynixQuote, type HynixHistory, type HynixQuote } from './monitor-hynix.ts';
+import { HYNIX_SPREAD_CHART, HYNIX_WARMUP_DAYS, coversHynixRange, hynixHistory, hynixQuote, hynixWarnings, type HynixHistory, type HynixQuote } from './monitor-hynix.ts';
 import { ExchangeComparison } from './MonitorExchanges.tsx';
 import { HynixFundingPanel } from './MonitorFunding.tsx';
 import { useLiveResource } from './use-live-resource.ts';
 
 // The Hynix ADR premium on the monitor page, laid out as the workbench's modules/monitor/app/dashboard.tsx (9c652bc) inside
 // the hub, where its top bar is hidden; the exchange comparison (M-2c) sits under the chart, the settled funding (M-2d)
-// under it, sharing the chart's range. Left out: the indicators (M-2e), the fills and the hub summary card. The service collects; the page reads what it saved.
+// under it, sharing the chart's range. Left out: the fills and the hub summary card. The service collects; the page reads what it saved.
 const QUOTE_PATH = '/api/monitor/hynix/quote', CANDLE_PATH = '/api/monitor/hynix/candles';
 const QUOTE_MS = 10_000, CANDLE_MS = 60_000, READ_TIMEOUT_MS = 10_000;
 // The complete history is at most 400 days of hourly rows, well under a megabyte.
@@ -56,6 +56,7 @@ export function HynixPanel({ onExpired }: { onExpired: () => void }) {
     return { mean: sum / points.length, min, max };
   }, [points]);
   const recent = useMemo(() => dailyPoints(points).slice(-6).reverse(), [points]);
+  const warnings = useMemo(() => hynixWarnings(points, chartPoints), [points, chartPoints]);
   // Current metrics always come from the live quote, never from the last hourly close.
   const current = quote ?? undefined;
   const direction = !current || current.premium >= 0 ? 'positive' : 'negative';
@@ -66,7 +67,7 @@ export function HynixPanel({ onExpired }: { onExpired: () => void }) {
     {quoteError && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />{quoteError}</div>}
     {error && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />历史行情：{error}{data ? ' 当前保留上次成功加载的数据。' : ''}</div>}
     {data?.status === 'snapshot' && <div className="notice"><Info size={16} aria-hidden="true" />K 线采集暂停{data.lastError ? `（${data.lastError}）` : ''}，图表展示 {stamp(data.fetchedAt)} 保存的行情。</div>}
-    {data?.warnings.map(w => <div className="notice" key={w}><Info size={16} aria-hidden="true" />{w}</div>)}
+    {warnings.map(w => <div className="notice" key={w}><Info size={16} aria-hidden="true" />{w}</div>)}
     <div className="hynix-chart-group"><section className="metrics readout" aria-label="最新价差概览">
       <article className="metric primary-metric"><div className="metric-label">当前 ADR 溢价率<Activity size={16} aria-hidden="true" /></div><div className={`metric-value ${direction}`}>{percent(current?.premium)}</div><div className="metric-foot">每份价差 <b className={direction}>{signedMoney(current?.spread)}</b></div></article>
       <article className="metric"><div className="metric-label"><span className="legend-dot adr" />ADR 价格<span className="ticker">SKHY</span></div><div className="metric-value">{money(current?.adr)}</div><div className="metric-foot">1 份 ADR <span>· xyz:SKHY</span></div></article>

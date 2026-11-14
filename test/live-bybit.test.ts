@@ -127,6 +127,9 @@ test('Bybit 连接器：只有明确拒绝码才算已拒绝；5xx、未知码�
   const guarded = setup();
   await assert.rejects(guarded.connector.place(binding(), order(), send(() => { throw new Error('租约已丢失'); })), kind('not-sent'));
   assert.equal(guarded.venue.count('POST /v5/order/create'), 0);
+  // No post-only here: sent as GTC it could take liquidity.
+  await assert.rejects(guarded.connector.place(binding(), order({ timeInForce: 'gtx' }), send()), kind('not-sent'));
+  assert.equal(guarded.venue.count('POST /v5/order/create'), 0);
   const sentBefore = guarded.venue.calls.length;
   for (const apiKey of ['bad key', 'line\nbreak', '']) {
     const odd = createBybitConnector({ credentials: () => ({ apiKey, apiSecret: SECRET }), fetchImpl: guarded.venue.fetch, now: () => NOW });

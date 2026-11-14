@@ -408,6 +408,8 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
       if (!ORDER_LINK_ID.test(request.clientOrderId)) refuse('客户订单号格式无效');
       try { amount(request.quantity, '数量'); if (request.limitPrice !== null) amount(request.limitPrice, '限价'); } catch { refuse('数量或价格无效'); }
       if (request.type === 'market' && (request.limitPrice !== null || request.timeInForce === 'gtc')) refuse('市价单不带限价，只能 IOC');
+      // Not declared in capabilities.postOnly; sending it as GTC would let it take liquidity.
+      if (request.timeInForce === 'gtx') refuse('本连接器不支持只挂单');
       if (request.type === 'limit' && request.limitPrice === null) refuse('限价单缺少价格');
       credentialsOf(binding, true);
       const idx = await sideChecked(binding, request.symbol, request.side, request.positionSide, request.reduceOnly, signal);

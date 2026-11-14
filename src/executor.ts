@@ -12,7 +12,7 @@ import {
   type ChaseConnector, type ChaseRequest, type OrderReport, type OrderRequest, type StrategyIdentity, type StrategyReport, type StrategyStatus, type TransferConnector, type VenueConnector,
 } from './connector.ts';
 import type { Store } from './store.ts';
-import { nearestBarrels, quantityForBarrels } from './barrels.ts';
+import { nearestBarrels, quantityForBarrels, splitBarrels } from './barrels.ts';
 import { createTransfers, type PairRecord, type TransferDeps } from './transfer.ts';
 import { DEFAULT_ADL_BUDGETS, createAdl, type Adl, type AdlBudgets } from './adl.ts';
 import type { AdlConnector } from './adl-contracts.ts';
@@ -40,8 +40,14 @@ export interface Budgets extends AdlBudgets, PositionsBudgets {
   maxSlippageBps: number;
   /** Both legs' books must have been received within this window of each other (L100). */
   pairQuoteWindowMs: number;
-  /** Hedge orders per job, counting the first; a definitive venue refusal stops earlier. */
+  /** Hedge orders per job that did not fill in full, counting the first; a definitive venue refusal stops earlier. */
   hedgeAttempts: number;
+  /** A local chase order rests at least this long before it is moved to a new best price. */
+  chaseRepriceMs: number;
+  /** Lead orders one job may send (local chase reposts and batches); three digits keep the client order id in bounds. */
+  chaseOrderLimit: number;
+  /** Lead sends in a row that ended without resting or filling (refused, not sent, not created, expired post-only) before a local chase gives up. */
+  chaseFailureLimit: number;
   /** How far a venue clock may be off when strategies are searched by creation time (Hub VENUE_CLOCK_TOLERANCE_MS). */
   venueClockToleranceMs: number;
   /** Slack on each side of the send window an adopted strategy's creation time must fall in. */
@@ -75,7 +81,7 @@ export interface Budgets extends AdlBudgets, PositionsBudgets {
 export const DEFAULT_BUDGETS: Readonly<Budgets> = Object.freeze({
   previewTtlMs: 30_000, previewQuoteMaxAgeMs: 10_000, sendQuoteMaxAgeMs: 10_000, futureToleranceMs: 1_000, callTimeoutMs: 35_000,
   createObserveMs: 120_000, createArrivalMarginMs: 60_000, absentChecks: 2, absentSpacingMs: 5_000, cancelAttempts: 5, cancelRetryMs: 10_000, leaseTtlMs: 60_000,
-  unresolvedGraceMs: 60_000, maxSlippageBps: 50, pairQuoteWindowMs: 1_500, hedgeAttempts: 5, venueClockToleranceMs: 300_000, adoptSkewMs: 5_000,
+  unresolvedGraceMs: 60_000, maxSlippageBps: 50, pairQuoteWindowMs: 1_500, hedgeAttempts: 5, chaseRepriceMs: 2_000, chaseOrderLimit: 300, chaseFailureLimit: 3, venueClockToleranceMs: 300_000, adoptSkewMs: 5_000,
   historyRetentionMs: 90 * 24 * 3_600_000, pruneIntervalMs: 3_600_000, pruneBatch: 500,
   transferHistorySpanMs: 180_000, transferClockToleranceMs: 60_000, transferLabelDeferMs: 300_000, transferSettleCooldownMs: 30_000, transferUncertainCooldownMs: 300_000, transferRetryMs: 5_000,
   transferReadTimeoutMs: 8_000, transferBaselineTimeoutMs: 1_500, transferBalanceMaxAgeMs: 8_000, transferRefreshDeferMs: 300_000, transferTickBudgetMs: 10_000,
@@ -116,6 +122,8 @@ export interface PlannedLeg {
   instrument: Instrument;
   /** Worst acceptable book price for this leg's side, fixed at preview. The lead sends it as an IOC limit (a chase lead as its maxChasePrice); the hedge only checks it before the lead goes out. Absent in rows written before it existed. */
   priceBound?: string | null;
+  /** Local chase sell only: the highest price it posts at, the preview ask moved up by the protection band; the notional caps count it. */
+  chaseCeiling?: string | null;
   quote: Pick<Quote, 'bid' | 'ask' | 'receivedAt' | 'connectionGeneration' | 'sequence'>;
 }
 export interface Preview {
@@ -128,6 +136,8 @@ export interface Preview {
   notional: string;
   /** Barrels per leg (quantity × contract size, equal on both legs). Absent in previews written before it existed. */
   barrels?: string;
+  /** Lead quantity of each batch, when the intent asked for more than one. */
+  batches?: string[];
   notes: string[];
 }
 export interface Job {
@@ -146,13 +156,25 @@ export interface Job {
   acknowledgedAt: number | null;
   /** First failed hedge-side account read; bounded by unresolvedGraceMs. Absent in rows written before it existed. */
   hedgeWaitSince?: number | null;
+  /** Lead quantity of each batch; absent is one batch of the lead's whole quantity. */
+  batches?: string[];
+  batchIntervalMs?: number;
+  /** When the batch in hand was found done; the next one goes out batchIntervalMs later. */
+  batchDoneAt?: number | null;
+  /**
+   * Set when the hedge cannot go on while a lead order rests (refused, out of attempts, unknown, guard refusal): the lead
+   * is withdrawn first, so no further fill lands unhedged, and the job ends once it settles.
+   */
+  leadWithdraw?: string | null;
 }
 export interface Operation {
   id: string;
   jobId: string;
   leg: 0 | 1;
-  /** 0 for the first order of a leg; hedge resumes count up. Absent in rows written before it existed means 0. */
+  /** 0 for the first order of a leg; hedge resumes, local chase reposts and later batches count up. Absent in rows written before it existed means 0. */
   attempt?: number;
+  /** Lead only: the batch this order belongs to. Absent means 0. */
+  batch?: number;
   venue: Venue;
   /** strategy: a venue-native chase strategy whose remoteId is its strategy id; the client order id stays local. Absent means order. */
   kind?: 'order' | 'strategy';
@@ -247,6 +269,21 @@ export interface ExecutorOptions {
 
 const digest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const exposure = (quantity: string, instrument: Instrument): string => mul(quantity, instrument.contractSize);
+/** Headroom over a venue's minimum notional for an amount priced at the preview, which the market may have left. */
+const MIN_NOTIONAL_MARGIN = '1.2';
+/** Whether the hedge contract's minimum quantity, at the preview bid, is under MIN_NOTIONAL_MARGIN times its minimum notional. */
+function reserveNeeded(leg: { instrument: Instrument; quote: Pick<Quote, 'bid'> }): boolean {
+  return cmp(mul(exposure(leg.instrument.minQuantity, leg.instrument), leg.quote.bid), mul(leg.instrument.minNotional, MIN_NOTIONAL_MARGIN)) < 0;
+}
+/** The smallest quantity on the step (and at least the minimum) worth MIN_NOTIONAL_MARGIN times the minimum notional at a price. */
+function reserveFor(instrument: Instrument, price: string): string {
+  const target = mul(instrument.minNotional, MIN_NOTIONAL_MARGIN), perStep = Number(mul(exposure(instrument.quantityStep, instrument), price));
+  if (!(perStep > 0)) return instrument.minQuantity;
+  // A float estimate of the step count, then exact steps up until the amount reaches the target.
+  let quantity = mul(instrument.quantityStep, String(Math.max(1, Math.ceil(Number(target) / perStep))));
+  while (cmp(mul(exposure(quantity, instrument), price), target) < 0) quantity = add(quantity, instrument.quantityStep);
+  return cmp(quantity, instrument.minQuantity) < 0 ? instrument.minQuantity : quantity;
+}
 const maskId = (id: string): string => id.length > 4 ? `***${id.slice(-4)}` : '***';
 const maxOf = (...values: string[]): string => values.reduce((top, value) => cmp(value, top) > 0 ? value : top);
 /**
@@ -254,8 +291,8 @@ const maxOf = (...values: string[]): string => values.reduce((top, value) => cmp
  * highest, so a sell is not undercounted at its lower bound. The market hedge carries no venue-enforced price limit, so its
  * real fill can still cost more than this.
  */
-const legNotional = (leg: Pick<PlannedLeg, 'quantity' | 'instrument' | 'priceBound' | 'quote' | 'limitPrice'>): string =>
-  mul(exposure(leg.quantity, leg.instrument), maxOf(leg.priceBound ?? '0', leg.quote.ask, leg.limitPrice ?? '0'));
+const legNotional = (leg: Pick<PlannedLeg, 'quantity' | 'instrument' | 'priceBound' | 'quote' | 'limitPrice' | 'chaseCeiling'>): string =>
+  mul(exposure(leg.quantity, leg.instrument), maxOf(leg.priceBound ?? '0', leg.quote.ask, leg.limitPrice ?? '0', leg.chaseCeiling ?? '0'));
 /** Both legs carry the same barrels, so the job's notional is the dearer leg, not their sum. */
 /** The rolling window of openPer24h, counted from each job's confirm. */
 export const OPEN_WINDOW_MS = 24 * 3_600_000;
@@ -274,8 +311,8 @@ const averageOf = (ops: readonly Pick<Operation, 'filledQuantity' | 'averagePric
   }
   return weight === 0n ? null : fromUnits(total / weight);
 };
-/** `pa1-` + 24 hex + `-` + leg index, plus `r` + attempt for a resumed hedge (at most two digits). */
-const CLIENT_ORDER_ID_LENGTH = 33;
+/** `pa1-` + 24 hex + `-` + leg index, plus `r` + attempt for a later order of the leg (at most three digits: both legs stop at chaseOrderLimit ≤ 999). */
+const CLIENT_ORDER_ID_LENGTH = 34;
 
 export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions, transfers: transferConnector, adl: adlConnector, positions: positionsConnector, notionalLimits, enableGuard, transferConfigGuard, adlOnlyEnabledPairs = false }: ExecutorOptions) {
   // Jobs never run on a real account without hard caps; a malformed cap stops the start instead of being ignored.
@@ -283,8 +320,11 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   const limits = notionalLimits ? parseExecutorNotionalLimits(notionalLimits) : null;
   // An override passed as undefined keeps the default instead of turning the budget into NaN arithmetic.
   const budgets: Budgets = { ...DEFAULT_BUDGETS, ...Object.fromEntries(Object.entries(overrides).filter(([, value]) => value !== undefined)) };
-  // The client order id reserves two digits for the resume index, and the band must stay strictly inside the book.
+  // The client order id has three digits for a leg's order index (chaseOrderLimit caps both legs), and the band must stay strictly inside the book.
   if (!Number.isSafeInteger(budgets.hedgeAttempts) || budgets.hedgeAttempts < 1 || budgets.hedgeAttempts > 99) throw new ContractError(500, 'budget', 'hedgeAttempts 须为 1–99');
+  if (!Number.isSafeInteger(budgets.chaseOrderLimit) || budgets.chaseOrderLimit < 1 || budgets.chaseOrderLimit > 999) throw new ContractError(500, 'budget', 'chaseOrderLimit 须为 1–999');
+  if (!Number.isSafeInteger(budgets.chaseFailureLimit) || budgets.chaseFailureLimit < 1 || budgets.chaseFailureLimit > 99) throw new ContractError(500, 'budget', 'chaseFailureLimit 须为 1–99');
+  if (!Number.isSafeInteger(budgets.chaseRepriceMs) || budgets.chaseRepriceMs < 500 || budgets.chaseRepriceMs > 60_000) throw new ContractError(500, 'budget', 'chaseRepriceMs 须为 500–60000');
   if (!Number.isSafeInteger(budgets.maxSlippageBps) || budgets.maxSlippageBps < 1 || budgets.maxSlippageBps > MAX_SLIPPAGE_BPS) throw new ContractError(500, 'budget', `maxSlippageBps 须为 1–${MAX_SLIPPAGE_BPS}`);
   if (controlOptions && Math.max(budgets.callTimeoutMs, budgets.adlOrderTimeoutMs) > MAX_OWNED_BUDGET_MS) throw new ContractError(500, 'control_budget', `共享写者登记要求单次调用不超过 ${MAX_OWNED_BUDGET_MS} 毫秒`);
   // The registry stops gating on an unknown ASTER transfer this long after it; a request still valid then could land unseen.
@@ -494,6 +534,23 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (action === 'open' && cmp(mul(mul(leg.quantity, quote.bid), instrument.contractSize), instrument.minNotional) < 0) reject('min_notional', `${name} 名义金额低于 ${instrument.minNotional} USDT`);
   }
 
+  /** Lead quantity of each batch. Every batch is checked as an order on both legs, so no batch is refused at send for its size. */
+  function planBatches(legs: [PlannedLeg, PlannedLeg], count: number, quotes: readonly Quote[], action: Action): string[] {
+    const barrels = exposure(legs[0].quantity, legs[0].instrument);
+    const parts = splitBarrels(barrels, count, legs.map(leg => leg.instrument)) ?? reject('batch_size', `${barrels} 桶分不成 ${count} 批：每批须是两腿共同桶数步长的整数倍`);
+    for (const part of parts) {
+      legs.forEach((leg, index) => {
+        const quantity = quantityForBarrels(part, leg.instrument) ?? reject('batch_size', `每批 ${part} 桶换算不成 ${VENUE_NAMES[leg.venue]} ${leg.symbol} 的整数步长`);
+        try { checkQuantity({ ...leg, quantity }, leg.instrument, quotes[index] as Quote, action); }
+        catch (error) {
+          if (error instanceof ContractError) reject('batch_size', `分 ${count} 批后每批约 ${part} 桶：${error.message}`);
+          throw error;
+        }
+      });
+    }
+    return parts.map(part => quantityForBarrels(part, legs[0].instrument) as string);
+  }
+
   /**
    * Notional of every opening job accepted so far, priced like at its preview. A job counts from its confirm on and is never
    * given back by fills, cancels or a close; only a job that ended without any order leaving this process (every operation
@@ -533,6 +590,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const accounts = intent.legs.map(leg => accountFor(leg.venue) ?? reject('account_missing', `${VENUE_NAMES[leg.venue]} 尚未绑定已核验的账户`, 409));
     for (const leg of intent.legs) if (connectorFor(leg.venue).capabilities.maxClientOrderIdLength < CLIENT_ORDER_ID_LENGTH) reject('client_order_id', `${VENUE_NAMES[leg.venue]} 客户订单号长度上限不足`, 409);
     for (const leg of intent.legs) if (leg.orderType === 'chase') chaseConnector(leg.venue);
+    for (const leg of intent.legs) if (leg.orderType === 'local-chase' && connectorFor(leg.venue).capabilities.postOnly !== true) reject('chase_unsupported', `${VENUE_NAMES[leg.venue]} 连接器不支持只挂单，不能本地追价`, 409);
     intent.legs.forEach((leg, index) => { if (db.prepare('SELECT 1 FROM locks WHERE resource = ?').get(`${accounts[index].account_key}:${leg.symbol}`)) reject('symbol_locked', '所选合约已有未结束任务', 409); });
     const reads = await Promise.all(intent.legs.map(async (leg, index) => {
       const binding = bindingOf(accounts[index]);
@@ -559,11 +617,14 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       const priceBound = orderSide === 'buy' ? bandEdge(quote.ask, slippageBps, 'up', instrument.tickSize) : bandEdge(quote.bid, slippageBps, 'down', instrument.tickSize);
       const planned = { venue: leg.venue, symbol: leg.symbol, side: leg.side, quantity: quantities[index] as string, orderType: leg.orderType, limitPrice: leg.limitPrice };
       checkQuantity(planned, instrument, quote, intent.action);
-      // A marketable limit beyond the band would fill past the protection the plan promises (L100).
-      if (planned.limitPrice !== null && (orderSide === 'buy' ? cmp(planned.limitPrice, priceBound) > 0 : cmp(planned.limitPrice, priceBound) < 0)) reject('limit_beyond_bound', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 限价 ${planned.limitPrice} 越过价格保护界限 ${priceBound}`, 409);
+      // A marketable limit beyond the band would fill past the protection the plan promises (L100); a chase bound may only be tighter.
+      if (planned.limitPrice !== null && (orderSide === 'buy' ? cmp(planned.limitPrice, priceBound) > 0 : cmp(planned.limitPrice, priceBound) < 0)) reject('limit_beyond_bound', `${VENUE_NAMES[leg.venue]} ${leg.symbol} ${leg.orderType === 'local-chase' ? '追价界限' : '限价'} ${planned.limitPrice} 越过价格保护界限 ${priceBound}`, 409);
+      // A selling local chase follows the ask up; it stops at the band above the preview ask, which the caps count.
+      const chaseCeiling = leg.orderType === 'local-chase' && orderSide === 'sell' ? bandEdge(quote.ask, slippageBps, 'up', instrument.tickSize) : null;
+      if (chaseCeiling && planned.limitPrice !== null && cmp(planned.limitPrice, chaseCeiling) > 0) reject('limit_beyond_bound', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 追价界限 ${planned.limitPrice} 高于卖出挂单上限 ${chaseCeiling}`, 409);
       const { baseline, positionMode } = checkLegAccount(planned, snapshot, intent.action);
       const result: PlannedLeg = {
-        ...planned, index: index as 0 | 1, orderSide, reduceOnly: intent.action === 'close', priceBound,
+        ...planned, index: index as 0 | 1, orderSide, reduceOnly: intent.action === 'close', priceBound, ...(chaseCeiling ? { chaseCeiling } : {}),
         accountKey: accountKey(binding), accountId: binding.accountId, credentialVersion: binding.credentialVersion, accountMode: binding.accountMode, positionMode, baseline, instrument,
         quote: { bid: quote.bid, ask: quote.ask, receivedAt: quote.receivedAt, connectionGeneration: quote.connectionGeneration, sequence: quote.sequence },
       };
@@ -572,20 +633,26 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     // Settlement completes only on equal barrels, so the plan must already be equal; a tolerance here would end every such job in attention.
     const [a, b] = legs.map(leg => units(exposure(leg.quantity, leg.instrument)));
     if (a !== b) reject('unbalanced', `两腿桶数不相等：${fromUnits(a)} 与 ${fromUnits(b)}`);
+    const batches = intent.batches ? planBatches(legs, intent.batches.count, reads.map(read => read.quote), intent.action) : null;
     const notional = jobNotional(legs);
     checkNotional(notional, intent.action);
     const capNote = !limits ? null : limits.openPer24h !== undefined
       ? `名义金额按价格保护界限计 ${notional} USDT；单笔上限 ${limits.perJob} USDT，最近 24 小时开仓上限 ${limits.openPer24h} USDT（按确认时刻滚动计；平仓只受单笔上限；确认时按当时用量再核一次，超限拒绝；对冲腿市价成交可能高于此估算）。`
       : `名义金额按价格保护界限计 ${notional} USDT；单笔上限 ${limits.perJob} USDT，累计开仓上限 ${limits.totalOpen} USDT（确认时按当时累计再核一次，超限拒绝；对冲腿市价成交可能高于此估算）。`;
     const value: Preview = {
-      id: randomUUID(), expiresAt: at + budgets.previewTtlMs, writerGeneration: generation, intent, legs, notional, barrels: fromUnits(a),
+      id: randomUUID(), expiresAt: at + budgets.previewTtlMs, writerGeneration: generation, intent, legs, notional, barrels: fromUnits(a), ...(batches ? { batches } : {}),
       notes: [
         `先发送 ${legLabel(legs, 0)} 腿，成交确认后按其成交量发送 ${legLabel(legs, 1)} 对冲腿。`,
-        legs[0].orderType === 'market'
+        ...(batches && intent.batches ? [`分 ${batches.length} 批，首腿每批 ${batches.map(quantity => exposure(quantity, legs[0].instrument)).join(' / ')} 桶；一批首腿结束并补齐对冲后，等 ${intent.batches.intervalMs / 1000} 秒再发下一批。后续批次发送前盘口或持仓不满足条件时等待到截止，不追加；截止或停止时未发的批次不再发送。`] : []),
+        legs[0].orderType === 'local-chase'
+          ? `首腿本地追价：只挂单挂在${legs[0].orderSide === 'buy' ? '买一' : '卖一'}，盘口变化后撤单重挂（挂满 ${budgets.chaseRepriceMs / 1000} 秒后才改价），${legs[0].orderSide === 'buy' ? '最高' : '最低'}追到 ${legs[0].limitPrice ?? legs[0].priceBound}${legs[0].limitPrice ? '（自填界限）' : `（${slippageBps} 基点价格保护界限）`}${legs[0].chaseCeiling ? `，最高挂到 ${legs[0].chaseCeiling}` : ''}；挂单期间的成交每轮按比例对冲。首腿最多 ${budgets.chaseOrderLimit} 笔委托（各批合计）；连续 ${budgets.chaseFailureLimit} 次挂单失败或到截止时间时撤单结束追价，按实际成交对冲后结束；请求停止则撤单且不再补发对冲腿。发送前对冲腿盘口越过界限 ${legs[1].priceBound} 即不发送。`
+          : legs[0].orderType === 'market'
           ? `价格保护 ${slippageBps} 基点：首腿以 IOC 限价 ${legs[0].priceBound} 发送，未即时成交的部分由交易所撤销；发送前任一腿盘口越过界限（对冲腿界限 ${legs[1].priceBound}）即不发送。`
           : legs[0].orderType === 'chase'
             ? `首腿以 ${VENUE_NAMES[legs[0].venue]} 原生追价策略发送，${legs[0].orderSide === 'buy' ? '最高' : '最低'}追价为 ${slippageBps} 基点界限 ${legs[0].priceBound}；发送前任一腿盘口越过界限（对冲腿界限 ${legs[1].priceBound}）即不发送；截止、停止或策略被交易所暂停时停止策略，按停止后重查的实际成交对冲。追价策略不接受客户编号：交易所回报的策略编号须经查询核对身份后才会被停止；创建结果不明时不重发、不自动核对，任务转人工，需填写策略编号认领、在观察窗后确认未创建，或强制释放（策略可能已成交，由人工在交易所处理）。`
             : `首腿按限价 ${legs[0].limitPrice} 挂单；发送前任一腿盘口越过 ${slippageBps} 基点界限即不发送。`,
+        ...(intent.action === 'open' && (legs[0].orderType === 'local-chase' || legs[0].orderType === 'limit') && reserveNeeded(legs[1])
+          ? [`对冲合约最小数量不足最小名义金额 ${MIN_NOTIONAL_MARGIN} 倍：首腿挂单期间留约 ${mul(legs[1].instrument.minNotional, MIN_NOTIONAL_MARGIN)} USDT 的成交不对冲，首腿结束后一并对冲；这期间请求停止，这部分转人工处理。`] : []),
         '对冲腿按市价发送；首腿成交后，包括服务重启接管后，按已落盘成交量补发对冲腿，补发不设价格限制。',
         ...(capNote ? [capNote] : []),
         environment === 'mainnet' ? '实盘传输：确认后委托会发送到真实交易所账户。' : '模拟传输：不会访问任何真实交易所。',
@@ -619,7 +686,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       }
       // Inside the write transaction, so two confirms cannot both fit under the running total.
       checkNotional(jobNotional(plan.legs), plan.intent.action);
-      const job: Job = { id: randomUUID(), status: 'accepted', reason: null, createdAt: now(), deadlineAt: now() + plan.intent.timeoutMs, previewId: plan.id, requestId: body.requestId, action: plan.intent.action, legs: plan.legs, holdNewSends: false, acknowledgedAt: null, hedgeWaitSince: null };
+      const job: Job = { id: randomUUID(), status: 'accepted', reason: null, createdAt: now(), deadlineAt: now() + plan.intent.timeoutMs, previewId: plan.id, requestId: body.requestId, action: plan.intent.action, legs: plan.legs, holdNewSends: false, acknowledgedAt: null, hedgeWaitSince: null,
+        ...(plan.batches && plan.intent.batches ? { batches: plan.batches, batchIntervalMs: plan.intent.batches.intervalMs, batchDoneAt: null } : {}) };
       db.prepare('INSERT INTO jobs(id, status, final, version, created_at, updated_at, json) VALUES (?, ?, 0, 1, ?, ?, ?)').run(job.id, job.status, job.createdAt, job.createdAt, JSON.stringify(job));
       for (const leg of plan.legs) db.prepare('INSERT INTO locks(resource, job_id) VALUES (?, ?)').run(`${leg.accountKey}:${leg.symbol}`, job.id);
       db.prepare('UPDATE previews SET consumed_job = ? WHERE id = ?').run(job.id, plan.id);
@@ -870,8 +938,12 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     return bindingOf(row as AccountRow);
   }
 
-  /** Final send guard of an exposure-opening lead leg: both books fresh, both accounts unchanged since preview. */
-  async function guardLead(job: Job): Promise<void> {
+  /**
+   * Final send guard of a lead order: both books fresh, both accounts where this job left them (the preview baseline before
+   * the first order). A local chase lead posts on its own side, so only the hedge's taker price is held to its bound here;
+   * its post price is checked by chaseTarget. Returns the lead's book.
+   */
+  async function guardLead(job: Job): Promise<Quote> {
     if (now() >= job.deadlineAt) reject('deadline', '任务已超过最长执行时间，未发送', 409);
     const checks = await Promise.all(job.legs.map(async leg => {
       const binding = bindingStillValid(leg);
@@ -882,14 +954,38 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     // A stale or broken book is a refusal; only two fresh books read too far apart are retried, like a failed read.
     for (const { quote } of checks) checkQuoteFresh(quote, at, budgets.sendQuoteMaxAgeMs, budgets.futureToleranceMs);
     if (Math.abs(checks[0].quote.receivedAt - checks[1].quote.receivedAt) > budgets.pairQuoteWindowMs) reject('quote_window', `两腿盘口接收时间相差超过 ${budgets.pairQuoteWindowMs} 毫秒，暂不发送`, 409);
+    // This job's own orders may still show in a snapshot read just after they ended.
+    const own = opsOf(job.id).map(item => item.clientOrderId);
     for (const { leg, quote, snapshot } of checks) {
       const price = leg.orderSide === 'buy' ? quote.ask : quote.bid, bound = leg.priceBound ?? null;
-      if (bound !== null && (leg.orderSide === 'buy' ? cmp(price, bound) > 0 : cmp(price, bound) < 0)) reject('price_moved', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 盘口 ${price} 已越过价格保护界限 ${bound}，未发送`, 409);
-      const { baseline, positionMode } = checkLegAccount(leg, snapshot, job.action);
-      if (cmp(baseline, leg.baseline) !== 0 || positionMode !== leg.positionMode) reject('position_changed', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 持仓已变化，请重新预览`, 409);
+      const posting = leg.index === 0 && leg.orderType === 'local-chase';
+      if (!posting && bound !== null && (leg.orderSide === 'buy' ? cmp(price, bound) > 0 : cmp(price, bound) < 0)) reject('price_moved', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 盘口 ${price} 已越过价格保护界限 ${bound}，未发送`, 409);
+      const { baseline, positionMode } = checkLegAccount({ ...leg, quantity: unfilledOf(job, leg.index) }, snapshot, job.action, own);
+      if (cmp(baseline, expectedPosition(job, leg.index)) !== 0 || positionMode !== leg.positionMode) reject('position_changed', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 持仓已变化，请重新预览`, 409);
     }
     // Both accounts: a lead whose hedge account cannot be written would leave an exposure nobody can close.
     for (const leg of job.legs) admit(leg);
+    return checks[0].quote;
+  }
+  /** What this job has yet to fill on a leg; a close needs at least that much position left. */
+  function unfilledOf(job: Job, index: 0 | 1): string {
+    const left = sub(job.legs[index].quantity, add('0', ...opsOf(job.id).filter(item => item.leg === index).map(item => item.filledQuantity)));
+    return cmp(left, '0') > 0 ? left : '0';
+  }
+  /**
+   * Where a local chase lead posts: its own side's best price, held inside its chase bound (the leg's limit, else the
+   * preview bound) and, for a sell, under its ceiling. A price that would take liquidity is refused, never sent.
+   */
+  function chaseTarget(leg: PlannedLeg, quote: Pick<Quote, 'bid' | 'ask'>): string {
+    const bound = leg.limitPrice ?? leg.priceBound ?? reject('chase_unsupported', '本地追价缺少追价界限，未发送', 409);
+    let price: string;
+    if (leg.orderSide === 'buy') price = cmp(quote.bid, bound) < 0 ? quote.bid : bound;
+    else {
+      price = cmp(quote.ask, bound) > 0 ? quote.ask : bound;
+      if (leg.chaseCeiling && cmp(price, leg.chaseCeiling) > 0) price = leg.chaseCeiling;
+    }
+    if (leg.orderSide === 'buy' ? cmp(price, quote.ask) >= 0 : cmp(price, quote.bid) <= 0) reject('price_moved', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 挂 ${price} 会立即成交（盘口 ${quote.bid} / ${quote.ask}），暂不挂单`, 409);
+    return price;
   }
   function admit(leg: PlannedLeg): void {
     if (control) control.admit(bindingStillValid(leg), budgets.callTimeoutMs);
@@ -905,10 +1001,14 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     admit(leg);
   }
 
-  async function send(job: Job, index: 0 | 1, quantity: string, attempt = 0): Promise<void> {
+  async function send(job: Job, index: 0 | 1, quantity: string, attempt = 0, lead: { batch: number; price: string | null } = { batch: 0, price: null }): Promise<void> {
     const leg = job.legs[index], orderType = leg.orderType, clientOrderId = clientOrderIdFor(job, index, attempt);
     let request: OrderRequest | ChaseRequest;
-    if (orderType === 'chase') {
+    if (orderType === 'local-chase') {
+      // Post-only, so the venue refuses it rather than let it take liquidity past the chase bound.
+      if (index !== 0 || lead.price === null) reject('chase_unsupported', '本地追价只用于首腿且需要挂单价，未发送', 409);
+      request = { clientOrderId, symbol: leg.symbol, side: leg.orderSide, positionSide: leg.side, quantity, type: 'limit', limitPrice: lead.price, timeInForce: 'gtx', reduceOnly: leg.reduceOnly };
+    } else if (orderType === 'chase') {
       // The preview bound is the venue-enforced protection of a chase lead, as the IOC limit is for a market lead.
       if (index !== 0 || !leg.priceBound) reject('chase_unsupported', '追价策略只用于首腿且需要价格保护界限，未发送', 409);
       request = { clientOrderId, symbol: leg.symbol, side: leg.orderSide, positionSide: leg.side, quantity, type: 'chase', maxChasePrice: leg.priceBound as string, reduceOnly: leg.reduceOnly };
@@ -921,7 +1021,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         timeInForce: protectedLead || orderType === 'market' ? 'ioc' : 'gtc', reduceOnly: leg.reduceOnly,
       };
     }
-    const op: Operation = { id: randomUUID(), jobId: job.id, leg: index, attempt, venue: leg.venue, kind: request.type === 'chase' ? 'strategy' : 'order', clientOrderId, request, state: 'prepared', remoteId: null, filledQuantity: '0', averagePrice: null, venueStatus: null,
+    const op: Operation = { id: randomUUID(), jobId: job.id, leg: index, attempt, ...(index === 0 ? { batch: lead.batch } : {}), venue: leg.venue, kind: request.type === 'chase' ? 'strategy' : 'order', clientOrderId, request, state: 'prepared', remoteId: null, filledQuantity: '0', averagePrice: null, venueStatus: null,
       preparedAt: now(), sentAt: null, lastCheckedAt: null, absentChecks: 0, absentAt: null, positionMismatchAt: null, cancelSent: 0, cancelRequestedAt: null, note: null,
       ...(request.type === 'chase' ? { strategyStatus: null, childrenSettled: false, childrenWaitSince: null, adoptedAt: null } : {}) };
     inFlight.add(op.id);
@@ -1262,23 +1362,25 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     // The grace starts no earlier than this writer's takeover, so a long outage still gets full checks before escalation.
     const unresolved = opsOf(job.id).find(item => item.state === 'unknown' && now() >= Math.max(createSettledAt(item), heldSince) + budgets.unresolvedGraceMs);
     if (unresolved) {
-      write(() => finish(readJob(job.id), 'attention', `${VENUE_NAMES[unresolved.venue]} 委托超过观察窗仍无法确认（${(unresolved.note ?? '无回报').slice(0, 120)}），不再发送；需人工核对`));
-      return;
+      const reason = `${VENUE_NAMES[unresolved.venue]} 委托超过观察窗仍无法确认（${(unresolved.note ?? '无回报').slice(0, 120)}），不再发送；需人工核对`;
+      // A lead order still resting would keep filling with nobody hedging: it is withdrawn before the job goes to a person.
+      if (!restingLeadOrder(job.id)) { write(() => finish(readJob(job.id), 'attention', reason)); return; }
+      holdLead(job.id, reason);
     }
     job = readJob(job.id);
     const stop = stopRequested(job.id);
     const pastDeadline = now() >= job.deadlineAt;
-    // After a takeover nothing new is sent, so resting orders are withdrawn instead of waiting for the deadline.
-    const withdraw = stop || pastDeadline || job.holdNewSends;
+    // After a takeover nothing new is sent, so resting orders are withdrawn instead of waiting for the deadline; so too when the hedge cannot go on.
+    const withdraw = stop || pastDeadline || job.holdNewSends || !!job.leadWithdraw;
     for (const op of opsOf(job.id).filter(item => item.state === 'open')) if (wantsStop(op, withdraw)) await cancel(job, op, withdraw ? undefined : '追价策略被交易所暂停，已停止；按实际成交对冲');
     job = readJob(job.id);
     if (FINAL_JOB.has(job.status)) return;
     const exhausted = opsOf(job.id).find(item => item.state === 'open' && wantsStop(item, withdraw) && item.cancelSent >= budgets.cancelAttempts && item.cancelRequestedAt !== null && now() - item.cancelRequestedAt >= budgets.cancelRetryMs);
-    if (exhausted) { write(() => finish(readJob(job.id), 'attention', `撤单 ${exhausted.cancelSent} 次仍未确认，委托可能仍在挂单；需人工核对`)); return; }
+    if (exhausted) { write(() => finish(readJob(job.id), 'attention', `${withdrawnFor(job)}撤单 ${exhausted.cancelSent} 次仍未确认，委托可能仍在挂单；需人工核对`)); return; }
     // A refusal caused by this order's own unknown cancel clears once that cancel's window has passed, so the grace counts from then;
     // like every grace here it starts no earlier than this writer's takeover.
     const blocked = opsOf(job.id).find(item => item.state === 'open' && wantsStop(item, withdraw) && item.cancelBlockedAt != null && now() >= Math.max(item.cancelBlockedAt, item.cancelRequestedAt === null ? 0 : cancelSettledAt(item), heldSince) + budgets.unresolvedGraceMs);
-    if (blocked) { write(() => finish(readJob(job.id), 'attention', `撤单被账户写入登记阻止超过 ${budgets.unresolvedGraceMs} 毫秒（${(blocked.note ?? '').slice(0, 120)}），委托仍在挂单；需人工核对`)); return; }
+    if (blocked) { write(() => finish(readJob(job.id), 'attention', `${withdrawnFor(job)}撤单被账户写入登记阻止超过 ${budgets.unresolvedGraceMs} 毫秒（${(blocked.note ?? '').slice(0, 120)}），委托仍在挂单；需人工核对`)); return; }
     const lagging = opsOf(job.id).find(item => item.state === 'open' && item.childrenWaitSince != null && now() >= Math.max(item.childrenWaitSince, heldSince) + budgets.unresolvedGraceMs);
     if (lagging) { write(() => finish(readJob(job.id), 'attention', `${VENUE_NAMES[lagging.venue]} 追价策略已结束，但子单超过 ${budgets.unresolvedGraceMs} 毫秒仍未结清，成交量无法确认；需人工核对`)); return; }
     // An id that no read has verified is never stopped, so it may run on unseen; that too is bounded by the grace.
@@ -1290,11 +1392,12 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       });
       return;
     }
-    const lead = legOps(job.id, 0)[0], hedges = legOps(job.id, 1);
-    if (!lead) {
+    const leads = legOps(job.id, 0), hedges = legOps(job.id, 1);
+    if (leads.length === 0) {
       if (stop) { write(() => finish(readJob(job.id), 'stopped', '已停止，未发送任何委托')); return; }
       if (job.holdNewSends) { write(() => finish(readJob(job.id), 'failed', '服务恢复后不再发送新委托')); return; }
-      try { await guardLead(job); }
+      let quote: Quote;
+      try { quote = await guardLead(job); }
       catch (error) {
         const reason = error instanceof Error ? error.message.slice(0, 200) : '发送前检查失败';
         // A failed read may clear before the deadline; any other refusal ends the job before anything is sent.
@@ -1302,20 +1405,52 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         if (retry && now() < job.deadlineAt) { write(() => { const current = readJob(job.id); current.reason = reason; saveJob(current); }); return; }
         write(() => finish(readJob(job.id), 'failed', reason)); return;
       }
-      await send(job, 0, job.legs[0].quantity);
+      try { await sendLead(job, quote, 0, 0); }
+      catch (error) {
+        if (!(error instanceof ContractError) || error.code !== 'price_moved') throw error;
+        write(() => finish(readJob(job.id), 'failed', error.message.slice(0, 200))); return;
+      }
       holdOrphan(job.id);
       return;
     }
-    if (!SETTLED.has(lead.state)) return;
+    // A strategy, or an order whose state is not known, is waited out; under an order of the job's own that rests, what it filled is hedged.
+    const resting = leads.find(item => !SETTLED.has(item.state));
+    if (resting && (resting.state !== 'open' || isStrategy(resting))) return;
     if (hedges.some(item => !SETTLED.has(item.state))) return;
     // Resume from what is on disk (L095): hedge what the lead filled minus what earlier hedge orders filled.
+    const leadFilled = add('0', ...leads.map(item => item.filledQuantity));
     const hedgeLeg = job.legs[1], hedged = add('0', ...hedges.map(item => item.filledQuantity));
-    const target = hedgeQuantityFor(job, lead.filledQuantity), gap = sub(target, hedged);
+    const target = hedgeQuantityFor(job, leadFilled), gap = sub(target, hedged);
     const remaining = cmp(gap, '0') > 0 ? floorToStep(gap, hedgeLeg.instrument.quantityStep) : '0';
     const refused = hedges.at(-1)?.state === 'rejected';
-    if (!refused && !stop && cmp(remaining, hedgeLeg.instrument.minQuantity) >= 0) {
-      if (hedges.length >= budgets.hedgeAttempts) {
-        write(() => finish(readJob(job.id), 'attention', `对冲腿已发送 ${hedges.length} 次仍差 ${remaining}，不再补发；首腿敞口保留，需人工处理`));
+    // An opening hedge below the venue's minimum notional is refused. While the lead goes on (an order of it rests, or a local chase
+    // posts again after a reprice or for the next batch) and so may fill in pieces, a reserve worth 1.2 times that minimum stays
+    // unhedged, so the last hedge is never too small; a hedge contract whose minimum quantity is already worth that needs none.
+    const upcoming = !resting && !refused && !withdraw ? nextLead(job, leads) : null;
+    const notional = (quantity: string): string => mul(exposure(quantity, hedgeLeg.instrument), hedgeLeg.quote.bid);
+    // A market lead's IOC may read as open for a pass, but it never goes on, so it holds no reserve.
+    const leadGoesOn = reserveNeeded(hedgeLeg) && job.action === 'open' && !withdraw && !refused
+      && ((!!resting && job.legs[0].orderType !== 'market') || (job.legs[0].orderType === 'local-chase' && upcoming !== null && 'quantity' in upcoming));
+    let hedgeNow = remaining;
+    if (leadGoesOn) {
+      const keep = reserveFor(hedgeLeg.instrument, hedgeLeg.quote.bid);
+      hedgeNow = cmp(remaining, keep) > 0 ? floorToStep(sub(remaining, keep), hedgeLeg.instrument.quantityStep) : '0';
+      if (cmp(notional(hedgeNow), mul(hedgeLeg.instrument.minNotional, MIN_NOTIONAL_MARGIN)) < 0) hedgeNow = '0';
+    } else if (job.action === 'open' && !refused && !stop && !resting && cmp(remaining, hedgeLeg.instrument.minQuantity) >= 0 && cmp(notional(remaining), hedgeLeg.instrument.minNotional) < 0) {
+      // The lead is over and what it left unhedged is too small for any opening hedge: a person closes it on the lead account.
+      write(() => finish(readJob(job.id), 'attention', `${withdrawnFor(job)}首腿结束后未对冲 ${remaining}（按预览价约 ${notional(remaining)} USDT）低于${VENUE_NAMES[hedgeLeg.venue]}最小名义金额 ${hedgeLeg.instrument.minNotional}，无法开对冲单；可在首腿账户只减仓平掉这部分，需人工处理`));
+      return;
+    }
+    // Escalation while a lead order rests withdraws it first; the job goes to a person once it has settled.
+    const escalate = async (reason: string): Promise<void> => {
+      if (resting) { holdLead(job.id, reason); await cancel(readJob(job.id), resting); return; }
+      write(() => finish(readJob(job.id), 'attention', reason));
+    };
+    if (!refused && !stop && cmp(hedgeNow, hedgeLeg.instrument.minQuantity) >= 0) {
+      // Only hedge orders that fell short count: a job that hedges batch by batch or fill by fill sends many that fill in full.
+      const short = hedges.filter(item => item.state !== 'filled').length;
+      if (short >= budgets.hedgeAttempts || hedges.length >= budgets.chaseOrderLimit) {
+        await escalate(`对冲腿已有 ${short >= budgets.hedgeAttempts ? `${short} 笔未全部成交` : `${hedges.length} 笔委托`}，仍差 ${remaining}，不再补发；首腿敞口保留，需人工处理`);
         return;
       }
       try { await guardHedge(job); }
@@ -1325,22 +1460,109 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
           : error instanceof ContractError && error.code === 'position_changed' ? '持仓核对' : null;
         if (waiting) {
           const message = error instanceof Error ? error.message : '未知';
-          write(() => {
-            // A wait recorded by a previous writer restarts at the takeover, so a fresh process still gets the full grace.
-            const current = readJob(job.id), since = Math.max(current.hedgeWaitSince ?? now(), heldSince);
-            if (now() - since >= budgets.unresolvedGraceMs) { finish(current, 'attention', `对冲腿持续无法发送（最后原因：${waiting}，${message.slice(0, 120)}）；首腿敞口保留，需人工处理`); return; }
-            current.hedgeWaitSince = since; current.reason = `对冲腿等待${waiting}：${message.slice(0, 160)}`; saveJob(current);
-          });
+          // A wait recorded by a previous writer restarts at the takeover, so a fresh process still gets the full grace.
+          const since = Math.max(readJob(job.id).hedgeWaitSince ?? now(), heldSince);
+          if (now() - since >= budgets.unresolvedGraceMs) { await escalate(`对冲腿持续无法发送（最后原因：${waiting}，${message.slice(0, 120)}）；首腿敞口保留，需人工处理`); return; }
+          write(() => { const current = readJob(job.id); current.hedgeWaitSince = since; current.reason = `对冲腿等待${waiting}：${message.slice(0, 160)}`; saveJob(current); });
           return;
         }
-        write(() => finish(readJob(job.id), 'attention', `对冲腿未发送：${error instanceof Error ? error.message.slice(0, 160) : '检查失败'}；首腿敞口保留，需人工处理`)); return;
+        await escalate(`对冲腿未发送：${error instanceof Error ? error.message.slice(0, 160) : '检查失败'}；首腿敞口保留，需人工处理`); return;
       }
       // Each wait is bounded on its own: an earlier wait that cleared must not shorten the next one.
       if (job.hedgeWaitSince != null) write(() => { const current = readJob(job.id); current.hedgeWaitSince = null; saveJob(current); });
-      await send(job, 1, remaining, hedges.length);
+      await send(job, 1, hedgeNow, hedges.length);
       return;
     }
-    write(() => settleJob(readJob(job.id)));
+    if (resting) {
+      // A refused hedge will not be sent again, so the lead must not fill any further.
+      if (refused && !withdraw) { holdLead(job.id, `对冲腿被交易所拒绝（${(hedges.at(-1)?.note ?? '').slice(0, 80)}）`); await cancel(readJob(job.id), resting); return; }
+      // A local chase follows the book; any other resting lead waits for its fills, the deadline or a stop.
+      if (job.legs[0].orderType === 'local-chase' && !withdraw) await reprice(job, resting);
+      return;
+    }
+    const next = refused || withdraw ? null : upcoming;
+    if (next && 'quantity' in next) {
+      if (next.batch !== (leads.at(-1)?.batch ?? 0)) {
+        // The interval counts from when the previous batch was found done, which survives a restart.
+        const doneAt = job.batchDoneAt ?? now();
+        if (job.batchDoneAt == null) write(() => { const current = readJob(job.id); current.batchDoneAt = doneAt; saveJob(current); });
+        if (now() < doneAt + (job.batchIntervalMs ?? 0)) return;
+      }
+      let quote: Quote;
+      try { quote = await guardLead(job); }
+      catch (error) {
+        if (error instanceof WriterLostError) throw error;
+        if (error instanceof ContractError && error.code === 'binding_changed') { write(() => settleJob(readJob(job.id), error.message.slice(0, 120))); return; }
+        // The lead's fills are hedged here (but for a local chase's small reserve), so a later send waits for books and accounts until the deadline ends the job.
+        const reason = `首腿等待发送：${error instanceof Error ? error.message.slice(0, 160) : '发送前检查失败'}`;
+        write(() => { const current = readJob(job.id); if (current.reason !== reason) { current.reason = reason; saveJob(current); } });
+        return;
+      }
+      try { await sendLead(job, quote, next.batch, leads.length, next.quantity); }
+      catch (error) {
+        if (!(error instanceof ContractError) || error.code !== 'price_moved') throw error;
+        write(() => { const current = readJob(job.id); current.reason = `首腿等待发送：${error.message.slice(0, 160)}`; saveJob(current); });
+        return;
+      }
+      // Cleared once the order is out, so a send that waits keeps the interval already served.
+      write(() => { const current = readJob(job.id); if (current.batchDoneAt != null || current.reason !== null) { current.batchDoneAt = null; current.reason = null; saveJob(current); } });
+      return;
+    }
+    write(() => settleJob(readJob(job.id), next?.end ?? (job.leadWithdraw ? '对冲腿一度无法发送，已撤销首腿挂单' : undefined)));
+  }
+
+  /** The lead's next order: a market or limit lead sends the batch whole, a local chase posts it at its target price. */
+  async function sendLead(job: Job, quote: Quote, batch: number, attempt: number, quantity = (job.batches ?? [job.legs[0].quantity])[0] as string): Promise<void> {
+    const lead = job.legs[0];
+    await send(job, 0, quantity, attempt, { batch, price: lead.orderType === 'local-chase' ? chaseTarget(lead, quote) : null });
+  }
+  /** The job's lead order still resting at the venue (a strategy is handled by its own paths). */
+  const restingLeadOrder = (jobId: string): Operation | undefined => legOps(jobId, 0).find(item => item.state === 'open' && !isStrategy(item));
+  /** Records why the lead is being withdrawn; the first reason stays. */
+  function holdLead(jobId: string, reason: string): void {
+    write(() => { const current = readJob(jobId); if (current.leadWithdraw) return; current.leadWithdraw = reason.slice(0, 240); current.reason = `正在撤销首腿挂单：${reason.slice(0, 160)}`; saveJob(current); });
+  }
+  /** Why the lead was being withdrawn, ahead of a reason that would otherwise hide it. */
+  const withdrawnFor = (job: Job): string => job.leadWithdraw ? `撤首腿挂单（${job.leadWithdraw.slice(0, 120)}）时：` : '';
+  /** A lead order that neither rested nor filled. */
+  const missed = (op: Operation): boolean => isZero(op.filledQuantity) && (op.state === 'rejected' || op.state === 'not-sent' || op.state === 'not-created' || (op.state === 'canceled' && op.venueStatus === 'expired'));
+  /**
+   * Once nothing of the lead rests and the hedge has caught up: the rest of this batch for a local chase, else the next batch,
+   * or the end (null when every batch is done, end when the lead gives up early).
+   */
+  function nextLead(job: Job, leads: readonly Operation[]): { batch: number; quantity: string } | { end: string } | null {
+    const lead = job.legs[0], plan = job.batches ?? [lead.quantity], last = leads.at(-1) as Operation, batch = last.batch ?? 0;
+    if (leads.length >= budgets.chaseOrderLimit) return { end: `首腿已发送 ${leads.length} 笔委托，达到上限，不再发送` };
+    if (lead.orderType === 'local-chase') {
+      let misses = 0;
+      for (const item of [...leads].reverse()) { if (!missed(item)) break; misses += 1; }
+      if (misses >= budgets.chaseFailureLimit) return { end: `首腿连续 ${misses} 次挂单未成功（${(last.note ?? last.venueStatus ?? last.state).slice(0, 80)}），停止追价` };
+      const left = sub(plan[batch] as string, add('0', ...leads.filter(item => (item.batch ?? 0) === batch).map(item => item.filledQuantity)));
+      // A remainder the venue would refuse as an opening order (minimum notional at the preview bid, with headroom once the batch
+      // has partly filled; a whole batch passed the preview's own check) ends the batch.
+      const margin = cmp(left, plan[batch] as string) < 0 ? MIN_NOTIONAL_MARGIN : '1';
+      const refusable = job.action === 'open' && cmp(mul(exposure(left, lead.instrument), lead.quote.bid), mul(lead.instrument.minNotional, margin)) < 0;
+      if (cmp(left, lead.instrument.minQuantity) >= 0 && !refusable) return { batch, quantity: left };
+    } else if (last.state === 'rejected' || last.state === 'not-sent' || last.state === 'not-created') {
+      // A whole batch refused or never sent would be refused again; an IOC that found no price within the bound is not.
+      return isZero(last.filledQuantity) && leads.length > 1 ? { end: `第 ${batch + 1} 批首腿未发出（${(last.note ?? last.state).slice(0, 80)}），不再发送后续批次` } : null;
+    }
+    return batch + 1 < plan.length ? { batch: batch + 1, quantity: plan[batch + 1] as string } : null;
+  }
+  /** Moves a local chase order that has rested chaseRepriceMs once its target price moved; a book that cannot be read leaves it. */
+  async function reprice(job: Job, op: Operation): Promise<void> {
+    if (op.sentAt === null || now() - op.sentAt < budgets.chaseRepriceMs) return;
+    const leg = job.legs[0], posted = (op.request as OrderRequest).limitPrice as string;
+    let target: string;
+    try {
+      const quote = await readQuote(leg.venue, leg.symbol);
+      checkQuoteFresh(quote, now(), budgets.sendQuoteMaxAgeMs, budgets.futureToleranceMs);
+      target = chaseTarget(leg, quote);
+    } catch (error) {
+      if (error instanceof WriterLostError) throw error;
+      return;
+    }
+    if (cmp(target, posted) !== 0) await cancel(job, op, `追价改价 ${posted} → ${target}`);
   }
 
   /**
@@ -1370,18 +1592,25 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     return floorToStep(scaled, hedge.instrument.quantityStep);
   }
 
-  function settleJob(job: Job): void {
+  /** note: why the lead stopped early, when it did. */
+  function settleJob(job: Job, note?: string): void {
     if (FINAL_JOB.has(job.status)) return;
     const ops = opsOf(job.id), filled = (index: 0 | 1) => add('0', ...ops.filter(item => item.leg === index).map(item => item.filledQuantity));
     const leadExposure = exposure(filled(0), job.legs[0].instrument), hedgeExposure = exposure(filled(1), job.legs[1].instrument);
-    const lead = ops.find(item => item.leg === 0);
+    const lead = ops.filter(item => item.leg === 0).sort((a, b) => attemptOf(a) - attemptOf(b)).at(-1);
     const refused = ops.filter(item => item.leg === 1).sort((a, b) => attemptOf(a) - attemptOf(b)).at(-1);
     if (isZero(leadExposure) && isZero(hedgeExposure)) {
-      finish(job, stopRequested(job.id) ? 'stopped' : 'failed', `首腿未成交（${lead?.state ?? '未发送'}），未发送对冲腿`);
+      finish(job, stopRequested(job.id) ? 'stopped' : 'failed', `首腿未成交（${note ?? lead?.state ?? '未发送'}），未发送对冲腿`);
       return;
     }
     const gap = sub(leadExposure, hedgeExposure);
-    if (isZero(gap)) { finish(job, 'completed', null); return; }
+    if (isZero(gap)) {
+      // Level but short of the plan (an IOC partly filled, a chase or batches cut off): say how far it got.
+      const planned = exposure(job.legs[0].quantity, job.legs[0].instrument);
+      const short = cmp(leadExposure, planned) < 0 ? `两腿各成交 ${leadExposure} 桶，计划 ${planned} 桶` : null;
+      finish(job, 'completed', [note, short].filter(Boolean).join('；') || null);
+      return;
+    }
     const why = refused?.state === 'rejected' ? `对冲腿被交易所拒绝（${(refused.note ?? '').slice(0, 80)}），不再补发；` : stopRequested(job.id) ? '已请求停止，不再补发对冲腿；' : '';
     finish(job, 'attention', `${why}两腿成交不平衡：${legLabel(job.legs, 0)} ${filled(0)}，${legLabel(job.legs, 1)} ${filled(1)}，未对冲 ${gap} 桶；敞口保留，需人工处理`);
   }
@@ -1568,13 +1797,15 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       locked: !!db.prepare('SELECT 1 FROM locks WHERE job_id = ? LIMIT 1').get(id), acknowledgedAt: job.acknowledgedAt,
       /** A strategy create without an answer waits for adoption, a confirmation of not-created or a release. */
       strategyPending: ops.some(isOrphanStrategy),
+      /** current: the batch of the latest lead order (0 before the first), 1-based. */
+      batches: job.batches ? { count: job.batches.length, current: ops.some(item => item.leg === 0) ? Math.max(...ops.filter(item => item.leg === 0).map(item => item.batch ?? 0)) + 1 : 0, intervalMs: job.batchIntervalMs ?? 0 } : null,
       legs: job.legs.map(leg => {
         const mine = ops.filter(item => item.leg === leg.index).sort((a, b) => attemptOf(a) - attemptOf(b)), op = mine.at(-1), filledQuantity = add('0', ...mine.map(item => item.filledQuantity));
-        return { venue: leg.venue, symbol: leg.symbol, side: leg.side, orderSide: leg.orderSide, orderType: leg.orderType, plannedQuantity: leg.quantity, accountId: maskId(leg.accountId), priceBound: leg.priceBound ?? null,
+        return { venue: leg.venue, symbol: leg.symbol, side: leg.side, orderSide: leg.orderSide, orderType: leg.orderType, plannedQuantity: leg.quantity, accountId: maskId(leg.accountId), priceBound: leg.priceBound ?? null, limitPrice: leg.limitPrice ?? null,
           contractSize: leg.instrument.contractSize, plannedBarrels: exposure(leg.quantity, leg.instrument), filledBarrels: exposure(filledQuantity, leg.instrument), averagePrice: averageOf(mine),
           previewQuote: { bid: leg.quote.bid, ask: leg.quote.ask },
           attempts: mine.length, filledQuantity,
-          operation: op ? { kind: op.kind ?? 'order', clientOrderId: op.clientOrderId, state: op.state, quantity: op.request.quantity, filledQuantity: op.filledQuantity, averagePrice: op.averagePrice, remoteId: op.remoteId,
+          operation: op ? { kind: op.kind ?? 'order', clientOrderId: op.clientOrderId, state: op.state, quantity: op.request.quantity, limitPrice: (op.request as { limitPrice?: string | null }).limitPrice ?? null, filledQuantity: op.filledQuantity, averagePrice: op.averagePrice, remoteId: op.remoteId,
             strategyStatus: op.strategyStatus ?? null, childrenSettled: op.childrenSettled ?? null, adoptedAt: op.adoptedAt ?? null, releasedAt: op.releasedAt ?? null, ackStrategyId: op.ackStrategyId ?? null, note: op.note } : null };
       }),
       events,

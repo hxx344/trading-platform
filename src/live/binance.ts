@@ -41,6 +41,8 @@ const KNOWN_REJECTIONS = new Set([
 ]);
 const TIMESTAMP_CODE = -1021;
 const NOT_FOUND_CODE = -2013;
+/** GTX is the venue's post-only: one that would take liquidity is refused with -5022 (a known rejection) and never rests. */
+const timeInForceOf = (request: OrderRequest): string => request.timeInForce === 'ioc' ? 'IOC' : request.timeInForce === 'gtx' ? 'GTX' : 'GTC';
 
 type Mode = 'one-way' | 'hedge';
 interface Endpoint { host: string; path: string; method: 'GET' | 'POST' | 'DELETE' }
@@ -174,7 +176,7 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
       if (side !== request.side) throw new ShapeError('委托回报方向与请求不一致');
       if (row.type !== (request.type === 'market' ? 'MARKET' : 'LIMIT')) throw new ShapeError('委托回报类型与请求不一致');
       if (request.type === 'limit') {
-        if (row.timeInForce !== (request.timeInForce === 'ioc' ? 'IOC' : 'GTC') || request.limitPrice === null || cmp(amount(row.price, '委托价格'), request.limitPrice) !== 0) throw new ShapeError('委托回报的价格或有效方式与请求不一致');
+        if (row.timeInForce !== timeInForceOf(request) || request.limitPrice === null || cmp(amount(row.price, '委托价格'), request.limitPrice) !== 0) throw new ShapeError('委托回报的价格或有效方式与请求不一致');
       }
       if (row.positionSide === 'BOTH') { if (row.reduceOnly !== request.reduceOnly) throw new ShapeError('委托回报只减仓标记与请求不一致'); }
       else if (row.positionSide === 'LONG' || row.positionSide === 'SHORT') {
@@ -238,11 +240,12 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
     try { amount(request.quantity, '数量'); if (request.limitPrice !== null) amount(request.limitPrice, '限价'); } catch { refuse('数量或价格无效'); }
     if (request.type === 'market' && (request.limitPrice !== null || request.timeInForce === 'gtc')) refuse('市价单不带限价，只能 IOC');
     if (request.type === 'limit' && request.limitPrice === null) refuse('限价单缺少价格');
+    if (request.type === 'market' && request.timeInForce === 'gtx') refuse('市价单不能只挂单');
   }
   const orderParams = (request: OrderRequest) => ({ symbol: request.symbol, origClientOrderId: request.clientOrderId });
 
   const capabilities: ConnectorCapabilities = {
-    transport: 'live', clientOrderId: true, queryByClientOrderId: true, cancelByClientOrderId: true, maxClientOrderIdLength: 36,
+    transport: 'live', clientOrderId: true, queryByClientOrderId: true, cancelByClientOrderId: true, maxClientOrderIdLength: 36, postOnly: true,
     // The venue accepts a request only while its timestamp is within recvWindow (5 s) of its own clock and at most 1 s
     // ahead of it, so a request stops being accepted at most 6 s after it was signed; 10 s leaves room for scheduling.
     requestValidityMs: 10_000,
@@ -336,7 +339,7 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
       if (mode === 'hedge' && hedgeClose(request.side, request.positionSide) !== request.reduceOnly) throw new VenueError('not-sent', 'Binance 双向持仓模式下只减仓标记与方向不一致，委托未发送');
       const params: Record<string, string> = {
         symbol: request.symbol, side: request.side === 'buy' ? 'BUY' : 'SELL', type: request.type === 'market' ? 'MARKET' : 'LIMIT', quantity: request.quantity,
-        ...(request.type === 'limit' ? { price: request.limitPrice as string, timeInForce: request.timeInForce === 'ioc' ? 'IOC' : 'GTC' } : {}),
+        ...(request.type === 'limit' ? { price: request.limitPrice as string, timeInForce: timeInForceOf(request) } : {}),
         ...(mode === 'hedge' ? { positionSide } : { positionSide: 'BOTH', reduceOnly: String(request.reduceOnly) }),
         newClientOrderId: request.clientOrderId, newOrderRespType: 'RESULT',
       };

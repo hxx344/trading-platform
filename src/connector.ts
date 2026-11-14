@@ -33,6 +33,8 @@ export interface ConnectorCapabilities {
    * so a create without a usable answer can never be retried or matched automatically.
    */
   chase?: true;
+  /** Limit orders may be post-only (timeInForce gtx): the venue refuses or expires one that would take liquidity. Needed for a local chase lead. */
+  postOnly?: true;
 }
 
 export interface OrderRequest {
@@ -43,8 +45,11 @@ export interface OrderRequest {
   quantity: string;
   type: OrderType;
   limitPrice: string | null;
-  /** ioc: whatever does not fill at once is canceled by the venue. Market orders are always ioc. Absent in rows written before it existed means gtc. */
-  timeInForce?: 'gtc' | 'ioc';
+  /**
+   * ioc: whatever does not fill at once is canceled by the venue. Market orders are always ioc. gtx: post-only, a limit
+   * that would fill at once is refused or expired unfilled. Absent in rows written before it existed means gtc.
+   */
+  timeInForce?: 'gtc' | 'ioc' | 'gtx';
   reduceOnly: boolean;
 }
 

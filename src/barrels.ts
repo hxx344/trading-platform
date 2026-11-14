@@ -30,3 +30,19 @@ export function nearestBarrels(barrels: string, instruments: readonly Instrument
   const low = below >= least ? below : least;
   return [fromUnits(low), fromUnits(low + grid)];
 }
+
+/**
+ * Barrels per batch for a job of these barrels split into count batches, every batch on the legs' common grid so each leg's
+ * share is a whole number of its steps and the hedge of a finished batch is exact. Spread evenly; the grid units left over
+ * go one each to the first batches. Null when there are fewer grid units than batches.
+ */
+export function splitBarrels(barrels: string, count: number, instruments: readonly Instrument[]): string[] | null {
+  const steps = instruments.map(barrelStep);
+  if (steps.some(step => step <= 0n)) throw new RangeError('合约步长或乘数无效');
+  const grid = steps.reduce((a, b) => a / gcd(a, b) * b), total = units(barrels);
+  if (total % grid !== 0n) return null;
+  const cells = total / grid, parts = BigInt(count);
+  if (cells < parts) return null;
+  const base = cells / parts, extra = cells % parts;
+  return Array.from({ length: count }, (_, index) => fromUnits((base + (BigInt(index) < extra ? 1n : 0n)) * grid));
+}

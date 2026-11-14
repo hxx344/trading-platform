@@ -260,3 +260,17 @@ test('Binance 连接器：执行器不混用真实与模拟传输：实盘里的
       (error: unknown) => error instanceof ContractError && error.code === 'live_transport_refused');
   } finally { h.dispose(); }
 });
+
+test('Binance 连接器：只挂单发 GTX、回报按 GTX 核对；会立即成交时 -5022 记为拒单；市价单不能只挂单', async () => {
+  const { venue, connector } = setup();
+  const posted = order({ timeInForce: 'gtx' });
+  const report = parseOrderReport(await connector.place(binding(), posted, send()), posted);
+  assert.equal(report.clientOrderId, posted.clientOrderId);
+  assert.equal(venue.calls.find(call => call.method === 'POST')!.params.get('timeInForce'), 'GTX');
+  assert.equal(connector.capabilities.postOnly, true);
+  venue.script('POST /fapi/v1/order', () => json({ code: -5022, msg: 'Due to the order could not be executed as maker, the Post Only order will be rejected.' }, 400));
+  await assert.rejects(connector.place(binding(), order({ clientOrderId: 'pa1-0123456789abcdef01234567-0r1', timeInForce: 'gtx' }), send()), kind('rejected'));
+  const posts = venue.count('POST /fapi/v1/order');
+  await assert.rejects(connector.place(binding(), order({ type: 'market', limitPrice: null, timeInForce: 'gtx' }), send()), kind('not-sent'));
+  assert.equal(venue.count('POST /fapi/v1/order'), posts);
+});

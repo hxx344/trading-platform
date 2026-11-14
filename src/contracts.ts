@@ -185,8 +185,11 @@ export function positionOf(snapshot: AccountSnapshot, symbol: string, side: Posi
 
 export type OrderSide = 'buy' | 'sell';
 export type OrderType = 'market' | 'limit';
-/** chase: a venue-native chase strategy, lead leg on Bybit only; it is a strategy, not an order. */
-export type LegOrderType = OrderType | 'chase';
+/**
+ * chase: a venue-native chase strategy, lead leg on Bybit only; it is a strategy, not an order.
+ * local-chase: post-only limit orders the executor itself moves to the same-side best price, lead leg on Binance only.
+ */
+export type LegOrderType = OrderType | 'chase' | 'local-chase';
 export type Action = 'open' | 'close';
 export const orderSideOf = (action: Action, side: PositionSide): OrderSide => (action === 'open') === (side === 'long') ? 'buy' : 'sell';
 
@@ -202,11 +205,15 @@ export interface LegIntent { venue: Venue; symbol: string; side: PositionSide; q
  */
 export const PRESETS = ['cross-exchange', 'same-exchange'] as const;
 export type Preset = typeof PRESETS[number];
-export interface Intent { market: 'oil'; preset: Preset; symbol: string | null; action: Action; timeoutMs: number; maxSlippageBps: number | null; legs: [LegIntent, LegIntent] }
+/** The lead split into count parts sent intervalMs apart, each hedged before the next; absent is one batch. */
+export interface BatchIntent { count: number; intervalMs: number }
+export interface Intent { market: 'oil'; preset: Preset; symbol: string | null; action: Action; timeoutMs: number; maxSlippageBps: number | null; legs: [LegIntent, LegIntent]; batches?: BatchIntent }
 export const MAX_SLIPPAGE_BPS = 1_000;
+export const MAX_BATCHES = 20;
+export const MAX_BATCH_INTERVAL_MS = 600_000;
 /** Two oil legs with opposite sides: one contract on two venues, or BZ against CL on one venue. */
 export function parseIntent(value: unknown): Intent {
-  const raw = exactKeys(value, ['market', 'preset', 'action', 'timeoutMs', 'legs'], ['symbol', 'maxSlippageBps']);
+  const raw = exactKeys(value, ['market', 'preset', 'action', 'timeoutMs', 'legs'], ['symbol', 'maxSlippageBps', 'batches']);
   oneOf(raw.market, ['oil'] as const, '品种');
   const preset = oneOf(raw.preset, PRESETS, '交易预设'), same = preset === 'same-exchange';
   // The cross-exchange body keeps its required top-level symbol; a same-exchange one names its contracts on the legs.
@@ -222,9 +229,10 @@ export function parseIntent(value: unknown): Intent {
     if (!VENUE_EXECUTION_SYMBOLS[venue].includes(legSymbol)) reject('venue_symbol', `${VENUE_NAMES[venue]} 不支持 ${legSymbol} 执行`);
     if (leg.quantity == null && leg.barrels == null) reject('missing_field', '缺少字段：quantity（或按桶数下单的 barrels）');
     if (leg.quantity != null && leg.barrels != null) reject('quantity_or_barrels', '每腿数量与桶数只能填一个');
-    const orderType = oneOf(leg.orderType, ['market', 'limit', 'chase'] as const, '下单方式');
-    const limitPrice = leg.limitPrice === undefined || leg.limitPrice === null ? null : decimalField(leg.limitPrice, '限价');
-    if ((orderType === 'limit') !== (limitPrice !== null)) reject('limit_price', orderType === 'limit' ? '限价单需要限价' : orderType === 'chase' ? '追价策略不设限价（最高追价取预览的价格保护界限）' : '市价单不设限价');
+    const orderType = oneOf(leg.orderType, ['market', 'limit', 'chase', 'local-chase'] as const, '下单方式');
+    // A local chase may name its own chase bound (highest buy, lowest sell); without one the preview bound is used.
+    const limitPrice = leg.limitPrice === undefined || leg.limitPrice === null ? null : decimalField(leg.limitPrice, orderType === 'local-chase' ? '追价界限' : '限价');
+    if (orderType !== 'local-chase' && (orderType === 'limit') !== (limitPrice !== null)) reject('limit_price', orderType === 'limit' ? '限价单需要限价' : orderType === 'chase' ? '追价策略不设限价（最高追价取预览的价格保护界限）' : '市价单不设限价');
     return {
       venue, symbol: legSymbol, side: oneOf(leg.side, ['long', 'short'] as const, '仓位方向'),
       quantity: leg.quantity == null ? null : decimalField(leg.quantity, '每腿数量'), barrels: leg.barrels == null ? null : decimalField(leg.barrels, '每腿桶数'),
@@ -239,10 +247,20 @@ export function parseIntent(value: unknown): Intent {
   if ((legs[0].barrels === null) !== (legs[1].barrels === null)) reject('quantity_mode', '两腿须同时按数量或同时按桶数下单');
   if (legs[0].barrels !== null && cmp(legs[0].barrels, legs[1].barrels as string) !== 0) reject('unbalanced', `两腿桶数不相等：${legs[0].barrels} 与 ${legs[1].barrels}`);
   // The hedge must go out at once for whatever the lead filled; a strategy that may rest or pause cannot do that.
-  if (legs[1].orderType === 'chase') reject('chase_unsupported', '追价策略只能用于首腿，对冲腿按市价发送');
+  if (legs[1].orderType === 'chase' || legs[1].orderType === 'local-chase') reject('chase_unsupported', '追价只能用于首腿，对冲腿按市价发送');
   if (legs[0].orderType === 'chase' && legs[0].venue !== 'bybit') reject('chase_unsupported', '只有 Bybit 支持原生追价策略');
+  if (legs[0].orderType === 'local-chase' && legs[0].venue !== 'binance') reject('chase_unsupported', '本地追价只用于 Binance 首腿；Bybit 请用原生追价');
   const maxSlippageBps = raw.maxSlippageBps === undefined || raw.maxSlippageBps === null ? null : integer(raw.maxSlippageBps, 1, MAX_SLIPPAGE_BPS, '价格保护基点');
-  return { market: 'oil', preset, symbol, action, timeoutMs: integer(raw.timeoutMs, 30_000, 3_600_000, '最长执行毫秒数'), maxSlippageBps, legs };
+  const timeoutMs = integer(raw.timeoutMs, 30_000, 3_600_000, '最长执行毫秒数');
+  let batches: BatchIntent | undefined;
+  if (raw.batches !== undefined && raw.batches !== null) {
+    const batch = exactKeys(raw.batches, ['count', 'intervalMs']);
+    batches = { count: integer(batch.count, 1, MAX_BATCHES, '批次数'), intervalMs: integer(batch.intervalMs, 0, MAX_BATCH_INTERVAL_MS, '批次间隔毫秒数') };
+    if (batches.count > 1 && legs[0].orderType !== 'market' && legs[0].orderType !== 'local-chase') reject('batch_unsupported', '分批只用于首腿市价或本地追价');
+    if ((batches.count - 1) * batches.intervalMs >= timeoutMs) reject('batch_timeout', `${batches.count} 批、每批间隔 ${batches.intervalMs} 毫秒超过最长执行时间`);
+    if (batches.count === 1) batches = undefined;
+  }
+  return { market: 'oil', preset, symbol, action, timeoutMs, maxSlippageBps, legs, ...(batches ? { batches } : {}) };
 }
 
 /** Confirmation body; confirmLive in the prototype authorizes only the simulated transport. */

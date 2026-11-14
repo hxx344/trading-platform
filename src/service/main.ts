@@ -25,7 +25,7 @@ import { createNotifier, type EventRow, type Notifier } from './feishu.ts';
 import { createStreamStatus, runUserStream, type SocketLike } from './stream.ts';
 import { balanceWindow, createBalanceSamples, type BalanceSamples } from './balance-samples.ts';
 import { readImportResult, submitImportRequest } from './import-channel.ts';
-import { oilLoops, oilViews, openOilRules, prepareOil, registerOilAccounts, strandedOilJobs, type OilRuntime } from './oil.ts';
+import { oilLoops, oilViews, openOilPnl, openOilRules, prepareOil, registerOilAccounts, strandedOilJobs, type OilRuntime } from './oil.ts';
 import { oilSummary } from './oil-config.ts';
 import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, stopMonitor, type MonitorRuntime } from './monitor.ts';
 import { monitorSummary } from './monitor-config.ts';
@@ -285,11 +285,13 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   catch (error) { samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw new Error(`期权状态无法恢复，拒绝启动：${error instanceof Error ? error.message : String(error)}`); }
   // Spread rules (observe and live) in their own file; one that cannot open is shown on the oil page, nothing else stops.
   const oilRules = oil ? openOilRules(oil, dir, { executor }) : undefined;
+  // PnL and ledgers (read only) in their own file; one that cannot open is shown on the oil page, nothing else stops.
+  const oilPnl = oil ? openOilPnl(oil, dir) : undefined;
   const oilText = `${oil ? `；原油执行账户 ${oil.config.accounts.length} 个` : ''}${options ? '；期权账户 1 个' : ''}`;
   try {
     notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}`);
     for (const text of warnings) notifier.notify(`【配置未生效】${text}`);
-  } catch (error) { oilRules?.close(); closeMonitorStore(); asset?.close(); samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
+  } catch (error) { oilPnl?.close(); oilRules?.close(); closeMonitorStore(); asset?.close(); samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
 
   return runExecutor({
     executor, store, dir, port, app, session,
@@ -302,7 +304,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
         const window = balanceWindow(range, Date.now());
         return window && { pairId, range, ...window, points: [], unavailable: `余额采样库无法打开，走势图不可用：${samplesError ?? '未知原因'}（不影响划转与 ADL）` };
       },
-      ...(oil ? { oil: oilViews(oil, executor, oilRules) } : {}),
+      ...(oil ? { oil: oilViews(oil, executor, oilRules, oilPnl) } : {}),
       ...(monitor ? { monitor: monitorViews(monitor) } : {}),
       summary: { setInterval: (minutes: number) => summary.setInterval(minutes), sendNow: () => summary.sendNow() },
       ...(asset ? { asset } : {}),
@@ -337,7 +339,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
         client, credentials: byAddress.get(accountId)!, accountId, stopped: context.stopped, pause: context.pause, ...(connect ? { connect } : {}),
         push: (id, event) => { streams.onMessage(id); trading.push(id, event); }, onState: (connected, reason) => streams.onState(accountId, connected, reason),
       })),
-      ...(oil ? oilLoops(oil, context, line => process.stderr.write(`${line}\n`), oilRules) : []),
+      ...(oil ? oilLoops(oil, context, line => process.stderr.write(`${line}\n`), oilRules, oilPnl) : []),
       ...(monitor ? monitorLoops(monitor, context) : []),
       ...(options && engine ? optionsLoops(options, engine, context, line => process.stderr.write(`${line}\n`)) : []),
     ],
@@ -356,6 +358,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       closeMonitorStore();
       asset?.close();
       oilRules?.close();
+      oilPnl?.close();
       locks.release();
       releaseOil();
       closeLogs();

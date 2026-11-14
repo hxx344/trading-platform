@@ -9,6 +9,7 @@ import type { FetchLike } from '../live/http.ts';
 import type { LiveCredentials } from '../live/values.ts';
 import { createOilMarket, MARKET_READ_MS, POSITIONS_READ_MS, type OilMarket } from '../oil/market.ts';
 import { createOilRules, OIL_RULES_DATABASE } from '../oil/rules.ts';
+import { createOilPnl, LEDGER_SYNC_MS, OIL_PNL_DATABASE, PNL_RANGES, PNL_SAMPLE_MS, type PnlRange } from '../oil/pnl.ts';
 import type { RuleExecutor } from '../oil/rule-live.ts';
 import { ContractError } from '../contracts.ts';
 import { join } from 'node:path';
@@ -84,17 +85,40 @@ export function openOilRules(oil: OilRuntime, dir: string, { now = Date.now, log
   }
 }
 
-/** The page's oil reads: the books and spreads, the accounts, venue positions, jobs and cap use, and the spread rules. */
-export function oilViews(oil: OilRuntime, executor: Executor, rules?: OilRulesRuntime) {
+/** The PnL and ledger reads (docs/oil.md section 9) as the page and the loops use them. */
+export interface OilPnlRuntime {
+  read(query: { range?: PnlRange; page?: number }): unknown;
+  sample(): Promise<void>;
+  syncLedgers(stopped?: () => boolean): Promise<void>;
+  close(): void;
+}
+
+/** Opens oil-pnl.sqlite in the data directory. A failure is logged and shown on the page; orders, jobs and rules run on. */
+export function openOilPnl(oil: OilRuntime, dir: string, { now = Date.now, log = (line: string) => process.stderr.write(`${line}\n`) }: { now?: () => number; log?: (line: string) => void } = {}): OilPnlRuntime {
+  try {
+    return createOilPnl({ file: join(dir, OIL_PNL_DATABASE), connectors: oil.connectors, accounts: oil.config.accounts, now });
+  } catch (error) {
+    const reason = `原油盈亏库无法打开，盈亏与资金费不可用（下单、任务与规则不受影响）：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`;
+    log(reason);
+    return { read: () => ({ available: false, error: reason }), sample: async () => {}, syncLedgers: async () => {}, close: () => {} };
+  }
+}
+
+/** The page's oil reads: the books and spreads, the accounts, venue positions, jobs and cap use, the spread rules and PnL. */
+export function oilViews(oil: OilRuntime, executor: Executor, rules?: OilRulesRuntime, pnl?: OilPnlRuntime) {
   return {
     market: () => oil.market.view(),
     state: () => ({ accounts: executor.accounts(), positions: oil.market.positionsView(), jobs: executor.recentJobs(20), notionalLimits: executor.notionalLimits() }),
     ...(rules ? { rules } : {}),
+    ...(pnl ? { pnl: (range: string, page: number) => Object.hasOwn(PNL_RANGES, range) ? pnl.read({ range: range as PnlRange, page }) : null } : {}),
   };
 }
 
-/** The market loops: books every 3 s (then the spread rules), positions every 15 s. Each round's reads carry their own timeout; a failure only marks the view. */
-export function oilLoops(oil: OilRuntime, context: { stopped(): boolean; pause(ms: number): Promise<void> }, log: (line: string) => void, rules?: OilRulesRuntime): Promise<void>[] {
+/**
+ * The market loops: books every 3 s (then the spread rules), positions every 15 s; with PnL, its positions every minute
+ * and its ledgers every five minutes. Each round's reads carry their own timeout; a failure only marks the view.
+ */
+export function oilLoops(oil: OilRuntime, context: { stopped(): boolean; pause(ms: number): Promise<void> }, log: (line: string) => void, rules?: OilRulesRuntime, pnl?: OilPnlRuntime): Promise<void>[] {
   const every = (spacingMs: number, name: string, round: () => Promise<void>) => (async () => {
     while (!context.stopped()) {
       const started = Date.now();
@@ -118,5 +142,6 @@ export function oilLoops(oil: OilRuntime, context: { stopped(): boolean; pause(m
   // On stop the books loop ends only after the judging round in flight, so its preview and confirm finish (or fail) before
   // the service closes the executor and the rules store.
   const books = every(MARKET_READ_MS, '盘口读取', quotes).then(async () => { await judging; });
-  return [books, every(POSITIONS_READ_MS, '持仓读取', oil.market.refreshPositions)];
+  return [books, every(POSITIONS_READ_MS, '持仓读取', oil.market.refreshPositions),
+    ...(pnl ? [every(PNL_SAMPLE_MS, '盈亏采样', () => pnl.sample()), every(LEDGER_SYNC_MS, '账单同步', () => pnl.syncLedgers(context.stopped))] : [])];
 }

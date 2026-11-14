@@ -199,7 +199,7 @@ test('服务配置：oil 可选；有 oil 时 pairs 可省略、密钥须含对�
   }
 });
 
-test('服务进程：配置 oil 时启动检查失败则拒绝启动并释放账户锁；通过后提供原油行情与状态接口并运行两腿任务循环', async () => {
+test('服务进程：配置 oil 时启动检查失败则拒绝启动并释放账户锁；通过后提供原油行情、状态与盈亏接口并运行两腿任务循环', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tp-oil-'));
   const binance = new FakeBinance();
   binance.info = [symbolInfo(), symbolInfo({ symbol: 'BZUSDT' })];
@@ -259,6 +259,17 @@ test('服务进程：配置 oil 时启动检查失败则拒绝启动并释放账
       assert.equal((await post(`/api/oil/rules/${saved.id}/live`, { revision: saved.revision })).body.code, 'confirm_required');
       assert.equal((await post(`/api/oil/rules/${saved.id}/other`, { revision: saved.revision })).status, 404);
       assert.equal((await post(`/api/oil/rules/${saved.id}/stop`, { revision: saved.revision })).status, 200);
+      // PnL (O4): its own file; positions sampled every minute and the ledgers synced at start, then every five minutes.
+      let pnl = await get('/api/oil/pnl?range=1d');
+      for (let i = 0; i < 100 && (pnl.body.pointCount === 0 || (pnl.body.accounts as { ledger: { coveredUntil: number | null } }[])[0]!.ledger.coveredUntil === null); i++) { await new Promise(resolve => setTimeout(resolve, 20)); pnl = await get('/api/oil/pnl?range=1d'); }
+      assert.equal(pnl.status, 200);
+      assert.equal(pnl.body.pointCount, 1);
+      assert.ok(['ready', 'incomplete'].includes(pnl.body.status as string), String(pnl.body.status));
+      assert.deepEqual(pnl.body.totals, { funding: '0', realized: '0', fee: '0' });
+      assert.ok(existsSync(join(dir, 'data', 'oil-pnl.sqlite')));
+      assert.equal((await get('/api/oil/pnl?range=2d')).status, 400);
+      assert.equal((await get('/api/oil/pnl?range=toString')).status, 400);
+      assert.equal((await get('/api/oil/pnl?page=-1')).status, 400);
       const health = (await get('/api/status')).body.health as { loops: { name: string }[] };
       assert.ok(health.loops.some(loop => loop.name === '两腿任务循环'), JSON.stringify(health.loops));
       assert.ok(!health.loops.some(loop => loop.name === '历史清理'), '两腿任务循环自带历史清理');

@@ -19,7 +19,7 @@ interface PositionSlot { long: Record<Symbol, string> | null; short: Record<Symb
 
 const message = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 160);
 /** One read bounded by its own timer as well as the abort signal, so a connector that ignores the signal cannot hold the round. */
-async function bounded<T>(read: (signal: AbortSignal) => Promise<T>, timeoutMs: number): Promise<T> {
+export async function bounded<T>(read: (signal: AbortSignal) => Promise<T>, timeoutMs: number): Promise<T> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<never>((_resolve, fail) => {

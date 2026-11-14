@@ -4,10 +4,10 @@ import { randomUUID } from 'node:crypto';
 import { add, cmp, fromUnits, isMultiple, mul, sub, units } from './decimal.ts';
 import { VENUE_READ_SYMBOLS, type AccountBinding, type AccountSnapshot, type Instrument, type Quote, type Venue, type PositionSide } from './contracts.ts';
 import {
-  VenueError, type CallOptions, type ConnectorCapabilities, type OrderReport, type OrderRequest, type SendOptions, type StrategyAck, type StrategyReport, type StrategyRequest, type StrategyStatus, type VenueConnector,
+  VenueError, type CallOptions, type ConnectorCapabilities, type LedgerEntry, type OrderReport, type PnlSnapshot, type OrderRequest, type SendOptions, type StrategyAck, type StrategyReport, type StrategyRequest, type StrategyStatus, type VenueConnector,
 } from './connector.ts';
 
-export type Operation = 'instrument' | 'quote' | 'account' | 'place' | 'query' | 'cancel' | 'strategy-place' | 'strategy-query' | 'strategy-stop' | 'strategy-list';
+export type Operation = 'instrument' | 'quote' | 'account' | 'pnl' | 'ledger' | 'place' | 'query' | 'cancel' | 'strategy-place' | 'strategy-query' | 'strategy-stop' | 'strategy-list';
 /**
  * reject: definitive venue refusal. not-sent: refused before transmission.
  * lost-request: the call fails as uncertain and the venue never saw it.
@@ -27,7 +27,10 @@ export interface Fault { operation: Operation; mode: FaultMode; times?: number; 
 interface Book { bid: string; ask: string; ageMs: number; complete: boolean; sequence: number }
 interface SimOrder { request: OrderRequest; accountId: string; remoteId: string; filled: string; notional: string; status: OrderReport['status']; updatedAt: number }
 interface SimStrategy { id: string; accountId: string; request: StrategyRequest; filled: string; notional: string; status: StrategyStatus; childrenSettled: boolean; lagQueries: number; createdAt: number; updatedAt: number }
-interface SimAccount { accountId: string; positionModes: Record<string, 'one-way' | 'hedge'>; positions: Map<string, string>; foreignOrders: { symbol: string; remoteId: string }[] }
+/** costs: the entry value (quantity × entry price) of each position, for the PnL reads; ledger: its fills' realized PnL and fees, and injected funding. */
+interface SimAccount { accountId: string; positionModes: Record<string, 'one-way' | 'hedge'>; positions: Map<string, string>; costs: Map<string, string>; ledger: LedgerEntry[]; foreignOrders: { symbol: string; remoteId: string }[] }
+/** The simulated taker fee, charged on every fill (5 bp of its value). */
+const SIM_FEE_RATE = '0.0005';
 
 const TERMINAL = new Set(['filled', 'canceled', 'rejected', 'expired']);
 
@@ -41,7 +44,7 @@ export class SimulatedVenue implements VenueConnector {
   readonly strategies = new Map<string, SimStrategy>();
   /** Requests that reached the venue's matching engine, per operation. */
   readonly arrived: Record<'place' | 'cancel' | 'strategy-place' | 'strategy-stop', number> = { place: 0, cancel: 0, 'strategy-place': 0, 'strategy-stop': 0 };
-  readonly calls: Record<Operation, number> = { instrument: 0, quote: 0, account: 0, place: 0, query: 0, cancel: 0, 'strategy-place': 0, 'strategy-query': 0, 'strategy-stop': 0, 'strategy-list': 0 };
+  readonly calls: Record<Operation, number> = { instrument: 0, quote: 0, account: 0, pnl: 0, ledger: 0, place: 0, query: 0, cancel: 0, 'strategy-place': 0, 'strategy-query': 0, 'strategy-stop': 0, 'strategy-list': 0 };
   connectionGeneration = 1;
   private faults: Fault[] = [];
   private hung: (() => void)[] = [];
@@ -63,10 +66,15 @@ export class SimulatedVenue implements VenueConnector {
     Object.assign(book, change); book.sequence++;
   }
   openAccount(accountId: string, positionModes: Record<string, 'one-way' | 'hedge'>): void {
-    this.accounts.set(accountId, { accountId, positionModes, positions: new Map(), foreignOrders: [] });
+    this.accounts.set(accountId, { accountId, positionModes, positions: new Map(), costs: new Map(), ledger: [], foreignOrders: [] });
   }
   setPosition(accountId: string, symbol: string, side: PositionSide, quantity: string): void { this.requireAccount(accountId).positions.set(`${symbol}:${side}`, quantity); }
   position(accountId: string, symbol: string, side: PositionSide): string { return this.requireAccount(accountId).positions.get(`${symbol}:${side}`) ?? '0'; }
+  /** A ledger row of the account as the venue would book it (a funding settlement, say); time defaults to now. */
+  addLedger(accountId: string, entry: Omit<LedgerEntry, 'id' | 'time'> & { time?: number }): void {
+    const account = this.requireAccount(accountId);
+    account.ledger.push({ id: `sim-${this.nextRemote++}`, time: entry.time ?? this.clock(), symbol: entry.symbol, kind: entry.kind, amount: entry.amount });
+  }
   addForeignOrder(accountId: string, symbol: string): void { this.requireAccount(accountId).foreignOrders.push({ symbol, remoteId: `foreign-${this.nextRemote++}` }); }
   inject(fault: Fault): void { this.faults.push({ times: 1, ...fault }); }
   clearFaults(): void { this.faults = []; }
@@ -124,10 +132,20 @@ export class SimulatedVenue implements VenueConnector {
     const account = this.requireAccount(strategy.accountId), key = `${strategy.request.symbol}:${strategy.request.positionSide}`;
     const current = account.positions.get(key) ?? '0';
     const opening = (strategy.request.side === 'buy') === (strategy.request.positionSide === 'long');
+    this.book(account, strategy.request.symbol, strategy.request.positionSide, opening, current, quantity, price);
     account.positions.set(key, opening ? add(current, quantity) : sub(current, quantity));
     strategy.filled = add(strategy.filled, quantity); strategy.notional = add(strategy.notional, mul(quantity, price));
     if (cmp(strategy.filled, strategy.request.quantity) === 0) { strategy.status = 'terminal'; strategy.childrenSettled = true; }
     strategy.updatedAt = this.clock();
+  }
+  /** Moves the position's entry value and books the fill's fee and, on a close, its realized PnL at the average entry. */
+  private book(account: SimAccount, symbol: string, side: PositionSide, opening: boolean, current: string, quantity: string, price: string): void {
+    const key = `${symbol}:${side}`, cost = account.costs.get(key) ?? '0', value = mul(quantity, price), time = this.clock();
+    account.ledger.push({ id: `sim-${this.nextRemote++}`, time, symbol, kind: 'fee', amount: sub('0', mul(value, SIM_FEE_RATE)) });
+    if (opening) { account.costs.set(key, add(cost, value)); return; }
+    const entryValue = cmp(current, '0') > 0 ? mul(averagePrice(cost, current), quantity) : '0';
+    account.costs.set(key, sub(cost, entryValue));
+    account.ledger.push({ id: `sim-${this.nextRemote++}`, time, symbol, kind: 'realized', amount: side === 'long' ? sub(value, entryValue) : sub(entryValue, value) });
   }
   private readFault(operation: Operation): void {
     const fault = this.takeFault(operation);
@@ -142,6 +160,7 @@ export class SimulatedVenue implements VenueConnector {
     const account = this.requireAccount(order.accountId), key = `${order.request.symbol}:${order.request.positionSide}`;
     const current = account.positions.get(key) ?? '0';
     const opening = (order.request.side === 'buy') === (order.request.positionSide === 'long');
+    this.book(account, order.request.symbol, order.request.positionSide, opening, current, quantity, price);
     account.positions.set(key, opening ? add(current, quantity) : sub(current, quantity));
     order.filled = add(order.filled, quantity); order.notional = add(order.notional, mul(quantity, price));
     order.status = cmp(order.filled, order.request.quantity) === 0 ? 'filled' : 'partially-filled';
@@ -182,6 +201,23 @@ export class SimulatedVenue implements VenueConnector {
       ...account.foreignOrders.map(order => ({ symbol: order.symbol, clientOrderId: null, remoteId: order.remoteId })), ...children].filter(order => wanted.has(order.symbol));
     const positionModes = Object.fromEntries(Object.entries(account.positionModes).filter(([symbol]) => wanted.has(symbol)));
     return { venue: this.venue, accountId: account.accountId, positionModes, positions, openOrders, receivedAt: this.clock() };
+  }
+  /** Marks at the book's mid price; unrealized PnL against the average entry. */
+  async pnlPositions(binding: AccountBinding, symbols: readonly string[], { signal }: CallOptions): Promise<PnlSnapshot> {
+    this.enter('pnl', signal); this.readFault('pnl');
+    const account = this.requireAccount(binding.accountId), wanted = new Set(symbols);
+    const positions = [...account.positions].flatMap(([key, quantity]) => {
+      const [symbol, side] = key.split(':') as [string, PositionSide];
+      if (!wanted.has(symbol) || cmp(quantity, '0') <= 0) return [];
+      const book = this.books.get(symbol), cost = account.costs.get(key) ?? '0';
+      const mark = book ? averagePrice(add(book.bid, book.ask), '2') : null, value = mark === null ? cost : mul(quantity, mark);
+      return [{ symbol, side, quantity, entryPrice: cmp(cost, '0') > 0 ? averagePrice(cost, quantity) : null, markPrice: mark, unrealizedPnl: side === 'long' ? sub(value, cost) : sub(cost, value) }];
+    });
+    return { venue: this.venue, accountId: account.accountId, positions, receivedAt: this.clock() };
+  }
+  async ledger(binding: AccountBinding, symbol: string, window: { from: number; to: number }, { signal }: CallOptions): Promise<LedgerEntry[]> {
+    this.enter('ledger', signal); this.readFault('ledger');
+    return this.requireAccount(binding.accountId).ledger.filter(entry => entry.symbol === symbol && entry.time >= window.from && entry.time <= window.to).map(entry => ({ ...entry }));
   }
   async place(binding: AccountBinding, request: OrderRequest, { signal, beforeSend }: SendOptions): Promise<OrderReport> {
     this.enter('place', signal);

@@ -6,6 +6,7 @@ import { ACTIVE_STATUSES, CONFIRM_ACKNOWLEDGE, CONFIRM_NOT_CREATED, CONFIRM_RELE
 import type { OilBook, OilConfirmResult, OilJob, OilMarket, OilPositionAccount, OilPreview, OilState } from './oil-types.ts';
 import { RequestIds } from './request-ids.ts';
 import { Callout, StatePanel } from './StateViews.tsx';
+import { OilPnl } from './OilPnl.tsx';
 import { OilRules } from './OilRules.tsx';
 import { useLiveResource, type LiveResource } from './use-live-resource.ts';
 import './trading.css';
@@ -470,5 +471,6 @@ export function OilPage({ onExpired }: { onExpired: () => void }) {
         <OrderForm state={state.data} onAccepted={job => { setTracked(job.id); setActive(true); void state.refresh(); }} />
       </section>}
     {state.data ? <OilRules onExpired={onExpired} /> : null}
+    {state.data ? <OilPnl onExpired={onExpired} /> : null}
   </div>;
 }

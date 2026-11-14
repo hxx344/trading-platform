@@ -306,3 +306,90 @@
 .auto-panel-note{padding:4px 16px 16px}
 @media (max-width:900px){.auto-rule-form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media (max-width:560px){.auto-rule-form-grid{grid-template-columns:minmax(0,1fr)}}
+
+/* O4 原油盈亏与资金费：照工作台 src/trading.css（a12e583）的盈亏、资金费与流水区块 */
+.trading-range{display:flex;flex-shrink:0;background:var(--surface-3);border-radius:var(--radius-md);padding:3px;gap:3px}
+.trading-range button{border:0;background:none;color:var(--text-tertiary);font-size:.75rem;min-height:28px;padding:4px 11px;border-radius:var(--radius-sm);cursor:pointer;transition:background-color .2s ease,border-color .2s ease,color .2s ease,box-shadow .2s ease,transform .2s ease}
+.trading-range button:hover{color:var(--text-secondary);background:var(--surface-4)}
+.trading-range button[aria-pressed=true]{background:var(--surface-2);color:var(--accent);box-shadow:var(--shadow-sm);font-weight:600}
+.trading-funding-summary{display:grid;grid-template-columns:1fr 1fr 1.15fr;padding:4px 16px 14px;gap:16px}
+.trading-funding-summary>div{min-width:0}
+.trading-funding-summary>div:last-child{padding-left:16px;border-left:1px solid var(--surface-4)}
+.trading-funding-summary span{display:flex;align-items:baseline;gap:8px;color:var(--text-tertiary);font-size:13px}
+.trading-funding-summary small{font-size:11px;color:var(--text-tertiary)}
+.trading-funding-summary strong{display:block;margin-top:4px;font-family:var(--font-mono);font-size:1.375rem;font-weight:600;line-height:1.3;font-variant-numeric:tabular-nums;letter-spacing:-.02em;overflow-wrap:anywhere}
+.trading-funding-coverage{border-block:1px solid var(--surface-4);padding:10px 16px;background:var(--surface-3);font-size:12px;color:var(--text-tertiary)}
+.trading-funding-coverage>p{display:flex;gap:7px;align-items:center;margin-bottom:10px}
+.trading-funding-coverage>div{display:flex;align-items:center;flex-wrap:wrap;gap:6px 10px;line-height:1.7}
+.trading-funding-coverage>div+div{margin-top:8px}
+.trading-funding-coverage>div>strong{min-width:52px;color:var(--text-primary)}
+.trading-funding-coverage>div>p{flex-basis:100%;overflow-wrap:anywhere}
+.trading-chart-empty{height:100%;display:grid;place-items:center;color:var(--text-tertiary);font-size:13px;background:var(--surface-3);border:1px dashed var(--surface-4);border-radius:var(--radius-md)}
+
+.trading-table-scroll{max-width:100%;overflow:auto;overscroll-behavior:contain}
+.trading-table-scroll table{color:var(--text-secondary);width:100%;border-collapse:collapse;white-space:nowrap;font-size:12px;font-variant-numeric:tabular-nums}
+.trading-table-scroll th,.trading-table-scroll td{padding:7px 12px;text-align:right;border-bottom:1px solid var(--surface-4)}
+.trading-table-scroll th{font-weight:500}
+.trading-table-scroll thead{color:var(--text-tertiary);background:var(--surface-3)}
+.trading-table-scroll thead th{letter-spacing:.02em}
+.trading-table-scroll tbody tr{transition:background-color .2s ease,border-color .2s ease,color .2s ease,box-shadow .2s ease,transform .2s ease}
+.trading-table-scroll tbody tr:hover{background:var(--surface-3)}
+.trading-ledger-scroll{max-height:430px}
+.trading-ledger-scroll th{position:sticky;top:0;background:var(--surface-3);z-index:1}
+.trading-ledger-scroll th:first-child,.trading-ledger-scroll td:first-child{padding-left:16px}
+.trading-ledger-scroll th:last-child,.trading-ledger-scroll td:last-child{padding-right:16px}
+.trading-ledger-scroll th:nth-child(2),.trading-ledger-scroll td:nth-child(2),.trading-ledger-scroll th:nth-child(3),.trading-ledger-scroll td:nth-child(3){text-align:left}
+.trading-pagination{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;gap:12px}
+.trading-pagination>span{color:var(--text-tertiary);font-size:12px}
+.trading-pagination>div{display:flex;gap:8px}
+.trading-pagination .button{font-size:12px;padding:7px 12px}
+.trading-ledger-empty{padding:18px 16px 24px;font-size:13px;color:var(--text-tertiary);text-align:center;line-height:1.8}
+.trading-window-loading{font-size:12px;color:var(--warning);margin:0 16px 12px!important}
+.trading-pnl>.trading-caption{padding:0 16px 12px}
+.trading-pnl .trading-caption{font-size:12px;color:var(--text-tertiary);line-height:1.7}
+.trading-pnl-chart{padding:0 16px}
+.trading-pnl-legend{display:flex;flex-wrap:wrap;gap:12px 20px;font-size:12px;color:var(--text-tertiary);margin-bottom:9px}
+.trading-pnl-legend>span{display:flex;gap:6px;align-items:center}
+.trading-pnl-legend i{width:16px;height:3px}
+.trading-pnl-latest{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:16px;padding:14px 0}
+.trading-pnl-latest>span{font-size:12px;color:var(--text-tertiary);min-width:0}
+.trading-pnl-latest b{display:block;font-family:var(--font-mono);font-size:1.25rem;font-weight:600;color:var(--text-primary);font-variant-numeric:tabular-nums;margin-top:7px;overflow-wrap:anywhere}
+.trading-pnl-latest>span:first-child b{color:var(--accent)}
+.trading-pnl-plot{height:246px;min-width:0}
+.trading-pnl-plot svg{touch-action:pan-y}
+.trading-pnl-plot .trading-chart-empty{padding:20px;text-align:center;line-height:1.8}
+.trading-pnl-inspect{font-size:12px;color:var(--text-tertiary);background:var(--surface-3);border-radius:var(--radius-md);padding:14px 16px;line-height:1.8}
+.trading-pnl-inspect label{display:block}
+.trading-pnl-inspect input{display:block;width:100%;height:26px;accent-color:var(--accent)}
+.trading-pnl-inspect>div{display:flex;gap:5px 18px;flex-wrap:wrap;font-variant-numeric:tabular-nums}
+.trading-pnl-inspect b{font-weight:500;color:var(--text-primary);overflow-wrap:anywhere}
+.trading-pnl-chart>.trading-footnote{padding:12px 0 0}
+@media(max-width:760px){
+  .trading-funding>.trading-panel-heading{align-items:flex-start;flex-wrap:wrap}
+  .trading-range button{min-height:40px;padding-inline:13px}
+  .trading-funding-summary{padding:6px 16px 18px;gap:12px;grid-template-columns:1fr 1fr}
+  .trading-funding-summary>div:last-child{grid-column:1/-1;padding:13px 0 0;margin-top:1px;border-left:0;border-top:1px solid var(--surface-4);display:flex;align-items:baseline;justify-content:space-between;gap:12px}
+  .trading-funding-summary strong{font-size:1.25rem;margin-top:4px}
+  .trading-funding-summary>div:last-child strong{margin-top:0;font-size:1.375rem}
+  .trading-funding-summary span{font-size:12px;gap:5px}
+  .trading-funding-summary small{font-size:10px}
+  .trading-funding-coverage{padding:12px 16px;font-size:11px}
+  .trading-funding-coverage>p{align-items:flex-start;line-height:1.7}
+  .trading-funding-coverage>p>svg{flex-shrink:0;margin-top:2px}
+  .trading-pagination{padding:14px 16px;flex-wrap:wrap}
+  .trading-pagination>span{font-size:11px}
+  .trading-pagination>div{margin-left:auto}
+  .trading-table-scroll th,.trading-table-scroll td{padding:11px 13px}
+  .trading-ledger-scroll th:first-child,.trading-ledger-scroll td:first-child{padding-left:16px}
+}
+@media(max-width:620px){
+  .trading-pnl>.trading-caption{padding-inline:16px}
+  .trading-pnl-chart{padding-inline:16px}
+  .trading-pnl-latest{grid-template-columns:1fr;gap:16px}
+  .trading-pnl-latest>span{font-size:12px}
+  .trading-pnl-latest b{font-size:1.125rem;margin-top:4px}
+  .trading-pnl-inspect{padding:12px}
+}
+@media(max-width:430px){
+  .trading-funding-coverage>div>span:not(.trading-status){flex-basis:100%;margin-top:1px}
+}

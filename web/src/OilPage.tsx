@@ -2,7 +2,7 @@ import { ArrowRightLeft, ChevronDown, Clock3, LoaderCircle, RefreshCw, Square } 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from './api.ts';
 import { clock, label, stamp } from './labels.ts';
-import { ACTIVE_STATUSES, CONFIRM_ACKNOWLEDGE, CONFIRM_NOT_CREATED, CONFIRM_RELEASE, DEFAULT_FORM, VENUE_LABEL, describeIntent, draftLegs, formToIntent, jobActions, type OilForm, type OilIntent, type OilSymbol, type OilVenue } from './oil-form.ts';
+import { ACTIVE_STATUSES, CONFIRM_ACKNOWLEDGE, CONFIRM_NOT_CREATED, CONFIRM_RELEASE, DEFAULT_FORM, LEAD_TYPES, VENUE_LABEL, describeIntent, leadTypeAllowed, draftLegs, formToIntent, jobActions, type OilForm, type OilIntent, type OilSymbol, type OilVenue } from './oil-form.ts';
 import type { OilBook, OilConfirmResult, OilJob, OilMarket, OilPositionAccount, OilPreview, OilState } from './oil-types.ts';
 import { RequestIds } from './request-ids.ts';
 import { Callout, StatePanel } from './StateViews.tsx';
@@ -27,7 +27,7 @@ const TRACKING_STATUS: Record<string, string> = {
 };
 const OP_STATE: Record<string, string> = { prepared: '已落盘', sending: '发送中', open: '交易所挂单中', unknown: '结果未知，核对中', rejected: '被拒绝', 'not-sent': '未发送', 'not-created': '确认未创建', filled: '已成交', canceled: '已撤销', confirmed: '已确认' };
 const STRATEGY_STATUS: Record<string, string> = { working: '运行中', paused: '已暂停', terminal: '已结束' };
-const ORDER_TYPE: Record<string, string> = { market: '市价', chase: '追价策略', limit: '限价' };
+const ORDER_TYPE: Record<string, string> = { market: '市价', chase: '追价策略', 'local-chase': '本地追价', limit: '限价' };
 const ACCOUNT_MODE: Record<string, string> = { standard: '普通 U 本位', 'portfolio-margin': '组合保证金', unified: '统一账户' };
 const SYMBOLS: readonly OilSymbol[] = ['BZUSDT', 'CLUSDT'];
 const statusOf = (error: unknown): number | undefined => {
@@ -43,6 +43,8 @@ const confirmRefused = (error: unknown): boolean => {
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 const short = (symbol: string): string => symbol.replace('USDT', '');
 const venueName = (venue: string): string => label(VENUE_LABEL, venue);
+/** Whether the leg's order buys: opening a long or closing a short. */
+const buys = (action: 'open' | 'close', side: string): boolean => (action === 'open') === (side === 'long');
 /** 开多 / 开空 / 平多 / 平空, as the workbench names a leg's operation. */
 const operation = (action: string, side: string): string => `${action === 'open' ? '开' : '平'}${side === 'long' ? '多' : '空'}`;
 
@@ -168,6 +170,7 @@ function PreviewCard({ preview, limits, busy, unknown, onConfirm, onEdit }: { pr
       <div><dt>估算名义金额</dt><dd>{preview.notional} USDT</dd></div>
       <div><dt>价格保护</dt><dd>{preview.intent.maxSlippageBps ? `${preview.intent.maxSlippageBps} 基点` : '执行器默认值'}</dd></div>
       <div><dt>最长执行</dt><dd>{Math.round(preview.intent.timeoutMs / 1000)} 秒</dd></div>
+      {preview.batches?.length ? <div><dt>分批</dt><dd>{preview.batches.length} 批 · 间隔 {Math.round((preview.intent.batches?.intervalMs ?? 0) / 1000)} 秒<small>首腿每批 {preview.batches.join(' / ')}</small></dd></div> : null}
     </dl>
     <div className="execution-review-legs execution-table-wrap"><table className="execution-progress-table execution-review-table">
       <thead><tr><th scope="col">交易腿</th><th scope="col">数量<small>合约数量</small></th><th scope="col">下单方式</th><th scope="col">价格保护界限<small>USDT</small></th><th scope="col">买一 / 卖一<small>盘口时间</small></th></tr></thead>
@@ -175,11 +178,11 @@ function PreviewCard({ preview, limits, busy, unknown, onConfirm, onEdit }: { pr
         <th scope="row"><strong>{venueName(leg.venue)} {short(leg.symbol)}</strong><span className={`execution-side ${leg.side}`}>{operation(preview.intent.action, leg.side)}{leg.reduceOnly ? ' · 只减仓' : ''}</span></th>
         <td data-label="数量"><strong>{leg.quantity}</strong><small>每张 {leg.instrument.contractSize} 桶</small></td>
         <td data-label="下单方式">{leg.index === 0 ? '首腿' : '对冲腿'} · {label(ORDER_TYPE, leg.orderType)}</td>
-        <td data-label="价格保护界限">{leg.priceBound ?? '—'}</td>
+        <td data-label="价格保护界限">{leg.orderType === 'local-chase' && leg.limitPrice ? <>{leg.limitPrice}<small>自填追价界限</small></> : leg.priceBound ?? '—'}{leg.chaseCeiling ? <small>挂单上限 {leg.chaseCeiling}</small> : null}</td>
         <td data-label="买一 / 卖一">{leg.quote.bid} / {leg.quote.ask}<small>{clock(leg.quote.receivedAt)}</small></td>
       </tr>)}</tbody>
     </table></div>
-    <p className="execution-help">首腿按所选方式下单：市价时以价格保护界限为 IOC 限价，超出界限的部分不成交；追价时界限是最高追价（卖出时为最低）。对冲腿在首腿成交后按市价跟上，不受界限约束，它的界限只在首腿发出前核对一次。{limits ? `单笔上限 ${limits.perJob} USDT；${preview.intent.action === 'open' ? `24 小时开仓已用 ${limits.openUsed} / ${limits.openPer24h} USDT。` : '平仓不计入 24 小时开仓额度。'}` : ''}</p>
+    <p className="execution-help">首腿按所选方式下单：市价时以价格保护界限为 IOC 限价，超出界限的部分不成交；追价时界限是最高追价（卖出时为最低），本地追价自填界限时以自填为准。对冲腿在首腿成交后按市价跟上，不受界限约束，它的界限只在首腿发出前核对一次。{limits ? `单笔上限 ${limits.perJob} USDT；${preview.intent.action === 'open' ? `24 小时开仓已用 ${limits.openUsed} / ${limits.openPer24h} USDT。` : '平仓不计入 24 小时开仓额度。'}` : ''}</p>
     {preview.notes.length ? <ul className="execution-review-notes">{preview.notes.map((note, index) => <li key={index}>{note}</li>)}</ul> : null}
     {/* An unanswered confirm is checked by clicking confirm again with the same request id: the executor answers it by that id whether or not the preview has expired since. */}
     {unknown ? <p className="execution-warning">上次确认没有收到应答，可能已受理：请先再点“确认并实盘{action}”核对（沿用同一请求编号，不会重复下单）。</p>
@@ -216,8 +219,10 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   const set = <K extends keyof OilForm>(key: K, value: OilForm[K]) => {
     setForm(current => {
       const next = { ...current, [key]: value };
-      // Chase is Bybit's alone: moving the lead to Binance takes the market order back.
-      if (next.venue !== 'bybit') next.leadOrderType = 'market';
+      // Each venue chases its own way (Bybit strategy, Binance local chase): moving the lead elsewhere takes the market order back.
+      if (!leadTypeAllowed(next.venue, next.leadOrderType)) next.leadOrderType = 'market';
+      // A native chase is never batched; its batch fields are hidden, so they must not keep a stale count.
+      if (next.leadOrderType === 'chase') { next.batchCount = '1'; next.batchIntervalSeconds = '0'; }
       return next;
     });
     changed();
@@ -302,19 +307,25 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
           const symbol = leg.symbol ?? form.symbol;
           return <section key={index} className="execution-leg-input" aria-label={`${index === 0 ? '首腿' : '对冲腿'} ${VENUE_LABEL[leg.venue]} ${short(symbol)} 交易参数`}>
             <header><strong>{VENUE_LABEL[leg.venue]} {short(symbol)}</strong><span className={`execution-side ${leg.side}`}>{operation(form.action, leg.side)}</span><small className="oil-leg-role">{index === 0 ? '首腿' : '对冲腿'}</small></header>
-            {index === 0 && form.venue === 'bybit' ? <Choice label="下单方式" id="oilLeadType" value={form.leadOrderType} options={[['market', '市价'], ['chase', '追价策略']]} onChange={next => set('leadOrderType', next)} /> : null}
-            <p className="execution-help execution-market-note">{index === 1 ? '首腿成交后按市价跟上相同桶数。'
+            {index === 0 ? <Choice label="下单方式" id="oilLeadType" value={form.leadOrderType} options={LEAD_TYPES[form.venue]} onChange={next => set('leadOrderType', next)} /> : null}
+            {index === 0 && form.leadOrderType === 'local-chase' ? <label className="execution-amount">追价界限 · USDT（选填）<input id="oilChaseLimit" type="text" inputMode="decimal" autoComplete="off" maxLength={24} value={form.chaseLimit} placeholder="留空用价格保护界限" onChange={event => set('chaseLimit', event.target.value)} /></label> : null}
+            <p className="execution-help execution-market-note">{index === 1 ? '首腿成交后按市价跟上相同桶数；首腿挂单期间的成交也会随时跟上。'
               : form.leadOrderType === 'chase' ? 'Bybit 原生追价策略，按本方一档追价，直到成交或达到最长执行时间。'
-              : form.venue === 'bybit' ? '市价：按对手盘吃单成交，受价格保护界限约束。' : '市价：按对手盘吃单成交，受价格保护界限约束；追价策略仅 Bybit 提供。'}</p>
+              : form.leadOrderType === 'local-chase' ? `只挂单挂在${buys(form.action, leg.side) ? '买一' : '卖一'}，盘口变化后撤单重挂，${buys(form.action, leg.side) ? '最高' : '最低'}追到界限；不吃单，到最长执行时间未成交的部分撤销。`
+              : '市价：按对手盘吃单成交，受价格保护界限约束。'}</p>
           </section>;
         })}</div>
         <details className="execution-advanced" open={advanced} onToggle={event => setAdvanced(event.currentTarget.open)}>
-          <summary><span><strong>执行参数</strong><small>最长 {form.timeoutSeconds || '?'} 秒 · 价格保护 {form.slippageBps ? `${form.slippageBps} 基点` : '默认'}</small></span><ChevronDown size={16} aria-hidden="true" /></summary>
+          <summary><span><strong>执行参数</strong><small>最长 {form.timeoutSeconds || '?'} 秒 · 价格保护 {form.slippageBps ? `${form.slippageBps} 基点` : '默认'}{Number(form.batchCount) > 1 ? ` · 分 ${form.batchCount} 批` : ''}</small></span><ChevronDown size={16} aria-hidden="true" /></summary>
           <div className="execution-settings">
             <label>最长执行 · 秒<input id="oilTimeout" type="text" inputMode="numeric" autoComplete="off" maxLength={4} value={form.timeoutSeconds} onChange={event => set('timeoutSeconds', event.target.value)} /></label>
             <label>价格保护 · 基点（选填）<input id="oilSlippage" type="text" inputMode="numeric" autoComplete="off" maxLength={4} value={form.slippageBps} placeholder="留空用默认值" onChange={event => set('slippageBps', event.target.value)} /></label>
+            {form.leadOrderType !== 'chase' ? <>
+              <label>分批 · 批数<input id="oilBatchCount" type="text" inputMode="numeric" autoComplete="off" maxLength={2} value={form.batchCount} onChange={event => set('batchCount', event.target.value)} /></label>
+              <label>批次间隔 · 秒<input id="oilBatchInterval" type="text" inputMode="numeric" autoComplete="off" maxLength={3} value={form.batchIntervalSeconds} disabled={Number(form.batchCount) <= 1} onChange={event => set('batchIntervalSeconds', event.target.value)} /></label>
+            </> : null}
           </div>
-          <p className="execution-help">到最长执行时间仍未完成时，停止发送并撤销余单，已成交部分保留。价格保护按预览盘口计算界限：首腿超出界限的部分不成交；对冲腿按市价成交，界限只在首腿发出前核对。</p>
+          <p className="execution-help">到最长执行时间仍未完成时，停止发送并撤销余单，已成交部分保留。分批时每批首腿成交并对冲后，等满间隔再发下一批；批次间隔合计须短于最长执行时间。价格保护按预览盘口计算界限：首腿超出界限的部分不成交；对冲腿按市价成交，界限只在首腿发出前核对。</p>
         </details>
         <div className="execution-builder-footer">
           {preview ? <p>正在确认上方预览；返回修改参数后可重新填写。</p> : messageView ?? <p>预览会重新读取盘口、交易规则与持仓，不会下单。</p>}
@@ -340,7 +351,7 @@ function JobCard({ job, busy, strategyId, onStrategyId, onAction }: { job: OilJo
   return <article className={`execution-job ${job.status}`} data-oil-job={job.id} aria-label={`${kind}${job.action === 'open' ? '开仓' : '平仓'} ${label(JOB_STATUS, job.status)}`}>
     <header><div>
       <h3>{kind}{job.action === 'open' ? '开仓' : '平仓'} <span className={`execution-badge ${JOB_BADGE[job.status] ?? ''}`}>{label(JOB_STATUS, job.status)}</span>{job.stopRequested ? <span className="execution-badge">已请求停止</span> : null}{job.holdNewSends ? <span className="execution-badge">恢复中，不再发送新委托</span> : null}</h3>
-      <p>任务 {job.id.slice(0, 8)} · 创建 {stamp(job.createdAt)} · 最迟 {clock(job.deadlineAt)}（北京时间）</p>
+      <p>任务 {job.id.slice(0, 8)} · 创建 {stamp(job.createdAt)} · 最迟 {clock(job.deadlineAt)}（北京时间）{job.batches ? ` · 分 ${job.batches.count} 批，${job.batches.current ? `第 ${job.batches.current} 批` : '未开始'}` : ''}</p>
     </div>{actions.stop ? <button className="button secondary execution-stop" type="button" data-oil-stop={job.id} disabled={busy} onClick={() => onAction(job, 'stop')}><Square size={14} aria-hidden="true" />停止并撤销余单</button> : null}</header>
     {job.reason ? <p className="execution-job-reason" role={job.status === 'attention' ? 'alert' : undefined}>{job.reason}</p> : null}
     <div className="execution-table-wrap"><table className="execution-progress-table">
@@ -350,8 +361,8 @@ function JobCard({ job, busy, strategyId, onStrategyId, onAction }: { job: OilJo
         <td data-label="已成交 / 计划"><span><strong>{leg.filledBarrels}</strong> / {leg.plannedBarrels} 桶<small>合约 {leg.filledQuantity} / {leg.plannedQuantity}{leg.attempts > 1 ? ` · ${leg.attempts} 笔` : ''}</small></span></td>
         <td data-label="成交均价">{leg.averagePrice ?? '—'}</td>
         <td data-label="当前委托 / 策略"><span className={leg.operation?.state === 'unknown' ? 'execution-warning' : undefined}>{leg.operation ? label(OP_STATE, leg.operation.state) : '未发送'}</span>
-          <small>{index === 0 ? '首腿' : '对冲腿'} · {label(ORDER_TYPE, leg.orderType)} · 账户 {leg.accountId}{strategyText(leg) ? ` · ${strategyText(leg)}` : ''}</small>{leg.operation?.note ? <small>{leg.operation.note}</small> : null}</td>
-        <td data-label="价格保护界限">{leg.priceBound ?? '—'}</td>
+          <small>{index === 0 ? '首腿' : '对冲腿'} · {label(ORDER_TYPE, leg.orderType)}{leg.orderType === 'local-chase' && leg.operation?.limitPrice ? ` 挂 ${leg.operation.limitPrice}` : ''} · 账户 {leg.accountId}{strategyText(leg) ? ` · ${strategyText(leg)}` : ''}</small>{leg.operation?.note ? <small>{leg.operation.note}</small> : null}</td>
+        <td data-label="价格保护界限">{leg.orderType === 'local-chase' && leg.limitPrice ? <>{leg.limitPrice}<small>自填追价界限</small></> : leg.priceBound ?? '—'}</td>
       </tr>)}</tbody>
     </table></div>
     {actions.strategy ? <div className="execution-reconcile" role="group" aria-label="追价策略核对">

@@ -61,3 +61,27 @@ test('原油任务操作：运行中可停止；追价创建结果未知时给�
   assert.deepEqual(jobActions({ ...flags, status: 'attention', locked: false }), { stop: false, strategy: false, acknowledge: false });
   for (const status of ['completed', 'failed', 'stopped']) assert.deepEqual(jobActions({ ...flags, status }), { stop: false, strategy: false, acknowledge: false });
 });
+
+test('原油下单表单：本地追价只给 Binance 首腿，可填追价界限；分批只用于市价与本地追价，通过执行器校验', () => {
+  const chase = build({ preset: 'cross-exchange', venue: 'binance', symbol: 'CLUSDT', leadOrderType: 'local-chase', chaseLimit: ' 70.5 ', batchCount: '3', batchIntervalSeconds: '10' });
+  assert.deepEqual(chase.legs[0], { venue: 'binance', side: 'long', orderType: 'local-chase', barrels: '10', limitPrice: '70.5' });
+  assert.deepEqual(chase.batches, { count: 3, intervalMs: 10_000 });
+  const parsed = parseIntent(chase);
+  assert.deepEqual([parsed.legs[0].orderType, parsed.legs[0].limitPrice, parsed.batches], ['local-chase', '70.5', { count: 3, intervalMs: 10_000 }]);
+  // No bound typed: the preview's price protection bound; one batch sends no batches field.
+  const plain = build({ leadOrderType: 'local-chase' });
+  assert.equal('limitPrice' in plain.legs[0], false);
+  assert.equal('batches' in plain, false);
+  assert.equal(parseIntent(plain).legs[0].orderType, 'local-chase');
+  assert.equal('limitPrice' in build({ leadOrderType: 'market', chaseLimit: '70' }).legs[0], false, '只有本地追价带界限');
+  assert.deepEqual(build({ batchCount: '2', batchIntervalSeconds: '' }).batches, { count: 2, intervalMs: 0 });
+
+  const error = (patch: Partial<OilForm>) => { const result = formToIntent({ ...DEFAULT_FORM, barrels: '10', ...patch }); return 'error' in result ? result.error : null; };
+  assert.match(error({ leadOrderType: 'local-chase', venue: 'bybit' }) ?? '', /只用于 Binance/);
+  assert.match(error({ leadOrderType: 'local-chase', chaseLimit: '-1' }) ?? '', /追价界限/);
+  for (const batchCount of ['0', '21', '1.5', '']) assert.match(error({ batchCount }) ?? '', /1–20/, batchCount);
+  assert.match(error({ batchCount: '2', batchIntervalSeconds: '601' }) ?? '', /0–600/);
+  assert.match(error({ venue: 'bybit', leadOrderType: 'chase', batchCount: '2' }) ?? '', /分批只用于/);
+  assert.match(error({ batchCount: '3', batchIntervalSeconds: '30' }) ?? '', /短于最长执行时间/);
+  assert.equal(error({ batchCount: '3', batchIntervalSeconds: '29' }), null);
+});

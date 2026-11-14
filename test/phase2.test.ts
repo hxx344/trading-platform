@@ -87,7 +87,7 @@ test('补发：对冲腿 IOC 部分成交，按差额补发；用尽次数后转
   const second = await previewAndConfirm(h);
   const view = await settle(h, second.jobId);
   assert.equal(view.status, 'attention');
-  assert.match(view.reason ?? '', /对冲腿已发送 5 次仍差 1/);
+  assert.match(view.reason ?? '', /对冲腿已有 5 笔未全部成交，仍差 1/);
   assert.equal(view.locked, true);
   assert.equal(view.legs[1].attempts, 5);
 }));

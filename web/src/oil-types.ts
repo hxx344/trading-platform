@@ -17,17 +17,19 @@ export interface OilPositionAccount {
 }
 export interface OilLimits { perJob: string; openPer24h: string; openUsed: string; windowMs: number; nextReleaseAt: number | null }
 export interface OilOperation {
-  kind: string; clientOrderId: string; state: string; quantity: string; filledQuantity: string; averagePrice: string | null; remoteId: string | null;
+  kind: string; clientOrderId: string; state: string; quantity: string; limitPrice?: string | null; filledQuantity: string; averagePrice: string | null; remoteId: string | null;
   strategyStatus: string | null; childrenSettled: boolean | null; adoptedAt: number | null; releasedAt: number | null; ackStrategyId: string | null; note: string | null;
 }
 export interface OilJobLeg {
-  venue: string; symbol: string; side: string; orderSide: string; orderType: string; plannedQuantity: string; accountId: string; priceBound: string | null;
+  venue: string; symbol: string; side: string; orderSide: string; orderType: string; plannedQuantity: string; accountId: string; priceBound: string | null; limitPrice?: string | null;
   contractSize: string; plannedBarrels: string; filledBarrels: string; averagePrice: string | null; previewQuote: { bid: string; ask: string };
   attempts: number; filledQuantity: string; operation: OilOperation | null;
 }
 export interface OilJob {
   id: string; preset: 'same-exchange' | 'cross-exchange'; action: 'open' | 'close'; status: string; reason: string | null; stopRequested: boolean;
   createdAt: number; deadlineAt: number; holdNewSends: boolean; locked: boolean; acknowledgedAt: number | null; strategyPending: boolean;
+  /** current: 1-based batch of the latest lead order, 0 before the first; null when the job is not batched. */
+  batches?: { count: number; current: number; intervalMs: number } | null;
   legs: OilJobLeg[]; events: { type: string; at: number; [key: string]: unknown }[];
 }
 export interface OilState {
@@ -38,8 +40,9 @@ export interface OilState {
 }
 export interface OilPreviewLeg {
   index: number; venue: string; symbol: string; side: string; orderSide: string; quantity: string; orderType: string; reduceOnly: boolean;
-  accountId: string; accountMode: string; priceBound?: string | null; instrument: { contractSize: string; quantityStep: string };
+  accountId: string; accountMode: string; priceBound?: string | null; limitPrice?: string | null; chaseCeiling?: string; instrument: { contractSize: string; quantityStep: string };
   quote: { bid: string; ask: string; receivedAt: number };
 }
-export interface OilPreview { id: string; expiresAt: number; intent: OilIntent; legs: OilPreviewLeg[]; notional: string; barrels?: string; notes: string[] }
+/** batches: the lead quantity of each batch, when the intent asked for more than one. */
+export interface OilPreview { id: string; expiresAt: number; intent: OilIntent; legs: OilPreviewLeg[]; notional: string; barrels?: string; batches?: string[]; notes: string[] }
 export interface OilConfirmResult { accepted: boolean; duplicate: boolean; job: OilJob }

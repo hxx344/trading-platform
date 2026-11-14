@@ -50,7 +50,7 @@ export class SimulatedVenue implements VenueConnector {
 
   constructor(venue: Venue, clock: () => number, { requestValidityMs = 5000 }: { requestValidityMs?: number } = {}) {
     this.venue = venue; this.clock = clock;
-    this.capabilities = { transport: 'simulated', clientOrderId: true, queryByClientOrderId: true, cancelByClientOrderId: true, maxClientOrderIdLength: 36, requestValidityMs, ...(venue === 'bybit' ? { chase: true as const } : {}) };
+    this.capabilities = { transport: 'simulated', clientOrderId: true, queryByClientOrderId: true, cancelByClientOrderId: true, maxClientOrderIdLength: 36, requestValidityMs, ...(venue === 'bybit' ? { chase: true as const } : { postOnly: true as const }) };
   }
 
   listInstrument(instrument: Omit<Instrument, 'venue'>, book: { bid: string; ask: string }): void {
@@ -196,11 +196,16 @@ export class SimulatedVenue implements VenueConnector {
       const account = this.requireAccount(binding.accountId), instrument = this.instruments.get(request.symbol), book = this.books.get(request.symbol);
       if (!instrument || !book || !isMultiple(request.quantity, instrument.quantityStep)) throw new VenueError('rejected', '数量或合约无效');
       if (request.reduceOnly && cmp(request.quantity, account.positions.get(`${request.symbol}:${request.positionSide}`) ?? '0') > 0) throw new VenueError('rejected', '只减仓数量超过持仓');
+      // An opening order below the minimum notional is refused, like Binance -4164 and Bybit 110094.
+      const pricedAt = request.type === 'market' ? (request.side === 'buy' ? book.ask : book.bid) : request.limitPrice as string;
+      if (!request.reduceOnly && cmp(mul(mul(request.quantity, pricedAt), instrument.contractSize), instrument.minNotional) < 0) throw new VenueError('rejected', '名义金额低于交易所最小值');
+      const crossing = request.type === 'market' || (request.side === 'buy' ? cmp(request.limitPrice as string, book.ask) >= 0 : cmp(request.limitPrice as string, book.bid) <= 0);
+      // Post-only that would take liquidity is refused like Binance -5022 and never recorded.
+      if (request.timeInForce === 'gtx' && (!this.capabilities.postOnly || crossing)) throw new VenueError('rejected', '只挂单会立即成交，交易所拒绝');
       const order: SimOrder = { request: { ...request }, accountId: account.accountId, remoteId: `${this.venue}-${this.nextRemote++}`, filled: '0', notional: '0', status: 'new', updatedAt: this.clock() };
       this.orders.set(request.clientOrderId, order);
       const takerPrice = request.side === 'buy' ? book.ask : book.bid;
-      const crosses = request.type === 'market' || (request.side === 'buy' ? cmp(request.limitPrice as string, book.ask) >= 0 : cmp(request.limitPrice as string, book.bid) <= 0);
-      if (crosses) {
+      if (crossing) {
         const quantity = fault?.mode === 'partial' ? fault.filled ?? '0' : request.quantity;
         if (cmp(quantity, '0') > 0) this.fill(order, quantity, takerPrice);
       }

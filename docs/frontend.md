@@ -292,7 +292,7 @@
 
 **对照的工作台页面**：`modules/monitor/app/exchange-comparison.tsx`（提交 `568a20d`）与 `hooks/use-exchange-quotes.ts`（`8470785`），放在原油、海力士详情的图表组之后、近期观察之前（同工作台 `app/oil-panel.tsx` 的 `children` 位置）。样式复制自 `app/globals.css`（`77f3cf2`）的交易所对比规则与“旧”标签，全部加 `.monitor-desk` 前缀，追加在 `web/src/monitor.css` 末尾，去掉了资金费面板与 Hub 卡片的规则。
 
-**页面**：`web/src/MonitorExchanges.tsx`：标题与刷新按钮、对比表（交易所 / 报价口径、两腿价格、价差、海力士多一列 ADR 溢价率、做空 / 做多价差年化）、说明、可展开的资金费周期与计算口径。每个交易所一行，各自用 `useLiveResource` 每 15 秒读一次（超时 12 秒），某一家失败只影响那一行（保留上次数据并标“保留数据 · 待更新”与“旧”）。时间按 UTC 显示。年化不可点（结算历史随 M-2d）；Variational 一行固定“未接入”。
+**页面**：`web/src/MonitorExchanges.tsx`：标题与刷新按钮、对比表（交易所 / 报价口径、两腿价格、价差、海力士多一列 ADR 溢价率、做空 / 做多价差年化）、说明、可展开的资金费周期与计算口径。每个交易所一行，各自用 `useLiveResource` 每 15 秒读一次（超时 20 秒，Lighter 冷启动要先读目录再取快照），某一家失败只影响那一行（保留上次数据并标“保留数据 · 待更新”与“旧”）。时间按 UTC 显示。年化不可点（结算历史随 M-2d）；Variational 一行固定“未接入”。
 
 **验证**：`scripts/dev-monitor.ts` 替身行情下 1280 与 390 宽度，原油 7 行、海力士 6 行齐全，展开说明、点刷新正常，无横向溢出（390 宽度按工作台改为卡片式行）；控制台只有未配置模块的入口探测 404。
 

@@ -12,6 +12,7 @@
 //   接口报错，本轮失败；
 // - Variational 需要登录会话，不接入：页面显示「未接入」，服务端不支持该交易所；
 // - Lighter 快照订阅多接一个中止信号（服务停止时立即结束）。
+// - 新增 checkedReply：OKX / Bitget 单个合约的应答先核对信封与合约行，读取器只缓存核对过的应答。
 import { oilSpread } from './oil-market.mjs';
 
 export const EXCHANGE_REFRESH_MS = 15_000;
@@ -202,6 +203,14 @@ function finishCex(exchange, monitorId, times, legs, funding, timestampBasis) {
   const apply = (leg, index) => { const item = funding?.[index]; return item ? { ...leg, fundingRate: item.fundingRate, fundingIntervalHours: item.fundingIntervalHours, nextFundingAt: item.nextFundingAt } : leg; };
   const fundingFetchedAt = funding ? new Date(Math.min(...funding.map(item => item.sourceTime))).toISOString() : null;
   return finishMark(exchange, monitorId, times, apply(legs[0], 0), apply(legs[1], 1), fundingFetchedAt, timestampBasis);
+}
+
+/** Checks one OKX / Bitget reply (catalog or funding) before the reader caches it: the official envelope and exactly one row
+ * for `symbol`. Returns the reply unchanged. */
+export function checkedReply(exchange, response, symbol) {
+  const { items } = envelope(response, exchange === 'okx' ? '0' : '00000');
+  unique(items, exchange === 'okx' ? 'instId' : 'symbol', symbol);
+  return response;
 }
 
 /** Official OKX envelopes (one or several); funding may contain one response per contract, null entries when one failed. */

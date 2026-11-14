@@ -6,7 +6,7 @@
 // no extra Binance or allMids reads.
 import {
   LIGHTER_ORIGIN, binanceOilExchangeQuote, bybitInstruments, hyperliquidHynixQuote, hyperliquidOilQuote, parseBinanceQuote, parseBitgetQuote,
-  parseBybitQuote, parseGateQuote, parseHyperliquidContexts, parseLighterOilMarkets, parseOkxQuote, readLighterOilSnapshot, supportsExchange,
+  parseBybitQuote, parseGateQuote, checkedReply, parseHyperliquidContexts, parseLighterOilMarkets, parseOkxQuote, readLighterOilSnapshot, supportsExchange,
   EXCHANGE_CONTRACTS, type Exchange, type ExchangeQuote, type HyperliquidContext, type LighterMarket, type SpreadMarket,
 } from '../vendor/exchange-comparison.mjs';
 import type { BinanceGate } from '../vendor/anthropic-market.mjs';
@@ -45,7 +45,8 @@ export function exchangeError(error: unknown): string {
   return '响应无效或网络失败';
 }
 
-const detail = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 200);
+// JSON parse errors quote the reply, so only their name is logged.
+const detail = (error: unknown): string => error instanceof SyntaxError ? error.name : (error instanceof Error ? error.message : String(error)).slice(0, 200);
 
 export function createExchangeReader({ gate, oilQuote, hynixQuote, fetchImpl = fetch, now = Date.now, WebSocketImpl, log = line => process.stderr.write(`${line}\n`) }: {
   /** The Binance cooldown shared with the collectors: everything reads Binance from the same address. */
@@ -124,7 +125,7 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, fetchImpl = f
         const [left, right, funding] = await Promise.all([
           request(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${contracts.left}`),
           request(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${contracts.right}`),
-          optional(shared('binance/funding', FUNDING_TTL_MS, () => request('https://fapi.binance.com/fapi/v1/fundingInfo'))),
+          optional(shared('binance/funding', FUNDING_TTL_MS, async () => { const reply = await request('https://fapi.binance.com/fapi/v1/fundingInfo'); if (!Array.isArray(reply)) throw new Error('Invalid fundingInfo'); return reply; })),
         ]);
         return parseBinanceQuote(market, [left, right], funding, now());
       }
@@ -139,18 +140,18 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, fetchImpl = f
       case 'okx': {
         const ids = bases.map(base => `${base}-USDT-SWAP`);
         const [instruments, marks, funding] = await Promise.all([
-          Promise.all(ids.map(id => retained(`okx/instruments/${id}`, () => request(`https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId=${id}`)))),
+          Promise.all(ids.map(id => retained(`okx/instruments/${id}`, async () => checkedReply('okx', await request(`https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId=${id}`), id)))),
           Promise.all(ids.map(id => request(`https://www.okx.com/api/v5/public/mark-price?instType=SWAP&instId=${id}`))),
-          Promise.all(ids.map(id => optional(shared(`okx/funding/${id}`, FUNDING_TTL_MS, () => request(`https://www.okx.com/api/v5/public/funding-rate?instId=${id}`))))),
+          Promise.all(ids.map(id => optional(shared(`okx/funding/${id}`, FUNDING_TTL_MS, async () => checkedReply('okx', await request(`https://www.okx.com/api/v5/public/funding-rate?instId=${id}`), id))))),
         ]);
         return parseOkxQuote(market, instruments, marks, funding, now());
       }
       case 'bitget': {
         const symbols = bases.map(base => `${base}USDT`);
         const [instruments, tickers, funding] = await Promise.all([
-          Promise.all(symbols.map(symbol => retained(`bitget/instruments/${symbol}`, () => request(`https://api.bitget.com/api/v2/mix/market/contracts?productType=USDT-FUTURES&symbol=${symbol}`)))),
+          Promise.all(symbols.map(symbol => retained(`bitget/instruments/${symbol}`, async () => checkedReply('bitget', await request(`https://api.bitget.com/api/v2/mix/market/contracts?productType=USDT-FUTURES&symbol=${symbol}`), symbol)))),
           Promise.all(symbols.map(symbol => request(`https://api.bitget.com/api/v2/mix/market/ticker?productType=USDT-FUTURES&symbol=${symbol}`))),
-          Promise.all(symbols.map(symbol => optional(shared(`bitget/funding/${symbol}`, FUNDING_TTL_MS, () => request(`https://api.bitget.com/api/v2/mix/market/current-fund-rate?productType=USDT-FUTURES&symbol=${symbol}`))))),
+          Promise.all(symbols.map(symbol => optional(shared(`bitget/funding/${symbol}`, FUNDING_TTL_MS, async () => checkedReply('bitget', await request(`https://api.bitget.com/api/v2/mix/market/current-fund-rate?productType=USDT-FUTURES&symbol=${symbol}`), symbol))))),
         ]);
         return parseBitgetQuote(market, instruments, tickers, funding, now());
       }

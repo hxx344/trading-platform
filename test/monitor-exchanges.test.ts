@@ -63,6 +63,29 @@ test('各交易所：替身上逐家读出两腿、价差与资金费，价格�
   assert.deepEqual([supportsExchange('oil', 'variational'), supportsExchange('hynix', 'gate'), supportsExchange('oil', 'gate')], [false, true, false]);
 });
 
+test('年化公式：按各腿名义与周期折算成每小时，再除以两腿总名义 × 8760；海力士左腿 10 份；任一腿缺资金费时为空', () => {
+  const leg = (symbol: string, price: number, fundingRate: number | null, fundingIntervalHours: number | null, fundingPrice = price) => ({ symbol, price, fundingPrice, fundingRate, fundingIntervalHours, nextFundingAt: null });
+  const at = new Date(Date.UTC(2026, 10, 13)).toISOString();
+  const base = { exchange: 'bybit', monitorId: 'hynix', currency: 'USDT', priceBasis: 'mark', fundingPriceBasis: 'mark', fetchedAt: at, fundingFetchedAt: at, status: 'live', fundingError: '' } as const;
+  // Short ADR (10 units at 26, +0.0001 per 8 h), long the ordinary share (1 at 240, -0.0002 per 4 h).
+  const hynix = { ...base, left: leg('SKHYUSDT', 26, 0.0001, 8), right: leg('SKHYNIXUSDT', 240, -0.0002, 4) };
+  const shortReceived = 10 * 26 * 0.0001 / 8, longPaid = 240 * -0.0002 / 4;
+  const expected = (shortReceived - longPaid) / (10 * 26 + 240) * 8760;
+  const metrics = calculateExchangeSpread(hynix as never);
+  close(metrics.shortAnnualized!, expected, 'short');
+  close(metrics.longAnnualized!, -expected, 'long');
+  close(metrics.equivalent, 24); close(metrics.spread, 2); close(metrics.premium, (26 / 24 - 1) * 100);
+  assert.ok(expected > 0, '空 ADR 收正费率、多正股收负费率，做空为正');
+  // Oil: one barrel each; the funding notional may differ from the price (Hyperliquid's oracle).
+  const oil = { ...base, exchange: 'hyperliquid', monitorId: 'oil', currency: 'USD', fundingPriceBasis: 'oracle', left: leg('xyz:BRENTOIL', 74, 0.00002, 1, 73.5), right: leg('xyz:CL', 70, 0.00001, 1, 70.2) };
+  close(calculateExchangeSpread(oil as never).shortAnnualized!, (73.5 * 0.00002 - 70.2 * 0.00001) / (73.5 + 70.2) * 8760, 'oil');
+  close(calculateExchangeSpread(oil as never).spread, 4);
+  for (const right of [leg('SKHYNIXUSDT', 240, null, 4), leg('SKHYNIXUSDT', 240, -0.0002, null)]) {
+    const missing = calculateExchangeSpread({ ...hynix, right } as never);
+    assert.deepEqual([missing.shortAnnualized, missing.longAnnualized], [null, null], '缺一腿不按 0 算');
+  }
+});
+
 test('缓存：同一交易所 5 秒内共用一次读取、并发只发一次；失败不缓存，下一次立即重读', async () => {
   const { reader, venues, advance, logs } = setup();
   const [a, b] = await Promise.all([reader.quote('hynix', 'gate'), reader.quote('hynix', 'gate')]);
@@ -114,6 +137,26 @@ test('合约目录：60 秒后才重读；重读失败时 10 分钟内沿用旧�
   await reader.quote('oil', 'bybit');
 });
 
+test('合约目录与资金费：HTTP 200 但错误码或缺合约的应答不进缓存，不顶掉旧目录', async () => {
+  let broken = false;
+  const { reader, advance } = setup({
+    fetchWrap: fetch => async (url, init) => {
+      if (broken && (url.includes('/public/instruments') || url.includes('/public/funding-rate'))) return new Response(JSON.stringify({ code: '50011', msg: 'busy', data: [] }), { status: 200 });
+      return fetch(url, init);
+    },
+  });
+  const first = await reader.quote('oil', 'okx');
+  assert.ok(first.left.fundingRate !== null);
+  advance(61_000);
+  broken = true;
+  const kept = await reader.quote('oil', 'okx');
+  assert.equal(kept.exchange, 'okx', '坏目录不覆盖旧目录');
+  assert.deepEqual([kept.left.fundingRate, kept.right.fundingRate], [null, null], '资金费坏应答只缺资金费');
+  broken = false;
+  advance(EXCHANGE_RESULT_TTL_MS);
+  assert.ok((await reader.quote('oil', 'okx')).left.fundingRate !== null, '资金费坏应答没被缓存');
+});
+
 test('Binance：429/418 后整个服务共用冷却，冷却内不发请求；资金费接口失败不影响价格', async () => {
   const { reader, venues, gate, advance, now } = setup();
   venues.oilStatus = 429;
@@ -127,7 +170,9 @@ test('Binance：429/418 后整个服务共用冷却，冷却内不发请求；�
   venues.down.add('funding');
   const quote = await reader.quote('hynix', 'binance');
   assert.equal(quote.exchange, 'binance');
-  assert.ok(quote.left.fundingIntervalHours === null || quote.fundingError, '资金费周期缺失时有说明');
+  assert.deepEqual([quote.left.fundingRate, quote.right.fundingRate, quote.left.fundingIntervalHours], [null, null, null], '周期缺失时两腿都不给费率');
+  assert.ok(quote.fundingError.length > 0);
+  assert.equal(calculateExchangeSpread(quote).shortAnnualized, null, '不按零费率算年化');
 
   advance(EXCHANGE_RESULT_TTL_MS);
   venues.oilStatus = 418;

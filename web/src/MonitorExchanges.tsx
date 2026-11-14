@@ -9,10 +9,10 @@ import { useLiveResource } from './use-live-resource.ts';
 
 // The multi-exchange comparison under the oil and Hynix charts, laid out as the workbench's modules/monitor/app/
 // exchange-comparison.tsx (568a20d) with its hook hooks/use-exchange-quotes.ts (8470785): every exchange is read on its own every 15 s
-// (12 s timeout) from the service, which reads the venue on demand. Changed: times are UTC like the rest of this page; the
+// (20 s timeout: a cold Lighter read is a catalog and a stream snapshot in turn) from the service, which reads the venue on demand. Changed: times are UTC like the rest of this page; the
 // annualized figures are plain text, since the settlement history behind them comes with M-2d; Variational needs a login
 // session and shows as 未接入; the four-leg hedge simulation and the hub summary hand-off are left out.
-const READ_TIMEOUT_MS = 12_000;
+const READ_TIMEOUT_MS = 20_000;
 type RowState = { quote: ExchangeQuote | null; error: string };
 
 const signed = (value: number | null | undefined, digits = 2, suffix = '') => { if (value == null) return '—'; const rounded = Number(value.toFixed(digits)); return `${rounded > 0 ? '+' : rounded < 0 ? '−' : ''}${Math.abs(rounded).toFixed(digits)}${suffix}`; };
@@ -23,7 +23,7 @@ const fundingPriceLabels = { oracle: '预言机价格', index: '指数价格', m
 const age = (fetchedAt: string, now: number) => { const seconds = Math.max(0, Math.round((now - Date.parse(fetchedAt)) / 1000)); return !Number.isFinite(seconds) ? '' : seconds < 60 ? `${seconds} 秒前` : seconds < 3600 ? `${Math.floor(seconds / 60)} 分钟前` : `${Math.floor(seconds / 3600)} 小时前`; };
 const utc = (value: string) => `${date(value, true)} ${new Date(value).toISOString().slice(11, 19)} UTC`;
 const settlement = (leg: ExchangeLeg) => leg.nextFundingAt ? `${utc(leg.nextFundingAt)}${leg.nextFundingEstimated ? '（推算）' : ''}` : '—';
-const readable = (error: Error | null) => !error ? '' : /[一-鿿]/.test(error.message) ? error.message : '本轮更新失败，保留上次数据';
+const readable = (error: Error | null, kept: boolean) => !error ? '' : /[一-鿿]/.test(error.message) ? error.message : kept ? '本轮更新失败，保留上次数据' : '读取失败，稍后自动重试';
 
 export function ExchangeComparison({ market, onExpired }: { market: SpreadMarket; onExpired: () => void }) {
   const [now, setNow] = useState(() => Date.now());
@@ -41,7 +41,7 @@ export function ExchangeComparison({ market, onExpired }: { market: SpreadMarket
   const exchanges = DISPLAY_EXCHANGES[market];
   const rightHeading = oil ? 'WTI' : '正股 ÷ 10';
   return <div className="hub-exchange-comparison"><section className="exchange-comparison" aria-label={`${oil ? '原油' : '海力士'}交易所实时对比`} data-exchange-market={market}>
-    <div className="exchange-heading"><div><h2>交易所实时对比</h2><p>{oil ? '布伦特 − WTI · 资金费按等桶数' : 'ADR − 正股 ÷ 10 · 10 份 ADR 对 1 股正股'}</p></div><div><span>各平台每 15 秒更新</span><button type="button" className="refresh-button" onClick={refresh} disabled={refreshing} aria-label={`刷新${oil ? '原油' : '海力士'}交易所报价`}><RefreshCw size={14} className={refreshing ? 'spinning' : ''} aria-hidden="true" />{refreshing ? '更新中' : '刷新'}</button></div></div>
+    <div className="exchange-heading"><div><h2>交易所实时对比</h2><p>{oil ? '布伦特 − WTI · 资金费按等桶数' : 'ADR − 正股 ÷ 10 · 10 份 ADR 对 1 股正股'}</p></div><div><span>各平台每 15 秒更新 · 结果 5 秒内共用</span><button type="button" className="refresh-button" onClick={refresh} disabled={refreshing} aria-label={`刷新${oil ? '原油' : '海力士'}交易所报价`}><RefreshCw size={14} className={refreshing ? 'spinning' : ''} aria-hidden="true" />{refreshing ? '更新中' : '刷新'}</button></div></div>
     <table className="exchange-table">
       <thead><tr><th>交易所 / 报价口径</th><th>{contracts.leftLabel} / {rightHeading}</th><th>{oil ? '价差 (USDT/桶)' : '价差'}</th>{!oil && <th>ADR 溢价率</th>}<th>做空价差年化</th><th>做多价差年化</th></tr></thead>
       <tbody>{exchanges.map(exchange => supportsExchange(market, exchange)
@@ -69,7 +69,7 @@ function ExchangeRow({ market, exchange, now, onExpired, onReport, onRegister }:
 }) {
   const parse = useCallback((raw: unknown) => validateExchangeQuote(raw, exchange, market), [exchange, market]);
   const live = useLiveResource<ExchangeQuote>(`/api/monitor/${market}/exchanges/${exchange}`, { intervalMs: EXCHANGE_REFRESH_MS, timeoutMs: READ_TIMEOUT_MS, parse, onExpired });
-  const quote = live.data, error = readable(live.error);
+  const quote = live.data, error = readable(live.error, live.data !== null);
   const { refresh } = live;
   useEffect(() => { onRegister(exchange, refresh); return () => onRegister(exchange, null); }, [exchange, refresh, onRegister]);
   useEffect(() => { onReport(exchange, { quote, error }); }, [exchange, quote, error, onReport]);

@@ -32,6 +32,7 @@ export function validateExchangeQuote(input: unknown, exchange: Exchange, monito
 
 export function parseBybitQuote(monitorId: SpreadMarket, instruments: unknown, tickers: unknown, now?: number): ExchangeQuote;
 export function bybitInstruments(response: unknown): Record<string, unknown>[];
+export function checkedReply(exchange: 'okx' | 'bitget', response: unknown, symbol: string): unknown;
 export function parseBinanceQuote(monitorId: SpreadMarket, tickers: unknown, fundingInfo: unknown, now?: number): ExchangeQuote;
 export function binanceOilExchangeQuote(market: OilMarket, stale?: boolean): ExchangeQuote;
 export function parseOkxQuote(monitorId: SpreadMarket, instruments: unknown, marks: unknown, funding: unknown, now?: number): ExchangeQuote;

@@ -2,7 +2,9 @@
 // Binance oil contracts (BZUSDT, CLUSDT) and the Hyperliquid Hynix pair (xyz:SKHY, xyz:SKHX), shared by the monitor tests and
 // scripts/dev-monitor.ts, plus the comparison venues of M-2c (Bybit, OKX, Bitget, Gate, Lighter REST and its market_stats
 // socket, Binance SKHY/SKHYNIX, Hyperliquid xyz oil and Hynix contexts), each a few cents off, and the settled funding of M-2d
-// (Binance BZ/CL every 4 h, Hyperliquid SKHY/SKHX hourly, each a few milliseconds after the grid point). Prices follow slow waves (~95 USD per share, Brent ~74 and WTI ~70 USDT per barrel, SKHX ~230 USD
+// (Binance BZ/CL every 4 h, Hyperliquid SKHY/SKHX hourly, each a few milliseconds after the grid point), and the settlement
+// history of M-2d-3 (Bybit, OKX, Bitget and Gate every 8 h, Binance SKHY/SKHYNIX every 4 h, Lighter and Hyperliquid xyz oil
+// hourly, 70 days back, paged as each venue pages). Prices follow slow waves (~95 USD per share, Brent ~74 and WTI ~70 USDT per barrel, SKHX ~230 USD
 // with the ADR 2–8 % above a tenth of it) so the charts have shape.
 import type { AnthropicLegKey } from '../src/vendor/anthropic-market.mjs';
 
@@ -51,6 +53,15 @@ export function venuePrice(venue: string, base: string, time: number): number {
   const value = base === 'BZ' ? fakeOilPrice('brent', time) : base === 'CL' ? fakeOilPrice('wti', time) : base === 'SKHY' ? fakeHynixPrice('skhy', time) : fakeHynixPrice('skhx', time);
   return Math.round(value * (1 + (VENUE_OFFSET[venue] ?? 0) * (base === 'CL' || base === 'SKHYNIX' ? -1 : 1)) * 1000) / 1000;
 }
+/** Each comparison venue's settlement step in hours, for the settlement-history stand-ins. */
+export const SETTLE_HOURS: Record<string, number> = { hyperliquid: 1, lighter: 1, binance: 4, bybit: 8, okx: 8, bitget: 8, gate: 8 };
+/** A comparison venue's settled rate for a contract base at grid time `time` (8 decimals): the first leg above the second. */
+export function venueSettledRate(venue: string, base: string, time: number): number {
+  const first = base === 'BZ' || base === 'SKHY', hours = SETTLE_HOURS[venue] ?? 8;
+  const wave = (first ? 0.00008 : 0.00002) * hours / 8 + 0.00006 * hours / 8 * Math.sin(time / (3 * DAY) + (VENUE_OFFSET[venue] ?? 0) * 500 + (first ? 0 : 2));
+  return Math.round(wave * 1e8) / 1e8;
+}
+
 function xyzContext(coin: string, time: number) {
   const base = coin === 'xyz:BRENTOIL' ? 'BZ' : coin === 'xyz:CL' ? 'CL' : coin === 'xyz:SKHY' ? 'SKHY' : 'SKHYNIX';
   const price = String(venuePrice('hyperliquid', base, time));
@@ -100,6 +111,8 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
     delayMs: 0,
     /** While set, every request waits for it (or its abort). */
     hold: null as Promise<void> | null,
+    /** Comparison contracts whose settlement history answers HTTP 500, as `${venue}:${base}` ('bybit:CL'). */
+    historyDown: new Set<string>(),
     /** Requests by kind ('quote:binance', 'candles:xyz', ...), and the most of one kind in flight at once. */
     requests: new Map<string, number>(),
     maxInFlight: new Map<string, number>(),
@@ -183,10 +196,38 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
     return fail(404);
   };
   const settle = (hours: number) => Math.ceil((now() + 1) / (hours * HOUR)) * hours * HOUR;
+  /** A contract's settlement times (ms) in [from, to], ascending: the venue's grid from 70 days before the first request. */
+  const settlements = (venue: string, from: number, to: number): number[] => {
+    const step = SETTLE_HOURS[venue]! * HOUR, out: number[] = [];
+    for (let t = Math.max(Math.ceil((start - 70 * DAY) / step) * step, Math.ceil(from / step) * step); t <= Math.min(to, now()); t += step) out.push(t);
+    return out;
+  };
+  /** The settlement-history envelopes of M-2d-3, paged as each venue pages; null when the request is not one. */
+  const history = (venue: string, url: URL, symbol: string, base: string): Response | null => {
+    const q = (name: string) => Number(url.searchParams.get(name));
+    const paths: Record<string, string> = { binance: '/fapi/v1/fundingRate', bybit: '/v5/market/funding/history', okx: '/api/v5/public/funding-rate-history', bitget: '/api/v2/mix/market/history-fund-rate', gate: '/api/v4/futures/usdt/funding_rate', lighter: '/api/v1/fundings' };
+    if (url.pathname !== paths[venue]) return null;
+    if (state.historyDown.has(`${venue}:${base}`)) return fail(500);
+    const rate = (t: number) => venueSettledRate(venue, base, t);
+    switch (venue) {
+      case 'binance': return ok(settlements(venue, q('startTime'), q('endTime')).slice(0, q('limit')).map(t => ({ symbol, fundingTime: t, fundingRate: String(rate(t)), markPrice: '1' })));
+      case 'bybit': return ok({ retCode: 0, result: { category: 'linear', list: settlements(venue, 0, q('endTime')).reverse().slice(0, q('limit')).map(t => ({ symbol, fundingRate: String(rate(t)), fundingRateTimestamp: String(t) })) } });
+      case 'okx': return ok({ code: '0', data: settlements(venue, 0, q('after') - 1).reverse().slice(0, q('limit')).map(t => ({ instId: symbol, instType: 'SWAP', method: 'current_period', fundingRate: String(rate(t)), realizedRate: String(rate(t)), fundingTime: String(t) })) });
+      case 'bitget': { const size = q('pageSize'), page = q('pageNo'); return ok({ code: '00000', data: settlements(venue, 0, now()).reverse().slice((page - 1) * size, page * size).map(t => ({ symbol, fundingRate: String(rate(t)), fundingTime: String(t) })) }); }
+      case 'gate': return ok(settlements(venue, q('from') * 1000, q('to') * 1000 - 1).reverse().slice(0, q('limit')).map(t => ({ t: t / 1000, r: String(rate(t)) })));
+      default: {
+        const id = q('market_id');
+        return ok({ code: 200, fundings: settlements(venue, q('start_timestamp') * 1000, q('end_timestamp') * 1000).map(t => { const value = rate(t); return { timestamp: t / 1000, market_id: id, rate: String(Math.abs(value) * 100), direction: value < 0 ? 'short' : 'long' }; }) });
+      }
+    }
+  };
   /** The comparison venues' official envelopes for one symbol's request. */
   const comparison = (venue: string, url: URL): Response => {
-    const t = now(), symbol = url.searchParams.get('symbol') ?? url.searchParams.get('instId') ?? url.pathname.split('/').at(-1)!;
-    const base = symbol.replace(/(-USDT-SWAP|_USDT|USDT)$/, '');
+    const lighterId = url.searchParams.get('market_id');
+    const t = now(), symbol = url.searchParams.get('symbol') ?? url.searchParams.get('instId') ?? url.searchParams.get('contract') ?? url.pathname.split('/').at(-1)!;
+    const base = lighterId !== null ? (lighterId === '91' ? 'BZ' : 'CL') : symbol.replace(/(-USDT-SWAP|_USDT|USDT)$/, '');
+    const settled = history(venue, url, symbol, base);
+    if (settled) return settled;
     const mark = String(venuePrice(venue, base, t));
     if (venue === 'binance') return ok({ symbol, markPrice: mark, lastFundingRate: '0.00004', nextFundingTime: settle(4), time: t });
     if (venue === 'bybit') {
@@ -250,6 +291,15 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
     if (url.hostname === 'fapi.binance.com') { leg = 'binance'; kind = url.pathname === '/fapi/v1/premiumIndex' ? 'quote' : 'candles'; }
     else if (url.hostname === 'api.hyperliquid.xyz') {
       body = JSON.parse(String(init.body)) as Record<string, any>;
+      if (body.type === 'fundingHistory' && (body.coin === 'xyz:BRENTOIL' || body.coin === 'xyz:CL')) {
+        state.requests.set('exchange:hyperliquid', (state.requests.get('exchange:hyperliquid') ?? 0) + 1);
+        if (state.hold) await held(state.hold, init.signal);
+        if (state.delayMs) await wait(state.delayMs, init.signal);
+        const base = body.coin === 'xyz:CL' ? 'CL' : 'BZ';
+        if (state.exchangeDown.has('hyperliquid') || state.historyDown.has(`hyperliquid:${base}`)) return fail(500);
+        // Hyperliquid answers at most 500 settlements a call, from startTime on.
+        return ok(settlements('hyperliquid', body.startTime, body.endTime).slice(0, 500).map(t => ({ coin: body!.coin, fundingRate: String(venueSettledRate('hyperliquid', base, t)), premium: '0', time: t })));
+      }
       if (body.type === 'allMids' || HYNIX_COINS[body.req?.coin] || (body.type === 'fundingHistory' && HYNIX_COINS[body.coin])) {
         const key = body.type === 'allMids' ? 'quote:hynix' : body.type === 'fundingHistory' ? `settled:${HYNIX_COINS[body.coin]}` : `candles:${HYNIX_COINS[body.req.coin]}`;
         state.requests.set(key, (state.requests.get(key) ?? 0) + 1);

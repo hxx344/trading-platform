@@ -4,10 +4,9 @@
 
 对照的工作台代码：`modules/monitor`（工作台提交 `7745181` 时的内容）。工作台 Monitor 的功能编号 M01–M14 沿用。
 
-## 当前状态（v0.25.0）
+## 当前状态（v0.27.0）
 
-- 已发布：M-1（Anthropic 价差）随 v0.12.0；v0.15.0 起在设置页「从工作台导入」里启用。M-2a（原油价差）随 v0.20.0。M-2b（海力士溢价）随 v0.21.0。M-2c（多交易所对比）随 v0.23.0。M-2d（已结算资金费历史与多空资金费图）随 v0.24.0。M-2e（技术指标）随 v0.25.0。
-- 进行中：M-2（原油价差与海力士行情），剩对比表各交易所的结算历史（M-2d-3），方案见下文《M-2》。
+- 已发布：M-1（Anthropic 价差）随 v0.12.0；v0.15.0 起在设置页「从工作台导入」里启用。M-2a（原油价差）随 v0.20.0。M-2b（海力士溢价）随 v0.21.0。M-2c（多交易所对比）随 v0.23.0。M-2d（已结算资金费历史与多空资金费图）随 v0.24.0。M-2e（技术指标）随 v0.25.0。M-2d-3（对比表各交易所的结算历史）随 v0.27.0，M-2 完成。
 - 未开始：M-3 至 M-6（见下表）。
 - M-1 没做：成交标记、股数从交易中心同步、概览卡片与告警（均线 / 布林带 / Z-score 随 M-2e 补上）。
 
@@ -16,7 +15,7 @@
 | 批次 | 内容 | 风险 | 状态 |
 | --- | --- | --- | --- |
 | M-1 | Anthropic 价差（M03）：Binance、Hyperliquid（xyz:ANT、io:ANTH）、Lighter RH 四条腿的报价与 15 分钟 K 线，每股口径溢价；只读公开接口，无凭据、无告警 | R2 | 完成（Linux CI 通过），随 v0.12.0 发布 |
-| M-2 | 原油价差与海力士行情（M01、M02），分 M-2a–M-2e 五小批（见下文），Var 腿先降级为“未接入” | R2 | M-2a 已发布（v0.20.0），M-2b 已发布（v0.21.0），M-2c 已发布（v0.23.0），M-2d 已发布（v0.24.0），M-2e 已发布（v0.25.0），M-2d-3 未开始 |
+| M-2 | 原油价差与海力士行情（M01、M02），分 M-2a–M-2e 五小批（见下文），Var 腿先降级为“未接入” | R2 | M-2a 已发布（v0.20.0），M-2b 已发布（v0.21.0），M-2c 已发布（v0.23.0），M-2d 已发布（v0.24.0），M-2e 已发布（v0.25.0），M-2d-3 已发布（v0.27.0） |
 | M-3 | 告警规则、飞书通知、监控开关、Var 会话 token（M09–M12） | R3 | 未开始 |
 | M-4 | 永续全市场报价（M04：11 家交易所公共 WS、SSE 增量） | R2 | 未开始 |
 | M-5 | 依赖 M04 的页面（M05–M08） | R2 | 未开始 |
@@ -103,7 +102,7 @@
 | M-2a | 原油价差：Binance BZUSDT / CLUSDT 标记价报价与 15 分钟 K 线、详情页（价差 / 价格对比） | 已发布（v0.20.0） |
 | M-2b | 海力士溢价：Hyperliquid xyz:SKHY（ADR）/ xyz:SKHX（普通股）报价与 1 小时 K 线、详情页（溢价率 / 美元价差 / 价格对比） | 已发布（v0.21.0） |
 | M-2c | 多交易所对比：原油（Hyperliquid、Bybit、Binance、Lighter、OKX、Bitget；Variational 显示“未接入”）与海力士（Hyperliquid、Bybit、Binance、OKX、Bitget、Gate）的同所两腿价差与资金费年化 | 已发布（v0.23.0） |
-| M-2d | 资金费：原油 Binance 已结算资金费（4 小时）与海力士 Hyperliquid 小时资金费历史、多空资金费图 | 已发布（v0.24.0）；对比表各交易所结算历史另成 M-2d-3 |
+| M-2d | 资金费：原油 Binance 已结算资金费（4 小时）与海力士 Hyperliquid 小时资金费历史、多空资金费图 | 已发布（v0.24.0）；对比表各交易所结算历史另成 M-2d-3，已发布（v0.27.0） |
 | M-2e | 技术指标：7 日均线、20 日布林带、Z-score（Anthropic、原油、海力士三个市场一起补） | 已发布（v0.25.0） |
 
 不做：工作台的四腿资金费对冲模拟、成交标记与相关持仓（依赖资产账本的成交，随 Asset 后续批次）、告警（M-3）、工作台的原油日线任务与旧的 Hyperliquid 原油行情。
@@ -310,3 +309,41 @@
 **本批没做**：成交标记、对比表各交易所的结算历史（M-2d-3）、告警（M-3）。
 
 **回滚**：`sudo bash install.sh --version v0.24.0`，不用改配置（只改页面）。
+
+### M-2d-3：对比表各交易所的结算历史
+
+对照：`lib/exchange-funding-history.ts`（`1fdb6e8`）、`lib/exchange-funding-analysis.ts`（`8470785`）、`lib/exchange-funding-cex.ts`（`ee3942c`）、`lib/exchange-funding-service.ts`（`1fdb6e8`）、`app/exchange-funding-history.tsx`（`7896143`）、`app/globals.css`（`77f3cf2`）第 7–10 行。工作台在对比表里点某一家的年化，展开这一家两腿最近 60 天的实际结算；这一批照做。
+
+**做法：按需读取，不后台轮询、不入库**（同工作台）。页面展开某一家时每 5 分钟请求一次服务；服务收到请求才读这一家的两腿历史，结果 5 分钟内各页面共用，同一家同时只有一个读取在途。之后再读时每条腿从上次覆盖终点前 1 天读起（交易所偶尔改写最近的结算），与旧记录合并，60 天窗口之外的记录剪掉。
+
+**接口**：`GET /api/monitor/<oil|hynix>/exchanges/<交易所>/funding-history`，返回 `{exchange, monitorId, currency, fetchedAt, status, reason, left, right, rows}`：`left` / `right` 是两腿的合约、采集时间、错误与实际查询覆盖（`coverage`，读不到时为 `null`），`rows` 是两腿各自的结算（`time, leftRate, rightRate`，同一时刻只有一腿时另一腿为 `null`，不按时间桶配对）。未配置该市场、该市场不支持这家（Variational、海力士的 Lighter、原油的 Gate）时 404；两腿都读不到且没有上次结果时 503（`code: funding_history_unavailable`，`message` 是固定中文原因）。
+
+**各交易所来源**（全部公开接口，不需要密钥）
+
+| 交易所 | 接口 | 翻页 |
+| --- | --- | --- |
+| Binance | `/fapi/v1/fundingRate`（原油同样直接读，不复用采集器的库） | `startTime` 往后，每页 1000 |
+| Bybit | `/v5/market/funding/history` | `endTime` 往前，每页 200 |
+| OKX | `/api/v5/public/funding-rate-history`（取 `realizedRate`） | `after` 往前，每页 400 |
+| Bitget | `/api/v2/mix/market/history-fund-rate` | `pageNo`，每页 100 |
+| Hyperliquid | `info` 的 `fundingHistory` | `startTime` 往后，每页 500，最多 10 页 |
+| Lighter | `/api/v1/fundings`（目录与对比表共用，费率是百分点并带付款方向） | 按 25 天一段 |
+| Gate | `/api/v4/futures/usdt/funding_rate` | `to`（秒）往前，每页 100，最多 32 页 |
+
+CEX 最多 32 页。
+
+**超时、重试与失败**（L039、L093：“查无”必须排除读取不完整）：每个请求 10 秒超时、不重试，整次读取 60 秒截止，服务停止时立即中止。任何一页失败、页数到上限、某页不前进或超出所查范围，这条腿整条算失败，不声明覆盖；交易所返回空页才算“查过，没有结算”。一腿失败时保留这条腿上次的记录与覆盖（覆盖随 60 天窗口收缩），并在这条腿上标错误；两腿都失败时有上次结果就返回它（`status: snapshot`，原因“历史结算费率暂时更新失败，保留上次成功记录。”，15 秒后再试），没有就 503，这个失败同样保留 15 秒（页面每 30 秒重试，不会每次都重读 60 天）。Binance 与采集器共用 429/418 冷却。失败按原因去重记日志，恢复记一次。
+
+**页面**：对比表的做空 / 做多年化变成按钮，点开在表下方显示这一家按该方向的结算历史（再点同一个按钮或点“收起”关闭，焦点回到原按钮）：快捷区间（最近 7 / 30 / 60 天）与自定义开始、结束（UTC，含开始不含结束，最长 60 天）、每条腿的原始费率累计、本方向收付累计与结算次数、覆盖说明（已查询 / 部分覆盖 / 未知）、结算明细表（每页 200 条，翻页）。
+
+### M-2d-3 实施记录（与上文不同或补充的地方）
+
+- **代码**：`src/vendor/exchange-funding-history.mjs`（附 `.d.mts`）复制上面各文件的解析、校验、翻页、合并与区间统计，页面与服务共用；`src/monitor/exchanges.ts` 加 `fundingHistory`（缓存、截止、失败快照与日志）；`src/http.ts` 加接口；`web/src/MonitorFundingHistory.tsx` 是面板，`web/src/MonitorExchanges.tsx` 把年化改成按钮。
+- **与工作台的差别**：不接 Variational（没有 `availability` 字段）、Aster 与 Bitget USDC；时间按 UTC 显示与输入（工作台是北京时间）；合并逻辑抽成 `mergeFundingHistory`；Lighter 目录由读取器注入（与对比表共用 60 秒缓存）；Bitget 的 `productType` 固定 `USDT-FUTURES`；没有进度回调。页面首次读取可能要十几秒（海力士小时结算回补 60 天要翻十几页），所以客户端等 75 秒，没数据且出错时每 30 秒重试。
+- **本地预览**：替身行情为 Binance（海力士）、Bybit、OKX、Bitget、Gate、Lighter、Hyperliquid（原油）加历史结算接口，按各所周期（Hyperliquid、Lighter 1 小时，Binance 4 小时，其余 8 小时）生成，费率按交易所与合约各自一条曲线，可按 `交易所:合约` 设为失败（`historyDown`）。
+- **测试**：新增 `test/monitor-funding-history.test.ts`（11 个：整理超过 200 条不截断与上限 / 冲突 / 非法值、各所解析与信封（OKX 实际费率、Binance Special、Lighter 方向、秒级时间）、快照校验与页面只认本服务支持的交易所、区间统计（UTC 输入、含头不含尾、覆盖说明）、两腿合并（一腿失败保留、窗口收缩、增量起点）、翻页（空历史、超大页、不前进、页数上限、单页失败）、替身上各交易所两腿 60 天、5 分钟缓存与并发去重与增量、一腿 / 两腿失败与快照与恢复日志、停止中止与 Binance 冷却、接口 401 / 404 / 503 / 200）。整次读取 60 秒截止与停止走同一个中止信号，测试只覆盖停止，没有实际等 60 秒。
+- **审查**：记录见 [docs/reviews/2026-11-14-monitor-m2d3.md](reviews/2026-11-14-monitor-m2d3.md)。
+
+**本批没做**：Variational、四腿资金费对冲模拟、告警（M-3）。真实交易所未验证（本机访问 Binance 返回 451）。
+
+**回滚**：`sudo bash install.sh --version v0.26.0`，不用改配置（没有新配置字段、没有新表）。

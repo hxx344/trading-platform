@@ -4,12 +4,18 @@
 // answers with a short Chinese reason. Contract catalogs are kept 60 s and, while a refresh fails, used up to 10 minutes.
 // Oil on Binance comes from the oil collector's quote and Hynix on Hyperliquid from the Hynix collector's mids, so they cost
 // no extra Binance or allMids reads.
+// M-2d-3: one exchange's settled funding history (60 days, both legs), read only while a page has its panel open. A snapshot
+// is shared for 5 minutes; the next read starts a day before each leg's last coverage end, so only the first read pages the
+// whole window. The whole read has a 60 s deadline on top of each request's 10 s timeout, pages are capped per leg, and no
+// request is retried. A leg that fails keeps its previous records and coverage; when both fail the previous snapshot is
+// served for 15 s marked as a snapshot, and without one the read answers with a short Chinese reason. Kept in memory only.
 import {
   LIGHTER_ORIGIN, binanceOilExchangeQuote, bybitInstruments, hyperliquidHynixQuote, hyperliquidOilQuote, parseBinanceQuote, parseBitgetQuote,
   parseBybitQuote, parseGateQuote, checkedReply, parseHyperliquidContexts, parseLighterOilMarkets, parseOkxQuote, readLighterOilSnapshot, supportsExchange,
   EXCHANGE_CONTRACTS, type Exchange, type ExchangeQuote, type HyperliquidContext, type LighterMarket, type SpreadMarket,
 } from '../vendor/exchange-comparison.mjs';
 import type { BinanceGate } from '../vendor/anthropic-market.mjs';
+import { HISTORY_REFRESH_MS, createFundingLegReader, mergeFundingHistory, supportsFundingHistory, type ExchangeFundingHistory } from '../vendor/exchange-funding-history.mjs';
 import type { HynixQuoteView } from './hynix.ts';
 import type { OilQuoteView } from './oil.ts';
 import { boundedReply } from './anthropic.ts';
@@ -17,6 +23,8 @@ import { boundedReply } from './anthropic.ts';
 export type ExchangeFetcher = (url: string, init: RequestInit) => Promise<Response>;
 export const EXCHANGE_RESULT_TTL_MS = 5_000;
 const REQUEST_TIMEOUT_MS = 10_000, CATALOG_TTL_MS = 60_000, CATALOG_RETAIN_MS = 600_000, FUNDING_TTL_MS = 15_000;
+/** The settled-history read: one deadline for all pages of both legs, and how long a kept snapshot answers after a failure. */
+export const FUNDING_HISTORY_DEADLINE_MS = 60_000, FUNDING_HISTORY_SNAPSHOT_MS = 15_000;
 const HYPERLIQUID = 'https://api.hyperliquid.xyz/info';
 
 /** A read that failed with a reason fit for the page. */
@@ -38,10 +46,11 @@ export function exchangeError(error: unknown): string {
   if (value?.name === 'TimeoutError' || value?.name === 'AbortError') return '请求超时';
   // The vendored parsers' own texts (fixed strings, never upstream content).
   if (/^Lighter /.test(message) && /[一-鿿]/.test(message)) return message;
-  if (/Unsupported .* contract|Missing or duplicate|Missing xyz:|Inactive xyz:|合约暂不可用/.test(message)) return '合约不可用或规格已变化';
+  if (/Unsupported .* contract|contract unavailable|Missing or duplicate|Missing xyz:|Inactive xyz:|合约暂不可用/.test(message)) return '合约不可用或规格已变化';
   if (/not synchronized/.test(message)) return '两腿报价时间不同步';
   if (/Delayed or invalid/.test(message)) return '报价时间过旧或无效';
   if (/超过大小上限/.test(message)) return '交易所应答超过大小上限';
+  if (/pagination|page limit|page size|page range|funding page|outside requested|Incomplete Lighter/.test(message)) return '历史分页不完整';
   return '响应无效或网络失败';
 }
 
@@ -62,7 +71,7 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, fetchImpl = f
   async function request(url: string, init: RequestInit = {}): Promise<unknown> {
     const binance = new URL(url).hostname === 'fapi.binance.com';
     if (binance && now() < gate.until) throw new BinanceCooldown(gate.status);
-    const signal = AbortSignal.any([AbortSignal.timeout(REQUEST_TIMEOUT_MS), stopping.signal]);
+    const signal = AbortSignal.any([AbortSignal.timeout(REQUEST_TIMEOUT_MS), stopping.signal, ...init.signal ? [init.signal] : []]);
     const response = boundedReply(await fetchImpl(url, { ...init, cache: 'no-store', signal }));
     if (binance && (response.status === 429 || response.status === 418)) {
       gate.until = Math.max(gate.until, now() + (response.status === 418 ? 120_000 : 60_000)); gate.status = response.status;
@@ -167,8 +176,53 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, fetchImpl = f
     }
   }
 
+  const lighterMarkets = () => retained('lighter/markets', async () => parseLighterOilMarkets(await request(`${LIGHTER_ORIGIN}/api/v1/orderBookDetails`))) as Promise<LighterMarket[]>;
+  // Settled histories by market/exchange: the last good snapshot stays as the base of the next incremental read. `failure`
+  // is why the round behind the entry failed (both legs, or one leg of a live snapshot), for the log. A failure with nothing
+  // to keep is held for the snapshot interval too, so pages retrying every 30 s do not each start a 60-day read.
+  type HistoryEntry = { value: ExchangeFundingHistory; until: number; failure: unknown };
+  const histories = new Map<string, HistoryEntry>(), historyPending = new Map<string, Promise<HistoryEntry>>();
+  const historyFailures = new Map<string, { until: number; error: unknown }>();
+  function readHistory(market: SpreadMarket, exchange: Exchange, key: string): Promise<HistoryEntry> {
+    const previous = histories.get(key);
+    if (previous && now() < previous.until) return Promise.resolve(previous);
+    const held = previous ? undefined : historyFailures.get(key);
+    if (held && now() < held.until) return Promise.reject(held.error);
+    let operation = historyPending.get(key);
+    if (!operation) {
+      const deadline = AbortSignal.timeout(FUNDING_HISTORY_DEADLINE_MS);
+      const legErrors: unknown[] = [];
+      const reader = createFundingLegReader({ request: (url, init = {}) => request(url, { ...init, signal: deadline }), clock: now, lighterMarkets });
+      const readLeg: typeof reader = (...args) => reader(...args).catch(error => { legErrors.push(error); throw error; });
+      operation = mergeFundingHistory({ exchange, monitorId: market, previous: previous?.value ?? null, readLeg, clock: now }).then(value => {
+        const entry = { value, until: now() + HISTORY_REFRESH_MS, failure: legErrors[0] ?? null };
+        histories.set(key, entry);
+        historyFailures.delete(key);
+        return entry;
+      }, error => {
+        if (!previous) {
+          const failure = legErrors[0] ?? error;
+          historyFailures.set(key, { until: now() + FUNDING_HISTORY_SNAPSHOT_MS, error: failure });
+          throw failure;
+        }
+        // The previous snapshot answers for a short while; its records keep their own receipt times.
+        const entry = { value: { ...previous.value, status: 'snapshot' as const, reason: '历史结算费率暂时更新失败，保留上次成功记录。' }, until: now() + FUNDING_HISTORY_SNAPSHOT_MS, failure: legErrors[0] ?? error };
+        histories.set(key, entry);
+        return entry;
+      }).finally(() => historyPending.delete(key));
+      historyPending.set(key, operation);
+    }
+    return operation;
+  }
+
   // Logs each exchange's failure when its reason changes and the recovery once, so a page left open does not log every 15 s.
   const lastFailure = new Map<string, string>();
+  const failed = (key: string, error: unknown): string => {
+    const reason = exchangeError(error);
+    if (lastFailure.get(key) !== reason && !stopping.signal.aborted) log(`交易所对比 ${key} 读取失败：${reason}（${detail(error)}）`);
+    lastFailure.set(key, reason);
+    return reason;
+  };
   return {
     /** One exchange's current comparison row; rejects with an ExchangeReadError carrying the page's reason. */
     async quote(market: SpreadMarket, exchange: Exchange): Promise<ExchangeQuote> {
@@ -179,13 +233,21 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, fetchImpl = f
         if (lastFailure.delete(key)) log(`交易所对比 ${key} 已恢复`);
         return value;
       } catch (error) {
-        const reason = exchangeError(error);
         // The reader's own reasons (a collector without a quote yet) are states, not failures worth a log line.
         if (error instanceof ExchangeReadError) throw error;
-        if (lastFailure.get(key) !== reason && !stopping.signal.aborted) log(`交易所对比 ${key} 读取失败：${reason}（${detail(error)}）`);
-        lastFailure.set(key, reason);
-        throw new ExchangeReadError(reason);
+        throw new ExchangeReadError(failed(key, error));
       }
+    },
+    /** One exchange's settled funding history (M-2d-3); rejects with an ExchangeReadError only when there is nothing to keep. */
+    async fundingHistory(market: SpreadMarket, exchange: Exchange): Promise<ExchangeFundingHistory> {
+      if (!supportsFundingHistory(market, exchange)) throw new ExchangeReadError('不支持的交易所');
+      const key = `${market}/${exchange}/funding-history`;
+      let entry: HistoryEntry;
+      try { entry = await readHistory(market, exchange, key); }
+      catch (error) { throw new ExchangeReadError(failed(key, error)); }
+      if (entry.failure) failed(key, entry.failure);
+      else if (lastFailure.delete(key)) log(`交易所对比 ${key} 已恢复`);
+      return entry.value;
     },
     /** Ends the requests in flight (at stopping). */
     stop(): void { stopping.abort(); },

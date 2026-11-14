@@ -14,7 +14,7 @@
 // credential or the key.
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { closeSync, constants, fstatSync, linkSync, openSync, readSync, rmSync, writeSync, fsyncSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 export const CREDENTIAL_KEY_FILE = 'asset-credential.key';
 const KEY_TEXT = /^[0-9a-f]{64}$/i;
@@ -48,7 +48,12 @@ function createKeyFile(path: string): Buffer {
     writeSync(fd, randomBytes(32).toString('hex') + '\n');
     fsyncSync(fd);
   } finally { closeSync(fd); }
-  try { linkSync(temporary, path); }
+  try {
+    linkSync(temporary, path);
+    // The connections sealed next are committed to the database; the key's directory entry must be durable first.
+    const dir = openSync(dirname(path), constants.O_RDONLY);
+    try { fsyncSync(dir); } finally { closeSync(dir); }
+  }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
   finally { rmSync(temporary, { force: true }); }
   const key = readKeyFile(path);

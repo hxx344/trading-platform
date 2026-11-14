@@ -298,9 +298,16 @@ export async function writeLedgerAsService(dataDir: string, write: LedgerWrite):
   const writer = spawn(process.execPath, [WRITER, 'write', '--owner', write.owner, '--file', write.file, '--data-dir', dataDir], { cwd: '/', env: {}, stdio: ['pipe', 'pipe', 'pipe', 'pipe'], ...identity });
   const writerDone = finished(writer), out = collect(writer, 'stdout', 1024 * 1024), err = collect(writer, 'stderr', 64 * 1024);
   let reader: ChildProcess | null = null, readerDone: ReturnType<typeof finished> | null = null, readerErr: Buffer[] = [];
+  let refusedReader: string | null = null;
   try {
     let stat;
     try { stat = lstatSync(write.ledger); } catch { stat = null; }
+    // The preview's rule again (readWorkbenchLedger): the file may have been swapped since.
+    if (stat?.isFile() && process.getuid?.() === 0 && stat.uid === 0) {
+      let dirUid: number | null = null;
+      try { dirUid = statSync(dirname(write.ledger)).uid; } catch { /* unreadable directory: refused below */ }
+      if (dirUid !== 0) { refusedReader = `${write.ledger} 归 root，但所在目录归其他账户，连接未导入（账本照常导入）；请确认文件来源`; stat = null; }
+    }
     // A ledger that is gone or no longer a plain file gives no connections: the writer reads end of file and says so.
     if (stat?.isFile() && writer.stdin) {
       reader = spawn(process.execPath, ['--input-type=module', '-e', DUMP_CONNECTIONS, '--', write.ledger, write.owner], { cwd: '/', env: {}, stdio: ['ignore', writer.stdin, 'pipe'], ...readerIdentity(stat, process.getuid?.()) });
@@ -318,6 +325,7 @@ export async function writeLedgerAsService(dataDir: string, write: LedgerWrite):
     try { answer = JSON.parse(Buffer.concat(out).toString('utf8')) as typeof answer; } catch { throw fail(`输出无法解析${as}`); }
     if (!answer?.info) throw new Error('写入资产账本后没有拿到导入记录，请在资产页核对');
     const report: ConnectionImport = answer.connections ?? { imported: [], skipped: [], problem: null };
+    if (refusedReader) report.problem = refusedReader;
     if (readResult && (readResult.error || readResult.code !== 0) && !report.imported.length)
       report.problem = `读取工作台的连接失败，连接未导入（账本照常导入），请在资产页重新连接：${printable(readResult.error?.message ?? (firstLine(readerErr) || `退出码 ${readResult.code ?? readResult.signal}`)).slice(0, 200)}`;
     return { ...lastOf(answer.info), connections: report };

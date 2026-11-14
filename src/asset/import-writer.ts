@@ -64,7 +64,7 @@ const READER_PROBLEMS: Record<string, string> = {
   invalid: '工作台资产模块的 config.json 没有有效的 credentialKey（64 位十六进制），连接未导入（账本照常导入），请在资产页重新连接',
   read: '读取工作台的连接表失败，连接未导入（账本照常导入），请在资产页重新连接',
 };
-const SKIP_REASONS: Record<string, string> = { decrypt: '无法用工作台密钥解密（密钥换过或数据损坏）', name: '连接名不是工作台写的', invalid: '凭据格式不符合连接接口的要求' };
+const SKIP_REASONS: Record<string, string> = { decrypt: '无法用工作台密钥解密（密钥换过或数据损坏）', name: '连接名不是工作台写的', invalid: '凭据格式不符合连接接口的要求', orphan: '账本里没有对应的 Aster 账号（页面上无法管理）' };
 const shownName = (value: unknown): string => typeof value === 'string' ? value.replace(/[^0-9A-Za-z:_-]/g, '').slice(0, 48) : '';
 
 /**
@@ -85,9 +85,16 @@ export function sealConnections(dataDir: string, ledger: PreparedLedger, text: s
   if (Array.isArray(dumped.skipped)) for (const item of dumped.skipped as { exchange?: unknown }[]) report.skipped.push({ exchange: shownName(item?.exchange), reason: SKIP_REASONS.decrypt! });
   const accepted: { name: string; credential: Credentials }[] = [];
   const seen = new Set<string>();
+  // An `aster:<id>` connection without its account would be invisible on the page and block that wallet from being added again.
+  const asterIds = new Set<string>();
+  try {
+    const saved = JSON.parse(ledger.settings.find(row => row.key === 'aster-accounts')?.value ?? '[]') as unknown;
+    if (Array.isArray(saved)) for (const account of saved) if (typeof account?.id === 'string') asterIds.add(account.id);
+  } catch { /* prepareLedger checked the settings; an unreadable list keeps no Aster account connection. */ }
   for (const item of Array.isArray(dumped.connections) ? dumped.connections as { exchange?: unknown; credential?: unknown }[] : []) {
     const name = item?.exchange, exchange = connectionExchange(name);
     if (!exchange || seen.has(name as string)) { report.skipped.push({ exchange: shownName(name), reason: SKIP_REASONS.name! }); continue; }
+    if ((name as string).startsWith('aster:') && !asterIds.has((name as string).slice('aster:'.length))) { report.skipped.push({ exchange: shownName(name), reason: SKIP_REASONS.orphan! }); continue; }
     const stored = item.credential;
     try {
       if (!stored || typeof stored !== 'object' || Array.isArray(stored)) throw new AssetInputError('credential');

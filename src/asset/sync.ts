@@ -10,7 +10,8 @@
 // - the credentials are sealed with this data directory's key (credentials.ts), the additional data being the
 //   connection name alone;
 // - the reads (exchanges, quotes, the yuan rate) come from an injected AssetSources (the copied src/asset/sources/*
-//   functions with an injected fetch by default); each request times out after 12 s and is not retried
+//   functions with an injected fetch by default); each request times out after 12 s (Variational's python read 20 s,
+//   23 s in all) and is not retried
 //   (sources/http.ts); a failed read marks that row "同步失败 · 保留旧值" and its `<exchange>-status` error, the next
 //   sync (the page asks every 60 s while open) reads again;
 // - the timestamps come from the injected clock;

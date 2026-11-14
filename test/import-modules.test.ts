@@ -179,14 +179,17 @@ test('资产账本写入：工作台连接由属主解密后直交写入进程�
     // Sealed for another user: does not open with this user's additional data.
     add('okx', await workbenchSeal({ exchange: 'okx', apiKey: 'okx-key-0001', apiSecret: 'okx-secret-0001', passphrase: 'pass' }, `${OTHER_OWNER}:okx`, WB_KEY));
     add('mystery', await workbenchSeal({ apiKey: 'x' }, `${OWNER}:mystery`, WB_KEY));
+    // A valid Aster connection whose account is not in the ledger: skipped, it could not be managed on the page.
+    const ORPHAN = '9e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b';
+    add(`aster:${ORPHAN}`, await workbenchSeal({ ...aster, walletAddress: '0x' + 'ab'.repeat(20) }, `${OWNER}:aster:${ORPHAN}`, WB_KEY));
     db.prepare("UPDATE settings SET value = ? WHERE owner = ? AND key = 'aster-accounts'").run(JSON.stringify([{ id: ACCOUNT, name: '主号', value: 6_200, details: [], updatedAt: new Date(NOW).toISOString(), includeSpot: true, configured: true, lastSync: null, error: null, scope: 'API Pro · 合约 + 现货', walletAddress: aster.walletAddress, label: 'e5f6' }]), OWNER);
     db.close();
 
     // The preview names the connections only.
     const source = readWorkbenchAsset(w.wb, w.svc);
     const owner = source.owners.find(item => item.owner === OWNER)!;
-    assert.deepEqual(owner.connections, [`aster:${ACCOUNT}`, 'binance', 'bybit', 'mystery', 'okx']);
-    assert.match(owner.detail, /连接 5 个（aster:3f2a1b0c-9d8e-4f7a-8b6c-5d4e3f2a1b0c、binance、bybit、mystery、okx）/);
+    assert.deepEqual(owner.connections, [`aster:${ACCOUNT}`, `aster:${ORPHAN}`, 'binance', 'bybit', 'mystery', 'okx']);
+    assert.match(owner.detail, /连接 6 个（aster:3f2a1b0c-9d8e-4f7a-8b6c-5d4e3f2a1b0c、aster:9e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b、binance、bybit、mystery、okx）/);
     assert.equal(source.connectionProblem, null);
     const notes: string[] = [];
     const plan = planAsset(source, { pairs: [] }, fits, OWNER, notes);
@@ -197,7 +200,8 @@ test('资产账本写入：工作台连接由属主解密后直交写入进程�
 
     const last = await writeLedgerAsService(w.svc, plan.write!);
     assert.deepEqual(last.connections.imported, ['aster:3f2a1b0c-9d8e-4f7a-8b6c-5d4e3f2a1b0c', 'binance']);
-    assert.deepEqual(last.connections.skipped.map(item => item.exchange).sort(), ['bybit', 'mystery', 'okx']);
+    assert.deepEqual(last.connections.skipped.map(item => item.exchange).sort(), [`aster:${ORPHAN}`, 'bybit', 'mystery', 'okx']);
+    assert.match(last.connections.skipped.find(item => item.exchange === `aster:${ORPHAN}`)!.reason, /没有对应的 Aster 账号/);
     assert.equal(last.connections.problem, null);
     const report = JSON.stringify(last);
     for (const secret of [binance.apiSecret, binance.apiKey, aster.privateKey, aster.walletAddress]) assert.ok(!report.includes(secret), '结果不带凭据');

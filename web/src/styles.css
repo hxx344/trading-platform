@@ -240,6 +240,7 @@ table.data.history{min-width:0}
 /* The options page's fixed notice (options.css, z-index 20) comes later in the DOM and would cover the open drawer. */
 /* The element selectors outrank shell.css's own z-index rules, which load later. */
 @media(max-width:760px){.app-shell>aside.sidebar{z-index:22}.app-shell>button.nav-backdrop{z-index:21}}
-/* The monitor page's breakpoints count the whole window; beside the 212px side navigation its 700px wrap of the detail
-   toolbar (monitor.css) is needed up to 912px, or the refresh area runs past the edge. */
-@media(min-width:761px) and (max-width:912px){.monitor-desk .page-heading{flex-wrap:wrap}.monitor-desk [data-monitor="anthropic"] .detail-toolbar{flex-wrap:wrap}.monitor-desk [data-monitor="anthropic"] .refresh-area{flex:1 1 100%;flex-wrap:wrap}}
+/* The monitor page's breakpoints count the whole window; beside the 212px side navigation the detail toolbar's refresh area
+   needs to shrink into the rest of the row and wrap inside (as monitor.css lets it below 700px) up to 912px, or it runs past
+   the edge. The toolbar itself does not wrap (monitor.css keeps .detail-toolbar nowrap inside .site-shell). */
+@media(min-width:761px) and (max-width:912px){.monitor-desk .site-shell .refresh-area{flex:1 1 auto;flex-wrap:wrap;justify-content:flex-end}}

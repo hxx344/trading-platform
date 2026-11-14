@@ -1,9 +1,9 @@
 import { Activity, ArrowDownRight, ArrowUpRight, ChevronDown, Clock3, Info, MoveRight, RefreshCw } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { oilSpread } from '../../src/vendor/oil-market.mjs';
+import { OIL_CANDLE_MS, oilSpread } from '../../src/vendor/oil-market.mjs';
 import { ApiError } from './api.ts';
 import { SpreadChart, date, stamp } from './MonitorChart.tsx';
-import { dailyPoints, ranges, selectRange, type ChartMode, type Point } from './monitor-history.ts';
+import { dailyPoints, rangeGaps, ranges, selectRange, type ChartMode, type Point } from './monitor-history.ts';
 import { OIL_SPREAD_CHART, OIL_WARMUP_DAYS, coversOilRange, oilHistory, oilQuote, type OilHistory, type OilQuote } from './monitor-oil.ts';
 import { ExchangeComparison } from './MonitorExchanges.tsx';
 import { OilFundingPanel } from './MonitorFunding.tsx';
@@ -11,7 +11,7 @@ import { useLiveResource } from './use-live-resource.ts';
 
 // The oil spread on the monitor page, laid out as the workbench's modules/monitor/app/oil-panel.tsx (9c652bc) inside the
 // hub, where its top bar is hidden; the exchange comparison (M-2c) sits under the chart, the settled funding (M-2d) under
-// it, sharing the chart's range. Left out: the indicators (M-2e), the fills and the hub summary card. The service collects; the page reads what it saved.
+// it, sharing the chart's range. Left out: the fills and the hub summary card. The service collects; the page reads what it saved.
 const QUOTE_PATH = '/api/monitor/oil/quote', CANDLE_PATH = '/api/monitor/oil/candles';
 const QUOTE_MS = 10_000, CANDLE_MS = 60_000, READ_TIMEOUT_MS = 10_000;
 // The complete history is up to 400 days of 15-minute rows, a few megabytes.
@@ -60,7 +60,8 @@ export function OilPanel({ onExpired }: { onExpired: () => void }) {
   // Current metrics always come from the live quote, never from the last candle close.
   const spread = quote ? oilSpread(quote.brent.markPx, quote.wti.markPx) : null;
   const direction = spread === null || spread >= 0 ? 'positive' : 'negative';
-  const missing = data?.metadata.missingObservationRows ?? 0;
+  // Counted on the bars the range shows: a windowed read's metadata also counts the indicator warmup before it.
+  const missing = useMemo(() => rangeGaps(points, OIL_CANDLE_MS).missing, [points]);
   const historyPending = data === null && !historyFailed;
   return <>
     <div className="page-heading detail-toolbar"><div className="toolbar-identity"><div className="eyebrow">BRENT / WTI <span>/</span> BZUSDT · CLUSDT</div><h1>原油价差<span className="small-tag">4 月 1 日以来</span></h1><p>布伦特 − WTI · Binance 永续合约 15 分钟 K 线</p></div><div className="refresh-area"><button type="button" className="refresh-button" onClick={refresh} disabled={loading}><RefreshCw size={15} className={loading ? 'spinning' : ''} aria-hidden="true" />{loading ? '加载行情' : '刷新行情'}</button><span>每 10 秒自动刷新</span></div></div>

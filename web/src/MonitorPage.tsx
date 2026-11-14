@@ -12,7 +12,7 @@ import './monitor.css';
 
 // The market monitor page, laid out as the workbench's Anthropic detail (modules/monitor/app/anthropic-panel.tsx and
 // spread-chart.tsx, styles copied in monitor.css) as it shows inside the workbench hub, where the top bar is hidden. Left
-// out: the fills on the chart, the indicators, the shares synced from the trading centre (the service's config gives them).
+// out: the fills on the chart, the shares synced from the trading centre (the service's config gives them).
 // Every read goes through useLiveResource; the service collects in the background, the page only reads what it saved.
 export const MONITOR_STATE_PATH = '/api/monitor/state';
 export const MONITOR_READ_TIMEOUT_MS = 10_000;

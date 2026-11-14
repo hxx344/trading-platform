@@ -307,3 +307,13 @@
 **验证**：`scripts/dev-monitor.ts` 替身行情下 1280 与 390 宽度，原油、海力士面板读数、覆盖说明、区间切换（1 周 / 1 月）、曲线切换、等名义口径、悬停提示与展开说明正常，海力士分段回补中（已到 09-08）的状态行与可点的刷新按钮正常，无横向溢出，控制台只有未配置模块的入口探测 404。
 
 **回滚**：`sudo bash install.sh --version v0.23.0`，不用改配置。
+
+## 行情监控页：技术指标（Monitor M-2e，v0.25.0）
+
+**对照的工作台页面**：`modules/monitor/app/spread-chart.tsx`（提交 `4be9aa4`）的指标部分，计算复制自 `lib/indicators.ts`（`8bc3bee`，在 `src/vendor/indicators.mjs`）。样式复制自 `app/globals.css`（`77f3cf2`）第 31、33–34、196–197、247、286–290 行的指标规则，全部加 `.monitor-desk` 前缀，追加在 `web/src/monitor.css` 末尾。
+
+**页面**：共用的 `web/src/MonitorChart.tsx` 在溢价率 / 价差标签下加技术指标开关（7 日均线、布林带 · 20 日、Z-score · 20 日）、最新读数与 Z-score 状态、主图的布林带与均线图层、悬停提示里的指标值、Z-score 小图（与主图同步悬停）和可展开的“指标怎么看”；价格标签不显示。指标先在读到的全部 K 线（所选范围加 21 天）上计算再截取范围。开关存 `localStorage` 的 `monitor:chart:<anthropic|oil|hynix>:v1`（读写包在 try/catch 里，读不到按默认全开），图表标签仍是页面状态。原油与海力士的缺口提示改为只数所选范围内的 K 线（`rangeGaps`）。
+
+**验证**：见 [docs/reviews/2026-11-14-monitor-m2e.md](reviews/2026-11-14-monitor-m2e.md) 的浏览器验收一节。
+
+**回滚**：`sudo bash install.sh --version v0.24.0`，不用改配置。

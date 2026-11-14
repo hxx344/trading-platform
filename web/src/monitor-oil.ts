@@ -1,6 +1,6 @@
 // The oil page's data rules, copied from the project-aggregation workbench (modules/monitor): oilHistory and coversOilRange
 // from lib/oil-history.ts (89f26e5; retainOilHistory left out, the page keeps the last read as useLiveResource gives it),
-// OIL_SPREAD_CHART from lib/oil-chart-config.ts (89f26e5, without the indicator periods and the fills). The quote is the
+// OIL_SPREAD_CHART from lib/oil-chart-config.ts (35ebb94, without the fills). The quote is the
 // service's validated Binance market plus whether the service still counts it as current.
 import { OIL_CANDLE_MS, validateIntradaySnapshot, validateMarket, validatedIntradayChartRows, type OilIntradayMetadata, type OilMarket } from '../../src/vendor/oil-market.mjs';
 import type { Point, SpreadChartConfig } from './monitor-history.ts';
@@ -9,6 +9,7 @@ import type { Point, SpreadChartConfig } from './monitor-history.ts';
 export const OIL_BANDS_DAYS = 20;
 /** Days read before a selected range so its first bar has the full indicator window, plus one day of margin. */
 export const OIL_WARMUP_DAYS = OIL_BANDS_DAYS + 1;
+const OIL_BARS_PER_DAY = 86_400_000 / OIL_CANDLE_MS;
 
 /** `lastError`: why the service's latest read failed, null when it succeeded. */
 export type OilQuote = OilMarket & { status: 'live' | 'snapshot'; lastError: string | null };
@@ -53,8 +54,8 @@ export const coversOilRange = (history: OilHistory, range: number | null) =>
 const usdt = (v: number) => `${v.toFixed(3)} USDT`;
 /** Brent (`adr`) against WTI (`equivalent`) on completed 15-minute Binance candles. */
 export const OIL_SPREAD_CHART: SpreadChartConfig = {
-  intervalMs: OIL_CANDLE_MS, kicker: 'SPREAD MONITOR', bar: '15 分钟',
-  span: count => `${(count / 4).toLocaleString()} 小时`, checkCadence: '每分钟检查更新',
+  intervalMs: OIL_CANDLE_MS, periods: { sma: 7 * OIL_BARS_PER_DAY, bands: OIL_BANDS_DAYS * OIL_BARS_PER_DAY }, preferenceKey: 'monitor:chart:oil:v1',
+  kicker: 'SPREAD MONITOR', bar: '15 分钟', span: count => `${(count / 4).toLocaleString()} 小时`, bars: count => `${count.toLocaleString()} 根连续 15 分钟 K 线`, checkCadence: '每分钟检查更新',
   // Oil charts only the absolute Brent − WTI spread; there is no percentage tab.
   modes: ['spread', 'price'], tabs: { spread: '价差', price: '价格对比' }, units: { spread: 'USDT / 桶 · 布伦特 − WTI', price: 'USDT / 桶' },
   spreadName: '价差', legs: ['布伦特', 'WTI'], zeroLabel: '0 = 同价', domainStep: 1, digits: 3, price: usdt,

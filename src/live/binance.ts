@@ -314,7 +314,7 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
           const kind = type === null ? undefined : INCOME_KINDS[type];
           if (!kind) throw new ShapeError(`账单类型 ${type ?? '无效'} 无法归类，暂不计入`);
           if (row.asset !== 'USDT') throw new ShapeError(`账单币种 ${typeof row.asset === 'string' ? row.asset.slice(0, 12) : '无效'} 不是 USDT（例如 BNB 抵扣手续费），无法计入`);
-          const entry: LedgerEntry = { id: `${type}:${identifier(row.tranId, '账单编号')}`, time, symbol, kind, amount: amount(row.income, '账单金额', 'any') };
+          const entry: LedgerEntry = { id: `${symbol}:${type}:${identifier(row.tranId, '账单编号')}`, time, symbol, kind, amount: amount(row.income, '账单金额', 'any') };
           const previous = entries.get(entry.id);
           if (previous && (previous.time !== entry.time || cmp(previous.amount, entry.amount) !== 0)) throw new ShapeError('同一账单编号出现不同内容');
           entries.set(entry.id, entry);

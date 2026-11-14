@@ -389,7 +389,7 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
           }
           const next = result.nextPageCursor;
           if (next === undefined || next === null || next === '') cursor = '';
-          else if (typeof next !== 'string' || next.length > 2000 || /[\r\n\0]/.test(next) || rows.length === 0 || cursors.has(next)) throw new ShapeError('账单分页游标无效或重复');
+          else if (typeof next !== 'string' || next.length > 2000 || /[\r\n\0]/.test(next) || cursors.has(next)) throw new ShapeError('账单分页游标无效或重复');
           else { cursors.add(next); cursor = next; }
         } while (cursor);
       }

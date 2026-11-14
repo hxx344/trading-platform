@@ -248,13 +248,17 @@
   - Binance：`/fapi/v1/income`（统一账户 `/papi/v1/um/income`），`FUNDING_FEE` 记资金费，`REALIZED_PNL` 记平仓盈亏，`COMMISSION`、`INSURANCE_CLEAR`、`COMMISSION_REBATE`、`API_REBATE` 记手续费；其他类型与非 USDT 币种（如 BNB 抵扣手续费）整窗读取失败，不悄悄漏记。满一页（1000 条）时把时间窗从中点（两半共用中点）对半重读、同一条只记一次，最多 64 次请求；2 毫秒内仍满页按读取失败（L093）。
   - Bybit：`/v5/account/transaction-log`（统一账户、`linear`、`baseCoin` BZ 或 CL、`currency` USDT），每段不超过 7 天、游标翻页最多 200 页；类型限 `SETTLEMENT`、`TRADE`、`LIQUIDATION`、`ADL`。一条拆成平仓盈亏 `cashFlow`、资金费 `funding`、手续费 `−fee` 三类（零额不记），并核对 `change = cashFlow + funding − fee`，对不上整窗读取失败。
 - **累计口径**：每个采样点把各账户的账单从区间起点累计到该账户自己的读取时刻（不含该时刻），所以两次读取之间成交的那笔不会既算平仓盈亏又算浮盈亏。采样时刻晚于任一账户的账单同步截止点时，该点只有浮盈亏、没有总盈亏；页面在 15 分钟内退回最近一个完整点并标出它的时刻（照工作台）。
-- **区间**：近 1 / 7 / 30 / 90 天；累计起点取区间起点与账单最早同步起点中较晚的一个（首次回溯 30 天，所以 90 天区间在运行满 60 天前从账单起点算），页面写明。采样间隔超过 2.5 分钟处断线；长区间按桶保留首尾与峰谷，最多约 1200 点。
-- **接口**：`GET /api/oil/pnl?range=1d|7d|30d|90d&page=N`，区间或页码无效 400，未配置原油 404；盈亏库打不开时回 `{ available: false, error }`，下单、任务与规则照常。账单流水按时间倒序每页 50 条。结果按区间、页码、分钟与数据版本缓存，有新采样或新账单时失效。
+- **区间**：近 1 / 7 / 30 / 90 天；累计起点取区间起点与账单最早同步起点中较晚的一个（首次回溯 30 天，所以 90 天区间在运行满 60 天前从账单起点算），页面写明。采样间隔超过 2.5 分钟处断线；长区间按桶保留首尾与峰谷（按近似值挑点，挑中的点再精确累计），最多约 1200 点。
+- **接口**：`GET /api/oil/pnl?range=1d|7d|30d|90d&page=N`，区间或页码无效 400，未配置原油 404；盈亏库打不开时回 `{ available: false, error }`，下单、任务与规则照常。账单流水按时间倒序每页 50 条。结果按区间、页码、分钟与数据版本缓存，有新采样、持仓读取结果变化或新账单时失效。
+- **计算方式**：服务启动时把保留期内的采样载入内存（92 天约 13 万点，载入约 1.5 秒），每个账户的账单按时间排好并记各类累计和；新采样只追加一点，有新账单入库时才整体重算。读一次 90 天约 50–60 毫秒（13 万点、两个账户的模拟数据实测），不再逐行解析整张采样表。
+- **已知限制**：
+  - 读取时刻取响应到达的时刻；同一毫秒内的成交与持仓读取可能各算一次，曲线上出现单点尖刺，下一个采样恢复。
+  - 同一编号内容冲突、或某一窗在 30 秒内始终读不完时，该合约的截止点停住且没有自动恢复：页面一直显示原因，曲线该点后没有总盈亏。前者核对交易所账单后，可删除 `oil-pnl.sqlite` 重新回溯；后者暂无手动办法，后续可改为读超时时自动把时间窗对半。
 
 ### 9.2 改动范围
 
 - `src/connector.ts`：选填 `pnlPositions`、`ledger` 两个只读方法及类型。`src/live/binance.ts`、`src/live/bybit.ts` 实现；`src/live/values.ts` 加不经浮点解析科学计数法金额的 `cashAmount`；`src/sim-venue.ts` 按 5 个基点记手续费、平仓按平均开仓价记平仓盈亏，并可注入资金费。
-- `src/oil/pnl.ts`（新）：`oil-pnl.sqlite`（WAL，`user_version` 1；表 `ledger`、`ledger_sync`、`samples`）、采样、账单同步、读取与缓存。
+- `src/oil/pnl.ts`（新）：`oil-pnl.sqlite`（WAL，`user_version` 1；表 `ledger`、`ledger_sync`、`samples`）、采样、账单同步、内存中的采样序列与账单累计和、读取与缓存。
 - `src/service/oil.ts`、`src/service/main.ts`、`src/http.ts`：打开盈亏库、两个循环、接口。
 - 原油页：`web/src/OilPnl.tsx`（新），曲线照工作台 `TradingPnlChart.tsx`，样式照工作台 `src/trading.css`（a12e583）追加到 `web/src/trading.css`。
 

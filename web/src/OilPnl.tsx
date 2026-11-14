@@ -102,7 +102,13 @@ export function OilPnl({ onExpired }: { onExpired: () => void }) {
   const live = useLiveResource<OilPnlView | OilPnlUnavailable>(`/api/oil/pnl?range=${range}&page=${page}`, { intervalMs: PNL_MS, timeoutMs: READ_TIMEOUT_MS, onExpired });
   // The last answer of any range or page stays on screen until the chosen one arrives.
   const [shown, setShown] = useState<OilPnlView | OilPnlUnavailable | null>(null);
-  useEffect(() => { if (live.data) setShown(live.data); }, [live.data]);
+  useEffect(() => {
+    const value = live.data;
+    if (!value) return;
+    setShown(value);
+    // The ledger shrank under the page asked for (the range moved on): follow the server to its last page instead of waiting forever.
+    if (!('available' in value) && value.range === range && page >= value.entries.pages) setPage(value.entries.pages - 1);
+  }, [live.data, range, page]);
   if (!shown) return live.status === 'error' || live.status === 'offline'
     ? <StatePanel kind="error" title="读取原油盈亏失败" detail={live.error?.message ?? '网络离线'} />
     : <StatePanel kind="loading" title="加载盈亏…" />;

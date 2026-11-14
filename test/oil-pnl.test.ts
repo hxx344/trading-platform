@@ -37,7 +37,7 @@ test('Binance 盈亏读取：持仓带开仓均价、标记价与浮盈亏，零
   ]));
   const entries = await connector.ledger!(fb.binding(), 'CLUSDT', { from, to }, { signal: fb.signal() });
   assert.deepEqual(entries.map(entry => [entry.id, entry.kind, entry.amount, entry.time]), [
-    ['REALIZED_PNL:7', 'realized', '5', from], ['FUNDING_FEE:9007199254740993', 'funding', '-0.12', fb.NOW - 1000], ['COMMISSION:7', 'fee', '-0.3', to]]);
+    ['CLUSDT:REALIZED_PNL:7', 'realized', '5', from], ['CLUSDT:FUNDING_FEE:9007199254740993', 'funding', '-0.12', fb.NOW - 1000], ['CLUSDT:COMMISSION:7', 'fee', '-0.3', to]]);
   const call = venue.calls.at(-1)!;
   assert.deepEqual([call.params.get('symbol'), call.params.get('startTime'), call.params.get('endTime'), call.params.get('limit')], ['CLUSDT', String(from), String(to), '1000']);
 
@@ -47,7 +47,7 @@ test('Binance 盈亏读取：持仓带开仓均价、标记价与浮盈亏，零
   const before = venue.count('GET /fapi/v1/income');
   const split = await connector.ledger!(fb.binding(), 'CLUSDT', { from, to }, { signal: fb.signal() });
   assert.equal(venue.count('GET /fapi/v1/income') - before, 3);
-  assert.deepEqual(split.map(entry => entry.id), ['FUNDING_FEE:1', 'FUNDING_FEE:2']);
+  assert.deepEqual(split.map(entry => entry.id), ['CLUSDT:FUNDING_FEE:1', 'CLUSDT:FUNDING_FEE:2']);
   const halves = venue.calls.slice(-2).map(item => [item.params.get('startTime'), item.params.get('endTime')]);
   assert.deepEqual(halves, [[String(from), String(from + 5000)], [String(from + 5000), String(to)]]);
 
@@ -90,6 +90,9 @@ test('Bybit 盈亏读取：持仓带均价、标记价与浮盈亏；交易日�
   }
   venue.script('GET /v5/account/transaction-log', () => fy.ok({ list: [logRow()], nextPageCursor: 'loop' }), () => fy.ok({ list: [logRow()], nextPageCursor: 'loop' }));
   await assert.rejects(connector.ledger!(fy.binding(), 'CLUSDT', { from: to - 10_000, to }, { signal: fy.signal() }), fy.kind('read-failed'));
+  // An empty page that still carries a new cursor goes on to the next page; only a repeated cursor fails.
+  venue.script('GET /v5/account/transaction-log', () => fy.ok({ list: [], nextPageCursor: 'p2' }), () => fy.ok({ list: [logRow()], nextPageCursor: '' }));
+  assert.deepEqual((await connector.ledger!(fy.binding(), 'CLUSDT', { from: to - 10_000, to }, { signal: fy.signal() })).map(entry => entry.id), ['592324_XRPUSDT_161440249321:funding']);
 });
 
 // ---- the store, against scripted connectors ----
@@ -255,6 +258,28 @@ test('模拟交易所：每笔成交按 5 个基点记手续费，平仓按平�
     await pnl.syncLedgers();
     const view = pnl.read({ range: '1d' }) as View;
     assert.equal(view.latest!.totalPnl, '1.86448');
+    pnl.close();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('原油盈亏库：采样里的持仓读取时刻按账户记，调换配置中账户的顺序后每个账户仍按自己的读取时刻累计账单', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oil-pnl-')), clock = { now: T0 };
+  const a = scripted('binance', clock), b = scripted('bybit', clock), file = join(dir, 'oil-pnl.sqlite');
+  const open = (accounts: AccountBinding[]) => createOilPnl({ file, connectors: [a.connector, b.connector], accounts, now: () => clock.now });
+  try {
+    // Binance read 20 s before Bybit: Binance's row 10 s before the sample is after its own read and not counted; Bybit's is.
+    a.state.readAt = now => now - 20_000;
+    a.state.ledger = [entry('y', T0 + MINUTE - 10_000, 'funding', '10')];
+    b.state.ledger = [entry('x', T0 + MINUTE - 10_000, 'funding', '1')];
+    let pnl = open([accountOf('binance'), accountOf('bybit')]);
+    await pnl.syncLedgers();
+    clock.now = T0 + MINUTE; await pnl.sample();
+    clock.now = T0 + 2 * MINUTE; await pnl.syncLedgers();
+    const total = (view: View) => view.points.filter(point => point.totalPnl !== null).map(point => Number(point.totalPnl));
+    assert.deepEqual(total(pnl.read({ range: '1d' }) as View), [1]);
+    pnl.close();
+    pnl = open([accountOf('bybit'), accountOf('binance')]);
+    assert.deepEqual(total(pnl.read({ range: '1d' }) as View), [1]);
     pnl.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

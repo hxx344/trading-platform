@@ -9,6 +9,9 @@ import { createHynixMonitor, type HynixMonitor } from '../monitor/hynix.ts';
 import { createOilMonitor, type OilMonitor } from '../monitor/oil.ts';
 import { createMonitorControl, type MonitorControl } from '../monitor/control.ts';
 import { MONITOR_FILE, createMonitorStore, type MonitorStore } from '../monitor/store.ts';
+import { createVariationalSession, type VariationalSession } from '../monitor/variational-session.ts';
+import { createVariationalFetch } from '../monitor/variational-transport.ts';
+import type { VariationalFetcher } from '../vendor/variational-market.mjs';
 import { createBinanceGate, type AnthropicFetcher } from '../vendor/anthropic-market.mjs';
 import type { Exchange } from '../vendor/exchange-comparison.mjs';
 import { monitorMarkets, type MonitorConfig, type MonitorMarket } from './monitor-config.ts';
@@ -21,18 +24,25 @@ export interface MonitorRuntime {
   alerts: Partial<Record<AlertMarket, AlertService>>;
   /** M-3c: each configured market's run switch. */
   control: MonitorControl;
+  /** M-3d: the Variational token the page saves; present when oil runs. */
+  variational: VariationalSession | null;
 }
 
 /** Opens monitor.sqlite and reads the saved history back; throws when the file cannot be opened. */
-export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now, log, WebSocketImpl, alertHooks }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void; WebSocketImpl?: typeof WebSocket; alertHooks?: AlertHooks } = {}): MonitorRuntime {
+export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now, log, WebSocketImpl, alertHooks, variationalFetch }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void; WebSocketImpl?: typeof WebSocket; alertHooks?: AlertHooks;
+  /** The transport to omni.variational.io; python3 and scripts/variational-request.py unless given (tests, the local preview). */
+  variationalFetch?: VariationalFetcher } = {}): MonitorRuntime {
   const store = createMonitorStore({ file: join(dir, MONITOR_FILE), ...(now ? { now } : {}) });
   try {
     const base = { store, ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}) };
     // One Binance cooldown for everything that reads Binance from the same address; the Hynix collector reads Hyperliquid only.
     const gate = createBinanceGate(), options = { ...base, gate };
     const oil = config.oil ? createOilMonitor(options) : null, hynix = config.hynix ? createHynixMonitor(base) : null;
+    const varFetch = oil ? variationalFetch ?? createVariationalFetch() : undefined;
+    const variational = oil && varFetch ? createVariationalSession({ dir, fetcher: varFetch, ...(now ? { now } : {}), ...(log ? { log } : {}) }) : null;
     const exchanges = oil || hynix ? createExchangeReader({
       gate, oilQuote: () => oil?.quote() ?? null, hynixQuote: () => hynix?.quote() ?? null,
+      ...(variational && varFetch ? { variationalSession: variational, variationalFetch: varFetch } : {}),
       ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}), ...(WebSocketImpl ? { WebSocketImpl } : {}),
     }) : null;
     const alerts: Partial<Record<AlertMarket, AlertService>> = {};
@@ -42,7 +52,7 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
       if (hynix) alerts.hynix = createAlertService({ ...common, market: 'hynix', quote: () => hynix.quote() });
     }
     const control = createMonitorControl({ store, markets: monitorMarkets(config), ...(log ? { log } : {}) });
-    return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, hynix, exchanges, alerts, control };
+    return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, hynix, exchanges, alerts, control, variational };
   } catch (error) { store.close(); throw error; }
 }
 
@@ -71,6 +81,8 @@ export function monitorViews(monitor: MonitorRuntime) {
     /** One exchange's settled funding history (M-2d-3); undefined when the market is not configured. Rejects with the page's reason. */
     fundingHistory: (market: 'oil' | 'hynix', exchange: Exchange): Promise<unknown> | undefined =>
       monitor.exchanges && monitor.config[market] ? monitor.exchanges.fundingHistory(market, exchange) : undefined,
+    /** M-3d: the saved Variational token's state and the page's save; undefined when oil is not configured. */
+    variationalSession: (): VariationalSession | undefined => monitor.variational ?? undefined,
     /** M-3a: the market's alert service; undefined when the market is not configured. */
     alerts: (market: AlertMarket) => monitor.alerts[market],
   };
@@ -132,5 +144,5 @@ export const monitorLoops = (monitor: MonitorRuntime, context: LoopContext, log:
 };
 
 /** Ends the requests in flight (at stopping), so the loops finish within the drain. */
-export const stopMonitor = (monitor: MonitorRuntime): void => { monitor.anthropic?.stop(); monitor.oil?.stop(); monitor.hynix?.stop(); monitor.exchanges?.stop(); };
+export const stopMonitor = (monitor: MonitorRuntime): void => { monitor.anthropic?.stop(); monitor.oil?.stop(); monitor.hynix?.stop(); monitor.exchanges?.stop(); monitor.variational?.stop(); };
 export const closeMonitor = (monitor: MonitorRuntime): void => { try { monitor.store.close(); } catch { /* best effort */ } };

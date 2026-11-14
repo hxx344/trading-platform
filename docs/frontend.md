@@ -294,7 +294,7 @@
 
 **对照的工作台页面**：`modules/monitor/app/exchange-comparison.tsx`（提交 `568a20d`）与 `hooks/use-exchange-quotes.ts`（`8470785`），放在原油、海力士详情的图表组之后、近期观察之前（同工作台 `app/oil-panel.tsx` 的 `children` 位置）。样式复制自 `app/globals.css`（`77f3cf2`）的交易所对比规则与“旧”标签，全部加 `.monitor-desk` 前缀，追加在 `web/src/monitor.css` 末尾，去掉了资金费面板与 Hub 卡片的规则。
 
-**页面**：`web/src/MonitorExchanges.tsx`：标题与刷新按钮、对比表（交易所 / 报价口径、两腿价格、价差、海力士多一列 ADR 溢价率、做空 / 做多价差年化）、说明、可展开的资金费周期与计算口径。每个交易所一行，各自用 `useLiveResource` 每 15 秒读一次（超时 20 秒，Lighter 冷启动要先读目录再取快照），某一家失败只影响那一行（保留上次数据并标“保留数据 · 待更新”与“旧”）。时间按 UTC 显示。年化当时不可点（M-2d-3 起可点开结算历史）；Variational 一行固定“未接入”。
+**页面**：`web/src/MonitorExchanges.tsx`：标题与刷新按钮、对比表（交易所 / 报价口径、两腿价格、价差、海力士多一列 ADR 溢价率、做空 / 做多价差年化）、说明、可展开的资金费周期与计算口径。每个交易所一行，各自用 `useLiveResource` 每 15 秒读一次（超时 20 秒，Lighter 冷启动要先读目录再取快照），某一家失败只影响那一行（保留上次数据并标“保留数据 · 待更新”与“旧”）。时间按 UTC 显示。年化当时不可点（M-2d-3 起可点开结算历史）；Variational 一行固定“未接入”。（M-3d-1 起 Var 行正常读取，见《行情监控页：Var 行与 token 表单》。）
 
 **验证**：`scripts/dev-monitor.ts` 替身行情下 1280 与 390 宽度，原油 7 行、海力士 6 行齐全，展开说明、点刷新正常，无横向溢出（390 宽度按工作台改为卡片式行）；控制台只有未配置模块的入口探测 404。
 
@@ -388,3 +388,14 @@
 **验证**：`scripts/asset-demo.ts`（资产示例）与 `scripts/dev-monitor.ts`（替身行情）上无头浏览器 1280 与 390 宽度：配对组、运行状态、日志、设置、资产、行情监控各页的侧栏分组、当前项高亮与面包屑正确，无横向溢出，无 CSP 报错；390 宽度下抽屉打开后焦点进入侧栏，Esc、点遮罩、选中页面都会收起（Esc 后焦点回到按钮），窗口加宽超过 760px 时抽屉收起，抽屉层级 22 / 21 高于期权提示框。800 与 1024 宽度（侧栏常驻、内容区最窄）配对组、运行状态、日志、设置、资产、行情监控无横向溢出，行情监控的 Anthropic、原油、海力士三个子页另在 761、800、912、913、1024 宽度逐个查过。原油、期权入口用拦截的状态应答核对了分组位置；原油页、期权页的内容区没有替身后端，未在浏览器里走。
 
 **回滚**：`sudo bash install.sh --version v0.31.0`。只改页面，不改接口、数据库和配置。
+
+## 行情监控页：Var 行与 token 表单（Monitor M-3d-1，v0.33.0）
+
+**对照的工作台页面**：`modules/monitor/app/exchange-comparison.tsx` 的 Variational 行与「更新 Var token」按钮、`app/variational-session.tsx` 表单（`8470785`）。表单样式复制自 `app/variational-session.css`（`8470785`）全部规则，次序与取值不改，加 `.monitor-desk` 前缀追加在 `web/src/monitor.css` 末尾。
+
+**页面**：Var 行与其它交易所同用 `ExchangeRow`，身份格多一个「更新 Var token」按钮（`aria-expanded` / `aria-controls`），表单在下一行展开，收起后焦点回到按钮；Var 的年化是纯文本，不能点开结算历史（无可核实的结算记录），说明区注明。表单的状态文字、应答核对与保存失败处理在 `web/src/monitor-variational.ts`（无 DOM，测试在 `test/monitor-variational.test.ts`）。与工作台的差别：时间用 UTC；读写走 `api()`（保存是 POST 带页面请求标记），401 转到会话失效；token 只在密码框里，不进 React 状态、浏览器存储与地址，保存后与收起时清空。同工作台：页面切到后台（如去别的标签页复制 Cookie）时表单自动收起，回来要再点开一次；输入框是 `type=password`，浏览器可能提示保存密码，存不存由用户决定。
+
+**验证**：`scripts/dev-monitor.ts` 替身行情下无头浏览器 1280 与 390 宽度：Var 行有价格、价差与年化，年化不可点（其它行可点）；展开表单、保存 token 后显示成功、输入框清空、页面 DOM 不含 token，下一次读取改用认证报价（带行情时间）；两次保存间隔不足 3 秒时显示限频提示；收起后焦点回到按钮；说明区 Var 条目正确；无横向溢出，控制台只有未配置模块的入口探测 404。本机无头浏览器没有中文字体，截图只用来看版式；未与运行中的工作台并排截图（本机没有运行中的工作台）。
+
+**回滚**：`sudo bash install.sh --version v0.32.0`，不用改配置。
+

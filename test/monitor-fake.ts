@@ -5,7 +5,9 @@
 // (Binance BZ/CL every 4 h, Hyperliquid SKHY/SKHX hourly, each a few milliseconds after the grid point), and the settlement
 // history of M-2d-3 (Bybit, OKX, Bitget and Gate every 8 h, Binance SKHY/SKHYNIX every 4 h, Lighter and Hyperliquid xyz oil
 // hourly, 70 days back, paged as each venue pages). Prices follow slow waves (~95 USD per share, Brent ~74 and WTI ~70 USDT per barrel, SKHX ~230 USD
-// with the ADR 2–8 % above a tenth of it) so the charts have shape.
+// with the ADR 2–8 % above a tenth of it) so the charts have shape. M-3d adds Variational: the public metadata/stats on `fetch`,
+// and on `variationalFetch` (standing in for the Python transport) /api/me, the authenticated indicative marks (5 cents above
+// the public marks, so a test can tell them apart) and the public predicted funding.
 import type { AnthropicLegKey } from '../src/vendor/anthropic-market.mjs';
 
 const BAR = 900_000, HOUR = 3_600_000, DAY = 86_400_000;
@@ -47,7 +49,17 @@ const COMPARISON_HOSTS: Record<string, string> = { 'api.bybit.com': 'bybit', 'ww
 const HYNIX_BINANCE = ['SKHYUSDT', 'SKHYNIXUSDT'];
 const LIGHTER_MARKETS = [{ symbol: 'BRENTOIL', market_id: 91 }, { symbol: 'WTI', market_id: 92 }];
 const XYZ_EXTRA = ['xyz:BRENTOIL', 'xyz:CL', 'xyz:SKHY', 'xyz:SKHX'];
-const VENUE_OFFSET: Record<string, number> = { hyperliquid: 0.004, bybit: -0.002, binance: 0, lighter: 0.003, okx: -0.001, bitget: 0.002, gate: -0.003 };
+const VENUE_OFFSET: Record<string, number> = { hyperliquid: 0.004, bybit: -0.002, binance: 0, lighter: 0.003, okx: -0.001, bitget: 0.002, gate: -0.003, variational: -0.004 };
+const VARIATIONAL_STATS_HOST = 'omni-client-api.prod.ap-northeast-1.variational.io';
+/** How far the authenticated Variational marks sit above the public ones in the stand-in. */
+export const VARIATIONAL_AUTH_SHIFT = 0.05;
+/** The Variational stand-in's annualized predicted funding per base, and its 8 h interval. */
+export const VARIATIONAL_ANNUAL_RATE: Record<string, number> = { BZ: 0.1095, CL: -0.0438 };
+/** A vr-token shaped JWT declaring expiry `exp` (ms); `id` makes distinct tokens. */
+export function fakeVariationalToken(exp: number, id = 'a'): string {
+  const part = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  return `${part({ alg: 'HS256', typ: 'JWT' })}.${part({ exp: Math.floor(exp / 1000), sub: id })}.${Buffer.from(`sig-${id}`).toString('base64url')}`;
+}
 /** A comparison venue's mark for a contract base (BZ, CL, SKHY, SKHYNIX) at `time`: the shared wave, a few tenths of a percent off. */
 export function venuePrice(venue: string, base: string, time: number): number {
   const value = base === 'BZ' ? fakeOilPrice('brent', time) : base === 'CL' ? fakeOilPrice('wti', time) : base === 'SKHY' ? fakeHynixPrice('skhy', time) : fakeHynixPrice('skhx', time);
@@ -113,6 +125,12 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
     hold: null as Promise<void> | null,
     /** Comparison contracts whose settlement history answers HTTP 500, as `${venue}:${base}` ('bybit:CL'). */
     historyDown: new Set<string>(),
+    /** M-3d: how the authenticated Variational endpoints answer the token: accept it, reject it (401 x-omni-auth: r), or
+     * challenge every omni.variational.io request (403 cf-mitigated: challenge); funding down answers its reads HTTP 500. */
+    variationalMode: 'accept' as 'accept' | 'reject' | 'challenge',
+    variationalFundingDown: false,
+    /** The tokens the authenticated requests carried, in order. */
+    variationalTokens: [] as string[],
     /** Requests by kind ('quote:binance', 'candles:xyz', ...), and the most of one kind in flight at once. */
     requests: new Map<string, number>(),
     maxInFlight: new Map<string, number>(),
@@ -270,9 +288,47 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
     }
     close(): void { /* nothing to release */ }
   }
+  const count = (key: string) => state.requests.set(key, (state.requests.get(key) ?? 0) + 1);
+  const pause = async (signal: AbortSignal | null | undefined) => {
+    if (state.hold) await held(state.hold, signal);
+    if (state.delayMs) await wait(state.delayMs, signal);
+  };
+  /** The Python transport's stand-in: the same Response shape for the three omni.variational.io reads. */
+  const variationalFetch = async (href: string, init: RequestInit = {}): Promise<Response> => {
+    const url = new URL(href), path = url.pathname, headers = new Headers(init.headers);
+    if (url.hostname !== 'omni.variational.io') throw new Error(`unexpected request ${href}`);
+    const kind = path === '/api/me' ? 'me' : path === '/api/quotes/indicative' ? 'indicative' : path === '/api/funding/v2' ? 'funding' : null;
+    if (!kind) throw new Error(`unexpected request ${href}`);
+    count(`variational:${kind}`);
+    await pause(init.signal);
+    if (state.variationalMode === 'challenge') return new Response('<html></html>', { status: 403, headers: { 'content-type': 'text/html', 'cf-mitigated': 'challenge' } });
+    const t = now();
+    if (kind === 'funding') {
+      if (headers.has('cookie')) throw new Error('public funding carried a token');
+      if (state.variationalFundingDown) return fail(500);
+      const base = url.searchParams.get('underlying') ?? '';
+      const next = (Math.floor(t / (8 * HOUR)) + 1) * 8 * HOUR;
+      return ok({ underlying: base, predicted_funding_rate: String(VARIATIONAL_ANNUAL_RATE[base]), funding_interval_s: 28_800, next_funding_time: new Date(next).toISOString() });
+    }
+    const token = /^vr-token=(.+)$/.exec(headers.get('cookie') ?? '')?.[1];
+    if (!token) throw new Error('authenticated request without a token');
+    state.variationalTokens.push(token);
+    if (state.variationalMode === 'reject') return new Response('{}', { status: 401, headers: { 'content-type': 'application/json', 'x-omni-auth': 'r' } });
+    if (kind === 'me') return ok({ address: '0xabc', token });
+    const instrument = (JSON.parse(String(init.body)) as { instrument: { underlying: string } }).instrument;
+    const mark = Math.round((venuePrice('variational', instrument.underlying, t) + VARIATIONAL_AUTH_SHIFT) * 1000) / 1000;
+    return ok({ instrument, qty: '1', mark_price: String(mark), bid: String(mark - 0.01), ask: String(mark + 0.01), timestamp: new Date(t - 1000).toISOString() });
+  };
   const fetch = async (href: string, init: RequestInit = {}): Promise<Response> => {
     const url = new URL(href);
     let leg: AnthropicLegKey, kind: string, body: Record<string, any> | null = null;
+    if (url.hostname === VARIATIONAL_STATS_HOST) {
+      count('exchange:variational');
+      await pause(init.signal);
+      if (state.exchangeDown.has('variational')) return fail(500);
+      const row = (ticker: string) => ({ ticker, mark_price: String(venuePrice('variational', ticker, now())), funding_rate: '0.0001', funding_interval_s: 28_800 });
+      return ok({ listings: [{ ticker: 'BTC', mark_price: '100000', funding_interval_s: 28_800 }, row('BZ'), row('CL')] });
+    }
     if (url.hostname === 'fapi.binance.com' && HYNIX_BINANCE.includes(url.searchParams.get('symbol') ?? '')) {
       state.requests.set('exchange:binance', (state.requests.get('exchange:binance') ?? 0) + 1);
       if (state.hold) await held(state.hold, init.signal);
@@ -329,6 +385,6 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
       return answer(leg, url, body);
     } finally { inFlight.set(key, inFlight.get(key)! - 1); }
   };
-  return Object.assign(state, { fetch, WebSocket: FakeSocket as unknown as typeof WebSocket });
+  return Object.assign(state, { fetch, variationalFetch, WebSocket: FakeSocket as unknown as typeof WebSocket });
 }
 export type FakeAnthropicVenues = ReturnType<typeof fakeAnthropicVenues>;

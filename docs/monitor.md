@@ -4,13 +4,14 @@
 
 对照的工作台代码：`modules/monitor`（工作台提交 `7745181` 时的内容）。工作台 Monitor 的功能编号 M01–M14 沿用。
 
-## 当前状态（v0.31.0）
+## 当前状态（v0.33.0）
 
 - 已发布：M-1（Anthropic 价差）随 v0.12.0；v0.15.0 起在设置页「从工作台导入」里启用。M-2a（原油价差）随 v0.20.0。M-2b（海力士溢价）随 v0.21.0。M-2c（多交易所对比）随 v0.23.0。M-2d（已结算资金费历史与多空资金费图）随 v0.24.0。M-2e（技术指标）随 v0.25.0。M-2d-3（对比表各交易所的结算历史）随 v0.27.0，M-2 完成。
 - M-3a（原油与海力士阈值告警、飞书出站队列、页面告警面板与测试消息）随 v0.29.0；替身后端与替身机器人验证，未接真实飞书。
 - M-3b（从工作台导入告警档位与行情告警机器人 `feishuMonitor`）随 v0.30.0；替身文件与替身机器人验证，未接真实工作台与飞书。
 - M-3c（各市场的监控开关：关闭后停采集、停告警，保留配置与历史）随 v0.31.0；替身行情验证。
-- 未开始：M-3d、M-4 至 M-6（见下表）。
+- M-3d-1（Var 行：公开行情与预测资金费、页面保存的会话 token 与认证标记价）随 v0.33.0；替身 Variational 验证，未接真实账户。
+- 未开始：M-3d-2、M-4 至 M-6（见下表）。
 - M-1 没做：成交标记、股数从交易中心同步、概览卡片与告警（均线 / 布林带 / Z-score 随 M-2e 补上）。
 
 ## 批次
@@ -19,7 +20,7 @@
 | --- | --- | --- | --- |
 | M-1 | Anthropic 价差（M03）：Binance、Hyperliquid（xyz:ANT、io:ANTH）、Lighter RH 四条腿的报价与 15 分钟 K 线，每股口径溢价；只读公开接口，无凭据、无告警 | R2 | 完成（Linux CI 通过），随 v0.12.0 发布 |
 | M-2 | 原油价差与海力士行情（M01、M02），分 M-2a–M-2e 五小批（见下文），Var 腿先降级为“未接入” | R2 | M-2a 已发布（v0.20.0），M-2b 已发布（v0.21.0），M-2c 已发布（v0.23.0），M-2d 已发布（v0.24.0），M-2e 已发布（v0.25.0），M-2d-3 已发布（v0.27.0） |
-| M-3 | 告警规则、飞书通知、监控开关、Var 会话 token（M09–M12），分 M-3a–M-3d 四小批（见下文） | R3 | M-3a 完成（v0.29.0），M-3b 完成（v0.30.0），M-3c 完成（v0.31.0） |
+| M-3 | 告警规则、飞书通知、监控开关、Var 会话 token（M09–M12），分 M-3a–M-3d 四小批（见下文） | R3 | M-3a 完成（v0.29.0），M-3b 完成（v0.30.0），M-3c 完成（v0.31.0），M-3d-1 完成（v0.33.0） |
 | M-4 | 永续全市场报价（M04：11 家交易所公共 WS、SSE 增量） | R2 | 未开始 |
 | M-5 | 依赖 M04 的页面（M05–M08） | R2 | 未开始 |
 | M-6 | 其余（M13、M14；M14 原靠 iframe 桥接宿主，需重新设计） | 待定 | 未开始 |
@@ -360,7 +361,7 @@ CEX 最多 32 页。
 | M-3a | 原油（价差、布伦特、WTI）与海力士（ADR 溢价率）阈值告警，经本服务已有的飞书出站队列发送；页面告警面板；测试消息 | R3 | 完成（v0.29.0） |
 | M-3b | 从工作台导入告警规则与行情监控的飞书机器人（设置页「从工作台导入」与 `--monitor-alerts`） | R3 | 完成（v0.30.0） |
 | M-3c | 各市场的监控开关（停采集、停告警，保留数据） | R2 | 完成（v0.31.0） |
-| M-3d | Variational 会话 token 与 Var 腿（对比表里现在是“未接入”） | R3 | 未开始 |
+| M-3d | Variational 会话 token 与 Var 腿（对比表里原是“未接入”），分两小批：M-3d-1 公开行情、预测资金费、页面保存 token 与认证标记价；M-3d-2 从工作台导入 token | R3 | M-3d-1 完成（v0.33.0），M-3d-2 未开始 |
 
 ## M-3a：原油与海力士阈值告警
 
@@ -473,3 +474,51 @@ CEX 最多 32 页。
 **回滚**：`sudo bash install.sh --version v0.30.0`，不用改配置。v0.30.0 不认识 `control.*` 记录，所有已配置的市场照常运行；记录留在 `monitor.sqlite`，再升级回来时恢复各开关。
 
 **本批没做**：开关不进飞书定时摘要；不支持定时开关。
+
+## M-3d：Variational 腿与会话 token
+
+对照工作台 `modules/monitor`（提交 `8470785`）：`lib/variational-api.ts`（token 到期解析、固定只读接口、拒绝与拦截的区分）、`lib/variational-market.ts`（认证标记价与公开预测资金费的解析）、`lib/oil-dex.ts` 的 `parseVariationalOilQuote` 与 `createOilDexReader` 里的 Var 部分（公开行情与认证行情的取舍、token 轮换）、`server/variational-session.mjs`（token 文件与更新）、`server/variational-transport.mjs` 与 `server/variational-request.py`（经 Python 标准库发请求）、`app/variational-session.tsx`（表单）、`app/exchange-comparison.tsx` 的 Var 行。
+
+### M-3d-1：公开行情、预测资金费与页面保存的 token
+
+**用户可见的变化**：原油「交易所实时对比」里 Variational 不再是“未接入”。
+
+- 不填 token 也有价格：公开接口 `omni-client-api…/metadata/stats` 的 BZ / CL 标记价（没有行情时间，标“采集时间”）；预测资金费来自公开接口 `omni.variational.io/api/funding/v2`（年化小数，按 `资金费周期 ÷ 一年秒数` 换成每期费率，下次结算时间来自接口）。两者都不带 token。
+- 填了有效 token：价格改用认证接口 `/api/quotes/indicative`（`qty = 1` 的标记价，带源时间，两腿时间相差超过 15 秒作废）。认证失败（只有 HTTP 401 且 `x-omni-auth: r` 才算 token 被拒）时本行退回公开价格，表单显示“会话已失效”；被 Cloudflare 拦截或网络失败不算 token 失效，显示“认证行情暂不可用”，同样退回公开价格。
+- Var 行的身份格下多一个「更新 Var token」按钮，展开表单（照工作台 `variational-session.tsx`）：状态（尚未配置 / 已配置 / 已过期 / 会话已失效 / 认证行情暂不可用）、token 声明的到期时间与最近保存时间（UTC，同本页）、密码框、保存、刷新配置。token 只在密码框里，不进页面状态与浏览器存储；保存成功后清空输入框。
+- Var 的年化不能点开结算历史（工作台同样没有：公开接口没有可核实的历史实际结算费率），格内是纯文本，说明里写明原因。海力士没有 Var 行，不变。
+
+**接口**（都在登录检查之后，原油监控关闭时同其它原油接口回 423）：
+
+- `GET /api/monitor/oil/exchanges/variational`：同其它交易所的一行。
+- `GET /api/monitor/oil/exchanges/variational/session`：`{ available, configured, revision, expiresAt, updatedAt, status, error }`，不含 token。
+- `POST /api/monitor/oil/exchanges/variational/session`（须带页面请求标记；工作台是 PUT，本服务的写接口统一用 POST）：请求体只能是 `{ token, revision }`。`revision` 与当前不一致 409（`session_conflict`）；token 格式不对、已过期或 30 秒内到期 400；距上次验证不足 3 秒 429；先用新 token 读一次 `/api/me`，Variational 确认有效（应答里带未过期的 token）才保存，否则 400 / 502 并说明“原配置未修改”；写文件失败 503，原配置保留。保存后下一次读取（页面每 15 秒）即用新 token，不用重启。
+
+**存放**：数据目录 `monitor-variational-session.json`（`{ version: 1, revision, token, updatedAt }`，服务账户 600，先写临时文件再改名）。启动时文件过大、权限不是 600、内容无效时不读它（日志说明，状态显示“尚未配置”并带原因），Var 行照常用公开价格；页面保存一次即覆盖。与工作台相同不加密（资产账本的 vr-token 加密存放在库里，防的是库文件单独外泄；这里是单独的 600 文件）。资产账本里保存的 vr-token 与这里互不相干，各存各的（同工作台）。
+
+**请求**：`omni.variational.io` 的三个接口经 `python3 -I -B scripts/variational-request.py` 发出（照工作台：标准库 HTTP 客户端，token 只经标准输入传入，不跟随重定向，只回传状态、三个应答头与 2 MB 以内的正文，出错只给退出码），`metadata/stats` 走本服务原有的 Node 请求。每个请求 10 秒超时、不重试；结果 5 秒内各页面共用（同其它交易所），认证行情按 token 版本分开缓存；没人看页面时不发请求。本机没有 `python3` 时认证行情与预测资金费不可用（公开价格照常），原因显示在本行。
+
+**token 轮换与在途读取**（L089）：读取开始时记下 token 版本，读完发现版本已变（页面刚保存了新 token）就丢掉这次结果重读，最多两次，之后用公开价格；旧版本的读取结果不会把新 token 标成“已失效”。
+
+**日志**：token、Cookie 与应答正文不进日志、接口错误与页面；失败按原因去重记一次，恢复记一次（同其它交易所）。保存 token 记一行“已更新 Var token（版本 N，声明到期 …）”。
+
+**影响面（R3）**：
+
+- 凭据：新增页面写入的会话凭据文件；token 只发往 `omni.variational.io` 的 `/api/me` 与 `/api/quotes/indicative`（固定路径、固定请求体，传输脚本再核对一遍），公开接口不带 token。vr-token 是网页会话凭据，本服务只发只读请求。
+- 新增 `python3` 子进程（资产账本的 Var 余额已在用同样的做法），一次读取通常四个（两腿认证标记价、两腿预测资金费），token 轮换重读时认证读取最多四轮（有上限），各 10 秒内结束。子进程只拿到 `PATH`（同资产账本），服务环境里的代理设置不用于 Var 请求。
+- 读取接口、缓存与日志沿用 M-2c；不碰交易、划转、通知队列、`monitor.sqlite` 与配置格式。
+
+**失败与回滚**：读取失败只影响 Var 这一行。回滚 `sudo bash install.sh --version v0.32.0`，不用改配置；旧版本不读 `monitor-variational-session.json`，Var 行回到“未接入”，文件留在数据目录（不再需要时手动删除）。
+
+**本批不做（登记）**：从工作台导入 token（M-3d-2）；token 到期前的飞书提醒；Var 进原油价差主图与告警（工作台也只在对比表里用）。
+
+**测试计划**：解析（公开行情、认证标记价、预测资金费的手算核对、过期与不同步）；token 文件（权限、坏文件、原子写、版本冲突、过期、3 秒限频、`/api/me` 不确认时不保存）；传输脚本（白名单外的路径与请求头被拒、token 不出现在输出与错误里、超时与中止）；读取器（无 token 走公开、认证成功、401 被拒退回公开并标“已失效”、拦截不标失效、轮换中途丢弃旧结果）；接口（登录、请求标记、409 / 400 / 429 / 423）；页面（表单状态、保存清空输入、Var 年化不可点）。
+
+**实施记录（v0.33.0）**：
+
+- 数据规则 `src/vendor/variational-market.mjs`（复制工作台 `lib/variational-market.ts` 与 `lib/variational-api.ts`，差别写在文件头）；`exchange-comparison.mjs` 的原油对比加入 Var，`exchange-funding-history.mjs` 把 Var 排除在结算历史外（`supportsFundingHistory`）。
+- 传输 `src/monitor/variational-transport.ts` 与 `scripts/variational-request.py`（逐字复制工作台脚本，只改说明），`deploy/package.sh` 把脚本打进发布包。
+- token 文件 `src/monitor/variational-session.ts`；读取器 `src/monitor/exchanges.ts` 的 `readVariational`（认证价与公开资金费并行，资金费失败只空出年化）；接口在 `src/http.ts`。
+- 页面：`web/src/MonitorExchanges.tsx` 的 Var 行与 `web/src/MonitorVariationalSession.tsx` 表单，见 [frontend.md](frontend.md)《行情监控页：Var 行与 token 表单》。
+- 测试 `test/monitor-variational.test.ts`（解析、token、认证请求、读取器含轮换、token 文件、传输与真实 `python3` 脚本的拒绝路径、接口、页面数据规则）；`scripts/dev-monitor.ts` 接上替身 Variational。
+- 与计划的差别：无。

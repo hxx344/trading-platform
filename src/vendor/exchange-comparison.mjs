@@ -10,7 +10,7 @@
 //   tickers 应答：各自校验时间、取较早者，两腿相差超过 15 秒作废（与其它交易所同一口径）；
 // - Binance 海力士不读 exchangeInfo（整个合约目录约数 MB）：按合约读 premiumIndex，不再核对合约状态与类型，合约下架时
 //   接口报错，本轮失败；
-// - Variational 需要登录会话，不接入：页面显示「未接入」，服务端不支持该交易所；
+// - Variational 的读取与解析在 variational-market.mjs（M-3d），本文件只把它列进原油的可读交易所；
 // - Lighter 快照订阅多接一个中止信号（服务停止时立即结束）。
 // - 新增 checkedReply：OKX / Bitget 单个合约的应答先核对信封与合约行，读取器只缓存核对过的应答。
 import { oilSpread } from './oil-market.mjs';
@@ -19,14 +19,14 @@ export const EXCHANGE_REFRESH_MS = 15_000;
 export const EXCHANGE_STALE_MS = 45_000;
 const HOUR = 3_600_000;
 
-/** 页面展示顺序；Variational 只占一行「未接入」。 */
+/** 页面展示顺序。 */
 export const DISPLAY_EXCHANGES = Object.freeze({
   oil: Object.freeze(['hyperliquid', 'bybit', 'binance', 'lighter', 'variational', 'okx', 'bitget']),
   hynix: Object.freeze(['hyperliquid', 'bybit', 'binance', 'okx', 'bitget', 'gate']),
 });
 /** 服务端能读的交易所。 */
 export const COMPARISON_EXCHANGES = Object.freeze({
-  oil: Object.freeze(['hyperliquid', 'bybit', 'binance', 'lighter', 'okx', 'bitget']),
+  oil: Object.freeze(['hyperliquid', 'bybit', 'binance', 'lighter', 'variational', 'okx', 'bitget']),
   hynix: Object.freeze(['hyperliquid', 'bybit', 'binance', 'okx', 'bitget', 'gate']),
 });
 export const supportsExchange = (market, exchange) => Object.hasOwn(COMPARISON_EXCHANGES, market) && COMPARISON_EXCHANGES[market].includes(exchange);

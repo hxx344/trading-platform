@@ -2,8 +2,9 @@
 // 快照校验，lib/exchange-funding-analysis.ts（8470785）的区间统计，lib/exchange-funding-cex.ts（ee3942c）的 Binance / Bybit /
 // OKX / Bitget 分页读取与解析，lib/exchange-funding-service.ts（1fdb6e8）的 Hyperliquid / Gate / Lighter 解析与分页、两腿合并。
 // 只放数据规则，服务端读取器（src/monitor/exchanges.ts）与页面共用。与原文件不同的地方：
-// - 不带 Variational（本服务不接入，页面不给它入口），于是去掉 availability 字段与「不支持」分支；交易所清单沿用
-//   exchange-comparison.mjs 的 COMPARISON_EXCHANGES，合约取 exchangeDefinition；
+// - 不带 Variational（公开接口没有可核实的历史实际结算费率，工作台返回「不支持」；本服务页面不给它入口），于是去掉
+//   availability 字段与「不支持」分支；交易所清单沿用 exchange-comparison.mjs 的 COMPARISON_EXCHANGES（除 Variational），
+//   合约取 exchangeDefinition；
 // - 不带 Aster、Bitget USDC 合约、调用方自带合约目录与 onProgress（工作台其它页面才用）；
 // - 页面统一用 UTC：区间输入框按 UTC 解析与显示（工作台按北京时间）；
 // - Lighter 合约目录由调用方传入（读取器复用 M-2c 已缓存的目录），请求函数与时钟都由调用方注入；
@@ -18,8 +19,8 @@ export const HISTORY_PAGE_SIZE = 200;
 export const HISTORY_LEG_LIMIT = 2_000;
 const EARLIEST = Date.UTC(2020, 0, 1);
 
-export const fundingHistoryExchanges = market => COMPARISON_EXCHANGES[market];
-export const supportsFundingHistory = (market, exchange) => supportsExchange(market, exchange);
+export const fundingHistoryExchanges = market => COMPARISON_EXCHANGES[market].filter(exchange => exchange !== 'variational');
+export const supportsFundingHistory = (market, exchange) => exchange !== 'variational' && supportsExchange(market, exchange);
 
 /** Preserve the original settlement timestamps; asynchronous legs are never paired by a time bucket. */
 export function normalizeSettledFunding(records, now) {

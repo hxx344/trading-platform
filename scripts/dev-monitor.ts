@@ -31,7 +31,7 @@ const alertHooks = {
   robot: () => 'feishuMonitor' as const,
   test: async (text: string) => { process.stdout.write(`[替身飞书·测试] ${text}\n`); },
 };
-const monitor = openMonitor(parseMonitorConfig({ anthropic: {}, oil: {}, hynix: {} }), dir, { fetchImpl: venues.fetch, WebSocketImpl: venues.WebSocket, alertHooks });
+const monitor = openMonitor(parseMonitorConfig({ anthropic: {}, oil: {}, hynix: {} }), dir, { fetchImpl: venues.fetch, WebSocketImpl: venues.WebSocket, variationalFetch: venues.variationalFetch, alertHooks });
 const store = openStore(join(dir, 'executor.sqlite'));
 const { binance, bybit, aster, asterTrading } = createSimulatedVenues(Date.now);
 const executor = createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, positions: asterTrading });

@@ -15,10 +15,13 @@ interface ImportedItem { id: string; status: string; detail: string }
 interface OilItem { venue: string; accountMode: string | null; accountId: string | null; blockedBy: string[]; status: 'added' | 'skipped'; detail: string }
 /** The workbench Greeks module's Bybit account for the options module; the UID comes masked. */
 interface OptionsItem { accountId: string | null; status: 'added' | 'skipped'; detail: string }
+/** The workbench CrossEx module's Gate account; the UID comes masked. Same shape as the options account. */
+// Same shape as src/service/import-crossex.ts CrossexItem; `warning` is set while the workbench still runs the account.
+interface CrossexItem { accountId: string | null; status: 'added' | 'skipped'; detail: string; warning?: string }
 interface ImportResult {
   id: string | null; action: 'preview' | 'import' | null; at: number; phase?: string; message: string;
   preview?: PreviewItem[]; imported?: ImportedItem[]; oil?: OilItem[]; oilError?: string; options?: OptionsItem; optionsError?: string;
-  monitor?: MonitorItem; asset?: AssetItem; assetError?: string; notes?: string[]; database?: string;
+  monitor?: MonitorItem; asset?: AssetItem; assetError?: string; crossex?: CrossexItem; crossexError?: string; notes?: string[]; database?: string;
 }
 const VENUE: Record<string, string> = { binance: 'Binance', bybit: 'Bybit' };
 
@@ -38,6 +41,15 @@ function OptionsRow({ item, preview }: { item: OptionsItem; preview: boolean }) 
     <tbody><tr>
       <td>Bybit 期权</td><td className="mono">{item.accountId ?? '—'}</td>
       <td className={item.status === 'added' ? 'ok' : preview ? 'muted' : 'err'}>{item.status === 'added' ? (preview ? '可导入：' : '已导入：') : (preview ? '不能导入：' : '未导入：')}{item.detail}</td>
+    </tr></tbody>
+  </table></div>;
+}
+function CrossexRow({ item, preview }: { item: CrossexItem; preview: boolean }) {
+  return <div className="table-wrap"><table className="data" id="importCrossexTable">
+    <thead><tr><th>CrossEx 账户</th><th>账户</th><th>{preview ? '说明' : '结果'}</th></tr></thead>
+    <tbody><tr>
+      <td>Gate CrossEx</td><td className="mono">{item.accountId ?? '—'}</td>
+      <td className={item.status === 'added' ? 'ok' : preview ? 'muted' : 'err'}>{item.status === 'added' ? (preview ? '可导入：' : '已导入：') : (preview ? '不能导入：' : '未导入：')}{item.detail}{item.warning ? <span className="err">（{item.warning}）</span> : null}</td>
     </tr></tbody>
   </table></div>;
 }
@@ -71,15 +83,16 @@ function AssetRows({ item, preview, owner, setOwner }: { item: AssetItem; previe
 }
 type Message = { tone: 'ok' | 'err' | 'muted'; text: string } | null;
 /** The module choices of the preview (live accounts and modules are never ticked by default). */
-interface ModulePicks { oil: boolean; options: boolean; monitor: boolean; asset: boolean; assetOwner: string | null }
+interface ModulePicks { oil: boolean; options: boolean; monitor: boolean; asset: boolean; assetOwner: string | null; crossex: boolean }
 
 function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { result: ImportResult; picked: Set<string>; setPicked: (value: Set<string>) => void; picks: ModulePicks; setPicks: (value: ModulePicks) => void; onRun: () => void; busy: boolean }) {
   const notes = (result.notes || []).map((note, index) => <p key={index} className="muted">{note}</p>);
   const oilError = result.oilError ? <p className="err">原油执行账户无法读取：{result.oilError}</p> : null;
   const optionsError = result.optionsError ? <p className="err">期权账户无法读取：{result.optionsError}</p> : null;
   const assetError = result.assetError ? <p className="err">资产账本无法读取：{result.assetError}</p> : null;
+  const crossexError = result.crossexError ? <p className="err">CrossEx 账户无法读取：{result.crossexError}</p> : null;
   if (result.action === 'preview') {
-    const rows = result.preview || [], oil = result.oil || [], options = result.options ?? null, monitor = result.monitor ?? null, asset = result.asset ?? null;
+    const rows = result.preview || [], oil = result.oil || [], options = result.options ?? null, monitor = result.monitor ?? null, asset = result.asset ?? null, crossex = result.crossex ?? null;
     const oilImportable = oil.some(item => item.status === 'added'), optionsImportable = options?.status === 'added';
     const oilPicked = picks.oil, optionsPicked = picks.options;
     const setOilPicked = (value: boolean) => setPicks({ ...picks, oil: value }), setOptionsPicked = (value: boolean) => setPicks({ ...picks, options: value });
@@ -110,6 +123,11 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
         <label className="pair-pick"><input type="checkbox" id="importOptionsPick" disabled={!optionsImportable} checked={optionsPicked && optionsImportable} onChange={event => setOptionsPicked(event.target.checked)} />导入期权账户（工作台期权模块的 Bybit 密钥与风险上限；本项目已配置期权时保留现有设置）</label>
       </> : null}
       {optionsError}
+      {crossex ? <>
+        <CrossexRow item={crossex} preview />
+        <label className="pair-pick"><input type="checkbox" id="importCrossexPick" disabled={crossex.status !== 'added'} checked={picks.crossex && crossex.status === 'added'} onChange={event => setPicks({ ...picks, crossex: event.target.checked })} />导入 CrossEx 账户（工作台 CrossEx 模块的 Gate 密钥与额度设置；本项目已配置 CrossEx 时保留现有设置）</label>
+      </> : null}
+      {crossexError}
       {monitor ? <>
         <MonitorRow item={monitor} preview />
         <label className="pair-pick"><input type="checkbox" id="importMonitorPick" disabled={!monitorImportable} checked={picks.monitor && monitorImportable} onChange={event => setPicks({ ...picks, monitor: event.target.checked })} />启用行情监控（Anthropic 价差，只读公开行情，不需要密钥；股数取默认值，本项目已启用时保留现有设置）</label>
@@ -119,7 +137,7 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
         <label className="pair-pick"><input type="checkbox" id="importAssetPick" disabled={!assetImportable} checked={picks.asset && assetImportable} onChange={event => setPicks({ ...picks, asset: event.target.checked })} />导入资产账本（所选用户的账本整体替换本项目现有账本；本项目已启用资产账本时只重新导入、不重启服务）</label>
       </> : null}
       {assetError}
-      {rows.length || oil.length || options || monitor || asset ? <p><button type="button" id="importRunBtn" className="button primary" disabled={busy} onClick={onRun}>{restarts(choicesOf(result, picked, picks), asset?.enabled ?? false) ? '导入所选并重启服务' : '导入所选'}</button></p> : null}
+      {rows.length || oil.length || options || crossex || monitor || asset ? <p><button type="button" id="importRunBtn" className="button primary" disabled={busy} onClick={onRun}>{restarts(choicesOf(result, picked, picks), asset?.enabled ?? false) ? '导入所选并重启服务' : '导入所选'}</button></p> : null}
       {notes}
       {result.database ? <p className="muted">读取自 {result.database}（只读）</p> : null}
     </>;
@@ -134,6 +152,8 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
     {oilError}
     {result.options ? <OptionsRow item={result.options} preview={false} /> : null}
     {optionsError}
+    {result.crossex ? <CrossexRow item={result.crossex} preview={false} /> : null}
+    {crossexError}
     {result.monitor ? <MonitorRow item={result.monitor} preview={false} /> : null}
     {result.asset ? <AssetRows item={result.asset} preview={false} /> : null}
     {assetError}
@@ -147,9 +167,10 @@ function choicesOf(result: ImportResult | null, picked: Set<string>, picks: Modu
   const oil = picks.oil ? (result?.oil || []).filter(item => item.status === 'added').map(item => `${VENUE[item.venue] ?? item.venue} ${item.accountId ?? ''}`) : [];
   const options = picks.options && result?.options?.status === 'added' ? `Bybit ${result.options.accountId ?? ''}` : null;
   const owner = picks.asset && result?.asset?.owners.some(item => item.importable && item.owner === picks.assetOwner) ? picks.assetOwner : null;
-  return { pairs, oil, options, monitor: picks.monitor && monitorAvailable(result?.monitor), assetOwner: owner };
+  const crossex = picks.crossex && result?.crossex?.status === 'added' ? `Gate ${result.crossex.accountId ?? ''}` : null;
+  return { pairs, oil, options, monitor: picks.monitor && monitorAvailable(result?.monitor), assetOwner: owner, crossex };
 }
-const NO_PICKS: ModulePicks = { oil: false, options: false, monitor: false, asset: false, assetOwner: null };
+const NO_PICKS: ModulePicks = { oil: false, options: false, monitor: false, asset: false, assetOwner: null, crossex: false };
 
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const statusOf = (error: unknown): number | undefined => {

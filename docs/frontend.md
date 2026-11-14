@@ -27,6 +27,7 @@
 | 期权 | `#/options`，子页 `#/options/positions`、`#/options/orders`、`#/options/performance`、`#/options/rfq` | `GET /api/options/state` 有应答（配置了 `options`） | 《期权页》 |
 | 行情监控 | `#/monitor` | `GET /api/monitor/state` 有应答（配置了 `monitor`） | 《行情监控页》 |
 | 资产 | `#/asset` | `GET /api/asset/state` 不是 404（配置了 `asset`；账本读取失败时也显示） | 《资产页》《资产页写入》 |
+| CrossEx | `#/crossex`，子页 `#/crossex/trade`、`#/crossex/hedge`、`#/crossex/orders`、`#/crossex/settings` | `GET /api/crossex/state` 有应答（配置了 `crossex`） | 《CrossEx 页》 |
 
 下面各节按接入批次记录当时的做法；后一批改掉前一批的地方以后一批为准（例如 F4 把总览与配对详情合并成配对组，A-2 去掉了 A-1 的只读提示）。
 
@@ -338,3 +339,25 @@
 
 **回滚**：`sudo bash install.sh --version v0.27.0`，不用改配置。
 
+## CrossEx 页
+
+**对照的工作台页面**：工作台 `modules/crossex/src/`（提交 `7745181`），按它嵌在 Hub 里显示的样子（`hub-embedded`，不显示模块自己的顶栏）。代码在 `web/src/crossex/`，每个文件头写明来源与差异；没有改动的文件只换了导入路径。顶部「CrossEx」标签只在 `GET /api/crossex/state` 有应答时出现。
+
+**页面**：五个子页照工作台：持仓（账户概览、持仓组与指标、ADL、历史与成交）、手动委托（行情、K 线、盘口、下单）、跨所对冲（两腿选择、价差、开仓额度、预览确认）、订单（委托查询与撤单、执行记录）、设置。读取沿用工作台的 `createLatestRead` 轮询、服务时钟与按子页决定的读取路径，没有改成 `use-live-resource`（外壳只用它判断要不要显示标签）。写入走 `api.ts`，带 `x-pa-executor`；下单与撤单沿用 `RequestIds`，结果未知的请求存在 sessionStorage，查清之前不能再下单。
+
+**与工作台的差异**
+
+- 地址改为 `/api/crossex/*`；bootstrap 是 `{ now, config, connection, limits }`，没有 csrfToken 与 Monitor 密码标志。
+- 设置页的连接区块只读：显示 UID、API Key 尾号、连接状态、读取 / 交易权限、持仓模式、最近校验和 `config.json` 的硬上限（`crossex.limits`），不填写、不断开密钥（密钥在 secrets.json，经「设置 → 从工作台导入」或配置文件管理）。额度表单字段与文案不变，用 `PUT /api/crossex/settings` 保存，服务以超过硬上限为由拒绝时显示服务的提示。
+- 去掉 Hub 桥接、Monitor ↗ 按钮、Market Monitor 地址与密码；对冲页的机会列表与「从 Monitor 导入」删掉，改为提示「机会列表待行情监控 M-4 接入，可直接在上方选择合约。」，手动选择两腿照常可用。
+- recharts 换成 `svg-plot.tsx`；收益曲线（ProfitChart）没有迁移。进度条、盘口深度条与数量对比条改用 SVG（`FillBar.tsx`），因为 CSP 不允许 `style` 宽度。`decimal.js` 换成本仓库的 `src/vendor/decimal.mjs`。
+
+**样式**
+
+- 工作台的 12 个样式文件（account-history、adl-indicator、base-currency-picker、dark-theme、design-tokens、hedge-leg-selector、holding-scenario、open-capacity、position-actions、position-metrics、relayout、styles）原样复制到 `web/src/crossex/`，文件头写明来源与提交号，只删掉本页没用到的规则（Monitor 与机会列表、资金费表、连接表单等）。
+- 隔离：每个文件整份包在 `.aster-desk .crossex-page { … }` 里，`:root` 与 `body` 改成 `&`；Vite 构建时把嵌套展开成带前缀的普通选择器。页面根是 `<div class="crossex-page"><div class="app hub-embedded">`，工作台 `.hub-embedded …` 的规则照样生效。
+- `web/src/crossex/crossex.css` 按工作台的引入顺序汇总这些文件，在 `main.tsx` 里排在 `aster.css` 之后引入：前缀同样是两个类，同等权重时 CrossEx 的规则在后、胜出。`styles.css` 末尾的 CrossEx 一节是本服务自己的规则：FillBar 的尺寸与颜色、设置页硬上限列表占满一行。
+
+**验证**：`node --test --test-reporter=dot 'web/test/crossex/*.test.mjs'`（工作台界面测试迁移版）。浏览器：`scripts/dev-monitor.ts` 提供真实外壳与 CSP，Playwright 拦截 `/api/crossex/*` 返回替身数据（取自工作台 `tests/crossex-position-metrics.browser.mjs`），五个子页在 1280 与 390 宽度下没有 CSP 报错、没有横向溢出；设置页超过硬上限时显示服务的拒绝提示，保存成功显示「已保存」。
+
+**回滚**：先删掉 `config.json` 的 `crossex` 与 secrets.json 的 `gate`，再 `sudo bash install.sh --version v0.28.0`。

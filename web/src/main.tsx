@@ -7,5 +7,7 @@ import './aster.css';
 import './asset.css';
 // After aster.css: the whole shell sits in .aster-desk, so on equal specificity the options page's own copy must win.
 import './options.css';
+// After aster.css for the same reason: every CrossEx rule sits under .aster-desk .crossex-page.
+import './crossex/crossex.css';
 
 createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>);

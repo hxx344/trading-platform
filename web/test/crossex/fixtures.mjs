@@ -1,0 +1,5 @@
+// 摘自工作台 modules/crossex/tests/fixtures.mjs（提交 7745181）：只取页面测试用到的 epoch、quote、feed；pairKey 取自本仓库移植的 src/vendor/crossex/model.mjs。
+import { pairKey } from '../../../src/vendor/crossex/model.mjs';
+export const epoch = 1790000000000;
+export function quote(exchange, at = epoch, extra = {}) { return { exchange, symbol: 'BTCUSDT', base: 'BTC', quoteCurrency: 'USDT', collateralCurrency: 'USDT', multiplier: 1, assetClass: 'crypto', identitySource: 'test-official-directory', identityVerified: true, bid: exchange === 'binance' ? 99 : 102, ask: exchange === 'binance' ? 100 : 103, bidAskAt: at, receivedAt: at, ...extra }; }
+export function feed(at = epoch) { const long = quote('binance', at), short = quote('bybit', at); const signal = { id: `signal-${at}`, base: 'BTC', quoteCurrency: 'USDT', long, short, observedAt: at, expiresAt: at + 10000 }; return { schemaVersion: 1, mode: 'paper', source: 'market-monitor', monitorId: 'perpetual', generatedAt: at, status: 'live', exchanges: [{ id: 'binance', status: 'live' }, { id: 'bybit', status: 'live' }], quotes: [long, short], signals: [{ ...signal, pairKey: pairKey(signal) }] }; }

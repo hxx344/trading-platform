@@ -17,6 +17,8 @@ import { ApiError } from './api.ts';
 import type { ServiceState } from './types.ts';
 import type { OilState } from './oil-types.ts';
 import type { AssetState } from '../../src/asset/views.ts';
+import { CrossexPage } from './crossex/CrossexPage.tsx';
+import { CROSSEX_READ_TIMEOUT_MS, CROSSEX_STATE_PATH } from './crossex/crossex-api.ts';
 
 // The page shell follows the workbench's ASTER desk (modules/aster/dashboard/app/page.tsx, b2fae14): the top bar with
 // the brand, the page heading with the connection state, then line tabs. The ASTER pages sit in .aster-module, which
@@ -45,6 +47,8 @@ const ASSET_TAB: Tab = { pages: ['asset'], href: '#/asset', text: '资产' };
 const ASSET_CHECK_MS = 60_000;
 /** Shown only where /api/options/state answers, like the oil tab. */
 const OPTIONS_TAB: Tab = { pages: ['options'], href: '#/options', text: '期权' };
+/** Shown only where /api/crossex/state answers (a service without crossex answers 404), like the oil tab. */
+const CROSSEX_TAB: Tab = { pages: ['crossex'], href: '#/crossex', text: 'CrossEx' };
 
 export function App() {
   const route = useRoute();
@@ -58,7 +62,9 @@ export function App() {
   const monitor = useLiveResource<MonitorState>(MONITOR_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: MONITOR_READ_TIMEOUT_MS, parse: parseMonitorState, onExpired });
   // The asset page reads the same path at the same pace and timeout (the shared read keeps the first subscriber's).
   const asset = useLiveResource<AssetState>(ASSET_STATE_PATH, { intervalMs: ASSET_CHECK_MS, timeoutMs: ASSET_READ_TIMEOUT_MS, onExpired });
-  const tabs = [...TABS, ...(oil.data !== null ? [OIL_TAB] : []), ...(options.data !== null ? [OPTIONS_TAB] : []), ...(monitor.data !== null ? [MONITOR_TAB] : []), ...(asset.data !== null || (asset.error instanceof ApiError && asset.error.status === 500) ? [ASSET_TAB] : [])];
+  // The CrossEx page reads its state on its own (tab-specific paths, paused around writes); this only decides whether the tab shows.
+  const crossex = useLiveResource<unknown>(CROSSEX_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: CROSSEX_READ_TIMEOUT_MS, onExpired });
+  const tabs = [...TABS, ...(oil.data !== null ? [OIL_TAB] : []), ...(options.data !== null ? [OPTIONS_TAB] : []), ...(monitor.data !== null ? [MONITOR_TAB] : []), ...(asset.data !== null || (asset.error instanceof ApiError && asset.error.status === 500) ? [ASSET_TAB] : []), ...(crossex.data !== null ? [CROSSEX_TAB] : [])];
   // A read that succeeds again (after logging in from another tab) clears the notice.
   useEffect(() => { if (status === 'ready') setExpired(false); }, [status]);
   const changed = useCallback(() => { void refresh(); }, [refresh]);
@@ -70,11 +76,11 @@ export function App() {
   const stale = state !== null && (status === 'error' || status === 'offline' || status === 'paused' || (status === 'loading' && (error !== null || old)));
   const failed = status === 'error' || status === 'offline';
   const limits = state ? limitsText(state) : null;
-  const aster = route.page !== 'oil' && route.page !== 'options' && route.page !== 'monitor' && route.page !== 'asset';
+  const aster = route.page !== 'oil' && route.page !== 'options' && route.page !== 'monitor' && route.page !== 'asset' && route.page !== 'crossex';
   return <div className="aster-desk">
     <main className="desk focused-desk">
       <header className="topbar">
-        <div className="brand"><Layers3 size={22} aria-hidden="true" /><span>统一交易平台<span className="brand-separator">/</span><small>ASTER 保证金平衡 · 原油 · 期权 · 行情监控 · 资产</small></span></div>
+        <div className="brand"><Layers3 size={22} aria-hidden="true" /><span>统一交易平台<span className="brand-separator">/</span><small>ASTER 保证金平衡 · 原油 · 期权 · 行情监控 · 资产 · CrossEx</small></span></div>
       </header>
       <div className="workspace">
         <div className="page-heading">
@@ -116,7 +122,7 @@ export function App() {
                   ? <StatePanel kind="error" title="读取服务状态失败" detail={error?.message ?? '网络离线'} />
                   : <StatePanel kind="loading" title="加载中…" />)
                   : <PairsWorkspace state={state} pairId={route.page === 'pair' ? route.pairId : null} stale={stale} onChanged={changed} onExpired={onExpired} />}
-            </div> : route.page === 'options' ? <OptionsPage tab={route.tab} onExpired={onExpired} /> : route.page === 'monitor' ? <MonitorPage onExpired={onExpired} /> : route.page === 'asset' ? <AssetPage onExpired={onExpired} /> : <OilPage onExpired={onExpired} />}
+            </div> : route.page === 'options' ? <OptionsPage tab={route.tab} onExpired={onExpired} /> : route.page === 'monitor' ? <MonitorPage onExpired={onExpired} /> : route.page === 'asset' ? <AssetPage onExpired={onExpired} /> : route.page === 'crossex' ? <CrossexPage tab={route.tab} onExpired={onExpired} /> : <OilPage onExpired={onExpired} />}
           </div>
         </div>
       </div>

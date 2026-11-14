@@ -17,8 +17,12 @@
 // (import-modules.ts); the ledger is written first, as the data directory's owner, then the config. Alone they import
 // no pair either.
 //
+// With --crossex it brings the workbench CrossEx module's Gate key and account over (import-crossex.ts): secrets.json
+// `gate`, config.json `crossex`, and on a first import the page settings into <--data-dir>/crossex.sqlite (written first,
+// as the data directory's owner). Alone it imports no pair either.
+//
 //   node import-workbench.ts --config /etc/trading-platform/config.json [--workbench-env FILE] [--workbench-data DIR]
-//                            [--pairs id,id] [--oil] [--options] [--monitor] [--asset [--asset-owner USER]]
+//                            [--pairs id,id] [--oil] [--options] [--monitor] [--asset [--asset-owner USER]] [--crossex]
 //                            [--data-dir DIR] [--dry-run]
 //
 // An existing config.json is extended: its pairs, accounts and robot stay as they are, and only pairs it does not have
@@ -38,6 +42,7 @@ import { validCredentials, type LiveCredentials } from '../live/values.ts';
 import { MODULE_KEYS, assertDistinctSigners, parseServiceConfig, parseServiceSecrets } from './config.ts';
 import { parseOilSecrets } from './oil-config.ts';
 import { planOptions, readWorkbenchOptions, resolveOptionsAccount, type OptionsItem, type OptionsSource } from './import-options.ts';
+import { planCrossex, readWorkbenchCrossex, writeCrossexSettingsAsService, type CrossexItem, type CrossexSource } from './import-crossex.ts';
 import { ASSET_OWNER } from './import-channel.ts';
 import { connectionLines, planAsset, planMonitor, readWorkbenchAsset, readWorkbenchMonitor, writeLedgerAsService, type AssetItem, type AssetSource, type LedgerWrite, type MonitorItem, type MonitorSource } from './import-modules.ts';
 
@@ -103,6 +108,10 @@ export interface ImportPlan {
   asset: AssetItem | null;
   /** The ledger rows to write into asset.sqlite, before the files; null when none come over. */
   ledger: LedgerWrite | null;
+  /** The CrossEx account looked at (null without options.crossex). */
+  crossex: CrossexItem | null;
+  /** The workbench page settings to copy into crossex.sqlite, before the files; null when none come over. */
+  crossexSettings: Json | null;
   notes: string[];
 }
 /** What the page shows for each workbench pair before anything is written: whether it could come over on its own. */
@@ -135,7 +144,7 @@ function feishuOf(env: WorkbenchSource['env'], channel: 'EVENT' | 'SCHEDULED' = 
  * Works out the files after the import. `existing` is the current config.json and secrets.json (raw JSON), or null on a
  * first setup. Throws when the result would not load: the caller then writes nothing.
  */
-export function planImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; only?: readonly string[]; known?: ReadonlyMap<string, AsterCredentials>; requireMargin?: boolean; oil?: OilSource; options?: OptionsSource; monitor?: MonitorSource; asset?: AssetSource; assetOwner?: string }): ImportPlan {
+export function planImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; only?: readonly string[]; known?: ReadonlyMap<string, AsterCredentials>; requireMargin?: boolean; oil?: OilSource; options?: OptionsSource; monitor?: MonitorSource; asset?: AssetSource; assetOwner?: string; crossex?: CrossexSource }): ImportPlan {
   const config: Json = existing ? structuredClone(existing.config) : { secretsFile: options.secretsFile, pairs: [] };
   const secrets: Json = existing ? structuredClone(existing.secrets) : { accounts: {} };
   // A config of other modules only (oil, options, monitor, asset) has no pairs yet; those blocks and their keys are carried over untouched.
@@ -160,9 +169,9 @@ export function planImport(source: WorkbenchSource, existing: { config: Json; se
   let known: Map<string, AsterCredentials>;
   // The oil venues' keys are allowed in the key file only when config.json names oil accounts (an invalid oil block is the
   // existing-config check's to report below).
-  let oilVenues: Venue[] = [], hasOptions = false;
-  try { const parsed = parseServiceConfig(config); oilVenues = parsed.oil?.accounts.map(account => account.venue) ?? []; hasOptions = parsed.options !== undefined; } catch { oilVenues = []; }
-  try { known = new Map(options.known ?? parseServiceSecrets(secrets, [], oilVenues, hasOptions).accounts); }
+  let oilVenues: Venue[] = [], hasOptions = false, hasCrossex = false;
+  try { const parsed = parseServiceConfig(config); oilVenues = parsed.oil?.accounts.map(account => account.venue) ?? []; hasOptions = parsed.options !== undefined; hasCrossex = parsed.crossex !== undefined; } catch { oilVenues = []; }
+  try { known = new Map(options.known ?? parseServiceSecrets(secrets, [], oilVenues, hasOptions, hasCrossex).accounts); }
   catch (error) { throw new Error(`现有密钥文件未通过检查，先修好再导入：${error instanceof Error ? error.message : String(error)}`); }
   /** Throws when this service would not start on these files: its config checks, with the signers already in hand. */
   const fits = (candidate: Json): void => {
@@ -260,8 +269,9 @@ export function planImport(source: WorkbenchSource, existing: { config: Json; se
   const optionsItem = options.options ? planOptions(options.options, config, secrets, fits, notes) : null;
   const monitorItem = options.monitor ? planMonitor(options.monitor, config, fits, notes) : null;
   const asset = options.asset ? planAsset(options.asset, config, fits, options.assetOwner, notes) : null;
+  const crossex = options.crossex ? planCrossex(options.crossex, config, secrets, fits, notes) : null;
   // Each added pair passed the checks with everything before it, and every key was derived once, so the result passes.
-  return { config, secrets, added, skipped, items, oil, options: optionsItem, monitor: monitorItem, asset: asset?.item ?? null, ledger: asset?.write ?? null, notes };
+  return { config, secrets, added, skipped, items, oil, options: optionsItem, monitor: monitorItem, asset: asset?.item ?? null, ledger: asset?.write ?? null, crossex: crossex?.item ?? null, crossexSettings: crossex?.settings ?? null, notes };
 }
 
 /**
@@ -332,13 +342,13 @@ function planOil(source: OilSource, config: Json, secrets: Json, fits: (candidat
  * and why the others cannot. Pairs that only fit one at a time (the request budget) show up when the selection is
  * imported. Throws when the existing files fail their checks: nothing could be imported then.
  */
-export function previewImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; oil?: OilSource; options?: OptionsSource; monitor?: MonitorSource; asset?: AssetSource }): { items: PreviewItem[]; oil: OilItem[]; options: OptionsItem | null; monitor?: MonitorItem; asset?: AssetItem; notes: string[] } {
+export function previewImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; oil?: OilSource; options?: OptionsSource; monitor?: MonitorSource; asset?: AssetSource; crossex?: CrossexSource }): { items: PreviewItem[]; oil: OilItem[]; options: OptionsItem | null; monitor?: MonitorItem; asset?: AssetItem; crossex?: CrossexItem; notes: string[] } {
   // The oil and options accounts, the monitor and the ledger are planned once, with no pair: the page imports them
   // together or on their own.
   const base = planImport(source, existing, { secretsFile: options.secretsFile, only: [], requireMargin: true, ...(options.oil ? { oil: options.oil } : {}), ...(options.options ? { options: options.options } : {}),
-    ...(options.monitor ? { monitor: options.monitor } : {}), ...(options.asset ? { asset: options.asset } : {}) });
+    ...(options.monitor ? { monitor: options.monitor } : {}), ...(options.asset ? { asset: options.asset } : {}), ...(options.crossex ? { crossex: options.crossex } : {}) });
   const parsedBase = parseServiceConfig(base.config);
-  const known = new Map(parseServiceSecrets(base.secrets, [], parsedBase.oil?.accounts.map(account => account.venue) ?? [], parsedBase.options !== undefined).accounts);
+  const known = new Map(parseServiceSecrets(base.secrets, [], parsedBase.oil?.accounts.map(account => account.venue) ?? [], parsedBase.options !== undefined, parsedBase.crossex !== undefined).accounts);
   const items = source.pairs.map((pair): PreviewItem => {
     const id = String(pair.id);
     const name = typeof pair.name === 'string' ? printable(pair.name).slice(0, 80) : null;
@@ -348,7 +358,7 @@ export function previewImport(source: WorkbenchSource, existing: { config: Json;
     catch (error) { item = { id, status: 'skipped', detail: error instanceof Error ? error.message : String(error) }; }
     return { id: printable(id).slice(0, 64), name, marginEnabled, importable: item?.status === 'added', detail: printable(item?.detail ?? '未能判断').slice(0, 300) };
   });
-  return { items, oil: base.oil, options: base.options, ...(base.monitor ? { monitor: base.monitor } : {}), ...(base.asset ? { asset: base.asset } : {}), notes: base.notes };
+  return { items, oil: base.oil, options: base.options, ...(base.monitor ? { monitor: base.monitor } : {}), ...(base.asset ? { asset: base.asset } : {}), ...(base.crossex ? { crossex: base.crossex } : {}), notes: base.notes };
 }
 
 /** Prints the raw data column of both tables; run with no environment, as the database's owner when that matters. */
@@ -376,8 +386,8 @@ export function readWorkbench(envFile: string, dataDir: string | undefined, opti
   const env = { ...base, ...(existsSync(moduleEnv) ? parseEnv(readFileSync(moduleEnv, 'utf8')) : {}) };
   const database = join(data, 'modules', 'aster', 'trading.sqlite3');
   if (!existsSync(database)) {
-    // An oil, options, monitor or asset import does not need the ASTER module: a workbench that never ran it has no pairs to bring.
-    if (options.asterOptional && (existsSync(join(data, 'hub.sqlite')) || ['greeks', 'monitor', 'asset'].some(name => existsSync(join(data, 'modules', name))))) return { pairs: [], accounts: [], env, database, data };
+    // An oil, options, monitor, asset or CrossEx import does not need the ASTER module: a workbench that never ran it has no pairs to bring.
+    if (options.asterOptional && (existsSync(join(data, 'hub.sqlite')) || ['greeks', 'monitor', 'asset', 'crossex'].some(name => existsSync(join(data, 'modules', name))))) return { pairs: [], accounts: [], env, database, data };
     throw new Error(`没有找到工作台的 ASTER 数据库 ${database}；工作台数据目录不在默认位置时用 --workbench-data 指定`);
   }
   // A read-only connection still creates -wal and -shm when it is the first one on a WAL database (the workbench opens
@@ -655,13 +665,16 @@ async function main(): Promise<void> {
   const { values } = parseArgs({ options: {
     config: { type: 'string' }, 'workbench-env': { type: 'string' }, 'workbench-data': { type: 'string' }, pairs: { type: 'string' }, oil: { type: 'boolean' }, options: { type: 'boolean' },
     monitor: { type: 'boolean' }, asset: { type: 'boolean' }, 'asset-owner': { type: 'string' }, 'data-dir': { type: 'string' }, 'dry-run': { type: 'boolean' },
+    crossex: { type: 'boolean' },
   } });
   const withOil = values.oil === true, withOptions = values.options === true, withMonitor = values.monitor === true, withAsset = values.asset === true;
-  const modules = withOil || withOptions || withMonitor || withAsset;
+  const withCrossex = values.crossex === true;
+  const modules = withOil || withOptions || withMonitor || withAsset || withCrossex;
   const assetOwner = values['asset-owner'], dataDir = values['data-dir'];
   if (assetOwner !== undefined && !withAsset) throw new Error('--asset-owner 须和 --asset 一起使用');
   if (assetOwner !== undefined && !ASSET_OWNER.test(assetOwner)) throw new Error('--asset-owner 须为工作台资产用户名（1–64 个字符，字母、数字或 . _ @ -，以字母或数字开头）');
   if (withAsset && (dataDir === undefined || !isAbsolute(dataDir))) throw new Error('--asset 需要 --data-dir <本服务数据目录的绝对路径>');
+  if (withCrossex && (dataDir === undefined || !isAbsolute(dataDir))) throw new Error('--crossex 需要 --data-dir <本服务数据目录的绝对路径>');
   // --oil / --options / --monitor / --asset alone bring their part only; pairs come along when named.
   const only = values.pairs ? values.pairs.split(',').map(item => item.trim()).filter(Boolean) : modules ? [] : undefined;
   const envFile = values['workbench-env'] ?? WORKBENCH_ENV;
@@ -670,15 +683,18 @@ async function main(): Promise<void> {
   const optionsSource = withOptions ? await resolveOptionsAccount(readWorkbenchOptions(envFile, source.data)) : undefined;
   const monitorSource = withMonitor ? readWorkbenchMonitor(source.data) : undefined;
   const assetSource = withAsset ? readWorkbenchAsset(source.data, dataDir!, assetOwner === undefined ? {} : { owner: assetOwner }) : undefined;
+  const crossexSource = withCrossex ? readWorkbenchCrossex(source.data) : undefined;
   const { configFile, secretsFile, existing } = readExisting(values.config ?? '');
 
   const plan = planImport(source, existing, { secretsFile, ...(only ? { only } : {}), ...(oilSource ? { oil: oilSource } : {}), ...(optionsSource ? { options: optionsSource } : {}),
-    ...(monitorSource ? { monitor: monitorSource } : {}), ...(assetSource ? { asset: assetSource } : {}), ...(assetOwner === undefined ? {} : { assetOwner }) });
+    ...(monitorSource ? { monitor: monitorSource } : {}), ...(assetSource ? { asset: assetSource } : {}), ...(assetOwner === undefined ? {} : { assetOwner }),
+    ...(crossexSource ? { crossex: crossexSource } : {}) });
   const out = (line: string): void => { process.stdout.write(line + '\n'); };
   if (!modules || (only?.length ?? 0) > 0) out(`工作台数据库：${source.database}（只读）`);
   if (oilSource) out(`工作台执行账户：${oilSource.hub}（只读）`);
   if (optionsSource) out(`工作台期权状态：${optionsSource.stateFile}（只读）`);
   if (assetSource) out(`工作台资产账本：${assetSource.ledger}（只读）`);
+  if (crossexSource) out(`工作台 CrossEx 数据库：${crossexSource.database}（只读）`);
   for (const line of plan.added) out(`导入配对 ${line}`);
   for (const line of plan.skipped) out(`跳过 ${line}`);
   for (const item of plan.oil) out(item.status === 'added' ? `导入原油执行账户 ${item.detail}` : `跳过原油执行账户 ${VENUE_NAMES[item.venue]}${item.accountId ? ` ${item.accountId}` : ''}：${item.detail}`);
@@ -689,11 +705,12 @@ async function main(): Promise<void> {
     // Which user's ledger is not guessed: nothing is written until one is named.
     if (plan.asset.status !== 'added' && assetOwner === undefined && plan.asset.owners.length > 1) throw new Error(`工作台资产账本有多个用户（${plan.asset.owners.map(item => item.owner).join('、')}${plan.asset.more ? ` 等 ${plan.asset.owners.length + plan.asset.more} 个` : ''}），请用 --asset-owner <用户> 指定，未改动任何文件`);
   }
+  if (plan.crossex) out(plan.crossex.status === 'added' ? `导入 CrossEx 账户 ${plan.crossex.detail}` : `跳过 CrossEx 账户${plan.crossex.accountId ? ` ${plan.crossex.accountId}` : ''}：${plan.crossex.detail}`);
   for (const line of plan.notes) out(line);
   const oilAdded = plan.oil.filter(item => item.status === 'added').length, optionsAdded = plan.options?.status === 'added';
-  const monitorAdded = plan.monitor?.status === 'added', assetAdded = plan.asset?.status === 'added';
-  if (plan.added.length === 0 && oilAdded === 0 && !optionsAdded && !monitorAdded && !assetAdded) {
-    const what = only?.length || !modules ? '配对' : [withOil ? '原油执行账户' : '', withOptions ? '期权账户' : '', withMonitor ? '行情监控' : '', withAsset ? '资产账本' : ''].filter(Boolean).join('或');
+  const monitorAdded = plan.monitor?.status === 'added', assetAdded = plan.asset?.status === 'added', crossexAdded = plan.crossex?.status === 'added';
+  if (plan.added.length === 0 && oilAdded === 0 && !optionsAdded && !monitorAdded && !assetAdded && !crossexAdded) {
+    const what = only?.length || !modules ? '配对' : [withOil ? '原油执行账户' : '', withOptions ? '期权账户' : '', withMonitor ? '行情监控' : '', withAsset ? '资产账本' : '', withCrossex ? 'CrossEx 账户' : ''].filter(Boolean).join('或');
     if (!existing) throw new Error(only?.length || !modules ? '工作台里没有可导入的配对（需开启保证金平衡、配好主账户凭据前缀且凭据齐全），未生成配置' : `工作台里没有可导入的${what}，未生成配置`);
     out(`没有新的${what}，配置未改动`);
     return;
@@ -705,6 +722,8 @@ async function main(): Promise<void> {
     out(`已写入资产账本 ${join(dataDir!, 'asset.sqlite')}：用户 ${last.owner}，资产 ${last.assets} 条、快照 ${last.snapshots} 条`);
     for (const line of connectionLines(last.connections)) out(line);
   }
+  // The CrossEx page settings likewise before the files; an existing crossex.sqlite keeps its own.
+  if (plan.crossexSettings) out(writeCrossexSettingsAsService(dataDir!, plan.crossexSettings) ? `已把工作台 CrossEx 页面设置写入 ${join(dataDir!, 'crossex.sqlite')}` : '本服务的 crossex.sqlite 已有页面设置，保留不变');
   if (filesUnchanged(plan, existing)) {
     out('配置未改动（资产账本已启用，只重新导入了账本；服务无需重启，页面下次读取即是新账本）');
     return;
@@ -712,7 +731,8 @@ async function main(): Promise<void> {
   // Keys first, so the config never names a key file that lacks its accounts.
   writeBoth(secretsFile, fileText(plan.secrets), configFile, fileText(plan.config));
   const what = [plan.added.length ? '导入的配对登记为停用，在工作台删除该配对后到本项目页面启用' : '', oilAdded ? '原油执行账户已写入，服务启动后页面出现「原油」标签' : '', optionsAdded ? '期权账户已写入，服务启动后页面出现「期权」标签' : '',
-    monitorAdded ? '行情监控已写入，服务启动后页面出现「行情监控」标签' : '', assetAdded && existing?.config.asset === undefined ? '资产账本已启用，服务启动后页面出现「资产」标签' : ''].filter(Boolean).join('；');
+    monitorAdded ? '行情监控已写入，服务启动后页面出现「行情监控」标签' : '', assetAdded && existing?.config.asset === undefined ? '资产账本已启用，服务启动后页面出现「资产」标签' : '',
+    crossexAdded ? 'CrossEx 账户已写入，服务启动后页面出现「CrossEx」标签；导入后在工作台 CrossEx 设置页断开账户' : ''].filter(Boolean).join('；');
   out(`已写入 ${configFile} 与 ${secretsFile}；${what}`);
 }
 

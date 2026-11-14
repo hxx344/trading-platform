@@ -230,3 +230,15 @@ table.data.history{min-width:0}
 .aster-desk .options-desk .subnav .count{margin-left:0}
 .aster-desk .options-desk .button{line-height:inherit;white-space:normal}
 .aster-desk .options-desk .button.primary:disabled:hover{background:var(--accent);border-color:transparent}
+/* CrossEx 页（web/src/crossex，样式来自工作台 modules/crossex/src，见 crossex/crossex.css）。工作台用 style={{ width }} 画的
+   条（维持保证金率、盘口深度、双腿数量对比）在本服务的 CSP 下改为 crossex/FillBar.tsx 的 SVG，尺寸与颜色取工作台原规则
+   （.kpi .meter i、.book-row>i、.position-quantity-track>span）的值。 */
+.aster-desk .crossex-page .fill-bar{display:block;width:100%;height:100%}
+.aster-desk .crossex-page .kpi .meter .fill-bar rect{fill:var(--emerald)}
+.aster-desk .crossex-page .book-row>.fill-bar{position:absolute;right:0;top:0;bottom:0;z-index:0;pointer-events:none}
+.aster-desk .crossex-page .book-row>.fill-bar rect{fill:var(--emerald-soft)}
+.aster-desk .crossex-page .book-row.sell>.fill-bar rect{fill:var(--error-soft)}
+.aster-desk .crossex-page .position-quantity-track .fill-bar rect{fill:var(--accent)}
+.aster-desk .crossex-page .position-quantity-comparison>div:nth-child(2) .position-quantity-track .fill-bar rect{fill:var(--amber)}
+/* The read-only hard caps sit in the settings disconnect-row (a wrapping flex row); take the full width like its label. */
+.aster-desk .crossex-page .disconnect-row>.ticket-details{width:100%}

@@ -320,6 +320,8 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
 
   /** Queues a message that does not come from the event log (start, stop, lost lease). */
   function notify(text: string): void { tx(() => insert(text, now())); }
+  /** Like notify, once per key while the key is kept (the outbox retention period); false when already sent. */
+  function notifyOnce(key: string, text: string): boolean { return tx(() => { const at = now(); if (!first(key, at)) return false; insert(text, at); return true; }); }
 
   async function post(text: string): Promise<void> {
     if (!feishu) return;
@@ -351,7 +353,7 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
   }
 
   return {
-    poll, notify, flush,
+    poll, notify, notifyOnce, flush,
     pending: (): number => (db.prepare('SELECT COUNT(*) AS n FROM outbox WHERE sent_at IS NULL').get() as { n: number }).n,
     /** For the status page: the outbox's counts, its last delivery and failure, and its newest messages. */
     status() {

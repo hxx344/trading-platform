@@ -15,13 +15,14 @@ import { parseOilConfig, parseOilSecrets, type OilConfig } from './oil-config.ts
 import { parseMonitorConfig, type MonitorConfig } from './monitor-config.ts';
 import { parseAssetConfig, type AssetConfig } from './asset-config.ts';
 import { parseOptionsConfig, parseOptionsSecrets, type OptionsConfig } from './options-config.ts';
+import { parseCrossexConfig, parseCrossexSecrets, type CrossexServiceConfig } from './crossex-config.ts';
 
 const ACCOUNT_NAME = /^[0-9A-Za-z_-]{1,64}$/;
 const FEISHU_HOOK = /^https:\/\/open\.(feishu\.cn|larksuite\.com)\/open-apis\/bot\/v2\/hook\/[0-9A-Za-z_-]{8,128}$/;
 export const DEFAULT_PORT = 4720;
 export const MAX_PAIRS = 20;
 /** Top-level blocks of modules besides the ASTER pairs; with any of them configured, pairs may be left out. */
-export const MODULE_KEYS = ['oil', 'options', 'monitor', 'asset'] as const;
+export const MODULE_KEYS = ['oil', 'options', 'monitor', 'asset', 'crossex'] as const;
 
 /** `adl` seeds the pair's ADL settings when it is first registered; afterwards the page owns them. */
 export interface ServicePair { id: string; main: string; long: string; short: string; transfer: TransferConfig; adl?: AdlConfig }
@@ -40,6 +41,8 @@ export interface ServiceConfig {
   asset?: AssetConfig;
   /** The options module's Bybit account and limits; absent means no options module (options-config.ts). */
   options?: OptionsConfig;
+  /** The Gate CrossEx account and its hard caps; absent means no CrossEx module (crossex-config.ts). */
+  crossex?: CrossexServiceConfig;
   /** The scheduled ASTER summary card (summary.ts); absent: every 60 minutes. 0 turns it off. */
   summary?: { intervalMinutes: number };
 }
@@ -50,6 +53,7 @@ export interface ServiceSecrets {
   feishuScheduled?: FeishuSecret | null;
   /** Keys of the oil accounts' venues; only with oil configured. */ exchanges?: Map<Venue, LiveCredentials>;
   /** The options module's Bybit key; only with options configured. */ bybitOptions?: LiveCredentials;
+  /** The CrossEx module's Gate key; only with crossex configured. */ gate?: LiveCredentials;
 }
 
 const perMinute = (ms: number): number => Math.ceil(60_000 / ms);
@@ -143,6 +147,7 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   const options = modules.includes('options') ? parseOptionsConfig(value.options) : undefined;
   const monitor = modules.includes('monitor') ? parseMonitorConfig(value.monitor) : undefined;
   const asset = modules.includes('asset') ? parseAssetConfig(value.asset) : undefined;
+  const crossex = modules.includes('crossex') ? parseCrossexConfig(value.crossex) : undefined;
   const pairsInput: unknown = hasModule && value.pairs === undefined ? [] : value.pairs;
   if (typeof value.secretsFile !== 'string' || !isAbsolute(value.secretsFile)) throw new Error('secretsFile 必须是绝对路径');
   const port = value.port === undefined ? DEFAULT_PORT : integer(value.port, 1_024, 65_535, '端口');
@@ -175,11 +180,11 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   const adlReserve = budgetRaw.adlReserve === undefined ? Math.floor(limitPerMinute / 6) : integer(budgetRaw.adlReserve, 0, limitPerMinute - 50, 'ADL 预留权重');
   if (limitPerMinute - adlReserve < needed) throw new Error(`${pairs.length} 个配对每分钟约需请求权重 ${needed}，而每分钟上限 ${limitPerMinute} 减去 ADL 预留 ${adlReserve} 只剩 ${limitPerMinute - adlReserve}；请调大 budget.limitPerMinute 或去掉 budget 使用自动值`);
   const summary = value.summary === undefined ? undefined : { intervalMinutes: integer(exactKeys(value.summary, ['intervalMinutes'], []).intervalMinutes, 0, 1_440, '定时摘要间隔（分钟，0 为关闭）') };
-  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs, ...(oil ? { oil } : {}), ...(options ? { options } : {}), ...(monitor ? { monitor } : {}), ...(asset ? { asset } : {}), ...(summary ? { summary } : {}) };
+  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs, ...(oil ? { oil } : {}), ...(options ? { options } : {}), ...(monitor ? { monitor } : {}), ...(asset ? { asset } : {}), ...(summary ? { summary } : {}), ...(crossex ? { crossex } : {}) };
 }
 
-export function parseServiceSecrets(raw: unknown, needed: readonly string[], oilVenues: readonly Venue[] = [], options = false): ServiceSecrets {
-  const value = exactKeys(raw, ['accounts'], ['feishu', 'feishuScheduled', ...(oilVenues.length ? ['binance', 'bybit'] : []), ...(options ? ['bybitOptions'] : [])]);
+export function parseServiceSecrets(raw: unknown, needed: readonly string[], oilVenues: readonly Venue[] = [], options = false, crossex = false): ServiceSecrets {
+  const value = exactKeys(raw, ['accounts'], ['feishu', 'feishuScheduled', ...(oilVenues.length ? ['binance', 'bybit'] : []), ...(options ? ['bybitOptions'] : []), ...(crossex ? ['gate'] : [])]);
   if (value.accounts === null || typeof value.accounts !== 'object' || Array.isArray(value.accounts)) throw new Error('accounts 须为 { 账户名: { user, signer, privateKey } }');
   const accounts = new Map<string, AsterCredentials>();
   for (const [name, item] of Object.entries(value.accounts as Record<string, unknown>)) {
@@ -191,7 +196,7 @@ export function parseServiceSecrets(raw: unknown, needed: readonly string[], oil
   if (new Set(users).size !== users.length) throw new Error('两个账户名指向同一个钱包地址');
   const feishu = parseFeishu(value.feishu, 'feishu');
   const feishuScheduled = parseFeishu(value.feishuScheduled, 'feishuScheduled');
-  return { accounts, feishu, ...(feishuScheduled ? { feishuScheduled } : {}), ...(oilVenues.length ? { exchanges: parseOilSecrets(value, oilVenues) } : {}), ...(options ? { bybitOptions: parseOptionsSecrets(value) } : {}) };
+  return { accounts, feishu, ...(feishuScheduled ? { feishuScheduled } : {}), ...(oilVenues.length ? { exchanges: parseOilSecrets(value, oilVenues) } : {}), ...(options ? { bybitOptions: parseOptionsSecrets(value) } : {}), ...(crossex ? { gate: parseCrossexSecrets(value) } : {}) };
 }
 
 function parseFeishu(raw: unknown, name: string): FeishuSecret | null {
@@ -224,7 +229,7 @@ export function loadServiceSecrets(config: ServiceConfig): ServiceSecrets {
   const raw = parsePrivateJson(readPrivateFile(config.secretsFile, '密钥文件'), '密钥文件');
   // parseAsterCredentials never quotes a key; other messages name only account names and fields.
   try {
-    const secrets = parseServiceSecrets(raw, [...new Set(config.pairs.flatMap(pair => [pair.main, pair.long, pair.short]))], config.oil?.accounts.map(account => account.venue) ?? [], config.options !== undefined);
+    const secrets = parseServiceSecrets(raw, [...new Set(config.pairs.flatMap(pair => [pair.main, pair.long, pair.short]))], config.oil?.accounts.map(account => account.venue) ?? [], config.options !== undefined, config.crossex !== undefined);
     assertDistinctSigners(config, secrets);
     return secrets;
   } catch (error) { throw fail('密钥文件', error); }

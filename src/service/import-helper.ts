@@ -23,6 +23,7 @@ import { VENUE_NAMES } from '../contracts.ts';
 import type { FetchLike } from '../live/http.ts';
 import { readWorkbenchOptions, resolveOptionsAccount, type OptionsSource } from './import-options.ts';
 import { connectionLines, readWorkbenchAsset, readWorkbenchMonitor, writeLedgerAsService, type AssetSource, type LedgerWrite, type WrittenLedger } from './import-modules.ts';
+import { readWorkbenchCrossex, writeCrossexSettingsAsService, type CrossexSource } from './import-crossex.ts';
 
 /** Requests handled in one start; one that arrives while the last is handled is still taken. */
 const MAX_PER_START = 5;
@@ -51,6 +52,8 @@ export interface HelperOptions {
   procDir?: string;
   /** Writes the asset ledger rows into asset.sqlite (tests); import-writer.ts as the data directory's owner by default. */
   writeLedger?: (dataDir: string, write: LedgerWrite) => Promise<WrittenLedger> | WrittenLedger;
+  /** Copies the CrossEx page settings into crossex.sqlite (tests); crossex/import-writer.ts as the data directory's owner by default. */
+  writeCrossexSettings?: (dataDir: string, settings: Record<string, unknown>) => boolean;
   now?: () => number;
   log?: (line: string) => void;
 }
@@ -211,10 +214,11 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
   const wantsOptions = request.action === 'preview' || request.options === true;
   const wantsMonitor = request.action === 'preview' || request.monitor === true;
   const wantsAsset = request.action === 'preview' || request.asset === true;
+  const wantsCrossex = request.action === 'preview' || request.crossex === true;
   const pairsWanted = request.action === 'preview' || (request.pairs?.length ?? 0) > 0;
   let source: ReturnType<typeof readWorkbench>, files: ReturnType<typeof readExisting>;
   try {
-    source = readWorkbench(options.workbenchEnv, options.workbenchData, { asterOptional: wantsOil || wantsOptions || wantsMonitor || wantsAsset });
+    source = readWorkbench(options.workbenchEnv, options.workbenchData, { asterOptional: wantsOil || wantsOptions || wantsMonitor || wantsAsset || wantsCrossex });
     files = readExisting(options.configFile);
   } catch (error) { answer({ phase: 'failed', message: message(error) }); return; }
   // The oil accounts' read failing does not hold the pairs back: the page shows why next to the oil choice.
@@ -230,25 +234,31 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
   const monitor = wantsMonitor ? readWorkbenchMonitor(source.data) : undefined;
   let asset: AssetSource | undefined, assetError: string | undefined;
   if (wantsAsset) { try { asset = readWorkbenchAsset(source.data, options.dataDir, request.assetOwner === undefined ? {} : { owner: request.assetOwner }); } catch (error) { assetError = message(error); } }
-  const oilReport = { ...(oilError !== undefined ? { oilError } : {}), ...(optionsError !== undefined ? { optionsError } : {}), ...(assetError !== undefined ? { assetError } : {}) };
-  const withOptions = { ...(optionsSource ? { options: optionsSource } : {}), ...(monitor ? { monitor } : {}), ...(asset ? { asset } : {}) };
+  // The CrossEx account likewise (its database and key, read as their owner).
+  let crossex: CrossexSource | undefined, crossexError: string | undefined;
+  if (wantsCrossex) { try { crossex = readWorkbenchCrossex(source.data); } catch (error) { crossexError = message(error); } }
+  const oilReport = { ...(oilError !== undefined ? { oilError } : {}), ...(optionsError !== undefined ? { optionsError } : {}), ...(assetError !== undefined ? { assetError } : {}),
+    ...(crossexError !== undefined ? { crossexError } : {}) };
+  const withOptions = { ...(optionsSource ? { options: optionsSource } : {}), ...(monitor ? { monitor } : {}), ...(asset ? { asset } : {}), ...(crossex ? { crossex } : {}) };
   if (request.action === 'preview') {
     try {
-      const { items, oil: oilItems, options: optionsItem, monitor: monitorItem, asset: assetItem, notes } = previewImport(source, files.existing, { secretsFile: files.secretsFile, ...(oil ? { oil } : {}), ...withOptions });
+      const { items, oil: oilItems, options: optionsItem, monitor: monitorItem, asset: assetItem, crossex: crossexItem, notes } = previewImport(source, files.existing, { secretsFile: files.secretsFile, ...(oil ? { oil } : {}), ...withOptions });
       const pairsLine = items.length ? `工作台有 ${items.length} 个配对，其中 ${items.filter(item => item.importable).length} 个可以导入` : '工作台里没有 ASTER 保证金平衡配对';
       const oilLine = oil ? `；原油执行账户 ${oilItems.length} 个，其中 ${oilItems.filter(item => item.status === 'added').length} 个可以导入` : '';
       const optionsLine = optionsItem ? `；期权账户${optionsItem.status === 'added' ? '可以导入' : '不能导入'}` : '';
       const monitorLine = monitorItem ? `；行情监控${monitorItem.status === 'added' ? '可以启用' : monitorItem.enabled ? '已启用' : '不能启用'}` : '';
       const ready = assetItem?.owners.filter(item => item.importable).length ?? 0;
       const assetLine = assetItem ? `；资产账本${ready ? `可以导入（${ready} 个用户）` : '不能导入'}` : '';
-      answer({ phase: 'done', message: pairsLine + oilLine + optionsLine + monitorLine + assetLine, database: source.database, preview: items, ...(oil ? { oil: oilItems } : {}), ...(optionsItem ? { options: optionsItem } : {}),
-        ...(monitorItem ? { monitor: monitorItem } : {}), ...(assetItem ? { asset: assetItem } : {}), ...oilReport, notes });
+      const crossexLine = crossexItem ? `；CrossEx 账户${crossexItem.status === 'added' ? '可以导入' : '不能导入'}` : '';
+      answer({ phase: 'done', message: pairsLine + oilLine + optionsLine + monitorLine + assetLine + crossexLine, database: source.database, preview: items, ...(oil ? { oil: oilItems } : {}), ...(optionsItem ? { options: optionsItem } : {}),
+        ...(monitorItem ? { monitor: monitorItem } : {}), ...(assetItem ? { asset: assetItem } : {}), ...(crossexItem ? { crossex: crossexItem } : {}), ...oilReport, notes });
     } catch (error) { answer({ phase: 'failed', message: message(error), ...oilReport }); }
     return;
   }
   // Nothing to plan: no pair chosen and none of the ticked modules could be read.
-  if (!pairsWanted && !oil && !optionsSource && !monitor && !asset) {
-    const unread = [oilError !== undefined ? `原油执行账户（${oilError}）` : '', optionsError !== undefined ? `期权账户（${optionsError}）` : '', assetError !== undefined ? `资产账本（${assetError}）` : ''].filter(Boolean).join('；');
+  if (!pairsWanted && !oil && !optionsSource && !monitor && !asset && !crossex) {
+    const unread = [oilError !== undefined ? `原油执行账户（${oilError}）` : '', optionsError !== undefined ? `期权账户（${optionsError}）` : '', assetError !== undefined ? `资产账本（${assetError}）` : '',
+      crossexError !== undefined ? `CrossEx 账户（${crossexError}）` : ''].filter(Boolean).join('；');
     answer({ phase: 'failed', message: `无法读取工作台的${unread || '所选内容'}，配置未改动` }); return;
   }
   let plan: ReturnType<typeof planImport>;
@@ -256,19 +266,23 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
   catch (error) { answer({ phase: 'failed', message: message(error), ...oilReport }); return; }
   const oilAdded = plan.oil.filter(item => item.status === 'added').map(item => VENUE_NAMES[item.venue]);
   const optionsAdded = plan.options?.status === 'added', monitorAdded = plan.monitor?.status === 'added', assetAdded = plan.asset?.status === 'added';
+  const crossexAdded = plan.crossex?.status === 'added';
   const assetBefore = files.existing?.config.asset !== undefined;
-  const notes = [...plan.notes, ...(oilError !== undefined ? [`原油执行账户未导入：${oilError}`] : []), ...(optionsError !== undefined ? [`期权账户未导入：${optionsError}`] : []), ...(assetError !== undefined ? [`资产账本未导入：${assetError}`] : [])];
+  const notes = [...plan.notes, ...(oilError !== undefined ? [`原油执行账户未导入：${oilError}`] : []), ...(optionsError !== undefined ? [`期权账户未导入：${optionsError}`] : []), ...(assetError !== undefined ? [`资产账本未导入：${assetError}`] : []),
+    ...(crossexError !== undefined ? [`CrossEx 账户未导入：${crossexError}`] : [])];
   const report = { database: source.database, imported: plan.items, ...(request.oil ? { oil: plan.oil } : {}), ...(request.options && plan.options ? { options: plan.options } : {}),
-    ...(request.monitor && plan.monitor ? { monitor: plan.monitor } : {}), ...(request.asset && plan.asset ? { asset: plan.asset } : {}), ...oilReport, notes };
-  if (plan.added.length === 0 && oilAdded.length === 0 && !optionsAdded && !monitorAdded && !assetAdded) {
-    const chosen = [pairsWanted ? '所选配对' : '', request.oil ? '原油执行账户' : '', request.options ? '期权账户' : '', request.monitor ? '行情监控' : '', request.asset ? '资产账本' : ''].filter(Boolean);
+    ...(request.monitor && plan.monitor ? { monitor: plan.monitor } : {}), ...(request.asset && plan.asset ? { asset: plan.asset } : {}),
+    ...(request.crossex && plan.crossex ? { crossex: plan.crossex } : {}), ...oilReport, notes };
+  if (plan.added.length === 0 && oilAdded.length === 0 && !optionsAdded && !monitorAdded && !assetAdded && !crossexAdded) {
+    const chosen = [pairsWanted ? '所选配对' : '', request.oil ? '原油执行账户' : '', request.options ? '期权账户' : '', request.monitor ? '行情监控' : '', request.asset ? '资产账本' : '', request.crossex ? 'CrossEx 账户' : ''].filter(Boolean);
     answer({ phase: 'failed', message: `${chosen.join('与')}${chosen.length > 1 || pairsWanted ? '都' : ''}不能导入，配置未改动`, ...report });
     return;
   }
   const what = [plan.added.length ? `${plan.added.length} 个配对` : '', oilAdded.length ? `原油执行账户（${oilAdded.join('、')}）` : '', optionsAdded ? `期权账户（Bybit ${plan.options?.accountId ?? ''}）` : '',
-    monitorAdded ? '行情监控' : '', assetAdded ? `资产账本（用户 ${plan.asset?.owner ?? ''}）` : ''].filter(Boolean).join('与');
+    monitorAdded ? '行情监控' : '', assetAdded ? `资产账本（用户 ${plan.asset?.owner ?? ''}）` : '', crossexAdded ? `CrossEx 账户（Gate ${plan.crossex?.accountId ?? ''}）` : ''].filter(Boolean).join('与');
   const after = [plan.added.length ? '配对登记为停用：先在旧工作台删除该配对，再在本页面启用' : '', oilAdded.length ? '原油执行账户已生效，页面出现「原油」标签' : '', optionsAdded ? '期权账户已生效，页面出现「期权」标签' : '',
-    monitorAdded ? '行情监控已生效，页面出现「行情监控」标签' : '', assetAdded && !assetBefore ? '资产账本已生效，页面出现「资产」标签' : ''].filter(Boolean).join('；');
+    monitorAdded ? '行情监控已生效，页面出现「行情监控」标签' : '', assetAdded && !assetBefore ? '资产账本已生效，页面出现「资产」标签' : '',
+    crossexAdded ? 'CrossEx 账户已生效，页面出现「CrossEx」标签；请在工作台 CrossEx 设置页断开账户' : ''].filter(Boolean).join('；');
   // The ledger first (docs/module-import.md §3): when it fails nothing has changed; once written it is whole, and stays
   // whatever becomes of the config (without `asset` the service does not read it).
   let ledgerLine = '';
@@ -280,6 +294,14 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
       // Names and reasons only; the page shows them with the other notes.
       for (const line of connectionLines(last.connections)) { notes.push(line); log(line); }
     } catch (error) { answer({ phase: 'failed', message: `${message(error)}；配置未改动，本次没有导入任何内容，可重试`, ...report }); return; }
+  }
+  // The CrossEx page settings likewise before the files (a first import only); an existing crossex.sqlite keeps its own.
+  if (plan.crossexSettings) {
+    try {
+      const seeded = (options.writeCrossexSettings ?? writeCrossexSettingsAsService)(options.dataDir, plan.crossexSettings);
+      const line = seeded ? '已把工作台 CrossEx 页面设置写入本服务' : '本服务的 crossex.sqlite 已有页面设置，保留不变';
+      notes.push(line); log(line);
+    } catch (error) { answer({ phase: 'failed', message: `${message(error)}；配置未改动${plan.ledger ? '（资产账本已写入并保留）' : ''}，可重试`, ...report }); return; }
   }
   if (filesUnchanged(plan, files.existing)) {
     answer({ phase: 'done', message: `已重新导入${ledgerLine}；配置未改动，未重启服务，资产页下次读取即是新账本`, ...report });

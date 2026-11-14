@@ -12,6 +12,7 @@ import type { WebApp } from './web-assets.ts';
 import { ANTHROPIC_RETENTION_DAYS } from './vendor/anthropic-market.mjs';
 import { supportsExchange, type Exchange } from './vendor/exchange-comparison.mjs';
 import type { AssetStore } from './asset/store.ts';
+import type { CrossexViews } from './service/crossex.ts';
 import { AssetConflict } from './asset/sync-lock.ts';
 import { AssetInputError, INPUT_INVALID } from './asset/validation.ts';
 
@@ -124,6 +125,8 @@ export interface ServiceViews {
   summary?: { setInterval(minutes: number): unknown; sendNow(): unknown };
   /** The asset ledger's reads and writes (asset/store.ts); absent when the service runs without asset. */
   asset?: Omit<AssetStore, 'close'>;
+  /** The Gate CrossEx module's reads and writes (service/crossex.ts); absent when the service runs without crossex. */
+  crossex?: CrossexViews;
 }
 
 /** accessToken is exchanged once per browser at /login; session is the cookie value and the executor session id. */
@@ -422,6 +425,37 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       if (request.method === 'POST' && path === 'rfq') return send(response, 200, await options.rfqCreate(await readJson(request)));
       if (request.method === 'POST' && path === 'rfq/execute') return send(response, 200, await options.rfqExecute(await readJson(request)));
       if (request.method === 'POST' && path === 'rfq/cancel') return send(response, 200, await options.rfqCancel(await readJson(request)));
+      return send(response, 404, { code: 'not_found', message: '不存在' });
+    }
+    if (url.pathname.startsWith('/api/crossex/')) {
+      if (!views?.crossex) return send(response, 404, { code: 'not_found', message: '本服务没有配置 CrossEx 模块' });
+      // The check above covers POST; settings also takes PUT (the workbench's method), which needs the same marker.
+      if (request.method === 'PUT' && (request.headers['x-pa-executor'] !== '1' || !String(request.headers['content-type'] ?? '').startsWith('application/json'))) return send(response, 403, { code: 'csrf', message: '缺少本页面请求标记' });
+      const crossex = views.crossex, path = url.pathname.slice('/api/crossex/'.length);
+      try {
+        if (request.method === 'GET' && path === 'state') return send(response, 200, crossex.state(url.searchParams.get('opportunities') !== '0', url.searchParams.get('funding') === '1'));
+        if (request.method === 'GET' && path === 'bootstrap') return send(response, 200, crossex.bootstrap());
+        if ((request.method === 'PUT' || request.method === 'POST') && path === 'settings') return send(response, 200, crossex.settings(await readJson(request)));
+        if (request.method === 'POST' && path === 'refresh') { await readJson(request); return send(response, 200, await crossex.refresh()); }
+        if (request.method === 'GET' && path === 'instruments') return send(response, 200, await crossex.instruments());
+        if (request.method === 'GET' && path === 'market') return send(response, 200, await crossex.market(url.searchParams.get('symbol'), url.searchParams.get('interval') || '5m'));
+        if (request.method === 'POST' && path === 'preview') return send(response, 200, await crossex.preview(await readJson(request)));
+        if (request.method === 'POST' && path === 'open-capacity') return send(response, 200, await crossex.openCapacity(await readJson(request)));
+        if (request.method === 'POST' && path === 'confirm') return send(response, 200, await crossex.confirm(await readJson(request)));
+        if (request.method === 'POST' && path === 'cancel') return send(response, 200, await crossex.cancel(await readJson(request)));
+        if (request.method === 'GET' && path.startsWith('requests/')) {
+          let id: string;
+          try { id = decodeURIComponent(path.slice('requests/'.length)); } catch { return send(response, 400, { code: 'crossex', message: '请求编号无效' }); }
+          return send(response, 200, await crossex.request(id));
+        }
+      } catch (error) {
+        if (error instanceof ContractError) throw error;
+        const failure = crossex.failure(error);
+        // Anything not raised as the runtime's own error is not shown: it may carry internals.
+        if (failure) return send(response, failure.status, failure.body);
+        process.stderr.write(`CrossEx 接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}\n`);
+        return send(response, 500, { code: 'crossex', message: '操作未完成，请检查服务状态' });
+      }
       return send(response, 404, { code: 'not_found', message: '不存在' });
     }
     if (request.method === 'GET' && (url.pathname === '/api/logs' || url.pathname === '/api/logs/problems')) {

@@ -1,5 +1,6 @@
-// Monitor M-2a: the oil spread collector (Brent − WTI on Binance BZUSDT / CLUSDT). Two loops: the two marks and the funding
-// terms every 10 s, completed 15-minute candles every 60 s through the vendored workbench module. Every request carries its
+// Monitor M-2a: the oil spread collector (Brent − WTI on Binance BZUSDT / CLUSDT). Three loops: the two marks and the funding
+// terms every 10 s, completed 15-minute candles every 60 s through the vendored workbench module, and (M-2d, funding.ts) the
+// settled four-hour funding rates every 5 minutes. Every request carries its
 // own timeout and is never retried within a round; a failed round keeps what was there and says why. The last quote and the
 // candles are kept in monitor.sqlite and read back at start, marked as a snapshot until a round succeeds.
 import {
@@ -7,6 +8,8 @@ import {
   type OilCandleRow, type OilCoverage, type OilFetcher, type OilIntraday, type OilIntradayWindow, type OilMarket,
 } from '../vendor/oil-market.mjs';
 import type { BinanceGate } from '../vendor/anthropic-market.mjs';
+import { OIL_FIRST_SETTLEMENT, OIL_FUNDING_MS, fetchOilFunding, validateOilFundingRows, type OilFundingRow } from '../vendor/settled-funding.mjs';
+import { FUNDING_REFRESH_MS, createFundingHistory, type FundingView } from './funding.ts';
 import { CANDLE_STALE_MS, QUOTE_STALE_MS, boundedReply, type LoopContext } from './anthropic.ts';
 import type { MonitorStore } from './store.ts';
 
@@ -14,6 +17,7 @@ export const OIL_QUOTE_REFRESH_MS = 10_000;
 export const OIL_RETENTION_DAYS = 400;
 export const OIL_QUOTE_KEY = 'oil.quote';
 export const OIL_CANDLE_KEY = 'oil.candles';
+export const OIL_FUNDING_KEY = 'oil.funding';
 const QUOTE_TIMEOUT_MS = 10_000, CANDLE_TIMEOUT_MS = 15_000, DAY_MS = 86_400_000;
 /**
  * How often a round also re-reads the gaps older than the last day. The vendored reader starts every round at the earliest
@@ -139,6 +143,13 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
     };
   };
   const quoteReport = reporter('报价读取'), quoteSave = reporter('报价保存'), candleReport = reporter('K 线读取'), candleSave = reporter('K 线保存');
+  const funding = createFundingHistory<OilFundingRow>({
+    // Binance pages 1000 settlements (~167 days) a request: the whole retention is a few requests, no need to split.
+    name: '原油', key: OIL_FUNDING_KEY, legs: ['brent', 'wti'], first: OIL_FIRST_SETTLEMENT, intervalMs: OIL_FUNDING_MS, spanMs: OIL_RETENTION_DAYS * DAY_MS,
+    read: () => store.oilFunding(), readState: () => store.readState(OIL_FUNDING_KEY)?.value ?? null, write: write => store.writeOilFunding(write),
+    validate: validateOilFundingRows, fetch: (start, end, at) => fetchOilFunding(start, { fetcher, timeout: CANDLE_TIMEOUT_MS, now: at, endTime: end }),
+    reason: oilError, aborted: () => stopping.signal.aborted, now, log,
+  });
 
   async function readQuote(): Promise<OilMarket> {
     const options = { fetcher, timeout: QUOTE_TIMEOUT_MS };
@@ -243,11 +254,14 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
       }
       return { coverage: { firstCommonObservation, lastCommonObservation, pairedObservationRows }, ...window.value, lastAttemptAt: iso(candleAttemptAt), lastError: candleError };
     },
+    refreshFunding: funding.refresh,
+    /** Every stored four-hour settlement since the retention cut; null before any row exists. */
+    funding: (): FundingView<OilFundingRow> | null => funding.view(),
     /** For the status page. */
     status() {
-      return { quoteAt: quote?.fetchedAt ?? null, quoteError, candlesAt: candles?.metadata.fetchedAt ?? null, candleRows: candles?.data.length ?? 0, candleError };
+      return { quoteAt: quote?.fetchedAt ?? null, quoteError, candlesAt: candles?.metadata.fetchedAt ?? null, candleRows: candles?.data.length ?? 0, candleError, ...funding.status() };
     },
-    /** The two loops; a round starts only after the previous one of its loop ended and the interval passed. */
+    /** The three loops; a round starts only after the previous one of its loop ended and the interval passed. */
     loops(context: LoopContext): Promise<void>[] {
       const every = (intervalMs: number, name: string, round: () => Promise<void>) => (async () => {
         while (!context.stopped()) {
@@ -256,7 +270,7 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
           await context.pause(intervalMs);
         }
       })();
-      return [every(OIL_QUOTE_REFRESH_MS, '报价', refreshQuote), every(OIL_CANDLE_REFRESH_MS, ' K 线', refreshCandles)];
+      return [every(OIL_QUOTE_REFRESH_MS, '报价', refreshQuote), every(OIL_CANDLE_REFRESH_MS, ' K 线', refreshCandles), every(FUNDING_REFRESH_MS, '资金费', funding.refresh)];
     },
     /** Cuts the requests in flight short; the loops then end at their next stop check. */
     stop(): void { stopping.abort(); },

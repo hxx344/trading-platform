@@ -1,11 +1,14 @@
-// Monitor M-2b: the Hynix ADR premium collector (Hyperliquid xyz:SKHY against xyz:SKHX ÷ 10). Two loops: the xyz dex's mids
-// every 10 s, completed 1-hour candles every 60 s through the vendored workbench module. Every request carries its own
+// Monitor M-2b: the Hynix ADR premium collector (Hyperliquid xyz:SKHY against xyz:SKHX ÷ 10). Three loops: the xyz dex's mids
+// every 10 s, completed 1-hour candles every 60 s through the vendored workbench module, and (M-2d, funding.ts) the settled
+// hourly funding rates every 5 minutes. Every request carries its own
 // timeout and is never retried within a round; a failed round keeps what was there and says why. The last quote and the
 // candles are kept in monitor.sqlite and read back at start, marked as a snapshot until a round succeeds.
 import {
   FIRST_FULL_HOUR, fetchHynixCandles, fetchHynixQuote, hynixCandleStart, validateHynixQuote, validateHynixRows,
   type HynixCandleRow, type HynixFetcher, type HynixQuote,
 } from '../vendor/hynix-market.mjs';
+import { HYNIX_FIRST_SETTLEMENT, HYNIX_FUNDING_MS, fetchHynixFunding, validateHynixFundingRows, type HynixFundingRow } from '../vendor/settled-funding.mjs';
+import { FUNDING_REFRESH_MS, createFundingHistory, type FundingView } from './funding.ts';
 import { CANDLE_STALE_MS, QUOTE_STALE_MS, boundedReply, type LoopContext } from './anthropic.ts';
 import type { MonitorStore } from './store.ts';
 
@@ -14,6 +17,9 @@ export const HYNIX_CANDLE_REFRESH_MS = 60_000;
 export const HYNIX_RETENTION_DAYS = 400;
 export const HYNIX_QUOTE_KEY = 'hynix.quote';
 export const HYNIX_CANDLE_KEY = 'hynix.candles';
+export const HYNIX_FUNDING_KEY = 'hynix.funding';
+/** The settlement range one funding round reads at most (see the funding history below). */
+export const HYNIX_FUNDING_SPAN_MS = 60 * 86_400_000;
 /** The workbench's timeouts (lib/quote-service.ts, lib/market-service.ts). */
 const QUOTE_TIMEOUT_MS = 5_000, CANDLE_TIMEOUT_MS = 10_000, DAY_MS = 86_400_000;
 /**
@@ -84,6 +90,14 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, l
     };
   };
   const quoteReport = reporter('报价读取'), quoteSave = reporter('报价保存'), candleReport = reporter('K 线读取'), candleSave = reporter('K 线保存');
+  const funding = createFundingHistory<HynixFundingRow>({
+    // Hyperliquid weighs fundingHistory 20 a call plus 1 per 20 records (1200 a minute per IP): 60 days are ~300 for both legs,
+    // where a 400-day backfill in one round would pass the limit and fail every round.
+    name: '海力士', key: HYNIX_FUNDING_KEY, legs: ['adr', 'ordinary'], first: HYNIX_FIRST_SETTLEMENT, intervalMs: HYNIX_FUNDING_MS, spanMs: HYNIX_FUNDING_SPAN_MS,
+    read: () => store.hynixFunding(), readState: () => store.readState(HYNIX_FUNDING_KEY)?.value ?? null, write: write => store.writeHynixFunding(write),
+    validate: validateHynixFundingRows, fetch: (start, end, at) => fetchHynixFunding(start, { fetcher, timeout: CANDLE_TIMEOUT_MS, now: at, endTime: end }),
+    reason: hynixError, aborted: () => stopping.signal.aborted, now, log,
+  });
 
   async function refreshQuote(): Promise<void> {
     quoteAttemptAt = now();
@@ -161,11 +175,14 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, l
       const shown = days === null ? rows : rows.filter(row => row.time >= from);
       return { rows: shown, fetchedAt, status: stale ? 'snapshot' : 'live', ...(days === null ? {} : { windowDays: days }), coverage, lastAttemptAt: iso(candleAttemptAt), lastError: candleError };
     },
+    refreshFunding: funding.refresh,
+    /** Every stored settlement hour since the retention cut; null before any row exists. */
+    funding: (): FundingView<HynixFundingRow> | null => funding.view(),
     /** For the status page. */
     status() {
-      return { quoteAt: quote?.fetchedAt ?? null, quoteError, candlesAt: fetchedAt, candleRows: rows.length, candleError };
+      return { quoteAt: quote?.fetchedAt ?? null, quoteError, candlesAt: fetchedAt, candleRows: rows.length, candleError, ...funding.status() };
     },
-    /** The two loops; a round starts only after the previous one of its loop ended and the interval passed. */
+    /** The three loops; a round starts only after the previous one of its loop ended and the interval passed. */
     loops(context: LoopContext): Promise<void>[] {
       const every = (intervalMs: number, name: string, round: () => Promise<void>) => (async () => {
         while (!context.stopped()) {
@@ -174,7 +191,7 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, l
           await context.pause(intervalMs);
         }
       })();
-      return [every(HYNIX_QUOTE_REFRESH_MS, '报价', refreshQuote), every(HYNIX_CANDLE_REFRESH_MS, ' K 线', refreshCandles)];
+      return [every(HYNIX_QUOTE_REFRESH_MS, '报价', refreshQuote), every(HYNIX_CANDLE_REFRESH_MS, ' K 线', refreshCandles), every(FUNDING_REFRESH_MS, '资金费', funding.refresh)];
     },
     /** Cuts the requests in flight short; the loops then end at their next stop check. */
     stop(): void { stopping.abort(); },

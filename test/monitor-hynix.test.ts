@@ -156,7 +156,7 @@ test('采集失败：报价失败本轮作废并说明原因（日志只记一�
     assert.equal(env.logs.filter(line => line === '海力士报价读取已恢复').length, 1);
     assert.ok(env.logs.includes('海力士K 线读取已恢复'));
     assert.ok(env.logs.includes('海力士K 线读取失败：接口返回 HTTP 500（Hyperliquid HTTP 500）'), '日志不重复“K 线读取失败”');
-    assert.deepEqual(monitor.status(), { quoteAt: monitor.quote()!.fetchedAt, quoteError: null, candlesAt: monitor.candles(null)!.fetchedAt, candleRows: rows, candleError: null });
+    assert.deepEqual(monitor.status(), { quoteAt: monitor.quote()!.fetchedAt, quoteError: null, candlesAt: monitor.candles(null)!.fetchedAt, candleRows: rows, candleError: null, fundingAt: null, fundingRows: 0, fundingError: null });
   } finally { env.dispose(); }
 });
 

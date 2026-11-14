@@ -1,7 +1,8 @@
 // A stand-in for the four public venues the Anthropic monitor reads (Binance, Hyperliquid xyz/io, Lighter RH) and the two
 // Binance oil contracts (BZUSDT, CLUSDT) and the Hyperliquid Hynix pair (xyz:SKHY, xyz:SKHX), shared by the monitor tests and
 // scripts/dev-monitor.ts, plus the comparison venues of M-2c (Bybit, OKX, Bitget, Gate, Lighter REST and its market_stats
-// socket, Binance SKHY/SKHYNIX, Hyperliquid xyz oil and Hynix contexts), each a few cents off. Prices follow slow waves (~95 USD per share, Brent ~74 and WTI ~70 USDT per barrel, SKHX ~230 USD
+// socket, Binance SKHY/SKHYNIX, Hyperliquid xyz oil and Hynix contexts), each a few cents off, and the settled funding of M-2d
+// (Binance BZ/CL every 4 h, Hyperliquid SKHY/SKHX hourly, each a few milliseconds after the grid point). Prices follow slow waves (~95 USD per share, Brent ~74 and WTI ~70 USDT per barrel, SKHX ~230 USD
 // with the ADR 2–8 % above a tenth of it) so the charts have shape.
 import type { AnthropicLegKey } from '../src/vendor/anthropic-market.mjs';
 
@@ -31,6 +32,13 @@ const HYNIX_COINS: Record<string, FakeHynixLeg> = { 'xyz:SKHY': 'skhy', 'xyz:SKH
 export function fakeHynixPrice(leg: FakeHynixLeg, time: number): number {
   const ordinary = 230 + 15 * Math.sin(time / (7 * DAY)), premium = 0.05 + 0.03 * Math.sin(time / (2 * DAY) + 1);
   return Math.round((leg === 'skhx' ? ordinary : ordinary / 10 * (1 + premium)) * 100) / 100;
+}
+
+/** A leg's settled funding rate at `time` (8 decimals): Brent above WTI, the ADR above the ordinary share, both drifting across zero now and then. */
+export function fakeSettledRate(leg: FakeOilLeg | FakeHynixLeg, time: number): number {
+  const wave = leg === 'brent' ? 0.0001 + 0.00012 * Math.sin(time / (4 * DAY)) : leg === 'wti' ? 0.00004 + 0.00006 * Math.sin(time / (5 * DAY) + 1)
+    : leg === 'skhy' ? 0.00002 + 0.00003 * Math.sin(time / (3 * DAY)) : 0.00001 + 0.00001 * Math.sin(time / (6 * DAY) + 2);
+  return Math.round(wave * 1e8) / 1e8;
 }
 
 const COMPARISON_HOSTS: Record<string, string> = { 'api.bybit.com': 'bybit', 'www.okx.com': 'okx', 'api.bitget.com': 'bitget', 'api.gateio.ws': 'gate', 'mainnet.zklighter.elliot.ai': 'lighter' };
@@ -75,7 +83,9 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
   const listed = (leg: AnthropicLegKey | FakeOilLeg | FakeHynixLeg) => listedAt[leg] ?? (leg === 'brent' || leg === 'wti' ? Math.max(Date.UTC(2026, 3, 1, 9), start - 30 * DAY) : leg === 'skhy' || leg === 'skhx' ? Math.ceil((start - 30 * DAY) / HOUR) * HOUR : start - (leg === 'rh' ? 20 : 60) * DAY);
   const state = {
     /** Legs answering HTTP 500 ('funding': the oil funding terms). */
-    down: new Set<AnthropicLegKey | FakeOilLeg | FakeHynixLeg | 'funding'>(),
+    down: new Set<AnthropicLegKey | FakeOilLeg | FakeHynixLeg | 'funding' | 'settled'>(),
+    /** Settlements a leg does not have, as `${leg}:${time}` ('brent:1775030400000'). */
+    settledMissing: new Set<string>(),
     /** HTTP status the oil legs answer instead (429, 418, ...); null: normal answers. */
     oilStatus: null as number | null,
     /** HTTP status the Hynix reads (mids and candles) answer instead; null: normal answers. */
@@ -105,6 +115,15 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
     if (state.oilStatus !== null) return fail(state.oilStatus);
     if (leg === 'funding') return ok([{ symbol: 'BTCUSDT', fundingIntervalHours: 8 }, { symbol: 'BZUSDT', fundingIntervalHours: 4 }, { symbol: 'CLUSDT', fundingIntervalHours: 4 }, { symbol: 'SKHYUSDT', fundingIntervalHours: 4 }, { symbol: 'SKHYNIXUSDT', fundingIntervalHours: 4 }]);
     const symbol = leg === 'brent' ? 'BZUSDT' : 'CLUSDT';
+    if (url.pathname === '/fapi/v1/fundingRate') {
+      if (state.down.has('settled')) return fail(500);
+      const from = Number(url.searchParams.get('startTime')), to = Number(url.searchParams.get('endTime')), limit = Number(url.searchParams.get('limit'));
+      const out: { symbol: string; fundingTime: number; fundingRate: string; markPrice: string }[] = [];
+      for (let t = Math.ceil(listed(leg) / (4 * HOUR)) * 4 * HOUR; t + 7 <= Math.min(to, now()) && out.length < limit; t += 4 * HOUR) {
+        if (t + 7 >= from && !state.settledMissing.has(`${leg}:${t}`)) out.push({ symbol, fundingTime: t + 7, fundingRate: String(fakeSettledRate(leg, t)), markPrice: String(fakeOilPrice(leg, t)) });
+      }
+      return ok(out);
+    }
     if (url.pathname === '/fapi/v1/premiumIndex') return ok({ symbol, markPrice: String(fakeOilPrice(leg, now())), lastFundingRate: leg === 'brent' ? '0.00005' : '-0.00002', nextFundingTime: Math.ceil(now() / 14_400_000) * 14_400_000, time: now() });
     const from = Number(url.searchParams.get('startTime')), to = Number(url.searchParams.get('endTime')), limit = Number(url.searchParams.get('limit'));
     return ok(bars(leg, from, to + 1).slice(0, limit).map(t => [t, '1', '1', '1', String(fakeOilPrice(leg, t)), '1', t + BAR - 1]));
@@ -114,6 +133,16 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
     if (body.type === 'allMids') {
       if (state.down.has('skhy') || state.down.has('skhx')) return fail(500);
       return ok({ 'xyz:ANT': '95', 'xyz:SKHY': String(fakeHynixPrice('skhy', now())), 'xyz:SKHX': String(fakeHynixPrice('skhx', now())) });
+    }
+    if (body.type === 'fundingHistory') {
+      const leg = HYNIX_COINS[body.coin]!;
+      if (state.down.has('settled')) return fail(500);
+      const out: { coin: string; fundingRate: string; premium: string; time: number }[] = [];
+      // Hyperliquid answers at most 500 settlements a call, from startTime on.
+      for (let t = Math.ceil(listed(leg) / HOUR) * HOUR + HOUR; t + 3 <= Math.min(body.endTime, now()) && out.length < 500; t += HOUR) {
+        if (t + 3 >= body.startTime && !state.settledMissing.has(`${leg}:${t}`)) out.push({ coin: body.coin, fundingRate: String(fakeSettledRate(leg, t)), premium: '0', time: t + 3 });
+      }
+      return ok(out);
     }
     const leg = HYNIX_COINS[body.req.coin]!;
     if (state.down.has(leg)) return fail(500);
@@ -212,7 +241,7 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
     }
     const oilLeg = url.hostname === 'fapi.binance.com' ? url.pathname === '/fapi/v1/fundingInfo' ? 'funding' as const : OIL_SYMBOLS[url.searchParams.get('symbol') ?? ''] : undefined;
     if (oilLeg) {
-      const key = `${url.pathname === '/fapi/v1/klines' ? 'candles' : 'quote'}:${oilLeg}`;
+      const key = `${url.pathname === '/fapi/v1/klines' ? 'candles' : url.pathname === '/fapi/v1/fundingRate' ? 'settled' : 'quote'}:${oilLeg}`;
       state.requests.set(key, (state.requests.get(key) ?? 0) + 1);
       if (state.hold) await held(state.hold, init.signal);
       if (state.delayMs) await wait(state.delayMs, init.signal);
@@ -221,8 +250,8 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
     if (url.hostname === 'fapi.binance.com') { leg = 'binance'; kind = url.pathname === '/fapi/v1/premiumIndex' ? 'quote' : 'candles'; }
     else if (url.hostname === 'api.hyperliquid.xyz') {
       body = JSON.parse(String(init.body)) as Record<string, any>;
-      if (body.type === 'allMids' || HYNIX_COINS[body.req?.coin]) {
-        const key = body.type === 'allMids' ? 'quote:hynix' : `candles:${HYNIX_COINS[body.req.coin]}`;
+      if (body.type === 'allMids' || HYNIX_COINS[body.req?.coin] || (body.type === 'fundingHistory' && HYNIX_COINS[body.coin])) {
+        const key = body.type === 'allMids' ? 'quote:hynix' : body.type === 'fundingHistory' ? `settled:${HYNIX_COINS[body.coin]}` : `candles:${HYNIX_COINS[body.req.coin]}`;
         state.requests.set(key, (state.requests.get(key) ?? 0) + 1);
         if (state.hold) await held(state.hold, init.signal);
         if (state.delayMs) await wait(state.delayMs, init.signal);

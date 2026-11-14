@@ -11,7 +11,8 @@
 - M-3b（从工作台导入告警档位与行情告警机器人 `feishuMonitor`）随 v0.30.0；替身文件与替身机器人验证，未接真实工作台与飞书。
 - M-3c（各市场的监控开关：关闭后停采集、停告警，保留配置与历史）随 v0.31.0；替身行情验证。
 - M-3d-1（Var 行：公开行情与预测资金费、页面保存的会话 token 与认证标记价）随 v0.33.0；替身 Variational 验证，未接真实账户。
-- 未开始：M-3d-2、M-4 至 M-6（见下表）。
+- 已完成：M-3d-2（从工作台导入 Var token，v0.34.0）。
+- 未开始：M-4 至 M-6（见下表）。
 - M-1 没做：成交标记、股数从交易中心同步、概览卡片与告警（均线 / 布林带 / Z-score 随 M-2e 补上）。
 
 ## 批次
@@ -361,7 +362,7 @@ CEX 最多 32 页。
 | M-3a | 原油（价差、布伦特、WTI）与海力士（ADR 溢价率）阈值告警，经本服务已有的飞书出站队列发送；页面告警面板；测试消息 | R3 | 完成（v0.29.0） |
 | M-3b | 从工作台导入告警规则与行情监控的飞书机器人（设置页「从工作台导入」与 `--monitor-alerts`） | R3 | 完成（v0.30.0） |
 | M-3c | 各市场的监控开关（停采集、停告警，保留数据） | R2 | 完成（v0.31.0） |
-| M-3d | Variational 会话 token 与 Var 腿（对比表里原是“未接入”），分两小批：M-3d-1 公开行情、预测资金费、页面保存 token 与认证标记价；M-3d-2 从工作台导入 token | R3 | M-3d-1 完成（v0.33.0），M-3d-2 未开始 |
+| M-3d | Variational 会话 token 与 Var 腿（对比表里原是“未接入”），分两小批：M-3d-1 公开行情、预测资金费、页面保存 token 与认证标记价；M-3d-2 从工作台导入 token | R3 | M-3d-1 完成（v0.33.0），M-3d-2 完成（v0.34.0） |
 
 ## M-3a：原油与海力士阈值告警
 
@@ -522,3 +523,25 @@ CEX 最多 32 页。
 - 页面：`web/src/MonitorExchanges.tsx` 的 Var 行与 `web/src/MonitorVariationalSession.tsx` 表单，见 [frontend.md](frontend.md)《行情监控页：Var 行与 token 表单》。
 - 测试 `test/monitor-variational.test.ts`（解析、token、认证请求、读取器含轮换、token 文件、传输与真实 `python3` 脚本的拒绝路径、接口、页面数据规则）；`scripts/dev-monitor.ts` 接上替身 Variational。
 - 与计划的差别：无。
+
+### M-3d-2：从工作台导入 Var token
+
+**用户可见的变化**：设置页「从工作台导入」的预览多一行“Var token”：工作台有没有 token、它声明的到期时间（UTC）、本服务现有 token 的到期时间、能否导入及原因；行情监控一节多一个勾选项“同时导入 Var token”。命令行 `sudo bash install.sh --import-workbench --monitor-variational`（可与 `--monitor-alerts` 同用）。只导入 token 时不重启，行情监控下一次读取（页面每 15 秒）即用导入的 token；同时启用或补全行情监控时照常改配置并重启。
+
+**来源**：工作台 `<工作台数据目录>/modules/monitor/variational-session.json`（`server/variational-session.mjs` 写入，`monitor-services.mjs` 传入的目录即 `modules/monitor`，与 M-3b 读的告警文件同一目录）。照 M-3b：由以该目录属主身份、空环境运行的子进程读取，只读普通文件（符号链接不跟随），另加工作台自己的两条拒读规则：超过 16 KiB、权限不是 600。内容须是 `{ version: 1, token }` 且 token 能解析出到期时间；已过期或 30 秒内到期不导入。不联网验证（导入时 Variational 可能拦截服务器；读取器下一次用它时自然会标出“会话已失效”）。
+
+**取舍**（导入替换本服务现有 token 的规则）：本服务没有 token、现有 token 文件无效（不包括只在内存里被 Variational 拒绝的判定，写入方看不到）或已过期 → 导入；与工作台的是同一个 token → 跳过（“已是同一个 token”）；本服务的 token 有效且声明到期不早于工作台的 → 跳过（“本服务的 token 更新”，页面保存过新的就不被旧的盖掉）；否则导入并替换。预览按导入前读到的状态给出结论，只比较到期时间（token 本身只有写入子进程同时看到两边），到期相同时写“多半是同一个 token”；写入时由写入子进程按当时文件再判断一次，结果与提示以写入子进程的实际判断为准。
+
+**写入**：token 经标准输入交给以数据目录属主身份、空环境运行的 `src/monitor/variational-import-writer.ts write`（同 M-3b 的 `import-writer.ts`），它复核 token、按上面的规则判断，写 `monitor-variational-session.json`（600，先写临时文件再改名，`revision` 取现有文件的版本 + 1）。现有文件是符号链接、不是普通文件或不归服务账户时拒绝写入；判断之后、改名之前文件被别人换过（页面刚保存）时放弃写入并提示重试。顺序：账本 → 档位 → token → 配置；token 写失败时前面已写的保留、配置不改。token 不进导入结果、日志与命令行输出，结果里只有到期时间与原因。
+
+**运行中的服务换上 token**：`variational-session.ts` 原只在启动时读文件；改为每次取用 token（读取器）和读状态（页面）时比较文件的设备号、inode、修改时间与大小，变了就重读一次，内容有效且与内存中的不同才换上（无效或被删掉时保留内存中的，日志记一次）。换上的 token 版本号若不大于内存中的，取内存版本 + 1：读取器按版本号共享结果，不同 token 不能共用一个号（导入在文件被删后写的是 1）。页面保存前先重读一次，等 Variational 期间落地的导入被这次保存以更大的版本号盖过；保存记下的是自己写的文件（取自写入句柄），之后别人换上的文件照样会被重读。页面自己保存时不触发重读。导入只写 token 文件、不改配置时不重启服务。
+
+**页面请求**：`POST /api/import` 新增 `monitorVariational: true`，须和 `monitor: true` 一起发（同 `monitorAlerts`）；本服务配置没有原油监控（`monitor.oil`）时跳过并说明。
+
+**影响面（R3：凭据）**：root 导入助手与安装脚本多读一个工作台凭据文件并写本服务一个凭据文件，读写各在降权子进程里完成，token 只经管道在内存中传递；`variational-session.ts` 多了按文件变化重读。不碰交易、划转、`monitor.sqlite`、配置格式与读取器的请求。
+
+**失败与回滚**：读不到或不合格时只跳过 Var token，其它所选内容照常导入。回滚 `sudo bash install.sh --version v0.33.0`：旧版本不认 `monitorVariational` 与 `--monitor-variational`，已导入的 token 文件格式不变，旧版本启动时照常读取。
+
+**测试计划**：来源读取（缺失、权限不是 600、过大、符号链接、坏 JSON、过期）；取舍规则（无 token、同一个、本服务更新、本服务过期）；写入子进程（复核、拒写符号链接与他人文件、版本 + 1、600）；会话按文件变化重读（导入后换上、无效文件不换、页面保存不重读）；导入助手与命令行的接线、请求校验；`deploy/test-install.sh` 的参数检查；页面勾选与请求体。
+
+**实施记录（v0.34.0）**：照上文实现。页面：导入面板行情监控一节下加 Var token 表（`#importVariationalTable`）与勾选项（`#importVariationalPick`），版式照同一面板的告警档位表，时间按 UTC 显示（与原因文字、对比表一致）；勾选 token 时请求体自动带上 `monitor: true`。独立审查（后端、页面两路）无 P0/P1，P2 与 P3 的处理见 `docs/reviews/2026-11-14-monitor-m3d2.md`。剩余已知限制：写入子进程的“改名前复核”与改名之间仍有微秒级窗口，没有跨进程锁；落在这个窗口里时，页面刚保存的 token 会被导入的盖掉（日志里有两次写入，重新保存即可）。

@@ -169,6 +169,8 @@ run --package "$tmp/a" --monitor && status=0 || status=$?
 check '--monitor 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -q -- "--monitor 须和 --import-workbench 一起使用" "$tmp/out"'
 run --package "$tmp/a" --monitor-alerts && status=0 || status=$?
 check '--monitor-alerts 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -q -- "--monitor-alerts 须和 --import-workbench 一起使用" "$tmp/out"'
+run --package "$tmp/a" --monitor-variational && status=0 || status=$?
+check '--monitor-variational 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -q -- "--monitor-variational 须和 --import-workbench 一起使用" "$tmp/out"'
 run --package "$tmp/a" --asset && status=0 || status=$?
 check '--asset 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -q -- "--asset 须和 --import-workbench 一起使用" "$tmp/out"'
 run --package "$tmp/a" --import-workbench --asset-owner alice && status=0 || status=$?
@@ -195,6 +197,17 @@ printf '%s' '{"version":1,"config":{"webhookUrl":"https://open.feishu.cn/open-ap
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor-alerts && status=0 || status=$?
 check '--monitor-alerts 导入原油档位与机器人并通过配置检查' '[[ $status -eq 0 ]] && grep -q "导入行情告警：替换本服务的原油 1 档" "$tmp/out" && grep -q "已写入告警档位（原油 1 档）" "$tmp/out" && grep -q "海力士告警 未导入：工作台没有 hynix/alerts.json" "$tmp/out" && grep -q "\"feishuMonitor\"" "$TP_CONF_DIR/secrets.json" && [[ -f "$TP_DATA_DIR/monitor.sqlite" ]]'
 check '导入告警的输出不含机器人地址与签名' '! grep -q "install-test-hook\|install-sign" "$tmp/out"'
+# The workbench's Var token (M-3d-2): mode 644 is refused as the workbench refuses it; at 600 it comes over, privately.
+var_token=$(cd "$root" && node --input-type=module -e 'const { fakeVariationalToken } = await import("./test/monitor-fake.ts"); process.stdout.write(fakeVariationalToken(Date.now() + 86400000, "install"));')
+printf '{"version":1,"revision":3,"token":"%s","updatedAt":"2026-11-14T00:00:00.000Z"}\n' "$var_token" >"$tmp/wb/data/modules/monitor/variational-session.json"
+chmod 644 "$tmp/wb/data/modules/monitor/variational-session.json"
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor-variational && status=0 || status=$?
+check '--monitor-variational 不导入权限不是 600 的 token 文件' '[[ $status -eq 0 && ! -e "$TP_DATA_DIR/monitor-variational-session.json" ]] && grep -q "跳过 Var token：variational-session.json 权限不是 600" "$tmp/out"'
+chmod 600 "$tmp/wb/data/modules/monitor/variational-session.json"
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor-variational && status=0 || status=$?
+check '--monitor-variational 导入 token、仅服务账户可读写且输出不含 token' '[[ $status -eq 0 && "$(stat -c %a "$TP_DATA_DIR/monitor-variational-session.json")" == 600 ]] && grep -q "已写入Var token（版本 1，声明到期" "$tmp/out" && grep -q "$var_token" "$TP_DATA_DIR/monitor-variational-session.json" && ! grep -q "$var_token" "$tmp/out"'
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor-variational && status=0 || status=$?
+check '重复导入同一个 Var token 时跳过' '[[ $status -eq 0 ]] && grep -q "跳过 Var token：本服务的 Var token 声明到期" "$tmp/out" && grep -q "\"revision\":1," "$TP_DATA_DIR/monitor-variational-session.json"'
 
 # No current link (data and config left from an earlier install): installs and points current at the release.
 rm "$TP_APP_DIR/current"

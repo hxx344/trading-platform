@@ -427,4 +427,4 @@
 
 **验证**：`node --test --test-reporter=dot 'web/test/crossex/*.test.mjs'`（工作台界面测试迁移版）。浏览器：`scripts/dev-monitor.ts` 提供真实外壳与 CSP，Playwright 拦截 `/api/crossex/*` 返回替身数据（取自工作台 `tests/crossex-position-metrics.browser.mjs`），五个子页在 1280 与 390 宽度下没有 CSP 报错、没有横向溢出；设置页超过硬上限时显示服务的拒绝提示，保存成功显示「已保存」。
 
-**回滚**：先删掉 `config.json` 的 `crossex` 与 secrets.json 的 `gate`，再 `sudo bash install.sh --version v0.33.0`。
+**回滚**：先删掉 `config.json` 的 `crossex` 与 secrets.json 的 `gate`，再 `sudo bash install.sh --version v0.34.0`。

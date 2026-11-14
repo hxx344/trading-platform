@@ -55,15 +55,18 @@
 
 **告警档位与机器人（M-3b，v0.30.0）**：勾选「同时导入告警档位与机器人」时，读工作台 `modules/monitor` 的三个告警文件，档位在账本之后、配置之前写入 `monitor.sqlite` 的待应用键，机器人写入 `secrets.json` 的 `feishuMonitor`；只换档位时不重启。规则、顺序与回滚见 [monitor.md](monitor.md) 的 M-3b。
 
+**Var token（M-3d-2，v0.34.0）**：勾选「同时导入 Var token」时，读工作台 `modules/monitor/variational-session.json`（只读取权限为 600、16 KiB 以内的普通文件，只校验格式与到期，不联网），在档位之后、配置之前由写入子进程写本服务的 `monitor-variational-session.json`；本服务的 token 是同一个或到期不早于工作台的时保留本服务的。只写 token 时不改配置、不重启，运行中的行情监控下一次读取即换上。规则与回滚见 [monitor.md](monitor.md) 的 M-3d-2。
+
 ## 4 页面请求
 
-`POST /api/import` 的导入请求新增三个字段，逐项严格校验（与 `oil`、`options` 同一写法，`exactKeys` 拒绝未知字段）：
+`POST /api/import` 的导入请求新增以下字段，逐项严格校验（与 `oil`、`options` 同一写法，`exactKeys` 拒绝未知字段）：
 
 - `monitor`：只能是 `true`。
 - `monitorAlerts`（v0.30.0）：只能是 `true`，且须和 `monitor: true` 一起发；预览总是带上告警一项。
+- `monitorVariational`（v0.34.0）：只能是 `true`，且须和 `monitor: true` 一起发；预览总是带上 Var token 一项（只有到期时间与原因，不含 token）。
 - `asset`：只能是 `true`；须同时带 `assetOwner`。
 - `assetOwner`：只在 `asset` 为 `true` 时允许；字符串，1–64 个字符，只允许字母、数字和 `.`、`_`、`@`、`-`，首字符须是字母或数字。助手另外核对它在工作台账本的用户列表里。
-- 预览请求不能带这三个字段。请求文件仍限 4 KiB。页面不能指定任何文件路径：来源库路径由助手按工作台数据目录推出，目标是服务的数据目录。
+- 预览请求不能带以上字段。请求文件仍限 4 KiB。页面不能指定任何文件路径：来源库路径由助手按工作台数据目录推出，目标是服务的数据目录。
 
 ## 5 命令行
 
@@ -75,6 +78,7 @@ sudo bash install.sh --import-workbench --monitor --asset [--asset-owner <用户
 - `--asset` 不带 `--asset-owner` 时，工作台账本只有一个用户就用它，多个用户时报错并列出用户名；`--asset-owner` 须和 `--asset` 一起用，用户名规则同页面。
 - 导入器新增 `--monitor`、`--asset`、`--asset-owner`、`--data-dir`（安装脚本传入本服务数据目录）。账本先写、再写配置；之后安装脚本照旧检查配置、重启，失败时恢复导入前的配置（账本保留，同 §3 第 4 步）。
 - 旧版本包不支持时安装脚本报“版本 … 不支持 --monitor / --asset”。
+- `--monitor-alerts`（v0.30.0）、`--monitor-variational`（v0.34.0）同时启用行情监控，并分别导入告警与 Var token；两者都需要 `--data-dir`，可同用。
 
 ## 6 备选方式（保留）
 
@@ -99,7 +103,7 @@ sudo bash install.sh --import-workbench --monitor --asset [--asset-owner <用户
 
 - 读取：`<DATA_DIR>/modules/crossex/crossex.sqlite` 与 `credentials.key`，两者须为普通文件（不跟随符号链接）。root 在子进程里以库属主身份、空环境只读打开；`-journal` 拒绝，有 `-wal` 无 `-shm` 拒绝，都没有时以 `immutable=1` 打开。子进程只回传 key（base64）、`live_connection`、未结束执行数、未结束订单数、`live_cache` 挂单数、`live_owner` 到期时刻与 `settings.config`；解密在助手进程里做，失败只报固定原因。
 - 计划：`config.json` 写 `crossex: { accountUid, credentialVersion, limits }`，`secrets.json` 写 `gate: { apiKey, apiSecret }`；已有 `crossex` 时整项保留，有 `gate` 无 `crossex` 时不覆盖。`limits` 取工作台 `settings.config` 与工作台默认值合并后的三项；页面设置（`entryPaused`、`slippageBps`、`cooldownSeconds`、`feeBps`、`feeSchedule`、`minNetBps`、`notionalPerLeg`、`maxOpen`、`maxTotalNotional`）经工作台 `configuration()` 校验，只在首次导入时、且本服务 `crossex.sqlite` 还没有 `config` 时写入（`INSERT OR IGNORE`）。工作台租约未过期时照常导入，结果附提示“导入后在工作台 CrossEx 设置页断开账户”。
-- 顺序：同资产账本——先写 `crossex.sqlite` 页面设置（失败则整次请求失败、配置不变），再走撤销记录 → 写配置 → 检查 → 重启。设置写入后配置若被恢复，服务不读它，下次导入也不覆盖。
+- 顺序：同资产账本——在资产账本、告警档位、Var token 之后、配置之前写 `crossex.sqlite` 页面设置（失败则整次请求失败、配置不变，已写入的前几项保留并在失败信息里列出），再走撤销记录 → 写配置 → 检查 → 重启。设置写入后配置若被恢复，服务不读它，下次导入也不覆盖。
 - 页面请求：`POST /api/import` 新增 `crossex`，只能是 `true`，可单独使用，预览不能带。结果新增 `crossex`（`{ accountId, status, detail, warning? }`，`accountId` 为 UID 末四位 `***xxxx`）与 `crossexError`（读不到工作台时的原因）；预览消息加“；CrossEx 账户可以导入 / 不能导入”。
 - 命令行：`sudo bash install.sh --import-workbench --crossex`（可与 `--pairs`、`--oil`、`--options`、`--monitor`、`--asset` 同用）；导入器参数 `--crossex`，须带 `--data-dir`（安装脚本传入，已带 `--asset` 时不重复）。旧版本包不支持时报“版本 … 不支持 --crossex”。
 - 测试：`test/crossex-service.test.ts` 的导入部分（解密、各拒绝原因、租约提示、不覆盖、只写一次设置、页面请求、助手预览与导入）；`deploy/test-install.sh` 未加 `--crossex` 用例。

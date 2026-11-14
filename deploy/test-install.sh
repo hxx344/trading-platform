@@ -24,6 +24,7 @@ check '发布包含构建好的页面' 'grep -q "/web/dist/index.html$" "$tmp/a.
 mkdir -p "$tmp/src-b/deploy"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-b/"
 mkdir -p "$tmp/src-b/web" && cp -R "$root/web/dist" "$tmp/src-b/web/"
+mkdir -p "$tmp/src-b/scripts" && cp "$root/scripts/variational-balance.py" "$tmp/src-b/scripts/"
 cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-b/deploy/"
 printf '\n升级测试\n' >>"$tmp/src-b/README.md"
 bash "$tmp/src-b/deploy/package.sh" "$tmp/b" >/dev/null
@@ -104,6 +105,7 @@ mkdir -p "$tmp/wb/data/modules/aster"
 mkdir -p "$tmp/src-c/deploy"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-c/"
 mkdir -p "$tmp/src-c/web" && cp -R "$root/web/dist" "$tmp/src-c/web/"
+mkdir -p "$tmp/src-c/scripts" && cp "$root/scripts/variational-balance.py" "$tmp/src-c/scripts/"
 cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-c/deploy/"
 sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { throw new Error('测试：配置检查失败');|" "$tmp/src-c/src/service/main.ts"
 bash "$tmp/src-c/deploy/package.sh" "$tmp/c" >/dev/null
@@ -116,6 +118,7 @@ check '导入后检查失败时仍是原版本' '[[ "$(readlink -f "$TP_APP_DIR/
 mkdir -p "$tmp/src-d/deploy"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-d/"
 mkdir -p "$tmp/src-d/web" && cp -R "$root/web/dist" "$tmp/src-d/web/"
+mkdir -p "$tmp/src-d/scripts" && cp "$root/scripts/variational-balance.py" "$tmp/src-d/scripts/"
 cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-d/deploy/"
 sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { (await import('node:fs')).writeFileSync(process.env.TP_TEST_MARK, ''); await new Promise(resolve => setTimeout(resolve, 1500));|" "$tmp/src-d/src/service/main.ts"
 bash "$tmp/src-d/deploy/package.sh" "$tmp/d" >/dev/null

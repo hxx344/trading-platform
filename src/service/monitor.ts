@@ -2,6 +2,7 @@
 // that block is there, and each market only when it is named. Their history sits in monitor.sqlite; a file that cannot be
 // opened costs only the monitor page.
 import { join } from 'node:path';
+import { ALERT_CHECK_MS, createAlertService, createTestGate, type AlertHooks, type AlertMarket, type AlertService } from '../monitor/alerts.ts';
 import { createAnthropicMonitor, type AnthropicMonitor, type LoopContext } from '../monitor/anthropic.ts';
 import { createExchangeReader, type ExchangeReader } from '../monitor/exchanges.ts';
 import { createHynixMonitor, type HynixMonitor } from '../monitor/hynix.ts';
@@ -15,10 +16,12 @@ export interface MonitorRuntime {
   config: MonitorConfig; store: MonitorStore; anthropic: AnthropicMonitor | null; oil: OilMonitor | null; hynix: HynixMonitor | null;
   /** The on-demand multi-exchange comparison (M-2c); present when oil or Hynix runs. */
   exchanges: ExchangeReader | null;
+  /** M-3a: each running oil / Hynix market's threshold alerts; absent without the Feishu outbox hooks (tests of the collectors). */
+  alerts: Partial<Record<AlertMarket, AlertService>>;
 }
 
 /** Opens monitor.sqlite and reads the saved history back; throws when the file cannot be opened. */
-export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now, log, WebSocketImpl }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void; WebSocketImpl?: typeof WebSocket } = {}): MonitorRuntime {
+export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now, log, WebSocketImpl, alertHooks }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void; WebSocketImpl?: typeof WebSocket; alertHooks?: AlertHooks } = {}): MonitorRuntime {
   const store = createMonitorStore({ file: join(dir, MONITOR_FILE), ...(now ? { now } : {}) });
   try {
     const base = { store, ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}) };
@@ -29,7 +32,13 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
       gate, oilQuote: () => oil?.quote() ?? null, hynixQuote: () => hynix?.quote() ?? null,
       ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}), ...(WebSocketImpl ? { WebSocketImpl } : {}),
     }) : null;
-    return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, hynix, exchanges };
+    const alerts: Partial<Record<AlertMarket, AlertService>> = {};
+    if (alertHooks) {
+      const gate = createTestGate(now ?? Date.now), common = { store, hooks: alertHooks, gate, ...(now ? { now } : {}), ...(log ? { log } : {}) };
+      if (oil) alerts.oil = createAlertService({ ...common, market: 'oil', quote: () => oil.quote() });
+      if (hynix) alerts.hynix = createAlertService({ ...common, market: 'hynix', quote: () => hynix.quote() });
+    }
+    return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, hynix, exchanges, alerts };
   } catch (error) { store.close(); throw error; }
 }
 
@@ -55,13 +64,30 @@ export function monitorViews(monitor: MonitorRuntime) {
     /** One exchange's settled funding history (M-2d-3); undefined when the market is not configured. Rejects with the page's reason. */
     fundingHistory: (market: 'oil' | 'hynix', exchange: Exchange): Promise<unknown> | undefined =>
       monitor.exchanges && monitor.config[market] ? monitor.exchanges.fundingHistory(market, exchange) : undefined,
+    /** M-3a: the market's alert service; undefined when the market is not configured. */
+    alerts: (market: AlertMarket) => monitor.alerts[market],
   };
 }
 
-/** For the status page: each configured market's last reads and errors. */
-export const monitorStatus = (monitor: MonitorRuntime) => ({ anthropic: monitor.anthropic?.status() ?? null, oil: monitor.oil?.status() ?? null, hynix: monitor.hynix?.status() ?? null });
+/** For the status page: each configured market's last reads and errors, and the alerts when the service runs them. */
+export const monitorStatus = (monitor: MonitorRuntime) => ({ anthropic: monitor.anthropic?.status() ?? null, oil: monitor.oil?.status() ?? null, hynix: monitor.hynix?.status() ?? null,
+  ...(Object.keys(monitor.alerts).length ? { alerts: { oil: monitor.alerts.oil?.status() ?? null, hynix: monitor.alerts.hynix?.status() ?? null } } : {}) });
 
-export const monitorLoops = (monitor: MonitorRuntime, context: LoopContext): Promise<void>[] => [...monitor.anthropic?.loops(context) ?? [], ...monitor.oil?.loops(context) ?? [], ...monitor.hynix?.loops(context) ?? []];
+/** Every 10 s each market's alerts check the collector's latest quote (no request of their own). */
+function alertLoop(service: AlertService, context: LoopContext, log: (line: string) => void): Promise<void> {
+  return (async () => {
+    while (!context.stopped()) {
+      try { service.check(); } catch (error) { log(`告警检查出错：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`); }
+      if (context.stopped()) break;
+      await context.pause(ALERT_CHECK_MS);
+    }
+  })();
+}
+
+export const monitorLoops = (monitor: MonitorRuntime, context: LoopContext, log: (line: string) => void = line => process.stderr.write(`${line}\n`)): Promise<void>[] => [
+  ...monitor.anthropic?.loops(context) ?? [], ...monitor.oil?.loops(context) ?? [], ...monitor.hynix?.loops(context) ?? [],
+  ...Object.values(monitor.alerts).map(service => alertLoop(service, context, log)),
+];
 
 /** Ends the requests in flight (at stopping), so the loops finish within the drain. */
 export const stopMonitor = (monitor: MonitorRuntime): void => { monitor.anthropic?.stop(); monitor.oil?.stop(); monitor.hynix?.stop(); monitor.exchanges?.stop(); };

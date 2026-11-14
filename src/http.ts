@@ -100,6 +100,8 @@ export interface ServiceViews {
     exchange?(market: 'oil' | 'hynix', exchange: Exchange): Promise<unknown> | undefined;
     /** M-2d-3: one exchange's settled funding history (60 days, both legs); undefined when the market is not configured; rejects with the page's reason. */
     fundingHistory?(market: 'oil' | 'hynix', exchange: Exchange): Promise<unknown> | undefined;
+    /** M-3a: the market's threshold alerts; undefined when the market is not configured (or the service runs without alerts). */
+    alerts?(market: 'oil' | 'hynix'): { view(): unknown; update(body: unknown): unknown; test(): Promise<unknown> } | undefined;
   };
   /** The options module's reads and writes (service/options.ts); absent when the service runs no options module. */
   options?: {
@@ -307,6 +309,18 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       if (!target) return send(response, 404, { code: 'not_found', message: '不存在' });
       const body = await readJson(request);
       return send(response, 200, target[2] === 'update' ? rules.update(target[1]!, body) : rules.act(target[1]!, target[2]!, body));
+    }
+    const alertRoute = /^\/api\/monitor\/(oil|hynix)\/alerts(\/test)?$/.exec(url.pathname);
+    if (alertRoute && (request.method === 'GET' ? !alertRoute[2] : request.method === 'POST')) {
+      const market = alertRoute[1] as 'oil' | 'hynix', name = MONITOR_NAMES[market];
+      if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
+      const alerts = views.monitor.state().markets.includes(market) ? views.monitor.alerts?.(market) : undefined;
+      if (!alerts) return send(response, 404, { code: 'not_found', message: `本服务没有配置${name}行情监控` });
+      if (request.method === 'GET') return send(response, 200, alerts.view());
+      const body = await readJson(request);
+      if (!alertRoute[2]) return send(response, 200, alerts.update(body));
+      exactKeys(body, []);
+      return send(response, 200, await alerts.test());
     }
     const exchangeRoute = request.method === 'GET' ? /^\/api\/monitor\/(oil|hynix)\/exchanges\/([a-z]{1,20})$/.exec(url.pathname) : null;
     if (exchangeRoute) {

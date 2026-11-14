@@ -21,7 +21,7 @@ import { assertDistinctSigners, checkIntervalBudget, enableBudget, idleWeight, l
 import { TRANSFER_CONFIG_KEYS, parseTransferConfig, type TransferConfig } from '../contracts.ts';
 import { PASSWORD_FILE, hashPassword, loadPasswordHash, type PasswordHash } from '../login-password.ts';
 import { createTakeoverGuard } from './takeover.ts';
-import { createNotifier, type EventRow, type Notifier } from './feishu.ts';
+import { createNotifier, sendFeishu, type EventRow, type Notifier } from './feishu.ts';
 import { createStreamStatus, runUserStream, type SocketLike } from './stream.ts';
 import { balanceWindow, createBalanceSamples, type BalanceSamples } from './balance-samples.ts';
 import { readImportResult, submitImportRequest } from './import-channel.ts';
@@ -272,7 +272,13 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   // The same for the monitor: without its file the monitor page is left out, nothing else.
   let monitor: MonitorRuntime | null = null, monitorError: string | null = null;
   if (config.monitor) {
-    try { monitor = openMonitor(config.monitor, dir, monitorFetch ? { fetchImpl: monitorFetch } : {}); }
+    // M-3a: the alerts queue in the same outbox and robot as the ASTER messages; the test message goes to that robot directly.
+    const robot = secrets.feishu;
+    const alertHooks = {
+      notify: (text: string) => notifier.notify(text), delivery: (ids: readonly number[]) => notifier.delivery(ids), robot: () => robot !== null,
+      test: async (text: string) => { if (robot) await sendFeishu(robot, { msg_type: 'text', content: { text } }, notifyFetch ? { fetchImpl: notifyFetch } : {}); },
+    };
+    try { monitor = openMonitor(config.monitor, dir, { ...(monitorFetch ? { fetchImpl: monitorFetch } : {}), alertHooks }); }
     catch (error) { monitorError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`行情监控库无法打开，行情监控页不可用：${monitorError}\n`); }
   }
   const closeMonitorStore = () => { if (monitor) closeMonitor(monitor); };

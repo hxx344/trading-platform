@@ -4,10 +4,10 @@
 
 对照的工作台代码：`modules/monitor`（工作台提交 `7745181` 时的内容）。工作台 Monitor 的功能编号 M01–M14 沿用。
 
-## 当前状态（v0.20.0）
+## 当前状态（v0.21.0）
 
-- 已发布：M-1（Anthropic 价差）随 v0.12.0；v0.15.0 起在设置页「从工作台导入」里启用。M-2a（原油价差）随 v0.20.0。
-- 进行中：M-2（原油价差与海力士行情），下一小批 M-2b（海力士），方案见下文《M-2》。
+- 已发布：M-1（Anthropic 价差）随 v0.12.0；v0.15.0 起在设置页「从工作台导入」里启用。M-2a（原油价差）随 v0.20.0。M-2b（海力士溢价）随 v0.21.0。
+- 进行中：M-2（原油价差与海力士行情），下一小批 M-2c（原油多交易所对比），方案见下文《M-2》。
 - 未开始：M-3 至 M-6（见下表）。
 - M-1 没做：成交标记、均线 / 布林带 / Z-score、股数从交易中心同步、概览卡片与告警。
 
@@ -16,7 +16,7 @@
 | 批次 | 内容 | 风险 | 状态 |
 | --- | --- | --- | --- |
 | M-1 | Anthropic 价差（M03）：Binance、Hyperliquid（xyz:ANT、io:ANTH）、Lighter RH 四条腿的报价与 15 分钟 K 线，每股口径溢价；只读公开接口，无凭据、无告警 | R2 | 完成（Linux CI 通过），随 v0.12.0 发布 |
-| M-2 | 原油价差与海力士行情（M01、M02），分 M-2a–M-2e 五小批（见下文），Var 腿先降级为“未接入” | R2 | M-2a 已发布（v0.20.0），M-2b 起未开始 |
+| M-2 | 原油价差与海力士行情（M01、M02），分 M-2a–M-2e 五小批（见下文），Var 腿先降级为“未接入” | R2 | M-2a 已发布（v0.20.0），M-2b 已发布（v0.21.0），M-2c 起未开始 |
 | M-3 | 告警规则、飞书通知、监控开关、Var 会话 token（M09–M12） | R3 | 未开始 |
 | M-4 | 永续全市场报价（M04：11 家交易所公共 WS、SSE 增量） | R2 | 未开始 |
 | M-5 | 依赖 M04 的页面（M05–M08） | R2 | 未开始 |
@@ -101,7 +101,7 @@
 | 小批 | 内容 | 状态 |
 | --- | --- | --- |
 | M-2a | 原油价差：Binance BZUSDT / CLUSDT 标记价报价与 15 分钟 K 线、详情页（价差 / 价格对比） | 已发布（v0.20.0） |
-| M-2b | 海力士溢价：Hyperliquid xyz:SKHY（ADR）/ xyz:SKHX（普通股）报价与 1 小时 K 线、详情页（溢价率 / 美元价差 / 价格对比） | 未开始 |
+| M-2b | 海力士溢价：Hyperliquid xyz:SKHY（ADR）/ xyz:SKHX（普通股）报价与 1 小时 K 线、详情页（溢价率 / 美元价差 / 价格对比） | 已发布（v0.21.0） |
 | M-2c | 原油的多交易所对比（OKX、Bitget、Gate、Bybit、Hyperliquid、Lighter；Var 先显示“未接入”，会话 token 随 M-3） | 未开始 |
 | M-2d | 资金费：原油 Binance 已结算资金费（4 小时）与海力士 Hyperliquid 小时资金费历史、多空资金费图 | 未开始 |
 | M-2e | 技术指标：7 日均线、20 日布林带、Z-score（Anthropic、原油、海力士三个市场一起补） | 未开始 |
@@ -116,7 +116,7 @@
 
 **存储**：同一个 `monitor.sqlite`，每个市场一张 K 线表（`oil_candles(time, brent, wti)`、`hynix_candles(time, adr, ordinary)`），最近一轮的状态仍在 `monitor_state`（键 `oil.quote`、`oil.candles` 等）。只加表，不改 M-1 的表。
 
-**回滚**：回到 v0.19.0 前从 `config.json` 删掉 `monitor.oil`、`monitor.hynix`（旧版本的配置检查不认识）；只剩 `monitor: {}` 时连同 `monitor` 一起删。新表留在 `monitor.sqlite` 里，旧版本不读。
+**回滚**：回到 v0.20.0 前删掉 `monitor.hynix`，回到 v0.19.0 前再删掉 `monitor.oil`（旧版本的配置检查不认识）；只剩 `monitor: {}` 时连同 `monitor` 一起删。新表留在 `monitor.sqlite` 里，旧版本不读。
 
 ### M-2a：原油价差
 
@@ -157,6 +157,44 @@
 - **本地预览**：`scripts/dev-monitor.ts` 同时启用两个市场；替身行情（`test/monitor-fake.ts`）新增 BZUSDT / CLUSDT 的 `premiumIndex`、`fundingInfo` 与 15 分钟 K 线（上市 30 天，价差在 2.5–5.5 之间缓慢摆动），可让单腿、资金费或整体返回 429 / 500。
 - **测试**：新增 `test/monitor-oil.test.ts`（10 个：vendor 价差精度、K 线配对 / 分页 / 续读补缺口 / 窗口，报价解析，采集的快照标记、续读起点、失败与恢复、Binance 冷却与 Anthropic 共用，读回失败整表重写与写入失败下一轮补写，永久缺口每小时补读，配置与接口）；`test/monitor-web.test.ts` 加 3 个原油页面数据规则；`test/import-modules.test.ts` 改写行情监控导入用例（全新、补市场、已齐、只有原油、无效配置、超出大小）。
 
-**本批没做**：多交易所对比（M-2b/M-2c）、多空资金费（M-2d）、指标（M-2e）、成交标记、概览卡片与告警（M-3）。`deploy/config.example.json` 仍只带 `anthropic`。
+**本批没做**：海力士（M-2b）、多交易所对比（M-2c）、多空资金费（M-2d）、指标（M-2e）、成交标记、概览卡片与告警（M-3）。`deploy/config.example.json` 仍只带 `anthropic`。
 
 **回滚**：`sudo bash install.sh --version v0.19.0`，回退前从 `config.json` 删掉 `monitor.oil`（只配了原油时删掉整个 `monitor`）；`monitor.sqlite` 里的 `oil_candles` 表旧版本不读。
+
+### M-2b：海力士溢价
+
+对照：`modules/monitor` 的 `lib/market.ts`、`lib/quote-service.ts`、`lib/market-service.ts`（`8470785`）、`lib/market-validation.ts`（`c534894`）、`app/dashboard.tsx`（`9c652bc`）、`app/spread-chart.tsx`（`4be9aa4`）。
+
+**代码**
+
+- `src/vendor/hynix-market.mjs`（附 `.d.mts`）：复制上面几个文件里 xyz dex `allMids` 报价解析、1 小时 K 线请求 / 校验 / 配对 / 续读起点、价格换算校验，页面与服务共用。与原文件不同的地方写在文件头：只存两腿收盘价（`time, adr, ordinary`），正股 ÷ 10、价差、溢价率读取时算；请求函数接收 fetcher / 超时 / 本机时刻；工作台随包的 `archive.json` 基线不带，首次从上市首个整点（2026-07-10 14:00 UTC）回补，起点不早于 Hyperliquid 保留的最近 5000 根；续读起点多一个 `full` 开关；资金费（`metaAndAssetCtxs`）不读，随 M-2d。
+- `src/monitor/hynix.ts`：采集与读取，结构同 `oil.ts`（启动读回、两条循环、快照标记、日志去重、写入失败内存不前进、读回失败整表重写、旧缺口每小时补读）。不经过 Binance 冷却。
+- `src/monitor/store.ts` 加 `hynix_candles` 表和对应的读写。
+
+**采集规则**
+
+| 项 | 间隔 | 单次请求超时 | 失败行为 |
+| --- | --- | --- | --- |
+| 报价 | 10 秒一轮：一个 `{type:'allMids', dex:'xyz'}` | 5 秒（同工作台） | 失败本轮作废，保留上次报价（超过 35 秒标为快照）并记原因；不在轮内重试 |
+| K 线 | 60 秒一轮：两腿 `candleSnapshot` 1h 并发，从最后一小时往前 48 小时续读；更早的缺口每小时补读一次（启动后第一轮也补读）；首次从上市首个整点回补（一次请求，最多 5000 根） | 10 秒（同工作台） | 任一腿失败本轮作废，保留已存的 K 线并记原因 |
+
+- 报价时刻：`allMids` 不带源时刻，`fetchedAt` 用收到应答的本机时刻（同工作台），新鲜度按它算。
+- 限流：Hyperliquid 公开接口每分钟约 8 个请求（报价 6 个、K 线 2 个），429 记为“接口限流（HTTP 429）”，不另设冷却。
+- 保留 400 天，实际受 Hyperliquid 只给最近 5000 小时（约 208 天）限制：更早的小时一旦存下就保留到 400 天，缺口补读不早于最近 5000 根。
+- 新鲜度规则同原油（报价 35 秒、K 线 615 秒，启动读回为快照）。
+
+**页面**：照工作台海力士详情：状态行、四格读数（当前溢价率、ADR、正股 ÷ 10、区间平均溢价率）、走势图（溢价率 / 美元价差 / 价格对比，1 周 / 1 月 / 全部，默认全部）、近期观察（每日最后共同小时，6 天）、如何比较（1 股正股 = 10 份 ADR）、数据来源与覆盖范围。不做：多空资金费图（M-2d）、指标（M-2e）、成交标记。
+
+### M-2b 实施记录（与上文不同或补充的地方）
+
+- **配置**：`monitor.hynix` 不带设置（写别的键或非对象时报“monitor.hynix 无效（不带设置，写 {}）”），可单独配置。运行状态的 `monitor` 段多一个 `hynix`（报价与 K 线的最近时刻、行数与错误）。
+- **接口**：`/api/monitor/hynix/quote`、`/api/monitor/hynix/candles?days=` 规则同原油（未配置 404 “本服务没有配置海力士行情监控”，先于参数检查；尚无数据 503；`days` 只认 1–400）；应答多出的字段同原油。
+- **K 线**：只收两腿同一已收盘整点都有的小时（工作台 `alignCandles`），读回时再校验整点、递增、不晚于轮次时刻与价格为正。替身行情缺某小时（任一腿没有成交）时该小时不存，页面按缺口断开。
+- **导入**：「启用行情监控」写入 `{ "anthropic": {}, "oil": {}, "hynix": {} }`；已启用的配置缺海力士时补上，规则同 M-2a。
+- **页面**：市场标签多一个“海力士”，默认范围“全部”、默认标签“溢价率”（同工作台）；快照提示附带服务最近一次失败的原因；K 线按所选范围加 21 天读（为 M-2e 预热）。来源说明按本服务改写：不提资金费，写明 Hyperliquid 只给最近 5000 小时、本服务存在 `monitor.sqlite` 保留 400 天。
+- **本地预览**：`scripts/dev-monitor.ts` 同时启用三个市场；替身行情新增 xyz dex 的 `allMids` 与 SKHY / SKHX 1 小时 K 线（上市 30 天，溢价在 2–8% 之间缓慢摆动），可让单腿或整体返回 429 / 500，可指定缺失的小时。
+- **测试**：新增 `test/monitor-hynix.test.ts`（8 个：报价换算与拒收、K 线配对 / 续读起点 / 5000 根下限 / 行校验，采集的快照标记与续读，失败与恢复、429，读回与写入失败，永久缺口每小时补读，配置与接口，页面数据规则）；`test/import-modules.test.ts` 行情监控导入用例补海力士。
+
+**本批没做**：多交易所对比（M-2c）、资金费（M-2d）、指标（M-2e）、成交标记、概览卡片与告警（M-3）。`deploy/config.example.json` 仍只带 `anthropic`。
+
+**回滚**：`sudo bash install.sh --version v0.20.0`，回退前从 `config.json` 删掉 `monitor.hynix`（只配了海力士时删掉整个 `monitor`）；`hynix_candles` 表旧版本不读。

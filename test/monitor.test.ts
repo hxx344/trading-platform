@@ -252,7 +252,7 @@ test('服务配置：monitor 段的默认股数与校验；只配 monitor 时 pa
   }
   assert.throws(() => parseServiceConfig({ secretsFile, monitor: {} }), /monitor 须至少配置一个市场/);
   assert.throws(() => parseServiceConfig({ secretsFile, monitor: null }), /monitor 无效/);
-  assert.throws(() => parseServiceConfig({ secretsFile, monitor: { anthropic: {}, hynix: {} } }), /monitor 无效/);
+  assert.throws(() => parseServiceConfig({ secretsFile, monitor: { anthropic: {}, aero: {} } }), /monitor 无效/);
   assert.throws(() => parseServiceConfig({ secretsFile, monitor: { anthropic: { refreshMs: 1000 } } }), /monitor\.anthropic 无效/);
   assert.throws(() => parseServiceConfig({ secretsFile }), '没有任何模块时仍须写 pairs');
 

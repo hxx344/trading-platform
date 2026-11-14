@@ -1,5 +1,5 @@
 // The optional monitor part of config.json: which read-only market monitors run (M-1: the Anthropic premium, M-2a: the oil
-// spread). No key is needed; the venues' public endpoints are read.
+// spread, M-2b: the Hynix ADR premium). No key is needed; the venues' public endpoints are read.
 import { ContractError, exactKeys } from '../contracts.ts';
 import { ANTHROPIC_SHARES, type AnthropicShares } from '../vendor/anthropic-market.mjs';
 
@@ -8,10 +8,12 @@ export interface MonitorConfig {
   anthropic?: { shares: AnthropicShares };
   /** Brent − WTI on Binance; takes no settings. */
   oil?: Record<string, never>;
+  /** Hyperliquid xyz:SKHY against xyz:SKHX; takes no settings. */
+  hynix?: Record<string, never>;
 }
-export const MONITOR_MARKETS = ['anthropic', 'oil'] as const;
+export const MONITOR_MARKETS = ['anthropic', 'oil', 'hynix'] as const;
 export type MonitorMarket = typeof MONITOR_MARKETS[number];
-export const MONITOR_LABELS: Record<MonitorMarket, string> = { anthropic: 'Anthropic 价差', oil: '原油价差' };
+export const MONITOR_LABELS: Record<MonitorMarket, string> = { anthropic: 'Anthropic 价差', oil: '原油价差', hynix: '海力士溢价' };
 /** The configured markets, in MONITOR_MARKETS order. */
 export const monitorMarkets = (config: MonitorConfig): MonitorMarket[] => MONITOR_MARKETS.filter(market => config[market] !== undefined);
 
@@ -21,16 +23,17 @@ const billions = (value: unknown, name: string): number => {
   return value;
 };
 
-/** { anthropic?: { shares?: { outstanding, diluted } }, oil?: {} }; at least one market. The share bounds are the workbench's. */
+/** { anthropic?: { shares?: { outstanding, diluted } }, oil?: {}, hynix?: {} }; at least one market. The share bounds are the workbench's. */
 export function parseMonitorConfig(value: unknown): MonitorConfig {
   let raw: Record<string, unknown>;
   try { raw = exactKeys(value, [], [...MONITOR_MARKETS]); } catch (error) { throw new Error(`monitor 无效：${reason(error)}`); }
   if (MONITOR_MARKETS.every(market => raw[market] === undefined)) throw new Error(`monitor 须至少配置一个市场（${MONITOR_MARKETS.join('、')}）`);
   const config: MonitorConfig = {};
   if (raw.anthropic !== undefined) config.anthropic = { shares: parseAnthropic(raw.anthropic) };
-  if (raw.oil !== undefined) {
-    try { exactKeys(raw.oil, []); } catch (error) { throw new Error(`monitor.oil 无效（不带设置，写 {}）：${reason(error)}`); }
-    config.oil = {};
+  for (const market of ['oil', 'hynix'] as const) {
+    if (raw[market] === undefined) continue;
+    try { exactKeys(raw[market], []); } catch (error) { throw new Error(`monitor.${market} 无效（不带设置，写 {}）：${reason(error)}`); }
+    config[market] = {};
   }
   return config;
 }
@@ -52,5 +55,6 @@ export function monitorSummary(monitor: MonitorConfig | undefined): string {
   const parts: string[] = [];
   if (monitor.anthropic) parts.push(`Anthropic 价差（流通股 ${monitor.anthropic.shares.outstanding} 十亿、完全稀释 ${monitor.anthropic.shares.diluted} 十亿股）`);
   if (monitor.oil) parts.push('原油价差（Binance 布伦特 − WTI）');
+  if (monitor.hynix) parts.push('海力士溢价（Hyperliquid SKHY / SKHX）');
   return `，行情监控 ${parts.join('、')}`;
 }

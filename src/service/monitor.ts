@@ -3,20 +3,25 @@
 // opened costs only the monitor page.
 import { join } from 'node:path';
 import { createAnthropicMonitor, type AnthropicMonitor, type LoopContext } from '../monitor/anthropic.ts';
+import { createHynixMonitor, type HynixMonitor } from '../monitor/hynix.ts';
 import { createOilMonitor, type OilMonitor } from '../monitor/oil.ts';
 import { MONITOR_FILE, createMonitorStore, type MonitorStore } from '../monitor/store.ts';
 import { createBinanceGate, type AnthropicFetcher } from '../vendor/anthropic-market.mjs';
 import { monitorMarkets, type MonitorConfig, type MonitorMarket } from './monitor-config.ts';
 
-export interface MonitorRuntime { config: MonitorConfig; store: MonitorStore; anthropic: AnthropicMonitor | null; oil: OilMonitor | null }
+export interface MonitorRuntime { config: MonitorConfig; store: MonitorStore; anthropic: AnthropicMonitor | null; oil: OilMonitor | null; hynix: HynixMonitor | null }
 
 /** Opens monitor.sqlite and reads the saved history back; throws when the file cannot be opened. */
 export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now, log }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void } = {}): MonitorRuntime {
   const store = createMonitorStore({ file: join(dir, MONITOR_FILE), ...(now ? { now } : {}) });
   try {
-    // One Binance cooldown for both markets: they read Binance from the same address.
-    const options = { store, gate: createBinanceGate(), ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}) };
-    return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil: config.oil ? createOilMonitor(options) : null };
+    const base = { store, ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}) };
+    // One Binance cooldown for the two markets that read Binance from the same address; Hynix reads Hyperliquid only.
+    const options = { ...base, gate: createBinanceGate() };
+    return {
+      config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil: config.oil ? createOilMonitor(options) : null,
+      hynix: config.hynix ? createHynixMonitor(base) : null,
+    };
   } catch (error) { store.close(); throw error; }
 }
 
@@ -25,7 +30,7 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
  * (the endpoint answers 404); one without data yet gives null (503).
  */
 export function monitorViews(monitor: MonitorRuntime) {
-  const collector = (market: MonitorMarket) => market === 'anthropic' ? monitor.anthropic : monitor.oil;
+  const collector = (market: MonitorMarket) => monitor[market];
   return {
     state: () => ({ markets: monitorMarkets(monitor.config), anthropic: monitor.config.anthropic ? { shares: monitor.config.anthropic.shares } : null }),
     quote: (market: MonitorMarket): unknown => collector(market)?.quote(),
@@ -34,10 +39,10 @@ export function monitorViews(monitor: MonitorRuntime) {
 }
 
 /** For the status page: each configured market's last reads and errors. */
-export const monitorStatus = (monitor: MonitorRuntime) => ({ anthropic: monitor.anthropic?.status() ?? null, oil: monitor.oil?.status() ?? null });
+export const monitorStatus = (monitor: MonitorRuntime) => ({ anthropic: monitor.anthropic?.status() ?? null, oil: monitor.oil?.status() ?? null, hynix: monitor.hynix?.status() ?? null });
 
-export const monitorLoops = (monitor: MonitorRuntime, context: LoopContext): Promise<void>[] => [...monitor.anthropic?.loops(context) ?? [], ...monitor.oil?.loops(context) ?? []];
+export const monitorLoops = (monitor: MonitorRuntime, context: LoopContext): Promise<void>[] => [...monitor.anthropic?.loops(context) ?? [], ...monitor.oil?.loops(context) ?? [], ...monitor.hynix?.loops(context) ?? []];
 
 /** Ends the requests in flight (at stopping), so the loops finish within the drain. */
-export const stopMonitor = (monitor: MonitorRuntime): void => { monitor.anthropic?.stop(); monitor.oil?.stop(); };
+export const stopMonitor = (monitor: MonitorRuntime): void => { monitor.anthropic?.stop(); monitor.oil?.stop(); monitor.hynix?.stop(); };
 export const closeMonitor = (monitor: MonitorRuntime): void => { try { monitor.store.close(); } catch { /* best effort */ } };

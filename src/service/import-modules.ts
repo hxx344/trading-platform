@@ -75,10 +75,10 @@ export function planMonitor(source: MonitorSource, config: Json, fits: (candidat
   item.markets = monitorMarkets(parseMonitorConfig(monitor));
   const reads = missing.map(market => market === 'anthropic'
     ? `Anthropic 价差（股数取默认值：流通 ${defaults.outstanding} / 完全稀释 ${defaults.diluted} 十亿股；每 10 秒读报价、每 60 秒读 K 线，Binance、Hyperliquid、Lighter RH 的公开行情）`
-    : '原油价差（每 10 秒读报价、每 60 秒读 K 线，Binance 的公开行情）');
+    : market === 'oil' ? '原油价差（每 10 秒读报价、每 60 秒读 K 线，Binance 的公开行情）' : '海力士溢价（每 10 秒读报价、每 60 秒读 K 线，Hyperliquid 的公开行情）');
   item.detail = `${item.enabled ? `补上 ${reads.join('、')}，已有的${names(MONITOR_MARKETS.filter(market => !missing.includes(market)))}保留现有设置` : reads.join('、')}；不需要密钥`;
   if (missing.includes('anthropic')) notes.push('行情监控的股数取默认值：工作台的股数设置只存在浏览器里，没有带过来；要改股数请改 config.json 的 monitor.anthropic.shares 后执行 sudo bash install.sh');
-  if (source.workbench) notes.push('工作台 Monitor 模块的本地行情记录不导入；本服务启用后从交易所回补（Anthropic 最近约 50 天，原油从 2026-04-01 起）');
+  if (source.workbench) notes.push('工作台 Monitor 模块的本地行情记录不导入；本服务启用后从交易所回补（Anthropic 最近约 50 天，原油从 2026-04-01 起，海力士从 2026-07-10 上市起，最多最近 5000 小时）');
   return item;
 }
 

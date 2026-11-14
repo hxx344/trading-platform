@@ -4,6 +4,7 @@ import { ANTHROPIC_COMPARISON_LEGS, ANTHROPIC_LEGS, anthropicPremium, anthropicS
 import { ApiError } from './api.ts';
 import { ANTHROPIC_WARMUP_DAYS, anthropicChartConfig, anthropicHistory, anthropicPoints, anthropicQuote, coversAnthropicRange, dailyPoints, ranges, selectRange, type AnthropicHistory, type AnthropicQuote, type ChartMode, type Point } from './monitor-history.ts';
 import { SpreadChart, date, stamp } from './MonitorChart.tsx';
+import { HynixPanel } from './MonitorHynix.tsx';
 import { OilPanel } from './MonitorOil.tsx';
 import { StatePanel } from './StateViews.tsx';
 import { useLiveResource } from './use-live-resource.ts';
@@ -43,7 +44,7 @@ const notReady = (error: Error | null) => error instanceof ApiError && error.sta
 // Validation errors are internal English text; only the service's (Chinese) messages are shown as they are.
 const readable = (error: Error, fallback: string) => /[一-鿿]/.test(error.message) ? error.message : fallback;
 
-const MARKET_TABS: Record<string, string> = { anthropic: 'Anthropic', oil: '原油' };
+const MARKET_TABS: Record<string, string> = { anthropic: 'Anthropic', oil: '原油', hynix: '海力士' };
 const TAB_KEY = 'monitor:market:v1';
 const savedTab = () => { try { return localStorage.getItem(TAB_KEY); } catch { return null; } };
 
@@ -63,7 +64,7 @@ export function MonitorPage({ onExpired }: { onExpired: () => void }) {
   return <div className="monitor-desk">
     <div className="site-shell" data-monitor={active}><div className="monitor-main">
       {markets.length > 1 && <div className="hub-nav-row"><div className="hub-market-nav" role="tablist" aria-label="选择监控市场">{markets.map(market => <button type="button" role="tab" key={market} aria-selected={active === market} data-state={active === market ? 'active' : 'inactive'} className="hub-market-tab" onClick={() => choose(market)}>{MARKET_TABS[market]}</button>)}</div></div>}
-      {active === 'oil' ? <OilPanel onExpired={onExpired} /> : shares && <AnthropicPanel outstanding={shares.outstanding} diluted={shares.diluted} onExpired={onExpired} />}
+      {active === 'oil' ? <OilPanel onExpired={onExpired} /> : active === 'hynix' ? <HynixPanel onExpired={onExpired} /> : shares && <AnthropicPanel outstanding={shares.outstanding} diluted={shares.diluted} onExpired={onExpired} />}
     </div></div>
   </div>;
 }

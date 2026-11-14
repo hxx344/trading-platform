@@ -1,8 +1,9 @@
 // Monitor history in a database file of its own (monitor.sqlite), like the balance samples: the executor's database keeps
 // its schema, so an older release still opens it after a rollback, and losing this file loses only the monitor history
-// (the venues serve the last ~50 days of Anthropic and the oil history since 2026-04-01 again). Nothing here takes part in a trading decision.
+// (the venues serve the last ~50 days of Anthropic, the oil history since 2026-04-01 and the last 5000 Hynix hours again). Nothing here takes part in a trading decision.
 import { DatabaseSync } from 'node:sqlite';
 import type { AnthropicCandleRow } from '../vendor/anthropic-market.mjs';
+import type { HynixCandleRow } from '../vendor/hynix-market.mjs';
 import type { OilCandleRow } from '../vendor/oil-market.mjs';
 
 export const MONITOR_FILE = 'monitor.sqlite';
@@ -24,6 +25,7 @@ export function createMonitorStore({ file, now = Date.now }: { file: string; now
     db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=2000;
     CREATE TABLE IF NOT EXISTS anthropic_candles (time INTEGER PRIMARY KEY, binance REAL, xyz REAL, io REAL, rh REAL);
     CREATE TABLE IF NOT EXISTS oil_candles (time INTEGER PRIMARY KEY, brent REAL, wti REAL);
+    CREATE TABLE IF NOT EXISTS hynix_candles (time INTEGER PRIMARY KEY, adr REAL NOT NULL, ordinary REAL NOT NULL);
     CREATE TABLE IF NOT EXISTS monitor_state (key TEXT PRIMARY KEY, json TEXT NOT NULL, updated_at INTEGER NOT NULL);`);
   } catch (error) { db.close(); throw error; }
   const upsertCandle = db.prepare(`INSERT INTO anthropic_candles(time, binance, xyz, io, rh) VALUES (?, ?, ?, ?, ?)
@@ -32,6 +34,9 @@ export function createMonitorStore({ file, now = Date.now }: { file: string; now
   const upsertOil = db.prepare(`INSERT INTO oil_candles(time, brent, wti) VALUES (?, ?, ?)
     ON CONFLICT(time) DO UPDATE SET brent = excluded.brent, wti = excluded.wti`);
   const pruneOil = db.prepare('DELETE FROM oil_candles WHERE time < ?');
+  const upsertHynix = db.prepare(`INSERT INTO hynix_candles(time, adr, ordinary) VALUES (?, ?, ?)
+    ON CONFLICT(time) DO UPDATE SET adr = excluded.adr, ordinary = excluded.ordinary`);
+  const pruneHynix = db.prepare('DELETE FROM hynix_candles WHERE time < ?');
   const upsertState = db.prepare(`INSERT INTO monitor_state(key, json, updated_at) VALUES (?, ?, ?)
     ON CONFLICT(key) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at`);
 
@@ -61,6 +66,11 @@ export function createMonitorStore({ file, now = Date.now }: { file: string; now
       return db.prepare('SELECT time, brent, wti FROM oil_candles ORDER BY time').all() as unknown as OilCandleRow[];
     },
     writeOilCandles: (write: CandleWrite<OilCandleRow>): number => writeRows('oil_candles', row => upsertOil.run(row.time, row.brent, row.wti), pruneOil, write),
+    /** Every stored Hynix hour (ADR and ordinary-share closes), oldest first. */
+    hynixCandles(): HynixCandleRow[] {
+      return db.prepare('SELECT time, adr, ordinary FROM hynix_candles ORDER BY time').all() as unknown as HynixCandleRow[];
+    },
+    writeHynixCandles: (write: CandleWrite<HynixCandleRow>): number => writeRows('hynix_candles', row => upsertHynix.run(row.time, row.adr, row.ordinary), pruneHynix, write),
     /** null when the key was never written; a value that no longer parses throws. */
     readState(key: string): { value: unknown; updatedAt: number } | null {
       const row = db.prepare('SELECT json, updated_at FROM monitor_state WHERE key = ?').get(key) as { json: string; updated_at: number } | undefined;

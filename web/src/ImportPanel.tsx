@@ -41,12 +41,12 @@ function OptionsRow({ item, preview }: { item: OptionsItem; preview: boolean }) 
     </tr></tbody>
   </table></div>;
 }
-const MARKET_NAMES: Record<string, string> = { anthropic: 'Anthropic 价差', oil: '原油价差' };
+const MARKET_NAMES: Record<string, string> = { anthropic: 'Anthropic 价差', oil: '原油价差', hynix: '海力士溢价' };
 function MonitorRow({ item, preview }: { item: MonitorItem; preview: boolean }) {
   return <div className="table-wrap"><table className="data" id="importMonitorTable">
     <thead><tr><th>行情监控</th><th>本项目</th><th>工作台 Monitor</th><th>{preview ? '说明' : '结果'}</th></tr></thead>
     <tbody><tr>
-      <td>{item.markets === undefined ? 'Anthropic 价差、原油价差' : item.markets.length ? item.markets.map(market => MARKET_NAMES[market] ?? market).join('、') : '—'}</td><td>{item.enabled ? '已启用' : '未启用'}</td><td className="muted">{item.workbench ? '有（本地行情记录不导入）' : '无'}</td>
+      <td>{item.markets === undefined ? 'Anthropic 价差、原油价差、海力士溢价' : item.markets.length ? item.markets.map(market => MARKET_NAMES[market] ?? market).join('、') : '—'}</td><td>{item.enabled ? '已启用' : '未启用'}</td><td className="muted">{item.workbench ? '有（本地行情记录不导入）' : '无'}</td>
       <td className={item.status === 'added' ? 'ok' : preview || item.enabled ? 'muted' : 'err'}>{item.status === 'added' ? (preview ? '可启用：' : '已启用：') : (preview ? '' : '未启用：')}{item.detail}</td>
     </tr></tbody>
   </table></div>;

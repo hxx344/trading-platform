@@ -26,12 +26,12 @@ function rig(): Rig {
   };
   return state;
 }
-function withRules(run: (context: { r: Rig; rules: ReturnType<typeof createOilRules>; file: string; reopen(): ReturnType<typeof createOilRules> }) => void) {
+async function withRules(run: (context: { r: Rig; rules: ReturnType<typeof createOilRules>; file: string; reopen(): ReturnType<typeof createOilRules> }) => Promise<void>) {
   const dir = mkdtempSync(join(tmpdir(), 'tp-oil-rules-'));
   const r = rig(), file = join(dir, 'oil-rules.sqlite');
   const open = () => createOilRules({ file, venues: ['binance'], books: () => r.books, now: () => r.now });
   let rules = open();
-  try { run({ r, rules, file, reopen: () => { rules.close(); rules = open(); return rules; } }); }
+  try { await run({ r, rules, file, reopen: () => { rules.close(); rules = open(); return rules; } }); }
   finally { rules.close(); rmSync(dir, { recursive: true, force: true }); }
 }
 type View = { rules: { id: string; revision: number; observing: boolean; title: string; problem: string | null; observation: { open: { value: string; met: boolean; hits: number; signaled: boolean } | null; close: { value: string; met: boolean; hits: number } | null; note: string | null } | null; observations: { kind: string; message: string; action?: string; value?: string; hits?: number }[]; events: { message: string }[] }[] };
@@ -75,102 +75,102 @@ test('可成交价差：做空开仓/做多平仓看卖出价差（BZ 买一 −
   assert.deepEqual(evaluateRule(short, 'open', r.books, r.now - 1_001), { error: 'BZUSDT 盘口时间超前，请检查时钟' });
 });
 
-test('观察：每份新盘口满足才计一次，同一份盘口不重复计；达到次数只记一条信号，中断后重新计数；不满足清零', () => withRules(({ r, rules }) => {
+test('观察：每份新盘口满足才计一次，同一份盘口不重复计；达到次数只记一条信号，中断后重新计数；不满足清零', () => withRules(async ({ r, rules }) => {
   r.set(['74.10', '74.12'], ['70.00', '70.05']);
   rules.create({ config: settings(), observing: true });
   // Books read before the rule started do not count.
-  rules.tick();
+  await rules.tick();
   assert.equal(first(rules.view()).observation!.note, '等待开始或清零后的两腿新盘口');
   r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']);
-  rules.tick();
+  await rules.tick();
   assert.equal(first(rules.view()).observation!.open!.hits, 1);
-  rules.tick();
+  await rules.tick();
   assert.equal(first(rules.view()).observation!.open!.hits, 1, '同一份盘口不重复计');
   assert.equal(signals(rules.view()).length, 0);
   r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']);
-  rules.tick();
+  await rules.tick();
   let view = first(rules.view());
   assert.deepEqual([view.observation!.open!.hits, view.observation!.open!.signaled], [2, true]);
   assert.deepEqual(signals(rules.view()).map(item => [item.action, item.value, item.hits, item.message]), [['open', '4.05', 2, '开仓条件本会触发；仅记录信号，未下单']]);
   r.now += 3_000; r.set(['74.20', '74.22'], ['70.00', '70.05']);
-  rules.tick();
+  await rules.tick();
   assert.equal(signals(rules.view()).length, 1, '同一轮连续满足只记一次');
   // The streak breaks, then two fresh hits signal again.
   r.now += 3_000; r.set(['73.00', '73.02'], ['70.00', '70.05']);
-  rules.tick();
+  await rules.tick();
   view = first(rules.view());
   assert.deepEqual([view.observation!.open!.hits, view.observation!.open!.met], [0, false]);
-  for (let i = 0; i < 2; i++) { r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']); rules.tick(); }
+  for (let i = 0; i < 2; i++) { r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']); await rules.tick(); }
   assert.equal(signals(rules.view()).length, 2);
   // The close condition is counted on its own: buy spread 2.95 ≤ 3.
-  for (let i = 0; i < 2; i++) { r.now += 3_000; r.set(['72.95', '73.00'], ['70.05', '70.10']); rules.tick(); }
+  for (let i = 0; i < 2; i++) { r.now += 3_000; r.set(['72.95', '73.00'], ['70.05', '70.10']); await rules.tick(); }
   assert.deepEqual(signals(rules.view()).map(item => item.action), ['open', 'open', 'close']);
 }));
 
-test('观察：读取失败、盘口过期、两次读数间隔超过 10 秒都清零并等新盘口，同一原因连续只记一次', () => withRules(({ r, rules }) => {
+test('观察：读取失败、盘口过期、两次读数间隔超过 10 秒都清零并等新盘口，同一原因连续只记一次', () => withRules(async ({ r, rules }) => {
   rules.create({ config: settings(), observing: true });
   r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']);
-  rules.tick();
+  await rules.tick();
   assert.equal(first(rules.view()).observation!.open!.hits, 1);
   r.books = [{ ...r.books[0]!, error: 'timeout' }, r.books[1]!];
-  rules.tick(); rules.tick();
+  await rules.tick(); await rules.tick();
   const resets = first(rules.view()).observations.filter(item => item.message === 'BZUSDT 盘口读取失败；连续次数清零');
   assert.equal(resets.length, 1);
   r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']);
-  rules.tick();
+  await rules.tick();
   assert.equal(first(rules.view()).observation!.open!.hits, 1, '清零后重新从 1 计');
   // Books still fresh, but the gap since the last counted reading is longer than 10 s.
   r.now += 11_000; r.set(['74.10', '74.12'], ['70.00', '70.05']);
-  rules.tick();
+  await rules.tick();
   assert.equal(first(rules.view()).observation!.note, '盘口更新间隔超过 10 秒');
   r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']);
-  rules.tick();
+  await rules.tick();
   assert.equal(first(rules.view()).observation!.open!.hits, 1, '间隔清零后下一份新盘口从 1 计');
   // Books that stop updating: the stale reason is recorded once however many rounds see it.
-  r.now += 11_000; rules.tick(); r.now += 3_000; rules.tick();
+  r.now += 11_000; await rules.tick(); r.now += 3_000; await rules.tick();
   assert.equal(first(rules.view()).observations.filter(item => item.message === 'BZUSDT 盘口已过期；连续次数清零').length, 1);
   assert.equal(signals(rules.view()).length, 0);
 }));
 
-test('观察：一条规则写库失败不影响同一轮的其它规则，失败汇总抛给循环记日志；写库恢复后补记信号', () => withRules(({ r, rules, file }) => {
+test('观察：一条规则写库失败不影响同一轮的其它规则，失败汇总抛给循环记日志；写库恢复后补记信号', () => withRules(async ({ r, rules, file }) => {
   rules.create({ config: settings({ name: '甲', confirmSamples: 1 }), observing: true });
   rules.create({ config: settings({ name: '乙', confirmSamples: 1 }), observing: true });
   const [a, b] = (rules.view() as View).rules;
   const db = new DatabaseSync(file);
   db.exec(`CREATE TRIGGER refuse BEFORE UPDATE ON rules WHEN NEW.id = '${a!.id}' BEGIN SELECT RAISE(ABORT, '写入被拒'); END`);
   r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']);
-  assert.throws(() => rules.tick(), /甲.*写入被拒/);
+  await assert.rejects(rules.tick(), /甲.*写入被拒/);
   const after = () => new Map((rules.view() as View).rules.map(rule => [rule.title, rule.observations.filter(item => item.kind === 'signal').length]));
   assert.deepEqual([...after()], [['甲', 0], ['乙', 1]]);
   db.exec('DROP TRIGGER refuse'); db.close();
-  rules.tick();
+  await rules.tick();
   assert.deepEqual([...after()], [['甲', 1], ['乙', 1]], '没写进库的信号下一轮补记，已记的不重复');
 }));
 
-test('观察：清零原因写库失败时连续次数照样清零，恢复后从 1 重新计、不凭旧次数出信号', () => withRules(({ r, rules, file }) => {
+test('观察：清零原因写库失败时连续次数照样清零，恢复后从 1 重新计、不凭旧次数出信号', () => withRules(async ({ r, rules, file }) => {
   rules.create({ config: settings({ confirmSamples: 3 }), observing: true });
   const id = first(rules.view()).id;
-  for (let i = 0; i < 2; i++) { r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']); rules.tick(); }
+  for (let i = 0; i < 2; i++) { r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']); await rules.tick(); }
   assert.equal(first(rules.view()).observation!.open!.hits, 2);
   const db = new DatabaseSync(file);
   db.exec(`CREATE TRIGGER refuse BEFORE UPDATE ON rules WHEN NEW.id = '${id}' BEGIN SELECT RAISE(ABORT, '写入被拒'); END`);
   r.now += 3_000; r.books = [{ ...r.books[0]!, error: 'timeout' }, r.books[1]!];
-  assert.throws(() => rules.tick(), /写入被拒/);
+  await assert.rejects(rules.tick(), /写入被拒/);
   db.exec('DROP TRIGGER refuse'); db.close();
-  r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']); rules.tick();
+  r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']); await rules.tick();
   assert.equal(first(rules.view()).observation!.open!.hits, 1);
   assert.equal(signals(rules.view()).length, 0);
 }));
 
-test('观察：重启、修改与停止都清零；修订号不一致返回 409；最多 12 条；停止后不再计数', () => withRules(({ r, rules: initial, reopen }) => {
+test('观察：重启、修改与停止都清零；修订号不一致返回 409；最多 12 条；停止后不再计数', () => withRules(async ({ r, rules: initial, reopen }) => {
   initial.create({ config: settings({ confirmSamples: 3 }), observing: true });
-  for (let i = 0; i < 2; i++) { r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']); initial.tick(); }
+  for (let i = 0; i < 2; i++) { r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']); await initial.tick(); }
   assert.equal(first(initial.view()).observation!.open!.hits, 2);
   const rules = reopen();
   assert.ok(first(rules.view()).observations.some(item => item.message === '服务重启，连续次数已清零，等待新盘口'));
-  rules.tick();
+  await rules.tick();
   assert.equal(first(rules.view()).observation!.note, '等待开始或清零后的两腿新盘口', '重启前的盘口不计');
-  r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']); rules.tick();
+  r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']); await rules.tick();
   assert.equal(first(rules.view()).observation!.open!.hits, 1);
   const { id, revision } = first(rules.view());
   assert.throws(() => rules.update(id, { revision: revision + 1, config: settings() }), code('stale_revision'));
@@ -180,17 +180,20 @@ test('观察：重启、修改与停止都清零；修订号不一致返回 409�
   rules.act(id, 'stop', { revision: view.revision });
   view = first(rules.view());
   assert.deepEqual([view.observing, view.observation], [false, null]);
-  r.now += 3_000; r.set(['80', '80.02'], ['70.00', '70.05']); rules.tick();
+  r.now += 3_000; r.set(['80', '80.02'], ['70.00', '70.05']); await rules.tick();
   assert.equal(signals(rules.view()).length, 0, '停止后不计数');
   assert.throws(() => rules.act(id, 'stop', { revision: view.revision }), code('not_observing'));
-  assert.throws(() => rules.act(id, 'live', { revision: view.revision }), code('not_found'));
+  assert.throws(() => rules.act(id, 'live', { revision: view.revision }), code('confirm_required'));
+  assert.throws(() => rules.act(id, 'live', { revision: view.revision, confirmLive: true }), code('live_unavailable'), '没有执行器不能转实盘');
+  assert.throws(() => rules.act(id, 'stop', { revision: view.revision, confirmLive: true }), code('unknown_field'));
+  assert.throws(() => rules.act(id, 'other', { revision: view.revision }), code('not_found'));
   for (let i = 1; i < MAX_RULES; i++) rules.create({ config: settings() });
   assert.throws(() => rules.create({ config: settings() }), code('too_many_rules'));
   rules.act(id, 'delete', { revision: view.revision });
   assert.equal((rules.view() as View).rules.length, MAX_RULES - 1);
 }));
 
-test('库：版本比本版本新时拒绝打开；参数读不了的规则保留显示、不判断、不能开始观察', () => {
+test('库：版本比本版本新时拒绝打开；参数读不了的规则保留显示、不判断、不能开始观察', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tp-oil-rules-'));
   const file = join(dir, 'oil-rules.sqlite'), r = rig();
   try {
@@ -202,7 +205,7 @@ test('库：版本比本版本新时拒绝打开；参数读不了的规则保�
     db.exec(`UPDATE rules SET config = '{"venue":"binance"}'`);
     db.close();
     const again = open();
-    r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']); again.tick();
+    r.now += 3_000; r.set(['74.10', '74.12'], ['70.00', '70.05']); await again.tick();
     const view = first(again.view());
     assert.match(view.problem!, /^规则参数无法读取/);
     assert.equal(signals(again.view()).length, 0);
@@ -224,7 +227,8 @@ test('库：版本比本版本新时拒绝打开；参数读不了的规则保�
     assert.match(broken.problem!, /^规则参数无法读取/);
     assert.equal(broken.observing, false);
     assert.deepEqual([broken.events, broken.observations], [[], []]);
-    // Records read back keep only well-formed items, at most 30; text that is not JSON reads as a stopped rule.
+    // Records read back keep only well-formed items, at most 30; text that is not JSON may belong to a live rule holding a
+    // position, so it is held for review and has to be reset before it can be deleted.
     const good = { at: 1, kind: 'reset', message: '好' }, signal = { at: 2, kind: 'signal', message: '信号', value: '4', threshold: '4', hits: 2, bzAt: 1, clAt: 1 };
     const mixed = [null, { at: 'x', kind: 'note', message: '坏' }, { at: 1, message: '缺类型' }, { ...signal, bzAt: undefined }, signal, ...Array.from({ length: 31 }, () => good)];
     const patch = new DatabaseSync(file);
@@ -235,13 +239,16 @@ test('库：版本比本版本新时拒绝打开；参数读不了的规则保�
     assert.deepEqual(filtered.observations.map(item => item.message), ['信号']);
     patch.exec(`UPDATE rules SET state = '{not json'`);
     patch.close();
-    assert.deepEqual([first(again.view()).observing, first(again.view()).events], [false, []]);
-    again.act(broken.id, 'delete', { revision: broken.revision });
+    const unread = first(again.view()) as View['rules'][number] & { mode: string; live: { phase: string; enabled: boolean } };
+    assert.deepEqual([unread.mode, unread.live.phase, unread.live.enabled, unread.observing, unread.events], ['live', 'review', false, false, []]);
+    assert.throws(() => again.act(broken.id, 'delete', { revision: broken.revision }), code('rule_holding'));
+    again.act(broken.id, 'reset', { revision: broken.revision });
+    again.act(broken.id, 'delete', { revision: broken.revision + 1 });
     again.close();
     const newer = new DatabaseSync(file);
-    newer.exec('PRAGMA user_version = 2');
+    newer.exec('PRAGMA user_version = 3');
     newer.close();
-    assert.throws(open, /库版本 2 比本版本能读的 1 新/);
+    assert.throws(open, /库版本 3 比本版本能读的 2 新/);
     // A rules table of another shape is refused and the version is not stamped on it.
     const other = join(dir, 'other.sqlite'), foreign = new DatabaseSync(other);
     foreign.exec('CREATE TABLE rules (id TEXT)');
@@ -270,5 +277,16 @@ test('服务接线：规则库打不开时只读出原因、写入 503；每轮�
     await Promise.all(oilLoops(oil, context, line => logs.push(line), rules));
     assert.ok(ticks >= 2, '判断失败后盘口循环继续下一轮');
     assert.ok(logs.includes('原油自动规则判断失败：坏了'));
+    // Stopping: the books loop ends only after the judging round in flight, which is told the service is stopping.
+    let release!: () => void, passed: (() => boolean) | undefined, done = false, paused = 0;
+    const slow = { ...stub, tick: (stopped?: () => boolean) => { passed = stopped; return new Promise<void>(resolve => { release = resolve; }); } };
+    const stopping = { stopped: () => paused >= 1, pause: async () => { paused++; } };
+    const loops = Promise.all(oilLoops(oil, stopping, line => logs.push(line), slow)).then(() => { done = true; });
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.equal(done, false, '判断轮没结束时盘口循环不退出');
+    assert.equal(passed, stopping.stopped);
+    release();
+    await loops;
+    assert.equal(done, true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

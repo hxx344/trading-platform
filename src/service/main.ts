@@ -283,8 +283,8 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   let engine: OptionsEngine | undefined;
   try { engine = options ? createEngineFor(options, { notify: text => notifier.notify(`【期权】${text}`), log: line => process.stderr.write(`${line}\n`) }) : undefined; }
   catch (error) { samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw new Error(`期权状态无法恢复，拒绝启动：${error instanceof Error ? error.message : String(error)}`); }
-  // Spread rules (observe mode) in their own file; one that cannot open is shown on the oil page, nothing else stops.
-  const oilRules = oil ? openOilRules(oil, dir) : undefined;
+  // Spread rules (observe and live) in their own file; one that cannot open is shown on the oil page, nothing else stops.
+  const oilRules = oil ? openOilRules(oil, dir, { executor }) : undefined;
   const oilText = `${oil ? `；原油执行账户 ${oil.config.accounts.length} 个` : ''}${options ? '；期权账户 1 个' : ''}`;
   try {
     notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}`);

@@ -102,6 +102,9 @@ export interface ServiceViews {
     fundingHistory?(market: 'oil' | 'hynix', exchange: Exchange): Promise<unknown> | undefined;
     /** M-3a: the market's threshold alerts; undefined when the market is not configured (or the service runs without alerts). */
     alerts?(market: 'oil' | 'hynix'): { view(): unknown; update(body: unknown): unknown; test(): Promise<unknown> } | undefined;
+    /** M-3c: false for a configured market switched off (its reads answer 423); the page's switch. */
+    enabled?(market: keyof typeof MONITOR_NAMES): boolean;
+    setControl?(market: keyof typeof MONITOR_NAMES, body: unknown): unknown;
   };
   /** The options module's reads and writes (service/options.ts); absent when the service runs no options module. */
   options?: {
@@ -309,6 +312,18 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       if (!target) return send(response, 404, { code: 'not_found', message: '不存在' });
       const body = await readJson(request);
       return send(response, 200, target[2] === 'update' ? rules.update(target[1]!, body) : rules.act(target[1]!, target[2]!, body));
+    }
+    // M-3c: the market's switch, and the reads of a market switched off (its data is kept, nothing is collected).
+    const controlRoute = request.method === 'POST' ? /^\/api\/monitor\/(anthropic|oil|hynix)\/control$/.exec(url.pathname) : null;
+    if (controlRoute) {
+      const market = controlRoute[1] as keyof typeof MONITOR_NAMES;
+      if (!views?.monitor?.setControl) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
+      if (!views.monitor.state().markets.includes(market)) return send(response, 404, { code: 'not_found', message: `本服务没有配置${MONITOR_NAMES[market]}行情监控` });
+      return send(response, 200, views.monitor.setControl(market, await readJson(request)));
+    }
+    const marketRead = /^\/api\/monitor\/(anthropic|oil|hynix)\//.exec(url.pathname)?.[1] as keyof typeof MONITOR_NAMES | undefined;
+    if (marketRead && views?.monitor?.enabled && views.monitor.state().markets.includes(marketRead) && !views.monitor.enabled(marketRead)) {
+      return send(response, 423, { code: 'monitor_disabled', message: `${MONITOR_NAMES[marketRead]}监控已关闭，行情采集与自动告警已暂停；开启后恢复` });
     }
     const alertRoute = /^\/api\/monitor\/(oil|hynix)\/alerts(\/test)?$/.exec(url.pathname);
     if (alertRoute && (request.method === 'GET' ? !alertRoute[2] : request.method === 'POST')) {

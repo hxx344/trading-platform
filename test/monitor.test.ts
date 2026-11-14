@@ -280,7 +280,7 @@ test('HTTP：行情监控三个接口未登录 401、未配置 404、尚无数�
     assert.equal((await fetch(`${withMonitor!.base}/api/monitor/state`)).status, 401);
     for (const path of ['/api/monitor/state', '/api/monitor/anthropic/quote', '/api/monitor/anthropic/candles']) assert.equal((await without!.get(path)).status, 404, path);
     const get = withMonitor!.get;
-    assert.deepEqual(await get('/api/monitor/state'), { status: 200, body: { markets: ['anthropic'], anthropic: { shares: { outstanding: 12.7, diluted: 16.7 } } } });
+    assert.deepEqual(await get('/api/monitor/state'), { status: 200, body: { markets: ['anthropic'], anthropic: { shares: { outstanding: 12.7, diluted: 16.7 } }, controls: { anthropic: { market: 'anthropic', enabled: true, revision: 0, error: null } } } });
     assert.deepEqual([(await get('/api/monitor/anthropic/quote')).status, (await get('/api/monitor/anthropic/quote')).body.code], [503, 'not_ready']);
     assert.deepEqual([(await get('/api/monitor/anthropic/candles')).status, (await get('/api/monitor/anthropic/candles')).body.code], [503, 'not_ready']);
     for (const days of ['0', 'x', '401', '007', '1.5', '-1', '']) {
@@ -335,7 +335,7 @@ test('服务进程：配置 monitor 时提供三个只读接口与状态；未�
     try {
       const get = await login(data, port);
       assert.equal((await fetch(`http://127.0.0.1:${port}/api/monitor/state`, { headers: FRESH })).status, 401);
-      assert.deepEqual(await get('/api/monitor/state'), { status: 200, body: { markets: ['anthropic'], anthropic: { shares: { outstanding: 13, diluted: 17 } } } });
+      assert.deepEqual(await get('/api/monitor/state'), { status: 200, body: { markets: ['anthropic'], anthropic: { shares: { outstanding: 13, diluted: 17 } }, controls: { anthropic: { market: 'anthropic', enabled: true, revision: 0, error: null } } } });
       assert.deepEqual((await get('/api/monitor/anthropic/quote')).status, 503);
       assert.equal((await get('/api/monitor/anthropic/quote')).body.code, 'not_ready');
       assert.equal((await get('/api/monitor/anthropic/candles?days=7')).status, 503);

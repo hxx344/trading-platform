@@ -1,9 +1,10 @@
 import { Activity, ArrowDownRight, ArrowUpRight, ChevronDown, Clock3, Info, MoveRight, RefreshCw } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ANTHROPIC_COMPARISON_LEGS, ANTHROPIC_LEGS, anthropicPremium, anthropicSharesPerUnit, perShare, type AnthropicComparisonLeg, type AnthropicShares } from '../../src/vendor/anthropic-market.mjs';
-import { ApiError } from './api.ts';
+import { api, ApiError } from './api.ts';
 import { ANTHROPIC_WARMUP_DAYS, anthropicChartConfig, anthropicHistory, anthropicPoints, anthropicQuote, coversAnthropicRange, dailyPoints, ranges, selectRange, type AnthropicHistory, type AnthropicQuote, type ChartMode, type Point } from './monitor-history.ts';
 import { SpreadChart, date, stamp } from './MonitorChart.tsx';
+import { disabledNotice, parseControl, parseControls, switchFailure, switchLabel, toggleBody, type MonitorControls } from './monitor-control.ts';
 import { HynixPanel } from './MonitorHynix.tsx';
 import { OilPanel } from './MonitorOil.tsx';
 import { StatePanel } from './StateViews.tsx';
@@ -17,20 +18,22 @@ import './monitor.css';
 export const MONITOR_STATE_PATH = '/api/monitor/state';
 export const MONITOR_READ_TIMEOUT_MS = 10_000;
 const QUOTE_PATH = '/api/monitor/anthropic/quote', CANDLE_PATH = '/api/monitor/anthropic/candles';
-const STATE_MS = 60_000, QUOTE_MS = 10_000, CANDLE_MS = 60_000;
+const STATE_MS = 60_000, CONTROL_TIMEOUT_MS = 15_000, QUOTE_MS = 10_000, CANDLE_MS = 60_000;
 // The complete history is up to 400 days of 15-minute rows, a few megabytes.
 const CANDLE_TIMEOUT_MS = 30_000;
 
-export type MonitorState = { markets: string[]; anthropic: { shares: AnthropicShares } | null };
+// controls is null from a service older than M-3c (no run switch): the page then shows the markets as before.
+export type MonitorState = { markets: string[]; anthropic: { shares: AnthropicShares } | null; controls: MonitorControls | null };
 
 const positive = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0;
 export function parseMonitorState(raw: unknown): MonitorState {
-  const value = raw as { markets?: unknown; anthropic?: { shares?: { outstanding?: unknown; diluted?: unknown } } } | null;
+  const value = raw as { markets?: unknown; anthropic?: { shares?: { outstanding?: unknown; diluted?: unknown } }; controls?: unknown } | null;
   if (!value || !Array.isArray(value.markets) || !value.markets.every(market => typeof market === 'string')) throw new Error('行情监控状态格式不正确');
-  if (!value.markets.includes('anthropic')) return { markets: value.markets, anthropic: null };
+  const controls = parseControls(value.controls, value.markets);
+  if (!value.markets.includes('anthropic')) return { markets: value.markets, anthropic: null, controls };
   const shares = value.anthropic?.shares;
   if (!shares || !positive(shares.outstanding) || !positive(shares.diluted)) throw new Error('行情监控状态缺少 Anthropic 股数');
-  return { markets: value.markets, anthropic: { shares: { outstanding: shares.outstanding, diluted: shares.diluted } } };
+  return { markets: value.markets, anthropic: { shares: { outstanding: shares.outstanding, diluted: shares.diluted } }, controls };
 }
 
 const EMPTY_POINTS: Point[] = [];
@@ -51,6 +54,25 @@ const savedTab = () => { try { return localStorage.getItem(TAB_KEY); } catch { r
 export function MonitorPage({ onExpired }: { onExpired: () => void }) {
   const state = useLiveResource<MonitorState>(MONITOR_STATE_PATH, { intervalMs: STATE_MS, timeoutMs: MONITOR_READ_TIMEOUT_MS, parse: parseMonitorState, onExpired });
   const [chosen, setChosen] = useState<string | null>(savedTab);
+  const [pending, setPending] = useState<string | null>(null);
+  const [switchError, setSwitchError] = useState<{ market: string; text: string } | null>(null);
+  const { data: current, commit, refresh } = state;
+  const toggle = useCallback(async (market: string) => {
+    const control = current?.controls?.[market];
+    if (!current || !control || pending) return;
+    setPending(market); setSwitchError(null);
+    try {
+      const view = parseControl(await api<unknown>(`/api/monitor/${market}/control`, { body: toggleBody(control), timeoutMs: CONTROL_TIMEOUT_MS }));
+      // The answer is the saved switch: it shows at once, without waiting for the next minute's read.
+      commit({ ...current, controls: { ...current.controls, [market]: view } });
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) { onExpired(); return; }
+      const answered = error instanceof ApiError;
+      setSwitchError({ market, text: switchFailure(answered ? error.status : null, answered ? error.code : undefined, answered ? error.message : null) });
+      // A conflict or an unknown outcome: read the switch again so the page shows what the service has.
+      if (!answered || error.code === 'control_conflict') void refresh();
+    } finally { setPending(null); }
+  }, [current, pending, commit, refresh, onExpired]);
   if (!state.data) return state.status === 'error' || state.status === 'offline'
     ? <StatePanel kind="error" title="读取行情监控失败" detail={state.error?.message ?? '网络离线'} />
     : <StatePanel kind="loading" title="加载中…" />;
@@ -60,11 +82,20 @@ export function MonitorPage({ onExpired }: { onExpired: () => void }) {
   const active = chosen && markets.includes(chosen) ? chosen : markets[0];
   const choose = (market: string) => { setChosen(market); try { localStorage.setItem(TAB_KEY, market); } catch { /* the choice only lasts this visit */ } };
   const shares = state.data.anthropic?.shares;
-  // Only the shown market reads: switching remounts its panel, which reads again at once.
+  const control = state.data.controls?.[active];
+  const busy = pending === active, failed = switchError?.market === active;
+  // The run switch sits on the right of the market tabs, as in the workbench hub; with one market the row shows only it.
+  const controls = state.data.controls && <div className="hub-monitor-controls"><span>运行监控</span><button type="button" role="switch" aria-checked={control?.enabled ?? false} aria-busy={busy} aria-label={`${MARKET_TABS[active]}运行监控`} disabled={!control || pending !== null} onClick={() => void toggle(active)}><span>{switchLabel(control, busy, failed)}</span><i aria-hidden="true" /></button></div>;
+  const off = control?.enabled === false;
+  // Only the shown market reads: switching remounts its panel, which reads again at once. A market switched off shows
+  // the notice instead, so its panel stops reading (the service answers 423 for it anyway).
   return <div className="monitor-desk">
     <div className="site-shell" data-monitor={active}><div className="monitor-main">
-      {markets.length > 1 && <div className="hub-nav-row"><div className="hub-market-nav" role="tablist" aria-label="选择监控市场">{markets.map(market => <button type="button" role="tab" key={market} aria-selected={active === market} data-state={active === market ? 'active' : 'inactive'} className="hub-market-tab" onClick={() => choose(market)}>{MARKET_TABS[market]}</button>)}</div></div>}
-      {active === 'oil' ? <OilPanel onExpired={onExpired} /> : active === 'hynix' ? <HynixPanel onExpired={onExpired} /> : shares && <AnthropicPanel outstanding={shares.outstanding} diluted={shares.diluted} onExpired={onExpired} />}
+      {(markets.length > 1 || controls) && <div className="hub-nav-row">{markets.length > 1 ? <div className="hub-market-nav" role="tablist" aria-label="选择监控市场">{markets.map(market => <button type="button" role="tab" key={market} aria-selected={active === market} data-state={active === market ? 'active' : 'inactive'} className="hub-market-tab" onClick={() => choose(market)}>{MARKET_TABS[market]}</button>)}</div> : <span />}{controls}</div>}
+      {failed && <p className="hub-control-notice" role="alert">{switchError.text}</p>}
+      {control?.error && <p className="hub-control-notice" role="alert">{control.error}</p>}
+      {off ? <p className="notice" role="status">{disabledNotice(active)}</p>
+        : active === 'oil' ? <OilPanel onExpired={onExpired} /> : active === 'hynix' ? <HynixPanel onExpired={onExpired} /> : shares && <AnthropicPanel outstanding={shares.outstanding} diluted={shares.diluted} onExpired={onExpired} />}
     </div></div>
   </div>;
 }

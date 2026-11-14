@@ -306,7 +306,7 @@ test('配置与接口：monitor.oil 不带设置；只配原油时 Anthropic 接
     const cookie = ((await fetch(`${base}/login?token=monitor-token-0002`, { redirect: 'manual' })).headers.get('set-cookie') ?? '').split(';')[0]!;
     const get = async (path: string) => { const response = await fetch(base + path, { headers: { cookie } }); return { status: response.status, body: await response.json() as Record<string, any> }; };
     assert.equal((await fetch(`${base}/api/monitor/oil/quote`)).status, 401);
-    assert.deepEqual(await get('/api/monitor/state'), { status: 200, body: { markets: ['oil'], anthropic: null } });
+    assert.deepEqual(await get('/api/monitor/state'), { status: 200, body: { markets: ['oil'], anthropic: null, controls: { oil: { market: 'oil', enabled: true, revision: 0, error: null } } } });
     for (const path of ['/api/monitor/anthropic/quote', '/api/monitor/anthropic/candles', '/api/monitor/anthropic/candles?days=x']) assert.deepEqual([(await get(path)).status, (await get(path)).body.message], [404, '本服务没有配置Anthropic行情监控'], path);
     assert.deepEqual([(await get('/api/monitor/oil/quote')).status, (await get('/api/monitor/oil/quote')).body.message], [503, '尚未取得原油报价，后台正在采集']);
     assert.equal((await get('/api/monitor/oil/candles?days=7')).status, 503);
@@ -318,7 +318,7 @@ test('配置与接口：monitor.oil 不带设置；只配原油时 Anthropic 接
     assert.deepEqual([quote.status, quote.body.status, quote.body.brent.coin, quote.body.staleAfterMs], [200, 'live', 'BZUSDT', QUOTE_STALE_MS]);
     const all = (await get('/api/monitor/oil/candles')).body, week = (await get('/api/monitor/oil/candles?days=7')).body;
     assert.deepEqual([all.status, all.windowDays, week.windowDays, week.coverage.pairedObservationRows], ['live', undefined, 7, all.metadata.pairedObservationRows]);
-    assert.deepEqual(Object.keys(monitorStatus(runtime)), ['anthropic', 'oil', 'hynix']);
+    assert.deepEqual(Object.keys(monitorStatus(runtime)), ['anthropic', 'oil', 'hynix', 'controls']);
     assert.equal(monitorStatus(runtime).anthropic, null);
     assert.equal(monitorStatus(runtime).oil!.candleRows, all.data.length);
   } finally {

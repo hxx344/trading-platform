@@ -229,3 +229,7 @@ table.data.history{min-width:0}
 .aster-desk .options-desk .subnav .count{margin-left:0}
 .aster-desk .options-desk .button{line-height:inherit;white-space:normal}
 .aster-desk .options-desk .button.primary:disabled:hover{background:var(--accent);border-color:transparent}
+/* The monitor page's run switch (MonitorPage.tsx, M-3c): the workbench puts .hub-monitor-controls in its hub's side card;
+   here it sits on the right of the market tab row, so it drops that card's margin and top rule. */
+.monitor-desk .hub-nav-row .hub-monitor-controls{margin:0;border-top:0;min-height:44px}
+.monitor-desk .monitor-main>.hub-control-notice{margin:0 0 12px}

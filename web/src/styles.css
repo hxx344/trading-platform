@@ -244,3 +244,19 @@ table.data.history{min-width:0}
    needs to shrink into the rest of the row and wrap inside (as monitor.css lets it below 700px) up to 912px, or it runs past
    the edge. The toolbar itself does not wrap (monitor.css keeps .detail-toolbar nowrap inside .site-shell). */
 @media(min-width:761px) and (max-width:912px){.monitor-desk .site-shell .refresh-area{flex:1 1 auto;flex-wrap:wrap;justify-content:flex-end}}
+/* CrossEx 页（web/src/crossex，样式来自工作台 modules/crossex/src，见 crossex/crossex.css）。工作台用 style={{ width }} 画的
+   条（维持保证金率、盘口深度、双腿数量对比）在本服务的 CSP 下改为 crossex/FillBar.tsx 的 SVG，尺寸与颜色取工作台原规则
+   （.kpi .meter i、.book-row>i、.position-quantity-track>span）的值。 */
+.aster-desk .crossex-page .fill-bar{display:block;width:100%;height:100%}
+.aster-desk .crossex-page .kpi .meter .fill-bar rect{fill:var(--emerald)}
+.aster-desk .crossex-page .book-row>.fill-bar{position:absolute;right:0;top:0;bottom:0;z-index:0;pointer-events:none}
+.aster-desk .crossex-page .book-row>.fill-bar rect{fill:var(--emerald-soft)}
+.aster-desk .crossex-page .book-row.sell>.fill-bar rect{fill:var(--error-soft)}
+.aster-desk .crossex-page .position-quantity-track .fill-bar rect{fill:var(--accent)}
+.aster-desk .crossex-page .position-quantity-comparison>div:nth-child(2) .position-quantity-track .fill-bar rect{fill:var(--amber)}
+/* The read-only hard caps sit in the settings disconnect-row (a wrapping flex row); take the full width like its label. */
+.aster-desk .crossex-page .disconnect-row>.ticket-details{width:100%}
+/* aster.css gives .count a 5px left margin the workbench copy never sets (it pushed the tab and filter counts 5px right);
+   put back the workbench value. Its .panel leaks into CrossEx are all overridden; shell.css reaches only its own sidebar and
+   top bar through child selectors (.app-shell > .workspace > .topbar), not CrossEx's .topbar/.brand (hidden under .hub-embedded). */
+.aster-desk .crossex-page .count{margin-left:0}

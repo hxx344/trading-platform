@@ -96,3 +96,14 @@ sudo bash install.sh --import-workbench --monitor --asset [--asset-owner <用户
 ## 8 回滚
 
 `sudo bash install.sh --version v0.12.0`。配置格式与库结构都没变，`monitor`、`asset` 两段与 `asset.sqlite` 回退后照常使用；v0.12.0 的面板没有这两项，回退后改用 §6 的备选方式。
+
+## 9 CrossEx 账户
+
+工作台 CrossEx 模块（Gate）的密钥与账户，规则见 [crossex.md](crossex.md) §3「导入」。实现：`src/service/import-crossex.ts`（读取、计划、写设置的子进程调用）与 `src/crossex/import-writer.ts`（以数据目录属主身份写 `crossex.sqlite`）。
+
+- 读取：`<DATA_DIR>/modules/crossex/crossex.sqlite` 与 `credentials.key`，两者须为普通文件（不跟随符号链接）。root 在子进程里以库属主身份、空环境只读打开；`-journal` 拒绝，有 `-wal` 无 `-shm` 拒绝，都没有时以 `immutable=1` 打开。子进程只回传 key（base64）、`live_connection`、未结束执行数、未结束订单数、`live_cache` 挂单数、`live_owner` 到期时刻与 `settings.config`；解密在助手进程里做，失败只报固定原因。
+- 计划：`config.json` 写 `crossex: { accountUid, credentialVersion, limits }`，`secrets.json` 写 `gate: { apiKey, apiSecret }`；已有 `crossex` 时整项保留，有 `gate` 无 `crossex` 时不覆盖。`limits` 取工作台 `settings.config` 与工作台默认值合并后的三项；页面设置（`entryPaused`、`slippageBps`、`cooldownSeconds`、`feeBps`、`feeSchedule`、`minNetBps`、`notionalPerLeg`、`maxOpen`、`maxTotalNotional`）经工作台 `configuration()` 校验，只在首次导入时、且本服务 `crossex.sqlite` 还没有 `config` 时写入（`INSERT OR IGNORE`）。工作台租约未过期时照常导入，结果附提示“导入后在工作台 CrossEx 设置页断开账户”。
+- 顺序：同资产账本——在资产账本、告警档位、Var token 之后、配置之前写 `crossex.sqlite` 页面设置（失败则整次请求失败、配置不变，已写入的前几项保留并在失败信息里列出），再走撤销记录 → 写配置 → 检查 → 重启。设置写入后配置若被恢复，服务不读它，下次导入也不覆盖。
+- 页面请求：`POST /api/import` 新增 `crossex`，只能是 `true`，可单独使用，预览不能带。结果新增 `crossex`（`{ accountId, status, detail, warning? }`，`accountId` 为 UID 末四位 `***xxxx`）与 `crossexError`（读不到工作台时的原因）；预览消息加“；CrossEx 账户可以导入 / 不能导入”。
+- 命令行：`sudo bash install.sh --import-workbench --crossex`（可与 `--pairs`、`--oil`、`--options`、`--monitor`、`--asset` 同用）；导入器参数 `--crossex`，须带 `--data-dir`（安装脚本传入，已带 `--asset` 时不重复）。旧版本包不支持时报“版本 … 不支持 --crossex”。
+- 测试：`test/crossex-service.test.ts` 的导入部分（解密、各拒绝原因、租约提示、不覆盖、只写一次设置、页面请求、助手预览与导入）；`deploy/test-install.sh` 未加 `--crossex` 用例。

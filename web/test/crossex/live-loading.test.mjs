@@ -1,0 +1,79 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createLatestRead } from '../../src/crossex/latest-read.ts';
+import { BOOTSTRAP_REFRESH_MS, CATALOG_CACHE_MS, createTimedCache, latestBootstrap, needsCatalog, parseBootstrap, readRetryDelay, stateReadPath } from '../../src/crossex/live-loading.ts';
+
+// Ported: this service has no CSRF token (writes carry x-pa-executor) and no Monitor address; the bootstrap carries the
+// hard caps (limits) instead, and the newest source decides the configuration as before.
+const limits = { notionalPerLeg: 200, maxOpen: 2, maxTotalNotional: 800 };
+const bootstrap = (changes = {}) => ({ now: 100, limits, config: { entryPaused: false }, connection: { configured: false, connected: false }, ...changes });
+
+test('connection setup can use the lightweight configuration while the full state is unavailable', () => {
+  const data = parseBootstrap(bootstrap());
+  assert.equal(latestBootstrap(data, null), data);
+  assert.equal(latestBootstrap(data, null).limits, limits);
+  assert.equal(latestBootstrap(null, null), null, 'unknown configuration must not become an empty configured account');
+  for (const value of [null, {}, bootstrap({ now: 'x' }), bootstrap({ connection: {} }), bootstrap({ config: {} })]) {
+    assert.throws(() => parseBootstrap(value), /连接信息格式不可用/);
+  }
+});
+
+test('administrative actions use the newest authoritative configuration', () => {
+  const earlier = bootstrap(), latest = bootstrap({ now: 200, config: { entryPaused: true } });
+  const state = { now: 150, config: { entryPaused: false, slippageBps: 7 }, live: { connection: { configured: true } } };
+  assert.equal(latestBootstrap(earlier, state).config, state.config);
+  assert.equal(latestBootstrap(earlier, state).limits, limits, 'the state carries no caps; the bootstrap ones stay');
+  assert.equal(latestBootstrap(latest, state).config, latest.config);
+  assert.equal(latestBootstrap(null, { ...state, live: {} }), null);
+});
+
+test('heavy opportunities and the instrument catalogue are requested only by relevant views', () => {
+  assert.equal(stateReadPath('hedge'), '/api/crossex/state');
+  assert.equal(stateReadPath('positions'), '/api/crossex/state?opportunities=0&funding=1');
+  for (const tab of ['trade', 'orders', 'settings']) assert.equal(stateReadPath(tab), '/api/crossex/state?opportunities=0');
+  for (const tab of ['trade', 'positions', 'hedge']) assert.equal(needsCatalog(tab), true);
+  for (const tab of ['settings', 'orders']) assert.equal(needsCatalog(tab), false);
+});
+
+test('catalogue memory cache reuses the same list for five minutes and then requires a fresh read', () => {
+  let now = 1000;
+  const cache = createTimedCache(CATALOG_CACHE_MS, () => now), items = [{ symbol: 'BINANCE_PERP_BTC_USDT' }];
+  assert.equal(cache.peek().fresh, false);
+  cache.put(items);
+  now += CATALOG_CACHE_MS - 1;
+  assert.equal(cache.peek().fresh, true);
+  assert.equal(cache.peek().value, items, 'stable references avoid rebuilding the instrument filter on account polls');
+  now++;
+  assert.equal(cache.peek().fresh, false);
+  assert.equal(cache.peek().value, items, 'stale catalogue remains visible while a new read is pending');
+  cache.put([]);
+  assert.equal(cache.peek().fresh, true, 'a genuine empty catalogue is also cached');
+});
+
+test('failed reads back off and successful bootstrap polling stays infrequent', () => {
+  assert.deepEqual([1, 2, 3, 4, 5, 6].map(readRetryDelay), [3000, 6000, 12000, 24000, 30000, 30000]);
+  assert.equal(BOOTSTRAP_REFRESH_MS, 30000);
+});
+
+test('bootstrap retries are single-flight and a cancelled late response cannot replace current connection data', async () => {
+  let finish, calls = 0;
+  const received = [], failures = [];
+  const reader = createLatestRead({ canRead: () => true, load: () => { calls++; return new Promise(resolve => { finish = resolve; }); }, onData: value => received.push(value), onError: error => failures.push(error), timeoutMs: 1000 });
+  const first = reader.refresh();
+  const duplicate = reader.refresh();
+  assert.equal(first, duplicate);
+  await Promise.resolve();
+  assert.equal(calls, 1);
+  const late = finish;
+  reader.cancel();
+  const retry = reader.refresh();
+  await Promise.resolve();
+  assert.equal(calls, 2);
+  finish(bootstrap({ now: 200, csrfToken: 'retry-csrf' }));
+  await retry;
+  late(bootstrap());
+  await first;
+  assert.equal(received.length, 1);
+  assert.equal(received[0].csrfToken, 'retry-csrf');
+  assert.deepEqual(failures, []);
+});

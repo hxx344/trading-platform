@@ -35,6 +35,8 @@ import { ASSET_DB_FILE } from '../asset/db.ts';
 import { createAssetStore } from '../asset/store.ts';
 import { createEngineFor, optionsLoops, optionsViews, prepareOptions, type OptionsRuntime } from './options.ts';
 import { optionsSummary } from './options-config.ts';
+import { createCrossexSupervisor, type CrossexOptions, type CrossexSupervisor } from './crossex.ts';
+import { crossexSummary } from './crossex-config.ts';
 import type { OptionsEngine } from '../options/engine.ts';
 import { createServiceLog, teeStream, type ServiceLog } from './service-log.ts';
 import { createSummary, type Summary, type SummaryInput } from './summary.ts';
@@ -212,6 +214,8 @@ export interface StartOptions {
   /** Tests stand in for Bybit's options API and shorten the start check. */
   optionsFetch?: (url: string, init: RequestInit) => Promise<Response>;
   optionsPreflightMs?: number;
+  /** Tests stand in for Gate and the CrossEx public readers and shorten the start check (only with config.crossex). */
+  crossexOptions?: CrossexOptions;
 }
 
 /** Opens the data directory, wires the executor and runs it with the alerts and the user streams until shutdown. */
@@ -232,7 +236,7 @@ export async function startService(options: StartOptions): Promise<ReturnType<ty
   catch (error) { closeLogs(); throw error; }
 }
 
-async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
+async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, crossexOptions }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
   const session = keptSession(dir);
   // Oil accounts are locked and checked before the store opens: a failed check refuses start (oil.ts).
   const oil = config.oil ? await prepareOil(config.oil, secrets.exchanges, oilFetch ? { fetchImpl: oilFetch } : {}) : undefined;
@@ -240,10 +244,19 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   let options: OptionsRuntime | undefined;
   try { options = config.options ? await prepareOptions(config.options, secrets.bybitOptions, dir, { ...(optionsFetch ? { fetchImpl: optionsFetch } : {}), ...(optionsPreflightMs === undefined ? {} : { preflightTimeoutMs: optionsPreflightMs }) }) : undefined; }
   catch (error) { oil?.locks.release(); throw error; }
+  // CrossEx is locked and checked too, but a failed start only disables CrossEx: it is retried in the background and the
+  // rest of the service runs (crossex.ts createCrossexSupervisor). Its runtime closes asynchronously, once.
+  let crossex: CrossexSupervisor | undefined;
+  const stopCrossex = (): Promise<void> => crossex ? crossex.stop() : Promise.resolve();
   const releaseOil = () => {
     oil?.locks.release();
     if (options) { try { options.store.close(); } catch { /* best effort */ } options.locks.release(); }
+    void stopCrossex();
   };
+  try {
+    crossex = config.crossex ? createCrossexSupervisor(config.crossex, secrets.gate, dir, crossexOptions) : undefined;
+    await crossex?.start();
+  } catch (error) { releaseOil(); throw error; }
   let store: ReturnType<typeof openStore>;
   try { store = openStore(join(dir, DATABASE_FILES.mainnet)); } catch (error) { releaseOil(); throw error; }
   let wiring: ServiceWiring;
@@ -283,6 +296,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
         names: names.get(pair.id) ?? { long: pair.long, short: pair.short }, balances: pair.balances, balancesFresh: pair.balancesFresh, current: pair.current,
         positions: positions.get(pair.id) ?? null, adl: adl.get(pair.id) ?? null,
       })),
+      ...(crossex ? { extraLines: [crossex.summaryLine()] } : {}),
     };
   };
   let summary: Summary;
@@ -323,7 +337,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   const oilRules = oil ? openOilRules(oil, dir, { executor }) : undefined;
   // PnL and ledgers (read only) in their own file; one that cannot open is shown on the oil page, nothing else stops.
   const oilPnl = oil ? openOilPnl(oil, dir) : undefined;
-  const oilText = `${oil ? `；原油执行账户 ${oil.config.accounts.length} 个` : ''}${options ? '；期权账户 1 个' : ''}`;
+  const oilText = `${oil ? `；原油执行账户 ${oil.config.accounts.length} 个` : ''}${options ? '；期权账户 1 个' : ''}${crossex ? `；CrossEx 账户 1 个${crossex.runtime() ? '' : '（未启动，后台重试）'}` : ''}`;
   try {
     notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}`);
     for (const text of warnings) notifier.notify(`【配置未生效】${text}`);
@@ -345,6 +359,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       summary: { setInterval: (minutes: number) => summary.setInterval(minutes), sendNow: () => summary.sendNow() },
       ...(asset ? { asset } : {}),
       ...(engine ? { options: optionsViews(engine) } : {}),
+      ...(crossex ? { crossex: crossex.views } : {}),
       ...(logs ? { logs: (filter: 'all' | 'problems', before: number | null, limit: number) => logs.page({ filter, before, limit }) } : {}),
     },
     ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir) } } : {}),
@@ -380,11 +395,14 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(oil ? oilLoops(oil, context, line => process.stderr.write(`${line}\n`), oilRules, oilPnl) : []),
       ...(monitor ? monitorLoops(monitor, context) : []),
       ...(options && engine ? optionsLoops(options, engine, context, line => process.stderr.write(`${line}\n`)) : []),
+      ...(crossex ? [crossex.loop(context, { notifyOnce: (key, text) => notifier.notifyOnce(key, text), notify: text => notifier.notify(text), log: line => process.stderr.write(`${line}\n`) })] : []),
     ],
     onStopping: (reason, detail) => {
       const text = reason === 'signal' ? '【服务停止】收到停止信号，正常退出' : `【服务异常停止】${detail || reason}；systemd 会在 5 秒后自动重启，请查看日志`;
       try { notifier.poll(); notifier.notify(text); } catch { /* best effort */ }
       if (monitor) stopMonitor(monitor);
+      // A CrossEx start in flight gives up rather than hold the shutdown up.
+      crossex?.abort();
     },
     onStopped: async () => {
       // Events from the drain (an unknown transfer, an ADL batch) go out now rather than at the next start.
@@ -399,6 +417,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       oilRules?.close();
       oilPnl?.close();
       locks.release();
+      await stopCrossex();
       releaseOil();
       closeLogs();
     },
@@ -425,7 +444,7 @@ async function main(): Promise<void> {
     // Read and validated offline (keys must derive their signers); nothing is sent anywhere.
     // Only noted, not refused: at boot or with Tailscale logged out the address is missing, and 127.0.0.1 still serves.
     const local = config.host === null || Object.values(networkInterfaces()).flat().some(item => item?.address === config.host);
-    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、') || '尚未导入'}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}，监听 127.0.0.1${config.host ? ` 与 ${urlHost(config.host)}` : ''}，登录密码${password ? '已设置' : '未设置'}，页面 ${app.assets.size} 个文件${oilSummary(config.oil)}${optionsSummary(config.options)}${monitorSummary(config.monitor)}${assetSummary(config.asset)}\n`);
+    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、') || '尚未导入'}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}，监听 127.0.0.1${config.host ? ` 与 ${urlHost(config.host)}` : ''}，登录密码${password ? '已设置' : '未设置'}，页面 ${app.assets.size} 个文件${oilSummary(config.oil)}${optionsSummary(config.options)}${monitorSummary(config.monitor)}${assetSummary(config.asset)}${crossexSummary(config.crossex)}\n`);
     if (!local) process.stdout.write(`注意：${config.host} 现在不在本机网卡上（地址写错，或 Tailscale 尚未连接）；服务会持续重试，在此之前页面只能经 127.0.0.1 打开\n`);
     return;
   }

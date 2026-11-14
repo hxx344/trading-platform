@@ -1,4 +1,4 @@
-import { Activity, ArrowLeftRight, ChevronRight, Menu, RefreshCw, ScrollText, Server, Settings2, ShieldCheck, Sigma, Wallet, type LucideIcon } from 'lucide-react';
+import { Activity, ArrowLeftRight, ChevronRight, Gauge, Menu, RefreshCw, ScrollText, Server, Settings2, ShieldCheck, Sigma, Wallet, type LucideIcon } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { OIL_READ_TIMEOUT_MS, OIL_STATE_PATH, OilPage } from './OilPage.tsx';
 import { ASSET_READ_TIMEOUT_MS, ASSET_STATE_PATH, AssetPage } from './AssetPage.tsx';
@@ -17,13 +17,15 @@ import { ApiError } from './api.ts';
 import type { ServiceState } from './types.ts';
 import type { OilState } from './oil-types.ts';
 import type { AssetState } from '../../src/asset/views.ts';
+import { CrossexPage } from './crossex/CrossexPage.tsx';
+import { CROSSEX_READ_TIMEOUT_MS, CROSSEX_STATE_PATH } from './crossex/crossex-api.ts';
 import { breadcrumbOf, entryOf, navEntries, workspaceGroups, type NavEntry } from './workspace-nav.ts';
 
 // The shell follows the workbench's main interface (src/App.tsx, 31242e0): a side navigation grouped by the workspaces
 // of the unified platform plan (workspace-nav.ts), a topbar with the breadcrumb, and on a phone a drawer behind a menu
 // button. The content keeps the workbench's ASTER desk (modules/aster/dashboard/app/page.tsx, b2fae14): the page heading
 // with the connection state, then the page. The ASTER pages sit in .aster-module, which carries the workbench's element
-// styles; the oil, options, monitor and asset pages keep their own.
+// styles; the oil, options, monitor, asset and CrossEx pages keep their own.
 
 const REFRESH_MS = 2_000;
 const READ_TIMEOUT_MS = 10_000;
@@ -38,9 +40,10 @@ const OIL_CHECK_MS = 60_000;
 const ASSET_CHECK_MS = 60_000;
 /** Shown on every service; the oil, options and monitor entries only where their state path answers (a service without
  * that module returns 404 there), the asset entry unless /api/asset/state answers 404 (a ledger that cannot be read keeps
- * the entry, and the page says why). */
+ * the entry, and the page says why), the CrossEx entry where /api/crossex/state answers or answers 503 (configured but
+ * not started, retrying: the page says why). */
 const ALWAYS: readonly NavEntry[] = ['pairs', 'status', 'logs', 'settings'];
-const ICONS: Record<NavEntry, LucideIcon> = { asset: Wallet, monitor: Activity, oil: ArrowLeftRight, pairs: ShieldCheck, options: Sigma, status: Server, logs: ScrollText, settings: Settings2 };
+const ICONS: Record<NavEntry, LucideIcon> = { asset: Wallet, monitor: Activity, oil: ArrowLeftRight, crossex: Gauge, pairs: ShieldCheck, options: Sigma, status: Server, logs: ScrollText, settings: Settings2 };
 /** Below this width the side navigation is a drawer (the workbench's 760px breakpoint, shell.css). */
 const DRAWER_QUERY = '(max-width: 760px)';
 
@@ -58,7 +61,11 @@ export function App() {
   const monitor = useLiveResource<MonitorState>(MONITOR_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: MONITOR_READ_TIMEOUT_MS, parse: parseMonitorState, onExpired });
   // The asset page reads the same path at the same pace and timeout (the shared read keeps the first subscriber's).
   const asset = useLiveResource<AssetState>(ASSET_STATE_PATH, { intervalMs: ASSET_CHECK_MS, timeoutMs: ASSET_READ_TIMEOUT_MS, onExpired });
-  const available = new Set<NavEntry>([...ALWAYS, ...(oil.data !== null ? ['oil' as const] : []), ...(options.data !== null ? ['options' as const] : []), ...(monitor.data !== null ? ['monitor' as const] : []), ...(asset.data !== null || (asset.error instanceof ApiError && asset.error.status === 500) ? ['asset' as const] : [])]);
+  // The CrossEx page reads its state on its own (tab-specific paths, paused around writes); this only decides whether the entry
+  // shows, so it asks for the light view without the opportunity list.
+  const crossex = useLiveResource<unknown>(`${CROSSEX_STATE_PATH}?opportunities=0`, { intervalMs: OIL_CHECK_MS, timeoutMs: CROSSEX_READ_TIMEOUT_MS, onExpired });
+  const available = new Set<NavEntry>([...ALWAYS, ...(oil.data !== null ? ['oil' as const] : []), ...(options.data !== null ? ['options' as const] : []), ...(monitor.data !== null ? ['monitor' as const] : []), ...(asset.data !== null || (asset.error instanceof ApiError && asset.error.status === 500) ? ['asset' as const] : []),
+    ...(crossex.data !== null || (crossex.error instanceof ApiError && crossex.error.status === 503) ? ['crossex' as const] : [])]);
   const current = entryOf(route), crumb = breadcrumbOf(route);
   // The phone drawer, as in the workbench: focus moves into it, Tab cycles inside, Escape or the backdrop closes it and
   // gives focus back to the menu button. Widening the window past the breakpoint closes it too.
@@ -95,7 +102,7 @@ export function App() {
   const stale = state !== null && (status === 'error' || status === 'offline' || status === 'paused' || (status === 'loading' && (error !== null || old)));
   const failed = status === 'error' || status === 'offline';
   const limits = state ? limitsText(state) : null;
-  const aster = route.page !== 'oil' && route.page !== 'options' && route.page !== 'monitor' && route.page !== 'asset';
+  const aster = route.page !== 'oil' && route.page !== 'options' && route.page !== 'monitor' && route.page !== 'asset' && route.page !== 'crossex';
   return <div className="app-shell">
     {menuOpen ? <button type="button" className="nav-backdrop" aria-label="关闭导航" onClick={closeMenu} /> : null}
     <aside ref={sidebar} className={`sidebar ${menuOpen ? 'open' : ''}`}><Brand /><nav aria-label="主导航">
@@ -144,7 +151,8 @@ export function App() {
                 ? <StatePanel kind="error" title="读取服务状态失败" detail={error?.message ?? '网络离线'} />
                 : <StatePanel kind="loading" title="加载中…" />)
                 : <PairsWorkspace state={state} pairId={route.page === 'pair' ? route.pairId : null} stale={stale} onChanged={changed} onExpired={onExpired} />}
-          </div> : route.page === 'options' ? <OptionsPage tab={route.tab} onExpired={onExpired} /> : route.page === 'monitor' ? <MonitorPage onExpired={onExpired} /> : route.page === 'asset' ? <AssetPage onExpired={onExpired} /> : <OilPage onExpired={onExpired} />}
+          </div> : route.page === 'options' ? <OptionsPage tab={route.tab} onExpired={onExpired} /> : route.page === 'monitor' ? <MonitorPage onExpired={onExpired} /> : route.page === 'asset' ? <AssetPage onExpired={onExpired} />
+            : route.page === 'crossex' ? <CrossexPage tab={route.tab} onExpired={onExpired} /> : <OilPage onExpired={onExpired} />}
         </div>
       </div></div></main>
     </div>

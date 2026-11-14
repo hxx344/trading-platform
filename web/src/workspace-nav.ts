@@ -13,13 +13,14 @@ export const workspaceLabels: Record<WorkspaceId, string> = {
   options: '期权', onchain: '链上', research: '研究室', system: '系统',
 };
 
-export type NavEntry = 'asset' | 'monitor' | 'oil' | 'pairs' | 'options' | 'status' | 'logs' | 'settings';
+export type NavEntry = 'asset' | 'monitor' | 'oil' | 'crossex' | 'pairs' | 'options' | 'status' | 'logs' | 'settings';
 
 /** Every entry of the side navigation, in its order inside the workspace. A new page is registered here. */
 export const navEntries: Record<NavEntry, { workspace: WorkspaceId; text: string; href: string }> = {
   asset: { workspace: 'overview', text: '资产', href: '#/asset' },
   monitor: { workspace: 'market', text: '行情监控', href: '#/monitor' },
   oil: { workspace: 'trading', text: '原油', href: '#/oil' },
+  crossex: { workspace: 'trading', text: 'CrossEx', href: '#/crossex' },
   pairs: { workspace: 'strategy', text: '配对组', href: '#/' },
   options: { workspace: 'options', text: '期权', href: '#/options' },
   status: { workspace: 'system', text: '运行状态', href: '#/status' },
@@ -27,7 +28,7 @@ export const navEntries: Record<NavEntry, { workspace: WorkspaceId; text: string
   settings: { workspace: 'system', text: '设置', href: '#/settings' },
 };
 
-/** The entry a route belongs to: the pair views sit under 配对组, every options tab under 期权. */
+/** The entry a route belongs to: the pair views sit under 配对组, every options tab under 期权, every CrossEx tab under CrossEx. */
 export function entryOf(route: Route): NavEntry {
   switch (route.page) {
     case 'overview': case 'pair': return 'pairs';

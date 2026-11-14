@@ -34,8 +34,10 @@ export interface ImportChoices {
   monitorVariational: { replaces: boolean } | null;
   /** The workbench user whose ledger comes over, or null. */
   assetOwner: string | null;
+  /** The Gate CrossEx account, as "Gate ***1234"; null or absent when it does not come over. */
+  crossex?: string | null;
 }
-export type ImportBody = { action: 'import'; pairs: string[]; oil?: true; options?: true; monitor?: true; monitorAlerts?: true; monitorVariational?: true; asset?: true; assetOwner?: string };
+export type ImportBody = { action: 'import'; pairs: string[]; oil?: true; options?: true; monitor?: true; monitorAlerts?: true; monitorVariational?: true; asset?: true; assetOwner?: string; crossex?: true };
 
 export const monitorAvailable = (item: MonitorItem | null | undefined): boolean => item?.status === 'added';
 /**
@@ -56,13 +58,14 @@ export function defaultAssetOwner(item: AssetItem | null | undefined): string | 
 
 /** The request for what is ticked; null when nothing is. */
 export function importBody(choices: ImportChoices): ImportBody | null {
-  const { pairs, oil, options, monitor, monitorAlerts, monitorVariational, assetOwner } = choices;
-  if (!pairs.length && !oil.length && options === null && !monitor && monitorAlerts === null && monitorVariational === null && assetOwner === null) return null;
+  const { pairs, oil, options, monitor, monitorAlerts, monitorVariational, assetOwner } = choices, crossex = choices.crossex ?? null;
+  if (!pairs.length && !oil.length && options === null && !monitor && monitorAlerts === null && monitorVariational === null && assetOwner === null && crossex === null) return null;
   // The service takes the alerts and the token only beside `monitor` (an enabled monitor is kept as it is).
   return {
     action: 'import', pairs, ...(oil.length ? { oil: true as const } : {}), ...(options !== null ? { options: true as const } : {}),
     ...(monitor || monitorAlerts !== null || monitorVariational !== null ? { monitor: true as const } : {}), ...(monitorAlerts !== null ? { monitorAlerts: true as const } : {}),
     ...(monitorVariational !== null ? { monitorVariational: true as const } : {}), ...(assetOwner !== null ? { asset: true as const, assetOwner } : {}),
+    ...(crossex !== null ? { crossex: true as const } : {}),
   };
 }
 
@@ -72,12 +75,13 @@ export function importBody(choices: ImportChoices): ImportBody | null {
  * token (the running monitor takes it on its next read).
  */
 export function restarts(choices: ImportChoices, assetEnabled: boolean): boolean {
-  return choices.pairs.length > 0 || choices.oil.length > 0 || choices.options !== null || choices.monitor || (choices.monitorAlerts?.robotChanges ?? false) || (choices.assetOwner !== null && !assetEnabled);
+  return choices.pairs.length > 0 || choices.oil.length > 0 || choices.options !== null || choices.monitor || (choices.monitorAlerts?.robotChanges ?? false) || (choices.crossex ?? null) !== null
+    || (choices.assetOwner !== null && !assetEnabled);
 }
 
 /** The question asked before the request is sent. */
 export function confirmText(choices: ImportChoices, assetEnabled: boolean): string {
-  const { pairs, oil, options, monitor, monitorAlerts, monitorVariational, assetOwner } = choices;
+  const { pairs, oil, options, monitor, monitorAlerts, monitorVariational, assetOwner } = choices, crossex = choices.crossex ?? null;
   const token = monitorVariational !== null ? `工作台的 Var token 写入本服务${monitorVariational.replaces ? '，替换现有的' : ''}，行情监控下一次读取即用它。` : '';
   const tiers = monitorAlerts !== null && monitorAlerts.tiers > 0 ? '导入的告警档位替换本服务现有的原油 / 海力士档位，行情监控 10 秒内换上；工作台的告警仍开着时两边都会发。' : '';
   if (!restarts(choices, assetEnabled)) {
@@ -87,11 +91,13 @@ export function confirmText(choices: ImportChoices, assetEnabled: boolean): stri
     return `${what}？${assetOwner !== null ? '整体替换本服务现有的资产账本；' : ''}${tiers}${token}配置不变，不重启服务。`;
   }
   const what = [pairs.length ? pairs.join('、') : '', oil.length ? `原油执行账户（${oil.join('、')}）` : '', options !== null ? `期权账户（${options}）` : '',
-    monitor ? '行情监控' : '', monitorAlerts !== null ? `行情告警${monitorAlerts.robot ? '与机器人' : ''}` : '', monitorVariational !== null ? 'Var token' : '', assetOwner !== null ? `资产账本（用户 ${assetOwner}）` : ''].filter(Boolean).join(' 与 ');
+    monitor ? '行情监控' : '', monitorAlerts !== null ? `行情告警${monitorAlerts.robot ? '与机器人' : ''}` : '', monitorVariational !== null ? 'Var token' : '', crossex !== null ? `CrossEx 账户（${crossex}）` : '',
+    assetOwner !== null ? `资产账本（用户 ${assetOwner}）` : ''].filter(Boolean).join(' 与 ');
   const after = [pairs.length ? '导入的配对登记为停用。' : '', oil.length ? '原油执行账户导入后即可在「原油」页面实盘下单；首次写入原油配置时名义金额上限取单笔 200、24 小时开仓 1000 USDT。' : '',
     options !== null ? '期权账户导入后即可在「期权」页面实盘手动开平仓，工作台期权模块此后不能再用这个账户下期权单。' : '',
     monitor ? '行情监控启用后服务器读取 Binance、Hyperliquid、Lighter RH 的公开行情（不需要密钥），股数取默认值。' : '',
     tiers, token, monitorAlerts?.robotChanges ? '行情告警改发工作台行情监控的机器人（secrets.json 的 feishuMonitor），ASTER 告警仍发 feishu。' : '',
+    crossex !== null ? 'CrossEx 账户导入后即可在「CrossEx」页面实盘手动下单；导入后请在工作台 CrossEx 设置页断开账户，此后只在本服务交易。' : '',
     assetOwner !== null ? (assetEnabled ? '资产账本整体替换为该用户的最新账本。' : '资产账本先写入，再启用「资产」页面（只读）；配置检查或重启失败时配置恢复，已写入的账本保留。') : ''].join('');
   return `导入 ${what} 并重启本服务？重启约半分钟，期间已启用配对的划转与 ADL 暂停。${after}`;
 }

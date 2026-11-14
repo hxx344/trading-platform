@@ -40,6 +40,8 @@ export interface SummaryInput {
   streams: { connected: boolean; lastError: string | null }[];
   budget: { usedLastMinute: number; limitPerMinute: number; coolingUntil: number | null; reason?: string | null };
   intervalMinutes: number;
+  /** One line each from other modules (CrossEx: groups, total notional, pending orders), shown above the footer. */
+  extraLines?: string[];
 }
 
 const TRANSFER_STATE: Record<string, string> = { prepared: '准备中', sending: '发送中', acknowledged: '已受理待结算', unknown: '结果未知' };
@@ -157,6 +159,7 @@ export function summaryCard(input: SummaryInput, now: number): Record<string, un
   const lastError = input.streams.find(stream => !stream.connected && stream.lastError)?.lastError;
   if (lastError) tail.splice(1, 0, label(`推送：${text(lastError, 120)}`, 'normal', 'orange'));
   if (input.budget.coolingUntil !== null && input.budget.coolingUntil > now) tail.splice(1, 0, label(`API 冷却等待 ${Math.ceil((input.budget.coolingUntil - now) / 1000)} 秒${input.budget.reason ? `：${text(input.budget.reason, 80)}` : ''}`, 'normal', 'orange'));
+  for (const line of (input.extraLines ?? []).toReversed()) tail.splice(1, 0, label(text(line, 200), 'normal'));
   const at = china(now);
   const card = {
     schema: '2.0', config: { summary: { content: 'ASTER 定时运行摘要' } },

@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseRoute } from '../web/src/route-parse.ts';
-import { breadcrumbOf, entryOf, navEntries, workspaceGroups, workspaceOrder, type NavEntry } from '../web/src/workspace-nav.ts';
+import { breadcrumbOf, entryOf, navEntries, workspaceGroups, type NavEntry } from '../web/src/workspace-nav.ts';
 
 test('every address keeps its entry and gets the workspace of the plan', () => {
   const cases: [string, NavEntry, string][] = [
@@ -27,7 +27,7 @@ test('groups follow the plan order and leave out workspaces without an entry', (
   const all = workspaceGroups(new Set(Object.keys(navEntries) as NavEntry[]));
   assert.deepEqual(all.map(group => group.label), ['总览与资产', '市场与机会', '交易中心', '策略与风险', '期权', '系统']);
   assert.deepEqual(all.at(-1)!.entries, ['status', 'logs', 'settings']);
-  assert.deepEqual(all.map(group => group.id), workspaceOrder.filter(id => all.some(group => group.id === id)));
+  assert.deepEqual(all.map(group => group.id), ['overview', 'market', 'trading', 'strategy', 'options', 'system']);
   // A service with only the ASTER pairs (no oil, options, monitor or asset configured).
   const bare = workspaceGroups(new Set<NavEntry>(['pairs', 'status', 'logs', 'settings']));
   assert.deepEqual(bare.map(group => [group.label, group.entries]), [['策略与风险', ['pairs']], ['系统', ['status', 'logs', 'settings']]]);

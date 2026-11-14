@@ -237,3 +237,9 @@ table.data.history{min-width:0}
    that content area fills the height beside the sidebar; the entries are links to the hash routes, not buttons. */
 .app-shell>.workspace>main.aster-desk{flex:1;min-width:0}
 .app-shell>.sidebar a.nav-item:focus-visible{outline-offset:-2px}
+/* The options page's fixed notice (options.css, z-index 20) comes later in the DOM and would cover the open drawer. */
+/* The element selectors outrank shell.css's own z-index rules, which load later. */
+@media(max-width:760px){.app-shell>aside.sidebar{z-index:22}.app-shell>button.nav-backdrop{z-index:21}}
+/* The monitor page's breakpoints count the whole window; beside the 212px side navigation its 700px wrap of the detail
+   toolbar (monitor.css) is needed up to 912px, or the refresh area runs past the edge. */
+@media(min-width:761px) and (max-width:912px){.monitor-desk .page-heading{flex-wrap:wrap}.monitor-desk [data-monitor="anthropic"] .detail-toolbar{flex-wrap:wrap}.monitor-desk [data-monitor="anthropic"] .refresh-area{flex:1 1 100%;flex-wrap:wrap}}

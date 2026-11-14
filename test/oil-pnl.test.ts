@@ -283,3 +283,36 @@ test('原油盈亏库：采样里的持仓读取时刻按账户记，调换配�
     pnl.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('原油盈亏库：读取时刻早于区间起点的账户在该点不累计；超过 1200 点时按桶保留峰谷，最新点不变', async () => {
+  const s = storeSetup(), DAY = 86_400_000;
+  try {
+    const pnl = s.open();
+    await pnl.syncLedgers();
+    // One sample at X; Binance read 30 s earlier. The 1-day range then starts 10 s before X, after Binance's read.
+    const X = T0 + MINUTE;
+    s.a.readAt = now => now - 30_000;
+    s.a.ledger = [entry('a-in-gap', X - 25_000, 'funding', '10')];
+    s.b.ledger = [entry('b-before', X - 15_000, 'funding', '100'), entry('b-in', X - 5_000, 'funding', '1')];
+    s.clock.now = X; await pnl.sample();
+    s.clock.now = X + DAY - 10_000; await pnl.syncLedgers();
+    const edge = pnl.read({ range: '1d' }) as View;
+    assert.equal(edge.start, X - 10_000);
+    assert.deepEqual(edge.points.filter(point => point.totalPnl !== null).map(point => Number(point.totalPnl)), [1]);
+
+    // 1300 more samples, one spike: the thinned curve keeps it, keeps the last point and stays within the cap.
+    s.a.readAt = now => now;
+    for (let index = 1; index <= 1300; index++) {
+      s.clock.now = X + DAY + index * MINUTE;
+      s.a.positions = [pos(index === 700 ? '999' : String(index % 7))];
+      await pnl.sample();
+    }
+    await pnl.syncLedgers();
+    const long = pnl.read({ range: '1d' }) as View;
+    assert.ok(long.points.length < 1300, `kept ${long.points.length}`);
+    assert.ok(long.points.some(point => point.unrealizedPnl === '999' && point.totalPnl !== null));
+    assert.equal(long.points.at(-1)!.time, X + DAY + 1300 * MINUTE);
+    assert.equal(long.points.at(-1)!.totalPnl, long.latest!.totalPnl);
+    pnl.close();
+  } finally { s.done(); }
+});

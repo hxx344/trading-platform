@@ -139,6 +139,7 @@ export function createOilPnl({ file, connectors, accounts, now = Date.now, pnlTi
   /** Bumped on every change a read shows (a sample, a position read, ledger rows or coverage); the read cache keys on it. */
   let version = 0;
   const cache = new Map<string, { version: number; minute: number; result: unknown }>();
+  const views = new Map<string, { version: number; minute: number } & ReturnType<typeof rangeView>>();
   const statements = new Map<string, StatementSync>();
   const sql = (text: string): StatementSync => { let found = statements.get(text); if (!found) { found = db.prepare(text); statements.set(text, found); } return found; };
 
@@ -194,9 +195,27 @@ export function createOilPnl({ file, connectors, accounts, now = Date.now, pnlTi
     for (let index = 0; index < series.times.length; index++) setAbs(index);
     seriesLoaded = true;
   }
-  function ledgerChanged(): void {
-    prefixes = null;
-    if (seriesLoaded) for (let index = 0; index < series.times.length; index++) setAbs(index);
+  /**
+   * New ledger rows from `from` on: the sums are rebuilt when next needed (once per sync round, not per window), and only
+   * samples after `from` change — a sample's time is its latest read time and only rows before a read time count.
+   */
+  let dirtyFrom: number | null = null;
+  function ledgerChanged(key: string, added: LedgerEntry[]): void {
+    const from = Math.min(...added.map(entry => entry.time)), prefix = prefixes?.[keys.indexOf(key)];
+    // Rows no earlier than the account's last one (the usual case: the last minutes) extend its sums; others rebuild them.
+    if (prefix && (prefix.times.at(-1) ?? -Infinity) <= from) {
+      for (const entry of [...added].sort((x, y) => x.time - y.time)) {
+        prefix.times.push(entry.time);
+        for (const kind of KINDS) prefix.cum[kind].push(prefix.cum[kind].at(-1)! + (entry.kind === kind ? units(entry.amount) : 0n));
+      }
+    } else prefixes = null;
+    dirtyFrom = dirtyFrom === null ? from : Math.min(dirtyFrom, from);
+  }
+  function settle(): void {
+    if (dirtyFrom === null) return;
+    const from = dirtyFrom;
+    dirtyFrom = null;
+    if (seriesLoaded) for (let index = atMost(series.times, from); index < series.times.length; index++) setAbs(index);
   }
   function prune(before: number): void {
     const count = below(series.times, before);
@@ -235,10 +254,10 @@ export function createOilPnl({ file, connectors, accounts, now = Date.now, pnlTi
     const unrealized = results.reduce((sum, result) => sum + result!.unrealized, 0n);
     // Read times by account key, so reordering the configured accounts keeps each read time with its account.
     sql('INSERT INTO samples (accounts, time, cutoffs, unrealized) VALUES (?, ?, ?, ?)').run(setKey, time, JSON.stringify(Object.fromEntries(keys.map((key, index) => [key, times[index]]))), fromUnits(unrealized));
-    sql('DELETE FROM samples WHERE time < ?').run(current - SAMPLE_RETENTION_MS);
     series.times.push(time); series.cutoffs.push(times); series.unrealized.push(unrealized);
-    setAbs(series.times.length - 1);
+    settle(); setAbs(series.times.length - 1);
     prune(current - SAMPLE_RETENTION_MS);
+    sql('DELETE FROM samples WHERE time < ?').run(current - SAMPLE_RETENTION_MS);
   }
 
   /**
@@ -274,18 +293,18 @@ export function createOilPnl({ file, connectors, accounts, now = Date.now, pnlTi
   }
   /** One window's rows and the coverage they prove, in one transaction. A stored row read again must be the same row. */
   function store(key: string, entries: LedgerEntry[], symbol: string, to: number): void {
-    let inserted = 0;
+    const added: LedgerEntry[] = [];
     db.exec('BEGIN IMMEDIATE');
     try {
       for (const entry of entries) {
         const stored = sql('SELECT time, symbol, kind, amount FROM ledger WHERE account=? AND id=?').get(key, entry.id) as { time: number; symbol: string; kind: string; amount: string } | undefined;
-        if (!stored) { sql('INSERT INTO ledger (account, id, time, symbol, kind, amount) VALUES (?, ?, ?, ?, ?, ?)').run(key, entry.id, entry.time, entry.symbol, entry.kind, entry.amount); inserted++; }
+        if (!stored) { sql('INSERT INTO ledger (account, id, time, symbol, kind, amount) VALUES (?, ?, ?, ?, ?, ?)').run(key, entry.id, entry.time, entry.symbol, entry.kind, entry.amount); added.push(entry); }
         else if (stored.time !== entry.time || stored.symbol !== entry.symbol || stored.kind !== entry.kind || units(stored.amount) !== units(entry.amount)) throw new Error('交易所账单与已保存的同一编号记录不一致，未写入；请核对交易所账单');
       }
       sql('UPDATE ledger_sync SET covered_until=MAX(covered_until, ?), synced_at=?, failed_at=NULL, error=NULL WHERE account=? AND symbol=?').run(to, now(), key, symbol);
       db.exec('COMMIT');
     } catch (error) { db.exec('ROLLBACK'); throw error; }
-    if (inserted) ledgerChanged();
+    if (added.length) ledgerChanged(key, added);
     version++;
   }
 
@@ -308,7 +327,7 @@ export function createOilPnl({ file, connectors, accounts, now = Date.now, pnlTi
    * are summed exactly, so a 90-day read does not do bigint sums for every minute.
    */
   function curve(start: number, current: number, sync: ReturnType<typeof syncState>[]) {
-    loadSeries();
+    loadSeries(); settle();
     const lo = below(series.times, start), hi = atMost(series.times, current);
     const ready = sync.every(state => state.ready && state.start <= start);
     const coverage = sync.map(state => state.coveredUntil ?? -Infinity);
@@ -344,31 +363,21 @@ export function createOilPnl({ file, connectors, accounts, now = Date.now, pnlTi
     return { count: hi - lo, points: reduceSlots(slots).map(point), latest: slots.length ? point(slots.length - 1) : null };
   }
 
-  /**
-   * The page's read. range picks the curve's start (never earlier than the ledgers' own start, so every total is summed
-   * from one start); page pages the range's ledger rows, newest first. Each range and page keeps its own answer until a
-   * sample, a position read, the ledgers or the minute change.
-   */
-  function read({ range = '7d', page = 0 }: { range?: PnlRange; page?: number } = {}) {
-    const current = now(), minute = Math.floor(current / PNL_SAMPLE_MS);
-    const cacheKey = `${range}:${page}`, cached = cache.get(cacheKey);
-    if (cached && cached.version === version && cached.minute === minute) return cached.result;
+  /** One range's curve, totals and account states (all but the ledger page). */
+  function rangeView(range: PnlRange, current: number) {
     const sync = keys.map(syncState);
     const ledgerStart = sync.every(state => state.ready) ? Math.max(...sync.map(state => state.start as number)) : null;
     const requestedStart = current - PNL_RANGES[range], start = ledgerStart === null ? requestedStart : Math.max(requestedStart, ledgerStart);
     const { count, points, latest } = curve(start, current, sync);
-    // Range totals from the stored rows, per account and symbol.
-    const totals = keys.map(key => sql('SELECT symbol, kind, amount FROM ledger WHERE account=? AND time>=? AND time<=?').all(key, start, current) as { symbol: string; kind: LedgerKind; amount: string }[]);
-    // One pass: sums by kind over everything and by account, symbol and kind.
+    // Range totals from the stored rows in one pass: by kind over everything and by account, symbol and kind.
     const sums = new Map<string, bigint>(), addTo = (key: string, value: bigint) => sums.set(key, (sums.get(key) ?? 0n) + value);
-    totals.forEach((rows, index) => { for (const row of rows) { const value = units(row.amount); addTo(row.kind, value); addTo(`${index}:${row.symbol}:${row.kind}`, value); } });
+    keys.forEach((key, index) => {
+      for (const row of sql('SELECT symbol, kind, amount FROM ledger WHERE account=? AND time>=? AND time<=?').all(key, start, current) as { symbol: string; kind: LedgerKind; amount: string }[]) {
+        const value = units(row.amount); addTo(row.kind, value); addTo(`${index}:${row.symbol}:${row.kind}`, value);
+      }
+    });
     const sum = (key: string) => fromUnits(sums.get(key) ?? 0n);
-    const total = sql(`SELECT COUNT(*) AS count FROM ledger WHERE account IN (${keys.map(() => '?').join(',')}) AND time>=? AND time<=?`).get(...keys, start, current) as { count: number };
-    const pages = Math.max(1, Math.ceil(total.count / PNL_PAGE_SIZE)), shown = Math.min(Math.max(0, page), pages - 1);
-    const rows = sql(`SELECT account, id, time, symbol, kind, amount FROM ledger WHERE account IN (${keys.map(() => '?').join(',')}) AND time>=? AND time<=? ORDER BY time DESC, account, id LIMIT ? OFFSET ?`)
-      .all(...keys, start, current, PNL_PAGE_SIZE, shown * PNL_PAGE_SIZE) as { account: string; id: string; time: number; symbol: string; kind: LedgerKind; amount: string }[];
-    const venueOf = (key: string) => accounts[keys.indexOf(key)]?.venue ?? null;
-    const result = {
+    return { start, body: {
       currency: 'USDT', range, ranges: Object.keys(PNL_RANGES), now: current, requestedStart, start, intervalMs: PNL_SAMPLE_MS, sampledAt,
       status: count === 0 ? 'collecting' : latest?.totalPnl === null ? 'incomplete' : 'ready',
       recordingStartedAt: series.times[0] ?? null, pointCount: count, points: points.map(formatPoint), latest: latest ? formatPoint(latest) : null,
@@ -378,22 +387,40 @@ export function createOilPnl({ file, connectors, accounts, now = Date.now, pnlTi
         return {
           venue: account.venue, accountId: maskId(account.accountId), accountMode: account.accountMode,
           positions: { ...slot }, ledger: { start: state.start, coveredUntil: state.coveredUntil, syncedAt: state.syncedAt, failedAt: state.failedAt, error: state.error },
-          symbols: OIL_SYMBOLS.map(symbol => {
-            return { symbol, funding: sum(`${index}:${symbol}:funding`), realized: sum(`${index}:${symbol}:realized`), fee: sum(`${index}:${symbol}:fee`),
-              unrealized: slot.rows ? fromUnits(slot.rows.filter(row => row.symbol === symbol).reduce((total, row) => total + units(row.unrealizedPnl), 0n)) : null };
-          }),
+          symbols: OIL_SYMBOLS.map(symbol => ({ symbol, funding: sum(`${index}:${symbol}:funding`), realized: sum(`${index}:${symbol}:realized`), fee: sum(`${index}:${symbol}:fee`),
+            unrealized: slot.rows ? fromUnits(slot.rows.filter(row => row.symbol === symbol).reduce((total, row) => total + units(row.unrealizedPnl), 0n)) : null })),
         };
       }),
-      entries: { page: shown, pages, total: total.count, pageSize: PNL_PAGE_SIZE, rows: rows.map(row => ({ venue: venueOf(row.account), id: row.id, time: row.time, symbol: row.symbol, kind: row.kind, amount: row.amount })) },
-    };
+    } };
+  }
+
+  /**
+   * The page's read. range picks the curve's start (never earlier than the ledgers' own start, so every total is summed
+   * from one start); page pages the range's ledger rows, newest first. Each range and page keeps its own answer until a
+   * sample, a position read, the ledgers or the minute change.
+   */
+  function read({ range = '7d', page = 0 }: { range?: PnlRange; page?: number } = {}) {
+    const current = now(), minute = Math.floor(current / PNL_SAMPLE_MS);
+    const cacheKey = `${range}:${page}`, cached = cache.get(cacheKey);
+    if (cached && cached.version === version && cached.minute === minute) return cached.result;
+    // Everything but the ledger page depends only on the range: paging reuses it.
+    let view = views.get(range);
+    if (!view || view.version !== version || view.minute !== minute) { view = { version, minute, ...rangeView(range, current) }; views.set(range, view); }
+    const { start, body } = view;
+    const total = sql(`SELECT COUNT(*) AS count FROM ledger WHERE account IN (${keys.map(() => '?').join(',')}) AND time>=? AND time<=?`).get(...keys, start, body.now) as { count: number };
+    const pages = Math.max(1, Math.ceil(total.count / PNL_PAGE_SIZE)), shown = Math.min(Math.max(0, page), pages - 1);
+    const rows = sql(`SELECT account, id, time, symbol, kind, amount FROM ledger WHERE account IN (${keys.map(() => '?').join(',')}) AND time>=? AND time<=? ORDER BY time DESC, account, id LIMIT ? OFFSET ?`)
+      .all(...keys, start, body.now, PNL_PAGE_SIZE, shown * PNL_PAGE_SIZE) as { account: string; id: string; time: number; symbol: string; kind: LedgerKind; amount: string }[];
+    const venueOf = (key: string) => accounts[keys.indexOf(key)]?.venue ?? null;
+    const result = { ...body, entries: { page: shown, pages, total: total.count, pageSize: PNL_PAGE_SIZE, rows: rows.map(row => ({ venue: venueOf(row.account), id: row.id, time: row.time, symbol: row.symbol, kind: row.kind, amount: row.amount })) } };
     // Bounded: four ranges times the pages viewed lately.
     if (cache.size >= 32) cache.clear();
     cache.set(cacheKey, { version, minute, result });
     return result;
   }
 
-  // Loaded once while the service starts, not on the first page read or sample.
-  loadSeries();
+  // Loaded once while the service starts, not on the first page read or sample; a store that cannot be loaded is closed.
+  try { loadSeries(); } catch (error) { db.close(); throw error; }
   return { sample, syncLedgers, read, close: () => db.close() };
 }
 export type OilPnl = ReturnType<typeof createOilPnl>;

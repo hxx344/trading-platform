@@ -4,7 +4,7 @@
 // service. Pairs dropped from the config are switched off at start.
 import { randomUUID } from 'node:crypto';
 import { networkInterfaces } from 'node:os';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { openStore } from '../store.ts';
@@ -17,11 +17,12 @@ import { AsterTransferConnector } from '../aster/transfer.ts';
 import { AsterTradingConnector } from '../aster/trading.ts';
 import { loadWebApp, type WebApp } from '../web-assets.ts';
 import { runExecutor } from '../runtime.ts';
-import { assertDistinctSigners, checkIntervalBudget, enableBudget, idleWeight, loadServiceConfig, loadServiceSecrets, urlHost, type ServiceConfig, type ServiceSecrets } from './config.ts';
+import { assertDistinctSigners, checkIntervalBudget, enableBudget, idleWeight, loadServiceConfig, loadServiceSecrets, urlHost, type FeishuSecret, type ServiceConfig, type ServiceSecrets } from './config.ts';
 import { TRANSFER_CONFIG_KEYS, parseTransferConfig, type TransferConfig } from '../contracts.ts';
 import { PASSWORD_FILE, hashPassword, loadPasswordHash, type PasswordHash } from '../login-password.ts';
 import { createTakeoverGuard } from './takeover.ts';
-import { createNotifier, sendFeishu, type EventRow, type Notifier } from './feishu.ts';
+import { MONITOR_OUTBOX_FILE, createNotifier, sendFeishu, type EventRow, type Notifier } from './feishu.ts';
+import type { AlertHooks, AlertRobot } from '../monitor/alerts.ts';
 import { createStreamStatus, runUserStream, type SocketLike } from './stream.ts';
 import { balanceWindow, createBalanceSamples, type BalanceSamples } from './balance-samples.ts';
 import { readImportResult, submitImportRequest } from './import-channel.ts';
@@ -165,6 +166,30 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
   return { executor, trading, client, byAddress, streamed: subAccounts, writable, warnings };
 }
 
+/**
+ * Where the market alerts go (M-3b): secrets.json `feishuMonitor` with its own outbox when set, else the ASTER robot
+ * `feishu` in notify.sqlite. Delivery is read from the outbox each alert was queued in, whatever the robot is now; an
+ * outbox that could not be opened throws, which the alert service shows and retries.
+ */
+export function marketAlertHooks({ secrets, notifier, monitorOutbox, monitorOutboxError, send }: {
+  secrets: Pick<ServiceSecrets, 'feishu' | 'feishuMonitor'>; notifier: Pick<Notifier, 'notify' | 'delivery'>; monitorOutbox: Pick<Notifier, 'notify' | 'delivery'> | null; monitorOutboxError: string | null;
+  send: (secret: FeishuSecret, text: string) => Promise<unknown>;
+}): AlertHooks {
+  // The test message goes to the same robot directly.
+  const robot = secrets.feishuMonitor ? { name: 'feishuMonitor' as const, secret: secrets.feishuMonitor } : secrets.feishu ? { name: 'feishu' as const, secret: secrets.feishu } : null;
+  const outboxOf = (name: AlertRobot): Pick<Notifier, 'notify' | 'delivery'> => {
+    if (name === 'feishu') return notifier;
+    if (!monitorOutbox) throw new Error(`${MONITOR_OUTBOX_FILE} 无法打开：${monitorOutboxError ?? '文件不存在'}`);
+    return monitorOutbox;
+  };
+  return {
+    notify: text => robot ? outboxOf(robot.name).notify(text) : null,
+    delivery: (ids, name) => outboxOf(name).delivery(ids),
+    robot: () => robot?.name ?? null,
+    test: async text => { if (robot) await send(robot.secret, text); },
+  };
+}
+
 export interface StartOptions {
   config: ServiceConfig;
   secrets: ServiceSecrets;
@@ -271,13 +296,18 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   catch (error) { samplesError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`余额采样库无法打开，走势图不可用：${samplesError}\n`); }
   // The same for the monitor: without its file the monitor page is left out, nothing else.
   let monitor: MonitorRuntime | null = null, monitorError: string | null = null;
+  // M-3b: with secrets.json `feishuMonitor` the market alerts have a robot and an outbox of their own (notify-monitor.sqlite,
+  // no event log behind it); without it they queue with the ASTER messages in notify.sqlite (M-3a). The file is opened while
+  // it exists even after the robot is removed, so the panel still reads the delivery of what was queued there.
+  let monitorOutbox: Notifier | null = null, monitorOutboxError: string | null = null;
+  if (config.monitor && (secrets.feishuMonitor || existsSync(join(dir, MONITOR_OUTBOX_FILE)))) {
+    try {
+      monitorOutbox = createNotifier({ file: join(dir, MONITOR_OUTBOX_FILE), feishu: secrets.feishuMonitor ?? null, ...(notifyFetch ? { fetchImpl: notifyFetch } : {}),
+        events: () => [], latestSeq: () => 0, pairs: () => [], incidentPair: () => null });
+    } catch (error) { monitorOutboxError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`行情告警的出站队列（${MONITOR_OUTBOX_FILE}）无法打开，行情告警暂停入队：${monitorOutboxError}\n`); }
+  }
   if (config.monitor) {
-    // M-3a: the alerts queue in the same outbox and robot as the ASTER messages; the test message goes to that robot directly.
-    const robot = secrets.feishu;
-    const alertHooks = {
-      notify: (text: string) => notifier.notify(text), delivery: (ids: readonly number[]) => notifier.delivery(ids), robot: () => robot !== null,
-      test: async (text: string) => { if (robot) await sendFeishu(robot, { msg_type: 'text', content: { text } }, notifyFetch ? { fetchImpl: notifyFetch } : {}); },
-    };
+    const alertHooks = marketAlertHooks({ secrets, notifier, monitorOutbox, monitorOutboxError, send: (secret, text) => sendFeishu(secret, { msg_type: 'text', content: { text } }, notifyFetch ? { fetchImpl: notifyFetch } : {}) });
     try { monitor = openMonitor(config.monitor, dir, { ...(monitorFetch ? { fetchImpl: monitorFetch } : {}), alertHooks }); }
     catch (error) { monitorError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`行情监控库无法打开，行情监控页不可用：${monitorError}\n`); }
   }
@@ -297,7 +327,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   try {
     notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}`);
     for (const text of warnings) notifier.notify(`【配置未生效】${text}`);
-  } catch (error) { oilPnl?.close(); oilRules?.close(); closeMonitorStore(); asset?.close(); samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
+  } catch (error) { oilPnl?.close(); oilRules?.close(); closeMonitorStore(); monitorOutbox?.close(); asset?.close(); samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
 
   return runExecutor({
     executor, store, dir, port, app, session,
@@ -324,6 +354,8 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
         while (!context.stopped()) {
           try { notifier.poll(); await notifier.flush(); }
           catch (error) { process.stderr.write(`告警处理失败：${error instanceof Error ? error.message : String(error)}\n`); }
+          try { await monitorOutbox?.flush(); }
+          catch (error) { process.stderr.write(`行情告警发送失败：${error instanceof Error ? error.message : String(error)}\n`); }
           await context.pause(NOTIFY_MS);
         }
       })(),
@@ -357,8 +389,9 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
     onStopped: async () => {
       // Events from the drain (an unknown transfer, an ADL batch) go out now rather than at the next start.
       try { notifier.poll(); } catch { /* best effort */ }
-      await Promise.race([notifier.flush(), new Promise(resolve => setTimeout(resolve, FINAL_FLUSH_MS).unref())]);
+      await Promise.race([Promise.all([notifier.flush(), monitorOutbox?.flush()]), new Promise(resolve => setTimeout(resolve, FINAL_FLUSH_MS).unref())]);
       notifier.close();
+      monitorOutbox?.close();
       summary.close();
       samples?.close();
       closeMonitorStore();

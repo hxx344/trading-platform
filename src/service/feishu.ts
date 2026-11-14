@@ -16,6 +16,8 @@ const EVENTS_PER_POLL = 500;
 /** Messages joined into one robot post; the robot allows a few posts per second at most. */
 const LINES_PER_POST = 10;
 const MAX_TEXT = 1_500;
+/** The market alerts' own outbox (M-3b), used while secrets.json has `feishuMonitor`. */
+export const MONITOR_OUTBOX_FILE = 'notify-monitor.sqlite';
 /** Newest outbox messages shown on the status page. */
 const STATUS_RECENT = 20;
 /** Repeats of one ongoing problem are posted at most this often. */
@@ -330,13 +332,15 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
   let sending = false;
   /** Sends what is due, oldest first, several messages per post; a failure backs off the whole batch. */
   async function flush(): Promise<void> {
-    if (!feishu || sending) return;
+    if (sending) return;
     sending = true;
     try {
       const at = now();
+      // Kept to the retention also without a robot (an outbox left after its robot was removed).
       db.prepare('DELETE FROM outbox WHERE created_at < ?').run(at - RETENTION_MS);
       db.prepare('DELETE FROM repeats WHERE at < ?').run(at - RETENTION_MS);
       db.prepare('DELETE FROM once WHERE at < ?').run(at - RETENTION_MS);
+      if (!feishu) return;
       const due = db.prepare('SELECT id, text, attempts FROM outbox WHERE sent_at IS NULL AND next_at <= ? ORDER BY id LIMIT ?').all(at, LINES_PER_POST) as { id: number; text: string; attempts: number }[];
       if (!due.length) return;
       const ids = due.map(row => row.id);

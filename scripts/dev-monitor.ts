@@ -28,7 +28,7 @@ const outbox: { text: string; at: number }[] = [];
 const alertHooks = {
   notify: (text: string) => { outbox.push({ text, at: Date.now() }); process.stdout.write(`[替身飞书·入队] ${text}\n`); return outbox.length; },
   delivery: (ids: readonly number[]) => new Map(ids.flatMap(id => { const item = outbox[id - 1]; return item ? [[id, { sentAt: Date.now() - item.at >= 2_000 ? item.at + 2_000 : null, attempts: 0, lastError: null, nextAt: item.at }] as const] : []; })),
-  robot: () => true,
+  robot: () => 'feishuMonitor' as const,
   test: async (text: string) => { process.stdout.write(`[替身飞书·测试] ${text}\n`); },
 };
 const monitor = openMonitor(parseMonitorConfig({ anthropic: {}, oil: {}, hynix: {} }), dir, { fetchImpl: venues.fetch, WebSocketImpl: venues.WebSocket, alertHooks });

@@ -83,6 +83,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 | 回退到早于 | 回退前要做的事 | 说明 | 详见 |
 | --- | --- | --- | --- |
+| v0.30.0 | 从 `secrets.json` 删掉 `feishuMonitor` | 旧版本按白名单读密钥；`monitor.sqlite` 里待应用的导入与“已导入”记录旧版本忽略；`notify-monitor.sqlite` 留在数据目录，其中未送达的行情告警不再发送 | [docs/monitor.md](docs/monitor.md) M-3b |
 | v0.21.0 | 从 `config.json` 删掉 `monitor.hynix`（只配了海力士时删掉整个 `monitor`） | 旧版本不认识 `hynix` 市场；`monitor.sqlite` 里的海力士 K 线旧版本不读，再升级回来照常续用 | [docs/monitor.md](docs/monitor.md) M-2b |
 | v0.20.0 | 从 `config.json` 删掉 `monitor.oil`（只配了原油时删掉整个 `monitor`） | 旧版本不认识 `oil` 市场；`monitor.sqlite` 里的原油 K 线旧版本不读，再升级回来照常续用 | [docs/monitor.md](docs/monitor.md) M-2a |
 | v0.19.0 | 不用改配置 | `asset.sqlite` 新增的 `connections` 表与数据目录的 `asset-credential.key` 旧版本不读；回退期间资产页不同步，交易所行停在最后一次同步的值，再升级回来连接照常可用 | [docs/asset.md](docs/asset.md) A-3/A-4 |

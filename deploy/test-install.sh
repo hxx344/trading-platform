@@ -166,6 +166,8 @@ TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workben
 check '--options 在工作台没有期权密钥时跳过且不改配置' '[[ $status -eq 0 ]] && grep -q "跳过期权账户：工作台期权模块没有配置 Bybit 密钥" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json"'
 run --package "$tmp/a" --monitor && status=0 || status=$?
 check '--monitor 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -q -- "--monitor 须和 --import-workbench 一起使用" "$tmp/out"'
+run --package "$tmp/a" --monitor-alerts && status=0 || status=$?
+check '--monitor-alerts 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -q -- "--monitor-alerts 须和 --import-workbench 一起使用" "$tmp/out"'
 run --package "$tmp/a" --asset && status=0 || status=$?
 check '--asset 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -q -- "--asset 须和 --import-workbench 一起使用" "$tmp/out"'
 run --package "$tmp/a" --import-workbench --asset-owner alice && status=0 || status=$?
@@ -185,6 +187,13 @@ check '导入的资产账本仅服务账户可读写且不含凭据' '[[ "$(stat
 cp "$TP_CONF_DIR/config.json" "$tmp/config.before"
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor --asset --asset-owner bob && status=0 || status=$?
 check '重复导入只替换资产账本、保留配置' '[[ $status -eq 0 ]] && grep -q "已写入资产账本 $TP_DATA_DIR/asset.sqlite：用户 bob" "$tmp/out" && grep -q "配置未改动（资产账本已启用，只重新导入了账本" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json"'
+# The workbench's market alerts (M-3b): the oil tiers and the one robot come over; Hynix has no file here.
+mkdir -p "$tmp/wb/data/modules/monitor/oil"
+printf '%s' '{"schemaVersion":1,"config":{"enabled":true,"rules":[{"id":"r1","label":"价差 5","metric":"spread","operator":"gte","threshold":5,"cooldownMinutes":30,"hysteresis":0.1,"enabled":true}]}}' >"$tmp/wb/data/modules/monitor/oil/monitor.json"
+printf '%s' '{"version":1,"config":{"webhookUrl":"https://open.feishu.cn/open-apis/bot/v2/hook/install-test-hook-0001","signingSecret":"install-sign-0001"},"candidates":[]}' >"$tmp/wb/data/modules/monitor/notifications.json"
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor-alerts && status=0 || status=$?
+check '--monitor-alerts 导入原油档位与机器人并通过配置检查' '[[ $status -eq 0 ]] && grep -q "导入行情告警：替换本服务的原油 1 档" "$tmp/out" && grep -q "已写入告警档位（原油 1 档）" "$tmp/out" && grep -q "海力士告警 未导入：工作台没有 hynix/alerts.json" "$tmp/out" && grep -q "\"feishuMonitor\"" "$TP_CONF_DIR/secrets.json" && [[ -f "$TP_DATA_DIR/monitor.sqlite" ]]'
+check '导入告警的输出不含机器人地址与签名' '! grep -q "install-test-hook\|install-sign" "$tmp/out"'
 
 # No current link (data and config left from an earlier install): installs and points current at the release.
 rm "$TP_APP_DIR/current"

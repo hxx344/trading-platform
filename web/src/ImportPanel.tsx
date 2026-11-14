@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from './api.ts';
 import { fullStamp } from './asset-format.ts';
-import { assetAvailable, confirmText, defaultAssetOwner, importBody, monitorAvailable, restarts, type AssetItem, type ImportBody, type ImportChoices, type MonitorItem } from './import-form.ts';
+import { alertsAvailable, assetAvailable, confirmText, defaultAssetOwner, importBody, monitorAvailable, restarts, type AssetItem, type ImportBody, type ImportChoices, type MonitorAlertsItem, type MonitorItem } from './import-form.ts';
 
 // The workbench import: the page leaves a request, a root helper on the host answers it (and restarts this service
 // for an import); the answer is polled by request id, and polling carries on while the service restarts.
@@ -18,7 +18,7 @@ interface OptionsItem { accountId: string | null; status: 'added' | 'skipped'; d
 interface ImportResult {
   id: string | null; action: 'preview' | 'import' | null; at: number; phase?: string; message: string;
   preview?: PreviewItem[]; imported?: ImportedItem[]; oil?: OilItem[]; oilError?: string; options?: OptionsItem; optionsError?: string;
-  monitor?: MonitorItem; asset?: AssetItem; assetError?: string; notes?: string[]; database?: string;
+  monitor?: MonitorItem; monitorAlerts?: MonitorAlertsItem; monitorAlertsError?: string; asset?: AssetItem; assetError?: string; notes?: string[]; database?: string;
 }
 const VENUE: Record<string, string> = { binance: 'Binance', bybit: 'Bybit' };
 
@@ -47,9 +47,27 @@ function MonitorRow({ item, preview }: { item: MonitorItem; preview: boolean }) 
     <thead><tr><th>行情监控</th><th>本项目</th><th>工作台 Monitor</th><th>{preview ? '说明' : '结果'}</th></tr></thead>
     <tbody><tr>
       <td>{item.markets === undefined ? 'Anthropic 价差、原油价差、海力士溢价' : item.markets.length ? item.markets.map(market => MARKET_NAMES[market] ?? market).join('、') : '—'}</td><td>{item.enabled ? '已启用' : '未启用'}</td><td className="muted">{item.workbench ? '有（本地行情记录不导入）' : '无'}</td>
-      <td className={item.status === 'added' ? 'ok' : preview || item.enabled ? 'muted' : 'err'}>{item.status === 'added' ? (preview ? '可启用：' : '已启用：') : (preview ? '' : '未启用：')}{item.detail}</td>
+      <td className={item.status === 'added' ? 'ok' : preview || item.enabled ? 'muted' : 'err'}>{item.status === 'added' ? (preview ? '可启用：' : '已启用：') : (preview || item.enabled ? '' : '未启用：')}{item.detail}</td>
     </tr></tbody>
   </table></div>;
+}
+const ALERT_MARKET_NAMES: Record<string, string> = { oil: '原油', hynix: '海力士' };
+/** The workbench monitor's alert tiers per market and its robot (M-3b). */
+function AlertsRows({ item, preview }: { item: MonitorAlertsItem; preview: boolean }) {
+  const robot = item.robot.imported ? `${preview ? '可导入' : '已导入'}为 secrets.json 的 feishuMonitor${item.robot.replaces ? '（替换原有的）' : item.robot.changes ? '' : '（与本服务现有的相同）'}` : `不导入：${item.robot.problem ?? '—'}`;
+  return <>
+    <div className="table-wrap"><table className="data" id="importAlertsTable">
+      <thead><tr><th>行情告警</th><th>档位</th><th>总开关</th><th>{preview ? '说明' : '结果'}</th></tr></thead>
+      <tbody>{item.markets.map(entry => <tr key={entry.market}>
+        <td>{ALERT_MARKET_NAMES[entry.market] ?? entry.market}</td>
+        <td>{entry.problem ? '—' : `${entry.rules} 档（启用 ${entry.enabledRules}）`}</td>
+        <td>{entry.enabled === null ? '—' : entry.enabled ? '开' : '关'}</td>
+        <td className={entry.problem ? (preview ? 'muted' : 'err') : 'ok'}>{entry.problem ? `不能导入：${entry.problem}` : `${preview ? '可导入，替换本服务现有档位' : '已导入'}${entry.notes.length ? `；${entry.notes.join('；')}` : ''}`}</td>
+      </tr>)}
+      <tr><td>飞书机器人</td><td>—</td><td>—</td><td className={item.robot.imported ? 'ok' : preview ? 'muted' : 'err'}>{robot}</td></tr></tbody>
+    </table></div>
+    {item.status === 'skipped' ? <p className={preview ? 'muted' : 'err'}>{preview ? '' : '未导入：'}{item.detail}</p> : null}
+  </>;
 }
 /** The workbench's ledger users; in a preview, the one to import is picked here. */
 function AssetRows({ item, preview, owner, setOwner }: { item: AssetItem; preview: boolean; owner?: string | null; setOwner?: (value: string) => void }) {
@@ -71,19 +89,21 @@ function AssetRows({ item, preview, owner, setOwner }: { item: AssetItem; previe
 }
 type Message = { tone: 'ok' | 'err' | 'muted'; text: string } | null;
 /** The module choices of the preview (live accounts and modules are never ticked by default). */
-interface ModulePicks { oil: boolean; options: boolean; monitor: boolean; asset: boolean; assetOwner: string | null }
+interface ModulePicks { oil: boolean; options: boolean; monitor: boolean; monitorAlerts: boolean; asset: boolean; assetOwner: string | null }
 
 function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { result: ImportResult; picked: Set<string>; setPicked: (value: Set<string>) => void; picks: ModulePicks; setPicks: (value: ModulePicks) => void; onRun: () => void; busy: boolean }) {
   const notes = (result.notes || []).map((note, index) => <p key={index} className="muted">{note}</p>);
   const oilError = result.oilError ? <p className="err">原油执行账户无法读取：{result.oilError}</p> : null;
   const optionsError = result.optionsError ? <p className="err">期权账户无法读取：{result.optionsError}</p> : null;
   const assetError = result.assetError ? <p className="err">资产账本无法读取：{result.assetError}</p> : null;
+  const alertsError = result.monitorAlertsError ? <p className="err">行情告警设置无法读取：{result.monitorAlertsError}</p> : null;
   if (result.action === 'preview') {
     const rows = result.preview || [], oil = result.oil || [], options = result.options ?? null, monitor = result.monitor ?? null, asset = result.asset ?? null;
     const oilImportable = oil.some(item => item.status === 'added'), optionsImportable = options?.status === 'added';
     const oilPicked = picks.oil, optionsPicked = picks.options;
     const setOilPicked = (value: boolean) => setPicks({ ...picks, oil: value }), setOptionsPicked = (value: boolean) => setPicks({ ...picks, options: value });
     const monitorImportable = monitorAvailable(monitor), assetImportable = assetAvailable(asset);
+    const alerts = result.monitorAlerts ?? null, alertsImportable = alertsAvailable(alerts, monitor, picks.monitor);
     return <>
       {rows.length ? <>
         <div className="table-wrap"><table className="data">
@@ -112,8 +132,13 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
       {optionsError}
       {monitor ? <>
         <MonitorRow item={monitor} preview />
-        <label className="pair-pick"><input type="checkbox" id="importMonitorPick" disabled={!monitorImportable} checked={picks.monitor && monitorImportable} onChange={event => setPicks({ ...picks, monitor: event.target.checked })} />启用行情监控（Anthropic 价差，只读公开行情，不需要密钥；股数取默认值，本项目已启用时保留现有设置）</label>
+        <label className="pair-pick"><input type="checkbox" id="importMonitorPick" disabled={!monitorImportable} checked={picks.monitor && monitorImportable} onChange={event => setPicks({ ...picks, monitor: event.target.checked, ...(event.target.checked ? {} : { monitorAlerts: false }) })} />启用行情监控（Anthropic 价差，只读公开行情，不需要密钥；股数取默认值，本项目已启用时保留现有设置）</label>
+        {alerts ? <>
+          <AlertsRows item={alerts} preview />
+          <label className="pair-pick"><input type="checkbox" id="importAlertsPick" disabled={!alertsImportable} checked={picks.monitorAlerts && alertsImportable} onChange={event => setPicks({ ...picks, monitorAlerts: event.target.checked })} />同时导入告警档位与机器人（替换本服务现有的原油 / 海力士档位；{monitorAvailable(monitor) ? (monitor.enabled ? '须同时勾选补全行情监控' : '须同时勾选启用行情监控') : monitor.enabled ? '行情监控已启用' : '须先在本服务启用行情监控'}）</label>
+        </> : null}
       </> : null}
+      {alertsError}
       {asset ? <>
         <AssetRows item={asset} preview owner={picks.assetOwner} setOwner={owner => setPicks({ ...picks, assetOwner: owner, asset: true })} />
         <label className="pair-pick"><input type="checkbox" id="importAssetPick" disabled={!assetImportable} checked={picks.asset && assetImportable} onChange={event => setPicks({ ...picks, asset: event.target.checked })} />导入资产账本（所选用户的账本整体替换本项目现有账本；本项目已启用资产账本时只重新导入、不重启服务）</label>
@@ -135,6 +160,8 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
     {result.options ? <OptionsRow item={result.options} preview={false} /> : null}
     {optionsError}
     {result.monitor ? <MonitorRow item={result.monitor} preview={false} /> : null}
+    {result.monitorAlerts ? <AlertsRows item={result.monitorAlerts} preview={false} /> : null}
+    {alertsError}
     {result.asset ? <AssetRows item={result.asset} preview={false} /> : null}
     {assetError}
     {notes}
@@ -147,9 +174,12 @@ function choicesOf(result: ImportResult | null, picked: Set<string>, picks: Modu
   const oil = picks.oil ? (result?.oil || []).filter(item => item.status === 'added').map(item => `${VENUE[item.venue] ?? item.venue} ${item.accountId ?? ''}`) : [];
   const options = picks.options && result?.options?.status === 'added' ? `Bybit ${result.options.accountId ?? ''}` : null;
   const owner = picks.asset && result?.asset?.owners.some(item => item.importable && item.owner === picks.assetOwner) ? picks.assetOwner : null;
-  return { pairs, oil, options, monitor: picks.monitor && monitorAvailable(result?.monitor), assetOwner: owner };
+  const alerts = result?.monitorAlerts;
+  const monitorAlerts = picks.monitorAlerts && alerts && alertsAvailable(alerts, result?.monitor, picks.monitor)
+    ? { tiers: alerts.markets.filter(entry => entry.problem === null).length, robot: alerts.robot.imported, robotChanges: alerts.robot.changes } : null;
+  return { pairs, oil, options, monitor: picks.monitor && monitorAvailable(result?.monitor), monitorAlerts, assetOwner: owner };
 }
-const NO_PICKS: ModulePicks = { oil: false, options: false, monitor: false, asset: false, assetOwner: null };
+const NO_PICKS: ModulePicks = { oil: false, options: false, monitor: false, monitorAlerts: false, asset: false, assetOwner: null };
 
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const statusOf = (error: unknown): number | undefined => {

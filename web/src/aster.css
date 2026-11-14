@@ -127,37 +127,6 @@
 .aster-desk .small-note.amber {
   color: var(--warning);
 }
-.aster-desk .topbar {
-  height: 52px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  border-bottom: 1px solid var(--border);
-  padding: 0 max(24px, calc((100vw - 1512px) / 2));
-  background: var(--card);
-}
-.aster-desk .brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  letter-spacing: 0.09em;
-  font-weight: 650;
-  font-size: 16px;
-}
-.aster-desk .brand > svg {
-  color: var(--primary);
-}
-.aster-desk .brand small {
-  letter-spacing: 0;
-  font-size: 13px;
-  font-weight: 450;
-  color: var(--muted-foreground);
-}
-.aster-desk .brand-separator {
-  margin: 0 10px;
-  color: var(--border);
-  font-weight: 300;
-}
 .aster-desk .account-controls {
   display: flex;
   align-items: center;
@@ -264,29 +233,12 @@
   .aster-desk .workspace {
     padding: 20px 24px;
   }
-  .aster-desk .topbar {
-    padding: 0 24px;
-  }
   .aster-desk .small-note {
     max-width: 175px;
     text-align: right;
   }
 }
 @media (max-width: 640px) {
-  .aster-desk .topbar {
-    height: 52px;
-    padding: 0 16px;
-  }
-  .aster-desk .brand {
-    font-size: 15px;
-    gap: 9px;
-  }
-  .aster-desk .brand-separator {
-    margin: 0 10px;
-  }
-  .aster-desk .brand small {
-    font-size: 13px;
-  }
   .aster-desk .workspace {
     padding: 16px 12px;
   }
@@ -308,9 +260,6 @@
 .aster-desk .focused-desk .workspace {
   max-width: 1560px;
   padding-top: 20px;
-}
-.aster-desk .focused-desk .topbar {
-  height: 52px;
 }
 .aster-desk .focused-desk .page-heading {
   margin-bottom: 14px;
@@ -338,42 +287,6 @@
 .aster-desk .account-run-actions {
   gap: 8px;
   flex-wrap: wrap;
-}
-.aster-desk .workspace-tabs {
-  gap: 16px;
-}
-.aster-desk .workspace-tabs > [data-slot='tabs-content'][hidden] {
-  display: none;
-}
-.aster-desk .workspace-navigation {
-  width: 100%;
-  justify-content: flex-start;
-  gap: 4px !important;
-  height: 40px !important;
-  padding: 0 !important;
-  border-bottom: 1px solid var(--border);
-  overflow-x: auto;
-  scrollbar-width: thin;
-}
-.aster-desk .workspace-navigation [data-slot='tabs-trigger'] {
-  flex: none;
-  height: 38px;
-  padding: 0 14px;
-  font-size: 13px;
-  color: var(--muted-foreground);
-  border-radius: 6px 6px 0 0;
-}
-.aster-desk .workspace-navigation [data-slot='tabs-trigger']:hover {
-  background: var(--surface-muted);
-  color: var(--primary);
-}
-.aster-desk .workspace-navigation [data-slot='tabs-trigger']::after {
-  bottom: -1px;
-  background: var(--primary);
-}
-.aster-desk .workspace-navigation [data-active] {
-  color: var(--primary);
-  background: var(--primary-subtle);
 }
 .aster-desk .feature-stack {
   display: flex;
@@ -549,21 +462,6 @@
     min-height: 44px;
     flex: 1;
   }
-  .aster-desk .workspace-tabs {
-    gap: 16px;
-  }
-  .aster-desk .workspace-navigation {
-    gap: 4px !important;
-    justify-content: flex-start;
-  }
-  .aster-desk .workspace-navigation {
-    height: 44px !important;
-  }
-  .aster-desk .workspace-navigation [data-slot='tabs-trigger'] {
-    height: 42px;
-    font-size: 13px;
-    padding: 0 12px;
-  }
   .aster-desk .focused-desk .section-head {
     padding: 12px 16px;
     flex-wrap: wrap;
@@ -635,9 +533,6 @@
 .aster-desk .page-heading .account-controls {
   gap: 8px;
   flex-wrap: wrap;
-}
-.aster-desk .workspace-tabs {
-  gap: 12px;
 }
 .aster-desk .section-head,
 .aster-desk .focused-desk .section-head {
@@ -992,42 +887,6 @@
   white-space: nowrap;
 }
 
-/* components/ui/tabs.tsx 的 line 变体：TabsList "inline-flex w-fit items-center justify-center p-[3px] gap-1 bg-transparent
-   rounded-none"；TabsTrigger "relative inline-flex flex-1 items-center justify-center gap-1.5 rounded-md border border-transparent
-   px-1.5 py-0.5 text-sm font-medium whitespace-nowrap transition-all"，下划线 "after:absolute after:inset-x-0 after:bottom-[-5px]
-   after:h-0.5 after:opacity-0"，选中时 "after:opacity-100"（尺寸、颜色与位置被上面 .workspace-navigation 的规则覆盖）。 */
-/* Tabs 根元素 "flex gap-2 data-horizontal:flex-col"（gap 被上面 .workspace-tabs 的规则覆盖）。 */
-.aster-desk .workspace-tabs {
-  display: flex;
-  flex-direction: column;
-}
-.aster-desk .workspace-navigation {
-  display: flex;
-  align-items: center;
-}
-.aster-desk .workspace-navigation [data-slot='tabs-trigger'] {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  border: 1px solid transparent;
-  font-weight: 500;
-  white-space: nowrap;
-  transition: all 0.15s;
-}
-.aster-desk .workspace-navigation [data-slot='tabs-trigger']::after {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 0;
-  height: 2px;
-  opacity: 0;
-  transition: opacity 0.15s;
-}
-.aster-desk .workspace-navigation [data-active]::after {
-  opacity: 1;
-}
 
 /* 配对设置表单（globals.css 同一提交） */
 .aster-module label {

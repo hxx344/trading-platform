@@ -233,3 +233,7 @@ table.data.history{min-width:0}
    here it sits on the right of the market tab row, so it drops that card's margin and top rule. */
 .monitor-desk .hub-nav-row .hub-monitor-controls{margin:0;border-top:0;min-height:44px}
 .monitor-desk .monitor-main>.hub-control-notice{margin:0 0 12px}
+/* The side navigation (shell.css, docs/frontend.md《导航按工作区组织》): the pages keep the ASTER desk's colours, so
+   that content area fills the height beside the sidebar; the entries are links to the hash routes, not buttons. */
+.app-shell>.workspace>main.aster-desk{flex:1;min-width:0}
+.app-shell>.sidebar a.nav-item:focus-visible{outline-offset:-2px}

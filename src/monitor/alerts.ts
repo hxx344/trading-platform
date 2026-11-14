@@ -400,6 +400,8 @@ export function createAlertService({ market, store, quote, hooks, gate, now = Da
 
   return {
     check,
+    /** Only the waiting import (M-3c: a market switched off still takes tiers imported from the workbench). */
+    applyPending,
     view,
     /** Replaces the tiers (POST /alerts); 409 on a stale revision, 503 when the write fails (nothing changes then). */
     update(body: unknown) {

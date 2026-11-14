@@ -346,3 +346,13 @@
 - 原油页（`OilPage.tsx`）：去掉顶部的实盘提示条。“同一账户请勿同时在工作台下原油单或开启原油自动规则”移到下单预览的灰色说明末尾（确认按钮上方）；实盘下单仍在预览后由“确认并实盘开仓 / 平仓”按钮确认，上限说明原本就在该段里。
 - 其余红色、黄色文字都只在真实的失败或陈旧状态下出现，未改。样式只删掉 `styles.css` 里不再用到的 `.oil-page>.callout`。
 - 回滚：`sudo bash install.sh --version v0.29.1`，不改接口、配置与数据。
+
+## 行情监控页：监控开关（Monitor M-3c，v0.31.0）
+
+**对照的工作台页面**：`modules/monitor/app/monitor-hub.tsx` 的「运行监控」开关与关闭提示。样式复制自 `app/globals.css`（`77f3cf2`）第 175–182 行（`.hub-monitor-controls`）与第 186 行（`.hub-control-notice`），加 `.monitor-desk` 前缀追加在 `web/src/monitor.css` 末尾。工作台把开关放在 Hub 侧栏卡片里，这里放在市场标签行右侧，所以在 `styles.css`《本服务》里去掉卡片的外边距与上边线，错误提示与页面左边对齐。
+
+**页面**：`web/src/MonitorPage.tsx` 读 `/api/monitor/state` 的 `controls`，开关与关闭提示的文字、请求体与失败文字在 `web/src/monitor-control.ts`（无 DOM，单元测试在 `test/monitor-control.test.ts`）。写入走 `api()`（POST 带页面请求标记），401 转到会话失效。
+
+**验证**：`scripts/dev-monitor.ts` 替身行情下 1280 与 390 宽度：开关在标签行右侧、无横向溢出；关闭后面板换成提示、报价接口 423、其他市场不受影响、刷新后保持关闭；另一页面先改过时提示并重新读取；重新开启后面板恢复。
+
+**回滚**：`sudo bash install.sh --version v0.30.0`，不用改配置。

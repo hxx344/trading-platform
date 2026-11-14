@@ -36,7 +36,7 @@ function setup({ fetchWrap }: { fetchWrap?: (fetch: (url: string, init: RequestI
   };
   const reader = createExchangeReader({
     gate, now, log: line => logs.push(line), WebSocketImpl: venues.WebSocket,
-    fetchImpl: fetchWrap ? fetchWrap(venues.fetch) : venues.fetch,
+    fetchImpl: fetchWrap ? fetchWrap(venues.fetch) : venues.fetch, variationalFetch: venues.variationalFetch,
     oilQuote: () => null, hynixQuote: hynixQuote as never,
   });
   return { venues, gate, logs, reader, advance: (ms: number) => { t += ms; }, now, setHynix: (status: typeof hynixStatus) => { hynixStatus = status; } };
@@ -59,8 +59,8 @@ test('各交易所：替身上逐家读出两腿、价差与资金费，价格�
   }
   await assert.rejects(reader.quote('oil', 'gate'), /不支持的交易所/);
   await assert.rejects(reader.quote('hynix', 'lighter'), /不支持的交易所/);
-  await assert.rejects(reader.quote('oil', 'variational'), /不支持的交易所/);
-  assert.deepEqual([supportsExchange('oil', 'variational'), supportsExchange('hynix', 'gate'), supportsExchange('oil', 'gate')], [false, true, false]);
+  await assert.rejects(reader.quote('hynix', 'variational'), /不支持的交易所/);
+  assert.deepEqual([supportsExchange('oil', 'variational'), supportsExchange('hynix', 'variational'), supportsExchange('hynix', 'gate'), supportsExchange('oil', 'gate')], [true, false, true, false]);
 });
 
 test('年化公式：按各腿名义与周期折算成每小时，再除以两腿总名义 × 8760；海力士左腿 10 份；任一腿缺资金费时为空', () => {

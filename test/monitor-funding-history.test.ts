@@ -7,9 +7,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
-import { COMPARISON_EXCHANGES, exchangeDefinition, type Exchange, type SpreadMarket } from '../src/vendor/exchange-comparison.mjs';
+import { exchangeDefinition, type Exchange, type SpreadMarket } from '../src/vendor/exchange-comparison.mjs';
 import {
-  HISTORY_LEG_LIMIT, HISTORY_REFRESH_MS, HISTORY_WINDOW_MS, analyzeFundingRange, createFundingLegReader, fundingRangeInput, mergeFundingHistory,
+  HISTORY_LEG_LIMIT, HISTORY_REFRESH_MS, HISTORY_WINDOW_MS, analyzeFundingRange, createFundingLegReader, fundingHistoryExchanges, fundingRangeInput, mergeFundingHistory,
   normalizeSettledFunding, parseCexFundingHistory, parseFundingRangeInput, parseGateFundingHistory, parseHyperliquidFundingHistory, parseLighterFundingHistory,
   validateExchangeFundingHistory, type ExchangeFundingHistory, type FundingLegReader,
 } from '../src/vendor/exchange-funding-history.mjs';
@@ -189,7 +189,7 @@ function setup(fetchWrap?: (fetch: (url: string, init: RequestInit) => Promise<R
 
 test('各交易所：替身上逐家读出两腿 60 天实际结算，费率来自该交易所该合约；页面规则接受服务给出的快照', async () => {
   const { reader, now } = setup();
-  for (const market of ['oil', 'hynix'] as SpreadMarket[]) for (const exchange of COMPARISON_EXCHANGES[market] as readonly Exchange[]) {
+  for (const market of ['oil', 'hynix'] as SpreadMarket[]) for (const exchange of fundingHistoryExchanges(market)) {
     const label = `${market}/${exchange}`;
     const history = await reader.fundingHistory(market, exchange);
     assert.deepEqual([history.exchange, history.monitorId, history.status, history.reason], [exchange, market, 'live', ''], label);

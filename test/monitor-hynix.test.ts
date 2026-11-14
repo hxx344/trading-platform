@@ -271,7 +271,7 @@ test('配置与接口：monitor.hynix 不带设置；只配海力士时其他市
     const cookie = ((await fetch(`${base}/login?token=monitor-token-0003`, { redirect: 'manual' })).headers.get('set-cookie') ?? '').split(';')[0]!;
     const get = async (path: string) => { const response = await fetch(base + path, { headers: { cookie } }); return { status: response.status, body: await response.json() as Record<string, any> }; };
     assert.equal((await fetch(`${base}/api/monitor/hynix/quote`)).status, 401);
-    assert.deepEqual(await get('/api/monitor/state'), { status: 200, body: { markets: ['hynix'], anthropic: null } });
+    assert.deepEqual(await get('/api/monitor/state'), { status: 200, body: { markets: ['hynix'], anthropic: null, controls: { hynix: { market: 'hynix', enabled: true, revision: 0, error: null } } } });
     assert.deepEqual([(await get('/api/monitor/oil/candles?days=x')).status, (await get('/api/monitor/oil/quote')).body.message], [404, '本服务没有配置原油行情监控']);
     assert.deepEqual([(await get('/api/monitor/hynix/quote')).status, (await get('/api/monitor/hynix/quote')).body.message], [503, '尚未取得海力士报价，后台正在采集']);
     assert.equal((await get('/api/monitor/hynix/candles?days=7')).status, 503);
@@ -286,7 +286,7 @@ test('配置与接口：monitor.hynix 不带设置；只配海力士时其他市
     assert.equal(hynixHistory(all).points.length, all.rows.length);
     assert.equal(hynixHistory(week).windowDays, 7);
     assert.equal(hynixQuote(quote.body).status, 'live');
-    assert.deepEqual(Object.keys(monitorStatus(runtime)), ['anthropic', 'oil', 'hynix']);
+    assert.deepEqual(Object.keys(monitorStatus(runtime)), ['anthropic', 'oil', 'hynix', 'controls']);
     assert.deepEqual([monitorStatus(runtime).oil, monitorStatus(runtime).hynix!.candleRows], [null, all.rows.length]);
   } finally {
     await new Promise(resolve => server.close(resolve));

@@ -1,5 +1,5 @@
-import { Layers3, RefreshCw } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { Activity, ArrowLeftRight, ChevronRight, Gauge, Menu, RefreshCw, ScrollText, Server, Settings2, ShieldCheck, Sigma, Wallet, type LucideIcon } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { OIL_READ_TIMEOUT_MS, OIL_STATE_PATH, OilPage } from './OilPage.tsx';
 import { ASSET_READ_TIMEOUT_MS, ASSET_STATE_PATH, AssetPage } from './AssetPage.tsx';
 import { LogsPage } from './LogsPage.tsx';
@@ -7,7 +7,7 @@ import { MONITOR_READ_TIMEOUT_MS, MONITOR_STATE_PATH, MonitorPage, parseMonitorS
 import { OPTIONS_READ_TIMEOUT_MS, OPTIONS_STATE_PATH, OptionsPage } from './OptionsPage.tsx';
 import type { OptionsState } from './options-types.ts';
 import { PairsWorkspace } from './PairsWorkspace.tsx';
-import { useRoute, type Route } from './route.ts';
+import { useRoute } from './route.ts';
 import { SettingsPage } from './SettingsPage.tsx';
 import { StatusPage } from './StatusPage.tsx';
 import { Callout, StatePanel } from './StateViews.tsx';
@@ -19,10 +19,13 @@ import type { OilState } from './oil-types.ts';
 import type { AssetState } from '../../src/asset/views.ts';
 import { CrossexPage } from './crossex/CrossexPage.tsx';
 import { CROSSEX_READ_TIMEOUT_MS, CROSSEX_STATE_PATH } from './crossex/crossex-api.ts';
+import { breadcrumbOf, entryOf, navEntries, workspaceGroups, type NavEntry } from './workspace-nav.ts';
 
-// The page shell follows the workbench's ASTER desk (modules/aster/dashboard/app/page.tsx, b2fae14): the top bar with
-// the brand, the page heading with the connection state, then line tabs. The ASTER pages sit in .aster-module, which
-// carries the workbench's element styles; the oil, monitor and asset pages keep their own.
+// The shell follows the workbench's main interface (src/App.tsx, 31242e0): a side navigation grouped by the workspaces
+// of the unified platform plan (workspace-nav.ts), a topbar with the breadcrumb, and on a phone a drawer behind a menu
+// button. The content keeps the workbench's ASTER desk (modules/aster/dashboard/app/page.tsx, b2fae14): the page heading
+// with the connection state, then the page. The ASTER pages sit in .aster-module, which carries the workbench's element
+// styles; the oil, options, monitor, asset and CrossEx pages keep their own.
 
 const REFRESH_MS = 2_000;
 const READ_TIMEOUT_MS = 10_000;
@@ -33,22 +36,18 @@ function limitsText(state: ServiceState): string | null {
   return `名义金额上限 单笔 ${limits.perJob} USDT，${'openPer24h' in limits ? `24 小时开仓 ${limits.openUsed} / ${limits.openPer24h}` : `累计开仓 ${limits.openUsed} / ${limits.totalOpen}`} USDT`;
 }
 
-type Tab = { pages: Route['page'][]; href: string; text: string };
-const TABS: Tab[] = [
-  { pages: ['overview', 'pair'], href: '#/', text: '配对组' }, { pages: ['status'], href: '#/status', text: '运行状态' }, { pages: ['logs'], href: '#/logs', text: '日志' }, { pages: ['settings'], href: '#/settings', text: '设置' },
-];
-/** Shown only where /api/oil/state answers: a service without oil returns 404 there. */
-const OIL_TAB: Tab = { pages: ['oil'], href: '#/oil', text: '原油' };
 const OIL_CHECK_MS = 60_000;
-/** Likewise for /api/monitor/state: without config.monitor (or its database) the service answers 404. */
-const MONITOR_TAB: Tab = { pages: ['monitor'], href: '#/monitor', text: '行情监控' };
-/** Hidden only where /api/asset/state answers 404 (a service without asset); a ledger that cannot be read keeps the tab, and the page says why. */
-const ASSET_TAB: Tab = { pages: ['asset'], href: '#/asset', text: '资产' };
 const ASSET_CHECK_MS = 60_000;
-/** Shown only where /api/options/state answers, like the oil tab. */
-const OPTIONS_TAB: Tab = { pages: ['options'], href: '#/options', text: '期权' };
-/** Shown only where /api/crossex/state answers (a service without crossex answers 404), like the oil tab. */
-const CROSSEX_TAB: Tab = { pages: ['crossex'], href: '#/crossex', text: 'CrossEx' };
+/** Shown on every service; the oil, options and monitor entries only where their state path answers (a service without
+ * that module returns 404 there), the asset entry unless /api/asset/state answers 404 (a ledger that cannot be read keeps
+ * the entry, and the page says why), the CrossEx entry where /api/crossex/state answers or answers 503 (configured but
+ * not started, retrying: the page says why). */
+const ALWAYS: readonly NavEntry[] = ['pairs', 'status', 'logs', 'settings'];
+const ICONS: Record<NavEntry, LucideIcon> = { asset: Wallet, monitor: Activity, oil: ArrowLeftRight, crossex: Gauge, pairs: ShieldCheck, options: Sigma, status: Server, logs: ScrollText, settings: Settings2 };
+/** Below this width the side navigation is a drawer (the workbench's 760px breakpoint, shell.css). */
+const DRAWER_QUERY = '(max-width: 760px)';
+
+function Brand() { return <div className="brand"><span className="brand-mark" aria-hidden="true"><i /><i /><i /><i /></span><span>统一交易平台<small>交易服务</small></span></div>; }
 
 export function App() {
   const route = useRoute();
@@ -62,11 +61,36 @@ export function App() {
   const monitor = useLiveResource<MonitorState>(MONITOR_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: MONITOR_READ_TIMEOUT_MS, parse: parseMonitorState, onExpired });
   // The asset page reads the same path at the same pace and timeout (the shared read keeps the first subscriber's).
   const asset = useLiveResource<AssetState>(ASSET_STATE_PATH, { intervalMs: ASSET_CHECK_MS, timeoutMs: ASSET_READ_TIMEOUT_MS, onExpired });
-  // The CrossEx page reads its state on its own (tab-specific paths, paused around writes); this only decides whether the tab
-  // shows, so it asks for the light view without the opportunity list. A 503 (configured but not started, retrying) shows
-  // the tab too, so the page can say why.
+  // The CrossEx page reads its state on its own (tab-specific paths, paused around writes); this only decides whether the entry
+  // shows, so it asks for the light view without the opportunity list.
   const crossex = useLiveResource<unknown>(`${CROSSEX_STATE_PATH}?opportunities=0`, { intervalMs: OIL_CHECK_MS, timeoutMs: CROSSEX_READ_TIMEOUT_MS, onExpired });
-  const tabs = [...TABS, ...(oil.data !== null ? [OIL_TAB] : []), ...(options.data !== null ? [OPTIONS_TAB] : []), ...(monitor.data !== null ? [MONITOR_TAB] : []), ...(asset.data !== null || (asset.error instanceof ApiError && asset.error.status === 500) ? [ASSET_TAB] : []), ...(crossex.data !== null || (crossex.error instanceof ApiError && crossex.error.status === 503) ? [CROSSEX_TAB] : [])];
+  const available = new Set<NavEntry>([...ALWAYS, ...(oil.data !== null ? ['oil' as const] : []), ...(options.data !== null ? ['options' as const] : []), ...(monitor.data !== null ? ['monitor' as const] : []), ...(asset.data !== null || (asset.error instanceof ApiError && asset.error.status === 500) ? ['asset' as const] : []),
+    ...(crossex.data !== null || (crossex.error instanceof ApiError && crossex.error.status === 503) ? ['crossex' as const] : [])]);
+  const current = entryOf(route), crumb = breadcrumbOf(route);
+  // The phone drawer, as in the workbench: focus moves into it, Tab cycles inside, Escape or the backdrop closes it and
+  // gives focus back to the menu button. Widening the window past the breakpoint closes it too.
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuButton = useRef<HTMLButtonElement>(null);
+  const sidebar = useRef<HTMLElement>(null);
+  const closeMenu = useCallback(() => { setMenuOpen(false); menuButton.current?.focus(); }, []);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const focusable = () => Array.from(sidebar.current?.querySelectorAll<HTMLElement>('a[href], button:not(:disabled)') ?? []);
+    focusable()[0]?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeMenu();
+      if (event.key === 'Tab') {
+        const items = focusable();
+        if (event.shiftKey && document.activeElement === items[0]) { event.preventDefault(); items.at(-1)?.focus(); }
+        else if (!event.shiftKey && document.activeElement === items.at(-1)) { event.preventDefault(); items[0]?.focus(); }
+      }
+    };
+    const drawer = matchMedia(DRAWER_QUERY);
+    const onWidth = () => { if (!drawer.matches) setMenuOpen(false); };
+    document.addEventListener('keydown', onKey);
+    drawer.addEventListener('change', onWidth);
+    return () => { document.removeEventListener('keydown', onKey); drawer.removeEventListener('change', onWidth); };
+  }, [menuOpen, closeMenu]);
   // A read that succeeds again (after logging in from another tab) clears the notice.
   useEffect(() => { if (status === 'ready') setExpired(false); }, [status]);
   const changed = useCallback(() => { void refresh(); }, [refresh]);
@@ -79,12 +103,23 @@ export function App() {
   const failed = status === 'error' || status === 'offline';
   const limits = state ? limitsText(state) : null;
   const aster = route.page !== 'oil' && route.page !== 'options' && route.page !== 'monitor' && route.page !== 'asset' && route.page !== 'crossex';
-  return <div className="aster-desk">
-    <main className="desk focused-desk">
-      <header className="topbar">
-        <div className="brand"><Layers3 size={22} aria-hidden="true" /><span>统一交易平台<span className="brand-separator">/</span><small>ASTER 保证金平衡 · 原油 · 期权 · 行情监控 · 资产 · CrossEx</small></span></div>
-      </header>
-      <div className="workspace">
+  return <div className="app-shell">
+    {menuOpen ? <button type="button" className="nav-backdrop" aria-label="关闭导航" onClick={closeMenu} /> : null}
+    <aside ref={sidebar} className={`sidebar ${menuOpen ? 'open' : ''}`}><Brand /><nav aria-label="主导航">
+      {workspaceGroups(available).map(group => <div className="nav-group" role="group" aria-label={group.label} key={group.id}>
+        <div className="nav-label" aria-hidden="true">{group.label}</div>
+        {group.entries.map(entry => {
+          const Icon = ICONS[entry], active = entry === current;
+          return <a key={entry} href={navEntries[entry].href} className={`nav-item ${active ? 'active' : ''}`} aria-current={active ? 'page' : undefined} onClick={menuOpen ? closeMenu : undefined}><Icon size={17} aria-hidden="true" /><span className="nav-text">{navEntries[entry].text}</span></a>;
+        })}
+      </div>)}
+    </nav></aside>
+    <div className="workspace">
+      <header className="topbar"><div className="breadcrumb">
+        <button ref={menuButton} type="button" className="icon-button mobile-menu" aria-label="打开导航" aria-expanded={menuOpen} onClick={() => setMenuOpen(true)}><Menu size={21} aria-hidden="true" /></button>
+        <span>{crumb.workspace}</span><ChevronRight size={13} aria-hidden="true" /><strong>{crumb.page}</strong>
+      </div></header>
+      <main className="aster-desk"><div className="desk focused-desk"><div className="workspace">
         <div className="page-heading">
           <div className="page-title">
             <div className="page-title-row">
@@ -107,27 +142,19 @@ export function App() {
           </div>
         </div>
         <div className="feature-stack">
-          <Callout tone="error" role="status">实盘：启用的配对会在真实 ASTER 子账户之间划转 USD1；ADL 导致两侧不一致时按只减仓市价单自动减仓。启用前请先在工作台停用并删除同一配对。停用后该配对的划转与新的 ADL 检测都会停止。</Callout>
           {expired ? <Callout tone="warning" action={{ label: '刷新页面', onClick: () => location.reload() }}>会话已失效，请刷新页面重新登录（或用数据目录 access-url 里的登录链接）。</Callout> : null}
-          <div className="workspace-tabs">
-            <nav className="workspace-navigation" data-slot="tabs-list" aria-label="页面">
-              {tabs.map(tab => {
-                const active = tab.pages.includes(route.page);
-                return <a key={tab.href} href={tab.href} data-slot="tabs-trigger" data-active={active ? '' : undefined} aria-current={active ? 'page' : undefined}>{tab.text}</a>;
-              })}
-            </nav>
-            {aster ? <div className="aster-module">
-              {route.page === 'status' ? <StatusPage onExpired={onExpired} /> : route.page === 'logs' ? <LogsPage onExpired={onExpired} /> : route.page === 'settings'
-                // The import does not need the state: it stays usable when the state cannot be read (the way to add the first pair).
-                ? <SettingsPage onChanged={changed} onExpired={onExpired} />
-                : !state ? (failed
-                  ? <StatePanel kind="error" title="读取服务状态失败" detail={error?.message ?? '网络离线'} />
-                  : <StatePanel kind="loading" title="加载中…" />)
-                  : <PairsWorkspace state={state} pairId={route.page === 'pair' ? route.pairId : null} stale={stale} onChanged={changed} onExpired={onExpired} />}
-            </div> : route.page === 'options' ? <OptionsPage tab={route.tab} onExpired={onExpired} /> : route.page === 'monitor' ? <MonitorPage onExpired={onExpired} /> : route.page === 'asset' ? <AssetPage onExpired={onExpired} /> : route.page === 'crossex' ? <CrossexPage tab={route.tab} onExpired={onExpired} /> : <OilPage onExpired={onExpired} />}
-          </div>
+          {aster ? <div className="aster-module">
+            {route.page === 'status' ? <StatusPage onExpired={onExpired} /> : route.page === 'logs' ? <LogsPage onExpired={onExpired} /> : route.page === 'settings'
+              // The import does not need the state: it stays usable when the state cannot be read (the way to add the first pair).
+              ? <SettingsPage onChanged={changed} onExpired={onExpired} />
+              : !state ? (failed
+                ? <StatePanel kind="error" title="读取服务状态失败" detail={error?.message ?? '网络离线'} />
+                : <StatePanel kind="loading" title="加载中…" />)
+                : <PairsWorkspace state={state} pairId={route.page === 'pair' ? route.pairId : null} stale={stale} onChanged={changed} onExpired={onExpired} />}
+          </div> : route.page === 'options' ? <OptionsPage tab={route.tab} onExpired={onExpired} /> : route.page === 'monitor' ? <MonitorPage onExpired={onExpired} /> : route.page === 'asset' ? <AssetPage onExpired={onExpired} />
+            : route.page === 'crossex' ? <CrossexPage tab={route.tab} onExpired={onExpired} /> : <OilPage onExpired={onExpired} />}
         </div>
-      </div>
-    </main>
+      </div></div></main>
+    </div>
   </div>;
 }

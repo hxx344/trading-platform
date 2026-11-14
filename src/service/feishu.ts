@@ -16,6 +16,8 @@ const EVENTS_PER_POLL = 500;
 /** Messages joined into one robot post; the robot allows a few posts per second at most. */
 const LINES_PER_POST = 10;
 const MAX_TEXT = 1_500;
+/** The market alerts' own outbox (M-3b), used while secrets.json has `feishuMonitor`. */
+export const MONITOR_OUTBOX_FILE = 'notify-monitor.sqlite';
 /** Newest outbox messages shown on the status page. */
 const STATUS_RECENT = 20;
 /** Repeats of one ongoing problem are posted at most this often. */
@@ -251,9 +253,10 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
     db.exec('BEGIN IMMEDIATE');
     try { const result = operation(); db.exec('COMMIT'); return result; } catch (error) { db.exec('ROLLBACK'); throw error; }
   };
-  const insert = (text: string, at: number): void => {
+  /** The queued message's id, or null without a robot (the text is only logged then). */
+  const insert = (text: string, at: number): number | null => {
     log(`告警：${text}`);
-    if (feishu) db.prepare('INSERT INTO outbox(created_at, text, next_at) VALUES (?, ?, ?)').run(at, text.slice(0, MAX_TEXT), at);
+    return feishu ? Number(db.prepare('INSERT INTO outbox(created_at, text, next_at) VALUES (?, ?, ?)').run(at, text.slice(0, MAX_TEXT), at).lastInsertRowid) : null;
   };
   /** False when the same ongoing problem was already posted within REPEAT_MS. */
   const fresh = (key: string, at: number): boolean => {
@@ -318,9 +321,9 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
     for (const id of [...stuck.keys()]) if (!seen.has(id)) stuck.delete(id);
   }
 
-  /** Queues a message that does not come from the event log (start, stop, lost lease). */
-  function notify(text: string): void { tx(() => insert(text, now())); }
-  /** Like notify, once per key while the key is kept (the outbox retention period); false when already sent. */
+  /** Queues a message that does not come from the event log (start, stop, lost lease, market alerts); its outbox id, null without a robot. */
+  function notify(text: string): number | null { return tx(() => insert(text, now())); }
+  /** Like notify, once per key while the key is kept (the outbox retention period); false when already sent, true when queued (or only logged without a robot). */
   function notifyOnce(key: string, text: string): boolean { return tx(() => { const at = now(); if (!first(key, at)) return false; insert(text, at); return true; }); }
 
   async function post(text: string): Promise<void> {
@@ -331,13 +334,15 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
   let sending = false;
   /** Sends what is due, oldest first, several messages per post; a failure backs off the whole batch. */
   async function flush(): Promise<void> {
-    if (!feishu || sending) return;
+    if (sending) return;
     sending = true;
     try {
       const at = now();
+      // Kept to the retention also without a robot (an outbox left after its robot was removed).
       db.prepare('DELETE FROM outbox WHERE created_at < ?').run(at - RETENTION_MS);
       db.prepare('DELETE FROM repeats WHERE at < ?').run(at - RETENTION_MS);
       db.prepare('DELETE FROM once WHERE at < ?').run(at - RETENTION_MS);
+      if (!feishu) return;
       const due = db.prepare('SELECT id, text, attempts FROM outbox WHERE sent_at IS NULL AND next_at <= ? ORDER BY id LIMIT ?').all(at, LINES_PER_POST) as { id: number; text: string; attempts: number }[];
       if (!due.length) return;
       const ids = due.map(row => row.id);
@@ -363,6 +368,16 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
       const recent = (db.prepare(`SELECT id, created_at AS createdAt, text, attempts, next_at AS nextAt, sent_at AS sentAt, last_error AS lastError FROM outbox ORDER BY id DESC LIMIT ${STATUS_RECENT}`).all() as unknown as
         { id: number; createdAt: number; text: string; attempts: number; nextAt: number; sentAt: number | null; lastError: string | null }[]);
       return { configured: feishu !== null, pending: counts.pending, retrying: counts.retrying, lastSentAt: sent.at, lastError: failed?.error ?? null, nextRetryAt: failed?.nextAt ?? null, retentionMs: RETENTION_MS, recent };
+    },
+    /** Delivery of queued messages by id (market alert history); an id missing from the result has left the outbox (retention). */
+    delivery(ids: readonly number[]): Map<number, { sentAt: number | null; attempts: number; lastError: string | null; nextAt: number }> {
+      const result = new Map<number, { sentAt: number | null; attempts: number; lastError: string | null; nextAt: number }>();
+      const read = db.prepare('SELECT sent_at AS sentAt, attempts, last_error AS lastError, next_at AS nextAt FROM outbox WHERE id = ?');
+      for (const id of ids) {
+        const row = read.get(id) as { sentAt: number | null; attempts: number; lastError: string | null; nextAt: number } | undefined;
+        if (row) result.set(id, { sentAt: row.sentAt, attempts: row.attempts, lastError: row.lastError, nextAt: row.nextAt });
+      }
+      return result;
     },
     close: (): void => db.close(),
   };

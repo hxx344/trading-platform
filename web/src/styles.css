@@ -178,7 +178,6 @@ table.data.log-table td.log-text{white-space:pre-wrap;word-break:break-word;font
 table.data.history{min-width:0}
 /* The oil page: what the copied workbench trading styles (trading.css) leave to the page itself. */
 .visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
-.oil-page>.callout{margin-bottom:12px}
 .execution-presets.oil-presets{grid-template-columns:repeat(2,minmax(0,1fr))}
 .execution-presets.oil-presets button:disabled{opacity:.55;cursor:not-allowed}
 .execution-review-settings.oil-limits{margin:0 16px;border-top:0}
@@ -230,6 +229,21 @@ table.data.history{min-width:0}
 .aster-desk .options-desk .subnav .count{margin-left:0}
 .aster-desk .options-desk .button{line-height:inherit;white-space:normal}
 .aster-desk .options-desk .button.primary:disabled:hover{background:var(--accent);border-color:transparent}
+/* The monitor page's run switch (MonitorPage.tsx, M-3c): the workbench puts .hub-monitor-controls in its hub's side card;
+   here it sits on the right of the market tab row, so it drops that card's margin and top rule. */
+.monitor-desk .hub-nav-row .hub-monitor-controls{margin:0;border-top:0;min-height:44px}
+.monitor-desk .monitor-main>.hub-control-notice{margin:0 0 12px}
+/* The side navigation (shell.css, docs/frontend.md《导航按工作区组织》): the pages keep the ASTER desk's colours, so
+   that content area fills the height beside the sidebar; the entries are links to the hash routes, not buttons. */
+.app-shell>.workspace>main.aster-desk{flex:1;min-width:0}
+.app-shell>.sidebar a.nav-item:focus-visible{outline-offset:-2px}
+/* The options page's fixed notice (options.css, z-index 20) comes later in the DOM and would cover the open drawer. */
+/* The element selectors outrank shell.css's own z-index rules, which load later. */
+@media(max-width:760px){.app-shell>aside.sidebar{z-index:22}.app-shell>button.nav-backdrop{z-index:21}}
+/* The monitor page's breakpoints count the whole window; beside the 212px side navigation the detail toolbar's refresh area
+   needs to shrink into the rest of the row and wrap inside (as monitor.css lets it below 700px) up to 912px, or it runs past
+   the edge. The toolbar itself does not wrap (monitor.css keeps .detail-toolbar nowrap inside .site-shell). */
+@media(min-width:761px) and (max-width:912px){.monitor-desk .site-shell .refresh-area{flex:1 1 auto;flex-wrap:wrap;justify-content:flex-end}}
 /* CrossEx 页（web/src/crossex，样式来自工作台 modules/crossex/src，见 crossex/crossex.css）。工作台用 style={{ width }} 画的
    条（维持保证金率、盘口深度、双腿数量对比）在本服务的 CSP 下改为 crossex/FillBar.tsx 的 SVG，尺寸与颜色取工作台原规则
    （.kpi .meter i、.book-row>i、.position-quantity-track>span）的值。 */
@@ -243,6 +257,6 @@ table.data.history{min-width:0}
 /* The read-only hard caps sit in the settings disconnect-row (a wrapping flex row); take the full width like its label. */
 .aster-desk .crossex-page .disconnect-row>.ticket-details{width:100%}
 /* aster.css gives .count a 5px left margin the workbench copy never sets (it pushed the tab and filter counts 5px right);
-   put back the workbench value. Its other leaks into CrossEx are invisible: .topbar justify-content (the actions sit at
-   margin-left:auto) and .brand font-weight (the brand is hidden under .hub-embedded); .panel's are all overridden. */
+   put back the workbench value. Its .panel leaks into CrossEx are all overridden; shell.css reaches only its own sidebar and
+   top bar through child selectors (.app-shell > .workspace > .topbar), not CrossEx's .topbar/.brand (hidden under .hub-embedded). */
 .aster-desk .crossex-page .count{margin-left:0}

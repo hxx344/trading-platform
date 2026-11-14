@@ -97,6 +97,15 @@ export function createMonitorStore({ file, now = Date.now }: { file: string; now
       return row ? { value: JSON.parse(row.json) as unknown, updatedAt: row.updated_at } : null;
     },
     writeState,
+    /** One transaction: the values written and the keys removed (an imported alert config replacing the saved one). */
+    commitStates(writes: readonly (readonly [string, unknown])[], removes: readonly string[] = []): void {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        for (const [key, value] of writes) writeState(key, value);
+        for (const key of removes) db.prepare('DELETE FROM monitor_state WHERE key = ?').run(key);
+        db.exec('COMMIT');
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
     close: (): void => db.close(),
   };
 }

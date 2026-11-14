@@ -5,7 +5,7 @@ import { clock, label, stamp } from './labels.ts';
 import { ACTIVE_STATUSES, CONFIRM_ACKNOWLEDGE, CONFIRM_NOT_CREATED, CONFIRM_RELEASE, DEFAULT_FORM, LEAD_TYPES, VENUE_LABEL, describeIntent, leadTypeAllowed, draftLegs, formToIntent, jobActions, type OilForm, type OilIntent, type OilSymbol, type OilVenue } from './oil-form.ts';
 import type { OilBook, OilConfirmResult, OilJob, OilMarket, OilPositionAccount, OilPreview, OilState } from './oil-types.ts';
 import { RequestIds } from './request-ids.ts';
-import { Callout, StatePanel } from './StateViews.tsx';
+import { StatePanel } from './StateViews.tsx';
 import { OilPnl } from './OilPnl.tsx';
 import { OilRules } from './OilRules.tsx';
 import { useLiveResource, type LiveResource } from './use-live-resource.ts';
@@ -183,7 +183,7 @@ function PreviewCard({ preview, limits, busy, unknown, onConfirm, onEdit }: { pr
         <td data-label="买一 / 卖一">{leg.quote.bid} / {leg.quote.ask}<small>{clock(leg.quote.receivedAt)}</small></td>
       </tr>)}</tbody>
     </table></div>
-    <p className="execution-help">首腿按所选方式下单：市价时以价格保护界限为 IOC 限价，超出界限的部分不成交；追价时界限是最高追价（卖出时为最低），本地追价自填界限时以自填为准。对冲腿在首腿成交后按市价跟上，不受界限约束，它的界限只在首腿发出前核对一次。{limits ? `单笔上限 ${limits.perJob} USDT；${preview.intent.action === 'open' ? `24 小时开仓已用 ${limits.openUsed} / ${limits.openPer24h} USDT。` : '平仓不计入 24 小时开仓额度。'}` : ''}</p>
+    <p className="execution-help">首腿按所选方式下单：市价时以价格保护界限为 IOC 限价，超出界限的部分不成交；追价时界限是最高追价（卖出时为最低），本地追价自填界限时以自填为准。对冲腿在首腿成交后按市价跟上，不受界限约束，它的界限只在首腿发出前核对一次。{limits ? `单笔上限 ${limits.perJob} USDT；${preview.intent.action === 'open' ? `24 小时开仓已用 ${limits.openUsed} / ${limits.openPer24h} USDT。` : '平仓不计入 24 小时开仓额度。'}` : ''}同一账户请勿同时在工作台下原油单或开启原油自动规则。</p>
     {preview.notes.length ? <ul className="execution-review-notes">{preview.notes.map((note, index) => <li key={index}>{note}</li>)}</ul> : null}
     {/* An unanswered confirm is checked by clicking confirm again with the same request id: the executor answers it by that id whether or not the preview has expired since. */}
     {unknown ? <p className="execution-warning">上次确认没有收到应答，可能已受理：请先再点“确认并实盘{action}”核对（沿用同一请求编号，不会重复下单）。</p>
@@ -454,7 +454,6 @@ export function OilPage({ onExpired }: { onExpired: () => void }) {
   const missing = state.error && statusOf(state.error) === 404;
   if (missing) return <StatePanel kind="empty" title="本服务没有配置原油执行" detail="在 config.json 写入 oil（或在「设置」页「从工作台导入」勾选原油执行账户）后重启服务。" />;
   return <div className="trading-page oil-page">
-    <Callout tone="error" role="status">实盘：确认执行会在真实 Binance / Bybit 账户下单。首腿成交后对冲腿按市价跟上；任务受单笔与 24 小时开仓名义金额上限约束。同一账户请勿同时在工作台下原油单或开启原油自动规则。</Callout>
     <div className="trading-trade-top">
       <MarketPanel live={market} />
       {state.data ? <PositionsPanel state={state.data} stale={stale} /> : null}

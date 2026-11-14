@@ -316,3 +316,24 @@ test('原油盈亏库：读取时刻早于区间起点的账户在该点不累�
     pnl.close();
   } finally { s.done(); }
 });
+
+test('原油盈亏库：晚到的账单早于已有账单时重建累计和，只改变读取时刻在它之后的采样', async () => {
+  const s = storeSetup();
+  try {
+    const pnl = s.open();
+    await pnl.syncLedgers();
+    const t1 = T0 + MINUTE + 10_000, t2 = T0 + 2 * MINUTE + 10_000;
+    s.a.ledger = [entry('later', t2, 'fee', '-2')];
+    s.clock.now = T0 + MINUTE; await pnl.sample();
+    s.clock.now = T0 + 2 * MINUTE; await pnl.sample();
+    s.clock.now = T0 + 3 * MINUTE; await pnl.sample();
+    s.clock.now = T0 + 4 * MINUTE; await pnl.syncLedgers();
+    const totals = () => (pnl.read({ range: '1d' }) as View).points.map(point => point.totalPnl === null ? null : Number(point.totalPnl));
+    assert.deepEqual(totals(), [0, 0, -2]);
+    // A row earlier than the stored one arrives within the re-read: only the samples read after it change.
+    s.a.ledger.push(entry('late', t1, 'funding', '0.5'));
+    s.clock.now = T0 + 5 * MINUTE; await pnl.syncLedgers();
+    assert.deepEqual(totals(), [0, 0.5, -1.5]);
+    pnl.close();
+  } finally { s.done(); }
+});

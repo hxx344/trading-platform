@@ -201,8 +201,11 @@ export function createOilPnl({ file, connectors, accounts, now = Date.now, pnlTi
    */
   let dirtyFrom: number | null = null;
   function ledgerChanged(key: string, added: LedgerEntry[]): void {
-    const from = Math.min(...added.map(entry => entry.time)), prefix = prefixes?.[keys.indexOf(key)];
-    // Rows no earlier than the account's last one (the usual case: the last minutes) extend its sums; others rebuild them.
+    let from = Infinity;
+    for (const entry of added) if (entry.time < from) from = entry.time;
+    const prefix = prefixes?.[keys.indexOf(key)];
+    // Rows no earlier than the account's last one extend its sums; earlier ones (a late row, or the second symbol's rows
+    // interleaved with the first's in the same round) rebuild them from the store when next needed, at most once a round.
     if (prefix && (prefix.times.at(-1) ?? -Infinity) <= from) {
       for (const entry of [...added].sort((x, y) => x.time - y.time)) {
         prefix.times.push(entry.time);

@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A manual run also measures each test file on a runner, for scripts/test-durations.json.
+  workflow_dispatch:
 permissions:
   contents: read
 # A new push to a PR supersedes its running checks. Each run on main gets its own group, so none is queued or cancelled.
@@ -10,44 +12,61 @@ concurrency:
   group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  # Each job below runs in parallel; the slowest decides the run's wall time, so the long suites are split into shards.
   check:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.15.0
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm check
-      - run: pnpm build:web
+      - uses: ./.github/actions/setup
+      # The same two projects as "check" in package.json (keep them in step), side by side; both report before a failure.
+      - name: tsc（两个项目）
+        run: |
+          node_modules/.bin/tsc -p tsconfig.json &
+          server=$!
+          node_modules/.bin/tsc -p web/tsconfig.json || { wait "$server" || true; exit 1; }
+          wait "$server"
+
+  # Needs no Node, so it skips the setup the other jobs share.
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
       - run: shellcheck deploy/*.sh
       - run: python3 -I -B deploy/main-watch/test_main_watch.py
-      - run: bash deploy/test-install.sh
 
-  # The test suite is the longest step; node --test splits its files into shards that run in parallel with the job above.
+  # deploy/test-install.sh in its three independent parts; each starts from its own first install.
+  install:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      # The package and its config check include the built page.
+      - run: npm run build:web
+      - run: bash deploy/test-install.sh ${{ matrix.part }}
+
+  # scripts/test.ts deals the test files into shards by their CI durations (scripts/test-durations.json).
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.15.0
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup
       # Some tests start the service, whose config check requires the built page.
-      - run: pnpm build:web
-      - run: pnpm test
+      - run: npm run build:web
+      - run: npm test
         env:
-          TEST_SHARD: ${{ matrix.shard }}/2
+          TEST_SHARD: ${{ matrix.shard }}/6
 
   # The second server's watchdog (docs/watch.md) installed on a real systemd: units, sandbox, alert round, upgrade, uninstall.
   watch:
@@ -64,3 +83,19 @@ jobs:
             sudo chmod go-w "$path"
           done
       - run: sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin TP_WATCH_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-watch-systemd.sh
+
+  durations:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - run: npm run build:web
+      - run: node scripts/test.ts --measure
+      # Uploaded even when a file failed: that file keeps its old duration, and the job still fails.
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-durations
+          path: scripts/test-durations.json

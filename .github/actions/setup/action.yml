@@ -1,0 +1,20 @@
+name: setup
+description: Node 24.15.0 and node_modules. A cache hit on the lockfile skips pnpm entirely; package.json scripts then run through npm run.
+runs:
+  using: composite
+  steps:
+    - id: node
+      uses: actions/setup-node@v4
+      with:
+        node-version: 24.15.0
+    # Exact key only: a node_modules from another lockfile is never restored.
+    - id: modules
+      uses: actions/cache@v4
+      with:
+        path: node_modules
+        key: node-modules-${{ runner.os }}-${{ runner.arch }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('pnpm-lock.yaml', 'package.json') }}
+    - if: steps.modules.outputs.cache-hit != 'true'
+      uses: pnpm/action-setup@v4
+    - if: steps.modules.outputs.cache-hit != 'true'
+      shell: bash
+      run: pnpm install --frozen-lockfile

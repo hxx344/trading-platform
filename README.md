@@ -61,7 +61,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
   - **登录**：`sudo bash install.sh --set-password` 设置登录密码（输入两次、不回显，只保存 scrypt 摘要到 `/etc/trading-platform/login-password`；沿用当前已装版本，不联网升级；脚本化时加 `--password-stdin` 从标准输入读一行；更换密码同样执行，已登录的浏览器须重新登录），之后页面输入密码即可。连续输错 5 次后锁定 30 秒，每再错一次锁定时间加倍，最长 15 分钟；一小时没有输错就重新计数。`sudo cat /var/lib/trading-platform/access-url` 里的登录链接始终可用（也会解除锁定）；删除 `login-password` 再执行一次安装脚本即取消密码。登录状态保留 30 天，服务重启（升级、页面导入）后不用重新登录。
   - 页面固定有四页，按配置另有模块页：
     - 「配对组」（配对开关、两侧余额与走势、持仓、ADL 处理、划转与 ADL 历史、结算依据）
-    - 「运行状态」（后台循环、数据库、请求权重、推送连接、飞书发件箱与定时摘要）
+    - 「运行状态」（后台循环、数据库、请求权重、推送连接、飞书发件箱与定时摘要；开了副服务器巡检心跳时多一栏送达情况）
     - 「日志」（服务日志，与 `journalctl -u trading-platform` 相同，可只看告警与问题；数据目录 `logs.sqlite` 保留 14 天、最多 5 万行，删掉只丢页面上的日志）
     - 「设置」（每个配对的划转参数与 ADL 设置、从工作台导入）
     - 配置了原油执行账户时多一个「原油」页（价差与盘口、持仓、额度、下单预览与实盘确认、任务与人工处理、自动开平仓，以及原油总盈亏：每分钟记录持仓浮盈亏、每 5 分钟同步资金费 / 平仓盈亏 / 手续费账单，存在数据目录的 `oil-pnl.sqlite`，这个文件打不开时只是不显示盈亏，其余照常）
@@ -78,7 +78,11 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
   - 就绪的条件：服务没在停止、持有写入租约，并且「运行状态」页列出的每个循环最近 3 分钟内都完成过一轮。这些循环是划转、ADL、持仓读取，以及历史清理（配了原油执行账户时换成两腿任务循环）。刚启动、还有循环没完成第一轮时是 503。原油规则、期权、行情监控、资产、飞书发件、用户推送等其他后台循环不参与判定。
   - 它判断的是进程在运行、持有租约、这些循环没卡住，**发现不了交易所连不上**：划转、ADL、持仓读取单轮里的交易所报错都记在各自的状态与事件里，这一轮仍算完成，接口照样是 200；这类故障由服务自己的飞书告警和页面提示处理。例外是配了原油、有未结束的两腿任务且交易所持续超时的时候，两腿任务循环一轮可能超过 3 分钟，接口会暂时变成 503。
   - 只支持 GET（HEAD、OPTIONS 等方法照旧要登录，返回 401）。接口只在服务监听的地址上可达（`127.0.0.1` 与 `config.json` 的 `host`），Host 头检查照旧（须是本机回环地址或 `config.json` 的 `host`），不需要也不应该为它对公网开放端口。
-  - 配合工作台的 main-watch：副服务器与本机在同一 Tailscale 网络时，把 `http://<本机 Tailscale IP>:4720/api/ready` 加进副服务器 `/etc/main-watch/config` 的 `CHECKS`；用心跳模式时，在本机安装推送端（工作台的 `install-main-watch.sh --sender`）时加 `--ready-url http://127.0.0.1:4720/api/ready`；一个推送端只探测一个就绪地址，本机还有工作台要探测时两者只能选一个，另一个走副服务器的 `CHECKS`。
+  - 副服务器能直连本机（例如同在一个 Tailscale 网络）时，可以让副服务器的巡检直接探测 `http://<本机 Tailscale IP>:4720/api/ready`（`install-watch.sh --main <本机 Tailscale IP>:4720`）。连不到时用下一条的心跳。
+- 副服务器巡检心跳（v0.47.0 起，见 [docs/watch.md](docs/watch.md)）：本服务每 30 秒向副服务器推送一次签名心跳，带上是否就绪；副服务器 90 秒收不到或收到“未就绪”算一次失败，连续 3 次（约 3～5 分钟）发飞书告警。主服务器只有出站连接，不用开端口，也不用另装程序。
+  - 副服务器：`curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/install-watch.sh && sudo bash install-watch.sh --heartbeat-listen 0.0.0.0:8792 --webhook <飞书机器人地址> --name 统一交易平台`，安全组放行 TCP 8792、来源只填本机公网 IP。已部署过（含工作台版本的 main-watch）时不带参数执行即升级，配置保留。
+  - 本机：执行副服务器脚本结束时打印的命令 `sudo bash install.sh --watch-url http://<副服务器 IP>:8792/heartbeat --watch-token <令牌>`。本机装过工作台推送端的，用 `sudo bash install.sh --watch-import` 直接沿用它的地址与令牌，并停用它（之后副服务器只收到本服务的就绪情况，工作台不再上报）。关闭用 `sudo bash install.sh --watch-off`。这几个开关沿用当前已装版本，不联网升级。
+  - 核对：页面「运行状态」→「副服务器巡检心跳」；副服务器上 `sudo main-watch probe`。
 - 飞书定时运行摘要（照工作台的「ASTER 运行摘要」卡片）：默认每 60 分钟一张，服务首次启动约 2 分钟后发第一张；重启沿用下次发送时间，停机错过的周期只补发一张（启动约 2 分钟后，等持仓与余额读到再发），不逐期补发。发往 `secrets.json` 的 `feishuScheduled` 机器人（格式同 `feishu`：`{"webhook": "…", "secret": "…"}`；页面导入新配对时从工作台的 `FEISHU_SCHEDULED_WEBHOOK_URL` / `FEISHU_SCHEDULED_SIGN_SECRET` 带过来），没有时发往告警机器人 `feishu`。间隔在页面「设置」→「飞书定时运行摘要」修改（1–1440 分钟，0 关闭，保存后以页面为准、重启保留），那里也能「立即发送一张」；没在页面改过时用 `config.json` 的 `"summary": {"intervalMinutes": 30}`（改完执行一次 `sudo bash install.sh`）。换了机器人（例如补上 `feishuScheduled`）后，重启约 2 分钟会先发一张到新机器人。只有原油、没有配对时不发。
 
 配对接管与回退步骤见 [docs/plan.md](docs/plan.md) 第 4 节。
@@ -89,6 +93,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 | 回退到早于 | 回退前要做的事 | 说明 | 详见 |
 | --- | --- | --- | --- |
+| v0.47.0 | 开了巡检心跳的先执行 `sudo bash install.sh --watch-off` | 旧版本不认识 `config.json` 与 `secrets.json` 的 `watch`，配置检查会失败；关闭后副服务器收不到心跳会告警，改用直连探测或卸载副服务器巡检 | [docs/watch.md](docs/watch.md) |
 | v0.46.0 | 不用改配置。副服务器巡检（main-watch）指向了 `/api/ready` 的，先改回 `tcp://<地址>:4720`（设了登录密码时也可以用 `http://<地址>:4720/login`，没设密码时它返回 401） | 旧版本没有 `/api/ready`，不登录访问返回 401，巡检会持续告警 | 《部署》的外部巡检一条 |
 | v0.36.0 | 从 `config.json` 删掉 `monitor.perpetual`（只配了合约价差时删掉整个 `monitor`） | 旧版本不认识 `perpetual`；`monitor.sqlite` 里的 `control.perpetual` 旧版本忽略 | [docs/monitor.md](docs/monitor.md) M-4a |
 | v0.30.0 | 从 `secrets.json` 删掉 `feishuMonitor` | 旧版本按白名单读密钥；`monitor.sqlite` 里待应用的导入与“已导入”记录旧版本忽略；`notify-monitor.sqlite` 留在数据目录，其中未送达的行情告警不再发送 | [docs/monitor.md](docs/monitor.md) M-3b |
@@ -113,4 +118,4 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 ## 来源
 
-执行器代码迁自 project-aggregation `platform/executor`（提交 `62b6067`），ASTER 签名与划转探测迁自其 `server/contract-probes`，资产账本的计算口径与页面样式复制自其 `modules/asset`（提交 `0014655`）。工作台只作历史参考，本仓库不回写工作台数据。
+执行器代码迁自 project-aggregation `platform/executor`（提交 `62b6067`），ASTER 签名与划转探测迁自其 `server/contract-probes`，资产账本的计算口径与页面样式复制自其 `modules/asset`（提交 `0014655`），副服务器巡检程序与安装脚本复制自其 `tools/main-watch` 与 `deploy/install-main-watch.sh`（提交 `7745181`）。工作台只作历史参考，本仓库不回写工作台数据。

@@ -34,6 +34,8 @@ export interface RunContext {
   stopped(): boolean;
   /** A wait that shutdown cuts short. */
   pause(ms: number): Promise<void>;
+  /** Why /api/ready would answer 503 right now, or null when ready; for the heartbeat pushed to an outside watchdog. */
+  notReady(): string | null;
 }
 
 export interface RunOptions {
@@ -106,13 +108,20 @@ export function runExecutor({ executor, store, dir, port, listen, password, list
     const timer = setTimeout(wake, ms);
     sleepers.add(wake);
   });
-  const context: RunContext = { stopped: () => stopping || executor.retired, pause };
   const startedAt = Date.now();
   /** Per loop, for the status page: its last good round and its failures in a row; okTick is that round on the monotonic clock. */
   const loopStatus = new Map<string, { lastOkAt: number | null; okTick: number | null; failures: number; lastError: string | null; lastErrorAt: number | null }>();
   const loopOk = (label: string) => { const row = loopStatus.get(label); if (row) { row.lastOkAt = Date.now(); row.okTick = performance.now(); row.failures = 0; } };
   const loopFailed = (label: string, error: string) => { const row = loopStatus.get(label); if (row) { row.failures += 1; row.lastError = error.slice(0, 300); row.lastErrorAt = Date.now(); } };
   const loopTracked = (label: string) => { loopStatus.set(label, { lastOkAt: null, okTick: null, failures: 0, lastError: null, lastErrorAt: null }); };
+  const notReady = (): string | null => {
+    if (stopping) return '服务正在停止';
+    if (executor.retired) return '已失去写入租约';
+    const tick = performance.now();
+    const stuck = [...loopStatus].filter(([, row]) => !loopsReady([row], tick)).map(([name, row]) => row.okTick === null ? `${name}尚未完成一轮` : `${name}已 ${Math.round((tick - row.okTick) / 1000)} 秒未完成一轮`);
+    return stuck.length ? stuck.join('；') : null;
+  };
+  const context: RunContext = { stopped: () => stopping || executor.retired, pause, notReady };
   // Each pass runs on its own schedule, so a venue that answers slowly holds up only its own loop (2.4a).
   // A loop that no longer runs must not keep the lease alive: exit and let another instance take over.
   const passLoop = (label: string, pass: () => Promise<void>) => (async () => {
@@ -142,7 +151,7 @@ export function runExecutor({ executor, store, dir, port, listen, password, list
       ...(views?.status?.() ?? {}),
     };
   };
-  const ready = (): boolean => !stopping && !executor.retired && loopsReady(loopStatus.values(), performance.now());
+  const ready = (): boolean => notReady() === null;
   const server = createExecutorServer({ executor, accessToken, log, ready, ...(listen ? { host: listen.urlHost } : {}), ...(password ? { password } : {}), ...(page ? { page } : {}), ...(app ? { app } : {}), ...(session ? { session, sessionMaxAgeS: SESSION_MAX_AGE_S } : {}), ...(imports ? { imports } : {}), views: { ...views, status } });
   // The chosen address feeds the same HTTP server, so both share one session, one login throttle and one Host check.
   const extra = listen ? createNetServer(socket => { server.emit('connection', socket); }) : null;

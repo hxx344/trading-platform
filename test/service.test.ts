@@ -590,6 +590,50 @@ test('服务进程：本机页面只含 ASTER 部分，状态接口可读，用�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('服务进程：配了巡检心跳时按间隔推送签名心跳，先报未就绪的原因、转起来后报就绪；状态里有送达情况而没有令牌', async () => {
+  const dir = tempDir();
+  const fake = new FakeAster();
+  const { createServer } = await import('node:net');
+  const { createHmac } = await import('node:crypto');
+  const port = await new Promise<number>(resolve => { const probe = createServer().listen(0, '127.0.0.1', () => { const { port } = probe.address() as { port: number }; probe.close(() => resolve(port)); }); });
+  const { startService } = await import('../src/service/main.ts');
+  const { readFileSync } = await import('node:fs');
+  const token = 'service-watch-token-0123456789abcdefgh';
+  const url = 'http://203.0.113.9:8792/heartbeat';
+  const beats: { ready: boolean; detail: string; signed: boolean }[] = [];
+  try {
+    const run = await startService({
+      config: parseServiceConfig({ ...configRaw(), watch: { url } }), secrets: { accounts: new Map([['main', MAIN], ['a', LONG], ['b', SHORT]]), feishu: null, watch: { token } },
+      dir: join(dir, 'data'), port, fetchImpl: fake.fetch, app: APP,
+      connect: target => { const socket = new FakeSocket(target); queueMicrotask(() => socket.emit('open')); return socket; },
+      watchOptions: {
+        firstMs: 0, intervalMs: 1_000,
+        fetchImpl: async (target, init) => {
+          const body = String(init.body), beat = JSON.parse(body) as { ready: boolean; detail: string };
+          beats.push({ ready: beat.ready, detail: beat.detail, signed: target === url && (init.headers as Record<string, string>)['X-Main-Watch-Signature'] === createHmac('sha256', token).update(body).digest('hex') });
+          return new Response(null, { status: 204 });
+        },
+      },
+    });
+    for (let i = 0; i < 300 && !beats.some(beat => beat.ready); i++) await new Promise(resolve => setTimeout(resolve, 20));
+    assert.ok(beats.every(beat => beat.signed), '每一条都签了名');
+    assert.ok(beats.some(beat => beat.ready), `各循环转起来后报就绪：${JSON.stringify(beats)}`);
+    for (const beat of beats.filter(item => !item.ready)) assert.match(beat.detail, /尚未完成一轮/, '未就绪时带原因');
+    let link = '';
+    for (let i = 0; i < 100 && !link; i++) { try { link = readFileSync(join(dir, 'data', 'access-url'), 'utf8').trim(); } catch { await new Promise(resolve => setTimeout(resolve, 20)); } }
+    const cookie = (await fetch(link, { redirect: 'manual' })).headers.get('set-cookie')!.split(';')[0]!;
+    const response = await fetch(`http://127.0.0.1:${port}/api/status`, { headers: { cookie } });
+    const text = await response.text();
+    const status = JSON.parse(text) as { watch: { url: string; lastOkAt: number | null; lastReady: boolean | null; failures: number } };
+    assert.deepEqual([status.watch.url, status.watch.failures, status.watch.lastReady, typeof status.watch.lastOkAt], [url, 0, true, 'number']);
+    assert.ok(!text.includes(token), '状态里不出现令牌');
+    await run.shutdown();
+    await run.done;
+    const sent = beats.length;
+    await new Promise(resolve => setTimeout(resolve, 1_200));
+    assert.equal(beats.length, sent, '停止后不再推送');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 test('服务进程：没有配对也启动，页面导入接口可用；重启后沿用同一页面会话', async () => {
   const dir = tempDir();
   const fake = new FakeAster();

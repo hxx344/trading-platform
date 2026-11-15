@@ -29,6 +29,12 @@
 #                                             工作台未连接、还有未结束的执行 / 订单 / 挂单或缺 UID 时拒绝；可与其他导入项同用
 #   sudo bash install.sh --set-password       设置或更换页面登录密码（输入两次，不回显；只存 scrypt 摘要，已登录的页面须重新登录；
 #                                             沿用当前已装版本，不联网升级；脚本化时加 --password-stdin 从标准输入读一行）
+#   sudo bash install.sh --watch-url <地址> --watch-token <令牌>
+#                                             开启副服务器巡检心跳：每 30 秒向副服务器 main-watch 的心跳地址（如 http://<副服务器 IP>:8792/heartbeat）
+#                                             推送签名心跳；地址与令牌由副服务器的 install-watch.sh 打印。只换地址时可不带 --watch-token
+#   sudo bash install.sh --watch-import       同上，地址与令牌取自本机工作台版本的心跳推送端配置 /etc/main-watch/sender，并停用那个推送端
+#   sudo bash install.sh --watch-off          关闭巡检心跳（回退到 v0.46.0 及更早版本前须先执行）。这三项与 --set-password 一样
+#                                             沿用当前已装版本、不联网升级（已装版本早于 v0.47.0 时先升级到最新版）
 #
 # 页面总在 127.0.0.1 监听（用 SSH 隧道打开）；在 config.json 写 "host": "<本机 Tailscale IP>" 后也在该地址监听，直接打开。
 # 删除 /etc/trading-platform/login-password 再执行本脚本即取消密码，只能用数据目录 access-url 里的链接登录。
@@ -54,6 +60,8 @@ RELEASE_BASE=${TP_RELEASE_BASE:-https://github.com/$REPO/releases}
 # 测试模式：不要求 root、不建系统账号、不改属主、不调用 systemctl；只用于仓库自带的安装测试。
 TEST_MODE=${TP_TEST_MODE:-0}
 WORKBENCH_ENV=${TP_WORKBENCH_ENV:-/etc/project-aggregation.env}
+# The workbench's heartbeat sender on this machine (its install-main-watch.sh --sender), read by --watch-import.
+WATCH_SENDER=${TP_WATCH_SENDER:-/etc/main-watch/sender}
 # The page's import requests: root owns it, the service's group writes requests, the root helper writes results.
 IMPORT_DIR=${TP_IMPORT_DIR:-/var/lib/trading-platform-import}
 UNIT_DIR=$(dirname "$UNIT_FILE")
@@ -82,7 +90,7 @@ restore_import() {
   if ((${#failed[@]} == 0)); then log "已恢复${backup_what}前的配置文件。"
   else printf '恢复%s前的配置失败：%s 可能仍是%s后的内容，请检查后手工改回\n' "$backup_what" "$(join "${failed[@]}")" "$backup_what" >&2; fi
 }
-usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 version=''
 package_dir=''
@@ -100,6 +108,10 @@ import_crossex=0
 asset_owner=''
 set_password=0
 password_stdin=0
+watch_url=''
+watch_token=''
+watch_import=0
+watch_off=0
 while (($#)); do
   case "$1" in
     --import-workbench) import_workbench=1; shift ;;
@@ -116,6 +128,10 @@ while (($#)); do
     --crossex) import_crossex=1; shift ;;
     --set-password) set_password=1; shift ;;
     --password-stdin) password_stdin=1; shift ;;
+    --watch-url) [[ $# -ge 2 && -n "$2" ]] || usage 2; watch_url=$2; shift 2 ;;
+    --watch-token) [[ $# -ge 2 && -n "$2" ]] || usage 2; watch_token=$2; shift 2 ;;
+    --watch-import) watch_import=1; shift ;;
+    --watch-off) watch_off=1; shift ;;
     --version) [[ $# -ge 2 ]] || usage 2; version=$2; shift 2 ;;
     --package) [[ $# -ge 2 ]] || usage 2; package_dir=$2; shift 2 ;;
     -h|--help) usage 0 ;;
@@ -135,6 +151,12 @@ done
 ((import_asset)) || [[ -z "$asset_owner" ]] || fail '--asset-owner 须和 --asset 一起使用'
 ((import_workbench || !import_crossex)) || fail '--crossex 须和 --import-workbench 一起使用'
 ((set_password || !password_stdin)) || fail '--password-stdin 须和 --set-password 一起使用'
+watch_change=0
+if [[ -n "$watch_url" ]] || ((watch_import || watch_off)); then watch_change=1; fi
+[[ -z "$watch_url" ]] || ((!watch_import && !watch_off)) || fail '--watch-url、--watch-import、--watch-off 只能用一个'
+((!watch_import || !watch_off)) || fail '--watch-url、--watch-import、--watch-off 只能用一个'
+[[ -z "$watch_token" || -n "$watch_url" ]] || fail '--watch-token 须和 --watch-url 一起使用'
+[[ -z "$watch_token" || "$watch_token" =~ ^[A-Za-z0-9_-]{32,256}$ ]] || fail '--watch-token 须为 32~256 位字母、数字、- 或 _（副服务器 /etc/main-watch/config 的 HEARTBEAT_TOKEN）'
 
 [[ "$(uname -s)" == Linux ]] || fail '只支持 Linux。'
 if [[ "$TEST_MODE" != 1 ]]; then
@@ -186,9 +208,14 @@ trap 'trap "" INT TERM HUP; restore_import; rm -rf "$work_dir"' EXIT
 trap 'exit 130' INT TERM HUP
 
 # ---- 1. 校验清单与程序包 ----------------------------------------------------------
-# Changing only the password keeps the installed release: nothing is downloaded and the program does not change.
+# Changing only the password or the heartbeat keeps the installed release: nothing is downloaded and the program does
+# not change. An installed release from before the heartbeat existed cannot switch it, so that case takes the latest.
 installed_sha=$(cat "$APP_DIR/current/.package-sha256" 2>/dev/null || true)
-if ((set_password)) && [[ -z "$version$package_dir" && "$installed_sha" =~ ^[a-f0-9]{64}$ ]]; then
+keep_installed=0
+if [[ -z "$version$package_dir" && "$installed_sha" =~ ^[a-f0-9]{64}$ ]]; then
+  if ((set_password)) || { ((watch_change)) && [[ -f "$APP_DIR/current/src/service/watch-config.ts" ]]; }; then keep_installed=1; fi
+fi
+if ((keep_installed)); then
   printf '%s  trading-platform.tar.gz\n' "$installed_sha" >"$work_dir/SHA256SUMS"
   source_label='当前已装版本'
   [[ "$(cat "$APP_DIR/releases/${installed_sha:0:16}/.package-sha256" 2>/dev/null)" == "$installed_sha" ]] || fail '找不到当前已装版本的目录，请加 --version 或 --package 指定要用的版本'
@@ -276,6 +303,25 @@ for name in config secrets; do
   example="$release_dir/deploy/$name.example.json"
   if ! cmp -s "$example" "$CONF_DIR/$name.example.json"; then install -m 644 "$example" "$CONF_DIR/$name.example.json"; fi
 done
+# Saves config.json and the key file it names (always in this directory) the first time it is called, so that whatever
+# an import or a heartbeat change writes can be put back; $1 names the change for the messages.
+backup_conf_files() {
+  local name
+  if [[ ! -d "$work_dir/conf-before" ]]; then
+    mkdir "$work_dir/conf-before"
+    {
+      printf '%s\n' config.json secrets.json
+      if [[ -f "$CONF_DIR/config.json" ]]; then
+        "$NODE_BIN" -e 'try { const v = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).secretsFile; const p = require("path"); if (typeof v === "string" && p.dirname(p.resolve(v)) === p.resolve(process.argv[2])) process.stdout.write(p.basename(v) + "\n"); } catch {}' "$CONF_DIR/config.json" "$CONF_DIR"
+      fi
+    } | sort -u >"$work_dir/conf-before/.files"
+    while IFS= read -r name; do
+      if [[ -f "$CONF_DIR/$name" ]]; then cp -p "$CONF_DIR/$name" "$work_dir/conf-before/$name"; fi
+    done <"$work_dir/conf-before/.files"
+  fi
+  import_backup="$work_dir/conf-before"
+  backup_what=${backup_what:+$backup_what与}$1
+}
 # Run as root: it reads the workbench's database and environment, and writes both files as root 600; the takeover
 # below then hands them to the service account. A failed import writes nothing and stops the install.
 if ((import_workbench)); then
@@ -288,19 +334,7 @@ if ((import_workbench)); then
   if ((import_monitor_paper)); then grep -q 'readWorkbenchPaper' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --monitor-paper，请用最新版本导入"; fi
   if ((import_asset)); then grep -q 'readWorkbenchAsset' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --asset，请用最新版本导入"; fi
   if ((import_crossex)); then grep -q 'readWorkbenchCrossex' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --crossex，请用最新版本导入"; fi
-  # The files the import may write: config.json and the key file it names (always in this directory).
-  mkdir "$work_dir/conf-before"
-  {
-    printf '%s\n' config.json secrets.json
-    if [[ -f "$CONF_DIR/config.json" ]]; then
-      "$NODE_BIN" -e 'try { const v = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).secretsFile; const p = require("path"); if (typeof v === "string" && p.dirname(p.resolve(v)) === p.resolve(process.argv[2])) process.stdout.write(p.basename(v) + "\n"); } catch {}' "$CONF_DIR/config.json" "$CONF_DIR"
-    fi
-  } | sort -u >"$work_dir/conf-before/.files"
-  while IFS= read -r name; do
-    if [[ -f "$CONF_DIR/$name" ]]; then cp -p "$CONF_DIR/$name" "$work_dir/conf-before/$name"; fi
-  done <"$work_dir/conf-before/.files"
-  import_backup="$work_dir/conf-before"
-  backup_what='导入'
+  backup_conf_files 导入
   import_args=(--config "$CONF_DIR/config.json" --workbench-env "$WORKBENCH_ENV")
   [[ -z "$workbench_data" ]] || import_args+=(--workbench-data "$workbench_data")
   [[ -z "$import_pairs" ]] || import_args+=(--pairs "$import_pairs")
@@ -347,6 +381,21 @@ if [[ ! -e "$CONF_DIR/config.json" && ! -L "$CONF_DIR/config.json" ]]; then
       "$CONF_DIR/config.json" "$CONF_DIR/secrets.json" || fail '无法生成空配置'
     changes+=('空配置（在页面导入配对）')
   fi
+fi
+# The heartbeat for the second server's main-watch (docs/watch.md): the address goes into config.json, the token into the
+# key file. Run as root like the import; the token reaches the program on stdin, not on its command line.
+if ((watch_change)); then
+  [[ -f "$release_dir/src/service/watch-config.ts" ]] || fail "版本 $new_version 不支持巡检心跳（v0.47.0 起提供），请用最新版本"
+  [[ -f "$CONF_DIR/config.json" ]] || fail "尚无 $CONF_DIR/config.json，无法设置巡检心跳"
+  backup_conf_files 设置巡检心跳
+  if ((watch_off)); then watch_args=(--off)
+  elif ((watch_import)); then watch_args=(--from-sender "$WATCH_SENDER")
+  else watch_args=(--url "$watch_url"); fi
+  set_watch() { (cd / && "$NODE_BIN" "$release_dir/src/service/watch-config.ts" --config "$CONF_DIR/config.json" "${watch_args[@]}" 9>&-); }
+  # Only --url reads the token line; the others get no pipe, whose writer could fail once they have exited.
+  if [[ -n "$watch_url" ]]; then printf '%s\n' "$watch_token" | set_watch || fail '设置巡检心跳失败'
+  else set_watch </dev/null || fail '设置巡检心跳失败'; fi
+  watch_token=''
 fi
 configured=0
 if [[ -f "$CONF_DIR/config.json" ]]; then
@@ -539,7 +588,7 @@ else
         previous_version=$(head -n1 "$previous_dir/VERSION" 2>/dev/null || echo 上一版本)
         # A config only the new version reads (say "host") would leave the old one unable to start: stay instead.
         if ! previous_check=$(as_service "$NODE_BIN" "$previous_dir/src/service/main.ts" --config "$CONF_DIR/config.json" --check-config 2>&1); then
-          fail "新版本 $new_version 启动失败；上一版本 $previous_version 不接受当前配置（$previous_check），未回退。请按上面的日志处理后重新执行本脚本；要回退，先删去 config.json 里新版本才有的字段（如 host）再执行 --version"
+          fail "新版本 $new_version 启动失败；上一版本 $previous_version 不接受当前配置（$previous_check），未回退。请按上面的日志处理后重新执行本脚本；要回退，先删去 config.json 里新版本才有的字段（如 host；开了巡检心跳的先执行 --watch-off）再执行 --version"
         fi
         ( trap '' INT TERM HUP; switch_to "$previous_dir" )
         rollback_unit=0
@@ -570,6 +619,17 @@ import_backup=''
 trap 'exit 130' INT TERM HUP
 trap - PIPE
 if ((interrupted)); then log '已收到停止信号；服务已正常运行，安装已完成。'; fi
+
+# The workbench's sender on this machine, when it pushes to the same receiver: the receiver takes the newest beat, so the
+# two would alternate with different answers. Only its timer is switched off; its files stay.
+if ((watch_change && !watch_off && configured)) && [[ "$TEST_MODE" != 1 && -f "$WATCH_SENDER" ]] && systemctl is-enabled --quiet main-watch-sender.timer 2>/dev/null; then
+  pushed_to=$("$NODE_BIN" -e 'try { const w = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).watch; if (w && typeof w.url === "string") process.stdout.write(w.url); } catch {}' "$CONF_DIR/config.json")
+  sender_to=$(sed -n 's/^[[:space:]]*HEARTBEAT_URL[[:space:]]*=[[:space:]]*//p' "$WATCH_SENDER" | tail -n 1 | tr -d "\"' ")
+  if [[ -n "$pushed_to" && "$pushed_to" == "$sender_to" ]]; then
+    if systemctl disable --now --quiet main-watch-sender.timer; then changes+=('停用工作台版本的心跳推送 main-watch-sender.timer（同一地址改由本服务推送；副服务器从此只收到本服务的就绪情况，工作台是否正常不再上报）')
+    else log '无法停用 main-watch-sender.timer：它与本服务推送到同一地址，请手工执行 sudo systemctl disable --now main-watch-sender.timer'; fi
+  fi
+fi
 
 # ---- 7. 清理旧版本 -------------------------------------------------------------------
 current_dir=$(readlink -f "$APP_DIR/current")

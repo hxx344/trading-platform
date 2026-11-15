@@ -2,7 +2,7 @@
 # shellcheck disable=SC2016,SC2034  # checks are eval-ed later on purpose
 # Runs install.sh as an ordinary user in test mode (temporary directories, no system account, no systemctl):
 # first install without config, unchanged rerun, permission repair, a config the new program rejects, an upgrade,
-# and a deterministic package. The systemd start, health check and rollback need root and are checked on the server.
+# the watchdog heartbeat's switches, and a deterministic package. The systemd start, health check and rollback need root and are checked on the server.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d)
@@ -20,13 +20,14 @@ check '同一源码打出的包校验和相同' 'cmp -s "$tmp/a/SHA256SUMS" "$tm
 tar -tzf "$tmp/a/trading-platform.tar.gz" >"$tmp/a.list"
 check '发布包含构建好的页面' 'grep -q "/web/dist/index.html$" "$tmp/a.list" && grep -q "/web/dist/assets/.*\.js$" "$tmp/a.list"'
 check '发布包含 Var 请求脚本（行情监控 M-3d）' 'grep -q "/scripts/variational-request.py$" "$tmp/a.list"'
+check '发布文件含副服务器巡检的安装脚本与程序，且与源码、校验清单一致' 'cmp -s "$root/deploy/install-watch.sh" "$tmp/a/install-watch.sh" && cmp -s "$root/deploy/main-watch/main_watch.py" "$tmp/a/main_watch.py" && (cd "$tmp/a" && sha256sum -c --quiet SHA256SUMS) && [[ "$(wc -l <"$tmp/a/SHA256SUMS")" == 4 ]]'
 
 # A second package with different contents, for the upgrade.
-mkdir -p "$tmp/src-b/deploy"
+mkdir -p "$tmp/src-b/deploy/main-watch" && cp "$root/deploy/main-watch/main_watch.py" "$tmp/src-b/deploy/main-watch/"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-b/"
 mkdir -p "$tmp/src-b/web" && cp -R "$root/web/dist" "$tmp/src-b/web/"
 mkdir -p "$tmp/src-b/scripts" && cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$tmp/src-b/scripts/"
-cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-b/deploy/"
+cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-b/deploy/"
 printf '\n升级测试\n' >>"$tmp/src-b/README.md"
 bash "$tmp/src-b/deploy/package.sh" "$tmp/b" >/dev/null
 
@@ -103,11 +104,11 @@ mkdir -p "$tmp/wb/data/modules/aster"
   process.stdout.write(`DATA_DIR=${dir}/data\n` + line("WB_MAIN", MAIN) + line("WB_L9", wallet("0x" + "4d".repeat(20), "24")) + line("WB_S9", wallet("0x" + "5e".repeat(20), "25")));
 ' "$tmp/wb") >"$tmp/wb/workbench.env"
 # A program whose config check fails: the imported files are put back, the old release stays current.
-mkdir -p "$tmp/src-c/deploy"
+mkdir -p "$tmp/src-c/deploy/main-watch" && cp "$root/deploy/main-watch/main_watch.py" "$tmp/src-c/deploy/main-watch/"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-c/"
 mkdir -p "$tmp/src-c/web" && cp -R "$root/web/dist" "$tmp/src-c/web/"
 mkdir -p "$tmp/src-c/scripts" && cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$tmp/src-c/scripts/"
-cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-c/deploy/"
+cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-c/deploy/"
 sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { throw new Error('测试：配置检查失败');|" "$tmp/src-c/src/service/main.ts"
 bash "$tmp/src-c/deploy/package.sh" "$tmp/c" >/dev/null
 cp -p "$TP_CONF_DIR/config.json" "$tmp/config.before"; cp -p "$TP_CONF_DIR/secrets.json" "$tmp/secrets.before"
@@ -116,11 +117,11 @@ TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/c" --import-workben
 check '导入后检查失败时恢复导入前的配置' '[[ $status -ne 0 ]] && grep -q "导入配对 wb-gold" "$tmp/out" && grep -q "已恢复导入前的配置文件" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json" && cmp -s "$tmp/secrets.before" "$TP_CONF_DIR/secrets.json" && [[ "$(stat -c %a "$TP_CONF_DIR/secrets.json")" == 600 ]]'
 check '导入后检查失败时仍是原版本' '[[ "$(readlink -f "$TP_APP_DIR/current")" == "$current_before" ]]'
 # Stopped by a signal while the new program checks the imported files: they are put back all the same.
-mkdir -p "$tmp/src-d/deploy"
+mkdir -p "$tmp/src-d/deploy/main-watch" && cp "$root/deploy/main-watch/main_watch.py" "$tmp/src-d/deploy/main-watch/"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-d/"
 mkdir -p "$tmp/src-d/web" && cp -R "$root/web/dist" "$tmp/src-d/web/"
 mkdir -p "$tmp/src-d/scripts" && cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$tmp/src-d/scripts/"
-cp "$root/deploy/"{package.sh,install.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-d/deploy/"
+cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-d/deploy/"
 sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { (await import('node:fs')).writeFileSync(process.env.TP_TEST_MARK, ''); await new Promise(resolve => setTimeout(resolve, 1500));|" "$tmp/src-d/src/service/main.ts"
 bash "$tmp/src-d/deploy/package.sh" "$tmp/d" >/dev/null
 rm -f "$tmp/mark"
@@ -222,6 +223,48 @@ check '--monitor-paper 写待载入文件、仅服务账户可读写，不碰持
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor-paper && status=0 || status=$?
 check '重复导入持仓记录时跳过' '[[ $status -eq 0 ]] && grep -q "跳过持仓记录：本服务已有这些记录" "$tmp/out"'
 
+# The heartbeat for the second server's main-watch: the address lands in config.json, the token in the key file (from
+# stdin, never printed), the new program checks both, and a failed check puts them back.
+watch_token=watch-install-token-0123456789abcdefgh
+watch_to=http://203.0.113.9:8792/heartbeat
+run --package "$tmp/a" --watch-token "$watch_token" && status=0 || status=$?
+check '--watch-token 须和 --watch-url 一起用' '[[ $status -ne 0 ]] && grep -q -- "--watch-token 须和 --watch-url 一起使用" "$tmp/out"'
+run --package "$tmp/a" --watch-url "$watch_to" --watch-off && status=0 || status=$?
+check '--watch-url 与 --watch-off 不能同用' '[[ $status -ne 0 ]] && grep -q "只能用一个" "$tmp/out"'
+run --package "$tmp/a" --watch-url "$watch_to" --watch-token short-token && status=0 || status=$?
+check '过短的心跳令牌被拒且不回显' '[[ $status -ne 0 ]] && grep -q "须为 32~256 位" "$tmp/out" && ! grep -q "short-token" "$tmp/out"'
+cp -p "$TP_CONF_DIR/config.json" "$tmp/config.before"; cp -p "$TP_CONF_DIR/secrets.json" "$tmp/secrets.before"
+run --package "$tmp/a" --watch-url "$watch_to" && status=0 || status=$?
+check '没存过令牌时只给地址被拒，不改任何文件' '[[ $status -ne 0 ]] && grep -q "还没有保存过心跳令牌" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json" && cmp -s "$tmp/secrets.before" "$TP_CONF_DIR/secrets.json"'
+run --package "$tmp/a" --watch-url "ftp://203.0.113.9/heartbeat" --watch-token "$watch_token" && status=0 || status=$?
+check '不是 http(s) 的心跳地址被拒，不改任何文件' '[[ $status -ne 0 ]] && grep -q "watch.url 须为" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json" && cmp -s "$tmp/secrets.before" "$TP_CONF_DIR/secrets.json"'
+current_before=$(readlink -f "$TP_APP_DIR/current")
+run --package "$tmp/c" --watch-url "$watch_to" --watch-token "$watch_token" && status=0 || status=$?
+check '开启心跳后配置检查失败时恢复两个文件、仍是原版本' '[[ $status -ne 0 ]] && grep -q "巡检心跳：每 30 秒推送到 $watch_to" "$tmp/out" && grep -q "已恢复设置巡检心跳前的配置文件" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json" && cmp -s "$tmp/secrets.before" "$TP_CONF_DIR/secrets.json" && [[ "$(readlink -f "$TP_APP_DIR/current")" == "$current_before" ]]'
+run --package "$tmp/a" --watch-url "$watch_to" --watch-token "$watch_token" && status=0 || status=$?
+check '--watch-url 写入地址与令牌并通过配置检查' '[[ $status -eq 0 ]] && grep -q "巡检心跳：每 30 秒推送到 $watch_to" "$tmp/out" && grep -q "，巡检心跳推送到 $watch_to" "$tmp/out" && [[ "$("$TP_NODE_BIN" -p "JSON.parse(require(\"fs\").readFileSync(process.argv[1], \"utf8\")).watch.url" "$TP_CONF_DIR/config.json")" == "$watch_to" && "$("$TP_NODE_BIN" -p "JSON.parse(require(\"fs\").readFileSync(process.argv[1], \"utf8\")).watch.token" "$TP_CONF_DIR/secrets.json")" == "$watch_token" ]]'
+check '心跳令牌只在密钥文件里，两个文件仍为 600' '! grep -q "$watch_token" "$tmp/out" "$TP_CONF_DIR/config.json" && [[ "$(stat -c %a "$TP_CONF_DIR/config.json")" == 600 && "$(stat -c %a "$TP_CONF_DIR/secrets.json")" == 600 ]]'
+check '开启心跳不动其余配置' '[[ "$("$TP_NODE_BIN" -e "const f = p => { const v = JSON.parse(require(\"fs\").readFileSync(p, \"utf8\")); delete v.watch; return JSON.stringify(v); }; process.stdout.write(String(f(process.argv[1]) === f(process.argv[2]) && f(process.argv[3]) === f(process.argv[4])))" "$tmp/config.before" "$TP_CONF_DIR/config.json" "$tmp/secrets.before" "$TP_CONF_DIR/secrets.json")" == true ]]'
+run --package "$tmp/a" --watch-url "$watch_to" --watch-token "$watch_token" && status=0 || status=$?
+check '重复开启心跳不改动配置' '[[ $status -eq 0 ]] && grep -q "巡检心跳已是推送到 $watch_to，配置未改动" "$tmp/out" && grep -q "无变化" "$tmp/out"'
+run --package "$tmp/a" --watch-url http://203.0.113.10:8792/heartbeat && status=0 || status=$?
+check '只换心跳地址时沿用已存的令牌' '[[ $status -eq 0 ]] && grep -q "，巡检心跳推送到 http://203.0.113.10:8792/heartbeat" "$tmp/out" && grep -q "\"token\": \"$watch_token\"" "$TP_CONF_DIR/secrets.json"'
+TP_WATCH_SENDER="$tmp/none/sender" run --package "$tmp/a" --watch-import && status=0 || status=$?
+check '--watch-import 找不到工作台推送端配置时说明改用 --watch-url' '[[ $status -ne 0 ]] && grep -q "没有找到工作台心跳推送端的配置" "$tmp/out" && grep -q "请改用 --watch-url 与 --watch-token" "$tmp/out"'
+sender_token=sender-file-token-0123456789abcdefghij
+printf 'HEARTBEAT_URL=http://203.0.113.11:8792/heartbeat\nHEARTBEAT_TOKEN=%s\nREADY_URL=http://127.0.0.1:3100/api/ready\nTIMEOUT=5\n' "$sender_token" >"$tmp/sender"
+TP_WATCH_SENDER="$tmp/sender" run --package "$tmp/a" --watch-import && status=0 || status=$?
+check '--watch-import 取工作台推送端的地址与令牌，输出不含令牌' '[[ $status -eq 0 ]] && grep -q "，巡检心跳推送到 http://203.0.113.11:8792/heartbeat" "$tmp/out" && grep -q "\"token\": \"$sender_token\"" "$TP_CONF_DIR/secrets.json" && ! grep -q "$sender_token" "$tmp/out"'
+run --package "$tmp/a" --watch-off && status=0 || status=$?
+check '--watch-off 去掉地址与令牌，配置回到开启前' '[[ $status -eq 0 ]] && grep -q "巡检心跳已关闭" "$tmp/out" && ! grep -q "巡检心跳推送到" "$tmp/out" && ! grep -q "\"watch\"" "$TP_CONF_DIR/config.json" "$TP_CONF_DIR/secrets.json" && [[ "$("$TP_NODE_BIN" -e "const f = p => JSON.stringify(JSON.parse(require(\"fs\").readFileSync(p, \"utf8\"))); process.stdout.write(String(f(process.argv[1]) === f(process.argv[2]) && f(process.argv[3]) === f(process.argv[4])))" "$tmp/config.before" "$TP_CONF_DIR/config.json" "$tmp/secrets.before" "$TP_CONF_DIR/secrets.json")" == true ]]'
+run --package "$tmp/a" --watch-off && status=0 || status=$?
+check '重复关闭心跳不改动配置' '[[ $status -eq 0 ]] && grep -q "巡检心跳本来就没有开启，配置未改动" "$tmp/out"'
+# No --version or --package: the installed release is kept, nothing is fetched (TP_RELEASE_BASE points nowhere).
+current_before=$(readlink -f "$TP_APP_DIR/current")
+TP_RELEASE_BASE=https://127.0.0.1:9/none run --watch-url "$watch_to" --watch-token "$watch_token" && status=0 || status=$?
+check '只开心跳时沿用已装版本、不联网' '[[ $status -eq 0 && "$(readlink -f "$TP_APP_DIR/current")" == "$current_before" ]] && grep -q "程序包（未变化）" "$tmp/out" && grep -q "，巡检心跳推送到 $watch_to" "$tmp/out"'
+TP_RELEASE_BASE=https://127.0.0.1:9/none run --watch-off && status=0 || status=$?
+check '只关心跳时沿用已装版本、不联网' '[[ $status -eq 0 && "$(readlink -f "$TP_APP_DIR/current")" == "$current_before" ]] && grep -q "巡检心跳已关闭" "$tmp/out"'
 # No current link (data and config left from an earlier install): installs and points current at the release.
 rm "$TP_APP_DIR/current"
 run --package "$tmp/b" && status=0 || status=$?

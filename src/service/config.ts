@@ -16,6 +16,7 @@ import { parseMonitorConfig, type MonitorConfig } from './monitor-config.ts';
 import { parseAssetConfig, type AssetConfig } from './asset-config.ts';
 import { parseOptionsConfig, parseOptionsSecrets, type OptionsConfig } from './options-config.ts';
 import { parseCrossexConfig, parseCrossexSecrets, type CrossexServiceConfig } from './crossex-config.ts';
+import { parseWatchConfig, parseWatchSecret, type WatchConfig, type WatchSecret } from './watch.ts';
 
 const ACCOUNT_NAME = /^[0-9A-Za-z_-]{1,64}$/;
 const FEISHU_HOOK = /^https:\/\/open\.(feishu\.cn|larksuite\.com)\/open-apis\/bot\/v2\/hook\/[0-9A-Za-z_-]{8,128}$/;
@@ -45,6 +46,8 @@ export interface ServiceConfig {
   crossex?: CrossexServiceConfig;
   /** The scheduled ASTER summary card (summary.ts); absent: every 60 minutes. 0 turns it off. */
   summary?: { intervalMinutes: number };
+  /** Where the heartbeat for the second server's main-watch goes (watch.ts); absent: none is pushed. */
+  watch?: WatchConfig;
 }
 export interface FeishuSecret { webhook: string; secret: string | null }
 export interface ServiceSecrets {
@@ -56,6 +59,7 @@ export interface ServiceSecrets {
   /** Keys of the oil accounts' venues; only with oil configured. */ exchanges?: Map<Venue, LiveCredentials>;
   /** The options module's Bybit key; only with options configured. */ bybitOptions?: LiveCredentials;
   /** The CrossEx module's Gate key; only with crossex configured. */ gate?: LiveCredentials;
+  /** The heartbeat's shared token; needed with config.json `watch`. */ watch?: WatchSecret;
 }
 
 const perMinute = (ms: number): number => Math.ceil(60_000 / ms);
@@ -144,7 +148,7 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   // pairs may be left out only when another module is there: at least one module must be configured.
   const modules = raw !== null && typeof raw === 'object' ? MODULE_KEYS.filter(key => Object.hasOwn(raw, key)) : [];
   const hasModule = modules.length > 0;
-  const value = exactKeys(raw, hasModule ? ['secretsFile'] : ['secretsFile', 'pairs'], ['port', 'host', 'budget', 'summary', ...(hasModule ? ['pairs', ...modules] : [])]);
+  const value = exactKeys(raw, hasModule ? ['secretsFile'] : ['secretsFile', 'pairs'], ['port', 'host', 'budget', 'summary', 'watch', ...(hasModule ? ['pairs', ...modules] : [])]);
   const oil = modules.includes('oil') ? parseOilConfig(value.oil) : undefined;
   const options = modules.includes('options') ? parseOptionsConfig(value.options) : undefined;
   const monitor = modules.includes('monitor') ? parseMonitorConfig(value.monitor) : undefined;
@@ -182,11 +186,12 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   const adlReserve = budgetRaw.adlReserve === undefined ? Math.floor(limitPerMinute / 6) : integer(budgetRaw.adlReserve, 0, limitPerMinute - 50, 'ADL 预留权重');
   if (limitPerMinute - adlReserve < needed) throw new Error(`${pairs.length} 个配对每分钟约需请求权重 ${needed}，而每分钟上限 ${limitPerMinute} 减去 ADL 预留 ${adlReserve} 只剩 ${limitPerMinute - adlReserve}；请调大 budget.limitPerMinute 或去掉 budget 使用自动值`);
   const summary = value.summary === undefined ? undefined : { intervalMinutes: integer(exactKeys(value.summary, ['intervalMinutes'], []).intervalMinutes, 0, 1_440, '定时摘要间隔（分钟，0 为关闭）') };
-  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs, ...(oil ? { oil } : {}), ...(options ? { options } : {}), ...(monitor ? { monitor } : {}), ...(asset ? { asset } : {}), ...(summary ? { summary } : {}), ...(crossex ? { crossex } : {}) };
+  const watch = value.watch === undefined ? undefined : parseWatchConfig(value.watch);
+  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs, ...(oil ? { oil } : {}), ...(options ? { options } : {}), ...(monitor ? { monitor } : {}), ...(asset ? { asset } : {}), ...(summary ? { summary } : {}), ...(crossex ? { crossex } : {}), ...(watch ? { watch } : {}) };
 }
 
 export function parseServiceSecrets(raw: unknown, needed: readonly string[], oilVenues: readonly Venue[] = [], options = false, crossex = false): ServiceSecrets {
-  const value = exactKeys(raw, ['accounts'], ['feishu', 'feishuScheduled', 'feishuMonitor', ...(oilVenues.length ? ['binance', 'bybit'] : []), ...(options ? ['bybitOptions'] : []), ...(crossex ? ['gate'] : [])]);
+  const value = exactKeys(raw, ['accounts'], ['feishu', 'feishuScheduled', 'feishuMonitor', 'watch', ...(oilVenues.length ? ['binance', 'bybit'] : []), ...(options ? ['bybitOptions'] : []), ...(crossex ? ['gate'] : [])]);
   if (value.accounts === null || typeof value.accounts !== 'object' || Array.isArray(value.accounts)) throw new Error('accounts 须为 { 账户名: { user, signer, privateKey } }');
   const accounts = new Map<string, AsterCredentials>();
   for (const [name, item] of Object.entries(value.accounts as Record<string, unknown>)) {
@@ -199,7 +204,8 @@ export function parseServiceSecrets(raw: unknown, needed: readonly string[], oil
   const feishu = parseFeishu(value.feishu, 'feishu');
   const feishuScheduled = parseFeishu(value.feishuScheduled, 'feishuScheduled');
   const feishuMonitor = parseFeishu(value.feishuMonitor, 'feishuMonitor');
-  return { accounts, feishu, ...(feishuScheduled ? { feishuScheduled } : {}), ...(feishuMonitor ? { feishuMonitor } : {}), ...(oilVenues.length ? { exchanges: parseOilSecrets(value, oilVenues) } : {}), ...(options ? { bybitOptions: parseOptionsSecrets(value) } : {}), ...(crossex ? { gate: parseCrossexSecrets(value) } : {}) };
+  const watch = value.watch === undefined ? undefined : parseWatchSecret(value.watch);
+  return { accounts, feishu, ...(watch ? { watch } : {}), ...(feishuScheduled ? { feishuScheduled } : {}), ...(feishuMonitor ? { feishuMonitor } : {}), ...(oilVenues.length ? { exchanges: parseOilSecrets(value, oilVenues) } : {}), ...(options ? { bybitOptions: parseOptionsSecrets(value) } : {}), ...(crossex ? { gate: parseCrossexSecrets(value) } : {}) };
 }
 
 function parseFeishu(raw: unknown, name: string): FeishuSecret | null {
@@ -234,6 +240,7 @@ export function loadServiceSecrets(config: ServiceConfig): ServiceSecrets {
   try {
     const secrets = parseServiceSecrets(raw, [...new Set(config.pairs.flatMap(pair => [pair.main, pair.long, pair.short]))], config.oil?.accounts.map(account => account.venue) ?? [], config.options !== undefined, config.crossex !== undefined);
     assertDistinctSigners(config, secrets);
+    if (config.watch && !secrets.watch) throw new Error('config.json 配了 watch，密钥文件须有 watch.token');
     return secrets;
   } catch (error) { throw fail('密钥文件', error); }
 }

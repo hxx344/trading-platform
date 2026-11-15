@@ -32,6 +32,7 @@ check '发布包含 Var 请求脚本（行情监控 M-3d）' 'grep -q "/scripts/
 check '发布文件含副服务器巡检的安装脚本与程序，且与源码、校验清单一致' 'cmp -s "$root/deploy/install-watch.sh" "$tmp/a/install-watch.sh" && cmp -s "$root/deploy/main-watch/main_watch.py" "$tmp/a/main_watch.py" && (cd "$tmp/a" && sha256sum -c --quiet SHA256SUMS) && [[ "$(wc -l <"$tmp/a/SHA256SUMS")" == 4 ]]'
 fi
 
+if part_is 1; then
 # A second package with different contents, for the upgrade.
 mkdir -p "$tmp/src-b/deploy/main-watch" && cp "$root/deploy/main-watch/main_watch.py" "$tmp/src-b/deploy/main-watch/"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-b/"
@@ -40,7 +41,8 @@ mkdir -p "$tmp/src-b/scripts" && cp "$root/scripts/variational-balance.py" "$roo
 cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-b/deploy/"
 printf '\n升级测试\n' >>"$tmp/src-b/README.md"
 bash "$tmp/src-b/deploy/package.sh" "$tmp/b" >/dev/null
-# A program whose config check always fails, for parts 2 and 3: the files they change are put back, the old release stays current.
+fi
+# A program whose config check always fails, used by every part: the files a run changes are put back, the old release stays current.
 mkdir -p "$tmp/src-c/deploy/main-watch" && cp "$root/deploy/main-watch/main_watch.py" "$tmp/src-c/deploy/main-watch/"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-c/"
 mkdir -p "$tmp/src-c/web" && cp -R "$root/web/dist" "$tmp/src-c/web/"
@@ -318,4 +320,4 @@ check '通配监听地址被配置检查拒绝' '[[ $status -ne 0 ]] && grep -q 
 fi
 
 if ((failures)); then printf '%d 项失败；最后一次输出：\n' "$failures"; cat "$tmp/out"; exit 1; fi
-printf '安装测试全部通过\n'
+if [[ $part == all ]]; then printf '安装测试全部通过\n'; else printf '安装测试第 %s 部分通过\n' "$part"; fi

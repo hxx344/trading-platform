@@ -22,12 +22,12 @@ jobs:
           node-version: 24.15.0
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      # The same two projects as pnpm check, side by side.
+      # The same two projects as "check" in package.json (keep them in step), side by side; both report before a failure.
       - name: pnpm check
         run: |
           pnpm exec tsc -p tsconfig.json &
           server=$!
-          pnpm exec tsc -p web/tsconfig.json
+          pnpm exec tsc -p web/tsconfig.json || { wait "$server" || true; exit 1; }
           wait "$server"
       - run: shellcheck deploy/*.sh
       - run: python3 -I -B deploy/main-watch/test_main_watch.py
@@ -52,7 +52,7 @@ jobs:
       - run: pnpm build:web
       - run: bash deploy/test-install.sh ${{ matrix.part }}
 
-  # node --test splits its files into shards by index.
+  # scripts/test.ts deals the test files into shards by their CI durations (scripts/test-durations.json).
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -89,3 +89,4 @@ jobs:
             sudo chmod go-w "$path"
           done
       - run: sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin TP_WATCH_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-watch-systemd.sh
+

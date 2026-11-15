@@ -43,6 +43,8 @@
 | 2 | P3 | `tell` 只接同步抛错；发送方以后若改成异步，被拒的 Promise 会变成未处理的拒绝 | 返回 thenable 时也接住错误并记日志。`crossex.ts` 里相同写法的 `notifyOnce` 不在本次差异内，登记 |
 | 2 | P3 | 恢复用例里“上一个进程”的引擎一直在轮询同一个替身，测试布置可能干扰断言 | 挂单就位后切断旧引擎的网络（模拟进程结束），并在切断那一刻取状态快照 |
 | 2 | P3 | 恢复用例没有显式证明重试时重新做了启动检查 | 断言切到 up 之后的请求里，`/v5/user/query-api` 出现在第一个 `/v5/order/cancel` 之前 |
+| 3 | — | 复核第 2 轮修复与 CI 修复：无 P0/P1/P2；`FakeAster` 默认行为不变，抢锁已消除 | — |
+| 3 | P3 | `OTHER_WALLETS` 的地址与 `service.test.ts`、`import-workbench.test.ts` 里不加锁的用例重合，以后改成起服务会再次抢锁 | 换成 test/ 下没人用过的字节（7a/8b/9c，签名私钥 37/38/39） |
 
 ## 已运行
 
@@ -51,3 +53,5 @@
 - 本机全套 `pnpm test`：15 分钟超时被终止，卡在 `test/service.test.ts`（不涉及期权）；该文件单独运行 19 项全部通过，几秒完成。本机高负载下的已知不稳定现象，全套以 CI 两个分片为准。
 - PR #49 第一次 CI：check、test (1)、watch 通过；test (2) 失败，原因是上表 CI 那一行的抢锁。
 - 第 2 轮修复后：`pnpm check` 通过；`node --test test/service.test.ts test/options-isolation.test.ts test/aster.test.ts test/monitor.test.ts test/asset-http.test.ts test/crossex-service.test.ts test/options.test.ts`（多个文件并行，覆盖抢锁场景和 `FakeAster` 的其他使用方）全部通过。
+- PR #49 第二次 CI（5158165）：check、test (1)、test (2)、watch 全部通过。
+- 第 3 轮修复后（只换测试钱包字节）：`node --test test/service.test.ts test/options-isolation.test.ts` 并行通过；最终 CI 见 PR #49。

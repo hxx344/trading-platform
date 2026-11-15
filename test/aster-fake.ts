@@ -19,8 +19,9 @@ export const LONG = wallet('0x' + '2b'.repeat(20), '22');
 export const SHORT = wallet('0x' + '3c'.repeat(20), '23');
 export const CREDENTIALS = new Map([MAIN, LONG, SHORT].map(item => [item.user, item]));
 export interface FakeWallets { main: AsterCredentials; long: AsterCredentials; short: AsterCredentials }
-/** A second set of accounts, for a service test file that runs beside service.test.ts: the host account locks never meet. */
-export const OTHER_WALLETS: FakeWallets = { main: wallet('0x' + '4d'.repeat(20), '24'), long: wallet('0x' + '5e'.repeat(20), '25'), short: wallet('0x' + '6f'.repeat(20), '26') };
+/** A second set of accounts, for a service test file that runs beside service.test.ts: the host account locks never meet.
+ * Bytes used nowhere else under test/, so a later startService elsewhere cannot collide either. */
+export const OTHER_WALLETS: FakeWallets = { main: wallet('0x' + '7a'.repeat(20), '37'), long: wallet('0x' + '8b'.repeat(20), '38'), short: wallet('0x' + '9c'.repeat(20), '39') };
 
 // BigInt values are written as bare JSON numbers, like the venue's 64-bit ids.
 export const json = (body: unknown, status = 200, headers: Record<string, string> = {}): Response =>

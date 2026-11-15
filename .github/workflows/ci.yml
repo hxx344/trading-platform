@@ -26,6 +26,13 @@ jobs:
           server=$!
           node_modules/.bin/tsc -p web/tsconfig.json || { wait "$server" || true; exit 1; }
           wait "$server"
+
+  # Needs no Node, so it skips the setup the other jobs share.
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
       - run: shellcheck deploy/*.sh
       - run: python3 -I -B deploy/main-watch/test_main_watch.py
 

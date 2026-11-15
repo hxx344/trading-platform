@@ -24,7 +24,7 @@
 ## 检查
 
 - 类型检查：`pnpm check`；测试：`pnpm test`；页面构建：`pnpm build:web`。
-- 测试文件列表在 `scripts/test.ts`，新增测试目录改那里。CI 用 `TEST_SHARD=i/n` 按 `scripts/test-durations.json` 里的耗时均衡分片；分片明显不均时在 CI 机器上跑 `node scripts/test.ts --measure` 更新这个文件。
+- 测试文件列表在 `scripts/test.ts`，新增测试目录改那里。CI 用 `TEST_SHARD=i/n` 按 `scripts/test-durations.json` 里的耗时均衡分片；分片明显不均时手动运行 ci 工作流（`gh workflow run ci.yml --ref <分支>`），用 `durations` 任务产物里的 `test-durations.json` 替换这个文件；本机负载高时测出的比例不可靠。
 - 安装测试：`bash deploy/test-install.sh`，先 `pnpm build:web`。CI 分三部分并行（参数 1 安装升级、2 从工作台导入、3 巡检心跳），新检查放进对应的 `if part_is N` 块，不依赖别的部分留下的状态。三部分各自从首次安装开始，完整顺序（心跳、密码叠加在导入后的配置上）只在发布工作流的 build 任务里跑。
 - 改页面时在替身后端上用浏览器走一遍，截 1280 和 390 宽度与工作台同页面对比。
 

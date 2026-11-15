@@ -21,6 +21,9 @@
 // (at most 20 active, 100 ended for 30 days) kept in the data directory's perpetual-paper-positions.json
 // (src/monitor/perpetual-paper-store.ts), each active one valued once a minute from the in-memory books while the collector runs
 // (checked on the broadcast timer, throttled by the service); built once, started and stopped with the collector.
+// M-5e2: records the workbench import left pending (perpetual-paper-positions.import.json) are merged on the broadcast timer
+// while the collector runs, and when it starts: the paper service is stopped (its writes drained), the store merges the file,
+// and the service is built again on the merged records; page writes wait for it. While the collector is off nothing is merged.
 // Left out (later batches, docs/monitor.md M-4/M-5): the saved quotes (market.sqlite), alerts, CrossEx filters.
 // Quotes live in memory only; a restart or a switch-off starts from empty.
 // Node's own WebSocket is used (it takes request headers); like fetch it goes through Node's global dispatcher, so with
@@ -42,7 +45,7 @@ import { createFundamentalsClient, type FundamentalsClient } from '../vendor/per
 import { fetchPositioning, type PositioningFetch } from '../vendor/perpetual-positioning.mjs';
 import type { PerpetualQualityReport } from '../vendor/perpetual-quality.ts';
 import { createPerpetualPaperService, type PerpetualPaperStore } from '../vendor/perpetual-paper-service.mjs';
-import { PERPETUAL_PAPER_FILE } from './perpetual-paper-store.ts';
+import { PERPETUAL_PAPER_FILE, perpetualPaperAdoptionLine, type PerpetualPaperAdoption, type PerpetualPaperFileStore } from './perpetual-paper-store.ts';
 import type { PerpetualPaperView } from '../vendor/perpetual-paper.ts';
 import type { PerpetualFundingHistoryReport } from '../vendor/perpetual-funding-history.ts';
 import type { PerpetualScannerDataReport } from '../vendor/perpetual-scanner-data.ts';
@@ -117,9 +120,10 @@ export interface PerpetualOptions {
   cacheUnavailable?: string;
   /**
    * M-5e1: the paper-position records (perpetual-paper-positions.json, service/monitor.ts). Without a store the records are
-   * unavailable: reads show `unavailableReason`, writes answer 503 with it.
+   * unavailable: reads show `unavailableReason`, writes answer 503 with it. M-5e2: a store with `pending` / `adoptPending`
+   * (perpetual-paper-store.ts) has its pending import merged while the collector runs.
    */
-  paper?: { store?: PerpetualPaperStore | undefined; unavailableReason?: string };
+  paper?: { store?: (PerpetualPaperStore & Partial<Pick<PerpetualPaperFileStore, 'pending' | 'adoptPending'>>) | undefined; unavailableReason?: string };
 }
 
 /** The quality service's refusals of an invalid batch (plain Errors there; the workbench's HTTP layer answers them 400). */
@@ -203,10 +207,30 @@ export function createPerpetualMonitor({
   });
   // M-5e1: as the workbench's (perpetual-service.mjs): a leg is valued only while its venue has a connection open.
   let paperHealthy = true;
-  const paper = createPerpetualPaperService({
+  const paperService = () => createPerpetualPaperService({
     store: paperOptions?.store, unavailableReason: paperOptions?.unavailableReason ?? (paperOptions?.store ? '' : '本服务没有配置持仓记录存放'),
     getQuote: key => quotes.get(key), isVenueLive: id => [...connections].some(connection => connection.exchange === id && connection.socket?.readyState === 1), clock,
   });
+  // M-5e2: replaced when a pending import is merged (adoptPaper); `adopting` is the merge in progress, awaited by page writes.
+  let paper = paperService(), adopting: Promise<void> | null = null;
+  /** Merges a pending import, if one waits: null when there is none (or no store that takes one). */
+  function adoptPaper(): Promise<void> | null {
+    if (adopting) return adopting;
+    const store = paperOptions?.store;
+    if (!store?.adoptPending || !store.pending?.()) return null;
+    const work = (async () => {
+      // Stopping drains the service's queued writes (a check or a page write in flight), so the merge reads the last save.
+      await paper.stop().catch(() => undefined);
+      let outcome: PerpetualPaperAdoption | null;
+      try { outcome = await store.adoptPending!(clock()); } catch (error) { outcome = { deferred: reason(error) }; }
+      // Built again on the store's records, merged or not; started only if the collector still runs.
+      paper = paperService();
+      if (running) paper.start();
+      if (outcome) log(perpetualPaperAdoptionLine(outcome));
+    })();
+    adopting = work.finally(() => { adopting = null; });
+    return adopting;
+  }
   let metricsStopping: Promise<void> = Promise.resolve();
   // The cached reads (metrics, funding history, scanner data, price history, quality): 503 while stopped, the service's 400 for an invalid batch, any other failure 500; the cache's
   // unavailability rides along as the report's storageError.
@@ -465,14 +489,18 @@ export function createPerpetualMonitor({
         getQuote: (exchange, symbol) => quotes.get(`${exchange}:${symbol}`), getMarket: (exchange, symbol) => states.get(exchange)?.markets?.get(symbol),
         clock, ...(fetchImpl ? { fetchImpl } : {}), ...executionOptions,
       });
-      marketMetrics.start(); fundingHistory.start(); priceHistory.start(); quality.start(); paper.start();
+      marketMetrics.start(); fundingHistory.start(); priceHistory.start(); quality.start();
+      // A pending import is merged before the paper service starts (the merge starts the rebuilt one); a merge still running
+      // from an earlier start starts it too.
+      if (!adoptPaper()) paper.start();
       if (observationIntervalMs > 0) { observationTimer = setInterval(observe, observationIntervalMs); observationTimer.unref?.(); }
       for (const exchange of states.keys()) void refresh(exchange);
       refreshTimer = setInterval(() => { for (const exchange of states.keys()) void refresh(exchange); }, discoveryIntervalMs);
       // The workbench checks the paper positions on its broadcast timer too; the service observes at most once a minute.
       broadcastTimer = setInterval(() => {
         // A failed save keeps the broadcast going; the log gets one line when saving starts or stops failing (the page shows it too).
-        void paper.check().catch(() => undefined).then(() => {
+        // A pending import is merged first, in the same chain, so it never runs beside a check.
+        void (adoptPaper() ?? Promise.resolve()).then(() => paper.check()).catch(() => undefined).then(() => {
           const healthy = paper.healthy();
           if (healthy === paperHealthy) return;
           paperHealthy = healthy;
@@ -490,7 +518,9 @@ export function createPerpetualMonitor({
       if (!running) return;
       running = false; closeStreams();
       execution?.stop(); execution = null;
-      metricsStopping = Promise.all([marketMetrics.stop(), fundingHistory.stop(), priceHistory.stop(), quality.stop(), paper.stop()].map(stopping => stopping.catch(() => undefined))).then(() => undefined);
+      // A merge in progress is waited for, then the service it built is stopped (unless the collector was started again).
+      const paperStopping = adopting ? adopting.then(() => (running ? undefined : paper.stop())) : paper.stop();
+      metricsStopping = Promise.all([marketMetrics.stop(), fundingHistory.stop(), priceHistory.stop(), quality.stop(), paperStopping].map(stopping => stopping.catch(() => undefined))).then(() => undefined);
       for (const timer of [observationTimer, refreshTimer, broadcastTimer]) clearInterval(timer);
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
@@ -612,6 +642,11 @@ export function createPerpetualMonitor({
      */
     async paperUpdate(input: unknown): Promise<PerpetualPaperView> {
       if (!running) throw new PerpetualInspectionError(503, '合约价差采集未运行，开启后再登记或修改持仓');
+      // M-5e2: a write during a merge waits for it and goes to the rebuilt service (which holds the merged records).
+      if (adopting) {
+        await adopting;
+        if (!running) throw new PerpetualInspectionError(503, '合约价差采集未运行，开启后再登记或修改持仓');
+      }
       return paper.update(input);
     },
     /** M-5b1/M-5e1: resolves once the last stop has written the metrics, histories and paper positions back (the cache file may close then). */

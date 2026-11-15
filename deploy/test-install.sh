@@ -171,6 +171,8 @@ run --package "$tmp/a" --monitor-alerts && status=0 || status=$?
 check '--monitor-alerts 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -q -- "--monitor-alerts 须和 --import-workbench 一起使用" "$tmp/out"'
 run --package "$tmp/a" --monitor-variational && status=0 || status=$?
 check '--monitor-variational 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -q -- "--monitor-variational 须和 --import-workbench 一起使用" "$tmp/out"'
+run --package "$tmp/a" --monitor-paper && status=0 || status=$?
+check '--monitor-paper 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -q -- "--monitor-paper 须和 --import-workbench 一起使用" "$tmp/out"'
 run --package "$tmp/a" --asset && status=0 || status=$?
 check '--asset 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -q -- "--asset 须和 --import-workbench 一起使用" "$tmp/out"'
 run --package "$tmp/a" --import-workbench --asset-owner alice && status=0 || status=$?
@@ -208,6 +210,17 @@ TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workben
 check '--monitor-variational 导入 token、仅服务账户可读写且输出不含 token' '[[ $status -eq 0 && "$(stat -c %a "$TP_DATA_DIR/monitor-variational-session.json")" == 600 ]] && grep -q "已写入Var token（版本 1，声明到期" "$tmp/out" && grep -q "$var_token" "$TP_DATA_DIR/monitor-variational-session.json" && ! grep -q "$var_token" "$tmp/out"'
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor-variational && status=0 || status=$?
 check '重复导入同一个 Var token 时跳过' '[[ $status -eq 0 ]] && grep -q "跳过 Var token：本服务的 Var token 声明到期" "$tmp/out" && grep -q "\"revision\":1," "$TP_DATA_DIR/monitor-variational-session.json"'
+# The workbench's paper records (M-5e2): written to the pending file only, which the service merges on its next check.
+mkdir -p "$tmp/wb/data/modules/monitor/perpetual"
+(cd "$root" && node --input-type=module -e '
+  const { writeFileSync } = await import("node:fs");
+  const { paperPosition, paperState } = await import("./test/monitor-paper-fixture.ts");
+  writeFileSync(process.argv[1], JSON.stringify(paperState([paperPosition("install-a1"), paperPosition("install-s1", { closedAt: Date.now() - 3600000 })])));
+' "$tmp/wb/data/modules/monitor/perpetual/paper-positions.json")
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor-paper && status=0 || status=$?
+check '--monitor-paper 写待载入文件、仅服务账户可读写，不碰持仓记录' '[[ $status -eq 0 && "$(stat -c %a "$TP_DATA_DIR/perpetual-paper-positions.import.json")" == 600 && ! -e "$TP_DATA_DIR/perpetual-paper-positions.json" ]] && grep -q "已写入持仓记录 2 条（待载入文件）" "$tmp/out" && grep -q "install-s1" "$TP_DATA_DIR/perpetual-paper-positions.import.json"'
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor-paper && status=0 || status=$?
+check '重复导入持仓记录时跳过' '[[ $status -eq 0 ]] && grep -q "跳过持仓记录：本服务已有这些记录" "$tmp/out"'
 
 # No current link (data and config left from an earlier install): installs and points current at the release.
 rm "$TP_APP_DIR/current"

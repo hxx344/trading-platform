@@ -4,13 +4,18 @@
 // frequent cache writes never wait on (or hold up) the alert, switch and import writes there; busy_timeout is the
 // workbench's 100 ms, a busy write fails quickly and the service retries its dirty entry. Only the service process writes
 // it; losing the file loses only cached public figures, which the venues serve again. M-5b2 adds funding_history_cache (the
-// settled-funding histories), M-5c price_history_cache (hourly trade closes for the pair chart); M-5d adds quality_samples.
+// settled-funding histories), M-5c price_history_cache (hourly trade closes for the pair chart), M-5d2 quality_samples (the
+// quality service's minute samples: one gzip JSON row per minute bucket, the last 24 hours and at most 1440 rows kept, read
+// back one minute at a time; the workbench's loadQualitySamples / saveQualitySample).
 import { DatabaseSync } from 'node:sqlite';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import type { PerpetualContractCacheEntry } from '../vendor/perpetual-market-metrics-service.mjs';
+import type { QualitySample } from '../vendor/perpetual-quality-service.mjs';
 
 export const PERPETUAL_CACHE_FILE = 'perpetual-cache.sqlite';
 const MAX_ROWS = 5000, MAX_ENTRY_BYTES = 1_000_000;
+/** The workbench's quality-sample bounds: 24 hours, one bucket a minute, 2 MB decoded per bucket. */
+const QUALITY_WINDOW_MS = 86_400_000, QUALITY_MAX_ROWS = 1440, QUALITY_MAX_BYTES = 2_000_000;
 
 export interface PerpetualCacheTable {
   /** One entry by key, or the newest `limit` (at most 5000) without one. */
@@ -24,6 +29,10 @@ export interface PerpetualCache {
   saveFundingHistory: PerpetualCacheTable['save'];
   loadPriceHistory: PerpetualCacheTable['load'];
   savePriceHistory: PerpetualCacheTable['save'];
+  /** M-5d2: the samples of the 24 hours before `now`, oldest first, decoded one bucket at a time; a corrupt bucket is skipped. */
+  loadQualitySamples(now: number): Generator<QualitySample>;
+  /** M-5d2: inserts one minute's rows (an existing bucket is kept) and prunes to 24 hours and 1440 rows. */
+  saveQualitySample(bucket: number, rows: unknown[]): void;
   close(): void;
 }
 
@@ -31,7 +40,9 @@ export function openPerpetualCache(file: string): PerpetualCache {
   const db = new DatabaseSync(file);
   try {
     db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=100; PRAGMA cache_size=-2048; PRAGMA wal_autocheckpoint=1000; PRAGMA journal_size_limit=4194304;');
-    db.exec('CREATE TABLE IF NOT EXISTS contract_metrics_cache (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, payload BLOB NOT NULL); CREATE TABLE IF NOT EXISTS funding_history_cache (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, payload BLOB NOT NULL); CREATE TABLE IF NOT EXISTS price_history_cache (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, payload BLOB NOT NULL);');
+    db.exec('CREATE TABLE IF NOT EXISTS contract_metrics_cache (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, payload BLOB NOT NULL); CREATE TABLE IF NOT EXISTS funding_history_cache (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, payload BLOB NOT NULL); CREATE TABLE IF NOT EXISTS price_history_cache (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, payload BLOB NOT NULL); CREATE TABLE IF NOT EXISTS quality_samples (bucket INTEGER PRIMARY KEY, payload BLOB NOT NULL);');
+    const insertSample = db.prepare('INSERT INTO quality_samples(bucket,payload) VALUES (?,?) ON CONFLICT(bucket) DO NOTHING');
+    const pruneSamples = db.prepare(`DELETE FROM quality_samples WHERE bucket<=? OR bucket NOT IN (SELECT bucket FROM quality_samples ORDER BY bucket DESC LIMIT ${QUALITY_MAX_ROWS})`);
     function publicCache(table: string): PerpetualCacheTable {
       db.exec(`CREATE INDEX IF NOT EXISTS ${table}_updated_at ON ${table}(updated_at DESC)`);
       const selectOne = db.prepare(`SELECT payload FROM ${table} WHERE id=?`);
@@ -67,6 +78,19 @@ export function openPerpetualCache(file: string): PerpetualCache {
       saveFundingHistory: funding.save,
       loadPriceHistory: price.load,
       savePriceHistory: price.save,
+      *loadQualitySamples(now) {
+        // Its own statement per iterator (interleaved readers stay independent), decoded one minute at a time.
+        for (const row of db.prepare(`SELECT bucket,payload FROM quality_samples WHERE bucket>? AND bucket<=? ORDER BY bucket LIMIT ${QUALITY_MAX_ROWS}`).iterate(now - QUALITY_WINDOW_MS, now)) {
+          try { yield { bucket: Number(row.bucket), rows: JSON.parse(gunzipSync(row.payload as Uint8Array, { maxOutputLength: QUALITY_MAX_BYTES }).toString()) as unknown[] }; }
+          catch { /* A corrupt public-history bucket stays a gap, never invented data. */ }
+        }
+      },
+      saveQualitySample(bucket, rows) {
+        const payload = gzipSync(JSON.stringify(rows), { level: 1 });
+        db.exec('BEGIN IMMEDIATE');
+        try { insertSample.run(bucket, payload); pruneSamples.run(bucket - QUALITY_WINDOW_MS); db.exec('COMMIT'); }
+        catch (error) { db.exec('ROLLBACK'); throw error; }
+      },
       close() { if (!closed) { closed = true; db.close(); } },
     };
   } catch (error) { db.close(); throw error; }

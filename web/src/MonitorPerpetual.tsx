@@ -7,6 +7,9 @@ import { usePerpetualFx } from './use-perpetual-fx.ts';
 import { usePerpetualMarketMetrics } from './use-perpetual-market-metrics.ts';
 import { usePerpetualFundingHistory } from './use-perpetual-funding-history.ts';
 import { usePerpetualScannerData } from './use-perpetual-scanner-data.ts';
+import { usePerpetualQuality } from './use-perpetual-quality.ts';
+import { evaluateOpportunityQuality, pairQualityHistory, qualityPairKey } from '../../src/vendor/perpetual-quality.ts';
+import { QualityCell, QualityEvidence } from './PerpetualQuality.tsx';
 import { compileScannerRanges, evaluateScannerRanges, parseScannerRangeInputs, type ScannerRangeId, type ScannerRangeInputs } from './perpetual-scanner-filters.ts';
 import { ScannerRangeFilters } from './PerpetualScannerFilters.tsx';
 import { createScannerDataPairSelector, scannerDataHistoryForPair } from '../../src/vendor/perpetual-scanner-data.ts';
@@ -37,8 +40,10 @@ import { ScannerFundingRate, ScannerHistory, ScannerLeg, ScannerMarketMetric, Sc
 // ROC with their settings, and header sorting over the columns the quotes alone can rank. M-5b2 adds settled funding history
 // (the three history columns and the details' four windows), the range filters over every candidate pair with the summary
 // read behind them, and the full-set sorts by volume, open interest and history.
-// Left out until later M-5 batches: quality (its tab and column), holding and trend estimates, the chart and paper
-// workspaces, position registration, favourites and blocking, CrossEx, health, alerts, fee settings and push toggles.
+// M-5c adds the chart workspace, M-5d1 the fee and slippage settings with the holding scenario, M-5d2 quality (its column,
+// the 质量依据 tab, the spread trend and the read caption).
+// Left out until later M-5 batches: the paper workspace, position registration, favourites and blocking, CrossEx, health,
+// alerts and push toggles.
 const scannerPreferencesKey = 'market-monitor:perpetual-scanner:v1';
 const preferencesKey = 'market-monitor:perpetual:v1';
 const scannerSortKey = 'market-monitor:perpetual-scanner-sort:v1';
@@ -46,7 +51,7 @@ const capitalAssumptionsKey = 'market-monitor:perpetual-capital-assumptions:v1';
 const scannerRangesKey = 'market-monitor:perpetual-scanner-ranges:v1';
 const qualityBudgetKey = 'market-monitor:perpetual-quality-budget:v1';
 // The columns built so far; stored choices of later batches' columns stay in storage untouched and are not offered.
-const builtColumns = new Set<ScannerColumnId>(['type', 'pair', 'funding', 'fundingSpread', 'annualized', 'volume', 'openInterest', 'quote', 'spread', 'capital', 'roc', 'history24h', 'history7d', 'history30d', 'time']);
+const builtColumns = new Set<ScannerColumnId>(['type', 'pair', 'funding', 'fundingSpread', 'annualized', 'volume', 'openInterest', 'quote', 'spread', 'capital', 'roc', 'history24h', 'history7d', 'history30d', 'quality', 'time']);
 const AVAILABLE_COLUMNS = SCANNER_COLUMNS.filter(column => builtColumns.has(column.id));
 // Every column the workbench sorts by; a stored sort by another column shows the default order and stays stored.
 const sortableScannerColumns = new Set<string>(['fundingSpread', 'annualized', 'volume', 'openInterest', 'quote', 'spread', 'capital', 'roc', 'history24h', 'history7d', 'history30d']);
@@ -132,13 +137,14 @@ function QuoteDetails({ quotes, venues, mode, now, staleAfterMs }: { quotes: Per
   </div>;
 }
 
-type DetailTab = 'execution' | 'exit' | 'quotes';
-const DETAIL_TABS: { id: DetailTab; label: string }[] = [{ id: 'execution', label: '成交与持有' }, { id: 'exit', label: '平仓与跟踪' }, { id: 'quotes', label: '各平台报价' }];
+type DetailTab = 'execution' | 'quality' | 'exit' | 'quotes';
+const DETAIL_TABS: { id: DetailTab; label: string }[] = [{ id: 'execution', label: '成交与持有' }, { id: 'quality', label: '质量依据' }, { id: 'exit', label: '平仓与跟踪' }, { id: 'quotes', label: '各平台报价' }];
 const fxCurrencies = ['USDC', 'USD1', 'USDG', 'USD'];
 
 // M-5c: the pair chart is its own chunk, as in the workbench.
 const PerpetualChart = lazy(() => import('./PerpetualChart.tsx'));
 const PerpetualHolding = lazy(() => import('./PerpetualHolding.tsx'));
+const PerpetualTrend = lazy(() => import('./PerpetualTrend.tsx'));
 
 export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
   // M-5c: the workbench's workspaces less positions (M-5e); the chart's pair and window are URL state (perpetual-chart-state.ts).
@@ -269,6 +275,19 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
   const visiblePage = Math.max(1, Math.min(paused ? inspection.page : page, totalPages));
   const rows = useMemo(() => ranking.slice((visiblePage - 1) * pageSize, visiblePage * pageSize), [ranking, visiblePage]);
   const fundingScenarios = useMemo(() => fundingSort ? new Map(rows.map(row => [perpetualSpreadKey(row), estimatePerpetualHoldingScenario(row, qualityBudget, { holdingHours: 24, exitSpreadPercent: row.spreadPercent, priceMode: filters.priceMode, staleAfterMs: data?.staleAfterMs }, now)])) : null, [fundingSort, rows, qualityBudget, filters.priceMode, data?.staleAfterMs, now]);
+  // M-5d2: the workbench's quality read (perpetual-panel.tsx 361-365): the page's rows, the expanded one with its minute series.
+  const qualityPairs = useMemo(() => rows.map(row => ({ base: row.base, longKey: `${row.long.exchange}:${row.long.symbol}`, shortKey: `${row.short.exchange}:${row.short.symbol}`, ...(perpetualSpreadKey(row) === expanded ? { includeSeries: true } : {}) })), [rows, expanded]);
+  const { report: qualityReport, loading: qualityLoading, error: qualityError } = usePerpetualQuality(qualityPairs, opportunitiesActive && view === 'rank' && (scanner.columns.includes('quality') || paused || toolsOpen), onExpired);
+  const qualities = useMemo(() => new Map(rows.map(row => [qualityPairKey(row), evaluateOpportunityQuality(row, qualityReport, now, qualityBudget, filters.priceMode)])), [rows, qualityReport, now, qualityBudget, filters.priceMode]);
+  const quoteQuality = useMemo(() => {
+    const counts = { stale: 0, unavailable: 0 };
+    if (!opportunitiesActive || !now) return counts;
+    for (const key of quoteSelection.keys) {
+      const status = classifyPerpetualQuote(quoteSelection.byKey.get(key)!, filters.priceMode, now, data?.staleAfterMs ?? 30_000);
+      if (status !== 'fresh') counts[status]++;
+    }
+    return counts;
+  }, [opportunitiesActive, quoteSelection, filters.priceMode, now, data?.staleAfterMs]);
   const quoteRows = view === 'quotes' ? quoteSelection.keys.slice((visiblePage - 1) * pageSize, visiblePage * pageSize).map(key => quoteSelection.byKey.get(key)!) : emptyQuotes;
   // The service rejects a whole batch with a leg past its delisting time (the workbench's rule), so such rows are not asked
   // for: their cells say 已下架 instead of the whole page failing.
@@ -279,10 +298,10 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
   const { report: fundingHistoryReport, error: fundingHistoryError } = usePerpetualFundingHistory(historyPairs, opportunitiesActive && view === 'rank' && (scanner.columns.some(column => column === 'history24h' || column === 'history7d' || column === 'history30d') || paused), onExpired);
   const detailQuotes = useMemo(() => expandedBase ? quotes.filter(quote => quote.base === expandedBase && (!selected || selected.has(quote.exchange))) : emptyQuotes, [quotes, expandedBase, selected]);
 
-  function inspect(row: PerpetualSpread) {
+  function inspect(row: PerpetualSpread, toggle = true, tab: DetailTab = 'execution') {
     const key = perpetualSpreadKey(row);
-    if (expanded === key) { setInspection(null); return; }
-    setDetailTab('execution');
+    if (toggle && expanded === key) { setInspection(null); return; }
+    setDetailTab(tab);
     if (data) setInspection(previous => previous ? { ...previous, key, base: row.base } : { key, base: row.base, snapshot: data, ranking, page: visiblePage });
     requestAnimationFrame(() => { const table = document.querySelector('.scanner-table-wrap'); if (table) table.scrollLeft = 0; });
   }
@@ -411,6 +430,9 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
         const detailId = `perp-detail-${rows.indexOf(row)}`;
         const pairLabel = `${row.base} 多 ${venues.get(row.long.exchange)?.name ?? row.long.exchange} / 空 ${venues.get(row.short.exchange)?.name ?? row.short.exchange}`;
         const primarySpread = netSort ? row.netSpreadPercent ?? null : row.spreadPercent;
+        const quality = qualities.get(rowKey)!;
+        const history = pairQualityHistory(row, qualityReport);
+        const historicalDeviation = history && !row.crossCurrency && filters.priceMode === 'book' && history.spread.samples >= 30 && history.spread.coverage >= .5 && history.spread.lastAt && now - history.spread.lastAt <= 180_000 && Number.isFinite(history.spread.mean) ? (row.spreadPercent - history.spread.mean!) * 100 : null;
         const longFunding = normalizedFunding8h(row.long, now), shortFunding = normalizedFunding8h(row.short, now);
         const fundingSpread = longFunding === null || shortFunding === null ? null : shortFunding - longFunding;
         const category = scannerPairCategory(row);
@@ -432,25 +454,26 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
           volume: rowDelisted ? <span className="scanner-metric-state">已下架</span> : <ScannerMarketMetric long={longMetric} short={shortMetric} metricName="volume24h" now={now} />,
           openInterest: rowDelisted ? <span className="scanner-metric-state">已下架</span> : <ScannerMarketMetric long={longMetric} short={shortMetric} metricName="openInterest" now={now} />,
           quote: <div className="scanner-stack"><div title={String(row.buyPrice)}>{price(row.buyPrice)} <small>{row.long.quoteCurrency}</small></div><div title={String(row.sellPrice)}>{price(row.sellPrice)} <small>{row.short.quoteCurrency}</small></div>{now - row.updatedAt > staleAfterMs ? <small className="scanner-stale">报价已过期</small> : null}</div>,
-          spread: <div className={scannerPolarity(primarySpread)}><strong>{percent(primarySpread)}</strong><small className="secondary">{netSort ? '毛' : '净'} {percent(netSort ? row.spreadPercent : row.netSpreadPercent ?? null)}</small></div>,
+          spread: <div className={scannerPolarity(primarySpread)} title={historicalDeviation === null ? undefined : `较 1h 均值 ${historicalDeviation.toFixed(1)} bp`}><strong>{percent(primarySpread)}</strong><small className="secondary">{netSort ? '毛' : '净'} {percent(netSort ? row.spreadPercent : row.netSpreadPercent ?? null)}</small></div>,
           capital: <span title={rowCapital.capitalPercent === null ? rowCapital.reason : `按多腿 ${capitalAssumptions.longLeverage}x、空腿 ${capitalAssumptions.shortLeverage}x、缓冲 ${capitalAssumptions.marginBufferPercent}% 估算；资本占做多腿名义 ${rowCapital.capitalPercent.toFixed(1)}%`}>{rowCapital.capitalPercent === null ? '—' : `${rowCapital.capitalPercent.toFixed(1)}%`}</span>,
           roc: rowRoc.rocPercent === null ? <span title={rowCapital.reason || rowRoc.reason}>—</span> : <div className={scannerPolarity(rowRoc.rocPercent)} title={`ROC =（净价差 + ${capitalAssumptions.holdingHours}h 资金费）÷ 所需资本；按同数量双腿名义金额加权，连续外推当前费率，假设退出价差归零。${rowRoc.reason}`}><strong>{scannerPercent(rowRoc.rocPercent, 2)}</strong><small className="secondary">{rowRoc.fundingAvailable ? `资金费年化 ${scannerPercent(rowRoc.fundingRocAnnualizedPercent, 1)}` : '资金费缺失或过期 · 仅价差'}</small></div>,
           history24h: <ScannerHistory long={longHistory} short={shortHistory} total={!rowDelisted && scannerRequirements.historyHours.includes(24) ? scannerDataHistoryForPair(scannerData, historyPair, 24) ?? null : undefined} now={now} />,
           history7d: <ScannerHistory long={longHistory} short={shortHistory} total={!rowDelisted && scannerRequirements.historyHours.includes(168) ? scannerDataHistoryForPair(scannerData, historyPair, 168) ?? null : undefined} now={now} hours={168} />,
           history30d: <ScannerHistory long={longHistory} short={shortHistory} total={!rowDelisted && scannerRequirements.historyHours.includes(720) ? scannerDataHistoryForPair(scannerData, historyPair, 720) ?? null : undefined} now={now} hours={720} />,
+          quality: <QualityCell quality={quality} pairLabel={pairLabel} onInspect={() => inspect(row, false, 'quality')} />,
           time: <div className="scanner-time"><time dateTime={new Date(row.updatedAt).toISOString()}>{stamp(row.updatedAt)}</time><small>{age(row.updatedAt, now)}{paused ? now - row.updatedAt > staleAfterMs ? ' · 已过期' : ' · 已暂停' : ''}</small></div>,
         };
         const delisting = row.long.delisting || row.short.delisting;
         return <Fragment key={rowKey}><tr className={isExpanded ? 'perp-row-expanded scanner-chart-row' : 'scanner-chart-row'} onClick={event => { const target = event.target as HTMLElement; if (event.currentTarget.contains(target) && !target.closest('button, a, input, select, summary')) openChart(row); }}>
           <th scope="row" className="perp-base-cell"><div><strong>{row.base}</strong><small>{row.crossCurrency ? `${row.long.quoteCurrency} / ${row.short.quoteCurrency}` : row.long.quoteCurrency}{row.fxAdjusted ? ' · 已换汇' : ''}</small></div></th>
           {visibleColumns.map(column => <td key={column.id} data-column={column.id} className="scanner-number">{cells[column.id]}</td>)}
-          <td className="perp-expand-cell"><button type="button" aria-label={`${isExpanded ? '收起' : '展开'} ${pairLabel} 盘口校验与各平台报价`} aria-expanded={isExpanded} aria-controls={detailId} onClick={() => inspect(row)}><ChevronDown size={16} /></button></td>
+          <td className="perp-expand-cell"><button type="button" aria-label={`${isExpanded ? '收起' : '展开'} ${pairLabel} 质量依据与各平台报价`} aria-expanded={isExpanded} aria-controls={detailId} onClick={() => inspect(row)}><ChevronDown size={16} /></button></td>
         </tr>{isExpanded ? <tr className="perp-detail-row" id={detailId}><td colSpan={visibleColumns.length + 2}>
           <div className="perp-inspection-bar"><p role="status"><strong>行情已暂停</strong> · 保留 {stamp(data?.generatedAt)} 的排名与报价{now - row.updatedAt > staleAfterMs ? ' · 报价已过期，仅供核对' : ''}</p><button type="button" onClick={() => setInspection(null)}>收起并恢复</button></div>
           <div className="scanner-detail-evidence"><button type="button" className="perp-refresh" onClick={() => openChart(row)}>创建价差图表 · 资金费稳定度</button>{delisting ? <><DelistingNotice quote={row.long} now={now} /><DelistingNotice quote={row.short} now={now} /></> : null}<FundingHistory long={longHistory} short={shortHistory} now={now} /><p>所需资本 {rowCapital.capitalPercent === null ? '—' : `${rowCapital.capitalPercent.toFixed(1)}%`} 多腿名义 · ROC（{capitalAssumptions.holdingHours}h）{scannerPercent(rowRoc.rocPercent, 2)} · 资金费年化 ROC {scannerPercent(rowRoc.fundingRocAnnualizedPercent, 1)}{rowRoc.reason ? ` · ${rowRoc.reason}` : ''}</p>{fundingScenario ? <p>未来 24h 资金费 {percent(fundingScenario.fundingPercent, 4)} · 未来 24h 扣费后 {percent(fundingScenario.estimatedNetPercent, 4)}{fundingScenario.reasons.length ? ` · ${fundingScenario.reasons[0]}` : ''}</p> : null}</div>
           <div className="perp-detail-navigation"><div role="tablist" aria-label="组合详情" onKeyDown={event => { const ids = DETAIL_TABS.map(tab => tab.id); const index = ids.indexOf(detailTab); const next = event.key === 'ArrowRight' ? ids[(index + 1) % ids.length] : event.key === 'ArrowLeft' ? ids[(index + ids.length - 1) % ids.length] : event.key === 'Home' ? ids[0] : event.key === 'End' ? ids[ids.length - 1] : null; if (next) { event.preventDefault(); setDetailTab(next); document.getElementById(`${detailId}-tab-${next}`)?.focus(); } }}>{DETAIL_TABS.map(tab => <button type="button" role="tab" key={tab.id} id={`${detailId}-tab-${tab.id}`} aria-selected={detailTab === tab.id} tabIndex={detailTab === tab.id ? 0 : -1} aria-controls={`${detailId}-content`} onClick={() => setDetailTab(tab.id)}>{tab.label}</button>)}</div></div>
           <div role="tabpanel" id={`${detailId}-content`} aria-labelledby={`${detailId}-tab-${detailTab}`} className="perp-detail-content">
-            {detailTab === 'execution' ? <><PerpetualExecution long={row.long} short={row.short} active now={now} onExpired={onExpired} /><LazyBoundary what="持有期情景" className="perp-quality-notice"><Suspense fallback={null}><PerpetualHolding row={row} budget={qualityBudget} now={now} mode={filters.priceMode} fundingFocused={fundingSort} /></Suspense></LazyBoundary></> : detailTab === 'exit' ? <PerpetualExit long={row.long} short={row.short} budget={qualityBudget} active now={now} onExpired={onExpired} /> : <QuoteDetails quotes={detailQuotes} venues={venues} mode={filters.priceMode} now={now} staleAfterMs={staleAfterMs} />}
+            {detailTab === 'execution' ? <><PerpetualExecution long={row.long} short={row.short} active now={now} onExpired={onExpired} /><LazyBoundary what="持有期情景" className="perp-quality-notice"><Suspense fallback={null}><PerpetualHolding row={row} budget={qualityBudget} now={now} mode={filters.priceMode} fundingFocused={fundingSort} /></Suspense></LazyBoundary><LazyBoundary what="价差趋势" className="perp-quality-notice"><Suspense fallback={null}><PerpetualTrend history={history} now={now} crossCurrency={row.crossCurrency} /></Suspense></LazyBoundary></> : detailTab === 'quality' ? <QualityEvidence row={row} report={qualityReport} quality={quality} venues={venues} now={now} slippagePercent={qualityBudget.slippagePercent} /> : detailTab === 'exit' ? <PerpetualExit long={row.long} short={row.short} budget={qualityBudget} active now={now} onExpired={onExpired} /> : <QuoteDetails quotes={detailQuotes} venues={venues} mode={filters.priceMode} now={now} staleAfterMs={staleAfterMs} />}
           </div>
         </td></tr> : null}</Fragment>;
       })}</tbody></table>
@@ -476,6 +499,8 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
       </details>
       <PerpetualManualPairs snapshot={data} mode={filters.priceMode} now={now} budget={qualityBudget} active={opportunitiesActive && toolsOpen} paused={paused} onExpired={onExpired} />
       <PerpetualFeeSettings budget={qualityBudget} onChange={next => { setInspection(null); setQualityBudget(next); }} />
+      <p className="perp-quality-caption">{qualityLoading ? '质量资料更新中' : qualityReport ? `质量资料最近读取 ${stamp(qualityReport.generatedAt)}` : '质量资料采集中'} · {quoteQuality.stale} 条报价过期 / {quoteQuality.unavailable} 条暂缺</p>
+      {qualityError || qualityReport?.error || qualityReport?.storageError ? <p className="perp-quality-notice" role="status">{[qualityError || qualityReport?.error, qualityReport?.storageError].filter(Boolean).join(' ')}</p> : null}
     </div></details>
     </>}
   </section>;

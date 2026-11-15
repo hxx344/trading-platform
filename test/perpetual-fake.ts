@@ -6,8 +6,13 @@
 // funding histories (M-5b2) answer Binance and Bybit (8-hourly) and Hyperliquid (hourly) with a stable rate per base and
 // time, paged as the venues page; OKX and Lighter fail likewise. The hourly trade closes (M-5c) answer Binance, Bybit and
 // Hyperliquid's candles around each base's opening price with a per-venue offset and a slow swing; OKX fails, Lighter is not a
-// venue the reader supports.
+// venue the reader supports. The quality service (M-5d2) gets stand-in sources instead of CoinGecko and the ratio venues: BTC
+// and ETH have market cap / FDV (every other base reads as unmapped); Binance and Bybit answer a long/short account ratio per
+// base for the current 5-minute period, OKX has no series (unavailable), Hyperliquid and Lighter are DEXs (unsupported).
 import type { PerpetualOptions } from '../src/monitor/perpetual.ts';
+import type { FundamentalsClient } from '../src/vendor/perpetual-fundamentals.mjs';
+import type { PositioningFetch } from '../src/vendor/perpetual-positioning.mjs';
+import type { TokenFundamentals } from '../src/vendor/perpetual-quality.ts';
 import type { PerpetualMarket, PerpetualUpdate } from '../src/vendor/perpetual-stream.mjs';
 
 const VENUES = [
@@ -151,6 +156,21 @@ export function fakePerpetualVenues(): PerpetualOptions {
     }
     throw new Error(`preview: no stand-in for ${url.hostname}${url.pathname}`);
   };
+  const assets: Record<string, Omit<TokenFundamentals, 'updatedAt'>> = {
+    BTC: { coinId: 'bitcoin', name: 'Bitcoin', marketCapUsd: 1_950_000_000_000, fdvUsd: 2_070_000_000_000, circulatingSupply: 19_800_000, totalSupply: 19_800_000, maxSupply: 21_000_000, source: 'preview' },
+    ETH: { coinId: 'ethereum', name: 'Ethereum', marketCapUsd: 412_000_000_000, fdvUsd: 412_000_000_000, circulatingSupply: 120_500_000, totalSupply: 120_500_000, maxSupply: null, source: 'preview' },
+  };
+  const fundamentals: FundamentalsClient = {
+    refresh: async () => ({}),
+    get: base => assets[base] ? { ...assets[base]!, updatedAt: Math.floor(Date.now() / 600_000) * 600_000 } : null,
+    describe: base => assets[base] ? { base, coinId: assets[base]!.coinId, status: 'ready', reason: null } : { base, coinId: null, status: 'unmapped', reason: '资产目录中未找到该币种' },
+  };
+  const positioningFetch: PositioningFetch = async (quote, options) => {
+    if (quote.exchange !== 'binance' && quote.exchange !== 'bybit') return null;
+    const period = Math.floor((options?.now ?? Date.now()) / 300_000) * 300_000;
+    const longRatio = 0.42 + ((quote.base.charCodeAt(0) + quote.base.length * 7 + (quote.exchange === 'bybit' ? 5 : 0)) % 20) / 100;
+    return { exchange: quote.exchange, symbol: quote.symbol, longRatio, shortRatio: 1 - longRatio, kind: 'accounts', scope: '合约全体持仓账户（5 分钟）', source: `preview:${quote.exchange}`, observedAt: period };
+  };
   class RefusingSocket {
     on(type: string, listener: (data?: unknown) => void): void { if (type === 'error') setTimeout(() => listener(), 0); }
     send(): void { /* Never opens. */ }
@@ -169,5 +189,6 @@ export function fakePerpetualVenues(): PerpetualOptions {
     metrics: { fetchImpl: metricsFetch },
     fundingHistory: { fetchImpl: fundingFetch },
     priceHistory: { fetchImpl: priceFetch },
+    quality: { fundamentals, positioningFetch },
   };
 }

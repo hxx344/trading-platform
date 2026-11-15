@@ -59,7 +59,7 @@
 }
 
 /* The workbench page also has Tailwind's preflight under these rules; the parts its markup relies on. */
-.monitor-desk *,.monitor-desk *::before,.monitor-desk *::after{margin:0;padding:0;border:0 solid var(--border)}
+:where(.monitor-desk) *,:where(.monitor-desk) *::before,:where(.monitor-desk) *::after{margin:0;padding:0;border:0 solid var(--border)}
 .monitor-desk button{background-color:transparent;border-radius:0;color:inherit}
 .monitor-desk h1,.monitor-desk h2,.monitor-desk h3{font-size:inherit;font-weight:inherit}
 .monitor-desk table{text-indent:0;border-color:inherit}

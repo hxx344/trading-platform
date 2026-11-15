@@ -10,7 +10,7 @@
     "check": "tsc -p tsconfig.json && tsc -p web/tsconfig.json",
     "build:web": "vite build --config web/vite.config.ts",
     "dev:web": "vite --config web/vite.config.ts --host 127.0.0.1",
-    "test": "node --test --test-reporter=dot test/*.test.ts test/crossex/*.test.mjs web/test/crossex/*.test.mjs",
+    "test": "node --test --test-reporter=dot test/*.test.ts test/crossex/*.test.mjs web/test/crossex/*.test.mjs test/perpetual/*.test.mjs web/test/perpetual/*.test.mjs",
     "start": "node src/main.ts",
     "service": "node src/service/main.ts",
     "measure": "node scripts/measure.ts"

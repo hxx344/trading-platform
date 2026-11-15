@@ -111,7 +111,11 @@ export interface ServiceViews {
     /** M-3d: the saved Variational token (state without the token, and the page's save); undefined when oil is not configured. */
     variationalSession?(): { view(): unknown; update(body: unknown): Promise<unknown> } | undefined;
     /** M-4a: the perpetual collector's table, summary and SSE stream; undefined when it is not configured. */
-    perpetual?(): { snapshot(): unknown; summary(): unknown; stream(request: IncomingMessage, response: ServerResponse): void } | undefined;
+    perpetual?(): {
+      snapshot(): unknown; summary(): unknown; stream(request: IncomingMessage, response: ServerResponse): void;
+      /** M-5a: one-shot public depth, the close estimate and the FX rates; refusals carry an HTTP `status`. */
+      depth?(input: unknown): Promise<unknown>; exit?(input: unknown): Promise<unknown>; fx?(): Promise<unknown>;
+    } | undefined;
   };
   /** The options module's reads and writes (service/options.ts); absent when the service runs no options module. */
   options?: {
@@ -342,6 +346,21 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       if (!perpetual) return send(response, 404, { code: 'not_found', message: '本服务没有配置合约价差行情监控' });
       if (perpetualRoute === 'stream') return perpetual.stream(request, response);
       return send(response, 200, perpetualRoute === 'quote' ? perpetual.snapshot() : perpetual.summary());
+    }
+    // M-5a: the workbench's depth / exit (POST) and fx (GET) actions — one public read each, refused with the venue's reason.
+    const inspection = /^\/api\/monitor\/perpetual\/(depth|exit|fx)$/.exec(url.pathname)?.[1];
+    if (inspection && request.method === (inspection === 'fx' ? 'GET' : 'POST')) {
+      if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
+      const perpetual = views.monitor.state().markets.includes('perpetual') ? views.monitor.perpetual?.() : undefined;
+      const read = inspection === 'fx' ? perpetual?.fx?.bind(perpetual) : inspection === 'depth' ? perpetual?.depth?.bind(perpetual) : perpetual?.exit?.bind(perpetual);
+      if (!read) return send(response, 404, { code: 'not_found', message: '本服务没有配置合约价差行情监控' });
+      const body = inspection === 'fx' ? undefined : await readJson(request);
+      try { return send(response, 200, await read(body)); }
+      catch (error) {
+        const status = (error as { status?: unknown })?.status;
+        const code = status === 429 ? 'rate_limited' : status === 409 ? 'identity_changed' : status === 400 ? 'invalid_request' : status === 503 ? 'unavailable' : 'upstream_error';
+        return send(response, typeof status === 'number' && status >= 400 && status < 600 ? status : 502, { code, message: error instanceof Error ? error.message : '盘口查询失败' });
+      }
     }
     const alertRoute = /^\/api\/monitor\/(oil|hynix)\/alerts(\/test)?$/.exec(url.pathname);
     if (alertRoute && (request.method === 'GET' ? !alertRoute[2] : request.method === 'POST')) {

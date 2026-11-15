@@ -3,14 +3,17 @@
 // The core of the workbench's createPerpetualService (modules/monitor/server/perpetual-service.mjs, c84ba27): discovery every
 // 5 minutes, one WebSocket per subscription plan with backoff, watchdog, heartbeats, the shared-host poll budget and REST
 // book snapshots; quotes are committed once a second and broadcast as patches against what every reader last got.
-// Left out (later batches, docs/monitor.md M-4): the saved quotes (market.sqlite), quality, funding/price history, alerts,
-// paper trading, depth, CrossEx filters, metrics. Quotes live in memory only; a restart or a switch-off starts from empty.
+// M-5a adds the workbench's execution service (perpetual-depth.mjs): one-shot public depth for an amount (depth), the close
+// estimate of a position (exit) and the spot FX rates (fx), created on start and stopped with the collector.
+// Left out (later batches, docs/monitor.md M-4/M-5): the saved quotes (market.sqlite), quality, funding/price history, alerts,
+// paper trading, CrossEx filters, metrics. Quotes live in memory only; a restart or a switch-off starts from empty.
 // Node's own WebSocket is used (it takes request headers); like fetch it goes through Node's global dispatcher, so with
 // NODE_USE_ENV_PROXY=1 and HTTPS_PROXY (README) both the directory reads and the sockets use the proxy.
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { constants as zlibConstants, createGzip, type Gzip } from 'node:zlib';
 import { EXCHANGES, createSubscriptions, discoverMarkets, getControlResponse, parseMessage, type PerpetualRequestOptions, type PerpetualSpec, type PerpetualVenue } from '../vendor/perpetual-exchanges.mjs';
+import { createPerpetualExecutionService, type PerpetualExecutionOptions, type PerpetualExecutionService } from '../vendor/perpetual-depth.mjs';
 import { MAX_FUTURE_MS, PERPETUAL_STALE_MS, createPerpetualChangedPatch, mergePerpetualQuote, withMarketMetadata, type PerpetualExchange, type PerpetualMarket, type PerpetualQuote, type PerpetualSnapshot, type PerpetualStatus, type PerpetualUpdate } from '../vendor/perpetual-stream.mjs';
 
 /** The workbench's collection policy (collection-policy.mjs). */
@@ -61,6 +64,14 @@ export interface PerpetualOptions {
   now?: () => number; log?: (line: string) => void;
   staleAfterMs?: number; retryMs?: number; discoveryIntervalMs?: number; observationIntervalMs?: number; broadcastIntervalMs?: number;
   watchdogIntervalMs?: number; quoteTimeoutMs?: number;
+  /** The depth / exit / FX reads' venues (tests and the local preview stand in for them). */
+  execution?: Pick<PerpetualExecutionOptions, 'fetchImpl' | 'WebSocketImpl' | 'maxMarkets' | 'cacheMs'>;
+}
+
+/** A refusal of the depth, exit or FX read, with the HTTP status the workbench gives it. */
+export class PerpetualInspectionError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) { super(message); this.status = status; }
 }
 
 /** Whether Accept-Encoding allows gzip (`gzip;q=0` refuses it). */
@@ -79,7 +90,7 @@ export function createPerpetualMonitor({
   exchanges = EXCHANGES, discover = discoverMarkets, subscriptions = createSubscriptions, parse = parseMessage, control = getControlResponse,
   fetchImpl, WebSocketImpl = globalThis.WebSocket as unknown as PerpetualSocketFactory, now: clock = Date.now, log = line => process.stderr.write(`${line}\n`),
   staleAfterMs = PERPETUAL_STALE_MS, retryMs = 5_000, discoveryIntervalMs = PERPETUAL_DISCOVERY_MS, observationIntervalMs = PERPETUAL_OBSERVATION_MS,
-  broadcastIntervalMs = PERPETUAL_OBSERVATION_MS, watchdogIntervalMs = 10_000, quoteTimeoutMs = 45_000,
+  broadcastIntervalMs = PERPETUAL_OBSERVATION_MS, watchdogIntervalMs = 10_000, quoteTimeoutMs = 45_000, execution: executionOptions,
 }: PerpetualOptions = {}) {
   const quotes = new Map<string, PerpetualQuote>(), pendingQuotes = new Map<string, PerpetualQuote>(), publishedQuotes = new Map<string, PerpetualQuote>(), publishDirty = new Set<string>();
   const connections = new Set<Connection>(), timers = new Set<ReturnType<typeof setTimeout>>(), pollBudgets = new Map<string, PollBudget>();
@@ -88,6 +99,16 @@ export function createPerpetualMonitor({
   const fresh = (): Map<string, VenueState> => new Map(exchanges.map(exchange => [exchange.id, { id: exchange.id, name: exchange.name, kind: exchange.kind, marketCount: 0, lastMessageAt: null, error: null, snapshotError: null, discovering: false, retryPending: false, discoveryFailing: false, generation: 0, reconnects: 0, lastProtocolError: null }]));
   let states = fresh();
   let running = false, sequence = 0, streamId = randomUUID();
+  // A new one per start: stop() aborts its controller for good (the workbench's service is never restarted).
+  let execution: PerpetualExecutionService | null = null;
+  async function inspect<T>(read: (service: PerpetualExecutionService) => Promise<T>): Promise<T> {
+    if (!execution) throw new PerpetualInspectionError(503, '合约价差采集未运行，开启后再查询盘口');
+    try { return await read(execution); }
+    catch (error) {
+      const status = (error as { status?: unknown })?.status;
+      throw new PerpetualInspectionError(typeof status === 'number' && status >= 400 && status < 600 ? status : 502, reason(error));
+    }
+  }
   let observationTimer: ReturnType<typeof setInterval> | undefined, broadcastTimer: ReturnType<typeof setInterval> | undefined, refreshTimer: ReturnType<typeof setInterval> | undefined;
   const venue = (exchange: string): VenueState => states.get(exchange)!;
 
@@ -329,6 +350,10 @@ export function createPerpetualMonitor({
     start(): void {
       if (running) return;
       running = true;
+      execution = createPerpetualExecutionService({
+        getQuote: (exchange, symbol) => quotes.get(`${exchange}:${symbol}`), getMarket: (exchange, symbol) => states.get(exchange)?.markets?.get(symbol),
+        clock, ...(fetchImpl ? { fetchImpl } : {}), ...executionOptions,
+      });
       if (observationIntervalMs > 0) { observationTimer = setInterval(observe, observationIntervalMs); observationTimer.unref?.(); }
       for (const exchange of states.keys()) void refresh(exchange);
       refreshTimer = setInterval(() => { for (const exchange of states.keys()) void refresh(exchange); }, discoveryIntervalMs);
@@ -342,6 +367,7 @@ export function createPerpetualMonitor({
     stop(): void {
       if (!running) return;
       running = false; closeStreams();
+      execution?.stop(); execution = null;
       for (const timer of [observationTimer, refreshTimer, broadcastTimer]) clearInterval(timer);
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
@@ -406,6 +432,12 @@ export function createPerpetualMonitor({
       if (!running) closeStreams();
     },
     closeStreams,
+    /** M-5a: the public books for a long-leg USDT amount on both legs (the workbench's depth action). */
+    depth: (input: unknown) => inspect(service => service.depth(input)),
+    /** M-5a: closing a position into the current public books (the workbench's exit action). */
+    exit: (input: unknown) => inspect(service => service.exit(input)),
+    /** M-5a: the spot FX rates of USDC, USD1, USDG and USD in USDT (cached a minute). */
+    fx: () => inspect(service => service.fx()),
   };
 }
 export type PerpetualMonitor = ReturnType<typeof createPerpetualMonitor>;

@@ -1,5 +1,7 @@
 // Stand-in perpetual venues for the local preview (scripts/dev-monitor.ts): five venues with the real ids (so the page shows
-// their marks), ~40 bases each, books and funding that drift once a second over in-process sockets. Nothing goes to the network.
+// their marks), ~40 bases each, books and funding that drift once a second over in-process sockets. Nothing goes to the network:
+// the on-demand depth check and spot FX (M-5a) read 20-level books around the current price from an in-process fetch, and the
+// one venue the service reads over WebSocket (Lighter) refuses at once.
 import type { PerpetualOptions } from '../src/monitor/perpetual.ts';
 import type { PerpetualMarket, PerpetualUpdate } from '../src/vendor/perpetual-stream.mjs';
 
@@ -62,6 +64,32 @@ export function fakePerpetualVenues(): PerpetualOptions {
     send(): void { /* Subscriptions are implied by the URL. */ }
     close(): void { this.closed = true; this.readyState = 3; clearInterval(this.timer); }
   }
+  const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200, headers: { 'content-type': 'application/json' } });
+  const levels = (base: string, side: 'bids' | 'asks') => {
+    const mid = prices.get(base) ?? 0;
+    return Array.from({ length: 20 }, (_, index) => [String(mid * (1 + (side === 'asks' ? 1 : -1) * (0.0002 + index * 0.0001))), String(2_500 / mid * (1 + index / 4))]);
+  };
+  const baseOf = (symbol: string) => symbol.replace(/USDT$|USDC$/, '');
+  const fetchImpl = async (input: string, init?: RequestInit): Promise<Response> => {
+    const url = new URL(input), symbol = url.searchParams.get('symbol') ?? url.searchParams.get('instId') ?? '', now = Date.now();
+    if (url.hostname === 'fapi.binance.com') return json({ E: now, bids: levels(baseOf(symbol), 'bids'), asks: levels(baseOf(symbol), 'asks') });
+    if (url.hostname === 'api.bybit.com') return json({ retCode: 0, result: { s: symbol, ts: now, b: levels(baseOf(symbol), 'bids'), a: levels(baseOf(symbol), 'asks') } });
+    if (url.pathname === '/api/v5/public/instruments') return json({ code: '0', data: [{ instId: symbol, ctType: 'linear', ctValCcy: symbol.split('-')[0], ctVal: '1', ctMult: '1' }] });
+    if (url.pathname === '/api/v5/market/books') return json({ code: '0', data: [{ ts: String(now), bids: levels(baseOf(symbol), 'bids'), asks: levels(baseOf(symbol), 'asks') }] });
+    if (url.hostname === 'api.hyperliquid.xyz') {
+      const coin = (JSON.parse(String(init?.body ?? '{}')) as { coin?: string }).coin ?? '';
+      const side = (name: 'bids' | 'asks') => levels(coin, name).map(([px, sz]) => ({ px, sz, n: 1 }));
+      return json({ coin, time: now, levels: [side('bids'), side('asks')] });
+    }
+    if (url.pathname === '/api/v4/spot/order_book') return json({ update: now, current: now, bids: [['0.9997', '50000']], asks: [['1.0002', '50000']] });
+    if (url.hostname === 'api.kraken.com') return json({ error: [], result: { USDTZUSD: { bids: [['1.0001', '50000', now / 1000]], asks: [['1.0003', '50000', now / 1000]] } } });
+    throw new Error(`preview: no stand-in for ${url.hostname}${url.pathname}`);
+  };
+  class RefusingSocket {
+    on(type: string, listener: (data?: unknown) => void): void { if (type === 'error') setTimeout(() => listener(), 0); }
+    send(): void { /* Never opens. */ }
+    terminate(): void { /* Never opened. */ }
+  }
   // Prices drift slowly so the ranking reorders.
   setInterval(() => { for (const [base, value] of prices) prices.set(base, value * (1 + (Math.random() - 0.5) * 0.001)); }, 2_000).unref();
   return {
@@ -71,5 +99,6 @@ export function fakePerpetualVenues(): PerpetualOptions {
     parse: ((_exchange: string, payload: unknown) => (payload as { updates?: PerpetualUpdate[] }).updates ?? []) as PerpetualOptions['parse'],
     control: (() => null) as PerpetualOptions['control'],
     WebSocketImpl: FakeSocket as unknown as PerpetualOptions['WebSocketImpl'],
+    execution: { fetchImpl, WebSocketImpl: RefusingSocket },
   };
 }

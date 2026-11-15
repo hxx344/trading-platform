@@ -28,7 +28,8 @@
 ## 已运行
 
 - YAML 解析校验；替身 node 核对 `TEST_SHARD` 设与不设时的展开参数；三文件上前置 `--test-shard` 时 1/2、2/2 测试数 34+14=48，与不分片相同。
-- PR #48 首次 CI：`check` 65s、`watch` 26s 通过，`test (2)` 52s 通过，`test (1)` 41s 失败（原因见上表）。修复后的 CI 结果见下节。
+- PR #48 首次 CI：`check` 65s、`watch` 26s 通过，`test (2)` 52s 通过，`test (1)` 41s 失败（原因见上表）。
+- PR #48 修复后 CI（ae0a587）：全部通过，总耗时 68s（改前约 135s）；`check` 66s、`test (1)` 54s、`test (2)` 48s、`watch` 22s。
 
 ## 未运行
 

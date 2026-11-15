@@ -54,4 +54,5 @@
 - PR #49 第一次 CI：check、test (1)、watch 通过；test (2) 失败，原因是上表 CI 那一行的抢锁。
 - 第 2 轮修复后：`pnpm check` 通过；`node --test test/service.test.ts test/options-isolation.test.ts test/aster.test.ts test/monitor.test.ts test/asset-http.test.ts test/crossex-service.test.ts test/options.test.ts`（多个文件并行，覆盖抢锁场景和 `FakeAster` 的其他使用方）全部通过。
 - PR #49 第二次 CI（5158165）：check、test (1)、test (2)、watch 全部通过。
-- 第 3 轮修复后（只换测试钱包字节）：`node --test test/service.test.ts test/options-isolation.test.ts` 并行通过；最终 CI 见 PR #49。
+- 第 3 轮修复后（只换测试钱包字节）：`node --test test/service.test.ts test/options-isolation.test.ts` 并行通过。
+- PR #49 最终 CI（123bec7）：check、test (1)、test (2)、watch 全部通过。合并为 391dacd，随 v0.48.0 发布（README、docs/options.md 所写版本号已核对一致）。

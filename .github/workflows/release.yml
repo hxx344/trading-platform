@@ -32,6 +32,7 @@ jobs:
       - run: pnpm build:web
       - run: pnpm test
       - run: shellcheck deploy/*.sh
+      - run: python3 -I -B deploy/main-watch/test_main_watch.py
       - run: bash deploy/test-install.sh
       - run: bash deploy/package.sh dist
       - name: 更新说明
@@ -68,5 +69,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/trading-platform.tar.gz dist/install.sh dist/SHA256SUMS \
+          gh release create "$GITHUB_REF_NAME" dist/trading-platform.tar.gz dist/install.sh dist/install-watch.sh dist/main_watch.py dist/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes-file dist/NOTES.md --verify-tag

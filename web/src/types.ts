@@ -72,6 +72,8 @@ export interface ServiceStatus {
   feishu?: { configured: boolean; pending: number; retrying: number; lastSentAt: number | null; lastError: string | null; nextRetryAt: number | null; retentionMs: number; recent: OutboxRow[] };
   summary?: SummaryStatus;
   samples?: { available: boolean; error: string | null };
+  /** The heartbeat pushed to the second server's main-watch; only with config.json `watch`. */
+  watch?: { url: string; lastOkAt: number | null; lastReady: boolean | null; failures: number; lastError: string | null; lastErrorAt: number | null };
 }
 
 /** One line of the service log (GET /api/logs). */

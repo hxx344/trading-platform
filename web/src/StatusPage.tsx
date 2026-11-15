@@ -86,6 +86,14 @@ function Summary({ summary }: { summary: NonNullable<ServiceStatus['summary']> }
   </dl></div>;
 }
 
+function Watch({ watch, now }: { watch: NonNullable<ServiceStatus['watch']>; now: number }) {
+  return <div className="panel-body"><dl className="facts">
+    <dt>推送到</dt><dd className="mono">{watch.url}</dd>
+    <dt>最近送达</dt><dd className={watch.failures ? 'err' : undefined}>{watch.lastOkAt ? `${stamp(watch.lastOkAt)}（${ago(watch.lastOkAt, now)}），上报${watch.lastReady ? '就绪' : '未就绪'}` : <span className="muted">尚未送达</span>}{watch.failures ? `，${watch.lastOkAt ? '之后' : ''}连续失败 ${watch.failures} 次` : ''}</dd>
+    <dt>最近错误</dt><dd className={watch.failures ? 'err' : undefined}>{watch.lastError ? <>{watch.lastError}<span className="muted">（{stamp(watch.lastErrorAt)}）</span></> : '无'}</dd>
+  </dl></div>;
+}
+
 /** The service's own health: background loops, the database, the request budget, user streams and the alert outbox. */
 export function StatusPage({ onExpired }: { onExpired: () => void }) {
   const { data, status, error } = useLiveResource<ServiceStatus>('/api/status', { intervalMs: REFRESH_MS, onExpired });
@@ -114,6 +122,11 @@ export function StatusPage({ onExpired }: { onExpired: () => void }) {
       <div className="section-head"><h2>飞书定时运行摘要</h2></div>
       <p className="panel-note">照工作台的「ASTER 运行摘要」卡片：合计浮盈亏、各配对两侧可用保证金与占用率、持仓、划转与 ADL 状态，需要处理的配对排在前面。</p>
       <Summary summary={data.summary} />
+    </section> : null}
+    {data.watch ? <section className="panel">
+      <div className="section-head"><h2>副服务器巡检心跳</h2></div>
+      <p className="panel-note">每 30 秒向副服务器的 main-watch 推送一次签名心跳，带上本服务是否就绪；副服务器 90 秒收不到或收到“未就绪”时按它的阈值发飞书告警。推送失败不影响划转与 ADL。</p>
+      <Watch watch={data.watch} now={now} />
     </section> : null}
     {data.samples ? <p className={data.samples.available ? 'status-line' : 'status-line err'}>余额采样：{data.samples.available ? '正常（每分钟一次，保留 30 天）' : `不可用：${data.samples.error ?? '未知原因'}（不影响划转与 ADL）`}</p> : null}
   </>;

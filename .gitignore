@@ -4,3 +4,4 @@ node_modules/
 *.sqlite-*
 dist/
 web/dist/
+__pycache__/

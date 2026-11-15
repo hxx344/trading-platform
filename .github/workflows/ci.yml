@@ -21,4 +21,21 @@ jobs:
       - run: pnpm build:web
       - run: pnpm test
       - run: shellcheck deploy/*.sh
+      - run: python3 -I -B deploy/main-watch/test_main_watch.py
       - run: bash deploy/test-install.sh
+
+  # The second server's watchdog (docs/watch.md) installed on a real systemd: units, sandbox, alert round, upgrade, uninstall.
+  watch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: 一次性 runner 上把安装路径整理为只有 root 可写
+        run: |
+          for path in /opt /usr/local /usr/local/bin; do
+            test -d "$path" && test ! -L "$path"
+            sudo setfacl --remove-all --remove-default "$path"
+            sudo chown root:root "$path"
+            sudo chmod go-w "$path"
+          done
+      - run: sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin TP_WATCH_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-watch-systemd.sh

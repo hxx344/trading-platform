@@ -13,6 +13,7 @@
 | 期权 Greeks | [docs/options.md](docs/options.md) |
 | 行情监控 | [docs/monitor.md](docs/monitor.md) |
 | 资产账本 | [docs/asset.md](docs/asset.md) |
+| 副服务器巡检（main-watch）、心跳推送、`install-watch.sh` | [docs/watch.md](docs/watch.md) |
 | 真实账户上已核实与待实测的事项 | [docs/live-results.md](docs/live-results.md)、[docs/plan.md](docs/plan.md) 第 6 节 |
 | 新模块的启用与数据迁移、从工作台导入 | [docs/module-import.md](docs/module-import.md) |
 

@@ -14,7 +14,9 @@ import { fundingWindowTotal, type PerpetualFundingLeg } from '../../src/vendor/p
 import { scannerCapitalMetrics } from './perpetual-capital.ts';
 import { nextScannerSort, parseScannerSort, scannerSortRequirements, sortScannerRows, type ScannerSort, type ScannerSortColumn } from './perpetual-scanner-sort.ts';
 import { normalizeCapitalAssumptions, parseCapitalAssumptions, type CapitalAssumptions } from '../../src/vendor/capital-metrics.mjs';
-import { defaultQualityBudget } from './perpetual-fees.ts';
+import { parseQualityBudget, type QualityBudget } from './perpetual-fees.ts';
+import { estimatePerpetualHoldingScenario } from './perpetual-opportunity.ts';
+import PerpetualFeeSettings from './PerpetualFeeSettings.tsx';
 import { PerpetualExecution } from './PerpetualExecution.tsx';
 import PerpetualExit from './PerpetualExit.tsx';
 import PerpetualManualPairs from './PerpetualManualPairs.tsx';
@@ -42,6 +44,7 @@ const preferencesKey = 'market-monitor:perpetual:v1';
 const scannerSortKey = 'market-monitor:perpetual-scanner-sort:v1';
 const capitalAssumptionsKey = 'market-monitor:perpetual-capital-assumptions:v1';
 const scannerRangesKey = 'market-monitor:perpetual-scanner-ranges:v1';
+const qualityBudgetKey = 'market-monitor:perpetual-quality-budget:v1';
 // The columns built so far; stored choices of later batches' columns stay in storage untouched and are not offered.
 const builtColumns = new Set<ScannerColumnId>(['type', 'pair', 'funding', 'fundingSpread', 'annualized', 'volume', 'openInterest', 'quote', 'spread', 'capital', 'roc', 'history24h', 'history7d', 'history30d', 'time']);
 const AVAILABLE_COLUMNS = SCANNER_COLUMNS.filter(column => builtColumns.has(column.id));
@@ -135,6 +138,7 @@ const fxCurrencies = ['USDC', 'USD1', 'USDG', 'USD'];
 
 // M-5c: the pair chart is its own chunk, as in the workbench.
 const PerpetualChart = lazy(() => import('./PerpetualChart.tsx'));
+const PerpetualHolding = lazy(() => import('./PerpetualHolding.tsx'));
 
 export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
   // M-5c: the workbench's workspaces less positions (M-5e); the chart's pair and window are URL state (perpetual-chart-state.ts).
@@ -152,6 +156,8 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
   const [scanner, setScanner] = useState<ScannerPreferences>(() => parseScannerPreferences(readStored(scannerPreferencesKey)));
   const [scannerSort, setScannerSort] = useState<ScannerSort | null>(() => parseScannerSort(readStored(scannerSortKey)));
   const [capitalAssumptions, setCapitalAssumptions] = useState<CapitalAssumptions>(() => parseCapitalAssumptions(readStored(capitalAssumptionsKey)));
+  // M-5d1: the workbench's taker-fee and slippage budget (read before the first render, like the ranges; no ready flag).
+  const [qualityBudget, setQualityBudget] = useState<QualityBudget>(() => parseQualityBudget(readStored(qualityBudgetKey)));
   const [view, setView] = useState<'rank' | 'quotes'>('rank');
   const [page, setPage] = useState(1);
   const [toolsOpen, setToolsOpen] = useState(false);
@@ -165,6 +171,13 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
   useEffect(() => { store(scannerSortKey, scannerSort); }, [scannerSort]);
   useEffect(() => { store(capitalAssumptionsKey, capitalAssumptions); }, [capitalAssumptions]);
   useEffect(() => { store(scannerRangesKey, rangeInputs); }, [rangeInputs]);
+  // Written only when it differs from what is stored: the first render does not overwrite a newer value another tab just saved.
+  useEffect(() => { const next = JSON.stringify({ version: 2, ...qualityBudget }); if (readStored(qualityBudgetKey) !== next) store(qualityBudgetKey, { version: 2, ...qualityBudget }); }, [qualityBudget]);
+  useEffect(() => {
+    const restore = (event: StorageEvent) => { if (event.key !== qualityBudgetKey) return; setInspection(null); setQualityBudget(parseQualityBudget(readStored(qualityBudgetKey))); };
+    window.addEventListener('storage', restore);
+    return () => window.removeEventListener('storage', restore);
+  }, []);
   // Another tab's ranges replace these, as in the workbench.
   useEffect(() => {
     const restore = (event: StorageEvent) => { if (event.key !== scannerRangesKey) return; setInspection(null); setPage(1); setRangeInputs(storedRanges()); };
@@ -205,7 +218,7 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
   const { data: fx, error: fxError } = usePerpetualFx(opportunitiesActive && (filters.crossCurrency || (view === 'rank' && ranges.valid && (ranges.needsFx || sortRequirements.needsFx))) && !paused, onExpired);
   // Favourites and blocking belong to a later M-5 batch: they stay off here whatever is stored.
   const rankingFilters = useMemo(() => ({ ...filters, search, applyNumericThresholds: false, favoritesOnly: false, blockedPairs: [] }), [filters, search]);
-  const fullRanking = useMemo(() => paused ? inspection.ranking : opportunitiesActive && view === 'rank' && data && now ? selectRanking(data, rankingFilters, now, defaultQualityBudget, fx) : [], [paused, inspection, opportunitiesActive, view, data, rankingFilters, now, selectRanking, fx]);
+  const fullRanking = useMemo(() => paused ? inspection.ranking : opportunitiesActive && view === 'rank' && data && now ? selectRanking(data, rankingFilters, now, qualityBudget, fx) : [], [paused, inspection, opportunitiesActive, view, data, rankingFilters, now, selectRanking, qualityBudget, fx]);
   const categoryRanking = useMemo(() => fullRanking.filter(row => categorySet.has(scannerPairCategory(row))), [fullRanking, categorySet]);
   // The workbench's pipeline: quote conditions first; the summary read then sees every remaining candidate, before the
   // metric and history conditions, the sort and the page cut.
@@ -255,6 +268,7 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
   const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
   const visiblePage = Math.max(1, Math.min(paused ? inspection.page : page, totalPages));
   const rows = useMemo(() => ranking.slice((visiblePage - 1) * pageSize, visiblePage * pageSize), [ranking, visiblePage]);
+  const fundingScenarios = useMemo(() => fundingSort ? new Map(rows.map(row => [perpetualSpreadKey(row), estimatePerpetualHoldingScenario(row, qualityBudget, { holdingHours: 24, exitSpreadPercent: row.spreadPercent, priceMode: filters.priceMode, staleAfterMs: data?.staleAfterMs }, now)])) : null, [fundingSort, rows, qualityBudget, filters.priceMode, data?.staleAfterMs, now]);
   const quoteRows = view === 'quotes' ? quoteSelection.keys.slice((visiblePage - 1) * pageSize, visiblePage * pageSize).map(key => quoteSelection.byKey.get(key)!) : emptyQuotes;
   // The service rejects a whole batch with a leg past its delisting time (the workbench's rule), so such rows are not asked
   // for: their cells say 已下架 instead of the whole page failing.
@@ -393,6 +407,7 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
     })}<th scope="col"><span className="perp-sr-only">展开组合详情</span></th></tr></thead>
       <tbody>{rows.map(row => {
         const rowKey = perpetualSpreadKey(row), isExpanded = expanded === rowKey;
+        const fundingScenario = fundingScenarios?.get(rowKey);
         const detailId = `perp-detail-${rows.indexOf(row)}`;
         const pairLabel = `${row.base} 多 ${venues.get(row.long.exchange)?.name ?? row.long.exchange} / 空 ${venues.get(row.short.exchange)?.name ?? row.short.exchange}`;
         const primarySpread = netSort ? row.netSpreadPercent ?? null : row.spreadPercent;
@@ -432,10 +447,10 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
           <td className="perp-expand-cell"><button type="button" aria-label={`${isExpanded ? '收起' : '展开'} ${pairLabel} 盘口校验与各平台报价`} aria-expanded={isExpanded} aria-controls={detailId} onClick={() => inspect(row)}><ChevronDown size={16} /></button></td>
         </tr>{isExpanded ? <tr className="perp-detail-row" id={detailId}><td colSpan={visibleColumns.length + 2}>
           <div className="perp-inspection-bar"><p role="status"><strong>行情已暂停</strong> · 保留 {stamp(data?.generatedAt)} 的排名与报价{now - row.updatedAt > staleAfterMs ? ' · 报价已过期，仅供核对' : ''}</p><button type="button" onClick={() => setInspection(null)}>收起并恢复</button></div>
-          <div className="scanner-detail-evidence"><button type="button" className="perp-refresh" onClick={() => openChart(row)}>创建价差图表 · 资金费稳定度</button>{delisting ? <><DelistingNotice quote={row.long} now={now} /><DelistingNotice quote={row.short} now={now} /></> : null}<FundingHistory long={longHistory} short={shortHistory} now={now} /><p>所需资本 {rowCapital.capitalPercent === null ? '—' : `${rowCapital.capitalPercent.toFixed(1)}%`} 多腿名义 · ROC（{capitalAssumptions.holdingHours}h）{scannerPercent(rowRoc.rocPercent, 2)} · 资金费年化 ROC {scannerPercent(rowRoc.fundingRocAnnualizedPercent, 1)}{rowRoc.reason ? ` · ${rowRoc.reason}` : ''}</p></div>
+          <div className="scanner-detail-evidence"><button type="button" className="perp-refresh" onClick={() => openChart(row)}>创建价差图表 · 资金费稳定度</button>{delisting ? <><DelistingNotice quote={row.long} now={now} /><DelistingNotice quote={row.short} now={now} /></> : null}<FundingHistory long={longHistory} short={shortHistory} now={now} /><p>所需资本 {rowCapital.capitalPercent === null ? '—' : `${rowCapital.capitalPercent.toFixed(1)}%`} 多腿名义 · ROC（{capitalAssumptions.holdingHours}h）{scannerPercent(rowRoc.rocPercent, 2)} · 资金费年化 ROC {scannerPercent(rowRoc.fundingRocAnnualizedPercent, 1)}{rowRoc.reason ? ` · ${rowRoc.reason}` : ''}</p>{fundingScenario ? <p>未来 24h 资金费 {percent(fundingScenario.fundingPercent, 4)} · 未来 24h 扣费后 {percent(fundingScenario.estimatedNetPercent, 4)}{fundingScenario.reasons.length ? ` · ${fundingScenario.reasons[0]}` : ''}</p> : null}</div>
           <div className="perp-detail-navigation"><div role="tablist" aria-label="组合详情" onKeyDown={event => { const ids = DETAIL_TABS.map(tab => tab.id); const index = ids.indexOf(detailTab); const next = event.key === 'ArrowRight' ? ids[(index + 1) % ids.length] : event.key === 'ArrowLeft' ? ids[(index + ids.length - 1) % ids.length] : event.key === 'Home' ? ids[0] : event.key === 'End' ? ids[ids.length - 1] : null; if (next) { event.preventDefault(); setDetailTab(next); document.getElementById(`${detailId}-tab-${next}`)?.focus(); } }}>{DETAIL_TABS.map(tab => <button type="button" role="tab" key={tab.id} id={`${detailId}-tab-${tab.id}`} aria-selected={detailTab === tab.id} tabIndex={detailTab === tab.id ? 0 : -1} aria-controls={`${detailId}-content`} onClick={() => setDetailTab(tab.id)}>{tab.label}</button>)}</div></div>
           <div role="tabpanel" id={`${detailId}-content`} aria-labelledby={`${detailId}-tab-${detailTab}`} className="perp-detail-content">
-            {detailTab === 'execution' ? <PerpetualExecution long={row.long} short={row.short} active now={now} onExpired={onExpired} /> : detailTab === 'exit' ? <PerpetualExit long={row.long} short={row.short} budget={defaultQualityBudget} active now={now} onExpired={onExpired} /> : <QuoteDetails quotes={detailQuotes} venues={venues} mode={filters.priceMode} now={now} staleAfterMs={staleAfterMs} />}
+            {detailTab === 'execution' ? <><PerpetualExecution long={row.long} short={row.short} active now={now} onExpired={onExpired} /><LazyBoundary what="持有期情景" className="perp-quality-notice"><Suspense fallback={null}><PerpetualHolding row={row} budget={qualityBudget} now={now} mode={filters.priceMode} fundingFocused={fundingSort} /></Suspense></LazyBoundary></> : detailTab === 'exit' ? <PerpetualExit long={row.long} short={row.short} budget={qualityBudget} active now={now} onExpired={onExpired} /> : <QuoteDetails quotes={detailQuotes} venues={venues} mode={filters.priceMode} now={now} staleAfterMs={staleAfterMs} />}
           </div>
         </td></tr> : null}</Fragment>;
       })}</tbody></table>
@@ -459,7 +474,8 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
         <p className="scanner-data-note">ROC 假设仅用于估算所需资本与资本回报，不改变交易所实际保证金；默认按两腿 3x、20% 缓冲、24 小时连续外推；资金费按同数量双腿的各自名义金额加权，假设退出价差归零。与按实际结算时点计数的 24h 估算口径不同。</p>
         <div className="perp-filter-footer"><span>筛选与排序保存在当前浏览器</span><button type="button" onClick={resetFilters}>重置全部筛选</button></div>
       </details>
-      <PerpetualManualPairs snapshot={data} mode={filters.priceMode} now={now} budget={defaultQualityBudget} active={opportunitiesActive && toolsOpen} paused={paused} onExpired={onExpired} />
+      <PerpetualManualPairs snapshot={data} mode={filters.priceMode} now={now} budget={qualityBudget} active={opportunitiesActive && toolsOpen} paused={paused} onExpired={onExpired} />
+      <PerpetualFeeSettings budget={qualityBudget} onChange={next => { setInspection(null); setQualityBudget(next); }} />
     </div></details>
     </>}
   </section>;

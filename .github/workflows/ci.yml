@@ -16,18 +16,13 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.15.0
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup
       # The same two projects as "check" in package.json (keep them in step), side by side; both report before a failure.
-      - name: pnpm check
+      - name: tsc（两个项目）
         run: |
-          pnpm exec tsc -p tsconfig.json &
+          node_modules/.bin/tsc -p tsconfig.json &
           server=$!
-          pnpm exec tsc -p web/tsconfig.json || { wait "$server" || true; exit 1; }
+          node_modules/.bin/tsc -p web/tsconfig.json || { wait "$server" || true; exit 1; }
           wait "$server"
       - run: shellcheck deploy/*.sh
       - run: python3 -I -B deploy/main-watch/test_main_watch.py
@@ -42,14 +37,9 @@ jobs:
         part: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.15.0
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup
       # The package and its config check include the built page.
-      - run: pnpm build:web
+      - run: npm run build:web
       - run: bash deploy/test-install.sh ${{ matrix.part }}
 
   # scripts/test.ts deals the test files into shards by their CI durations (scripts/test-durations.json).
@@ -62,15 +52,10 @@ jobs:
         shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.15.0
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup
       # Some tests start the service, whose config check requires the built page.
-      - run: pnpm build:web
-      - run: pnpm test
+      - run: npm run build:web
+      - run: npm test
         env:
           TEST_SHARD: ${{ matrix.shard }}/6
 

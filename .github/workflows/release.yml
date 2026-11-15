@@ -30,7 +30,6 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo '标签提交不在 main 上'; exit 1; }
       - run: pnpm check
       - run: pnpm build:web
-      - run: pnpm test
       - run: shellcheck deploy/*.sh
       - run: python3 -I -B deploy/main-watch/test_main_watch.py
       - run: bash deploy/test-install.sh
@@ -54,8 +53,31 @@ jobs:
           name: release
           path: dist/
           retention-days: 7
+  # Same shards as ci.yml; publish waits for both, so a release still requires the full suite to pass.
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Some tests start the service, whose config check requires the built page.
+      - run: pnpm build:web
+      - run: pnpm test
+        env:
+          TEST_SHARD: ${{ matrix.shard }}/2
   publish:
-    needs: build
+    needs: [build, test]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

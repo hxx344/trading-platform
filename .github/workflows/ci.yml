@@ -5,6 +5,10 @@ on:
   pull_request:
 permissions:
   contents: read
+# A new push to a PR supersedes its running checks. Each run on main gets its own group, so none is queued or cancelled.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   check:
     runs-on: ubuntu-24.04
@@ -19,10 +23,31 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       - run: pnpm build:web
-      - run: pnpm test
       - run: shellcheck deploy/*.sh
       - run: python3 -I -B deploy/main-watch/test_main_watch.py
       - run: bash deploy/test-install.sh
+
+  # The test suite is the longest step; node --test splits its files into shards that run in parallel with the job above.
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Some tests start the service, whose config check requires the built page.
+      - run: pnpm build:web
+      - run: pnpm test
+        env:
+          TEST_SHARD: ${{ matrix.shard }}/2
 
   # The second server's watchdog (docs/watch.md) installed on a real systemd: units, sandbox, alert round, upgrade, uninstall.
   watch:

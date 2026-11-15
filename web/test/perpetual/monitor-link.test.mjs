@@ -1,7 +1,7 @@
 // M-5c: the workbench's chart URL next to this page's hash route (web/src/monitor-link.ts and perpetual-chart-state.ts).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { linkedMonitorTab, withoutMonitorLink } from '../../src/monitor-link.ts';
+import { linkedMonitorTab, perpetualWorkspaceLink, withoutMonitorLink } from '../../src/monitor-link.ts';
 import { perpetualChartUrl, readPerpetualChartSelection } from '../../src/perpetual-chart-state.ts';
 
 const selected = { base: 'ETH', longKey: 'binance:ETHUSDT', shortKey: 'bybit:ETHUSDT', days: 7 };
@@ -34,4 +34,15 @@ test('无效链接：窗口或合约不合规时读不出组合（页面显示�
     assert.equal(readPerpetualChartSelection(url.searchParams), null, query);
   }
   assert.equal(linkedMonitorTab('not a url'), null);
+});
+
+test('M-5e1 持仓跟踪：带 monitor=perpetual 与 perpView=positions，去掉图表参数；回到发现机会全部去掉，hash 与其它参数保留', () => {
+  const chart = perpetualChartUrl('https://tp.local/?lang=zh#/monitor', selected);
+  const positions = new URL(perpetualWorkspaceLink(chart, 'positions'));
+  assert.equal(positions.searchParams.get('monitor'), 'perpetual');
+  assert.equal(positions.searchParams.get('perpView'), 'positions');
+  assert.equal(readPerpetualChartSelection(positions.searchParams), null);
+  assert.equal(positions.hash, '#/monitor');
+  assert.equal(linkedMonitorTab(positions.href), 'perpetual');
+  assert.equal(perpetualWorkspaceLink(positions.href, 'opportunities'), 'https://tp.local/?lang=zh#/monitor');
 });

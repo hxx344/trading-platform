@@ -1,7 +1,7 @@
 /* 复制自 project-aggregation 工作台 modules/monitor/app/perpetual.css 与 perpetual-scanner.css（提交 c84ba27），
  * 按原顺序只保留 MonitorPerpetual.tsx、perpetual-scanner-parts.tsx、PerpetualExecution.tsx、PerpetualExit.tsx 与
- * PerpetualManualPairs.tsx（M-5d1 起加 PerpetualFeeSettings.tsx、PerpetualHolding.tsx，M-5d2 起加 PerpetualQuality.tsx、PerpetualTrend.tsx）用到的类的规则：选择器里的每个类都用到才保留，`:not()` 里的类不要求存在，`:is()` 列表有一项
- * 可用即可。声明未改动，只重排了空白；两个文件的分界用注释标出。M-5b1 按新增的列、表头排序、指标单元格与排序状态行重新过滤；M-5b2 加上 PerpetualScannerFilters.tsx，按筛选按钮、范围面板、筛选进度、历史列与详情的资金费历史重新过滤。M-5d1 按手续费与滑点设置、持有期情景重新过滤；M-5d2 按质量列、质量依据、价差趋势与读取说明重新过滤；M-5c 按工作区导航、组合单元格开图按钮与可点击行重新过滤；M-5a 起末列为展开按钮，与工作台一致，不再删去规则；
+ * PerpetualManualPairs.tsx（M-5d1 起加 PerpetualFeeSettings.tsx、PerpetualHolding.tsx，M-5d2 起加 PerpetualQuality.tsx、PerpetualTrend.tsx，M-5e1 起加 PerpetualPaper.tsx）用到的类的规则：选择器里的每个类都用到才保留，`:not()` 里的类不要求存在，`:is()` 列表有一项
+ * 可用即可。声明未改动，只重排了空白；两个文件的分界用注释标出。M-5b1 按新增的列、表头排序、指标单元格与排序状态行重新过滤；M-5b2 加上 PerpetualScannerFilters.tsx，按筛选按钮、范围面板、筛选进度、历史列与详情的资金费历史重新过滤。M-5d1 按手续费与滑点设置、持有期情景重新过滤；M-5d2 按质量列、质量依据、价差趋势与读取说明重新过滤；M-5e1 按持仓跟踪工作区与登记切换重新过滤（`perp-scanner` 改为按工作区条件加上，手工列入）；M-5c 按工作区导航、组合单元格开图按钮与可点击行重新过滤；M-5a 起末列为展开按钮，与工作台一致，不再删去规则；
  * 文件末尾一段是本服务的补充，单独标出。 */
 /* —— perpetual.css —— */
 .perpetual-panel { --perp-surface:var(--card);--perp-border:var(--border);--perp-muted:var(--muted-foreground);--perp-accent:var(--primary);padding:30px 4.2% 36px;color:var(--foreground);font-variant-numeric:tabular-nums }
@@ -460,7 +460,7 @@
 .perpetual-panel button { min-height:40px; }
 .perpetual-panel :is(input:not([type=checkbox]):not([type=radio]):not([type=range]),select) { min-height:40px; }
 .perpetual-panel :is(button,input,select,summary):focus-visible { outline-color:var(--primary); }
-.perp-table-wrap,.perp-execution,.perp-exit-workspace { background:var(--card); border-color:var(--border); border-radius:8px; }
+.perp-table-wrap,.perp-execution,.perp-exit-workspace,.perp-paper { background:var(--card); border-color:var(--border); border-radius:8px; }
 .perp-table thead th,.perp-detail thead th,.perp-convergence thead { background:var(--muted); }
 .perp-table>tbody>tr:hover { background:var(--muted); }
 .perp-table>tbody>tr.perp-row-expanded,.perp-table>tbody>tr.perp-detail-row>td { background:var(--background); }
@@ -470,7 +470,7 @@
 .perp-workspace-nav button { min-height:44px; padding:10px 2px; border:0; border-bottom:2px solid transparent; border-radius:0; background:transparent; font-weight:600; }
 .perp-workspace-nav button[aria-current=page] { color:var(--primary); border-bottom-color:var(--primary); background:transparent; }
 .perp-workspace-nav button:hover { color:var(--primary-hover); }
-.perp-tool-button.is-selected { color:var(--primary); border-color:var(--primary-border); background:var(--active-surface); }
+.perp-tool-button.is-selected,.perp-exit-mode button[aria-pressed=true] { color:var(--primary); border-color:var(--primary-border); background:var(--active-surface); }
 .perp-execution-form button,button.perp-exit-primary { background:var(--primary); border-color:var(--primary); color:var(--primary-foreground); }
 .perp-execution-form button:hover,button.perp-exit-primary:hover { background:var(--primary-hover); color:var(--primary-foreground); }
 .perp-notice,.perp-currency-warning,.perp-inspection-bar { background:var(--warning-surface); color:var(--warning); border-color:var(--warning-border); border-radius:7px; }

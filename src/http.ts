@@ -117,6 +117,8 @@ export interface ServiceViews {
       depth?(input: unknown): Promise<unknown>; exit?(input: unknown): Promise<unknown>; fx?(): Promise<unknown>; marketMetrics?(input: unknown): Promise<unknown>;
       fundingHistory?(input: unknown): Promise<unknown>; scannerData?(input: unknown): Promise<unknown>; priceHistory?(input: unknown): Promise<unknown>;
       quality?(input: unknown): Promise<unknown>;
+      /** M-5e1: the paper positions' view, and a create / update / close / delete answering the new view; refusals carry an HTTP `status`. */
+      paperView?(): unknown; paperUpdate?(input: unknown): Promise<unknown>;
     } | undefined;
   };
   /** The options module's reads and writes (service/options.ts); absent when the service runs no options module. */
@@ -369,6 +371,24 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
         const status = (error as { status?: unknown })?.status;
         const code = status === 429 ? 'rate_limited' : status === 409 ? 'identity_changed' : status === 400 ? 'invalid_request' : status === 503 ? 'unavailable' : status === 500 ? 'internal_error' : 'upstream_error';
         return send(response, typeof status === 'number' && status >= 400 && status < 600 ? status : 502, { code, message: error instanceof Error ? error.message : inspection === 'metrics' ? '市场指标读取失败' : inspection === 'funding-history' ? '历史资金费读取失败' : inspection === 'scanner-data' ? '筛选数据读取失败' : inspection === 'price-history' ? '成交价历史读取失败' : inspection === 'quality' ? '质量资料读取失败' : '盘口查询失败' });
+      }
+    }
+    // M-5e1: the paper positions (the workbench's paper action): GET the view, POST create / update / close / delete at a
+    // revision, answering the new view. The service's 400 / 404 / 409 / 503 as they are; the exit calculator's input checks
+    // (plain Errors) 400 as the workbench answers them; anything else 500. This relies on the service wrapping its own failures
+    // (save errors become 503): when the vendored service is updated, check it throws no plain Error for an internal fault.
+    if (url.pathname === '/api/monitor/perpetual/paper' && (request.method === 'GET' || request.method === 'POST')) {
+      if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
+      const perpetual = views.monitor.state().markets.includes('perpetual') ? views.monitor.perpetual?.() : undefined;
+      if (!perpetual?.paperView || !perpetual.paperUpdate) return send(response, 404, { code: 'not_found', message: '本服务没有配置合约价差行情监控' });
+      if (request.method === 'GET') return send(response, 200, perpetual.paperView());
+      const body = await readJson(request);
+      try { return send(response, 200, await perpetual.paperUpdate(body)); }
+      catch (error) {
+        const raw = (error as { status?: unknown })?.status;
+        const status = raw === 400 || raw === 404 || raw === 409 || raw === 503 ? raw : raw === undefined && error instanceof Error && error.constructor === Error ? 400 : 500;
+        const code = status === 400 ? 'invalid_request' : status === 404 ? 'not_found' : status === 409 ? 'conflict' : status === 503 ? 'unavailable' : 'internal_error';
+        return send(response, status, { code, message: status === 500 ? '持仓记录处理失败' : error instanceof Error ? error.message : '持仓记录处理失败' });
       }
     }
     const alertRoute = /^\/api\/monitor\/(oil|hynix)\/alerts(\/test)?$/.exec(url.pathname);

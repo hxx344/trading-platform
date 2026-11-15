@@ -10,6 +10,8 @@ import { createOilMonitor, type OilMonitor } from '../monitor/oil.ts';
 import { createPerpetualMonitor, type PerpetualMonitor, type PerpetualOptions } from '../monitor/perpetual.ts';
 import { createMonitorControl, type MonitorControl } from '../monitor/control.ts';
 import { PERPETUAL_CACHE_FILE, openPerpetualCache, type PerpetualCache } from '../monitor/perpetual-cache.ts';
+import { PERPETUAL_PAPER_FILE, openPerpetualPaperStore } from '../monitor/perpetual-paper-store.ts';
+import type { PerpetualPaperStore } from '../vendor/perpetual-paper-service.mjs';
 import { MONITOR_FILE, createMonitorStore, type MonitorStore } from '../monitor/store.ts';
 import { createVariationalSession, type VariationalSession } from '../monitor/variational-session.ts';
 import { createVariationalFetch } from '../monitor/variational-transport.ts';
@@ -84,13 +86,23 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
     // A cache that cannot be opened costs only the cached figures: the metrics then live in memory, the log says so and
     // every metrics report carries the notice (the page shows it under the table).
     let perpetualCache: PerpetualCache | null = null;
+    // M-5e1: paper-position records that cannot be read cost only the position tracking (the page shows the reason); the
+    // file is left as it is for the operator to repair or restore.
+    let paperStore: PerpetualPaperStore | undefined, paperUnavailable = '';
     if (config.perpetual) {
       try { perpetualCache = openPerpetualCache(join(dir, PERPETUAL_CACHE_FILE)); }
       catch (error) { (log ?? (line => process.stderr.write(`${line}\n`)))(`合约价差缓存 ${PERPETUAL_CACHE_FILE} 打不开，市场指标、历史资金费、成交价历史与质量样本只存内存：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`); }
+      try { paperStore = openPerpetualPaperStore(join(dir, PERPETUAL_PAPER_FILE)); }
+      catch (error) {
+        paperUnavailable = error instanceof Error ? error.message : String(error);
+        const cause = error instanceof Error && error.cause instanceof Error ? `：${error.cause.message.slice(0, 200)}` : '';
+        (log ?? (line => process.stderr.write(`${line}\n`)))(`合约价差持仓记录 ${PERPETUAL_PAPER_FILE} 无法读取，持仓跟踪不可用，原文件未改动${cause}`);
+      }
     }
     try {
       const perpetual = config.perpetual ? createPerpetualMonitor({ ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}), cache: perpetualCache,
-        ...(perpetualCache ? {} : { cacheUnavailable: `缓存库 ${PERPETUAL_CACHE_FILE} 打不开，市场指标、历史资金费、成交价历史与质量样本只存内存，重启后重新采集。` }), ...perpetualOptions,
+        ...(perpetualCache ? {} : { cacheUnavailable: `缓存库 ${PERPETUAL_CACHE_FILE} 打不开，市场指标、历史资金费、成交价历史与质量样本只存内存，重启后重新采集。` }),
+        paper: { store: paperStore, unavailableReason: paperUnavailable }, ...perpetualOptions,
         quality: { ...perpetualQualityEnv(env, log ?? (line => process.stderr.write(`${line}\n`))), ...perpetualOptions?.quality } }) : null;
       return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, hynix, exchanges, alerts, control, variational, perpetual, perpetualCache };
     } catch (error) { perpetualCache?.close(); throw error; }

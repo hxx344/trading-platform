@@ -548,3 +548,17 @@
 
 **回滚**：`sudo bash install.sh --version v0.42.0`，不用改配置。
 
+
+### M-5e1 补充（v0.44.0）：持仓跟踪与登记
+
+**对照的工作台页面**：`app/perpetual-paper.tsx`、`app/perpetual-paper.css`、`app/perpetual-exit.tsx`（登记方式切换与登记按钮）、`app/perpetual-panel.tsx`（「持仓跟踪」工作区、`perpView=positions`、登记后切到持仓跟踪）、`lib/polling.ts`（提交 `c84ba27`）。
+
+**页面**：工作区导航加「持仓跟踪」；展开详情「平仓与跟踪」页签恢复「模拟仓位 / 手工登记已有持仓」、目标净收益、最长持有时间、开仓时间与登记按钮；持仓跟踪工作区照搬（活动卡片、核验平仓盘口、更新资金费与参数、登记平仓、停止跟踪、已结束记录与分页、删除、版本冲突时保留输入并载入最新版本）。
+
+**与工作台的差别**：请求走 `api()`（401 转登录、失败带服务原因）；去掉 `hubChanged()`；盘口测算懒加载外套 `LazyBoundary`；工作区地址按本页链接规则带 `?monitor=perpetual`（`perpetualWorkspaceLink`），进入空的图表工作区时去掉。
+
+**样式**：`perpetual-paper.css` 原样复制；`perpetual.css` 加上 `PerpetualPaper.tsx` 重新过滤，补回两条工作台规则的选择器（`.perp-paper` 的卡片背景、`.perp-exit-mode button[aria-pressed=true]` 的选中态）。面板的 `perp-scanner` 类改为按工作区条件加上（持仓跟踪时去掉，同工作台），过滤脚本认不出条件表达式里的类名，手工列入。
+
+**验证**：替身后端，无头浏览器 1280：登记模拟持仓后切到持仓跟踪、焦点落在导航按钮；手工登记（切换后清空开仓价格）；一分钟内出现有效估算；另一页面改参数后本页提示冲突，载入最新版本保留输入再保存；登记平仓、核验平仓盘口、停止跟踪、删除已结束记录；导航地址 `perpView=positions`、刷新后恢复、回到发现机会去掉参数；接口只有 200，无页面错误。390：平仓页签手工登记表单与持仓跟踪（含已结束记录与分页）无横向溢出。未与运行中的工作台并排截图。
+
+**回滚**：`sudo bash install.sh --version v0.43.0`，不用改配置。

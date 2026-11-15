@@ -3,24 +3,34 @@
 # Runs install.sh as an ordinary user in test mode (temporary directories, no system account, no systemctl):
 # first install without config, unchanged rerun, permission repair, a config the new program rejects, an upgrade,
 # the watchdog heartbeat's switches, and a deterministic package. The systemd start, health check and rollback need root and are checked on the server.
+# An optional part (1, 2 or 3) runs only that group after the shared setup and first install, so CI can run the three
+# groups in parallel: 1 install, upgrade, password and listen address; 2 importing from the workbench; 3 the watchdog
+# heartbeat. With no argument all of them run in file order.
 set -euo pipefail
+part=${1:-all}
+[[ $part =~ ^(all|1|2|3)$ ]] || { printf '用法：%s [1|2|3]\n' "$0" >&2; exit 2; }
+part_is() { [[ $part == all || $part == "$1" ]]; }
 root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 export TP_TEST_MODE=1 TP_NODE_BIN TP_APP_DIR="$tmp/opt" TP_CONF_DIR="$tmp/etc" TP_DATA_DIR="$tmp/var" TP_UNIT_FILE="$tmp/unit.service" TP_IMPORT_DIR="$tmp/import"
 TP_NODE_BIN=$(command -v node)
+# Every install.sh run starts node on the same release files; the compile cache saves re-parsing them each time.
+export NODE_COMPILE_CACHE=${NODE_COMPILE_CACHE:-$tmp/node-compile-cache}
 install_sh="$root/deploy/install.sh"
 failures=0
 check() { if eval "$2"; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); fi; }
 run() { bash "$install_sh" "$@" >"$tmp/out" 2>&1; }
 
 bash "$root/deploy/package.sh" "$tmp/a" >/dev/null
+if part_is 1; then
 bash "$root/deploy/package.sh" "$tmp/a2" >/dev/null
 check '同一源码打出的包校验和相同' 'cmp -s "$tmp/a/SHA256SUMS" "$tmp/a2/SHA256SUMS"'
 tar -tzf "$tmp/a/trading-platform.tar.gz" >"$tmp/a.list"
 check '发布包含构建好的页面' 'grep -q "/web/dist/index.html$" "$tmp/a.list" && grep -q "/web/dist/assets/.*\.js$" "$tmp/a.list"'
 check '发布包含 Var 请求脚本（行情监控 M-3d）' 'grep -q "/scripts/variational-request.py$" "$tmp/a.list"'
 check '发布文件含副服务器巡检的安装脚本与程序，且与源码、校验清单一致' 'cmp -s "$root/deploy/install-watch.sh" "$tmp/a/install-watch.sh" && cmp -s "$root/deploy/main-watch/main_watch.py" "$tmp/a/main_watch.py" && (cd "$tmp/a" && sha256sum -c --quiet SHA256SUMS) && [[ "$(wc -l <"$tmp/a/SHA256SUMS")" == 4 ]]'
+fi
 
 # A second package with different contents, for the upgrade.
 mkdir -p "$tmp/src-b/deploy/main-watch" && cp "$root/deploy/main-watch/main_watch.py" "$tmp/src-b/deploy/main-watch/"
@@ -30,6 +40,14 @@ mkdir -p "$tmp/src-b/scripts" && cp "$root/scripts/variational-balance.py" "$roo
 cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-b/deploy/"
 printf '\n升级测试\n' >>"$tmp/src-b/README.md"
 bash "$tmp/src-b/deploy/package.sh" "$tmp/b" >/dev/null
+# A program whose config check always fails, for parts 2 and 3: the files they change are put back, the old release stays current.
+mkdir -p "$tmp/src-c/deploy/main-watch" && cp "$root/deploy/main-watch/main_watch.py" "$tmp/src-c/deploy/main-watch/"
+cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-c/"
+mkdir -p "$tmp/src-c/web" && cp -R "$root/web/dist" "$tmp/src-c/web/"
+mkdir -p "$tmp/src-c/scripts" && cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$tmp/src-c/scripts/"
+cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-c/deploy/"
+sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { throw new Error('测试：配置检查失败');|" "$tmp/src-c/src/service/main.ts"
+bash "$tmp/src-c/deploy/package.sh" "$tmp/c" >/dev/null
 
 run --package "$tmp/a" && status=0 || status=$?
 check '首次安装成功' '[[ $status -eq 0 ]]'
@@ -43,8 +61,10 @@ check '数据目录权限 700' '[[ "$(stat -c %a "$TP_DATA_DIR")" == 700 ]]'
 check 'systemd 单元已填入路径' '! grep -q "@" "$TP_UNIT_FILE" && grep -q "ExecStart=$TP_NODE_BIN $TP_APP_DIR/current/src/service/main.ts --config $TP_CONF_DIR/config.json --data-dir $TP_DATA_DIR --import-dir $TP_IMPORT_DIR" "$TP_UNIT_FILE" && grep -q "ReadWritePaths=$TP_DATA_DIR -$TP_IMPORT_DIR" "$TP_UNIT_FILE"'
 first=$(readlink -f "$TP_APP_DIR/current")
 
+if part_is 1; then
 run --package "$tmp/a"
 check '重复执行无变化' 'grep -q "无变化" "$tmp/out" && grep -q "程序包（未变化）" "$tmp/out" && grep -q "systemd 单元（未变化）" "$tmp/out"'
+fi
 
 # Test-only keys from the ASTER stand-in.
 (cd "$root" && node --input-type=module -e '
@@ -61,6 +81,7 @@ check '配置检查同时载入页面' 'grep -Eq "页面 [1-9][0-9]* 个文件" 
 check '配置与密钥改为 600' '[[ "$(stat -c %a "$TP_CONF_DIR/config.json")" == 600 && "$(stat -c %a "$TP_CONF_DIR/secrets.json")" == 600 ]]'
 check '输出 SSH 隧道说明' 'grep -q "ssh -N -L 4720:127.0.0.1:4720" "$tmp/out"'
 
+if part_is 1; then
 sed -i 's/"short": "short-1"/"short": "long-1"/' "$TP_CONF_DIR/config.json"
 run --package "$tmp/b" && status=0 || status=$?
 check '配置无效时安装失败' '[[ $status -ne 0 ]] && grep -q "配置检查未通过，服务保持原版本" "$tmp/out"'
@@ -85,7 +106,9 @@ sed -i "s|$TP_CONF_DIR/secrets.json|$tmp/outside/secrets.json|" "$TP_CONF_DIR/co
 run --package "$tmp/a" && status=0 || status=$?
 check '目录外的密钥文件不改权限' '[[ "$(stat -c %a "$tmp/outside/secrets.json")" == 640 ]] && grep -q "未调整属主与权限" "$tmp/out"'
 sed -i "s|$tmp/outside/secrets.json|$TP_CONF_DIR/secrets.json|" "$TP_CONF_DIR/config.json"
+fi
 
+if part_is 2; then
 # Importing from a workbench on the same machine: its enabled pair is added beside pair-1, the main account is
 # matched to the existing entry by wallet, and the result passes the new program's config check.
 mkdir -p "$tmp/wb/data/modules/aster"
@@ -103,14 +126,6 @@ mkdir -p "$tmp/wb/data/modules/aster"
   const line = (prefix, w) => `${prefix}_USER=${w.user}\n${prefix}_SIGNER=${w.signer}\n${prefix}_PRIVATE_KEY=${w.privateKey}\n`;
   process.stdout.write(`DATA_DIR=${dir}/data\n` + line("WB_MAIN", MAIN) + line("WB_L9", wallet("0x" + "4d".repeat(20), "24")) + line("WB_S9", wallet("0x" + "5e".repeat(20), "25")));
 ' "$tmp/wb") >"$tmp/wb/workbench.env"
-# A program whose config check fails: the imported files are put back, the old release stays current.
-mkdir -p "$tmp/src-c/deploy/main-watch" && cp "$root/deploy/main-watch/main_watch.py" "$tmp/src-c/deploy/main-watch/"
-cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-c/"
-mkdir -p "$tmp/src-c/web" && cp -R "$root/web/dist" "$tmp/src-c/web/"
-mkdir -p "$tmp/src-c/scripts" && cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$tmp/src-c/scripts/"
-cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-c/deploy/"
-sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { throw new Error('测试：配置检查失败');|" "$tmp/src-c/src/service/main.ts"
-bash "$tmp/src-c/deploy/package.sh" "$tmp/c" >/dev/null
 cp -p "$TP_CONF_DIR/config.json" "$tmp/config.before"; cp -p "$TP_CONF_DIR/secrets.json" "$tmp/secrets.before"
 current_before=$(readlink -f "$TP_APP_DIR/current")
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/c" --import-workbench && status=0 || status=$?
@@ -222,7 +237,9 @@ TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workben
 check '--monitor-paper 写待载入文件、仅服务账户可读写，不碰持仓记录' '[[ $status -eq 0 && "$(stat -c %a "$TP_DATA_DIR/perpetual-paper-positions.import.json")" == 600 && ! -e "$TP_DATA_DIR/perpetual-paper-positions.json" ]] && grep -q "已写入持仓记录 2 条（待载入文件）" "$tmp/out" && grep -q "install-s1" "$TP_DATA_DIR/perpetual-paper-positions.import.json"'
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor-paper && status=0 || status=$?
 check '重复导入持仓记录时跳过' '[[ $status -eq 0 ]] && grep -q "跳过持仓记录：本服务已有这些记录" "$tmp/out"'
+fi
 
+if part_is 3; then
 # The heartbeat for the second server's main-watch: the address lands in config.json, the token in the key file (from
 # stdin, never printed), the new program checks both, and a failed check puts them back.
 watch_token=watch-install-token-0123456789abcdefgh
@@ -265,6 +282,9 @@ TP_RELEASE_BASE=https://127.0.0.1:9/none run --watch-url "$watch_to" --watch-tok
 check '只开心跳时沿用已装版本、不联网' '[[ $status -eq 0 && "$(readlink -f "$TP_APP_DIR/current")" == "$current_before" ]] && grep -q "程序包（未变化）" "$tmp/out" && grep -q "，巡检心跳推送到 $watch_to" "$tmp/out"'
 TP_RELEASE_BASE=https://127.0.0.1:9/none run --watch-off && status=0 || status=$?
 check '只关心跳时沿用已装版本、不联网' '[[ $status -eq 0 && "$(readlink -f "$TP_APP_DIR/current")" == "$current_before" ]] && grep -q "巡检心跳已关闭" "$tmp/out"'
+fi
+
+if part_is 1; then
 # No current link (data and config left from an earlier install): installs and points current at the release.
 rm "$TP_APP_DIR/current"
 run --package "$tmp/b" && status=0 || status=$?
@@ -295,6 +315,7 @@ check '配置 host 后直接给出页面地址' '[[ $status -eq 0 ]] && grep -q 
 "$TP_NODE_BIN" -e 'const fs = require("fs"), p = process.argv[1], c = JSON.parse(fs.readFileSync(p, "utf8")); c.host = "0.0.0.0"; fs.writeFileSync(p, JSON.stringify(c, null, 2));' "$TP_CONF_DIR/config.json"
 run --package "$tmp/b" && status=0 || status=$?
 check '通配监听地址被配置检查拒绝' '[[ $status -ne 0 ]] && grep -q "不能是 0.0.0.0" "$tmp/out"'
+fi
 
 if ((failures)); then printf '%d 项失败；最后一次输出：\n' "$failures"; cat "$tmp/out"; exit 1; fi
 printf '安装测试全部通过\n'

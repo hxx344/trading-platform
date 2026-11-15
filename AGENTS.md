@@ -24,6 +24,7 @@
 ## 检查
 
 - 类型检查：`pnpm check`；测试：`pnpm test`；页面构建：`pnpm build:web`。
+- 安装测试：`bash deploy/test-install.sh`，先 `pnpm build:web`。CI 分三部分并行（参数 1 安装升级、2 从工作台导入、3 巡检心跳），新检查放进对应的 `if part_is N` 块，不依赖别的部分留下的状态。
 - 改页面时在替身后端上用浏览器走一遍，截 1280 和 390 宽度与工作台同页面对比。
 
 ## 合并前审查

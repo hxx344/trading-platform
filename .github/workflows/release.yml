@@ -71,6 +71,8 @@ jobs:
           node-version: 24.15.0
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Some tests start the service, whose config check requires the built page.
+      - run: pnpm build:web
       - run: pnpm test
         env:
           TEST_SHARD: ${{ matrix.shard }}/2

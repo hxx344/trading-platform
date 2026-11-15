@@ -2,7 +2,9 @@
 // their marks), ~40 bases each, books and funding that drift once a second over in-process sockets. Nothing goes to the network:
 // the on-demand depth check and spot FX (M-5a) read 20-level books around the current price from an in-process fetch, and the
 // one venue the service reads over WebSocket (Lighter) refuses at once. The market metrics (M-5b1) answer Binance, Bybit and
-// Hyperliquid's batch tickers and open interest; OKX and Lighter fail, so the page shows its failure state too.
+// Hyperliquid's batch tickers and open interest; OKX and Lighter fail, so the page shows its failure state too. The settled
+// funding histories (M-5b2) answer Binance and Bybit (8-hourly) and Hyperliquid (hourly) with a stable rate per base and
+// time, paged as the venues page; OKX and Lighter fail likewise.
 import type { PerpetualOptions } from '../src/monitor/perpetual.ts';
 import type { PerpetualMarket, PerpetualUpdate } from '../src/vendor/perpetual-stream.mjs';
 
@@ -103,6 +105,28 @@ export function fakePerpetualVenues(): PerpetualOptions {
     }
     throw new Error(`preview: no stand-in for ${url.hostname}${url.pathname}`);
   };
+  const HOUR = 3_600_000;
+  // A stable settled rate per venue, base and time: a per-base level, a per-venue offset and a slow swing, so the two legs of a
+  // pair differ, the windows differ and some net carries are negative.
+  const settled = (venue: string, base: string, time: number) => (([...base].reduce((sum, char) => sum + char.charCodeAt(0), 0) % 7 - 2) * 0.00002 + ({ binance: 0, bybit: 0.00003, hyperliquid: -0.00002 }[venue] ?? 0) + 0.00001 * Math.sin(time / HOUR / 13)).toFixed(8);
+  const times = (from: number, to: number, step: number) => { const list: number[] = []; for (let time = Math.ceil(from / step) * step; time <= to; time += step) list.push(time); return list; };
+  const fundingFetch = async (input: string, init?: RequestInit): Promise<Response> => {
+    const url = new URL(input), params = url.searchParams, now = Date.now();
+    if (url.hostname === 'fapi.binance.com' && url.pathname === '/fapi/v1/fundingRate') {
+      const symbol = params.get('symbol') ?? '', limit = Number(params.get('limit'));
+      return json(times(Number(params.get('startTime')), Math.min(now, Number(params.get('endTime'))), 8 * HOUR).slice(0, limit).map(time => ({ symbol, fundingTime: time, fundingRate: settled('binance', baseOf(symbol), time) })));
+    }
+    if (url.hostname === 'api.bybit.com' && url.pathname === '/v5/market/funding/history') {
+      const symbol = params.get('symbol') ?? '', limit = Number(params.get('limit')), end = Math.min(now, Number(params.get('endTime')));
+      const list = times(end - limit * 8 * HOUR, end, 8 * HOUR).reverse().slice(0, limit).map(time => ({ symbol, fundingRateTimestamp: String(time), fundingRate: settled('bybit', baseOf(symbol), time) }));
+      return json({ retCode: 0, result: { category: 'linear', list } });
+    }
+    if (url.hostname === 'api.hyperliquid.xyz' && init?.body) {
+      const body = JSON.parse(String(init.body)) as { type: string; coin: string; startTime: number; endTime: number };
+      if (body.type === 'fundingHistory') return json(times(body.startTime, Math.min(now, body.endTime), HOUR).slice(0, 500).map(time => ({ coin: body.coin, time, fundingRate: settled('hyperliquid', baseOf(body.coin), time), premium: '0' })));
+    }
+    throw new Error(`preview: no stand-in for ${url.hostname}${url.pathname}`);
+  };
   class RefusingSocket {
     on(type: string, listener: (data?: unknown) => void): void { if (type === 'error') setTimeout(() => listener(), 0); }
     send(): void { /* Never opens. */ }
@@ -119,5 +143,6 @@ export function fakePerpetualVenues(): PerpetualOptions {
     WebSocketImpl: FakeSocket as unknown as PerpetualOptions['WebSocketImpl'],
     execution: { fetchImpl, WebSocketImpl: RefusingSocket },
     metrics: { fetchImpl: metricsFetch },
+    fundingHistory: { fetchImpl: fundingFetch },
   };
 }

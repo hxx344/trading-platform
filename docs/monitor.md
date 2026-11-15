@@ -16,7 +16,8 @@
 - M-4b（合约价差页面；从工作台导入时一并启用）随 v0.37.0；替身合约行情上浏览器走查（见 M-4b 实施记录）。
 - M-5a（展开组合详情：按金额校验盘口、平仓收益测算；跨计价币排名；手动配对）随 v0.38.0；替身交易所验证（见 M-5a 实施记录）。
 - M-5b1（市场指标：成交额与持仓量列；所需资本与 ROC；列选择；表头排序）随 v0.39.0；替身交易所验证（见 M-5b1 实施记录）。
-- 未开始：M-5b2–M-5f、M-6（见下表与「M-5」节）。
+- M-5b2（资金费历史：24h / 7天 / 30天实际资金费列与详情；汇总接口；范围筛选；成交额、持仓量与历史列的全量排序）随 v0.40.0；替身交易所验证（见 M-5b2 实施记录）。
+- 未开始：M-5c–M-5f、M-6（见下表与「M-5」节）。
 - M-1 没做：成交标记、股数从交易中心同步、概览卡片与告警（均线 / 布林带 / Z-score 随 M-2e 补上）。
 
 ## 批次
@@ -27,7 +28,7 @@
 | M-2 | 原油价差与海力士行情（M01、M02），分 M-2a–M-2e 五小批（见下文），Var 腿先降级为“未接入” | R2 | M-2a 已发布（v0.20.0），M-2b 已发布（v0.21.0），M-2c 已发布（v0.23.0），M-2d 已发布（v0.24.0），M-2e 已发布（v0.25.0），M-2d-3 已发布（v0.27.0） |
 | M-3 | 告警规则、飞书通知、监控开关、Var 会话 token（M09–M12），分 M-3a–M-3d 四小批（见下文） | R3 | M-3a 完成（v0.29.0），M-3b 完成（v0.30.0），M-3c 完成（v0.31.0），M-3d-1 完成（v0.33.0），M-3d-2 完成（v0.34.0） |
 | M-4 | 永续全市场报价（M04：11 家交易所公共 WS、SSE 增量），分 M-4a（采集器与接口）、M-4b（页面与导入） | R2 | 完成（M-4a v0.36.0，M-4b v0.37.0） |
-| M-5 | 依赖 M04 的页面（M05–M08），分 M-5a–M-5f 小批（M-5b 再拆 b1、b2，见「M-5」节） | R2 | M-5a（v0.38.0）、M-5b1（v0.39.0）完成，其余未开始 |
+| M-5 | 依赖 M04 的页面（M05–M08），分 M-5a–M-5f 小批（M-5b 再拆 b1、b2，见「M-5」节） | R2 | M-5a（v0.38.0）、M-5b1（v0.39.0）、M-5b2（v0.40.0）完成，其余未开始 |
 | M-6 | 其余（M13、M14；M14 原靠 iframe 桥接宿主，需重新设计） | 待定 | 未开始 |
 
 ## M-1：Anthropic 价差
@@ -705,3 +706,38 @@ CrossEx 的机会来源（C5）与导入预填属 M13，按 R3 单独做（见 [
 - 401：指标读取在登录失效后仍按 60 秒间隔重试（面板在登录提示后面不卸载），重新登录后自动恢复；与汇率读取（401 后停）不同，是有意的。
 - 停机：`settleMonitor` 排在告警的最终写入之后，最坏 20 + 5 + 2 秒，仍在 systemd 默认 30 秒停止时限内；通常关闭开关时写回已开始，这里立即返回。
 - Lighter 与 Aster 的持仓金额口径工作台标为待核实，显示“暂无数据”，同工作台。
+
+### M-5b2：资金费历史、汇总接口与范围筛选
+
+**对照**：工作台 `server/perpetual-{funding-history,funding-reader,scanner-data,store}.mjs`、`lib/exchange-funding-cex.ts`、`lib/perpetual-{scanner-data,scanner-data-feed,funding-history-feed}.ts`、`hooks/use-perpetual-{funding-history,scanner-data}.ts`、`app/perpetual-scanner-filters.tsx`、`app/perpetual-panel.tsx`（范围筛选、历史列、展开详情的 `FundingHistory`、全量排序）与 `perpetual-scanner.css`（提交 `c84ba27`）。
+
+**范围**：
+- 服务：采集器内建资金费历史服务（工作台 `createPerpetualFundingHistoryService` 与读取器原样复制），与 M-5b1 的指标服务同样随开关启停、跨开关复用：页面读过的合约（缓存至多 500 个）每秒调度一次，每家交易所同时只有一个请求（两次之间至少 350 ms）、全部交易所合计同时至多 3 个，先读最近 4 天再每次向前回补 4 天、回补到 32 天，之后按结算周期增量刷新；429/418 按 `Retry-After` 退避该交易所。Kraken 与未核实的计价币返回“不支持”。汇总接口（`createPerpetualScannerDataService`）一次校验至多 30 个组合，登记到两个服务并返回指标与 24h / 3天 / 7天 / 30天净累计。
+- 读取器依赖：工作台 `lib/exchange-funding-cex.ts` 原样复制为 `src/vendor/perpetual-funding-cex.ts`（本仓库 M-2d 的 `exchange-funding-history.mjs` 去掉了 Aster、Bitget USDC、合约白名单与进度回调，这里都要用）；Lighter 解析复用 `exchange-funding-history.mjs` 的 `parseLighterFundingHistory`（与工作台同函数逐字一致）。
+- 缓存：`perpetual-cache.sqlite` 加 `funding_history_cache` 表（同 M-5b1 的写法）。
+- 接口：`POST /api/monitor/perpetual/funding-history`、`POST /api/monitor/perpetual/scanner-data`（带页面请求标记）；未运行 503，组合无效 400，其它 500；缓存打不开时回复带 `storageError`。
+- 页面：工具栏「筛选」按钮与范围筛选面板（成交额、持仓量、开仓价差、资金费差、年化、24h / 7天 / 30天实际资金费，存储键 `market-monitor:perpetual-scanner-ranges:v1`，首次从旧的最小价差 / 最小资金费差迁移，默认开仓价差 ≥ 0）；筛选与排序状态行（候选数、匹配数、待采集、缺失或过期）；24h / 7天 / 30天实际资金费三列（列菜单补齐到 15 列）；展开详情的已结算资金费累计；成交额、持仓量与三个历史列开放表头排序（排序和筛选覆盖全部候选组合，由汇总接口分批补齐）。
+
+**不搬**（后续批次）：价差图表与资金费稳定度（M-5c）、质量列（M-5d）、自选与屏蔽、现货充提与 CrossEx 过滤（M-5f）。
+
+**影响面（R2）**：新增两个只读接口与常驻的按需历史采集，会访问 Binance、Bybit、OKX、Bitget、Aster、Gate、Hyperliquid、Lighter、RH Lighter 的公开资金费历史接口；启用范围筛选或按成交额、持仓量、历史排序时，汇总接口会为全部候选组合（不只当前页）登记采集，单次 30 组、按页面节奏分批。不碰凭据、交易与 `monitor.sqlite`。
+
+**回滚**：`sudo bash install.sh --version v0.39.0`，不用改配置；旧版本不读新表，留在缓存库无害。
+
+**测试计划**：移植工作台 `tests/perpetual-{funding-history-feed,funding-reader,scanner-data-feed,scanner-data,scanner-filters}.test.mjs`、`tests/exchange-funding-cex.test.mjs`（只改导入），`perpetual-funding-history.test.mjs` 中依赖工作台整体服务的用例改测本仓库采集器；本仓库补采集器与接口测试（未运行 503、组合无效 400、历史就绪、停止写回、重开读缓存、汇总接口返回指标与净累计）。替身补资金费历史接口，浏览器走查范围筛选、历史列、全量排序与展开详情。
+
+#### M-5b2 实施记录（v0.40.0）
+
+按上面的计划实现，差别与补充：
+
+- 复制：工作台 `server/perpetual-funding-history.mjs`、`perpetual-funding-reader.mjs`、`perpetual-scanner-data.mjs` 分别复制为 `src/vendor/perpetual-{funding-history-service,funding-reader,scanner-data-service}.mjs`（与同目录已有的 `lib/` 复制区分），`lib/exchange-funding-cex.ts` 复制为 `perpetual-funding-cex.ts`，`lib/perpetual-scanner-data.ts` 复制到 `src/vendor/`（去掉对页面 `perpetual-spreads` 的类型导入，改为结构相同的本地类型）；只改导入，`.mjs` 配 `.d.mts`。
+- 采集器：两项服务与 M-5b1 的指标服务一起随开关启停，停止时并行写回；读取器请求间隔 350 ms。`fundingHistory` 选项可单独注入 `fetchImpl`（替身与测试用），默认用采集器的 `fetchImpl`。缓存库打不开时，两个接口与指标接口一样在回复里带“只存内存”的 `storageError`，服务日志与提示文案改为“市场指标与历史资金费只存内存”。
+- 接口：`POST /api/monitor/perpetual/funding-history`（`{ pairs }`）与 `POST /api/monitor/perpetual/scanner-data`（`{ pairs, metrics, historyHours }`，`historyHours` 只认 24 / 72 / 168 / 720）；503 文案分别为「…开启后再读取历史资金费」「…开启后再读取筛选数据」。
+- 页面：两个 hook 照 M-5b1 的写法走 `api()`（401 转登录，其它失败显示服务给的原因）；范围存储改为渲染前同步读取（工作台在挂载后读，所以多一个 ready 标志），跨标签页同步同工作台。
+- 下架组合：汇总接口对含已到下架时间的腿的批次整批 400（工作台规则），页面不为这类组合请求汇总数据；需要这些数据的范围条件把它们计为“缺失或过期”，而不是一直“待采集”。资金费历史接口不拒绝下架合约，页面照常读取当前页全部行。
+- 指标单元格：范围或排序需要成交额、持仓量时取汇总数据，汇总里还没有的腿退回当前页指标读取的数值（工作台此时只取汇总数据，单元格会短暂显示“采集中”）。
+- 默认范围：首次打开从旧的最小价差（资金费模式为最小资金费差）迁移，默认「开仓价差 ≥ 0」生效，筛选状态行常显；负价差组合从此默认不显示（与工作台一致），点「全部清除」后不再恢复。
+- 样式修正：`monitor.css` 的两条 `td small` 规则改用 `:where(.monitor-desk)`。工作台是 `td small`（特异度 0,0,2），面板自己的 `.perp-detail small`、`.perp-funding-history-time` 等规则能覆盖它；加 `.monitor-desk` 前缀后升到 0,1,2，宽度 ≤ 1100px 时把详情的结算截止时间、各平台报价表的小字整个隐藏，桌面宽度下字号与左边距也被改大（M-4b 起就有）。
+- 替身：`test/perpetual-fake.ts` 加 Binance、Bybit（8 小时）与 Hyperliquid（1 小时）的资金费历史，费率按交易所、币种与时间确定，OKX 与 Lighter 抛错以展示“更新失败”。
+- 测试：工作台 `perpetual-funding-history.test.mjs` 中测工作台整体服务的用例不移植，改由 `test/monitor-perpetual-funding.test.ts` 覆盖本仓库采集器（未运行 503、组合无效 400、历史就绪与净累计、停止写回、新采集器先读缓存）、汇总接口（指标与净累计、参数无效 400）、缓存表（与指标表互不覆盖、坏行按缺失）与两条路由的 401/403/404/503/400/423。
+- 回补节奏：首批读最近 4 天（24h 列很快就绪），之后每次 tick 向前回补 4 天，单个合约约 8 次请求（约 8–10 秒）补齐 32 天，期间 7 天、30 天列显示“采集中”或“历史不足”；每家交易所同一时刻只有一个请求、每秒调度一次，所以范围或排序覆盖全部候选组合时，首轮大约按每家交易所每秒一个请求逐个合约补齐，页面显示“待采集 N · 自动补齐中”。已到下架时间的组合不进汇总，历史列退回逐页读取的已结算记录。

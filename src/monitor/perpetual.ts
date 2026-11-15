@@ -5,8 +5,11 @@
 // book snapshots; quotes are committed once a second and broadcast as patches against what every reader last got.
 // M-5a adds the workbench's execution service (perpetual-depth.mjs): one-shot public depth for an amount (depth), the close
 // estimate of a position (exit) and the spot FX rates (fx), created on start and stopped with the collector.
+// M-5b1 adds the workbench's market-metrics service (perpetual-market-metrics.mjs): 24h volume and open interest of the
+// contracts a page has read, refreshed every 30 s; built once, started and stopped with the collector, cached in
+// perpetual-cache.sqlite (src/monitor/perpetual-cache.ts) so a restart or a switch-off keeps the figures.
 // Left out (later batches, docs/monitor.md M-4/M-5): the saved quotes (market.sqlite), quality, funding/price history, alerts,
-// paper trading, CrossEx filters, metrics. Quotes live in memory only; a restart or a switch-off starts from empty.
+// paper trading, CrossEx filters. Quotes live in memory only; a restart or a switch-off starts from empty.
 // Node's own WebSocket is used (it takes request headers); like fetch it goes through Node's global dispatcher, so with
 // NODE_USE_ENV_PROXY=1 and HTTPS_PROXY (README) both the directory reads and the sockets use the proxy.
 import { randomUUID } from 'node:crypto';
@@ -14,6 +17,9 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { constants as zlibConstants, createGzip, type Gzip } from 'node:zlib';
 import { EXCHANGES, createSubscriptions, discoverMarkets, getControlResponse, parseMessage, type PerpetualRequestOptions, type PerpetualSpec, type PerpetualVenue } from '../vendor/perpetual-exchanges.mjs';
 import { createPerpetualExecutionService, type PerpetualExecutionOptions, type PerpetualExecutionService } from '../vendor/perpetual-depth.mjs';
+import { createPerpetualMarketMetricsService, type PerpetualContractMetricsStore } from '../vendor/perpetual-market-metrics-service.mjs';
+import { createPerpetualMetricsReader } from '../vendor/perpetual-metrics-reader.mjs';
+import type { PerpetualMarketMetricsReport } from '../vendor/perpetual-market-metrics.ts';
 import { MAX_FUTURE_MS, PERPETUAL_STALE_MS, createPerpetualChangedPatch, mergePerpetualQuote, withMarketMetadata, type PerpetualExchange, type PerpetualMarket, type PerpetualQuote, type PerpetualSnapshot, type PerpetualStatus, type PerpetualUpdate } from '../vendor/perpetual-stream.mjs';
 
 /** The workbench's collection policy (collection-policy.mjs). */
@@ -66,6 +72,12 @@ export interface PerpetualOptions {
   watchdogIntervalMs?: number; quoteTimeoutMs?: number;
   /** The depth / exit / FX reads' venues (tests and the local preview stand in for them). */
   execution?: Pick<PerpetualExecutionOptions, 'fetchImpl' | 'WebSocketImpl' | 'maxMarkets' | 'cacheMs'>;
+  /** M-5b1: the market-metrics reads' venues (tests and the local preview stand in for them) and the scheduler tick. */
+  metrics?: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; intervalMs?: number };
+  /** M-5b1: the metrics cache (perpetual-cache.sqlite); without it the figures live in memory only. */
+  cache?: PerpetualContractMetricsStore | null;
+  /** M-5b1: set when the cache file could not be opened; every metrics report then carries it as its storageError. */
+  cacheUnavailable?: string;
 }
 
 /** A refusal of the depth, exit or FX read, with the HTTP status the workbench gives it. */
@@ -91,6 +103,7 @@ export function createPerpetualMonitor({
   fetchImpl, WebSocketImpl = globalThis.WebSocket as unknown as PerpetualSocketFactory, now: clock = Date.now, log = line => process.stderr.write(`${line}\n`),
   staleAfterMs = PERPETUAL_STALE_MS, retryMs = 5_000, discoveryIntervalMs = PERPETUAL_DISCOVERY_MS, observationIntervalMs = PERPETUAL_OBSERVATION_MS,
   broadcastIntervalMs = PERPETUAL_OBSERVATION_MS, watchdogIntervalMs = 10_000, quoteTimeoutMs = 45_000, execution: executionOptions,
+  metrics: metricsOptions, cache = null, cacheUnavailable,
 }: PerpetualOptions = {}) {
   const quotes = new Map<string, PerpetualQuote>(), pendingQuotes = new Map<string, PerpetualQuote>(), publishedQuotes = new Map<string, PerpetualQuote>(), publishDirty = new Set<string>();
   const connections = new Set<Connection>(), timers = new Set<ReturnType<typeof setTimeout>>(), pollBudgets = new Map<string, PollBudget>();
@@ -109,6 +122,15 @@ export function createPerpetualMonitor({
       throw new PerpetualInspectionError(typeof status === 'number' && status >= 400 && status < 600 ? status : 502, reason(error));
     }
   }
+  // One for the collector's life (its registrations and cache outlive a switch-off); its stop is async (the in-flight reads
+  // settle, then the dirty entries are written back), awaited by settled() before the cache file closes.
+  const metricsFetch = metricsOptions?.fetchImpl ?? fetchImpl;
+  const marketMetrics = createPerpetualMarketMetricsService({
+    getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket: (exchange, symbol) => states.get(exchange)?.markets?.get(symbol),
+    store: cache, clock, reader: createPerpetualMetricsReader({ clock, ...(metricsFetch ? { fetchImpl: metricsFetch } : {}) }),
+    ...(metricsOptions?.intervalMs ? { intervalMs: metricsOptions.intervalMs } : {}),
+  });
+  let metricsStopping: Promise<void> = Promise.resolve();
   let observationTimer: ReturnType<typeof setInterval> | undefined, broadcastTimer: ReturnType<typeof setInterval> | undefined, refreshTimer: ReturnType<typeof setInterval> | undefined;
   const venue = (exchange: string): VenueState => states.get(exchange)!;
 
@@ -354,6 +376,7 @@ export function createPerpetualMonitor({
         getQuote: (exchange, symbol) => quotes.get(`${exchange}:${symbol}`), getMarket: (exchange, symbol) => states.get(exchange)?.markets?.get(symbol),
         clock, ...(fetchImpl ? { fetchImpl } : {}), ...executionOptions,
       });
+      marketMetrics.start();
       if (observationIntervalMs > 0) { observationTimer = setInterval(observe, observationIntervalMs); observationTimer.unref?.(); }
       for (const exchange of states.keys()) void refresh(exchange);
       refreshTimer = setInterval(() => { for (const exchange of states.keys()) void refresh(exchange); }, discoveryIntervalMs);
@@ -368,6 +391,7 @@ export function createPerpetualMonitor({
       if (!running) return;
       running = false; closeStreams();
       execution?.stop(); execution = null;
+      metricsStopping = marketMetrics.stop().catch(() => undefined);
       for (const timer of [observationTimer, refreshTimer, broadcastTimer]) clearInterval(timer);
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
@@ -438,6 +462,23 @@ export function createPerpetualMonitor({
     exit: (input: unknown) => inspect(service => service.exit(input)),
     /** M-5a: the spot FX rates of USDC, USD1, USDG and USD in USDT (cached a minute). */
     fx: () => inspect(service => service.fx()),
+    /**
+     * M-5b1: the 24h volume and open interest of up to 30 current pairs (the workbench's metrics action); registers the legs
+     * for the 30 s refresh and answers from the cache at once. 503 while stopped, 400 for an invalid batch.
+     */
+    async marketMetrics(input: unknown): Promise<PerpetualMarketMetricsReport> {
+      if (!running) throw new PerpetualInspectionError(503, '合约价差采集未运行，开启后再读取市场指标');
+      try {
+        const report = marketMetrics.read(input);
+        return cacheUnavailable && !report.storageError ? { ...report, storageError: cacheUnavailable } : report;
+      }
+      catch (error) {
+        const status = (error as { status?: unknown })?.status;
+        throw new PerpetualInspectionError(status === 400 ? 400 : 500, reason(error));
+      }
+    },
+    /** M-5b1: resolves once the last stop has written the metrics back (the cache file may close then). */
+    settled: (): Promise<void> => metricsStopping,
   };
 }
 export type PerpetualMonitor = ReturnType<typeof createPerpetualMonitor>;

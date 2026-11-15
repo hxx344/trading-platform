@@ -15,7 +15,8 @@
 - M-4a（合约价差采集器：11 家交易所永续合约公开盘口，SSE 增量，只在内存）随 v0.36.0；替身交易所验证，并在开发机上对真实交易所做过 20 秒冒烟（见 M-4a 实施记录）。页面与导入见下一条。
 - M-4b（合约价差页面；从工作台导入时一并启用）随 v0.37.0；替身合约行情上浏览器走查（见 M-4b 实施记录）。
 - M-5a（展开组合详情：按金额校验盘口、平仓收益测算；跨计价币排名；手动配对）随 v0.38.0；替身交易所验证（见 M-5a 实施记录）。
-- 未开始：M-5b–M-5f、M-6（见下表与「M-5」节）。
+- M-5b1（市场指标：成交额与持仓量列；所需资本与 ROC；列选择；表头排序）随 v0.39.0；替身交易所验证（见 M-5b1 实施记录）。
+- 未开始：M-5b2–M-5f、M-6（见下表与「M-5」节）。
 - M-1 没做：成交标记、股数从交易中心同步、概览卡片与告警（均线 / 布林带 / Z-score 随 M-2e 补上）。
 
 ## 批次
@@ -26,7 +27,7 @@
 | M-2 | 原油价差与海力士行情（M01、M02），分 M-2a–M-2e 五小批（见下文），Var 腿先降级为“未接入” | R2 | M-2a 已发布（v0.20.0），M-2b 已发布（v0.21.0），M-2c 已发布（v0.23.0），M-2d 已发布（v0.24.0），M-2e 已发布（v0.25.0），M-2d-3 已发布（v0.27.0） |
 | M-3 | 告警规则、飞书通知、监控开关、Var 会话 token（M09–M12），分 M-3a–M-3d 四小批（见下文） | R3 | M-3a 完成（v0.29.0），M-3b 完成（v0.30.0），M-3c 完成（v0.31.0），M-3d-1 完成（v0.33.0），M-3d-2 完成（v0.34.0） |
 | M-4 | 永续全市场报价（M04：11 家交易所公共 WS、SSE 增量），分 M-4a（采集器与接口）、M-4b（页面与导入） | R2 | 完成（M-4a v0.36.0，M-4b v0.37.0） |
-| M-5 | 依赖 M04 的页面（M05–M08），分 M-5a–M-5f 六小批（见「M-5」节） | R2 | M-5a 完成（v0.38.0），其余未开始 |
+| M-5 | 依赖 M04 的页面（M05–M08），分 M-5a–M-5f 小批（M-5b 再拆 b1、b2，见「M-5」节） | R2 | M-5a（v0.38.0）、M-5b1（v0.39.0）完成，其余未开始 |
 | M-6 | 其余（M13、M14；M14 原靠 iframe 桥接宿主，需重新设计） | 待定 | 未开始 |
 
 ## M-1：Anthropic 价差
@@ -631,9 +632,10 @@ CEX 最多 32 页。
 | 小批 | 内容（工作台对应） | 新增存储 | 依赖 |
 | --- | --- | --- | --- |
 | M-5a | 采集器内的按需盘口服务：成交校验（depth）、平仓测算（exit）、现货汇率（fx）；页面的组合展开详情、跨计价币、手动配对（M07） | 无 | M-4 |
-| M-5b | 资金费历史与市场指标（funding-history、funding-reader、market-metrics、metrics-reader、scanner-data）；成交额、持仓量、资本与 ROC、范围筛选、表头排序、列选择 | `funding_history_cache`、`contract_metrics_cache` | M-4 |
-| M-5c | 价格历史与价差图（price-history、price-reader、图表工作区） | `price_history_cache` | M-4 |
-| M-5d | 质量采样与质量依据（quality：含 CoinGecko 与多空比请求）、手续费与滑点预算设置 | `quality_samples` | M-5b |
+| M-5b1 | 市场指标（market-metrics、metrics-reader）：成交额、持仓量列；所需资本与 ROC（含设置）；列选择；表头排序（只开放报价能算的列） | `perpetual-cache.sqlite` 的 `contract_metrics_cache` | M-4 |
+| M-5b2 | 资金费历史与汇总（funding-history、funding-reader、scanner-data）：24h / 7天 / 30天实际资金费列与展开详情的已结算资金费；范围筛选；成交额、持仓量与历史列的全量排序 | 同一文件的 `funding_history_cache` | M-5b1 |
+| M-5c | 价格历史与价差图（price-history、price-reader、图表工作区；资金费稳定度读 M-5b2 的资金费历史） | 同一文件的 `price_history_cache` | M-5b2 |
+| M-5d | 质量采样与质量依据（quality：含 CoinGecko 与多空比请求）、手续费与滑点预算设置 | 同一文件的 `quality_samples` | M-5b1（缓存库、列与排序框架） |
 | M-5e | 模拟与手工持仓跟踪（paper）：展开详情「平仓与跟踪」的登记、持仓跟踪工作区 | `monitor_state` 的一个键 | M-5a |
 | M-5f | 机会列表 v1/v2、现货划转证据、CrossEx 设置（opportunities、spot-transfer、crossex-settings） | 待定 | M-5a（汇率） |
 
@@ -666,3 +668,40 @@ CrossEx 的机会来源（C5）与导入预填属 M13，按 R3 单独做（见 [
 - 页面：`web/src/PerpetualExecution.tsx`、`PerpetualExit.tsx`、`PerpetualManualPairs.tsx`、`use-perpetual-fx.ts`；请求走 `api()`（带页面请求标记，401 转登录，失败显示服务给的原因）。平仓测算的输入字段与默认值同工作台模拟仓位（展开时快照的多腿卖一、空腿买一，1000 USDT），去掉登记方式切换与登记按钮。
 - 样式：三份组件 css 原样复制；`perpetual.css` 按新增的类重新过滤（展开列、详情行、页签、汇率提示），末列恢复为展开按钮后，M-4b 删去的 `th:last-child` 规则也照工作台保留。补了一段：工作台的监控模块在 iframe 里，详情按 `100vw` 限宽；本服务左侧有导航栏，改为按表格容器宽度（容器查询 `100cqw`），否则 1280 宽度下详情右侧被裁掉。
 - 手续费与滑点预算用工作台默认值（`defaultQualityBudget`：公开 taker 费率、0.10% 滑点），可调的设置面板属 M-5d。
+
+### M-5b1：市场指标、所需资本与 ROC、列选择与表头排序
+
+**拆分**：工作台的资金费历史、市场指标与汇总接口合计约 3,000 行（服务端约 1,450、页面约 1,700），一次搬完不利于审查与验收，按功能拆成 b1（指标、资本、列与排序框架）与 b2（资金费历史、汇总接口与范围筛选、依赖汇总数据的全量排序）。b1 不需要汇总接口：成交额与持仓量只读当前页 30 个组合，排序只开放报价能算的列。
+
+**对照**：工作台 `server/perpetual-{market-metrics,metrics-reader,store}.mjs`、`lib/perpetual-{market-metrics,market-metrics-feed,contract-data-feed,capital,scanner-sort,scanner-filters,funding-history}.ts`、`lib/read-activity.ts`、`hooks/use-perpetual-market-metrics.ts`、`server/capital-metrics.mjs`（project-aggregation 仓库根）、`app/perpetual-scanner-parts.tsx` 的指标单元格、`app/perpetual-panel.tsx` 的列菜单、表头排序、资本与 ROC 部分（提交 `c84ba27`）。
+
+**范围**：
+- 服务：采集器内建一个市场指标服务（工作台 `createPerpetualMarketMetricsService` 与读取器原样复制），跨开关启停复用：开关打开时启动、关闭时停止（中止在途请求并写回缓存），页面读过的合约每 30 秒刷新 24h 成交额与持仓金额，各交易所限速、限流退避与失败退避同工作台。接口 `POST /api/monitor/perpetual/metrics`（至多 30 个组合，返回各腿的成交额、持仓金额、来源与时间）：须登录、带页面请求标记；关闭开关 423，采集器未运行 503，组合无效 400。
+- 缓存：数据目录新增 `perpetual-cache.sqlite`（工作台的 `publicCache` 写法：`contract_metrics_cache(id, updated_at, payload)`，gzip JSON，至多 5000 行，WAL、`busy_timeout=100`），只有服务进程写；与 `monitor.sqlite` 分开，指标写入不和告警、开关、导入争锁。打不开时只用内存，接口带 `storageError`。b2、M-5c、M-5d 在同一文件加表。
+- 页面：「显示列」菜单与「恢复默认列」（列偏好沿用 `market-monitor:perpetual-scanner:v1` 的 `columns`，b1 只列出已实现的列，没实现的列保留在存储里）；成交额、持仓量两列（多空两腿，点按钮弹出来源与时间，过期标灰）；所需资本、ROC 两列与详情行的资本说明；「监控工具与设置」加 ROC 杠杆、保证金缓冲、持有小时（键 `market-monitor:perpetual-capital-assumptions:v1`）；表头排序（键 `market-monitor:perpetual-scanner-sort:v1`），b1 可排资金费差、年化、报价（分多空腿，跨计价币按汇率）、开仓价差、所需资本、ROC；存储里是 b2 才有的排序列时按默认排序显示、不改存储。报价时间列照工作台默认隐藏，可在「显示列」打开。
+
+**不搬**（b2 及以后）：资金费历史三列与展开详情的已结算资金费、范围筛选面板、成交额与持仓量与历史列的排序（要对全部候选组合读指标，靠汇总接口）、质量列（M-5d）。
+
+**影响面（R2）**：新增一个只读接口与常驻的按需采集：只采页面读过的合约（缓存至多 500 个，按最近访问淘汰），每家交易所串行、间隔 350 ms，每秒至多 30 次读取，多数交易所走批量行情接口；新增一个可丢弃的缓存库文件。不碰凭据、交易、划转与 `monitor.sqlite`。
+
+**回滚**：`sudo bash install.sh --version v0.38.0`，不用改配置；旧版本不读 `perpetual-cache.sqlite`，留在数据目录无害，可手动删除。
+
+**测试计划**：移植工作台 `tests/perpetual-{market-metrics,metrics-reader,market-metrics-feed,scanner-sort,cache-store}.test.mjs` 与 `tests/capital-metrics.test.mjs`（只改导入；缓存库测试改测本仓库的缓存模块）；本仓库补采集器与接口测试（未运行 503、组合无效 400、未配置 404、关闭 423、开关重开后继续用同一缓存、停止时写回）、缓存库打不开时退化为内存。浏览器在替身后端（替身指标接口）1280 与 390 宽度走一遍列菜单、指标列与悬停、资本与 ROC 设置、表头排序与刷新后记住。
+
+#### M-5b1 实施记录（v0.39.0）
+
+按上面的计划实现，差别与补充：
+
+- 工作台 `server/perpetual-market-metrics.mjs`（指标服务）复制为 `src/vendor/perpetual-market-metrics-service.mjs`（同目录已有 `lib/perpetual-market-metrics.ts` 的复制，改名避免同名）；`metrics-reader.mjs`、`capital-metrics.mjs`、`lib/perpetual-{market-metrics,funding-history}.ts` 原样复制到 `src/vendor/`，`.mjs` 配 `.d.mts` 类型声明。
+- 缓存库：`src/monitor/perpetual-cache.ts`，表与写法同工作台 `publicCache`；本批只建 `contract_metrics_cache`。打不开（如路径被目录占用、磁盘只读、文件损坏）时服务照常启动，指标只存内存，日志写明原因，指标接口的每个回复带 `storageError`（页面在表格上方提示）；文件损坏不会自动重建，停服务后删掉该文件即可（只丢缓存的公开数值）。
+- 接口：`POST /api/monitor/perpetual/metrics`（带页面请求标记），请求体 `{ pairs }` 至多 30 组；采集未运行返回 503「合约价差采集未运行，开启后再读取市场指标」，请求格式错误 400，其它错误 500。页面把服务给的原因放在提示里。
+- 停止：关闭开关时中止在途请求并写回缓存；服务进程退出时 `settleMonitor` 至多等 2 秒让写回完成，再关闭数据库。
+- 页面：`web/src/use-perpetual-market-metrics.ts`（请求走 `api()`，401 转登录）；`read-activity.ts` 为独立页版本（页面隐藏时读取间隔至少 30 秒、离线停读，不接宿主的读取活动）；`lib/perpetual-{capital,scanner-sort,scanner-filters,contract-data-feed,market-metrics-feed}.ts` 复制到 `web/src/`，只改导入路径（服务端也用的文件从 `src/vendor/` 引入）。
+- 排序：表头排序只开放报价能算的六列（资金费差、年化、报价、价差、所需资本、ROC）；存储里若是成交额、持仓量或历史列（工作台写入的），本批按默认排序显示、不改存储，b2 开放后自动生效。排序需要汇率时按需读取汇率并提示缺失。
+- 替身：`test/perpetual-fake.ts` 加指标接口（Binance、Bybit、Hyperliquid 给数值，OKX 与 Lighter 抛错以展示“更新失败”）。
+- 测试：工作台缓存库测试不移植（测的是工作台的 store），改由 `test/monitor-perpetual-metrics.test.ts` 测本仓库缓存模块，同文件覆盖采集器启停与重开读缓存、服务层缓存打不开时只存内存、接口的 401/403/503/400/404/423。
+- 常驻采集：页面读过的合约登记后不会因页面关闭或闲置而过期，重启后从缓存库读回最近的 500 个继续采；只有关闭合约价差开关才停。频率有上限：批量行情接口每 30 秒一轮，Binance 持仓与 OKX K 线按 5 分钟分桶缓存，每家交易所串行、间隔 350 ms。
+- 下架组合：服务端对含已到下架时间的腿的批次整批返回 400（工作台规则，原样保留）；页面不为这类行请求指标（下架时间提前 5 秒算，抵消页面时钟与服务端到达时刻的差；单元格显示“已下架”），避免整页指标失败。目录变化导致报价被删、页面快照还没更新的短暂窗口里仍可能整批失败一轮，60 秒后重试恢复；展开详情冻结期间行不更新，这种失败会持续到收起。
+- 401：指标读取在登录失效后仍按 60 秒间隔重试（面板在登录提示后面不卸载），重新登录后自动恢复；与汇率读取（401 后停）不同，是有意的。
+- 停机：`settleMonitor` 排在告警的最终写入之后，最坏 20 + 5 + 2 秒，仍在 systemd 默认 30 秒停止时限内；通常关闭开关时写回已开始，这里立即返回。
+- Lighter 与 Aster 的持仓金额口径工作台标为待核实，显示“暂无数据”，同工作台。

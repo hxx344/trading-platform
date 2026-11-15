@@ -9,6 +9,7 @@ import { createHynixMonitor, type HynixMonitor } from '../monitor/hynix.ts';
 import { createOilMonitor, type OilMonitor } from '../monitor/oil.ts';
 import { createPerpetualMonitor, type PerpetualMonitor, type PerpetualOptions } from '../monitor/perpetual.ts';
 import { createMonitorControl, type MonitorControl } from '../monitor/control.ts';
+import { PERPETUAL_CACHE_FILE, openPerpetualCache, type PerpetualCache } from '../monitor/perpetual-cache.ts';
 import { MONITOR_FILE, createMonitorStore, type MonitorStore } from '../monitor/store.ts';
 import { createVariationalSession, type VariationalSession } from '../monitor/variational-session.ts';
 import { createVariationalFetch } from '../monitor/variational-transport.ts';
@@ -29,6 +30,8 @@ export interface MonitorRuntime {
   variational: VariationalSession | null;
   /** M-4a: every venue's perpetual quotes, in memory only; present when `perpetual` is configured. */
   perpetual: PerpetualMonitor | null;
+  /** M-5b1: the perpetual collector's public-data cache (perpetual-cache.sqlite); null when not configured or not openable. */
+  perpetualCache: PerpetualCache | null;
 }
 
 /** Opens monitor.sqlite and reads the saved history back; throws when the file cannot be opened. */
@@ -58,8 +61,18 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
     }
     const control = createMonitorControl({ store, markets: monitorMarkets(config), ...(log ? { log } : {}) });
     // Built here, started by its loop once the switch is on (monitorLoops).
-    const perpetual = config.perpetual ? createPerpetualMonitor({ ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}), ...perpetualOptions }) : null;
-    return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, hynix, exchanges, alerts, control, variational, perpetual };
+    // A cache that cannot be opened costs only the cached figures: the metrics then live in memory, the log says so and
+    // every metrics report carries the notice (the page shows it under the table).
+    let perpetualCache: PerpetualCache | null = null;
+    if (config.perpetual) {
+      try { perpetualCache = openPerpetualCache(join(dir, PERPETUAL_CACHE_FILE)); }
+      catch (error) { (log ?? (line => process.stderr.write(`${line}\n`)))(`合约价差缓存 ${PERPETUAL_CACHE_FILE} 打不开，市场指标只存内存：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`); }
+    }
+    try {
+      const perpetual = config.perpetual ? createPerpetualMonitor({ ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}), cache: perpetualCache,
+        ...(perpetualCache ? {} : { cacheUnavailable: `缓存库 ${PERPETUAL_CACHE_FILE} 打不开，市场指标只存内存，重启后重新采集。` }), ...perpetualOptions }) : null;
+      return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, hynix, exchanges, alerts, control, variational, perpetual, perpetualCache };
+    } catch (error) { perpetualCache?.close(); throw error; }
   } catch (error) { store.close(); throw error; }
 }
 
@@ -173,4 +186,12 @@ export const monitorLoops = (monitor: MonitorRuntime, context: LoopContext, log:
 
 /** Ends the requests in flight (at stopping), so the loops finish within the drain. */
 export const stopMonitor = (monitor: MonitorRuntime): void => { monitor.anthropic?.stop(); monitor.oil?.stop(); monitor.hynix?.stop(); monitor.exchanges?.stop(); monitor.variational?.stop(); monitor.perpetual?.stop(); };
-export const closeMonitor = (monitor: MonitorRuntime): void => { try { monitor.store.close(); } catch { /* best effort */ } };
+export const closeMonitor = (monitor: MonitorRuntime): void => {
+  try { monitor.store.close(); } catch { /* best effort */ }
+  try { monitor.perpetualCache?.close(); } catch { /* best effort */ }
+};
+/** M-5b1: waits (at most `limitMs`) for the perpetual metrics to be written back after the stop, before closeMonitor. */
+export const settleMonitor = async (monitor: MonitorRuntime, limitMs = 2_000): Promise<void> => {
+  if (!monitor.perpetual) return;
+  await Promise.race([monitor.perpetual.settled(), new Promise(resolve => setTimeout(resolve, limitMs).unref())]);
+};

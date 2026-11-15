@@ -33,11 +33,10 @@ import { monitorSummary } from './monitor-config.ts';
 import { assetSummary } from './asset-config.ts';
 import { ASSET_DB_FILE } from '../asset/db.ts';
 import { createAssetStore } from '../asset/store.ts';
-import { createEngineFor, optionsLoops, optionsViews, prepareOptions, type OptionsRuntime } from './options.ts';
+import { createOptionsSupervisor, type OptionsSupervisor } from './options.ts';
 import { optionsSummary } from './options-config.ts';
 import { createCrossexSupervisor, type CrossexOptions, type CrossexSupervisor } from './crossex.ts';
 import { crossexSummary } from './crossex-config.ts';
-import type { OptionsEngine } from '../options/engine.ts';
 import { createServiceLog, teeStream, type ServiceLog } from './service-log.ts';
 import { createSummary, type Summary, type SummaryInput } from './summary.ts';
 import { createWatch, watchLoop, watchSummary, type Watch } from './watch.ts';
@@ -215,6 +214,8 @@ export interface StartOptions {
   /** Tests stand in for Bybit's options API and shorten the start check. */
   optionsFetch?: (url: string, init: RequestInit) => Promise<Response>;
   optionsPreflightMs?: number;
+  /** Tests shorten the retry after a failed options start (OPTIONS_RETRY_MS). */
+  optionsRetryMs?: number;
   /** Tests stand in for Gate and the CrossEx public readers and shorten the start check (only with config.crossex). */
   crossexOptions?: CrossexOptions;
   /** Tests stand in for the second server's heartbeat receiver and shorten the cadence (only with config.watch). */
@@ -239,21 +240,29 @@ export async function startService(options: StartOptions): Promise<ReturnType<ty
   catch (error) { closeLogs(); throw error; }
 }
 
-async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, crossexOptions, watchOptions }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
+async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, watchOptions }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
   const session = keptSession(dir);
   // Oil accounts are locked and checked before the store opens: a failed check refuses start (oil.ts).
   const oil = config.oil ? await prepareOil(config.oil, secrets.exchanges, oilFetch ? { fetchImpl: oilFetch } : {}) : undefined;
-  // The options account likewise: locked and checked, and its own state database opened, before the main store (options.ts).
-  let options: OptionsRuntime | undefined;
-  try { options = config.options ? await prepareOptions(config.options, secrets.bybitOptions, dir, { ...(optionsFetch ? { fetchImpl: optionsFetch } : {}), ...(optionsPreflightMs === undefined ? {} : { preflightTimeoutMs: optionsPreflightMs }) }) : undefined; }
-  catch (error) { oil?.locks.release(); throw error; }
+  // Options is locked and checked too, but a failed start only disables options: it is retried in the background and the
+  // rest of the service runs (options.ts createOptionsSupervisor). Its task messages wait here until the notifier exists.
+  let optionsNotify: ((text: string) => void) | null = null;
+  const optionsEarly: string[] = [];
+  let options: OptionsSupervisor | undefined;
+  try {
+    options = config.options ? createOptionsSupervisor(config.options, secrets.bybitOptions, dir,
+      { ...(optionsFetch ? { fetchImpl: optionsFetch } : {}), ...(optionsPreflightMs === undefined ? {} : { preflightTimeoutMs: optionsPreflightMs }), ...(optionsRetryMs === undefined ? {} : { retryMs: optionsRetryMs }) },
+      { notify: text => { if (optionsNotify) optionsNotify(text); else optionsEarly.push(text); }, log: line => process.stderr.write(`${line}\n`) }) : undefined;
+    await options?.start();
+  } catch (error) { oil?.locks.release(); throw error; }
+  const stopOptions = (): Promise<void> => options ? options.stop() : Promise.resolve();
   // CrossEx is locked and checked too, but a failed start only disables CrossEx: it is retried in the background and the
   // rest of the service runs (crossex.ts createCrossexSupervisor). Its runtime closes asynchronously, once.
   let crossex: CrossexSupervisor | undefined;
   const stopCrossex = (): Promise<void> => crossex ? crossex.stop() : Promise.resolve();
   const releaseOil = () => {
     oil?.locks.release();
-    if (options) { try { options.store.close(); } catch { /* best effort */ } options.locks.release(); }
+    void stopOptions();
     void stopCrossex();
   };
   try {
@@ -332,15 +341,14 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   // Opened lazily by the store (read-write, read-only when the service cannot write it): a missing or not yet imported asset.sqlite answers "not imported".
   const asset = config.asset ? createAssetStore(join(dir, ASSET_DB_FILE)) : null;
   const enabled = executor.transferPairs().filter(pair => pair.enabled).length;
-  // The options engine needs the notifier for its task messages; a state document it cannot read refuses start.
-  let engine: OptionsEngine | undefined;
-  try { engine = options ? createEngineFor(options, { notify: text => notifier.notify(`【期权】${text}`), log: line => process.stderr.write(`${line}\n`) }) : undefined; }
-  catch (error) { samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw new Error(`期权状态无法恢复，拒绝启动：${error instanceof Error ? error.message : String(error)}`); }
+  // The options engine's task messages (and any it sent while starting) go out through the notifier from here on.
+  optionsNotify = text => notifier.notify(`【期权】${text}`);
+  for (const text of optionsEarly.splice(0)) optionsNotify(text);
   // Spread rules (observe and live) in their own file; one that cannot open is shown on the oil page, nothing else stops.
   const oilRules = oil ? openOilRules(oil, dir, { executor }) : undefined;
   // PnL and ledgers (read only) in their own file; one that cannot open is shown on the oil page, nothing else stops.
   const oilPnl = oil ? openOilPnl(oil, dir) : undefined;
-  const oilText = `${oil ? `；原油执行账户 ${oil.config.accounts.length} 个` : ''}${options ? '；期权账户 1 个' : ''}${crossex ? `；CrossEx 账户 1 个${crossex.runtime() ? '' : '（未启动，后台重试）'}` : ''}`;
+  const oilText = `${oil ? `；原油执行账户 ${oil.config.accounts.length} 个` : ''}${options ? `；期权账户 1 个${options.running() ? '' : '（未启动，后台重试）'}` : ''}${crossex ? `；CrossEx 账户 1 个${crossex.runtime() ? '' : '（未启动，后台重试）'}` : ''}`;
   try {
     notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}`);
     for (const text of warnings) notifier.notify(`【配置未生效】${text}`);
@@ -364,7 +372,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(monitor ? { monitor: monitorViews(monitor) } : {}),
       summary: { setInterval: (minutes: number) => summary.setInterval(minutes), sendNow: () => summary.sendNow() },
       ...(asset ? { asset } : {}),
-      ...(engine ? { options: optionsViews(engine) } : {}),
+      ...(options ? { options: options.views } : {}),
       ...(crossex ? { crossex: crossex.views } : {}),
       ...(logs ? { logs: (filter: 'all' | 'problems', before: number | null, limit: number) => logs.page({ filter, before, limit }) } : {}),
     },
@@ -400,7 +408,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       })),
       ...(oil ? oilLoops(oil, context, line => process.stderr.write(`${line}\n`), oilRules, oilPnl) : []),
       ...(monitor ? monitorLoops(monitor, context) : []),
-      ...(options && engine ? optionsLoops(options, engine, context, line => process.stderr.write(`${line}\n`)) : []),
+      ...(options ? [options.loop(context, { notifyOnce: (key, text) => notifier.notifyOnce(key, text), notify: text => notifier.notify(text) })] : []),
       ...(crossex ? [crossex.loop(context, { notifyOnce: (key, text) => notifier.notifyOnce(key, text), notify: text => notifier.notify(text), log: line => process.stderr.write(`${line}\n`) })] : []),
       ...(config.watch && secrets.watch ? [watchLoop(watch = createWatch({ config: config.watch, secret: secrets.watch, problem: context.notReady, ...(watchOptions?.fetchImpl ? { fetchImpl: watchOptions.fetchImpl } : {}), log: line => process.stderr.write(`${line}\n`) }), context, watchOptions)] : []),
     ],
@@ -410,8 +418,9 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       if (monitor) stopMonitor(monitor);
       // A beat in flight must not hold the stop for its timeout.
       watch?.abort();
-      // A CrossEx start in flight gives up rather than hold the shutdown up.
+      // A CrossEx or options start in flight gives up rather than hold the shutdown up.
       crossex?.abort();
+      options?.abort();
     },
     onStopped: async () => {
       // Events from the drain (an unknown transfer, an ADL batch) go out now rather than at the next start.
@@ -428,6 +437,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       oilPnl?.close();
       locks.release();
       await stopCrossex();
+      await stopOptions();
       releaseOil();
       closeLogs();
     },

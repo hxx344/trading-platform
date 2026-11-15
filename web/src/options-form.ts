@@ -121,9 +121,13 @@ export function orderState(order: OrderRow, task: Pick<Task, 'status'> | undefin
   return task && isActive(task) && task.status !== 'recovery_needed' ? { label: '挂单中', tone: 'working' } : { label: '状态未知 · 待核对', tone: 'warning' };
 }
 
-/** A refusal of the start itself (bad body, plan gone or used, limits, a reused id): the request id was never accepted. */
+/**
+ * A refusal of the start itself (bad body, plan gone or used, limits, a reused id; or options not started, 503
+ * options_unavailable, answered before anything is sent): the request id was never accepted.
+ */
 export const startRefused = (error: unknown): boolean => {
-  const status = (error as { status?: unknown } | null)?.status;
+  const { status, code } = (error ?? {}) as { status?: unknown; code?: unknown };
+  if (status === 503 && code === 'options_unavailable') return true;
   return typeof status === 'number' && status >= 400 && status < 500 && status !== 401 && status !== 403;
 };
 

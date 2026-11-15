@@ -62,7 +62,12 @@
 - 代码：`src/options/`（`client.ts` 期权客户端，`market.ts` 期权链，`strategy.ts` 选腿、预算与风险，`account.ts` 持仓 / Greeks / 账户健康，`orders.ts` 跟价下单与核对，`engine.ts` 计划 / 任务 / 对账 / 跟踪策略，`store.ts` 状态库），服务接线 `src/service/options.ts`、`options-config.ts`。
 - 状态：单独的 `options.sqlite`，一行 JSON 状态文档（版本 1，带账户 UID；G2a 加 `schedule`：页面开关、本周已开、最近一次被拒原因与飞书提醒周，旧文档读入时补默认值），G2c 加 `rfq`：唯一一笔询价的记录，旧文档读入时为空；每次变更整体写入（WAL + synchronous=FULL），对应工作台原子写的 `engine_state.json`。G2b 在同一库加两张表：`executions`（成交台账，按成交编号）与 `samples`（收益采样，按组合与时间，只追加），状态文档版本与字段不变。主库不迁移，回退时不受影响。状态文档损坏或 UID 不符时拒绝启动。
 - 配置 `config.json` 新增可选 `options`：`{ accountId, limits: { maxRiskUsd, maxMarginUsd }, legQty?, strategyMode?, marginMode?, orderTimeoutSeconds?, feeRate?, marginBufferPct?, autoOpen?, openHourUtc?, openMinuteUtc?, openWindowSeconds?, marketFallback? }`（缺省同工作台：1、iron_condor、REGULAR_MARGIN、600、0.0003、0.10、false、21、0、60、false；`openWindowSeconds` 1–300）；密钥 `secrets.json` 新增 `bybitOptions: { apiKey, apiSecret }`。`pairs`、`oil`、`options` 至少有一个。
-- 启动：配置了 `options` 时取进程锁 `pa-options/bybit/<UID>`，读 `query-api` 检查密钥（读写、绑定 IP、只开合约交易 / 期权交易 / 统一账户衍生品，钱包、现货等都关闭）、统一账户、UID 与配置一致（30 s 上限），失败拒绝启动（安装时自动回退旧版本）。
+- 启动：配置了 `options` 时取进程锁 `pa-options/bybit/<UID>`，读 `query-api` 检查密钥（读写、绑定 IP、只开合约交易 / 期权交易 / 统一账户衍生品，钱包、现货等都关闭）、统一账户、UID 与配置一致（30 s 上限），再打开 `options.sqlite` 并恢复状态文档。
+- 启动失败只停期权（v0.48.0 起，issue #10；此前整个服务拒绝启动、安装时自动回退旧版本，ASTER 划转与 ADL 一起停）：
+  - 范围：取不到锁（本机另一个进程占用此账户）、Bybit 读不到（网络、超时、密钥无效）、密钥或账户没通过检查（权限、IP、统一账户、UID 不符）、`options.sqlite` 打不开或状态文档无法恢复（如属于另一账户）。`config.json` / `secrets.json` 本身解析不过（如缺 `bybitOptions`）仍拒绝启动；ASTER 的写入租约与账户锁冲突仍拒绝启动，不受影响。
+  - 失败时：释放账户锁、关闭已打开的 `options.sqlite`，不建引擎、不跑期权循环、不向 Bybit 发任何写请求；`/api/options/*` 读写都回 503 `options_unavailable` 并写明原因（页面保留期权入口并显示原因，开仓确认按“未提交”处理）；日志写明细节（原因首次出现或变化时各一行），飞书每个原因每次进程启动只发一条“【期权未启动】”；启动通知写“期权账户 1 个（未启动，后台重试）”。
+  - 重试：每 60 s 从头再走一遍（取锁 → 启动检查 → 打开库 → 按服务启动时的规则恢复状态，进行中的任务改为恢复中并请求停止，不补发旧请求）；通过后发“【期权已启动】”并开始轮询。停服时进行中的启动检查立即放弃。
+  - 安装与导入：期权启动检查失败不再让安装判定启动失败、自动回退；从工作台导入期权时仍先用密钥读一次 `query-api` 核对，失败不导入。
 - 循环：期权链每 10 s（单次 10 s 超时、失败保留上次结果并记日志）；定时开仓每 5 s（G2a）；对账每 15 s（核对未结束订单 → 结束已恢复的任务 → 同步持仓与退役）；账户健康每 15 s；收益每 15 s（补读成交、采样，G2b）；询价核对每 3 s（读询价状态、报价与成交列表，G2c）。
 - 外部调用：每个 HTTP 请求 10 s 超时；只读请求不重试（下一轮再读），签名写请求只在时间戳被拒（10002，证明未执行）时同步时钟后重发一次。
 - 结果未知的订单：对账撤单后读实时与历史订单。下单应答丢失、从未拿到订单号，发出已超过 2 分钟（Bybit 接收窗口 5 s）且不到 6 天（历史订单默认只查最近 7 天）、每次读取都明确查无此单时，按未下单（成交 0）结算；有订单号的始终保持未知、转人工。订单编号前缀为 `tpo-`（工作台为 `ic-`），回退后工作台不会把本服务的成交认成自己的。

@@ -287,8 +287,14 @@ export function createOptionsSupervisor(config: OptionsConfig, credentials: Live
     },
     async loop(context, { notifyOnce, notify: post }) {
       // A message that cannot be queued (notify.sqlite full or busy) must not end the retries or keep the loops (and the
-      // engine's close at stop) from running.
-      const tell = (send: () => unknown) => { try { send(); } catch (error) { log(`期权启动消息未能入队：${describe(error)}`); } };
+      // engine's close at stop) from running. A sender that turns async is caught too, never an unhandled rejection.
+      const unqueued = (error: unknown) => log(`期权启动消息未能入队：${describe(error)}`);
+      const tell = (send: () => unknown) => {
+        try {
+          const sent = send();
+          if (sent && typeof (sent as PromiseLike<unknown>).then === 'function') (sent as PromiseLike<unknown>).then(undefined, unqueued);
+        } catch (error) { unqueued(error); }
+      };
       let failed = false;
       while (!context.stopped() && !running) {
         if (problem) {

@@ -36,10 +36,18 @@
 | 1 | P3 | Bybit 业务码拒绝（IP 未绑定 10010、密钥无效 10003）归为 unreachable，页面没提 IP | 原因文字补“本服务器 IP 不在密钥白名单内，详见服务日志”；按错误码细分登记，不在本批做 |
 | 1 | P3 | `locked` 的日志细节含完整 UID | 只进日志，与改前及 CrossEx 一致，不改 |
 | 1 | P3 | README、docs/options.md 写的 v0.48.0 须与发版一致 | 发版时核对 |
-| 1 | 待确认 | 期权账户锁冲突按“只停期权”处理，偏离 issue 验收“共享锁冲突仍拒绝”的字面 | 理由见“变更前对齐”；在 issue 里说明，请作者确认 |
+| 1 | 待确认 | 期权账户锁冲突按“只停期权”处理，偏离 issue 验收“共享锁冲突仍拒绝”的字面 | 理由见“变更前对齐”；在 PR #49 里说明，请作者确认 |
+| CI | 缺陷 | PR #49 第一次 CI 分片 2 失败：新用例与 `test/service.test.ts` 用同一组 ASTER 测试账户，两个文件并行时抢同一把本机账户锁 | `FakeAster` 可传入另一组钱包（`OTHER_WALLETS`），期权隔离用例改用它 |
+| 2 | — | 复核第 1 轮修复：无 P0/P1/P2 | — |
+| 2 | P3 | `tell` 的修复没有回归用例 | 登记，不在本批做：要在服务级让 notify.sqlite 写失败，或单独起监督器，代价大于收益 |
+| 2 | P3 | `tell` 只接同步抛错；发送方以后若改成异步，被拒的 Promise 会变成未处理的拒绝 | 返回 thenable 时也接住错误并记日志。`crossex.ts` 里相同写法的 `notifyOnce` 不在本次差异内，登记 |
+| 2 | P3 | 恢复用例里“上一个进程”的引擎一直在轮询同一个替身，测试布置可能干扰断言 | 挂单就位后切断旧引擎的网络（模拟进程结束），并在切断那一刻取状态快照 |
+| 2 | P3 | 恢复用例没有显式证明重试时重新做了启动检查 | 断言切到 up 之后的请求里，`/v5/user/query-api` 出现在第一个 `/v5/order/cancel` 之前 |
 
 ## 已运行
 
 - `pnpm check` 通过；`pnpm build:web` 通过。
 - 第 1 轮修复后：`node --test test/options-isolation.test.ts test/options-form.test.ts test/options.test.ts test/import-options.test.ts test/crossex-service.test.ts test/service.test.ts` 全部通过。`options-isolation` 六个服务级故障注入：Bybit 不通后恢复；密钥被拒反复重试只提醒一次、状态库属于另一账户；账户被另一进程占用后释放；停服时进行中的启动检查立即放弃；启动检查超时；带进行中任务的状态在重试通过后恢复且不补发下单。
-- 本机全套 `pnpm test`：15 分钟超时被终止，卡在 `test/service.test.ts`（不涉及期权）；该文件单独运行 19 项全部通过，几秒完成。本机高负载下的已知不稳定现象，全套以 CI 两个分片为准（见下）。
+- 本机全套 `pnpm test`：15 分钟超时被终止，卡在 `test/service.test.ts`（不涉及期权）；该文件单独运行 19 项全部通过，几秒完成。本机高负载下的已知不稳定现象，全套以 CI 两个分片为准。
+- PR #49 第一次 CI：check、test (1)、watch 通过；test (2) 失败，原因是上表 CI 那一行的抢锁。
+- 第 2 轮修复后：`pnpm check` 通过；`node --test test/service.test.ts test/options-isolation.test.ts test/aster.test.ts test/monitor.test.ts test/asset-http.test.ts test/crossex-service.test.ts test/options.test.ts`（多个文件并行，覆盖抢锁场景和 `FakeAster` 的其他使用方）全部通过。

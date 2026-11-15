@@ -13,7 +13,7 @@ import { holdAccountLocks } from '../src/live/setup.ts';
 import { openOptionsStore } from '../src/options/store.ts';
 import { OPTIONS_DATABASE } from '../src/service/options.ts';
 import type { SocketLike } from '../src/service/stream.ts';
-import { FakeAster, LONG, MAIN, SHORT } from './aster-fake.ts';
+import { FakeAster, OTHER_WALLETS } from './aster-fake.ts';
 import { createOptionsClient } from '../src/options/client.ts';
 import { createOptionsEngine } from '../src/options/engine.ts';
 import { createOptionMarket } from '../src/options/market.ts';
@@ -72,8 +72,8 @@ async function runService(data: string, accountId: string, fetch: (url: string, 
   const notifyFetch = async () => new Response(JSON.stringify({ code: 0 }), { status: 200, headers: { 'content-type': 'application/json' } });
   const run = await startService({
     config: parseServiceConfig({ secretsFile: '/etc/tp/secrets.json', pairs: [{ id: 'p1', main: 'main', long: 'a', short: 'b' }], options: { accountId, limits: { maxRiskUsd: 500, maxMarginUsd: 1_000 } } }),
-    secrets: { accounts: new Map([['main', MAIN], ['a', LONG], ['b', SHORT]]), feishu: FEISHU, bybitOptions: OPTIONS_KEY },
-    dir: data, port, app: APP, fetchImpl: new FakeAster().fetch, notifyFetch, optionsFetch: fetch, optionsPreflightMs: preflightMs, optionsRetryMs: retryMs,
+    secrets: { accounts: new Map([['main', OTHER_WALLETS.main], ['a', OTHER_WALLETS.long], ['b', OTHER_WALLETS.short]]), feishu: FEISHU, bybitOptions: OPTIONS_KEY },
+    dir: data, port, app: APP, fetchImpl: new FakeAster(OTHER_WALLETS).fetch, notifyFetch, optionsFetch: fetch, optionsPreflightMs: preflightMs, optionsRetryMs: retryMs,
     connect: () => { const socket = new Socket(); queueMicrotask(() => socket.emit('open')); return socket; },
   });
   try {
@@ -248,7 +248,9 @@ test('期权启动：重试通过后按服务启动规则恢复状态，进行�
   const fake = new FakeOptions(now);
   fake.uid = Number(uid);
   fake.fillMode = 'rest';
-  const client = createOptionsClient({ credentials: OPTIONS_KEY, fetchImpl: fake.fetch });
+  // The earlier process ends once its orders rest: its client stops reaching the venue, so only this service acts.
+  let earlierAlive = true;
+  const client = createOptionsClient({ credentials: OPTIONS_KEY, fetchImpl: (url, init) => earlierAlive ? fake.fetch(url, init) : Promise.reject(new TypeError('process ended')) });
   const earlier = mkdtempSync(join(tmpdir(), 'tp-options-earlier-')), earlierStore = openOptionsStore(join(earlier, OPTIONS_DATABASE));
   const engine = createOptionsEngine({
     client, market: createOptionMarket(client, { now }), store: earlierStore, uid, now, sleep: async () => { await sleep(2); }, pollMs: 20,
@@ -259,20 +261,26 @@ test('期权启动：重试通过后按服务启动规则恢复状态，进行�
     const plan = await engine.createPlan({ operation: 'open' });
     const { taskId } = await engine.startTask({ planId: plan.planId, requestId: 'isolation-recover-1', confirmLive: true });
     await until(() => fake.orders.size === 2 && Object.keys(engine.state().journal).length === 2, '两条护翼挂单');
+    earlierAlive = false;
+    const left = structuredClone(earlierStore.load());
     // This service's data directory, made by a first start (options down), then given that state.
     venue.control.mode = 'down';
     const first = await runService(data, uid, venue.fetch, { retryMs: 60_000 });
     await first.run.shutdown(); await first.run.done;
     const mine = openOptionsStore(join(data, OPTIONS_DATABASE));
-    try { mine.save(structuredClone(earlierStore.load())); } finally { mine.close(); }
+    try { mine.save(left); } finally { mine.close(); }
     const resting = fake.orders.size;
 
     const { run, call } = await runService(data, uid, venue.fetch);
     try {
       await optionsRefused(call, /读不到 Bybit 账户信息/);
+      const before = venue.calls.length;
       venue.control.mode = 'up';
       await until(async () => (await call('/api/options/state')).status === 200, '恢复后启动');
       await until(() => [...fake.orders.values()].every(order => order.status === 'Cancelled'), '对账撤掉遗留挂单');
+      // The retry checked the key again before touching any order.
+      const retried = venue.calls.slice(before), checked = retried.indexOf('/v5/user/query-api'), cancelled = retried.indexOf('/v5/order/cancel');
+      assert.ok(checked >= 0 && cancelled > checked, '重试先做启动检查再撤单');
     } finally { await run.shutdown(); await run.done; }
     const saved = openOptionsStore(join(data, OPTIONS_DATABASE));
     try {

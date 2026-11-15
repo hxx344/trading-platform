@@ -93,7 +93,9 @@ jobs:
       - uses: ./.github/actions/setup
       - run: npm run build:web
       - run: node scripts/test.ts --measure
-      - uses: actions/upload-artifact@v4
+      # Uploaded even when a file failed: that file keeps its old duration, and the job still fails.
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
         with:
           name: test-durations
           path: scripts/test-durations.json

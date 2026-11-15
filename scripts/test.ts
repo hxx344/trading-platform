@@ -31,9 +31,9 @@ export function shardFiles(all: readonly string[], durations: Record<string, num
 
 function readDurations(): Record<string, number> {
   let parsed: unknown;
-  try { parsed = JSON.parse(readFileSync(durationsFile, 'utf8')); } catch (error) { process.stderr.write(`读不到 ${durationsFile}（${(error as Error).message}），各文件按相同耗时分片\n`); return {}; }
+  try { parsed = JSON.parse(readFileSync(durationsFile, 'utf8')); } catch (error) { process.stderr.write(`读不到 ${durationsFile}（${(error as Error).message}），按空表处理\n`); return {}; }
   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, number>;
-  process.stderr.write(`${durationsFile} 不是对象，各文件按相同耗时分片\n`);
+  process.stderr.write(`${durationsFile} 不是对象，按空表处理\n`);
   return {};
 }
 

@@ -3,7 +3,8 @@ description: Node 24.15.0 and node_modules. A cache hit on the lockfile skips pn
 runs:
   using: composite
   steps:
-    - uses: actions/setup-node@v4
+    - id: node
+      uses: actions/setup-node@v4
       with:
         node-version: 24.15.0
     # Exact key only: a node_modules from another lockfile is never restored.
@@ -11,7 +12,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: node_modules
-        key: node-modules-${{ runner.os }}-${{ runner.arch }}-node24.15.0-${{ hashFiles('pnpm-lock.yaml', 'package.json') }}
+        key: node-modules-${{ runner.os }}-${{ runner.arch }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('pnpm-lock.yaml', 'package.json') }}
     - if: steps.modules.outputs.cache-hit != 'true'
       uses: pnpm/action-setup@v4
     - if: steps.modules.outputs.cache-hit != 'true'

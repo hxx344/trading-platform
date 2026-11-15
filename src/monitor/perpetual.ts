@@ -13,7 +13,11 @@
 // batch registered with both services, answering metrics and net window totals for range filters and full sorting).
 // M-5c adds the workbench's hourly trade-close history (perpetual-price-history.mjs: one pair per read, the selected legs
 // leased for 10 minutes, 3 days first then 30 days in 7-day pages; same life and cache file) for the pair chart.
-// Left out (later batches, docs/monitor.md M-4/M-5): the saved quotes (market.sqlite), quality, alerts,
+// M-5d2 adds the workbench's quality service (perpetual-quality-service.mjs): a ranked sample of the current quotes every
+// minute (at most 1000 pairs, 24 hours kept in perpetual-cache.sqlite quality_samples and restored on start), CoinGecko
+// fundamentals of every comparable base in the background (checked each minute; the coin list kept 24 hours, market data 30
+// minutes, page or not) and the public long/short account ratios of the pairs a page read in the last 3 minutes; same life.
+// Left out (later batches, docs/monitor.md M-4/M-5): the saved quotes (market.sqlite), alerts,
 // paper trading, CrossEx filters. Quotes live in memory only; a restart or a switch-off starts from empty.
 // Node's own WebSocket is used (it takes request headers); like fetch it goes through Node's global dispatcher, so with
 // NODE_USE_ENV_PROXY=1 and HTTPS_PROXY (README) both the directory reads and the sockets use the proxy.
@@ -29,6 +33,10 @@ import { createPerpetualScannerDataService } from '../vendor/perpetual-scanner-d
 import { createPerpetualPriceHistoryService, type PerpetualPriceHistoryStore } from '../vendor/perpetual-price-history-service.mjs';
 import { createPerpetualPriceReader } from '../vendor/perpetual-price-reader.mjs';
 import type { PerpetualPriceHistoryReport } from '../vendor/perpetual-price-history.ts';
+import { createPerpetualQualityService, type PerpetualQualityStore } from '../vendor/perpetual-quality-service.mjs';
+import { createFundamentalsClient, type FundamentalsClient } from '../vendor/perpetual-fundamentals.mjs';
+import { fetchPositioning, type PositioningFetch } from '../vendor/perpetual-positioning.mjs';
+import type { PerpetualQualityReport } from '../vendor/perpetual-quality.ts';
 import type { PerpetualFundingHistoryReport } from '../vendor/perpetual-funding-history.ts';
 import type { PerpetualScannerDataReport } from '../vendor/perpetual-scanner-data.ts';
 import { createPerpetualMetricsReader } from '../vendor/perpetual-metrics-reader.mjs';
@@ -91,11 +99,19 @@ export interface PerpetualOptions {
   fundingHistory?: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response> };
   /** M-5c: the hourly trade-close reads' venues (tests and the local preview stand in for them). */
   priceHistory?: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response> };
-  /** M-5b1/M-5b2/M-5c: the metrics, funding and price history cache (perpetual-cache.sqlite); without it all live in memory. */
-  cache?: (PerpetualContractMetricsStore & Partial<PerpetualFundingHistoryStore> & Partial<PerpetualPriceHistoryStore>) | null;
+  /**
+   * M-5d2: the quality service's sources. `coinIds` / `apiKey` are PERPETUAL_COIN_IDS and COINGECKO_DEMO_API_KEY (service/monitor.ts);
+   * `fetchImpl` stands in for CoinGecko and the ratio venues; `fundamentals` / `positioningFetch` replace the clients outright.
+   */
+  quality?: { fetchImpl?: Fetcher; coinIds?: Record<string, string>; apiKey?: string; fundamentals?: FundamentalsClient; positioningFetch?: PositioningFetch };
+  /** M-5b1/M-5b2/M-5c/M-5d2: the metrics, funding and price history and quality-sample cache (perpetual-cache.sqlite); without it all live in memory. */
+  cache?: (PerpetualContractMetricsStore & Partial<PerpetualFundingHistoryStore> & Partial<PerpetualPriceHistoryStore> & PerpetualQualityStore) | null;
   /** M-5b1: set when the cache file could not be opened; every metrics report then carries it as its storageError. */
   cacheUnavailable?: string;
 }
+
+/** The quality service's refusals of an invalid batch (plain Errors there; the workbench's HTTP layer answers them 400). */
+const QUALITY_INPUT_ERRORS = new Set(['每次最多评估30个平台组合', '平台组合格式无效']);
 
 /** A refusal of the depth, exit or FX read, with the HTTP status the workbench gives it. */
 export class PerpetualInspectionError extends Error {
@@ -120,7 +136,7 @@ export function createPerpetualMonitor({
   fetchImpl, WebSocketImpl = globalThis.WebSocket as unknown as PerpetualSocketFactory, now: clock = Date.now, log = line => process.stderr.write(`${line}\n`),
   staleAfterMs = PERPETUAL_STALE_MS, retryMs = 5_000, discoveryIntervalMs = PERPETUAL_DISCOVERY_MS, observationIntervalMs = PERPETUAL_OBSERVATION_MS,
   broadcastIntervalMs = PERPETUAL_OBSERVATION_MS, watchdogIntervalMs = 10_000, quoteTimeoutMs = 45_000, execution: executionOptions,
-  metrics: metricsOptions, fundingHistory: fundingOptions, priceHistory: priceOptions, cache = null, cacheUnavailable,
+  metrics: metricsOptions, fundingHistory: fundingOptions, priceHistory: priceOptions, quality: qualityOptions, cache = null, cacheUnavailable,
 }: PerpetualOptions = {}) {
   const quotes = new Map<string, PerpetualQuote>(), pendingQuotes = new Map<string, PerpetualQuote>(), publishedQuotes = new Map<string, PerpetualQuote>(), publishDirty = new Set<string>();
   const connections = new Set<Connection>(), timers = new Set<ReturnType<typeof setTimeout>>(), pollBudgets = new Map<string, PollBudget>();
@@ -161,8 +177,19 @@ export function createPerpetualMonitor({
     getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket: (exchange, symbol) => states.get(exchange)?.markets?.get(symbol),
     marketMetrics, fundingHistory, clock,
   });
+  // M-5d2: the workbench's service; its snapshot is this collector's (status, staleAfterMs, venue statuses and quotes). The
+  // workbench defers the fundamentals and ratio reads while its event loop p99 passes 80 ms or its CPU 160 %; this collector
+  // measures neither, so they never defer.
+  const qualityFetch = qualityOptions?.fetchImpl ?? fetchImpl;
+  const quality = createPerpetualQualityService({
+    getSnapshot: () => snapshot(), store: cache, clock, shouldDeferAuxiliary: () => false,
+    fundamentals: qualityOptions?.fundamentals ?? createFundamentalsClient({
+      clock, ...(qualityOptions?.coinIds ? { coinIds: qualityOptions.coinIds } : {}), ...(qualityOptions?.apiKey ? { apiKey: qualityOptions.apiKey } : {}), ...(qualityFetch ? { fetchImpl: qualityFetch } : {}),
+    }),
+    positioningFetch: qualityOptions?.positioningFetch ?? (qualityFetch ? (quote, options) => fetchPositioning(quote, { ...options, fetchImpl: qualityFetch }) : fetchPositioning),
+  });
   let metricsStopping: Promise<void> = Promise.resolve();
-  // The cached reads (metrics, funding history, scanner data, price history): 503 while stopped, the service's 400 for an invalid batch, any other failure 500; the cache's
+  // The cached reads (metrics, funding history, scanner data, price history, quality): 503 while stopped, the service's 400 for an invalid batch, any other failure 500; the cache's
   // unavailability rides along as the report's storageError.
   function cachedRead<T extends { storageError?: string }>(stopped: string, read: () => T): T {
     if (!running) throw new PerpetualInspectionError(503, stopped);
@@ -419,7 +446,7 @@ export function createPerpetualMonitor({
         getQuote: (exchange, symbol) => quotes.get(`${exchange}:${symbol}`), getMarket: (exchange, symbol) => states.get(exchange)?.markets?.get(symbol),
         clock, ...(fetchImpl ? { fetchImpl } : {}), ...executionOptions,
       });
-      marketMetrics.start(); fundingHistory.start(); priceHistory.start();
+      marketMetrics.start(); fundingHistory.start(); priceHistory.start(); quality.start();
       if (observationIntervalMs > 0) { observationTimer = setInterval(observe, observationIntervalMs); observationTimer.unref?.(); }
       for (const exchange of states.keys()) void refresh(exchange);
       refreshTimer = setInterval(() => { for (const exchange of states.keys()) void refresh(exchange); }, discoveryIntervalMs);
@@ -434,7 +461,7 @@ export function createPerpetualMonitor({
       if (!running) return;
       running = false; closeStreams();
       execution?.stop(); execution = null;
-      metricsStopping = Promise.all([marketMetrics.stop(), fundingHistory.stop(), priceHistory.stop()].map(stopping => stopping.catch(() => undefined))).then(() => undefined);
+      metricsStopping = Promise.all([marketMetrics.stop(), fundingHistory.stop(), priceHistory.stop(), quality.stop()].map(stopping => stopping.catch(() => undefined))).then(() => undefined);
       for (const timer of [observationTimer, refreshTimer, broadcastTimer]) clearInterval(timer);
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
@@ -532,6 +559,17 @@ export function createPerpetualMonitor({
      */
     async priceHistory(input: unknown): Promise<PerpetualPriceHistoryReport> {
       return cachedRead('合约价差采集未运行，开启后再读取成交价历史', () => priceHistory.read(input));
+    },
+    /**
+     * M-5d2: the quality evidence of up to 30 current pairs (the workbench's quality action): spread and funding stability, quote
+     * convergence, fundamentals and long/short ratios from what the service has collected; marks the pairs watched for 3 minutes.
+     * 503 while stopped, 400 for an invalid batch, any other failure 500.
+     */
+    async quality(input: unknown): Promise<PerpetualQualityReport & { storageError?: string }> {
+      return cachedRead<PerpetualQualityReport & { storageError?: string }>('合约价差采集未运行，开启后再读取质量资料', () => {
+        try { return quality.read(input); }
+        catch (error) { throw error instanceof Error && QUALITY_INPUT_ERRORS.has(error.message) ? Object.assign(error, { status: 400 }) : error; }
+      });
     },
     /** M-5b1: resolves once the last stop has written the metrics and histories back (the cache file may close then). */
     settled: (): Promise<void> => metricsStopping,

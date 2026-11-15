@@ -19,7 +19,8 @@
 - M-5b2（资金费历史：24h / 7天 / 30天实际资金费列与详情；汇总接口；范围筛选；成交额、持仓量与历史列的全量排序）随 v0.40.0；替身交易所验证（见 M-5b2 实施记录）。
 - M-5c（成交价历史与价差图表：图表工作区、两腿成交价与价差、资金费稳定度、可分享的图表链接）随 v0.41.0；替身交易所验证（见 M-5c 实施记录）。
 - M-5d1（手续费与滑点设置、持有期情景、资金费模式的未来 24h 情景）随 v0.42.0；替身交易所验证（见 M-5d1 实施记录）。
-- 未开始：M-5d2–M-5f、M-6（见下表与「M-5」节）。
+- M-5d2（质量采样与质量依据：质量列、「质量依据」页签、价差趋势、读取说明）随 v0.43.0；替身交易所验证（见 M-5d2 实施记录）。
+- 未开始：M-5e–M-5f、M-6（见下表与「M-5」节）。
 - M-1 没做：成交标记、股数从交易中心同步、概览卡片与告警（均线 / 布林带 / Z-score 随 M-2e 补上）。
 
 ## 批次
@@ -30,7 +31,7 @@
 | M-2 | 原油价差与海力士行情（M01、M02），分 M-2a–M-2e 五小批（见下文），Var 腿先降级为“未接入” | R2 | M-2a 已发布（v0.20.0），M-2b 已发布（v0.21.0），M-2c 已发布（v0.23.0），M-2d 已发布（v0.24.0），M-2e 已发布（v0.25.0），M-2d-3 已发布（v0.27.0） |
 | M-3 | 告警规则、飞书通知、监控开关、Var 会话 token（M09–M12），分 M-3a–M-3d 四小批（见下文） | R3 | M-3a 完成（v0.29.0），M-3b 完成（v0.30.0），M-3c 完成（v0.31.0），M-3d-1 完成（v0.33.0），M-3d-2 完成（v0.34.0） |
 | M-4 | 永续全市场报价（M04：11 家交易所公共 WS、SSE 增量），分 M-4a（采集器与接口）、M-4b（页面与导入） | R2 | 完成（M-4a v0.36.0，M-4b v0.37.0） |
-| M-5 | 依赖 M04 的页面（M05–M08），分 M-5a–M-5f 小批（M-5b、M-5d 再拆两批，见「M-5」节） | R2 | M-5a（v0.38.0）、M-5b1（v0.39.0）、M-5b2（v0.40.0）、M-5c（v0.41.0）、M-5d1（v0.42.0）完成，其余未开始 |
+| M-5 | 依赖 M04 的页面（M05–M08），分 M-5a–M-5f 小批（M-5b、M-5d 再拆两批，见「M-5」节） | R2 | M-5a（v0.38.0）、M-5b1（v0.39.0）、M-5b2（v0.40.0）、M-5c（v0.41.0）、M-5d1（v0.42.0）、M-5d2（v0.43.0）完成，其余未开始 |
 | M-6 | 其余（M13、M14；M14 原靠 iframe 桥接宿主，需重新设计） | 待定 | 未开始 |
 
 ## M-1：Anthropic 价差
@@ -800,3 +801,37 @@ CrossEx 的机会来源（C5）与导入预填属 M13，按 R3 单独做（见 [
 - 存储：预算在渲染前同步读取（工作台挂载后读），写回格式同工作台（`{ version: 2, ... }`），只在与已存的值不同时写回（首次渲染不会盖掉其它标签页刚存的新值）；存储事件只认这个键（清空事件忽略，同工作台）。其它标签页改了预算时同本页修改一样收起展开的行（工作台不收起，展开行冻结的排名会与平仓测算、持有情景用两套预算）。
 - 持有情景外套 `LazyBoundary`（M-5c 引入），分块加载失败时就地提示刷新。
 - 测试：三份移植测试 21 项通过（`web/test/perpetual/{fees,opportunity,funding}.test.mjs`）。
+
+### M-5d2：质量采样与质量依据
+
+**对照**：工作台 `server/perpetual-quality-service.mjs`、`perpetual-quality-history.mjs`、`perpetual-fundamentals.mjs`、`perpetual-positioning.mjs`、`perpetual-positioning-summary.mjs`、`server/perpetual-store.mjs`（`quality_samples`）、`server/perpetual-service.mjs`（质量服务的启停与 `quality` 动作）、`server/monitor-services.mjs`（`PERPETUAL_COIN_IDS`、`COINGECKO_DEMO_API_KEY`）、`lib/perpetual-quality.ts`、`lib/perpetual-quality-cache.ts`、`lib/perpetual-quality-feed.ts`、`hooks/use-perpetual-quality.ts`、`app/perpetual-trend.tsx` 与 `app/perpetual-panel.tsx`（`QualityCell`、`PositioningOverviewCard`、`QualityEvidence`、质量列、「质量依据」页签、价差趋势、`perp-quality-caption`）（提交 `c84ba27`）。
+
+**范围**：
+- 服务：采集器内建质量服务（工作台 `createPerpetualQualityService` 与四个依赖模块原样复制），随开关启停、跨开关复用。每分钟从当前报价取一次排名样本（至多 1000 个组合），保留 24 小时，算价差与资金费的稳定度、报价收敛统计；CoinGecko 市值 / FDV 在后台按当前全部可比币种刷新（每分钟检查一次，币种目录缓存 24 小时、行情缓存 30 分钟，每批至多 250 个 id；键可选，无键走公开限额），没人打开页面也照常；Binance、Bybit、OKX、Bitget、Gate 的公开多空账户比只查页面 3 分钟内读过的组合，按交易所退避。页面请求只读缓存的结果。
+- 缓存：`perpetual-cache.sqlite` 加 `quality_samples` 表（每分钟一行 gzip JSON，保留 24 小时、至多 1440 行，同工作台），重启后恢复样本。
+- 接口：`POST /api/monitor/perpetual/quality`（带页面请求标记）；未运行 503，请求无效 400，其它 500；缓存打不开时回复带 `storageError`。
+- 页面：排名表「质量」列（列选择里可开）；展开详情「质量依据」页签（质量判断、多空比概览、基本面、稳定度与收敛统计）；「执行」页签的价差趋势；排名表下方质量资料的读取说明与错误提示。
+
+**不搬**：机会提醒、CrossEx 相关（M-5f / M13）。
+
+**影响面（R2）**：新增一个只读接口和常驻的分钟采样（只用内存中的报价）；开启期间常驻访问 CoinGecko（全部可比币种，缓存过期才请求），按页面读过的组合访问 5 家交易所的公开多空比接口。页面的元素重置改为 `:where`，合约价差整页的边框与内边距随之对齐工作台（见实施记录）。不碰凭据（CoinGecko 键可选、只读环境变量）、交易与 `monitor.sqlite`。
+
+**回滚**：上一版本的 `sudo bash install.sh --version <上一版本>`，不用改配置；旧版本不读新表，留在缓存库无害。
+
+**测试计划**：移植工作台 `tests/perpetual-{quality,quality-service,quality-cache,quality-feed,fundamentals,positioning,positioning-summary}.test.mjs`（只改导入；依赖工作台整体服务与 HTTP 的用例改测本仓库采集器）；本仓库补采集器、缓存表与接口测试。浏览器走查质量列、质量依据页签、价差趋势与读取说明，1280 与 390 宽度。
+
+#### M-5d2 实施记录（v0.43.0）
+
+按上面的计划实现，差别与补充：
+
+- 复制：工作台 `perpetual-quality-service.mjs`、`perpetual-quality-history.mjs` 复制到 `src/vendor/`（只改导入路径），`perpetual-fundamentals.mjs`、`perpetual-positioning.mjs`、`perpetual-positioning-summary.mjs`、`lib/perpetual-quality.ts`、`lib/perpetual-spreads.ts` 原样复制；三个 `.mjs` 补了类型声明（`.d.mts`）。页面的 `perpetual-quality-cache.ts`、`perpetual-quality-feed.ts`、`PerpetualTrend.tsx` 复制到 `web/src/`（类型改从 `src/vendor/perpetual-quality.ts` 导入，去掉 `"use client"`）；`QualityCell`、`PositioningOverviewCard`、`QualityEvidence` 与其常量从 `perpetual-panel.tsx` 搬到 `web/src/PerpetualQuality.tsx`。
+- 服务：`src/monitor/perpetual.ts` 的质量服务随监控开关启停，开关反复切换时复用同一实例与样本；工作台在事件循环 p99 超过 80ms 或 CPU 超过 160% 时推迟 CoinGecko 与多空比请求（`shouldDeferAuxiliary`），本仓库采集器没有这两项负载指标，固定为不推迟；工作台诊断接口里的质量指标未搬。缓存库打不开时工作台不建质量服务，本仓库照建、只存内存。
+- 环境变量：`PERPETUAL_COIN_IDS`（JSON，币种到 CoinGecko id 的覆盖）与 `COINGECKO_DEMO_API_KEY` 由 `perpetualQualityEnv` 读取；`PERPETUAL_COIN_IDS` 无效时忽略并记一行日志，不拒绝启动（工作台启动失败）。两者都可不设；要设时写进 `/etc/trading-platform/environment`（同代理设置，服务单元以 `EnvironmentFile` 读取），改后重启服务。键只进 CoinGecko 请求头，不进日志、错误、接口回复与状态页。注意：命令行导入（`install.sh --import-workbench`）沿用旧做法，把该文件的全部变量放在导入进程的命令行上，导入期间本机其他用户可从进程列表看到；不放心时导入前先注释掉这一行。
+- 缓存：`perpetual-cache.sqlite` 加 `quality_samples`（`loadQualitySamples` / `saveQualitySample`）；缓存库打不开时质量服务照常运行、样本只存内存，接口回复带 `storageError`，页面读取说明下方显示。
+- 接口：两种已知的请求校验错误（组合无效、超过 30 个）回 400，其它异常回 500（工作台的 HTTP 层把动作抛出的错误都回 400）；带页面请求标记与登录，同其它合约价差接口；未配置 404，关闭 423，未运行 503。
+- 页面：`use-perpetual-quality.ts` 按本仓库的 `api()` 改写（12 秒超时，401 时转登录，失败时把服务给的原因加进提示），回复格式校验同工作台；只在排名视图、展开详情或工具面板打开、或开了「质量」列时请求。质量单元格点击直接打开该行的「质量依据」页签；价差单元格的提示带「较 1h 均值 … bp」。价差趋势外套 `LazyBoundary` 与按需加载。
+- 样式基线：`monitor.css` 的元素重置原写成 `.monitor-desk *`（特异度一个类），又在合约价差各样式文件之后加载，压过了这些文件里所有单类规则的内边距、外边距与边框（M-4b 起就如此，质量依据各卡片最明显）；工作台用 Tailwind v4，重置在 `@layer base` 里，任何非层规则都胜过它。改为 `:where(.monitor-desk) *`（特异度 0）。只换这一行、其余不变，前后各构建一次对比计算样式：Anthropic、原油、海力士三页唯一变化是 `td small` 的 `margin-left: 9px` 恢复生效；合约价差页（排名、展开后四个页签、工具面板、范围筛选、全部报价，1280 与 390）每个状态有 16–32 个类变化，都是工作台同名规则重新生效——面板左右内边距（1280 为 20px、390 为 16px）、刷新与视图按钮和搜索框的 1px 边框、工作区导航下边线、展开详情提示条的内边距与上边线、已结算资金费的分隔线、成交校验 / 平仓测算卡片的内边距与边框、手动配对卡片的边框与上下外边距、范围筛选字段区的分隔线与间距、全部报价表外框、合约行小字左缩进 9px。展开详情里「创建价差图表 · 资金费稳定度」按钮因此带边框，与工作台相同（同为 `perp-refresh`）。
+- 替身：`test/perpetual-fake.ts` 加 CoinGecko 与多空比替身（BTC、ETH 有基本面；Binance、Bybit 有多空比；OKX 无数据；DEX 显示未接入）。
+- 测试：移植 `test/perpetual/{quality,quality-service,fundamentals,positioning,positioning-summary}.test.mjs` 与 `web/test/perpetual/{quality-cache,quality-feed}.test.mjs`（只改导入；`quality-service` 里一处用例把工作台的报价表读写换成本仓库的 `saveContractMetrics` / `loadContractMetrics`，见文件头）；工作台依赖其整体 HTTP 的用例（如“quality POST retains shared HTTP authentication”）不搬，由 `test/monitor-perpetual-quality.test.ts` 改测本仓库采集器、缓存表与接口。
+- 启动时的空分钟：本仓库关闭时清空报价、重启后不恢复报价（工作台从 `market.sqlite` 恢复），恢复样本结束时取的那一分钟是空样本，第一个有效样本要等下一分钟；不影响统计（这段时间本来就没有报价）。
+- 两份副本：`perpetual-spreads.ts`、`perpetual-fees.ts`、`perpetual-types.ts` 在 `src/vendor/` 与 `web/src/` 各有一份（内容相同），页面的质量计算经 `src/vendor/perpetual-quality.ts` 用前者，排名用后者；更新工作台版本时两份一起换（审查登记，后续让页面直接引用 `src/vendor/`）。

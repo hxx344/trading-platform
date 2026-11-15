@@ -71,6 +71,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
   - 划转参数与 ADL 设置保存在数据库里，`config.json` 里的 `transfer` 与 `adl` 只在配对第一次登记时作为初始值，之后以页面为准（两边不一致时启动日志会列出页面当前值）；改短检查间隔使空闲请求权重超出「每分钟上限减 ADL 预留」时会被拒绝，并给出能用的最短间隔。
   - 余额走势来自数据目录里的 `samples.sqlite`（每分钟一条，保留 30 天；删掉只丢走势图）。
 - 需要代理时写 `/etc/trading-platform/environment`，例如 `NODE_USE_ENV_PROXY=1` 与 `HTTPS_PROXY=…`。
+- 合约价差的质量依据（可选）：CoinGecko 演示键 `COINGECKO_DEMO_API_KEY=…`、币种到 CoinGecko id 的覆盖 `PERPETUAL_COIN_IDS={"XXX":"coin-id"}` 也写在这个文件里，改后 `sudo systemctl restart trading-platform`；不设时走公开限额与自动匹配。
 - 只校验配置、不启动（`node` 用 `systemctl cat trading-platform` 里 ExecStart 的那个）：`sudo -u trading-platform node /opt/trading-platform/current/src/service/main.ts --config /etc/trading-platform/config.json --check-config`。
 - 日志：页面「日志」，或 `journalctl -u trading-platform -f`。
 - 飞书定时运行摘要（照工作台的「ASTER 运行摘要」卡片）：默认每 60 分钟一张，服务首次启动约 2 分钟后发第一张；重启沿用下次发送时间，停机错过的周期只补发一张（启动约 2 分钟后，等持仓与余额读到再发），不逐期补发。发往 `secrets.json` 的 `feishuScheduled` 机器人（格式同 `feishu`：`{"webhook": "…", "secret": "…"}`；页面导入新配对时从工作台的 `FEISHU_SCHEDULED_WEBHOOK_URL` / `FEISHU_SCHEDULED_SIGN_SECRET` 带过来），没有时发往告警机器人 `feishu`。间隔在页面「设置」→「飞书定时运行摘要」修改（1–1440 分钟，0 关闭，保存后以页面为准、重启保留），那里也能「立即发送一张」；没在页面改过时用 `config.json` 的 `"summary": {"intervalMinutes": 30}`（改完执行一次 `sudo bash install.sh`）。换了机器人（例如补上 `feishuScheduled`）后，重启约 2 分钟会先发一张到新机器人。只有原油、没有配对时不发。

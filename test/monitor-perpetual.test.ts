@@ -310,14 +310,22 @@ test('接口：未配置合约价差时各读取 404', async () => {
   }
 });
 
-test('配置与导入：perpetual 不带设置；--check-config 摘要；从工作台导入暂不补上 perpetual，已有的保留', () => {
+test('配置与导入：perpetual 不带设置；--check-config 摘要；从工作台导入补上 perpetual，已有的保留', () => {
   assert.deepEqual(parseMonitorConfig({ perpetual: {} }), { perpetual: {} });
   assert.throws(() => parseMonitorConfig({ perpetual: { venues: ['binance'] } }), /monitor\.perpetual 无效（不带设置，写 \{\}）/);
   assert.match(monitorSummary({ perpetual: {} }), /合约价差（各交易所永续合约公开盘口）/);
   const fits = () => undefined;
   const fresh: Record<string, any> = {};
   planMonitor({ workbench: false }, fresh, fits, []);
-  assert.deepEqual(fresh.monitor, { anthropic: {}, oil: {}, hynix: {} }, '新导入不含 perpetual（M-4b 随页面加入）');
+  assert.deepEqual(fresh.monitor, { anthropic: {}, oil: {}, hynix: {}, perpetual: {} }, 'M-4b：新导入随页面带上 perpetual');
+  const withoutPerpetual: Record<string, any> = { monitor: { anthropic: {}, oil: {}, hynix: {} } };
+  const grown = planMonitor({ workbench: false }, withoutPerpetual, fits, []);
+  assert.deepEqual([grown.status, withoutPerpetual.monitor.perpetual], ['added', {}]);
+  assert.match(grown.detail, /^补上 合约价差（11 家交易所永续合约的公开盘口.*报价只在内存.*已有的Anthropic 价差、原油价差、海力士溢价保留现有设置/);
+  // From the workbench, adding only the perpetual spreads says nothing about backfilling candles (it keeps no history).
+  const onlyPerpetualNotes: string[] = [];
+  planMonitor({ workbench: true }, { monitor: { anthropic: {}, oil: {}, hynix: {} } }, fits, onlyPerpetualNotes);
+  assert.deepEqual(onlyPerpetualNotes, []);
   const existing: Record<string, any> = { monitor: { anthropic: {}, oil: {}, hynix: {}, perpetual: {} } };
   const item = planMonitor({ workbench: false }, existing, fits, []);
   assert.deepEqual([item.status, existing.monitor.perpetual, item.markets], ['skipped', {}, ['anthropic', 'oil', 'hynix', 'perpetual']]);

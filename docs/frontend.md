@@ -428,3 +428,21 @@
 **验证**：`node --test --test-reporter=dot 'web/test/crossex/*.test.mjs'`（工作台界面测试迁移版）。浏览器：`scripts/dev-monitor.ts` 提供真实外壳与 CSP，Playwright 拦截 `/api/crossex/*` 返回替身数据（取自工作台 `tests/crossex-position-metrics.browser.mjs`），五个子页在 1280 与 390 宽度下没有 CSP 报错、没有横向溢出；设置页超过硬上限时显示服务的拒绝提示，保存成功显示「已保存」。
 
 **回滚**：先删掉 `config.json` 的 `crossex` 与 secrets.json 的 `gate`，再 `sudo bash install.sh --version v0.34.0`。
+
+## 行情监控页：合约价差（Monitor M-4b，v0.37.0）
+
+**对照的工作台页面**：`modules/monitor/app/perpetual-panel.tsx` 的「发现机会」工作区（提交 `c84ba27`），零件取自 `app/perpetual-scanner-parts.tsx`，读取 hook 改写自 `hooks/use-perpetual-feed.ts`；`lib/perpetual-{types,feed,display,spreads,fees,fx,scanner}.ts` 原样复制到 `web/src/`，文件头写明来源与提交。
+
+**页面**：`web/src/MonitorPerpetual.tsx`。行情页加「合约价差」标签（排在海力士之后，同工作台 `lib/monitors.ts` 的名称）；面板照工作台排版：标题“合约价差套利”与刷新按钮；工具栏（价格套利 / 资金费套利 / 全部报价、交易所多选、币种搜索、RWA / 加密 / 类别）；状态行；排名表（类型、组合、资金费率、资金费差、年化、报价、开仓价差、报价时间）与分页（每页 30 条）；全部报价表（含下架提示）；“监控工具与设置 → 更多筛选与排序设置”里的价差排序、报价口径、平台组合与重置。表格在自己的框内横向滚动，390 宽度的全部报价表按工作台改为卡片。
+
+**与工作台的差别**：
+- 不搬（留给 M-5）：成交额、持仓量、资本与 ROC、已结算资金费历史、质量列、组合展开详情、图表与持仓跟踪工作区、自选与屏蔽、范围筛选、列选择与表头排序、跨计价币（汇率）、CrossEx 导入、报价健康、提醒、手动组合、推送开关。存储里即使有自选、屏蔽或跨计价币的设置，本页也按关闭处理，写回时原样保留这些字段。
+- 读取走 `api()`（401 转到会话失效，其它错误显示服务给的原因），地址 `/api/monitor/perpetual/stream|quote`；页面隐藏时轮询放慢到 30 秒。
+- 服务回答采集器未运行（`status: unavailable`，例如刚打开“运行监控”开关的那一秒）时，每 3 秒重连一次并立即显示新快照，不等工作台的 20 / 30 秒重试；开关重新打开后约 6–8 秒出数据（原样照搬时约 35 秒）。
+- 数据说明一行只写本页有的列：资金费差折算 / 8h、年化外推、净价差的算法（毛价差 − 四次公开 taker 费 − 0.10% 滑点预算）。
+
+**样式**：`web/src/perpetual.css`，由工作台 `app/perpetual.css` 与 `app/perpetual-scanner.css`（`c84ba27`）按原顺序过滤而来：选择器里的每个类都被本页用到才保留，声明不改，只重排空白（720 行 → 约 350 行）。设计令牌（`--card`、`--muted-foreground` 等）沿用 `monitor.css` 已有的。
+
+**验证**：`scripts/dev-monitor.ts` 加了替身合约行情（`test/perpetual-fake.ts`：5 家交易所、约 40 个币种，含 RWA 与一个即将下架的合约，Bybit / OKX / Lighter 带公开费率元数据）。无头浏览器 1280 与 390 宽度：三个视图、交易所多选、搜索、翻页、净价差排序、标记价口径、平台组合、刷新后记住筛选、重置全部筛选、关闭再打开运行开关；无横向溢出，控制台只有未配置模块的入口探测 404。本机无头浏览器没有中文字体，截图只用来看版式；未与运行中的工作台并排截图（本机没有运行中的工作台）。
+
+**回滚**：`sudo bash install.sh --version v0.36.0`，不用改配置。

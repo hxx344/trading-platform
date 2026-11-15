@@ -1,5 +1,5 @@
 // A local preview of the monitor page on the stand-in venues of test/monitor-fake.ts: a simulated executor, the built
-// page and the Anthropic, oil and Hynix collectors in a throwaway data directory, removed on exit. Nothing goes to the network. Unlike the
+// page and the Anthropic, oil, Hynix and perpetual-spread collectors in a throwaway data directory, removed on exit. Nothing goes to the network. Unlike the
 // service it takes no account locks and writes no environment marker, so it also runs on Windows.
 //   pnpm build:web; node scripts/dev-monitor.ts [--port 4731]
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -14,6 +14,7 @@ import { loadWebApp } from '../src/web-assets.ts';
 import { parseMonitorConfig } from '../src/service/monitor-config.ts';
 import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, stopMonitor } from '../src/service/monitor.ts';
 import { fakeAnthropicVenues } from '../test/monitor-fake.ts';
+import { fakePerpetualVenues } from '../test/perpetual-fake.ts';
 
 const { values } = parseArgs({ options: { port: { type: 'string', default: '4731' } } });
 const port = Number(values.port);
@@ -31,7 +32,7 @@ const alertHooks = {
   robot: () => 'feishuMonitor' as const,
   test: async (text: string) => { process.stdout.write(`[替身飞书·测试] ${text}\n`); },
 };
-const monitor = openMonitor(parseMonitorConfig({ anthropic: {}, oil: {}, hynix: {} }), dir, { fetchImpl: venues.fetch, WebSocketImpl: venues.WebSocket, variationalFetch: venues.variationalFetch, alertHooks });
+const monitor = openMonitor(parseMonitorConfig({ anthropic: {}, oil: {}, hynix: {}, perpetual: {} }), dir, { fetchImpl: venues.fetch, WebSocketImpl: venues.WebSocket, variationalFetch: venues.variationalFetch, alertHooks, perpetualOptions: fakePerpetualVenues() });
 const store = openStore(join(dir, 'executor.sqlite'));
 const { binance, bybit, aster, asterTrading } = createSimulatedVenues(Date.now);
 const executor = createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, positions: asterTrading });

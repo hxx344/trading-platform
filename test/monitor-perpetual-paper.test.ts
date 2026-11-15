@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { createPerpetualMonitor, type PerpetualMonitor, type PerpetualOptions } from '../src/monitor/perpetual.ts';
-import { PERPETUAL_PAPER_FILE, PERPETUAL_PAPER_UNREADABLE, openPerpetualPaperStore } from '../src/monitor/perpetual-paper-store.ts';
+import { PERPETUAL_PAPER_FILE, PERPETUAL_PAPER_IMPORT_FILE, PERPETUAL_PAPER_REJECTED_FILE, PERPETUAL_PAPER_UNREADABLE, openPerpetualPaperStore } from '../src/monitor/perpetual-paper-store.ts';
 import { PERPETUAL_PAPER_LIMITS, perpetualPaperIdentity, type PerpetualPaperState } from '../src/vendor/perpetual-paper.ts';
 import type { PerpetualPaperStore } from '../src/vendor/perpetual-paper-service.mjs';
 import type { PerpetualQuote, PerpetualUpdate } from '../src/vendor/perpetual-stream.mjs';
@@ -18,6 +18,7 @@ import { parseServiceConfig } from '../src/service/config.ts';
 import { closeMonitor, monitorViews, openMonitor, settleMonitor } from '../src/service/monitor.ts';
 import { createExecutorServer } from '../src/http.ts';
 import { createHarness } from './harness.ts';
+import { paperPosition, paperState } from './monitor-paper-fixture.ts';
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 async function until(check: () => boolean | Promise<boolean>, what: string): Promise<void> {
@@ -196,6 +197,118 @@ test('采集器：未运行时写入 503、读取可用；开启后登记写盘�
     const closed = await perpetual.paperUpdate({ revision: 1, action: 'close', id: position!.id, close: { kind: 'stop' } });
     assert.equal(closed.positions[0]!.status, 'stopped', '重开后可以结束观察');
   } finally {
+    perpetual?.stop(); await perpetual?.settled();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('采集器载入导入的持仓记录（M-5e2）：关闭时不载入；运行中下一次检查时合并、记日志，页面写入排在其后；超过上限的改名为 rejected', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-perpetual-paper-adopt-'));
+  const file = join(dir, PERPETUAL_PAPER_FILE), pending = join(dir, PERPETUAL_PAPER_IMPORT_FILE);
+  const logs: string[] = [];
+  let perpetual: PerpetualMonitor | null = null;
+  try {
+    const store = openPerpetualPaperStore(file);
+    perpetual = createPerpetualMonitor({ ...venues(), paper: { store }, log: line => { logs.push(line); } });
+    const put = (state: PerpetualPaperState) => writeFileSync(pending, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+    put(paperState([paperPosition('wb-1'), paperPosition('wb-2', { closedAt: Date.now() - HOUR })]));
+    await sleep(60);
+    assert.deepEqual([existsSync(pending), perpetual.paperView().positions.length], [true, 0], '采集关闭时不载入');
+
+    perpetual.start();
+    await until(() => !existsSync(pending), '开启后载入');
+    assert.deepEqual(perpetual.paperView().positions.map(position => position.id), ['wb-1', 'wb-2']);
+    assert.deepEqual(saved(file).positions.map(position => position.id), ['wb-1', 'wb-2']);
+    assert.ok(logs.includes('合约价差：已载入从工作台导入的持仓记录 2 条'), logs.join('\n'));
+    await until(() => perpetual!.snapshot().quotes.length === 2, '两腿报价');
+
+    // A pending file lands while a page write comes in: the write waits for the merge and sees its revision.
+    put(paperState([paperPosition('wb-3')]));
+    const revision = perpetual.paperView().revision;
+    let view;
+    for (let attempt = 0; ; attempt++) {
+      try { view = await perpetual.paperUpdate({ revision: perpetual.paperView().revision, action: 'create', position: draft(perpetual.snapshot().quotes) }); break; }
+      catch (error) { if ((error as { status?: number }).status !== 409 || attempt > 5) throw error; }
+    }
+    assert.ok(view.revision > revision);
+    await until(() => !existsSync(pending), '运行中载入');
+    const now = perpetual.paperView();
+    assert.ok(['wb-1', 'wb-2', 'wb-3'].every(id => now.positions.some(position => position.id === id)) && now.positions.length === 4, '导入的与页面登记的都在');
+    assert.equal(saved(file).positions.length, 4);
+
+    // The minute observations keep writing (and reordering) the file meanwhile: only which records it holds is compared.
+    const held = () => saved(file).positions.map(position => position.id).sort();
+    const before = held();
+    put(paperState(Array.from({ length: PERPETUAL_PAPER_LIMITS.active }, (_, i) => paperPosition(`many-${i}`))));
+    await until(() => existsSync(join(dir, PERPETUAL_PAPER_REJECTED_FILE)), '超过上限改名');
+    assert.deepEqual([existsSync(pending), held(), perpetual.paperView().positions.length], [false, before, 4]);
+    assert.ok(logs.some(line => line.startsWith('合约价差：从工作台导入的持仓记录未载入（导入后活动持仓 23 个，超过上限 20 个，整批不导入）')), logs.join('\n'));
+    assert.equal(perpetual.paperView().running, true, '载入后服务照常运行');
+  } finally {
+    perpetual?.stop(); await perpetual?.settled();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('采集器载入挂起时（M-5e2）：页面写入等载入完成并落在重建的服务上；停止与重开只留一个持仓服务，settled 等载入结束', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-perpetual-paper-hold-'));
+  const file = join(dir, PERPETUAL_PAPER_FILE), pending = join(dir, PERPETUAL_PAPER_IMPORT_FILE);
+  const put = (state: PerpetualPaperState) => writeFileSync(pending, `${JSON.stringify(state)}\n`, { mode: 0o600 });
+  let perpetual: PerpetualMonitor | null = null;
+  const releases: (() => void)[] = [];
+  try {
+    const real = openPerpetualPaperStore(file);
+    // Each paper service reads the store once when built: `builds` counts them.
+    let builds = 0, entered = 0;
+    const store = {
+      get: () => { builds++; return real.get(); }, save: (state: PerpetualPaperState) => real.save(state), pending: () => real.pending(),
+      adoptPending: async (at?: number) => { entered++; await new Promise<void>(resolve => releases.push(resolve)); return real.adoptPending(at); },
+    };
+    perpetual = createPerpetualMonitor({ ...venues(), paper: { store } });
+    perpetual.start();
+    await until(() => perpetual!.snapshot().quotes.length === 2, '两腿报价');
+    const first = await perpetual.paperUpdate({ revision: 0, action: 'create', position: draft(perpetual.snapshot().quotes) });
+
+    // A write while the merge hangs waits for it, then meets the rebuilt service: the revision moved, so 409, nothing applied.
+    put(paperState([paperPosition('wb-1')]));
+    await until(() => entered === 1, '开始载入');
+    let answered = false;
+    const late = refused(perpetual.paperUpdate({ revision: first.revision, action: 'create', position: draft(perpetual.snapshot().quotes) }).finally(() => { answered = true; }));
+    await sleep(40);
+    assert.equal(answered, false, '载入完成前不回答');
+    const built = builds;
+    releases.shift()!();
+    assert.equal((await late)[0], 409);
+    const merged = perpetual.paperView();
+    assert.deepEqual([merged.revision, merged.positions.length, merged.running, builds - built], [first.revision + 1, 2, true, 1]);
+
+    // stop → start → stop while a merge hangs: settled waits for it; the rebuilt service is not started.
+    put(paperState([paperPosition('wb-2')]));
+    await until(() => entered === 2, '第二次载入');
+    perpetual.stop(); perpetual.start(); perpetual.stop();
+    let settled = false;
+    void perpetual.settled().then(() => { settled = true; });
+    await sleep(40);
+    assert.equal(settled, false, 'settled 等载入结束');
+    releases.shift()!();
+    await perpetual.settled();
+    assert.deepEqual([perpetual.paperView().running, perpetual.paperView().positions.some(position => position.id === 'wb-2'), entered], [false, true, 2]);
+
+    // stop → start while a merge hangs: one service, started once the merge is done, checking as before.
+    perpetual.start();
+    await until(() => perpetual!.paperView().running, '重开');
+    put(paperState([paperPosition('wb-3')]));
+    await until(() => entered === 3, '第三次载入');
+    perpetual.stop(); perpetual.start();
+    const before = builds;
+    releases.shift()!();
+    await until(() => perpetual!.paperView().positions.some(position => position.id === 'wb-3'), '载入后重建');
+    assert.deepEqual([perpetual.paperView().running, builds - before, entered], [true, 1, 3]);
+    await until(() => perpetual!.snapshot().quotes.length === 2, '重开后两腿报价');
+    const view = await perpetual.paperUpdate({ revision: perpetual.paperView().revision, action: 'close', id: first.positions[0]!.id, close: { kind: 'stop' } });
+    assert.equal(view.positions.find(position => position.id === first.positions[0]!.id)!.status, 'stopped');
+  } finally {
+    for (const release of releases) release();
     perpetual?.stop(); await perpetual?.settled();
     rmSync(dir, { recursive: true, force: true });
   }

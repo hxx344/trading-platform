@@ -94,6 +94,15 @@ test('导入面板：Var token 须随行情监控一起发，只导入 token 时
   assert.match(confirmText(tokenOnly, false), /^导入 Var token？工作台的 Var token 写入本服务，替换现有的，行情监控下一次读取即用它。配置不变，不重启服务。$/);
   assert.match(confirmText({ ...NONE, monitorVariational: { replaces: false } }, false), /^导入 Var token？工作台的 Var token 写入本服务，行情监控下一次读取即用它。配置不变，不重启服务。$/);
   assert.match(confirmText({ ...tokenOnly, assetOwner: 'alice' }, true), /^重新导入资产账本（用户 alice），并导入 Var token？整体替换/);
+  // M-5e2: the records go with the monitor too and, alone or with the token, restart nothing.
+  const recordsOnly: ImportChoices = { ...NONE, monitorPaper: { added: 3 } };
+  assert.deepEqual(importBody(recordsOnly), { action: 'import', pairs: [], monitor: true, monitorPaper: true });
+  assert.equal(restarts(recordsOnly, false), false);
+  assert.equal(confirmText(recordsOnly, false), '导入 持仓记录？工作台的 3 条持仓记录写入待载入文件，行情监控下一次检查时载入（合约价差采集关闭时在下次开启时），本服务已有的记录保留。配置不变，不重启服务。');
+  assert.match(confirmText({ ...recordsOnly, monitorVariational: { replaces: false } }, false), /^导入 Var token 与 持仓记录？工作台的 Var token 写入本服务[^]*工作台的 3 条持仓记录写入待载入文件/);
+  assert.match(confirmText({ ...recordsOnly, monitor: true }, false), /^导入 行情监控 与 持仓记录 并重启本服务？[^]*工作台的 3 条持仓记录写入待载入文件，服务启动时载入，本服务已有的记录保留。/);
+  const paperBound: import('../web/src/import-form.ts').MonitorPaperItem = {} as import('../src/service/import-monitor-paper.ts').MonitorPaperItem;
+  void paperBound;
   // The page's copy of the helper's item stays the same shape.
   const bound: import('../web/src/import-form.ts').MonitorVariationalItem = {} as import('../src/service/import-monitor-variational.ts').MonitorVariationalItem;
   void bound;

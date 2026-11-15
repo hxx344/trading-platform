@@ -57,6 +57,8 @@
 
 **Var token（M-3d-2，v0.34.0）**：勾选「同时导入 Var token」时，读工作台 `modules/monitor/variational-session.json`（只读取权限为 600、16 KiB 以内的普通文件，只校验格式与到期，不联网），在档位之后、配置之前由写入子进程写本服务的 `monitor-variational-session.json`；本服务的 token 是同一个或到期不早于工作台的时保留本服务的。只写 token 时不改配置、不重启，运行中的行情监控下一次读取即换上。规则与回滚见 [monitor.md](monitor.md) 的 M-3d-2。
 
+**持仓记录（M-5e2，v0.45.0）**：勾选「同时导入持仓记录」时，读工作台 `modules/monitor/perpetual/paper-positions.json`（1 MB 以内的普通文件，按工作台规则校验），在 Var token 之后、配置之前由写入子进程写待载入文件 `perpetual-paper-positions.import.json`；本服务的持仓文件只由服务进程在载入时写。按记录编号合并，已有的跳过，合并后超过 20 个活动或 100 个已结束时整批不导入。只写持仓记录时不改配置、不重启。规则、载入与回滚见 [monitor.md](monitor.md) 的 M-5e2。
+
 **合约价差（M-4a v0.36.0，M-4b v0.37.0）**：M-4a 时 `monitor.perpetual` 不由导入补上；M-4b 起随页面一起加入：补上缺的市场时一并补上 `perpetual: {}`（不带设置），预览写“合约价差（11 家交易所永续合约的公开盘口，常驻约 20 条 WebSocket，报价只在内存，不写数据库）”。已有配置里写了它时原样保留。不想要时在监控页关掉“运行监控”开关即可停掉全部连接。回滚到 v0.36.0 时多出的 `perpetual: {}` 被那一版接受（M-4a 已认这个键），不用改配置。
 
 ## 4 页面请求
@@ -66,6 +68,7 @@
 - `monitor`：只能是 `true`。
 - `monitorAlerts`（v0.30.0）：只能是 `true`，且须和 `monitor: true` 一起发；预览总是带上告警一项。
 - `monitorVariational`（v0.34.0）：只能是 `true`，且须和 `monitor: true` 一起发；预览总是带上 Var token 一项（只有到期时间与原因，不含 token）。
+- `monitorPaper`（v0.45.0）：只能是 `true`，且须和 `monitor: true` 一起发；预览总是带上持仓记录一项（计数与原因）。
 - `asset`：只能是 `true`；须同时带 `assetOwner`。
 - `assetOwner`：只在 `asset` 为 `true` 时允许；字符串，1–64 个字符，只允许字母、数字和 `.`、`_`、`@`、`-`，首字符须是字母或数字。助手另外核对它在工作台账本的用户列表里。
 - 预览请求不能带以上字段。请求文件仍限 4 KiB。页面不能指定任何文件路径：来源库路径由助手按工作台数据目录推出，目标是服务的数据目录。
@@ -81,6 +84,7 @@ sudo bash install.sh --import-workbench --monitor --asset [--asset-owner <用户
 - 导入器新增 `--monitor`、`--asset`、`--asset-owner`、`--data-dir`（安装脚本传入本服务数据目录）。账本先写、再写配置；之后安装脚本照旧检查配置、重启，失败时恢复导入前的配置（账本保留，同 §3 第 4 步）。
 - 旧版本包不支持时安装脚本报“版本 … 不支持 --monitor / --asset”。
 - `--monitor-alerts`（v0.30.0）、`--monitor-variational`（v0.34.0）同时启用行情监控，并分别导入告警与 Var token；两者都需要 `--data-dir`，可同用。
+- `--monitor-paper`（v0.45.0）同时启用行情监控并导入持仓记录，需要 `--data-dir`，可与上面两项同用。
 
 ## 6 备选方式（保留）
 

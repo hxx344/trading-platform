@@ -21,6 +21,9 @@
 #   sudo bash install.sh --import-workbench --monitor-variational
 #                                             同时启用行情监控，并导入工作台保存的 Var token（本服务没有、已过期或到期更早时替换；
 #                                             运行中的服务下一次读取即用它，不重启）；可与 --monitor-alerts 同用
+#   sudo bash install.sh --import-workbench --monitor-paper
+#                                             同时启用行情监控，并导入工作台合约价差的模拟与手工持仓记录（本服务已有的保留；写入
+#                                             待载入文件，运行中的服务下一次检查时载入，不重启）；可与 --monitor-alerts、--monitor-variational 同用
 #   sudo bash install.sh --import-workbench --crossex
 #                                             导入工作台 CrossEx 模块的 Gate 密钥、账户 UID 与额度（首次导入时连同页面设置）；
 #                                             工作台未连接、还有未结束的执行 / 订单 / 挂单或缺 UID 时拒绝；可与其他导入项同用
@@ -91,6 +94,7 @@ import_options=0
 import_monitor=0
 import_monitor_alerts=0
 import_monitor_variational=0
+import_monitor_paper=0
 import_asset=0
 import_crossex=0
 asset_owner=''
@@ -106,6 +110,7 @@ while (($#)); do
     --monitor) import_monitor=1; shift ;;
     --monitor-alerts) import_monitor_alerts=1; shift ;;
     --monitor-variational) import_monitor_variational=1; shift ;;
+    --monitor-paper) import_monitor_paper=1; shift ;;
     --asset) import_asset=1; shift ;;
     --asset-owner) [[ $# -ge 2 ]] || usage 2; asset_owner=$2; shift 2 ;;
     --crossex) import_crossex=1; shift ;;
@@ -125,6 +130,7 @@ done
 ((import_workbench || !import_monitor)) || fail '--monitor 须和 --import-workbench 一起使用'
 ((import_workbench || !import_monitor_alerts)) || fail '--monitor-alerts 须和 --import-workbench 一起使用'
 ((import_workbench || !import_monitor_variational)) || fail '--monitor-variational 须和 --import-workbench 一起使用'
+((import_workbench || !import_monitor_paper)) || fail '--monitor-paper 须和 --import-workbench 一起使用'
 ((import_workbench || !import_asset)) || fail '--asset 须和 --import-workbench 一起使用'
 ((import_asset)) || [[ -z "$asset_owner" ]] || fail '--asset-owner 须和 --asset 一起使用'
 ((import_workbench || !import_crossex)) || fail '--crossex 须和 --import-workbench 一起使用'
@@ -279,6 +285,7 @@ if ((import_workbench)); then
   if ((import_monitor)); then grep -q 'readWorkbenchMonitor' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --monitor，请用最新版本导入"; fi
   if ((import_monitor_alerts)); then grep -q 'readWorkbenchAlerts' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --monitor-alerts，请用最新版本导入"; fi
   if ((import_monitor_variational)); then grep -q 'readWorkbenchVariational' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --monitor-variational，请用最新版本导入"; fi
+  if ((import_monitor_paper)); then grep -q 'readWorkbenchPaper' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --monitor-paper，请用最新版本导入"; fi
   if ((import_asset)); then grep -q 'readWorkbenchAsset' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --asset，请用最新版本导入"; fi
   if ((import_crossex)); then grep -q 'readWorkbenchCrossex' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --crossex，请用最新版本导入"; fi
   # The files the import may write: config.json and the key file it names (always in this directory).
@@ -302,14 +309,15 @@ if ((import_workbench)); then
   ((!import_monitor)) || import_args+=(--monitor)
   ((!import_monitor_alerts)) || import_args+=(--monitor-alerts)
   ((!import_monitor_variational)) || import_args+=(--monitor-variational)
-  # The ledger, the alert tiers and the Var token go into the service's data directory, written by the importer as that
-  # directory's owner.
+  ((!import_monitor_paper)) || import_args+=(--monitor-paper)
+  # The ledger, the alert tiers, the Var token and the pending paper records go into the service's data directory, written
+  # by the importer as that directory's owner.
   ((!import_asset)) || import_args+=(--asset)
-  ((!import_asset && !import_monitor_alerts && !import_monitor_variational)) || import_args+=(--data-dir "$DATA_DIR")
+  ((!import_asset && !import_monitor_alerts && !import_monitor_variational && !import_monitor_paper)) || import_args+=(--data-dir "$DATA_DIR")
   [[ -z "$asset_owner" ]] || import_args+=(--asset-owner "$asset_owner")
   # The CrossEx page settings go into the same data directory (named once when an item above already named it).
   ((!import_crossex)) || import_args+=(--crossex)
-  ((!import_crossex || import_asset || import_monitor_alerts || import_monitor_variational)) || import_args+=(--data-dir "$DATA_DIR")
+  ((!import_crossex || import_asset || import_monitor_alerts || import_monitor_variational || import_monitor_paper)) || import_args+=(--data-dir "$DATA_DIR")
   # The service's proxy settings (KEY=VALUE lines, as systemd reads them): importing the options account reads Bybit once.
   import_env=()
   if [[ -f "$CONF_DIR/environment" ]]; then

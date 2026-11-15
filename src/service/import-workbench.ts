@@ -47,6 +47,8 @@ import { ASSET_OWNER } from './import-channel.ts';
 import { alertsLine, planMonitorAlerts, readWorkbenchAlerts, writeMonitorAlertsAsService, type MonitorAlertsItem, type MonitorAlertsSource } from './import-monitor-alerts.ts';
 import { inspectVariationalAsService, planMonitorVariational, readWorkbenchVariational, variationalLine, writeVariationalAsService, type MonitorVariationalItem, type MonitorVariationalSource } from './import-monitor-variational.ts';
 import type { ServiceVariational } from '../monitor/variational-import-writer.ts';
+import { paperInput, paperLine, planMonitorPaper, readWorkbenchPaper, writePaperAsService, type MonitorPaperItem, type PaperInput } from './import-monitor-paper.ts';
+import type { PerpetualPaperState } from '../vendor/perpetual-paper.ts';
 import type { AlertImport } from '../monitor/alert-import.ts';
 import { ALERT_SPECS } from '../monitor/alerts.ts';
 import { connectionLines, planAsset, planMonitor, readWorkbenchAsset, readWorkbenchMonitor, writeLedgerAsService, type AssetItem, type AssetSource, type LedgerWrite, type MonitorItem, type MonitorSource } from './import-modules.ts';
@@ -121,6 +123,10 @@ export interface ImportPlan {
   monitorVariational: MonitorVariationalItem | null;
   /** The token to hand to the writer (after the tiers, before the files); null when it does not come over. Never shown. */
   variationalWrite: { token: string } | null;
+  /** The workbench's paper-position records looked at (null without options.monitorPaper). */
+  monitorPaper: MonitorPaperItem | null;
+  /** The records to hand to the writer (after the token, before the files); null when none come over. */
+  paperWrite: { state: PerpetualPaperState } | null;
   /** The CrossEx account looked at (null without options.crossex). */
   crossex: CrossexItem | null;
   /** The workbench page settings to copy into crossex.sqlite, before the files; null when none come over. */
@@ -159,7 +165,7 @@ function feishuOf(env: WorkbenchSource['env'], channel: 'EVENT' | 'SCHEDULED' = 
  * Works out the files after the import. `existing` is the current config.json and secrets.json (raw JSON), or null on a
  * first setup. Throws when the result would not load: the caller then writes nothing.
  */
-export function planImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; only?: readonly string[]; known?: ReadonlyMap<string, AsterCredentials>; requireMargin?: boolean; oil?: OilSource; options?: OptionsSource; monitor?: MonitorSource; monitorAlerts?: MonitorAlertsSource; monitorVariational?: VariationalInput; asset?: AssetSource; assetOwner?: string; crossex?: CrossexSource }): ImportPlan {
+export function planImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; only?: readonly string[]; known?: ReadonlyMap<string, AsterCredentials>; requireMargin?: boolean; oil?: OilSource; options?: OptionsSource; monitor?: MonitorSource; monitorAlerts?: MonitorAlertsSource; monitorVariational?: VariationalInput; monitorPaper?: PaperInput; asset?: AssetSource; assetOwner?: string; crossex?: CrossexSource }): ImportPlan {
   const config: Json = existing ? structuredClone(existing.config) : { secretsFile: options.secretsFile, pairs: [] };
   const secrets: Json = existing ? structuredClone(existing.secrets) : { accounts: {} };
   // A config of other modules only (oil, options, monitor, asset) has no pairs yet; those blocks and their keys are carried over untouched.
@@ -286,10 +292,13 @@ export function planImport(source: WorkbenchSource, existing: { config: Json; se
   // After the monitor's own plan: the tiers come over only to a config that runs the monitor.
   const alerts = options.monitorAlerts ? planMonitorAlerts(options.monitorAlerts, config, secrets, notes) : null;
   const variational = options.monitorVariational ? planMonitorVariational(options.monitorVariational.source, options.monitorVariational.current, options.monitorVariational.currentError, config) : null;
+  // Likewise the paper records: only to a config whose monitor runs the perpetual collector (planMonitor may have added it).
+  const paper = options.monitorPaper ? planMonitorPaper(options.monitorPaper, config) : null;
   const asset = options.asset ? planAsset(options.asset, config, fits, options.assetOwner, notes) : null;
   const crossex = options.crossex ? planCrossex(options.crossex, config, secrets, fits, notes) : null;
   // Each added pair passed the checks with everything before it, and every key was derived once, so the result passes.
   return { config, secrets, added, skipped, items, oil, options: optionsItem, monitor: monitorItem, asset: asset?.item ?? null, ledger: asset?.write ?? null, monitorAlerts: alerts?.item ?? null, alertWrite: alerts?.write ?? null, monitorVariational: variational?.item ?? null, variationalWrite: variational?.write ?? null,
+    monitorPaper: paper?.item ?? null, paperWrite: paper?.write ?? null,
     crossex: crossex?.item ?? null, crossexSettings: crossex?.settings ?? null, notes };
 }
 
@@ -361,11 +370,11 @@ function planOil(source: OilSource, config: Json, secrets: Json, fits: (candidat
  * and why the others cannot. Pairs that only fit one at a time (the request budget) show up when the selection is
  * imported. Throws when the existing files fail their checks: nothing could be imported then.
  */
-export function previewImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; oil?: OilSource; options?: OptionsSource; monitor?: MonitorSource; monitorAlerts?: MonitorAlertsSource; monitorVariational?: VariationalInput; asset?: AssetSource; crossex?: CrossexSource }): { items: PreviewItem[]; oil: OilItem[]; options: OptionsItem | null; monitor?: MonitorItem; monitorAlerts?: MonitorAlertsItem; monitorVariational?: MonitorVariationalItem; asset?: AssetItem; crossex?: CrossexItem; notes: string[] } {
+export function previewImport(source: WorkbenchSource, existing: { config: Json; secrets: Json } | null, options: { secretsFile: string; oil?: OilSource; options?: OptionsSource; monitor?: MonitorSource; monitorAlerts?: MonitorAlertsSource; monitorVariational?: VariationalInput; monitorPaper?: PaperInput; asset?: AssetSource; crossex?: CrossexSource }): { items: PreviewItem[]; oil: OilItem[]; options: OptionsItem | null; monitor?: MonitorItem; monitorAlerts?: MonitorAlertsItem; monitorVariational?: MonitorVariationalItem; monitorPaper?: MonitorPaperItem; asset?: AssetItem; crossex?: CrossexItem; notes: string[] } {
   // The oil and options accounts, the monitor and the ledger are planned once, with no pair: the page imports them
   // together or on their own.
   const base = planImport(source, existing, { secretsFile: options.secretsFile, only: [], requireMargin: true, ...(options.oil ? { oil: options.oil } : {}), ...(options.options ? { options: options.options } : {}),
-    ...(options.monitor ? { monitor: options.monitor } : {}), ...(options.monitorAlerts ? { monitorAlerts: options.monitorAlerts } : {}), ...(options.monitorVariational ? { monitorVariational: options.monitorVariational } : {}), ...(options.asset ? { asset: options.asset } : {}), ...(options.crossex ? { crossex: options.crossex } : {}) });
+    ...(options.monitor ? { monitor: options.monitor } : {}), ...(options.monitorAlerts ? { monitorAlerts: options.monitorAlerts } : {}), ...(options.monitorVariational ? { monitorVariational: options.monitorVariational } : {}), ...(options.monitorPaper ? { monitorPaper: options.monitorPaper } : {}), ...(options.asset ? { asset: options.asset } : {}), ...(options.crossex ? { crossex: options.crossex } : {}) });
   const parsedBase = parseServiceConfig(base.config);
   const known = new Map(parseServiceSecrets(base.secrets, [], parsedBase.oil?.accounts.map(account => account.venue) ?? [], parsedBase.options !== undefined, parsedBase.crossex !== undefined).accounts);
   const items = source.pairs.map((pair): PreviewItem => {
@@ -377,7 +386,7 @@ export function previewImport(source: WorkbenchSource, existing: { config: Json;
     catch (error) { item = { id, status: 'skipped', detail: error instanceof Error ? error.message : String(error) }; }
     return { id: printable(id).slice(0, 64), name, marginEnabled, importable: item?.status === 'added', detail: printable(item?.detail ?? '未能判断').slice(0, 300) };
   });
-  return { items, oil: base.oil, options: base.options, ...(base.monitor ? { monitor: base.monitor } : {}), ...(base.monitorAlerts ? { monitorAlerts: base.monitorAlerts } : {}), ...(base.monitorVariational ? { monitorVariational: base.monitorVariational } : {}), ...(base.asset ? { asset: base.asset } : {}),
+  return { items, oil: base.oil, options: base.options, ...(base.monitor ? { monitor: base.monitor } : {}), ...(base.monitorAlerts ? { monitorAlerts: base.monitorAlerts } : {}), ...(base.monitorVariational ? { monitorVariational: base.monitorVariational } : {}), ...(base.monitorPaper ? { monitorPaper: base.monitorPaper } : {}), ...(base.asset ? { asset: base.asset } : {}),
     ...(base.crossex ? { crossex: base.crossex } : {}), notes: base.notes };
 }
 
@@ -691,12 +700,12 @@ export function variationalInput(source: MonitorVariationalSource, dataDir: stri
 async function main(): Promise<void> {
   const { values } = parseArgs({ options: {
     config: { type: 'string' }, 'workbench-env': { type: 'string' }, 'workbench-data': { type: 'string' }, pairs: { type: 'string' }, oil: { type: 'boolean' }, options: { type: 'boolean' },
-    monitor: { type: 'boolean' }, 'monitor-alerts': { type: 'boolean' }, 'monitor-variational': { type: 'boolean' }, asset: { type: 'boolean' }, 'asset-owner': { type: 'string' }, 'data-dir': { type: 'string' }, 'dry-run': { type: 'boolean' },
+    monitor: { type: 'boolean' }, 'monitor-alerts': { type: 'boolean' }, 'monitor-variational': { type: 'boolean' }, 'monitor-paper': { type: 'boolean' }, asset: { type: 'boolean' }, 'asset-owner': { type: 'string' }, 'data-dir': { type: 'string' }, 'dry-run': { type: 'boolean' },
     crossex: { type: 'boolean' },
   } });
   // --monitor-alerts brings the monitor along: the tiers only run with it.
-  const withAlerts = values['monitor-alerts'] === true, withVariational = values['monitor-variational'] === true;
-  const withOil = values.oil === true, withOptions = values.options === true, withMonitor = values.monitor === true || withAlerts || withVariational, withAsset = values.asset === true;
+  const withAlerts = values['monitor-alerts'] === true, withVariational = values['monitor-variational'] === true, withPaper = values['monitor-paper'] === true;
+  const withOil = values.oil === true, withOptions = values.options === true, withMonitor = values.monitor === true || withAlerts || withVariational || withPaper, withAsset = values.asset === true;
   const withCrossex = values.crossex === true;
   const modules = withOil || withOptions || withMonitor || withAsset || withCrossex;
   const assetOwner = values['asset-owner'], dataDir = values['data-dir'];
@@ -705,6 +714,7 @@ async function main(): Promise<void> {
   if (withAsset && (dataDir === undefined || !isAbsolute(dataDir))) throw new Error('--asset 需要 --data-dir <本服务数据目录的绝对路径>');
   if (withAlerts && (dataDir === undefined || !isAbsolute(dataDir))) throw new Error('--monitor-alerts 需要 --data-dir <本服务数据目录的绝对路径>');
   if (withVariational && (dataDir === undefined || !isAbsolute(dataDir))) throw new Error('--monitor-variational 需要 --data-dir <本服务数据目录的绝对路径>');
+  if (withPaper && (dataDir === undefined || !isAbsolute(dataDir))) throw new Error('--monitor-paper 需要 --data-dir <本服务数据目录的绝对路径>');
   if (withCrossex && (dataDir === undefined || !isAbsolute(dataDir))) throw new Error('--crossex 需要 --data-dir <本服务数据目录的绝对路径>');
   // --oil / --options / --monitor / --asset alone bring their part only; pairs come along when named.
   const only = values.pairs ? values.pairs.split(',').map(item => item.trim()).filter(Boolean) : modules ? [] : undefined;
@@ -715,12 +725,13 @@ async function main(): Promise<void> {
   const monitorSource = withMonitor ? readWorkbenchMonitor(source.data) : undefined;
   const alertsSource = withAlerts ? readWorkbenchAlerts(source.data) : undefined;
   const variationalSource = withVariational ? variationalInput(readWorkbenchVariational(source.data), dataDir!) : undefined;
+  const paperSource = withPaper ? paperInput(readWorkbenchPaper(source.data), dataDir!) : undefined;
   const assetSource = withAsset ? readWorkbenchAsset(source.data, dataDir!, assetOwner === undefined ? {} : { owner: assetOwner }) : undefined;
   const crossexSource = withCrossex ? readWorkbenchCrossex(source.data) : undefined;
   const { configFile, secretsFile, existing } = readExisting(values.config ?? '');
 
   const plan = planImport(source, existing, { secretsFile, ...(only ? { only } : {}), ...(oilSource ? { oil: oilSource } : {}), ...(optionsSource ? { options: optionsSource } : {}),
-    ...(monitorSource ? { monitor: monitorSource } : {}), ...(alertsSource ? { monitorAlerts: alertsSource } : {}), ...(variationalSource ? { monitorVariational: variationalSource } : {}), ...(assetSource ? { asset: assetSource } : {}), ...(assetOwner === undefined ? {} : { assetOwner }),
+    ...(monitorSource ? { monitor: monitorSource } : {}), ...(alertsSource ? { monitorAlerts: alertsSource } : {}), ...(variationalSource ? { monitorVariational: variationalSource } : {}), ...(paperSource ? { monitorPaper: paperSource } : {}), ...(assetSource ? { asset: assetSource } : {}), ...(assetOwner === undefined ? {} : { assetOwner }),
     ...(crossexSource ? { crossex: crossexSource } : {}) });
   const out = (line: string): void => { process.stdout.write(line + '\n'); };
   if (!modules || (only?.length ?? 0) > 0) out(`工作台数据库：${source.database}（只读）`);
@@ -739,6 +750,7 @@ async function main(): Promise<void> {
     if (plan.monitorAlerts.robot.problem && !plan.monitorAlerts.robot.imported) out(`  机器人未导入：${plan.monitorAlerts.robot.problem}`);
   }
   if (plan.monitorVariational) out(plan.monitorVariational.status === 'added' ? plan.monitorVariational.detail : `跳过 Var token：${plan.monitorVariational.detail}`);
+  if (plan.monitorPaper) out(plan.monitorPaper.status === 'added' ? plan.monitorPaper.detail : `跳过持仓记录：${plan.monitorPaper.detail}`);
   if (plan.asset) {
     out(plan.asset.status === 'added' ? `导入资产账本 ${plan.asset.detail}` : `跳过资产账本：${plan.asset.detail}`);
     // Which user's ledger is not guessed: nothing is written until one is named.
@@ -748,8 +760,9 @@ async function main(): Promise<void> {
   for (const line of plan.notes) out(line);
   const oilAdded = plan.oil.filter(item => item.status === 'added').length, optionsAdded = plan.options?.status === 'added';
   const monitorAdded = plan.monitor?.status === 'added', assetAdded = plan.asset?.status === 'added', alertsAdded = plan.monitorAlerts?.status === 'added', variationalAdded = plan.monitorVariational?.status === 'added', crossexAdded = plan.crossex?.status === 'added';
-  if (plan.added.length === 0 && oilAdded === 0 && !optionsAdded && !monitorAdded && !assetAdded && !alertsAdded && !variationalAdded && !crossexAdded) {
-    const what = only?.length || !modules ? '配对' : [withOil ? '原油执行账户' : '', withOptions ? '期权账户' : '', withMonitor ? `行情监控${[withAlerts ? '告警' : '', withVariational ? 'Var token' : ''].filter(Boolean).map(part => `与${part}`).join('')}` : '', withAsset ? '资产账本' : '', withCrossex ? 'CrossEx 账户' : ''].filter(Boolean).join('或');
+  const paperAdded = plan.monitorPaper?.status === 'added';
+  if (plan.added.length === 0 && oilAdded === 0 && !optionsAdded && !monitorAdded && !assetAdded && !alertsAdded && !variationalAdded && !paperAdded && !crossexAdded) {
+    const what = only?.length || !modules ? '配对' : [withOil ? '原油执行账户' : '', withOptions ? '期权账户' : '', withMonitor ? `行情监控${[withAlerts ? '告警' : '', withVariational ? 'Var token' : '', withPaper ? '持仓记录' : ''].filter(Boolean).map(part => `与${part}`).join('')}` : '', withAsset ? '资产账本' : '', withCrossex ? 'CrossEx 账户' : ''].filter(Boolean).join('或');
     if (!existing) throw new Error(only?.length || !modules ? '工作台里没有可导入的配对（需开启保证金平衡、配好主账户凭据前缀且凭据齐全），未生成配置' : `工作台里没有可导入的${what}，未生成配置`);
     out(`没有新的${what}，配置未改动`);
     return;
@@ -767,6 +780,12 @@ async function main(): Promise<void> {
   if (plan.variationalWrite) {
     const written = writeVariationalAsService(dataDir!, plan.variationalWrite.token);
     out(written.written ? `已写入${variationalLine(written)}，行情监控下一次读取即用它` : `未写入 Var token：${written.reason ?? '写入时判断不需要'}`);
+  }
+  // Then the paper records: the writer plans them again against this service's files and leaves them pending; the running
+  // monitor merges them on its next check (perpetual-paper-store.ts), a restarted one at start.
+  if (plan.paperWrite) {
+    const written = writePaperAsService(dataDir!, plan.paperWrite.state);
+    out(written.written ? `已写入${paperLine(written)}（待载入文件），行情监控下一次检查时载入（合约价差采集关闭时在下次开启时）` : `未写入持仓记录：${written.reason ?? '写入时判断不需要'}`);
   }
   // The CrossEx page settings last, also before the files; an existing crossex.sqlite keeps its own.
   if (plan.crossexSettings) out(writeCrossexSettingsAsService(dataDir!, plan.crossexSettings) ? `已把工作台 CrossEx 页面设置写入 ${join(dataDir!, 'crossex.sqlite')}` : '本服务的 crossex.sqlite 已有页面设置，保留不变');

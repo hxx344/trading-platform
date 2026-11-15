@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from './api.ts';
 import { fullStamp } from './asset-format.ts';
-import { alertsAvailable, assetAvailable, confirmText, defaultAssetOwner, importBody, monitorAvailable, restarts, variationalAvailable, type AssetItem, type ImportBody, type ImportChoices, type MonitorAlertsItem, type MonitorItem, type MonitorVariationalItem } from './import-form.ts';
+import { alertsAvailable, assetAvailable, confirmText, defaultAssetOwner, importBody, monitorAvailable, paperAvailable, restarts, variationalAvailable, type AssetItem, type ImportBody, type ImportChoices, type MonitorAlertsItem, type MonitorItem, type MonitorPaperItem, type MonitorVariationalItem } from './import-form.ts';
 
 // The workbench import: the page leaves a request, a root helper on the host answers it (and restarts this service
 // for an import); the answer is polled by request id, and polling carries on while the service restarts.
@@ -21,7 +21,7 @@ interface CrossexItem { accountId: string | null; status: 'added' | 'skipped'; d
 interface ImportResult {
   id: string | null; action: 'preview' | 'import' | null; at: number; phase?: string; message: string;
   preview?: PreviewItem[]; imported?: ImportedItem[]; oil?: OilItem[]; oilError?: string; options?: OptionsItem; optionsError?: string;
-  monitor?: MonitorItem; monitorAlerts?: MonitorAlertsItem; monitorAlertsError?: string; monitorVariational?: MonitorVariationalItem; monitorVariationalError?: string; asset?: AssetItem; assetError?: string; crossex?: CrossexItem; crossexError?: string; notes?: string[]; database?: string;
+  monitor?: MonitorItem; monitorAlerts?: MonitorAlertsItem; monitorAlertsError?: string; monitorVariational?: MonitorVariationalItem; monitorVariationalError?: string; monitorPaper?: MonitorPaperItem; monitorPaperError?: string; asset?: AssetItem; assetError?: string; crossex?: CrossexItem; crossexError?: string; notes?: string[]; database?: string;
 }
 const VENUE: Record<string, string> = { binance: 'Binance', bybit: 'Bybit' };
 
@@ -97,6 +97,20 @@ function VariationalRow({ item, preview }: { item: MonitorVariationalItem; previ
     </tr></tbody>
   </table></div>;
 }
+/** The workbench's paper-position records against this service's (M-5e2): counts and reasons only. */
+function PaperRow({ item, preview }: { item: MonitorPaperItem; preview: boolean }) {
+  const current = item.current === null ? (item.status === 'added' ? '读不出（写入时再判断）' : '—') : `活动 ${item.current.active} 条、已结束 ${item.current.closed} 条${item.current.pending ? `（其中 ${item.current.pending} 条待载入）` : ''}`;
+  const verdict = item.status === 'added' ? `${preview ? '可导入' : '已导入'}：${item.detail}` : `${preview ? '不导入' : '未导入'}：${item.detail}`;
+  return <div className="table-wrap"><table className="data" id="importPaperTable">
+    <thead><tr><th>持仓记录</th><th>工作台</th><th>{preview ? '本服务现有' : '导入前本服务'}</th><th>{preview ? '说明' : '结果'}</th></tr></thead>
+    <tbody><tr>
+      <td>合约价差持仓记录</td>
+      <td>{item.workbench ? `活动 ${item.workbench.active} 条、已结束 ${item.workbench.closed} 条` : item.problem ?? '—'}</td>
+      <td>{current}</td>
+      <td className={item.status === 'added' ? 'ok' : preview ? 'muted' : 'err'}>{verdict}</td>
+    </tr></tbody>
+  </table></div>;
+}
 /** The workbench's ledger users; in a preview, the one to import is picked here. */
 function AssetRows({ item, preview, owner, setOwner }: { item: AssetItem; preview: boolean; owner?: string | null; setOwner?: (value: string) => void }) {
   const last = item.last ? `上次导入：用户 ${item.last.owner}，${fullStamp(item.last.importedAt)}，资产 ${item.last.assets} 条、快照 ${item.last.snapshots} 条` : '尚未导入过账本';
@@ -117,7 +131,7 @@ function AssetRows({ item, preview, owner, setOwner }: { item: AssetItem; previe
 }
 type Message = { tone: 'ok' | 'err' | 'muted'; text: string } | null;
 /** The module choices of the preview (live accounts and modules are never ticked by default). */
-interface ModulePicks { oil: boolean; options: boolean; monitor: boolean; monitorAlerts: boolean; monitorVariational: boolean; asset: boolean; assetOwner: string | null; crossex: boolean }
+interface ModulePicks { oil: boolean; options: boolean; monitor: boolean; monitorAlerts: boolean; monitorVariational: boolean; monitorPaper: boolean; asset: boolean; assetOwner: string | null; crossex: boolean }
 
 function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { result: ImportResult; picked: Set<string>; setPicked: (value: Set<string>) => void; picks: ModulePicks; setPicks: (value: ModulePicks) => void; onRun: () => void; busy: boolean }) {
   const notes = (result.notes || []).map((note, index) => <p key={index} className="muted">{note}</p>);
@@ -126,6 +140,7 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
   const assetError = result.assetError ? <p className="err">资产账本无法读取：{result.assetError}</p> : null;
   const alertsError = result.monitorAlertsError ? <p className="err">行情告警设置无法读取：{result.monitorAlertsError}</p> : null;
   const variationalError = result.monitorVariationalError ? <p className="err">Var token 无法读取：{result.monitorVariationalError}</p> : null;
+  const paperError = result.monitorPaperError ? <p className="err">持仓记录无法读取：{result.monitorPaperError}</p> : null;
   const crossexError = result.crossexError ? <p className="err">CrossEx 账户无法读取：{result.crossexError}</p> : null;
   if (result.action === 'preview') {
     const rows = result.preview || [], oil = result.oil || [], options = result.options ?? null, monitor = result.monitor ?? null, asset = result.asset ?? null, crossex = result.crossex ?? null;
@@ -135,6 +150,9 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
     const monitorImportable = monitorAvailable(monitor), assetImportable = assetAvailable(asset);
     const alerts = result.monitorAlerts ?? null, alertsImportable = alertsAvailable(alerts, monitor, picks.monitor);
     const variational = result.monitorVariational ?? null, variationalImportable = variationalAvailable(variational, monitor, picks.monitor);
+    const paper = result.monitorPaper ?? null, paperImportable = paperAvailable(paper, monitor, picks.monitor);
+    // Ticking the monitor (enable or complete) restarts the service; otherwise these load without a restart.
+    const monitorRestart = Boolean(monitor && monitorAvailable(monitor));
     const monitorNeed = monitor ? (monitorAvailable(monitor) ? (monitor.enabled ? '须同时勾选补全行情监控' : '须同时勾选启用行情监控') : monitor.enabled ? '行情监控已启用' : '须先在本服务启用行情监控') : '';
     return <>
       {rows.length ? <>
@@ -169,18 +187,23 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
       {crossexError}
       {monitor ? <>
         <MonitorRow item={monitor} preview />
-        <label className="pair-pick"><input type="checkbox" id="importMonitorPick" disabled={!monitorImportable} checked={picks.monitor && monitorImportable} onChange={event => setPicks({ ...picks, monitor: event.target.checked, ...(event.target.checked ? {} : { monitorAlerts: false, monitorVariational: false }) })} />启用行情监控（Anthropic 价差，只读公开行情，不需要密钥；股数取默认值，本项目已启用时保留现有设置）</label>
+        <label className="pair-pick"><input type="checkbox" id="importMonitorPick" disabled={!monitorImportable} checked={picks.monitor && monitorImportable} onChange={event => setPicks({ ...picks, monitor: event.target.checked, ...(event.target.checked ? {} : { monitorAlerts: false, monitorVariational: false, monitorPaper: false }) })} />启用行情监控（Anthropic 价差，只读公开行情，不需要密钥；股数取默认值，本项目已启用时保留现有设置）</label>
         {alerts ? <>
           <AlertsRows item={alerts} preview />
           <label className="pair-pick"><input type="checkbox" id="importAlertsPick" disabled={!alertsImportable} checked={picks.monitorAlerts && alertsImportable} onChange={event => setPicks({ ...picks, monitorAlerts: event.target.checked })} />同时导入告警档位与机器人（替换本服务现有的原油 / 海力士档位；{monitorNeed}）</label>
         </> : null}
         {variational ? <>
           <VariationalRow item={variational} preview />
-          <label className="pair-pick"><input type="checkbox" id="importVariationalPick" disabled={!variationalImportable} checked={picks.monitorVariational && variationalImportable} onChange={event => setPicks({ ...picks, monitorVariational: event.target.checked })} />同时导入 Var token（原油对比表 Variational 行的认证行情；本服务的 token 到期不早于工作台的时保留本服务的，不重启服务；{monitorNeed}）</label>
+          <label className="pair-pick"><input type="checkbox" id="importVariationalPick" disabled={!variationalImportable} checked={picks.monitorVariational && variationalImportable} onChange={event => setPicks({ ...picks, monitorVariational: event.target.checked })} />同时导入 Var token（原油对比表 Variational 行的认证行情；本服务的 token 到期不早于工作台的时保留本服务的，{monitorRestart ? '随行情监控一起重启后生效' : '不重启服务'}；{monitorNeed}）</label>
+        </> : null}
+        {paper ? <>
+          <PaperRow item={paper} preview />
+          <label className="pair-pick"><input type="checkbox" id="importPaperPick" disabled={!paperImportable} checked={picks.monitorPaper && paperImportable} onChange={event => setPicks({ ...picks, monitorPaper: event.target.checked })} />同时导入持仓记录（合约价差的模拟与手工持仓；本服务已有的记录保留，{monitorRestart ? '随行情监控一起重启后载入' : '行情监控下一次检查时载入，不重启服务'}；{monitorNeed}）</label>
         </> : null}
       </> : null}
       {alertsError}
       {variationalError}
+      {paperError}
       {asset ? <>
         <AssetRows item={asset} preview owner={picks.assetOwner} setOwner={owner => setPicks({ ...picks, assetOwner: owner, asset: true })} />
         <label className="pair-pick"><input type="checkbox" id="importAssetPick" disabled={!assetImportable} checked={picks.asset && assetImportable} onChange={event => setPicks({ ...picks, asset: event.target.checked })} />导入资产账本（所选用户的账本整体替换本项目现有账本；本项目已启用资产账本时只重新导入、不重启服务）</label>
@@ -208,6 +231,8 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
     {alertsError}
     {result.monitorVariational ? <VariationalRow item={result.monitorVariational} preview={false} /> : null}
     {variationalError}
+    {result.monitorPaper ? <PaperRow item={result.monitorPaper} preview={false} /> : null}
+    {paperError}
     {result.asset ? <AssetRows item={result.asset} preview={false} /> : null}
     {assetError}
     {notes}
@@ -225,10 +250,12 @@ function choicesOf(result: ImportResult | null, picked: Set<string>, picks: Modu
     ? { tiers: alerts.markets.filter(entry => entry.problem === null).length, robot: alerts.robot.imported, robotChanges: alerts.robot.changes } : null;
   const variational = result?.monitorVariational;
   const monitorVariational = picks.monitorVariational && variational && variationalAvailable(variational, result?.monitor, picks.monitor) ? { replaces: variational.replaces } : null;
+  const paper = result?.monitorPaper;
+  const monitorPaper = picks.monitorPaper && paper && paperAvailable(paper, result?.monitor, picks.monitor) ? { added: paper.added } : null;
   const crossex = picks.crossex && result?.crossex?.status === 'added' ? `Gate ${result.crossex.accountId ?? ''}` : null;
-  return { pairs, oil, options, monitor: picks.monitor && monitorAvailable(result?.monitor), monitorAlerts, monitorVariational, assetOwner: owner, crossex };
+  return { pairs, oil, options, monitor: picks.monitor && monitorAvailable(result?.monitor), monitorAlerts, monitorVariational, monitorPaper, assetOwner: owner, crossex };
 }
-const NO_PICKS: ModulePicks = { oil: false, options: false, monitor: false, monitorAlerts: false, monitorVariational: false, asset: false, assetOwner: null, crossex: false };
+const NO_PICKS: ModulePicks = { oil: false, options: false, monitor: false, monitorAlerts: false, monitorVariational: false, monitorPaper: false, asset: false, assetOwner: null, crossex: false };
 
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const statusOf = (error: unknown): number | undefined => {

@@ -45,6 +45,8 @@ test('期权页面表单：只有服务端对启动本身的拒绝才换请求�
   assert.equal(startRefused(new ContractError(409, 'plan_used', 'x')), true);
   assert.equal(startRefused({ status: 400 }), true);
   for (const unknown of [new Error('timeout'), { status: 401 }, { status: 403 }, { status: 503 }]) assert.equal(startRefused(unknown), false);
+  // Options not started: refused before anything is sent (service/options.ts createOptionsSupervisor).
+  assert.equal(startRefused({ status: 503, code: 'options_unavailable' }), true);
 });
 
 const leg = (symbol: string, side: 'Buy' | 'Sell', optionType: 'Call' | 'Put', strike: number): PreviewLeg => ({ symbol, side, optionType, strike, delta: 0, qty: '1', mark: 0, targetDelta: 0, estimatedFeeUsd: 0, feeCapUsd: 0, feeBasisPrice: 0 });

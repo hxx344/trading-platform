@@ -18,6 +18,10 @@ export const MAIN = wallet('0x' + '1a'.repeat(20), '21');
 export const LONG = wallet('0x' + '2b'.repeat(20), '22');
 export const SHORT = wallet('0x' + '3c'.repeat(20), '23');
 export const CREDENTIALS = new Map([MAIN, LONG, SHORT].map(item => [item.user, item]));
+export interface FakeWallets { main: AsterCredentials; long: AsterCredentials; short: AsterCredentials }
+/** A second set of accounts, for a service test file that runs beside service.test.ts: the host account locks never meet.
+ * Bytes used nowhere else under test/, so a later startService elsewhere cannot collide either. */
+export const OTHER_WALLETS: FakeWallets = { main: wallet('0x' + '7a'.repeat(20), '37'), long: wallet('0x' + '8b'.repeat(20), '38'), short: wallet('0x' + '9c'.repeat(20), '39') };
 
 // BigInt values are written as bare JSON numbers, like the venue's 64-bit ids.
 export const json = (body: unknown, status = 200, headers: Record<string, string> = {}): Response =>
@@ -41,15 +45,10 @@ export class FakeAster {
   /** Requests whose signature or nonce the venue would refuse. */
   refused: string[] = [];
   lastNonce = new Map<string, bigint>();
-  subAccounts: Row[] = [
-    { parentAccount: true, accountId: 1, address: MAIN.user },
-    { parentAccount: false, accountId: 2, address: LONG.user, status: 'NORMAL' },
-    { parentAccount: false, accountId: 3, address: SHORT.user },
-  ];
-  accounts = new Map<string, Row>([
-    [LONG.user, { accountId: 2, canTrade: true, assets: [{ asset: 'USD1', availableBalance: '120.5', maxWithdrawAmount: '110', marginBalance: '150' }, { asset: 'USDT', availableBalance: '9' }], positions: [] }],
-    [SHORT.user, { accountId: 3, canTrade: true, assets: [{ asset: 'USD1', availableBalance: '80', maxWithdrawAmount: '80', walletBalance: '90', unrealizedProfit: '-5.5' }], positions: [] }],
-  ]);
+  readonly wallets: FakeWallets;
+  private readonly credentials: Map<string, AsterCredentials>;
+  subAccounts: Row[];
+  accounts: Map<string, Row>;
   income = new Map<string, Row[]>();
   risk = new Map<string, Row[]>();
   openOrders = new Map<string, Row[]>();
@@ -58,6 +57,20 @@ export class FakeAster {
   info: Row[] = [symbolInfo()];
   /** One-shot replies by "METHOD path", consumed in order. */
   scripted = new Map<string, ((call: AsterCall) => Response | Promise<Response>)[]>();
+
+  constructor(wallets: FakeWallets = { main: MAIN, long: LONG, short: SHORT }) {
+    this.wallets = wallets;
+    this.credentials = new Map([wallets.main, wallets.long, wallets.short].map(item => [item.user, item]));
+    this.subAccounts = [
+      { parentAccount: true, accountId: 1, address: wallets.main.user },
+      { parentAccount: false, accountId: 2, address: wallets.long.user, status: 'NORMAL' },
+      { parentAccount: false, accountId: 3, address: wallets.short.user },
+    ];
+    this.accounts = new Map<string, Row>([
+      [wallets.long.user, { accountId: 2, canTrade: true, assets: [{ asset: 'USD1', availableBalance: '120.5', maxWithdrawAmount: '110', marginBalance: '150' }, { asset: 'USDT', availableBalance: '9' }], positions: [] }],
+      [wallets.short.user, { accountId: 3, canTrade: true, assets: [{ asset: 'USD1', availableBalance: '80', maxWithdrawAmount: '80', walletBalance: '90', unrealizedProfit: '-5.5' }], positions: [] }],
+    ]);
+  }
 
   script(route: string, ...replies: ((call: AsterCall) => Response | Promise<Response>)[]): void { this.scripted.set(route, [...(this.scripted.get(route) ?? []), ...replies]); }
   count(path: string): number { return this.calls.filter(call => call.path === path).length; }
@@ -102,7 +115,7 @@ export class FakeAster {
   private owner(call: AsterCall): string {
     const user = call.params.user;
     if (!user) throw new Error(`${call.path} needs user`);
-    const credentials = CREDENTIALS.get(user);
+    const credentials = this.credentials.get(user);
     if (!credentials || credentials.signer !== call.params.signer) throw new Error('signer not authorized for user');
     return user;
   }
@@ -119,7 +132,7 @@ export class FakeAster {
       }
       case 'POST /fapi/v3/subAccountTransfer':
         if ('user' in params) throw new Error('transfer must be signed without user');
-        if (params.signer !== MAIN.signer) throw new Error('transfer must be signed by the main account');
+        if (params.signer !== this.wallets.main.signer) throw new Error('transfer must be signed by the main account');
         return json({ code: 200, msg: 'success' });
       case 'GET /fapi/v3/positionRisk': return json(this.risk.get(this.owner(call)) ?? []);
       case 'GET /fapi/v3/openOrders': {

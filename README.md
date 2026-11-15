@@ -93,6 +93,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 | 回退到早于 | 回退前要做的事 | 说明 | 详见 |
 | --- | --- | --- | --- |
+| v0.48.0 | 不用改配置 | 旧版本里期权启动检查失败（Bybit 不通、密钥被拒、账户被占用、状态无法恢复）会让整个服务拒绝启动，ASTER 划转与 ADL 一起停；新版本只停期权并每 60 秒重试 | [docs/options.md](docs/options.md) 第 3 节 |
 | v0.47.0 | 开了巡检心跳的先执行 `sudo bash install.sh --watch-off` | 旧版本不认识 `config.json` 与 `secrets.json` 的 `watch`，配置检查会失败；关闭后副服务器收不到心跳会告警，改用直连探测或卸载副服务器巡检 | [docs/watch.md](docs/watch.md) |
 | v0.46.0 | 不用改配置。副服务器巡检（main-watch）指向了 `/api/ready` 的，先改回 `tcp://<地址>:4720`（设了登录密码时也可以用 `http://<地址>:4720/login`，没设密码时它返回 401） | 旧版本没有 `/api/ready`，不登录访问返回 401，巡检会持续告警 | 《部署》的外部巡检一条 |
 | v0.36.0 | 从 `config.json` 删掉 `monitor.perpetual`（只配了合约价差时删掉整个 `monitor`） | 旧版本不认识 `perpetual`；`monitor.sqlite` 里的 `control.perpetual` 旧版本忽略 | [docs/monitor.md](docs/monitor.md) M-4a |

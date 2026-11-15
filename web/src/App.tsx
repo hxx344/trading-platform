@@ -38,10 +38,10 @@ function limitsText(state: ServiceState): string | null {
 
 const OIL_CHECK_MS = 60_000;
 const ASSET_CHECK_MS = 60_000;
-/** Shown on every service; the oil, options and monitor entries only where their state path answers (a service without
- * that module returns 404 there), the asset entry unless /api/asset/state answers 404 (a ledger that cannot be read keeps
- * the entry, and the page says why), the CrossEx entry where /api/crossex/state answers or answers 503 (configured but
- * not started, retrying: the page says why). */
+/** Shown on every service; the oil and monitor entries only where their state path answers (a service without that
+ * module returns 404 there), the asset entry unless /api/asset/state answers 404 (a ledger that cannot be read keeps
+ * the entry, and the page says why), the CrossEx and options entries where their state path answers or answers 503
+ * (configured but not started, retrying: the page says why). */
 const ALWAYS: readonly NavEntry[] = ['pairs', 'status', 'logs', 'settings'];
 const ICONS: Record<NavEntry, LucideIcon> = { asset: Wallet, monitor: Activity, oil: ArrowLeftRight, crossex: Gauge, pairs: ShieldCheck, options: Sigma, status: Server, logs: ScrollText, settings: Settings2 };
 /** Below this width the side navigation is a drawer (the workbench's 760px breakpoint, shell.css). */
@@ -64,7 +64,7 @@ export function App() {
   // The CrossEx page reads its state on its own (tab-specific paths, paused around writes); this only decides whether the entry
   // shows, so it asks for the light view without the opportunity list.
   const crossex = useLiveResource<unknown>(`${CROSSEX_STATE_PATH}?opportunities=0`, { intervalMs: OIL_CHECK_MS, timeoutMs: CROSSEX_READ_TIMEOUT_MS, onExpired });
-  const available = new Set<NavEntry>([...ALWAYS, ...(oil.data !== null ? ['oil' as const] : []), ...(options.data !== null ? ['options' as const] : []), ...(monitor.data !== null ? ['monitor' as const] : []), ...(asset.data !== null || (asset.error instanceof ApiError && asset.error.status === 500) ? ['asset' as const] : []),
+  const available = new Set<NavEntry>([...ALWAYS, ...(oil.data !== null ? ['oil' as const] : []), ...(options.data !== null || (options.error instanceof ApiError && options.error.status === 503) ? ['options' as const] : []), ...(monitor.data !== null ? ['monitor' as const] : []), ...(asset.data !== null || (asset.error instanceof ApiError && asset.error.status === 500) ? ['asset' as const] : []),
     ...(crossex.data !== null || (crossex.error instanceof ApiError && crossex.error.status === 503) ? ['crossex' as const] : [])]);
   const current = entryOf(route), crumb = breadcrumbOf(route);
   // The phone drawer, as in the workbench: focus moves into it, Tab cycles inside, Escape or the backdrop closes it and

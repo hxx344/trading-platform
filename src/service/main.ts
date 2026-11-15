@@ -28,7 +28,7 @@ import { balanceWindow, createBalanceSamples, type BalanceSamples } from './bala
 import { readImportResult, submitImportRequest } from './import-channel.ts';
 import { oilLoops, oilViews, openOilPnl, openOilRules, prepareOil, registerOilAccounts, strandedOilJobs, type OilRuntime } from './oil.ts';
 import { oilSummary } from './oil-config.ts';
-import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, stopMonitor, type MonitorRuntime } from './monitor.ts';
+import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, settleMonitor, stopMonitor, type MonitorRuntime } from './monitor.ts';
 import { monitorSummary } from './monitor-config.ts';
 import { assetSummary } from './asset-config.ts';
 import { ASSET_DB_FILE } from '../asset/db.ts';
@@ -408,6 +408,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       // Events from the drain (an unknown transfer, an ADL batch) go out now rather than at the next start.
       try { notifier.poll(); } catch { /* best effort */ }
       await Promise.race([Promise.all([notifier.flush(), monitorOutbox?.flush()]), new Promise(resolve => setTimeout(resolve, FINAL_FLUSH_MS).unref())]);
+      if (monitor) await settleMonitor(monitor);
       notifier.close();
       monitorOutbox?.close();
       summary.close();

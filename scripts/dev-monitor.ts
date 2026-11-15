@@ -12,7 +12,7 @@ import { createSimulatedVenues } from '../src/simulation.ts';
 import { runExecutor } from '../src/runtime.ts';
 import { loadWebApp } from '../src/web-assets.ts';
 import { parseMonitorConfig } from '../src/service/monitor-config.ts';
-import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, stopMonitor } from '../src/service/monitor.ts';
+import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, settleMonitor, stopMonitor } from '../src/service/monitor.ts';
 import { fakeAnthropicVenues } from '../test/monitor-fake.ts';
 import { fakePerpetualVenues } from '../test/perpetual-fake.ts';
 
@@ -44,7 +44,7 @@ const run = runExecutor({
   startedMessage: `行情监控预览（替身行情）已启动，数据目录 ${dir}`,
   background: context => monitorLoops(monitor, context),
   onStopping: () => stopMonitor(monitor),
-  onStopped: () => closeMonitor(monitor),
+  onStopped: async () => { await settleMonitor(monitor); closeMonitor(monitor); },
 });
 let link = '';
 for (let i = 0; i < 100 && !link; i++) {

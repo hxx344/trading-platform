@@ -4,7 +4,7 @@
 
 对照的工作台代码：`modules/monitor`（工作台提交 `7745181` 时的内容）。工作台 Monitor 的功能编号 M01–M14 沿用。
 
-## 当前状态（v0.38.0）
+## 当前状态（v0.41.0）
 
 - 已发布：M-1（Anthropic 价差）随 v0.12.0；v0.15.0 起在设置页「从工作台导入」里启用。M-2a（原油价差）随 v0.20.0。M-2b（海力士溢价）随 v0.21.0。M-2c（多交易所对比）随 v0.23.0。M-2d（已结算资金费历史与多空资金费图）随 v0.24.0。M-2e（技术指标）随 v0.25.0。M-2d-3（对比表各交易所的结算历史）随 v0.27.0，M-2 完成。
 - M-3a（原油与海力士阈值告警、飞书出站队列、页面告警面板与测试消息）随 v0.29.0；替身后端与替身机器人验证，未接真实飞书。
@@ -17,7 +17,8 @@
 - M-5a（展开组合详情：按金额校验盘口、平仓收益测算；跨计价币排名；手动配对）随 v0.38.0；替身交易所验证（见 M-5a 实施记录）。
 - M-5b1（市场指标：成交额与持仓量列；所需资本与 ROC；列选择；表头排序）随 v0.39.0；替身交易所验证（见 M-5b1 实施记录）。
 - M-5b2（资金费历史：24h / 7天 / 30天实际资金费列与详情；汇总接口；范围筛选；成交额、持仓量与历史列的全量排序）随 v0.40.0；替身交易所验证（见 M-5b2 实施记录）。
-- 未开始：M-5c–M-5f、M-6（见下表与「M-5」节）。
+- M-5c（成交价历史与价差图表：图表工作区、两腿成交价与价差、资金费稳定度、可分享的图表链接）随 v0.41.0；替身交易所验证（见 M-5c 实施记录）。
+- 未开始：M-5d–M-5f、M-6（见下表与「M-5」节）。
 - M-1 没做：成交标记、股数从交易中心同步、概览卡片与告警（均线 / 布林带 / Z-score 随 M-2e 补上）。
 
 ## 批次
@@ -28,7 +29,7 @@
 | M-2 | 原油价差与海力士行情（M01、M02），分 M-2a–M-2e 五小批（见下文），Var 腿先降级为“未接入” | R2 | M-2a 已发布（v0.20.0），M-2b 已发布（v0.21.0），M-2c 已发布（v0.23.0），M-2d 已发布（v0.24.0），M-2e 已发布（v0.25.0），M-2d-3 已发布（v0.27.0） |
 | M-3 | 告警规则、飞书通知、监控开关、Var 会话 token（M09–M12），分 M-3a–M-3d 四小批（见下文） | R3 | M-3a 完成（v0.29.0），M-3b 完成（v0.30.0），M-3c 完成（v0.31.0），M-3d-1 完成（v0.33.0），M-3d-2 完成（v0.34.0） |
 | M-4 | 永续全市场报价（M04：11 家交易所公共 WS、SSE 增量），分 M-4a（采集器与接口）、M-4b（页面与导入） | R2 | 完成（M-4a v0.36.0，M-4b v0.37.0） |
-| M-5 | 依赖 M04 的页面（M05–M08），分 M-5a–M-5f 小批（M-5b 再拆 b1、b2，见「M-5」节） | R2 | M-5a（v0.38.0）、M-5b1（v0.39.0）、M-5b2（v0.40.0）完成，其余未开始 |
+| M-5 | 依赖 M04 的页面（M05–M08），分 M-5a–M-5f 小批（M-5b 再拆 b1、b2，见「M-5」节） | R2 | M-5a（v0.38.0）、M-5b1（v0.39.0）、M-5b2（v0.40.0）、M-5c（v0.41.0）完成，其余未开始 |
 | M-6 | 其余（M13、M14；M14 原靠 iframe 桥接宿主，需重新设计） | 待定 | 未开始 |
 
 ## M-1：Anthropic 价差
@@ -741,3 +742,33 @@ CrossEx 的机会来源（C5）与导入预填属 M13，按 R3 单独做（见 [
 - 替身：`test/perpetual-fake.ts` 加 Binance、Bybit（8 小时）与 Hyperliquid（1 小时）的资金费历史，费率按交易所、币种与时间确定，OKX 与 Lighter 抛错以展示“更新失败”。
 - 测试：工作台 `perpetual-funding-history.test.mjs` 中测工作台整体服务的用例不移植，改由 `test/monitor-perpetual-funding.test.ts` 覆盖本仓库采集器（未运行 503、组合无效 400、历史就绪与净累计、停止写回、新采集器先读缓存）、汇总接口（指标与净累计、参数无效 400）、缓存表（与指标表互不覆盖、坏行按缺失）与两条路由的 401/403/404/503/400/423。
 - 回补节奏：首批读最近 4 天（24h 列很快就绪），之后每次 tick 向前回补 4 天，单个合约约 8 次请求（约 8–10 秒）补齐 32 天，期间 7 天、30 天列显示“采集中”或“历史不足”；每家交易所同一时刻只有一个请求、每秒调度一次，所以范围或排序覆盖全部候选组合时，首轮大约按每家交易所每秒一个请求逐个合约补齐，页面显示“待采集 N · 自动补齐中”。已到下架时间的组合不进汇总，历史列退回逐页读取的已结算记录。
+
+### M-5c：成交价历史与价差图表
+
+**对照**：工作台 `server/perpetual-price-history.mjs`、`perpetual-price-reader.mjs`、`lib/perpetual-price-history.ts`、`lib/perpetual-chart-state.ts`、`lib/perpetual-funding-stability.ts`、`hooks/use-perpetual-price-history.ts`、`app/perpetual-chart.tsx`、`perpetual-chart.css` 与 `app/perpetual-panel.tsx`（工作区导航、`selectChart` / `openChart` / `leaveChart`、组合单元格与行点击、详情按钮、图表 URL 状态）（提交 `c84ba27`）。
+
+**范围**：
+- 服务：采集器内建成交价历史服务（工作台 `createPerpetualPriceHistoryService` 与读取器原样复制），与 M-5b 的两项服务同样随开关启停。只为页面读过的两腿采集：每次读取把两腿的租约延长 10 分钟，租约内每秒调度，全部交易所合计同时至多 2 个请求、同一主机两次之间至少 350 ms；先读最近 72 小时，再向后增量、向前回补到 30 天；429/418 退避该主机。支持 Binance、Aster、Bybit、Gate（USDT）、OKX、Bitget、Hyperliquid 的小时 K 线，其余平台与未核实的计价币返回“不支持”。
+- 缓存：`perpetual-cache.sqlite` 加 `price_history_cache` 表（同 M-5b 的写法）。
+- 接口：`POST /api/monitor/perpetual/price-history`（`{ pair: { base, longKey, shortKey }, days: 3 | 7 | 30 }`，带页面请求标记）；未运行 503，组合或窗口无效 400，其它 500；缓存打不开时回复带 `storageError`。
+- 页面：合约价差面板加「发现机会 / 创建价差图表」工作区导航；排名表的组合单元格、整行（交互元素除外）与展开详情的「创建价差图表 · 资金费稳定度」按钮进入图表；图表组件（价差、两腿成交价、累计资金费、日净资金费、3 / 7 / 30 天稳定度、实际结算记录）按需加载；图表的组合与窗口写进地址栏查询参数，可复制链接、刷新后恢复、浏览器前进后退切换。
+
+**不搬**：持仓跟踪工作区（M-5e）、价差趋势与质量依据（M-5d）。
+
+**影响面（R2）**：新增一个只读接口与按需采集，打开图表时访问所选两腿交易所的公开 K 线接口（上面 7 家），离开图表 10 分钟后停止。不碰凭据、交易与 `monitor.sqlite`。
+
+**回滚**：`sudo bash install.sh --version v0.40.0`，不用改配置；旧版本不读新表，留在缓存库无害；旧版本不认图表查询参数，打开这类链接会停在机会列表。
+
+**测试计划**：移植工作台 `tests/perpetual-{price-reader,price-history,price-feed,chart-state,funding-stability}.test.mjs`（只改导入，`price-feed` 改名为 `price-history-feed`；`perpetual-price-history.test.mjs` 中依赖工作台整体服务与 HTTP 的用例改测本仓库采集器）；本仓库补采集器、缓存表与接口测试。替身补 Binance、Bybit、Hyperliquid 的小时 K 线，浏览器走查开图、交换多空、窗口切换、复制链接、刷新恢复、前进后退与返回。
+
+#### M-5c 实施记录（v0.41.0）
+
+按上面的计划实现，差别与补充：
+
+- 复制：工作台 `server/perpetual-price-history.mjs`、`perpetual-price-reader.mjs` 复制为 `src/vendor/perpetual-price-{history-service,reader}.mjs`（只改导入，配 `.d.mts`）；`lib/perpetual-price-history.ts` 拆成两份：校验与类型复制到 `src/vendor/perpetual-price-history.ts`（服务端与页面共用），页面轮询部分放 `web/src/perpetual-price-history-feed.ts`（读取活动用本仓库独立页版 `read-activity.ts`）。`perpetual-chart-state.ts`、`perpetual-funding-stability.ts` 与 `PerpetualChart.tsx`、`perpetual-chart.css` 复制到 `web/src/`，只改导入；图表组件加 `onExpired` 属性传给两个 hook（401 转登录）。
+- 采集器：`priceHistory` 选项可单独注入 `fetchImpl`（替身与测试用），默认用采集器的 `fetchImpl`；停止时与指标、资金费历史并行写回。缓存库打不开时的提示文案改为“市场指标、历史资金费与成交价历史只存内存”。503 文案「合约价差采集未运行，开启后再读取成交价历史」。
+- 地址：本仓库页面用 hash 路由，图表状态沿用工作台的查询参数（`monitor=perpetual&perpView=chart&chartBase&chartLong&chartShort&chartDays`），放在 `#/monitor` 之前；行情监控页先认 `?monitor=` 再用上次保存的标签，浏览器前进后退时按地址里的 `?monitor=` 切回对应市场（工作台 `monitor-hub.tsx` 的 popstate 同步）；切到别的市场或离开图表时连同 `monitor` 一起去掉图表参数（工作台离开图表保留 `?monitor=perpetual`，那是它的标签状态；本仓库标签存在本地，留着会把这个浏览器标签页固定在合约价差），见 `web/src/monitor-link.ts`。从图表直接点导航去别的页面时参数留在地址上，回到行情监控会重新打开该图表。链接里的合约无效时显示空态与「选择套利组合」。
+- 按需加载失败：图表分块加载失败（页面开着时服务升级、旧分块已不存在，或网络中断）时，`LazyBoundary` 就地显示“加载失败，请刷新页面”和刷新按钮，不再让整页卸载；CrossEx 持仓指标的两个按需图表一并套上。
+- 门控：图表工作区时机会列表的读取（汇率、全量排名、汇总数据、市场指标、资金费历史、手动配对）暂停，与工作台一致。
+- 替身：`test/perpetual-fake.ts` 加 Binance、Bybit 与 Hyperliquid 的小时 K 线，收盘价由报价基准、交易所偏移与正弦波动生成；Lighter、OKX 不提供，图表显示“不支持”或“更新失败”。
+- 测试：`web/test/perpetual/monitor-link.test.mjs` 覆盖图表地址与 hash 路由并存（保留 `#/monitor`、离开时去掉参数、无效链接）；`test/monitor-perpetual-price.test.ts` 覆盖采集器（未运行 503、窗口 / 组合无效 400、两腿就绪、停止写回、新采集器先读缓存、缓存不可用提示）、缓存表（与资金费表互不覆盖、坏行按缺失）与路由的 401/403/404/503/400/423。

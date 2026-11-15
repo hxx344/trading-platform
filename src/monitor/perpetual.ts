@@ -11,7 +11,9 @@
 // M-5b2 adds the workbench's settled-funding history (perpetual-funding-history.mjs: the same life and cache as the metrics,
 // 30 days per contract, backfilled in 4-day chunks) and its scanner-data summary (perpetual-scanner-data.mjs: one validated
 // batch registered with both services, answering metrics and net window totals for range filters and full sorting).
-// Left out (later batches, docs/monitor.md M-4/M-5): the saved quotes (market.sqlite), quality, price history, alerts,
+// M-5c adds the workbench's hourly trade-close history (perpetual-price-history.mjs: one pair per read, the selected legs
+// leased for 10 minutes, 3 days first then 30 days in 7-day pages; same life and cache file) for the pair chart.
+// Left out (later batches, docs/monitor.md M-4/M-5): the saved quotes (market.sqlite), quality, alerts,
 // paper trading, CrossEx filters. Quotes live in memory only; a restart or a switch-off starts from empty.
 // Node's own WebSocket is used (it takes request headers); like fetch it goes through Node's global dispatcher, so with
 // NODE_USE_ENV_PROXY=1 and HTTPS_PROXY (README) both the directory reads and the sockets use the proxy.
@@ -24,6 +26,9 @@ import { createPerpetualMarketMetricsService, type PerpetualContractMetricsStore
 import { createPerpetualFundingHistoryService, type PerpetualFundingHistoryStore } from '../vendor/perpetual-funding-history-service.mjs';
 import { createPerpetualFundingReader } from '../vendor/perpetual-funding-reader.mjs';
 import { createPerpetualScannerDataService } from '../vendor/perpetual-scanner-data-service.mjs';
+import { createPerpetualPriceHistoryService, type PerpetualPriceHistoryStore } from '../vendor/perpetual-price-history-service.mjs';
+import { createPerpetualPriceReader } from '../vendor/perpetual-price-reader.mjs';
+import type { PerpetualPriceHistoryReport } from '../vendor/perpetual-price-history.ts';
 import type { PerpetualFundingHistoryReport } from '../vendor/perpetual-funding-history.ts';
 import type { PerpetualScannerDataReport } from '../vendor/perpetual-scanner-data.ts';
 import { createPerpetualMetricsReader } from '../vendor/perpetual-metrics-reader.mjs';
@@ -84,8 +89,10 @@ export interface PerpetualOptions {
   metrics?: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; intervalMs?: number };
   /** M-5b2: the settled-funding history reads' venues (tests and the local preview stand in for them). */
   fundingHistory?: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response> };
-  /** M-5b1/M-5b2: the metrics and funding-history cache (perpetual-cache.sqlite); without it both live in memory only. */
-  cache?: (PerpetualContractMetricsStore & Partial<PerpetualFundingHistoryStore>) | null;
+  /** M-5c: the hourly trade-close reads' venues (tests and the local preview stand in for them). */
+  priceHistory?: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response> };
+  /** M-5b1/M-5b2/M-5c: the metrics, funding and price history cache (perpetual-cache.sqlite); without it all live in memory. */
+  cache?: (PerpetualContractMetricsStore & Partial<PerpetualFundingHistoryStore> & Partial<PerpetualPriceHistoryStore>) | null;
   /** M-5b1: set when the cache file could not be opened; every metrics report then carries it as its storageError. */
   cacheUnavailable?: string;
 }
@@ -113,7 +120,7 @@ export function createPerpetualMonitor({
   fetchImpl, WebSocketImpl = globalThis.WebSocket as unknown as PerpetualSocketFactory, now: clock = Date.now, log = line => process.stderr.write(`${line}\n`),
   staleAfterMs = PERPETUAL_STALE_MS, retryMs = 5_000, discoveryIntervalMs = PERPETUAL_DISCOVERY_MS, observationIntervalMs = PERPETUAL_OBSERVATION_MS,
   broadcastIntervalMs = PERPETUAL_OBSERVATION_MS, watchdogIntervalMs = 10_000, quoteTimeoutMs = 45_000, execution: executionOptions,
-  metrics: metricsOptions, fundingHistory: fundingOptions, cache = null, cacheUnavailable,
+  metrics: metricsOptions, fundingHistory: fundingOptions, priceHistory: priceOptions, cache = null, cacheUnavailable,
 }: PerpetualOptions = {}) {
   const quotes = new Map<string, PerpetualQuote>(), pendingQuotes = new Map<string, PerpetualQuote>(), publishedQuotes = new Map<string, PerpetualQuote>(), publishDirty = new Set<string>();
   const connections = new Set<Connection>(), timers = new Set<ReturnType<typeof setTimeout>>(), pollBudgets = new Map<string, PollBudget>();
@@ -145,12 +152,17 @@ export function createPerpetualMonitor({
     getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket: (exchange, symbol) => states.get(exchange)?.markets?.get(symbol),
     store: cache, clock, reader: createPerpetualFundingReader({ clock, requestSpacingMs: 350, ...(fundingFetch ? { fetchImpl: fundingFetch } : {}) }),
   });
+  const priceFetch = priceOptions?.fetchImpl ?? fetchImpl;
+  const priceHistory = createPerpetualPriceHistoryService({
+    getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket: (exchange, symbol) => states.get(exchange)?.markets?.get(symbol),
+    store: cache, clock, reader: createPerpetualPriceReader({ clock, requestSpacingMs: 350, ...(priceFetch ? { fetchImpl: priceFetch } : {}) }),
+  });
   const scannerData = createPerpetualScannerDataService({
     getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket: (exchange, symbol) => states.get(exchange)?.markets?.get(symbol),
     marketMetrics, fundingHistory, clock,
   });
   let metricsStopping: Promise<void> = Promise.resolve();
-  // The three cached reads: 503 while stopped, the service's 400 for an invalid batch, any other failure 500; the cache's
+  // The cached reads (metrics, funding history, scanner data, price history): 503 while stopped, the service's 400 for an invalid batch, any other failure 500; the cache's
   // unavailability rides along as the report's storageError.
   function cachedRead<T extends { storageError?: string }>(stopped: string, read: () => T): T {
     if (!running) throw new PerpetualInspectionError(503, stopped);
@@ -407,7 +419,7 @@ export function createPerpetualMonitor({
         getQuote: (exchange, symbol) => quotes.get(`${exchange}:${symbol}`), getMarket: (exchange, symbol) => states.get(exchange)?.markets?.get(symbol),
         clock, ...(fetchImpl ? { fetchImpl } : {}), ...executionOptions,
       });
-      marketMetrics.start(); fundingHistory.start();
+      marketMetrics.start(); fundingHistory.start(); priceHistory.start();
       if (observationIntervalMs > 0) { observationTimer = setInterval(observe, observationIntervalMs); observationTimer.unref?.(); }
       for (const exchange of states.keys()) void refresh(exchange);
       refreshTimer = setInterval(() => { for (const exchange of states.keys()) void refresh(exchange); }, discoveryIntervalMs);
@@ -422,7 +434,7 @@ export function createPerpetualMonitor({
       if (!running) return;
       running = false; closeStreams();
       execution?.stop(); execution = null;
-      metricsStopping = Promise.all([marketMetrics.stop(), fundingHistory.stop()].map(stopping => stopping.catch(() => undefined))).then(() => undefined);
+      metricsStopping = Promise.all([marketMetrics.stop(), fundingHistory.stop(), priceHistory.stop()].map(stopping => stopping.catch(() => undefined))).then(() => undefined);
       for (const timer of [observationTimer, refreshTimer, broadcastTimer]) clearInterval(timer);
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
@@ -513,6 +525,13 @@ export function createPerpetualMonitor({
      */
     async scannerData(input: unknown): Promise<PerpetualScannerDataReport> {
       return cachedRead('合约价差采集未运行，开启后再读取筛选数据', () => scannerData.read(input));
+    },
+    /**
+     * M-5c: the hourly trade closes of one current pair's two legs (the workbench's price-history action) for a 3, 7 or 30 day
+     * chart; leases both legs for 10 minutes and answers from the cache at once. 503 while stopped, 400 for an invalid pair.
+     */
+    async priceHistory(input: unknown): Promise<PerpetualPriceHistoryReport> {
+      return cachedRead('合约价差采集未运行，开启后再读取成交价历史', () => priceHistory.read(input));
     },
     /** M-5b1: resolves once the last stop has written the metrics and histories back (the cache file may close then). */
     settled: (): Promise<void> => metricsStopping,

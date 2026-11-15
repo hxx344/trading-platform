@@ -5,6 +5,7 @@ import { api, ApiError } from './api.ts';
 import { ANTHROPIC_WARMUP_DAYS, anthropicChartConfig, anthropicHistory, anthropicPoints, anthropicQuote, coversAnthropicRange, dailyPoints, ranges, selectRange, type AnthropicHistory, type AnthropicQuote, type ChartMode, type Point } from './monitor-history.ts';
 import { SpreadChart, date, stamp } from './MonitorChart.tsx';
 import { disabledNotice, parseControl, parseControls, switchFailure, switchLabel, toggleBody, type MonitorControls } from './monitor-control.ts';
+import { linkedMonitorTab, withoutMonitorLink } from './monitor-link.ts';
 import { HynixPanel } from './MonitorHynix.tsx';
 import { OilPanel } from './MonitorOil.tsx';
 import { PerpetualPanel } from './MonitorPerpetual.tsx';
@@ -51,13 +52,19 @@ const readable = (error: Error, fallback: string) => /[一-鿿]/.test(error.mess
 const MARKET_TABS: Record<string, string> = { anthropic: 'Anthropic', oil: '原油', hynix: '海力士', perpetual: '合约价差' };
 const TAB_KEY = 'monitor:market:v1';
 const savedTab = () => { try { return localStorage.getItem(TAB_KEY); } catch { return null; } };
+// M-5c: a pair-chart link opens its market over the saved tab, also on back / forward (monitor-link.ts).
 
 export function MonitorPage({ onExpired }: { onExpired: () => void }) {
   const state = useLiveResource<MonitorState>(MONITOR_STATE_PATH, { intervalMs: STATE_MS, timeoutMs: MONITOR_READ_TIMEOUT_MS, parse: parseMonitorState, onExpired });
-  const [chosen, setChosen] = useState<string | null>(savedTab);
+  const [chosen, setChosen] = useState<string | null>(() => linkedMonitorTab(location.href) ?? savedTab());
   const [pending, setPending] = useState<string | null>(null);
   const [switchError, setSwitchError] = useState<{ market: string; text: string } | null>(null);
   const { data: current, commit, refresh } = state;
+  useEffect(() => {
+    const follow = () => { const linked = linkedMonitorTab(location.href); if (linked) setChosen(linked); };
+    window.addEventListener('popstate', follow);
+    return () => window.removeEventListener('popstate', follow);
+  }, []);
   // The answer is merged into the latest state, not the one at the click: a state read landing meanwhile keeps the other markets.
   const latest = useRef(current);
   latest.current = current;
@@ -85,7 +92,10 @@ export function MonitorPage({ onExpired }: { onExpired: () => void }) {
   const markets = state.data.markets.filter(market => market in MARKET_TABS);
   if (!markets.length) return <StatePanel kind="empty" title="本服务没有启用行情监控" />;
   const active = chosen && markets.includes(chosen) ? chosen : markets[0];
-  const choose = (market: string) => { setChosen(market); try { localStorage.setItem(TAB_KEY, market); } catch { /* the choice only lasts this visit */ } };
+  const choose = (market: string) => {
+    setChosen(market); try { localStorage.setItem(TAB_KEY, market); } catch { /* the choice only lasts this visit */ }
+    if (market !== 'perpetual' && linkedMonitorTab(location.href)) history.replaceState(history.state, '', withoutMonitorLink(location.href));
+  };
   const shares = state.data.anthropic?.shares;
   const control = state.data.controls?.[active];
   const busy = pending === active, failed = switchError?.market === active;

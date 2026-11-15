@@ -66,11 +66,11 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
     let perpetualCache: PerpetualCache | null = null;
     if (config.perpetual) {
       try { perpetualCache = openPerpetualCache(join(dir, PERPETUAL_CACHE_FILE)); }
-      catch (error) { (log ?? (line => process.stderr.write(`${line}\n`)))(`合约价差缓存 ${PERPETUAL_CACHE_FILE} 打不开，市场指标只存内存：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`); }
+      catch (error) { (log ?? (line => process.stderr.write(`${line}\n`)))(`合约价差缓存 ${PERPETUAL_CACHE_FILE} 打不开，市场指标与历史资金费只存内存：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`); }
     }
     try {
       const perpetual = config.perpetual ? createPerpetualMonitor({ ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}), cache: perpetualCache,
-        ...(perpetualCache ? {} : { cacheUnavailable: `缓存库 ${PERPETUAL_CACHE_FILE} 打不开，市场指标只存内存，重启后重新采集。` }), ...perpetualOptions }) : null;
+        ...(perpetualCache ? {} : { cacheUnavailable: `缓存库 ${PERPETUAL_CACHE_FILE} 打不开，市场指标与历史资金费只存内存，重启后重新采集。` }), ...perpetualOptions }) : null;
       return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, hynix, exchanges, alerts, control, variational, perpetual, perpetualCache };
     } catch (error) { perpetualCache?.close(); throw error; }
   } catch (error) { store.close(); throw error; }

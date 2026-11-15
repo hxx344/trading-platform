@@ -3,8 +3,8 @@
 // JSON entry per contract, the newest 5000 kept, a corrupt entry read as a miss. Kept apart from monitor.sqlite so the
 // frequent cache writes never wait on (or hold up) the alert, switch and import writes there; busy_timeout is the
 // workbench's 100 ms, a busy write fails quickly and the service retries its dirty entry. Only the service process writes
-// it; losing the file loses only cached public figures, which the venues serve again. Later batches add their tables here
-// (M-5b2 funding_history_cache, M-5c price_history_cache, M-5d quality_samples).
+// it; losing the file loses only cached public figures, which the venues serve again. M-5b2 adds funding_history_cache (the
+// settled-funding histories); later batches add theirs (M-5c price_history_cache, M-5d quality_samples).
 import { DatabaseSync } from 'node:sqlite';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import type { PerpetualContractCacheEntry } from '../vendor/perpetual-market-metrics-service.mjs';
@@ -20,6 +20,8 @@ export interface PerpetualCacheTable {
 export interface PerpetualCache {
   loadContractMetrics: PerpetualCacheTable['load'];
   saveContractMetrics: PerpetualCacheTable['save'];
+  loadFundingHistory: PerpetualCacheTable['load'];
+  saveFundingHistory: PerpetualCacheTable['save'];
   close(): void;
 }
 
@@ -27,7 +29,7 @@ export function openPerpetualCache(file: string): PerpetualCache {
   const db = new DatabaseSync(file);
   try {
     db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=100; PRAGMA cache_size=-2048; PRAGMA wal_autocheckpoint=1000; PRAGMA journal_size_limit=4194304;');
-    db.exec('CREATE TABLE IF NOT EXISTS contract_metrics_cache (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, payload BLOB NOT NULL);');
+    db.exec('CREATE TABLE IF NOT EXISTS contract_metrics_cache (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, payload BLOB NOT NULL); CREATE TABLE IF NOT EXISTS funding_history_cache (id TEXT PRIMARY KEY, updated_at INTEGER NOT NULL, payload BLOB NOT NULL);');
     function publicCache(table: string): PerpetualCacheTable {
       db.exec(`CREATE INDEX IF NOT EXISTS ${table}_updated_at ON ${table}(updated_at DESC)`);
       const selectOne = db.prepare(`SELECT payload FROM ${table} WHERE id=?`);
@@ -54,11 +56,13 @@ export function openPerpetualCache(file: string): PerpetualCache {
         },
       };
     }
-    const metrics = publicCache('contract_metrics_cache');
+    const metrics = publicCache('contract_metrics_cache'), funding = publicCache('funding_history_cache');
     let closed = false;
     return {
       loadContractMetrics: metrics.load,
       saveContractMetrics: metrics.save,
+      loadFundingHistory: funding.load,
+      saveFundingHistory: funding.save,
       close() { if (!closed) { closed = true; db.close(); } },
     };
   } catch (error) { db.close(); throw error; }

@@ -1,7 +1,7 @@
 /* 复制自 project-aggregation 工作台 modules/monitor/app/perpetual.css 与 perpetual-scanner.css（提交 c84ba27），
  * 按原顺序只保留 MonitorPerpetual.tsx、perpetual-scanner-parts.tsx、PerpetualExecution.tsx、PerpetualExit.tsx 与
- * PerpetualManualPairs.tsx 用到的类的规则：选择器里的每个类都用到才保留，`:not()` 里的类不要求存在，`:is()` 列表有一项
- * 可用即可。声明未改动，只重排了空白；两个文件的分界用注释标出。M-5b1 按新增的列、表头排序、指标单元格与排序状态行重新过滤；M-5b2 加上 PerpetualScannerFilters.tsx，按筛选按钮、范围面板、筛选进度、历史列与详情的资金费历史重新过滤。M-5c 按工作区导航、组合单元格开图按钮与可点击行重新过滤；M-5a 起末列为展开按钮，与工作台一致，不再删去规则；
+ * PerpetualManualPairs.tsx（M-5d1 起加 PerpetualFeeSettings.tsx、PerpetualHolding.tsx）用到的类的规则：选择器里的每个类都用到才保留，`:not()` 里的类不要求存在，`:is()` 列表有一项
+ * 可用即可。声明未改动，只重排了空白；两个文件的分界用注释标出。M-5b1 按新增的列、表头排序、指标单元格与排序状态行重新过滤；M-5b2 加上 PerpetualScannerFilters.tsx，按筛选按钮、范围面板、筛选进度、历史列与详情的资金费历史重新过滤。M-5d1 按手续费与滑点设置、持有期情景重新过滤；M-5c 按工作区导航、组合单元格开图按钮与可点击行重新过滤；M-5a 起末列为展开按钮，与工作台一致，不再删去规则；
  * 文件末尾一段是本服务的补充，单独标出。 */
 /* —— perpetual.css —— */
 .perpetual-panel { --perp-surface:var(--card);--perp-border:var(--border);--perp-muted:var(--muted-foreground);--perp-accent:var(--primary);padding:30px 4.2% 36px;color:var(--foreground);font-variant-numeric:tabular-nums }
@@ -170,8 +170,43 @@
 .perp-table thead th:nth-child(6) { width:12% }
 .perp-table thead th:nth-child(7) { width:10%;padding:13px 10px }
 .perp-table thead th:nth-child(8) { width:4%;padding:0 }
+.perp-quality-budget { margin:8px 0 11px;border-top:1px solid var(--border);border-bottom:1px solid var(--border);font-size:11px;color:var(--muted-foreground) }
+.perp-quality-budget>summary { display:flex;align-items:center;gap:12px;min-height:42px;cursor:pointer;list-style:none }
+.perp-quality-budget>summary::-webkit-details-marker { display:none }
+.perp-quality-budget>summary>span { margin-left:auto;color:var(--muted-foreground) }
+.perp-quality-budget[open]>summary>svg { transform:rotate(180deg) }
+.perp-quality-budget-fields { display:flex;gap:15px;align-items:flex-end;padding:8px 0 12px }
+.perp-quality-budget-fields>label { display:flex;flex-direction:column;gap:7px;max-width:240px;flex:1 }
+.perp-quality-budget-fields input { width:100%;min-width:0;padding:8px 10px;background:var(--card);color:var(--foreground);border:1px solid var(--border);border-radius:4px }
+.perp-quality-budget-fields>button { padding:9px 10px;background:transparent;color:var(--chart-2);border:1px solid var(--border);border-radius:4px;font-size:11px }
+.perp-quality-budget>p { line-height:1.7;margin:0 0 13px;color:var(--muted-foreground) }
 .perp-quality-notice { margin:0 0 12px;font-size:12px;line-height:1.7;color:var(--warning) }
+@media(max-width:700px) {
+  .perp-quality-budget>summary { gap:7px;font-size:11px }
+  .perp-quality-budget>summary>span { font-size:10px }
+  .perp-quality-budget-fields { flex-wrap:wrap;gap:12px }
+  .perp-quality-budget-fields>label { flex-basis:calc(50% - 6px) }
+  .perp-quality-budget-fields input { font-size:16px;min-height:42px }
+  .perp-quality-budget-fields>button { min-height:38px }
+}
+.perp-taker-settings { display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px 16px;margin:12px 0 }
+.perp-taker-settings>label { display:flex;flex-direction:column;gap:7px;min-width:0 }
+.perp-taker-settings label>span { color:var(--chart-2);font-size:12px }
+.perp-taker-settings small { display:block;color:var(--muted-foreground);font-size:10px;margin-top:3px }
+.perp-taker-settings input { width:100%;min-width:0;padding:9px 10px;border:1px solid var(--border);border-radius:4px;background:var(--card);color:var(--foreground) }
+.perp-taker-settings input::placeholder { color:var(--muted-foreground) }
+@media(max-width:1050px) {
+  .perp-taker-settings { grid-template-columns:repeat(3,minmax(0,1fr)) }
+}
+@media(max-width:700px) {
+  .perp-taker-settings { grid-template-columns:repeat(2,minmax(0,1fr));gap:12px }
+  .perp-taker-settings input { font-size:16px;min-height:42px }
+  .perp-quality-budget>summary { flex-wrap:wrap;gap:5px 8px;padding:8px 0 }
+  .perp-quality-budget>summary>span { margin-left:0 }
+  .perp-quality-budget>summary>svg { margin-left:auto }
+}
 .perp-heading-actions { display:flex;gap:8px;align-items:center;flex-wrap:wrap }
+.perpetual-panel .is-positive { color:var(--positive) }
 .perp-search>button { padding:6px;display:flex;align-items:center;justify-content:center;background:none;border:0;color:var(--muted-foreground) }
 .perp-detail-navigation { display:flex;align-items:center;justify-content:space-between;gap:14px;padding:0 20px;border-bottom:1px solid var(--border);background:var(--card);white-space:normal }
 .perp-detail-navigation [role=tablist] { display:flex;gap:20px }
@@ -183,6 +218,30 @@
 .perp-inspection-bar button { flex:none;border:1px solid var(--border);background:transparent;color:var(--warning);border-radius:4px;padding:6px 9px;font-size:11px }
 .perpetual-panel .perp-detail-content { white-space:normal;overflow-wrap:anywhere }
 .perp-detail-content .perp-detail { padding-top:18px }
+.perp-holding { margin:18px 20px;padding:18px 0;border-top:1px solid var(--border);white-space:normal }
+.perp-detail-section-title { display:flex;align-items:baseline;justify-content:space-between;gap:14px;margin-bottom:14px }
+.perp-detail-section-title h3 { font-size:14px;color:var(--foreground);font-weight:550;margin:0 }
+.perp-detail-section-title h3 small { display:inline;margin-left:10px;font-size:10px;color:var(--muted-foreground);font-weight:400 }
+.perp-detail-section-title>span { font-size:10px;color:var(--muted-foreground) }
+.perp-scenario-controls { display:grid;grid-template-columns:minmax(130px,190px) minmax(130px,190px) 1fr;gap:18px;align-items:end;margin-bottom:18px }
+.perp-scenario-controls>label { display:flex;flex-direction:column;gap:7px;min-width:0;font-size:11px;color:var(--muted-foreground) }
+.perp-scenario-controls :is(input,select) { width:100%;border:1px solid var(--border);background:var(--card);color:var(--foreground);border-radius:4px;padding:8px 10px;min-height:38px;font-size:13px }
+.perp-scenario-controls>div { justify-self:end;text-align:right }
+.perp-scenario-controls>div>span { display:block;font-size:11px;color:var(--muted-foreground) }
+.perp-scenario-controls>div>strong { display:block;font-size:24px;font-weight:600;margin:4px 0 }
+.perp-scenario-controls>div>small { display:block;font-size:10px;color:var(--muted-foreground) }
+.perp-scenario-breakdown { display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:16px 0 }
+.perp-scenario-breakdown dt { font-size:10px;color:var(--muted-foreground) }
+.perp-scenario-breakdown dd { font-size:14px;margin:6px 0 0;color:var(--foreground) }
+.perp-settlement-legs { display:grid;grid-template-columns:1fr 1fr;gap:18px;border-top:1px solid var(--border);padding-top:14px }
+.perp-settlement-legs>div { display:flex;flex-direction:column;gap:6px }
+.perp-settlement-legs strong { font-size:12px;font-weight:500;color:var(--chart-2) }
+.perp-settlement-legs span { font-size:11px;color:var(--chart-2) }
+.perp-settlement-legs small { font-size:10px;color:var(--muted-foreground) }
+.perp-scenario-reasons { font-size:11px;color:var(--warning);padding-left:17px;line-height:1.8;margin-top:12px }
+.perp-scenario-assumptions { font-size:10px;color:var(--muted-foreground);margin-top:14px;line-height:1.8 }
+.perp-scenario-assumptions summary { cursor:pointer;min-height:26px;color:var(--chart-2) }
+.perp-scenario-assumptions p { margin:7px 0 }
 @media(min-width:701px) {
   .perp-table thead th { position:sticky;top:0;z-index:1 }
   .perp-table-wrap { overflow:clip }
@@ -204,6 +263,19 @@
   .perp-detail-navigation [role=tab] { font-size:12px;padding-top:14px }
   .perp-inspection-bar { padding:10px 12px;align-items:flex-start;font-size:10px;gap:10px }
   .perp-inspection-bar button { font-size:10px;min-height:36px;padding:6px }
+  .perp-holding { margin:12px;padding:15px 0 }
+  .perp-detail-section-title { flex-wrap:wrap;gap:6px }
+  .perp-detail-section-title h3 { font-size:13px }
+  .perp-detail-section-title h3 small { display:block;margin:5px 0 0 }
+  .perp-scenario-controls { grid-template-columns:1fr 1fr;gap:12px }
+  .perp-scenario-controls>div { grid-column:1/-1;justify-self:stretch;text-align:left;border-top:1px solid var(--border);padding-top:12px }
+  .perp-scenario-controls>div>strong { font-size:26px }
+  .perp-scenario-controls :is(input,select) { font-size:16px;min-height:42px }
+  .perp-scenario-breakdown { grid-template-columns:1fr 1fr;gap:15px }
+  .perp-scenario-breakdown dt { font-size:11px }
+  .perp-scenario-breakdown dd { font-size:14px }
+  .perp-settlement-legs { grid-template-columns:1fr;gap:14px }
+  .perp-settlement-legs small { font-size:10px }
 }
 .perp-fx-details { font-size:11px;color:var(--muted-foreground);margin:-5px 0 14px;line-height:1.8 }
 .perp-fx-details summary { cursor:pointer;min-height:30px }

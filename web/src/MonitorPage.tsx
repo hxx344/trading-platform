@@ -7,6 +7,7 @@ import { SpreadChart, date, stamp } from './MonitorChart.tsx';
 import { disabledNotice, parseControl, parseControls, switchFailure, switchLabel, toggleBody, type MonitorControls } from './monitor-control.ts';
 import { HynixPanel } from './MonitorHynix.tsx';
 import { OilPanel } from './MonitorOil.tsx';
+import { PerpetualPanel } from './MonitorPerpetual.tsx';
 import { StatePanel } from './StateViews.tsx';
 import { useLiveResource } from './use-live-resource.ts';
 import './monitor.css';
@@ -47,7 +48,7 @@ const notReady = (error: Error | null) => error instanceof ApiError && error.sta
 // Validation errors are internal English text; only the service's (Chinese) messages are shown as they are.
 const readable = (error: Error, fallback: string) => /[一-鿿]/.test(error.message) ? error.message : fallback;
 
-const MARKET_TABS: Record<string, string> = { anthropic: 'Anthropic', oil: '原油', hynix: '海力士' };
+const MARKET_TABS: Record<string, string> = { anthropic: 'Anthropic', oil: '原油', hynix: '海力士', perpetual: '合约价差' };
 const TAB_KEY = 'monitor:market:v1';
 const savedTab = () => { try { return localStorage.getItem(TAB_KEY); } catch { return null; } };
 
@@ -99,7 +100,7 @@ export function MonitorPage({ onExpired }: { onExpired: () => void }) {
       {failed && <p className="hub-control-notice" role="alert">{switchError.text}</p>}
       {control?.error && <p className="hub-control-notice" role="alert">{control.error}</p>}
       {off ? <p className="notice" role="status">{disabledNotice(active)}</p>
-        : active === 'oil' ? <OilPanel onExpired={onExpired} /> : active === 'hynix' ? <HynixPanel onExpired={onExpired} /> : shares && <AnthropicPanel outstanding={shares.outstanding} diluted={shares.diluted} onExpired={onExpired} />}
+        : active === 'oil' ? <OilPanel onExpired={onExpired} /> : active === 'hynix' ? <HynixPanel onExpired={onExpired} /> : active === 'perpetual' ? <PerpetualPanel onExpired={onExpired} /> : shares && <AnthropicPanel outstanding={shares.outstanding} diluted={shares.diluted} onExpired={onExpired} />}
     </div></div>
   </div>;
 }

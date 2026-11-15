@@ -66,7 +66,7 @@ test('取舍与计划：没有或过期则导入，同一个或本服务到期�
   assert.deepEqual(decideVariationalImport({ ...later, problem: '本服务的 Var token 已过期' }, { token, expiry }), { write: true, replaces: true });
 
   const source = { token, expiresAt: new Date(expiry).toISOString() };
-  const config = { monitor: { anthropic: {}, oil: {}, hynix: {} } };
+  const config = { monitor: { anthropic: {}, oil: {}, hynix: {}, perpetual: {} } };
   assert.equal(planMonitorVariational(source, none, null, {}).item.detail, '行情监控未启用，Var token 不导入');
   assert.equal(planMonitorVariational(source, none, null, { monitor: { anthropic: {} } }).item.detail, '本服务的行情监控没有原油价差，Var token 不导入');
   assert.deepEqual(planMonitorVariational({ token: null, problem: '工作台没有保存 Var token' }, null, null, config).item.status, 'skipped');
@@ -188,7 +188,7 @@ test('导入助手：预览列出 Var token；勾选后写入、不改配置不�
     for (const path of [conf, dir, join(f.root, 'proc')]) mkdirSync(path, { recursive: true });
     writeFileSync(join(f.root, 'workbench.env'), `DATA_DIR=${f.wb}\n`);
     const configFile = join(conf, 'config.json'), secretsFile = join(conf, 'secrets.json');
-    const config = fileText({ secretsFile, pairs: [], monitor: { anthropic: {}, oil: {}, hynix: {} } });
+    const config = fileText({ secretsFile, pairs: [], monitor: { anthropic: {}, oil: {}, hynix: {}, perpetual: {} } });
     writeFileSync(secretsFile, fileText({ accounts: {} }), { mode: 0o600 });
     writeFileSync(configFile, config, { mode: 0o600 });
     const restarts: number[] = [], logs: string[] = [];

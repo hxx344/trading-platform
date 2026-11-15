@@ -115,7 +115,7 @@ export interface ServiceViews {
       snapshot(): unknown; summary(): unknown; stream(request: IncomingMessage, response: ServerResponse): void;
       /** M-5a: one-shot public depth, the close estimate and the FX rates; refusals carry an HTTP `status`. */
       depth?(input: unknown): Promise<unknown>; exit?(input: unknown): Promise<unknown>; fx?(): Promise<unknown>; marketMetrics?(input: unknown): Promise<unknown>;
-      fundingHistory?(input: unknown): Promise<unknown>; scannerData?(input: unknown): Promise<unknown>;
+      fundingHistory?(input: unknown): Promise<unknown>; scannerData?(input: unknown): Promise<unknown>; priceHistory?(input: unknown): Promise<unknown>;
     } | undefined;
   };
   /** The options module's reads and writes (service/options.ts); absent when the service runs no options module. */
@@ -352,19 +352,21 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     // M-5b1: metrics (POST) — the cached 24h volume and open interest of up to 30 pairs, registered for the 30 s refresh.
     // M-5b2: funding-history and scanner-data (POST) — the cached settled-funding histories, and the range filters' and full
     // sorting's summary (metrics plus net window totals), of up to 30 pairs each.
-    const inspection = /^\/api\/monitor\/perpetual\/(depth|exit|fx|metrics|funding-history|scanner-data)$/.exec(url.pathname)?.[1];
+    // M-5c: price-history (POST) — the cached hourly trade closes of one pair's two legs for the pair chart.
+    const inspection = /^\/api\/monitor\/perpetual\/(depth|exit|fx|metrics|funding-history|scanner-data|price-history)$/.exec(url.pathname)?.[1];
     if (inspection && request.method === (inspection === 'fx' ? 'GET' : 'POST')) {
       if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
       const perpetual = views.monitor.state().markets.includes('perpetual') ? views.monitor.perpetual?.() : undefined;
       const read = inspection === 'fx' ? perpetual?.fx?.bind(perpetual) : inspection === 'depth' ? perpetual?.depth?.bind(perpetual) : inspection === 'metrics' ? perpetual?.marketMetrics?.bind(perpetual)
-        : inspection === 'funding-history' ? perpetual?.fundingHistory?.bind(perpetual) : inspection === 'scanner-data' ? perpetual?.scannerData?.bind(perpetual) : perpetual?.exit?.bind(perpetual);
+        : inspection === 'funding-history' ? perpetual?.fundingHistory?.bind(perpetual) : inspection === 'scanner-data' ? perpetual?.scannerData?.bind(perpetual)
+        : inspection === 'price-history' ? perpetual?.priceHistory?.bind(perpetual) : perpetual?.exit?.bind(perpetual);
       if (!read) return send(response, 404, { code: 'not_found', message: '本服务没有配置合约价差行情监控' });
       const body = inspection === 'fx' ? undefined : await readJson(request);
       try { return send(response, 200, await read(body)); }
       catch (error) {
         const status = (error as { status?: unknown })?.status;
         const code = status === 429 ? 'rate_limited' : status === 409 ? 'identity_changed' : status === 400 ? 'invalid_request' : status === 503 ? 'unavailable' : status === 500 ? 'internal_error' : 'upstream_error';
-        return send(response, typeof status === 'number' && status >= 400 && status < 600 ? status : 502, { code, message: error instanceof Error ? error.message : inspection === 'metrics' ? '市场指标读取失败' : inspection === 'funding-history' ? '历史资金费读取失败' : inspection === 'scanner-data' ? '筛选数据读取失败' : '盘口查询失败' });
+        return send(response, typeof status === 'number' && status >= 400 && status < 600 ? status : 502, { code, message: error instanceof Error ? error.message : inspection === 'metrics' ? '市场指标读取失败' : inspection === 'funding-history' ? '历史资金费读取失败' : inspection === 'scanner-data' ? '筛选数据读取失败' : inspection === 'price-history' ? '成交价历史读取失败' : '盘口查询失败' });
       }
     }
     const alertRoute = /^\/api\/monitor\/(oil|hynix)\/alerts(\/test)?$/.exec(url.pathname);

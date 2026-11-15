@@ -4,7 +4,9 @@
 // one venue the service reads over WebSocket (Lighter) refuses at once. The market metrics (M-5b1) answer Binance, Bybit and
 // Hyperliquid's batch tickers and open interest; OKX and Lighter fail, so the page shows its failure state too. The settled
 // funding histories (M-5b2) answer Binance and Bybit (8-hourly) and Hyperliquid (hourly) with a stable rate per base and
-// time, paged as the venues page; OKX and Lighter fail likewise.
+// time, paged as the venues page; OKX and Lighter fail likewise. The hourly trade closes (M-5c) answer Binance, Bybit and
+// Hyperliquid's candles around each base's opening price with a per-venue offset and a slow swing; OKX fails, Lighter is not a
+// venue the reader supports.
 import type { PerpetualOptions } from '../src/monitor/perpetual.ts';
 import type { PerpetualMarket, PerpetualUpdate } from '../src/vendor/perpetual-stream.mjs';
 
@@ -127,6 +129,28 @@ export function fakePerpetualVenues(): PerpetualOptions {
     }
     throw new Error(`preview: no stand-in for ${url.hostname}${url.pathname}`);
   };
+  const opening = new Map(prices);
+  const close = (venue: string, base: string, open: number) => (opening.get(base) ?? 1) * (1 + ({ binance: 0, bybit: 0.0008, hyperliquid: -0.0005 }[venue] ?? 0)
+    + 0.004 * Math.sin(open / HOUR / 17) + 0.0006 * Math.sin(open / HOUR / 3 + venue.length));
+  // Closed and current hours only, as the venues answer (the reader drops the open one).
+  const opens = (from: number, to: number) => times(from, Math.min(to, Math.floor(Date.now() / HOUR) * HOUR), HOUR);
+  const priceFetch = async (input: string, init?: RequestInit): Promise<Response> => {
+    const url = new URL(input), params = url.searchParams;
+    if (url.hostname === 'fapi.binance.com' && url.pathname === '/fapi/v1/klines') {
+      const symbol = params.get('symbol') ?? '';
+      return json(opens(Number(params.get('startTime')), Number(params.get('endTime'))).slice(0, Number(params.get('limit'))).map(open => [open, '0', '0', '0', String(close('binance', baseOf(symbol), open)), '0', open + HOUR - 1]));
+    }
+    if (url.hostname === 'api.bybit.com' && url.pathname === '/v5/market/kline') {
+      const symbol = params.get('symbol') ?? '';
+      const list = opens(Number(params.get('start')), Number(params.get('end'))).slice(0, Number(params.get('limit'))).reverse().map(open => [String(open), '0', '0', '0', String(close('bybit', baseOf(symbol), open)), '0', '0']);
+      return json({ retCode: 0, result: { symbol, category: 'linear', list } });
+    }
+    if (url.hostname === 'api.hyperliquid.xyz' && init?.body) {
+      const body = JSON.parse(String(init.body)) as { type: string; req: { coin: string; startTime: number; endTime: number } };
+      if (body.type === 'candleSnapshot') return json(opens(body.req.startTime, body.req.endTime).map(open => ({ t: open, T: open + HOUR - 1, s: body.req.coin, i: '1h', c: String(close('hyperliquid', body.req.coin, open)) })));
+    }
+    throw new Error(`preview: no stand-in for ${url.hostname}${url.pathname}`);
+  };
   class RefusingSocket {
     on(type: string, listener: (data?: unknown) => void): void { if (type === 'error') setTimeout(() => listener(), 0); }
     send(): void { /* Never opens. */ }
@@ -144,5 +168,6 @@ export function fakePerpetualVenues(): PerpetualOptions {
     execution: { fetchImpl, WebSocketImpl: RefusingSocket },
     metrics: { fetchImpl: metricsFetch },
     fundingHistory: { fetchImpl: fundingFetch },
+    priceHistory: { fetchImpl: priceFetch },
   };
 }

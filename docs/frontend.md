@@ -497,3 +497,21 @@
 **验证**：替身后端（替身资金费历史：Binance、Bybit、Hyperliquid 给结算，OKX 与 Lighter 失败），无头浏览器 1280 与 390 宽度：默认范围迁移与存储、无效金额提示、成交额与 24h 历史范围的待采集到匹配、全部清除与收起后焦点、7 天历史与空腿成交额的全量排序、详情的四个窗口与双腿明细；无横向溢出，控制台只有未配置模块的入口探测 404。
 
 **回滚**：`sudo bash install.sh --version v0.39.0`，不用改配置。
+
+### M-5c 补充（v0.41.0）：价差图表工作区
+
+**对照的工作台页面**：`app/perpetual-chart.tsx`、`perpetual-chart.css`，`app/perpetual-panel.tsx` 的工作区导航、组合单元格按钮、整行点击、详情的「创建价差图表 · 资金费稳定度」按钮与图表 URL 状态，`hooks/use-perpetual-price-history.ts`（提交 `c84ba27`）。
+
+**页面**：合约价差标题下「发现机会 / 创建价差图表」两个工作区；组合单元格（按钮）、整行（按钮、链接、输入框除外）与展开详情的按钮打开图表，窗口沿用上次选择（默认 7 天）；图表组件 `PerpetualChart.tsx` 按需加载（单独分块），含交换多空、复制链接、返回机会、3 / 7 / 30 天窗口；图表工作区时标题右侧的刷新按钮隐藏，机会列表的读取暂停。
+
+**与工作台的差别**：
+- 地址：图表状态用工作台同名查询参数，放在 hash 路由 `#/monitor` 之前；`MonitorPage.tsx` 先认 `?monitor=perpetual`，前进后退时按它切回市场；切到别的市场时用 `replaceState`、离开图表时用 `pushState` 连同 `monitor` 一起去掉图表参数（工作台离开图表保留 `?monitor=perpetual`）。
+- 图表分块外加 `LazyBoundary`（`web/src/LazyBoundary.tsx`），加载失败就地提示刷新，不整页卸载。
+- 两个 hook 走 `api()`，图表组件多一个 `onExpired` 属性（401 转登录）。
+- 不搬：持仓跟踪工作区（M-5e）、价差趋势（M-5d），CrossEx 导入列（M13）不在本仓库，所以行点击的排除列表没有 `[data-crossex-import]`。
+
+**样式**：`perpetual-chart.css` 原样复制（规则只供图表组件用）；`perpetual.css` 按工作区导航、组合单元格按钮与可点击行重新过滤（约 540 行）。
+
+**验证**：替身后端（替身 K 线：Binance、Bybit、Hyperliquid；Lighter 等不支持），无头浏览器 1280 与 390 宽度：组合单元格开图（焦点落到图表标题）、交换多空、30 天窗口、复制链接、刷新后恢复、后退回上一窗口、返回机会、导航回到上次的图表、无效链接的空态、整行点击开图；两腿都有 K 线的组合画出价差、两腿成交价、累计与日净资金费；两种宽度无横向溢出。未与运行中的工作台并排截图。
+
+**回滚**：`sudo bash install.sh --version v0.40.0`，不用改配置。

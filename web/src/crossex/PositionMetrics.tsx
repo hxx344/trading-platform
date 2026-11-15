@@ -1,4 +1,5 @@
 import { lazy, Suspense } from 'react';
+import { LazyBoundary } from '../LazyBoundary.tsx';
 import Decimal from './decimal.mjs';
 import type { PositionGroup } from './live-types.ts';
 import type { PositionSample } from './position-history.ts';
@@ -53,7 +54,7 @@ export function PositionMetricsDetails({ group, now, samples, stale }: { group: 
           <div><dt>价差收益率</dt><dd className={amountClass(m.spreadReturnRatio)}>{percentage(m.spreadReturnRatio)}</dd></div>
         </dl>
         <p className="metrics-note">价差 =（空头价格 − 多头价格）/ 多头价格；收益率以开仓多头名义额计，不含交易费。</p>
-        <Suspense fallback={<p className="metrics-note">正在加载趋势…</p>}><PositionCharts kind="spread" samples={samples}/></Suspense>
+        <LazyBoundary what="趋势图" className="metrics-note"><Suspense fallback={<p className="metrics-note">正在加载趋势…</p>}><PositionCharts kind="spread" samples={samples}/></Suspense></LazyBoundary>
       </section>
       <section className="position-detail-block" aria-label={`${group.base} 资金费分析`}><h3>资金费收益</h3>
         <dl className="position-metric-values">
@@ -76,7 +77,7 @@ export function PositionMetricsDetails({ group, now, samples, stale }: { group: 
         <div><dt>最大回撤</dt><dd>— <small>需要完整持仓净值历史</small></dd></div>
         <div><dt>资金费反转概率</dt><dd>— <small>缺少历史样本与概率模型</small></dd></div>
       </dl>
-      <div className="position-composition"><h4>收益构成</h4><p><span>价差收益</span><Amount value={m.spreadReturn} currency={m.currency}/></p><p><span>资金费收益</span><Amount value={m.fundingFee} currency={m.currency}/></p><p><span>合计</span><Amount value={m.totalReturn} currency={m.currency}/></p>{canShowComposition ? <Suspense fallback={null}><PositionCharts kind="composition" values={[m.spreadReturn!, m.fundingFee!]}/></Suspense> : <small className="metrics-note">存在亏损、零收益或缺失项时，按带符号金额展示构成。</small>}</div>
+      <div className="position-composition"><h4>收益构成</h4><p><span>价差收益</span><Amount value={m.spreadReturn} currency={m.currency}/></p><p><span>资金费收益</span><Amount value={m.fundingFee} currency={m.currency}/></p><p><span>合计</span><Amount value={m.totalReturn} currency={m.currency}/></p>{canShowComposition ? <LazyBoundary what="收益构成图" className="metrics-note"><Suspense fallback={null}><PositionCharts kind="composition" values={[m.spreadReturn!, m.fundingFee!]}/></Suspense></LazyBoundary> : <small className="metrics-note">存在亏损、零收益或缺失项时，按带符号金额展示构成。</small>}</div>
       <p className="metrics-note metrics-method">综合年化 =（价差收益 + 累计资金费）/ 当前占用保证金 / 持仓天数 × 365，不含已实现盈亏与交易费。时长从最早的当前持仓腿计起，增减仓或保证金变化会影响指标，短时持仓的年化可能明显放大。三项规则观察从 100 分起：价差绝对幅度较开仓收窄超过 30% 扣 30 分，持仓超过 7 天扣 20 分，当前持仓方向净资金费为负扣 25 分；≥70、≥40、低于 40 分别以绿、黄、红标示。该分值只反映这三项规则，不是综合风险评估；当前净费率为负不代表已确认发生历史变号。</p>
     </div></details>
   </div>;

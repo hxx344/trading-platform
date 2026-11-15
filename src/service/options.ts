@@ -35,7 +35,7 @@ export type OptionsStartReason = 'locked' | 'unreachable' | 'key' | 'state' | 'o
 /** Said on the page (503) and in Feishu; the detail goes to the log only. */
 export const OPTIONS_START_REASONS: Readonly<Record<OptionsStartReason, string>> = {
   locked: '本机另一个进程正占用此 Bybit 期权账户（同一 UID 只能由一个服务运行）',
-  unreachable: '读不到 Bybit 账户信息（网络不通、Bybit 未在 30 秒内应答，或密钥无效）',
+  unreachable: '读不到 Bybit 账户信息（网络不通、Bybit 未在 30 秒内应答，或密钥无效、本服务器 IP 不在密钥白名单内），详见服务日志',
   key: 'Bybit 期权密钥没有通过启动检查（权限、IP 绑定、统一账户，或 UID 与 config.json options.accountId 不符），详见服务日志',
   state: 'options.sqlite 无法打开或期权状态无法恢复（例如属于另一个账户），详见服务日志',
   other: '期权模块启动失败，详见服务日志',
@@ -286,19 +286,23 @@ export function createOptionsSupervisor(config: OptionsConfig, credentials: Live
       rfqCancel: async body => current().rfqCancel(body),
     },
     async loop(context, { notifyOnce, notify: post }) {
+      // A message that cannot be queued (notify.sqlite full or busy) must not end the retries or keep the loops (and the
+      // engine's close at stop) from running.
+      const tell = (send: () => unknown) => { try { send(); } catch (error) { log(`期权启动消息未能入队：${describe(error)}`); } };
       let failed = false;
       while (!context.stopped() && !running) {
         if (problem) {
           failed = true;
           // One message per reason per process start: a retry failing the same way every minute stays quiet.
-          notifyOnce(`options:start:${problem.reason}:${startedAt}`, `【期权未启动】${OPTIONS_START_REASONS[problem.reason]}；ASTER 划转与 ADL 等其他模块照常运行，${every}`);
+          const reason = problem.reason;
+          tell(() => notifyOnce(`options:start:${reason}:${startedAt}`, `【期权未启动】${OPTIONS_START_REASONS[reason]}；ASTER 划转与 ADL 等其他模块照常运行，${every}`));
         }
         await context.pause(retryMs);
         if (context.stopped()) break;
         await start();
       }
       if (!running) return;
-      if (failed && !context.stopped()) { log('期权重试后已启动'); post('【期权已启动】重试后通过启动检查，开始轮询账户'); }
+      if (failed && !context.stopped()) { log('期权重试后已启动'); tell(() => post('【期权已启动】重试后通过启动检查，开始轮询账户')); }
       // Also when stopping: the loops end at once and the last one closes the engine (stops its tasks, cancels their orders).
       await Promise.all(optionsLoops(running.runtime, running.engine, context, log));
     },

@@ -23,9 +23,23 @@
 
 ## 审查结论
 
-（待独立审查）
+独立只读审查（每轮新开审查者，上下文与作者隔离），第 2 轮只复核第 1 轮的修复。
+
+已核实（第 1 轮）：期权失败时锁在 `prepareOptions` 内释放、库在监督器内关闭、不建引擎，视图第一步即 503，写请求在 `readJson` 之后、任何发送之前被拒；`attempt ??=` 与 `running` 保证同时只有一次启动、不会有两个引擎；中止检查到 `running` 赋值之间同步执行，没有竞态窗口；停服时已在运行的照常进入期权循环并 `engine.close()`；`runtime.ts` 在 drainMs 超时后仍等循环结束才进 `onStopped`；`startWired` 各失败路径都经 `releaseOil → stopOptions` 释放锁与库；消息缓存不丢不重；503 正文与飞书只用固定文字，细节只进日志；`options_unavailable` 只由监督器产生且 `running` 不会回退，`startRefused` 的改动安全；文档与代码一致；安装判据是“90 秒内正常监听”，“不再自动回退”成立。
+
+| 轮次 | 级别 | 问题 | 处理 |
+| --- | --- | --- | --- |
+| 1 | P2 | 重试成功后写“【期权已启动】”若抛错（notify.sqlite 满或忙），`loop` 在期权循环之前退出：对账等循环不跑，停服时也不 `engine.close()` | `notify` / `notifyOnce` 包 try/catch，失败只记日志 |
+| 1 | P2 | 失败期间 `notifyOnce` 抛错会结束 `loop`，期权不再重试 | 同上 |
+| 1 | P2 | issue 验收“Bybit 超时”“恢复需重新验证、不补发旧请求”没有专门用例，`ORDER_PATHS` 断言在没有进行中任务时空过 | 新增两条：启动检查超时（300 ms）；状态库带两条挂着的护翼单，失败后重试通过，断言任务 `stopRequested`、只有本服务发出的撤单、没有 `order/create`、交易所订单数不变 |
+| 1 | P3 | 测试在失败期间探测账户锁，可能与 150 ms 的重试互相抢锁 | 失败期间的锁探测改在重试间隔 60 s 的用例里做 |
+| 1 | P3 | Bybit 业务码拒绝（IP 未绑定 10010、密钥无效 10003）归为 unreachable，页面没提 IP | 原因文字补“本服务器 IP 不在密钥白名单内，详见服务日志”；按错误码细分登记，不在本批做 |
+| 1 | P3 | `locked` 的日志细节含完整 UID | 只进日志，与改前及 CrossEx 一致，不改 |
+| 1 | P3 | README、docs/options.md 写的 v0.48.0 须与发版一致 | 发版时核对 |
+| 1 | 待确认 | 期权账户锁冲突按“只停期权”处理，偏离 issue 验收“共享锁冲突仍拒绝”的字面 | 理由见“变更前对齐”；在 issue 里说明，请作者确认 |
 
 ## 已运行
 
 - `pnpm check` 通过；`pnpm build:web` 通过。
-- `node --test test/options-isolation.test.ts test/options-form.test.ts`：全部通过。四个服务级故障注入：Bybit 不通后恢复；密钥被拒反复重试只提醒一次、状态库属于另一账户；账户被另一进程占用后释放；停服时进行中的启动检查立即放弃。
+- 第 1 轮修复后：`node --test test/options-isolation.test.ts test/options-form.test.ts test/options.test.ts test/import-options.test.ts test/crossex-service.test.ts test/service.test.ts` 全部通过。`options-isolation` 六个服务级故障注入：Bybit 不通后恢复；密钥被拒反复重试只提醒一次、状态库属于另一账户；账户被另一进程占用后释放；停服时进行中的启动检查立即放弃；启动检查超时；带进行中任务的状态在重试通过后恢复且不补发下单。
+- 本机全套 `pnpm test`：15 分钟超时被终止，卡在 `test/service.test.ts`（不涉及期权）；该文件单独运行 19 项全部通过，几秒完成。本机高负载下的已知不稳定现象，全套以 CI 两个分片为准（见下）。

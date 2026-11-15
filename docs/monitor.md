@@ -20,7 +20,8 @@
 - M-5c（成交价历史与价差图表：图表工作区、两腿成交价与价差、资金费稳定度、可分享的图表链接）随 v0.41.0；替身交易所验证（见 M-5c 实施记录）。
 - M-5d1（手续费与滑点设置、持有期情景、资金费模式的未来 24h 情景）随 v0.42.0；替身交易所验证（见 M-5d1 实施记录）。
 - M-5d2（质量采样与质量依据：质量列、「质量依据」页签、价差趋势、读取说明）随 v0.43.0；替身交易所验证（见 M-5d2 实施记录）。
-- 未开始：M-5e–M-5f、M-6（见下表与「M-5」节）。
+- M-5e1（模拟与手工持仓跟踪：平仓页签的登记、持仓跟踪工作区、数据目录 `perpetual-paper-positions.json`）随 v0.44.0；替身交易所验证（见 M-5e1 实施记录）。
+- 未开始：M-5e2、M-5f、M-6（见下表与「M-5」节）。
 - M-1 没做：成交标记、股数从交易中心同步、概览卡片与告警（均线 / 布林带 / Z-score 随 M-2e 补上）。
 
 ## 批次
@@ -641,7 +642,8 @@ CEX 最多 32 页。
 | M-5c | 价格历史与价差图（price-history、price-reader、图表工作区；资金费稳定度读 M-5b2 的资金费历史） | 同一文件的 `price_history_cache` | M-5b2 |
 | M-5d1 | 手续费与滑点预算设置、持有期情景（含资金费模式下展开详情的未来 24h 情景），只改页面 | 浏览器本地存储（同工作台键） | M-5a |
 | M-5d2 | 质量采样与质量依据（quality：含 CoinGecko 与多空比请求）、质量列、价差趋势 | 同一文件的 `quality_samples` | M-5b1（缓存库、列与排序框架）、M-5d1 |
-| M-5e | 模拟与手工持仓跟踪（paper）：展开详情「平仓与跟踪」的登记、持仓跟踪工作区 | `monitor_state` 的一个键 | M-5a |
+| M-5e1 | 模拟与手工持仓跟踪（paper）：展开详情「平仓与跟踪」的登记、持仓跟踪工作区 | 数据目录 `perpetual-paper-positions.json`（同工作台的单文件） | M-5a |
+| M-5e2 | 从工作台导入持仓记录（设置页面板与命令行） | 同上 | M-5e1 |
 | M-5f | 机会列表 v1/v2、现货划转证据、CrossEx 设置（opportunities、spot-transfer、crossex-settings） | 待定 | M-5a（汇率） |
 
 CrossEx 的机会来源（C5）与导入预填属 M13，按 R3 单独做（见 [crossex.md](crossex.md)）。
@@ -835,3 +837,33 @@ CrossEx 的机会来源（C5）与导入预填属 M13，按 R3 单独做（见 [
 - 测试：移植 `test/perpetual/{quality,quality-service,fundamentals,positioning,positioning-summary}.test.mjs` 与 `web/test/perpetual/{quality-cache,quality-feed}.test.mjs`（只改导入；`quality-service` 里一处用例把工作台的报价表读写换成本仓库的 `saveContractMetrics` / `loadContractMetrics`，见文件头）；工作台依赖其整体 HTTP 的用例（如“quality POST retains shared HTTP authentication”）不搬，由 `test/monitor-perpetual-quality.test.ts` 改测本仓库采集器、缓存表与接口。
 - 启动时的空分钟：本仓库关闭时清空报价、重启后不恢复报价（工作台从 `market.sqlite` 恢复），恢复样本结束时取的那一分钟是空样本，第一个有效样本要等下一分钟；不影响统计（这段时间本来就没有报价）。
 - 两份副本：`perpetual-spreads.ts`、`perpetual-fees.ts`、`perpetual-types.ts` 在 `src/vendor/` 与 `web/src/` 各有一份（内容相同），页面的质量计算经 `src/vendor/perpetual-quality.ts` 用前者，排名用后者；更新工作台版本时两份一起换（审查登记，后续让页面直接引用 `src/vendor/`）。
+
+### M-5e1：模拟与手工持仓跟踪
+
+**对照**：工作台 `server/perpetual-paper-service.mjs`、`server/perpetual-paper-store.mjs`、`lib/perpetual-paper.ts`、`server/perpetual-service.mjs`（paper 的建立、启停、`paper.check()` 与 `paper` 动作）、`server/monitor-services.mjs`（打开 `perpetual/paper-positions.json`）、`app/perpetual-paper.tsx`、`app/perpetual-paper.css`、`app/perpetual-exit.tsx`（「模拟仓位 / 手工登记已有持仓」与登记按钮）、`app/perpetual-panel.tsx`（「持仓跟踪」工作区、`perpView=positions`、登记后切到持仓跟踪）、`lib/polling.ts`、`lib/read-activity.ts`（提交 `c84ba27`）。
+
+**范围**：
+- 服务：采集器内建持仓跟踪服务（工作台三个文件原样复制）。至多 20 个活动、100 个已结束（保留 30 天）；开启期间每分钟用内存中的买卖一估算每个活动持仓的净收益（报价新鲜、两腿连接在线、来源时间相差不超过 5 秒才算有效），记最差观测、目标触达与超时，5 分钟一个采样点（活动至多 288 个、结束后压到 12 个）。不读交易账户、不下单、不联网；资金费只用手工登记的净额，跨结算时点提示核对。
+- 存放：数据目录 `perpetual-paper-positions.json`（工作台为 `<模块数据>/perpetual/paper-positions.json`，格式相同，`{ version: 1, revision, positions }`，1 MB 上限，600，先写临时文件再改名，写入串行、按 `revision` 乐观并发）。启动时同步读取并按工作台的 `validatePerpetualPaperState` 校验；文件坏了或过大时持仓跟踪不可用（页面写明原因），不覆盖原文件。
+- 接口：`GET /api/monitor/perpetual/paper`（读）与 `POST`（`create` / `update` / `close` / `delete`，带页面请求标记）；状态码沿用工作台（无效 400、版本冲突或登记编号复用 409、记录不存在 404、写盘失败或不可用 503），其余同其它合约价差接口（未配置 404、关闭 423）。登记带 `requestId`，丢失应答后重试得到同一条记录。
+- 页面：工作区导航加「持仓跟踪」（地址 `perpView=positions`）；展开详情「平仓与跟踪」页签恢复「模拟仓位 / 手工登记已有持仓」切换、目标净收益、最长持有时间、开仓时间与登记按钮，登记成功后切到持仓跟踪；持仓跟踪工作区：活动持仓卡片（当前一档估算、费用、资金费核对提示、最差观测、核验平仓盘口）、更新资金费与参数、登记平仓、停止跟踪、已结束记录与分页、删除；每 5 秒读一次，写入时让在途读取失效（L089），版本冲突时保留输入并可载入最新版本。
+
+**不搬**：工作台 `hubChanged()`（工作台外壳的跨模块刷新通知，本仓库没有）；从工作台导入持仓记录（M-5e2）；机会提醒与 CrossEx（M-5f / M13）。
+
+**影响面（R2）**：新增一个写本地文件的接口（只写数据目录里这一个 JSON，服务进程是唯一写者），与交易、凭据、`config.json`、`monitor.sqlite` 无关；常驻的分钟观测只读内存报价。页面新增一个工作区，平仓页签多出登记表单。
+
+**回滚**：`sudo bash install.sh --version v0.43.0`，不用改配置；旧版本不读 `perpetual-paper-positions.json`，文件留在数据目录无害，再升级时原样读回。
+
+**测试计划**：移植工作台 `tests/perpetual-paper.test.mjs`（只改导入；依赖工作台 HTTP 的用例改测本仓库接口）；补采集器接入（启停、分钟观测、连接在线判定）、存放（同步读取、坏文件不可用且不覆盖、原子写）、接口（登录、请求标记、状态码、关闭 423）。页面在替身后端上走查：登记模拟与手工持仓、切到持仓跟踪、更新资金费、登记平仓、停止、删除、两页面版本冲突，1280 与 390。
+
+
+#### M-5e1 实施记录（v0.44.0）
+
+按上面的计划实现，差别与补充：
+
+- 复制：工作台 `lib/perpetual-paper.ts` 原样复制到 `src/vendor/`，`perpetual-paper-service.mjs`、`perpetual-paper-store.mjs` 只改导入路径，补了 `.d.mts`（`getQuote` 用采集器自己的报价类型，同 `perpetual-depth.d.mts`）。exit、fees、spreads、types 四个已有副本核对过与工作台一致。
+- 存放：`src/monitor/perpetual-paper-store.ts` 同步打开（`statSync` / `readFileSync`，不建目录也不建文件，文件不存在即空状态）；保存照工作台（校验、1 MB 上限、写 `.tmp`（600）后改名、失败删临时文件），另外写之前先删掉残留的 `.tmp`，免得它的宽权限经改名带到正式文件。坏文件或过大：持仓跟踪不可用，原因写在页面上（「持仓记录无法读取，请修复或恢复 perpetual-paper-positions.json。」），日志记一行，原文件不动，监控其余部分照常启动。
+- 服务：`src/monitor/perpetual.ts` 建采集器时一并建持仓服务，随开关启停（停止纳入 `settled()` 的等待），停了可以再启动（工作台从不重启），持仓状态在采集器生命周期里保留；连接在线判定同工作台（该交易所有 `readyState === 1` 的连接）；`paper.check()` 挂在广播计时器上（服务内部按分钟节流）。采集器没在运行时写入回 503「合约价差采集未运行，开启后再登记或修改持仓」（工作台仍允许写；这里只会出现在启动空档或正在停止，开关关掉时接口先回 423），读取不拦，回 `running: false`。分钟观测写盘失败不打断广播，日志在开始失败和恢复时各记一行（工作台不记）；持仓服务的 `metrics()` 没接到状态页（本仓库没有工作台的诊断动作）。持仓跟踪属于合约价差监控，开关关掉时接口回 423，页面换成关闭提示，记录也看不到（文件不动，开启后照常读回）。
+- 接口：服务给的 400 / 404 / 409 / 503 原样回（code 依次为 `invalid_request` / `not_found` / `conflict` / `unavailable`）；平仓计算器的输入检查抛的是不带状态的普通 Error，按工作台回 400；其它异常回 500「持仓记录处理失败」。报错格式为本仓库的 `{ code, message }`（工作台为 `{ error }`）。
+- 页面：`PerpetualPaper.tsx` 与 `PerpetualExit.tsx` 的请求改走 `api()`（写入带页面请求标记，401 转登录，失败显示服务原因，409 照旧标记冲突）；去掉 `hubChanged()`；盘口测算用 `React.lazy` 加 `LazyBoundary`。轮询复制工作台 `lib/polling.ts` 为 `web/src/polling.ts`，宿主读权限按本服务独立打开的语义固定（同 `read-activity.ts`）。打开持仓跟踪时行情推送暂停（工作台的 `marketActive`）；工作区地址带 `?monitor=perpetual&perpView=positions`，回到「发现机会」或进入空的图表工作区时去掉（本页的链接规则，`monitor-link.ts` 的 `perpetualWorkspaceLink`，建在工作台的 `perpetualWorkspaceUrl` 上）；登记成功切到持仓跟踪不改地址，同工作台。
+- 测试：移植 `test/perpetual/paper.test.mjs`（15 项，只改导入；依赖工作台 HTTP 的一项删去；其中两项存放用例只验证工作台的异步存放副本）与 `web/test/perpetual/polling.test.mjs`（去掉 quote-service 的三项）；`monitor-link.test.mjs` 加持仓跟踪地址；新增 `test/monitor-perpetual-paper.test.ts`（存放的空、坏、过大、原子写与 600 权限、残留临时文件、目录不可写时不改文件与内存；写盘失败与恢复各记一行日志；采集器启停、分钟观测、连接断开时观测无效；接口的登录、请求标记、各状态码、未配置 404、关闭 423、`requestId` 重试幂等）。

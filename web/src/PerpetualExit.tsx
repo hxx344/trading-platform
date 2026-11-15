@@ -1,12 +1,13 @@
 // 改写自 project-aggregation 工作台 modules/monitor/app/perpetual-exit.tsx（提交 c84ba27）。改动：地址改为本服务的
-// /api/monitor/perpetual/exit，请求走 api.ts（带页面请求标记；401 转登录，失败给服务的原因）；lib 从 src/vendor 引入。
-// 本批（M-5a）只有测算：ExitWorkspace 去掉「模拟仓位 / 手工登记」切换与登记按钮（持仓跟踪属 M-5e），字段与默认值不变，
-// 默认按模拟起点（展开时快照的多腿卖一、空腿买一，1000 USDT）。
+// /api/monitor/perpetual/exit 与 /api/monitor/perpetual/paper，请求走 api.ts（写入带页面请求标记；401 转登录，失败给服务的
+// 原因）；去掉工作台宿主的 hubChanged；lib 从 src/vendor 引入。M-5a 只搬了测算，M-5e1 恢复「模拟仓位 / 手工登记」切换与
+// 登记按钮，字段、默认值、校验与幂等 requestId 与工作台相同。
 import { memo, useEffect, useId, useRef, useState } from "react";
 import { api, ApiError } from "./api.ts";
 import type { PerpetualQuote } from "./perpetual-types.ts";
 import { resolveTakerFee, type QualityBudget } from "./perpetual-fees.ts";
 import { exitEstimateExpired, perpetualExitIdentity, validatePerpetualExitPosition, type PerpetualExitEstimate, type PerpetualExitInput } from "../../src/vendor/perpetual-exit.ts";
+import type { PerpetualPaperView } from "../../src/vendor/perpetual-paper.ts";
 import "./perpetual-exit.css";
 
 const number = (value: number | null | undefined, digits = 4) => typeof value === "number" && Number.isFinite(value) ? value.toLocaleString("zh-CN", { maximumFractionDigits: digits }) : "—";
@@ -59,21 +60,52 @@ export const PerpetualExitCheck = memo(function PerpetualExitCheck(props: { inpu
   return <ExitCheck key={JSON.stringify(props.input)} {...props}/>;
 });
 
-type Props = { long: PerpetualQuote; short: PerpetualQuote; budget: QualityBudget; active: boolean; now: number; onExpired: () => void };
-function ExitWorkspace({ long, short, budget, active, now, onExpired }: Props) {
-  const id = useId();
+type Props = { long: PerpetualQuote; short: PerpetualQuote; budget: QualityBudget; active: boolean; now: number; onRegistered: () => void; onExpired: () => void };
+function ExitWorkspace({ long, short, budget, active, now, onRegistered, onExpired }: Props) {
+  const id = useId(), pending = useRef<AbortController | null>(null);
+  const registration = useRef<{ key: string; requestId: string; openedAt: number } | null>(null);
+  const [mode, setMode] = useState<"paper" | "manual">("paper");
   const initialQuantity = long.ask && long.ask > 0 ? 1000 / long.ask : 0;
   const longFee = resolveTakerFee(long, budget.takerOverrides, now), shortFee = resolveTakerFee(short, budget.takerOverrides, now);
   const initialFee = longFee.percent !== null && shortFee.percent !== null && long.ask && short.bid ? initialQuantity * (long.ask * longFee.percent + short.bid * shortFee.percent) / 100 : null;
-  const [fields, setFields] = useState({ quantity: initialQuantity ? String(Number(initialQuantity.toPrecision(10))) : "", entryLongPrice: long.ask ? String(long.ask) : "", entryShortPrice: short.bid ? String(short.bid) : "", entryFeePaid: initialFee === null ? "" : String(Number(initialFee.toPrecision(8))), settledFunding: "0", capital: "" });
+  const [fields, setFields] = useState({ quantity: initialQuantity ? String(Number(initialQuantity.toPrecision(10))) : "", entryLongPrice: long.ask ? String(long.ask) : "", entryShortPrice: short.bid ? String(short.bid) : "", entryFeePaid: initialFee === null ? "" : String(Number(initialFee.toPrecision(8))), settledFunding: "0", capital: "", targetNetProfit: "", maxHoldingHours: "", openedAt: "" });
+  const [busy, setBusy] = useState(false), [error, setError] = useState("");
+  useEffect(() => {
+    if (!active) pending.current?.abort();
+    const hide = () => { if (document.hidden) pending.current?.abort(); };
+    document.addEventListener("visibilitychange", hide);
+    return () => { pending.current?.abort(); document.removeEventListener("visibilitychange", hide); };
+  }, [active]);
   const supported = [long, short].every(quote => quote.quoteCurrency === "USDT" && (!quote.collateralCurrency || quote.collateralCurrency === "USDT"));
   const input: PerpetualExitInput = { long: { exchange: long.exchange, symbol: long.symbol }, short: { exchange: short.exchange, symbol: short.symbol }, identity: perpetualExitIdentity(long, short), quantity: amount(fields.quantity), entryLongPrice: amount(fields.entryLongPrice), entryShortPrice: amount(fields.entryShortPrice), entryFeePaid: amount(fields.entryFeePaid), settledFunding: amount(fields.settledFunding), capital: fields.capital.trim() ? amount(fields.capital) : null, takerOverrides: budget.takerOverrides };
+  async function register() {
+    if (busy || !active || document.hidden) return;
+    try { validatePerpetualExitPosition(input); } catch (cause) { setError((cause as Error).message); return; }
+    const registrationKey = JSON.stringify({ mode, fields, input });
+    const openedAt = registration.current?.key === registrationKey ? registration.current.openedAt : mode === "paper" ? now : Date.parse(`${fields.openedAt}:00+08:00`);
+    if (!Number.isFinite(openedAt) || openedAt > now + 5_000) { setError("请填写有效的开仓北京时间，不能晚于当前时间"); return; }
+    if (registration.current?.key !== registrationKey) registration.current = { key: registrationKey, requestId: globalThis.crypto?.randomUUID?.() ?? `paper-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 14)}`, openedAt };
+    const controller = new AbortController(); pending.current = controller; setBusy(true); setError("");
+    try {
+      const state = await api<PerpetualPaperView>("/api/monitor/perpetual/paper", { signal: controller.signal, timeoutMs: 8_000 });
+      if (!state.available) throw new Error(state.error || "持仓跟踪暂不可用");
+      await api<PerpetualPaperView>("/api/monitor/perpetual/paper", { signal: controller.signal, timeoutMs: 20_000, body: { revision: state.revision, action: "create", position: { ...input, mode, requestId: registration.current!.requestId, base: long.base, longKey: `${long.exchange}:${long.symbol}`, shortKey: `${short.exchange}:${short.symbol}`, openedAt, targetNetProfit: fields.targetNetProfit.trim() ? amount(fields.targetNetProfit) : null, maxHoldingHours: fields.maxHoldingHours.trim() ? amount(fields.maxHoldingHours) : null } } });
+      if (!controller.signal.aborted) onRegistered();
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 401) onExpired();
+      if (!controller.signal.aborted) setError(cause instanceof Error && cause.message ? cause.message : "登记失败");
+    }
+    finally { if (pending.current === controller) { pending.current = null; setBusy(false); } }
+  }
   return <section className="perp-exit-workspace" aria-labelledby={`${id}-heading`}>
-    <div className="perp-exit-heading"><div><h4 id={`${id}-heading`}>平仓收益测算</h4><p>多 {long.exchange} {long.symbol} / 空 {short.exchange} {short.symbol}</p></div><span>仅测算</span></div>
-    {!supported ? <p className="perp-exit-warning">当前仅支持两腿均以 USDT 计价、以 USDT 抵押的线性合约。此组合暂不测算，避免币种换算造成错误收益。</p> : <>
-      <p className="perp-exit-note">默认开仓价格来自当前展开时的快照，仅作测算起点，不代表实际成交。修改数量或价格后，请同时核对开仓费用。 数量统一为标的币数量，非合约张数；资金费收入填正数，支出填负数。</p>
-      <div className="perp-exit-fields">{([{ key: "quantity", label: `两腿相同数量 / ${long.base}`, required: true }, { key: "entryLongPrice", label: "多腿开仓均价 / USDT", required: true }, { key: "entryShortPrice", label: "空腿开仓均价 / USDT", required: true }, { key: "entryFeePaid", label: "已付开仓费用合计 / USDT", required: true }, { key: "settledFunding", label: "累计已结算资金费 / USDT", required: true }, { key: "capital", label: "两账户投入本金 / USDT" }] as const).map(field => <label key={field.key} htmlFor={`${id}-${field.key}`}><span>{field.label}</span><input id={`${id}-${field.key}`} type="number" step="any" inputMode="decimal" value={fields[field.key]} placeholder={'required' in field ? "必填" : "可选"} onChange={event => setFields(previous => ({ ...previous, [field.key]: event.target.value }))}/></label>)}</div>
+    <div className="perp-exit-heading"><div><h4 id={`${id}-heading`}>平仓收益与持仓跟踪</h4><p>多 {long.exchange} {long.symbol} / 空 {short.exchange} {short.symbol}</p></div><span>仅测算与登记</span></div>
+    {!supported ? <p className="perp-exit-warning">当前仅支持两腿均以 USDT 计价、以 USDT 抵押的线性合约。此组合暂不登记，避免币种换算造成错误收益。</p> : <>
+      <div className="perp-exit-mode" aria-label="登记方式">{([['paper', '模拟仓位'], ['manual', '手工登记已有持仓']] as const).map(([value, label]) => <button key={value} type="button" aria-pressed={mode === value} disabled={busy} onClick={() => { if (mode === value) return; setMode(value); setError(""); if (value === "manual") setFields(previous => ({ ...previous, entryLongPrice: "", entryShortPrice: "", entryFeePaid: "" })); }}>{label}</button>)}</div>
+      <p className="perp-exit-note">{mode === "paper" ? "默认开仓价格来自当前展开时的快照，仅作模拟起点，不代表实际成交。修改数量或价格后，请同时核对开仓费用。" : "填写两腿实际开仓均价与已付费用；时间按北京时间登记。系统不读取交易账户。"} 数量统一为标的币数量，非合约张数；资金费收入填正数，支出填负数。</p>
+      <div className="perp-exit-fields">{([{ key: "quantity", label: `两腿相同数量 / ${long.base}`, required: true }, { key: "entryLongPrice", label: "多腿开仓均价 / USDT", required: true }, { key: "entryShortPrice", label: "空腿开仓均价 / USDT", required: true }, { key: "entryFeePaid", label: "已付开仓费用合计 / USDT", required: true }, { key: "settledFunding", label: "累计已结算资金费 / USDT", required: true }, { key: "capital", label: "两账户投入本金 / USDT" }, { key: "targetNetProfit", label: "目标净收益 / USDT" }, { key: "maxHoldingHours", label: "最长持有时间 / 小时" }] as const).map(field => <label key={field.key} htmlFor={`${id}-${field.key}`}><span>{field.label}</span><input id={`${id}-${field.key}`} type="number" step="any" inputMode="decimal" disabled={busy} value={fields[field.key]} placeholder={'required' in field ? "必填" : "可选"} onChange={event => setFields(previous => ({ ...previous, [field.key]: event.target.value }))}/></label>)}{mode === "manual" ? <label htmlFor={`${id}-opened`}><span>开仓时间 / 北京时间</span><input id={`${id}-opened`} type="datetime-local" disabled={busy} value={fields.openedAt} onChange={event => setFields(previous => ({ ...previous, openedAt: event.target.value }))}/></label> : null}</div>
       <PerpetualExitCheck input={input} active={active} now={now} onExpired={onExpired}/>
+      <div className="perp-exit-register"><button type="button" disabled={busy || !active} onClick={() => void register()}>{busy ? "正在登记…" : mode === "paper" ? "加入模拟跟踪" : "登记持仓并跟踪"}</button><span>按缓存报价跟踪；深度仅手动查询。资金费需手工更新。</span></div>
+      {error ? <p role="alert" className="perp-exit-warning">{error}</p> : null}
     </>}
   </section>;
 }

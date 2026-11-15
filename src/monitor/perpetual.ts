@@ -17,8 +17,12 @@
 // minute (at most 1000 pairs, 24 hours kept in perpetual-cache.sqlite quality_samples and restored on start), CoinGecko
 // fundamentals of every comparable base in the background (checked each minute; the coin list kept 24 hours, market data 30
 // minutes, page or not) and the public long/short account ratios of the pairs a page read in the last 3 minutes; same life.
-// Left out (later batches, docs/monitor.md M-4/M-5): the saved quotes (market.sqlite), alerts,
-// paper trading, CrossEx filters. Quotes live in memory only; a restart or a switch-off starts from empty.
+// M-5e1 adds the workbench's paper-position service (perpetual-paper-service.mjs): simulated and manually registered positions
+// (at most 20 active, 100 ended for 30 days) kept in the data directory's perpetual-paper-positions.json
+// (src/monitor/perpetual-paper-store.ts), each active one valued once a minute from the in-memory books while the collector runs
+// (checked on the broadcast timer, throttled by the service); built once, started and stopped with the collector.
+// Left out (later batches, docs/monitor.md M-4/M-5): the saved quotes (market.sqlite), alerts, CrossEx filters.
+// Quotes live in memory only; a restart or a switch-off starts from empty.
 // Node's own WebSocket is used (it takes request headers); like fetch it goes through Node's global dispatcher, so with
 // NODE_USE_ENV_PROXY=1 and HTTPS_PROXY (README) both the directory reads and the sockets use the proxy.
 import { randomUUID } from 'node:crypto';
@@ -37,6 +41,9 @@ import { createPerpetualQualityService, type PerpetualQualityStore } from '../ve
 import { createFundamentalsClient, type FundamentalsClient } from '../vendor/perpetual-fundamentals.mjs';
 import { fetchPositioning, type PositioningFetch } from '../vendor/perpetual-positioning.mjs';
 import type { PerpetualQualityReport } from '../vendor/perpetual-quality.ts';
+import { createPerpetualPaperService, type PerpetualPaperStore } from '../vendor/perpetual-paper-service.mjs';
+import { PERPETUAL_PAPER_FILE } from './perpetual-paper-store.ts';
+import type { PerpetualPaperView } from '../vendor/perpetual-paper.ts';
 import type { PerpetualFundingHistoryReport } from '../vendor/perpetual-funding-history.ts';
 import type { PerpetualScannerDataReport } from '../vendor/perpetual-scanner-data.ts';
 import { createPerpetualMetricsReader } from '../vendor/perpetual-metrics-reader.mjs';
@@ -108,6 +115,11 @@ export interface PerpetualOptions {
   cache?: (PerpetualContractMetricsStore & Partial<PerpetualFundingHistoryStore> & Partial<PerpetualPriceHistoryStore> & PerpetualQualityStore) | null;
   /** M-5b1: set when the cache file could not be opened; every metrics report then carries it as its storageError. */
   cacheUnavailable?: string;
+  /**
+   * M-5e1: the paper-position records (perpetual-paper-positions.json, service/monitor.ts). Without a store the records are
+   * unavailable: reads show `unavailableReason`, writes answer 503 with it.
+   */
+  paper?: { store?: PerpetualPaperStore | undefined; unavailableReason?: string };
 }
 
 /** The quality service's refusals of an invalid batch (plain Errors there; the workbench's HTTP layer answers them 400). */
@@ -137,6 +149,7 @@ export function createPerpetualMonitor({
   staleAfterMs = PERPETUAL_STALE_MS, retryMs = 5_000, discoveryIntervalMs = PERPETUAL_DISCOVERY_MS, observationIntervalMs = PERPETUAL_OBSERVATION_MS,
   broadcastIntervalMs = PERPETUAL_OBSERVATION_MS, watchdogIntervalMs = 10_000, quoteTimeoutMs = 45_000, execution: executionOptions,
   metrics: metricsOptions, fundingHistory: fundingOptions, priceHistory: priceOptions, quality: qualityOptions, cache = null, cacheUnavailable,
+  paper: paperOptions,
 }: PerpetualOptions = {}) {
   const quotes = new Map<string, PerpetualQuote>(), pendingQuotes = new Map<string, PerpetualQuote>(), publishedQuotes = new Map<string, PerpetualQuote>(), publishDirty = new Set<string>();
   const connections = new Set<Connection>(), timers = new Set<ReturnType<typeof setTimeout>>(), pollBudgets = new Map<string, PollBudget>();
@@ -187,6 +200,12 @@ export function createPerpetualMonitor({
       clock, ...(qualityOptions?.coinIds ? { coinIds: qualityOptions.coinIds } : {}), ...(qualityOptions?.apiKey ? { apiKey: qualityOptions.apiKey } : {}), ...(qualityFetch ? { fetchImpl: qualityFetch } : {}),
     }),
     positioningFetch: qualityOptions?.positioningFetch ?? (qualityFetch ? (quote, options) => fetchPositioning(quote, { ...options, fetchImpl: qualityFetch }) : fetchPositioning),
+  });
+  // M-5e1: as the workbench's (perpetual-service.mjs): a leg is valued only while its venue has a connection open.
+  let paperHealthy = true;
+  const paper = createPerpetualPaperService({
+    store: paperOptions?.store, unavailableReason: paperOptions?.unavailableReason ?? (paperOptions?.store ? '' : '本服务没有配置持仓记录存放'),
+    getQuote: key => quotes.get(key), isVenueLive: id => [...connections].some(connection => connection.exchange === id && connection.socket?.readyState === 1), clock,
   });
   let metricsStopping: Promise<void> = Promise.resolve();
   // The cached reads (metrics, funding history, scanner data, price history, quality): 503 while stopped, the service's 400 for an invalid batch, any other failure 500; the cache's
@@ -446,11 +465,21 @@ export function createPerpetualMonitor({
         getQuote: (exchange, symbol) => quotes.get(`${exchange}:${symbol}`), getMarket: (exchange, symbol) => states.get(exchange)?.markets?.get(symbol),
         clock, ...(fetchImpl ? { fetchImpl } : {}), ...executionOptions,
       });
-      marketMetrics.start(); fundingHistory.start(); priceHistory.start(); quality.start();
+      marketMetrics.start(); fundingHistory.start(); priceHistory.start(); quality.start(); paper.start();
       if (observationIntervalMs > 0) { observationTimer = setInterval(observe, observationIntervalMs); observationTimer.unref?.(); }
       for (const exchange of states.keys()) void refresh(exchange);
       refreshTimer = setInterval(() => { for (const exchange of states.keys()) void refresh(exchange); }, discoveryIntervalMs);
-      broadcastTimer = setInterval(broadcast, broadcastIntervalMs);
+      // The workbench checks the paper positions on its broadcast timer too; the service observes at most once a minute.
+      broadcastTimer = setInterval(() => {
+        // A failed save keeps the broadcast going; the log gets one line when saving starts or stops failing (the page shows it too).
+        void paper.check().catch(() => undefined).then(() => {
+          const healthy = paper.healthy();
+          if (healthy === paperHealthy) return;
+          paperHealthy = healthy;
+          log(healthy ? `合约价差：持仓记录已恢复保存` : `合约价差：持仓记录保存失败（${PERPETUAL_PAPER_FILE}），保留最后成功保存的状态，恢复前不再记录`);
+        });
+        broadcast();
+      }, broadcastIntervalMs);
       refreshTimer.unref?.(); broadcastTimer.unref?.();
     },
     /**
@@ -461,7 +490,7 @@ export function createPerpetualMonitor({
       if (!running) return;
       running = false; closeStreams();
       execution?.stop(); execution = null;
-      metricsStopping = Promise.all([marketMetrics.stop(), fundingHistory.stop(), priceHistory.stop(), quality.stop()].map(stopping => stopping.catch(() => undefined))).then(() => undefined);
+      metricsStopping = Promise.all([marketMetrics.stop(), fundingHistory.stop(), priceHistory.stop(), quality.stop(), paper.stop()].map(stopping => stopping.catch(() => undefined))).then(() => undefined);
       for (const timer of [observationTimer, refreshTimer, broadcastTimer]) clearInterval(timer);
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
@@ -571,7 +600,21 @@ export function createPerpetualMonitor({
         catch (error) { throw error instanceof Error && QUALITY_INPUT_ERRORS.has(error.message) ? Object.assign(error, { status: 400 }) : error; }
       });
     },
-    /** M-5b1: resolves once the last stop has written the metrics and histories back (the cache file may close then). */
+    /**
+     * M-5e1: the paper positions (the workbench's paper GET): the records, each active one with its estimate from the current
+     * books. Readable while stopped (`running: false`, every estimate invalid); `available: false` with the reason without a store.
+     */
+    paperView: (): PerpetualPaperView => paper.view(),
+    /**
+     * M-5e1: create / update / close / delete a paper position at the view's revision (the workbench's paper POST); answers the
+     * new view. 503 while stopped; the service's refusals keep their `status` (400, 404, 409, 503), the exit calculator's plain
+     * input errors have none (the route answers them 400, as the workbench does).
+     */
+    async paperUpdate(input: unknown): Promise<PerpetualPaperView> {
+      if (!running) throw new PerpetualInspectionError(503, '合约价差采集未运行，开启后再登记或修改持仓');
+      return paper.update(input);
+    },
+    /** M-5b1/M-5e1: resolves once the last stop has written the metrics, histories and paper positions back (the cache file may close then). */
     settled: (): Promise<void> => metricsStopping,
   };
 }

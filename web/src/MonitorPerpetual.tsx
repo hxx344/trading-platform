@@ -24,7 +24,7 @@ import { PerpetualExecution } from './PerpetualExecution.tsx';
 import PerpetualExit from './PerpetualExit.tsx';
 import PerpetualManualPairs from './PerpetualManualPairs.tsx';
 import { perpetualChartUrl, readPerpetualChartSelection, type PerpetualChartSelection } from './perpetual-chart-state.ts';
-import { withoutMonitorLink } from './monitor-link.ts';
+import { perpetualWorkspaceLink } from './monitor-link.ts';
 import { LazyBoundary } from './LazyBoundary.tsx';
 import { classifyPerpetualQuote, createPerpetualQuoteSelector, createPerpetualRankingSelector, defaultPerpetualFilters, normalizedFunding8h, parsePerpetualPreferences, perpetualSpreadKey, quotePriceTime, type PerpetualFilters, type PerpetualSpread } from './perpetual-spreads.ts';
 import type { PerpetualExchange, PerpetualPairMode, PerpetualPriceMode, PerpetualQuote, PerpetualSnapshot } from './perpetual-types.ts';
@@ -41,9 +41,9 @@ import { ScannerFundingRate, ScannerHistory, ScannerLeg, ScannerMarketMetric, Sc
 // (the three history columns and the details' four windows), the range filters over every candidate pair with the summary
 // read behind them, and the full-set sorts by volume, open interest and history.
 // M-5c adds the chart workspace, M-5d1 the fee and slippage settings with the holding scenario, M-5d2 quality (its column,
-// the 质量依据 tab, the spread trend and the read caption).
-// Left out until later M-5 batches: the paper workspace, position registration, favourites and blocking, CrossEx, health,
-// alerts and push toggles.
+// the 质量依据 tab, the spread trend and the read caption), M-5e1 the 持仓跟踪 workspace (PerpetualPaper.tsx) with registration
+// from the 平仓收益 tab; the market feed stops while it is open, as in the workbench (marketActive).
+// Left out until later M-5 batches: favourites and blocking, CrossEx, health, alerts and push toggles.
 const scannerPreferencesKey = 'market-monitor:perpetual-scanner:v1';
 const preferencesKey = 'market-monitor:perpetual:v1';
 const scannerSortKey = 'market-monitor:perpetual-scanner-sort:v1';
@@ -145,10 +145,11 @@ const fxCurrencies = ['USDC', 'USD1', 'USDG', 'USD'];
 const PerpetualChart = lazy(() => import('./PerpetualChart.tsx'));
 const PerpetualHolding = lazy(() => import('./PerpetualHolding.tsx'));
 const PerpetualTrend = lazy(() => import('./PerpetualTrend.tsx'));
+const PerpetualPaper = lazy(() => import('./PerpetualPaper.tsx'));
 
 export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
-  // M-5c: the workbench's workspaces less positions (M-5e); the chart's pair and window are URL state (perpetual-chart-state.ts).
-  const [workspace, setWorkspace] = useState<'opportunities' | 'chart'>('opportunities');
+  // The workbench's three workspaces; the chart's pair and window and the positions view are URL state (perpetual-chart-state.ts).
+  const [workspace, setWorkspace] = useState<'opportunities' | 'positions' | 'chart'>('opportunities');
   const [chartSelection, setChartSelection] = useState<PerpetualChartSelection | null>(null);
   const [chartLinkError, setChartLinkError] = useState('');
   const opportunitiesActive = workspace === 'opportunities';
@@ -156,7 +157,7 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
   const [inspection, setInspection] = useState<{ key: string; base: string; snapshot: PerpetualSnapshot; ranking: PerpetualSpread[]; page: number } | null>(null);
   const [detailTab, setDetailTab] = useState<DetailTab>('execution');
   const paused = opportunitiesActive && inspection !== null;
-  const { data: liveData, connection, error, now, refresh } = usePerpetualFeed(onExpired, paused);
+  const { data: liveData, connection, error, now, refresh } = usePerpetualFeed(onExpired, paused || workspace === 'positions');
   const data = paused ? inspection.snapshot : liveData;
   const [filters, setFilters] = useState<PerpetualFilters>(() => parsePerpetualPreferences(readStored(preferencesKey)));
   const [scanner, setScanner] = useState<ScannerPreferences>(() => parseScannerPreferences(readStored(scannerPreferencesKey)));
@@ -190,7 +191,7 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
     window.addEventListener('storage', restore);
     return () => window.removeEventListener('storage', restore);
   }, []);
-  // M-5c: the workbench's URL restore, chart part (on load and on back / forward); positions come with M-5e.
+  // The workbench's URL restore, chart and positions parts (on load and on back / forward).
   useEffect(() => {
     const restore = () => {
       const params = new URL(window.location.href).searchParams;
@@ -200,7 +201,7 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
         setInspection(null); setWorkspace('chart');
         return;
       }
-      setWorkspace('opportunities'); setChartLinkError('');
+      setWorkspace(params.get('perpView') === 'positions' ? 'positions' : 'opportunities'); setChartLinkError('');
     };
     const timer = setTimeout(restore, 0); window.addEventListener('popstate', restore);
     return () => { clearTimeout(timer); window.removeEventListener('popstate', restore); };
@@ -334,10 +335,11 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
   function openChart(row: PerpetualSpread) {
     selectChart({ base: row.base, longKey: `${row.long.exchange}:${row.long.symbol}`, shortKey: `${row.short.exchange}:${row.short.symbol}`, days: chartSelection?.days ?? 7 });
   }
-  function leaveChart() {
-    setInspection(null); setWorkspace('opportunities');
-    // The workbench keeps ?monitor=perpetual here; this page drops it with the chart (monitor-link.ts).
-    const url = withoutMonitorLink(window.location.href);
+  function leaveChart(next: 'opportunities' | 'positions' = 'opportunities') {
+    setInspection(null); setWorkspace(next);
+    // The workbench keeps ?monitor=perpetual here; this page drops it with the chart, and sets it with perpView=positions so a
+    // positions link opens this market over the saved tab (monitor-link.ts).
+    const url = perpetualWorkspaceLink(window.location.href, next);
     if (url !== window.location.href) window.history.pushState(window.history.state, '', url);
   }
   function changeView(next: 'rank' | 'quotes') { setInspection(null); setView(next); setPage(1); }
@@ -368,10 +370,10 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
     ? scannerError || (rangeSelection.pending > 0 ? `正在为全部候选组合补齐筛选数据，仍有 ${rangeSelection.pending} 个组合待采集，完成后自动显示匹配项。` : rangeSelection.missing > 0 ? '现有有效数据未找到匹配组合；部分组合缺少所需数据或汇率，也可能已经过期。' : '没有组合满足当前范围，可以调整条件或全部清除。') : '';
   const emptyMessage = !scanner.categories.length ? '请选择至少一种资产类别。' : fullRanking.length > 0 && !ranking.length ? '当前类别下没有可比较组合；未核验类别可在“类别”中启用“未分类”。' : !data ? '正在获取交易所与合约报价…' : data.status === 'unavailable' ? '采集服务启动后，这里会显示实时合约价差。' : quotes.length === 0 ? '交易所正在连接，收到首批有效报价后自动更新。' : selected && selected.size < 2 ? '请至少选择两家交易所。' : fundingSort ? '当前筛选下没有可比较的资金费组合，可调整交易所。' : netSort && filters.priceMode === 'mark' ? '标记价仅供参考。切换买卖盘口可查看净价差排名。' : netSort ? '当前筛选下没有可比较的净价差组合，可切换毛价差核对。' : '当前筛选下没有有效价差。可以增加平台或切换报价口径。';
 
-  return <section className={`perpetual-panel perp-scanner${fundingSort && view === 'rank' ? ' is-funding-mode' : ''}`} aria-label="CEX 与 DEX 合约价差监控">
+  return <section className={`perpetual-panel${workspace !== 'positions' ? ' perp-scanner' : ''}${fundingSort && view === 'rank' ? ' is-funding-mode' : ''}`} aria-label="CEX 与 DEX 合约价差监控">
     <header className="perp-heading"><div><h2>合约价差套利</h2></div><div className="perp-heading-actions" hidden={workspace !== 'opportunities'}><button className="perp-refresh" type="button" onClick={() => paused ? setInspection(null) : refresh()} disabled={!paused && connection === 'paused'}><RefreshCw size={15} />{paused ? '收起并恢复' : '刷新'}</button></div></header>
-    <nav className="perp-workspace-nav" aria-label="合约价差工作区"><button type="button" aria-current={workspace === 'opportunities' ? 'page' : undefined} onClick={() => leaveChart()}>发现机会</button><button type="button" aria-current={workspace === 'chart' ? 'page' : undefined} onClick={() => { if (chartSelection) selectChart(chartSelection); else { setInspection(null); setWorkspace('chart'); } }}>创建价差图表</button></nav>
-    {workspace === 'chart' ? chartSelection ? <LazyBoundary what="组合图表" className="perp-empty"><Suspense fallback={<p role="status">正在加载组合图表…</p>}><PerpetualChart key={JSON.stringify([chartSelection.base, chartSelection.longKey, chartSelection.shortKey])} selection={chartSelection} snapshot={data} active now={now} onSelectionChange={selectChart} onBack={() => leaveChart()} connectionError={problem} onExpired={onExpired} /></Suspense></LazyBoundary> : <div className="perp-empty"><h3 id="perpetual-chart-heading" tabIndex={-1}>创建价差图表</h3><p>{chartLinkError || '从套利列表点击组合，自动带入做多和做空合约，查看价差与 3、7、30 天资金费稳定度。'}</p><button type="button" onClick={() => leaveChart()}>选择套利组合</button></div> : <>
+    <nav className="perp-workspace-nav" aria-label="合约价差工作区"><button type="button" aria-current={workspace === 'opportunities' ? 'page' : undefined} onClick={() => leaveChart()}>发现机会</button><button type="button" aria-current={workspace === 'chart' ? 'page' : undefined} onClick={() => { if (chartSelection) selectChart(chartSelection); else { setInspection(null); setWorkspace('chart'); const url = perpetualWorkspaceLink(window.location.href, 'opportunities'); if (url !== window.location.href) window.history.pushState(window.history.state, '', url); } }}>创建价差图表</button><button id="perp-positions-tab" type="button" aria-current={workspace === 'positions' ? 'page' : undefined} onClick={() => leaveChart('positions')}>持仓跟踪</button></nav>
+    {workspace === 'positions' ? <LazyBoundary what="持仓跟踪" className="perp-empty"><Suspense fallback={<p role="status">正在加载持仓跟踪…</p>}><PerpetualPaper active onExpired={onExpired} /></Suspense></LazyBoundary> : workspace === 'chart' ? chartSelection ? <LazyBoundary what="组合图表" className="perp-empty"><Suspense fallback={<p role="status">正在加载组合图表…</p>}><PerpetualChart key={JSON.stringify([chartSelection.base, chartSelection.longKey, chartSelection.shortKey])} selection={chartSelection} snapshot={data} active now={now} onSelectionChange={selectChart} onBack={() => leaveChart()} connectionError={problem} onExpired={onExpired} /></Suspense></LazyBoundary> : <div className="perp-empty"><h3 id="perpetual-chart-heading" tabIndex={-1}>创建价差图表</h3><p>{chartLinkError || '从套利列表点击组合，自动带入做多和做空合约，查看价差与 3、7、30 天资金费稳定度。'}</p><button type="button" onClick={() => leaveChart()}>选择套利组合</button></div> : <>
     <div className="scanner-toolbar">
       <div className="perp-view-tabs" role="group" aria-label="行情视图">
         <button type="button" aria-pressed={view === 'rank' && !fundingSort} onClick={() => changeOpportunityMode(false)}>价格套利</button>
@@ -473,7 +475,7 @@ export function PerpetualPanel({ onExpired }: { onExpired: () => void }) {
           <div className="scanner-detail-evidence"><button type="button" className="perp-refresh" onClick={() => openChart(row)}>创建价差图表 · 资金费稳定度</button>{delisting ? <><DelistingNotice quote={row.long} now={now} /><DelistingNotice quote={row.short} now={now} /></> : null}<FundingHistory long={longHistory} short={shortHistory} now={now} /><p>所需资本 {rowCapital.capitalPercent === null ? '—' : `${rowCapital.capitalPercent.toFixed(1)}%`} 多腿名义 · ROC（{capitalAssumptions.holdingHours}h）{scannerPercent(rowRoc.rocPercent, 2)} · 资金费年化 ROC {scannerPercent(rowRoc.fundingRocAnnualizedPercent, 1)}{rowRoc.reason ? ` · ${rowRoc.reason}` : ''}</p>{fundingScenario ? <p>未来 24h 资金费 {percent(fundingScenario.fundingPercent, 4)} · 未来 24h 扣费后 {percent(fundingScenario.estimatedNetPercent, 4)}{fundingScenario.reasons.length ? ` · ${fundingScenario.reasons[0]}` : ''}</p> : null}</div>
           <div className="perp-detail-navigation"><div role="tablist" aria-label="组合详情" onKeyDown={event => { const ids = DETAIL_TABS.map(tab => tab.id); const index = ids.indexOf(detailTab); const next = event.key === 'ArrowRight' ? ids[(index + 1) % ids.length] : event.key === 'ArrowLeft' ? ids[(index + ids.length - 1) % ids.length] : event.key === 'Home' ? ids[0] : event.key === 'End' ? ids[ids.length - 1] : null; if (next) { event.preventDefault(); setDetailTab(next); document.getElementById(`${detailId}-tab-${next}`)?.focus(); } }}>{DETAIL_TABS.map(tab => <button type="button" role="tab" key={tab.id} id={`${detailId}-tab-${tab.id}`} aria-selected={detailTab === tab.id} tabIndex={detailTab === tab.id ? 0 : -1} aria-controls={`${detailId}-content`} onClick={() => setDetailTab(tab.id)}>{tab.label}</button>)}</div></div>
           <div role="tabpanel" id={`${detailId}-content`} aria-labelledby={`${detailId}-tab-${detailTab}`} className="perp-detail-content">
-            {detailTab === 'execution' ? <><PerpetualExecution long={row.long} short={row.short} active now={now} onExpired={onExpired} /><LazyBoundary what="持有期情景" className="perp-quality-notice"><Suspense fallback={null}><PerpetualHolding row={row} budget={qualityBudget} now={now} mode={filters.priceMode} fundingFocused={fundingSort} /></Suspense></LazyBoundary><LazyBoundary what="价差趋势" className="perp-quality-notice"><Suspense fallback={null}><PerpetualTrend history={history} now={now} crossCurrency={row.crossCurrency} /></Suspense></LazyBoundary></> : detailTab === 'quality' ? <QualityEvidence row={row} report={qualityReport} quality={quality} venues={venues} now={now} slippagePercent={qualityBudget.slippagePercent} /> : detailTab === 'exit' ? <PerpetualExit long={row.long} short={row.short} budget={qualityBudget} active now={now} onExpired={onExpired} /> : <QuoteDetails quotes={detailQuotes} venues={venues} mode={filters.priceMode} now={now} staleAfterMs={staleAfterMs} />}
+            {detailTab === 'execution' ? <><PerpetualExecution long={row.long} short={row.short} active now={now} onExpired={onExpired} /><LazyBoundary what="持有期情景" className="perp-quality-notice"><Suspense fallback={null}><PerpetualHolding row={row} budget={qualityBudget} now={now} mode={filters.priceMode} fundingFocused={fundingSort} /></Suspense></LazyBoundary><LazyBoundary what="价差趋势" className="perp-quality-notice"><Suspense fallback={null}><PerpetualTrend history={history} now={now} crossCurrency={row.crossCurrency} /></Suspense></LazyBoundary></> : detailTab === 'quality' ? <QualityEvidence row={row} report={qualityReport} quality={quality} venues={venues} now={now} slippagePercent={qualityBudget.slippagePercent} /> : detailTab === 'exit' ? <PerpetualExit long={row.long} short={row.short} budget={qualityBudget} active now={now} onExpired={onExpired} onRegistered={() => { setInspection(null); setWorkspace('positions'); document.getElementById('perp-positions-tab')?.focus(); }} /> : <QuoteDetails quotes={detailQuotes} venues={venues} mode={filters.priceMode} now={now} staleAfterMs={staleAfterMs} />}
           </div>
         </td></tr> : null}</Fragment>;
       })}</tbody></table>

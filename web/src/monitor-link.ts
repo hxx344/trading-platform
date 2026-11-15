@@ -2,6 +2,8 @@
 // (#/monitor). The workbench keeps ?monitor= as its hub tab; here the tab is saved locally, so the parameter only marks a
 // chart link: it opens its market over the saved tab, and is dropped with the chart parameters when the chart is left or
 // another market is chosen. The hash is kept as it is.
+import { perpetualWorkspaceUrl } from './perpetual-chart-state.ts';
+
 export const MONITOR_LINK_PARAMS = ['monitor', 'perpView', 'chartBase', 'chartLong', 'chartShort', 'chartDays'] as const;
 
 /** The market a link names (?monitor=), or null. */
@@ -13,5 +15,12 @@ export function linkedMonitorTab(href: string): string | null {
 export function withoutMonitorLink(href: string): string {
   const url = new URL(href);
   for (const key of MONITOR_LINK_PARAMS) url.searchParams.delete(key);
+  return url.href;
+}
+
+/** M-5e1: the workbench's perpetualWorkspaceUrl on this page's rule: positions carry ?monitor=perpetual, opportunities drop it. */
+export function perpetualWorkspaceLink(href: string, workspace: 'opportunities' | 'positions'): string {
+  const url = new URL(perpetualWorkspaceUrl(href, workspace));
+  if (workspace === 'positions') url.searchParams.set('monitor', 'perpetual'); else url.searchParams.delete('monitor');
   return url.href;
 }

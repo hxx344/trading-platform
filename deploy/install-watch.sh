@@ -171,7 +171,7 @@ restore() {
   systemctl daemon-reload || true
   for name in "${units[@]:1}"; do
     if [[ -n ${was_enabled[$name]:-} ]]; then systemctl enable "$name" >/dev/null 2>&1 || true; else systemctl disable "$name" >/dev/null 2>&1 || true; fi
-    if [[ -n ${was_active[$name]:-} ]]; then systemctl restart "$name" || true; else systemctl stop "$name" >/dev/null 2>&1 || true; fi
+    if [[ -n ${was_active[$name]:-} ]]; then systemctl reset-failed "$name" >/dev/null 2>&1 || true; systemctl restart "$name" || true; else systemctl stop "$name" >/dev/null 2>&1 || true; fi
   done
 }
 cleanup() {
@@ -435,7 +435,9 @@ fi
 systemctl reset-failed main-watch.service >/dev/null 2>&1 || true
 systemctl start main-watch.service || { journalctl -u main-watch.service -n 20 --no-pager >&2 || true; die '首轮巡检在 systemd 下运行失败。'; }
 systemctl enable main-watch.timer >/dev/null 2>&1
-systemctl restart main-watch.timer
+# 短时间内多次部署会撞上 systemd 的启动频率限制；先清掉计数，定时器才一定能启动。
+systemctl reset-failed main-watch.timer >/dev/null 2>&1 || true
+systemctl restart main-watch.timer || { journalctl -u main-watch.timer -n 20 --no-pager >&2 || true; die '定时器未能启动。'; }
 systemctl is-active --quiet main-watch.timer || die '定时器未能启动。'
 switched=0
 say "已部署版本 $revision_label，每分钟巡检一次。当前探测结果："

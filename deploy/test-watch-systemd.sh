@@ -21,7 +21,7 @@ server_pid='' release_pid=''
 cleanup() {
   result=$?
   trap - EXIT
-  if ((result)); then journalctl -u main-watch.service -u main-watch-heartbeat.service --no-pager -n 60 || true; fi
+  if ((result)); then journalctl -u main-watch.service -u main-watch-heartbeat.service -u main-watch.timer --no-pager -n 60 || true; fi
   [[ -z $server_pid ]] || kill "$server_pid" 2>/dev/null || true
   [[ -z $release_pid ]] || kill "$release_pid" 2>/dev/null || true
   systemctl disable --now main-watch.timer main-watch-heartbeat.service >/dev/null 2>&1 || true

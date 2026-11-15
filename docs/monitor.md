@@ -4,7 +4,7 @@
 
 对照的工作台代码：`modules/monitor`（工作台提交 `7745181` 时的内容）。工作台 Monitor 的功能编号 M01–M14 沿用。
 
-## 当前状态（v0.36.0）
+## 当前状态（v0.38.0）
 
 - 已发布：M-1（Anthropic 价差）随 v0.12.0；v0.15.0 起在设置页「从工作台导入」里启用。M-2a（原油价差）随 v0.20.0。M-2b（海力士溢价）随 v0.21.0。M-2c（多交易所对比）随 v0.23.0。M-2d（已结算资金费历史与多空资金费图）随 v0.24.0。M-2e（技术指标）随 v0.25.0。M-2d-3（对比表各交易所的结算历史）随 v0.27.0，M-2 完成。
 - M-3a（原油与海力士阈值告警、飞书出站队列、页面告警面板与测试消息）随 v0.29.0；替身后端与替身机器人验证，未接真实飞书。
@@ -14,7 +14,8 @@
 - M-3d-2（从工作台导入 Var token）随 v0.34.0；替身文件验证，未接真实工作台。M-3 完成。
 - M-4a（合约价差采集器：11 家交易所永续合约公开盘口，SSE 增量，只在内存）随 v0.36.0；替身交易所验证，并在开发机上对真实交易所做过 20 秒冒烟（见 M-4a 实施记录）。页面与导入见下一条。
 - M-4b（合约价差页面；从工作台导入时一并启用）随 v0.37.0；替身合约行情上浏览器走查（见 M-4b 实施记录）。
-- 未开始：M-5、M-6（见下表）。
+- M-5a（展开组合详情：按金额校验盘口、平仓收益测算；跨计价币排名；手动配对）随 v0.38.0；替身交易所验证（见 M-5a 实施记录）。
+- 未开始：M-5b–M-5f、M-6（见下表与「M-5」节）。
 - M-1 没做：成交标记、股数从交易中心同步、概览卡片与告警（均线 / 布林带 / Z-score 随 M-2e 补上）。
 
 ## 批次
@@ -25,7 +26,7 @@
 | M-2 | 原油价差与海力士行情（M01、M02），分 M-2a–M-2e 五小批（见下文），Var 腿先降级为“未接入” | R2 | M-2a 已发布（v0.20.0），M-2b 已发布（v0.21.0），M-2c 已发布（v0.23.0），M-2d 已发布（v0.24.0），M-2e 已发布（v0.25.0），M-2d-3 已发布（v0.27.0） |
 | M-3 | 告警规则、飞书通知、监控开关、Var 会话 token（M09–M12），分 M-3a–M-3d 四小批（见下文） | R3 | M-3a 完成（v0.29.0），M-3b 完成（v0.30.0），M-3c 完成（v0.31.0），M-3d-1 完成（v0.33.0），M-3d-2 完成（v0.34.0） |
 | M-4 | 永续全市场报价（M04：11 家交易所公共 WS、SSE 增量），分 M-4a（采集器与接口）、M-4b（页面与导入） | R2 | 完成（M-4a v0.36.0，M-4b v0.37.0） |
-| M-5 | 依赖 M04 的页面（M05–M08） | R2 | 未开始 |
+| M-5 | 依赖 M04 的页面（M05–M08），分 M-5a–M-5f 六小批（见「M-5」节） | R2 | M-5a 完成（v0.38.0），其余未开始 |
 | M-6 | 其余（M13、M14；M14 原靠 iframe 桥接宿主，需重新设计） | 待定 | 未开始 |
 
 ## M-1：Anthropic 价差
@@ -623,3 +624,45 @@ CEX 最多 32 页。
 - 替身：`test/perpetual-fake.ts` 供 `scripts/dev-monitor.ts` 用；费率元数据放在合约目录里（同真实交易所模块：`takerFee*` 随目录进入报价，不随行情更新）。
 - 跨计价币默认关闭（同工作台），CEX 用 USDT、DEX 用 USDC 计价时 CEX↔DEX 组合为空；跨计价币需要汇率，属 M-5。
 
+## M-5：合约价差的其余功能（M05–M08）
+
+对照工作台 `modules/monitor` 的 `server/perpetual-*.mjs`、`app/perpetual-*.tsx` 与 `lib/perpetual-*.ts`（提交 `c84ba27`）。按依赖与存储拆成六小批，每批都只在配置了 `monitor.perpetual` 时生效：
+
+| 小批 | 内容（工作台对应） | 新增存储 | 依赖 |
+| --- | --- | --- | --- |
+| M-5a | 采集器内的按需盘口服务：成交校验（depth）、平仓测算（exit）、现货汇率（fx）；页面的组合展开详情、跨计价币、手动配对（M07） | 无 | M-4 |
+| M-5b | 资金费历史与市场指标（funding-history、funding-reader、market-metrics、metrics-reader、scanner-data）；成交额、持仓量、资本与 ROC、范围筛选、表头排序、列选择 | `funding_history_cache`、`contract_metrics_cache` | M-4 |
+| M-5c | 价格历史与价差图（price-history、price-reader、图表工作区） | `price_history_cache` | M-4 |
+| M-5d | 质量采样与质量依据（quality：含 CoinGecko 与多空比请求）、手续费与滑点预算设置 | `quality_samples` | M-5b |
+| M-5e | 模拟与手工持仓跟踪（paper）：展开详情「平仓与跟踪」的登记、持仓跟踪工作区 | `monitor_state` 的一个键 | M-5a |
+| M-5f | 机会列表 v1/v2、现货划转证据、CrossEx 设置（opportunities、spot-transfer、crossex-settings） | 待定 | M-5a（汇率） |
+
+CrossEx 的机会来源（C5）与导入预填属 M13，按 R3 单独做（见 [crossex.md](crossex.md)）。
+
+### M-5a：按需盘口、跨计价币与手动配对
+
+**对照**：工作台 `server/perpetual-depth.mjs`、`lib/perpetual-{execution,exit,fx,fees,types,manual-pairs}.ts`、`hooks/use-perpetual-fx.ts`、`app/perpetual-{execution,exit,manual-pairs}.tsx` 与其 css、`app/perpetual-panel.tsx` 的行展开部分（提交 `c84ba27`）。
+
+**范围**：
+- 服务：把工作台的按需盘口服务（`createPerpetualExecutionService`）放进合约价差采集器，报价与合约目录直接取采集器内存。接口 `POST /api/monitor/perpetual/depth`（两腿按金额读公开盘口，估算成交均价与价差）、`POST /api/monitor/perpetual/exit`（按登记的开仓数量与价格估算现在平仓的净收益）、`GET /api/monitor/perpetual/fx`（USDC、USD1、USDG 对 USDT 取 Gate 现货一档，USD 取 Kraken USDTUSD）。须登录，POST 带页面请求标记；关闭开关时 423，采集器未运行时 503，参数无效 400，合约身份已变 409，上游限流 429，其它上游失败 502；拒绝都带服务的原因。
+- 页面：排名行末加展开按钮。展开时冻结当前快照、排名与页码并停掉行情连接（时钟照走，报价按时过期），页签「成交与持有」（按金额校验盘口）、「平仓与跟踪」（只有测算）、「各平台报价」（同币种各平台报价）；两腿有下架安排时显示下架提示。筛选、翻页、切换视图或「收起并恢复」都会收起。
+- 跨计价币：「更多筛选与排序设置」加「计价币范围」（仅相同计价币 / 跨计价币 · 按现货汇率校正），选跨计价币时每 60 秒读一次汇率，排名按汇率换算，状态行下方显示汇率时间与每条汇率的来源时间与买卖价。
+- 手动配对：「监控工具与设置」里加手动配对（自选两个合约与换算倍数，独立算双向价差），只存浏览器 `localStorage`（键 `market-monitor:perpetual-manual-pairs:v1`，同工作台）。
+
+**不搬**（留给后续小批）：质量依据页签与质量列（M-5d）、持有情景与价差趋势（M-5b/M-5d）、价差图表按钮（M-5c）、平仓页签里的登记与持仓跟踪工作区（M-5e）、CrossEx 导入与屏蔽、提醒、手续费设置。
+
+**影响面（R2）**：服务端新增三个只读接口，都按需访问交易所公开接口：盘口查询全站最多同时缓存 10 个市场、请求有全局速率预算（工作台原值），汇率结果缓存 60 秒；不写数据库、不碰账户与凭据。Lighter / RH Lighter / Kraken 的盘口经 WebSocket 读取（Node 自带 WebSocket，随 `NODE_USE_ENV_PROXY` 走代理）；这三家的真实 WebSocket 盘口路径只在替身上走过（替身拒绝连接），登记为待实测（[plan.md](plan.md) 第 6 节）。页面只在展开详情时多一次手动查询。
+
+**回滚**：`sudo bash install.sh --version v0.37.0`，不用改配置（没有新增配置与存储）。
+
+**测试计划**：工作台 `tests/perpetual-execution.test.mjs`（从 `server/perpetual-depth.mjs` 导入）、`perpetual-exit.test.mjs`、`perpetual-manual-pairs.test.mjs` 移植为 `test/perpetual/{execution,exit}.test.mjs`、`web/test/perpetual/manual-pairs.test.mjs`（只改导入路径）；本仓库补采集器与接口测试（未运行 503、参数 400、身份变化 409、POST/GET 方法、未配置 404、关闭后 423、停止后再启动换新的查询服务）、Node WebSocket 适配器、页面与服务端两份 lib 的一致性。浏览器在替身后端（`test/perpetual-fake.ts` 加替身盘口与汇率）上 1280 与 390 宽度走一遍展开、校验、平仓测算、各平台报价、收起恢复、跨计价币与汇率详情、手动配对增删。
+
+#### M-5a 实施记录（v0.38.0）
+
+按上面的计划实现，差别与补充：
+
+- 工作台 `lib/perpetual-{types,fx,fees,execution,exit}.ts` 原样复制到 `src/vendor/`（发布包不含 `web/src`，服务端要用就得放在 `src`）；`server/perpetual-depth.mjs` 复制为 `src/vendor/perpetual-depth.mjs`，只改导入路径，并把默认的 `ws` 库换成 `NodeWebSocket`：继承本仓库已有的 ws 兼容适配 `src/vendor/crossex/node-ws.mjs`（`binaryType = 'arraybuffer'`，文本帧与二进制帧都以 `Buffer` 交付，原文件的 `String(raw)` 照常解码），选项取工作台 `PerpetualWebSocket` 的 `maxPayload` 8 MB 与握手 20 秒。页面的 `web/src/perpetual-{types,fx,fees}.ts` 与 `src/vendor` 的副本由测试比对一致；页面新文件直接从 `src/vendor` 引入 execution 与 exit。
+- 汇率按需读取：工作台在服务端每 60 秒常驻刷新一次汇率（供机会列表的 `peekFx`）；本批只有页面要汇率，改为请求时读、缓存 60 秒，常驻刷新留到 M-5f 需要 `peekFx` 时再加。
+- 页面：`web/src/PerpetualExecution.tsx`、`PerpetualExit.tsx`、`PerpetualManualPairs.tsx`、`use-perpetual-fx.ts`；请求走 `api()`（带页面请求标记，401 转登录，失败显示服务给的原因）。平仓测算的输入字段与默认值同工作台模拟仓位（展开时快照的多腿卖一、空腿买一，1000 USDT），去掉登记方式切换与登记按钮。
+- 样式：三份组件 css 原样复制；`perpetual.css` 按新增的类重新过滤（展开列、详情行、页签、汇率提示），末列恢复为展开按钮后，M-4b 删去的 `th:last-child` 规则也照工作台保留。补了一段：工作台的监控模块在 iframe 里，详情按 `100vw` 限宽；本服务左侧有导航栏，改为按表格容器宽度（容器查询 `100cqw`），否则 1280 宽度下详情右侧被裁掉。
+- 手续费与滑点预算用工作台默认值（`defaultQualityBudget`：公开 taker 费率、0.10% 滑点），可调的设置面板属 M-5d。

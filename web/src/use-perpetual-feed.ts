@@ -2,6 +2,7 @@
 // - 地址改为本服务的 /api/monitor/perpetual/stream 与 /quote；快照读取走 api.ts：401 转登录，其它失败给服务的原因。
 // - 工作台嵌在宿主里时由宿主决定能否后台读取（lib/read-activity.ts）；本服务没有宿主，按工作台独立打开时的规则：
 //   一直可读，页面隐藏时轮询与时钟放慢到 30 秒。
+// - paused（M-5a，照工作台）：展开组合详情时停掉连接，时钟照走，保留的报价按时过期。
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from './api.ts';
 import { createPerpetualClock, parsePerpetualSnapshot, PerpetualRequestError, startPerpetualFeed, type PerpetualConnection } from './perpetual-feed.ts';
@@ -25,7 +26,7 @@ export async function readServiceSnapshot(signal: AbortSignal, onExpired: () => 
   catch { throw new PerpetualRequestError('行情接口返回了无效数据。'); }
 }
 
-export function usePerpetualFeed(onExpired: () => void) {
+export function usePerpetualFeed(onExpired: () => void, paused = false) {
   const [data, setData] = useState<PerpetualSnapshot | null>(null);
   const [connection, setConnection] = useState<PerpetualConnection>('connecting');
   const [error, setError] = useState('');
@@ -49,6 +50,9 @@ export function usePerpetualFeed(onExpired: () => void) {
       const updateClock = () => setNow(sourceClock.read());
       updateClock();
       clock = setInterval(updateClock, backgroundDelay(1_000));
+      // Inspection stops network work, but source time must still age so a
+      // retained quote cannot stay "fresh" indefinitely while the user reads it.
+      if (paused) { controls.current?.stop(); controls.current = null; publisher.reset(); setConnection('paused'); return; }
       if (!navigator.onLine) {
         controls.current?.stop(); controls.current = null;
         publisher.reset();
@@ -92,7 +96,7 @@ export function usePerpetualFeed(onExpired: () => void) {
       publisher.stop(); display.current = null;
       controls.current?.stop(); controls.current = null;
     };
-  }, [sourceClock]);
+  }, [paused, sourceClock]);
 
   // The collector starts within a second of the switch being turned on, but a panel mounted in that second finds it stopped:
   // the service closes the stream at once and the feed would retry only after 20 s (snapshot) and 30 s (stream). While the
@@ -101,7 +105,7 @@ export function usePerpetualFeed(onExpired: () => void) {
   // feed's own 20 s / 30 s retries take over again.
   const unavailable = data?.status === 'unavailable';
   useEffect(() => {
-    if (!unavailable) return;
+    if (!unavailable || paused) return;
     let attempts = 0;
     const timer = setInterval(() => {
       if (document.hidden) return;
@@ -109,7 +113,7 @@ export function usePerpetualFeed(onExpired: () => void) {
       display.current?.flush(); controls.current?.resume();
     }, 3_000);
     return () => clearInterval(timer);
-  }, [unavailable]);
+  }, [unavailable, paused]);
 
   const refresh = useCallback(() => {
     const feed = controls.current, publisher = display.current;

@@ -1,5 +1,6 @@
 // 本仓新写（非复制）：npm 包 ws 的最小兼容适配，基于 Node 24 全局 WebSocket，只覆盖 src/vendor/crossex 复制代码用到的部分，
-// 让复制文件除 import 路径外保持原样。约定：
+// 让复制文件除 import 路径外保持原样。行情监控的 src/vendor/perpetual-depth.mjs 的 NodeWebSocket 也继承本类（盘口快照
+// 依赖下面的 Buffer 消息、close 只触发一次与 terminate 同步 close），改动时一并照顾。约定：
 // - 构造 (url, { maxPayload, handshakeTimeout })：handshakeTimeout 毫秒内未连上即报 error 并关闭；单条消息超过 maxPayload
 //   字节即报 error 并断开（全局 WebSocket 先收完整条再交付，因此只能在交付时拒绝，不能像 ws 那样在读帧时提前截断）。
 //   其它 ws 选项（perMessageDeflate、followRedirects）被忽略：全局 WebSocket 不跟随重定向。

@@ -446,3 +446,20 @@
 **验证**：`scripts/dev-monitor.ts` 加了替身合约行情（`test/perpetual-fake.ts`：5 家交易所、约 40 个币种，含 RWA 与一个即将下架的合约，Bybit / OKX / Lighter 带公开费率元数据）。无头浏览器 1280 与 390 宽度：三个视图、交易所多选、搜索、翻页、净价差排序、标记价口径、平台组合、刷新后记住筛选、重置全部筛选、关闭再打开运行开关；无横向溢出，控制台只有未配置模块的入口探测 404。本机无头浏览器没有中文字体，截图只用来看版式；未与运行中的工作台并排截图（本机没有运行中的工作台）。
 
 **回滚**：`sudo bash install.sh --version v0.36.0`，不用改配置。
+
+### M-5a 补充（v0.38.0）：组合展开详情、跨计价币、手动配对
+
+**对照的工作台页面**：`app/perpetual-panel.tsx` 的行展开（`inspect`、`perp-detail-row`、页签与 `perp-inspection-bar`）、`app/perpetual-execution.tsx`、`app/perpetual-exit.tsx`（`ExitCheck` 与输入字段）、`app/perpetual-manual-pairs.tsx`、`hooks/use-perpetual-fx.ts` 与三份组件 css（提交 `c84ba27`）。
+
+**页面**：排名行末的展开按钮打开详情行：顶部“行情已暂停”条与「收起并恢复」，下架提示，页签「成交与持有」（按金额校验盘口）、「平仓与跟踪」（平仓收益测算）、「各平台报价」。展开期间行情连接停掉，排名、页码与报价冻结在展开时，状态行显示“查看详情 · 行情刷新已暂停”，刷新按钮变为「收起并恢复」。「更多筛选与排序设置」加「计价币范围」；选跨计价币时状态行下方显示汇率提示与可展开的汇率详情。「监控工具与设置」里加手动配对。
+
+**与工作台的差别**：
+- 不搬：质量依据页签、持有情景与价差趋势、价差图表按钮、CrossEx 导入、提醒与屏蔽按钮、平仓页签的登记方式切换与登记按钮（属 M-5b–M-5e）。
+- 请求走 `api()`；汇率 hook 只看是否需要（跨计价币或手动配对有跨币组合），不再接宿主的读取活动。
+- 详情限宽：工作台按 `100vw` 限宽（模块在 iframe 里），本服务按表格容器宽度（`perpetual.css` 末尾的补充段）。
+
+**样式**：`perpetual-execution.css`、`perpetual-exit.css`、`perpetual-manual-pairs.css` 原样复制；`perpetual.css` 用同样的过滤方式重新生成（约 420 行），并在 `MonitorPerpetual.tsx` 里先于组件引入，使组件 css 在后，层叠顺序同工作台（那里组件是懒加载块）。
+
+**验证**：替身后端（`test/perpetual-fake.ts` 加替身盘口与现货汇率，Lighter 的 WebSocket 盘口直接拒绝），无头浏览器 1280 与 390 宽度：展开第一行（避开 Lighter）、校验盘口、平仓测算、各平台报价、收起恢复后恢复自动刷新、跨计价币排名与汇率详情、手动配对添加与删除并写入 `localStorage`；无横向溢出，控制台只有未配置模块的入口探测 404。
+
+**回滚**：`sudo bash install.sh --version v0.37.0`，不用改配置。

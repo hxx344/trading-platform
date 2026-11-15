@@ -537,6 +537,10 @@ test('服务进程：本机页面只含 ASTER 部分，状态接口可读，用�
     for (let i = 0; i < 100 && sockets.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 20));
     assert.equal(sockets.length, 2, '每个子账户一条用户推送');
     const get = async (path: string, headers: Record<string, string> = { cookie }) => { const response = await fetch(`http://127.0.0.1:${port}${path}`, { headers }); return { status: response.status, body: await response.json() as Record<string, any> }; };
+    // The watchdog's probe needs no login and turns ready once every loop has finished a round.
+    let readiness = { status: 0, body: {} as Record<string, any> };
+    for (let i = 0; i < 150 && readiness.status !== 200; i++) { readiness = await get('/api/ready', {}); if (readiness.status !== 200) await new Promise(resolve => setTimeout(resolve, 20)); }
+    assert.deepEqual([readiness.status, readiness.body], [200, { ready: true }], '就绪接口不用登录');
     for (const path of ['/api/status', '/api/transfer-pairs/p1/balances', '/api/transfer-pairs/p1/history', '/api/adl/pairs/p1/incidents', '/api/logs', '/api/logs/problems']) assert.equal((await get(path, {})).status, 401, `${path} 须登录`);
     // What the service writes (stdout and stderr) shows up on the log tab. Here the test runner shares stdout for its own
     // frames, so the startup line may follow one of them on the same row; on the server stdout carries whole lines only.

@@ -74,6 +74,11 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 - 合约价差的质量依据（可选）：CoinGecko 演示键 `COINGECKO_DEMO_API_KEY=…`、币种到 CoinGecko id 的覆盖 `PERPETUAL_COIN_IDS={"XXX":"coin-id"}` 也写在这个文件里，改后 `sudo systemctl restart trading-platform`；不设时走公开限额与自动匹配。
 - 只校验配置、不启动（`node` 用 `systemctl cat trading-platform` 里 ExecStart 的那个）：`sudo -u trading-platform node /opt/trading-platform/current/src/service/main.ts --config /etc/trading-platform/config.json --check-config`。
 - 日志：页面「日志」，或 `journalctl -u trading-platform -f`。
+- 外部巡检（v0.46.0 起）：`GET /api/ready` 不用登录，服务就绪时返回 200 `{"ready":true}`，否则返回 503 `{"ready":false}`，不带其他内容。
+  - 就绪的条件：服务没在停止、持有写入租约，并且「运行状态」页列出的每个循环最近 3 分钟内都完成过一轮。这些循环是划转、ADL、持仓读取，以及历史清理（配了原油执行账户时换成两腿任务循环）。刚启动、还有循环没完成第一轮时是 503。原油规则、期权、行情监控、资产、飞书发件、用户推送等其他后台循环不参与判定。
+  - 它判断的是进程在运行、持有租约、这些循环没卡住，**发现不了交易所连不上**：划转、ADL、持仓读取单轮里的交易所报错都记在各自的状态与事件里，这一轮仍算完成，接口照样是 200；这类故障由服务自己的飞书告警和页面提示处理。例外是配了原油、有未结束的两腿任务且交易所持续超时的时候，两腿任务循环一轮可能超过 3 分钟，接口会暂时变成 503。
+  - 只支持 GET（HEAD、OPTIONS 等方法照旧要登录，返回 401）。接口只在服务监听的地址上可达（`127.0.0.1` 与 `config.json` 的 `host`），Host 头检查照旧（须是本机回环地址或 `config.json` 的 `host`），不需要也不应该为它对公网开放端口。
+  - 配合工作台的 main-watch：副服务器与本机在同一 Tailscale 网络时，把 `http://<本机 Tailscale IP>:4720/api/ready` 加进副服务器 `/etc/main-watch/config` 的 `CHECKS`；用心跳模式时，在本机安装推送端（工作台的 `install-main-watch.sh --sender`）时加 `--ready-url http://127.0.0.1:4720/api/ready`；一个推送端只探测一个就绪地址，本机还有工作台要探测时两者只能选一个，另一个走副服务器的 `CHECKS`。
 - 飞书定时运行摘要（照工作台的「ASTER 运行摘要」卡片）：默认每 60 分钟一张，服务首次启动约 2 分钟后发第一张；重启沿用下次发送时间，停机错过的周期只补发一张（启动约 2 分钟后，等持仓与余额读到再发），不逐期补发。发往 `secrets.json` 的 `feishuScheduled` 机器人（格式同 `feishu`：`{"webhook": "…", "secret": "…"}`；页面导入新配对时从工作台的 `FEISHU_SCHEDULED_WEBHOOK_URL` / `FEISHU_SCHEDULED_SIGN_SECRET` 带过来），没有时发往告警机器人 `feishu`。间隔在页面「设置」→「飞书定时运行摘要」修改（1–1440 分钟，0 关闭，保存后以页面为准、重启保留），那里也能「立即发送一张」；没在页面改过时用 `config.json` 的 `"summary": {"intervalMinutes": 30}`（改完执行一次 `sudo bash install.sh`）。换了机器人（例如补上 `feishuScheduled`）后，重启约 2 分钟会先发一张到新机器人。只有原油、没有配对时不发。
 
 配对接管与回退步骤见 [docs/plan.md](docs/plan.md) 第 4 节。
@@ -84,6 +89,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 | 回退到早于 | 回退前要做的事 | 说明 | 详见 |
 | --- | --- | --- | --- |
+| v0.46.0 | 不用改配置。副服务器巡检（main-watch）指向了 `/api/ready` 的，先改回 `tcp://<地址>:4720`（设了登录密码时也可以用 `http://<地址>:4720/login`，没设密码时它返回 401） | 旧版本没有 `/api/ready`，不登录访问返回 401，巡检会持续告警 | 《部署》的外部巡检一条 |
 | v0.36.0 | 从 `config.json` 删掉 `monitor.perpetual`（只配了合约价差时删掉整个 `monitor`） | 旧版本不认识 `perpetual`；`monitor.sqlite` 里的 `control.perpetual` 旧版本忽略 | [docs/monitor.md](docs/monitor.md) M-4a |
 | v0.30.0 | 从 `secrets.json` 删掉 `feishuMonitor` | 旧版本按白名单读密钥；`monitor.sqlite` 里待应用的导入与“已导入”记录旧版本忽略；`notify-monitor.sqlite` 留在数据目录，其中未送达的行情告警不再发送 | [docs/monitor.md](docs/monitor.md) M-3b |
 | v0.21.0 | 从 `config.json` 删掉 `monitor.hynix`（只配了海力士时删掉整个 `monitor`） | 旧版本不认识 `hynix` 市场；`monitor.sqlite` 里的海力士 K 线旧版本不读，再升级回来照常续用 | [docs/monitor.md](docs/monitor.md) M-2b |

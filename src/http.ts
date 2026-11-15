@@ -165,6 +165,11 @@ export interface HttpOptions {
   password?: PasswordHash;
   /** The address listened on besides loopback, as written in a URL (an IPv6 one in brackets); accepted in Host. */
   host?: string;
+  /**
+   * Answers the login-free GET /api/ready, which a watchdog on another host probes: true while the run is healthy.
+   * Without it the path does not exist.
+   */
+  ready?: () => boolean;
   /** Tests set the clock; one throttle per server otherwise. */
   throttle?: LoginThrottle;
   log?: (line: string) => void;
@@ -174,7 +179,7 @@ export interface HttpOptions {
 const sameSecret = (given: string, expected: string): boolean =>
   timingSafeEqual(createHash('sha256').update(given).digest(), createHash('sha256').update(expected).digest());
 
-export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, app, imports, views, password, host, throttle = new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
+export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, app, imports, views, password, host, ready, throttle = new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
   if (!accessToken) throw new Error('需要访问令牌');
   if (sameSecret(session, accessToken)) throw new Error('会话值不能与访问令牌相同');
   // The executor records which session asked for each command; it gets a digest, so the stored rows never hold the cookie.
@@ -277,6 +282,12 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       response.writeHead(303, { ...PAGE_HEADERS, location: '/', 'set-cookie': sessionCookie(request) });
       response.end();
       return;
+    }
+    // The one /api path open without a login. The answer is a single boolean: an outsider who can reach the port
+    // learns that the service runs and nothing about accounts, balances, configuration or why it is not ready.
+    if (ready && request.method === 'GET' && url.pathname === '/api/ready') {
+      const ok = ready();
+      return send(response, ok ? 200 : 503, { ready: ok });
     }
     if (request.method === 'GET' && url.pathname === '/') {
       if (!authorized(request)) return loginPage(response, 401);

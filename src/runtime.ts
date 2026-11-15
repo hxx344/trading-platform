@@ -13,6 +13,19 @@ const TICK_MS = 1_000;
 const WAL_CHECK_MS = 1_000;
 /** Consecutive failed passes before the entry gives up the lease and exits, so another instance can take over. */
 const MAX_TICK_FAILURES = 5;
+/**
+ * A loop without a finished round for this long counts as stuck in /api/ready. Rounds are bounded by pass budgets and
+ * per-call limits and normally end far sooner; the watchdog probes once a minute and alerts after several misses.
+ */
+export const READY_STALE_MS = 180_000;
+/**
+ * Whether every tracked loop finished a round within READY_STALE_MS; one that has never finished a round is not ready.
+ * Ticks are performance.now() readings, so a step of the wall clock neither hides a stuck loop nor reports one.
+ */
+export function loopsReady(loops: Iterable<{ okTick: number | null }>, tick: number): boolean {
+  for (const loop of loops) if (loop.okTick === null || tick - loop.okTick > READY_STALE_MS) return false;
+  return true;
+}
 /** A kept session's cookie lasts this long in the browser; logging in again with access-url renews it. */
 const SESSION_MAX_AGE_S = SESSION_LIFETIME_MS / 1000;
 
@@ -95,11 +108,11 @@ export function runExecutor({ executor, store, dir, port, listen, password, list
   });
   const context: RunContext = { stopped: () => stopping || executor.retired, pause };
   const startedAt = Date.now();
-  /** Per loop, for the status page: its last good round and its failures in a row. */
-  const loopStatus = new Map<string, { lastOkAt: number | null; failures: number; lastError: string | null; lastErrorAt: number | null }>();
-  const loopOk = (label: string) => { const row = loopStatus.get(label); if (row) { row.lastOkAt = Date.now(); row.failures = 0; } };
+  /** Per loop, for the status page: its last good round and its failures in a row; okTick is that round on the monotonic clock. */
+  const loopStatus = new Map<string, { lastOkAt: number | null; okTick: number | null; failures: number; lastError: string | null; lastErrorAt: number | null }>();
+  const loopOk = (label: string) => { const row = loopStatus.get(label); if (row) { row.lastOkAt = Date.now(); row.okTick = performance.now(); row.failures = 0; } };
   const loopFailed = (label: string, error: string) => { const row = loopStatus.get(label); if (row) { row.failures += 1; row.lastError = error.slice(0, 300); row.lastErrorAt = Date.now(); } };
-  const loopTracked = (label: string) => { loopStatus.set(label, { lastOkAt: null, failures: 0, lastError: null, lastErrorAt: null }); };
+  const loopTracked = (label: string) => { loopStatus.set(label, { lastOkAt: null, okTick: null, failures: 0, lastError: null, lastErrorAt: null }); };
   // Each pass runs on its own schedule, so a venue that answers slowly holds up only its own loop (2.4a).
   // A loop that no longer runs must not keep the lease alive: exit and let another instance take over.
   const passLoop = (label: string, pass: () => Promise<void>) => (async () => {
@@ -124,12 +137,13 @@ export function runExecutor({ executor, store, dir, port, listen, password, list
       health: {
         startedAt, now: Date.now(), generation: executor.generation, retired: executor.retired, schemaVersion: store.schemaVersion(), walBytes: store.walBytes(), walLimitBytes: WAL_SIZE_LIMIT_BYTES,
         writes: { transactions: writes.transactions, busy: writes.busy, waitBucketsMs: [...WAIT_BUCKETS_MS], waitBuckets: writes.waitBuckets, maxWaitMs: writes.maxWaitMs, maxHoldMs: writes.maxHoldMs },
-        loops: [...loopStatus].map(([name, row]) => ({ name, ...row })),
+        loops: [...loopStatus].map(([name, { okTick: _, ...row }]) => ({ name, ...row })),
       },
       ...(views?.status?.() ?? {}),
     };
   };
-  const server = createExecutorServer({ executor, accessToken, log, ...(listen ? { host: listen.urlHost } : {}), ...(password ? { password } : {}), ...(page ? { page } : {}), ...(app ? { app } : {}), ...(session ? { session, sessionMaxAgeS: SESSION_MAX_AGE_S } : {}), ...(imports ? { imports } : {}), views: { ...views, status } });
+  const ready = (): boolean => !stopping && !executor.retired && loopsReady(loopStatus.values(), performance.now());
+  const server = createExecutorServer({ executor, accessToken, log, ready, ...(listen ? { host: listen.urlHost } : {}), ...(password ? { password } : {}), ...(page ? { page } : {}), ...(app ? { app } : {}), ...(session ? { session, sessionMaxAgeS: SESSION_MAX_AGE_S } : {}), ...(imports ? { imports } : {}), views: { ...views, status } });
   // The chosen address feeds the same HTTP server, so both share one session, one login throttle and one Host check.
   const extra = listen ? createNetServer(socket => { server.emit('connection', socket); }) : null;
   server.on('error', error => {

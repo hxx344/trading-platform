@@ -27,7 +27,9 @@ import type { FillMarket, HubFills } from './fills-types.ts';
 import { liveSources, type AssetSources, type SyncContext } from './sync.ts';
 import type { Fetcher } from './sources/http.ts';
 import * as writes from './writes.ts';
-import { importSource, parseImportBody, type ImportSummary } from './source-import.ts';
+import { importSource, parseImportBody } from './source-import.ts';
+import type { ImportReply } from './views.ts';
+export type { ImportReply } from './views.ts';
 import { DAILY_CHANGE_DAYS, readDailyChanges, shiftDay } from './daily-changes.ts';
 import {
   cashFlowsView, historyView, ledgerView, notImported, withdrawalsView,
@@ -162,11 +164,6 @@ export interface AssetStore {
   close(): void;
 }
 /** A write refused because the service may not write the file (opened read-only). */
-export type ImportReply =
-  | { preview: true; summary: ImportSummary; fingerprint: string }
-  // `import` is null when the same file was imported before (nothing changed); the ledger view keeps its own `summary`.
-  | (AssetLedgerView & { preview: false; alreadyImported: boolean; import: { summary: ImportSummary; backupName: string } | null });
-
 export const READ_ONLY = '资产库不可写：asset.sqlite 或其 -wal/-shm 不归服务账户或没有写权限，请把它们改回服务账户所有（chown）并可写后重试';
 /** SQLite's answers for a file this account may not write: READONLY, PERM, CANTOPEN (primary result codes). */
 const NOT_WRITABLE_CODES = new Set([8, 3, 14]);

@@ -35,6 +35,12 @@ export type LedgerSummary = {
   byExchange: ExchangeTotal[];
 };
 export type AssetLedgerView = Imported & { today: string; ledger: Omit<Ledger, 'history'> | null; rows: Asset[]; summary: LedgerSummary | null };
+/** The workbook import's preview (A-6, POST /api/asset/import); the ImportReply below is its answer: a preview, or the ledger after an apply or a repeat. */
+export type ImportSummary = { source: string; rows: number; periods: number; baselineDate: string; baselineTotal: number; resultingRows: number; retained: string[] };
+export type ImportReply =
+  | { preview: true; summary: ImportSummary; fingerprint: string }
+  // `import` is null when the same file was imported before (nothing changed); the ledger view keeps its own `summary`.
+  | (AssetLedgerView & { preview: false; alreadyImported: boolean; import: { summary: ImportSummary; backupName: string } | null });
 
 export type TrendPoint = ReturnType<typeof assetTrend>[number];
 /** One row of the history table: the period and, for periods the curve counts, its measures. */

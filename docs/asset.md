@@ -248,3 +248,29 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
   - 代码：`sudo bash install.sh --version v0.54.0`，不用改配置。旧版本照常读取导入后的账本，归档快照沿用已有的 `archived` 口径，`source-import-hash` 旧版不读。
   - 数据（撤销某次导入）：停服务后，用 `asset-backups/before-import-<编号>.sqlite` 覆盖 `asset.sqlite`，并删除同目录的 `asset.sqlite-wal`、`-shm`，再启动。命令写在实施记录里。
 
+
+### A-6 实施记录
+
+- **服务端**（`src/asset/source-import.ts`、`source-ledger.ts` 的 `parseSource`、`store.ts` 的 `importSource`、`src/http.ts`）：
+  - `parseSource` 把工作台的 zod 规则逐条手写：未知字段丢弃、项目与类别去空白、`future`/`rowSum`/`difference` 按 `startedAt` 重算，结果按 schema 的键序构造，指纹（`sha256(JSON.stringify(解析结果))`）与工作台对同一文件算出的相同；起始快照、行合计、三条必有资产等台账规则与报错原文照搬。
+  - `importPlan` 照搬（只把「现在」改成注入的时钟）：保留已同步的交易所余额、手动修改与当前汇率。
+  - 接口 `POST /api/asset/import`，请求体 `{source, apply, fingerprint?}`，多余字段 400。预览返回 `{preview: true, summary, fingerprint}`；应用与「同一份文件已导入」返回账本视图加 `{preview: false, alreadyImported, import: {summary, backupName} | null}`（账本视图本身已有 `summary`，导入摘要放在 `import` 下）。
+  - 报错：超过 5 MB 413「导入文件不能超过 5 MB」；格式不对 400 `invalid_input`；示例文件、账本已有原表数据等工作台的拒绝 400 `asset_rejected`（原文）；文件与预览时不同 409 `import_changed`；锁被占 409 `busy`；备份失败 503 `backup_failed`。
+  - 备份：`<数据目录>/asset-backups/before-import-<uuid>.sqlite`，目录 0700（不能是符号链接），文件先以 0600 独占创建再 `VACUUM INTO`，随后 fsync 并 `PRAGMA quick_check`；任一步失败删掉半成品、抛出备份失败，账本不动。
+  - 写入在同步锁租约的事务里：再核对 `source-ledger` 仍是预览时那份、`import-info` 未变（`lease.write`），然后替换资产、写 `source-ledger`、`source-import-hash`、`fx`、`fx-status`、`last-attempt='0'`，旧快照与示例的原表期全部归档为 `archive-<批次>-<序号>`，最后用 `saveSnapshot` 写当天快照。
+- **页面**（`web/src/AssetImport.tsx`、`AssetPage.tsx`、`asset.css` 末节）：示例数据提示文案与「导入原表数据」按钮照工作台；点开后在提示下方原位展开面板，标题、说明、文件框、摘要块、帮助文字、「取消 / 导入并保留已有修改」照 `import-ledger-dialog.tsx`；客户端先查 5 MB 与 JSON 格式。请求走页面的写入器（同一时间只有一个写入或同步，401 回登录，409 与 5xx 后重读账本），超时按连接接口的 60 秒。面板打开期间跳过自动同步、「刷新资产」按钮置灰；账本不再是示例（导入成功，或被「从工作台导入」替换）时面板随提示一起收起，同步恢复。成功与重复导入的提示条文案照工作台的 toast。
+- **脚本**：`scripts/import-workbook.py` 照搬，只加了头部说明、缺参数时的用法提示，默认输出改为当前目录的 `imported-ledger.json`（工作台写进自己源码树的 `lib/`）。随安装包发布到 `<安装目录>/current/scripts/`，服务端不调用：它要 `openpyxl`，服务器上没有也不该为此装；用户复制到自己电脑上运行，再在页面选择输出文件。
+- **与工作台的差异**：
+  - 应用必须带预览返回的指纹，文件在预览后变了就 409（工作台只凭重新发送的内容）；
+  - 备份改为 `VACUUM INTO` 加完整性检查，目录 `asset-backups/`（工作台 `db.backup()` 到 `.data/backups/` 后再 chmod）；备份失败明确 503 且不写入；
+  - 写入事务里再核对一次源账本与 `import-info`，挡住备份与写入之间的「从工作台导入」；
+  - 请求体字段严格校验；弹窗改为原位面板；面板里多一行说明导入文件从哪来。
+- **撤销某次导入**（默认目录，root 执行）：
+  ```bash
+  systemctl stop trading-platform
+  cd /var/lib/trading-platform
+  cp asset-backups/before-import-<编号>.sqlite asset.sqlite && rm -f asset.sqlite-wal asset.sqlite-shm
+  chown trading-platform: asset.sqlite && chmod 600 asset.sqlite
+  systemctl start trading-platform
+  ```
+- **测试**：`test/asset-source-import.test.ts`（解析规则；预览不写；应用后的资产、设置、归档与当天快照，备份文件权限与内容；同一文件再导入；示例文件、已有原表数据、指纹不符、缺指纹、多余字段的拒绝都不写；备份目录不可用时不写且锁已释放；锁被占时预览与应用都 409；导入与编辑同时发起时编辑被拒；HTTP 的登录顺序、5 MB 上限、其余接口仍 16 KB、各类报错码）。`deploy/test-install.sh` 加了发布包含转换脚本的检查。页面在替身后端走了一遍 1280 与 390 宽度：坏文件报错、预览摘要、取消、确认导入后提示消失并生成备份，面板打开期间没有同步请求。

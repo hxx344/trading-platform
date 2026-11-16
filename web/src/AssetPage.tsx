@@ -1,9 +1,9 @@
 // The asset page: the workbench ledger's overview, history and withdrawals views (project_aggregation
 // modules/asset/app/dashboard.tsx and withdrawals-panel.tsx at 0014655). Changes: the data is what src/asset/import.ts
 // imported and the service computes the figures (/api/asset/*); the edit, fx and withdrawal writes go to this service's
-// ledger (A-2, docs/asset.md); the sync and the connections view are A-3 (AssetConnections.tsx); the import dialog is
-// left out (the settings page imports); dialogs became panels opened in place; the toasts are a status line under the
-// alerts.
+// ledger (A-2, docs/asset.md); the sync and the connections view are A-3 (AssetConnections.tsx); the workbook import
+// dialog is A-6 (AssetImport.tsx, opened from the example-data notice); dialogs became panels opened in place; the toasts
+// are a status line under the alerts.
 import { Check, ChevronRight, Eye, Info, Pencil, Plus, RefreshCw, ShieldCheck, Trash2, TriangleAlert, X } from 'lucide-react';
 import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { api, ApiError } from './api.ts';
@@ -13,6 +13,7 @@ import { useLiveResource } from './use-live-resource.ts';
 import { AssetTrend } from './AssetTrend.tsx';
 import { CONNECTIONS_PATH, ConnectionsView, SIDE_EXCHANGES, pendingText, type CardExchange } from './AssetConnections.tsx';
 import { startRefreshLoop } from './asset-refresh-loop.ts';
+import { IMPORT_PATH, ImportPanel } from './AssetImport.tsx';
 import { isExchangeMode, EXCHANGE_NAMES, type AssetHistoryView, type AssetLedgerView, type AssetPeriodView, type AssetState, type AssetWithdrawalsView, type HistoryRow } from '../../src/asset/views.ts';
 import type { Asset, Withdrawal } from '../../src/asset/types.ts';
 import {
@@ -29,13 +30,19 @@ export const ASSET_WRITE_TIMEOUT_MS = 20_000;
 /** The workbench's limits (dashboard.tsx api()): a sync reads every exchange, a connection is verified with one first. */
 const SYNC_PATH = '/api/asset/sync';
 const SYNC_TIMEOUT_MS = 80_000, CONNECT_TIMEOUT_MS = 60_000;
-const writeTimeout = (path: string): number => path.startsWith(CONNECTIONS_PATH) || path.startsWith('/api/asset/aster-accounts/') ? CONNECT_TIMEOUT_MS : ASSET_WRITE_TIMEOUT_MS;
+// The workbook import sends up to 5 MB and backs the database up before it writes: it gets the connection's limit.
+const writeTimeout = (path: string): number => path.startsWith(CONNECTIONS_PATH) || path.startsWith('/api/asset/aster-accounts/') || path === IMPORT_PATH ? CONNECT_TIMEOUT_MS : ASSET_WRITE_TIMEOUT_MS;
 
 /**
  * One write at a time for the whole page, like the workbench's mutate(): busy blocks the other forms, the error stays in
  * the open form with its input, and a confirmed answer becomes the ledger at once.
  */
-export type Writer = { busy: boolean; writes: number; errorOf: (...paths: string[]) => string; clear: () => void; run: <T>(path: string, body: unknown, done: (result: T) => void) => Promise<void> };
+/**
+ * preview: an answer that is not a ledger view (the import's preview) changed nothing, so it is handed to done without
+ * counting as a write or showing the saved line; saved: the status line for this answer instead of 已保存 (null: none).
+ */
+export type WriteOptions<T> = { preview?: boolean; saved?: (result: T) => string | null };
+export type Writer = { busy: boolean; writes: number; errorOf: (...paths: string[]) => string; clear: () => void; run: <T>(path: string, body: unknown, done: (result: T) => void, options?: WriteOptions<T>) => Promise<void> };
 
 type View = 'overview' | 'history' | 'withdrawals' | 'connections';
 const VIEWS: { id: View; label: string }[] = [{ id: 'overview', label: '资产总览' }, { id: 'history', label: '历史记录' }, { id: 'withdrawals', label: '出金记录' }, { id: 'connections', label: '交易所连接' }];
@@ -61,12 +68,18 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
     void refreshLedger(); void refreshHistory(); void refreshWithdrawals();
   }, [version, refreshLedger, refreshHistory, refreshWithdrawals]);
   const writer = useWriter({ onExpired, onLedger: ledger.commit, onWritten: useCallback((committed: boolean) => { void state.refresh(); if (!committed) void refreshLedger(); void refreshHistory(); void refreshWithdrawals(); }, [state.refresh, refreshLedger, refreshHistory, refreshWithdrawals]) });
+  // The workbench's toggleImport: no sync starts while the import panel is open (dashboard.tsx importOpenRef).
+  const [importOpen, setImportOpen] = useState(false), importing = useRef(false);
+  const toggleImport = (open: boolean) => { importing.current = open; setImportOpen(open); if (open) writer.clear(); };
+  // The panel goes with the example notice (a workbench re-import made the ledger personal): the syncs resume.
+  const showsExample = ledger.data?.ledger?.dataKind === 'example';
+  useEffect(() => { if (!showsExample) { importing.current = false; setImportOpen(false); } }, [showsExample]);
   // The workbench's startRefreshLoop: a sync every minute while the page is shown and online, and one when it comes back.
   const sync = useRef(writer.sync), stopSync = useRef(writer.stopSync);
   useEffect(() => { sync.current = writer.sync; stopSync.current = writer.stopSync; });
   useEffect(() => {
     if (!imported) return;
-    const loop = startRefreshLoop({ page: document, view: window, enabled: () => !document.hidden && navigator.onLine, onActivity: active => { if (!active) stopSync.current(); }, refresh: () => void sync.current(false) });
+    const loop = startRefreshLoop({ page: document, view: window, enabled: () => !document.hidden && navigator.onLine && !importing.current, onActivity: active => { if (!active) stopSync.current(); }, refresh: () => void sync.current(false) });
     return () => loop.stop();
   }, [imported]);
 
@@ -94,14 +107,16 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
     ...(data?.summary?.valuation.partial ? [{ key: 'valuation', role: 'status' as const, text: data.summary.valuation.missingValues + ' 项资产估值缺失，汇总仅包含已知金额，当前为部分估值。', tone: 'warn' as const }] : []),
     ...(data?.ledger?.assets ?? []).filter(asset => asset.error).map(asset => ({ key: 'asset-' + asset.id, role: 'status' as const, text: asset.project + '：' + asset.error, tone: 'warn' as const })),
   ];
+  // The workbench's importNotice and its dialog (A-6), the dialog as a panel under the notice.
   const example = data?.ledger?.dataKind === 'example'
-    ? <div className="notice import-notice"><Info size={15} aria-hidden="true" /><div><strong>当前为示例数据，工作台尚未导入原表</strong><p>这里的资产和金额是演示内容。在工作台导入原表后重新运行导入命令，才会显示真实持仓和历史。</p></div></div> : null;
+    ? <><div className="notice import-notice"><Info size={15} aria-hidden="true" /><div><strong>当前为示例数据，尚未导入你的原表</strong><p>这里的资产和金额是演示内容。导入原表后才会显示你的真实持仓和历史。</p></div><button type="button" className="button primary" disabled={writer.busy || importOpen} onClick={() => toggleImport(true)}>导入原表数据</button></div>
+      {importOpen ? <ImportPanel writer={writer} onClose={() => toggleImport(false)} /> : null}</> : null;
   return <div className="asset-desk">
     <div className="ledger-head">
       <nav className="ledger-tabs" aria-label="资产账本">{VIEWS.map(({ id, label }) => <button type="button" key={id} aria-current={view === id ? 'page' : undefined} onClick={() => navigate(id)}>{label}{counts[id] ? <span className="count-chip">{counts[id]}</span> : null}</button>)}</nav>
       <div className="ledger-head-meta">
         <span className="workspace-date">导入于 {fullStamp(info.importedAt)} · 北京时间</span>
-        <button type="button" className="button primary" disabled={writer.busy} onClick={() => void writer.sync(true)}><RefreshCw size={15} className={writer.syncing ? 'loading-spin' : undefined} aria-hidden="true" />{writer.syncing ? '正在更新' : '刷新资产'}</button>
+        <button type="button" className="button primary" disabled={writer.busy || importOpen} onClick={() => void writer.sync(true)}><RefreshCw size={15} className={writer.syncing ? 'loading-spin' : undefined} aria-hidden="true" />{writer.syncing ? '正在更新' : '刷新资产'}</button>
       </div>
     </div>
     {alerts.length ? <div className="ledger-strip"><span className="strip-title"><TriangleAlert size={14} aria-hidden="true" />{alerts.length} 项提醒</span>{alerts.map(item => <span key={item.key} className={'strip-item ' + item.tone} role={item.role}>{item.text}</span>)}</div> : null}
@@ -137,7 +152,7 @@ function useWriter({ onExpired, onLedger, onWritten }: { onExpired: () => void; 
   const flash = useCallback((text: string) => { setSaved(text); clearTimeout(timer.current); timer.current = setTimeout(() => { if (mounted.current) setSaved(''); }, SAVED_MS); }, []);
   const clear = useCallback(() => setError(null), []);
   const errorOf = useCallback((...paths: string[]) => error && paths.includes(error.path) ? error.text : '', [error]);
-  const run = useCallback(async <T,>(path: string, body: unknown, done: (result: T) => void) => {
+  const run = useCallback(async <T,>(path: string, body: unknown, done: (result: T) => void, options: WriteOptions<T> = {}) => {
     if (running.current) return;
     running.current = true; setBusy(true); setError(null); setSaved('');
     try {
@@ -145,9 +160,11 @@ function useWriter({ onExpired, onLedger, onWritten }: { onExpired: () => void; 
       if (!mounted.current) return;
       // A success without a readable body (api.ts answers {}) went through; the ledger is read again instead.
       const committed = isLedgerView(result);
+      if (!committed && options.preview) { done(result); return; }
       if (committed) onLedger(result);
       onWritten(committed); setWrites(count => count + 1); done(result);
-      flash('已保存');
+      const text = options.saved ? options.saved(result) : '已保存';
+      if (text) flash(text);
     } catch (reason) {
       if (!mounted.current) return;
       if (reason instanceof ApiError && reason.status === 401) { onExpired(); return; }

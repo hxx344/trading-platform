@@ -16,9 +16,10 @@ pkg="$stage/trading-platform"
 mkdir -p "$pkg/deploy" "$pkg/web" "$pkg/scripts" "$out"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$pkg/"
 # The Var helpers run as `python3 -I -B <release>/scripts/variational-*.py` (src/asset/sources/variational-python.ts and
-# src/monitor/variational-transport.ts find them relative to their own files); the other scripts are development tools and
-# stay out of the package.
-cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$pkg/scripts/"
+# src/monitor/variational-transport.ts find them relative to their own files); import-workbook.py is the workbook converter
+# the asset page's import panel names (A-6, run by hand on a computer with openpyxl, never by the service); the other
+# scripts are development tools and stay out of the package.
+cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$root/scripts/import-workbook.py" "$pkg/scripts/"
 cp -R "$root/web/dist" "$pkg/web/"
 cp "$root/deploy/trading-platform.service" "$root/deploy/trading-platform-import.service" "$root/deploy/trading-platform-import.path" "$root/deploy/trading-platform-update.service" "$root/deploy/trading-platform-update.path" "$root/deploy/config.example.json" "$root/deploy/secrets.example.json" "$pkg/deploy/"
 printf 'v%s %s\n' "$version" "$commit" >"$pkg/VERSION"

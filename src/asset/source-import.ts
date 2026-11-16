@@ -21,6 +21,8 @@ import type { AssetDb } from './db.ts';
 import type { SyncLease } from './sync-lock.ts';
 import { AssetConflict } from './sync-lock.ts';
 import type { Asset, Ledger } from './types.ts';
+import type { ImportSummary } from './views.ts';
+export type { ImportSummary } from './views.ts';
 import { seedLedger } from './seed.ts';
 import { EXAMPLE_SOURCE, isGateProject, isHyperliquidProject, parseSource, type SourceLedger } from './source-ledger.ts';
 import { quantityValue, withMarketQuantity, UNKNOWN_QUANTITY_ERROR } from './asset-values.ts';
@@ -36,7 +38,6 @@ export class AssetBackupError extends Error {
   constructor() { super(BACKUP_FAILED); this.name = 'AssetBackupError'; }
 }
 
-export type ImportSummary = { source: string; rows: number; periods: number; baselineDate: string; baselineTotal: number; resultingRows: number; retained: string[] };
 export type ImportInput = { source: unknown; apply: boolean; fingerprint: string | null };
 type Database = Pick<AssetDb, 'prepare'>;
 

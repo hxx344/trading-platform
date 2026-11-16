@@ -388,3 +388,13 @@
 .asset-desk .connections-grid > .connect-panel { grid-column: 1 / -1; margin-bottom: 0 }
 .asset-desk .aster-accounts-panel .edit-panel { margin: 14px 0 0; padding: 12px 0 0; border-top: 1px solid var(--border) }
 .asset-desk .aster-accounts-panel .edit-panel h3 { font-size: 14px; font-weight: 600; margin: 0 0 4px }
+
+/* A-6 原表导入：复制自工作台 modules/asset/app/globals.css（7745181）第 114 行的 .import-notice .button 与 .import-summary、
+   第 245 行、第 371 行（600px 以下），规则不改，加 .asset-desk 前缀；导入弹窗按本页做法改为原位展开的面板（沿用 .edit-panel） */
+.asset-desk .import-notice .button { flex-shrink: 0 }
+.asset-desk .import-summary { border: 1px solid var(--border); background: var(--secondary); border-radius: 8px; padding: 16px; font-size: .875rem; line-height: 1.9; overflow-wrap: anywhere }
+.asset-desk .import-notice .button { min-height: 28px; padding: 0 10px; font-size: 12px }
+@media (max-width: 600px) { .asset-desk .import-notice .button { margin-left: auto; min-height: 40px } }
+/* 本服务自己的：摘要里每行一段，去掉段落外边距；生成命令可换行 */
+.asset-desk .import-summary p { margin: 0 }
+.asset-desk .import-panel code { overflow-wrap: anywhere }

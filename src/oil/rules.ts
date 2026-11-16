@@ -1,5 +1,5 @@
-// Oil spread rules (docs/oil.md section 7). A rule watches one venue's same-venue BZ − CL executable spread on the books the
-// oil page already reads every 3 s. In observe mode (O2a) it only records when its open or close condition would have fired;
+// Spread rules (docs/oil.md section 7; hynix docs/hynix.md 8.2). A rule watches one venue's same-venue executable spread on
+// the books the oil and hynix pages already read every 3 s: BZ − CL in USDT per barrel, or the hynix ADR premium in percent. In observe mode (O2a) it only records when its open or close condition would have fired;
 // in live mode (O2b, rule-live.ts) it opens and closes through the executor's own preview and confirm.
 //
 // The semantics follow the workbench's server/trading-auto.mjs (commit 31242e0): open and close are counted on their own,
@@ -8,11 +8,12 @@
 // live in oil-rules.sqlite beside the main database, which an older version never opens.
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { ContractError, VENUES, VENUE_NAMES, exactKeys, integer, oneOf, reject, type Venue } from '../contracts.ts';
+import { ContractError, MAX_BATCHES, MAX_BATCH_INTERVAL_MS, VENUES, VENUE_NAMES, exactKeys, integer, oneOf, reject, type Venue } from '../contracts.ts';
 import { cmp, decimal, sub } from '../decimal.ts';
+import { comparePremium, premiumPercent } from '../hynix/sizing.ts';
 import {
-  FAILURE_LIMIT, PHASE_NAMES, RETRY_MS, actionName, beijingDay, idleLive, isFinal, liveOf, opensOn, planLegs, planRows, ruleIntent, ruleSession, sameAccount, settleJob,
-  type LiveState, type RuleExecutor, type Tracked,
+  BASE_LEG, FAILURE_LIMIT, JOB_TIMEOUT_MS, LEG_LABELS, MARKET_LABELS, MAX_RULE_JOB_MS, PHASE_NAMES, PREMIUM_LEG, RETRY_MS, RULE_LEGS, RULE_MARKETS, actionName, beijingDay, idleLive, isFinal, liveOf, opensOn, planLegs, planRows, ruleIntent, ruleSession, sameAccount, settleJob,
+  type LiveState, type RuleExecutor, type RuleMarket, type Tracked,
 } from './rule-live.ts';
 
 export const OIL_RULES_DATABASE = 'oil-rules.sqlite';
@@ -24,33 +25,41 @@ export const MAX_EVENTS = 30;
 export const QUOTE_MAX_AGE_MS = 10_000;
 /** A book stamped further ahead of the server clock than this is not trusted. */
 export const QUOTE_FUTURE_MS = 1_000;
-const THRESHOLD_LIMIT = '1000', BARRELS_LIMIT = '10000';
-const BZ = 'BZUSDT', CL = 'CLUSDT';
+const THRESHOLD_LIMIT = '1000', BARRELS_LIMIT = '10000', NOTIONAL_LIMIT = '1000000';
+/** Hynix premiums cannot fall below −100 %; the workbench allows −99. */
+const THRESHOLD_LOW: Record<RuleMarket, string> = { oil: `-${THRESHOLD_LIMIT}`, hynix: '-99' };
 
 export type Direction = 'short' | 'long';
 export type RuleAction = 'open' | 'close';
 export interface RuleConfig {
+  /** Stored only for hynix: a rule written before hynix rules (or an oil rule) has none and is oil. */
+  market: RuleMarket;
   name: string;
   venue: Venue;
   direction: Direction;
-  /** USDT per barrel, decimal strings. */
+  /** Oil: USDT per barrel; hynix: percent. Decimal strings. */
   openThreshold: string;
   closeThreshold: string;
-  /** Per leg; used by the live mode only. */
-  barrels: string;
+  /** Oil, per leg; used by the live mode only. */
+  barrels?: string;
+  /** Hynix, USDT per leg; used by the live mode only. */
+  notional?: string;
   confirmSamples: number;
   /** Beijing calendar day; used by the live mode only. */
   maxOpensPerDay: number;
+  /** Each job split into this many market batches; absent is one batch (stored only when more than one). */
+  batches?: { count: number; intervalMs: number };
 }
 export interface RuleEvent {
   at: number;
   kind: 'signal' | 'reset' | 'note';
   message: string;
   action?: RuleAction;
-  /** The executable spread that met the threshold, USDT per barrel. */
+  /** The executable spread that met the threshold: USDT per barrel (oil) or percent (hynix). */
   value?: string;
   threshold?: string;
   hits?: number;
+  /** Book times of the premium leg (BZ, the hynix ADR) and the base leg (CL, the ordinary share); named for oil. */
   bzAt?: number;
   clAt?: number;
   revision?: number;
@@ -58,13 +67,14 @@ export interface RuleEvent {
 interface RuleState { mode: 'observe' | 'live'; observing: boolean; live: LiveState; events: RuleEvent[]; observations: RuleEvent[] }
 interface Rule { id: string; revision: number; createdAt: number; config: RuleConfig; state: RuleState }
 
-/** The slice of the oil market view a rule reads: one row per venue and contract. */
+/** The slice of the oil and hynix market views a rule reads: one row per venue and contract. */
 export interface BookRow { venue: Venue; symbol: string; bid: string | null; ask: string | null; receivedAt: number | null; error: string | null }
 export interface Reading { value: string; met: boolean; side: 'sell' | 'buy'; sample: string; at: number; bzAt: number; clAt: number }
 interface Counted extends Reading { hits: number; signaled: boolean }
 interface Observed { open?: Counted; close?: Counted; note: string | null }
 
-const CONFIG_KEYS = ['name', 'venue', 'direction', 'openThreshold', 'closeThreshold', 'barrels', 'confirmSamples', 'maxOpensPerDay'] as const;
+const CONFIG_KEYS = ['name', 'venue', 'direction', 'openThreshold', 'closeThreshold', 'confirmSamples', 'maxOpensPerDay'] as const;
+const OPTIONAL_KEYS = ['market', 'barrels', 'notional', 'batches'] as const;
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
 
 function bounded(value: unknown, name: string, low: string, high: string, sign: 'any' | 'positive'): string {
@@ -77,25 +87,40 @@ function bounded(value: unknown, name: string, low: string, high: string, sign: 
   return result;
 }
 
-/** Checks a rule's settings; `venues` are the configured oil venues (a rule elsewhere could never be judged). */
+/**
+ * Checks a rule's settings; `venues` are the configured execution venues (a rule elsewhere could never be judged). Oil sizes
+ * by barrels, hynix by USDT notional, each refusing the other's field; batches of one are dropped so the rule reads as before.
+ */
 export function parseRuleConfig(value: unknown, venues: readonly Venue[]): RuleConfig {
-  const raw = exactKeys(value, [...CONFIG_KEYS]);
+  const raw = exactKeys(value, [...CONFIG_KEYS], [...OPTIONAL_KEYS]);
+  const market = raw.market === undefined ? 'oil' : oneOf(raw.market, RULE_MARKETS, '品种'), hynix = market === 'hynix';
   const name = raw.name;
   if (typeof name !== 'string' || name.trim().length > 40 || CONTROL.test(name)) reject('invalid_value', '规则名称最多 40 个字符');
   const venue = oneOf(raw.venue, VENUES, '交易所');
-  if (!venues.includes(venue)) reject('venue_not_configured', `没有配置 ${VENUE_NAMES[venue]} 原油执行账户`);
+  if (!venues.includes(venue)) reject('venue_not_configured', `没有配置 ${VENUE_NAMES[venue]} 执行账户`);
   const direction = oneOf(raw.direction, ['short', 'long'] as const, '开仓方向');
-  const openThreshold = bounded(raw.openThreshold, '开仓阈值', `-${THRESHOLD_LIMIT}`, THRESHOLD_LIMIT, 'any');
-  const closeThreshold = bounded(raw.closeThreshold, '平仓阈值', `-${THRESHOLD_LIMIT}`, THRESHOLD_LIMIT, 'any');
-  const order = cmp(closeThreshold, openThreshold);
-  if (direction === 'short' ? order >= 0 : order <= 0) reject('threshold_order', direction === 'short' ? '做空价差时，平仓阈值须低于开仓阈值' : '做多价差时，平仓阈值须高于开仓阈值');
-  return {
-    name: (name as string).trim(), venue, direction, openThreshold, closeThreshold,
-    barrels: bounded(raw.barrels, '每腿桶数', '0', BARRELS_LIMIT, 'positive'),
-    confirmSamples: integer(raw.confirmSamples, 1, 30, '连续满足次数'),
-    maxOpensPerDay: integer(raw.maxOpensPerDay, 1, 50, '每日最多开仓次数'),
-  };
+  const openThreshold = bounded(raw.openThreshold, '开仓阈值', THRESHOLD_LOW[market], THRESHOLD_LIMIT, 'any');
+  const closeThreshold = bounded(raw.closeThreshold, '平仓阈值', THRESHOLD_LOW[market], THRESHOLD_LIMIT, 'any');
+  const order = cmp(closeThreshold, openThreshold), spread = hynix ? '溢价' : '价差';
+  if (direction === 'short' ? order >= 0 : order <= 0) reject('threshold_order', direction === 'short' ? `做空${spread}时，平仓阈值须低于开仓阈值` : `做多${spread}时，平仓阈值须高于开仓阈值`);
+  const [sizeKey, otherKey] = hynix ? ['notional', 'barrels'] as const : ['barrels', 'notional'] as const;
+  if (raw[otherKey] !== undefined) reject('unknown_field', `未知字段：${otherKey}`);
+  if (raw[sizeKey] === undefined) reject('missing_field', `缺少字段：${sizeKey}`);
+  const size = hynix ? { notional: bounded(raw.notional, '每腿名义金额', '0', NOTIONAL_LIMIT, 'positive') } : { barrels: bounded(raw.barrels, '每腿桶数', '0', BARRELS_LIMIT, 'positive') };
+  const confirmSamples = integer(raw.confirmSamples, 1, 30, '连续满足次数'), maxOpensPerDay = integer(raw.maxOpensPerDay, 1, 50, '每日最多开仓次数');
+  let batches: RuleConfig['batches'];
+  if (raw.batches !== undefined && raw.batches !== null) {
+    const batch = exactKeys(raw.batches, ['count', 'intervalMs']);
+    batches = { count: integer(batch.count, 1, MAX_BATCHES, '批次数'), intervalMs: integer(batch.intervalMs, 0, MAX_BATCH_INTERVAL_MS, '批次间隔毫秒数') };
+    // The job's deadline grows with the intervals and the executor takes an hour at most.
+    if (JOB_TIMEOUT_MS + (batches.count - 1) * batches.intervalMs > MAX_RULE_JOB_MS) reject('batch_timeout', `${batches.count} 批、每批间隔 ${batches.intervalMs / 1000} 秒，加上 ${JOB_TIMEOUT_MS / 1000} 秒执行时间超过 ${MAX_RULE_JOB_MS / 1000} 秒`);
+    if (batches.count === 1) batches = undefined;
+  }
+  // Key order is the stored order: an oil rule without batches is written exactly as before hynix rules (docs/hynix.md 8.3).
+  return { market, name: (name as string).trim(), venue, direction, openThreshold, closeThreshold, ...size, confirmSamples, maxOpensPerDay, ...(batches ? { batches } : {}) };
 }
+/** The settings as stored: oil leaves out its market, so a store without hynix or batched rules reads in older versions. */
+export const storedConfig = ({ market, ...rest }: RuleConfig): string => JSON.stringify(market === 'oil' ? rest : { market, ...rest });
 
 /** A complete stand-in for stored settings that no longer parse: each field kept only when it has the right type. */
 function placeholderConfig(text: string): RuleConfig {
@@ -103,17 +128,19 @@ function placeholderConfig(text: string): RuleConfig {
   try { const value: unknown = JSON.parse(text); if (value && typeof value === 'object' && !Array.isArray(value)) raw = value as Record<string, unknown>; } catch { /* nothing to keep */ }
   const text24 = (value: unknown) => typeof value === 'string' && value.length <= 24 ? value : '';
   const whole = (value: unknown) => Number.isSafeInteger(value) ? value as number : 0;
+  const market: RuleMarket = raw.market === 'hynix' ? 'hynix' : 'oil';
   return {
+    market,
     name: typeof raw.name === 'string' && raw.name.length <= 40 && !CONTROL.test(raw.name) ? raw.name : '',
     venue: (VENUES as readonly unknown[]).includes(raw.venue) ? raw.venue as Venue : 'binance',
     direction: raw.direction === 'long' ? 'long' : 'short',
-    openThreshold: text24(raw.openThreshold), closeThreshold: text24(raw.closeThreshold), barrels: text24(raw.barrels),
+    openThreshold: text24(raw.openThreshold), closeThreshold: text24(raw.closeThreshold), ...(market === 'hynix' ? { notional: text24(raw.notional) } : { barrels: text24(raw.barrels) }),
     confirmSamples: whole(raw.confirmSamples), maxOpensPerDay: whole(raw.maxOpensPerDay),
   };
 }
 
 /** Stored state read defensively: anything that is not the expected shape becomes a stopped rule with the records it can keep. */
-function stateOf(text: string): RuleState {
+function stateOf(text: string, market: RuleMarket): RuleState {
   let raw: Record<string, unknown> | null = null;
   try { const value: unknown = JSON.parse(text); if (value && typeof value === 'object' && !Array.isArray(value)) raw = value as Record<string, unknown>; } catch { /* nothing to keep */ }
   const valid = (item: unknown): item is RuleEvent => {
@@ -131,16 +158,19 @@ function stateOf(text: string): RuleState {
   }
   const mode = raw.mode === 'live' ? 'live' : 'observe';
   // An observe rule keeps the day's opens it made while live, so switching modes does not clear the daily limit.
-  const live = mode === 'live' ? liveOf(raw.live) : { ...idleLive(), opens: liveOf(raw.live).opens };
+  const live = mode === 'live' ? liveOf(raw.live, market) : { ...idleLive(), opens: liveOf(raw.live, market).opens };
   return { mode, observing: mode === 'observe' && raw.observing === true, live, events: records(raw.events), observations: records(raw.observations) };
 }
 
-export const ruleTitle = (config: RuleConfig): string => config.name || `${VENUE_NAMES[config.venue]} 原油${config.direction === 'short' ? '做空' : '做多'}价差`;
+export const ruleTitle = (config: RuleConfig): string => config.name || `${VENUE_NAMES[config.venue]} ${MARKET_LABELS[config.market]}${config.direction === 'short' ? '做空' : '做多'}${config.market === 'hynix' ? '溢价' : '价差'}`;
+/** The value for records: oil as before (USDT per barrel, no unit), hynix in percent cut to four places. */
+export const spreadText = (market: RuleMarket, value: string): string => market === 'hynix' ? `${value.replace(/(\.\d{4})\d+$/, '$1')}%` : value;
 
 /**
  * The executable spread for one condition and whether it meets its threshold, or why it cannot be judged. Selling the
- * spread (short open, long close) gets BZ bid − CL ask and must reach the threshold; buying it (short close, long open)
- * pays BZ ask − CL bid and must not exceed it.
+ * spread (short open, long close) gets the premium leg's bid against the base leg's ask and must reach the threshold;
+ * buying it (short close, long open) pays the premium ask against the base bid and must not exceed it. Oil: BZ − CL in
+ * USDT per barrel. Hynix: ADR × 10 ÷ ordinary − 1 in percent, compared exactly as the workbench's compareSpread.
  */
 export function evaluateRule(config: RuleConfig, action: RuleAction, books: readonly BookRow[], now: number): Reading | { error: string } {
   const read = (symbol: string): { bid: string; ask: string; at: number } | { error: string } => {
@@ -151,13 +181,19 @@ export function evaluateRule(config: RuleConfig, action: RuleAction, books: read
     if (now - row.receivedAt > QUOTE_MAX_AGE_MS) return { error: `${symbol} 盘口已过期` };
     return { bid: row.bid, ask: row.ask, at: row.receivedAt };
   };
-  const bz = read(BZ), cl = read(CL);
-  if ('error' in bz) return bz;
-  if ('error' in cl) return cl;
+  const premium = read(PREMIUM_LEG[config.market]), base = read(BASE_LEG[config.market]);
+  if ('error' in premium) return premium;
+  if ('error' in base) return base;
   const sell = (config.direction === 'short') === (action === 'open');
-  const value = sell ? sub(bz.bid, cl.ask) : sub(bz.ask, cl.bid);
-  const sign = cmp(value, action === 'open' ? config.openThreshold : config.closeThreshold);
-  return { value, met: sell ? sign >= 0 : sign <= 0, side: sell ? 'sell' : 'buy', sample: `${bz.at}|${cl.at}`, at: Math.min(bz.at, cl.at), bzAt: bz.at, clAt: cl.at };
+  const premiumPrice = sell ? premium.bid : premium.ask, basePrice = sell ? base.ask : base.bid;
+  const threshold = action === 'open' ? config.openThreshold : config.closeThreshold;
+  let value: string, sign: -1 | 0 | 1;
+  if (config.market === 'hynix') {
+    const percent = premiumPercent(premiumPrice, basePrice);
+    if (percent === null) return { error: `${BASE_LEG.hynix} 盘口价格无效` };
+    value = percent; sign = comparePremium(premiumPrice, basePrice, threshold);
+  } else { value = sub(premiumPrice, basePrice); sign = cmp(value, threshold); }
+  return { value, met: sell ? sign >= 0 : sign <= 0, side: sell ? 'sell' : 'buy', sample: `${premium.at}|${base.at}`, at: Math.min(premium.at, base.at), bzAt: premium.at, clAt: base.at };
 }
 
 function openDatabase(file: string): DatabaseSync {
@@ -178,9 +214,9 @@ function openDatabase(file: string): DatabaseSync {
 
 export interface OilRulesOptions {
   file: string;
-  /** Configured oil venues. */
+  /** Configured execution venues (oil's accounts; hynix trades on the same ones). */
   venues: readonly Venue[];
-  /** The oil market's current books (OilMarket.view().books). */
+  /** The current oil and hynix books (OilMarket.view().books and HynixMarket.view().books together). */
   books: () => readonly BookRow[];
   now?: () => number;
   /** The executor live rules order through; without it rules can only observe. */
@@ -220,13 +256,14 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
   type Row = { id: string; revision: number; createdAt: number; config: string; state: string };
   const parse = (row: Row | undefined): Rule | null => {
     if (!row) return null;
-    let config: RuleConfig, state: RuleState;
-    state = stateOf(row.state);
+    let config: RuleConfig;
     try { config = parseRuleConfig(JSON.parse(row.config), VENUES); invalid.delete(row.id); }
     catch (error) {
       invalid.set(row.id, `规则参数无法读取：${error instanceof Error ? error.message.slice(0, 120) : String(error)}；请修改或删除`);
       config = placeholderConfig(row.config);
     }
+    // The held legs are read against the rule's market, so a record of other contracts is held for review.
+    const state = stateOf(row.state, config.market);
     return { id: row.id, revision: Number(row.revision), createdAt: Number(row.createdAt), config, state };
   };
   const rows = (): Rule[] => (selectAll.all() as Row[]).map(row => parse(row)!);
@@ -273,7 +310,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
    */
   function countOn(rule: Rule, current: readonly BookRow[], actions: readonly RuleAction[]): Observed | null {
     if (invalid.has(rule.id)) { observed.set(rule.id, { note: invalid.get(rule.id)! }); return null; }
-    if (!venues.includes(rule.config.venue)) { resetObservation(rule, `配置里没有 ${VENUE_NAMES[rule.config.venue]} 原油执行账户`); return null; }
+    if (!venues.includes(rule.config.venue)) { resetObservation(rule, `配置里没有 ${VENUE_NAMES[rule.config.venue]} 执行账户`); return null; }
     const time = now();
     const readings: Partial<Record<RuleAction, Reading>> = {};
     for (const action of actions) {
@@ -410,13 +447,13 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     const current = unchanged(id, revision, phase);
     hold(rule, `${actionName(action)}已处理，等待新盘口`);
     if (!current) return;
-    const live = current.state.live, legs = planLegs(plan);
-    if (!legs) { rejected(current, action, '预览', new Error('预览的两腿不是 CL、BZ')); return; }
+    const live = current.state.live, legs = planLegs(plan, current.config.market);
+    if (!legs) { rejected(current, action, '预览', new Error(`预览的两腿不是 ${RULE_LEGS[current.config.market].join('、')}`)); return; }
     const time = now(), day = beijingDay(time);
     // Recheck on the books the plan was priced on: the executor protects the price, this protects the threshold.
     const again = evaluateRule(current.config, action, planRows(current.config.venue, legs), time);
     if ('error' in again || !again.met) {
-      event(current.state, `下单前复核未通过（${'error' in again ? again.error : `预览盘口价差 ${again.value}，阈值 ${action === 'open' ? current.config.openThreshold : current.config.closeThreshold}`}），不下单，重新计数`);
+      event(current.state, `下单前复核未通过（${'error' in again ? again.error : `预览盘口${current.config.market === 'hynix' ? '溢价' : '价差'} ${spreadText(current.config.market, again.value)}，阈值 ${action === 'open' ? current.config.openThreshold : current.config.closeThreshold}`}），不下单，重新计数`);
       save(current);
       return;
     }
@@ -428,7 +465,8 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     live.phase = action === 'open' ? 'opening' : 'closing';
     live.pending = { action, requestId: randomUUID(), previewId: plan.id, at: time, day, accounts: legs.map(leg => ({ accountKey: leg.accountKey, credentialVersion: leg.credentialVersion })) };
     if (action === 'open') live.opens = { day, count: opensOn(live, day) + 1 };
-    event(current.state, `${actionName(action)}预览通过：价差 ${again.value}，CL ${legs[0].quantity}、BZ ${legs[1].quantity}${plan.barrels ? `（每腿 ${plan.barrels} 桶）` : ''}${plan.notional ? `，名义 ${plan.notional} USDT` : ''}；确认下单`);
+    const sizes = legs.map(leg => `${LEG_LABELS[leg.symbol] ?? leg.symbol} ${leg.quantity}`).join('、');
+    event(current.state, `${actionName(action)}预览通过：${current.config.market === 'hynix' ? '溢价' : '价差'} ${spreadText(current.config.market, again.value)}，${sizes}${plan.barrels ? `（每腿 ${plan.barrels} 桶）` : ''}${plan.batches && plan.batches.length > 1 ? `，分 ${plan.batches.length} 批` : ''}${plan.notional ? `，名义 ${plan.notional} USDT` : ''}；确认下单`);
     // Written before the confirm, so a restart in between replays the same request instead of sending another.
     save(current);
     submit(current);
@@ -444,7 +482,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
       throw error;
     }
     if (!isFinal(job.status)) { observed.set(rule.id, { note: `${actionName(tracked.action)}任务执行中` }); return; }
-    const outcome = settleJob(job, tracked, live.held, rule.config.direction);
+    const outcome = settleJob(job, tracked, live.held, rule.config);
     if (outcome.kind === 'review') { toReview(rule, outcome.message); return; }
     live.job = null;
     let text = outcome.message;
@@ -550,7 +588,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     const state: RuleState = { mode: 'observe', observing, live: idleLive(), events: [], observations: [] };
     event(state, '规则已创建（观察模式，不下单）');
     observation(state, observing ? '开始只观察，等待新盘口' : '观察规则已保存，尚未开始');
-    insert.run(id, 0, now(), JSON.stringify(config), JSON.stringify(state));
+    insert.run(id, 0, now(), storedConfig(config), JSON.stringify(state));
     restart(id);
     return view();
   }
@@ -560,6 +598,8 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     checkRevision(rule, raw.revision);
     const config = parseRuleConfig(raw.config, venues);
     const live = rule.state.live;
+    // Contracts, units and the held record all follow the market: a rule keeps the market it was created with.
+    if (config.market !== rule.config.market) throw new ContractError(409, 'rule_market', '规则品种不能修改；请新建另一品种的规则');
     if (rule.state.mode === 'live') {
       if (busy(live)) throw new ContractError(409, 'rule_busy', '规则正在开仓或平仓，结束后再修改');
       // Size, thresholds and limits were confirmed when the rule was enabled: changing them takes a disable and a new enable.
@@ -568,7 +608,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     }
     event(rule.state, '规则参数已修改');
     if (rule.state.observing || judging(rule)) observation(rule.state, '规则参数已修改，连续次数已清零，等待新盘口');
-    write.run(rule.revision + 1, JSON.stringify(config), JSON.stringify(rule.state), id);
+    write.run(rule.revision + 1, storedConfig(config), JSON.stringify(rule.state), id);
     invalid.delete(id);
     restart(id);
     return view();
@@ -584,7 +624,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
       if (raw.confirmLive !== true) reject('confirm_required', '实盘规则须明确确认（confirmLive: true）');
       if (!executor) throw new ContractError(503, 'live_unavailable', '本服务没有接入执行器，不能启用实盘规则');
       if (invalid.has(id)) refuse('invalid_rule', invalid.get(id)!);
-      if (!venues.includes(rule.config.venue)) refuse('venue_not_configured', `配置里没有 ${VENUE_NAMES[rule.config.venue]} 原油执行账户`);
+      if (!venues.includes(rule.config.venue)) refuse('venue_not_configured', `配置里没有 ${VENUE_NAMES[rule.config.venue]} 执行账户`);
     }
     if (action === 'delete') {
       if (isLive && (busy(live) || live.phase !== 'idle' || live.held)) refuse('rule_holding', '只有等待开仓且没有持仓的规则能删除');

@@ -30,21 +30,26 @@ export interface HynixForm {
   chaseLimit: string;
   timeoutSeconds: string;
   slippageBps: string;
+  /** Lead market or local chase only: the lead split on its step, each batch's hedge in the planned proportion (docs/hynix.md 8.2). */
+  batchCount: string;
+  batchIntervalSeconds: string;
 }
 
 export interface HynixLegIntent { venue: OilVenue; symbol?: HynixSymbol; side: OilSide; orderType: OilLeadType; notional?: string; quantity?: string; limitPrice?: string }
 export interface HynixIntent {
-  market: 'hynix'; preset: OilPreset; symbol?: HynixSymbol; action: 'open' | 'close'; timeoutMs: number; maxSlippageBps?: number;
+  market: 'hynix'; preset: OilPreset; symbol?: HynixSymbol; action: 'open' | 'close'; timeoutMs: number; maxSlippageBps?: number; batches?: { count: number; intervalMs: number };
   legs: [HynixLegIntent, HynixLegIntent];
 }
 
 export const DEFAULT_HYNIX_FORM: HynixForm = {
   preset: 'same-exchange', venue: 'binance', action: 'open', premium: 'short', leadSymbol: 'SKHYUSDT', symbol: 'SKHYUSDT', leadSide: 'long',
   sizing: 'notional', notional: '', leadQuantity: '', hedgeQuantity: '', leadOrderType: 'market', chaseLimit: '', timeoutSeconds: '60', slippageBps: '',
+  batchCount: '1', batchIntervalSeconds: '0',
 };
 
 const DECIMAL = /^(0|[1-9]\d{0,11})(\.\d{1,8})?$/;
 const INTEGER = /^[1-9]\d{0,6}$/;
+const COUNT = /^\d{1,6}$/;
 const other = <T extends string>(value: T, pair: readonly [T, T]): T => (value === pair[0] ? pair[1] : pair[0]);
 const opposite = (side: OilSide): OilSide => (side === 'long' ? 'short' : 'long');
 const positive = (value: string): boolean => DECIMAL.test(value) && Number(value) > 0;
@@ -81,7 +86,16 @@ export function hynixFormToIntent(form: HynixForm): { intent: HynixIntent } | { 
   if (!leadTypeAllowed(form.venue, form.leadOrderType)) return { error: form.leadOrderType === 'chase' ? '追价策略只有 Bybit 支持；Binance 首腿请选市价或本地追价' : '本地追价只用于 Binance 首腿；Bybit 首腿请选追价策略' };
   const chaseLimit = form.leadOrderType === 'local-chase' ? form.chaseLimit.trim() : '';
   if (chaseLimit !== '' && !positive(chaseLimit)) return { error: '追价界限须为正数价格，或留空用价格保护界限' };
-  const common = { market: 'hynix' as const, action: form.action, timeoutMs: Number(seconds) * 1000, ...(bps ? { maxSlippageBps: Number(bps) } : {}) };
+  // The same checks as the oil form (oil-form.ts) and the executor's parseIntent.
+  const count = form.batchCount.trim() || '1', interval = form.batchIntervalSeconds.trim() || '0';
+  if (!INTEGER.test(count) || Number(count) > 20) return { error: '批次数须为 1–20 的整数' };
+  if (!COUNT.test(interval) || Number(interval) > 600) return { error: '批次间隔须为 0–600 秒的整数' };
+  if (Number(count) > 1 && form.leadOrderType === 'chase') return { error: '分批只用于首腿市价或本地追价' };
+  if ((Number(count) - 1) * Number(interval) >= Number(seconds)) return { error: `${count} 批、每批间隔 ${interval} 秒，总间隔须短于最长执行时间` };
+  const common = {
+    market: 'hynix' as const, action: form.action, timeoutMs: Number(seconds) * 1000, ...(bps ? { maxSlippageBps: Number(bps) } : {}),
+    ...(Number(count) > 1 ? { batches: { count: Number(count), intervalMs: Number(interval) * 1000 } } : {}),
+  };
   const legs = draftHynixLegs({ ...form, chaseLimit });
   return { intent: form.preset === 'same-exchange' ? { ...common, preset: 'same-exchange', legs } : { ...common, preset: 'cross-exchange', symbol: form.symbol, legs } };
 }

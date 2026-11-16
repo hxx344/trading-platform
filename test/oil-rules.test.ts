@@ -223,7 +223,7 @@ test('库：版本比本版本新时拒绝打开；参数读不了的规则保�
     raw.close();
     const broken = first(again.view()) as View['rules'][number] & { config: RuleConfig };
     assert.equal(broken.title, 'Binance 原油做空价差');
-    assert.deepEqual(broken.config, { name: '', venue: 'binance', direction: 'short', openThreshold: '', closeThreshold: '', barrels: '', confirmSamples: 0, maxOpensPerDay: 0 });
+    assert.deepEqual(broken.config, { market: 'oil', name: '', venue: 'binance', direction: 'short', openThreshold: '', closeThreshold: '', barrels: '', confirmSamples: 0, maxOpensPerDay: 0 });
     assert.match(broken.problem!, /^规则参数无法读取/);
     assert.equal(broken.observing, false);
     assert.deepEqual([broken.events, broken.observations], [[], []]);

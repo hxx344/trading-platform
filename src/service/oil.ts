@@ -82,7 +82,7 @@ export interface OilRulesRuntime {
  */
 export function openOilRules(oil: OilRuntime, dir: string, { now = Date.now, log = (line: string) => process.stderr.write(`${line}\n`), executor }: { now?: () => number; log?: (line: string) => void; executor?: RuleExecutor } = {}): OilRulesRuntime {
   try {
-    return createOilRules({ file: join(dir, OIL_RULES_DATABASE), venues: oil.config.accounts.map(account => account.venue), books: () => oil.market.view().books, now, ...(executor ? { executor } : {}) });
+    return createOilRules({ file: join(dir, OIL_RULES_DATABASE), venues: oil.config.accounts.map(account => account.venue), books: () => [...oil.market.view().books, ...oil.hynix.view().books], now, ...(executor ? { executor } : {}) });
   } catch (error) {
     const reason = `原油自动规则库无法打开，自动规则不可用（下单与任务不受影响）：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`;
     log(reason);
@@ -190,7 +190,7 @@ export function hynixViews(oil: OilRuntime, executor: Executor, balance: HynixBa
 }
 
 /**
- * The market loops: books every 3 s (then the spread rules), positions every 15 s; with PnL, its positions every minute
+ * The market loops: oil and hynix books every 3 s (each round then the spread rules), positions every 15 s; with PnL, its positions every minute
  * and its ledgers every five minutes. Each round's reads carry their own timeout; a failure only marks the view.
  */
 export function oilLoops(oil: OilRuntime, context: { stopped(): boolean; pause(ms: number): Promise<void> }, log: (line: string) => void, rules?: OilRulesRuntime, pnl?: OilPnlRuntime, hynixCheck?: () => void): Promise<void>[] {
@@ -204,19 +204,20 @@ export function oilLoops(oil: OilRuntime, context: { stopped(): boolean; pause(m
   })();
   // The rules judge each round's books as soon as they are read; their own failure is logged apart from the read's. A live
   // rule's preview reads the venue (up to its timeout), so the books keep refreshing meanwhile and the next judging round
-  // starts on the books read after this one ends.
+  // starts on the books read after this one ends. Both markets' book rounds start a judging round (one at a time), so a
+  // hynix rule counts each fresh hynix sample even when the oil read lags; samples already counted are not counted again.
   let judging: Promise<void> | null = null;
-  const quotes = async () => {
-    await oil.market.refreshQuotes();
+  const judge = () => {
     if (rules && !judging) {
       judging = Promise.resolve().then(() => rules.tick(context.stopped))
         .catch(error => log(`原油自动规则判断失败：${error instanceof Error ? error.message : String(error)}`))
         .finally(() => { judging = null; });
     }
   };
-  // On stop the books loop ends only after the judging round in flight, so its preview and confirm finish (or fail) before
+  // On stop the books loops end only after the judging round in flight, so its preview and confirm finish (or fail) before
   // the service closes the executor and the rules store.
-  const books = every(MARKET_READ_MS, '原油盘口读取', quotes).then(async () => { await judging; });
+  const books = every(MARKET_READ_MS, '原油盘口读取', async () => { await oil.market.refreshQuotes(); judge(); }).then(async () => { await judging; });
+  const hynixBooks = every(MARKET_READ_MS, '海力士盘口读取', async () => { await oil.hynix.refreshQuotes(); judge(); }).then(async () => { await judging; });
   // The balance alert is judged on the positions just read; its failure is logged apart and never fails the read.
   const hynixPositions = async () => {
     await oil.hynix.refreshPositions();
@@ -224,6 +225,6 @@ export function oilLoops(oil: OilRuntime, context: { stopped(): boolean; pause(m
     try { hynixCheck(); } catch (error) { log(`海力士两腿平衡告警判断失败：${error instanceof Error ? error.message : String(error)}`); }
   };
   return [books, every(POSITIONS_READ_MS, '原油持仓读取', oil.market.refreshPositions),
-    every(MARKET_READ_MS, '海力士盘口读取', oil.hynix.refreshQuotes), every(POSITIONS_READ_MS, '海力士持仓读取', hynixPositions),
+    hynixBooks, every(POSITIONS_READ_MS, '海力士持仓读取', hynixPositions),
     ...(pnl ? [every(PNL_SAMPLE_MS, '原油盈亏采样', () => pnl.sample()), every(LEDGER_SYNC_MS, '原油账单同步', () => pnl.syncLedgers(context.stopped))] : [])];
 }

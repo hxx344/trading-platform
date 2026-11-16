@@ -8,6 +8,7 @@ import type { HynixState, OilBook, OilConfirmResult, OilJob, OilPreview, OilStat
 import { BalancePanel } from './HynixBalance.tsx';
 import { readBalance } from './hynix-balance.ts';
 import { ACCOUNT_MODE, ACTIVE_MS, Choice, IDLE_MS, JOB_STATUS, JobsSection, LEAVE_UNANSWERED, MARKET_MS, OIL_READ_TIMEOUT_MS, ORDER_TYPE, PositionsPanel, SyncLine, buys, confirmRefused, errorText, operation, staleness, statusOf, venueName, type PositionsKind } from './OilPage.tsx';
+import { OilRules } from './OilRules.tsx';
 import { RequestIds } from './request-ids.ts';
 import { StatePanel } from './StateViews.tsx';
 import { useLiveResource, type LiveResource } from './use-live-resource.ts';
@@ -88,6 +89,7 @@ function PreviewCard({ preview, busy, unknown, onConfirm, onEdit }: { preview: H
       <div><dt>估算名义金额</dt><dd>{preview.notional} USDT</dd></div>
       <div><dt>价格保护</dt><dd>{preview.intent.maxSlippageBps ? `${preview.intent.maxSlippageBps} 基点` : '执行器默认值'}</dd></div>
       <div><dt>最长执行</dt><dd>{Math.round(preview.intent.timeoutMs / 1000)} 秒</dd></div>
+      {preview.batches?.length ? <div><dt>分批</dt><dd>{preview.batches.length} 批 · 间隔 {Math.round((preview.intent.batches?.intervalMs ?? 0) / 1000)} 秒<small>首腿每批 {preview.batches.join(' / ')}，对冲腿每批按计划比例</small></dd></div> : null}
     </dl>
     <div className="execution-review-legs execution-table-wrap"><table className="execution-progress-table execution-review-table">
       <thead><tr><th scope="col">交易腿</th><th scope="col">数量<small>合约数量</small></th><th scope="col">下单方式</th><th scope="col">价格保护界限<small>USDT</small></th><th scope="col">买一 / 卖一<small>盘口时间</small></th></tr></thead>
@@ -241,12 +243,16 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
           </section>;
         })}</div>
         <details className="execution-advanced" open={advanced} onToggle={event => setAdvanced(event.currentTarget.open)}>
-          <summary><span><strong>执行参数</strong><small>最长 {form.timeoutSeconds || '?'} 秒 · 价格保护 {form.slippageBps ? `${form.slippageBps} 基点` : '默认'}</small></span><ChevronDown size={16} aria-hidden="true" /></summary>
+          <summary><span><strong>执行参数</strong><small>最长 {form.timeoutSeconds || '?'} 秒 · 价格保护 {form.slippageBps ? `${form.slippageBps} 基点` : '默认'}{Number(form.batchCount) > 1 ? ` · 分 ${form.batchCount} 批` : ''}</small></span><ChevronDown size={16} aria-hidden="true" /></summary>
           <div className="execution-settings">
             <label>最长执行 · 秒<input id="hynixTimeout" type="text" inputMode="numeric" autoComplete="off" maxLength={4} value={form.timeoutSeconds} onChange={event => set('timeoutSeconds', event.target.value)} /></label>
             <label>价格保护 · 基点（选填）<input id="hynixSlippage" type="text" inputMode="numeric" autoComplete="off" maxLength={4} value={form.slippageBps} placeholder="留空用默认值" onChange={event => set('slippageBps', event.target.value)} /></label>
+            {form.leadOrderType !== 'chase' ? <>
+              <label>分批 · 批数<input id="hynixBatchCount" type="text" inputMode="numeric" autoComplete="off" maxLength={2} value={form.batchCount} onChange={event => set('batchCount', event.target.value)} /></label>
+              <label>批次间隔 · 秒<input id="hynixBatchInterval" type="text" inputMode="numeric" autoComplete="off" maxLength={3} value={form.batchIntervalSeconds} disabled={Number(form.batchCount) <= 1} onChange={event => set('batchIntervalSeconds', event.target.value)} /></label>
+            </> : null}
           </div>
-          <p className="execution-help">到最长执行时间仍未完成时，停止发送并撤销余单，已成交部分保留。海力士暂不支持分批。价格保护按预览盘口计算界限：首腿超出界限的部分不成交；对冲腿按市价成交，界限只在首腿发出前核对。</p>
+          <p className="execution-help">到最长执行时间仍未完成时，停止发送并撤销余单，已成交部分保留。分批时首腿按数量步长均分，每批对冲腿按两腿计划比例跟上，首腿成交并对冲后等满间隔再发下一批；批次间隔合计须短于最长执行时间，任何一批两腿低于最小数量或最小名义金额时预览拒绝。价格保护按预览盘口计算界限：首腿超出界限的部分不成交；对冲腿按市价成交，界限只在首腿发出前核对。</p>
         </details>
         <div className="execution-builder-footer">
           {preview ? <p>正在确认上方预览；返回修改参数后可重新填写。</p> : messageView ?? <p>预览会重新读取盘口、交易规则与持仓，不会下单。</p>}
@@ -286,5 +292,6 @@ export function HynixPage({ onExpired }: { onExpired: () => void }) {
         <JobsSection jobs={state.data.jobs} stale={stale} tracked={tracked} onUntrack={() => setTracked(null)} onChanged={() => { void state.refresh(); }} />
         <OrderForm state={state.data} onAccepted={accepted} />
       </section>}
+    {state.data ? <OilRules market="hynix" onExpired={onExpired} /> : null}
   </div>;
 }

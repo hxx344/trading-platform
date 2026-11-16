@@ -117,6 +117,8 @@
 
 ## 7 价差自动规则（O2）
 
+海力士溢价规则与两品种的规则分批（H3）共用本节的状态机与规则库，差异见 [hynix.md](hynix.md) 第 8 节。
+
 按并行分工，原油价差自动规则由执行线（Agent A）负责，先做观察（observe）模式，审查后再开实盘（live）。规则语义照工作台 `server/trading-auto.mjs`（提交 `31242e0`）的同所规则，页面照工作台 `src/TradingAutoRules.tsx`。
 
 ### 7.1 规则

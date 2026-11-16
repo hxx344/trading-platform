@@ -25,7 +25,7 @@ async function withHarness(run: (h: Harness) => Promise<void>) {
   try { await run(h); } finally { h.dispose(); }
 }
 
-test('意图：海力士同所须一腿 ADR 一腿正股；每腿名义金额或数量二选一、金额须相等；不收桶数与分批；不能混用原油合约', () => {
+test('意图：海力士同所须一腿 ADR 一腿正股；每腿名义金额或数量二选一、金额须相等；不收桶数；可分批；不能混用原油合约', () => {
   const same = parsePairIntent(sameIntent());
   assert.equal(same.market, 'hynix');
   assert.deepEqual(same.legs.map(item => [item.symbol, item.side, item.quantity, item.notional]), [['SKHYUSDT', 'short', null, '100'], ['SKHYNIXUSDT', 'long', null, '100']]);
@@ -35,7 +35,8 @@ test('意图：海力士同所须一腿 ADR 一腿正股；每腿名义金额或
   assert.throws(() => parseIntent({ ...base, legs: [base.legs[0], leg('binance', 'SKHYNIXUSDT', 'long', { notional: '90' })] }), code('unbalanced'));
   assert.throws(() => parseIntent({ ...base, legs: [base.legs[0], leg('binance', 'SKHYNIXUSDT', 'long', { quantity: '0.2' })] }), code('quantity_mode'));
   assert.throws(() => parseIntent({ ...base, legs: [leg('binance', 'SKHYUSDT', 'short', { barrels: '1' }), base.legs[1]] }), code('unknown_field'));
-  assert.throws(() => parseIntent({ ...base, batches: { count: 2, intervalMs: 0 } }), code('batch_unsupported'));
+  assert.deepEqual(parsePairIntent({ ...base, batches: { count: 2, intervalMs: 0 } }).batches, { count: 2, intervalMs: 0 });
+  assert.throws(() => parseIntent({ ...base, batches: { count: 21, intervalMs: 0 } }), code('invalid_value'));
   // Opening per-leg quantities could put almost all of it on one side: open is by equal notional only.
   assert.throws(() => parseIntent({ ...base, legs: [leg('binance', 'SKHYUSDT', 'short', { quantity: '100' }), leg('binance', 'SKHYNIXUSDT', 'long', { quantity: '0.001' })] }), code('open_requires_notional'));
   // Quantities per leg may differ (a close sized to the positions held).
@@ -88,6 +89,23 @@ test('同所开平：等名义金额折成两腿数量，按计划比例对冲�
   assert.deepEqual(h.ex.recentJobs(20, 'hynix').map(job => job.id), [closed.id, opened.id]);
   assert.deepEqual(h.ex.recentJobs(20, 'oil').map(job => job.id), [oil.id]);
   assert.equal(h.ex.recentJobs(20).length, 3);
+}));
+
+test('分批：首腿按步长均分，每批对冲按计划比例累计取整，两腿合计等于计划；任何一批低于最小数量或最小名义金额拒绝', () => withHarness(async h => {
+  bindAccounts(h.ex);
+  const intent = { ...sameIntent(), batches: { count: 2, intervalMs: 0 } };
+  const preview = await h.ex.preview(intent, SESSION);
+  assert.deepEqual(preview.legs.map(item => item.quantity), ['2.42', '0.249']);
+  assert.deepEqual(preview.batches, ['1.21', '1.21']);
+  assert.ok(preview.notes.some(note => note.includes('分 2 批') && note.includes('对冲腿每批按计划比例')), preview.notes.join('\n'));
+  const done = await settle(h, (await previewAndConfirm(h, intent)).jobId);
+  assert.equal(done.status, 'completed', done.reason ?? '');
+  assert.deepEqual(done.legs.map(item => [item.symbol, item.filledQuantity]), [['SKHYUSDT', '2.42'], ['SKHYNIXUSDT', '0.249']]);
+  assert.equal(done.batches?.count, 2);
+  assert.equal(done.batches?.current, 2);
+  assert.equal(h.binance.position(SIM_ACCOUNTS.binance, 'SKHYNIXUSDT', 'long'), '0.249');
+  // 242 lead steps in 20 batches: 0.13, 0.13, then 0.12 ADR (4.94 USDT at the 41.20 bid) under the 5 USDT minimum notional.
+  await assert.rejects(h.ex.preview({ ...sameIntent(), batches: { count: 20, intervalMs: 0 } }, SESSION), (error: unknown) => error instanceof ContractError && error.code === 'batch_size' && error.message.includes('第 3 批'));
 }));
 
 test('金额太小、跨所等金额：不足最小数量拒绝；跨所同一合约按各所步长折算后按比例完成', () => withHarness(async h => {

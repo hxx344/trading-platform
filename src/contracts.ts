@@ -294,7 +294,6 @@ export function parsePairIntent(value: unknown): PairIntent {
     batches = { count: integer(batch.count, 1, MAX_BATCHES, '批次数'), intervalMs: integer(batch.intervalMs, 0, MAX_BATCH_INTERVAL_MS, '批次间隔毫秒数') };
     if (batches.count > 1 && legs[0].orderType !== 'market' && legs[0].orderType !== 'local-chase') reject('batch_unsupported', '分批只用于首腿市价或本地追价');
     if ((batches.count - 1) * batches.intervalMs >= timeoutMs) reject('batch_timeout', `${batches.count} 批、每批间隔 ${batches.intervalMs} 毫秒超过最长执行时间`);
-    if (batches.count > 1 && hynix) reject('batch_unsupported', '海力士暂不支持分批');
     if (batches.count === 1) batches = undefined;
   }
   return { market, preset, symbol, action, timeoutMs, maxSlippageBps, legs, ...(batches ? { batches } : {}) };

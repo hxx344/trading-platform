@@ -13,7 +13,7 @@ import {
 } from './connector.ts';
 import type { Store } from './store.ts';
 import { nearestBarrels, quantityForBarrels, splitBarrels } from './barrels.ts';
-import { midOf, quantityForNotional } from './hynix/sizing.ts';
+import { midOf, proportionalHedge, quantityForNotional, splitSteps } from './hynix/sizing.ts';
 import { pairBalance, rebalanceOrder, type HeldContract, type RebalanceMethod } from './hynix/balance.ts';
 import { createTransfers, type PairRecord, type TransferDeps } from './transfer.ts';
 import { DEFAULT_ADL_BUDGETS, createAdl, type Adl, type AdlBudgets } from './adl.ts';
@@ -559,6 +559,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
 
   /** Lead quantity of each batch. Every batch is checked as an order on both legs, so no batch is refused at send for its size. */
   function planBatches(legs: [PlannedLeg, PlannedLeg], count: number, quotes: readonly Quote[], action: Action): string[] {
+    if (marketOfSymbol(legs[0].symbol) === 'hynix') return planHynixBatches(legs, count, quotes, action);
     const barrels = exposure(legs[0].quantity, legs[0].instrument);
     const parts = splitBarrels(barrels, count, legs.map(leg => leg.instrument)) ?? reject('batch_size', `${barrels} 桶分不成 ${count} 批：每批须是两腿共同桶数步长的整数倍`);
     for (const part of parts) {
@@ -572,6 +573,28 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       });
     }
     return parts.map(part => quantityForBarrels(part, legs[0].instrument) as string);
+  }
+  /**
+   * Hynix (docs/hynix.md 8.2): the lead split evenly on its own step; each batch's hedge is what the planned proportion adds
+   * for that batch's lead (the executor hedges cumulative lead fills by it), so a batch that fills in full is hedged exactly so.
+   */
+  function planHynixBatches(legs: [PlannedLeg, PlannedLeg], count: number, quotes: readonly Quote[], action: Action): string[] {
+    const [lead, hedge] = legs, step = lead.instrument.quantityStep;
+    const parts = splitSteps(lead.quantity, count, step) ?? reject('batch_size', `首腿 ${lead.quantity} 分不成 ${count} 批：每批至少一个数量步长 ${step}`);
+    let done = '0', hedged = '0';
+    parts.forEach((part, batch) => {
+      done = add(done, part);
+      const target = proportionalHedge(hedge.quantity, lead.quantity, done, hedge.instrument.quantityStep), hedgePart = sub(target, hedged);
+      hedged = target;
+      [part, hedgePart].forEach((quantity, index) => {
+        try { checkQuantity({ ...legs[index]!, quantity }, legs[index]!.instrument, quotes[index] as Quote, action); }
+        catch (error) {
+          if (error instanceof ContractError) reject('batch_size', `分 ${count} 批后第 ${batch + 1} 批首腿 ${part}、对冲腿 ${hedgePart}：${error.message}`);
+          throw error;
+        }
+      });
+    });
+    return parts;
   }
 
   /**
@@ -667,7 +690,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
           ? `先发送 ${legLabel(legs, 0)} 腿，成交确认后按计划比例（对冲腿 ${legs[1].quantity} ÷ 首腿 ${legs[0].quantity}）换算其成交量，向下取整到步长后发送 ${legLabel(legs, 1)} 对冲腿；取整留下的差额不超过对冲腿一个数量步长 ${legs[1].instrument.quantityStep}。`
           : `先发送 ${legLabel(legs, 0)} 腿，成交确认后按其成交量发送 ${legLabel(legs, 1)} 对冲腿。`,
         ...(hynix ? [`按预览中间价估算：${legs.map(leg => `${legLabel(legs, leg.index)} ${leg.quantity} 约 ${mul(exposure(leg.quantity, leg.instrument), midOf(leg.quote.bid, leg.quote.ask)).replace(/(\.\d{2})\d+$/, '$1')} USDT`).join('，')}。`] : []),
-        ...(batches && intent.batches ? [`分 ${batches.length} 批，首腿每批 ${batches.map(quantity => exposure(quantity, legs[0].instrument)).join(' / ')} 桶；一批首腿结束并补齐对冲后，等 ${intent.batches.intervalMs / 1000} 秒再发下一批。后续批次发送前盘口或持仓不满足条件时等待到截止，不追加；截止或停止时未发的批次不再发送。`] : []),
+        ...(batches && intent.batches ? [`分 ${batches.length} 批，首腿每批 ${hynix ? `${batches.join(' / ')}（${legs[0].symbol} 合约数量），对冲腿每批按计划比例` : `${batches.map(quantity => exposure(quantity, legs[0].instrument)).join(' / ')} 桶`}；一批首腿结束并补齐对冲后，等 ${intent.batches.intervalMs / 1000} 秒再发下一批。后续批次发送前盘口或持仓不满足条件时等待到截止，不追加；截止或停止时未发的批次不再发送。`] : []),
         legs[0].orderType === 'local-chase'
           ? `首腿本地追价：只挂单挂在${legs[0].orderSide === 'buy' ? '买一' : '卖一'}，盘口变化后撤单重挂（挂满 ${budgets.chaseRepriceMs / 1000} 秒后才改价），${legs[0].orderSide === 'buy' ? '最高' : '最低'}追到 ${legs[0].limitPrice ?? legs[0].priceBound}${legs[0].limitPrice ? '（自填界限）' : `（${slippageBps} 基点价格保护界限）`}${legs[0].chaseCeiling ? `，最高挂到 ${legs[0].chaseCeiling}` : ''}；挂单期间的成交每轮按比例对冲。首腿最多 ${budgets.chaseOrderLimit} 笔委托（各批合计）；连续 ${budgets.chaseFailureLimit} 次挂单失败或到截止时间时撤单结束追价，按实际成交对冲后结束；请求停止则撤单且不再补发对冲腿。发送前对冲腿盘口越过界限 ${legs[1].priceBound} 即不发送。`
           : legs[0].orderType === 'market'
@@ -1739,8 +1762,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   /** Hedge the lead's actual fill in the planned proportion, floored to the hedge venue's step. */
   function hedgeQuantityFor(job: PairJob, leadFilled: string): string {
     const [lead, hedge] = job.legs;
-    const scaled = fromUnits(units(hedge.quantity) * units(leadFilled) / units(lead.quantity));
-    return floorToStep(scaled, hedge.instrument.quantityStep);
+    return proportionalHedge(hedge.quantity, lead.quantity, leadFilled, hedge.instrument.quantityStep);
   }
 
   /** note: why the lead stopped early, when it did. */

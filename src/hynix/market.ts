@@ -1,6 +1,6 @@
 // SK hynix market display for the service page (docs/hynix.md): the ADR and ordinary-share books on each configured venue and
-// the accounts' hynix positions, read the same way as oil's, and the two legs' notional balance per venue (section 7.4).
-// Nothing here feeds a preview or a send.
+// the accounts' hynix positions, read the same way as oil's, and the two legs' notional balance per venue (section 7.4). The
+// spread rules judge on these books (docs/hynix.md 8.2); a preview and a send read their own.
 import { sub } from '../decimal.ts';
 import { HYNIX_ADR, HYNIX_ORDINARY, HYNIX_SYMBOLS, VENUE_NAMES, parseInstrument, type Instrument, type Venue } from '../contracts.ts';
 import { MARKET_READ_MS, MARKET_TIMEOUT_MS, POSITIONS_READ_MS, POSITIONS_TIMEOUT_MS, bounded, createMarketReader, type BookSlot, type OilMarketOptions } from '../oil/market.ts';

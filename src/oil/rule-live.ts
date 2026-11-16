@@ -1,5 +1,5 @@
-// Live mode of the oil spread rules (docs/oil.md 7.3, O2b): the stored live state, the executor intent a rule sends, and
-// what a finished job means for the rule. Orders go only through the executor's own preview and confirm, so its caps,
+// Live mode of the spread rules (docs/oil.md 7.3, O2b; hynix docs/hynix.md 8.2): the stored live state, the executor intent
+// a rule sends, and what a finished job means for the rule. Orders go only through the executor's own preview and confirm, so its caps,
 // account checks and price protection apply to an automatic job exactly as to one sent from the page.
 import type { PositionSide, Venue } from '../contracts.ts';
 import { cmp, sub } from '../decimal.ts';
@@ -13,16 +13,27 @@ export const FAILURE_LIMIT = 3;
 export const RETRY_MS = 60_000;
 /** An automatic job's longest run; the executor ends it at this deadline. */
 export const JOB_TIMEOUT_MS = 60_000;
-/** Lead leg first: CL is the same-venue preset's default lead. */
-export const RULE_SYMBOLS = ['CLUSDT', 'BZUSDT'] as const;
-export type RuleSymbol = typeof RULE_SYMBOLS[number];
+/** An automatic job's longest run including its batch intervals; the intent allows up to an hour. */
+export const MAX_RULE_JOB_MS = 3_600_000;
+export const RULE_MARKETS = ['oil', 'hynix'] as const;
+export type RuleMarket = typeof RULE_MARKETS[number];
+/**
+ * Each market's two contracts, lead (sent first) then hedge: oil leads with CL (the same-venue preset's default lead), hynix
+ * with the ADR (the hynix form's default and the workbench's order). The premium leg is the one sold when selling the spread.
+ */
+export const RULE_LEGS: Record<RuleMarket, readonly [string, string]> = { oil: ['CLUSDT', 'BZUSDT'], hynix: ['SKHYUSDT', 'SKHYNIXUSDT'] };
+export const PREMIUM_LEG: Record<RuleMarket, string> = { oil: 'BZUSDT', hynix: 'SKHYUSDT' };
+export const BASE_LEG: Record<RuleMarket, string> = { oil: 'CLUSDT', hynix: 'SKHYNIXUSDT' };
+export const LEG_LABELS: Record<string, string> = { CLUSDT: 'CL', BZUSDT: 'BZ', SKHYUSDT: 'ADR', SKHYNIXUSDT: '正股' };
+export const MARKET_LABELS: Record<RuleMarket, string> = { oil: '原油', hynix: '海力士' };
+const legLabel = (symbol: string): string => LEG_LABELS[symbol] ?? symbol;
 const FINAL = ['completed', 'failed', 'stopped', 'attention'];
 const ZERO = '0';
 
 /** The executor account a leg used, compared before a close so a rule never closes on a different account than it opened. */
 export interface AccountRef { accountKey: string; credentialVersion: number }
 /** One leg the rule holds: what its opening job filled, less what its closing jobs filled. */
-export interface HeldLeg extends AccountRef { symbol: RuleSymbol; side: PositionSide; quantity: string; barrels: string }
+export interface HeldLeg extends AccountRef { symbol: string; side: PositionSide; quantity: string; barrels: string }
 /** Written before the confirm is called; a restart replays the confirm with the same request id. */
 export interface Pending { action: RuleAction; requestId: string; previewId: string; at: number; day: string; accounts: AccountRef[] }
 /** The job the rule follows until it ends. */
@@ -43,7 +54,7 @@ export interface LiveState {
 
 /** The slices of the executor a rule uses (src/executor.ts). */
 export interface RulePlanLeg extends AccountRef { symbol: string; quantity: string; quote: { bid: string; ask: string; receivedAt: number } }
-export interface RulePlan { id: string; legs: readonly RulePlanLeg[]; notional?: string; barrels?: string }
+export interface RulePlan { id: string; legs: readonly RulePlanLeg[]; notional?: string; barrels?: string; batches?: readonly string[] }
 export interface RuleJobLeg { symbol: string; filledQuantity: string; filledBarrels: string }
 export interface RuleExecutor {
   preview(intent: unknown, session: string): Promise<RulePlan>;
@@ -62,26 +73,34 @@ export const opensOn = (live: LiveState, day: string): number => live.opens.day 
 export const actionName = (action: RuleAction): string => action === 'open' ? '开仓' : '平仓';
 export const PHASE_NAMES: Record<Phase, string> = { idle: '等待开仓', opening: '开仓中', holding: '持仓中', closing: '平仓中', review: '待核对' };
 
-/** Position side of each contract: selling the spread (short) is short BZ, long CL. */
-export const legSides = (direction: Direction): Record<RuleSymbol, PositionSide> => direction === 'short' ? { CLUSDT: 'long', BZUSDT: 'short' } : { CLUSDT: 'short', BZUSDT: 'long' };
+/** Position side of each contract: selling the spread (short) is short the premium leg (BZ, the ADR), long the base leg. */
+export const legSides = (market: RuleMarket, direction: Direction): Record<string, PositionSide> => direction === 'short'
+  ? { [PREMIUM_LEG[market]]: 'short', [BASE_LEG[market]]: 'long' } : { [PREMIUM_LEG[market]]: 'long', [BASE_LEG[market]]: 'short' };
 
-/** The executor intent: same venue, CL lead then BZ hedge, both at market; an open by barrels, a close by the held quantities. */
+/** The job's longest run: one minute, plus the batch intervals when the rule splits its orders (docs/hynix.md 8.2). */
+export const ruleTimeout = (config: Pick<RuleConfig, 'batches'>): number => JOB_TIMEOUT_MS + (config.batches ? (config.batches.count - 1) * config.batches.intervalMs : 0);
+
+/**
+ * The executor intent: same venue, lead then hedge, both at market; an open by barrels (oil) or equal USDT notional (hynix),
+ * a close by the held quantities; the rule's batches on both.
+ */
 export function ruleIntent(config: RuleConfig, action: RuleAction, held: readonly HeldLeg[] | null) {
-  const sides = legSides(config.direction);
+  const sides = legSides(config.market, config.direction);
   if (action === 'close' && !held) throw new Error('没有持有记录，无法平仓');
+  const size = config.market === 'hynix' ? { notional: config.notional } : { barrels: config.barrels };
   return {
-    market: 'oil', preset: 'same-exchange', action, timeoutMs: JOB_TIMEOUT_MS,
-    legs: RULE_SYMBOLS.map(symbol => ({
+    market: config.market, preset: 'same-exchange', action, timeoutMs: ruleTimeout(config), ...(config.batches ? { batches: config.batches } : {}),
+    legs: RULE_LEGS[config.market].map(symbol => ({
       venue: config.venue, symbol, side: sides[symbol], orderType: 'market',
-      ...(action === 'open' ? { barrels: config.barrels } : { quantity: held!.find(leg => leg.symbol === symbol)!.quantity }),
+      ...(action === 'open' ? size : { quantity: held!.find(leg => leg.symbol === symbol)!.quantity }),
     })),
   };
 }
 
-/** The preview's legs in the planned order, or null when they are not CL then BZ. */
-export function planLegs(plan: RulePlan): [RulePlanLeg, RulePlanLeg] | null {
-  const [lead, hedge] = plan.legs;
-  return plan.legs.length === 2 && lead?.symbol === RULE_SYMBOLS[0] && hedge?.symbol === RULE_SYMBOLS[1] ? [lead, hedge] : null;
+/** The preview's legs in the planned order, or null when they are not the market's lead then hedge. */
+export function planLegs(plan: RulePlan, market: RuleMarket): [RulePlanLeg, RulePlanLeg] | null {
+  const [lead, hedge] = plan.legs, symbols = RULE_LEGS[market];
+  return plan.legs.length === 2 && lead?.symbol === symbols[0] && hedge?.symbol === symbols[1] ? [lead, hedge] : null;
 }
 /** The preview's books as the rule reads books, for the recheck before confirm. */
 export const planRows = (venue: Venue, legs: readonly RulePlanLeg[]): BookRow[] => legs.map(leg => ({ venue, symbol: leg.symbol, bid: leg.quote.bid, ask: leg.quote.ask, receivedAt: leg.quote.receivedAt, error: null }));
@@ -97,35 +116,41 @@ export type Outcome =
 
 const STATUS_NAMES: Record<string, string> = { completed: '已完成', failed: '失败', stopped: '已停止', attention: '转人工' };
 
-/** What a finished job leaves the rule with; anything that does not add up goes to review. */
-export function settleJob(job: { status: string; reason?: string | null; legs: readonly RuleJobLeg[] }, tracked: Tracked, held: readonly HeldLeg[] | null, direction: Direction): Outcome {
+/**
+ * What a finished job leaves the rule with; anything that does not add up goes to review. Oil legs must fill equal barrels;
+ * hynix legs differ in units by design and the executor hedges them in the planned proportion, so both must just have filled.
+ */
+export function settleJob(job: { status: string; reason?: string | null; legs: readonly RuleJobLeg[] }, tracked: Tracked, held: readonly HeldLeg[] | null, config: Pick<RuleConfig, 'market' | 'direction'>): Outcome {
   const label = `${actionName(tracked.action)}任务 ${tracked.id}`, status = STATUS_NAMES[job.status] ?? job.status;
   const review = (why: string): Outcome => ({ kind: 'review', message: `${label}${status}，${why}；规则已停用，请在执行进度与交易所核对后重置` });
-  const legs = RULE_SYMBOLS.map(symbol => job.legs.find(leg => leg.symbol === symbol));
+  const symbols = RULE_LEGS[config.market], oil = config.market === 'oil';
+  const legs = symbols.map(symbol => job.legs.find(leg => leg.symbol === symbol));
   if (legs.some(leg => !leg)) return review('任务两腿与规则不符');
   const filled = legs.map(leg => leg!.filledQuantity), barrels = legs.map(leg => leg!.filledBarrels);
+  const both = (values: readonly string[]) => symbols.map((symbol, index) => `${legLabel(symbol)} ${values[index]}`).join('、');
   const none = filled.every(quantity => cmp(quantity, ZERO) === 0);
   if (job.status !== 'completed') {
     // failed or stopped with nothing filled is a job that sent nothing or whose lead IOC did not fill: try again later.
     if (job.status !== 'attention' && none) return { kind: 'revert', message: `${label}${status}，两腿都没有成交${job.reason ? `（${job.reason.slice(0, 120)}）` : ''}；${RETRY_MS / 1000} 秒后再判断` };
-    return review(none ? '任务转人工' : `已成交 CL ${filled[0]}、BZ ${filled[1]}`);
+    return review(none ? '任务转人工' : `已成交 ${both(filled)}`);
   }
   if (none) return { kind: 'revert', message: `${label}${status}，但两腿都没有成交；${RETRY_MS / 1000} 秒后再判断` };
-  if (cmp(barrels[0]!, barrels[1]!) !== 0) return review(`两腿成交桶数不等（CL ${barrels[0]}、BZ ${barrels[1]}）`);
+  if (oil && cmp(barrels[0]!, barrels[1]!) !== 0) return review(`两腿成交桶数不等（${both(barrels)}）`);
+  if (!oil && filled.some(quantity => cmp(quantity, ZERO) === 0)) return review(`一腿没有成交（${both(filled)}）`);
   if (tracked.action === 'open') {
-    const sides = legSides(direction);
+    const sides = legSides(config.market, config.direction);
     if (tracked.accounts.length !== 2) return review('开仓账户记录缺失');
     return {
-      kind: 'hold', message: `开仓完成：CL ${filled[0]}、BZ ${filled[1]}（每腿 ${barrels[0]} 桶），进入持仓中`,
-      held: RULE_SYMBOLS.map((symbol, index) => ({ symbol, side: sides[symbol], quantity: filled[index]!, barrels: barrels[index]!, ...tracked.accounts[index]! })),
+      kind: 'hold', message: `开仓完成：${both(filled)}${oil ? `（每腿 ${barrels[0]} 桶）` : ''}，进入持仓中`,
+      held: symbols.map((symbol, index) => ({ symbol, side: sides[symbol]!, quantity: filled[index]!, barrels: barrels[index]!, ...tracked.accounts[index]! })),
     };
   }
   if (!held) return review('规则没有持有记录');
   const left = held.map((leg, index) => ({ ...leg, quantity: sub(leg.quantity, filled[index]!), barrels: sub(leg.barrels, barrels[index]!) }));
-  if (left.some(leg => cmp(leg.quantity, ZERO) < 0 || cmp(leg.barrels, ZERO) < 0)) return review('成交超过规则持有量');
-  if (left.every(leg => cmp(leg.quantity, ZERO) === 0)) return { kind: 'flat', message: `平仓完成：CL ${filled[0]}、BZ ${filled[1]}，回到等待开仓` };
-  if (left.some(leg => cmp(leg.quantity, ZERO) === 0) || cmp(left[0]!.barrels, left[1]!.barrels) !== 0) return review(`平仓后两腿剩余不等（CL ${left[0]!.quantity}、BZ ${left[1]!.quantity}）`);
-  return { kind: 'hold', held: left, message: `部分平仓：CL ${filled[0]}、BZ ${filled[1]}，剩余每腿 ${left[0]!.barrels} 桶，继续等平仓条件` };
+  if (left.some(leg => cmp(leg.quantity, ZERO) < 0 || (oil && cmp(leg.barrels, ZERO) < 0))) return review('成交超过规则持有量');
+  if (left.every(leg => cmp(leg.quantity, ZERO) === 0)) return { kind: 'flat', message: `平仓完成：${both(filled)}，回到等待开仓` };
+  if (left.some(leg => cmp(leg.quantity, ZERO) === 0) || (oil && cmp(left[0]!.barrels, left[1]!.barrels) !== 0)) return review(`平仓后两腿剩余不等（${both(left.map(leg => leg.quantity))}）`);
+  return { kind: 'hold', held: left, message: `部分平仓：${both(filled)}，剩余${oil ? `每腿 ${left[0]!.barrels} 桶` : ` ${both(left.map(leg => leg.quantity))}`}，继续等平仓条件` };
 }
 
 // ---- stored state, read defensively ----------------------------------------------------------------------------------
@@ -155,24 +180,26 @@ function trackedOf(value: unknown): Tracked | null {
   if (!raw || !action || !accounts || typeof raw.id !== 'string' || !UUID.test(raw.id) || !Number.isFinite(raw.at) || typeof raw.day !== 'string' || !DAY.test(raw.day)) return null;
   return { id: raw.id, action, at: raw.at as number, day: raw.day, accounts };
 }
-function heldOf(value: unknown): HeldLeg[] | null {
+function heldOf(value: unknown, market: RuleMarket): HeldLeg[] | null {
   if (!Array.isArray(value) || value.length !== 2) return null;
+  const symbols = RULE_LEGS[market];
   const legs = value.map((item, index) => {
     const raw = object(item), account = accountOf(item);
-    if (!raw || !account || raw.symbol !== RULE_SYMBOLS[index] || (raw.side !== 'long' && raw.side !== 'short')) return null;
+    // A record of the other market's contracts (a rule whose market reads differently) is not this rule's position.
+    if (!raw || !account || raw.symbol !== symbols[index] || (raw.side !== 'long' && raw.side !== 'short')) return null;
     if (typeof raw.quantity !== 'string' || !DECIMAL.test(raw.quantity) || typeof raw.barrels !== 'string' || !DECIMAL.test(raw.barrels)) return null;
-    return { symbol: RULE_SYMBOLS[index]!, side: raw.side, quantity: raw.quantity, barrels: raw.barrels, ...account } satisfies HeldLeg;
+    return { symbol: symbols[index]!, side: raw.side, quantity: raw.quantity, barrels: raw.barrels, ...account } satisfies HeldLeg;
   });
   return legs.every(Boolean) ? legs as HeldLeg[] : null;
 }
 
 /** A live rule's stored state; one that does not add up is held for review with what can still be read. */
-export function liveOf(value: unknown): LiveState {
+export function liveOf(value: unknown, market: RuleMarket): LiveState {
   const raw = object(value) ?? {};
   const phase = (PHASES as readonly unknown[]).includes(raw.phase) ? raw.phase as Phase : null;
   const opens = object(raw.opens);
   const live: LiveState = {
-    enabled: raw.enabled === true, phase: phase ?? 'review', pending: pendingOf(raw.pending), job: trackedOf(raw.job), held: heldOf(raw.held),
+    enabled: raw.enabled === true, phase: phase ?? 'review', pending: pendingOf(raw.pending), job: trackedOf(raw.job), held: heldOf(raw.held, market),
     opens: opens && typeof opens.day === 'string' && DAY.test(opens.day) && Number.isSafeInteger(opens.count) && (opens.count as number) >= 0 ? { day: opens.day, count: opens.count as number } : { day: '', count: 0 },
     failures: Number.isSafeInteger(raw.failures) && (raw.failures as number) >= 0 ? raw.failures as number : 0,
     retryAt: Number.isFinite(raw.retryAt) ? raw.retryAt as number : null,

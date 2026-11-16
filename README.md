@@ -95,6 +95,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 | 回退到早于 | 回退前要做的事 | 说明 | 详见 |
 | --- | --- | --- | --- |
+| v0.55.0 | 不用改配置 | 旧版本没有资产页「导入原表数据」；导入后的账本旧版本照常读取，数据目录的 `asset-backups/` 旧版本不读，留着即可 | [docs/asset.md](docs/asset.md) A-6 节 |
 | v0.54.0 | 不用改配置 | 旧版本没有持仓页与行情监控的成交、关联交易面板；`asset.sqlite` 里新增的 `fill_cache` 只是缓存，旧版本不读，留着即可 | [docs/asset.md](docs/asset.md) A-5 节 |
 | v0.53.0 | 不用改配置。先停用全部海力士规则与分批的原油规则，并处理掉它们的持仓与未结束任务 | 旧版本读不了海力士规则与分批规则（显示“规则参数无法读取”，不判断、不下单）；不分批的原油规则照常运行，但不再带阈值界限，只受基点价格保护界限约束 | [docs/hynix.md](docs/hynix.md) 第 8.3 节 |
 | v0.52.1 | 不用改配置 | 旧版本每 30 分钟检查一次新版本，没有每分钟的发布页探测 | [docs/update.md](docs/update.md) 第 3 节 |

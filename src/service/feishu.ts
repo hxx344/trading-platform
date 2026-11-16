@@ -41,6 +41,8 @@ export interface JobSummary {
   reason: string | null;
   /** Absent in summaries made before hynix existed: oil. */
   market?: 'oil' | 'hynix';
+  /** One of the two jobs of a four-leg confirm (docs/oil.md 11); absent or null on every other job. */
+  group?: { id: string; index: 0 | 1; peer: string } | null;
   legs: { venue: string; symbol: string; side: 'long' | 'short'; orderSide: 'buy' | 'sell'; plannedBarrels: string; filledBarrels: string; plannedQuantity?: string; filledQuantity?: string; averagePrice: string | null; previewQuote: { bid: string; ask: string } }[];
 }
 export interface PairState {
@@ -140,6 +142,10 @@ const minus = (left: string, right: string): string | null => { try { return pri
  * first leg's venue − second leg's venue.
  */
 export function describeJob(summary: JobSummary | null, jobId: string, status: string, reason: string | null): string {
+  const text = describePairJob(summary, jobId, status, reason);
+  return summary?.group ? `${text}（四腿，另一交易所任务 ${short(summary.group.peer)}）` : text;
+}
+function describePairJob(summary: JobSummary | null, jobId: string, status: string, reason: string | null): string {
   if (summary?.market === 'hynix') return describeHynixJob(summary, jobId, status, reason);
   const tail = reason ? `：${clip(reason, 240)}` : '';
   // Without the job's details its market is unknown: the title names no product rather than a wrong one.

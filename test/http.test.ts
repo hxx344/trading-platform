@@ -113,6 +113,24 @@ test('HTTP：预览、确认、重复确认返回原任务；状态页只显示�
   assert.equal(((await stale.json()) as { code: string }).code, 'preview_invalid');
 }));
 
+test('HTTP：四腿预览只显示脱敏账户；四腿确认建两个任务，重复确认返回同一组，普通确认拒绝四腿预览', () => withServer(async (base, cookie, h) => {
+  const leg = (venue: string, symbol: string, side: string) => ({ venue, symbol, side, orderType: 'market', barrels: '1' });
+  const intent = { market: 'oil', preset: 'four-leg', action: 'open', timeoutMs: 60_000, legs: [leg('binance', 'BZUSDT', 'short'), leg('binance', 'CLUSDT', 'long'), leg('bybit', 'BZUSDT', 'long'), leg('bybit', 'CLUSDT', 'short')] };
+  const previewText = await (await post(base, '/api/four-leg/preview', intent, { cookie })).text();
+  assert.doesNotMatch(previewText, /BN1001|BY2002|accountKey/);
+  const preview = JSON.parse(previewText) as { id: string; parts: { legs: { accountId: string }[] }[] };
+  assert.ok(preview.parts.every(part => part.legs.every(item => item.accountId.startsWith('***'))));
+  const plain = await post(base, '/api/confirm', { previewId: preview.id, requestId: randomUUID(), confirmLive: true }, { cookie });
+  assert.equal(plain.status, 409);
+  const body = { previewId: preview.id, requestId: randomUUID(), confirmLive: true };
+  const first = await (await post(base, '/api/four-leg/confirm', body, { cookie })).json() as { group: string; jobs: { id: string }[]; duplicate: boolean };
+  const again = await (await post(base, '/api/four-leg/confirm', body, { cookie })).json() as { group: string; jobs: { id: string }[]; duplicate: boolean };
+  assert.equal(first.jobs.length, 2);
+  assert.deepEqual([again.duplicate, again.group, again.jobs.map(job => job.id)], [true, first.group, first.jobs.map(job => job.id)]);
+  await settle(h, first.jobs[0]!.id);
+  await settle(h, first.jobs[1]!.id);
+}));
+
 test('HTTP：追价策略认领与确认未创建接口沿用会话与请求标记，参数与状态错误映射为 4xx', () => withServer(async (base, cookie, h) => {
   h.bybit.inject({ operation: 'strategy-place', mode: 'lost-response' });
   const preview = await (await post(base, '/api/preview', chaseIntent(), { cookie })).json() as { id: string };

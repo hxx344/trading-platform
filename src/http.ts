@@ -649,6 +649,9 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     }
     if (request.method === 'POST' && url.pathname === '/api/preview') return send(response, 200, executor.publicPreview(await executor.preview(await readJson(request), sessionId)));
     if (request.method === 'POST' && url.pathname === '/api/confirm') return send(response, 200, executor.confirm(await readJson(request), sessionId));
+    // Four legs (docs/oil.md 11.3): one preview of both venues' plans, one confirm that creates both jobs or neither.
+    if (request.method === 'POST' && url.pathname === '/api/four-leg/preview') return send(response, 200, executor.publicFourLegPreview(await executor.previewFourLeg(await readJson(request), sessionId)));
+    if (request.method === 'POST' && url.pathname === '/api/four-leg/confirm') return send(response, 200, executor.confirmFourLeg(await readJson(request), sessionId));
     const pair = request.method === 'POST' ? PAIR_PATH.exec(url.pathname) : null;
     if (pair) {
       const body = exactKeys(await readJson(request), ['requestId']);

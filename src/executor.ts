@@ -4,8 +4,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { add, bandEdge, cmp, floorToStep, isMultiple, isZero, mul, sub, units, fromUnits } from './decimal.ts';
 import {
-  ContractError, HYNIX_SYMBOLS, MAX_SLIPPAGE_BPS, UUID, marketOfSymbol, MARKET_SYMBOLS, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, exactKeys, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseNotionalLimits, parseInstrument, parseIntent, parseQuote, positionOf, reject, text,
-  type AccountBinding, type BatchIntent, type NotionalLimits, type AccountSnapshot, type Action, type Environment, type Instrument, type LegOrderType, type Market, type OrderSide, type PairIntent, type PositionSide, type Quote, type RebalanceIntent, type TransferConfig, type Venue,
+  ContractError, HYNIX_SYMBOLS, MAX_SLIPPAGE_BPS, UUID, marketOfSymbol, MARKET_SYMBOLS, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, exactKeys, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseNotionalLimits, parseInstrument, parseIntent, parseFourLegIntent, parseQuote, positionOf, reject, text,
+  type AccountBinding, type BatchIntent, type NotionalLimits, type AccountSnapshot, type Action, type Environment, type FourLegIntent, type Instrument, type LegOrderType, type Market, type OrderSide, type PairIntent, type PositionSide, type Quote, type RebalanceIntent, type TransferConfig, type Venue,
 } from './contracts.ts';
 import {
   STRATEGY_ID, VenueError, parseOrderReport, parseStrategyAck, parseStrategyReport, strategyRequestOf, supportsChase,
@@ -155,6 +155,16 @@ export interface RebalancePreview extends PreviewBase {
   };
 }
 export type Preview = PairPreview | RebalancePreview;
+/**
+ * Four legs (docs/oil.md 11): one same-exchange plan per venue, stored as one preview that only the four-leg confirm takes.
+ * notional is the two plans' sum; barrels (oil) is per leg, equal on all four.
+ */
+export interface FourLegPreview {
+  id: string; fourLeg: true; expiresAt: number; writerGeneration: number; intent: Omit<FourLegIntent, 'parts'>;
+  parts: [PairPreview, PairPreview]; notional: string; barrels?: string; notes: string[];
+}
+/** The two jobs of one four-leg confirm: id is the group's, index the venue's place in the intent, peer the other job. */
+export interface JobGroup { id: string; index: 0 | 1; peer: string }
 interface JobBase {
   id: string;
   status: JobStatus;
@@ -185,6 +195,13 @@ interface JobBase {
    * is withdrawn first, so no further fill lands unhedged, and the job ends once it settles.
    */
   leadWithdraw?: string | null;
+  /** A job of a four-leg group; absent on every other job and in older rows. */
+  group?: JobGroup;
+  /**
+   * Set when the other job of the group ended without completing: no new lead order (nor batch) goes out and a resting lead
+   * is withdrawn, but what the lead filled is still hedged; the job then settles as usual (docs/oil.md 11.3).
+   */
+  peerHalt?: string | null;
 }
 /** A lead and its hedge (oil, hynix). */
 export interface PairJob extends JobBase { legs: PairLegs; rebalance?: undefined }
@@ -485,6 +502,20 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     // An unhedged or unverified exposure must not let a new job trade the same symbol on that account.
     if (status !== 'attention') db.prepare('DELETE FROM locks WHERE job_id = ?').run(job.id);
     event(job.id, 'job-finished', { status, reason });
+    if (status !== 'completed' && job.group) haltPeer(job, status, reason);
+  }
+  const STATUS_TEXT: Record<JobStatus, string> = { accepted: '已受理', running: '执行中', completed: '已完成', failed: '失败', stopped: '已停止', attention: '需人工处理' };
+  /**
+   * The other job of a four-leg group, once this one ended without completing: no new lead goes out there, a resting lead
+   * is withdrawn and its fills are still hedged (docs/oil.md 11.3). A job already over or already told to stop is left alone.
+   */
+  function haltPeer(job: Job, status: JobStatus, reason: string | null): void {
+    const peer = readJob((job.group as JobGroup).peer);
+    if (FINAL_JOB.has(peer.status) || peer.peerHalt || stopRequested(peer.id)) return;
+    peer.peerHalt = `${VENUE_NAMES[job.legs[0].venue]} 任务${STATUS_TEXT[status]}${reason ? `：${reason.slice(0, 120)}` : ''}`;
+    peer.reason = '四腿另一交易所任务未完成：不再发送新的首腿，撤销首腿挂单，已成交部分照常对冲';
+    saveJob(peer);
+    event(peer.id, 'four-leg-halted', { by: job.id, status });
   }
 
   // ---- accounts ----------------------------------------------------------------
@@ -652,6 +683,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const intent = parseIntent(input);
     assertWriter();
     if (intent.preset === 'rebalance') return previewRebalance(intent, session);
+    return storePreview(await planPair(intent), session);
+  }
+  /** A same-exchange or cross-exchange plan from the books, rules and accounts just read; stored by the caller. */
+  async function planPair(intent: PairIntent): Promise<PairPreview> {
     const accounts = intent.legs.map(leg => accountFor(leg.venue) ?? reject('account_missing', `${VENUE_NAMES[leg.venue]} 尚未绑定已核验的账户`, 409));
     for (const leg of intent.legs) if (connectorFor(leg.venue).capabilities.maxClientOrderIdLength < CLIENT_ORDER_ID_LENGTH) reject('client_order_id', `${VENUE_NAMES[leg.venue]} 客户订单号长度上限不足`, 409);
     for (const leg of intent.legs) if (leg.orderType === 'chase') chaseConnector(leg.venue);
@@ -745,9 +780,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         environment === 'mainnet' ? '实盘传输：确认后委托会发送到真实交易所账户。' : '模拟传输：不会访问任何真实交易所。',
       ],
     };
-    return storePreview(value, session);
+    return value;
   }
-  function storePreview<T extends Preview>(value: T, session: string): T {
+  function storePreview<T extends Preview | FourLegPreview>(value: T, session: string): T {
     write(() => {
       db.prepare('DELETE FROM previews WHERE expires_at < ? AND consumed_job IS NULL').run(now());
       db.prepare('INSERT INTO previews(id, session, expires_at, json) VALUES (?, ?, ?, ?)').run(value.id, session, value.expiresAt, JSON.stringify(value));
@@ -841,28 +876,96 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       if (!record || record.session !== session || record.expires_at <= now() || record.consumed_job) reject('preview_invalid', '预览已过期、已提交或不属于本会话，请重新预览', 409);
       const plan = JSON.parse((record as { json: string }).json) as Preview;
       if (plan.writerGeneration !== generation) reject('preview_generation', '执行器已重启或换代，请重新预览', 409);
-      for (const leg of plan.legs) {
-        const row = accountFor(leg.venue);
-        if (!row || row.account_key !== leg.accountKey || row.credential_version !== leg.credentialVersion || row.account_mode !== leg.accountMode) reject('binding_changed', `${VENUE_NAMES[leg.venue]} 账户绑定已变化，请重新预览`, 409);
-        if (db.prepare('SELECT 1 FROM locks WHERE resource = ?').get(`${leg.accountKey}:${leg.symbol}`)) reject('symbol_locked', '所选合约已有未结束任务', 409);
-      }
-      // A rebalance also holds its other leg, which no leg of the plan names.
-      for (const resource of lockResources(plan).slice(plan.legs.length)) if (db.prepare('SELECT 1 FROM locks WHERE resource = ?').get(resource)) reject('symbol_locked', '另一腿合约已有未结束任务', 409);
-      const action = plan.rebalance ? REBALANCE_ACTION[plan.rebalance.method] : plan.intent.action;
-      // Inside the write transaction, so two confirms cannot both fit under the running total.
-      checkNotional(jobNotional(plan.legs), action);
-      const base = { id: randomUUID(), status: 'accepted' as const, reason: null, createdAt: now(), deadlineAt: now() + plan.intent.timeoutMs, previewId: plan.id, requestId: body.requestId, action, holdNewSends: false, acknowledgedAt: null, hedgeWaitSince: null };
-      const job: Job = plan.rebalance
-        ? { ...base, legs: plan.legs, rebalance: { method: plan.rebalance.method, counter: plan.rebalance.counter } }
-        : { ...base, legs: plan.legs, ...(plan.batches && plan.intent.batches ? { batches: plan.batches, batchIntervalMs: plan.intent.batches.intervalMs, batchDoneAt: null } : {}) };
-      db.prepare('INSERT INTO jobs(id, status, final, version, created_at, updated_at, json) VALUES (?, ?, 0, 1, ?, ?, ?)').run(job.id, job.status, job.createdAt, job.createdAt, JSON.stringify(job));
-      for (const resource of lockResources(job)) db.prepare('INSERT INTO locks(resource, job_id) VALUES (?, ?)').run(resource, job.id);
+      if (Object.hasOwn(plan, 'fourLeg')) reject('preview_invalid', '四腿预览须用四腿确认', 409);
+      const job = insertJob(plan, plan.id, body.requestId);
       db.prepare('UPDATE previews SET consumed_job = ? WHERE id = ?').run(job.id, plan.id);
       db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(body.requestId, 'confirm', payload, session, job.id, now());
-      event(job.id, 'job-accepted', { previewId: plan.id, requestId: body.requestId });
       return { accepted: true as const, duplicate: false, job: jobView(job.id) };
     });
   }
+  /**
+   * Inside confirm's write transaction: the plan's accounts as previewed and its symbols free, then the job, its locks and
+   * its accepted event. Any refusal rolls the whole transaction back.
+   */
+  function insertJob(plan: Preview, previewId: string, requestId: string, group?: JobGroup & { jobId: string }): Job {
+    for (const leg of plan.legs) {
+      const row = accountFor(leg.venue);
+      if (!row || row.account_key !== leg.accountKey || row.credential_version !== leg.credentialVersion || row.account_mode !== leg.accountMode) reject('binding_changed', `${VENUE_NAMES[leg.venue]} 账户绑定已变化，请重新预览`, 409);
+      if (db.prepare('SELECT 1 FROM locks WHERE resource = ?').get(`${leg.accountKey}:${leg.symbol}`)) reject('symbol_locked', group ? `${VENUE_NAMES[leg.venue]} ${leg.symbol} 已有未结束任务，四腿整体不确认` : '所选合约已有未结束任务', 409);
+    }
+    // A rebalance also holds its other leg, which no leg of the plan names.
+    for (const resource of lockResources(plan).slice(plan.legs.length)) if (db.prepare('SELECT 1 FROM locks WHERE resource = ?').get(resource)) reject('symbol_locked', '另一腿合约已有未结束任务', 409);
+    const action = plan.rebalance ? REBALANCE_ACTION[plan.rebalance.method] : plan.intent.action;
+    // Inside the write transaction, so two confirms cannot both fit under the running total.
+    checkNotional(jobNotional(plan.legs), action);
+    const base = { id: group?.jobId ?? randomUUID(), status: 'accepted' as const, reason: null, createdAt: now(), deadlineAt: now() + plan.intent.timeoutMs, previewId, requestId, action, holdNewSends: false, acknowledgedAt: null, hedgeWaitSince: null };
+    const job: Job = plan.rebalance
+      ? { ...base, legs: plan.legs, rebalance: { method: plan.rebalance.method, counter: plan.rebalance.counter } }
+      : { ...base, legs: plan.legs, ...(plan.batches && plan.intent.batches ? { batches: plan.batches, batchIntervalMs: plan.intent.batches.intervalMs, batchDoneAt: null } : {}), ...(group ? { group: { id: group.id, index: group.index, peer: group.peer }, peerHalt: null } : {}) };
+    db.prepare('INSERT INTO jobs(id, status, final, version, created_at, updated_at, json) VALUES (?, ?, 0, 1, ?, ?, ?)').run(job.id, job.status, job.createdAt, job.createdAt, JSON.stringify(job));
+    for (const resource of lockResources(job)) db.prepare('INSERT INTO locks(resource, job_id) VALUES (?, ?)').run(resource, job.id);
+    event(job.id, 'job-accepted', { previewId, requestId, ...(group ? { group: group.id, peer: group.peer } : {}) });
+    return job;
+  }
+
+  /**
+   * Four legs (docs/oil.md 11.3): one same-exchange plan per venue, read side by side; either refusing refuses the whole,
+   * and only the four-leg record is stored, so no single plan can be confirmed alone.
+   */
+  async function previewFourLeg(input: unknown, session: string): Promise<FourLegPreview> {
+    if (typeof session !== 'string' || !/^[\x21-\x7e]{8,128}$/.test(session)) reject('session', '会话无效', 401);
+    const { parts: intents, ...intent } = parseFourLegIntent(input);
+    assertWriter();
+    const settled = await Promise.allSettled(intents.map(planPair));
+    const failed = settled.find(item => item.status === 'rejected');
+    if (failed) {
+      const index = settled.indexOf(failed), error = failed.reason;
+      // Each plan names its venue, so the refusal says which of the two it was.
+      const venue = VENUE_NAMES[intents[index]!.legs[0].venue];
+      if (error instanceof ContractError) throw new ContractError(error.status, error.code, error.message.startsWith(venue) ? error.message : `${venue}：${error.message}`);
+      throw error;
+    }
+    const parts = settled.map(item => (item as PromiseFulfilledResult<PairPreview>).value) as [PairPreview, PairPreview];
+    if (intent.market === 'oil' && parts[0].barrels !== parts[1].barrels) reject('unbalanced', `两个交易所每腿桶数不相等：${parts[0].barrels} 与 ${parts[1].barrels}`);
+    const venues = parts.map(part => VENUE_NAMES[part.legs[0].venue]);
+    const batchCounts = parts.map(part => part.batches?.length ?? 1);
+    const value: FourLegPreview = {
+      id: randomUUID(), fourLeg: true, expiresAt: Math.min(...parts.map(part => part.expiresAt)), writerGeneration: generation, intent, parts,
+      notional: add(parts[0].notional, parts[1].notional), ...(parts[0].barrels ? { barrels: parts[0].barrels } : {}),
+      notes: [
+        `确认后建两个同所两腿任务：${venues[0]} 与 ${venues[1]} 各一个，一起取四个合约锁，各自先首腿、成交后对冲腿；两个任务在同一执行轮里先后推进，不是四腿同时发出。`,
+        `任一个任务以失败、停止或待人工处理结束时，另一个任务不再发送新的首腿（含后续批次）并撤销首腿挂单，首腿已成交部分照常补发对冲腿；已成交仓位都不回平。`,
+        '停止任一个任务会同时停止另一个。',
+        ...(batchCounts[0] !== batchCounts[1] ? [`两个交易所能分的批数不同：${venues[0]} ${batchCounts[0]} 批，${venues[1]} ${batchCounts[1]} 批。`] : []),
+      ],
+    };
+    return storePreview(value, session);
+  }
+  /** The two jobs of a four-leg confirm, built in one write transaction: any refusal (a lock, a binding, a cap) creates none. */
+  function confirmFourLeg(input: unknown, session: string): { accepted: true; duplicate: boolean; group: string; jobs: ReturnType<typeof jobView>[] } {
+    const body = parseConfirm(input);
+    const payload = digest({ kind: 'confirm-four-leg', previewId: body.previewId, confirmLive: body.confirmLive });
+    return write(() => {
+      const existing = db.prepare('SELECT * FROM commands WHERE request_id = ?').get(body.requestId) as { kind: string; digest: string; session: string; job_id: string } | undefined;
+      if (existing) {
+        if (existing.kind !== 'confirm-four-leg' || existing.digest !== payload || existing.session !== session) reject('request_reused', '请求编号已用于其他内容', 409);
+        const first = readJob(existing.job_id), group = first.group ?? reject('group_missing', '四腿任务缺少分组', 500);
+        return { accepted: true as const, duplicate: true, group: group.id, jobs: [jobView(first.id), jobView(group.peer)] };
+      }
+      const record = db.prepare('SELECT * FROM previews WHERE id = ?').get(body.previewId) as { session: string; expires_at: number; consumed_job: string | null; json: string } | undefined;
+      if (!record || record.session !== session || record.expires_at <= now() || record.consumed_job) reject('preview_invalid', '预览已过期、已提交或不属于本会话，请重新预览', 409);
+      const plan = JSON.parse((record as { json: string }).json) as FourLegPreview;
+      if (plan.fourLeg !== true) reject('preview_invalid', '这不是四腿预览，请用普通确认', 409);
+      if (plan.writerGeneration !== generation) reject('preview_generation', '执行器已重启或换代，请重新预览', 409);
+      const group = randomUUID(), ids = [randomUUID(), randomUUID()] as const;
+      const jobs = plan.parts.map((part, index) => insertJob(part, plan.id, body.requestId, { id: group, index: index as 0 | 1, peer: ids[1 - index] as string, jobId: ids[index] as string }));
+      db.prepare('UPDATE previews SET consumed_job = ? WHERE id = ?').run(jobs[0]!.id, plan.id);
+      db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(body.requestId, 'confirm-four-leg', payload, session, jobs[0]!.id, now());
+      return { accepted: true as const, duplicate: false, group, jobs: jobs.map(job => jobView(job.id)) };
+    });
+  }
+  /** Page and API view of a four-leg preview: each plan as publicPreview shows it. */
+  const publicFourLegPreview = (value: FourLegPreview) => ({ ...value, parts: value.parts.map(publicPreview) });
 
   /**
    * Read-only lookup of the job a confirm of this preview with this request id created for this session, or null when none
@@ -887,6 +990,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       if (!existing) {
         db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(requestId, 'stop', payload, session, jobId, now());
         if (!FINAL_JOB.has(job.status)) { db.prepare('INSERT OR IGNORE INTO stop_requests(job_id, request_id, requested_at) VALUES (?, ?, ?)').run(jobId, requestId, now()); event(jobId, 'stop-requested', { requestId }); }
+        // A four-leg stop stops both venues' jobs (docs/oil.md 11.3).
+        const peer = job.group ? readJob(job.group.peer) : null;
+        if (peer && !FINAL_JOB.has(peer.status)) { db.prepare('INSERT OR IGNORE INTO stop_requests(job_id, request_id, requested_at) VALUES (?, ?, ?)').run(peer.id, requestId, now()); event(peer.id, 'stop-requested', { requestId, via: jobId }); }
       }
       return jobView(jobId);
     });
@@ -1221,7 +1327,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       const current = readJob(job.id);
       // After a takeover only the hedge may still go out; any earlier order of the same leg must be settled and older.
       const earlier = opsOf(job.id).filter(item => item.leg === index);
-      if (FINAL_JOB.has(current.status) || (index === 0 && current.holdNewSends) || stopRequested(job.id)
+      if (FINAL_JOB.has(current.status) || (index === 0 && (current.holdNewSends || !!current.peerHalt)) || stopRequested(job.id)
         || earlier.some(item => attemptOf(item) >= attemptOf(op) || !SETTLED.has(item.state))) reject('send_superseded', '任务状态已变化，本次不发送', 409);
       const valid = bindingStillValid(leg);
       db.prepare('INSERT INTO operations(id, job_id, leg, venue, client_order_id, state, settled, version, json) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?)').run(op.id, job.id, index, leg.venue, op.clientOrderId, op.state, JSON.stringify(op));
@@ -1559,7 +1665,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const stop = stopRequested(job.id);
     const pastDeadline = now() >= job.deadlineAt;
     // After a takeover nothing new is sent, so resting orders are withdrawn instead of waiting for the deadline; so too when the hedge cannot go on.
-    const withdraw = stop || pastDeadline || job.holdNewSends || !!job.leadWithdraw;
+    const withdraw = stop || pastDeadline || job.holdNewSends || !!job.leadWithdraw || !!job.peerHalt;
     for (const op of opsOf(job.id).filter(item => item.state === 'open')) if (wantsStop(op, withdraw)) await cancel(job, op, withdraw ? undefined : '追价策略被交易所暂停，已停止；按实际成交对冲');
     job = readJob(job.id);
     if (FINAL_JOB.has(job.status)) return;
@@ -1584,6 +1690,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const leads = legOps(job.id, 0), hedges = legOps(job.id, 1);
     if (leads.length === 0) {
       if (stop) { write(() => finish(readJob(job.id), 'stopped', '已停止，未发送任何委托')); return; }
+      if (job.peerHalt) { write(() => finish(readJob(job.id), 'stopped', `四腿联动停止（${job.peerHalt}），未发送任何委托`)); return; }
       if (job.holdNewSends) { write(() => finish(readJob(job.id), 'failed', '服务恢复后不再发送新委托')); return; }
       let quote: Quote;
       try { quote = await guardLead(job); }
@@ -1697,7 +1804,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       write(() => { const current = readJob(job.id); if (current.batchDoneAt != null || current.reason !== null) { current.batchDoneAt = null; current.reason = null; saveJob(current); } });
       return;
     }
-    write(() => settleJob(readJob(job.id), next?.end ?? (job.leadWithdraw ? '对冲腿一度无法发送，已撤销首腿挂单' : undefined)));
+    write(() => settleJob(readJob(job.id), next?.end ?? (job.peerHalt ? `四腿联动停止（${job.peerHalt}），首腿不再发送` : job.leadWithdraw ? '对冲腿一度无法发送，已撤销首腿挂单' : undefined)));
   }
 
   /**
@@ -1816,7 +1923,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (isZero(leadExposure) && isZero(hedgeExposure)) {
       // A protected market lead is an IOC at its bound: every lead order expiring unfilled says the book was past it.
       const expired = job.legs[0].orderType === 'market' && leadsOf.length > 0 && leadsOf.every(item => item.state === 'canceled' && isZero(item.filledQuantity));
-      finish(job, stopRequested(job.id) ? 'stopped' : 'failed', `首腿未成交（${note ?? lead?.state ?? '未发送'}），未发送对冲腿`, expired && !stopRequested(job.id) ? 'lead_unfilled' : undefined);
+      const stopped = stopRequested(job.id) || !!job.peerHalt;
+      finish(job, stopped ? 'stopped' : 'failed', `首腿未成交（${note ?? lead?.state ?? '未发送'}），未发送对冲腿`, expired && !stopped ? 'lead_unfilled' : undefined);
       return;
     }
     if (marketOfJob(job) === 'hynix') {
@@ -2034,7 +2142,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const events = (db.prepare('SELECT type, at, json FROM events WHERE job_id = ? ORDER BY seq DESC LIMIT 40').all(id) as { type: string; at: number; json: string }[]).reverse().map(row => ({ type: row.type, at: row.at, ...JSON.parse(row.json) }));
     return {
       id: job.id, endCode: job.endCode ?? null, market: marketOfJob(job), preset: !isPair(job) ? 'rebalance' as const : job.legs[0].venue === job.legs[1].venue ? 'same-exchange' as const : 'cross-exchange' as const,
-      rebalance: job.rebalance ? { method: job.rebalance.method } : null, action: job.action, status: job.status, reason: job.reason, stopRequested: stopRequested(id), createdAt: job.createdAt, deadlineAt: job.deadlineAt, holdNewSends: job.holdNewSends,
+      rebalance: job.rebalance ? { method: job.rebalance.method } : null, group: job.group ?? null, peerHalt: job.peerHalt ?? null, action: job.action, status: job.status, reason: job.reason, stopRequested: stopRequested(id), createdAt: job.createdAt, deadlineAt: job.deadlineAt, holdNewSends: job.holdNewSends,
       locked: !!db.prepare('SELECT 1 FROM locks WHERE job_id = ? LIMIT 1').get(id), acknowledgedAt: job.acknowledgedAt,
       /** A strategy create without an answer waits for adoption, a confirmation of not-created or a release. */
       strategyPending: ops.some(isOrphanStrategy),
@@ -2065,6 +2173,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     preview,
     publicPreview,
     confirm,
+    previewFourLeg,
+    publicFourLegPreview,
+    confirmFourLeg,
     confirmedJob,
     requestStop,
     acknowledge,

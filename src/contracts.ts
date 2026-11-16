@@ -311,6 +311,31 @@ export function parsePairIntent(value: unknown): PairIntent {
   }
   return { market, preset, symbol, action, timeoutMs, maxSlippageBps, legs, ...(batches ? { batches } : {}) };
 }
+/**
+ * Four legs (docs/oil.md 11): two venues, each trading the market's two contracts on opposite sides, every contract on
+ * opposite sides across the two venues, all four legs sized alike (oil barrels, hynix notional). legs are venue A's lead
+ * and hedge, then venue B's; each venue's pair is parsed as a same-exchange intent, which the executor runs as its own job.
+ */
+export interface FourLegIntent {
+  market: Market; preset: 'four-leg'; action: Action; timeoutMs: number; maxSlippageBps: number | null; batches?: BatchIntent;
+  legs: [LegIntent, LegIntent, LegIntent, LegIntent]; parts: [PairIntent, PairIntent];
+}
+export function parseFourLegIntent(value: unknown): FourLegIntent {
+  const raw = exactKeys(value, ['market', 'preset', 'action', 'timeoutMs', 'legs'], ['maxSlippageBps', 'batches']);
+  if (raw.preset !== 'four-leg') reject('invalid_value', '交易预设须为 four-leg');
+  if (!Array.isArray(raw.legs) || raw.legs.length !== 4) reject('leg_count', '四腿需要正好四条腿：甲所首腿、甲所对冲腿、乙所首腿、乙所对冲腿');
+  const common = { market: raw.market, preset: 'same-exchange', action: raw.action, timeoutMs: raw.timeoutMs, ...(raw.maxSlippageBps !== undefined ? { maxSlippageBps: raw.maxSlippageBps } : {}), ...(raw.batches !== undefined ? { batches: raw.batches } : {}) };
+  const legs = raw.legs as unknown[];
+  const parts = [parsePairIntent({ ...common, legs: legs.slice(0, 2) }), parsePairIntent({ ...common, legs: legs.slice(2, 4) })] as [PairIntent, PairIntent];
+  const [a, b] = parts, hynix = a.market === 'hynix';
+  if (a.legs[0].venue === b.legs[0].venue) reject('same_venue', '四腿须选择两个不同交易所');
+  for (const leg of a.legs) if (b.legs.find(other => other.symbol === leg.symbol)?.side === leg.side) reject('same_side', `四腿中 ${leg.symbol} 在两个交易所的方向必须相反`);
+  const all = [...a.legs, ...b.legs] as FourLegIntent['legs'];
+  const sizes = all.map(leg => hynix ? leg.notional ?? null : leg.barrels);
+  if (sizes.some(size => size === null)) reject('quantity_mode', hynix ? '四腿须按每腿相同的名义金额下单' : '四腿须按每腿相同的桶数下单');
+  if (sizes.some(size => cmp(size as string, sizes[0] as string) !== 0)) reject('unbalanced', hynix ? `四腿名义金额须相等：${sizes.join('、')}` : `四腿桶数须相等：${sizes.join('、')}`);
+  return { market: a.market, preset: 'four-leg', action: a.action, timeoutMs: a.timeoutMs, maxSlippageBps: a.maxSlippageBps, ...(a.batches ? { batches: a.batches } : {}), legs: all, parts };
+}
 function parseRebalanceIntent(value: unknown): RebalanceIntent {
   const raw = exactKeys(value, ['market', 'preset', 'venue', 'method', 'timeoutMs'], ['maxSlippageBps']);
   if (oneOf(raw.market, ['oil', 'hynix'] as const, '品种') !== 'hynix') reject('rebalance_market', '单腿调平只用于海力士');

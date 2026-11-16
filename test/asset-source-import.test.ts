@@ -251,9 +251,9 @@ test('after the backup and before the write: a workbench re-import, a changed so
   assert.equal(w.backups().length, 3);
 });
 
-test('the backup runs in steps without holding the event loop, narrows an existing directory and only the newest backups stay', async t => {
+test('the backup runs in the thread pool without holding the event loop, narrows an existing directory and only the newest backups stay', async t => {
   const w = exampleLedger(t);
-  // About 24 MB of snapshots: the copy takes many steps.
+  // About 24 MB of snapshots.
   const raw = new DatabaseSync(w.file);
   try {
     raw.exec('BEGIN');
@@ -262,7 +262,7 @@ test('the backup runs in steps without holding the event loop, narrows an existi
     raw.exec('COMMIT');
   } finally { raw.close(); }
   mkdirSync(join(w.dataDir, BACKUP_DIR), { mode: 0o755 }); chmodSync(join(w.dataDir, BACKUP_DIR), 0o755);
-  // A synchronous copy (VACUUM INTO) gives no turn to the event loop until it ends; the online backup yields between steps.
+  // A synchronous copy (VACUUM INTO) gives no turn to the event loop until it ends; the online backup runs in the thread pool meanwhile.
   let turns = 0, spinning = true;
   const spin = () => { turns++; if (spinning) setImmediate(spin); };
   setImmediate(spin);
@@ -300,4 +300,49 @@ test('the page pauses the automatic sync while the import panel is mounted, and 
   const first = gate.hold(); first(); const second = gate.hold();
   assert.equal(gate.held, true);
   second(); assert.equal(gate.held, false);
+});
+
+test('the backup finishes while another connection keeps writing, under a temporary name that never counts as a backup', async t => {
+  const w = exampleLedger(t);
+  const raw = new DatabaseSync(w.file);
+  try {
+    raw.exec('BEGIN');
+    const insert = raw.prepare('INSERT INTO snapshots(date, data) VALUES(?, ?)'), padding = 'x'.repeat(6_000);
+    for (let i = 0; i < 4_000; i++) insert.run(`pad-${i}`, JSON.stringify({ padding: padding + i }));
+    raw.exec('COMMIT');
+  } catch (error) { raw.close(); throw error; }
+  // Leftovers of a copy a stopped process left half made: removed before the next copy; other files stay.
+  const directory = join(w.dataDir, BACKUP_DIR), leftover = '.partial-00000000-0000-4000-8000-000000000009.sqlite';
+  mkdirSync(directory, { mode: 0o700 });
+  for (const name of [leftover, leftover + '-wal', 'notes.txt']) writeFileSync(join(directory, name), 'half');
+  // A write every few milliseconds from another connection (as fill_cache or a workbench import could): a copy in steps
+  // would restart after each one; the single step finishes and the event loop keeps turning meanwhile.
+  let writes = 0, turns = 0, spinning = true;
+  const writer = setInterval(() => { raw.prepare("INSERT OR REPLACE INTO settings(key, value) VALUES('test-write', ?)").run(String(++writes)); }, 2);
+  const spin = () => { turns++; if (spinning) setImmediate(spin); };
+  setImmediate(spin);
+  while (writes < 3) await new Promise(resolve => setTimeout(resolve, 2));
+  const started = performance.now(), writesBefore = writes;
+  let path: string, writesDuring = 0;
+  try {
+    path = await Promise.race([
+      backupDatabase(w.file, 'before-import-00000000-0000-4000-8000-00000000000a.sqlite'),
+      new Promise<never>((_, fail) => setTimeout(() => fail(new Error('the backup did not finish within 20 s')), 20_000).unref()),
+    ]);
+    writesDuring = writes - writesBefore;
+  } finally { spinning = false; clearInterval(writer); raw.close(); }
+  assert.ok(performance.now() - started < 20_000);
+  assert.ok(writesDuring > 0, 'the source was written during the backup');
+  assert.ok(turns > 3, `the event loop turned ${turns} times during the backup`);
+  assert.deepEqual(readdirSync(directory).sort(), ['before-import-00000000-0000-4000-8000-00000000000a.sqlite', 'notes.txt']);
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+  const copy = new DatabaseSync(path, { readOnly: true });
+  try {
+    assert.equal(copy.prepare('PRAGMA quick_check').get()!.quick_check, 'ok');
+    assert.equal(copy.prepare("SELECT COUNT(*) AS count FROM snapshots WHERE date LIKE 'pad-%'").get()!.count, 4_000);
+  } finally { copy.close(); }
+  // A failed copy (the source is not a database) leaves neither its temporary file nor a backup name behind.
+  writeFileSync(join(w.dataDir, 'broken.sqlite'), 'not a database file, long enough to have a header '.repeat(4));
+  await assert.rejects(backupDatabase(join(w.dataDir, 'broken.sqlite'), 'before-import-00000000-0000-4000-8000-00000000000b.sqlite'), { name: 'AssetBackupError' });
+  assert.deepEqual(readdirSync(directory).sort(), ['before-import-00000000-0000-4000-8000-00000000000a.sqlite', 'notes.txt']);
 });

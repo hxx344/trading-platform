@@ -6,9 +6,9 @@
 // - apply needs the fingerprint the preview returned, and refuses (409) when the file sent differs from the previewed one
 //   (the workbench applies whatever is sent the second time);
 // - the backup: node:sqlite's online backup (the workbench's better-sqlite3 db.backup(), into .data/backups, chmod after),
-//   here into a file created empty with mode 600 in <data dir>/asset-backups (700), in steps off the main thread so the
-//   service's other loops keep running; then fsynced (file and directory) and checked with PRAGMA quick_check before
-//   anything is written. A failed backup writes nothing (AssetBackupError, answered 503). After a successful import only
+//   here into a temporary file created empty with mode 600 in <data dir>/asset-backups (700), in one step that runs in
+//   the thread pool so the service's other loops keep running; checked with PRAGMA quick_check, fsynced, renamed to its
+//   final name and the directory fsynced before anything is written. A failed backup writes nothing (AssetBackupError, answered 503). After a successful import only
 //   the newest BACKUP_KEEP backups stay;
 // - the write re-checks, in its transaction, that the source ledger it planned from is still there (the lease already
 //   refuses once the ledger was imported again from the workbench, import-info);
@@ -16,7 +16,7 @@
 //   the cached positions) instead of the hand-built row of importLedger, which lacks those two fields;
 // - the clock is injected.
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { backup, DatabaseSync } from 'node:sqlite';
 import type { AssetDb } from './db.ts';
@@ -34,9 +34,16 @@ import { saveSetting, saveSnapshot, type PositionsPeek } from './writes.ts';
 export const BACKUP_DIR = 'asset-backups';
 /** The backups kept after a successful import (the newest by time); older ones are removed then. */
 export const BACKUP_KEEP = 5;
-/** Pages copied per backup step (4 KB pages: 1 MB a step); the steps run in the thread pool between event-loop turns. */
-export const BACKUP_PAGES_PER_STEP = 256;
+/**
+ * The backup copies every page in one step (-1). Copied in several steps, a write to the source from another connection
+ * between two steps restarts the copy from the start, without bound while the source is written often (fill_cache and the
+ * workbench import write without the sync lock). The one step runs in the thread pool and holds only a WAL read
+ * transaction, so neither the event loop nor the writers wait for it.
+ */
+export const BACKUP_PAGES_PER_STEP = -1;
 const BACKUP_NAME = /^before-import-[0-9a-f-]{36}\.sqlite$/;
+/** A copy still being made; outside BACKUP_NAME so a leftover (the process stopped mid-copy) never counts as a backup. */
+const PARTIAL_NAME = /^\.partial-[0-9a-f-]{36}\.sqlite(-wal|-shm|-journal)?$/;
 export const IMPORT_FINGERPRINT_KEY = 'source-import-hash';
 export const IMPORT_CHANGED = '导入文件与预览时不同，请重新选择文件并预览';
 export const BACKUP_FAILED = '导入前备份数据库失败，未执行导入，已有数据保持不变';
@@ -108,12 +115,13 @@ export function importPlan(source: SourceLedger, current: Ledger, previous: Sour
 const fsyncPath = (path: string, flags: string) => { const handle = openSync(path, flags); try { fsyncSync(handle); } finally { closeSync(handle); } };
 
 /**
- * A consistent copy of the database next to it, made with SQLite's online backup from a connection of its own (the
- * caller holds the sync lock, so the service's ledger writes wait; another writer only makes SQLite restart the copy).
- * Throws AssetBackupError and leaves no file behind on failure.
+ * A consistent copy of the database next to it, made with SQLite's online backup in one step from a connection of its own
+ * (a snapshot of the last commit; writes from other connections meanwhile go on and are not in the copy). It is written
+ * under a temporary .partial- name and renamed only once checked and synced, so the backup name always means a complete
+ * copy. Throws AssetBackupError and leaves no file behind on failure.
  */
 export async function backupDatabase(dbFile: string, name: string): Promise<string> {
-  const directory = join(dirname(dbFile), BACKUP_DIR), path = join(directory, name);
+  const directory = join(dirname(dbFile), BACKUP_DIR), path = join(directory, name), partial = join(directory, `.partial-${randomUUID()}.sqlite`);
   let created = false;
   try {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -121,23 +129,31 @@ export async function backupDatabase(dbFile: string, name: string): Promise<stri
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('not a directory');
     // An existing directory (made by hand, or by an older umask) is narrowed to the service account too.
     if ((stat.mode & 0o777) !== 0o700) chmodSync(directory, 0o700);
+    removePartials(directory);
     // Created empty and private before SQLite writes into it, so the copy is never readable by others.
-    closeSync(openSync(path, 'wx', 0o600)); created = true;
+    closeSync(openSync(partial, 'wx', 0o600)); created = true;
     const from = new DatabaseSync(dbFile, { readOnly: true });
-    try { await backup(from, path, { rate: BACKUP_PAGES_PER_STEP }); } finally { from.close(); }
+    try { await backup(from, partial, { rate: BACKUP_PAGES_PER_STEP }); } finally { from.close(); }
     // The copy carries the source's WAL mode; a rollback journal keeps it one self-contained file (no -wal, -shm beside it).
-    const check = new DatabaseSync(path);
+    const check = new DatabaseSync(partial);
     try {
       check.exec('PRAGMA journal_mode = DELETE');
       if ((check.prepare('PRAGMA quick_check').get() as { quick_check?: string } | undefined)?.quick_check !== 'ok') throw new Error('backup check failed');
     } finally { check.close(); }
-    fsyncPath(path, 'r+');
+    fsyncPath(partial, 'r+');
+    // The final name carries a fresh uuid (importSource), so the rename replaces nothing.
+    renameSync(partial, path);
     fsyncPath(directory, 'r');
     return path;
   } catch {
-    if (created) for (const file of [path, path + '-wal', path + '-shm', path + '-journal']) try { rmSync(file, { force: true }); } catch { /* an unusable copy is left behind; nothing was written */ }
+    if (created) for (const file of [partial, partial + '-wal', partial + '-shm', partial + '-journal']) try { rmSync(file, { force: true }); } catch { /* removed before the next import */ }
     throw new AssetBackupError();
   }
+}
+
+/** Removes copies a stopped process left half made (only the .partial- names this module writes). */
+function removePartials(directory: string): void {
+  for (const name of readdirSync(directory)) if (PARTIAL_NAME.test(name)) rmSync(join(directory, name), { force: true });
 }
 
 /** Keeps the newest BACKUP_KEEP import backups (by modification time); a file that cannot be removed stays. */

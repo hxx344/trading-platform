@@ -2,13 +2,31 @@ name: release
 on:
   push:
     tags: ['v*.*.*']
-# Install, tests and packaging run with a read-only token; only the last job, which runs no project code, can write.
+# Install, the install test and packaging run with a read-only token; only the last job, which runs no project code, can write.
 permissions:
   contents: read
 concurrency:
   group: release
   cancel-in-progress: false
 jobs:
+  # ci.yml ran every check on this commit when it was pushed to main; this waits for that result instead of running
+  # them again. publish needs it, so a commit whose ci failed, is missing or cannot be read is not released.
+  ci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+      - run: node scripts/wait-ci.ts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -28,10 +46,8 @@ jobs:
           version=$(node -p 'require("./package.json").version')
           [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "标签 $GITHUB_REF_NAME 与 package.json 版本 v$version 不一致"; exit 1; }
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo '标签提交不在 main 上'; exit 1; }
-      - run: pnpm check
       - run: pnpm build:web
-      - run: shellcheck deploy/*.sh
-      - run: python3 -I -B deploy/main-watch/test_main_watch.py
+      # ci.yml runs this in three parts that each start from a first install; the whole sequence in one go runs only here.
       - run: bash deploy/test-install.sh
       - run: bash deploy/package.sh dist
       - name: 更新说明
@@ -53,31 +69,8 @@ jobs:
           name: release
           path: dist/
           retention-days: 7
-  # Same shards as ci.yml; publish waits for both, so a release still requires the full suite to pass.
-  test:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4, 5, 6]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24.15.0
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      # Some tests start the service, whose config check requires the built page.
-      - run: pnpm build:web
-      - run: pnpm test
-        env:
-          TEST_SHARD: ${{ matrix.shard }}/6
   publish:
-    needs: [build, test]
+    needs: [ci, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

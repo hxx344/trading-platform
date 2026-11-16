@@ -17,9 +17,9 @@ import './trading.css';
 // a failure); every write keeps its request id until an answer arrives.
 export const OIL_STATE_PATH = '/api/oil/state';
 export const OIL_READ_TIMEOUT_MS = 10_000;
-const MARKET_MS = 3_000, ACTIVE_MS = 2_000, IDLE_MS = 5_000;
+export const MARKET_MS = 3_000, ACTIVE_MS = 2_000, IDLE_MS = 5_000;
 
-const JOB_STATUS: Record<string, string> = { accepted: '已受理', running: '执行中', completed: '已完成', failed: '失败', stopped: '已停止', attention: '需人工处理' };
+export const JOB_STATUS: Record<string, string> = { accepted: '已受理', running: '执行中', completed: '已完成', failed: '失败', stopped: '已停止', attention: '需人工处理' };
 /** The workbench badge colours: running blue, completed green, waiting for a person amber. */
 const JOB_BADGE: Record<string, string> = { accepted: 'running', running: 'running', completed: 'completed', failed: 'attention', attention: 'attention' };
 const TRACKING_STATUS: Record<string, string> = {
@@ -28,29 +28,31 @@ const TRACKING_STATUS: Record<string, string> = {
 };
 const OP_STATE: Record<string, string> = { prepared: '已落盘', sending: '发送中', open: '交易所挂单中', unknown: '结果未知，核对中', rejected: '被拒绝', 'not-sent': '未发送', 'not-created': '确认未创建', filled: '已成交', canceled: '已撤销', confirmed: '已确认' };
 const STRATEGY_STATUS: Record<string, string> = { working: '运行中', paused: '已暂停', terminal: '已结束' };
-const ORDER_TYPE: Record<string, string> = { market: '市价', chase: '追价策略', 'local-chase': '本地追价', limit: '限价' };
-const ACCOUNT_MODE: Record<string, string> = { standard: '普通 U 本位', 'portfolio-margin': '组合保证金', unified: '统一账户' };
+export const ORDER_TYPE: Record<string, string> = { market: '市价', chase: '追价策略', 'local-chase': '本地追价', limit: '限价' };
+export const ACCOUNT_MODE: Record<string, string> = { standard: '普通 U 本位', 'portfolio-margin': '组合保证金', unified: '统一账户' };
 const SYMBOLS: readonly OilSymbol[] = ['BZUSDT', 'CLUSDT'];
-const statusOf = (error: unknown): number | undefined => {
+export const statusOf = (error: unknown): number | undefined => {
   const status = (error as { status?: unknown } | null)?.status;
   return typeof status === 'number' ? status : undefined;
 };
 // Only the confirm's own refusal (a bad body, an invalid preview, a lock or a cap) proves the request id was never accepted.
 // A refusal given before the executor looks the id up (401, 403, 421, 5xx) or a reused id leaves the first request's result unknown.
-const confirmRefused = (error: unknown): boolean => {
+export const confirmRefused = (error: unknown): boolean => {
   const status = statusOf(error);
   return (status === 400 || status === 409) && (error as { code?: unknown } | null)?.code !== 'request_reused';
 };
-const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
+export const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 const short = (symbol: string): string => symbol.replace('USDT', '');
-const venueName = (venue: string): string => label(VENUE_LABEL, venue);
+/** Hynix legs are named as the workbench names them: ADR and the ordinary share. */
+const HYNIX_CONTRACT: Record<string, string> = { SKHYUSDT: 'ADR', SKHYNIXUSDT: '正股' };
+export const venueName = (venue: string): string => label(VENUE_LABEL, venue);
 /** Whether the leg's order buys: opening a long or closing a short. */
-const buys = (action: 'open' | 'close', side: string): boolean => (action === 'open') === (side === 'long');
+export const buys = (action: 'open' | 'close', side: string): boolean => (action === 'open') === (side === 'long');
 /** 开多 / 开空 / 平多 / 平空, as the workbench names a leg's operation. */
-const operation = (action: string, side: string): string => `${action === 'open' ? '开' : '平'}${side === 'long' ? '多' : '空'}`;
+export const operation = (action: string, side: string): string => `${action === 'open' ? '开' : '平'}${side === 'long' ? '多' : '空'}`;
 
 /** The same staleness rule as the overview: a failed or paused read, or a result older than two refreshes and a timeout. */
-function staleness(live: Pick<LiveResource<unknown>, 'data' | 'status' | 'error' | 'receivedAt'>, refreshMs: number): { stale: boolean; text: string | null } {
+export function staleness(live: Pick<LiveResource<unknown>, 'data' | 'status' | 'error' | 'receivedAt'>, refreshMs: number): { stale: boolean; text: string | null } {
   const { data, status, error, receivedAt } = live;
   const old = receivedAt !== null && Date.now() - receivedAt > 2 * refreshMs + OIL_READ_TIMEOUT_MS;
   const stale = data !== null && (status === 'error' || status === 'offline' || status === 'paused' || (status === 'loading' && (error !== null || old)));
@@ -59,19 +61,19 @@ function staleness(live: Pick<LiveResource<unknown>, 'data' | 'status' | 'error'
   return { stale, text: status === 'paused' ? `页面在后台，已暂停刷新（停留在 ${at}）` : status === 'offline' ? `网络离线（停留在 ${at}）` : error ? `刷新失败：${error.message}（停留在 ${at}）` : `正在刷新，下方仍是 ${at} 的结果` };
 }
 
-const LEAVE_UNANSWERED = '上次确认没有收到应答，可能已经受理并下单。返回修改后会放弃核对，再次预览确认会是新的请求，可能重复下单。确定返回？';
+export const LEAVE_UNANSWERED = '上次确认没有收到应答，可能已经受理并下单。返回修改后会放弃核对，再次预览确认会是新的请求，可能重复下单。确定返回？';
 type ReadState = 'live' | 'stale' | 'loading' | 'error';
 const READ_STATE: Record<ReadState, string> = { live: '实时', stale: '已过期', loading: '读取中', error: '读取失败' };
 function ReadStatus({ state }: { state: ReadState }) { return <span className={`trading-status ${state}`}><i aria-hidden="true" />{READ_STATE[state]}</span>; }
 
 /** The sync line under a panel heading: how often it refreshes, or why the shown result is old. */
-function SyncLine({ stale, text, every, at }: { stale: boolean; text: string | null; every: string; at: number | null }) {
+export function SyncLine({ stale, text, every, at }: { stale: boolean; text: string | null; every: string; at: number | null }) {
   return <div className={`execution-sync${stale ? ' stale' : ''}`} role={stale ? 'status' : undefined}><Clock3 size={14} aria-hidden="true" />
     <span>{text ?? (at === null ? '正在读取…' : `前台${every}更新。最近取得：${clock(at)}（北京时间）`)}</span></div>;
 }
 
 /** The workbench segmented choice: one pressed button per option. */
-function Choice<T extends string>({ label: name, value, options, onChange, id }: { label: string; value: T; options: readonly (readonly [T, string])[]; onChange: (value: T) => void; id?: string }) {
+export function Choice<T extends string>({ label: name, value, options, onChange, id }: { label: string; value: T; options: readonly (readonly [T, string])[]; onChange: (value: T) => void; id?: string }) {
   return <div className="execution-choice"><span aria-hidden="true">{name}</span><div className="execution-segmented" role="group" aria-label={name} id={id}>
     {options.map(([key, text]) => <button key={key} type="button" aria-pressed={value === key} data-value={key} onClick={() => { if (value !== key) onChange(key); }}>{text}</button>)}
   </div></div>;
@@ -121,7 +123,11 @@ function MarketPanel({ live }: { live: LiveResource<OilMarket> }) {
   </section>;
 }
 
-function PositionsPanel({ state, stale }: { state: OilState; stale: boolean }) {
+/** Which contracts a positions panel lists and how it names them: oil by default, hynix from its page. */
+export interface PositionsKind { name: string; symbols: readonly string[]; contract: (symbol: string) => string; id: string }
+const OIL_POSITIONS: PositionsKind = { name: '原油', symbols: SYMBOLS, contract: short, id: 'oilPositions' };
+
+export function PositionsPanel({ state, stale, kind = OIL_POSITIONS }: { state: Pick<OilState, 'positions'>; stale: boolean; kind?: PositionsKind }) {
   const view = state.positions;
   const readState = (account: OilPositionAccount): ReadState => {
     if (account.failedAt !== null && (account.receivedAt === null || account.failedAt > account.receivedAt)) return 'error';
@@ -130,26 +136,26 @@ function PositionsPanel({ state, stale }: { state: OilState; stale: boolean }) {
   };
   const amount = (side: Record<string, string> | null, symbol: string): string | null => side ? side[symbol] ?? '0' : null;
   const cell = (value: string | null, side: 'long' | 'short'): ReactNode => value === null ? '—' : Number(value) ? <span className={`trading-side ${side}`}>{value}</span> : <span className="trading-muted">0</span>;
-  return <section className="trading-panel trading-overview" id="oilPositions" aria-labelledby="oil-positions-title">
-    <header className="trading-panel-heading"><div><h2 id="oil-positions-title">原油持仓</h2><p>执行账户的 BZ / CL 合约数量与原油挂单 · 每 {Math.round(view.readEveryMs / 1000)} 秒读取</p></div></header>
-    {view.accounts.length ? <div className="trading-position-scroll"><table className="trading-position-table" aria-label="原油持仓">
-      <thead><tr><th scope="col">合约 / 账户</th><th scope="col">多头<small>合约数量</small></th><th scope="col">空头<small>合约数量</small></th><th scope="col">原油挂单</th><th scope="col">读取时间<small>北京时间</small></th></tr></thead>
-      <tbody>{view.accounts.flatMap(account => SYMBOLS.map((symbol, index) => {
+  return <section className="trading-panel trading-overview" id={kind.id} aria-labelledby={`${kind.id}-title`}>
+    <header className="trading-panel-heading"><div><h2 id={`${kind.id}-title`}>{kind.name}持仓</h2><p>执行账户的 {kind.symbols.map(kind.contract).join(' / ')} 合约数量与{kind.name}挂单 · 每 {Math.round(view.readEveryMs / 1000)} 秒读取</p></div></header>
+    {view.accounts.length ? <div className="trading-position-scroll"><table className="trading-position-table" aria-label={`${kind.name}持仓`}>
+      <thead><tr><th scope="col">合约 / 账户</th><th scope="col">多头<small>合约数量</small></th><th scope="col">空头<small>合约数量</small></th><th scope="col">{kind.name}挂单</th><th scope="col">读取时间<small>北京时间</small></th></tr></thead>
+      <tbody>{view.accounts.flatMap(account => kind.symbols.map((symbol, index) => {
         const read = readState(account);
         return <tr key={`${account.venue}:${symbol}`} className={index === 0 ? 'trading-leg-start' : ''}>
-          <th scope="row" className="trading-leg-name"><strong>{venueName(account.venue)} {short(symbol)}</strong><span>{account.accountId} · {label(ACCOUNT_MODE, account.accountMode)}</span>{index === 0 ? <ReadStatus state={read} /> : null}</th>
+          <th scope="row" className="trading-leg-name"><strong>{venueName(account.venue)} {kind.contract(symbol)}</strong><span>{account.accountId} · {label(ACCOUNT_MODE, account.accountMode)}</span>{index === 0 ? <ReadStatus state={read} /> : null}</th>
           <td data-label="多头">{cell(amount(account.long, symbol), 'long')}</td>
           <td data-label="空头">{cell(amount(account.short, symbol), 'short')}</td>
-          <td data-label="原油挂单">{index === 0 ? account.openOrders ?? '—' : ''}</td>
+          <td data-label={`${kind.name}挂单`}>{index === 0 ? account.openOrders ?? '—' : ''}</td>
           <td data-label="读取时间">{index === 0 ? read === 'error' ? <span className="trading-warning">读取失败：{account.error ?? '未知原因'}{account.receivedAt ? `（显示 ${clock(account.receivedAt)} 的结果）` : ''}</span> : clock(account.receivedAt) : ''}</td>
         </tr>;
       }))}</tbody>
-    </table></div> : <p className="trading-footnote">没有配置原油执行账户。</p>}
+    </table></div> : <p className="trading-footnote">没有配置{kind.name}执行账户。</p>}
     {stale ? <p className="trading-footnote trading-warning">执行状态未能刷新，显示的是上次读取的结果。</p> : null}
   </section>;
 }
 
-function Limits({ limits }: { limits: OilState['notionalLimits'] }) {
+export function Limits({ limits }: { limits: OilState['notionalLimits'] }) {
   if (!limits) return null;
   return <dl className="execution-review-settings oil-limits" id="oilLimits">
     <div><dt>单笔名义上限</dt><dd>{limits.perJob} USDT</dd></div>
@@ -347,7 +353,9 @@ type ActionKind = 'stop' | 'acknowledge' | 'adopt' | 'notcreated' | 'release';
 
 function JobCard({ job, busy, strategyId, onStrategyId, onAction }: { job: OilJob; busy: boolean; strategyId: string; onStrategyId: (value: string) => void; onAction: (job: OilJob, kind: ActionKind) => void }) {
   const actions = jobActions(job);
-  const kind = job.preset === 'same-exchange' ? `${venueName(job.legs[0]?.venue ?? '')} 同所价差` : '跨所同合约';
+  const hynix = job.market === 'hynix';
+  const kind = job.preset === 'same-exchange' ? `${venueName(job.legs[0]?.venue ?? '')} 同所${hynix ? '溢价' : '价差'}` : '跨所同合约';
+  const legName = (symbol: string): string => hynix ? HYNIX_CONTRACT[symbol] ?? short(symbol) : short(symbol);
   const strategyLeg = job.legs.find(leg => leg.operation?.kind === 'strategy');
   return <article className={`execution-job ${job.status}`} data-oil-job={job.id} aria-label={`${kind}${job.action === 'open' ? '开仓' : '平仓'} ${label(JOB_STATUS, job.status)}`}>
     <header><div>
@@ -356,10 +364,12 @@ function JobCard({ job, busy, strategyId, onStrategyId, onAction }: { job: OilJo
     </div>{actions.stop ? <button className="button secondary execution-stop" type="button" data-oil-stop={job.id} disabled={busy} onClick={() => onAction(job, 'stop')}><Square size={14} aria-hidden="true" />停止并撤销余单</button> : null}</header>
     {job.reason ? <p className="execution-job-reason" role={job.status === 'attention' ? 'alert' : undefined}>{job.reason}</p> : null}
     <div className="execution-table-wrap"><table className="execution-progress-table">
-      <thead><tr><th scope="col">交易腿</th><th scope="col">已成交 / 计划<small>桶</small></th><th scope="col">成交均价<small>USDT</small></th><th scope="col">当前委托 / 策略</th><th scope="col">价格保护界限<small>USDT</small></th></tr></thead>
+      <thead><tr><th scope="col">交易腿</th><th scope="col">已成交 / 计划<small>{hynix ? '合约数量' : '桶'}</small></th><th scope="col">成交均价<small>USDT</small></th><th scope="col">当前委托 / 策略</th><th scope="col">价格保护界限<small>USDT</small></th></tr></thead>
       <tbody>{job.legs.map((leg, index) => <tr key={index}>
-        <th scope="row"><strong>{venueName(leg.venue)} {short(leg.symbol)}</strong><span className={`execution-side ${leg.side}`}>{operation(job.action, leg.side)}</span></th>
-        <td data-label="已成交 / 计划"><span><strong>{leg.filledBarrels}</strong> / {leg.plannedBarrels} 桶<small>合约 {leg.filledQuantity} / {leg.plannedQuantity}{leg.attempts > 1 ? ` · ${leg.attempts} 笔` : ''}</small></span></td>
+        <th scope="row"><strong>{venueName(leg.venue)} {legName(leg.symbol)}</strong><span className={`execution-side ${leg.side}`}>{operation(job.action, leg.side)}</span></th>
+        <td data-label="已成交 / 计划">{hynix
+          ? <span><strong>{leg.filledQuantity}</strong> / {leg.plannedQuantity}<small>{leg.symbol}{leg.attempts > 1 ? ` · ${leg.attempts} 笔` : ''}</small></span>
+          : <span><strong>{leg.filledBarrels}</strong> / {leg.plannedBarrels} 桶<small>合约 {leg.filledQuantity} / {leg.plannedQuantity}{leg.attempts > 1 ? ` · ${leg.attempts} 笔` : ''}</small></span>}</td>
         <td data-label="成交均价">{leg.averagePrice ?? '—'}</td>
         <td data-label="当前委托 / 策略"><span className={leg.operation?.state === 'unknown' ? 'execution-warning' : undefined}>{leg.operation ? label(OP_STATE, leg.operation.state) : '未发送'}</span>
           <small>{index === 0 ? '首腿' : '对冲腿'} · {label(ORDER_TYPE, leg.orderType)}{leg.orderType === 'local-chase' && leg.operation?.limitPrice ? ` 挂 ${leg.operation.limitPrice}` : ''} · 账户 {leg.accountId}{strategyText(leg) ? ` · ${strategyText(leg)}` : ''}</small>{leg.operation?.note ? <small>{leg.operation.note}</small> : null}</td>
@@ -367,7 +377,7 @@ function JobCard({ job, busy, strategyId, onStrategyId, onAction }: { job: OilJo
       </tr>)}</tbody>
     </table></div>
     {actions.strategy ? <div className="execution-reconcile" role="group" aria-label="追价策略核对">
-      <strong>{strategyLeg ? `${venueName(strategyLeg.venue)} ${short(strategyLeg.symbol)} · ` : ''}追价策略创建结果未知</strong>
+      <strong>{strategyLeg ? `${venueName(strategyLeg.venue)} ${legName(strategyLeg.symbol)} · ` : ''}追价策略创建结果未知</strong>
       <p>请在 Bybit 核对该账户、合约、方向与数量：找到对应策略就填入编号认领；确认没有创建就点「确认未创建」；无法核对时可强制释放，但策略可能已在交易所成交。</p>
       <label>交易所显示的策略编号<input type="text" data-oil-strategy={job.id} autoComplete="off" spellCheck={false} maxLength={100} value={strategyId} disabled={busy} onChange={event => onStrategyId(event.target.value)} /></label>
       <div className="execution-actions">
@@ -393,7 +403,7 @@ function JobCard({ job, busy, strategyId, onStrategyId, onAction }: { job: OilJo
 /** Whether a job still asks for something: it runs, or it waits for a person (strategy reconcile, acknowledgement). */
 const needsWatch = (job: OilJob): boolean => { const actions = jobActions(job); return ACTIVE_STATUSES.includes(job.status) || actions.strategy || actions.acknowledge; };
 
-function JobsSection({ jobs, stale, tracked, onUntrack, onChanged }: { jobs: OilJob[]; stale: boolean; tracked: string | null; onUntrack: () => void; onChanged: () => void }) {
+export function JobsSection({ jobs, stale, tracked, onUntrack, onChanged }: { jobs: OilJob[]; stale: boolean; tracked: string | null; onUntrack: () => void; onChanged: () => void }) {
   const ids = useRef(new RequestIds());
   const trackingRef = useRef<HTMLElement>(null);
   const [strategyIds, setStrategyIds] = useState<Record<string, string>>({});

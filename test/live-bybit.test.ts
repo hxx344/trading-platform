@@ -294,6 +294,13 @@ test('Bybit 连接器：原生追价按真实账户的形状走完一生：挂�
   assert.equal((await fresh.connector.queryStrategy(binding(), STRATEGY_A, { signal: signal() }))!.symbol, 'BZUSDT');
   assert.deepEqual(fresh.venue.calls.filter(call => call.path === '/v5/strategy/list').map(call => call.params.get('symbol')), ['CLUSDT', 'BZUSDT']);
   assert.equal(await fresh.connector.queryStrategy(binding(), 'aaaaaaaa-0000-4000-8000-000000000000', { signal: signal() }), null);
+  // The caller's contract limits the search to it (the executor always passes the leg's), so an oil reconcile never reads the hynix contracts.
+  const hinted = setup();
+  hinted.venue.strategies.push(strategyRow({ symbol: 'BZUSDT' }));
+  assert.equal(await hinted.connector.queryStrategy(binding(), STRATEGY_A, { signal: signal(), symbol: 'CLUSDT' }), null);
+  assert.equal((await hinted.connector.queryStrategy(binding(), STRATEGY_A, { signal: signal(), symbol: 'BZUSDT' }))!.symbol, 'BZUSDT');
+  assert.deepEqual(hinted.venue.calls.filter(call => call.path === '/v5/strategy/list').map(call => call.params.get('symbol')), ['CLUSDT', 'BZUSDT']);
+  await assert.rejects(hinted.connector.queryStrategy(binding(), STRATEGY_A, { signal: signal(), symbol: 'ETHUSDT' }), kind('read-failed'));
   // A strategy created here is read on its own symbol only.
   fresh.venue.strategies = [];
   await fresh.connector.placeChase(binding(), chase({ symbol: 'BZUSDT' }), send());

@@ -4,8 +4,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { add, bandEdge, cmp, floorToStep, isMultiple, isZero, mul, sub, units, fromUnits } from './decimal.ts';
 import {
-  ContractError, MAX_SLIPPAGE_BPS, UUID, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, exactKeys, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseExecutorNotionalLimits, parseInstrument, parseIntent, parseQuote, positionOf, reject, text,
-  type AccountBinding, type ExecutorNotionalLimits, type AccountSnapshot, type Action, type Environment, type Instrument, type Intent, type LegOrderType, type OrderSide, type PositionSide, type Quote, type TransferConfig, type Venue,
+  ContractError, MAX_SLIPPAGE_BPS, UUID, marketOfSymbol, MARKET_SYMBOLS, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, exactKeys, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseExecutorNotionalLimits, parseInstrument, parseIntent, parseQuote, positionOf, reject, text,
+  type AccountBinding, type ExecutorNotionalLimits, type AccountSnapshot, type Action, type Environment, type Instrument, type Intent, type LegOrderType, type Market, type OrderSide, type PositionSide, type Quote, type TransferConfig, type Venue,
 } from './contracts.ts';
 import {
   STRATEGY_ID, VenueError, parseOrderReport, parseStrategyAck, parseStrategyReport, strategyRequestOf, supportsChase,
@@ -13,6 +13,7 @@ import {
 } from './connector.ts';
 import type { Store } from './store.ts';
 import { nearestBarrels, quantityForBarrels, splitBarrels } from './barrels.ts';
+import { midOf, quantityForNotional } from './hynix/sizing.ts';
 import { createTransfers, type PairRecord, type TransferDeps } from './transfer.ts';
 import { DEFAULT_ADL_BUDGETS, createAdl, type Adl, type AdlBudgets } from './adl.ts';
 import type { AdlConnector } from './adl-contracts.ts';
@@ -599,7 +600,14 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     }));
     // Barrels become each leg's native quantity here, from the contract rules just read; a count that is not a whole number
     // of every leg's steps is refused with the nearest counts both legs can take.
-    const quantities = intent.legs.map((leg, index) => leg.quantity ?? quantityForBarrels(leg.barrels as string, reads[index].instrument));
+    // Hynix notional becomes each leg's quantity at the book midpoint just read, floored to the step (docs/hynix.md 2).
+    const hynix = intent.market === 'hynix';
+    const quantities = intent.legs.map((leg, index) => leg.quantity
+      ?? (leg.notional != null ? quantityForNotional(leg.notional, midOf(reads[index].quote.bid, reads[index].quote.ask), reads[index].instrument) : quantityForBarrels(leg.barrels as string, reads[index].instrument)));
+    intent.legs.forEach((leg, index) => {
+      const quantity = quantities[index], { instrument } = reads[index];
+      if (leg.notional != null && quantity !== null && cmp(quantity, instrument.minQuantity) < 0) reject('notional_too_small', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 每腿 ${leg.notional} USDT 按中间价折算不足最小数量 ${instrument.minQuantity}（数量步长 ${instrument.quantityStep}）`);
+    });
     if (quantities.some(quantity => quantity === null)) {
       const barrels = intent.legs[0].barrels as string, [low, high] = nearestBarrels(barrels, reads.map(read => read.instrument));
       const rules = intent.legs.map((leg, index) => `${VENUE_NAMES[leg.venue]} ${leg.symbol} 每步 ${mul(reads[index].instrument.quantityStep, reads[index].instrument.contractSize)} 桶`).join('、');
@@ -630,9 +638,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       };
       return result;
     }) as [PlannedLeg, PlannedLeg];
-    // Settlement completes only on equal barrels, so the plan must already be equal; a tolerance here would end every such job in attention.
+    // Oil settlement completes only on equal barrels, so the plan must already be equal; a tolerance here would end every such
+    // job in attention. Hynix legs hedge equal notional, so their units differ and they settle in the planned proportion.
     const [a, b] = legs.map(leg => units(exposure(leg.quantity, leg.instrument)));
-    if (a !== b) reject('unbalanced', `两腿桶数不相等：${fromUnits(a)} 与 ${fromUnits(b)}`);
+    if (!hynix && a !== b) reject('unbalanced', `两腿桶数不相等：${fromUnits(a)} 与 ${fromUnits(b)}`);
     const batches = intent.batches ? planBatches(legs, intent.batches.count, reads.map(read => read.quote), intent.action) : null;
     const notional = jobNotional(legs);
     checkNotional(notional, intent.action);
@@ -640,9 +649,12 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       ? `名义金额按价格保护界限计 ${notional} USDT；单笔上限 ${limits.perJob} USDT，最近 24 小时开仓上限 ${limits.openPer24h} USDT（按确认时刻滚动计；平仓只受单笔上限；确认时按当时用量再核一次，超限拒绝；对冲腿市价成交可能高于此估算）。`
       : `名义金额按价格保护界限计 ${notional} USDT；单笔上限 ${limits.perJob} USDT，累计开仓上限 ${limits.totalOpen} USDT（确认时按当时累计再核一次，超限拒绝；对冲腿市价成交可能高于此估算）。`;
     const value: Preview = {
-      id: randomUUID(), expiresAt: at + budgets.previewTtlMs, writerGeneration: generation, intent, legs, notional, barrels: fromUnits(a), ...(batches ? { batches } : {}),
+      id: randomUUID(), expiresAt: at + budgets.previewTtlMs, writerGeneration: generation, intent, legs, notional, ...(hynix ? {} : { barrels: fromUnits(a) }), ...(batches ? { batches } : {}),
       notes: [
-        `先发送 ${legLabel(legs, 0)} 腿，成交确认后按其成交量发送 ${legLabel(legs, 1)} 对冲腿。`,
+        hynix
+          ? `先发送 ${legLabel(legs, 0)} 腿，成交确认后按计划比例（对冲腿 ${legs[1].quantity} ÷ 首腿 ${legs[0].quantity}）换算其成交量，向下取整到步长后发送 ${legLabel(legs, 1)} 对冲腿；取整留下的差额不超过对冲腿一个数量步长 ${legs[1].instrument.quantityStep}。`
+          : `先发送 ${legLabel(legs, 0)} 腿，成交确认后按其成交量发送 ${legLabel(legs, 1)} 对冲腿。`,
+        ...(hynix ? [`按预览中间价估算：${legs.map(leg => `${legLabel(legs, leg.index)} ${leg.quantity} 约 ${mul(exposure(leg.quantity, leg.instrument), midOf(leg.quote.bid, leg.quote.ask)).replace(/(\.\d{2})\d+$/, '$1')} USDT`).join('，')}。`] : []),
         ...(batches && intent.batches ? [`分 ${batches.length} 批，首腿每批 ${batches.map(quantity => exposure(quantity, legs[0].instrument)).join(' / ')} 桶；一批首腿结束并补齐对冲后，等 ${intent.batches.intervalMs / 1000} 秒再发下一批。后续批次发送前盘口或持仓不满足条件时等待到截止，不追加；截止或停止时未发的批次不再发送。`] : []),
         legs[0].orderType === 'local-chase'
           ? `首腿本地追价：只挂单挂在${legs[0].orderSide === 'buy' ? '买一' : '卖一'}，盘口变化后撤单重挂（挂满 ${budgets.chaseRepriceMs / 1000} 秒后才改价），${legs[0].orderSide === 'buy' ? '最高' : '最低'}追到 ${legs[0].limitPrice ?? legs[0].priceBound}${legs[0].limitPrice ? '（自填界限）' : `（${slippageBps} 基点价格保护界限）`}${legs[0].chaseCeiling ? `，最高挂到 ${legs[0].chaseCeiling}` : ''}；挂单期间的成交每轮按比例对冲。首腿最多 ${budgets.chaseOrderLimit} 笔委托（各批合计）；连续 ${budgets.chaseFailureLimit} 次挂单失败或到截止时间时撤单结束追价，按实际成交对冲后结束；请求停止则撤单且不再补发对冲腿。发送前对冲腿盘口越过界限 ${legs[1].priceBound} 即不发送。`
@@ -813,7 +825,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (claimedStrategies().has(strategyId)) reject('strategy_claimed', '该策略编号已被其他委托认领', 409);
     let report: StrategyReport;
     try {
-      const value = await callVenue('read', signal => chaseConnector(op.venue).queryStrategy(binding, strategyId, { signal }));
+      const value = await callVenue('read', signal => chaseConnector(op.venue).queryStrategy(binding, strategyId, { signal, symbol: op.request.symbol }));
       report = value === null ? reject('strategy_not_found', `${name} 交易所查无该策略编号`, 409) : parseStrategyReport(value, { ...strategyIdentity(op), strategyId });
     } catch (error) { return readFailure(error); }
     // createdAt is the venue's clock; the window is the local prepare-to-send span widened by the skew.
@@ -1093,7 +1105,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   async function checkAck(op: Operation, binding: AccountBinding, strategyId: string, ackAt: number): Promise<AckCheck> {
     if (claimedStrategies().has(strategyId)) return { orphan: `回报的策略编号 ${strategyId} 已被其他委托认领` };
     try {
-      const value = await callVenue('read', signal => chaseConnector(op.venue).queryStrategy(binding, strategyId, { signal }));
+      const value = await callVenue('read', signal => chaseConnector(op.venue).queryStrategy(binding, strategyId, { signal, symbol: op.request.symbol }));
       if (value === null) return { orphan: `交易所查无回报的策略编号 ${strategyId}` };
       const report = parseStrategyReport(value, { ...strategyIdentity(op), strategyId });
       if (outsideAck(op, report.createdAt, ackAt, budgets.adoptSkewMs)) return { orphan: `回报的策略编号 ${strategyId} 的创建时间不在本委托发送时段内` };
@@ -1218,7 +1230,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (strategyId === null) return;
     const startedAt = now();
     let report: StrategyReport | null;
-    try { const value = await callVenue('read', signal => chaseConnector(op.venue).queryStrategy(binding, strategyId, { signal })); report = value === null ? null : parseStrategyReport(value, { ...strategyIdentity(op), strategyId }); }
+    try { const value = await callVenue('read', signal => chaseConnector(op.venue).queryStrategy(binding, strategyId, { signal, symbol: op.request.symbol })); report = value === null ? null : parseStrategyReport(value, { ...strategyIdentity(op), strategyId }); }
     catch (error) {
       if (error instanceof ContractError && error.code === 'strategy_identity') return strategyMismatch(job, op, strategyId);
       write(() => { const current = readOp(op.id); current.note = `策略核对读取失败：${error instanceof Error ? error.message.slice(0, 160) : '未知'}`; current.lastCheckedAt = now(); saveOp(current); });
@@ -1585,6 +1597,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
   const orphanReason = (orphan: Operation): string => `${VENUE_NAMES[orphan.venue]} 追价策略创建结果未知（交易所无客户编号，无法自动核对；${(orphan.note ?? '无回报').slice(0, 100)}），不再发送；需人工填写策略编号认领、在观察窗后确认未创建，或强制释放`;
 
+  const marketOfJob = (job: Pick<Job, 'legs'>): Market => marketOfSymbol(job.legs[0].symbol);
   /** Hedge the lead's actual fill in the planned proportion, floored to the hedge venue's step. */
   function hedgeQuantityFor(job: Job, leadFilled: string): string {
     const [lead, hedge] = job.legs;
@@ -1601,6 +1614,18 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const refused = ops.filter(item => item.leg === 1).sort((a, b) => attemptOf(a) - attemptOf(b)).at(-1);
     if (isZero(leadExposure) && isZero(hedgeExposure)) {
       finish(job, stopRequested(job.id) ? 'stopped' : 'failed', `首腿未成交（${note ?? lead?.state ?? '未发送'}），未发送对冲腿`);
+      return;
+    }
+    if (marketOfJob(job) === 'hynix') {
+      // Hynix legs hedge in the planned proportion: done when the hedge filled exactly what the lead's fill asks for.
+      const target = hedgeQuantityFor(job, filled(0)), missing = sub(target, filled(1));
+      if (isZero(missing)) {
+        const short = cmp(filled(0), job.legs[0].quantity) < 0 ? `首腿成交 ${filled(0)}，计划 ${job.legs[0].quantity}；对冲腿按比例成交 ${filled(1)}` : null;
+        finish(job, 'completed', [note, short].filter(Boolean).join('；') || null);
+        return;
+      }
+      const why = refused?.state === 'rejected' ? `对冲腿被交易所拒绝（${(refused.note ?? '').slice(0, 80)}），不再补发；` : stopRequested(job.id) ? '已请求停止，不再补发对冲腿；' : '';
+      finish(job, 'attention', `${why}两腿成交不平衡：${legLabel(job.legs, 0)} ${filled(0)}，${legLabel(job.legs, 1)} ${filled(1)}，按计划比例对冲腿应为 ${target}，相差 ${missing}；敞口保留，需人工处理`);
       return;
     }
     const gap = sub(leadExposure, hedgeExposure);
@@ -1793,7 +1818,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const job = readJob(id), ops = opsOf(id);
     const events = (db.prepare('SELECT type, at, json FROM events WHERE job_id = ? ORDER BY seq DESC LIMIT 40').all(id) as { type: string; at: number; json: string }[]).reverse().map(row => ({ type: row.type, at: row.at, ...JSON.parse(row.json) }));
     return {
-      id: job.id, preset: job.legs[0].venue === job.legs[1].venue ? 'same-exchange' as const : 'cross-exchange' as const, action: job.action, status: job.status, reason: job.reason, stopRequested: stopRequested(id), createdAt: job.createdAt, deadlineAt: job.deadlineAt, holdNewSends: job.holdNewSends,
+      id: job.id, market: marketOfJob(job), preset: job.legs[0].venue === job.legs[1].venue ? 'same-exchange' as const : 'cross-exchange' as const, action: job.action, status: job.status, reason: job.reason, stopRequested: stopRequested(id), createdAt: job.createdAt, deadlineAt: job.deadlineAt, holdNewSends: job.holdNewSends,
       locked: !!db.prepare('SELECT 1 FROM locks WHERE job_id = ? LIMIT 1').get(id), acknowledgedAt: job.acknowledgedAt,
       /** A strategy create without an answer waits for adoption, a confirmation of not-created or a release. */
       strategyPending: ops.some(isOrphanStrategy),
@@ -1860,7 +1885,14 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     /** null when no caps are configured. */
     environment,
     notionalLimits: notionalView,
-    recentJobs: (limit = 20) => (db.prepare('SELECT id FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?').all(Math.min(Math.max(1, Math.trunc(limit)), 100)) as { id: string }[]).map(row => jobView(row.id)),
+    /** The latest jobs, of one market when it is named (a job's market is its first leg's contract). */
+    recentJobs: (limit = 20, market?: Market) => {
+      const count = Math.min(Math.max(1, Math.trunc(limit)), 100);
+      const rows = market
+        ? db.prepare(`SELECT id FROM jobs WHERE json_extract(json, '$.legs[0].symbol') IN (${MARKET_SYMBOLS[market].map(() => '?').join(', ')}) ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(...MARKET_SYMBOLS[market], count)
+        : db.prepare('SELECT id FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?').all(count);
+      return (rows as { id: string }[]).map(row => jobView(row.id));
+    },
     /** Principal ids are masked: the page needs to tell accounts apart, not to see who they are. */
     accounts: () => (db.prepare('SELECT * FROM accounts WHERE environment = ? ORDER BY venue').all(environment) as unknown as AccountRow[])
       .map(row => ({ venue: row.venue, accountMode: row.account_mode, credentialVersion: row.credential_version, accountId: maskId(row.account_id) })),

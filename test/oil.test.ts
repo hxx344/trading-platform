@@ -170,6 +170,7 @@ test('飞书：原油任务的确认、完成各发一次，同一任务同一�
     assert.match(sent[1]!, /【原油任务完成】Binance 同所 开仓 做空价差.*成交 BZUSDT 2 桶 均价 [\d.]+、CLUSDT 2 桶 均价 [\d.]+；成交价差 BZ−CL [\d.-]+ USDT\/桶/);
     // Without the job reader (the service with no oil) these events say nothing.
     assert.equal(describeJob(null, 'abcdef123456', 'failed', '对冲腿未成交').includes('详情读取失败'), true);
+    assert.equal(describeJob(null, 'abcdef123456', 'failed', '对冲腿未成交').includes('原油'), false, '读不到详情时不知道品种，标题不写原油');
   } finally { notifier.close(); }
 }));
 
@@ -237,6 +238,15 @@ test('服务进程：配置 oil 时启动检查失败则拒绝启动并释放账
       assert.deepEqual((state.body.accounts as { venue: string }[]).map(item => item.venue), ['binance']);
       assert.deepEqual(state.body.notionalLimits, { perJob: '200', openPer24h: '1000', openUsed: '0', windowMs: OPEN_WINDOW_MS, nextReleaseAt: null });
       assert.deepEqual(state.body.jobs, []);
+      // Hynix rides on the same accounts: its reads answer (this fake lists no hynix contract, so its books carry errors).
+      const hynixState = await get('/api/hynix/state');
+      assert.equal(hynixState.status, 200);
+      assert.deepEqual(hynixState.body.jobs, []);
+      assert.deepEqual(hynixState.body.notionalLimits, state.body.notionalLimits);
+      assert.equal((await fetch(`http://127.0.0.1:${port}/api/hynix/state`)).status, 401, '海力士接口须登录');
+      const hynixMarket = await get('/api/hynix/market');
+      assert.equal(hynixMarket.status, 200);
+      assert.deepEqual((hynixMarket.body.books as { symbol: string }[]).map(item => item.symbol), ['SKHYUSDT', 'SKHYNIXUSDT']);
       // A same-venue preview through the page goes to the live connector with each leg's own contract.
       const previewed = await fetch(`http://127.0.0.1:${port}/api/preview`, { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }, body: JSON.stringify(sameIntent()) });
       const preview = await previewed.json() as { legs: { venue: string; symbol: string; quantity: string; accountId: string }[]; barrels: string };

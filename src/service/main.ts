@@ -26,7 +26,7 @@ import type { AlertHooks, AlertRobot } from '../monitor/alerts.ts';
 import { createStreamStatus, runUserStream, type SocketLike } from './stream.ts';
 import { balanceWindow, createBalanceSamples, type BalanceSamples } from './balance-samples.ts';
 import { readImportResult, submitImportRequest } from './import-channel.ts';
-import { oilLoops, oilViews, openOilPnl, openOilRules, prepareOil, registerOilAccounts, strandedOilJobs, type OilRuntime } from './oil.ts';
+import { hynixViews, oilLoops, oilViews, openOilPnl, openOilRules, prepareOil, registerOilAccounts, strandedOilJobs, type OilRuntime } from './oil.ts';
 import { oilSummary } from './oil-config.ts';
 import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, settleMonitor, stopMonitor, type MonitorRuntime } from './monitor.ts';
 import { monitorSummary } from './monitor-config.ts';
@@ -368,7 +368,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
         const window = balanceWindow(range, Date.now());
         return window && { pairId, range, ...window, points: [], unavailable: `余额采样库无法打开，走势图不可用：${samplesError ?? '未知原因'}（不影响划转与 ADL）` };
       },
-      ...(oil ? { oil: oilViews(oil, executor, oilRules, oilPnl) } : {}),
+      ...(oil ? { oil: oilViews(oil, executor, oilRules, oilPnl), hynix: hynixViews(oil, executor) } : {}),
       ...(monitor ? { monitor: monitorViews(monitor) } : {}),
       summary: { setInterval: (minutes: number) => summary.setInterval(minutes), sendNow: () => summary.sendNow() },
       ...(asset ? { asset } : {}),

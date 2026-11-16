@@ -26,7 +26,7 @@ export interface OilJobLeg {
   attempts: number; filledQuantity: string; operation: OilOperation | null;
 }
 export interface OilJob {
-  id: string; preset: 'same-exchange' | 'cross-exchange'; action: 'open' | 'close'; status: string; reason: string | null; stopRequested: boolean;
+  id: string; market?: 'oil' | 'hynix'; preset: 'same-exchange' | 'cross-exchange'; action: 'open' | 'close'; status: string; reason: string | null; stopRequested: boolean;
   createdAt: number; deadlineAt: number; holdNewSends: boolean; locked: boolean; acknowledgedAt: number | null; strategyPending: boolean;
   /** current: 1-based batch of the latest lead order, 0 before the first; null when the job is not batched. */
   batches?: { count: number; current: number; intervalMs: number } | null;

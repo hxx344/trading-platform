@@ -94,6 +94,8 @@ export interface ServiceViews {
     /** PnL, funding and ledgers (docs/oil.md section 9); null for an unknown range. */
     pnl?(range: string, page: number): unknown;
   };
+  /** SK hynix trading on the oil accounts (docs/hynix.md): books and premium; accounts, positions, hynix jobs, caps. Absent without oil. */
+  hynix?: { market(): unknown; state(): unknown };
   /** The read-only market monitors; a market's reads give undefined when it is not configured and null until there is data. Absent without config.monitor. */
   monitor?: {
     state(): { markets: readonly string[] }; quote(market: CandleMarket): unknown; candles(market: CandleMarket, days: number | null): unknown;
@@ -321,6 +323,10 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'GET' && (url.pathname === '/api/oil/market' || url.pathname === '/api/oil/state')) {
       if (!views?.oil) return send(response, 404, { code: 'not_found', message: '本服务没有配置原油执行' });
       return send(response, 200, url.pathname === '/api/oil/market' ? views.oil.market() : views.oil.state());
+    }
+    if (request.method === 'GET' && (url.pathname === '/api/hynix/market' || url.pathname === '/api/hynix/state')) {
+      if (!views?.hynix) return send(response, 404, { code: 'not_found', message: '本服务没有配置海力士执行（与原油共用执行账户）' });
+      return send(response, 200, url.pathname === '/api/hynix/market' ? views.hynix.market() : views.hynix.state());
     }
     if (request.method === 'GET' && url.pathname === '/api/oil/pnl') {
       if (!views?.oil?.pnl) return send(response, 404, { code: 'not_found', message: '本服务没有配置原油执行' });

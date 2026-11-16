@@ -13,13 +13,14 @@ export const workspaceLabels: Record<WorkspaceId, string> = {
   options: '期权', onchain: '链上', research: '研究室', system: '系统',
 };
 
-export type NavEntry = 'asset' | 'monitor' | 'oil' | 'crossex' | 'pairs' | 'options' | 'status' | 'logs' | 'settings';
+export type NavEntry = 'asset' | 'monitor' | 'oil' | 'hynix' | 'crossex' | 'pairs' | 'options' | 'status' | 'logs' | 'settings';
 
 /** Every entry of the side navigation, in its order inside the workspace. A new page is registered here. */
 export const navEntries: Record<NavEntry, { workspace: WorkspaceId; text: string; href: string }> = {
   asset: { workspace: 'overview', text: '资产', href: '#/asset' },
   monitor: { workspace: 'market', text: '行情监控', href: '#/monitor' },
   oil: { workspace: 'trading', text: '原油', href: '#/oil' },
+  hynix: { workspace: 'trading', text: '海力士', href: '#/hynix' },
   crossex: { workspace: 'trading', text: 'CrossEx', href: '#/crossex' },
   pairs: { workspace: 'strategy', text: '配对组', href: '#/' },
   options: { workspace: 'options', text: '期权', href: '#/options' },

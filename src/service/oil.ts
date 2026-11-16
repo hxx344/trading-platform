@@ -2,12 +2,13 @@
 // that block is there; the service without it runs exactly as before. Before anything is opened the accounts are locked
 // on this host and every account passes its venue's key and identity check, so a bad key or a second process refuses start.
 import type { VenueConnector } from '../connector.ts';
-import { VENUE_NAMES, type Venue } from '../contracts.ts';
+import { MARKET_NAMES, VENUE_NAMES, marketOfSymbol, type Venue } from '../contracts.ts';
 import type { Executor } from '../executor.ts';
 import { createLiveConnectors, holdAccountLocks, preflightLive } from '../live/setup.ts';
 import type { FetchLike } from '../live/http.ts';
 import type { LiveCredentials } from '../live/values.ts';
 import { createOilMarket, MARKET_READ_MS, POSITIONS_READ_MS, type OilMarket } from '../oil/market.ts';
+import { createHynixMarket, type HynixMarket } from '../hynix/market.ts';
 import { createOilRules, OIL_RULES_DATABASE } from '../oil/rules.ts';
 import { createOilPnl, LEDGER_SYNC_MS, OIL_PNL_DATABASE, PNL_RANGES, PNL_SAMPLE_MS, type PnlRange } from '../oil/pnl.ts';
 import type { RuleExecutor } from '../oil/rule-live.ts';
@@ -22,6 +23,8 @@ export interface OilRuntime {
   config: OilConfig;
   connectors: VenueConnector[];
   market: OilMarket;
+  /** SK hynix trades on the same accounts and executor (docs/hynix.md); its books and positions are read apart. */
+  hynix: HynixMarket;
   locks: { release(): void };
 }
 
@@ -37,7 +40,7 @@ export async function prepareOil(config: OilConfig, keys: Map<Venue, LiveCredent
     const venues = new Set(config.accounts.map(account => account.venue));
     const connectors = createLiveConnectors(config, keys, { ...(fetchImpl ? { fetchImpl } : {}), now }).filter(connector => venues.has(connector.venue));
     await preflightLive(config, connectors, ...(preflightTimeoutMs === undefined ? [] : [preflightTimeoutMs]));
-    return { config, connectors, market: createOilMarket({ connectors, accounts: config.accounts, now }), locks };
+    return { config, connectors, market: createOilMarket({ connectors, accounts: config.accounts, now }), hynix: createHynixMarket({ connectors, accounts: config.accounts, now }), locks };
   } catch (error) { locks.release(); throw new Error(`原油执行账户启动检查未通过，拒绝启动：${error instanceof Error ? error.message : String(error)}`); }
 }
 
@@ -53,10 +56,10 @@ export function registerOilAccounts(oil: OilRuntime, executor: Executor): void {
 export function strandedOilJobs(executor: Pick<Executor, 'unfinished' | 'jobView'>, config: OilConfig | undefined): string[] {
   const configured = new Set<Venue>(config?.accounts.map(account => account.venue) ?? []);
   return executor.unfinished().flatMap(id => {
-    const missing = [...new Set(executor.jobView(id).legs.map(leg => leg.venue))].filter(venue => !configured.has(venue));
+    const legs = executor.jobView(id).legs, missing = [...new Set(legs.map(leg => leg.venue))].filter(venue => !configured.has(venue));
     if (!missing.length) return [];
     const where = config ? `没有 ${missing.map(venue => VENUE_NAMES[venue]).join('、')} 执行账户` : '已没有 oil';
-    return [`原油任务 ${id} 尚未结束，但配置里${where}：本服务不再推进或核对它，交易所上可能仍有敞口；请把配置加回后重启，处理完再删除`];
+    return [`${MARKET_NAMES[marketOfSymbol(legs[0]!.symbol)]}任务 ${id} 尚未结束，但配置里${where}：本服务不再推进或核对它，交易所上可能仍有敞口；请把配置加回后重启，处理完再删除`];
   });
 }
 
@@ -108,9 +111,17 @@ export function openOilPnl(oil: OilRuntime, dir: string, { now = Date.now, log =
 export function oilViews(oil: OilRuntime, executor: Executor, rules?: OilRulesRuntime, pnl?: OilPnlRuntime) {
   return {
     market: () => oil.market.view(),
-    state: () => ({ accounts: executor.accounts(), positions: oil.market.positionsView(), jobs: executor.recentJobs(20), notionalLimits: executor.notionalLimits() }),
+    state: () => ({ accounts: executor.accounts(), positions: oil.market.positionsView(), jobs: executor.recentJobs(20, 'oil'), notionalLimits: executor.notionalLimits() }),
     ...(rules ? { rules } : {}),
     ...(pnl ? { pnl: (range: string, page: number) => Object.hasOwn(PNL_RANGES, range) ? pnl.read({ range: range as PnlRange, page }) : null } : {}),
+  };
+}
+
+/** The page's hynix reads (docs/hynix.md): the books and premium, the accounts, hynix positions, hynix jobs and the shared caps. */
+export function hynixViews(oil: OilRuntime, executor: Executor) {
+  return {
+    market: () => oil.hynix.view(),
+    state: () => ({ accounts: executor.accounts(), positions: oil.hynix.positionsView(), jobs: executor.recentJobs(20, 'hynix'), notionalLimits: executor.notionalLimits() }),
   };
 }
 
@@ -122,7 +133,7 @@ export function oilLoops(oil: OilRuntime, context: { stopped(): boolean; pause(m
   const every = (spacingMs: number, name: string, round: () => Promise<void>) => (async () => {
     while (!context.stopped()) {
       const started = Date.now();
-      try { await round(); } catch (error) { log(`原油${name}失败：${error instanceof Error ? error.message : String(error)}`); }
+      try { await round(); } catch (error) { log(`${name}失败：${error instanceof Error ? error.message : String(error)}`); }
       if (context.stopped()) break;
       await context.pause(Math.max(MIN_GAP_MS, spacingMs - (Date.now() - started)));
     }
@@ -141,7 +152,8 @@ export function oilLoops(oil: OilRuntime, context: { stopped(): boolean; pause(m
   };
   // On stop the books loop ends only after the judging round in flight, so its preview and confirm finish (or fail) before
   // the service closes the executor and the rules store.
-  const books = every(MARKET_READ_MS, '盘口读取', quotes).then(async () => { await judging; });
-  return [books, every(POSITIONS_READ_MS, '持仓读取', oil.market.refreshPositions),
-    ...(pnl ? [every(PNL_SAMPLE_MS, '盈亏采样', () => pnl.sample()), every(LEDGER_SYNC_MS, '账单同步', () => pnl.syncLedgers(context.stopped))] : [])];
+  const books = every(MARKET_READ_MS, '原油盘口读取', quotes).then(async () => { await judging; });
+  return [books, every(POSITIONS_READ_MS, '原油持仓读取', oil.market.refreshPositions),
+    every(MARKET_READ_MS, '海力士盘口读取', oil.hynix.refreshQuotes), every(POSITIONS_READ_MS, '海力士持仓读取', oil.hynix.refreshPositions),
+    ...(pnl ? [every(PNL_SAMPLE_MS, '原油盈亏采样', () => pnl.sample()), every(LEDGER_SYNC_MS, '原油账单同步', () => pnl.syncLedgers(context.stopped))] : [])];
 }

@@ -547,11 +547,13 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
       return { strategyId: ack.strategyId };
     },
 
-    queryStrategy: (binding: AccountBinding, strategyId: string, { signal }: CallOptions) => reading(async (): Promise<StrategyReport | null> => {
+    queryStrategy: (binding: AccountBinding, strategyId: string, { signal, symbol: hint }: CallOptions & { symbol?: string }) => reading(async (): Promise<StrategyReport | null> => {
       if (!STRATEGY_ID.test(strategyId)) throw new VenueError('read-failed', '策略编号格式无效');
-      const remembered = strategySymbols.get(strategyId);
-      // An unknown id answers an empty list, so trying each execution symbol is a complete search.
-      for (const symbol of remembered ? [remembered] : VENUE_EXECUTION_SYMBOLS.bybit) {
+      if (hint !== undefined && !VENUE_EXECUTION_SYMBOLS.bybit.includes(hint)) throw new VenueError('read-failed', `${hint} 不是可执行合约`);
+      const known = strategySymbols.get(strategyId) ?? hint;
+      // An unknown id answers an empty list, so trying each execution symbol is a complete search. The caller's contract
+      // limits it to that one, so an oil reconcile never depends on how the venue answers for the hynix contracts.
+      for (const symbol of known ? [known] : VENUE_EXECUTION_SYMBOLS.bybit) {
         const rows = await pages(binding, '/v5/strategy/list', strategyQuery(symbol, { strategyId }), 'nextCursor', signal);
         if (rows.length === 0) continue;
         if (rows.length !== 1) throw new ShapeError('同一策略编号返回了多条记录');

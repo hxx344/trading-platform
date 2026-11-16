@@ -264,7 +264,7 @@ test('服务接线：规则库打不开时只读出原因、写入 503；每轮�
   const dir = mkdtempSync(join(tmpdir(), 'tp-oil-rules-'));
   try {
     const logs: string[] = [];
-    const oil = { config: { notionalLimits: { perJob: '1', openPer24h: '1' }, accounts: [{ venue: 'binance' }] }, market: { view: () => ({ books: [] }), refreshQuotes: async () => {}, refreshPositions: async () => {} } } as unknown as OilRuntime;
+    const oil = { config: { notionalLimits: { perJob: '1', openPer24h: '1' }, accounts: [{ venue: 'binance' }] }, market: { view: () => ({ books: [] }), refreshQuotes: async () => {}, refreshPositions: async () => {} }, hynix: { refreshQuotes: async () => {}, refreshPositions: async () => {} } } as unknown as OilRuntime;
     const stub = openOilRules(oil, join(dir, 'missing', 'deeper'), { log: line => logs.push(line) });
     assert.deepEqual(Object.keys(stub.view() as object), ['available', 'error', 'rules']);
     assert.equal((stub.view() as { available: boolean }).available, false);
@@ -273,7 +273,8 @@ test('服务接线：规则库打不开时只读出原因、写入 503；每轮�
     assert.match(logs[0]!, /原油自动规则库无法打开/);
     let ticks = 0, rounds = 0;
     const rules = { ...stub, tick: () => { ticks++; throw new Error('坏了'); } };
-    const context = { stopped: () => rounds >= 3, pause: async () => { rounds++; } };
+    // Stop once the rules were judged twice (every loop's pause counts toward the safety cap, the hynix loops' too).
+    const context = { stopped: () => ticks >= 2 || rounds >= 100, pause: async () => { rounds++; } };
     await Promise.all(oilLoops(oil, context, line => logs.push(line), rules));
     assert.ok(ticks >= 2, '判断失败后盘口循环继续下一轮');
     assert.ok(logs.includes('原油自动规则判断失败：坏了'));

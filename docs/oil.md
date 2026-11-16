@@ -272,3 +272,49 @@
 ### 9.3 回滚
 
 回退到 v0.27.0 或更早不需要处理数据：旧版本不打开 `oil-pnl.sqlite`，文件留在数据目录；再升级回来时继续使用（账单从截止点往后同步，停用期间的持仓采样缺失、曲线在该段断线）。删除该文件即重新回溯 30 天。
+
+## 10 OKX 执行（O5）
+
+2026-11-16 按并行分工（交易线）实施，R3（资金：新交易所下单与撤单；凭据：新增 passphrase；唯一写者：新账户的进程锁与账户写入登记）。
+
+### 10.1 范围
+
+- 原油（BZUSDT、CLUSDT）与海力士（SKHYUSDT、SKHYNIXUSDT）在 OKX 执行：同所两腿、与 Binance / Bybit 跨所两腿；规则可选 OKX。
+- 连接器 `src/live/okx.ts`：合约规则、盘口、账户快照、下单、查单、撤单、启动检查、盈亏持仓与账单（第 9 节 O4 口径）。
+- 配置与密钥：`oil.accounts` 可列 OKX（每所至多一个，最多 3 个）；密钥文件 `okx` 项为 `{ apiKey, apiSecret, passphrase }`；启动检查与进程锁与 Binance / Bybit 相同。
+- 从工作台导入：设置页面板与 `install.sh --import-workbench --oil` 一并导入 OKX 执行账户，拒绝条件与现有交易所相同。
+- 不做：金丝雀（仍只 Binance、Bybit）、OKX 原生追价与改单、资金划转、ADL、期权。
+
+### 10.2 对照的工作台文件（origin/main 7745181）
+
+- `server/trading-okx-common.mjs`：接口路径、签名与时钟同步、错误码分类、合约规则与盘口解析、账户配置校验、持仓解析。
+- `server/trading-okx-execution.mjs`：下单体、委托状态、委托回报核对、账户快照（活动委托与策略委托）。
+- `server/trading-okx-readonly.mjs`：账单（资金费 173/174，平仓 2/5/9/14）。
+- `server/exchange-transport/okx.mjs`：签名，本仓库已有副本 `src/vendor/okx.mjs`（88ad918）。
+- `server/trading-execution.mjs` 的 `connect`：passphrase 规则（8–128 字符、无控制字符）；`execution_accounts` 的 OKX 行（`account_mode` 为 `cross` / `isolated`，`identity` 为 UID）。
+
+### 10.3 规则
+
+- 合约：`CL-USDT-SWAP`、`BZ-USDT-SWAP`、`SKHY-USDT-SWAP`、`SKHYNIX-USDT-SWAP`。目录须为 `SWAP`、`linear`、USDT 结算、`ctValCcy` 等于合约基础币、状态 `live`（`post_only` 状态只能挂只挂单，市价上限记 0 视为不可市价，本仓库按不可交易拒绝）。数量单位是张：`contractSize = ctVal × ctMult`，步长 `lotSz`、最小 `minSz`、限价上限 `maxLmtSz`、市价上限 `maxMktSz`；`maxLmtAmt` 是美元，不当 USDT 用，最小名义金额记 0。执行器按张下单，桶数网格与名义金额都乘 `contractSize`（与现有逻辑相同）。
+- 账户模式（`accountMode`）：`cross` 或 `isolated`，即下单的 `tdMode`。启动检查：密钥权限恰为 `read_only,trade`（多了提现等或少了交易都拒绝，原因写明请开启 / 请关闭什么）、`acctLv` 为 2 或 3、`posMode` 为 `net_mode` 或 `long_short_mode`、`uid` 等于配置的账户。账户快照里该合约有另一种保证金模式的持仓时按读取失败处理。
+- 客户订单号：执行器的 `pa1-<24 位十六进制>-<腿>[r<序号>]` 去掉连字符作 `clOrdId`（字母数字，至多 32 位），回报与活动委托再还原，所以重启后也能认出自己的委托；格式不符拒绝发送。
+- 下单方式：市价 `market`；执行器的限价 IOC（受保护的市价首腿）`ioc`；限价 GTC `limit`；只挂单（本地追价）`post_only`。单向持仓 `posSide: net` 并带 `reduceOnly`；双向持仓按仓位方向发 `long` / `short`，只减仓由方向决定（不发 `reduceOnly`）。
+- 结果判定：下单与撤单只有回执，随后按 `clOrdId` 查一次单（与 Bybit 相同）；查不到或读不到时下单报“新委托、未成交”，撤单报结果不确定，由执行器按客户订单号继续核对。`code`/`sCode` 在拒绝码表内（含 50011 限频）且 HTTP 小于 500 的写操作是确定拒绝，不重试；50102（时间戳过期）同步时钟后重发一次；其余写操作的错误一律“结果不确定”，进入 120 秒观察窗（L039）。查单 51603 表示没有这笔委托。
+- 状态：`live` 新委托，`partially_filled` 部分成交，`filled` 全部成交（须 `accFillSz = sz`），`canceled` / `mmp_canceled` 已撤销；只挂单未成交、且不是用户撤单（`cancelSource` 不是 1）的撤销记为“过期”，计入本地追价连续失败。
+- 签名请求的有效期按 OKX 时间戳 30 秒容差记 `requestValidityMs` 40 秒（创建结果的结算时刻仍由 120 秒观察窗决定）。
+- 账单：`/api/v5/account/bills-archive`（近 3 个月），按合约、USDT、`begin`/`end` 读，100 条一页，按 `billId` 向前翻页（编号须严格递减，最多 200 页），请求间隔至少 420 毫秒。类型 8（资金费，子类型 173 支出须非正、174 收入须非负）记资金费 `pnl`；2、5、9、14（成交、强平、ADL、大宗）记平仓盈亏 `pnl` 与手续费 `fee`（零额不记）；6（逐仓保证金调整）不计；其他类型整窗读取失败。
+- 页面：原油与海力士下单面板可选 OKX；跨所时另选对冲腿交易所；本地追价可用于 Binance 与 OKX 首腿，原生追价仍只 Bybit；规则可选 OKX；跨所价差按每两个已配置交易所各列一组。
+
+### 10.4 影响面
+
+- `src/contracts.ts`：`VENUES` 加 `okx`，可执行合约、账户模式；本地追价放开到 OKX。所有 `Record<Venue, …>` 跟着补齐。
+- `src/live/okx.ts`（新）、`src/live/setup.ts`（连接器）、`src/live/values.ts`（凭据加选填 passphrase）。
+- `src/service/oil-config.ts`、`src/service/config.ts`：OKX 账户与密钥。
+- `src/service/import-workbench.ts`、设置页导入面板、`deploy/test-install.sh` 第 2 部分。
+- `src/oil/market.ts`、`src/hynix/market.ts`：跨所价差的交易所组合。
+- 原油页、海力士页、规则、盈亏页的交易所名称与选项。
+- 不改：存储结构、执行器状态机、金丝雀、划转与 ADL。
+
+### 10.5 回滚
+
+回退到不认识 `okx` 的版本前：先在原油页、海力士页确认 OKX 腿的任务都已结束、OKX 规则已停用，再从 `config.json` 的 `oil.accounts` 和密钥文件删除 `okx` 项（旧版本见到 `okx` 拒绝启动）。执行器库里已结束的 OKX 任务旧版本读到未知交易所的任务视图可能报错，回退后不要打开这些任务；未结束的 OKX 任务旧版本不会推进，须先在新版本处理完。

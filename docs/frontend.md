@@ -270,7 +270,7 @@
   - 读取用 `use-live-resource.ts`。
 - 样式：`web/src/positions.css` 复制工作台 `src/trading-center.css`（`7745181`）第 5–6、17–106、107–137 行，去掉 `.trading-sections`；格式化函数 `web/src/positions-format.ts` 复制自 `src/trading-format.ts`。
 
-**行情监控**：原油、海力士详情的成交标记、套利成交面板与关联交易，见 [monitor.md](monitor.md)《M14：成交标记与关联交易》。样式复制在 `web/src/monitor.css` 末尾，文件里注明了行号。
+**行情监控**：原油、海力士详情的成交标记、套利成交面板，以及 Anthropic、原油、海力士详情右侧栏的关联交易（v0.57.0），见 [monitor.md](monitor.md)《M14：成交标记与关联交易》。样式复制在 `web/src/monitor.css` 末尾，文件里注明了行号。
 
 **验证**：
 

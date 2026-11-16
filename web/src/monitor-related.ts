@@ -1,10 +1,11 @@
-// 原油、海力士详情的「关联交易」（A-5）：从资产账本持仓（/api/asset/positions）里挑出本市场两条腿的持仓，同一交易所
-// 两腿各一笔且方向相反时算开仓 / 当前 / 平仓价差与组合盈亏（含本轮 cycle）。复制自工作台（提交 7745181）并改写成
+// Anthropic、原油、海力士详情的「关联交易」（A-5）：从资产账本持仓（/api/asset/positions）里挑出本市场各腿的持仓；原油、
+// 海力士同一交易所两腿各一笔且方向相反时算开仓 / 当前 / 平仓价差与组合盈亏（含本轮 cycle）。复制自工作台（提交 7745181）并改写成
 // TypeScript，规则不改：
 // - src/hub-positions.ts（工作台宿主）的 matchBase、positionItems（MAX_POSITION_ITEMS 50、90 秒算旧值）；
-// - modules/monitor/lib/related-pairs.ts 的 RELATED_SYMBOLS、pairTotals、relatedSpreadPairs。
+// - modules/monitor/lib/related-pairs.ts 的 RELATED_SYMBOLS（含 anthropic）、pairTotals、relatedSpreadPairs。
 // 与工作台的差异：只有本服务一个来源（工作台汇总多个 Asset 项目），来源固定为「资产账本」；数据来自本服务自己的
-// 接口，不再逐字段校验格式；Anthropic 的 ANT 组合合计（related-position-totals.ts）不做（A-5 不做 anthropic）。
+// 接口，不再逐字段校验格式；Anthropic 的 ANT 组合合计（related-position-totals.ts）不做：资产账本只读 Binance、Bybit、
+// OKX 的持仓，ANT 组合的对比腿在 Hyperliquid（xyz:ANT、io:ANTH）与 Lighter RH，这里读不到，组合无法成立。
 import type { FillMarket } from '../../src/asset/fills-types.ts';
 import type { HubPositions, PositionCycle } from '../../src/asset/positions-types.ts';
 import { oilSpread } from '../../src/vendor/oil-market.mjs';
@@ -12,8 +13,11 @@ import { oilSpread } from '../../src/vendor/oil-market.mjs';
 export const RELATED_SOURCE = '资产账本';
 export const MAX_POSITION_ITEMS = 50;
 export const POSITIONS_STALE_AFTER_MS = 90_000;
-/** Hyperliquid names the ordinary-share leg SKHX; the CEX contracts use SKHYNIX. */
-export const RELATED_SYMBOLS: Record<FillMarket, readonly string[]> = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHX', 'SKHYNIX'] };
+/** The detail pages that show related positions; only oil and Hynix pair their legs. */
+export type RelatedMarket = FillMarket | 'anthropic';
+/** Hyperliquid names the ordinary-share leg SKHX; the CEX contracts use SKHYNIX. Anthropic: Binance ANTHROPICUSDT, io:ANTH, xyz:ANT. */
+export const RELATED_SYMBOLS: Record<RelatedMarket, readonly string[]> = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHX', 'SKHYNIX'], anthropic: ['ANTHROPIC', 'IOANTH', 'XYZANT'] };
+export const pairedMarket = (market: RelatedMarket): market is FillMarket => market !== 'anthropic';
 export type RelatedItem = {
   key: string; source: string; exchange: string; exchangeId?: string; symbol: string; base: string; side: 'long' | 'short';
   quantity: string; quantityUnit: string; entryPrice: string | null; markPrice: string | null;

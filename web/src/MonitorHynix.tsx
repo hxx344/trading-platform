@@ -9,12 +9,12 @@ import { HynixFundingPanel } from './MonitorFunding.tsx';
 import { AlertSettings } from './MonitorAlerts.tsx';
 import { useLiveResource } from './use-live-resource.ts';
 import { useFills } from './MonitorTrades.tsx';
-import { RelatedPositions } from './MonitorRelated.tsx';
+import { DetailLayout, RelatedPositions } from './MonitorRelated.tsx';
 import type { VenueSpreads } from './monitor-related.ts';
 
 // The Hynix ADR premium on the monitor page, laid out as the workbench's modules/monitor/app/dashboard.tsx (9c652bc) inside
 // the hub, where its top bar is hidden; the exchange comparison (M-2c) sits under the chart, the settled funding (M-2d)
-// under it, sharing the chart's range. Left out: the hub summary card. The asset ledger's fills mark the chart and the related positions sit under it (A-5;
+// under it, sharing the chart's range. Left out: the hub summary card. The asset ledger's fills mark the chart and the related positions sit in the right column (A-5;
 // MonitorTrades.tsx, MonitorRelated.tsx). The service collects; the page reads what it saved.
 const QUOTE_PATH = '/api/monitor/hynix/quote', CANDLE_PATH = '/api/monitor/hynix/candles';
 const QUOTE_MS = 10_000, CANDLE_MS = 60_000, READ_TIMEOUT_MS = 10_000;
@@ -69,7 +69,7 @@ export function HynixPanel({ onExpired }: { onExpired: () => void }) {
   const trades = useFills('hynix', onExpired);
   // The related pairs' current spread per venue, reported by the exchange comparison below (the workbench hub's oilSpreads / hynixSpreads).
   const [venueSpreads, setVenueSpreads] = useState<VenueSpreads>({});
-  return <>
+  return <DetailLayout side={<RelatedPositions market="hynix" spreads={venueSpreads} onExpired={onExpired} />}>
     <div className="page-heading detail-toolbar"><div className="toolbar-identity"><div className="eyebrow">SK HYNIX <span>/</span> 000660 · SKHY</div><h1>海力士 ADR 价差<span className="small-tag">上市以来</span></h1><p>正股与 ADR 同口径比较 · Hyperliquid 永续合约</p></div><div className="refresh-area"><button type="button" className="refresh-button" onClick={refresh} disabled={loading}><RefreshCw size={15} className={loading ? 'spinning' : ''} aria-hidden="true" />{loading ? '加载行情' : '刷新行情'}</button><span>每 10 秒自动刷新</span></div></div>
     <div className="data-status" role="status"><span className="status-left"><Clock3 size={14} aria-hidden="true" />{quote ? `${quoteError ? '实时更新中断 · 上次获取' : '实时报价 · 获取于'} ${date(quote.fetchedAt, true)} ${new Date(quote.fetchedAt).toISOString().slice(11, 19)} UTC` : quoteFailed ? '实时报价暂不可用 · 每 10 秒自动重试' : '正在获取实时报价 · 每 10 秒自动刷新'}</span><span className="status-right">USD · 1 股正股 = 10 份 ADR</span></div>
     {quoteError && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />{quoteError}</div>}
@@ -84,7 +84,6 @@ export function HynixPanel({ onExpired }: { onExpired: () => void }) {
     </section>
     <SpreadChart data={chartPoints} loading={historyPending} range={range} onRangeChange={setRange} mode={mode} onModeChange={setMode} config={HYNIX_SPREAD_CHART} trades={trades} tradeMarket="hynix" />
     <p className="chart-footnote"><Info size={13} aria-hidden="true" />缺失时段曲线断开，不补 0 · 采样 1 小时</p></div>
-    <RelatedPositions market="hynix" spreads={venueSpreads} onExpired={onExpired} />
     <ExchangeComparison market="hynix" onExpired={onExpired} onSpreads={setVenueSpreads} />
     <HynixFundingPanel range={range} onRangeChange={setRange} onExpired={onExpired} />
     <AlertSettings market="hynix" onExpired={onExpired} />
@@ -92,5 +91,5 @@ export function HynixPanel({ onExpired }: { onExpired: () => void }) {
     <aside className="method-panel"><div className="section-heading"><h2>如何比较</h2><span className="info-icon"><Info size={17} aria-hidden="true" /></span></div><div className="conversion"><div><span className="instrument-label">韩国正股</span><strong>1 <small>股</small></strong><span>000660 · KRX</span></div><MoveRight size={22} aria-hidden="true" /><div><span className="instrument-label">美国 ADR</span><strong>10 <small>份</small></strong><span>SKHY · NASDAQ</span></div></div><div className="formula"><span>ADR 溢价率</span><code>(ADR ÷ (正股美元价 ÷ 10) − 1) × 100%</code></div><p className="method-note">正数表示 ADR 溢价，负数表示折价。两条行情均来自 Hyperliquid 永续合约；价差包含合约基差，并非交易所现货价差。</p><div className="listing-note"><span>ADR 首次交易</span><b>2026.07.10</b></div></aside></div>
     <section className="source-panel"><button type="button" className="source-toggle" aria-expanded={details} onClick={() => setDetails(!details)}><span><Info size={16} aria-hidden="true" />数据来源与覆盖范围</span><ChevronDown size={17} className={details ? 'rotated' : ''} aria-hidden="true" /></button>{details && <div className="source-content"><div><h3>行情来源</h3><p>Hyperliquid HIP-3 / XYZ：xyz:SKHX（正股美元代理）与 xyz:SKHY（ADR 代理）。SKHX 已包含韩元兑美元换算。服务后台每 10 秒读取一次实时报价，使用 allMids 中间价（空盘口时为最近成交价），时间标注为服务成功获取的时间。历史图每 60 秒检查更新，使用已结束的 1 小时 K 线收盘价，仅匹配双方都有报价的时段；不补齐缺失报价。图中时间为该小时起点。</p><a href="https://docs.trade.xyz/perpetuals/specifications-and-schedules/specification-index" target="_blank" rel="noreferrer">XYZ 合约说明 <ArrowUpRight size={13} aria-hidden="true" /></a></div><div><h3>历史覆盖</h3><p>ADR 于 2026 年 7 月 10 日以 SKHYV 首次交易。小时图从当日 14:00 UTC 开始，排除上市前的合约交易。{data ? `当前共同可用行情 ${stamp(data.coverage.firstObservation)} 至 ${stamp(data.coverage.lastObservation)}，共 ${data.coverage.rows.toLocaleString()} 小时；取数时间：${stamp(data.fetchedAt)}。` : '正在检查历史覆盖范围。'} 接口只保留最近 5,000 根小时线；后台持续保存到 monitor.sqlite 并与新行情合并展示，最多保留 400 天。休市时永续合约仍可交易。</p><a href="https://depositaryreceipts.citi.com/adr/guides/pgm_dispabook.aspx?cusip=78392B206&pageId=15&subpageID=111" target="_blank" rel="noreferrer">Citi ADR 换算比例 <ArrowUpRight size={13} aria-hidden="true" /></a><a className="second-source" href="https://news.skhynix.com/en/skhynix-lists-adrs-on-nasdaq/" target="_blank" rel="noreferrer">上市公告 <ArrowUpRight size={13} aria-hidden="true" /></a></div></div>}</section>
     <footer><span>HYNIX / SPREAD<span className="footer-divider">·</span>同口径，看价差。</span><span>Hyperliquid 永续合约数据<span className="footer-divider">/</span>所有时间为 UTC</span></footer>
-  </>;
+  </DetailLayout>;
 }

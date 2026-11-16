@@ -194,7 +194,7 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
 - **与工作台的差别**：
   - 只有本服务一个来源（工作台汇总多个 Asset 项目），来源名固定为「资产账本」，所以去掉了来源筛选和「（来源 n）」区分；
   - 页面直接读本服务接口，代替 iframe 桥接；
-  - 本服务的监控详情没有右侧栏，关联交易放在图表下方。
+  - 关联交易 A-5 时放在图表下方；v0.57.0 起照工作台放在详情页右侧栏，Anthropic 也有（见 monitor.md《M14》的「详情页右侧栏」）。
 - **与工作台不同的安全口径**（审查后修改）：持仓快照的只读权限校验失败（Binance 任一写权限或缺读权限、Bybit `readOnly≠1`、OKX `perm≠read_only` 或 config 不是单条）时：
   - 读取器抛带类型的 `PositionsPermissionError`（`code` 为 `POSITIONS_PERMISSION`，文案仍是 `POSITIONS_FAILED`）；
   - 成交刷新随即中止，不再用该凭据读 85 天历史，并删除该凭据在 `fill_cache` 里所有市场、所有范围的行；同一凭据（同一 revision）其它市场、其它范围的内存条目同时作废并清空历史与游标，之后它们遇到网络失败也不会把旧成交写回；

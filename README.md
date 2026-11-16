@@ -95,6 +95,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 | 回退到早于 | 回退前要做的事 | 说明 | 详见 |
 | --- | --- | --- | --- |
+| v0.57.0 | 不用改配置 | 旧版本的关联交易在原油、海力士图表下方，Anthropic 没有关联交易 | [docs/monitor.md](docs/monitor.md)《M14》的「详情页右侧栏」 |
 | v0.56.0 | 先在原油页、海力士页把 OKX 腿的任务都处理到结束（待人工处理的先人工确认）、停用 OKX 规则；OKX 上的持仓先平掉；再从 `config.json` 的 `oil.accounts` 和密钥文件删掉 `okx` 项 | 旧版本见到 `okx`（配置或密钥文件）启动失败，整个服务不运行。删掉后：已结束的 OKX 任务不影响启动，主页与原油页照常读出；未结束的 OKX 任务不会让旧版本起不来，但旧版本没有 OKX 连接器，不撤 OKX 上的挂单、不核对成交与持仓，约 75 秒后转待人工处理，人工确认后才释放两腿合约的锁。没平的 OKX 持仓旧版本不再管理，须到 OKX 手工处理；跨所组合另一腿在 Binance / Bybit 的只剩单腿敞口：规则不会把它当成自己的，平仓预览按账户持仓算可平数量，海力士单腿会触发两腿不成对告警（实测与核对见详见一栏） | [docs/oil.md](docs/oil.md) 第 10.5 节 |
 | v0.55.0 | 不用改配置 | 旧版本没有资产页「导入原表数据」；导入后的账本旧版本照常读取，数据目录的 `asset-backups/` 旧版本不读，留着即可 | [docs/asset.md](docs/asset.md) A-6 节 |
 | v0.54.0 | 不用改配置 | 旧版本没有持仓页与行情监控的成交、关联交易面板；`asset.sqlite` 里新增的 `fill_cache` 只是缓存，旧版本不读，留着即可 | [docs/asset.md](docs/asset.md) A-5 节 |

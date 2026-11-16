@@ -1,18 +1,19 @@
-// 原油、海力士详情的「关联交易」面板（A-5），照工作台 modules/monitor/app/related-positions.tsx 与 app/cycle-evidence.tsx
+// Anthropic、原油、海力士详情的「关联交易」面板（A-5），照工作台 modules/monitor/app/related-positions.tsx 与 app/cycle-evidence.tsx
 // （提交 7745181）：持仓逐笔、本轮已平仓（cycle）与逐笔核对证据、同一交易所两腿的价差与组合盈亏。与工作台的差异：
 // - 持仓从本服务 /api/asset/positions 读（use-live-resource.ts，每 60 秒；有腿的本轮统计还在读时每 25 秒，
 //   沿用工作台 POSITIONS_REFRESH_MS / POSITIONS_FOLLOW_UP_MS），代替经 iframe 桥接向工作台宿主要数据；
 //   宿主相关的状态（独立打开、连接中、未登录工作台、宿主不支持）去掉，换成「本服务没有配置资产账本」；
 // - 「在交易中心查看」按钮换成指向本服务持仓页（#/positions）的链接；
-// - 只有 panel 版式（工作台永续页用的 strip 版式本服务没有）；ANT 合计不做；
+// - 只有 panel 版式（工作台永续页用的 strip 版式本服务没有）；ANT 合计不做（原因见 monitor-related.ts），Anthropic 只列逐腿持仓并注明；
 // - 当前价差取自同页「多交易所对比」各交易所的读数（MonitorExchanges.tsx onSpreads，原油价差、海力士溢价率），与工作台宿主
 //   的 oilSpreads / hynixSpreads 相同；对比表还没读到的交易所显示 —；
-// - 本服务详情页没有右侧栏，面板放在图表下方（工作台窄屏时也排在主栏下方）。
+// - 面板放在详情页右侧栏（DetailLayout，照工作台 monitor-hub.tsx 的 .monitor-detail 两栏）；工作台侧栏里的告警摘要
+//   （monitor-detail-side.tsx）本服务没有，告警设置仍在主栏。
 import { useEffect, useState, type ReactNode } from 'react';
 import { ArrowUpRight, Link2 } from 'lucide-react';
 import { ApiError } from './api.ts';
 import { useLiveResource } from './use-live-resource.ts';
-import { RELATED_SYMBOLS, positionItems, relatedSpreadPairs, type RealizedStatus, type RelatedItem, type SpreadPair, type UnpairedReason, type VenueSpreads } from './monitor-related.ts';
+import { RELATED_SYMBOLS, pairedMarket, positionItems, relatedSpreadPairs, type RelatedMarket, type RealizedStatus, type RelatedItem, type SpreadPair, type UnpairedReason, type VenueSpreads } from './monitor-related.ts';
 import type { FillMarket } from '../../src/asset/fills-types.ts';
 import type { CycleEvidence, HubPositions } from '../../src/asset/positions-types.ts';
 
@@ -24,6 +25,8 @@ const pairFoot: Record<FillMarket, string> = {
   oil: `价差 = BZ − CL（USDT/桶），仅在同一交易所 CL 与 BZ 各一笔且方向相反时计算；当前价差取本页交易所报价。${totalsFoot}`,
   hynix: `价差 = ADR ÷（正股 ÷ 10）− 1，10 份 ADR 对 1 股正股；仅在同一交易所 ADR 与正股各一笔且方向相反时计算；当前价差取本页交易所报价，无报价的交易所显示 —。${totalsFoot}`,
 };
+
+const ANT_TOTALS_NOTE = '资产账本只读 Binance、Bybit、OKX 的持仓，读不到 Hyperliquid 与 Lighter RH 上的对比腿，ANT 组合盈亏暂不合计；下面是逐腿持仓。';
 
 const beijing = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 const beijingDate = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
@@ -124,7 +127,12 @@ function PositionRows({ items }: { items: RelatedItem[] }) {
   </li>)}</ul>;
 }
 
-export function RelatedPositions({ market, spreads, onExpired }: { market: FillMarket; spreads?: VenueSpreads; onExpired: () => void }) {
+/** The detail page's two columns (the workbench hub's .monitor-detail): the market's panel and, on the right, `side`. */
+export function DetailLayout({ side, children }: { side: ReactNode; children: ReactNode }) {
+  return <div className="monitor-detail"><div className="monitor-detail-main">{children}</div><aside className="monitor-detail-side">{side}</aside></div>;
+}
+
+export function RelatedPositions({ market, spreads, onExpired }: { market: RelatedMarket; spreads?: VenueSpreads; onExpired: () => void }) {
   const [followUp, setFollowUp] = useState(false);
   const live = useLiveResource<HubPositions>(RELATED_PATH, { intervalMs: followUp ? POSITIONS_FOLLOW_UP_MS : POSITIONS_REFRESH_MS, timeoutMs: POSITIONS_TIMEOUT_MS, onExpired });
   const missing = live.error instanceof ApiError && live.error.status === 404;
@@ -137,7 +145,8 @@ export function RelatedPositions({ market, spreads, onExpired }: { market: FillM
   const incomplete = snapshot?.incomplete === true;
   const sourcesIncomplete = snapshot?.sourcesIncomplete === true;
   const range = snapshot?.truncated ? `仅显示前 ${snapshot.itemLimit} 条（${sourcesIncomplete ? '已读取部分中共' : '共'} ${snapshot.matchedCount} 条匹配）` : '';
-  const pairs = relatedSpreadPairs(market, shown, spreads, incomplete);
+  const pairMarket = pairedMarket(market) ? market : null;
+  const pairs = pairMarket ? relatedSpreadPairs(pairMarket, shown, spreads, incomplete) : [];
   const status = missing ? 'missing' : snapshot ? (failed ? 'retained' : 'ok') : failed ? 'unavailable' : 'loading';
   const message = status === 'missing' ? '本服务没有配置资产账本，在「设置」页从工作台导入后显示关联持仓'
     : status === 'loading' ? '加载中…'
@@ -151,11 +160,12 @@ export function RelatedPositions({ market, spreads, onExpired }: { market: FillM
     {message ? <p className={status === 'unavailable' || status === 'missing' || incomplete ? 'detail-side-error' : 'detail-side-empty'}>{message}</p> : null}
     {partial ? <p className="detail-side-error">部分数据源不可用，列表可能不完整</p> : null}
     {range ? <p className="detail-side-error">{range}</p> : null}
-    {incomplete && shown.length ? <p className="detail-side-note">持仓列表不完整，暂不确认配对</p> : null}
+    {pairMarket && incomplete && shown.length ? <p className="detail-side-note">持仓列表不完整，暂不确认配对</p> : null}
     {keptAt ? <p className="detail-side-note">{keptAt}</p> : null}
-    {pairs.length ? <ul className="related-spread-pairs">{pairs.map(pair => <li key={pair.key} data-pair-status={pair.status}><span>{pair.label}</span>{pair.status === 'paired' ? <PairDetail pair={pair} market={market} /> : <p className="related-unpaired">无法配对 · {unpairedText(market)[pair.reason]}</p>}</li>)}</ul> : null}
+    {market === 'anthropic' && shown.length ? <p className="detail-side-note">{ANT_TOTALS_NOTE}</p> : null}
+    {pairMarket && pairs.length ? <ul className="related-spread-pairs">{pairs.map(pair => <li key={pair.key} data-pair-status={pair.status}><span>{pair.label}</span>{pair.status === 'paired' ? <PairDetail pair={pair} market={pairMarket} /> : <p className="related-unpaired">无法配对 · {unpairedText(pairMarket)[pair.reason]}</p>}</li>)}</ul> : null}
     {shown.length ? <PositionRows items={shown} /> : null}
-    {pairs.length ? <p className="detail-side-foot">{pairFoot[market]}</p> : null}
+    {pairMarket && pairs.length ? <p className="detail-side-foot">{pairFoot[pairMarket]}</p> : null}
     {status !== 'missing' ? <div className="related-positions-actions"><a className="detail-side-action" href="#/positions">在持仓页查看<ArrowUpRight size={13} aria-hidden="true" /></a></div> : null}
   </section>;
 }

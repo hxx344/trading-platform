@@ -368,7 +368,7 @@ CEX 最多 32 页。
 
 工作台的 M14 靠 iframe 桥接向宿主（工作台外壳）要资产账本的持仓与成交。本服务自带资产账本，所以改成直接读本服务的接口：
 `GET /api/asset/fills?market=oil|hynix` 和 `GET /api/asset/positions`。服务端读取与 `fill_cache` 表见 [asset.md](asset.md) 的 A-5 节。
-Anthropic 详情的成交标记与关联持仓不做（A-5 范围外，登记在 asset.md）。
+Anthropic 详情的成交标记不做（A-5 范围外，登记在 asset.md）；关联交易随 v0.57.0 补上逐腿持仓（见下文「详情页右侧栏」）。
 
 **对照**（工作台提交 `7745181`）：
 
@@ -385,7 +385,7 @@ Anthropic 详情的成交标记与关联持仓不做（A-5 范围外，登记在
   - 原油按 15 分钟 K 线，用绝对价差；海力士按小时 K 线，用溢价率；海力士的美元价差模式用 usd 值。
   - 坐标轴与时间范围会放宽，把标记包进去。
 - 图下是「套利成交」面板：同日连续分批的入场 / 出场汇总、其余事件列表、点选后的逐笔明细。
-- 图表脚注下是「关联交易」面板（工作台的 `related-positions.tsx` panel 版式）：
+- 详情页右侧栏是「关联交易」面板（工作台的 `related-positions.tsx` panel 版式，位置见下文「详情页右侧栏」）：
   - 同一交易所两腿各一笔且方向相反时，显示开仓 / 当前 / 平仓价差、价差变化与组合盈亏（未实现 + 本轮 cycle 已实现、手续费、资金费、净额）；
   - 其下逐笔持仓与本轮 cycle 依据；
   - 底部链接到 `#/positions`。
@@ -405,15 +405,27 @@ Anthropic 详情的成交标记与关联持仓不做（A-5 范围外，登记在
 
 - 只有本服务一个来源，来源名固定为「资产账本」，所以「（来源 n）」区分不会出现。
   数据来自本服务自己的接口，不再逐字段校验来源格式（工作台校验 iframe 消息）。
-- 本服务的监控详情没有右侧栏（M-1 起去掉了 `.monitor-detail` 两栏），关联交易放在图表下方。这与工作台 1100px 以下的单栏排布一致，没有复制 `.monitor-detail-side`。
-- Anthropic 的执行归属（execution / attribution / orderId）与 ANT 组合合计不做。
+- Anthropic 的执行归属（execution / attribution / orderId）与 ANT 组合合计不做：资产账本只读 Binance、Bybit、OKX 的持仓，ANT 组合的对比腿在 Hyperliquid（xyz:ANT、io:ANTH）与 Lighter RH，读不到，组合不会成立。
 - 工作台的前台失活停止跟读改由 `use-live-resource.ts` 的暂停（页面隐藏）处理。
 - 已知口径（与工作台一致，不改）：`relatedSpreadPairs` 只按「来源 | 交易所」分组，不分账户。同一交易所两个账户各持一腿、方向相反时，也会被当成一对算价差与组合盈亏。
+
+**详情页右侧栏**（v0.57.0）：
+
+- A-5 时关联交易放在图表下方（M-1 起本服务去掉了工作台的 `.monitor-detail` 两栏）。v0.57.0 照工作台 `monitor-hub.tsx` 恢复两栏：Anthropic、原油、海力士详情的主栏是原来的整页，右栏是关联交易；合约价差页不变（工作台也是整宽）。
+- 版式组件是 `MonitorRelated.tsx` 的 `DetailLayout`，三个面板各自包一层；原油、海力士右栏的当前价差仍取同页对比表的读数。
+- Anthropic 的关联交易：`RELATED_SYMBOLS.anthropic` 同工作台（`ANTHROPIC`、`IOANTH`、`XYZANT`），只列逐腿持仓与本轮 cycle，不配对（`pairedMarket`）；有持仓时注明 ANT 组合不合计的原因（见上文「与工作台的差别」）。
+- 工作台侧栏里的告警摘要（`monitor-detail-side.tsx`）本服务没有，告警设置仍在主栏。
+- 样式在 `web/src/monitor.css` 末尾，文件里注明了出处与行号：
+  - 右栏取工作台现行的 312px（`c84ba27`；`7745181` 时是 clamp(380px, 32vw, 480px)）。本服务还有 212px 的左侧导航，宽右栏会让主栏更窄。
+  - 工作台在视口 1100px 处转单栏，两栏时主栏最窄约 665px；本服务改在视口 1239px 及以下转单栏（主栏不足约 660px），单栏时关联交易排在整页之后。
+  - 视口 1240–1399px（主栏 660–820px）时，概览改两列、Anthropic 工具栏换行，规则取自工作台 1100px / 700px 断点。
+  - 海力士对比表（`table-layout:fixed`，六列）主栏不足约 730px 时会裁掉最后一列的资金费按钮（改版前视口 800–950px 就有）。781px 以上给表格最小宽度 740px，对比框在自身内横向滚动。
+- 验证：替身后端（`scripts/dev-monitor.ts`，持仓接口在浏览器里拦截换成假数据：Binance 的 CL / BZ 一对与 ANTHROPICUSDT 一笔），无头浏览器 800、1239、1240、1280、1400、1600、1920 与 390 宽度看了三个详情页：两栏与单栏的切换点正确，右栏显示配对、组合盈亏、逐腿持仓与 cycle，Anthropic 显示注明与逐腿持仓；页面无横向溢出、无页面错误，主栏内没有被裁的内容（海力士对比表在框内滚动）。未与运行中的工作台并排截图。
 
 **测试**：
 
 - `test/monitor-trades.test.ts`：照工作台 oil-trade-markers.test.mjs，加海力士小时 K 线、分批汇总、本服务响应摊平。
-- `test/monitor-related.test.ts`：持仓挑选与 90 秒旧值、同所配对、海力士溢价率、未配对原因、cycle 合计与 loading。
+- `test/monitor-related.test.ts`：持仓挑选与 90 秒旧值、同所配对、海力士溢价率、未配对原因、cycle 合计与 loading；Anthropic 三个合约的匹配与不配对。
 
 ## M-3：告警与飞书（分批）
 

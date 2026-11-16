@@ -2,7 +2,7 @@
 // 的规则核对持仓挑选、同所配对与本轮 cycle 合计。全部是纯函数，不读网络。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MAX_POSITION_ITEMS, POSITIONS_STALE_AFTER_MS, matchBase, positionItems, relatedSpreadPairs, RELATED_SYMBOLS, type RelatedItem } from '../web/src/monitor-related.ts';
+import { MAX_POSITION_ITEMS, POSITIONS_STALE_AFTER_MS, matchBase, positionItems, relatedSpreadPairs, RELATED_SYMBOLS, pairedMarket, type RelatedItem } from '../web/src/monitor-related.ts';
 import type { HubPositions, Position, PositionCycle, PositionsScope } from '../src/asset/positions-types.ts';
 
 const at = '2026-10-01T08:00:00.000Z', now = Date.parse(at) + 10_000;
@@ -78,4 +78,14 @@ test('missing legs, same sides, duplicates and incomplete lists never pair', () 
   const loading = reply(['binance', scope([position('CLUSDT', 'long', '60', { cycle: cycle({ status: 'loading' }) }), position('BZUSDT', 'short', '64', { cycle: cycle() })])]);
   const [pending] = relatedSpreadPairs('oil', items(loading), undefined);
   assert.ok(pending && pending.status === 'paired'); assert.equal(pending.totals.realizedStatus, 'loading'); assert.equal(pending.closing, null);
+});
+
+test('anthropic picks Binance ANTHROPICUSDT and the Hyperliquid legs, and never pairs', () => {
+  assert.equal(matchBase('ANTHROPICUSDT', RELATED_SYMBOLS.anthropic), 'ANTHROPIC');
+  assert.equal(matchBase('xyz:ANT', RELATED_SYMBOLS.anthropic), 'XYZANT');
+  assert.equal(matchBase('io:ANTH', RELATED_SYMBOLS.anthropic), 'IOANTH');
+  const data = reply(['binance', scope([position('ANTHROPICUSDT', 'short', '480'), position('CLUSDT', 'long', '60')])]);
+  assert.deepEqual(positionItems(data, RELATED_SYMBOLS.anthropic, now).items.map(item => item.symbol), ['ANTHROPICUSDT']);
+  assert.equal(pairedMarket('anthropic'), false);
+  assert.equal(pairedMarket('oil'), true);
 });

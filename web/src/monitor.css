@@ -488,8 +488,8 @@
 
 /* 成交标记与关联交易（A-5，MonitorTrades.tsx、MonitorRelated.tsx）：复制自工作台 modules/monitor/app/globals.css（提交 7745181）
    第 32 行（.trade-panel、.trade-marker 等）、第 395–404 行（.trade-summary*）、第 406–424 行（.detail-side-*、.detail-stale-tag、
-   .related-positions dl）与第 431–447 行（.related-*），次序与取值不改，选择器放到 .monitor-desk 下。不复制：右侧栏 .monitor-detail-side
-   （本服务详情页没有右侧栏）、永续页的 strip 版式（第 448–455 行）。 */
+   .related-positions dl）与第 431–447 行（.related-*），次序与取值不改，选择器放到 .monitor-desk 下。右侧栏见文件末尾；
+   不复制：永续页的 strip 版式（第 448–455 行）。 */
 .monitor-desk .trade-panel{--trade-entry:#f59e0b;--trade-exit:#f472b6;--trade-rebalance:#a78bfa;--trade-trade:#cbd5e1;border-top:1px solid var(--border);padding:14px 25px 16px;min-width:0}.monitor-desk .trade-panel h3{font-size:14px;font-weight:500;margin:0}.monitor-desk .trade-status{font-size:12px;color:var(--muted-foreground);overflow-wrap:anywhere;margin:5px 0 8px}.monitor-desk [data-trade-type=entry]{--trade-color:var(--trade-entry)}.monitor-desk [data-trade-type=exit]{--trade-color:var(--trade-exit)}.monitor-desk [data-trade-type=rebalance]{--trade-color:var(--trade-rebalance)}.monitor-desk [data-trade-type=trade]{--trade-color:var(--trade-trade)}.monitor-desk .trade-legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;margin:0 0 8px}.monitor-desk .trade-legend [data-trade-type]{color:var(--trade-color);font-weight:600}.monitor-desk .trade-legend-note{color:var(--muted-foreground)}.monitor-desk .trade-list{display:grid;gap:4px;max-height:220px;overflow:auto;font-size:12px;color:var(--muted-foreground)}.monitor-desk .trade-list-item{text-align:left;white-space:normal;overflow-wrap:anywhere;width:100%;padding:6px 8px;background:var(--card);color:var(--foreground);border:1px solid var(--border);border-left:3px solid var(--trade-color,var(--border));border-radius:4px;font-size:12px}.monitor-desk .trade-list-item[aria-pressed=true]{background:var(--active-surface)}.monitor-desk .trade-details{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;max-height:320px;overflow:auto;border-top:1px solid var(--border);margin-top:8px;padding-top:8px}.monitor-desk .trade-marker{cursor:pointer;--trade-entry:#f59e0b;--trade-exit:#f472b6;--trade-rebalance:#a78bfa;--trade-trade:#cbd5e1}.monitor-desk .trade-marker text{fill:var(--trade-color);font-size:20px;paint-order:stroke;stroke:var(--background);stroke-width:4px;stroke-linejoin:round}.monitor-desk .trade-marker:focus{outline:none}.monitor-desk .trade-marker:focus circle,.monitor-desk .trade-marker[data-selected] circle{stroke:var(--foreground);stroke-width:2px}@media(max-width:780px){.monitor-desk .trade-panel{padding:14px 20px 16px}}
 .monitor-desk .trade-summary-list{display: grid; gap: 8px; font-size: 12px; min-width: 0; max-height: 440px; overflow: auto;}
 .monitor-desk .trade-summary{border: 1px solid var(--border); border-left: 3px solid var(--trade-color); border-radius: 4px; min-width: 0;}
@@ -537,3 +537,36 @@
 .monitor-desk .related-unpaired{margin: 4px 0 0; color: var(--warning);}
 .monitor-desk .related-positions-actions{display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px;}
 .monitor-desk .related-positions-actions small{color: var(--muted-foreground); font-size: 11px;}
+
+/* 详情页两栏（MonitorRelated.tsx 的 DetailLayout），照工作台 globals.css 的 .monitor-detail / .monitor-detail-side，选择器放到
+   .monitor-desk 下：
+   - 两栏与侧栏取工作台现行版本（提交 c84ba27）第 378、380、392 行：右栏 312px（7745181 时是 clamp(380px, 32vw, 480px)，之后工作台
+     自己收窄了；本服务还有 212px 的左侧导航，宽右栏会把主栏挤得更窄）。.monitor-detail 的外边距去掉（本页的左右留白由外层给，
+     同其它已去掉的 .monitor-detail 祖先）；.monitor-detail-main 不用 flex 间距（工作台主栏里是一个 .hub-content 包着整页，间距
+     不作用在面板之间），保留各面板原有的上下间距。
+   - 转单栏：工作台在视口 1100px 处转单栏，两栏时主栏最窄约 665px。本服务的左侧导航（styles.css --sidebar-width，761px 以上常驻）
+     让主栏窄 212px，所以改在主栏不足约 660px（视口 1239px 及以下）时转单栏；交易所对比表是 table-layout:fixed，主栏约 600px 时
+     海力士最后一列的资金费按钮会被裁掉。单栏时侧栏规则同 7745181 第 477 行（侧栏只有一个面板，一列）。
+   - 海力士对比表（六列）在主栏不足约 730px 时最后一列被裁（改版前视口 800–950px 就有，两栏后 1240–1300px 也会遇到）：781px 以上
+     （再窄是工作台的卡片排布）给表格最小宽度 740px，对比框在自身内横向滚动，不裁内容。
+   - 两栏而主栏不足约 820px（视口 1240–1399px）时，套用工作台 1100px 断点里概览改两列的规则（7745181 第 478–480 行，本文件上方
+     已复制的同一组）与 700px 断点里 Anthropic 工具栏换行的规则（第 492–493 行；选择器加上 .site-shell 与 .page-heading，压过
+     上方 detail-toolbar 的 nowrap），不然 Anthropic 的工具栏与四格概览互相挤压。 */
+.monitor-desk .monitor-detail{display: grid; grid-template-columns: minmax(0, 1fr) 312px; gap: 16px; align-items: start; min-width: 0;}
+.monitor-desk .monitor-detail-main{min-width: 0;}
+.monitor-desk .monitor-detail-side{position: sticky; top: 12px; display: flex; flex-direction: column; gap: 12px; min-width: 0;}
+@media (max-width: 1239px){
+  .monitor-desk .monitor-detail{grid-template-columns: minmax(0, 1fr);}
+  .monitor-desk .monitor-detail-side{position: static; display: grid; grid-template-columns: minmax(0, 1fr); align-items: start;}
+}
+@media (min-width: 1240px) and (max-width: 1399px){
+  .monitor-desk .hynix-chart-group .metrics.readout{grid-template-columns:repeat(2, minmax(0, 1fr))}
+  .monitor-desk .hynix-chart-group .readout .metric:nth-child(3){border-left:0}
+  .monitor-desk .hynix-chart-group .readout .metric:nth-child(n+3){border-top:1px solid var(--border)}
+  .monitor-desk .site-shell[data-monitor="anthropic"] .page-heading.detail-toolbar{flex-wrap:wrap}
+  .monitor-desk .site-shell[data-monitor="anthropic"] .refresh-area{flex:1 1 100%;flex-wrap:wrap}
+}
+@media (min-width: 781px){
+  .monitor-desk .exchange-comparison[data-exchange-market="hynix"]{overflow-x:auto}
+  .monitor-desk .exchange-comparison[data-exchange-market="hynix"] .exchange-table{min-width:740px}
+}

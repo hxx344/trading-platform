@@ -1,4 +1,4 @@
-// Hard notional caps (plan 7, 3.0): per job and running total of opening jobs, checked at preview and inside confirm.
+// Hard notional caps (plan 7, 3.0), set by the live canary only: per job and running total of opening jobs, checked at preview and inside confirm.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -15,9 +15,9 @@ async function withHarness(run: (h: Harness) => Promise<void>, notionalLimits?: 
 const bzIntent = () => ({ ...openIntent(), symbol: 'BZUSDT' });
 const closeIntent = () => openIntent({ action: 'close' });
 
-test('真实账户必须配置名义金额上限；格式错误的上限不能启动', () => withHarness(async h => {
-  assert.throws(() => createExecutor({ store: h.store, connectors: [h.binance, h.bybit], environment: 'mainnet' }), code('notional_limits_required'));
-  // With caps the mainnet start still stops at the simulated-only transport guard.
+test('名义金额上限可不配；格式错误的上限不能启动', () => withHarness(async h => {
+  // With or without caps the mainnet start gets as far as the simulated-only transport guard.
+  assert.throws(() => createExecutor({ store: h.store, connectors: [h.binance, h.bybit], environment: 'mainnet' }), code('live_transport_refused'));
   assert.throws(() => createExecutor({ store: h.store, connectors: [h.binance, h.bybit], environment: 'mainnet', notionalLimits: { perJob: '100', totalOpen: '500' } }), code('live_transport_refused'));
   assert.throws(() => createExecutor({ store: h.store, connectors: [h.binance], notionalLimits: { perJob: '600', totalOpen: '500' } }), code('invalid_value'));
   assert.throws(() => createExecutor({ store: h.store, connectors: [h.binance], notionalLimits: { perJob: '0', totalOpen: '500' } }), code('invalid_decimal'));

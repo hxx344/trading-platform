@@ -107,21 +107,21 @@ export function openOilPnl(oil: OilRuntime, dir: string, { now = Date.now, log =
   }
 }
 
-/** The page's oil reads: the books and spreads, the accounts, venue positions, jobs and cap use, the spread rules and PnL. */
+/** The page's oil reads: the books and spreads, the accounts, venue positions, jobs, the spread rules and PnL. */
 export function oilViews(oil: OilRuntime, executor: Executor, rules?: OilRulesRuntime, pnl?: OilPnlRuntime) {
   return {
     market: () => oil.market.view(),
-    state: () => ({ accounts: executor.accounts(), positions: oil.market.positionsView(), jobs: executor.recentJobs(20, 'oil'), notionalLimits: executor.notionalLimits() }),
+    state: () => ({ accounts: executor.accounts(), positions: oil.market.positionsView(), jobs: executor.recentJobs(20, 'oil') }),
     ...(rules ? { rules } : {}),
     ...(pnl ? { pnl: (range: string, page: number) => Object.hasOwn(PNL_RANGES, range) ? pnl.read({ range: range as PnlRange, page }) : null } : {}),
   };
 }
 
-/** The page's hynix reads (docs/hynix.md): the books and premium, the accounts, hynix positions, hynix jobs and the shared caps. */
+/** The page's hynix reads (docs/hynix.md): the books and premium, the accounts, hynix positions and hynix jobs. */
 export function hynixViews(oil: OilRuntime, executor: Executor) {
   return {
     market: () => oil.hynix.view(),
-    state: () => ({ accounts: executor.accounts(), positions: oil.hynix.positionsView(), jobs: executor.recentJobs(20, 'hynix'), notionalLimits: executor.notionalLimits() }),
+    state: () => ({ accounts: executor.accounts(), positions: oil.hynix.positionsView(), jobs: executor.recentJobs(20, 'hynix') }),
   };
 }
 

@@ -155,17 +155,7 @@ export function PositionsPanel({ state, stale, kind = OIL_POSITIONS }: { state: 
   </section>;
 }
 
-export function Limits({ limits }: { limits: OilState['notionalLimits'] }) {
-  if (!limits) return null;
-  return <dl className="execution-review-settings oil-limits" id="oilLimits">
-    <div><dt>单笔名义上限</dt><dd>{limits.perJob} USDT</dd></div>
-    <div><dt>24 小时开仓已用</dt><dd>{limits.openUsed} / {limits.openPer24h} USDT</dd></div>
-    <div><dt>最早释放</dt><dd>{limits.nextReleaseAt ? stamp(limits.nextReleaseAt) : '窗口内没有开仓'}</dd></div>
-    <div><dt>平仓</dt><dd>不计入 24 小时开仓额度</dd></div>
-  </dl>;
-}
-
-function PreviewCard({ preview, limits, busy, unknown, onConfirm, onEdit }: { preview: OilPreview; limits: OilState['notionalLimits']; busy: boolean; unknown: boolean; onConfirm: () => void; onEdit: () => void }) {
+function PreviewCard({ preview, busy, unknown, onConfirm, onEdit }: { preview: OilPreview; busy: boolean; unknown: boolean; onConfirm: () => void; onEdit: () => void }) {
   const action = preview.intent.action === 'open' ? '开仓' : '平仓';
   const accounts = [...new Map(preview.legs.map(leg => [`${leg.venue}:${leg.accountId}`, leg])).values()];
   const expired = Date.now() > preview.expiresAt;
@@ -189,7 +179,7 @@ function PreviewCard({ preview, limits, busy, unknown, onConfirm, onEdit }: { pr
         <td data-label="买一 / 卖一">{leg.quote.bid} / {leg.quote.ask}<small>{clock(leg.quote.receivedAt)}</small></td>
       </tr>)}</tbody>
     </table></div>
-    <p className="execution-help">首腿按所选方式下单：市价时以价格保护界限为 IOC 限价，超出界限的部分不成交；追价时界限是最高追价（卖出时为最低），本地追价自填界限时以自填为准。对冲腿在首腿成交后按市价跟上，不受界限约束，它的界限只在首腿发出前核对一次。{limits ? `单笔上限 ${limits.perJob} USDT；${preview.intent.action === 'open' ? `24 小时开仓已用 ${limits.openUsed} / ${limits.openPer24h} USDT。` : '平仓不计入 24 小时开仓额度。'}` : ''}同一账户请勿同时在工作台下原油单或开启原油自动规则。</p>
+    <p className="execution-help">首腿按所选方式下单：市价时以价格保护界限为 IOC 限价，超出界限的部分不成交；追价时界限是最高追价（卖出时为最低），本地追价自填界限时以自填为准。对冲腿在首腿成交后按市价跟上，不受界限约束，它的界限只在首腿发出前核对一次。同一账户请勿同时在工作台下原油单或开启原油自动规则。</p>
     {preview.notes.length ? <ul className="execution-review-notes">{preview.notes.map((note, index) => <li key={index}>{note}</li>)}</ul> : null}
     {/* An unanswered confirm is checked by clicking confirm again with the same request id: the executor answers it by that id whether or not the preview has expired since. */}
     {unknown ? <p className="execution-warning">上次确认没有收到应答，可能已受理：请先再点“确认并实盘{action}”核对（沿用同一请求编号，不会重复下单）。</p>
@@ -276,7 +266,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   if (!venues.length) return <p className="execution-message warning" role="status">没有配置原油执行账户，不能下单。</p>;
   const messageView = message ? <p id="oilOrderMsg" className={message.tone === 'err' ? 'execution-warning' : message.tone === 'ok' ? 'oil-ok' : undefined} role="status">{message.text}</p> : null;
   return <>
-    <div ref={reviewRef}>{preview ? <PreviewCard preview={preview} limits={state.notionalLimits} busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={leave} /> : null}</div>
+    <div ref={reviewRef}>{preview ? <PreviewCard preview={preview} busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={leave} /> : null}</div>
     <form className="execution-builder" id="oilOrder" aria-label="原油组合交易参数" onSubmit={event => { event.preventDefault(); void runPreview(); }}>
       {preview && messageView ? <div className="oil-review-message">{messageView}</div> : null}
       <fieldset disabled={busy || !!preview}>
@@ -475,7 +465,6 @@ export function OilPage({ onExpired }: { onExpired: () => void }) {
         <header className="trading-panel-heading"><div><h2 id="oil-execution-title">原油组合交易</h2><p>同所 BZ − CL 价差 · 跨所同一合约 · 首腿市价或 Bybit 追价策略，成交后对冲腿市价跟上</p></div>
           <button className="button secondary" type="button" onClick={() => void state.refresh()}><RefreshCw size={15} aria-hidden="true" />刷新执行状态</button></header>
         <SyncLine stale={stale} text={text} every={`每 ${refreshMs / 1000} 秒`} at={state.receivedAt} />
-        <Limits limits={state.data.notionalLimits} />
         <JobsSection jobs={state.data.jobs} stale={stale} tracked={tracked} onUntrack={() => setTracked(null)} onChanged={() => { void state.refresh(); }} />
         <OrderForm state={state.data} onAccepted={job => { setTracked(job.id); setActive(true); void state.refresh(); }} />
       </section>}

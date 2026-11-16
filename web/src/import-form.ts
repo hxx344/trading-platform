@@ -104,7 +104,7 @@ export function confirmText(choices: ImportChoices, assetEnabled: boolean): stri
   const what = [pairs.length ? pairs.join('、') : '', oil.length ? `原油执行账户（${oil.join('、')}）` : '', options !== null ? `期权账户（${options}）` : '',
     monitor ? '行情监控' : '', monitorAlerts !== null ? `行情告警${monitorAlerts.robot ? '与机器人' : ''}` : '', monitorVariational !== null ? 'Var token' : '', monitorPaper !== null ? '持仓记录' : '', crossex !== null ? `CrossEx 账户（${crossex}）` : '',
     assetOwner !== null ? `资产账本（用户 ${assetOwner}）` : ''].filter(Boolean).join(' 与 ');
-  const after = [pairs.length ? '导入的配对登记为停用。' : '', oil.length ? '原油执行账户导入后即可在「原油」页面实盘下单；首次写入原油配置时名义金额上限取单笔 200、24 小时开仓 1000 USDT。' : '',
+  const after = [pairs.length ? '导入的配对登记为停用。' : '', oil.length ? '原油执行账户导入后即可在「原油」页面实盘下单，下单不设名义金额上限。' : '',
     options !== null ? '期权账户导入后即可在「期权」页面实盘手动开平仓，工作台期权模块此后不能再用这个账户下期权单。' : '',
     monitor ? '行情监控启用后服务器读取 Binance、Hyperliquid、Lighter RH 的公开行情（不需要密钥），股数取默认值。' : '',
     tiers, token, records, monitorAlerts?.robotChanges ? '行情告警改发工作台行情监控的机器人（secrets.json 的 feishuMonitor），ASTER 告警仍发 feishu。' : '',

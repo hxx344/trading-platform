@@ -31,12 +31,6 @@ import { breadcrumbOf, entryOf, navEntries, workspaceGroups, type NavEntry } fro
 const REFRESH_MS = 2_000;
 const READ_TIMEOUT_MS = 10_000;
 
-function limitsText(state: ServiceState): string | null {
-  const limits = state.notionalLimits;
-  if (!limits) return null;
-  return `名义金额上限 单笔 ${limits.perJob} USDT，${'openPer24h' in limits ? `24 小时开仓 ${limits.openUsed} / ${limits.openPer24h}` : `累计开仓 ${limits.openUsed} / ${limits.totalOpen}`} USDT`;
-}
-
 const OIL_CHECK_MS = 60_000;
 const ASSET_CHECK_MS = 60_000;
 /** Shown on every service; the oil and monitor entries only where their state path answers (a service without that
@@ -103,7 +97,6 @@ export function App() {
   const old = receivedAt !== null && Date.now() - receivedAt > 2 * REFRESH_MS + READ_TIMEOUT_MS;
   const stale = state !== null && (status === 'error' || status === 'offline' || status === 'paused' || (status === 'loading' && (error !== null || old)));
   const failed = status === 'error' || status === 'offline';
-  const limits = state ? limitsText(state) : null;
   const aster = route.page !== 'oil' && route.page !== 'hynix' && route.page !== 'options' && route.page !== 'monitor' && route.page !== 'asset' && route.page !== 'crossex';
   return <div className="app-shell">
     {menuOpen ? <button type="button" className="nav-backdrop" aria-label="关闭导航" onClick={closeMenu} /> : null}
@@ -132,7 +125,6 @@ export function App() {
             </div>
             {state ? <p className="page-meta">
               <span>写者代次 {state.generation} · 传输 {state.transport}</span>
-              {limits ? <span>{limits}</span> : null}
               <span className={stale ? 'amber' : undefined}>{stale
                 ? status === 'paused' ? `页面在后台，已暂停刷新（停留在 ${clock(receivedAt)}）` : status === 'offline' ? `网络离线（停留在 ${clock(receivedAt)}）`
                   : error ? `刷新失败：${error.message}（停留在 ${clock(receivedAt)}）` : `正在刷新，下方仍是 ${clock(receivedAt)} 的结果`

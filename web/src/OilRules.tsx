@@ -169,6 +169,6 @@ export function OilRules({ onExpired }: { onExpired: () => void }) {
     {editor && venues.length ? <RuleFormView key={editor.key} initial={editor.rule ? ruleFormOf(editor.rule.config) : emptyRuleForm(venues[0]!)} editing={editor.rule} venues={venues} disabled={disabled} onSave={save} onCancel={() => setEditor(null)} /> : null}
     <div className="auto-rules">{view ? view.rules.length ? view.rules.map(rule => <RuleCard key={`${rule.id}:${rule.revision}`} rule={rule} disabled={disabled} evidenceValid={evidenceValid} liveAvailable={!!view.available && view.liveAvailable} onAction={act} onEdit={item => setEditor({ rule: item, key: Date.now() })} />)
       : view.available ? <p className="execution-help">尚无自动规则。新建后先只观察条件信号，核对无误再转为实盘。</p> : null : <p className="execution-help">正在读取自动规则…</p>}</div>
-    <p className="execution-help auto-panel-note">规则使用原油页同一份每 3 秒读取的盘口；读取失败、盘口超过 10 秒未更新或服务重启时连续次数清零，等新盘口重新计数。观察规则不下单、不占用额度，也不会发飞书消息。实盘规则只经执行器预览与确认下单（首腿 CL、对冲腿 BZ，均为市价），与手动任务一样受名义金额上限、账户核对与价格保护约束，任务出现在上方执行进度，可在那里停止；预览、确认或任务连续 3 次失败时规则停用；任务被手动停止时规则也停用；成交结果对不上时规则停用并转待核对。启用中的实盘规则先停用才能修改，改完重新启用确认。</p>
+    <p className="execution-help auto-panel-note">规则使用原油页同一份每 3 秒读取的盘口；读取失败、盘口超过 10 秒未更新或服务重启时连续次数清零，等新盘口重新计数。观察规则不下单、不占用额度，也不会发飞书消息。实盘规则只经执行器预览与确认下单（首腿 CL、对冲腿 BZ，均为市价），与手动任务一样受账户核对与价格保护约束，任务出现在上方执行进度，可在那里停止；预览、确认或任务连续 3 次失败时规则停用；任务被手动停止时规则也停用；成交结果对不上时规则停用并转待核对。启用中的实盘规则先停用才能修改，改完重新启用确认。</p>
   </section>;
 }

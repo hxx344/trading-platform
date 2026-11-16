@@ -297,36 +297,18 @@ export function parseConfirm(value: unknown): Confirm {
 }
 
 /**
- * Hard notional caps in USDT for jobs on real accounts (plan 7, 3.0). perJob bounds one job; totalOpen bounds the sum over
+ * Hard notional caps in USDT for the live canary's jobs (plan 7, 3.0). perJob bounds one job; totalOpen bounds the sum over
  * every opening job this data directory has accepted. Both are fixed at startup; nothing on the page or the API changes them.
+ * The service runs without caps.
  */
-export interface NotionalLimits { perJob: string; totalOpen: string; openPer24h?: undefined }
-/** The oil module's caps: openPer24h bounds the opening jobs confirmed within the last 24 hours instead of the lifetime sum. */
-export interface RollingNotionalLimits { perJob: string; openPer24h: string; totalOpen?: undefined }
-export type ExecutorNotionalLimits = NotionalLimits | RollingNotionalLimits;
+export interface NotionalLimits { perJob: string; totalOpen: string }
 const NOTIONAL_LIMIT_CEILING = '1000000000';
-/** The live canary's caps: perJob and the lifetime totalOpen, nothing else. */
 export function parseNotionalLimits(value: unknown): NotionalLimits {
   const raw = exactKeys(value, ['perJob', 'totalOpen']);
   const limits: NotionalLimits = { perJob: decimalField(raw.perJob, '单笔名义金额上限'), totalOpen: decimalField(raw.totalOpen, '累计开仓名义金额上限') };
   if (cmp(limits.totalOpen, NOTIONAL_LIMIT_CEILING) > 0) reject('invalid_value', '累计开仓名义金额上限超出范围');
   if (cmp(limits.perJob, limits.totalOpen) > 0) reject('invalid_value', '单笔名义金额上限不得大于累计开仓名义金额上限');
   return limits;
-}
-/** The 24-hour form only: perJob and openPer24h. */
-export function parseRollingNotionalLimits(value: unknown): RollingNotionalLimits {
-  const raw = exactKeys(value, ['perJob', 'openPer24h']);
-  const limits: RollingNotionalLimits = { perJob: decimalField(raw.perJob, '单笔名义金额上限'), openPer24h: decimalField(raw.openPer24h, '24 小时开仓名义金额上限') };
-  if (cmp(limits.openPer24h, NOTIONAL_LIMIT_CEILING) > 0) reject('invalid_value', '24 小时开仓名义金额上限超出范围');
-  if (cmp(limits.perJob, limits.openPer24h) > 0) reject('invalid_value', '单笔名义金额上限不得大于 24 小时开仓名义金额上限');
-  return limits;
-}
-/** What the executor accepts: perJob with exactly one of totalOpen and openPer24h. */
-export function parseExecutorNotionalLimits(value: unknown): ExecutorNotionalLimits {
-  const raw = exactKeys(value, ['perJob'], ['totalOpen', 'openPer24h']);
-  if (raw.totalOpen !== undefined && raw.openPer24h !== undefined) reject('invalid_value', '累计开仓上限 totalOpen 与 24 小时开仓上限 openPer24h 只能设一个');
-  if (raw.totalOpen === undefined && raw.openPer24h === undefined) reject('missing_field', '缺少字段：totalOpen 或 openPer24h');
-  return raw.openPer24h === undefined ? parseNotionalLimits(raw) : parseRollingNotionalLimits(raw);
 }
 
 // ---- ASTER margin-balance transfers ---------------------------------------------

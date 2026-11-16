@@ -1,4 +1,4 @@
-// Oil module O1a: same-venue BZ/CL jobs, barrels, the rolling 24-hour open cap, the service's oil wiring and job alerts.
+// Oil module O1a: same-venue BZ/CL jobs, barrels, no notional caps on the service, the service's oil wiring and job alerts.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ContractError, parseIntent } from '../src/contracts.ts';
 import { cmp } from '../src/decimal.ts';
-import { createExecutor, OPEN_WINDOW_MS } from '../src/executor.ts';
+import { createExecutor } from '../src/executor.ts';
 import { SIM_ACCOUNTS } from '../src/simulation.ts';
 import { nearestBarrels, quantityForBarrels } from '../src/barrels.ts';
 import { parseServiceConfig, parseServiceSecrets } from '../src/service/config.ts';
@@ -101,33 +101,19 @@ test('同所 BZ/CL：开仓与平仓都走同一交易所两腿，按桶数核�
   assert.deepEqual(cross.legs.map(item => [item.venue, item.symbol, item.filledBarrels]), [['binance', 'CLUSDT', '1'], ['bybit', 'CLUSDT', '1']]);
 }));
 
-test('24 小时开仓上限：按确认时间滚动计算，平仓不受限，满 24 小时后释放；与累计上限互斥', () => withHarness(async h => {
-  assert.throws(() => createExecutor({ store: h.store, connectors: [h.binance], notionalLimits: { perJob: '100', totalOpen: '500', openPer24h: '500' } as never }), code('invalid_value'));
-  assert.throws(() => createExecutor({ store: h.store, connectors: [h.binance], notionalLimits: { perJob: '600', openPer24h: '500' } as never }), code('invalid_value'));
+test('服务不设名义金额上限：实盘环境不配上限也能启动；旧上限拦下的开仓照常预览与成交', () => withHarness(async h => {
+  // Without caps the mainnet start gets as far as the simulated-only transport guard.
+  assert.throws(() => createExecutor({ store: h.store, connectors: [h.binance, h.bybit], environment: 'mainnet' }), code('live_transport_refused'));
   bindAccounts(h.ex);
-  const first = await settle(h, (await previewAndConfirm(h, openIntent({ quantity: ['2', '2'] }))).jobId);
-  assert.equal(first.status, 'completed');
-  const view = h.ex.notionalLimits() as { openPer24h: string; openUsed: string; windowMs: number; nextReleaseAt: number | null };
-  assert.equal(view.openPer24h, '250');
-  assert.equal(view.windowMs, OPEN_WINDOW_MS);
-  assert.equal(view.nextReleaseAt, first.createdAt + OPEN_WINDOW_MS);
-  assert.ok(cmp(view.openUsed, '140') > 0);
-  await assert.rejects(h.ex.preview(openIntent({ quantity: ['2', '2'] }), SESSION), code('notional_24h_cap'));
-  // Closing is never limited and does not count.
-  const closed = await settle(h, (await previewAndConfirm(h, openIntent({ quantity: ['1', '1'], action: 'close' }))).jobId);
-  assert.equal(closed.status, 'completed', closed.reason ?? '');
-  assert.equal((h.ex.notionalLimits() as { openUsed: string }).openUsed, view.openUsed);
-  // One millisecond short of 24 hours the first job still counts; at 24 hours it leaves the window.
-  // A long idle gap: the lease has lapsed, so a fresh instance takes over (the window lives in the database, not in memory).
-  h.clock.now = first.createdAt + OPEN_WINDOW_MS - 1;
-  h.restart();
-  assert.equal(h.ex.acquire(), true);
-  await assert.rejects(h.ex.preview(openIntent({ quantity: ['2', '2'] }), SESSION), code('notional_24h_cap'));
-  h.advance(1);
-  assert.equal(cmp((h.ex.notionalLimits() as { openUsed: string }).openUsed, '0'), 0);
-  const again = await settle(h, (await previewAndConfirm(h, openIntent({ quantity: ['2', '2'] }))).jobId);
-  assert.equal(again.status, 'completed', again.reason ?? '');
-}, { perJob: '200', openPer24h: '250' } as never));
+  assert.equal(h.ex.notionalLimits(), null);
+  // 10 CL is about 700 USDT a leg: over the 200 a job and, three times, over the 1000 a day that v0.49.2 enforced.
+  for (let i = 0; i < 3; i++) {
+    const { preview, jobId } = await previewAndConfirm(h, openIntent({ quantity: ['10', '10'] }));
+    assert.ok(cmp(preview.notional, '200') > 0);
+    assert.ok(!preview.notes.some(note => note.includes('上限')));
+    assert.equal((await settle(h, jobId)).status, 'completed');
+  }
+}));
 
 test('旧格式任务记录（无价格界限、无对冲等待字段）重启后照常恢复并给出新视图字段', () => withHarness(async h => {
   bindAccounts(h.ex);
@@ -183,10 +169,13 @@ test('服务配置：oil 可选；有 oil 时 pairs 可省略、密钥须含对�
   assert.throws(() => parseServiceConfig({ secretsFile: '/etc/tp/secrets.json', pairs: [], oil: undefined, extra: 1 }), /不支持的字段/);
   const config = parseServiceConfig({ secretsFile: '/etc/tp/secrets.json', oil });
   assert.deepEqual(config.pairs, []);
-  assert.deepEqual(config.oil!.notionalLimits, { perJob: '200', openPer24h: '1000' });
   assert.equal(config.oil!.accounts[0]!.environment, 'mainnet');
-  assert.match(oilSummary(config.oil), /原油执行账户 Binance \*\*\*6789（standard，凭据版本 1），名义金额上限 单笔 200 \/ 24 小时开仓 1000 USDT/);
-  assert.throws(() => parseServiceConfig({ secretsFile: '/x/s.json', oil: { ...oil, notionalLimits: { perJob: '200', totalOpen: '1000' } } }), /oil\.notionalLimits 无效/);
+  assert.match(oilSummary(config.oil), /原油执行账户 Binance \*\*\*6789（standard，凭据版本 1）（不设名义金额上限）$/);
+  // notionalLimits is a leftover of v0.49.2 and earlier: accepted in any shape, never required, never applied.
+  const { notionalLimits: _legacy, ...bare } = oil;
+  assert.deepEqual(parseServiceConfig({ secretsFile: '/x/s.json', oil: bare }).oil, config.oil);
+  assert.deepEqual(parseServiceConfig({ secretsFile: '/x/s.json', oil: { ...oil, notionalLimits: { perJob: '200', totalOpen: '1000' } } }).oil, config.oil);
+  assert.throws(() => parseServiceConfig({ secretsFile: '/x/s.json', oil: { ...oil, limits: {} } }), /oil 无效/);
   assert.throws(() => parseServiceConfig({ secretsFile: '/x/s.json', oil: { ...oil, accounts: [oil.accounts[0], oil.accounts[0]] } }), /每个交易所至多一个账户/);
   assert.throws(() => parseServiceConfig({ secretsFile: '/x/s.json', oil: { ...oil, accounts: [] } }), /1–2 个执行账户/);
 
@@ -236,13 +225,14 @@ test('服务进程：配置 oil 时启动检查失败则拒绝启动并释放账
       const state = await get('/api/oil/state');
       assert.equal(state.status, 200);
       assert.deepEqual((state.body.accounts as { venue: string }[]).map(item => item.venue), ['binance']);
-      assert.deepEqual(state.body.notionalLimits, { perJob: '200', openPer24h: '1000', openUsed: '0', windowMs: OPEN_WINDOW_MS, nextReleaseAt: null });
+      assert.equal('notionalLimits' in state.body, false, '旧配置里的上限不再生效，也不再下发');
+      assert.equal((await get('/api/state')).body.notionalLimits, null);
       assert.deepEqual(state.body.jobs, []);
       // Hynix rides on the same accounts: its reads answer (this fake lists no hynix contract, so its books carry errors).
       const hynixState = await get('/api/hynix/state');
       assert.equal(hynixState.status, 200);
       assert.deepEqual(hynixState.body.jobs, []);
-      assert.deepEqual(hynixState.body.notionalLimits, state.body.notionalLimits);
+      assert.equal('notionalLimits' in hynixState.body, false);
       assert.equal((await fetch(`http://127.0.0.1:${port}/api/hynix/state`)).status, 401, '海力士接口须登录');
       const hynixMarket = await get('/api/hynix/market');
       assert.equal(hynixMarket.status, 200);

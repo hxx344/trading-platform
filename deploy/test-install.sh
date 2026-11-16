@@ -173,7 +173,7 @@ check '--oil 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -
   db.close();
 ' "$tmp/wb")
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --oil && status=0 || status=$?
-check '--oil 导入原油执行账户并通过配置检查' '[[ $status -eq 0 ]] && grep -q "导入原油执行账户 Binance standard 账户 \*\*\*6789" "$tmp/out" && grep -q "原油执行账户 Binance \*\*\*6789（standard，凭据版本 2）" "$tmp/out" && grep -q "\"perJob\": \"200\"" "$TP_CONF_DIR/config.json"'
+check '--oil 导入原油执行账户并通过配置检查' '[[ $status -eq 0 ]] && grep -q "导入原油执行账户 Binance standard 账户 \*\*\*6789" "$tmp/out" && grep -q "原油执行账户 Binance \*\*\*6789（standard，凭据版本 2）" "$tmp/out" && grep -q "不设名义金额上限" "$tmp/out" && ! grep -q "notionalLimits" "$TP_CONF_DIR/config.json"'
 check '导入原油账户的输出不含密钥' '! grep -q "kkkkkkkk\|ssssssss" "$tmp/out"'
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --oil && status=0 || status=$?
 check '重复导入原油账户保留现有设置' '[[ $status -eq 0 ]] && grep -q "已在本项目配置中，保留现有设置" "$tmp/out" && grep -q "没有新的原油执行账户，配置未改动" "$tmp/out"'

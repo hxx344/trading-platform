@@ -74,8 +74,6 @@ export interface WorkbenchSource {
   unreadablePairs?: number;
 }
 
-/** The caps written with the first oil account; the operator raises them in config.json. */
-export const OIL_DEFAULT_LIMITS = { perJob: '200', openPer24h: '1000' } as const;
 /** One workbench execution account of a venue this service trades oil on; `problem` says why it cannot come over. */
 export interface OilCandidate {
   venue: Venue;
@@ -343,7 +341,7 @@ function planOil(source: OilSource, config: Json, secrets: Json, fits: (candidat
   }
   if (fresh.length === 0) return items;
   const accounts = [...(current && Array.isArray(current.accounts) ? current.accounts : []), ...fresh.map(entry => entry.binding)];
-  const oil = current ? { ...current, accounts } : { notionalLimits: { ...OIL_DEFAULT_LIMITS }, accounts };
+  const oil = current ? { ...current, accounts } : { accounts };
   const keys: Json = { ...secrets };
   for (const entry of fresh) keys[entry.item.venue] = { apiKey: entry.credentials.apiKey, apiSecret: entry.credentials.apiSecret };
   try {
@@ -361,7 +359,6 @@ function planOil(source: OilSource, config: Json, secrets: Json, fits: (candidat
     entry.item.status = 'added';
     entry.item.detail = `${VENUE_NAMES[entry.item.venue]} ${entry.binding.accountMode} 账户 ${entry.item.accountId}，凭据版本 ${String(entry.binding.credentialVersion)}`;
   }
-  if (!current) notes.push(`首次写入原油配置，名义金额上限取默认值：单笔 ${OIL_DEFAULT_LIMITS.perJob} USDT、24 小时开仓 ${OIL_DEFAULT_LIMITS.openPer24h} USDT；要调整请改 config.json 的 oil.notionalLimits 后执行 sudo bash install.sh`);
   return items;
 }
 

@@ -91,5 +91,5 @@ export const heldText = (held: NonNullable<OilRuleLive['held']>): string => `${h
 export function liveConfirmText(rule: OilRule, action: 'live' | 'enable' | 'reset', venueName: string): string {
   const { config } = rule;
   if (action === 'reset') return `确认已在交易所核对并处理「${rule.title}」的仓位？\n重置后规则不再记录之前的持仓${rule.live?.held ? `（${heldText(rule.live.held)}）` : ''}，回到等待开仓、未启用；不会向交易所发送任何委托。`;
-  return `${action === 'live' ? `将「${rule.title}」转为实盘并启用？` : `启用实盘规则「${rule.title}」？`}\n条件连续满足 ${config.confirmSamples} 次后，服务器会在 ${venueName} 自动下单：开仓每腿 ${config.barrels} 桶（CL 首腿 IOC 市价带价格保护，BZ 对冲腿市价），平仓按规则自己的持有量；每日最多开仓 ${config.maxOpensPerDay} 次。\n名义金额上限、账户核对与价格保护照常生效。关闭页面不影响，停用前会一直运行。`;
+  return `${action === 'live' ? `将「${rule.title}」转为实盘并启用？` : `启用实盘规则「${rule.title}」？`}\n条件连续满足 ${config.confirmSamples} 次后，服务器会在 ${venueName} 自动下单：开仓每腿 ${config.barrels} 桶（CL 首腿 IOC 市价带价格保护，BZ 对冲腿市价），平仓按规则自己的持有量；每日最多开仓 ${config.maxOpensPerDay} 次。\n账户核对与价格保护照常生效。关闭页面不影响，停用前会一直运行。`;
 }

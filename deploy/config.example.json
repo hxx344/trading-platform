@@ -20,10 +20,6 @@
     }
   ],
   "oil": {
-    "notionalLimits": {
-      "perJob": "200",
-      "openPer24h": "1000"
-    },
     "accounts": [
       {
         "venue": "binance",

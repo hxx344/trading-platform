@@ -15,7 +15,6 @@ export interface OilPositionAccount {
   long: Record<string, string> | null; short: Record<string, string> | null; openOrders: number | null;
   receivedAt: number | null; failedAt: number | null; error: string | null;
 }
-export interface OilLimits { perJob: string; openPer24h: string; openUsed: string; windowMs: number; nextReleaseAt: number | null }
 export interface OilOperation {
   kind: string; clientOrderId: string; state: string; quantity: string; limitPrice?: string | null; filledQuantity: string; averagePrice: string | null; remoteId: string | null;
   strategyStatus: string | null; childrenSettled: boolean | null; adoptedAt: number | null; releasedAt: number | null; ackStrategyId: string | null; note: string | null;
@@ -36,7 +35,6 @@ export interface OilState {
   accounts: Account[];
   positions: { readAt: number | null; readEveryMs: number; timeoutMs: number; accounts: OilPositionAccount[] };
   jobs: OilJob[];
-  notionalLimits: OilLimits | null;
 }
 export interface OilPreviewLeg {
   index: number; venue: string; symbol: string; side: string; orderSide: string; quantity: string; orderType: string; reduceOnly: boolean;

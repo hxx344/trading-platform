@@ -220,7 +220,7 @@ test('执行器实盘环境：拒绝共享写者登记、模拟连接器与 ASTE
     assert.throws(() => createExecutor({ ...base, transfers: h.aster }), code('live_transport_refused'));
     assert.throws(() => createExecutor({ ...base, adl: h.asterTrading }), code('live_transport_refused'));
     assert.throws(() => createExecutor({ ...base, positions: h.asterTrading }), code('live_transport_refused'));
-    assert.throws(() => createExecutor({ ...base, notionalLimits: undefined }), code('notional_limits_required'));
+    assert.equal(createExecutor({ ...base, notionalLimits: undefined }).notionalLimits(), null);
     assert.throws(() => ex.registerAccount({ ...binanceBinding(), environment: 'simulated' }), code('environment'));
   } finally { h.dispose(); }
   assert.ok(LIVE_PAGE.includes('<title>执行器（实盘金丝雀）</title>') && LIVE_PAGE.includes('确认执行（实盘）') && LIVE_PAGE.includes('ASTER 保证金平衡（实盘未接入）'));
@@ -270,6 +270,20 @@ test('端到端：执行器用真实连接器对替身交易所跑完两腿开�
     assert.deepEqual([binance.net.get('CLUSDT'), bybit.net.get('CLUSDT')], [0, 0]);
     assert.equal(closed.legs[0].operation?.childrenSettled, true);
     assert.equal(bybit.count('POST /v5/strategy/create'), 1);
+
+    // The service's form: mainnet without caps. Jobs carry no cap note, and a selling native chase stays refused.
+    const bareStore = openStore(join(dir, 'bare.sqlite'));
+    try {
+      const bare = createExecutor({ store: bareStore, connectors, environment: 'mainnet', now: () => clock.now });
+      assert.ok(bare.acquire());
+      for (const account of config.accounts) bare.registerAccount(account);
+      assert.equal(bare.notionalLimits(), null);
+      const big = await bare.preview(openIntent({ quantity: ['10', '10'] }), 'live-session');
+      assert.ok(Number(big.notional) > Number(LIMITS.perJob) && !big.notes.some(note => note.includes('上限')));
+      const sell = { ...chaseIntent(), legs: [{ venue: 'bybit', side: 'short', quantity: '1', orderType: 'chase' }, { venue: 'binance', side: 'long', quantity: '1', orderType: 'market' }] };
+      await assert.rejects(bare.preview(sell, 'live-session'), code('notional_chase_sell'));
+      assert.equal(bybit.count('POST /v5/strategy/create'), 1);
+    } finally { bareStore.close(); }
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 

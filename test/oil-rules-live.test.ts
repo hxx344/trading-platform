@@ -200,7 +200,7 @@ test('实盘：预览拒绝——合约被占或执行器失去写入权等 60 �
   await feed(r, rules, OPEN, 2);
   assert.deepEqual([ex.previews.length, live(rules).failures, live(rules).retryAt], [3, 0, null]);
   assert.match(lastEvent(rules), /重新计数，不计失败/);
-  ex.previewError = new ContractError(409, 'notional_24h_cap', '超过 24 小时开仓上限');
+  ex.previewError = new ContractError(409, 'account_missing', 'Binance 尚未绑定已核验的账户');
   for (let i = 1; i <= 3; i++) {
     await feed(r, rules, OPEN, 2);
     assert.equal(live(rules).failures, i);
@@ -208,7 +208,7 @@ test('实盘：预览拒绝——合约被占或执行器失去写入权等 60 �
   }
   const state = live(rules);
   assert.deepEqual([state.enabled, state.phase], [false, 'idle']);
-  assert.match(state.reason!, /^连续 3 次失败，规则已停用：超过 24 小时开仓上限/);
+  assert.match(state.reason!, /^连续 3 次失败，规则已停用：Binance 尚未绑定已核验的账户/);
   await feed(r, rules, OPEN, 3);
   assert.equal(ex.previews.length, 6, '停用后不再预览');
 }));

@@ -9,7 +9,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, wr
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { OIL_DEFAULT_LIMITS, decryptCredential, fileText, planImport, readWorkbench, readWorkbenchOil } from '../src/service/import-workbench.ts';
+import { decryptCredential, fileText, planImport, readWorkbench, readWorkbenchOil } from '../src/service/import-workbench.ts';
 import { parseImportBody, parseImportRequest, readImportResult, submitImportRequest } from '../src/service/import-channel.ts';
 import { runImportHelper } from '../src/service/import-helper.ts';
 import { parseServiceConfig, parseServiceSecrets } from '../src/service/config.ts';
@@ -63,13 +63,13 @@ const noSecrets = (text: string): void => {
   for (const secret of [API_KEY, API_SECRET, BYBIT_KEY, BYBIT_SECRET]) assert.ok(!text.includes(secret.slice(-12)), '不得含密钥');
 };
 
-test('原油导入：解密执行账户写成 oil 配置与 binance/bybit 密钥，首次写入默认名义上限，只输出打码账户', () => {
+test('原油导入：解密执行账户写成 oil 配置与 binance/bybit 密钥，不写名义金额上限，只输出打码账户', () => {
   const wb = hub([{ exchange: 'binance' }, { exchange: 'bybit', revision: 7 }, { exchange: 'okx' }]);
   try {
     const oil = readWorkbenchOil(wb.data);
     assert.deepEqual(oil.accounts.map(item => [item.venue, item.accountMode, item.accountId, item.credentialVersion, item.problem]), [['binance', 'standard', '123456789', 3, null], ['bybit', 'unified', '55667788', 7, null]], 'OKX 不是本服务的交易所');
     const plan = planImport({ pairs: [], accounts: [], env: {} }, null, { secretsFile: '/etc/trading-platform/secrets.json', only: [], oil });
-    assert.deepEqual(plan.config.oil, { notionalLimits: OIL_DEFAULT_LIMITS, accounts: [
+    assert.deepEqual(plan.config.oil, { accounts: [
       { venue: 'binance', accountId: '123456789', accountMode: 'standard', credentialVersion: 3 },
       { venue: 'bybit', accountId: '55667788', accountMode: 'unified', credentialVersion: 7 },
     ] });
@@ -79,7 +79,7 @@ test('原油导入：解密执行账户写成 oil 配置与 binance/bybit 密钥
     const config = parseServiceConfig(plan.config);
     assert.equal(parseServiceSecrets(plan.secrets, [], config.oil!.accounts.map(account => account.venue)).exchanges!.size, 2);
     assert.deepEqual(plan.oil.map(item => [item.venue, item.status, item.accountId]), [['binance', 'added', '***6789'], ['bybit', 'added', '***7788']]);
-    assert.ok(plan.notes.some(note => /单笔 200 USDT、24 小时开仓 1000 USDT/.test(note)));
+    assert.ok(!plan.notes.some(note => /上限/.test(note)));
     noSecrets(JSON.stringify({ items: plan.oil, notes: plan.notes }));
   } finally { rmSync(wb.root, { recursive: true, force: true }); }
 });
@@ -159,7 +159,7 @@ test('原油导入：已停用但任务仍在执行或待核对的原油规则�
   assert.deepEqual(statuses(plan([], [{ raw: JSON.stringify({ status: 'queued', plan: {} }) }])), ['skipped', 'skipped'], '看不出交易所的任务按无法解析处理');
 });
 
-test('原油导入：已有 oil 配置的交易所保留现有设置与上限，只补新交易所；未登记账户的同名密钥不覆盖', () => {
+test('原油导入：已有 oil 配置的交易所保留现有设置（含已不生效的旧上限字段），只补新交易所；未登记账户的同名密钥不覆盖', () => {
   const wb = hub([{ exchange: 'binance' }, { exchange: 'bybit' }]);
   try {
     const oil = readWorkbenchOil(wb.data);
@@ -171,10 +171,9 @@ test('原油导入：已有 oil 配置的交易所保留现有设置与上限，
     assert.deepEqual(plan.oil.map(item => [item.venue, item.status]), [['binance', 'skipped'], ['bybit', 'added']]);
     assert.match(plan.oil[0]!.detail, /已在本项目配置中，保留现有设置/);
     const written = plan.config.oil as { notionalLimits: unknown; accounts: { venue: string; accountId: string }[] };
-    assert.deepEqual(written.notionalLimits, { perJob: '50', openPer24h: '300' }, '上限不改');
+    assert.deepEqual(written.notionalLimits, { perJob: '50', openPer24h: '300' }, '旧字段原样保留，回滚到 v0.49.2 仍可用');
     assert.deepEqual(written.accounts.map(account => [account.venue, account.accountId]), [['binance', '99990000'], ['bybit', '55667788']]);
     assert.deepEqual(plan.secrets.binance, { apiKey: 'old-key-0001', apiSecret: 'old-secret-0001' });
-    assert.ok(!plan.notes.some(note => /默认值/.test(note)), '已有 oil 时不提默认上限');
 
     // A bybit key already in the file without its account: left alone, the account not added.
     const stray = planImport({ pairs: [], accounts: [], env: {} }, { config: existing.config, secrets: { ...existing.secrets, bybit: { apiKey: 'stray-key-1', apiSecret: 'stray-secret-1' } } }, { secretsFile: '/x/secrets.json', only: [], oil });
@@ -237,12 +236,13 @@ test('原油导入：命令行 --oil 只导入原油执行账户（没有 ASTER 
     const first = run('--oil');
     assert.equal(first.status, 0, first.stderr);
     assert.match(first.stdout, /导入原油执行账户 Binance standard 账户 \*\*\*6789，凭据版本 3/);
-    assert.match(first.stdout, /首次写入原油配置/);
+    assert.doesNotMatch(first.stdout, /名义金额上限/);
     noSecrets(first.stdout + first.stderr);
     for (const name of ['config.json', 'secrets.json']) assert.equal(statSync(join(conf, name)).mode & 0o777, 0o600);
     const config = JSON.parse(readFileSync(join(conf, 'config.json'), 'utf8')) as Record<string, unknown>;
     assert.deepEqual(config.pairs, []);
     assert.equal(parseServiceConfig(config).oil!.accounts[0]!.accountId, '123456789');
+    assert.deepEqual(Object.keys(config.oil as object), ['accounts'], '不写 notionalLimits');
 
     const before = readFileSync(join(conf, 'config.json'), 'utf8');
     const again = run('--oil');

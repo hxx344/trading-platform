@@ -47,7 +47,7 @@
 
 - 唯一写者：工作台与本服务不协调。切换后须在工作台 CrossEx 设置页断开账户（第 4 节）。本服务用进程锁 `pa-executor-live/gate-crossex/<UID>` 防同机多开，不搬账户写者（`account-writer`）。
   - 实现：运行时整体照搬，`live_owner` 租约表保留（运行时自己建表、续约）；进程锁已保证同账户只有一个进程，所以启动时先删掉上次进程留下的租约，免得等满 60 秒租约过期。
-- 硬上限：`config.json` 的 `crossex.limits`（`notionalPerLeg`、`maxOpen`、`maxTotalNotional`）页面与接口不能改，同原油的 `notionalLimits`。页面设置（`entryPaused`、`slippageBps`、`cooldownSeconds`、每腿默认金额、费率、`minNetBps`）存在 `crossex.sqlite`，保存时不得超过硬上限。
+- 硬上限：`config.json` 的 `crossex.limits`（`notionalPerLeg`、`maxOpen`、`maxTotalNotional`）页面与接口不能改。页面设置（`entryPaused`、`slippageBps`、`cooldownSeconds`、每腿默认金额、费率、`minNetBps`）存在 `crossex.sqlite`，保存时不得超过硬上限。
 - 数值：工作台用 decimal.js。
   - 实现：没有改写成 `src/decimal.ts`，而是把 decimal.js 10.6.0（工作台锁定版本，MIT）原样放进 `src/vendor/decimal.mjs`，不增加 npm 依赖；运行时的数值逻辑因此与工作台逐位相同。
 - 图表：不引入 recharts，沿用本仓库现有的 SVG 图表组件。

@@ -129,7 +129,7 @@
 
 ## 原油页样式（v0.8.1）
 
-原油页（`web/src/OilPage.tsx`）按旧工作台原油交易页（`OilTradingPage` / `TradingSpread` / `TradingExecution`）的结构排版：价差与持仓并排，下面是额度、任务和下单表单，确认前在表单上方显示预览卡片。样式从工作台复制到 `web/src/trading.css`，来源是 `src/trading.css`（提交 `a12e583`）和 `src/trading-execution.css`（提交 `1d06abd`），只保留原油页用到的规则，规则内容不改。本服务另需的样式写在 `styles.css` 末尾的原油页一节。数据读取、请求编号和确认逻辑都没改。
+原油页（`web/src/OilPage.tsx`）按旧工作台原油交易页（`OilTradingPage` / `TradingSpread` / `TradingExecution`）的结构排版：价差与持仓并排，下面是任务和下单表单（v0.50.0 起没有额度条），确认前在表单上方显示预览卡片。样式从工作台复制到 `web/src/trading.css`，来源是 `src/trading.css`（提交 `a12e583`）和 `src/trading-execution.css`（提交 `1d06abd`），只保留原油页用到的规则，规则内容不改。本服务另需的样式写在 `styles.css` 末尾的原油页一节。数据读取、请求编号和确认逻辑都没改。
 
 **回滚**：`sudo bash install.sh --version v0.8.0`。只改页面，不改接口、数据库和配置。
 
@@ -569,10 +569,20 @@
 
 **对照的工作台页面**：交易中心的海力士市场（`src/TradingSpread.tsx` 的 `SPREAD_MARKETS.hynix`、`src/TradingExecution.tsx` 的 `MARKET_PRESETS.hynix`，`origin/main` `7745181`），排版照本仓库原油页。
 
-**页面**：`web/src/HynixPage.tsx`：海力士实时溢价（每所一行：ADR、正股买一 / 卖一，溢价率、卖出溢价、买入溢价，单位 %；跨所价差折叠）、海力士持仓、执行面板（额度与原油合计、任务、预览确认、下单表单）。下单表单：同所溢价 / 跨所同合约，等金额（每腿 USDT）或按数量（两腿各填，平仓可按当前持仓填入），首腿市价、Bybit 追价策略或 Binance 本地追价，不显示分批。持仓表、任务卡片、额度、同步行和确认的请求编号逻辑从 `OilPage.tsx` 导出复用，任务卡片按 `market` 显示合约数量或桶数。表单换算在 `web/src/hynix-form.ts`，由 `test/hynix.test.ts` 覆盖。
+**页面**：`web/src/HynixPage.tsx`：海力士实时溢价（每所一行：ADR、正股买一 / 卖一，溢价率、卖出溢价、买入溢价，单位 %；跨所价差折叠）、海力士持仓、执行面板（任务、预览确认、下单表单）。下单表单：同所溢价 / 跨所同合约，等金额（每腿 USDT）或按数量（两腿各填，平仓可按当前持仓填入），首腿市价、Bybit 追价策略或 Binance 本地追价，不显示分批。持仓表、任务卡片、同步行和确认的请求编号逻辑从 `OilPage.tsx` 导出复用，任务卡片按 `market` 显示合约数量或桶数。表单换算在 `web/src/hynix-form.ts`，由 `test/hynix.test.ts` 覆盖。
 
 **样式**：没有新增规则，全部沿用 `trading.css` 已从工作台复制的规则。
 
 **验证**：模拟 Binance / Bybit 上的临时预览服务，无头浏览器 1280 与 390 宽度，见 [hynix.md](hynix.md) 第 5 节。
 
 **回滚**：见 README 回退表 v0.49.0 一行（先确认没有未结束的海力士任务）。
+
+## 取消名义金额上限后的页面（v0.50.0）
+
+2026-11-16 用户决定取消服务的单笔与 24 小时开仓名义金额上限（后端做法见 [oil.md](oil.md) 第 2 节）。页面随之去掉三处显示，不新增样式：
+
+- 页头状态行不再显示「名义金额上限 单笔 … / 24 小时开仓 …」（`web/src/App.tsx`）。
+- 原油页、海力士页执行面板顶部的额度条（单笔上限、24 小时已用、最早释放、平仓说明）删除，`Limits` 组件与 `.oil-limits` 样式一并删除；面板从同步行直接接任务列表。
+- 预览卡片说明里的「单笔上限 … 24 小时开仓已用 …」一句删除；自动规则说明、启用确认与导入确认里提到名义金额上限的文字相应改掉。
+
+回滚版本：v0.49.2。

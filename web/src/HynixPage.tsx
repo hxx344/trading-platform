@@ -5,7 +5,7 @@ import { clock, label } from './labels.ts';
 import { ACTIVE_STATUSES, type OilVenue } from './oil-form.ts';
 import { DEFAULT_HYNIX_FORM, HYNIX_LABEL, LEG_FIELDS, HYNIX_SYMBOLS, LEAD_TYPES, VENUE_LABEL, closeQuantities, describeHynixIntent, draftHynixLegs, hynixFormToIntent, leadTypeAllowed, type HynixForm, type HynixIntent, type HynixSymbol } from './hynix-form.ts';
 import type { OilBook, OilConfirmResult, OilJob, OilPreview, OilState } from './oil-types.ts';
-import { ACCOUNT_MODE, ACTIVE_MS, Choice, IDLE_MS, JOB_STATUS, JobsSection, LEAVE_UNANSWERED, Limits, MARKET_MS, OIL_READ_TIMEOUT_MS, ORDER_TYPE, PositionsPanel, SyncLine, buys, confirmRefused, errorText, operation, staleness, statusOf, venueName, type PositionsKind } from './OilPage.tsx';
+import { ACCOUNT_MODE, ACTIVE_MS, Choice, IDLE_MS, JOB_STATUS, JobsSection, LEAVE_UNANSWERED, MARKET_MS, OIL_READ_TIMEOUT_MS, ORDER_TYPE, PositionsPanel, SyncLine, buys, confirmRefused, errorText, operation, staleness, statusOf, venueName, type PositionsKind } from './OilPage.tsx';
 import { RequestIds } from './request-ids.ts';
 import { StatePanel } from './StateViews.tsx';
 import { useLiveResource, type LiveResource } from './use-live-resource.ts';
@@ -73,7 +73,7 @@ function MarketPanel({ live }: { live: LiveResource<HynixMarket> }) {
   </section>;
 }
 
-function PreviewCard({ preview, limits, busy, unknown, onConfirm, onEdit }: { preview: HynixPreview; limits: OilState['notionalLimits']; busy: boolean; unknown: boolean; onConfirm: () => void; onEdit: () => void }) {
+function PreviewCard({ preview, busy, unknown, onConfirm, onEdit }: { preview: HynixPreview; busy: boolean; unknown: boolean; onConfirm: () => void; onEdit: () => void }) {
   const action = preview.intent.action === 'open' ? '开仓' : '平仓';
   const accounts = [...new Map(preview.legs.map(leg => [`${leg.venue}:${leg.accountId}`, leg])).values()];
   const expired = Date.now() > preview.expiresAt;
@@ -97,7 +97,7 @@ function PreviewCard({ preview, limits, busy, unknown, onConfirm, onEdit }: { pr
         <td data-label="买一 / 卖一">{leg.quote.bid} / {leg.quote.ask}<small>{clock(leg.quote.receivedAt)}</small></td>
       </tr>)}</tbody>
     </table></div>
-    <p className="execution-help">首腿按所选方式下单：市价时以价格保护界限为 IOC 限价；追价时界限是最高追价（卖出时为最低）。对冲腿在首腿成交后按市价跟上，数量按两腿计划比例（对冲腿计划 × 首腿成交 ÷ 首腿计划，向下取整到步长）。{limits ? `单笔上限 ${limits.perJob} USDT（与原油合计）；${preview.intent.action === 'open' ? `24 小时开仓已用 ${limits.openUsed} / ${limits.openPer24h} USDT。` : '平仓不计入 24 小时开仓额度。'}` : ''}同一账户请勿同时在工作台下海力士单。</p>
+    <p className="execution-help">首腿按所选方式下单：市价时以价格保护界限为 IOC 限价；追价时界限是最高追价（卖出时为最低）。对冲腿在首腿成交后按市价跟上，数量按两腿计划比例（对冲腿计划 × 首腿成交 ÷ 首腿计划，向下取整到步长）。同一账户请勿同时在工作台下海力士单。</p>
     {preview.notes.length ? <ul className="execution-review-notes">{preview.notes.map((note, index) => <li key={index}>{note}</li>)}</ul> : null}
     {unknown ? <p className="execution-warning">上次确认没有收到应答，可能已受理：请先再点“确认并实盘{action}”核对（沿用同一请求编号，不会重复下单）。</p>
       : expired ? <p className="execution-warning" role="status">预览已过期，确认会被执行器拒绝；请返回修改参数后重新预览。</p> : null}
@@ -189,7 +189,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   const messageView = message ? <p id="hynixOrderMsg" className={message.tone === 'err' ? 'execution-warning' : message.tone === 'ok' ? 'oil-ok' : undefined} role="status">{message.text}</p> : null;
   const same = form.preset === 'same-exchange';
   return <>
-    <div ref={reviewRef}>{preview ? <PreviewCard preview={preview} limits={state.notionalLimits} busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={leave} /> : null}</div>
+    <div ref={reviewRef}>{preview ? <PreviewCard preview={preview} busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={leave} /> : null}</div>
     <form className="execution-builder" id="hynixOrder" aria-label="海力士组合交易参数" onSubmit={event => { event.preventDefault(); void runPreview(); }}>
       {preview && messageView ? <div className="oil-review-message">{messageView}</div> : null}
       <fieldset disabled={busy || !!preview}>
@@ -277,7 +277,6 @@ export function HynixPage({ onExpired }: { onExpired: () => void }) {
         <header className="trading-panel-heading"><div><h2 id="hynix-execution-title">海力士组合交易</h2><p>同所 ADR 对正股等金额 · 跨所同一合约 · 首腿市价或追价，成交后对冲腿按比例市价跟上</p></div>
           <button className="button secondary" type="button" onClick={() => void state.refresh()}><RefreshCw size={15} aria-hidden="true" />刷新执行状态</button></header>
         <SyncLine stale={stale} text={text} every={`每 ${refreshMs / 1000} 秒`} at={state.receivedAt} />
-        <Limits limits={state.data.notionalLimits} />
         <JobsSection jobs={state.data.jobs} stale={stale} tracked={tracked} onUntrack={() => setTracked(null)} onChanged={() => { void state.refresh(); }} />
         <OrderForm state={state.data} onAccepted={job => { setTracked(job.id); setActive(true); void state.refresh(); }} />
       </section>}

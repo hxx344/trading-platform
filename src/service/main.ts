@@ -91,8 +91,8 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
   };
   // A new check interval from the page must fit the request budget, like the config's do at start.
   const transferConfigGuard = (pairId: string, next: Readonly<TransferConfig>, pairs: readonly { id: string; enabled: boolean; config: TransferConfig }[]): void => checkIntervalBudget(config, pairs, pairId, next.checkIntervalMs);
-  // With oil, the Binance/Bybit connectors and the oil caps; without it, no order venue at all, as before.
-  const executor: Executor = createExecutor({ store, connectors: oil?.connectors ?? [], ...(oil ? { notionalLimits: oil.config.notionalLimits } : {}), environment: 'mainnet', now, transfers, adl: trading, positions: trading, enableGuard, transferConfigGuard, adlOnlyEnabledPairs: true });
+  // With oil, the Binance/Bybit connectors; without it, no order venue at all. No notional caps either way.
+  const executor: Executor = createExecutor({ store, connectors: oil?.connectors ?? [], environment: 'mainnet', now, transfers, adl: trading, positions: trading, enableGuard, transferConfigGuard, adlOnlyEnabledPairs: true });
   const warnings: string[] = [];
   try {
     // A crashed instance leaves its lease for up to a minute; wait it out here rather than crash-looping under systemd.

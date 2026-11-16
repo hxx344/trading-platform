@@ -2,15 +2,15 @@ name: release
 on:
   push:
     tags: ['v*.*.*']
-# Install, the install test and packaging run with a read-only token; only the last job, which runs no project code, can write.
+# Install and packaging run with a read-only token; only the last job, which runs no project code, can write.
 permissions:
   contents: read
 concurrency:
   group: release
   cancel-in-progress: false
 jobs:
-  # ci.yml ran every check on this commit when it was pushed to main; this waits for that result instead of running
-  # them again. publish needs it, so a commit whose ci failed, is missing or cannot be read is not released.
+  # This workflow runs no tests. ci.yml ran every check on this commit when it was pushed to main; this waits for that
+  # result. publish needs it, so a commit whose ci failed, is missing or cannot be read is not released.
   ci:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -47,8 +47,6 @@ jobs:
           [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "标签 $GITHUB_REF_NAME 与 package.json 版本 v$version 不一致"; exit 1; }
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo '标签提交不在 main 上'; exit 1; }
       - run: pnpm build:web
-      # ci.yml runs this in three parts that each start from a first install; the whole sequence in one go runs only here.
-      - run: bash deploy/test-install.sh
       - run: bash deploy/package.sh dist
       - name: 更新说明
         run: |

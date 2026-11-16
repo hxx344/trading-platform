@@ -11,6 +11,7 @@ import { PairsWorkspace } from './PairsWorkspace.tsx';
 import { useRoute } from './route.ts';
 import { SettingsPage } from './SettingsPage.tsx';
 import { StatusPage } from './StatusPage.tsx';
+import { UpdateStatus } from './UpdateStatus.tsx';
 import { Callout, StatePanel } from './StateViews.tsx';
 import { clock } from './labels.ts';
 import { useLiveResource } from './use-live-resource.ts';
@@ -114,6 +115,8 @@ export function App() {
           const Icon = ICONS[entry], active = entry === current;
           return <a key={entry} href={navEntries[entry].href} className={`nav-item ${active ? 'active' : ''}`} aria-current={active ? 'page' : undefined} onClick={menuOpen ? closeMenu : undefined}><Icon size={17} aria-hidden="true" /><span className="nav-text">{navEntries[entry].text}</span></a>;
         })}
+        {/* The online update sits after the system pages, as in the workbench (docs/update.md). */}
+        {group.id === 'system' ? <UpdateStatus onExpired={onExpired} onOpen={menuOpen ? closeMenu : undefined} /> : null}
       </div>)}
     </nav></aside>
     <div className="workspace">

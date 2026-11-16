@@ -54,6 +54,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 - 期权账户（工作台期权模块 Greeks 的 Bybit 密钥与风险上限，见 [docs/options.md](docs/options.md)）：页面「从工作台导入」的预览同时列出工作台期权账户（打码 UID、能否导入及原因），勾选「导入期权账户」后随导入一起写入；命令行为 `sudo bash install.sh --import-workbench --options`（可与 `--oil`、`--pairs` 同用）。工作台开着自动开仓（`AUTO_OPEN`）、不是实盘主网、还有未结束的订单 / 执行任务 / RFQ，或还在跟踪一组策略时拒绝导入；导入时用密钥读一次 Bybit 账户 UID 并检查权限、绑定 IP 与统一账户。已配置 `options` 时不覆盖。导入后页面出现「期权」标签，导入写入的配置里定时开仓为关闭（要用时在期权页打开；数据目录里留有以前的 `options.sqlite`、且当时在页面打开过定时开仓时，沿用页面上的开关，导入后先在期权页确认），工作台期权模块此后不能再用这个账户下期权单。
 - 首次执行放好程序（`/opt/trading-platform`）、系统账号 `trading-platform`、数据目录 `/var/lib/trading-platform`、导入交接目录 `/var/lib/trading-platform-import`、示例配置和不含配对的空配置，并启动 systemd 服务 `trading-platform`。也可以按 `/etc/trading-platform/config.example.json` 与 `secrets.example.json` 手写配置后再执行一次。
 - 以后每次执行都是增量升级。脚本先只下载校验清单，程序、Node.js、单元和配置都没变就直接结束。有变化时先用新程序校验配置，不通过就保持原版本。重启后 90 秒内没有正常监听就自动回退到上一版本（自动回退到 v0.7.0 之前的版本同样会用 `config.json` 的 `transfer` 覆盖页面改过的参数，见下）。改了配置也是再执行一次让它生效（配对的 `transfer` 与 `adl` 除外，见下）。
+- 页面在线更新（v0.50.0 起）：侧栏「系统」组的「系统更新」查看最新正式版，确认后由服务器上的 root 更新助手执行一次 `install.sh --version <新版本>`（校验、重启、失败回退照旧）。从 v0.49.1 及更早版本升级时要先在服务器上手工执行一次上面的一键部署命令，页面才会从“待启用”变为可用。只能升级、不能在页面降级。详见 [docs/update.md](docs/update.md)。
 - 指定或回退版本：`sudo bash install.sh --version v0.1.0`。服务器访问不了 GitHub 时，在别处下载 Release 的三个文件放进同一目录，然后执行 `sudo bash install.sh --package <目录>`。回退前先看下文《回退到旧版本》。
 - 打开页面：
   - **Tailscale（推荐）**：在 `/etc/trading-platform/config.json` 加一行 `"host": "<服务器的 Tailscale IP>"`（`tailscale ip -4` 查看，只能填本机的具体 IP，不能填 `0.0.0.0`），再执行一次 `sudo bash install.sh`，之后直接打开 `http://<Tailscale IP>:4720/`。该地址绑不上时（开机 Tailscale 还没连上、节点已登出）服务照常运行，持续重试，间隔最长 30 秒；配置检查会提示地址不在本机网卡上。
@@ -94,6 +95,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 | 回退到早于 | 回退前要做的事 | 说明 | 详见 |
 | --- | --- | --- | --- |
+| v0.50.0 | 不用改配置 | 旧版本没有页面在线更新；已装的 `trading-platform-update.path` 与 `.service` 留着无害（没人写更新请求就不会触发），要清掉见详见一栏 | [docs/update.md](docs/update.md) |
 | v0.49.0 | 不用改配置。先在「海力士」页确认没有未结束或待人工处理的海力士任务 | 旧版本不认识海力士合约，无法推进、核对或释放这些任务；库结构未变 | [docs/hynix.md](docs/hynix.md) 第 4 节 |
 | v0.48.0 | 不用改配置 | 旧版本里期权启动检查失败（Bybit 不通、密钥被拒、账户被占用、状态无法恢复）会让整个服务拒绝启动，ASTER 划转与 ADL 一起停；新版本只停期权并每 60 秒重试 | [docs/options.md](docs/options.md) 第 3 节 |
 | v0.47.0 | 开了巡检心跳的先执行 `sudo bash install.sh --watch-off` | 旧版本不认识 `config.json` 与 `secrets.json` 的 `watch`，配置检查会失败；关闭后副服务器收不到心跳会告警，改用直连探测或卸载副服务器巡检 | [docs/watch.md](docs/watch.md) |

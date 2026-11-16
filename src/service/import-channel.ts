@@ -117,12 +117,12 @@ export function parseImportRequest(raw: unknown): ImportRequest {
   return { id: value.id, at: value.at, ...body };
 }
 
-const lstatOrNull = (path: string): Stats | null => {
+export const lstatOrNull = (path: string): Stats | null => {
   try { return lstatSync(path); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
 };
 
 /** Reads at most `limit` bytes of a plain file without following a link; null when it is not there. */
-function readBounded(path: string, limit: number, check?: (stat: Stats) => void): string | null {
+export function readBounded(path: string, limit: number, check?: (stat: Stats) => void): string | null {
   let fd: number;
   try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
   catch (error) {

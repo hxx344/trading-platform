@@ -30,6 +30,7 @@
 | [L095](#l095) | 多步资金流程的自动重试必须按每一步落盘的进度续做 | `src/executor.ts` |
 | [L100](#l100) | 多腿价差保护要在同一时间窗的盘口上一次算好全部腿的界限 | `src/executor.ts` |
 | [L110](#l110) | 自动保护规则不能因瞬时持仓状态或“无强平价”而自行解除 | `src/executor.ts` |
+| [L201](#l201) | root 不按路径写入低权限账户可写的目录 | `deploy/install.sh`、`src/service/update-helper.ts` |
 
 ## 条目
 
@@ -196,3 +197,15 @@
 **以后做法：** 区分“交易所明确表示无强平价”（各所原始字段为 0/空串/null，记为 `noLiquidation`，视为未达阈值）与“字段缺失或格式错误”（仍算读取失败）。持仓缺失、上一轮不一致这类可能瞬时的状态单独建错误类，按间隔重试；不一致须连续多次读到同一结果才改按当前持仓继续监测，不直接停用。真正停用、转人工核对或被外部挂单阻塞时写入持久通知序号，由通知通道先占用再发送，确定失败才释放。手动“实盘测试”与规则轮次分开记录，测试不能改动规则状态，在途测试未结束时拒绝的请求不得覆盖它的结果。
 
 **本仓库的应用：** `src/executor.ts`。对冲前持仓核对不一致，可能只是交易所还没反映上一笔成交；要持续超过宽限时间才转人工，不立即停下。
+
+### L201：root 不按路径写入低权限账户可写的目录
+
+**适用条件：** 以 root 运行的安装脚本、systemd 助手，在服务账户可写的目录（页面导入、在线更新的交接目录 `/var/lib/trading-platform-import`）里建文件、改权限、读请求或写结果。
+
+**根因：** 页面在线更新的第一版由 `install.sh` 以 root 在交接目录写就绪标记 `.update-helper` 再 `chmod 644`。该目录服务账户可写、没有粘滞位，服务（或拿到服务账户的人）可以先放一个同名符号链接：`printf >` 会让 root 在链接指向处建文件，`chmod` 跟随链接把任意文件（如 `/etc/trading-platform/environment` 里的凭据）改成全员可读。独立审查发现（P0），未上线。
+
+**以后做法：** root 自己产生的状态（标记、锁、配置）放 root 所有的目录（程序目录 `/opt/trading-platform`），服务只读。必须在交接目录读写时照 `src/service/update-helper.ts` 与 `import-channel.ts`：读用 `O_NOFOLLOW` 打开后按文件描述符查属主、单链接与大小，删除前核对 inode；写用随机临时名 `O_EXCL` 创建、`fchown` 后改名，不对已有路径 `chmod`/`chown`。
+
+**如何验证：** `deploy/test-install.sh` 第 1 部分检查就绪标记写在程序目录、权限 644、交接目录里没有；`test/update.test.ts` 检查取请求时符号链接、硬链接、过大的文件不读并删除。证据：[docs/reviews/2026-11-16-online-update.md](docs/reviews/2026-11-16-online-update.md)。未在真实服务器上验证。
+
+**本仓库的应用：** `deploy/install.sh` 的 `UPDATE_READY`、`src/service/update.ts` 的 `updateReadyFile()`。

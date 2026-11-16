@@ -175,11 +175,11 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
 
 - 结构：`fill_cache(account, scope, revision, data, updated_at, PRIMARY KEY(account, scope))`，即工作台表去掉 `owner` 列。服务以 `service` 方式打开库时 `CREATE TABLE IF NOT EXISTS`，与 A-3 加 `connections` 表相同；导入的新库直接带这张表。
 - 缓存内容可丢：表缺失、读不出或写失败只让下一次冷读取改为完整读取历史；凭据换了（revision 不同）的行在读取时删除；断开连接与重新导入时一并删除。
-- 旧版本：v0.51.0 及以前不认识这张表，也不会读写它；回滚后表留在库里不影响账本，重新升级后按 revision 校验继续使用。
+- 旧版本：v0.53.0 及以前不认识这张表，也不会读写它；回滚后表留在库里不影响账本，重新升级后按 revision 校验继续使用。
 
 **回滚**
 
-`sudo bash install.sh --version v0.51.0`。不需要处理数据：`fill_cache` 只是缓存，旧版本忽略它；每日快照里多出的 `positions` 字段旧版本读取时忽略（工作台快照本就带这个字段）。
+`sudo bash install.sh --version v0.53.0`。不需要处理数据：`fill_cache` 只是缓存，旧版本忽略它；每日快照里多出的 `positions` 字段旧版本读取时忽略（工作台快照本就带这个字段）。
 
 ### A-5 实施记录（与上文不同或补充的地方）
 

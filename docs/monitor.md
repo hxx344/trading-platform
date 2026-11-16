@@ -22,8 +22,9 @@
 - M-5d2（质量采样与质量依据：质量列、「质量依据」页签、价差趋势、读取说明）随 v0.43.0；替身交易所验证（见 M-5d2 实施记录）。
 - M-5e1（模拟与手工持仓跟踪：平仓页签的登记、持仓跟踪工作区、数据目录 `perpetual-paper-positions.json`）随 v0.44.0；替身交易所验证（见 M-5e1 实施记录）。
 - M-5e2（从工作台导入持仓记录：导入面板勾选项与 `--monitor-paper`、待载入文件 `perpetual-paper-positions.import.json`）随 v0.45.0；替身导入验证（见 M-5e2 实施记录）。
-- 未开始：M-5f、M-6（见下表与「M-5」节）。
-- M-1 没做：成交标记、股数从交易中心同步、概览卡片与告警（均线 / 布林带 / Z-score 随 M-2e 补上）。
+- M14（原油、海力士详情的成交标记与关联交易）随资产账本 A-5 做完（见「M14：成交标记与关联交易」节），版本号随 A-5 发布时填写。
+- 未开始：M-5f、M13（见下表与「M-5」节）。
+- M-1 没做：股数从交易中心同步、概览卡片与告警（均线 / 布林带 / Z-score 随 M-2e 补上，成交标记随 A-5 / M14 补上）。
 
 ## 批次
 
@@ -34,7 +35,7 @@
 | M-3 | 告警规则、飞书通知、监控开关、Var 会话 token（M09–M12），分 M-3a–M-3d 四小批（见下文） | R3 | M-3a 完成（v0.29.0），M-3b 完成（v0.30.0），M-3c 完成（v0.31.0），M-3d-1 完成（v0.33.0），M-3d-2 完成（v0.34.0） |
 | M-4 | 永续全市场报价（M04：11 家交易所公共 WS、SSE 增量），分 M-4a（采集器与接口）、M-4b（页面与导入） | R2 | 完成（M-4a v0.36.0，M-4b v0.37.0） |
 | M-5 | 依赖 M04 的页面（M05–M08），分 M-5a–M-5f 小批（M-5b、M-5d 再拆两批，见「M-5」节） | R2 | M-5a（v0.38.0）、M-5b1（v0.39.0）、M-5b2（v0.40.0）、M-5c（v0.41.0）、M-5d1（v0.42.0）、M-5d2（v0.43.0）、M-5e1（v0.44.0）、M-5e2（v0.45.0）完成，其余未开始 |
-| M-6 | 其余（M13、M14；M14 原靠 iframe 桥接宿主，需重新设计） | 待定 | 未开始 |
+| M-6 | 其余（M13、M14；M14 原靠 iframe 桥接宿主，需重新设计） | 待定 | M14 随资产账本 A-5 完成（见「M14」节）；M13 未开始 |
 
 ## M-1：Anthropic 价差
 
@@ -83,7 +84,7 @@
 
 - 地址 `#/monitor`，标签“行情监控”，只在 `/api/monitor/state` 有应答时显示。
 - 对照工作台 `modules/monitor/app/anthropic-panel.tsx`（`35ebb94`）与 `spread-chart.tsx`（`4be9aa4`）：对比合约切换（xyz:ANT / io:ANTH / Lighter RH）、状态行、股数说明、四格读数（当前溢价、两边每股价、区间平均）、走势图（溢价率 / 每股价差 / 每股价格三个标签与时间范围）、近期观察表、如何比较、数据来源与覆盖范围。文案沿用工作台。
-- 走势图用本仓库的 `svg-plot.tsx` 画。本批不做：成交标记（依赖资产账本的成交，随 Asset 后续批次补）；股数从交易中心同步（本服务用配置里的股数）。
+- 走势图用本仓库的 `svg-plot.tsx` 画。本批不做：成交标记（依赖资产账本的成交，后随 A-5 / M14 补上）；股数从交易中心同步（本服务用配置里的股数）。
 - 样式：`web/src/monitor.css` 复制自工作台 `modules/monitor/app/globals.css`（`77f3cf2`）里这个页面用到的规则，每条选择器前加 `.monitor-desk ` 限定范围（具体取法见下面的实施记录）。
 
 **测试**
@@ -106,7 +107,7 @@
 - **本地预览**：`scripts/dev-monitor.ts`（`pnpm build:web; node scripts/dev-monitor.ts [--port 4731]`）用替身行情（`test/monitor-fake.ts`）、模拟执行器和临时数据目录跑页面，不走 `startService`（不加账户锁、不写环境标记），Windows 上也能跑；不联网。
 - **测试**：`test/monitor-anthropic.test.ts`（vendor 行为，14 个）、`test/monitor.test.ts`（存储、采集、配置、导入、HTTP 层与两个整服务用例，9 个）、`test/monitor-web.test.ts`（页面数据规则，6 个）、`test/web.test.ts` 补 `#/monitor` 路由。两个整服务用例（`startService`）与仓库原有服务进程用例一样，在 Windows 上因数据目录 fsync 报 EPERM 跑不了，需在 Linux（CI）上验证。
 
-**本批没做**：成交标记、均线 / 布林带 / Z-score、股数从交易中心同步、概览卡片与告警（M-3）。
+**本批没做**：成交标记（后随 A-5 / M14 补上）、均线 / 布林带 / Z-score、股数从交易中心同步、概览卡片与告警（M-3）。
 
 ## M-2：原油价差与海力士行情
 
@@ -120,7 +121,7 @@
 | M-2d | 资金费：原油 Binance 已结算资金费（4 小时）与海力士 Hyperliquid 小时资金费历史、多空资金费图 | 已发布（v0.24.0）；对比表各交易所结算历史另成 M-2d-3，已发布（v0.27.0） |
 | M-2e | 技术指标：7 日均线、20 日布林带、Z-score（Anthropic、原油、海力士三个市场一起补） | 已发布（v0.25.0） |
 
-不做：工作台的四腿资金费对冲模拟、成交标记与相关持仓（依赖资产账本的成交，随 Asset 后续批次）、告警（M-3）、工作台的原油日线任务与旧的 Hyperliquid 原油行情。
+不做：工作台的四腿资金费对冲模拟、成交标记与相关持仓（依赖资产账本的成交，后随 A-5 / M14 补上）、告警（M-3）、工作台的原油日线任务与旧的 Hyperliquid 原油行情。
 
 **配置**：`monitor` 下每个市场一个键，`{}` 表示启用，至少一个：`"monitor": { "anthropic": {}, "oil": {}, "hynix": {} }`。`anthropic` 从 M-2 起可以不写（只看原油也行）；`oil`、`hynix` 不带任何字段。
 
@@ -171,7 +172,7 @@
 - **本地预览**：`scripts/dev-monitor.ts` 同时启用两个市场；替身行情（`test/monitor-fake.ts`）新增 BZUSDT / CLUSDT 的 `premiumIndex`、`fundingInfo` 与 15 分钟 K 线（上市 30 天，价差在 2.5–5.5 之间缓慢摆动），可让单腿、资金费或整体返回 429 / 500。
 - **测试**：新增 `test/monitor-oil.test.ts`（10 个：vendor 价差精度、K 线配对 / 分页 / 续读补缺口 / 窗口，报价解析，采集的快照标记、续读起点、失败与恢复、Binance 冷却与 Anthropic 共用，读回失败整表重写与写入失败下一轮补写，永久缺口每小时补读，配置与接口）；`test/monitor-web.test.ts` 加 3 个原油页面数据规则；`test/import-modules.test.ts` 改写行情监控导入用例（全新、补市场、已齐、只有原油、无效配置、超出大小）。
 
-**本批没做**：海力士（M-2b）、多交易所对比（M-2c）、多空资金费（M-2d）、指标（M-2e）、成交标记、概览卡片与告警（M-3）。`deploy/config.example.json` 仍只带 `anthropic`。
+**本批没做**：海力士（M-2b）、多交易所对比（M-2c）、多空资金费（M-2d）、指标（M-2e）、成交标记（后随 A-5 / M14）、概览卡片与告警（M-3）。`deploy/config.example.json` 仍只带 `anthropic`。
 
 **回滚**：`sudo bash install.sh --version v0.19.0`，回退前从 `config.json` 删掉 `monitor.oil`（只配了原油时删掉整个 `monitor`）；`monitor.sqlite` 里的 `oil_candles` 表旧版本不读。
 
@@ -211,7 +212,7 @@
 - **本地预览**：`scripts/dev-monitor.ts` 同时启用三个市场；替身行情新增 xyz dex 的 `allMids` 与 SKHY / SKHX 1 小时 K 线（上市 30 天，溢价在 2–8% 之间缓慢摆动），可让单腿或整体返回 429 / 500，可指定缺失的小时。
 - **测试**：新增 `test/monitor-hynix.test.ts`（9 个：报价换算与拒收、K 线配对 / 续读起点 / 5000 根下限 / 行校验，采集的快照标记与续读，失败与恢复、429，读回与写入失败，永久缺口每小时补读、补读轮写入失败下一轮照样补读，配置与接口，页面数据规则）；`test/import-modules.test.ts` 行情监控导入用例补海力士。
 
-**本批没做**：多交易所对比（M-2c）、资金费（M-2d）、指标（M-2e）、成交标记、概览卡片与告警（M-3）。`deploy/config.example.json` 仍只带 `anthropic`。
+**本批没做**：多交易所对比（M-2c）、资金费（M-2d）、指标（M-2e）、成交标记（后随 A-5 / M14）、概览卡片与告警（M-3）。`deploy/config.example.json` 仍只带 `anthropic`。
 
 **回滚**：`sudo bash install.sh --version v0.20.0`，回退前从 `config.json` 删掉 `monitor.hynix`（只配了海力士时删掉整个 `monitor`）；`hynix_candles` 表旧版本不读。
 
@@ -321,7 +322,7 @@
 - **测试**：新增 `test/monitor-indicators.test.ts`（6 个：手算均线 / 布林带 / Z-score 与零波动、缺口与无效值重置窗口、各市场窗口根数与 15 分钟序列遇小时步长重置、按范围加 21 天读与完整历史在范围内结果一致、缺口只数显示范围、开关读取的缺省与损坏处理）；`test/monitor-hynix.test.ts` 的提示用例改为按显示范围。
 - **审查**：记录见 [docs/reviews/2026-11-14-monitor-m2e.md](reviews/2026-11-14-monitor-m2e.md)。
 
-**本批没做**：成交标记、对比表各交易所的结算历史（M-2d-3）、告警（M-3）。
+**本批没做**：成交标记（后随 A-5 / M14）、对比表各交易所的结算历史（M-2d-3）、告警（M-3）。
 
 **回滚**：`sudo bash install.sh --version v0.24.0`，不用改配置（只改页面）。
 
@@ -362,6 +363,55 @@ CEX 最多 32 页。
 **本批没做**：Variational、四腿资金费对冲模拟、告警（M-3）。真实交易所未验证（本机访问 Binance 返回 451）。
 
 **回滚**：`sudo bash install.sh --version v0.26.0`，不用改配置（没有新配置字段、没有新表）。
+
+## M14：成交标记与关联交易（随资产账本 A-5）
+
+工作台的 M14 靠 iframe 桥接向宿主（工作台外壳）要资产账本的持仓与成交。本服务自带资产账本，所以改成直接读本服务的接口：
+`GET /api/asset/fills?market=oil|hynix` 和 `GET /api/asset/positions`。服务端读取与 `fill_cache` 表见 [asset.md](asset.md) 的 A-5 节。
+Anthropic 详情的成交标记与关联持仓不做（A-5 范围外，登记在 asset.md）。
+
+**对照**（工作台提交 `7745181`）：
+
+- 成交标记：`modules/monitor/app/spread-chart.tsx` 的 TradeMark / TradePanel，规则来自以下文件（改写成 TypeScript 放在 `web/src/monitor-trades.ts`）：
+  - `modules/oil/trades.mjs`、`trade-decimal.mjs`、`trade-markers.mjs`；
+  - `lib/trade-summary.ts`、`lib/hynix-trades.ts`、`lib/oil-chart-config.ts`；
+  - 宿主 `src/hub-fills.ts` 的 fillItems。
+- 关联交易：`app/related-positions.tsx` 与 `cycle-evidence.tsx`，规则来自 `lib/related-pairs.ts` 和宿主 `src/hub-positions.ts`，改写后放在 `web/src/monitor-related.ts`。
+- 样式：`app/globals.css` 第 32、395–404、406–424、431–447 行，复制到 `web/src/monitor.css` 末尾。
+
+**页面**：
+
+- 原油详情的价格图（价差、溢价率模式）按成交所在的 K 线画 ▲入场 / ▼出场 / ◆调仓 / ●成交：
+  - 原油按 15 分钟 K 线，用绝对价差；海力士按小时 K 线，用溢价率；海力士的美元价差模式用 usd 值。
+  - 坐标轴与时间范围会放宽，把标记包进去。
+- 图下是「套利成交」面板：同日连续分批的入场 / 出场汇总、其余事件列表、点选后的逐笔明细。
+- 图表脚注下是「关联交易」面板（工作台的 `related-positions.tsx` panel 版式）：
+  - 同一交易所两腿各一笔且方向相反时，显示开仓 / 当前 / 平仓价差、价差变化与组合盈亏（未实现 + 本轮 cycle 已实现、手续费、资金费、净额）；
+  - 其下逐笔持仓与本轮 cycle 依据；
+  - 底部链接到 `#/positions`。
+- 当前价差取自同页「多交易所对比」各交易所的读数（原油取价差，海力士取溢价率），与工作台宿主的 oilSpreads / hynixSpreads 相同。
+  为此 `ExchangeComparison` 加了 `onSpreads`，照工作台 `exchange-comparison.tsx` 的同名回调。
+
+**读取节奏**：
+
+- 成交：有范围在读时每 5 秒读一次，连续最多 36 次后回到每 5 分钟（工作台 FILLS_FOLLOW_UP_MS / FILLS_MAX_FOLLOW_UPS / FILLS_REFRESH_MS）。
+- 持仓：每 60 秒读一次；cycle 在读或读取失败时每 25 秒一次（工作台 POSITIONS_FOLLOW_UP_MS）。
+- 两者失败时都保留上次数据并注明。服务没有资产账本（404）时：
+  - 成交面板只显示一行说明，图上不画标记；
+  - 关联交易显示「本服务没有配置资产账本」。
+
+**与工作台的差别**：
+
+- 只有本服务一个来源，来源名固定为「资产账本」，所以「（来源 n）」区分不会出现。
+  数据来自本服务自己的接口，不再逐字段校验来源格式（工作台校验 iframe 消息）。
+- 本服务的监控详情没有右侧栏（M-1 起去掉了 `.monitor-detail` 两栏），关联交易放在图表下方。这与工作台 1100px 以下的单栏排布一致，没有复制 `.monitor-detail-side`。
+- Anthropic 的执行归属（execution / attribution / orderId）与 ANT 组合合计不做。
+- 工作台的前台失活停止跟读改由 `use-live-resource.ts` 的暂停（页面隐藏）处理。
+
+**测试**：
+
+- `test/monitor-trades.test.ts`：照工作台 oil-trade-markers.test.mjs，加海力士小时 K 线、分批汇总、本服务响应摊平。
+- `test/monitor-related.test.ts`：持仓挑选与 90 秒旧值、同所配对、海力士溢价率、未配对原因、cycle 合计与 loading。
 
 ## M-3：告警与飞书（分批）
 

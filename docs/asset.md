@@ -180,3 +180,26 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
 **回滚**
 
 `sudo bash install.sh --version v0.51.0`。不需要处理数据：`fill_cache` 只是缓存，旧版本忽略它；每日快照里多出的 `positions` 字段旧版本读取时忽略（工作台快照本就带这个字段）。
+
+### A-5 实施记录（与上文不同或补充的地方）
+
+- **后端**（提交 `3945481`）：
+  - 按上文「改动范围」逐个复制，文件头注明了来源与差异；
+  - 持仓服务与成交服务由 `createAssetStore` 持有，测试与示例可以注入 `positions` / `fills` 选项，替换交易所读取；
+  - 每日快照通过 `peek` 取持仓缓存。
+- **页面**：
+  - 持仓页见 [frontend.md](frontend.md)《持仓页与成交标记（Asset A-5）》；
+  - 原油、海力士详情的成交标记、套利成交面板与关联交易见 [monitor.md](monitor.md)《M14：成交标记与关联交易》；
+  - 页面里「关联持仓」的标题沿用工作台 `related-positions.tsx` 的实际文案「关联交易」。
+- **与工作台的差别**：
+  - 只有本服务一个来源（工作台汇总多个 Asset 项目），来源名固定为「资产账本」，所以去掉了来源筛选和「（来源 n）」区分；
+  - 页面直接读本服务接口，代替 iframe 桥接；
+  - 本服务的监控详情没有右侧栏，关联交易放在图表下方。
+- **没做（登记）**：
+  - Anthropic（ANT）的成交读取、执行归属与关联持仓合计：`fillsQueryMarket` 只接受 `oil` / `hynix`，Anthropic 详情不画标记；
+  - A08 留到下一批；A14 不迁移。
+- **测试**：
+  - 后端：`test/asset-fills.test.ts`、`asset-positions-*.test.ts`、`positions.test.ts`；
+  - 页面纯函数：`test/monitor-trades.test.ts`、`test/monitor-related.test.ts`；
+  - 导航与路由：`test/workspace-nav.test.ts`、`test/web.test.ts`；
+  - 所有交易所读取都换成替身。

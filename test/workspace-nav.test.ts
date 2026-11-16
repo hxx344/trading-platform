@@ -8,7 +8,7 @@ import { breadcrumbOf, entryOf, navEntries, workspaceGroups, type NavEntry } fro
 test('every address keeps its entry and gets the workspace of the plan', () => {
   const cases: [string, NavEntry, string][] = [
     ['', 'pairs', '策略与风险'], ['#/', 'pairs', '策略与风险'], ['#/pair/xau', 'pairs', '策略与风险'], ['#/pair/', 'pairs', '策略与风险'],
-    ['#/asset', 'asset', '总览与资产'], ['#/monitor', 'monitor', '市场与机会'], ['#/oil', 'oil', '交易中心'], ['#/hynix', 'hynix', '交易中心'],
+    ['#/asset', 'asset', '总览与资产'], ['#/positions', 'positions', '总览与资产'], ['#/monitor', 'monitor', '市场与机会'], ['#/oil', 'oil', '交易中心'], ['#/hynix', 'hynix', '交易中心'],
     ['#/crossex', 'crossex', '交易中心'], ['#/crossex/trade', 'crossex', '交易中心'], ['#/crossex/hedge', 'crossex', '交易中心'],
     ['#/crossex/orders', 'crossex', '交易中心'], ['#/crossex/settings', 'crossex', '交易中心'],
     ['#/options', 'options', '期权'], ['#/options/rfq', 'options', '期权'], ['#/options/performance', 'options', '期权'],
@@ -28,6 +28,7 @@ test('entries keep the addresses the pages had before the regrouping', () => {
 test('groups follow the plan order and leave out workspaces without an entry', () => {
   const all = workspaceGroups(new Set(Object.keys(navEntries) as NavEntry[]));
   assert.deepEqual(all.map(group => group.label), ['总览与资产', '市场与机会', '交易中心', '策略与风险', '期权', '系统']);
+  assert.deepEqual(all[0]!.entries, ['asset', 'positions'], '持仓在资产之后');
   assert.deepEqual(all.at(-1)!.entries, ['status', 'logs', 'settings']);
   assert.deepEqual(all.find(group => group.id === 'trading')!.entries, ['oil', 'hynix', 'crossex'], '海力士在原油之后、CrossEx 之前');
   assert.deepEqual(all.map(group => group.id), ['overview', 'market', 'trading', 'strategy', 'options', 'system']);

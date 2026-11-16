@@ -8,6 +8,7 @@ import { supportsFundingHistory } from '../../src/vendor/exchange-funding-histor
 import { FundingHistoryPanel, utc, type FundingHistorySelection } from './MonitorFundingHistory.tsx';
 import { VariationalSessionForm } from './MonitorVariationalSession.tsx';
 import { useLiveResource } from './use-live-resource.ts';
+import type { VenueSpreads } from './monitor-related.ts';
 
 // The multi-exchange comparison under the oil and Hynix charts, laid out as the workbench's modules/monitor/app/
 // exchange-comparison.tsx (568a20d) with its hook hooks/use-exchange-quotes.ts (8470785): every exchange is read on its own every 15 s
@@ -27,7 +28,7 @@ const age = (fetchedAt: string, now: number) => { const seconds = Math.max(0, Ma
 const settlement = (leg: ExchangeLeg) => leg.nextFundingAt ? `${utc(leg.nextFundingAt)}${leg.nextFundingEstimated ? '（推算）' : ''}` : '—';
 const readable = (error: Error | null, kept: boolean) => !error ? '' : /[一-鿿]/.test(error.message) ? error.message : kept ? '本轮更新失败，保留上次数据' : '读取失败，稍后自动重试';
 
-export function ExchangeComparison({ market, onExpired }: { market: SpreadMarket; onExpired: () => void }) {
+export function ExchangeComparison({ market, onExpired, onSpreads }: { market: SpreadMarket; onExpired: () => void; onSpreads?: (spreads: VenueSpreads) => void }) {
   const [now, setNow] = useState(() => Date.now());
   const [states, setStates] = useState<Partial<Record<Exchange, RowState>>>({});
   const [refreshing, setRefreshing] = useState(false);
@@ -53,6 +54,19 @@ export function ExchangeComparison({ market, onExpired }: { market: SpreadMarket
   };
   const contracts = EXCHANGE_CONTRACTS[market], oil = market === 'oil';
   const exchanges = DISPLAY_EXCHANGES[market];
+  // A-5: each market reports its own spread metric to the related positions (oil the absolute spread, Hynix the ADR premium),
+  // as the workbench's exchange-comparison.tsx onSpreads (7745181).
+  const spreadKey = JSON.stringify(exchanges.filter(exchange => supportsExchange(market, exchange)).map(exchange => {
+    const quote = states[exchange]?.quote ?? null;
+    let metrics: ReturnType<typeof calculateExchangeSpread> | null = null;
+    try { metrics = quote ? calculateExchangeSpread(quote) : null; } catch { metrics = null; }
+    return [exchange, (oil ? metrics?.spread : metrics?.premium) ?? null, Boolean(quote && (states[exchange]?.error || externalQuoteStale(quote, now)))];
+  }));
+  useEffect(() => {
+    if (!onSpreads) return;
+    const entries = JSON.parse(spreadKey) as [string, number | null, boolean][];
+    onSpreads(Object.fromEntries(entries.map(([name, value, stale]) => [name, { value, stale }])));
+  }, [onSpreads, spreadKey]);
   const rightHeading = oil ? 'WTI' : '正股 ÷ 10';
   return <div className="hub-exchange-comparison"><section className="exchange-comparison" aria-label={`${oil ? '原油' : '海力士'}交易所实时对比`} data-exchange-market={market}>
     <div className="exchange-heading"><div><h2>交易所实时对比</h2><p>{oil ? '布伦特 − WTI · 资金费按等桶数' : 'ADR − 正股 ÷ 10 · 10 份 ADR 对 1 股正股'}</p></div><div><span>各平台每 15 秒更新 · 结果 5 秒内共用</span><button type="button" className="refresh-button" onClick={refresh} disabled={refreshing} aria-label={`刷新${oil ? '原油' : '海力士'}交易所报价`}><RefreshCw size={14} className={refreshing ? 'spinning' : ''} aria-hidden="true" />{refreshing ? '更新中' : '刷新'}</button></div></div>

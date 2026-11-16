@@ -6,6 +6,7 @@ import './shell.css';
 import './aster.css';
 // After aster.css: the asset page's rules replace the ASTER ones of equal weight (.aster-desk .panel and the like).
 import './asset.css';
+import './positions.css';
 // After aster.css: every page sits in .aster-desk, so on equal specificity the options page's own copy must win.
 import './options.css';
 // After aster.css for the same reason: every CrossEx rule sits under .aster-desk .crossex-page.

@@ -4,12 +4,16 @@ import { calculateIndicators, type IndicatorPoint, type SpreadMetric } from '../
 import { ranges, sampleChartPoints, savedToggles, selectRange, type ChartMode, type IndicatorToggles as Toggles, type Point, type SpreadChartConfig } from './monitor-history.ts';
 import { SvgPlot, createHoverStore, type PlotLayer } from './svg-plot.tsx';
 import { fixedAxis, niceAxis } from './svg-plot-geometry.ts';
+import { groupTradeEvents, tradeMarkers, type FillsView } from './monitor-trades.ts';
+import { TradeMark, TradePanel } from './MonitorTrades.tsx';
+import type { FillMarket } from '../../src/asset/fills-types.ts';
 
-// The history chart of every monitor market, the workbench's modules/monitor/app/spread-chart.tsx (4be9aa4) without the
-// fills and trade markers: the 7-day average, the 20-day Bollinger bands and the 20-day Z-score panel, computed over the
+// The history chart of every monitor market, the workbench's modules/monitor/app/spread-chart.tsx (4be9aa4): the 7-day average, the 20-day Bollinger bands and the 20-day Z-score panel, computed over the
 // whole read (the selected range plus its warmup) before the range is cut. Each market's config names its tabs: Anthropic
 // has premium, spread and price; oil has spread and price only. The tab stays page state (the funding panel shares the
 // range, not the tab); the indicator toggles are remembered per market in this browser, as the workbench does.
+// Oil and Hynix also pass the asset ledger's fills (A-5): the trade markers on the chart and the trade panel under it, as in
+// spread-chart.tsx at 7745181 (TradeMark, TradePanel, plotted markers widening the axis and the time range); Anthropic has none.
 export const date = (t: number | string, full = false) => new Intl.DateTimeFormat('zh-CN', { timeZone: 'UTC', month: '2-digit', day: '2-digit', ...(full ? { year: 'numeric' } : {}) }).format(new Date(t));
 export const stamp = (t: number | string) => `${date(t, true)} ${new Date(t).toISOString().slice(11, 16)} UTC`;
 
@@ -58,8 +62,9 @@ function indicatorTooltip(p: ChartPoint, mode: ChartMode, enabled: Toggles, conf
   </div>;
 }
 
-export const SpreadChart = memo(function SpreadChart({ data, loading, range, onRangeChange, mode, onModeChange, config }: {
+export const SpreadChart = memo(function SpreadChart({ data, loading, range, onRangeChange, mode, onModeChange, config, trades, tradeMarket }: {
   data: Point[]; loading: boolean; range: number | null; onRangeChange: (range: number | null) => void; mode: ChartMode; onModeChange: (mode: ChartMode) => void; config: SpreadChartConfig;
+  trades?: FillsView; tradeMarket?: FillMarket;
 }) {
   const { intervalMs, periods, preferenceKey } = config;
   // Each market's page has its own chart, so the key never changes under one instance.
@@ -74,6 +79,14 @@ export const SpreadChart = memo(function SpreadChart({ data, loading, range, onR
   const fullHistory = useMemo(() => calculateIndicators(data, metric, periods, intervalMs), [data, metric, periods, intervalMs]);
   const points = useMemo(() => selectRange(fullHistory, range), [fullHistory, range]);
   const latest = points.at(-1);
+  const tradeItems = trades?.items;
+  const events = useMemo(() => tradeItems && tradeMarket ? groupTradeEvents(tradeItems, tradeMarket) : [], [tradeItems, tradeMarket]);
+  const markers = useMemo(() => tradeMarket ? tradeMarkers(tradeMarket, events, points) : [], [events, points, tradeMarket]);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const selected = markers.find(marker => marker.event.key === selectedKey) ?? null;
+  // Fill premiums use trade prices, so the price chart has no matching axis.
+  const plotted = useMemo(() => mode === 'price' ? [] : markers.flatMap(marker => { const y = mode === 'premium' ? marker.value : marker.usd; return y !== null && Number.isFinite(y) ? [{ marker, y }] : []; }), [markers, mode]);
+  const lastTradeTime = plotted.reduce((max, item) => Math.max(max, item.marker.event.time), -Infinity);
   const chartPoints = useMemo((): ChartPoint[] => points.flatMap((p, i) => i && p.time - points[i - 1]!.time > intervalMs ? [
     { time: points[i - 1]!.time + intervalMs, adr: null, ordinary: null, equivalent: null, spread: null, premium: null, sma: null, basis: null, upper: null, lower: null, band: null, zscore: null, deviation: null, consecutiveHours: null }, p,
   ] : [p]), [points, intervalMs]);
@@ -86,9 +99,10 @@ export const SpreadChart = memo(function SpreadChart({ data, loading, range, onR
     let low = 0, high = 0, any = false;
     const add = (value: number) => { if (Number.isFinite(value)) { any = true; low = Math.min(low, value); high = Math.max(high, value); } };
     for (const p of points) { add(p[metric]); if (enabled.sma && p.sma !== null) add(p.sma); if (enabled.bands && p.band) { add(p.band[0]); add(p.band[1]); } }
+    for (const item of plotted) add(item.y);
     if (!any) return [0, step];
     return [Math.floor(low / step) * step, Math.ceil(high / step) * step || step];
-  }, [points, metric, enabled.sma, enabled.bands, step]);
+  }, [points, metric, enabled.sma, enabled.bands, plotted, step]);
   const zDomain = useMemo(() => {
     let low = 0, high = 0;
     for (const p of points) if (p.zscore !== null) { low = Math.min(low, p.zscore); high = Math.max(high, p.zscore); }
@@ -102,7 +116,7 @@ export const SpreadChart = memo(function SpreadChart({ data, loading, range, onR
   // Premium/spread and z keep their explicit domains; only the price axis widens to round ticks.
   const mainAxis = useMemo(() => mode === 'price' ? niceAxis(priceDomain[0], priceDomain[1]) : fixedAxis(domain[0], domain[1]), [mode, priceDomain, domain]);
   const zAxis = useMemo(() => fixedAxis(zDomain[0], zDomain[1]), [zDomain]);
-  const xRange = useMemo(() => points.length ? [points[0]!.time, points.at(-1)!.time] as const : [0, 1] as const, [points]);
+  const xRange = useMemo(() => points.length ? [points[0]!.time, Math.max(points.at(-1)!.time, lastTradeTime)] as const : [0, 1] as const, [points, lastTradeTime]);
   const layers = useMemo((): PlotLayer[] => mode === 'price' ? [
     { kind: 'line', key: 'adr', color: 'var(--chart-2)', width: 2, active: true },
     { kind: 'line', key: 'equivalent', color: 'var(--warning)', width: 2, active: true },
@@ -149,9 +163,11 @@ export const SpreadChart = memo(function SpreadChart({ data, loading, range, onR
         : <SvgPlot rows={sampled} hoverRows={chartPoints} xDomain={xRange} yDomain={mainAxis.domain} yTicks={mainAxis.ticks} yTick={tick}
           layers={layers} references={mode === 'price' ? [] : zeroLine} margin={{ top: 25, right: 82, bottom: 36 }} height={300} hover={hover}
           label={mode === 'price' ? `${config.legs.join(' 与 ')} ${config.bar}收盘价格走势` : `${metricName}${config.bar}走势`}
-          defs={premiumFill} tooltip={row => indicatorTooltip(row as ChartPoint, mode, enabled, config)} />}
+          defs={premiumFill} tooltip={row => indicatorTooltip(row as ChartPoint, mode, enabled, config)}
+          overlay={plotted.length ? ({ x, y }) => plotted.map(({ marker, y: value }) => <TradeMark key={marker.event.key} cx={x(marker.event.time)} cy={y(value)} marker={marker} selected={selectedKey === marker.event.key} onSelect={setSelectedKey} />) : undefined} />}
     </div>
     <div className="chart-caption"><span>{mode === 'price' ? <><i className="legend-dot adr" />{config.legs[0]} <i className="legend-dot ordinary" />{config.legs[1]}</> : <><i className="legend-dot premium" />{metricName}<span className="zero-line" />{config.zeroLabel}</>}</span><span>{points.length ? `${date(points[0]!.time, true)} — ${date(points.at(-1)!.time, true)} · ${config.span(points.length)}${sampled.length < chartPoints.length ? ` · 绘图保留极值与缺口共 ${sampled.length.toLocaleString()} 点，读数与统计使用全部记录` : ''}` : `${config.bar}收盘 · UTC`}</span></div>
+    {trades && tradeMarket && <TradePanel trades={trades} markers={markers} selected={selected} onSelect={setSelectedKey} chartMarkers={mode !== 'price'} market={tradeMarket} spreadTabs={spreadTabs(config)} />}
     {mode !== 'price' && enabled.zscore && <div className="zscore-panel" aria-label="Z-score 历史走势">
       <div className="zscore-heading"><h3><span className="sample-line z-line" />Z-score <span>20 日</span></h3><span>0 = 近期均值 · 虚线 = ±2σ</span></div>
       <div className="zscore-chart">

@@ -22,7 +22,8 @@
 | 工作区 | 页面 | 地址 | 何时显示 | 本文小节 |
 | --- | --- | --- | --- | --- |
 | 总览与资产 | 资产 | `#/asset` | `GET /api/asset/state` 不是 404（配置了 `asset`；账本读取失败时也显示） | 《资产页》《资产页写入》《资产页同步与交易所连接》 |
-| 市场与机会 | 行情监控 | `#/monitor` | `GET /api/monitor/state` 有应答（配置了 `monitor`） | 《行情监控页》及其后 M-2a 至 M-3c 各节 |
+| 总览与资产 | 持仓 | `#/positions` | 同资产（与资产页共用探测） | 《持仓页与成交标记（Asset A-5）》 |
+| 市场与机会 | 行情监控 | `#/monitor` | `GET /api/monitor/state` 有应答（配置了 `monitor`） | 《行情监控页》及其后 M-2a 至 M-3c 各节、《持仓页与成交标记（Asset A-5）》 |
 | 交易中心 | 原油 | `#/oil` | `GET /api/oil/state` 有应答（配置了 `oil`） | 《原油页样式》《原油自动规则区块》《原油盈亏与资金费》，页面内容见 [oil.md](oil.md) 第 3 节 |
 | 交易中心 | 海力士 | `#/hynix` | 同原油（海力士与原油共用执行账户，沿用原油状态的探测，不另发请求） | 《海力士页》，页面内容见 [hynix.md](hynix.md) 第 3 节 |
 | 交易中心 | CrossEx | `#/crossex`，子页 `#/crossex/trade`、`#/crossex/hedge`、`#/crossex/orders`、`#/crossex/settings` | `GET /api/crossex/state` 有应答或返回 503（配置了 `crossex`；已配置但未启动、后台重试中也显示） | 《CrossEx 页》 |
@@ -255,6 +256,27 @@
 - 连接视图：新增“交易所连接”标签（未连接数显示为“N 待连接”），卡片、说明、按钮文案与工作台相同。连接弹窗改为视图顶部整行展开的面板（`.connect-panel`），字段按交易所区分：Var 填 vr-token，Hyperliquid、Lighter RH 填地址，其余 API Key + Secret，OKX 加 Passphrase，Bybit 加账户地区（原生 `select`）。Aster 新增 / 更新 / 移除确认改为账号卡片内的原位面板。差异：Var 的“测试访问”诊断未移植；面板多一个“取消”按钮；Aster 新账号 id 用 `newRequestId()`（页面走 http 时没有 `crypto.randomUUID`）。
 - 总览：侧栏由 A-1 的“分交易所合计”恢复为工作台的“数据连接”（每行点开对应连接，Aster 跳到连接视图），交易所资产 KPI 显示“N 个账户待连接 / 账户已连接”，汇率面板文案恢复工作台原文，页脚加各视图说明。
 - 样式：`.connections-grid`、`.connection-card*`、`.aster-*`、`.loading-spin`、`.section-note`、`.exchange-mark.virtual` 复制自工作台 `globals.css`（`0014655`，行号见 `asset.css` 注释），规则与先后次序不改，加 `.asset-desk ` 前缀；连接面板整行展开与 Aster 卡片内面板的规则写在 `asset.css` 末尾。
+
+## 持仓页与成交标记（Asset A-5）
+
+**持仓页**（`web/src/AssetPositions.tsx`，`#/positions`，侧栏「总览与资产 · 持仓」）：
+
+- 对照工作台交易中心的 `src/TradingPositions.tsx`（提交 `7745181`）。
+- 版式与工作台相同：工具栏（刷新）、提示、概览、数据源卡片、交易所 / 账户筛选、按交易所 → 账户 → 产品范围的持仓表、页脚说明。
+- 数据读 `GET /api/asset/positions`，每 5 秒一次，读取超时 15 秒；范围超过 90 秒未更新算旧值；404 显示「本服务没有配置资产账本」。
+- 与工作台的差别：
+  - 只有本服务一个来源，所以去掉来源筛选，数据源卡片只有一张，并链接到 `#/asset`；
+  - 筛选放在页面状态里，不进地址；
+  - 读取用 `use-live-resource.ts`。
+- 样式：`web/src/positions.css` 复制工作台 `src/trading-center.css`（`7745181`）第 5–6、17–106、107–137 行，去掉 `.trading-sections`；格式化函数 `web/src/positions-format.ts` 复制自 `src/trading-format.ts`。
+
+**行情监控**：原油、海力士详情的成交标记、套利成交面板与关联交易，见 [monitor.md](monitor.md)《M14：成交标记与关联交易》。样式复制在 `web/src/monitor.css` 末尾，文件里注明了行号。
+
+**验证**：
+
+- 临时替身后端：资产账本示例数据，Binance 的持仓、cycle 与成交读取换成假数据，加上替身行情。
+- 无头浏览器 1280 与 390 宽度看了：持仓页、原油与海力士详情（标记、点选明细、关联交易）。两个宽度都没有横向溢出。
+- 本机没有中文字体，截图里的中文显示为方框。
 
 ## 导入面板：行情监控与资产账本
 

@@ -8,10 +8,14 @@ import { ExchangeComparison } from './MonitorExchanges.tsx';
 import { HynixFundingPanel } from './MonitorFunding.tsx';
 import { AlertSettings } from './MonitorAlerts.tsx';
 import { useLiveResource } from './use-live-resource.ts';
+import { useFills } from './MonitorTrades.tsx';
+import { RelatedPositions } from './MonitorRelated.tsx';
+import type { VenueSpreads } from './monitor-related.ts';
 
 // The Hynix ADR premium on the monitor page, laid out as the workbench's modules/monitor/app/dashboard.tsx (9c652bc) inside
 // the hub, where its top bar is hidden; the exchange comparison (M-2c) sits under the chart, the settled funding (M-2d)
-// under it, sharing the chart's range. Left out: the fills and the hub summary card. The service collects; the page reads what it saved.
+// under it, sharing the chart's range. Left out: the hub summary card. The asset ledger's fills mark the chart and the related positions sit under it (A-5;
+// MonitorTrades.tsx, MonitorRelated.tsx). The service collects; the page reads what it saved.
 const QUOTE_PATH = '/api/monitor/hynix/quote', CANDLE_PATH = '/api/monitor/hynix/candles';
 const QUOTE_MS = 10_000, CANDLE_MS = 60_000, READ_TIMEOUT_MS = 10_000;
 // The complete history is at most 400 days of hourly rows, well under a megabyte.
@@ -62,6 +66,9 @@ export function HynixPanel({ onExpired }: { onExpired: () => void }) {
   const current = quote ?? undefined;
   const direction = !current || current.premium >= 0 ? 'positive' : 'negative';
   const historyPending = data === null && !historyFailed;
+  const trades = useFills('hynix', onExpired);
+  // The related pairs' current spread per venue, reported by the exchange comparison below (the workbench hub's oilSpreads / hynixSpreads).
+  const [venueSpreads, setVenueSpreads] = useState<VenueSpreads>({});
   return <>
     <div className="page-heading detail-toolbar"><div className="toolbar-identity"><div className="eyebrow">SK HYNIX <span>/</span> 000660 · SKHY</div><h1>海力士 ADR 价差<span className="small-tag">上市以来</span></h1><p>正股与 ADR 同口径比较 · Hyperliquid 永续合约</p></div><div className="refresh-area"><button type="button" className="refresh-button" onClick={refresh} disabled={loading}><RefreshCw size={15} className={loading ? 'spinning' : ''} aria-hidden="true" />{loading ? '加载行情' : '刷新行情'}</button><span>每 10 秒自动刷新</span></div></div>
     <div className="data-status" role="status"><span className="status-left"><Clock3 size={14} aria-hidden="true" />{quote ? `${quoteError ? '实时更新中断 · 上次获取' : '实时报价 · 获取于'} ${date(quote.fetchedAt, true)} ${new Date(quote.fetchedAt).toISOString().slice(11, 19)} UTC` : quoteFailed ? '实时报价暂不可用 · 每 10 秒自动重试' : '正在获取实时报价 · 每 10 秒自动刷新'}</span><span className="status-right">USD · 1 股正股 = 10 份 ADR</span></div>
@@ -75,9 +82,10 @@ export function HynixPanel({ onExpired }: { onExpired: () => void }) {
       <article className="metric"><div className="metric-label"><span className="legend-dot ordinary" />正股折算价格<span className="ticker">SKHX</span></div><div className="metric-value">{money(current?.equivalent)}</div><div className="metric-foot">正股 {money(current?.ordinary)} <span>÷ 10</span></div></article>
       <article className="metric"><div className="metric-label">区间平均溢价<span className="ticker">{ranges.find(r => r.days === range)?.label}</span></div><div className="metric-value">{percent(stats?.mean)}</div><div className="metric-foot">{stats ? `${percent(stats.min)} 至 ${percent(stats.max)}` : '等待行情数据'}</div></article>
     </section>
-    <SpreadChart data={chartPoints} loading={historyPending} range={range} onRangeChange={setRange} mode={mode} onModeChange={setMode} config={HYNIX_SPREAD_CHART} />
+    <SpreadChart data={chartPoints} loading={historyPending} range={range} onRangeChange={setRange} mode={mode} onModeChange={setMode} config={HYNIX_SPREAD_CHART} trades={trades} tradeMarket="hynix" />
     <p className="chart-footnote"><Info size={13} aria-hidden="true" />缺失时段曲线断开，不补 0 · 采样 1 小时</p></div>
-    <ExchangeComparison market="hynix" onExpired={onExpired} />
+    <RelatedPositions market="hynix" spreads={venueSpreads} onExpired={onExpired} />
+    <ExchangeComparison market="hynix" onExpired={onExpired} onSpreads={setVenueSpreads} />
     <HynixFundingPanel range={range} onRangeChange={setRange} onExpired={onExpired} />
     <AlertSettings market="hynix" onExpired={onExpired} />
     <div className="bottom-grid"><section className="table-panel"><div className="section-heading"><h2>近期观察</h2><span>每日最后共同小时 · 起点 UTC</span></div><div className="table-scroll"><table><thead><tr><th>日期</th><th>ADR</th><th>正股 ÷ 10</th><th>每份价差</th><th>溢价率</th></tr></thead><tbody>{recent.map(p => <tr key={p.time}><td>{date(p.time, true)}<small>{new Date(p.time).toISOString().slice(11, 16)}</small></td><td>{money(p.adr)}</td><td>{money(p.equivalent)}</td><td>{signedMoney(p.spread)}</td><td><span className={`premium-pill ${p.premium >= 0 ? 'positive' : 'negative'}`}>{p.premium >= 0 ? <ArrowUpRight size={13} aria-hidden="true" /> : <ArrowDownRight size={13} aria-hidden="true" />}{percent(p.premium)}</span></td></tr>)}{!recent.length && <tr><td colSpan={5} className="empty-table">{historyPending ? '正在加载记录…' : '暂无记录'}</td></tr>}</tbody></table></div></section>

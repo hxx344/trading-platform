@@ -9,12 +9,13 @@ import { useEffect, useRef, useState } from 'react';
 import type { ImportReply, ImportSummary } from '../../src/asset/views.ts';
 import { money } from './asset-format.ts';
 import type { Writer } from './AssetPage.tsx';
+import type { ImportGate } from './asset-import-gate.ts';
 
 export const IMPORT_PATH = '/api/asset/import';
 /** The workbench's limit (lib/source-ledger.ts IMPORT_MAX_BYTES); the server refuses a larger body too. */
 export const IMPORT_MAX_BYTES = 5 * 1024 * 1024;
-/** Where install.sh puts the converter (its default APP_DIR) and how it is run; the service never runs it. */
-export const IMPORT_SCRIPT_PATH = '/opt/trading-platform/current/scripts/import-workbook.py';
+/** Where install.sh puts the converter (under its install directory, TP_APP_DIR) and how it is run; the service never runs it. */
+export const IMPORT_SCRIPT_PATH = 'current/scripts/import-workbook.py', DEFAULT_APP_DIR = '/opt/trading-platform';
 export const IMPORT_SCRIPT = 'python3 import-workbook.py 资产统计.xlsx';
 
 /** What the workbench's preview() shows for a file it cannot use, before anything is sent. */
@@ -32,11 +33,13 @@ export function summaryLines(summary: ImportSummary): string[] {
   ];
 }
 
-export function ImportPanel({ writer, onClose }: { writer: Writer; onClose: () => void }) {
+export function ImportPanel({ writer, gate, onClose }: { writer: Writer; gate: ImportGate; onClose: () => void }) {
   const [source, setSource] = useState<unknown>(), [preview, setPreview] = useState<{ summary: ImportSummary; fingerprint: string } | null>(null);
   const [fileError, setFileError] = useState('');
   const panel = useRef<HTMLElement | null>(null);
   useEffect(() => { panel.current?.scrollIntoView({ block: 'nearest' }); }, []);
+  // Held while mounted: the automatic sync pauses and resumes however the panel goes away (asset-import-gate.ts).
+  useEffect(() => gate.hold(), [gate]);
   async function choose(file?: File) {
     setSource(undefined); setPreview(null); setFileError(''); writer.clear();
     if (!file) return;
@@ -59,7 +62,7 @@ export function ImportPanel({ writer, onClose }: { writer: Writer; onClose: () =
       <label>原表导入文件（JSON）<input type="file" accept=".json,application/json" disabled={writer.busy} onChange={event => void choose(event.target.files?.[0])} /></label>
       {preview ? <div className="import-summary"><strong>{preview.summary.source}</strong>{summaryLines(preview.summary).map(line => <p key={line}>{line}</p>)}</div> : null}
       <p className="help">已有手动修改、只读 API 连接及同步余额会保留。导入前自动备份；旧示例快照保留在历史记录，不参与真实资产曲线。当前估值会随实时行情变化。</p>
-      <p className="help">导入文件由随本服务安装的 <code>{IMPORT_SCRIPT_PATH}</code> 生成：复制到装有 openpyxl 的电脑上运行 <code>{IMPORT_SCRIPT}</code>，得到 imported-ledger.json。</p>
+      <p className="help">导入文件由随本服务安装的脚本生成：它在安装目录下的 <code>{IMPORT_SCRIPT_PATH}</code>（默认安装目录 <code>{DEFAULT_APP_DIR}</code>），复制到装有 openpyxl 的电脑上运行 <code>{IMPORT_SCRIPT}</code>，得到 imported-ledger.json。</p>
       {error ? <p className="error-text" role="alert">{error}</p> : null}
       <div className="form-actions"><button type="button" className="button" disabled={writer.busy} onClick={onClose}>取消</button><button type="button" className="button primary" disabled={writer.busy || !preview} onClick={apply}>{writer.busy ? '正在处理…' : '导入并保留已有修改'}</button></div>
     </div>

@@ -5,18 +5,20 @@
 // - the body is checked strictly ({source, apply, fingerprint}): an unknown key refuses it, as the other asset writes do;
 // - apply needs the fingerprint the preview returned, and refuses (409) when the file sent differs from the previewed one
 //   (the workbench applies whatever is sent the second time);
-// - the backup: VACUUM INTO a file created empty with mode 600 in <data dir>/asset-backups (700), fsynced and checked
-//   with PRAGMA quick_check before anything is written; a failed backup writes nothing (AssetBackupError, answered 503).
-//   The workbench uses better-sqlite3's online backup into .data/backups and chmods the file afterwards;
+// - the backup: node:sqlite's online backup (the workbench's better-sqlite3 db.backup(), into .data/backups, chmod after),
+//   here into a file created empty with mode 600 in <data dir>/asset-backups (700), in steps off the main thread so the
+//   service's other loops keep running; then fsynced (file and directory) and checked with PRAGMA quick_check before
+//   anything is written. A failed backup writes nothing (AssetBackupError, answered 503). After a successful import only
+//   the newest BACKUP_KEEP backups stay;
 // - the write re-checks, in its transaction, that the source ledger it planned from is still there (the lease already
 //   refuses once the ledger was imported again from the workbench, import-info);
 // - today's snapshot is written by writes.ts saveSnapshot (the workbench's snapshot(): it also carries `withdrawn` and
 //   the cached positions) instead of the hand-built row of importLedger, which lacks those two fields;
 // - the clock is injected.
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, rmSync } from 'node:fs';
+import { chmodSync, closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { backup, DatabaseSync } from 'node:sqlite';
 import type { AssetDb } from './db.ts';
 import type { SyncLease } from './sync-lock.ts';
 import { AssetConflict } from './sync-lock.ts';
@@ -30,6 +32,11 @@ import { AssetInputError } from './validation.ts';
 import { saveSetting, saveSnapshot, type PositionsPeek } from './writes.ts';
 
 export const BACKUP_DIR = 'asset-backups';
+/** The backups kept after a successful import (the newest by time); older ones are removed then. */
+export const BACKUP_KEEP = 5;
+/** Pages copied per backup step (4 KB pages: 1 MB a step); the steps run in the thread pool between event-loop turns. */
+export const BACKUP_PAGES_PER_STEP = 256;
+const BACKUP_NAME = /^before-import-[0-9a-f-]{36}\.sqlite$/;
 export const IMPORT_FINGERPRINT_KEY = 'source-import-hash';
 export const IMPORT_CHANGED = '导入文件与预览时不同，请重新选择文件并预览';
 export const BACKUP_FAILED = '导入前备份数据库失败，未执行导入，已有数据保持不变';
@@ -39,7 +46,6 @@ export class AssetBackupError extends Error {
 }
 
 export type ImportInput = { source: unknown; apply: boolean; fingerprint: string | null };
-type Database = Pick<AssetDb, 'prepare'>;
 
 /** The body of POST /api/asset/import: {source, apply: boolean, fingerprint?: sha256 hex}; apply needs the fingerprint. */
 export function parseImportBody(value: unknown): ImportInput {
@@ -99,28 +105,49 @@ export function importPlan(source: SourceLedger, current: Ledger, previous: Sour
   return { ledger: imported, retained };
 }
 
-/** A consistent copy of the open database next to it; throws AssetBackupError and leaves no usable file on failure. */
-export function backupDatabase(database: Database, dbFile: string, name: string): string {
+const fsyncPath = (path: string, flags: string) => { const handle = openSync(path, flags); try { fsyncSync(handle); } finally { closeSync(handle); } };
+
+/**
+ * A consistent copy of the database next to it, made with SQLite's online backup from a connection of its own (the
+ * caller holds the sync lock, so the service's ledger writes wait; another writer only makes SQLite restart the copy).
+ * Throws AssetBackupError and leaves no file behind on failure.
+ */
+export async function backupDatabase(dbFile: string, name: string): Promise<string> {
   const directory = join(dirname(dbFile), BACKUP_DIR), path = join(directory, name);
   let created = false;
   try {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const stat = lstatSync(directory);
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('not a directory');
+    // An existing directory (made by hand, or by an older umask) is narrowed to the service account too.
+    if ((stat.mode & 0o777) !== 0o700) chmodSync(directory, 0o700);
     // Created empty and private before SQLite writes into it, so the copy is never readable by others.
     closeSync(openSync(path, 'wx', 0o600)); created = true;
-    database.prepare('VACUUM INTO ?').bind(path).run();
-    const handle = openSync(path, 'r+');
-    try { fsyncSync(handle); } finally { closeSync(handle); }
-    const check = new DatabaseSync(path, { readOnly: true });
+    const from = new DatabaseSync(dbFile, { readOnly: true });
+    try { await backup(from, path, { rate: BACKUP_PAGES_PER_STEP }); } finally { from.close(); }
+    // The copy carries the source's WAL mode; a rollback journal keeps it one self-contained file (no -wal, -shm beside it).
+    const check = new DatabaseSync(path);
     try {
+      check.exec('PRAGMA journal_mode = DELETE');
       if ((check.prepare('PRAGMA quick_check').get() as { quick_check?: string } | undefined)?.quick_check !== 'ok') throw new Error('backup check failed');
     } finally { check.close(); }
+    fsyncPath(path, 'r+');
+    fsyncPath(directory, 'r');
     return path;
   } catch {
-    if (created) try { rmSync(path, { force: true }); } catch { /* an unusable copy is left behind; nothing was written */ }
+    if (created) for (const file of [path, path + '-wal', path + '-shm', path + '-journal']) try { rmSync(file, { force: true }); } catch { /* an unusable copy is left behind; nothing was written */ }
     throw new AssetBackupError();
   }
+}
+
+/** Keeps the newest BACKUP_KEEP import backups (by modification time); a file that cannot be removed stays. */
+export function pruneBackups(dbFile: string, keep = BACKUP_KEEP): void {
+  const directory = join(dirname(dbFile), BACKUP_DIR);
+  let names: string[];
+  try { names = readdirSync(directory).filter(name => BACKUP_NAME.test(name)); } catch { return; }
+  const dated = names.flatMap(name => { try { return [{ name, at: statSync(join(directory, name)).mtimeMs }]; } catch { return []; } })
+    .sort((a, b) => b.at - a.at || (a.name < b.name ? 1 : -1));
+  for (const { name } of dated.slice(keep)) try { rmSync(join(directory, name), { force: true }); } catch { /* left for the next import */ }
 }
 
 export type ImportResult =
@@ -129,7 +156,7 @@ export type ImportResult =
   | { kind: 'applied'; summary: ImportSummary; backupName: string };
 
 /** importLedger under the caller's lease: import once into the example ledger; never overwrite a personal one. */
-export function importSource(database: AssetDb, lease: SyncLease, current: Ledger, input: ImportInput, options: { dbFile: string; now: () => number; peek?: PositionsPeek }): ImportResult {
+export async function importSource(database: AssetDb, lease: SyncLease, current: Ledger, input: ImportInput, options: { dbFile: string; now: () => number; peek?: PositionsPeek }): Promise<ImportResult> {
   const source = parseSource(input.source);
   if (source.source === EXAMPLE_SOURCE) throw new Error('请选择从原表生成的导入文件，不能再次导入示例');
   const fingerprint = createHash('sha256').update(JSON.stringify(source)).digest('hex');
@@ -150,7 +177,7 @@ export function importSource(database: AssetDb, lease: SyncLease, current: Ledge
   if (input.fingerprint !== fingerprint) throw new AssetConflict('import_changed', IMPORT_CHANGED);
 
   const batchId = randomUUID(), backupName = 'before-import-' + batchId + '.sqlite';
-  backupDatabase(database, options.dbFile, backupName);
+  await backupDatabase(options.dbFile, backupName);
   lease.write(() => {
     // The lease refuses a re-import from the workbench; this refuses any other change of the planned-from source.
     if (database.prepare("SELECT value FROM settings WHERE key = 'source-ledger'").get<{ value: string }>()?.value !== original.value) throw new Error('无法读取原有记录，未执行导入');
@@ -168,5 +195,6 @@ export function importSource(database: AssetDb, lease: SyncLease, current: Ledge
     for (const period of archived) database.prepare('INSERT INTO snapshots(date,data) VALUES(?,?)').bind(period.id, JSON.stringify(period)).run();
     saveSnapshot(database, { ...plan.ledger, connections: current.connections }, at, options.peek);
   });
+  pruneBackups(options.dbFile);
   return { kind: 'applied', summary, backupName };
 }

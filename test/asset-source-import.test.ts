@@ -2,7 +2,7 @@
 // POST /api/asset/import. The expectations follow the workbench's importLedger (modules/asset/lib/import-ledger.ts at 7745181).
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -10,11 +10,12 @@ import type { AddressInfo } from 'node:net';
 import { createExecutorServer, type ServiceViews } from '../src/http.ts';
 import { ASSET_DB_FILE, openAssetDb } from '../src/asset/db.ts';
 import { importLedger } from '../src/asset/import.ts';
-import { createAssetStore, type ImportReply } from '../src/asset/store.ts';
-import { acquireSyncLock, LOCK_BUSY } from '../src/asset/sync-lock.ts';
+import { createAssetStore, readLedger, type ImportReply } from '../src/asset/store.ts';
+import { acquireSyncLock, LEDGER_REIMPORTED, LOCK_BUSY, LOCK_LOST, type SyncLease } from '../src/asset/sync-lock.ts';
 import { AssetInputError } from '../src/asset/validation.ts';
 import { EXAMPLE_SOURCE, parseSource } from '../src/asset/source-ledger.ts';
-import { BACKUP_DIR, BACKUP_FAILED, IMPORT_CHANGED, IMPORT_FINGERPRINT_KEY } from '../src/asset/source-import.ts';
+import { BACKUP_DIR, BACKUP_FAILED, BACKUP_KEEP, IMPORT_CHANGED, IMPORT_FINGERPRINT_KEY, backupDatabase, importSource } from '../src/asset/source-import.ts';
+import { importGate } from '../web/src/asset-import-gate.ts';
 import { bindAccounts, createHarness } from './harness.ts';
 import { OWNER, dayBefore, writeWorkbenchLedger } from './asset-fixture.ts';
 
@@ -175,7 +176,7 @@ test('the import and the other ledger writes exclude each other through the sync
 
 const TOKEN = 'asset-access-token-0006';
 const SESSION = 'asset-session-value-0006';
-async function withServer(views: ServiceViews, run: (post: (path: string, body: string, headers?: Record<string, string>) => Promise<Response>) => Promise<void>) {
+async function withServer(views: ServiceViews, run: (post: (path: string, body: string, headers?: Record<string, string>) => Promise<Response>, cookie: string) => Promise<void>) {
   const h = createHarness();
   bindAccounts(h.ex);
   const server = createExecutorServer({ executor: h.ex, accessToken: TOKEN, session: SESSION, views });
@@ -184,14 +185,15 @@ async function withServer(views: ServiceViews, run: (post: (path: string, body: 
   try {
     const login = await fetch(`${base}/login?token=${TOKEN}`, { redirect: 'manual' });
     const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0]!;
-    await run((path, body, headers = { cookie, 'x-pa-executor': '1', 'content-type': 'application/json' }) => fetch(base + path, { method: 'POST', headers, body }));
+    await run((path, body, headers = { cookie, 'x-pa-executor': '1', 'content-type': 'application/json' }) => fetch(base + path, { method: 'POST', headers, body }), cookie);
   } finally { await new Promise(resolve => server.close(resolve)); h.dispose(); }
 }
 
 test('POST /api/asset/import: login and page marker first, 5 MB body limit, preview and apply, errors as the workbench answers', async t => {
   const w = exampleLedger(t);
-  await withServer({ asset: w.store }, async post => {
+  await withServer({ asset: w.store }, async (post, cookie) => {
     assert.equal((await post('/api/asset/import', JSON.stringify({ source: workbook(), apply: false }), { 'x-pa-executor': '1', 'content-type': 'application/json' })).status, 401, 'login comes first');
+    assert.equal((await post('/api/asset/import', JSON.stringify({ source: workbook(), apply: false }), { cookie, 'content-type': 'application/json' })).status, 403, 'then the page marker');
     const large = JSON.stringify({ source: workbook({ padding: 'x'.repeat(5 * 1024 * 1024) }), apply: false });
     const tooLarge = await post('/api/asset/import', large);
     assert.deepEqual([tooLarge.status, await tooLarge.json()], [413, { code: 'body_too_large', message: '导入文件不能超过 5 MB' }]);
@@ -217,3 +219,85 @@ test('POST /api/asset/import: login and page marker first, 5 MB body limit, prev
   });
 });
 const mkdirBlocked = (dataDir: string) => { writeFileSync(join(dataDir, BACKUP_DIR), ''); chmodSync(join(dataDir, BACKUP_DIR), 0o600); };
+
+/** importSource under a real lease whose write first runs `between`: what happens after the backup and before the write. */
+async function applyWith(w: ReturnType<typeof exampleLedger>, fingerprint: string, between: (raw: DatabaseSync, lease: SyncLease) => void) {
+  const database = openAssetDb(w.file, { mode: 'service' }), raw = new DatabaseSync(w.file);
+  const lease = await acquireSyncLock(database, { now: () => NOW });
+  const wrapped: SyncLease = { ...lease, write: run => { between(raw, lease); return lease.write(run); } };
+  try {
+    const current = await readLedger(database, false, NOW);
+    return await importSource(database, wrapped, current, { source: workbook(), apply: true, fingerprint }, { dbFile: w.file, now: () => NOW });
+  } finally { await lease.release().catch(() => undefined); raw.close(); database.close(); }
+}
+
+test('after the backup and before the write: a workbench re-import, a changed source ledger or a lost lease writes nothing', async t => {
+  const w = exampleLedger(t);
+  const { fingerprint } = await preview(w.store, workbook());
+  const before = w.state();
+  const reimport = (raw: DatabaseSync) => raw.prepare("UPDATE settings SET value = value || ' ' WHERE key = 'import-info'").run();
+  await assert.rejects(applyWith(w, fingerprint, reimport), { name: 'AssetConflict', code: 'reimported', message: LEDGER_REIMPORTED });
+  const afterReimport = w.state();
+  assert.deepEqual({ ...afterReimport, settings: afterReimport.settings.filter(item => item.key !== 'import-info') }, { ...before, settings: before.settings.filter(item => item.key !== 'import-info') });
+  const changed = w.state();
+  await assert.rejects(applyWith(w, fingerprint, raw => raw.prepare("UPDATE settings SET value = replace(value, '\"sheet\"', '\"sheet\" ') WHERE key = 'source-ledger'").run()), { message: '无法读取原有记录，未执行导入' });
+  const afterChange = w.state();
+  assert.deepEqual(afterChange.assets, changed.assets); assert.deepEqual(afterChange.snapshots, changed.snapshots);
+  assert.equal(afterChange.settings.find(item => item.key === IMPORT_FINGERPRINT_KEY), undefined, 'nothing of the import was written');
+  const lost = w.state();
+  await assert.rejects(applyWith(w, fingerprint, raw => raw.prepare('UPDATE sync_locks SET expires = 0').run()), { name: 'AssetConflict', code: 'lease_lost', message: LOCK_LOST });
+  assert.deepEqual(w.state(), lost);
+  // Each attempt made its backup (the copy before anything changed); none was pruned, nothing else was written.
+  assert.equal(w.backups().length, 3);
+});
+
+test('the backup runs in steps without holding the event loop, narrows an existing directory and only the newest backups stay', async t => {
+  const w = exampleLedger(t);
+  // About 24 MB of snapshots: the copy takes many steps.
+  const raw = new DatabaseSync(w.file);
+  try {
+    raw.exec('BEGIN');
+    const insert = raw.prepare('INSERT INTO snapshots(date, data) VALUES(?, ?)'), padding = 'x'.repeat(6_000);
+    for (let i = 0; i < 4_000; i++) insert.run(`pad-${i}`, JSON.stringify({ padding: padding + i }));
+    raw.exec('COMMIT');
+  } finally { raw.close(); }
+  mkdirSync(join(w.dataDir, BACKUP_DIR), { mode: 0o755 }); chmodSync(join(w.dataDir, BACKUP_DIR), 0o755);
+  // A synchronous copy (VACUUM INTO) gives no turn to the event loop until it ends; the online backup yields between steps.
+  let turns = 0, spinning = true;
+  const spin = () => { turns++; if (spinning) setImmediate(spin); };
+  setImmediate(spin);
+  const path = await backupDatabase(w.file, 'before-import-00000000-0000-4000-8000-000000000000.sqlite');
+  spinning = false;
+  assert.ok(turns > 3, `the event loop turned ${turns} times during the backup`);
+  assert.equal(statSync(join(w.dataDir, BACKUP_DIR)).mode & 0o777, 0o700, 'an existing directory is narrowed');
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+  const copy = new DatabaseSync(path, { readOnly: true });
+  try { assert.equal(copy.prepare("SELECT COUNT(*) AS count FROM snapshots WHERE date LIKE 'pad-%'").get()!.count, 4_000); } finally { copy.close(); }
+
+  // Older backups (and the one above) beyond the newest BACKUP_KEEP go once an import succeeds; other files stay.
+  const old = (n: number) => `before-import-00000000-0000-4000-8000-00000000000${n}.sqlite`;
+  for (let n = 1; n <= 6; n++) { writeFileSync(join(w.dataDir, BACKUP_DIR, old(n)), ''); utimesSync(join(w.dataDir, BACKUP_DIR, old(n)), new Date(NOW - n * 60_000), new Date(NOW - n * 60_000)); }
+  utimesSync(path, new Date(NOW - 10 * 60_000), new Date(NOW - 10 * 60_000));
+  writeFileSync(join(w.dataDir, BACKUP_DIR, 'notes.txt'), '');
+  const { fingerprint } = await preview(w.store, workbook());
+  const applied = await w.store.importSource({ source: workbook(), apply: true, fingerprint });
+  assert.equal(applied.preview, false);
+  const kept = w.backups().sort();
+  assert.equal(kept.filter(name => name.startsWith('before-import-')).length, BACKUP_KEEP);
+  assert.ok(!applied.preview && kept.includes(applied.import!.backupName));
+  assert.deepEqual(kept.filter(name => name.startsWith('before-import-00000000')), [old(1), old(2), old(3), old(4)].sort());
+  assert.ok(kept.includes('notes.txt'));
+});
+
+test('the page pauses the automatic sync while the import panel is mounted, and resumes however it unmounts', () => {
+  const gate = importGate();
+  assert.equal(gate.held, false);
+  const release = gate.hold();
+  assert.equal(gate.held, true);
+  release(); assert.equal(gate.held, false);
+  release(); assert.equal(gate.held, false, 'a second release does nothing');
+  // React StrictMode in development: mount, unmount, mount again; the panel stays held.
+  const first = gate.hold(); first(); const second = gate.hold();
+  assert.equal(gate.held, true);
+  second(); assert.equal(gate.held, false);
+});

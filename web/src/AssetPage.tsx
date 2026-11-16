@@ -14,6 +14,7 @@ import { AssetTrend } from './AssetTrend.tsx';
 import { CONNECTIONS_PATH, ConnectionsView, SIDE_EXCHANGES, pendingText, type CardExchange } from './AssetConnections.tsx';
 import { startRefreshLoop } from './asset-refresh-loop.ts';
 import { IMPORT_PATH, ImportPanel } from './AssetImport.tsx';
+import { importGate } from './asset-import-gate.ts';
 import { isExchangeMode, EXCHANGE_NAMES, type AssetHistoryView, type AssetLedgerView, type AssetPeriodView, type AssetState, type AssetWithdrawalsView, type HistoryRow } from '../../src/asset/views.ts';
 import type { Asset, Withdrawal } from '../../src/asset/types.ts';
 import {
@@ -68,20 +69,22 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
     void refreshLedger(); void refreshHistory(); void refreshWithdrawals();
   }, [version, refreshLedger, refreshHistory, refreshWithdrawals]);
   const writer = useWriter({ onExpired, onLedger: ledger.commit, onWritten: useCallback((committed: boolean) => { void state.refresh(); if (!committed) void refreshLedger(); void refreshHistory(); void refreshWithdrawals(); }, [state.refresh, refreshLedger, refreshHistory, refreshWithdrawals]) });
-  // The workbench's toggleImport: no sync starts while the import panel is open (dashboard.tsx importOpenRef).
-  const [importOpen, setImportOpen] = useState(false), importing = useRef(false);
-  const toggleImport = (open: boolean) => { importing.current = open; setImportOpen(open); if (open) writer.clear(); };
-  // The panel goes with the example notice (a workbench re-import made the ledger personal): the syncs resume.
+  // The workbench's toggleImport: no sync starts while the import panel is shown (dashboard.tsx importOpenRef, checked in
+  // its refresh(), as here: the loop's enabled() is only asked on page events, its minute timer calls refresh). The panel
+  // holds the gate while mounted, so leaving it any way resumes the syncs; the flag only says whether to show it.
+  const [importOpen, setImportOpen] = useState(false), [gate] = useState(importGate);
+  const toggleImport = (open: boolean) => { setImportOpen(open); if (open) writer.clear(); };
+  // The panel goes with the example notice (a workbench re-import made the ledger personal) and does not come back with it.
   const showsExample = ledger.data?.ledger?.dataKind === 'example';
-  useEffect(() => { if (!showsExample) { importing.current = false; setImportOpen(false); } }, [showsExample]);
+  useEffect(() => { if (!showsExample) setImportOpen(false); }, [showsExample]);
   // The workbench's startRefreshLoop: a sync every minute while the page is shown and online, and one when it comes back.
   const sync = useRef(writer.sync), stopSync = useRef(writer.stopSync);
   useEffect(() => { sync.current = writer.sync; stopSync.current = writer.stopSync; });
   useEffect(() => {
     if (!imported) return;
-    const loop = startRefreshLoop({ page: document, view: window, enabled: () => !document.hidden && navigator.onLine && !importing.current, onActivity: active => { if (!active) stopSync.current(); }, refresh: () => void sync.current(false) });
+    const loop = startRefreshLoop({ page: document, view: window, enabled: () => !document.hidden && navigator.onLine, onActivity: active => { if (!active) stopSync.current(); }, refresh: () => { if (!gate.held) void sync.current(false); } });
     return () => loop.stop();
-  }, [imported]);
+  }, [imported, gate]);
 
   const failed = (status: string) => status === 'error' || status === 'offline';
   if (!state.data) return <div className="asset-desk"><div className="page">{failed(state.status)
@@ -95,8 +98,9 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
   </div></div>;
 
   const info = state.data, data = ledger.data?.imported ? ledger.data : null;
-  const navigate = (next: View) => { setView(next); if (next !== 'connections') setConnecting(null); window.scrollTo({ top: 0 }); };
-  const connect = (exchange: CardExchange | 'aster') => { writer.clear(); setView('connections'); setConnecting(exchange === 'aster' ? null : exchange); window.scrollTo({ top: 0 }); };
+  // Another tab closes the import panel (the workbench's dialog would block the tabs instead).
+  const navigate = (next: View) => { setView(next); setImportOpen(false); if (next !== 'connections') setConnecting(null); window.scrollTo({ top: 0 }); };
+  const connect = (exchange: CardExchange | 'aster') => { writer.clear(); setView('connections'); setImportOpen(false); setConnecting(exchange === 'aster' ? null : exchange); window.scrollTo({ top: 0 }); };
   const pending = data?.ledger ? Object.values(data.ledger.connections).filter(item => !item.configured).length : 0;
   const counts: Partial<Record<View, string>> = { history: history.data?.imported ? String(history.data.periods.length) : undefined, withdrawals: data?.ledger ? String(data.ledger.withdrawals.length) : undefined, connections: pending ? pending + ' 待连接' : undefined };
   const readErrors = [state, ledger, view === 'withdrawals' ? withdrawals : history].filter(item => failed(item.status) && item.error).map(item => item.error!.message);
@@ -110,7 +114,7 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
   // The workbench's importNotice and its dialog (A-6), the dialog as a panel under the notice.
   const example = data?.ledger?.dataKind === 'example'
     ? <><div className="notice import-notice"><Info size={15} aria-hidden="true" /><div><strong>当前为示例数据，尚未导入你的原表</strong><p>这里的资产和金额是演示内容。导入原表后才会显示你的真实持仓和历史。</p></div><button type="button" className="button primary" disabled={writer.busy || importOpen} onClick={() => toggleImport(true)}>导入原表数据</button></div>
-      {importOpen ? <ImportPanel writer={writer} onClose={() => toggleImport(false)} /> : null}</> : null;
+      {importOpen ? <ImportPanel writer={writer} gate={gate} onClose={() => toggleImport(false)} /> : null}</> : null;
   return <div className="asset-desk">
     <div className="ledger-head">
       <nav className="ledger-tabs" aria-label="资产账本">{VIEWS.map(({ id, label }) => <button type="button" key={id} aria-current={view === id ? 'page' : undefined} onClick={() => navigate(id)}>{label}{counts[id] ? <span className="count-chip">{counts[id]}</span> : null}</button>)}</nav>

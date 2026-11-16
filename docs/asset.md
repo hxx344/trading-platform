@@ -242,11 +242,11 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
   - `src/asset/`：新增导入模块，补全 `source-ledger.ts` 的 `parseSource`，`store.ts` 加导入方法；
   - `src/http.ts`：新接口与它的请求体上限；
   - 资产页与样式、`deploy/package.sh`（打包脚本）、文档与测试。
-  - 库结构不变：只新增设置键 `source-import-hash`，以及数据目录下的 `asset-backups/`。
+  - 库结构不变：只新增设置键 `source-import-hash`，以及数据目录下的 `asset-backups/`（导入前的备份，只留最近 5 份）。
   - 划转、ADL、原油、期权、监控不变。
 - **回滚**：
   - 代码：`sudo bash install.sh --version v0.54.0`，不用改配置。旧版本照常读取导入后的账本，归档快照沿用已有的 `archived` 口径，`source-import-hash` 旧版不读。
-  - 数据（撤销某次导入）：停服务后，用 `asset-backups/before-import-<编号>.sqlite` 覆盖 `asset.sqlite`，并删除同目录的 `asset.sqlite-wal`、`-shm`，再启动。命令写在实施记录里。
+  - 数据（撤销某次导入，会丢掉导入之后的所有变化，见实施记录）：停服务后，用 `asset-backups/before-import-<编号>.sqlite` 覆盖 `asset.sqlite`，并删除同目录的 `asset.sqlite-wal`、`-shm`，再启动。命令写在实施记录里。
 
 
 ### A-6 实施记录
@@ -256,16 +256,16 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
   - `importPlan` 照搬（只把「现在」改成注入的时钟）：保留已同步的交易所余额、手动修改与当前汇率。
   - 接口 `POST /api/asset/import`，请求体 `{source, apply, fingerprint?}`，多余字段 400。预览返回 `{preview: true, summary, fingerprint}`；应用与「同一份文件已导入」返回账本视图加 `{preview: false, alreadyImported, import: {summary, backupName} | null}`（账本视图本身已有 `summary`，导入摘要放在 `import` 下）。
   - 报错：超过 5 MB 413「导入文件不能超过 5 MB」；格式不对 400 `invalid_input`；示例文件、账本已有原表数据等工作台的拒绝 400 `asset_rejected`（原文）；文件与预览时不同 409 `import_changed`；锁被占 409 `busy`；备份失败 503 `backup_failed`。
-  - 备份：`<数据目录>/asset-backups/before-import-<uuid>.sqlite`，目录 0700（不能是符号链接），文件先以 0600 独占创建再 `VACUUM INTO`，随后 fsync 并 `PRAGMA quick_check`；任一步失败删掉半成品、抛出备份失败，账本不动。
+  - 备份：`<数据目录>/asset-backups/before-import-<uuid>.sqlite`。目录 0700（不能是符号链接，已存在而权限更宽时收紧到 0700），文件先以 0600 独占创建，再用 node:sqlite 的在线备份 `backup()` 从单独的只读连接分步复制（每步 256 页约 1 MB，复制在线程池里进行，步间事件循环照常运转，ADL、划转等循环不被卡住），复制件改为普通日志模式（单个文件，没有 -wal/-shm），`PRAGMA quick_check` 通过后对文件和目录 fsync；任一步失败删掉半成品、返回备份失败，账本不动。导入在备份完成后才进入写入事务。导入成功后只保留按修改时间最新的 5 份 `before-import-*.sqlite`，更早的删除（目录里其他文件不动；导入失败时不清理）。
   - 写入在同步锁租约的事务里：再核对 `source-ledger` 仍是预览时那份、`import-info` 未变（`lease.write`），然后替换资产、写 `source-ledger`、`source-import-hash`、`fx`、`fx-status`、`last-attempt='0'`，旧快照与示例的原表期全部归档为 `archive-<批次>-<序号>`，最后用 `saveSnapshot` 写当天快照。
-- **页面**（`web/src/AssetImport.tsx`、`AssetPage.tsx`、`asset.css` 末节）：示例数据提示文案与「导入原表数据」按钮照工作台；点开后在提示下方原位展开面板，标题、说明、文件框、摘要块、帮助文字、「取消 / 导入并保留已有修改」照 `import-ledger-dialog.tsx`；客户端先查 5 MB 与 JSON 格式。请求走页面的写入器（同一时间只有一个写入或同步，401 回登录，409 与 5xx 后重读账本），超时按连接接口的 60 秒。面板打开期间跳过自动同步、「刷新资产」按钮置灰；账本不再是示例（导入成功，或被「从工作台导入」替换）时面板随提示一起收起，同步恢复。成功与重复导入的提示条文案照工作台的 toast。
-- **脚本**：`scripts/import-workbook.py` 照搬，只加了头部说明、缺参数时的用法提示，默认输出改为当前目录的 `imported-ledger.json`（工作台写进自己源码树的 `lib/`）。随安装包发布到 `<安装目录>/current/scripts/`，服务端不调用：它要 `openpyxl`，服务器上没有也不该为此装；用户复制到自己电脑上运行，再在页面选择输出文件。
+- **页面**（`web/src/AssetImport.tsx`、`AssetPage.tsx`、`asset.css` 末节）：示例数据提示文案与「导入原表数据」按钮照工作台；点开后在提示下方原位展开面板，标题、说明、文件框、摘要块、帮助文字、「取消 / 导入并保留已有修改」照 `import-ledger-dialog.tsx`；客户端先查 5 MB 与 JSON 格式。请求走页面的写入器（同一时间只有一个写入或同步，401 回登录，409 与 5xx 后重读账本），超时按连接接口的 60 秒。面板挂载期间跳过自动同步、「刷新资产」按钮置灰（`web/src/asset-import-gate.ts`：面板挂载时占用、卸载时释放，所以关闭、切到别的标签、账本不再是示例而收起，任何一种离开都恢复同步；切换标签与打开交易所连接时面板关闭）。成功与重复导入的提示条文案照工作台的 toast。
+- **脚本**：`scripts/import-workbook.py` 照搬，只加了头部说明、缺参数时的用法提示，默认输出改为当前目录的 `imported-ledger.json`（工作台写进自己源码树的 `lib/`）。随安装包发布到 `<安装目录>/current/scripts/`（默认安装目录 `/opt/trading-platform`，页面上按这个口径写），服务端不调用：它要 `openpyxl`，服务器上没有也不该为此装；用户复制到自己电脑上运行，再在页面选择输出文件。
 - **与工作台的差异**：
   - 应用必须带预览返回的指纹，文件在预览后变了就 409（工作台只凭重新发送的内容）；
-  - 备份改为 `VACUUM INTO` 加完整性检查，目录 `asset-backups/`（工作台 `db.backup()` 到 `.data/backups/` 后再 chmod）；备份失败明确 503 且不写入；
+  - 备份用 node:sqlite 的在线备份分步复制并做完整性检查，目录 `asset-backups/`，只留最近 5 份（工作台 `db.backup()` 到 `.data/backups/` 后再 chmod，不清理）；备份失败明确 503 且不写入；
   - 写入事务里再核对一次源账本与 `import-info`，挡住备份与写入之间的「从工作台导入」；
   - 请求体字段严格校验；弹窗改为原位面板；面板里多一行说明导入文件从哪来。
-- **撤销某次导入**（默认目录，root 执行）：
+- **撤销某次导入**（默认目录，root 执行）。注意：用备份覆盖会回到导入前的那一刻，导入之后的所有变化都会丢掉，包括同步来的余额、交易所连接与凭据的增删、出金与资金流登记、手动修改；只在导入本身有误、且之后没有需要保留的变化时这样做：
   ```bash
   systemctl stop trading-platform
   cd /var/lib/trading-platform
@@ -273,4 +273,5 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
   chown trading-platform: asset.sqlite && chmod 600 asset.sqlite
   systemctl start trading-platform
   ```
-- **测试**：`test/asset-source-import.test.ts`（解析规则；预览不写；应用后的资产、设置、归档与当天快照，备份文件权限与内容；同一文件再导入；示例文件、已有原表数据、指纹不符、缺指纹、多余字段的拒绝都不写；备份目录不可用时不写且锁已释放；锁被占时预览与应用都 409；导入与编辑同时发起时编辑被拒；HTTP 的登录顺序、5 MB 上限、其余接口仍 16 KB、各类报错码）。`deploy/test-install.sh` 加了发布包含转换脚本的检查。页面在替身后端走了一遍 1280 与 390 宽度：坏文件报错、预览摘要、取消、确认导入后提示消失并生成备份，面板打开期间没有同步请求。
+- **备份实测**（本机，Node 24.15）：49 MB 的库，在线备份含完整性检查共 0.29–0.35 秒，期间 5 毫秒定时器的最长间隔 7–16 毫秒；同一库用 `VACUUM INTO` 要 0.25–0.39 秒且全程阻塞事件循环。
+- **测试**：`test/asset-source-import.test.ts`（解析规则；预览不写；应用后的资产、设置、归档与当天快照，备份文件权限与内容；同一文件再导入；示例文件、已有原表数据、指纹不符、缺指纹、多余字段的拒绝都不写；备份目录不可用时不写且锁已释放；锁被占时预览与应用都 409；导入与编辑同时发起时编辑被拒；HTTP 的登录顺序与页面标记 403、5 MB 上限、其余接口仍 16 KB、各类报错码；备份之后、写入之前发生工作台重新导入、`source-ledger` 被改、租约过期时都不写入；约 24 MB 的库备份期间事件循环持续运转、已存在目录被收紧、只保留最新 5 份；页面同步暂停的占用与释放，含 StrictMode 的挂载、卸载、再挂载）。`deploy/test-install.sh` 加了发布包含转换脚本的检查。页面在替身后端走了一遍 1280 与 390 宽度：坏文件报错、预览摘要、取消、确认导入后提示消失并生成备份，面板打开期间没有同步请求。

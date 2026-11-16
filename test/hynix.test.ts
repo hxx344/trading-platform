@@ -142,7 +142,7 @@ test('市价腿自带价格界限：按跳动向内取整、只收紧基点界�
   // Selling the ADR: 41.1205 rounds up to 41.13 (band 41); buying the ordinary: 401.1756… rounds down to 401.17 (band 402.40).
   const tight = await h.ex.preview(bounded('41.1205', '401.175609756097560975'), SESSION);
   assert.deepEqual(tight.legs.map(item => item.priceBound), ['41.13', '401.17']);
-  assert.ok(tight.notes.includes('价格界限：Binance SKHYUSDT 卖出不低于 41.13，Binance SKHYNIXUSDT 买入不高于 401.17（规则阈值界限与 50 基点界限取较紧者）；每一批发送前任一腿盘口越过界限即不发送。'), tight.notes.join('\n'));
+  assert.ok(tight.notes.includes('价格界限：Binance SKHYUSDT 卖出不低于 41.13，Binance SKHYNIXUSDT 买入不高于 401.17（自带价格界限与 50 基点界限取较紧者）；每一批发送前任一腿盘口越过界限即不发送。'), tight.notes.join('\n'));
   // Looser than the band: the band stays.
   assert.deepEqual((await h.ex.preview(bounded('30', '500'), SESSION)).legs.map(item => item.priceBound), ['41', '402.4']);
   await assert.rejects(h.ex.preview(bounded('41.25', '401'), SESSION), code('price_moved'));
@@ -168,6 +168,28 @@ test('规则界限对每一批生效：首腿 IOC 限价取界限；后续批次
   assert.equal([...h.binance.orders.values()].filter(order => order.request.symbol === 'SKHYUSDT').length, 1, '第 2 批首腿没有发送');
   assert.deepEqual(view.legs.map(item => item.filledQuantity), ['1.21', '0.124']);
   assert.match(view.reason ?? '', /首腿成交 1\.21，计划 2\.42/);
+}));
+
+test('零成交的结束原因：发送前盘口越过界限记 price_moved，首腿 IOC 在界限上没成交记 lead_unfilled，交易所拒单不记', () => withHarness(async h => {
+  bindAccounts(h.ex);
+  const bounded = () => {
+    const intent = sameIntent();
+    intent.legs = [{ ...intent.legs[0]!, priceBound: '41.1205' }, { ...intent.legs[1]!, priceBound: '401.175609756097560975' }] as unknown as typeof intent.legs;
+    return intent;
+  };
+  let { jobId } = await previewAndConfirm(h, bounded());
+  h.binance.setBook('SKHYUSDT', { bid: '41.12' });
+  let view = await settle(h, jobId);
+  assert.deepEqual([view.status, view.endCode], ['failed', 'price_moved'], view.reason ?? '');
+  h.binance.setBook('SKHYUSDT', { bid: '41.20' });
+  ({ jobId } = await previewAndConfirm(h, bounded()));
+  h.binance.inject({ operation: 'place', mode: 'partial', filled: '0' });
+  view = await settle(h, jobId);
+  assert.deepEqual([view.status, view.endCode, view.legs[0]!.operation?.state], ['failed', 'lead_unfilled', 'canceled'], view.reason ?? '');
+  ({ jobId } = await previewAndConfirm(h, bounded()));
+  h.binance.inject({ operation: 'place', mode: 'reject' });
+  view = await settle(h, jobId);
+  assert.deepEqual([view.status, view.endCode], ['failed', null], view.reason ?? '');
 }));
 
 test('金额太小、跨所等金额：不足最小数量拒绝；跨所同一合约按各所步长折算后按比例完成', () => withHarness(async h => {

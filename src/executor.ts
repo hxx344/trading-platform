@@ -159,6 +159,11 @@ interface JobBase {
   id: string;
   status: JobStatus;
   reason: string | null;
+  /**
+   * Why a job that filled nothing ended, when a caller may act on it: 'price_moved' (a book past its bound before the first
+   * lead was sent) or 'lead_unfilled' (the protected market lead's IOC expired unfilled). Absent otherwise and in older rows.
+   */
+  endCode?: 'price_moved' | 'lead_unfilled';
   createdAt: number;
   deadlineAt: number;
   previewId: string;
@@ -324,7 +329,8 @@ function tighterBound(band: string, asked: string, side: OrderSide, tick: string
 /**
  * A leg's notional at the highest price the plan admits for it: the preview bound, the book's ask or the limit, whichever is
  * highest, so a sell is not undercounted at its lower bound. The market hedge carries no venue-enforced price limit, so its
- * real fill can still cost more than this.
+ * real fill can still cost more than this. A buy leg's own tighter bound (priceBound in the intent) counts it at that lower
+ * price, never under the preview ask.
  */
 const legNotional = (leg: Pick<PlannedLeg, 'quantity' | 'instrument' | 'priceBound' | 'quote' | 'limitPrice' | 'chaseCeiling'>): string =>
   mul(exposure(leg.quantity, leg.instrument), maxOf(leg.priceBound ?? '0', leg.quote.ask, leg.limitPrice ?? '0', leg.chaseCeiling ?? '0'));
@@ -472,8 +478,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     db.prepare('UPDATE operations SET state = ?, settled = ?, version = version + 1, json = ? WHERE id = ?').run(op.state, SETTLED.has(op.state) ? 1 : 0, JSON.stringify(op), op.id);
   }
   const stopRequested = (jobId: string): boolean => !!db.prepare('SELECT 1 FROM stop_requests WHERE job_id = ?').get(jobId);
-  function finish(job: Job, status: JobStatus, reason: string | null): void {
-    job.status = status; job.reason = reason; saveJob(job);
+  function finish(job: Job, status: JobStatus, reason: string | null, endCode?: Job['endCode']): void {
+    job.status = status; job.reason = reason;
+    if (endCode) job.endCode = endCode;
+    saveJob(job);
     // An unhedged or unverified exposure must not let a new job trade the same symbol on that account.
     if (status !== 'attention') db.prepare('DELETE FROM locks WHERE job_id = ?').run(job.id);
     event(job.id, 'job-finished', { status, reason });
@@ -721,7 +729,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
           : `先发送 ${legLabel(legs, 0)} 腿，成交确认后按其成交量发送 ${legLabel(legs, 1)} 对冲腿。`,
         ...(hynix ? [`按预览中间价估算：${legs.map(leg => `${legLabel(legs, leg.index)} ${leg.quantity} 约 ${mul(exposure(leg.quantity, leg.instrument), midOf(leg.quote.bid, leg.quote.ask)).replace(/(\.\d{2})\d+$/, '$1')} USDT`).join('，')}。`] : []),
         ...(intent.batches && (batches?.length ?? 1) < intent.batches.count ? [`持有量分不成 ${intent.batches.count} 批，按能分开的最多 ${batches?.length ?? 1} 批平仓。`] : []),
-        ...(bounded ? [`价格界限：${legs.map(leg => `${legLabel(legs, leg.index)} ${leg.orderSide === 'buy' ? '买入不高于' : '卖出不低于'} ${leg.priceBound}`).join('，')}（规则阈值界限与 ${slippageBps} 基点界限取较紧者）；每一批发送前任一腿盘口越过界限即不发送。`] : []),
+        ...(bounded ? [`价格界限：${legs.map(leg => `${legLabel(legs, leg.index)} ${leg.orderSide === 'buy' ? '买入不高于' : '卖出不低于'} ${leg.priceBound}`).join('，')}（自带价格界限与 ${slippageBps} 基点界限取较紧者）；每一批发送前任一腿盘口越过界限即不发送。`] : []),
         ...(batches && intent.batches ? [`分 ${batches.length} 批，首腿每批 ${hynix ? `${batches.join(' / ')}（${legs[0].symbol} 合约数量），对冲腿每批按计划比例` : `${batches.map(quantity => exposure(quantity, legs[0].instrument)).join(' / ')} 桶`}；一批首腿结束并补齐对冲后，等 ${intent.batches.intervalMs / 1000} 秒再发下一批。后续批次发送前盘口或持仓不满足条件时等待到截止，不追加；截止或停止时未发的批次不再发送。`] : []),
         legs[0].orderType === 'local-chase'
           ? `首腿本地追价：只挂单挂在${legs[0].orderSide === 'buy' ? '买一' : '卖一'}，盘口变化后撤单重挂（挂满 ${budgets.chaseRepriceMs / 1000} 秒后才改价），${legs[0].orderSide === 'buy' ? '最高' : '最低'}追到 ${legs[0].limitPrice ?? legs[0].priceBound}${legs[0].limitPrice ? '（自填界限）' : `（${slippageBps} 基点价格保护界限）`}${legs[0].chaseCeiling ? `，最高挂到 ${legs[0].chaseCeiling}` : ''}；挂单期间的成交每轮按比例对冲。首腿最多 ${budgets.chaseOrderLimit} 笔委托（各批合计）；连续 ${budgets.chaseFailureLimit} 次挂单失败或到截止时间时撤单结束追价，按实际成交对冲后结束；请求停止则撤单且不再补发对冲腿。发送前对冲腿盘口越过界限 ${legs[1].priceBound} 即不发送。`
@@ -1584,12 +1592,12 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         // A failed read may clear before the deadline; any other refusal ends the job before anything is sent.
         const retry = error instanceof ContractError && (error.code === 'venue_read_failed' || error.code === 'quote_window') || error instanceof ControlRefusal && error.transient;
         if (retry && now() < job.deadlineAt) { write(() => { const current = readJob(job.id); current.reason = reason; saveJob(current); }); return; }
-        write(() => finish(readJob(job.id), 'failed', reason)); return;
+        write(() => finish(readJob(job.id), 'failed', reason, error instanceof ContractError && error.code === 'price_moved' ? 'price_moved' : undefined)); return;
       }
       try { await sendLead(job, quote, 0, 0); }
       catch (error) {
         if (!(error instanceof ContractError) || error.code !== 'price_moved') throw error;
-        write(() => finish(readJob(job.id), 'failed', error.message.slice(0, 200))); return;
+        write(() => finish(readJob(job.id), 'failed', error.message.slice(0, 200), 'price_moved')); return;
       }
       holdOrphan(job.id);
       return;
@@ -1803,10 +1811,12 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (!isPair(job)) { settleRebalance(job); return; }
     const ops = opsOf(job.id), filled = (index: 0 | 1) => add('0', ...ops.filter(item => item.leg === index).map(item => item.filledQuantity));
     const leadExposure = exposure(filled(0), job.legs[0].instrument), hedgeExposure = exposure(filled(1), job.legs[1].instrument);
-    const lead = ops.filter(item => item.leg === 0).sort((a, b) => attemptOf(a) - attemptOf(b)).at(-1);
+    const leadsOf = ops.filter(item => item.leg === 0), lead = [...leadsOf].sort((a, b) => attemptOf(a) - attemptOf(b)).at(-1);
     const refused = ops.filter(item => item.leg === 1).sort((a, b) => attemptOf(a) - attemptOf(b)).at(-1);
     if (isZero(leadExposure) && isZero(hedgeExposure)) {
-      finish(job, stopRequested(job.id) ? 'stopped' : 'failed', `首腿未成交（${note ?? lead?.state ?? '未发送'}），未发送对冲腿`);
+      // A protected market lead is an IOC at its bound: every lead order expiring unfilled says the book was past it.
+      const expired = job.legs[0].orderType === 'market' && leadsOf.length > 0 && leadsOf.every(item => item.state === 'canceled' && isZero(item.filledQuantity));
+      finish(job, stopRequested(job.id) ? 'stopped' : 'failed', `首腿未成交（${note ?? lead?.state ?? '未发送'}），未发送对冲腿`, expired && !stopRequested(job.id) ? 'lead_unfilled' : undefined);
       return;
     }
     if (marketOfJob(job) === 'hynix') {
@@ -2023,7 +2033,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const job = readJob(id), ops = opsOf(id);
     const events = (db.prepare('SELECT type, at, json FROM events WHERE job_id = ? ORDER BY seq DESC LIMIT 40').all(id) as { type: string; at: number; json: string }[]).reverse().map(row => ({ type: row.type, at: row.at, ...JSON.parse(row.json) }));
     return {
-      id: job.id, market: marketOfJob(job), preset: !isPair(job) ? 'rebalance' as const : job.legs[0].venue === job.legs[1].venue ? 'same-exchange' as const : 'cross-exchange' as const,
+      id: job.id, endCode: job.endCode ?? null, market: marketOfJob(job), preset: !isPair(job) ? 'rebalance' as const : job.legs[0].venue === job.legs[1].venue ? 'same-exchange' as const : 'cross-exchange' as const,
       rebalance: job.rebalance ? { method: job.rebalance.method } : null, action: job.action, status: job.status, reason: job.reason, stopRequested: stopRequested(id), createdAt: job.createdAt, deadlineAt: job.deadlineAt, holdNewSends: job.holdNewSends,
       locked: !!db.prepare('SELECT 1 FROM locks WHERE job_id = ? LIMIT 1').get(id), acknowledgedAt: job.acknowledgedAt,
       /** A strategy create without an answer waits for adoption, a confirmation of not-created or a release. */

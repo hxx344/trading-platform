@@ -54,7 +54,7 @@ const SIZES: Record<string, string> = { SKHYUSDT: '2.42', SKHYNIXUSDT: '0.249' }
 class FakeExecutor implements RuleExecutor {
   previews: { intent: Intent; session: string }[] = [];
   confirms: { body: { previewId: string; requestId: string; confirmLive: boolean }; session: string }[] = [];
-  jobs = new Map<string, { status: string; legs: { symbol: string; filledQuantity: string; filledBarrels: string }[] }>();
+  jobs = new Map<string, { status: string; endCode?: string; legs: { symbol: string; filledQuantity: string; filledBarrels: string }[] }>();
   byRequest = new Map<string, string>();
   previewError: Error | null = null;
   loseAnswer = false;
@@ -88,9 +88,9 @@ class FakeExecutor implements RuleExecutor {
     return job;
   }
   /** Ends the latest job with these fills on the ADR and the ordinary share. */
-  finish(status: string, [adr, ordinary]: [string, string]) {
+  finish(status: string, [adr, ordinary]: [string, string], endCode?: string) {
     const id = [...this.jobs.keys()].at(-1)!;
-    this.jobs.set(id, { status, legs: [{ symbol: 'SKHYUSDT', filledQuantity: adr, filledBarrels: adr }, { symbol: 'SKHYNIXUSDT', filledQuantity: ordinary, filledBarrels: ordinary }] });
+    this.jobs.set(id, { status, ...(endCode ? { endCode } : {}), legs: [{ symbol: 'SKHYUSDT', filledQuantity: adr, filledBarrels: adr }, { symbol: 'SKHYNIXUSDT', filledQuantity: ordinary, filledBarrels: ordinary }] });
   }
 }
 
@@ -118,11 +118,11 @@ function goLive(rules: Rules, config: Record<string, unknown> = hynix()): string
 async function feed(r: Rig, rules: Rules, pair: Pair, times = 1): Promise<void> {
   for (let i = 0; i < times; i++) { r.now += 3_000; r.set(pair); await rules.tick(); }
 }
-async function openWith(r: Rig, ex: FakeExecutor, rules: Rules, status: string, fills: [string, string]) {
+async function openWith(r: Rig, ex: FakeExecutor, rules: Rules, status: string, fills: [string, string], endCode?: string) {
   const before = ex.confirms.length;
   await feed(r, rules, OPEN, 2);
   assert.equal(ex.confirms.length, before + 1, '两份新盘口后确认开仓');
-  ex.finish(status, fills);
+  ex.finish(status, fills, endCode);
   await rules.tick();
 }
 
@@ -458,4 +458,31 @@ test('阈值界限：两腿各分一半余量，按界限成交时组合价差�
   assert.equal(ex.previews.length, 1);
   assert.deepEqual([live(rules).failures, live(rules).phase], [0, 'idle']);
   assert.match(lastEvent(rules), /重新计数，不计失败/);
+}));
+
+test('任务因阈值界限零成交（发送前越过界限、首腿 IOC 在界限上没成交）重新计数：不计失败、不停用、开仓退回当日次数，平仓留在持仓中；其他零成交照旧计失败', () => withLive(async ({ r, ex, rules }) => {
+  goLive(rules);
+  for (const endCode of ['lead_unfilled', 'price_moved', 'lead_unfilled', 'price_moved']) {
+    await openWith(r, ex, rules, 'failed', ['0', '0'], endCode);
+    assert.deepEqual([live(rules).failures, live(rules).enabled, live(rules).phase, live(rules).opensToday, live(rules).job], [0, true, 'idle', 0, null], lastEvent(rules));
+    assert.match(lastEvent(rules), /重新计数，不计失败/);
+  }
+  // No wait after it: the next two fresh samples open again at once.
+  await openWith(r, ex, rules, 'completed', ['2.42', '0.249']);
+  assert.equal(live(rules).phase, 'holding');
+  // Closing: the same end codes keep the position and the rule, three times over.
+  for (const endCode of ['price_moved', 'lead_unfilled', 'price_moved']) {
+    const before = ex.confirms.length;
+    await feed(r, rules, CLOSE, 2);
+    assert.equal(ex.confirms.length, before + 1);
+    ex.finish('failed', ['0', '0'], endCode);
+    await rules.tick();
+    assert.deepEqual([live(rules).failures, live(rules).enabled, live(rules).phase], [0, true, 'holding'], lastEvent(rules));
+    assert.deepEqual(live(rules).held!.map(leg => leg.quantity), ['2.42', '0.249']);
+  }
+  // A venue refusal that filled nothing still counts.
+  await feed(r, rules, CLOSE, 2);
+  ex.finish('failed', ['0', '0']);
+  await rules.tick();
+  assert.deepEqual([live(rules).failures, live(rules).phase], [1, 'holding']);
 }));

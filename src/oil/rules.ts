@@ -502,8 +502,10 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     else if (outcome.kind === 'flat') { live.phase = 'idle'; live.held = null; live.failures = 0; }
     else {
       live.phase = tracked.action === 'open' ? 'idle' : 'holding';
-      live.retryAt = now() + RETRY_MS;
       if (tracked.action === 'open') giveBack(live, tracked.day);
+      // A job that ended on the threshold bound counts the samples again, like a preview refused for it: no wait, no failure.
+      if (outcome.recount) { event(rule.state, text); save(rule); restart(rule.id); return; }
+      live.retryAt = now() + RETRY_MS;
       // A job stopped from the page is a person stepping in: the rule stops too. A job the venue refused counts as a failure,
       // so a venue that keeps refusing disables the rule instead of being tried every minute.
       if (job.status === 'stopped') { live.enabled = false; live.reason = '任务被手动停止，规则已停用'; text += '；任务是手动停止的，规则已停用'; }

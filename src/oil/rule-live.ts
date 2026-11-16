@@ -60,7 +60,8 @@ export interface RuleJobLeg { symbol: string; filledQuantity: string; filledBarr
 export interface RuleExecutor {
   preview(intent: unknown, session: string): Promise<RulePlan>;
   confirm(body: unknown, session: string): { duplicate: boolean; job: { id: string } };
-  jobView(id: string): { status: string; reason?: string | null; legs: readonly RuleJobLeg[] };
+  /** endCode: why a job that filled nothing ended, when it was the price bound ('price_moved', 'lead_unfilled'). */
+  jobView(id: string): { status: string; reason?: string | null; endCode?: string | null; legs: readonly RuleJobLeg[] };
   /** The job a confirm of this preview with this request id created for this session, or null; never creates one. */
   confirmedJob(requestId: string, previewId: string, session: string): string | null;
 }
@@ -149,7 +150,7 @@ export const sameAccount = (a: AccountRef, b: AccountRef): boolean => a.accountK
 export type Outcome =
   | { kind: 'hold'; held: HeldLeg[]; message: string }
   | { kind: 'flat'; message: string }
-  | { kind: 'revert'; message: string }
+  | { kind: 'revert'; message: string; recount?: true }
   | { kind: 'review'; message: string };
 
 const STATUS_NAMES: Record<string, string> = { completed: '已完成', failed: '失败', stopped: '已停止', attention: '转人工' };
@@ -158,7 +159,7 @@ const STATUS_NAMES: Record<string, string> = { completed: '已完成', failed: '
  * What a finished job leaves the rule with; anything that does not add up goes to review. Oil legs must fill equal barrels;
  * hynix legs differ in units by design and the executor hedges them in the planned proportion, so both must just have filled.
  */
-export function settleJob(job: { status: string; reason?: string | null; legs: readonly RuleJobLeg[] }, tracked: Tracked, held: readonly HeldLeg[] | null, config: Pick<RuleConfig, 'market' | 'direction'>): Outcome {
+export function settleJob(job: { status: string; reason?: string | null; endCode?: string | null; legs: readonly RuleJobLeg[] }, tracked: Tracked, held: readonly HeldLeg[] | null, config: Pick<RuleConfig, 'market' | 'direction'>): Outcome {
   const label = `${actionName(tracked.action)}任务 ${tracked.id}`, status = STATUS_NAMES[job.status] ?? job.status;
   const review = (why: string): Outcome => ({ kind: 'review', message: `${label}${status}，${why}；规则已停用，请在执行进度与交易所核对后重置` });
   const symbols = RULE_LEGS[config.market], oil = config.market === 'oil';
@@ -169,6 +170,9 @@ export function settleJob(job: { status: string; reason?: string | null; legs: r
   const none = filled.every(quantity => cmp(quantity, ZERO) === 0);
   if (job.status !== 'completed') {
     // failed or stopped with nothing filled is a job that sent nothing or whose lead IOC did not fill: try again later.
+    // The books moved past the threshold bound (before the first send, or the lead's IOC expired at it): the same as a preview
+    // refused for it, so the samples are counted again and no failure is counted (docs/hynix.md 8.2).
+    if (job.status === 'failed' && none && (job.endCode === 'price_moved' || job.endCode === 'lead_unfilled')) return { kind: 'revert', recount: true, message: `${label}${status}，两腿都没有成交（${job.endCode === 'price_moved' ? '盘口越过阈值界限，未发送' : '首腿在阈值界限上没有成交'}）；重新计数，不计失败` };
     if (job.status !== 'attention' && none) return { kind: 'revert', message: `${label}${status}，两腿都没有成交${job.reason ? `（${job.reason.slice(0, 120)}）` : ''}；${RETRY_MS / 1000} 秒后再判断` };
     return review(none ? '任务转人工' : `已成交 ${both(filled)}`);
   }

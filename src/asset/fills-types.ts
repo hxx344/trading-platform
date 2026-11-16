@@ -3,6 +3,8 @@
 import type { PositionsStatus } from './positions-types.ts';
 
 /** Fixed perpetual bases per arbitrage market; each market is read, cached and replayed separately. */
+/** The scope error of a credential that failed the read-only check (fills-service.ts); the page matches it exactly. */
+export const FILLS_PERMISSION = '此连接不是只读 API Key，已停止读取成交并清除缓存；请换成只读 Key 后重新连接';
 export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'] } as const;
 export type FillMarket = keyof typeof FILL_MARKETS;
 export type FillBase = (typeof FILL_MARKETS)[FillMarket][number];

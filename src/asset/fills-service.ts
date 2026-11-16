@@ -25,14 +25,15 @@ import { PositionsPermissionError } from './positions-values.ts';
 import { fillsSupported, readFills } from './fills-readers.ts';
 import type { FillsRequest } from './fills-readers.ts';
 import { FillConflict, fillsNewestFirst, mergeFills, replayFills } from './fills-replay.ts';
-import { FILL_MARKETS } from './fills-types.ts';
+import { FILL_MARKETS, FILLS_PERMISSION } from './fills-types.ts';
 import type { FillMarket, FillsScope, HubFills, ReadFill } from './fills-types.ts';
 
 const TTL = 5 * 60_000, RETRY = 60_000, IDLE = 15 * 60_000, DEADLINE = 45_000, OVERLAP = 10 * 60_000;
 const SKEW_RETRY = 30_000, MAX_AUTO_RETRIES = 10;
 export const FILLS_FAILED = '成交读取失败，请检查连接、读取权限及服务器时间；已保留上次数据';
 /** A-5 review: the key has write permission. Fixed text; the stored fills of the account are dropped. */
-export const FILLS_PERMISSION = '此连接不是只读 API Key，已停止读取成交并清除缓存；请换成只读 Key 后重新连接';
+// Shared with the page (fills-types.ts has no server dependencies), which shows its own wording for it.
+export { FILLS_PERMISSION };
 const CONFLICT = '成交记录存在冲突，暂时无法更新';
 const UNSUPPORTED: Record<FillMarket, string> = { oil: '此交易所或产品范围暂不支持原油成交读取', hynix: '此交易所或产品范围暂不支持海力士成交读取' };
 type ReadPositions = (credentials: Credentials, scope: string, signal: AbortSignal, fetcher: Fetcher) => Promise<Position[]>;
@@ -252,7 +253,12 @@ export function createFillsService(options: FillsServiceOptions = {}) {
         }
         const denied = error instanceof PositionsPermissionError;
         if (denied) {
-          // Every stored scope of this credential goes, not only this one; nothing read with it is kept or shown.
+          // Every stored scope of this credential goes, not only this one: the rows of every market and scope, and the
+          // in-memory history of its other entries, so a later failure of those entries cannot save the old fills back.
+          for (const [other, item] of entries) {
+            if ((JSON.parse(other) as [string])[0] !== account.key || item.revision !== entry.revision) continue;
+            item.cacheInvalidated = true; item.raw = []; item.cursor = null; item.historyCursor = null;
+          }
           entry.cacheInvalidated = true; entry.raw = []; entry.cursor = null; entry.historyCursor = null;
           forgetAccount(database, account.key, entry.revision);
         }

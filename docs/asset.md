@@ -197,8 +197,10 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
   - 本服务的监控详情没有右侧栏，关联交易放在图表下方。
 - **与工作台不同的安全口径**（审查后修改）：持仓快照的只读权限校验失败（Binance 任一写权限或缺读权限、Bybit `readOnly≠1`、OKX `perm≠read_only` 或 config 不是单条）时：
   - 读取器抛带类型的 `PositionsPermissionError`（`code` 为 `POSITIONS_PERMISSION`，文案仍是 `POSITIONS_FAILED`）；
-  - 成交刷新随即中止，不再用该凭据读 85 天历史，并删除该凭据在 `fill_cache` 里所有市场、所有范围的行；
-  - 该范围回应 `status: 'error'`，配固定文案 `FILLS_PERMISSION`，不回显上游内容，与网络失败的 `FILLS_FAILED` 区分；
+  - 成交刷新随即中止，不再用该凭据读 85 天历史，并删除该凭据在 `fill_cache` 里所有市场、所有范围的行；同一凭据（同一 revision）其它市场、其它范围的内存条目同时作废并清空历史与游标，之后它们遇到网络失败也不会把旧成交写回；
+  - 该范围回应 `status: 'error'`，配固定文案 `FILLS_PERMISSION`，不回显上游内容，与网络失败的 `FILLS_FAILED` 区分；监控页成交面板据此提示到资产页更换只读 Key；
+  - 持仓页对权限校验失败的 Key 仍显示上次完整快照（与工作台一致）。这与成交清缓存不对称，属有意保留；
+  - Aster、Variational、Lighter 没有权限接口，不走这条路径；
   - 工作台 `hub-fills.ts` 第 189–192 行把它当普通快照失败，仍会读历史。
 - **Binance 请求权重估算**（按读取器实际发出的请求估算，未在真实账户上实测）：
   - 本轮盈亏统计：每个持仓约 455 / 5 分钟（85 天成交、资金费与收入分段读取）；

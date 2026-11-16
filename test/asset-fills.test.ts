@@ -416,9 +416,10 @@ test('position read failure still exposes history with unknown replay and does n
 
 test('a key that fails the read-only check reads no history, drops every stored scope of the credential and says so', async t => {
   const f = fixture(); t.after(() => f.database.close()); await f.save();
-  let denied = false, historyReads = 0;
-  const service = createFillsService({ now: () => clock, read: async () => { if (denied) throw new PositionsPermissionError(); return [held('1')]; },
-    fills: async () => { historyReads++; return [fill('1', at - minute - 1, 'buy', '1')]; } });
+  let denied = false, offline = false, historyReads = 0, offlineReads = 0;
+  const service = createFillsService({ now: () => clock,
+    read: async () => { if (offline) { offlineReads++; throw new Error('network'); } if (denied) throw new PositionsPermissionError(); return [held('1')]; },
+    fills: async () => { if (offline) throw new Error('network'); historyReads++; return [fill('1', at - minute - 1, 'buy', '1')]; } });
   let clock = at;
   await service.read(() => f.database, f.unseal); await service.idle();
   await service.read(() => f.database, f.unseal, 'hynix'); await service.idle();
@@ -432,6 +433,12 @@ test('a key that fails the read-only check reads no history, drops every stored 
   const result = scope(await service.read(() => f.database, f.unseal));
   assert.equal(result.status, 'error'); assert.equal(result.error, FILLS_PERMISSION); assert.deepEqual(result.fills, []);
   assert.equal(await rows(), 0, 'stored fills of every market and scope of that credential are deleted');
+  // The hynix scope still has an in-memory entry from before; its next refresh fails on the network and must not write
+  // the old fills back.
+  offline = true; clock += minute;
+  await service.read(() => f.database, f.unseal, 'hynix'); await service.idle();
+  assert.ok(offlineReads > 0, 'the hynix scope refreshed'); assert.equal(await rows(), 0, 'a network failure of another market does not restore the deleted cache');
+  offline = false;
   // A process restart has nothing to restore either.
   const restarted = createFillsService({ now: () => clock, read: async () => { throw new PositionsPermissionError(); }, fills: async () => { historyReads++; return []; } });
   const cold = scope(await restarted.read(() => f.database, f.unseal)); await restarted.idle();

@@ -394,7 +394,8 @@ Anthropic 详情的成交标记与关联持仓不做（A-5 范围外，登记在
 
 **读取节奏**：
 
-- 成交：读取成功且有范围在读（pending）时每 5 秒跟读一次，连续最多 36 次后回到每 5 分钟；读取失败或不再 pending 立即回到每 5 分钟；每次例行读取重新计数。规则同工作台 `createFillsPoller`（FILLS_FOLLOW_UP_MS / FILLS_MAX_FOLLOW_UPS / FILLS_REFRESH_MS），写成纯函数 `followUpStep`。
+- 成交：读取成功且有范围在读（pending）时每 5 秒跟读一次，连续最多 36 次后回到每 5 分钟；读取失败或不再 pending 立即回到每 5 分钟；每次例行读取重新计数。计数规则同工作台 `createFillsPoller`（FILLS_FOLLOW_UP_MS / FILLS_MAX_FOLLOW_UPS / FILLS_REFRESH_MS），写成纯函数 `followUpStep`；例行周期从最后一次读取起算（工作台从启动起固定每 5 分钟，与跟读并行）。
+- 某范围回应 `FILLS_PERMISSION`（连接不是只读 Key，资产账本已停读并清缓存）时，成交面板状态行不计入「部分账户失败」，改显示「该连接不是只读 Key，成交已停止读取，请在资产页更换为只读 Key」（`FILLS_PERMISSION_TEXT`）。
 - 持仓：每 60 秒读一次；cycle 在读或读取失败时每 25 秒一次（工作台 POSITIONS_FOLLOW_UP_MS）。
 - 两者失败时都保留上次数据并注明。服务没有资产账本（404）时：
   - 成交面板只显示一行说明，图上不画标记；

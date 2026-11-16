@@ -3,11 +3,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  FILLS_MAX_FOLLOW_UPS, FILLS_STALE_AFTER_MS, FOLLOW_UP_IDLE, MAX_FILL_ITEMS, classifyFill, emptyFillsView, fillItems, fillsStatusText, followUpStep, groupTradeEvents,
+  FILLS_MAX_FOLLOW_UPS, FILLS_PERMISSION_TEXT, FILLS_STALE_AFTER_MS, FOLLOW_UP_IDLE, MAX_FILL_ITEMS, classifyFill, emptyFillsView, fillItems, fillsStatusText, followUpStep, groupTradeEvents,
   spreadTradeMarkers, summarizeTradeEvents, tradeDetailLines, tradeMarkers, type FillItem, type FillsView, type FollowUpState, type TradeEvent,
 } from '../web/src/monitor-trades.ts';
 import type { Point } from '../web/src/monitor-history.ts';
-import type { Fill, HubFills } from '../src/asset/fills-types.ts';
+import { FILLS_PERMISSION, type Fill, type HubFills } from '../src/asset/fills-types.ts';
 
 const fill = (overrides: Partial<FillItem> = {}): FillItem => ({
   key: 'asset|binance|account|um|1', sourceId: 'asset', source: '资产账本', exchangeId: 'binance', exchange: 'Binance',
@@ -91,6 +91,11 @@ test('coverage states keep the actual source time and distinguish stale and part
   const result = fillsStatusText(failed, String);
   for (const label of ['部分账户失败', '保留上次成功数据', '已截断', '最近 85 天', '仅支持 Binance、Bybit、OKX', view().coverage[0]!.fetchedAt!]) assert.ok(result.includes(label), label);
   assert.equal(result.includes(view().generatedAt!), false, 'response generation never refreshes stale source time');
+  const refused = { ...view().coverage[0]!, status: 'error' as const, fetchedAt: null, error: FILLS_PERMISSION };
+  const denied = fillsStatusText(view({ items: [], coverage: [refused] }), String);
+  assert.ok(denied.includes(FILLS_PERMISSION_TEXT) && !denied.includes('部分账户失败'), 'a refused key says what to do, not a transient failure');
+  const mixed = fillsStatusText(view({ coverage: [refused, { ...view().coverage[0]!, status: 'error', error: '成交读取失败' }] }), String);
+  assert.ok(mixed.includes('部分账户失败（1 个范围）') && mixed.includes(FILLS_PERMISSION_TEXT));
   assert.match(fillsStatusText(view({ pending: true }), String), /^已显示上次成交，后台更新中…/);
   assert.match(fillsStatusText(view({ pending: true, items: [], coverage: [{ ...view().coverage[0]!, status: 'loading', fetchedAt: null }] }), String), /^读取中…/);
 });

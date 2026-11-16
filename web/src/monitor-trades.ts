@@ -9,6 +9,7 @@
 // 与工作台的差异：只有本服务一个来源（工作台汇总多个 Asset 项目），所以来源固定为「资产账本」、不逐字段校验来源格式
 // （数据来自本服务自己的接口）；Anthropic 的执行任务归属（execution / attribution / orderId）不做（A-5 不做 anthropic）。
 import { decimalDifference, oilSpread } from '../../src/vendor/oil-market.mjs';
+import { FILLS_PERMISSION } from '../../src/asset/fills-types.ts';
 import type { FillMarket, HubFills } from '../../src/asset/fills-types.ts';
 import type { PositionsStatus } from '../../src/asset/positions-types.ts';
 import type { Point } from './monitor-history.ts';
@@ -388,6 +389,8 @@ export function tradeDetailLines(marker: SpreadTradeMarker, formatTime: (time: n
     }),
   ];
 }
+/** Shown instead of a failure count when the ledger refused a key that is not read-only (FILLS_PERMISSION). */
+export const FILLS_PERMISSION_TEXT = '该连接不是只读 Key，成交已停止读取，请在资产页更换为只读 Key';
 export function fillsStatusText(view: FillsView, formatTime: (time: string) => string, sources = '仅支持 Binance、Bybit、OKX') {
   const state = {
     missing: '本服务没有配置资产账本', loading: '读取中…', unavailable: '成交服务暂不可用，稍后自动重试',
@@ -395,12 +398,15 @@ export function fillsStatusText(view: FillsView, formatTime: (time: string) => s
     ok: view.pending ? view.coverage.some(scope => scope.fetchedAt) ? '已显示上次成交，后台更新中…' : '读取中…' : '成交已更新',
   }[view.status];
   const failed = view.coverage.filter(scope => ['stale', 'error'].includes(scope.status)).length;
+  // A refused (not read-only) key is not a transient failure: say what to do instead of counting it as one.
+  const denied = view.coverage.filter(scope => scope.status === 'error' && scope.error === FILLS_PERMISSION).length;
   const times = view.coverage.map(scope => scope.fetchedAt).filter((time): time is string => !!time).sort();
   // generatedAt is the response time, not the time a stale venue was successfully read.
   const through = times[0] ?? view.generatedAt;
   return [state, through ? `截至 ${formatTime(through)} 北京时间` : null,
     view.retained ? '刷新失败，保留上次成功数据' : null,
-    failed ? `部分账户失败（${failed} 个范围）` : null,
+    failed > denied ? `部分账户失败（${failed - denied} 个范围）` : null,
+    denied ? FILLS_PERMISSION_TEXT : null,
     view.incomplete && view.status === 'ok' ? '覆盖不完整，部分成交开平未知或数据陈旧' : null,
     view.truncated ? '成交记录已截断' : null,
     sources, '最近 85 天',

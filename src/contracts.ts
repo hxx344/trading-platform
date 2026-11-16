@@ -15,8 +15,17 @@ export type Venue = typeof VENUES[number];
 export const VENUE_NAMES: Record<Venue, string> = { binance: 'Binance', bybit: 'Bybit' };
 /** Oil contracts each first-batch venue lists in the baseline catalog; ANT is read-only on Binance and absent on Bybit. */
 export const OIL_SYMBOLS = ['CLUSDT', 'BZUSDT'] as const;
-export const VENUE_EXECUTION_SYMBOLS: Record<Venue, readonly string[]> = { binance: OIL_SYMBOLS, bybit: OIL_SYMBOLS };
-export const VENUE_READ_SYMBOLS: Record<Venue, readonly string[]> = { binance: [...OIL_SYMBOLS, 'ANTHROPICUSDT'], bybit: OIL_SYMBOLS };
+/** SK hynix: the ADR (SKHYUSDT) and the ordinary share (SKHYNIXUSDT); one ordinary share is ten ADRs (docs/hynix.md). */
+export const HYNIX_SYMBOLS = ['SKHYUSDT', 'SKHYNIXUSDT'] as const;
+export const HYNIX_ADR = 'SKHYUSDT', HYNIX_ORDINARY = 'SKHYNIXUSDT';
+export type Market = 'oil' | 'hynix';
+export const MARKET_SYMBOLS: Record<Market, readonly string[]> = { oil: OIL_SYMBOLS, hynix: HYNIX_SYMBOLS };
+export const MARKET_NAMES: Record<Market, string> = { oil: '原油', hynix: '海力士' };
+/** The market of a contract; jobs never mix them, so a job's market is its first leg's. */
+export const marketOfSymbol = (symbol: string): Market => (HYNIX_SYMBOLS as readonly string[]).includes(symbol) ? 'hynix' : 'oil';
+const EXECUTION_SYMBOLS = [...OIL_SYMBOLS, ...HYNIX_SYMBOLS];
+export const VENUE_EXECUTION_SYMBOLS: Record<Venue, readonly string[]> = { binance: EXECUTION_SYMBOLS, bybit: EXECUTION_SYMBOLS };
+export const VENUE_READ_SYMBOLS: Record<Venue, readonly string[]> = { binance: [...EXECUTION_SYMBOLS, 'ANTHROPICUSDT'], bybit: EXECUTION_SYMBOLS };
 export const ACCOUNT_MODES: Record<Venue, readonly string[]> = { binance: ['standard', 'portfolio-margin'], bybit: ['unified'] };
 export type Environment = 'simulated' | 'mainnet';
 
@@ -197,7 +206,8 @@ export const orderSideOf = (action: Action, side: PositionSide): OrderSide => (a
  * One leg as asked. Exactly one of quantity (native contract quantity) and barrels is set; barrels are converted to the
  * leg's native quantity at preview from the venue's contract size and step, so the page never has to know either.
  */
-export interface LegIntent { venue: Venue; symbol: string; side: PositionSide; quantity: string | null; barrels: string | null; orderType: LegOrderType; limitPrice: string | null }
+/** Each leg names quantity, barrels (oil) or notional (hynix, USDT); the preview turns barrels and notional into quantity. */
+export interface LegIntent { venue: Venue; symbol: string; side: PositionSide; quantity: string | null; barrels: string | null; notional?: string | null; orderType: LegOrderType; limitPrice: string | null }
 /**
  * cross-exchange: one contract (the top-level symbol), two venues, opposite sides. same-exchange: one venue, one BZUSDT and
  * one CLUSDT leg, opposite sides; each leg names its contract and there is no top-level symbol (null here).
@@ -207,28 +217,34 @@ export const PRESETS = ['cross-exchange', 'same-exchange'] as const;
 export type Preset = typeof PRESETS[number];
 /** The lead split into count parts sent intervalMs apart, each hedged before the next; absent is one batch. */
 export interface BatchIntent { count: number; intervalMs: number }
-export interface Intent { market: 'oil'; preset: Preset; symbol: string | null; action: Action; timeoutMs: number; maxSlippageBps: number | null; legs: [LegIntent, LegIntent]; batches?: BatchIntent }
+export interface Intent { market: Market; preset: Preset; symbol: string | null; action: Action; timeoutMs: number; maxSlippageBps: number | null; legs: [LegIntent, LegIntent]; batches?: BatchIntent }
 export const MAX_SLIPPAGE_BPS = 1_000;
 export const MAX_BATCHES = 20;
 export const MAX_BATCH_INTERVAL_MS = 600_000;
-/** Two oil legs with opposite sides: one contract on two venues, or BZ against CL on one venue. */
+/**
+ * Two legs of one market with opposite sides: one contract on two venues, or the market's two contracts on one venue (oil:
+ * BZ against CL; hynix: the ADR against the ordinary share, docs/hynix.md).
+ */
 export function parseIntent(value: unknown): Intent {
   const raw = exactKeys(value, ['market', 'preset', 'action', 'timeoutMs', 'legs'], ['symbol', 'maxSlippageBps', 'batches']);
-  oneOf(raw.market, ['oil'] as const, '品种');
+  const market = oneOf(raw.market, ['oil', 'hynix'] as const, '品种'), hynix = market === 'hynix';
+  const symbols = MARKET_SYMBOLS[market], symbolName = hynix ? '海力士合约' : '原油合约';
   const preset = oneOf(raw.preset, PRESETS, '交易预设'), same = preset === 'same-exchange';
   // The cross-exchange body keeps its required top-level symbol; a same-exchange one names its contracts on the legs.
   if (!same && !Object.hasOwn(raw, 'symbol')) reject('missing_field', '缺少字段：symbol');
   if (same && raw.symbol !== undefined) reject('unknown_field', '同所预设的合约写在每条腿上，不设顶层 symbol');
-  const symbol = same ? null : oneOf(raw.symbol, OIL_SYMBOLS, '原油合约');
+  const symbol = same ? null : oneOf(raw.symbol, symbols, symbolName);
   const action = oneOf(raw.action, ['open', 'close'] as const, '开平仓操作');
   if (!Array.isArray(raw.legs) || raw.legs.length !== 2) reject('leg_count', same ? '同所双腿需要正好两条腿' : '跨所双腿需要正好两条腿');
   const legs = (raw.legs as unknown[]).map(item => {
-    const leg = exactKeys(item, same ? ['venue', 'symbol', 'side', 'orderType'] : ['venue', 'side', 'orderType'], ['quantity', 'barrels', 'limitPrice']);
+    // Oil sizes by barrels, hynix by USDT notional; each market refuses the other's field as unknown.
+    const leg = exactKeys(item, same ? ['venue', 'symbol', 'side', 'orderType'] : ['venue', 'side', 'orderType'], ['quantity', hynix ? 'notional' : 'barrels', 'limitPrice']);
     const venue = oneOf(leg.venue, VENUES, '交易所');
-    const legSymbol = symbol ?? oneOf(leg.symbol, OIL_SYMBOLS, '原油合约');
+    const legSymbol = symbol ?? oneOf(leg.symbol, symbols, symbolName);
     if (!VENUE_EXECUTION_SYMBOLS[venue].includes(legSymbol)) reject('venue_symbol', `${VENUE_NAMES[venue]} 不支持 ${legSymbol} 执行`);
-    if (leg.quantity == null && leg.barrels == null) reject('missing_field', '缺少字段：quantity（或按桶数下单的 barrels）');
-    if (leg.quantity != null && leg.barrels != null) reject('quantity_or_barrels', '每腿数量与桶数只能填一个');
+    const sized = hynix ? leg.notional : leg.barrels;
+    if (leg.quantity == null && sized == null) reject('missing_field', hynix ? '缺少字段：quantity（或按名义金额下单的 notional）' : '缺少字段：quantity（或按桶数下单的 barrels）');
+    if (leg.quantity != null && sized != null) reject('quantity_or_barrels', hynix ? '每腿数量与名义金额只能填一个' : '每腿数量与桶数只能填一个');
     const orderType = oneOf(leg.orderType, ['market', 'limit', 'chase', 'local-chase'] as const, '下单方式');
     // A local chase may name its own chase bound (highest buy, lowest sell); without one the preview bound is used.
     const limitPrice = leg.limitPrice === undefined || leg.limitPrice === null ? null : decimalField(leg.limitPrice, orderType === 'local-chase' ? '追价界限' : '限价');
@@ -236,16 +252,24 @@ export function parseIntent(value: unknown): Intent {
     return {
       venue, symbol: legSymbol, side: oneOf(leg.side, ['long', 'short'] as const, '仓位方向'),
       quantity: leg.quantity == null ? null : decimalField(leg.quantity, '每腿数量'), barrels: leg.barrels == null ? null : decimalField(leg.barrels, '每腿桶数'),
+      ...(hynix ? { notional: leg.notional == null ? null : decimalField(leg.notional, '每腿名义金额') } : {}),
       orderType, limitPrice,
     };
   }) as [LegIntent, LegIntent];
   if (same) {
     if (legs[0].venue !== legs[1].venue) reject('cross_venue', '同所双腿须选择同一个交易所');
-    if (legs[0].symbol === legs[1].symbol) reject('same_symbol', '同所双腿须一腿 BZUSDT、一腿 CLUSDT');
+    if (legs[0].symbol === legs[1].symbol) reject('same_symbol', hynix ? '同所双腿须一腿 SKHYUSDT、一腿 SKHYNIXUSDT' : '同所双腿须一腿 BZUSDT、一腿 CLUSDT');
   } else if (legs[0].venue === legs[1].venue) reject('same_venue', '跨所双腿须选择两个不同交易所');
   if (legs[0].side === legs[1].side) reject('same_side', '双腿方向必须相反');
   if ((legs[0].barrels === null) !== (legs[1].barrels === null)) reject('quantity_mode', '两腿须同时按数量或同时按桶数下单');
   if (legs[0].barrels !== null && cmp(legs[0].barrels, legs[1].barrels as string) !== 0) reject('unbalanced', `两腿桶数不相等：${legs[0].barrels} 与 ${legs[1].barrels}`);
+  if (hynix) {
+    const [a, b] = legs.map(leg => leg.notional ?? null);
+    if ((a === null) !== (b === null)) reject('quantity_mode', '两腿须同时按数量或同时按名义金额下单');
+    if (a !== null && cmp(a, b as string) !== 0) reject('unbalanced', `两腿名义金额不相等：${a} 与 ${b}`);
+    // Quantities may differ only to close what is held; an open sized per leg could put almost all of it on one side.
+    if (action === 'open' && a === null) reject('open_requires_notional', '海力士开仓须按每腿相同的名义金额下单；按各腿数量只用于平仓');
+  }
   // The hedge must go out at once for whatever the lead filled; a strategy that may rest or pause cannot do that.
   if (legs[1].orderType === 'chase' || legs[1].orderType === 'local-chase') reject('chase_unsupported', '追价只能用于首腿，对冲腿按市价发送');
   if (legs[0].orderType === 'chase' && legs[0].venue !== 'bybit') reject('chase_unsupported', '只有 Bybit 支持原生追价策略');
@@ -258,9 +282,10 @@ export function parseIntent(value: unknown): Intent {
     batches = { count: integer(batch.count, 1, MAX_BATCHES, '批次数'), intervalMs: integer(batch.intervalMs, 0, MAX_BATCH_INTERVAL_MS, '批次间隔毫秒数') };
     if (batches.count > 1 && legs[0].orderType !== 'market' && legs[0].orderType !== 'local-chase') reject('batch_unsupported', '分批只用于首腿市价或本地追价');
     if ((batches.count - 1) * batches.intervalMs >= timeoutMs) reject('batch_timeout', `${batches.count} 批、每批间隔 ${batches.intervalMs} 毫秒超过最长执行时间`);
+    if (batches.count > 1 && hynix) reject('batch_unsupported', '海力士暂不支持分批');
     if (batches.count === 1) batches = undefined;
   }
-  return { market: 'oil', preset, symbol, action, timeoutMs, maxSlippageBps, legs, ...(batches ? { batches } : {}) };
+  return { market, preset, symbol, action, timeoutMs, maxSlippageBps, legs, ...(batches ? { batches } : {}) };
 }
 
 /** Confirmation body; confirmLive in the prototype authorizes only the simulated transport. */

@@ -174,7 +174,8 @@ export interface VenueConnector {
   /** Present only with capabilities.chase. An answer only proves acceptance; fills are read with queryStrategy. */
   placeChase?(binding: AccountBinding, request: StrategyRequest, options: SendOptions): Promise<StrategyAck>;
   /** null means the venue answered that no strategy with this id exists on the account. */
-  queryStrategy?(binding: AccountBinding, strategyId: string, options: CallOptions): Promise<StrategyReport | null>;
+  /** symbol: the contract the strategy was created on, when the caller knows it; the search is then limited to it. */
+  queryStrategy?(binding: AccountBinding, strategyId: string, options: CallOptions & { symbol?: string }): Promise<StrategyReport | null>;
   /** An answer does not prove that nothing filled; the strategy must be read again. */
   stopStrategy?(binding: AccountBinding, strategyId: string, options: SendOptions): Promise<StrategyAck>;
   /**

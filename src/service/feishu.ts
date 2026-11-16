@@ -36,7 +36,9 @@ export interface JobSummary {
   action: 'open' | 'close';
   status: string;
   reason: string | null;
-  legs: { venue: string; symbol: string; side: 'long' | 'short'; orderSide: 'buy' | 'sell'; plannedBarrels: string; filledBarrels: string; averagePrice: string | null; previewQuote: { bid: string; ask: string } }[];
+  /** Absent in summaries made before hynix existed: oil. */
+  market?: 'oil' | 'hynix';
+  legs: { venue: string; symbol: string; side: 'long' | 'short'; orderSide: 'buy' | 'sell'; plannedBarrels: string; filledBarrels: string; plannedQuantity?: string; filledQuantity?: string; averagePrice: string | null; previewQuote: { bid: string; ask: string } }[];
 }
 export interface PairState {
   id: string; enabled: boolean; blocked: string | null; note: string | null;
@@ -135,9 +137,11 @@ const minus = (left: string, right: string): string | null => { try { return pri
  * first leg's venue − second leg's venue.
  */
 export function describeJob(summary: JobSummary | null, jobId: string, status: string, reason: string | null): string {
-  const title = JOB_TITLES[status] ?? `原油任务${status}`;
+  if (summary?.market === 'hynix') return describeHynixJob(summary, jobId, status, reason);
   const tail = reason ? `：${clip(reason, 240)}` : '';
-  if (!summary || summary.legs.length !== 2) return `【${title}】任务 ${short(jobId)}（详情读取失败）${tail}`;
+  // Without the job's details its market is unknown: the title names no product rather than a wrong one.
+  if (!summary || summary.legs.length !== 2) return `【${(JOB_TITLES[status] ?? `原油任务${status}`).replace(/^原油/, '')}】任务 ${short(jobId)}（详情读取失败）${tail}`;
+  const title = JOB_TITLES[status] ?? `原油任务${status}`;
   const [a, b] = summary.legs as [JobSummary['legs'][0], JobSummary['legs'][0]];
   const sideText = (side: string) => side === 'long' ? '多' : '空';
   const action = summary.action === 'open' ? '开仓' : '平仓';
@@ -159,6 +163,43 @@ export function describeJob(summary: JobSummary | null, jobId: string, status: s
     const fills = [high, low].map(leg => `${label(leg)} ${clip(leg.filledBarrels, 24)} 桶${leg.averagePrice ? ` 均价 ${price(leg.averagePrice)}` : ''}`).join('、');
     const spread = high.averagePrice && low.averagePrice ? minus(high.averagePrice, low.averagePrice) : null;
     numbers = `计划每腿 ${clip(a.plannedBarrels, 24)} 桶；成交 ${fills}${spread === null ? '' : `；成交价差 ${spreadName} ${spread} USDT/桶`}`;
+  }
+  return `【${title}】${where}，${numbers}（任务 ${short(jobId)}）${tail}`;
+}
+
+const HYNIX_NAMES: Record<string, string> = { SKHYUSDT: 'ADR', SKHYNIXUSDT: '正股' };
+/** (adr × 10 ÷ ordinary − 1) × 100, two decimals; null when either price is missing or not positive. */
+const premium = (adr: string | null | undefined, ordinary: string | null | undefined): string | null => {
+  const a = Number(adr), o = Number(ordinary);
+  return adr && ordinary && a > 0 && o > 0 ? ((a * 10 / o - 1) * 100).toFixed(2) : null;
+};
+/**
+ * One line per hynix job state (docs/hynix.md): venue, contracts and sides, each leg's quantity, then the fills' average
+ * prices and the ADR premium over a tenth of the ordinary share; across venues the price difference of the one contract.
+ */
+function describeHynixJob(summary: JobSummary, jobId: string, status: string, reason: string | null): string {
+  const title = `海力士${(JOB_TITLES[status] ?? `原油任务${status}`).replace(/^原油/, '')}`;
+  const tail = reason ? `：${clip(reason, 240)}` : '';
+  if (summary.legs.length !== 2) return `【${title}】任务 ${short(jobId)}（详情读取失败）${tail}`;
+  const [a, b] = summary.legs as [JobSummary['legs'][0], JobSummary['legs'][0]];
+  const sideText = (side: string) => side === 'long' ? '多' : '空';
+  const action = summary.action === 'open' ? '开仓' : '平仓';
+  const same = summary.preset === 'same-exchange';
+  const adr = same ? (a.symbol === 'SKHYUSDT' ? a : b) : null, ordinary = same ? (a.symbol === 'SKHYUSDT' ? b : a) : null;
+  const where = same
+    ? `${VENUE_TEXT[a.venue] ?? a.venue} 同所 ${action} ${adr!.side === 'long' ? '做多溢价' : '做空溢价'}（${sideText(adr!.side)} SKHYUSDT、${sideText(ordinary!.side)} SKHYNIXUSDT）`
+    : `${a.symbol} 跨所 ${action}（${VENUE_TEXT[a.venue] ?? a.venue} ${sideText(a.side)}、${VENUE_TEXT[b.venue] ?? b.venue} ${sideText(b.side)}）`;
+  const label = (leg: typeof a) => same ? HYNIX_NAMES[leg.symbol] ?? leg.symbol : VENUE_TEXT[leg.venue] ?? leg.venue;
+  let numbers: string;
+  if (status === 'accepted') {
+    const at = (leg: typeof a) => leg.orderSide === 'buy' ? leg.previewQuote.ask : leg.previewQuote.bid;
+    const legsText = [a, b].map(leg => `${label(leg)} ${clip(leg.plannedQuantity ?? leg.plannedBarrels, 24)} 可成交价 ${price(at(leg))}`).join('、');
+    const value = same ? premium(at(adr!), at(ordinary!)) : minus(at(a), at(b));
+    numbers = `计划 ${legsText}${value === null ? '' : same ? `，溢价 ${value}%` : `，价差 ${label(a)}−${label(b)} ${value} USDT`}`;
+  } else {
+    const fills = [a, b].map(leg => `${label(leg)} ${clip(leg.filledQuantity ?? leg.filledBarrels, 24)}${leg.averagePrice ? ` 均价 ${price(leg.averagePrice)}` : ''}`).join('、');
+    const value = same ? premium(adr!.averagePrice, ordinary!.averagePrice) : a.averagePrice && b.averagePrice ? minus(a.averagePrice, b.averagePrice) : null;
+    numbers = `成交 ${fills}${value === null ? '' : same ? `；成交溢价 ${value}%` : `；成交价差 ${label(a)}−${label(b)} ${value} USDT`}`;
   }
   return `【${title}】${where}，${numbers}（任务 ${short(jobId)}）${tail}`;
 }

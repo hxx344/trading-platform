@@ -657,6 +657,7 @@ test('服务进程：没有配对也启动，页面导入接口可用；重启�
     const state = await (await fetch(`http://127.0.0.1:${port}/api/state`, { headers: { cookie } })).json() as { transfers: { pairs: unknown[] } };
     assert.deepEqual(state.transfers.pairs, []);
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/oil/market`, { headers: { cookie } })).status, 404, '没有 oil 时不提供原油接口');
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/hynix/state`, { headers: { cookie } })).status, 404, '没有 oil 时也不提供海力士接口');
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/oil/rules`, { headers: { cookie } })).status, 404, '没有 oil 时不提供原油自动规则接口');
     const status = await (await fetch(`http://127.0.0.1:${port}/api/status`, { headers: { cookie } })).json() as { samples: { available: boolean; error: string | null } };
     assert.equal(status.samples.available, false);

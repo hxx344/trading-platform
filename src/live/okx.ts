@@ -16,6 +16,11 @@ export interface OkxConnectorOptions {
   fetchImpl?: FetchLike;
   now?: () => number;
   /**
+   * Monotonic milliseconds (performance.now), compared with `now` to see the local clock jump after a sync. With an injected
+   * `now` and no monotonic clock, the injected one serves as both (tests drive a single clock).
+   */
+  monotonic?: () => number;
+  /**
    * Per HTTP exchange; must stay well under the executor's callTimeoutMs (a create plus its follow-up read is two, a stale
    * clock offset adds a time read before the create).
    */
@@ -33,6 +38,8 @@ const MAX_CLOCK_OFFSET_MS = 300_000;
  * from 35 s + 2.5 s after it was signed by the local clock, within the 40 s the executor is told (requestValidityMs).
  */
 const CLOCK_SYNC_TTL_MS = 600_000;
+/** The local clock moving more than this against the monotonic one since the sync (stepped by NTP or by hand) voids the offset. */
+const CLOCK_JUMP_MS = 1_000;
 const REQUEST_EXPIRY_MS = 35_000;
 const REQUEST_VALIDITY_MS = 40_000;
 const CONFIG_TTL_MS = 60_000;
@@ -98,10 +105,10 @@ interface AccountConfig { uid: string; mode: Mode; perm: unknown; ip: unknown; a
 
 export function createOkxConnector(options: OkxConnectorOptions): VenueConnector {
   const fetchImpl = options.fetchImpl ?? ((url, init) => fetch(url, init));
-  const now = options.now ?? Date.now, timeoutMs = options.timeoutMs ?? 10_000, ruleTtlMs = options.ruleTtlMs ?? 60_000, billSpacingMs = options.billSpacingMs ?? 420;
+  const now = options.now ?? Date.now, monotonic = options.monotonic ?? (options.now ? options.now : () => performance.now()), timeoutMs = options.timeoutMs ?? 10_000, ruleTtlMs = options.ruleTtlMs ?? 60_000, billSpacingMs = options.billSpacingMs ?? 420;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 15_000) throw new Error('OKX 连接器单次请求超时须在 100–15000 毫秒之间');
   if (!Number.isSafeInteger(billSpacingMs) || billSpacingMs < 0 || billSpacingMs > 5_000) throw new Error('OKX 账单请求间隔须在 0–5000 毫秒之间');
-  let offset = 0, syncedAt: number | null = null, lastBillAt = -Infinity;
+  let offset = 0, synced: { at: number; mono: number } | null = null, lastBillAt = -Infinity;
   const rules = new Map<string, { instrument: Instrument; expiresAt: number }>();
   const configs = new Map<string, { config: AccountConfig; at: number; apiKey: string }>();
   const bindingKey = (binding: AccountBinding): string => `${accountKey(binding)}:${binding.credentialVersion}:${binding.accountMode}`;
@@ -119,13 +126,13 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
   async function syncClock(signal: AbortSignal): Promise<void> {
     const before = now();
     const reply = await exchange(fetchImpl, timeoutMs, { url: `${HOST}/api/v5/public/time`, method: 'GET', maxBytes: 4096 }, { signal });
-    const after = now();
+    const after = now(), afterMono = monotonic();
     let ts: unknown;
     try { if (!classify(reply)) ts = record(list(record(reply.data, '服务器时间').data, '服务器时间', 1)[0], '服务器时间').ts; } catch { ts = undefined; }
     if (typeof ts !== 'string' || !/^\d{1,16}$/.test(ts) || after - before > 5_000) throw new VenueError('read-failed', 'OKX 服务器时间读取失败');
     const next = Math.round(Number(ts) - (before + after) / 2);
     if (!Number.isSafeInteger(next) || Math.abs(next) > MAX_CLOCK_OFFSET_MS) throw new VenueError('read-failed', `本机时钟与 OKX 相差 ${next} 毫秒，超过上限`);
-    offset = next; syncedAt = after;
+    offset = next; synced = { at: after, mono: afterMono };
   }
 
   async function publicRead(path: string, params: Record<string, string>, signal: AbortSignal): Promise<unknown[]> {
@@ -144,9 +151,10 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
     const credentials = credentialsOf(binding, mutation);
     const query = mutation ? '' : new URLSearchParams(params as Record<string, string>).toString(), body = mutation ? JSON.stringify(params) : '';
     const requestPath = `${path}${query ? `?${query}` : ''}`;
-    // The validity a write declares rests on a recent offset (the start offset 0 is a guess): read it first when stale.
-    const time = now();
-    if (mutation && (syncedAt === null || time < syncedAt || time - syncedAt > CLOCK_SYNC_TTL_MS)) {
+    // The validity a write declares rests on a recent offset (the start offset 0 is a guess): read it first when stale, or
+    // when the local clock jumped since (its elapsed time no longer matches the monotonic clock's).
+    const elapsed = synced && now() - synced.at, elapsedMono = synced && monotonic() - synced.mono;
+    if (mutation && (elapsed === null || elapsedMono === null || elapsedMono > CLOCK_SYNC_TTL_MS || Math.abs(elapsed - elapsedMono) > CLOCK_JUMP_MS)) {
       try { await syncClock(signal); } catch (error) { throw new VenueError('not-sent', `OKX 时钟同步失败，请求未发送：${describe(error)}`); }
     }
     for (let attempt = 0; ; attempt++) {

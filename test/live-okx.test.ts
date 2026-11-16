@@ -203,6 +203,24 @@ test('OKX 连接器：写请求前时钟偏移过期就先同步，带 expTime�
   assert.equal(venue.count('GET /api/v5/public/time'), 3);
 });
 
+test('OKX 连接器：同步后本机时钟相对单调时钟跳动超过 1 秒，下一笔写请求前重新同步', async () => {
+  const venue = new FakeOkx();
+  let mono = 5_000;
+  const connector = createOkxConnector({ credentials: () => CREDENTIALS, fetchImpl: venue.fetch, now: () => venue.clock, monotonic: () => mono, billSpacingMs: 0 });
+  const next = (n: number) => order({ clientOrderId: `pa1-0123456789abcdef01234567-0r${n}` });
+  await connector.place(binding(), next(1), send());
+  assert.equal(venue.count('GET /api/v5/public/time'), 1);
+  venue.clock += 30_000; mono += 29_200;
+  await connector.place(binding(), next(2), send());
+  assert.equal(venue.count('GET /api/v5/public/time'), 1, '差 0.8 秒沿用偏移');
+  // The local clock is stepped 40 s ahead (OKX's clock is not): the old offset would sign 40 s in the future.
+  venue.clock += 40_000; venue.serverSkew -= 40_000; mono += 10;
+  await connector.place(binding(), next(3), send());
+  assert.equal(venue.count('GET /api/v5/public/time'), 2, '跳动后重新同步');
+  assert.equal(Number(venue.last('POST /api/v5/trade/order').expTime), venue.clock + venue.serverSkew + 35_000);
+  assert.equal(venue.count('POST /api/v5/trade/order'), 3, '没有 50102 重发');
+});
+
 test('OKX 连接器：时间戳过期（50102）同步时钟后同一 clOrdId 重发一次；回执后查单失败按已受理未成交报告', async () => {
   const { venue, connector } = setup();
   await connector.place(binding(), order({ clientOrderId: 'pa1-0123456789abcdef01234567-1' }), send());

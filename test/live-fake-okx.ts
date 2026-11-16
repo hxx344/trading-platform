@@ -7,7 +7,7 @@ import type { AccountBinding } from '../src/contracts.ts';
 export const KEY = 'okx-test-key', SECRET = 'okx-test-secret', PASSPHRASE = 'okx-pass-phrase', NOW = 1_800_000_000_000, UID = '5551234567';
 export const CREDENTIALS = { apiKey: KEY, apiSecret: SECRET, passphrase: PASSPHRASE };
 export type Row = Record<string, unknown>;
-export interface Call { method: string; path: string; params: URLSearchParams; body: Row | null; apiKey: string | null }
+export interface Call { method: string; path: string; params: URLSearchParams; body: Row | null; apiKey: string | null; expTime: string | null }
 export const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 export const ok = (data: unknown[]): Response => json({ code: '0', msg: '', data });
 /** A refusal of a whole request (code in the envelope). */
@@ -40,6 +40,13 @@ export class FakeOkx {
   fill: 'full' | 'partial' | 'rest' = 'full';
   /** A post-only order that would take liquidity is canceled by the venue (cancelSource 31). */
   crossPostOnly = false;
+  /** A cancel is accepted but the order stays live until the next order read after it (OKX cancels asynchronously). */
+  asyncCancel = false;
+  pendingCancels = new Set<string>();
+  /** Reads that showed an order live after its cancel was accepted, and creates sent while another order of the symbol was still working. */
+  liveAfterCancel = 0;
+  overlaps = 0;
+  book = { bid: '70.10', ask: '70.12' };
   /** Every order moves the one-way position kept per symbol (in contracts). */
   net = new Map<string, number>();
   scripted = new Map<string, ((call: Call) => Response | Promise<Response>)[]>();
@@ -54,7 +61,7 @@ export class FakeOkx {
     const parsed = new URL(url), headers = new Headers(init.headers), body = typeof init.body === 'string' ? init.body : '';
     assert.equal(parsed.origin, 'https://www.okx.com');
     assert.equal(init.redirect, 'error');
-    const call: Call = { method: init.method ?? 'GET', path: parsed.pathname, params: parsed.searchParams, body: body ? JSON.parse(body) as Row : null, apiKey: headers.get('OK-ACCESS-KEY') };
+    const call: Call = { method: init.method ?? 'GET', path: parsed.pathname, params: parsed.searchParams, body: body ? JSON.parse(body) as Row : null, apiKey: headers.get('OK-ACCESS-KEY'), expTime: headers.get('expTime') };
     this.calls.push(call);
     const route = `${call.method} ${call.path}`, queue = this.scripted.get(route), p = call.params;
     if (call.path.startsWith('/api/v5/public/') || call.path.startsWith('/api/v5/market/')) {
@@ -62,7 +69,7 @@ export class FakeOkx {
       if (queue?.length) return queue.shift()!(call);
       if (call.path === '/api/v5/public/time') return ok([{ ts: String(this.clock + this.serverSkew) }]);
       if (call.path === '/api/v5/public/instruments') return ok(this.instruments.filter(row => row.instId === p.get('instId')));
-      if (call.path === '/api/v5/market/books') return ok([{ asks: [['70.12', '125', '0', '3']], bids: [['70.10', '310', '0', '5']], ts: String(this.clock - 250) }]);
+      if (call.path === '/api/v5/market/books') return ok([{ asks: [[this.book.ask, '125', '0', '3']], bids: [[this.book.bid, '310', '0', '5']], ts: String(this.clock - 250) }]);
     }
     const refused = this.checkSignature(headers, call.method, `${parsed.pathname}${parsed.search}`, body);
     if (refused) return refused;
@@ -80,6 +87,12 @@ export class FakeOkx {
       case 'GET /api/v5/trade/orders-algo-pending': return ok(this.algos.filter(row => row.instId === p.get('instId') && row.ordType === p.get('ordType')));
       case 'GET /api/v5/trade/order': {
         const row = this.orders.get(p.get('clOrdId')!);
+        // The first read after an asynchronous cancel still shows the order live; the one after it shows the cancel.
+        if (row && this.pendingCancels.has(row.clOrdId as string)) {
+          if (row.cancelSeen) { this.pendingCancels.delete(row.clOrdId as string); delete row.cancelSeen; Object.assign(row, { state: 'canceled', cancelSource: '1', uTime: String(this.clock) }); }
+          else row.cancelSeen = true;
+          if (row.state === 'live') { this.liveAfterCancel++; const { cancelSeen: _seen, ...visible } = row; return ok([visible]); }
+        }
         return row && row.instId === p.get('instId') ? ok([row]) : fail('51603', 'Order does not exist');
       }
       case 'POST /api/v5/trade/order': return this.create(call.body!);
@@ -87,7 +100,8 @@ export class FakeOkx {
         const row = this.orders.get(call.body!.clOrdId as string);
         if (!row) return failWrite('51603', 'Order does not exist');
         if (!['live', 'partially_filled'].includes(row.state as string)) return failWrite('51400', 'Order cancellation failed as the order has been filled, canceled or does not exist');
-        Object.assign(row, { state: 'canceled', cancelSource: '1', uTime: String(this.clock) });
+        if (this.asyncCancel) this.pendingCancels.add(row.clOrdId as string);
+        else Object.assign(row, { state: 'canceled', cancelSource: '1', uTime: String(this.clock) });
         return ok([{ clOrdId: row.clOrdId, ordId: row.ordId, sCode: '0', sMsg: '' }]);
       }
       case 'GET /api/v5/account/bills-archive': {
@@ -108,11 +122,18 @@ export class FakeOkx {
     assert.equal(headers.get('OK-ACCESS-SIGN'), createHmac('sha256', SECRET).update(timestamp + method + requestPath + body).digest('base64'));
     assert.match(timestamp, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
     if (Math.abs(Date.parse(timestamp) - (this.clock + this.serverSkew)) > 30_000) return fail('50102', 'Timestamp request expired', 401);
+    const expTime = headers.get('expTime');
+    if (method === 'POST') {
+      assert.match(expTime ?? '', /^\d{13}$/, '写请求带 expTime');
+      // The code OKX answers for a passed expTime is still to be read on a real account; any unknown code is uncertain.
+      if (this.clock + this.serverSkew > Number(expTime)) return failWrite('59999', 'Request expired');
+    }
     return null;
   }
 
   create(b: Row): Response {
     if (this.orders.has(b.clOrdId as string)) return failWrite('51016', 'Duplicated clOrdId');
+    if ([...this.orders.values()].some(row => row.instId === b.instId && ['live', 'partially_filled'].includes(row.state as string))) this.overlaps++;
     const sz = Number(b.sz), market = b.ordType === 'market', postOnly = b.ordType === 'post_only';
     let filled: number, state: string, cancelSource = '';
     if (market || this.fill === 'full') { filled = sz; state = 'filled'; }

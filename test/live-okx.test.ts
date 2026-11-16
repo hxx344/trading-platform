@@ -150,6 +150,12 @@ test('OKX 连接器：只挂单发 post_only；会立即成交被交易所撤销
   venue.crossPostOnly = true;
   const crossed = await connector.place(binding(), { ...request, clientOrderId: 'pa1-0123456789abcdef01234567-0r1' }, send());
   assert.deepEqual([crossed.status, crossed.terminal, crossed.filledQuantity], ['expired', true, '0']);
+  // Only cancelSource 31 (would take liquidity) means it never rested; a venue cancel for any other reason stays canceled.
+  const other = venue.orders.get('pa10123456789abcdef012345670r1')!;
+  for (const source of ['', '6', '14']) {
+    other.cancelSource = source;
+    assert.equal((await connector.query(binding(), { ...request, clientOrderId: 'pa1-0123456789abcdef01234567-0r1' }, { signal: signal() }))!.status, 'canceled', source);
+  }
   await assert.rejects(connector.place(binding(), order({ type: 'market', limitPrice: null, timeInForce: 'gtx' }), send()), kind('not-sent'));
 });
 
@@ -173,15 +179,39 @@ test('OKX 连接器：50011 限频与清单内拒绝码按已拒绝且不重发�
   await assert.rejects(slow.place(binding(), order(), send()), kind('not-sent'), '持仓模式读不到时不发送');
 });
 
+test('OKX 连接器：写请求前时钟偏移过期就先同步，带 expTime（OKX 时钟 + 35 秒），同步失败不发送', async () => {
+  // The local clock runs 29 s fast: the start offset 0 would let a signed request live about 59 s.
+  const { venue, connector } = setup(fake => { fake.serverSkew = -29_000; });
+  await connector.account(binding(), ['CLUSDT'], { signal: signal() });
+  assert.equal(venue.count('GET /api/v5/public/time'), 0, '读取不同步时钟');
+  await connector.place(binding(), order(), send());
+  assert.equal(venue.count('GET /api/v5/public/time'), 1);
+  assert.equal(Number(venue.last('POST /api/v5/trade/order').expTime), venue.clock - 29_000 + 35_000);
+  assert.ok(connector.capabilities.requestValidityMs >= 35_000 + 2_500);
+  venue.fill = 'rest';
+  const resting = order({ clientOrderId: 'pa1-0123456789abcdef01234567-0r1', timeInForce: 'gtc' });
+  venue.clock += 60_000;
+  await connector.place(binding(), resting, send());
+  await connector.cancel(binding(), resting, send());
+  assert.equal(venue.count('GET /api/v5/public/time'), 1, '10 分钟内沿用偏移');
+  assert.equal(Number(venue.last('POST /api/v5/trade/cancel-order').expTime), venue.clock - 29_000 + 35_000, '撤单也带 expTime');
+  venue.clock += 600_001;
+  venue.script('GET /api/v5/public/time', () => fail('50001', 'busy', 503));
+  await assert.rejects(connector.place(binding(), order({ clientOrderId: 'pa1-0123456789abcdef01234567-0r2' }), send()), kind('not-sent', /时钟同步失败/));
+  assert.equal(venue.count('POST /api/v5/trade/order'), 2, '同步失败不发送');
+  await connector.place(binding(), order({ clientOrderId: 'pa1-0123456789abcdef01234567-0r2' }), send());
+  assert.equal(venue.count('GET /api/v5/public/time'), 3);
+});
+
 test('OKX 连接器：时间戳过期（50102）同步时钟后同一 clOrdId 重发一次；回执后查单失败按已受理未成交报告', async () => {
   const { venue, connector } = setup();
-  await connector.account(binding(), ['CLUSDT'], { signal: signal() });
+  await connector.place(binding(), order({ clientOrderId: 'pa1-0123456789abcdef01234567-1' }), send());
   venue.serverSkew = 45_000;
   let guarded = 0;
   const report = await connector.place(binding(), order(), send(() => { guarded++; }));
   assert.equal(guarded, 2, '重发前再过一次守卫');
-  assert.equal(venue.count('POST /api/v5/trade/order'), 2);
-  assert.equal(venue.count('GET /api/v5/public/time'), 1);
+  assert.equal(venue.count('POST /api/v5/trade/order'), 3);
+  assert.equal(venue.count('GET /api/v5/public/time'), 2);
   assert.equal(report.status, 'filled');
 
   const second = setup();
@@ -190,6 +220,9 @@ test('OKX 连接器：时间戳过期（50102）同步时钟后同一 clOrdId �
   assert.deepEqual([accepted.status, accepted.filledQuantity, accepted.terminal], ['new', '0', false]);
   // Query: 51603 is "no such order"; cancel without a readable order stays open.
   assert.equal(await second.connector.query(binding(), order({ clientOrderId: 'pa1-0123456789abcdef01234567-1' }), { signal: signal() }), null);
+  // Only 51603 is "no such order": a success without a row proves nothing (L093).
+  second.venue.script('GET /api/v5/trade/order', () => json({ code: '0', msg: '', data: [] }));
+  await assert.rejects(second.connector.query(binding(), order({ clientOrderId: 'pa1-0123456789abcdef01234567-1' }), { signal: signal() }), kind('read-failed', /没有委托记录/));
   second.venue.fill = 'rest';
   const resting = order({ clientOrderId: 'pa1-0123456789abcdef01234567-0r1', timeInForce: 'gtc' });
   await second.connector.place(binding(), resting, send());
@@ -229,6 +262,39 @@ test('OKX 盈亏读取：持仓带开仓均价、标记价与浮盈亏；账单�
 });
 
 /** One OKX account and the executor; `run` drives a job to its end. */
+test('OKX 连接器：再次 50102、重发前守卫拒绝、同步时钟失败都按已拒绝，不再发送', async () => {
+  const cases: [string, (venue: FakeOkx) => void, () => void, number][] = [
+    ['再次 50102', venue => venue.script('POST /api/v5/trade/order', () => fail('50102', 'Timestamp request expired', 401), () => fail('50102', 'Timestamp request expired', 401)), () => undefined, 2],
+    ['守卫拒绝', venue => venue.script('POST /api/v5/trade/order', () => fail('50102', 'Timestamp request expired', 401)), (() => { let n = 0; return () => { if (n++ > 0) throw new Error('登记已变化'); }; })(), 1],
+    ['同步失败', venue => { venue.script('POST /api/v5/trade/order', () => fail('50102', 'Timestamp request expired', 401)); venue.script('GET /api/v5/public/time', () => fail('50001', 'busy', 503)); }, () => undefined, 1],
+  ];
+  for (const [name, configure, guard, posts] of cases) {
+    const { venue, connector } = setup();
+    await connector.place(binding(), order({ clientOrderId: 'pa1-0123456789abcdef01234567-1' }), send());
+    configure(venue);
+    await assert.rejects(connector.place(binding(), order(), send(guard)), kind('rejected'), name);
+    assert.equal(venue.count('POST /api/v5/trade/order'), 1 + posts, name);
+    assert.equal(venue.orders.has(NATIVE), false, name);
+  }
+});
+
+test('OKX 连接器：撤单拒绝 51400 / 51401 结果未知、50011 已拒绝；撤单异步时回报仍挂着，下一次查单才是已撤销', async () => {
+  for (const [code, expected] of [['51400', 'uncertain'], ['51401', 'uncertain'], ['50011', 'rejected']] as const) {
+    const { venue, connector } = setup(fake => { fake.fill = 'rest'; });
+    await connector.place(binding(), order({ timeInForce: 'gtc' }), send());
+    venue.script('POST /api/v5/trade/cancel-order', () => failWrite(code, 'refused'));
+    await assert.rejects(connector.cancel(binding(), order({ timeInForce: 'gtc' }), send()), kind(expected), code);
+    assert.equal(venue.count('GET /api/v5/trade/order'), 1, `${code} 不查单`);
+  }
+  const { venue, connector } = setup(fake => { fake.fill = 'rest'; fake.asyncCancel = true; });
+  const resting = order({ timeInForce: 'gtc' });
+  await connector.place(binding(), resting, send());
+  const accepted = await connector.cancel(binding(), resting, send());
+  assert.deepEqual([accepted.status, accepted.terminal], ['new', false]);
+  const ended = await connector.query(binding(), resting, { signal: signal() });
+  assert.deepEqual([ended!.status, ended!.terminal], ['canceled', true]);
+});
+
 async function withExecutor(work: (ctx: { venue: FakeOkx; ex: ReturnType<typeof createExecutor>; run: (intent: unknown, between?: (i: number) => void) => Promise<ReturnType<ReturnType<typeof createExecutor>['jobView']>>; clock: { now: number } }) => Promise<void>) {
   const dir = mkdtempSync(join(tmpdir(), 'pa-okx-'));
   const venue = new FakeOkx(), clock = { now: venue.clock };
@@ -273,6 +339,22 @@ test('端到端（OKX 同所）：执行器按桶数换算成张下单，两腿�
     assert.equal(lost.status, 'completed', JSON.stringify(lost.events.slice(-6)));
     assert.deepEqual([venue.net.get('BZ-USDT-SWAP'), venue.net.get('CL-USDT-SWAP')], [-10, 10]);
     assert.ok(venue.count('GET /api/v5/trade/order') >= 3);
+  });
+});
+
+test('端到端（OKX 本地追价）：撤单受理后查到仍挂着时不发新单，读到已撤销后才按新价重挂，成交后对冲完成', async () => {
+  await withExecutor(async ({ venue, run }) => {
+    venue.fill = 'rest'; venue.asyncCancel = true;
+    const job = await run({ ...sameOkx(), legs: [{ venue: 'okx', symbol: 'CLUSDT', side: 'long', orderType: 'local-chase', barrels: '2' }, { venue: 'okx', symbol: 'BZUSDT', side: 'short', orderType: 'market', barrels: '2' }] }, i => {
+      if (i === 3) venue.book = { bid: '70.20', ask: '70.22' };
+      if (venue.count('POST /api/v5/trade/cancel-order') > 0) venue.fill = 'full';
+    });
+    assert.equal(job.status, 'completed', JSON.stringify(job.events.slice(-6)));
+    const leads = venue.calls.filter(call => call.method === 'POST' && call.path === '/api/v5/trade/order' && call.body!.instId === 'CL-USDT-SWAP').map(call => [call.body!.ordType, call.body!.px]);
+    assert.deepEqual(leads, [['post_only', '70.1'], ['post_only', '70.2']]);
+    assert.ok(venue.liveAfterCancel >= 1, '撤单受理后至少一次查到仍挂着');
+    assert.equal(venue.overlaps, 0, '旧挂单未结束时不发新单');
+    assert.deepEqual([venue.net.get('CL-USDT-SWAP'), venue.net.get('BZ-USDT-SWAP')], [20, -20]);
   });
 });
 

@@ -206,6 +206,8 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   // The preview whose confirm got no answer: it may have been accepted, so leaving it needs a warning.
   const [unanswered, setUnanswered] = useState<string | null>(null);
   const [advanced, setAdvanced] = useState(false);
+  // Set when picking the hedge venue as the lead swapped the two: with two venues the hedge choice is not shown, so say it.
+  const [swapNote, setSwapNote] = useState<string | null>(null);
   const ids = useRef(new RequestIds());
   const reviewRef = useRef<HTMLDivElement>(null);
   // Bumped on every form change: a preview answered for an older form is dropped, never shown beside the new one.
@@ -222,6 +224,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   // A new preview takes the focus, so the confirmation is what the keyboard and the screen reader reach first.
   useEffect(() => { if (preview) reviewRef.current?.querySelector<HTMLElement>('.execution-review')?.focus(); }, [preview]);
   const set = <K extends keyof OilForm>(key: K, value: OilForm[K]) => {
+    if (key === 'venue' || key === 'hedgeVenue' || key === 'preset') setSwapNote(key === 'venue' && form.preset === 'cross-exchange' && value === form.hedgeVenue && value !== form.venue ? `首腿与对冲腿交易所已对调：对冲腿已改为 ${VENUE_LABEL[form.venue]}` : null);
     setForm(current => {
       const next = { ...current, [key]: value };
       // Picking the hedge venue as the lead swaps the two, so a cross-venue pair stays on two venues.
@@ -294,6 +297,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
             ? <Choice label="首腿合约" id="oilLeadSymbol" value={form.leadSymbol} options={[['CLUSDT', 'CL 先下'], ['BZUSDT', 'BZ 先下']]} onChange={next => set('leadSymbol', next)} />
             : <Choice label="合约" id="oilSymbol" value={form.symbol} options={[['BZUSDT', 'BZ 布伦特'], ['CLUSDT', 'CL WTI']]} onChange={next => set('symbol', next)} />}
         </div>
+        {swapNote && form.preset === 'cross-exchange' ? <p className="trading-footnote" id="oilHedgeSwap" role="status">{swapNote}</p> : null}
         <div className="execution-choice execution-direction"><span aria-hidden="true">{form.action === 'open' ? '开仓方向' : '待平仓方向'}</span>
           <div className="execution-direction-options" role="group" aria-label={form.action === 'open' ? '开仓方向' : '待平仓方向'}>
             {(['long', 'short'] as const).map(side => {

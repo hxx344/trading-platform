@@ -194,6 +194,31 @@ test('原油导入：已有 oil 配置的交易所保留现有设置（含已不
   } finally { rmSync(wb.root, { recursive: true, force: true }); }
 });
 
+test('原油导入（OKX）：实盘启用的 OKX 原油规则、用该账户的未结束任务、密钥文件已有 okx 但配置里没有，都只拒绝 OKX', () => {
+  const plan = (rules: Rule[], jobs: Job[], existing: Parameters<typeof planImport>[1] = null) => {
+    const wb = hub([{ exchange: 'binance' }, { exchange: 'okx' }], rules, jobs);
+    try { return planImport({ pairs: [], accounts: [], env: {} }, existing, { secretsFile: '/x/secrets.json', only: [], oil: readWorkbenchOil(wb.data) }); }
+    finally { rmSync(wb.root, { recursive: true, force: true }); }
+  };
+  const statuses = (result: ReturnType<typeof plan>) => result.oil.map(item => [item.venue, item.status]);
+  const ruled = plan([{ exchange: 'okx', name: 'OKX 原油价差' }], []);
+  assert.deepEqual(statuses(ruled), [['binance', 'added'], ['okx', 'skipped']]);
+  assert.match(ruled.oil[1]!.detail, /先在工作台停用原油自动规则（OKX 原油价差）/);
+  assert.equal(ruled.secrets.okx, undefined);
+
+  const running = plan([], [{ status: 'running', exchanges: ['okx'] }]);
+  assert.deepEqual(statuses(running), [['binance', 'added'], ['okx', 'skipped']]);
+  assert.match(running.oil[1]!.detail, /工作台还有未结束的执行任务在用该账户（job-0-00 running）/);
+
+  const stray = { apiKey: 'stray-okx-key-1', apiSecret: 'stray-okx-secret-1', passphrase: 'stray-pass-1' };
+  const binance = { venue: 'binance', accountId: '99990000', accountMode: 'portfolio-margin', credentialVersion: 1 };
+  const kept = plan([], [], { config: { secretsFile: '/x/secrets.json', pairs: [], oil: { accounts: [binance] } }, secrets: { accounts: {}, binance: { apiKey: 'old-key-0001', apiSecret: 'old-secret-0001' }, okx: stray } });
+  assert.deepEqual(statuses(kept), [['binance', 'skipped'], ['okx', 'skipped']]);
+  assert.match(kept.oil[1]!.detail, /已有 okx 的密钥但 config.json 没有对应账户，不覆盖/);
+  assert.deepEqual(kept.secrets.okx, stray);
+  assert.deepEqual((kept.config.oil as { accounts: { venue: string }[] }).accounts.map(account => account.venue), ['binance']);
+});
+
 test('原油导入：未完成的回滚日志、工作台未运行时的未合并 WAL、符号链接与长度不对的密钥都拒绝读取', () => {
   const wb = hub([{ exchange: 'binance' }]);
   const hubFile = join(wb.data, 'hub.sqlite');

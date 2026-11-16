@@ -15,7 +15,10 @@ export interface OkxConnectorOptions {
   credentials: (binding: AccountBinding) => LiveCredentials;
   fetchImpl?: FetchLike;
   now?: () => number;
-  /** Per HTTP exchange; must stay well under the executor's callTimeoutMs (a create plus its follow-up read is two). */
+  /**
+   * Per HTTP exchange; must stay well under the executor's callTimeoutMs (a create plus its follow-up read is two, a stale
+   * clock offset adds a time read before the create).
+   */
   timeoutMs?: number;
   ruleTtlMs?: number;
   /** Least time between two bill reads (the workbench spaces them 420 ms for the venue's bill rate limit). */
@@ -24,10 +27,19 @@ export interface OkxConnectorOptions {
 
 const HOST = 'https://www.okx.com';
 const MAX_CLOCK_OFFSET_MS = 300_000;
+/**
+ * A write is sent only with a clock offset read within this long, and carries OKX's expTime header (venue clock) this far
+ * ahead. The offset is off by at most half the sync round trip (≤ 2.5 s, see syncClock), so the venue refuses the request
+ * from 35 s + 2.5 s after it was signed by the local clock, within the 40 s the executor is told (requestValidityMs).
+ */
+const CLOCK_SYNC_TTL_MS = 600_000;
+const REQUEST_EXPIRY_MS = 35_000;
+const REQUEST_VALIDITY_MS = 40_000;
 const CONFIG_TTL_MS = 60_000;
 const PAGE_SIZE = 100;
 const MAX_ORDER_PAGES = 20;
-const BILL_MAX_PAGES = 200;
+/** 60 pages at the 420 ms spacing (about 25 s) fit inside the PnL ledger timeout (LEDGER_TIMEOUT_MS, 30 s); more fails the window by name. */
+const BILL_MAX_PAGES = 60;
 export const INSTRUMENT_IDS: Record<string, string> = { CLUSDT: 'CL-USDT-SWAP', BZUSDT: 'BZ-USDT-SWAP', SKHYUSDT: 'SKHY-USDT-SWAP', SKHYNIXUSDT: 'SKHYNIX-USDT-SWAP' };
 /** Strategy orders of any of these kinds can trade on the account at any time; each one counts as foreign activity. */
 const ALGO_TYPES = ['conditional,oco', 'trigger', 'move_order_stop', 'iceberg', 'twap', 'chase'];
@@ -41,8 +53,8 @@ const TIMESTAMP_CODE = '50102';
 const NOT_FOUND_CODE = '51603';
 const ORDER_TERMINAL: Record<string, OrderStatus> = { filled: 'filled', canceled: 'canceled', mmp_canceled: 'canceled' };
 const ORDER_WORKING: Record<string, OrderStatus> = { live: 'new', partially_filled: 'partially-filled' };
-/** cancelSource 1: canceled by the user (this service's cancel). A post-only order canceled for any other reason never rested. */
-const USER_CANCEL = '1';
+/** cancelSource 31: the venue canceled a post-only order because it would have taken liquidity (it never rested). */
+const POST_ONLY_TAKER_CANCEL = '31';
 /** Bill types (workbench trades/funding): 8 funding, 2 trade, 5 liquidation, 9 ADL, 14 block trade carry PnL; 6 is an isolated margin move. */
 const FUNDING_BILL = '8', MARGIN_BILL = '6', TRADE_BILLS = new Set(['2', '5', '9', '14']);
 
@@ -89,7 +101,7 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
   const now = options.now ?? Date.now, timeoutMs = options.timeoutMs ?? 10_000, ruleTtlMs = options.ruleTtlMs ?? 60_000, billSpacingMs = options.billSpacingMs ?? 420;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 15_000) throw new Error('OKX 连接器单次请求超时须在 100–15000 毫秒之间');
   if (!Number.isSafeInteger(billSpacingMs) || billSpacingMs < 0 || billSpacingMs > 5_000) throw new Error('OKX 账单请求间隔须在 0–5000 毫秒之间');
-  let offset = 0, lastBillAt = -Infinity;
+  let offset = 0, syncedAt: number | null = null, lastBillAt = -Infinity;
   const rules = new Map<string, { instrument: Instrument; expiresAt: number }>();
   const configs = new Map<string, { config: AccountConfig; at: number; apiKey: string }>();
   const bindingKey = (binding: AccountBinding): string => `${accountKey(binding)}:${binding.credentialVersion}:${binding.accountMode}`;
@@ -113,7 +125,7 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
     if (typeof ts !== 'string' || !/^\d{1,16}$/.test(ts) || after - before > 5_000) throw new VenueError('read-failed', 'OKX 服务器时间读取失败');
     const next = Math.round(Number(ts) - (before + after) / 2);
     if (!Number.isSafeInteger(next) || Math.abs(next) > MAX_CLOCK_OFFSET_MS) throw new VenueError('read-failed', `本机时钟与 OKX 相差 ${next} 毫秒，超过上限`);
-    offset = next;
+    offset = next; syncedAt = after;
   }
 
   async function publicRead(path: string, params: Record<string, string>, signal: AbortSignal): Promise<unknown[]> {
@@ -132,9 +144,17 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
     const credentials = credentialsOf(binding, mutation);
     const query = mutation ? '' : new URLSearchParams(params as Record<string, string>).toString(), body = mutation ? JSON.stringify(params) : '';
     const requestPath = `${path}${query ? `?${query}` : ''}`;
+    // The validity a write declares rests on a recent offset (the start offset 0 is a guess): read it first when stale.
+    const time = now();
+    if (mutation && (syncedAt === null || time < syncedAt || time - syncedAt > CLOCK_SYNC_TTL_MS)) {
+      try { await syncClock(signal); } catch (error) { throw new VenueError('not-sent', `OKX 时钟同步失败，请求未发送：${describe(error)}`); }
+    }
     for (let attempt = 0; ; attempt++) {
       let headers: Record<string, string>;
-      try { headers = { ...okxAuthHeaders(credentials, { timestamp: new Date(now() + offset).toISOString(), method, requestPath, body }), ...(mutation ? { 'Content-Type': 'application/json' } : {}) }; }
+      try {
+        const signedAt = now() + offset;
+        headers = { ...okxAuthHeaders(credentials, { timestamp: new Date(signedAt).toISOString(), method, requestPath, body }), ...(mutation ? { 'Content-Type': 'application/json', expTime: String(signedAt + REQUEST_EXPIRY_MS) } : {}) };
+      }
       catch (error) { // A resend follows a refusal of the first transmission, so that refusal is the answer.
         throw new VenueError(!mutation ? 'read-failed' : attempt > 0 ? 'rejected' : 'not-sent', `OKX 请求签名失败：${describe(error)}`); }
       let reply: HttpReply;
@@ -235,8 +255,8 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
       let status = typeof state === 'string' ? ORDER_TERMINAL[state] ?? ORDER_WORKING[state] : undefined;
       if (!status) throw new ShapeError(`委托状态 ${String(state).slice(0, 32)} 无法识别`);
       if (status === 'filled' && cmp(filledQuantity, quantity) !== 0) throw new ShapeError('全部成交的委托成交数量不足');
-      // A post-only order the venue canceled without a fill never rested (it would have taken liquidity): expired, as on Binance.
-      if (status === 'canceled' && row.ordType === 'post_only' && isZero(filledQuantity) && row.cancelSource !== USER_CANCEL) status = 'expired';
+      // A post-only order the venue canceled for taking liquidity never rested: expired, as on Binance. Any other cancel stays canceled.
+      if (status === 'canceled' && row.ordType === 'post_only' && isZero(filledQuantity) && row.cancelSource === POST_ONLY_TAKER_CANCEL) status = 'expired';
       const averagePrice = isZero(filledQuantity) ? null : optionalPrice(row.avgPx, '成交均价');
       if (!isZero(filledQuantity) && averagePrice === null) throw new ShapeError('有成交但没有成交均价');
       return {
@@ -248,12 +268,16 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
       throw error;
     }
   }
-  /** The order by clOrdId (open, or ended within the venue's retention); null when the venue answers 51603. */
+  /**
+   * The order by clOrdId (open, or ended within the venue's retention); null only when the venue answers 51603. A success
+   * with no row proves nothing, so it fails the read (L093).
+   */
   async function findOrder(binding: AccountBinding, request: OrderRequest, signal: AbortSignal): Promise<unknown | null> {
     const clOrdId = toClOrdId(request.clientOrderId);
     if (!clOrdId) throw new VenueError('read-failed', 'OKX 查单：客户订单号格式无效');
     const data = await reading(async () => signed(binding, 'GET', '/api/v5/trade/order', { instId: instrumentId(request.symbol), clOrdId }, { signal }));
-    if (data === null || data.length === 0) return null;
+    if (data === null) return null;
+    if (data.length === 0) throw new VenueError('read-failed', 'OKX 查单应答成功但没有委托记录');
     if (data.length > 1) throw new VenueError('read-failed', 'OKX 同一客户订单号返回了多笔委托');
     return data[0];
   }
@@ -276,8 +300,8 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
   const capabilities: ConnectorCapabilities = {
     // The executor's 34-character ids fit: they are sent without their dashes (32 characters at most).
     transport: 'live', clientOrderId: true, queryByClientOrderId: true, cancelByClientOrderId: true, maxClientOrderIdLength: 34,
-    // OKX refuses a request whose timestamp is more than 30 s from its clock (50102); 40 s leaves room for scheduling.
-    requestValidityMs: 40_000,
+    // Writes carry expTime 35 s ahead on a recently synced clock (REQUEST_EXPIRY_MS); the offset error stays inside 40 s.
+    requestValidityMs: REQUEST_VALIDITY_MS,
     postOnly: true,
   };
 

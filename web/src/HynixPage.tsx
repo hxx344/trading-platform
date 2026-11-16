@@ -123,6 +123,8 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   const [busy, setBusy] = useState(false);
   const [unanswered, setUnanswered] = useState<string | null>(null);
   const [advanced, setAdvanced] = useState(false);
+  // Set when picking the hedge venue as the lead swapped the two: with two venues the hedge choice is not shown, so say it.
+  const [swapNote, setSwapNote] = useState<string | null>(null);
   const ids = useRef(new RequestIds());
   const reviewRef = useRef<HTMLDivElement>(null);
   const formVersion = useRef(0);
@@ -137,6 +139,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   }, [venues, cross, form.venue, form.hedgeVenue, form.preset]);
   useEffect(() => { if (preview) reviewRef.current?.querySelector<HTMLElement>('.execution-review')?.focus(); }, [preview]);
   const update = (patch: Partial<HynixForm>) => {
+    if ('venue' in patch || 'hedgeVenue' in patch || 'preset' in patch) setSwapNote(patch.venue !== undefined && form.preset === 'cross-exchange' && patch.venue === form.hedgeVenue && patch.venue !== form.venue ? `首腿与对冲腿交易所已对调：对冲腿已改为 ${VENUE_LABEL[form.venue]}` : null);
     setForm(current => {
       const next = { ...current, ...patch };
       // Picking the hedge venue as the lead swaps the two, so a cross-venue pair stays on two venues.
@@ -218,6 +221,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
             ? <Choice label="首腿合约" id="hynixLeadSymbol" value={form.leadSymbol} options={[['SKHYUSDT', 'ADR 先下'], ['SKHYNIXUSDT', '正股先下']]} onChange={next => set('leadSymbol', next)} />
             : <Choice label="合约" id="hynixSymbol" value={form.symbol} options={[['SKHYUSDT', 'ADR'], ['SKHYNIXUSDT', '正股']]} onChange={next => set('symbol', next)} />}
         </div>
+        {swapNote && !same ? <p className="trading-footnote" id="hynixHedgeSwap" role="status">{swapNote}</p> : null}
         <div className="execution-choice execution-direction"><span aria-hidden="true">{form.action === 'open' ? '开仓方向' : '待平仓方向'}</span>
           <div className="execution-direction-options" role="group" aria-label={form.action === 'open' ? '开仓方向' : '待平仓方向'}>
             {(['short', 'long'] as const).map(side => {

@@ -2,7 +2,7 @@
 // executor's own parseIntent with the legs the form meant.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseIntent } from '../src/contracts.ts';
+import { parseIntent, parsePairIntent } from '../src/contracts.ts';
 import { DEFAULT_FORM, describeIntent, formToIntent, jobActions, type OilForm } from '../web/src/oil-form.ts';
 
 const build = (patch: Partial<OilForm>) => {
@@ -18,7 +18,7 @@ test('原油下单表单：同所做多价差 = 多 BZ / 空 CL，首腿按所�
     { venue: 'binance', symbol: 'BZUSDT', side: 'long', orderType: 'market', barrels: '10' },
   ] });
   assert.equal(describeIntent(long), '开仓 Binance 做多价差：空 CL / 多 BZ');
-  const parsed = parseIntent(long);
+  const parsed = parsePairIntent(long);
   assert.deepEqual(parsed.legs.map(leg => [leg.symbol, leg.side, leg.barrels]), [['CLUSDT', 'short', '10'], ['BZUSDT', 'long', '10']]);
 
   const short = build({ spread: 'short', leadSymbol: 'BZUSDT', action: 'close', venue: 'bybit', leadOrderType: 'chase', timeoutSeconds: '120', slippageBps: '25' });
@@ -38,7 +38,7 @@ test('原油下单表单：跨所同一合约，首腿交易所与方向由表�
     { venue: 'binance', side: 'long', orderType: 'market', barrels: '2.5' },
   ] });
   assert.equal(describeIntent(cross), '开仓 跨所 CLUSDT：Bybit 空 CL / Binance 多 CL');
-  assert.equal(parseIntent(cross).symbol, 'CLUSDT');
+  assert.equal(parsePairIntent(cross).symbol, 'CLUSDT');
 });
 
 test('原油下单表单：桶数、执行时间、价格保护与 Binance 追价先在页面拒绝并说明', () => {
@@ -66,13 +66,13 @@ test('原油下单表单：本地追价只给 Binance 首腿，可填追价界�
   const chase = build({ preset: 'cross-exchange', venue: 'binance', symbol: 'CLUSDT', leadOrderType: 'local-chase', chaseLimit: ' 70.5 ', batchCount: '3', batchIntervalSeconds: '10' });
   assert.deepEqual(chase.legs[0], { venue: 'binance', side: 'long', orderType: 'local-chase', barrels: '10', limitPrice: '70.5' });
   assert.deepEqual(chase.batches, { count: 3, intervalMs: 10_000 });
-  const parsed = parseIntent(chase);
+  const parsed = parsePairIntent(chase);
   assert.deepEqual([parsed.legs[0].orderType, parsed.legs[0].limitPrice, parsed.batches], ['local-chase', '70.5', { count: 3, intervalMs: 10_000 }]);
   // No bound typed: the preview's price protection bound; one batch sends no batches field.
   const plain = build({ leadOrderType: 'local-chase' });
   assert.equal('limitPrice' in plain.legs[0], false);
   assert.equal('batches' in plain, false);
-  assert.equal(parseIntent(plain).legs[0].orderType, 'local-chase');
+  assert.equal(parsePairIntent(plain).legs[0].orderType, 'local-chase');
   assert.equal('limitPrice' in build({ leadOrderType: 'market', chaseLimit: '70' }).legs[0], false, '只有本地追价带界限');
   assert.deepEqual(build({ batchCount: '2', batchIntervalSeconds: '' }).batches, { count: 2, intervalMs: 0 });
 

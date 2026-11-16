@@ -26,6 +26,9 @@ const TRACKING_STATUS: Record<string, string> = {
   accepted: '已受理，正在发送首腿。', running: '执行中：首腿成交后对冲腿按市价跟上。', completed: '已完成，两腿成交见下表。',
   failed: '执行失败，原因见下方；已成交部分保留。', stopped: '已停止，已成交部分保留。', attention: '需要人工处理，请按下方说明核对交易所。',
 };
+/** A hynix rebalance sends one order and nothing follows it. */
+const REBALANCE_TRACKING: Record<string, string> = { ...TRACKING_STATUS, accepted: '已受理，正在发送调平委托。', running: '执行中：调平委托已发送，等待成交结果。', completed: '已完成，成交见下表。' };
+const isRebalance = (job: Pick<OilJob, 'preset'>): boolean => job.preset === 'rebalance';
 const OP_STATE: Record<string, string> = { prepared: '已落盘', sending: '发送中', open: '交易所挂单中', unknown: '结果未知，核对中', rejected: '被拒绝', 'not-sent': '未发送', 'not-created': '确认未创建', filled: '已成交', canceled: '已撤销', confirmed: '已确认' };
 const STRATEGY_STATUS: Record<string, string> = { working: '运行中', paused: '已暂停', terminal: '已结束' };
 export const ORDER_TYPE: Record<string, string> = { market: '市价', chase: '追价策略', 'local-chase': '本地追价', limit: '限价' };
@@ -344,12 +347,15 @@ type ActionKind = 'stop' | 'acknowledge' | 'adopt' | 'notcreated' | 'release';
 function JobCard({ job, busy, strategyId, onStrategyId, onAction }: { job: OilJob; busy: boolean; strategyId: string; onStrategyId: (value: string) => void; onAction: (job: OilJob, kind: ActionKind) => void }) {
   const actions = jobActions(job);
   const hynix = job.market === 'hynix';
-  const kind = job.preset === 'same-exchange' ? `${venueName(job.legs[0]?.venue ?? '')} 同所${hynix ? '溢价' : '价差'}` : '跨所同合约';
+  const rebalance = isRebalance(job);
+  const title = rebalance ? `${venueName(job.legs[0]?.venue ?? '')} 调平 · ${job.rebalance?.method === 'add' ? '加仓' : '减仓'}`
+    : `${job.preset === 'same-exchange' ? `${venueName(job.legs[0]?.venue ?? '')} 同所${hynix ? '溢价' : '价差'}` : '跨所同合约'}${job.action === 'open' ? '开仓' : '平仓'}`;
+  const role = (index: number): string => rebalance ? '调平腿' : index === 0 ? '首腿' : '对冲腿';
   const legName = (symbol: string): string => hynix ? HYNIX_CONTRACT[symbol] ?? short(symbol) : short(symbol);
   const strategyLeg = job.legs.find(leg => leg.operation?.kind === 'strategy');
-  return <article className={`execution-job ${job.status}`} data-oil-job={job.id} aria-label={`${kind}${job.action === 'open' ? '开仓' : '平仓'} ${label(JOB_STATUS, job.status)}`}>
+  return <article className={`execution-job ${job.status}`} data-oil-job={job.id} aria-label={`${title} ${label(JOB_STATUS, job.status)}`}>
     <header><div>
-      <h3>{kind}{job.action === 'open' ? '开仓' : '平仓'} <span className={`execution-badge ${JOB_BADGE[job.status] ?? ''}`}>{label(JOB_STATUS, job.status)}</span>{job.stopRequested ? <span className="execution-badge">已请求停止</span> : null}{job.holdNewSends ? <span className="execution-badge">恢复中，不再发送新委托</span> : null}</h3>
+      <h3>{title} <span className={`execution-badge ${JOB_BADGE[job.status] ?? ''}`}>{label(JOB_STATUS, job.status)}</span>{job.stopRequested ? <span className="execution-badge">已请求停止</span> : null}{job.holdNewSends ? <span className="execution-badge">恢复中，不再发送新委托</span> : null}</h3>
       <p>任务 {job.id.slice(0, 8)} · 创建 {stamp(job.createdAt)} · 最迟 {clock(job.deadlineAt)}（北京时间）{job.batches ? ` · 分 ${job.batches.count} 批，${job.batches.current ? `第 ${job.batches.current} 批` : '未开始'}` : ''}</p>
     </div>{actions.stop ? <button className="button secondary execution-stop" type="button" data-oil-stop={job.id} disabled={busy} onClick={() => onAction(job, 'stop')}><Square size={14} aria-hidden="true" />停止并撤销余单</button> : null}</header>
     {job.reason ? <p className="execution-job-reason" role={job.status === 'attention' ? 'alert' : undefined}>{job.reason}</p> : null}
@@ -362,7 +368,7 @@ function JobCard({ job, busy, strategyId, onStrategyId, onAction }: { job: OilJo
           : <span><strong>{leg.filledBarrels}</strong> / {leg.plannedBarrels} 桶<small>合约 {leg.filledQuantity} / {leg.plannedQuantity}{leg.attempts > 1 ? ` · ${leg.attempts} 笔` : ''}</small></span>}</td>
         <td data-label="成交均价">{leg.averagePrice ?? '—'}</td>
         <td data-label="当前委托 / 策略"><span className={leg.operation?.state === 'unknown' ? 'execution-warning' : undefined}>{leg.operation ? label(OP_STATE, leg.operation.state) : '未发送'}</span>
-          <small>{index === 0 ? '首腿' : '对冲腿'} · {label(ORDER_TYPE, leg.orderType)}{leg.orderType === 'local-chase' && leg.operation?.limitPrice ? ` 挂 ${leg.operation.limitPrice}` : ''} · 账户 {leg.accountId}{strategyText(leg) ? ` · ${strategyText(leg)}` : ''}</small>{leg.operation?.note ? <small>{leg.operation.note}</small> : null}</td>
+          <small>{role(index)} · {label(ORDER_TYPE, leg.orderType)}{leg.orderType === 'local-chase' && leg.operation?.limitPrice ? ` 挂 ${leg.operation.limitPrice}` : ''} · 账户 {leg.accountId}{strategyText(leg) ? ` · ${strategyText(leg)}` : ''}</small>{leg.operation?.note ? <small>{leg.operation.note}</small> : null}</td>
         <td data-label="价格保护界限">{leg.orderType === 'local-chase' && leg.limitPrice ? <>{leg.limitPrice}<small>自填追价界限</small></> : leg.priceBound ?? '—'}</td>
       </tr>)}</tbody>
     </table></div>
@@ -378,10 +384,10 @@ function JobCard({ job, busy, strategyId, onStrategyId, onAction }: { job: OilJo
     </div> : null}
     {actions.acknowledge ? <div className="execution-reconcile" role="group" aria-label="人工处理">
       <strong>需要人工处理</strong>
-      <p>请在交易所核对两腿敞口与挂单，处理完后释放合约；释放前这两个合约不能再下单。</p>
+      <p>{rebalance ? '请在交易所核对海力士 ADR 与正股的持仓与挂单，处理完后释放合约；释放前这两个合约不能再下单。' : '请在交易所核对两腿敞口与挂单，处理完后释放合约；释放前这两个合约不能再下单。'}</p>
       <div className="execution-actions"><button type="button" className="button secondary" data-oil-ack={job.id} disabled={busy} onClick={() => onAction(job, 'acknowledge')}>已人工处理，释放合约</button></div>
     </div> : null}
-    <footer><span>{job.locked ? '合约锁占用中：这两个合约暂不能再下单。' : '合约锁已释放。'}{job.acknowledgedAt ? `已人工处理 ${stamp(job.acknowledgedAt)}。` : ''}</span><span>停止只撤销余单，已成交仓位保留。</span></footer>
+    <footer><span>{job.locked ? rebalance ? '合约锁占用中：ADR 与正股合约暂不能再下单。' : '合约锁占用中：这两个合约暂不能再下单。' : '合约锁已释放。'}{job.acknowledgedAt ? `已人工处理 ${stamp(job.acknowledgedAt)}。` : ''}</span><span>停止只撤销余单，已成交仓位保留。</span></footer>
     <details className="execution-events"><summary>执行记录与编号（{job.events.length}）</summary><p>任务编号：{job.id} · 最迟结束：{stamp(job.deadlineAt)}（北京时间）</p>
       <ul>{job.events.map((event, index) => {
         const note = ['reason', 'message', 'note'].map(key => event[key]).find(value => typeof value === 'string') as string | undefined;
@@ -434,7 +440,7 @@ export function JobsSection({ jobs, stale, tracked, onUntrack, onChanged }: { jo
     {message ? <p className={`execution-message${message.tone === 'err' ? ' warning' : ''}`} id="oilJobMsg" role="status">{message.text}</p> : null}
     {trackedJob ? <section ref={trackingRef} className="execution-jobs execution-tracking" id="oilTracking" aria-label="成交进度与结果">
       <div className="oil-tracking-heading"><h3>成交进度与结果</h3><button type="button" className="button secondary" data-oil-untrack onClick={onUntrack}>收起</button></div>
-      <p className={`execution-tracking-status${stale || trackedJob.status === 'attention' || trackedJob.status === 'failed' ? ' warning' : ''}`} role="status">{stale ? '进度暂未更新，以下保留上次读取的结果；恢复后继续核对。' : TRACKING_STATUS[trackedJob.status] ?? label(JOB_STATUS, trackedJob.status)}</p>
+      <p className={`execution-tracking-status${stale || trackedJob.status === 'attention' || trackedJob.status === 'failed' ? ' warning' : ''}`} role="status">{stale ? '进度暂未更新，以下保留上次读取的结果；恢复后继续核对。' : (isRebalance(trackedJob) ? REBALANCE_TRACKING : TRACKING_STATUS)[trackedJob.status] ?? label(JOB_STATUS, trackedJob.status)}</p>
       {card(trackedJob)}
     </section> : null}
     {active.length ? <section className="execution-jobs" id="oilActiveJobs" aria-labelledby="oil-active-title"><h3 id="oil-active-title">执行进度</h3>{active.map(card)}</section> : null}

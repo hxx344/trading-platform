@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
-import { ContractError, parseIntent } from '../src/contracts.ts';
+import { ContractError, parseIntent, parsePairIntent } from '../src/contracts.ts';
 import { cmp } from '../src/decimal.ts';
 import { splitBarrels } from '../src/barrels.ts';
 import { SIM_ACCOUNTS } from '../src/simulation.ts';
@@ -30,12 +30,12 @@ async function withHarness(run: (h: Harness) => Promise<void>, options: Paramete
 async function tick(h: Harness, ms = 1_000) { await h.ex.tick(); h.advance(ms); }
 
 test('意图：本地追价只用于 Binance 首腿、可带追价界限；分批只用于首腿市价或本地追价，总间隔须短于最长执行时间', () => {
-  const parsed = parseIntent(leadIntent({ limitPrice: '70.10', batches: { count: 3, intervalMs: 5_000 } }));
+  const parsed = parsePairIntent(leadIntent({ limitPrice: '70.10', batches: { count: 3, intervalMs: 5_000 } }));
   assert.equal(parsed.legs[0].orderType, 'local-chase');
   assert.equal(parsed.legs[0].limitPrice, '70.1');
   assert.deepEqual(parsed.batches, { count: 3, intervalMs: 5_000 });
-  assert.equal(parseIntent(leadIntent({ batches: { count: 1, intervalMs: 0 } })).batches, undefined, '一批等于不分批');
-  assert.equal(parseIntent(leadIntent()).legs[0].limitPrice, null, '不填界限时用预览的价格保护界限');
+  assert.equal(parsePairIntent(leadIntent({ batches: { count: 1, intervalMs: 0 } })).batches, undefined, '一批等于不分批');
+  assert.equal(parsePairIntent(leadIntent()).legs[0].limitPrice, null, '不填界限时用预览的价格保护界限');
   const base = leadIntent();
   assert.throws(() => parseIntent({ ...base, legs: [base.legs[0], { ...base.legs[1], orderType: 'local-chase' }] }), code('chase_unsupported'));
   assert.throws(() => parseIntent({ ...base, legs: [{ ...base.legs[0], venue: 'bybit' }, { ...base.legs[1], venue: 'binance' }] }), code('chase_unsupported'));

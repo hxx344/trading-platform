@@ -4,8 +4,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { add, bandEdge, cmp, floorToStep, isMultiple, isZero, mul, sub, units, fromUnits } from './decimal.ts';
 import {
-  ContractError, MAX_SLIPPAGE_BPS, UUID, marketOfSymbol, MARKET_SYMBOLS, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, exactKeys, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseNotionalLimits, parseInstrument, parseIntent, parseQuote, positionOf, reject, text,
-  type AccountBinding, type NotionalLimits, type AccountSnapshot, type Action, type Environment, type Instrument, type Intent, type LegOrderType, type Market, type OrderSide, type PositionSide, type Quote, type TransferConfig, type Venue,
+  ContractError, HYNIX_SYMBOLS, MAX_SLIPPAGE_BPS, UUID, marketOfSymbol, MARKET_SYMBOLS, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, exactKeys, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseNotionalLimits, parseInstrument, parseIntent, parseQuote, positionOf, reject, text,
+  type AccountBinding, type NotionalLimits, type AccountSnapshot, type Action, type Environment, type Instrument, type LegOrderType, type Market, type OrderSide, type PairIntent, type PositionSide, type Quote, type RebalanceIntent, type TransferConfig, type Venue,
 } from './contracts.ts';
 import {
   STRATEGY_ID, VenueError, parseOrderReport, parseStrategyAck, parseStrategyReport, strategyRequestOf, supportsChase,
@@ -14,6 +14,7 @@ import {
 import type { Store } from './store.ts';
 import { nearestBarrels, quantityForBarrels, splitBarrels } from './barrels.ts';
 import { midOf, quantityForNotional } from './hynix/sizing.ts';
+import { pairBalance, rebalanceOrder, type HeldContract, type RebalanceMethod } from './hynix/balance.ts';
 import { createTransfers, type PairRecord, type TransferDeps } from './transfer.ts';
 import { DEFAULT_ADL_BUDGETS, createAdl, type Adl, type AdlBudgets } from './adl.ts';
 import type { AdlConnector } from './adl-contracts.ts';
@@ -127,12 +128,14 @@ export interface PlannedLeg {
   chaseCeiling?: string | null;
   quote: Pick<Quote, 'bid' | 'ask' | 'receivedAt' | 'connectionGeneration' | 'sequence'>;
 }
-export interface Preview {
+type PairLegs = [PlannedLeg, PlannedLeg];
+/** The other hynix leg of a rebalance: never traded by the job, but locked and required to stay as the preview read it. */
+export interface RebalanceCounter { symbol: string; side: PositionSide; quantity: string; positionMode: 'one-way' | 'hedge' }
+export interface RebalancePlan { method: RebalanceMethod; counter: RebalanceCounter }
+interface PreviewBase {
   id: string;
   expiresAt: number;
   writerGeneration: number;
-  intent: Intent;
-  legs: [PlannedLeg, PlannedLeg];
   /** USDT, as counted against the notional limits; recomputed from the legs at confirm, never trusted from here. */
   notional: string;
   /** Barrels per leg (quantity × contract size, equal on both legs). Absent in previews written before it existed. */
@@ -141,7 +144,18 @@ export interface Preview {
   batches?: string[];
   notes: string[];
 }
-export interface Job {
+export interface PairPreview extends PreviewBase { intent: PairIntent; legs: PairLegs; rebalance?: undefined }
+/** before and after: USDT notional at the preview's book midpoints; after is the estimate once the order fills in full. */
+export interface RebalancePreview extends PreviewBase {
+  intent: RebalanceIntent;
+  legs: [PlannedLeg];
+  rebalance: RebalancePlan & {
+    before: { longNotional: string; shortNotional: string; gap: string; percent: string; netSide: PositionSide | null };
+    after: { gap: string; netSide: PositionSide | null };
+  };
+}
+export type Preview = PairPreview | RebalancePreview;
+interface JobBase {
   id: string;
   status: JobStatus;
   reason: string | null;
@@ -150,7 +164,6 @@ export interface Job {
   previewId: string;
   requestId: string;
   action: Action;
-  legs: [PlannedLeg, PlannedLeg];
   /** Set by takeover recovery: reconcile what was sent, never send anything new for this job. */
   holdNewSends: boolean;
   /** attention keeps its symbol locks until a person acknowledges the remaining exposure. */
@@ -168,6 +181,18 @@ export interface Job {
    */
   leadWithdraw?: string | null;
 }
+/** A lead and its hedge (oil, hynix). */
+export interface PairJob extends JobBase { legs: PairLegs; rebalance?: undefined }
+/** One hynix order that levels the two legs' notional; action is that order's (close for reduce, open for add). */
+export interface RebalanceJob extends JobBase { legs: [PlannedLeg]; rebalance: RebalancePlan }
+export type Job = PairJob | RebalanceJob;
+const isPair = (job: Job): job is PairJob => job.legs.length === 2;
+const REBALANCE_ACTION: Record<RebalanceMethod, Action> = { reduce: 'close', add: 'open' };
+/** Every symbol a job or preview holds on its account: its legs, and a rebalance's other leg too. */
+const lockResources = (value: { legs: readonly PlannedLeg[]; rebalance?: { counter: Pick<RebalanceCounter, 'symbol'> } }): string[] =>
+  [...value.legs.map(leg => `${leg.accountKey}:${leg.symbol}`), ...(value.rebalance && value.legs[0] ? [`${value.legs[0].accountKey}:${value.rebalance.counter.symbol}`] : [])];
+/** A leg by its operation index; a rebalance job only has leg 0, which every path of its own uses. */
+const legAt = (job: Pick<Job, 'legs'>, index: 0 | 1): PlannedLeg => (index === 0 ? job.legs[0] : job.legs.length === 2 ? job.legs[1] : undefined) ?? reject('leg_missing', '任务没有该腿', 500);
 export interface Operation {
   id: string;
   jobId: string;
@@ -297,7 +322,7 @@ const legNotional = (leg: Pick<PlannedLeg, 'quantity' | 'instrument' | 'priceBou
 /** Legs are told apart by venue across venues and by contract on one venue. */
 const legLabel = (legs: readonly Pick<PlannedLeg, 'venue' | 'symbol'>[], index: number): string => {
   const leg = legs[index]!;
-  return legs[0]!.venue === legs[1]!.venue ? `${VENUE_NAMES[leg.venue]} ${leg.symbol}` : VENUE_NAMES[leg.venue];
+  return legs.length < 2 || legs[0]!.venue === legs[1]!.venue ? `${VENUE_NAMES[leg.venue]} ${leg.symbol}` : VENUE_NAMES[leg.venue];
 };
 /** Both legs carry the same barrels, so the job's notional is the dearer leg, not their sum. */
 const jobNotional = (legs: readonly PlannedLeg[]): string => maxOf(...legs.map(legNotional));
@@ -416,7 +441,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     }
     for (const job of unfinishedJobs()) {
       if (job.status === 'accepted' && !opsOf(job.id).length) finish(job, 'failed', '服务重启时任务尚未发送，已取消；请重新预览');
-      else if (!job.holdNewSends) { job.holdNewSends = true; job.reason = '服务恢复：核对已发送委托；首腿不再新发并撤销挂单，已成交部分按落盘进度补发对冲腿'; saveJob(job); event(job.id, 'job-held', {}); }
+      else if (!job.holdNewSends) { job.holdNewSends = true; job.reason = isPair(job) ? '服务恢复：核对已发送委托；首腿不再新发并撤销挂单，已成交部分按落盘进度补发对冲腿' : '服务恢复：核对已发送的调平委托；不再新发并撤销挂单'; saveJob(job); event(job.id, 'job-held', {}); }
     }
     transfers.recover();
     adl.recover();
@@ -574,6 +599,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (typeof session !== 'string' || !/^[\x21-\x7e]{8,128}$/.test(session)) reject('session', '会话无效', 401);
     const intent = parseIntent(input);
     assertWriter();
+    if (intent.preset === 'rebalance') return previewRebalance(intent, session);
     const accounts = intent.legs.map(leg => accountFor(leg.venue) ?? reject('account_missing', `${VENUE_NAMES[leg.venue]} 尚未绑定已核验的账户`, 409));
     for (const leg of intent.legs) if (connectorFor(leg.venue).capabilities.maxClientOrderIdLength < CLIENT_ORDER_ID_LENGTH) reject('client_order_id', `${VENUE_NAMES[leg.venue]} 客户订单号长度上限不足`, 409);
     for (const leg of intent.legs) if (leg.orderType === 'chase') chaseConnector(leg.venue);
@@ -634,7 +660,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     checkNotional(notional, intent.action);
     const capNote = !limits ? null
       : `名义金额按价格保护界限计 ${notional} USDT；单笔上限 ${limits.perJob} USDT，累计开仓上限 ${limits.totalOpen} USDT（确认时按当时累计再核一次，超限拒绝；对冲腿市价成交可能高于此估算）。`;
-    const value: Preview = {
+    const value: PairPreview = {
       id: randomUUID(), expiresAt: at + budgets.previewTtlMs, writerGeneration: generation, intent, legs, notional, ...(hynix ? {} : { barrels: fromUnits(a) }), ...(batches ? { batches } : {}),
       notes: [
         hynix
@@ -656,11 +682,86 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         environment === 'mainnet' ? '实盘传输：确认后委托会发送到真实交易所账户。' : '模拟传输：不会访问任何真实交易所。',
       ],
     };
+    return storePreview(value, session);
+  }
+  function storePreview<T extends Preview>(value: T, session: string): T {
     write(() => {
       db.prepare('DELETE FROM previews WHERE expires_at < ? AND consumed_job IS NULL').run(now());
       db.prepare('INSERT INTO previews(id, session, expires_at, json) VALUES (?, ?, ?, ?)').run(value.id, session, value.expiresAt, JSON.stringify(value));
     });
     return value;
+  }
+
+  /**
+   * A single order that levels the two hynix legs the venue's account holds (docs/hynix.md 7.3). Which leg, which way and
+   * how much are worked out here from the positions and books just read; the other leg is checked and locked, not traded.
+   */
+  async function previewRebalance(intent: RebalanceIntent, session: string): Promise<RebalancePreview> {
+    const { venue, method } = intent, venueName = VENUE_NAMES[venue];
+    const account = accountFor(venue) ?? reject('account_missing', `${venueName} 尚未绑定已核验的账户`, 409);
+    if (connectorFor(venue).capabilities.maxClientOrderIdLength < CLIENT_ORDER_ID_LENGTH) reject('client_order_id', `${venueName} 客户订单号长度上限不足`, 409);
+    for (const symbol of HYNIX_SYMBOLS) if (db.prepare('SELECT 1 FROM locks WHERE resource = ?').get(`${account.account_key}:${symbol}`)) reject('symbol_locked', `${venueName} ${symbol} 已有未结束任务，调平须两个合约都空闲`, 409);
+    const binding = bindingOf(account);
+    const reads = await Promise.all(HYNIX_SYMBOLS.map(async symbol => {
+      const [instrument, quote, snapshot] = await Promise.all([readInstrument(venue, symbol), readQuote(venue, symbol), readAccount(binding, symbol)]);
+      return { symbol, instrument, quote, snapshot };
+    }));
+    const at = now();
+    for (const { quote } of reads) checkQuoteFresh(quote, at, budgets.previewQuoteMaxAgeMs, budgets.futureToleranceMs);
+    if (Math.abs(reads[0].quote.receivedAt - reads[1].quote.receivedAt) > budgets.pairQuoteWindowMs) reject('quote_window', `两腿盘口接收时间相差超过 ${budgets.pairQuoteWindowMs} 毫秒，请重新预览`, 409);
+    const held = reads.map(({ symbol, instrument, quote, snapshot }): HeldContract => (
+      { symbol, long: positionOf(snapshot, symbol, 'long'), short: positionOf(snapshot, symbol, 'short'), price: midOf(quote.bid, quote.ask), contractSize: instrument.contractSize }));
+    const balance = pairBalance(held[0], held[1]);
+    if (balance.status === 'none') return reject('rebalance_unpaired', `${venueName} 账户没有海力士持仓，无需调平`, 409);
+    if (balance.status === 'unpaired') return reject('rebalance_unpaired', `${venueName} 海力士两腿不成对（${balance.reason}），不能调平；请先人工处理`, 409);
+    const order = rebalanceOrder(balance, method, Object.fromEntries(reads.map(read => [read.symbol, read.instrument])));
+    if ('error' in order) return reject('rebalance_too_small', order.error, 409);
+    const target = reads.find(read => read.symbol === order.symbol) ?? reject('rebalance_target', '调平合约未读到', 500);
+    const other = reads.find(read => read.symbol !== order.symbol) ?? reject('rebalance_target', '另一腿合约未读到', 500);
+    const otherLeg = order.side === 'long' ? balance.short : balance.long, otherName = `${venueName} ${other.symbol}`;
+    // The other leg is not traded, so only what checkLegAccount would refuse for any symbol applies to it.
+    const otherMode = other.snapshot.positionModes[other.symbol] ?? reject('position_mode', `${otherName} 持仓模式无法确认，禁止下单`, 409);
+    if (other.snapshot.openOrders.some(item => item.symbol === other.symbol)) reject('external_orders', `${otherName} 存在本任务之外的活动委托`, 409);
+    const action = REBALANCE_ACTION[method], { instrument, quote } = target;
+    const orderSide = orderSideOf(action, order.side), slippageBps = intent.maxSlippageBps ?? budgets.maxSlippageBps;
+    const priceBound = orderSide === 'buy' ? bandEdge(quote.ask, slippageBps, 'up', instrument.tickSize) : bandEdge(quote.bid, slippageBps, 'down', instrument.tickSize);
+    const planned = { venue, symbol: order.symbol, side: order.side, quantity: order.quantity, orderType: 'market' as const, limitPrice: null };
+    checkQuantity(planned, instrument, quote, action);
+    const { baseline, positionMode } = checkLegAccount(planned, target.snapshot, action);
+    const leg: PlannedLeg = {
+      ...planned, index: 0, orderSide, reduceOnly: action === 'close', priceBound,
+      accountKey: accountKey(binding), accountId: binding.accountId, credentialVersion: binding.credentialVersion, accountMode: binding.accountMode, positionMode, baseline, instrument,
+      quote: { bid: quote.bid, ask: quote.ask, receivedAt: quote.receivedAt, connectionGeneration: quote.connectionGeneration, sequence: quote.sequence },
+    };
+    // The estimate after a full fill, on the same midpoints the quantity was worked out on.
+    const moved = action === 'close' ? sub(baseline, order.quantity) : add(baseline, order.quantity);
+    const afterHeld = held.map(item => item.symbol !== order.symbol ? item : order.side === 'long' ? { ...item, long: moved } : { ...item, short: moved });
+    const after = pairBalance(afterHeld[0], afterHeld[1]);
+    const afterGap = after.status === 'paired' ? after.gap : '0', afterSide = after.status === 'paired' ? after.netSide : null;
+    const legs: [PlannedLeg] = [leg];
+    const notional = jobNotional(legs);
+    checkNotional(notional, action);
+    const cents = (value: string): string => value.replace(/(\.\d{2})\d+$/, '$1');
+    const sideName = (side: PositionSide | null): string => side === 'long' ? '多头' : side === 'short' ? '空头' : '无';
+    const capNote = !limits ? null
+      : `名义金额按价格保护界限计 ${notional} USDT；单笔上限 ${limits.perJob} USDT，累计开仓上限 ${limits.totalOpen} USDT（确认时按当时累计再核一次，超限拒绝）。`;
+    const value: RebalancePreview = {
+      id: randomUUID(), expiresAt: at + budgets.previewTtlMs, writerGeneration: generation, intent, legs, notional,
+      rebalance: {
+        method, counter: { symbol: other.symbol, side: otherLeg.side, quantity: otherLeg.quantity, positionMode: otherMode },
+        before: { longNotional: balance.long.notional, shortNotional: balance.short.notional, gap: balance.gap, percent: balance.percent, netSide: balance.netSide },
+        after: { gap: afterGap, netSide: afterSide },
+      },
+      notes: [
+        `${method === 'reduce' ? '减仓调平' : '加仓调平'}：${action === 'close' ? '平' : '加'} ${venueName} ${order.symbol} ${sideName(order.side)} ${order.quantity}${action === 'close' ? '（只减仓）' : ''}，只发这一笔，未成交部分不补发。`,
+        `按预览中间价：多头 ${balance.long.symbol} 约 ${cents(balance.long.notional)} USDT，空头 ${balance.short.symbol} 约 ${cents(balance.short.notional)} USDT，净敞口 ${cents(balance.gap)} USDT（${sideName(balance.netSide)}多出 ${cents(balance.percent)}%）；全部成交后估算净敞口约 ${cents(afterGap)} USDT${afterSide ? `（${sideName(afterSide)}多出）` : ''}。`,
+        `价格保护 ${slippageBps} 基点：以 IOC 限价 ${priceBound} 发送，未即时成交的部分由交易所撤销；发送前盘口越过界限，或两腿持仓与预览时不一致，即不发送，任务失败。部分成交记为完成，可重新预览再调。`,
+        `另一腿 ${other.symbol}（${sideName(otherLeg.side)} ${otherLeg.quantity}）不下单，但任务期间与本合约一起锁定，其他任务不能改动。`,
+        ...(capNote ? [capNote] : []),
+        environment === 'mainnet' ? '实盘传输：确认后委托会发送到真实交易所账户。' : '模拟传输：不会访问任何真实交易所。',
+      ],
+    };
+    return storePreview(value, session);
   }
 
   // ---- confirm -----------------------------------------------------------------
@@ -682,12 +783,17 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         if (!row || row.account_key !== leg.accountKey || row.credential_version !== leg.credentialVersion || row.account_mode !== leg.accountMode) reject('binding_changed', `${VENUE_NAMES[leg.venue]} 账户绑定已变化，请重新预览`, 409);
         if (db.prepare('SELECT 1 FROM locks WHERE resource = ?').get(`${leg.accountKey}:${leg.symbol}`)) reject('symbol_locked', '所选合约已有未结束任务', 409);
       }
+      // A rebalance also holds its other leg, which no leg of the plan names.
+      for (const resource of lockResources(plan).slice(plan.legs.length)) if (db.prepare('SELECT 1 FROM locks WHERE resource = ?').get(resource)) reject('symbol_locked', '另一腿合约已有未结束任务', 409);
+      const action = plan.rebalance ? REBALANCE_ACTION[plan.rebalance.method] : plan.intent.action;
       // Inside the write transaction, so two confirms cannot both fit under the running total.
-      checkNotional(jobNotional(plan.legs), plan.intent.action);
-      const job: Job = { id: randomUUID(), status: 'accepted', reason: null, createdAt: now(), deadlineAt: now() + plan.intent.timeoutMs, previewId: plan.id, requestId: body.requestId, action: plan.intent.action, legs: plan.legs, holdNewSends: false, acknowledgedAt: null, hedgeWaitSince: null,
-        ...(plan.batches && plan.intent.batches ? { batches: plan.batches, batchIntervalMs: plan.intent.batches.intervalMs, batchDoneAt: null } : {}) };
+      checkNotional(jobNotional(plan.legs), action);
+      const base = { id: randomUUID(), status: 'accepted' as const, reason: null, createdAt: now(), deadlineAt: now() + plan.intent.timeoutMs, previewId: plan.id, requestId: body.requestId, action, holdNewSends: false, acknowledgedAt: null, hedgeWaitSince: null };
+      const job: Job = plan.rebalance
+        ? { ...base, legs: plan.legs, rebalance: { method: plan.rebalance.method, counter: plan.rebalance.counter } }
+        : { ...base, legs: plan.legs, ...(plan.batches && plan.intent.batches ? { batches: plan.batches, batchIntervalMs: plan.intent.batches.intervalMs, batchDoneAt: null } : {}) };
       db.prepare('INSERT INTO jobs(id, status, final, version, created_at, updated_at, json) VALUES (?, ?, 0, 1, ?, ?, ?)').run(job.id, job.status, job.createdAt, job.createdAt, JSON.stringify(job));
-      for (const leg of plan.legs) db.prepare('INSERT INTO locks(resource, job_id) VALUES (?, ?)').run(`${leg.accountKey}:${leg.symbol}`, job.id);
+      for (const resource of lockResources(job)) db.prepare('INSERT INTO locks(resource, job_id) VALUES (?, ?)').run(resource, job.id);
       db.prepare('UPDATE previews SET consumed_job = ? WHERE id = ?').run(job.id, plan.id);
       db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(body.requestId, 'confirm', payload, session, job.id, now());
       event(job.id, 'job-accepted', { previewId: plan.id, requestId: body.requestId });
@@ -786,7 +892,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
   function manualTarget(job: Job): { op: Operation; binding: AccountBinding } {
     const op = orphanOf(job);
-    const leg = job.legs[op.leg], row = accountFor(leg.venue);
+    const leg = legAt(job, op.leg), row = accountFor(leg.venue);
     if (!row || row.account_key !== leg.accountKey) reject('binding_changed', `${VENUE_NAMES[leg.venue]} 账户绑定已变化，暂不能核对`, 409);
     return { op, binding: bindingOf(row as AccountRow) };
   }
@@ -853,7 +959,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const payload = digest({ kind: 'confirm-not-created', jobId });
     assertWriter();
     if (priorCommand(requestId, payload, session)) return jobView(jobId);
-    const job = readJob(jobId), { op, binding } = manualTarget(job), leg = job.legs[op.leg], name = `${VENUE_NAMES[leg.venue]} ${leg.symbol}`;
+    const job = readJob(jobId), { op, binding } = manualTarget(job), leg = legAt(job, op.leg), name = `${VENUE_NAMES[leg.venue]} ${leg.symbol}`;
     const settledAt = createSettledAt(op);
     if (now() < settledAt) reject('create_window', `${name} 追价策略创建请求仍可能送达交易所，请约 ${Math.ceil((settledAt - now()) / 1000)} 秒后再确认`, 409);
     const tolerance = budgets.venueClockToleranceMs, sentAt = op.sentAt ?? op.preparedAt;
@@ -941,7 +1047,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
    * the first order). A local chase lead posts on its own side, so only the hedge's taker price is held to its bound here;
    * its post price is checked by chaseTarget. Returns the lead's book.
    */
-  async function guardLead(job: Job): Promise<Quote> {
+  async function guardLead(job: PairJob): Promise<Quote> {
     if (now() >= job.deadlineAt) reject('deadline', '任务已超过最长执行时间，未发送', 409);
     const checks = await Promise.all(job.legs.map(async leg => {
       const binding = bindingStillValid(leg);
@@ -965,9 +1071,30 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     for (const leg of job.legs) admit(leg);
     return checks[0].quote;
   }
+  /**
+   * Final send guard of a rebalance order: its book fresh and inside the preview bound, its account where the preview left it,
+   * and the other leg, which the quantity was worked out against, still exactly as the preview read it. Returns the book.
+   */
+  async function guardRebalance(job: RebalanceJob): Promise<Quote> {
+    if (now() >= job.deadlineAt) reject('deadline', '任务已超过最长执行时间，未发送', 409);
+    const leg = job.legs[0], counter = job.rebalance.counter, binding = bindingStillValid(leg);
+    const [quote, snapshot, counterSnapshot] = await Promise.all([readQuote(leg.venue, leg.symbol), readAccount(binding, leg.symbol), readAccount(binding, counter.symbol)]);
+    checkQuoteFresh(quote, now(), budgets.sendQuoteMaxAgeMs, budgets.futureToleranceMs);
+    const price = leg.orderSide === 'buy' ? quote.ask : quote.bid, bound = leg.priceBound ?? null;
+    if (bound !== null && (leg.orderSide === 'buy' ? cmp(price, bound) > 0 : cmp(price, bound) < 0)) reject('price_moved', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 盘口 ${price} 已越过价格保护界限 ${bound}，未发送`, 409);
+    const own = opsOf(job.id).map(item => item.clientOrderId);
+    const { baseline, positionMode } = checkLegAccount({ ...leg, quantity: unfilledOf(job, 0) }, snapshot, job.action, own);
+    if (cmp(baseline, expectedPosition(job, 0)) !== 0 || positionMode !== leg.positionMode) reject('position_changed', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 持仓已变化，调平委托未发送；请重新预览`, 409);
+    const name = `${VENUE_NAMES[leg.venue]} ${counter.symbol}`;
+    if (cmp(positionOf(counterSnapshot, counter.symbol, counter.side), counter.quantity) !== 0 || !isZero(positionOf(counterSnapshot, counter.symbol, counter.side === 'long' ? 'short' : 'long'))
+      || counterSnapshot.positionModes[counter.symbol] !== counter.positionMode) reject('position_changed', `${name}（另一腿）持仓已变化，调平委托未发送；请重新预览`, 409);
+    if (counterSnapshot.openOrders.some(order => order.symbol === counter.symbol)) reject('external_orders', `${name} 存在本任务之外的活动委托`, 409);
+    admit(leg);
+    return quote;
+  }
   /** What this job has yet to fill on a leg; a close needs at least that much position left. */
   function unfilledOf(job: Job, index: 0 | 1): string {
-    const left = sub(job.legs[index].quantity, add('0', ...opsOf(job.id).filter(item => item.leg === index).map(item => item.filledQuantity)));
+    const left = sub(legAt(job, index).quantity, add('0', ...opsOf(job.id).filter(item => item.leg === index).map(item => item.filledQuantity)));
     return cmp(left, '0') > 0 ? left : '0';
   }
   /**
@@ -992,7 +1119,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
    * The hedge reduces the lead's exposure: only the account basis that decides its quantity is required (L084).
    * A resumed hedge expects the preview baseline moved by the fills of this job's earlier hedge orders.
    */
-  async function guardHedge(job: Job): Promise<void> {
+  async function guardHedge(job: PairJob): Promise<void> {
     const leg = job.legs[1], binding = bindingStillValid(leg), snapshot = await readAccount(binding, leg.symbol);
     const { baseline, positionMode } = checkLegAccount({ ...leg, quantity: '0' }, snapshot, job.action);
     if (cmp(baseline, expectedPosition(job, 1)) !== 0 || positionMode !== leg.positionMode) reject('position_changed', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 持仓已变化，对冲腿未发送`, 409);
@@ -1000,7 +1127,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
 
   async function send(job: Job, index: 0 | 1, quantity: string, attempt = 0, lead: { batch: number; price: string | null } = { batch: 0, price: null }): Promise<void> {
-    const leg = job.legs[index], orderType = leg.orderType, clientOrderId = clientOrderIdFor(job, index, attempt);
+    const leg = legAt(job, index), orderType = leg.orderType, clientOrderId = clientOrderIdFor(job, index, attempt);
     let request: OrderRequest | ChaseRequest;
     if (orderType === 'local-chase') {
       // Post-only, so the venue refuses it rather than let it take liquidity past the chase bound.
@@ -1026,7 +1153,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     try { await sendPrepared(job, index, op, request); } finally { inFlight.delete(op.id); }
   }
   async function sendPrepared(job: Job, index: 0 | 1, op: Operation, request: OrderRequest | ChaseRequest): Promise<void> {
-    const leg = job.legs[index], quantity = request.quantity;
+    const leg = legAt(job, index), quantity = request.quantity;
     const binding = write(() => {
       const current = readJob(job.id);
       // After a takeover only the hedge may still go out; any earlier order of the same leg must be settled and older.
@@ -1149,7 +1276,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   async function reconcile(job: Job, op: Operation): Promise<void> {
     // A released create has nothing the venue can be asked about, and its release note must stay.
     if (op.releasedAt != null) return;
-    const leg = job.legs[op.leg], row = accountFor(leg.venue);
+    const leg = legAt(job, op.leg), row = accountFor(leg.venue);
     // Reconciling on another principal could find nothing and wrongly conclude not-created.
     if (!row || row.account_key !== leg.accountKey) { write(() => { const current = readOp(op.id); current.note = '账户绑定已变化，暂停核对'; saveOp(current); }); return; }
     if (isStrategy(op)) return reconcileStrategy(job, op, bindingOf(row));
@@ -1281,7 +1408,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
   /** Baseline plus this job's settled fills on the leg, excluding the operation under test (which has none known). */
   function expectedPosition(job: Job, index: 0 | 1): string {
-    const leg = job.legs[index], filled = add('0', ...opsOf(job.id).filter(item => item.leg === index).map(item => item.filledQuantity));
+    const leg = legAt(job, index), filled = add('0', ...opsOf(job.id).filter(item => item.leg === index).map(item => item.filledQuantity));
     return job.action === 'open' ? add(leg.baseline, filled) : sub(leg.baseline, filled);
   }
 
@@ -1292,7 +1419,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const strategyId = isStrategy(op) ? op.remoteId : undefined;
     // Checked here too, so no caller can stop a strategy id that no read has shown to be this create's.
     if (strategyId === null || (strategyId !== undefined && (op.identityVerifiedAt == null || op.identityMismatchAt != null))) return;
-    const leg = job.legs[op.leg], binding = bindingOf(accountFor(leg.venue) ?? reject('account_missing', '账户绑定缺失，保留待核对', 409));
+    const leg = legAt(job, op.leg), binding = bindingOf(accountFor(leg.venue) ?? reject('account_missing', '账户绑定缺失，保留待核对', 409));
     const seq = (op.cancelSeq ?? 0) + 1;
     let stopFailed: string | null = null;
     // The shared operation comes first: a sequence above the local one then proves this cancel was never sent.
@@ -1390,6 +1517,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       });
       return;
     }
+    if (!isPair(job)) { await progressRebalance(job, stop); return; }
     const leads = legOps(job.id, 0), hedges = legOps(job.id, 1);
     if (leads.length === 0) {
       if (stop) { write(() => finish(readJob(job.id), 'stopped', '已停止，未发送任何委托')); return; }
@@ -1509,6 +1637,30 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     write(() => settleJob(readJob(job.id), next?.end ?? (job.leadWithdraw ? '对冲腿一度无法发送，已撤销首腿挂单' : undefined)));
   }
 
+  /**
+   * After the shared steps of progress (reconciling, withdrawing, escalation): the one order goes out once, is waited on, and
+   * the job settles from what it filled. Nothing is ever sent again, and there is no hedge.
+   */
+  async function progressRebalance(job: RebalanceJob, stop: boolean): Promise<void> {
+    const orders = legOps(job.id, 0);
+    if (orders.length === 0) {
+      if (stop) { write(() => finish(readJob(job.id), 'stopped', '已停止，未发送任何委托')); return; }
+      if (job.holdNewSends) { write(() => finish(readJob(job.id), 'failed', '服务恢复后不再发送新委托')); return; }
+      let quote: Quote;
+      try { quote = await guardRebalance(job); }
+      catch (error) {
+        const reason = error instanceof Error ? error.message.slice(0, 200) : '发送前检查失败';
+        const retry = error instanceof ContractError && error.code === 'venue_read_failed' || error instanceof ControlRefusal && error.transient;
+        if (retry && now() < job.deadlineAt) { write(() => { const current = readJob(job.id); current.reason = reason; saveJob(current); }); return; }
+        write(() => finish(readJob(job.id), 'failed', reason)); return;
+      }
+      await sendLead(job, quote, 0, 0);
+      return;
+    }
+    if (orders.some(item => !SETTLED.has(item.state))) return;
+    write(() => settleJob(readJob(job.id)));
+  }
+
   /** The lead's next order: a market or limit lead sends the batch whole, a local chase posts it at its target price. */
   async function sendLead(job: Job, quote: Quote, batch: number, attempt: number, quantity = (job.batches ?? [job.legs[0].quantity])[0] as string): Promise<void> {
     const lead = job.legs[0];
@@ -1518,10 +1670,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   const restingLeadOrder = (jobId: string): Operation | undefined => legOps(jobId, 0).find(item => item.state === 'open' && !isStrategy(item));
   /** Records why the lead is being withdrawn; the first reason stays. */
   function holdLead(jobId: string, reason: string): void {
-    write(() => { const current = readJob(jobId); if (current.leadWithdraw) return; current.leadWithdraw = reason.slice(0, 240); current.reason = `正在撤销首腿挂单：${reason.slice(0, 160)}`; saveJob(current); });
+    write(() => { const current = readJob(jobId); if (current.leadWithdraw) return; current.leadWithdraw = reason.slice(0, 240); current.reason = `${isPair(current) ? '正在撤销首腿挂单' : '正在撤销调平委托'}：${reason.slice(0, 160)}`; saveJob(current); });
   }
   /** Why the lead was being withdrawn, ahead of a reason that would otherwise hide it. */
-  const withdrawnFor = (job: Job): string => job.leadWithdraw ? `撤首腿挂单（${job.leadWithdraw.slice(0, 120)}）时：` : '';
+  const withdrawnFor = (job: Job): string => job.leadWithdraw ? `${isPair(job) ? '撤首腿挂单' : '撤调平委托'}（${job.leadWithdraw.slice(0, 120)}）时：` : '';
   /** A lead order that neither rested nor filled. */
   const missed = (op: Operation): boolean => isZero(op.filledQuantity) && (op.state === 'rejected' || op.state === 'not-sent' || op.state === 'not-created' || (op.state === 'canceled' && op.venueStatus === 'expired'));
   /**
@@ -1585,7 +1737,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
 
   const marketOfJob = (job: Pick<Job, 'legs'>): Market => marketOfSymbol(job.legs[0].symbol);
   /** Hedge the lead's actual fill in the planned proportion, floored to the hedge venue's step. */
-  function hedgeQuantityFor(job: Job, leadFilled: string): string {
+  function hedgeQuantityFor(job: PairJob, leadFilled: string): string {
     const [lead, hedge] = job.legs;
     const scaled = fromUnits(units(hedge.quantity) * units(leadFilled) / units(lead.quantity));
     return floorToStep(scaled, hedge.instrument.quantityStep);
@@ -1594,6 +1746,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   /** note: why the lead stopped early, when it did. */
   function settleJob(job: Job, note?: string): void {
     if (FINAL_JOB.has(job.status)) return;
+    if (!isPair(job)) { settleRebalance(job); return; }
     const ops = opsOf(job.id), filled = (index: 0 | 1) => add('0', ...ops.filter(item => item.leg === index).map(item => item.filledQuantity));
     const leadExposure = exposure(filled(0), job.legs[0].instrument), hedgeExposure = exposure(filled(1), job.legs[1].instrument);
     const lead = ops.filter(item => item.leg === 0).sort((a, b) => attemptOf(a) - attemptOf(b)).at(-1);
@@ -1624,6 +1777,18 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     }
     const why = refused?.state === 'rejected' ? `对冲腿被交易所拒绝（${(refused.note ?? '').slice(0, 80)}），不再补发；` : stopRequested(job.id) ? '已请求停止，不再补发对冲腿；' : '';
     finish(job, 'attention', `${why}两腿成交不平衡：${legLabel(job.legs, 0)} ${filled(0)}，${legLabel(job.legs, 1)} ${filled(1)}，未对冲 ${gap} 桶；敞口保留，需人工处理`);
+  }
+
+  /** A partial fill still levels part of the gap and leaves no new exposure, so it completes; nothing is sent for the rest. */
+  function settleRebalance(job: RebalanceJob): void {
+    const ops = legOps(job.id, 0), leg = job.legs[0], filled = add('0', ...ops.map(item => item.filledQuantity)), last = ops.at(-1);
+    if (isZero(filled)) {
+      const why = !last ? '未发送' : last.state === 'canceled' ? '价格保护界限内没有成交，已由交易所撤销' : last.state === 'rejected' ? '交易所拒绝' : last.state === 'not-created' ? '未送达交易所' : last.state === 'not-sent' ? '未发送' : last.state;
+      finish(job, stopRequested(job.id) ? 'stopped' : 'failed', `调平委托未成交（${why}${last?.note ? `：${last.note.slice(0, 120)}` : ''}）`);
+      return;
+    }
+    if (cmp(filled, leg.quantity) === 0) { finish(job, 'completed', null); return; }
+    finish(job, 'completed', `调平委托成交 ${filled}，计划 ${leg.quantity}；未成交部分已由交易所撤销，可重新预览再调平`);
   }
 
   // ---- retention ---------------------------------------------------------------
@@ -1804,7 +1969,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const job = readJob(id), ops = opsOf(id);
     const events = (db.prepare('SELECT type, at, json FROM events WHERE job_id = ? ORDER BY seq DESC LIMIT 40').all(id) as { type: string; at: number; json: string }[]).reverse().map(row => ({ type: row.type, at: row.at, ...JSON.parse(row.json) }));
     return {
-      id: job.id, market: marketOfJob(job), preset: job.legs[0].venue === job.legs[1].venue ? 'same-exchange' as const : 'cross-exchange' as const, action: job.action, status: job.status, reason: job.reason, stopRequested: stopRequested(id), createdAt: job.createdAt, deadlineAt: job.deadlineAt, holdNewSends: job.holdNewSends,
+      id: job.id, market: marketOfJob(job), preset: !isPair(job) ? 'rebalance' as const : job.legs[0].venue === job.legs[1].venue ? 'same-exchange' as const : 'cross-exchange' as const,
+      rebalance: job.rebalance ? { method: job.rebalance.method } : null, action: job.action, status: job.status, reason: job.reason, stopRequested: stopRequested(id), createdAt: job.createdAt, deadlineAt: job.deadlineAt, holdNewSends: job.holdNewSends,
       locked: !!db.prepare('SELECT 1 FROM locks WHERE job_id = ? LIMIT 1').get(id), acknowledgedAt: job.acknowledgedAt,
       /** A strategy create without an answer waits for adoption, a confirmation of not-created or a release. */
       strategyPending: ops.some(isOrphanStrategy),

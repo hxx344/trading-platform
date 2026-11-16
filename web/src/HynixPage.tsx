@@ -4,7 +4,9 @@ import { api } from './api.ts';
 import { clock, label } from './labels.ts';
 import { ACTIVE_STATUSES, type OilVenue } from './oil-form.ts';
 import { DEFAULT_HYNIX_FORM, HYNIX_LABEL, LEG_FIELDS, HYNIX_SYMBOLS, LEAD_TYPES, VENUE_LABEL, closeQuantities, describeHynixIntent, draftHynixLegs, hynixFormToIntent, leadTypeAllowed, type HynixForm, type HynixIntent, type HynixSymbol } from './hynix-form.ts';
-import type { OilBook, OilConfirmResult, OilJob, OilPreview, OilState } from './oil-types.ts';
+import type { HynixState, OilBook, OilConfirmResult, OilJob, OilPreview, OilState } from './oil-types.ts';
+import { BalancePanel } from './HynixBalance.tsx';
+import { readBalance } from './hynix-balance.ts';
 import { ACCOUNT_MODE, ACTIVE_MS, Choice, IDLE_MS, JOB_STATUS, JobsSection, LEAVE_UNANSWERED, MARKET_MS, OIL_READ_TIMEOUT_MS, ORDER_TYPE, PositionsPanel, SyncLine, buys, confirmRefused, errorText, operation, staleness, statusOf, venueName, type PositionsKind } from './OilPage.tsx';
 import { RequestIds } from './request-ids.ts';
 import { StatePanel } from './StateViews.tsx';
@@ -13,8 +15,8 @@ import './trading.css';
 
 // The SK hynix page (docs/hynix.md), laid out as the workbench trading page's hynix market (TradingSpread /
 // TradingExecution, workbench origin/main 7745181; styles are the ones trading.css already copied for oil): the premium
-// and books, the hynix positions, then one execution panel with the caps (shared with oil), the jobs, the preview and the
-// order form. Execution accounts, locks and the executor are oil's.
+// and books, the hynix positions, the two legs' notional balance with its rebalance (HynixBalance.tsx), then one execution
+// panel with the jobs, the preview and the order form. Execution accounts, locks and the executor are oil's.
 export const HYNIX_STATE_PATH = '/api/hynix/state';
 
 interface HynixMarket {
@@ -258,18 +260,22 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
 export function HynixPage({ onExpired }: { onExpired: () => void }) {
   const [tracked, setTracked] = useState<string | null>(null);
   const [active, setActive] = useState(false);
-  const state = useLiveResource<OilState>(HYNIX_STATE_PATH, { intervalMs: active ? ACTIVE_MS : IDLE_MS, timeoutMs: OIL_READ_TIMEOUT_MS, onExpired });
+  const state = useLiveResource<HynixState>(HYNIX_STATE_PATH, { intervalMs: active ? ACTIVE_MS : IDLE_MS, timeoutMs: OIL_READ_TIMEOUT_MS, onExpired });
   const market = useLiveResource<HynixMarket>('/api/hynix/market', { intervalMs: MARKET_MS, timeoutMs: OIL_READ_TIMEOUT_MS, onExpired });
   const jobs = state.data?.jobs;
   useEffect(() => { setActive(!!jobs?.some(job => ACTIVE_STATUSES.includes(job.status))); }, [jobs]);
   const refreshMs = active ? ACTIVE_MS : IDLE_MS;
   const { stale, text } = staleness(state, refreshMs);
+  const rawBalance = state.data?.balance;
+  const balance = useMemo(() => readBalance(rawBalance), [rawBalance]);
+  const accepted = (job: OilJob): void => { setTracked(job.id); setActive(true); void state.refresh(); };
   if (state.error && statusOf(state.error) === 404) return <StatePanel kind="empty" title="本服务没有配置海力士执行" detail="海力士与原油共用执行账户：在「设置」页「从工作台导入」勾选原油执行账户（或在 config.json 写入 oil）后重启服务。" />;
   return <div className="trading-page oil-page hynix-page">
     <div className="trading-trade-top">
       <MarketPanel live={market} />
       {state.data ? <PositionsPanel state={state.data} stale={stale} kind={POSITIONS} /> : null}
     </div>
+    {state.data && balance ? <BalancePanel balance={balance} stale={stale} receivedAt={state.receivedAt} onSaved={() => { void state.refresh(); }} onAccepted={accepted} /> : null}
     {!state.data ? (state.status === 'error' || state.status === 'offline'
       ? <StatePanel kind="error" title="读取海力士状态失败" detail={state.error?.message ?? '网络离线'} />
       : <StatePanel kind="loading" title="加载中…" />)
@@ -278,7 +284,7 @@ export function HynixPage({ onExpired }: { onExpired: () => void }) {
           <button className="button secondary" type="button" onClick={() => void state.refresh()}><RefreshCw size={15} aria-hidden="true" />刷新执行状态</button></header>
         <SyncLine stale={stale} text={text} every={`每 ${refreshMs / 1000} 秒`} at={state.receivedAt} />
         <JobsSection jobs={state.data.jobs} stale={stale} tracked={tracked} onUntrack={() => setTracked(null)} onChanged={() => { void state.refresh(); }} />
-        <OrderForm state={state.data} onAccepted={job => { setTracked(job.id); setActive(true); void state.refresh(); }} />
+        <OrderForm state={state.data} onAccepted={accepted} />
       </section>}
   </div>;
 }

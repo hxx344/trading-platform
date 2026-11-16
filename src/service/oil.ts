@@ -9,6 +9,9 @@ import type { FetchLike } from '../live/http.ts';
 import type { LiveCredentials } from '../live/values.ts';
 import { createOilMarket, MARKET_READ_MS, POSITIONS_READ_MS, type OilMarket } from '../oil/market.ts';
 import { createHynixMarket, type HynixMarket } from '../hynix/market.ts';
+import { DEFAULT_BALANCE_SETTINGS, type BalanceSettings } from '../hynix/balance.ts';
+import { createBalanceStore, HYNIX_DATABASE } from '../hynix/balance-store.ts';
+import { createBalanceAlerts } from '../hynix/balance-alert.ts';
 import { createOilRules, OIL_RULES_DATABASE } from '../oil/rules.ts';
 import { createOilPnl, LEDGER_SYNC_MS, OIL_PNL_DATABASE, PNL_RANGES, PNL_SAMPLE_MS, type PnlRange } from '../oil/pnl.ts';
 import type { RuleExecutor } from '../oil/rule-live.ts';
@@ -117,11 +120,72 @@ export function oilViews(oil: OilRuntime, executor: Executor, rules?: OilRulesRu
   };
 }
 
-/** The page's hynix reads (docs/hynix.md): the books and premium, the accounts, hynix positions and hynix jobs. */
-export function hynixViews(oil: OilRuntime, executor: Executor) {
+/** The H2 balance settings as the page, the alerts and the save use them; a store that cannot open keeps the defaults. */
+export interface HynixBalanceRuntime {
+  settings(): BalanceSettings;
+  /** False only when the file cannot be used: saves are refused. */
+  readonly available: boolean;
+  /** Why the defaults are in effect: the file cannot be used, or the saved value is invalid (a save then overwrites it). */
+  readonly error: string | null;
+  save(body: unknown): BalanceSettings;
+  close(): void;
+}
+
+/**
+ * Opens hynix.sqlite in the data directory. A file that cannot open is logged and shown, and saves answer 503; saved
+ * settings that no longer parse are logged and shown too, but a save overwrites them.
+ */
+export function openHynixBalance(dir: string, { log = (line: string) => process.stderr.write(`${line}\n`) }: { log?: (line: string) => void } = {}): HynixBalanceRuntime {
+  try {
+    const store = createBalanceStore(join(dir, HYNIX_DATABASE));
+    const invalid = store.invalid();
+    if (invalid) log(`海力士两腿平衡设置：${invalid}`);
+    const save = (body: unknown): BalanceSettings => {
+      const before = store.settings();
+      let next: BalanceSettings;
+      try { next = store.save(body); }
+      catch (error) {
+        if (error instanceof ContractError) throw error;
+        throw new ContractError(503, 'settings_unavailable', `海力士两腿平衡设置未能保存：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`);
+      }
+      const show = (s: BalanceSettings) => `调平线 ${s.rebalancePercent}% / 硬上限 ${s.hardPercent}% / 最小差额 ${s.minGapUsdt} USDT`;
+      log(`海力士两腿平衡设置已修改：${show(before)} → ${show(next)}`);
+      return next;
+    };
+    return { settings: store.settings, available: true, get error() { return store.invalid(); }, save, close: store.close };
+  } catch (error) {
+    const reason = `海力士设置库无法打开，两腿平衡按默认阈值判断、设置不能保存（下单与任务不受影响）：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`;
+    log(reason);
+    return { settings: () => ({ ...DEFAULT_BALANCE_SETTINGS }), available: false, error: reason, save: () => { throw new ContractError(503, 'settings_unavailable', reason); }, close: () => {} };
+  }
+}
+
+/** True while the venue has an unfinished hynix job (a rebalance job has one leg, a two-leg job may span both venues). */
+export function hynixBusy(executor: Pick<Executor, 'unfinished' | 'jobView'>): (venue: Venue) => boolean {
+  return venue => executor.unfinished().some(id => {
+    const job = executor.jobView(id);
+    return job.market === 'hynix' && job.legs.some(leg => leg.venue === venue);
+  });
+}
+
+/** The balance alert judged after each hynix positions round (docs/hynix.md 7.4). */
+export function hynixBalanceCheck(oil: OilRuntime, balance: Pick<HynixBalanceRuntime, 'settings'>, options: Parameters<typeof createBalanceAlerts>[0]): () => void {
+  const alerts = createBalanceAlerts(options);
+  return () => { const settings = balance.settings(); alerts.judge(oil.hynix.balanceView(settings), settings); };
+}
+
+/** The page's hynix reads (docs/hynix.md): the books and premium, the accounts, hynix positions, hynix jobs and the balance. */
+export function hynixViews(oil: OilRuntime, executor: Executor, balance: HynixBalanceRuntime) {
   return {
     market: () => oil.hynix.view(),
-    state: () => ({ accounts: executor.accounts(), positions: oil.hynix.positionsView(), jobs: executor.recentJobs(20, 'hynix') }),
+    state: () => {
+      const settings = balance.settings();
+      return {
+        accounts: executor.accounts(), positions: oil.hynix.positionsView(), jobs: executor.recentJobs(20, 'hynix'),
+        balance: { settings, settingsAvailable: balance.available, settingsError: balance.error, venues: oil.hynix.balanceView(settings) },
+      };
+    },
+    saveBalanceSettings: (body: unknown) => balance.save(body),
   };
 }
 
@@ -129,7 +193,7 @@ export function hynixViews(oil: OilRuntime, executor: Executor) {
  * The market loops: books every 3 s (then the spread rules), positions every 15 s; with PnL, its positions every minute
  * and its ledgers every five minutes. Each round's reads carry their own timeout; a failure only marks the view.
  */
-export function oilLoops(oil: OilRuntime, context: { stopped(): boolean; pause(ms: number): Promise<void> }, log: (line: string) => void, rules?: OilRulesRuntime, pnl?: OilPnlRuntime): Promise<void>[] {
+export function oilLoops(oil: OilRuntime, context: { stopped(): boolean; pause(ms: number): Promise<void> }, log: (line: string) => void, rules?: OilRulesRuntime, pnl?: OilPnlRuntime, hynixCheck?: () => void): Promise<void>[] {
   const every = (spacingMs: number, name: string, round: () => Promise<void>) => (async () => {
     while (!context.stopped()) {
       const started = Date.now();
@@ -153,7 +217,13 @@ export function oilLoops(oil: OilRuntime, context: { stopped(): boolean; pause(m
   // On stop the books loop ends only after the judging round in flight, so its preview and confirm finish (or fail) before
   // the service closes the executor and the rules store.
   const books = every(MARKET_READ_MS, '原油盘口读取', quotes).then(async () => { await judging; });
+  // The balance alert is judged on the positions just read; its failure is logged apart and never fails the read.
+  const hynixPositions = async () => {
+    await oil.hynix.refreshPositions();
+    if (!hynixCheck) return;
+    try { hynixCheck(); } catch (error) { log(`海力士两腿平衡告警判断失败：${error instanceof Error ? error.message : String(error)}`); }
+  };
   return [books, every(POSITIONS_READ_MS, '原油持仓读取', oil.market.refreshPositions),
-    every(MARKET_READ_MS, '海力士盘口读取', oil.hynix.refreshQuotes), every(POSITIONS_READ_MS, '海力士持仓读取', oil.hynix.refreshPositions),
+    every(MARKET_READ_MS, '海力士盘口读取', oil.hynix.refreshQuotes), every(POSITIONS_READ_MS, '海力士持仓读取', hynixPositions),
     ...(pnl ? [every(PNL_SAMPLE_MS, '原油盈亏采样', () => pnl.sample()), every(LEDGER_SYNC_MS, '原油账单同步', () => pnl.syncLedgers(context.stopped))] : [])];
 }

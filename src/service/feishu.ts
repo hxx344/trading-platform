@@ -32,7 +32,10 @@ export interface EventRow { seq: number; type: string; at: number; json: string;
 /** What an oil job message needs, in the shape of the executor's job view. */
 export interface JobSummary {
   id: string;
-  preset: 'same-exchange' | 'cross-exchange';
+  /** rebalance: one hynix order levelling the two legs' notional; its one leg is the order. */
+  preset: 'same-exchange' | 'cross-exchange' | 'rebalance';
+  /** Absent in summaries made before rebalance jobs existed. */
+  rebalance?: { method: 'reduce' | 'add' } | null;
   action: 'open' | 'close';
   status: string;
   reason: string | null;
@@ -178,6 +181,7 @@ const premium = (adr: string | null | undefined, ordinary: string | null | undef
  * prices and the ADR premium over a tenth of the ordinary share; across venues the price difference of the one contract.
  */
 function describeHynixJob(summary: JobSummary, jobId: string, status: string, reason: string | null): string {
+  if (summary.preset === 'rebalance') return describeRebalanceJob(summary, jobId, status, reason);
   const title = `海力士${(JOB_TITLES[status] ?? `原油任务${status}`).replace(/^原油/, '')}`;
   const tail = reason ? `：${clip(reason, 240)}` : '';
   if (summary.legs.length !== 2) return `【${title}】任务 ${short(jobId)}（详情读取失败）${tail}`;
@@ -201,6 +205,21 @@ function describeHynixJob(summary: JobSummary, jobId: string, status: string, re
     const value = same ? premium(adr!.averagePrice, ordinary!.averagePrice) : a.averagePrice && b.averagePrice ? minus(a.averagePrice, b.averagePrice) : null;
     numbers = `成交 ${fills}${value === null ? '' : same ? `；成交溢价 ${value}%` : `；成交价差 ${label(a)}−${label(b)} ${value} USDT`}`;
   }
+  return `【${title}】${where}，${numbers}（任务 ${short(jobId)}）${tail}`;
+}
+
+/** A hynix rebalance (docs/hynix.md 7.3): one order on one contract, so venue, contract, which way, quantity and its fill. */
+function describeRebalanceJob(summary: JobSummary, jobId: string, status: string, reason: string | null): string {
+  const title = `海力士调平${(JOB_TITLES[status] ?? `原油任务${status}`).replace(/^原油/, '')}`;
+  const tail = reason ? `：${clip(reason, 240)}` : '';
+  const leg = summary.legs[0];
+  if (!leg || summary.legs.length !== 1) return `【${title}】任务 ${short(jobId)}（详情读取失败）${tail}`;
+  const reduce = (summary.rebalance?.method ?? (summary.action === 'close' ? 'reduce' : 'add')) === 'reduce';
+  const where = `${VENUE_TEXT[leg.venue] ?? leg.venue} ${reduce ? '减仓调平' : '加仓调平'} ${HYNIX_NAMES[leg.symbol] ?? leg.symbol}（${leg.symbol}）${leg.side === 'long' ? '多头' : '空头'}`;
+  const planned = clip(leg.plannedQuantity ?? leg.plannedBarrels, 24);
+  const numbers = status === 'accepted'
+    ? `计划 ${planned}，可成交价 ${price(leg.orderSide === 'buy' ? leg.previewQuote.ask : leg.previewQuote.bid)}`
+    : `计划 ${planned}，成交 ${clip(leg.filledQuantity ?? leg.filledBarrels, 24)}${leg.averagePrice ? ` 均价 ${price(leg.averagePrice)}` : ''}`;
   return `【${title}】${where}，${numbers}（任务 ${short(jobId)}）${tail}`;
 }
 

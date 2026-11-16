@@ -203,7 +203,7 @@ test('价格保护：首腿以预览界限的 IOC 限价发送；对冲腿仍为
   bindAccounts(h.ex);
   const { preview, jobId } = await previewAndConfirm(h);
   assert.equal(preview.legs[0].priceBound, '70.37');
-  assert.equal(preview.legs[1].priceBound, '69.7');
+  assert.equal(preview.legs[1]!.priceBound, '69.7');
   assert.ok(preview.notes.some(note => note.includes('IOC 限价 70.37')));
   h.binance.setBook('CLUSDT', { bid: '70.08', ask: '70.10' });
   assert.equal((await settle(h, jobId)).status, 'completed');

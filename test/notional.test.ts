@@ -32,7 +32,7 @@ test('单笔上限：按价格保护界限计价，超限在预览拒绝且不�
   // Binance buys at its bound (above the 70.02 ask); the job counts the dearer leg.
   const [lead, hedge] = preview.legs;
   assert.equal(cmp(preview.notional, lead.priceBound as string), 0);
-  assert.ok(cmp(preview.notional, hedge.quote.ask) >= 0 && cmp(preview.notional, '100') <= 0);
+  assert.ok(cmp(preview.notional, hedge!.quote.ask) >= 0 && cmp(preview.notional, '100') <= 0);
   assert.ok(preview.notes.some(note => note.includes('单笔上限 100 USDT')));
   assert.equal(h.binance.calls.place + h.bybit.calls.place, 0);
 }, { perJob: '100', totalOpen: '1000' }));

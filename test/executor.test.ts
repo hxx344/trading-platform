@@ -18,7 +18,7 @@ test('正常双腿：预览不下单，确认后先发首腿，按成交量对�
   const preview = await h.ex.preview(openIntent(), SESSION);
   assert.equal(h.binance.calls.place + h.bybit.calls.place, 0);
   assert.equal(preview.legs[0].orderSide, 'buy');
-  assert.equal(preview.legs[1].orderSide, 'sell');
+  assert.equal(preview.legs[1]!.orderSide, 'sell');
   const confirmed = h.ex.confirm({ previewId: preview.id, requestId: randomUUID(), confirmLive: true }, SESSION);
   assert.equal(confirmed.duplicate, false);
   assert.equal(confirmed.job.status, 'accepted');

@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
-import { ContractError, parseIntent } from '../src/contracts.ts';
+import { ContractError, parseIntent, parsePairIntent } from '../src/contracts.ts';
 import { cmp } from '../src/decimal.ts';
 import { SIM_ACCOUNTS, SIM_BINDINGS } from '../src/simulation.ts';
 import { midOf, premiumPercent, quantityForNotional } from '../src/hynix/sizing.ts';
@@ -26,7 +26,7 @@ async function withHarness(run: (h: Harness) => Promise<void>) {
 }
 
 test('意图：海力士同所须一腿 ADR 一腿正股；每腿名义金额或数量二选一、金额须相等；不收桶数与分批；不能混用原油合约', () => {
-  const same = parseIntent(sameIntent());
+  const same = parsePairIntent(sameIntent());
   assert.equal(same.market, 'hynix');
   assert.deepEqual(same.legs.map(item => [item.symbol, item.side, item.quantity, item.notional]), [['SKHYUSDT', 'short', null, '100'], ['SKHYNIXUSDT', 'long', null, '100']]);
   const base = sameIntent();
@@ -39,14 +39,14 @@ test('意图：海力士同所须一腿 ADR 一腿正股；每腿名义金额或
   // Opening per-leg quantities could put almost all of it on one side: open is by equal notional only.
   assert.throws(() => parseIntent({ ...base, legs: [leg('binance', 'SKHYUSDT', 'short', { quantity: '100' }), leg('binance', 'SKHYNIXUSDT', 'long', { quantity: '0.001' })] }), code('open_requires_notional'));
   // Quantities per leg may differ (a close sized to the positions held).
-  const close = parseIntent({ ...base, action: 'close', legs: [leg('binance', 'SKHYUSDT', 'long', { quantity: '2.4' }), leg('binance', 'SKHYNIXUSDT', 'short', { quantity: '0.25' })] });
+  const close = parsePairIntent({ ...base, action: 'close', legs: [leg('binance', 'SKHYUSDT', 'long', { quantity: '2.4' }), leg('binance', 'SKHYNIXUSDT', 'short', { quantity: '0.25' })] });
   assert.deepEqual(close.legs.map(item => item.quantity), ['2.4', '0.25']);
   // Oil keeps its shape: no notional field on its legs, and notional is refused there.
-  const oil = parseIntent({ market: 'oil', preset: 'same-exchange', action: 'open', timeoutMs: 60_000, legs: [leg('binance', 'BZUSDT', 'short', { barrels: '1' }), leg('binance', 'CLUSDT', 'long', { barrels: '1' })] });
+  const oil = parsePairIntent({ market: 'oil', preset: 'same-exchange', action: 'open', timeoutMs: 60_000, legs: [leg('binance', 'BZUSDT', 'short', { barrels: '1' }), leg('binance', 'CLUSDT', 'long', { barrels: '1' })] });
   assert.equal(Object.hasOwn(oil.legs[0], 'notional'), false);
   assert.throws(() => parseIntent({ market: 'oil', preset: 'same-exchange', action: 'open', timeoutMs: 60_000, legs: [leg('binance', 'BZUSDT', 'short', { notional: '1' }), leg('binance', 'CLUSDT', 'long', { notional: '1' })] }), code('unknown_field'));
   // Across venues: one hynix contract named at the top.
-  const cross = parseIntent({ market: 'hynix', preset: 'cross-exchange', symbol: 'SKHYUSDT', action: 'open', timeoutMs: 60_000, legs: [{ venue: 'binance', side: 'long', orderType: 'market', notional: '50' }, { venue: 'bybit', side: 'short', orderType: 'market', notional: '50' }] });
+  const cross = parsePairIntent({ market: 'hynix', preset: 'cross-exchange', symbol: 'SKHYUSDT', action: 'open', timeoutMs: 60_000, legs: [{ venue: 'binance', side: 'long', orderType: 'market', notional: '50' }, { venue: 'bybit', side: 'short', orderType: 'market', notional: '50' }] });
   assert.deepEqual(cross.legs.map(item => [item.venue, item.symbol]), [['binance', 'SKHYUSDT'], ['bybit', 'SKHYUSDT']]);
   assert.throws(() => parseIntent({ market: 'hynix', preset: 'cross-exchange', symbol: 'BZUSDT', action: 'open', timeoutMs: 60_000, legs: cross.legs }), code('invalid_value'));
 });
@@ -181,10 +181,10 @@ test('页面表单：等金额与按数量两种意图、校验、按持仓填�
   assert.deepEqual(held, { leadQuantity: '0.249', hedgeQuantity: '2.42' });
   const close = hynixFormToIntent({ ...closeForm, ...held });
   assert.ok('intent' in close);
-  assert.deepEqual(parseIntent(close.intent).legs.map(item => [item.symbol, item.side, item.quantity]), [['SKHYNIXUSDT', 'long', '0.249'], ['SKHYUSDT', 'short', '2.42']]);
+  assert.deepEqual(parsePairIntent(close.intent).legs.map(item => [item.symbol, item.side, item.quantity]), [['SKHYNIXUSDT', 'long', '0.249'], ['SKHYUSDT', 'short', '2.42']]);
   assert.deepEqual(closeQuantities(closeForm, [{ venue: 'binance', long: null, short: null }]), { error: 'Binance 正股多头持仓尚未读到，请稍后再填' });
   assert.deepEqual(closeQuantities({ ...closeForm, premium: 'long' }, accounts), { error: 'Binance 正股空头没有持仓，不能按持仓平仓' });
   const cross = hynixFormToIntent({ ...DEFAULT_HYNIX_FORM, preset: 'cross-exchange', venue: 'bybit', leadOrderType: 'chase', notional: '50', symbol: 'SKHYNIXUSDT' });
   assert.ok('intent' in cross);
-  assert.deepEqual(parseIntent(cross.intent).legs.map(item => [item.venue, item.symbol, item.side, item.orderType]), [['bybit', 'SKHYNIXUSDT', 'long', 'chase'], ['binance', 'SKHYNIXUSDT', 'short', 'market']]);
+  assert.deepEqual(parsePairIntent(cross.intent).legs.map(item => [item.venue, item.symbol, item.side, item.orderType]), [['bybit', 'SKHYNIXUSDT', 'long', 'chase'], ['binance', 'SKHYNIXUSDT', 'short', 'market']]);
 });

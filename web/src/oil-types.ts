@@ -25,10 +25,12 @@ export interface OilJobLeg {
   attempts: number; filledQuantity: string; operation: OilOperation | null;
 }
 export interface OilJob {
-  id: string; market?: 'oil' | 'hynix'; preset: 'same-exchange' | 'cross-exchange'; action: 'open' | 'close'; status: string; reason: string | null; stopRequested: boolean;
+  id: string; market?: 'oil' | 'hynix'; preset: 'same-exchange' | 'cross-exchange' | 'rebalance'; action: 'open' | 'close'; status: string; reason: string | null; stopRequested: boolean;
   createdAt: number; deadlineAt: number; holdNewSends: boolean; locked: boolean; acknowledgedAt: number | null; strategyPending: boolean;
   /** current: 1-based batch of the latest lead order, 0 before the first; null when the job is not batched. */
   batches?: { count: number; current: number; intervalMs: number } | null;
+  /** A hynix rebalance (preset 'rebalance'): one leg; null or absent on two-leg jobs. */
+  rebalance?: { method: 'reduce' | 'add' } | null;
   legs: OilJobLeg[]; events: { type: string; at: number; [key: string]: unknown }[];
 }
 export interface OilState {
@@ -44,6 +46,33 @@ export interface OilPreviewLeg {
 /** batches: the lead quantity of each batch, when the intent asked for more than one. */
 export interface OilPreview { id: string; expiresAt: number; intent: OilIntent; legs: OilPreviewLeg[]; notional: string; barrels?: string; batches?: string[]; notes: string[] }
 export interface OilConfirmResult { accepted: boolean; duplicate: boolean; job: OilJob }
+
+/** H2 (docs/hynix.md section 7): the two hynix legs one venue's account holds, compared by USDT notional. */
+export type RebalanceMethod = 'reduce' | 'add';
+export interface HynixBalanceSettings { rebalancePercent: string; hardPercent: string; minGapUsdt: string }
+export interface HynixBalanceLeg { symbol: string; side: 'long' | 'short'; quantity: string; price: string; notional: string }
+/** The one order that levels the legs, or why it is not offered. */
+export type RebalanceSuggestion = { symbol: string; side: 'long' | 'short'; action: 'open' | 'close'; quantity: string } | { error: string };
+export type HynixBalanceRow = { venue: string; positionsAt: number | null; quotesAt: number | null } & (
+  | { status: 'unavailable'; reason: string }
+  | { status: 'none'; level: 'ok' | 'rebalance' | 'hard' }
+  | { status: 'unpaired'; reason: string; legs: HynixBalanceLeg[]; level: 'ok' | 'rebalance' | 'hard' }
+  | { status: 'paired'; long: HynixBalanceLeg; short: HynixBalanceLeg; gap: string; netSide: 'long' | 'short' | null; percent: string; level: 'ok' | 'rebalance' | 'hard'; suggest?: { reduce: RebalanceSuggestion; add: RebalanceSuggestion } }
+);
+export interface HynixBalanceView { settings: HynixBalanceSettings; settingsAvailable: boolean; settingsError: string | null; venues: HynixBalanceRow[] }
+/** GET /api/hynix/state: the oil state's shape on the hynix contracts, with the balance (absent from services before H2). */
+export type HynixState = OilState & { balance?: unknown };
+export interface HynixRebalanceIntent { market: 'hynix'; preset: 'rebalance'; venue: string; method: RebalanceMethod; timeoutMs: number; maxSlippageBps?: number | null }
+/** A rebalance preview: one leg; before and after are USDT notional at the preview's midpoints. Fields may be missing on older executors. */
+export interface HynixRebalancePreview extends Omit<OilPreview, 'intent' | 'barrels' | 'batches'> {
+  intent: HynixRebalanceIntent;
+  rebalance?: {
+    method?: RebalanceMethod;
+    counter?: { symbol?: string; side?: string; quantity?: string; positionMode?: string };
+    before?: { longNotional?: string; shortNotional?: string; gap?: string; percent?: string; netSide?: 'long' | 'short' | null };
+    after?: { gap?: string; netSide?: 'long' | 'short' | null };
+  };
+}
 
 /** GET /api/oil/pnl (docs/oil.md section 9): amounts are USDT decimal strings; null where the ledgers do not reach. */
 export interface OilPnlPoint { time: number; unrealizedPnl: string | null; fundingPnl: string | null; realizedPnl: string | null; feePnl: string | null; totalPnl: string | null }

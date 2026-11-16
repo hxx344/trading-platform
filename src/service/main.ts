@@ -27,7 +27,7 @@ import { createStreamStatus, runUserStream, type SocketLike } from './stream.ts'
 import { balanceWindow, createBalanceSamples, type BalanceSamples } from './balance-samples.ts';
 import { readImportResult, submitImportRequest } from './import-channel.ts';
 import { createUpdates, readInstalledVersion, updateReadyFile, type InstalledVersion, type UpdateFetch } from './update.ts';
-import { hynixViews, oilLoops, oilViews, openOilPnl, openOilRules, prepareOil, registerOilAccounts, strandedOilJobs, type OilRuntime } from './oil.ts';
+import { hynixBalanceCheck, hynixBusy, hynixViews, oilLoops, oilViews, openHynixBalance, openOilPnl, openOilRules, prepareOil, registerOilAccounts, strandedOilJobs, type OilRuntime } from './oil.ts';
 import { oilSummary } from './oil-config.ts';
 import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, settleMonitor, stopMonitor, type MonitorRuntime } from './monitor.ts';
 import { monitorSummary } from './monitor-config.ts';
@@ -353,11 +353,14 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   const oilRules = oil ? openOilRules(oil, dir, { executor }) : undefined;
   // PnL and ledgers (read only) in their own file; one that cannot open is shown on the oil page, nothing else stops.
   const oilPnl = oil ? openOilPnl(oil, dir) : undefined;
+  // Hynix balance settings in their own file; one that cannot open keeps the default thresholds and refuses saves.
+  const hynixBalance = oil ? openHynixBalance(dir) : undefined;
+  const hynixCheck = oil && hynixBalance ? hynixBalanceCheck(oil, hynixBalance, { notify: text => notifier.notify(text), busy: hynixBusy(executor), log: line => process.stderr.write(`${line}\n`) }) : undefined;
   const oilText = `${oil ? `；原油执行账户 ${oil.config.accounts.length} 个` : ''}${options ? `；期权账户 1 个${options.running() ? '' : '（未启动，后台重试）'}` : ''}${crossex ? `；CrossEx 账户 1 个${crossex.runtime() ? '' : '（未启动，后台重试）'}` : ''}`;
   try {
     notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}`);
     for (const text of warnings) notifier.notify(`【配置未生效】${text}`);
-  } catch (error) { oilPnl?.close(); oilRules?.close(); closeMonitorStore(); monitorOutbox?.close(); asset?.close(); samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
+  } catch (error) { hynixBalance?.close(); oilPnl?.close(); oilRules?.close(); closeMonitorStore(); monitorOutbox?.close(); asset?.close(); samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
 
   // The heartbeat for the second server's main-watch; made once the run loop can say whether it is ready.
   let watch: Watch | null = null;
@@ -381,7 +384,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
         const window = balanceWindow(range, Date.now());
         return window && { pairId, range, ...window, points: [], unavailable: `余额采样库无法打开，走势图不可用：${samplesError ?? '未知原因'}（不影响划转与 ADL）` };
       },
-      ...(oil ? { oil: oilViews(oil, executor, oilRules, oilPnl), hynix: hynixViews(oil, executor) } : {}),
+      ...(oil ? { oil: oilViews(oil, executor, oilRules, oilPnl), hynix: hynixViews(oil, executor, hynixBalance!) } : {}),
       ...(monitor ? { monitor: monitorViews(monitor) } : {}),
       summary: { setInterval: (minutes: number) => summary.setInterval(minutes), sendNow: () => summary.sendNow() },
       ...(asset ? { asset } : {}),
@@ -427,7 +430,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
         client, credentials: byAddress.get(accountId)!, accountId, stopped: context.stopped, pause: context.pause, ...(connect ? { connect } : {}),
         push: (id, event) => { streams.onMessage(id); trading.push(id, event); }, onState: (connected, reason) => streams.onState(accountId, connected, reason),
       })),
-      ...(oil ? oilLoops(oil, context, line => process.stderr.write(`${line}\n`), oilRules, oilPnl) : []),
+      ...(oil ? oilLoops(oil, context, line => process.stderr.write(`${line}\n`), oilRules, oilPnl, hynixCheck) : []),
       ...(monitor ? monitorLoops(monitor, context) : []),
       ...(options ? [options.loop(context, { notifyOnce: (key, text) => notifier.notifyOnce(key, text), notify: text => notifier.notify(text) })] : []),
       ...(crossex ? [crossex.loop(context, { notifyOnce: (key, text) => notifier.notifyOnce(key, text), notify: text => notifier.notify(text), log: line => process.stderr.write(`${line}\n`) })] : []),
@@ -457,6 +460,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       asset?.close();
       oilRules?.close();
       oilPnl?.close();
+      hynixBalance?.close();
       locks.release();
       await stopCrossex();
       await stopOptions();

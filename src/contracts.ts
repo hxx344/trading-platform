@@ -217,15 +217,27 @@ export const PRESETS = ['cross-exchange', 'same-exchange'] as const;
 export type Preset = typeof PRESETS[number];
 /** The lead split into count parts sent intervalMs apart, each hedged before the next; absent is one batch. */
 export interface BatchIntent { count: number; intervalMs: number }
-export interface Intent { market: Market; preset: Preset; symbol: string | null; action: Action; timeoutMs: number; maxSlippageBps: number | null; legs: [LegIntent, LegIntent]; batches?: BatchIntent }
+export interface PairIntent { market: Market; preset: Preset; symbol: string | null; action: Action; timeoutMs: number; maxSlippageBps: number | null; legs: [LegIntent, LegIntent]; batches?: BatchIntent }
+/** reduce closes part of the larger hynix leg, add opens more of the smaller one (docs/hynix.md 7.3). */
+export const REBALANCE_METHODS = ['reduce', 'add'] as const;
+/**
+ * One order that levels the notional of the two hynix legs one venue's account holds. The contract, side and quantity are
+ * not part of the request: the executor works them out from the positions and books it reads at preview.
+ */
+export interface RebalanceIntent { market: 'hynix'; preset: 'rebalance'; venue: Venue; method: typeof REBALANCE_METHODS[number]; timeoutMs: number; maxSlippageBps: number | null }
+export type Intent = PairIntent | RebalanceIntent;
 export const MAX_SLIPPAGE_BPS = 1_000;
 export const MAX_BATCHES = 20;
 export const MAX_BATCH_INTERVAL_MS = 600_000;
+/** A hynix rebalance (preset 'rebalance') or a two-leg intent. */
+export function parseIntent(value: unknown): Intent {
+  return isObject(value) && value.preset === 'rebalance' ? parseRebalanceIntent(value) : parsePairIntent(value);
+}
 /**
  * Two legs of one market with opposite sides: one contract on two venues, or the market's two contracts on one venue (oil:
- * BZ against CL; hynix: the ADR against the ordinary share, docs/hynix.md).
+ * BZ against CL; hynix: the ADR against the ordinary share, docs/hynix.md). A rebalance body is refused as an unknown preset.
  */
-export function parseIntent(value: unknown): Intent {
+export function parsePairIntent(value: unknown): PairIntent {
   const raw = exactKeys(value, ['market', 'preset', 'action', 'timeoutMs', 'legs'], ['symbol', 'maxSlippageBps', 'batches']);
   const market = oneOf(raw.market, ['oil', 'hynix'] as const, '品种'), hynix = market === 'hynix';
   const symbols = MARKET_SYMBOLS[market], symbolName = hynix ? '海力士合约' : '原油合约';
@@ -286,6 +298,15 @@ export function parseIntent(value: unknown): Intent {
     if (batches.count === 1) batches = undefined;
   }
   return { market, preset, symbol, action, timeoutMs, maxSlippageBps, legs, ...(batches ? { batches } : {}) };
+}
+function parseRebalanceIntent(value: unknown): RebalanceIntent {
+  const raw = exactKeys(value, ['market', 'preset', 'venue', 'method', 'timeoutMs'], ['maxSlippageBps']);
+  if (oneOf(raw.market, ['oil', 'hynix'] as const, '品种') !== 'hynix') reject('rebalance_market', '单腿调平只用于海力士');
+  const venue = oneOf(raw.venue, VENUES, '交易所');
+  for (const symbol of HYNIX_SYMBOLS) if (!VENUE_EXECUTION_SYMBOLS[venue].includes(symbol)) reject('venue_symbol', `${VENUE_NAMES[venue]} 不支持 ${symbol} 执行`);
+  const method = oneOf(raw.method, REBALANCE_METHODS, '调平方式');
+  const maxSlippageBps = raw.maxSlippageBps === undefined || raw.maxSlippageBps === null ? null : integer(raw.maxSlippageBps, 1, MAX_SLIPPAGE_BPS, '价格保护基点');
+  return { market: 'hynix', preset: 'rebalance', venue, method, timeoutMs: integer(raw.timeoutMs, 30_000, 3_600_000, '最长执行毫秒数'), maxSlippageBps };
 }
 
 /** Confirmation body; confirmLive in the prototype authorizes only the simulated transport. */

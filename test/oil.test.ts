@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ContractError, parseIntent } from '../src/contracts.ts';
+import { ContractError, parseIntent, parsePairIntent } from '../src/contracts.ts';
 import { cmp } from '../src/decimal.ts';
 import { createExecutor } from '../src/executor.ts';
 import { SIM_ACCOUNTS } from '../src/simulation.ts';
@@ -34,7 +34,7 @@ test('意图：同所双腿须同一交易所、一腿 BZ 一腿 CL、方向相�
   assert.equal(same.preset, 'same-exchange');
   assert.equal(same.symbol, null);
   assert.deepEqual(same.legs.map(item => [item.venue, item.symbol, item.side, item.quantity, item.barrels]), [['binance', 'BZUSDT', 'short', null, '1'], ['binance', 'CLUSDT', 'long', null, '1']]);
-  const cross = parseIntent(openIntent());
+  const cross = parsePairIntent(openIntent());
   assert.deepEqual([cross.preset, cross.symbol, cross.legs.map(item => [item.symbol, item.quantity, item.barrels])], ['cross-exchange', 'CLUSDT', [['CLUSDT', '1', null], ['CLUSDT', '1', null]]]);
   const base = sameIntent();
   assert.throws(() => parseIntent({ ...base, symbol: 'CLUSDT' }), code('unknown_field'));
@@ -46,7 +46,7 @@ test('意图：同所双腿须同一交易所、一腿 BZ 一腿 CL、方向相�
   assert.throws(() => parseIntent({ ...base, legs: [base.legs[0], leg('binance', 'CLUSDT', 'long', { barrels: '2' })] }), code('unbalanced'));
   assert.throws(() => parseIntent({ ...base, legs: [{ venue: 'binance', side: 'short', orderType: 'market', barrels: '1' }, base.legs[1]] }), code('missing_field'));
   // null is the same as leaving the field out, so a form that sends both keys still parses.
-  const nulls = parseIntent({ ...base, legs: [leg('binance', 'BZUSDT', 'short', { barrels: '1', quantity: null }), leg('binance', 'CLUSDT', 'long', { barrels: '1', quantity: null })] });
+  const nulls = parsePairIntent({ ...base, legs: [leg('binance', 'BZUSDT', 'short', { barrels: '1', quantity: null }), leg('binance', 'CLUSDT', 'long', { barrels: '1', quantity: null })] });
   assert.deepEqual(nulls.legs.map(item => [item.quantity, item.barrels]), [[null, '1'], [null, '1']]);
   assert.throws(() => parseIntent({ ...base, legs: [leg('binance', 'BZUSDT', 'short', { barrels: null, quantity: null }), base.legs[1]] }), code('missing_field'));
   // Cross-exchange keeps one top-level symbol and legs without one.

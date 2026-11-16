@@ -137,8 +137,9 @@ test('实盘：开仓 → 持仓 → 平仓 → 等待开仓；意图、会话�
   assert.deepEqual(ex.previews[0], {
     session: `oil-rule:${id}`,
     intent: { market: 'oil', preset: 'same-exchange', action: 'open', timeoutMs: 60_000, legs: [
-      { venue: 'binance', symbol: 'CLUSDT', side: 'long', orderType: 'market', barrels: '1' },
-      { venue: 'binance', symbol: 'BZUSDT', side: 'short', orderType: 'market', barrels: '1' },
+      // Threshold bounds (docs/hynix.md 8.2): BZ bid 74.10 against the 74.05 at which CL ask 70.05 meets 4, half the slack each.
+      { venue: 'binance', symbol: 'CLUSDT', side: 'long', orderType: 'market', barrels: '1', priceBound: '70.075' },
+      { venue: 'binance', symbol: 'BZUSDT', side: 'short', orderType: 'market', barrels: '1', priceBound: '74.075' },
     ] },
   });
   assert.equal(ex.confirms.length, 1);

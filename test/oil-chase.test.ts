@@ -191,6 +191,22 @@ test('市价分批：每批对冲后等满间隔再发下一批，任务显示�
   assert.deepEqual(view.batches, { count: 3, current: 3, intervalMs: 5_000 });
 }));
 
+test('原油平仓 fit：持有量分不成所请批数时降到能分开的最多批数（最少 1 批），不拒绝；不带 fit 照旧拒绝', () => withHarness(async h => {
+  assert.equal((await settle(h, (await previewAndConfirm(h, openIntent())).jobId)).status, 'completed');
+  const close = (quantity: string, batches: Record<string, unknown>) => ({ ...openIntent({ action: 'close', quantity: [quantity, quantity] }), batches });
+  await assert.rejects(h.ex.preview(close('0.2', { count: 3, intervalMs: 0 }), SESSION), code('batch_size'));
+  const two = await h.ex.preview(close('0.2', { count: 3, intervalMs: 0, fit: true }), SESSION);
+  assert.deepEqual(two.batches, ['0.1', '0.1']);
+  assert.ok(two.notes.includes('持有量分不成 3 批，按能分开的最多 2 批平仓。'), two.notes.join('\n'));
+  const one = await h.ex.preview(close('0.1', { count: 3, intervalMs: 0, fit: true }), SESSION);
+  assert.equal(one.batches, undefined);
+  const { jobId } = await previewAndConfirm(h, close('0.2', { count: 3, intervalMs: 0, fit: true }));
+  const view = await settle(h, jobId);
+  assert.equal(view.status, 'completed', view.reason ?? '');
+  assert.equal(view.batches?.count, 2);
+  assert.equal(h.binance.position(SIM_ACCOUNTS.binance, 'CLUSDT', 'long'), '0.8');
+}));
+
 test('本地追价分批：一批挂满成交、对冲跟上后才挂下一批', () => withHarness(async h => {
   const { jobId } = await previewAndConfirm(h, leadIntent({ batches: { count: 2, intervalMs: 0 } }));
   await tick(h);

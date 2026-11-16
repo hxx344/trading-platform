@@ -89,7 +89,8 @@ export function hynixFormToIntent(form: HynixForm): { intent: HynixIntent } | { 
   // The same checks as the oil form (oil-form.ts) and the executor's parseIntent.
   const count = form.batchCount.trim() || '1', interval = form.batchIntervalSeconds.trim() || '0';
   if (!INTEGER.test(count) || Number(count) > 20) return { error: '批次数须为 1–20 的整数' };
-  if (!COUNT.test(interval) || Number(interval) > 600) return { error: '批次间隔须为 0–600 秒的整数' };
+  // One batch has no interval: whatever the hidden field holds is ignored, not refused.
+  if (Number(count) > 1 && (!COUNT.test(interval) || Number(interval) > 600)) return { error: '批次间隔须为 0–600 秒的整数' };
   if (Number(count) > 1 && form.leadOrderType === 'chase') return { error: '分批只用于首腿市价或本地追价' };
   if ((Number(count) - 1) * Number(interval) >= Number(seconds)) return { error: `${count} 批、每批间隔 ${interval} 秒，总间隔须短于最长执行时间` };
   const common = {

@@ -12,7 +12,7 @@ import { ContractError, MAX_BATCHES, MAX_BATCH_INTERVAL_MS, VENUES, VENUE_NAMES,
 import { cmp, decimal, sub } from '../decimal.ts';
 import { comparePremium, premiumPercent } from '../hynix/sizing.ts';
 import {
-  BASE_LEG, FAILURE_LIMIT, JOB_TIMEOUT_MS, LEG_LABELS, MARKET_LABELS, MAX_RULE_JOB_MS, PHASE_NAMES, PREMIUM_LEG, RETRY_MS, RULE_LEGS, RULE_MARKETS, actionName, beijingDay, idleLive, isFinal, liveOf, opensOn, planLegs, planRows, ruleIntent, ruleSession, sameAccount, settleJob,
+  BASE_LEG, FAILURE_LIMIT, JOB_TIMEOUT_MS, LEG_LABELS, MARKET_LABELS, MAX_RULE_JOB_MS, PHASE_NAMES, PREMIUM_LEG, RETRY_MS, RULE_LEGS, RULE_MARKETS, actionName, beijingDay, idleLive, isFinal, liveOf, opensOn, planLegs, planRows, ruleIntent, ruleSession, sameAccount, settleJob, thresholdBounds,
   type LiveState, type RuleExecutor, type RuleMarket, type Tracked,
 } from './rule-live.ts';
 
@@ -172,6 +172,15 @@ export const spreadText = (market: RuleMarket, value: string): string => market 
  * buying it (short close, long open) pays the premium ask against the base bid and must not exceed it. Oil: BZ − CL in
  * USDT per barrel. Hynix: ADR × 10 ÷ ordinary − 1 in percent, compared exactly as the workbench's compareSpread.
  */
+/** The threshold bounds of each leg on these books (thresholdBounds), or null when they do not meet the threshold. */
+export function ruleBounds(config: RuleConfig, action: RuleAction, books: readonly BookRow[]): Record<string, string> | null {
+  const row = (symbol: string) => books.find(item => item.venue === config.venue && item.symbol === symbol);
+  const premium = row(PREMIUM_LEG[config.market]), base = row(BASE_LEG[config.market]);
+  if (!premium?.bid || !premium.ask || !base?.bid || !base.ask) return null;
+  const sell = (config.direction === 'short') === (action === 'open');
+  return thresholdBounds(config.market, sell, action === 'open' ? config.openThreshold : config.closeThreshold, { bid: premium.bid, ask: premium.ask }, { bid: base.bid, ask: base.ask });
+}
+
 export function evaluateRule(config: RuleConfig, action: RuleAction, books: readonly BookRow[], now: number): Reading | { error: string } {
   const read = (symbol: string): { bid: string; ask: string; at: number } | { error: string } => {
     const row = books.find(item => item.venue === config.venue && item.symbol === symbol);
@@ -235,7 +244,7 @@ export function createOilRules({ file, venues, books, now = Date.now, executor }
 
 const message = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 200);
 /** Codes a preview or confirm answers that mean the books moved or the plan aged: count again, no failure. */
-const RECOUNT = new Set(['quote_stale', 'quote_incomplete', 'quote_future', 'quote_window', 'preview_invalid', 'preview_generation']);
+const RECOUNT = new Set(['quote_stale', 'quote_incomplete', 'quote_future', 'quote_window', 'preview_invalid', 'preview_generation', 'price_moved']);
 
 function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readonly BookRow[], now: () => number, executor: RuleExecutor | undefined) {
   const selectAll = db.prepare('SELECT id, revision, created_at AS createdAt, config, state FROM rules ORDER BY created_at, rowid');
@@ -429,13 +438,16 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
   }
 
   /** Preview, recheck and confirm one open or close; the counts start again whatever happens. */
-  async function trigger(rule: Rule, action: RuleAction, reading: Counted): Promise<void> {
+  async function trigger(rule: Rule, action: RuleAction, reading: Counted, booksNow: readonly BookRow[]): Promise<void> {
     const id = rule.id, revision = rule.revision, phase = rule.state.live.phase;
+    // Each leg's bound keeps the spread on the threshold for every batch of the job, not just the first (docs/hynix.md 8.2).
+    const bounds = ruleBounds(rule.config, action, booksNow);
+    if (!bounds) { hold(rule, `${actionName(action)}价格界限算不出（盘口不满足阈值），重新计数`); return; }
     hold(rule, `${actionName(action)}条件已满足，正在预览`);
     rule.state.observations = push(rule.state.observations, { kind: 'signal', message: `${actionName(action)}条件连续满足，预览下单`, action, value: reading.value, threshold: action === 'open' ? rule.config.openThreshold : rule.config.closeThreshold, hits: reading.hits, bzAt: reading.bzAt, clAt: reading.clAt, revision });
     save(rule);
     let plan: Awaited<ReturnType<RuleExecutor['preview']>>;
-    try { plan = await executor!.preview(ruleIntent(rule.config, action, rule.state.live.held), ruleSession(id)); }
+    try { plan = await executor!.preview(ruleIntent(rule.config, action, rule.state.live.held, bounds), ruleSession(id)); }
     catch (error) {
       const current = unchanged(id, revision, phase);
       if (current) rejected(current, action, '预览', error);
@@ -466,7 +478,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     live.pending = { action, requestId: randomUUID(), previewId: plan.id, at: time, day, accounts: legs.map(leg => ({ accountKey: leg.accountKey, credentialVersion: leg.credentialVersion })) };
     if (action === 'open') live.opens = { day, count: opensOn(live, day) + 1 };
     const sizes = legs.map(leg => `${LEG_LABELS[leg.symbol] ?? leg.symbol} ${leg.quantity}`).join('、');
-    event(current.state, `${actionName(action)}预览通过：${current.config.market === 'hynix' ? '溢价' : '价差'} ${spreadText(current.config.market, again.value)}，${sizes}${plan.barrels ? `（每腿 ${plan.barrels} 桶）` : ''}${plan.batches && plan.batches.length > 1 ? `，分 ${plan.batches.length} 批` : ''}${plan.notional ? `，名义 ${plan.notional} USDT` : ''}；确认下单`);
+    event(current.state, `${actionName(action)}预览通过：${current.config.market === 'hynix' ? '溢价' : '价差'} ${spreadText(current.config.market, again.value)}，${sizes}${plan.barrels ? `（每腿 ${plan.barrels} 桶）` : ''}${plan.batches && plan.batches.length > 1 ? `，分 ${plan.batches.length} 批` : ''}${plan.notional ? `，两腿合计名义 ${plan.notional} USDT` : ''}；确认下单`);
     // Written before the confirm, so a restart in between replays the same request instead of sending another.
     save(current);
     submit(current);
@@ -515,7 +527,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     if (action === 'open' && opensOn(live, beijingDay(time)) >= rule.config.maxOpensPerDay) { hold(rule, `今日已开仓 ${opensOn(live, beijingDay(time))} 次，达到每日上限`); return; }
     const counts = countOn(rule, current, [action]);
     const reading = counts?.[action];
-    if (reading && reading.hits >= rule.config.confirmSamples) await trigger(rule, action, reading);
+    if (reading && reading.hits >= rule.config.confirmSamples) await trigger(rule, action, reading, current);
   }
 
   let running: Promise<void> | null = null;

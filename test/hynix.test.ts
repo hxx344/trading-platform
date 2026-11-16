@@ -108,6 +108,68 @@ test('分批：首腿按步长均分，每批对冲按计划比例累计取整�
   await assert.rejects(h.ex.preview({ ...sameIntent(), batches: { count: 20, intervalMs: 0 } }, SESSION), (error: unknown) => error instanceof ContractError && error.code === 'batch_size' && error.message.includes('第 3 批'));
 }));
 
+/** Close what an equal-100-USDT open holds (2.42 ADR short, 0.249 ordinary long) by these quantities. */
+const closeIntent = (adr: string, ordinary: string, batches?: Record<string, unknown>) => ({
+  market: 'hynix', preset: 'same-exchange', action: 'close', timeoutMs: 120_000,
+  legs: [leg('binance', 'SKHYUSDT', 'short', { quantity: adr }), leg('binance', 'SKHYNIXUSDT', 'long', { quantity: ordinary })], ...(batches ? { batches } : {}),
+});
+
+test('分批对冲腿取整：某批对冲腿按比例取整为 0（低于最小数量）拒绝 batch_size；平仓带 fit 时降到能分开的最多批数，最少 1 批', () => withHarness(async h => {
+  bindAccounts(h.ex);
+  assert.equal((await settle(h, (await previewAndConfirm(h, sameIntent())).jobId)).status, 'completed');
+  // 0.001 ordinary over 2 batches: the first batch's hedge is floor(0.001 × 1.21 ÷ 2.42) = 0, under the 0.001 minimum.
+  await assert.rejects(h.ex.preview(closeIntent('2.42', '0.001', { count: 2, intervalMs: 0 }), SESSION), (error: unknown) => error instanceof ContractError && error.code === 'batch_size' && error.message.includes('第 1 批首腿 1.21、对冲腿 0'));
+  // fit: two batches do not split, so one; three do not but two do (0.002 → 0.001 each).
+  const one = await h.ex.preview(closeIntent('2.42', '0.001', { count: 2, intervalMs: 0, fit: true }), SESSION);
+  assert.equal(one.batches, undefined);
+  assert.ok(one.notes.includes('持有量分不成 2 批，按能分开的最多 1 批平仓。'), one.notes.join('\n'));
+  const two = await h.ex.preview(closeIntent('2.42', '0.002', { count: 3, intervalMs: 0, fit: true }), SESSION);
+  assert.deepEqual(two.batches, ['1.21', '1.21']);
+  assert.ok(two.notes.some(note => note.startsWith('分 2 批')), two.notes.join('\n'));
+  // A count that splits is kept as asked; fit is refused on an open.
+  assert.deepEqual((await h.ex.preview(closeIntent('2.42', '0.249', { count: 2, intervalMs: 0, fit: true }), SESSION)).batches, ['1.21', '1.21']);
+  assert.throws(() => parseIntent({ ...sameIntent(), batches: { count: 2, intervalMs: 0, fit: true } }), code('batch_unsupported'));
+  assert.throws(() => parseIntent(closeIntent('1', '1', { count: 2, intervalMs: 0, fit: 'yes' })), code('invalid_value'));
+}));
+
+test('市价腿自带价格界限：按跳动向内取整、只收紧基点界限；盘口已越过拒绝 price_moved；只用于市价腿', () => withHarness(async h => {
+  bindAccounts(h.ex);
+  const bounded = (adr: string, ordinary: string) => {
+    const intent = sameIntent();
+    intent.legs = [{ ...intent.legs[0]!, priceBound: adr }, { ...intent.legs[1]!, priceBound: ordinary }] as unknown as typeof intent.legs;
+    return intent;
+  };
+  // Selling the ADR: 41.1205 rounds up to 41.13 (band 41); buying the ordinary: 401.1756… rounds down to 401.17 (band 402.40).
+  const tight = await h.ex.preview(bounded('41.1205', '401.175609756097560975'), SESSION);
+  assert.deepEqual(tight.legs.map(item => item.priceBound), ['41.13', '401.17']);
+  assert.ok(tight.notes.includes('价格界限：Binance SKHYUSDT 卖出不低于 41.13，Binance SKHYNIXUSDT 买入不高于 401.17（规则阈值界限与 50 基点界限取较紧者）；每一批发送前任一腿盘口越过界限即不发送。'), tight.notes.join('\n'));
+  // Looser than the band: the band stays.
+  assert.deepEqual((await h.ex.preview(bounded('30', '500'), SESSION)).legs.map(item => item.priceBound), ['41', '402.4']);
+  await assert.rejects(h.ex.preview(bounded('41.25', '401'), SESSION), code('price_moved'));
+  await assert.rejects(h.ex.preview(bounded('41', '399.99'), SESSION), code('price_moved'));
+  const limit = sameIntent();
+  limit.legs = [{ ...limit.legs[0]!, orderType: 'local-chase', priceBound: '41' }, limit.legs[1]!] as unknown as typeof limit.legs;
+  assert.throws(() => parseIntent(limit), code('limit_price'));
+}));
+
+test('规则界限对每一批生效：首腿 IOC 限价取界限；后续批次对冲腿盘口越过界限即不发送，等到截止，只按已成交批次结束', () => withHarness(async h => {
+  bindAccounts(h.ex);
+  const intent = { ...sameIntent(), batches: { count: 2, intervalMs: 0 } };
+  intent.legs = [{ ...intent.legs[0]!, priceBound: '41.1205' }, { ...intent.legs[1]!, priceBound: '401.175609756097560975' }] as unknown as typeof intent.legs;
+  const { jobId } = await previewAndConfirm(h, intent);
+  for (let i = 0; i < 4 && h.binance.position(SIM_ACCOUNTS.binance, 'SKHYNIXUSDT', 'long') === '0'; i++) { await h.ex.tick(); h.advance(500); }
+  const firstLead = [...h.binance.orders.values()].find(order => order.request.symbol === 'SKHYUSDT')!;
+  assert.deepEqual([firstLead.request.type, firstLead.request.limitPrice, firstLead.request.quantity], ['limit', '41.13', '1.21']);
+  assert.equal(h.binance.position(SIM_ACCOUNTS.binance, 'SKHYNIXUSDT', 'long'), '0.124');
+  // The ordinary share's ask moves past its 401.17 bound: batch 2 waits instead of selling ADR the hedge could not cover at the threshold.
+  h.binance.setBook('SKHYNIXUSDT', { ask: '401.20' });
+  const view = await settle(h, jobId, { ticks: 80 });
+  assert.equal(view.status, 'completed', view.reason ?? '');
+  assert.equal([...h.binance.orders.values()].filter(order => order.request.symbol === 'SKHYUSDT').length, 1, '第 2 批首腿没有发送');
+  assert.deepEqual(view.legs.map(item => item.filledQuantity), ['1.21', '0.124']);
+  assert.match(view.reason ?? '', /首腿成交 1\.21，计划 2\.42/);
+}));
+
 test('金额太小、跨所等金额：不足最小数量拒绝；跨所同一合约按各所步长折算后按比例完成', () => withHarness(async h => {
   bindAccounts(h.ex);
   await assert.rejects(h.ex.preview(sameIntent({ notional: '0.3' }), SESSION), code('notional_too_small'));

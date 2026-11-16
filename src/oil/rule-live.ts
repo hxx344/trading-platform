@@ -2,7 +2,8 @@
 // a rule sends, and what a finished job means for the rule. Orders go only through the executor's own preview and confirm, so its caps,
 // account checks and price protection apply to an automatic job exactly as to one sent from the page.
 import type { PositionSide, Venue } from '../contracts.ts';
-import { cmp, sub } from '../decimal.ts';
+import { cmp, fromUnits, sub, units } from '../decimal.ts';
+import { HYNIX_RATIO } from '../hynix/sizing.ts';
 import type { BookRow, Direction, RuleAction, RuleConfig } from './rules.ts';
 
 export const PHASES = ['idle', 'opening', 'holding', 'closing', 'review'] as const;
@@ -80,19 +81,56 @@ export const legSides = (market: RuleMarket, direction: Direction): Record<strin
 /** The job's longest run: one minute, plus the batch intervals when the rule splits its orders (docs/hynix.md 8.2). */
 export const ruleTimeout = (config: Pick<RuleConfig, 'batches'>): number => JOB_TIMEOUT_MS + (config.batches ? (config.batches.count - 1) * config.batches.intervalMs : 0);
 
+const SCALE = 10n ** 18n;
+const divCeil = (a: bigint, b: bigint): bigint => (a + b - 1n) / b;
+
+/**
+ * Per-leg price bounds that keep the spread on the threshold, as the workbench's boundsFor (server/trading-auto.mjs): the
+ * slack between the executable spread and the threshold is split between the legs, so any fill no worse than both bounds
+ * still meets the threshold (L100). Selling the spread, the premium leg sells no lower than its bound and the base leg buys no
+ * higher; buying it is the reverse. The bounds here are exact, rounded toward safety at 18 digits; the executor rounds each
+ * inward on its tick and keeps the tighter of it and its basis-point band, for every batch (docs/hynix.md 8.2). A sell
+ * bound at or below zero bounds nothing and is left out. Null when the books do not meet the threshold.
+ */
+export function thresholdBounds(market: RuleMarket, sell: boolean, threshold: string, premium: { bid: string; ask: string }, base: { bid: string; ask: string }): Record<string, string> | null {
+  const limit = units(threshold), factor = limit + 100n * SCALE, scale = HYNIX_RATIO * 100n * SCALE;
+  if (market === 'hynix' && factor <= 0n) return null;
+  // Premium price at the threshold for a base price, and base price at the threshold for a premium price.
+  const premiumAt = (b: bigint, up: boolean) => market === 'hynix' ? (up ? divCeil(factor * b, scale) : factor * b / scale) : b + limit;
+  const baseAt = (p: bigint, up: boolean) => market === 'hynix' ? (up ? divCeil(p * scale, factor) : p * scale / factor) : p - limit;
+  const bounds: Record<string, string> = {};
+  const put = (symbol: string, value: bigint, buying: boolean): boolean => {
+    if (value > 0n) bounds[symbol] = fromUnits(value);
+    return value > 0n || !buying;
+  };
+  if (sell) {
+    const bid = units(premium.bid), floor = premiumAt(units(base.ask), true);
+    if (bid < floor) return null;
+    const premiumLimit = bid - (bid - floor) / 2n;
+    return put(PREMIUM_LEG[market], premiumLimit, false) && put(BASE_LEG[market], baseAt(premiumLimit, false), true) ? bounds : null;
+  }
+  const ask = units(premium.ask), ceiling = premiumAt(units(base.bid), false);
+  if (ask > ceiling) return null;
+  const premiumLimit = ask + (ceiling - ask) / 2n;
+  return put(PREMIUM_LEG[market], premiumLimit, true) && put(BASE_LEG[market], baseAt(premiumLimit, true), false) ? bounds : null;
+}
+
 /**
  * The executor intent: same venue, lead then hedge, both at market; an open by barrels (oil) or equal USDT notional (hynix),
- * a close by the held quantities; the rule's batches on both.
+ * a close by the held quantities; the rule's batches on both (a close fits them to what is held, down to one batch); each
+ * leg held to its threshold bound.
  */
-export function ruleIntent(config: RuleConfig, action: RuleAction, held: readonly HeldLeg[] | null) {
+export function ruleIntent(config: RuleConfig, action: RuleAction, held: readonly HeldLeg[] | null, bounds: Record<string, string> = {}) {
   const sides = legSides(config.market, config.direction);
   if (action === 'close' && !held) throw new Error('没有持有记录，无法平仓');
   const size = config.market === 'hynix' ? { notional: config.notional } : { barrels: config.barrels };
   return {
-    market: config.market, preset: 'same-exchange', action, timeoutMs: ruleTimeout(config), ...(config.batches ? { batches: config.batches } : {}),
+    market: config.market, preset: 'same-exchange', action, timeoutMs: ruleTimeout(config),
+    ...(config.batches ? { batches: action === 'close' ? { ...config.batches, fit: true } : config.batches } : {}),
     legs: RULE_LEGS[config.market].map(symbol => ({
       venue: config.venue, symbol, side: sides[symbol], orderType: 'market',
       ...(action === 'open' ? size : { quantity: held!.find(leg => leg.symbol === symbol)!.quantity }),
+      ...(bounds[symbol] ? { priceBound: bounds[symbol] } : {}),
     })),
   };
 }
@@ -136,6 +174,8 @@ export function settleJob(job: { status: string; reason?: string | null; legs: r
   }
   if (none) return { kind: 'revert', message: `${label}${status}，但两腿都没有成交；${RETRY_MS / 1000} 秒后再判断` };
   if (oil && cmp(barrels[0]!, barrels[1]!) !== 0) return review(`两腿成交桶数不等（${both(barrels)}）`);
+  // Hynix legs are not compared here: a completed job means the executor filled the hedge at the proportional target of the
+  // lead's fills (proportionalHedge; docs/hynix.md 2), and anything short of it ends the job in attention, not completed.
   if (!oil && filled.some(quantity => cmp(quantity, ZERO) === 0)) return review(`一腿没有成交（${both(filled)}）`);
   if (tracked.action === 'open') {
     const sides = legSides(config.market, config.direction);

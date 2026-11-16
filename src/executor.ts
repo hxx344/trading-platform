@@ -5,7 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { add, bandEdge, cmp, floorToStep, isMultiple, isZero, mul, sub, units, fromUnits } from './decimal.ts';
 import {
   ContractError, HYNIX_SYMBOLS, MAX_SLIPPAGE_BPS, UUID, marketOfSymbol, MARKET_SYMBOLS, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, exactKeys, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseNotionalLimits, parseInstrument, parseIntent, parseQuote, positionOf, reject, text,
-  type AccountBinding, type NotionalLimits, type AccountSnapshot, type Action, type Environment, type Instrument, type LegOrderType, type Market, type OrderSide, type PairIntent, type PositionSide, type Quote, type RebalanceIntent, type TransferConfig, type Venue,
+  type AccountBinding, type BatchIntent, type NotionalLimits, type AccountSnapshot, type Action, type Environment, type Instrument, type LegOrderType, type Market, type OrderSide, type PairIntent, type PositionSide, type Quote, type RebalanceIntent, type TransferConfig, type Venue,
 } from './contracts.ts';
 import {
   STRATEGY_ID, VenueError, parseOrderReport, parseStrategyAck, parseStrategyReport, strategyRequestOf, supportsChase,
@@ -313,6 +313,15 @@ function reserveFor(instrument: Instrument, price: string): string {
 const maskId = (id: string): string => id.length > 4 ? `***${id.slice(-4)}` : '***';
 const maxOf = (...values: string[]): string => values.reduce((top, value) => cmp(value, top) > 0 ? value : top);
 /**
+ * A leg's asked bound rounded inward on the tick (a buy's down, a sell's up), then the tighter of it and the band: a buy is
+ * held to the lower, a sell to the higher, so the asked bound can only narrow what may fill.
+ */
+function tighterBound(band: string, asked: string, side: OrderSide, tick: string): string {
+  const unit = units(tick), raw = units(asked);
+  const rounded = fromUnits(side === 'buy' ? raw - raw % unit : (raw + unit - 1n) / unit * unit);
+  return side === 'buy' ? (cmp(rounded, band) < 0 ? rounded : band) : (cmp(rounded, band) > 0 ? rounded : band);
+}
+/**
  * A leg's notional at the highest price the plan admits for it: the preview bound, the book's ask or the limit, whichever is
  * highest, so a sell is not undercounted at its lower bound. The market hedge carries no venue-enforced price limit, so its
  * real fill can still cost more than this.
@@ -557,6 +566,18 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (action === 'open' && cmp(mul(mul(leg.quantity, quote.bid), instrument.contractSize), instrument.minNotional) < 0) reject('min_notional', `${name} 名义金额低于 ${instrument.minNotional} USDT`);
   }
 
+  /**
+   * The batches of a plan, or null for one batch. A close asked to fit (the spread rules', docs/hynix.md 8.2) takes the most
+   * batches its quantities split into, down to one; anything else refuses a count that does not split.
+   */
+  function fitBatches(legs: [PlannedLeg, PlannedLeg], asked: BatchIntent, quotes: readonly Quote[], action: Action): string[] | null {
+    if (!asked.fit) return planBatches(legs, asked.count, quotes, action);
+    for (let count = asked.count; count > 1; count--) {
+      try { return planBatches(legs, count, quotes, action); }
+      catch (error) { if (!(error instanceof ContractError) || error.code !== 'batch_size') throw error; }
+    }
+    return null;
+  }
   /** Lead quantity of each batch. Every batch is checked as an order on both legs, so no batch is refused at send for its size. */
   function planBatches(legs: [PlannedLeg, PlannedLeg], count: number, quotes: readonly Quote[], action: Action): string[] {
     if (marketOfSymbol(legs[0].symbol) === 'hynix') return planHynixBatches(legs, count, quotes, action);
@@ -658,7 +679,15 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       // A selling chase has only a floor: it may chase the price up for the whole job, past what the caps counted. On real
       // accounts it stays refused without caps too: that order has never run on one.
       if ((limits || environment === 'mainnet') && leg.orderType === 'chase' && orderSide === 'sell') reject('notional_chase_sell', '卖出方向的原生追价首腿只有最低价、没有价格上限，不能使用；请改用市价、限价或本地追价', 409);
-      const priceBound = orderSide === 'buy' ? bandEdge(quote.ask, slippageBps, 'up', instrument.tickSize) : bandEdge(quote.bid, slippageBps, 'down', instrument.tickSize);
+      const band = orderSide === 'buy' ? bandEdge(quote.ask, slippageBps, 'up', instrument.tickSize) : bandEdge(quote.bid, slippageBps, 'down', instrument.tickSize);
+      // A market leg's own bound (the spread rules' threshold bound) is rounded inward on the tick and only ever tightens the
+      // band; the lead's IOC price and every batch's send check then hold to it (docs/hynix.md 8.2, L100). A book already past
+      // it is refused here: the rule counts its samples again.
+      const priceBound = leg.priceBound === undefined ? band : tighterBound(band, leg.priceBound, orderSide, instrument.tickSize);
+      if (leg.priceBound !== undefined) {
+        const price = orderSide === 'buy' ? quote.ask : quote.bid;
+        if (orderSide === 'buy' ? cmp(price, priceBound) > 0 : cmp(price, priceBound) < 0) reject('price_moved', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 盘口 ${price} 已越过价格界限 ${priceBound}`, 409);
+      }
       const planned = { venue: leg.venue, symbol: leg.symbol, side: leg.side, quantity: quantities[index] as string, orderType: leg.orderType, limitPrice: leg.limitPrice };
       checkQuantity(planned, instrument, quote, intent.action);
       // A marketable limit beyond the band would fill past the protection the plan promises (L100); a chase bound may only be tighter.
@@ -678,7 +707,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     // job in attention. Hynix legs hedge equal notional, so their units differ and they settle in the planned proportion.
     const [a, b] = legs.map(leg => units(exposure(leg.quantity, leg.instrument)));
     if (!hynix && a !== b) reject('unbalanced', `两腿桶数不相等：${fromUnits(a)} 与 ${fromUnits(b)}`);
-    const batches = intent.batches ? planBatches(legs, intent.batches.count, reads.map(read => read.quote), intent.action) : null;
+    const batches = intent.batches ? fitBatches(legs, intent.batches, reads.map(read => read.quote), intent.action) : null;
+    const bounded = intent.legs.some(leg => leg.priceBound !== undefined);
     const notional = jobNotional(legs);
     checkNotional(notional, intent.action);
     const capNote = !limits ? null
@@ -690,6 +720,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
           ? `先发送 ${legLabel(legs, 0)} 腿，成交确认后按计划比例（对冲腿 ${legs[1].quantity} ÷ 首腿 ${legs[0].quantity}）换算其成交量，向下取整到步长后发送 ${legLabel(legs, 1)} 对冲腿；取整留下的差额不超过对冲腿一个数量步长 ${legs[1].instrument.quantityStep}。`
           : `先发送 ${legLabel(legs, 0)} 腿，成交确认后按其成交量发送 ${legLabel(legs, 1)} 对冲腿。`,
         ...(hynix ? [`按预览中间价估算：${legs.map(leg => `${legLabel(legs, leg.index)} ${leg.quantity} 约 ${mul(exposure(leg.quantity, leg.instrument), midOf(leg.quote.bid, leg.quote.ask)).replace(/(\.\d{2})\d+$/, '$1')} USDT`).join('，')}。`] : []),
+        ...(intent.batches && (batches?.length ?? 1) < intent.batches.count ? [`持有量分不成 ${intent.batches.count} 批，按能分开的最多 ${batches?.length ?? 1} 批平仓。`] : []),
+        ...(bounded ? [`价格界限：${legs.map(leg => `${legLabel(legs, leg.index)} ${leg.orderSide === 'buy' ? '买入不高于' : '卖出不低于'} ${leg.priceBound}`).join('，')}（规则阈值界限与 ${slippageBps} 基点界限取较紧者）；每一批发送前任一腿盘口越过界限即不发送。`] : []),
         ...(batches && intent.batches ? [`分 ${batches.length} 批，首腿每批 ${hynix ? `${batches.join(' / ')}（${legs[0].symbol} 合约数量），对冲腿每批按计划比例` : `${batches.map(quantity => exposure(quantity, legs[0].instrument)).join(' / ')} 桶`}；一批首腿结束并补齐对冲后，等 ${intent.batches.intervalMs / 1000} 秒再发下一批。后续批次发送前盘口或持仓不满足条件时等待到截止，不追加；截止或停止时未发的批次不再发送。`] : []),
         legs[0].orderType === 'local-chase'
           ? `首腿本地追价：只挂单挂在${legs[0].orderSide === 'buy' ? '买一' : '卖一'}，盘口变化后撤单重挂（挂满 ${budgets.chaseRepriceMs / 1000} 秒后才改价），${legs[0].orderSide === 'buy' ? '最高' : '最低'}追到 ${legs[0].limitPrice ?? legs[0].priceBound}${legs[0].limitPrice ? '（自填界限）' : `（${slippageBps} 基点价格保护界限）`}${legs[0].chaseCeiling ? `，最高挂到 ${legs[0].chaseCeiling}` : ''}；挂单期间的成交每轮按比例对冲。首腿最多 ${budgets.chaseOrderLimit} 笔委托（各批合计）；连续 ${budgets.chaseFailureLimit} 次挂单失败或到截止时间时撤单结束追价，按实际成交对冲后结束；请求停止则撤单且不再补发对冲腿。发送前对冲腿盘口越过界限 ${legs[1].priceBound} 即不发送。`

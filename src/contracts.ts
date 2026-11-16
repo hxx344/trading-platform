@@ -207,7 +207,11 @@ export const orderSideOf = (action: Action, side: PositionSide): OrderSide => (a
  * leg's native quantity at preview from the venue's contract size and step, so the page never has to know either.
  */
 /** Each leg names quantity, barrels (oil) or notional (hynix, USDT); the preview turns barrels and notional into quantity. */
-export interface LegIntent { venue: Venue; symbol: string; side: PositionSide; quantity: string | null; barrels: string | null; notional?: string | null; orderType: LegOrderType; limitPrice: string | null }
+/**
+ * priceBound: a market leg's own price bound, only ever tighter than the preview's basis-point band (the spread rules pass
+ * the bounds that keep the spread on their threshold, docs/hynix.md 8.2); absent on every manual order.
+ */
+export interface LegIntent { venue: Venue; symbol: string; side: PositionSide; quantity: string | null; barrels: string | null; notional?: string | null; orderType: LegOrderType; limitPrice: string | null; priceBound?: string }
 /**
  * cross-exchange: one contract (the top-level symbol), two venues, opposite sides. same-exchange: one venue, one BZUSDT and
  * one CLUSDT leg, opposite sides; each leg names its contract and there is no top-level symbol (null here).
@@ -215,8 +219,11 @@ export interface LegIntent { venue: Venue; symbol: string; side: PositionSide; q
  */
 export const PRESETS = ['cross-exchange', 'same-exchange'] as const;
 export type Preset = typeof PRESETS[number];
-/** The lead split into count parts sent intervalMs apart, each hedged before the next; absent is one batch. */
-export interface BatchIntent { count: number; intervalMs: number }
+/**
+ * The lead split into count parts sent intervalMs apart, each hedged before the next; absent is one batch. fit (a close
+ * only): when the quantities cannot be split into count batches, the most batches they can be split into, down to one.
+ */
+export interface BatchIntent { count: number; intervalMs: number; fit?: true }
 export interface PairIntent { market: Market; preset: Preset; symbol: string | null; action: Action; timeoutMs: number; maxSlippageBps: number | null; legs: [LegIntent, LegIntent]; batches?: BatchIntent }
 /** reduce closes part of the larger hynix leg, add opens more of the smaller one (docs/hynix.md 7.3). */
 export const REBALANCE_METHODS = ['reduce', 'add'] as const;
@@ -250,7 +257,7 @@ export function parsePairIntent(value: unknown): PairIntent {
   if (!Array.isArray(raw.legs) || raw.legs.length !== 2) reject('leg_count', same ? '同所双腿需要正好两条腿' : '跨所双腿需要正好两条腿');
   const legs = (raw.legs as unknown[]).map(item => {
     // Oil sizes by barrels, hynix by USDT notional; each market refuses the other's field as unknown.
-    const leg = exactKeys(item, same ? ['venue', 'symbol', 'side', 'orderType'] : ['venue', 'side', 'orderType'], ['quantity', hynix ? 'notional' : 'barrels', 'limitPrice']);
+    const leg = exactKeys(item, same ? ['venue', 'symbol', 'side', 'orderType'] : ['venue', 'side', 'orderType'], ['quantity', hynix ? 'notional' : 'barrels', 'limitPrice', 'priceBound']);
     const venue = oneOf(leg.venue, VENUES, '交易所');
     const legSymbol = symbol ?? oneOf(leg.symbol, symbols, symbolName);
     if (!VENUE_EXECUTION_SYMBOLS[venue].includes(legSymbol)) reject('venue_symbol', `${VENUE_NAMES[venue]} 不支持 ${legSymbol} 执行`);
@@ -261,11 +268,13 @@ export function parsePairIntent(value: unknown): PairIntent {
     // A local chase may name its own chase bound (highest buy, lowest sell); without one the preview bound is used.
     const limitPrice = leg.limitPrice === undefined || leg.limitPrice === null ? null : decimalField(leg.limitPrice, orderType === 'local-chase' ? '追价界限' : '限价');
     if (orderType !== 'local-chase' && (orderType === 'limit') !== (limitPrice !== null)) reject('limit_price', orderType === 'limit' ? '限价单需要限价' : orderType === 'chase' ? '追价策略不设限价（最高追价取预览的价格保护界限）' : '市价单不设限价');
+    const priceBound = leg.priceBound === undefined ? undefined : decimalField(leg.priceBound, '价格界限');
+    if (priceBound !== undefined && orderType !== 'market') reject('limit_price', '只有市价腿可以自带价格界限');
     return {
       venue, symbol: legSymbol, side: oneOf(leg.side, ['long', 'short'] as const, '仓位方向'),
       quantity: leg.quantity == null ? null : decimalField(leg.quantity, '每腿数量'), barrels: leg.barrels == null ? null : decimalField(leg.barrels, '每腿桶数'),
       ...(hynix ? { notional: leg.notional == null ? null : decimalField(leg.notional, '每腿名义金额') } : {}),
-      orderType, limitPrice,
+      orderType, limitPrice, ...(priceBound !== undefined ? { priceBound } : {}),
     };
   }) as [LegIntent, LegIntent];
   if (same) {
@@ -290,8 +299,10 @@ export function parsePairIntent(value: unknown): PairIntent {
   const timeoutMs = integer(raw.timeoutMs, 30_000, 3_600_000, '最长执行毫秒数');
   let batches: BatchIntent | undefined;
   if (raw.batches !== undefined && raw.batches !== null) {
-    const batch = exactKeys(raw.batches, ['count', 'intervalMs']);
-    batches = { count: integer(batch.count, 1, MAX_BATCHES, '批次数'), intervalMs: integer(batch.intervalMs, 0, MAX_BATCH_INTERVAL_MS, '批次间隔毫秒数') };
+    const batch = exactKeys(raw.batches, ['count', 'intervalMs'], ['fit']);
+    if (batch.fit !== undefined && batch.fit !== true) reject('invalid_value', 'fit 只能为 true');
+    if (batch.fit === true && action !== 'close') reject('batch_unsupported', '按持有量降低批数只用于平仓');
+    batches = { count: integer(batch.count, 1, MAX_BATCHES, '批次数'), intervalMs: integer(batch.intervalMs, 0, MAX_BATCH_INTERVAL_MS, '批次间隔毫秒数'), ...(batch.fit === true ? { fit: true as const } : {}) };
     if (batches.count > 1 && legs[0].orderType !== 'market' && legs[0].orderType !== 'local-chase') reject('batch_unsupported', '分批只用于首腿市价或本地追价');
     if ((batches.count - 1) * batches.intervalMs >= timeoutMs) reject('batch_timeout', `${batches.count} 批、每批间隔 ${batches.intervalMs} 毫秒超过最长执行时间`);
     if (batches.count === 1) batches = undefined;

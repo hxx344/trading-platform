@@ -8,10 +8,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ContractError } from '../src/contracts.ts';
+import { ContractError, exactKeys } from '../src/contracts.ts';
 import { cmp } from '../src/decimal.ts';
-import { createOilRules, evaluateRule, parseRuleConfig, type BookRow } from '../src/oil/rules.ts';
-import { RETRY_MS, beijingDay, type RuleExecutor, type RulePlan } from '../src/oil/rule-live.ts';
+import { createOilRules, evaluateRule, parseRuleConfig, storedConfig, type BookRow } from '../src/oil/rules.ts';
+import { oilLoops, openOilRules, type OilRuntime } from '../src/service/oil.ts';
+import { RETRY_MS, beijingDay, thresholdBounds, type RuleExecutor, type RulePlan } from '../src/oil/rule-live.ts';
+import { comparePremium } from '../src/hynix/sizing.ts';
 import { SIM_ACCOUNTS } from '../src/simulation.ts';
 import { bindAccounts, createHarness, settle } from './harness.ts';
 
@@ -94,7 +96,7 @@ class FakeExecutor implements RuleExecutor {
 
 type Rules = ReturnType<typeof createOilRules>;
 type LiveView = { enabled: boolean; phase: string; held: { symbol: string; side: string; quantity: string }[] | null; pending: { action: string } | null; job: { id: string } | null; opensToday: number; failures: number; reason: string | null };
-type RuleView = { id: string; revision: number; title: string; config: Record<string, unknown>; live: LiveView | null; observation: { note: string | null; open: { value: string; hits: number } | null } | null; events: { message: string }[] };
+type RuleView = { id: string; revision: number; title: string; config: { market?: string; notional?: string }; live: LiveView | null; observation: { note: string | null; open: { value: string; hits: number } | null } | null; events: { message: string }[] };
 const first = (rules: Rules) => (rules.view() as { rules: RuleView[] }).rules[0]!;
 const live = (rules: Rules) => first(rules).live!;
 const lastEvent = (rules: Rules) => first(rules).events.at(-1)!.message;
@@ -204,12 +206,14 @@ test('海力士实盘：连续两份新盘口才开仓，同一份盘口不重�
   assert.deepEqual(ex.previews[0], {
     session: `oil-rule:${id}`,
     intent: { market: 'hynix', preset: 'same-exchange', action: 'open', timeoutMs: 60_000, legs: [
-      { venue: 'binance', symbol: 'SKHYUSDT', side: 'short', orderType: 'market', notional: '100' },
-      { venue: 'binance', symbol: 'SKHYNIXUSDT', side: 'long', orderType: 'market', notional: '100' },
+      // ADR bid 41.20 against the 41.041 at which ordinary ask 400.40 meets 2.5 %: the ADR sells ≥ 41.1205, the ordinary
+      // share buys ≤ 41.1205 × 1000 ÷ 102.5 (truncated), which together still meet 2.5 %.
+      { venue: 'binance', symbol: 'SKHYUSDT', side: 'short', orderType: 'market', notional: '100', priceBound: '41.1205' },
+      { venue: 'binance', symbol: 'SKHYNIXUSDT', side: 'long', orderType: 'market', notional: '100', priceBound: '401.175609756097560975' },
     ] },
   });
   const events = (rules: Rules) => first(rules).events.map(item => item.message);
-  assert.ok(events(rules).includes('开仓预览通过：溢价 2.8971%，ADR 2.42、正股 0.249，名义 200 USDT；确认下单'), events(rules).join('\n'));
+  assert.ok(events(rules).includes('开仓预览通过：溢价 2.8971%，ADR 2.42、正股 0.249，两腿合计名义 200 USDT；确认下单'), events(rules).join('\n'));
   assert.equal(live(rules).phase, 'opening');
   ex.finish('completed', ['2.42', '0.249']);
   await rules.tick();
@@ -220,6 +224,9 @@ test('海力士实盘：连续两份新盘口才开仓，同一份盘口不重�
   assert.equal(ex.previews.length, 1);
   await feed(r, rules, CLOSE, 2);
   assert.deepEqual(ex.previews[1]!.intent.legs.map(leg => [leg.symbol, leg.side, leg.quantity, leg.notional]), [['SKHYUSDT', 'short', '2.42', undefined], ['SKHYNIXUSDT', 'long', '0.249', undefined]]);
+  // Buying back: ADR ask 40.14 against the 40.20 at which ordinary bid 400.00 meets 0.5 %: the ADR buys ≤ 40.17, the
+  // ordinary share sells ≥ 40.17 × 1000 ÷ 100.5 (rounded up), which together stay at or under 0.5 %.
+  assert.deepEqual(ex.previews[1]!.intent.legs.map(leg => (leg as { priceBound?: string }).priceBound), ['40.17', '399.701492537313432836']);
   ex.finish('completed', ['1.21', '0.124']);
   await rules.tick();
   assert.deepEqual([live(rules).phase, live(rules).held!.map(leg => leg.quantity)], ['holding', ['1.21', '0.125']]);
@@ -282,12 +289,12 @@ test('规则分批：海力士与原油规则的意图带上批次，最长执�
   goLive(rules, hynix({ batches: { count: 3, intervalMs: 10_000 } }));
   await feed(r, rules, OPEN, 2);
   assert.deepEqual([ex.previews[0]!.intent.batches, ex.previews[0]!.intent.timeoutMs], [{ count: 3, intervalMs: 10_000 }, 80_000]);
-  assert.ok(first(rules).events.some(item => item.message.endsWith('，分 3 批，名义 200 USDT；确认下单')), lastEvent(rules));
+  assert.ok(first(rules).events.some(item => item.message.endsWith('，分 3 批，两腿合计名义 200 USDT；确认下单')), lastEvent(rules));
   ex.finish('completed', ['2.42', '0.249']);
   await rules.tick();
   // The close splits the same way.
   await feed(r, rules, CLOSE, 2);
-  assert.deepEqual([ex.previews[1]!.intent.action, ex.previews[1]!.intent.batches], ['close', { count: 3, intervalMs: 10_000 }]);
+  assert.deepEqual([ex.previews[1]!.intent.action, ex.previews[1]!.intent.batches], ['close', { count: 3, intervalMs: 10_000, fit: true }]);
   const oilId = goLive(rules, oil({ batches: { count: 2, intervalMs: 5_000 } }));
   const plain = goLive(rules, oil({ name: '不分批', openThreshold: '4.04' }));
   await feed(r, rules, OPEN, 2);
@@ -347,3 +354,108 @@ test('海力士实盘端到端：真实执行器与模拟交易所上分 2 批�
     } finally { rules.close(); }
   } finally { h.dispose(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('规则平仓按持有量降批：持有量分不成规则批数时按能分开的最多批数平仓，不计失败、不带仓停用（真实执行器）', async () => {
+  const h = createHarness();
+  const dir = mkdtempSync(join(tmpdir(), 'tp-hynix-rules-')), file = join(dir, 'oil-rules.sqlite');
+  try {
+    bindAccounts(h.ex);
+    const books = (): BookRow[] => ['SKHYUSDT', 'SKHYNIXUSDT', 'BZUSDT', 'CLUSDT'].map(symbol => {
+      const book = h.binance.books.get(symbol)!;
+      return { venue: 'binance', symbol, bid: book.bid, ask: book.ask, receivedAt: h.clock.now, error: null };
+    });
+    const executor: RuleExecutor = { preview: (intent, session) => h.ex.preview(intent, session), confirm: (body, session) => h.ex.confirm(body, session), jobView: id => h.ex.jobView(id), confirmedJob: (requestId, previewId, session) => h.ex.confirmedJob(requestId, previewId, session) };
+    const open = () => createOilRules({ file, venues: ['binance'], books, now: () => h.clock.now, executor });
+    let rules = open();
+    try {
+      const id = goLive(rules, hynix({ closeThreshold: '1', batches: { count: 2, intervalMs: 0 } }));
+      for (let i = 0; i < 2; i++) { h.advance(3_000); await rules.tick(); }
+      assert.equal((await settle(h, live(rules).job!.id)).status, 'completed');
+      await rules.tick();
+      // What is left after an earlier partial close: 0.001 ordinary cannot be split in two (the first batch's hedge rounds to 0).
+      rules.close();
+      const raw = new DatabaseSync(file);
+      const state = JSON.parse((raw.prepare('SELECT state FROM rules WHERE id = ?').get(id) as { state: string }).state);
+      state.live.held[1].quantity = '0.001';
+      state.live.held[1].barrels = '0.001';
+      raw.prepare('UPDATE rules SET state = ? WHERE id = ?').run(JSON.stringify(state), id);
+      raw.close();
+      rules = open();
+      h.binance.setBook('SKHYUSDT', { bid: '40.00', ask: '40.02' });
+      for (let i = 0; i < 2; i++) { h.advance(3_000); await rules.tick(); }
+      const closing = live(rules);
+      assert.deepEqual([closing.phase, closing.failures], ['closing', 0], lastEvent(rules));
+      const closed = await settle(h, closing.job!.id);
+      assert.equal(closed.status, 'completed', closed.reason ?? '');
+      assert.equal(closed.batches, null, '降为 1 批即不分批');
+      await rules.tick();
+      assert.deepEqual([live(rules).phase, live(rules).held, live(rules).enabled], ['idle', null, true]);
+    } finally { rules.close(); }
+  } finally { h.dispose(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('服务接线：规则读原油与海力士两组盘口；海力士盘口循环也触发判断，原油读取卡住时海力士规则照常计数', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-hynix-rules-'));
+  const clock = { now: Date.UTC(2026, 10, 13, 2, 0, 0) };
+  let hynixBooks: BookRow[] = [], releaseOil!: () => void;
+  const oilStuck = new Promise<void>(resolve => { releaseOil = resolve; });
+  const oil = {
+    config: { accounts: [{ venue: 'binance' }] },
+    market: { view: () => ({ books: OIL_BOOKS(Date.UTC(2026, 10, 13, 1, 0, 0)) }), refreshQuotes: () => oilStuck, refreshPositions: async () => {} },
+    hynix: {
+      view: () => ({ books: hynixBooks }),
+      // Each round a new sample that meets the open threshold (≈ 2.897 % against 2.5 %).
+      refreshQuotes: async () => {
+        clock.now += 3_000;
+        hynixBooks = [['SKHYUSDT', '41.20', '41.24'], ['SKHYNIXUSDT', '400.00', '400.40']].map(([symbol, bid, ask]) => ({ venue: 'binance', symbol: symbol!, bid: bid!, ask: ask!, receivedAt: clock.now, error: null }));
+      },
+      refreshPositions: async () => {},
+    },
+  } as unknown as OilRuntime;
+  const rules = openOilRules(oil, dir, { now: () => clock.now });
+  try {
+    rules.create({ config: hynix(), observing: true });
+    const hits = () => ((rules.view() as { rules: RuleView[] }).rules[0]!.observation?.open?.hits ?? 0);
+    let rounds = 0;
+    const context = { stopped: () => hits() >= 3 || rounds >= 200, pause: async () => { rounds++; await new Promise(resolve => setImmediate(resolve)); } };
+    const loops = Promise.all(oilLoops(oil, context, () => {}, rules));
+    while (!context.stopped()) await new Promise(resolve => setImmediate(resolve));
+    assert.ok(hits() >= 3, `原油盘口读取没结束时海力士规则计到 ${hits()} 次`);
+    releaseOil();
+    await loops;
+    // The rules read both markets' books: the hynix rule's reading came from the hynix view, the oil books are there too.
+    const observation = (rules.view() as { rules: RuleView[] }).rules[0]!.observation!;
+    assert.match(observation.open!.value, /^2\.89/);
+  } finally { rules.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('回退兼容：v0.51.0 的规则参数键集合读不了海力士与分批规则（显示规则参数无法读取、不会下单），原油不分批规则照旧可读', () => {
+  // CONFIG_KEYS of v0.51.0's src/oil/rules.ts, read there with exactKeys(value, [...CONFIG_KEYS]).
+  const V051_KEYS = ['name', 'venue', 'direction', 'openThreshold', 'closeThreshold', 'barrels', 'confirmSamples', 'maxOpensPerDay'];
+  const stored = (config: Record<string, unknown>) => JSON.parse(storedConfig(parseRuleConfig(config, ['binance'])));
+  assert.doesNotThrow(() => exactKeys(stored(oil()), V051_KEYS));
+  assert.throws(() => exactKeys(stored(hynix()), V051_KEYS), code('unknown_field'));
+  assert.throws(() => exactKeys(stored(oil({ batches: { count: 2, intervalMs: 0 } })), V051_KEYS), code('unknown_field'));
+  assert.throws(() => exactKeys(stored(hynix({ batches: { count: 2, intervalMs: 0 } })), V051_KEYS), code('unknown_field'));
+});
+
+test('阈值界限：两腿各分一半余量，按界限成交时组合价差恰不越过阈值；盘口不满足阈值时为 null；越过界限的预览重新计数、不计失败', () => withLive(async ({ r, ex, rules }) => {
+  // Hynix, selling at ≥ 2.5 % and buying back at ≤ 0.5 %: at both bounds the premium still meets the threshold.
+  const sell = thresholdBounds('hynix', true, '2.5', { bid: '41.20', ask: '41.24' }, { bid: '400.00', ask: '400.40' })!;
+  assert.ok(comparePremium(sell.SKHYUSDT!, sell.SKHYNIXUSDT!, '2.5') >= 0);
+  const buy = thresholdBounds('hynix', false, '0.5', { bid: '40.10', ask: '40.14' }, { bid: '400.00', ask: '400.40' })!;
+  assert.ok(comparePremium(buy.SKHYUSDT!, buy.SKHYNIXUSDT!, '0.5') <= 0);
+  assert.equal(thresholdBounds('hynix', true, '3', { bid: '41.20', ask: '41.24' }, { bid: '400.00', ask: '400.40' }), null);
+  // Oil, by difference: selling BZ − CL at ≥ 4 and buying it back at ≤ 3 (BZ ask 73.00, CL bid 70.05: ceiling 73.05).
+  assert.deepEqual(thresholdBounds('oil', true, '4', { bid: '74.10', ask: '74.12' }, { bid: '70.00', ask: '70.05' }), { BZUSDT: '74.075', CLUSDT: '70.075' });
+  assert.deepEqual(thresholdBounds('oil', false, '3', { bid: '72.95', ask: '73.00' }, { bid: '70.05', ask: '70.10' }), { BZUSDT: '73.025', CLUSDT: '70.025' });
+  // A sell bound at or under zero bounds nothing and is left out (a long open far under the spread).
+  assert.deepEqual(thresholdBounds('oil', false, '200', { bid: '74.10', ask: '74.12' }, { bid: '70.00', ask: '70.05' }), { BZUSDT: '172.06' });
+  // The executor refusing a book already past the bound: counted again, not a failure.
+  goLive(rules);
+  ex.previewError = new ContractError(409, 'price_moved', 'Binance SKHYUSDT 盘口 41.10 已越过价格界限 41.13');
+  await feed(r, rules, OPEN, 2);
+  assert.equal(ex.previews.length, 1);
+  assert.deepEqual([live(rules).failures, live(rules).phase], [0, 'idle']);
+  assert.match(lastEvent(rules), /重新计数，不计失败/);
+}));

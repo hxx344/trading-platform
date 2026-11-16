@@ -148,6 +148,8 @@ export interface ServiceViews {
   asset?: Omit<AssetStore, 'close'>;
   /** The Gate CrossEx module's reads and writes (service/crossex.ts); absent when the service runs without crossex, 503 while it has not started. */
   crossex?: CrossexViews;
+  /** The online update (service/update.ts): versions, a manual check, and the request to the root update helper. */
+  update?: { status(): unknown; check(): Promise<unknown>; apply(body: unknown): unknown };
 }
 
 /** accessToken is exchanged once per browser at /login; session is the cookie value and the executor session id. */
@@ -598,6 +600,12 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       const { intervalMinutes } = exactKeys(await readJson(request), ['intervalMinutes']);
       if (typeof intervalMinutes !== 'number') return send(response, 400, { code: 'summary_interval', message: '间隔须为整数分钟' });
       return send(response, 200, views.summary.setInterval(intervalMinutes));
+    }
+    if (url.pathname === '/api/update' || url.pathname === '/api/update/check' || url.pathname === '/api/update/apply') {
+      if (!views?.update) return send(response, 404, { code: 'not_found', message: '本服务没有在线更新' });
+      if (request.method === 'GET' && url.pathname === '/api/update') return send(response, 200, views.update.status());
+      if (request.method === 'POST' && url.pathname === '/api/update/check') { exactKeys(await readJson(request), []); return send(response, 200, await views.update.check()); }
+      if (request.method === 'POST' && url.pathname === '/api/update/apply') return send(response, 200, views.update.apply(await readJson(request)));
     }
     if (url.pathname === '/api/import') {
       if (!imports) return send(response, 404, { code: 'not_found', message: '本服务没有开启页面导入' });

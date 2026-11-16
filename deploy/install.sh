@@ -66,6 +66,11 @@ WATCH_SENDER=${TP_WATCH_SENDER:-/etc/main-watch/sender}
 IMPORT_DIR=${TP_IMPORT_DIR:-/var/lib/trading-platform-import}
 UNIT_DIR=$(dirname "$UNIT_FILE")
 IMPORT_UNITS=("$SERVICE-import.path" "$SERVICE-import.service")
+# The page's root helpers: the import above and the online update (docs/update.md), both watching the import directory.
+HELPER_UNITS=("${IMPORT_UNITS[@]}" "$SERVICE-update.path" "$SERVICE-update.service")
+# Written once trading-platform-update.path is enabled and running; the service offers the page's update only with it.
+# In the root-owned program directory: root never writes by path into the hand-off directory the service can change.
+UPDATE_READY="$APP_DIR/.update-helper"
 
 # Never fails: a closed terminal (SSH gone) or pipe must not end the script half way through a start.
 log() { printf '%s\n' "$*" 2>/dev/null || true; }
@@ -478,9 +483,10 @@ render_unit() { # 模板 目标；有变化并已写入返回 0，未变化返�
 }
 write_unit() { render_unit "$1/deploy/trading-platform.service" "$UNIT_FILE"; } # $1：取单元模板的版本目录
 FLOCK_BIN=$(command -v flock)
-# The page's import helper. A release without its templates (older than v0.3.0) leaves any installed units as they are.
-# Rendered before any unit is written, so a failure here leaves every installed unit untouched.
-for unit in "${IMPORT_UNITS[@]}"; do
+# The page's helpers. A release without a helper's templates (the import before v0.3.0, the update before v0.50.0) leaves
+# any installed units of it as they are. Rendered before any unit is written, so a failure here leaves every installed
+# unit untouched.
+for unit in "${HELPER_UNITS[@]}"; do
   if [[ -f "$release_dir/deploy/$unit" ]]; then render_to "$release_dir/deploy/$unit" "$work_dir/$unit" || fail "无法生成 $unit，未切换版本。"; fi
 done
 unit_changed=0
@@ -492,19 +498,19 @@ case $unit_status in
   *) fail '无法从程序包生成 systemd 单元，未切换版本。' ;;
 esac
 import_units_changed=0
-for unit in "${IMPORT_UNITS[@]}"; do
+for unit in "${HELPER_UNITS[@]}"; do
   [[ -f "$work_dir/$unit" ]] || continue
   cmp -s "$work_dir/$unit" "$UNIT_DIR/$unit" && continue
   install -m 644 "$work_dir/$unit" "$UNIT_DIR/$unit"
   import_units_changed=1
 done
-if ((import_units_changed)); then changes+=('页面导入助手单元'); fi
+if ((import_units_changed)); then changes+=('页面助手单元'); fi
 # An earlier run may have written a unit and stopped before reloading.
 needs_reload() {
   ((unit_changed || import_units_changed)) && return 0
   [[ "$TEST_MODE" != 1 ]] || return 1
   local unit
-  for unit in "$SERVICE" "${IMPORT_UNITS[@]}"; do
+  for unit in "$SERVICE" "${HELPER_UNITS[@]}"; do
     [[ "$(systemctl show -p NeedDaemonReload --value "$unit" 2>/dev/null)" != yes ]] || return 0
   done
   return 1
@@ -519,16 +525,23 @@ if ((configured)); then
 fi
 
 # ---- 6. 启动或重启 ------------------------------------------------------------------
-# Failing to arm the import helper does not fail the install: the service runs, only the page's import waits for it.
-ensure_import_path() {
-  [[ -f "$UNIT_DIR/$SERVICE-import.path" ]] || return 0
-  local unit="$SERVICE-import.path"
+# Failing to arm a helper does not fail the install: the service runs, only the page's import or update waits for it.
+arm_path() { # 单元 用途
+  local unit=$1 what=$2
+  [[ -f "$UNIT_DIR/$unit" ]] || return 1
   if ! systemctl is-enabled --quiet "$unit"; then
-    if systemctl enable --quiet "$unit"; then changes+=('页面导入助手'); else log "无法设置 $unit 开机自启，页面导入暂不可用"; return 0; fi
+    if systemctl enable --quiet "$unit"; then changes+=("$what"); else log "无法设置 $unit 开机自启，${what}暂不可用"; return 1; fi
   fi
   if ((import_units_changed)) || ! systemctl is-active --quiet "$unit"; then
-    systemctl restart "$unit" || log "无法启动 $unit，页面导入暂不可用"
+    systemctl restart "$unit" || { log "无法启动 $unit，${what}暂不可用"; return 1; }
   fi
+}
+ensure_import_path() {
+  arm_path "$SERVICE-import.path" 页面导入助手 || true
+  # The page offers the update only while its helper is armed (the service looks for this file).
+  if [[ -f "$release_dir/src/service/update-helper.ts" ]] && arm_path "$SERVICE-update.path" 页面在线更新; then
+    [[ -f "$UPDATE_READY" ]] || { printf '%s\n' "$new_version" >"$UPDATE_READY" && chmod 644 "$UPDATE_READY"; } || log "无法写入 $UPDATE_READY，页面在线更新暂不可用"
+  else rm -f "$UPDATE_READY"; fi
 }
 journal_tail() { steady journalctl -u "$SERVICE" -n 30 --no-pager -o cat 2>/dev/null || true; }
 healthy() { # marker：重启前的时间（秒）；服务写出新的登录链接文件说明已完成装配并在本机监听
@@ -546,6 +559,8 @@ healthy() { # marker：重启前的时间（秒）；服务写出新的登录链
 }
 if [[ "$TEST_MODE" == 1 ]]; then
   skipped+=('systemctl（测试模式）')
+  # deploy/test-install.sh arms the page helpers against a stand-in systemctl on PATH.
+  if [[ "${TP_TEST_ARM:-0}" == 1 ]]; then ensure_import_path; fi
   ((configured)) && printf '%s\n' "$applied" >"$applied_file"
 elif ((!configured)); then
   if needs_reload; then systemctl daemon-reload; fi

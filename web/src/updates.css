@@ -1,0 +1,115 @@
+/* 系统更新（UpdateStatus.tsx，docs/update.md）。
+   来源：project-aggregation src/updates.css 提交 9222ed6，第 2–7、9–10、12、14–16、18、20–25、27–32、34–36、71–92、94–100、
+   138、140–143、145、147–148 行与 150–168 行媒体查询中用到的规则，原样复制；没复制令牌、更新方式、下载进度、耗时与步骤列表。
+   .icon-button 与 .text-button 来自同仓库 src/styles.css 提交 3e1d69b 第 98–100 行；本仓库没有全局的这两个类（shell.css、
+   asset.css 各自限定），所以加 .update-dialog 前缀。
+   .nav-item 本身的样式在 shell.css（.app-shell > .sidebar .nav-item）；本文件只加工作台 .update-nav 的部分。
+   本仓库新增（工作台没有）：.update-job-step、.update-output（安装脚本最近几行输出）。 */
+.update-nav{margin-top:2px;min-height:44px}
+.update-nav>span{flex:1;color:var(--text-primary)}
+.update-nav small{display:block;font-size:.6875rem;color:var(--text-tertiary);margin-top:1px}
+.update-nav.available>svg:first-child,.update-nav.available small{color:var(--accent)}
+.update-nav.attention small{color:var(--warning)}
+.update-nav>svg:last-child{color:var(--text-tertiary)}
+.update-dialog{padding:0;border:1px solid var(--surface-5);border-radius:var(--radius-lg);width:min(670px,calc(100vw - 32px));max-height:calc(100dvh - 48px);box-shadow:var(--shadow-lg);color:var(--text-primary);background:var(--surface-2);overflow:hidden}
+.update-dialog::backdrop{background:rgba(3,5,8,.78)}
+.update-dialog-content{display:flex;flex-direction:column;max-height:calc(100dvh - 50px)}
+
+.update-header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:16px 20px;border-bottom:1px solid var(--surface-4);flex-shrink:0}
+.update-header h2{font-size:1.0625rem;color:var(--text-primary)}
+.update-header p{font-size:.8125rem;color:var(--text-tertiary);margin-top:5px}
+
+.update-body{overflow-y:auto;overscroll-behavior:contain;padding:16px 20px}
+
+.update-summary{display:flex;align-items:center;gap:12px;padding-bottom:16px}
+.update-summary-icon{display:flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:var(--radius-md);background:var(--emerald-soft);color:var(--emerald);flex-shrink:0}
+.update-summary.available .update-summary-icon{background:var(--accent-subtle);color:var(--accent)}
+.update-summary.attention .update-summary-icon{background:var(--warning-soft);color:var(--warning)}
+.update-summary strong{font-size:1rem;color:var(--text-primary)}
+.update-summary p{font-size:.75rem;color:var(--text-tertiary);margin-top:4px}
+
+.update-message{display:flex;align-items:flex-start;gap:10px;border:1px solid var(--warning-border);background:var(--warning-soft);color:var(--warning);border-radius:var(--radius-md);padding:10px 12px;margin-bottom:14px;font-size:.8125rem;line-height:1.75;overflow-wrap:anywhere}
+.update-message>svg{flex-shrink:0;margin-top:3px}
+.update-message p+p,.update-message strong+p{margin-top:4px}
+.update-message.setup{background:var(--accent-subtle);border-color:var(--accent);color:var(--accent)}
+.update-message .text-button{font-size:.8125rem;padding:5px 0 0;color:inherit;transition:background-color .2s ease,border-color .2s ease,color .2s ease,box-shadow .2s ease,transform .2s ease}
+.update-message .text-button:hover{opacity:.8}
+
+.update-section-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+.update-section-heading h3{font-size:.875rem;color:var(--text-primary)}
+.update-section-heading>span{font-size:.75rem;color:var(--text-tertiary)}
+
+.update-modules{padding:0;margin:0;list-style:none;border:1px solid var(--surface-4);border-radius:var(--radius-md);overflow:hidden}
+.update-module{padding:12px 14px;background:var(--surface-2)}
+.update-module+.update-module{border-top:1px solid var(--surface-4)}
+.update-module-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.update-module-heading h3{font-size:.875rem;overflow-wrap:anywhere;color:var(--text-primary)}
+
+.update-tag{font-size:.6875rem;border-radius:var(--radius-sm);padding:3px 7px;white-space:nowrap;color:var(--text-tertiary);background:var(--surface-3)}
+.update-tag.current{color:var(--emerald);background:var(--emerald-soft)}
+.update-tag.available{color:var(--accent);background:var(--accent-subtle)}
+.update-tag.unavailable,.update-tag.unmanaged{color:var(--warning);background:var(--warning-soft)}
+
+.update-versions{display:grid;grid-template-columns:minmax(0,1fr) 20px minmax(0,1fr);align-items:center;gap:17px;margin-top:12px}
+.update-versions>div>span:first-child{font-size:.6875rem;color:var(--text-tertiary);letter-spacing:.02em}
+.update-versions>svg{color:var(--text-tertiary)}
+.update-version{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;overflow-wrap:anywhere;margin-top:3px;line-height:1.5;font-variant-numeric:tabular-nums}
+.update-version strong{font-family:var(--font-mono);font-weight:550;font-size:.78125rem;color:var(--text-primary)}
+.update-version small{font-size:.6875rem;color:var(--text-tertiary)}
+
+.update-module-note{font-size:.75rem;color:var(--text-tertiary);margin-top:9px;line-height:1.65;overflow-wrap:anywhere}
+.update-release-notes{min-width:0;margin-top:12px;padding-top:4px;border-top:1px solid var(--surface-4)}
+.update-release-notes summary{padding:8px 0;min-height:36px;color:var(--accent);font-size:.8125rem;cursor:pointer}
+.update-release-notes p{margin:8px 0 4px;font-size:.8125rem;line-height:1.75;color:var(--text-secondary);white-space:pre-wrap;overflow-wrap:anywhere}
+
+.update-progress{--text-tertiary:var(--text-secondary);margin-bottom:16px;padding:12px 14px;border:1px solid var(--accent);border-radius:var(--radius-md);background:var(--accent-subtle)}
+.update-progress-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.update-progress-heading h3{font-size:.875rem;display:flex;align-items:center;gap:8px;color:var(--accent)}
+.update-progress-heading>span{font-size:.6875rem;color:var(--text-tertiary)}
+.update-progress>p{font-size:.8125rem;color:var(--text-tertiary);margin-top:9px;line-height:1.65;overflow-wrap:anywhere}
+.update-progress.failed,.update-progress.interrupted{background:var(--warning-soft);border-color:var(--warning-border)}
+.update-progress.failed h3,.update-progress.interrupted h3{color:var(--warning)}
+
+.update-progress-note{display:block;font-size:.75rem;color:var(--text-tertiary);margin-top:12px;line-height:1.65}
+
+.update-review{scroll-margin-block:8px;border:1px solid var(--accent);background:var(--accent-subtle);padding:12px 14px;border-radius:var(--radius-md);margin-top:14px;color:var(--accent)}
+.update-review h3{font-size:.875rem}
+.update-review p{font-size:.8125rem;margin-top:7px;line-height:1.75;overflow-wrap:anywhere}
+.update-review p[role=alert]{color:var(--warning)}
+
+.update-footnote,.update-empty{font-size:.75rem;color:var(--text-tertiary);line-height:1.75;margin-top:16px}
+
+.update-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 20px;border-top:1px solid var(--surface-4);background:var(--surface-1);flex-shrink:0}
+.update-channel{font-size:.75rem;color:var(--text-tertiary)}
+
+.update-dialog .icon-button{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border:0;border-radius:var(--radius-sm);background:transparent;color:var(--text-secondary);flex-shrink:0;transition:background-color .15s ease,color .15s ease}
+.update-dialog .icon-button:hover{background:var(--surface-3);color:var(--text-primary)}
+.update-dialog .text-button{display:inline-flex;align-items:center;gap:3px;border:0;background:none;font-size:.75rem;color:var(--accent);padding:4px 0}
+
+/* 本仓库新增：当前步骤与安装脚本输出，颜色与间距沿用上面 .update-progress>p 与 .update-release-notes。 */
+.update-progress>p.update-job-step{margin-top:6px;font-size:.75rem}
+.update-output{margin-top:10px;padding-top:4px;border-top:1px solid var(--surface-4)}
+.update-output summary{padding:8px 0;min-height:36px;color:var(--accent);font-size:.8125rem;cursor:pointer}
+.update-output pre{margin:4px 0 0;max-height:240px;overflow:auto;padding:10px 12px;border-radius:var(--radius-sm);background:var(--surface-1);color:var(--text-secondary);font-family:var(--font-mono);font-size:.71875rem;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}
+
+@media(max-width:540px){
+  .update-dialog{width:calc(100vw - 16px);max-height:calc(100dvh - 16px);border-radius:var(--radius-lg)}
+  .update-dialog-content{max-height:calc(100dvh - 18px)}
+  .update-header{padding:14px 16px}
+  .update-header h2{font-size:1.0625rem}
+  .update-header p{font-size:.75rem}
+  .update-body{padding:14px 16px}
+  .update-module{padding:14px}
+  .update-versions{gap:10px}
+  .update-version{gap:3px;flex-direction:column}
+  .update-footer{padding:12px 16px;gap:8px}
+  .update-footer .button{font-size:.8125rem;padding:9px 10px}
+  .update-progress{padding:14px}
+  .update-progress-heading{align-items:flex-start;flex-direction:column;gap:5px}
+  .update-summary{padding-bottom:18px}
+}
+
+/* 本仓库新增：shell.css 的 .app-shell > .sidebar .nav-item 规则在本文件之后载入，上面复制来的 .update-nav 高度与有新版本
+   时的图标颜色会被它盖掉（高度那条权重相同、靠后者胜），这里加上 .nav-item 等限定再写一次。 */
+.app-shell > .sidebar .nav-item.update-nav{min-height:44px}
+.app-shell > .sidebar .update-nav.available>svg:first-child{color:var(--accent)}

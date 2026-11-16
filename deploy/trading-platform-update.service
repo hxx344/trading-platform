@@ -1,0 +1,18 @@
+# Installed by deploy/install.sh, which fills in the paths; started by trading-platform-update.path (docs/update.md).
+# Runs as root: it downloads the requested release's install.sh, checks it against that release's SHA256SUMS and runs
+# `install.sh --version <version>`, which takes the install lock, checks the config, restarts the service and rolls back
+# a version that does not come up. The start limit covers a Node.js download, the package, the health check (90 s) and a
+# rollback with its own check; if it is still cut short, ExecStopPost marks the update as interrupted for the page.
+[Unit]
+Description=统一交易平台：在线更新（页面请求）
+
+[Service]
+Type=oneshot
+# The same proxy settings as the service: curl and install.sh read HTTPS_PROXY from here.
+EnvironmentFile=-@CONF_DIR@/environment
+ExecStart=@NODE@ @APP_DIR@/current/src/service/update-helper.ts --dir @IMPORT_DIR@ --app-dir @APP_DIR@ --data-dir @DATA_DIR@
+ExecStopPost=@NODE@ @APP_DIR@/current/src/service/update-helper.ts --recover --dir @IMPORT_DIR@ --app-dir @APP_DIR@ --data-dir @DATA_DIR@
+TimeoutStartSec=1800
+# install.sh holds off TERM while it checks the restarted service and rolls back (about 95 s each): let it finish.
+TimeoutStopSec=300
+PrivateTmp=yes

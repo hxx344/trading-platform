@@ -38,7 +38,7 @@ mkdir -p "$tmp/src-b/deploy/main-watch" && cp "$root/deploy/main-watch/main_watc
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-b/"
 mkdir -p "$tmp/src-b/web" && cp -R "$root/web/dist" "$tmp/src-b/web/"
 mkdir -p "$tmp/src-b/scripts" && cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$tmp/src-b/scripts/"
-cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-b/deploy/"
+cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,trading-platform-update.service,trading-platform-update.path,config.example.json,secrets.example.json} "$tmp/src-b/deploy/"
 printf '\n升级测试\n' >>"$tmp/src-b/README.md"
 bash "$tmp/src-b/deploy/package.sh" "$tmp/b" >/dev/null
 fi
@@ -47,7 +47,7 @@ mkdir -p "$tmp/src-c/deploy/main-watch" && cp "$root/deploy/main-watch/main_watc
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-c/"
 mkdir -p "$tmp/src-c/web" && cp -R "$root/web/dist" "$tmp/src-c/web/"
 mkdir -p "$tmp/src-c/scripts" && cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$tmp/src-c/scripts/"
-cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-c/deploy/"
+cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,trading-platform-update.service,trading-platform-update.path,config.example.json,secrets.example.json} "$tmp/src-c/deploy/"
 sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { throw new Error('测试：配置检查失败');|" "$tmp/src-c/src/service/main.ts"
 bash "$tmp/src-c/deploy/package.sh" "$tmp/c" >/dev/null
 
@@ -57,6 +57,8 @@ check '首次安装生成空配置并通过检查' 'grep -q "\"pairs\": \[\]" "$
 check '首次安装提示在页面导入' 'grep -q "下一步：在页面「从工作台导入配对」" "$tmp/out"'
 check '导入目录权限 770' '[[ "$(stat -c %a "$TP_IMPORT_DIR")" == 770 ]]'
 check '导入助手单元已填入路径' '! grep -q "@" "$tmp/trading-platform-import.service" "$tmp/trading-platform-import.path" && grep -q "PathChanged=$TP_IMPORT_DIR/request.json" "$tmp/trading-platform-import.path" && grep -q "ExecStart=$(command -v flock) -w 100 $TP_APP_DIR/.install.lock $TP_NODE_BIN $TP_APP_DIR/current/src/service/import-helper.ts --dir $TP_IMPORT_DIR --config $TP_CONF_DIR/config.json --data-dir $TP_DATA_DIR" "$tmp/trading-platform-import.service" && grep -q "ExecStopPost=$(command -v flock) -w 60 $TP_APP_DIR/.install.lock $TP_NODE_BIN $TP_APP_DIR/current/src/service/import-helper.ts --recover --dir $TP_IMPORT_DIR" "$tmp/trading-platform-import.service"'
+check '在线更新助手单元已填入路径（docs/update.md）' '! grep -q "@" "$tmp/trading-platform-update.service" "$tmp/trading-platform-update.path" && grep -q "PathChanged=$TP_IMPORT_DIR/update-request.json" "$tmp/trading-platform-update.path" && grep -q "ExecStart=$TP_NODE_BIN $TP_APP_DIR/current/src/service/update-helper.ts --dir $TP_IMPORT_DIR --app-dir $TP_APP_DIR --data-dir $TP_DATA_DIR$" "$tmp/trading-platform-update.service" && grep -q "ExecStopPost=$TP_NODE_BIN $TP_APP_DIR/current/src/service/update-helper.ts --recover --dir $TP_IMPORT_DIR --app-dir $TP_APP_DIR --data-dir $TP_DATA_DIR$" "$tmp/trading-platform-update.service"'
+check '测试模式不写在线更新就绪标记（只在 systemd 启用 .path 后写）' '[[ ! -e "$TP_APP_DIR/.update-helper" && ! -e "$TP_IMPORT_DIR/.update-helper" ]]'
 check '当前版本指向新包' '[[ -f "$TP_APP_DIR/current/src/service/main.ts" ]]'
 check '示例配置已放入' '[[ -f "$TP_CONF_DIR/config.example.json" && -f "$TP_CONF_DIR/secrets.example.json" ]]'
 check '数据目录权限 700' '[[ "$(stat -c %a "$TP_DATA_DIR")" == 700 ]]'
@@ -66,6 +68,34 @@ first=$(readlink -f "$TP_APP_DIR/current")
 if part_is 1; then
 run --package "$tmp/a"
 check '重复执行无变化' 'grep -q "无变化" "$tmp/out" && grep -q "程序包（未变化）" "$tmp/out" && grep -q "systemd 单元（未变化）" "$tmp/out"'
+fi
+
+if part_is 1; then
+# Arming the page helpers (docs/update.md) against a stand-in systemctl: units are neither enabled nor active, `enable`
+# fails for the units listed in TP_FAKE_FAIL. The update helper's marker goes into the root-owned program directory.
+mkdir -p "$tmp/fakebin"
+cat >"$tmp/fakebin/systemctl" <<'EOS'
+#!/usr/bin/env bash
+case $1 in
+  is-enabled|is-active) exit 1 ;;
+  enable) for unit in ${TP_FAKE_FAIL:-}; do [[ ${!#} == "$unit" ]] && exit 1; done; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOS
+chmod +x "$tmp/fakebin/systemctl"
+arm() { PATH="$tmp/fakebin:$PATH" TP_TEST_ARM=1 run "$@"; }
+arm --package "$tmp/a" && status=0 || status=$?
+check '启用在线更新助手后在程序目录写就绪标记（644），交接目录里没有' '[[ $status -eq 0 && -f "$TP_APP_DIR/.update-helper" && ! -L "$TP_APP_DIR/.update-helper" && "$(stat -c %a "$TP_APP_DIR/.update-helper")" == 644 && ! -e "$TP_IMPORT_DIR/.update-helper" ]] && grep -q "页面在线更新" "$tmp/out"'
+TP_FAKE_FAIL=trading-platform-update.path arm --package "$tmp/a" && status=0 || status=$?
+check '在线更新助手启用失败时删掉就绪标记，安装照常成功' '[[ $status -eq 0 && ! -e "$TP_APP_DIR/.update-helper" ]] && grep -q "无法设置 trading-platform-update.path 开机自启，页面在线更新暂不可用" "$tmp/out"'
+arm --package "$tmp/a" >/dev/null && [[ -f "$TP_APP_DIR/.update-helper" ]]
+# A release from before the online update (no update-helper.ts): the marker goes, the units stay.
+mkdir -p "$tmp/src-d" && cp -R "$tmp/src-b/." "$tmp/src-d/" && rm "$tmp/src-d/src/service/update-helper.ts"
+printf '\n没有在线更新助手\n' >>"$tmp/src-d/README.md"
+bash "$tmp/src-d/deploy/package.sh" "$tmp/d" >/dev/null
+arm --package "$tmp/d" && status=0 || status=$?
+check '装没有在线更新助手的版本时删掉就绪标记、保留单元' '[[ $status -eq 0 && ! -e "$TP_APP_DIR/.update-helper" && -f "$tmp/trading-platform-update.path" ]]'
+run --package "$tmp/a" >/dev/null || true
 fi
 
 # Test-only keys from the ASTER stand-in.
@@ -138,7 +168,7 @@ mkdir -p "$tmp/src-d/deploy/main-watch" && cp "$root/deploy/main-watch/main_watc
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-d/"
 mkdir -p "$tmp/src-d/web" && cp -R "$root/web/dist" "$tmp/src-d/web/"
 mkdir -p "$tmp/src-d/scripts" && cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$tmp/src-d/scripts/"
-cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,config.example.json,secrets.example.json} "$tmp/src-d/deploy/"
+cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,trading-platform-update.service,trading-platform-update.path,config.example.json,secrets.example.json} "$tmp/src-d/deploy/"
 sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { (await import('node:fs')).writeFileSync(process.env.TP_TEST_MARK, ''); await new Promise(resolve => setTimeout(resolve, 1500));|" "$tmp/src-d/src/service/main.ts"
 bash "$tmp/src-d/deploy/package.sh" "$tmp/d" >/dev/null
 rm -f "$tmp/mark"

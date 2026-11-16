@@ -13,6 +13,7 @@
 | 期权 Greeks | [docs/options.md](docs/options.md) |
 | 行情监控 | [docs/monitor.md](docs/monitor.md) |
 | 资产账本 | [docs/asset.md](docs/asset.md) |
+| 页面在线更新（系统更新）、`trading-platform-update.*` 单元、`update-helper.ts` | [docs/update.md](docs/update.md) |
 | 副服务器巡检（main-watch）、心跳推送、`install-watch.sh` | [docs/watch.md](docs/watch.md) |
 | 真实账户上已核实与待实测的事项 | [docs/live-results.md](docs/live-results.md)、[docs/plan.md](docs/plan.md) 第 6 节 |
 | 新模块的启用与数据迁移、从工作台导入 | [docs/module-import.md](docs/module-import.md) |
@@ -50,5 +51,6 @@
 | 行情、盘口新鲜度、价差保护 | L100 |
 | 外部接口的历史读取与分页、“查无”判定 | L039 L093 |
 | 从工作台导入、读别的进程的 SQLite、备份 | L063 |
+| root 运行的安装脚本与助手、服务可写的交接目录 | L201 |
 
 审查中确认的缺陷值得复用时，按 LESSONS.md 的《记录规则》新增或更新条目，并登记到上表。

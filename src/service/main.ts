@@ -26,6 +26,7 @@ import type { AlertHooks, AlertRobot } from '../monitor/alerts.ts';
 import { createStreamStatus, runUserStream, type SocketLike } from './stream.ts';
 import { balanceWindow, createBalanceSamples, type BalanceSamples } from './balance-samples.ts';
 import { readImportResult, submitImportRequest } from './import-channel.ts';
+import { createUpdates, readInstalledVersion, updateReadyFile, type InstalledVersion, type UpdateFetch } from './update.ts';
 import { hynixViews, oilLoops, oilViews, openOilPnl, openOilRules, prepareOil, registerOilAccounts, strandedOilJobs, type OilRuntime } from './oil.ts';
 import { oilSummary } from './oil-config.ts';
 import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, settleMonitor, stopMonitor, type MonitorRuntime } from './monitor.ts';
@@ -45,6 +46,8 @@ const NOTIFY_MS = 2_000;
 const SUMMARY_TICK_MS = 5_000;
 /** How often the stored balances are looked at for the trend chart; a pair gets at most one sample a minute. */
 const SAMPLE_MS = 30_000;
+/** How often the update loop looks whether a version check is due (update.ts decides). */
+const UPDATE_TICK_MS = 15_000;
 const FINAL_FLUSH_MS = 5_000;
 const CONFIG_SESSION = 'service-config';
 /** Under systemd's TimeoutStopSec (30 s), leaving time for the final alert flush. */
@@ -218,6 +221,8 @@ export interface StartOptions {
   optionsRetryMs?: number;
   /** Tests stand in for Gate and the CrossEx public readers and shorten the start check (only with config.crossex). */
   crossexOptions?: CrossexOptions;
+  /** Tests stand in for GitHub's latest-release answer (docs/update.md). */
+  updateFetch?: UpdateFetch;
   /** Tests stand in for the second server's heartbeat receiver and shorten the cadence (only with config.watch). */
   watchOptions?: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; firstMs?: number; intervalMs?: number };
 }
@@ -240,7 +245,7 @@ export async function startService(options: StartOptions): Promise<ReturnType<ty
   catch (error) { closeLogs(); throw error; }
 }
 
-async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, watchOptions }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
+async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, watchOptions, updateFetch }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
   const session = keptSession(dir);
   // Oil accounts are locked and checked before the store opens: a failed check refuses start (oil.ts).
   const oil = config.oil ? await prepareOil(config.oil, secrets.exchanges, oilFetch ? { fetchImpl: oilFetch } : {}) : undefined;
@@ -356,6 +361,14 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
 
   // The heartbeat for the second server's main-watch; made once the run loop can say whether it is ready.
   let watch: Watch | null = null;
+  // The online update (docs/update.md): versions from GitHub, and the root helper's hand-off in the import directory.
+  // A VERSION file that cannot be read costs only the update panel, never the start.
+  let installed: InstalledVersion, readyFile: string | null;
+  try { installed = readInstalledVersion(); }
+  catch (error) { process.stderr.write(`无法读取版本号，在线更新不可用：${error instanceof Error ? error.message : String(error)}\n`); installed = { version: 'v0.0.0', commit: null, packaged: false }; }
+  try { readyFile = updateReadyFile(); }
+  catch (error) { process.stderr.write(`无法确定程序目录，在线更新不可用：${error instanceof Error ? error.message : String(error)}\n`); readyFile = null; }
+  const updates = createUpdates({ current: installed, dir: importDir ?? null, readyFile, ...(updateFetch ? { fetchImpl: updateFetch } : {}) });
   return runExecutor({
     executor, store, dir, port, app, session,
     ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: oil ? ['jobs', 'transfers', 'adl'] : ['transfers', 'adl'], drainMs: DRAIN_MS,
@@ -375,6 +388,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(options ? { options: options.views } : {}),
       ...(crossex ? { crossex: crossex.views } : {}),
       ...(logs ? { logs: (filter: 'all' | 'problems', before: number | null, limit: number) => logs.page({ filter, before, limit }) } : {}),
+      update: updates,
     },
     ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir) } } : {}),
     startedMessage: `ASTER 服务已启动（${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}）`,
@@ -386,6 +400,13 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
           try { await monitorOutbox?.flush(); }
           catch (error) { process.stderr.write(`行情告警发送失败：${error instanceof Error ? error.message : String(error)}\n`); }
           await context.pause(NOTIFY_MS);
+        }
+      })(),
+      (async () => {
+        while (!context.stopped()) {
+          try { await updates.tick(); }
+          catch (error) { process.stderr.write(`检查新版本出错：${error instanceof Error ? error.message : String(error)}\n`); }
+          await context.pause(UPDATE_TICK_MS);
         }
       })(),
       (async () => {
@@ -416,8 +437,9 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       const text = reason === 'signal' ? '【服务停止】收到停止信号，正常退出' : `【服务异常停止】${detail || reason}；systemd 会在 5 秒后自动重启，请查看日志`;
       try { notifier.poll(); notifier.notify(text); } catch { /* best effort */ }
       if (monitor) stopMonitor(monitor);
-      // A beat in flight must not hold the stop for its timeout.
+      // A beat or a version check in flight must not hold the stop for its timeout.
       watch?.abort();
+      updates.abort();
       // A CrossEx or options start in flight gives up rather than hold the shutdown up.
       crossex?.abort();
       options?.abort();

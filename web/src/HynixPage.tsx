@@ -122,8 +122,9 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   const changed = (): void => { formVersion.current++; setPreview(null); };
   const cross = venues.length === 2;
   useEffect(() => {
-    if (venues.length && !venues.includes(form.venue)) { setForm(current => ({ ...current, venue: venues[0]! })); changed(); }
-    if (!cross && form.preset === 'cross-exchange') { setForm(current => ({ ...current, preset: 'same-exchange' })); changed(); }
+    // Through update(), so a venue or preset forced by an account change also clears the per-leg quantities.
+    if (venues.length && !venues.includes(form.venue)) update({ venue: venues[0]! });
+    if (!cross && form.preset === 'cross-exchange') update({ preset: 'same-exchange' });
   }, [venues, cross, form.venue, form.preset]);
   useEffect(() => { if (preview) reviewRef.current?.querySelector<HTMLElement>('.execution-review')?.focus(); }, [preview]);
   const update = (patch: Partial<HynixForm>) => {

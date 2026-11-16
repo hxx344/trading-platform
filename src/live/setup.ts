@@ -7,6 +7,7 @@ import { ContractError, exactKeys, parseBinding, parseNotionalLimits, type Accou
 import type { VenueConnector } from '../connector.ts';
 import { createBinanceConnector } from './binance.ts';
 import { createBybitConnector } from './bybit.ts';
+import { createOkxConnector } from './okx.ts';
 import type { FetchLike } from './http.ts';
 import { describe, validCredentials, type LiveCredentials } from './values.ts';
 
@@ -115,7 +116,7 @@ export function createLiveConnectors(config: Pick<LiveConfig, 'accounts'>, keys:
     if (!account || !key || account.accountId !== binding.accountId || account.accountMode !== binding.accountMode || account.credentialVersion !== binding.credentialVersion) throw new Error('该账户不是实盘配置里的账户或凭据版本');
     return key;
   };
-  return [createBinanceConnector({ credentials, ...options }), createBybitConnector({ credentials, ...options })];
+  return [createBinanceConnector({ credentials, ...options }), createBybitConnector({ credentials, ...options }), createOkxConnector({ credentials, ...options })];
 }
 
 /** Every configured account passes its venue's key and identity check, one after another, before any is registered. */

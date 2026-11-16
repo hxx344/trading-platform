@@ -11,7 +11,7 @@ const IMPORT_WAIT_MS = 760_000, IMPORT_PICKUP_MS = 135_000, IMPORT_SLOW_MS = 10_
 
 interface PreviewItem { id: string; name?: string; marginEnabled: boolean; importable: boolean; detail: string }
 interface ImportedItem { id: string; status: string; detail: string }
-/** A workbench Binance/Bybit execution account for the oil module; the id comes masked. */
+/** A workbench Binance/Bybit/OKX execution account for the oil module; the id comes masked. */
 interface OilItem { venue: string; accountMode: string | null; accountId: string | null; blockedBy: string[]; status: 'added' | 'skipped'; detail: string }
 /** The workbench Greeks module's Bybit account for the options module; the UID comes masked. */
 interface OptionsItem { accountId: string | null; status: 'added' | 'skipped'; detail: string }
@@ -23,7 +23,7 @@ interface ImportResult {
   preview?: PreviewItem[]; imported?: ImportedItem[]; oil?: OilItem[]; oilError?: string; options?: OptionsItem; optionsError?: string;
   monitor?: MonitorItem; monitorAlerts?: MonitorAlertsItem; monitorAlertsError?: string; monitorVariational?: MonitorVariationalItem; monitorVariationalError?: string; monitorPaper?: MonitorPaperItem; monitorPaperError?: string; asset?: AssetItem; assetError?: string; crossex?: CrossexItem; crossexError?: string; notes?: string[]; database?: string;
 }
-const VENUE: Record<string, string> = { binance: 'Binance', bybit: 'Bybit' };
+const VENUE: Record<string, string> = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX' };
 
 function OilRows({ items, preview }: { items: OilItem[]; preview: boolean }) {
   return <div className="table-wrap"><table className="data" id="importOilTable">

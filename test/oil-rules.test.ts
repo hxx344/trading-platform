@@ -44,7 +44,9 @@ test('规则参数：方向决定阈值先后；交易所须已配置；名称�
   assert.throws(() => parseRuleConfig(settings({ direction: 'long' }), ['binance']), code('threshold_order'));
   assert.equal(parseRuleConfig(settings({ direction: 'long', openThreshold: '2', closeThreshold: '3.5' }), ['binance']).closeThreshold, '3.5');
   assert.throws(() => parseRuleConfig(settings({ venue: 'bybit' }), ['binance']), code('venue_not_configured'));
-  assert.throws(() => parseRuleConfig(settings({ venue: 'okx' }), ['binance']), code('invalid_value'));
+  assert.throws(() => parseRuleConfig(settings({ venue: 'okx' }), ['binance']), code('venue_not_configured'));
+  assert.equal(parseRuleConfig(settings({ venue: 'okx' }), ['okx']).venue, 'okx');
+  assert.throws(() => parseRuleConfig(settings({ venue: 'gate' }), ['binance']), code('invalid_value'));
   assert.throws(() => parseRuleConfig(settings({ openThreshold: '1001' }), ['binance']), code('invalid_value'));
   assert.throws(() => parseRuleConfig(settings({ openThreshold: 4 }), ['binance']), code('invalid_decimal'));
   assert.throws(() => parseRuleConfig(settings({ barrels: '0' }), ['binance']), code('invalid_decimal'));

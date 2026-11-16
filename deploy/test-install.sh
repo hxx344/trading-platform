@@ -201,11 +201,13 @@ check '--oil 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -
   const db = new DatabaseSync(dir + "/data/hub.sqlite");
   db.exec("CREATE TABLE execution_accounts (exchange TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0, credentials TEXT, account_mode TEXT NOT NULL, identity TEXT)");
   db.prepare("INSERT INTO execution_accounts VALUES (?, ?, ?, ?, ?)").run("binance", 2, encrypt({ purpose: "execution", exchange: "binance", apiKey: "k".repeat(64), apiSecret: "s".repeat(64) }), "standard", "123456789");
+  db.prepare("INSERT INTO execution_accounts VALUES (?, ?, ?, ?, ?)").run("okx", 1, encrypt({ purpose: "execution", exchange: "okx", apiKey: "q".repeat(36), apiSecret: "w".repeat(32), passphrase: "Pp-" + "z".repeat(12) }), "cross", "5551234567");
   db.close();
 ' "$tmp/wb")
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --oil && status=0 || status=$?
 check '--oil 导入原油执行账户并通过配置检查' '[[ $status -eq 0 ]] && grep -q "导入原油执行账户 Binance standard 账户 \*\*\*6789" "$tmp/out" && grep -q "原油执行账户 Binance \*\*\*6789（standard，凭据版本 2）" "$tmp/out" && grep -q "不设名义金额上限" "$tmp/out" && ! grep -q "notionalLimits" "$TP_CONF_DIR/config.json"'
-check '导入原油账户的输出不含密钥' '! grep -q "kkkkkkkk\|ssssssss" "$tmp/out"'
+check '--oil 一并导入 OKX 执行账户（带 Passphrase）' 'grep -q "导入原油执行账户 OKX cross 账户 \*\*\*4567，凭据版本 1" "$tmp/out" && grep -q "OKX \*\*\*4567（cross，凭据版本 1）" "$tmp/out" && grep -q "\"passphrase\": \"Pp-zzzzzzzzzzzz\"" "$TP_CONF_DIR/secrets.json"'
+check '导入原油账户的输出不含密钥' '! grep -q "kkkkkkkk\|ssssssss\|qqqqqqqq\|wwwwwwww\|zzzzzzzz" "$tmp/out"'
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --oil && status=0 || status=$?
 check '重复导入原油账户保留现有设置' '[[ $status -eq 0 ]] && grep -q "已在本项目配置中，保留现有设置" "$tmp/out" && grep -q "没有新的原油执行账户，配置未改动" "$tmp/out"'
 run --package "$tmp/a" --options && status=0 || status=$?

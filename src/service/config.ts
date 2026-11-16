@@ -3,7 +3,7 @@
 // check as the live canary files, and no message built here carries a key or a webhook.
 import { isIP } from 'node:net';
 import { isAbsolute } from 'node:path';
-import { ContractError, PAIR_ID, exactKeys, integer, parseTransferConfig, reject, type TransferConfig } from '../contracts.ts';
+import { ContractError, PAIR_ID, VENUES, exactKeys, integer, parseTransferConfig, reject, type TransferConfig } from '../contracts.ts';
 import { IP_CEILING, parseAsterCredentials, type AsterCredentials } from '../aster/client.ts';
 import { DEFAULT_ADL_BUDGETS } from '../adl.ts';
 import { parseAdlConfig, type AdlConfig } from '../adl-contracts.ts';
@@ -191,7 +191,7 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
 }
 
 export function parseServiceSecrets(raw: unknown, needed: readonly string[], oilVenues: readonly Venue[] = [], options = false, crossex = false): ServiceSecrets {
-  const value = exactKeys(raw, ['accounts'], ['feishu', 'feishuScheduled', 'feishuMonitor', 'watch', ...(oilVenues.length ? ['binance', 'bybit'] : []), ...(options ? ['bybitOptions'] : []), ...(crossex ? ['gate'] : [])]);
+  const value = exactKeys(raw, ['accounts'], ['feishu', 'feishuScheduled', 'feishuMonitor', 'watch', ...(oilVenues.length ? VENUES : []), ...(options ? ['bybitOptions'] : []), ...(crossex ? ['gate'] : [])]);
   if (value.accounts === null || typeof value.accounts !== 'object' || Array.isArray(value.accounts)) throw new Error('accounts 须为 { 账户名: { user, signer, privateKey } }');
   const accounts = new Map<string, AsterCredentials>();
   for (const [name, item] of Object.entries(value.accounts as Record<string, unknown>)) {

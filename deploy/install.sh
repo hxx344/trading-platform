@@ -7,7 +7,7 @@
 #   sudo bash install.sh --import-workbench   命令行方式从本机工作台导入已开启保证金平衡的配对与凭据并启动（可加 --pairs id,id
 #                                             只导入指定配对，--workbench-data <目录> 指定工作台数据目录）；页面上也能导入，见下
 #   sudo bash install.sh --import-workbench --oil
-#                                             只导入工作台的原油执行账户（Binance / Bybit，hub.sqlite 解密）；同时导入配对时
+#                                             只导入工作台的原油执行账户（Binance / Bybit / OKX，hub.sqlite 解密）；同时导入配对时
 #                                             再加 --pairs id,id。工作台有实盘启用的原油自动规则时拒绝导入该交易所账户
 #   sudo bash install.sh --import-workbench --options
 #                                             导入工作台期权模块（Greeks）的 Bybit 密钥与风险上限（可与 --oil、--pairs 同用）；

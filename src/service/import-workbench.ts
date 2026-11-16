@@ -4,7 +4,7 @@
 // workbench). Imported pairs are registered switched off like any configured pair; taking one over still needs the
 // workbench pair deleted and the takeover checks passed in the page. Nothing is sent to ASTER or to the workbench.
 //
-// With --oil it also brings the workbench's Binance/Bybit execution accounts over for the oil module: <data>/hub.sqlite
+// With --oil it also brings the workbench's Binance/Bybit/OKX execution accounts over for the oil module: <data>/hub.sqlite
 // execution_accounts, decrypted with <data>/credentials.key (read the same way, as the database's owner). Only then: --oil
 // alone imports the oil accounts only, --oil --pairs id,id both.
 //
@@ -38,7 +38,7 @@ import { parseAsterCredentials, type AsterCredentials } from '../aster/client.ts
 import { ACCOUNT_MODES, VENUES, VENUE_NAMES, parseTransferConfig, type Venue } from '../contracts.ts';
 import { parseAdlConfig } from '../adl-contracts.ts';
 import { parsePrivateJson } from '../live/setup.ts';
-import { validCredentials, type LiveCredentials } from '../live/values.ts';
+import { validCredentials, validPassphrase, type LiveCredentials } from '../live/values.ts';
 import { MODULE_KEYS, assertDistinctSigners, parseServiceConfig, parseServiceSecrets } from './config.ts';
 import { parseOilSecrets } from './oil-config.ts';
 import { planOptions, readWorkbenchOptions, resolveOptionsAccount, type OptionsItem, type OptionsSource } from './import-options.ts';
@@ -323,7 +323,7 @@ function planOil(source: OilSource, config: Json, secrets: Json, fits: (candidat
   const current = isRecord(config.oil) ? config.oil : null;
   const configured = new Set(current && Array.isArray(current.accounts) ? current.accounts.filter(isRecord).map(account => account.venue) : []);
   const fresh: { item: OilItem; binding: Json; credentials: LiveCredentials }[] = [];
-  if (source.accounts.length === 0) notes.push('工作台没有连接 Binance / Bybit 执行账户，没有原油执行账户可导入');
+  if (source.accounts.length === 0) notes.push('工作台没有连接 Binance / Bybit / OKX 执行账户，没有原油执行账户可导入');
   for (const candidate of source.accounts) {
     // A rule whose venue cannot be read could be on this one; any unreadable rule could be a live oil rule.
     const blockedBy = source.rules.filter(rule => rule.oil && (rule.live || rule.active) && (rule.venue === candidate.venue || rule.venue === null)).map(rule => rule.name);
@@ -343,7 +343,7 @@ function planOil(source: OilSource, config: Json, secrets: Json, fits: (candidat
   const accounts = [...(current && Array.isArray(current.accounts) ? current.accounts : []), ...fresh.map(entry => entry.binding)];
   const oil = current ? { ...current, accounts } : { accounts };
   const keys: Json = { ...secrets };
-  for (const entry of fresh) keys[entry.item.venue] = { apiKey: entry.credentials.apiKey, apiSecret: entry.credentials.apiSecret };
+  for (const entry of fresh) keys[entry.item.venue] = { apiKey: entry.credentials.apiKey, apiSecret: entry.credentials.apiSecret, ...(entry.item.venue === 'okx' ? { passphrase: entry.credentials.passphrase } : {}) };
   try {
     fits({ ...config, oil });
     parseOilSecrets(keys, accounts.filter(isRecord).map(account => account.venue as Venue));
@@ -497,7 +497,7 @@ export function decryptCredential(key: Buffer, blob: string): unknown {
 const ACCOUNT_ID = /^[0-9A-Za-z_-]{1,64}$/;
 const MODE_TEXT = /^[a-z][a-z0-9-]{0,31}$/;
 
-/** The Binance/Bybit rows of execution_accounts as import candidates; other venues (OKX) are not this service's. */
+/** The Binance/Bybit/OKX rows of execution_accounts as import candidates; other venues are not this service's. OKX keys carry a passphrase. */
 export function oilCandidates(key: Buffer, rows: readonly unknown[]): OilCandidate[] {
   const candidates: OilCandidate[] = [];
   for (const row of rows) {
@@ -514,14 +514,15 @@ export function oilCandidates(key: Buffer, rows: readonly unknown[]): OilCandida
     try { value = decryptCredential(key, row.credentials); } catch { refuse('凭据无法解密（credentials.key 与 hub.sqlite 不匹配，或记录已损坏）'); continue; }
     if (!isRecord(value) || value.purpose !== 'execution') { refuse('凭据用途不是执行账户（purpose 须为 execution），不导入'); continue; }
     if (value.exchange !== venue) { refuse('凭据所属交易所与记录不一致，不导入'); continue; }
-    const credentials = { apiKey: value.apiKey, apiSecret: value.apiSecret } as LiveCredentials;
+    const credentials = { apiKey: value.apiKey, apiSecret: value.apiSecret, ...(venue === 'okx' ? { passphrase: value.passphrase } : {}) } as LiveCredentials;
     if (!validCredentials(credentials)) { refuse('凭据里的 API 密钥不完整或格式无效'); continue; }
+    if (venue === 'okx' && !validPassphrase(credentials.passphrase)) { refuse('凭据里的 OKX Passphrase 缺失或格式无效（本服务只接受 8–128 个可打印 ASCII 字符、首尾不是空格）'); continue; }
     if (credentialVersion === null) { refuse('工作台记录的凭据版本无效（须为正整数）'); continue; }
     if (accountMode === null || !ACCOUNT_MODES[venue].includes(accountMode)) {
-      refuse(`账户模式${accountMode ? ` ${accountMode} ` : '未知，'}不支持：Binance 只支持 standard / portfolio-margin，Bybit 只支持 unified`); continue;
+      refuse(`账户模式${accountMode ? ` ${accountMode} ` : '未知，'}不支持：Binance 只支持 standard / portfolio-margin，Bybit 只支持 unified，OKX 只支持 cross / isolated`); continue;
     }
     if (accountId === null) { refuse('工作台没有记录该账户的身份（UID），须先在工作台重新验证该执行账户再导入'); continue; }
-    candidates.push({ ...base, credentials: { apiKey: credentials.apiKey, apiSecret: credentials.apiSecret }, problem: null });
+    candidates.push({ ...base, credentials: { apiKey: credentials.apiKey, apiSecret: credentials.apiSecret, ...(venue === 'okx' ? { passphrase: credentials.passphrase } : {}) }, problem: null });
   }
   return candidates;
 }

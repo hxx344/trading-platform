@@ -10,9 +10,9 @@ export class ContractError extends Error {
 }
 export const reject = (code: string, message: string, status = 400): never => { throw new ContractError(status, code, message); };
 
-export const VENUES = ['binance', 'bybit'] as const;
+export const VENUES = ['binance', 'bybit', 'okx'] as const;
 export type Venue = typeof VENUES[number];
-export const VENUE_NAMES: Record<Venue, string> = { binance: 'Binance', bybit: 'Bybit' };
+export const VENUE_NAMES: Record<Venue, string> = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX' };
 /** Oil contracts each first-batch venue lists in the baseline catalog; ANT is read-only on Binance and absent on Bybit. */
 export const OIL_SYMBOLS = ['CLUSDT', 'BZUSDT'] as const;
 /** SK hynix: the ADR (SKHYUSDT) and the ordinary share (SKHYNIXUSDT); one ordinary share is ten ADRs (docs/hynix.md). */
@@ -24,9 +24,11 @@ export const MARKET_NAMES: Record<Market, string> = { oil: '原油', hynix: '海
 /** The market of a contract; jobs never mix them, so a job's market is its first leg's. */
 export const marketOfSymbol = (symbol: string): Market => (HYNIX_SYMBOLS as readonly string[]).includes(symbol) ? 'hynix' : 'oil';
 const EXECUTION_SYMBOLS = [...OIL_SYMBOLS, ...HYNIX_SYMBOLS];
-export const VENUE_EXECUTION_SYMBOLS: Record<Venue, readonly string[]> = { binance: EXECUTION_SYMBOLS, bybit: EXECUTION_SYMBOLS };
-export const VENUE_READ_SYMBOLS: Record<Venue, readonly string[]> = { binance: [...EXECUTION_SYMBOLS, 'ANTHROPICUSDT'], bybit: EXECUTION_SYMBOLS };
-export const ACCOUNT_MODES: Record<Venue, readonly string[]> = { binance: ['standard', 'portfolio-margin'], bybit: ['unified'] };
+export const VENUE_EXECUTION_SYMBOLS: Record<Venue, readonly string[]> = { binance: EXECUTION_SYMBOLS, bybit: EXECUTION_SYMBOLS, okx: EXECUTION_SYMBOLS };
+export const VENUE_READ_SYMBOLS: Record<Venue, readonly string[]> = { binance: [...EXECUTION_SYMBOLS, 'ANTHROPICUSDT'], bybit: EXECUTION_SYMBOLS, okx: EXECUTION_SYMBOLS };
+export const ACCOUNT_MODES: Record<Venue, readonly string[]> = { binance: ['standard', 'portfolio-margin'], bybit: ['unified'], okx: ['cross', 'isolated'] };
+/** Venues whose connector places post-only limit orders, so a local chase lead may run there (docs/oil.md sections 8 and 10). */
+export const LOCAL_CHASE_VENUES: readonly Venue[] = ['binance', 'okx'];
 export type Environment = 'simulated' | 'mainnet';
 
 type Json = Record<string, unknown>;
@@ -294,7 +296,7 @@ export function parsePairIntent(value: unknown): PairIntent {
   // The hedge must go out at once for whatever the lead filled; a strategy that may rest or pause cannot do that.
   if (legs[1].orderType === 'chase' || legs[1].orderType === 'local-chase') reject('chase_unsupported', '追价只能用于首腿，对冲腿按市价发送');
   if (legs[0].orderType === 'chase' && legs[0].venue !== 'bybit') reject('chase_unsupported', '只有 Bybit 支持原生追价策略');
-  if (legs[0].orderType === 'local-chase' && legs[0].venue !== 'binance') reject('chase_unsupported', '本地追价只用于 Binance 首腿；Bybit 请用原生追价');
+  if (legs[0].orderType === 'local-chase' && !LOCAL_CHASE_VENUES.includes(legs[0].venue)) reject('chase_unsupported', '本地追价只用于 Binance 或 OKX 首腿；Bybit 请用原生追价');
   const maxSlippageBps = raw.maxSlippageBps === undefined || raw.maxSlippageBps === null ? null : integer(raw.maxSlippageBps, 1, MAX_SLIPPAGE_BPS, '价格保护基点');
   const timeoutMs = integer(raw.timeoutMs, 30_000, 3_600_000, '最长执行毫秒数');
   let batches: BatchIntent | undefined;

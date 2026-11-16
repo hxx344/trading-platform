@@ -86,3 +86,25 @@ export function bybitAccountProblem(status: unknown): string | null {
   return status === 1 ? 'Bybit 账户为经典账户，请先升级为统一交易账户'
     : Number.isSafeInteger(status) ? `Bybit 返回了未识别的账户状态 ${status as number}` : status === undefined ? 'Bybit 未返回账户状态' : 'Bybit 返回的账户状态格式无效';
 }
+
+const OKX_PERMISSIONS: Record<string, string> = { read_only: '读取', trade: '交易', withdraw: '提现' };
+/** OKX /account/config perm (workbench validateConfig): exactly read_only and trade; says what to turn on or off. */
+export function okxPermissionProblem(perm: unknown): string | null {
+  if (typeof perm !== 'string') return 'OKX 未返回密钥权限';
+  const granted = perm.split(','), wanted = ['read_only', 'trade'];
+  if (granted.length === wanted.length && new Set(granted).size === wanted.length && wanted.every(name => granted.includes(name))) return null;
+  const label = (name: string): string => labelOf(OKX_PERMISSIONS, name);
+  const missing = wanted.filter(name => !granted.includes(name)), extra = [...new Set(granted)].filter(name => name && !wanted.includes(name));
+  const parts = [...missing.length ? [`请开启：${missing.map(label).join('、')}`] : [], ...extra.length ? [`请关闭：${extra.map(label).join('、')}`] : []];
+  return parts.join('；') || '仅允许读取、交易权限';
+}
+/** OKX config ip: comma-separated bound addresses, empty when the key is not bound (stricter than the workbench, like the others). */
+export function okxIpProblem(ip: unknown): string | null {
+  return typeof ip === 'string' && ip.split(',').some(item => item.trim() !== '') ? null : '密钥未绑定 IP，请在 OKX API 管理里只允许本机出口 IP';
+}
+/** acctLv 2 (futures mode) or 3 (multi-currency margin); posMode net_mode or long_short_mode (workbench validateConfig, execution). */
+export function okxAccountProblem(acctLv: unknown, posMode: unknown): string | null {
+  if (acctLv !== '2' && acctLv !== '3') return `OKX 账户模式须为合约模式或跨币种保证金模式（acctLv 2 或 3），当前为 ${typeof acctLv === 'string' ? acctLv.replace(/[^\w-]/g, '').slice(0, 8) || '空' : '未返回'}`;
+  if (posMode !== 'net_mode' && posMode !== 'long_short_mode') return 'OKX 持仓模式无法确认（须为单向或双向持仓）';
+  return null;
+}

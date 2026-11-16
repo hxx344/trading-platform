@@ -1,4 +1,4 @@
-// Importing the workbench's Binance/Bybit execution accounts for the oil module: hub.sqlite decrypted with
+// Importing the workbench's Binance/Bybit/OKX execution accounts for the oil module: hub.sqlite decrypted with
 // credentials.key, every account the service could not trade on refused with its reason, a live oil rule of the workbench
 // blocking its venue, an existing oil config kept, and no key, ciphertext or field content in any message.
 import { test } from 'node:test';
@@ -18,6 +18,11 @@ const API_KEY = 'K'.repeat(40) + 'apikeyBINANCE';
 const API_SECRET = 'S'.repeat(40) + 'secretBINANCE';
 const BYBIT_KEY = 'B'.repeat(18) + 'bybitkey';
 const BYBIT_SECRET = 'Y'.repeat(30) + 'bybitsecret';
+const OKX_KEY = '0e7c1a2b-' + 'o'.repeat(20) + 'okxkey';
+const OKX_SECRET = 'F'.repeat(24) + 'okxsecret';
+const OKX_PASSPHRASE = 'Okx-Pass-' + 'p'.repeat(6) + 'phrase';
+/** The workbench's stored key fields per venue (trading-execution.mjs: OKX adds the passphrase). */
+const stored = (exchange: string) => exchange === 'bybit' ? { apiKey: BYBIT_KEY, apiSecret: BYBIT_SECRET } : exchange === 'okx' ? { apiKey: OKX_KEY, apiSecret: OKX_SECRET, passphrase: OKX_PASSPHRASE } : { apiKey: API_KEY, apiSecret: API_SECRET };
 
 const encrypt = (key: Buffer, value: unknown): string => {
   const iv = randomBytes(12), cipher = createCipheriv('aes-256-gcm', key, iv);
@@ -42,10 +47,10 @@ function hub(rows: Row[], rules: Rule[] = [], jobs?: Job[]) {
     identity TEXT, key_label TEXT, verified_at TEXT, snapshot TEXT);
     CREATE TABLE execution_auto_rules (id TEXT PRIMARY KEY, revision INTEGER NOT NULL, enabled INTEGER NOT NULL, created_at TEXT NOT NULL, config TEXT NOT NULL, state TEXT NOT NULL);`);
   for (const row of rows) {
-    const credentials = row.credentials === undefined ? encrypt(row.foreignKey ? other : key, { purpose: 'execution', exchange: row.exchange, apiKey: row.exchange === 'bybit' ? BYBIT_KEY : API_KEY, apiSecret: row.exchange === 'bybit' ? BYBIT_SECRET : API_SECRET })
+    const credentials = row.credentials === undefined ? encrypt(row.foreignKey ? other : key, { purpose: 'execution', exchange: row.exchange, ...stored(row.exchange) })
       : typeof row.credentials === 'string' || row.credentials === null ? row.credentials : encrypt(key, row.credentials);
     db.prepare('INSERT INTO execution_accounts (exchange, revision, credentials, account_mode, identity) VALUES (?, ?, ?, ?, ?)')
-      .run(row.exchange, row.revision ?? 3, credentials as string | null, row.mode ?? (row.exchange === 'bybit' ? 'unified' : 'standard'), row.identity === undefined ? (row.exchange === 'bybit' ? '55667788' : '123456789') : row.identity);
+      .run(row.exchange, row.revision ?? 3, credentials as string | null, row.mode ?? ({ bybit: 'unified', okx: 'cross' }[row.exchange] ?? 'standard'), row.identity === undefined ? ({ bybit: '55667788', okx: '5551234567' }[row.exchange] ?? '123456789') : row.identity);
   }
   rules.forEach((rule, index) => {
     const config = rule.raw ?? JSON.stringify({ name: rule.name ?? '', market: rule.market ?? 'oil', exchange: rule.exchange ?? 'binance' });
@@ -60,25 +65,27 @@ function hub(rows: Row[], rules: Rule[] = [], jobs?: Job[]) {
 }
 
 const noSecrets = (text: string): void => {
-  for (const secret of [API_KEY, API_SECRET, BYBIT_KEY, BYBIT_SECRET]) assert.ok(!text.includes(secret.slice(-12)), '不得含密钥');
+  for (const secret of [API_KEY, API_SECRET, BYBIT_KEY, BYBIT_SECRET, OKX_KEY, OKX_SECRET, OKX_PASSPHRASE]) assert.ok(!text.includes(secret.slice(-12)), '不得含密钥');
 };
 
-test('原油导入：解密执行账户写成 oil 配置与 binance/bybit 密钥，不写名义金额上限，只输出打码账户', () => {
-  const wb = hub([{ exchange: 'binance' }, { exchange: 'bybit', revision: 7 }, { exchange: 'okx' }]);
+test('原油导入：解密执行账户写成 oil 配置与 binance/bybit/okx 密钥（OKX 带 Passphrase），不写名义金额上限，只输出打码账户', () => {
+  const wb = hub([{ exchange: 'binance' }, { exchange: 'bybit', revision: 7 }, { exchange: 'okx', revision: 2 }, { exchange: 'gate' }]);
   try {
     const oil = readWorkbenchOil(wb.data);
-    assert.deepEqual(oil.accounts.map(item => [item.venue, item.accountMode, item.accountId, item.credentialVersion, item.problem]), [['binance', 'standard', '123456789', 3, null], ['bybit', 'unified', '55667788', 7, null]], 'OKX 不是本服务的交易所');
+    assert.deepEqual(oil.accounts.map(item => [item.venue, item.accountMode, item.accountId, item.credentialVersion, item.problem]), [['binance', 'standard', '123456789', 3, null], ['bybit', 'unified', '55667788', 7, null], ['okx', 'cross', '5551234567', 2, null]], 'Gate 不是本服务的交易所');
     const plan = planImport({ pairs: [], accounts: [], env: {} }, null, { secretsFile: '/etc/trading-platform/secrets.json', only: [], oil });
     assert.deepEqual(plan.config.oil, { accounts: [
       { venue: 'binance', accountId: '123456789', accountMode: 'standard', credentialVersion: 3 },
       { venue: 'bybit', accountId: '55667788', accountMode: 'unified', credentialVersion: 7 },
+      { venue: 'okx', accountId: '5551234567', accountMode: 'cross', credentialVersion: 2 },
     ] });
     assert.deepEqual(plan.secrets.binance, { apiKey: API_KEY, apiSecret: API_SECRET });
     assert.deepEqual(plan.secrets.bybit, { apiKey: BYBIT_KEY, apiSecret: BYBIT_SECRET });
+    assert.deepEqual(plan.secrets.okx, { apiKey: OKX_KEY, apiSecret: OKX_SECRET, passphrase: OKX_PASSPHRASE });
     // The files load as the service would read them.
     const config = parseServiceConfig(plan.config);
-    assert.equal(parseServiceSecrets(plan.secrets, [], config.oil!.accounts.map(account => account.venue)).exchanges!.size, 2);
-    assert.deepEqual(plan.oil.map(item => [item.venue, item.status, item.accountId]), [['binance', 'added', '***6789'], ['bybit', 'added', '***7788']]);
+    assert.equal(parseServiceSecrets(plan.secrets, [], config.oil!.accounts.map(account => account.venue)).exchanges!.size, 3);
+    assert.deepEqual(plan.oil.map(item => [item.venue, item.status, item.accountId]), [['binance', 'added', '***6789'], ['bybit', 'added', '***7788'], ['okx', 'added', '***4567']]);
     assert.ok(!plan.notes.some(note => /上限/.test(note)));
     noSecrets(JSON.stringify({ items: plan.oil, notes: plan.notes }));
   } finally { rmSync(wb.root, { recursive: true, force: true }); }
@@ -97,6 +104,10 @@ test('原油导入：用途、账户模式、缺身份、未连接、密钥不�
     [{ exchange: 'binance', revision: 0 }, /凭据版本无效/],
     [{ exchange: 'binance', credentials: { purpose: 'execution', exchange: 'bybit', apiKey: API_KEY, apiSecret: API_SECRET } }, /交易所与记录不一致/],
     [{ exchange: 'binance', credentials: { purpose: 'execution', exchange: 'binance', apiKey: 'has space', apiSecret: API_SECRET } }, /不完整或格式无效/],
+    [{ exchange: 'okx', mode: 'unified' }, /账户模式 unified 不支持.*OKX 只支持 cross \/ isolated/],
+    [{ exchange: 'okx', credentials: { purpose: 'execution', exchange: 'okx', apiKey: OKX_KEY, apiSecret: OKX_SECRET } }, /OKX Passphrase 缺失或格式无效/],
+    [{ exchange: 'okx', credentials: { purpose: 'execution', exchange: 'okx', apiKey: OKX_KEY, apiSecret: OKX_SECRET, passphrase: 'Okx-密码-passphrase' } }, /OKX Passphrase 缺失或格式无效/],
+    [{ exchange: 'okx', credentials: { purpose: 'execution', exchange: 'okx', apiKey: OKX_KEY, apiSecret: OKX_SECRET, passphrase: ` ${OKX_PASSPHRASE}` } }, /OKX Passphrase 缺失或格式无效/],
   ];
   for (const [row, reason] of cases) {
     const one = hub([row]);
@@ -108,6 +119,7 @@ test('原油导入：用途、账户模式、缺身份、未连接、密钥不�
       assert.match(plan.oil[0]!.detail, reason);
       assert.equal(plan.config.oil, undefined);
       assert.equal(plan.secrets.binance, undefined);
+      assert.equal(plan.secrets.okx, undefined);
       noSecrets(JSON.stringify(plan.oil));
     } finally { rmSync(one.root, { recursive: true, force: true }); }
   }

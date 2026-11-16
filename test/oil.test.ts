@@ -177,13 +177,21 @@ test('服务配置：oil 可选；有 oil 时 pairs 可省略、密钥须含对�
   assert.deepEqual(parseServiceConfig({ secretsFile: '/x/s.json', oil: { ...oil, notionalLimits: { perJob: '200', totalOpen: '1000' } } }).oil, config.oil);
   assert.throws(() => parseServiceConfig({ secretsFile: '/x/s.json', oil: { ...oil, limits: {} } }), /oil 无效/);
   assert.throws(() => parseServiceConfig({ secretsFile: '/x/s.json', oil: { ...oil, accounts: [oil.accounts[0], oil.accounts[0]] } }), /每个交易所至多一个账户/);
-  assert.throws(() => parseServiceConfig({ secretsFile: '/x/s.json', oil: { ...oil, accounts: [] } }), /1–2 个执行账户/);
+  assert.throws(() => parseServiceConfig({ secretsFile: '/x/s.json', oil: { ...oil, accounts: [] } }), /1–3 个执行账户（Binance、Bybit、OKX 各至多一个）/);
 
   const secret = 'Zx9-very-secret-value';
   assert.throws(() => parseServiceSecrets({ accounts: {}, binance: { apiKey: KEY, apiSecret: SECRET } }, []), /不支持的字段/);
   const secrets = parseServiceSecrets({ accounts: {}, binance: { apiKey: KEY, apiSecret: SECRET } }, [], ['binance']);
   assert.deepEqual(secrets.exchanges!.get('binance'), { apiKey: KEY, apiSecret: SECRET });
   assert.throws(() => parseServiceSecrets({ accounts: {} }, [], ['binance']), /缺少 binance 的密钥/);
+  // OKX keys carry a passphrase; a wrong field set or a bad passphrase is refused without echoing anything read.
+  const okx = { apiKey: KEY, apiSecret: SECRET, passphrase: 'pass-phrase-1' };
+  assert.deepEqual(parseServiceSecrets({ accounts: {}, okx }, [], ['okx']).exchanges!.get('okx'), okx);
+  assert.throws(() => parseServiceSecrets({ accounts: {}, okx: { apiKey: KEY, apiSecret: SECRET } }, [], ['okx']), /okx 的字段须恰好为 apiKey、apiSecret、passphrase/);
+  for (const passphrase of ['short', ` ${secret}`, `${secret}\n`, '密码密码密码密码', 42]) {
+    assert.throws(() => parseServiceSecrets({ accounts: {}, okx: { ...okx, passphrase } }, [], ['okx']), (error: unknown) => error instanceof Error && !error.message.includes(secret) && /okx 的密钥不完整或格式无效/.test(error.message), String(passphrase));
+  }
+  assert.throws(() => parseServiceSecrets({ accounts: {}, binance: { ...okx } }, [], ['binance']), /binance 的字段须恰好为 apiKey、apiSecret$/);
   for (const bad of [{ apiKey: KEY, [secret]: SECRET }, { apiKey: `${secret}\n`, apiSecret: SECRET }, { apiKey: KEY, apiSecret: '' }]) {
     assert.throws(() => parseServiceSecrets({ accounts: {}, binance: bad }, [], ['binance']), (error: unknown) => error instanceof Error && !error.message.includes(secret) && /binance/.test(error.message), JSON.stringify(Object.keys(bad)));
   }

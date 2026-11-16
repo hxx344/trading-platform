@@ -45,7 +45,13 @@ export function identifier(value: unknown, name: string): string {
 }
 export const describe = (error: unknown): string => error instanceof Error ? error.message.slice(0, 160) : '未知错误';
 
-export interface LiveCredentials { apiKey: string; apiSecret: string }
+/** passphrase: OKX only (docs/oil.md section 10); the other venues' keys never carry one. */
+export interface LiveCredentials { apiKey: string; apiSecret: string; passphrase?: string }
+/**
+ * An OKX passphrase: 8–128 printable ASCII characters without spaces at either end (the workbench takes 8–128 of any
+ * non-control text; a header value outside ASCII or with outer spaces could not be sent as typed).
+ */
+export const validPassphrase = (value: unknown): value is string => typeof value === 'string' && /^[\x21-\x7e](?:[\x20-\x7e]{6,126})[\x21-\x7e]$/.test(value);
 /** Same rule as the production client: a key that cannot be a header value is refused before anything is sent. */
 export const validCredentials = (value: LiveCredentials | null | undefined): boolean => typeof value?.apiKey === 'string' && /^[\x21-\x7e]{1,512}$/.test(value.apiKey)
   && typeof value.apiSecret === 'string' && value.apiSecret.trim() !== '' && value.apiSecret.length <= 1024 && !/[\r\n\0]/.test(value.apiSecret);

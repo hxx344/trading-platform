@@ -95,6 +95,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 | 回退到早于 | 回退前要做的事 | 说明 | 详见 |
 | --- | --- | --- | --- |
+| v0.52.1 | 不用改配置 | 旧版本每 30 分钟检查一次新版本，没有每分钟的发布页探测 | [docs/update.md](docs/update.md) 第 3 节 |
 | v0.52.0 | 不用改配置。先在「海力士」页确认没有未结束或待人工处理的调平任务（待人工处理的要先人工确认），否则旧版本起不来。只有没做过调平任务时才能干净回退；做过之后建议升到修复版本而不是回退 | 旧版本按双腿读取任务，读到单腿的调平任务（含已完成的）会出错：有未结束或待人工处理的调平任务时旧版本启动失败，整个服务（含 ASTER 划转与 ADL）不运行；已结束的只要还在最近 20 个任务里，主页与海力士页的状态就读不出，直到被 20 个更新的任务挤出去。数据目录的 `hynix.sqlite`（平衡阈值）旧版本不读，留着即可 | [docs/hynix.md](docs/hynix.md) 第 7.5 节 |
 | v0.51.0 | 不用改配置 | 旧版本没有页面在线更新；已装的 `trading-platform-update.path` 与 `.service` 留着无害（没人写更新请求就不会触发），要清掉见详见一栏 | [docs/update.md](docs/update.md) |
 | v0.50.0 | `config.json` 的 `oil` 里没有 `notionalLimits` 的（v0.50.0 之后才首次导入原油账户），先补上 `"notionalLimits": { "perJob": "200", "openPer24h": "1000" }`；原来就有的不用改 | 旧版本要求这一项并恢复单笔与 24 小时开仓名义金额上限；回退后 24 小时内，之前确认的开仓也计入额度 | [docs/oil.md](docs/oil.md) 第 2 节 |

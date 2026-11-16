@@ -24,6 +24,10 @@ export const UPDATE_RUNNING_STALE_MS = 2_160_000;
 export const UPDATE_MAX_WAIT_MS = 3_600_000;
 export const UPDATE_CHECK_INTERVAL_MS = 30 * 60_000;
 export const UPDATE_FIRST_CHECK_MS = 60_000;
+/** How often the release page's redirect is read between the API checks (probe() below). */
+export const UPDATE_PROBE_INTERVAL_MS = 60_000;
+/** The shortest time between two API checks brought forward by the probe, should the page and the API disagree for long. */
+export const UPDATE_PROBE_API_GAP_MS = 5 * 60_000;
 export const UPDATE_MANUAL_GAP_MS = 60_000;
 const UPDATE_CHECK_TIMEOUT_MS = 20_000;
 /** Backoff after failed automatic checks (not rate limits, which wait for GitHub's own reset time). */
@@ -155,15 +159,17 @@ export interface UpdateOptions {
   fetchImpl?: UpdateFetch;
   now?: () => number;
   repo?: string;
+  log?: (line: string) => void;
 }
 
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
 const clock = (ms: number): string => new Date(ms).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Shanghai' });
 
 /** The service's update state: the release check and the hand-off to the root helper. */
-export function createUpdates({ current, dir, readyFile, fetchImpl = fetch, now = Date.now, repo = RELEASE_REPO }: UpdateOptions) {
+export function createUpdates({ current, dir, readyFile, fetchImpl = fetch, now = Date.now, repo = RELEASE_REPO, log = line => { process.stderr.write(`${line}\n`); } }: UpdateOptions) {
   let latest: ReleaseInfo | null = null, checkedAt: number | null = null, error: string | null = null;
   let retryAt: number | null = null, nextAt = now() + UPDATE_FIRST_CHECK_MS, failures = 0, manualAt = 0;
+  let probeAt = nextAt + UPDATE_PROBE_INTERVAL_MS, probeError: string | null = null, broughtForwardAt = -Infinity;
   let checking: Promise<void> | null = null;
   /** The last request this service wrote (readJob). */
   let submitted: UpdateRequest | null = null;
@@ -203,6 +209,7 @@ export function createUpdates({ current, dir, readyFile, fetchImpl = fetch, now 
       try {
         await fetchLatest();
         checkedAt = now(); error = null; failures = 0; nextAt = now() + UPDATE_CHECK_INTERVAL_MS;
+        probeAt = now() + UPDATE_PROBE_INTERVAL_MS;
       } catch (cause) {
         error = message(cause);
         failures++;
@@ -210,6 +217,45 @@ export function createUpdates({ current, dir, readyFile, fetchImpl = fetch, now 
       } finally { checking = null; }
     })();
     return checking;
+  }
+
+  /**
+   * The cheap check between the API ones. github.com answers releases/latest with a redirect to the latest stable
+   * release's tag page, and that request is outside the API's hourly quota (60 without a token), which a read every
+   * minute would use up. It tells the tag only: one other than the release last read brings the next API check forward
+   * for the details, and the same one confirms the last check. A probe that fails changes nothing but a log line; the
+   * API checks go on at their own pace.
+   */
+  async function probe(): Promise<void> {
+    probeAt = now() + UPDATE_PROBE_INTERVAL_MS;
+    let tag: string;
+    try {
+      let response: Response;
+      try {
+        response = await fetchImpl(`https://github.com/${repo}/releases/latest`, {
+          method: 'HEAD', headers: { 'user-agent': 'trading-platform-updater' },
+          redirect: 'manual', signal: AbortSignal.any([stop.signal, AbortSignal.timeout(UPDATE_CHECK_TIMEOUT_MS)]),
+        });
+      } catch (cause) {
+        throw new Error(cause instanceof Error && cause.name === 'TimeoutError' ? '连接 GitHub 超时' : `连接 GitHub 失败：${message(cause).slice(0, 200)}`);
+      }
+      await response.body?.cancel().catch(() => undefined);
+      const prefix = `https://github.com/${repo}/releases/tag/`, location = response.headers.get('location') ?? '';
+      const found = location.startsWith(prefix) ? location.slice(prefix.length) : '';
+      if (response.status < 300 || response.status >= 400 || !isVersion(found)) throw new Error(`发布页的应答无法识别（HTTP ${response.status}）`);
+      tag = found;
+    } catch (cause) {
+      if (stop.signal.aborted) return;
+      if (probeError === null) log(`每分钟的新版本探测失败（${message(cause)}），恢复前只靠每 ${UPDATE_CHECK_INTERVAL_MS / 60_000} 分钟一次的检查发现新版本`);
+      probeError = message(cause);
+      return;
+    }
+    if (probeError !== null) { log('每分钟的新版本探测已恢复'); probeError = null; }
+    const at = now();
+    if (tag === latest?.version) { if (error === null) checkedAt = at; return; }
+    // After a failed API check its backoff decides the next one; a tag the API keeps answering differently is asked
+    // about again only after the gap.
+    if (failures === 0 && at - broughtForwardAt >= UPDATE_PROBE_API_GAP_MS) { broughtForwardAt = at; nextAt = at; }
   }
 
   function readJob(): { job: UpdateView['job']; pending: UpdateView['pending']; jobError?: string } {
@@ -255,10 +301,15 @@ export function createUpdates({ current, dir, readyFile, fetchImpl = fetch, now 
       await run();
       return status();
     },
-    /** The background check: once the interval (or the backoff after a failure) and any rate-limit wait have passed. */
+    /**
+     * The background check: the API once the interval (or the backoff after a failure) and any rate-limit wait have
+     * passed, and in between the probe every minute, which may make the API check due at once.
+     */
     async tick(): Promise<void> {
-      const at = now();
-      if (stop.signal.aborted || checking || at < nextAt || (retryAt !== null && at < retryAt)) return;
+      const due = (): boolean => { const at = now(); return at >= nextAt && (retryAt === null || at >= retryAt); };
+      if (stop.signal.aborted || checking) return;
+      if (!due() && now() >= probeAt) await probe();
+      if (stop.signal.aborted || checking || !due()) return;
       await run();
     },
     /** Shutdown: a check in flight gives up rather than hold the stop for its timeout. */

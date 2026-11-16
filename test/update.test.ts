@@ -27,9 +27,15 @@ function setup(answers: (() => Response | Promise<Response>)[], { ready = true, 
   const calls: string[] = [];
   const fetchImpl: UpdateFetch = async url => { calls.push(url); const next = answers.shift(); if (!next) throw new Error('没有更多应答'); return next(); };
   if (dir && ready) writeFileSync(join(dir, UPDATE_READY_FILE), 'v0.50.0\n');
-  const updates = createUpdates({ current: CURRENT, dir, readyFile: dir ? join(dir, UPDATE_READY_FILE) : null, fetchImpl, now: () => clock });
-  return { updates, calls, dir, advance: (ms: number) => { clock += ms; }, now: () => clock };
+  const logs: string[] = [];
+  const updates = createUpdates({ current: CURRENT, dir, readyFile: dir ? join(dir, UPDATE_READY_FILE) : null, fetchImpl, now: () => clock, log: line => { logs.push(line); } });
+  return { updates, calls, logs, dir, advance: (ms: number) => { clock += ms; }, now: () => clock };
 }
+
+const API_URL = 'https://api.github.com/repos/hxx344/trading-platform/releases/latest';
+const PAGE_URL = 'https://github.com/hxx344/trading-platform/releases/latest';
+/** github.com's answer to releases/latest: a redirect to the latest release's tag page. */
+const redirect = (tag: string, base = 'https://github.com/hxx344/trading-platform') => () => new Response(null, { status: 302, headers: { location: `${base}/releases/tag/${tag}` } });
 
 test('在线更新：版本比较与更新说明只取「更新说明」一节', () => {
   assert.equal(compareVersions('v0.50.0', 'v0.49.1'), 1);
@@ -88,7 +94,8 @@ test('在线更新：GitHub 限流时按恢复时间暂停，手动检查也不�
   const s = setup([]);
   const reset = Math.floor(s.now() / 1000) + 3600;
   const answers = [() => answer(403, { message: 'API rate limit exceeded' }, { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(reset) })];
-  const limited = createUpdates({ current: CURRENT, dir: s.dir, readyFile: join(s.dir!, UPDATE_READY_FILE), now: s.now, fetchImpl: async () => answers.shift()!() });
+  const calls: string[] = [];
+  const limited = createUpdates({ current: CURRENT, dir: s.dir, readyFile: join(s.dir!, UPDATE_READY_FILE), now: s.now, fetchImpl: async url => { calls.push(url); return url === PAGE_URL ? redirect('v0.50.0')() : answers.shift()!(); } });
   try {
     await limited.check();
     const view = limited.status();
@@ -97,7 +104,113 @@ test('在线更新：GitHub 限流时按恢复时间暂停，手动检查也不�
     s.advance(120_000);
     await assert.rejects(limited.check(), (error: Error & { status?: number }) => error.status === 429 && /额度已用完/.test(error.message));
     await limited.tick();
-    assert.equal(answers.length, 0, '没有再发请求（再发会因没有应答而失败）');
+    assert.deepEqual(calls, [API_URL, PAGE_URL], '限流期间只探测发布页，探测到新标签也不读 API');
+    assert.match(limited.status().error ?? '', /额度已用完/);
+  } finally { rmSync(s.dir!, { recursive: true, force: true }); }
+});
+
+test('在线更新：每分钟探测发布页的跳转，标签没变只确认上次检查，变了立即读 API', async () => {
+  const s = setup([() => answer(200, release()), redirect('v0.50.0'), redirect('v0.50.1'), () => answer(200, release('v0.50.1'))]);
+  try {
+    s.advance(60_000);
+    await s.updates.tick();
+    const first = s.updates.status().checkedAt;
+    await s.updates.tick();
+    s.advance(59_000);
+    await s.updates.tick();
+    assert.deepEqual(s.calls, [API_URL], '读过 API 后 1 分钟内不探测');
+    s.advance(1_000);
+    await s.updates.tick();
+    assert.deepEqual(s.calls, [API_URL, PAGE_URL]);
+    assert.equal(s.updates.status().checkedAt, first! + 60_000, '标签没变：上次检查时间前进');
+    assert.equal(s.updates.status().latest?.version, 'v0.50.0');
+    s.advance(30_000);
+    await s.updates.tick();
+    assert.equal(s.calls.length, 2, '探测 1 分钟一次');
+    s.advance(30_000);
+    await s.updates.tick();
+    assert.deepEqual(s.calls.slice(2), [PAGE_URL, API_URL], '标签变了：同一轮里读 API');
+    const view = s.updates.status();
+    assert.equal(view.latest?.version, 'v0.50.1');
+    assert.equal(view.latest?.notes, '- 新功能一\n- 修复二');
+    assert.equal(view.available, true);
+    assert.deepEqual(s.logs, []);
+  } finally { rmSync(s.dir!, { recursive: true, force: true }); }
+});
+
+test('在线更新：服务停止时进行中的探测静默结束，不记日志', async () => {
+  const logs: string[] = [];
+  let clock = 1_800_000_000_000, asked = 0;
+  const updates = createUpdates({
+    current: CURRENT, dir: null, readyFile: null, now: () => clock, log: line => { logs.push(line); },
+    fetchImpl: (url, init) => url === PAGE_URL
+      ? new Promise<Response>((_resolve, reject) => { asked++; init.signal!.addEventListener('abort', () => reject(init.signal!.reason)); })
+      : Promise.resolve(answer(200, release())),
+  });
+  clock += 60_000;
+  await updates.tick();
+  clock += 60_000;
+  const pending = updates.tick();
+  assert.equal(asked, 1);
+  updates.abort();
+  await pending;
+  assert.deepEqual(logs, []);
+  assert.equal(updates.status().latest?.version, 'v0.50.0');
+});
+
+test('在线更新：发布页与 API 的结果不一致时，探测提前的 API 检查 5 分钟最多一次', async () => {
+  const s = setup([() => answer(200, release()), redirect('v0.50.1'), () => answer(200, release()), redirect('v0.50.1'), redirect('v0.50.1'), redirect('v0.50.1'), redirect('v0.50.1'), redirect('v0.50.1'), () => answer(200, release('v0.50.1'))]);
+  try {
+    s.advance(60_000);
+    await s.updates.tick();
+    s.advance(60_000);
+    await s.updates.tick();
+    assert.deepEqual(s.calls, [API_URL, PAGE_URL, API_URL]);
+    assert.equal(s.updates.status().latest?.version, 'v0.50.0', 'API 还没跟上');
+    for (let minute = 0; minute < 4; minute++) { s.advance(60_000); await s.updates.tick(); }
+    assert.deepEqual(s.calls.slice(3), [PAGE_URL, PAGE_URL, PAGE_URL, PAGE_URL], '5 分钟内不再提前读 API');
+    s.advance(60_000);
+    await s.updates.tick();
+    assert.deepEqual(s.calls.slice(7), [PAGE_URL, API_URL]);
+    assert.equal(s.updates.status().latest?.version, 'v0.50.1');
+  } finally { rmSync(s.dir!, { recursive: true, force: true }); }
+});
+
+test('在线更新：探测失败只记一行日志，不改检查结果；API 检查失败后的退避不被探测打断', async () => {
+  const s = setup([
+    () => answer(200, release()),
+    () => { throw new Error('connect ECONNREFUSED'); }, () => new Response('', { status: 404 }), redirect('v0.50.1', 'https://github.com/someone/else'), redirect('v0.50.0-rc1'),
+    redirect('v0.50.0'),
+    () => answer(500, {}), () => answer(500, {}), redirect('v0.50.1'),
+  ]);
+  try {
+    s.advance(60_000);
+    await s.updates.tick();
+    const first = s.updates.status().checkedAt;
+    for (let minute = 0; minute < 4; minute++) { s.advance(60_000); await s.updates.tick(); }
+    assert.deepEqual(s.calls.slice(1), [PAGE_URL, PAGE_URL, PAGE_URL, PAGE_URL], '连接失败、非跳转、别的仓库、不是正式版标签都不读 API');
+    assert.equal(s.logs.length, 1, '连续失败只记一次');
+    assert.match(s.logs[0]!, /探测失败（连接 GitHub 失败：connect ECONNREFUSED）/);
+    let view = s.updates.status();
+    assert.equal(view.error, null);
+    assert.equal(view.checkedAt, first);
+    assert.equal(view.latest?.version, 'v0.50.0');
+    s.advance(60_000);
+    await s.updates.tick();
+    assert.equal(s.logs.length, 2);
+    assert.match(s.logs[1]!, /已恢复/);
+    assert.equal(s.updates.status().checkedAt, first! + 5 * 60_000);
+    // Two failed API checks: the second waits two minutes, and the probe in between finds a new tag.
+    await s.updates.check();
+    s.advance(60_000);
+    await s.updates.tick();
+    assert.deepEqual(s.calls.slice(6), [API_URL, API_URL]);
+    s.advance(60_000);
+    await s.updates.tick();
+    assert.deepEqual(s.calls.slice(8), [PAGE_URL], '退避期间探测到新标签也不提前读 API');
+    view = s.updates.status();
+    assert.equal(view.error, 'GitHub 返回 HTTP 500');
+    assert.equal(view.checkedAt, first! + 5 * 60_000, 'API 检查失败后探测不再更新上次检查时间');
   } finally { rmSync(s.dir!, { recursive: true, force: true }); }
 });
 

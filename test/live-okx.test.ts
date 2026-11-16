@@ -12,7 +12,10 @@ import { PreflightError } from '../src/live/permissions.ts';
 import { createOkxConnector, fromClOrdId, toClOrdId } from '../src/live/okx.ts';
 import { createLiveConnectors, preflightLive } from '../src/live/setup.ts';
 import { openStore } from '../src/store.ts';
-import { CREDENTIALS, FakeOkx, INST, binding, fail, failWrite, json, order, type Row } from './live-fake-okx.ts';
+import { createOilMarket } from '../src/oil/market.ts';
+import { createOilPnl } from '../src/oil/pnl.ts';
+import { prepareOil } from '../src/service/oil.ts';
+import { CREDENTIALS, FakeOkx, INST, KEY, PASSPHRASE, SECRET, binding, fail, failWrite, json, order, type Row } from './live-fake-okx.ts';
 
 const signal = () => new AbortController().signal;
 const send = (beforeSend: () => void = () => undefined) => ({ signal: signal(), beforeSend });
@@ -281,4 +284,48 @@ test('端到端（OKX 同所）：首腿 50011 限频按已拒绝结束、不重
     assert.equal(venue.count('POST /api/v5/trade/order'), 1);
     assert.equal(venue.net.size, 0);
   });
+});
+
+test('原油行情：跨所价差按已配置交易所两两列出（Binance–Bybit、Binance–OKX、Bybit–OKX），OKX 盘口取自其连接器', async () => {
+  const { venue, connector } = setup();
+  const stub = (name: 'binance' | 'bybit', bid: string, ask: string) => ({ venue: name, quote: async (symbol: string) => ({ venue: name, symbol, bid, ask, sourceTime: null, receivedAt: venue.clock, connectionGeneration: 0, sequence: null, complete: true }) });
+  const market = createOilMarket({ connectors: [stub('bybit', '70.00', '70.05'), connector, stub('binance', '70.20', '70.22')] as never, accounts: [], now: () => venue.clock });
+  await market.refreshQuotes();
+  const rows = market.view().crossExchange.filter(row => row.symbol === 'CLUSDT').map(row => [row.first, row.second, row.firstOverSecond, row.secondOverFirst, row.receivedAt]);
+  assert.deepEqual(rows, [['binance', 'bybit', '0.15', '-0.22', venue.clock], ['binance', 'okx', '0.08', '-0.12', venue.clock], ['bybit', 'okx', '-0.12', '0.05', venue.clock]]);
+  const two = createOilMarket({ connectors: [connector] as never, accounts: [], now: () => venue.clock });
+  assert.deepEqual(two.view().crossExchange, []);
+});
+
+test('原油盈亏（OKX 腿）：盈亏库用 OKX 连接器的持仓与账单，总盈亏 = 浮盈亏 + 资金费 + 平仓盈亏 + 手续费', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pa-okx-pnl-'));
+  const { venue, connector } = setup();
+  try {
+    venue.positions = [{ instType: 'SWAP', instId: 'CL-USDT-SWAP', mgnMode: 'cross', posSide: 'net', pos: '-30', avgPx: '70.5', markPx: '70.2', upl: '0.9', ccy: 'USDT' }];
+    const bill = (billId: number, ago: number, overrides: Row): Row => ({ billId: String(billId), instType: 'SWAP', instId: 'CL-USDT-SWAP', ccy: 'USDT', ts: String(venue.clock - ago), type: '2', subType: '1', pnl: '0', fee: '0', ...overrides });
+    venue.bills = [bill(1, 3_600_000, { type: '8', subType: '173', pnl: '-0.12' }), bill(2, 1_800_000, { type: '2', pnl: '1.5', fee: '-0.03' })];
+    const pnl = createOilPnl({ file: join(dir, 'oil-pnl.sqlite'), connectors: [connector], accounts: [binding()], now: () => venue.clock });
+    venue.clock += 1000;
+    await pnl.sample();
+    venue.clock += 1000;
+    await pnl.syncLedgers();
+    const view = pnl.read({ range: '1d' }) as { latest: { unrealizedPnl: string; fundingPnl: string; realizedPnl: string; feePnl: string; totalPnl: string } | null };
+    assert.deepEqual(view.latest && [view.latest.unrealizedPnl, view.latest.fundingPnl, view.latest.realizedPnl, view.latest.feePnl, view.latest.totalPnl], ['0.9', '-0.12', '1.5', '-0.03', '2.25']);
+    pnl.close();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('服务启动（OKX 账户）：按账户加进程锁、启动检查不通过时拒绝启动且报错不含密钥，通过后行情与执行都用 OKX 连接器', async () => {
+  const venue = new FakeOkx();
+  const config = { accounts: [binding({ accountId: String(Date.now()).slice(-10) })] };
+  venue.config = { ...venue.config, uid: config.accounts[0]!.accountId, perm: 'read_only,trade,withdraw' };
+  const keys = new Map([['okx', CREDENTIALS]]) as never;
+  await assert.rejects(prepareOil(config as never, keys, { fetchImpl: venue.fetch, now: () => venue.clock }), (error: unknown) => error instanceof Error
+    && /原油执行账户启动检查未通过，拒绝启动：.*请关闭：提现/.test(error.message) && ![KEY, SECRET, PASSPHRASE].some(secret => error.message.includes(secret)));
+  venue.config = { ...venue.config, perm: 'read_only,trade' };
+  const oil = await prepareOil(config as never, keys, { fetchImpl: venue.fetch, now: () => venue.clock });
+  try {
+    assert.deepEqual(oil.connectors.map(connector => connector.venue), ['okx']);
+    await assert.rejects(prepareOil(config as never, keys, { fetchImpl: venue.fetch, now: () => venue.clock }), /已被本机另一个/);
+  } finally { oil.locks.release(); }
 });

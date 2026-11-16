@@ -1,4 +1,4 @@
-// The oil module inside the ASTER service: Binance/Bybit execution accounts named in config.json `oil`. Started only when
+// The oil module inside the ASTER service: Binance/Bybit/OKX execution accounts named in config.json `oil`. Started only when
 // that block is there; the service without it runs exactly as before. Before anything is opened the accounts are locked
 // on this host and every account passes its venue's key and identity check, so a bad key or a second process refuses start.
 import type { VenueConnector } from '../connector.ts';

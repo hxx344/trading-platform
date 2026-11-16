@@ -1,16 +1,18 @@
 // The SK hynix order form turned into the executor's intent (POST /api/preview, market 'hynix', docs/hynix.md). Kept free
 // of the DOM so the server-side tests import it.
-import { LEAD_TYPES, VENUE_LABEL, leadTypeAllowed, type OilLeadType, type OilPreset, type OilSide, type OilVenue } from './oil-form.ts';
+import { LEAD_TYPES, OIL_VENUES, VENUE_LABEL, hedgeVenueFor, leadTypeAllowed, type OilLeadType, type OilPreset, type OilSide, type OilVenue } from './oil-form.ts';
 
 export type HynixSymbol = 'SKHYUSDT' | 'SKHYNIXUSDT';
 export const HYNIX_SYMBOLS: readonly HynixSymbol[] = ['SKHYUSDT', 'SKHYNIXUSDT'];
 export const HYNIX_LABEL: Record<HynixSymbol, string> = { SKHYUSDT: 'ADR', SKHYNIXUSDT: '正股' };
-export { LEAD_TYPES, VENUE_LABEL, leadTypeAllowed };
+export { LEAD_TYPES, OIL_VENUES, VENUE_LABEL, hedgeVenueFor, leadTypeAllowed };
 
 export interface HynixForm {
   preset: OilPreset;
-  /** Same venue: the venue of both legs. Cross venue: the first leg's venue; the hedge goes to the other one. */
+  /** Same venue: the venue of both legs. Cross venue: the first leg's venue. */
   venue: OilVenue;
+  /** Cross venue: the hedge leg's venue, never the first leg's. */
+  hedgeVenue: OilVenue;
   action: 'open' | 'close';
   /** Same venue: long the premium is long the ADR / short the ordinary share (on open; close takes the same choice back). */
   premium: OilSide;
@@ -42,7 +44,7 @@ export interface HynixIntent {
 }
 
 export const DEFAULT_HYNIX_FORM: HynixForm = {
-  preset: 'same-exchange', venue: 'binance', action: 'open', premium: 'short', leadSymbol: 'SKHYUSDT', symbol: 'SKHYUSDT', leadSide: 'long',
+  preset: 'same-exchange', venue: 'binance', hedgeVenue: 'bybit', action: 'open', premium: 'short', leadSymbol: 'SKHYUSDT', symbol: 'SKHYUSDT', leadSide: 'long',
   sizing: 'notional', notional: '', leadQuantity: '', hedgeQuantity: '', leadOrderType: 'market', chaseLimit: '', timeoutSeconds: '60', slippageBps: '',
   batchCount: '1', batchIntervalSeconds: '0',
 };
@@ -69,7 +71,7 @@ export function draftHynixLegs(form: HynixForm): [HynixLegIntent, HynixLegIntent
   }
   return [
     { venue: form.venue, side: form.leadSide, orderType: form.leadOrderType, ...size(form.leadQuantity), ...bound },
-    { venue: other(form.venue, ['binance', 'bybit'] as const), side: opposite(form.leadSide), orderType: 'market', ...size(form.hedgeQuantity) },
+    { venue: form.hedgeVenue, side: opposite(form.leadSide), orderType: 'market', ...size(form.hedgeQuantity) },
   ];
 }
 
@@ -83,7 +85,8 @@ export function hynixFormToIntent(form: HynixForm): { intent: HynixIntent } | { 
   if (!INTEGER.test(seconds) || Number(seconds) < 30 || Number(seconds) > 3600) return { error: '最长执行时间须为 30–3600 秒的整数' };
   const bps = form.slippageBps.trim();
   if (bps !== '' && (!INTEGER.test(bps) || Number(bps) > 1000)) return { error: '价格保护须为 1–1000 的整数基点，或留空用默认值' };
-  if (!leadTypeAllowed(form.venue, form.leadOrderType)) return { error: form.leadOrderType === 'chase' ? '追价策略只有 Bybit 支持；Binance 首腿请选市价或本地追价' : '本地追价只用于 Binance 首腿；Bybit 首腿请选追价策略' };
+  if (!leadTypeAllowed(form.venue, form.leadOrderType)) return { error: form.leadOrderType === 'chase' ? `追价策略只有 Bybit 支持；${VENUE_LABEL[form.venue]} 首腿请选市价或本地追价` : '本地追价只用于 Binance 或 OKX 首腿；Bybit 首腿请选追价策略' };
+  if (form.preset === 'cross-exchange' && form.hedgeVenue === form.venue) return { error: '跨所组合的对冲腿须在另一个交易所' };
   const chaseLimit = form.leadOrderType === 'local-chase' ? form.chaseLimit.trim() : '';
   if (chaseLimit !== '' && !positive(chaseLimit)) return { error: '追价界限须为正数价格，或留空用价格保护界限' };
   // The same checks as the oil form (oil-form.ts) and the executor's parseIntent.
@@ -114,7 +117,7 @@ export function describeHynixIntent(intent: HynixIntent): string {
 }
 
 /** The fields that decide which contract and account each leg is: a change to any of them clears the per-leg quantities. */
-export const LEG_FIELDS: readonly (keyof HynixForm)[] = ['preset', 'venue', 'action', 'premium', 'leadSymbol', 'symbol', 'leadSide'];
+export const LEG_FIELDS: readonly (keyof HynixForm)[] = ['preset', 'venue', 'hedgeVenue', 'action', 'premium', 'leadSymbol', 'symbol', 'leadSide'];
 
 /** The held amounts a position read gives, by side and contract (null: that account's read has not answered). */
 export interface HeldPositions { venue: string; long: Record<string, string> | null; short: Record<string, string> | null }

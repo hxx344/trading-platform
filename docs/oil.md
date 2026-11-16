@@ -13,7 +13,8 @@
 - 名义金额上限：v0.50.0 取消（2026-11-16 用户决定），原油与海力士任务不再受单笔与 24 小时开仓上限约束，见第 2 节。
 - 规则分批与阈值界限：v0.53.0（随海力士 H3，见 [hynix.md](hynix.md) 第 8 节），原油规则可选分批，每批受阈值界限约束；因界限零成交的任务重新计数、不计失败。
 - 价格提醒：由行情监控 M-3a（v0.29.0）的原油价差、布伦特、WTI 阈值告警覆盖，见 [monitor.md](monitor.md)。
-- 未做：第 1 节“后置”一栏其余各项（四腿与 OKX）。
+- OKX 执行：O5（第 10 节），原油与海力士在 OKX 同所两腿、与 Binance / Bybit 跨所两腿、规则与盈亏；替身 OKX 与模拟交易所上已测，真实账户未实测，实盘首跑须用户当次授权。
+- 未做：第 1 节“后置”一栏其余各项（四腿）。
 
 ## 1 范围
 
@@ -23,7 +24,7 @@
 | --- | --- |
 | 执行器支持同所 BZ/CL 两腿，保留跨所 | 价差自动规则（先 observe 再 live） |
 | 按桶数下单，服务端换算各腿原生数量 | Binance 本地追价、追价界限、分批 |
-| 服务接线：Binance/Bybit 账户、密钥、启动检查、进程锁、两腿任务循环 | 四腿、OKX |
+| 服务接线：Binance/Bybit 账户、密钥、启动检查、进程锁、两腿任务循环 | 四腿、~~OKX~~（O5 已做，第 10 节） |
 | 页面“原油”页：价差与盘口、持仓、下单（预览 → 确认实盘）、任务进度与人工处理 | 盈亏、资金费、已实现盈亏账本与走势 |
 | 飞书：原油任务告警 | 价格/价差提醒（monitor 那套） |
 | 从工作台导入 Binance/Bybit 执行账户 | |
@@ -59,7 +60,7 @@
 - 启动：配置了 `oil` 时按账户取进程锁（与金丝雀同名 `pa-executor-live/<交易所>/<账户>`，二者不能同时操作同一账户），逐个账户 `preflightLive`（30 s 上限），失败拒绝启动（安装时自动回退旧版本）；`registerAccount`；`passes` 加 `jobs`。
 - 库里有未结束的原油任务、但它的交易所（或整个 `oil`）已不在配置里时，启动照常，日志与飞书【配置未生效】逐条提示该任务不会被推进或核对。
 - 行情：服务端每 3 s 读一次已配置交易所的 BZ、CL 盘口（单次 3 s 超时、失败保留上次结果并标注时刻，不重试），只供页面显示；预览与执行照旧自己读盘口。
-- 新增接口（须登录，未配置 `oil` 时 404）：`GET /api/oil/market`（`books` 各所各合约买一卖一与读取/失败时刻，`sameExchange` 各所 `sell`/`buy` 价差，`crossExchange` 各合约 `binanceOverBybit`/`bybitOverBinance`）；`GET /api/oil/state`（`accounts`、`positions`（每 15 s 读一次各账户 BZ/CL 多空持仓与挂单数，单次 10 s 超时、不重试，失败保留上次结果）、`jobs`（最近 20 个，含 `preset` 与每腿计划/成交桶数、成交均价、预览盘口）；v0.50.0 起不再带 `notionalLimits`）；预览、确认、任务操作沿用现有 `/api/preview`、`/api/confirm`、`/api/jobs/<编号>/…`。
+- 新增接口（须登录，未配置 `oil` 时 404）：`GET /api/oil/market`（`books` 各所各合约买一卖一与读取/失败时刻，`sameExchange` 各所 `sell`/`buy` 价差，`crossExchange` 每两个已配置交易所（按 Binance、Bybit、OKX 顺序）各合约一行：`first`/`second` 交易所、`firstOverSecond` = 前者买一 − 后者卖一、`secondOverFirst` 反之；O5 起取代原来的 `binanceOverBybit`/`bybitOverBinance`）；`GET /api/oil/state`（`accounts`、`positions`（每 15 s 读一次各账户 BZ/CL 多空持仓与挂单数，单次 10 s 超时、不重试，失败保留上次结果）、`jobs`（最近 20 个，含 `preset` 与每腿计划/成交桶数、成交均价、预览盘口）；v0.50.0 起不再带 `notionalLimits`）；预览、确认、任务操作沿用现有 `/api/preview`、`/api/confirm`、`/api/jobs/<编号>/…`。
 - 飞书：任务确认发出、完成、转人工（不平衡/结果未知）、失败、停止各一条，带交易所、合约、方向、桶数、成交均价与价差；同一任务同一状态只发一次。沿用事件表 → 发件箱：`job-accepted` / `job-finished` 事件转成消息，`notify.sqlite` 新表 `once` 按“任务 + 状态”去重（随发件箱保留期清理）；确认时给预览可成交价差，结束时给成交均价差。
 - 页面：顶部“原油”标签（`#/oil`）只在 `GET /api/oil/state` 有应答时出现（没配 `oil` 时接口 404，标签不显示；总览每 60 s 探一次）。
   - 原油页按旧工作台原油交易页排版，样式复制自工作台（见 `docs/frontend.md`《原油页样式》）：
@@ -73,8 +74,8 @@
 - 导入：`install.sh --import-workbench --oil` 与页面导入的“导入原油执行账户”勾选框。
   - 只读工作台 `hub.sqlite` 的 `execution_accounts`，用同目录 `credentials.key`（32 字节）以 AES-256-GCM 解密（`node:crypto`，任何失败只报固定原因，不回显密钥、密文或字段内容），以库属主身份在子进程里读（同现有导入，拒绝符号链接与非普通文件）。
   - 读库规则沿用 `server/contract-probes/lib/workbench-accounts.ts`：有未完成的回滚日志拒绝；有未合并 WAL 而没有 `-shm`（工作台未在运行）拒绝；工作台运行中（有 `-shm`，含检查点刚清空 WAL 时）照常只读打开；既没有待合并 WAL 也没有 `-shm` 时才以 `immutable=1` 打开，不生成 `-wal`/`-shm`。
-  - 逐账户拒绝并说明：未连接、记录格式错误、无法解密、`purpose` 不是 `execution`、交易所与记录不一致、密钥格式无效、凭据版本无效、账户模式不支持（Binance 只接受 standard/portfolio-margin，Bybit 只接受 unified）、没有身份（UID，“须在工作台重新验证”）。
-  - 映射：`credentialVersion` = `revision`，`accountId` = `identity`，密钥写入 `secrets.json` 的 `binance`/`bybit`。
+  - 逐账户拒绝并说明：未连接、记录格式错误、无法解密、`purpose` 不是 `execution`、交易所与记录不一致、密钥格式无效、凭据版本无效、账户模式不支持（Binance 只接受 standard/portfolio-margin，Bybit 只接受 unified，OKX 只接受 cross/isolated）、OKX Passphrase 缺失或不是 8–128 个可打印 ASCII 字符、没有身份（UID，“须在工作台重新验证”）。
+  - 映射：`credentialVersion` = `revision`，`accountId` = `identity`，密钥写入 `secrets.json` 的 `binance`/`bybit`/`okx`（OKX 带 `passphrase`）。
   - 自动规则按交易所拦截：`execution_auto_rules` 里实盘模式且启用的原油规则拦截同交易所账户（交易所无法识别的规则拦截全部），已停用但阶段仍是开仓中、平仓中或待核对的原油规则同样拦截（停用规则不会停掉它已发出的任务）；观察模式、已停用且空闲或只持仓、非原油与其他交易所的规则不拦；有任何一条规则无法解析时全部拦截（“先在工作台停用原油自动规则”）。
   - 工作台 `execution_jobs` 里未结束（不是 completed/stopped，含转人工）的任务按腿上交易所拦截对应账户，不论品种；无法解析或看不出交易所的任务拦截全部。
   - 已在 `oil.accounts` 里的交易所保留现有设置，不覆盖；`secrets.json` 已有同名交易所密钥但 `config.json` 没有对应账户时也不覆盖。
@@ -318,3 +319,18 @@
 ### 10.5 回滚
 
 回退到不认识 `okx` 的版本前：先在原油页、海力士页确认 OKX 腿的任务都已结束、OKX 规则已停用，再从 `config.json` 的 `oil.accounts` 和密钥文件删除 `okx` 项（旧版本见到 `okx` 拒绝启动）。执行器库里已结束的 OKX 任务旧版本读到未知交易所的任务视图可能报错，回退后不要打开这些任务；未结束的 OKX 任务旧版本不会推进，须先在新版本处理完。
+
+### 10.6 实施记录
+
+- 提交：连接器、配置密钥与导入（35f9c95）；跨所价差交易所组合、页面与盈亏（本节同批提交）。版本号与发布由主代理统一处理。
+- 与工作台的差异（都比工作台严或更贴合本仓库执行器）：
+  - `clOrdId`：工作台用 `ox` + 哈希（不可还原）；本仓库去掉连字符直接作 `clOrdId`，可还原，重启后账户快照能认出自己的活动委托。
+  - Passphrase：工作台只要求 8–128 字符、无控制字符；本仓库要求可打印 ASCII（首尾不是空格），工作台里存的非 ASCII Passphrase 导入时拒绝并说明。
+  - 启动检查另要求密钥绑定 IP（`ip` 非空）；`perm` 须恰为 `read_only,trade`。
+  - 工作台市价腿直接发 `market`、追价用只挂单原地改价（`amend-order`）；本仓库按执行器语义，受保护的市价首腿发 `ioc`（价格保护界限为限价），本地追价撤单重挂（与 Binance 相同），不用改单。
+  - 合约目录状态 `post_only`（只能挂只挂单）按不可交易拒绝；`maxLmtAmt`/`maxMktAmt`（按金额的上限）不读，只用张数上限 `maxLmtSz`/`maxMktSz`。
+  - 账户快照与工作台一样读策略委托（条件、计划、移动止盈止损、冰山、时间加权、追价），任一条都记为外部委托，由执行器按现有规则拒绝在该合约下单。
+- 页面：原油与海力士下单面板的交易所为已配置的 Binance / Bybit / OKX；配置了三个交易所时跨所组合多一个“对冲腿交易所”选择，选到对冲腿所在交易所作首腿时两者对调；只有两个交易所时对冲腿就是另一所。账户模式显示“全仓 / 逐仓”。跨所价差按每两个交易所各一张表。
+- 测试：`test/live-fake-okx.ts`（替身 OKX：签名与 Passphrase 校验、时间戳过期、委托与持仓状态、策略委托、账单分页）与 `test/live-okx.test.ts`（规则、盘口、启动检查各拒绝原因、账户快照、下单体、部分成交、只挂单过期、50011 与拒绝码、结果未知、50102 重发、查单与撤单、盈亏读取、执行器端到端同所与首腿回执丢失、50011 首腿、三所跨所价差、盈亏库）；导入见 `test/import-oil.test.ts`、`deploy/test-install.sh` 第 2 部分。
+- 浏览器：模拟交易所加一个 OKX 账户（合约面值 0.1 桶），1280 与 390 宽度走原油页跨所 OKX 首腿 → Bybit 对冲（预览、确认、完成）、海力士页 Bybit → OKX 跨所，无横向溢出。
+- 真实账户待实测：下单回执与查单时序、`sCode` 拒绝码、`bills-archive` 类型与子类型、`acctLv`/`posMode`/`perm` 的实际取值。

@@ -237,7 +237,7 @@ test('行情视图：同所溢价（中间价、卖出、买入）与跨所价�
     assert.equal(Number(binance.premium).toFixed(4), ((41.22 * 10 / 400.2 - 1) * 100).toFixed(4));
     assert.equal(Number(binance.sell).toFixed(4), ((41.2 * 10 / 400.4 - 1) * 100).toFixed(4));
     assert.equal(Number(binance.buy).toFixed(4), '3.1000');
-    assert.deepEqual(view.crossExchange.map(row => [row.symbol, row.binanceOverBybit, row.bybitOverBinance]), [['SKHYUSDT', '-0.06', '-0.02'], ['SKHYNIXUSDT', '-0.5', '-0.3']]);
+    assert.deepEqual(view.crossExchange.map(row => [row.symbol, row.first, row.second, row.firstOverSecond, row.secondOverFirst]), [['SKHYUSDT', 'binance', 'bybit', '-0.06', '-0.02'], ['SKHYNIXUSDT', 'binance', 'bybit', '-0.5', '-0.3']]);
     const positions = market.positionsView();
     assert.deepEqual(Object.keys(positions.accounts[0]!.long ?? {}), ['SKHYUSDT', 'SKHYNIXUSDT']);
   } finally { h.dispose(); }
@@ -286,7 +286,13 @@ test('页面表单：等金额与按数量两种意图、校验、按持仓填�
   assert.deepEqual(parsePairIntent(close.intent).legs.map(item => [item.symbol, item.side, item.quantity]), [['SKHYNIXUSDT', 'long', '0.249'], ['SKHYUSDT', 'short', '2.42']]);
   assert.deepEqual(closeQuantities(closeForm, [{ venue: 'binance', long: null, short: null }]), { error: 'Binance 正股多头持仓尚未读到，请稍后再填' });
   assert.deepEqual(closeQuantities({ ...closeForm, premium: 'long' }, accounts), { error: 'Binance 正股空头没有持仓，不能按持仓平仓' });
-  const cross = hynixFormToIntent({ ...DEFAULT_HYNIX_FORM, preset: 'cross-exchange', venue: 'bybit', leadOrderType: 'chase', notional: '50', symbol: 'SKHYNIXUSDT' });
+  const cross = hynixFormToIntent({ ...DEFAULT_HYNIX_FORM, preset: 'cross-exchange', venue: 'bybit', hedgeVenue: 'binance', leadOrderType: 'chase', notional: '50', symbol: 'SKHYNIXUSDT' });
   assert.ok('intent' in cross);
   assert.deepEqual(parsePairIntent(cross.intent).legs.map(item => [item.venue, item.symbol, item.side, item.orderType]), [['bybit', 'SKHYNIXUSDT', 'long', 'chase'], ['binance', 'SKHYNIXUSDT', 'short', 'market']]);
+  // OKX: either leg of a cross-venue pair, local chase on its lead; the hedge must be another venue.
+  const okx = hynixFormToIntent({ ...DEFAULT_HYNIX_FORM, preset: 'cross-exchange', venue: 'okx', hedgeVenue: 'bybit', leadOrderType: 'local-chase', notional: '50', symbol: 'SKHYUSDT' });
+  assert.ok('intent' in okx);
+  assert.deepEqual(parsePairIntent(okx.intent).legs.map(item => [item.venue, item.orderType]), [['okx', 'local-chase'], ['bybit', 'market']]);
+  assert.deepEqual(hynixFormToIntent({ ...DEFAULT_HYNIX_FORM, preset: 'cross-exchange', venue: 'okx', hedgeVenue: 'okx', notional: '50' }), { error: '跨所组合的对冲腿须在另一个交易所' });
+  assert.deepEqual(hynixFormToIntent({ ...DEFAULT_HYNIX_FORM, venue: 'okx', leadOrderType: 'chase', notional: '50' }), { error: '追价策略只有 Bybit 支持；OKX 首腿请选市价或本地追价' });
 });

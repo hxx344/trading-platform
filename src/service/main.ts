@@ -94,7 +94,7 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
   };
   // A new check interval from the page must fit the request budget, like the config's do at start.
   const transferConfigGuard = (pairId: string, next: Readonly<TransferConfig>, pairs: readonly { id: string; enabled: boolean; config: TransferConfig }[]): void => checkIntervalBudget(config, pairs, pairId, next.checkIntervalMs);
-  // With oil, the Binance/Bybit connectors; without it, no order venue at all. No notional caps either way.
+  // With oil, the Binance/Bybit/OKX connectors; without it, no order venue at all. No notional caps either way.
   const executor: Executor = createExecutor({ store, connectors: oil?.connectors ?? [], environment: 'mainnet', now, transfers, adl: trading, positions: trading, enableGuard, transferConfigGuard, adlOnlyEnabledPairs: true });
   const warnings: string[] = [];
   try {
@@ -210,7 +210,7 @@ export interface StartOptions {
   password?: PasswordHash;
   /** The built page (loadWebApp); main reads it before the config check, so a release without it never switches in. */
   app: WebApp;
-  /** Tests stand in for Binance/Bybit (only with config.oil). */
+  /** Tests stand in for Binance/Bybit/OKX (only with config.oil). */
   oilFetch?: (url: string, init: RequestInit) => Promise<Response>;
   /** Tests stand in for the monitor's public venues (only with config.monitor). */
   monitorFetch?: (url: string, init: RequestInit) => Promise<Response>;

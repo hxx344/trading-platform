@@ -1,15 +1,17 @@
 // The oil order form turned into the executor's intent (POST /api/preview), and the rules for which job actions the
 // page offers. Kept free of the DOM so the server-side tests import it.
 
-export type OilVenue = 'binance' | 'bybit';
+export type OilVenue = 'binance' | 'bybit' | 'okx';
 export type OilSymbol = 'CLUSDT' | 'BZUSDT';
 export type OilSide = 'long' | 'short';
 export type OilPreset = 'same-exchange' | 'cross-exchange';
 
 export interface OilForm {
   preset: OilPreset;
-  /** Same venue: the venue of both legs. Cross venue: the first leg's venue; the hedge goes to the other one. */
+  /** Same venue: the venue of both legs. Cross venue: the first leg's venue. */
   venue: OilVenue;
+  /** Cross venue: the hedge leg's venue, never the first leg's. */
+  hedgeVenue: OilVenue;
   action: 'open' | 'close';
   /** Same venue: long the spread is long BZ / short CL (on open; close takes the same choice back). */
   spread: OilSide;
@@ -21,7 +23,7 @@ export interface OilForm {
   leadSide: OilSide;
   /** Barrels per leg, equal on both legs. */
   barrels: string;
-  /** chase: Bybit's native strategy; local-chase: post-only orders the executor moves, Binance only. */
+  /** chase: Bybit's native strategy; local-chase: post-only orders the executor moves, Binance or OKX only. */
   leadOrderType: OilLeadType;
   /** Local chase: the highest buy / lowest sell it chases to; empty takes the preview's price protection bound. */
   chaseLimit: string;
@@ -39,21 +41,28 @@ export interface OilIntent {
   market: 'oil'; preset: OilPreset; symbol?: OilSymbol; action: 'open' | 'close'; timeoutMs: number; maxSlippageBps?: number;
   legs: [OilLegIntent, OilLegIntent]; batches?: { count: number; intervalMs: number };
 }
-/** The lead order types a venue offers: Bybit chases with its own strategy, Binance with the executor's post-only orders. */
+/** The lead order types a venue offers: Bybit chases with its own strategy, Binance and OKX with the executor's post-only orders. */
 export const LEAD_TYPES: Record<OilVenue, readonly (readonly [OilLeadType, string])[]> = {
   binance: [['market', '市价'], ['local-chase', '本地追价']],
   bybit: [['market', '市价'], ['chase', '追价策略']],
+  okx: [['market', '市价'], ['local-chase', '本地追价']],
 };
 export const leadTypeAllowed = (venue: OilVenue, type: OilLeadType): boolean => LEAD_TYPES[venue].some(([key]) => key === type);
 
-export const VENUE_LABEL: Record<OilVenue, string> = { binance: 'Binance', bybit: 'Bybit' };
+export const VENUE_LABEL: Record<OilVenue, string> = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX' };
+/** Venue order on the page, as the service lists them (contracts.ts VENUES). */
+export const OIL_VENUES: readonly OilVenue[] = ['binance', 'bybit', 'okx'];
+export const isOilVenue = (value: string): value is OilVenue => (OIL_VENUES as readonly string[]).includes(value);
+/** The hedge venue a cross-venue form falls back to: the one kept if still valid, else the first other configured venue. */
+export const hedgeVenueFor = (venues: readonly OilVenue[], lead: OilVenue, current: OilVenue): OilVenue | null =>
+  current !== lead && venues.includes(current) ? current : venues.find(venue => venue !== lead) ?? null;
 export const SIDE_LABEL: Record<OilSide, string> = { long: '多', short: '空' };
 export const SYMBOL_LABEL: Record<OilSymbol, string> = { BZUSDT: 'BZ（布伦特）', CLUSDT: 'CL（WTI）' };
 const other = <T extends string>(value: T, pair: readonly [T, T]): T => (value === pair[0] ? pair[1] : pair[0]);
 const opposite = (side: OilSide): OilSide => (side === 'long' ? 'short' : 'long');
 
 export const DEFAULT_FORM: OilForm = {
-  preset: 'same-exchange', venue: 'binance', action: 'open', spread: 'long', leadSymbol: 'CLUSDT', symbol: 'BZUSDT', leadSide: 'long',
+  preset: 'same-exchange', venue: 'binance', hedgeVenue: 'bybit', action: 'open', spread: 'long', leadSymbol: 'CLUSDT', symbol: 'BZUSDT', leadSide: 'long',
   barrels: '', leadOrderType: 'market', chaseLimit: '', batchCount: '1', batchIntervalSeconds: '0', timeoutSeconds: '60', slippageBps: '',
 };
 
@@ -63,7 +72,8 @@ const COUNT = /^(0|[1-9]\d{0,6})$/;
 
 /**
  * The intent for this form, or the first thing to fix. Only what the page can tell on its own is checked here (a number
- * where one is needed, chase only on a Bybit lead, local chase only on a Binance one, batches only for market and local
+ * where one is needed, chase only on a Bybit lead, local chase only on a Binance or OKX one, two different venues across
+ * venues, batches only for market and local
  * chase); the executor checks the rest at preview (barrel step, batch sizes, caps, books).
  */
 export function formToIntent(form: OilForm): { intent: OilIntent } | { error: string } {
@@ -73,8 +83,9 @@ export function formToIntent(form: OilForm): { intent: OilIntent } | { error: st
   if (!INTEGER.test(seconds) || Number(seconds) < 30 || Number(seconds) > 3600) return { error: '最长执行时间须为 30–3600 秒的整数' };
   const bps = form.slippageBps.trim();
   if (bps !== '' && (!INTEGER.test(bps) || Number(bps) > 1000)) return { error: '价格保护须为 1–1000 的整数基点，或留空用默认值' };
-  if (form.leadOrderType === 'chase' && form.venue !== 'bybit') return { error: '追价策略只有 Bybit 支持；Binance 首腿请选市价或本地追价' };
-  if (form.leadOrderType === 'local-chase' && form.venue !== 'binance') return { error: '本地追价只用于 Binance 首腿；Bybit 首腿请选追价策略' };
+  if (form.leadOrderType === 'chase' && !leadTypeAllowed(form.venue, 'chase')) return { error: `追价策略只有 Bybit 支持；${VENUE_LABEL[form.venue]} 首腿请选市价或本地追价` };
+  if (form.leadOrderType === 'local-chase' && !leadTypeAllowed(form.venue, 'local-chase')) return { error: '本地追价只用于 Binance 或 OKX 首腿；Bybit 首腿请选追价策略' };
+  if (form.preset === 'cross-exchange' && form.hedgeVenue === form.venue) return { error: '跨所组合的对冲腿须在另一个交易所' };
   const chaseLimit = form.leadOrderType === 'local-chase' ? form.chaseLimit.trim() : '';
   if (chaseLimit !== '' && (!DECIMAL.test(chaseLimit) || Number(chaseLimit) <= 0)) return { error: '追价界限须为正数价格，或留空用价格保护界限' };
   const count = form.batchCount.trim(), interval = form.batchIntervalSeconds.trim() || '0';
@@ -105,7 +116,7 @@ export function draftLegs(form: OilForm): [OilLegIntent, OilLegIntent] {
   }
   return [
     { venue: form.venue, side: form.leadSide, orderType: form.leadOrderType, barrels, ...bound },
-    { venue: other(form.venue, ['binance', 'bybit'] as const), side: opposite(form.leadSide), orderType: 'market', barrels },
+    { venue: form.hedgeVenue, side: opposite(form.leadSide), orderType: 'market', barrels },
   ];
 }
 

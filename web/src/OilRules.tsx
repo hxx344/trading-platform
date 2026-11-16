@@ -13,7 +13,7 @@ import { useLiveResource } from './use-live-resource.ts';
 
 export const OIL_RULES_PATH = '/api/oil/rules';
 const RULES_MS = 3_000, READ_TIMEOUT_MS = 10_000;
-const VENUES: Record<RuleVenue, string> = { binance: 'Binance', bybit: 'Bybit' };
+const VENUES: Record<RuleVenue, string> = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX' };
 /** Oil USDT per barrel as read; hynix percent cut to four places, as the hynix premium panel. */
 const spread = (market: RuleMarket, value: string) => market === 'hynix' ? `${value.replace(/(\.\d{4})\d+$/, '$1')}%` : `${value} USDT/桶`;
 /** What differs between the two pages' panels. */

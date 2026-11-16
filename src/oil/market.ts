@@ -2,7 +2,7 @@
 // venue every few seconds and the configured accounts' oil positions a little less often. Nothing here feeds a preview or a
 // send (those read their own books); a failed read keeps the last good value and says when it was read and when it failed.
 import { sub } from '../decimal.ts';
-import { OIL_SYMBOLS, VENUE_NAMES, accountKey, parseAccountSnapshot, parseQuote, positionOf, type AccountBinding, type Venue } from '../contracts.ts';
+import { OIL_SYMBOLS, VENUES, VENUE_NAMES, accountKey, parseAccountSnapshot, parseQuote, positionOf, type AccountBinding, type Venue } from '../contracts.ts';
 import type { VenueConnector } from '../connector.ts';
 
 /** Book read spacing and the timeout of one read; a read is never retried, the next round reads again. */
@@ -89,7 +89,20 @@ export function createMarketReader({ connectors, accounts, symbols, now = Date.n
   const header = () => ({ now: now(), readAt: quotesReadAt, readEveryMs: MARKET_READ_MS, timeoutMs: quoteTimeoutMs });
   const book = (venue: Venue, symbol: string) => ({ venue, symbol, ...slot(venue, symbol) });
   const oldest = (...slots: BookSlot[]): number | null => slots.some(item => item.receivedAt === null) ? null : Math.min(...slots.map(item => item.receivedAt as number));
-  return { venues, symbols, slot, book, oldest, header, refreshQuotes, refreshPositions, positionsView };
+  /**
+   * One contract across every two configured venues, in VENUES order (Binance–Bybit, Binance–OKX, Bybit–OKX):
+   * firstOverSecond = first bid − second ask (sell on the first, buy on the second), secondOverFirst the other way.
+   */
+  const crossExchange = () => {
+    const configured = VENUES.filter(venue => venues.includes(venue));
+    const pairs = configured.flatMap((first, index) => configured.slice(index + 1).map(second => [first, second] as const));
+    const spread = (high: BookSlot, low: BookSlot) => high.bid !== null && low.ask !== null ? sub(high.bid, low.ask) : null;
+    return pairs.flatMap(([first, second]) => symbols.map(symbol => {
+      const a = slot(first, symbol), b = slot(second, symbol);
+      return { symbol, first, second, firstOverSecond: spread(a, b), secondOverFirst: spread(b, a), receivedAt: oldest(a, b) };
+    }));
+  };
+  return { venues, symbols, slot, book, oldest, header, crossExchange, refreshQuotes, refreshPositions, positionsView };
 }
 export type MarketReader = ReturnType<typeof createMarketReader>;
 
@@ -98,7 +111,7 @@ export type MarketReader = ReturnType<typeof createMarketReader>;
  * so a price is already per barrel and two prices subtract directly.
  * - same venue, BZ − CL: sell = BZ bid − CL ask (sell BZ, buy CL: what shorting the spread gets), buy = BZ ask − CL bid
  *   (what going long the spread costs).
- * - one contract across venues: Binance bid − Bybit ask and Bybit bid − Binance ask.
+ * - one contract across every two configured venues: first bid − second ask and second bid − first ask (reader.crossExchange).
  */
 export function createOilMarket(options: OilMarketOptions) {
   const reader = createMarketReader({ ...options, symbols: OIL_SYMBOLS });
@@ -112,10 +125,7 @@ export function createOilMarket(options: OilMarketOptions) {
         const bz = slot(venue, BZ), cl = slot(venue, CL);
         return { venue, sell: spread(bz, cl), buy: bz.ask !== null && cl.bid !== null ? sub(bz.ask, cl.bid) : null, receivedAt: oldest(bz, cl) };
       }),
-      crossExchange: venues.includes('binance') && venues.includes('bybit') ? OIL_SYMBOLS.map(symbol => {
-        const binance = slot('binance', symbol), bybit = slot('bybit', symbol);
-        return { symbol, binanceOverBybit: spread(binance, bybit), bybitOverBinance: spread(bybit, binance), receivedAt: oldest(binance, bybit) };
-      }) : [],
+      crossExchange: reader.crossExchange(),
     };
   }
   return { refreshQuotes: reader.refreshQuotes, refreshPositions: reader.refreshPositions, view, positionsView: reader.positionsView };

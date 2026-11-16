@@ -3,8 +3,8 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from './api.ts';
 import { clock, label } from './labels.ts';
 import { ACTIVE_STATUSES, type OilVenue } from './oil-form.ts';
-import { DEFAULT_HYNIX_FORM, HYNIX_LABEL, LEG_FIELDS, HYNIX_SYMBOLS, LEAD_TYPES, VENUE_LABEL, closeQuantities, describeHynixIntent, draftHynixLegs, hynixFormToIntent, leadTypeAllowed, type HynixForm, type HynixIntent, type HynixSymbol } from './hynix-form.ts';
-import type { HynixState, OilBook, OilConfirmResult, OilJob, OilPreview, OilState } from './oil-types.ts';
+import { DEFAULT_HYNIX_FORM, HYNIX_LABEL, LEG_FIELDS, HYNIX_SYMBOLS, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, hedgeVenueFor, closeQuantities, describeHynixIntent, draftHynixLegs, hynixFormToIntent, leadTypeAllowed, type HynixForm, type HynixIntent, type HynixSymbol } from './hynix-form.ts';
+import { crossPairs, type CrossRow, type HynixState, type OilBook, type OilConfirmResult, type OilJob, type OilPreview, type OilState } from './oil-types.ts';
 import { BalancePanel } from './HynixBalance.tsx';
 import { readBalance } from './hynix-balance.ts';
 import { ACCOUNT_MODE, ACTIVE_MS, Choice, IDLE_MS, JOB_STATUS, JobsSection, LEAVE_UNANSWERED, MARKET_MS, OIL_READ_TIMEOUT_MS, ORDER_TYPE, PositionsPanel, SyncLine, buys, confirmRefused, errorText, operation, staleness, statusOf, venueName, type PositionsKind } from './OilPage.tsx';
@@ -25,7 +25,7 @@ interface HynixMarket {
   books: OilBook[];
   /** Percent: premium from both midpoints; sell = ADR bid × 10 ÷ ordinary ask − 1; buy = ADR ask × 10 ÷ ordinary bid − 1. */
   sameExchange: { venue: string; premium: string | null; sell: string | null; buy: string | null; receivedAt: number | null }[];
-  crossExchange: { symbol: string; binanceOverBybit: string | null; bybitOverBinance: string | null; receivedAt: number | null }[];
+  crossExchange: CrossRow[];
 }
 type HynixPreview = Omit<OilPreview, 'intent'> & { intent: HynixIntent };
 
@@ -62,15 +62,18 @@ function MarketPanel({ live }: { live: LiveResource<HynixMarket> }) {
           {cell('溢价率', percent(row.premium), row.receivedAt)}{cell('卖出溢价', percent(row.sell), row.receivedAt)}{cell('买入溢价', percent(row.buy), row.receivedAt)}
         </tr>)}</tbody>
       </table></div></div>
-      {market.crossExchange.length ? <details className="spread-cross"><summary>跨所价差 · Binance 与 Bybit 同一合约（USDT）</summary>
-        <div className="spread-markets oil-spread-markets"><div className="execution-table-wrap"><table className="execution-progress-table spread-table" id="hynixCross">
-          <thead><tr><th scope="col">合约</th><th scope="col">Binance 买一 / 卖一</th><th scope="col">Bybit 买一 / 卖一</th><th scope="col">Binance 买一 − Bybit 卖一</th><th scope="col">Bybit 买一 − Binance 卖一</th></tr></thead>
-          <tbody>{market.crossExchange.map(row => <tr key={row.symbol}>
-            <th scope="row">{name(row.symbol)}</th>
-            <td data-label="Binance 买一 / 卖一">{quote(book('binance', row.symbol))}</td><td data-label="Bybit 买一 / 卖一">{quote(book('bybit', row.symbol))}</td>
-            {cell('Binance 买一 − Bybit 卖一', row.binanceOverBybit, row.receivedAt)}{cell('Bybit 买一 − Binance 卖一', row.bybitOverBinance, row.receivedAt)}
-          </tr>)}</tbody>
-        </table></div></div>
+      {market.crossExchange.length ? <details className="spread-cross"><summary>跨所价差 · {crossPairs(market.crossExchange).map(pair => `${venueName(pair.first)} 与 ${venueName(pair.second)}`).join('、')} 同一合约（USDT）</summary>
+        {crossPairs(market.crossExchange).map(pair => {
+          const [a, b] = [venueName(pair.first), venueName(pair.second)];
+          return <div key={`${pair.first}:${pair.second}`} className="spread-markets oil-spread-markets"><div className="execution-table-wrap"><table className="execution-progress-table spread-table" id={`hynixCross-${pair.first}-${pair.second}`}>
+            <thead><tr><th scope="col">合约</th><th scope="col">{a} 买一 / 卖一</th><th scope="col">{b} 买一 / 卖一</th><th scope="col">{a} 买一 − {b} 卖一</th><th scope="col">{b} 买一 − {a} 卖一</th></tr></thead>
+            <tbody>{pair.rows.map(row => <tr key={row.symbol}>
+              <th scope="row">{name(row.symbol)}</th>
+              <td data-label={`${a} 买一 / 卖一`}>{quote(book(pair.first, row.symbol))}</td><td data-label={`${b} 买一 / 卖一`}>{quote(book(pair.second, row.symbol))}</td>
+              {cell(`${a} 买一 − ${b} 卖一`, row.firstOverSecond, row.receivedAt)}{cell(`${b} 买一 − ${a} 卖一`, row.secondOverFirst, row.receivedAt)}
+            </tr>)}</tbody>
+          </table></div></div>;
+        })}
       </details> : null}
     </> : failed ? null : <p className="trading-footnote">正在读取盘口…</p>}
   </section>;
@@ -113,8 +116,8 @@ function PreviewCard({ preview, busy, unknown, onConfirm, onEdit }: { preview: H
 }
 
 function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: OilJob) => void }) {
-  const venues = useMemo(() => state.accounts.map(account => account.venue).filter((venue): venue is OilVenue => venue === 'binance' || venue === 'bybit'), [state.accounts]);
-  const [form, setForm] = useState<HynixForm>(() => ({ ...DEFAULT_HYNIX_FORM, venue: venues[0] ?? 'binance' }));
+  const venues = useMemo(() => OIL_VENUES.filter(venue => state.accounts.some(account => account.venue === venue)), [state.accounts]);
+  const [form, setForm] = useState<HynixForm>(() => ({ ...DEFAULT_HYNIX_FORM, venue: venues[0] ?? 'binance', hedgeVenue: hedgeVenueFor(venues, venues[0] ?? 'binance', DEFAULT_HYNIX_FORM.hedgeVenue) ?? DEFAULT_HYNIX_FORM.hedgeVenue }));
   const [preview, setPreview] = useState<HynixPreview | null>(null);
   const [message, setMessage] = useState<{ tone: 'ok' | 'err' | 'muted'; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -124,16 +127,20 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   const reviewRef = useRef<HTMLDivElement>(null);
   const formVersion = useRef(0);
   const changed = (): void => { formVersion.current++; setPreview(null); };
-  const cross = venues.length === 2;
+  const cross = venues.length >= 2;
   useEffect(() => {
     // Through update(), so a venue or preset forced by an account change also clears the per-leg quantities.
     if (venues.length && !venues.includes(form.venue)) update({ venue: venues[0]! });
     if (!cross && form.preset === 'cross-exchange') update({ preset: 'same-exchange' });
-  }, [venues, cross, form.venue, form.preset]);
+    const hedge = hedgeVenueFor(venues, form.venue, form.hedgeVenue);
+    if (hedge && hedge !== form.hedgeVenue) update({ hedgeVenue: hedge });
+  }, [venues, cross, form.venue, form.hedgeVenue, form.preset]);
   useEffect(() => { if (preview) reviewRef.current?.querySelector<HTMLElement>('.execution-review')?.focus(); }, [preview]);
   const update = (patch: Partial<HynixForm>) => {
     setForm(current => {
       const next = { ...current, ...patch };
+      // Picking the hedge venue as the lead swaps the two, so a cross-venue pair stays on two venues.
+      if (patch.venue !== undefined && patch.venue === current.hedgeVenue) next.hedgeVenue = current.venue;
       if (!leadTypeAllowed(next.venue, next.leadOrderType)) next.leadOrderType = 'market';
       // Opening is by equal notional only; closing defaults to the quantities held.
       if (patch.action && patch.action !== current.action) next.sizing = patch.action === 'open' ? 'notional' : 'quantity';
@@ -200,11 +207,13 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
         <legend className="visually-hidden">选择组合并填写交易参数</legend>
         <div className="execution-presets oil-presets" role="group" aria-label="交易预设">
           <button type="button" aria-pressed={same} data-hynix-preset="same-exchange" onClick={() => { if (!same) set('preset', 'same-exchange'); }}>同所溢价<small>单所 · ADR 对正股 · 两腿同一账户</small></button>
-          <button type="button" aria-pressed={!same} data-hynix-preset="cross-exchange" disabled={!cross} onClick={() => { if (same) set('preset', 'cross-exchange'); }}>跨所同合约<small>{cross ? 'Binance 对 Bybit · 同一合约' : '需同时配置 Binance 与 Bybit 执行账户'}</small></button>
+          <button type="button" aria-pressed={!same} data-hynix-preset="cross-exchange" disabled={!cross} onClick={() => { if (same) set('preset', 'cross-exchange'); }}>跨所同合约<small>{cross ? `${venues.length === 2 ? `${VENUE_LABEL[venues[0]!]} 对 ${VENUE_LABEL[venues[1]!]}` : '任选两所'} · 同一合约` : '需配置两个交易所的执行账户'}</small></button>
         </div>
         <div className="execution-row">
           <Choice label="交易动作" id="hynixAction" value={form.action} options={[['open', '开仓'], ['close', '平仓']]} onChange={next => set('action', next)} />
           <Choice label={same ? '交易所' : '首腿交易所'} id="hynixVenue" value={form.venue} options={venues.map(venue => [venue, VENUE_LABEL[venue]] as const)} onChange={next => set('venue', next)} />
+          {!same && venues.length > 2
+            ? <Choice label="对冲腿交易所" id="hynixHedgeVenue" value={form.hedgeVenue} options={venues.filter(venue => venue !== form.venue).map(venue => [venue, VENUE_LABEL[venue]] as const)} onChange={next => set('hedgeVenue', next)} /> : null}
           {same
             ? <Choice label="首腿合约" id="hynixLeadSymbol" value={form.leadSymbol} options={[['SKHYUSDT', 'ADR 先下'], ['SKHYNIXUSDT', '正股先下']]} onChange={next => set('leadSymbol', next)} />
             : <Choice label="合约" id="hynixSymbol" value={form.symbol} options={[['SKHYUSDT', 'ADR'], ['SKHYNIXUSDT', '正股']]} onChange={next => set('symbol', next)} />}

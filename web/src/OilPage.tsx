@@ -2,8 +2,8 @@ import { ArrowRightLeft, ChevronDown, Clock3, LoaderCircle, RefreshCw, Square } 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from './api.ts';
 import { clock, label, stamp } from './labels.ts';
-import { ACTIVE_STATUSES, CONFIRM_ACKNOWLEDGE, CONFIRM_NOT_CREATED, CONFIRM_RELEASE, DEFAULT_FORM, LEAD_TYPES, VENUE_LABEL, describeIntent, leadTypeAllowed, draftLegs, formToIntent, jobActions, type OilForm, type OilIntent, type OilSymbol, type OilVenue } from './oil-form.ts';
-import type { OilBook, OilConfirmResult, OilJob, OilMarket, OilPositionAccount, OilPreview, OilState } from './oil-types.ts';
+import { ACTIVE_STATUSES, CONFIRM_ACKNOWLEDGE, CONFIRM_NOT_CREATED, CONFIRM_RELEASE, DEFAULT_FORM, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, describeIntent, hedgeVenueFor, leadTypeAllowed, draftLegs, formToIntent, jobActions, type OilForm, type OilIntent, type OilSymbol, type OilVenue } from './oil-form.ts';
+import { crossPairs, type OilBook, type OilConfirmResult, type OilJob, type OilMarket, type OilPositionAccount, type OilPreview, type OilState } from './oil-types.ts';
 import { RequestIds } from './request-ids.ts';
 import { StatePanel } from './StateViews.tsx';
 import { OilPnl } from './OilPnl.tsx';
@@ -32,7 +32,7 @@ const isRebalance = (job: Pick<OilJob, 'preset'>): boolean => job.preset === 're
 const OP_STATE: Record<string, string> = { prepared: '已落盘', sending: '发送中', open: '交易所挂单中', unknown: '结果未知，核对中', rejected: '被拒绝', 'not-sent': '未发送', 'not-created': '确认未创建', filled: '已成交', canceled: '已撤销', confirmed: '已确认' };
 const STRATEGY_STATUS: Record<string, string> = { working: '运行中', paused: '已暂停', terminal: '已结束' };
 export const ORDER_TYPE: Record<string, string> = { market: '市价', chase: '追价策略', 'local-chase': '本地追价', limit: '限价' };
-export const ACCOUNT_MODE: Record<string, string> = { standard: '普通 U 本位', 'portfolio-margin': '组合保证金', unified: '统一账户' };
+export const ACCOUNT_MODE: Record<string, string> = { standard: '普通 U 本位', 'portfolio-margin': '组合保证金', unified: '统一账户', cross: '全仓', isolated: '逐仓' };
 const SYMBOLS: readonly OilSymbol[] = ['BZUSDT', 'CLUSDT'];
 export const statusOf = (error: unknown): number | undefined => {
   const status = (error as { status?: unknown } | null)?.status;
@@ -112,15 +112,18 @@ function MarketPanel({ live }: { live: LiveResource<OilMarket> }) {
           {spread('卖出价差', row.sell, row.receivedAt)}{spread('买入价差', row.buy, row.receivedAt)}
         </tr>)}</tbody>
       </table></div></div>
-      {market.crossExchange.length ? <details className="spread-cross"><summary>跨所价差 · Binance 与 Bybit 同一合约</summary>
-        <div className="spread-markets oil-spread-markets"><div className="execution-table-wrap"><table className="execution-progress-table spread-table" id="oilCross">
-          <thead><tr><th scope="col">合约</th><th scope="col">Binance 买一 / 卖一</th><th scope="col">Bybit 买一 / 卖一</th><th scope="col">Binance 买一 − Bybit 卖一</th><th scope="col">Bybit 买一 − Binance 卖一</th></tr></thead>
-          <tbody>{market.crossExchange.map(row => <tr key={row.symbol}>
-            <th scope="row">{short(row.symbol)}</th>
-            <td data-label="Binance 买一 / 卖一">{quote(book('binance', row.symbol))}</td><td data-label="Bybit 买一 / 卖一">{quote(book('bybit', row.symbol))}</td>
-            {spread('Binance 买一 − Bybit 卖一', row.binanceOverBybit, row.receivedAt)}{spread('Bybit 买一 − Binance 卖一', row.bybitOverBinance, row.receivedAt)}
-          </tr>)}</tbody>
-        </table></div></div>
+      {market.crossExchange.length ? <details className="spread-cross"><summary>跨所价差 · {crossPairs(market.crossExchange).map(pair => `${venueName(pair.first)} 与 ${venueName(pair.second)}`).join('、')} 同一合约</summary>
+        {crossPairs(market.crossExchange).map(pair => {
+          const [a, b] = [venueName(pair.first), venueName(pair.second)];
+          return <div key={`${pair.first}:${pair.second}`} className="spread-markets oil-spread-markets"><div className="execution-table-wrap"><table className="execution-progress-table spread-table" id={`oilCross-${pair.first}-${pair.second}`}>
+            <thead><tr><th scope="col">合约</th><th scope="col">{a} 买一 / 卖一</th><th scope="col">{b} 买一 / 卖一</th><th scope="col">{a} 买一 − {b} 卖一</th><th scope="col">{b} 买一 − {a} 卖一</th></tr></thead>
+            <tbody>{pair.rows.map(row => <tr key={row.symbol}>
+              <th scope="row">{short(row.symbol)}</th>
+              <td data-label={`${a} 买一 / 卖一`}>{quote(book(pair.first, row.symbol))}</td><td data-label={`${b} 买一 / 卖一`}>{quote(book(pair.second, row.symbol))}</td>
+              {spread(`${a} 买一 − ${b} 卖一`, row.firstOverSecond, row.receivedAt)}{spread(`${b} 买一 − ${a} 卖一`, row.secondOverFirst, row.receivedAt)}
+            </tr>)}</tbody>
+          </table></div></div>;
+        })}
       </details> : null}
     </> : failed ? null : <p className="trading-footnote">正在读取盘口…</p>}
   </section>;
@@ -195,8 +198,8 @@ function PreviewCard({ preview, busy, unknown, onConfirm, onEdit }: { preview: O
 }
 
 function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: OilJob) => void }) {
-  const venues = useMemo(() => state.accounts.map(account => account.venue).filter((venue): venue is OilVenue => venue === 'binance' || venue === 'bybit'), [state.accounts]);
-  const [form, setForm] = useState<OilForm>(() => ({ ...DEFAULT_FORM, venue: venues[0] ?? 'binance' }));
+  const venues = useMemo(() => OIL_VENUES.filter(venue => state.accounts.some(account => account.venue === venue)), [state.accounts]);
+  const [form, setForm] = useState<OilForm>(() => ({ ...DEFAULT_FORM, venue: venues[0] ?? 'binance', hedgeVenue: hedgeVenueFor(venues, venues[0] ?? 'binance', DEFAULT_FORM.hedgeVenue) ?? DEFAULT_FORM.hedgeVenue }));
   const [preview, setPreview] = useState<OilPreview | null>(null);
   const [message, setMessage] = useState<{ tone: 'ok' | 'err' | 'muted'; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -208,18 +211,22 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   // Bumped on every form change: a preview answered for an older form is dropped, never shown beside the new one.
   const formVersion = useRef(0);
   const changed = (): void => { formVersion.current++; setPreview(null); };
-  const cross = venues.length === 2;
-  // A venue that is no longer configured, or cross venue without both venues, falls back to what is possible.
+  const cross = venues.length >= 2;
+  // A venue that is no longer configured, or cross venue without two venues, falls back to what is possible.
   useEffect(() => {
     if (venues.length && !venues.includes(form.venue)) { setForm(current => ({ ...current, venue: venues[0]! })); changed(); }
     if (!cross && form.preset === 'cross-exchange') { setForm(current => ({ ...current, preset: 'same-exchange' })); changed(); }
-  }, [venues, cross, form.venue, form.preset]);
+    const hedge = hedgeVenueFor(venues, form.venue, form.hedgeVenue);
+    if (hedge && hedge !== form.hedgeVenue) { setForm(current => ({ ...current, hedgeVenue: hedge })); changed(); }
+  }, [venues, cross, form.venue, form.hedgeVenue, form.preset]);
   // A new preview takes the focus, so the confirmation is what the keyboard and the screen reader reach first.
   useEffect(() => { if (preview) reviewRef.current?.querySelector<HTMLElement>('.execution-review')?.focus(); }, [preview]);
   const set = <K extends keyof OilForm>(key: K, value: OilForm[K]) => {
     setForm(current => {
       const next = { ...current, [key]: value };
-      // Each venue chases its own way (Bybit strategy, Binance local chase): moving the lead elsewhere takes the market order back.
+      // Picking the hedge venue as the lead swaps the two, so a cross-venue pair stays on two venues.
+      if (key === 'venue' && next.venue === current.hedgeVenue) next.hedgeVenue = current.venue;
+      // Each venue chases its own way (Bybit strategy, Binance and OKX local chase): moving the lead elsewhere takes the market order back.
       if (!leadTypeAllowed(next.venue, next.leadOrderType)) next.leadOrderType = 'market';
       // A native chase is never batched; its batch fields are hidden, so they must not keep a stale count.
       if (next.leadOrderType === 'chase') { next.batchCount = '1'; next.batchIntervalSeconds = '0'; }
@@ -276,11 +283,13 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
         <legend className="visually-hidden">选择组合并填写交易参数</legend>
         <div className="execution-presets oil-presets" role="group" aria-label="交易预设">
           <button type="button" aria-pressed={form.preset === 'same-exchange'} data-oil-preset="same-exchange" onClick={() => { if (form.preset !== 'same-exchange') set('preset', 'same-exchange'); }}>同所价差<small>单所 · BZ 对 CL · 两腿同一账户</small></button>
-          <button type="button" aria-pressed={form.preset === 'cross-exchange'} data-oil-preset="cross-exchange" disabled={!cross} onClick={() => { if (form.preset !== 'cross-exchange') set('preset', 'cross-exchange'); }}>跨所同合约<small>{cross ? 'Binance 对 Bybit · 同一合约' : '需同时配置 Binance 与 Bybit 执行账户'}</small></button>
+          <button type="button" aria-pressed={form.preset === 'cross-exchange'} data-oil-preset="cross-exchange" disabled={!cross} onClick={() => { if (form.preset !== 'cross-exchange') set('preset', 'cross-exchange'); }}>跨所同合约<small>{cross ? `${venues.length === 2 ? `${VENUE_LABEL[venues[0]!]} 对 ${VENUE_LABEL[venues[1]!]}` : '任选两所'} · 同一合约` : '需配置两个交易所的执行账户'}</small></button>
         </div>
         <div className="execution-row">
           <Choice label="交易动作" id="oilAction" value={form.action} options={[['open', '开仓'], ['close', '平仓']]} onChange={next => set('action', next)} />
           <Choice label={form.preset === 'same-exchange' ? '交易所' : '首腿交易所'} id="oilVenue" value={form.venue} options={venues.map(venue => [venue, VENUE_LABEL[venue]] as const)} onChange={next => set('venue', next)} />
+          {form.preset === 'cross-exchange' && venues.length > 2
+            ? <Choice label="对冲腿交易所" id="oilHedgeVenue" value={form.hedgeVenue} options={venues.filter(venue => venue !== form.venue).map(venue => [venue, VENUE_LABEL[venue]] as const)} onChange={next => set('hedgeVenue', next)} /> : null}
           {form.preset === 'same-exchange'
             ? <Choice label="首腿合约" id="oilLeadSymbol" value={form.leadSymbol} options={[['CLUSDT', 'CL 先下'], ['BZUSDT', 'BZ 先下']]} onChange={next => set('leadSymbol', next)} />
             : <Choice label="合约" id="oilSymbol" value={form.symbol} options={[['BZUSDT', 'BZ 布伦特'], ['CLUSDT', 'CL WTI']]} onChange={next => set('symbol', next)} />}

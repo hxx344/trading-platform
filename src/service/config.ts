@@ -34,7 +34,7 @@ export interface ServiceConfig {
   budget: { limitPerMinute: number; adlReserve: number };
   secretsFile: string;
   pairs: ServicePair[];
-  /** The oil module's Binance/Bybit execution accounts and caps; absent means the service runs as before (oil-config.ts). */
+  /** The oil module's Binance/Bybit/OKX execution accounts and caps; absent means the service runs as before (oil-config.ts). */
   oil?: OilConfig;
   /** The read-only market monitors (monitor-config.ts); absent means no monitor page. */
   monitor?: MonitorConfig;

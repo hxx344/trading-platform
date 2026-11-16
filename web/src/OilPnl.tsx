@@ -11,7 +11,7 @@ import { useLiveResource } from './use-live-resource.ts';
 
 const PNL_MS = 30_000, READ_TIMEOUT_MS = 10_000, SETTLED_WINDOW = 15 * 60_000;
 const RANGES = [['1d', '近1天'], ['7d', '近7天'], ['30d', '近30天'], ['90d', '近90天']] as const;
-const VENUES: Record<string, string> = { binance: 'Binance', bybit: 'Bybit' };
+const VENUES: Record<string, string> = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX' };
 const KINDS: Record<string, string> = { funding: '资金费', realized: '平仓盈亏', fee: '手续费' };
 const time = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
 const full = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });

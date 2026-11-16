@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseIntent, parsePairIntent } from '../src/contracts.ts';
-import { DEFAULT_FORM, describeIntent, formToIntent, jobActions, type OilForm } from '../web/src/oil-form.ts';
+import { DEFAULT_FORM, describeIntent, formToIntent, hedgeVenueFor, jobActions, type OilForm } from '../web/src/oil-form.ts';
 
 const build = (patch: Partial<OilForm>) => {
   const result = formToIntent({ ...DEFAULT_FORM, barrels: '10', ...patch });
@@ -32,13 +32,30 @@ test('原油下单表单：同所做多价差 = 多 BZ / 空 CL，首腿按所�
 });
 
 test('原油下单表单：跨所同一合约，首腿交易所与方向由表单定，对冲腿去另一个交易所反向市价，通过执行器校验', () => {
-  const cross = build({ preset: 'cross-exchange', venue: 'bybit', symbol: 'CLUSDT', leadSide: 'short', barrels: '2.5' });
+  const cross = build({ preset: 'cross-exchange', venue: 'bybit', hedgeVenue: 'binance', symbol: 'CLUSDT', leadSide: 'short', barrels: '2.5' });
   assert.deepEqual(cross, { market: 'oil', preset: 'cross-exchange', symbol: 'CLUSDT', action: 'open', timeoutMs: 60_000, legs: [
     { venue: 'bybit', side: 'short', orderType: 'market', barrels: '2.5' },
     { venue: 'binance', side: 'long', orderType: 'market', barrels: '2.5' },
   ] });
   assert.equal(describeIntent(cross), '开仓 跨所 CLUSDT：Bybit 空 CL / Binance 多 CL');
   assert.equal(parsePairIntent(cross).symbol, 'CLUSDT');
+});
+
+test('原油下单表单（OKX）：同所两腿与跨所任选两所，OKX 首腿可本地追价、不可追价策略；对冲腿须在另一所', () => {
+  const same = build({ venue: 'okx', leadOrderType: 'local-chase', chaseLimit: '70.1' });
+  assert.deepEqual(same.legs.map(leg => [leg.venue, leg.symbol, leg.orderType]), [['okx', 'CLUSDT', 'local-chase'], ['okx', 'BZUSDT', 'market']]);
+  assert.equal((parseIntent(same) as { legs: { venue: string }[] }).legs[0]!.venue, 'okx');
+  const cross = build({ preset: 'cross-exchange', venue: 'okx', hedgeVenue: 'bybit', symbol: 'BZUSDT', leadSide: 'long' });
+  assert.deepEqual(cross.legs.map(leg => [leg.venue, leg.side]), [['okx', 'long'], ['bybit', 'short']]);
+  assert.equal(describeIntent(cross), '开仓 跨所 BZUSDT：OKX 多 BZ / Bybit 空 BZ');
+  assert.equal(parsePairIntent(cross).legs[1]!.venue, 'bybit');
+  const error = (patch: Partial<OilForm>) => { const result = formToIntent({ ...DEFAULT_FORM, barrels: '10', ...patch }); return 'error' in result ? result.error : null; };
+  assert.match(error({ venue: 'okx', leadOrderType: 'chase' }) ?? '', /只有 Bybit 支持；OKX 首腿/);
+  assert.match(error({ preset: 'cross-exchange', venue: 'okx', hedgeVenue: 'okx' }) ?? '', /对冲腿须在另一个交易所/);
+  assert.equal(hedgeVenueFor(['binance', 'bybit', 'okx'], 'okx', 'bybit'), 'bybit');
+  assert.equal(hedgeVenueFor(['binance', 'bybit', 'okx'], 'bybit', 'bybit'), 'binance');
+  assert.equal(hedgeVenueFor(['binance', 'okx'], 'binance', 'bybit'), 'okx');
+  assert.equal(hedgeVenueFor(['okx'], 'okx', 'bybit'), null);
 });
 
 test('原油下单表单：桶数、执行时间、价格保护与 Binance 追价先在页面拒绝并说明', () => {
@@ -77,7 +94,7 @@ test('原油下单表单：本地追价只给 Binance 首腿，可填追价界�
   assert.deepEqual(build({ batchCount: '2', batchIntervalSeconds: '' }).batches, { count: 2, intervalMs: 0 });
 
   const error = (patch: Partial<OilForm>) => { const result = formToIntent({ ...DEFAULT_FORM, barrels: '10', ...patch }); return 'error' in result ? result.error : null; };
-  assert.match(error({ leadOrderType: 'local-chase', venue: 'bybit' }) ?? '', /只用于 Binance/);
+  assert.match(error({ leadOrderType: 'local-chase', venue: 'bybit' }) ?? '', /只用于 Binance 或 OKX/);
   assert.match(error({ leadOrderType: 'local-chase', chaseLimit: '-1' }) ?? '', /追价界限/);
   for (const batchCount of ['0', '21', '1.5', '']) assert.match(error({ batchCount }) ?? '', /1–20/, batchCount);
   assert.match(error({ batchCount: '2', batchIntervalSeconds: '601' }) ?? '', /0–600/);

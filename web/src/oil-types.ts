@@ -8,7 +8,18 @@ export interface OilMarket {
   books: OilBook[];
   /** sell: BZ bid − CL ask (what selling the spread gets); buy: BZ ask − CL bid (what buying it costs). */
   sameExchange: { venue: string; sell: string | null; buy: string | null; receivedAt: number | null }[];
-  crossExchange: { symbol: string; binanceOverBybit: string | null; bybitOverBinance: string | null; receivedAt: number | null }[];
+  crossExchange: CrossRow[];
+}
+/** One contract on two configured venues: firstOverSecond = first bid − second ask, secondOverFirst the other way. */
+export interface CrossRow { symbol: string; first: string; second: string; firstOverSecond: string | null; secondOverFirst: string | null; receivedAt: number | null }
+/** The cross-venue rows grouped by venue pair, in the order the service lists them. */
+export function crossPairs(rows: readonly CrossRow[]): { first: string; second: string; rows: CrossRow[] }[] {
+  const groups: { first: string; second: string; rows: CrossRow[] }[] = [];
+  for (const row of rows) {
+    const group = groups.find(item => item.first === row.first && item.second === row.second);
+    if (group) group.rows.push(row); else groups.push({ first: row.first, second: row.second, rows: [row] });
+  }
+  return groups;
 }
 export interface OilPositionAccount {
   venue: string; accountId: string; accountMode: string;

@@ -2,7 +2,7 @@
 // config the service checks, and the shapes of GET /api/oil/rules. Wording follows the workbench's TradingAutoRules.tsx.
 
 export type RuleDirection = 'short' | 'long';
-export type RuleVenue = 'binance' | 'bybit';
+export type RuleVenue = 'binance' | 'bybit' | 'okx';
 export type RuleMarket = 'oil' | 'hynix';
 export interface RuleBatches { count: number; intervalMs: number }
 export interface OilRuleConfig {

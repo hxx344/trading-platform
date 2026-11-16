@@ -7,7 +7,7 @@ export const REBALANCE_TIMEOUT_MS = 60_000;
 const NAME: Record<string, string> = { SKHYUSDT: 'ADR', SKHYNIXUSDT: '正股' };
 /** How a quantity of each contract is counted: ADR in units (份), the ordinary share in shares (股). */
 const UNIT: Record<string, string> = { SKHYUSDT: '份 ADR', SKHYNIXUSDT: '股正股' };
-const VENUE: Record<string, string> = { binance: 'Binance', bybit: 'Bybit' };
+const VENUE: Record<string, string> = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX' };
 export const contractName = (symbol: string | undefined): string => symbol ? NAME[symbol] ?? symbol : '—';
 export const venueLabel = (venue: string | undefined): string => venue ? VENUE[venue] ?? venue : '—';
 export const sideName = (side: string | null | undefined): string => side === 'long' ? '多头' : side === 'short' ? '空头' : '—';

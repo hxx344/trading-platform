@@ -5,7 +5,8 @@
 //   宿主相关的状态（独立打开、连接中、未登录工作台、宿主不支持）去掉，换成「本服务没有配置资产账本」；
 // - 「在交易中心查看」按钮换成指向本服务持仓页（#/positions）的链接；
 // - 只有 panel 版式（工作台永续页用的 strip 版式本服务没有）；ANT 合计不做；
-// - 当前价差只有本页的 Binance 报价（本服务详情页的报价来自 Binance），其它交易所显示 —，与工作台无报价时一致；
+// - 当前价差取自同页「多交易所对比」各交易所的读数（MonitorExchanges.tsx onSpreads，原油价差、海力士溢价率），与工作台宿主
+//   的 oilSpreads / hynixSpreads 相同；对比表还没读到的交易所显示 —；
 // - 本服务详情页没有右侧栏，面板放在图表下方（工作台窄屏时也排在主栏下方）。
 import { useEffect, useState, type ReactNode } from 'react';
 import { ArrowUpRight, Link2 } from 'lucide-react';

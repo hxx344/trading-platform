@@ -1,17 +1,17 @@
 // 价格图上的成交标记与「套利成交」面板（A-5），照工作台 modules/monitor/app/spread-chart.tsx（提交 7745181）的 TradeMark、
 // TradePanel 与 lib/hub-fills.ts 的 useHubFills。与工作台的差异：
 // - 成交从本服务 /api/asset/fills?market=… 读（use-live-resource.ts），代替工作台经 iframe 桥接向宿主要数据：有范围在读
-//   （pending）时每 5 秒读一次，连续最多 36 次（3 分钟）后回到每 5 分钟（工作台 hub-fills-contract.ts 的 FILLS_FOLLOW_UP_MS、
-//   FILLS_MAX_FOLLOW_UPS、FILLS_REFRESH_MS）；pending 结束后下一轮 pending 重新有 36 次；
+//   （pending）且本次读取成功时每 5 秒跟读一次，连续最多 36 次（3 分钟）后回到每 5 分钟；读取失败或不再 pending 立即回到
+//   每 5 分钟；每次例行读取重新计数（规则在 monitor-trades.ts followUpStep，照工作台 hub-fills-contract.ts createFillsPoller）；
 // - 服务没有资产账本（404）时面板只显示一行说明，图上不画标记；
 // - Anthropic 的原生来源覆盖说明不做（A-5 不做 anthropic）。
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { ApiError } from './api.ts';
 import { useLiveResource } from './use-live-resource.ts';
-import { TRADE_TEXT, TRADE_TYPES, emptyFillsView, fillItems, fillsStatusText, spreadText, summarizeTradeEvents, tradeDetailLines, type FillsView, type SpreadTradeMarker, type TradeSummary, type TradeType } from './monitor-trades.ts';
+import { FILLS_FOLLOW_UP_MS, FILLS_REFRESH_MS, FOLLOW_UP_IDLE, TRADE_TEXT, TRADE_TYPES, emptyFillsView, fillsPending, followUpStep, fillItems, fillsStatusText, spreadText, summarizeTradeEvents, tradeDetailLines, type FillsView, type SpreadTradeMarker, type TradeSummary, type TradeType } from './monitor-trades.ts';
 import type { FillMarket, HubFills } from '../../src/asset/fills-types.ts';
 
-export const FILLS_TIMEOUT_MS = 20_000, FILLS_REFRESH_MS = 300_000, FILLS_FOLLOW_UP_MS = 5_000, FILLS_MAX_FOLLOW_UPS = 36;
+export const FILLS_TIMEOUT_MS = 20_000;
 const beijingFormatter = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 export const beijing = (time: number | string) => beijingFormatter.format(new Date(time));
 const markerText = ({ value, unit }: SpreadTradeMarker) => spreadText(value, unit);
@@ -19,16 +19,15 @@ const markerText = ({ value, unit }: SpreadTradeMarker) => spreadText(value, uni
 /** Successful reads replace the snapshot; a failed read keeps the last one, marked retained. */
 export function useFills(market: FillMarket, onExpired: () => void): FillsView {
   const [followUp, setFollowUp] = useState(false);
-  const pendingSince = useRef<number | null>(null);
+  const step = useRef(FOLLOW_UP_IDLE);
   const live = useLiveResource<HubFills>(`/api/asset/fills?market=${market}`, { intervalMs: followUp ? FILLS_FOLLOW_UP_MS : FILLS_REFRESH_MS, timeoutMs: FILLS_TIMEOUT_MS, onExpired });
-  const data = live.data;
-  // While a scope is still reading, read again every few seconds for at most 3 minutes; then back to the slow refresh.
+  const data = live.data, { receivedAt, error } = live;
+  // Every reply changes receivedAt (success) or the error object (failure); a failure keeps the old data, so it is judged by error.
   useEffect(() => {
-    const pending = !!data?.exchanges.some(exchange => exchange.accounts.some(account => account.scopes.some(scope => scope.status === 'loading' || scope.refreshing)));
-    if (!pending) { pendingSince.current = null; setFollowUp(false); return; }
-    pendingSince.current ??= Date.now();
-    setFollowUp(Date.now() - pendingSince.current < FILLS_MAX_FOLLOW_UPS * FILLS_FOLLOW_UP_MS);
-  }, [data]);
+    if (receivedAt === null && error === null) return;
+    step.current = followUpStep(step.current, { ok: error === null, pending: fillsPending(data) });
+    setFollowUp(step.current.follow);
+  }, [receivedAt, error]); // once per reply: data is read with the reply it came with
   const missing = live.error instanceof ApiError && live.error.status === 404;
   const failed = live.status === 'error' || live.status === 'offline';
   return useMemo(() => missing ? emptyFillsView('missing') : data ? { status: 'ok', ...fillItems(data, Date.now(), market), retained: failed } : failed ? emptyFillsView('unavailable') : emptyFillsView('loading'), [missing, data, failed, market]);

@@ -3,8 +3,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  FILLS_STALE_AFTER_MS, MAX_FILL_ITEMS, emptyFillsView, fillItems, fillsStatusText, groupTradeEvents, spreadTradeMarkers, summarizeTradeEvents,
-  tradeDetailLines, tradeMarkers, type FillItem, type FillsView, type TradeEvent,
+  FILLS_MAX_FOLLOW_UPS, FILLS_STALE_AFTER_MS, FOLLOW_UP_IDLE, MAX_FILL_ITEMS, classifyFill, emptyFillsView, fillItems, fillsStatusText, followUpStep, groupTradeEvents,
+  spreadTradeMarkers, summarizeTradeEvents, tradeDetailLines, tradeMarkers, type FillItem, type FillsView, type FollowUpState, type TradeEvent,
 } from '../web/src/monitor-trades.ts';
 import type { Point } from '../web/src/monitor-history.ts';
 import type { Fill, HubFills } from '../src/asset/fills-types.ts';
@@ -120,4 +120,52 @@ test('the asset ledger reply is flattened per market, newest first, with stale a
   assert.equal(loading.pending, true); assert.equal(loading.items.length, 0);
   const many = fillItems(reply({ fills: Array.from({ length: MAX_FILL_ITEMS + 1 }, (_, i) => serverFill(String(i))) }), now, 'oil');
   assert.equal(many.items.length, MAX_FILL_ITEMS); assert.equal(many.truncated, true); assert.equal(many.incomplete, true);
+});
+
+test('a fill through zero is a close and an open (rebalance); a reduction is an exit; unexplained position is unknown', () => {
+  const through = fill({ side: 'sell', quantity: '5', positionBefore: '2', positionAfter: '-3' });
+  assert.deepEqual(classifyFill(through), [{ effect: 'close', quantity: '2' }, { effect: 'open', quantity: '3' }]);
+  const [rebalance] = groupTradeEvents([through], 'oil');
+  assert.equal(rebalance!.type, 'rebalance');
+  assert.ok(tradeDetailLines(oilMarkers([rebalance!])[0]!, String).some(line => line.includes('平仓 2 CL → 开仓 3 CL')), 'both halves listed, quantities not doubled');
+  const [exit] = groupTradeEvents([fill({ side: 'sell', quantity: '2', positionBefore: '2', positionAfter: '0' })], 'oil');
+  assert.equal(exit!.type, 'exit');
+  for (const unexplained of [fill({ positionBefore: null }), fill({ positionBefore: '0', positionAfter: '3' }), fill({ positionSide: 'long', side: 'sell', quantity: '3', positionBefore: '1', positionAfter: '-2' })]) {
+    assert.equal(groupTradeEvents([unexplained], 'oil')[0]!.type, 'trade');
+  }
+});
+
+test('paired legs name the spread direction from the sides of the two legs', () => {
+  const direction = (bz: 'buy' | 'sell', cl: 'buy' | 'sell') => groupTradeEvents([
+    fill({ side: cl, price: '61', positionAfter: cl === 'buy' ? '2' : '-2' }),
+    fill({ key: 'bz', symbol: 'BZUSDT', base: 'BZ', quantityUnit: 'BZ', price: '65', side: bz, positionAfter: bz === 'buy' ? '2' : '-2' }),
+  ], 'oil')[0]!.venues[0]!.direction;
+  assert.equal(direction('sell', 'buy'), '做空价差（空布伦特 / 多 WTI）');
+  assert.equal(direction('buy', 'sell'), '做多价差（多布伦特 / 空 WTI）');
+  assert.equal(direction('buy', 'buy'), '双向或同向成交');
+  assert.equal(groupTradeEvents([fill()], 'oil')[0]!.venues[0]!.direction, '单腿');
+});
+
+test('hynix paired fills give the ADR premium over one tenth of the share and the per-ADR dollar gap', () => {
+  const hour = 3_600_000;
+  const events = groupTradeEvents([
+    fill({ symbol: 'SKHYUSDT', base: 'SKHY', quantityUnit: 'SKHY', price: '55', side: 'sell', positionAfter: '-10' }),
+    fill({ key: 'ord', symbol: 'SKHYNIXUSDT', base: 'SKHYNIX', quantityUnit: 'SKHYNIX', price: '500', positionAfter: '1' }),
+  ], 'hynix');
+  assert.equal(events[0]!.venues[0]!.direction, '做空溢价（空 ADR / 多正股）');
+  assert.ok(Math.abs(events[0]!.spread! - 10) < 1e-9, '55 against 500 / 10 is a 10% premium');
+  const [marker] = tradeMarkers('hynix', events, [{ ...point(0), time: start - hour }]);
+  assert.equal(marker!.basis, '成交溢价率'); assert.ok(Math.abs(marker!.usd! - 5) < 1e-9, '55 − 500 / 10');
+});
+
+test('follow-ups run only after successful pending replies, stop after 36 or on failure, and restart after a regular read', () => {
+  const run = (replies: { ok: boolean; pending: boolean }[], from: FollowUpState = FOLLOW_UP_IDLE) => replies.reduce(followUpStep, from);
+  assert.deepEqual(run([{ ok: true, pending: true }]), { count: 1, follow: true });
+  assert.deepEqual(run([{ ok: true, pending: true }, { ok: true, pending: false }]), FOLLOW_UP_IDLE);
+  // A failed read keeps the old (pending) data on screen but must not keep the 5-second cadence.
+  assert.deepEqual(run([{ ok: true, pending: true }, { ok: false, pending: true }]), FOLLOW_UP_IDLE);
+  const capped = run(Array.from({ length: FILLS_MAX_FOLLOW_UPS + 1 }, () => ({ ok: true, pending: true })));
+  assert.deepEqual(capped, { count: FILLS_MAX_FOLLOW_UPS, follow: false }, 'the reply after the 36th follow-up returns to the regular cadence');
+  // The next reply arrives from the regular 5-minute read and gets a fresh budget, as the workbench's run() resets it.
+  assert.deepEqual(followUpStep(capped, { ok: true, pending: true }), { count: 1, follow: true });
 });

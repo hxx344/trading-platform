@@ -1,10 +1,16 @@
-// Copied from project_aggregation modules/asset/lib/positions-values.ts at 7745181 (same as 0014655), unchanged.
+// Copied from project_aggregation modules/asset/lib/positions-values.ts at 7745181 (same as 0014655). Added: the typed
+// PositionsPermissionError (A-5 review), so the fill refresh can stop on a key with write permission; its message is POSITIONS_FAILED.
 import type { Position } from './positions-types.ts';
 import { createHash } from 'node:crypto';
 import { decimal, POSITIONS_INVALID } from './positions-decimal.ts';
 export { decimal, POSITIONS_INVALID } from './positions-decimal.ts';
 
 export const POSITIONS_FAILED = '仓位读取失败，请检查连接、读取权限及服务器时间；已保留上次完整快照';
+/** The key is not read-only. The message stays POSITIONS_FAILED; callers tell it apart by type or `code`, never by upstream text. */
+export class PositionsPermissionError extends Error {
+  readonly code = 'POSITIONS_PERMISSION';
+  constructor() { super(POSITIONS_FAILED); this.name = 'PositionsPermissionError'; }
+}
 export function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(POSITIONS_INVALID);
   return value as Record<string, unknown>;

@@ -90,6 +90,23 @@ export function fillItems(data: HubFills, now: number, market: FillMarket): Omit
   return { generatedAt: data.generatedAt, lookbackStart: data.lookbackStart, pending, incomplete, truncated, coverage, items };
 }
 
+// ---- hub-fills-contract.ts createFillsPoller (follow-up rule) ----
+export const FILLS_FOLLOW_UP_MS = 5_000, FILLS_REFRESH_MS = 300_000, FILLS_MAX_FOLLOW_UPS = 36;
+/** `follow`: the next read comes after FILLS_FOLLOW_UP_MS instead of FILLS_REFRESH_MS; `count`: follow-ups since the last regular read. */
+export type FollowUpState = { count: number; follow: boolean };
+export const FOLLOW_UP_IDLE: FollowUpState = { count: 0, follow: false };
+export const fillsPending = (data: HubFills | null) => !!data?.exchanges.some(exchange => exchange.accounts.some(account => account.scopes.some(scope => scope.status === 'loading' || scope.refreshing)));
+/**
+ * One reply, as the workbench poller's onReply: follow up only after a successful reply that is still pending, at most
+ * FILLS_MAX_FOLLOW_UPS times in a row; a failed or settled reply goes back to the regular cadence. A reply that arrives
+ * while not following came from a regular read, which restarts the count (the workbench's run() resets it every 5 minutes).
+ */
+export function followUpStep(state: FollowUpState, reply: { ok: boolean; pending: boolean }): FollowUpState {
+  if (!reply.ok || !reply.pending) return FOLLOW_UP_IDLE;
+  const count = state.follow ? state.count : 0;
+  return count < FILLS_MAX_FOLLOW_UPS ? { count: count + 1, follow: true } : { count, follow: false };
+}
+
 // ---- trades.mjs ----
 export const TRADE_GAP_MS = 10 * 60_000;
 export const tradeDate = (time: string) => new Date(Date.parse(time) + 8 * 3_600_000).toISOString().slice(0, 10);
@@ -322,7 +339,7 @@ export const tradeMarkers = (market: FillMarket, events: TradeEvent[], points: P
   : spreadTradeMarkers(events, points, { intervalMs: HOUR_MS, rightPerUnit: 10, tradedBasis: '成交溢价率', chartBasis: '图表溢价率' });
 /** The panel text of each market: oil's from oil-chart-config.ts, Hynix's from HYNIX_SPREAD_CHART. */
 export const TRADE_TEXT: Record<FillMarket, { priceUnit: string; chartLabel: string; chartNote: string; metricName: string }> = {
-  oil: { priceUnit: '/桶', chartLabel: '图表同时刻价差', chartNote: '最近 15 分钟 K 线', metricName: '价差' },
+  oil: { priceUnit: '/桶', chartLabel: '图表同时刻价差', chartNote: '15 分钟 K 线收盘，未收盘 K 线为未知', metricName: '价差' },
   hynix: { priceUnit: '', chartLabel: '图表同小时溢价率', chartNote: '小时收盘，未收盘小时为未知', metricName: '溢价率' },
 };
 

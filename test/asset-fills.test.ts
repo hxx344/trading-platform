@@ -2,7 +2,7 @@
 // (src/asset/fills-service.ts): no owner (connections and fill_cache have no owner column; the owner-isolation checks
 // are left out), the database is passed as a getter and the credential opener is synchronous with the connection name as
 // its context; the ANT market and identity tests, the diagnostics test and the route test (its own test in
-// asset-positions-http.test.ts) are left out; the market loops cover oil and hynix, and the cooldown test reads hynix
+// asset-positions-store.test.ts) are left out; the market loops cover oil and hynix, and the cooldown test reads hynix
 // where the workbench read ANT; the check against the trading center's normalizer (server/asset-fills.mjs, not in this
 // repository) is left out. Every read is a fake reader or fetch; nothing connects to an exchange.
 import test from 'node:test';
@@ -11,12 +11,12 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { openAssetDb } from '../src/asset/db.ts';
-import { createFillsService } from '../src/asset/fills-service.ts';
+import { FILLS_PERMISSION, createFillsService } from '../src/asset/fills-service.ts';
 import { readFills } from '../src/asset/fills-readers.ts';
 import { FillConflict, mergeFills, replayFills } from '../src/asset/fills-replay.ts';
 import { CYCLE_LOOKBACK_MS } from '../src/asset/positions-cycle.ts';
 import { historyContext } from '../src/asset/positions-history.ts';
-import { position } from '../src/asset/positions-values.ts';
+import { PositionsPermissionError, position } from '../src/asset/positions-values.ts';
 import type { HubFills, ReadFill } from '../src/asset/fills-types.ts';
 import type { Position } from '../src/asset/positions-types.ts';
 import type { Credentials } from '../src/asset/validation.ts';
@@ -410,6 +410,33 @@ test('position read failure still exposes history with unknown replay and does n
   await service.read(() => f.database, f.unseal); await service.idle();
   const result = scope(await service.read(() => f.database, f.unseal));
   assert.equal(result.fills.length, 1); assert.equal(result.fills[0].positionBefore, null); assert.equal(result.fetchedAt, null); assert.equal(result.status, 'error');
+  // A transport-style snapshot failure is not the permission refusal below.
+  assert.notEqual(result.error, FILLS_PERMISSION);
+});
+
+test('a key that fails the read-only check reads no history, drops every stored scope of the credential and says so', async t => {
+  const f = fixture(); t.after(() => f.database.close()); await f.save();
+  let denied = false, historyReads = 0;
+  const service = createFillsService({ now: () => clock, read: async () => { if (denied) throw new PositionsPermissionError(); return [held('1')]; },
+    fills: async () => { historyReads++; return [fill('1', at - minute - 1, 'buy', '1')]; } });
+  let clock = at;
+  await service.read(() => f.database, f.unseal); await service.idle();
+  await service.read(() => f.database, f.unseal, 'hynix'); await service.idle();
+  const rows = async () => (await f.database.prepare('SELECT scope FROM fill_cache').all()).results.length;
+  assert.ok(await rows() >= 2, 'both markets stored before the refusal');
+  assert.equal(scope(await service.read(() => f.database, f.unseal)).fills.length, 1);
+  const before = historyReads;
+  denied = true; clock += 5 * minute;
+  await service.read(() => f.database, f.unseal); await service.idle();
+  assert.equal(historyReads, before, 'no history read with a key that is not read-only');
+  const result = scope(await service.read(() => f.database, f.unseal));
+  assert.equal(result.status, 'error'); assert.equal(result.error, FILLS_PERMISSION); assert.deepEqual(result.fills, []);
+  assert.equal(await rows(), 0, 'stored fills of every market and scope of that credential are deleted');
+  // A process restart has nothing to restore either.
+  const restarted = createFillsService({ now: () => clock, read: async () => { throw new PositionsPermissionError(); }, fills: async () => { historyReads++; return []; } });
+  const cold = scope(await restarted.read(() => f.database, f.unseal)); await restarted.idle();
+  assert.deepEqual(cold.fills, []); assert.equal(historyReads, before);
+  assert.equal(scope(await restarted.read(() => f.database, f.unseal)).error, FILLS_PERMISSION);
 });
 
 test('scope cap replays before trimming and response cap keeps the globally newest 5000', async t => {

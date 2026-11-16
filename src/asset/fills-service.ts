@@ -8,7 +8,10 @@
 //   cannot be written or read (a read-only file) costs only the next cold read a full history read, as in the workbench;
 // - the ANT market and its attribution (accountIdentity, attributionVersion, orderId backfill) are not ported, and the
 //   local diagnostics endpoint and its metrics are left out;
-// - the fetch every reader uses is injectable (tests).
+// - the fetch every reader uses is injectable (tests);
+// - a position snapshot that fails the read-only check (PositionsPermissionError) stops the refresh: no history is read
+//   with that key, every stored scope of the credential is deleted and the scope answers FILLS_PERMISSION. The workbench
+//   (hub-fills.ts 189-192) treats it like any snapshot failure and still reads the history.
 import type { Credentials } from './validation.ts';
 import { parseConnection } from './validation.ts';
 import { POSITIONS_CATALOG } from './positions-catalog.ts';
@@ -18,6 +21,7 @@ import { connectionRow, connectionRows, defaultRead, revisionOf, sourceAccounts 
 import type { DatabaseSource, Fetcher, SourceAccount, Unseal } from './positions-service.ts';
 import { CYCLE_LOOKBACK_MS } from './positions-cycle.ts';
 import { MAX_REQUESTS } from './positions-history.ts';
+import { PositionsPermissionError } from './positions-values.ts';
 import { fillsSupported, readFills } from './fills-readers.ts';
 import type { FillsRequest } from './fills-readers.ts';
 import { FillConflict, fillsNewestFirst, mergeFills, replayFills } from './fills-replay.ts';
@@ -27,6 +31,8 @@ import type { FillMarket, FillsScope, HubFills, ReadFill } from './fills-types.t
 const TTL = 5 * 60_000, RETRY = 60_000, IDLE = 15 * 60_000, DEADLINE = 45_000, OVERLAP = 10 * 60_000;
 const SKEW_RETRY = 30_000, MAX_AUTO_RETRIES = 10;
 export const FILLS_FAILED = '成交读取失败，请检查连接、读取权限及服务器时间；已保留上次数据';
+/** A-5 review: the key has write permission. Fixed text; the stored fills of the account are dropped. */
+export const FILLS_PERMISSION = '此连接不是只读 API Key，已停止读取成交并清除缓存；请换成只读 Key 后重新连接';
 const CONFLICT = '成交记录存在冲突，暂时无法更新';
 const UNSUPPORTED: Record<FillMarket, string> = { oil: '此交易所或产品范围暂不支持原油成交读取', hynix: '此交易所或产品范围暂不支持海力士成交读取' };
 type ReadPositions = (credentials: Credentials, scope: string, signal: AbortSignal, fetcher: Fetcher) => Promise<Position[]>;
@@ -112,6 +118,9 @@ export function createFillsService(options: FillsServiceOptions = {}) {
   function forget(database: DatabaseSource, account: string, slot: string, revision: string) {
     try { database()?.prepare('DELETE FROM fill_cache WHERE account = ? AND scope = ? AND revision = ?').bind(account, slot, revision).run(); } catch { /* retried on the next read */ }
   }
+  function forgetAccount(database: DatabaseSource, account: string, revision: string) {
+    try { database()?.prepare('DELETE FROM fill_cache WHERE account = ? AND revision = ?').bind(account, revision).run(); } catch { /* retried on the next read */ }
+  }
   /** Stored scopes of one market for configured accounts that are not in memory; rows of replaced or removed credentials are deleted. */
   function restore(database: DatabaseSource, accounts: SourceAccount[], market: FillMarket) {
     const restored = new Map<string, Stored>();
@@ -193,7 +202,12 @@ export function createFillsService(options: FillsServiceOptions = {}) {
             positions = await (options.read ?? defaultRead)(credentials, entry.scope.id, abort.signal, fetcher);
             if (!valid()) throw new Error(FILLS_FAILED);
             entry.snapshotOkAt = snapshotStart; entry.snapshotHealthy = true;
-          } catch { entry.snapshotHealthy = false; if (abort.signal.aborted) throw new Error(FILLS_FAILED); }
+          } catch (error) {
+            entry.snapshotHealthy = false;
+            // Unlike the workbench (hub-fills.ts reads history anyway), a key that fails the read-only check reads nothing more.
+            if (error instanceof PositionsPermissionError) throw error;
+            if (abort.signal.aborted) throw new Error(FILLS_FAILED);
+          }
           if (!valid()) throw new Error(FILLS_FAILED);
           // This local completion time only anchors older windows; the newest query has no local upper bound.
           const snapshotAt = Math.max(snapshotStart, now());
@@ -236,9 +250,18 @@ export function createFillsService(options: FillsServiceOptions = {}) {
           entry.cacheInvalidated = true;
           forget(database, account.key, slotOf(entry.market, entry.scope.id), entry.revision);
         }
+        const denied = error instanceof PositionsPermissionError;
+        if (denied) {
+          // Every stored scope of this credential goes, not only this one; nothing read with it is kept or shown.
+          entry.cacheInvalidated = true; entry.raw = []; entry.cursor = null; entry.historyCursor = null;
+          forgetAccount(database, account.key, entry.revision);
+        }
         let still = false;
         try { still = current(database, account, entry.revision); } catch { /* the file is gone */ }
-        if (entries.get(key) === entry && still) {
+        if (entries.get(key) === entry && still && denied) {
+          entry.scope = { ...entry.scope, status: 'error', fills: [], truncated: false, coverageStart: null, coverageEnd: null, error: FILLS_PERMISSION };
+          entry.retryAt = now() + RETRY;
+        } else if (entries.get(key) === entry && still) {
           entry.scope = { ...entry.scope, status: error instanceof FillConflict ? 'error' : entry.scope.fetchedAt ? 'stale' : 'error',
             error: error instanceof FillConflict ? CONFLICT : FILLS_FAILED };
           entry.retryAt = now() + RETRY;
@@ -304,7 +327,9 @@ export function createFillsService(options: FillsServiceOptions = {}) {
         }),
       }));
       for (const [key, entry] of entries) if (entry.market === market && !keep.has(key)) remove(key, entry);
-      // The workbench yields to its database here; a connection changed meanwhile fails this answer.
+      // The workbench awaits its asynchronous database here and re-checks the connections. With this synchronous database
+      // the re-check below only covers writes already queued as microtasks; a replaced key is kept out by the revision in
+      // every cache key and by the current() checks before and after each refresh, not by this yield.
       await Promise.resolve();
       const latest = connectionRows(database());
       for (const account of accounts) {

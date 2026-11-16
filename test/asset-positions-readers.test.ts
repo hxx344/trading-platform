@@ -1,12 +1,14 @@
 // Copied from project_aggregation modules/asset/tests/positions-readers.test.ts at 7745181; only the imports point at this
 // repository's copies (src/asset/positions-readers.ts, sources/aster.ts asterGet) and Promise.withResolvers (ES2024, not in
-// this repository's tsconfig lib) is a local helper. Every read goes to a fake fetch.
+// this repository's tsconfig lib) is a local helper. Every read goes to a fake fetch. Added (A-5 review): every exchange's
+// read-only refusal throws PositionsPermissionError and sends no position request after the permission read.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import { Wallet } from 'ethers';
 import { positionsGet, readBinancePositions, readBybitPositions, readOkxPositions, readAsterPositions } from '../src/asset/positions-readers.ts';
 import { asterGet } from '../src/asset/sources/aster.ts';
+import { PositionsPermissionError } from '../src/asset/positions-values.ts';
 function withResolvers() { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done; }); return { promise, resolve }; }
 
 const c = { apiKey: 'synthetic-key', apiSecret: 'synthetic-secret' };
@@ -344,4 +346,33 @@ test('read allowlists and sanitized transport errors prevent writes, redirects, 
   await assert.rejects(readBinancePositions(c, redirect));
   const badJson = (async () => new Response('PRIVATE ' + c.apiSecret)) as typeof fetch;
   await assert.rejects(readBinancePositions(c, badJson), error => error instanceof Error && !error.message.includes(c.apiSecret));
+});
+
+// A-5 review: each exchange refuses a key with any write permission before asking for positions.
+const refused = async (read: (fetcher: typeof fetch) => Promise<unknown>, answer: (url: URL) => unknown, label: string) => {
+  const paths: string[] = [];
+  await assert.rejects(read(mock(url => { paths.push(url.pathname); return answer(url); })), error => error instanceof PositionsPermissionError && error.code === 'POSITIONS_PERMISSION', label);
+  assert.equal(paths.length, 1, `${label}: only the permission read is sent (${paths.join(', ')})`);
+};
+
+test('Binance refuses every write permission and a missing read permission before reading positions', async () => {
+  for (const scope of ['um', 'pm-um'] as const) {
+    for (const key of writes) await refused(f => readBinancePositions(c, f, undefined, scope), () => ({ ...permissions(), [key]: true }), `${scope} ${key}`);
+    for (const key of writes) await refused(f => readBinancePositions(c, f, undefined, scope), () => { const value: Record<string, unknown> = permissions(); delete value[key]; return value; }, `${scope} ${key} missing`);
+    for (const key of ['enableFixApiTrade', 'enablePortfolioMarginTrading']) await refused(f => readBinancePositions(c, f, undefined, scope), () => ({ ...permissions(), [key]: true }), `${scope} ${key}`);
+    await refused(f => readBinancePositions(c, f, undefined, scope), () => ({ ...permissions(), enableReading: false }), `${scope} enableReading`);
+  }
+});
+
+test('Bybit refuses a key whose readOnly is not 1 before reading positions', async () => {
+  for (const readOnly of [0, '0', null, 2]) {
+    await refused(f => readBybitPositions(bybit, 'linear-usdt', f), () => ({ retCode: 0, result: { readOnly } }), `readOnly ${readOnly}`);
+  }
+  await refused(f => readBybitPositions(bybit, 'linear-usdt', f), () => ({ retCode: 0, result: {} }), 'readOnly missing');
+});
+
+test('OKX refuses a key that is not read_only or a config that is not a single row before reading positions', async () => {
+  for (const data of [[{ perm: 'read_only,trade' }], [{ perm: 'trade' }], [{}], [], [{ perm: 'read_only' }, { perm: 'read_only' }]]) {
+    await refused(f => readOkxPositions(okx, 'SWAP', f), () => ({ code: '0', data }), JSON.stringify(data));
+  }
 });

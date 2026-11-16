@@ -241,8 +241,9 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
       for (const [key, entry] of entries) {
         if (!keep.has(key) || now() - entry.touchedAt > IDLE) { stop(entry); entries.delete(key); }
       }
-      // Never return the old account snapshot if a connection changed while the reads were starting (the workbench
-      // yields to its database here). The next poll rebuilds from current revisions.
+      // The workbench awaits its asynchronous database here and re-checks the connections. With this synchronous database
+      // the re-check below only covers writes already queued as microtasks; a replaced key is kept out by the revision in
+      // every cache key and by the current() checks before and after each refresh, not by this yield.
       await Promise.resolve();
       const latest = connectionRows(database());
       for (const account of accounts) {

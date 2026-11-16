@@ -111,7 +111,7 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
 - 服务改为读写打开 `asset.sqlite`（仍是首次用到且文件存在时才打开；文件不存在 = 未导入，写接口回 409“尚未导入资产账本”）。打开时 `CREATE TABLE IF NOT EXISTS sync_locks(id INTEGER PRIMARY KEY CHECK(id = 1), expires INTEGER NOT NULL, token TEXT NOT NULL)`（单用户，去掉 `owner` 列，固定一行）。库文件或其 `-wal`/`-shm` 不归服务账户、SQLite 报不可写（READONLY / PERM / CANTOPEN）时，读接口照常（退回只读打开），写接口回 409 并说明“资产库不可写……请把它们改回服务账户所有（chown）并可写后重试”；打开时碰上导入正在写（BUSY）同样只读打开，但写接口报“资产正在更新，请稍后重试”，下一次写入重新打开。服务连接的 `busy_timeout` 为 1 秒（node:sqlite 同步等待，会挡住同进程的 ADL 与划转），导入连接仍为 5 秒。
 - 同步锁照搬工作台 `sync-lock.ts`：每次取锁一个随机令牌，TTL 120 s、每 30 s 续期、最长持有 600 s；忙时报“资产正在更新，请稍后重试”（409）；每次写入在一个 `BEGIN IMMEDIATE` 事务里先核对令牌未过期才写，否则报“资产更新超时或已被其他操作接替，本次结果未保存”。随机数用 `node:crypto`。
 - **与导入的竞争**（工作台没有这一情形）：取锁时记下 `settings.import-info` 的原值，每次写入事务里同时核对它没变；导入在锁持有期间整体替换了账本时，本次写入作废并报“资产账本刚被重新导入，本次修改未保存，请刷新后重试”。导入本身不取锁（导入写入是单个事务，替换后旧锁令牌照常过期）。
-- 每次写入后照工作台 `snapshot()` 写当天（北京时间）的日快照 `snapshots(date='YYYY-MM-DD')`，口径用已复制的 `snapshotValues`、`configuredExchanges`、`embeddedWithdrawals`；本服务没有持仓缓存（A-5），快照不带 `positions`。
+- 每次写入后照工作台 `snapshot()` 写当天（北京时间）的日快照 `snapshots(date='YYYY-MM-DD')`，口径用已复制的 `snapshotValues`、`configuredExchanges`、`embeddedWithdrawals`；A-2 时本服务没有持仓缓存，快照不带 `positions`；自 A-5 起经持仓缓存的 `peek` 带 `positions`（不发起读取，见 A-5 节）。
 
 **写接口**（都要登录；沿用现有 POST 的页面请求标记与 JSON 检查；本服务只有 POST，删除与修改也用 POST；输入严格校验、拒绝未知字段，规则与工作台 zod 规则逐条相同，不引入 zod；成功都返回新的 `/api/asset/ledger` 应答）：
 
@@ -162,7 +162,7 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
 
 **对照的工作台文件（`project-aggregation` 提交 `7745181`；资产库与 `0014655` 相同）**
 
-- 后端：`modules/asset/lib/hub-positions.ts`、`hub-positions-readers.ts`、`hub-positions-catalog.ts`、`hub-positions-values.ts`、`hub-positions-types.ts`、`hub-positions-cycle.ts`、`hub-positions-cycle-readers.ts`、`hub-positions-history.ts`、`hub-positions-evidence.ts`、`hub-fills.ts`、`hub-fills-readers.ts`、`hub-fills-replay.ts`、`hub-fills-types.ts`、`daily-positions.ts`、`store.ts`（断开连接清成交缓存）、`drizzle/0002_fill_cache.sql`；Variational 持仓（`variational-python.ts`、`scripts/variational-balance.py`）与 RH Lighter 持仓（`sources/rh-lighter.ts`）。
+- 后端（`modules/asset/` 下）：`lib/hub-positions.ts`、`lib/positions-readers.ts`、`lib/positions-catalog.ts`、`lib/positions-values.ts`、`lib/positions-decimal.ts`、`lib/positions-types.ts`、`lib/positions-cycle.ts`、`lib/positions-cycle-readers.ts`、`lib/positions-history.ts`、`lib/positions-evidence.ts`、`lib/hub-fills.ts`、`lib/hub-fills-readers.ts`、`lib/hub-fills-replay.ts`、`lib/hub-fills-types.ts`、`lib/daily-positions.ts`、`lib/store.ts`（断开连接清成交缓存）、`drizzle/0002_fill_cache.sql`；Variational 持仓（`lib/variational-python-client.ts`、`scripts/variational-diagnostic.py`）与 RH Lighter 持仓（`lib/rh-lighter.ts`）。
 - 接口：`app/api/hub/positions`、`app/api/hub/fills` 的路由（参数校验与 400/503 文案）。
 - 页面：`src/TradingPositions.tsx` 与 `src/trading-center.css`（持仓页）；`modules/monitor/app/related-positions.tsx`、`spread-chart.tsx`、`oil-panel.tsx` 及其依赖（关联持仓、成交标记）。
 
@@ -195,6 +195,16 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
   - 只有本服务一个来源（工作台汇总多个 Asset 项目），来源名固定为「资产账本」，所以去掉了来源筛选和「（来源 n）」区分；
   - 页面直接读本服务接口，代替 iframe 桥接；
   - 本服务的监控详情没有右侧栏，关联交易放在图表下方。
+- **与工作台不同的安全口径**（审查后修改）：持仓快照的只读权限校验失败（Binance 任一写权限或缺读权限、Bybit `readOnly≠1`、OKX `perm≠read_only` 或 config 不是单条）时：
+  - 读取器抛带类型的 `PositionsPermissionError`（`code` 为 `POSITIONS_PERMISSION`，文案仍是 `POSITIONS_FAILED`）；
+  - 成交刷新随即中止，不再用该凭据读 85 天历史，并删除该凭据在 `fill_cache` 里所有市场、所有范围的行；
+  - 该范围回应 `status: 'error'`，配固定文案 `FILLS_PERMISSION`，不回显上游内容，与网络失败的 `FILLS_FAILED` 区分；
+  - 工作台 `hub-fills.ts` 第 189–192 行把它当普通快照失败，仍会读历史。
+- **Binance 请求权重估算**（按读取器实际发出的请求估算，未在真实账户上实测）：
+  - 本轮盈亏统计：每个持仓约 455 / 5 分钟（85 天成交、资金费与收入分段读取）；
+  - 成交冷读：约 130 / 范围；之后的增量读取远小于此；
+  - 持仓页：每 5 秒一次读接口，服务端缓存命中时为 0，缓存过期后约 5；
+  - 这些都按出口 IP 计。与原油执行账户、同机的工作台共用出口 IP 时三者叠加，持仓多时注意 Binance 每分钟权重上限。
 - **没做（登记）**：
   - Anthropic（ANT）的成交读取、执行归属与关联持仓合计：`fillsQueryMarket` 只接受 `oil` / `hynix`，Anthropic 详情不画标记；
   - A08 留到下一批；A14 不迁移。

@@ -2,7 +2,8 @@
 // Changes: signing and response imports point at src/vendor and ./sources; the Aster signature uses this repository's
 // src/aster/eip712.ts signAsterMessage (the same EIP-712 domain and Message type ethers' signTypedData signs, see
 // ./sources/aster.ts) instead of an ethers Wallet. Hosts, the read-only endpoint allowlist, the permission checks,
-// timeouts, limits, catalogs and messages are unchanged.
+// timeouts, limits, catalogs and messages are unchanged, except that a failed permission check throws the typed
+// PositionsPermissionError (same message) so the fill refresh can stop (A-5 review; the workbench throws a plain Error).
 import { binanceSignedQuery } from '../vendor/binance.mjs';
 import { bybitAuthHeaders } from '../vendor/bybit.mjs';
 import { okxAuthHeaders } from '../vendor/okx.mjs';
@@ -13,7 +14,7 @@ import { signAsterMessage } from '../aster/eip712.ts';
 import type { BinanceCredential, BybitCredential } from './sources/exchanges.ts';
 import type { OkxCredential } from './sources/okx.ts';
 import type { Position } from './positions-types.ts';
-import { absolute, decimal, isZero, multiplyDecimals, optionalDecimal, position, positionId, record, rows, text, timestamp, uniquePositions, POSITIONS_FAILED, POSITIONS_INVALID } from './positions-values.ts';
+import { absolute, decimal, isZero, multiplyDecimals, optionalDecimal, position, positionId, record, rows, text, timestamp, uniquePositions, POSITIONS_FAILED, POSITIONS_INVALID, PositionsPermissionError } from './positions-values.ts';
 
 type Fetcher = typeof fetch;
 type Json = Record<string, unknown>;
@@ -146,7 +147,7 @@ export async function readBinancePositions(c: BinanceCredential, fetcher: Fetche
   const permissions = record(await positionsGet('binance', c, '/sapi/v1/account/apiRestrictions', new URLSearchParams(), fetcher, signal));
   const writes = ['enableWithdrawals', 'enableInternalTransfer', 'enableMargin', 'enableFutures', 'permitsUniversalTransfer', 'enableVanillaOptions', 'enableSpotAndMarginTrading'];
   if (permissions.enableReading !== true || writes.some(key => permissions[key] !== false)
-    || ['enableFixApiTrade', 'enablePortfolioMarginTrading'].some(key => Object.hasOwn(permissions, key) && permissions[key] !== false)) throw new Error(POSITIONS_FAILED);
+    || ['enableFixApiTrade', 'enablePortfolioMarginTrading'].some(key => Object.hasOwn(permissions, key) && permissions[key] !== false)) throw new PositionsPermissionError();
   const coinMargined = scope === 'cm' || scope === 'pm-cm', portfolioMargin = scope.startsWith('pm-');
   const path = portfolioMargin ? '/papi/v1/' + (coinMargined ? 'cm' : 'um') + '/positionRisk' : coinMargined ? '/dapi/v1/positionRisk' : '/fapi/v3/positionRisk';
   const data = await positionsGet('binance', c, path, new URLSearchParams(), fetcher, signal);
@@ -180,7 +181,7 @@ function normalizeBinanceInverse(data: unknown, metadata: unknown): Position[] {
 export type BybitScope = 'linear-usdt' | 'linear-usdc' | 'inverse' | 'option';
 export async function readBybitPositions(c: BybitCredential, scope: BybitScope, fetcher: Fetcher = fetch, signal?: AbortSignal): Promise<Position[]> {
   const info = record(await positionsGet('bybit', c, '/v5/user/query-api', new URLSearchParams(), fetcher, signal));
-  if (Number(info.readOnly) !== 1) throw new Error(POSITIONS_FAILED);
+  if (Number(info.readOnly) !== 1) throw new PositionsPermissionError();
   const category = scope.startsWith('linear-') ? 'linear' : scope;
   const settleCoin = scope === 'linear-usdt' ? 'USDT' : scope === 'linear-usdc' ? 'USDC' : undefined;
   const params = new URLSearchParams({ category, limit: '200', ...(settleCoin ? { settleCoin } : {}) });
@@ -218,7 +219,7 @@ export async function readBybitPositions(c: BybitCredential, scope: BybitScope, 
 
 export async function readOkxPositions(c: OkxCredential, scope: 'SWAP' | 'FUTURES', fetcher: Fetcher = fetch, signal?: AbortSignal): Promise<Position[]> {
   const config = rows(await positionsGet('okx', c, '/api/v5/account/config', new URLSearchParams(), fetcher, signal));
-  if (config.length !== 1 || config[0].perm !== 'read_only') throw new Error(POSITIONS_FAILED);
+  if (config.length !== 1 || config[0].perm !== 'read_only') throw new PositionsPermissionError();
   const data = rows(await positionsGet('okx', c, '/api/v5/account/positions', new URLSearchParams({ instType: scope }), fetcher, signal));
   const metadata = new Map<string, Json>(), result: Position[] = [];
   for (const row of data) {

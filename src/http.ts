@@ -16,6 +16,7 @@ import type { AssetStore } from './asset/store.ts';
 import type { CrossexViews } from './service/crossex.ts';
 import { AssetConflict } from './asset/sync-lock.ts';
 import { AssetInputError, INPUT_INVALID } from './asset/validation.ts';
+import { fillsQueryMarket } from './asset/fills-service.ts';
 
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_LOGIN_BYTES = 4 * 1024;
@@ -505,6 +506,19 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
           throw new ContractError(500, 'asset_unreadable', `资产账本读取失败：${reason}`);
         }
       };
+      // A-5: the workbench's app/api/hub/positions and hub/fills routes at 7745181 (their checks and messages; any failure is 503).
+      if (url.pathname === '/api/asset/positions') {
+        const version = url.searchParams.get('schemaVersion');
+        if (version !== null && version !== '1') return send(response, 400, { code: 'invalid_version', message: '不支持的仓位版本' });
+        try { return send(response, 200, await asset.positions()); }
+        catch { return send(response, 503, { code: 'unavailable', message: '仓位服务暂不可用，请稍后重试' }); }
+      }
+      if (url.pathname === '/api/asset/fills') {
+        const market = fillsQueryMarket(url.searchParams);
+        if (!market) return send(response, 400, { code: 'invalid_query', message: '不支持的成交查询参数' });
+        try { return send(response, 200, await asset.fills(market)); }
+        catch { return send(response, 503, { code: 'unavailable', message: '成交服务暂不可用，请稍后重试' }); }
+      }
       if (url.pathname === '/api/asset/period') {
         const id = url.searchParams.get('id') ?? '';
         if (!ASSET_PERIOD_ID.test(id)) return send(response, 400, { code: 'invalid_id', message: '记录编号无效' });

@@ -276,8 +276,10 @@ test('formal Python failures retain safe HTTP and challenge diagnoses without ex
 });
 
 const python = spawnSync('python3', ['--version'], { stdio: 'ignore' }).status === 0;
-test('the helper passes its own offline Python tests (python3 -I -B)', { skip: !python && 'python3 不可用' }, () => {
-  const script = fileURLToPath(new URL('./asset-sources-variational-balance.py', import.meta.url));
-  const run = spawnSync('python3', ['-I', '-B', script], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' }, timeout: 60_000 });
-  assert.equal(run.status, 0, run.stderr.split('\n').slice(-20).join('\n'));
-});
+for (const file of ['asset-sources-variational-balance.py', 'asset-sources-variational-positions.py']) {
+  test(`the helper passes its own offline Python tests: ${file} (python3 -I -B)`, { skip: !python && 'python3 不可用' }, () => {
+    const script = fileURLToPath(new URL('./' + file, import.meta.url));
+    const run = spawnSync('python3', ['-I', '-B', script], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' }, timeout: 60_000 });
+    assert.equal(run.status, 0, run.stderr.split('\n').slice(-20).join('\n'));
+  });
+}

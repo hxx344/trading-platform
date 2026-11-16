@@ -2,7 +2,8 @@
 
 Copied from project_aggregation modules/asset/tests/test_variational_diagnostic.py at 0014655, narrowed to the
 "sync-portfolio" operation the balance helper keeps: the session-only structure test is left out, success fixtures
-carry a balance, and the diagnostic operations are now among the refused stdin inputs. Run by
+carry a balance, and the diagnostic operations are now among the refused stdin inputs. Since A-5 the helper also keeps
+"sync-positions" (tested in asset-sources-variational-positions.py), so it is no longer refused. Run by
 test/asset-sources-variational.test.ts with `python3 -I -B`.
 """
 import contextlib
@@ -182,7 +183,7 @@ class HelperTests(unittest.TestCase):
                     json.dumps({"vrToken": TOKEN}).encode(),
                     *(json.dumps({"vrToken": TOKEN, "operation": operation}).encode() for operation in (
                         None, {}, [], "GET", "sync", "https://untrusted.example",
-                        "diagnose-session", "diagnose-portfolio", "sync-positions")),
+                        "diagnose-session", "diagnose-portfolio")),
                     json.dumps({"vrToken": TOKEN, "operation": "sync-portfolio", "balance": "125"}).encode(),
                     json.dumps({"vrToken": TOKEN}).encode() + b"{}", b"x" * 8193):
             opener = Opener(Response())
@@ -247,7 +248,7 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(len(opener.calls), 1)
             self.assertEqual(result["balance"], "321.125")
         opener = Opener(Response())
-        for operation in ("unexpected", None, {}, [], "diagnose-session", "diagnose-portfolio", "sync-positions"):
+        for operation in ("unexpected", None, {}, [], "diagnose-session", "diagnose-portfolio"):
             with self.assertRaises(ValueError):
                 helper.probe(TOKEN, opener, operation)
         self.assertEqual(opener.calls, [])

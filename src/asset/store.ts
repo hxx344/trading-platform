@@ -2,7 +2,8 @@
 // started before the first import serves "not imported" and picks the data up once import.ts has written it (WAL lets
 // the import commit while this connection stays open). Since A-2 it is opened read-write (one connection, so a write
 // shows in the next read) and falls back to read-only when the service cannot write it; the writes (writes.ts) run under
-// the sync lock (sync-lock.ts).
+// the sync lock (sync-lock.ts). Since A-5 it also holds the positions and fills services (positions-service.ts,
+// fills-service.ts): they read the saved connections of the open file on every use and live as long as the store.
 import { statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { assertOwnFiles, openAssetDb, type AssetDb } from './db.ts';
@@ -19,6 +20,10 @@ import { acquireSyncLock, AssetConflict, LOCK_BUSY, NOT_IMPORTED, type SyncLease
 import { parseAsterAccount, parseAsterAccountDelete, parseConnection, parseDisconnect, parseEdit, parseFx, parseWithdrawal, parseWithdrawalId } from './validation.ts';
 import { dataDirVault } from './credentials.ts';
 import * as sync from './sync.ts';
+import { createPositionsService, type PositionsServiceOptions } from './positions-service.ts';
+import { createFillsService, type FillsServiceOptions } from './fills-service.ts';
+import type { HubPositions } from './positions-types.ts';
+import type { FillMarket, HubFills } from './fills-types.ts';
 import { liveSources, type AssetSources, type SyncContext } from './sync.ts';
 import type { Fetcher } from './sources/http.ts';
 import * as writes from './writes.ts';
@@ -142,6 +147,12 @@ export interface AssetStore {
   disconnect(body: unknown): Promise<AssetLedgerView>;
   saveAsterAccount(body: unknown, editing: boolean): Promise<AssetLedgerView>;
   deleteAsterAccount(body: unknown): Promise<AssetLedgerView>;
+  /**
+   * The positions and fills of the saved connections (A-5), read-only and cached (the workbench's hub positions and
+   * fills). Before the import every account is unconfigured. A failure throws (the HTTP layer answers 503).
+   */
+  positions(): Promise<HubPositions>;
+  fills(market: FillMarket): Promise<HubFills>;
   close(): void;
 }
 /** A write refused because the service may not write the file (opened read-only). */
@@ -156,11 +167,18 @@ export interface AssetStoreOptions {
   fetch?: Fetcher;
   /** Replaces single external readers (tests). */
   sources?: Partial<AssetSources>;
+  /** Options of the positions and fills services (tests); their fetch defaults to `fetch` above. */
+  positions?: PositionsServiceOptions;
+  fills?: FillsServiceOptions;
 }
-export function createAssetStore(file: string, { now = Date.now, fetch: fetcher = fetch, sources: replaced = {} }: AssetStoreOptions = {}): AssetStore {
+export function createAssetStore(file: string, { now = Date.now, fetch: fetcher = fetch, sources: replaced = {}, positions: positionsOptions = {}, fills: fillsOptions = {} }: AssetStoreOptions = {}): AssetStore {
   const sources: AssetSources = { ...liveSources(fetcher), ...replaced };
   const vault = dataDirVault(dirname(file));
-  const context = (database: AssetDb, lease: SyncLease): SyncContext => ({ database, lease, vault, sources, now });
+  const positionsService = createPositionsService({ now, fetcher, ...positionsOptions });
+  const fillsService = createFillsService({ now, fetcher, ...fillsOptions });
+  // The daily snapshot carries the cached positions; peek never starts a read (workbench daily-positions.ts).
+  const context = (database: AssetDb, lease: SyncLease): SyncContext => ({ database, lease, vault, sources, now, positions: positionsService.peek });
+  const peek = positionsService.peek;
   // Why the open handle is read-only: the files are not the service's to write, or another writer held the file too long.
   let handle: AssetDb | null = null, opened = '', writable = false, busy = false;
   /** Which file is at the path: a file deleted and imported again is a new one, and the open handle would keep reading the deleted one. */
@@ -212,6 +230,11 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     try { return await change(database, lease); }
     // A failed release must not turn a saved change into an error; the lock then runs out after its TTL.
     finally { await lease.release().catch(() => undefined); }
+  }
+  /** The open file for the positions and fills services, read again on every use (a re-import reopens it); null before the import. */
+  async function source(): Promise<() => AssetDb | null> {
+    const found = await current();
+    return found ? () => handle : () => null;
   }
   const stamp = (info: ImportInfo) => ({ imported: true, importedAt: info.importedAt });
   async function ledger(): Promise<AssetLedgerView> {
@@ -270,12 +293,12 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     },
     async editAsset(body) {
       const input = parseEdit(body);
-      await locked(async (database, lease) => writes.editAsset(database, lease, await readLedger(database, false), input, now()));
+      await locked(async (database, lease) => writes.editAsset(database, lease, await readLedger(database, false), input, now(), peek));
       return ledger();
     },
     async editFx(body) {
       const fx = parseFx(body);
-      await locked(async (database, lease) => writes.editFx(database, lease, await readLedger(database, false), fx, now()));
+      await locked(async (database, lease) => writes.editFx(database, lease, await readLedger(database, false), fx, now(), peek));
       return ledger();
     },
     async sync() {
@@ -304,12 +327,12 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     },
     async saveWithdrawal(body, editing) {
       const input = parseWithdrawal(body);
-      await locked(async (database, lease) => writes.saveWithdrawal(database, lease, await readLedger(database, false), input, editing, now()));
+      await locked(async (database, lease) => writes.saveWithdrawal(database, lease, await readLedger(database, false), input, editing, now(), peek));
       return ledger();
     },
     async deleteWithdrawal(body) {
       const id = parseWithdrawalId(body);
-      await locked(async (database, lease) => writes.deleteWithdrawal(database, lease, await readLedger(database, false), id, now()));
+      await locked(async (database, lease) => writes.deleteWithdrawal(database, lease, await readLedger(database, false), id, now(), peek));
       return ledger();
     },
     async saveCashFlow(body) {
@@ -318,6 +341,8 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
       await locked(async (database, lease) => writes.saveCashFlow(database, lease, await loadCashFlows(database), input, now()));
       return cashFlows();
     },
-    close() { drop(); },
+    async positions() { return positionsService.read(await source(), vault.unseal); },
+    async fills(market) { return fillsService.read(await source(), vault.unseal, market); },
+    close() { positionsService.close(); fillsService.close(); drop(); },
   };
 }

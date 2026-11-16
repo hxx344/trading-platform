@@ -7,7 +7,8 @@
 ## 当前状态（v0.19.0）
 
 - 已发布：A-1 只读账本随 v0.12.0；v0.15.0 起在设置页「从工作台导入」里启用并导入账本；A-2 本地写入（编辑手动资产、汇率、出金、资金流）随 v0.16.0；A-3/A-4（凭据加密存放、交易所连接与同步、行情与汇率自动更新、从工作台导入连接）随 v0.19.0，尚未用真实交易所账户读取过。
-- 未开始：A-5（持仓与成交）、A-6（交易凭据导出、原表导入）。
+- 进行中：A-5（持仓与成交，见下文 A-5）。
+- 未开始：A-6 的原表导入（A08）；A14 交易凭据导出不迁移（见批次表）。
 - 下文 A-1 一节是当时只读批次的记录；写入入口、去掉只读提示等以 A-2 一节为准。
 
 ## 批次
@@ -18,8 +19,9 @@
 | A-2 | 本地写入：手工资产（A06）、汇率（A07）、出金（A09）、现金流（A11）、同步锁 | R3 | 完成，随 v0.16.0 发布（见下文 A-2） |
 | A-3 | 凭据与中心化交易所余额同步（A01、A02：Binance、Bybit、OKX、Gate）、行情与汇率自动更新 | R3 | 完成，随 v0.19.0 发布（见下文 A-3/A-4） |
 | A-4 | 其余数据源（Aster 多账户 A03、Hyperliquid、Lighter RH、Variational A15） | R3 | 与 A-3 同批，v0.19.0 |
-| A-5 | 持仓与成交（A04、A05） | R2 | 未开始 |
-| A-6 | 交易凭据导出（A14）、原表导入（A08） | R3 | 未开始 |
+| A-5 | 持仓与成交（A04、A05） | R2（`fill_cache` 新表按数据库结构归 R3，回滚见下文 A-5） | 进行中（见下文 A-5） |
+| A-6 | 原表导入（A08） | R3 | 未开始，下一批 |
+| — | 交易凭据导出（A14） | — | 不迁移：工作台只把只读密钥导出给交易中心的只读账本；本仓库没有这个账本，原油盈亏直接读执行账户，资产与交易同在一个进程 |
 
 ## A-1：只读账本与计算口径
 
@@ -147,3 +149,34 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
 - **回滚**：`sudo bash install.sh --version v0.18.0`，配置不用改；`connections` 表与 `asset-credential.key` 旧版本不读，回退期间资产页不同步，再升级回来连接照常可用；v0.19.0 同步时写进 `aster-accounts` 的钱包地址（不是凭据）在旧版本的账本接口里会原样返回给页面。
 - 未纳入：Variational 连接诊断（`/api/connections/variational-test`）、持仓与成交（A-5）、交易凭据导出与原表导入（A-6）。
 - **Gate 错误诊断（v0.29.1，与工作台不同）**：真实账户上 Gate 总资产接口返回过 HTTP 500 与本程序未收录的 `label`，页面只显示固定代号 `API_CODE_UNKNOWN`，看不出真实错误码。现在未收录的 `label` 只要是纯大写字母单词以下划线连接、3–40 个字符（密钥、签名、地址、网址与句子都不是这个形状），就原样显示在诊断里（如 `HTTP 500 · SOME_LABEL`）供反馈；其余形状仍只显示 `API_CODE_UNKNOWN`，`message` 等字段照旧不显示。补收录文档里的 `SERVER_TIMEOUT`、`FAILED_RETRIEVE_ASSETS`；5xx 的诊断加上“请稍后重试”。回滚 `sudo bash install.sh --version v0.29.0`，不用改配置。审查记录见 [reviews/2026-11-15-gate-unlisted-label.md](reviews/2026-11-15-gate-unlisted-label.md)。
+
+## A-5：持仓与成交（A04、A05）
+
+**范围**
+
+- 服务端持仓读取与缓存：只用资产已保存的连接，只读，保留只读权限校验；新增 `GET /api/asset/positions`，含本轮盈亏（cycle）。
+- 成交读取与缓存：`asset.sqlite` 新增 `fill_cache` 表；新增 `GET /api/asset/fills?market=oil|hynix`。Anthropic（ANT）市场与归属不迁移，登记为未做。
+- 页面：资产工作区新增「持仓」页（总览与资产）；行情监控原油、海力士详情的价格图加成交标记，并加「关联持仓」（含本轮盈亏）。
+- 每日快照（`daily-positions.ts` 的口径）用持仓缓存的 peek 写入 `positions`，peek 不发起读取。
+- 不含：A08（下一批）、A14（不迁移，见批次表）、工作台的成交诊断接口与指标。
+
+**对照的工作台文件（`project-aggregation` 提交 `7745181`；资产库与 `0014655` 相同）**
+
+- 后端：`modules/asset/lib/hub-positions.ts`、`hub-positions-readers.ts`、`hub-positions-catalog.ts`、`hub-positions-values.ts`、`hub-positions-types.ts`、`hub-positions-cycle.ts`、`hub-positions-cycle-readers.ts`、`hub-positions-history.ts`、`hub-positions-evidence.ts`、`hub-fills.ts`、`hub-fills-readers.ts`、`hub-fills-replay.ts`、`hub-fills-types.ts`、`daily-positions.ts`、`store.ts`（断开连接清成交缓存）、`drizzle/0002_fill_cache.sql`；Variational 持仓（`variational-python.ts`、`scripts/variational-balance.py`）与 RH Lighter 持仓（`sources/rh-lighter.ts`）。
+- 接口：`app/api/hub/positions`、`app/api/hub/fills` 的路由（参数校验与 400/503 文案）。
+- 页面：`src/TradingPositions.tsx` 与 `src/trading-center.css`（持仓页）；`modules/monitor/app/related-positions.tsx`、`spread-chart.tsx`、`oil-panel.tsx` 及其依赖（关联持仓、成交标记）。
+
+**改动范围**
+
+- 新文件：`src/asset/positions-*.ts`、`src/asset/fills-*.ts`（逐个复制并在文件头注明来源与差异）。
+- 修改：`src/asset/db.ts`（`fill_cache` 表）、`import.ts`（导入时清空）、`sync.ts`（断开连接清缓存、快照带持仓）、`writes.ts`（快照 peek）、`store.ts`（服务生命周期）、`src/http.ts`（两个接口）、`sources/variational-python.ts`、`sources/rh-lighter.ts`、`scripts/variational-balance.py`；页面 `web/src/` 新增持仓页、改行情监控原油与海力士详情、`workspace-nav.ts`；测试与 `scripts/test.ts`。
+
+**`fill_cache` 迁移与旧版本兼容**
+
+- 结构：`fill_cache(account, scope, revision, data, updated_at, PRIMARY KEY(account, scope))`，即工作台表去掉 `owner` 列。服务以 `service` 方式打开库时 `CREATE TABLE IF NOT EXISTS`，与 A-3 加 `connections` 表相同；导入的新库直接带这张表。
+- 缓存内容可丢：表缺失、读不出或写失败只让下一次冷读取改为完整读取历史；凭据换了（revision 不同）的行在读取时删除；断开连接与重新导入时一并删除。
+- 旧版本：v0.51.0 及以前不认识这张表，也不会读写它；回滚后表留在库里不影响账本，重新升级后按 revision 校验继续使用。
+
+**回滚**
+
+`sudo bash install.sh --version v0.51.0`。不需要处理数据：`fill_cache` 只是缓存，旧版本忽略它；每日快照里多出的 `positions` 字段旧版本读取时忽略（工作台快照本就带这个字段）。

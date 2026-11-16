@@ -1,0 +1,347 @@
+// Copied from project_aggregation modules/asset/tests/positions-readers.test.ts at 7745181; only the imports point at this
+// repository's copies (src/asset/positions-readers.ts, sources/aster.ts asterGet) and Promise.withResolvers (ES2024, not in
+// this repository's tsconfig lib) is a local helper. Every read goes to a fake fetch.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
+import { Wallet } from 'ethers';
+import { positionsGet, readBinancePositions, readBybitPositions, readOkxPositions, readAsterPositions } from '../src/asset/positions-readers.ts';
+import { asterGet } from '../src/asset/sources/aster.ts';
+function withResolvers() { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done; }); return { promise, resolve }; }
+
+const c = { apiKey: 'synthetic-key', apiSecret: 'synthetic-secret' };
+const bybit = { ...c, region: 'global' as const };
+const okx = { ...c, passphrase: 'synthetic-passphrase' };
+const writes = ['enableWithdrawals', 'enableInternalTransfer', 'enableMargin', 'enableFutures', 'permitsUniversalTransfer', 'enableVanillaOptions', 'enableSpotAndMarginTrading'];
+const permissions = () => ({ enableReading: true, ...Object.fromEntries(writes.map(key => [key, false])) });
+const at = 1750000000000;
+function mock(handler: (url: URL, init: RequestInit) => unknown): typeof fetch {
+  return (async (url, init = {}) => { assert.equal(init.method, 'GET'); assert.equal(init.redirect, 'manual'); assert.equal(init.cache, 'no-store'); return Response.json(await handler(new URL(String(url)), init)); }) as typeof fetch;
+}
+const linearPosition = (positionAmt = '1.000000000000000001', positionSide = 'BOTH') => ({ symbol: 'BTCUSDT', positionAmt, positionSide, entryPrice: '90000.123456789012345678', markPrice: '95000', notional: '95000', unRealizedProfit: '-1.000000000000000001', updateTime: at });
+const linearMetadata = { symbols: [{ symbol: 'BTCUSDT', baseAsset: 'BTC', quoteAsset: 'USDT', marginAsset: 'USDT' }] };
+
+test('Binance UM and PM UM preserve precision, both hedge legs, fixed GET signature and explicit empty positions', async () => {
+  for (const scope of ['um', 'pm-um'] as const) {
+    const calls: URL[] = [];
+    const result = await readBinancePositions(c, mock((url, init) => {
+      calls.push(url);
+      if (url.pathname.endsWith('/exchangeInfo')) { assert.deepEqual(init.headers, {}); return linearMetadata; }
+      assert.equal((init.headers as Record<string, string>)['X-MBX-APIKEY'], c.apiKey);
+      const query = new URLSearchParams(url.search); const signature = query.get('signature'); query.delete('signature');
+      assert.equal(signature, createHmac('sha256', c.apiSecret).update(query.toString()).digest('hex'));
+      assert.equal(query.get('recvWindow'), '10000');
+      if (url.pathname.includes('apiRestrictions')) return permissions();
+      assert.equal(url.hostname, scope === 'um' ? 'fapi.binance.com' : 'papi.binance.com');
+      return [linearPosition('1.000000000000000001', 'LONG'), linearPosition('-2', 'SHORT'), linearPosition('0', 'BOTH')];
+    }), undefined, scope);
+    assert.equal(calls.length, 3); assert.equal(result.length, 2);
+    assert.equal(result[0].quantity, '1.000000000000000001'); assert.equal(result[0].entryPrice, '90000.123456789012345678');
+    assert.equal(result[0].unrealizedPnl, '-1.000000000000000001'); assert.equal(result[1].quantity, '2'); assert.equal(result[1].side, 'short');
+    assert.equal(result[0].quantityUnit, 'BTC'); assert.equal(result[0].pnlCurrency, 'USDT'); assert.notEqual(result[0].id, result[1].id);
+    if (scope === 'pm-um') assert.equal(result[0].marginMode, 'portfolio');
+  }
+  assert.deepEqual(await readBinancePositions(c, mock(url => url.pathname.includes('apiRestrictions') ? permissions() : [])), []);
+});
+
+test('Binance CM and PM CM preserve contract counts, face size, and coin P&L without USD conversion', async () => {
+  for (const scope of ['cm', 'pm-cm'] as const) {
+    const [result] = await readBinancePositions(c, mock(url => {
+      if (url.pathname.includes('apiRestrictions')) return permissions();
+      if (url.pathname.endsWith('/exchangeInfo')) return { symbols: [{ symbol: 'BTCUSD_PERP', baseAsset: 'BTC', quoteAsset: 'USD', marginAsset: 'BTC', contractSize: 100 }] };
+      assert.equal(url.hostname, scope === 'cm' ? 'dapi.binance.com' : 'papi.binance.com');
+      return [{ ...linearPosition('-7'), symbol: 'BTCUSD_PERP', unRealizedProfit: '-0.000000000000000001' }];
+    }), undefined, scope);
+    assert.equal(result.quantity, '7'); assert.equal(result.contractSize, '100'); assert.equal(result.notional, '700');
+    assert.equal(result.quantityUnit, '张（USD/张）'); assert.equal(result.notionalCurrency, 'USD'); assert.equal(result.pnlCurrency, 'BTC');
+  }
+});
+
+test('malformed or unauthorized Binance responses fail rather than returning flat; duplicate rows are rejected', async () => {
+  for (const payload of [{}, [{ positionAmt: null }], [{ positionAmt: 0 }], [linearPosition(), linearPosition()]]) {
+    await assert.rejects(readBinancePositions(c, mock(url => url.pathname.includes('apiRestrictions') ? permissions() : url.pathname.endsWith('/exchangeInfo') ? linearMetadata : payload)));
+  }
+  let calls = 0;
+  await assert.rejects(readBinancePositions(c, mock(() => { calls++; return { ...permissions(), enableFutures: true }; })));
+  assert.equal(calls, 1);
+});
+
+test('Binance validates only held instruments and keeps native non-ASCII symbols', async () => {
+  const unrelated = [{ symbol: '龙虾USDT', baseAsset: '龙虾', quoteAsset: 'USDT', marginAsset: 'USDT' }, { symbol: null }, { symbol: 'BAD\u0000USDT' }];
+  for (const scope of ['um', 'pm-um'] as const) {
+    const result = await readBinancePositions(c, mock(url => url.pathname.includes('apiRestrictions') ? permissions()
+      : url.pathname.endsWith('/exchangeInfo') ? { symbols: [...unrelated, ...linearMetadata.symbols, { symbol: '币安人生USDT', baseAsset: '币安人生', quoteAsset: 'USDT', marginAsset: 'USDT' }] }
+        : [linearPosition('1'), { ...linearPosition('-3'), symbol: '币安人生USDT' }]), undefined, scope);
+    assert.deepEqual(result.map(item => [item.symbol, item.side, item.quantity, item.quantityUnit]), [['BTCUSDT', 'long', '1', 'BTC'], ['币安人生USDT', 'short', '3', '币安人生']]);
+  }
+  const [inverse] = await readBinancePositions(c, mock(url => url.pathname.includes('apiRestrictions') ? permissions()
+    : url.pathname.endsWith('/exchangeInfo') ? { symbols: [...unrelated, { symbol: 'BTCUSD_PERP', baseAsset: 'BTC', quoteAsset: 'USD', marginAsset: 'BTC', contractSize: 100 }] }
+      : [{ ...linearPosition('2'), symbol: 'BTCUSD_PERP' }]), undefined, 'pm-cm');
+  assert.equal(inverse.notional, '200');
+  for (const symbol of ['BAD\u0000USDT', 'MISSINGUSDT']) {
+    await assert.rejects(readBinancePositions(c, mock(url => url.pathname.includes('apiRestrictions') ? permissions()
+      : url.pathname.endsWith('/exchangeInfo') ? { symbols: unrelated } : [{ ...linearPosition('1'), symbol }])));
+  }
+});
+
+test('Binance and Aster share the public catalog per fetcher, reload for an unseen symbol, and never cache failures', async () => {
+  let catalogs = 0, failCatalog = false, held = 'BTCUSDT';
+  const symbols = () => [...linearMetadata.symbols, { symbol: 'ETHUSDT', baseAsset: 'ETH', quoteAsset: 'USDT', marginAsset: 'USDT' }];
+  let listed = linearMetadata.symbols;
+  const fetcher = mock(url => {
+    if (url.pathname.includes('apiRestrictions')) return permissions();
+    if (url.pathname.endsWith('/exchangeInfo')) { catalogs++; return failCatalog ? { code: -1003 } : { symbols: listed }; }
+    return [{ ...linearPosition('1'), symbol: held }];
+  });
+  for (const scope of ['um', 'pm-um', 'um'] as const) await readBinancePositions(c, fetcher, undefined, scope);
+  assert.equal(catalogs, 1, 'UM and PM-UM reuse one cached catalog');
+  held = 'ETHUSDT'; listed = symbols();
+  assert.equal((await readBinancePositions(c, fetcher))[0].symbol, 'ETHUSDT'); assert.equal(catalogs, 2, 'unseen symbol forces one reload');
+  held = 'NEWUSDT'; await assert.rejects(readBinancePositions(c, fetcher)); assert.equal(catalogs, 3);
+  const fresh = mock(url => url.pathname.includes('apiRestrictions') ? permissions() : url.pathname.endsWith('/exchangeInfo') ? (catalogs++, failCatalog ? { code: -1003 } : { symbols: listed }) : [{ ...linearPosition('1'), symbol: 'BTCUSDT' }]);
+  failCatalog = true; await assert.rejects(readBinancePositions(c, fresh)); failCatalog = false;
+  await readBinancePositions(c, fresh); assert.equal(catalogs, 5, 'a failed load is retried next time');
+});
+
+const catalogScopes = ['um', 'pm-um', 'cm', 'pm-cm', 'aster'] as const;
+function catalogFixture(scope: typeof catalogScopes[number]) {
+  const inverse = scope === 'cm' || scope === 'pm-cm';
+  const instrument = inverse ? { symbol: 'BTCUSD_PERP', baseAsset: 'BTC', quoteAsset: 'USD', marginAsset: 'BTC', contractSize: 100 }
+    : { ...linearMetadata.symbols[0] };
+  const row = { ...linearPosition('2'), symbol: instrument.symbol };
+  const privateKey = '0'.repeat(63) + '1';
+  const credential = { privateKey, walletAddress: new Wallet(privateKey).address, includeSpot: false };
+  return { inverse, instrument, row, read: (fetcher: typeof fetch) => scope === 'aster'
+    ? readAsterPositions(credential, fetcher) : readBinancePositions(c, fetcher, undefined, scope) };
+}
+
+test('held catalog fields are validated before caching, so the next read recovers immediately after repair', async t => {
+  for (const scope of catalogScopes) {
+    const fixture = catalogFixture(scope);
+    const damaged: [string, unknown][] = fixture.inverse
+      ? [['quoteAsset', null], ['marginAsset', 'BAD\u0000'], ['contractSize', 0], ['contractSize', '-100'], ['contractSize', 'NaN']]
+      : [['baseAsset', null], ['quoteAsset', 'BAD\u0000'], ['marginAsset', null]];
+    for (const [field, value] of damaged) await t.test(`${scope}: ${field}=${JSON.stringify(value)}`, async () => {
+      let broken = true, loads = 0;
+      const fetcher = mock(url => {
+        if (url.pathname.includes('apiRestrictions')) return permissions();
+        if (url.pathname.endsWith('/exchangeInfo')) {
+          loads++;
+          return { symbols: [{ symbol: 'UNRELATED', baseAsset: null, quoteAsset: 'BAD\u0000', contractSize: 0 }, { symbol: null },
+            { ...fixture.instrument, ...(broken ? { [field]: value } : {}) }] };
+        }
+        return [fixture.row];
+      });
+      await assert.rejects(fixture.read(fetcher), /仓位数据不完整/);
+      assert.equal(loads, 1, 'a malformed fresh catalog is fetched only once per read');
+      broken = false;
+      const [recovered] = await fixture.read(fetcher);
+      assert.equal(recovered.symbol, fixture.instrument.symbol);
+      assert.equal(recovered.contractSize, fixture.inverse ? '100' : '1');
+      assert.equal(recovered.pnlCurrency, fixture.instrument.marginAsset);
+      assert.equal(loads, 2, 'repair is visible without waiting for the TTL');
+      await fixture.read(fetcher);
+      assert.equal(loads, 2, 'a repaired catalog is reused despite unrelated malformed entries');
+    });
+  }
+});
+
+test('a newly held malformed cached entry forces one shared reload and remains invalid after persistent damage', async t => {
+  for (const scope of catalogScopes) await t.test(scope, async () => {
+    const fixture = catalogFixture(scope);
+    const next = { ...fixture.instrument, symbol: fixture.inverse ? 'ETHUSD_PERP' : 'ETHUSDT', baseAsset: 'ETH' };
+    let held = fixture.instrument.symbol, repaired = false, loads = 0;
+    const fetcher = mock(url => {
+      if (url.pathname.includes('apiRestrictions')) return permissions();
+      if (url.pathname.endsWith('/exchangeInfo')) {
+        loads++;
+        return { symbols: [fixture.instrument, { ...next, ...(repaired ? {} : { marginAsset: null }) }] };
+      }
+      return [{ ...fixture.row, symbol: held }];
+    });
+    await fixture.read(fetcher);
+    held = next.symbol;
+    await assert.rejects(fixture.read(fetcher), /仓位数据不完整/);
+    assert.equal(loads, 2, 'the invalid cached entry triggers at most one reload');
+    repaired = true;
+    assert.equal((await fixture.read(fetcher))[0].symbol, next.symbol);
+    assert.equal(loads, 3, 'persistent malformed metadata was not cached again');
+    await fixture.read(fetcher);
+    assert.equal(loads, 3);
+  });
+});
+
+test('valid public catalogs expire at ten minutes and missing held contracts never become cached successes', async t => {
+  let now = at;
+  t.mock.method(Date, 'now', () => now);
+  for (const scope of catalogScopes) await t.test(scope, async () => {
+    const fixture = catalogFixture(scope);
+    let held = fixture.instrument.symbol, loads = 0;
+    let listed = [fixture.instrument];
+    const fetcher = mock(url => {
+      if (url.pathname.includes('apiRestrictions')) return permissions();
+      if (url.pathname.endsWith('/exchangeInfo')) { loads++; return { symbols: listed }; }
+      return [{ ...fixture.row, symbol: held }];
+    });
+    await fixture.read(fetcher);
+    now += 10 * 60_000 - 1;
+    await fixture.read(fetcher); assert.equal(loads, 1);
+    now++;
+    await fixture.read(fetcher); assert.equal(loads, 2, 'TTL boundary reloads the catalog');
+    held = fixture.inverse ? 'NEWUSD_PERP' : 'NEWUSDT';
+    await assert.rejects(fixture.read(fetcher), /仓位数据不完整/);
+    assert.equal(loads, 3, 'a missing held contract triggers one reload');
+    listed = [{ ...fixture.instrument, symbol: held }];
+    assert.equal((await fixture.read(fetcher))[0].symbol, held);
+    assert.equal(loads, 4, 'the missing contract is retried on the next read');
+  });
+});
+
+test('concurrent readers share one catalog load per wave, including persistent damage and immediate repair', async t => {
+  for (const scope of catalogScopes) await t.test(scope, async t => {
+    const fixture = catalogFixture(scope);
+    let loads = 0, broken = true;
+    let gate = withResolvers(), entered = withResolvers();
+    t.after(() => gate.resolve());
+    const fetcher = mock(async url => {
+      if (url.pathname.includes('apiRestrictions')) return permissions();
+      if (url.pathname.endsWith('/exchangeInfo')) {
+        loads++; entered.resolve(); await gate.promise;
+        return { symbols: [{ ...fixture.instrument, ...(broken ? { quoteAsset: null } : {}) }] };
+      }
+      return [fixture.row];
+    });
+    for (let wave = 0; wave < 3; wave++) {
+      broken = wave < 2;
+      gate = withResolvers(); entered = withResolvers();
+      const reads = Promise.allSettled(Array.from({ length: 8 }, () => fixture.read(fetcher)));
+      await Promise.race([entered.promise, reads.then(() => assert.fail('a fresh catalog request must start before the reads complete'))]);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(loads, wave + 1, 'all concurrent readers share the in-flight public request');
+      gate.resolve();
+      const results = await reads;
+      assert.ok(results.every(result => result.status === (broken ? 'rejected' : 'fulfilled')));
+      assert.equal(loads, wave + 1, 'malformed responses do not trigger an unbounded retry');
+    }
+    await fixture.read(fetcher); assert.equal(loads, 3, 'the repaired shared catalog is reused');
+  });
+});
+
+test('one invalid held entry prevents another concurrent reader from caching the same shared catalog', async t => {
+  for (const scope of catalogScopes) await t.test(scope, async t => {
+    const fixture = catalogFixture(scope);
+    const other = { ...fixture.instrument, symbol: fixture.inverse ? 'ETHUSD_PERP' : 'ETHUSDT' };
+    const gate = withResolvers(), entered = withResolvers();
+    t.after(() => gate.resolve());
+    let loads = 0, positions = 0;
+    const fetcher = mock(async url => {
+      if (url.pathname.includes('apiRestrictions')) return permissions();
+      if (url.pathname.endsWith('/exchangeInfo')) {
+        loads++; entered.resolve(); await gate.promise;
+        return { symbols: [fixture.instrument, { ...other, marginAsset: null }] };
+      }
+      return [{ ...fixture.row, symbol: positions++ === 0 ? other.symbol : fixture.instrument.symbol }];
+    });
+    const reads = Promise.allSettled([fixture.read(fetcher), fixture.read(fetcher)]);
+    await Promise.race([entered.promise, reads.then(() => assert.fail('a catalog request must start before the reads complete'))]);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(loads, 1);
+    gate.resolve();
+    assert.deepEqual((await reads).map(result => result.status).sort(), ['fulfilled', 'rejected']);
+    await fixture.read(fetcher);
+    assert.equal(loads, 2, 'a successful waiter cannot restore the copy rejected by another waiter');
+    await fixture.read(fetcher); assert.equal(loads, 2, 'unrelated malformed entries still permit subsequent valid reuse');
+  });
+});
+
+const bybitPosition = (side = 'Buy', symbol = 'BTCUSDT') => ({ symbol, side, size: '0.000000000000000001', avgPrice: '100', markPrice: '102', positionValue: '0.000000000000000102', unrealisedPnl: '-0.01', leverage: '', liqPrice: '', updatedTime: String(at) });
+test('Bybit follows every cursor and normalizes USDT/USDC/inverse/option using instrument currency metadata', async () => {
+  for (const scope of ['linear-usdt', 'linear-usdc', 'inverse', 'option'] as const) {
+    const category = scope.startsWith('linear-') ? 'linear' : scope;
+    const settleCoin = scope === 'linear-usdt' ? 'USDT' : scope === 'inverse' ? 'BTC' : 'USDC';
+    const symbol = scope === 'linear-usdt' ? 'BTCUSDT' : scope === 'linear-usdc' ? 'BTCPERP' : scope === 'inverse' ? 'BTCUSD' : 'BTC-30DEC26-80000-C';
+    let pages = 0;
+    const result = await readBybitPositions({ ...bybit, region: 'eu' }, scope, mock((url, init) => {
+      assert.equal(url.hostname, 'api.bybit.eu');
+      if (url.pathname === '/v5/user/query-api') return { retCode: 0, result: { readOnly: 1 } };
+      if (url.pathname.includes('instruments-info')) { assert.deepEqual(init.headers, {}); return { retCode: 0, result: { list: [{ symbol, baseCoin: 'BTC', quoteCoin: category === 'inverse' ? 'USD' : settleCoin, settleCoin }] } }; }
+      const headers = init.headers as Record<string, string>;
+      assert.equal(headers['X-BAPI-SIGN'], createHmac('sha256', c.apiSecret).update(headers['X-BAPI-TIMESTAMP'] + c.apiKey + '10000' + url.search.slice(1)).digest('hex'));
+      assert.equal(url.searchParams.get('category'), category); assert.equal(url.searchParams.get('limit'), '200');
+      if (category === 'linear') assert.equal(url.searchParams.get('settleCoin'), settleCoin);
+      const cursor = url.searchParams.get('cursor'); if (pages++) assert.equal(cursor, 'second page +/&');
+      return { retCode: 0, result: { category, list: [bybitPosition(cursor ? 'Sell' : 'Buy', symbol)], nextPageCursor: cursor ? '' : 'second page +/&' } };
+    }));
+    assert.equal(pages, 2); assert.equal(result.length, 2); assert.equal(result[0].quantity, '0.000000000000000001');
+    assert.equal(result[0].pnlCurrency, settleCoin); assert.equal(result[0].leverage, null); assert.equal(result[0].liquidationPrice, null);
+    assert.equal(result[0].notionalCurrency, category === 'inverse' ? 'BTC' : settleCoin);
+    assert.equal(result[0].quantityUnit, category === 'inverse' ? 'USD' : 'BTC'); assert.equal(result[1].side, 'short');
+  }
+});
+
+test('Bybit missing cursor, repeating cursor, failed later page and malformed records never produce partial results', async () => {
+  for (const scenario of ['missing', 'loop', 'failure', 'bad-row']) {
+    let page = 0;
+    await assert.rejects(readBybitPositions(bybit, 'linear-usdt', mock(url => {
+      if (url.pathname.endsWith('query-api')) return { retCode: 0, result: { readOnly: 1 } };
+      if (scenario === 'failure' && page++) return { retCode: 10001, retMsg: 'SECRET PROVIDER CONTENT' };
+      return { retCode: 0, result: { category: 'linear', list: scenario === 'bad-row' ? [{}] : [bybitPosition()],
+        ...(scenario === 'missing' ? {} : { nextPageCursor: scenario === 'bad-row' ? '' : 'same' }) } };
+    })));
+  }
+});
+
+test('OKX keeps contract count and ctVal × ctMult exactly, preserving inverse settlement and nullable fields', async () => {
+  for (const inverse of [false, true]) {
+    const symbol = inverse ? 'BTC-USD-SWAP' : 'BTC-USDT-SWAP';
+    const result = await readOkxPositions(okx, 'SWAP', mock((url, init) => {
+      if (url.pathname.endsWith('/config')) return { code: '0', data: [{ perm: 'read_only' }] };
+      if (url.pathname.endsWith('/instruments')) {
+        assert.deepEqual(init.headers, {}); return { code: '0', data: [{ instId: symbol, instType: 'SWAP', uly: inverse ? 'BTC-USD' : 'BTC-USDT', settleCcy: inverse ? 'BTC' : 'USDT', ctVal: inverse ? '100' : '0.010000000000000001', ctMult: '2', ctValCcy: inverse ? 'USD' : 'BTC' }] };
+      }
+      const headers = init.headers as Record<string, string>;
+      assert.equal(headers['OK-ACCESS-SIGN'], createHmac('sha256', c.apiSecret).update(headers['OK-ACCESS-TIMESTAMP'] + 'GET' + url.pathname + url.search).digest('base64'));
+      return { code: '0', data: [{ instId: symbol, instType: 'SWAP', pos: '-3', posSide: 'net', posId: '123', mgnMode: 'cross', avgPx: '100000', markPx: '99000', notionalUsd: '600', upl: '-0.001', lever: '5', liqPx: '', uTime: String(at) }] };
+    }));
+    assert.equal(result[0].quantity, '3'); assert.equal(result[0].side, 'short'); assert.equal(result[0].contractSize, inverse ? '200' : '0.020000000000000002');
+    assert.equal(result[0].quantityUnit, inverse ? '张（USD/张）' : '张（BTC/张）'); assert.equal(result[0].pnlCurrency, inverse ? 'BTC' : 'USDT');
+    assert.equal(result[0].notionalCurrency, 'USD'); assert.equal(result[0].liquidationPrice, null);
+  }
+});
+
+test('Aster uses its fixed API Pro GET and retains separate hedge positions', async () => {
+  const privateKey = '0'.repeat(63) + '1'; const wallet = new Wallet(privateKey);
+  const result = await readAsterPositions({ privateKey, walletAddress: wallet.address, includeSpot: true }, mock(url => {
+    assert.equal(url.hostname, 'fapi.asterdex.com');
+    if (url.pathname.endsWith('exchangeInfo')) return linearMetadata;
+    assert.equal(url.pathname, '/fapi/v3/positionRisk'); assert.equal(url.searchParams.get('signer'), wallet.address);
+    assert.ok(url.searchParams.get('signature')?.startsWith('0x')); assert.equal(url.search.includes(privateKey), false);
+    return [linearPosition('3', 'LONG'), linearPosition('-4', 'SHORT')];
+  }));
+  assert.equal(result.length, 2); assert.equal(result[0].side, 'long'); assert.equal(result[1].side, 'short');
+});
+
+test('Aster balance and position reads allocate distinct nonces for the same wallet in the same millisecond', async t => {
+  t.mock.method(Date, 'now', () => at);
+  const privateKey = '0'.repeat(63) + '1', wallet = new Wallet(privateKey);
+  const c = { privateKey, walletAddress: wallet.address, includeSpot: false };
+  const nonces: string[] = [];
+  const fetcher = (async (input, init) => {
+    assert.equal(init?.method, 'GET'); const url = new URL(String(input));
+    nonces.push(url.searchParams.get('nonce')!); return Response.json(url.pathname.endsWith('positionRisk') ? [] : { assets: [] });
+  }) as typeof fetch;
+  await Promise.all([asterGet(c, '/fapi/v3/accountWithJoinMargin', fetcher), readAsterPositions(c, fetcher)]);
+  assert.equal(nonces.length, 2); assert.equal(new Set(nonces).size, 2);
+});
+
+test('read allowlists and sanitized transport errors prevent writes, redirects, signed URLs and upstream secrets from escaping', async () => {
+  for (const exchange of ['binance', 'bybit', 'okx'] as const) {
+    await assert.rejects(positionsGet(exchange, { ...okx, region: 'global' }, '/order', new URLSearchParams(), mock(() => assert.fail('network must not run'))), /只读/);
+  }
+  const secretFailure = (async () => { throw new Error('https://upstream?signature=PRIVATE ' + c.apiSecret); }) as typeof fetch;
+  await assert.rejects(readBinancePositions(c, secretFailure), error => error instanceof Error && !error.message.includes('PRIVATE') && !error.message.includes(c.apiSecret));
+  const redirect = (async () => new Response('', { status: 302, headers: { Location: 'https://evil.invalid' } })) as typeof fetch;
+  await assert.rejects(readBinancePositions(c, redirect));
+  const badJson = (async () => new Response('PRIVATE ' + c.apiSecret)) as typeof fetch;
+  await assert.rejects(readBinancePositions(c, badJson), error => error instanceof Error && !error.message.includes(c.apiSecret));
+});

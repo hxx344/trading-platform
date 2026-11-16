@@ -4,7 +4,10 @@
 // replaces the whole ledger in one transaction, and the service (store.ts, since A-2) edits it under the sync lock
 // (sync-lock.ts). The lock table is the workbench's sync_locks without its owner column: one row, id 1. The connections
 // table (A-3/A-4) is the workbench's without its owner column: one sealed credential per connection name
-// (credentials.ts); the import replaces it with the ledger.
+// (credentials.ts); the import replaces it with the ledger. The fill_cache table (A-5) is the workbench's
+// (drizzle/0002_fill_cache.sql at 7745181) without its owner column: the fills of one account and scope (slot) stored under
+// the credential revision they were read with (fills-service.ts); the import empties it with the connections. A version
+// before A-5 never reads it and leaves it alone.
 import { lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -13,11 +16,13 @@ import type { QueryDatabase, QueryStatement, QueryValue } from './query.ts';
 export const ASSET_DB_FILE = 'asset.sqlite';
 const LOCK_TABLE = 'CREATE TABLE IF NOT EXISTS sync_locks (id INTEGER PRIMARY KEY CHECK (id = 1), expires INTEGER NOT NULL, token TEXT NOT NULL);';
 const CONNECTIONS_TABLE = 'CREATE TABLE IF NOT EXISTS connections (exchange TEXT PRIMARY KEY NOT NULL, encrypted TEXT NOT NULL, updated_at TEXT NOT NULL);';
+const FILL_CACHE_TABLE = 'CREATE TABLE IF NOT EXISTS fill_cache (account TEXT NOT NULL, scope TEXT NOT NULL, revision TEXT NOT NULL, data TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (account, scope));';
 const SCHEMA = `CREATE TABLE IF NOT EXISTS assets (id TEXT PRIMARY KEY NOT NULL, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS snapshots (date TEXT PRIMARY KEY NOT NULL, data TEXT NOT NULL);
 ${LOCK_TABLE}
-${CONNECTIONS_TABLE}`;
+${CONNECTIONS_TABLE}
+${FILL_CACHE_TABLE}`;
 
 class Statement implements QueryStatement {
   private connection: DatabaseSync;
@@ -53,8 +58,8 @@ export interface AssetDb extends QueryDatabase {
 
 /**
  * `import` (the default) creates the tables and WAL; `read` opens an existing file without creating it or touching its
- * schema; `service` opens an existing file for the service's edits: it only adds the lock and connections tables (a file
- * imported before A-3 has no connections table) and proves it can write
+ * schema; `service` opens an existing file for the service's edits: it only adds the lock, connections and fill_cache tables
+ * (a file imported before A-3 has no connections table, one before A-5 no fill_cache) and proves it can write
  * (a file the service account cannot write opens read-only in SQLite and fails only at the first write).
  */
 export type AssetDbMode = 'import' | 'read' | 'service';
@@ -63,7 +68,7 @@ const SETUP: Record<AssetDbMode, string> = {
   read: 'PRAGMA busy_timeout = 5000;',
   // node:sqlite waits synchronously, so the service, which also runs ADL and transfers, waits at most a second for an
   // import's transaction (the import itself waits 5 s); a write that cannot get the file in time answers 503.
-  service: `PRAGMA busy_timeout = 1000; ${LOCK_TABLE} ${CONNECTIONS_TABLE} DELETE FROM sync_locks WHERE 0;`,
+  service: `PRAGMA busy_timeout = 1000; ${LOCK_TABLE} ${CONNECTIONS_TABLE} ${FILL_CACHE_TABLE} DELETE FROM sync_locks WHERE 0;`,
 };
 
 export function openAssetDb(file: string, { readOnly = false, mode = readOnly ? 'read' : 'import' }: { readOnly?: boolean; mode?: AssetDbMode } = {}): AssetDb {

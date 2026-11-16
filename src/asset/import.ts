@@ -142,13 +142,13 @@ export function prepareLedger(rows: unknown, { file, owner, now = Date.now }: { 
 
 /** A connection sealed with this data directory's key (credentials.ts), as the connections table stores it. */
 export interface SealedConnection { exchange: string; encrypted: string }
-/** Replaces the ledger tables and the connections of <dataDir>/asset.sqlite in one transaction, with the import record. */
+/** Replaces the ledger tables and the connections of <dataDir>/asset.sqlite in one transaction, with the import record; the fills cached for the old connections (A-5) go with them. */
 export function writeLedger(dataDir: string, ledger: PreparedLedger, connections: readonly SealedConnection[] = [], at = Date.parse(ledger.info.importedAt)): ImportInfo {
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const database = openAssetDb(resolve(dataDir, ASSET_DB_FILE));
   try {
     database.replace(() => {
-      for (const table of ['assets', 'settings', 'snapshots', 'connections']) database.prepare(`DELETE FROM ${table}`).run();
+      for (const table of ['assets', 'settings', 'snapshots', 'connections', 'fill_cache']) database.prepare(`DELETE FROM ${table}`).run();
       for (const row of connections) database.prepare('INSERT INTO connections (exchange, encrypted, updated_at) VALUES (?, ?, ?)').bind(row.exchange, row.encrypted, new Date(at).toISOString()).run();
       for (const row of ledger.assets) database.prepare('INSERT INTO assets (id, data) VALUES (?, ?)').bind(row.id, row.data).run();
       for (const row of ledger.snapshots) database.prepare('INSERT INTO snapshots (date, data) VALUES (?, ?)').bind(row.date, row.data).run();

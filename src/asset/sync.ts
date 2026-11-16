@@ -15,7 +15,8 @@
 //   (sources/http.ts); a failed read marks that row "同步失败 · 保留旧值" and its `<exchange>-status` error, the next
 //   sync (the page asks every 60 s while open) reads again;
 // - the timestamps come from the injected clock;
-// - disconnect has no fill cache to clear (positions and fills are A-5);
+// - disconnect clears the fill cache of that connection in the same transaction (A-5), as the workbench does;
+// - the daily snapshot carries the cached positions through the context's peek (A-5; writes.ts saveSnapshot);
 // - an Aster account write needs the ledger's Aster row: without one it is refused with the connect message
 //   '未找到交易所资产' before anything is read (the workbench would fail on the missing row while writing);
 // - the market row is refreshed only when the ledger has one (the workbench assumes it);
@@ -29,7 +30,7 @@ import type { Vault } from './credentials.ts';
 import { asterKey, aggregateAster, mergeAsterRefresh, readAsterAccounts, type AsterRefresh } from './aster-accounts.ts';
 import { knownAssetValue, refreshMarketAsset } from './asset-values.ts';
 import { isGateProject, isHyperliquidProject, isVariationalProject } from './source-ledger.ts';
-import { saveSetting, saveSnapshot } from './writes.ts';
+import { saveSetting, saveSnapshot, type PositionsPeek } from './writes.ts';
 // store.ts imports this module too; the cycle is safe, nothing is called while the modules load.
 import { currentLedger } from './store.ts';
 import type { AsterAccountInput, ConnectionExchange, Credentials } from './validation.ts';
@@ -86,6 +87,8 @@ export interface SyncContext {
   vault: Vault;
   sources: AssetSources;
   now: () => number;
+  /** The cached positions for the daily snapshot (A-5); none leaves `positions` out. */
+  positions?: PositionsPeek;
 }
 type Run = () => void;
 const iso = (at: number) => new Date(at).toISOString();
@@ -110,7 +113,7 @@ function commit(ctx: SyncContext, statements: Run[]): void {
   });
 }
 /** The workbench's snapshot(), inside a transaction already open. */
-function snapshotNow(ctx: SyncContext, at: number): void { saveSnapshot(ctx.database, currentLedger(ctx.database, at), at); }
+function snapshotNow(ctx: SyncContext, at: number): void { saveSnapshot(ctx.database, currentLedger(ctx.database, at), at, ctx.positions); }
 const ledgerReader = currentLedger;
 
 const MATCHED_BY_PROJECT: Partial<Record<ConnectionExchange, (project: string) => boolean>> = {
@@ -160,6 +163,7 @@ export async function disconnect(ctx: SyncContext, exchange: ConnectionExchange)
   const ledger = ledgerReader(database, ctx.now()), asset = ledger.assets.find(a => a.mode === exchange);
   commit(ctx, [
     deleteConnection(database, exchange),
+    () => { database.prepare('DELETE FROM fill_cache WHERE account = ?').bind(exchange).run(); },
     settingStatement(database, exchange + '-status', { configured: false, lastSync: ledger.connections[exchange].lastSync, error: null, scope: ledger.connections[exchange].scope }),
     ...(asset ? [assetStatement(database, { ...asset, status: '已断开 · 保留旧值', error: undefined })] : []),
   ]);

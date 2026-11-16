@@ -1,10 +1,12 @@
 // Copied from project_aggregation modules/asset/tests/rh-lighter.test.ts at 0014655, balance reading only. Changes: the
 // position-mapping test and the connection-schema assertions are left out; the cases that read through
 // readRhLighterPositions now read through syncRhLighter (refusals) or readRhLighterSnapshot (sharing, abort), which go
-// through the same account parsing. Expected messages and values are unchanged.
+// through the same account parsing. Expected messages and values are unchanged. Since A-5 (positions restored) the
+// position-mapping test is back, copied from the workbench file at 7745181.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { syncRhLighter, readRhLighterSnapshot, RH_LIGHTER_ERRORS, RH_LIGHTER_SNAPSHOT_TTL_MS, RH_LIGHTER_COOLDOWN_MS, NOTE_COIN } from '../src/asset/sources/rh-lighter.ts';
+import { syncRhLighter, readRhLighterPositions, readRhLighterSnapshot, RH_LIGHTER_ERRORS, RH_LIGHTER_SNAPSHOT_TTL_MS, RH_LIGHTER_COOLDOWN_MS, NOTE_COIN } from '../src/asset/sources/rh-lighter.ts';
+import { positionId } from '../src/asset/positions-values.ts';
 // The DOM lib is not loaded (tsconfig "types": ["node"]); these are the fetch argument types the copied fixtures use.
 type RequestInfo = string | Request;
 
@@ -185,4 +187,14 @@ test('valid open, short and closed positions are accepted and leave the balance 
   const result = await syncRhLighter({ walletAddress: ADDRESS }, f.fetcher);
   assert.equal(result.total, 200.5);
   assert.deepEqual(result.details.map(row => row.account), ['账户 #5 · 账户总值（含未实现盈亏）', '账户 #6 · 账户总值（含未实现盈亏）']);
+});
+
+test('positions skip closed markets, map sign, margin mode, leverage and missing liquidation price', async () => {
+  const f = fixture(() => page([account(5, { positions: [short, closed] }), account(6, { positions: [long] })]));
+  const positions = await readRhLighterPositions({ walletAddress: ADDRESS }, f.fetcher);
+  assert.deepEqual(positions.map(p => [p.symbol, p.side, p.quantity, p.entryPrice, p.notional, p.unrealizedPnl, p.leverage, p.liquidationPrice, p.marginMode, p.priceCurrency]), [
+    ['ANTHROPIC', 'short', '0.44104', '1516.1', '668.6', '0.06', '5', '3000.5', 'cross', 'USDG'],
+    ['BTC', 'long', '0.01', '100000', '1000', '-2.5', '20', null, 'isolated', 'USDG'],
+  ]);
+  assert.deepEqual(positions.map(p => p.id), [positionId('rh-lighter', '5', '120', 'short'), positionId('rh-lighter', '6', '1', 'long')]);
 });

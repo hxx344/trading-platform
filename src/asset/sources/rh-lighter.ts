@@ -1,17 +1,18 @@
-// Copied from project_aggregation modules/asset/lib/rh-lighter.ts at 0014655, balance reading only.
-// Changes: the positions reader (readRhLighterPositions) and the Position mapping are left out (positions are A-5).
-// Each position row is still validated exactly as the workbench parses it (checkPosition keeps every refusal of
-// parsePosition), so an account read the workbench refuses is refused here too and the balance outcome is the same.
-// Imports point at src/vendor and ../types.ts. The shared per-address snapshot, the 60 s cooldown, the 10 s
-// per-request timeout (the workbench's value for this source), limits and messages are unchanged.
+// Copied from project_aggregation modules/asset/lib/rh-lighter.ts at 0014655 (same at 7745181).
+// Changes: imports point at src/vendor, ../types.ts and ../positions-*.ts. Until A-5 the positions reader and the Position
+// mapping were left out; A-5 restores readRhLighterPositions and parsePosition unchanged. The shared per-address
+// snapshot, the 60 s cooldown, the 10 s per-request timeout (the workbench's value for this source), limits and messages
+// are unchanged.
 import type { Balance } from '../types.ts';
+import type { Position } from '../positions-types.ts';
+import { positionId } from '../positions-values.ts';
 import { ExchangeResponseError, readJsonResponse } from '../../vendor/response.mjs';
 
 export type RhLighterCredential = { walletAddress: string };
 type Json = Record<string, unknown>;
 type Fetcher = typeof fetch;
 type Asset = { symbol: string; balance: number; locked: number };
-type Account = { index: number; name: string | null; value: number; assets: Asset[]; pooled: boolean; binary: boolean };
+type Account = { index: number; name: string | null; value: number; assets: Asset[]; positions: Position[]; pooled: boolean; binary: boolean };
 /** `at` is when the read started, so a reused snapshot is never presented as newer than its request. */
 export type RhLighterSnapshot = { address: string; at: number; accounts: Account[] };
 type Slot = { value?: RhLighterSnapshot; pending?: Promise<RhLighterSnapshot> };
@@ -78,24 +79,31 @@ function rows(value: unknown, optional = false): unknown[] {
   return value as unknown[];
 }
 
-/** The workbench's parsePosition without building the Position: the same rows are skipped and the same rows refused. */
-function checkPosition(row: unknown): void {
+function parsePosition(row: unknown, account: number, at: string): Position | null {
   if (!object(row)) return fail(RH_LIGHTER_ERRORS.invalid);
   const quantity = decimalText(row.position);
-  if (isZero(quantity)) return;
+  if (isZero(quantity)) return null;
   if (quantity.startsWith('-') || !integer(row.market_id)) fail(RH_LIGHTER_ERRORS.invalid);
-  if (row.sign !== 1 && row.sign !== -1) fail(RH_LIGHTER_ERRORS.invalid);
-  symbolOf(row.symbol);
-  if (row.margin_mode !== 0 && row.margin_mode !== 1) fail(RH_LIGHTER_ERRORS.invalid);
+  const side = row.sign === 1 ? 'long' as const : row.sign === -1 ? 'short' as const : fail(RH_LIGHTER_ERRORS.invalid);
+  const symbol = symbolOf(row.symbol);
+  const marginMode = row.margin_mode === 0 ? 'cross' : row.margin_mode === 1 ? 'isolated' : fail(RH_LIGHTER_ERRORS.invalid);
+  // initial_margin_fraction is a percentage, so the configured leverage is its reciprocal.
   const fraction = amount(row.initial_margin_fraction);
   if (fraction < 0) fail(RH_LIGHTER_ERRORS.invalid);
-  decimalText(row.liquidation_price);
-  decimalText(row.avg_entry_price);
-  decimalText(row.position_value);
-  decimalText(row.unrealized_pnl);
+  const liquidation = decimalText(row.liquidation_price);
+  return {
+    id: positionId('rh-lighter', String(account), String(row.market_id), side), symbol, instrumentId: symbol, side, positionSide: 'net',
+    quantity, quantityUnit: symbol, contractSize: '1',
+    entryPrice: decimalText(row.avg_entry_price), markPrice: null,
+    notional: decimalText(row.position_value).replace(/^-/, ''), unrealizedPnl: decimalText(row.unrealized_pnl),
+    leverage: fraction > 0 ? String(Number((100 / fraction).toFixed(4))) : null,
+    // Lighter reports 0 when the position has no liquidation price.
+    liquidationPrice: isZero(liquidation) ? null : liquidation,
+    priceCurrency: COLLATERAL, notionalCurrency: COLLATERAL, pnlCurrency: COLLATERAL, marginMode, sourceUpdatedAt: at,
+  };
 }
 
-function parseAccount(item: unknown, user: string): Account {
+function parseAccount(item: unknown, user: string, at: string): Account {
   if (!object(item)) return fail(RH_LIGHTER_ERRORS.invalid);
   const index = item.index ?? item.account_index;
   if (!integer(index) || (item.account_index !== undefined && item.account_index !== index)) fail(RH_LIGHTER_ERRORS.invalid);
@@ -105,9 +113,9 @@ function parseAccount(item: unknown, user: string): Account {
     const symbol = typeof asset.symbol === 'string' && SYMBOL.test(asset.symbol) ? asset.symbol : integer(asset.asset_id) ? `资产 #${asset.asset_id}` : fail(RH_LIGHTER_ERRORS.invalid);
     return { symbol, balance: amount(asset.balance), locked: amount(asset.locked_balance) };
   });
-  for (const row of rows(item.positions)) checkPosition(row);
+  const positions = rows(item.positions).map(row => parsePosition(row, index as number, at)).filter(row => row !== null);
   const name = typeof item.name === 'string' && /^[\p{L}\p{N} _.-]{1,32}$/u.test(item.name.trim()) ? item.name.trim() : null;
-  return { index: index as number, name, value: amount(item.total_asset_value), assets,
+  return { index: index as number, name, value: amount(item.total_asset_value), assets, positions,
     pooled: rows(item.shares, true).length > 0, binary: rows(item.bo_positions, true).length > 0 };
 }
 
@@ -141,7 +149,7 @@ async function request(url: string, fetcher: Fetcher, state: State): Promise<unk
 }
 
 async function load(user: string, fetcher: Fetcher, state: State): Promise<RhLighterSnapshot> {
-  const startedAt = Date.now();
+  const startedAt = Date.now(), at = new Date(startedAt).toISOString();
   const accounts: Account[] = [], seen = new Set<number>();
   let cursor = '', total = -1;
   for (let page = 0; ; page++) {
@@ -154,7 +162,7 @@ async function load(user: string, fetcher: Fetcher, state: State): Promise<RhLig
     const body = data as Json;
     if (page === 0) total = body.total as number;
     for (const item of body.accounts as unknown[]) {
-      const account = parseAccount(item, user);
+      const account = parseAccount(item, user, at);
       if (seen.has(account.index)) fail(RH_LIGHTER_ERRORS.invalid);
       seen.add(account.index); accounts.push(account);
     }
@@ -232,3 +240,8 @@ export async function syncRhLighter(c: RhLighterCredential, fetcher: Fetcher = f
   return { total: total === 0 ? 0 : total, details, updatedAt: new Date(snapshot.at).toISOString() };
 }
 
+/** Perpetual positions of every account of the address, read from the same shared snapshot as the balance. */
+export async function readRhLighterPositions(c: RhLighterCredential, fetcher: Fetcher = fetch, signal?: AbortSignal): Promise<Position[]> {
+  const snapshot = await readRhLighterSnapshot(c?.walletAddress, fetcher, signal);
+  return snapshot.accounts.flatMap(account => account.positions);
+}

@@ -405,7 +405,7 @@ Anthropic 详情的成交标记不做（A-5 范围外，登记在 asset.md）；
 
 - 只有本服务一个来源，来源名固定为「资产账本」，所以「（来源 n）」区分不会出现。
   数据来自本服务自己的接口，不再逐字段校验来源格式（工作台校验 iframe 消息）。
-- Anthropic 的执行归属（execution / attribution / orderId）与 ANT 组合合计不做：资产账本只读 Binance、Bybit、OKX 的持仓，ANT 组合的对比腿在 Hyperliquid（xyz:ANT、io:ANTH）与 Lighter RH，读不到，组合不会成立。
+- Anthropic 的执行归属（execution / attribution / orderId）与 ANT 组合合计不做：资产账本不读 Hyperliquid 持仓，xyz:ANT、io:ANTH 两组成立不了；Binance ↔ Lighter RH 的两腿都读得到，但组合合计（工作台 `relatedAnthropicPair`，跨所按股数换算）本次不做，登记在 asset.md。
 - 工作台的前台失活停止跟读改由 `use-live-resource.ts` 的暂停（页面隐藏）处理。
 - 已知口径（与工作台一致，不改）：`relatedSpreadPairs` 只按「来源 | 交易所」分组，不分账户。同一交易所两个账户各持一腿、方向相反时，也会被当成一对算价差与组合盈亏。
 

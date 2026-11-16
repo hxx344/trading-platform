@@ -80,12 +80,11 @@ test('missing legs, same sides, duplicates and incomplete lists never pair', () 
   assert.ok(pending && pending.status === 'paired'); assert.equal(pending.totals.realizedStatus, 'loading'); assert.equal(pending.closing, null);
 });
 
-test('anthropic picks Binance ANTHROPICUSDT and the Hyperliquid legs, and never pairs', () => {
-  assert.equal(matchBase('ANTHROPICUSDT', RELATED_SYMBOLS.anthropic), 'ANTHROPIC');
-  assert.equal(matchBase('xyz:ANT', RELATED_SYMBOLS.anthropic), 'XYZANT');
-  assert.equal(matchBase('io:ANTH', RELATED_SYMBOLS.anthropic), 'IOANTH');
-  const data = reply(['binance', scope([position('ANTHROPICUSDT', 'short', '480'), position('CLUSDT', 'long', '60')])]);
-  assert.deepEqual(positionItems(data, RELATED_SYMBOLS.anthropic, now).items.map(item => item.symbol), ['ANTHROPICUSDT']);
-  assert.equal(pairedMarket('anthropic'), false);
-  assert.equal(pairedMarket('oil'), true);
+test('anthropic picks the ANTHROPIC legs only and never pairs them', () => {
+  for (const symbol of ['ANTHROPICUSDT', 'ANTHROPIC-USDT-SWAP', 'ANTHROPIC']) assert.equal(matchBase(symbol, RELATED_SYMBOLS.anthropic), 'ANTHROPIC', symbol);
+  for (const symbol of ['ANTUSDT', 'ANTHUSDT', 'ANT-USDT-SWAP', '1000ANTHROPICUSDT', 'ANTHROPIC2USDT']) assert.equal(matchBase(symbol, RELATED_SYMBOLS.anthropic), null, `${symbol} is another asset`);
+  const data = reply(['binance', scope([position('ANTHROPICUSDT', 'short', '480'), position('ANTUSDT', 'long', '1')])], ['rh-lighter', scope([position('ANTHROPIC', 'long', '30')])]);
+  const picked = positionItems(data, RELATED_SYMBOLS.anthropic, now).items;
+  assert.deepEqual(picked.map(item => `${item.exchangeId}:${item.symbol}`), ['binance:ANTHROPICUSDT', 'rh-lighter:ANTHROPIC']);
+  assert.equal(pairedMarket('anthropic'), false, 'opposite Binance and Lighter RH legs stay unpaired: ANT totals are not done');
 });

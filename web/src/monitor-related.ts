@@ -4,8 +4,8 @@
 // - src/hub-positions.ts（工作台宿主）的 matchBase、positionItems（MAX_POSITION_ITEMS 50、90 秒算旧值）；
 // - modules/monitor/lib/related-pairs.ts 的 RELATED_SYMBOLS（含 anthropic）、pairTotals、relatedSpreadPairs。
 // 与工作台的差异：只有本服务一个来源（工作台汇总多个 Asset 项目），来源固定为「资产账本」；数据来自本服务自己的
-// 接口，不再逐字段校验格式；Anthropic 的 ANT 组合合计（related-position-totals.ts）不做：资产账本只读 Binance、Bybit、
-// OKX 的持仓，ANT 组合的对比腿在 Hyperliquid（xyz:ANT、io:ANTH）与 Lighter RH，这里读不到，组合无法成立。
+// 接口，不再逐字段校验格式；Anthropic 的 ANT 组合合计（related-position-totals.ts）不做：资产账本不读 Hyperliquid 持仓，
+// xyz:ANT、io:ANTH 两组成立不了；Binance ↔ Lighter RH 两腿都读得到，但组合合计（跨所按股数换算）本次不做，登记在 asset.md。
 import type { FillMarket } from '../../src/asset/fills-types.ts';
 import type { HubPositions, PositionCycle } from '../../src/asset/positions-types.ts';
 import { oilSpread } from '../../src/vendor/oil-market.mjs';
@@ -15,7 +15,7 @@ export const MAX_POSITION_ITEMS = 50;
 export const POSITIONS_STALE_AFTER_MS = 90_000;
 /** The detail pages that show related positions; only oil and Hynix pair their legs. */
 export type RelatedMarket = FillMarket | 'anthropic';
-/** Hyperliquid names the ordinary-share leg SKHX; the CEX contracts use SKHYNIX. Anthropic: Binance ANTHROPICUSDT, io:ANTH, xyz:ANT. */
+/** Hyperliquid names the ordinary-share leg SKHX; the CEX contracts use SKHYNIX. Anthropic: Binance ANTHROPICUSDT, Lighter RH ANTHROPIC (rh-lighter), io:ANTH, xyz:ANT. */
 export const RELATED_SYMBOLS: Record<RelatedMarket, readonly string[]> = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHX', 'SKHYNIX'], anthropic: ['ANTHROPIC', 'IOANTH', 'XYZANT'] };
 export const pairedMarket = (market: RelatedMarket): market is FillMarket => market !== 'anthropic';
 export type RelatedItem = {

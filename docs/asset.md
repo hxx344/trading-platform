@@ -208,7 +208,7 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
   - 持仓页：每 5 秒一次读接口，服务端缓存命中时为 0，缓存过期后约 5；
   - 这些都按出口 IP 计。与原油执行账户、同机的工作台共用出口 IP 时三者叠加，持仓多时注意 Binance 每分钟权重上限。
 - **没做（登记）**：
-  - Anthropic（ANT）的成交读取、执行归属与关联持仓合计：`fillsQueryMarket` 只接受 `oil` / `hynix`，Anthropic 详情不画标记；
+  - Anthropic（ANT）的成交读取、执行归属与关联持仓合计：`fillsQueryMarket` 只接受 `oil` / `hynix`，Anthropic 详情不画标记；关联交易只列逐腿持仓，Binance ↔ Lighter RH 的组合合计（工作台 `relatedAnthropicPair`）没做（Hyperliquid 持仓资产账本不读，那两组成立不了）；
   - A08 留到下一批；A14 不迁移。
 - **测试**：
   - 后端：`test/asset-fills.test.ts`、`asset-positions-*.test.ts`、`positions.test.ts`；

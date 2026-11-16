@@ -20,7 +20,7 @@ export const LOCK_LOST = '资产更新超时或已被其他操作接替，本次
 export const LEDGER_REIMPORTED = '资产账本刚被重新导入，本次修改未保存，请刷新后重试';
 export const NOT_IMPORTED = '尚未导入资产账本';
 
-export type AssetConflictCode = 'not_imported' | 'read_only' | 'busy' | 'lease_lost' | 'reimported';
+export type AssetConflictCode = 'not_imported' | 'read_only' | 'busy' | 'lease_lost' | 'reimported' | 'import_changed';
 /** A write refused because of the ledger's state rather than its input: answered 409. */
 export class AssetConflict extends Error {
   readonly code: AssetConflictCode;

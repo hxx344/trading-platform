@@ -16,6 +16,8 @@ import type { AssetStore } from './asset/store.ts';
 import type { CrossexViews } from './service/crossex.ts';
 import { AssetConflict } from './asset/sync-lock.ts';
 import { AssetInputError, INPUT_INVALID } from './asset/validation.ts';
+import { AssetBackupError } from './asset/source-import.ts';
+import { IMPORT_MAX_BYTES } from './asset/source-ledger.ts';
 import { fillsQueryMarket } from './asset/fills-service.ts';
 
 const MAX_BODY_BYTES = 16 * 1024;
@@ -40,7 +42,10 @@ const ASSET_WRITES = { '/api/asset/assets/edit': 'edit', '/api/asset/fx': 'fx', 
   // A-3/A-4: the sync and the connections.
   '/api/asset/sync': 'sync', '/api/asset/connections': 'connect', '/api/asset/connections/delete': 'disconnect',
   '/api/asset/aster-accounts/add': 'asterAdd', '/api/asset/aster-accounts/edit': 'asterEdit', '/api/asset/aster-accounts/delete': 'asterDelete',
+  // A-6: the workbook import (the workbench's POST /api/import); its body may be up to IMPORT_MAX_BYTES.
+  '/api/asset/import': 'import',
 } as const;
+const IMPORT_TOO_LARGE = '导入文件不能超过 5 MB';
 /** The workbench's database and network failures (modules/asset/lib/api.ts failure at 0014655). */
 const ASSET_UNAVAILABLE = /D1_|SQLITE|decrypt|OperationError|fetch failed|network|aborted|timeout/i;
 /**
@@ -50,6 +55,7 @@ const ASSET_UNAVAILABLE = /D1_|SQLITE|decrypt|OperationError|fetch failed|networ
  */
 function assetWriteError(error: unknown): ContractError {
   if (error instanceof AssetInputError) return new ContractError(400, 'invalid_input', INPUT_INVALID);
+  if (error instanceof AssetBackupError) return new ContractError(503, 'backup_failed', error.message);
   if (error instanceof AssetConflict) return new ContractError(409, error.code, error.message);
   if (error instanceof Error && ((error as NodeJS.ErrnoException).code === 'ERR_SQLITE_ERROR' || ASSET_UNAVAILABLE.test(error.message))) return new ContractError(503, 'asset_unavailable', '服务暂时不可用，已保留上次数据，请稍后重试');
   if (error instanceof SyntaxError) return new ContractError(500, 'asset_unreadable', '资产账本读取失败：库里有一项数据格式无效，请重新导入');
@@ -264,14 +270,14 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...headers });
     response.end(payload);
   };
-  const readJson = (request: IncomingMessage): Promise<unknown> => new Promise((resolve, fail) => {
+  const readJson = (request: IncomingMessage, maxBytes = MAX_BODY_BYTES, tooLarge = '请求体过大'): Promise<unknown> => new Promise((resolve, fail) => {
     let size = 0; const chunks: Buffer[] = [];
     const onData = (chunk: Buffer) => {
       size += chunk.length;
-      if (size <= MAX_BODY_BYTES) { chunks.push(chunk); return; }
+      if (size <= maxBytes) { chunks.push(chunk); return; }
       // Drain instead of destroying so the client still receives the 413; the connection closes after it.
       request.off('data', onData); request.resume();
-      fail(new ContractError(413, 'body_too_large', '请求体过大'));
+      fail(new ContractError(413, 'body_too_large', tooLarge));
     };
     request.on('data', onData);
     request.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null')); } catch { fail(new ContractError(400, 'invalid_json', '请求体不是有效 JSON')); } });
@@ -532,9 +538,11 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'POST' && Object.hasOwn(ASSET_WRITES, url.pathname)) {
       const asset = views?.asset;
       if (!asset) return send(response, 404, { code: 'not_found', message: '本服务没有配置资产账本' });
-      const body = await readJson(request);
+      const action = ASSET_WRITES[url.pathname as keyof typeof ASSET_WRITES];
+      const body = action === 'import' ? await readJson(request, IMPORT_MAX_BYTES, IMPORT_TOO_LARGE) : await readJson(request);
       try {
-        switch (ASSET_WRITES[url.pathname as keyof typeof ASSET_WRITES]) {
+        switch (action) {
+          case 'import': return send(response, 200, await asset.importSource(body));
           case 'edit': return send(response, 200, await asset.editAsset(body));
           case 'fx': return send(response, 200, await asset.editFx(body));
           case 'add': return send(response, 200, await asset.saveWithdrawal(body, false));

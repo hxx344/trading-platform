@@ -27,6 +27,7 @@ import type { FillMarket, HubFills } from './fills-types.ts';
 import { liveSources, type AssetSources, type SyncContext } from './sync.ts';
 import type { Fetcher } from './sources/http.ts';
 import * as writes from './writes.ts';
+import { importSource, parseImportBody, type ImportSummary } from './source-import.ts';
 import { DAILY_CHANGE_DAYS, readDailyChanges, shiftDay } from './daily-changes.ts';
 import {
   cashFlowsView, historyView, ledgerView, notImported, withdrawalsView,
@@ -138,6 +139,11 @@ export interface AssetStore {
   deleteWithdrawal(body: unknown): Promise<AssetLedgerView>;
   saveCashFlow(body: unknown): Promise<AssetCashFlowsView>;
   /**
+   * The workbook import (A-6, the workbench's POST /api/import): a preview answers the summary and the fingerprint to
+   * apply with; an applied import (or the same file again) answers the new ledger view, with the summary and the backup.
+   */
+  importSource(body: unknown): Promise<ImportReply>;
+  /**
    * The connection writes and the sync (A-3/A-4), same contract. A failed exchange verification is a plain Error with the
    * exchange's message (nothing saved); a credential that cannot be opened, the network and the database are errors the
    * HTTP layer answers with 503. The sync answers the ledger as it is when the last attempt was less than 30 s ago.
@@ -156,6 +162,11 @@ export interface AssetStore {
   close(): void;
 }
 /** A write refused because the service may not write the file (opened read-only). */
+export type ImportReply =
+  | { preview: true; summary: ImportSummary; fingerprint: string }
+  // `import` is null when the same file was imported before (nothing changed); the ledger view keeps its own `summary`.
+  | (AssetLedgerView & { preview: false; alreadyImported: boolean; import: { summary: ImportSummary; backupName: string } | null });
+
 export const READ_ONLY = '资产库不可写：asset.sqlite 或其 -wal/-shm 不归服务账户或没有写权限，请把它们改回服务账户所有（chown）并可写后重试';
 /** SQLite's answers for a file this account may not write: READONLY, PERM, CANTOPEN (primary result codes). */
 const NOT_WRITABLE_CODES = new Set([8, 3, 14]);
@@ -334,6 +345,12 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
       const id = parseWithdrawalId(body);
       await locked(async (database, lease) => writes.deleteWithdrawal(database, lease, await readLedger(database, false), id, now(), peek));
       return ledger();
+    },
+    async importSource(body) {
+      const input = parseImportBody(body);
+      const result = await locked(async (database, lease) => importSource(database, lease, await readLedger(database, false, now()), input, { dbFile: file, now, peek }));
+      if (result.kind === 'preview') return { preview: true, summary: result.summary, fingerprint: result.fingerprint };
+      return { ...await ledger(), preview: false, alreadyImported: result.kind === 'already', import: result.kind === 'applied' ? { summary: result.summary, backupName: result.backupName } : null };
     },
     async saveCashFlow(body) {
       // The workbench parses before taking the lock (cash-flow-store.ts); its messages are business errors (400).

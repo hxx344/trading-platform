@@ -8,7 +8,7 @@
 
 - 已发布：A-1 只读账本随 v0.12.0；v0.15.0 起在设置页「从工作台导入」里启用并导入账本；A-2 本地写入（编辑手动资产、汇率、出金、资金流）随 v0.16.0；A-3/A-4（凭据加密存放、交易所连接与同步、行情与汇率自动更新、从工作台导入连接）随 v0.19.0，尚未用真实交易所账户读取过。
 - 进行中：A-5（持仓与成交，见下文 A-5）。
-- 未开始：A-6 的原表导入（A08）；A14 交易凭据导出不迁移（见批次表）。
+- 进行中：A-6 的原表导入（A08，见下文 A-6）；A14 交易凭据导出不迁移（见批次表）。
 - 下文 A-1 一节是当时只读批次的记录；写入入口、去掉只读提示等以 A-2 一节为准。
 
 ## 批次
@@ -20,7 +20,7 @@
 | A-3 | 凭据与中心化交易所余额同步（A01、A02：Binance、Bybit、OKX、Gate）、行情与汇率自动更新 | R3 | 完成，随 v0.19.0 发布（见下文 A-3/A-4） |
 | A-4 | 其余数据源（Aster 多账户 A03、Hyperliquid、Lighter RH、Variational A15） | R3 | 与 A-3 同批，v0.19.0 |
 | A-5 | 持仓与成交（A04、A05） | R2（`fill_cache` 新表按数据库结构归 R3，回滚见下文 A-5） | 进行中（见下文 A-5） |
-| A-6 | 原表导入（A08） | R3 | 未开始，下一批 |
+| A-6 | 原表导入（A08） | R3 | 进行中（见下文 A-6） |
 | — | 交易凭据导出（A14） | — | 不迁移：工作台只把只读密钥导出给交易中心的只读账本；本仓库没有这个账本，原油盈亏直接读执行账户，资产与交易同在一个进程 |
 
 ## A-1：只读账本与计算口径
@@ -215,3 +215,36 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
   - 页面纯函数：`test/monitor-trades.test.ts`、`test/monitor-related.test.ts`；
   - 导航与路由：`test/workspace-nav.test.ts`、`test/web.test.ts`；
   - 所有交易所读取都换成替身。
+
+## A-6：原表导入（A08）
+
+2026-11-16 开工。把工作台资产页「导入原表数据」搬过来：账本还是示例数据时，选一份由《资产统计.xlsx》生成的 JSON，先预览、再确认导入；导入前备份数据库。A14 不迁移（见批次表）。
+
+- **等级 R3**（账本整体替换、数据库备份）。
+- **对照的工作台代码**（`modules/asset/`，提交 `7745181`，这些文件与 `0014655` 相同）：
+  - `lib/import-ledger.ts`（`importPlan`、`importLedger`）、`lib/source-ledger.ts`（`IMPORT_MAX_BYTES`、`parseSource` 及其 zod 规则）；
+  - `app/api/import/route.ts`（`POST /api/import {source, apply}`）、`lib/api.ts`（请求体上限、`failure` 的报错口径）；
+  - `app/import-ledger-dialog.tsx`（预览与确认弹窗）、`app/dashboard.tsx`（示例数据提示里的「导入原表数据」按钮，弹窗打开时暂停自动刷新）、`app/globals.css` 第 114 行（`.import-notice`、`.import-summary`）；
+  - `scripts/import-workbook.py`（把原表转成 JSON；工作台由用户在命令行手动运行，服务端不调用它）。
+- **范围**：
+  - 服务端：`POST /api/asset/import`，在全局登录与页面请求标记检查之后，请求体上限 5 MB（单独放宽，其余接口仍是 16 KB）；规则照 `importLedger`：
+    - 不能导入示例；
+    - 同一份文件（sha256 指纹与上次导入相同）直接返回当前账本；
+    - 账本已不是示例数据时拒绝（工作台判定：`source-ledger` 的 `source` 不是示例标记）；
+    - 预览只返回摘要；应用时先备份数据库，再在一个事务里替换资产、写设置、把旧快照归档（`archived: true`，不进资产曲线）并写当天快照。
+  - 页面：资产页示例数据提示里加「导入原表数据」，原位展开导入面板（本页的弹窗都改成原位面板），文案、摘要与按钮照工作台。
+  - 脚本：`scripts/import-workbook.py` 照搬，仍由用户手动运行（需要 `openpyxl`），随安装包发布。
+- **并发**：导入的预览与应用都在同步锁（`sync_locks`）里进行，同工作台 `withLock`。
+  - 导入期间，A-2 的写入与 A-3 的同步取锁时得到 409「资产正在更新」；反过来，它们持锁时导入同样得到 409。
+  - 写入时同样核对 `import-info`：备份与写入之间，账本被「从工作台导入」整体替换时，本次导入什么都不写（409）。
+  - 页面上导入面板打开期间，跳过每分钟的自动同步（同工作台 `importOpenRef`）。
+- **影响面**：
+  - `src/asset/`：新增导入模块，补全 `source-ledger.ts` 的 `parseSource`，`store.ts` 加导入方法；
+  - `src/http.ts`：新接口与它的请求体上限；
+  - 资产页与样式、`deploy/package.sh`（打包脚本）、文档与测试。
+  - 库结构不变：只新增设置键 `source-import-hash`，以及数据目录下的 `asset-backups/`。
+  - 划转、ADL、原油、期权、监控不变。
+- **回滚**：
+  - 代码：`sudo bash install.sh --version v0.54.0`，不用改配置。旧版本照常读取导入后的账本，归档快照沿用已有的 `archived` 口径，`source-import-hash` 旧版不读。
+  - 数据（撤销某次导入）：停服务后，用 `asset-backups/before-import-<编号>.sqlite` 覆盖 `asset.sqlite`，并删除同目录的 `asset.sqlite-wal`、`-shm`，再启动。命令写在实施记录里。
+

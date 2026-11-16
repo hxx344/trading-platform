@@ -31,7 +31,7 @@ async function withHarness(run: (h: Harness) => Promise<void>) {
 test('意图：调平只收交易所、方式与最长时间（可选价格保护）；不收腿、合约、方向与数量；只用于海力士', () => {
   assert.deepEqual(parseIntent(rebalance('reduce')), { market: 'hynix', preset: 'rebalance', venue: 'binance', method: 'reduce', timeoutMs: 60_000, maxSlippageBps: null });
   assert.equal(parseIntent(rebalance('add', { venue: 'bybit', maxSlippageBps: 30 })).maxSlippageBps, 30);
-  for (const extra of [{ legs: [] }, { symbol: 'SKHYUSDT' }, { action: 'close' }, { quantity: '1' }, { notional: '10' }, { batches: { count: 2, intervalMs: 0 } }]) {
+  for (const extra of [{ legs: [] }, { symbol: 'SKHYUSDT' }, { action: 'close' }, { quantity: '1' }, { notional: '10' }, { batches: { count: 2, intervalMs: 0 } }, { batches: { count: 2, intervalMs: 0, fit: true } }, { priceBound: '1' }]) {
     assert.throws(() => parseIntent(rebalance('reduce', extra)), code('unknown_field'), JSON.stringify(extra));
   }
   assert.throws(() => parseIntent(rebalance('reduce', { market: 'oil' })), code('rebalance_market'));
@@ -190,6 +190,8 @@ test('IOC 部分成交记为完成并写明数量；零成交记为失败；都�
   const none = await settle(h, (await previewAndConfirm(h, rebalance('reduce'))).jobId);
   assert.equal(none.status, 'failed');
   assert.match(none.reason ?? '', /调平委托未成交/);
+  // The spread rules' recount codes (docs/hynix.md 8.2) belong to two-leg jobs; a rebalance's zero fill never carries one.
+  assert.equal(none.endCode, null);
   assert.equal(h.binance.position(BN, 'SKHYUSDT', 'short'), '3.8');
   assert.equal(none.locked, false);
   assert.equal(h.binance.calls.place, 2);

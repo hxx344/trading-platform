@@ -175,7 +175,7 @@ feat(monitor): 一句中文摘要
 建议：
 ```
 
-在 Claude Code 里可以用 `/review <范围>` 发起，命令定义在 `.claude/commands/review.md`。
+`/review <范围>` 只在 Claude Code 里可用，命令定义在 `.claude/commands/review.md`。其他代理没有这个命令，按本节把固定的差异范围、本文件与待核查重点交给只读审查者。
 
 ### 修复与复核
 

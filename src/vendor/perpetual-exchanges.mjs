@@ -1,5 +1,6 @@
 // 复制自 project-aggregation 工作台 modules/monitor/modules/perpetual/exchanges.mjs（提交 c84ba27），改了相对导入路径；另有两处本服务的修正：
 // OKX 改连 443 端口（8443 将停用），OKX 的 notice 消息不当作订阅失败（工作台会因此反复重连、取不到 OKX 行情）。
+// O7（docs/oil.md 第 12 节）：Binance 合约发现另收 TRADIFI_PERPETUAL（原油、海力士等），原油与海力士的自动规则复用这些盘口；工作台排除它们。
 // 11 家交易所的公开合约目录、WebSocket 订阅、消息解析与 REST 盘口快照；本服务的采集器在 src/monitor/perpetual.ts。
 /** Public, unauthenticated perpetual market adapters. No trading/account endpoints.
  * Protocol references were checked on 2026-09-19; see EXCHANGES[].docsUrl.
@@ -192,7 +193,7 @@ export async function discoverMarkets(exchangeId, { fetchImpl = fetch, signal, n
     const funding = fundingResult.status === 'fulfilled' && Array.isArray(fundingResult.value) ? fundingResult.value : null;
     const fundingBySymbol = new Map((funding || []).map(row => [row.symbol, number(row.fundingIntervalHours, true)]));
     rows = assertArray(symbolsResult.value.symbols, exchangeId)
-      .filter(row => row.status === 'TRADING' && row.contractType === 'PERPETUAL' && STABLE_QUOTES.has(row.quoteAsset) && row.marginAsset === row.quoteAsset)
+      .filter(row => row.status === 'TRADING' && (row.contractType === 'PERPETUAL' || (exchangeId === 'binance' && row.contractType === 'TRADIFI_PERPETUAL')) && STABLE_QUOTES.has(row.quoteAsset) && row.marginAsset === row.quoteAsset)
       .map(row => {
         const identity = classifyMarketIdentity(exchangeId, row.baseAsset, row);
         // Aster's published schedules distinguish RWA and USD1 contracts.

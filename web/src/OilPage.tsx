@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from './api.ts';
 import { clock, label, stamp } from './labels.ts';
 import { ACTIVE_STATUSES, CONFIRM_ACKNOWLEDGE, CONFIRM_NOT_CREATED, CONFIRM_RELEASE, DEFAULT_FORM, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, describeFourLeg, describeIntent, draftFourLegs, fourLegFormToIntent, hedgeVenueFor, leadTypeAllowed, draftLegs, formToIntent, jobActions, type OilForm, type OilFourLegIntent, type OilIntent, type OilLeadType, type OilSymbol, type OilVenue } from './oil-form.ts';
-import { crossPairs, type OilBook, type OilConfirmResult, type OilJob, type OilMarket, type OilPositionAccount, type OilPreview, type OilPreviewLeg, type OilState } from './oil-types.ts';
+import { bookTitle, crossPairs, type OilBook, type OilConfirmResult, type OilJob, type OilMarket, type OilPositionAccount, type OilPreview, type OilPreviewLeg, type OilState } from './oil-types.ts';
 import { groupJobs, groupStatus, isFourLegPreview, type FourLegConfirmResult, type FourLegPreview, type GroupState } from './four-leg.ts';
 import { RequestIds } from './request-ids.ts';
 import { StatePanel } from './StateViews.tsx';
@@ -96,7 +96,7 @@ function MarketPanel({ live }: { live: LiveResource<OilMarket> }) {
     const broken = row.failedAt !== null && (row.receivedAt === null || row.failedAt > row.receivedAt);
     if (broken && row.bid === null) return <span className="spread-error">读取失败：{row.error ?? '未知原因'}</span>;
     const late = broken || old(row.receivedAt);
-    return <span className={late ? 'spread-stale' : undefined} title={`盘口时间 ${clock(row.receivedAt)}${late ? '（已过期）' : ''}`}>{row.bid ?? '—'} / {row.ask ?? '—'}{late ? <small>{broken ? `读取失败：${row.error ?? '未知原因'}` : `已过期 · ${clock(row.receivedAt)}`}</small> : null}</span>;
+    return <span className={late ? 'spread-stale' : undefined} title={bookTitle(clock(row.receivedAt), row.source, late)}>{row.bid ?? '—'} / {row.ask ?? '—'}{late ? <small>{broken ? `读取失败：${row.error ?? '未知原因'}` : `已过期 · ${clock(row.receivedAt)}`}</small> : null}</span>;
   };
   const spread = (label: string, value: string | null, at: number | null): ReactNode => <td data-label={label} className={value !== null && old(at) ? 'spread-stale' : undefined}>{value ?? '—'}{value !== null && old(at) ? <small>过期</small> : null}</td>;
   return <section className="trading-panel spread-panel" id="oilMarket" aria-labelledby="oil-market-title">

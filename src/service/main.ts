@@ -30,6 +30,8 @@ import { createUpdates, readInstalledVersion, updateReadyFile, type InstalledVer
 import { hynixBalanceCheck, hynixBusy, hynixViews, oilLoops, oilViews, openHynixBalance, openOilPnl, openOilRules, prepareOil, registerOilAccounts, strandedOilJobs, type OilRuntime } from './oil.ts';
 import { oilSummary } from './oil-config.ts';
 import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, settleMonitor, stopMonitor, type MonitorRuntime } from './monitor.ts';
+import type { PerpetualMonitor } from '../monitor/perpetual.ts';
+import { pushedBooks } from '../oil/pushed.ts';
 import { monitorSummary } from './monitor-config.ts';
 import { assetSummary } from './asset-config.ts';
 import { ASSET_DB_FILE } from '../asset/db.ts';
@@ -247,8 +249,12 @@ export async function startService(options: StartOptions): Promise<ReturnType<ty
 
 async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, watchOptions, updateFetch }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
   const session = keptSession(dir);
+  // O7: the oil and hynix books come from the market monitor's perpetual collector when it has a recent one (oil/pushed.ts);
+  // the monitor opens further down, so the source looks it up on each read (no collector: every leg is read over REST).
+  let collector: PerpetualMonitor | null = null;
+  const pushed = pushedBooks(() => collector, Date.now);
   // Oil accounts are locked and checked before the store opens: a failed check refuses start (oil.ts).
-  const oil = config.oil ? await prepareOil(config.oil, secrets.exchanges, oilFetch ? { fetchImpl: oilFetch } : {}) : undefined;
+  const oil = config.oil ? await prepareOil(config.oil, secrets.exchanges, { ...(oilFetch ? { fetchImpl: oilFetch } : {}), pushed }) : undefined;
   // Options is locked and checked too, but a failed start only disables options: it is retried in the background and the
   // rest of the service runs (options.ts createOptionsSupervisor). Its task messages wait here until the notifier exists.
   let optionsNotify: ((text: string) => void) | null = null;
@@ -339,7 +345,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   }
   if (config.monitor) {
     const alertHooks = marketAlertHooks({ secrets, notifier, monitorOutbox, monitorOutboxError, send: (secret, text) => sendFeishu(secret, { msg_type: 'text', content: { text } }, notifyFetch ? { fetchImpl: notifyFetch } : {}) });
-    try { monitor = openMonitor(config.monitor, dir, { ...(monitorFetch ? { fetchImpl: monitorFetch } : {}), alertHooks }); }
+    try { monitor = openMonitor(config.monitor, dir, { ...(monitorFetch ? { fetchImpl: monitorFetch } : {}), alertHooks }); collector = monitor.perpetual; }
     catch (error) { monitorError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`行情监控库无法打开，行情监控页不可用：${monitorError}\n`); }
   }
   const closeMonitorStore = () => { if (monitor) closeMonitor(monitor); };

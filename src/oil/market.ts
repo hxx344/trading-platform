@@ -1,9 +1,12 @@
 // Oil market and position display for the service page. Reads only: the books of BZUSDT and CLUSDT on each configured
 // venue every few seconds and the configured accounts' oil positions a little less often. Nothing here feeds a preview or a
 // send (those read their own books); a failed read keeps the last good value and says when it was read and when it failed.
+// O7: a leg whose book the market monitor's collector pushed within the last round is taken from there (src/oil/pushed.ts);
+// the other legs are read over REST as before. Each book says which (`source`).
 import { sub } from '../decimal.ts';
 import { OIL_SYMBOLS, VENUES, VENUE_NAMES, accountKey, parseAccountSnapshot, parseQuote, positionOf, type AccountBinding, type Venue } from '../contracts.ts';
 import type { VenueConnector } from '../connector.ts';
+import type { PushedBooks } from './pushed.ts';
 
 /** Book read spacing and the timeout of one read; a read is never retried, the next round reads again. */
 export const MARKET_READ_MS = 3_000;
@@ -13,7 +16,9 @@ export const POSITIONS_READ_MS = 15_000;
 export const POSITIONS_TIMEOUT_MS = 10_000;
 
 const BZ = 'BZUSDT', CL = 'CLUSDT';
-export interface BookSlot { bid: string | null; ask: string | null; receivedAt: number | null; failedAt: number | null; error: string | null }
+/** `receivedAt` is this host's receive time for a REST read and the venue's book time for a pushed one (`source`). */
+export type BookSource = 'pushed' | 'rest';
+export interface BookSlot { bid: string | null; ask: string | null; receivedAt: number | null; source: BookSource | null; failedAt: number | null; error: string | null }
 interface PositionSlot { long: Record<string, string> | null; short: Record<string, string> | null; openOrders: number | null; receivedAt: number | null; failedAt: number | null; error: string | null }
 
 const message = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 160);
@@ -34,6 +39,8 @@ export interface OilMarketOptions {
   now?: () => number;
   quoteTimeoutMs?: number;
   positionsTimeoutMs?: number;
+  /** O7: the market monitor's pushed books; without it (or without a usable book for a leg) every leg is read over REST. */
+  pushed?: PushedBooks;
 }
 
 export interface MarketReaderOptions extends OilMarketOptions { symbols: readonly string[] }
@@ -42,13 +49,13 @@ export interface MarketReaderOptions extends OilMarketOptions { symbols: readonl
  * The books of these contracts on each configured venue and the accounts' positions in them, read on demand; a failed read
  * keeps the last good value. The oil and hynix views build their spreads on it.
  */
-export function createMarketReader({ connectors, accounts, symbols, now = Date.now, quoteTimeoutMs = MARKET_TIMEOUT_MS, positionsTimeoutMs = POSITIONS_TIMEOUT_MS }: MarketReaderOptions) {
+export function createMarketReader({ connectors, accounts, symbols, now = Date.now, quoteTimeoutMs = MARKET_TIMEOUT_MS, positionsTimeoutMs = POSITIONS_TIMEOUT_MS, pushed }: MarketReaderOptions) {
   const venues = connectors.map(connector => connector.venue);
   const books = new Map<string, BookSlot>();
   const slot = (venue: Venue, symbol: string): BookSlot => {
     const key = `${venue}:${symbol}`;
     let found = books.get(key);
-    if (!found) { found = { bid: null, ask: null, receivedAt: null, failedAt: null, error: null }; books.set(key, found); }
+    if (!found) { found = { bid: null, ask: null, receivedAt: null, source: null, failedAt: null, error: null }; books.set(key, found); }
     return found;
   };
   const positions = new Map<string, PositionSlot>(accounts.map(account => [accountKey(account), { long: null, short: null, openOrders: null, receivedAt: null, failedAt: null, error: null }]));
@@ -58,8 +65,11 @@ export function createMarketReader({ connectors, accounts, symbols, now = Date.n
     await Promise.all(connectors.flatMap(connector => symbols.map(async symbol => {
       const target = slot(connector.venue, symbol);
       try {
+        // A pushed book never moves a leg back in time (a REST read may have landed after the venue time of the pushed one).
+        const book = pushed?.(connector.venue, symbol) ?? null;
+        if (book && (target.receivedAt === null || book.at >= target.receivedAt)) { Object.assign(target, { bid: book.bid, ask: book.ask, receivedAt: book.at, source: 'pushed', error: null }); return; }
         const quote = parseQuote(await bounded(signal => connector.quote(symbol, { signal }), quoteTimeoutMs), connector.venue, symbol);
-        Object.assign(target, { bid: quote.bid, ask: quote.ask, receivedAt: quote.receivedAt, error: null });
+        Object.assign(target, { bid: quote.bid, ask: quote.ask, receivedAt: quote.receivedAt, source: 'rest', error: null });
       } catch (error) { Object.assign(target, { failedAt: now(), error: message(error) }); }
     })));
     quotesReadAt = now();

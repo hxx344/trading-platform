@@ -2,7 +2,11 @@
 import type { Account } from './types.ts';
 import type { OilIntent } from './oil-form.ts';
 
-export interface OilBook { venue: string; symbol: string; bid: string | null; ask: string | null; receivedAt: number | null; failedAt: number | null; error: string | null }
+/** O7: `pushed` = the market monitor's collector (venue time), `rest` = this service's own read (receive time); absent before v0.59.0. */
+export interface OilBook { venue: string; symbol: string; bid: string | null; ask: string | null; receivedAt: number | null; source?: 'pushed' | 'rest' | null; failedAt: number | null; error: string | null }
+/** The book cell's hover text: its time, where it came from, and whether it is stale. */
+export const bookTitle = (time: string, source: OilBook['source'], late: boolean): string =>
+  `盘口时间 ${time}${source === 'pushed' ? ' · 行情监控推送' : source === 'rest' ? ' · 交易所接口读取' : ''}${late ? '（已过期）' : ''}`;
 export interface OilMarket {
   now: number; readAt: number | null; readEveryMs: number; timeoutMs: number;
   books: OilBook[];

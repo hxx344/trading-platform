@@ -5,7 +5,7 @@ import { clock, label } from './labels.ts';
 import { ACTIVE_STATUSES, type OilVenue } from './oil-form.ts';
 import { DEFAULT_HYNIX_FORM, HYNIX_LABEL, LEG_FIELDS, HYNIX_SYMBOLS, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, hedgeVenueFor, closeQuantities, describeHynixFourLeg, describeHynixIntent, draftHynixFourLegs, draftHynixLegs, hynixFormToIntent, hynixFourLegFormToIntent, leadTypeAllowed, type HynixForm, type HynixFourLegIntent, type HynixIntent, type HynixSymbol } from './hynix-form.ts';
 import { isFourLegPreview, type FourLegConfirmResult, type FourLegPreview } from './four-leg.ts';
-import { crossPairs, type CrossRow, type HynixState, type OilBook, type OilConfirmResult, type OilJob, type OilPreview, type OilState } from './oil-types.ts';
+import { bookTitle, crossPairs, type CrossRow, type HynixState, type OilBook, type OilConfirmResult, type OilJob, type OilPreview, type OilState } from './oil-types.ts';
 import { BalancePanel } from './HynixBalance.tsx';
 import { readBalance } from './hynix-balance.ts';
 import { ACCOUNT_MODE, ACTIVE_MS, Choice, IDLE_MS, JOB_STATUS, JobsSection, LEAVE_UNANSWERED, MARKET_MS, OIL_READ_TIMEOUT_MS, ORDER_TYPE, PositionsPanel, SyncLine, buys, confirmRefused, errorText, operation, staleness, statusOf, venueName, FourLegInputs, FourLegPreviewCard, chased, venuePairs, type PositionsKind } from './OilPage.tsx';
@@ -46,7 +46,7 @@ function MarketPanel({ live }: { live: LiveResource<HynixMarket> }) {
     const broken = row.failedAt !== null && (row.receivedAt === null || row.failedAt > row.receivedAt);
     if (broken && row.bid === null) return <span className="spread-error">读取失败：{row.error ?? '未知原因'}</span>;
     const late = broken || old(row.receivedAt);
-    return <span className={late ? 'spread-stale' : undefined} title={`盘口时间 ${clock(row.receivedAt)}${late ? '（已过期）' : ''}`}>{row.bid ?? '—'} / {row.ask ?? '—'}{late ? <small>{broken ? `读取失败：${row.error ?? '未知原因'}` : `已过期 · ${clock(row.receivedAt)}`}</small> : null}</span>;
+    return <span className={late ? 'spread-stale' : undefined} title={bookTitle(clock(row.receivedAt), row.source, late)}>{row.bid ?? '—'} / {row.ask ?? '—'}{late ? <small>{broken ? `读取失败：${row.error ?? '未知原因'}` : `已过期 · ${clock(row.receivedAt)}`}</small> : null}</span>;
   };
   const cell = (heading: string, value: string | null, at: number | null): ReactNode => <td data-label={heading} className={value !== null && old(at) ? 'spread-stale' : undefined}>{value ?? '—'}{value !== null && old(at) ? <small>过期</small> : null}</td>;
   return <section className="trading-panel spread-panel" id="hynixMarket" aria-labelledby="hynix-market-title">

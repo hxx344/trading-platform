@@ -481,6 +481,15 @@ export function createPerpetualMonitor({
 
   return {
     running: (): boolean => running,
+    /**
+     * O7 (docs/oil.md section 12): one contract's committed best bid and ask with their time (the earlier of the venue's bid and
+     * ask times), for the oil and hynix book readers; null while stopped or without a book. Read only.
+     */
+    book(exchange: string, symbol: string): { bid: number; ask: number; at: number; multiplier: number } | null {
+      const quote = running ? quotes.get(`${exchange}:${symbol}`) : undefined;
+      if (!quote || quote.bid === null || quote.ask === null || !Number.isFinite(quote.bidAskAt)) return null;
+      return { bid: quote.bid, ask: quote.ask, at: quote.bidAskAt!, multiplier: quote.multiplier ?? 1 };
+    },
     /** Starts discovery and the connections; idempotent. */
     start(): void {
       if (running) return;

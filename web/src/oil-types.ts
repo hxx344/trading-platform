@@ -32,7 +32,7 @@ export interface OilOperation {
 }
 export interface OilJobLeg {
   venue: string; symbol: string; side: string; orderSide: string; orderType: string; plannedQuantity: string; accountId: string; priceBound: string | null; limitPrice?: string | null;
-  contractSize: string; quantityStep?: string; fillSlack?: string; plannedBarrels: string; filledBarrels: string; averagePrice: string | null; previewQuote: { bid: string; ask: string };
+  contractSize: string; quantityStep?: string; skippedQuantity?: string; plannedBarrels: string; filledBarrels: string; averagePrice: string | null; previewQuote: { bid: string; ask: string };
   attempts: number; filledQuantity: string; operation: OilOperation | null;
 }
 export interface OilJob {

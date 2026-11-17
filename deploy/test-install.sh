@@ -272,6 +272,28 @@ TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workben
 check '--monitor-paper 写待载入文件、仅服务账户可读写，不碰持仓记录' '[[ $status -eq 0 && "$(stat -c %a "$TP_DATA_DIR/perpetual-paper-positions.import.json")" == 600 && ! -e "$TP_DATA_DIR/perpetual-paper-positions.json" ]] && grep -q "已写入持仓记录 2 条（待载入文件）" "$tmp/out" && grep -q "install-s1" "$TP_DATA_DIR/perpetual-paper-positions.import.json"'
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor-paper && status=0 || status=$?
 check '重复导入持仓记录时跳过' '[[ $status -eq 0 ]] && grep -q "跳过持仓记录：本服务已有这些记录" "$tmp/out"'
+# The workbench Ondo module (docs/ondo.md §8): its settings come over in observe mode; the key only once the workbench
+# has no session record left, which the second import then adds to the module already enabled.
+run --package "$tmp/a" --ondo && status=0 || status=$?
+check '--ondo 须和 --import-workbench 一起用' '[[ $status -ne 0 ]] && grep -q -- "--ondo 须和 --import-workbench 一起使用" "$tmp/out"'
+mkdir -p "$tmp/wb/data/ondo-mm"
+(cd "$root" && node --input-type=module -e '
+  const { readFileSync, writeFileSync } = await import("node:fs");
+  const { randomBytes, createCipheriv } = await import("node:crypto");
+  const { ONDO_MM_DEFAULTS } = await import("./src/vendor/ondo/mm.mjs");
+  const dir = process.argv[1], key = readFileSync(dir + "/credentials.key");
+  const encrypt = value => { const iv = randomBytes(12); const cipher = createCipheriv("aes-256-gcm", key, iv); const data = Buffer.concat([cipher.update(JSON.stringify(value)), cipher.final()]); return Buffer.concat([iv, cipher.getAuthTag(), data]).toString("base64"); };
+  writeFileSync(dir + "/ondo-mm/config.json", JSON.stringify({ revision: 3, config: { ...ONDO_MM_DEFAULTS, mode: "live", markets: ["NVDA-USD.P", "TSLA-USD.P"], orderUsd: "250", maxPositionUsd: "250" } }));
+  writeFileSync(dir + "/ondo-mm/credentials.json", JSON.stringify({ hint: "9876", value: encrypt({ keyId: "ondokey-install-9876", secret: "ondosecret-" + "x".repeat(24) }) }));
+  writeFileSync(dir + "/ondo-mm/session.json", JSON.stringify({ startedAt: new Date().toISOString(), prefix: "omm-abc-" }));
+' "$tmp/wb/data")
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --ondo && status=0 || status=$?
+check '--ondo 在工作台仍有会话记录时只启用模块、不导入 API Key' '[[ $status -eq 0 ]] && grep -q "导入 Ondo 挂单奖励（未导入 API Key：工作台 Ondo 挂单仍在实盘" "$tmp/out" && grep -q "\"orderUsd\": \"250\"" "$TP_CONF_DIR/config.json" && grep -q "\"mode\": \"observe\"" "$TP_CONF_DIR/config.json" && ! grep -q "\"ondo\"" "$TP_CONF_DIR/secrets.json" && grep -q "Ondo 挂单奖励（未配置 API Key，只能观察）" "$tmp/out"'
+rm "$tmp/wb/data/ondo-mm/session.json"
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --ondo && status=0 || status=$?
+check '--ondo 在会话结束后补入 API Key、输出不含 Secret' '[[ $status -eq 0 ]] && grep -q "已在本项目配置中，补入 API Key \*\*\*9876" "$tmp/out" && grep -q "ondosecret-x" "$TP_CONF_DIR/secrets.json" && grep -q "Ondo 挂单奖励（API Key \*\*\*9876）" "$tmp/out" && ! grep -q "ondosecret" "$tmp/out"'
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --ondo && status=0 || status=$?
+check '重复导入 Ondo 时保留现有设置' '[[ $status -eq 0 ]] && grep -q "已在本项目配置中（含 API Key），保留现有设置" "$tmp/out" && grep -q "没有新的Ondo 挂单奖励，配置未改动" "$tmp/out"'
 fi
 
 if part_is 3; then

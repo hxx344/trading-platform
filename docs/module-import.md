@@ -113,3 +113,14 @@ sudo bash install.sh --import-workbench --monitor --asset [--asset-owner <用户
 - 页面请求：`POST /api/import` 新增 `crossex`，只能是 `true`，可单独使用，预览不能带。结果新增 `crossex`（`{ accountId, status, detail, warning? }`，`accountId` 为 UID 末四位 `***xxxx`）与 `crossexError`（读不到工作台时的原因）；预览消息加“；CrossEx 账户可以导入 / 不能导入”。
 - 命令行：`sudo bash install.sh --import-workbench --crossex`（可与 `--pairs`、`--oil`、`--options`、`--monitor`、`--asset` 同用）；导入器参数 `--crossex`，须带 `--data-dir`（安装脚本传入，已带 `--asset` 时不重复）。旧版本包不支持时报“版本 … 不支持 --crossex”。
 - 测试：`test/crossex-service.test.ts` 的导入部分（解密、各拒绝原因、租约提示、不覆盖、只写一次设置、页面请求、助手预览与导入）；`deploy/test-install.sh` 未加 `--crossex` 用例。
+
+## 10 Ondo 挂单奖励
+
+工作台 Ondo 挂单模块的设置与 API Key，规则见 [ondo.md](ondo.md) 第 8 节。实现：`src/service/import-ondo.ts`。
+
+- 读取：`<DATA_DIR>/ondo-mm/{config.json,credentials.json,session.json}` 与 `<DATA_DIR>/credentials.key`，须为普通文件（不跟随符号链接），单个不超过 64 KB，密钥须 32 字节。以目录属主身份、空环境的子进程读出，解密在导入进程里做，失败只报固定原因。没有 `ondo-mm` 目录时照样可以启用（只观察）。
+- 计划：`config.json` 写 `ondo: { initial }`（工作台设置通过校验时带上，模式一律改为观察）或 `ondo: {}`；有 Key 且工作台没有 `session.json` 时 `secrets.json` 写 `ondo: { keyId, secret }`。已有 `ondo` 时保留设置，只补缺少的 Key；`secrets.json` 已有 `ondo` 时不覆盖。
+- 页面请求：`POST /api/import` 新增 `ondo`，只能是 `true`，可单独使用，预览不能带。结果新增 `ondo`（`{ keyId, status, detail, warning? }`，`keyId` 为末四位 `***xxxx`）与 `ondoError`；预览消息加“；Ondo 挂单奖励可以启用 / 不导入”。
+- 命令行：`sudo bash install.sh --import-workbench --ondo`（可与其他模块同用）；导入器参数 `--ondo`，不需要 `--data-dir`。旧版本包不支持时报“版本 … 不支持 --ondo”。
+- 测试：`test/ondo-service.test.ts`（解密、会话记录、符号链接与密钥长度、计划各分支、页面请求）；`deploy/test-install.sh` 第 2 部分（会话记录在时不导入 Key、移走后补入 Key、重复导入不改动）。
+

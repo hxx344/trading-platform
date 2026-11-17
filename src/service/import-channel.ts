@@ -11,6 +11,7 @@ import type { ImportItem, OilItem, PreviewItem } from './import-workbench.ts';
 import type { OptionsItem } from './import-options.ts';
 import type { AssetItem, MonitorItem } from './import-modules.ts';
 import type { CrossexItem } from './import-crossex.ts';
+import type { OndoItem } from './import-ondo.ts';
 import type { MonitorAlertsItem } from './import-monitor-alerts.ts';
 import type { MonitorVariationalItem } from './import-monitor-variational.ts';
 import type { MonitorPaperItem } from './import-monitor-paper.ts';
@@ -28,7 +29,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 export const ASSET_OWNER = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$/;
 
 export type ImportAction = 'preview' | 'import';
-export interface ImportRequest { id: string; action: ImportAction; pairs?: string[]; oil?: true; options?: true; monitor?: true; monitorAlerts?: true; monitorVariational?: true; monitorPaper?: true; asset?: true; assetOwner?: string; crossex?: true; at: number }
+export interface ImportRequest { id: string; action: ImportAction; pairs?: string[]; oil?: true; options?: true; monitor?: true; monitorAlerts?: true; monitorVariational?: true; monitorPaper?: true; asset?: true; assetOwner?: string; crossex?: true; ondo?: true; at: number }
 export interface ImportResult {
   /** The request answered; null when the request file itself could not be read. */
   id: string | null;
@@ -70,11 +71,15 @@ export interface ImportResult {
   crossex?: CrossexItem;
   /** Why the CrossEx account could not be read. */
   crossexError?: string;
+  /** The Ondo maker-reward module (key id masked): previewed, or what the import did with it. */
+  ondo?: OndoItem;
+  /** Why the workbench's Ondo files could not be read. */
+  ondoError?: string;
   notes?: string[];
 }
 
-type ImportBody = { action: ImportAction; pairs?: string[]; oil?: true; options?: true; monitor?: true; monitorAlerts?: true; monitorVariational?: true; monitorPaper?: true; asset?: true; assetOwner?: string; crossex?: true };
-const OPTIONAL_KEYS = ['pairs', 'oil', 'options', 'monitor', 'monitorAlerts', 'monitorVariational', 'monitorPaper', 'asset', 'assetOwner', 'crossex'];
+type ImportBody = { action: ImportAction; pairs?: string[]; oil?: true; options?: true; monitor?: true; monitorAlerts?: true; monitorVariational?: true; monitorPaper?: true; asset?: true; assetOwner?: string; crossex?: true; ondo?: true };
+const OPTIONAL_KEYS = ['pairs', 'oil', 'options', 'monitor', 'monitorAlerts', 'monitorVariational', 'monitorPaper', 'asset', 'assetOwner', 'crossex', 'ondo'];
 
 /** What the page may ask for: a preview of everything the workbench has, or importing the chosen parts. */
 export function parseImportBody(raw: unknown): ImportBody {
@@ -92,19 +97,20 @@ export function parseImportBody(raw: unknown): ImportBody {
   if (value.monitorPaper !== undefined && (value.monitorPaper !== true || value.monitor !== true)) throw new ContractError(400, 'import_monitor', 'monitorPaper 只能是 true，且须和 monitor 一起使用');
   if (value.asset !== undefined && value.asset !== true) throw new ContractError(400, 'import_asset', 'asset 只能是 true');
   if (value.crossex !== undefined && value.crossex !== true) throw new ContractError(400, 'import_crossex', 'crossex 只能是 true');
+  if (value.ondo !== undefined && value.ondo !== true) throw new ContractError(400, 'import_ondo', 'ondo 只能是 true');
   const asset = value.asset === true;
   if (!asset && value.assetOwner !== undefined) throw new ContractError(400, 'import_asset', 'assetOwner 须和 asset 一起使用');
   if (asset && (typeof value.assetOwner !== 'string' || !ASSET_OWNER.test(value.assetOwner))) throw new ContractError(400, 'import_asset', '导入资产账本须选择一个工作台用户（1–64 个字符，字母、数字或 . _ @ -，以字母或数字开头）');
-  const oil = value.oil === true, options = value.options === true, monitor = value.monitor === true, crossex = value.crossex === true, module = oil || options || monitor || asset || crossex;
+  const oil = value.oil === true, options = value.options === true, monitor = value.monitor === true, crossex = value.crossex === true, ondo = value.ondo === true, module = oil || options || monitor || asset || crossex || ondo;
   // A module may come over on its own; then no pair is chosen.
   const pairs = value.pairs ?? (module ? [] : undefined);
-  if (!Array.isArray(pairs) || pairs.length < (module ? 0 : 1) || pairs.length > MAX_PAIRS) throw new ContractError(400, 'import_pairs', module ? `配对至多 ${MAX_PAIRS} 个` : `请选择 1–${MAX_PAIRS} 个配对，或勾选导入原油执行账户 / 期权账户 / 行情监控 / 资产账本 / CrossEx 账户`);
+  if (!Array.isArray(pairs) || pairs.length < (module ? 0 : 1) || pairs.length > MAX_PAIRS) throw new ContractError(400, 'import_pairs', module ? `配对至多 ${MAX_PAIRS} 个` : `请选择 1–${MAX_PAIRS} 个配对，或勾选导入原油执行账户 / 期权账户 / 行情监控 / 资产账本 / CrossEx 账户 / Ondo 挂单奖励`);
   if (!pairs.every(id => typeof id === 'string' && PAIR_ID.test(id))) throw new ContractError(400, 'import_pairs', '配对 id 无效');
   if (new Set(pairs).size !== pairs.length) throw new ContractError(400, 'import_pairs', '配对重复');
   return {
     action: 'import', pairs: pairs as string[], ...(oil ? { oil: true as const } : {}), ...(options ? { options: true as const } : {}),
     ...(monitor ? { monitor: true as const } : {}), ...(value.monitorAlerts === true ? { monitorAlerts: true as const } : {}), ...(value.monitorVariational === true ? { monitorVariational: true as const } : {}), ...(value.monitorPaper === true ? { monitorPaper: true as const } : {}), ...(asset ? { asset: true as const, assetOwner: value.assetOwner as string } : {}),
-    ...(crossex ? { crossex: true as const } : {}),
+    ...(crossex ? { crossex: true as const } : {}), ...(ondo ? { ondo: true as const } : {}),
   };
 }
 

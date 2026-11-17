@@ -30,7 +30,7 @@ test('groups follow the plan order and leave out workspaces without an entry', (
   assert.deepEqual(all.map(group => group.label), ['总览与资产', '市场与机会', '交易中心', '策略与风险', '期权', '系统']);
   assert.deepEqual(all[0]!.entries, ['asset', 'positions'], '持仓在资产之后');
   assert.deepEqual(all.at(-1)!.entries, ['status', 'logs', 'settings']);
-  assert.deepEqual(all.find(group => group.id === 'trading')!.entries, ['oil', 'hynix', 'crossex'], '海力士在原油之后、CrossEx 之前');
+  assert.deepEqual(all.find(group => group.id === 'trading')!.entries, ['oil', 'hynix', 'crossex', 'ondo'], '海力士在原油之后、CrossEx 之前，Ondo 最后');
   assert.deepEqual(all.map(group => group.id), ['overview', 'market', 'trading', 'strategy', 'options', 'system']);
   // A service with only the ASTER pairs (no oil, options, monitor, asset or CrossEx configured).
   const bare = workspaceGroups(new Set<NavEntry>(['pairs', 'status', 'logs', 'settings']));

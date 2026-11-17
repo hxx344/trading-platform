@@ -1,0 +1,86 @@
+/* Ondo 挂单奖励页（web/src/ondo/OndoPage.tsx）。
+   第一部分复制自 project-aggregation 工作台 src/ondo-mm.css（提交 7745181），未改动。 */
+.om-layout{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:16px;align-items:start}
+.om-column{display:flex;flex-direction:column;gap:16px;min-width:0}
+.om-facts{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:10px;font-size:.8125rem;color:var(--text-secondary)}
+.om-table{overflow-x:auto}
+.om-table table{width:100%;border-collapse:collapse;font-size:.8125rem}
+.om-table th,.om-table td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--surface-4);vertical-align:top;white-space:nowrap}
+.om-table th{font-weight:500;color:var(--text-tertiary);font-size:.75rem}
+.om-table tr:last-child td{border-bottom:0}
+.om-table .num{text-align:right;font-variant-numeric:tabular-nums}
+.om-table small{display:block;color:var(--text-tertiary);font-size:.6875rem;white-space:normal}
+.om-hold{color:var(--warning)}
+.om-ok{color:var(--emerald)}
+.om-form{padding:16px}
+.om-grid{grid-template-columns:repeat(2,minmax(0,1fr));margin:0 0 14px}
+.om-modes{display:flex;flex-wrap:wrap;gap:8px 16px;margin-bottom:14px;font-size:.8125rem;color:var(--text-secondary)}
+.om-modes label{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
+.om-modes input{accent-color:var(--accent);margin:0}
+.om-confirm{margin:0 0 12px}
+.om-events{list-style:none;margin:0;padding:4px 16px 12px;max-height:420px;overflow-y:auto;font-size:.75rem}
+.om-events li{display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px;padding:6px 0;border-bottom:1px solid var(--surface-4);overflow-wrap:anywhere}
+.om-events li:last-child{border-bottom:0}
+.om-events time{color:var(--text-tertiary);font-variant-numeric:tabular-nums}
+.om-events b{font-weight:500;margin-right:6px}
+@media (max-width:1100px){.om-layout{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:640px){.om-grid{grid-template-columns:minmax(0,1fr)}}
+
+/* 工作台共享页面骨架里本服务 styles.css 还没有的规则：复制自工作台 src/styles.css（提交 7745181）第 342–343、477–503 行，
+   去掉 Aero 的 lp-* 别名。 */
+.checkbox-field{display:flex;align-items:center;gap:8px;font-size:.8125rem;color:var(--text-secondary);margin:2px 0 14px}
+.checkbox-field input{accent-color:var(--accent);width:15px;height:15px;margin:0;cursor:pointer}
+.wb-state.running{color:var(--emerald)}
+.wb-state.starting,.wb-state.stopping,.wb-paused{color:var(--warning)}
+.wb-state.fault{color:var(--error)}
+.wb-section{min-width:0;overflow:hidden}
+.wb-section fieldset{margin:0;border:0;padding:0 20px;min-width:0}
+.wb-section h3{font-size:.8125rem;font-weight:600;margin:18px 0 12px}
+.wb-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px 20px}
+.wb-field{display:flex;flex-direction:column;gap:6px;min-width:0;font-size:.75rem;color:var(--text-secondary)}
+.wb-field.wide{grid-column:span 3}
+.wb-field input{width:100%;min-width:0;height:36px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);padding:7px 10px;color:var(--text-primary);background:var(--surface-1);font-variant-numeric:tabular-nums}
+.wb-field input:disabled{color:var(--text-tertiary);background:var(--surface-2)}
+.wb-field small{font-size:.6875rem;line-height:1.65;color:var(--text-tertiary)}
+.wb-key-actions{display:flex;gap:8px;flex-wrap:wrap}
+.wb-key{display:flex;flex-direction:column;gap:12px;padding:0 20px 18px}
+.wb-events{list-style:none;margin:0;padding:0 20px 14px;max-height:420px;overflow-y:auto}
+.wb-events li{display:grid;grid-template-columns:120px 90px minmax(0,1fr);gap:10px;padding:8px 0;border-bottom:1px solid var(--surface-4);font-size:.75rem;align-items:baseline}
+.wb-events li:last-child{border-bottom:0}
+.wb-events time{color:var(--text-tertiary);font-variant-numeric:tabular-nums}
+.wb-events li.bad strong{color:var(--error)}
+@media(max-width:1100px){.wb-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.wb-field.wide{grid-column:span 2}}
+@media(max-width:650px){
+  .wb-heading{flex-direction:column}.wb-status{padding:16px}
+  .wb-grid{grid-template-columns:minmax(0,1fr);gap:14px}.wb-field.wide{grid-column:auto}.wb-field input{height:40px;font-size:16px}
+  .wb-section fieldset,.wb-key,.wb-events{padding-left:16px;padding-right:16px}
+  .wb-events li{grid-template-columns:minmax(0,1fr);gap:2px}
+}
+@media(prefers-reduced-motion:reduce){.wb-page .spin{animation:none}}
+
+/* 本服务新增：奖励市场盘口与收益模拟（OndoRewards.tsx），沿用上面 om-* 的表格与表单样式。 */
+.or-panel{display:flex;flex-direction:column}
+.or-heading-tools{display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:.75rem}
+.or-window{display:inline-flex;align-items:center;gap:6px;color:var(--text-secondary)}
+.or-window select,.or-sim select{height:30px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);padding:0 8px;color:var(--text-primary);background:var(--surface-1);font:inherit}
+.or-sim select{height:36px}
+.or-note{font-size:.75rem;line-height:1.7;margin:0 0 14px}
+.or-grid{grid-template-columns:repeat(4,minmax(0,1fr));margin:0 0 12px}
+.or-grid .wb-field.wide{grid-column:1/-1}
+.or-actions{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap}
+.or-actions .checkbox-field{margin:0}
+.or-settings{margin-top:14px;padding-top:14px;border-top:1px solid var(--surface-4)}
+.or-table tfoot th,.or-table tfoot td{border-top:1px solid var(--surface-5);font-weight:600}
+.or-toggle{display:inline-flex;align-items:center;gap:4px;border:0;background:none;color:inherit;font:inherit;font-weight:600;padding:0;cursor:pointer}
+.or-toggle svg{color:var(--text-tertiary)}
+.or-loss{color:var(--error)}
+.or-detail-row>td{background:var(--surface-2);white-space:normal}
+.or-detail{display:flex;flex-direction:column;gap:12px;padding:4px 0}
+.or-detail>p{margin:0;font-size:.75rem}
+.or-books{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.or-levels{min-width:0;overflow-x:auto}
+.or-levels h3{font-size:.75rem;font-weight:600;margin:0 0 6px;color:var(--text-secondary)}
+.or-levels table{width:100%;border-collapse:collapse}
+.or-levels th,.or-levels td{padding:4px 8px}
+@media (max-width:1100px){.or-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:640px){.or-grid,.or-books{grid-template-columns:minmax(0,1fr)}}

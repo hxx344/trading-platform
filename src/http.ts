@@ -14,6 +14,7 @@ import { supportsExchange, type Exchange } from './vendor/exchange-comparison.mj
 import { supportsFundingHistory } from './vendor/exchange-funding-history.mjs';
 import type { AssetStore } from './asset/store.ts';
 import type { CrossexViews } from './service/crossex.ts';
+import type { OndoViews } from './service/ondo.ts';
 import { AssetConflict } from './asset/sync-lock.ts';
 import { AssetInputError, INPUT_INVALID } from './asset/validation.ts';
 import { AssetBackupError } from './asset/source-import.ts';
@@ -159,6 +160,8 @@ export interface ServiceViews {
   asset?: Omit<AssetStore, 'close'>;
   /** The Gate CrossEx module's reads and writes (service/crossex.ts); absent when the service runs without crossex, 503 while it has not started. */
   crossex?: CrossexViews;
+  /** The Ondo maker-reward module (service/ondo.ts, docs/ondo.md); absent without config.ondo. */
+  ondo?: OndoViews;
   /** The online update (service/update.ts): versions, a manual check, and the request to the root update helper. */
   update?: { status(): unknown; check(): Promise<unknown>; apply(body: unknown): unknown };
 }
@@ -602,6 +605,32 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
         const failure = crossex.failure(error);
         // Anything not raised as the runtime's own error is answered with a fixed text (it may carry internals) and logged.
         if (failure.internal) process.stderr.write(`CrossEx 接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}\n`);
+        return send(response, failure.status, failure.body);
+      }
+      return send(response, 404, { code: 'not_found', message: '不存在' });
+    }
+    if (url.pathname.startsWith('/api/ondo/')) {
+      if (!views?.ondo) return send(response, 404, { code: 'not_found', message: '本服务没有配置 Ondo 模块' });
+      // Settings are PUT, as in the workbench; they need the same marker as a POST.
+      if (request.method === 'PUT' && (request.headers['x-pa-executor'] !== '1' || !String(request.headers['content-type'] ?? '').startsWith('application/json'))) return send(response, 403, { code: 'csrf', message: '缺少本页面请求标记' });
+      const ondo = views.ondo, path = url.pathname.slice('/api/ondo/'.length);
+      try {
+        if (request.method === 'GET' && path === 'state') return send(response, 200, ondo.state());
+        if (request.method === 'PUT' && path === 'config') return send(response, 200, ondo.save(await readJson(request)));
+        if (request.method === 'POST' && path === 'start') return send(response, 200, await ondo.start(await readJson(request)));
+        if (request.method === 'POST' && path === 'stop') return send(response, 200, await ondo.stop(await readJson(request)));
+        if (request.method === 'POST' && path === 'cleanup') return send(response, 200, await ondo.cleanup(await readJson(request)));
+        if (request.method === 'POST' && path === 'recovery/discard') return send(response, 200, ondo.discardRecovery(await readJson(request)));
+        if (request.method === 'GET' && path === 'rewards') {
+          const window = url.searchParams.get('window');
+          return send(response, 200, ondo.rewards(window !== null && /^\d{1,4}$/.test(window) ? Number(window) : undefined));
+        }
+        if (request.method === 'PUT' && path === 'rewards/config') return send(response, 200, ondo.saveRewards(await readJson(request)));
+        if (request.method === 'GET' && path === 'rewards/book') return send(response, 200, await ondo.book(url.searchParams.get('market') ?? ''));
+      } catch (error) {
+        if (error instanceof ContractError) throw error;
+        const failure = ondo.failure(error);
+        if (failure.internal) process.stderr.write(`Ondo 接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}\n`);
         return send(response, failure.status, failure.body);
       }
       return send(response, 404, { code: 'not_found', message: '不存在' });

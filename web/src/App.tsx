@@ -1,4 +1,4 @@
-import { Activity, ArrowLeftRight, Cpu, ChevronRight, Gauge, Layers, Menu, RefreshCw, ScrollText, Server, Settings2, ShieldCheck, Sigma, Wallet, type LucideIcon } from 'lucide-react';
+import { Activity, ArrowLeftRight, Cpu, ChevronRight, Coins, Gauge, Layers, Menu, RefreshCw, ScrollText, Server, Settings2, ShieldCheck, Sigma, Wallet, type LucideIcon } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { OIL_READ_TIMEOUT_MS, OIL_STATE_PATH, OilPage } from './OilPage.tsx';
 import { HynixPage } from './HynixPage.tsx';
@@ -22,6 +22,7 @@ import type { OilState } from './oil-types.ts';
 import type { AssetState } from '../../src/asset/views.ts';
 import { CrossexPage } from './crossex/CrossexPage.tsx';
 import { CROSSEX_READ_TIMEOUT_MS, CROSSEX_STATE_PATH } from './crossex/crossex-api.ts';
+import { ONDO_READ_TIMEOUT_MS, ONDO_STATE_PATH, OndoPage } from './ondo/OndoPage.tsx';
 import { breadcrumbOf, entryOf, navEntries, workspaceGroups, type NavEntry } from './workspace-nav.ts';
 
 // The shell follows the workbench's main interface (src/App.tsx, 31242e0): a side navigation grouped by the workspaces
@@ -40,7 +41,7 @@ const ASSET_CHECK_MS = 60_000;
  * the entry, and the page says why), the CrossEx and options entries where their state path answers or answers 503
  * (configured but not started, retrying: the page says why). */
 const ALWAYS: readonly NavEntry[] = ['pairs', 'status', 'logs', 'settings'];
-const ICONS: Record<NavEntry, LucideIcon> = { asset: Wallet, positions: Layers, monitor: Activity, oil: ArrowLeftRight, hynix: Cpu, crossex: Gauge, pairs: ShieldCheck, options: Sigma, status: Server, logs: ScrollText, settings: Settings2 };
+const ICONS: Record<NavEntry, LucideIcon> = { asset: Wallet, positions: Layers, monitor: Activity, oil: ArrowLeftRight, hynix: Cpu, crossex: Gauge, ondo: Coins, pairs: ShieldCheck, options: Sigma, status: Server, logs: ScrollText, settings: Settings2 };
 /** Below this width the side navigation is a drawer (the workbench's 760px breakpoint, shell.css). */
 const DRAWER_QUERY = '(max-width: 760px)';
 
@@ -62,8 +63,10 @@ export function App() {
   // The CrossEx page reads its state on its own (tab-specific paths, paused around writes); this only decides whether the entry
   // shows, so it asks for the light view without the opportunity list.
   const crossex = useLiveResource<unknown>(`${CROSSEX_STATE_PATH}?opportunities=0`, { intervalMs: OIL_CHECK_MS, timeoutMs: CROSSEX_READ_TIMEOUT_MS, onExpired });
+  // The Ondo page reads the same path at the same timeout; here it only decides whether the entry shows.
+  const ondo = useLiveResource<unknown>(ONDO_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: ONDO_READ_TIMEOUT_MS, onExpired });
   const available = new Set<NavEntry>([...ALWAYS, ...(oil.data !== null ? ['oil' as const, 'hynix' as const] : []), ...(options.data !== null || (options.error instanceof ApiError && options.error.status === 503) ? ['options' as const] : []), ...(monitor.data !== null ? ['monitor' as const] : []), ...(asset.data !== null || (asset.error instanceof ApiError && asset.error.status === 500) ? ['asset' as const, 'positions' as const] : []),
-    ...(crossex.data !== null || (crossex.error instanceof ApiError && crossex.error.status === 503) ? ['crossex' as const] : [])]);
+    ...(crossex.data !== null || (crossex.error instanceof ApiError && crossex.error.status === 503) ? ['crossex' as const] : []), ...(ondo.data !== null ? ['ondo' as const] : [])]);
   const current = entryOf(route), crumb = breadcrumbOf(route);
   // The phone drawer, as in the workbench: focus moves into it, Tab cycles inside, Escape or the backdrop closes it and
   // gives focus back to the menu button. Widening the window past the breakpoint closes it too.
@@ -99,7 +102,7 @@ export function App() {
   const old = receivedAt !== null && Date.now() - receivedAt > 2 * REFRESH_MS + READ_TIMEOUT_MS;
   const stale = state !== null && (status === 'error' || status === 'offline' || status === 'paused' || (status === 'loading' && (error !== null || old)));
   const failed = status === 'error' || status === 'offline';
-  const aster = route.page !== 'oil' && route.page !== 'hynix' && route.page !== 'options' && route.page !== 'monitor' && route.page !== 'asset' && route.page !== 'positions' && route.page !== 'crossex';
+  const aster = route.page !== 'oil' && route.page !== 'hynix' && route.page !== 'options' && route.page !== 'monitor' && route.page !== 'asset' && route.page !== 'positions' && route.page !== 'crossex' && route.page !== 'ondo';
   return <div className="app-shell">
     {menuOpen ? <button type="button" className="nav-backdrop" aria-label="关闭导航" onClick={closeMenu} /> : null}
     <aside ref={sidebar} className={`sidebar ${menuOpen ? 'open' : ''}`}><Brand /><nav aria-label="主导航">
@@ -150,7 +153,7 @@ export function App() {
                 : <StatePanel kind="loading" title="加载中…" />)
                 : <PairsWorkspace state={state} pairId={route.page === 'pair' ? route.pairId : null} stale={stale} onChanged={changed} onExpired={onExpired} />}
           </div> : route.page === 'options' ? <OptionsPage tab={route.tab} onExpired={onExpired} /> : route.page === 'monitor' ? <MonitorPage onExpired={onExpired} /> : route.page === 'asset' ? <AssetPage onExpired={onExpired} /> : route.page === 'positions' ? <AssetPositions onExpired={onExpired} />
-            : route.page === 'crossex' ? <CrossexPage tab={route.tab} onExpired={onExpired} /> : route.page === 'hynix' ? <HynixPage onExpired={onExpired} /> : <OilPage onExpired={onExpired} />}
+            : route.page === 'ondo' ? <OndoPage onExpired={onExpired} /> : route.page === 'crossex' ? <CrossexPage tab={route.tab} onExpired={onExpired} /> : route.page === 'hynix' ? <HynixPage onExpired={onExpired} /> : <OilPage onExpired={onExpired} />}
         </div>
       </div></div></main>
     </div>

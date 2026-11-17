@@ -11,5 +11,6 @@ import './positions.css';
 import './options.css';
 // After aster.css for the same reason: every CrossEx rule sits under .aster-desk .crossex-page.
 import './crossex/crossex.css';
+import './ondo/ondo.css';
 
 createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>);

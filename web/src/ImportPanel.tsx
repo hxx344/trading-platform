@@ -18,10 +18,12 @@ interface OptionsItem { accountId: string | null; status: 'added' | 'skipped'; d
 /** The workbench CrossEx module's Gate account; the UID comes masked. Same shape as the options account. */
 // Same shape as src/service/import-crossex.ts CrossexItem; `warning` is set while the workbench still runs the account.
 interface CrossexItem { accountId: string | null; status: 'added' | 'skipped'; detail: string; warning?: string }
+/** Same shape as src/service/import-ondo.ts OndoItem; the key id comes masked. */
+interface OndoItem { keyId: string | null; status: 'added' | 'skipped'; detail: string; warning?: string }
 interface ImportResult {
   id: string | null; action: 'preview' | 'import' | null; at: number; phase?: string; message: string;
   preview?: PreviewItem[]; imported?: ImportedItem[]; oil?: OilItem[]; oilError?: string; options?: OptionsItem; optionsError?: string;
-  monitor?: MonitorItem; monitorAlerts?: MonitorAlertsItem; monitorAlertsError?: string; monitorVariational?: MonitorVariationalItem; monitorVariationalError?: string; monitorPaper?: MonitorPaperItem; monitorPaperError?: string; asset?: AssetItem; assetError?: string; crossex?: CrossexItem; crossexError?: string; notes?: string[]; database?: string;
+  monitor?: MonitorItem; monitorAlerts?: MonitorAlertsItem; monitorAlertsError?: string; monitorVariational?: MonitorVariationalItem; monitorVariationalError?: string; monitorPaper?: MonitorPaperItem; monitorPaperError?: string; asset?: AssetItem; assetError?: string; crossex?: CrossexItem; crossexError?: string; ondo?: OndoItem; ondoError?: string; notes?: string[]; database?: string;
 }
 const VENUE: Record<string, string> = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX' };
 
@@ -50,6 +52,15 @@ function CrossexRow({ item, preview }: { item: CrossexItem; preview: boolean }) 
     <tbody><tr>
       <td>Gate CrossEx</td><td className="mono">{item.accountId ?? '—'}</td>
       <td className={item.status === 'added' ? 'ok' : preview ? 'muted' : 'err'}>{item.status === 'added' ? (preview ? '可导入：' : '已导入：') : (preview ? '不能导入：' : '未导入：')}{item.detail}{item.warning ? <span className="err">（{item.warning}）</span> : null}</td>
+    </tr></tbody>
+  </table></div>;
+}
+function OndoRow({ item, preview }: { item: OndoItem; preview: boolean }) {
+  return <div className="table-wrap"><table className="data" id="importOndoTable">
+    <thead><tr><th>Ondo 挂单奖励</th><th>API Key</th><th>{preview ? '说明' : '结果'}</th></tr></thead>
+    <tbody><tr>
+      <td>Ondo Perps</td><td className="mono">{item.keyId ?? '—'}</td>
+      <td className={item.status === 'added' ? 'ok' : preview ? 'muted' : 'err'}>{item.status === 'added' ? (preview ? '可导入：' : '已导入：') : (preview ? '不导入：' : '未导入：')}{item.detail}{item.warning ? <span className="err">（{item.warning}）</span> : null}</td>
     </tr></tbody>
   </table></div>;
 }
@@ -131,7 +142,7 @@ function AssetRows({ item, preview, owner, setOwner }: { item: AssetItem; previe
 }
 type Message = { tone: 'ok' | 'err' | 'muted'; text: string } | null;
 /** The module choices of the preview (live accounts and modules are never ticked by default). */
-interface ModulePicks { oil: boolean; options: boolean; monitor: boolean; monitorAlerts: boolean; monitorVariational: boolean; monitorPaper: boolean; asset: boolean; assetOwner: string | null; crossex: boolean }
+interface ModulePicks { oil: boolean; options: boolean; monitor: boolean; monitorAlerts: boolean; monitorVariational: boolean; monitorPaper: boolean; asset: boolean; assetOwner: string | null; crossex: boolean; ondo: boolean }
 
 function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { result: ImportResult; picked: Set<string>; setPicked: (value: Set<string>) => void; picks: ModulePicks; setPicks: (value: ModulePicks) => void; onRun: () => void; busy: boolean }) {
   const notes = (result.notes || []).map((note, index) => <p key={index} className="muted">{note}</p>);
@@ -142,8 +153,9 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
   const variationalError = result.monitorVariationalError ? <p className="err">Var token 无法读取：{result.monitorVariationalError}</p> : null;
   const paperError = result.monitorPaperError ? <p className="err">持仓记录无法读取：{result.monitorPaperError}</p> : null;
   const crossexError = result.crossexError ? <p className="err">CrossEx 账户无法读取：{result.crossexError}</p> : null;
+  const ondoError = result.ondoError ? <p className="err">Ondo 挂单奖励无法读取：{result.ondoError}</p> : null;
   if (result.action === 'preview') {
-    const rows = result.preview || [], oil = result.oil || [], options = result.options ?? null, monitor = result.monitor ?? null, asset = result.asset ?? null, crossex = result.crossex ?? null;
+    const rows = result.preview || [], oil = result.oil || [], options = result.options ?? null, monitor = result.monitor ?? null, asset = result.asset ?? null, crossex = result.crossex ?? null, ondo = result.ondo ?? null;
     const oilImportable = oil.some(item => item.status === 'added'), optionsImportable = options?.status === 'added';
     const oilPicked = picks.oil, optionsPicked = picks.options;
     const setOilPicked = (value: boolean) => setPicks({ ...picks, oil: value }), setOptionsPicked = (value: boolean) => setPicks({ ...picks, options: value });
@@ -185,6 +197,11 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
         <label className="pair-pick"><input type="checkbox" id="importCrossexPick" disabled={crossex.status !== 'added'} checked={picks.crossex && crossex.status === 'added'} onChange={event => setPicks({ ...picks, crossex: event.target.checked })} />导入 CrossEx 账户（工作台 CrossEx 模块的 Gate 密钥与额度设置；本项目已配置 CrossEx 时保留现有设置）</label>
       </> : null}
       {crossexError}
+      {ondo ? <>
+        <OndoRow item={ondo} preview />
+        <label className="pair-pick"><input type="checkbox" id="importOndoPick" disabled={ondo.status !== 'added'} checked={picks.ondo && ondo.status === 'added'} onChange={event => setPicks({ ...picks, ondo: event.target.checked })} />启用 Ondo 挂单奖励（工作台 Ondo 挂单的设置以观察模式带过来，没有遗留挂单时一并导入 API Key；本项目已启用时只补入缺少的 API Key）</label>
+      </> : null}
+      {ondoError}
       {monitor ? <>
         <MonitorRow item={monitor} preview />
         <label className="pair-pick"><input type="checkbox" id="importMonitorPick" disabled={!monitorImportable} checked={picks.monitor && monitorImportable} onChange={event => setPicks({ ...picks, monitor: event.target.checked, ...(event.target.checked ? {} : { monitorAlerts: false, monitorVariational: false, monitorPaper: false }) })} />启用行情监控（Anthropic 价差，只读公开行情，不需要密钥；股数取默认值，本项目已启用时保留现有设置）</label>
@@ -209,7 +226,7 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
         <label className="pair-pick"><input type="checkbox" id="importAssetPick" disabled={!assetImportable} checked={picks.asset && assetImportable} onChange={event => setPicks({ ...picks, asset: event.target.checked })} />导入资产账本（所选用户的账本整体替换本项目现有账本；本项目已启用资产账本时只重新导入、不重启服务）</label>
       </> : null}
       {assetError}
-      {rows.length || oil.length || options || crossex || monitor || asset ? <p><button type="button" id="importRunBtn" className="button primary" disabled={busy} onClick={onRun}>{restarts(choicesOf(result, picked, picks), asset?.enabled ?? false) ? '导入所选并重启服务' : '导入所选'}</button></p> : null}
+      {rows.length || oil.length || options || crossex || ondo || monitor || asset ? <p><button type="button" id="importRunBtn" className="button primary" disabled={busy} onClick={onRun}>{restarts(choicesOf(result, picked, picks), asset?.enabled ?? false) ? '导入所选并重启服务' : '导入所选'}</button></p> : null}
       {notes}
       {result.database ? <p className="muted">读取自 {result.database}（只读）</p> : null}
     </>;
@@ -226,6 +243,8 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
     {optionsError}
     {result.crossex ? <CrossexRow item={result.crossex} preview={false} /> : null}
     {crossexError}
+    {result.ondo ? <OndoRow item={result.ondo} preview={false} /> : null}
+    {ondoError}
     {result.monitor ? <MonitorRow item={result.monitor} preview={false} /> : null}
     {result.monitorAlerts ? <AlertsRows item={result.monitorAlerts} preview={false} /> : null}
     {alertsError}
@@ -253,9 +272,10 @@ function choicesOf(result: ImportResult | null, picked: Set<string>, picks: Modu
   const paper = result?.monitorPaper;
   const monitorPaper = picks.monitorPaper && paper && paperAvailable(paper, result?.monitor, picks.monitor) ? { added: paper.added } : null;
   const crossex = picks.crossex && result?.crossex?.status === 'added' ? `Gate ${result.crossex.accountId ?? ''}` : null;
-  return { pairs, oil, options, monitor: picks.monitor && monitorAvailable(result?.monitor), monitorAlerts, monitorVariational, monitorPaper, assetOwner: owner, crossex };
+  const ondo = picks.ondo && result?.ondo?.status === 'added' ? { keyId: result.ondo.keyId } : null;
+  return { pairs, oil, options, monitor: picks.monitor && monitorAvailable(result?.monitor), monitorAlerts, monitorVariational, monitorPaper, assetOwner: owner, crossex, ondo };
 }
-const NO_PICKS: ModulePicks = { oil: false, options: false, monitor: false, monitorAlerts: false, monitorVariational: false, monitorPaper: false, asset: false, assetOwner: null, crossex: false };
+const NO_PICKS: ModulePicks = { oil: false, options: false, monitor: false, monitorAlerts: false, monitorVariational: false, monitorPaper: false, asset: false, assetOwner: null, crossex: false, ondo: false };
 
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const statusOf = (error: unknown): number | undefined => {

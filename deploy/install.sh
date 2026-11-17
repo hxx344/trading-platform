@@ -27,6 +27,9 @@
 #   sudo bash install.sh --import-workbench --crossex
 #                                             导入工作台 CrossEx 模块的 Gate 密钥、账户 UID 与额度（首次导入时连同页面设置）；
 #                                             工作台未连接、还有未结束的执行 / 订单 / 挂单或缺 UID 时拒绝；可与其他导入项同用
+#   sudo bash install.sh --import-workbench --ondo
+#                                             启用 Ondo 挂单奖励：工作台 Ondo 挂单设置以观察模式带过来，工作台没有实盘会话记录时
+#                                             一并导入 API Key（写入 secrets.json 的 ondo）；没有工作台 Ondo 数据时也可启用（只观察）
 #   sudo bash install.sh --set-password       设置或更换页面登录密码（输入两次，不回显；只存 scrypt 摘要，已登录的页面须重新登录；
 #                                             沿用当前已装版本，不联网升级；脚本化时加 --password-stdin 从标准输入读一行）
 #   sudo bash install.sh --watch-url <地址> --watch-token <令牌>
@@ -110,6 +113,7 @@ import_monitor_variational=0
 import_monitor_paper=0
 import_asset=0
 import_crossex=0
+import_ondo=0
 asset_owner=''
 set_password=0
 password_stdin=0
@@ -131,6 +135,7 @@ while (($#)); do
     --asset) import_asset=1; shift ;;
     --asset-owner) [[ $# -ge 2 ]] || usage 2; asset_owner=$2; shift 2 ;;
     --crossex) import_crossex=1; shift ;;
+    --ondo) import_ondo=1; shift ;;
     --set-password) set_password=1; shift ;;
     --password-stdin) password_stdin=1; shift ;;
     --watch-url) [[ $# -ge 2 && -n "$2" ]] || usage 2; watch_url=$2; shift 2 ;;
@@ -155,6 +160,7 @@ done
 ((import_workbench || !import_asset)) || fail '--asset 须和 --import-workbench 一起使用'
 ((import_asset)) || [[ -z "$asset_owner" ]] || fail '--asset-owner 须和 --asset 一起使用'
 ((import_workbench || !import_crossex)) || fail '--crossex 须和 --import-workbench 一起使用'
+((import_workbench || !import_ondo)) || fail '--ondo 须和 --import-workbench 一起使用'
 ((set_password || !password_stdin)) || fail '--password-stdin 须和 --set-password 一起使用'
 watch_change=0
 if [[ -n "$watch_url" ]] || ((watch_import || watch_off)); then watch_change=1; fi
@@ -339,6 +345,7 @@ if ((import_workbench)); then
   if ((import_monitor_paper)); then grep -q 'readWorkbenchPaper' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --monitor-paper，请用最新版本导入"; fi
   if ((import_asset)); then grep -q 'readWorkbenchAsset' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --asset，请用最新版本导入"; fi
   if ((import_crossex)); then grep -q 'readWorkbenchCrossex' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --crossex，请用最新版本导入"; fi
+  if ((import_ondo)); then grep -q 'readWorkbenchOndo' "$release_dir/src/service/import-workbench.ts" || fail "版本 $new_version 不支持 --ondo，请用最新版本导入"; fi
   backup_conf_files 导入
   import_args=(--config "$CONF_DIR/config.json" --workbench-env "$WORKBENCH_ENV")
   [[ -z "$workbench_data" ]] || import_args+=(--workbench-data "$workbench_data")
@@ -357,6 +364,7 @@ if ((import_workbench)); then
   # The CrossEx page settings go into the same data directory (named once when an item above already named it).
   ((!import_crossex)) || import_args+=(--crossex)
   ((!import_crossex || import_asset || import_monitor_alerts || import_monitor_variational || import_monitor_paper)) || import_args+=(--data-dir "$DATA_DIR")
+  ((!import_ondo)) || import_args+=(--ondo)
   # The service's proxy settings (KEY=VALUE lines, as systemd reads them): importing the options account reads Bybit once.
   import_env=()
   if [[ -f "$CONF_DIR/environment" ]]; then

@@ -40,6 +40,8 @@ import { createOptionsSupervisor, type OptionsSupervisor } from './options.ts';
 import { optionsSummary } from './options-config.ts';
 import { createCrossexSupervisor, type CrossexOptions, type CrossexSupervisor } from './crossex.ts';
 import { crossexSummary } from './crossex-config.ts';
+import { createOndoModule, type OndoModule } from './ondo.ts';
+import { ondoSummary } from './ondo-config.ts';
 import { createServiceLog, teeStream, type ServiceLog } from './service-log.ts';
 import { createSummary, type Summary, type SummaryInput } from './summary.ts';
 import { createWatch, watchLoop, watchSummary, type Watch } from './watch.ts';
@@ -223,6 +225,8 @@ export interface StartOptions {
   optionsRetryMs?: number;
   /** Tests stand in for Gate and the CrossEx public readers and shorten the start check (only with config.crossex). */
   crossexOptions?: CrossexOptions;
+  /** Tests stand in for the Ondo venue (only with config.ondo). */
+  ondoOptions?: Parameters<typeof createOndoModule>[3];
   /** Tests stand in for GitHub's latest-release answer (docs/update.md). */
   updateFetch?: UpdateFetch;
   /** Tests stand in for the second server's heartbeat receiver and shorten the cadence (only with config.watch). */
@@ -247,7 +251,7 @@ export async function startService(options: StartOptions): Promise<ReturnType<ty
   catch (error) { closeLogs(); throw error; }
 }
 
-async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, watchOptions, updateFetch }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
+async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, ondoOptions, watchOptions, updateFetch }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
   const session = keptSession(dir);
   // O7: the oil and hynix books come from the market monitor's perpetual collector when it has a recent one (oil/pushed.ts);
   // the monitor opens further down, so the source looks it up on each read (no collector: every leg is read over REST).
@@ -271,14 +275,18 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   // rest of the service runs (crossex.ts createCrossexSupervisor). Its runtime closes asynchronously, once.
   let crossex: CrossexSupervisor | undefined;
   const stopCrossex = (): Promise<void> => crossex ? crossex.stop() : Promise.resolve();
+  // Ondo starts nothing on the venue by itself: a live session only starts from the page (docs/ondo.md §4).
+  let ondo: OndoModule | undefined;
   const releaseOil = () => {
     oil?.locks.release();
     void stopOptions();
     void stopCrossex();
+    void ondo?.close();
   };
   try {
     crossex = config.crossex ? createCrossexSupervisor(config.crossex, secrets.gate, dir, crossexOptions) : undefined;
     await crossex?.start();
+    ondo = config.ondo ? createOndoModule(config.ondo, secrets.ondo, dir, ondoOptions) : undefined;
   } catch (error) { releaseOil(); throw error; }
   let store: ReturnType<typeof openStore>;
   try { store = openStore(join(dir, DATABASE_FILES.mainnet)); } catch (error) { releaseOil(); throw error; }
@@ -396,6 +404,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(asset ? { asset } : {}),
       ...(options ? { options: options.views } : {}),
       ...(crossex ? { crossex: crossex.views } : {}),
+      ...(ondo ? { ondo: ondo.views } : {}),
       ...(logs ? { logs: (filter: 'all' | 'problems', before: number | null, limit: number) => logs.page({ filter, before, limit }) } : {}),
       update: updates,
     },
@@ -440,6 +449,8 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(monitor ? monitorLoops(monitor, context) : []),
       ...(options ? [options.loop(context, { notifyOnce: (key, text) => notifier.notifyOnce(key, text), notify: text => notifier.notify(text) })] : []),
       ...(crossex ? [crossex.loop(context, { notifyOnce: (key, text) => notifier.notifyOnce(key, text), notify: text => notifier.notify(text), log: line => process.stderr.write(`${line}\n`) })] : []),
+      // Samples the reward markets; on stop it withdraws a live session's quotes inside the drain.
+      ...(ondo ? [ondo.loop(context)] : []),
       ...(config.watch && secrets.watch ? [watchLoop(watch = createWatch({ config: config.watch, secret: secrets.watch, problem: context.notReady, ...(watchOptions?.fetchImpl ? { fetchImpl: watchOptions.fetchImpl } : {}), log: line => process.stderr.write(`${line}\n`) }), context, watchOptions)] : []),
     ],
     onStopping: (reason, detail) => {
@@ -496,7 +507,7 @@ async function main(): Promise<void> {
     // Read and validated offline (keys must derive their signers); nothing is sent anywhere.
     // Only noted, not refused: at boot or with Tailscale logged out the address is missing, and 127.0.0.1 still serves.
     const local = config.host === null || Object.values(networkInterfaces()).flat().some(item => item?.address === config.host);
-    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、') || '尚未导入'}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}，监听 127.0.0.1${config.host ? ` 与 ${urlHost(config.host)}` : ''}，登录密码${password ? '已设置' : '未设置'}，页面 ${app.assets.size} 个文件${oilSummary(config.oil)}${optionsSummary(config.options)}${monitorSummary(config.monitor)}${assetSummary(config.asset)}${crossexSummary(config.crossex)}${watchSummary(config.watch)}\n`);
+    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、') || '尚未导入'}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}，监听 127.0.0.1${config.host ? ` 与 ${urlHost(config.host)}` : ''}，登录密码${password ? '已设置' : '未设置'}，页面 ${app.assets.size} 个文件${oilSummary(config.oil)}${optionsSummary(config.options)}${monitorSummary(config.monitor)}${assetSummary(config.asset)}${crossexSummary(config.crossex)}${ondoSummary(config.ondo, secrets.ondo)}${watchSummary(config.watch)}\n`);
     if (!local) process.stdout.write(`注意：${config.host} 现在不在本机网卡上（地址写错，或 Tailscale 尚未连接）；服务会持续重试，在此之前页面只能经 127.0.0.1 打开\n`);
     return;
   }

@@ -6,7 +6,7 @@
 import { sub } from '../decimal.ts';
 import { OIL_SYMBOLS, VENUES, VENUE_NAMES, accountKey, parseAccountSnapshot, parseQuote, positionOf, type AccountBinding, type Venue } from '../contracts.ts';
 import type { VenueConnector } from '../connector.ts';
-import type { PushedBooks } from './pushed.ts';
+import type { PushedBook, PushedBooks } from './pushed.ts';
 
 /** Book read spacing and the timeout of one read; a read is never retried, the next round reads again. */
 export const MARKET_READ_MS = 3_000;
@@ -64,10 +64,16 @@ export function createMarketReader({ connectors, accounts, symbols, now = Date.n
   async function refreshQuotes(): Promise<void> {
     await Promise.all(connectors.flatMap(connector => symbols.map(async symbol => {
       const target = slot(connector.venue, symbol);
+      // A pushed book never moves a leg back in time, nor lands before the leg's last failed read: both are host times (a REST
+      // read may have landed after the venue time of the pushed book), and the page reads a failure as failedAt > receivedAt.
+      // A failing lookup counts as no pushed book.
+      let book: PushedBook | null = null;
+      try { book = pushed?.(connector.venue, symbol) ?? null; } catch { book = null; }
+      if (book && book.at >= Math.max(target.receivedAt ?? -Infinity, target.failedAt ?? -Infinity)) {
+        Object.assign(target, { bid: book.bid, ask: book.ask, receivedAt: book.at, source: 'pushed', error: null });
+        return;
+      }
       try {
-        // A pushed book never moves a leg back in time (a REST read may have landed after the venue time of the pushed one).
-        const book = pushed?.(connector.venue, symbol) ?? null;
-        if (book && (target.receivedAt === null || book.at >= target.receivedAt)) { Object.assign(target, { bid: book.bid, ask: book.ask, receivedAt: book.at, source: 'pushed', error: null }); return; }
         const quote = parseQuote(await bounded(signal => connector.quote(symbol, { signal }), quoteTimeoutMs), connector.venue, symbol);
         Object.assign(target, { bid: quote.bid, ask: quote.ask, receivedAt: quote.receivedAt, source: 'rest', error: null });
       } catch (error) { Object.assign(target, { failedAt: now(), error: message(error) }); }

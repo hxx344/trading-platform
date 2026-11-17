@@ -3,11 +3,10 @@
 // This file maps a venue and contract to the collector's key and decides whether its book can stand in for a REST read.
 import type { Venue } from '../contracts.ts';
 import { INSTRUMENT_IDS } from '../live/okx.ts';
+import { QUOTE_FUTURE_MS } from './rules.ts';
 
 /** A pushed book is used only while its venue time is at most this old (one read round); older legs are read over REST. */
 export const PUSHED_MAX_AGE_MS = 3_000;
-/** The rules' own allowance for a venue clock ahead of this host (rules.ts QUOTE_FUTURE_MS). */
-export const PUSHED_FUTURE_MS = 1_000;
 
 /** What the collector holds for one contract (PerpetualMonitor.book). */
 export interface CollectorBook { bid: number; ask: number; at: number; multiplier: number }
@@ -31,13 +30,14 @@ function price(value: number): string | null {
 
 /**
  * The collector's book for this leg when it can replace a REST read now: both sides present and ordered (bid < ask), prices
- * per contract (multiplier 1), and the venue time no older than PUSHED_MAX_AGE_MS nor more than PUSHED_FUTURE_MS ahead.
+ * per contract (multiplier 1), and the venue time no older than PUSHED_MAX_AGE_MS nor more than the rules' QUOTE_FUTURE_MS ahead (defensive: the
+ * collector already clamps its book time to the local receive time).
  */
 export function pushedBook(collector: CollectorBooks | null, venue: Venue, symbol: string, now: number): PushedBook | null {
   const key = collector ? collectorSymbol(venue, symbol) : null;
   const book = key ? collector!.book(venue, key) : null;
   if (!book || book.multiplier !== 1 || !(book.bid < book.ask)) return null;
-  if (!Number.isFinite(book.at) || now - book.at > PUSHED_MAX_AGE_MS || book.at - now > PUSHED_FUTURE_MS) return null;
+  if (!Number.isFinite(book.at) || now - book.at > PUSHED_MAX_AGE_MS || book.at - now > QUOTE_FUTURE_MS) return null;
   const bid = price(book.bid), ask = price(book.ask);
   return bid && ask ? { bid, ask, at: book.at } : null;
 }

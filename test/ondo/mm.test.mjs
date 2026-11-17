@@ -288,6 +288,22 @@ test('a one-sided frame invalidates both openings even if a full snapshot follow
   assert.deepEqual(v.calls.filter(([method]) => method === 'cancel').map(([, id]) => id).sort(), original);
 });
 
+test('rate-limited account holds preserve the original wall-withdrawal timer through retries', async () => {
+  const { f, v, mm } = fixture();
+  await f.live({ wallUsd: '5000' });
+  const buy = v.orders.find(o => o.side === 'buy'), at = f.time + 1;
+  v.cancelError = new OndoError('rate_limited', { status: 429 });
+  f.time = at; f.push([['200.00', '1']], ASKS);
+  await new Promise(resolve => setImmediate(resolve));
+  v.cooldown = at + 2000; f.time = at + 1100; f.push([['200.00', '1']], ASKS);
+  await mm.tick();
+  v.cancelError = null; f.time = at + 3200; f.push([['200.00', '1']], ASKS);
+  await mm.tick(); await new Promise(resolve => setImmediate(resolve));
+  assert.ok(!v.orders.some(order => order.id === buy.id));
+  const withdraw = mm.state().latency.markets[0].withdraw;
+  assert.ok(withdraw.n > 0); assert.equal(withdraw.p95Ms, 3200);
+});
+
 test('live quotes rest on both sides inside the band and follow the book', async () => {
   const { f, v, mm, count } = fixture();
   await f.live();

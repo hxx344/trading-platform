@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { createOndoClient, ONDO_MARKET, OndoError, type OndoClient, type OndoDepth, type OndoRules } from '../vendor/ondo/client.mjs';
 import type { OndoRestingOrder } from '../vendor/ondo/mm.mjs';
 import { createOndoStream, type OndoBook, type OndoStream, type OndoStreamFactory } from '../vendor/ondo/stream.mjs';
-import { formatDecimalUnits } from '../vendor/ondo/decimal.mjs';
+import { decimalUnits, formatDecimalUnits } from '../vendor/ondo/decimal.mjs';
 import { BUCKET_BPS, BUCKETS, type OndoLevel, type OndoRewardConfig, type OndoRewardMarket, type OndoRewardsView } from './reward-types.ts';
 
 /** The markets Ondo's reward rules list (docs/ondo.md §5). */
@@ -73,13 +73,21 @@ export function validateRewardConfig(value: unknown): OndoRewardConfig {
 }
 
 /** Levels of one side as numbers, best first; a malformed level fails the whole snapshot. */
-function side(raw: unknown): { price: string; size: string; p: number; q: number }[] {
+function side(raw: unknown, ascending: boolean): { price: string; size: string; p: number; q: number; priceUnits: bigint }[] {
   if (!Array.isArray(raw)) throw new OndoError('invalid_data');
+  let prior: bigint | null = null;
   return raw.map(level => {
-    if (!Array.isArray(level) || level.length < 2) throw new OndoError('invalid_data');
+    if (!Array.isArray(level) || level.length < 2 || ![level[0], level[1]].every(value =>
+      typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value)))) throw new OndoError('invalid_data');
     const price = String(level[0]), size = String(level[1]), p = Number(price), q = Number(size);
-    if (!/^\d+(?:\.\d+)?$/.test(price) || !/^\d+(?:\.\d+)?$/.test(size) || !(p > 0) || !(q >= 0)) throw new OndoError('invalid_data');
-    return { price, size, p, q };
+    let priceUnits: bigint, sizeUnits: bigint;
+    try {
+      priceUnits = decimalUnits(price);
+      sizeUnits = decimalUnits(size);
+    } catch { throw new OndoError('invalid_data'); }
+    if (priceUnits <= 0n || sizeUnits <= 0n || (prior !== null && (ascending ? priceUnits <= prior : priceUnits >= prior))) throw new OndoError('invalid_data');
+    prior = priceUnits;
+    return { price, size, p, q, priceUnits };
   });
 }
 
@@ -91,20 +99,27 @@ export function bookDepth(market: string, book: OndoBook): OndoDepth {
 
 /** One snapshot reduced to what the view keeps; `ours` is size per price on each side, taken out of the depth. */
 export function digest(depth: OndoDepth, ours: { buy: Map<number, number>; sell: Map<number, number> }, at: number) {
-  const bids = side(depth.bids), asks = side(depth.asks);
+  const bids = side(depth.bids, false), asks = side(depth.asks, true);
   if (!bids.length || !asks.length) throw new Error('盘口一侧为空');
   const best = { bid: bids[0].p, ask: asks[0].p };
   if (!(best.bid < best.ask)) throw new Error('盘口买一不低于卖一');
   const mid = (best.bid + best.ask) / 2;
+  const twiceMid = bids[0].priceUnits + asks[0].priceUnits;
+  const bucketsPerBps = BigInt(1 / BUCKET_BPS);
   const pass = (levels: typeof bids, own: Map<number, number>, sign: 1 | -1) => {
     const buckets = new Float32Array(BUCKETS), shown: OndoLevel[] = [];
     let cum = 0, depth5 = 0, cover = 0;
     for (const level of levels) {
-      const bps = sign * (mid - level.p) / mid * 1e4;
+      // The binary midpoint can move a quote exactly 5 or 10 bps out to the previous bucket.
+      // Compare the integer numerator and denominator before converting distances for display.
+      const distance = BigInt(sign) * (twiceMid - 2n * level.priceUnits) * 10_000n;
+      if (distance < 0n) throw new OndoError('invalid_data');
+      const bucket = Number(distance * bucketsPerBps / twiceMid);
+      const bps = Number(distance * 1_000_000_000n / twiceMid) / 1e9;
       cover = Math.max(cover, bps);
       const oursSize = Math.min(level.q, own.get(level.p) ?? 0), othersUsd = (level.q - oursSize) * level.p;
-      if (bps < BUCKETS * BUCKET_BPS) buckets[Math.max(0, Math.floor(bps / BUCKET_BPS))] += othersUsd;
-      if (bps <= LEVELS_BPS) {
+      if (bucket < BUCKETS) buckets[bucket] += othersUsd;
+      if (distance <= BigInt(LEVELS_BPS) * twiceMid) {
         cum += othersUsd; depth5 += othersUsd;
         if (shown.length < MAX_LEVELS) shown.push({ price: level.price, size: level.size, usd: round(othersUsd), bps: round(bps), cumUsd: round(cum), oursUsd: round(oursSize * level.p) });
       }
@@ -223,7 +238,7 @@ export function createOndoRewards({ dataDir, restingOrders = () => [], clientFac
       try {
         const depth = await api().depth(target.name, 100);
         const at = now(), sourceAt = typeof depth.time === 'number' ? depth.time : typeof depth.time === 'string' ? Date.parse(depth.time) : NaN;
-        if (Number.isFinite(sourceAt) ? Math.abs(at - sourceAt) > FRESH_MS : target.record) throw new Error('交易所盘口时刻缺失或过期');
+        if (!Number.isFinite(sourceAt) || Math.abs(at - sourceAt) > FRESH_MS) throw new Error('交易所盘口时刻缺失或过期');
         const { sample, latest } = digest(depth, ours(target.name), at);
         target.latest = latest; target.error = null;
         // Only a slot still watched is sampled (the list may have changed while the read was out).

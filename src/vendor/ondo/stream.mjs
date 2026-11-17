@@ -72,6 +72,7 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
     const old = socket;
     const expiryWait = armingAttempted ? (DEAD_MAN_SECONDS + 1) * 1000 : 0;
     armingAttempted = false;
+    if (pendingPings) sample(latency?.missedPings, pendingPings);
     pendingPings = 0; singlePing = null;
     sample(latency?.down);
     era += 1; socket = null; open = false; loggedIn = false; subscribed = new Set(); heartbeatAckAt = null;
@@ -98,11 +99,14 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
       // A busy depth feed only proves the inbound path. Require a round trip on the socket that armed the timer.
       if (subscribed.has(DEAD_MAN) && !deadManReady()) { fail('heartbeat_timeout'); return; }
       // The protocol has no ping id. With overlapping pings, discard RTTs until every outstanding pong has arrived.
-      if (latency) {
-        pendingPings++;
-        singlePing = pendingPings === 1 ? sample(latency.stamp) : null;
+      const sent = sample(latency?.stamp);
+      if (send({ op: 'ping' }) && current === era) {
+        if (latency) {
+          pendingPings++;
+          singlePing = pendingPings === 1 ? sent : null;
+        }
+        schedule(beat, PING_MS);
       }
-      if (send({ op: 'ping' }) && current === era) schedule(beat, PING_MS);
     }, PING_MS);
   }
   const privateReady = () => loggedIn && PRIVATE.every(channel => subscribed.has(channel));
@@ -118,6 +122,7 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
       if (subscribed.has(DEAD_MAN)) heartbeatAckAt = lastFrame;
       if (pendingPings > 0) {
         if (pendingPings === 1 && singlePing) sample(latency?.elapsed, null, 'wsRtt', singlePing, received);
+        else sample(latency?.missedPings, 1);
         pendingPings--; singlePing = null;
       }
       return;

@@ -42,7 +42,7 @@ function Detail({ market, params, onExpired }: { market: OndoRewardMarket; param
   const shown = book.data ?? market;
   const rows = useMemo(() => params ? sweep(simMarket(market), params, SWEEP_BPS) : [], [market, params]);
   return <div className="or-detail">
-    <p className="muted">盘口 {time(shown.at)}{book.error && !(book.error instanceof ApiError && book.error.status === 401) ? `（刷新失败：${book.error.message}）` : ''} · 中间价 {fixed(shown.mid, 4)} · 买一 {shown.bid ?? '—'} / 卖一 {shown.ask ?? '—'} · 金额已扣除本模块自己的挂单</p>
+    <p className="muted">盘口 {time(shown.at)}{book.error && !(book.error instanceof ApiError && book.error.status === 401) ? `（刷新失败：${book.error.message}）` : shown.error ? `（${shown.error}，暂无新盘口）` : ''} · 中间价 {fixed(shown.mid, 4)} · 买一 {shown.bid ?? '—'} / 卖一 {shown.ask ?? '—'} · 金额已扣除本模块自己的挂单</p>
     {shown.levels ? <div className="or-books"><Levels title="买盘（前 5 bps）" levels={shown.levels.bid} /><Levels title="卖盘（前 5 bps）" levels={shown.levels.ask} /></div> : <TableEmpty>还没有盘口数据</TableEmpty>}
     {params ? <div className="or-levels"><h3>不同挂单距离的估算（最近距离与挂单距离保持当前差值）</h3><table>
       <thead><tr><th scope="col" className="num">距离 bps</th><th scope="col">档位</th><th scope="col" className="num">份额 买 / 卖</th><th scope="col" className="num">奖励/日</th><th scope="col" className="num">成交/日</th><th scope="col" className="num">亏损/日</th><th scope="col" className="num">净收益/日</th></tr></thead>

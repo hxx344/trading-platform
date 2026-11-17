@@ -77,8 +77,8 @@ function MarketPicker({ selected, configured, rewards, onChange }: {
   </details>;
 }
 
-function ObservationDetail({ rows, earnings, market, capital }: {
-  rows: OndoObservation['rows']; earnings: OndoObservationEarnings | undefined; market: string; capital: number | null;
+function ObservationDetail({ rows, earnings, market, capital, stale }: {
+  rows: OndoObservation['rows']; earnings: OndoObservationEarnings | undefined; market: string; capital: number | null; stale: boolean;
 }) {
   const estimate = earnings?.markets.find(item => item.market === market);
   return <>
@@ -90,7 +90,7 @@ function ObservationDetail({ rows, earnings, market, capital }: {
         <tbody>{estimate.tiers.map(tier => <tr key={tier.distanceBps}><th scope="row">{tier.distanceBps} bps</th>
           <td className="num"><Apr net={tier.netDay} capital={capital} /></td><td className="num">{dailyUsd(tier.netDay)}</td>
           <td className="num">{dailyUsd(tier.rewardDay)}</td><td className="num">{dailyUsd(tier.lossDay)}</td>
-          <td className="num">{percent(tier.buyUptime * 100)} / {percent(tier.sellUptime * 100)}</td><td>{tier.reason ?? '可估算'}</td></tr>)}</tbody>
+          <td className="num">{percent(tier.buyUptime * 100)} / {percent(tier.sellUptime * 100)}</td><td>{tier.reason ?? (stale ? '上次估算' : '可估算')}</td></tr>)}</tbody>
       </table></div>
       <details className="oo-method"><summary>收益测算口径</summary>
         <p>每单 {number.format(earnings.orderUsd)} USD，每周奖池 {number.format(earnings.poolUsd)} USD，按 {earnings.eligible} 个市场分配。
@@ -129,7 +129,7 @@ export function OndoObservationPanel({ snapshot, rewards, stale, busy, dirty, on
   const capital = useReferenceCapital(snapshot.config.orderUsd, data);
   const earnings = data?.earnings;
   const body = observeStartRequest(snapshot.config.mode, snapshot.revision, selected);
-  const block = dirty ? '请先保存挂单设置。' : snapshot.config.mode !== 'observe' ? '启动观察前，请在挂单设置中选择观察模式并保存。'
+  const block = stale ? '正在核对当前会话，请待刷新后启动。' : dirty ? '请先保存挂单设置。' : snapshot.config.mode !== 'observe' ? '启动观察前，请在挂单设置中选择观察模式并保存。'
     : !selected.length ? '请至少勾选一个观察市场。' : !body ? `单次观察限 1–${MAX_OBSERVE_MARKETS} 个有效市场。` : '';
   const state = ended ? '观察已停止 · 本次结果已冻结' : !data ? '尚未启动' : stale ? '页面数据过期 · 保留上次读取'
     : !snapshot.stream?.publicReady ? '公开行情未连接 · 暂停计时' : '观察中';
@@ -168,7 +168,7 @@ export function OndoObservationPanel({ snapshot, rewards, stale, busy, dirty, on
       {selectedDetail ? <>
         <div className="oo-results-heading"><h3>市场明细</h3><label className="or-window">查看市场<select value={selectedDetail} onChange={event => setDetail(event.target.value)}>
           {markets.map(market => <option key={market}>{market}</option>)}</select></label></div>
-        <ObservationDetail rows={data.rows.filter(row => row.market === selectedDetail)} earnings={earnings} market={selectedDetail} capital={capital.denominator} />
+        <ObservationDetail rows={data.rows.filter(row => row.market === selectedDetail)} earnings={earnings} market={selectedDetail} capital={capital.denominator} stale={stale && !ended} />
       </> : null}
     </>}
   </section>;

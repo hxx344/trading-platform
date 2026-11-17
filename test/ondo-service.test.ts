@@ -135,7 +135,7 @@ async function withServer(views: ServiceViews | undefined, run: (call: (method: 
 
 const depthClient = (): OndoClient => ({
   async markets() { return new Map([['NVDA-USD.P', { tick: '0.01', step: '0.01', trading: true, makerFee: null }]]); },
-  async depth(name: string) { return { market: name, bids: [['100.00', '3']], asks: [['100.02', '4']] }; },
+  async depth(name: string) { return { market: name, time: Date.now(), bids: [['100.00', '3']], asks: [['100.02', '4']] }; },
   close() {},
 } as unknown as OndoClient);
 

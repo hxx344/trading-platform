@@ -94,6 +94,26 @@ test('only an unambiguous pong from the same socket measures RTT; the existing p
   s.stream.close();
 });
 
+test('silent disconnection records unanswered pings without making them successful latency samples', async () => {
+  const latency = createOndoLatency({ markets: [], mode: 'observe', startedAt: EPOCH, now: () => s.now(), monotonicNow: () => s.now() - EPOCH });
+  const s = fixture({ latency }); s.stream.start(); s.sockets[0].emit('open');
+  await s.advance(15_000);
+  const rtt = latency.snapshot().wsRtt;
+  assert.deepEqual([rtt.failed, rtt.n, rtt.p95Ms, rtt.lastFailureAt], [2, 0, null, EPOCH + 15_000]);
+  s.stream.close();
+});
+
+test('public subscription and private login timeouts count only a ping actually sent on that socket', async () => {
+  for (const options of [{ onTrade() {} }, { credentials: keys }]) {
+    const latency = createOndoLatency({ markets: [], mode: 'observe', startedAt: EPOCH, now: () => s.now(), monotonicNow: () => s.now() - EPOCH });
+    const s = fixture({ latency, ...options }); s.stream.start(); s.sockets[0].emit('open');
+    await s.advance(8000);
+    assert.equal(s.sockets[0].sent.filter(frame => frame.op === 'ping').length, 1);
+    assert.equal(latency.snapshot().wsRtt.failed, 1); assert.equal(latency.snapshot().wsRtt.n, 0);
+    s.stream.close();
+  }
+});
+
 test('a broken latency observer cannot invalidate a book or interrupt the account heartbeat', async () => {
   const broken = () => { throw new Error('observer'); };
   const s = fixture({ credentials: keys, latency: { stamp: () => ({ wall: EPOCH, mono: 0 }), book: broken, elapsed: broken, down: broken } });

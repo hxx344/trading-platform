@@ -14,7 +14,7 @@ function MetricRow({ name, metric, note }: { name: string; metric: OndoLatencyMe
     <td className="num">{ms(metric.lastMs)}{metric.lastAt !== null ? <small>{time(metric.lastAt)}</small> : null}</td>
     <td className="num">{ms(metric.p50Ms)}</td><td className="num">{ms(metric.p95Ms)}</td>
     <td className="num">{metric.n ? `${metric.n} 个` : '暂无样本'}
-      {metric.failed > 0 ? <small className="om-hold">{metric.failed} 次未获确认 · {time(metric.lastFailureAt)}</small> : null}</td></tr>;
+      {metric.failed > 0 ? <small className="om-hold">{metric.failed} 次未计入耗时 · {time(metric.lastFailureAt)}</small> : null}</td></tr>;
 }
 
 export function OndoLatencyPanel({ data, connected, stale }: { data?: OndoLatencySnapshot | null; connected: boolean; stale: boolean }) {

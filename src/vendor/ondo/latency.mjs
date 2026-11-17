@@ -76,10 +76,17 @@ export function createOndoLatency({ markets, mode, startedAt, prefix, now = Date
   }
   return {
     stamp, elapsed, snapshot,
+    missedPings(count) {
+      const at = stamp();
+      if (stopped || !at) return;
+      for (let i = 0; i < Math.min(count, MAX_SAMPLES); i++) rtt.add(null, at);
+    },
     // One round is local to run() for this market. Never carry a cancelled order over to a later tick.
     cancel(market, order, reason, round) {
       if (order.role !== 'quote' || !order.clientId.startsWith(prefix)) return;
-      const protective = PROTECTIVE.has(reason);
+      // While the venue rate-limits us, holdOf changes the retry reason on the very same
+      // order. It is still the original withdrawal, not a new timed operation.
+      const protective = PROTECTIVE.has(reason) || (reason === 'rate_limited' && withdrawals.has(order));
       if (!protective) withdrawals.delete(order);
       const replace = round && reason === 'too_far' && !order.protectionLost && !order.cancelFailures && !order.wasOpen && order.remaining === order.size;
       if (!protective && !replace) return;

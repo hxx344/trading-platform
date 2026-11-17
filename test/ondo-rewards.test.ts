@@ -126,6 +126,21 @@ test('盘口：前 5 bps 各档、扣除自己的挂单、按 0.5 bps 分桶', (
   assert.throws(() => digest(book([level('-1', '1')], [level('100.01', '1')]), { buy: new Map(), sell: new Map() }, 0), OndoError);
 });
 
+test('整数价格比值区分恰好覆盖奖励档和只差一个价格步长的盘口', () => {
+  const snap = (bid: string, ask: string) => digest(book([level('99.999', '1'), level(bid, '1')],
+    [level('100.001', '1'), level(ask, '1')]), { buy: new Map(), sell: new Map() }, 1000);
+  const five = snap('99.95', '100.05'), ten = snap('99.9', '100.1'), inside = snap('99.9500000001', '100.0499999999');
+  assert.deepEqual(five.sample.cover, [5, 5]); assert.deepEqual(ten.sample.cover, [10, 10]);
+  assert.ok(five.sample.bid[10] > 0 && five.sample.ask[10] > 0 && ten.sample.bid[20] > 0);
+  assert.ok(inside.sample.cover.every(value => value < 5)); assert.ok(inside.sample.ask[9] > 0 && inside.sample.ask[10] === 0);
+  for (const bids of [[level('99.9', '1'), level('99', '0')], [level('99.9', '1'), level('99.9', '1')], [level('99', '1'), level('99.9', '1')]]) {
+    assert.throws(() => digest(book(bids, [level('100.1', '1')]), { buy: new Map(), sell: new Map() }, 1000), OndoError);
+  }
+  for (const bad of [[[['99.94'], '1']], [['99.94', ['1000000']]]]) {
+    assert.throws(() => digest({ market: 'NVDA-USD.P', bids: bad, asks: [['100.06', '1']] }, { buy: new Map(), sell: new Map() }, 0), OndoError);
+  }
+});
+
 test('波动：各分钟的收益平方和合计后开方；不足 MIN_RETURNS 个为空', () => {
   const minutes = [{ rv: 12 * 1e-6, rn: 12 }, { rv: 8 * 1e-6, rn: 8 }];
   const measured = minuteVolatility(minutes);
@@ -266,6 +281,20 @@ test('采集：逐市场核对推送及 REST 兜底的交易所时刻，迟到�
   assert.deepEqual(markets.map(m => m.avg.samples), [1, 0, 0]);
   assert.match(markets[1].error!, /时刻/); assert.match(markets[2].error!, /时刻/);
   rewards.close();
+});
+
+test('按需展开盘口时，缺少源时间的 REST 应答保留上次可信价格和时间并显示错误', async () => {
+  const time = { now: 1_800_000_000_000 }, market = 'NVDA-USD.P', fake = fakeClient(time);
+  let valid = true;
+  const client = { ...fake.client, async depth() { return { ...book([level(valid ? '99' : '97', '1')], [level('101', '1')]), time: valid ? time.now : undefined }; } };
+  const rewards = createOndoRewards({ dataDir: mkdtempSync(join(tmpdir(), 'tp-ondo-detail-')), clientFactory: () => client, now: () => time.now });
+  rewards.initialize();
+  try {
+    const first = await rewards.book(market); assert.equal(first.bid, 99);
+    time.now += 6000; valid = false;
+    const second = await rewards.book(market);
+    assert.equal(second.at, first.at); assert.equal(second.bid, 99); assert.match(second.error ?? '', /时刻缺失或过期/);
+  } finally { rewards.close(); }
 });
 
 test('采集：推送全断时说明原因并全部走 REST；REST 撞上页面发起的读取时共用并记样本；停在推送中途关闭推送、不记样本', async () => {

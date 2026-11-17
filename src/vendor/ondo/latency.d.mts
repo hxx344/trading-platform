@@ -14,6 +14,7 @@ export interface OndoLatencySnapshot {
 export interface OndoLatencyStamp { wall: number; mono: number }
 export interface OndoLatencyObserver {
   stamp(): OndoLatencyStamp | null;
+  missedPings?(count: number): void;
   elapsed(market: string | null, metric: 'wsRtt' | 'restQueue' | 'cancelAck' | 'placeAck',
     start: OndoLatencyStamp | null, end: OndoLatencyStamp | null, success?: boolean): void;
   book(market: string, sourceAt: number, received: OndoLatencyStamp): void;

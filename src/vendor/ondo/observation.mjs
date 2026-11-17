@@ -17,9 +17,11 @@ function retire(row, at) {
   row.pendingSince = null;
 }
 function endDepth(trial, at) {
+  at = Math.max(trial.cursor, at);
   for (const row of trial.rows) retire(row, at);
   trial.until = null;
   trial.offset = null;
+  trial.cursor = at;
 }
 
 export function createOndoObservation({ markets, cfg, startedAt, readRules, bookMaxAgeMs, rulesMaxAgeMs, dwellMs, minRestMs }) {
@@ -32,19 +34,22 @@ export function createOndoObservation({ markets, cfg, startedAt, readRules, book
       const band = { target, min: inner < MIN_BPS ? MIN_BPS : inner, max: outer > MAX_BPS ? MAX_BPS : outer, wallMin: cfg.wallMin };
       for (const side of ['buy', 'sell']) rows.push({ side, distanceBps, band, touches: 0, sweeps: 0, activeMs: 0, open: null, pendingSince: null });
     }
-    groups.set(market, { market, base: { rows, until: null, offset: null, enabled: true }, pending: [], seen: new Map(),
-      through: -Infinity, lastDepth: null, tradable: false, quietUntil: -Infinity });
+    groups.set(market, { market, base: { rows, until: null, offset: null, rules: null, cursor: startedAt }, pending: [], seen: new Map(),
+      through: -Infinity, lastDepth: null, clockAnchor: null, currentRules: null, quietUntil: -Infinity });
   }
 
-  function apply(trial, event) {
-    if (event.kind === -1) { trial.enabled = true; return; }
-    if (event.kind === 1) { endDepth(trial, event.local); trial.enabled = false; return; }
-    if (!trial.enabled) return;
-    // Use one source-to-host clock offset throughout a continuous interval. Moving
-    // it on each arrival would make a delayed print's measured lifetime change.
-    let at = event.time + (trial.offset ?? 0);
+  function apply(trial, event, latest) {
+    const bound = time => Math.max(trial.cursor, Math.min(latest, time));
+    if (event.kind === -1) { trial.rules = event.rules; trial.cursor = bound(event.local); return; }
+    if (event.kind === 1) { endDepth(trial, bound(event.local)); trial.rules = null; return; }
+    if (!trial.rules) return;
+    // Source time determines event order. The estimated local instant cannot precede
+    // earlier events or exceed the receipt of this or any already-received later event.
+    const projected = trial.offset === null ? event.local : event.time + trial.offset;
+    let at = bound(projected);
     if (event.kind === 2) {
-      if (trial.until === null || at >= trial.until || Math.abs(at - event.local) >= bookMaxAgeMs) return;
+      if (trial.until === null || at >= trial.until || projected >= trial.until || Math.abs(projected - event.local) >= bookMaxAgeMs) return;
+      trial.cursor = at;
       const buy = event.aggressorSide === 'sell';
       for (const row of trial.rows) {
         const order = row.open;
@@ -54,11 +59,12 @@ export function createOndoObservation({ markets, cfg, startedAt, readRules, book
       }
       return;
     }
-    if (!event.depth) { endDepth(trial, trial.offset === null ? event.local : at); return; }
-    if (trial.until !== null && (at > trial.until || Math.abs(at - event.local) >= bookMaxAgeMs)) endDepth(trial, Math.min(at, event.local));
-    if (trial.offset === null) { trial.offset = event.local - event.time; at = event.local; }
-    trial.until = Math.min(at + bookMaxAgeMs, event.local + bookMaxAgeMs, event.rules.at + rulesMaxAgeMs);
-    const { depth, rules } = event;
+    if (!event.depth) { endDepth(trial, at); return; }
+    if (trial.until !== null && (projected > trial.until || Math.abs(projected - event.local) >= bookMaxAgeMs)) endDepth(trial, at);
+    if (trial.offset === null) { at = bound(event.local); trial.offset = at - event.time; }
+    trial.cursor = at;
+    const depth = event.depth, rules = trial.rules;
+    trial.until = Math.min(at + bookMaxAgeMs, event.local + bookMaxAgeMs, rules.at + rulesMaxAgeMs);
     for (const row of trial.rows) {
       if (row.open) {
         const current = row.open;
@@ -77,62 +83,81 @@ export function createOndoObservation({ markets, cfg, startedAt, readRules, book
     }
   }
 
+  function replay(trial, events, count, asOf) {
+    if (!count) return;
+    const upper = Array(count);
+    let latest = asOf;
+    for (let i = events.length - 1; i >= 0; i--) {
+      latest = Math.min(latest, events[i].local);
+      if (i < count) upper[i] = latest;
+    }
+    for (let i = 0; i < count; i++) apply(trial, events[i], upper[i]);
+  }
   function commit(group, through) {
     let count = 0;
-    while (count < group.pending.length && group.pending[count].time <= through) apply(group.base, group.pending[count++]);
-    if (count) group.pending.splice(0, count);
+    while (count < group.pending.length && group.pending[count].time <= through) count++;
+    if (count) { replay(group.base, group.pending, count, through + bookMaxAgeMs); group.pending.splice(0, count); }
     group.through = Math.max(group.through, through);
   }
   function disconnect(group, at) {
-    for (const event of group.pending) apply(group.base, event);
+    replay(group.base, group.pending, group.pending.length, at);
     const anchor = group.lastDepth;
     group.through = Math.max(group.through, group.pending.at(-1)?.time ?? -Infinity, anchor ? anchor.time + (at - anchor.local) : -Infinity);
     endDepth(group.base, at);
-    group.base.enabled = true;
+    group.base.rules = null;
     group.pending.length = 0;
     group.lastDepth = null;
-    group.tradable = false;
+    group.clockAnchor = null;
+    group.currentRules = null;
   }
   function enqueue(group, event) {
     if (event.local < group.quietUntil || event.time <= group.through) return;
     if (group.pending.length >= MAX_PENDING || group.seen.size >= MAX_IDS) {
       // The tail is incomplete. Discard that window and resume on a fresh book.
-      endDepth(group.base, group.base.offset === null ? event.local : group.through + group.base.offset);
-      group.pending.length = 0; group.seen.clear(); group.lastDepth = null;
+      endDepth(group.base, group.base.offset === null ? event.local : Math.min(event.local, group.through + group.base.offset));
+      group.pending.length = 0; group.seen.clear(); group.lastDepth = null; group.clockAnchor = null;
+      group.base.rules = group.currentRules;
       group.through = Math.max(group.through, event.local + bookMaxAgeMs);
       group.quietUntil = event.local + bookMaxAgeMs;
       return;
     }
     const index = group.pending.findLastIndex(prior => compareEvents(prior, event) <= 0) + 1;
     group.pending.splice(index, 0, event);
-    if (event.kind === 0 && (!group.lastDepth || event.time > group.lastDepth.time)) group.lastDepth = { time: event.time, local: event.local };
+    if (event.kind === 0 && (!group.lastDepth || event.time > group.lastDepth.time)) {
+      group.lastDepth = { time: event.time, local: event.local };
+      group.clockAnchor ??= group.lastDepth;
+    }
     if (event.kind === 2) group.seen.set(event.id, event.local);
   }
   function prepare(group, at) {
     const rules = readRules(group.market);
     if (!rules) { disconnect(group, at); return null; }
     const valid = rules.trading && rules.tick > 0n && rules.step > 0n && rules.at <= at && at < rules.at + rulesMaxAgeMs;
-    if (valid !== group.tradable && group.lastDepth) {
+    const prior = group.currentRules;
+    if (Boolean(valid) !== Boolean(prior) || (valid && (rules.at !== prior.at || rules.tick !== prior.tick || rules.step !== prior.step))) {
+      group.currentRules = valid ? { tick: rules.tick, step: rules.step, at: rules.at } : null;
       const local = (valid || !rules.trading) && rules.at > 0 ? Math.min(at, rules.at) : at;
-      const time = group.lastDepth.time + (local - group.lastDepth.local);
-      const event = { kind: valid ? -1 : 1, time, local };
-      if (time <= group.through) apply(group.base, event);
-      else enqueue(group, event);
+      if (group.clockAnchor) {
+        const time = group.clockAnchor.time + (local - group.clockAnchor.local);
+        const event = { kind: valid ? -1 : 1, time, local, rules: group.currentRules };
+        if (time <= group.through) apply(group.base, event, at);
+        else enqueue(group, event);
+      } else group.base.rules = group.currentRules;
     }
-    group.tradable = valid;
     commit(group, at - bookMaxAgeMs);
     for (const [id, seenAt] of group.seen) {
       if (at - seenAt < 2 * bookMaxAgeMs) break;
       group.seen.delete(id);
     }
-    return valid ? rules : null;
+    return group.currentRules;
   }
   const timely = (source, at) => Number.isFinite(source) && at - source < bookMaxAgeMs && source - at <= bookMaxAgeMs;
 
   return {
     book(name, depth, at) {
       const group = groups.get(name); if (!group) return;
-      const rules = prepare(group, at); if (!rules) return;
+      prepare(group, at);
+      if (!group.currentRules && !group.lastDepth) return;
       if (!depth || !timely(depth.time, at)) {
         if (!depth) disconnect(group, at);
         return;
@@ -143,12 +168,12 @@ export function createOndoObservation({ markets, cfg, startedAt, readRules, book
         if (duplicate.depth && (!usable || !equalLevels(duplicate.depth.bids, usable.bids) || !equalLevels(duplicate.depth.asks, usable.asks))) duplicate.depth = null;
         return;
       }
-      enqueue(group, { kind: 0, time: depth.time, local: at, depth: usable, rules: { tick: rules.tick, step: rules.step, at: rules.at } });
+      enqueue(group, { kind: 0, time: depth.time, local: at, depth: usable });
     },
     trade(name, print, at) {
       const group = groups.get(name); if (!group) return;
       prepare(group, at);
-      if (!timely(print.time, at) || group.seen.has(print.id) || (!group.tradable && !group.lastDepth)) return;
+      if (!timely(print.time, at) || group.seen.has(print.id) || (!group.currentRules && !group.lastDepth)) return;
       enqueue(group, { kind: 2, time: print.time, local: at, id: print.id, price: print.price, aggressorSide: print.aggressorSide });
     },
     down(at) { for (const group of groups.values()) disconnect(group, at); },
@@ -157,7 +182,7 @@ export function createOndoObservation({ markets, cfg, startedAt, readRules, book
       for (const group of groups.values()) {
         prepare(group, at);
         const trial = copyTrial(group.base);
-        for (const event of group.pending) apply(trial, event);
+        replay(trial, group.pending, group.pending.length, at);
         for (const row of trial.rows) {
           const activeMs = row.activeMs + (row.open ? Math.max(0, Math.min(at, row.open.until) - row.open.since) : 0);
           const rate = count => activeMs >= MIN_RATE_MS ? count * 3_600_000 / activeMs : null;

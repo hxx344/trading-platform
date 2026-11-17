@@ -168,6 +168,19 @@ test('an unconfirmed REST withdrawal leaves the venue timer to expire until the 
   s.stream.close();
 });
 
+test('the venue switch is not armed if reconciliation expires during the login handshake', async () => {
+  let accountFresh = true;
+  const s = fixture({ credentials: keys, heartbeatAllowed: () => accountFresh }); s.stream.start();
+  const first = s.sockets[0]; first.emit('open'); first.frame({ type: 'loggedIn' });
+  s.stream.expireOrders(() => accountFresh);
+  await s.advance(31_000);
+  const second = s.sockets[1]; second.emit('open');
+  accountFresh = false; second.frame({ type: 'loggedIn' });
+  assert.ok(!second.sent.some(item => item.channel === 'cancelAllOrdersAfterPerps'));
+  assert.equal(second.closed, true); assert.equal(s.stream.status().deadManReady, false);
+  s.stream.close();
+});
+
 test('a silent, broken or closed connection is reported down and reopened with backoff', async () => {
   const s = fixture(); s.stream.start();
   s.sockets[0].emit('open'); s.sockets[0].frame({ type: 'subscribed', channel: 'depthBooksPerps' });

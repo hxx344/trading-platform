@@ -334,6 +334,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
   // without its position, which would let the filled side be quoted again.
   async function sync(current) {
     if (current.syncing) return;
+    expireStaleAccount(current);
     current.syncing = true; current.syncAttemptAt = now();
     const started = now(), stoppingAtStart = current.stopping, orderEpoch = current.orderEpoch;
     const seqs = new Map([...current.markets.values()].map(market => [market, market.dirtySeq]));
@@ -352,6 +353,8 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
       const beforePositions = new Map(current.awaiting);
       const positions = await current.client.positions({ details: true });
       if (session !== current) return;
+      expireStaleAccount(current);
+      if (now() - started >= SYNC_MAX_AGE_MS) throw new OndoError('account_read_stale');
       current.accountPositions = [...positions].filter(([, detail]) => units(detail.size) !== 0n)
         .map(([market, detail]) => ({ market, position: fmt(units(detail.size)) }));
       for (const { market: name } of current.accountPositions) {
@@ -416,7 +419,8 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
         }
       }
       saveLiveEvidence(current);
-      current.remoteOurs = remote; current.verifiedAt = started; current.syncOkAt = now(); current.syncError = null;
+      current.remoteOurs = remote; current.verifiedAt = started; current.syncOkAt = started; current.syncError = null;
+      if (orderEpoch === current.orderEpoch) current.accountStale = false;
       if (!open.length && orderEpoch === current.orderEpoch) current.emptyEpoch = orderEpoch;
       if (stoppingAtStart) current.verifiedOnStop = true;
       for (const order of strays.slice(0, STRAY_CANCELS)) {
@@ -508,7 +512,18 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
   function stopRenewal(current) {
     current.orderEpoch++;
     current.stream.expireOrders(() => current.emptyEpoch === current.orderEpoch && current.verifiedAt > current.lastWriteAt
-      && !current.syncError && now() - current.syncOkAt <= SYNC_MAX_AGE_MS);
+      && !current.syncError && accountFresh(current));
+  }
+  function accountFresh(current) {
+    return !current.accountStale && now() - current.syncOkAt < SYNC_MAX_AGE_MS;
+  }
+  function expireStaleAccount(current) {
+    if (current.stopping || current.accountStale || accountFresh(current)) return;
+    current.accountStale = true;
+    const reason = '整账户挂单和持仓已超过核对时限';
+    lockQuotes(current, '账户', reason);
+    stopRenewal(current);
+    notice(current, '账户', 'account_read', reason + '，已停止开仓和续撤单心跳。');
   }
   function expireUnconfirmedOrder(current, market, order) {
     if (session !== current || current.stopping || order.expiryRequested) return;
@@ -597,7 +612,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     if (!current.rulesAt || now() - current.rulesAt > RULES_MAX_AGE_MS) return 'no_rules';
     if (!market.rules) return 'unknown_market';
     if (!market.rules.trading) return 'market_closed';
-    if (current.live && now() - current.syncOkAt > SYNC_MAX_AGE_MS) return 'account_unknown';
+    if (current.live && !accountFresh(current)) return 'account_unknown';
     if (current.live) {
       const stream = current.stream.status();
       if (!stream.privateReady) return 'private_stream';
@@ -828,18 +843,13 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     const at = now(), work = [];
     if (!current.rulesAttemptAt || at - current.rulesAttemptAt >= RULES_REFRESH_MS) work.push(refreshRules(current));
     if (current.live) {
-      if (!current.stopping && at - current.syncOkAt > SYNC_MAX_AGE_MS && current.stream.status().deadManReady) {
-        const reason = '整账户挂单和持仓已超过核对时限';
-        lockQuotes(current, '账户', reason);
-        stopRenewal(current);
-        notice(current, '账户', 'account_read', reason + '，已停止开仓和续撤单心跳。');
-      }
+      expireStaleAccount(current);
       // A lost cancellation can remain "unknown" without reaching another attempt during a REST outage.
       for (const market of current.markets.values()) for (const order of market.orders.values()) {
         if (order.withdrawSince !== undefined && at - order.withdrawSince >= SYNC_MAX_AGE_MS) expireUnconfirmedOrder(current, market, order);
       }
       const dirty = [...current.markets.values()].some(market => market.dirty);
-      if (at - current.syncAttemptAt >= SYNC_GAP_MS && (current.stopping || dirty || at - current.syncOkAt >= SYNC_MS) && at >= current.client.cooldownUntil()) work.push(sync(current));
+      if (at - current.syncAttemptAt >= SYNC_GAP_MS && (current.stopping || current.accountStale || dirty || at - current.syncOkAt >= SYNC_MS) && at >= current.client.cooldownUntil()) work.push(sync(current));
     }
     for (const market of current.markets.values()) work.push(step(current, market));
     await Promise.all(work);
@@ -853,7 +863,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
       markets: new Map(config.markets.map(name => [name, { name, rules: null, listed: false, book: null, bookAt: 0, mid: null, orders: new Map(), bookDebits: [], foreign: [], position: 0n, positionKnown: !live,
         dirty: live, dirtySeq: 0, pending: { buy: null, sell: null }, backoff: { buy: 0, sell: 0 }, rejects: { buy: 0, sell: 0 },
         view: { buy: { role: 'quote', state: 'none', reason: 'starting' }, sell: { role: 'quote', state: 'none', reason: 'starting' } }, hold: 'starting', busy: false, error: null, lastCancel: null }])),
-      accountPositions: [], orderEpoch: 0, emptyEpoch: null, awaiting: new Map(), evidenceSeq: 0, savedEvidence: null, syncing: false, syncAttemptAt: 0, syncOkAt: now(), syncError: null, remoteOurs: null, verifiedAt: 0, lastWriteAt: now(),
+      accountPositions: [], accountStale: false, orderEpoch: 0, emptyEpoch: null, awaiting: new Map(), evidenceSeq: 0, savedEvidence: null, syncing: false, syncAttemptAt: 0, syncOkAt: now(), syncError: null, remoteOurs: null, verifiedAt: 0, lastWriteAt: now(),
       loadingRules: false, rulesAttemptAt: 0, rulesAt: 0, rulesError: null, totals: { placed: 0, canceled: 0, rejected: 0, postOnly: 0, fills: 0 }, client: null, stream: null };
     current.client = clientFactory(clientOptions({ credentials: keys, rps: config.rps }));
     current.observation = live ? null : createOndoObservation({
@@ -862,6 +872,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
       readRules: name => current.stream.status().publicReady ? { ...current.markets.get(name).rules, at: current.rulesAt } : null,
     });
     current.stream = streamFactory({ markets: config.markets, credentials: keys, ...(WebSocketImpl ? { WebSocketImpl } : {}), now,
+      ...(live ? { heartbeatAllowed: () => session === current && !current.stopping && accountFresh(current) } : {}),
       ...(current.observation ? { onTrade(name, trade, at) { if (session === current) current.observation.trade(name, trade, at); } } : {}),
       onBook(name, book, at) {
         const market = current.markets.get(name);

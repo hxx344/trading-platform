@@ -340,6 +340,21 @@ test('an untracked open order freezes quotes before its apparent liquidity can p
   assert.match(mm.state().incident.reason, /其他永续挂单/); assert.equal(count('place'), placed); assert.deepEqual(f.resting(), []);
 });
 
+test('an empty account read that crosses the freshness deadline cannot reauthorize a disconnected session', async () => {
+  const { f, v, mm } = fixture();
+  await f.live({ wallUsd: '1000000' });
+  f.stream.onPrivate('ordersPerps', [{ market: 'TSLA-USD.P', clientOrderId: 'external', status: 'open' }]);
+  await f.rounds(6, 1000); const allowed = f.expiry;
+  assert.equal(allowed(), true);
+  let release;
+  v.positionsGate = new Promise(r => { release = r; });
+  f.time += 6000; const slow = mm.tick(); await new Promise(r => setImmediate(r));
+  f.time += 16_000; assert.equal(allowed(), false);
+  release(); await slow;
+  assert.equal(allowed(), false); assert.equal(mm.state().syncError, 'account_read_stale');
+  await f.rounds(2, 1000); assert.equal(allowed(), true);
+});
+
 test('repeated failed cancellations stop the heartbeat even when private data is flowing', async () => {
   const { f, v, mm } = fixture();
   await f.live(); v.cancelError = new OndoError('cancel_refused', { status: 400 });

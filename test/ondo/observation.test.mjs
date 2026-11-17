@@ -167,3 +167,37 @@ test('depth and prints from a halt cannot reopen the trial when they arrive afte
   book(180);
   assert.deepEqual([row(200, 'buy').touches, row(200, 'buy').activeMs], [0, 70]);
 });
+
+test('pre-halt depth arriving during the halt re-arms the same order as punctual depth', () => {
+  for (const late of [false, true]) {
+    const { book, trade, rules, row } = fixture();
+    book(0); trade('sell', '99.95', 50, 'first');
+    if (!late) book(100);
+    rules.trading = false; rules.at = START + 150;
+    row(150, 'buy');
+    if (late) book(160, { source: 100 });
+    book(165, { source: 155 }); // no virtual order can re-open inside the halt
+    trade('sell', '99.95', 110, 'second', 170);
+    trade('sell', '99.95', 158, 'halted', 172);
+    const buy = row(175, 'buy');
+    assert.deepEqual([buy.touches, buy.sweeps, buy.activeMs], [2, 2, 60]);
+    rules.trading = true; rules.at = START + 180;
+    book(185);
+    assert.equal(row(195, 'buy').activeMs, 70);
+  }
+});
+
+test('each swept order ends within elapsed local time even when the initial depth clock is behind', () => {
+  const { trial, book, trade, row } = fixture();
+  book(0, { source: -500 });
+  trade('sell', '99.95', 100, 'first');
+  const first = trial.snapshot(START + 100, true);
+  assert.ok(first.rows.every(r => r.activeMs <= 100));
+  const buy = first.rows.find(r => r.side === 'buy' && r.distanceBps === 4);
+  assert.deepEqual([buy.sweeps, buy.activeMs], [1, 100]);
+  // The next order was observed from 110 to 120. Neither order can consume time
+  // from the idle interval after its own sweep, even when the final view is later.
+  book(110, { source: 200 });
+  trade('sell', '99.95', 250, 'second', 120);
+  assert.deepEqual([row(200, 'buy').sweeps, row(200, 'buy').activeMs], [2, 110]);
+});

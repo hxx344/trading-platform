@@ -49,7 +49,7 @@ function parsePublicTrade(row) {
 // reopened after 1-30 s, 60 s after a refused login, without a retry limit:
 // reconnecting places no order. Private payloads are passed on unparsed; the
 // caller treats them as hints and reads the account over REST.
-export function createOndoStream({ markets, credentials = null, depth = 50, onBook, onTrade, onPrivate = () => {}, onDown = () => {},
+export function createOndoStream({ markets, credentials = null, depth = 50, onBook, onTrade, heartbeatAllowed = () => true, onPrivate = () => {}, onDown = () => {},
   WebSocketImpl = globalThis.WebSocket, now = Date.now, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout } = {}) {
   const wanted = new Set(markets);
   const observeTrades = !credentials && typeof onTrade === 'function';
@@ -82,7 +82,9 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
     failures += 1;
     retryTimer = schedule(() => { retryTimer = null; connect(); }, wait);
   }
+  const authorized = () => !credentials || (heartbeatAllowed() && (!resumeAfterExpiry || resumeAfterExpiry()));
   function send(value) {
+    if (!authorized()) { fail('account_unverified'); return false; }
     try { socket.send(JSON.stringify(value)); return true; } catch { fail('send_failed'); return false; }
   }
   function watch(current) {
@@ -115,6 +117,8 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
     if (message.type === 'subscribed') {
       if (message.channel === DEAD_MAN) {
         if (!credentials || !loggedIn) return;
+        if (!authorized()) { fail('account_unverified'); return; }
+        resumeAfterExpiry = null;
         heartbeatAckAt = lastFrame;
       }
       if (typeof message.channel === 'string') subscribed.add(message.channel);
@@ -150,11 +154,10 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
   }
   function connect() {
     if (closed || socket) return;
-    if (resumeAfterExpiry && !resumeAfterExpiry()) {
+    if (!authorized()) {
       retryTimer = schedule(() => { retryTimer = null; connect(); }, 1000);
       return;
     }
-    resumeAfterExpiry = null;
     if (typeof WebSocketImpl !== 'function') { error = 'unsupported'; return; }
     const current = ++era;
     let ws;
@@ -190,7 +193,7 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
     start() { if (!started && !closed) { started = true; connect(); } },
     expireOrders(confirmedClear) {
       if (closed || !credentials) return;
-      resumeAfterExpiry ??= confirmedClear;
+      resumeAfterExpiry = confirmedClear;
       if (socket) fail('cancel_unconfirmed');
     },
     status: () => ({ connected: open, publicReady: open && publicReady(), privateReady: open && privateReady(), deadManReady: open && deadManReady(), lastFrameAt: lastFrame || null, error }),

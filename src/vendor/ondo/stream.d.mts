@@ -8,6 +8,7 @@ export interface OndoStream { start(): void; status(): OndoStreamStatus; close()
 export interface OndoStreamOptions {
   markets: string[];
   credentials?: unknown;
+  heartbeatAllowed?: () => boolean;
   /** Levels per side asked for. */
   depth?: number;
   /** A book, or null when it was malformed or crossed; `at` is when the frame arrived. */

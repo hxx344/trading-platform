@@ -33,11 +33,38 @@ test('Asset catalog includes every positions exchange before setup and never exp
   await f.save('owner', 'gate', { exchange: 'gate', apiKey: 'gate-asset-key', apiSecret: 'gate-asset-secret' });
   const service = createPositionsService({ read: async () => assert.fail('unconfigured must not read') });
   const report = await service.read(() => f.database, () => assert.fail('asset-only Gate and unconfigured accounts must not decrypt'));
-  assert.deepEqual(report.exchanges.map(item => item.id), ['binance', 'bybit', 'okx', 'aster', 'variational', 'rh-lighter']);
+  assert.deepEqual(report.exchanges.map(item => item.id), ['binance', 'bybit', 'okx', 'aster', 'variational', 'rh-lighter', 'hyperliquid']);
   for (const exchange of report.exchanges) for (const account of exchange.accounts) {
     assert.equal(account.configured, false); assert.equal(account.revision, null);
     for (const item of account.scopes) { assert.equal(item.status, 'unconfigured'); assert.equal(item.fetchedAt, null); assert.deepEqual(item.positions, []); }
   }
+});
+
+test('Hyperliquid cache preserves an observation when the venue repeats or rolls back its time', async t => {
+  const f = fixture(); t.after(() => f.database.close());
+  await f.save('owner', 'hyperliquid', { exchange: 'hyperliquid', walletAddress: '0x00000000000000000000000000000000000000ab' });
+  let clock = at, sourceAt = at - 10_000, held = true;
+  const service = createPositionsService({ now: () => clock, fetcher: async (_url, init) => {
+    const { type, dex } = JSON.parse(String(init?.body));
+    if (type === 'perpDexs') return Response.json([null, { name: 'xyz' }, { name: 'io' }]);
+    if (type === 'meta') return Response.json({ collateralToken: 0 });
+    const assetPositions = held && dex === 'xyz' ? [{ type: 'oneWay', position: { coin: 'xyz:ANT', szi: '-1', unrealizedPnl: '8' } }] : [];
+    return Response.json({ time: sourceAt, assetPositions });
+  } });
+  t.after(() => service.close());
+  const refresh = async () => {
+    await service.refreshForSnapshot(() => f.database, f.unseal);
+    return service.peek(f.database).find(item => item.scope === 'xyz')!;
+  };
+  const first = await refresh();
+  assert.deepEqual([first.status, first.fetchedAt, first.positions[0].symbol], ['live', new Date(sourceAt).toISOString(), 'xyz:ANT']);
+  clock += 30_000; held = false;
+  assert.deepEqual(await refresh(), first, 'same venue timestamp must be idempotent');
+  clock += 30_000; sourceAt -= 1000;
+  assert.deepEqual(await refresh(), { ...first, status: 'stale' }, 'older empty response cannot replace a newer held position');
+  clock += 30_000; sourceAt = clock;
+  const fresh = await refresh();
+  assert.deepEqual([fresh.status, fresh.fetchedAt, fresh.positions], ['live', new Date(sourceAt).toISOString(), []]);
 });
 
 test('GET returns loading promptly, single-flights within TTL and marks only successful empty results live', async t => {
@@ -222,7 +249,8 @@ test('cycle summaries load in the background, stay cached by side and quantity, 
 test('peek returns cached holdings for snapshots without reading, and drops replaced credentials', async t => {
   const f = fixture(); t.after(() => f.database.close()); await f.save(); let clock = at; let reads = 0;
   const service = createPositionsService({ now: () => clock, read: async () => { reads++; return sample; } });
-  assert.deepEqual(await service.peek(f.database), [], 'nothing cached before the first read');
+  const cold = service.peek(f.database);
+  assert.ok(cold.length && cold.every(item => item.status === 'stale' && item.positions.length === 0), 'unread configured scopes remain unknown');
   await service.read(() => f.database, f.unseal); await service.idle();
   const before = reads, live = await service.peek(f.database);
   const um = live.find(item => item.scope === 'um')!;
@@ -231,7 +259,8 @@ test('peek returns cached holdings for snapshots without reading, and drops repl
   assert.equal(live.some(item => item.scope === 'options'), false, 'unsupported scopes are not captured');
   clock += 90_000; assert.equal((await service.peek(f.database)).find(item => item.scope === 'um')!.status, 'stale');
   assert.equal(reads, before, 'peek never starts a read');
-  await f.save(); assert.deepEqual(await service.peek(f.database), [], 'replaced credentials invalidate cached holdings');
+  await f.save();
+  assert.ok(service.peek(f.database).every(item => item.status === 'stale' && item.positions.length === 0 && item.generation !== um.generation), 'replaced credentials invalidate cached holdings');
   assert.equal(JSON.stringify(live).includes('synthetic'), false);
 });
 

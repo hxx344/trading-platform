@@ -9,7 +9,7 @@ import { niceAxis } from './svg-plot-geometry.ts';
 import { useLiveResource } from './use-live-resource.ts';
 import { MIN_MONTHLY_SPAN_DAYS, formatGain, formatReturnRate, performanceTone } from '../../src/asset/performance-metrics.ts';
 import { DAILY_CHANGE_DAYS } from '../../src/asset/daily-changes.ts';
-import type { PositionAnalysis } from '../../src/asset/daily-positions.ts';
+import { POSITION_GROUPS, type PositionAnalysis } from '../../src/asset/daily-positions.ts';
 import { businessDay, type CashFlowInput, type CashFlowRecord } from '../../src/asset/cash-flows.ts';
 import { newRequestId } from './request-ids.ts';
 import type { Writer } from './AssetPage.tsx';
@@ -96,12 +96,18 @@ export const AssetTrend = memo(function AssetTrend({ history, version, writer, o
   </section>;
 });
 
-function Holdings({ positions }: { positions: PositionAnalysis }) {
-  if (!positions.compared) return positions.recorded ? <p className="daily-combos-note">持仓从这天开始记录，下一份快照起计算持仓影响</p> : null;
-  return <ul className="daily-combos" aria-label="持仓影响">{positions.groups.map(group => <li key={group.id}>
-    <span>{group.label}</span><b className={group.change === null ? undefined : performanceTone(group.change)}>{formatGain(group.change)}</b>
-    {group.change !== null && !group.complete ? <small className="daily-partial">部分</small> : null}
-  </li>)}</ul>;
+function Holdings({ positions }: { positions: PositionAnalysis | null }) {
+  const note = !positions?.recorded ? '这份快照缺少持仓数据' : !positions.compared ? '上一份快照缺少持仓数据'
+    : positions.groups.every(group => group.change === null) ? '两份快照间缺少可比持仓数据' : null;
+  return <>
+    <ul className="daily-combos" aria-label="持仓影响（USD）">{POSITION_GROUPS.map(({ id, label }) => {
+      const group = positions?.groups.find(item => item.id === id), change = group?.change ?? null;
+      return <li key={id}><span>{label}</span><b className={change === null ? undefined : performanceTone(change)}>{formatGain(change)}</b>
+        {change !== null && !group?.complete ? <small className="daily-partial">部分</small> : null}
+      </li>;
+    })}</ul>
+    {note ? <p className="daily-combos-note">{note}</p> : null}
+  </>;
 }
 
 /** Read only while expanded; read again when the ledger changes (a new import or a write here), at once while open or on the next opening. */
@@ -118,7 +124,7 @@ function DailyChanges({ version, writer, onExpired }: { version: string; writer:
     <div className="performance-monthly-body">
       {open ? <CashFlows version={version} writer={writer} onExpired={onExpired} /> : null}
       <p className="performance-note">逐日对比上一份已有快照，缺失日期不补造。来源为各资产行估值变化，展开可看交易所按账户、币种的分项；出金单列并加回，与“剔除出金影响”口径一致。入金未剔除，资产变化不等于投资收益。</p>
-      <p className="performance-note">持仓影响分原油套利、海力士套利、ANT 套利和其他持仓四项，每项 = 两份快照间的浮盈亏变化 + 本轮已实现盈亏、手续费、资金费的变化，按快照内的稳定币价格折成 USD，是近似值。ANT 仅统计资产快照已记录的持仓，当前不含 Hyperliquid。持仓随快照记录，此前的日期没有持仓数据；当天已平仓、本轮统计不可比或只有浮盈亏的仓位使该项标为“部分”，无法计算时显示“—”。</p>
+      <p className="performance-note">持仓影响按资产已接入的合约分组，Hyperliquid 覆盖 xyz 和 io。金额以 USD 显示，含浮盈亏变化和可比的已实现盈亏、手续费及资金费。“部分”表示只统计了能核对的金额，“—”表示缺少可比数据。</p>
       {open && error && !loading ? <p className="error-text" role="alert">{error.message}{report ? '，当前显示上次读取结果' : null} <button type="button" className="text-button" onClick={() => void refresh()}>重试</button></p> : null}
       {!report ? (loading ? <p className="help" role="status">读取每日波动…</p> : null)
         : !days.length ? <p className="help">近 {DAILY_CHANGE_DAYS} 天不足两份快照，暂无逐日变化。</p>
@@ -131,7 +137,7 @@ function DailyChanges({ version, writer, onExpired }: { version: string; writer:
               <span><strong>{day.date.slice(5)}</strong>{day.partial ? <small className="daily-partial" title="快照含旧值或缺失估值，仅比较已知金额">部分数据</small> : null}<small>较 {day.previousDate.slice(5)}{day.gapDays > 1 ? ' · 间隔 ' + day.gapDays + ' 天' : null}</small></span>
               <span className={performanceTone(day.change)}>$ {formatGain(day.change)}<small>{formatReturnRate(rate)}</small></span>
             </div>
-            {day.positions ? <Holdings positions={day.positions} /> : null}
+            <Holdings positions={day.positions} />
             {day.attribution ? <details><summary>资金流与未解释差额</summary>
               <p>已标注净外部资金流：{formatGain(day.attribution.cashFlows.knownNetUsd)} USD · 已知持仓贡献：{formatGain(day.attribution.knownPositionChange)} USD · 出金加回：{formatGain(day.withdrawnChange)} USD · 未解释差额：{formatGain(day.attribution.unexplained)} USD</p>
               <p className="performance-note">{day.attribution.note}</p>

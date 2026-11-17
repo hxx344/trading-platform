@@ -208,13 +208,20 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
   - 持仓页：每 5 秒一次读接口，服务端缓存命中时为 0，缓存过期后约 5；
   - 这些都按出口 IP 计。与原油执行账户、同机的工作台共用出口 IP 时三者叠加，持仓多时注意 Binance 每分钟权重上限。
 - **没做（登记）**：
-  - Anthropic（ANT）的成交读取、执行归属与关联持仓合计：`fillsQueryMarket` 只接受 `oil` / `hynix`，Anthropic 详情不画标记；关联交易只列逐腿持仓，Binance ↔ Lighter RH 的组合合计（工作台 `relatedAnthropicPair`）没做（Hyperliquid 持仓资产账本不读，那两组成立不了）；
+  - Anthropic（ANT）的成交读取、执行归属与关联持仓合计：`fillsQueryMarket` 只接受 `oil` / `hynix`；Anthropic 详情的关联交易只列逐腿持仓。
   - A08 留到下一批；A14 不迁移。
 - **测试**：
   - 后端：`test/asset-fills.test.ts`、`asset-positions-*.test.ts`、`positions.test.ts`；
   - 页面纯函数：`test/monitor-trades.test.ts`、`test/monitor-related.test.ts`；
   - 导航与路由：`test/workspace-nav.test.ts`、`test/web.test.ts`；
   - 所有交易所读取都换成替身。
+
+### 每日套利仓位归因（v0.62.1）
+
+- 资产刷新沿用现有同步节流，余额与持仓并行读取。持仓复用原有缓存与并发上限，资产同步最多等持仓请求 12 秒。本轮成交统计在后台完成，编辑资产等写入只取已有持仓缓存。
+- 每两份快照按合约标的归入原油、海力士、ANT 或其他持仓，单腿也归入对应标的。Hyperliquid 使用资产里保存的钱包地址读取 `xyz`、`io` 永续仓位，按合约全名识别原油、海力士和 ANT，并保留交易所采样时间。两处目前提供浮盈亏，按快照内可核实的结算币价格折 USD，显示为部分贡献。
+- 已配置范围读取失败、持仓快照缺失、换连接以及重复采样时保留未知。已平仓或本轮盈亏不可比时只计能核对的部分。旧快照已有的持仓按新规则归类，缺少覆盖记录的组保留未知。资产总额、资金流和出金沿用现有口径。
+- 回滚版本为 v0.62.0。快照增加可选的持仓覆盖标记，旧版本可继续读取。
 
 ## A-6：原表导入（A08）
 

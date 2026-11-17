@@ -26,7 +26,7 @@ const pairFoot: Record<FillMarket, string> = {
   hynix: `价差 = ADR ÷（正股 ÷ 10）− 1，10 份 ADR 对 1 股正股；仅在同一交易所 ADR 与正股各一笔且方向相反时计算；当前价差取本页交易所报价，无报价的交易所显示 —。${totalsFoot}`,
 };
 
-const ANT_TOTALS_NOTE = '资产账本读不到 Hyperliquid（xyz:ANT、io:ANTH）上的对比腿，Binance ↔ Lighter RH 的组合盈亏暂不合计；下面是逐腿持仓。';
+const ANT_TOTALS_NOTE = '这里按交易所逐腿列出 ANT 持仓及盈亏。';
 
 const beijing = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 const beijingDate = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });

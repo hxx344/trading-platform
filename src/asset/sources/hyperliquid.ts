@@ -1,6 +1,8 @@
 // Copied from project_aggregation modules/asset/lib/hyperliquid.ts at 0014655.
 // Changes: imports point at ./concurrency.ts, src/vendor and ../types.ts. Logic, caches, the 12 s per-request timeout, the 40 s sync budget, limits and messages are unchanged.
 import type { Balance } from '../types.ts';
+import type { Position } from '../positions-types.ts';
+import { decimal as positionDecimal, isZero, optionalDecimal as optionalPositionDecimal, position, record, rows, text, uniquePositions } from '../positions-values.ts';
 import { mapConcurrent } from './concurrency.ts';
 import { ExchangeResponseError, readJsonResponse } from '../../vendor/response.mjs';
 
@@ -23,6 +25,7 @@ const QUOTE_MAX_BYTES = 128 * 1024;
 // Entries expire after this TTL; a DEX that is not yet cached is always read on demand.
 const STATIC_TTL_MS = 10 * 60_000;
 const VALUE_MAX_AGE_MS = 5 * 60_000, FUTURE_TOLERANCE_MS = 60_000, QUOTE_MAX_AGE_MS = 900_000;
+const POSITION_MAX_AGE_MS = 90_000;
 const DECIMAL = /^-?\d+(?:\.\d+)?$/;
 // Unified account and portfolio margin keep all balances in the spot clearinghouse; their
 // per-DEX perp states repeat that collateral and must not be listed as separate equity.
@@ -209,6 +212,38 @@ async function spotMarket(read: Read, known: Map<number, string>): Promise<SpotM
     if (!previous || (canonical && !previous.canonical) || (canonical === previous.canonical && volume > previous.volume)) best.set(token, { price, canonical, volume });
   }
   return { names, prices: new Map([...best].map(([token, entry]) => [token, entry.price])) };
+}
+
+/** Read the HIP-3 scopes used by the tracked arbitrages, using the saved public wallet address. */
+export async function readHyperliquidPositions(c: HyperliquidCredential, dex: string, fetcher: Fetcher, signal: AbortSignal, now = Date.now): Promise<{ positions: Position[]; observedAt: string }> {
+  if (dex !== 'xyz' && dex !== 'io') throw new Error(HYPERLIQUID_ERRORS.invalid);
+  const user = address(c.walletAddress);
+  const read: Read = body => info(body, fetcher, signal);
+  const state = record(await read({ type: 'clearinghouseState', user, dex }));
+  const sourceAt = state.time, receivedAt = now();
+  if (typeof sourceAt !== 'number' || !Number.isSafeInteger(sourceAt) || sourceAt <= 0) throw new Error(HYPERLIQUID_ERRORS.invalid);
+  if (receivedAt - sourceAt >= POSITION_MAX_AGE_MS || sourceAt - receivedAt > FUTURE_TOLERANCE_MS) throw new Error(HYPERLIQUID_ERRORS.stale);
+  const observedAt = new Date(sourceAt).toISOString();
+  const holdings = rows(state.assetPositions).map(item => {
+    const entry = record(item.position), quantity = positionDecimal(entry.szi), symbol = text(entry.coin);
+    if (item.type !== 'oneWay' || !symbol.startsWith(`${dex}:`)) throw new Error(HYPERLIQUID_ERRORS.invalid);
+    return { entry, quantity, symbol };
+  }).filter(item => !isZero(item.quantity));
+  if (!holdings.length) return { positions: [], observedAt };
+
+  const meta = await perpDexes(fetcher, read, receivedAt);
+  const token = await collateralOf(meta, dex, read);
+  const known = tokenNames.get(fetcher) ?? new Map<number, string>();
+  tokenNames.set(fetcher, known);
+  if (token !== 0 && !known.has(token)) await spotMarket(read, known);
+  const currency = token === 0 ? 'USDC' : known.get(token) ?? null;
+  const positions = holdings.map(({ entry, quantity, symbol }) => ({
+    ...position(symbol, quantity.startsWith('-') ? 'short' : 'long', quantity, '标的'),
+    entryPrice: optionalPositionDecimal(entry.entryPx), notional: optionalPositionDecimal(entry.positionValue),
+    unrealizedPnl: positionDecimal(entry.unrealizedPnl), liquidationPrice: optionalPositionDecimal(entry.liquidationPx),
+    priceCurrency: currency, pnlCurrency: currency, notionalCurrency: currency, sourceUpdatedAt: observedAt,
+  }));
+  return { positions: uniquePositions(positions), observedAt };
 }
 
 async function quoteJson(url: string, fetcher: Fetcher, deadline: AbortSignal): Promise<Json> {

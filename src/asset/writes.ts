@@ -32,7 +32,7 @@ export function dailySnapshot(ledger: Pick<Ledger, 'assets' | 'fx' | 'fxStatus' 
   const assets = ledger.assets.map(asset => ({ ...asset, value: knownAssetValue(asset) }));
   const { total, partial, missingValues } = snapshotValues(assets, ledger.fxStatus, at, configuredExchanges(ledger.connections));
   const date = chinaDay(new Date(at)), updatedAt = new Date(at).toISOString();
-  return { date, data: { id: 'daily-' + date, date, total, fx: ledger.fx, fxStatus: ledger.fxStatus, cny: total * ledger.fx, future: false, difference: 0, partial, missingValues, withdrawn: embeddedWithdrawals(assets), updatedAt, assets, ...(scopes ? { positions: { capturedAt: updatedAt, scopes } satisfies PositionsCapture } : {}) } };
+  return { date, data: { id: 'daily-' + date, date, total, fx: ledger.fx, fxStatus: ledger.fxStatus, cny: total * ledger.fx, future: false, difference: 0, partial, missingValues, withdrawn: embeddedWithdrawals(assets), updatedAt, assets, ...(scopes ? { positions: { capturedAt: updatedAt, scopes, scopeCoverage: 'configured' } satisfies PositionsCapture } : {}) } };
 }
 export function saveSnapshot(database: Database, ledger: Pick<Ledger, 'assets' | 'fx' | 'fxStatus' | 'connections'>, at: number, peek?: PositionsPeek) {
   let scopes: SnapshotScope[] | null = null;

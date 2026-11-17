@@ -1,4 +1,4 @@
-// Copied from project_aggregation modules/asset/lib/daily-positions.ts at 0014655. The calculation is unchanged.
+// Adapted from project_aggregation modules/asset/lib/daily-positions.ts at 0014655.
 import type { Position, PositionCycle } from './positions-types.ts';
 
 /** Positions as cached when a daily snapshot was written; balances and holdings share that moment. */
@@ -6,11 +6,11 @@ export type SnapshotCycle = Pick<PositionCycle, 'status' | 'since' | 'realizedPn
 export type SnapshotPosition = Pick<Position, 'id' | 'symbol' | 'instrumentId' | 'side' | 'quantity' | 'quantityUnit' | 'unrealizedPnl' | 'pnlCurrency'> & { cycle: SnapshotCycle | null };
 /** `generation` is a one-way digest of the stored credential, so a replaced account is never compared with the old one. */
 export type SnapshotScope = { exchange: string; account: string; accountName: string; generation: string; scope: string; status: 'live' | 'stale'; fetchedAt: string; positions: SnapshotPosition[] };
-export type PositionsCapture = { capturedAt: string; scopes: SnapshotScope[] };
+export type PositionsCapture = { capturedAt: string; scopes: SnapshotScope[]; scopeCoverage?: 'configured' };
 
 export type ComboId = 'oil' | 'hynix' | 'anthropic';
 export const COMBOS: { id: ComboId; label: string; bases: string[] }[] = [
-  { id: 'oil', label: '原油套利', bases: ['CL', 'BZ'] },
+  { id: 'oil', label: '原油套利', bases: ['CL', 'BZ', 'BRENTOIL', 'WTI'] },
   { id: 'hynix', label: '海力士套利', bases: ['SKHY', 'SKHX', 'SKHYNIX'] },
   { id: 'anthropic', label: 'ANT 套利', bases: ['ANTHROPIC'] },
 ];
@@ -27,7 +27,7 @@ export type GroupId = ComboId | 'other';
 export type GroupImpact = { id: GroupId; label: string; change: number | null; complete: boolean; legs: number };
 /** `groups` is empty until two captures can be compared; `recorded` says the current snapshot holds any scope. */
 export type PositionAnalysis = { compared: boolean; recorded: boolean; capturedAt: string; previousCapturedAt: string | null; groups: GroupImpact[] };
-const GROUPS: { id: GroupId; label: string }[] = [...COMBOS.map(({ id, label }) => ({ id, label })), { id: 'other', label: '其他持仓' }];
+export const POSITION_GROUPS: ReadonlyArray<{ id: GroupId; label: string }> = [...COMBOS.map(({ id, label }) => ({ id, label })), { id: 'other', label: '其他持仓' }];
 type BalanceRow = { mode?: string; value: number | null; details?: { coin: string; value: number; price: number }[] };
 
 const CENT = 0.005;
@@ -42,8 +42,14 @@ export function matchBase(symbol: string, bases: readonly string[]): string | nu
   for (const base of bases) if (normalized.startsWith(base) && SUFFIXES.has(normalized.slice(base.length)) && (!match || base.length > match.length)) match = base;
   return match;
 }
-export const comboOf = (position: Pick<Position, 'symbol' | 'instrumentId'>): ComboId | null =>
-  COMBOS.find(combo => matchBase(position.symbol, combo.bases) || matchBase(position.instrumentId, combo.bases))?.id ?? null;
+const HYPERLIQUID_COMBOS = new Map<string, ComboId>([
+  ['XYZ:CL', 'oil'], ['XYZ:BRENTOIL', 'oil'], ['XYZ:SKHY', 'hynix'], ['XYZ:SKHX', 'hynix'],
+  ['XYZ:ANT', 'anthropic'], ['IO:ANTH', 'anthropic'],
+]);
+export function comboOf(position: Pick<Position, 'symbol' | 'instrumentId'>, exchange: string): ComboId | null {
+  if (exchange === 'hyperliquid') return HYPERLIQUID_COMBOS.get(position.symbol.toUpperCase()) ?? HYPERLIQUID_COMBOS.get(position.instrumentId.toUpperCase()) ?? null;
+  return COMBOS.find(combo => matchBase(position.symbol, combo.bases) || matchBase(position.instrumentId, combo.bases))?.id ?? null;
+}
 
 const amount = (value: string | null | undefined) => {
   if (value === null || value === undefined) return null;
@@ -74,13 +80,14 @@ function cashFlow(previous: SnapshotPosition | undefined, current: SnapshotPosit
   return end === null || start === null ? null : end - start;
 }
 
-function positionChange(previous: SnapshotPosition | undefined, current: SnapshotPosition | undefined, at: { usable: boolean; previous: string | null; current: string }, rate: (currency: string | null) => number | null, account: string, key: string): PositionChange {
+function positionChange(previous: SnapshotPosition | undefined, current: SnapshotPosition | undefined, at: { usable: boolean; previous: string | null; current: string }, rate: (currency: string | null) => number | null, scope: SnapshotScope, key: string): PositionChange {
   const held = current ?? previous!, { usable, previous: previousAt } = at;
-  const base = { key, account, symbol: held.symbol, side: held.side, combo: comboOf(held), previousQuantity: previous?.quantity ?? null, quantity: current?.quantity ?? null,
+  const base = { key, account: scope.accountName, symbol: held.symbol, side: held.side, combo: comboOf(held, scope.exchange), previousQuantity: previous?.quantity ?? null, quantity: current?.quantity ?? null,
     quantityUnit: held.quantityUnit, currency: held.pnlCurrency };
   const unknown = (note: string): PositionChange => ({ ...base, unrealizedChange: null, cashFlowChange: null, change: null, partial: true, note });
   if (!usable || previousAt === null) return unknown(previousAt === null ? '前一份快照未记录持仓' : '持仓未在两份快照中同时有效读取');
   if (!current) return unknown('已平仓，平仓盈亏未单独统计');
+  if (previous && previous.pnlCurrency !== current.pnlCurrency) return unknown('两份快照的盈亏币种不同');
   const before = previous ? amount(previous.unrealizedPnl) : 0, after = amount(current.unrealizedPnl);
   if (before === null || after === null) return unknown('缺少浮盈亏');
   const usd = rate(held.pnlCurrency);
@@ -98,17 +105,17 @@ export function comparePositions(input: CompareInput): { positions: PositionChan
   const before = new Map((previous?.scopes ?? []).map(scope => [scopeKey(scope), scope]));
   const after = new Map(current.scopes.map(scope => [scopeKey(scope), scope]));
   const positions: PositionChange[] = [];
-  // An empty capture means the positions cache was cold, not that nothing was held.
-  let readable = before.size > 0 && after.size > 0;
+  // Older captures omitted unread scopes. Use their known legs, but require explicit coverage to prove a group is empty.
+  let readable = previous?.scopeCoverage === 'configured' && current.scopeCoverage === 'configured' && before.size > 0 && after.size > 0;
   for (const key of new Set([...after.keys(), ...before.keys()])) {
     const old = before.get(key), next = after.get(key), scope = next ?? old!;
-    const usable = !!previous && old?.status === 'live' && next?.status === 'live';
+    const usable = old?.status === 'live' && next?.status === 'live' && Date.parse(next.fetchedAt) > Date.parse(old.fetchedAt);
     if (!usable) readable = false;
     const oldPositions = new Map((old?.positions ?? []).map(item => [item.id, item]));
     const nextPositions = new Map((next?.positions ?? []).map(item => [item.id, item]));
     for (const id of new Set([...nextPositions.keys(), ...oldPositions.keys()])) {
       positions.push(positionChange(oldPositions.get(id), nextPositions.get(id), { usable, previous: previous ? old?.fetchedAt ?? previous.capturedAt : null, current: next?.fetchedAt ?? current.capturedAt },
-        currency => usdRate(currency, input.rows, scope.exchange), scope.accountName, JSON.stringify([key, id])));
+        currency => usdRate(currency, input.rows, scope.exchange), scope, JSON.stringify([key, id])));
     }
   }
   return { positions, readable };
@@ -119,7 +126,7 @@ export function analyzePositions(input: Omit<CompareInput, 'current'> & { curren
   const { previous, current } = input;
   if (!current) return null;
   const { positions, readable } = comparePositions({ ...input, current });
-  const groups = !previous ? [] : GROUPS.map(group => {
+  const groups = !previous ? [] : POSITION_GROUPS.map(group => {
     const legs = positions.filter(item => (item.combo ?? 'other') === group.id);
     // No legs only proves "no holdings" when every scope was read live at both captures.
     const change = legs.length ? knownSum(legs.map(item => item.change)) : readable ? 0 : null;
@@ -133,7 +140,7 @@ const decimalOrNull = (value: unknown) => isText(value, 128) && /^-?\d+(?:\.\d+)
 /** Stored JSON is re-validated on read; malformed captures are dropped rather than trusted. */
 export function positionsOf(value: unknown): PositionsCapture | null {
   if (!value || typeof value !== 'object') return null;
-  const raw = value as { capturedAt?: unknown; scopes?: unknown };
+  const raw = value as { capturedAt?: unknown; scopes?: unknown; scopeCoverage?: unknown };
   if (!isText(raw.capturedAt) || !Number.isFinite(Date.parse(raw.capturedAt)) || !Array.isArray(raw.scopes)) return null;
   const scopes: SnapshotScope[] = [];
   for (const item of raw.scopes) {
@@ -155,5 +162,5 @@ export function positionsOf(value: unknown): PositionsCapture | null {
     scopes.push({ exchange: scope.exchange as string, account: scope.account as string, accountName: scope.accountName as string, generation: scope.generation as string, scope: scope.scope as string,
       status: scope.status, fetchedAt: scope.fetchedAt as string, positions });
   }
-  return { capturedAt: raw.capturedAt, scopes };
+  return { capturedAt: raw.capturedAt, scopes, ...(raw.scopeCoverage === 'configured' ? { scopeCoverage: raw.scopeCoverage } : {}) };
 }

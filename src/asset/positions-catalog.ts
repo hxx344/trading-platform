@@ -1,5 +1,5 @@
 // Copied from project_aggregation modules/asset/lib/positions-catalog.ts at 7745181 (same as 0014655), unchanged.
-export type PositionsExchangeId = 'binance' | 'bybit' | 'okx' | 'aster' | 'variational' | 'rh-lighter';
+export type PositionsExchangeId = 'binance' | 'bybit' | 'okx' | 'aster' | 'variational' | 'rh-lighter' | 'hyperliquid';
 export type ScopeDefinition = { id: string; label: string; unsupported?: string; accountMode?: 'classic' | 'portfolio' };
 export const POSITIONS_CATALOG: { id: PositionsExchangeId; name: string; scopes: ScopeDefinition[] }[] = [
   { id: 'binance', name: 'Binance', scopes: [
@@ -20,4 +20,7 @@ export const POSITIONS_CATALOG: { id: PositionsExchangeId; name: string; scopes:
   { id: 'aster', name: 'Aster', scopes: [{ id: 'perpetual', label: '合约 · API Pro' }] },
   { id: 'variational', name: 'Variational', scopes: [{ id: 'portfolio', label: 'Omni 永续合约 · 会话只读' }] },
   { id: 'rh-lighter', name: 'Lighter RH', scopes: [{ id: 'perpetual', label: '永续合约 · 地址只读（L1 地址下全部账户）' }] },
+  { id: 'hyperliquid', name: 'Hyperliquid', scopes: [
+    { id: 'xyz', label: 'trade.xyz 永续 · 地址只读' }, { id: 'io', label: 'Entropy 永续 · 地址只读' },
+  ] },
 ];

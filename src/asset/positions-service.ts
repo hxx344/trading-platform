@@ -26,6 +26,7 @@ import { readBinancePositions, readBybitPositions, readOkxPositions, readAsterPo
 import type { BinanceScope, BybitScope } from './positions-readers.ts';
 import { readVariationalPythonPositions } from './sources/variational-python.ts';
 import { readRhLighterPositions } from './sources/rh-lighter.ts';
+import { readHyperliquidPositions } from './sources/hyperliquid.ts';
 
 export type Database = Pick<AssetDb, 'prepare'>;
 /** The open asset.sqlite at the moment of the call; null before the first import. */
@@ -43,9 +44,10 @@ type Entry = { revision: string; scope: PositionsScope; attemptedAt: number; tou
 const TTL = 5_000;
 // Variational reads start a Python process per refresh. Lighter RH shares a 60-requests-per-minute limit with other
 // modules; its reader also reuses one account read per address for 30 seconds.
-const SLOW_TTL: Partial<Record<PositionsExchangeId, number>> = { variational: 30_000, 'rh-lighter': 30_000 };
+const SLOW_TTL: Partial<Record<PositionsExchangeId, number>> = { variational: 30_000, 'rh-lighter': 30_000, hyperliquid: 30_000 };
 const STALE_AFTER = 90_000;
 const DEADLINE = 25_000;
+const SNAPSHOT_WAIT = 12_000;
 const IDLE = 15 * 60_000;
 // Cycle summaries walk fill history, so they refresh far less often than positions: on a quantity change after
 // CYCLE_MIN_AGE, otherwise after CYCLE_TTL (CYCLE_RETRY after a failure). One summary is read at a time globally.
@@ -111,7 +113,11 @@ export type PositionsService = ReturnType<typeof createPositionsService>;
 export function createPositionsService(options: PositionsServiceOptions = {}) {
   const now = options.now ?? Date.now;
   const fetcher = options.fetcher ?? fetch;
-  const read: Read = options.read ?? ((credentials, scope, signal) => defaultRead(credentials, scope, signal, fetcher));
+  async function readPositions(credentials: Credentials, scope: string, signal: AbortSignal) {
+    if (!options.read && credentials.exchange === 'hyperliquid') return readHyperliquidPositions(credentials, scope, fetcher, signal, now);
+    const positions = await (options.read ?? defaultRead)(credentials, scope, signal, fetcher);
+    return { positions, observedAt: new Date(now()).toISOString() };
+  }
   const defaultCycle: CycleRead = (credentials, scope, request, signal) => readPositionCycle(credentials, scope, request, { signal, fetcher });
   // An injected position reader has no matching fill history unless a cycle reader is injected with it.
   const cycleRead = options.cycle !== undefined ? options.cycle : options.read ? null : defaultCycle;
@@ -130,6 +136,17 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
   const limited = limiter(Math.max(1, Math.min(3, options.concurrency ?? 3))), cycleLimited = limiter(1);
   const stop = (entry: Entry) => { entry.abort?.abort(); entry.cycleAbort?.abort(); };
   const cacheKey = (key: string, scope: string) => JSON.stringify([key, scope]);
+  function inactiveScopes(account: SourceAccount, scopes: ScopeDefinition[], revision: string | null) {
+    const healthyMode = (mode: ScopeDefinition['accountMode']) => scopes.some(scope => {
+      if (!mode || scope.accountMode !== mode) return false;
+      const entry = entries.get(cacheKey(account.key, scope.id));
+      return !!revision && entry?.revision === revision && entry.scope.status === 'live';
+    });
+    // Binance account modes are exclusive; suppress an unread mode only if its counterpart is working.
+    const classic = healthyMode('classic'), portfolio = healthyMode('portfolio');
+    if (classic === portfolio) return new Set<string>();
+    return new Set(scopes.filter(scope => scope.accountMode === (classic ? 'portfolio' : 'classic')).map(scope => scope.id));
+  }
   function empty(scope: ScopeDefinition, configured: boolean): PositionsScope {
     return { id: scope.id, label: scope.label, status: !configured ? 'unconfigured' : scope.unsupported ? 'unsupported' : 'loading',
       refreshing: false, fetchedAt: null, error: configured ? scope.unsupported ?? null : null, positions: [] };
@@ -183,13 +200,16 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
         const work = async () => {
           const c = parseConnection(unseal(account.row!.encrypted, account.key));
           if (c.exchange !== account.exchange || !current(database, account, entry.revision)) throw new Error(POSITIONS_FAILED);
-          return { c, positions: await read(c, entry.scope.id, abort.signal) };
+          return { c, ...await readPositions(c, entry.scope.id, abort.signal) };
         };
-        const { c, positions } = await Promise.race([work(), new Promise<never>((_, reject) => {
+        const { c, positions, observedAt } = await Promise.race([work(), new Promise<never>((_, reject) => {
           timer = setTimeout(() => { abort.abort(); reject(new Error(POSITIONS_FAILED)); }, options.deadline ?? DEADLINE);
         })]);
         if (entries.get(key) !== entry || !current(database, account, entry.revision)) return;
-        entry.scope = { ...entry.scope, positions, status: 'live', refreshing: false, fetchedAt: new Date(now()).toISOString(), error: null };
+        const previousObservation = c.exchange === 'hyperliquid' ? entry.scope.fetchedAt : null;
+        if (previousObservation && observedAt < previousObservation) throw new Error(POSITIONS_FAILED);
+        entry.scope = { ...entry.scope, positions: observedAt === previousObservation ? entry.scope.positions : positions,
+          status: 'live', refreshing: false, fetchedAt: observedAt, error: null };
         if (cyclesFor(account.exchange, entry.scope.id)) scheduleCycles(database, account, entry, key, c, startedAt);
       } catch {
         let still = false;
@@ -204,53 +224,57 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
       if (entries.get(key) === entry) entry.scope = { ...entry.scope, status: 'error', refreshing: false, error: POSITIONS_FAILED };
     }).finally(() => { entry.pending = undefined; });
   }
+  async function read(database: DatabaseSource, unseal: Unseal, pending?: Set<Promise<void>>): Promise<HubPositions> {
+    const accounts = sourceAccounts(database());
+    const keep = new Set<string>();
+    const exchanges = POSITIONS_CATALOG.map(exchange => ({ id: exchange.id, name: exchange.name,
+      accounts: accounts.filter(account => account.exchange === exchange.id).map(account => {
+        const revision = account.row ? revisionOf(account.row.encrypted) : null;
+        const inactive = inactiveScopes(account, exchange.scopes, revision);
+        return { id: account.id, name: account.name, configured: !!account.row, revision, scopes: exchange.scopes.flatMap(scope => {
+          const key = cacheKey(account.key, scope.id); keep.add(key);
+          let entry = entries.get(key);
+          if (entry && entry.revision !== revision) { stop(entry); entries.delete(key); entry = undefined; }
+          if (!revision || scope.unsupported) return [empty(scope, !!revision)];
+          if (inactive.has(scope.id)) return [];
+          if (!entry) {
+            entry = { revision, scope: empty(scope, true), attemptedAt: -Infinity, touchedAt: now() }; entries.set(key, entry);
+          }
+          entry.touchedAt = now();
+          if (!entry.pending && now() - entry.attemptedAt >= ttlFor(account.exchange)) refresh(database, account, entry, key, unseal);
+          if (entry.pending) pending?.add(entry.pending);
+          const cycles = cyclesFor(account.exchange, scope.id), owned = entry;
+          const result = { ...entry.scope, positions: entry.scope.positions.map(item => cycles ? { ...item, cycle: cycleView(owned, item) } : { ...item }) };
+          if (result.status === 'live' && result.fetchedAt && now() - Date.parse(result.fetchedAt) >= STALE_AFTER) result.status = 'stale';
+          return [result];
+        }) };
+      }),
+    }));
+    for (const [key, entry] of entries) {
+      if (!keep.has(key) || now() - entry.touchedAt > IDLE) { stop(entry); entries.delete(key); }
+    }
+    // The workbench awaits its asynchronous database here and re-checks the connections. With this synchronous database
+    // the re-check below only covers writes already queued as microtasks; a replaced key is kept out by the revision in
+    // every cache key and by the current() checks before and after each refresh, not by this yield.
+    await Promise.resolve();
+    const latest = connectionRows(database());
+    for (const account of accounts) {
+      const row = latest.find(item => item.exchange === account.key);
+      if ((row?.encrypted ?? null) !== (account.row?.encrypted ?? null)) throw new Error(POSITIONS_FAILED);
+    }
+    return boundPositionEvidence({ schemaVersion: 1, generatedAt: new Date(now()).toISOString(), exchanges });
+  }
   return {
-    async read(database: DatabaseSource, unseal: Unseal): Promise<HubPositions> {
-      const accounts = sourceAccounts(database());
-      const keep = new Set<string>();
-      const exchanges = POSITIONS_CATALOG.map(exchange => ({ id: exchange.id, name: exchange.name,
-        accounts: accounts.filter(account => account.exchange === exchange.id).map(account => {
-          const revision = account.row ? revisionOf(account.row.encrypted) : null;
-          const healthy = (scope: ScopeDefinition) => {
-            const entry = entries.get(cacheKey(account.key, scope.id));
-            return !!revision && entry?.revision === revision && entry.scope.status === 'live';
-          };
-          // Account modes are exclusive (Binance restricts fapi/dapi user data once Portfolio Margin is on), so a
-          // mode is hidden and not polled only while the other mode reads successfully and this one never does.
-          const inactive = new Set(exchange.scopes.filter(scope => scope.accountMode
-            && !exchange.scopes.some(item => item.accountMode === scope.accountMode && healthy(item))
-            && exchange.scopes.some(item => item.accountMode && item.accountMode !== scope.accountMode && healthy(item))).map(scope => scope.id));
-          return { id: account.id, name: account.name, configured: !!account.row, revision, scopes: exchange.scopes.flatMap(scope => {
-            const key = cacheKey(account.key, scope.id); keep.add(key);
-            let entry = entries.get(key);
-            if (entry && entry.revision !== revision) { stop(entry); entries.delete(key); entry = undefined; }
-            if (!revision || scope.unsupported) return [empty(scope, !!revision)];
-            if (inactive.has(scope.id)) return [];
-            if (!entry) {
-              entry = { revision, scope: empty(scope, true), attemptedAt: -Infinity, touchedAt: now() }; entries.set(key, entry);
-            }
-            entry.touchedAt = now();
-            if (!entry.pending && now() - entry.attemptedAt >= ttlFor(account.exchange)) refresh(database, account, entry, key, unseal);
-            const cycles = cyclesFor(account.exchange, scope.id), owned = entry;
-            const result = { ...entry.scope, positions: entry.scope.positions.map(item => cycles ? { ...item, cycle: cycleView(owned, item) } : { ...item }) };
-            if (result.status === 'live' && result.fetchedAt && now() - Date.parse(result.fetchedAt) >= STALE_AFTER) result.status = 'stale';
-            return [result];
-          }) };
-        }),
-      }));
-      for (const [key, entry] of entries) {
-        if (!keep.has(key) || now() - entry.touchedAt > IDLE) { stop(entry); entries.delete(key); }
-      }
-      // The workbench awaits its asynchronous database here and re-checks the connections. With this synchronous database
-      // the re-check below only covers writes already queued as microtasks; a replaced key is kept out by the revision in
-      // every cache key and by the current() checks before and after each refresh, not by this yield.
-      await Promise.resolve();
-      const latest = connectionRows(database());
-      for (const account of accounts) {
-        const row = latest.find(item => item.exchange === account.key);
-        if ((row?.encrypted ?? null) !== (account.row?.encrypted ?? null)) throw new Error(POSITIONS_FAILED);
-      }
-      return boundPositionEvidence({ schemaVersion: 1, generatedAt: new Date(now()).toISOString(), exchanges });
+    read,
+    /** Share the live reads, but cap how long the ledger waits and leave cycle reads in the background. */
+    async refreshForSnapshot(database: DatabaseSource, unseal: Unseal): Promise<void> {
+      const pending = new Set<Promise<void>>();
+      await read(database, unseal, pending);
+      if (!pending.size) return;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([Promise.all(pending), new Promise<void>(resolve => { timer = setTimeout(resolve, SNAPSHOT_WAIT); })]);
+      } finally { clearTimeout(timer); }
     },
     /** Cached scopes for daily snapshots; never starts a read and does not keep idle entries alive. */
     peek(database: Database | null): SnapshotScope[] {
@@ -258,10 +282,16 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
       for (const account of sourceAccounts(database)) {
         if (!account.row) continue;
         const revision = revisionOf(account.row.encrypted), catalog = POSITIONS_CATALOG.find(item => item.id === account.exchange)!;
-        const generation = revisionOf('daily-snapshot:' + revision).slice(0, 16);
+        const generation = revisionOf('daily-snapshot:' + revision).slice(0, 16), inactive = inactiveScopes(account, catalog.scopes, revision);
         for (const definition of catalog.scopes) {
-          const entry = entries.get(cacheKey(account.key, definition.id)), fetchedAt = entry?.scope.fetchedAt;
-          if (definition.unsupported || !entry || entry.revision !== revision || !fetchedAt) continue;
+          if (definition.unsupported || inactive.has(definition.id)) continue;
+          const cached = entries.get(cacheKey(account.key, definition.id)), entry = cached?.revision === revision ? cached : undefined;
+          const fetchedAt = entry?.scope.fetchedAt;
+          if (!entry || !fetchedAt) {
+            // Keep evidence of unread configured scopes so a successful read elsewhere can't turn missing data into zero.
+            scopes.push({ exchange: account.exchange, account: account.id, accountName: account.name, generation, scope: definition.id, fetchedAt: '', status: 'stale', positions: [] });
+            continue;
+          }
           const cycles = cyclesFor(account.exchange, definition.id);
           scopes.push({ exchange: account.exchange, account: account.id, accountName: account.name, generation, scope: definition.id, fetchedAt,
             status: entry.scope.status === 'live' && now() - Date.parse(fetchedAt) < STALE_AFTER ? 'live' : 'stale',

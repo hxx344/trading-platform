@@ -6,17 +6,19 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { chmodSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { createExecutorServer } from '../src/http.ts';
 import { ASSET_DB_FILE, openAssetDb, type AssetDb } from '../src/asset/db.ts';
+import { CREDENTIAL_KEY_FILE } from '../src/asset/credentials.ts';
 import { importLedger } from '../src/asset/import.ts';
 import { createAssetStore, type AssetStore, type AssetStoreOptions } from '../src/asset/store.ts';
 import type { AssetSources } from '../src/asset/sync.ts';
 import type { FxStatus } from '../src/asset/types.ts';
 import { position } from '../src/asset/positions-values.ts';
+import type { PositionsCapture } from '../src/asset/daily-positions.ts';
 import type { HubPositions, Position, PositionCycle } from '../src/asset/positions-types.ts';
 import type { HubFills, ReadFill } from '../src/asset/fills-types.ts';
 import { bindAccounts, createHarness } from './harness.ts';
@@ -39,12 +41,14 @@ const sources: Partial<AssetSources> = {
   async syncBinance() { return { total: 10, details: [] }; },
 };
 
-function world(t: TestContext, options: Omit<AssetStoreOptions, 'now' | 'sources'> = {}, { importIt = true } = {}) {
+function world(t: TestContext, options: Omit<AssetStoreOptions, 'now'> = {}, { importIt = true } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'tp-asset-positions-'));
   const from = join(root, 'ledger.sqlite'), dataDir = join(root, 'data'), file = join(dataDir, ASSET_DB_FILE);
   writeWorkbenchLedger(from, { now: NOW });
   if (importIt) {
     importLedger({ from, owner: OWNER, dataDir, now: () => NOW });
+    // The ledger opens an existing key here. Creating a durable key is covered separately and needs directory fsync.
+    writeFileSync(join(dataDir, CREDENTIAL_KEY_FILE), '1'.repeat(64) + '\n', { mode: 0o600, flag: 'wx' });
     // The fixture's Aster account has an id the workbench never writes (asset-sync.test.ts empties it the same way).
     const database = openAssetDb(file, { mode: 'service' });
     try { database.prepare("UPDATE settings SET value = '[]' WHERE key = 'aster-accounts'").run(); } finally { database.close(); }
@@ -91,7 +95,8 @@ test('持仓：用资产已保存的连接只读读取，默认读取经过 stor
   }, cycle: async (_c, scope, request) => { cycles.push(scope + ':' + request.position.symbol); return cycle; } } });
   await w.store.connect({ exchange: 'binance', apiKey: KEY, apiSecret: SECRET });
   const before = w.latestDaily();
-  assert.deepEqual(before.positions, { capturedAt: new Date(NOW).toISOString(), scopes: [] }, '缓存为空时快照带空的 positions，与工作台一致');
+  const cold = (before.positions as PositionsCapture).scopes;
+  assert.ok(cold.length && cold.every(item => item.status === 'stale' && !item.positions.length), '冷缓存保留未读到的范围');
   const loading = scopeOf(await w.store.positions());
   assert.equal(loading.status, 'loading');
   await idle(w.store);
@@ -108,6 +113,43 @@ test('持仓：用资产已保存的连接只读读取，默认读取经过 stor
   assert.equal(um.status, 'live');
   assert.deepEqual(um.positions.map(item => [item.symbol, item.cycle?.net]), [['BTCUSDT', '2.45']]);
   assert.equal(JSON.stringify(snapshot).includes(SECRET) || JSON.stringify(snapshot).includes(KEY), false);
+});
+
+test('仅刷新资产即可积累套利仓位快照，缺失的一侧保留部分金额', async t => {
+  let latest = false, failed = false;
+  let sourceAt = NOW;
+  const holding = (symbol: string, unrealizedPnl: string): Position => ({ ...position(symbol, 'long', '1', '标的'), unrealizedPnl, pnlCurrency: 'USDC' });
+  const w = world(t, {
+    sources: { ...sources,
+      async quotes() { return { VIRTUAL: { price: 1, at: new Date(sourceAt).toISOString(), source: '替身' } }; },
+      async syncBinance() { return { total: 10, details: [{ coin: 'USDC', account: 'USDⓈ-M', quantity: 10, price: 1, value: 10 }] }; },
+      async syncHyperliquid() { return { total: 20, details: [], updatedAt: new Date(sourceAt).toISOString() }; },
+    },
+    positions: { read: async (credentials, scope) => {
+      if (credentials.exchange === 'binance') return scope === 'um'
+        ? [holding('CLUSDT', latest ? '9' : '4'), holding('ANTHROPICUSDT', latest ? '3' : '0')] : [];
+      assert.equal(credentials.exchange, 'hyperliquid');
+      if (failed) throw new Error('读仓失败');
+      return scope === 'xyz' ? [holding('xyz:SKHY', latest ? '2' : '4'), holding('xyz:SKHX', '5'), holding('xyz:ANT', latest ? '1' : '3')]
+        : [holding('io:ANTH', latest ? '7' : '2')];
+    } },
+  });
+  await w.store.connect({ exchange: 'binance', apiKey: KEY, apiSecret: SECRET });
+  await w.store.connect({ exchange: 'hyperliquid', walletAddress: '0x00000000000000000000000000000000000000ab' });
+  await w.store.sync({});
+  w.clock.at += 86_400_000; sourceAt = w.clock.at; latest = true;
+  await w.store.sync({});
+  const day = (await w.store.dailyChanges()).days[0];
+  assert.deepEqual(day.positions?.groups.map(({ id, change, legs }) => [id, change, legs]), [
+    ['oil', 5, 1], ['hynix', -2, 2], ['anthropic', 6, 3], ['other', 0, 0],
+  ]);
+  assert.equal(day.change, 0, '持仓贡献与资产余额口径分开');
+  w.clock.at += 86_400_000; sourceAt = w.clock.at; failed = true;
+  await w.store.sync({});
+  const incomplete = (await w.store.dailyChanges()).days[0];
+  assert.deepEqual(incomplete.positions?.groups.map(({ id, change, complete }) => [id, change, complete]), [
+    ['oil', 0, false], ['hynix', null, false], ['anthropic', 0, false], ['other', null, false],
+  ]);
 });
 
 test('成交：读取写入 fill_cache；换密钥后旧成交作废，断开连接清掉该连接的缓存；海力士与原油各自一行', async t => {

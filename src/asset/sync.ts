@@ -238,7 +238,7 @@ const DATED: Record<DatedSource, { missing: string; status: string; prefix: stri
 };
 
 /** The workbench's refresh(): false when it was skipped (an attempt less than 30 s ago). */
-export async function refresh(ctx: SyncContext): Promise<boolean> {
+export async function refresh(ctx: SyncContext, refreshPositions?: () => Promise<void>): Promise<boolean> {
   const { database, lease, sources, vault } = ctx;
   const ledger = ledgerReader(database, ctx.now());
   const last = database.prepare("SELECT value FROM settings WHERE key = 'last-attempt'").get<{ value: string }>();
@@ -324,6 +324,10 @@ export async function refresh(ctx: SyncContext): Promise<boolean> {
   () => dated('variational', c => sources.syncVariational(c)),
   () => dated('hyperliquid', c => sources.syncHyperliquid(c, {})),
   () => dated('rh-lighter', c => sources.syncRhLighter(c)),
+  async () => {
+    // A failed position read must not keep successful balance updates from being snapshotted.
+    try { await refreshPositions?.(); } catch { /* peek records whatever is still available */ }
+  },
   async () => {
     const [fxResult] = await Promise.allSettled([sources.yuanQuote(ctx.now())]);
     if (fxResult.status === 'fulfilled') lease.write(() => { saveSetting(database, 'fx', String(fxResult.value.rate)); saveSetting(database, 'fx-status', fxResult.value.status); });

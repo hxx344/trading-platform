@@ -1,7 +1,7 @@
 // Copied from project_aggregation modules/asset/tests/hyperliquid.test.ts at 0014655; imports point at src/asset/sources, expectations unchanged; the connection-schema test (A-3 connection management) is left out.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { syncHyperliquid, HYPERLIQUID_ERRORS, NOTE_COIN } from '../src/asset/sources/hyperliquid.ts';
+import { readHyperliquidPositions, syncHyperliquid, HYPERLIQUID_ERRORS, NOTE_COIN } from '../src/asset/sources/hyperliquid.ts';
 // The DOM lib is not loaded (tsconfig "types": ["node"]); these are the fetch argument types the copied fixtures use.
 type RequestInfo = string | Request;
 
@@ -67,6 +67,35 @@ const types = (calls: Body[]) => calls.map(call => call.type + (call.dex !== und
 const close = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} != ${expected}`);
 const notes = (details: { coin: string; account: string }[]) => details.filter(row => row.coin === NOTE_COIN).map(row => row.account);
 const sync = (overrides: Overrides = {}, quote?: Quote) => syncHyperliquid({ walletAddress: ADDRESS }, fixture(overrides, quote).fetcher);
+
+test('HIP-3 positions keep the exact contract, direction and collateral; a mismatched scope is rejected', async () => {
+  const leg = (coin: string, szi: string) => ({ type: 'oneWay', position: { coin, szi, entryPx: '19', positionValue: '26.25', unrealizedPnl: '-2.5' } });
+  const { fetcher, calls } = fixture({
+    clearinghouseState: body => ({ time: Date.now(), assetPositions: body.dex === 'xyz' ? [leg('xyz:ANT', '-1.25'), leg('xyz:CL', '0')] : [leg('io:ANTH', '1')] }),
+    meta: body => ({ collateralToken: body.dex === 'xyz' ? 150 : 0 }),
+  });
+  const read = (dex: string) => readHyperliquidPositions({ walletAddress: ADDRESS }, dex, fetcher, new AbortController().signal);
+  assert.deepEqual((await read('xyz')).positions.map(item => [item.symbol, item.side, item.quantity, item.unrealizedPnl, item.pnlCurrency]), [['xyz:ANT', 'short', '1.25', '-2.5', 'HYPE']]);
+  assert.deepEqual((await read('io')).positions.map(item => [item.symbol, item.side, item.pnlCurrency]), [['io:ANTH', 'long', 'USDC']]);
+  await assert.rejects(read('other'), /格式不符/);
+  const wrong = fixture({ clearinghouseState: () => ({ time: Date.now(), assetPositions: [leg('io:ANTH', '1')] }) });
+  await assert.rejects(readHyperliquidPositions({ walletAddress: ADDRESS }, 'xyz', wrong.fetcher, new AbortController().signal), /格式不符/);
+  assert.deepEqual(types(calls), ['clearinghouseState:xyz', 'perpDexs', 'meta:xyz', 'spotMetaAndAssetCtxs', 'clearinghouseState:io', 'meta:io']);
+});
+
+test('HIP-3 uses the venue observation time even for empty scopes, and rejects stale empty responses', async () => {
+  let now = Date.parse('2026-11-07T16:00:10Z');
+  const sourceAt = now - 20_000;
+  const { fetcher, calls } = fixture({ clearinghouseState: () => ({ time: sourceAt, assetPositions: [] }) });
+  const read = () => readHyperliquidPositions({ walletAddress: ADDRESS }, 'xyz', fetcher, new AbortController().signal, () => now);
+  const first = await read();
+  now += 30_000;
+  assert.deepEqual(first, { positions: [], observedAt: new Date(sourceAt).toISOString() });
+  assert.deepEqual(await read(), first);
+  now += 40_000;
+  await assert.rejects(read(), /时间已过期/);
+  assert.deepEqual(types(calls), ['clearinghouseState:xyz', 'clearinghouseState:xyz', 'clearinghouseState:xyz']);
+});
 
 test('default mode totals the official account value once and lists perps, spot, vaults and staking as detail rows', async t => {
   const now = Date.parse('2026-11-07T08:00:00.500Z');

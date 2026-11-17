@@ -256,7 +256,7 @@ const leg = (symbol: string, side: 'long' | 'short', quantity: string, upnl: str
   id: symbol + ':' + side, symbol, instrumentId: symbol, side, quantity, quantityUnit: symbol.replace('USDT', ''), unrealizedPnl: upnl, pnlCurrency: 'USDT',
   cycle: cycle && { status: 'complete' as const, since: cycle.since, realizedPnl: null, fees: null, funding: null, net: cycle.net, currency: 'USDT', updatedAt: cycle.updatedAt ?? null as string | null },
 });
-const capture = (at: string, positions: ReturnType<typeof leg>[], status: 'live' | 'stale' = 'live') => ({ capturedAt: at, scopes: [
+const capture = (at: string, positions: ReturnType<typeof leg>[], status: 'live' | 'stale' = 'live'): PositionsCapture => ({ capturedAt: at, scopeCoverage: 'configured', scopes: [
   { exchange: 'binance', account: 'default', accountName: '默认账号', generation: 'g1', scope: 'pm-um', status, fetchedAt: at,
     positions: positions.map(item => item.cycle ? { ...item, cycle: { ...item.cycle, updatedAt: item.cycle.updatedAt ?? at } } : item) },
 ] });
@@ -407,12 +407,42 @@ test('a stalled cycle summary is not mixed with fresh unrealized PnL', () => {
 
 test('ANT uses the Anthropic contract name, never the unrelated ANT token or a loose prefix', () => {
   for (const symbol of ['ANTHROPICUSDT', 'ANTHROPIC-USDT-SWAP', 'ANTHROPIC']) {
-    assert.equal(comboOf({ symbol, instrumentId: symbol }), 'anthropic', symbol);
-    assert.equal(comboOf({ symbol: 'display-name', instrumentId: symbol }), 'anthropic', 'native instrument identity');
+    assert.equal(comboOf({ symbol, instrumentId: symbol }, 'binance'), 'anthropic', symbol);
+    assert.equal(comboOf({ symbol: 'display-name', instrumentId: symbol }, 'rh-lighter'), 'anthropic', 'native instrument identity');
   }
   for (const symbol of ['ANT', 'ANTUSDT', 'ANT-USDT-SWAP', 'ANTHROPICXUSDT', 'XANTHROPICUSDT', 'xyz:ANT', 'io:ANTH']) {
-    assert.equal(comboOf({ symbol, instrumentId: symbol }), null, symbol);
+    assert.equal(comboOf({ symbol, instrumentId: symbol }, 'binance'), null, symbol);
   }
+  assert.equal(comboOf({ symbol: 'ANT', instrumentId: 'xyz:ANT' }, 'hyperliquid'), 'anthropic');
+  assert.equal(comboOf({ symbol: 'other:ANT', instrumentId: 'ANT' }, 'hyperliquid'), null);
+  assert.equal(comboOf({ symbol: 'BRENTOIL', instrumentId: '123' }, 'rh-lighter'), 'oil');
+});
+
+test('reused observations across two days cannot establish a zero change', () => {
+  const previous = capture('2026-10-21T15:59:50.000Z', [leg('CLUSDT', 'long', '1', '12', null)]);
+  const current = { ...previous, capturedAt: '2026-10-21T16:00:10.000Z' };
+  const comparison = legs(previous, current);
+  assert.equal(comparison.readable, false);
+  assert.equal(comparison.positions[0].change, null);
+});
+
+test('a position with a changed settlement currency has no comparable change', () => {
+  const position = leg('CLUSDT', 'long', '1', '12', null);
+  const previous = capture('2026-10-21T15:00:00.000Z', [position]);
+  const current = capture('2026-10-22T15:00:00.000Z', [{ ...position, pnlCurrency: 'USDC' }]);
+  assert.equal(legs(previous, current).positions[0].change, null);
+});
+
+test('legacy captures keep observed legs but do not prove that an unrecorded group was empty', () => {
+  const before = capture('2026-10-21T15:00:00.000Z', [leg('CLUSDT', 'long', '1', '10', null)]);
+  const after = capture('2026-10-22T15:00:00.000Z', [leg('CLUSDT', 'long', '1', '12', null)]);
+  const legacy = (snapshot: PositionsCapture) => ({ capturedAt: snapshot.capturedAt, scopes: snapshot.scopes });
+  const [day] = calculateDailyChanges({ ...base, snapshots: [
+    snap('2026-10-21', [binance(1000)], { positions: legacy(before) }), snap('2026-10-22', [binance(1010)], { positions: legacy(after) }),
+  ] }).days;
+  assert.ok(Math.abs(group(day.positions!, 'oil').change! - 1.998) < 1e-9);
+  assert.equal(group(day.positions!, 'anthropic').change, null);
+  assert.equal(group(day.positions!, 'anthropic').complete, false);
 });
 
 test('stored ANT holdings move out of other and use each settlement currency price without changing daily asset totals', async () => {

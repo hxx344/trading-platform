@@ -1,4 +1,4 @@
-// 持仓页（#/positions，A-5）：资产账本已保存连接的全部交易所账户持仓，只读。排版、文案与状态规则照工作台
+// 持仓页（#/positions，A-5）：资产账本已接入交易所账户的可读持仓。排版、文案与状态规则照工作台
 // src/TradingPositions.tsx（提交 7745181），样式见 positions.css。与工作台的差异：
 // - 工作台汇总多个 Asset 项目（来源），本服务只有自己的资产账本：来源卡片只有一张，指向资产页；来源筛选去掉；
 // - 读取用 use-live-resource.ts（每 5 秒，页面隐藏时暂停、失败保留上次结果并标为旧值、401 提示重新登录），
@@ -76,7 +76,7 @@ export function AssetPositions({ onExpired }: { onExpired: () => void }) {
   const invalidFilter = !!filters.exchange && !exchangeOptions.some(([id]) => id === filters.exchange) || !!filters.account && !accountOptions.some(account => account.id === filters.account);
   const issues = exchanges.some(exchange => exchange.accounts.some(account => account.scopes.some(scope => scope.status !== 'live' || oldTime(scope.fetchedAt, now))));
   return <div className="positions-page">
-    <div className="trading-toolbar"><p className="positions-readonly"><ShieldCheck size={15} /><span>资产账本中全部交易所账户的持仓 · 只读查看，账户在资产页管理</span></p><button type="button" className="button secondary" onClick={() => void live.refresh()} disabled={reading || offline}>{reading ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}刷新仓位</button></div>
+    <div className="trading-toolbar"><p className="positions-readonly"><ShieldCheck size={15} /><span>资产账本已接入的持仓 · 只读查看，账户在资产页管理</span></p><button type="button" className="button secondary" onClick={() => void live.refresh()} disabled={reading || offline}>{reading ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}刷新仓位</button></div>
     {offline ? <Callout tone="warning" role="status">网络已断开，当前显示最后读取的旧值；连接恢复后自动更新。</Callout> : null}
     {error ? <Callout tone="warning">{error}{data ? ' 当前保留上次数据，已标记为旧值。' : ''}</Callout> : null}
     {data && reading ? <Callout tone="info">已显示上次读取的仓位，正在后台更新。</Callout> : null}

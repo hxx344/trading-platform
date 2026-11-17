@@ -184,7 +184,7 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
   const vault = dataDirVault(dirname(file));
   const positionsService = createPositionsService({ now, fetcher, ...positionsOptions });
   const fillsService = createFillsService({ now, fetcher, ...fillsOptions });
-  // The daily snapshot carries the cached positions; peek never starts a read (workbench daily-positions.ts).
+  // Other ledger writes only peek. An asset sync refreshes the same cache alongside balance reads.
   const context = (database: AssetDb, lease: SyncLease): SyncContext => ({ database, lease, vault, sources, now, positions: positionsService.peek });
   const peek = positionsService.peek;
   // Why the open handle is read-only: the files are not the service's to write, or another writer held the file too long.
@@ -310,7 +310,9 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
       return ledger();
     },
     async sync() {
-      await locked(async (database, lease) => { await sync.refresh(context(database, lease)); });
+      await locked(async (database, lease) => {
+        await sync.refresh(context(database, lease), () => positionsService.refreshForSnapshot(() => handle, vault.unseal));
+      });
       return ledger();
     },
     async connect(body) {

@@ -4,8 +4,7 @@
 // - src/hub-positions.ts（工作台宿主）的 matchBase、positionItems（MAX_POSITION_ITEMS 50、90 秒算旧值）；
 // - modules/monitor/lib/related-pairs.ts 的 RELATED_SYMBOLS（含 anthropic）、pairTotals、relatedSpreadPairs。
 // 与工作台的差异：只有本服务一个来源（工作台汇总多个 Asset 项目），来源固定为「资产账本」；数据来自本服务自己的
-// 接口，不再逐字段校验格式；Anthropic 的 ANT 组合合计（related-position-totals.ts）不做：资产账本不读 Hyperliquid 持仓，
-// xyz:ANT、io:ANTH 两组成立不了；Binance ↔ Lighter RH 两腿都读得到，但组合合计（跨所按股数换算）本次不做，登记在 asset.md。
+// 接口，不再逐字段校验格式；Anthropic 按交易所列出每条腿，跨所按股数换算的组合盈亏见 asset.md 的范围记录。
 import type { FillMarket } from '../../src/asset/fills-types.ts';
 import type { HubPositions, PositionCycle } from '../../src/asset/positions-types.ts';
 import { oilSpread } from '../../src/vendor/oil-market.mjs';

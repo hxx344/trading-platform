@@ -1,7 +1,7 @@
 // 来源：project-aggregation 工作台 server/trading-ondo-client.mjs（提交 7745181）。改动：import 路径；新增 depth()（公开 REST 盘口）与 markets() 的 makerFee，奖励分析用（docs/ondo.md §5）。
 import { ondoAuthHeaders } from './transport.mjs';
 import { readJsonResponse } from '../response.mjs';
-import { decimal } from './decimal.mjs';
+import { compareDecimals, decimal } from './decimal.mjs';
 
 const BASE = 'https://api.ondoperps.xyz';
 const MAX_BYTES = 4 * 1024 * 1024;
@@ -29,14 +29,16 @@ const invalid = () => new OndoError('invalid_data');
 const fee = value => { try { return decimal(value); } catch { return null; } };
 const amount = (value, options) => { try { return decimal(value, options); } catch { throw invalid(); } };
 
-function orderOf(value) {
+function orderOf(value, expected = {}) {
   if (!object(value) || typeof value.orderId !== 'string' || !ID.test(value.orderId) || !['buy', 'sell'].includes(value.side)
-    || typeof value.market !== 'string' || typeof value.status !== 'string') throw invalid();
+    || typeof value.market !== 'string' || !['open', 'fullyfilled', 'canceled', 'pending', 'untriggered'].includes(value.status)) throw invalid();
   const clientId = value.clientOrderId === undefined || value.clientOrderId === '' ? null : value.clientOrderId;
   if (clientId !== null && (typeof clientId !== 'string' || clientId.length > 64)) throw invalid();
-  return { id: value.orderId, clientId, market: value.market, side: value.side, price: amount(value.price, { positive: true }),
-    size: amount(value.size, { positive: true }), filled: amount(value.filledSize ?? '0', { nonnegative: true }),
+  const order = { id: value.orderId, clientId, market: value.market, side: value.side, price: amount(value.price, { positive: true }),
+    size: amount(value.size, { positive: true }), filled: amount(value.filledSize, { nonnegative: true }),
     status: value.status, reduceOnly: value.reduceOnly === true };
+  if (compareDecimals(order.filled, order.size) > 0 || Object.entries(expected).some(([key, field]) => order[key] !== field)) throw invalid();
+  return order;
 }
 
 // Every request: one attempt bounded by timeoutMs. Nothing is retried except a
@@ -88,7 +90,7 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
     if (now() < until) throw new OndoError('rate_limited', { retryAt: until });
   };
 
-  async function request(method, path, { body, auth = true, urgent = false, write = false, cancel = false } = {}, resigned = false) {
+  async function request(method, path, { body, auth = true, urgent = false, write = false, cancel = false, canSend } = {}, resigned = false) {
     refuse(cancel);
     await slot(urgent);
     refuse(cancel);
@@ -98,6 +100,8 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
       if (!credentials) throw new OndoError('no_credentials');
       Object.assign(headers, ondoAuthHeaders(credentials, { timestamp: String(Math.trunc(now() + offset)), method, requestPath: path, body: text }));
     }
+    // No await between checking the latest session/book and invoking fetch. A veto never reached the venue.
+    if (canSend && canSend() !== true) throw new OndoError('send_guard');
     const sentAt = now();
     const controller = new AbortController(); controllers.add(controller);
     const deadline = setTimeoutImpl(() => controller.abort(), timeoutMs);
@@ -118,7 +122,7 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
     if (status >= 200 && status < 300 && (!object(payload) || !code)) throw new OndoError('invalid_data', { status, uncertain: write });
     if (code && code.includes('timestamp') && auth && !resigned) {
       const date = Date.parse(response.headers?.get?.('date') ?? '');
-      if (Number.isFinite(date)) { offset = date - now(); return request(method, path, { body, auth, urgent, write, cancel }, true); }
+      if (Number.isFinite(date)) { offset = date - now(); return request(method, path, { body, auth, urgent, write, cancel, canSend }, true); }
     }
     throw new OndoError(code ?? `http_${status}`, { status });
   }
@@ -146,23 +150,32 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
       if (!object(result) || result.market !== name) throw invalid();
       return result;
     },
-    /** A post-only GTC limit order. Rejections carry the venue's code (post_only_has_match, ...). */
-    async place({ market: name, side, price, size, reduceOnly = false, clientOrderId }) {
+    /** Quotes and maker closes are post-only. An IOC is always a reduce-only limit order. */
+    async place({ market: name, side, price, size, reduceOnly = false, clientOrderId, timeInForce = 'GTC', canSend }) {
       if (!['buy', 'sell'].includes(side)) throw new TypeError('Invalid Ondo order side');
+      if (typeof reduceOnly !== 'boolean' || !['GTC', 'IOC'].includes(timeInForce) || (timeInForce === 'IOC' && !reduceOnly)) throw new TypeError('Invalid Ondo order instructions');
       const body = { market: market(name), side, price: decimal(price, { positive: true }), size: decimal(size, { positive: true }), type: 'limit',
-        timeInForce: 'GTC', postOnly: true, reduceOnly: reduceOnly === true, clientOrderId: id(clientOrderId) };
-      const payload = await request('POST', '/v1/perps/orders', { body, write: true, urgent: reduceOnly === true });
-      // An accepted placement whose description cannot be read may be resting.
-      try { return orderOf(payload.result); } catch { throw new OndoError('invalid_data', { status: 200, uncertain: true }); }
+        timeInForce, postOnly: timeInForce === 'GTC', reduceOnly, clientOrderId: id(clientOrderId) };
+      const payload = await request('POST', '/v1/perps/orders', { body, write: true, urgent: reduceOnly, canSend });
+      try {
+        if (payload.result?.timeInForce !== undefined && payload.result.timeInForce !== timeInForce) throw invalid();
+        const order = orderOf(payload.result, { clientId: clientOrderId, market: name, side, price: body.price, size: body.size, reduceOnly });
+        if (order.status === 'untriggered') throw invalid();
+        return order;
+      } catch { throw new OndoError('invalid_data', { status: 200, uncertain: true }); }
     },
-    /** Cancels one order and returns it as cancelled, or null when the answer does not describe it. order_not_found, order_already_canceled and order_already_fully_filled are rejections. */
-    async cancel(orderId) {
+    /** A mismatched or nonterminal cancel reply leaves the outcome unknown. */
+    async cancel(orderId, expected = {}) {
       const payload = await request('DELETE', `/v1/perps/orders/${id(orderId)}`, { write: true, urgent: true, cancel: true });
-      try { return orderOf(payload.result); } catch { return null; }
+      try {
+        const order = orderOf(payload.result, { ...expected, id: orderId });
+        if (!['canceled', 'fullyfilled'].includes(order.status)) throw invalid();
+        return order;
+      } catch { throw new OndoError('invalid_data', { status: 200, uncertain: true }); }
     },
     /** The order with this client id, or null when the venue has none. */
-    async orderByClientId(clientOrderId) {
-      try { return orderOf((await request('GET', `/v1/perps/orders/client:${id(clientOrderId)}`, { urgent: true })).result); }
+    async orderByClientId(clientOrderId, expected = {}) {
+      try { return orderOf((await request('GET', `/v1/perps/orders/client:${id(clientOrderId)}`, { urgent: true })).result, { ...expected, clientId: clientOrderId }); }
       catch (error) { if (error instanceof OndoError && (error.code === 'order_not_found' || error.status === 404)) return null; throw error; }
     },
     /** Every open order of the account. Fails with incomplete_data rather than return a partial list. */
@@ -174,22 +187,29 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
         if (!Array.isArray(payload.result)) throw invalid();
         for (const item of payload.result) orders.push(orderOf(item));
         const next = payload.pageInfo?.nextCursor;
-        if (next === undefined || next === null || next === '' || payload.result.length === 0) return orders;
+        if (payload.result.length >= PAGE && !object(payload.pageInfo)) throw new OndoError('incomplete_data');
+        if (next === undefined || next === null || next === '') return orders;
+        if (!payload.result.length || next === cursor) throw new OndoError('incomplete_data');
         if (typeof next !== 'string' || next.length > 256) throw invalid();
         cursor = next;
       }
       throw new OndoError('incomplete_data');
     },
-    /** Signed position size per market: Map market -> decimal string (long > 0). */
-    async positions() {
+    /** Keep the signed-size Map for callers. The exit engine also requests the venue's average entry. */
+    async positions({ details = false } = {}) {
       const rows = (await request('GET', '/v1/perps/positions', { urgent: true })).result;
       if (!Array.isArray(rows)) throw invalid();
       const positions = new Map();
       for (const row of rows) {
-        if (!object(row) || typeof row.market !== 'string' || !['long', 'short'].includes(row.direction)) throw invalid();
+        if (!object(row) || typeof row.market !== 'string' || !['long', 'short', 'neutral'].includes(row.direction)) throw invalid();
         const size = amount(String(row.netQuantity ?? '').replace(/^-/, ''), { nonnegative: true });
-        if (positions.has(row.market)) throw invalid();
-        positions.set(row.market, row.direction === 'short' && size !== '0' ? `-${size}` : size);
+        if (positions.has(row.market) || (row.direction === 'neutral' && size !== '0')) throw invalid();
+        const signed = row.direction === 'short' && size !== '0' ? `-${size}` : size;
+        let entryPrice = null;
+        if (details && size !== '0') {
+          try { entryPrice = decimal(row.averageEntryPrice, { positive: true }); } catch { /* Still report the exposure when its cost basis is unavailable. */ }
+        }
+        positions.set(row.market, details ? { size: signed, entryPrice } : signed);
       }
       return positions;
     },

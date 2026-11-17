@@ -138,7 +138,7 @@ const depthClient = (): OndoClient => ({
   close() {},
 } as unknown as OndoClient);
 
-test('路由：没有 ondo 时 404；设置须带请求标记；未知字段 400；没有 API Key 不能实盘；不返回 Secret', async () => {
+test('路由：没有 ondo 时 404，写操作校验标记、字段、专户确认和凭据', async () => {
   await withServer(undefined, async call => { assert.equal((await call('GET', '/api/ondo/state')).status, 404); });
   const dataDir = mkdtempSync(join(tmpdir(), 'tp-ondo-routes-'));
   const silent = (): void => {};
@@ -152,9 +152,12 @@ test('路由：没有 ondo 时 404；设置须带请求标记；未知字段 400
       assert.equal(extra.status, 400); assert.equal(((await extra.json()) as { message: string }).message, '请求包含未知字段');
       assert.equal((await call('PUT', '/api/ondo/config', { config: { ...LIVE, maxBps: '40' } })).status, 400);
       const saved = await (await call('PUT', '/api/ondo/config', { config: LIVE })).json() as { revision: number };
-      const refused = await call('POST', '/api/ondo/start', { revision: saved.revision, confirmLive: true });
+      const oldConfirmation = await call('POST', '/api/ondo/start', { revision: saved.revision, confirmLive: true });
+      assert.equal(oldConfirmation.status, 400);
+      assert.match(((await oldConfirmation.json()) as { message: string }).message, /专用账户/);
+      const refused = await call('POST', '/api/ondo/start', { revision: saved.revision, confirmLive: true, confirmAccountWide: true });
       assert.equal(refused.status, 409); assert.match(((await refused.json()) as { message: string }).message, /没有配置 Ondo API Key/);
-      assert.equal((await call('POST', '/api/ondo/start', { revision: saved.revision, confirmLive: true, force: true })).status, 400);
+      assert.equal((await call('POST', '/api/ondo/start', { revision: saved.revision, confirmLive: true, confirmAccountWide: true, force: true })).status, 400);
       assert.equal((await call('POST', '/api/ondo/stop', { extra: 1 })).status, 400);
       assert.equal(((await (await call('POST', '/api/ondo/stop', {})).json()) as { phase: string }).phase, 'stopped');
       // An empty JSON body (readJson gives null) is the same as {}; a body with fields is not.
@@ -169,6 +172,10 @@ test('路由：没有 ondo 时 404；设置须带请求标记；未知字段 400
       assert.equal((await call('GET', '/api/ondo/missing')).status, 404);
     });
   } finally { await watching.close(); }
+});
+
+test('专用账户的本机进程锁防止重复启动，状态和错误不返回密钥', async () => {
+  const silent = (): void => {};
   const keyed = await createOndoModule({}, KEY, mkdtempSync(join(tmpdir(), 'tp-ondo-routes-')), { log: silent, rewardsClient: depthClient, mmIntervalMs: 0 });
   try {
     await withServer({ ondo: keyed.views }, async call => {

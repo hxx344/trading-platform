@@ -1,4 +1,4 @@
-// 来源：project-aggregation 工作台 server/trading-ondo-quote.mjs（提交 7745181），原样复制。
+// 来源：project-aggregation 工作台 server/trading-ondo-quote.mjs（提交 7745181）。开仓须有足额前方外部挂单。
 // Quote placement for resting liquidity rewards. Pure functions over exact
 // fixed-point units (value × 10^18, see trading-decimal.mjs): prices, sizes,
 // USD amounts and basis points are all BigInt units. Book levels are
@@ -65,7 +65,8 @@ function band(side, ref, tick) {
 
 // External size resting at prices better than `price` on its own side: what
 // a taker has to trade through before reaching the quote.
-function protectionOf(buy, ext, price) {
+export function frontNotional(side, ext, price) {
+  const buy = side === 'buy';
   let total = 0n;
   for (const [level, size] of buy ? ext.bids : ext.asks) {
     if (buy ? level <= price : level >= price) break;
@@ -81,7 +82,7 @@ function protectionOf(buy, ext, price) {
 export function planQuote(side, ref, ext, tick, config, limit) {
   const range = band(side, ref, tick);
   if (!range) return { price: null, reason: 'no_book' };
-  const { buy, toward } = range;
+  const { buy } = range;
   let target = range.closest(config.target);
   const outer = range.farthest(config.max);
   if (target === null) return { price: null, reason: 'no_price' };
@@ -95,17 +96,18 @@ export function planQuote(side, ref, ext, tick, config, limit) {
     target = buy ? floorStep(limit - 1n, tick) : ceilStep(limit + 1n, tick);
     if (buy ? target < outer : target > outer) return { price: null, reason: 'own_order_in_way' };
   }
-  const result = (price, mode) => ({ price, mode, protection: protectionOf(buy, ext, price), bps: range.bps(price) });
-  if (!config.wallEnabled) return result(target, 'fixed');
-  if (protectionOf(buy, ext, target) >= config.wallMin) return result(target, 'wall');
-  // One tick behind a level, walking away from the mid, until enough rests in front.
-  for (const [level] of buy ? ext.bids : ext.asks) {
-    const price = level - toward;
-    if (buy ? price >= target : price <= target) continue;
-    if (buy ? price < outer : price > outer) break;
-    if (protectionOf(buy, ext, price) >= config.wallMin) return result(price, 'wall');
+  if (typeof config.wallMin !== 'bigint' || config.wallMin <= 0n) return { price: null, reason: 'unprotected' };
+  let total = 0n;
+  for (const [level, size] of buy ? ext.bids : ext.asks) {
+    // At or outside the outer tick the level cannot protect any quote in the band.
+    if (buy ? level <= outer : level >= outer) break;
+    total += notional(level, size);
+    if (total < config.wallMin) continue;
+    const behind = buy ? floorStep(level - 1n, tick) : ceilStep(level + 1n, tick);
+    const price = (buy ? target < behind : target > behind) ? target : behind;
+    return { price, mode: 'wall', protection: frontNotional(side, ext, price), bps: range.bps(price) };
   }
-  return result(target, 'fixed');
+  return { price: null, reason: 'unprotected' };
 }
 
 // Whether a resting quote may stay. `urgent` replacements skip the dwell time.
@@ -115,12 +117,10 @@ export function assessQuote(side, price, ref, ext, tick, config, limit) {
   const { buy } = range;
   if (!range.resting(price) || !range.far(price, config.min)) return { keep: false, reason: 'too_close', urgent: true };
   if (limit !== undefined && (buy ? price >= limit : price <= limit)) return { keep: false, reason: 'own_order_in_way', urgent: true };
+  const protection = frontNotional(side, ext, price);
+  if (typeof config.wallMin !== 'bigint' || config.wallMin <= 0n || protection < config.wallMin) return { keep: false, reason: 'unprotected', urgent: true };
   if (!range.near(price, config.max)) return { keep: false, reason: 'too_far', urgent: false };
-  if (config.wallEnabled && protectionOf(buy, ext, price) * 2n < config.wallMin) {
-    const plan = planQuote(side, ref, ext, tick, config, limit);
-    if (plan.price !== null && plan.mode === 'wall' && plan.price !== price) return { keep: false, reason: 'unprotected', urgent: false };
-  }
-  return { keep: true, bps: range.bps(price), protection: protectionOf(buy, ext, price) };
+  return { keep: true, bps: range.bps(price), protection };
 }
 
 // A reduce-only close joins the best external price on its side and never crosses.

@@ -48,6 +48,9 @@ export const ondoLockId = (keyId: string): string => createHash('sha256').update
 
 export async function createOndoModule(config: OndoServiceConfig, key: OndoCredentials | undefined, dataDir: string, options: {
   log?: Log; fetchImpl?: typeof fetch; WebSocketImpl?: unknown; rewardsClient?: () => OndoClient; rewardsStream?: OndoStreamFactory; mmIntervalMs?: number;
+  notifyRisk?: (key: string, text: string) => void;
+  /** Simulator for the local preview. Only used when the entire module has no credentials. */
+  observeFeed?: { client: () => OndoClient; stream: OndoStreamFactory };
   locks?: typeof holdAccountLocks;
 } = {}): Promise<OndoModule> {
   const log = options.log ?? (line => process.stderr.write(`${line}\n`));
@@ -71,6 +74,8 @@ export async function createOndoModule(config: OndoServiceConfig, key: OndoCrede
     mm = made = createOndoMarketMaker({
       dataDir, readCredentials: () => key ?? null, ...(config.initial ? { initialConfig: config.initial } : {}), closeWaitMs: ONDO_CLOSE_WAIT_MS,
       log: { info: say('info'), warn: say('warn'), error: say('error'), debug: say('debug') },
+      ...(options.notifyRisk ? { notifyRisk: options.notifyRisk } : {}),
+      ...(!key && options.observeFeed ? { clientFactory: options.observeFeed.client, streamFactory: options.observeFeed.stream } : {}),
       ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}), ...(options.WebSocketImpl ? { WebSocketImpl: options.WebSocketImpl } : {}),
       ...(options.mmIntervalMs === undefined ? {} : { intervalMs: options.mmIntervalMs }),
     });
@@ -87,9 +92,9 @@ export async function createOndoModule(config: OndoServiceConfig, key: OndoCrede
 
   const views: OndoViews = {
     state: () => mm.state(),
-    // The workbench route's bodies (data-plane.mjs): settings under `config`, a start with its three fields, the rest empty.
+    // A live start additionally requires acknowledgement of the venue's account-wide cancellation scope.
     save: body => mm.save(only(body, 'config').config),
-    start: body => mm.start(only(body, 'revision', 'confirmLive', 'adoptPositions')),
+    start: body => mm.start(only(body, 'revision', 'confirmLive', 'confirmAccountWide', 'adoptPositions')),
     stop: body => { only(body); return mm.stop(); },
     cleanup: body => { only(body); return mm.cleanup(); },
     discardRecovery: body => { only(body); return mm.discardRecovery(); },

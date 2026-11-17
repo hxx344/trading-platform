@@ -1,8 +1,8 @@
 // A local preview of the Ondo page (docs/ondo.md): the module in a throwaway data directory, with the reward collector
 // reading a simulated public book (a random walk per market, about 0.04% a minute, depth thinning away from the mid)
 // instead of Ondo: a simulated feed pushes every market about 4 times a second while open, except the eighth market,
-// which it leaves to the REST fallback. Nothing goes to the network as long as the quoting session is not started; there
-// is no API key, so live mode is refused. The 1-minute volatility shows after about 10 minutes (20 returns).
+// which it leaves to the REST fallback. The observation session uses the same simulated depth and public trades. There
+// is no API key. The 1-minute volatility shows after about 10 minutes (20 returns).
 // Removed on exit, like scripts/dev-hynix.ts.
 //   pnpm build:web; node scripts/dev-ondo.ts [--port 4733]
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -47,13 +47,22 @@ const snapshot = (market: string) => {
   book.at = now;
   return { market, bids: side(book.mid, book.depth, -1, 0.0001), asks: side(book.mid, book.depth, 1, 0.0001) };
 };
-const feed: OndoStreamFactory = ({ markets, onBook }) => {
+const feed: OndoStreamFactory = ({ markets, onBook, onTrade }) => {
   let timer: NodeJS.Timeout | undefined;
+  let seq = 0;
   return {
     start() {
       timer = setInterval(() => {
         // A market added on the page that the simulation does not know is left to the REST fallback (which reports it).
-        for (const market of markets) if (market !== REWARD_MARKETS[7] && books.has(market)) onBook(market, parseOndoBook({ time: new Date().toISOString(), ...snapshot(market) }), Date.now());
+        for (const market of markets) {
+          if (market === REWARD_MARKETS[7] || !books.has(market)) continue;
+          const at = Date.now(), book = parseOndoBook({ time: new Date(at).toISOString(), ...snapshot(market) });
+          if (book && onTrade && ++seq % 6 === 0) {
+            const buy = seq % 12 === 0, levels = buy ? book.asks : book.bids;
+            onTrade(market, { id: String(seq), time: at, price: levels[48]![0], aggressorSide: buy ? 'buy' : 'sell' }, at);
+          }
+          onBook(market, book, at);
+        }
       }, 250);
     },
     status: () => ({ connected: true, publicReady: true, privateReady: false, lastFrameAt: Date.now(), error: null }),
@@ -61,13 +70,14 @@ const feed: OndoStreamFactory = ({ markets, onBook }) => {
   };
 };
 const client = {
+  cooldownUntil: () => 0,
   async markets() { return new Map(REWARD_MARKETS.map((market, i) => [market, { tick: '0.0001', step: '0.001', trading: i !== 7, makerFee: i % 3 === 0 ? null : '0.0001' }])); },
   async depth(market: string) { return snapshot(market); },
   close() {},
 } as unknown as OndoClient;
 
 const log = (line: string) => process.stderr.write(`${line}\n`);
-const ondo = await createOndoModule({}, undefined, dir, { log, rewardsClient: () => client, rewardsStream: feed });
+const ondo = await createOndoModule({}, undefined, dir, { log, rewardsClient: () => client, rewardsStream: feed, observeFeed: { client: () => client, stream: feed } });
 const run = runExecutor({
   executor, store, dir, port, app, passes: [],
   views: { ondo: ondo.views },

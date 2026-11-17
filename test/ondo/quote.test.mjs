@@ -28,16 +28,16 @@ test('WebSocket login signs the time with the fixed suffix', () => {
 
 const levels = rows => rows.map(([price, size]) => [u(price), u(size)]);
 const book = (bids, asks) => ({ bids: levels(bids), asks: levels(asks) });
-const cfg = (extra = {}) => ({ target: u('4'), min: u('3'), max: u('4.8'), wallEnabled: false, wallMin: u('5000'), ...extra });
+const cfg = (extra = {}) => ({ target: u('4'), min: u('3'), max: u('4.8'), wallMin: u('5000'), ...extra });
 const TICK = u('0.01');
 // Mid 200.02; one tick is 0.5 bps.
 const B = book([['200.00', '10'], ['199.98', '20'], ['199.95', '100'], ['199.90', '300']], [['200.04', '10'], ['200.06', '20'], ['200.09', '100'], ['200.14', '300']]);
 
-test('fixed quotes sit at the tick nearest the mid that is at least the target away', () => {
+test('protected quotes sit at the tick nearest the mid that is at least the target away', () => {
   const buy = planQuote('buy', B, B, TICK, cfg()), sell = planQuote('sell', B, B, TICK, cfg());
   // 200.02 × (1 − 4 bps) = 199.939992, 200.02 × (1 + 4 bps) = 200.100008.
   assert.equal(f(buy.price), '199.93'); assert.equal(f(sell.price), '200.11');
-  assert.equal(buy.mode, 'fixed');
+  assert.equal(buy.mode, 'wall');
   assert.ok(buy.bps >= 4 && buy.bps <= 4.8 && sell.bps >= 4 && sell.bps <= 4.8);
 });
 
@@ -51,13 +51,10 @@ test('a coarse tick uses the tick just inside the target, or none when it would 
   assert.deepEqual(planQuote('buy', tiny, tiny, TICK, cfg()), { price: null, reason: 'no_tick_in_band' });
 });
 
-test('inside a wide spread the distance is measured from the mid the quote creates', () => {
+test('a quote inside a wide spread cannot rest without a better external order', () => {
   const wide = book([['100.00', '5']], [['101.00', '5']]);
-  const buy = planQuote('buy', wide, wide, TICK, cfg());
-  // 101 × (1 − 4 bps) / (1 + 4 bps) = 100.9192…: the new mid is 100.955 and the quote is 4.46 bps from it.
-  assert.equal(f(buy.price), '100.91');
-  assert.ok(buy.bps >= 4 && buy.bps <= 4.8);
-  assert.equal(assessQuote('buy', buy.price, wide, wide, TICK, cfg()).keep, true);
+  assert.deepEqual(planQuote('buy', wide, wide, TICK, cfg({ wallMin: u('1') })), { price: null, reason: 'unprotected' });
+  assert.deepEqual(assessQuote('buy', u('100.91'), wide, wide, TICK, cfg()), { keep: false, reason: 'unprotected', urgent: true });
 });
 
 test('wall protection moves one tick behind the level that puts enough size in front', () => {
@@ -67,9 +64,24 @@ test('wall protection moves one tick behind the level that puts enough size in f
   assert.equal(f(buy.price), '199.89'); assert.equal(buy.mode, 'wall'); assert.equal(f(buy.protection), '85964.6');
   const enough = planQuote('buy', B, B, TICK, cfg({ wallEnabled: true, wallMin: u('5000') }));
   assert.equal(f(enough.price), '199.93'); assert.equal(enough.mode, 'wall');
-  // No wall inside the band: the fixed distance is used.
-  const none = planQuote('buy', B, B, TICK, cfg({ wallEnabled: true, wallMin: u('50000') }));
-  assert.equal(f(none.price), '199.93'); assert.equal(none.mode, 'fixed');
+  // Neither legacy settings nor an amount of zero can disable the requirement.
+  for (const wallMin of [u('50000'), 0n]) for (const side of ['buy', 'sell']) {
+    assert.deepEqual(planQuote(side, B, B, TICK, cfg({ wallEnabled: false, wallMin })), { price: null, reason: 'unprotected' });
+  }
+});
+
+test('only strictly better external levels count, down to the exact USD threshold on each side', () => {
+  for (const [side, price, threshold] of [['buy', '199.93', '5999.6'], ['sell', '200.11', '6001.6']]) {
+    const buy = side === 'buy';
+    const ref = book([['200', '10'], ['199.98', '20'], ['199.95', '100'], ['199.93', '10000']], [['200.04', '10'], ['200.06', '20'], ['200.09', '100'], ['200.11', '10000']]);
+    const external = withoutOrders(ref, [{ side, price: u(buy ? '199.95' : '200.09'), remaining: u('100') }]);
+    const exact = cfg({ wallMin: u(threshold) });
+    assert.equal(planQuote(side, ref, external, TICK, exact).price, u(price));
+    assert.equal(assessQuote(side, u(price), ref, external, TICK, exact).protection, u(threshold));
+    const short = cfg({ wallMin: u(threshold) + 1n });
+    assert.deepEqual(assessQuote(side, u(price), ref, external, TICK, short), { keep: false, reason: 'unprotected', urgent: true });
+    assert.deepEqual(planQuote(side, ref, external, TICK, short), { price: null, reason: 'unprotected' });
+  }
 });
 
 test('own orders are not counted as external protection and are never crossed', () => {
@@ -87,8 +99,10 @@ test('a resting quote is urgent when too close and patient when too far', () => 
   assert.equal(assessQuote('buy', u('199.93'), B, B, TICK, cfg()).keep, true);
   const down = book([['199.94', '10']], [['199.98', '10']]);
   assert.deepEqual(assessQuote('buy', u('199.93'), down, down, TICK, cfg()), { keep: false, reason: 'too_close', urgent: true });
-  const up = book([['200.10', '10']], [['200.14', '10']]);
+  const up = book([['200.10', '50']], [['200.14', '50']]);
   assert.deepEqual(assessQuote('buy', u('199.93'), up, up, TICK, cfg()), { keep: false, reason: 'too_far', urgent: false });
+  const vanished = book([['200.10', '20']], [['200.14', '50']]);
+  assert.deepEqual(assessQuote('buy', u('199.93'), vanished, vanished, TICK, cfg()), { keep: false, reason: 'unprotected', urgent: true });
   // The market traded through the quote: it no longer rests below the ask.
   const through = book([['199.90', '10']], [['199.92', '10']]);
   assert.equal(assessQuote('buy', u('199.93'), through, through, TICK, cfg()).reason, 'too_close');

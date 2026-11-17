@@ -1,4 +1,4 @@
-// 来源：project-aggregation 工作台 server/trading-ondo-stream.mjs（提交 7745181）。改动：import 路径。
+// 来源：project-aggregation 工作台 server/trading-ondo-stream.mjs（提交 7745181）。本服务增加公开逐笔与永续账户断线撤单。
 import { Buffer } from 'node:buffer';
 import { ondoWsLogin } from './transport.mjs';
 import { decimalUnits } from './decimal.mjs';
@@ -8,6 +8,7 @@ const MAX_BYTES = 1024 * 1024;
 const MAX_LEVELS = 200;
 const CONNECT_MS = 8000, LOGIN_MS = 8000;
 const PING_MS = 5000, SILENCE_MS = 15_000;
+const DEAD_MAN = 'cancelAllOrdersAfterPerps', DEAD_MAN_SECONDS = 30;
 const RETRY_MS = [1000, 2000, 4000, 8000, 15_000, 30_000], AUTH_RETRY_MS = 60_000;
 const PRIVATE = ['ordersPerps', 'fillsPerps', 'positionsPerps'];
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -33,6 +34,14 @@ export function parseOndoBook(row) {
   } catch { return null; }
 }
 
+function parsePublicTrade(row) {
+  if (typeof row.id !== 'string' || !row.id.length || row.id.length > 256 || typeof row.time !== 'string'
+    || typeof row.price !== 'string' || !['buy', 'sell'].includes(row.aggressor_side)) throw new Error('trade');
+  const time = Date.parse(row.time), price = decimalUnits(row.price);
+  if (!Number.isFinite(time) || price <= 0n) throw new Error('trade');
+  return { id: row.id, time, price, aggressorSide: row.aggressor_side };
+}
+
 // One socket: full depth snapshots of `markets` (about four a second) and,
 // with credentials, the account's order, fill and position channels. It sends
 // nothing but login, subscriptions and pings. A lost, silent or refused
@@ -40,11 +49,13 @@ export function parseOndoBook(row) {
 // reopened after 1-30 s, 60 s after a refused login, without a retry limit:
 // reconnecting places no order. Private payloads are passed on unparsed; the
 // caller treats them as hints and reads the account over REST.
-export function createOndoStream({ markets, credentials = null, depth = 50, onBook, onPrivate = () => {}, onDown = () => {},
+export function createOndoStream({ markets, credentials = null, depth = 50, onBook, onTrade, onPrivate = () => {}, onDown = () => {},
   WebSocketImpl = globalThis.WebSocket, now = Date.now, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout } = {}) {
   const wanted = new Set(markets);
+  const observeTrades = !credentials && typeof onTrade === 'function';
   let socket = null, era = 0, closed = false, started = false, failures = 0, lastFrame = 0, error = null;
   let open = false, loggedIn = false, subscribed = new Set();
+  let heartbeatAckAt = null, armingAttempted = false;
   const timers = new Set();
   let retryTimer = null;
 
@@ -56,14 +67,17 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
   function clearTimers() { for (const timer of timers) clearTimeoutImpl(timer); timers.clear(); retryTimer = null; }
   function fail(reason, auth = false) {
     const old = socket;
-    era += 1; socket = null; open = false; loggedIn = false; subscribed = new Set();
+    const expiryWait = armingAttempted ? (DEAD_MAN_SECONDS + 1) * 1000 : 0;
+    armingAttempted = false;
+    era += 1; socket = null; open = false; loggedIn = false; subscribed = new Set(); heartbeatAckAt = null;
     clearTimers();
     error = reason;
     // Close reasons and socket errors are not propagated: they can echo credentials.
     try { old?.close(); } catch { /* already unusable */ }
     onDown(reason);
     if (closed) return;
-    const wait = auth ? AUTH_RETRY_MS : RETRY_MS[Math.min(failures, RETRY_MS.length - 1)];
+    // A quick reconnect/ping must not renew the previous connection's timer over leftover GTC orders.
+    const wait = Math.max(expiryWait, auth ? AUTH_RETRY_MS : RETRY_MS[Math.min(failures, RETRY_MS.length - 1)]);
     failures += 1;
     retryTimer = schedule(() => { retryTimer = null; connect(); }, wait);
   }
@@ -74,26 +88,43 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
     schedule(function beat() {
       if (current !== era || !open) return;
       if (now() - lastFrame >= SILENCE_MS) { fail('silent'); return; }
+      // A busy depth feed only proves the inbound path. Require a round trip on the socket that armed the timer.
+      if (subscribed.has(DEAD_MAN) && !deadManReady()) { fail('heartbeat_timeout'); return; }
       if (send({ op: 'ping' }) && current === era) schedule(beat, PING_MS);
     }, PING_MS);
   }
   const privateReady = () => loggedIn && PRIVATE.every(channel => subscribed.has(channel));
+  const publicReady = () => subscribed.has('depthBooksPerps') && (!observeTrades || subscribed.has('tradesPerps'));
+  const deadManReady = () => loggedIn && subscribed.has(DEAD_MAN) && heartbeatAckAt !== null && now() - heartbeatAckAt < SILENCE_MS;
   function receive(data) {
     const raw = typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
     if (raw.length > MAX_BYTES) throw new Error('size');
     const message = JSON.parse(raw);
     if (!object(message)) throw new Error('shape');
     lastFrame = now();
-    if (message.type === 'pong') return;
+    if (message.type === 'pong') { if (subscribed.has(DEAD_MAN)) heartbeatAckAt = lastFrame; return; }
     if (message.type === 'loggedIn') {
       if (!credentials || loggedIn) return;
       loggedIn = true;
       for (const channel of PRIVATE) if (!send({ op: 'subscribe', channel })) return;
+      armingAttempted = true;
+      send({ op: 'subscribe', channel: DEAD_MAN, timeout_seconds: DEAD_MAN_SECONDS });
       return;
     }
     if (message.type === 'subscribed') {
+      if (message.channel === DEAD_MAN) {
+        if (!credentials || !loggedIn) return;
+        heartbeatAckAt = lastFrame;
+      }
       if (typeof message.channel === 'string') subscribed.add(message.channel);
-      if (subscribed.has('depthBooksPerps') && (!credentials || privateReady())) { failures = 0; error = null; }
+      if (publicReady() && (!credentials || privateReady())) { failures = 0; error = null; }
+      return;
+    }
+    if (message.type === 'unsubscribed' && (message.channel === 'depthBooksPerps' || (observeTrades && message.channel === 'tradesPerps'))) {
+      fail('public_unsubscribed'); return;
+    }
+    if (message.type === 'unsubscribed' && (message.channel === DEAD_MAN || PRIVATE.includes(message.channel))) {
+      fail('protection_lost');
       return;
     }
     if (message.type === 'error') {
@@ -107,6 +138,12 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
       for (const row of message.data) {
         if (!object(row) || !wanted.has(row.market)) continue;
         onBook(row.market, parseOndoBook(row), lastFrame);
+      }
+    } else if (message.channel === 'tradesPerps' && observeTrades && publicReady()) {
+      if (!Array.isArray(message.data)) throw new Error('shape');
+      for (const row of message.data) {
+        if (!object(row) || typeof row.market !== 'string') throw new Error('trade');
+        if (wanted.has(row.market)) onTrade(row.market, parsePublicTrade(row), lastFrame);
       }
     } else if (PRIVATE.includes(message.channel) && privateReady()) onPrivate(message.channel, message.data);
   }
@@ -124,11 +161,15 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
       if (!active()) return;
       open = true; lastFrame = now();
       if (!send({ op: 'subscribe', channel: 'depthBooksPerps', markets: [...wanted], limit: depth })) return;
+      if (observeTrades) {
+        if (!send({ op: 'subscribe', channel: 'tradesPerps', markets: [...wanted], numPastTrades: 0 })) return;
+        schedule(() => { if (active() && !publicReady()) fail('public_timeout'); }, CONNECT_MS);
+      }
       if (credentials) {
         let login;
         try { login = ondoWsLogin(credentials, String(Math.trunc(now()))); } catch { fail('login_refused', true); return; }
         if (!send(login)) return;
-        schedule(() => { if (active() && !privateReady()) fail('login_timeout'); }, LOGIN_MS);
+        schedule(() => { if (active() && (!privateReady() || !deadManReady())) fail('login_timeout'); }, LOGIN_MS);
       }
       watch(current);
     });
@@ -141,7 +182,7 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
   }
   return {
     start() { if (!started && !closed) { started = true; connect(); } },
-    status: () => ({ connected: open, publicReady: open && subscribed.has('depthBooksPerps'), privateReady: open && privateReady(), lastFrameAt: lastFrame || null, error }),
+    status: () => ({ connected: open, publicReady: open && publicReady(), privateReady: open && privateReady(), deadManReady: open && deadManReady(), lastFrameAt: lastFrame || null, error }),
     close() {
       if (closed) return;
       closed = true;

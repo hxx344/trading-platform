@@ -135,8 +135,8 @@ test('requests share one bucket and cancels go ahead of new quotes', async () =>
   const clock = { now: EPOCH };
   const client = createOndoClient({ credentials: keys, now: () => clock.now, rps: 1, setTimeoutImpl: (fn, ms) => { timers.push({ fn, ms }); return timers.length; }, clearTimeoutImpl() {},
     fetchImpl: async (url, init) => { sent.push(init.method); return init.method === 'DELETE' ? json({ success: true, result: order({ status: 'canceled' }) }) : json({ success: true, result: order() }); } });
-  const input = { market: 'NVDA-USD.P', side: 'buy', price: '1', size: '1', clientOrderId: 'a' };
-  const all = [client.place(input), client.place(input), client.cancel('abc')];
+  const input = { market: 'NVDA-USD.P', side: 'buy', price: '199.93', size: '0.5', clientOrderId: 'omm-1' };
+  const all = [client.place(input), client.place(input), client.cancel('abc123')];
   await new Promise(resolve => setImmediate(resolve));
   assert.deepEqual(sent, ['POST']);
   for (let round = 0; round < 2; round++) { clock.now += 1000; const due = timers.find(timer => timer.ms <= 1000 && !timer.fired); due.fired = true; due.fn(); await new Promise(resolve => setImmediate(resolve)); }
@@ -149,6 +149,47 @@ test('requests share one bucket and cancels go ahead of new quotes', async () =>
 test('an accepted placement that cannot be read is uncertain', async () => {
   const { client } = fixture([json({ success: true, result: { orderId: 'abc123' } })]);
   await assert.rejects(client.place({ market: 'NVDA-USD.P', side: 'buy', price: '1', size: '1', clientOrderId: 'a' }), rejected('invalid_data', { uncertain: true }));
+});
+
+test('an IOC is a signed reduce-only limit and every response is bound to its original request', async () => {
+  const input = { market: 'NVDA-USD.P', side: 'sell', price: '199.93', size: '0.5', clientOrderId: 'omm-1', reduceOnly: true, timeInForce: 'IOC' };
+  const good = { side: 'sell', reduceOnly: true, status: 'canceled', timeInForce: 'IOC' };
+  const wrong = [{ market: 'TSLA-USD.P' }, { clientOrderId: 'another' }, { side: 'buy' }, { price: '199.94' },
+    { size: '0.501' }, { reduceOnly: false }, { timeInForce: 'GTC' }, { filledSize: '1' }];
+  const reply = extra => json({ success: true, result: order({ ...good, ...extra }) });
+  const { client, calls, clock } = fixture([reply({}), ...wrong.map(reply), reply({ orderId: 'different' }), reply({ clientOrderId: 'another' })]);
+  await assert.rejects(client.place({ ...input, reduceOnly: false }), TypeError);
+  await client.place(input);
+  assert.deepEqual(JSON.parse(calls[0].init.body), { market: input.market, side: 'sell', price: input.price, size: input.size, type: 'limit', timeInForce: 'IOC', postOnly: false, reduceOnly: true, clientOrderId: input.clientOrderId });
+  for (const _ of wrong) await assert.rejects(client.place(input), rejected('invalid_data', { uncertain: true }));
+  clock.now += 1000;
+  await assert.rejects(client.cancel('abc123'), rejected('invalid_data', { uncertain: true }));
+  await assert.rejects(client.orderByClientId('omm-1'), rejected('invalid_data', { uncertain: false }));
+});
+
+test('a locally vetoed queued order or timestamp retry never reaches fetch', async () => {
+  const timers = [], clock = { now: EPOCH };
+  const { client, calls } = fixture([json({ success: true, result: [] })], { rps: 1, now: () => clock.now,
+    setTimeoutImpl(fn, ms) { timers.push({ fn, ms }); return timers.length; }, clearTimeoutImpl() {} });
+  await client.positions();
+  let armed = true;
+  const input = { market: 'NVDA-USD.P', side: 'buy', price: '199.93', size: '0.5', clientOrderId: 'omm-1', canSend: () => armed };
+  const queued = client.place(input);
+  armed = false; clock.now += 1000; timers.find(timer => timer.ms === 1000).fn();
+  await assert.rejects(queued, rejected('send_guard', { uncertain: false })); assert.equal(calls.length, 1);
+  armed = true;
+  const resigned = fixture([() => { armed = false; return json({ error_code: 'invalid_timestamp' }, 400, { Date: new Date(EPOCH).toUTCString() }); }]);
+  await assert.rejects(resigned.client.place(input), rejected('send_guard', { uncertain: false })); assert.equal(resigned.calls.length, 1);
+});
+
+test('position details retain the venue entry price, accept explicit neutral zero, and reject an inconsistent direction', async () => {
+  const rows = [{ market: 'NVDA-USD.P', direction: 'short', netQuantity: '0.500', averageEntryPrice: '200.070' },
+    { market: 'TSLA-USD.P', direction: 'neutral', netQuantity: '0', averageEntryPrice: '0' },
+    { market: 'AMD-USD.P', direction: 'long', netQuantity: '1', averageEntryPrice: 'unavailable' }];
+  const { client } = fixture([json({ success: true, result: rows }), json({ success: true, result: [{ ...rows[1], netQuantity: '1' }] })]);
+  assert.deepEqual([...(await client.positions({ details: true }))], [['NVDA-USD.P', { size: '-0.5', entryPrice: '200.07' }],
+    ['TSLA-USD.P', { size: '0', entryPrice: null }], ['AMD-USD.P', { size: '1', entryPrice: null }]]);
+  await assert.rejects(client.positions(), rejected('invalid_data'));
 });
 
 test('a cancel waits out a shorter, bounded part of a cooldown, and its own 429 is counted once per burst', async () => {

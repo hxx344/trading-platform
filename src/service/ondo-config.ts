@@ -3,7 +3,7 @@
 // `ondo: { keyId, secret }` is the API key, optional because watching and the reward view need none. No message built
 // here carries a key, a secret or a field name read from the key file.
 import { ContractError, exactKeys } from '../contracts.ts';
-import { validateCredentials, validateOndoMmConfig, type OndoMmConfig } from '../vendor/ondo/mm.mjs';
+import { validateCredentials, readOndoMmConfig, type OndoMmConfig } from '../vendor/ondo/mm.mjs';
 
 export interface OndoServiceConfig {
   /** The workbench quoting settings imported once; the module saves the page's own in <data>/ondo-mm/config.json. */
@@ -18,7 +18,7 @@ export function parseOndoConfig(value: unknown): OndoServiceConfig {
   try { raw = exactKeys(value, [], ['initial']); } catch (error) { throw new Error(`ondo 无效：${reason(error)}`); }
   if (raw.initial === undefined) return {};
   // Imported settings never start a live session by themselves.
-  try { return { initial: { ...validateOndoMmConfig(raw.initial), mode: 'observe' } }; } catch (error) { throw new Error(`ondo.initial 无效：${reason(error)}`); }
+  try { return { initial: { ...readOndoMmConfig(raw.initial), mode: 'observe' } }; } catch (error) { throw new Error(`ondo.initial 无效：${reason(error)}`); }
 }
 
 /** secrets.json `ondo: { keyId, secret }`, or undefined when absent; field names and values are never echoed. */

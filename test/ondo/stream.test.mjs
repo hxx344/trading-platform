@@ -53,7 +53,7 @@ test('a public stream subscribes to depth only and passes each snapshot on', asy
   socket.emit('open');
   assert.deepEqual(socket.sent, [{ op: 'subscribe', channel: 'depthBooksPerps', markets: ['NVDA-USD.P'], limit: 50 }]);
   socket.frame({ type: 'subscribed', channel: 'depthBooksPerps' });
-  assert.deepEqual(s.stream.status(), { connected: true, publicReady: true, privateReady: false, lastFrameAt: EPOCH, error: null });
+  assert.deepEqual(s.stream.status(), { connected: true, publicReady: true, privateReady: false, deadManReady: false, lastFrameAt: EPOCH, error: null });
   socket.frame(s.depth());
   socket.frame(s.depth({ market: 'TSLA-USD.P' }));
   socket.frame(s.depth({ bids: [['200.04', '1']] }));
@@ -63,6 +63,30 @@ test('a public stream subscribes to depth only and passes each snapshot on', asy
   assert.equal(s.hints.length, 0);
   s.stream.close();
   assert.equal(socket.closed, true); assert.deepEqual(s.downs, []);
+});
+
+test('an observation stream requires both public subscriptions and requests no historical prints', async () => {
+  const trades = [];
+  const s = fixture({ onTrade: (market, trade, at) => trades.push({ market, trade, at }) });
+  s.stream.start();
+  const socket = s.sockets[0]; socket.emit('open');
+  assert.deepEqual(socket.sent[1], { op: 'subscribe', channel: 'tradesPerps', markets: ['NVDA-USD.P'], numPastTrades: 0 });
+  const row = { market: 'NVDA-USD.P', price: '199.93', aggressor_side: 'sell', id: 'trade1', time: new Date(EPOCH).toISOString() };
+  const frame = rows => socket.frame({ type: 'update', channel: 'tradesPerps', data: rows });
+  socket.frame({ type: 'subscribed', channel: 'depthBooksPerps' });
+  frame([row]);
+  assert.equal(s.stream.status().publicReady, false); assert.equal(trades.length, 0);
+  socket.frame({ type: 'subscribed', channel: 'tradesPerps' });
+  frame([{ ...row, market: 'TSLA-USD.P' }, row]);
+  assert.equal(s.stream.status().publicReady, true);
+  assert.deepEqual(trades, [{ market: 'NVDA-USD.P', trade: { id: 'trade1', time: EPOCH, aggressorSide: 'sell', price: 199_930_000_000_000_000_000n }, at: EPOCH }]);
+  frame([{ ...row, aggressor_side: 'unknown' }]);
+  assert.deepEqual(s.downs, ['invalid_data']); assert.equal(s.stream.status().publicReady, false);
+  await s.advance(1000); s.sockets[1].emit('open');
+  s.sockets[1].frame({ type: 'subscribed', channel: 'depthBooksPerps' });
+  await s.advance(8000);
+  assert.equal(s.downs.at(-1), 'public_timeout');
+  s.stream.close();
 });
 
 test('with credentials the private channels follow a signed login', async () => {
@@ -75,12 +99,58 @@ test('with credentials the private channels follow a signed login', async () => 
   assert.equal(s.hints.length, 0);
   assert.equal(s.stream.status().privateReady, false);
   socket.frame({ type: 'loggedIn' });
-  assert.deepEqual(socket.sent.slice(2), ['ordersPerps', 'fillsPerps', 'positionsPerps'].map(channel => ({ op: 'subscribe', channel })));
+  assert.deepEqual(socket.sent.slice(2), [...['ordersPerps', 'fillsPerps', 'positionsPerps'].map(channel => ({ op: 'subscribe', channel })),
+    { op: 'subscribe', channel: 'cancelAllOrdersAfterPerps', timeout_seconds: 30 }]);
   for (const channel of ['ordersPerps', 'fillsPerps', 'positionsPerps']) socket.frame({ type: 'subscribed', channel });
   assert.equal(s.stream.status().privateReady, true);
+  assert.equal(s.stream.status().deadManReady, false);
+  socket.frame({ type: 'subscribed', channel: 'cancelAllOrdersAfterPerps' });
+  assert.equal(s.stream.status().deadManReady, true);
   socket.frame({ type: 'update', channel: 'fillsPerps', data: [{ market: 'NVDA-USD.P', size: '0.5' }] });
   assert.deepEqual(s.hints, [{ channel: 'fillsPerps', data: [{ market: 'NVDA-USD.P', size: '0.5' }] }]);
   s.stream.close();
+});
+
+test('the account-wide timer must expire across disconnect and be acknowledged on the new socket', async () => {
+  const s = fixture({ credentials: keys }); s.stream.start();
+  const first = s.sockets[0];
+  first.emit('open'); first.frame({ type: 'loggedIn' });
+  first.frame({ type: 'subscribed', channel: 'cancelAllOrdersAfterPerps' });
+  for (const channel of ['ordersPerps', 'fillsPerps', 'positionsPerps']) first.frame({ type: 'subscribed', channel });
+  // Inbound market data can still arrive while our heartbeat round trip is broken.
+  await s.advance(9000); first.frame(s.depth());
+  await s.advance(6000);
+  assert.equal(s.downs.at(-1), 'heartbeat_timeout'); assert.equal(s.stream.status().deadManReady, false);
+  await s.advance(30_000); assert.equal(s.sockets.length, 1);
+  await s.advance(1000);
+  const second = s.sockets[1]; second.emit('open'); second.frame({ type: 'loggedIn' });
+  first.frame({ type: 'subscribed', channel: 'cancelAllOrdersAfterPerps' });
+  assert.equal(s.stream.status().deadManReady, false);
+  assert.deepEqual(second.sent.at(-1), { op: 'subscribe', channel: 'cancelAllOrdersAfterPerps', timeout_seconds: 30 });
+  second.frame({ type: 'subscribed', channel: 'cancelAllOrdersAfterPerps' });
+  second.frame({ type: 'unsubscribed', channel: 'cancelAllOrdersAfterPerps' });
+  assert.equal(s.downs.at(-1), 'protection_lost'); assert.equal(s.stream.status().deadManReady, false);
+  s.stream.close();
+});
+
+test('authenticated heartbeat renews the switch until shutdown and leaves it armed when the client stops', async () => {
+  const s = fixture({ credentials: keys }); s.stream.start();
+  const socket = s.sockets[0]; socket.emit('open'); socket.frame({ type: 'loggedIn' });
+  let venueDeadline = 0;
+  for (const message of socket.sent.filter(item => item.op === 'subscribe')) {
+    socket.frame({ type: 'subscribed', channel: message.channel });
+    if (message.channel === 'cancelAllOrdersAfterPerps') venueDeadline = s.now() + message.timeout_seconds * 1000;
+  }
+  for (let i = 0; i < 9; i++) {
+    const before = socket.sent.length; await s.advance(5000);
+    assert.ok(s.now() < venueDeadline);
+    assert.deepEqual(socket.sent.slice(before), [{ op: 'ping' }]);
+    socket.frame({ type: 'pong' }); venueDeadline = s.now() + 30_000;
+  }
+  const count = socket.sent.length;
+  s.stream.close(); await s.advance(30_000);
+  assert.equal(socket.sent.length, count); assert.equal(s.sockets.length, 1);
+  assert.equal(s.now(), venueDeadline);
 });
 
 test('a silent, broken or closed connection is reported down and reopened with backoff', async () => {

@@ -286,7 +286,6 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   try {
     crossex = config.crossex ? createCrossexSupervisor(config.crossex, secrets.gate, dir, crossexOptions) : undefined;
     await crossex?.start();
-    ondo = config.ondo ? await createOndoModule(config.ondo, secrets.ondo, dir, ondoOptions) : undefined;
   } catch (error) { releaseOil(); throw error; }
   let store: ReturnType<typeof openStore>;
   try { store = openStore(join(dir, DATABASE_FILES.mainnet)); } catch (error) { releaseOil(); throw error; }
@@ -311,6 +310,11 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(oil ? { job: (id: string) => executor.jobView(id) } : {}),
     });
   } catch (error) { executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
+  try {
+    ondo = config.ondo ? await createOndoModule(config.ondo, secrets.ondo, dir, {
+      notifyRisk: (key, text) => notifier.notifyOnce(key, text), ...ondoOptions,
+    }) : undefined;
+  } catch (error) { notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
   const streams = createStreamStatus(streamed);
   // The scheduled summary card: the workbench's 定时 robot when imported, else the alert robot.
   const names = new Map(config.pairs.map(pair => [pair.id, { long: pair.long, short: pair.short }]));

@@ -9,7 +9,7 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
-import { validateCredentials, validateOndoMmConfig, type OndoMmConfig } from '../vendor/ondo/mm.mjs';
+import { validateCredentials, readOndoMmConfig, splitOndoMmConfig, type OndoMmConfig } from '../vendor/ondo/mm.mjs';
 import { decryptCredential, readerIdentity } from './import-workbench.ts';
 import { parseOndoConfig, parseOndoSecrets, type OndoCredentials } from './ondo-config.ts';
 
@@ -66,7 +66,7 @@ export function ondoCandidate(dump: OndoDump): OndoSource {
     try {
       const saved = JSON.parse(dump.config) as unknown;
       if (!isRecord(saved)) throw new Error('format');
-      source.initial = { ...validateOndoMmConfig(saved.config), mode: 'observe' };
+      source.initial = { ...readOndoMmConfig(saved.config), mode: 'observe' };
     } catch { source.settingsProblem = '工作台 Ondo 挂单设置无法解析或本服务不接受，按默认值'; }
   }
   if (dump.credentials !== null) {
@@ -141,7 +141,8 @@ export function planOndo(source: OndoSource, config: Json, secrets: Json, fits: 
     return item;
   }
   if (secrets.ondo !== undefined) { item.detail = '现有密钥文件里已有 ondo 但 config.json 没有 ondo，不覆盖；请先确认并移走它'; return item; }
-  const ondo: Json = source.initial ? { initial: source.initial } : {};
+  // Only the workbench's quoting fields are imported. The exit policy belongs to this service.
+  const ondo: Json = source.initial ? { initial: splitOndoMmConfig(source.initial).config } : {};
   try {
     fits({ ...config, ondo });
     parseOndoConfig(ondo);

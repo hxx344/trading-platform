@@ -280,7 +280,7 @@ export function describeEvent(row: EventRow, incidentPair: (id: string) => strin
     }
     case 'four-leg-unbalanced':
       // Written once both jobs of a four-leg group are over (docs/oil.md 11.3); one message per group.
-      return { text: `【四腿成交不等】四腿组 ${short(detail.group)}（任务 ${short(row.jobId)} 与 ${short(detail.peer)}）：${Array.isArray(detail.details) ? detail.details.map(item => clip(item)).join('；') : '?'}；请到交易所核对两所敞口`, onceKey: `four-leg:${clip(detail.group, 64)}` };
+      return { text: `【四腿成交不等】四腿组 ${short(detail.group)}（任务 ${short(row.jobId)} 与 ${short(detail.peer)}）：${Array.isArray(detail.details) ? detail.details.map(item => clip(item)).join('；') : '?'}${detail.attention ? '；有任务需人工处理，委托仍在核对，成交以结束时为准' : '（以两个任务结束时为准）'}；请到交易所核对两所敞口`, onceKey: `four-leg:${clip(detail.group, 64)}` };
     case 'adl-tick-failed':
       return { text: `【ADL 循环出错】${clip(detail.reason)}`, repeatKey: `adl-tick:${clip(detail.reason, 80)}` };
     case 'adl-push-dropped':

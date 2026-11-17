@@ -13,7 +13,7 @@ import {
 } from './connector.ts';
 import type { Store } from './store.ts';
 import { nearestBarrels, quantityForBarrels, splitBarrels } from './barrels.ts';
-import { fillGapText, fillGaps, type FillLeg } from './four-leg-fill.ts';
+import { fillGapText, fillGaps, shortOfPlan, type FillLeg } from './four-leg-fill.ts';
 import { midOf, proportionalHedge, quantityForNotional, splitSteps } from './hynix/sizing.ts';
 import { pairBalance, rebalanceOrder, type HeldContract, type RebalanceMethod } from './hynix/balance.ts';
 import { createTransfers, type PairRecord, type TransferDeps } from './transfer.ts';
@@ -510,9 +510,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       const venue = VENUE_NAMES[job.legs[0].venue];
       if (status !== 'completed') haltPeer(job, `${venue} 任务${STATUS_TEXT[status]}${reason ? `：${reason.slice(0, 120)}` : ''}`);
       else {
-        // A completed job may have filled less than planned (a local chase's end, a partial IOC): the other venue then stops too.
-        const filled = add('0', ...opsOf(job.id).filter(item => item.leg === 0).map(item => item.filledQuantity));
-        if (cmp(filled, job.legs[0].quantity) < 0) haltPeer(job, `${venue} 任务已完成但首腿成交少于计划（${filled} / ${job.legs[0].quantity}）`);
+        // A completed job whose lead filled materially less than planned (a local chase that gave up, an IOC that found too little)
+        // stops the other venue too; a remainder within fillSlack (a local chase's unsendable leftover) does not.
+        const lead = fillLegs(job)[0]!;
+        if (shortOfPlan(lead)) haltPeer(job, `${venue} 任务已完成但首腿成交少于计划（${lead.filled} / ${lead.planned}，可差 ${lead.slack}）`);
       }
       checkGroupFills(job);
     }
@@ -530,18 +531,45 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     saveJob(peer);
     event(peer.id, 'four-leg-halted', { by: job.id, reason: why, ...detail });
   }
-  /** Once both jobs of a group are over, fills that differ between the venues are recorded for Feishu (four-leg-fill.ts). */
-  function checkGroupFills(job: Job): void {
+  /**
+   * How far a leg may fall short of its plan by design: one quantity step per batch, and for a local-chase lead what nextLead
+   * leaves unsent in each batch (a remainder under the minimum quantity, or opening under the minimum notional with its margin
+   * at the preview bid). The hedge follows the lead in proportion, so it takes the lead's slack scaled to its plan plus a step.
+   */
+  function fillSlack(job: PairJob, index: 0 | 1): number {
+    const lead = job.legs[0], step = Number(lead.instrument.quantityStep), batches = (job.batches ?? [lead.quantity]).length;
+    let perBatch = step;
+    if (lead.orderType === 'local-chase') {
+      const underMinimum = Number(lead.instrument.minQuantity) - step;
+      const underNotional = job.action === 'open' ? Number(lead.instrument.minNotional) * Number(MIN_NOTIONAL_MARGIN) / (Number(lead.quote.bid) * Number(lead.instrument.contractSize)) : 0;
+      perBatch = Math.max(step, underMinimum, Number.isFinite(underNotional) ? underNotional : 0);
+    }
+    const slack = perBatch * batches;
+    if (index === 0) return slack;
+    const hedge = job.legs[1];
+    return slack * Number(hedge.quantity) / Number(lead.quantity) + Number(hedge.instrument.quantityStep);
+  }
+  /** A job's two legs as four-leg-fill.ts compares them. */
+  function fillLegs(job: PairJob): FillLeg[] {
+    const ops = opsOf(job.id);
+    return job.legs.map(leg => {
+      const filled = add('0', ...ops.filter(item => item.leg === leg.index).map(item => item.filledQuantity));
+      const slack = fillSlack(job, leg.index as 0 | 1);
+      return { venue: VENUE_NAMES[leg.venue], symbol: leg.symbol, filled, planned: leg.quantity, slack: String(Number(slack.toPrecision(12))),
+        shown: marketOfJob(job) === 'oil' ? `${exposure(filled, leg.instrument)} / ${exposure(leg.quantity, leg.instrument)} 桶` : `${filled} / ${leg.quantity}` };
+    });
+  }
+  /**
+   * Once both jobs of a group are over, fills that differ between the venues are recorded for Feishu (four-leg-fill.ts). A job
+   * needing a person may still have orders being reconciled, so the alert says the fills are as of the end.
+   */
+  function checkGroupFills(job: PairJob): void {
     const group = job.group as JobGroup;
-    if (!FINAL_JOB.has(readJob(group.peer).status)) return;
-    const legsOf = (id: string): FillLeg[] => {
-      const view = jobView(id);
-      return view.legs.map(leg => ({ venue: VENUE_NAMES[leg.venue as Venue] ?? leg.venue, symbol: leg.symbol, filled: leg.filledQuantity, planned: leg.plannedQuantity, step: leg.quantityStep,
-        shown: view.market === 'oil' ? `${leg.filledBarrels} / ${leg.plannedBarrels} 桶` : `${leg.filledQuantity} / ${leg.plannedQuantity}` }));
-    };
-    const [first, second] = group.index === 0 ? [job.id, group.peer] : [group.peer, job.id];
-    const gaps = fillGaps(legsOf(first), legsOf(second));
-    if (gaps.length) event(job.id, 'four-leg-unbalanced', { group: group.id, peer: group.peer, details: gaps.map(fillGapText) });
+    const peer = readJob(group.peer);
+    if (!FINAL_JOB.has(peer.status) || !isPair(peer)) return;
+    const [first, second] = group.index === 0 ? [job, peer] : [peer, job];
+    const gaps = fillGaps(fillLegs(first), fillLegs(second));
+    if (gaps.length) event(job.id, 'four-leg-unbalanced', { group: group.id, peer: group.peer, details: gaps.map(fillGapText), attention: job.status === 'attention' || peer.status === 'attention' });
   }
   /**
    * Before a group's first lead goes out, the other venue's job is checked too (L100): if its lead could not go out now, this
@@ -1733,17 +1761,18 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       if (stop) { write(() => finish(readJob(job.id), 'stopped', '已停止，未发送任何委托')); return; }
       if (job.peerHalt) { write(() => finish(readJob(job.id), 'stopped', `四腿联动停止（${job.peerHalt}），未发送任何委托`)); return; }
       if (job.holdNewSends) { write(() => finish(readJob(job.id), 'failed', '服务恢复后不再发送新委托')); return; }
-      let quote: Quote;
-      try { quote = await guardLead(job); }
-      catch (error) {
+      // Four legs: the other venue's job is checked alongside (in parallel, so this one's quote stays fresh for the send).
+      const [own, blocked] = await Promise.all([guardLead(job).then(value => ({ value }), (error: unknown) => ({ error })), peerFirstLeadBlocked(job)]);
+      if ('error' in own) {
+        const error = own.error;
         const reason = error instanceof Error ? error.message.slice(0, 200) : '发送前检查失败';
         // A failed read may clear before the deadline; any other refusal ends the job before anything is sent.
         const retry = error instanceof ContractError && (error.code === 'venue_read_failed' || error.code === 'quote_window') || error instanceof ControlRefusal && error.transient;
         if (retry && now() < job.deadlineAt) { write(() => { const current = readJob(job.id); current.reason = reason; saveJob(current); }); return; }
         write(() => finish(readJob(job.id), 'failed', reason, error instanceof ContractError && error.code === 'price_moved' ? 'price_moved' : undefined)); return;
       }
+      const quote = own.value;
       // The other venue's refusal ends that job in its own turn, which halts this one; until then this one only waits.
-      const blocked = await peerFirstLeadBlocked(job);
       if (blocked) { const reason = `四腿另一交易所首腿暂不能发送（${blocked}），本所首腿等待`; write(() => { const current = readJob(job.id); if (current.reason !== reason) { current.reason = reason; saveJob(current); } }); return; }
       try { await sendLead(job, quote, 0, 0); }
       catch (error) {
@@ -2195,7 +2224,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       legs: job.legs.map(leg => {
         const mine = ops.filter(item => item.leg === leg.index).sort((a, b) => attemptOf(a) - attemptOf(b)), op = mine.at(-1), filledQuantity = add('0', ...mine.map(item => item.filledQuantity));
         return { venue: leg.venue, symbol: leg.symbol, side: leg.side, orderSide: leg.orderSide, orderType: leg.orderType, plannedQuantity: leg.quantity, accountId: maskId(leg.accountId), priceBound: leg.priceBound ?? null, limitPrice: leg.limitPrice ?? null,
-          contractSize: leg.instrument.contractSize, quantityStep: leg.instrument.quantityStep, plannedBarrels: exposure(leg.quantity, leg.instrument), filledBarrels: exposure(filledQuantity, leg.instrument), averagePrice: averageOf(mine),
+          contractSize: leg.instrument.contractSize, quantityStep: leg.instrument.quantityStep, fillSlack: isPair(job) ? fillLegs(job)[leg.index]!.slack : leg.instrument.quantityStep, plannedBarrels: exposure(leg.quantity, leg.instrument), filledBarrels: exposure(filledQuantity, leg.instrument), averagePrice: averageOf(mine),
           previewQuote: { bid: leg.quote.bid, ask: leg.quote.ask },
           attempts: mine.length, filledQuantity,
           operation: op ? { kind: op.kind ?? 'order', clientOrderId: op.clientOrderId, state: op.state, quantity: op.request.quantity, limitPrice: (op.request as { limitPrice?: string | null }).limitPrice ?? null, filledQuantity: op.filledQuantity, averagePrice: op.averagePrice, remoteId: op.remoteId,
@@ -2264,7 +2293,11 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         : db.prepare('SELECT id FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?').all(count);
       // A four-leg job whose other job fell outside the limit brings it along, so the page always shows the group whole.
       const views = (rows as { id: string }[]).map(row => jobView(row.id));
-      for (const view of [...views]) if (view.group && !views.some(item => item.id === view.group!.peer)) views.push(jobView(view.group.peer));
+      // A row that is gone is skipped: the page then shows the group as "另一所未列出" rather than no list at all.
+      for (const view of [...views]) {
+        if (!view.group || views.some(item => item.id === view.group!.peer)) continue;
+        try { views.push(jobView(view.group.peer)); } catch (error) { if (!(error instanceof ContractError)) throw error; }
+      }
       return views;
     },
     /** Principal ids are masked: the page needs to tell accounts apart, not to see who they are. */

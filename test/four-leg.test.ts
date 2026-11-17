@@ -8,7 +8,7 @@ import { SIM_ACCOUNTS } from '../src/simulation.ts';
 import type { SimulatedVenue } from '../src/sim-venue.ts';
 import { describeEvent, describeJob, type JobSummary } from '../src/service/feishu.ts';
 import { SESSION, bindAccounts, createHarness, openIntent, previewAndConfirm, type Harness } from './harness.ts';
-import { fillGaps, fillGapText, type FillLeg } from '../src/four-leg-fill.ts';
+import { fillGaps, fillGapText, shortOfPlan, type FillLeg } from '../src/four-leg-fill.ts';
 import { DEFAULT_FORM, describeFourLeg, fourLegFormToIntent, type OilForm } from '../web/src/oil-form.ts';
 import { DEFAULT_HYNIX_FORM, describeHynixFourLeg, hynixFourLegFormToIntent } from '../web/src/hynix-form.ts';
 import { groupJobs, groupStatus } from '../web/src/four-leg.ts';
@@ -290,20 +290,22 @@ test('四腿停止一所时另一所首腿已成交未对冲：另一所只记�
   assert.equal(locks(h).filter(row => row.job_id === ids[1]).length, 0);
 }));
 
-test('四腿一所完成但成交少于计划：另一所联动停止；两边结束后成交不等记一条飞书告警', () => withHarness(async h => {
+test('四腿一所完成但首腿成交实质性少于计划（IOC 只成交一半）：另一所联动停止；两边结束后成交不等记一条飞书告警', () => withHarness(async h => {
   // Binance's local chase rests unfilled; Bybit's market lead fills half and its job completes short.
   h.bybit.inject({ operation: 'place', mode: 'partial', filled: '0.5', times: 1 });
   const { ids, result } = await confirmFour(h, fourIntent({ binanceLead: 'local-chase' }));
   const [binance, bybit] = await settleAll(h, ids);
   assert.equal(bybit!.status, 'completed');
-  assert.match(binance!.peerHalt ?? '', /^Bybit 任务已完成但首腿成交少于计划（0\.5 \/ 1）/);
+  assert.match(binance!.peerHalt ?? '', /^Bybit 任务已完成但首腿成交少于计划（0\.5 \/ 1，可差 0\.1）/);
   assert.equal(binance!.status, 'stopped');
   assert.equal(ordersOf(h.binance).filter(order => order.status === 'new').length, 0, 'Binance 首腿挂单已撤');
   const alerts = h.store.db.prepare("SELECT seq, at, job_id, json FROM events WHERE type = 'four-leg-unbalanced'").all() as { seq: number; at: number; job_id: string; json: string }[];
   assert.equal(alerts.length, 1);
   const message = describeEvent({ seq: alerts[0]!.seq, at: alerts[0]!.at, type: 'four-leg-unbalanced', json: alerts[0]!.json, jobId: alerts[0]!.job_id }, () => null);
   assert.equal(message?.onceKey, `four-leg:${result.group}`);
-  assert.match(message?.text ?? '', /^【四腿成交不等】.*BZ 两所成交不等：Binance 0 \/ 1 桶，Bybit 0\.5 \/ 1 桶.*请到交易所核对两所敞口$/);
+  // With a job needing a person its orders are still being reconciled: the text says the fills are as of the end.
+  assert.match(describeEvent({ seq: 1, at: 0, type: 'four-leg-unbalanced', json: JSON.stringify({ ...JSON.parse(alerts[0]!.json), attention: true }), jobId: alerts[0]!.job_id }, () => null)?.text ?? '', /有任务需人工处理，委托仍在核对，成交以结束时为准/);
+  assert.match(message?.text ?? '', /^【四腿成交不等】.*BZ 两所成交不等：Binance 0 \/ 1 桶，Bybit 0\.5 \/ 1 桶.*（以两个任务结束时为准）；请到交易所核对两所敞口$/);
   const detail = JSON.parse(alerts[0]!.json) as { group: string; details: string[] };
   assert.equal(detail.group, result.group);
   assert.deepEqual(detail.details, ['BZ 两所成交不等：Binance 0 / 1 桶，Bybit 0.5 / 1 桶', 'CL 两所成交不等：Binance 0 / 1 桶，Bybit 0.5 / 1 桶']);
@@ -313,8 +315,8 @@ test('四腿一所完成但成交少于计划：另一所联动停止；两边�
 test('四腿成交比较：按各所计划的成交比例比较，相差在一个下单步长内不算不等；计划非正无法比较', () => {
   // Hynix sizes each venue by notional, so the two venues' plans differ in contracts.
   const legs = (venue: string, [sky, sk]: [string, string], [skyPlan, skPlan] = ['4', '30']): FillLeg[] => [
-    { venue, symbol: 'SKHYUSDT', filled: sky, planned: skyPlan, step: '1', shown: `${sky} / ${skyPlan}` },
-    { venue, symbol: 'SKHYNIXUSDT', filled: sk, planned: skPlan, step: '1', shown: `${sk} / ${skPlan}` },
+    { venue, symbol: 'SKHYUSDT', filled: sky, planned: skyPlan, slack: '1', shown: `${sky} / ${skyPlan}` },
+    { venue, symbol: 'SKHYNIXUSDT', filled: sk, planned: skPlan, slack: '1', shown: `${sk} / ${skPlan}` },
   ];
   assert.deepEqual(fillGaps(legs('Binance', ['4', '30']), legs('Bybit', ['5', '24'], ['5', '24'])), [], '全部成交');
   assert.deepEqual(fillGaps(legs('Binance', ['2', '15']), legs('Bybit', ['3', '12'], ['5', '24'])), [], '同比例部分成交，相差在一步内');
@@ -322,6 +324,11 @@ test('四腿成交比较：按各所计划的成交比例比较，相差在一�
   const gaps = fillGaps(legs('Binance', ['4', '30']), legs('Bybit', ['2', '12'], ['5', '24']));
   assert.deepEqual(gaps.map(fillGapText), ['SKHY 两所成交不等：Binance 4 / 4，Bybit 2 / 5', 'SKHYNIX 两所成交不等：Binance 30 / 30，Bybit 12 / 24']);
   assert.deepEqual(fillGaps(legs('Binance', ['0', '0'], ['0', '30']), legs('Bybit', ['0', '0'])).map(gap => [gap.symbol, gap.comparable]), [['SKHYUSDT', false]]);
+  // A slack that is not a number counts as none: a gap of one contract then shows instead of passing silently.
+  const broken = (venue: string, filled: string): FillLeg[] => [{ venue, symbol: 'SKHYUSDT', filled, planned: '4', slack: 'abc', shown: '' }];
+  assert.equal(fillGaps(broken('Binance', '4'), broken('Bybit', '3')).length, 1);
+  assert.equal(shortOfPlan(broken('Binance', '3')[0]!), true);
+  assert.equal(shortOfPlan({ ...broken('Binance', '3.95')[0]!, slack: '0.081' }), false);
 });
 
 test('四腿任务列表：组内另一任务落在最近 20 条之外时随列表一起返回', () => withHarness(async h => {
@@ -332,4 +339,30 @@ test('四腿任务列表：组内另一任务落在最近 20 条之外时随列�
   const listed = h.ex.recentJobs(20).map(job => job.id);
   assert.equal(listed.length, 21);
   assert.ok(listed.includes(ids[0]!) && listed.includes(ids[1]!));
+  // The other job's row not found (its id pointing nowhere): the list still comes back, with the group's one job.
+  h.store.db.prepare("UPDATE jobs SET json = json_set(json, '$.group.peer', ?) WHERE id = ?").run(randomUUID(), ids[1]!);
+  assert.deepEqual(h.ex.recentJobs(20).filter(job => job.group).map(job => job.id), [ids[1]]);
+}));
+
+test('四腿一所本地追价留下发不出的零头完成：另一所仍在追价不被停，结束后不算成交不等', () => withHarness(async h => {
+  // Binance's local chase fills 0.95 of 1 BZ; the 0.05 left is under the minimum notional with its margin, so the batch ends.
+  // Bybit's chase strategy is still working with nothing filled.
+  h.bybit.inject({ operation: 'strategy-place', mode: 'partial', filled: '0' });
+  const { ids } = await confirmFour(h, { ...fourIntent({ binanceLead: 'local-chase' }), legs: fourIntent({ binanceLead: 'local-chase' }).legs.map((item, index) => index === 2 ? { ...item, orderType: 'chase' } : item) });
+  await tick(h);
+  const resting = ordersOf(h.binance).at(-1)!;
+  h.binance.fillResting(resting.request.clientOrderId, '0.95');
+  // The book moves, so the chase withdraws the 0.05 left resting and finds it too small to send again.
+  h.binance.setBook('BZUSDT', { bid: '74.05', ask: '74.07' });
+  for (let i = 0; i < 10 && h.ex.jobView(ids[0]!).status !== 'completed'; i++) await tick(h);
+  const [binance, bybit] = ids.map(id => h.ex.jobView(id));
+  assert.equal(binance!.status, 'completed');
+  assert.equal(binance!.legs[0]!.filledQuantity, '0.95');
+  assert.deepEqual([bybit!.status, bybit!.peerHalt], ['running', null], 'Bybit 不被联动停止');
+  const strategy = [...h.bybit.strategies.values()].find(item => item.status === 'working')!;
+  h.bybit.fillStrategy(strategy.id, '1');
+  const views = await settleAll(h, ids);
+  assert.deepEqual(views.map(view => view.status), ['completed', 'completed']);
+  assert.equal(h.store.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'four-leg-unbalanced'").get()!.n, 0, '0.05 在可差范围内');
+  assert.equal(locks(h).length, 0);
 }));

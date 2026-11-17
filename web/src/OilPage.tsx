@@ -277,7 +277,7 @@ function FourLegGroup({ jobs, card }: { jobs: OilJob[]; card: (job: OilJob) => R
   const title = `四腿组合 · ${venues} ${first.action === 'open' ? '开仓' : '平仓'}`;
   return <section className="execution-job-group" data-four-leg={first.group?.id} aria-label={`${title} ${overall.text}`}>
     <header><h3>{title} <span className={`execution-badge ${GROUP_BADGE[overall.status]}`}>{overall.text}</span></h3>
-      <p>组 {first.group?.id.slice(0, 8)} · 停止任一所的任务会同时停止另一所；一所未完成时另一所不再发送新的首腿，已成交部分照常对冲。</p></header>
+      <p>组 {first.group?.id.slice(0, 8)} · 停止一所的任务时另一所只停首腿、撤首腿挂单；一所未完成或成交明显少于计划时另一所同样只停首腿，已成交部分照常对冲。</p></header>
     {overall.details.length ? <ul className={`execution-job-group-notes${GROUP_BADGE[overall.status] === 'attention' ? ' warning' : ''}`} role={GROUP_BADGE[overall.status] === 'attention' ? 'alert' : undefined}>{overall.details.map(text => <li key={text}>{text}</li>)}</ul> : null}
     {jobs.map(card)}
   </section>;

@@ -66,17 +66,19 @@ export function createMarketReader({ connectors, accounts, symbols, now = Date.n
       const target = slot(connector.venue, symbol);
       // A pushed book never moves a leg back in time, nor lands before the leg's last failed read: both are host times (a REST
       // read may have landed after the venue time of the pushed book), and the page reads a failure as failedAt > receivedAt.
-      // A failing lookup counts as no pushed book.
+      // A failing lookup counts as no pushed book. A failed REST read is dated when it started: a read that times out lands
+      // MARKET_TIMEOUT_MS later, and dating it then would leave a pushed book only the half-second gap before the next round.
       let book: PushedBook | null = null;
       try { book = pushed?.(connector.venue, symbol) ?? null; } catch { book = null; }
       if (book && book.at >= Math.max(target.receivedAt ?? -Infinity, target.failedAt ?? -Infinity)) {
         Object.assign(target, { bid: book.bid, ask: book.ask, receivedAt: book.at, source: 'pushed', error: null });
         return;
       }
+      const startedAt = now();
       try {
         const quote = parseQuote(await bounded(signal => connector.quote(symbol, { signal }), quoteTimeoutMs), connector.venue, symbol);
         Object.assign(target, { bid: quote.bid, ask: quote.ask, receivedAt: quote.receivedAt, source: 'rest', error: null });
-      } catch (error) { Object.assign(target, { failedAt: now(), error: message(error) }); }
+      } catch (error) { Object.assign(target, { failedAt: startedAt, error: message(error) }); }
     })));
     quotesReadAt = now();
   }

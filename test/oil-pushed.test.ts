@@ -42,13 +42,14 @@ test('推送盘口可用性：两边齐全且买一 < 卖一、乘数为 1、交
 /** A REST connector that counts its book reads. */
 function restVenue(venue: 'binance' | 'bybit' | 'okx', clock: { now: number }, prices: Record<string, [string, string]>) {
   const reads: string[] = [], failing = new Set<string>();
+  let slowFailMs = 0;
   return {
-    reads, failing,
+    reads, failing, slow(ms: number) { slowFailMs = ms; },
     connector: {
       venue,
       quote: async (symbol: string) => {
         reads.push(symbol);
-        if (failing.has(symbol)) throw new Error('读取超时');
+        if (failing.has(symbol)) { clock.now += slowFailMs; throw new Error('读取超时'); }
         const [bid, ask] = prices[symbol] ?? ['1', '2'];
         return { venue, symbol, bid, ask, sourceTime: null, receivedAt: clock.now, connectionGeneration: 0, sequence: null, complete: true };
       },
@@ -92,7 +93,7 @@ test('读取器：推送盘口可用的腿不发 REST、盘口时刻记交易所
   assert.deepEqual(hynix.view().books.map(row => [row.symbol, row.bid, row.source]), [['SKHYUSDT', '120.5', 'pushed'], ['SKHYNIXUSDT', '11.1', 'pushed']]);
 });
 
-test('读取器：REST 失败后，早于失败时刻的推送盘口不用（页面与规则对同一条腿判断一致）；推送查询抛错当作没有推送', async () => {
+test('读取器：REST 失败（超时按读取开始时刻）后，早于失败时刻的推送盘口不用（页面与规则对同一条腿判断一致）；推送查询抛错当作没有推送', async () => {
   const clock = { now: NOW };
   const books: Record<string, CollectorBook> = {};
   const rest = restVenue('binance', clock, { BZUSDT: ['74.00', '74.05'] });
@@ -120,6 +121,17 @@ test('读取器：REST 失败后，早于失败时刻的推送盘口不用（页
   clock.now += 500;
   await market.refreshQuotes();
   assert.deepEqual([bz().source, bz().error, broken()], ['pushed', null, false], '失败之后的推送盘口：采用，页面不再显示失败');
+  // A read that times out: dated when it started, so a book pushed during the wait is taken next round.
+  delete books['binance:BZUSDT'];
+  rest.failing.add('BZUSDT'); rest.slow(3_000);
+  const started = clock.now;
+  await market.refreshQuotes();
+  assert.deepEqual([bz().failedAt, broken()], [started, true], '超时失败记读取开始时刻');
+  books['binance:BZUSDT'] = at({ at: started + 1_500 });
+  clock.now += 500;
+  await market.refreshQuotes();
+  assert.deepEqual([bz().source, broken()], ['pushed', false], '超时等待期间的推送盘口：下一轮采用');
+  rest.slow(0);
   throwing = true; rest.failing.clear();
   const before = rest.reads.length;
   clock.now += 1_000;

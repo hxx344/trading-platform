@@ -50,14 +50,21 @@ function fixture(options = {}) {
     async orderByClientId(clientId) { v.calls.push(['lookup', clientId]); if (v.lookupError) throw v.lookupError; const found = v.orders.find(order => order.clientId === clientId) ?? v.history.get(clientId); return found ? { ...found } : null; },
     async openOrders() { v.calls.push(['open']); if (v.readError) throw v.readError; return v.orders.map(order => ({ ...order })); },
     async positions({ details = false } = {}) { v.calls.push(['positions']); await v.positionsGate; if (v.positionsError) throw v.positionsError;
-      return details ? new Map([...v.positions].map(([name, size]) => [name, { size, entryPrice: v.entries.get(name) ?? '200' }])) : new Map(v.positions); },
+      if (details) return new Map([...v.positions].map(([name, size]) => [name, { size, entryPrice: v.entries.get(name) ?? '200' }]));
+      const snapshot = new Map(v.positions); v.afterPreflight?.(); return snapshot; },
     close() {},
   });
-  const streamFactory = input => { f.stream = input; return { start() {}, close() { f.streamClosed += 1; }, status: () => ({ connected: true, publicReady: true, privateReady: !!input.credentials && f.privateReady, deadManReady: !!input.credentials && f.deadManReady !== false, lastFrameAt: f.time, error: null }) }; };
+  const streamFactory = input => {
+    f.stream = input;
+    return { start() {}, close() { f.streamClosed += 1; },
+      expireOrders(verified) { if (f.deadManReady !== false) { f.expiry = verified; f.deadManReady = false; } },
+      status: () => ({ connected: true, publicReady: true, privateReady: !!input.credentials && f.privateReady,
+        deadManReady: !!input.credentials && f.deadManReady !== false, lastFrameAt: f.time, error: null }) };
+  };
   const mm = createOndoMarketMaker({ dataDir, readCredentials: () => f.key, log: silent, now: () => f.time, intervalMs: 0, clientFactory, streamFactory,
     readMaintenance: () => f.maintenance, readAdmission: () => f.admission, sleep: async ms => { f.time += ms; }, ...options.manager });
   const levels = rows => rows.map(([price, size]) => [u(price), u(size)]);
-  f.push = (bids = BIDS, asks = ASKS) => { f.book = [bids, asks]; f.stream.onBook(MARKET, { time: f.time, bids: levels(bids), asks: levels(asks) }, f.time); };
+  f.push = (bids = BIDS, asks = ASKS, source = f.time) => { f.book = [bids, asks]; f.stream.onBook(MARKET, { time: source, bids: levels(bids), asks: levels(asks) }, f.time); };
   f.rounds = async (n = 1, ms = 300) => { for (let i = 0; i < n; i++) { f.time += ms; if (f.book && !f.frozen) f.push(...f.book); await mm.tick(); } };
   f.resting = () => v.orders.map(order => `${order.side} ${order.size}@${order.price}${order.reduceOnly ? ' close' : ''}`).sort();
   f.live = async (extra = {}) => {
@@ -172,6 +179,64 @@ test('a recovered wall cannot release a queued opening or leave an already-sent 
   }
 });
 
+test('canceled size in an old depth cannot fund a new opening, including duplicate and delayed venue frames', async () => {
+  for (const venueTimestamp of [true, false]) {
+    const { f, v, mm } = fixture();
+    await f.live({ wallUsd: '5000' });
+    const old = v.orders.find(order => order.side === 'buy');
+    const bids = [['199.95', '25'], ['199.93', old.size]], asks = [['199.96', '100']];
+    f.time += 10;
+    const changed = f.time, through = changed + (venueTimestamp ? 400 : 1500);
+    v.onCancel = order => venueTimestamp ? { ...order, canceledAt: through } : order;
+    f.push(bids, asks); await mm.tick();
+    assert.ok(!v.orders.some(order => order.side === 'buy'));
+    for (const source of [changed, changed + 1, through]) {
+      f.time = Math.max(f.time + 100, source);
+      f.push(bids, asks, source); await mm.tick();
+      assert.ok(!v.orders.some(order => order.side === 'buy'));
+      assert.equal(f.market().buy.reason, 'unprotected');
+    }
+    f.time += 1; f.push(bids, asks, through + 1); await mm.tick();
+    assert.equal(v.orders.find(order => order.side === 'buy')?.price, '199.87');
+    assert.equal(f.market().buy.protection, '5098.715');
+  }
+});
+
+test('the queued replacement rechecks external depth with the canceled amount still deducted', async () => {
+  const { f, v, mm } = fixture();
+  await f.live({ wallUsd: '5000' });
+  const old = v.orders.find(order => order.side === 'buy'), asks = [['199.96', '100']];
+  let queued;
+  v.beforeSend = input => {
+    if (input.side !== 'buy') return;
+    queued = input.clientOrderId;
+    f.time += 1;
+    f.push([['199.95', '25'], ['199.93', old.size]], asks);
+  };
+  f.time += 1; f.push([['199.95', '26'], ['199.93', old.size]], asks);
+  await mm.tick();
+  assert.ok(queued);
+  assert.ok(!v.calls.some(([method, order]) => method === 'place' && order.clientOrderId === queued));
+});
+
+test('a terminal lookup after an open-order disappearance retains its old depth debit', async () => {
+  const { f, v, mm } = fixture();
+  await f.live({ wallUsd: '5000' });
+  const old = v.orders.find(order => order.side === 'buy');
+  v.orders = v.orders.filter(order => order !== old);
+  const settled = f.time + 1800;
+  v.history.set(old.clientId, { ...old, status: 'canceled', canceledAt: settled });
+  f.stream.onPrivate('ordersPerps', [{ market: MARKET, clientOrderId: old.clientId, status: 'canceled', filledSize: '0', cancelReason: 'user' }]);
+  f.time += 1100; f.push(); await mm.tick();
+  f.time += 5;
+  const bids = [['199.95', '25'], ['199.93', old.size]], asks = [['199.96', '100']];
+  f.push(bids, asks); await mm.tick();
+  assert.ok(v.calls.some(([method, id]) => method === 'lookup' && id === old.clientId));
+  f.time += 1001; f.push(bids, asks, settled); await mm.tick(); await mm.tick();
+  assert.equal(f.market().buy.reason, 'unprotected');
+  assert.ok(!v.orders.some(order => order.side === 'buy'));
+});
+
 test('a one-sided frame invalidates both openings even if a full snapshot follows immediately', async () => {
   const { f, v } = fixture();
   await f.live();
@@ -215,6 +280,92 @@ test('private data without the venue dead-man acknowledgement cannot authorize a
   assert.equal(v.orders.length, 2);
   f.deadManReady = false; await f.rounds();
   assert.equal(f.market().hold, 'dead_man_switch'); assert.deepEqual(v.orders, []);
+});
+
+test('a stale stop from another tab cannot stop a newer live session', async () => {
+  const { f, v, mm } = fixture();
+  mm.initialize();
+  const observed = await mm.start({ revision: 0 });
+  await mm.stop({ sessionId: observed.sessionId, live: false });
+  await f.live();
+  await assert.rejects(mm.stop({ sessionId: observed.sessionId, live: false }), status(409));
+  await assert.rejects(mm.stop({}), status(409));
+  assert.equal(mm.state().live, true); assert.equal(v.orders.length, 2);
+  await mm.stop({ sessionId: mm.state().sessionId, live: true });
+  assert.equal(v.orders.length, 0);
+});
+
+test('an out-of-scope legacy quote appearing after startup cannot keep the account heartbeat alive', async () => {
+  const { f, v, mm } = fixture();
+  await f.live({ wallUsd: '1000000' }); assert.equal(v.orders.length, 0);
+  v.orders.push({ market: 'TSLA-USD.P', id: 'stray', clientId: 'tpo-older-1', side: 'buy', size: '1', price: '300', filled: '0', status: 'open', reduceOnly: false });
+  v.cancelError = new OndoError('timeout', { uncertain: true });
+  await f.rounds(6, 1000);
+  assert.equal(mm.state().stream.deadManReady, false); assert.equal(f.expiry(), false);
+  v.orders = []; await f.rounds(7, 1000); assert.equal(f.expiry(), true);
+  assert.equal(mm.state().incident.market, 'TSLA-USD.P');
+});
+
+test('a foreign private order stops renewal while REST is down; a new order invalidates even an earlier all-clear', async () => {
+  const { f, v, mm } = fixture();
+  await f.live({ wallUsd: '1000000' });
+  const stray = { market: 'TSLA-USD.P', clientOrderId: 'tpo-older-1', orderId: 'stray1', status: 'open', filledSize: '0' };
+  v.readError = new OndoError('network'); f.stream.onPrivate('ordersPerps', [stray]);
+  assert.equal(mm.state().stream.deadManReady, false);
+  const canReconnect = f.expiry; assert.equal(canReconnect(), false);
+  v.readError = null; await f.rounds(6, 1000); assert.equal(canReconnect(), true);
+
+  let release;
+  v.positionsGate = new Promise(r => { release = r; });
+  v.orders.push({ market: stray.market, clientId: stray.clientOrderId, id: stray.orderId, side: 'buy', size: '1', price: '300', filled: '0', status: 'open', reduceOnly: false });
+  f.time += 6000; const nonempty = mm.tick();
+  await new Promise(r => setImmediate(r));
+  assert.equal(canReconnect(), false, 'the order list arrives before the pending positions read');
+  release(); await nonempty;
+  v.orders = []; await f.rounds(6, 1000); assert.equal(canReconnect(), true);
+
+  v.positionsGate = new Promise(r => { release = r; });
+  f.time += 6000; const oldEmpty = mm.tick();
+  await new Promise(r => setImmediate(r)); f.stream.onPrivate('ordersPerps', [stray]);
+  release(); await oldEmpty;
+  assert.equal(canReconnect(), false, 'a flat snapshot started before the new private order is not authoritative');
+  await f.rounds(3, 1000); assert.equal(canReconnect(), true);
+});
+
+test('an untracked open order freezes quotes before its apparent liquidity can provide protection', async () => {
+  const { f, mm, count } = fixture();
+  await f.live({ wallUsd: '5000' }); const placed = count('place');
+  f.stream.onPrivate('ordersPerps', [{ market: MARKET, clientOrderId: 'manual', orderId: 'other', status: 'open', filledSize: '0' }]);
+  f.push([['200', '25']], [['200.04', '25']]); await f.rounds(5);
+  assert.match(mm.state().incident.reason, /其他永续挂单/); assert.equal(count('place'), placed); assert.deepEqual(f.resting(), []);
+});
+
+test('repeated failed cancellations stop the heartbeat even when private data is flowing', async () => {
+  const { f, v, mm } = fixture();
+  await f.live(); v.cancelError = new OndoError('cancel_refused', { status: 400 });
+  f.stream.onPrivate('fillsPerps', [{ market: MARKET, side: 'buy', size: '0.1', price: '199.93' }]);
+  await f.rounds(6, 1100);
+  assert.equal(mm.state().stream.deadManReady, false); assert.equal(f.expiry(), false);
+  v.cancelError = null; v.orders = []; await f.rounds(18, 1100);
+  assert.equal(f.expiry(), true); assert.ok(mm.state().incident);
+});
+
+test('adopting a known position permits only reductions even if the next REST snapshot is flat', async () => {
+  const { f, v, mm, count } = fixture();
+  f.key = KEY; mm.initialize(); mm.save(config());
+  v.positions.set(MARKET, '0.1'); v.afterPreflight = () => v.positions.clear();
+  await mm.start({ revision: 1, confirmLive: true, confirmAccountWide: true, adoptPositions: true });
+  f.push(); await f.rounds(5);
+  assert.ok(mm.state().incident); assert.equal(count('place'), 0);
+});
+
+test('an ambiguous withdrawal with both lookup and REST offline cannot keep the venue timer alive', async () => {
+  const { f, v, mm } = fixture();
+  await f.live();
+  v.cancelError = new OndoError('timeout', { uncertain: true });
+  v.lookupError = v.readError = new OndoError('network');
+  f.push([], []); await f.rounds(17, 1000);
+  assert.equal(mm.state().stream.deadManReady, false); assert.equal(f.expiry(), false);
 });
 
 test('a fill locks all new exposure, including after the maker close brings the account back to flat', async () => {
@@ -534,6 +685,28 @@ test('a stop that cannot be confirmed keeps trying and blocks an update', async 
   assert.equal(mm.state().phase, 'stopped'); assert.deepEqual(v.orders, []);
 });
 
+test('a flat snapshot from before stop cannot complete a stop while REST is unavailable', async () => {
+  const { f, v, mm } = fixture();
+  await f.live({ wallUsd: '1000000' }); await f.rounds(6, 1000);
+  assert.equal(v.orders.length, 0);
+  v.readError = new OndoError('network');
+  assert.equal((await mm.stop()).phase, 'stopping');
+  assert.equal(JSON.parse(readFileSync(join(f.dataDir, 'ondo-mm/session.json'))).interrupted, true);
+  v.readError = null; assert.equal((await mm.stop()).phase, 'stopped');
+  assert.equal(existsSync(join(f.dataDir, 'ondo-mm/session.json')), false);
+});
+
+test('a process lost before open-order settlement requires manual reconciliation across flat reads', async () => {
+  const { f, mm } = fixture(); await f.live(); await mm.close(0);
+  const file = join(f.dataDir, 'ondo-mm/session.json');
+  assert.equal(JSON.parse(readFileSync(file)).interrupted, true);
+  const again = fixture({ dataDir: f.dataDir, key: KEY });
+  again.mm.initialize(); await again.mm.cleanup(); await again.mm.cleanup();
+  assert.equal(again.mm.state().recovery.error, 'position_unconfirmed'); assert.equal(existsSync(file), true);
+  await assert.rejects(again.mm.start({ revision: 1, confirmLive: true, confirmAccountWide: true }), status(409));
+  again.mm.discardRecovery(); assert.equal(existsSync(file), false);
+});
+
 test('an order that appears after its cancel was thought done is found by the closing account read', async () => {
   const { f, v, mm } = fixture();
   await f.live();
@@ -557,8 +730,9 @@ test('a restart does not resume: it withdraws what the last live session left an
   assert.equal(mm.state().phase, 'stopped'); assert.ok(mm.state().recovery);
   await mm.cleanup();
   assert.deepEqual(v.orders.map(order => order.id), ['manual1', 'workbench1']);
-  assert.equal(mm.state().recovery, null); assert.equal(count('place'), 0);
-  assert.equal(existsSync(join(f.dataDir, 'ondo-mm', 'session.json')), false);
+  assert.equal(mm.state().recovery.error, 'position_unconfirmed'); assert.equal(count('place'), 0);
+  assert.equal(existsSync(join(f.dataDir, 'ondo-mm', 'session.json')), true);
+  mm.discardRecovery();
   await mm.prepareStop();
 });
 
@@ -570,9 +744,91 @@ test('a fill during an outage is reported on recovery even when the dead-man swi
   mm.initialize(); await mm.cleanup();
   assert.equal(mm.state().recovery.error, 'positions_remain'); assert.ok(existsSync(join(dir, 'session.json')));
   assert.deepEqual(mm.state().leftPositions, [{ market: MARKET, position: '-0.5' }]);
-  assert.match(alerts[0].text, /NVDA-USD\.P -0\.5/); assert.equal(count('place'), 0);
+  assert.ok(alerts.some(alert => /NVDA-USD\.P -0\.5/.test(alert.text))); assert.equal(count('place'), 0);
   v.positions.clear(); await mm.cleanup();
-  assert.equal(mm.state().recovery, null); assert.deepEqual(mm.state().leftPositions, []); assert.equal(count('place'), 0);
+  assert.equal(mm.state().recovery.error, 'position_unconfirmed'); assert.deepEqual(mm.state().leftPositions, []); assert.equal(count('place'), 0);
+});
+
+test('restart cleanup records the original cancellation before DELETE and keeps its fill pending across another restart', async () => {
+  const other = 'TSLA-USD.P';
+  for (const outcome of ['partial', 'already_filled', 'already_fully_filled', 'lost_reply']) {
+    const { f, v, mm } = fixture({ key: KEY });
+    const dir = join(f.dataDir, 'ondo-mm'), file = join(dir, 'session.json');
+    mkdirSync(dir); writeFileSync(file, JSON.stringify({ startedAt: '2026-11-12T00:00:00.000Z', interrupted: false }));
+    v.orders.push({ id: 'left1', clientId: 'tpo-dead-1', market: MARKET, side: 'buy', price: '200', size: '0.5', filled: '0', status: 'open', reduceOnly: false });
+    let beforeDelete;
+    v.onCancel = order => {
+      beforeDelete = JSON.parse(readFileSync(file, 'utf8')).canceling;
+      if (outcome === 'partial') return { ...order, filled: '0.1' };
+      if (outcome === 'lost_reply') throw new OndoError('timeout', { uncertain: true });
+      throw new OndoError(`order_${outcome}`);
+    };
+    v.positions.set(other, '2');
+    mm.initialize(); await mm.cleanup();
+    assert.equal(beforeDelete?.clientId, 'tpo-dead-1', outcome);
+    assert.equal(mm.state().recovery?.error, 'positions_remain', outcome);
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).unconfirmed, [MARKET], outcome);
+    await mm.close();
+    const notices = [], again = fixture({ dataDir: f.dataDir, key: KEY, manager: { notifyRisk: (_key, text) => notices.push(text) } });
+    again.mm.initialize(); await again.mm.cleanup();
+    assert.equal(again.mm.state().recovery?.error, 'position_unconfirmed', outcome);
+    assert.ok(notices.some(text => text.includes(MARKET)), outcome);
+    await again.mm.cleanup(); assert.ok(existsSync(file), outcome);
+    again.v.positions.set(MARKET, '0.1'); await again.mm.cleanup();
+    assert.deepEqual(again.mm.state().leftPositions, [{ market: MARKET, position: '0.1' }], outcome);
+    again.v.positions.clear(); await again.mm.cleanup();
+    assert.equal(again.mm.state().recovery, null, outcome); assert.equal(again.count('place'), 0);
+  }
+});
+
+test('a normal stop and an expedited process close both leave durable evidence for late positions, including outside the selected markets', async () => {
+  const other = 'TSLA-USD.P';
+  for (const expedited of [false, true]) {
+    const { f, v, mm } = fixture();
+    await f.live();
+    if (!expedited) {
+      v.positions.set(other, '-2');
+      f.stream.onPrivate('positionsPerps', [{ market: other, direction: 'short', netQuantity: '2' }]);
+      await f.rounds(8);
+    }
+    f.stream.onPrivate('fillsPerps', [{ market: MARKET, direction: 'openLong', side: 'buy', size: '0.1', price: '200' }]);
+    if (!expedited) {
+      const stopped = await mm.stop();
+      assert.equal(stopped.phase, 'stopped'); assert.deepEqual(stopped.leftPositions, [{ market: other, position: '-2' }]);
+    }
+    await mm.close(0);
+    const notices = [], again = fixture({ dataDir: f.dataDir, key: KEY, manager: { notifyRisk: (_key, text) => notices.push(text) } });
+    again.mm.initialize(); await again.mm.cleanup();
+    assert.equal(again.mm.state().recovery?.error, 'position_unconfirmed');
+    assert.ok(notices.some(text => text.includes(MARKET)));
+    if (!expedited) assert.ok(notices.some(text => text.includes(other)));
+    await assert.rejects(again.mm.start({ revision: 1, confirmLive: true, confirmAccountWide: true }), status(409));
+    again.mm.discardRecovery(); assert.equal(again.mm.state().recovery, null);
+  }
+});
+
+test('a process that dies during DELETE resumes by the recorded order identity before settling the account', async () => {
+  for (const knownCanceled of [false, true]) {
+    const { f, v, mm, count } = fixture({ key: KEY });
+    const dir = join(f.dataDir, 'ondo-mm'); mkdirSync(dir);
+    const canceling = { id: 'o1', clientId: 'tpo-dead-3', market: MARKET, side: 'sell', price: '200', size: '1', reduceOnly: false };
+    writeFileSync(join(dir, 'session.json'), JSON.stringify({ interrupted: false, canceling }));
+    if (knownCanceled) v.history.set(canceling.clientId, { ...canceling, status: 'canceled', filled: '0' });
+    mm.initialize(); await mm.cleanup();
+    assert.deepEqual(v.calls.filter(call => call[0] === 'lookup'), [['lookup', canceling.clientId]]);
+    assert.equal(count('cancel'), 0); assert.equal(count('place'), 0);
+    assert.equal(mm.state().recovery?.error ?? null, knownCanceled ? null : 'position_unconfirmed');
+  }
+});
+
+test('cleanup catches a late position in its second flat-account read even without an earlier fill receipt', async () => {
+  let venue;
+  const { f, v, mm } = fixture({ key: KEY, manager: { sleep: async () => { venue.positions.set(MARKET, '0.2'); } } });
+  venue = v;
+  const dir = join(f.dataDir, 'ondo-mm'); mkdirSync(dir); writeFileSync(join(dir, 'session.json'), JSON.stringify({ interrupted: false }));
+  mm.initialize(); await mm.cleanup();
+  assert.equal(mm.state().recovery?.error, 'positions_remain');
+  assert.deepEqual(mm.state().leftPositions, [{ market: MARKET, position: '0.2' }]);
 });
 
 test('leftovers that cannot be withdrawn stay reported and block an update', async () => {
@@ -589,6 +845,7 @@ test('leftovers that cannot be withdrawn stay reported and block an update', asy
   await assert.rejects(mm.start({ revision: mm.state().revision, confirmLive: true, confirmAccountWide: true }), status(409));
   v.readError = null;
   await mm.cleanup();
+  assert.equal(mm.state().recovery.error, 'position_unconfirmed'); mm.discardRecovery();
   assert.equal(mm.state().recovery, null);
 });
 

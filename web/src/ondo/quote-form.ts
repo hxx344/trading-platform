@@ -1,4 +1,4 @@
-import type { OndoMmConfig } from './ondo-mm-types.ts';
+import type { OndoMmConfig, OndoMmSnapshot } from './ondo-mm-types.ts';
 
 const decimalIn = (value: string, min: number, max: number) =>
   /^\d{1,9}(?:\.\d{1,4})?$/.test(value) && Number(value) >= min && Number(value) <= max;
@@ -15,6 +15,12 @@ export function quoteStartRequest(mode: OndoMmConfig['mode'], revision: number, 
   if (mode === 'observe') return { revision };
   if (confirmedRevision !== revision) return null;
   return { revision, confirmLive: true, confirmAccountWide: true, adoptPositions };
+}
+
+export type OndoStopRequest = { sessionId: string; live: boolean };
+export function quoteStopRequest(snapshot: Pick<OndoMmSnapshot, 'phase' | 'sessionId' | 'live'> | null): OndoStopRequest | null {
+  if (!snapshot || snapshot.phase === 'stopped' || !snapshot.sessionId) return null;
+  return { sessionId: snapshot.sessionId, live: snapshot.live };
 }
 
 export const ACCOUNT_WIDE_CONFIRMATION = '我使用专用永续账户。账户任一市场已有外部挂单时拒绝启动。交易所连续 30 秒收不到本服务的心跳，将撤销这个账户的全部永续挂单。';

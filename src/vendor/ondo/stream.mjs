@@ -56,6 +56,7 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
   let socket = null, era = 0, closed = false, started = false, failures = 0, lastFrame = 0, error = null;
   let open = false, loggedIn = false, subscribed = new Set();
   let heartbeatAckAt = null, armingAttempted = false;
+  let resumeAfterExpiry = null;
   const timers = new Set();
   let retryTimer = null;
 
@@ -149,6 +150,11 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
   }
   function connect() {
     if (closed || socket) return;
+    if (resumeAfterExpiry && !resumeAfterExpiry()) {
+      retryTimer = schedule(() => { retryTimer = null; connect(); }, 1000);
+      return;
+    }
+    resumeAfterExpiry = null;
     if (typeof WebSocketImpl !== 'function') { error = 'unsupported'; return; }
     const current = ++era;
     let ws;
@@ -182,6 +188,11 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
   }
   return {
     start() { if (!started && !closed) { started = true; connect(); } },
+    expireOrders(confirmedClear) {
+      if (closed || !credentials) return;
+      resumeAfterExpiry ??= confirmedClear;
+      if (socket) fail('cancel_unconfirmed');
+    },
     status: () => ({ connected: open, publicReady: open && publicReady(), privateReady: open && privateReady(), deadManReady: open && deadManReady(), lastFrameAt: lastFrame || null, error }),
     close() {
       if (closed) return;

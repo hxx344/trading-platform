@@ -11,7 +11,7 @@ import { useLiveResource } from '../use-live-resource.ts';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { OndoObservationPanel } from './OndoObservation.tsx';
 import { OndoRewards } from './OndoRewards.tsx';
-import { ACCOUNT_WIDE_CONFIRMATION, exitSummary, quoteConfigRequest, quoteStartRequest } from './quote-form.ts';
+import { ACCOUNT_WIDE_CONFIRMATION, exitSummary, quoteConfigRequest, quoteStartRequest, quoteStopRequest, type OndoStopRequest } from './quote-form.ts';
 
 const ROOT = '/api/ondo';
 export const ONDO_STATE_PATH = `${ROOT}/state`;
@@ -34,7 +34,8 @@ const dates = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit
 const when = (value: string | number | null) => { const ms = typeof value === 'number' ? value : value ? Date.parse(value) : NaN; return Number.isFinite(ms) ? dates.format(ms) : '—'; };
 const message = (reason: unknown) => reason instanceof Error ? reason.message : '请求失败，请重试。';
 const marketList = (text: string) => text.split(/[\s,，、]+/).filter(Boolean).map(item => item.toUpperCase());
-const stopNotice = (mode: 'observe' | 'live') => mode === 'observe' ? '观察已停止，本次统计已保留。' : '实盘已停止，已核对本模块挂单。请核实账户余仓。';
+const stopNotice = (live: boolean) => live ? '实盘已停止，已核对本模块挂单。请核实账户余仓。' : '观察已停止，本次统计已保留。';
+const STOP_SESSION_CHANGED = '会话已变化，本次请求未停止新会话。请核对刷新后的运行状态。';
 
 function SideCell({ side }: { side: OndoMmSide }) {
   if (side.state === 'none') return <td><span className="muted">未挂</span>{side.reason ? <small>{REASONS[side.reason] ?? side.reason}</small> : null}</td>;
@@ -51,7 +52,7 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
   const [marketsText, setMarketsText] = useState('');
   const [confirmedRevision, setConfirmedRevision] = useState<number | null>(null);
   const [adoptPositions, setAdoptPositions] = useState(false);
-  const [stopPending, setStopPending] = useState<'live' | 'observe' | null>(null);
+  const [stopPending, setStopPending] = useState<OndoStopRequest | null>(null);
   const [busy, setBusy] = useState('');
   const [actionError, setActionError] = useState('');
   const [notice, setNotice] = useState('');
@@ -85,7 +86,7 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
     const controller = new AbortController(); lifetime.current = controller;
     return () => { controller.abort(); };
   }, []);
-  const execute = async (name: string, path: string, method: 'POST' | 'PUT', body: unknown, done: string, replace: () => boolean | undefined = () => undefined, timeoutMs = 30_000) => {
+  const execute = async (name: string, path: string, method: 'POST' | 'PUT', body: unknown, done: string, replace: () => boolean | undefined = () => undefined, timeoutMs = 30_000): Promise<{ data: OndoMmSnapshot } | { error: unknown } | null> => {
     const signal = lifetime.current?.signal;
     if (!signal || signal.aborted || busyRef.current) return null;
     busyRef.current = true;
@@ -93,9 +94,14 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
     try {
       const data = await api<OndoMmSnapshot>(ROOT + path, { method, body, signal, timeoutMs });
       if (signal.aborted) return null;
+      if (!data.config) throw new Error('服务应答缺少挂单状态，正在重新读取。');
       accept(data, replace()); resource.commit(data); setNotice(done);
-      return data;
-    } catch (reason) { if (!signal.aborted) { fail(reason, setActionError); void resource.refresh(); } return null; }
+      return { data };
+    } catch (error) {
+      if (signal.aborted) return null;
+      fail(error, setActionError); void resource.refresh();
+      return { error };
+    }
     finally { busyRef.current = false; if (!signal.aborted) setBusy(''); }
   };
   const change = (next: Partial<OndoMmConfig>) => setDraft(current => current && { ...current, ...next });
@@ -119,24 +125,36 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
     }
     await execute('start', '/start', 'POST', body, live ? '实盘会话已启动' : '观察已启动');
   };
+  const stopRequest = quoteStopRequest(snapshot);
   const stop = async () => {
-    // 停止要等交易所确认没有遗留挂单，最长约 20 秒；超时后服务器继续撤单。
-    const stopped = await execute('stop', '/stop', 'POST', {}, '', undefined, 60_000);
-    // 请求本身失败时服务器可能仍在撤单：撤完后同样清掉提示。
-    const mode = snapshot?.live ? 'live' : 'observe';
-    if (!stopped) { setStopPending(mode); return; }
-    if (stopped.phase === 'stopped') setNotice(stopNotice(mode));
-    else { setStopPending(mode); setActionError('撤单尚未得到交易所确认，服务器仍在继续撤单。请留意下方状态，必要时到 Ondo 手动撤单。'); }
+    if (!stopRequest || busyRef.current) return;
+    setStopPending(null);
+    const result = await execute('stop', '/stop', 'POST', stopRequest, '', undefined, 60_000);
+    if (!result) return;
+    if ('error' in result) {
+      if (result.error instanceof ApiError) {
+        if (result.error.status === 409) setActionError(STOP_SESSION_CHANGED);
+      } else setStopPending(stopRequest); // 网络中断时仍需核对原会话。
+      return;
+    }
+    if (result.data.phase === 'stopped') setNotice(stopNotice(stopRequest.live));
+    else if (result.data.sessionId === stopRequest.sessionId && result.data.live === stopRequest.live) {
+      setStopPending(stopRequest); setActionError('停止尚未完成，服务器仍在核对挂单。请留意下方状态。');
+    } else setActionError(STOP_SESSION_CHANGED);
   };
-  // 服务器在后台撤完后，上面的提示不再成立。
+  // 只跟踪用户点停止时看到的会话。应答未知时，轮询只能确认当前状态。
   useEffect(() => {
-    if (!stopPending || snapshot?.phase !== 'stopped') return;
-    setActionError(''); setNotice(stopNotice(stopPending)); setStopPending(null);
-  }, [stopPending, snapshot?.phase]);
+    if (!stopPending || !snapshot) return;
+    if (snapshot.phase === 'stopped') {
+      setActionError(''); setNotice('当前没有运行中的会话。请以最近核对的状态为准。');
+    } else if (snapshot.sessionId !== stopPending.sessionId || snapshot.live !== stopPending.live) setActionError(STOP_SESSION_CHANGED);
+    else return;
+    setStopPending(null);
+  }, [stopPending, snapshot]);
 
   const cleanup = async () => {
     const checked = await execute('cleanup', '/cleanup', 'POST', {}, '', undefined, 60_000);
-    if (checked && !checked.recovery) setNotice('已完成上次实盘的恢复核对。');
+    if (checked && 'data' in checked && !checked.data.recovery) setNotice('已完成上次实盘的恢复核对。');
   };
   const discard = () => {
     if (window.confirm('请先在 Ondo 核实已撤清本模块挂单，并确认剩余仓位由你自行处理。现在结束上次会话的恢复跟踪？实盘须另行手动启动。')) {
@@ -151,7 +169,7 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
   const startBlock = !snapshot ? '' : dirty ? '请先保存设置' : liveSaved && !snapshot.credentials.configured ? '没有配置 API Key' : liveSaved && snapshot.paused ? snapshot.pauseReason ?? '挂单已暂停' : liveSaved && recovery ? '请先核对上次实盘的挂单与余仓' : liveSaved && !confirmLive ? '请先勾选实盘确认' : '';
   const heading = <header className="wb-heading"><div><h1>Ondo 挂单奖励</h1><p>观察奖励区间的盘口与触价频率。实盘仅在前方保护量充足时挂 Maker 开仓单，成交后暂停开仓并处理持仓。</p></div><div className="wb-toolbar">
     <button className="button secondary" disabled={!!busy} onClick={() => void resource.refresh()}><RefreshCw size={15} />刷新</button>
-    {active ? <button className="button primary" disabled={!!busy} onClick={() => void stop()}>{busy === 'stop' ? <LoaderCircle size={15} className="spin" /> : <Square size={15} />}{snapshot?.phase === 'stopping' ? '继续停止' : snapshot?.live ? '停止并撤单' : '停止观察'}</button>
+    {active ? <button key={stopRequest?.sessionId} className="button primary" disabled={!!busy || !stopRequest} title={!stopRequest ? '请刷新以核对当前会话' : undefined} onClick={() => void stop()}>{busy === 'stop' ? <LoaderCircle size={15} className="spin" /> : <Square size={15} />}{snapshot?.phase === 'stopping' ? '继续停止' : snapshot?.live ? '停止并撤单' : '停止观察'}</button>
       : <><button className="button secondary" disabled={!dirty || !!busy || !!configError} title={configError || undefined} onClick={() => void save()}>{busy === 'save' ? <LoaderCircle size={15} className="spin" /> : <Save size={15} />}保存设置</button>
         <button className="button primary" disabled={!!busy || !snapshot || !!startBlock} title={startBlock || undefined} onClick={() => void start()}>{busy === 'start' ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}{liveSaved ? '启动实盘挂单' : '启动观察'}</button></>}
   </div></header>;
@@ -169,6 +187,7 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
     {remaining && !recoveryPositions ? <Callout tone="warning"><strong>最近一次实盘核对仍有余仓</strong> · {remaining}。这是核对时的数量。请到 Ondo 查验当前持仓并自行处理，或手动启动实盘时勾选接管。</Callout> : null}
     {recovery ? <Callout tone="warning"><strong>{recoveryPositions ? '本模块遗留挂单已清，账户仍有持仓' : '上次实盘的挂单与持仓待核对'}</strong>{recovery.startedAt ? ` · 上次启动 ${when(recovery.startedAt)}` : ''}
       <p>{recoveryPositions ? <>{remaining ? `上次核对余仓为 ${remaining}。` : ''}请到 Ondo 平仓后重新核对，或确认由你接手余仓。</>
+        : recovery.error === 'position_unconfirmed' ? '订单可能已成交，最新持仓尚未证实结果。请核对 Ondo 成交记录和余仓。'
         : <>交易所可能仍有本模块的挂单。{recovery.error ? `最近一次核对未完成（${recovery.error}）。` : ''}</>}
         {recovery.cleaning ? '正在撤销遗留挂单并核对持仓…' : active ? '停止观察后可重新核对。' : ''}</p>
       <button className="button secondary" disabled={!!busy || recovery.cleaning || active} onClick={() => void cleanup()}>{busy === 'cleanup' ? <LoaderCircle size={15} className="spin" /> : null}{recoveryPositions ? '重新核对持仓' : '撤单并核对'}</button>

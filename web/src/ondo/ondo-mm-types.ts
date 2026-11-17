@@ -19,7 +19,7 @@ export type OndoObservation = {
   }[];
 };
 export type OndoMmSnapshot = {
-  schema: 1; phase: 'stopped' | 'running' | 'stopping'; live: boolean; startedAt: string | null;
+  schema: 1; phase: 'stopped' | 'running' | 'stopping'; sessionId: string | null; live: boolean; startedAt: string | null;
   config: OndoMmConfig; revision: number; activeConfig: OndoMmConfig | null;
   credentials: { configured: boolean; hint: string | null; error: string | null };
   paused: boolean; pauseReason: string | null; halt: string | null; lastError: string | null; cooldownUntil: number | null;

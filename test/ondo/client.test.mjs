@@ -45,6 +45,17 @@ test('a refusal keeps only the venue code, never its message', async () => {
   assert.ok(!JSON.stringify({ ...error, message: error.message }).includes(keys.keyId));
 });
 
+test('terminal order reports expose venue fill and cancel times for matching later depth', async () => {
+  const when = new Date(EPOCH + 123).toISOString();
+  const { client } = fixture([
+    json({ success: true, result: order({ status: 'canceled', canceledAt: when, filledAt: 'invalid' }) }),
+    json({ success: true, result: order({ status: 'fullyfilled', filledSize: '0.5', filledAt: when }) }),
+  ]);
+  const canceled = await client.cancel('abc123');
+  assert.equal(canceled.canceledAt, EPOCH + 123); assert.equal(canceled.filledAt, undefined);
+  assert.equal((await client.orderByClientId('omm-1')).filledAt, EPOCH + 123);
+});
+
 test('a write that fails after it was sent is uncertain and is not sent again; a read is not', async () => {
   const lost = fixture([new Error('socket hang up'), json({}, 502), new Response('<html>', { status: 200 }), new Error('socket hang up')]);
   const input = { market: 'NVDA-USD.P', side: 'buy', price: '1', size: '1', clientOrderId: 'a' };

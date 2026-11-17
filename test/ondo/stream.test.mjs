@@ -153,6 +153,21 @@ test('authenticated heartbeat renews the switch until shutdown and leaves it arm
   assert.equal(s.now(), venueDeadline);
 });
 
+test('an unconfirmed REST withdrawal leaves the venue timer to expire until the account is reconciled', async () => {
+  let clear = false;
+  const s = fixture({ credentials: keys }); s.stream.start();
+  const first = s.sockets[0]; first.emit('open'); first.frame({ type: 'loggedIn' });
+  first.frame({ type: 'subscribed', channel: 'cancelAllOrdersAfterPerps' });
+  const sent = first.sent.length;
+  s.stream.expireOrders(() => clear);
+  assert.equal(first.closed, true); assert.equal(s.stream.status().deadManReady, false);
+  await s.advance(40_000);
+  assert.equal(s.sockets.length, 1); assert.equal(first.sent.length, sent);
+  clear = true; await s.advance(1000);
+  assert.equal(s.sockets.length, 2); assert.equal(s.stream.status().deadManReady, false);
+  s.stream.close();
+});
+
 test('a silent, broken or closed connection is reported down and reopened with backoff', async () => {
   const s = fixture(); s.stream.start();
   s.sockets[0].emit('open'); s.sockets[0].frame({ type: 'subscribed', channel: 'depthBooksPerps' });

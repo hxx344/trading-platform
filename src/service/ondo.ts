@@ -95,7 +95,7 @@ export async function createOndoModule(config: OndoServiceConfig, key: OndoCrede
     // A live start additionally requires acknowledgement of the venue's account-wide cancellation scope.
     save: body => mm.save(only(body, 'config').config),
     start: body => mm.start(only(body, 'revision', 'confirmLive', 'confirmAccountWide', 'adoptPositions')),
-    stop: body => { only(body); return mm.stop(); },
+    stop: body => mm.stop(only(body ?? {}, 'sessionId', 'live')),
     cleanup: body => { only(body); return mm.cleanup(); },
     discardRecovery: body => { only(body); return mm.discardRecovery(); },
     rewards: windowMin => rewards.state(windowMin),

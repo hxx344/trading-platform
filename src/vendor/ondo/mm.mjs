@@ -1,7 +1,7 @@
 // 来源：project-aggregation 工作台 server/automation/ondo-mm.mjs（提交 7745181）。改动见文件内「本服务」注释与 docs/ondo.md §3。
 // 本服务在工作台基础上增加严格保护、账户级断线撤单、成交退出和连续观察，详见 docs/ondo.md。
 // - import 路径；atomicJson 与 HttpError 写在本文件（工作台 server/atomic-json.mjs、server/http-common.mjs 的同名导出）。
-// - 订单前缀 omm- 改为 tpo-：本服务与工作台不会撤对方的挂单（两边都只撤带自己前缀的单）。
+// - 本服务的逐笔撤单按 tpo- 识别。交易所断线撤单覆盖整个永续账户。
 // - API Key 不在页面填写、不由本模块加密保存：由 readCredentials() 从 secrets.json 的 ondo 读取（docs/ondo.md §3），
 //   去掉 setKey / clearKey；state().credentials 只报是否配置与尾号。
 // - initialConfig：没有已保存的设置时用它（从工作台导入的设置，config.json ondo.initial）。
@@ -27,7 +27,7 @@ function atomicJson(file, value) {
 }
 
 const FILE_LIMIT = 64 * 1024;
-// Every order of this module carries this client-id prefix; orders without it are never touched.
+// REST recovery selects this module's prefix. The venue's dead-man switch is account-wide.
 const PREFIX = 'tpo-';
 const SIDES = ['buy', 'sell'];
 const MAX_MARKETS = 10;
@@ -110,8 +110,7 @@ function readBounded(file) {
 }
 
 // Two-sided resting quotes on Ondo Perps that follow the book to stay inside
-// the liquidity-reward band, behind a large resting order where one exists.
-// Inside a wide spread a quote can itself be the best price.
+// the liquidity-reward band only behind sufficient external size at better prices.
 //
 // Per market and side there is at most one post-only order. A quote is
 // withdrawn at once when it gets closer than minBps, when the book is stale or
@@ -156,6 +155,44 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
   const failure = error => (error instanceof OndoError ? error.code : 'internal');
   const clientOptions = extra => ({ ...(fetchImpl ? { fetchImpl } : {}), now, cooldownUntil, ...extra });
 
+  function recoveryRecord({ startedAt = null, prefix = null, unconfirmed = [], positions = [], canceling = null, invalid = false, interrupted = false } = {}) {
+    const named = name => typeof name === 'string' && /^[A-Za-z0-9._-]{1,80}$/.test(name);
+    if (!Array.isArray(unconfirmed) || unconfirmed.some(name => !named(name))
+      || !Array.isArray(positions) || positions.some(row => !object(row) || !named(row.market) || units(row.position) === 0n)
+      || (canceling !== null && (!object(canceling) || !named(canceling.market) || !canceling.clientId?.startsWith(PREFIX)
+        || !SIDES.includes(canceling.side) || typeof canceling.id !== 'string' || typeof canceling.reduceOnly !== 'boolean'))) throw new Error('invalid_recovery');
+    return { startedAt, prefix, unconfirmed, positions, canceling, invalid, interrupted: interrupted !== false };
+  }
+  function liveRecord(current, interrupted = true) {
+    const pending = new Set(current.awaiting.keys());
+    for (const market of current.markets.values()) if (market.exit?.expected) pending.add(market.name);
+    return recoveryRecord({ startedAt: new Date(current.startedAt).toISOString(), prefix: current.prefix,
+      unconfirmed: [...pending].sort(), positions: current.accountPositions, interrupted });
+  }
+  function saveLiveEvidence(current) {
+    if (!current.live || !current.incident) return;
+    const record = liveRecord(current), encoded = JSON.stringify(record);
+    if (current.savedEvidence === encoded) return;
+    try { atomicJson(sessionPath, record); current.savedEvidence = encoded; }
+    catch { notice(current, current.incident.market, 'recovery_store', '无法保存成交核对记录，请在交易所核对订单与仓位。'); }
+  }
+  function saveRecovery(next) {
+    atomicJson(sessionPath, recoveryRecord(next));
+    recovery = next;
+  }
+  let lastRecoveryAlert = null;
+  function recoveryAlert(prior = false) {
+    const { unconfirmed: pending, positions, canceling, invalid, interrupted } = recovery;
+    const key = `ondo:recovery:${recovery.prefix ?? recovery.startedAt ?? 'unknown'}:${JSON.stringify([pending, positions, canceling?.id, invalid, interrupted])}`;
+    if ((!pending.length && !positions.length && !canceling && !invalid && !interrupted) || lastRecoveryAlert === key) return;
+    lastRecoveryAlert = key;
+    const residual = positions.map(row => `${row.market} ${row.position}`).join('、');
+    const text = `上次 Ondo 会话${prior ? '保存的待核对记录' : '核对结果'}。${interrupted ? '实盘在完成核对前中断。' : ''}${residual ? `仍有持仓：${residual}。` : ''}${pending.length ? `这些市场的成交或撤单仍未反映到已核实仓位：${pending.join('、')}。` : ''}${canceling ? `${canceling.market} 的撤单结果未知。` : ''}${invalid ? '原恢复记录不完整。' : ''}请在交易所核对订单和仓位。`;
+    event(null, 'risk', text);
+    try { Promise.resolve(notifyRisk(key, text)).catch(() => log.warn({ type: 'ondo-mm' }, 'Ondo 恢复通知发送失败')); }
+    catch { log.warn({ type: 'ondo-mm' }, 'Ondo 恢复通知发送失败'); }
+  }
+
   function markDirty(market) { market.dirty = true; market.dirtySeq += 1; }
   function markAllDirty(current) { for (const market of current.markets.values()) markDirty(market); }
   function notice(current, name, code, text) {
@@ -166,7 +203,20 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     try { Promise.resolve(notifyRisk(key, `${name} · ${text}`)).catch(() => log.warn({ type: 'ondo-mm' }, 'Ondo 风险通知发送失败')); }
     catch { log.warn({ type: 'ondo-mm' }, 'Ondo 风险通知发送失败'); }
   }
-  function freeze(current, name, reason, venueTime) {
+  function lockQuotes(current, name, reason) {
+    if (current.incident) return;
+    current.incident = { at: now(), market: name, reason };
+    for (const item of current.markets.values()) for (const order of item.orders.values()) {
+      if (order.role === 'quote') void cancelOrder(current, item, order, 'incident');
+    }
+  }
+  function foreignOrder(current, name) {
+    const reason = '专用账户出现其他永续挂单';
+    lockQuotes(current, name, reason);
+    if (!current.stopping) stopRenewal(current);
+    notice(current, name, 'foreign', reason + '，已锁定开仓并停止续撤单心跳，请核对写入来源。');
+  }
+  function freeze(current, name, reason, venueTime, confirmedPosition = false) {
     if (!current.live || session !== current) return;
     const market = current.markets.get(name);
     const time = typeof venueTime === 'string' ? Date.parse(venueTime) : NaN;
@@ -174,13 +224,9 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     if (market && !market.exit) market.exit = { since, seenPosition: false, entry: null, trigger: null, triggeredAt: 0, anchor: null,
       manual: null, attempts: 0, nextAt: 0, expected: null, recentCloses: new Map() };
     else if (market) market.exit.since = Math.min(market.exit.since, since);
-    if (!current.incident) {
-      current.incident = { at: now(), market: name, reason };
-      // Set the lock before starting withdrawals; pending HTTP placements recheck it just before fetch.
-      for (const item of current.markets.values()) for (const order of item.orders.values()) {
-        if (order.role === 'quote') void cancelOrder(current, item, order, 'incident');
-      }
-    }
+    if (!confirmedPosition) current.awaiting.set(name, ++current.evidenceSeq);
+    lockQuotes(current, name, reason);
+    saveLiveEvidence(current);
     notice(current, name, 'incident', `${reason}。已锁定全会话开仓，正在撤销剩余开仓单。${market ? '平仓后需人工重新启用。' : '该市场不在配置内，请人工核对并处理仓位。'}`);
   }
   function manualExit(current, market, reason) {
@@ -190,10 +236,25 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
   }
   const orderIdentity = (market, order) => ({ market: market.name, clientId: order.clientId, side: order.side,
     price: fmt(order.price), size: fmt(order.size), reduceOnly: order.role === 'close' });
+  // A private fill/cancel can arrive before the public depth has removed our quantity.
+  // Keep subtracting the decrease until a strictly newer venue snapshot. Without a
+  // venue event time, cover the maximum exchange clock lead accepted by onBook.
+  function reduceBookQuantity(market, order, remaining, venueTime) {
+    if (market.orders.get(order.clientId) !== order || remaining >= order.remaining) return;
+    const through = Math.max(market.sourceAt ?? 0, Number.isFinite(venueTime) ? venueTime : now() + BOOK_MAX_AGE_MS);
+    market.bookDebits.push({ side: order.side, price: order.price, remaining: order.remaining - remaining, through });
+    order.remaining = remaining;
+  }
+  function removeTrackedOrder(market, order, terminal) {
+    if (market.orders.get(order.clientId) !== order) return;
+    reduceBookQuantity(market, order, 0n, terminal?.status === 'canceled' ? terminal.canceledAt : terminal?.filledAt);
+    market.orders.delete(order.clientId);
+  }
   function observeOrder(current, market, order, report) {
     const filled = report.status === 'fullyfilled' ? order.size : units(report.filled);
     if (filled <= (order.reportedFill ?? 0n)) return;
     order.reportedFill = filled;
+    reduceBookQuantity(market, order, order.size - filled, filled === order.size ? report.filledAt : undefined);
     if (order.role === 'quote') freeze(current, market.name, filled === order.size ? '开仓单已全部成交' : '开仓单部分成交');
     else if (market.exit && order.positionBefore != null) {
       const net = order.positionBefore;
@@ -215,7 +276,11 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
   function hint(current, channel, data) {
     const zero = value => value === undefined || (typeof value === 'string' && /^0(?:\.0+)?$/.test(value));
     for (const row of Array.isArray(data) ? data : [data]) {
-      if (!object(row) || typeof row.market !== 'string' || !ONDO_MARKET.test(row.market)) { markAllDirty(current); continue; }
+      if (!object(row) || typeof row.market !== 'string' || !ONDO_MARKET.test(row.market)) {
+        markAllDirty(current);
+        if (channel === 'ordersPerps' && ['open', 'pending'].includes(row?.status)) foreignOrder(current, '账户');
+        continue;
+      }
       const market = current.markets.get(row.market);
       const recent = market?.exit?.recentCloses;
       const tracked = market?.orders.get(row.clientOrderId) ?? recent?.get(row.clientOrderId)
@@ -241,6 +306,13 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
         const safe = SIDES.includes(row.side) && [row.size, row.price].every(value => typeof value === 'string' && /^[0-9.]{1,24}$/.test(value));
         event(row.market, 'fill', safe ? `成交：${row.side === 'buy' ? '买入' : '卖出'} ${row.size} @ ${row.price}` : '收到成交通知');
       } else if (channel === 'ordersPerps') {
+        if (row.status === 'open' || row.status === 'pending') {
+          current.orderEpoch++;
+          if (!market || (!tracked && !(typeof row.clientOrderId === 'string' && row.clientOrderId.startsWith(current.prefix)))) {
+            markAllDirty(current);
+            foreignOrder(current, row.market);
+          }
+        }
         if (row.status === 'fullyfilled' || !zero(row.filledSize)) {
           if (tracked) {
             try { observeOrder(current, market, tracked, { status: row.status, filled: row.filledSize }); } catch { markDirty(market); }
@@ -251,7 +323,8 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
       } else {
         let size = null;
         try { size = units(String(row.netQuantity).replace(/^-/, '')) * (row.direction === 'short' ? -1n : 1n); } catch { /* reread */ }
-        if (size !== null && size !== 0n) freeze(current, row.market, '持仓推送报告非零仓位');
+        if (size !== null && size !== 0n) freeze(current, row.market, '持仓推送报告非零仓位', undefined,
+          current.accountPositions.some(position => position.market === row.market && units(position.position) === size));
         if (market && (size === null || !market.positionKnown || size !== market.position)) markDirty(market);
       }
     }
@@ -262,18 +335,29 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
   async function sync(current) {
     if (current.syncing) return;
     current.syncing = true; current.syncAttemptAt = now();
-    const started = now(), seqs = new Map([...current.markets.values()].map(market => [market, market.dirtySeq]));
+    const started = now(), stoppingAtStart = current.stopping, orderEpoch = current.orderEpoch;
+    const seqs = new Map([...current.markets.values()].map(market => [market, market.dirtySeq]));
     const initialOrders = new Map([...current.markets.values()].flatMap(market => [...market.orders]));
     try {
       const open = await current.client.openOrders();
       if (session !== current) return;
+      if (open.length) current.emptyEpoch = null;
+      for (const order of open) {
+        if (!current.markets.has(order.market) || !order.clientId?.startsWith(current.prefix)) foreignOrder(current, order.market);
+      }
       // A second, slower REST read must not postpone the account-wide opening lock.
       for (const order of open) if (!order.reduceOnly && (order.status === 'fullyfilled' || units(order.filled) > 0n)) {
         freeze(current, order.market, '账户挂单报告开仓成交');
       }
+      const beforePositions = new Map(current.awaiting);
       const positions = await current.client.positions({ details: true });
       if (session !== current) return;
-      for (const [name, detail] of positions) if (units(detail.size) !== 0n) freeze(current, name, '账户核对发现非零仓位');
+      current.accountPositions = [...positions].filter(([, detail]) => units(detail.size) !== 0n)
+        .map(([market, detail]) => ({ market, position: fmt(units(detail.size)) }));
+      for (const { market: name } of current.accountPositions) {
+        if (current.awaiting.get(name) === beforePositions.get(name)) current.awaiting.delete(name);
+        freeze(current, name, '账户核对发现非零仓位', undefined, true);
+      }
       const strays = [];
       let remote = 0;
       for (const order of open) {
@@ -296,7 +380,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
           }
           if (!tracked) {
             tracked = { clientId: order.clientId, id: order.id, side: order.side, role: order.reduceOnly ? 'close' : 'quote', price: units(order.price),
-              size, remaining, state: 'open', since: started, attempts: 0, nextCheckAt: 0, nextCancelAt: 0, mode: null };
+              size, remaining: size, state: 'open', since: started, attempts: 0, nextCheckAt: 0, nextCancelAt: 0, mode: null };
             market.orders.set(order.clientId, tracked);
             event(market.name, 'adopt', `接管已有挂单：${order.side === 'buy' ? '买' : '卖'} ${order.price}`);
           } else {
@@ -306,7 +390,6 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
             if (tracked.state === 'unknown' && tracked.since < started) { tracked.state = 'open'; tracked.id = order.id; }
           }
           observeOrder(current, market, tracked, order);
-          tracked.remaining = size - (tracked.reportedFill ?? 0n);
           if (current.incident && tracked.role === 'quote') void cancelOrder(current, market, tracked, 'incident');
         }
         for (const tracked of [...market.orders.values()]) {
@@ -332,7 +415,10 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
           }
         }
       }
+      saveLiveEvidence(current);
       current.remoteOurs = remote; current.verifiedAt = started; current.syncOkAt = now(); current.syncError = null;
+      if (!open.length && orderEpoch === current.orderEpoch) current.emptyEpoch = orderEpoch;
+      if (stoppingAtStart) current.verifiedOnStop = true;
       for (const order of strays.slice(0, STRAY_CANCELS)) {
         current.lastWriteAt = now();
         try {
@@ -386,9 +472,9 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
         timeInForce: mode === 'ioc' ? 'IOC' : 'GTC', canSend });
       order.id = placed.id; order.since = now(); market.rejects[side] = 0; current.totals.placed += 1;
       observeOrder(current, market, order, placed);
-      if (!['open', 'pending'].includes(placed.status)) { market.orders.delete(clientId); markDirty(market); }
+      if (!['open', 'pending'].includes(placed.status)) { removeTrackedOrder(market, order, placed); markDirty(market); }
       else {
-        order.state = 'open'; order.remaining = size - (order.reportedFill ?? 0n);
+        order.state = 'open';
         if (role === 'quote' && (current.incident || order.protectionLost)) await cancelOrder(current, market, order, current.incident ? 'incident' : order.protectionLost);
         else if (mode === 'ioc') { order.state = 'unknown'; order.wasOpen = true; order.nextCheckAt = now() + SYNC_GAP_MS; markDirty(market); }
         else if (role === 'close' && (market.exit?.manual || market.exit?.trigger)) await cancelOrder(current, market, order, 'exit');
@@ -419,20 +505,33 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
       current.lastWriteAt = now();
     }
   }
+  function stopRenewal(current) {
+    current.orderEpoch++;
+    current.stream.expireOrders(() => current.emptyEpoch === current.orderEpoch && current.verifiedAt > current.lastWriteAt
+      && !current.syncError && now() - current.syncOkAt <= SYNC_MAX_AGE_MS);
+  }
+  function expireUnconfirmedOrder(current, market, order) {
+    if (session !== current || current.stopping || order.expiryRequested) return;
+    order.expiryRequested = true;
+    freeze(current, market.name, '撤单未获确认');
+    stopRenewal(current);
+    notice(current, market.name, 'cancel', '撤单未获确认，已停止续交易所撤单心跳。正在核对全部余单，请检查账户和持仓。');
+  }
   async function cancelOrder(current, market, order, reason) {
     if (order.state !== 'open' || (now() < order.nextCancelAt && !(current.stopping && order.nextCancelAt === Infinity))) return;
     order.state = 'canceling'; current.lastWriteAt = now();
+    order.withdrawSince ??= current.lastWriteAt;
     try {
       const result = await current.client.cancel(order.id, orderIdentity(market, order));
       if (!result) throw new OndoError('invalid_data', { uncertain: true });
       observeOrder(current, market, order, result);
-      market.orders.delete(order.clientId); current.totals.canceled += 1; market.lastCancel = reason;
+      removeTrackedOrder(market, order, result); current.totals.canceled += 1; market.lastCancel = reason;
       if (order.role === 'close') markDirty(market);
     } catch (error) {
       const code = failure(error);
       if (code === 'order_already_filled' || code === 'order_already_fully_filled') {
         observeOrder(current, market, order, { status: 'fullyfilled' });
-        market.orders.delete(order.clientId); markDirty(market);
+        removeTrackedOrder(market, order); markDirty(market);
       }
       else {
         if (GONE.has(code) || (error instanceof OndoError && error.uncertain)) {
@@ -441,17 +540,14 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
         } else order.state = 'open';
         order.cancelFailures = (order.cancelFailures ?? 0) + 1;
         order.nextCancelAt = now() + Math.min(MAX_BACKOFF_MS, SYNC_GAP_MS * 2 ** Math.min(order.cancelFailures - 1, 6));
-        if (current.incident && !current.stopping && order.cancelFailures >= EXIT_ATTEMPTS) {
-          order.nextCancelAt = Infinity;
-          notice(current, market.name, 'cancel', '多次撤单未获确认，请人工核对并撤销交易所的剩余挂单。');
-        }
+        if (order.cancelFailures >= EXIT_ATTEMPTS) expireUnconfirmedOrder(current, market, order);
         denied(current, error);
         if (!(error instanceof OndoError)) log.warn({ err: error, type: 'ondo-mm' }, 'Ondo 撤单失败');
       }
     } finally { current.lastWriteAt = now(); }
   }
   function retireUnknown(current, market, order) {
-    market.orders.delete(order.clientId); markDirty(market);
+    removeTrackedOrder(market, order); markDirty(market);
     if (order.mode === 'ioc' || (order.role === 'close' && order.wasOpen)) {
       manualExit(current, market, '原平仓委托的终态无法核实，已停止自动减仓');
     } else if (order.wasOpen) freeze(current, market.name, '原开仓委托离开盘口，未能确认最终成交量');
@@ -472,9 +568,9 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
       if (found) observeOrder(current, market, order, found);
       if (order.state !== 'unknown' || market.orders.get(order.clientId) !== order) continue;
       if (found && ['open', 'pending', 'untriggered'].includes(found.status)) {
-        order.id = found.id; order.state = 'open'; order.since = now(); order.remaining = order.size - (order.reportedFill ?? 0n); order.missed = 0;
+        order.id = found.id; order.state = 'open'; order.since = now(); order.missed = 0;
         if ((current.incident && order.role === 'quote') || order.mode === 'ioc') await cancelOrder(current, market, order, 'incident');
-      } else if (found && ['fullyfilled', 'canceled'].includes(found.status)) { market.orders.delete(order.clientId); markDirty(market); }
+      } else if (found && ['fullyfilled', 'canceled'].includes(found.status)) { removeTrackedOrder(market, order, found); markDirty(market); }
       else if (!found && ++order.attempts >= UNKNOWN_CHECKS) {
         retireUnknown(current, market, order);
       }
@@ -486,7 +582,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
   function protectRestingQuotes(current, market, freshBook) {
     const quotes = [...market.orders.values()].filter(order => order.role === 'quote' && !order.protectionLost);
     if (!quotes.length) return;
-    const external = freshBook && withoutOrders(freshBook, [...market.orders.values(), ...market.foreign]);
+    const external = freshBook && withoutOrders(freshBook, [...market.orders.values(), ...market.foreign, ...market.bookDebits]);
     for (const order of quotes) {
       if (external && frontNotional(order.side, external, order.price) >= current.cfg.wallMin) continue;
       order.protectionLost = external ? 'unprotected' : 'stale_book';
@@ -501,12 +597,12 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     if (!current.rulesAt || now() - current.rulesAt > RULES_MAX_AGE_MS) return 'no_rules';
     if (!market.rules) return 'unknown_market';
     if (!market.rules.trading) return 'market_closed';
+    if (current.live && now() - current.syncOkAt > SYNC_MAX_AGE_MS) return 'account_unknown';
     if (current.live) {
       const stream = current.stream.status();
       if (!stream.privateReady) return 'private_stream';
       if (!stream.deadManReady) return 'dead_man_switch';
     }
-    if (current.live && now() - current.syncOkAt > SYNC_MAX_AGE_MS) return 'account_unknown';
     const book = market.book;
     if (!book || !book.bids.length || !book.asks.length || now() - market.bookAt > BOOK_MAX_AGE_MS || now() - book.time > SOURCE_MAX_AGE_MS) return 'stale_book';
     if ([...market.orders.values()].some(order => order.state === 'unknown' && (!current.incident || order.role === 'close'))) return 'unknown_order';
@@ -537,7 +633,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     const book = market.book;
     const valid = book?.bids.length && book.asks.length && book.bids[0][0] < book.asks[0][0]
       && at - market.bookAt <= BOOK_MAX_AGE_MS && at - book.time <= SOURCE_MAX_AGE_MS;
-    const ext = valid ? withoutOrders(book, [...market.orders.values(), ...market.foreign]) : null;
+    const ext = valid ? withoutOrders(book, [...market.orders.values(), ...market.foreign, ...market.bookDebits]) : null;
     const touch = market.position > 0n ? ext?.bids[0]?.[0] : ext?.asks[0]?.[0];
     if (!market.dirty && exit.entry === null) notice(current, market.name, 'no-entry', '账户未给出有效入场均价，无法计算亏损阈值；最长持仓时间仍生效。');
     if (!exit.trigger) {
@@ -574,7 +670,8 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     const existing = mine[0] ?? null;
     if (existing?.protectionLost) return { type: 'cancel', order: existing, reason: existing.protectionLost, view: { ...shown(existing), reason: existing.protectionLost } };
     const own = [...orders.map(order => ({ side: order.side, price: order.price, remaining: order.remaining, ours: true })), ...market.foreign];
-    const ext = withoutOrders(book, own), ref = withoutOrders(book, own.filter(order => order.ours && order.side === side));
+    const ext = withoutOrders(book, [...own, ...market.bookDebits]);
+    const ref = withoutOrders(book, [...own.filter(order => order.ours && order.side === side), ...market.bookDebits]);
     let limit;
     for (const order of own) if (order.side !== side && order.remaining > 0n && (limit === undefined || (side === 'buy' ? order.price < limit : order.price > limit))) limit = order.price;
     const fresh = !market.dirty && market.positionKnown, position = market.position;
@@ -703,17 +800,27 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     if (!current.stopping) current.stream.close();
     current.client.close();
     session = null;
-    if (current.live) { try { rmSync(sessionPath, { force: true }); } catch (error) { log.warn({ err: error, type: 'ondo-mm' }, 'Ondo 会话记录未能删除'); } }
-    if (current.live) leftPositions = [...current.markets.values()].filter(market => market.position !== 0n).map(market => ({ market: market.name, position: fmt(market.position) }));
+    if (current.live) {
+      leftPositions = current.accountPositions;
+      const record = liveRecord(current, false);
+      if (leftPositions.length || record.unconfirmed.length) {
+        recovery = { ...record, error: leftPositions.length ? 'positions_remain' : 'position_unconfirmed' };
+        try { saveRecovery(recovery); }
+        catch { log.warn({ type: 'ondo-mm' }, '停机时未能更新 Ondo 恢复记录'); }
+        recoveryAlert();
+      } else {
+        try { rmSync(sessionPath, { force: true }); } catch (error) { log.warn({ err: error, type: 'ondo-mm' }, 'Ondo 会话记录未能删除'); }
+      }
+    }
     event(null, 'session', !current.live ? '观察已停止' : leftPositions.length
       ? `实盘挂单已停止，挂单已确认撤销；仍有持仓未平：${leftPositions.map(item => `${item.market} ${item.position}`).join('、')}`
-      : '实盘挂单已停止，全部挂单已确认撤销，没有持仓');
+      : recovery ? '实盘挂单已停止，全部挂单已确认撤销，成交后的仓位仍须核实' : '实盘挂单已停止，全部挂单已确认撤销，没有持仓');
   }
   // A live session ends only when nothing of it is in flight or tracked and an
   // account read begun after its last write lists no order with its prefix.
   function settled(current) {
     return [...current.markets.values()].every(market => market.orders.size === 0 && !market.busy)
-      && !current.syncing && current.remoteOurs === 0 && current.verifiedAt > current.lastWriteAt;
+      && current.verifiedOnStop && !current.syncError && !current.syncing && current.remoteOurs === 0 && current.verifiedAt > current.lastWriteAt;
   }
   async function tick() {
     const current = session;
@@ -721,23 +828,32 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     const at = now(), work = [];
     if (!current.rulesAttemptAt || at - current.rulesAttemptAt >= RULES_REFRESH_MS) work.push(refreshRules(current));
     if (current.live) {
-      if (current.stopping) markAllDirty(current);
+      if (!current.stopping && at - current.syncOkAt > SYNC_MAX_AGE_MS && current.stream.status().deadManReady) {
+        const reason = '整账户挂单和持仓已超过核对时限';
+        lockQuotes(current, '账户', reason);
+        stopRenewal(current);
+        notice(current, '账户', 'account_read', reason + '，已停止开仓和续撤单心跳。');
+      }
+      // A lost cancellation can remain "unknown" without reaching another attempt during a REST outage.
+      for (const market of current.markets.values()) for (const order of market.orders.values()) {
+        if (order.withdrawSince !== undefined && at - order.withdrawSince >= SYNC_MAX_AGE_MS) expireUnconfirmedOrder(current, market, order);
+      }
       const dirty = [...current.markets.values()].some(market => market.dirty);
-      if (at - current.syncAttemptAt >= SYNC_GAP_MS && (dirty || at - current.syncOkAt >= SYNC_MS) && at >= current.client.cooldownUntil()) work.push(sync(current));
+      if (at - current.syncAttemptAt >= SYNC_GAP_MS && (current.stopping || dirty || at - current.syncOkAt >= SYNC_MS) && at >= current.client.cooldownUntil()) work.push(sync(current));
     }
     for (const market of current.markets.values()) work.push(step(current, market));
     await Promise.all(work);
     if (session === current && current.stopping && settled(current)) finish(current);
   }
   function open(live, keys) {
-    const tag = randomBytes(4).toString('hex');
+    const tag = randomBytes(12).toString('hex');
     const current = { live, config: structuredClone(config), prefix: `${PREFIX}${tag}-`, seq: 0, startedAt: now(), stopping: false, halt: null, incident: null, notices: new Set(),
       cfg: { target: units(config.targetBps), min: units(config.minBps), max: units(config.maxBps), wallEnabled: config.wallEnabled, wallMin: units(config.wallUsd),
         orderUsd: units(config.orderUsd), maxPosition: units(config.maxPositionUsd), maxTotal: units(config.maxTotalUsd) },
-      markets: new Map(config.markets.map(name => [name, { name, rules: null, listed: false, book: null, bookAt: 0, mid: null, orders: new Map(), foreign: [], position: 0n, positionKnown: !live,
+      markets: new Map(config.markets.map(name => [name, { name, rules: null, listed: false, book: null, bookAt: 0, mid: null, orders: new Map(), bookDebits: [], foreign: [], position: 0n, positionKnown: !live,
         dirty: live, dirtySeq: 0, pending: { buy: null, sell: null }, backoff: { buy: 0, sell: 0 }, rejects: { buy: 0, sell: 0 },
         view: { buy: { role: 'quote', state: 'none', reason: 'starting' }, sell: { role: 'quote', state: 'none', reason: 'starting' } }, hold: 'starting', busy: false, error: null, lastCancel: null }])),
-      syncing: false, syncAttemptAt: 0, syncOkAt: now(), syncError: null, remoteOurs: null, verifiedAt: 0, lastWriteAt: now(),
+      accountPositions: [], orderEpoch: 0, emptyEpoch: null, awaiting: new Map(), evidenceSeq: 0, savedEvidence: null, syncing: false, syncAttemptAt: 0, syncOkAt: now(), syncError: null, remoteOurs: null, verifiedAt: 0, lastWriteAt: now(),
       loadingRules: false, rulesAttemptAt: 0, rulesAt: 0, rulesError: null, totals: { placed: 0, canceled: 0, rejected: 0, postOnly: 0, fills: 0 }, client: null, stream: null };
     current.client = clientFactory(clientOptions({ credentials: keys, rps: config.rps }));
     current.observation = live ? null : createOndoObservation({
@@ -754,7 +870,10 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
         const gap = market.bookAt > 0 && at - market.bookAt > BOOK_MAX_AGE_MS;
         const duplicate = book && market.book?.time === book.time;
         market.book = book && (book.time > at + BOOK_MAX_AGE_MS || book.time < market.sourceAt) ? null : book;
-        if (market.book) market.sourceAt = market.book.time;
+        if (market.book) {
+          market.sourceAt = market.book.time;
+          if (market.bookDebits.length) market.bookDebits = market.bookDebits.filter(debit => market.sourceAt <= debit.through);
+        }
         if (!duplicate) market.bookAt = at;
         const valid = market.book?.bids.length && market.book.asks.length && at - market.book.time <= SOURCE_MAX_AGE_MS;
         if (valid) market.mid = (book.bids[0][0] + book.asks[0][0]) / 2n;
@@ -768,7 +887,10 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
           market.book = null;
           if (current.live) protectRestingQuotes(current, market, null);
         }
-        if (current.live) markAllDirty(current);
+        if (current.live) {
+          markAllDirty(current);
+          if (!current.stopping) stopRenewal(current);
+        }
       },
       onPrivate(channel, data) { if (session === current) hint(current, channel, data); } });
     return current;
@@ -781,6 +903,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     for (const market of current.markets.values()) for (const order of market.orders.values()) order.nextCancelAt = 0;
     if (!current.stopping) {
       current.stopping = true;
+      markAllDirty(current);
       // Stop renewing the venue timer immediately. REST keeps cancelling and reconciling even if a response is lost.
       current.stream.close();
       event(null, 'session', '正在停止：撤销全部挂单并核对');
@@ -793,11 +916,66 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     }
   }
   // Withdraws what a previous process left resting. Cancels only orders with this module's prefix.
+  const hasFill = report => report?.status === 'fullyfilled' || (report != null && units(report.filled) > 0n);
+  function completeRecoveryCancel(report) {
+    const { market } = recovery.canceling;
+    const unconfirmed = report && !hasFill(report) ? recovery.unconfirmed : [...new Set([...recovery.unconfirmed, market])];
+    saveRecovery({ ...recovery, canceling: null, unconfirmed });
+  }
+  async function lookupRecoveryCancel(client) {
+    const { id, clientId, ...expected } = recovery.canceling;
+    let report;
+    try { report = await client.orderByClientId(clientId, { ...expected, id }); } catch { /* Keep the market pending if terminal history is unavailable. */ }
+    if (report && !['fullyfilled', 'canceled'].includes(report.status)) throw new OndoError('orders_remain');
+    completeRecoveryCancel(report);
+  }
+  async function cancelLeftovers(client, left) {
+    const previous = recovery.canceling;
+    if (previous) {
+      const index = left.findIndex(order => order.clientId === previous.clientId && order.id === previous.id);
+      if (index < 0) await lookupRecoveryCancel(client);
+      else {
+        if (Object.entries(previous).some(([key, value]) => left[index][key] !== value)) throw new OndoError('invalid_data');
+        left.unshift(...left.splice(index, 1));
+      }
+    }
+    for (const order of left) {
+      const { id, clientId, market, side, price, size, reduceOnly } = order;
+      const canceling = { id, clientId, market, side, price, size, reduceOnly };
+      const unconfirmed = hasFill(order) ? [...new Set([...recovery.unconfirmed, market])] : recovery.unconfirmed;
+      // A crash after DELETE but before its reply must leave an identifiable unresolved request on disk.
+      saveRecovery({ ...recovery, unconfirmed, canceling });
+      try {
+        const report = await client.cancel(id, { clientId, market, side, price, size, reduceOnly });
+        if (!report || !['fullyfilled', 'canceled'].includes(report.status)) throw new OndoError('invalid_data', { uncertain: true });
+        completeRecoveryCancel(report);
+      } catch (error) {
+        const code = failure(error);
+        if (code === 'order_already_filled' || code === 'order_already_fully_filled') completeRecoveryCancel(null);
+        else if (GONE.has(code)) await lookupRecoveryCancel(client);
+        else throw error;
+      }
+    }
+  }
+  async function checkRecoveryAccount(client) {
+    if ((await client.openOrders()).some(order => order.clientId?.startsWith(PREFIX))) throw new OndoError('orders_remain');
+    const positions = [...await client.positions()].filter(([, size]) => units(size) !== 0n)
+      .map(([market, size]) => ({ market, position: fmt(units(size)) }));
+    const held = new Set(positions.map(row => row.market));
+    // Only a later observation of the same market can account for the opening fill.
+    const unconfirmed = recovery.unconfirmed.filter(name => !held.has(name));
+    if (positions.length || unconfirmed.length || recovery.invalid || recovery.interrupted) {
+      saveRecovery({ ...recovery, positions, unconfirmed, error: positions.length ? 'positions_remain' : 'position_unconfirmed' });
+      leftPositions = positions; recoveryAlert();
+      return false;
+    }
+    return true;
+  }
   async function cleanup(attempts) {
     if (cleaning) return cleaning;
     let keys;
     try { keys = credentials(); } catch { if (recovery) recovery = { ...recovery, error: 'no_credentials' }; return undefined; }
-    const task = (async () => {
+    const task = Promise.resolve().then(async () => {
       let client = null;
       try {
         client = clientFactory(clientOptions({ credentials: keys, rps: config.rps }));
@@ -805,32 +983,27 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
           if (attempt) await sleep(CLEANUP_PAUSE_MS);
           try {
             const left = (await client.openOrders()).filter(order => order.clientId?.startsWith(PREFIX));
-            for (const order of left) { try { await client.cancel(order.id); } catch (error) { if (!GONE.has(failure(error))) throw error; } }
-            if ((await client.openOrders()).some(order => order.clientId?.startsWith(PREFIX))) throw new OndoError('orders_remain');
-            const positions = await client.positions();
-            leftPositions = [...positions].filter(([name, size]) => ONDO_MARKET.test(name) && units(size) !== 0n)
-              .map(([market, size]) => ({ market, position: fmt(units(size)) }));
-            if (leftPositions.length) {
-              const text = '上次 Ondo 会话的挂单已撤，账户仍有持仓：' + leftPositions.map(row => `${row.market} ${row.position}`).join('、') + '。请在交易所核对并处理。';
-              event(null, 'risk', text);
-              recovery = { ...recovery, error: 'positions_remain' };
-              await notifyRisk(`ondo:recovery:${recovery.startedAt ?? 'unknown'}`, text);
-              return;
-            }
+            await cancelLeftovers(client, left);
+            if (!await checkRecoveryAccount(client)) return;
+            // Allow an exchange snapshot that lagged the final cancellation to catch up. A known
+            // opening fill with no position evidence remains pending until explicit reconciliation.
+            await sleep(SYNC_GAP_MS);
+            if (closed || !await checkRecoveryAccount(client)) return;
             rmSync(sessionPath, { force: true }); recovery = null;
+            leftPositions = [];
             event(null, 'session', left.length ? `已撤销上次实盘遗留的 ${left.length} 笔挂单` : '上次实盘没有遗留挂单');
-          } catch (error) { recovery = { ...recovery, error: failure(error) }; }
+          } catch (error) { recovery = { ...recovery, error: failure(error) }; recoveryAlert(); }
         }
       } catch (error) { if (recovery) recovery = { ...recovery, error: failure(error) }; }
       finally { if (client) { cooldownUntil = Math.max(cooldownUntil, client.cooldownUntil()); client.close(); } if (cleaning === task) cleaning = null; }
-    })();
+    });
     cleaning = task;
     return task;
   }
 
   function state() {
     const current = session, hold = gate();
-    return { schema: 1, phase: !current ? 'stopped' : current.stopping ? 'stopping' : 'running', live: current?.live ?? false, startedAt: current ? new Date(current.startedAt).toISOString() : null,
+    return { schema: 1, phase: !current ? 'stopped' : current.stopping ? 'stopping' : 'running', sessionId: current?.prefix ?? null, live: current?.live ?? false, startedAt: current ? new Date(current.startedAt).toISOString() : null,
       config: structuredClone(config), revision, activeConfig: current ? structuredClone(current.config) : null,
       credentials: { configured: !!keyHint, hint: keyHint, error: keyError },
       observation: current?.observation?.snapshot(now()) ?? lastObservation,
@@ -872,8 +1045,20 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
       try { const saved = readCredentials(); if (saved) keyHint = validateCredentials(saved).keyId.slice(-4); }
       catch { keyError = 'secrets.json 里的 Ondo API Key 格式不正确'; }
       // A session record that outlived its process means orders may still rest.
-      try { const saved = readBounded(sessionPath); if (saved) recovery = { startedAt: typeof saved.startedAt === 'string' ? saved.startedAt : null, error: null }; }
-      catch { recovery = { startedAt: null, error: null }; }
+      try {
+        const saved = readBounded(sessionPath);
+        if (saved) {
+          if (!object(saved)) throw new Error('invalid_recovery');
+          // Legacy markers also mean that the old process never proved a clean stop.
+          const record = recoveryRecord({ interrupted: true, ...saved });
+          leftPositions = record.positions;
+          recovery = { ...record, error: record.positions.length ? 'positions_remain' : record.unconfirmed.length || record.invalid || record.interrupted ? 'position_unconfirmed' : null };
+          recoveryAlert(true);
+        }
+      } catch {
+        recovery = { ...recoveryRecord(), invalid: true, error: 'position_unconfirmed' };
+        recoveryAlert(true);
+      }
       if (recovery && keyHint) void cleanup(CLEANUP_ATTEMPTS);
       if (intervalMs > 0) { timer = setInterval(() => { void tick().catch(error => log.warn({ err: error, type: 'ondo-mm' }, 'Ondo 挂单定时任务出错')); }, intervalMs); timer.unref?.(); }
     },
@@ -917,7 +1102,8 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
         try {
           openOrders = await current.client.openOrders();
           const positions = await current.client.positions();
-          held = current.config.markets.filter(name => units(positions.get(name) ?? '0') !== 0n).map(name => `${name} ${positions.get(name)}`);
+          held = current.config.markets.filter(name => units(positions.get(name) ?? '0') !== 0n)
+            .map(name => ({ name, size: positions.get(name) }));
           outside = [...positions].some(([name, size]) => !current.markets.has(name) && units(size) !== 0n);
         } catch (error) {
           cooldownUntil = Math.max(cooldownUntil, current.client.cooldownUntil());
@@ -927,24 +1113,31 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
         }
         if (openOrders.length) refuse(409, '启动前账户须无永续挂单。请先在 Ondo 核实并处理现有订单，再启用账户级断线撤单');
         if (outside) refuse(409, '专用账户在所选市场之外已有持仓，请先核实持仓或调整市场设置');
-        if (held.length && input.adoptPositions !== true) refuse(409, `账户在这些市场已有持仓：${held.join('、')}。启动后本模块会挂只减仓单把它们平掉；确认交给本模块处理请勾选「已有持仓交给本模块平掉」后再启动`);
+        if (held.length && input.adoptPositions !== true) refuse(409, `账户在这些市场已有持仓：${held.map(p => `${p.name} ${p.size}`).join('、')}。确认接管仓位并只减仓退出后再启动`);
         const later = gate();
         if (later) refuse(409, gateText(later));
         if (attempt.cancelled) refuse(409, '启动已被停止请求取消，未开始挂单');
         if (signal?.aborted) refuse(503, '请求已取消，未开始挂单');
         if (session || recovery || cleaning || closed) refuse(409, '挂单状态已变化，请刷新后重试');
         // The record is on disk before the first order, so a crash cannot leave unknown orders behind.
-        try { atomicJson(sessionPath, { startedAt: new Date(current.startedAt).toISOString(), prefix: current.prefix }); }
+        try { atomicJson(sessionPath, liveRecord(current)); }
         catch (error) { current.stream.close(); current.client.close(); log.warn({ err: error, type: 'ondo-mm' }, 'Ondo 会话记录写入失败'); throw new HttpError(503, '会话记录无法保存，未开始挂单'); }
         session = current; lastError = null; leftPositions = [];
         event(null, 'session', `开始实盘挂单：${current.config.markets.join('、')}`);
-        if (held.length) event(null, 'position', `按确认接管已有持仓：${held.join('、')}`);
+        for (const { name } of held) freeze(current, name, '启动时已确认接管现有仓位');
         starting = null;
         current.stream.start(); await tick();
         return state();
       })).finally(() => { if (starting === attempt) starting = null; });
     },
-    async stop() { if (starting) starting.cancelled = true; await halt(STOP_WAIT_MS); return state(); },
+    async stop(expected) {
+      if (expected && (starting || (session && (expected.sessionId !== session.prefix || expected.live !== session.live)))) {
+        throw new HttpError(409, '会话已变化，请刷新后核对当前会话再停止');
+      }
+      if (starting) starting.cancelled = true;
+      await halt(STOP_WAIT_MS);
+      return state();
+    },
     async cleanup() {
       if (starting) throw new HttpError(409, '正在启动实盘挂单，请稍后再试');
       if (session) throw new HttpError(409, '挂单运行中，无需清理');
@@ -958,7 +1151,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
       if (session) throw new HttpError(409, '挂单运行中，无需处理');
       if (cleaning) throw new HttpError(409, '正在清理上次实盘的遗留挂单，请稍后再试');
       if (recovery) {
-        rmSync(sessionPath, { force: true }); recovery = null;
+        rmSync(sessionPath, { force: true }); recovery = null; leftPositions = [];
         event(null, 'session', '已按人工核对结果忽略上次实盘的遗留记录');
       }
       return state();
@@ -983,7 +1176,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     async close(waitMs = closeWaitMs) {
       if (session?.live) await halt(waitMs).catch(() => {});
       closed = true; clearInterval(timer);
-      if (session) { session.stream.close(); session.client.close(); }
+      if (session) { saveLiveEvidence(session); session.stream.close(); session.client.close(); }
     },
   };
 }

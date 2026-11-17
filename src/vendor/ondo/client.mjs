@@ -38,6 +38,10 @@ function orderOf(value, expected = {}) {
     size: amount(value.size, { positive: true }), filled: amount(value.filledSize, { nonnegative: true }),
     status: value.status, reduceOnly: value.reduceOnly === true };
   if (compareDecimals(order.filled, order.size) > 0 || Object.entries(expected).some(([key, field]) => order[key] !== field)) throw invalid();
+  for (const field of ['filledAt', 'canceledAt']) {
+    const time = typeof value[field] === 'string' ? Date.parse(value[field]) : NaN;
+    if (Number.isFinite(time)) order[field] = time;
+  }
   return order;
 }
 

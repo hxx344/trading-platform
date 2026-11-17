@@ -46,6 +46,65 @@ test('a prompt but later-delivered trade matches the quote resting at its exchan
   assert.equal(row(120, 'buy').touches, 1);
 });
 
+test('late delivery just after depth expiry records the same sweep and duration as on-time delivery', () => {
+  const run = (received, nextDepth, disconnect) => {
+    const { trial, book, trade, row } = fixture();
+    for (let ms = 0; ms <= 60_000; ms += 1000) book(ms);
+    if (disconnect) trial.down(START + 61_510);
+    if (nextDepth) book(61_515, { source: 61_505, bid: '99.89', ask: '99.91' });
+    trade('sell', '99.95', 61_450, 'final-sweep', received);
+    return row(61_520, 'buy');
+  };
+  const onTime = run(61_450, false, false), late = run(61_520, false, false);
+  assert.deepEqual(late, onTime);
+  assert.deepEqual([late.touches, late.sweeps, late.activeMs], [1, 1, 61_450]);
+  // A newer depth before the late print adds only its own five ms.
+  const next = run(61_520, true, false);
+  assert.deepEqual([next.sweeps, next.activeMs], [1, 61_455]);
+  assert.equal(run(61_520, true, true).sweeps, 0);
+  assert.equal(run(63_020, false, false).sweeps, 0);
+});
+
+test('out-of-order sweeps end one virtual order at the earliest print without duplicating counts', () => {
+  const { book, trade, row } = fixture();
+  book(0);
+  trade('sell', '99.95', 100, 'later');
+  book(125);
+  trade('sell', '99.94', 40, 'earlier', 130);
+  trade('sell', '99.93', 65, 'between', 150);
+  const buy = row(150, 'buy');
+  assert.deepEqual([buy.touches, buy.sweeps, buy.activeMs], [1, 1, 65]); // 40 ms, then 25 ms on the new order
+});
+
+test('all arrival orders replay the same swept quote, replacement and second sweep before stop', () => {
+  for (const sequence of ['ABC', 'ACB', 'BAC', 'BCA', 'CAB', 'CBA']) {
+    const { trial, book, trade } = fixture(); book(0);
+    const events = {
+      A: arrival => trade('sell', '99.95', 50, 'first', arrival),
+      B: arrival => book(arrival, { source: 100 }),
+      C: arrival => trade('sell', '99.95', 110, 'second', arrival),
+    };
+    [...sequence].forEach((name, index) => events[name](120 + index));
+    const result = trial.snapshot(START + 130, true);
+    const best = result.rows.find(r => r.side === 'buy' && r.distanceBps === 4);
+    assert.deepEqual([best.touches, best.sweeps, best.activeMs, result.endedAt], [2, 2, 60, START + 130], sequence);
+  }
+});
+
+test('same-millisecond depth precedes prints; an overflowing tail is discarded and recovers on fresh data', () => {
+  const { book, trade, row } = fixture();
+  book(0);
+  trade('sell', '99.95', 50, 'first');
+  trade('sell', '99.95', 100, 'same-time', 110);
+  book(120, { source: 100 });
+  assert.deepEqual([row(130, 'buy').sweeps, row(130, 'buy').activeMs], [2, 50]);
+  for (let i = 0; i < 2050; i++) trade('sell', '100.50', 140, String(i), 140);
+  assert.equal(row(200, 'buy').activeMs, 0);
+  book(3000);
+  trade('sell', '99.95', 3100, 'recovered');
+  assert.deepEqual([row(3100, 'buy').sweeps, row(3100, 'buy').activeMs], [1, 100]);
+});
+
 test('a venue clock 600 ms ahead keeps source-time causality and local exposure duration', () => {
   const { book, trade, row } = fixture();
   book(0, { source: 600 });
@@ -95,4 +154,16 @@ test('only protected, tick-aligned orders of a tradable size earn side time; rat
   const tiny = fixture(); tiny.rules.step = rules.step;
   tiny.book(0);
   assert.equal(tiny.row(1000, 'buy').activeMs, 0);
+});
+
+test('depth and prints from a halt cannot reopen the trial when they arrive after trading resumes', () => {
+  const { book, trade, rules, row } = fixture();
+  book(0);
+  rules.at = START + 50; rules.trading = false;
+  assert.equal(row(50, 'buy').activeMs, 50);
+  rules.at = START + 150; rules.trading = true;
+  book(160, { source: 100 });
+  trade('sell', '99.80', 120, 'during-halt', 170);
+  book(180);
+  assert.deepEqual([row(200, 'buy').touches, row(200, 'buy').activeMs], [0, 70]);
 });

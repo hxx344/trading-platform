@@ -18,7 +18,7 @@ export interface OndoMarketMaker {
   initialize(): void;
   save(value: unknown): Record<string, unknown>;
   start(input?: unknown, options?: { signal?: AbortSignal }): Promise<Record<string, unknown>>;
-  stop(): Promise<Record<string, unknown>>;
+  stop(expected?: { sessionId?: unknown; live?: unknown }): Promise<Record<string, unknown>>;
   cleanup(): Promise<Record<string, unknown>>;
   discardRecovery(): Record<string, unknown>;
   prepareStop(): Promise<void>;

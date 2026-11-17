@@ -4,7 +4,7 @@ export interface OndoBook { time: number; bids: [bigint, bigint][]; asks: [bigin
 export interface OndoPublicTrade { id: string; time: number; price: bigint; aggressorSide: 'buy' | 'sell' }
 export function parseOndoBook(row: unknown): OndoBook | null;
 export interface OndoStreamStatus { connected: boolean; publicReady: boolean; privateReady: boolean; deadManReady?: boolean; lastFrameAt: number | null; error: string | null }
-export interface OndoStream { start(): void; status(): OndoStreamStatus; close(): void }
+export interface OndoStream { start(): void; status(): OndoStreamStatus; close(): void; expireOrders?(confirmedClear: () => boolean): void }
 export interface OndoStreamOptions {
   markets: string[];
   credentials?: unknown;

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ONDO_MM_DEFAULTS, validateOndoMmConfig } from '../src/vendor/ondo/mm.mjs';
-import { quoteConfigRequest, quoteStartRequest } from '../web/src/ondo/quote-form.ts';
+import { quoteConfigRequest, quoteStartRequest, quoteStopRequest } from '../web/src/ondo/quote-form.ts';
 
 test('Ondo 挂单表单与服务使用一致的开仓保护、持仓和退出范围', () => {
   for (const config of [
@@ -28,4 +28,12 @@ test('Ondo 实盘仅对本次勾选的设置版本发送账户级撤单确认；
     assert.deepEqual(quoteStartRequest('live', 3, 3, adoptPositions), { revision: 3, confirmLive: true, confirmAccountWide: true, adoptPositions });
     assert.deepEqual(quoteStartRequest('observe', 3, 3, adoptPositions), { revision: 3 });
   }
+});
+
+test('Ondo 停止请求绑定所见会话和实盘标记；缺少活动会话就不能停止', () => {
+  assert.equal(quoteStopRequest(null), null);
+  assert.equal(quoteStopRequest({ phase: 'stopped', sessionId: null, live: false }), null);
+  assert.equal(quoteStopRequest({ phase: 'running', sessionId: null, live: true }), null);
+  assert.deepEqual(quoteStopRequest({ phase: 'running', sessionId: 'first', live: false }), { sessionId: 'first', live: false });
+  assert.deepEqual(quoteStopRequest({ phase: 'stopping', sessionId: 'next', live: true }), { sessionId: 'next', live: true });
 });

@@ -4,7 +4,7 @@ import { api } from './api.ts';
 import { clock, label, stamp } from './labels.ts';
 import { ACTIVE_STATUSES, CONFIRM_ACKNOWLEDGE, CONFIRM_NOT_CREATED, CONFIRM_RELEASE, DEFAULT_FORM, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, describeFourLeg, describeIntent, draftFourLegs, fourLegFormToIntent, hedgeVenueFor, leadTypeAllowed, draftLegs, formToIntent, jobActions, type OilForm, type OilFourLegIntent, type OilIntent, type OilLeadType, type OilSymbol, type OilVenue } from './oil-form.ts';
 import { crossPairs, type OilBook, type OilConfirmResult, type OilJob, type OilMarket, type OilPositionAccount, type OilPreview, type OilPreviewLeg, type OilState } from './oil-types.ts';
-import { groupJobs, groupStatus, isFourLegPreview, type FourLegConfirmResult, type FourLegPreview } from './four-leg.ts';
+import { groupJobs, groupStatus, isFourLegPreview, type FourLegConfirmResult, type FourLegPreview, type GroupState } from './four-leg.ts';
 import { RequestIds } from './request-ids.ts';
 import { StatePanel } from './StateViews.tsx';
 import { OilPnl } from './OilPnl.tsx';
@@ -267,7 +267,7 @@ export function FourLegInputs({ legs, action, leadTypes, onLeadType, legName, id
   })}</div>;
 }
 
-const GROUP_BADGE: Record<string, string> = { completed: 'completed', running: 'running', incomplete: 'attention' };
+const GROUP_BADGE: Record<GroupState, string> = { completed: 'completed', running: 'running', incomplete: 'attention', unbalanced: 'attention', unlisted: '' };
 
 /** A four-leg group in the job list: its overall status, then the two venues' jobs as their own cards. */
 function FourLegGroup({ jobs, card }: { jobs: OilJob[]; card: (job: OilJob) => ReactNode }) {
@@ -278,7 +278,7 @@ function FourLegGroup({ jobs, card }: { jobs: OilJob[]; card: (job: OilJob) => R
   return <section className="execution-job-group" data-four-leg={first.group?.id} aria-label={`${title} ${overall.text}`}>
     <header><h3>{title} <span className={`execution-badge ${GROUP_BADGE[overall.status]}`}>{overall.text}</span></h3>
       <p>组 {first.group?.id.slice(0, 8)} · 停止任一所的任务会同时停止另一所；一所未完成时另一所不再发送新的首腿，已成交部分照常对冲。</p></header>
-    {overall.details.length ? <ul className={`execution-job-group-notes${overall.status === 'incomplete' ? ' warning' : ''}`} role={overall.status === 'incomplete' ? 'alert' : undefined}>{overall.details.map(text => <li key={text}>{text}</li>)}</ul> : null}
+    {overall.details.length ? <ul className={`execution-job-group-notes${GROUP_BADGE[overall.status] === 'attention' ? ' warning' : ''}`} role={GROUP_BADGE[overall.status] === 'attention' ? 'alert' : undefined}>{overall.details.map(text => <li key={text}>{text}</li>)}</ul> : null}
     {jobs.map(card)}
   </section>;
 }
@@ -323,6 +323,8 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
       // Four legs: the pair is listed in venue order (venuePairs), and the second venue's lead chases its own way too.
       if (key === 'preset' && value === 'four-leg' && OIL_VENUES.indexOf(next.venue) > OIL_VENUES.indexOf(next.hedgeVenue)) [next.venue, next.hedgeVenue] = [next.hedgeVenue, next.venue];
       if (!leadTypeAllowed(next.hedgeVenue, next.peerLeadOrderType)) next.peerLeadOrderType = 'market';
+      // The four-leg direction names the first venue's spread, so it is picked afresh whenever the preset changes.
+      if (key === 'preset') next.fourSpread = '';
       // A native chase is never batched; its batch fields are hidden, so they must not keep a stale count.
       if (chased(next)) { next.batchCount = '1'; next.batchIntervalSeconds = '0'; }
       return next;
@@ -331,7 +333,8 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   };
   const setPair = (pair: string): void => {
     const [venue, hedgeVenue] = pair.split(',') as [OilVenue, OilVenue];
-    setForm(current => ({ ...current, venue, hedgeVenue, ...(leadTypeAllowed(venue, current.leadOrderType) ? {} : { leadOrderType: 'market' }), ...(leadTypeAllowed(hedgeVenue, current.peerLeadOrderType) ? {} : { peerLeadOrderType: 'market' }) }));
+    // Another first venue turns the same direction into the opposite trade: the direction is picked again.
+    setForm(current => ({ ...current, venue, hedgeVenue, fourSpread: current.venue === venue && current.hedgeVenue === hedgeVenue ? current.fourSpread : '', ...(leadTypeAllowed(venue, current.leadOrderType) ? {} : { leadOrderType: 'market' }), ...(leadTypeAllowed(hedgeVenue, current.peerLeadOrderType) ? {} : { peerLeadOrderType: 'market' }) }));
     changed();
   };
   const four = form.preset === 'four-leg';
@@ -405,8 +408,8 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
         <legend className="visually-hidden">选择组合并填写交易参数</legend>
         <div className="execution-presets oil-presets" role="group" aria-label="交易预设">
           <button type="button" aria-pressed={form.preset === 'same-exchange'} data-oil-preset="same-exchange" onClick={() => { if (form.preset !== 'same-exchange') set('preset', 'same-exchange'); }}>同所价差<small>单所 · BZ 对 CL · 两腿同一账户</small></button>
-          <button type="button" aria-pressed={form.preset === 'cross-exchange'} data-oil-preset="cross-exchange" disabled={!cross} onClick={() => { if (form.preset !== 'cross-exchange') set('preset', 'cross-exchange'); }}>跨所同合约<small>{cross ? `${venues.length === 2 ? `${VENUE_LABEL[venues[0]!]} 对 ${VENUE_LABEL[venues[1]!]}` : '任选两所'} · 同一合约` : '需配置两个交易所的执行账户'}</small></button>
           <button type="button" aria-pressed={four} data-oil-preset="four-leg" disabled={!cross} onClick={() => { if (!four) set('preset', 'four-leg'); }}>四腿组合<small>{cross ? `${venues.length === 2 ? `${VENUE_LABEL[venues[0]!]} 与 ${VENUE_LABEL[venues[1]!]}` : '任选两所'} · BZ 对 CL` : '需配置两个交易所的执行账户'}</small></button>
+          <button type="button" aria-pressed={form.preset === 'cross-exchange'} data-oil-preset="cross-exchange" disabled={!cross} onClick={() => { if (form.preset !== 'cross-exchange') set('preset', 'cross-exchange'); }}>跨所同合约<small>{cross ? `${venues.length === 2 ? `${VENUE_LABEL[venues[0]!]} 对 ${VENUE_LABEL[venues[1]!]}` : '任选两所'} · 同一合约` : '需配置两个交易所的执行账户'}</small></button>
         </div>
         <div className="execution-row">
           <Choice label="交易动作" id="oilAction" value={form.action} options={[['open', '开仓'], ['close', '平仓']]} onChange={next => set('action', next)} />
@@ -423,9 +426,9 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
           <div className="execution-direction-options" role="group" aria-label={form.action === 'open' ? '开仓方向' : '待平仓方向'}>
             {(['long', 'short'] as const).map(side => {
               if (four) {
-                const pressed = form.spread === side, shown = draftFourLegs({ ...form, spread: side });
+                const pressed = form.fourSpread === side, shown = draftFourLegs(form, side);
                 const ordered = [shown.slice(0, 2), shown.slice(2)].flatMap(pair => [...pair].sort((a, b) => Number(b.symbol === 'BZUSDT') - Number(a.symbol === 'BZUSDT')));
-                return <button key={side} type="button" aria-pressed={pressed} data-oil-direction={side} onClick={() => { if (!pressed) set('spread', side); }}>
+                return <button key={side} type="button" aria-pressed={pressed} data-oil-direction={side} onClick={() => { if (!pressed) set('fourSpread', side); }}>
                   <span className="oil-direction-name">{VENUE_LABEL[form.venue]} {side === 'long' ? '做多' : '做空'}价差 · {VENUE_LABEL[form.hedgeVenue]} {side === 'long' ? '做空' : '做多'}价差</span>
                   {ordered.map(leg => <span key={`${leg.venue}:${leg.symbol}`} className={`execution-leg-chip ${leg.side}`}>{VENUE_LABEL[leg.venue]} {short(leg.symbol ?? '')} <b>{leg.side === 'long' ? '多' : '空'}</b></span>)}
                 </button>;
@@ -445,7 +448,8 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
           <label className="execution-amount">每腿桶数<span className="execution-input-unit"><input id="oilBarrels" type="text" inputMode="decimal" autoComplete="off" maxLength={24} value={form.barrels} placeholder="例如 10" onChange={event => set('barrels', event.target.value)} /><span aria-hidden="true">桶</span></span></label>
           <p className="execution-help">{four ? '四腿' : '两腿'}桶数相同，按各合约每张桶数换算成合约数量；不足一个数量步长的部分由预览指出，实际各腿数量以预览为准。</p>
         </div>
-        {four ? <FourLegInputs legs={draftFourLegs(form)} action={form.action} leadTypes={[form.leadOrderType, form.peerLeadOrderType]} onLeadType={(venue, next) => set(venue === 0 ? 'leadOrderType' : 'peerLeadOrderType', next)} legName={short} idPrefix="oil" hedgeNote="本所首腿成交后按市价跟上相同桶数；首腿挂单期间的成交也会随时跟上。" />
+        {four && !form.fourSpread ? <p className="execution-choose-direction" id="oilChooseDirection">先选择方向，再设置各腿下单方式。</p>
+        : four ? <FourLegInputs legs={draftFourLegs(form, form.fourSpread || 'long')} action={form.action} leadTypes={[form.leadOrderType, form.peerLeadOrderType]} onLeadType={(venue, next) => set(venue === 0 ? 'leadOrderType' : 'peerLeadOrderType', next)} legName={short} idPrefix="oil" hedgeNote="本所首腿成交后按市价跟上相同桶数；首腿挂单期间的成交也会随时跟上。" />
         : <div className="execution-leg-inputs">{legs.map((leg, index) => {
           const symbol = leg.symbol ?? form.symbol;
           return <section key={index} className="execution-leg-input" aria-label={`${index === 0 ? '首腿' : '对冲腿'} ${VENUE_LABEL[leg.venue]} ${short(symbol)} 交易参数`}>
@@ -472,7 +476,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
         </details>
         <div className="execution-builder-footer">
           {preview ? <p>正在确认上方预览；返回修改参数后可重新填写。</p> : messageView ?? <p>预览会重新读取盘口、交易规则与持仓，不会下单。</p>}
-          <button className="button primary" type="submit" id="oilPreviewBtn">{busy && !preview ? <LoaderCircle size={16} className="spin" aria-hidden="true" /> : <ArrowRightLeft size={16} aria-hidden="true" />}预览{action}组合</button>
+          <button className="button primary" type="submit" id="oilPreviewBtn" disabled={four && !form.fourSpread}>{busy && !preview ? <LoaderCircle size={16} className="spin" aria-hidden="true" /> : <ArrowRightLeft size={16} aria-hidden="true" />}预览{action}组合</button>
         </div>
       </fieldset>
     </form>

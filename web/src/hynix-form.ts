@@ -16,6 +16,8 @@ export interface HynixForm {
   action: 'open' | 'close';
   /** Same venue: long the premium is long the ADR / short the ordinary share (on open; close takes the same choice back). */
   premium: OilSide;
+  /** Four legs: the first venue's premium, unset ('') until picked; cleared with the preset or the venue pair (oil-form.ts fourSpread). */
+  fourPremium: OilSide | '';
   /** Same venue: the contract sent first. */
   leadSymbol: HynixSymbol;
   /** Cross venue: the one contract both legs trade. */
@@ -52,7 +54,7 @@ export interface HynixFourLegIntent {
 
 export const DEFAULT_HYNIX_FORM: HynixForm = {
   preset: 'same-exchange', venue: 'binance', hedgeVenue: 'bybit', action: 'open', premium: 'short', leadSymbol: 'SKHYUSDT', symbol: 'SKHYUSDT', leadSide: 'long',
-  sizing: 'notional', notional: '', leadQuantity: '', hedgeQuantity: '', leadOrderType: 'market', peerLeadOrderType: 'market', chaseLimit: '', timeoutSeconds: '60', slippageBps: '',
+  sizing: 'notional', notional: '', leadQuantity: '', hedgeQuantity: '', leadOrderType: 'market', fourPremium: '', peerLeadOrderType: 'market', chaseLimit: '', timeoutSeconds: '60', slippageBps: '',
   batchCount: '1', batchIntervalSeconds: '0',
 };
 
@@ -119,18 +121,20 @@ export function hynixFormToIntent(form: HynixForm): { intent: HynixIntent } | { 
 export function hynixFourLegFormToIntent(form: HynixForm): { intent: HynixFourLegIntent } | { error: string } {
   if (form.hedgeVenue === form.venue) return { error: '四腿须选择两个不同的交易所' };
   if (form.sizing !== 'notional') return { error: '四腿须按每腿相同的名义金额下单' };
-  const first = hynixFormToIntent({ ...form, preset: 'same-exchange', chaseLimit: '' });
+  if (!form.fourPremium) return { error: '请先选择方向' };
+  const premium = form.fourPremium;
+  const first = hynixFormToIntent({ ...form, preset: 'same-exchange', chaseLimit: '', premium });
   if ('error' in first) return first;
-  const second = hynixFormToIntent({ ...form, preset: 'same-exchange', chaseLimit: '', venue: form.hedgeVenue, premium: opposite(form.premium), leadOrderType: form.peerLeadOrderType });
+  const second = hynixFormToIntent({ ...form, preset: 'same-exchange', chaseLimit: '', venue: form.hedgeVenue, premium: opposite(premium), leadOrderType: form.peerLeadOrderType });
   if ('error' in second) return { error: `${VENUE_LABEL[form.hedgeVenue]}：${second.error}` };
   const { preset: _preset, symbol: _symbol, legs, ...common } = first.intent;
   return { intent: { ...common, preset: 'four-leg', legs: [...legs, ...second.intent.legs] } };
 }
 
-/** The four legs a four-leg form describes, in the intent's order. */
-export function draftHynixFourLegs(form: HynixForm): [HynixLegIntent, HynixLegIntent, HynixLegIntent, HynixLegIntent] {
-  const same = { ...form, preset: 'same-exchange' as const, chaseLimit: '', sizing: 'notional' as const };
-  return [...draftHynixLegs(same), ...draftHynixLegs({ ...same, venue: form.hedgeVenue, premium: opposite(form.premium), leadOrderType: form.peerLeadOrderType })];
+/** The four legs a four-leg form describes for a picked premium, in the intent's order. */
+export function draftHynixFourLegs(form: HynixForm, premium: OilSide): [HynixLegIntent, HynixLegIntent, HynixLegIntent, HynixLegIntent] {
+  const same = { ...form, preset: 'same-exchange' as const, chaseLimit: '', sizing: 'notional' as const, premium };
+  return [...draftHynixLegs(same), ...draftHynixLegs({ ...same, venue: form.hedgeVenue, premium: opposite(premium), leadOrderType: form.peerLeadOrderType })];
 }
 
 /** One line for the confirm dialog and the preview heading, e.g. "开仓四腿 Binance 做空溢价 / Bybit 做多溢价". */
@@ -152,7 +156,7 @@ export function describeHynixIntent(intent: HynixIntent): string {
 }
 
 /** The fields that decide which contract and account each leg is: a change to any of them clears the per-leg quantities. */
-export const LEG_FIELDS: readonly (keyof HynixForm)[] = ['preset', 'venue', 'hedgeVenue', 'action', 'premium', 'leadSymbol', 'symbol', 'leadSide'];
+export const LEG_FIELDS: readonly (keyof HynixForm)[] = ['preset', 'venue', 'hedgeVenue', 'action', 'premium', 'fourPremium', 'leadSymbol', 'symbol', 'leadSide'];
 
 /** The held amounts a position read gives, by side and contract (null: that account's read has not answered). */
 export interface HeldPositions { venue: string; long: Record<string, string> | null; short: Record<string, string> | null }

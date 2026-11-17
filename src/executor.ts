@@ -13,6 +13,7 @@ import {
 } from './connector.ts';
 import type { Store } from './store.ts';
 import { nearestBarrels, quantityForBarrels, splitBarrels } from './barrels.ts';
+import { fillGapText, fillGaps, type FillLeg } from './four-leg-fill.ts';
 import { midOf, proportionalHedge, quantityForNotional, splitSteps } from './hynix/sizing.ts';
 import { pairBalance, rebalanceOrder, type HeldContract, type RebalanceMethod } from './hynix/balance.ts';
 import { createTransfers, type PairRecord, type TransferDeps } from './transfer.ts';
@@ -471,7 +472,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       if (op.state === 'prepared') { Object.assign(op, { state: 'not-sent', note: '恢复：落盘后、发送前中断，传输未调用' }); saveOp(op); event(op.jobId, 'operation-recovered', { op: op.id, state: op.state }); }
       else if (op.state === 'sending') { Object.assign(op, { state: 'unknown', note: isStrategy(op) ? `恢复：追价策略发送中断，结果未知；交易所无客户编号，需人工认领或确认未创建${ackHint(op)}` : '恢复：发送中断，结果未知，按原客户订单号核对' }); saveOp(op); event(op.jobId, 'operation-recovered', { op: op.id, state: op.state }); }
     }
-    for (const job of unfinishedJobs()) {
+    // Read afresh each time: finishing one job of a four-leg group writes the other's linked halt (haltPeer).
+    for (const { id } of unfinishedJobs()) {
+      const job = readJob(id);
+      if (FINAL_JOB.has(job.status)) continue;
       if (job.status === 'accepted' && !opsOf(job.id).length) finish(job, 'failed', '服务重启时任务尚未发送，已取消；请重新预览');
       else if (!job.holdNewSends) { job.holdNewSends = true; job.reason = isPair(job) ? '服务恢复：核对已发送委托；首腿不再新发并撤销挂单，已成交部分按落盘进度补发对冲腿' : '服务恢复：核对已发送的调平委托；不再新发并撤销挂单'; saveJob(job); event(job.id, 'job-held', {}); }
     }
@@ -502,20 +506,56 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     // An unhedged or unverified exposure must not let a new job trade the same symbol on that account.
     if (status !== 'attention') db.prepare('DELETE FROM locks WHERE job_id = ?').run(job.id);
     event(job.id, 'job-finished', { status, reason });
-    if (status !== 'completed' && job.group) haltPeer(job, status, reason);
+    if (job.group && isPair(job)) {
+      const venue = VENUE_NAMES[job.legs[0].venue];
+      if (status !== 'completed') haltPeer(job, `${venue} 任务${STATUS_TEXT[status]}${reason ? `：${reason.slice(0, 120)}` : ''}`);
+      else {
+        // A completed job may have filled less than planned (a local chase's end, a partial IOC): the other venue then stops too.
+        const filled = add('0', ...opsOf(job.id).filter(item => item.leg === 0).map(item => item.filledQuantity));
+        if (cmp(filled, job.legs[0].quantity) < 0) haltPeer(job, `${venue} 任务已完成但首腿成交少于计划（${filled} / ${job.legs[0].quantity}）`);
+      }
+      checkGroupFills(job);
+    }
   }
   const STATUS_TEXT: Record<JobStatus, string> = { accepted: '已受理', running: '执行中', completed: '已完成', failed: '失败', stopped: '已停止', attention: '需人工处理' };
   /**
    * The other job of a four-leg group, once this one ended without completing: no new lead goes out there, a resting lead
    * is withdrawn and its fills are still hedged (docs/oil.md 11.3). A job already over or already told to stop is left alone.
    */
-  function haltPeer(job: Job, status: JobStatus, reason: string | null): void {
+  function haltPeer(job: Job, why: string, detail: Record<string, unknown> = {}): void {
     const peer = readJob((job.group as JobGroup).peer);
     if (FINAL_JOB.has(peer.status) || peer.peerHalt || stopRequested(peer.id)) return;
-    peer.peerHalt = `${VENUE_NAMES[job.legs[0].venue]} 任务${STATUS_TEXT[status]}${reason ? `：${reason.slice(0, 120)}` : ''}`;
-    peer.reason = '四腿另一交易所任务未完成：不再发送新的首腿，撤销首腿挂单，已成交部分照常对冲';
+    peer.peerHalt = why;
+    peer.reason = '四腿另一交易所任务未完成或已停止：不再发送新的首腿，撤销首腿挂单，已成交部分照常对冲';
     saveJob(peer);
-    event(peer.id, 'four-leg-halted', { by: job.id, status });
+    event(peer.id, 'four-leg-halted', { by: job.id, reason: why, ...detail });
+  }
+  /** Once both jobs of a group are over, fills that differ between the venues are recorded for Feishu (four-leg-fill.ts). */
+  function checkGroupFills(job: Job): void {
+    const group = job.group as JobGroup;
+    if (!FINAL_JOB.has(readJob(group.peer).status)) return;
+    const legsOf = (id: string): FillLeg[] => {
+      const view = jobView(id);
+      return view.legs.map(leg => ({ venue: VENUE_NAMES[leg.venue as Venue] ?? leg.venue, symbol: leg.symbol, filled: leg.filledQuantity, planned: leg.plannedQuantity, step: leg.quantityStep,
+        shown: view.market === 'oil' ? `${leg.filledBarrels} / ${leg.plannedBarrels} 桶` : `${leg.filledQuantity} / ${leg.plannedQuantity}` }));
+    };
+    const [first, second] = group.index === 0 ? [job.id, group.peer] : [group.peer, job.id];
+    const gaps = fillGaps(legsOf(first), legsOf(second));
+    if (gaps.length) event(job.id, 'four-leg-unbalanced', { group: group.id, peer: group.peer, details: gaps.map(fillGapText) });
+  }
+  /**
+   * Before a group's first lead goes out, the other venue's job is checked too (L100): if its lead could not go out now, this
+   * one waits, so one venue does not open alone. The text says why, or null when the other job is already past this point.
+   */
+  async function peerFirstLeadBlocked(job: PairJob): Promise<string | null> {
+    if (!job.group) return null;
+    const peer = readJob(job.group.peer);
+    if (!isPair(peer) || FINAL_JOB.has(peer.status) || peer.peerHalt || peer.holdNewSends || stopRequested(peer.id) || legOps(peer.id, 0).length) return null;
+    try { await guardLead(peer); return null; }
+    catch (error) {
+      if (error instanceof WriterLostError) throw error;
+      return `${VENUE_NAMES[peer.legs[0].venue]}：${error instanceof Error ? error.message.slice(0, 160) : '发送前检查失败'}`;
+    }
   }
 
   // ---- accounts ----------------------------------------------------------------
@@ -991,8 +1031,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(requestId, 'stop', payload, session, jobId, now());
         if (!FINAL_JOB.has(job.status)) { db.prepare('INSERT OR IGNORE INTO stop_requests(job_id, request_id, requested_at) VALUES (?, ?, ?)').run(jobId, requestId, now()); event(jobId, 'stop-requested', { requestId }); }
         // A four-leg stop stops both venues' jobs (docs/oil.md 11.3).
-        const peer = job.group ? readJob(job.group.peer) : null;
-        if (peer && !FINAL_JOB.has(peer.status)) { db.prepare('INSERT OR IGNORE INTO stop_requests(job_id, request_id, requested_at) VALUES (?, ?, ?)').run(peer.id, requestId, now()); event(peer.id, 'stop-requested', { requestId, via: jobId }); }
+        // The other venue gets the linked halt, not a stop: its lead stops and is withdrawn, its fills are still hedged, so
+        // no exposure is left on the venue the user did not stop.
+        if (job.group && !FINAL_JOB.has(job.status)) haltPeer(job, `${VENUE_NAMES[job.legs[0].venue]} 任务已请求停止`, { requestId });
       }
       return jobView(jobId);
     });
@@ -1701,6 +1742,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         if (retry && now() < job.deadlineAt) { write(() => { const current = readJob(job.id); current.reason = reason; saveJob(current); }); return; }
         write(() => finish(readJob(job.id), 'failed', reason, error instanceof ContractError && error.code === 'price_moved' ? 'price_moved' : undefined)); return;
       }
+      // The other venue's refusal ends that job in its own turn, which halts this one; until then this one only waits.
+      const blocked = await peerFirstLeadBlocked(job);
+      if (blocked) { const reason = `四腿另一交易所首腿暂不能发送（${blocked}），本所首腿等待`; write(() => { const current = readJob(job.id); if (current.reason !== reason) { current.reason = reason; saveJob(current); } }); return; }
       try { await sendLead(job, quote, 0, 0); }
       catch (error) {
         if (!(error instanceof ContractError) || error.code !== 'price_moved') throw error;
@@ -2151,7 +2195,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       legs: job.legs.map(leg => {
         const mine = ops.filter(item => item.leg === leg.index).sort((a, b) => attemptOf(a) - attemptOf(b)), op = mine.at(-1), filledQuantity = add('0', ...mine.map(item => item.filledQuantity));
         return { venue: leg.venue, symbol: leg.symbol, side: leg.side, orderSide: leg.orderSide, orderType: leg.orderType, plannedQuantity: leg.quantity, accountId: maskId(leg.accountId), priceBound: leg.priceBound ?? null, limitPrice: leg.limitPrice ?? null,
-          contractSize: leg.instrument.contractSize, plannedBarrels: exposure(leg.quantity, leg.instrument), filledBarrels: exposure(filledQuantity, leg.instrument), averagePrice: averageOf(mine),
+          contractSize: leg.instrument.contractSize, quantityStep: leg.instrument.quantityStep, plannedBarrels: exposure(leg.quantity, leg.instrument), filledBarrels: exposure(filledQuantity, leg.instrument), averagePrice: averageOf(mine),
           previewQuote: { bid: leg.quote.bid, ask: leg.quote.ask },
           attempts: mine.length, filledQuantity,
           operation: op ? { kind: op.kind ?? 'order', clientOrderId: op.clientOrderId, state: op.state, quantity: op.request.quantity, limitPrice: (op.request as { limitPrice?: string | null }).limitPrice ?? null, filledQuantity: op.filledQuantity, averagePrice: op.averagePrice, remoteId: op.remoteId,
@@ -2218,7 +2262,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       const rows = market
         ? db.prepare(`SELECT id FROM jobs WHERE json_extract(json, '$.legs[0].symbol') IN (${MARKET_SYMBOLS[market].map(() => '?').join(', ')}) ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(...MARKET_SYMBOLS[market], count)
         : db.prepare('SELECT id FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?').all(count);
-      return (rows as { id: string }[]).map(row => jobView(row.id));
+      // A four-leg job whose other job fell outside the limit brings it along, so the page always shows the group whole.
+      const views = (rows as { id: string }[]).map(row => jobView(row.id));
+      for (const view of [...views]) if (view.group && !views.some(item => item.id === view.group!.peer)) views.push(jobView(view.group.peer));
+      return views;
     },
     /** Principal ids are masked: the page needs to tell accounts apart, not to see who they are. */
     accounts: () => (db.prepare('SELECT * FROM accounts WHERE environment = ? ORDER BY venue').all(environment) as unknown as AccountRow[])

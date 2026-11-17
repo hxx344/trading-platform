@@ -6,8 +6,9 @@ import { randomUUID } from 'node:crypto';
 import { ContractError, parseFourLegIntent } from '../src/contracts.ts';
 import { SIM_ACCOUNTS } from '../src/simulation.ts';
 import type { SimulatedVenue } from '../src/sim-venue.ts';
-import { describeJob, type JobSummary } from '../src/service/feishu.ts';
-import { SESSION, bindAccounts, createHarness, previewAndConfirm, type Harness } from './harness.ts';
+import { describeEvent, describeJob, type JobSummary } from '../src/service/feishu.ts';
+import { SESSION, bindAccounts, createHarness, openIntent, previewAndConfirm, type Harness } from './harness.ts';
+import { fillGaps, fillGapText, type FillLeg } from '../src/four-leg-fill.ts';
 import { DEFAULT_FORM, describeFourLeg, fourLegFormToIntent, type OilForm } from '../web/src/oil-form.ts';
 import { DEFAULT_HYNIX_FORM, describeHynixFourLeg, hynixFourLegFormToIntent } from '../web/src/hynix-form.ts';
 import { groupJobs, groupStatus } from '../web/src/four-leg.ts';
@@ -31,8 +32,8 @@ const hynixIntent = (notional = '100') => ({
   market: 'hynix', preset: 'four-leg', action: 'open', timeoutMs: 60_000,
   legs: [leg('binance', 'SKHYUSDT', 'long', { notional }), leg('binance', 'SKHYNIXUSDT', 'short', { notional }), leg('bybit', 'SKHYUSDT', 'short', { notional }), leg('bybit', 'SKHYNIXUSDT', 'long', { notional })],
 });
-async function withHarness(run: (h: Harness) => Promise<void>) {
-  const h = createHarness();
+async function withHarness(run: (h: Harness) => Promise<void>, options: Parameters<typeof createHarness>[0] = {}) {
+  const h = createHarness(options);
   bindAccounts(h.ex);
   try { await run(h); } finally { h.dispose(); }
 }
@@ -158,15 +159,17 @@ test('四腿一边失败时另一边首腿正挂单：撤首腿挂单，已成�
   assert.equal(locks(h).length, 0);
 }));
 
-test('四腿停止：停止任一个子任务同时停止另一个；同一请求编号重放不报错', () => withHarness(async h => {
+test('四腿停止：停止任一个子任务，另一个记联动停止（不是普通停止）；同一请求编号重放不报错', () => withHarness(async h => {
   const { ids } = await confirmFour(h);
   const stopId = randomUUID();
   const view = h.ex.requestStop(ids[1]!, stopId, SESSION);
   assert.equal(view.stopRequested, true);
-  assert.equal(h.ex.jobView(ids[0]!).stopRequested, true);
+  const peer = h.ex.jobView(ids[0]!);
+  assert.equal(peer.stopRequested, false);
+  assert.equal(peer.peerHalt, 'Bybit 任务已请求停止');
   assert.equal(h.ex.requestStop(ids[1]!, stopId, SESSION).stopRequested, true);
   const views = await settleAll(h, ids);
-  assert.deepEqual(views.map(item => [item.status, item.reason]), [['stopped', '已停止，未发送任何委托'], ['stopped', '已停止，未发送任何委托']]);
+  assert.deepEqual(views.map(item => [item.status, item.reason]), [['stopped', '四腿联动停止（Bybit 任务已请求停止），未发送任何委托'], ['stopped', '已停止，未发送任何委托']]);
   assert.equal(ordersOf(h.binance).length + ordersOf(h.bybit).length, 0);
   assert.equal(locks(h).length, 0);
 }));
@@ -185,7 +188,7 @@ test('四腿一边转人工：另一边照常对冲完成，待人工的任务�
 }));
 
 test('四腿页面表单：甲所按所选价差、乙所反向，两所都先下所选合约，各自首腿方式；通过执行器校验，页面先拒绝同所与追价分批', () => {
-  const form: OilForm = { ...DEFAULT_FORM, preset: 'four-leg', venue: 'binance', hedgeVenue: 'bybit', spread: 'long', leadSymbol: 'BZUSDT', barrels: '10', leadOrderType: 'local-chase', peerLeadOrderType: 'chase', chaseLimit: '70' };
+  const form: OilForm = { ...DEFAULT_FORM, preset: 'four-leg', venue: 'binance', hedgeVenue: 'bybit', fourSpread: 'long', leadSymbol: 'BZUSDT', barrels: '10', leadOrderType: 'local-chase', peerLeadOrderType: 'chase', chaseLimit: '70' };
   const built = fourLegFormToIntent(form);
   assert.ok('intent' in built);
   const parsed = parseFourLegIntent(built.intent);
@@ -195,8 +198,11 @@ test('四腿页面表单：甲所按所选价差、乙所反向，两所都先�
   ]);
   assert.equal(describeFourLeg(built.intent), '开仓四腿 Binance 做多价差 / Bybit 做空价差');
   assert.match((fourLegFormToIntent({ ...form, hedgeVenue: 'binance' }) as { error: string }).error, /两个不同/);
+  // No direction until one is picked (the page clears it on a preset or venue-pair change and disables the preview).
+  assert.equal((fourLegFormToIntent({ ...form, fourSpread: '' }) as { error: string }).error, '请先选择方向');
+  assert.equal((hynixFourLegFormToIntent({ ...DEFAULT_HYNIX_FORM, preset: 'four-leg', venue: 'binance', hedgeVenue: 'okx', notional: '500', sizing: 'notional' }) as { error: string }).error, '请先选择方向');
   assert.match((fourLegFormToIntent({ ...form, batchCount: '2', batchIntervalSeconds: '5' }) as { error: string }).error, /^Bybit：分批只用于/);
-  const hynix = hynixFourLegFormToIntent({ ...DEFAULT_HYNIX_FORM, preset: 'four-leg', venue: 'binance', hedgeVenue: 'okx', premium: 'short', notional: '500', sizing: 'notional' });
+  const hynix = hynixFourLegFormToIntent({ ...DEFAULT_HYNIX_FORM, preset: 'four-leg', venue: 'binance', hedgeVenue: 'okx', fourPremium: 'short', notional: '500', sizing: 'notional' });
   assert.ok('intent' in hynix);
   assert.deepEqual(parseFourLegIntent(hynix.intent).legs.map(item => [item.venue, item.symbol, item.side, item.notional]), [
     ['binance', 'SKHYUSDT', 'short', '500'], ['binance', 'SKHYNIXUSDT', 'long', '500'], ['okx', 'SKHYUSDT', 'long', '500'], ['okx', 'SKHYNIXUSDT', 'short', '500'],
@@ -205,10 +211,10 @@ test('四腿页面表单：甲所按所选价差、乙所反向，两所都先�
   assert.match((hynixFourLegFormToIntent({ ...DEFAULT_HYNIX_FORM, preset: 'four-leg', action: 'close', sizing: 'quantity', leadQuantity: '1', hedgeQuantity: '1' }) as { error: string }).error, /名义金额/);
 });
 
-test('四腿任务列表：两个子任务按组排在一起；整体状态为执行中、已完成或四腿不完整，结束后标出两所成交不等', () => {
+test('四腿任务列表：两个子任务按组排在一起；整体状态为执行中、已完成、两所成交不等、四腿不完整或另一所未列出', () => {
   const job = (id: string, venue: string, status: string, filled: [string, string], group?: { id: string; index: number; peer: string }) => ({
     id, market: 'oil', preset: 'same-exchange', action: 'open', status, group: group ?? null,
-    legs: (['BZUSDT', 'CLUSDT'] as const).map((symbol, index) => ({ venue, symbol, filledBarrels: filled[index], plannedBarrels: '10', filledQuantity: filled[index], plannedQuantity: '10' })),
+    legs: (['BZUSDT', 'CLUSDT'] as const).map((symbol, index) => ({ venue, symbol, filledBarrels: filled[index], plannedBarrels: '10', filledQuantity: filled[index], plannedQuantity: '10', quantityStep: '1' })),
   }) as unknown as OilJob;
   const a = job('a', 'binance', 'completed', ['10', '10'], { id: 'g', index: 0, peer: 'b' });
   const b = job('b', 'bybit', 'running', ['4', '4'], { id: 'g', index: 1, peer: 'a' });
@@ -219,7 +225,111 @@ test('四腿任务列表：两个子任务按组排在一起；整体状态为�
   assert.equal(groupStatus([a, { ...b, status: 'completed', legs: a.legs.map(item => ({ ...item, venue: 'bybit' })) }]).status, 'completed');
   const stopped = groupStatus([a, { ...b, status: 'stopped' }]);
   assert.equal(stopped.text, '四腿不完整');
-  assert.deepEqual(stopped.details, ['Bybit 任务已停止', 'BZ 两所成交桶数不等：Binance 10 桶，Bybit 4 桶', 'CL 两所成交桶数不等：Binance 10 桶，Bybit 4 桶']);
+  assert.deepEqual(stopped.details, ['Bybit 任务已停止', 'BZ 两所成交不等：Binance 10 / 10 桶，Bybit 4 / 10 桶', 'CL 两所成交不等：Binance 10 / 10 桶，Bybit 4 / 10 桶']);
+  // Both completed, one short: the same rule as the executor's alert; one quantity step apart is not a gap.
+  assert.deepEqual(groupStatus([a, { ...b, status: 'completed' }]).status, 'unbalanced');
+  assert.deepEqual(groupStatus([a, job('b', 'bybit', 'completed', ['9', '10'], { id: 'g', index: 1, peer: 'a' })]), { status: 'completed', text: '已完成', details: [] });
   assert.deepEqual(groupStatus([{ ...a, status: 'failed' }, { ...b, status: 'attention' }]).details.slice(0, 2), ['Bybit 任务需人工处理，请先处理', 'Binance 任务失败']);
-  assert.deepEqual(groupStatus([a]).details, ['另一交易所的任务不在当前列表中，请到交易所核对']);
+  assert.deepEqual(groupStatus([a]), { status: 'unlisted', text: '另一所未列出', details: ['另一交易所的任务不在当前列表中，可在该交易所的成交记录里核对'] });
+  assert.equal(groupStatus([b]).status, 'running');
 });
+
+test('四腿预览：过期、接管换代次后确认被拒绝；四腿确认不接受普通预览', () => withHarness(async h => {
+  const expired = await h.ex.previewFourLeg(fourIntent(), SESSION);
+  h.advance(121_000);
+  assert.throws(() => h.ex.confirmFourLeg({ previewId: expired.id, requestId: randomUUID(), confirmLive: true }, SESSION), code('preview_invalid'));
+  const plain = await h.ex.preview(openIntent(), SESSION);
+  assert.throws(() => h.ex.confirmFourLeg({ previewId: plain.id, requestId: randomUUID(), confirmLive: true }, SESSION), (error: unknown) => code('preview_invalid')(error) && /这不是四腿预览/.test((error as Error).message));
+  const old = await h.ex.previewFourLeg(fourIntent(), SESSION);
+  h.clock.now += 61_000;
+  h.restart();
+  assert.equal(h.ex.acquire(), true);
+  assert.throws(() => h.ex.confirmFourLeg({ previewId: old.id, requestId: randomUUID(), confirmLive: true }, SESSION), code('preview_generation'));
+  assert.equal(jobCount(h), 0);
+}, { budgets: { previewTtlMs: 120_000 } }));
+
+test('四腿接管恢复：组关系与联动停止在重启后保留，恢复时一边结束写下的联动停止不被另一边的旧快照覆盖', () => withHarness(async h => {
+  const { ids, result } = await confirmFour(h);
+  // Nothing was sent before the old writer went away: the takeover fails both jobs, the first one halting the second.
+  h.clock.now += 61_000;
+  h.restart();
+  assert.equal(h.ex.acquire(), true);
+  const [binance, bybit] = ids.map(id => h.ex.jobView(id));
+  assert.deepEqual([binance!.status, bybit!.status], ['failed', 'failed']);
+  assert.deepEqual([binance!.group, bybit!.group], [{ id: result.group, index: 0, peer: ids[1] }, { id: result.group, index: 1, peer: ids[0] }]);
+  assert.match(bybit!.peerHalt ?? '', /^Binance 任务失败/);
+  assert.equal(locks(h).length, 0);
+}));
+
+test('四腿组内顺序反过来：后处理的交易所盘口越过界限时，先处理的交易所也不发送首腿', () => withHarness(async h => {
+  // Bybit (index 1) is processed after Binance in a pass; its BZ book moves past its bound after the preview.
+  const preview = await h.ex.previewFourLeg(fourIntent(), SESSION);
+  h.bybit.setBook('BZUSDT', { bid: '90.00', ask: '90.02' });
+  const ids = h.ex.confirmFourLeg({ previewId: preview.id, requestId: randomUUID(), confirmLive: true }, SESSION).jobs.map(job => job.id);
+  await tick(h);
+  assert.equal(ordersOf(h.binance).length, 0, 'Binance 等另一所也能发送');
+  const [binance, bybit] = await settleAll(h, ids);
+  assert.deepEqual([bybit!.status, bybit!.endCode], ['failed', 'price_moved']);
+  assert.equal(binance!.status, 'stopped');
+  assert.match(binance!.peerHalt ?? '', /^Bybit 任务失败/);
+  assert.equal(ordersOf(h.binance).length + ordersOf(h.bybit).length, 0);
+  assert.equal(locks(h).length, 0);
+}));
+
+test('四腿停止一所时另一所首腿已成交未对冲：另一所只记联动停止，对冲照常发送', () => withHarness(async h => {
+  // After the first pass both leads have filled and no hedge has gone out yet.
+  const { ids } = await confirmFour(h);
+  await tick(h);
+  assert.deepEqual([pos(h.bybit, 'BZUSDT', 'long'), pos(h.bybit, 'CLUSDT', 'short')], ['1', '0'], '首腿已成交、对冲未发');
+  h.ex.requestStop(ids[0]!, randomUUID(), SESSION);
+  const bybit = h.ex.jobView(ids[1]!);
+  assert.deepEqual([bybit.stopRequested, bybit.peerHalt], [false, 'Binance 任务已请求停止']);
+  const views = await settleAll(h, ids);
+  assert.equal(pos(h.bybit, 'CLUSDT', 'short'), '1', 'Bybit 对冲照常发送');
+  assert.equal(views[1]!.status, 'completed');
+  assert.equal(locks(h).filter(row => row.job_id === ids[1]).length, 0);
+}));
+
+test('四腿一所完成但成交少于计划：另一所联动停止；两边结束后成交不等记一条飞书告警', () => withHarness(async h => {
+  // Binance's local chase rests unfilled; Bybit's market lead fills half and its job completes short.
+  h.bybit.inject({ operation: 'place', mode: 'partial', filled: '0.5', times: 1 });
+  const { ids, result } = await confirmFour(h, fourIntent({ binanceLead: 'local-chase' }));
+  const [binance, bybit] = await settleAll(h, ids);
+  assert.equal(bybit!.status, 'completed');
+  assert.match(binance!.peerHalt ?? '', /^Bybit 任务已完成但首腿成交少于计划（0\.5 \/ 1）/);
+  assert.equal(binance!.status, 'stopped');
+  assert.equal(ordersOf(h.binance).filter(order => order.status === 'new').length, 0, 'Binance 首腿挂单已撤');
+  const alerts = h.store.db.prepare("SELECT seq, at, job_id, json FROM events WHERE type = 'four-leg-unbalanced'").all() as { seq: number; at: number; job_id: string; json: string }[];
+  assert.equal(alerts.length, 1);
+  const message = describeEvent({ seq: alerts[0]!.seq, at: alerts[0]!.at, type: 'four-leg-unbalanced', json: alerts[0]!.json, jobId: alerts[0]!.job_id }, () => null);
+  assert.equal(message?.onceKey, `four-leg:${result.group}`);
+  assert.match(message?.text ?? '', /^【四腿成交不等】.*BZ 两所成交不等：Binance 0 \/ 1 桶，Bybit 0\.5 \/ 1 桶.*请到交易所核对两所敞口$/);
+  const detail = JSON.parse(alerts[0]!.json) as { group: string; details: string[] };
+  assert.equal(detail.group, result.group);
+  assert.deepEqual(detail.details, ['BZ 两所成交不等：Binance 0 / 1 桶，Bybit 0.5 / 1 桶', 'CL 两所成交不等：Binance 0 / 1 桶，Bybit 0.5 / 1 桶']);
+  assert.equal(locks(h).length, 0);
+}));
+
+test('四腿成交比较：按各所计划的成交比例比较，相差在一个下单步长内不算不等；计划非正无法比较', () => {
+  // Hynix sizes each venue by notional, so the two venues' plans differ in contracts.
+  const legs = (venue: string, [sky, sk]: [string, string], [skyPlan, skPlan] = ['4', '30']): FillLeg[] => [
+    { venue, symbol: 'SKHYUSDT', filled: sky, planned: skyPlan, step: '1', shown: `${sky} / ${skyPlan}` },
+    { venue, symbol: 'SKHYNIXUSDT', filled: sk, planned: skPlan, step: '1', shown: `${sk} / ${skPlan}` },
+  ];
+  assert.deepEqual(fillGaps(legs('Binance', ['4', '30']), legs('Bybit', ['5', '24'], ['5', '24'])), [], '全部成交');
+  assert.deepEqual(fillGaps(legs('Binance', ['2', '15']), legs('Bybit', ['3', '12'], ['5', '24'])), [], '同比例部分成交，相差在一步内');
+  assert.deepEqual(fillGaps(legs('Binance', ['4', '29']), legs('Bybit', ['5', '24'], ['5', '24'])), [], '相差一步');
+  const gaps = fillGaps(legs('Binance', ['4', '30']), legs('Bybit', ['2', '12'], ['5', '24']));
+  assert.deepEqual(gaps.map(fillGapText), ['SKHY 两所成交不等：Binance 4 / 4，Bybit 2 / 5', 'SKHYNIX 两所成交不等：Binance 30 / 30，Bybit 12 / 24']);
+  assert.deepEqual(fillGaps(legs('Binance', ['0', '0'], ['0', '30']), legs('Bybit', ['0', '0'])).map(gap => [gap.symbol, gap.comparable]), [['SKHYUSDT', false]]);
+});
+
+test('四腿任务列表：组内另一任务落在最近 20 条之外时随列表一起返回', () => withHarness(async h => {
+  const { ids } = await confirmFour(h);
+  await settleAll(h, ids);
+  // 19 later jobs: the group's second job is the 20th listed, its first one the 21st.
+  for (let i = 0; i < 19; i++) { const { jobId } = await previewAndConfirm(h); await settleAll(h, [jobId]); }
+  const listed = h.ex.recentJobs(20).map(job => job.id);
+  assert.equal(listed.length, 21);
+  assert.ok(listed.includes(ids[0]!) && listed.includes(ids[1]!));
+}));

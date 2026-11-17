@@ -27,6 +27,11 @@ export interface OilForm {
   barrels: string;
   /** chase: Bybit's native strategy; local-chase: post-only orders the executor moves, Binance or OKX only. */
   leadOrderType: OilLeadType;
+  /**
+   * Four legs: the first venue's spread, unset ('') until picked and cleared whenever the preset or the venue pair changes,
+   * since the same button means the opposite trade once the first venue changes (workbench TradingExecution.tsx, 7745181).
+   */
+  fourSpread: OilSide | '';
   /** Four legs: the second venue's lead order type (leadOrderType is the first venue's). */
   peerLeadOrderType: OilLeadType;
   /** Local chase: the highest buy / lowest sell it chases to; empty takes the preview's price protection bound. */
@@ -72,7 +77,7 @@ const opposite = (side: OilSide): OilSide => (side === 'long' ? 'short' : 'long'
 
 export const DEFAULT_FORM: OilForm = {
   preset: 'same-exchange', venue: 'binance', hedgeVenue: 'bybit', action: 'open', spread: 'long', leadSymbol: 'CLUSDT', symbol: 'BZUSDT', leadSide: 'long',
-  barrels: '', leadOrderType: 'market', peerLeadOrderType: 'market', chaseLimit: '', batchCount: '1', batchIntervalSeconds: '0', timeoutSeconds: '60', slippageBps: '',
+  barrels: '', leadOrderType: 'market', fourSpread: '', peerLeadOrderType: 'market', chaseLimit: '', batchCount: '1', batchIntervalSeconds: '0', timeoutSeconds: '60', slippageBps: '',
 };
 
 const DECIMAL = /^(0|[1-9]\d{0,11})(\.\d{1,8})?$/;
@@ -118,18 +123,20 @@ export function formToIntent(form: OilForm): { intent: OilIntent } | { error: st
  */
 export function fourLegFormToIntent(form: OilForm): { intent: OilFourLegIntent } | { error: string } {
   if (form.hedgeVenue === form.venue) return { error: '四腿须选择两个不同的交易所' };
-  const first = formToIntent({ ...form, preset: 'same-exchange', chaseLimit: '' });
+  if (!form.fourSpread) return { error: '请先选择方向' };
+  const spread = form.fourSpread;
+  const first = formToIntent({ ...form, preset: 'same-exchange', chaseLimit: '', spread });
   if ('error' in first) return first;
-  const second = formToIntent({ ...form, preset: 'same-exchange', chaseLimit: '', venue: form.hedgeVenue, spread: opposite(form.spread), leadOrderType: form.peerLeadOrderType });
+  const second = formToIntent({ ...form, preset: 'same-exchange', chaseLimit: '', venue: form.hedgeVenue, spread: opposite(spread), leadOrderType: form.peerLeadOrderType });
   if ('error' in second) return { error: `${VENUE_LABEL[form.hedgeVenue]}：${second.error}` };
   const { preset: _preset, legs, ...common } = first.intent;
   return { intent: { ...common, preset: 'four-leg', legs: [...legs, ...second.intent.legs] } };
 }
 
-/** The four legs a four-leg form describes, in the intent's order; the page shows them while the form is filled. */
-export function draftFourLegs(form: OilForm): [OilLegIntent, OilLegIntent, OilLegIntent, OilLegIntent] {
-  const same = { ...form, preset: 'same-exchange' as const, chaseLimit: '' };
-  return [...draftLegs(same), ...draftLegs({ ...same, venue: form.hedgeVenue, spread: opposite(form.spread), leadOrderType: form.peerLeadOrderType })];
+/** The four legs a four-leg form describes for a picked spread, in the intent's order; the page shows them while the form is filled. */
+export function draftFourLegs(form: OilForm, spread: OilSide): [OilLegIntent, OilLegIntent, OilLegIntent, OilLegIntent] {
+  const same = { ...form, preset: 'same-exchange' as const, chaseLimit: '', spread };
+  return [...draftLegs(same), ...draftLegs({ ...same, venue: form.hedgeVenue, spread: opposite(spread), leadOrderType: form.peerLeadOrderType })];
 }
 
 /** One line for the confirm dialog and the preview heading, e.g. "开仓四腿 Binance 做多价差 / Bybit 做空价差". */

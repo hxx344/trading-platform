@@ -278,6 +278,9 @@ export function describeEvent(row: EventRow, incidentPair: (id: string) => strin
       try { summary = job(row.jobId); } catch { summary = null; }
       return { text: describeJob(summary, row.jobId, status, row.type === 'job-finished' && typeof detail.reason === 'string' ? detail.reason : null), onceKey: `job:${row.jobId}:${status}` };
     }
+    case 'four-leg-unbalanced':
+      // Written once both jobs of a four-leg group are over (docs/oil.md 11.3); one message per group.
+      return { text: `【四腿成交不等】四腿组 ${short(detail.group)}（任务 ${short(row.jobId)} 与 ${short(detail.peer)}）：${Array.isArray(detail.details) ? detail.details.map(item => clip(item)).join('；') : '?'}；请到交易所核对两所敞口`, onceKey: `four-leg:${clip(detail.group, 64)}` };
     case 'adl-tick-failed':
       return { text: `【ADL 循环出错】${clip(detail.reason)}`, repeatKey: `adl-tick:${clip(detail.reason, 80)}` };
     case 'adl-push-dropped':

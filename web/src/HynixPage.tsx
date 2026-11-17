@@ -150,6 +150,8 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
       // leg takes the same notional, opening or closing.
       if (patch.preset === 'four-leg' && OIL_VENUES.indexOf(next.venue) > OIL_VENUES.indexOf(next.hedgeVenue)) [next.venue, next.hedgeVenue] = [next.hedgeVenue, next.venue];
       if (!leadTypeAllowed(next.hedgeVenue, next.peerLeadOrderType)) next.peerLeadOrderType = 'market';
+      // The four-leg direction names the first venue's premium: another preset or venue pair has it picked again.
+      if (next.preset !== current.preset || next.venue !== current.venue || next.hedgeVenue !== current.hedgeVenue) next.fourPremium = '';
       // Opening is by equal notional only; closing defaults to the quantities held.
       if (patch.action && patch.action !== current.action) next.sizing = patch.action === 'open' ? 'notional' : 'quantity';
       if (next.preset === 'four-leg') next.sizing = 'notional';
@@ -240,8 +242,8 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
         <legend className="visually-hidden">选择组合并填写交易参数</legend>
         <div className="execution-presets oil-presets" role="group" aria-label="交易预设">
           <button type="button" aria-pressed={same} data-hynix-preset="same-exchange" onClick={() => { if (!same) set('preset', 'same-exchange'); }}>同所溢价<small>单所 · ADR 对正股 · 两腿同一账户</small></button>
-          <button type="button" aria-pressed={crossed} data-hynix-preset="cross-exchange" disabled={!cross} onClick={() => { if (!crossed) set('preset', 'cross-exchange'); }}>跨所同合约<small>{cross ? `${venues.length === 2 ? `${VENUE_LABEL[venues[0]!]} 对 ${VENUE_LABEL[venues[1]!]}` : '任选两所'} · 同一合约` : '需配置两个交易所的执行账户'}</small></button>
           <button type="button" aria-pressed={four} data-hynix-preset="four-leg" disabled={!cross} onClick={() => { if (!four) set('preset', 'four-leg'); }}>四腿组合<small>{cross ? `${venues.length === 2 ? `${VENUE_LABEL[venues[0]!]} 与 ${VENUE_LABEL[venues[1]!]}` : '任选两所'} · ADR 对正股` : '需配置两个交易所的执行账户'}</small></button>
+          <button type="button" aria-pressed={crossed} data-hynix-preset="cross-exchange" disabled={!cross} onClick={() => { if (!crossed) set('preset', 'cross-exchange'); }}>跨所同合约<small>{cross ? `${venues.length === 2 ? `${VENUE_LABEL[venues[0]!]} 对 ${VENUE_LABEL[venues[1]!]}` : '任选两所'} · 同一合约` : '需配置两个交易所的执行账户'}</small></button>
         </div>
         <div className="execution-row">
           <Choice label="交易动作" id="hynixAction" value={form.action} options={[['open', '开仓'], ['close', '平仓']]} onChange={next => set('action', next)} />
@@ -258,9 +260,9 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
           <div className="execution-direction-options" role="group" aria-label={form.action === 'open' ? '开仓方向' : '待平仓方向'}>
             {(['short', 'long'] as const).map(side => {
               if (four) {
-                const pressed = form.premium === side, shown = draftHynixFourLegs({ ...form, premium: side });
+                const pressed = form.fourPremium === side, shown = draftHynixFourLegs(form, side);
                 const ordered = [shown.slice(0, 2), shown.slice(2)].flatMap(pair => [...pair].sort((a, b) => Number(b.symbol === 'SKHYUSDT') - Number(a.symbol === 'SKHYUSDT')));
-                return <button key={side} type="button" aria-pressed={pressed} data-hynix-direction={side} onClick={() => { if (!pressed) set('premium', side); }}>
+                return <button key={side} type="button" aria-pressed={pressed} data-hynix-direction={side} onClick={() => { if (!pressed) set('fourPremium', side); }}>
                   <span className="oil-direction-name">{VENUE_LABEL[form.venue]} {side === 'long' ? '做多' : '做空'}溢价 · {VENUE_LABEL[form.hedgeVenue]} {side === 'long' ? '做空' : '做多'}溢价</span>
                   {ordered.map(leg => <span key={`${leg.venue}:${leg.symbol}`} className={`execution-leg-chip ${leg.side}`}>{VENUE_LABEL[leg.venue]} {name(leg.symbol ?? '')} <b>{leg.side === 'long' ? '多' : '空'}</b></span>)}
                 </button>;
@@ -282,7 +284,8 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
             : form.action === 'close' ? <button type="button" className="button secondary" id="hynixFillHeld" onClick={fillHeld}>按当前持仓填入</button> : null}
           <p className="execution-help">{form.sizing === 'notional' ? '每腿按预览盘口中间价折算相同 USDT 名义金额，向下取整到下单步长；10 份 ADR 约对应 1 股正股。实际各腿数量以预览为准。' : '两腿各填合约数量，可以不等（按实际持仓）；对冲腿按两腿数量比例跟上首腿成交。改动交易所、合约、方向或动作后数量会清空，需重新填写。'}</p>
         </div>
-        {four ? <FourLegInputs legs={draftHynixFourLegs(form)} action={form.action} leadTypes={[form.leadOrderType, form.peerLeadOrderType]} onLeadType={(venue, next) => set(venue === 0 ? 'leadOrderType' : 'peerLeadOrderType', next)} legName={name} idPrefix="hynix" hedgeNote="本所首腿成交后按市价跟上，数量按两腿计划比例；首腿挂单期间的成交也会随时跟上。" />
+        {four && !form.fourPremium ? <p className="execution-choose-direction" id="hynixChooseDirection">先选择方向，再设置各腿下单方式。</p>
+        : four ? <FourLegInputs legs={draftHynixFourLegs(form, form.fourPremium || 'short')} action={form.action} leadTypes={[form.leadOrderType, form.peerLeadOrderType]} onLeadType={(venue, next) => set(venue === 0 ? 'leadOrderType' : 'peerLeadOrderType', next)} legName={name} idPrefix="hynix" hedgeNote="本所首腿成交后按市价跟上，数量按两腿计划比例；首腿挂单期间的成交也会随时跟上。" />
         : <div className="execution-leg-inputs">{legs.map((leg, index) => {
           const symbol = leg.symbol ?? form.symbol;
           return <section key={index} className="execution-leg-input" aria-label={`${index === 0 ? '首腿' : '对冲腿'} ${VENUE_LABEL[leg.venue]} ${name(symbol)} 交易参数`}>
@@ -310,7 +313,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
         </details>
         <div className="execution-builder-footer">
           {preview ? <p>正在确认上方预览；返回修改参数后可重新填写。</p> : messageView ?? <p>预览会重新读取盘口、交易规则与持仓，不会下单。</p>}
-          <button className="button primary" type="submit" id="hynixPreviewBtn">{busy && !preview ? <LoaderCircle size={16} className="spin" aria-hidden="true" /> : <ArrowRightLeft size={16} aria-hidden="true" />}预览{action}组合</button>
+          <button className="button primary" type="submit" id="hynixPreviewBtn" disabled={four && !form.fourPremium}>{busy && !preview ? <LoaderCircle size={16} className="spin" aria-hidden="true" /> : <ArrowRightLeft size={16} aria-hidden="true" />}预览{action}组合</button>
         </div>
       </fieldset>
     </form>

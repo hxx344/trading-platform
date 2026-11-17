@@ -167,7 +167,8 @@ test('采集：每分钟订阅推送 10 秒、按秒取盘口；推送缺的市�
   assert.equal(feed.feeds.length, 11);
   for (const opened of feed.feeds) {
     assert.ok(opened.started && opened.closed);
-    assert.deepEqual(opened.options.markets, ['NVDA-USD.P', 'TSLA-USD.P']); assert.equal(opened.options.depth, FEED_LEVELS);
+    // TSLA is not in the trading rules, so it is not asked for (Ondo would refuse the whole subscription).
+    assert.deepEqual(opened.options.markets, ['NVDA-USD.P']); assert.equal(opened.options.depth, FEED_LEVELS);
     assert.equal(opened.options.credentials, undefined);
   }
   assert.equal(FEED_LEVELS, 100); assert.equal(BURST_MS, 10_000);
@@ -240,6 +241,36 @@ test('采集：推送全断时说明原因并全部走 REST；REST 撞上页面�
   assert.equal(halted.state().markets[0]!.avg.samples, 0); assert.equal(halted.state().feed, null);
   assert.ok(halted.state().markets[0]!.levels);
   rewards.close(); halted.close();
+});
+
+test('采集：推送期间保存观察列表，移除的市场不写回、留下的照常记样本；关闭后迟到的推送不改盘口', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'tp-ondo-rewards-')), time = { now: 1_800_000_000_000 };
+  const fake = fakeClient(time), feed = fakeFeeds();
+  const twoListed = { ...fake.client, async markets() { return new Map([['NVDA-USD.P', { tick: '0.01', step: '0.01', trading: true, makerFee: null }], ['TSLA-USD.P', { tick: '0.01', step: '0.01', trading: true, makerFee: null }]]); } } as unknown as OndoClient;
+  const rewards = createOndoRewards({ dataDir, clientFactory: () => twoListed, streamFactory: feed.factory, now: () => time.now });
+  rewards.initialize();
+  rewards.save({ markets: ['NVDA-USD.P', 'TSLA-USD.P'], poolUsd: '1000', eligible: 2 });
+  let ticks = 0, cycles = 0;
+  await rewards.run({ stopped: () => cycles >= 1, pause: async ms => {
+    time.now += ms;
+    if (ms !== 1000) { cycles += 1; return; }
+    ticks += 1;
+    if (ticks === 3) rewards.save({ markets: ['NVDA-USD.P'], poolUsd: '1000', eligible: 1 });
+    feed.push('NVDA-USD.P', 100, time.now); feed.push('TSLA-USD.P', 200, time.now);
+  } });
+  assert.deepEqual(feed.feeds[0]!.options.markets, ['NVDA-USD.P', 'TSLA-USD.P']);
+  const view = rewards.state(15);
+  assert.deepEqual(view.markets.map(item => item.market), ['NVDA-USD.P']);
+  assert.equal(view.markets[0]!.avg.samples, 1); assert.equal(view.markets[0]!.avg.snapshots, 10);
+  // TSLA is gone for good: adding it back starts empty, and it was not read over REST.
+  assert.equal(fake.calls.filter(call => call === 'TSLA-USD.P').length, 0);
+  rewards.save({ markets: ['NVDA-USD.P', 'TSLA-USD.P'], poolUsd: '1000', eligible: 2 });
+  assert.equal(rewards.state(15).markets[1]!.avg.samples, 0); assert.equal(rewards.state(15).markets[1]!.levels, null);
+  // A book the closed feed delivers late changes nothing.
+  const before = rewards.state(15).markets[0]!.at;
+  rewards.close();
+  time.now += 1000; feed.push('NVDA-USD.P', 150, time.now);
+  assert.equal(rewards.state(15).markets[0]!.at, before); assert.equal(rewards.state(15).markets[0]!.mid, 100);
 });
 
 test('采集：关闭后不再新建客户端；停在读交易规则时不再读盘口', async () => {

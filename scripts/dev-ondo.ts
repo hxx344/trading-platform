@@ -52,7 +52,8 @@ const feed: OndoStreamFactory = ({ markets, onBook }) => {
   return {
     start() {
       timer = setInterval(() => {
-        for (const market of markets) if (market !== REWARD_MARKETS[7]) onBook(market, parseOndoBook({ time: new Date().toISOString(), ...snapshot(market) }), Date.now());
+        // A market added on the page that the simulation does not know is left to the REST fallback (which reports it).
+        for (const market of markets) if (market !== REWARD_MARKETS[7] && books.has(market)) onBook(market, parseOndoBook({ time: new Date().toISOString(), ...snapshot(market) }), Date.now());
       }, 250);
     },
     status: () => ({ connected: true, publicReady: true, privateReady: false, lastFrameAt: Date.now(), error: null }),

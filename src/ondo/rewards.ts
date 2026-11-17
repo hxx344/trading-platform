@@ -109,8 +109,8 @@ export function digest(depth: OndoDepth, ours: { buy: Map<number, number>; sell:
         if (shown.length < MAX_LEVELS) shown.push({ price: level.price, size: level.size, usd: round(othersUsd), bps: round(bps), cumUsd: round(cum), oursUsd: round(oursSize * level.p) });
       }
     }
-    // How many levels Ondo returns at most is not known (docs/ondo.md §10), so a short side is not taken as whole: the
-    // farthest level seen is the cover, and a thin book is reported as such too.
+    // Ondo sends at most 100 levels a side, which on a dense book may still end short of 25 bps, so a short side is not
+    // taken as whole: the farthest level seen is the cover, and a thin book is reported as such too.
     return { buckets, shown, depth5: round(depth5), cover };
   };
   const bid = pass(bids, ours.buy, 1), ask = pass(asks, ours.sell, -1);
@@ -238,7 +238,10 @@ export function createOndoRewards({ dataDir, restingOrders = () => [], clientFac
   async function burst(context: { pause(ms: number): Promise<void> }, names: string[], halted: () => boolean): Promise<string[]> {
     const start = now();
     let pushed = 0, error: string | null = null;
-    const current = feed = streamFactory({ markets: names, depth: FEED_LEVELS, now, onBook(market, book, at) {
+    // Ondo refuses the whole subscription when one market is unknown (an error frame, then nothing): only the markets the
+    // trading rules list are asked for once the rules are in; the rest are read over REST like any market the feed missed.
+    const listed = rules ? names.filter(name => rules!.has(name)) : names;
+    const current = feed = streamFactory({ markets: listed, depth: FEED_LEVELS, now, onBook(market, book, at) {
       const target = slots.get(market);
       if (target && book && current === feed) target.pushed = { book, at };
     } });

@@ -34,4 +34,4 @@ export function fillGaps(a: readonly FillLeg[], b: readonly FillLeg[]): FillGap[
 }
 
 /** One line per gap, e.g. "BZ 两所成交不等：Binance 10 / 10 桶，Bybit 4 / 10 桶". */
-export const fillGapText = (gap: FillGap): string => `${gap.symbol.replace(/USDT$/, '')} ${gap.comparable ? '两所成交不等' : '计划数量无效，无法比较两所成交'}：${gap.a.venue} ${gap.a.shown}，${gap.b.venue} ${gap.b.shown}`;
+export const fillGapText = (gap: FillGap): string => `${gap.symbol.replace(/USDT$/, '')} ${gap.comparable ? '两所成交不等' : '计划或成交数量无效，无法比较两所成交'}：${gap.a.venue} ${gap.a.shown}，${gap.b.venue} ${gap.b.shown}`;

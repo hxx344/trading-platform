@@ -64,15 +64,24 @@ export async function createOndoModule(config: OndoServiceConfig, key: OndoCrede
     const err = detail && typeof detail === 'object' && 'err' in detail ? (detail as { err?: unknown }).err : null;
     if (level !== 'debug' && text) log(`Ondo：${text}${err instanceof Error ? `（${err.message.slice(0, 160)}）` : ''}`);
   };
-  const mm: OndoMarketMaker = createOndoMarketMaker({
-    dataDir, readCredentials: () => key ?? null, ...(config.initial ? { initialConfig: config.initial } : {}), closeWaitMs: ONDO_CLOSE_WAIT_MS,
-    log: { info: say('info'), warn: say('warn'), error: say('error'), debug: say('debug') },
-    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}), ...(options.WebSocketImpl ? { WebSocketImpl: options.WebSocketImpl } : {}),
-    ...(options.mmIntervalMs === undefined ? {} : { intervalMs: options.mmIntervalMs }),
-  });
-  const rewards: OndoRewards = createOndoRewards({ dataDir, restingOrders: () => mm.restingOrders(), log, ...(options.rewardsClient ? { clientFactory: options.rewardsClient } : {}) });
-  mm.initialize();
-  rewards.initialize();
+  let made: OndoMarketMaker | null = null;
+  let mm: OndoMarketMaker, rewards: OndoRewards;
+  try {
+    mm = made = createOndoMarketMaker({
+      dataDir, readCredentials: () => key ?? null, ...(config.initial ? { initialConfig: config.initial } : {}), closeWaitMs: ONDO_CLOSE_WAIT_MS,
+      log: { info: say('info'), warn: say('warn'), error: say('error'), debug: say('debug') },
+      ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}), ...(options.WebSocketImpl ? { WebSocketImpl: options.WebSocketImpl } : {}),
+      ...(options.mmIntervalMs === undefined ? {} : { intervalMs: options.mmIntervalMs }),
+    });
+    rewards = createOndoRewards({ dataDir, restingOrders: () => mm.restingOrders(), log, ...(options.rewardsClient ? { clientFactory: options.rewardsClient } : {}) });
+    mm.initialize();
+    rewards.initialize();
+  } catch (error) {
+    // Nothing is left behind for a later start in this process: the quoting timer stops and the lock goes.
+    void made?.close(0).catch(() => {});
+    lock?.release();
+    throw error;
+  }
 
   const views: OndoViews = {
     state: () => mm.state(),

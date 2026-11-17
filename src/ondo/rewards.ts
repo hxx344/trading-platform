@@ -79,7 +79,6 @@ export function digest(depth: OndoDepth, ours: { buy: Map<number, number>; sell:
         if (shown.length < MAX_LEVELS) shown.push({ price: level.price, size: level.size, usd: round(othersUsd), bps: round(bps), cumUsd: round(cum), oursUsd: round(oursSize * level.p) });
       }
     }
-    // Fewer than 100 levels means the venue sent the whole side: everything out to 25 bps is known.
     // How many levels Ondo returns at most is not known (docs/ondo.md §10), so a short side is not taken as whole: the
     // farthest level seen is the cover, and a thin book is reported as such too.
     return { buckets, shown, depth5: round(depth5), cover };
@@ -129,9 +128,10 @@ export function createOndoRewards({ dataDir, restingOrders = () => [], clientFac
   let rules: Map<string, OndoRules> | null = null, rulesAt = 0, rulesError: string | null = null, rulesPending: Promise<void> | null = null;
   const slots = new Map<string, Slot>();
   const startedAt = now();
-  let client: OndoClient | null = null, cursor = 0;
+  let client: OndoClient | null = null, cursor = 0, closed = false;
 
-  const api = () => client ??= clientFactory();
+  // After close nothing opens a new client: a read that comes later fails at once instead of going out.
+  const api = (): OndoClient => { if (closed) throw new OndoError('closed'); return client ??= clientFactory(); };
   const slot = (name: string): Slot => {
     let found = slots.get(name);
     if (!found) slots.set(name, found = { name, samples: [], latest: null, error: null, fetchedAt: 0, pending: null, record: false });
@@ -251,6 +251,7 @@ export function createOndoRewards({ dataDir, restingOrders = () => [], clientFac
       while (!context.stopped()) {
         const started = now();
         if (!rules || now() - rulesAt > RULES_MS) await refreshRules();
+        if (context.stopped()) break;
         const names = config.markets;
         if (names.length) {
           const name = names[cursor % names.length];
@@ -260,9 +261,9 @@ export function createOndoRewards({ dataDir, restingOrders = () => [], clientFac
         // Spread the cycle over the markets so the reads go out one at a time; the read's own time counts toward the step,
         // so each market still comes round once a minute.
         const step = Math.max(1000, Math.floor(CYCLE_MS / Math.max(1, names.length)));
-        await context.pause(Math.max(250, step - (now() - started)));
+        await context.pause(Math.max(250, step - Math.max(0, now() - started)));
       }
     },
-    close() { client?.close(); client = null; },
+    close() { closed = true; client?.close(); client = null; },
   };
 }

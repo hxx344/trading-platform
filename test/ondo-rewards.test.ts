@@ -186,6 +186,29 @@ test('采集：读取耗时计入每步间隔；循环撞上页面发起的读�
   rewards.close();
 });
 
+test('采集：关闭后不再新建客户端；停在读交易规则时不再读盘口', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'tp-ondo-rewards-')), time = { now: 1_800_000_000_000 };
+  let created = 0, depths = 0;
+  const aborts: (() => void)[] = [];
+  const hanging = (): OndoClient => {
+    created += 1;
+    return { markets: () => new Promise((_, reject) => { aborts.push(() => reject(new OndoError('closed'))); }),
+      async depth() { depths += 1; return book([level('99.99', '1')], [level('100.01', '1')]); },
+      close() { for (const abort of aborts.splice(0)) abort(); } } as unknown as OndoClient;
+  };
+  const rewards = createOndoRewards({ dataDir, clientFactory: hanging, now: () => time.now });
+  rewards.initialize();
+  let stopped = false;
+  const cycle = rewards.run({ stopped: () => stopped, pause: async () => {} });
+  await new Promise(resolve => setImmediate(resolve));
+  stopped = true; rewards.close();
+  await cycle;
+  assert.equal(depths, 0); assert.equal(created, 1);
+  await rewards.book('NVDA-USD.P');
+  assert.equal(created, 1); assert.equal(depths, 0);
+  assert.match(rewards.state().markets.find(item => item.market === 'NVDA-USD.P')!.error!, /closed/);
+});
+
 test('采集：盘口按需读取最多 2 秒一次；不在列表的市场拒绝；坏的设置文件退回默认值', async () => {
   const dataDir = mkdtempSync(join(tmpdir(), 'tp-ondo-rewards-')), time = { now: 1_800_000_000_000 };
   mkdirSync(join(dataDir, 'ondo-mm'));

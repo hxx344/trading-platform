@@ -185,6 +185,12 @@ test('路由：没有 ondo 时 404；设置须带请求标记；未知字段 400
   // Released on close.
   const again = await createOndoModule({}, KEY, mkdtempSync(join(tmpdir(), 'tp-ondo-routes-')), { log: silent, rewardsClient: depthClient, mmIntervalMs: 0 });
   await again.close();
+  // And when the module fails to start after taking it (here the data directory is a file).
+  const notDir = join(mkdtempSync(join(tmpdir(), 'tp-ondo-routes-')), 'file');
+  writeFileSync(notDir, '');
+  await assert.rejects(createOndoModule({}, KEY, notDir, { log: silent, rewardsClient: depthClient, mmIntervalMs: 0 }), (error: Error) => !/已被本机另一个服务进程使用/.test(error.message));
+  const after = await createOndoModule({}, KEY, mkdtempSync(join(tmpdir(), 'tp-ondo-routes-')), { log: silent, rewardsClient: depthClient, mmIntervalMs: 0 });
+  await after.close();
 });
 
 test('模块：服务停止时立即中止进行中的盘口读取并关闭挂单，不等读取超时', async () => {

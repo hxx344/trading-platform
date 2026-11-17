@@ -141,7 +141,7 @@ test('路由：没有 ondo 时 404；设置须带请求标记；未知字段 400
   await withServer(undefined, async call => { assert.equal((await call('GET', '/api/ondo/state')).status, 404); });
   const dataDir = mkdtempSync(join(tmpdir(), 'tp-ondo-routes-'));
   const silent = (): void => {};
-  const watching = createOndoModule({ initial: { ...LIVE, mode: 'observe' } as never }, undefined, dataDir, { log: silent, rewardsClient: depthClient, mmIntervalMs: 0 });
+  const watching = await createOndoModule({ initial: { ...LIVE, mode: 'observe' } as never }, undefined, dataDir, { log: silent, rewardsClient: depthClient, mmIntervalMs: 0 });
   try {
     await withServer({ ondo: watching.views }, async call => {
       const state = await (await call('GET', '/api/ondo/state')).json() as { config: { orderUsd: string; mode: string }; credentials: { configured: boolean }; revision: number };
@@ -156,6 +156,9 @@ test('路由：没有 ondo 时 404；设置须带请求标记；未知字段 400
       assert.equal((await call('POST', '/api/ondo/start', { revision: saved.revision, confirmLive: true, force: true })).status, 400);
       assert.equal((await call('POST', '/api/ondo/stop', { extra: 1 })).status, 400);
       assert.equal(((await (await call('POST', '/api/ondo/stop', {})).json()) as { phase: string }).phase, 'stopped');
+      // An empty JSON body (readJson gives null) is the same as {}; a body with fields is not.
+      assert.equal(((await watching.views.stop(null)) as { phase: string }).phase, 'stopped');
+      assert.throws(() => watching.views.discardRecovery({ x: 1 }), /请求包含未知字段/);
       const rewards = await (await call('GET', '/api/ondo/rewards?window=15')).json() as { windowMin: number; markets: unknown[] };
       assert.equal(rewards.windowMin, 15); assert.equal(rewards.markets.length, 20);
       assert.equal((await call('PUT', '/api/ondo/rewards/config', { markets: [] })).status, 400);
@@ -165,7 +168,7 @@ test('路由：没有 ondo 时 404；设置须带请求标记；未知字段 400
       assert.equal((await call('GET', '/api/ondo/missing')).status, 404);
     });
   } finally { await watching.close(); }
-  const keyed = createOndoModule({}, KEY, mkdtempSync(join(tmpdir(), 'tp-ondo-routes-')), { log: silent, rewardsClient: depthClient, mmIntervalMs: 0 });
+  const keyed = await createOndoModule({}, KEY, mkdtempSync(join(tmpdir(), 'tp-ondo-routes-')), { log: silent, rewardsClient: depthClient, mmIntervalMs: 0 });
   try {
     await withServer({ ondo: keyed.views }, async call => {
       const text = await (await call('GET', '/api/ondo/state')).text();
@@ -175,17 +178,42 @@ test('路由：没有 ondo 时 404；设置须带请求标记；未知字段 400
     // Anything not the module's own refusal is answered with a fixed text.
     assert.deepEqual(keyed.views.failure(new TypeError('secret detail')), { status: 500, body: { code: 'internal', message: 'Ondo 模块内部错误' }, internal: true });
     assert.equal(keyed.views.failure(Object.assign(new Error('奖励设置无法保存'), { status: 503 })).status, 503);
+    // One process per key on this host: a second one is refused before it reads or withdraws anything.
+    await assert.rejects(createOndoModule({}, KEY, mkdtempSync(join(tmpdir(), 'tp-ondo-routes-')), { log: silent, rewardsClient: depthClient, mmIntervalMs: 0 }),
+      (error: Error) => /\*\*\*4321 已被本机另一个服务进程使用/.test(error.message) && !error.message.includes(KEY.keyId));
   } finally { await keyed.close(); }
+  // Released on close.
+  const again = await createOndoModule({}, KEY, mkdtempSync(join(tmpdir(), 'tp-ondo-routes-')), { log: silent, rewardsClient: depthClient, mmIntervalMs: 0 });
+  await again.close();
 });
 
-test('模块：服务停止时采集结束并关闭挂单', async () => {
+test('模块：服务停止时立即中止进行中的盘口读取并关闭挂单，不等读取超时', async () => {
   const lines: string[] = [];
-  const module = createOndoModule({}, undefined, mkdtempSync(join(tmpdir(), 'tp-ondo-loop-')), { log: line => lines.push(line), rewardsClient: depthClient, mmIntervalMs: 0 });
-  let stopped = false, pauses = 0;
-  await module.loop({ stopped: () => stopped, pause: async () => { pauses += 1; if (pauses >= 3) stopped = true; } });
-  assert.equal(pauses, 3);
-  assert.equal(module.views.state() !== null, true);
+  let closed = 0, reads = 0;
+  const aborts: (() => void)[] = [];
+  const hanging = (): OndoClient => ({
+    async markets() { return new Map(); },
+    depth() { reads += 1; return new Promise((_, reject) => { aborts.push(() => reject(new Error('closed'))); }); },
+    close() { closed += 1; for (const abort of aborts.splice(0)) abort(); },
+  } as unknown as OndoClient);
+  const module = await createOndoModule({}, undefined, mkdtempSync(join(tmpdir(), 'tp-ondo-loop-')), { log: line => lines.push(line), rewardsClient: hanging, mmIntervalMs: 0 });
+  let stopped = false;
+  const wakers = new Set<() => void>();
+  const pause = (ms: number) => new Promise<void>(resolve => {
+    if (stopped) { resolve(); return; }
+    const wake = () => { clearTimeout(timer); wakers.delete(wake); resolve(); };
+    const timer = setTimeout(wake, ms);
+    wakers.add(wake);
+  });
+  const loop = module.loop({ stopped: () => stopped, pause });
+  while (reads === 0) await new Promise(resolve => setTimeout(resolve, 5));
+  const at = Date.now();
+  stopped = true;
+  for (const wake of [...wakers]) wake();
+  await loop;
+  assert.ok(Date.now() - at < 1000, `${Date.now() - at} ms`);
+  assert.ok(closed >= 1);
   // A second close is the same one.
   await module.close();
-  assert.deepEqual(lines.filter(line => line.includes('出错')), []);
+  assert.deepEqual(lines.filter(line => line.includes('出错') || line.includes('异常')), []);
 });

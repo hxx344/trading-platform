@@ -31,7 +31,7 @@ const books = new Map(REWARD_MARKETS.map((market, i) => [market, {
   sigma: 0.0002 + 0.0001 * (i % 7), depth: 2000 * (1 + (i * 7919) % 13), at: Date.now(),
 }]));
 const gauss = () => Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random());
-const side = (mid: number, depth: number, sign: 1 | -1, tick: number): [string, string][] => Array.from({ length: 60 }, (_, i) => {
+const side = (mid: number, depth: number, sign: 1 | -1, tick: number): [string, string][] => Array.from({ length: 80 }, (_, i) => {
   const price = Math.round((mid * (1 + sign * (0.5 + i * 0.35) / 1e4)) / tick) * tick;
   const usd = depth * Math.exp(-i / 18) * (0.4 + Math.random());
   return [price.toFixed(4), (usd / price).toFixed(3)];
@@ -50,7 +50,7 @@ const client = {
 } as unknown as OndoClient;
 
 const log = (line: string) => process.stderr.write(`${line}\n`);
-const ondo = createOndoModule({}, undefined, dir, { log, rewardsClient: () => client });
+const ondo = await createOndoModule({}, undefined, dir, { log, rewardsClient: () => client });
 const run = runExecutor({
   executor, store, dir, port, app, passes: [],
   views: { ondo: ondo.views },

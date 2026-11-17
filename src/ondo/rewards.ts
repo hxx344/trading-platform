@@ -28,6 +28,8 @@ interface Slot {
   error: string | null;
   fetchedAt: number;
   pending: Promise<void> | null;
+  /** The read in flight was started by the page, and the cycle asked for a sample of it meanwhile. */
+  record: boolean;
 }
 
 const text = (error: unknown): string => error instanceof OndoError ? `Ondo 接口出错（${error.code}）` : error instanceof Error ? error.message.slice(0, 160) : '未知错误';
@@ -78,7 +80,9 @@ export function digest(depth: OndoDepth, ours: { buy: Map<number, number>; sell:
       }
     }
     // Fewer than 100 levels means the venue sent the whole side: everything out to 25 bps is known.
-    return { buckets, shown, depth5: round(depth5), cover: levels.length < 100 ? Infinity : cover };
+    // How many levels Ondo returns at most is not known (docs/ondo.md §10), so a short side is not taken as whole: the
+    // farthest level seen is the cover, and a thin book is reported as such too.
+    return { buckets, shown, depth5: round(depth5), cover };
   };
   const bid = pass(bids, ours.buy, 1), ask = pass(asks, ours.sell, -1);
   return {
@@ -88,7 +92,7 @@ export function digest(depth: OndoDepth, ours: { buy: Map<number, number>; sell:
 }
 
 const round = (value: number): number => Math.round(value * 100) / 100;
-const coverOut = (value: number): number | null => value === Infinity ? 25 : Number.isFinite(value) ? round(Math.min(value, 25)) : null;
+const coverOut = (value: number): number | null => Number.isFinite(value) ? round(Math.min(value, 25)) : null;
 
 /** σ of one-minute log returns (zero mean), each return scaled to one minute by its gap; null below MIN_RETURNS. */
 export function minuteVolatility(samples: readonly { at: number; mid: number }[]): { sigma1m: number | null; returns: number } {
@@ -130,7 +134,7 @@ export function createOndoRewards({ dataDir, restingOrders = () => [], clientFac
   const api = () => client ??= clientFactory();
   const slot = (name: string): Slot => {
     let found = slots.get(name);
-    if (!found) slots.set(name, found = { name, samples: [], latest: null, error: null, fetchedAt: 0, pending: null });
+    if (!found) slots.set(name, found = { name, samples: [], latest: null, error: null, fetchedAt: 0, pending: null, record: false });
     return found;
   };
   const sync = () => { for (const name of [...slots.keys()]) if (!config.markets.includes(name)) slots.delete(name); for (const name of config.markets) slot(name); };
@@ -157,19 +161,20 @@ export function createOndoRewards({ dataDir, restingOrders = () => [], clientFac
 
   /** Reads one market; `record` adds a minute sample (the cycle), otherwise only the latest levels move. */
   function read(target: Slot, record: boolean): Promise<void> {
-    if (target.pending) return target.pending;
+    if (target.pending) { if (record) target.record = true; return target.pending; }
+    target.record = record;
     target.pending = (async () => {
       try {
         const depth = await api().depth(target.name, 100);
         const at = now(), { sample, latest } = digest(depth, ours(target.name), at);
         target.latest = latest; target.error = null;
-        if (record) {
+        if (target.record) {
           target.samples.push(sample);
           const oldest = at - MAX_WINDOW_MIN * 60_000;
           while (target.samples.length && target.samples[0].at < oldest) target.samples.shift();
         }
       } catch (error) { target.error = `盘口读取失败：${text(error)}`; }
-      finally { target.fetchedAt = now(); target.pending = null; }
+      finally { target.fetchedAt = now(); target.pending = null; target.record = false; }
     })();
     return target.pending;
   }
@@ -244,6 +249,7 @@ export function createOndoRewards({ dataDir, restingOrders = () => [], clientFac
     },
     async run(context) {
       while (!context.stopped()) {
+        const started = now();
         if (!rules || now() - rulesAt > RULES_MS) await refreshRules();
         const names = config.markets;
         if (names.length) {
@@ -251,8 +257,10 @@ export function createOndoRewards({ dataDir, restingOrders = () => [], clientFac
           cursor = (cursor + 1) % names.length;
           await read(slot(name), true);
         }
-        // Spread the cycle over the markets so the reads go out one at a time.
-        await context.pause(Math.max(1000, Math.floor(CYCLE_MS / Math.max(1, names.length))));
+        // Spread the cycle over the markets so the reads go out one at a time; the read's own time counts toward the step,
+        // so each market still comes round once a minute.
+        const step = Math.max(1000, Math.floor(CYCLE_MS / Math.max(1, names.length)));
+        await context.pause(Math.max(250, step - (now() - started)));
       }
     },
     close() { client?.close(); client = null; },

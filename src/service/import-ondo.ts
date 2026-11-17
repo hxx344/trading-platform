@@ -51,7 +51,7 @@ try {
   if (config?.big || credentials?.big || session?.big) out({ refused: 'size' });
   else {
     let key = null;
-    if (credentials) { const raw = readFileSync(keyFile); if (raw.length !== 32) { out({ refused: 'key' }); process.exit(0); } key = raw.toString('base64'); }
+    if (credentials) { if (statSync(keyFile).size !== 32) { out({ refused: 'key' }); process.exit(0); } const raw = readFileSync(keyFile); if (raw.length !== 32) { out({ refused: 'key' }); process.exit(0); } key = raw.toString('base64'); }
     out({ config: config?.text ?? null, credentials: credentials?.text ?? null, session: session !== null, key });
   }
 } catch (error) { process.stderr.write(String(error && error.message || error).split('\\n')[0]); process.exitCode = 1; }`;

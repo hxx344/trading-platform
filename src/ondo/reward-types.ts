@@ -26,7 +26,7 @@ export interface OndoRewardMarket {
   levels: { bid: OndoLevel[]; ask: OndoLevel[] } | null;
   /** USD resting within 0–5 bps now, others only. */
   depth5: { bid: number; ask: number } | null;
-  /** How far from the mid the snapshot's 100 levels reached, per side, in bps (25 or more covers every band). */
+  /** How far from the mid the snapshot's levels reached (the farthest level returned), per side, in bps (25 or more covers every band). */
   cover: { bid: number | null; ask: number | null };
   /** Averages over the window: USD per BUCKET_BPS bucket, others only; cover is the window's smallest. */
   avg: { samples: number; from: number | null; bid: number[]; ask: number[]; cover: { bid: number | null; ask: number | null } };

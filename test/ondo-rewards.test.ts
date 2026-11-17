@@ -75,8 +75,8 @@ test('盘口：前 5 bps 各档、扣除自己的挂单、按 0.5 bps 分桶', (
   assert.equal(latest.depth5.bid, 1099.95); assert.equal(latest.depth5.ask, 1000.2);
   // 99.90 is 11 bps out: not a shown level, but in its bucket.
   close(sample.bid[1]!, 600, 1e-3); close(sample.bid[3]!, 499.95, 1e-3); close(sample.bid[21]!, 99.9, 1e-3);
-  // Fewer than 100 levels: the side came whole.
-  assert.deepEqual(latest.cover, [Infinity, Infinity]);
+  // A short side is not taken as whole: the cover is the farthest level returned (Ondo's level limit is not known).
+  close(latest.cover[0], (100.01 - 99.9) / 100.01 * 1e4, 1e-6); close(latest.cover[1], (100.1 - 100.01) / 100.01 * 1e4, 1e-6);
   const full = Array.from({ length: 100 }, (_, i) => level((100 - i * 0.001).toFixed(3), '1'));
   // 100 levels: only as far as the last one is known.
   close(digest(book(full, [level('100.02', '1')]), { buy: new Map(), sell: new Map() }, 0).latest.cover[0], (100.01 - 99.901) / 100.01 * 1e4, 1e-6);
@@ -158,6 +158,32 @@ test('采集：轮流读取各市场、按窗口平均、计算波动；设置�
   const again = createOndoRewards({ dataDir, clientFactory: () => fake.client, now: () => time.now });
   again.initialize();
   assert.equal(again.state().config.poolUsd, '1400'); assert.equal(again.state().revision, 1); assert.equal(again.state().loadError, null);
+});
+
+test('采集：读取耗时计入每步间隔；循环撞上页面发起的读取时仍记一个样本', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'tp-ondo-rewards-')), time = { now: 1_800_000_000_000 };
+  let release: (() => void) | null = null;
+  const fake = fakeClient(time);
+  const slow = { ...fake.client, async depth(name: string, levels: number) {
+    await new Promise<void>(resolve => { release = resolve; });
+    time.now += 400;
+    return fake.client.depth(name, levels);
+  } } as unknown as OndoClient;
+  const rewards = createOndoRewards({ dataDir, clientFactory: () => slow, now: () => time.now });
+  rewards.initialize();
+  rewards.save({ markets: ['NVDA-USD.P'], poolUsd: '1000', eligible: 1 });
+  const pageRead = rewards.book('NVDA-USD.P');
+  await new Promise(resolve => setImmediate(resolve));
+  const pauses: number[] = [];
+  const cycle = rewards.run({ stopped: () => pauses.length >= 1, pause: async ms => { pauses.push(ms); } });
+  await new Promise(resolve => setImmediate(resolve));
+  release!();
+  await Promise.all([pageRead, cycle]);
+  // One read served both; the cycle's step (60 s for one market) less the 400 ms it took.
+  assert.equal(fake.calls.filter(call => call === 'NVDA-USD.P').length, 1);
+  assert.equal(rewards.state(15).markets[0]!.avg.samples, 1);
+  assert.deepEqual(pauses, [59_600]);
+  rewards.close();
 });
 
 test('采集：盘口按需读取最多 2 秒一次；不在列表的市场拒绝；坏的设置文件退回默认值', async () => {

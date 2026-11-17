@@ -1,6 +1,9 @@
 // The Ondo maker-reward module (docs/ondo.md): the workbench's quoting module (vendor/ondo/mm.mjs) plus the reward-market
 // collector (ondo/rewards.ts). The routes call `views`; `loop` keeps the collector sampling and, when the service stops,
-// withdraws a live session's quotes inside the shutdown's drain.
+// withdraws a live session's quotes inside the shutdown's drain. With a key it holds the host lock for that key first,
+// so a second process here can neither quote on it nor withdraw this one's quotes as "left over" (docs/ondo.md §3).
+import { createHash } from 'node:crypto';
+import { holdAccountLocks } from '../live/setup.ts';
 import { createOndoMarketMaker, HttpError, type OndoMarketMaker } from '../vendor/ondo/mm.mjs';
 import { ONDO_MARKET, type OndoClient } from '../vendor/ondo/client.mjs';
 import { createOndoRewards, RewardInputError, type OndoRewards } from '../ondo/rewards.ts';
@@ -26,21 +29,36 @@ export interface OndoViews {
 export interface OndoModule {
   views: OndoViews;
   loop(context: { stopped(): boolean; pause(ms: number): Promise<void> }): Promise<void>;
-  /** Stops the quoting timer without waiting (a start that failed later in main.ts). */
+  /** Stops the quoting timer without waiting (a start that failed later in main.ts) and releases the key's host lock. */
   close(): Promise<void>;
 }
 
 type Log = (line: string) => void;
 
 function only(body: unknown, ...keys: string[]): Record<string, unknown> {
+  // stop, cleanup and recovery/discard take nothing: an empty body is the same as {}.
+  if (body === null && keys.length === 0) return {};
   if (body === null || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !keys.includes(key))) throw new HttpError(400, '请求包含未知字段');
   return body as Record<string, unknown>;
 }
 
-export function createOndoModule(config: OndoServiceConfig, key: OndoCredentials | undefined, dataDir: string, options: {
+/** The host lock's name for a key: a digest of the key id, which then never shows in /proc/net/unix. */
+export const ondoLockId = (keyId: string): string => createHash('sha256').update(keyId).digest('hex').slice(0, 16);
+
+export async function createOndoModule(config: OndoServiceConfig, key: OndoCredentials | undefined, dataDir: string, options: {
   log?: Log; fetchImpl?: typeof fetch; WebSocketImpl?: unknown; rewardsClient?: () => OndoClient; mmIntervalMs?: number;
-} = {}): OndoModule {
+  locks?: typeof holdAccountLocks;
+} = {}): Promise<OndoModule> {
   const log = options.log ?? (line => process.stderr.write(`${line}\n`));
+  // Before initialize: it withdraws every tpo- order it finds when a session record is left.
+  let lock: { release(): void } | null = null;
+  if (key) {
+    try { lock = await (options.locks ?? holdAccountLocks)([{ venue: 'ondo', accountId: ondoLockId(key.keyId) }]); }
+    catch (error) {
+      const why = error instanceof Error && error.message.includes('已被本机另一个实盘执行器占用') ? '已被本机另一个服务进程使用' : `无法加进程锁（${error instanceof Error ? error.message : String(error)}）`;
+      throw new Error(`Ondo API Key ***${key.keyId.slice(-4)} ${why}；同一个 Key 在本机只能由一个进程挂单`);
+    }
+  }
   const say = (level: string) => (detail: unknown, message?: unknown) => {
     const text = typeof message === 'string' ? message : typeof detail === 'string' ? detail : '';
     const err = detail && typeof detail === 'object' && 'err' in detail ? (detail as { err?: unknown }).err : null;
@@ -80,18 +98,21 @@ export function createOndoModule(config: OndoServiceConfig, key: OndoCredentials
 
   let closing: Promise<void> | null = null;
   const close = (waitMs?: number) => closing ??= (async () => {
-    try { await mm.close(waitMs); } catch (error) { log(`Ondo 挂单关闭出错：${error instanceof Error ? error.message : String(error)}`); }
     rewards.close();
+    try { await mm.close(waitMs); } catch (error) { log(`Ondo 挂单关闭出错：${error instanceof Error ? error.message : String(error)}`); }
+    finally { lock?.release(); lock = null; }
   })();
 
   return {
     views,
     async loop(context) {
-      try { await rewards.run(context); }
-      catch (error) { log(`Ondo 奖励盘口采集异常退出：${error instanceof Error ? error.message : String(error)}`); while (!context.stopped()) await context.pause(1000); }
-      // The service is stopping: a live session withdraws its quotes before the process goes.
+      const collecting = rewards.run(context).catch(error => { log(`Ondo 奖励盘口采集异常退出：${error instanceof Error ? error.message : String(error)}`); });
+      // The pause wakes as soon as the service stops.
+      while (!context.stopped()) await context.pause(60_000);
+      // The service is stopping: a live session withdraws its quotes before the process goes, without waiting for a book
+      // read in flight (close() aborts it first).
       if (mm.state().live) log('服务停止：正在撤销 Ondo 挂单');
-      await close(ONDO_CLOSE_WAIT_MS);
+      await Promise.all([close(ONDO_CLOSE_WAIT_MS), collecting]);
     },
     close: () => close(0),
   };

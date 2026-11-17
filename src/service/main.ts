@@ -286,7 +286,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   try {
     crossex = config.crossex ? createCrossexSupervisor(config.crossex, secrets.gate, dir, crossexOptions) : undefined;
     await crossex?.start();
-    ondo = config.ondo ? createOndoModule(config.ondo, secrets.ondo, dir, ondoOptions) : undefined;
+    ondo = config.ondo ? await createOndoModule(config.ondo, secrets.ondo, dir, ondoOptions) : undefined;
   } catch (error) { releaseOil(); throw error; }
   let store: ReturnType<typeof openStore>;
   try { store = openStore(join(dir, DATABASE_FILES.mainnet)); } catch (error) { releaseOil(); throw error; }

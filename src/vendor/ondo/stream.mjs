@@ -2,6 +2,7 @@
 import { Buffer } from 'node:buffer';
 import { ondoWsLogin } from './transport.mjs';
 import { decimalUnits } from './decimal.mjs';
+import { sample } from './latency.mjs';
 
 const URL = 'wss://api.ondoperps.xyz/ws';
 const MAX_BYTES = 1024 * 1024;
@@ -49,13 +50,14 @@ function parsePublicTrade(row) {
 // reopened after 1-30 s, 60 s after a refused login, without a retry limit:
 // reconnecting places no order. Private payloads are passed on unparsed; the
 // caller treats them as hints and reads the account over REST.
-export function createOndoStream({ markets, credentials = null, depth = 50, onBook, onTrade, heartbeatAllowed = () => true, onPrivate = () => {}, onDown = () => {},
+export function createOndoStream({ markets, credentials = null, depth = 50, onBook, onTrade, latency, heartbeatAllowed = () => true, onPrivate = () => {}, onDown = () => {},
   WebSocketImpl = globalThis.WebSocket, now = Date.now, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout } = {}) {
   const wanted = new Set(markets);
   const observeTrades = !credentials && typeof onTrade === 'function';
   let socket = null, era = 0, closed = false, started = false, failures = 0, lastFrame = 0, error = null;
   let open = false, loggedIn = false, subscribed = new Set();
   let heartbeatAckAt = null, armingAttempted = false;
+  let pendingPings = 0, singlePing = null;
   let resumeAfterExpiry = null;
   const timers = new Set();
   let retryTimer = null;
@@ -70,6 +72,8 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
     const old = socket;
     const expiryWait = armingAttempted ? (DEAD_MAN_SECONDS + 1) * 1000 : 0;
     armingAttempted = false;
+    pendingPings = 0; singlePing = null;
+    sample(latency?.down);
     era += 1; socket = null; open = false; loggedIn = false; subscribed = new Set(); heartbeatAckAt = null;
     clearTimers();
     error = reason;
@@ -93,19 +97,31 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
       if (now() - lastFrame >= SILENCE_MS) { fail('silent'); return; }
       // A busy depth feed only proves the inbound path. Require a round trip on the socket that armed the timer.
       if (subscribed.has(DEAD_MAN) && !deadManReady()) { fail('heartbeat_timeout'); return; }
+      // The protocol has no ping id. With overlapping pings, discard RTTs until every outstanding pong has arrived.
+      if (latency) {
+        pendingPings++;
+        singlePing = pendingPings === 1 ? sample(latency.stamp) : null;
+      }
       if (send({ op: 'ping' }) && current === era) schedule(beat, PING_MS);
     }, PING_MS);
   }
   const privateReady = () => loggedIn && PRIVATE.every(channel => subscribed.has(channel));
   const publicReady = () => subscribed.has('depthBooksPerps') && (!observeTrades || subscribed.has('tradesPerps'));
   const deadManReady = () => loggedIn && subscribed.has(DEAD_MAN) && heartbeatAckAt !== null && now() - heartbeatAckAt < SILENCE_MS;
-  function receive(data) {
+  function receive(data, received) {
     const raw = typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
     if (raw.length > MAX_BYTES) throw new Error('size');
     const message = JSON.parse(raw);
     if (!object(message)) throw new Error('shape');
     lastFrame = now();
-    if (message.type === 'pong') { if (subscribed.has(DEAD_MAN)) heartbeatAckAt = lastFrame; return; }
+    if (message.type === 'pong') {
+      if (subscribed.has(DEAD_MAN)) heartbeatAckAt = lastFrame;
+      if (pendingPings > 0) {
+        if (pendingPings === 1 && singlePing) sample(latency?.elapsed, null, 'wsRtt', singlePing, received);
+        pendingPings--; singlePing = null;
+      }
+      return;
+    }
     if (message.type === 'loggedIn') {
       if (!credentials || loggedIn) return;
       loggedIn = true;
@@ -140,10 +156,16 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
     if (message.type !== 'update' || typeof message.channel !== 'string') return;
     if (message.channel === 'depthBooksPerps') {
       if (!Array.isArray(message.data)) throw new Error('shape');
+      const frameEra = era;
+      const frameBooks = received ? new Map() : null;
       for (const row of message.data) {
         if (!object(row) || !wanted.has(row.market)) continue;
-        onBook(row.market, parseOndoBook(row), lastFrame);
+        const book = parseOndoBook(row);
+        onBook(row.market, book, lastFrame);
+        // If a market appears several times in one frame, its newest complete BBO represents this arrival.
+        if (frameBooks && book?.bids.length && book.asks.length) frameBooks.set(row.market, Math.max(frameBooks.get(row.market) ?? -Infinity, book.time));
       }
+      if (frameBooks && frameEra === era) for (const [market, sourceAt] of frameBooks) sample(latency?.book, market, sourceAt, received);
     } else if (message.channel === 'tradesPerps' && observeTrades && publicReady()) {
       if (!Array.isArray(message.data)) throw new Error('shape');
       for (const row of message.data) {
@@ -184,7 +206,8 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
     });
     ws.addEventListener('message', event => {
       if (!active()) return;
-      try { receive(event.data); } catch { if (active()) fail('invalid_data'); }
+      const received = sample(latency?.stamp);
+      try { receive(event.data, received); } catch { if (active()) fail('invalid_data'); }
     });
     ws.addEventListener('error', () => { if (active()) fail('socket_error'); });
     ws.addEventListener('close', () => { if (active()) fail('disconnected'); });
@@ -200,6 +223,8 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
     close() {
       if (closed) return;
       closed = true;
+      pendingPings = 0; singlePing = null;
+      sample(latency?.down);
       const old = socket;
       era += 1; socket = null; open = false; loggedIn = false; subscribed = new Set();
       clearTimers();

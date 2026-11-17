@@ -2,6 +2,7 @@
 import { ondoAuthHeaders } from './transport.mjs';
 import { readJsonResponse } from '../response.mjs';
 import { compareDecimals, decimal } from './decimal.mjs';
+import { cleanOrderAck, markRetriedReport, sample } from './latency.mjs';
 
 const BASE = 'https://api.ondoperps.xyz';
 const MAX_BYTES = 4 * 1024 * 1024;
@@ -52,7 +53,7 @@ function orderOf(value, expected = {}) {
 // write that fails after it was sent, or answers 5xx, is reported uncertain and
 // left to the caller to look up. Requests share one token bucket of `rps`
 // (burst = one second); urgent ones (cancels, closes) go first.
-export function createOndoClient({ credentials = null, fetchImpl = fetch, now = Date.now, timeoutMs = 5000, rps = 4,
+export function createOndoClient({ credentials = null, fetchImpl = fetch, now = Date.now, timeoutMs = 5000, rps = 4, latency,
   setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout, cooldownUntil = 0 } = {}) {
   if (!Number.isFinite(rps) || rps < 1 || rps > 20) throw new RangeError('Ondo rps must be 1-20');
   const queue = [];
@@ -66,17 +67,17 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
     while (queue.length && tokens >= 1) {
       const index = Math.max(0, queue.findIndex(item => item.urgent));
       const [item] = queue.splice(index, 1);
-      tokens -= 1; item.resolve();
+      tokens -= 1; item.resolve(item.timed ? sample(latency.stamp) : null);
     }
     if (queue.length && timer === null) {
       timer = setTimeoutImpl(() => { timer = null; pump(); }, Math.ceil((1 - tokens) * 1000 / rps));
       timer?.unref?.();
     }
   }
-  function slot(urgent) {
+  function slot(urgent, timed) {
     // A backlog means quotes are already stale: fresh ones are refused, cancels still queue.
     if (!urgent && queue.length >= MAX_QUEUE) return Promise.reject(new OndoError('local_backlog'));
-    return new Promise((resolve, reject) => { queue.push({ urgent, resolve, reject }); pump(); });
+    return new Promise((resolve, reject) => { queue.push({ urgent, timed, resolve, reject }); pump(); });
   }
   function cool(response, sentAt) {
     const header = Number(response.headers?.get?.('retry-after'));
@@ -94,9 +95,17 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
     if (now() < until) throw new OndoError('rate_limited', { retryAt: until });
   };
 
-  async function request(method, path, { body, auth = true, urgent = false, write = false, cancel = false, canSend } = {}, resigned = false) {
+  // No URL, order id, body, signature or credentials leave the client via the observer.
+  function finishAck(timing, success) {
+    if (!timing?.sent) return;
+    sample(latency.elapsed, timing.market, timing.metric, timing.sent, sample(latency.stamp), success);
+    timing.sent = null;
+  }
+  async function request(method, path, { body, auth = true, urgent = false, write = false, cancel = false, canSend, timing } = {}, resigned = false) {
     refuse(cancel);
-    await slot(urgent);
+    const queued = timing && sample(latency.stamp);
+    const granted = await slot(urgent, !!queued);
+    if (queued) sample(latency.elapsed, timing.market, 'restQueue', queued, granted);
     refuse(cancel);
     const text = body === undefined ? '' : JSON.stringify(body);
     const headers = { Accept: 'application/json', ...(text ? { 'Content-Type': 'application/json' } : {}) };
@@ -111,6 +120,7 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
     const deadline = setTimeoutImpl(() => controller.abort(), timeoutMs);
     let response, payload = null;
     try {
+      if (timing) timing.sent = sample(latency.stamp);
       response = await fetchImpl(BASE + path, { method, headers, ...(text ? { body: text } : {}), signal: controller.signal, redirect: 'error', cache: 'no-store' });
       try { payload = await readJsonResponse(response, { maxBytes: MAX_BYTES, signal: controller.signal }); }
       catch (error) { if (error?.code === 'aborted' || controller.signal.aborted) throw error; }
@@ -126,9 +136,27 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
     if (status >= 200 && status < 300 && (!object(payload) || !code)) throw new OndoError('invalid_data', { status, uncertain: write });
     if (code && code.includes('timestamp') && auth && !resigned) {
       const date = Date.parse(response.headers?.get?.('date') ?? '');
-      if (Number.isFinite(date)) { offset = date - now(); return request(method, path, { body, auth, urgent, write, cancel, canSend }, true); }
+      if (Number.isFinite(date)) {
+        offset = date - now();
+        if (timing) { finishAck(timing, false); timing.retried = true; }
+        return request(method, path, { body, auth, urgent, write, cancel, canSend, timing }, true);
+      }
     }
     throw new OndoError(code ?? `http_${status}`, { status });
+  }
+
+  async function writeOrder(method, path, options, name, status, parse) {
+    const timing = latency && name ? { market: name, metric: status === 'open' ? 'placeAck' : 'cancelAck' } : null;
+    let confirmed = false;
+    try {
+      const payload = await request(method, path, { ...options, write: true, timing });
+      let order;
+      try { order = parse(payload.result); }
+      catch { throw new OndoError('invalid_data', { status: 200, uncertain: true }); }
+      confirmed = cleanOrderAck(order, status);
+      if (timing?.retried) markRetriedReport(order);
+      return order;
+    } finally { finishAck(timing, confirmed); }
   }
 
   const id = value => { if (typeof value !== 'string' || !ID.test(value)) throw new TypeError('Invalid Ondo order id'); return value; };
@@ -160,22 +188,20 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
       if (typeof reduceOnly !== 'boolean' || !['GTC', 'IOC'].includes(timeInForce) || (timeInForce === 'IOC' && !reduceOnly)) throw new TypeError('Invalid Ondo order instructions');
       const body = { market: market(name), side, price: decimal(price, { positive: true }), size: decimal(size, { positive: true }), type: 'limit',
         timeInForce, postOnly: timeInForce === 'GTC', reduceOnly, clientOrderId: id(clientOrderId) };
-      const payload = await request('POST', '/v1/perps/orders', { body, write: true, urgent: reduceOnly, canSend });
-      try {
-        if (payload.result?.timeInForce !== undefined && payload.result.timeInForce !== timeInForce) throw invalid();
-        const order = orderOf(payload.result, { clientId: clientOrderId, market: name, side, price: body.price, size: body.size, reduceOnly });
+      return writeOrder('POST', '/v1/perps/orders', { body, urgent: reduceOnly, canSend }, reduceOnly ? null : name, 'open', result => {
+        if (result?.timeInForce !== undefined && result.timeInForce !== timeInForce) throw invalid();
+        const order = orderOf(result, { clientId: clientOrderId, market: name, side, price: body.price, size: body.size, reduceOnly });
         if (order.status === 'untriggered') throw invalid();
         return order;
-      } catch { throw new OndoError('invalid_data', { status: 200, uncertain: true }); }
+      });
     },
     /** A mismatched or nonterminal cancel reply leaves the outcome unknown. */
     async cancel(orderId, expected = {}) {
-      const payload = await request('DELETE', `/v1/perps/orders/${id(orderId)}`, { write: true, urgent: true, cancel: true });
-      try {
-        const order = orderOf(payload.result, { ...expected, id: orderId });
+      return writeOrder('DELETE', `/v1/perps/orders/${id(orderId)}`, { urgent: true, cancel: true }, expected?.market, 'canceled', result => {
+        const order = orderOf(result, { ...expected, id: orderId });
         if (!['canceled', 'fullyfilled'].includes(order.status)) throw invalid();
         return order;
-      } catch { throw new OndoError('invalid_data', { status: 200, uncertain: true }); }
+      });
     },
     /** The order with this client id, or null when the venue has none. */
     async orderByClientId(clientOrderId, expected = {}) {

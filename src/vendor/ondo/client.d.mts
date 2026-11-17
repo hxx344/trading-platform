@@ -14,5 +14,6 @@ export interface OndoClient {
   close(): void;
 }
 export function createOndoClient(options?: {
+  latency?: import('./latency.mjs').OndoLatencyObserver;
   credentials?: { keyId: string; secret: string } | null; fetchImpl?: typeof fetch; now?: () => number; timeoutMs?: number; rps?: number; cooldownUntil?: number;
 }): OndoClient;

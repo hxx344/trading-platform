@@ -13,7 +13,7 @@ export function splitOndoMmConfig(config: OndoMmConfig): { config: Omit<OndoMmCo
 export function validateCredentials(value: unknown): { keyId: string; secret: string };
 export interface OndoRestingOrder { market: string; side: 'buy' | 'sell'; price: string; size: string }
 export interface OndoMarketMaker {
-  state(): Record<string, unknown> & { config: OndoMmConfig; phase: 'stopped' | 'stopping' | 'running'; live: boolean };
+  state(): Record<string, unknown> & { config: OndoMmConfig; phase: 'stopped' | 'stopping' | 'running'; live: boolean; latency: import('./latency.mjs').OndoLatencySnapshot | null };
   tick(): Promise<void>;
   initialize(): void;
   save(value: unknown): Record<string, unknown>;
@@ -30,9 +30,10 @@ export function createOndoMarketMaker(options: {
   readCredentials?: () => { keyId: string; secret: string } | null;
   initialConfig?: unknown;
   notifyRisk?: (key: string, text: string) => void;
+  createObservationEstimator?: (config: OndoMmConfig) => import('../../ondo/observation-earnings.ts').ObservationEstimator;
   closeWaitMs?: number;
   log?: { info(...args: unknown[]): void; warn(...args: unknown[]): void; error(...args: unknown[]): void; debug?(...args: unknown[]): void };
-  now?: () => number; intervalMs?: number; fetchImpl?: typeof fetch; WebSocketImpl?: unknown;
+  now?: () => number; monotonicNow?: () => number; intervalMs?: number; fetchImpl?: typeof fetch; WebSocketImpl?: unknown;
   clientFactory?: (options: Record<string, unknown>) => unknown; streamFactory?: import('./stream.mjs').OndoStreamFactory;
   sleep?: (ms: number) => Promise<void>;
 }): OndoMarketMaker;

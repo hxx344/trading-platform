@@ -3,6 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import { createOndoStream, parseOndoBook } from '../../src/vendor/ondo/stream.mjs';
+import { createOndoLatency } from '../../src/vendor/ondo/latency.mjs';
 import { formatDecimalUnits as f } from '../../src/vendor/ondo/decimal.mjs';
 
 const EPOCH = 1_800_000_000_000;
@@ -44,6 +45,63 @@ test('depth snapshots are parsed exactly and malformed or crossed ones become nu
   assert.equal(parseOndoBook({ time: '2026-11-12T18:30:26Z', asks: [['1e3', '1']], bids: [] }), null);
   assert.equal(parseOndoBook({ time: 'never', asks: [], bids: [] }), null);
   assert.equal(parseOndoBook({ time: '2026-11-12T18:30:26Z', asks: [['1', '0']], bids: [] }), null);
+});
+
+test('BBO latency samples complete market frames once, keeps clock lead, and restarts intervals on reconnect', async () => {
+  const markets = ['NVDA-USD.P', 'TSLA-USD.P'];
+  let wallOffset = 0;
+  const latency = createOndoLatency({ markets, mode: 'observe', startedAt: EPOCH, now: () => s.now() + wallOffset, monotonicNow: () => s.now() - EPOCH });
+  const s = fixture({ markets, latency });
+  s.stream.start();
+  const first = s.sockets[0]; first.emit('open');
+  const batch = s.depth(), row = batch.data[0];
+  batch.data.push({ ...row, time: new Date(EPOCH + 13).toISOString() }, { ...row, market: markets[1] });
+  first.frame(batch);
+  let [a, b] = latency.snapshot().markets;
+  assert.deepEqual([a.bboAge.n, a.bboAge.lastMs, a.clockAheadN, a.bookInterval.lastMs], [1, -13, 1, null]);
+  assert.deepEqual([b.bboAge.n, b.bboAge.lastMs, b.clockAheadN], [1, 0, 0]);
+  await s.advance(50); first.frame(s.depth({ asks: [] }));
+  await s.advance(70); wallOffset = -100;
+  first.frame(s.depth({ time: new Date(EPOCH).toISOString() }));
+  [a, b] = latency.snapshot().markets;
+  assert.deepEqual([a.bboAge.lastMs, a.bboAge.lastAt, a.bookInterval.lastMs], [20, EPOCH + 20, 120]);
+  assert.deepEqual([b.bboAge.n, b.bookInterval.n], [1, 0]);
+  first.close(); await s.advance(1000);
+  const next = s.sockets[1]; next.emit('open');
+  first.frame(s.depth()); next.frame(s.depth());
+  assert.equal(latency.snapshot().markets[0].bookInterval.n, 1);
+  s.stream.close();
+});
+
+test('only an unambiguous pong from the same socket measures RTT; the existing ping schedule is preserved', async () => {
+  const latency = createOndoLatency({ markets: ['NVDA-USD.P'], mode: 'observe', startedAt: EPOCH, now: () => s.now(), monotonicNow: () => s.now() - EPOCH });
+  const s = fixture({ latency }); s.stream.start();
+  const first = s.sockets[0]; first.emit('open');
+  const pong = socket => socket.frame({ type: 'pong' });
+  pong(first); await s.advance(5000); await s.advance(83); pong(first); pong(first);
+  assert.deepEqual([latency.snapshot().wsRtt.lastMs, latency.snapshot().wsRtt.n], [83, 1]);
+  await s.advance(9917); // Both the 10 s and 15 s pings are outstanding. Neither reply can be attributed.
+  pong(first); pong(first);
+  assert.equal(latency.snapshot().wsRtt.n, 1);
+  await s.advance(5000); await s.advance(12); pong(first);
+  assert.deepEqual([latency.snapshot().wsRtt.lastMs, latency.snapshot().wsRtt.n], [12, 2]);
+  await s.advance(4988); first.close(); await s.advance(1000);
+  const second = s.sockets[1]; second.emit('open'); pong(first); pong(second);
+  assert.equal(latency.snapshot().wsRtt.n, 2);
+  await s.advance(5000); pong(second);
+  assert.deepEqual([latency.snapshot().wsRtt.lastMs, latency.snapshot().wsRtt.n], [0, 3]);
+  assert.equal(first.sent.filter(value => value.op === 'ping').length, 5);
+  s.stream.close();
+});
+
+test('a broken latency observer cannot invalidate a book or interrupt the account heartbeat', async () => {
+  const broken = () => { throw new Error('observer'); };
+  const s = fixture({ credentials: keys, latency: { stamp: () => ({ wall: EPOCH, mono: 0 }), book: broken, elapsed: broken, down: broken } });
+  s.stream.start(); const socket = s.sockets[0]; socket.emit('open'); socket.frame({ type: 'loggedIn' });
+  for (const item of socket.sent.filter(it => it.op === 'subscribe')) socket.frame({ type: 'subscribed', channel: item.channel });
+  socket.frame(s.depth()); await s.advance(5000); socket.frame({ type: 'pong' });
+  assert.equal(s.books.length, 1); assert.equal(s.stream.status().deadManReady, true); assert.deepEqual(s.downs, []);
+  s.stream.close();
 });
 
 test('a public stream subscribes to depth only and passes each snapshot on', async () => {

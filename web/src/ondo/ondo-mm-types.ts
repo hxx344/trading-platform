@@ -1,5 +1,7 @@
 // 改编自 project-aggregation 工作台 src/ondo-mm-types.ts（提交 7745181）；挂单配置与服务共用类型。
 import type { OndoMmConfig } from '../../../src/vendor/ondo/mm.mjs';
+import type { OndoLatencySnapshot } from '../../../src/vendor/ondo/latency.mjs';
+import type { OndoObservationEarnings } from '../../../src/ondo/reward-types.ts';
 export type { OndoMmConfig };
 export type OndoMmSide = {
   role: 'quote' | 'close'; state: 'none' | 'planned' | 'sending' | 'open' | 'canceling' | 'unknown';
@@ -13,6 +15,7 @@ export type OndoMmMarket = {
 export type OndoMmEvent = { at: string; market: string | null; kind: string; text: string };
 export type OndoObservation = {
   startedAt: number; endedAt: number | null;
+  earnings?: OndoObservationEarnings;
   rows: {
     market: string; side: 'buy' | 'sell'; distanceBps: 4 | 8 | 15; activeMs: number;
     touches: number; sweeps: number; touchesPerHour: number | null; sweepsPerHour: number | null;
@@ -30,6 +33,7 @@ export type OndoMmSnapshot = {
   leftPositions: { market: string; position: string }[];
   incident: { at: number; market: string; reason: string } | null;
   observation: OndoObservation | null;
+  latency?: OndoLatencySnapshot | null;
   recovery: { startedAt: string | null; error: string | null; cleaning: boolean } | null;
   events: OndoMmEvent[]; loadError: string | null; serverNow: number;
 };

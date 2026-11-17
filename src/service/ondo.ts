@@ -8,6 +8,7 @@ import { createOndoMarketMaker, HttpError, type OndoMarketMaker } from '../vendo
 import { ONDO_MARKET, type OndoClient } from '../vendor/ondo/client.mjs';
 import { createOndoStream, type OndoStreamFactory } from '../vendor/ondo/stream.mjs';
 import { createOndoRewards, RewardInputError, type OndoRewards } from '../ondo/rewards.ts';
+import { OBSERVATION_WINDOW_MIN, observationEarnings } from '../ondo/observation-earnings.ts';
 import type { OndoCredentials, OndoServiceConfig } from './ondo-config.ts';
 
 /** How long a stop waits for a live session's quotes to be withdrawn; inside the 20 s drain (main.ts DRAIN_MS). */
@@ -73,6 +74,10 @@ export async function createOndoModule(config: OndoServiceConfig, key: OndoCrede
   try {
     mm = made = createOndoMarketMaker({
       dataDir, readCredentials: () => key ?? null, ...(config.initial ? { initialConfig: config.initial } : {}), closeWaitMs: ONDO_CLOSE_WAIT_MS,
+      createObservationEstimator: quote => {
+        const pool = rewards.config();
+        return (observation, status, at) => observationEarnings(quote, pool, observation, status, rewards.state(OBSERVATION_WINDOW_MIN).markets, at);
+      },
       log: { info: say('info'), warn: say('warn'), error: say('error'), debug: say('debug') },
       ...(options.notifyRisk ? { notifyRisk: options.notifyRisk } : {}),
       ...(!key && options.observeFeed ? { clientFactory: options.observeFeed.client, streamFactory: options.observeFeed.stream } : {}),
@@ -94,7 +99,7 @@ export async function createOndoModule(config: OndoServiceConfig, key: OndoCrede
     state: () => mm.state(),
     // A live start additionally requires acknowledgement of the venue's account-wide cancellation scope.
     save: body => mm.save(only(body, 'config').config),
-    start: body => mm.start(only(body, 'revision', 'confirmLive', 'confirmAccountWide', 'adoptPositions')),
+    start: body => mm.start(only(body, 'revision', 'confirmLive', 'confirmAccountWide', 'adoptPositions', 'observeMarkets')),
     stop: body => mm.stop(only(body ?? {}, 'sessionId', 'live')),
     cleanup: body => { only(body); return mm.cleanup(); },
     discardRecovery: body => { only(body); return mm.discardRecovery(); },

@@ -3,6 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import { createOndoClient, OndoError } from '../../src/vendor/ondo/client.mjs';
+import { createOndoLatency } from '../../src/vendor/ondo/latency.mjs';
 
 const keys = { keyId: 'ondoKeyId_fixture', secret: 'ondoApiSecret_fixture-secret' };
 const EPOCH = 1_800_000_000_000;
@@ -20,6 +21,70 @@ function fixture(replies, options = {}) {
   return { calls, clock, client: createOndoClient({ credentials: keys, fetchImpl, now: () => clock.now, rps: 10, ...options }) };
 }
 const rejected = (code, extra = {}) => error => error instanceof OndoError && error.code === code && Object.entries(extra).every(([key, value]) => error[key] === value);
+
+test('queue timing ends at token grant; HTTP timing waits for the complete validated body', async () => {
+  let mono = 0, releaseToken, body;
+  const market = 'NVDA-USD.P', now = () => EPOCH + mono;
+  const latency = createOndoLatency({ markets: [market], mode: 'live', startedAt: EPOCH, now, monotonicNow: () => mono });
+  const client = createOndoClient({ credentials: keys, rps: 1, now, latency,
+    setTimeoutImpl(fn, ms) { if (ms === 1000) releaseToken = fn; return 1; }, clearTimeoutImpl() {},
+    fetchImpl: async (_, { method }) => {
+      if (method === 'GET') return json({ success: true, result: [] });
+      mono += 17;
+      return new Response(new ReadableStream({ start(controller) { body = controller; } }), { headers: { 'Content-Type': 'application/json' } });
+    } });
+  await client.positions();
+  const placing = client.place({ market, side: 'buy', price: '199.93', size: '0.5', clientOrderId: 'omm-1' });
+  mono += 1000; releaseToken(); await new Promise(resolve => setImmediate(resolve));
+  let row = latency.snapshot().markets[0];
+  assert.deepEqual([row.restQueue.lastMs, row.restQueue.lastAt, row.placeAck.n], [1000, EPOCH + 1000, 0]);
+  mono += 23; body.enqueue(new TextEncoder().encode(JSON.stringify({ success: true, result: order() }))); body.close();
+  await placing; row = latency.snapshot().markets[0];
+  assert.deepEqual([row.placeAck.lastMs, row.placeAck.lastAt, row.placeAck.n], [40, EPOCH + 1040, 1]);
+  client.close();
+});
+
+test('request failures, incomplete acknowledgements and local vetoes never enter successful HTTP quantiles', async () => {
+  const market = 'NVDA-USD.P', now = () => EPOCH + mono;
+  let mono = 0;
+  const latency = createOndoLatency({ markets: [market], mode: 'live', startedAt: EPOCH, now, monotonicNow: () => mono });
+  const input = { market, side: 'buy', price: '199.93', size: '0.5', clientOrderId: 'omm-1' };
+  const reply = extra => json({ success: true, result: order(extra) });
+  const responses = [
+    () => { mono += 17; return reply({ status: 'canceled' }); },
+    reply({ status: 'canceled', filledSize: '0.1' }), reply({ status: 'canceled', market: 'TSLA-USD.P' }),
+    new Error('connection lost'), json({ error_code: 'post_only_has_match' }, 400), reply({ status: 'pending' }),
+    reply({ filledSize: '0.1' }), reply({ reduceOnly: true }),
+    json({ error_code: 'invalid_timestamp' }, 400, { Date: new Date(EPOCH).toUTCString() }),
+    () => { mono += 24; return reply({}); },
+  ];
+  const { client, calls } = fixture(responses, { now, latency, rps: 20 });
+  await client.cancel('abc123', { market });
+  await client.cancel('abc123', { market });
+  await assert.rejects(client.cancel('abc123', { market }), rejected('invalid_data', { uncertain: true }));
+  await assert.rejects(client.place(input), rejected('network', { uncertain: true }));
+  await assert.rejects(client.place(input), rejected('post_only_has_match'));
+  await client.place(input); await client.place(input);
+  await client.place({ ...input, reduceOnly: true });
+  await client.place(input);
+  await assert.rejects(client.place({ ...input, canSend: () => false }), rejected('send_guard'));
+  const row = latency.snapshot().markets[0];
+  assert.deepEqual([row.cancelAck.n, row.cancelAck.failed, row.cancelAck.p95Ms], [1, 2, 17]);
+  assert.deepEqual([row.placeAck.n, row.placeAck.failed, row.placeAck.p95Ms, row.placeAck.lastFailureAt], [1, 5, 24, EPOCH + 17]);
+  assert.deepEqual([row.restQueue.n, row.restQueue.lastMs], [10, 0]);
+  assert.equal(calls.length, 10);
+  client.close();
+});
+
+test('an observer failure leaves the outgoing order, its guard, and its result intact', async () => {
+  const broken = () => { throw new Error('observer'); };
+  const { client, calls } = fixture([json({ success: true, result: order() })], { latency: { stamp: broken, elapsed: broken } });
+  const input = { market: 'NVDA-USD.P', side: 'buy', price: '199.93', size: '0.5', clientOrderId: 'omm-1' };
+  const accepted = await client.place(input);
+  await assert.rejects(client.place({ ...input, canSend: () => false }), rejected('send_guard'));
+  assert.equal(accepted.status, 'open'); assert.equal(calls.length, 1);
+  client.close();
+});
 
 test('an order is sent post-only, signed over its exact body, to the fixed host', async () => {
   const { client, calls } = fixture([json({ success: true, result: order() })]);

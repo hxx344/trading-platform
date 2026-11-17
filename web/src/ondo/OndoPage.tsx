@@ -7,9 +7,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { LoaderCircle, Play, RefreshCw, Save, Square } from 'lucide-react';
 import { api, ApiError } from '../api.ts';
 import type { OndoMmConfig, OndoMmSide, OndoMmSnapshot } from './ondo-mm-types.ts';
+import type { OndoRewardsView } from '../../../src/ondo/reward-types.ts';
 import { useLiveResource } from '../use-live-resource.ts';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { OndoObservationPanel } from './OndoObservation.tsx';
+import { OndoLatencyPanel } from './OndoLatency.tsx';
 import { OndoRewards } from './OndoRewards.tsx';
 import { ACCOUNT_WIDE_CONFIRMATION, exitSummary, quoteConfigRequest, quoteStartRequest, quoteStopRequest, type OndoStopRequest } from './quote-form.ts';
 
@@ -76,6 +78,8 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
   }, []);
   const active = !!snapshot && snapshot.phase !== 'stopped';
   const resource = useLiveResource<OndoMmSnapshot>(ONDO_STATE_PATH, { intervalMs: active ? 2000 : 15_000, timeoutMs: ONDO_READ_TIMEOUT_MS, onExpired });
+  const [rewardWindow, setRewardWindow] = useState(60);
+  const rewards = useLiveResource<OndoRewardsView>(`${ROOT}/rewards?window=${rewardWindow}`, { intervalMs: 15_000, timeoutMs: 10_000, onExpired });
   const loadError = resource.error && !(resource.error instanceof ApiError && resource.error.status === 401) ? resource.error.message : '';
   // 写入进行中不接收读取结果：写入成功后的结果作废之前发出的读取（L089）。
   useEffect(() => {
@@ -112,18 +116,14 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
     const submitted = JSON.stringify(draft);
     await execute('save', '/config', 'PUT', configRequest.body, '设置已保存', () => JSON.stringify(draftRef.current) === submitted);
   };
-  const start = async () => {
-    if (!snapshot || active || startBlock) return;
-    const live = snapshot.config.mode === 'live';
-    const body = quoteStartRequest(snapshot.config.mode, snapshot.revision, confirmedRevision, adoptPositions);
+  const startLive = async () => {
+    if (!snapshot || snapshot.config.mode !== 'live' || active || startBlock) return;
+    const body = quoteStartRequest('live', snapshot.revision, confirmedRevision, adoptPositions);
     if (!body) return;
-    if (live) {
-      const config = snapshot.config;
-      const preview = [`在 ${config.markets.join('、')} 启动实盘，每单 ${config.orderUsd} USD，开仓前方至少 ${config.wallUsd} USD。`,
-        ACCOUNT_WIDE_CONFIRMATION, exitSummary(config), adoptPositions ? '将接管所选市场的已有持仓。' : '所选市场已有持仓时拒绝启动。', '确认启动实盘挂单？'].join('\n\n');
-      if (!window.confirm(preview)) return;
-    }
-    await execute('start', '/start', 'POST', body, live ? '实盘会话已启动' : '观察已启动');
+    const config = snapshot.config;
+    const preview = [`在 ${config.markets.join('、')} 启动实盘，每单 ${config.orderUsd} USD，开仓前方至少 ${config.wallUsd} USD。`,
+      ACCOUNT_WIDE_CONFIRMATION, exitSummary(config), adoptPositions ? '将接管所选市场的已有持仓。' : '所选市场已有持仓时拒绝启动。', '确认启动实盘挂单？'].join('\n\n');
+    if (window.confirm(preview)) await execute('start', '/start', 'POST', body, '实盘会话已启动');
   };
   const stopRequest = quoteStopRequest(snapshot);
   const stop = async () => {
@@ -171,7 +171,7 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
     <button className="button secondary" disabled={!!busy} onClick={() => void resource.refresh()}><RefreshCw size={15} />刷新</button>
     {active ? <button key={stopRequest?.sessionId} className="button primary" disabled={!!busy || !stopRequest} title={!stopRequest ? '请刷新以核对当前会话' : undefined} onClick={() => void stop()}>{busy === 'stop' ? <LoaderCircle size={15} className="spin" /> : <Square size={15} />}{snapshot?.phase === 'stopping' ? '继续停止' : snapshot?.live ? '停止并撤单' : '停止观察'}</button>
       : <><button className="button secondary" disabled={!dirty || !!busy || !!configError} title={configError || undefined} onClick={() => void save()}>{busy === 'save' ? <LoaderCircle size={15} className="spin" /> : <Save size={15} />}保存设置</button>
-        <button className="button primary" disabled={!!busy || !snapshot || !!startBlock} title={startBlock || undefined} onClick={() => void start()}>{busy === 'start' ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}{liveSaved ? '启动实盘挂单' : '启动观察'}</button></>}
+        {liveSaved ? <button className="button primary" disabled={!!busy || !!startBlock} title={startBlock || undefined} onClick={() => void startLive()}>{busy === 'start' ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}启动实盘挂单</button> : null}</>}
   </div></header>;
   const disabled = active || !!busy;
   return <div className="wb-page">
@@ -192,7 +192,12 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
         {recovery.cleaning ? '正在撤销遗留挂单并核对持仓…' : active ? '停止观察后可重新核对。' : ''}</p>
       <button className="button secondary" disabled={!!busy || recovery.cleaning || active} onClick={() => void cleanup()}>{busy === 'cleanup' ? <LoaderCircle size={15} className="spin" /> : null}{recoveryPositions ? '重新核对持仓' : '撤单并核对'}</button>
       {' '}{recovery.error && !recovery.cleaning ? <button className="button secondary" disabled={!!busy || active} onClick={discard}>已人工核对并接手</button> : null}</Callout> : null}
-    {!snapshot || !draft ? <StatePanel kind="loading" title="正在读取状态" /> : <div className="om-layout">
+    {!snapshot || !draft ? <StatePanel kind="loading" title="正在读取状态" /> : <>
+      <OndoObservationPanel snapshot={snapshot} rewards={rewards.data?.config.markets ?? []} busy={busy} dirty={dirty}
+        stale={!!loadError || resource.status === 'offline'} onStart={body => {
+          if (!active && !dirty && snapshot.config.mode === 'observe' && body.revision === snapshot.revision) void execute('start', '/start', 'POST', body, '观察已启动');
+        }} />
+      <div className="om-layout">
       <div className="om-column">
         <section className="panel wb-status" aria-label="运行状态"><div className="wb-state-line">
           <span className={`wb-state ${snapshot.incident ? 'fault' : snapshot.phase}`}>{snapshot.phase === 'stopped' ? '未运行' : snapshot.phase === 'stopping' ? '正在停止，撤单并核对中' : snapshot.incident ? '实盘已锁定开仓' : snapshot.live ? '实盘会话运行中' : '观察中（不下单）'}</span>
@@ -209,7 +214,7 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
             {snapshot.totals && snapshot.live ? <span>下单 {snapshot.totals.placed} · 撤单 {snapshot.totals.canceled} · 成交 {snapshot.totals.fills} · 被拒 {snapshot.totals.rejected} · 只做 Maker 拦截 {snapshot.totals.postOnly}</span> : null}
           </div> : null}</section>
         <section className="panel" aria-label="市场"><div className="panel-heading"><h2>市场</h2><span className="muted">{active ? `数据 ${when(snapshot.serverNow)}` : '启动后显示'}</span></div>
-          {!snapshot.markets.length ? <TableEmpty>尚未运行。保存设置后启动观察，可以先看计划的挂单位置。</TableEmpty> : <div className="om-table"><table>
+          {!snapshot.markets.length ? <TableEmpty>尚未运行。启动观察后可查看各市场的虚拟挂单位置。</TableEmpty> : <div className="om-table"><table>
             <thead><tr><th scope="col">市场</th><th scope="col">状态</th><th scope="col" className="num">买一 / 卖一</th><th scope="col" className="num">持仓</th><th scope="col">买单</th><th scope="col">卖单</th></tr></thead>
             <tbody>{snapshot.markets.map(market => <tr key={market.market}>
               <th scope="row">{market.market}</th>
@@ -221,8 +226,7 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
               <SideCell side={market.buy} /><SideCell side={market.sell} />
             </tr>)}</tbody>
           </table></div>}</section>
-        <OndoObservationPanel data={snapshot.observation} ready={!!snapshot.stream?.publicReady} stale={!!loadError || resource.status === 'offline'}
-          period={snapshot.observation ? `${when(snapshot.observation.startedAt)} 至 ${when(snapshot.observation.endedAt ?? snapshot.serverNow)}` : ''} />
+        <OndoLatencyPanel data={snapshot.latency} connected={!!snapshot.stream?.publicReady} stale={!!loadError || resource.status === 'offline'} />
         <section className="panel" aria-label="事件"><div className="panel-heading"><h2>事件</h2><span className="muted">最近 {snapshot.events.length} 条，重启后清空</span></div>
           {snapshot.events.length ? <ul className="om-events">{snapshot.events.map((event, index) => <li key={`${event.at}-${index}`}><time>{when(event.at)}</time><span>{event.market ? <b>{event.market}</b> : null}{event.text}</span></li>)}</ul>
             : <p className="muted om-form">暂无事件</p>}</section>
@@ -234,7 +238,7 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
               <label><input type="radio" name="om-mode" checked={draft.mode === 'observe'} onChange={() => change({ mode: 'observe' })} />观察（只计算，不下单）</label>
               <label><input type="radio" name="om-mode" checked={draft.mode === 'live'} onChange={() => change({ mode: 'live' })} />实盘（真实下单）</label></div>
             <div className="wb-grid om-grid">
-              <label className="wb-field wide"><span>市场</span><input value={marketsText} onChange={e => { setMarketsText(e.target.value); change({ markets: marketList(e.target.value) }); }} placeholder="NVDA-USD.P, TSLA-USD.P" /><small>最多 10 个，逗号分隔。奖励市场名单每周可能变化，请以 Ondo 公告为准。</small></label>
+              <label className="wb-field wide"><span>已保存的挂单市场</span><input value={marketsText} onChange={e => { setMarketsText(e.target.value); change({ markets: marketList(e.target.value) }); }} placeholder="NVDA-USD.P, TSLA-USD.P" /><small>最多 10 个，逗号分隔。实盘使用这份名单，本次观察可在上方单独选市场。</small></label>
               <label className="wb-field"><span>每单金额（USD）</span><input inputMode="decimal" value={draft.orderUsd} onChange={e => change({ orderUsd: e.target.value.trim() })} /><small>每个市场买卖各挂一单。</small></label>
               <label className="wb-field"><span>目标距离（bps）</span><input inputMode="decimal" value={draft.targetBps} onChange={e => change({ targetBps: e.target.value.trim() })} /><small>距中间价 0–5 bps 的挂单分 85% 奖励。</small></label>
               <label className="wb-field"><span>最近距离（bps）</span><input inputMode="decimal" value={draft.minBps} onChange={e => change({ minBps: e.target.value.trim() })} /><small>比这更近立即撤单重挂。</small></label>
@@ -267,7 +271,7 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
         <section className="panel wb-section" aria-label="API Key"><div className="panel-heading"><h2>Ondo API Key</h2><span className="muted">{snapshot.credentials.configured ? `已配置 …${snapshot.credentials.hint ?? ''}` : '尚未配置'}</span></div>
           <p className="muted om-form">本服务从密钥文件 secrets.json 的 ondo（keyId、secret）读取，不在页面填写或回显。从工作台迁移时在设置页「从工作台导入」勾选 Ondo 一并导入；自己修改时改密钥文件后重启服务。没有 Key 时只能观察。在 Ondo Perps 的 API 管理页创建，只需交易权限，建议绑定服务器 IP 白名单。</p></section>
       </div>
-    </div>}
-    <OndoRewards mmConfig={snapshot?.config ?? null} onExpired={onExpired} />
+    </div></>}
+    <OndoRewards mmConfig={snapshot?.config ?? null} onExpired={onExpired} windowMin={rewardWindow} setWindowMin={setRewardWindow} resource={rewards} />
   </div>;
 }

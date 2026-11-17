@@ -26,7 +26,7 @@ function fixture(options = {}) {
   const count = name => v.calls.filter(call => call[0] === name).length;
   const clientFactory = () => ({
     cooldownUntil: () => v.cooldown,
-    async markets() { v.calls.push(['markets']); return v.rules; },
+    async markets() { v.calls.push(['markets']); if (v.rulesGate) await v.rulesGate; if (v.rulesError) throw v.rulesError; return v.rules; },
     async place(input) {
       await v.beforeSend?.(input);
       if (!input.canSend()) throw new OndoError('send_guard');
@@ -61,7 +61,7 @@ function fixture(options = {}) {
       status: () => ({ connected: true, publicReady: true, privateReady: !!input.credentials && f.privateReady,
         deadManReady: !!input.credentials && f.deadManReady !== false, lastFrameAt: f.time, error: null }) };
   };
-  const mm = createOndoMarketMaker({ dataDir, readCredentials: () => f.key, log: silent, now: () => f.time, intervalMs: 0, clientFactory, streamFactory,
+  const mm = createOndoMarketMaker({ dataDir, readCredentials: () => f.key, log: silent, now: () => f.time, monotonicNow: () => f.time - EPOCH, intervalMs: 0, clientFactory, streamFactory,
     readMaintenance: () => f.maintenance, readAdmission: () => f.admission, sleep: async ms => { f.time += ms; }, ...options.manager });
   const levels = rows => rows.map(([price, size]) => [u(price), u(size)]);
   f.push = (bids = BIDS, asks = ASKS, source = f.time) => { f.book = [bids, asks]; f.stream.onBook(MARKET, { time: source, bids: levels(bids), asks: levels(asks) }, f.time); };
@@ -128,6 +128,48 @@ test('observe mode computes quotes and sends nothing', async () => {
   assert.equal(stopped.observation.rows.find(row => row.side === 'buy' && row.distanceBps === 4).sweeps, 1);
   f.time += 60_000;
   assert.deepEqual(mm.state().observation, stopped.observation);
+});
+
+test('parallel observation subscribes listed and trading markets on one public feed without changing trading configuration', async () => {
+  const { f, v, mm, count } = fixture({ key: KEY });
+  mm.initialize();
+  const markets = [MARKET, ...Array.from({ length: 19 }, (_, i) => `OBS${i}-USD.P`)];
+  for (const name of markets.slice(1, -1)) v.rules.set(name, { ...v.rules.get(MARKET), trading: true });
+  v.rules.get(markets[1]).trading = false;
+  for (const invalid of [[], [MARKET, MARKET], [false], [...markets, 'EXTRA-USD.P']]) await assert.rejects(mm.start({ revision: 0, observeMarkets: invalid }), status(400));
+  const state = await mm.start({ revision: 0, observeMarkets: markets });
+  assert.deepEqual(state.config.markets, [MARKET]); assert.deepEqual(state.activeConfig.markets, markets);
+  assert.deepEqual(f.stream.markets, [MARKET, ...markets.slice(2, -1)]); assert.equal(f.stream.credentials, null);
+  assert.equal(state.observation.rows.length, 120); assert.equal(state.markets.at(-1).hold, 'unknown_market'); assert.equal(state.markets[1].hold, 'market_closed');
+  const prior = f.stream;
+  v.rules.get(markets[1]).trading = true; v.rules.delete(MARKET);
+  f.time += 60_000; await mm.tick();
+  assert.deepEqual(f.stream.markets, markets.slice(1, -1)); assert.equal(f.streamClosed, 1);
+  prior.onBook(MARKET, { time: f.time, bids: [[u('99'), u('1')]], asks: [[u('100'), u('1')]] }, f.time);
+  assert.equal(mm.state().markets[0].bid, null);
+  // No order, account read or persisted trade permission, including on a host which does have credentials.
+  assert.equal(v.calls.length, count('markets')); assert.equal(existsSync(join(f.dataDir, 'ondo-mm', 'config.json')), false);
+  await mm.stop({ sessionId: state.sessionId, live: false });
+  assert.throws(() => mm.save(config({ markets })), status(400));
+  mm.save(config());
+  await assert.rejects(mm.start({ revision: 1, confirmLive: true, confirmAccountWide: true, observeMarkets: [MARKET] }), status(400));
+  assert.equal(v.calls.length, count('markets')); assert.equal(mm.state().phase, 'stopped');
+});
+
+test('an observation waits for public rules, retries a failure and fences a rule response across stop', async () => {
+  const { f, v, mm } = fixture(); mm.initialize();
+  v.rulesError = new OndoError('upstream');
+  const failed = await mm.start({ revision: 0, observeMarkets: [MARKET, 'OLD-USD.P'] });
+  assert.equal(failed.rulesError, 'upstream'); assert.equal(failed.markets[0].hold, 'no_rules'); assert.equal(f.stream, null);
+  v.rulesError = null; f.time += 60_000; await mm.tick();
+  assert.deepEqual(f.stream.markets, [MARKET]); assert.equal(mm.state().rulesError, null);
+  await mm.stop({ sessionId: failed.sessionId, live: false });
+  let release; v.rulesGate = new Promise(resolve => { release = resolve; });
+  const pending = mm.start({ revision: 0, observeMarkets: [MARKET] });
+  const warming = mm.state(); assert.equal(warming.stream, null);
+  const stopped = await mm.stop({ sessionId: warming.sessionId, live: false });
+  release(); await assert.rejects(pending, status(409));
+  assert.equal(f.streamClosed, 1); assert.deepEqual(mm.state().observation, stopped.observation);
 });
 
 test('a live start needs confirmation, the saved revision, credentials and an open gate', async () => {
@@ -263,13 +305,58 @@ test('live quotes rest on both sides inside the band and follow the book', async
   assert.equal(f.market().buy.protection, '25994.6');
   f.push();
   // The market drops: the buy is 1.5 bps from the mid and is replaced at once; the sell is merely far and waits out the dwell time.
+  v.onCancel = order => { f.time += 7; return order; };
+  v.onPlace = () => { f.time += 11; };
   f.push([['199.94', '10']], [['199.98', '10']]);
   await f.rounds(1);
   assert.deepEqual(f.resting(), ['buy 0.5@199.88', 'sell 0.49@200.11']);
   assert.equal(f.market().sell.reason, 'too_far');
+  let stats = mm.state().latency.markets[0];
+  assert.deepEqual([stats.withdraw.n, stats.withdraw.lastMs, stats.replace.n], [1, 7, 0]);
   await f.rounds(6);
   assert.deepEqual(f.resting(), ['buy 0.5@199.88', 'sell 0.49@200.04']);
   assert.equal(count('place'), 4); assert.equal(count('cancel'), 2);
+  stats = mm.state().latency.markets[0];
+  assert.deepEqual([stats.replace.n, stats.replace.lastMs, stats.replace.failed], [1, 18, 0]);
+  const stopped = await mm.stop();
+  assert.equal(stopped.latency.mode, 'live'); assert.equal(stopped.latency.stoppedAt, f.time);
+  f.time += 600_000;
+  assert.deepEqual(mm.state().latency, stopped.latency);
+});
+
+test('replacement excludes a rejected, unknown, pending or partially filled leg and never matches a later tick', async t => {
+  for (const scenario of ['new rejected', 'new unknown', 'new pending', 'new partial', 'old partial', 'old cancel failed', 'mid-request stop', 'mid-request book gap']) {
+    await t.test(scenario, async () => {
+      const { f, v, mm } = fixture();
+      await f.live({ dwellMs: 0 });
+      await f.rounds(3, 300);
+      let stopping;
+      v.onCancel = old => {
+        if (old.side === 'sell' && scenario === 'old partial') return { ...old, filled: '0.01' };
+        if (old.side === 'sell' && scenario === 'old cancel failed') throw new OndoError('timeout', { uncertain: true });
+        return old;
+      };
+      v.onPlace = input => {
+        if (input.side !== 'sell') return;
+        if (scenario === 'new rejected') return { rests: false, error: new OndoError('post_only_has_match') };
+        if (scenario === 'new unknown') return { rests: false, error: new OndoError('timeout', { uncertain: true }) };
+        if (scenario === 'new pending') return { report: { status: 'pending' } };
+        if (scenario === 'new partial') return { report: { filled: '0.01' } };
+        if (scenario === 'mid-request stop') stopping = mm.stop();
+        if (scenario === 'mid-request book gap') { f.push([], ASKS); f.push([['199.94', '10']], [['199.98', '10']]); }
+      };
+      f.push([['199.94', '10']], [['199.98', '10']]); await mm.tick();
+      if (stopping) await stopping;
+      let metric = mm.state().latency.markets[0].replace;
+      assert.deepEqual([metric.n, metric.failed, metric.lastMs], [0, 1, null]);
+      if (scenario === 'new rejected') {
+        v.onPlace = null; await f.rounds(4, 300);
+        assert.ok(v.orders.some(order => order.side === 'sell' && order.price === '200.04'));
+        metric = mm.state().latency.markets[0].replace;
+        assert.deepEqual([metric.n, metric.failed], [0, 1]);
+      }
+    });
+  }
 });
 
 test('private data without the venue dead-man acknowledgement cannot authorize a quote', async () => {

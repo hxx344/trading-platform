@@ -32,7 +32,7 @@ export interface OndoRewardMarket {
    * Averages over the window: USD per BUCKET_BPS bucket, others only, each minute weighted alike; cover is the window's
    * smallest. samples counts minutes, snapshots the books behind them (about 10 a minute from the feed, 1 over REST).
    */
-  avg: { samples: number; snapshots: number; from: number | null; bid: number[]; ask: number[]; cover: { bid: number | null; ask: number | null } };
+  avg: { samples: number; snapshots: number; from: number | null; to: number | null; bid: number[]; ask: number[]; cover: { bid: number | null; ask: number | null } };
   /** Standard deviation of the mid's log returns (5–120 s apart) scaled to one minute, over the window; null with fewer than minReturns. */
   sigma1m: number | null;
   returns: number;
@@ -59,4 +59,23 @@ export interface OndoRewardsView {
   rulesError: string | null;
   loadError: string | null;
   markets: OndoRewardMarket[];
+}
+
+export interface OndoObservationTier {
+  distanceBps: 4 | 8 | 15;
+  /** Each side's effective virtual quoting time divided by the wall time of the observation session. */
+  buyUptime: number; sellUptime: number;
+  /** USD per day. Loss includes modelled adverse movement and two public maker fees. */
+  rewardDay: number | null; lossDay: number | null; netDay: number | null;
+  reason: string | null;
+}
+
+/** One observation session's estimate, frozen with the counters at stop. */
+export interface OndoObservationEarnings {
+  asOf: number; windowMin: number; orderUsd: number; referenceCapitalUsd: number;
+  poolUsd: number; eligible: number; reactionSec: number; holdSec: number; decayK: number;
+  markets: {
+    market: string; sampleAt: number | null; samples: number; returns: number;
+    makerFee: number | null; sigma1m: number | null; tiers: OndoObservationTier[];
+  }[];
 }

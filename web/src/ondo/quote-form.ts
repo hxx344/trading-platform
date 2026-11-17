@@ -17,6 +17,15 @@ export function quoteStartRequest(mode: OndoMmConfig['mode'], revision: number, 
   return { revision, confirmLive: true, confirmAccountWide: true, adoptPositions };
 }
 
+export const MAX_OBSERVE_MARKETS = 20;
+export type ObserveStartRequest = { revision: number; observeMarkets: string[] };
+/** The selection is an override for this public session only; the server also checks mode and revision. */
+export function observeStartRequest(mode: OndoMmConfig['mode'], revision: number, markets: readonly string[]): ObserveStartRequest | null {
+  if (mode !== 'observe' || !markets.length || markets.length > MAX_OBSERVE_MARKETS || new Set(markets).size !== markets.length) return null;
+  if (markets.some(market => !/^[A-Z0-9]{1,16}-USD\.P$/.test(market))) return null;
+  return { revision, observeMarkets: [...markets] };
+}
+
 export type OndoStopRequest = { sessionId: string; live: boolean };
 export function quoteStopRequest(snapshot: Pick<OndoMmSnapshot, 'phase' | 'sessionId' | 'live'> | null): OndoStopRequest | null {
   if (!snapshot || snapshot.phase === 'stopped' || !snapshot.sessionId) return null;

@@ -45,9 +45,9 @@ const snapshot = (market: string) => {
   const now = Date.now();
   book.mid *= Math.exp(book.sigma * Math.sqrt((now - book.at) / 60_000) * gauss());
   book.at = now;
-  return { market, bids: side(book.mid, book.depth, -1, 0.0001), asks: side(book.mid, book.depth, 1, 0.0001) };
+  return { market, time: new Date(now).toISOString(), bids: side(book.mid, book.depth, -1, 0.0001), asks: side(book.mid, book.depth, 1, 0.0001) };
 };
-const feed: OndoStreamFactory = ({ markets, onBook, onTrade }) => {
+const feed: OndoStreamFactory = ({ markets, onBook, onTrade, latency }) => {
   let timer: NodeJS.Timeout | undefined;
   let seq = 0;
   return {
@@ -56,12 +56,14 @@ const feed: OndoStreamFactory = ({ markets, onBook, onTrade }) => {
         // A market added on the page that the simulation does not know is left to the REST fallback (which reports it).
         for (const market of markets) {
           if (market === REWARD_MARKETS[7] || !books.has(market)) continue;
-          const at = Date.now(), book = parseOndoBook({ time: new Date(at).toISOString(), ...snapshot(market) });
+          const at = Date.now(), book = parseOndoBook(snapshot(market));
           if (book && onTrade && ++seq % 6 === 0) {
             const buy = seq % 12 === 0, levels = buy ? book.asks : book.bids;
             onTrade(market, { id: String(seq), time: at, price: levels[48]![0], aggressorSide: buy ? 'buy' : 'sell' }, at);
           }
-          onBook(market, book, at);
+          const received = latency?.stamp();
+          onBook(market, book, received?.wall ?? at);
+          if (received && book) latency?.book(market, book.time, received);
         }
       }, 250);
     },

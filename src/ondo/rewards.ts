@@ -121,7 +121,8 @@ export function digest(depth: OndoDepth, ours: { buy: Map<number, number>; sell:
 }
 
 const round = (value: number): number => Math.round(value * 100) / 100;
-const coverOut = (value: number): number | null => Number.isFinite(value) ? round(Math.min(value, 25)) : null;
+// Never round a partial reward band up to a full one.
+const coverOut = (value: number): number | null => Number.isFinite(value) ? Math.floor(Math.min(value, 25) * 100) / 100 : null;
 
 /** σ of the mid's log returns scaled to one minute (zero mean) over the samples; null below MIN_RETURNS returns. */
 export function minuteVolatility(samples: readonly { rv: number; rn: number }[]): { sigma1m: number | null; returns: number } {
@@ -158,6 +159,7 @@ function flush(target: Slot, source: Sample['source']): void {
 
 export interface OndoRewards {
   initialize(): void;
+  config(): OndoRewardConfig;
   state(windowMin?: number): OndoRewardsView;
   save(input: unknown): OndoRewardsView;
   /** The latest levels of one market, read again over REST when older than 5 s. */
@@ -220,7 +222,9 @@ export function createOndoRewards({ dataDir, restingOrders = () => [], clientFac
     target.pending = (async () => {
       try {
         const depth = await api().depth(target.name, 100);
-        const at = now(), { sample, latest } = digest(depth, ours(target.name), at);
+        const at = now(), sourceAt = typeof depth.time === 'number' ? depth.time : typeof depth.time === 'string' ? Date.parse(depth.time) : NaN;
+        if (Number.isFinite(sourceAt) ? Math.abs(at - sourceAt) > FRESH_MS : target.record) throw new Error('交易所盘口时刻缺失或过期');
+        const { sample, latest } = digest(depth, ours(target.name), at);
         target.latest = latest; target.error = null;
         // Only a slot still watched is sampled (the list may have changed while the read was out).
         if (target.record && slots.get(target.name) === target) { accumulate(target, sample); flush(target, 'rest'); }
@@ -252,7 +256,9 @@ export function createOndoRewards({ dataDir, restingOrders = () => [], clientFac
         if (halted()) break;
         for (const name of names) {
           const target = slots.get(name), book = target?.pushed;
-          if (!target || !book || book.at <= target.taken || now() - book.at > PUSH_FRESH_MS) continue;
+          const at = now();
+          if (!target || !book || book.at <= target.taken || book.at > at || at - book.at > PUSH_FRESH_MS
+            || !Number.isFinite(book.book.time) || Math.abs(at - book.book.time) > PUSH_FRESH_MS) continue;
           target.taken = book.at;
           try {
             const { sample, latest } = digest(bookDepth(name, book.book), ours(name), book.at);
@@ -297,7 +303,8 @@ export function createOndoRewards({ dataDir, restingOrders = () => [], clientFac
       spreadBps: latest ? round((latest.ask - latest.bid) / latest.mid * 1e4) : null,
       levels: latest?.levels ?? null, depth5: latest?.depth5 ?? null,
       cover: { bid: latest ? coverOut(latest.cover[0]) : null, ask: latest ? coverOut(latest.cover[1]) : null },
-      avg: { samples: window.length, snapshots: window.reduce((sum, sample) => sum + sample.n, 0), from: window[0]?.at ?? null, bid: average('bid'), ask: average('ask'), cover: { bid: minCover(0), ask: minCover(1) } },
+      avg: { samples: window.length, snapshots: window.reduce((sum, sample) => sum + sample.n, 0), from: window[0]?.at ?? null, to: window.at(-1)?.at ?? null,
+        bid: average('bid'), ask: average('ask'), cover: { bid: minCover(0), ask: minCover(1) } },
       sigma1m, returns, source: last?.source ?? null, error: target.error,
     };
   }
@@ -325,6 +332,7 @@ export function createOndoRewards({ dataDir, restingOrders = () => [], clientFac
       }
       sync();
     },
+    config: () => structuredClone(config),
     state,
     save(input) {
       const next = validateRewardConfig(input);

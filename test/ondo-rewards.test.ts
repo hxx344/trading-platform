@@ -6,6 +6,8 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BANDS, bandOf, bandScores, fillsPerDay, normalCdf, simulate, sweep, type SimMarket, type SimParams } from '../src/ondo/reward-sim.ts';
+import { observationEarnings } from '../src/ondo/observation-earnings.ts';
+import { ONDO_MM_DEFAULTS } from '../src/vendor/ondo/mm.mjs';
 import { BUCKETS } from '../src/ondo/reward-types.ts';
 import { BURST_MS, createOndoRewards, digest, FEED_LEVELS, MIN_RETURNS, minuteVolatility, REWARD_MARKETS, RewardInputError, validateRewardConfig } from '../src/ondo/rewards.ts';
 import { parseOndoBook, type OndoStreamFactory, type OndoStreamOptions } from '../src/vendor/ondo/stream.mjs';
@@ -65,6 +67,44 @@ test('模拟：成交亏损按波动、平仓耗时与两次挂单手续费计',
   assert.equal(rows[2]!.result.band, 2);
 });
 
+test('观察收益：三档的买卖有效时长分别定权，手续费或波动缺失保留毛奖励，失效的样本不可年化', () => {
+  const market = 'NVDA-USD.P', at = 1_800_000_120_000;
+  const quote = { ...ONDO_MM_DEFAULTS, maxHoldSec: 25, orderUsd: '200' };
+  const pool = { poolUsd: '1400', eligible: 2, markets: [market] };
+  const observed = { startedAt: at - 120_000, rows: ([4, 8, 15] as const).flatMap(distanceBps => [
+    { market, distanceBps, side: 'buy' as const, activeMs: 60_000 }, { market, distanceBps, side: 'sell' as const, activeMs: 90_000 },
+  ]) };
+  const status = { market, issue: null, makerFee: '0.0001' };
+  const bid = empty(), ask = empty(); bid[0] = 2000; ask[0] = 600;
+  const sample = { market, avg: { samples: 12, snapshots: 110, from: at - 12 * 60_000, to: at - 25_000, bid, ask, cover: { bid: 25, ask: 25 } }, returns: 22, sigma1m: 0.004 };
+  const estimate = () => observationEarnings(quote, pool, observed, [status], [sample], at);
+  const result = estimate(), first = result.markets[0].tiers[0];
+  assert.deepEqual([result.referenceCapitalUsd, result.reactionSec, result.holdSec], [400, 1, 25]);
+  assert.deepEqual(result.markets[0].tiers.map(tier => tier.distanceBps), [4, 8, 15]);
+  assert.deepEqual([first.buyUptime, first.sellUptime, first.reason], [0.5, 0.75, null]);
+  const myScore = 200 * Math.exp(-0.4), weight = Math.exp(-0.025);
+  close(first.rewardDay!, 1400 / 2 / 7 / 2 * 0.85 * (0.5 * myScore / (myScore + 2000 * weight) + 0.75 * myScore / (myScore + 600 * weight)));
+  close(first.lossDay!, 1.25 * fillsPerDay(0.004, 3, 1) * 200 * (0.004 / Math.sqrt(60) * 5 * Math.sqrt(2 / Math.PI) + 0.0002));
+  close(first.netDay!, first.rewardDay! - first.lossDay!); assert.ok(first.netDay! < 0);
+  const tier = (fee: string | null, sigma1m: number | null) => observationEarnings(quote, pool, observed, [{ ...status, makerFee: fee }], [{ ...sample, sigma1m }], at).markets[0].tiers[0];
+  assert.equal(tier(null, 0.004).rewardDay, first.rewardDay); assert.equal(tier(null, 0.004).netDay, null);
+  assert.match(tier(null, 0.004).reason!, /费率/); assert.equal(tier('0.0001', null).lossDay, null);
+  assert.match(tier('0.0001', null).reason!, /波动率/);
+  assert.notEqual(tier('0', 0).netDay, null); // Explicit zero fee and zero measured volatility are valid data.
+  sample.avg.cover.ask = 9.99;
+  assert.deepEqual(estimate().markets[0].tiers.map(item => item.rewardDay === null), [false, true, true]);
+  assert.match(estimate().markets[0].tiers[1].reason!, /10 bps/);
+  observed.rows.forEach(row => { row.activeMs = 59_999; });
+  assert.match(estimate().markets[0].tiers[0].reason!, /60 秒/);
+  sample.avg.to = at - 120_001;
+  assert.match(estimate().markets[0].tiers[0].reason!, /过期/);
+  // A newer on-demand book is deliberately absent from the estimate's inputs.
+  sample.avg.to = at + 1; assert.equal(estimate().markets[0].tiers[0].netDay, null);
+  assert.match(observationEarnings(quote, pool, observed, [status], [], at).markets[0].tiers[0].reason!, /分钟样本/);
+  assert.match(observationEarnings(quote, { ...pool, markets: [] }, observed, [status], [sample], at).markets[0].tiers[0].reason!, /采集名单/);
+  assert.match(observationEarnings(quote, pool, observed, [{ ...status, issue: '该市场休市或暂停交易' }], [sample], at).markets[0].tiers[0].reason!, /休市/);
+});
+
 const level = (price: string, size: string): [string, string] => [price, size];
 const book = (bids: [string, string][], asks: [string, string][], market = 'NVDA-USD.P'): OndoDepth => ({ market, bids, asks } as unknown as OndoDepth);
 
@@ -115,7 +155,7 @@ function fakeClient(time: { now: number }) {
       if (failNext) { failNext = false; throw new OndoError('upstream', { status: 502 }); }
       // The mid steps 0.1% a minute, so the measured σ is 0.001.
       const mid = 100 * Math.exp(0.001 * Math.round((time.now - 1_800_000_000_000) / 60_000));
-      return book([level((mid - 0.01).toFixed(4), '10'), level((mid - 0.03).toFixed(4), '20')], [level((mid + 0.01).toFixed(4), '10')], name);
+      return { ...book([level((mid - 0.01).toFixed(4), '10'), level((mid - 0.03).toFixed(4), '20')], [level((mid + 0.01).toFixed(4), '10')], name), time: new Date(time.now).toISOString() };
     },
     close() { calls.push('close'); },
   };
@@ -131,8 +171,8 @@ function fakeFeeds(error: string | null = null) {
     return { start() { feed.started = true; }, close() { feed.closed = true; },
       status: () => ({ connected: error === null, publicReady: error === null, privateReady: false, lastFrameAt: null, error }) };
   };
-  const push = (market: string, mid: number, at: number) => {
-    const row = { time: new Date(at).toISOString(), bids: [[(mid - 0.01).toFixed(4), '10'], [(mid - 0.03).toFixed(4), '20']], asks: [[(mid + 0.01).toFixed(4), '10']] };
+  const push = (market: string, mid: number, at: number, sourceAt = at) => {
+    const row = { time: new Date(sourceAt).toISOString(), bids: [[(mid - 0.01).toFixed(4), '10'], [(mid - 0.03).toFixed(4), '20']], asks: [[(mid + 0.01).toFixed(4), '10']] };
     feeds.at(-1)!.options.onBook(market, parseOndoBook(row), at);
   };
   return { factory, feeds, push };
@@ -182,6 +222,7 @@ test('采集：每分钟订阅推送 10 秒、按秒取盘口；推送缺的市�
   const [nvda, tsla] = state.markets;
   assert.equal(nvda!.listed, true); assert.equal(nvda!.makerFee, '0.0001'); assert.equal(nvda!.error, null);
   assert.equal(nvda!.source, 'ws'); assert.equal(nvda!.avg.samples, 11); assert.equal(nvda!.avg.snapshots, 108);
+  assert.equal(nvda!.avg.to, T0 + 10 * 60_000 + 9900);
   // Returns: one 5 s one in each burst and one across each gap between bursts; the 1% step is one 5 s return.
   assert.equal(nvda!.returns, 21); close(nvda!.sigma1m! ** 2, 0.01 ** 2 * 12 / 21, 1e-8); // prices are rounded to 4 places
   // Our own resting sell is taken out of the depth: 6 left of 10 at the best ask; the average carries it too.
@@ -196,12 +237,35 @@ test('采集：每分钟订阅推送 10 秒、按秒取盘口；推送缺的市�
   fake.fail(); time.now += 10_000;
   const failed = await rewards.book('TSLA-USD.P');
   assert.match(failed.error!, /盘口读取失败：Ondo 接口出错（upstream）/); assert.ok(failed.levels);
+  time.now += 3000;
+  const newer = await rewards.book('TSLA-USD.P');
+  assert.ok(newer.at! > tsla!.at!); assert.equal(newer.avg.to, tsla!.avg.to);
   rewards.close();
   assert.ok(fake.calls.includes('close'));
   // A new instance reads the saved settings.
   const again = createOndoRewards({ dataDir, clientFactory: () => fake.client, streamFactory: feed.factory, now: () => time.now });
   again.initialize();
   assert.equal(again.state().config.poolUsd, '1400'); assert.equal(again.state().revision, 1); assert.equal(again.state().loadError, null);
+});
+
+test('采集：逐市场核对推送及 REST 兜底的交易所时刻，迟到、超前和无时刻的盘口不能刷新分钟样本', async () => {
+  const names = ['NVDA-USD.P', 'TSLA-USD.P', 'AMD-USD.P'], epoch = 1_800_000_000_000, time = { now: epoch };
+  const feed = fakeFeeds(), fake = fakeClient(time), rule = { tick: '0.01', step: '0.01', makerFee: '0.0001', trading: true };
+  const client = { ...fake.client, async markets() { return new Map(names.map(name => [name, rule])); },
+    async depth(name: string) { const sample = await fake.client.depth(name); return { ...sample, time: name === names[1] ? time.now - 5001 : undefined }; } };
+  const rewards = createOndoRewards({ dataDir: mkdtempSync(join(tmpdir(), 'tp-ondo-time-')), clientFactory: () => client, streamFactory: feed.factory, now: () => time.now });
+  rewards.initialize(); rewards.save({ markets: names, poolUsd: '700', eligible: 3 });
+  let done = false;
+  await rewards.run({ stopped: () => done, pause: async ms => {
+    time.now += ms;
+    if (ms !== 1000) { done = true; return; }
+    feed.push(names[0], 100, time.now); feed.push(names[1], 100, time.now, time.now - 2001); feed.push(names[2], 100, time.now, time.now + 2001);
+  } });
+  const markets = rewards.state(60).markets;
+  assert.deepEqual(markets.map(m => m.avg.to), [epoch + 10_000, null, null]);
+  assert.deepEqual(markets.map(m => m.avg.samples), [1, 0, 0]);
+  assert.match(markets[1].error!, /时刻/); assert.match(markets[2].error!, /时刻/);
+  rewards.close();
 });
 
 test('采集：推送全断时说明原因并全部走 REST；REST 撞上页面发起的读取时共用并记样本；停在推送中途关闭推送、不记样本', async () => {

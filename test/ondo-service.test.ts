@@ -15,8 +15,9 @@ import { LIVE_WARNING, SESSION_PROBLEM, ondoCandidate, planOndo, readWorkbenchOn
 import { planImport } from '../src/service/import-workbench.ts';
 import { parseImportBody } from '../src/service/import-channel.ts';
 import { ONDO_MM_DEFAULTS } from '../src/vendor/ondo/mm.mjs';
+import type { OndoObservationEarnings } from '../src/ondo/reward-types.ts';
 import type { OndoClient } from '../src/vendor/ondo/client.mjs';
-import type { OndoStreamFactory } from '../src/vendor/ondo/stream.mjs';
+import type { OndoStreamFactory, OndoStreamOptions } from '../src/vendor/ondo/stream.mjs';
 import { bindAccounts, createHarness } from './harness.ts';
 
 const SECRET = 'ondo-secret-fixture-value-0001';
@@ -172,6 +173,93 @@ test('路由：没有 ondo 时 404，写操作校验标记、字段、专户确�
       assert.equal((await call('GET', '/api/ondo/missing')).status, 404);
     });
   } finally { await watching.close(); }
+});
+
+test('路由：并行观察保持原交易市场和奖池假设，停止时冻结虚挂与收益快照', async () => {
+  const first = 'NVDA-USD.P', second = 'TSLA-USD.P', closed = 'HALT-USD.P', missing = 'OLD-USD.P';
+  const rule = { tick: '0.01', step: '0.01', trading: true, makerFee: '0.0002' };
+  const client = (): OndoClient => ({ ...depthClient(), cooldownUntil: () => 0, async markets() {
+    return new Map([[first, rule], [second, rule], [closed, { ...rule, trading: false }]]);
+  } });
+  const streams: string[][] = [];
+  const stream: OndoStreamFactory = input => ({
+    start() { streams.push(input.markets); assert.equal(input.credentials, null); assert.equal(typeof input.onTrade, 'function');
+      for (const name of input.markets) { const at = Date.now(); input.onBook(name, { time: at, bids: [[99n * 10n ** 18n, 10n ** 18n]], asks: [[101n * 10n ** 18n, 10n ** 18n]] }, at); }
+    }, close() {}, status: () => ({ publicReady: true, connected: true, privateReady: false, lastFrameAt: Date.now(), error: null }),
+  });
+  const service = await createOndoModule({}, undefined, mkdtempSync(join(tmpdir(), 'tp-ondo-observe-')), { log: () => {}, rewardsClient: client,
+    observeFeed: { client, stream }, mmIntervalMs: 0 });
+  type Reply = { sessionId: string; revision: number; config: { markets: string[] }; activeConfig: { markets: string[] }; observation: { endedAt: number | null; earnings: OndoObservationEarnings } };
+  try {
+    await withServer({ ondo: service.views }, async call => {
+      const names = [second, first, closed, missing];
+      const run = await call('POST', '/api/ondo/start', { revision: 0, observeMarkets: names });
+      assert.equal(run.status, 200);
+      const started = await run.json() as Reply;
+      assert.deepEqual(started.config.markets, [first]); assert.deepEqual(started.activeConfig.markets, names); assert.deepEqual(streams, [[second, first]]);
+      const earnings = started.observation.earnings;
+      assert.deepEqual([earnings.orderUsd, earnings.referenceCapitalUsd, earnings.poolUsd], [100, 200, 125000]);
+      assert.deepEqual(earnings.markets.map(row => row.market), names); assert.equal(earnings.markets[0].makerFee, 0.0002);
+      assert.match(earnings.markets[0].tiers[0].reason!, /完整的奖励分钟样本/); assert.match(earnings.markets[2].tiers[0].reason!, /休市/);
+      assert.match(earnings.markets[3].tiers[0].reason!, /未上市/);
+      assert.ok(earnings.markets.every(m => m.tiers.length === 3 && m.tiers.every(t => t.rewardDay === null && t.netDay === null)));
+      const rewardConfig = { markets: [first], poolUsd: '700', eligible: 3 };
+      assert.equal((await call('PUT', '/api/ondo/rewards/config', rewardConfig)).status, 200);
+      const end = await (await call('POST', '/api/ondo/stop', { sessionId: started.sessionId, live: false })).json() as Reply;
+      assert.equal(end.observation.earnings.poolUsd, 125000); assert.equal(end.observation.earnings.eligible, 20);
+      assert.equal(end.observation.earnings.asOf, end.observation.endedAt);
+      const saved = await (await call('PUT', '/api/ondo/config', { config: { ...LIVE, markets: [first] } })).json() as Reply;
+      assert.deepEqual(saved.observation, end.observation);
+      const refused = await call('POST', '/api/ondo/start', { revision: saved.revision, confirmLive: true, confirmAccountWide: true, observeMarkets: [second] });
+      assert.equal(refused.status, 400); assert.match(((await refused.json()) as { message: string }).message, /不能指定观察市场/);
+    });
+  } finally { await service.close(); }
+});
+
+test('模块：完整的公开样本与连续有效报价产出三档净收益，停止后数值不随采样、配置或时钟改变', async t => {
+  const market = 'NVDA-USD.P', epoch = 1_800_000_000_000;
+  t.mock.timers.enable({ apis: ['Date'], now: epoch });
+  const open = new Set<OndoStreamOptions>();
+  const feed: OndoStreamFactory = input => ({ start() { open.add(input); }, close() { open.delete(input); },
+    status: () => ({ connected: true, publicReady: true, privateReady: false, lastFrameAt: Date.now(), error: null }) });
+  const client = (): OndoClient => ({ ...depthClient(), cooldownUntil: () => 0,
+    async markets() { return new Map([[market, { tick: '0.0001', step: '0.01', trading: true, makerFee: '0.0002' }]]); } });
+  const service = await createOndoModule({}, undefined, mkdtempSync(join(tmpdir(), 'tp-ondo-income-')), { log: () => {},
+    rewardsClient: client, rewardsStream: feed, observeFeed: { client, stream: feed }, mmIntervalMs: 0 });
+  service.views.saveRewards({ markets: [market], poolUsd: '700', eligible: 1 });
+  const pending = new Map<() => void, number>();
+  let stopped = false;
+  const loop = service.loop({ stopped: () => stopped, pause: ms => new Promise(resolve => { pending.set(resolve, Date.now() + ms); }) });
+  const advance = async (seconds: number) => {
+    for (let i = 0; i < seconds; i++) {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      t.mock.timers.tick(1000);
+      const at = Date.now(), mid = 1_000_000n + BigInt(Math.round(5 * Math.sin((at - epoch) / 5000)));
+      const levels = (sign: bigint): [bigint, bigint][] => [50n, 310n, 620n, 1200n, 2800n].map(offset => [(mid + sign * offset) * 10n ** 14n, 100n * 10n ** 18n]);
+      for (const stream of open) stream.onBook(market, { time: at, bids: levels(-1n), asks: levels(1n) }, at);
+      for (const [wake, due] of pending) if (at >= due) { pending.delete(wake); wake(); }
+    }
+  };
+  type Reply = { sessionId: string; observation: { endedAt: number | null; earnings: OndoObservationEarnings } };
+  try {
+    await advance(11 * 60);
+    const run = await service.views.start({ revision: 0, observeMarkets: [market] }) as Reply;
+    await advance(65);
+    const active = service.views.state() as Reply;
+    const result = active.observation.earnings.markets[0];
+    assert.ok(result.samples >= 11 && result.returns >= 20);
+    for (const tier of result.tiers) { assert.ok(tier.buyUptime > 0.95 && tier.sellUptime > 0.95); assert.ok(tier.netDay! > 0); assert.equal(tier.reason, null); }
+    const end = await service.views.stop({ sessionId: run.sessionId, live: false }) as Reply;
+    assert.deepEqual(end.observation.earnings, active.observation.earnings);
+    await advance(125);
+    service.views.saveRewards({ markets: [market], poolUsd: '7', eligible: 20 });
+    service.views.save({ config: { ...ONDO_MM_DEFAULTS, orderUsd: '50' } });
+    assert.deepEqual((service.views.state() as Reply).observation, end.observation);
+  } finally {
+    stopped = true;
+    for (const wake of pending.keys()) wake();
+    await loop;
+  }
 });
 
 test('专用账户的本机进程锁防止重复启动，状态和错误不返回密钥', async () => {

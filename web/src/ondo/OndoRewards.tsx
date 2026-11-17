@@ -4,7 +4,7 @@ import { Fragment, useEffect, useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, LoaderCircle, Save } from 'lucide-react';
 import { api, ApiError } from '../api.ts';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
-import { useLiveResource } from '../use-live-resource.ts';
+import { useLiveResource, type LiveResource } from '../use-live-resource.ts';
 import { BANDS, simulate, sweep, SWEEP_BPS, type SimMarket, type SimParams, type SimResult } from '../../../src/ondo/reward-sim.ts';
 import type { OndoLevel, OndoRewardMarket, OndoRewardsView } from '../../../src/ondo/reward-types.ts';
 import type { OndoMmConfig } from './ondo-mm-types.ts';
@@ -63,9 +63,9 @@ function Field({ label, hint, value, onChange }: { label: string; hint: string; 
 const FEED_ERRORS: Record<string, string> = { connect_timeout: '连接超时', connect_failed: '无法连接', socket_error: '连接出错', disconnected: '连接断开', silent: '长时间没有数据',
   venue_error: '交易所返回错误', invalid_data: '数据无效', send_failed: '发送失败', unsupported: '运行环境不支持 WebSocket' };
 
-export function OndoRewards({ mmConfig, onExpired }: { mmConfig: OndoMmConfig | null; onExpired: () => void }) {
-  const [windowMin, setWindowMin] = useState<number>(60);
-  const resource = useLiveResource<OndoRewardsView>(`${ROOT}?window=${windowMin}`, { intervalMs: 15_000, timeoutMs: 10_000, onExpired });
+export function OndoRewards({ mmConfig, onExpired, windowMin, setWindowMin, resource }: {
+  mmConfig: OndoMmConfig | null; onExpired: () => void; windowMin: number; setWindowMin: (minutes: number) => void; resource: LiveResource<OndoRewardsView>;
+}) {
   const view = resource.data;
   const [form, setForm] = useState<SimForm | null>(() => readSimForm(readStored(SIM_STORAGE_KEY)));
   // 第一次打开时按已保存的挂单设置给出默认参数；之后以本浏览器记住的为准。

@@ -1,6 +1,6 @@
 // The SK hynix order form turned into the executor's intent (POST /api/preview, market 'hynix', docs/hynix.md). Kept free
 // of the DOM so the server-side tests import it.
-import { LEAD_TYPES, OIL_VENUES, VENUE_LABEL, hedgeVenueFor, leadTypeAllowed, type OilLeadType, type OilPreset, type OilSide, type OilVenue } from './oil-form.ts';
+import { LEAD_TYPES, OIL_VENUES, VENUE_LABEL, hedgeVenueFor, leadTypeAllowed, type FormPreset, type OilLeadType, type OilPreset, type OilSide, type OilVenue } from './oil-form.ts';
 
 export type HynixSymbol = 'SKHYUSDT' | 'SKHYNIXUSDT';
 export const HYNIX_SYMBOLS: readonly HynixSymbol[] = ['SKHYUSDT', 'SKHYNIXUSDT'];
@@ -8,10 +8,10 @@ export const HYNIX_LABEL: Record<HynixSymbol, string> = { SKHYUSDT: 'ADR', SKHYN
 export { LEAD_TYPES, OIL_VENUES, VENUE_LABEL, hedgeVenueFor, leadTypeAllowed };
 
 export interface HynixForm {
-  preset: OilPreset;
+  preset: FormPreset;
   /** Same venue: the venue of both legs. Cross venue: the first leg's venue. */
   venue: OilVenue;
-  /** Cross venue: the hedge leg's venue, never the first leg's. */
+  /** Cross venue: the hedge leg's venue, never the first leg's. Four legs: the second venue. */
   hedgeVenue: OilVenue;
   action: 'open' | 'close';
   /** Same venue: long the premium is long the ADR / short the ordinary share (on open; close takes the same choice back). */
@@ -29,6 +29,8 @@ export interface HynixForm {
   leadQuantity: string;
   hedgeQuantity: string;
   leadOrderType: OilLeadType;
+  /** Four legs: the second venue's lead order type (leadOrderType is the first venue's). */
+  peerLeadOrderType: OilLeadType;
   chaseLimit: string;
   timeoutSeconds: string;
   slippageBps: string;
@@ -42,10 +44,15 @@ export interface HynixIntent {
   market: 'hynix'; preset: OilPreset; symbol?: HynixSymbol; action: 'open' | 'close'; timeoutMs: number; maxSlippageBps?: number; batches?: { count: number; intervalMs: number };
   legs: [HynixLegIntent, HynixLegIntent];
 }
+/** Four legs: the first venue's lead and hedge, then the second venue's, equal notional on all four (docs/oil.md 11). */
+export interface HynixFourLegIntent {
+  market: 'hynix'; preset: 'four-leg'; action: 'open' | 'close'; timeoutMs: number; maxSlippageBps?: number; batches?: { count: number; intervalMs: number };
+  legs: [HynixLegIntent, HynixLegIntent, HynixLegIntent, HynixLegIntent];
+}
 
 export const DEFAULT_HYNIX_FORM: HynixForm = {
   preset: 'same-exchange', venue: 'binance', hedgeVenue: 'bybit', action: 'open', premium: 'short', leadSymbol: 'SKHYUSDT', symbol: 'SKHYUSDT', leadSide: 'long',
-  sizing: 'notional', notional: '', leadQuantity: '', hedgeQuantity: '', leadOrderType: 'market', chaseLimit: '', timeoutSeconds: '60', slippageBps: '',
+  sizing: 'notional', notional: '', leadQuantity: '', hedgeQuantity: '', leadOrderType: 'market', peerLeadOrderType: 'market', chaseLimit: '', timeoutSeconds: '60', slippageBps: '',
   batchCount: '1', batchIntervalSeconds: '0',
 };
 
@@ -87,6 +94,7 @@ export function hynixFormToIntent(form: HynixForm): { intent: HynixIntent } | { 
   if (bps !== '' && (!INTEGER.test(bps) || Number(bps) > 1000)) return { error: '价格保护须为 1–1000 的整数基点，或留空用默认值' };
   if (!leadTypeAllowed(form.venue, form.leadOrderType)) return { error: form.leadOrderType === 'chase' ? `追价策略只有 Bybit 支持；${VENUE_LABEL[form.venue]} 首腿请选市价或本地追价` : '本地追价只用于 Binance 或 OKX 首腿；Bybit 首腿请选追价策略' };
   if (form.preset === 'cross-exchange' && form.hedgeVenue === form.venue) return { error: '跨所组合的对冲腿须在另一个交易所' };
+  if (form.preset === 'four-leg') return { error: '四腿组合用 hynixFourLegFormToIntent' };
   const chaseLimit = form.leadOrderType === 'local-chase' ? form.chaseLimit.trim() : '';
   if (chaseLimit !== '' && !positive(chaseLimit)) return { error: '追价界限须为正数价格，或留空用价格保护界限' };
   // The same checks as the oil form (oil-form.ts) and the executor's parseIntent.
@@ -102,6 +110,33 @@ export function hynixFormToIntent(form: HynixForm): { intent: HynixIntent } | { 
   };
   const legs = draftHynixLegs({ ...form, chaseLimit });
   return { intent: form.preset === 'same-exchange' ? { ...common, preset: 'same-exchange', legs } : { ...common, preset: 'cross-exchange', symbol: form.symbol, legs } };
+}
+
+/**
+ * The four-leg intent for this form: the first venue (venue) takes the premium as picked, the second (hedgeVenue) the
+ * opposite, both sending leadSymbol first, equal notional on all four legs. No custom chase limit, as in the oil form.
+ */
+export function hynixFourLegFormToIntent(form: HynixForm): { intent: HynixFourLegIntent } | { error: string } {
+  if (form.hedgeVenue === form.venue) return { error: '四腿须选择两个不同的交易所' };
+  if (form.sizing !== 'notional') return { error: '四腿须按每腿相同的名义金额下单' };
+  const first = hynixFormToIntent({ ...form, preset: 'same-exchange', chaseLimit: '' });
+  if ('error' in first) return first;
+  const second = hynixFormToIntent({ ...form, preset: 'same-exchange', chaseLimit: '', venue: form.hedgeVenue, premium: opposite(form.premium), leadOrderType: form.peerLeadOrderType });
+  if ('error' in second) return { error: `${VENUE_LABEL[form.hedgeVenue]}：${second.error}` };
+  const { preset: _preset, symbol: _symbol, legs, ...common } = first.intent;
+  return { intent: { ...common, preset: 'four-leg', legs: [...legs, ...second.intent.legs] } };
+}
+
+/** The four legs a four-leg form describes, in the intent's order. */
+export function draftHynixFourLegs(form: HynixForm): [HynixLegIntent, HynixLegIntent, HynixLegIntent, HynixLegIntent] {
+  const same = { ...form, preset: 'same-exchange' as const, chaseLimit: '', sizing: 'notional' as const };
+  return [...draftHynixLegs(same), ...draftHynixLegs({ ...same, venue: form.hedgeVenue, premium: opposite(form.premium), leadOrderType: form.peerLeadOrderType })];
+}
+
+/** One line for the confirm dialog and the preview heading, e.g. "开仓四腿 Binance 做空溢价 / Bybit 做多溢价". */
+export function describeHynixFourLeg(intent: HynixFourLegIntent): string {
+  const premium = (index: number) => `${VENUE_LABEL[intent.legs[index]!.venue]} ${intent.legs.slice(index, index + 2).find(leg => leg.symbol === 'SKHYUSDT')?.side === 'long' ? '做多' : '做空'}溢价`;
+  return `${intent.action === 'open' ? '开仓' : '平仓'}四腿 ${premium(0)} / ${premium(2)}`;
 }
 
 /** One line for the confirm dialog and the preview heading, e.g. "开仓 Binance 做空溢价：空 ADR / 多 正股". */

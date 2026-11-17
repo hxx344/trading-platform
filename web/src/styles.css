@@ -178,7 +178,6 @@ table.data.log-table td.log-text{white-space:pre-wrap;word-break:break-word;font
 table.data.history{min-width:0}
 /* The oil page: what the copied workbench trading styles (trading.css) leave to the page itself. */
 .visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
-.execution-presets.oil-presets{grid-template-columns:repeat(2,minmax(0,1fr))}
 .execution-presets.oil-presets button:disabled{opacity:.55;cursor:not-allowed}
 .oil-ok{color:var(--emerald);font-size:12px;line-height:1.8}
 .oil-review-message{margin-bottom:10px}
@@ -188,7 +187,17 @@ table.data.history{min-width:0}
 .oil-direction-name{flex-basis:100%;font-size:13px;font-weight:600;color:var(--text-primary)}
 .oil-danger{color:var(--error)}
 .execution-panel .execution-job>footer{flex-wrap:wrap}
-@media(max-width:760px){.oil-page .spread-table caption{display:block;width:auto}.execution-presets.oil-presets{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:760px){.oil-page .spread-table caption{display:block;width:auto}}
+/* Four legs (docs/oil.md 11): the three presets keep trading.css's three columns, as the workbench's 同所两腿 / 四腿组合 /
+   跨所两腿 row (project-aggregation 7745181 src/trading-execution.css .execution-presets). The workbench shows a four-leg run
+   as one job card; here it is two jobs, so a group frame holds them, its header and notes taking .execution-job>header's
+   type sizes (trading.css, from trading-execution.css 1d06abd). */
+.execution-job-group{border:1px solid var(--execution-border);border-radius:var(--radius-md);padding:0 10px 2px;margin-bottom:12px;background:var(--surface-1)}
+.execution-job-group>header{padding:11px 4px 9px}
+.execution-job-group>header h3{display:flex;align-items:center;flex-wrap:wrap;gap:9px;font-size:14px;color:var(--text-primary)}
+.execution-job-group>header p{margin-top:5px;font-size:11px;color:var(--execution-muted);line-height:1.7}
+.execution-job-group-notes{margin:0 4px 10px;padding-left:18px;font-size:12px;line-height:1.8;color:var(--text-secondary)}
+.execution-job-group-notes.warning{color:var(--execution-alert)}
 .spread-markets.oil-spread-markets{grid-template-columns:minmax(0,1fr)}
 .oil-page .execution-leg-input .execution-market-note{max-width:440px}
 .aster-desk .form-actions{align-items:center;flex-wrap:wrap}

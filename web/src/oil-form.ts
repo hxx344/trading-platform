@@ -5,12 +5,14 @@ export type OilVenue = 'binance' | 'bybit' | 'okx';
 export type OilSymbol = 'CLUSDT' | 'BZUSDT';
 export type OilSide = 'long' | 'short';
 export type OilPreset = 'same-exchange' | 'cross-exchange';
+/** The form's presets: four-leg is two same-venue pairs on two venues, sent as one POST /api/four-leg/preview (docs/oil.md 11). */
+export type FormPreset = OilPreset | 'four-leg';
 
 export interface OilForm {
-  preset: OilPreset;
+  preset: FormPreset;
   /** Same venue: the venue of both legs. Cross venue: the first leg's venue. */
   venue: OilVenue;
-  /** Cross venue: the hedge leg's venue, never the first leg's. */
+  /** Cross venue: the hedge leg's venue, never the first leg's. Four legs: the second venue. */
   hedgeVenue: OilVenue;
   action: 'open' | 'close';
   /** Same venue: long the spread is long BZ / short CL (on open; close takes the same choice back). */
@@ -25,6 +27,8 @@ export interface OilForm {
   barrels: string;
   /** chase: Bybit's native strategy; local-chase: post-only orders the executor moves, Binance or OKX only. */
   leadOrderType: OilLeadType;
+  /** Four legs: the second venue's lead order type (leadOrderType is the first venue's). */
+  peerLeadOrderType: OilLeadType;
   /** Local chase: the highest buy / lowest sell it chases to; empty takes the preview's price protection bound. */
   chaseLimit: string;
   /** Lead split into this many batches (1: one batch), each hedged before the next; market and local chase only. */
@@ -40,6 +44,11 @@ export interface OilLegIntent { venue: OilVenue; symbol?: OilSymbol; side: OilSi
 export interface OilIntent {
   market: 'oil'; preset: OilPreset; symbol?: OilSymbol; action: 'open' | 'close'; timeoutMs: number; maxSlippageBps?: number;
   legs: [OilLegIntent, OilLegIntent]; batches?: { count: number; intervalMs: number };
+}
+/** Four legs: the first venue's lead and hedge, then the second venue's, each pair as a same-venue intent's legs. */
+export interface OilFourLegIntent {
+  market: 'oil'; preset: 'four-leg'; action: 'open' | 'close'; timeoutMs: number; maxSlippageBps?: number;
+  legs: [OilLegIntent, OilLegIntent, OilLegIntent, OilLegIntent]; batches?: { count: number; intervalMs: number };
 }
 /** The lead order types a venue offers: Bybit chases with its own strategy, Binance and OKX with the executor's post-only orders. */
 export const LEAD_TYPES: Record<OilVenue, readonly (readonly [OilLeadType, string])[]> = {
@@ -63,7 +72,7 @@ const opposite = (side: OilSide): OilSide => (side === 'long' ? 'short' : 'long'
 
 export const DEFAULT_FORM: OilForm = {
   preset: 'same-exchange', venue: 'binance', hedgeVenue: 'bybit', action: 'open', spread: 'long', leadSymbol: 'CLUSDT', symbol: 'BZUSDT', leadSide: 'long',
-  barrels: '', leadOrderType: 'market', chaseLimit: '', batchCount: '1', batchIntervalSeconds: '0', timeoutSeconds: '60', slippageBps: '',
+  barrels: '', leadOrderType: 'market', peerLeadOrderType: 'market', chaseLimit: '', batchCount: '1', batchIntervalSeconds: '0', timeoutSeconds: '60', slippageBps: '',
 };
 
 const DECIMAL = /^(0|[1-9]\d{0,11})(\.\d{1,8})?$/;
@@ -86,6 +95,7 @@ export function formToIntent(form: OilForm): { intent: OilIntent } | { error: st
   if (form.leadOrderType === 'chase' && !leadTypeAllowed(form.venue, 'chase')) return { error: `追价策略只有 Bybit 支持；${VENUE_LABEL[form.venue]} 首腿请选市价或本地追价` };
   if (form.leadOrderType === 'local-chase' && !leadTypeAllowed(form.venue, 'local-chase')) return { error: '本地追价只用于 Binance 或 OKX 首腿；Bybit 首腿请选追价策略' };
   if (form.preset === 'cross-exchange' && form.hedgeVenue === form.venue) return { error: '跨所组合的对冲腿须在另一个交易所' };
+  if (form.preset === 'four-leg') return { error: '四腿组合用 fourLegFormToIntent' };
   const chaseLimit = form.leadOrderType === 'local-chase' ? form.chaseLimit.trim() : '';
   if (chaseLimit !== '' && (!DECIMAL.test(chaseLimit) || Number(chaseLimit) <= 0)) return { error: '追价界限须为正数价格，或留空用价格保护界限' };
   const count = form.batchCount.trim(), interval = form.batchIntervalSeconds.trim() || '0';
@@ -99,6 +109,33 @@ export function formToIntent(form: OilForm): { intent: OilIntent } | { error: st
   };
   const legs = draftLegs({ ...form, barrels, chaseLimit });
   return { intent: form.preset === 'same-exchange' ? { ...common, preset: 'same-exchange', legs } : { ...common, preset: 'cross-exchange', symbol: form.symbol, legs } };
+}
+
+/**
+ * The four-leg intent for this form: the first venue (venue) takes the spread as picked, the second (hedgeVenue) the
+ * opposite, both sending leadSymbol first. Each venue's pair passes the same checks as a same-venue form; no custom chase
+ * limit, since one price cannot bound two venues' opposite leads.
+ */
+export function fourLegFormToIntent(form: OilForm): { intent: OilFourLegIntent } | { error: string } {
+  if (form.hedgeVenue === form.venue) return { error: '四腿须选择两个不同的交易所' };
+  const first = formToIntent({ ...form, preset: 'same-exchange', chaseLimit: '' });
+  if ('error' in first) return first;
+  const second = formToIntent({ ...form, preset: 'same-exchange', chaseLimit: '', venue: form.hedgeVenue, spread: opposite(form.spread), leadOrderType: form.peerLeadOrderType });
+  if ('error' in second) return { error: `${VENUE_LABEL[form.hedgeVenue]}：${second.error}` };
+  const { preset: _preset, legs, ...common } = first.intent;
+  return { intent: { ...common, preset: 'four-leg', legs: [...legs, ...second.intent.legs] } };
+}
+
+/** The four legs a four-leg form describes, in the intent's order; the page shows them while the form is filled. */
+export function draftFourLegs(form: OilForm): [OilLegIntent, OilLegIntent, OilLegIntent, OilLegIntent] {
+  const same = { ...form, preset: 'same-exchange' as const, chaseLimit: '' };
+  return [...draftLegs(same), ...draftLegs({ ...same, venue: form.hedgeVenue, spread: opposite(form.spread), leadOrderType: form.peerLeadOrderType })];
+}
+
+/** One line for the confirm dialog and the preview heading, e.g. "开仓四腿 Binance 做多价差 / Bybit 做空价差". */
+export function describeFourLeg(intent: OilFourLegIntent): string {
+  const spread = (index: number) => `${VENUE_LABEL[intent.legs[index]!.venue]} ${intent.legs.slice(index, index + 2).find(leg => leg.symbol === 'BZUSDT')?.side === 'long' ? '做多' : '做空'}价差`;
+  return `${intent.action === 'open' ? '开仓' : '平仓'}四腿 ${spread(0)} / ${spread(2)}`;
 }
 
 /** The two legs this form describes, first leg first, whatever the fields hold; the page shows them while the form is filled. */

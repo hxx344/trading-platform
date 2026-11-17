@@ -3,11 +3,12 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from './api.ts';
 import { clock, label } from './labels.ts';
 import { ACTIVE_STATUSES, type OilVenue } from './oil-form.ts';
-import { DEFAULT_HYNIX_FORM, HYNIX_LABEL, LEG_FIELDS, HYNIX_SYMBOLS, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, hedgeVenueFor, closeQuantities, describeHynixIntent, draftHynixLegs, hynixFormToIntent, leadTypeAllowed, type HynixForm, type HynixIntent, type HynixSymbol } from './hynix-form.ts';
+import { DEFAULT_HYNIX_FORM, HYNIX_LABEL, LEG_FIELDS, HYNIX_SYMBOLS, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, hedgeVenueFor, closeQuantities, describeHynixFourLeg, describeHynixIntent, draftHynixFourLegs, draftHynixLegs, hynixFormToIntent, hynixFourLegFormToIntent, leadTypeAllowed, type HynixForm, type HynixFourLegIntent, type HynixIntent, type HynixSymbol } from './hynix-form.ts';
+import { isFourLegPreview, type FourLegConfirmResult, type FourLegPreview } from './four-leg.ts';
 import { crossPairs, type CrossRow, type HynixState, type OilBook, type OilConfirmResult, type OilJob, type OilPreview, type OilState } from './oil-types.ts';
 import { BalancePanel } from './HynixBalance.tsx';
 import { readBalance } from './hynix-balance.ts';
-import { ACCOUNT_MODE, ACTIVE_MS, Choice, IDLE_MS, JOB_STATUS, JobsSection, LEAVE_UNANSWERED, MARKET_MS, OIL_READ_TIMEOUT_MS, ORDER_TYPE, PositionsPanel, SyncLine, buys, confirmRefused, errorText, operation, staleness, statusOf, venueName, type PositionsKind } from './OilPage.tsx';
+import { ACCOUNT_MODE, ACTIVE_MS, Choice, IDLE_MS, JOB_STATUS, JobsSection, LEAVE_UNANSWERED, MARKET_MS, OIL_READ_TIMEOUT_MS, ORDER_TYPE, PositionsPanel, SyncLine, buys, confirmRefused, errorText, operation, staleness, statusOf, venueName, FourLegInputs, FourLegPreviewCard, chased, venuePairs, type PositionsKind } from './OilPage.tsx';
 import { OilRules } from './OilRules.tsx';
 import { RequestIds } from './request-ids.ts';
 import { StatePanel } from './StateViews.tsx';
@@ -118,7 +119,7 @@ function PreviewCard({ preview, busy, unknown, onConfirm, onEdit }: { preview: H
 function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: OilJob) => void }) {
   const venues = useMemo(() => OIL_VENUES.filter(venue => state.accounts.some(account => account.venue === venue)), [state.accounts]);
   const [form, setForm] = useState<HynixForm>(() => ({ ...DEFAULT_HYNIX_FORM, venue: venues[0] ?? 'binance', hedgeVenue: hedgeVenueFor(venues, venues[0] ?? 'binance', DEFAULT_HYNIX_FORM.hedgeVenue) ?? DEFAULT_HYNIX_FORM.hedgeVenue }));
-  const [preview, setPreview] = useState<HynixPreview | null>(null);
+  const [preview, setPreview] = useState<HynixPreview | FourLegPreview<HynixFourLegIntent> | null>(null);
   const [message, setMessage] = useState<{ tone: 'ok' | 'err' | 'muted'; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [unanswered, setUnanswered] = useState<string | null>(null);
@@ -133,7 +134,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   useEffect(() => {
     // Through update(), so a venue or preset forced by an account change also clears the per-leg quantities.
     if (venues.length && !venues.includes(form.venue)) update({ venue: venues[0]! });
-    if (!cross && form.preset === 'cross-exchange') update({ preset: 'same-exchange' });
+    if (!cross && form.preset !== 'same-exchange') update({ preset: 'same-exchange' });
     const hedge = hedgeVenueFor(venues, form.venue, form.hedgeVenue);
     if (hedge && hedge !== form.hedgeVenue) update({ hedgeVenue: hedge });
   }, [venues, cross, form.venue, form.hedgeVenue, form.preset]);
@@ -143,10 +144,17 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
     setForm(current => {
       const next = { ...current, ...patch };
       // Picking the hedge venue as the lead swaps the two, so a cross-venue pair stays on two venues.
-      if (patch.venue !== undefined && patch.venue === current.hedgeVenue) next.hedgeVenue = current.venue;
+      if (patch.venue !== undefined && patch.hedgeVenue === undefined && patch.venue === current.hedgeVenue) next.hedgeVenue = current.venue;
       if (!leadTypeAllowed(next.venue, next.leadOrderType)) next.leadOrderType = 'market';
+      // Four legs: the pair is listed in venue order (venuePairs), the second venue's lead chases its own way, and every
+      // leg takes the same notional, opening or closing.
+      if (patch.preset === 'four-leg' && OIL_VENUES.indexOf(next.venue) > OIL_VENUES.indexOf(next.hedgeVenue)) [next.venue, next.hedgeVenue] = [next.hedgeVenue, next.venue];
+      if (!leadTypeAllowed(next.hedgeVenue, next.peerLeadOrderType)) next.peerLeadOrderType = 'market';
       // Opening is by equal notional only; closing defaults to the quantities held.
       if (patch.action && patch.action !== current.action) next.sizing = patch.action === 'open' ? 'notional' : 'quantity';
+      if (next.preset === 'four-leg') next.sizing = 'notional';
+      // A native chase is never batched; its batch fields are hidden, so they must not keep a stale count.
+      if (chased(next)) { next.batchCount = '1'; next.batchIntervalSeconds = '0'; }
       // Quantities belong to the legs they were typed for: a change of contract, venue, side or action clears them, so a
       // number never moves onto another contract.
       if (LEG_FIELDS.some(key => key in patch && patch[key] !== current[key])) { next.leadQuantity = ''; next.hedgeQuantity = ''; }
@@ -157,6 +165,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   const set = <K extends keyof HynixForm>(key: K, value: HynixForm[K]) => update({ [key]: value } as Partial<HynixForm>);
   const action = form.action === 'open' ? '开仓' : '平仓';
   const legs = draftHynixLegs(form);
+  const four = form.preset === 'four-leg';
 
   function fillHeld(): void {
     const held = closeQuantities(form, state.positions.accounts);
@@ -165,19 +174,21 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   }
 
   async function runPreview(): Promise<void> {
-    const built = hynixFormToIntent(form);
+    const built = four ? hynixFourLegFormToIntent(form) : hynixFormToIntent(form);
     if ('error' in built) { setMessage({ tone: 'err', text: built.error }); setPreview(null); return; }
     setBusy(true); setMessage({ tone: 'muted', text: '预览中…' }); setPreview(null);
     const asked = formVersion.current;
     const stale = (): boolean => asked !== formVersion.current && (setMessage({ tone: 'muted', text: '表单在预览期间改过，请重新预览' }), true);
     try {
-      const result = await api<HynixPreview>('/api/preview', { body: built.intent });
+      const result = built.intent.preset === 'four-leg' ? await api<FourLegPreview<HynixFourLegIntent>>('/api/four-leg/preview', { body: built.intent })
+        : await api<HynixPreview>('/api/preview', { body: built.intent });
       if (!stale()) { setPreview(result); setMessage(null); }
     } catch (error) { if (!stale()) setMessage({ tone: 'err', text: errorText(error) }); }
     finally { setBusy(false); }
   }
 
-  async function runConfirm(current: HynixPreview): Promise<void> {
+  async function runConfirm(current: HynixPreview | FourLegPreview<HynixFourLegIntent>): Promise<void> {
+    if (isFourLegPreview<HynixFourLegIntent>(current)) { await runFourLegConfirm(current); return; }
     const sizes = current.legs.map(leg => `${name(leg.symbol)} ${leg.quantity}`).join('、');
     const text = `实盘执行：${describeHynixIntent(current.intent)}，${sizes}，名义金额约 ${current.notional} USDT，${Math.round(current.intent.timeoutMs / 1000)} 秒内完成。确定发送到交易所？`;
     if (!confirm(text)) return;
@@ -194,6 +205,23 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
     } finally { setBusy(false); }
   }
 
+  /** The four-leg confirm: one request creates both jobs, retried with the same request id while its answer is unknown. */
+  async function runFourLegConfirm(current: FourLegPreview<HynixFourLegIntent>): Promise<void> {
+    const text = `实盘执行：${describeHynixFourLeg(current.intent)}，每腿 ${current.intent.legs[0].notional ?? '?'} USDT，名义金额约 ${current.notional} USDT（四腿合计），${Math.round(current.intent.timeoutMs / 1000)} 秒内完成。确定发送到交易所？`;
+    if (!confirm(text)) return;
+    setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
+    try {
+      const result = await ids.current.run('confirm', current.id, requestId => api<FourLegConfirmResult>('/api/four-leg/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }), confirmRefused);
+      setPreview(null); setUnanswered(null);
+      setMessage({ tone: 'ok', text: `${result.duplicate ? '该请求已受理过' : '已受理'}：四腿组 ${result.group.slice(0, 8)}，任务 ${result.jobs.map(job => job.id.slice(0, 8)).join('、')}，进度见上方「成交进度与结果」` });
+      onAccepted(result.jobs[0]!);
+    } catch (error) {
+      const unknown = !confirmRefused(error);
+      setUnanswered(unknown ? current.id : null);
+      setMessage({ tone: 'err', text: unknown ? `${errorText(error)}（结果未知，可再次点击确认，沿用同一请求编号）` : errorText(error) });
+    } finally { setBusy(false); }
+  }
+
   function leave(): void {
     if (preview && unanswered === preview.id && !confirm(LEAVE_UNANSWERED)) return;
     changed(); setMessage(null); setUnanswered(null);
@@ -201,30 +229,42 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
 
   if (!venues.length) return <p className="execution-message warning" role="status">没有配置执行账户，不能下单。</p>;
   const messageView = message ? <p id="hynixOrderMsg" className={message.tone === 'err' ? 'execution-warning' : message.tone === 'ok' ? 'oil-ok' : undefined} role="status">{message.text}</p> : null;
-  const same = form.preset === 'same-exchange';
+  const same = form.preset === 'same-exchange', crossed = form.preset === 'cross-exchange';
   return <>
-    <div ref={reviewRef}>{preview ? <PreviewCard preview={preview} busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={leave} /> : null}</div>
+    <div ref={reviewRef}>{preview ? isFourLegPreview<HynixFourLegIntent>(preview)
+      ? <FourLegPreviewCard preview={preview} title={describeHynixFourLeg(preview.intent)} size={['每腿下单方式', `等金额 ${preview.intent.legs[0].notional ?? '—'} USDT`]} legName={name} quantityNote={leg => `${leg.symbol} · 步长 ${leg.instrument.quantityStep}`} idPrefix="hynix" busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={leave} />
+      : <PreviewCard preview={preview} busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={leave} /> : null}</div>
     <form className="execution-builder" id="hynixOrder" aria-label="海力士组合交易参数" onSubmit={event => { event.preventDefault(); void runPreview(); }}>
       {preview && messageView ? <div className="oil-review-message">{messageView}</div> : null}
       <fieldset disabled={busy || !!preview}>
         <legend className="visually-hidden">选择组合并填写交易参数</legend>
         <div className="execution-presets oil-presets" role="group" aria-label="交易预设">
           <button type="button" aria-pressed={same} data-hynix-preset="same-exchange" onClick={() => { if (!same) set('preset', 'same-exchange'); }}>同所溢价<small>单所 · ADR 对正股 · 两腿同一账户</small></button>
-          <button type="button" aria-pressed={!same} data-hynix-preset="cross-exchange" disabled={!cross} onClick={() => { if (same) set('preset', 'cross-exchange'); }}>跨所同合约<small>{cross ? `${venues.length === 2 ? `${VENUE_LABEL[venues[0]!]} 对 ${VENUE_LABEL[venues[1]!]}` : '任选两所'} · 同一合约` : '需配置两个交易所的执行账户'}</small></button>
+          <button type="button" aria-pressed={crossed} data-hynix-preset="cross-exchange" disabled={!cross} onClick={() => { if (!crossed) set('preset', 'cross-exchange'); }}>跨所同合约<small>{cross ? `${venues.length === 2 ? `${VENUE_LABEL[venues[0]!]} 对 ${VENUE_LABEL[venues[1]!]}` : '任选两所'} · 同一合约` : '需配置两个交易所的执行账户'}</small></button>
+          <button type="button" aria-pressed={four} data-hynix-preset="four-leg" disabled={!cross} onClick={() => { if (!four) set('preset', 'four-leg'); }}>四腿组合<small>{cross ? `${venues.length === 2 ? `${VENUE_LABEL[venues[0]!]} 与 ${VENUE_LABEL[venues[1]!]}` : '任选两所'} · ADR 对正股` : '需配置两个交易所的执行账户'}</small></button>
         </div>
         <div className="execution-row">
           <Choice label="交易动作" id="hynixAction" value={form.action} options={[['open', '开仓'], ['close', '平仓']]} onChange={next => set('action', next)} />
-          <Choice label={same ? '交易所' : '首腿交易所'} id="hynixVenue" value={form.venue} options={venues.map(venue => [venue, VENUE_LABEL[venue]] as const)} onChange={next => set('venue', next)} />
-          {!same && venues.length > 2
+          {four ? <Choice label="跨所组合" id="hynixVenuePair" value={`${form.venue},${form.hedgeVenue}`} options={venuePairs(venues)} onChange={pair => { const [venue, hedgeVenue] = pair.split(',') as [OilVenue, OilVenue]; update({ venue, hedgeVenue }); }} />
+            : <Choice label={same ? '交易所' : '首腿交易所'} id="hynixVenue" value={form.venue} options={venues.map(venue => [venue, VENUE_LABEL[venue]] as const)} onChange={next => set('venue', next)} />}
+          {crossed && venues.length > 2
             ? <Choice label="对冲腿交易所" id="hynixHedgeVenue" value={form.hedgeVenue} options={venues.filter(venue => venue !== form.venue).map(venue => [venue, VENUE_LABEL[venue]] as const)} onChange={next => set('hedgeVenue', next)} /> : null}
-          {same
+          {!crossed
             ? <Choice label="首腿合约" id="hynixLeadSymbol" value={form.leadSymbol} options={[['SKHYUSDT', 'ADR 先下'], ['SKHYNIXUSDT', '正股先下']]} onChange={next => set('leadSymbol', next)} />
             : <Choice label="合约" id="hynixSymbol" value={form.symbol} options={[['SKHYUSDT', 'ADR'], ['SKHYNIXUSDT', '正股']]} onChange={next => set('symbol', next)} />}
         </div>
-        {swapNote && !same ? <p className="trading-footnote" id="hynixHedgeSwap" role="status">{swapNote}</p> : null}
+        {swapNote && crossed ? <p className="trading-footnote" id="hynixHedgeSwap" role="status">{swapNote}</p> : null}
         <div className="execution-choice execution-direction"><span aria-hidden="true">{form.action === 'open' ? '开仓方向' : '待平仓方向'}</span>
           <div className="execution-direction-options" role="group" aria-label={form.action === 'open' ? '开仓方向' : '待平仓方向'}>
             {(['short', 'long'] as const).map(side => {
+              if (four) {
+                const pressed = form.premium === side, shown = draftHynixFourLegs({ ...form, premium: side });
+                const ordered = [shown.slice(0, 2), shown.slice(2)].flatMap(pair => [...pair].sort((a, b) => Number(b.symbol === 'SKHYUSDT') - Number(a.symbol === 'SKHYUSDT')));
+                return <button key={side} type="button" aria-pressed={pressed} data-hynix-direction={side} onClick={() => { if (!pressed) set('premium', side); }}>
+                  <span className="oil-direction-name">{VENUE_LABEL[form.venue]} {side === 'long' ? '做多' : '做空'}溢价 · {VENUE_LABEL[form.hedgeVenue]} {side === 'long' ? '做空' : '做多'}溢价</span>
+                  {ordered.map(leg => <span key={`${leg.venue}:${leg.symbol}`} className={`execution-leg-chip ${leg.side}`}>{VENUE_LABEL[leg.venue]} {name(leg.symbol ?? '')} <b>{leg.side === 'long' ? '多' : '空'}</b></span>)}
+                </button>;
+              }
               const pressed = same ? form.premium === side : form.leadSide === side;
               const shown = draftHynixLegs(same ? { ...form, premium: side } : { ...form, leadSide: side });
               // Same venue: the ADR first, as the premium reads; cross venue: the first leg first.
@@ -236,13 +276,14 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
             })}
           </div></div>
         <div className="execution-row execution-sizing">
-          {form.action === 'close' ? <Choice label="数量方式" id="hynixSizing" value={form.sizing} options={[['notional', '等金额'], ['quantity', '按数量']]} onChange={next => set('sizing', next)} /> : null}
+          {form.action === 'close' && !four ? <Choice label="数量方式" id="hynixSizing" value={form.sizing} options={[['notional', '等金额'], ['quantity', '按数量']]} onChange={next => set('sizing', next)} /> : null}
           {form.sizing === 'notional'
             ? <label className="execution-amount">每腿名义金额<span className="execution-input-unit"><input id="hynixNotional" type="text" inputMode="decimal" autoComplete="off" maxLength={24} value={form.notional} placeholder="例如 1000" onChange={event => set('notional', event.target.value)} /><span aria-hidden="true">USDT</span></span></label>
             : form.action === 'close' ? <button type="button" className="button secondary" id="hynixFillHeld" onClick={fillHeld}>按当前持仓填入</button> : null}
           <p className="execution-help">{form.sizing === 'notional' ? '每腿按预览盘口中间价折算相同 USDT 名义金额，向下取整到下单步长；10 份 ADR 约对应 1 股正股。实际各腿数量以预览为准。' : '两腿各填合约数量，可以不等（按实际持仓）；对冲腿按两腿数量比例跟上首腿成交。改动交易所、合约、方向或动作后数量会清空，需重新填写。'}</p>
         </div>
-        <div className="execution-leg-inputs">{legs.map((leg, index) => {
+        {four ? <FourLegInputs legs={draftHynixFourLegs(form)} action={form.action} leadTypes={[form.leadOrderType, form.peerLeadOrderType]} onLeadType={(venue, next) => set(venue === 0 ? 'leadOrderType' : 'peerLeadOrderType', next)} legName={name} idPrefix="hynix" hedgeNote="本所首腿成交后按市价跟上，数量按两腿计划比例；首腿挂单期间的成交也会随时跟上。" />
+        : <div className="execution-leg-inputs">{legs.map((leg, index) => {
           const symbol = leg.symbol ?? form.symbol;
           return <section key={index} className="execution-leg-input" aria-label={`${index === 0 ? '首腿' : '对冲腿'} ${VENUE_LABEL[leg.venue]} ${name(symbol)} 交易参数`}>
             <header><strong>{VENUE_LABEL[leg.venue]} {name(symbol)}</strong><span className={`execution-side ${leg.side}`}>{operation(form.action, leg.side)}</span><small className="oil-leg-role">{index === 0 ? '首腿' : '对冲腿'}</small></header>
@@ -254,13 +295,13 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
               : form.leadOrderType === 'local-chase' ? `只挂单挂在${buys(form.action, leg.side) ? '买一' : '卖一'}，盘口变化后撤单重挂，${buys(form.action, leg.side) ? '最高' : '最低'}追到界限；不吃单，到最长执行时间未成交的部分撤销。`
               : '市价：按对手盘吃单成交，受价格保护界限约束。'}</p>
           </section>;
-        })}</div>
+        })}</div>}
         <details className="execution-advanced" open={advanced} onToggle={event => setAdvanced(event.currentTarget.open)}>
           <summary><span><strong>执行参数</strong><small>最长 {form.timeoutSeconds || '?'} 秒 · 价格保护 {form.slippageBps ? `${form.slippageBps} 基点` : '默认'}{Number(form.batchCount) > 1 ? ` · 分 ${form.batchCount} 批` : ''}</small></span><ChevronDown size={16} aria-hidden="true" /></summary>
           <div className="execution-settings">
             <label>最长执行 · 秒<input id="hynixTimeout" type="text" inputMode="numeric" autoComplete="off" maxLength={4} value={form.timeoutSeconds} onChange={event => set('timeoutSeconds', event.target.value)} /></label>
             <label>价格保护 · 基点（选填）<input id="hynixSlippage" type="text" inputMode="numeric" autoComplete="off" maxLength={4} value={form.slippageBps} placeholder="留空用默认值" onChange={event => set('slippageBps', event.target.value)} /></label>
-            {form.leadOrderType !== 'chase' ? <>
+            {!chased(form) ? <>
               <label>分批 · 批数<input id="hynixBatchCount" type="text" inputMode="numeric" autoComplete="off" maxLength={2} value={form.batchCount} onChange={event => set('batchCount', event.target.value)} /></label>
               <label>批次间隔 · 秒<input id="hynixBatchInterval" type="text" inputMode="numeric" autoComplete="off" maxLength={3} value={form.batchIntervalSeconds} disabled={Number(form.batchCount) <= 1} onChange={event => set('batchIntervalSeconds', event.target.value)} /></label>
             </> : null}

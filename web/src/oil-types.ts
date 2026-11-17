@@ -42,6 +42,10 @@ export interface OilJob {
   batches?: { count: number; current: number; intervalMs: number } | null;
   /** A hynix rebalance (preset 'rebalance'): one leg; null or absent on two-leg jobs. */
   rebalance?: { method: 'reduce' | 'add' } | null;
+  /** One of a four-leg group's two jobs: index is the venue's place in the intent, peer the other job (docs/oil.md 11). */
+  group?: { id: string; index: number; peer: string } | null;
+  /** Set when the other job of the group ended unfinished: no new lead is sent, fills already made are still hedged. */
+  peerHalt?: string | null;
   legs: OilJobLeg[]; events: { type: string; at: number; [key: string]: unknown }[];
 }
 export interface OilState {

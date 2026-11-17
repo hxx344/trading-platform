@@ -8,6 +8,10 @@ import { SIM_ACCOUNTS } from '../src/simulation.ts';
 import type { SimulatedVenue } from '../src/sim-venue.ts';
 import { describeJob, type JobSummary } from '../src/service/feishu.ts';
 import { SESSION, bindAccounts, createHarness, previewAndConfirm, type Harness } from './harness.ts';
+import { DEFAULT_FORM, describeFourLeg, fourLegFormToIntent, type OilForm } from '../web/src/oil-form.ts';
+import { DEFAULT_HYNIX_FORM, describeHynixFourLeg, hynixFourLegFormToIntent } from '../web/src/hynix-form.ts';
+import { groupJobs, groupStatus } from '../web/src/four-leg.ts';
+import type { OilJob } from '../web/src/oil-types.ts';
 
 const code = (expected: string) => (error: unknown) => error instanceof ContractError && error.code === expected;
 type Side = 'long' | 'short';
@@ -179,3 +183,43 @@ test('四腿一边转人工：另一边照常对冲完成，待人工的任务�
   h.ex.acknowledge(ids[1]!, randomUUID(), SESSION);
   assert.equal(locks(h).length, 0);
 }));
+
+test('四腿页面表单：甲所按所选价差、乙所反向，两所都先下所选合约，各自首腿方式；通过执行器校验，页面先拒绝同所与追价分批', () => {
+  const form: OilForm = { ...DEFAULT_FORM, preset: 'four-leg', venue: 'binance', hedgeVenue: 'bybit', spread: 'long', leadSymbol: 'BZUSDT', barrels: '10', leadOrderType: 'local-chase', peerLeadOrderType: 'chase', chaseLimit: '70' };
+  const built = fourLegFormToIntent(form);
+  assert.ok('intent' in built);
+  const parsed = parseFourLegIntent(built.intent);
+  assert.deepEqual(parsed.legs.map(item => [item.venue, item.symbol, item.side, item.orderType, item.barrels, item.limitPrice ?? null]), [
+    ['binance', 'BZUSDT', 'long', 'local-chase', '10', null], ['binance', 'CLUSDT', 'short', 'market', '10', null],
+    ['bybit', 'BZUSDT', 'short', 'chase', '10', null], ['bybit', 'CLUSDT', 'long', 'market', '10', null],
+  ]);
+  assert.equal(describeFourLeg(built.intent), '开仓四腿 Binance 做多价差 / Bybit 做空价差');
+  assert.match((fourLegFormToIntent({ ...form, hedgeVenue: 'binance' }) as { error: string }).error, /两个不同/);
+  assert.match((fourLegFormToIntent({ ...form, batchCount: '2', batchIntervalSeconds: '5' }) as { error: string }).error, /^Bybit：分批只用于/);
+  const hynix = hynixFourLegFormToIntent({ ...DEFAULT_HYNIX_FORM, preset: 'four-leg', venue: 'binance', hedgeVenue: 'okx', premium: 'short', notional: '500', sizing: 'notional' });
+  assert.ok('intent' in hynix);
+  assert.deepEqual(parseFourLegIntent(hynix.intent).legs.map(item => [item.venue, item.symbol, item.side, item.notional]), [
+    ['binance', 'SKHYUSDT', 'short', '500'], ['binance', 'SKHYNIXUSDT', 'long', '500'], ['okx', 'SKHYUSDT', 'long', '500'], ['okx', 'SKHYNIXUSDT', 'short', '500'],
+  ]);
+  assert.equal(describeHynixFourLeg(hynix.intent), '开仓四腿 Binance 做空溢价 / OKX 做多溢价');
+  assert.match((hynixFourLegFormToIntent({ ...DEFAULT_HYNIX_FORM, preset: 'four-leg', action: 'close', sizing: 'quantity', leadQuantity: '1', hedgeQuantity: '1' }) as { error: string }).error, /名义金额/);
+});
+
+test('四腿任务列表：两个子任务按组排在一起；整体状态为执行中、已完成或四腿不完整，结束后标出两所成交不等', () => {
+  const job = (id: string, venue: string, status: string, filled: [string, string], group?: { id: string; index: number; peer: string }) => ({
+    id, market: 'oil', preset: 'same-exchange', action: 'open', status, group: group ?? null,
+    legs: (['BZUSDT', 'CLUSDT'] as const).map((symbol, index) => ({ venue, symbol, filledBarrels: filled[index], plannedBarrels: '10', filledQuantity: filled[index], plannedQuantity: '10' })),
+  }) as unknown as OilJob;
+  const a = job('a', 'binance', 'completed', ['10', '10'], { id: 'g', index: 0, peer: 'b' });
+  const b = job('b', 'bybit', 'running', ['4', '4'], { id: 'g', index: 1, peer: 'a' });
+  const lone = job('c', 'okx', 'completed', ['1', '1']);
+  const entries = groupJobs([b, lone, a]);
+  assert.deepEqual(entries.map(entry => [entry.group, entry.jobs.map(item => item.id)]), [['g', ['a', 'b']], [null, ['c']]]);
+  assert.deepEqual(groupStatus([a, b]), { status: 'running', text: '执行中', details: [] });
+  assert.equal(groupStatus([a, { ...b, status: 'completed', legs: a.legs.map(item => ({ ...item, venue: 'bybit' })) }]).status, 'completed');
+  const stopped = groupStatus([a, { ...b, status: 'stopped' }]);
+  assert.equal(stopped.text, '四腿不完整');
+  assert.deepEqual(stopped.details, ['Bybit 任务已停止', 'BZ 两所成交桶数不等：Binance 10 桶，Bybit 4 桶', 'CL 两所成交桶数不等：Binance 10 桶，Bybit 4 桶']);
+  assert.deepEqual(groupStatus([{ ...a, status: 'failed' }, { ...b, status: 'attention' }]).details.slice(0, 2), ['Bybit 任务需人工处理，请先处理', 'Binance 任务失败']);
+  assert.deepEqual(groupStatus([a]).details, ['另一交易所的任务不在当前列表中，请到交易所核对']);
+});

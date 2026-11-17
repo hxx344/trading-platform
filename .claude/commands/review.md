@@ -7,7 +7,9 @@ description: 按项目标准审查当前改动（只读，不改代码）
 审查范围：$ARGUMENTS
 
 1. 读取 `docs/code-review.md`（`AGENTS.md` 已随会话加载）。
-2. 确认固定范围：上面给了提交、分支或 PR 时审查该范围（如 `git diff <base>...<head>`），不以空工作区 diff 代替；没给时用 `git status` 和 `git diff HEAD`。范围不明确时先问，不要自行扩大。
+2. 确认审查范围：
+   - 指定提交、分支或 PR 时，只审指定差异。
+   - 未指定时审查当前工作区。用 `git status --short --untracked-files=all` 列出文件，用 `git diff HEAD` 查看已跟踪文件的改动，并逐个读取与本次任务相关的 `??` 文件。文件归属不明时再向用户确认。
 3. 按 `AGENTS.md` 的《按改动取用经验》只读改动涉及的 `LESSONS.md` 条目，作为意见依据；并读改动所属模块的文档（`docs/` 下对应文件）。
 4. 按 `docs/code-review.md` 第 2 节判定风险等级，按 D1–D7 顺序审查：先语义与正确性，再失败路径，最后细节。
 5. 意见格式照 `docs/code-review.md`《独立审查》：一条一议，同一根因的多个位置合并为一条；给不出复现路径的按该文件第 3 节标「待核实」，不按 P1 阻塞。

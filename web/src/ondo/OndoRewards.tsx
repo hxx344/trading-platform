@@ -1,5 +1,5 @@
 // 奖励市场盘口与收益模拟（本服务新增，docs/ondo.md §5–§6）：每个奖励市场前 5 bps 的各档挂单量，以及按波动率、
-// 挂单量与奖励公式估算的每日收益。数据来自 GET /api/ondo/rewards（服务每分钟采样一次），模拟在页面里算。
+// 挂单量与奖励公式估算的每日收益。数据来自 GET /api/ondo/rewards（服务每分钟订阅 WebSocket 10 秒、按秒取盘口，推送缺的市场走 REST），模拟在页面里算。
 import { Fragment, useEffect, useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, LoaderCircle, Save } from 'lucide-react';
 import { api, ApiError } from '../api.ts';
@@ -59,6 +59,10 @@ function Field({ label, hint, value, onChange }: { label: string; hint: string; 
   return <label className="wb-field"><span>{label}</span><input inputMode="decimal" value={value} onChange={event => onChange(event.target.value)} /><small>{hint}</small></label>;
 }
 
+// The feed's error codes (vendor/ondo/stream.mjs).
+const FEED_ERRORS: Record<string, string> = { connect_timeout: '连接超时', connect_failed: '无法连接', socket_error: '连接出错', disconnected: '连接断开', silent: '长时间没有数据',
+  venue_error: '交易所返回错误', invalid_data: '数据无效', send_failed: '发送失败', unsupported: '运行环境不支持 WebSocket' };
+
 export function OndoRewards({ mmConfig, onExpired }: { mmConfig: OndoMmConfig | null; onExpired: () => void }) {
   const [windowMin, setWindowMin] = useState<number>(60);
   const resource = useLiveResource<OndoRewardsView>(`${ROOT}?window=${windowMin}`, { intervalMs: 15_000, timeoutMs: 10_000, onExpired });
@@ -100,10 +104,11 @@ export function OndoRewards({ mmConfig, onExpired }: { mmConfig: OndoMmConfig | 
     <div className="panel-heading"><h2>奖励市场盘口与收益模拟</h2>
       <div className="or-heading-tools">
         <label className="or-window">统计窗口<select value={windowMin} onChange={event => setWindowMin(Number(event.target.value))}>{WINDOWS.map(minutes => <option key={minutes} value={minutes}>{minutes < 60 ? `${minutes} 分钟` : `${minutes / 60} 小时`}</option>)}</select></label>
-        <span className="muted">{view ? `更新 ${time(view.serverNow)} · 每市场每分钟采样` : ''}</span>
+        <span className="muted">{view ? `更新 ${time(view.serverNow)} · 每分钟实时推送 ${view.burstMs / 1000} 秒` : ''}</span>
       </div></div>
     {loadError ? <Callout tone="warning">奖励数据读取失败：{loadError}。保留最后读取的数据，稍后自动重试。</Callout> : null}
     {view?.rulesError ? <Callout tone="warning">{view.rulesError}</Callout> : null}
+    {view?.feed && view.feed.pushed === 0 ? <Callout tone="warning">上一分钟没有收到实时推送{view.feed.error ? `（${FEED_ERRORS[view.feed.error] ?? view.feed.error}）` : ''}，各市场改用 REST 每分钟读一次盘口。</Callout> : null}
     {view?.loadError ? <Callout tone="warning">{view.loadError}</Callout> : null}
     {!view ? <StatePanel kind="loading" title="正在读取奖励市场" /> : <>
       <div className="om-form or-sim">
@@ -151,9 +156,9 @@ export function OndoRewards({ mmConfig, onExpired }: { mmConfig: OndoMmConfig | 
                 {market.error ? <small className="om-hold">{market.error}</small> : market.listed === false ? <small className="om-hold">交易所没有这个市场</small> : market.trading === false ? <small className="om-hold">休市或暂停交易</small> : null}</th>
               <td className="num">{fixed(market.mid, 4)}</td>
               <td className="num">{fixed(market.spreadBps, 2)}</td>
-              <td className="num">{market.sigma1m === null ? <span className="muted">样本 {market.returns}/10</span> : `${(market.sigma1m * 1e4).toFixed(2)} bps`}</td>
+              <td className="num">{market.sigma1m === null ? <span className="muted">样本 {market.returns}/{view.minReturns}</span> : `${(market.sigma1m * 1e4).toFixed(2)} bps`}</td>
               <td className="num">{market.depth5 ? `${usd(market.depth5.bid)} / ${usd(market.depth5.ask)}` : '—'}</td>
-              <td className="num">{market.avg.samples ? `${usd(sum5(market.avg.bid))} / ${usd(sum5(market.avg.ask))}` : '—'}<small>{market.avg.samples} 次采样{thin ? ` · 盘口只覆盖到 ${fixed(Math.min(market.avg.cover.bid ?? 25, market.avg.cover.ask ?? 25), 1)} bps` : ''}</small></td>
+              <td className="num">{market.avg.samples ? `${usd(sum5(market.avg.bid))} / ${usd(sum5(market.avg.ask))}` : '—'}<small>{market.avg.samples} 分钟 · {market.avg.snapshots} 个盘口{market.source === 'rest' ? ' · REST' : ''}{thin ? ` · 盘口只覆盖到 ${fixed(Math.min(market.avg.cover.bid ?? 25, market.avg.cover.ask ?? 25), 1)} bps` : ''}</small></td>
               <td className="num">{result && market.avg.samples ? `${(result.share.bid * 100).toFixed(1)}% / ${(result.share.ask * 100).toFixed(1)}%` : '—'}</td>
               <td className="num">{result && market.avg.samples ? money(result.rewardDay) : '—'}</td>
               <td className="num">{fixed(result?.fillsDay, 1)}</td>

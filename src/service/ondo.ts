@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import { holdAccountLocks } from '../live/setup.ts';
 import { createOndoMarketMaker, HttpError, type OndoMarketMaker } from '../vendor/ondo/mm.mjs';
 import { ONDO_MARKET, type OndoClient } from '../vendor/ondo/client.mjs';
+import { createOndoStream, type OndoStreamFactory } from '../vendor/ondo/stream.mjs';
 import { createOndoRewards, RewardInputError, type OndoRewards } from '../ondo/rewards.ts';
 import type { OndoCredentials, OndoServiceConfig } from './ondo-config.ts';
 
@@ -46,7 +47,7 @@ function only(body: unknown, ...keys: string[]): Record<string, unknown> {
 export const ondoLockId = (keyId: string): string => createHash('sha256').update(keyId).digest('hex').slice(0, 16);
 
 export async function createOndoModule(config: OndoServiceConfig, key: OndoCredentials | undefined, dataDir: string, options: {
-  log?: Log; fetchImpl?: typeof fetch; WebSocketImpl?: unknown; rewardsClient?: () => OndoClient; mmIntervalMs?: number;
+  log?: Log; fetchImpl?: typeof fetch; WebSocketImpl?: unknown; rewardsClient?: () => OndoClient; rewardsStream?: OndoStreamFactory; mmIntervalMs?: number;
   locks?: typeof holdAccountLocks;
 } = {}): Promise<OndoModule> {
   const log = options.log ?? (line => process.stderr.write(`${line}\n`));
@@ -73,7 +74,8 @@ export async function createOndoModule(config: OndoServiceConfig, key: OndoCrede
       ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}), ...(options.WebSocketImpl ? { WebSocketImpl: options.WebSocketImpl } : {}),
       ...(options.mmIntervalMs === undefined ? {} : { intervalMs: options.mmIntervalMs }),
     });
-    rewards = createOndoRewards({ dataDir, restingOrders: () => mm.restingOrders(), log, ...(options.rewardsClient ? { clientFactory: options.rewardsClient } : {}) });
+    rewards = createOndoRewards({ dataDir, restingOrders: () => mm.restingOrders(), log, ...(options.rewardsClient ? { clientFactory: options.rewardsClient } : {}),
+      ...(options.rewardsStream ? { streamFactory: options.rewardsStream } : options.WebSocketImpl ? { streamFactory: feed => createOndoStream({ ...feed, WebSocketImpl: options.WebSocketImpl }) } : {}) });
     mm.initialize();
     rewards.initialize();
   } catch (error) {

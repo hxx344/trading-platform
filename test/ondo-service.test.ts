@@ -16,6 +16,7 @@ import { planImport } from '../src/service/import-workbench.ts';
 import { parseImportBody } from '../src/service/import-channel.ts';
 import { ONDO_MM_DEFAULTS } from '../src/vendor/ondo/mm.mjs';
 import type { OndoClient } from '../src/vendor/ondo/client.mjs';
+import type { OndoStreamFactory } from '../src/vendor/ondo/stream.mjs';
 import { bindAccounts, createHarness } from './harness.ts';
 
 const SECRET = 'ondo-secret-fixture-value-0001';
@@ -193,7 +194,7 @@ test('路由：没有 ondo 时 404；设置须带请求标记；未知字段 400
   await after.close();
 });
 
-test('模块：服务停止时立即中止进行中的盘口读取并关闭挂单，不等读取超时', async () => {
+test('模块：服务停止时立即关闭推送、中止进行中的盘口读取并关闭挂单，不等读取超时', async () => {
   const lines: string[] = [];
   let closed = 0, reads = 0;
   const aborts: (() => void)[] = [];
@@ -202,7 +203,10 @@ test('模块：服务停止时立即中止进行中的盘口读取并关闭挂�
     depth() { reads += 1; return new Promise((_, reject) => { aborts.push(() => reject(new Error('closed'))); }); },
     close() { closed += 1; for (const abort of aborts.splice(0)) abort(); },
   } as unknown as OndoClient);
-  const module = await createOndoModule({}, undefined, mkdtempSync(join(tmpdir(), 'tp-ondo-loop-')), { log: line => lines.push(line), rewardsClient: hanging, mmIntervalMs: 0 });
+  const feed = { started: 0, closed: 0 };
+  const rewardsStream: OndoStreamFactory = () => ({ start() { feed.started += 1; }, close() { feed.closed += 1; },
+    status: () => ({ connected: true, publicReady: true, privateReady: false, lastFrameAt: null, error: null }) });
+  const module = await createOndoModule({}, undefined, mkdtempSync(join(tmpdir(), 'tp-ondo-loop-')), { log: line => lines.push(line), rewardsClient: hanging, rewardsStream, mmIntervalMs: 0 });
   let stopped = false;
   const wakers = new Set<() => void>();
   const pause = (ms: number) => new Promise<void>(resolve => {
@@ -212,13 +216,15 @@ test('模块：服务停止时立即中止进行中的盘口读取并关闭挂�
     wakers.add(wake);
   });
   const loop = module.loop({ stopped: () => stopped, pause });
-  while (reads === 0) await new Promise(resolve => setTimeout(resolve, 5));
+  // Stopped mid-burst with the page's REST read hanging.
+  const page = module.views.book('NVDA-USD.P').catch(() => null);
+  while (reads === 0 || feed.started === 0) await new Promise(resolve => setTimeout(resolve, 5));
   const at = Date.now();
   stopped = true;
   for (const wake of [...wakers]) wake();
-  await loop;
+  await Promise.all([loop, page]);
   assert.ok(Date.now() - at < 1000, `${Date.now() - at} ms`);
-  assert.ok(closed >= 1);
+  assert.ok(closed >= 1); assert.ok(feed.closed >= 1);
   // A second close is the same one.
   await module.close();
   assert.deepEqual(lines.filter(line => line.includes('出错') || line.includes('异常')), []);

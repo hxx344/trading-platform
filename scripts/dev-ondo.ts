@@ -1,7 +1,8 @@
 // A local preview of the Ondo page (docs/ondo.md): the module in a throwaway data directory, with the reward collector
 // reading a simulated public book (a random walk per market, about 0.04% a minute, depth thinning away from the mid)
-// instead of Ondo. Nothing goes to the network as long as the quoting session is not started; there is no API key, so
-// live mode is refused. The 1-minute volatility shows after about 11 minutes, once each market has 10 returns.
+// instead of Ondo: a simulated feed pushes every market about 4 times a second while open, except the eighth market,
+// which it leaves to the REST fallback. Nothing goes to the network as long as the quoting session is not started; there
+// is no API key, so live mode is refused. The 1-minute volatility shows after about 10 minutes (20 returns).
 // Removed on exit, like scripts/dev-hynix.ts.
 //   pnpm build:web; node scripts/dev-ondo.ts [--port 4733]
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -15,6 +16,7 @@ import { loadWebApp } from '../src/web-assets.ts';
 import { createOndoModule } from '../src/service/ondo.ts';
 import { REWARD_MARKETS } from '../src/ondo/rewards.ts';
 import type { OndoClient } from '../src/vendor/ondo/client.mjs';
+import { parseOndoBook, type OndoStreamFactory } from '../src/vendor/ondo/stream.mjs';
 
 const { values } = parseArgs({ options: { port: { type: 'string', default: '4733' } } });
 const port = Number(values.port);
@@ -34,23 +36,37 @@ const gauss = () => Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * M
 const side = (mid: number, depth: number, sign: 1 | -1, tick: number): [string, string][] => Array.from({ length: 80 }, (_, i) => {
   const price = Math.round((mid * (1 + sign * (0.5 + i * 0.35) / 1e4)) / tick) * tick;
   const usd = depth * Math.exp(-i / 18) * (0.4 + Math.random());
-  return [price.toFixed(4), (usd / price).toFixed(3)];
+  // The feed refuses a zero size, as Ondo never sends one.
+  return [price.toFixed(4), Math.max(usd / price, 0.001).toFixed(3)];
 });
+const snapshot = (market: string) => {
+  const book = books.get(market);
+  if (!book) throw new Error(`未知市场 ${market}`);
+  const now = Date.now();
+  book.mid *= Math.exp(book.sigma * Math.sqrt((now - book.at) / 60_000) * gauss());
+  book.at = now;
+  return { market, bids: side(book.mid, book.depth, -1, 0.0001), asks: side(book.mid, book.depth, 1, 0.0001) };
+};
+const feed: OndoStreamFactory = ({ markets, onBook }) => {
+  let timer: NodeJS.Timeout | undefined;
+  return {
+    start() {
+      timer = setInterval(() => {
+        for (const market of markets) if (market !== REWARD_MARKETS[7]) onBook(market, parseOndoBook({ time: new Date().toISOString(), ...snapshot(market) }), Date.now());
+      }, 250);
+    },
+    status: () => ({ connected: true, publicReady: true, privateReady: false, lastFrameAt: Date.now(), error: null }),
+    close() { clearInterval(timer); },
+  };
+};
 const client = {
   async markets() { return new Map(REWARD_MARKETS.map((market, i) => [market, { tick: '0.0001', step: '0.001', trading: i !== 7, makerFee: i % 3 === 0 ? null : '0.0001' }])); },
-  async depth(market: string) {
-    const book = books.get(market);
-    if (!book) throw new Error(`未知市场 ${market}`);
-    const now = Date.now();
-    book.mid *= Math.exp(book.sigma * Math.sqrt((now - book.at) / 60_000) * gauss());
-    book.at = now;
-    return { market, bids: side(book.mid, book.depth, -1, 0.0001), asks: side(book.mid, book.depth, 1, 0.0001) };
-  },
+  async depth(market: string) { return snapshot(market); },
   close() {},
 } as unknown as OndoClient;
 
 const log = (line: string) => process.stderr.write(`${line}\n`);
-const ondo = await createOndoModule({}, undefined, dir, { log, rewardsClient: () => client });
+const ondo = await createOndoModule({}, undefined, dir, { log, rewardsClient: () => client, rewardsStream: feed });
 const run = runExecutor({
   executor, store, dir, port, app, passes: [],
   views: { ondo: ondo.views },

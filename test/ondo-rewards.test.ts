@@ -7,7 +7,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BANDS, bandOf, bandScores, fillsPerDay, normalCdf, simulate, sweep, type SimMarket, type SimParams } from '../src/ondo/reward-sim.ts';
 import { BUCKETS } from '../src/ondo/reward-types.ts';
-import { createOndoRewards, digest, minuteVolatility, REWARD_MARKETS, RewardInputError, validateRewardConfig } from '../src/ondo/rewards.ts';
+import { BURST_MS, createOndoRewards, digest, FEED_LEVELS, MIN_RETURNS, minuteVolatility, REWARD_MARKETS, RewardInputError, validateRewardConfig } from '../src/ondo/rewards.ts';
+import { parseOndoBook, type OndoStreamFactory, type OndoStreamOptions } from '../src/vendor/ondo/stream.mjs';
 import { OndoError, type OndoClient, type OndoDepth } from '../src/vendor/ondo/client.mjs';
 import { defaultSimForm, readSimForm, rewardConfigRequest, simParams, type SimForm } from '../web/src/ondo/reward-form.ts';
 
@@ -85,15 +86,13 @@ test('盘口：前 5 bps 各档、扣除自己的挂单、按 0.5 bps 分桶', (
   assert.throws(() => digest(book([level('-1', '1')], [level('100.01', '1')]), { buy: new Map(), sell: new Map() }, 0), OndoError);
 });
 
-test('波动：只算间隔 30–120 秒的收益，按分钟折算，不足 10 个为空', () => {
-  const samples = Array.from({ length: 12 }, (_, i) => ({ at: i * 60_000, mid: 100 * Math.exp(0.001 * i) }));
-  const measured = minuteVolatility(samples);
-  assert.equal(measured.returns, 11); close(measured.sigma1m!, 0.001);
-  // A two-minute gap counts as one return scaled to a minute; a 10 s and a 5 min gap do not count.
-  const gappy = [{ at: 0, mid: 100 }, { at: 10_000, mid: 101 }, { at: 130_000, mid: 101 * Math.exp(0.002) }, { at: 430_000, mid: 200 }];
-  const result = minuteVolatility(gappy);
-  assert.equal(result.returns, 1); assert.equal(result.sigma1m, null);
-  assert.equal(minuteVolatility(samples.slice(0, 10)).sigma1m, null);
+test('波动：各分钟的收益平方和合计后开方；不足 MIN_RETURNS 个为空', () => {
+  const minutes = [{ rv: 12 * 1e-6, rn: 12 }, { rv: 8 * 1e-6, rn: 8 }];
+  const measured = minuteVolatility(minutes);
+  assert.equal(measured.returns, 20); close(measured.sigma1m!, 0.001);
+  assert.equal(MIN_RETURNS, 20);
+  assert.deepEqual(minuteVolatility(minutes.slice(0, 1)), { sigma1m: null, returns: 12 });
+  assert.deepEqual(minuteVolatility([]), { sigma1m: null, returns: 0 });
 });
 
 test('奖励设置：只收市场、奖池与市场数', () => {
@@ -123,67 +122,124 @@ function fakeClient(time: { now: number }) {
   return { client: client as unknown as OndoClient, calls, fail: () => { failNext = true; } };
 }
 
-test('采集：轮流读取各市场、按窗口平均、计算波动；设置保存在数据目录', async () => {
-  const dataDir = mkdtempSync(join(tmpdir(), 'tp-ondo-rewards-')), time = { now: 1_800_000_000_000 };
-  const fake = fakeClient(time);
-  const rewards = createOndoRewards({ dataDir, clientFactory: () => fake.client, now: () => time.now,
-    restingOrders: () => [{ market: 'NVDA-USD.P', side: 'sell', price: (100 * Math.exp(0.001 * Math.round((time.now - 1_800_000_000_000) / 60_000)) + 0.01).toFixed(4), size: '4' }] });
+/** A feed the test pushes books into; every burst opens one. */
+function fakeFeeds(error: string | null = null) {
+  const feeds: { options: OndoStreamOptions; started: boolean; closed: boolean }[] = [];
+  const factory: OndoStreamFactory = options => {
+    const feed = { options, started: false, closed: false };
+    feeds.push(feed);
+    return { start() { feed.started = true; }, close() { feed.closed = true; },
+      status: () => ({ connected: error === null, publicReady: error === null, privateReady: false, lastFrameAt: null, error }) };
+  };
+  const push = (market: string, mid: number, at: number) => {
+    const row = { time: new Date(at).toISOString(), bids: [[(mid - 0.01).toFixed(4), '10'], [(mid - 0.03).toFixed(4), '20']], asks: [[(mid + 0.01).toFixed(4), '10']] };
+    feeds.at(-1)!.options.onBook(market, parseOndoBook(row), at);
+  };
+  return { factory, feeds, push };
+}
+
+test('采集：每分钟订阅推送 10 秒、按秒取盘口；推送缺的市场走 REST；按分钟平均并计算波动；设置保存在数据目录', async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'tp-ondo-rewards-')), T0 = 1_800_000_000_000, time = { now: T0 };
+  const fake = fakeClient(time), feed = fakeFeeds();
+  // The pushed mid stays at 100 but for one step of 1% inside minute 2's burst, between the snapshots at 1 s and 6 s.
+  const pushedMid = () => time.now >= T0 + 123_500 ? 100 * Math.exp(0.01) : 100;
+  const rewards = createOndoRewards({ dataDir, clientFactory: () => fake.client, streamFactory: feed.factory, now: () => time.now,
+    restingOrders: () => [{ market: 'NVDA-USD.P', side: 'sell', price: (pushedMid() + 0.01).toFixed(4), size: '4' }] });
   rewards.initialize();
-  assert.equal(rewards.state().markets.length, 20); assert.equal(rewards.state().revision, 0);
+  assert.equal(rewards.state().markets.length, 20); assert.equal(rewards.state().revision, 0); assert.equal(rewards.state().feed, null);
   assert.throws(() => rewards.save({ markets: [] }), RewardInputError);
   const saved = rewards.save({ markets: ['NVDA-USD.P', 'TSLA-USD.P'], poolUsd: '1400', eligible: 2 });
   assert.equal(saved.revision, 1); assert.deepEqual(saved.markets.map(item => item.market), ['NVDA-USD.P', 'TSLA-USD.P']);
   assert.equal(JSON.parse(readFileSync(join(dataDir, 'ondo-mm', 'rewards.json'), 'utf8')).config.poolUsd, '1400');
-  // 2 markets: one read every 30 s, each market once a minute; 44 rounds = 22 samples each.
-  let rounds = 0;
-  await rewards.run({ stopped: () => rounds >= 44, pause: async ms => { assert.equal(ms, 30_000); time.now += ms; rounds += 1; } });
-  // The trading rules are read at the start and again after 15 minutes.
-  assert.equal(fake.calls.filter(call => call === 'markets').length, 2);
-  assert.equal(fake.calls.filter(call => call === 'NVDA-USD.P').length, 22);
-  const view = rewards.state(15).markets[0]!;
-  assert.equal(view.listed, true); assert.equal(view.makerFee, '0.0001');
-  assert.equal(view.error, null);
-  assert.equal(view.avg.samples, 15); assert.equal(view.returns, 14); close(view.sigma1m!, 0.001, 1e-6);
-  // Our own resting sell is taken out of the depth: 6 left of 10 at the best ask.
-  assert.equal(view.levels!.ask[0]!.oursUsd > 0, true); close(view.depth5!.ask, 6 * (view.ask ?? 0), 0.01);
+  // Only NVDA is pushed, 100 ms before each tick. Minute 0 misses tick 7 (the tick-6 book is not taken twice) and minute 1
+  // gets a 3 s old book at tick 3 (not taken): 108 snapshots in 11 minutes.
+  let minutes = 0, tick = 0;
+  const pauses: number[] = [];
+  await rewards.run({ stopped: () => minutes >= 11, pause: async ms => {
+    pauses.push(ms);
+    if (ms === 1000) {
+      tick += 1; time.now += 900;
+      if (!(minutes === 0 && tick === 7)) feed.push('NVDA-USD.P', pushedMid(), minutes === 1 && tick === 3 ? time.now - 2900 : time.now);
+      time.now += 100;
+    } else { assert.equal(ms, 50_000); time.now += ms; minutes += 1; tick = 0; }
+  } });
+  assert.deepEqual(pauses.slice(0, 11), [...new Array<number>(10).fill(1000), 50_000]);
+  assert.equal(feed.feeds.length, 11);
+  for (const opened of feed.feeds) {
+    assert.ok(opened.started && opened.closed);
+    assert.deepEqual(opened.options.markets, ['NVDA-USD.P', 'TSLA-USD.P']); assert.equal(opened.options.depth, FEED_LEVELS);
+    assert.equal(opened.options.credentials, undefined);
+  }
+  assert.equal(FEED_LEVELS, 100); assert.equal(BURST_MS, 10_000);
+  // The trading rules once (15 min apart); TSLA, which the feed missed, over REST once a minute; NVDA never over REST.
+  assert.equal(fake.calls.filter(call => call === 'markets').length, 1);
+  assert.equal(fake.calls.filter(call => call === 'TSLA-USD.P').length, 11);
+  assert.equal(fake.calls.filter(call => call === 'NVDA-USD.P').length, 0);
+  const state = rewards.state(15);
+  assert.deepEqual(state.feed, { at: T0 + 10 * 60_000, pushed: 1, of: 2, error: null });
+  assert.equal(state.burstMs, 10_000); assert.equal(state.minReturns, 20);
+  const [nvda, tsla] = state.markets;
+  assert.equal(nvda!.listed, true); assert.equal(nvda!.makerFee, '0.0001'); assert.equal(nvda!.error, null);
+  assert.equal(nvda!.source, 'ws'); assert.equal(nvda!.avg.samples, 11); assert.equal(nvda!.avg.snapshots, 108);
+  // Returns: one 5 s one in each burst and one across each gap between bursts; the 1% step is one 5 s return.
+  assert.equal(nvda!.returns, 21); close(nvda!.sigma1m! ** 2, 0.01 ** 2 * 12 / 21, 1e-8); // prices are rounded to 4 places
+  // Our own resting sell is taken out of the depth: 6 left of 10 at the best ask; the average carries it too.
+  assert.ok(nvda!.levels!.ask[0]!.oursUsd > 0); close(nvda!.depth5!.ask, 6 * (nvda!.ask ?? 0), 0.01);
+  const avgAsk5 = nvda!.avg.ask.slice(0, 10).reduce((sum, value) => sum + value, 0);
+  assert.ok(avgAsk5 > 6 * 100.01 - 0.01 && avgAsk5 < 6 * 101.015 + 0.01, String(avgAsk5));
+  assert.equal(tsla!.listed, false); assert.equal(tsla!.source, 'rest');
+  assert.equal(tsla!.avg.samples, 11); assert.equal(tsla!.avg.snapshots, 11);
+  assert.equal(tsla!.returns, 10); assert.equal(tsla!.sigma1m, null);
   assert.equal(rewards.state(9999).windowMin, 60);
-  assert.equal(rewards.state().markets[1]!.listed, false);
   // A failed read keeps the last levels and says why.
   fake.fail(); time.now += 10_000;
-  const failed = await rewards.book('NVDA-USD.P');
+  const failed = await rewards.book('TSLA-USD.P');
   assert.match(failed.error!, /盘口读取失败：Ondo 接口出错（upstream）/); assert.ok(failed.levels);
   rewards.close();
   assert.ok(fake.calls.includes('close'));
   // A new instance reads the saved settings.
-  const again = createOndoRewards({ dataDir, clientFactory: () => fake.client, now: () => time.now });
+  const again = createOndoRewards({ dataDir, clientFactory: () => fake.client, streamFactory: feed.factory, now: () => time.now });
   again.initialize();
   assert.equal(again.state().config.poolUsd, '1400'); assert.equal(again.state().revision, 1); assert.equal(again.state().loadError, null);
 });
 
-test('采集：读取耗时计入每步间隔；循环撞上页面发起的读取时仍记一个样本', async () => {
+test('采集：推送全断时说明原因并全部走 REST；REST 撞上页面发起的读取时共用并记样本；停在推送中途关闭推送、不记样本', async () => {
   const dataDir = mkdtempSync(join(tmpdir(), 'tp-ondo-rewards-')), time = { now: 1_800_000_000_000 };
   let release: (() => void) | null = null;
-  const fake = fakeClient(time);
+  const fake = fakeClient(time), feed = fakeFeeds('connect_timeout');
   const slow = { ...fake.client, async depth(name: string, levels: number) {
     await new Promise<void>(resolve => { release = resolve; });
-    time.now += 400;
     return fake.client.depth(name, levels);
   } } as unknown as OndoClient;
-  const rewards = createOndoRewards({ dataDir, clientFactory: () => slow, now: () => time.now });
+  const rewards = createOndoRewards({ dataDir, clientFactory: () => slow, streamFactory: feed.factory, now: () => time.now });
   rewards.initialize();
   rewards.save({ markets: ['NVDA-USD.P'], poolUsd: '1000', eligible: 1 });
   const pageRead = rewards.book('NVDA-USD.P');
   await new Promise(resolve => setImmediate(resolve));
   const pauses: number[] = [];
-  const cycle = rewards.run({ stopped: () => pauses.length >= 1, pause: async ms => { pauses.push(ms); } });
+  const cycle = rewards.run({ stopped: () => pauses.length >= 11, pause: async ms => { pauses.push(ms); time.now += ms; } });
+  while (pauses.length < 10) await new Promise(resolve => setImmediate(resolve));
   await new Promise(resolve => setImmediate(resolve));
   release!();
   await Promise.all([pageRead, cycle]);
-  // One read served both; the cycle's step (60 s for one market) less the 400 ms it took.
+  // One read served the page and the cycle, and it is the minute's sample.
   assert.equal(fake.calls.filter(call => call === 'NVDA-USD.P').length, 1);
-  assert.equal(rewards.state(15).markets[0]!.avg.samples, 1);
-  assert.deepEqual(pauses, [59_600]);
-  rewards.close();
+  const view = rewards.state(15);
+  assert.equal(view.markets[0]!.avg.samples, 1); assert.equal(view.markets[0]!.source, 'rest');
+  assert.deepEqual(view.feed, { at: 1_800_000_000_000, pushed: 0, of: 1, error: 'connect_timeout' });
+  assert.equal(pauses.at(-1), 50_000);
+
+  // Stopping mid-burst: the feed is closed and the half minute is not a sample.
+  const pushed = fakeFeeds(), dir = mkdtempSync(join(tmpdir(), 'tp-ondo-rewards-'));
+  const halted = createOndoRewards({ dataDir: dir, clientFactory: () => fake.client, streamFactory: pushed.factory, now: () => time.now });
+  halted.initialize();
+  halted.save({ markets: ['NVDA-USD.P'], poolUsd: '1000', eligible: 1 });
+  let ticks = 0;
+  await halted.run({ stopped: () => ticks >= 3, pause: async ms => { time.now += ms; ticks += 1; pushed.push('NVDA-USD.P', 100, time.now); } });
+  assert.equal(pushed.feeds.length, 1); assert.ok(pushed.feeds[0]!.closed);
+  assert.equal(halted.state().markets[0]!.avg.samples, 0); assert.equal(halted.state().feed, null);
+  assert.ok(halted.state().markets[0]!.levels);
+  rewards.close(); halted.close();
 });
 
 test('采集：关闭后不再新建客户端；停在读交易规则时不再读盘口', async () => {
@@ -196,7 +252,7 @@ test('采集：关闭后不再新建客户端；停在读交易规则时不再�
       async depth() { depths += 1; return book([level('99.99', '1')], [level('100.01', '1')]); },
       close() { for (const abort of aborts.splice(0)) abort(); } } as unknown as OndoClient;
   };
-  const rewards = createOndoRewards({ dataDir, clientFactory: hanging, now: () => time.now });
+  const rewards = createOndoRewards({ dataDir, clientFactory: hanging, streamFactory: fakeFeeds().factory, now: () => time.now });
   rewards.initialize();
   let stopped = false;
   const cycle = rewards.run({ stopped: () => stopped, pause: async () => {} });

@@ -95,6 +95,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 | 回退到早于 | 回退前要做的事 | 说明 | 详见 |
 | --- | --- | --- | --- |
+| v0.61.0 | 不用改配置 | 旧版本的 Ondo 奖励市场盘口改回每分钟向交易所读一次（REST），重启后平均值与波动重新累积 | [docs/ondo.md](docs/ondo.md) 第 5 节 |
 | v0.60.0 | 从 `config.json` 删掉 `ondo`、从 `secrets.json` 删掉 `ondo`；在实盘挂单的先在页面停止并确认撤单完成 | 旧版本不认识 `ondo`，配置检查失败、整个服务不启动；数据目录的 `ondo-mm/` 旧版本不读，留着即可 | [docs/ondo.md](docs/ondo.md) 第 9 节 |
 | v0.59.0 | 不用改配置 | 旧版本的原油、海力士盘口与自动开平仓全部向交易所读取（每 3 秒），合约价差页不再有 Binance 的 RWA 合约 | [docs/oil.md](docs/oil.md) 12.4 |
 | v0.58.0 | 先把四腿任务都处理到结束（待人工处理的先人工确认），再回退 | 旧版本把一组四腿当作两个独立的同所两腿任务：页面不成组，不再联动停止，停止只作用于被点的那个任务，不发四腿成交不等告警；未消费的四腿预览在旧版本确认时报错、不下单。每所剩下的持仓是同所两腿，旧版本可照常平仓 | [docs/oil.md](docs/oil.md) 11.5 |

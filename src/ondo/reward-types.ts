@@ -28,11 +28,16 @@ export interface OndoRewardMarket {
   depth5: { bid: number; ask: number } | null;
   /** How far from the mid the snapshot's levels reached (the farthest level returned), per side, in bps (25 or more covers every band). */
   cover: { bid: number | null; ask: number | null };
-  /** Averages over the window: USD per BUCKET_BPS bucket, others only; cover is the window's smallest. */
-  avg: { samples: number; from: number | null; bid: number[]; ask: number[]; cover: { bid: number | null; ask: number | null } };
-  /** Standard deviation of one-minute log returns of the mid over the window; null with fewer than MIN_RETURNS. */
+  /**
+   * Averages over the window: USD per BUCKET_BPS bucket, others only, each minute weighted alike; cover is the window's
+   * smallest. samples counts minutes, snapshots the books behind them (about 10 a minute from the feed, 1 over REST).
+   */
+  avg: { samples: number; snapshots: number; from: number | null; bid: number[]; ask: number[]; cover: { bid: number | null; ask: number | null } };
+  /** Standard deviation of the mid's log returns (5–120 s apart) scaled to one minute, over the window; null with fewer than minReturns. */
   sigma1m: number | null;
   returns: number;
+  /** Where the latest minute's sample came from: the WebSocket feed, or REST when the feed missed the market. */
+  source: 'ws' | 'rest' | null;
   error: string | null;
 }
 
@@ -44,8 +49,12 @@ export interface OndoRewardsView {
   /** Minutes averaged; the samples kept span at most maxWindowMin. */
   windowMin: number;
   maxWindowMin: number;
-  /** How often each market is sampled. */
+  /** Each cycle the feed is open for burstMs. */
   cycleMs: number;
+  burstMs: number;
+  minReturns: number;
+  /** The last finished burst: when it began, how many markets got a pushed book, and the feed's last error code. */
+  feed: { at: number; pushed: number; of: number; error: string | null } | null;
   startedAt: number;
   rulesError: string | null;
   loadError: string | null;

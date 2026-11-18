@@ -6,7 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -291,6 +291,46 @@ test('传输：白名单外的地址、请求头与请求体不启动子进程�
   await assert.rejects(pending, /已取消/);
   const noPython = (() => { const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true }); setImmediate(() => child.emit('error', Object.assign(new Error('spawn python3 ENOENT'), { code: 'ENOENT' }))); return child; }) as unknown as SpawnImpl;
   await assert.rejects(createVariationalFetch({ spawnImpl: noPython })('https://omni.variational.io/api/me', me), /需要 Python 3/);
+});
+
+const testPython = process.platform === 'win32' ? 'python' : 'python3';
+test('传输脚本：真实子进程把直接和 urllib 包装的套接字超时映射为专用退出码，普通故障仍保留原分类', {
+  skip: spawnSync(testPython, ['--version']).status !== 0 && '本机没有 Python 3',
+}, async () => {
+  // The shipped helper validates stdin and sets its own exit status; an idle local socket pair produces the actual timeout.
+  const fixture = `
+import runpy, socket, sys, urllib.error, urllib.request
+mode = sys.argv[2]
+def opened(self, request, timeout):
+    if mode == "refused":
+        raise urllib.error.URLError(ConnectionRefusedError("private upstream detail"))
+    left, right = socket.socketpair()
+    with left, right:
+        left.settimeout(0.01)
+        try:
+            left.recv(1)
+        except socket.timeout as error:
+            if mode == "wrapped":
+                raise urllib.error.URLError(error) from None
+            raise
+urllib.request.OpenerDirector.open = opened
+runpy.run_path(sys.argv[1], run_name="__main__")
+`;
+  for (const [mode, expectedExit, name, expectedCode] of [['direct', 3, 'TimeoutError', 'VARIATIONAL_TIMEOUT'], ['wrapped', 3, 'TimeoutError', 'VARIATIONAL_TIMEOUT'], ['refused', 2, 'Error', 'VARIATIONAL_TRANSPORT_FAILURE']] as const) {
+    const output: Buffer[] = [];
+    let exit: number | null = null;
+    const fetcher = createVariationalFetch({ spawnImpl: (_command, args, options) => {
+      const child = spawn(testPython, [...args.slice(0, -1), '-c', fixture, args.at(-1)!, mode], { ...options, stdio: 'pipe' });
+      child.stdout.on('data', chunk => output.push(chunk)); child.stderr.on('data', chunk => output.push(chunk));
+      child.once('exit', code => { exit = code; });
+      return child;
+    } });
+    const publicUrl = 'https://omni.variational.io/api/funding/v2?underlying=BZ&instrument_type=perpetual_rwa_future';
+    await assert.rejects(fetcher(publicUrl, {}), (error: Error & { code?: string }) => {
+      assert.equal(error.name, name); assert.equal(error.code, expectedCode); assert.ok(!error.message.includes('private upstream detail')); return true;
+    });
+    assert.deepEqual([exit, Buffer.concat(output).length], [expectedExit, 0], mode);
+  }
 });
 
 test('传输脚本：真实 python3 收到白名单外或格式不对的输入时只以退出码 2 结束，不打印输入', { skip: spawnSync('python3', ['--version']).status !== 0 && '本机没有 python3' }, () => {

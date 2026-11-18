@@ -424,3 +424,14 @@ test('手动调平在另一合约行情已过期或新价格使原方向越过�
     });
   }
 });
+
+test('调平保持原张数时发送前须重新核对目标合约面值', () => withHarness(async h => {
+  holdUneven(h);
+  const preview = await h.ex.preview(rebalance('add'), SESSION);
+  const { job } = h.ex.confirm({ previewId: preview.id, requestId: randomUUID(), confirmLive: true }, SESSION);
+  const leg = preview.legs[0];
+  h.binance.listInstrument({ ...leg.instrument, contractSize: '2' }, { bid: leg.quote.bid, ask: leg.quote.ask });
+  await h.ex.tickJobs();
+  assert.equal(h.binance.arrived.place, 0);
+  assert.match(h.ex.jobView(job.id).reason ?? '', /合约规格已变化/);
+}));

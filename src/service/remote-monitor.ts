@@ -6,7 +6,7 @@ import type { FeedEvent, SubscribeFeed } from '../monitor/perpetual-feed.ts';
 import { unwrapMarketRead, type MarketRead, type MetricBatch, type FundamentalRow } from '../monitor/market-contract.ts';
 import type { Exchange, ExchangeQuote, SpreadMarket } from '../vendor/exchange-comparison.mjs';
 import type { ExchangeFundingHistory } from '../vendor/exchange-funding-history.mjs';
-import type { VariationalPublicFunding } from '../vendor/variational-market.mjs';
+import { variationalRequestError, type VariationalPublicFunding } from '../vendor/variational-market.mjs';
 import { createPerpetualEstimates } from '../vendor/perpetual-estimates.mjs';
 import { perpetualPriceIdentity, type PerpetualQuote } from '../vendor/perpetual-stream.mjs';
 import type { PerpetualExecutionService } from '../vendor/perpetual-depth.mjs';
@@ -56,7 +56,13 @@ export function createRemoteMonitor(client: MarketClient, clock: () => number = 
     quote: (market, exchange, hynix, signal) => read('exchange.quote', { market, exchange, hynix }, signal),
     history: (market, exchange, signal) => read('exchange.history', { market, exchange }, signal),
     variationalMarks: signal => read('variational.marks', null, signal),
-    variationalFunding: signal => read('variational.funding', null, signal),
+    async variationalFunding(signal) {
+      try { return await read<VariationalPublicFunding>('variational.funding', null, signal); }
+      catch (error) {
+        if (signal.aborted && signal.reason?.name === 'TimeoutError') throw variationalRequestError(signal.reason);
+        throw error;
+      }
+    },
   };
   // A batch ticker read warms other registered contracts. Carry the worker's actual expiry back to the scheduler.
   const cached = new Map<string, number>(), retries = new Map<string, number>();

@@ -256,6 +256,41 @@ test('读回与写入失败：库里的报价无法解析时等新报价；K 线
   } finally { env.dispose(); }
 });
 
+test('原油日常续读严格限制在已查截止前一天，较早的共同收盘和最近多天的单腿不能标为实时', async () => {
+  const store = createMonitorStore({ file: ':memory:' }), starts: number[] = [];
+  let at = START + 23 * DAY, recovered = false;
+  const collector = createOilMonitor({ store, gate: createBinanceGate(), now: () => at, log: () => {}, fetchImpl: async url => {
+    const query = new URL(url).searchParams, start = Number(query.get('startTime')), end = Number(query.get('endTime'));
+    const brent = query.get('symbol') === 'BZUSDT'; starts.push(start);
+    const data = [];
+    for (let t = start; t <= end && t + BAR <= at; t += BAR) {
+      // Brent is listed first. Only days 2–3 have a common bar, followed by a long one-sided tail.
+      if (brent || (t >= START + 2 * DAY && t < START + 3 * DAY) || (recovered && t >= at - DAY)) data.push(candle(t, brent ? 74 : 69));
+    }
+    return Response.json(data);
+  } });
+  try {
+    await collector.refreshCandles();
+    assert.ok(starts.length > 2, '历史回补跨越一个窗口');
+    const common = START + 3 * DAY - BAR;
+    assert.equal(Date.parse(collector.candles(null)!.metadata.lastCommonObservation), common);
+    assert.equal(collector.candles(null)!.status, 'snapshot');
+    const through = Math.floor(at / BAR) * BAR;
+    at += 60_000; starts.length = 0; await collector.refreshCandles();
+    assert.deepEqual(starts, [through - DAY, through - DAY]);
+    assert.equal(collector.candles(null)!.status, 'snapshot');
+
+    starts.length = 0; at += OIL_GAP_RETRY_MS; await collector.refreshCandles();
+    assert.equal(Math.min(...starts), START, '小时轮仍从历史缺腿处补读');
+    assert.equal(collector.candles(null)!.status, 'snapshot');
+    starts.length = 0; const repairedThrough = Math.floor(at / BAR) * BAR;
+    recovered = true; at += BAR; await collector.refreshCandles();
+    assert.deepEqual(starts, [repairedThrough - DAY, repairedThrough - DAY]);
+    assert.equal(collector.candles(null)!.status, 'live');
+    assert.equal(Date.parse(collector.candles(null)!.metadata.lastCommonObservation), Math.floor(at / BAR) * BAR - BAR);
+  } finally { collector.stop(); store.close(); }
+});
+
 test('永久缺口：交易所始终不给的 K 线不让每轮都从缺口处翻页，每小时补读一次', async () => {
   const env = oilEnv();
   try {
@@ -274,7 +309,7 @@ test('永久缺口：交易所始终不给的 K 线不让每轮都从缺口处�
     read();
     env.clock += 60_000;
     await collector.refreshCandles();
-    assert.deepEqual(read(), [first.data.at(-1)!.time - 96 * BAR], '一小时内只从最后一天续读');
+    assert.deepEqual(read(), [first.data.at(-1)!.time + BAR - DAY], '一小时内只从最后验证边界之前一天续读');
     assert.deepEqual([collector.candles(null)!.data[0], collector.candles(null)!.metadata.missingObservationRows], [first.data[0], 1], '更早的行原样保留');
     assert.deepEqual(plain(env.store.oilCandles()), plain(collector.candles(null)!.data));
     env.clock += OIL_GAP_RETRY_MS;
@@ -283,7 +318,7 @@ test('永久缺口：交易所始终不给的 K 线不让每轮都从缺口处�
     const afterRetry = collector.candles(null)!.data.at(-1)!.time;
     env.clock += 60_000;
     await collector.refreshCandles();
-    assert.deepEqual(read(), [afterRetry - 96 * BAR], '补读之后又是一小时只续读最后一天');
+    assert.deepEqual(read(), [afterRetry + BAR - DAY], '补读之后又是一小时只续读最后一天');
   } finally { env.dispose(); }
 });
 

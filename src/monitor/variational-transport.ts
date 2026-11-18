@@ -20,7 +20,8 @@ const RESPONSE_HEADERS = new Set(['content-type', 'x-omni-auth', 'cf-mitigated']
 const MAX_BODY_BYTES = 2_000_000, MAX_STDOUT_BYTES = 3_000_000, MAX_STDERR_BYTES = 16_384;
 const fail = (message = 'Variational 标准行情传输暂不可用，请稍后重试。', code = 'VARIATIONAL_TRANSPORT_FAILURE', name = 'Error') => Object.assign(new Error(message), { code, name });
 const invalid = () => fail('不支持的 Variational 数据请求。', 'VARIATIONAL_REQUEST_INVALID');
-const abortError = () => fail('Variational 数据请求已取消。', 'VARIATIONAL_ABORTED', 'AbortError');
+const timeoutError = () => fail('Variational 数据请求超时，请稍后重试。', 'VARIATIONAL_TIMEOUT', 'TimeoutError');
+const abortError = (signal: AbortSignal) => signal.reason?.name === 'TimeoutError' ? timeoutError() : fail('Variational 数据请求已取消。', 'VARIATIONAL_ABORTED', 'AbortError');
 const plainObject = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 const sameKeys = (value: unknown, names: string[]): value is Record<string, unknown> => plainObject(value) && Object.keys(value).length === names.length && names.every(name => Object.hasOwn(value, name));
 const jwtCookie = (value: string | null): boolean => typeof value === 'string' && value.length <= 8201 && /^vr-token=[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
@@ -78,7 +79,7 @@ export function createVariationalFetch({ spawnImpl = spawn as unknown as SpawnIm
     if (typeof input !== 'string') throw invalid();
     const payload = requestPayload(input, init), signal = init.signal;
     if (signal !== undefined && signal !== null && !(signal instanceof AbortSignal)) throw invalid();
-    if (signal?.aborted) throw abortError();
+    if (signal?.aborted) throw abortError(signal);
     return new Promise<Response>((resolve, reject) => {
       let child: ChildProcessWithoutNullStreams | undefined, timer: NodeJS.Timeout | undefined, settled = false, stdoutSize = 0, stderrSize = 0;
       const chunks: Buffer[] = [];
@@ -93,7 +94,7 @@ export function createVariationalFetch({ spawnImpl = spawn as unknown as SpawnIm
         child?.stderr?.destroy();
         if (error) reject(error); else resolve(response!);
       };
-      const onAbort = () => finish(abortError(), undefined, true);
+      const onAbort = () => finish(abortError(signal!), undefined, true);
       const processError = (error: unknown) => finish((error as { code?: string } | null)?.code === 'ENOENT'
         ? fail('Variational 行情传输需要 Python 3，当前服务未找到运行环境；请重新运行一键部署或安装 Python 3。', 'VARIATIONAL_PYTHON_MISSING')
         : fail(), undefined, true);
@@ -120,11 +121,11 @@ export function createVariationalFetch({ spawnImpl = spawn as unknown as SpawnIm
         });
         child.once('close', (code: number | null) => {
           if (settled) return;
-          if (code !== 0) { finish(fail()); return; }
+          if (code !== 0) { finish(code === 3 ? timeoutError() : fail()); return; }
           try { finish(undefined, responseFromOutput(Buffer.concat(chunks).toString('utf8'))); }
           catch { finish(fail()); }
         });
-        timer = setTimeout(() => finish(fail('Variational 数据请求超时，请稍后重试。', 'VARIATIONAL_TIMEOUT', 'TimeoutError'), undefined, true), duration);
+        timer = setTimeout(() => finish(timeoutError(), undefined, true), duration);
         signal?.addEventListener('abort', onAbort, { once: true });
         if (signal?.aborted) { onAbort(); return; }
         child.stdin.end(payload);

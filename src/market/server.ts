@@ -20,7 +20,7 @@ function json(res: ServerResponse, status: number, value: unknown): void {
   res.end(bytes);
 }
 
-export function createMarketServer(groups: Readonly<Record<string, MarketOperations>>, build: string) {
+export function createMarketServer(groups: Readonly<Record<string, MarketOperations>>, build: string, { callTimeoutMs = RPC_TIMEOUT_MS, maxCalls = 128 } = {}) {
   const instance = randomUUID();
   const stopped = new AbortController();
   let calls = 0, streams = 0;
@@ -35,9 +35,9 @@ export function createMarketServer(groups: Readonly<Record<string, MarketOperati
     const prefix = op.split('.', 1)[0];
     const group = Object.hasOwn(groups, prefix) ? groups[prefix] : undefined;
     if (!group && !(streaming && op === 'system.epoch')) return json(res, 404, { message: '未知行情操作' });
-    if (streaming ? streams >= 128 : calls >= 128) return json(res, 429, { message: '行情任务已满，请稍后再试' });
+    if (streaming ? streams >= 128 : calls >= maxCalls) return json(res, 429, { message: '行情任务已满，请稍后再试' });
     const lifetime = new AbortController();
-    const signal = AbortSignal.any([stopped.signal, lifetime.signal, ...(streaming ? [] : [AbortSignal.timeout(RPC_TIMEOUT_MS)])]);
+    const signal = AbortSignal.any([stopped.signal, lifetime.signal, ...(streaming ? [] : [AbortSignal.timeout(callTimeoutMs)])]);
     const finish = () => lifetime.abort();
     res.once('close', finish);
     if (streaming) streams++; else calls++;

@@ -128,6 +128,8 @@ export function createMarketClient(socketPath: string): MarketClient & { close()
         if (lease !== active || deadline.aborted) throw new MarketError('行情服务应答已过期');
         return result as T;
       } catch (error) {
+        if (deadline.aborted && deadline.reason?.name === 'TimeoutError') throw new DOMException('公开行情请求超时', 'TimeoutError');
+        if (signal?.aborted) throw new DOMException('公开行情请求已中止', 'AbortError');
         if (error instanceof MarketError) throw error;
         throw new MarketError('行情服务暂不可用');
       }

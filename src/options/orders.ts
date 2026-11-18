@@ -101,9 +101,10 @@ export interface FollowHooks extends ReconcileHooks {
   pause(ms: number): Promise<void>;
 }
 
-function atTransmission(client: OptionsClient, ticker: Row | null, price: string, hooks: { checkStop(): void; checkPrice(price: number): void }): () => void {
+function atTransmission(client: OptionsClient, ticker: Row | null, price: string, hooks: FollowHooks | IocHooks): () => void {
   return () => {
     hooks.checkStop();
+    if ('deadline' in hooks && hooks.now() >= hooks.deadline) throw new VenueError('not-sent', '期权跟价已到截止时间');
     if (ticker) client.publicAt?.(ticker);
     hooks.checkPrice(Number(price));
   };

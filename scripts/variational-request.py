@@ -1,11 +1,12 @@
 """Fixed read-only Variational HTTP bridge. Credentials are read only from stdin.
 
-Copied from project_aggregation modules/monitor/server/variational-request.py at 8470785, unchanged apart from this
-docstring. Run as `python3 -I -B` by src/monitor/variational-transport.ts.
+Based on project_aggregation modules/monitor/server/variational-request.py at 8470785. Exit 3 identifies
+a socket timeout; all other failures exit 2 without emitting details. Run as `python3 -I -B` by src/monitor/variational-transport.ts.
 """
 import base64
 import json
 import re
+import socket
 import sys
 import urllib.error
 import urllib.request
@@ -115,6 +116,11 @@ def main():
         result = fetch_response(value)
         sys.stdout.write(json.dumps(result, ensure_ascii=True, separators=(",", ":")))
         return 0
+    except (TimeoutError, socket.timeout):
+        return 3
+    except urllib.error.URLError as error:
+        # urllib wraps connection timeouts in URLError, while reading a body can raise the socket timeout directly.
+        return 3 if isinstance(error.reason, (TimeoutError, socket.timeout)) else 2
     except Exception:
         # Never print input, URLs, request headers, response bodies, or tracebacks.
         return 2

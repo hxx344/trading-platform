@@ -106,6 +106,29 @@ test('独立行情经本机套接字整轮回补；各腿原时间、落盘检�
   }
 });
 
+test('Var 公开资金费在真实 IPC 调用中直到执行端 10 秒截止才中止，比较行保留超时原因和公开价格', async () => {
+  const venues = fakeAnthropicVenues(), dir = mkdtempSync(join(tmpdir(), 'tp-market-var-deadline-')), socket = socketPath(dir);
+  let started = 0, aborted = 0;
+  const worker = await listen(socket, { log: quiet, fetchImpl: venues.fetch, variationalFetch: async (_url, init) => {
+    started++;
+    const signal = init.signal!;
+    return new Promise<Response>((_resolve, reject) => {
+      signal.addEventListener('abort', () => { aborted++; reject(signal.reason); }, { once: true });
+    });
+  } });
+  const client = createMarketClient(socket), config = parseServiceConfig({ secretsFile: '/secrets', monitor: { oil: {} } }).monitor!;
+  const runtime = openMonitor(config, dir, { marketClient: client, log: quiet });
+  try {
+    await until(() => !!client.epoch());
+    const quote = await runtime.exchanges!.quote('oil', 'variational');
+    assert.ok(quote.left.price > 0 && quote.right.price > 0);
+    assert.equal(quote.left.fundingRate, null);
+    assert.match(quote.fundingError, /Variational 请求超时/);
+    await until(() => aborted === 2);
+    assert.equal(started, 2);
+  } finally { stopMonitor(runtime); closeMonitor(runtime); client.close(); worker.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 function controlledBooks(now: () => number) {
   const sockets: Socket[] = [], markets: PerpetualMarket[] = [{ id: 'binance:BZUSDT', exchange: 'binance', symbol: 'BZUSDT', base: 'BZ', quoteCurrency: 'USDT' }];
   class Socket {

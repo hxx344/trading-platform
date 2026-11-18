@@ -75,12 +75,17 @@ export async function requestVariational(path, token, { fetcher, body, signal } 
       return JSON.parse(text + decoder.decode());
     } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
   } catch (error) {
-    const rejected = Boolean(error && typeof error === 'object' && 'rejected' in error && error.rejected === true);
-    const blocked = Boolean(error && typeof error === 'object' && 'blocked' in error && error.blocked === true);
-    const missingRuntime = Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'VARIATIONAL_PYTHON_MISSING');
-    const timedOut = Boolean(error && typeof error === 'object' && 'name' in error && (error.name === 'TimeoutError' || error.name === 'AbortError'));
-    throw Object.assign(Error(rejected ? 'Variational 未通过会话认证，请更新 token。' : blocked ? '服务器访问 Variational 被拦截，请稍后重试；这不代表 token 已过期。' : missingRuntime ? 'Variational 请求需要 Python 3，请重新运行一键部署或安装 Python 3。' : timedOut ? 'Variational 请求超时，请稍后重试。' : 'Variational 暂不可用，请稍后重试。'), { rejected, blocked, status: rejected ? 400 : 502, variational: true });
+    throw variationalRequestError(error);
   }
+}
+
+/** Only the public classification and fixed message cross transport boundaries. */
+export function variationalRequestError(error) {
+  const rejected = Boolean(error && typeof error === 'object' && 'rejected' in error && error.rejected === true);
+  const blocked = Boolean(error && typeof error === 'object' && 'blocked' in error && error.blocked === true);
+  const missingRuntime = Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'VARIATIONAL_PYTHON_MISSING');
+  const timedOut = Boolean(error && typeof error === 'object' && 'name' in error && (error.name === 'TimeoutError' || error.name === 'AbortError'));
+  return Object.assign(Error(rejected ? 'Variational 未通过会话认证，请更新 token。' : blocked ? '服务器访问 Variational 被拦截，请稍后重试；这不代表 token 已过期。' : missingRuntime ? 'Variational 请求需要 Python 3，请重新运行一键部署或安装 Python 3。' : timedOut ? 'Variational 请求超时，请稍后重试。' : 'Variational 暂不可用，请稍后重试。'), { rejected, blocked, status: rejected ? 400 : 502, variational: true });
 }
 
 const instrument = symbol => ({ underlying: symbol, instrument_type: 'perpetual_rwa_future', settlement_asset: 'USDC', kind: 'commodity' });

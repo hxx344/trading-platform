@@ -10,10 +10,10 @@ import type { TerminalFeed } from '../vendor/crossex/terminal-feed.mjs';
 /** Signed REST stays on the executor. Observation/reward clients only need these two public reads. */
 export function remoteOndoClient(market: MarketClient, options?: Parameters<typeof createOndoClient>[0]): OndoClient {
   const account = options?.credentials ? createOndoClient(options) : null, stopped = new AbortController();
-  const signal = () => AbortSignal.any([stopped.signal, AbortSignal.timeout(5500)]);
+  const signal = (caller?: AbortSignal) => AbortSignal.any([stopped.signal, AbortSignal.timeout(5500), ...(caller ? [caller] : [])]);
   return { ...account, cooldownUntil: () => account?.cooldownUntil() ?? 0,
-    async markets() {
-      const rows = await market.call<unknown>('ondo.markets', {}, signal()), rules = new Map<string, OndoRules>();
+    async markets(caller) {
+      const rows = await market.call<unknown>('ondo.markets', {}, signal(caller)), rules = new Map<string, OndoRules>();
       if (!Array.isArray(rows) || rows.length > 4096) throw new Error('Ondo 合约目录无效');
       for (const row of rows) {
         if (!Array.isArray(row) || row.length !== 2) throw new Error('Ondo 合约目录无效');
@@ -25,8 +25,8 @@ export function remoteOndoClient(market: MarketClient, options?: Parameters<type
       }
       return rules;
     },
-    async depth(name, levels = 100) {
-      const result = await market.call<OndoDepth>('ondo.depth', { market: name, levels }, signal());
+    async depth(name, levels = 100, caller) {
+      const result = await market.call<OndoDepth>('ondo.depth', { market: name, levels }, signal(caller));
       if (result?.market !== name) throw new Error('Ondo 盘口市场不符');
       return result;
     },

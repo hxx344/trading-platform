@@ -697,20 +697,33 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
    * Before a group's first lead goes out, the other venue's job is checked too (L100): if its lead could not go out now, this
    * one waits, so one venue does not open alone. The text says why, or null when the other job is already past this point.
    */
+  function acceptedLead(op: Operation): boolean {
+    const filled = boundedFill(op);
+    if (filled === null) return false;
+    if (filled > 0n) return true;
+    return isStrategy(op) ? op.identityVerifiedAt != null : !!op.venueStatus && op.venueStatus !== 'rejected';
+  }
   async function peerFirstLeadEvidence(job: PairJob): Promise<Quote[] | string> {
-    if (!job.group) return [];
+    if (!job.group || legOps(job.id, 0).some(acceptedLead)) return [];
     const peer = readJob(job.group.peer);
-    if (!isPair(peer) || FINAL_JOB.has(peer.status) || peer.peerHalt || peer.holdNewSends || stopRequested(peer.id)) return [];
+    if (!isPair(peer)) return '四腿任务的另一组身份无效';
     const leads = legOps(peer.id, 0);
-    if (leads.length) {
-      const accepted = leads.some(op => cmp(op.filledQuantity, '0') > 0 || (op.state === 'open' && (!isStrategy(op) || op.identityVerifiedAt != null)));
-      return accepted ? [] : `${VENUE_NAMES[peer.legs[0].venue]} 首腿尚无已受理的有效委托或成交`;
+    if (leads.some(acceptedLead)) return [];
+    if (leads.length || FINAL_JOB.has(peer.status) || peer.peerHalt || peer.holdNewSends || stopRequested(peer.id)) {
+      return `${VENUE_NAMES[peer.legs[0].venue]} 首腿尚无已受理的有效委托或成交`;
     }
     try { return await guardLead(peer); }
     catch (error) {
       if (error instanceof WriterLostError) throw error;
       return `${VENUE_NAMES[peer.legs[0].venue]}：${error instanceof Error ? error.message.slice(0, 160) : '发送前检查失败'}`;
     }
+  }
+
+  /** Applies to a repost too when the venue has never accepted a lead of this group. */
+  async function groupLeadBooks(job: PairJob): Promise<Quote[]> {
+    const [books, peer] = await Promise.all([guardLead(job), peerFirstLeadEvidence(job)]);
+    if (typeof peer === 'string') return reject('four_leg_peer', `四腿另一交易所首腿暂不能发送（${peer}），本所首腿等待`, 409);
+    return [...books, ...peer];
   }
 
   // ---- accounts ----------------------------------------------------------------
@@ -1450,10 +1463,14 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   async function guardRebalance(job: RebalanceJob): Promise<Quote[]> {
     if (now() >= job.deadlineAt) reject('deadline', '任务已超过最长执行时间，未发送', 409);
     const leg = job.legs[0], counter = job.rebalance.counter, binding = bindingStillValid(leg);
-    const [quote, otherQuote, counterRules, snapshot, counterSnapshot] = await Promise.all([
-      readQuote(leg.venue, leg.symbol), readQuote(leg.venue, counter.symbol), readInstrument(leg.venue, counter.symbol),
+    const [quote, otherQuote, targetRules, counterRules, snapshot, counterSnapshot] = await Promise.all([
+      readQuote(leg.venue, leg.symbol), readQuote(leg.venue, counter.symbol), readInstrument(leg.venue, leg.symbol), readInstrument(leg.venue, counter.symbol),
       readAccount(binding, leg.symbol), readAccount(binding, counter.symbol),
     ]);
+    const sizing = ['contractSize', 'tickSize', 'quantityStep', 'minQuantity', 'maxQuantity', 'maxMarketQuantity', 'minNotional'] as const;
+    if (targetRules.catalogVersion !== leg.instrument.catalogVersion || sizing.some(key => cmp(targetRules[key], leg.instrument[key]) !== 0)) {
+      reject('instrument_changed', '调平合约规格已变化，请重新预览', 409);
+    }
     const books = [quote, otherQuote], at = now();
     for (const book of books) checkBook(book, at, budgets.sendQuoteMaxAgeMs);
     if (!sameQuoteWindow(books, budgets.pairQuoteWindowMs)) reject('quote_window', '调平两腿盘口不在同一时间窗，请重新预览', 409);
@@ -1469,8 +1486,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const held = (symbol: string, account: AccountSnapshot, book: Quote, rules: Instrument): HeldContract => ({
       symbol, long: positionOf(account, symbol, 'long'), short: positionOf(account, symbol, 'short'), price: midOf(book.bid, book.ask), contractSize: rules.contractSize,
     });
-    const balance = pairBalance(held(leg.symbol, snapshot, quote, leg.instrument), held(counter.symbol, counterSnapshot, otherQuote, counterRules));
-    const order = balance.status === 'paired' ? rebalanceOrder(balance, job.rebalance.method, { [leg.symbol]: leg.instrument, [counter.symbol]: counterRules }) : null;
+    const balance = pairBalance(held(leg.symbol, snapshot, quote, targetRules), held(counter.symbol, counterSnapshot, otherQuote, counterRules));
+    const order = balance.status === 'paired' ? rebalanceOrder(balance, job.rebalance.method, { [leg.symbol]: targetRules, [counter.symbol]: counterRules }) : null;
     if (!order || 'error' in order || order.symbol !== leg.symbol || order.side !== leg.side || cmp(order.quantity, leg.quantity) < 0) {
       reject('rebalance_changed', '当前两腿盘口已不支持原先确认的调平方向或数量，请重新预览', 409);
     }
@@ -1945,19 +1962,16 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       if (job.peerHalt) { write(() => finish(readJob(job.id), 'stopped', `四腿联动停止（${job.peerHalt}），未发送任何委托`)); return; }
       if (job.holdNewSends) { write(() => finish(readJob(job.id), 'failed', '服务恢复后不再发送新委托')); return; }
       // Four legs: the other venue's job is checked alongside (in parallel, so this one's quote stays fresh for the send).
-      const [own, peerEvidence] = await Promise.all([guardLead(job).then(value => ({ value }), (error: unknown) => ({ error })), peerFirstLeadEvidence(job)]);
-      if ('error' in own) {
-        const error = own.error;
+      let books: Quote[];
+      try { books = await groupLeadBooks(job); }
+      catch (error) {
+        if (error instanceof WriterLostError) throw error;
         const reason = error instanceof Error ? error.message.slice(0, 200) : '发送前检查失败';
-        // A failed read may clear before the deadline; any other refusal ends the job before anything is sent.
-        const retry = error instanceof ContractError && (error.code === 'venue_read_failed' || error.code === 'quote_window') || error instanceof ControlRefusal && error.transient;
-        if (retry && now() < job.deadlineAt) { write(() => { const current = readJob(job.id); current.reason = reason; saveJob(current); }); return; }
+        const retry = error instanceof ContractError && ['venue_read_failed', 'quote_window', 'four_leg_peer'].includes(error.code) || error instanceof ControlRefusal && error.transient;
+        if (retry && now() < job.deadlineAt) { write(() => { const current = readJob(job.id); if (current.reason !== reason) { current.reason = reason; saveJob(current); } }); return; }
         write(() => finish(readJob(job.id), 'failed', reason, error instanceof ContractError && error.code === 'price_moved' ? 'price_moved' : undefined)); return;
       }
-      const quote = own.value;
-      // The other venue's refusal ends that job in its own turn, which halts this one; until then this one only waits.
-      if (typeof peerEvidence === 'string') { const reason = `四腿另一交易所首腿暂不能发送（${peerEvidence}），本所首腿等待`; write(() => { const current = readJob(job.id); if (current.reason !== reason) { current.reason = reason; saveJob(current); } }); return; }
-      try { await sendLead(job, [...quote, ...peerEvidence], 0, 0); }
+      try { await sendLead(job, books, 0, 0); }
       catch (error) {
         if (!(error instanceof ContractError) || error.code !== 'price_moved') throw error;
         write(() => finish(readJob(job.id), 'failed', error.message.slice(0, 200), 'price_moved')); return;
@@ -2044,7 +2058,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         if (now() < doneAt + (job.batchIntervalMs ?? 0)) return;
       }
       let quote: Quote[];
-      try { quote = await guardLead(job); }
+      try { quote = await groupLeadBooks(job); }
       catch (error) {
         if (error instanceof WriterLostError) throw error;
         if (error instanceof ContractError && error.code === 'binding_changed') { write(() => settleJob(readJob(job.id), error.message.slice(0, 120))); return; }

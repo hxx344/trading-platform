@@ -4,7 +4,7 @@
 // own timeout and is never retried within a round; a failed round keeps what was there and says why. The last quote and the
 // candles are kept in monitor.sqlite and read back at start, marked as a snapshot until a round succeeds.
 import {
-  OIL_CANDLE_MS, OIL_CANDLE_REFRESH_MS, createIntradaySnapshot, oilCandleStart, mergeOilCandleRows, validateOilCandleRows, intradayWindow, validateMarket,
+  HISTORY_START, OIL_CANDLE_MS, OIL_CANDLE_REFRESH_MS, createIntradaySnapshot, oilCandleStart, mergeOilCandleRows, validateOilCandleRows, intradayWindow, validateMarket,
   type OilCandleRow, type OilCoverage, type OilFetcher, type OilIntraday, type OilIntradayWindow, type OilMarket,
 } from '../vendor/oil-market.mjs';
 import type { BinanceGate } from '../vendor/anthropic-market.mjs';
@@ -125,17 +125,10 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
     candleAttemptAt = at;
     const cutoff = at - OIL_RETENTION_DAYS * DAY_MS;
     const full = at >= gapRetryAt;
-    let history = candleRows;
-    if (!full && history.length) {
-      const from = history.at(-1)!.time - RESUME_MS;
-      const firstPair = history.findIndex(row => row.time >= from && row.brent !== null && row.wti !== null);
-      if (firstPair > 0) history = history.slice(firstPair);
-    }
     const target = Math.floor(at / OIL_CANDLE_MS) * OIL_CANDLE_MS, stamp = new Date(at).toISOString();
-    let suggested = oilCandleStart(history);
-    if (!full && (!candles || (history.at(-1)?.time ?? 0) < checkedThrough - RESUME_MS)) suggested = Math.max(suggested, checkedThrough - RESUME_MS);
-    let start = Math.max(resumeAt ?? suggested, Math.ceil(cutoff / OIL_CANDLE_MS) * OIL_CANDLE_MS);
-    let sawBrent = false, sawWti = false;
+    // Routine reads overlap just the last verified day, including when the entire tail has only one leg. A durable repair cursor takes precedence.
+    const suggested = resumeAt ?? (full || !checkedThrough ? oilCandleStart(candleRows) : checkedThrough - RESUME_MS);
+    let start = Math.max(HISTORY_START, suggested, Math.ceil(cutoff / OIL_CANDLE_MS) * OIL_CANDLE_MS);
     while (start < target && !stopping.signal.aborted) {
       const end = Math.min(start + OIL_CANDLE_WINDOW_MS, target);
       let next: OilCandleRow[], projection: OilIntraday | null, changed: OilCandleRow[];
@@ -144,7 +137,6 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
         if (stopping.signal.aborted) return;
         const incoming = validateOilCandleRows(batch, new Date(end).toISOString());
         if (incoming.some(row => row.time < start)) throw new Error('原油 K 线超出本轮范围');
-        sawBrent ||= incoming.some(row => row.brent !== null); sawWti ||= incoming.some(row => row.wti !== null);
         next = mergeOilCandleRows(candleRows, incoming).filter(row => row.time >= cutoff);
         projection = chart(next, stamp);
         const previous = new Map(candleRows.map(row => [row.time, row]));
@@ -167,7 +159,7 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
         candleSave.failed('monitor.sqlite 写入失败', detail(error)); return;
       }
       resumeAt = cursor; checkedThrough = end; candleRows = next; candles = projection;
-      candlesRestored = cursor !== null || !sawBrent || !sawWti;
+      candlesRestored = cursor !== null;
       replaceCandles = false; start = end; candleError = null;
     }
     if (stopping.signal.aborted) return;
@@ -187,7 +179,9 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
     /** The candles opening within `days` before the last paired bar (null: all of them), with the complete history's range; null before any row exists. */
     candles(days: number | null): OilCandleView | null {
       if (!candles) return null;
-      const stale = candlesRestored || candleError !== null || now() - Date.parse(candles.metadata.fetchedAt) > CANDLE_STALE_MS;
+      const current = now(), lastClosedBoundary = Math.floor(current / OIL_CANDLE_MS) * OIL_CANDLE_MS;
+      const stale = candlesRestored || candleError !== null || current - Date.parse(candles.metadata.fetchedAt) > CANDLE_STALE_MS
+        || Date.parse(candles.metadata.lastCommonObservation) < lastClosedBoundary - RESUME_MS;
       const snapshot: OilIntraday = { ...candles, status: stale ? 'snapshot' : 'live' };
       const { firstCommonObservation, lastCommonObservation, pairedObservationRows } = snapshot.metadata;
       // Cutting a window validates every stored row; it is redone only when a round stored new candles or the freshness changed.

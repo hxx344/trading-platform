@@ -63,6 +63,23 @@ test('四腿首次发送在签名中丢失行情依据时，另一所不能把�
   assert.equal(delayed, true);
   assert.deepEqual([h.binance.arrived.place, h.bybit.arrived.place], [0, 0]);
 }));
+
+test('本地追价首笔明确未发后，同批重挂仍须取得另一所的两个有效盘口', () => withHarness(async h => {
+  await confirmFour(h, fourIntent({ binanceLead: 'local-chase' }));
+  const place = h.binance.place.bind(h.binance);
+  let first = true;
+  h.binance.place = (...args) => {
+    if (first) { first = false; h.advance(h.ex.budgets.sendQuoteMaxAgeMs + 1); }
+    return place(...args);
+  };
+  await h.ex.tickJobs();
+  assert.equal(first, false);
+  assert.deepEqual([h.binance.arrived.place, h.bybit.arrived.place], [0, 0]);
+  h.bybit.setBook('BZUSDT', { ageMs: 60_000 });
+  h.advance(1000);
+  await h.ex.tickJobs();
+  assert.deepEqual([h.binance.arrived.place, h.bybit.arrived.place], [0, 0]);
+}));
 const locks = (h: Harness) => (h.store.db.prepare('SELECT resource, job_id FROM locks ORDER BY resource').all() as { resource: string; job_id: string }[]);
 const jobCount = (h: Harness) => (h.store.db.prepare('SELECT COUNT(*) AS n FROM jobs').get() as { n: number }).n;
 const pos = (venue: SimulatedVenue, symbol: string, side: Side) => venue.position(SIM_ACCOUNTS[venue.venue as 'binance' | 'bybit'], symbol, side);

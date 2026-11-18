@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { MarketClient } from '../src/market/ipc.ts';
 import { createOptionsClient } from '../src/options/client.ts';
-import { iocOrder } from '../src/options/orders.ts';
+import { followOrder, iocOrder } from '../src/options/orders.ts';
 
 test('期权新单在真正发出前仍须持有同一代新鲜行情，订单与撤单使用私有客户端', async () => {
   let epoch: string | null = 'first', now = 1_800_000_000_000, source = now;
@@ -31,6 +31,25 @@ test('期权新单在真正发出前仍须持有同一代新鲜行情，订单�
   assert.equal(await client.order(symbol, spec.link, AbortSignal.timeout(1000)), null);
   await client.cancel(symbol, spec.link, AbortSignal.timeout(1000));
   assert.deepEqual(requests, ['/v5/order/realtime', '/v5/order/history', '/v5/order/cancel']);
+});
+
+test('期权跟价在校时期间到期后不会重发，即使单合约行情仍新', async () => {
+  let now = Date.now(), sent = 0;
+  const symbol = 'BTC-20NOV26-80000-C', deadline = now + 1000;
+  const market: MarketClient = { epoch: () => 'first', stream: () => () => {}, call: async <T>() => ({
+    value: { symbol, bid1Price: '10', ask1Price: '11' }, receivedAt: now, sourceAt: now,
+  }) as T };
+  const client = createOptionsClient({ marketClient: market, now: () => now, credentials: { apiKey: 'demo', apiSecret: 'test-only-secret' },
+    fetchImpl: async url => {
+      if (new URL(url).pathname === '/v5/market/time') { now += 2000; return Response.json({ retCode: 0, result: { timeNano: String(BigInt(now) * 1_000_000n) } }); }
+      sent++; return Response.json({ retCode: 10002, result: {} });
+    } });
+  const answer = await followOrder(client, { symbol, side: 'Buy', qty: '1', link: 'deadline-test', tick: '1', reduceOnly: false }, {
+    now: () => now, deadline, pollMs: 1, checkStop() {}, checkPrice() {}, record() {}, log() {}, pause: async () => {}, sleep: async () => {},
+  });
+  assert.equal(sent, 1);
+  assert.equal(answer.status, 'not_submitted');
+  assert.match(answer.message ?? '', /截止/);
 });
 
 test('Bybit 调时重试前即使单合约报价仍新，组合风险或停止状态不允许也不会发送第二个 POST', async () => {

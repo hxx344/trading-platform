@@ -21,6 +21,7 @@ export function variationalIndicativeBody(symbol: 'BZ' | 'CL'): { instrument: { 
 export function parseVariationalMark(input: unknown, symbol: 'BZ' | 'CL', now?: number): { price: number; sourceTime: number };
 export function parseVariationalFunding(input: unknown, now?: number): VariationalFunding;
 export function readVariationalPublicFunding(options: { fetcher: VariationalFetcher; clock?: () => number; signal?: AbortSignal }): Promise<VariationalPublicFunding>;
+export function variationalRequestError(error: unknown): VariationalError;
 export function variationalReasonNote(reason: string): string;
 /** `reason`: why the funding read failed (a fixed text), shown in the row's fundingError. */
 export function withVariationalFunding(quote: ExchangeQuote, funding: VariationalPublicFunding | null, now?: number, reason?: string): ExchangeQuote;

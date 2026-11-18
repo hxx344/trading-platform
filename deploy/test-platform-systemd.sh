@@ -372,6 +372,32 @@ assert_market_absent
 [[ $(id -gn "$extra_user") == "$market-ipc" ]]
 userdel "$extra_user"
 
+echo 'A broken two-process downgrade cannot bring the previous market back with an unsafe socket group'
+install_release 8
+market_probe "$app/market"
+last_good=$(readlink "$app/current")
+useradd --system --no-user-group --gid "$market-ipc" --no-create-home --shell /usr/sbin/nologin "$extra_user"
+broken_dual="$fixture/broken-dual"
+mkdir -p "$broken_dual/source"
+tar -xzf "$dual/trading-platform.tar.gz" -C "$broken_dual/source"
+# An unsuccessful ExecStartPre fails the real systemctl restart job immediately, before the 90-second health wait.
+printf '\n[Service]\nExecStartPre=/bin/false\nRestart=no\n' >>"$broken_dual/source/trading-platform/deploy/$service.service"
+tar -C "$broken_dual/source" -czf "$broken_dual/trading-platform.tar.gz" trading-platform
+(cd "$broken_dual" && sha256sum trading-platform.tar.gz >SHA256SUMS)
+if bash "$root/deploy/install.sh" --package "$broken_dual" >"$fixture/out" 2>&1; then echo 'Broken downgrade accepted' >&2; exit 1; fi
+systemctl is-failed --quiet "$service"
+grep -Fxq 'ExecStartPre=/bin/false' "$unitdir/$service.service"
+grep -Fq '上一版本 v99.1.8 的行情账户未通过核验，无法重新启用' "$fixture/out"
+[[ $(cat "$app/.deployment/current") == "$last_good" && $(readlink "$app/current") != "$last_good" ]]
+assert_market_absent
+# The known-good two-process package can recover execution without granting the unrelated UID any new access.
+bash "$root/deploy/install.sh" --package "$dual" >"$fixture/out" 2>&1
+login
+assert_page v0.64.0
+assert_market_absent
+[[ $(id -gn "$extra_user") == "$market-ipc" ]]
+userdel "$extra_user"
+
 echo 'Reconciling a real old installer which changed current without updating the split deployment record'
 systemctl disable --now "$control"
 bash "$old/install.sh" --package "$old" >"$fixture/out" 2>&1

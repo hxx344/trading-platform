@@ -331,10 +331,15 @@ test('开仓对冲挂单部分成交后剩余低于最小名义金额：不再�
   assert.equal(ordersOf(h.binance).length, 1);
 }));
 
-test('对冲挂单撤单用尽而首腿仍挂着：先撤首腿，首腿撤单结清后才转人工', () => withHarness(async h => {
+/** Cancels the executor has sent for one order, from the stored operation. */
+const hedgeCancels = (h: Harness, clientOrderId: string): number => (h.store.db.prepare('SELECT json FROM operations').all() as { json: string }[])
+  .map(row => JSON.parse(row.json) as { clientOrderId: string; cancelSent: number }).find(op => op.clientOrderId === clientOrderId)?.cancelSent ?? 0;
+
+/** Same venue, both legs chasing: the lead rests half filled and the hedge post rests for that half. */
+async function bothResting(h: Harness, chaseTimeoutMs: number) {
   const intent = {
     market: 'oil', preset: 'same-exchange', action: 'open', timeoutMs: 600_000,
-    legs: [{ venue: 'binance', symbol: 'CLUSDT', side: 'long', orderType: 'local-chase', barrels: '1' }, { venue: 'binance', symbol: 'BZUSDT', side: 'short', orderType: 'local-chase', barrels: '1', chaseTimeoutMs: 2_000 }],
+    legs: [{ venue: 'binance', symbol: 'CLUSDT', side: 'long', orderType: 'local-chase', barrels: '1' }, { venue: 'binance', symbol: 'BZUSDT', side: 'short', orderType: 'local-chase', barrels: '1', chaseTimeoutMs }],
   };
   const { jobId } = await previewAndConfirm(h, intent);
   await tick(h);
@@ -343,19 +348,46 @@ test('对冲挂单撤单用尽而首腿仍挂着：先撤首腿，首腿撤单�
   await tick(h);
   const hedge = lastOrder(h.binance, 'BZUSDT');
   assert.equal(hedge.request.timeInForce, 'gtx');
+  return { jobId, lead, hedge };
+}
+
+for (const via of ['timeout', 'stop'] as const) test(`对冲挂单撤单用尽而首腿仍挂着（${via === 'timeout' ? '追价超时' : '请求停止'}）：先撤首腿，首腿撤单结清后才转人工`, () => withHarness(async h => {
+  const { jobId, lead, hedge } = await bothResting(h, 2_000);
   h.binance.inject({ operation: 'cancel', mode: 'reject', times: 100, clientOrderId: hedge.request.clientOrderId });
-  // The lead's first two cancels are refused too; its third goes through.
-  h.binance.inject({ operation: 'cancel', mode: 'reject', times: 2, clientOrderId: lead.request.clientOrderId });
-  let leadStillResting = false;
+  if (via === 'stop') {
+    // The hedge's chase timed out and three of its cancels were refused when the stop comes: its cancels run out before the lead's.
+    for (let i = 0; i < 20 && hedgeCancels(h, hedge.request.clientOrderId) < 3; i++) await tick(h, 5_000);
+    assert.equal(hedgeCancels(h, hedge.request.clientOrderId), 3);
+    h.ex.requestStop(jobId, randomUUID(), SESSION);
+  }
+  // The lead's first cancels are refused too; a later one goes through.
+  h.binance.inject({ operation: 'cancel', mode: 'reject', times: via === 'stop' ? 3 : 2, clientOrderId: lead.request.clientOrderId });
+  let waitedForLead = false;
   for (let i = 0; i < 40 && h.ex.jobView(jobId).status !== 'attention'; i++) {
     await tick(h, 5_000);
-    if (h.ex.jobView(jobId).status !== 'attention' && h.ex.jobView(jobId).legs[0]!.operation) leadStillResting ||= lead.status === 'new' || lead.status === 'partially-filled';
+    const view = h.ex.jobView(jobId);
+    // The hedge's cancels have run out while the lead's are still refused: the job waits for the lead.
+    if (view.status !== 'attention' && lead.status !== 'canceled' && hedgeCancels(h, hedge.request.clientOrderId) >= 5) waitedForLead = true;
   }
   const view = h.ex.jobView(jobId);
   assert.equal(view.status, 'attention', view.reason ?? '');
-  assert.ok(leadStillResting, '首腿撤单前两次被拒，曾仍挂着');
+  assert.ok(waitedForLead, '对冲撤单用尽时首腿仍在撤，任务等首腿');
   assert.equal(lead.status, 'canceled', '转人工前首腿已撤销');
   assert.match(view.reason ?? '', /撤单 \d+ 次仍未确认/);
   assert.ok(['new', 'partially-filled'].includes(hedge.status), `对冲挂单仍在，交人工核对：${hedge.status}`);
   assert.equal(ordersOf(h.binance, 'CLUSDT').length, 1, '首腿没有重挂');
+}));
+
+test('对冲挂单撤单用尽、首腿撤单一直发不出去：等待有上限，到时转人工', () => withHarness(async h => {
+  const { jobId, lead, hedge } = await bothResting(h, 2_000);
+  h.binance.inject({ operation: 'cancel', mode: 'reject', times: 1_000, clientOrderId: hedge.request.clientOrderId });
+  h.binance.inject({ operation: 'cancel', mode: 'not-sent', times: 1_000, clientOrderId: lead.request.clientOrderId });
+  const start = h.clock.now;
+  for (let i = 0; i < 100 && h.ex.jobView(jobId).status !== 'attention'; i++) await tick(h, 5_000);
+  const view = h.ex.jobView(jobId);
+  assert.equal(view.status, 'attention', view.reason ?? '');
+  assert.match(view.reason ?? '', /撤单 \d+ 次仍未确认/);
+  assert.notEqual(lead.status, 'canceled', '首腿撤单从未发出');
+  // cancelAttempts × cancelRetryMs + unresolvedGraceMs after the hedge's last cancel, well before the 600 s deadline.
+  assert.ok(h.clock.now - start < 300_000, `等待 ${h.clock.now - start} 毫秒`);
 }));

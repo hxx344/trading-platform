@@ -1889,10 +1889,13 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     job = readJob(job.id);
     const deviation = job.leadDeviation ?? null;
     if (FINAL_JOB.has(job.status)) return;
-    // A chasing hedge's post whose cancels ran out holds the lead back (below); its lead order is withdrawn and settles first, so the job
-    // does not go to a person while that lead may still fill. The lead's own cancels are bounded the same way.
-    const leadUnsettled = !!job.leadWithdraw && opsOf(job.id).some(item => item.leg === 0 && !SETTLED.has(item.state));
-    const exhausted = opsOf(job.id).find(item => item.state === 'open' && wantsStop(item, withdraw) && !(leadUnsettled && isPostedHedge(item)) && item.cancelSent >= budgets.cancelAttempts && item.cancelRequestedAt !== null && now() - item.cancelRequestedAt >= budgets.cancelRetryMs);
+    // A chasing hedge's post whose cancels ran out waits while a lead order is still being withdrawn, so the job does not go to a
+    // person while that lead may still fill; the lead's own cancels are bounded by the same check. The wait itself is bounded too
+    // (a cancel that is never sent does not count), after which the post goes to a person whatever the lead's state.
+    const leadUnsettled = withdraw && opsOf(job.id).some(item => item.leg === 0 && !isStrategy(item) && !SETTLED.has(item.state));
+    const leadWait = budgets.cancelAttempts * budgets.cancelRetryMs + budgets.unresolvedGraceMs;
+    const exhausted = opsOf(job.id).find(item => item.state === 'open' && wantsStop(item, withdraw) && item.cancelSent >= budgets.cancelAttempts && item.cancelRequestedAt !== null
+      && now() - item.cancelRequestedAt >= (leadUnsettled && isPostedHedge(item) ? Math.max(budgets.cancelRetryMs, leadWait) : budgets.cancelRetryMs));
     if (exhausted) { write(() => finish(readJob(job.id), 'attention', `${withdrawnFor(job)}撤单 ${exhausted.cancelSent} 次仍未确认，委托可能仍在挂单；需人工核对`)); return; }
     // A refusal caused by this order's own unknown cancel clears once that cancel's window has passed, so the grace counts from then;
     // like every grace here it starts no earlier than this writer's takeover.
@@ -2191,8 +2194,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     let misses = 0;
     for (const item of [...hedges].reverse()) { if (!isPostedHedge(item) || !missed(item)) break; misses += 1; }
     // The job's order limit keeps room for the market orders that hedge the rest.
-    // At least one post is allowed when the limit is configured below the market attempts.
-    return timedOut || misses >= budgets.chaseFailureLimit || hedges.length >= Math.max(1, budgets.chaseOrderLimit - budgets.hedgeAttempts);
+    // A limit configured at or below the market attempts leaves no room to post: the hedge goes straight to market.
+    return timedOut || misses >= budgets.chaseFailureLimit || hedges.length >= budgets.chaseOrderLimit - budgets.hedgeAttempts;
   }
 
   /**

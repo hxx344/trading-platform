@@ -35,5 +35,6 @@ export function createOndoMarketMaker(options: {
   log?: { info(...args: unknown[]): void; warn(...args: unknown[]): void; error(...args: unknown[]): void; debug?(...args: unknown[]): void };
   now?: () => number; monotonicNow?: () => number; intervalMs?: number; fetchImpl?: typeof fetch; WebSocketImpl?: unknown;
   clientFactory?: (options: Record<string, unknown>) => unknown; streamFactory?: import('./stream.mjs').OndoStreamFactory;
+  topStreamFactory?: import('./stream.mjs').OndoTopStreamFactory | null;
   sleep?: (ms: number) => Promise<void>;
 }): OndoMarketMaker;

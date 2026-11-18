@@ -123,6 +123,17 @@ export function assessQuote(side, price, ref, ext, tick, config, limit) {
   return { keep: true, bps: range.bps(price), protection };
 }
 
+// 本服务：what the best bid and ask alone can say about a resting quote. 'unprotected' when
+// nothing rests at a better price on its side, 'too_close' when it is nearer the mid than
+// `min` bps, null when the top gives no reason to withdraw it.
+export function assessTop(side, price, top, min) {
+  const bid = top.bids[0]?.[0], ask = top.asks[0]?.[0], buy = side === 'buy';
+  const best = buy ? bid : ask;
+  if (best === undefined || (buy ? best <= price : best >= price)) return 'unprotected';
+  if (bid === undefined || ask === undefined || bid >= ask) return null;
+  const mid = bid + ask, distance = buy ? mid - 2n * price : 2n * price - mid;
+  return distance * BPS * SCALE < min * mid ? 'too_close' : null;
+}
 // A reduce-only close joins the best external price on its side and never crosses.
 export function closePrice(side, ext, tick) {
   const bid = ext.bids[0]?.[0], ask = ext.asks[0]?.[0];

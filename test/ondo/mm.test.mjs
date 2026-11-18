@@ -7,7 +7,7 @@ import { join } from 'node:path';
 // readCredentials (secrets.json here) instead of setKey/clearKey; the order prefix is tpo- and the workbench's omm- orders
 // are left alone; the workbench route test is replaced by test/ondo-service.test.ts.
 import { createOndoMarketMaker, ONDO_MM_DEFAULTS, validateOndoMmConfig } from '../../src/vendor/ondo/mm.mjs';
-import { OndoError } from '../../src/vendor/ondo/client.mjs';
+import { createOndoClient, OndoError } from '../../src/vendor/ondo/client.mjs';
 import { decimalUnits as u } from '../../src/vendor/ondo/decimal.mjs';
 
 const silent = { info() {}, warn() {}, error() {}, debug() {} };
@@ -20,8 +20,8 @@ const BIDS = [['200.00', '10'], ['199.98', '20'], ['199.95', '100']], ASKS = [['
 
 function fixture(options = {}) {
   const dataDir = options.dataDir ?? mkdtempSync(join(tmpdir(), 'ondo-mm-'));
-  const f = { dataDir, key: options.key ?? null, time: EPOCH, maintenance: false, admission: true, privateReady: true, stream: null, streamClosed: 0, book: null, frozen: false };
-  const v = { orders: [], history: new Map(), positions: new Map(), entries: new Map(), calls: [], seq: 0, cooldown: 0, onPlace: null, cancelError: null, readError: null,
+  const f = { dataDir, key: options.key ?? null, time: EPOCH, maintenance: false, admission: true, privateReady: true, stream: null, streamClosed: 0, top: null, topClosed: 0, book: null, frozen: false };
+  const v = { orders: [], history: new Map(), positions: new Map(), entries: new Map(), calls: [], cancelTurns: [], turn: 0, seq: 0, cooldown: 0, onPlace: null, cancelError: null, readError: null,
     rules: new Map([[MARKET, { tick: '0.01', step: '0.01', trading: true }]]) };
   const count = name => v.calls.filter(call => call[0] === name).length;
   const clientFactory = () => ({
@@ -39,6 +39,8 @@ function fixture(options = {}) {
     },
     async cancel(id) {
       v.calls.push(['cancel', id]);
+      v.cancelTurns.push(v.turn); queueMicrotask(() => { v.turn += 1; });
+      if (v.cancelGate) await v.cancelGate;
       if (v.cancelError) throw v.cancelError;
       const index = v.orders.findIndex(order => order.id === id);
       if (index < 0) throw new OndoError('order_not_found', { status: 400 });
@@ -52,8 +54,10 @@ function fixture(options = {}) {
     async positions({ details = false } = {}) { v.calls.push(['positions']); await v.positionsGate; if (v.positionsError) throw v.positionsError;
       if (details) return new Map([...v.positions].map(([name, size]) => [name, { size, entryPrice: v.entries.get(name) ?? '200' }]));
       const snapshot = new Map(v.positions); v.afterPreflight?.(); return snapshot; },
+    batchCancels: () => v.batching !== false,
     close() {},
   });
+  const topStreamFactory = input => { f.top = input; return { start() { f.topStarted = true; }, close() { f.topClosed += 1; }, status: () => ({ connected: true, ready: true, lastFrameAt: f.time, error: null }) }; };
   const streamFactory = input => {
     f.stream = input;
     return { start() {}, close() { f.streamClosed += 1; },
@@ -61,10 +65,11 @@ function fixture(options = {}) {
       status: () => ({ connected: true, publicReady: true, privateReady: !!input.credentials && f.privateReady,
         deadManReady: !!input.credentials && f.deadManReady !== false, lastFrameAt: f.time, error: null }) };
   };
-  const mm = createOndoMarketMaker({ dataDir, readCredentials: () => f.key, log: silent, now: () => f.time, monotonicNow: () => f.time - EPOCH, intervalMs: 0, clientFactory, streamFactory,
+  const mm = createOndoMarketMaker({ dataDir, readCredentials: () => f.key, log: silent, now: () => f.time, monotonicNow: () => f.time - EPOCH, intervalMs: 0, clientFactory, streamFactory, topStreamFactory,
     readMaintenance: () => f.maintenance, readAdmission: () => f.admission, sleep: async ms => { f.time += ms; }, ...options.manager });
   const levels = rows => rows.map(([price, size]) => [u(price), u(size)]);
   f.push = (bids = BIDS, asks = ASKS, source = f.time) => { f.book = [bids, asks]; f.stream.onBook(MARKET, { time: source, bids: levels(bids), asks: levels(asks) }, f.time); };
+  f.topPush = (bids, asks, source = f.time) => f.top.onTop(MARKET, { time: source, bids: levels(bids), asks: levels(asks) }, f.time);
   f.rounds = async (n = 1, ms = 300) => { for (let i = 0; i < n; i++) { f.time += ms; if (f.book && !f.frozen) f.push(...f.book); await mm.tick(); } };
   f.resting = () => v.orders.map(order => `${order.side} ${order.size}@${order.price}${order.reduceOnly ? ' close' : ''}`).sort();
   f.live = async (extra = {}) => {
@@ -1104,4 +1109,144 @@ test('an unknown placement whose lookup keeps failing is dropped once account re
   assert.ok(count('lookup') > 3);
   assert.deepEqual(f.resting(), ['buy 0.5@199.93', 'sell 0.49@200.11']);
   assert.equal((await mm.stop()).phase, 'stopped');
+});
+
+test('withdrawals due together are requested in the same turn, before any of them is answered', async () => {
+  const turn = () => new Promise(resolve => setImmediate(resolve));
+  for (const path of ['decision', 'hold']) {
+    const { f, v, mm, count } = fixture();
+    await f.live({ dwellMs: 0 });
+    await f.rounds(4);
+    let release;
+    v.cancelGate = new Promise(resolve => { release = resolve; });
+    f.time += 300;
+    // The sell keeps its wall but is one bp from the mid (urgent); the buy is merely far.
+    if (path === 'decision') f.push([['200.08', '10']], [['200.10', '10'], ['200.12', '10']]);
+    else { f.push(); f.maintenance = true; }
+    assert.equal(count('cancel'), 0, path);
+    const tick = mm.tick(); await turn();
+    assert.equal(count('cancel'), 2, path); assert.equal(count('place'), 2, path);
+    // No microtask ran between the two requests, so the client can send them as one batch.
+    assert.equal(v.cancelTurns.at(-1), v.cancelTurns.at(-2), path);
+    release(); await tick;
+    assert.equal(v.orders.length, path === 'decision' ? 2 : 0, path);
+  }
+});
+
+test('a newer best price with nothing in front withdraws that opening order at once; the side waits for a depth as new', async () => {
+  const { f, v, mm, count } = fixture();
+  await f.live({ dwellMs: 60_000 });
+  assert.equal(f.topStarted, true);
+  const buy = v.orders.find(order => order.side === 'buy'), sell = v.orders.find(order => order.side === 'sell');
+  const depthAt = f.time; f.frozen = true; f.time += 50;
+  const bare = [['199.93', '5']];
+  // Not newer than the depth, a clock more than 1.5 s away, or an unreadable row: nothing happens.
+  f.topPush(bare, ASKS, depthAt); f.topPush(bare, ASKS, f.time + 1501); f.top.onTop(MARKET, null, f.time);
+  // A better price still rests in front and the mid is far enough.
+  f.topPush([['199.94', '0.01'], ['199.93', '5']], ASKS, depthAt + 10);
+  assert.equal(count('cancel'), 0);
+  f.topPush(bare, ASKS);
+  assert.deepEqual(v.calls.filter(([method]) => method === 'cancel').map(([, id]) => id), [buy.id]);
+  const top = f.time;
+  // The old depth still shows the wall: it must not put the quote straight back.
+  f.time += 100; await mm.tick();
+  assert.equal(f.market().lastCancel, 'unprotected'); assert.equal(f.market().buy.reason, 'awaiting_depth');
+  f.time += 100; f.push(BIDS, ASKS, top - 20); await mm.tick();
+  assert.equal(f.market().buy.reason, 'awaiting_depth'); assert.equal(count('place'), 2);
+  assert.ok(v.orders.some(order => order.id === sell.id));
+  f.time += 100; f.push(BIDS, ASKS, top); await mm.tick();
+  assert.equal(count('place'), 3); assert.deepEqual(f.resting(), ['buy 0.5@199.93', 'sell 0.49@200.11']);
+  assert.equal(mm.state().events.filter(event => event.text.startsWith('最优价提前撤单')).length, 1);
+  await mm.stop();
+  assert.equal(f.topClosed, 1);
+});
+
+test('a best price that leaves the quote too close withdraws it, and the wait for depth ends after 1.5 s', async () => {
+  const { f, v, mm, count } = fixture();
+  await f.live({ dwellMs: 60_000 });
+  const buy = v.orders.find(order => order.side === 'buy');
+  let source = f.time; f.frozen = true; f.time += 50;
+  // Mid 199.97: the buy at 199.93 is 2 bps away behind a better bid; the sell is far and has asks in front.
+  f.topPush([['199.96', '10']], [['199.98', '10']], f.time + 1400);
+  assert.deepEqual(v.calls.filter(([method]) => method === 'cancel').map(([, id]) => id), [buy.id]);
+  const at = f.time;
+  // Depth keeps arriving with venue times that never reach the top's.
+  while (f.time + 300 < at + 1500) { f.time += 300; f.push(BIDS, ASKS, ++source); await mm.tick(); }
+  assert.equal(f.market().lastCancel, 'too_close'); assert.equal(f.market().buy.reason, 'awaiting_depth'); assert.equal(count('place'), 2);
+  f.time = at + 1500; f.push(BIDS, ASKS, ++source); await mm.tick();
+  assert.equal(count('place'), 3);
+});
+
+test('the top of book is not used while observing, and a failing top socket cannot stop a live session', async () => {
+  const observing = fixture();
+  observing.mm.initialize(); observing.mm.save(config({ mode: 'observe' }));
+  await observing.mm.start({ revision: observing.mm.state().revision });
+  assert.equal(observing.f.top, null);
+  const { f, v, mm } = fixture({ manager: { topStreamFactory() { throw new Error('unsupported'); } } });
+  await f.live();
+  assert.equal(v.orders.length, 2); assert.equal(mm.state().stream.publicReady, true);
+  // Losing batch cancels is reported once.
+  v.batching = false; await f.rounds(2);
+  assert.equal(mm.state().events.filter(event => event.text.includes('逐笔撤单')).length, 1);
+});
+
+test('through the real client: a batch reply that omits one order leaves that order unknown until it is looked up, and nothing is resent', async () => {
+  const requests = [], venue = { orders: [], history: new Map(), seq: 0, listed: side => side === 'buy' };
+  const reply = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+  const ok = result => reply({ success: true, result });
+  const take = id => { const index = venue.orders.findIndex(order => order.orderId === id); const [order] = venue.orders.splice(index, 1); const done = { ...order, status: 'canceled' }; venue.history.set(done.clientOrderId, done); return done; };
+  const fetchImpl = async (url, init) => {
+    const path = url.replace('https://api.ondoperps.xyz', '');
+    requests.push(`${init.method} ${path}`);
+    if (path === '/v1/markets') return ok({ perps: { tradingPairs: [{ market: MARKET, quoteIncrement: '0.01', baseIncrement: '0.01', tradingState: 'TRADING' }] } });
+    if (path.startsWith('/v1/perps/orders?')) return ok(venue.orders);
+    if (path === '/v1/perps/positions') return ok([]);
+    if (init.method === 'POST') {
+      const body = JSON.parse(init.body);
+      const order = { orderId: `v${++venue.seq}`, clientOrderId: body.clientOrderId, market: body.market, side: body.side, price: body.price, size: body.size, filledSize: '0', status: 'open', reduceOnly: body.reduceOnly };
+      venue.orders.push(order);
+      return ok(order);
+    }
+    if (path.startsWith('/v1/perps/orders/batch?orderIDs=')) {
+      const done = path.split('=')[1].split(',').map(take);
+      return ok({ successfulCancels: done.filter(order => venue.listed(order.side)), failedCancels: [] });
+    }
+    if (path.startsWith('/v1/perps/orders/client:')) {
+      const found = venue.history.get(path.split('client:')[1]);
+      return found ? ok(found) : reply({ success: false, error_code: 'order_not_found' }, 404);
+    }
+    throw new Error(`unexpected ${init.method} ${path}`);
+  };
+  const { f, mm } = fixture({ manager: { clientFactory: options => createOndoClient({ ...options, fetchImpl }) } });
+  await f.live({ rps: 10 });
+  assert.equal(venue.orders.length, 2);
+  const ids = venue.orders.map(order => order.orderId);
+  f.maintenance = true; f.time += 300; f.push(); await mm.tick();
+  const deletes = () => requests.filter(line => line.startsWith('DELETE'));
+  assert.deepEqual(deletes(), [`DELETE /v1/perps/orders/batch?orderIDs=${ids.join(',')}`]);
+  assert.equal(f.market().buy.state, 'none'); assert.equal(f.market().sell.state, 'unknown');
+  const before = requests.length;
+  f.maintenance = false; await f.rounds(6, 400);
+  // The omitted order was read by its client id, found canceled, and only then was the market quoted again.
+  assert.ok(requests.slice(before).some(line => line.startsWith('GET /v1/perps/orders/client:')));
+  assert.equal(deletes().length, 1);
+  assert.equal(venue.orders.length, 2); assert.equal(mm.state().incident, null);
+  const lookup = requests.findIndex((line, index) => index >= before && line.startsWith('GET /v1/perps/orders/client:'));
+  assert.ok(!requests.slice(before, lookup).some(line => line.startsWith('POST')));
+  await mm.stop();
+});
+
+test('an early withdrawal the venue refuses stays due: the order is withdrawn again after the backoff and never kept', async () => {
+  const { f, v, mm, count } = fixture();
+  await f.live({ dwellMs: 60_000 });
+  const buy = v.orders.find(order => order.side === 'buy');
+  v.cancelError = new OndoError('order_not_in_cancelable_state', { status: 400 });
+  f.time += 50; f.topPush([['199.93', '5']], ASKS);
+  assert.equal(count('cancel'), 1);
+  // The depth shows the wall again, which must not rescue an order already marked.
+  await f.rounds(2, 300);
+  assert.equal(count('cancel'), 1); assert.ok(v.orders.some(order => order.id === buy.id));
+  v.cancelError = null; await f.rounds(3, 300);
+  assert.equal(count('cancel'), 2); assert.ok(!v.orders.some(order => order.id === buy.id));
+  assert.equal(mm.state().markets[0].lastCancel, 'unprotected');
 });

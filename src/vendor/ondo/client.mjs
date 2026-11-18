@@ -13,6 +13,9 @@ const CODE = /^[A-Za-z0-9_]{1,64}$/;
 // A cancel waits out a cooldown only up to this long: a resting quote must not sit out five minutes.
 const CANCEL_MAX_WAIT_MS = 15_000;
 const ID = /^[A-Za-z0-9_-]{1,64}$/;
+const BATCH_MAX = 20;
+// A refusal of the whole batch with one of these codes describes a single order in it.
+const ITEM_REFUSALS = new Set(['order_already_canceled', 'order_already_cancelled', 'order_already_fully_filled', 'order_already_filled', 'order_not_found', 'order_not_in_cancelable_state', 'order_not_in_cancellable_state', 'trading_disabled']);
 export const ONDO_MARKET = /^[A-Z0-9]{1,16}-USD\.P$/;
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
@@ -103,9 +106,11 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
   }
   async function request(method, path, { body, auth = true, urgent = false, write = false, cancel = false, canSend, timing } = {}, resigned = false) {
     refuse(cancel);
-    const queued = timing && sample(latency.stamp);
+    // A batch cancel carries one timing per order; the queue wait is sampled once per market.
+    const timings = !timing ? [] : Array.isArray(timing) ? timing : [timing];
+    const queued = timings.length ? sample(latency.stamp) : null;
     const granted = await slot(urgent, !!queued);
-    if (queued) sample(latency.elapsed, timing.market, 'restQueue', queued, granted);
+    if (queued) for (const name of new Set(timings.map(item => item.market))) sample(latency.elapsed, name, 'restQueue', queued, granted);
     refuse(cancel);
     const text = body === undefined ? '' : JSON.stringify(body);
     const headers = { Accept: 'application/json', ...(text ? { 'Content-Type': 'application/json' } : {}) };
@@ -120,7 +125,7 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
     const deadline = setTimeoutImpl(() => controller.abort(), timeoutMs);
     let response, payload = null;
     try {
-      if (timing) timing.sent = sample(latency.stamp);
+      if (timings.length) { const sent = sample(latency.stamp); for (const item of timings) item.sent = sent; }
       response = await fetchImpl(BASE + path, { method, headers, ...(text ? { body: text } : {}), signal: controller.signal, redirect: 'error', cache: 'no-store' });
       try { payload = await readJsonResponse(response, { maxBytes: MAX_BYTES, signal: controller.signal }); }
       catch (error) { if (error?.code === 'aborted' || controller.signal.aborted) throw error; }
@@ -138,7 +143,7 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
       const date = Date.parse(response.headers?.get?.('date') ?? '');
       if (Number.isFinite(date)) {
         offset = date - now();
-        if (timing) { finishAck(timing, false); timing.retried = true; }
+        for (const item of timings) { finishAck(item, false); item.retried = true; }
         return request(method, path, { body, auth, urgent, write, cancel, canSend, timing }, true);
       }
     }
@@ -160,6 +165,84 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
   }
 
   const id = value => { if (typeof value !== 'string' || !ID.test(value)) throw new TypeError('Invalid Ondo order id'); return value; };
+  const canceledOrder = (result, orderId, expected) => {
+    const order = orderOf(result, { ...expected, id: orderId });
+    if (!['canceled', 'fullyfilled'].includes(order.status)) throw invalid();
+    return order;
+  };
+  const cancelOne = (orderId, expected) => writeOrder('DELETE', `/v1/perps/orders/${orderId}`, { urgent: true, cancel: true }, expected?.market, 'canceled',
+    result => canceledOrder(result, orderId, expected));
+
+  // 本服务：cancels requested in the same turn travel as one DELETE /v1/perps/orders/batch and
+  // spend one token. Each order still gets its own answer: its terminal report, the venue's
+  // coded refusal, or "unknown" when the batch reply does not account for it.
+  let waiting = [], batching = true;
+  const unknown = () => new OndoError('invalid_data', { status: 200, uncertain: true });
+  async function cancelBatch(items) {
+    const single = item => cancelOne(item.orderId, item.expected).then(item.resolve, item.reject);
+    const settle = (item, error, order) => {
+      const confirmed = !error && cleanOrderAck(order, 'canceled');
+      if (order && item.timing?.retried) markRetriedReport(order);
+      finishAck(item.timing, confirmed);
+      if (error) item.reject(error); else item.resolve(order);
+    };
+    let result;
+    try {
+      result = (await request('DELETE', `/v1/perps/orders/batch?orderIDs=${items.map(item => item.orderId).join(',')}`,
+        { urgent: true, cancel: true, write: true, timing: items.map(item => item.timing).filter(Boolean) })).result;
+    } catch (error) {
+      const refused = error instanceof OndoError && !error.uncertain && error.status >= 400 && error.status < 500
+        && ![401, 403, 429].includes(error.status) && !error.code.includes('timestamp');
+      if (!refused) {
+        // A 2xx that is not a batch result names no order: a code in it cannot stand as every order's answer.
+        const vague = error instanceof OndoError && error.status !== null && error.status < 400;
+        if (vague) batching = false;
+        for (const item of items) settle(item, vague && !error.uncertain ? unknown() : error);
+        return;
+      }
+      // The venue names one order's state for the whole batch, or does not take batches at all.
+      // Either way nothing is known per order: ask again one by one, which is safe to repeat.
+      if (!ITEM_REFUSALS.has(error.code)) batching = false;
+      for (const item of items) { finishAck(item.timing, false); void single(item); }
+      return;
+    }
+    const lists = object(result) && Array.isArray(result.successfulCancels) && Array.isArray(result.failedCancels);
+    if (!lists) batching = false;
+    const rows = new Map();
+    if (lists) for (const [list, done] of [[result.successfulCancels, true], [result.failedCancels, false]]) for (const row of list) {
+      const key = object(row) ? row.orderId : undefined;
+      if (typeof key === 'string') rows.set(key, rows.has(key) ? null : { row, done });
+    }
+    for (const item of items) {
+      const found = rows.get(item.orderId);
+      if (!found) { settle(item, unknown()); continue; }
+      if (found.done) {
+        let order;
+        try { order = canceledOrder(found.row, item.orderId, item.expected); } catch { settle(item, unknown()); continue; }
+        settle(item, null, order);
+      } else {
+        const code = typeof found.row.errorCode === 'string' && CODE.test(found.row.errorCode) ? found.row.errorCode.toLowerCase() : null;
+        settle(item, code ? new OndoError(code, { status: 200 }) : unknown());
+      }
+    }
+  }
+  function flushCancels() {
+    const items = waiting; waiting = [];
+    const single = item => { cancelOne(item.orderId, item.expected).then(item.resolve, item.reject); };
+    const seen = new Set(), unique = [], repeated = [];
+    for (const item of items) {
+      if (!batching || seen.has(item.orderId)) repeated.push(item);
+      else { seen.add(item.orderId); unique.push(item); }
+    }
+    for (let i = 0; i < unique.length; i += BATCH_MAX) {
+      const chunk = unique.slice(i, i + BATCH_MAX);
+      if (chunk.length === 1) { single(chunk[0]); continue; }
+      for (const item of chunk) item.timing = latency && item.expected?.market ? { market: item.expected.market, metric: 'cancelAck' } : null;
+      void cancelBatch(chunk);
+    }
+    // An id asked for twice in one turn cannot share a batch with itself.
+    repeated.forEach(single);
+  }
   const market = value => { if (typeof value !== 'string' || !ONDO_MARKET.test(value)) throw new TypeError('Invalid Ondo market'); return value; };
   return {
     cooldownUntil: () => cooldownUntil,
@@ -197,12 +280,14 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
     },
     /** A mismatched or nonterminal cancel reply leaves the outcome unknown. */
     async cancel(orderId, expected = {}) {
-      return writeOrder('DELETE', `/v1/perps/orders/${id(orderId)}`, { urgent: true, cancel: true }, expected?.market, 'canceled', result => {
-        const order = orderOf(result, { ...expected, id: orderId });
-        if (!['canceled', 'fullyfilled'].includes(order.status)) throw invalid();
-        return order;
+      id(orderId);
+      if (!batching) return cancelOne(orderId, expected);
+      return new Promise((resolve, reject) => {
+        if (waiting.push({ orderId, expected, resolve, reject }) === 1) queueMicrotask(flushCancels);
       });
     },
+    /** 本服务：false once the venue refused a batch cancel or answered it in an unexpected shape; cancels then go one by one. */
+    batchCancels: () => batching,
     /** The order with this client id, or null when the venue has none. */
     async orderByClientId(clientOrderId, expected = {}) {
       try { return orderOf((await request('GET', `/v1/perps/orders/client:${id(clientOrderId)}`, { urgent: true })).result, { ...expected, clientId: clientOrderId }); }

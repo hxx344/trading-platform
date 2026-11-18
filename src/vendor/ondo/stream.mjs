@@ -10,6 +10,7 @@ const MAX_LEVELS = 200;
 const CONNECT_MS = 8000, LOGIN_MS = 8000;
 const PING_MS = 5000, SILENCE_MS = 15_000;
 const DEAD_MAN = 'cancelAllOrdersAfterPerps', DEAD_MAN_SECONDS = 30;
+const TOP = 'topOfBooksPerps', STEADY_MS = 10_000;
 const RETRY_MS = [1000, 2000, 4000, 8000, 15_000, 30_000], AUTH_RETRY_MS = 60_000;
 const PRIVATE = ['ordersPerps', 'fillsPerps', 'positionsPerps'];
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -235,5 +236,85 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
       clearTimers();
       try { old?.close(); } catch { /* already unusable */ }
     },
+  };
+}
+
+// 本服务：a second socket that never logs in, for topOfBooksPerps alone. The venue publishes the
+// best bid and ask ahead of the depth snapshots, so a newer top can withdraw a quote early
+// (mm.mjs). It carries no heartbeat for the account: when it is down or silent nothing is
+// reported but onState(false), and the depth socket keeps deciding on its own. Reopened after 1-30 s.
+export function createOndoTopStream({ markets, onTop, onState = () => {}, WebSocketImpl = globalThis.WebSocket, now = Date.now,
+  setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout } = {}) {
+  const wanted = new Set(markets);
+  let socket = null, era = 0, closed = false, started = false, failures = 0, lastFrame = 0, error = null, open = false, ready = false, steady = false;
+  const timers = new Set();
+  function schedule(fn, ms) {
+    const timer = setTimeoutImpl(() => { timers.delete(timer); fn(); }, ms);
+    timers.add(timer); timer?.unref?.();
+  }
+  function drop(reason) {
+    const old = socket, wasSteady = steady;
+    era += 1; socket = null; open = false; ready = false; steady = false; error = reason;
+    for (const timer of timers) clearTimeoutImpl(timer);
+    timers.clear();
+    try { old?.close(); } catch { /* already unusable */ }
+    if (wasSteady && !closed) sample(onState, false);
+  }
+  function fail(reason) {
+    drop(reason);
+    if (closed) return;
+    schedule(connect, RETRY_MS[Math.min(failures, RETRY_MS.length - 1)]);
+    failures += 1;
+  }
+  function receive(data) {
+    const raw = typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
+    if (raw.length > MAX_BYTES) throw new Error('size');
+    const message = JSON.parse(raw);
+    if (!object(message)) throw new Error('shape');
+    lastFrame = now();
+    if (message.channel === TOP && message.type === 'subscribed') {
+      if (!ready) {
+        ready = true; error = null;
+        // A subscription the venue confirms and then drops must keep backing off and stay unreported.
+        schedule(() => { failures = 0; steady = true; sample(onState, true); }, STEADY_MS);
+      }
+    } else if (message.type === 'error' || (message.channel === TOP && message.type === 'unsubscribed')) fail('venue_error');
+    else if (message.type === 'update' && message.channel === TOP && ready) {
+      if (!Array.isArray(message.data)) throw new Error('shape');
+      for (const row of message.data) if (object(row) && wanted.has(row.market)) onTop(row.market, parseOndoBook(row), lastFrame);
+    }
+  }
+  function connect() {
+    if (closed || socket) return;
+    if (typeof WebSocketImpl !== 'function') { error = 'unsupported'; return; }
+    const current = ++era;
+    let ws;
+    try { ws = new WebSocketImpl(URL); } catch { fail('connect_failed'); return; }
+    socket = ws;
+    try { ws.binaryType = 'arraybuffer'; } catch { /* text frames only */ }
+    const active = () => socket === ws && current === era && !closed;
+    const send = value => { try { ws.send(JSON.stringify(value)); return true; } catch { fail('send_failed'); return false; } };
+    schedule(() => { if (active() && !ready) fail('connect_timeout'); }, CONNECT_MS);
+    ws.addEventListener('open', () => {
+      if (!active()) return;
+      open = true; lastFrame = now();
+      if (!send({ op: 'subscribe', channel: TOP, markets: [...wanted] })) return;
+      schedule(function beat() {
+        if (!active()) return;
+        if (now() - lastFrame >= SILENCE_MS) { fail('silent'); return; }
+        if (send({ op: 'ping' })) schedule(beat, PING_MS);
+      }, PING_MS);
+    });
+    ws.addEventListener('message', event => {
+      if (!active()) return;
+      try { receive(event.data); } catch { if (active()) fail('invalid_data'); }
+    });
+    ws.addEventListener('error', () => { if (active()) fail('socket_error'); });
+    ws.addEventListener('close', () => { if (active()) fail('disconnected'); });
+  }
+  return {
+    start() { if (!started && !closed) { started = true; connect(); } },
+    status: () => ({ connected: open, ready, lastFrameAt: lastFrame || null, error }),
+    close() { if (!closed) { closed = true; drop(error); } },
   };
 }

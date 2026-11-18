@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
-import { createOndoStream, parseOndoBook } from '../../src/vendor/ondo/stream.mjs';
+import { createOndoStream, createOndoTopStream, parseOndoBook } from '../../src/vendor/ondo/stream.mjs';
 import { createOndoLatency } from '../../src/vendor/ondo/latency.mjs';
 import { formatDecimalUnits as f } from '../../src/vendor/ondo/decimal.mjs';
 
@@ -310,4 +310,112 @@ test('a refused login waits a minute and never exposes the venue text', async ()
   await s.advance(8000);
   assert.equal(s.downs.at(-1), 'login_timeout');
   s.stream.close();
+});
+
+function topFixture() {
+  let time = EPOCH, nextTimer = 0;
+  const timers = new Map(), sockets = [], tops = [], states = [];
+  class Socket {
+    constructor(url) { this.url = url; this.sent = []; this.listeners = new Map(); this.closed = false; sockets.push(this); }
+    addEventListener(name, fn) { const list = this.listeners.get(name) ?? []; list.push(fn); this.listeners.set(name, list); }
+    emit(name, value) { for (const fn of this.listeners.get(name) ?? []) fn(value); }
+    send(text) { if (this.closed) throw new Error('closed'); this.sent.push(JSON.parse(text)); }
+    frame(value) { this.emit('message', { data: typeof value === 'string' ? value : JSON.stringify(value) }); }
+    close() { this.closed = true; this.emit('close', {}); }
+  }
+  const stream = createOndoTopStream({ markets: ['NVDA-USD.P'], WebSocketImpl: Socket, now: () => time,
+    setTimeoutImpl: (fn, ms) => { const id = ++nextTimer; timers.set(id, { fn, at: time + ms }); return id; }, clearTimeoutImpl: id => timers.delete(id),
+    onTop: (market, top, at) => tops.push({ market, top, at }), onState: ready => states.push(ready) });
+  async function advance(ms) {
+    const until = time + ms;
+    for (;;) {
+      const first = [...timers].filter(([, value]) => value.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
+      if (!first) break;
+      timers.delete(first[0]); time = first[1].at; first[1].fn(); await flush();
+    }
+    time = until;
+  }
+  const update = (extra = {}) => ({ type: 'update', channel: 'topOfBooksPerps', data: [{ market: 'NVDA-USD.P', time: new Date(time).toISOString(), asks: [['200.04', '10']], bids: [['200.00', '10']], ...extra }] });
+  return { stream, sockets, tops, states, advance, update };
+}
+
+test('本服务：the top-of-book stream subscribes without logging in and passes rows on only once confirmed', async () => {
+  const s = topFixture(); s.stream.start();
+  const socket = s.sockets[0];
+  assert.equal(socket.url, 'wss://api.ondoperps.xyz/ws');
+  socket.emit('open');
+  assert.deepEqual(socket.sent, [{ op: 'subscribe', channel: 'topOfBooksPerps', markets: ['NVDA-USD.P'] }]);
+  socket.frame(s.update());
+  assert.equal(s.tops.length, 0);
+  socket.frame({ type: 'subscribed', channel: 'topOfBooksPerps' }); socket.frame({ type: 'subscribed', channel: 'topOfBooksPerps' });
+  assert.deepEqual(s.stream.status(), { connected: true, ready: true, lastFrameAt: EPOCH, error: null });
+  socket.frame(s.update()); socket.frame(s.update({ market: 'TSLA-USD.P' })); socket.frame(s.update({ bids: [['200.04', '1']] }));
+  socket.frame({ type: 'update', channel: 'depthBooksPerps', data: s.update().data });
+  assert.equal(s.tops.length, 2);
+  assert.equal(f(s.tops[0].top.bids[0][0]), '200'); assert.equal(s.tops[0].at, EPOCH); assert.equal(s.tops[1].top, null);
+  // Readiness is reported once the subscription has held for ten seconds.
+  assert.deepEqual(s.states, []);
+  await s.advance(5000); socket.frame({ type: 'pong' }); await s.advance(5000);
+  assert.deepEqual(s.states, [true]);
+  s.stream.close();
+  // Closing is not a lost connection, and nothing is reopened.
+  assert.equal(socket.closed, true); assert.deepEqual(s.states, [true]);
+  await s.advance(120_000);
+  assert.equal(s.sockets.length, 1);
+});
+
+test('本服务：a silent or broken top-of-book connection is reported once and reopened; a flapping one backs off unreported', async () => {
+  const s = topFixture(); s.stream.start();
+  s.sockets[0].emit('open'); s.sockets[0].frame({ type: 'subscribed', channel: 'topOfBooksPerps' });
+  await s.advance(5000);
+  assert.deepEqual(s.sockets[0].sent.at(-1), { op: 'ping' });
+  s.sockets[0].frame({ type: 'pong' });
+  await s.advance(20_000);
+  assert.deepEqual(s.states, [true, false]); assert.equal(s.stream.status().error, 'silent'); assert.equal(s.sockets[0].closed, true);
+  await s.advance(1000);
+  assert.equal(s.sockets.length, 2);
+  // The venue confirms and at once refuses, drops or garbles the subscription, round after round.
+  const waits = [2000, 4000, 8000, 15_000, 30_000, 30_000];
+  const breaks = [socket => socket.frame({ type: 'error', msg: 'unknown market' }), socket => socket.close(), socket => socket.frame('not json'),
+    socket => socket.frame({ type: 'unsubscribed', channel: 'topOfBooksPerps' }), socket => socket.frame({ type: 'update', channel: 'topOfBooksPerps', data: {} }), socket => socket.close()];
+  for (const [index, wait] of waits.entries()) {
+    const socket = s.sockets.at(-1), count = s.sockets.length;
+    socket.emit('open'); socket.frame({ type: 'subscribed', channel: 'topOfBooksPerps' }); breaks[index](socket);
+    await s.advance(wait - 1); assert.equal(s.sockets.length, count, String(wait));
+    await s.advance(1); assert.equal(s.sockets.length, count + 1, String(wait));
+  }
+  assert.deepEqual(s.states, [true, false]);
+  // A connection that never opens is dropped after the connect timeout.
+  await s.advance(8000);
+  assert.equal(s.stream.status().error, 'connect_timeout');
+  await s.advance(30_000);
+  // Ten steady seconds reset the backoff and report readiness again.
+  const steady = s.sockets.at(-1), count = s.sockets.length;
+  steady.emit('open'); steady.frame({ type: 'subscribed', channel: 'topOfBooksPerps' });
+  await s.advance(5000); steady.frame({ type: 'pong' }); await s.advance(5000);
+  steady.close();
+  assert.deepEqual(s.states, [true, false, true, false]);
+  await s.advance(1000);
+  assert.equal(s.sockets.length, count + 1);
+  s.stream.close();
+});
+
+test('本服务：a consumer that throws on a top-of-book row only reopens this connection', async () => {
+  let time = EPOCH;
+  const sockets = [], timers = [];
+  class Socket {
+    constructor() { this.listeners = new Map(); this.closed = false; sockets.push(this); }
+    addEventListener(name, fn) { this.listeners.set(name, fn); }
+    send() {}
+    close() { this.closed = true; }
+  }
+  const stream = createOndoTopStream({ markets: ['NVDA-USD.P'], WebSocketImpl: Socket, now: () => time, setTimeoutImpl: (fn, ms) => { timers.push({ fn, ms }); return timers.length; }, clearTimeoutImpl() {},
+    onTop() { throw new Error('consumer'); } });
+  stream.start();
+  const frame = value => sockets[0].listeners.get('message')({ data: JSON.stringify(value) });
+  sockets[0].listeners.get('open')(); frame({ type: 'subscribed', channel: 'topOfBooksPerps' });
+  assert.doesNotThrow(() => frame({ type: 'update', channel: 'topOfBooksPerps', data: [{ market: 'NVDA-USD.P', time: new Date(time).toISOString(), bids: [['1', '1']], asks: [['2', '1']] }] }));
+  assert.equal(sockets[0].closed, true); assert.equal(stream.status().error, 'invalid_data');
+  assert.equal(timers.at(-1).ms, 1000);
+  stream.close();
 });

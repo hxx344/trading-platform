@@ -656,7 +656,6 @@ for (const [planned, skipped] of [['0', null], ['invalid', '0.1']] as const) {
     historical.legs[0].quantity = planned;
     if (skipped) historical.leadSkipped = { 0: skipped };
     h.store.db.prepare('UPDATE jobs SET json = ? WHERE id = ?').run(JSON.stringify(historical), ids[0]!);
-    if (planned === '0') assert.equal(h.ex.jobView(ids[0]!).legs[0]!.plannedQuantity, '0');
     const strategy = [...h.bybit.strategies.values()][0]!;
     h.bybit.fillStrategy(strategy.id, strategy.request.quantity);
     const [peer] = await settleAll(h, [ids[1]!]);
@@ -664,5 +663,118 @@ for (const [planned, skipped] of [['0', null], ['invalid', '0.1']] as const) {
     assert.deepEqual(peer.events.filter(event => event.type === 'four-leg-unbalanced').flatMap(event => event.details), [
       `SKHY 计划或成交数量无效，无法比较两所成交：Binance 2.42 / ${planned}，Bybit 2.4 / 2.4`,
     ]);
+    const listed = groupJobs(h.ex.recentJobs(1, 'hynix'))[0].jobs;
+    assert.deepEqual(groupStatus(listed).details, peer.events.find(event => event.type === 'four-leg-unbalanced')!.details);
   }));
 }
+
+for (const field of ['计划', '成交', '跳过量'] as const) {
+  test(`原油四腿旧任务：${field}损坏仍能结清健康对手、释放锁和读取整组`, () => withHarness(async h => {
+    const intent = fourIntent();
+    intent.legs[2].orderType = 'chase';
+    h.bybit.inject({ operation: 'strategy-place', mode: 'partial', filled: '0' });
+    const { ids } = await confirmFour(h, intent);
+    const [archived] = await settleAll(h, [ids[0]]);
+    assert.equal(archived.status, 'completed');
+    if (field === '成交') {
+      h.store.db.prepare("UPDATE operations SET json = json_set(json, '$.filledQuantity', 'broken') WHERE job_id = ? AND leg = 0").run(ids[0]);
+    } else if (field === '计划') {
+      h.store.db.prepare("UPDATE jobs SET json = json_set(json, '$.legs[0].quantity', 'broken') WHERE id = ?").run(ids[0]);
+    } else {
+      h.store.db.prepare("UPDATE jobs SET json = json_set(json, '$.leadSkipped', json(?)) WHERE id = ?").run(JSON.stringify({ 0: '0.03', 1: 'broken', 2: '-0.1' }), ids[0]);
+    }
+    const strategy = [...h.bybit.strategies.values()][0];
+    h.bybit.fillStrategy(strategy.id, field === '跳过量' ? '0.5' : '1');
+    if (field === '跳过量') h.advance(60_000);
+    const [healthy] = await settleAll(h, [ids[1]], 5);
+    assert.deepEqual([healthy.status, locks(h).length], ['completed', 0]);
+    const group = groupJobs(h.ex.recentJobs(20, 'oil'))[0].jobs;
+    const state = groupStatus(group);
+    assert.deepEqual(state.details, healthy.events.find(event => event.type === 'four-leg-unbalanced')!.details);
+    if (field === '跳过量') {
+      assert.equal(h.ex.jobView(ids[0]).leadSkipped, '0.03');
+      assert.equal(state.details.length, 2);
+      assert.ok(state.details.every(line => line.includes('两所成交不等')));
+    } else {
+      assert.equal(state.details.length, 1);
+      assert.match(state.details[0], /BZ 计划或成交数量无效，无法比较两所成交/);
+      if (field === '成交') assert.equal(group[0].legs[0].averagePrice, null);
+    }
+  }));
+}
+
+for (const kind of ['IOC', '原生追价'] as const) {
+  test(`四腿首笔${kind}应答即撤余：同一轮联动停止后处理的交易所，避免其发送首腿`, () => withHarness(async h => {
+    const intent = fourIntent();
+    if (kind === 'IOC') h.binance.inject({ operation: 'place', mode: 'partial', filled: '0.5' });
+    else {
+      intent.legs = [...intent.legs.slice(2), ...intent.legs.slice(0, 2)];
+      intent.legs[0].orderType = 'chase';
+      h.bybit.inject({ operation: 'strategy-place', mode: 'partial', filled: '0.5' });
+      const place = h.bybit.placeChase.bind(h.bybit);
+      h.bybit.placeChase = async (binding, request, options) => {
+        const ack = await place(binding, request, options);
+        await h.bybit.stopStrategy(binding, ack.strategyId, options);
+        return ack;
+      };
+    }
+    const { ids } = await confirmFour(h, intent);
+    await tick(h);
+    const why = `${kind === 'IOC' ? 'Binance' : 'Bybit'} 第 1 批首腿发出 1，成交 0.5`;
+    const other = kind === 'IOC' ? h.bybit : h.binance;
+    assert.deepEqual([h.ex.jobView(ids[0]).leadDeviation, h.ex.jobView(ids[1]).peerHalt, other.arrived.place], [why, why, 0]);
+    const [own, peer] = await settleAll(h, ids);
+    assert.deepEqual([own.status, own.legs[1].filledQuantity, peer.status, other.arrived.place], ['completed', '0.5', 'stopped', 0]);
+    assert.deepEqual([eventCount(h, 'four-leg-deviation'), eventCount(h, 'four-leg-halted'), eventCount(h, 'four-leg-unbalanced')], [1, 1, 1]);
+  }));
+}
+
+for (const peerSent of [true, false]) {
+  test(`四腿旧写者只落盘了首腿终态：对方${peerSent ? '已发' : '未发'}时接管补记单笔偏离，继续对冲实际成交`, () => withHarness(async h => {
+    const { ids } = await confirmFour(h);
+    const leadId = leadOrderId(ids[0], 0);
+    h.binance.inject({ operation: 'place', mode: 'partial', filled: '0.5', clientOrderId: leadId });
+    const place = h.binance.place.bind(h.binance);
+    h.binance.place = async (binding, request, options) => {
+      const report = await place(binding, request, options);
+      if (request.clientOrderId !== leadId) return report;
+      if (!peerSent) h.bybit.inject({ operation: 'quote', mode: 'read-fail' });
+      return { ...report, status: 'partially-filled', terminal: false };
+    };
+    await tick(h);
+    assert.equal(h.ex.jobView(ids[0]).leadDeviation, null);
+    // The old writer stored the venue's actual terminal report and stopped before its next progress pass.
+    h.store.db.prepare("UPDATE operations SET state = 'canceled', settled = 1, json = json_set(json, '$.state', 'canceled', '$.venueStatus', 'canceled') WHERE client_order_id = ?").run(leadId);
+    h.clock.now += 61_000; h.restart(); assert.equal(h.ex.acquire(), true);
+    const [own, peer] = await settleAll(h, ids);
+    const why = 'Binance 第 1 批首腿发出 1，成交 0.5';
+    assert.deepEqual([own.leadDeviation, own.legs[1].filledQuantity, peer.peerHalt, peer.legs[1].filledQuantity], [why, '0.5', why, peerSent ? '1' : '0']);
+    assert.equal(eventCount(h, 'four-leg-deviation'), 1);
+  }));
+}
+
+test('四腿首腿核对到累计 0.6 撤余的同一轮对冲核对超时：先登记单笔偏离，再保留人工处理及锁', () => withHarness(async h => {
+  const { ids } = await confirmFour(h);
+  const leadId = leadOrderId(ids[0], 0);
+  h.binance.inject({ operation: 'place', mode: 'partial', filled: '0.6', clientOrderId: leadId });
+  const place = h.binance.place.bind(h.binance);
+  h.binance.place = async (binding, request, options) => {
+    const report = await place(binding, request, options);
+    return request.clientOrderId === leadId ? { ...report, status: 'partially-filled', terminal: false, filledQuantity: '0.4' } : report;
+  };
+  await tick(h);
+  h.binance.inject({ operation: 'query', mode: 'read-fail', clientOrderId: leadId });
+  h.binance.inject({ operation: 'place', mode: 'lost-response' });
+  h.bybit.inject({ operation: 'place', mode: 'lost-response' });
+  await tick(h);
+  const [own, peer] = ids.map(id => h.ex.jobView(id));
+  assert.deepEqual([own.legs[0].filledQuantity, own.legs[1].operation!.state, own.leadDeviation], ['0.4', 'unknown', null]);
+  h.binance.inject({ operation: 'query', mode: 'read-fail', clientOrderId: own.legs[1].operation!.clientOrderId, times: 2 });
+  h.advance(190_000);
+  await tick(h);
+  const done = h.ex.jobView(own.id), why = 'Binance 第 1 批首腿发出 1，成交 0.6';
+  assert.deepEqual([done.status, done.locked, done.legs[0].filledQuantity, done.leadDeviation, h.ex.jobView(peer.id).peerHalt], ['attention', true, '0.6', why, why]);
+  assert.equal(h.ex.jobView(peer.id).legs[1].filledQuantity, '1');
+  await tick(h);
+  assert.deepEqual([eventCount(h, 'four-leg-deviation'), eventCount(h, 'four-leg-halted')], [1, 1]);
+}));

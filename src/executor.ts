@@ -2,7 +2,7 @@
 // database and only accepts simulated connectors, so it cannot take execution
 // rights over a real account (plan 1, 5.3, 8).
 import { createHash, randomUUID } from 'node:crypto';
-import { add, bandEdge, cmp, floorToStep, isMultiple, isZero, mul, sub, units, fromUnits } from './decimal.ts';
+import { add, bandEdge, cmp, DecimalError, floorToStep, isMultiple, isZero, mul, sub, units, fromUnits } from './decimal.ts';
 import {
   ContractError, HYNIX_SYMBOLS, MAX_SLIPPAGE_BPS, UUID, marketOfSymbol, MARKET_SYMBOLS, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, exactKeys, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseNotionalLimits, parseInstrument, parseIntent, parseFourLegIntent, parseQuote, positionOf, reject, text,
   type AccountBinding, type BatchIntent, type NotionalLimits, type AccountSnapshot, type Action, type Environment, type FourLegIntent, type Instrument, type LegOrderType, type Market, type OrderSide, type PairIntent, type PositionSide, type Quote, type RebalanceIntent, type TransferConfig, type Venue,
@@ -485,8 +485,15 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       if (op.state === 'prepared') { Object.assign(op, { state: 'not-sent', note: '恢复：落盘后、发送前中断，传输未调用' }); saveOp(op); event(op.jobId, 'operation-recovered', { op: op.id, state: op.state }); }
       else if (op.state === 'sending') { Object.assign(op, { state: 'unknown', note: isStrategy(op) ? `恢复：追价策略发送中断，结果未知；交易所无客户编号，需人工认领或确认未创建${ackHint(op)}` : '恢复：发送中断，结果未知，按原客户订单号核对' }); saveOp(op); event(op.jobId, 'operation-recovered', { op: op.id, state: op.state }); }
     }
-    // Read afresh each time: finishing one job of a four-leg group writes the other's linked halt (haltPeer).
-    for (const { id } of unfinishedJobs()) {
+    // Older writers persisted a terminal lead before its deviation. Recover it before failing an as-yet unsent peer.
+    const pending = unfinishedJobs();
+    for (const { id, group } of pending) {
+      if (!group) continue;
+      const job = readJob(id), why = shortLeadReason(job, legOps(id, 0));
+      if (why) noteDeviation(job, why);
+    }
+    // Finishing or halting one job may have changed its peer.
+    for (const { id } of pending) {
       const job = readJob(id);
       if (FINAL_JOB.has(job.status)) continue;
       if (job.status === 'accepted' && !opsOf(job.id).length) finish(job, 'failed', '服务重启时任务尚未发送，已取消；请重新预览');
@@ -557,6 +564,18 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
   /** What a local-chase lead of a four-leg job skipped by design, all batches together (leadSkipped). */
   const skippedOf = (job: Job): string => add('0', ...Object.values(job.leadSkipped ?? {}));
+  /** A terminal accepted lead that fell short by at least a whole order step. Local reposts account for their own batch. */
+  function shortLeadReason(job: Job, leads: readonly Operation[]): string | null {
+    if (!job.group || job.peerHalt || job.leadDeviation || job.legs[0].orderType === 'local-chase') return null;
+    const short = leads.find(item => (item.state === 'filled' || item.state === 'canceled') && cmp(sub(item.request.quantity, item.filledQuantity), job.legs[0].instrument.quantityStep) >= 0);
+    return short ? `${VENUE_NAMES[job.legs[0].venue]} 第 ${(short.batch ?? 0) + 1} 批首腿发出 ${short.request.quantity}，成交 ${short.filledQuantity}` : null;
+  }
+  /** Called inside the transaction applying the order/strategy report, before the scheduler can send the peer's lead. */
+  function noteReportedShortLead(op: Operation): void {
+    if (op.leg !== 0 || (op.state !== 'filled' && op.state !== 'canceled') || op.filledQuantity === op.request.quantity) return;
+    const job = readJob(op.jobId), why = shortLeadReason(job, [op]);
+    if (why) noteDeviation(job, why);
+  }
   /** The first deviation of a four-leg job's lead from its plan: recorded once, and the other job is halted (docs/oil.md 11.3). */
   function noteDeviation(job: Job, why: string): void {
     const current = readJob(job.id);
@@ -566,14 +585,33 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     event(current.id, 'four-leg-deviation', { reason: why });
     haltPeer(current, why);
   }
-  /** A job's two legs as four-leg-fill.ts compares them; the hedge's skip is the lead's scaled by the two legs' plans. */
-  function fillLegs(job: PairJob): FillLeg[] {
-    const ops = opsOf(job.id), skipped = skippedOf(job);
-    const hedgeSkipped = hedgeSkippedQuantity(skipped, job.legs[0].quantity, job.legs[1].quantity);
+  /** Only the numeric projection of a finished job is recoverable here. Store and programming errors still propagate. */
+  function historicalDecimal<T>(read: () => T, invalid: T): T {
+    try { return read(); } catch (error) { if (error instanceof DecimalError) return invalid; throw error; }
+  }
+  function historicalTotal(values: readonly string[], kind: 'filled' | 'skipped'): string {
+    let total = 0n;
+    for (const value of values) {
+      const amount = historicalDecimal(() => units(value), null);
+      if (amount !== null && amount >= 0n) total += amount;
+      else if (kind === 'filled') return '无效'; // One unknown fill invalidates the total. A bad skip contributes no allowance.
+    }
+    return historicalDecimal(() => fromUnits(total), kind === 'filled' ? '无效' : '0');
+  }
+  /** The alert and job view read the same quantities. A damaged historical field cannot abort the healthy peer's settlement. */
+  function fillLegs(job: PairJob, ops = opsOf(job.id)): (FillLeg & { filledBarrels: string; plannedBarrels: string })[] {
+    const historical = FINAL_JOB.has(job.status);
+    const skipped = historical ? historicalTotal(Object.values(job.leadSkipped ?? {}), 'skipped') : skippedOf(job);
+    const hedgeSkip = () => hedgeSkippedQuantity(skipped, job.legs[0].quantity, job.legs[1].quantity);
+    const hedgeSkipped = historical ? historicalDecimal(hedgeSkip, '0') : hedgeSkip();
     return job.legs.map(leg => {
-      const filled = add('0', ...ops.filter(item => item.leg === leg.index).map(item => item.filledQuantity));
-      return { venue: VENUE_NAMES[leg.venue], symbol: leg.symbol, filled, planned: leg.quantity, step: leg.instrument.quantityStep, skipped: leg.index === 0 ? skipped : hedgeSkipped,
-        shown: marketOfJob(job) === 'oil' ? `${exposure(filled, leg.instrument)} / ${exposure(leg.quantity, leg.instrument)} 桶` : `${filled} / ${leg.quantity}` };
+      const quantities = ops.filter(item => item.leg === leg.index).map(item => item.filledQuantity);
+      const filled = historical ? historicalTotal(quantities, 'filled') : add('0', ...quantities);
+      const planned = typeof leg.quantity === 'string' ? leg.quantity : '无效';
+      const barrels = (value: string) => historical ? historicalDecimal(() => exposure(value, leg.instrument), '无效') : exposure(value, leg.instrument);
+      const filledBarrels = barrels(filled), plannedBarrels = barrels(planned);
+      return { venue: VENUE_NAMES[leg.venue], symbol: leg.symbol, filled, planned, filledBarrels, plannedBarrels, step: leg.instrument.quantityStep, skipped: leg.index === 0 ? skipped : hedgeSkipped,
+        shown: marketOfJob(job) === 'oil' ? `${filledBarrels} / ${plannedBarrels} 桶` : `${filled} / ${planned}` };
     });
   }
   /**
@@ -1501,12 +1539,14 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const lagging = report.status === 'terminal' && !report.childrenSettled;
     Object.assign(op, { state, remoteId: report.strategyId, filledQuantity: report.filledQuantity, averagePrice: report.averagePrice, strategyStatus: report.status, childrenSettled: report.childrenSettled,
       childrenWaitSince: lagging ? op.childrenWaitSince ?? now() : null, identityVerifiedAt: now(), lastCheckedAt: now(), absentChecks: 0, absentAt: null });
+    noteReportedShortLead(op);
   }
   function applyReport(op: Operation, report: OrderReport): void {
     // Cumulative fills never go backwards; a lower count is a stale or foreign answer.
     if (cmp(report.filledQuantity, op.filledQuantity) < 0) reject('report_regressed', '委托回报的成交数量回退，保留原状态', 409);
     const state: OpState = report.status === 'filled' ? 'filled' : report.terminal ? (report.status === 'rejected' && isZero(report.filledQuantity) ? 'rejected' : 'canceled') : 'open';
     Object.assign(op, { state, remoteId: report.remoteId, filledQuantity: report.filledQuantity, averagePrice: report.averagePrice, venueStatus: report.status, lastCheckedAt: now(), absentChecks: 0, absentAt: null });
+    noteReportedShortLead(op);
   }
 
   // ---- reconciliation ----------------------------------------------------------
@@ -1755,10 +1795,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const pastDeadline = now() >= job.deadlineAt;
     // After a takeover nothing new is sent, so resting orders are withdrawn instead of waiting for the deadline; so too when the hedge cannot go on.
     const withdraw = stop || pastDeadline || job.holdNewSends || !!job.leadWithdraw || !!job.peerHalt;
-    // Four legs: a lead that deviated from its plan sends no further batch either, so both venues stop where they filled.
-    let deviation = job.leadDeviation ?? null;
     for (const op of opsOf(job.id).filter(item => item.state === 'open')) if (wantsStop(op, withdraw)) await cancel(job, op, withdraw ? undefined : '追价策略被交易所暂停，已停止；按实际成交对冲');
     job = readJob(job.id);
+    const deviation = job.leadDeviation ?? null;
     if (FINAL_JOB.has(job.status)) return;
     const exhausted = opsOf(job.id).find(item => item.state === 'open' && wantsStop(item, withdraw) && item.cancelSent >= budgets.cancelAttempts && item.cancelRequestedAt !== null && now() - item.cancelRequestedAt >= budgets.cancelRetryMs);
     if (exhausted) { write(() => finish(readJob(job.id), 'attention', `${withdrawnFor(job)}撤单 ${exhausted.cancelSent} 次仍未确认，委托可能仍在挂单；需人工核对`)); return; }
@@ -1806,16 +1845,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     }
     // A strategy, or an order whose state is not known, is waited out; under an order of the job's own that rests, what it filled is hedged.
     const resting = leads.find(item => !SETTLED.has(item.state));
-    // Four legs: a market (IOC) or native-chase lead order the venue took that filled less than it asked for, by a step or more,
-    // is a deviation at once, so the other venue stops before its next batch (docs/oil.md 11.3). A refused or unsent order ends
-    // or fails the job instead; a job the other one halted leaves its shortfall to that one.
-    if (job.group && !deviation && !job.peerHalt && job.legs[0].orderType !== 'local-chase') {
-      const short = leads.find(item => (item.state === 'filled' || item.state === 'canceled') && cmp(sub(item.request.quantity, item.filledQuantity), job.legs[0].instrument.quantityStep) >= 0);
-      if (short) {
-        const why = `${VENUE_NAMES[job.legs[0].venue]} 第 ${(short.batch ?? 0) + 1} 批首腿发出 ${short.request.quantity}，成交 ${short.filledQuantity}`;
-        write(() => noteDeviation(job, why)); deviation = why;
-      }
-    }
     if (resting && (resting.state !== 'open' || isStrategy(resting))) return;
     // Once the last lead settles its batch remainder is known, even if a hedge is still unknown or new leads are prohibited.
     const decision = resting ? null : nextLead(job, leads);
@@ -2253,19 +2282,21 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   function jobView(id: string) {
     const job = readJob(id), ops = opsOf(id);
     const events = (db.prepare('SELECT type, at, json FROM events WHERE job_id = ? ORDER BY seq DESC LIMIT 40').all(id) as { type: string; at: number; json: string }[]).reverse().map(row => ({ type: row.type, at: row.at, ...JSON.parse(row.json) }));
-    const skipped = isPair(job) && job.group ? fillLegs(job).map(item => item.skipped) : null;
+    const groupLegs = isPair(job) && job.group ? fillLegs(job, ops) : null;
     return {
       id: job.id, endCode: job.endCode ?? null, market: marketOfJob(job), preset: !isPair(job) ? 'rebalance' as const : job.legs[0].venue === job.legs[1].venue ? 'same-exchange' as const : 'cross-exchange' as const,
-      rebalance: job.rebalance ? { method: job.rebalance.method } : null, group: job.group ?? null, peerHalt: job.peerHalt ?? null, leadSkipped: job.leadSkipped ? skippedOf(job) : null, leadDeviation: job.leadDeviation ?? null, action: job.action, status: job.status, reason: job.reason, stopRequested: stopRequested(id), createdAt: job.createdAt, deadlineAt: job.deadlineAt, holdNewSends: job.holdNewSends,
+      rebalance: job.rebalance ? { method: job.rebalance.method } : null, group: job.group ?? null, peerHalt: job.peerHalt ?? null, leadSkipped: job.leadSkipped ? groupLegs?.[0].skipped ?? skippedOf(job) : null, leadDeviation: job.leadDeviation ?? null, action: job.action, status: job.status, reason: job.reason, stopRequested: stopRequested(id), createdAt: job.createdAt, deadlineAt: job.deadlineAt, holdNewSends: job.holdNewSends,
       locked: !!db.prepare('SELECT 1 FROM locks WHERE job_id = ? LIMIT 1').get(id), acknowledgedAt: job.acknowledgedAt,
       /** A strategy create without an answer waits for adoption, a confirmation of not-created or a release. */
       strategyPending: ops.some(isOrphanStrategy),
       /** current: the batch of the latest lead order (0 before the first), 1-based. */
       batches: job.batches ? { count: job.batches.length, current: ops.some(item => item.leg === 0) ? Math.max(...ops.filter(item => item.leg === 0).map(item => item.batch ?? 0)) + 1 : 0, intervalMs: job.batchIntervalMs ?? 0 } : null,
       legs: job.legs.map(leg => {
-        const mine = ops.filter(item => item.leg === leg.index).sort((a, b) => attemptOf(a) - attemptOf(b)), op = mine.at(-1), filledQuantity = add('0', ...mine.map(item => item.filledQuantity));
-        return { venue: leg.venue, symbol: leg.symbol, side: leg.side, orderSide: leg.orderSide, orderType: leg.orderType, plannedQuantity: leg.quantity, accountId: maskId(leg.accountId), priceBound: leg.priceBound ?? null, limitPrice: leg.limitPrice ?? null,
-          contractSize: leg.instrument.contractSize, quantityStep: leg.instrument.quantityStep, skippedQuantity: skipped?.[leg.index] ?? '0', plannedBarrels: exposure(leg.quantity, leg.instrument), filledBarrels: exposure(filledQuantity, leg.instrument), averagePrice: averageOf(mine),
+        const mine = ops.filter(item => item.leg === leg.index).sort((a, b) => attemptOf(a) - attemptOf(b)), op = mine.at(-1), groupLeg = groupLegs?.[leg.index];
+        const filledQuantity = groupLeg?.filled ?? add('0', ...mine.map(item => item.filledQuantity));
+        const averagePrice = filledQuantity === '无效' ? null : groupLeg && FINAL_JOB.has(job.status) ? historicalDecimal(() => averageOf(mine), null) : averageOf(mine);
+        return { venue: leg.venue, symbol: leg.symbol, side: leg.side, orderSide: leg.orderSide, orderType: leg.orderType, plannedQuantity: groupLeg?.planned ?? leg.quantity, accountId: maskId(leg.accountId), priceBound: leg.priceBound ?? null, limitPrice: leg.limitPrice ?? null,
+          contractSize: leg.instrument.contractSize, quantityStep: leg.instrument.quantityStep, skippedQuantity: groupLeg?.skipped ?? '0', plannedBarrels: groupLeg?.plannedBarrels ?? exposure(leg.quantity, leg.instrument), filledBarrels: groupLeg?.filledBarrels ?? exposure(filledQuantity, leg.instrument), averagePrice,
           previewQuote: { bid: leg.quote.bid, ask: leg.quote.ask },
           attempts: mine.length, filledQuantity,
           operation: op ? { kind: op.kind ?? 'order', clientOrderId: op.clientOrderId, state: op.state, quantity: op.request.quantity, limitPrice: (op.request as { limitPrice?: string | null }).limitPrice ?? null, filledQuantity: op.filledQuantity, averagePrice: op.averagePrice, remoteId: op.remoteId,

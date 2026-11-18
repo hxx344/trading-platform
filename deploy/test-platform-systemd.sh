@@ -106,6 +106,44 @@ build() {
   bash "$source/deploy/package.sh" "$fixture/release-$1" >/dev/null
 }
 install_release() { bash "$root/deploy/install.sh" --package "$fixture/release-$1" >"$fixture/out" 2>&1; }
+# Only the four intentionally crashing candidates get a short negative probe. The real services, probe bodies,
+# stable-PID checks and rollback all run unchanged. Match the package actually passed to the selected probe.
+expect_unhealthy_release() {
+  local version=$1 component=$2 exception=$3 unit good_sha bad_sha since began=$SECONDS
+  local check="healthy_$component" installer="$fixture/check-$version.sh" trace="$fixture/health-$version"
+  case "$component" in
+    executor) unit=$service; good_sha=$(cat "$app/executor/.package-sha256") ;;
+    control) unit=$control; good_sha=$(cat "$app/current/.package-sha256") ;;
+    market) unit=$market; good_sha=$(cat "$app/current/.package-sha256") ;;
+    *) echo "Unknown component $component" >&2; return 1 ;;
+  esac
+  bad_sha=$(awk '$2 == "trading-platform.tar.gz" { print $1 }' "$fixture/release-$version/SHA256SUMS")
+  [[ "$bad_sha" =~ ^[a-f0-9]{64}$ && "$good_sha" != "$bad_sha" && $(grep -Fxc "$check() {" "$root/deploy/install.sh") == 1 ]]
+  {
+    printf '%s() {\n  local bad_sha=%q trace=%q\n' "$check" "$bad_sha" "$trace"
+    cat <<'PROBE'
+  local actual_sha began=$SECONDS result=0
+  actual_sha=$(read_value "$1/.package-sha256")
+  if [[ "$actual_sha" == "$bad_sha" ]]; then local HEALTH_WAIT_S=8; fi
+  ci_original_health "$@" || result=$?
+  printf '%s %s %s %s\n' "$actual_sha" "$HEALTH_WAIT_S" "$result" "$((SECONDS - began))" >>"$trace"
+  return "$result"
+}
+PROBE
+    sed "s/^$check() {$/ci_original_health() {/" "$root/deploy/install.sh"
+  } >"$installer"
+  since=$(date +%s)
+  if bash "$installer" --package "$fixture/release-$version" >"$fixture/out" 2>&1; then echo "Broken $component accepted" >&2; return 1; fi
+  # A short timeout alone is not proof of the intended fault. Require the candidate's own exception and both
+  # results from the original probe: the bad generation timed out, and the previous one passed with the full budget.
+  journalctl -q -u "$unit" --since "@$since" --grep "Error: $exception" -n 1 --no-pager -o cat | grep -Fq "Error: $exception"
+  awk -v bad="$bad_sha" -v good="$good_sha" '
+    $1 == bad && $2 == 8 && $3 == 1 && $4 >= 8 { failed++; elapsed=$4 }
+    $1 == good && $2 == 90 && $3 == 0 { recovered++ }
+    END { if (NR != 2 || failed != 1 || recovered != 1) exit 1; print "Bad generation failed its health check after " elapsed "s; previous generation passed with its 90s budget." }
+  ' "$trace"
+  echo "$component candidate v99.1.$version and rollback verified in $((SECONDS - began))s"
+}
 public_port=4720
 url() { printf 'http://127.0.0.1:%s%s' "$public_port" "$1"; }
 login() {
@@ -257,7 +295,7 @@ echo 'A broken market-only package restores the previous market and preserves bo
 cp "$source/src/market/main.ts" "$fixture/good-market"
 sed -i '1i if (import.meta.main) throw new Error("模拟行情服务启动失败");' "$source/src/market/main.ts"
 build 14
-if install_release 14; then echo 'Broken market accepted' >&2; exit 1; fi
+expect_unhealthy_release 14 market '模拟行情服务启动失败'
 grep -q '已回退到 v99.1.13 并确认运行正常' "$fixture/out"
 [[ $(pid "$service") == "$executor_pid" && $(pid "$control") == "$control_pid" ]]
 market_probe "$app/market"
@@ -287,7 +325,7 @@ echo 'A control activation that exits keeps the execution PID and restores the k
 cp "$source/src/control/main.ts" "$fixture/good-control"
 sed -i '1i if (import.meta.main) throw new Error("模拟控制面启动失败");' "$source/src/control/main.ts"
 build 7
-if install_release 7; then echo 'Broken control accepted' >&2; exit 1; fi
+expect_unhealthy_release 7 control '模拟控制面启动失败'
 grep -q '已回退到 v99.1.6 并确认运行正常' "$fixture/out"
 [[ $(pid "$service") == "$executor_pid" ]]
 assert_page v99.1.6
@@ -305,7 +343,7 @@ assert_page v99.1.8
 echo 'Failed execution code rolls back in order and still serves the last good release'
 sed -i '1i if (import.meta.main && !process.argv.includes("--check-config")) throw new Error("模拟执行面启动失败");' "$source/src/service/main.ts"
 build 9
-if install_release 9; then echo 'Broken execution accepted' >&2; exit 1; fi
+expect_unhealthy_release 9 executor '模拟执行面启动失败'
 grep -q '已回退到 v99.1.8 并确认运行正常' "$fixture/out"
 [[ $(pid "$service") != "$executor_pid" && $(pid "$control") == "$control_pid" ]]
 assert_page v99.1.8
@@ -316,7 +354,7 @@ node -e 'const fs = require("fs"), file = process.argv[1], c = JSON.parse(fs.rea
 cp "$app/executor/src/service/main.ts" "$source/src/service/main.ts"
 sed -i '1i if (import.meta.main) throw new Error("模拟新端口下控制面启动失败");' "$source/src/control/main.ts"
 build 10
-if install_release 10; then echo 'Broken control with changed listen port accepted' >&2; exit 1; fi
+expect_unhealthy_release 10 control '模拟新端口下控制面启动失败'
 grep -q '已回退到 v99.1.8 并确认运行正常' "$fixture/out"
 login
 assert_page v99.1.8

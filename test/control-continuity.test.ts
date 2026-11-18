@@ -5,6 +5,7 @@ import { fork, spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { request } from 'node:http';
 import { connect, createServer, type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -24,6 +25,25 @@ interface State {
   adl: { recent: ReturnType<Executor['recentAdlIncidents']> };
 }
 interface Status { health: { startedAt: number; generation: number }; exchange: ExchangeSnapshot }
+
+/** This test deliberately kills a listener and binds a new process to the same port. Keep each ordinary request on
+ * a fresh TCP connection, apart from the deliberately unread confirm socket below. No write is automatically retried. */
+function requestOnce(url: string, options: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal } = {}): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const req = request(url, { method: options.method, headers: options.headers, signal: options.signal ?? AbortSignal.timeout(5000), agent: false }, res => {
+      const chunks: Buffer[] = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('error', fail);
+      res.on('end', () => {
+        const headers = new Headers();
+        for (let i = 0; i < res.rawHeaders.length; i += 2) headers.append(res.rawHeaders[i], res.rawHeaders[i + 1]);
+        resolve(new Response(Buffer.concat(chunks), { status: res.statusCode, headers }));
+      });
+    });
+    function fail(error: Error) { reject(new Error(`${options.method ?? 'GET'} ${new URL(url).pathname}: ${error.message}`, { cause: error })); }
+    req.on('error', fail); req.end(options.body);
+  });
+}
 const EXECUTION_BUILD = 'a'.repeat(64);
 
 async function until<T>(description: string, read: () => T | null | Promise<T | null>): Promise<T> {
@@ -89,7 +109,7 @@ test('更换页面版本、杀掉并重启控制面期间，两腿交易、保�
     await until('控制面就绪', async () => {
       execution.check(); service.check();
       try {
-        const response = await fetch(base + '/api/ready', { signal: AbortSignal.timeout(2_000) });
+        const response = await requestOnce(base + '/api/ready', { signal: AbortSignal.timeout(2_000) });
         const value = await response.json() as { ready: boolean };
         return response.ok && value.ready ? true : null;
       } catch { return null; }
@@ -97,21 +117,20 @@ test('更换页面版本、杀掉并重启控制面期间，两腿交易、保�
     return service;
   }
   const original = await startControl();
-  assert.equal((await fetch(base + '/api/state')).status, 401);
-  const login = await fetch(readFileSync(join(dir, 'access-url'), 'utf8').trim(), { redirect: 'manual' });
+  assert.equal((await requestOnce(base + '/api/state')).status, 401);
+  const login = await requestOnce(readFileSync(join(dir, 'access-url'), 'utf8').trim());
   assert.equal(login.status, 303);
   const cookie = login.headers.getSetCookie()[0]?.split(';')[0];
   assert.ok(cookie);
-  // Do not borrow a pooled TCP socket to the deliberately killed control process for the post-restart identity check.
-  const headers = { cookie, 'x-pa-executor': '1', 'content-type': 'application/json', connection: 'close' };
+  const headers = { cookie, 'x-pa-executor': '1', 'content-type': 'application/json' };
   async function api<T>(path: string, body?: unknown): Promise<T> {
-    const response = await fetch(base + path, { headers, ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(5_000) });
+    const response = await requestOnce(base + path, { headers, ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(5_000) });
     const payload = await response.text();
     assert.equal(response.status, 200, `${path}：${payload}`);
     return JSON.parse(payload) as T;
   }
   async function page(path: string) {
-    const response = await fetch(base + path, { headers: { cookie, connection: 'close' } });
+    const response = await requestOnce(base + path, { headers: { cookie } });
     assert.equal(response.status, 200);
     return response.text();
   }
@@ -157,7 +176,7 @@ test('更换页面版本、杀掉并重启控制面期间，两腿交易、保�
   await original.kill();
   pendingReply.destroy();
   const downAt = performance.now();
-  await assert.rejects(fetch(base + '/api/ready', { signal: AbortSignal.timeout(1_500) }));
+  await assert.rejects(requestOnce(base + '/api/ready', { signal: AbortSignal.timeout(1_500) }));
   execution.child.send('fill-and-deliver');
   db = new DatabaseSync(join(dir, 'executor.sqlite'), { readOnly: true });
   const rows = db.prepare(`SELECT j.status AS job, t.state AS transfer, a.status AS adl FROM jobs j, transfers t, adl_incidents a
@@ -199,9 +218,9 @@ test('更换页面版本、杀掉并重启控制面期间，两腿交易、保�
 
   // Shutdown in the other direction: an otherwise live control must not serve a cached page or advertise readiness.
   await execution.kill();
-  const unavailable = await fetch(base + '/api/ready');
+  const unavailable = await requestOnce(base + '/api/ready');
   assert.equal(unavailable.status, 503);
   assert.deepEqual(await unavailable.json(), { ready: false });
-  assert.equal((await fetch(base + '/', { headers: { cookie } })).status, 503);
+  assert.equal((await requestOnce(base + '/', { headers: { cookie } })).status, 503);
   assert.equal(probe().status, 1, '执行面退出后，正式部署探针必须拒绝认定切换成功');
 });

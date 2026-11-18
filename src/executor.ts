@@ -489,7 +489,14 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const pending = unfinishedJobs();
     for (const { id, group } of pending) {
       if (!group) continue;
-      const job = readJob(id), why = shortLeadReason(job, legOps(id, 0));
+      const job = readJob(id), leads = legOps(id, 0);
+      let why: string | null;
+      try { why = shortLeadReason(job, leads); }
+      catch (error) {
+        if (!(error instanceof DecimalError)) throw error;
+        finish(job, 'attention', '服务恢复时首腿终态回报的数量无效，保留合约锁，需人工核对');
+        continue;
+      }
       if (why) noteDeviation(job, why);
     }
     // Finishing or halting one job may have changed its peer.

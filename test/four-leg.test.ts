@@ -778,3 +778,21 @@ test('四腿首腿核对到累计 0.6 撤余的同一轮对冲核对超时：先
   await tick(h);
   assert.deepEqual([eventCount(h, 'four-leg-deviation'), eventCount(h, 'four-leg-halted')], [1, 1]);
 }));
+
+test('接管旧四腿时在途任务的首腿终态数量损坏：该组保留人工处理与锁，另一组正常对冲完成', () => withHarness(async h => {
+  const oil = await confirmFour(h);
+  const hynix = await confirmFour(h, hynixIntent());
+  await tick(h);
+  h.store.db.prepare("UPDATE operations SET json = json_set(json, '$.filledQuantity', 'broken') WHERE job_id = ? AND leg = 0").run(oil.ids[0]);
+  h.clock.now += 61_000;
+  h.restart();
+  assert.equal(h.ex.acquire(), true);
+  const [damaged, peer] = await settleAll(h, oil.ids);
+  assert.deepEqual([damaged.status, damaged.locked, damaged.legs[0].filledQuantity, damaged.legs[1].attempts], ['attention', true, '无效', 0]);
+  assert.match(damaged.reason ?? '', /恢复.*首腿.*数量无效/);
+  assert.match(peer.peerHalt ?? '', /Binance 任务需人工处理/);
+  assert.deepEqual([peer.status, peer.legs[1].filledQuantity], ['completed', '1']);
+  const healthy = await settleAll(h, hynix.ids);
+  assert.deepEqual(healthy.map(job => [job.status, job.locked, job.legs[1].filledQuantity]), [['completed', false, '0.249'], ['completed', false, '0.24']]);
+  assert.deepEqual(locks(h).map(item => item.job_id), [damaged.id, damaged.id]);
+}));

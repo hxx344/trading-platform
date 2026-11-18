@@ -243,6 +243,7 @@ test('海力士实盘：连续两份新盘口才开仓，同一份盘口不重�
   await openWith(r, ex, rules, 'completed', ['2.42', '0']);
   assert.deepEqual([live(rules).phase, live(rules).enabled], ['review', false]);
   assert.throws(() => rules.checkHynixRebalance('binance', ACCOUNT.accountKey), code('rebalance_rule_conflict'));
+  rules.checkHynixRebalance('binance', 'replacement-account');
   rules.checkHynixRebalance('bybit', 'bybit-account');
   assert.match(live(rules).reason!, /一腿没有成交（ADR 2\.42、正股 0）/);
 }));

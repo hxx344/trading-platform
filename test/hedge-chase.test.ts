@@ -363,11 +363,17 @@ for (const via of ['timeout', 'stop'] as const) test(`对冲挂单撤单用尽�
   // The lead's first cancels are refused too; a later one goes through.
   h.binance.inject({ operation: 'cancel', mode: 'reject', times: via === 'stop' ? 3 : 2, clientOrderId: lead.request.clientOrderId });
   let waitedForLead = false;
+  let exhaustedAt: number | null = null;
+  let withdrawingAt: number | null = via === 'stop' ? h.clock.now : null;
   for (let i = 0; i < 40 && h.ex.jobView(jobId).status !== 'attention'; i++) {
     await tick(h, 5_000);
     const view = h.ex.jobView(jobId);
     // The hedge's cancels have run out while the lead's are still refused: the job waits for the lead.
-    if (view.status !== 'attention' && lead.status !== 'canceled' && hedgeCancels(h, hedge.request.clientOrderId) >= 5) waitedForLead = true;
+    // Without the wait the job goes to a person cancelRetryMs after the hedge's fifth cancel.
+    // (and, once the lead is being withdrawn, on the next round).
+    if (exhaustedAt === null && hedgeCancels(h, hedge.request.clientOrderId) >= 5) exhaustedAt = h.clock.now;
+    if (withdrawingAt === null && /正在撤销首腿挂单/.test(view.reason ?? '')) withdrawingAt = h.clock.now;
+    if (exhaustedAt !== null && withdrawingAt !== null && h.clock.now >= Math.max(exhaustedAt + 10_000, withdrawingAt + 5_000) && view.status !== 'attention' && lead.status !== 'canceled') waitedForLead = true;
   }
   const view = h.ex.jobView(jobId);
   assert.equal(view.status, 'attention', view.reason ?? '');
@@ -388,6 +394,7 @@ test('对冲挂单撤单用尽、首腿撤单一直发不出去：等待有上�
   assert.equal(view.status, 'attention', view.reason ?? '');
   assert.match(view.reason ?? '', /撤单 \d+ 次仍未确认/);
   assert.notEqual(lead.status, 'canceled', '首腿撤单从未发出');
+  assert.match(view.reason ?? '', /对冲腿撤单 \d+ 次仍未确认.*首腿委托也可能仍在挂单/);
   // cancelAttempts × cancelRetryMs + unresolvedGraceMs after the hedge's last cancel, well before the 600 s deadline.
   assert.ok(h.clock.now - start < 300_000, `等待 ${h.clock.now - start} 毫秒`);
 }));

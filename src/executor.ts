@@ -1896,7 +1896,12 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const leadWait = budgets.cancelAttempts * budgets.cancelRetryMs + budgets.unresolvedGraceMs;
     const exhausted = opsOf(job.id).find(item => item.state === 'open' && wantsStop(item, withdraw) && item.cancelSent >= budgets.cancelAttempts && item.cancelRequestedAt !== null
       && now() - item.cancelRequestedAt >= (leadUnsettled && isPostedHedge(item) ? Math.max(budgets.cancelRetryMs, leadWait) : budgets.cancelRetryMs));
-    if (exhausted) { write(() => finish(readJob(job.id), 'attention', `${withdrawnFor(job)}撤单 ${exhausted.cancelSent} 次仍未确认，委托可能仍在挂单；需人工核对`)); return; }
+    if (exhausted) {
+      const which = isPair(job) ? (exhausted.leg === 0 ? '首腿' : '对冲腿') : '';
+      const leadToo = leadUnsettled && exhausted.leg !== 0 ? '，首腿委托也可能仍在挂单' : '';
+      write(() => finish(readJob(job.id), 'attention', `${withdrawnFor(job)}${which}撤单 ${exhausted.cancelSent} 次仍未确认，委托可能仍在挂单${leadToo}；需人工核对`));
+      return;
+    }
     // A refusal caused by this order's own unknown cancel clears once that cancel's window has passed, so the grace counts from then;
     // like every grace here it starts no earlier than this writer's takeover.
     const blocked = opsOf(job.id).find(item => item.state === 'open' && wantsStop(item, withdraw) && item.cancelBlockedAt != null && now() >= Math.max(item.cancelBlockedAt, item.cancelRequestedAt === null ? 0 : cancelSettledAt(item), heldSince) + budgets.unresolvedGraceMs);

@@ -1,21 +1,21 @@
 // The root side of the page's online update (docs/update.md), started by trading-platform-update.path when the service
-// leaves update-request.json in the import hand-off directory. It takes the request (a version only), checks it is a
+// leaves update-request.json in the update hand-off directory. It takes the request (a version only), checks it is a
 // vX.Y.Z newer than the installed release, downloads that release's SHA256SUMS and install.sh, checks install.sh against
 // the sums and runs `bash install.sh --version <version>`: the same download, config check, restart, health check and
 // rollback as the one-line install. Its progress and the installer's last lines go to update-result.json for the page.
 //
-//   node update-helper.ts --dir /var/lib/trading-platform-import --app-dir /opt/trading-platform
+//   node update-helper.ts --dir /var/lib/trading-platform-update --app-dir /opt/trading-platform
 //                         --data-dir /var/lib/trading-platform [--recover]
 //
 // --recover (the unit's ExecStopPost) marks a result the helper left running as interrupted.
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { fchownSync, lstatSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, type Stats } from 'node:fs';
+import { fchownSync, lstatSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
-import { lstatOrNull, readBounded } from './import-channel.ts';
+import { takeHandoff } from './take-handoff.ts';
 import {
   RELEASE_REPO, UPDATE_REQUEST_FILE, UPDATE_REQUEST_STALE_MS, UPDATE_RESULT_FILE, compareVersions, parseUpdateRequest, readInstalledVersion,
   readUpdateResult, writeHandoff, type UpdateRequest, type UpdateResult,
@@ -71,21 +71,10 @@ function writeResult(dir: string, result: UpdateResult, owner: Owner): void {
  */
 export function takeUpdateRequest(dir: string, owner: { uid: number }): UpdateRequest | { invalid: string } | null {
   const path = join(dir, UPDATE_REQUEST_FILE);
-  let seen: Stats | null = null;
   let text: string | null;
-  try {
-    text = readBounded(path, MAX_REQUEST_BYTES, stat => {
-      seen = stat;
-      if (stat.uid !== owner.uid) throw new Error('请求文件不属于服务账户');
-      if (stat.nlink !== 1) throw new Error('请求文件有多个硬链接');
-    });
-  } catch (error) {
-    try { const now = lstatOrNull(path); if (now && !now.isDirectory()) unlinkSync(path); } catch { /* the next request replaces it */ }
-    return { invalid: message(error) };
-  }
+  try { text = takeHandoff(path, MAX_REQUEST_BYTES, owner.uid); }
+  catch (error) { return { invalid: message(error) }; }
   if (text === null) return null;
-  const read = seen as Stats | null, current = lstatOrNull(path);
-  if (read && current && current.ino === read.ino && current.dev === read.dev) unlinkSync(path);
   try { return parseUpdateRequest(JSON.parse(text)); }
   catch (error) { return { invalid: error instanceof SyntaxError ? '请求不是有效 JSON' : message(error) }; }
 }

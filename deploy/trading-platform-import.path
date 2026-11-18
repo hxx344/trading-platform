@@ -3,7 +3,7 @@
 Description=统一交易平台：等待页面的工作台导入请求
 
 [Path]
-PathChanged=@IMPORT_DIR@/request.json
+PathExists=@IMPORT_DIR@/request.json
 Unit=trading-platform-import.service
 
 [Install]

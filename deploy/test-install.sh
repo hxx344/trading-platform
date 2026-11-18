@@ -57,8 +57,8 @@ check '首次安装成功' '[[ $status -eq 0 ]]'
 check '首次安装生成空配置并通过检查' 'grep -q "\"pairs\": \[\]" "$TP_CONF_DIR/config.json" && [[ "$(stat -c %a "$TP_CONF_DIR/config.json")" == 600 && "$(stat -c %a "$TP_CONF_DIR/secrets.json")" == 600 ]] && grep -q "配置有效：0 个配对（尚未导入）" "$tmp/out"'
 check '首次安装提示在页面导入' 'grep -q "下一步：在页面「从工作台导入配对」" "$tmp/out"'
 check '导入目录权限 770' '[[ "$(stat -c %a "$TP_IMPORT_DIR")" == 770 ]]'
-check '导入助手单元已填入路径' '! grep -q "@" "$tmp/trading-platform-import.service" "$tmp/trading-platform-import.path" && grep -q "PathChanged=$TP_IMPORT_DIR/request.json" "$tmp/trading-platform-import.path" && grep -q "ExecStart=$(command -v flock) -w 100 $TP_APP_DIR/.install.lock $TP_NODE_BIN $TP_APP_DIR/current/src/service/import-helper.ts --dir $TP_IMPORT_DIR --config $TP_CONF_DIR/config.json --data-dir $TP_DATA_DIR" "$tmp/trading-platform-import.service" && grep -q "ExecStopPost=$(command -v flock) -w 60 $TP_APP_DIR/.install.lock $TP_NODE_BIN $TP_APP_DIR/current/src/service/import-helper.ts --recover --dir $TP_IMPORT_DIR" "$tmp/trading-platform-import.service"'
-check '在线更新助手单元已填入路径（docs/update.md）' '! grep -q "@" "$tmp/trading-platform-update.service" "$tmp/trading-platform-update.path" && grep -q "PathChanged=$TP_UPDATE_DIR/update-request.json" "$tmp/trading-platform-update.path" && grep -q "ExecStart=$TP_NODE_BIN $TP_APP_DIR/current/src/service/update-helper.ts --dir $TP_UPDATE_DIR --app-dir $TP_APP_DIR --data-dir $TP_DATA_DIR --request-uid $(id -u) --request-gid $(id -g)$" "$tmp/trading-platform-update.service" && grep -q "ExecStopPost=$TP_NODE_BIN $TP_APP_DIR/current/src/service/update-helper.ts --recover --dir $TP_UPDATE_DIR --app-dir $TP_APP_DIR --data-dir $TP_DATA_DIR --request-uid $(id -u) --request-gid $(id -g)$" "$tmp/trading-platform-update.service"'
+check '导入助手单元已填入路径' '! grep -q "@" "$tmp/trading-platform-import.service" "$tmp/trading-platform-import.path" && grep -q "PathExists=$TP_IMPORT_DIR/request.json" "$tmp/trading-platform-import.path" && grep -q "ExecStart=$(command -v flock) -w 100 $TP_APP_DIR/.install.lock $TP_NODE_BIN $TP_APP_DIR/current/src/service/import-helper.ts --dir $TP_IMPORT_DIR --config $TP_CONF_DIR/config.json --data-dir $TP_DATA_DIR" "$tmp/trading-platform-import.service" && grep -q "ExecStopPost=$(command -v flock) -w 60 $TP_APP_DIR/.install.lock $TP_NODE_BIN $TP_APP_DIR/current/src/service/import-helper.ts --recover --dir $TP_IMPORT_DIR" "$tmp/trading-platform-import.service"'
+check '在线更新助手单元已填入路径（docs/update.md）' '! grep -q "@" "$tmp/trading-platform-update.service" "$tmp/trading-platform-update.path" && grep -q "PathExists=$TP_UPDATE_DIR/update-request.json" "$tmp/trading-platform-update.path" && grep -q "ExecStart=$TP_NODE_BIN $TP_APP_DIR/current/src/service/update-helper.ts --dir $TP_UPDATE_DIR --app-dir $TP_APP_DIR --data-dir $TP_DATA_DIR --request-uid $(id -u) --request-gid $(id -g)$" "$tmp/trading-platform-update.service" && grep -q "ExecStopPost=$TP_NODE_BIN $TP_APP_DIR/current/src/service/update-helper.ts --recover --dir $TP_UPDATE_DIR --app-dir $TP_APP_DIR --data-dir $TP_DATA_DIR --request-uid $(id -u) --request-gid $(id -g)$" "$tmp/trading-platform-update.service"'
 check '测试模式不写在线更新就绪标记（只在 systemd 启用 .path 后写）' '[[ ! -e "$TP_APP_DIR/.update-helper" && ! -e "$TP_IMPORT_DIR/.update-helper" ]]'
 check '当前版本指向新包' '[[ -f "$TP_APP_DIR/current/src/service/main.ts" ]]'
 check '示例配置已放入' '[[ -f "$TP_CONF_DIR/config.example.json" && -f "$TP_CONF_DIR/secrets.example.json" ]]'
@@ -67,6 +67,14 @@ check 'systemd 单元已填入路径' '! grep -q "@" "$TP_UNIT_FILE" && grep -q 
 first=$(readlink -f "$TP_APP_DIR/current")
 
 if part_is 1; then
+for unsafe_queue in "$TP_APP_DIR/releases" "$TP_APP_DIR/runtime/updates" "$TP_CONF_DIR/queue" "$TP_DATA_DIR/queue" "$TP_IMPORT_DIR/queue" "$tmp"; do
+  before_mode=$(stat -c '%u:%g %a' "$unsafe_queue" 2>/dev/null || echo absent)
+  TP_UPDATE_DIR="$unsafe_queue" run --package "$tmp/a" && status=0 || status=$?
+  check '拒绝更新交接目录与运行目录重叠且保持其权限' '[[ $status -ne 0 && "$(stat -c "%u:%g %a" "$unsafe_queue" 2>/dev/null || echo absent)" == "$before_mode" ]] && grep -q "更新交接目录须与" "$tmp/out"'
+done
+unsafe_queue="$TP_DATA_DIR/legacy-queue"
+TP_DATA_DIR="$tmp/other-data" TP_UPDATE_DIR="$unsafe_queue" run --package "$tmp/a" && status=0 || status=$?
+check '修改目录参数时保护已安装单元的交易数据目录' '[[ $status -ne 0 && ! -e "$TP_DATA_DIR/legacy-queue" ]] && grep -q "更新交接目录须与" "$tmp/out"'
 run --package "$tmp/a"
 check '重复执行无变化' 'grep -q "无变化" "$tmp/out" && grep -q "程序包（未变化）" "$tmp/out" && grep -q "systemd 单元（未变化）" "$tmp/out"'
 fi

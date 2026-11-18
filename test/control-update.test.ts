@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { request as httpRequest } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
@@ -9,6 +10,8 @@ import { test } from 'node:test';
 import { createControl } from '../src/control/main.ts';
 import { createExecutorServer } from '../src/http.ts';
 import { legacyUpdateJob } from '../src/service/update-legacy.ts';
+import { takeUpdateRequest } from '../src/service/update-helper.ts';
+import { takeImportRequest } from '../src/service/import-channel.ts';
 import { createHarness } from './harness.ts';
 
 test('在线更新经执行面授权，控制面校验原请求并沿用 root 助手的交接文件', async t => {
@@ -60,6 +63,9 @@ test('在线更新经执行面授权，控制面校验原请求并沿用 root �
   const file = join(handoff, 'update-request.json');
   const oldJob = { id: randomUUID(), version: 'v0.64.0', from: 'v0.63.0', startedAt: Date.now(), at: Date.now(), phase: 'running', message: '正在切换', output: [] };
   const oldResult = join(legacyDir, 'update-result.json');
+  const earlier = { ...oldJob, id: randomUUID(), startedAt: oldJob.startedAt - 1000, at: oldJob.at - 900, phase: 'done' };
+  // A downgrade and a second migration leave a valid result from the first split installation behind.
+  writeFileSync(join(handoff, 'update-result.json'), JSON.stringify(earlier));
   writeFileSync(oldResult, JSON.stringify(oldJob));
   const statusJob = async () => (await (await fetch(base + '/api/update', { headers })).json() as { job: typeof oldJob | null }).job;
   assert.deepEqual(await statusJob(), oldJob);
@@ -75,7 +81,27 @@ test('在线更新经执行面授权，控制面校验原请求并沿用 root �
   const { pending } = await accepted.json() as { pending: { id: string } };
   const saved = JSON.parse(readFileSync(file, 'utf8'));
   assert.deepEqual([saved.id, saved.version], [pending.id, 'v0.65.0']);
-  assert.equal(await statusJob(), null, '新目录已有待处理请求时不显示旧任务');
+  assert.deepEqual(await statusJob(), earlier, '新目录已有待处理请求时优先显示新目录的记录');
   assert.equal((await post(apply, headers, body)).status, 409);
   assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), saved);
+});
+
+test('页面助手将误投的目录移出监听路径，保留内容并能处理下一份请求', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-handoff-'));
+  try {
+    const owner = { uid: statSync(dir).uid };
+    for (const [name, take] of [['request.json', takeImportRequest], ['update-request.json', takeUpdateRequest]] as const) {
+      const path = join(dir, name);
+      mkdirSync(path);
+      writeFileSync(join(path, 'keep'), '保留');
+      assert.ok('invalid' in take(dir, owner)!);
+      assert.equal(existsSync(path), false);
+      const quarantine = readdirSync(dir).find(item => item.startsWith(name + '.taken-'))!;
+      assert.equal(readFileSync(join(dir, quarantine, 'keep'), 'utf8'), '保留');
+      assert.equal(take(dir, owner), null);
+      const request = { id: randomUUID(), at: Date.now(), ...(name === 'request.json' ? { action: 'preview' } : { version: 'v0.65.0' }) };
+      writeFileSync(path, JSON.stringify(request));
+      assert.equal((take(dir, owner) as { id: string }).id, request.id);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

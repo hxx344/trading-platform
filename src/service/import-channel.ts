@@ -3,9 +3,10 @@
 // the request, reads the workbench, writes this service's two files, restarts the service and leaves its answer as one
 // result file. Only names, ids, account tails and reasons go through here; keys and webhooks never do.
 import { randomBytes, randomUUID } from 'node:crypto';
-import { closeSync, constants, fchownSync, fsyncSync, lstatSync, openSync, renameSync, rmSync, unlinkSync, writeSync, type Stats } from 'node:fs';
+import { closeSync, constants, fchownSync, fsyncSync, lstatSync, openSync, renameSync, rmSync, writeSync, type Stats } from 'node:fs';
 import { join } from 'node:path';
 import { readBounded } from './handoff-file.ts';
+import { takeHandoff } from './take-handoff.ts';
 export { readBounded } from './handoff-file.ts';
 import { ContractError, PAIR_ID, exactKeys } from '../contracts.ts';
 import { MAX_PAIRS } from './config.ts';
@@ -171,23 +172,10 @@ export function submitImportRequest(dir: string, body: unknown, now: () => numbe
  */
 export function takeImportRequest(dir: string, owner: { uid: number }): ImportRequest | { invalid: string } | null {
   const path = join(dir, REQUEST_FILE);
-  let seen: Stats | null = null;
   let text: string | null;
-  try {
-    text = readBounded(path, MAX_REQUEST_BYTES, stat => {
-      seen = stat;
-      if (stat.uid !== owner.uid) throw new Error('请求文件不属于服务账户');
-      if (stat.nlink !== 1) throw new Error('请求文件有多个硬链接');
-    });
-  } catch (error) {
-    // Whatever is there (a link, a directory, someone else's file) is not a request: removed without following it.
-    try { const now = lstatOrNull(path); if (now && !now.isDirectory()) unlinkSync(path); } catch { /* the next request replaces it */ }
-    return { invalid: error instanceof Error ? error.message : String(error) };
-  }
+  try { text = takeHandoff(path, MAX_REQUEST_BYTES, owner.uid); }
+  catch (error) { return { invalid: error instanceof Error ? error.message : String(error) }; }
   if (text === null) return null;
-  // Removed only while it is still the file read; a newer request that replaced it meanwhile stays for the next round.
-  const read = seen as Stats | null, current = lstatOrNull(path);
-  if (read && current && current.ino === read.ino && current.dev === read.dev) unlinkSync(path);
   try { return parseImportRequest(JSON.parse(text)); }
   catch (error) { return { invalid: error instanceof SyntaxError ? '请求不是有效 JSON' : error instanceof Error ? error.message : String(error) }; }
 }

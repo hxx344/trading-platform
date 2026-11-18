@@ -1,6 +1,6 @@
 // Public TCP listener. Only the execution process can authenticate a browser or accept a trading command.
 import { createServer, request as httpRequest, type IncomingMessage, type OutgoingHttpHeaders, type ServerResponse } from 'node:http';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -8,7 +8,7 @@ import { readComponentBuild } from '../component-build.ts';
 import { ContractError, exactKeys } from '../contracts.ts';
 import { APP_HEADERS, ASSET_HEADERS, ASSET_PATH, CLIENT_ADDRESS_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, controlRoute, listenPublic, readJson, sendJson } from '../http-public.ts';
 import { parseListenConfig, urlHost } from '../service/listen-config.ts';
-import { createUpdates, readInstalledVersion, UPDATE_RESULT_FILE, updateReadyFile, type UpdateFetch, type UpdateView } from '../service/update.ts';
+import { createUpdates, readInstalledVersion, updateReadyFile, type UpdateFetch, type UpdateView } from '../service/update.ts';
 import { loadWebApp } from '../web-assets.ts';
 import { PROBE_HEADER, probeResponse } from './probe.ts';
 
@@ -119,8 +119,11 @@ export function createControl(options: {
     const release = active;
     const headers = engineHeaders(request, release.executionBuild, route === null);
     // During the first online migration the v0.63 helper still finishes in the executor-owned hand-off directory.
-    const legacy = (route === 'update' || route === 'apply') && options.importDir && !existsSync(join(options.importDir, UPDATE_RESULT_FILE));
-    if (legacy) headers[LEGACY_UPDATE_HEADER] = '1';
+    const legacy = (route === 'update' || route === 'apply') && options.importDir;
+    if (legacy) {
+      headers[LEGACY_UPDATE_HEADER] = '1';
+      if (route === 'apply') headers['x-trading-platform-update-since'] = String(updates.status().job?.startedAt ?? 0);
+    }
     const forwardedWrite = !route && request.method !== 'GET' && request.method !== 'HEAD';
     // One upstream request, even if a write loses its response. The caller resolves it using its original request ID.
     const backend = httpRequest({ socketPath: options.socketPath, path, method: request.method, agent: false, setHost: false, headers }, upstream => {
@@ -171,9 +174,9 @@ export function createControl(options: {
       chunks.push(chunk);
     }
     const view = updates.status();
-    if (!view.job && !view.pending) {
-      const legacy = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Pick<UpdateView, 'job'>;
-      view.job = legacy.job;
+    if (!view.pending) {
+      const { job } = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Pick<UpdateView, 'job'>;
+      if (job && (!view.job || job.startedAt > view.job.startedAt || (job.id === view.job.id && job.at > view.job.at))) view.job = job;
     }
     sendJson(response, 200, view);
   }

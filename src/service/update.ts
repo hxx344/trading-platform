@@ -1,5 +1,5 @@
 // Online update (docs/update.md), the service's side: it reads the latest stable release from GitHub on a timer, and when
-// the page confirms an update it leaves one request in the import hand-off directory for the root update helper
+// the page confirms an update it leaves one request in the update hand-off directory for the root update helper
 // (update-helper.ts, started by trading-platform-update.path), whose answer it reads back for the page. The request
 // carries a version only; the helper checks it again and runs that release's install.sh.
 import { randomBytes, randomUUID } from 'node:crypto';

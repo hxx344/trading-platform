@@ -74,7 +74,7 @@ UPDATE_DIR=${TP_UPDATE_DIR:-/var/lib/trading-platform-update}
 if [[ "$TEST_MODE" == 1 && -z "${TP_UPDATE_DIR:-}" ]]; then UPDATE_DIR="$IMPORT_DIR-updates"; fi
 UNIT_DIR=$(dirname "$UNIT_FILE")
 IMPORT_UNITS=("$SERVICE-import.path" "$SERVICE-import.service")
-# The page's root helpers: the import above and the online update (docs/update.md), both watching the import directory.
+# Each root helper watches its service account's private handoff, the trading import queue and the control update queue.
 HELPER_UNITS=("${IMPORT_UNITS[@]}" "$SERVICE-update.path" "$SERVICE-update.service")
 # Written once trading-platform-update.path is enabled and running; the service offers the page's update only with it.
 # In the root-owned program directory: root never writes by path into the hand-off directory the service can change.
@@ -348,12 +348,38 @@ if ((split)) || [[ -f "$APP_DIR/control/.control-sha256" ]]; then
        "$CONTROL_GID" == "$(getent group "$CONTROL_USER" | cut -d: -f3)" ]] || fail '两个服务须使用不同的专用账户及私有组。'
   fi
   update_path=$(realpath -m "$UPDATE_DIR")
-  for protected in "$APP_DIR" "$CONF_DIR" "$DATA_DIR" "$IMPORT_DIR"; do
+  protected_dirs=("$APP_DIR" "$CONF_DIR" "$DATA_DIR" "$IMPORT_DIR" /run/trading-platform)
+  old_units=("$UNIT_FILE")
+  if [[ "$TEST_MODE" != 1 ]]; then
+    protected_dirs+=("$UNIT_DIR" /etc/systemd/system /opt/trading-platform /etc/trading-platform /var/lib/trading-platform /var/lib/trading-platform-import)
+    [[ "$UNIT_FILE" == "/etc/systemd/system/$SERVICE.service" ]] || old_units+=("/etc/systemd/system/$SERVICE.service")
+  fi
+  # Keep previous non-standard locations protected when this invocation changes a directory override.
+  for unit in "${old_units[@]}"; do
+    [[ -f "$unit" ]] || continue
+    while IFS= read -r old_dir; do protected_dirs+=("$old_dir"); done < <(awk '/^ExecStart=/ {
+      for (i=1; i<=NF; i++) {
+        if ($i == "--data-dir" || $i == "--import-dir") print $(i+1);
+        if ($i == "--config") { dir=$(i+1); sub(/\/[^/]+$/, "", dir); print dir; }
+        if ($i ~ /\/(current|executor)\/src\/service\/main[.]ts$/) { dir=$i; sub(/\/(current|executor)\/src\/service\/main[.]ts$/, "", dir); print dir; }
+      }
+    }' "$unit")
+  done
+  for protected in "${protected_dirs[@]}"; do
     protected_path=$(realpath -m "$protected")
     [[ "$update_path" != / && "$update_path" != "$protected_path" && "$protected_path" != "$update_path/"* &&
-       ( "$protected" == "$APP_DIR" || "$update_path" != "$protected_path/"* ) ]] || fail '更新交接目录须与程序、配置、执行数据和导入交接目录隔离。'
+       "$update_path" != "$protected_path/"* ]] || fail '更新交接目录须与程序、配置、执行数据和导入交接目录隔离。'
   done
-  as_root_dir "$UPDATE_DIR" 770 root "$CONTROL_USER"
+  # Never take over another existing directory (including paths used by an older install with other overrides).
+  # An existing handoff is already provisioned for the dedicated group. Leave its ownership and mode untouched.
+  if [[ -e "$UPDATE_DIR" || -L "$UPDATE_DIR" ]]; then
+    expected_owner=0
+    [[ "$TEST_MODE" != 1 ]] || expected_owner=$(id -u)
+    [[ -d "$UPDATE_DIR" && ! -L "$UPDATE_DIR" && "$(stat -c '%u:%g %a' "$UPDATE_DIR")" == "$expected_owner:$CONTROL_GID 770" ]] ||
+      fail "已有的 $UPDATE_DIR 不属于专用更新交接目录，请指定独立新目录。"
+  else
+    as_root_dir "$UPDATE_DIR" 770 root "$CONTROL_USER"
+  fi
 fi
 for name in config secrets; do
   example="$release_dir/deploy/$name.example.json"
@@ -690,8 +716,15 @@ probe_control() {
     >"$work_dir/probe.log" 2>&1
 }
 probe_execution_config() {
-  as_service timeout --kill-after=1 4 "$NODE_BIN" "$1/src/control/probe.ts" --current "$1" --socket /run/trading-platform/execution.sock --config-check "$2" \
-    >"$work_dir/config-probe.log" 2>&1
+  local attempt status
+  for attempt in 1 2; do
+    status=0
+    as_service timeout --kill-after=1 4 "$NODE_BIN" "$1/src/control/probe.ts" --current "$1" --socket /run/trading-platform/execution.sock --config-check "$2" \
+      >"$work_dir/config-probe.log" 2>&1 || status=$?
+    case $status in 0|3) return "$status" ;; esac
+    if ((attempt == 1)); then steady sleep 1; fi
+  done
+  return "$status"
 }
 healthy_control() {
   local target=$1 deadline=$((SECONDS + HEALTH_WAIT_S))
@@ -769,10 +802,6 @@ activate() {
   if [[ -n "$exe" && -z "$action_ex" ]]; then
     probe_status=0
     probe_execution_config "$target" "$(read_value "$to/config-key")" || probe_status=$?
-    if ((probe_status != 0 && probe_status != 3)); then
-      steady sleep 1; probe_status=0
-      probe_execution_config "$target" "$(read_value "$to/config-key")" || probe_status=$?
-    fi
     case $probe_status in
       0) ;;
       3) action_ex=restart ;;
@@ -791,6 +820,9 @@ activate() {
     # restart also starts an inactive unit. A plain start could race an automatic start after the state check:
     # its access-url might already have been written before our marker, leaving a healthy generation unprovable.
     steady systemctl restart "$SERVICE" && healthy_executor "$exe" || return 1
+    if [[ -n "$exe" ]] && ! probe_execution_config "$target" "$(read_value "$to/config-key")"; then
+      log '新执行服务未能确认目标配置，正在恢复。'; return 1
+    fi
     rm -f "$APP_DIR/.restarting-executor" || return 1
     changes+=("执行服务已$([[ $action_ex == start ]] && echo 启动 || echo 重启)")
   else skipped+=('执行服务（继续运行）'); fi

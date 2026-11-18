@@ -25,7 +25,39 @@ cleanup() {
   trap - EXIT
   if ((result)); then
     [[ ! -f "$fixture/out" ]] || tail -n 20 "$fixture/out"
-    journalctl -u "$service" -u "$control" --no-pager -n 40 || true
+    systemctl show "$service-update.path" "$service-update.service" "$service-import.path" "$service-import.service" \
+      -p Id -p ActiveState -p SubState -p Result -p ExecMainStatus -p Paths -p Triggers --no-pager || true
+    journalctl -u "$service" -u "$control" -u "$service-update.path" -u "$service-update.service" \
+      -u "$service-import.path" -u "$service-import.service" --no-pager -n 70 || true
+    # Report only file type, owner/mode, the phase and an enumerated reason. Never open links or print a request,
+    # access token, updater output array, password, or an arbitrary string written by a service account.
+    node --input-type=module - "$updates" "$handoff" <<'JS' || true
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
+import { join } from 'node:path';
+for (const [dir, files] of [[process.argv[2], ['update-request.json', 'update-result.json']], [process.argv[3], ['request.json', 'result.json']]]) {
+  for (const name of files) {
+    const path = join(dir, name);
+    let fd;
+    try {
+      const s = lstatSync(path);
+      const summary = { path, uid:s.uid, gid:s.gid, mode:(s.mode & 0o7777).toString(8), type:s.isFile() ? 'file' : s.isDirectory() ? 'directory' : 'other' };
+      if (s.isFile() && name.endsWith('result.json')) {
+        fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        if (fstatSync(fd).isFile()) {
+          const bytes = Buffer.alloc(32769), n = readSync(fd, bytes, 0, bytes.length, 0);
+          if (n < bytes.length) {
+            const v = JSON.parse(bytes.toString('utf8', 0, n));
+            summary.phase = ['running','done','failed'].includes(v.phase) ? v.phase : 'unknown';
+            summary.reason = ['请求文件不属于服务账户','不比已装版本','不是普通文件','已过期','中断'].find(r => String(v.message).includes(r)) ?? 'other';
+          }
+        }
+      }
+      console.log(summary);
+    } catch (e) { console.log(path, e.code ?? 'unreadable'); }
+    finally { if (fd !== undefined) closeSync(fd); }
+  }
+}
+JS
   fi
   systemctl disable --now "$service-update.path" "$service-import.path" "$control" "$service" >/dev/null 2>&1 || true
   rm -f "${units[@]/#/$unitdir/}"
@@ -104,17 +136,23 @@ update_reply() {
   local reason=$1
   for _ in {1..80}; do
     if [[ -f "$updates/update-result.json" ]] && grep -q "$reason" "$updates/update-result.json"; then
-      [[ $(stat -c '%U:%G %a' "$updates/update-result.json") == "$control:$control 600" ]] && return 0
+      if [[ $(stat -c '%U:%G %a' "$updates/update-result.json") == "$control:$control 600" ]]; then echo "Update helper answered: $reason"; return 0; fi
     fi
     sleep 0.25
   done
-  return 1
+  echo "Timed out waiting for update helper: $reason" >&2; return 1
 }
+systemctl stop "$service-update.path"
 printf '{"id":"%s","version":"v99.1.1","at":%s}\n' "$request_id" "$(date +%s%3N)" >"$fixture/root-request"
 mv -T "$fixture/root-request" "$updates/update-request.json"
+systemctl start "$service-update.path"
 update_reply '请求文件不属于服务账户'
 runuser -u "$control" -- node -e 'const fs=require("fs"), p=process.argv[1]; fs.writeFileSync(p+".next", JSON.stringify({id:process.argv[2],version:"v99.1.1",at:Date.now()}), {flag:"wx",mode:0o600}); fs.renameSync(p+".next",p);' "$updates/update-request.json" "$request_id"
 update_reply '不比已装版本'
+runuser -u "$control" -- mkdir "$updates/update-request.json"
+update_reply '不是普通文件'
+[[ ! -e "$updates/update-request.json" ]]
+systemctl is-active --quiet "$service-update.path"
 
 echo 'An actual page import restarts execution once and the subsequent page deployment keeps the imported generation'
 curl --noproxy '*' -fsS --max-time 3 -b "$fixture/cookie" -H 'x-pa-executor: 1' -H 'Content-Type: application/json' \
@@ -217,6 +255,22 @@ grep -qF "PathChanged=$handoff/update-request.json" "$unitdir/$service-update.pa
 grep -qF -- "--dir $handoff --app-dir $app" "$unitdir/$service-update.service"
 if systemctl is-active --quiet "$control"; then echo 'Control still running on downgrade' >&2; exit 1; fi
 login
+assert_page v0.63.0
+install_release 8
+login
+assert_page v99.1.8
+
+echo 'Reconciling a real old installer which changed current without updating the split deployment record'
+systemctl disable --now "$control"
+bash "$old/install.sh" --package "$old" >"$fixture/out" 2>&1
+legacy_pid=$(pid "$service")
+legacy_dir=$(readlink "$app/current")
+[[ $(cat "$app/.deployment/current") != "$legacy_dir" ]]
+sed -i '1i if (import.meta.main && process.argv.includes("--check-config")) throw new Error("模拟配置预检失败");' "$source/src/service/main.ts"
+build 12
+if install_release 12; then echo 'Broken config check accepted' >&2; exit 1; fi
+grep -q '模拟配置预检失败' "$fixture/out"
+[[ $(pid "$service") == "$legacy_pid" && $(readlink "$app/current") == "$legacy_dir" && $(cat "$app/.deployment/current") == "$legacy_dir" ]]
 assert_page v0.63.0
 install_release 8
 login

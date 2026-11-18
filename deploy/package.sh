@@ -36,7 +36,7 @@ const packagePath = file => relative(root, file).split(sep).join('/');
 const control = new Set();
 const executor = new Set();
 // These programs are launched by root or the install CLI. The live executor imports import-channel for its API.
-const helperOnly = new Set(['update-helper', 'watch-config', 'import-helper', 'import-workbench',
+const helperOnly = new Set(['update-helper', 'take-handoff', 'watch-config', 'import-helper', 'import-workbench',
   'import-modules', 'import-options', 'import-crossex', 'import-ondo', 'import-monitor-alerts',
   'import-monitor-variational', 'import-monitor-paper'].map(name => 'src/service/' + name + '.ts'));
 const hooks = registerHooks({ resolve(specifier, context, next) {

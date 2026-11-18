@@ -80,6 +80,23 @@ test('本地追价首笔明确未发后，同批重挂仍须取得另一所的�
   await h.ex.tickJobs();
   assert.deepEqual([h.binance.arrived.place, h.bybit.arrived.place], [0, 0]);
 }));
+
+test('只挂单立即过期且零成交不能当作实际挂上，另一所首单与本所重挂均须重新取价', () => withHarness(async h => {
+  await confirmFour(h, fourIntent({ binanceLead: 'local-chase' }));
+  let expired = 0;
+  h.binance.place = async (_account, order, options) => {
+    options.beforeSend(); expired++;
+    h.binance.setBook('BZUSDT', { ageMs: 60_000 });
+    return { clientOrderId: order.clientOrderId, remoteId: 'never-rested', symbol: order.symbol, side: order.side, quantity: order.quantity,
+      filledQuantity: '0', averagePrice: null, status: 'expired', terminal: true, updatedAt: h.clock.now };
+  };
+  await h.ex.tickJobs();
+  assert.deepEqual([expired, h.bybit.arrived.place], [1, 0]);
+  h.binance.setBook('BZUSDT', { ageMs: 0 });
+  h.bybit.setBook('BZUSDT', { ageMs: 60_000 });
+  h.advance(1000); await h.ex.tickJobs();
+  assert.deepEqual([expired, h.bybit.arrived.place], [1, 0]);
+}));
 const locks = (h: Harness) => (h.store.db.prepare('SELECT resource, job_id FROM locks ORDER BY resource').all() as { resource: string; job_id: string }[]);
 const jobCount = (h: Harness) => (h.store.db.prepare('SELECT COUNT(*) AS n FROM jobs').get() as { n: number }).n;
 const pos = (venue: SimulatedVenue, symbol: string, side: Side) => venue.position(SIM_ACCOUNTS[venue.venue as 'binance' | 'bybit'], symbol, side);

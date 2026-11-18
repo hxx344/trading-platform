@@ -243,6 +243,8 @@ export interface Operation {
   filledQuantity: string;
   averagePrice: string | null;
   venueStatus: OrderReport['status'] | null;
+  /** A verified nonterminal venue report proved this order rested. An immediate post-only expiry never sets this. */
+  observedResting?: true;
   preparedAt: number;
   sentAt: number | null;
   lastCheckedAt: number | null;
@@ -701,7 +703,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const filled = boundedFill(op);
     if (filled === null) return false;
     if (filled > 0n) return true;
-    return isStrategy(op) ? op.identityVerifiedAt != null : !!op.venueStatus && op.venueStatus !== 'rejected';
+    return isStrategy(op) ? op.state === 'open' && op.identityVerifiedAt != null : op.state === 'open' || op.observedResting === true;
   }
   async function peerFirstLeadEvidence(job: PairJob): Promise<Quote[] | string> {
     if (!job.group || legOps(job.id, 0).some(acceptedLead)) return [];
@@ -1663,6 +1665,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     // Cumulative fills never go backwards; a lower count is a stale or foreign answer.
     if ((!reviewingQuantities || boundedFill(op) !== null) && cmp(report.filledQuantity, op.filledQuantity) < 0) reject('report_regressed', '委托回报的成交数量回退，保留原状态', 409);
     const state: OpState = report.status === 'filled' ? 'filled' : report.terminal ? (report.status === 'rejected' && isZero(report.filledQuantity) ? 'rejected' : 'canceled') : 'open';
+    if (state === 'open') op.observedResting = true;
     Object.assign(op, { state, remoteId: report.remoteId, filledQuantity: report.filledQuantity, averagePrice: report.averagePrice, venueStatus: report.status, lastCheckedAt: now(), absentChecks: 0, absentAt: null });
     noteReportedShortLead(op);
   }

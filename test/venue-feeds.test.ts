@@ -125,9 +125,10 @@ test('a cancelled Ondo IPC request leaves the rate queue immediately and an acti
     return new Promise<Response>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
   } });
   const feeds = createVenueFeeds({ ondo }); t.after(() => feeds.close?.());
+  const api = remoteOndoClient(connection(feeds).peer); t.after(() => api.close());
   const first = controller(), queued = controller();
-  const active = feeds.call('ondo.depth', { market: symbol, levels: 50 }, first.signal), http = await entered.promise;
-  const second = feeds.call('ondo.markets', {}, queued.signal); queued.abort();
+  const active = api.depth(symbol, 50, first.signal), http = await entered.promise;
+  const second = api.markets(queued.signal); queued.abort();
   await assert.rejects(second); assert.equal(http.aborted, false);
   first.abort(); await assert.rejects(active); assert.equal(http.aborted, true); assert.equal(calls.length, 1);
 });

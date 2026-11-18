@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from './api.ts';
 import { clock, label } from './labels.ts';
 import { ACTIVE_STATUSES, type OilVenue } from './oil-form.ts';
-import { DEFAULT_HYNIX_FORM, HYNIX_LABEL, LEG_FIELDS, HYNIX_SYMBOLS, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, HEDGE_TYPES, hedgeTypeAllowed, hedgeVenueFor, hedgeVenueOf, closeQuantities, describeHynixFourLeg, describeHynixIntent, draftHynixFourLegs, draftHynixLegs, hynixFormToIntent, hynixFourLegFormToIntent, leadTypeAllowed, type HynixForm, type HynixFourLegIntent, type HynixIntent, type HynixSymbol } from './hynix-form.ts';
+import { DEFAULT_HYNIX_FORM, HYNIX_LABEL, LEG_FIELDS, HYNIX_SYMBOLS, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, HEDGE_TYPES, allowedOrderTypes, hedgeVenueFor, closeQuantities, describeHynixFourLeg, describeHynixIntent, draftHynixFourLegs, draftHynixLegs, hynixFormToIntent, hynixFourLegFormToIntent, type HynixForm, type HynixFourLegIntent, type HynixIntent, type HynixSymbol } from './hynix-form.ts';
 import { isFourLegPreview, type FourLegConfirmResult, type FourLegPreview } from './four-leg.ts';
 import { bookTitle, crossPairs, type CrossRow, type HynixState, type OilBook, type OilConfirmResult, type OilJob, type OilPreview, type OilState } from './oil-types.ts';
 import { BalancePanel } from './HynixBalance.tsx';
@@ -145,13 +145,10 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
       const next = { ...current, ...patch };
       // Picking the hedge venue as the lead swaps the two, so a cross-venue pair stays on two venues.
       if (patch.venue !== undefined && patch.hedgeVenue === undefined && patch.venue === current.hedgeVenue) next.hedgeVenue = current.venue;
-      if (!leadTypeAllowed(next.venue, next.leadOrderType)) next.leadOrderType = 'market';
-      // Four legs: the pair is listed in venue order (venuePairs), the second venue's lead chases its own way, and every
-      // leg takes the same notional, opening or closing.
+      // Four legs: the pair is listed in venue order (venuePairs), and every leg takes the same notional, opening or closing.
       if (patch.preset === 'four-leg' && OIL_VENUES.indexOf(next.venue) > OIL_VENUES.indexOf(next.hedgeVenue)) [next.venue, next.hedgeVenue] = [next.hedgeVenue, next.venue];
-      if (!leadTypeAllowed(next.hedgeVenue, next.peerLeadOrderType)) next.peerLeadOrderType = 'market';
-      // The hedge chases on Binance and OKX only (docs/oil.md 13): a hedge moved to Bybit goes back to market.
-      if (!hedgeTypeAllowed(hedgeVenueOf(next), next.hedgeOrderType)) next.hedgeOrderType = 'market';
+      // Each venue chases its own way, the hedge only on Binance and OKX: an order type the venue now does not offer goes back to market.
+      Object.assign(next, allowedOrderTypes(next));
       // The four-leg direction names the first venue's premium: another preset or venue pair has it picked again.
       if (next.preset !== current.preset || next.venue !== current.venue || next.hedgeVenue !== current.hedgeVenue) next.fourPremium = '';
       // Opening is by equal notional only; closing defaults to the quantities held.

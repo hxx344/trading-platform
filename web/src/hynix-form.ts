@@ -1,11 +1,11 @@
 // The SK hynix order form turned into the executor's intent (POST /api/preview, market 'hynix', docs/hynix.md). Kept free
 // of the DOM so the server-side tests import it.
-import { HEDGE_TYPES, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, hedgeOrder, hedgeOrderError, hedgeTypeAllowed, hedgeVenueFor, hedgeVenueOf, leadTypeAllowed, type FormPreset, type OilHedgeType, type OilLeadType, type OilPreset, type OilSide, type OilVenue } from './oil-form.ts';
+import { HEDGE_TYPES, LEAD_TYPES, allowedOrderTypes, OIL_VENUES, VENUE_LABEL, hedgeOrder, hedgeOrderError, hedgeTypeAllowed, hedgeVenueFor, hedgeVenueOf, leadTypeAllowed, type FormPreset, type OilHedgeType, type OilLeadType, type OilPreset, type OilSide, type OilVenue } from './oil-form.ts';
 
 export type HynixSymbol = 'SKHYUSDT' | 'SKHYNIXUSDT';
 export const HYNIX_SYMBOLS: readonly HynixSymbol[] = ['SKHYUSDT', 'SKHYNIXUSDT'];
 export const HYNIX_LABEL: Record<HynixSymbol, string> = { SKHYUSDT: 'ADR', SKHYNIXUSDT: '正股' };
-export { HEDGE_TYPES, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, hedgeTypeAllowed, hedgeVenueFor, hedgeVenueOf, leadTypeAllowed };
+export { HEDGE_TYPES, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, allowedOrderTypes, hedgeVenueFor };
 
 export interface HynixForm {
   preset: FormPreset;

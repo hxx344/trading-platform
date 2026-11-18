@@ -330,3 +330,32 @@ test('开仓对冲挂单部分成交后剩余低于最小名义金额：不再�
   assert.match(view.reason ?? '', /低于Binance最小名义金额/);
   assert.equal(ordersOf(h.binance).length, 1);
 }));
+
+test('对冲挂单撤单用尽而首腿仍挂着：先撤首腿，首腿撤单结清后才转人工', () => withHarness(async h => {
+  const intent = {
+    market: 'oil', preset: 'same-exchange', action: 'open', timeoutMs: 600_000,
+    legs: [{ venue: 'binance', symbol: 'CLUSDT', side: 'long', orderType: 'local-chase', barrels: '1' }, { venue: 'binance', symbol: 'BZUSDT', side: 'short', orderType: 'local-chase', barrels: '1', chaseTimeoutMs: 2_000 }],
+  };
+  const { jobId } = await previewAndConfirm(h, intent);
+  await tick(h);
+  const lead = lastOrder(h.binance, 'CLUSDT');
+  h.binance.fillResting(lead.request.clientOrderId, '0.5');
+  await tick(h);
+  const hedge = lastOrder(h.binance, 'BZUSDT');
+  assert.equal(hedge.request.timeInForce, 'gtx');
+  h.binance.inject({ operation: 'cancel', mode: 'reject', times: 100, clientOrderId: hedge.request.clientOrderId });
+  // The lead's first two cancels are refused too; its third goes through.
+  h.binance.inject({ operation: 'cancel', mode: 'reject', times: 2, clientOrderId: lead.request.clientOrderId });
+  let leadStillResting = false;
+  for (let i = 0; i < 40 && h.ex.jobView(jobId).status !== 'attention'; i++) {
+    await tick(h, 5_000);
+    if (h.ex.jobView(jobId).status !== 'attention' && h.ex.jobView(jobId).legs[0]!.operation) leadStillResting ||= lead.status === 'new' || lead.status === 'partially-filled';
+  }
+  const view = h.ex.jobView(jobId);
+  assert.equal(view.status, 'attention', view.reason ?? '');
+  assert.ok(leadStillResting, '首腿撤单前两次被拒，曾仍挂着');
+  assert.equal(lead.status, 'canceled', '转人工前首腿已撤销');
+  assert.match(view.reason ?? '', /撤单 \d+ 次仍未确认/);
+  assert.ok(['new', 'partially-filled'].includes(hedge.status), `对冲挂单仍在，交人工核对：${hedge.status}`);
+  assert.equal(ordersOf(h.binance, 'CLUSDT').length, 1, '首腿没有重挂');
+}));

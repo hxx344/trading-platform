@@ -21,7 +21,7 @@ import { readComponentBuild } from '../component-build.ts';
 import { checkSocketOptions, runExecutor } from '../runtime.ts';
 import { assertDistinctSigners, checkIntervalBudget, enableBudget, idleWeight, loadServiceConfig, loadServiceSecrets, urlHost, type FeishuSecret, type ServiceConfig, type ServiceSecrets } from './config.ts';
 import { configFingerprint, fingerprintReader } from './config-fingerprint.ts';
-import { TRANSFER_CONFIG_KEYS, parseTransferConfig, type TransferConfig } from '../contracts.ts';
+import { ContractError, TRANSFER_CONFIG_KEYS, parseTransferConfig, type TransferConfig } from '../contracts.ts';
 import { PASSWORD_FILE, hashPassword, loadPasswordHash, type PasswordHash } from '../login-password.ts';
 import { createTakeoverGuard } from './takeover.ts';
 import { MONITOR_OUTBOX_FILE, createNotifier, sendFeishu, type EventRow, type Notifier } from './feishu.ts';
@@ -31,7 +31,7 @@ import { balanceWindow, createBalanceSamples, type BalanceSamples } from './bala
 import { readImportResult, submitImportRequest } from './import-channel.ts';
 import { legacyUpdateJob } from './update-legacy.ts';
 import type { UpdateFetch } from './update.ts';
-import { hynixBalanceCheck, hynixBusy, hynixViews, oilLoops, oilViews, openHynixBalance, openOilPnl, openOilRules, prepareOil, registerOilAccounts, strandedOilJobs, type OilRuntime } from './oil.ts';
+import { hynixBalanceCheck, hynixBusy, hynixViews, oilLoops, oilViews, openHynixBalance, openOilPnl, openOilRules, prepareOil, registerOilAccounts, strandedOilJobs, type OilRulesRuntime, type OilRuntime } from './oil.ts';
 import { oilSummary } from './oil-config.ts';
 import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, settleMonitor, stopMonitor, type MonitorRuntime } from './monitor.ts';
 import type { PerpetualMonitor } from '../monitor/perpetual.ts';
@@ -78,7 +78,7 @@ export interface ServiceWiring {
 }
 
 /** Builds the connectors and the executor on an open store and brings the registered pairs in line with the config. */
-export async function wireService(config: ServiceConfig, secrets: ServiceSecrets, store: ReturnType<typeof openStore>, { fetchImpl, now = Date.now, log = (line: string) => process.stderr.write(`${line}\n`), leaseWaitMs = LEASE_WAIT_MS, oil }: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; now?: () => number; log?: (line: string) => void; leaseWaitMs?: number; oil?: OilRuntime } = {}): Promise<ServiceWiring> {
+export async function wireService(config: ServiceConfig, secrets: ServiceSecrets, store: ReturnType<typeof openStore>, { fetchImpl, now = Date.now, log = (line: string) => process.stderr.write(`${line}\n`), leaseWaitMs = LEASE_WAIT_MS, oil, getOilRules }: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; now?: () => number; log?: (line: string) => void; leaseWaitMs?: number; oil?: OilRuntime; getOilRules?: () => OilRulesRuntime | undefined } = {}): Promise<ServiceWiring> {
   assertDistinctSigners(config, secrets);
   const address = (name: string): string => secrets.accounts.get(name)!.user;
   const byAddress = new Map([...secrets.accounts.values()].map(item => [item.user, item]));
@@ -103,7 +103,13 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
   // A new check interval from the page must fit the request budget, like the config's do at start.
   const transferConfigGuard = (pairId: string, next: Readonly<TransferConfig>, pairs: readonly { id: string; enabled: boolean; config: TransferConfig }[]): void => checkIntervalBudget(config, pairs, pairId, next.checkIntervalMs);
   // With oil, the Binance/Bybit/OKX connectors; without it, no order venue at all. No notional caps either way.
-  const executor: Executor = createExecutor({ store, connectors: oil?.connectors ?? [], environment: 'mainnet', now, transfers, adl: trading, positions: trading, enableGuard, transferConfigGuard, adlOnlyEnabledPairs: true });
+  const executor: Executor = createExecutor({ store, connectors: oil?.connectors ?? [], environment: 'mainnet', now, transfers, adl: trading, positions: trading, enableGuard, transferConfigGuard, adlOnlyEnabledPairs: true,
+    checkHynixRebalance(venue, key) {
+      const rules = getOilRules?.();
+      if (!rules) throw new ContractError(503, 'rules_unavailable', '无法核对海力士规则持仓，暂不能手动调平');
+      rules.checkHynixRebalance(venue, key);
+    },
+  });
   const warnings: string[] = [];
   try {
     // A crashed instance leaves its lease for up to a minute; wait it out here rather than crash-looping under systemd.
@@ -301,7 +307,8 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   let store: ReturnType<typeof openStore>;
   try { store = openStore(join(dir, DATABASE_FILES.mainnet)); } catch (error) { releaseOil(); throw error; }
   let wiring: ServiceWiring;
-  try { wiring = await wireService(config, secrets, store, { ...(fetchImpl ? { fetchImpl } : {}), ...(leaseWaitMs === undefined ? {} : { leaseWaitMs }), ...(oil ? { oil } : {}) }); }
+  let oilRules: OilRulesRuntime | undefined;
+  try { wiring = await wireService(config, secrets, store, { ...(fetchImpl ? { fetchImpl } : {}), ...(leaseWaitMs === undefined ? {} : { leaseWaitMs }), ...(oil ? { oil, getOilRules: () => oilRules } : {}) }); }
   catch (error) { store.close(); releaseOil(); throw error; }
   const { executor, trading, client, byAddress, streamed, writable, warnings } = wiring;
   // One process per account on this host, covering pairs left in the database as well as configured ones; the kernel
@@ -378,8 +385,8 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   // The options engine's task messages (and any it sent while starting) go out through the notifier from here on.
   optionsNotify = text => notifier.notify(`【期权】${text}`);
   for (const text of optionsEarly.splice(0)) optionsNotify(text);
-  // Spread rules (observe and live) in their own file; one that cannot open is shown on the oil page, nothing else stops.
-  const oilRules = oil ? openOilRules(oil, dir, { executor }) : undefined;
+  // The rule owner is ready before the executor accepts manual confirmations.
+  oilRules = oil ? openOilRules(oil, dir, { executor }) : undefined;
   // PnL and ledgers (read only) in their own file; one that cannot open is shown on the oil page, nothing else stops.
   const oilPnl = oil ? openOilPnl(oil, dir) : undefined;
   // Hynix balance settings in their own file; one that cannot open keeps the default thresholds and refuses saves.

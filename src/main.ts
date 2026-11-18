@@ -12,6 +12,7 @@ import { DATABASE_FILES, assertDedicatedDataDir, claimDataDirEnvironment, writeA
 import { createLiveConnectors, holdAccountLocks, loadLiveConfig, loadLiveCredentials, preflightLive } from './live/setup.ts';
 import { SIM_BINDINGS, SIM_TRANSFER_PAIR, createSimulatedVenues } from './simulation.ts';
 import { runExecutor } from './runtime.ts';
+import { checkStoredHynixRebalance, OIL_RULES_DATABASE } from './oil/rules.ts';
 
 export { DATABASE_FILES, assertDedicatedDataDir, claimDataDirEnvironment, writeAccessUrl };
 
@@ -34,7 +35,9 @@ async function main(): Promise<void> {
   let executor!: Executor;
   try {
     if (live && liveConnectors) {
-      executor = createExecutor({ store, connectors: liveConnectors, environment: 'mainnet', notionalLimits: live.notionalLimits });
+      const rulesFile = join(dir, OIL_RULES_DATABASE);
+      executor = createExecutor({ store, connectors: liveConnectors, environment: 'mainnet', notionalLimits: live.notionalLimits,
+        checkHynixRebalance: (venue, key) => checkStoredHynixRebalance(rulesFile, venue, key) });
       if (!executor.acquire()) throw new Error('另一个执行器实例持有写入租约；等待其租约过期后再启动');
       for (const binding of live.accounts) executor.registerAccount(binding);
     } else {

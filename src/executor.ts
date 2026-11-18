@@ -312,6 +312,8 @@ export interface ExecutorOptions {
    * accepted. The live canary sets them; the service runs without, and then no job is bounded by notional.
    */
   notionalLimits?: NotionalLimits;
+  /** Checks rule-owned positions on the bound account synchronously, including inside the confirm transaction. */
+  checkHynixRebalance?: (venue: Venue, accountKey: string) => void;
   /** Extra checks before a transfer pair is switched on (after ownership is proven); throws a ContractError to refuse. */
   enableGuard?: TransferDeps['enableGuard'];
   /** Checks a transfer pair's new settings from the page before they are stored; throws a ContractError to refuse. */
@@ -378,7 +380,7 @@ const averageOf = (ops: readonly Pick<Operation, 'filledQuantity' | 'averagePric
 /** `pa1-` + 24 hex + `-` + leg index, plus `r` + attempt for a later order of the leg (at most three digits: both legs stop at chaseOrderLimit ≤ 999). */
 const CLIENT_ORDER_ID_LENGTH = 34;
 
-export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions, transfers: transferConnector, adl: adlConnector, positions: positionsConnector, notionalLimits, enableGuard, transferConfigGuard, adlOnlyEnabledPairs = false }: ExecutorOptions) {
+export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions, transfers: transferConnector, adl: adlConnector, positions: positionsConnector, notionalLimits, checkHynixRebalance, enableGuard, transferConfigGuard, adlOnlyEnabledPairs = false }: ExecutorOptions) {
   // Caps are optional; a malformed cap stops the start instead of being ignored.
   const limits = notionalLimits ? parseNotionalLimits(notionalLimits) : null;
   // An override passed as undefined keeps the default instead of turning the budget into NaN arithmetic.
@@ -870,12 +872,14 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const account = accountFor(venue) ?? reject('account_missing', `${venueName} 尚未绑定已核验的账户`, 409);
     if (connectorFor(venue).capabilities.maxClientOrderIdLength < CLIENT_ORDER_ID_LENGTH) reject('client_order_id', `${venueName} 客户订单号长度上限不足`, 409);
     for (const symbol of HYNIX_SYMBOLS) if (db.prepare('SELECT 1 FROM locks WHERE resource = ?').get(`${account.account_key}:${symbol}`)) reject('symbol_locked', `${venueName} ${symbol} 已有未结束任务，调平须两个合约都空闲`, 409);
+    checkHynixRebalance?.(venue, account.account_key);
     const binding = bindingOf(account);
     const reads = await Promise.all(HYNIX_SYMBOLS.map(async symbol => {
       const [instrument, quote, snapshot] = await Promise.all([readInstrument(venue, symbol), readQuote(venue, symbol), readAccount(binding, symbol)]);
       return { symbol, instrument, quote, snapshot };
     }));
     const at = now();
+    checkHynixRebalance?.(venue, account.account_key);
     for (const { quote } of reads) checkQuoteFresh(quote, at, budgets.previewQuoteMaxAgeMs, budgets.futureToleranceMs);
     if (Math.abs(reads[0].quote.receivedAt - reads[1].quote.receivedAt) > budgets.pairQuoteWindowMs) reject('quote_window', `两腿盘口接收时间相差超过 ${budgets.pairQuoteWindowMs} 毫秒，请重新预览`, 409);
     const held = reads.map(({ symbol, instrument, quote, snapshot }): HeldContract => (
@@ -966,6 +970,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     }
     // A rebalance also holds its other leg, which no leg of the plan names.
     for (const resource of lockResources(plan).slice(plan.legs.length)) if (db.prepare('SELECT 1 FROM locks WHERE resource = ?').get(resource)) reject('symbol_locked', '另一腿合约已有未结束任务', 409);
+    if (plan.rebalance) checkHynixRebalance?.(plan.legs[0].venue, plan.legs[0].accountKey);
     const action = plan.rebalance ? REBALANCE_ACTION[plan.rebalance.method] : plan.intent.action;
     // Inside the write transaction, so two confirms cannot both fit under the running total.
     checkNotional(jobNotional(plan.legs), action);

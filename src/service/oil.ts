@@ -68,8 +68,9 @@ export function strandedOilJobs(executor: Pick<Executor, 'unfinished' | 'jobView
   });
 }
 
-/** The spread rules as the page and the market loop use them; a store that cannot open leaves orders and jobs alone. */
+/** The spread rules as the executor, page and market loop use them. */
 export interface OilRulesRuntime {
+  checkHynixRebalance(venue: Venue, accountKey: string): void;
   view(): unknown;
   create(body: unknown): unknown;
   update(id: string, body: unknown): unknown;
@@ -79,17 +80,17 @@ export interface OilRulesRuntime {
 }
 
 /**
- * Opens oil-rules.sqlite in the data directory. A failure is logged and shown on the page; the rest of oil runs on. With
+ * Opens oil-rules.sqlite in the data directory. A failure disables rules and manual hynix rebalancing. With
  * the executor, live rules order through its preview and confirm (docs/oil.md 7.3); without it they can only observe.
  */
 export function openOilRules(oil: OilRuntime, dir: string, { now = Date.now, log = (line: string) => process.stderr.write(`${line}\n`), executor }: { now?: () => number; log?: (line: string) => void; executor?: RuleExecutor } = {}): OilRulesRuntime {
   try {
     return createOilRules({ file: join(dir, OIL_RULES_DATABASE), venues: oil.config.accounts.map(account => account.venue), books: () => [...oil.market.view().books, ...oil.hynix.view().books], now, ...(executor ? { executor } : {}) });
   } catch (error) {
-    const reason = `原油自动规则库无法打开，自动规则不可用（下单与任务不受影响）：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`;
+    const reason = `原油自动规则库无法打开，自动规则和海力士手动调平暂不可用：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`;
     log(reason);
     const refuse = () => { throw new ContractError(503, 'rules_unavailable', reason); };
-    return { view: () => ({ available: false, error: reason, rules: [] }), create: refuse, update: refuse, act: refuse, tick: async () => {}, close: () => {} };
+    return { view: () => ({ available: false, error: reason, rules: [] }), create: refuse, update: refuse, act: refuse, checkHynixRebalance: refuse, tick: async () => {}, close: () => {} };
   }
 }
 

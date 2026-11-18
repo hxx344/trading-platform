@@ -7,6 +7,7 @@
 // restart clears the count and waits for the next fresh books. Counts live in memory only; the rules and their records
 // live in oil-rules.sqlite beside the main database, which an older version never opens.
 import { randomUUID } from 'node:crypto';
+import { lstatSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { ContractError, MAX_BATCHES, MAX_BATCH_INTERVAL_MS, VENUES, VENUE_NAMES, exactKeys, integer, oneOf, reject, type Venue } from '../contracts.ts';
 import { cmp, decimal, sub } from '../decimal.ts';
@@ -163,6 +164,43 @@ function stateOf(text: string, market: RuleMarket): RuleState {
 }
 
 export const ruleTitle = (config: RuleConfig): string => config.name || `${VENUE_NAMES[config.venue]} ${MARKET_LABELS[config.market]}${config.direction === 'short' ? '做空' : '做多'}${config.market === 'hynix' ? '溢价' : '价差'}`;
+
+/** An executor job releases its symbol locks before the rule consumes the result. Its pending/tracked accounts cover
+ * that handoff; held covers partial closes and disabled rules. Rotating credentials does not move the position. */
+function checkHynixRebalance(db: DatabaseSync, venue: Venue, accountKey: string): void {
+  let rows: { config: string; state: string }[];
+  try { rows = db.prepare('SELECT config, state FROM rules').all() as typeof rows; }
+  catch { throw new ContractError(503, 'rules_unavailable', '无法读取海力士规则持仓，暂不能手动调平'); }
+  for (const row of rows) {
+    let config: RuleConfig | null = null;
+    try { config = parseRuleConfig(JSON.parse(row.config), VENUES); } catch { /* Unknown market or venue may own a position. */ }
+    if (config?.market === 'oil') continue;
+    const { mode, live } = stateOf(row.state, 'hynix');
+    if (mode !== 'live' || live.phase === 'idle') continue;
+    const accounts = [...(live.held ?? []), ...(live.job?.accounts ?? []), ...(live.pending?.accounts ?? [])];
+    const owned = accounts.some(owner => owner.accountKey === accountKey);
+    const unknownOwner = accounts.length === 0 && (!config || config.venue === venue);
+    if (owned || unknownOwner) {
+      const name = config ? `「${ruleTitle(config)}」` : '（参数待核对）';
+      throw new ContractError(409, 'rebalance_rule_conflict', `海力士实盘规则${name}仍有持仓或待核对的任务，不能在该账户手动调平；请先核对规则与持仓`);
+    }
+  }
+}
+
+/** The standalone live executor has no rule engine. An existing service directory may still hold a rule's position. */
+export function checkStoredHynixRebalance(file: string, venue: Venue, accountKey: string): void {
+  let db: DatabaseSync | undefined;
+  try {
+    if (!lstatSync(file, { throwIfNoEntry: false })) return;
+    db = new DatabaseSync(file, { readOnly: true });
+    const version = db.prepare('PRAGMA user_version').get()?.user_version;
+    if (version !== 1 && version !== RULES_SCHEMA_VERSION) throw new Error('unsupported rules database');
+    checkHynixRebalance(db, venue, accountKey);
+  } catch (error) {
+    if (error instanceof ContractError) throw error;
+    throw new ContractError(503, 'rules_unavailable', '无法核对海力士规则持仓，暂不能手动调平');
+  } finally { db?.close(); }
+}
 /** The value for records: oil as before (USDT per barrel, no unit), hynix in percent cut to four places. */
 export const spreadText = (market: RuleMarket, value: string): string => market === 'hynix' ? `${value.replace(/(\.\d{4})\d+$/, '$1')}%` : value;
 
@@ -694,6 +732,6 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     restart(id);
     return view();
   }
-  return { view, tick, create, update, act, close: () => db.close() };
+  return { view, tick, create, update, act, checkHynixRebalance: (venue: Venue, key: string) => checkHynixRebalance(db, venue, key), close: () => db.close() };
 }
 export type OilRules = ReturnType<typeof createOilRules>;

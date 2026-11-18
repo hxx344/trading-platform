@@ -267,6 +267,21 @@ test('服务进程：配置 oil 时启动检查失败则拒绝启动并释放账
       assert.equal((await post(`/api/oil/rules/${saved.id}/live`, { revision: saved.revision })).body.code, 'confirm_required');
       assert.equal((await post(`/api/oil/rules/${saved.id}/other`, { revision: saved.revision })).status, 404);
       assert.equal((await post(`/api/oil/rules/${saved.id}/stop`, { revision: saved.revision })).status, 200);
+      // A disabled rule left holding from an earlier run must protect the authenticated service's trading entry.
+      const held = ['SKHYUSDT', 'SKHYNIXUSDT'].map((symbol, index) => ({
+        symbol, side: index === 0 ? 'short' : 'long', quantity: '1', barrels: '1',
+        accountKey: 'binance:mainnet:123456789', credentialVersion: 1,
+      }));
+      const rulesDb = new DatabaseSync(join(dir, 'data', 'oil-rules.sqlite'));
+      try {
+        const { barrels, ...shared } = rule;
+        const config = { ...shared, market: 'hynix', notional: '100' };
+        rulesDb.prepare('INSERT INTO rules(id, revision, created_at, config, state) VALUES (?, 1, ?, ?, ?)').run(
+          'existing-hynix-rule', Date.now(), JSON.stringify(config), JSON.stringify({ mode: 'live', live: { enabled: false, phase: 'holding', held } }),
+        );
+      } finally { rulesDb.close(); }
+      const blocked = await post('/api/preview', { market: 'hynix', preset: 'rebalance', venue: 'binance', method: 'reduce', timeoutMs: 60_000 });
+      assert.deepEqual([blocked.status, blocked.body.code], [409, 'rebalance_rule_conflict']);
       // PnL (O4): its own file; positions sampled every minute and the ledgers synced at start, then every five minutes.
       let pnl = await get('/api/oil/pnl?range=1d');
       for (let i = 0; i < 100 && (pnl.body.pointCount === 0 || (pnl.body.accounts as { ledger: { coveredUntil: number | null } }[])[0]!.ledger.coveredUntil === null); i++) { await new Promise(resolve => setTimeout(resolve, 20)); pnl = await get('/api/oil/pnl?range=1d'); }

@@ -51,6 +51,7 @@ umask 022
 
 REPO=hxx344/trading-platform
 SERVICE=trading-platform
+CONTROL=$SERVICE-control
 SERVICE_USER=trading-platform
 CONTROL_USER=trading-platform-control
 IPC_GROUP=trading-platform-ipc
@@ -501,7 +502,6 @@ fi
 ((configured || !set_password)) || fail "尚无 $CONF_DIR/config.json，无法设置登录密码"
 
 # ---- 4. 校验配置 ----------------------------------------------------------------------
-CONTROL=$SERVICE-control
 STATE="$APP_DIR/.deployment"
 RECORDS="$APP_DIR/.deployments"
 as_root_dir "$RECORDS" 700

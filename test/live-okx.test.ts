@@ -378,6 +378,42 @@ test('端到端（OKX 本地追价）：撤单受理后查到仍挂着时不发�
   });
 });
 
+test('OKX 对冲追价首次查无又返回异号，部分成交的异步撤单结清后仅按实际余量补市价', async () => {
+  await withExecutor(async ({ venue, ex, clock }) => {
+    const intent = sameOkx();
+    const preview = await ex.preview({ ...intent, legs: [intent.legs[0], { ...intent.legs[1], orderType: 'local-chase', chaseTimeoutMs: 3_000 }] }, 'live-session');
+    const { job } = ex.confirm({ previewId: preview.id, requestId: randomUUID(), confirmLive: true }, 'live-session');
+    const tick = async (ms = 0) => { clock.now += ms; venue.clock = clock.now; await ex.tickJobs(); };
+    const hedge = () => ex.jobView(job.id).legs[1].operation!;
+    const postings = () => venue.calls.filter(call => call.method === 'POST' && call.path === '/api/v5/trade/order').map(call => call.body!);
+    await tick();
+    venue.fill = 'rest'; venue.asyncCancel = true;
+    venue.script('GET /api/v5/trade/order', () => fail('51603', 'Order does not exist'));
+    await tick();
+    const post = postings()[1], original = venue.orders.get(post.clOrdId as string)!;
+    assert.deepEqual([post.ordType, post.sz, hedge().state, hedge().remoteId, hedge().filledQuantity], ['post_only', '20', 'open', original.ordId, '0']);
+    const wrongFill = () => json({ code: '0', msg: '', data: [{ ...original, ordId: '80000001', state: 'filled', accFillSz: '20', avgPx: '70.11' }] });
+    venue.script('GET /api/v5/trade/order', wrongFill);
+    await tick(100);
+    assert.deepEqual([hedge().remoteId, hedge().filledQuantity, postings().length], [original.ordId, '0', 2]);
+
+    Object.assign(original, { state: 'partially_filled', accFillSz: '7', fillPx: '70.11', avgPx: '70.11' });
+    venue.move(original.instId as string, original.side, 7);
+    await tick(3_000);
+    assert.deepEqual(venue.last('POST /api/v5/trade/cancel-order').body, { instId: original.instId, ordId: original.ordId });
+    assert.deepEqual([original.state, hedge().state, hedge().filledQuantity, postings().length], ['partially_filled', 'open', '7', 2]);
+    venue.script('GET /api/v5/trade/order', wrongFill);
+    await tick(100);
+    assert.deepEqual([hedge().remoteId, hedge().filledQuantity, postings().length], [original.ordId, '7', 2]);
+    await tick(100);
+    await tick();
+    assert.deepEqual(postings().map(body => [body.instId, body.ordType, body.sz]), [
+      ['BZ-USDT-SWAP', 'ioc', '20'], ['CL-USDT-SWAP', 'post_only', '20'], ['CL-USDT-SWAP', 'market', '13'],
+    ]);
+    assert.deepEqual([original.state, venue.overlaps, ex.jobView(job.id).status, ex.jobView(job.id).legs[1].filledQuantity], ['canceled', 0, 'completed', '20']);
+  });
+});
+
 test('端到端（OKX 同所）：首腿 50011 限频按已拒绝结束、不重发也不发对冲腿', async () => {
   await withExecutor(async ({ venue, run }) => {
     venue.script('POST /api/v5/trade/order', () => failWrite('50011', 'Too Many Requests', 429));

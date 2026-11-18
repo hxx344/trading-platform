@@ -3,12 +3,12 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from './api.ts';
 import { clock, label } from './labels.ts';
 import { ACTIVE_STATUSES, type OilVenue } from './oil-form.ts';
-import { DEFAULT_HYNIX_FORM, HYNIX_LABEL, LEG_FIELDS, HYNIX_SYMBOLS, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, hedgeVenueFor, closeQuantities, describeHynixFourLeg, describeHynixIntent, draftHynixFourLegs, draftHynixLegs, hynixFormToIntent, hynixFourLegFormToIntent, leadTypeAllowed, type HynixForm, type HynixFourLegIntent, type HynixIntent, type HynixSymbol } from './hynix-form.ts';
+import { DEFAULT_HYNIX_FORM, HYNIX_LABEL, LEG_FIELDS, HYNIX_SYMBOLS, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, HEDGE_TYPES, allowedOrderTypes, hedgeVenueFor, closeQuantities, describeHynixFourLeg, describeHynixIntent, draftHynixFourLegs, draftHynixLegs, hynixFormToIntent, hynixFourLegFormToIntent, type HynixForm, type HynixFourLegIntent, type HynixIntent, type HynixSymbol } from './hynix-form.ts';
 import { isFourLegPreview, type FourLegConfirmResult, type FourLegPreview } from './four-leg.ts';
 import { bookTitle, crossPairs, type CrossRow, type HynixState, type OilBook, type OilConfirmResult, type OilJob, type OilPreview, type OilState } from './oil-types.ts';
 import { BalancePanel } from './HynixBalance.tsx';
 import { readBalance } from './hynix-balance.ts';
-import { ACCOUNT_MODE, ACTIVE_MS, Choice, IDLE_MS, JOB_STATUS, JobsSection, LEAVE_UNANSWERED, MARKET_MS, OIL_READ_TIMEOUT_MS, ORDER_TYPE, PositionsPanel, SyncLine, buys, confirmRefused, errorText, operation, staleness, statusOf, venueName, FourLegInputs, FourLegPreviewCard, chased, venuePairs, type PositionsKind } from './OilPage.tsx';
+import { ACCOUNT_MODE, ACTIVE_MS, Choice, IDLE_MS, JOB_STATUS, JobsSection, LEAVE_UNANSWERED, MARKET_MS, OIL_READ_TIMEOUT_MS, ORDER_TYPE, PositionsPanel, SyncLine, buys, confirmRefused, errorText, hedgeNote, operation, staleness, statusOf, venueName, FourLegInputs, FourLegPreviewCard, chased, venuePairs, type PositionsKind } from './OilPage.tsx';
 import { OilRules } from './OilRules.tsx';
 import { RequestIds } from './request-ids.ts';
 import { StatePanel } from './StateViews.tsx';
@@ -100,12 +100,12 @@ function PreviewCard({ preview, busy, unknown, onConfirm, onEdit }: { preview: H
       <tbody>{preview.legs.map(leg => <tr key={leg.index}>
         <th scope="row"><strong>{venueName(leg.venue)} {name(leg.symbol)}</strong><span className={`execution-side ${leg.side}`}>{operation(preview.intent.action, leg.side)}{leg.reduceOnly ? ' · 只减仓' : ''}</span></th>
         <td data-label="数量"><strong>{leg.quantity}</strong><small>{leg.symbol} · 步长 {leg.instrument.quantityStep}</small></td>
-        <td data-label="下单方式">{leg.index === 0 ? '首腿' : '对冲腿'} · {label(ORDER_TYPE, leg.orderType)}</td>
+        <td data-label="下单方式">{leg.index === 0 ? '首腿' : '对冲腿'} · {label(ORDER_TYPE, leg.orderType)}{leg.chaseTimeoutMs ? <small>超过 {leg.chaseTimeoutMs / 1000} 秒剩余转市价</small> : null}</td>
         <td data-label="价格保护界限">{leg.orderType === 'local-chase' && leg.limitPrice ? <>{leg.limitPrice}<small>自填追价界限</small></> : leg.priceBound ?? '—'}{leg.chaseCeiling ? <small>挂单上限 {leg.chaseCeiling}</small> : null}</td>
         <td data-label="买一 / 卖一">{leg.quote.bid} / {leg.quote.ask}<small>{clock(leg.quote.receivedAt)}</small></td>
       </tr>)}</tbody>
     </table></div>
-    <p className="execution-help">首腿按所选方式下单：市价时以价格保护界限为 IOC 限价；追价时界限是最高追价（卖出时为最低）。对冲腿在首腿成交后按市价跟上，数量按两腿计划比例（对冲腿计划 × 首腿成交 ÷ 首腿计划，向下取整到步长）。同一账户请勿同时在工作台下海力士单。</p>
+    <p className="execution-help">首腿按所选方式下单：市价时以价格保护界限为 IOC 限价；追价时界限是最高追价（卖出时为最低）。对冲腿在首腿成交后按市价或本地追价跟上，数量按两腿计划比例（对冲腿计划 × 首腿成交 ÷ 首腿计划，向下取整到步长）。同一账户请勿同时在工作台下海力士单。</p>
     {preview.notes.length ? <ul className="execution-review-notes">{preview.notes.map((note, index) => <li key={index}>{note}</li>)}</ul> : null}
     {unknown ? <p className="execution-warning">上次确认没有收到应答，可能已受理：请先再点“确认并实盘{action}”核对（沿用同一请求编号，不会重复下单）。</p>
       : expired ? <p className="execution-warning" role="status">预览已过期，确认会被执行器拒绝；请返回修改参数后重新预览。</p> : null}
@@ -145,11 +145,10 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
       const next = { ...current, ...patch };
       // Picking the hedge venue as the lead swaps the two, so a cross-venue pair stays on two venues.
       if (patch.venue !== undefined && patch.hedgeVenue === undefined && patch.venue === current.hedgeVenue) next.hedgeVenue = current.venue;
-      if (!leadTypeAllowed(next.venue, next.leadOrderType)) next.leadOrderType = 'market';
-      // Four legs: the pair is listed in venue order (venuePairs), the second venue's lead chases its own way, and every
-      // leg takes the same notional, opening or closing.
+      // Four legs: the pair is listed in venue order (venuePairs), and every leg takes the same notional, opening or closing.
       if (patch.preset === 'four-leg' && OIL_VENUES.indexOf(next.venue) > OIL_VENUES.indexOf(next.hedgeVenue)) [next.venue, next.hedgeVenue] = [next.hedgeVenue, next.venue];
-      if (!leadTypeAllowed(next.hedgeVenue, next.peerLeadOrderType)) next.peerLeadOrderType = 'market';
+      // Each venue chases its own way, the hedge only on Binance and OKX: an order type the venue now does not offer goes back to market.
+      Object.assign(next, allowedOrderTypes(next));
       // The four-leg direction names the first venue's premium: another preset or venue pair has it picked again.
       if (next.preset !== current.preset || next.venue !== current.venue || next.hedgeVenue !== current.hedgeVenue) next.fourPremium = '';
       // Opening is by equal notional only; closing defaults to the quantities held.
@@ -292,8 +291,10 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
             <header><strong>{VENUE_LABEL[leg.venue]} {name(symbol)}</strong><span className={`execution-side ${leg.side}`}>{operation(form.action, leg.side)}</span><small className="oil-leg-role">{index === 0 ? '首腿' : '对冲腿'}</small></header>
             {form.sizing === 'quantity' ? <label className="execution-amount">合约数量<input id={index === 0 ? 'hynixLeadQuantity' : 'hynixHedgeQuantity'} type="text" inputMode="decimal" autoComplete="off" maxLength={24} value={index === 0 ? form.leadQuantity : form.hedgeQuantity} placeholder={symbol} onChange={event => set(index === 0 ? 'leadQuantity' : 'hedgeQuantity', event.target.value)} /></label> : null}
             {index === 0 ? <Choice label="下单方式" id="hynixLeadType" value={form.leadOrderType} options={LEAD_TYPES[form.venue]} onChange={next => set('leadOrderType', next)} /> : null}
+            {index === 1 ? <Choice label="下单方式" id="hynixHedgeType" value={form.hedgeOrderType} options={HEDGE_TYPES[leg.venue]} onChange={next => set('hedgeOrderType', next)} /> : null}
+            {index === 1 && form.hedgeOrderType === 'local-chase' ? <label className="execution-amount">对冲追价时限 · 秒<input id="hynixHedgeChaseSeconds" type="text" inputMode="numeric" autoComplete="off" maxLength={3} value={form.hedgeChaseSeconds} onChange={event => set('hedgeChaseSeconds', event.target.value)} /></label> : null}
             {index === 0 && form.leadOrderType === 'local-chase' ? <label className="execution-amount">追价界限 · USDT（选填）<input id="hynixChaseLimit" type="text" inputMode="decimal" autoComplete="off" maxLength={24} value={form.chaseLimit} placeholder="留空用价格保护界限" onChange={event => set('chaseLimit', event.target.value)} /></label> : null}
-            <p className="execution-help execution-market-note">{index === 1 ? '首腿成交后按市价跟上，数量按两腿计划比例；首腿挂单期间的成交也会随时跟上。'
+            <p className="execution-help execution-market-note">{index === 1 ? hedgeNote(form.hedgeOrderType, form.hedgeChaseSeconds, buys(form.action, leg.side), '按两腿计划比例')
               : form.leadOrderType === 'chase' ? 'Bybit 原生追价策略，按本方一档追价，直到成交或达到最长执行时间。'
               : form.leadOrderType === 'local-chase' ? `只挂单挂在${buys(form.action, leg.side) ? '买一' : '卖一'}，盘口变化后撤单重挂，${buys(form.action, leg.side) ? '最高' : '最低'}追到界限；不吃单，到最长执行时间未成交的部分撤销。`
               : '市价：按对手盘吃单成交，受价格保护界限约束。'}</p>
@@ -309,7 +310,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
               <label>批次间隔 · 秒<input id="hynixBatchInterval" type="text" inputMode="numeric" autoComplete="off" maxLength={3} value={form.batchIntervalSeconds} disabled={Number(form.batchCount) <= 1} onChange={event => set('batchIntervalSeconds', event.target.value)} /></label>
             </> : null}
           </div>
-          <p className="execution-help">到最长执行时间仍未完成时，停止发送并撤销余单，已成交部分保留。分批时首腿按数量步长均分，每批对冲腿按两腿计划比例跟上，首腿成交并对冲后等满间隔再发下一批；批次间隔合计须短于最长执行时间，任何一批两腿低于最小数量或最小名义金额时预览拒绝。价格保护按预览盘口计算界限：首腿超出界限的部分不成交；对冲腿按市价成交，界限只在首腿发出前核对。</p>
+          <p className="execution-help">到最长执行时间仍未完成时，停止发送并撤销余单，已成交部分保留。分批时首腿按数量步长均分，每批对冲腿按两腿计划比例跟上，首腿成交并对冲后等满间隔再发下一批；批次间隔合计须短于最长执行时间，任何一批两腿低于最小数量或最小名义金额时预览拒绝。价格保护按预览盘口计算界限：首腿超出界限的部分不成交；对冲腿市价成交时界限只在首腿发出前核对，本地追价时挂单不越过界限，超过对冲追价时限后剩余按市价补齐。</p>
         </details>
         <div className="execution-builder-footer">
           {preview ? <p>正在确认上方预览；返回修改参数后可重新填写。</p> : messageView ?? <p>预览会重新读取盘口、交易规则与持仓，不会下单。</p>}
@@ -343,7 +344,7 @@ export function HynixPage({ onExpired }: { onExpired: () => void }) {
       ? <StatePanel kind="error" title="读取海力士状态失败" detail={state.error?.message ?? '网络离线'} />
       : <StatePanel kind="loading" title="加载中…" />)
       : <section className="trading-panel execution-panel" aria-labelledby="hynix-execution-title">
-        <header className="trading-panel-heading"><div><h2 id="hynix-execution-title">海力士组合交易</h2><p>同所 ADR 对正股等金额 · 跨所同一合约 · 首腿市价或追价，成交后对冲腿按比例市价跟上</p></div>
+        <header className="trading-panel-heading"><div><h2 id="hynix-execution-title">海力士组合交易</h2><p>同所 ADR 对正股等金额 · 跨所同一合约 · 首腿市价或追价，成交后对冲腿按比例市价或本地追价跟上</p></div>
           <button className="button secondary" type="button" onClick={() => void state.refresh()}><RefreshCw size={15} aria-hidden="true" />刷新执行状态</button></header>
         <SyncLine stale={stale} text={text} every={`每 ${refreshMs / 1000} 秒`} at={state.receivedAt} />
         <JobsSection jobs={state.data.jobs} stale={stale} tracked={tracked} onUntrack={() => setTracked(null)} onChanged={() => { void state.refresh(); }} />

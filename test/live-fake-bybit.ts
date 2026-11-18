@@ -107,7 +107,8 @@ export class FakeBybit {
       case 'GET /v5/order/history': return ok({ category: 'linear', list: this.matching(this.history, p), nextPageCursor: '' });
       case 'POST /v5/order/create': return this.create(call.body!);
       case 'POST /v5/order/cancel': {
-        const row = this.orders.find(item => item.orderLinkId === call.body!.orderLinkId);
+        const { symbol, orderId, orderLinkId } = call.body!;
+        const row = this.orders.findLast(item => item.symbol === symbol && (orderId !== undefined ? item.orderId === orderId : item.orderLinkId === orderLinkId));
         if (!row || !['New', 'PartiallyFilled'].includes(row.orderStatus as string)) return fail(110001, 'order not exists or too late to cancel');
         row.orderStatus = 'Cancelled';
         return ok({ orderId: row.orderId, orderLinkId: row.orderLinkId });
@@ -151,7 +152,8 @@ export class FakeBybit {
     return this.mode === 'one-way' ? [{ ...base, positionIdx: 0 }] : [{ ...base, positionIdx: 1 }, { ...base, positionIdx: 2 }];
   }
   matching(rows: Row[], p: URLSearchParams): Row[] {
-    return rows.filter(row => row.symbol === p.get('symbol') && (!p.has('orderLinkId') || row.orderLinkId === p.get('orderLinkId')));
+    return rows.filter(row => row.symbol === p.get('symbol') && (!p.has('orderLinkId') || row.orderLinkId === p.get('orderLinkId'))
+      && (!p.has('orderId') || row.orderId === p.get('orderId')));
   }
   create(b: Row): Response {
     if (this.orders.some(row => row.orderLinkId === b.orderLinkId)) return fail(110072, 'OrderLinkedID is duplicate');

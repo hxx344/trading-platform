@@ -249,6 +249,29 @@ test('Binance 连接器：按客户订单号查单与撤单；查无返回 null�
   await assert.rejects(connector.query(binding(), resting, { signal: signal() }), kind('read-failed'));
 });
 
+test('Binance 标准与组合账户按已知 orderId 查撤，即使客户号已指向另一单也只撤原单', async () => {
+  for (const [accountMode, path] of [['standard', '/fapi/v1/order'], ['portfolio-margin', '/papi/v1/um/order']] as const) {
+    const { venue, connector } = setup();
+    const account = binding({ accountMode }), request = order({ timeInForce: 'gtc' });
+    const { remoteId } = await connector.place(account, request, send());
+    const original = venue.orders.get(request.clientOrderId)!;
+    Object.assign(original, { status: 'NEW', executedQty: '0', avgPrice: '0' });
+    const other = { ...original, orderId: venue.nextOrderId++, status: 'NEW' };
+    venue.orders.set(remoteId, original);
+    venue.orders.set(request.clientOrderId, other);
+    const lookup = { signal: signal(), remoteId };
+    assert.equal((await connector.query(account, request, lookup))?.remoteId, remoteId);
+    venue.script('GET ' + path, () => json(other), () => json({ ...original, clientOrderId: 'someone-else' }));
+    await assert.rejects(connector.query(account, request, lookup), kind('read-failed'));
+    await assert.rejects(connector.query(account, request, lookup), kind('read-failed'));
+    const canceled = await connector.cancel(account, request, { ...send(), remoteId });
+    assert.deepEqual([canceled.remoteId, canceled.status, original.status, other.status], ['9007199254740993', 'canceled', 'CANCELED', 'NEW']);
+    const calls = venue.calls.filter(call => call.path === path && call.method !== 'POST');
+    assert.deepEqual(calls.map(call => call.method), ['GET', 'GET', 'GET', 'DELETE']);
+    for (const { params } of calls) assert.deepEqual([params.get('symbol'), params.get('orderId'), params.has('origClientOrderId')], ['CLUSDT', remoteId, false]);
+  }
+});
+
 test('Binance 连接器：执行器不混用真实与模拟传输：实盘里的模拟连接器、模拟环境里的真实连接器都拒绝', () => {
   const h = createHarness();
   try {

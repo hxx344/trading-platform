@@ -43,6 +43,11 @@ export function identifier(value: unknown, name: string): string {
   const parsed = typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? String(value) : value;
   return typeof parsed === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(parsed) ? parsed : shape(`${name}无效`);
 }
+export function checkedOrderId(value: unknown, expected?: string | null): string {
+  const id = identifier(value, '交易所订单号');
+  if (expected != null && id !== expected) throw new ShapeError('回报与原交易所委托编号不一致');
+  return id;
+}
 export const describe = (error: unknown): string => error instanceof Error ? error.message.slice(0, 160) : '未知错误';
 
 /** passphrase: OKX only (docs/oil.md section 10); the other venues' keys never carry one. */

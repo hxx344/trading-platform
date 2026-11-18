@@ -94,7 +94,7 @@ test('Bybit 连接器：下单参数按持仓模式带 positionIdx；回执后�
   const working = parseOrderReport(await connector.query(binding(), pending, { signal: signal() }), pending);
   assert.deepEqual([working.status, working.remoteId, working.filledQuantity], ['new', acked.remoteId, '0']);
   // A follow-up read that finds this client id with another venue id, or a row that does not match, is not a fallback.
-  const echo = (change: Row) => (call: Call) => ok({ category: 'linear', list: venue.orders.filter(row => row.orderLinkId === call.params.get('orderLinkId')).map(row => ({ ...row, ...change })), nextPageCursor: '' });
+  const echo = (change: Row) => (call: Call) => ok({ category: 'linear', list: venue.orders.filter(row => row.orderId === call.params.get('orderId')).map(row => ({ ...row, ...change })), nextPageCursor: '' });
   venue.script('GET /v5/order/realtime', echo({ orderId: 'someone-else' }));
   await assert.rejects(connector.place(binding(), order({ clientOrderId: 'pa1-other-id' }), send()), kind('uncertain'));
   venue.script('GET /v5/order/realtime', echo({ positionIdx: 2 }));

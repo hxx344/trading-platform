@@ -56,6 +56,10 @@ export class FakeOkx {
   count(route: string): number { return this.calls.filter(call => `${call.method} ${call.path}` === route).length; }
   last(route: string): Call { return this.calls.filter(call => `${call.method} ${call.path}` === route).at(-1)!; }
   move(instId: string, side: unknown, quantity: number): void { this.net.set(instId, (this.net.get(instId) ?? 0) + (side === 'buy' ? quantity : -quantity)); }
+  findOrder(instId: unknown, ordId: unknown, clOrdId: unknown): Row | undefined {
+    const row = typeof ordId === 'string' ? [...this.orders.values()].find(item => item.ordId === ordId) : this.orders.get(clOrdId as string);
+    return row?.instId === instId ? row : undefined;
+  }
 
   fetch = async (url: string, init: RequestInit): Promise<Response> => {
     const parsed = new URL(url), headers = new Headers(init.headers), body = typeof init.body === 'string' ? init.body : '';
@@ -86,21 +90,22 @@ export class FakeOkx {
       case 'GET /api/v5/trade/orders-pending': return ok([...this.orders.values()].filter(row => row.instId === p.get('instId') && ['live', 'partially_filled'].includes(row.state as string)));
       case 'GET /api/v5/trade/orders-algo-pending': return ok(this.algos.filter(row => row.instId === p.get('instId') && row.ordType === p.get('ordType')));
       case 'GET /api/v5/trade/order': {
-        const row = this.orders.get(p.get('clOrdId')!);
+        const row = this.findOrder(p.get('instId'), p.get('ordId'), p.get('clOrdId'));
         // The first read after an asynchronous cancel still shows the order live; the one after it shows the cancel.
-        if (row && this.pendingCancels.has(row.clOrdId as string)) {
-          if (row.cancelSeen) { this.pendingCancels.delete(row.clOrdId as string); delete row.cancelSeen; Object.assign(row, { state: 'canceled', cancelSource: '1', uTime: String(this.clock) }); }
+        if (row && this.pendingCancels.has(row.ordId as string)) {
+          if (row.cancelSeen) { this.pendingCancels.delete(row.ordId as string); delete row.cancelSeen; Object.assign(row, { state: 'canceled', cancelSource: '1', uTime: String(this.clock) }); }
           else row.cancelSeen = true;
           if (row.state === 'live') { this.liveAfterCancel++; const { cancelSeen: _seen, ...visible } = row; return ok([visible]); }
         }
-        return row && row.instId === p.get('instId') ? ok([row]) : fail('51603', 'Order does not exist');
+        return row ? ok([row]) : fail('51603', 'Order does not exist');
       }
       case 'POST /api/v5/trade/order': return this.create(call.body!);
       case 'POST /api/v5/trade/cancel-order': {
-        const row = this.orders.get(call.body!.clOrdId as string);
+        const { instId, ordId, clOrdId } = call.body!;
+        const row = this.findOrder(instId, ordId, clOrdId);
         if (!row) return failWrite('51603', 'Order does not exist');
         if (!['live', 'partially_filled'].includes(row.state as string)) return failWrite('51400', 'Order cancellation failed as the order has been filled, canceled or does not exist');
-        if (this.asyncCancel) this.pendingCancels.add(row.clOrdId as string);
+        if (this.asyncCancel) this.pendingCancels.add(row.ordId as string);
         else Object.assign(row, { state: 'canceled', cancelSource: '1', uTime: String(this.clock) });
         return ok([{ clOrdId: row.clOrdId, ordId: row.ordId, sCode: '0', sMsg: '' }]);
       }

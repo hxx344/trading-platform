@@ -4,11 +4,11 @@
 import { okxAuthHeaders } from '../vendor/okx.mjs';
 import { createHash } from 'node:crypto';
 import { VENUE_EXECUTION_SYMBOLS, accountKey, type AccountBinding, type AccountSnapshot, type Instrument, type OpenOrder, type Position, type PositionSide } from '../contracts.ts';
-import { VenueError, type CallOptions, type ConnectorCapabilities, type LedgerEntry, type OrderReport, type OrderRequest, type OrderStatus, type PnlPosition, type PnlSnapshot, type SendOptions, type VenueConnector } from '../connector.ts';
+import { VenueError, type CallOptions, type ConnectorCapabilities, type LedgerEntry, type OrderLookupOptions, type OrderReport, type OrderRequest, type OrderStatus, type PlaceOptions, type PnlPosition, type PnlSnapshot, type SendOptions, type VenueConnector } from '../connector.ts';
 import { cmp, isZero, mul, sub } from '../decimal.ts';
 import { exchange, isRecord, type FetchLike, type HttpReply } from './http.ts';
 import { PreflightError, okxAccountProblem, okxIpProblem, okxPermissionProblem } from './permissions.ts';
-import { ShapeError, amount, cashAmount, describe, hedgeClose, identifier, list, millis, optionalPrice, record, validCredentials, validPassphrase, type LiveCredentials } from './values.ts';
+import { ShapeError, amount, cashAmount, checkedOrderId, describe, hedgeClose, identifier, list, millis, optionalPrice, record, validCredentials, validPassphrase, type LiveCredentials } from './values.ts';
 
 export interface OkxConnectorOptions {
   /** Resolves the key for one binding; a throw refuses the call before anything is sent. */
@@ -248,7 +248,7 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
     return found;
   }
 
-  function orderReport(value: unknown, binding: AccountBinding, request: OrderRequest, mode: Mode | null, kind: 'uncertain' | 'read-failed'): OrderReport {
+  function orderReport(value: unknown, binding: AccountBinding, request: OrderRequest, mode: Mode | null, kind: 'uncertain' | 'read-failed', remoteId?: string | null): OrderReport {
     try {
       const row = record(value, '委托回报');
       if (row.clOrdId !== toClOrdId(request.clientOrderId) || row.instId !== INSTRUMENT_IDS[request.symbol] || row.instType !== 'SWAP' || sideOf(row.side) !== request.side) throw new ShapeError('委托回报的客户订单号、合约或方向与请求不一致');
@@ -269,7 +269,7 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
       const averagePrice = isZero(filledQuantity) ? null : optionalPrice(row.avgPx, '成交均价');
       if (!isZero(filledQuantity) && averagePrice === null) throw new ShapeError('有成交但没有成交均价');
       return {
-        clientOrderId: request.clientOrderId, remoteId: identifier(row.ordId, '交易所订单号'), symbol: request.symbol, side: request.side, quantity, filledQuantity, averagePrice,
+        clientOrderId: request.clientOrderId, remoteId: checkedOrderId(row.ordId, remoteId), symbol: request.symbol, side: request.side, quantity, filledQuantity, averagePrice,
         status, terminal: Object.hasOwn(ORDER_TERMINAL, state), updatedAt: millis(row.uTime || row.cTime, '委托更新时间'),
       };
     } catch (error) {
@@ -278,25 +278,25 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
     }
   }
   /**
-   * The order by clOrdId (open, or ended within the venue's retention); null only when the venue answers 51603. A success
+   * The original order by ordId (clOrdId until a venue ID is known); null only when the venue answers 51603. A success
    * with no row proves nothing, so it fails the read (L093).
    */
-  async function findOrder(binding: AccountBinding, request: OrderRequest, signal: AbortSignal): Promise<unknown | null> {
+  async function findOrder(binding: AccountBinding, request: OrderRequest, signal: AbortSignal, remoteId?: string | null): Promise<unknown | null> {
     const clOrdId = toClOrdId(request.clientOrderId);
     if (!clOrdId) throw new VenueError('read-failed', 'OKX 查单：客户订单号格式无效');
-    const data = await reading(async () => signed(binding, 'GET', '/api/v5/trade/order', { instId: instrumentId(request.symbol), clOrdId }, { signal }));
+    const data = await reading(async () => signed(binding, 'GET', '/api/v5/trade/order', { instId: instrumentId(request.symbol), ...(remoteId == null ? { clOrdId } : { ordId: remoteId }) }, { signal }));
     if (data === null) return null;
     if (data.length === 0) throw new VenueError('read-failed', 'OKX 查单应答成功但没有委托记录');
     if (data.length > 1) throw new VenueError('read-failed', 'OKX 同一客户订单号返回了多笔委托');
     return data[0];
   }
   /** The one acknowledgement row of a write: sCode 0 and our clOrdId; anything else leaves the outcome open. */
-  function ackOf(data: unknown[] | null, clOrdId: string, what: string): string {
+  function ackOf(data: unknown[] | null, clOrdId: string, what: string, remoteId?: string | null): string {
     try {
       if (data === null || data.length !== 1) throw new ShapeError(`${what}回执不是一条记录`);
       const row = record(data[0], `${what}回执`);
       if (row.sCode !== '0' || row.clOrdId !== clOrdId) throw new ShapeError(`${what}回执的状态码或客户订单号与请求不一致`);
-      return identifier(row.ordId, '交易所订单号');
+      return checkedOrderId(row.ordId, remoteId);
     } catch (error) { throw new VenueError('uncertain', `OKX ${what}回执无法使用：${describe(error)}`); }
   }
 
@@ -389,7 +389,7 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
       return { venue: 'okx', accountId: config.uid, positionModes, positions, openOrders, receivedAt: now() };
     }),
 
-    async place(binding: AccountBinding, request: OrderRequest, { signal, beforeSend }: SendOptions): Promise<OrderReport> {
+    async place(binding: AccountBinding, request: OrderRequest, { signal, beforeSend, ackOnly }: PlaceOptions): Promise<OrderReport> {
       const refuse = (message: string): never => { throw new VenueError('not-sent', `OKX 委托未发送：${message}`); };
       if (!VENUE_EXECUTION_SYMBOLS.okx.includes(request.symbol) || !INSTRUMENT_IDS[request.symbol]) refuse(`${request.symbol} 不是可执行合约`);
       const clOrdId = toClOrdId(request.clientOrderId);
@@ -407,32 +407,30 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
       };
       const remoteId = ackOf(await signed(binding, 'POST', '/api/v5/trade/order', body, { signal, beforeSend }), clOrdId, '下单');
       // OKX assigns the ID before the matching engine can cancel a crossing post-only order.
+      const ack: OrderReport = { clientOrderId: request.clientOrderId, remoteId, symbol: request.symbol, side: request.side, quantity: request.quantity, filledQuantity: '0', averagePrice: null, status: 'acknowledged', terminal: false, updatedAt: now() + offset };
+      if (ackOnly) return ack;
       let row: unknown = null;
-      try { row = await findOrder(binding, request, signal); }
+      try { row = await findOrder(binding, request, signal, remoteId); }
       catch (error) { if (!(error instanceof VenueError && error.kind === 'read-failed')) throw error; }
-      if (row !== null) {
-        const report = orderReport(row, binding, request, mode, 'uncertain');
-        if (report.remoteId !== remoteId) throw new VenueError('uncertain', 'OKX 同一客户订单号查到的委托编号与下单回执不一致');
-        return report;
-      }
-      return { clientOrderId: request.clientOrderId, remoteId, symbol: request.symbol, side: request.side, quantity: request.quantity, filledQuantity: '0', averagePrice: null, status: 'acknowledged', terminal: false, updatedAt: now() + offset };
+      return row === null ? ack : orderReport(row, binding, request, mode, 'uncertain', remoteId);
     },
 
-    async query(binding: AccountBinding, request: OrderRequest, { signal }: CallOptions): Promise<OrderReport | null> {
+    async query(binding: AccountBinding, request: OrderRequest, { signal, remoteId }: OrderLookupOptions): Promise<OrderReport | null> {
       if (!VENUE_EXECUTION_SYMBOLS.okx.includes(request.symbol)) throw new VenueError('read-failed', `${request.symbol} 不是可执行合约`);
-      const row = await findOrder(binding, request, signal);
-      return row === null ? null : orderReport(row, binding, request, null, 'read-failed');
+      const row = await findOrder(binding, request, signal, remoteId);
+      return row === null ? null : orderReport(row, binding, request, null, 'read-failed', remoteId);
     },
 
-    async cancel(binding: AccountBinding, request: OrderRequest, { signal, beforeSend }: SendOptions): Promise<OrderReport> {
+    async cancel(binding: AccountBinding, request: OrderRequest, { signal, beforeSend, remoteId }: SendOptions & OrderLookupOptions): Promise<OrderReport> {
       const clOrdId = toClOrdId(request.clientOrderId);
       if (!VENUE_EXECUTION_SYMBOLS.okx.includes(request.symbol) || !INSTRUMENT_IDS[request.symbol] || !clOrdId) throw new VenueError('not-sent', 'OKX 撤单未发送：合约或客户订单号无效');
-      ackOf(await signed(binding, 'POST', '/api/v5/trade/cancel-order', { instId: INSTRUMENT_IDS[request.symbol], clOrdId }, { signal, beforeSend }), clOrdId, '撤单');
+      const target = remoteId == null ? { clOrdId } : { ordId: remoteId };
+      const canceledId = ackOf(await signed(binding, 'POST', '/api/v5/trade/cancel-order', { instId: INSTRUMENT_IDS[request.symbol], ...target }, { signal, beforeSend }), clOrdId, '撤单', remoteId);
       // The cancel answers only an acknowledgement; without a readable order the outcome stays open and is read again later.
       let row: unknown;
-      try { row = await findOrder(binding, request, signal); } catch (error) { throw new VenueError('uncertain', `OKX 撤单已受理，委托回报读取失败：${describe(error)}`); }
+      try { row = await findOrder(binding, request, signal, canceledId); } catch (error) { throw new VenueError('uncertain', `OKX 撤单已受理，委托回报读取失败：${describe(error)}`); }
       if (row === null) throw new VenueError('uncertain', 'OKX 撤单已受理，但查不到该委托');
-      return orderReport(row, binding, request, null, 'uncertain');
+      return orderReport(row, binding, request, null, 'uncertain', canceledId);
     },
 
     pnlPositions: (binding: AccountBinding, symbols: readonly string[], { signal }: CallOptions) => reading(async (): Promise<PnlSnapshot> => {

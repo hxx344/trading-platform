@@ -163,6 +163,14 @@ export interface SendOptions extends CallOptions {
   /** Called synchronously right before transmission; a throw means the request was not sent. */
   beforeSend: () => void;
 }
+export interface PlaceOptions extends SendOptions {
+  /** Return an asynchronous create's receipt before its first status query, so the executor can save the venue ID. */
+  ackOnly?: boolean;
+}
+export interface OrderLookupOptions extends CallOptions {
+  /** A known venue ID is the lookup/cancel target. The returned order must still match the original client ID. */
+  remoteId?: string | null;
+}
 
 export interface VenueConnector {
   readonly venue: Venue;
@@ -172,10 +180,10 @@ export interface VenueConnector {
   /** Rechecked before a price-dependent send, including after signing or a venue clock retry. */
   quoteCurrent?(quote: Quote): boolean;
   account(binding: AccountBinding, symbols: readonly string[], options: CallOptions): Promise<AccountSnapshot>;
-  place(binding: AccountBinding, order: OrderRequest, options: SendOptions): Promise<OrderReport>;
-  /** null means the venue answered that no order with this client id exists. */
-  query(binding: AccountBinding, order: OrderRequest, options: CallOptions): Promise<OrderReport | null>;
-  cancel(binding: AccountBinding, order: OrderRequest, options: SendOptions): Promise<OrderReport>;
+  place(binding: AccountBinding, order: OrderRequest, options: PlaceOptions): Promise<OrderReport>;
+  /** null means the venue answered that no order with the requested ID exists. */
+  query(binding: AccountBinding, order: OrderRequest, options: OrderLookupOptions): Promise<OrderReport | null>;
+  cancel(binding: AccountBinding, order: OrderRequest, options: SendOptions & OrderLookupOptions): Promise<OrderReport>;
   /** Present only with capabilities.chase. An answer only proves acceptance; fills are read with queryStrategy. */
   placeChase?(binding: AccountBinding, request: StrategyRequest, options: SendOptions): Promise<StrategyAck>;
   /** null means the venue answered that no strategy with this id exists on the account. */

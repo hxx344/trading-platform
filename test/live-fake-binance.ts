@@ -112,7 +112,8 @@ export class FakeBinance {
       this.orders.set(id, row);
       return json(row);
     }
-    const row = this.orders.get(p.get('origClientOrderId')!);
+    const row = p.has('orderId') ? [...this.orders.values()].find(item => item.symbol === p.get('symbol') && String(item.orderId) === p.get('orderId'))
+      : this.orders.get(p.get('origClientOrderId')!);
     if (call.method === 'GET') return row ? json(row) : json({ code: -2013, msg: 'Order does not exist.' }, 400);
     if (!row || row.status !== 'NEW') return json({ code: -2011, msg: 'Unknown order sent.' }, 400);
     row.status = 'CANCELED';

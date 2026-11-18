@@ -1596,7 +1596,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     };
     try {
       if (request.type === 'chase') strategyId = parseStrategyAck(await callVenue('write', signal => chaseConnector(leg.venue).placeChase(binding, strategyRequestOf(request), { signal, beforeSend }))).strategyId;
-      else report = parseOrderReport(await callVenue('write', signal => connectorFor(leg.venue).place(binding, request, { signal, beforeSend })), request);
+      else report = parseOrderReport(await callVenue('write', signal => connectorFor(leg.venue).place(binding, request, { signal, beforeSend, ackOnly: true })), request);
     } catch (error) { failure = error; }
     const ackAt = now();
     if (strategyId !== null) {
@@ -1623,6 +1623,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     });
     // Released only after the local result is durable; anything left open is settled from local facts later.
     if (registered && settled) control?.finish(registered, outcomeOf(settled));
+    if (settled === 'open' && report?.status === 'acknowledged') await reconcile(job, readOp(op.id));
   }
   type AckCheck = { report: StrategyReport } | { orphan: string } | { unread: string };
   /**
@@ -1704,7 +1705,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const binding = bindingOf(row), startedAt = now(), request = op.request as OrderRequest;
     let report: OrderReport | null;
     try {
-      const value = await callVenue('read', signal => connectorFor(op.venue).query(binding, request, { signal }));
+      const value = await callVenue('read', signal => connectorFor(op.venue).query(binding, request, { signal, remoteId: op.remoteId }));
       report = value === null ? null : parseOrderReport(value, request, op.remoteId);
     }
     catch (error) {
@@ -1728,7 +1729,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         return working;
       });
     }
-    if (op.state === 'open') { write(() => { const current = readOp(op.id); current.note = '交易所查无已确认的委托，保留待人工核对'; saveOp(current); }); return; }
+    if (op.state === 'open') { write(() => { const current = readOp(op.id); current.note = '交易所暂未查到原委托，保留编号继续核对'; saveOp(current); }); return; }
     // A damaged ledger cannot prove that the account has no trace of an unknown order.
     if (op.state !== 'unknown' || job.fourLegQuantityIssue) return;
     // A miss is not proof (L039/L093): wait out the request validity window, count spaced misses, then require the account to show no trace.
@@ -1879,7 +1880,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
           outcome = 'confirmed';
         } else {
           const request = op.request as OrderRequest;
-          const report = parseOrderReport(await callVenue('write', signal => connectorFor(op.venue).cancel(binding, request, { signal, beforeSend })), request, op.remoteId);
+          const report = parseOrderReport(await callVenue('write', signal => connectorFor(op.venue).cancel(binding, request, { signal, beforeSend, remoteId: op.remoteId })), request, op.remoteId);
           write(() => { const current = readOp(op.id); if (SETTLED.has(current.state)) return; applyReport(current, report); saveOp(current); });
           outcome = 'confirmed';
         }
@@ -2441,7 +2442,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
           previewQuote: { bid: leg.quote.bid, ask: leg.quote.ask },
           attempts: mine.length, filledQuantity,
           operation: op ? { kind: op.kind ?? 'order', clientOrderId: op.clientOrderId, state: op.state, quantity: op.request?.quantity ?? '无效', limitPrice: (op.request as { limitPrice?: string | null })?.limitPrice ?? null, filledQuantity: op.filledQuantity, averagePrice: op.averagePrice, remoteId: op.remoteId,
-            strategyStatus: op.strategyStatus ?? null, childrenSettled: op.childrenSettled ?? null, adoptedAt: op.adoptedAt ?? null, releasedAt: op.releasedAt ?? null, ackStrategyId: op.ackStrategyId ?? null, note: op.note } : null };
+            venueStatus: op.venueStatus ?? null, verifiedWorking: op.verifiedWorking === true, strategyStatus: op.identityVerifiedAt != null && op.identityMismatchAt == null ? op.strategyStatus ?? null : null,
+            childrenSettled: op.childrenSettled ?? null, adoptedAt: op.adoptedAt ?? null, releasedAt: op.releasedAt ?? null, ackStrategyId: op.ackStrategyId ?? null, note: op.note } : null };
       }),
       events,
     };

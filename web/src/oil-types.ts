@@ -1,6 +1,7 @@
 // The shapes of the oil reads (GET /api/oil/market, /api/oil/state) and of a preview, as the oil page reads them.
 import type { Account } from './types.ts';
 import type { OilIntent } from './oil-form.ts';
+import type { OrderStatus, StrategyStatus } from '../../src/connector.ts';
 
 /** O7: `pushed` = the market monitor's collector (venue time), `rest` = this service's own read (receive time); absent before v0.59.0. */
 export interface OilBook { venue: string; symbol: string; bid: string | null; ask: string | null; receivedAt: number | null; source?: 'pushed' | 'rest' | null; failedAt: number | null; error: string | null }
@@ -32,7 +33,27 @@ export interface OilPositionAccount {
 }
 export interface OilOperation {
   kind: string; clientOrderId: string; state: string; quantity: string; limitPrice?: string | null; filledQuantity: string; averagePrice: string | null; remoteId: string | null;
-  strategyStatus: string | null; childrenSettled: boolean | null; adoptedAt: number | null; releasedAt: number | null; ackStrategyId: string | null; note: string | null;
+  /** Latest ordinary order report and whether a working order or strategy has ever been verified. Older APIs omit both. */
+  venueStatus?: OrderStatus | null; verifiedWorking?: boolean;
+  strategyStatus: StrategyStatus | null; childrenSettled: boolean | null; adoptedAt: number | null; releasedAt: number | null; ackStrategyId: string | null; note: string | null;
+}
+const OP_STATE: Record<string, string> = { prepared: '已落盘', sending: '发送中', unknown: '结果未知，核对中', rejected: '被拒绝', 'not-sent': '未发送', 'not-created': '确认未创建', filled: '已成交', canceled: '已撤销', confirmed: '已确认' };
+export function operationStatus(op: Pick<OilOperation, 'state' | 'kind' | 'venueStatus' | 'verifiedWorking' | 'strategyStatus' | 'childrenSettled'> | null): string {
+  if (!op) return '未发送';
+  if (op.state !== 'open') return OP_STATE[op.state] ?? op.state;
+  if (op.kind === 'strategy') {
+    // Older APIs did not check the strategy's identity when exposing its status.
+    if (op.verifiedWorking === undefined) return '策略状态待核实';
+    if (op.strategyStatus === 'paused') return '策略已暂停';
+    if (op.strategyStatus === 'terminal') {
+      if (op.childrenSettled === false) return '策略已结束，子单待结清';
+      return op.childrenSettled === true ? '策略已结束' : '策略已结束，子单状态待核实';
+    }
+    return op.strategyStatus === 'working' && op.verifiedWorking ? '策略运行中' : '策略状态待核实';
+  }
+  if (op.venueStatus === 'acknowledged') return '已收到回执，挂单待核实';
+  if (op.kind === 'order' && op.verifiedWorking && (op.venueStatus === 'new' || op.venueStatus === 'partially-filled')) return '交易所挂单中';
+  return '挂单状态待核实';
 }
 export interface OilJobLeg {
   venue: string; symbol: string; side: string; orderSide: string; orderType: string; plannedQuantity: string; accountId: string; priceBound: string | null; limitPrice?: string | null;

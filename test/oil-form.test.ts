@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseIntent, parsePairIntent } from '../src/contracts.ts';
 import { DEFAULT_FORM, describeIntent, formToIntent, hedgeVenueFor, jobActions, type OilForm } from '../web/src/oil-form.ts';
+import { operationStatus } from '../web/src/oil-types.ts';
 
 const build = (patch: Partial<OilForm>) => {
   const result = formToIntent({ ...DEFAULT_FORM, barrels: '10', ...patch });
@@ -77,6 +78,31 @@ test('原油任务操作：运行中可停止；追价创建结果未知时给�
   assert.deepEqual(jobActions({ ...flags, status: 'attention' }), { stop: false, strategy: false, acknowledge: true });
   assert.deepEqual(jobActions({ ...flags, status: 'attention', locked: false }), { stop: false, strategy: false, acknowledge: false });
   for (const status of ['completed', 'failed', 'stopped']) assert.deepEqual(jobActions({ ...flags, status }), { stop: false, strategy: false, acknowledge: false });
+});
+
+test('原油与海力士任务卡：按最新委托回报显示，历史挂单证据不能把本次回执显示为在挂', () => {
+  const order = { kind: 'order', state: 'open', strategyStatus: null, childrenSettled: null };
+  assert.equal(operationStatus(order), '挂单状态待核实');
+  assert.equal(operationStatus({ ...order, venueStatus: 'new', verifiedWorking: false }), '挂单状态待核实');
+  for (const verifiedWorking of [false, true]) {
+    assert.equal(operationStatus({ ...order, venueStatus: 'acknowledged', verifiedWorking }), '已收到回执，挂单待核实');
+  }
+  for (const venueStatus of ['new', 'partially-filled'] as const) {
+    assert.equal(operationStatus({ ...order, venueStatus, verifiedWorking: true }), '交易所挂单中');
+  }
+  assert.equal(operationStatus({ ...order, state: 'filled' }), '已成交');
+  assert.equal(operationStatus({ ...order, state: 'canceled' }), '已撤销');
+});
+
+test('原油与海力士任务卡：区分策略运行、首次核对即暂停、子单待结清，以及未核对身份的回执与旧记录', () => {
+  const strategy = { kind: 'strategy', state: 'open', strategyStatus: null, childrenSettled: false };
+  assert.equal(operationStatus({ ...strategy, verifiedWorking: false }), '策略状态待核实');
+  assert.equal(operationStatus({ ...strategy, verifiedWorking: true }), '策略状态待核实');
+  assert.equal(operationStatus({ ...strategy, strategyStatus: 'working' }), '策略状态待核实');
+  assert.equal(operationStatus({ ...strategy, strategyStatus: 'working', verifiedWorking: true }), '策略运行中');
+  assert.equal(operationStatus({ ...strategy, strategyStatus: 'paused', verifiedWorking: false }), '策略已暂停');
+  assert.equal(operationStatus({ ...strategy, strategyStatus: 'terminal', verifiedWorking: false }), '策略已结束，子单待结清');
+  assert.equal(operationStatus({ ...strategy, state: 'unknown', verifiedWorking: false }), '结果未知，核对中');
 });
 
 test('原油下单表单：本地追价只给 Binance 首腿，可填追价界限；分批只用于市价与本地追价，通过执行器校验', () => {

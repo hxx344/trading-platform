@@ -16,14 +16,14 @@ const OKX_CREATE = 'POST /api/v5/trade/order', OKX_QUERY = 'GET /api/v5/trade/or
 const BYBIT_CREATE = 'POST /v5/order/create', BYBIT_QUERY = 'GET /v5/order/realtime';
 
 /** An oil four-leg group driven through the two production connectors, with all HTTP served by the venues below. */
-async function fourLeg(t: TestContext, first: 'okx' | 'bybit') {
+async function fourLeg(t: TestContext, first: 'okx' | 'bybit', firstBybitLookup: (venue: FakeBybit) => Response = () => bybitFail(10016, 'server error', 500)) {
   const okx = new FakeOkx(), bybit = new FakeBybit();
   okx.fill = 'rest';
   bybit.instruments.push(instrumentRow({ symbol: 'BZUSDT', baseCoin: 'BZ' }));
   bybit.script(BYBIT_CREATE, call => {
     const receipt = bybit.create(call.body!);
     Object.assign(bybit.orders.at(-1)!, { orderStatus: 'Created', cumExecQty: '0', avgPrice: '' });
-    bybit.script(BYBIT_QUERY, () => bybitFail(10016, 'server error', 500));
+    bybit.script(BYBIT_QUERY, () => firstBybitLookup(bybit));
     return receipt;
   });
   const now = () => okx.clock;
@@ -77,8 +77,8 @@ test('四腿 OKX 只挂单回执后查无，再查到零成交过期，两所重
   await tick();
   assert.deepEqual([lead().state, lead().filledQuantity, okx.count(OKX_CREATE), bybit.count(BYBIT_CREATE)], ['canceled', '0', 1, 0]);
   assert.match(ex.jobView(firstId).reason ?? '', /Bybit.*盘口已过期/);
-  assert.deepEqual(okx.calls.filter(call => call.method === 'GET' && call.path === '/api/v5/trade/order').map(call => call.params.get('clOrdId')),
-    [create.clOrdId, create.clOrdId, create.clOrdId]);
+  assert.deepEqual(okx.calls.filter(call => call.method === 'GET' && call.path === '/api/v5/trade/order')
+    .map(call => [call.params.get('ordId'), call.params.has('clOrdId')]), Array(3).fill([row.ordId, false]));
 
   okx.script('GET /api/v5/market/books', () => okxOk([{ bids: [['70.10', '31']], asks: [['70.12', '12.5']], ts: String(okx.clock - 60_000) }]));
   await tick();
@@ -101,12 +101,13 @@ test('四腿 OKX 按原编号核实挂单后 Bybit 放行，随后可按原编�
   await tick();
   assert.deepEqual([okx.count(OKX_CREATE), bybit.count(BYBIT_CREATE), lead().remoteId], [1, 0, row.ordId], '同一客户编号下的另一个交易所编号不能解锁');
   await tick();
-  assert.equal(okx.last(OKX_QUERY).params.get('clOrdId'), original.clOrdId);
+  assert.deepEqual([okx.last(OKX_QUERY).params.get('ordId'), okx.last(OKX_QUERY).params.has('clOrdId')], [row.ordId, false]);
   assert.deepEqual([okx.count(OKX_CREATE), bybit.count(BYBIT_CREATE), lead().state, lead().filledQuantity], [1, 1, 'open', '0']);
 
   okx.book = { bid: '70.15', ask: '70.17' };
   await tick(2_000);
-  assert.deepEqual([okx.count(OKX_CANCEL), okx.last(OKX_CANCEL).body!.clOrdId, okx.count(OKX_CREATE), lead().state], [1, original.clOrdId, 1, 'canceled']);
+  assert.deepEqual([okx.count(OKX_CANCEL), okx.count(OKX_CREATE), lead().state], [1, 1, 'canceled']);
+  assert.deepEqual(okx.last(OKX_CANCEL).body, { instId: row.instId, ordId: row.ordId });
   assert.equal(bybit.orders[0].orderStatus, 'Created');
   staleBybitBook(bybit);
   await tick();
@@ -122,12 +123,69 @@ test('四腿 Bybit 限价单仅获编号或查到 Created 时 OKX 等待，同�
   assert.deepEqual([bybit.count(BYBIT_CREATE), bybit.last(BYBIT_CREATE).body!.timeInForce, okx.count(OKX_CREATE)], [1, 'GTC', 0]);
   assert.deepEqual([lead().state, lead().clientOrderId, lead().remoteId], ['open', id, order.orderId]);
   await tick();
-  assert.equal(bybit.last(BYBIT_QUERY).params.get('orderLinkId'), id);
+  assert.deepEqual([bybit.last(BYBIT_QUERY).params.get('orderId'), bybit.last(BYBIT_QUERY).params.has('orderLinkId')], [order.orderId, false]);
   assert.deepEqual([order.orderStatus, bybit.count(BYBIT_CREATE), okx.count(OKX_CREATE)], ['Created', 1, 0]);
   order.orderStatus = 'New';
   await tick();
   assert.deepEqual([bybit.count(BYBIT_CREATE), okx.count(OKX_CREATE), lead().filledQuantity], [1, 1, '0']);
   ex.requestStop(firstId, randomUUID(), SESSION);
   await tick();
-  assert.deepEqual([bybit.last('POST /v5/order/cancel').body!.orderLinkId, lead().remoteId, lead().state], [id, order.orderId, 'canceled']);
+  assert.deepEqual(bybit.last('POST /v5/order/cancel').body, { symbol: order.symbol, category: 'linear', orderId: order.orderId });
+  assert.deepEqual([lead().remoteId, lead().state], [order.orderId, 'canceled']);
+});
+
+test('四腿 OKX 首查前已保存 ordId，连续查到同客户号的另一单挂单和成交都不放行，停止只撤原单', async t => {
+  const { okx, bybit, ex, firstId, tick, lead } = await fourLeg(t, 'okx');
+  const otherId = '80000001';
+  let savedAtFirstRead: string | null = null;
+  okx.script(OKX_QUERY, () => {
+    savedAtFirstRead = lead().remoteId;
+    const original = [...okx.orders.values()][0];
+    return okxOk([{ ...original, ordId: otherId }]);
+  });
+  await tick();
+  const original = [...okx.orders.values()][0];
+  const other = { ...original, ordId: otherId, state: 'live' };
+  assert.equal(savedAtFirstRead, original.ordId);
+  assert.deepEqual([lead().remoteId, lead().state, lead().filledQuantity, bybit.count(BYBIT_CREATE)], [original.ordId, 'open', '0', 0]);
+  okx.script(OKX_QUERY, () => okxOk([{ ...other, state: 'filled', accFillSz: original.sz, avgPx: '70.11' }]));
+  await tick();
+  assert.deepEqual([lead().remoteId, lead().filledQuantity, okx.count(OKX_CREATE), bybit.count(BYBIT_CREATE)], [original.ordId, '0', 1, 0]);
+  const lookups = okx.calls.filter(call => call.method === 'GET' && call.path === '/api/v5/trade/order');
+  assert.deepEqual(lookups.map(call => [call.params.get('ordId'), call.params.has('clOrdId')]), Array(2).fill([original.ordId, false]));
+
+  // The client ID now resolves to the other open order. Only the venue ID can cancel the original.
+  okx.orders.set(original.ordId as string, original);
+  okx.orders.set(original.clOrdId as string, other);
+  ex.requestStop(firstId, randomUUID(), SESSION);
+  await tick();
+  assert.deepEqual(okx.last(OKX_CANCEL).body, { instId: original.instId, ordId: original.ordId });
+  assert.deepEqual([original.state, other.state, lead().remoteId, lead().state, bybit.count(BYBIT_CREATE)], ['canceled', 'live', original.ordId, 'canceled', 0]);
+});
+
+test('四腿 Bybit 首查前已保存 orderId，连续查到其他编号的成交和挂单都不计入，撤单按原编号送达', async t => {
+  const otherId = '0000-99';
+  let savedAtFirstRead: string | null = null;
+  const h = await fourLeg(t, 'bybit', venue => {
+    savedAtFirstRead = h.lead().remoteId;
+    const original = venue.orders[0];
+    return bybitOk({ category: 'linear', list: [{ ...original, orderId: otherId, orderStatus: 'Filled', cumExecQty: original.qty, avgPrice: '70.11' }], nextPageCursor: '' });
+  });
+  const { okx, bybit, ex, firstId, tick, lead } = h;
+  await tick();
+  const original = bybit.orders[0], other = { ...original, orderId: otherId, orderStatus: 'New' };
+  assert.equal(savedAtFirstRead, original.orderId);
+  assert.deepEqual([lead().remoteId, lead().state, lead().filledQuantity, okx.count(OKX_CREATE)], [original.orderId, 'open', '0', 0]);
+  bybit.script(BYBIT_QUERY, () => bybitOk({ category: 'linear', list: [other], nextPageCursor: '' }));
+  await tick();
+  assert.deepEqual([lead().remoteId, lead().filledQuantity, bybit.count(BYBIT_CREATE), okx.count(OKX_CREATE)], [original.orderId, '0', 1, 0]);
+  const lookups = bybit.calls.filter(call => call.path === '/v5/order/realtime' && (call.params.has('orderId') || call.params.has('orderLinkId')));
+  assert.deepEqual(lookups.map(call => [call.params.get('orderId'), call.params.has('orderLinkId')]), Array(2).fill([original.orderId, false]));
+
+  original.orderStatus = 'New';
+  bybit.orders.push(other);
+  ex.requestStop(firstId, randomUUID(), SESSION);
+  await tick();
+  assert.deepEqual(bybit.last('POST /v5/order/cancel').body, { symbol: original.symbol, category: 'linear', orderId: original.orderId });
+  assert.deepEqual([original.orderStatus, other.orderStatus, lead().remoteId, lead().state, okx.count(OKX_CREATE)], ['Cancelled', 'New', original.orderId, 'canceled', 0]);
 });

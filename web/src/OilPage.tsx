@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from './api.ts';
 import { clock, label, stamp } from './labels.ts';
 import { ACTIVE_STATUSES, CONFIRM_ACKNOWLEDGE, CONFIRM_NOT_CREATED, CONFIRM_RELEASE, DEFAULT_FORM, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, describeFourLeg, describeIntent, draftFourLegs, fourLegFormToIntent, hedgeVenueFor, leadTypeAllowed, draftLegs, formToIntent, jobActions, type OilForm, type OilFourLegIntent, type OilIntent, type OilLeadType, type OilSymbol, type OilVenue } from './oil-form.ts';
-import { bookTitle, crossPairs, type OilBook, type OilConfirmResult, type OilJob, type OilMarket, type OilPositionAccount, type OilPreview, type OilPreviewLeg, type OilState } from './oil-types.ts';
+import { bookTitle, crossPairs, operationStatus, type OilBook, type OilConfirmResult, type OilJob, type OilMarket, type OilPositionAccount, type OilPreview, type OilPreviewLeg, type OilState } from './oil-types.ts';
 import { groupJobs, groupStatus, isFourLegPreview, type FourLegConfirmResult, type FourLegPreview, type GroupState } from './four-leg.ts';
 import { RequestIds } from './request-ids.ts';
 import { StatePanel } from './StateViews.tsx';
@@ -30,8 +30,6 @@ const TRACKING_STATUS: Record<string, string> = {
 /** A hynix rebalance sends one order and nothing follows it. */
 const REBALANCE_TRACKING: Record<string, string> = { ...TRACKING_STATUS, accepted: '已受理，正在发送调平委托。', running: '执行中：调平委托已发送，等待成交结果。', completed: '已完成，成交见下表。' };
 const isRebalance = (job: Pick<OilJob, 'preset'>): boolean => job.preset === 'rebalance';
-const OP_STATE: Record<string, string> = { prepared: '已落盘', sending: '发送中', open: '交易所挂单中', unknown: '结果未知，核对中', rejected: '被拒绝', 'not-sent': '未发送', 'not-created': '确认未创建', filled: '已成交', canceled: '已撤销', confirmed: '已确认' };
-const STRATEGY_STATUS: Record<string, string> = { working: '运行中', paused: '已暂停', terminal: '已结束' };
 export const ORDER_TYPE: Record<string, string> = { market: '市价', chase: '追价策略', 'local-chase': '本地追价', limit: '限价' };
 export const ACCOUNT_MODE: Record<string, string> = { standard: '普通 U 本位', 'portfolio-margin': '组合保证金', unified: '统一账户', cross: '全仓', isolated: '逐仓' };
 const SYMBOLS: readonly OilSymbol[] = ['BZUSDT', 'CLUSDT'];
@@ -486,7 +484,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
 function strategyText(leg: OilJob['legs'][number]): string {
   const op = leg.operation;
   if (!op || op.kind !== 'strategy') return '';
-  return `追价策略 ${op.remoteId ?? '编号未知'}${op.strategyStatus ? ` ${label(STRATEGY_STATUS, op.strategyStatus)}` : ''}${op.strategyStatus === 'terminal' && op.childrenSettled === false ? '（子单未结清）' : ''}${op.adoptedAt ? '（人工认领）' : ''}${op.releasedAt ? '（已强制释放）' : ''}`;
+  return ` · 策略编号 ${op.remoteId ?? '未知'}${op.adoptedAt ? '（人工认领）' : ''}${op.releasedAt ? '（已强制释放）' : ''}`;
 }
 
 type ActionKind = 'stop' | 'acknowledge' | 'adopt' | 'notcreated' | 'release';
@@ -514,8 +512,8 @@ function JobCard({ job, busy, strategyId, onStrategyId, onAction }: { job: OilJo
           ? <span><strong>{leg.filledQuantity}</strong> / {leg.plannedQuantity}<small>{leg.symbol}{leg.attempts > 1 ? ` · ${leg.attempts} 笔` : ''}</small></span>
           : <span><strong>{leg.filledBarrels}</strong> / {leg.plannedBarrels} 桶<small>合约 {leg.filledQuantity} / {leg.plannedQuantity}{leg.attempts > 1 ? ` · ${leg.attempts} 笔` : ''}</small></span>}</td>
         <td data-label="成交均价">{leg.averagePrice ?? '—'}</td>
-        <td data-label="当前委托 / 策略"><span className={leg.operation?.state === 'unknown' ? 'execution-warning' : undefined}>{leg.operation ? label(OP_STATE, leg.operation.state) : '未发送'}</span>
-          <small>{role(index)} · {label(ORDER_TYPE, leg.orderType)}{leg.orderType === 'local-chase' && leg.operation?.limitPrice ? ` 挂 ${leg.operation.limitPrice}` : ''} · 账户 {leg.accountId}{strategyText(leg) ? ` · ${strategyText(leg)}` : ''}</small>{leg.operation?.note ? <small>{leg.operation.note}</small> : null}</td>
+        <td data-label="当前委托 / 策略"><span className={leg.operation?.state === 'unknown' ? 'execution-warning' : undefined}>{operationStatus(leg.operation)}</span>
+          <small>{role(index)} · {label(ORDER_TYPE, leg.orderType)}{leg.orderType === 'local-chase' && leg.operation?.limitPrice ? ` 委托价 ${leg.operation.limitPrice}` : ''} · 账户 {leg.accountId}{strategyText(leg)}</small>{leg.operation?.note ? <small>{leg.operation.note}</small> : null}</td>
         <td data-label="价格保护界限">{leg.orderType === 'local-chase' && leg.limitPrice ? <>{leg.limitPrice}<small>自填追价界限</small></> : leg.priceBound ?? '—'}</td>
       </tr>)}</tbody>
     </table></div>

@@ -3,11 +3,11 @@
 import { createHash } from 'node:crypto';
 import { binanceSignedQuery } from '../vendor/binance.mjs';
 import { VENUE_EXECUTION_SYMBOLS, VENUE_READ_SYMBOLS, accountKey, type AccountBinding, type AccountSnapshot, type Instrument, type OpenOrder, type Position } from '../contracts.ts';
-import { VenueError, type CallOptions, type ConnectorCapabilities, type LedgerEntry, type LedgerKind, type OrderReport, type OrderRequest, type OrderStatus, type PnlPosition, type PnlSnapshot, type SendOptions, type VenueConnector } from '../connector.ts';
+import { VenueError, type CallOptions, type ConnectorCapabilities, type LedgerEntry, type LedgerKind, type OrderLookupOptions, type OrderReport, type OrderRequest, type OrderStatus, type PnlPosition, type PnlSnapshot, type SendOptions, type VenueConnector } from '../connector.ts';
 import { cmp, isZero, sub } from '../decimal.ts';
 import { exchange, type FetchLike, type HttpReply } from './http.ts';
 import { PreflightError, binanceIpProblem, binancePermissionProblem } from './permissions.ts';
-import { ShapeError, amount, describe, hedgeClose, identifier, list, millis, optionalPrice, record, validCredentials, type LiveCredentials } from './values.ts';
+import { ShapeError, amount, checkedOrderId, describe, hedgeClose, identifier, list, millis, optionalPrice, record, validCredentials, type LiveCredentials } from './values.ts';
 
 export type { LiveCredentials } from './values.ts';
 export interface BinanceConnectorOptions {
@@ -180,7 +180,7 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
   }
 
   /** Every malformed or mismatched answer to a write is uncertain: the venue answered, but not in a way that settles anything. */
-  function orderReport(value: unknown, request: OrderRequest, kind: 'uncertain' | 'read-failed'): OrderReport {
+  function orderReport(value: unknown, request: OrderRequest, kind: 'uncertain' | 'read-failed', remoteId?: string | null): OrderReport {
     try {
       const row = record(value, '委托回报');
       if (row.clientOrderId !== request.clientOrderId || row.symbol !== request.symbol) throw new ShapeError('委托回报的客户订单号或合约与请求不一致');
@@ -202,7 +202,7 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
       const averagePrice = isZero(filledQuantity) ? null : optionalPrice(row.avgPrice, '成交均价');
       if (!isZero(filledQuantity) && averagePrice === null) throw new ShapeError('有成交但没有成交均价');
       return {
-        clientOrderId: request.clientOrderId, remoteId: identifier(row.orderId, '交易所订单号'), symbol: request.symbol, side, quantity, filledQuantity, averagePrice,
+        clientOrderId: request.clientOrderId, remoteId: checkedOrderId(row.orderId, remoteId), symbol: request.symbol, side, quantity, filledQuantity, averagePrice,
         status, terminal: Object.hasOwn(TERMINAL, row.status as string), updatedAt: millis(row.updateTime ?? row.time, '委托更新时间'),
       };
     } catch (error) {
@@ -254,7 +254,8 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
     if (request.type === 'limit' && request.limitPrice === null) refuse('限价单缺少价格');
     if (request.type === 'market' && request.timeInForce === 'gtx') refuse('市价单不能只挂单');
   }
-  const orderParams = (request: OrderRequest) => ({ symbol: request.symbol, origClientOrderId: request.clientOrderId });
+  const orderParams = (request: OrderRequest, remoteId?: string | null): Record<string, string> =>
+    remoteId == null ? { symbol: request.symbol, origClientOrderId: request.clientOrderId } : { symbol: request.symbol, orderId: remoteId };
 
   const capabilities: ConnectorCapabilities = {
     transport: 'live', clientOrderId: true, queryByClientOrderId: true, cancelByClientOrderId: true, maxClientOrderIdLength: 36, postOnly: true,
@@ -408,14 +409,14 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
       return orderReport(await signed(binding, endpoints(binding.accountMode).place, params, { signal, beforeSend }), request, 'uncertain');
     },
 
-    async query(binding: AccountBinding, request: OrderRequest, { signal }: CallOptions): Promise<OrderReport | null> {
-      const row = await signed(binding, endpoints(binding.accountMode).query, orderParams(request), { signal });
-      return row === null ? null : orderReport(row, request, 'read-failed');
+    async query(binding: AccountBinding, request: OrderRequest, { signal, remoteId }: OrderLookupOptions): Promise<OrderReport | null> {
+      const row = await signed(binding, endpoints(binding.accountMode).query, orderParams(request, remoteId), { signal });
+      return row === null ? null : orderReport(row, request, 'read-failed', remoteId);
     },
 
-    async cancel(binding: AccountBinding, request: OrderRequest, { signal, beforeSend }: SendOptions): Promise<OrderReport> {
+    async cancel(binding: AccountBinding, request: OrderRequest, { signal, beforeSend, remoteId }: SendOptions & OrderLookupOptions): Promise<OrderReport> {
       if (!VENUE_EXECUTION_SYMBOLS.binance.includes(request.symbol) || !CLIENT_ID.test(request.clientOrderId)) throw new VenueError('not-sent', 'Binance 撤单未发送：合约或客户订单号无效');
-      return orderReport(await signed(binding, endpoints(binding.accountMode).cancel, orderParams(request), { signal, beforeSend }), request, 'uncertain');
+      return orderReport(await signed(binding, endpoints(binding.accountMode).cancel, orderParams(request, remoteId), { signal, beforeSend }), request, 'uncertain', remoteId);
     },
   };
 }

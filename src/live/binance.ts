@@ -183,9 +183,11 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
   function orderReport(value: unknown, request: OrderRequest, kind: 'uncertain' | 'read-failed', remoteId?: string | null, positionMode?: Mode): OrderReport {
     try {
       const row = record(value, '委托回报');
+      // Binance assigns order IDs per symbol. Another symbol's row says nothing about this ID's owner.
+      if (row.symbol !== request.symbol) throw new ShapeError('委托回报合约与请求不一致');
       const id = checkedOrderId(row.orderId, remoteId);
-      checkOrderOwner(id, row.clientOrderId, remoteId, request.clientOrderId, kind);
-      if (row.clientOrderId !== request.clientOrderId || row.symbol !== request.symbol) throw new ShapeError('委托回报的客户订单号或合约与请求不一致');
+      checkOrderOwner(id, row.clientOrderId, remoteId, request.clientOrderId, kind, CLIENT_ID);
+      if (row.clientOrderId !== request.clientOrderId) throw new ShapeError('委托回报的客户订单号与请求不一致');
       const side = row.side === 'BUY' ? 'buy' : row.side === 'SELL' ? 'sell' : null;
       if (side !== request.side) throw new ShapeError('委托回报方向与请求不一致');
       if (row.type !== (request.type === 'market' ? 'MARKET' : 'LIMIT')) throw new ShapeError('委托回报类型与请求不一致');

@@ -19,8 +19,13 @@ export class VenueError extends Error {
 }
 /** An order located by its known venue ID is explicitly attributed to a different client order. */
 export class OrderOwnerConflict extends VenueError {}
-export function checkOrderOwner(id: string, clientId: unknown, expectedId: string | null | undefined, expectedClientId: string | null, kind: 'read-failed' | 'uncertain'): void {
-  if (id === expectedId && typeof clientId === 'string' && clientId !== expectedClientId) throw new OrderOwnerConflict(kind, '原交易所编号返回了另一客户订单号，需人工核对');
+export function checkOrderOwner(
+  id: string, clientId: unknown, expectedId: string | null | undefined, expectedClientId: string | null,
+  kind: 'read-failed' | 'uncertain', clientIdPattern = /^[\x21-\x7e]{1,64}$/,
+): void {
+  if (id === expectedId && expectedClientId !== null && typeof clientId === 'string' && clientIdPattern.test(clientId) && clientId !== expectedClientId) {
+    throw new OrderOwnerConflict(kind, '原交易所编号返回了另一客户订单号，需人工核对');
+  }
 }
 
 export interface ConnectorCapabilities {
@@ -88,9 +93,10 @@ export function parseOrderReport(value: unknown, request: Pick<OrderRequest, 'cl
     updatedAt: integer(raw.updatedAt, 0, Number.MAX_SAFE_INTEGER, '委托更新时间'),
   };
   // A report for another order, or one that overstates fills, never settles this operation.
+  if (report.symbol !== request.symbol) reject('report_identity', '委托回报的合约与原委托不一致', 409);
   checkOrderOwner(report.remoteId, report.clientOrderId, expectedRemoteId, request.clientOrderId, 'read-failed');
   if (expectedRemoteId !== null && report.remoteId !== expectedRemoteId) reject('report_identity', '回报与原交易所委托编号不一致，保留原单待核对', 409);
-  if (report.clientOrderId !== request.clientOrderId || report.symbol !== request.symbol || report.side !== request.side || cmp(report.quantity, request.quantity) !== 0) reject('report_identity', '委托回报的身份或数量与本操作不一致', 409);
+  if (report.clientOrderId !== request.clientOrderId || report.side !== request.side || cmp(report.quantity, request.quantity) !== 0) reject('report_identity', '委托回报的身份或数量与本操作不一致', 409);
   if (cmp(report.filledQuantity, report.quantity) > 0) reject('report_overfill', '委托回报成交数量超过委托数量', 409);
   if (report.status === 'acknowledged' && cmp(report.filledQuantity, '0') !== 0) reject('report_fill', '仅有订单受理编号的回报不能确认成交', 502);
   if (report.terminal !== ['filled', 'canceled', 'rejected', 'expired'].includes(report.status)) reject('report_terminal', '委托终态与状态不一致', 502);

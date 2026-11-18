@@ -94,7 +94,19 @@ test('四腿 OKX 只挂单回执后查无，再查到零成交过期，两所重
 });
 
 test('四腿 OKX 按原编号核实挂单后 Bybit 放行，随后可按原编号撤单，另一所行情过期时仍可改价重挂', async t => {
-  const { okx, bybit, tick, lead } = await fourLeg(t, 'okx');
+  const { okx, bybit, ex, firstId, tick, lead } = await fourLeg(t, 'okx');
+  for (const missingIdentity of [
+    { instId: 'BZ-USDT-SWAP', clOrdId: 'othercustomer' }, { instType: 'FUTURES', clOrdId: 'othercustomer' },
+    { clOrdId: '' }, { clOrdId: 'invalid client id' }, { clOrdId: 'other@customer' },
+  ]) {
+    okx.script(OKX_QUERY, () => {
+      const original = [...okx.orders.values()][0];
+      return okxOk([{ ...original, ...missingIdentity }]);
+    });
+    await tick();
+    assert.notEqual(ex.jobView(firstId).status, 'attention', JSON.stringify(missingIdentity));
+    assert.deepEqual([okx.count(OKX_CREATE), bybit.count(BYBIT_CREATE), lead().filledQuantity], [1, 0, '0']);
+  }
   okx.script(OKX_QUERY, () => okxFail('50001', 'busy', 503));
   await tick();
   const original = okx.last(OKX_CREATE).body!, row = okx.orders.get(original.clOrdId as string)!;
@@ -127,9 +139,12 @@ test('四腿 Bybit 限价单仅获编号或查到 Created 时 OKX 等待，同�
   await tick();
   assert.deepEqual([bybit.last(BYBIT_QUERY).params.get('orderId'), bybit.last(BYBIT_QUERY).params.has('orderLinkId')], [order.orderId, false]);
   assert.deepEqual([order.orderStatus, bybit.count(BYBIT_CREATE), okx.count(OKX_CREATE)], ['Created', 1, 0]);
-  bybit.script(BYBIT_QUERY, () => bybitOk({ category: 'linear', list: [{ ...order, orderStatus: 'New', positionIdx: 2 }], nextPageCursor: '' }));
-  await tick();
-  assert.deepEqual([lead().remoteId, lead().filledQuantity, okx.count(OKX_CREATE)], [order.orderId, '0', 0], '单向账户的空头回报须是 positionIdx 0');
+  for (const mismatch of [{ symbol: 'BZUSDT', orderLinkId: 'other-customer' }, { orderLinkId: '' }, { orderLinkId: 'other@customer' }, { positionIdx: 2 }]) {
+    bybit.script(BYBIT_QUERY, () => bybitOk({ category: 'linear', list: [{ ...order, orderStatus: 'New', ...mismatch }], nextPageCursor: '' }));
+    await tick();
+    assert.notEqual(ex.jobView(firstId).status, 'attention', JSON.stringify(mismatch));
+    assert.deepEqual([lead().remoteId, lead().filledQuantity, okx.count(OKX_CREATE)], [order.orderId, '0', 0]);
+  }
   order.orderStatus = 'New';
   await tick();
   assert.deepEqual([bybit.count(BYBIT_CREATE), okx.count(OKX_CREATE), lead().filledQuantity], [1, 1, '0']);

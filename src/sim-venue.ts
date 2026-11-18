@@ -256,6 +256,7 @@ export class SimulatedVenue implements VenueConnector {
     if (remoteId != null && order?.remoteId !== remoteId) order = [...this.orders.values()].find(item => item.remoteId === remoteId);
     if (!order || order.accountId !== binding.accountId || order.request.symbol !== request.symbol) return;
     checkOrderOwner(order.remoteId, order.request.clientOrderId, remoteId, request.clientOrderId, kind);
+    if (order.request.clientOrderId !== request.clientOrderId) throw new VenueError(kind, '模拟委托回报客户订单号与原委托不一致');
     if (positionMode !== undefined && order.positionMode !== positionMode) throw new VenueError(kind, '模拟委托回报持仓模式不一致');
     return order;
   }

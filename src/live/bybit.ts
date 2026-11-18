@@ -230,9 +230,10 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
   function orderReport(value: unknown, request: OrderRequest, kind: 'uncertain' | 'read-failed', remoteId?: string | null, positionMode?: Mode): OrderReport {
     try {
       const row = record(value, '委托回报');
+      if (row.symbol !== request.symbol) throw new ShapeError('委托回报合约与请求不一致');
       const id = checkedOrderId(row.orderId, remoteId);
-      checkOrderOwner(id, row.orderLinkId, remoteId, request.clientOrderId, kind);
-      if (row.orderLinkId !== request.clientOrderId || row.symbol !== request.symbol || sideOf(row.side) !== request.side) throw new ShapeError('委托回报的客户订单号、合约或方向与请求不一致');
+      checkOrderOwner(id, row.orderLinkId, remoteId, request.clientOrderId, kind, ORDER_LINK_ID);
+      if (row.orderLinkId !== request.clientOrderId || sideOf(row.side) !== request.side) throw new ShapeError('委托回报的客户订单号或方向与请求不一致');
       if (row.orderType !== (request.type === 'market' ? 'Market' : 'Limit')) throw new ShapeError('委托回报类型与请求不一致');
       if (request.type === 'limit' && (row.timeInForce !== (request.timeInForce === 'ioc' ? 'IOC' : 'GTC') || request.limitPrice === null || cmp(amount(row.price, '委托价格'), request.limitPrice) !== 0)) throw new ShapeError('委托回报的价格或有效方式与请求不一致');
       const idx = numeric(row.positionIdx, [0, 1, 2] as const, '持仓方向编号');
@@ -512,7 +513,7 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
       let canceledId: string;
       try { canceledId = checkedOrderId(ack.orderId, remoteId); }
       catch (error) { throw new VenueError('uncertain', `Bybit 撤单回执无法使用：${describe(error)}`); }
-      if (ack.orderLinkId) checkOrderOwner(canceledId, ack.orderLinkId, remoteId, request.clientOrderId, 'uncertain');
+      checkOrderOwner(canceledId, ack.orderLinkId, remoteId, request.clientOrderId, 'uncertain', ORDER_LINK_ID);
       if (ack.orderLinkId !== request.clientOrderId) throw new VenueError('uncertain', 'Bybit 撤单回执的客户订单号与请求不一致');
       // The cancel answers only an acknowledgement; without a readable order the outcome stays open and is read again later.
       let row: unknown;

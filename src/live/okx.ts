@@ -70,6 +70,7 @@ const FUNDING_BILL = '8', MARGIN_BILL = '6', TRADE_BILLS = new Set(['2', '5', '9
  * The executor's client id `pa1-<24 hex>-<leg>[r<n>]` without its dashes is a clOrdId (letters and digits, at most 32),
  * and goes back the same way, so orders placed before a restart are still recognised.
  */
+const CLIENT_ID = /^[A-Za-z0-9]{1,32}$/;
 const EXECUTOR_ID = /^pa1-([0-9a-f]{24})-([01])(r\d{1,3})?$/;
 const NATIVE_ID = /^pa1([0-9a-f]{24})([01])(r\d{1,3})?$/;
 export const toClOrdId = (clientOrderId: string): string | null => { const match = EXECUTOR_ID.exec(clientOrderId); return match ? `pa1${match[1]}${match[2]}${match[3] ?? ''}` : null; };
@@ -251,9 +252,11 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
   function orderReport(value: unknown, binding: AccountBinding, request: OrderRequest, mode: Mode | null, kind: 'uncertain' | 'read-failed', remoteId?: string | null): OrderReport {
     try {
       const row = record(value, '委托回报');
+      if (row.instId !== INSTRUMENT_IDS[request.symbol] || row.instType !== 'SWAP') throw new ShapeError('委托回报合约与请求不一致');
       const id = checkedOrderId(row.ordId, remoteId);
-      checkOrderOwner(id, row.clOrdId, remoteId, toClOrdId(request.clientOrderId), kind);
-      if (row.clOrdId !== toClOrdId(request.clientOrderId) || row.instId !== INSTRUMENT_IDS[request.symbol] || row.instType !== 'SWAP' || sideOf(row.side) !== request.side) throw new ShapeError('委托回报的客户订单号、合约或方向与请求不一致');
+      const clOrdId = toClOrdId(request.clientOrderId);
+      checkOrderOwner(id, row.clOrdId, remoteId, clOrdId, kind, CLIENT_ID);
+      if (row.clOrdId !== clOrdId || sideOf(row.side) !== request.side) throw new ShapeError('委托回报的客户订单号或方向与请求不一致');
       if (row.tdMode !== binding.accountMode) throw new ShapeError('委托回报的保证金模式与账户不一致');
       if (row.ordType !== ordTypeOf(request)) throw new ShapeError('委托回报类型与请求不一致');
       if (request.type === 'limit' && (request.limitPrice === null || cmp(amount(row.px, '委托价格'), request.limitPrice) !== 0)) throw new ShapeError('委托回报的价格与请求不一致');
@@ -299,7 +302,7 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
       const row = record(data[0], `${what}回执`);
       if (row.sCode !== '0') throw new ShapeError(`${what}回执的状态码不符`);
       const id = checkedOrderId(row.ordId, remoteId);
-      if (row.clOrdId) checkOrderOwner(id, row.clOrdId, remoteId, clOrdId, 'uncertain');
+      checkOrderOwner(id, row.clOrdId, remoteId, clOrdId, 'uncertain', CLIENT_ID);
       if (row.clOrdId !== clOrdId) throw new ShapeError(`${what}回执的客户订单号与请求不一致`);
       return id;
     } catch (error) {

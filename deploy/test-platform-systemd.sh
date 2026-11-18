@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # Actual systemd services, public HTTP and a single private writer, in the empty GitHub-hosted Linux runner only.
+# With no argument (or all), each scenario inherits the running services, packages and session from the previous one.
 set -Eeuo pipefail
+scenario=${1-all}
+if (( $# > 1 )) || [[ ! $scenario =~ ^(all|migration|components|execution|topology|reconcile)$ ]]; then
+  printf 'Usage: %s [all|migration|components|execution|topology|reconcile]\n' "$0" >&2
+  exit 2
+fi
+runs() { [[ $scenario == all || $scenario == "$1" ]]; }
+
 [[ ${TP_PLATFORM_DISPOSABLE_CI:-0} == 1 && ${GITHUB_ACTIONS:-false} == true && $(uname -s) == Linux && $EUID == 0 && $(cat /proc/1/comm) == systemd ]] ||
   { echo 'Requires a disposable GitHub Linux runner with systemd as PID 1.' >&2; exit 1; }
 root=$(cd "$(dirname "$0")/.." && pwd -P)
@@ -85,18 +93,25 @@ cp "$unitdir/$service.service.d/ci-loopback.conf" "$unitdir/$market.service.d/ci
 old="$fixture/v0.63.0"
 dual="$fixture/v0.64.0"
 previous="$fixture/v0.66.0"
-for version in v0.63.0 v0.64.0 v0.66.0; do
-  mkdir "$fixture/$version"
+download_release() {
+  local dir=$1 version=${1##*/} asset
+  mkdir "$dir"
   for asset in SHA256SUMS trading-platform.tar.gz install.sh; do
     curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 10 --max-time 180 \
-      "https://github.com/hxx344/trading-platform/releases/download/$version/$asset" -o "$fixture/$version/$asset"
+      "https://github.com/hxx344/trading-platform/releases/download/$version/$asset" -o "$dir/$asset"
   done
-  (cd "$fixture/$version" && awk '$2 == "install.sh" || $2 == "trading-platform.tar.gz"' SHA256SUMS >required && [[ $(wc -l <required) == 2 ]] && sha256sum -c --quiet required)
-done
-bash "$old/install.sh" --package "$old" >"$fixture/out" 2>&1
+  (cd "$dir" && awk '$2 == "install.sh" || $2 == "trading-platform.tar.gz"' SHA256SUMS >required && [[ $(wc -l <required) == 2 ]] && sha256sum -c --quiet required)
+}
+if runs migration || runs topology || runs reconcile; then download_release "$old"; fi
+if runs topology; then download_release "$dual"; fi
+if runs reconcile; then download_release "$previous"; fi
+
 pid() { local value; value=$(systemctl show -p MainPID --value "$1"); [[ "$value" =~ ^[1-9][0-9]*$ ]] && printf '%s\n' "$value"; }
-legacy_pid=$(pid "$service")
-[[ ! -e "$unitdir/$control.service" ]]
+if runs migration; then
+  bash "$old/install.sh" --package "$old" >"$fixture/out" 2>&1
+  legacy_pid=$(pid "$service")
+  [[ ! -e "$unitdir/$control.service" ]]
+fi
 # Build all candidates with the production packager. Their independently changed files exercise component selection.
 source="$fixture/source"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$root/deploy" "$root/scripts" "$source/"
@@ -167,6 +182,52 @@ assert_market_absent() {
   [[ ! -e "$unitdir/$market.service" && ! -e "$app/market" && ! -e "$app/market.env" && ! -e "$market_socket" ]]
   if systemctl is-active --quiet "$market"; then echo 'Market still running after downgrade' >&2; return 1; fi
 }
+
+# Standalone scenarios start real services against the observe-only configuration left by the page import.
+# The installer provisions all accounts, units, sockets and deployment records from these input files.
+write_imported_config() (
+  umask 077
+  mkdir "$conf"
+  printf '{"secretsFile":"%s/secrets.json","pairs":[],"ondo":{},"port":%s}\n' "$conf" "$public_port" >"$conf/config.json"
+  printf '{"accounts":{}}\n' >"$conf/secrets.json"
+)
+write_environment() {
+  printf '%s\n' 'NODE_USE_ENV_PROXY=1' 'NO_PROXY=127.0.0.1' "COINGECKO_DEMO_API_KEY=$1" 'CI_EXECUTION_ONLY=marker' >"$conf/environment"
+}
+case $scenario in
+  components|execution)
+    write_imported_config
+    build 1
+    install_release 1
+    executor_pid=$(pid "$service")
+    control_pid=$(pid "$control")
+    market_pid=$(pid "$market")
+    first_market=$(readlink "$app/market")
+    market_probe "$first_market"
+    login
+    assert_page v99.1.1
+    ;;
+  topology|reconcile)
+    public_port=14720
+    write_imported_config
+    write_environment changed-market-key
+    build 8
+    if [[ $scenario == topology ]]; then
+      install_release 8
+      login
+      assert_page v99.1.8
+      market_probe "$app/market"
+    else
+      # The old installer must find a live two-process deployment and a session that survives the downgrade.
+      bash "$root/deploy/install.sh" --package "$previous" >"$fixture/out" 2>&1
+      login
+      assert_page v0.66.0
+      assert_market_absent
+    fi
+    ;;
+esac
+
+if runs migration; then
 build 1
 echo 'Migrating the genuine single writer to the private socket and the browser service'
 install_release 1
@@ -280,7 +341,9 @@ for version in 2 3 4 5; do
   [[ $(pid "$market") == "$market_pid" && -f "$first_market/src/market/main.ts" ]]
   assert_page "v99.1.$version"
 done
+fi
 
+if runs components; then
 echo 'Changing public subscriptions and historical/depth readers refreshes only the market generation and its reported identity'
 for reader in monitor/perpetual-feed.ts vendor/perpetual-exchanges.mjs vendor/perpetual-price-reader.mjs vendor/crossex/depth-reader.mjs; do
   printf '\n// simulated public market reader upgrade\n' >>"$source/src/$reader"
@@ -289,6 +352,7 @@ build 13
 install_release 13
 [[ $(pid "$service") == "$executor_pid" && $(pid "$control") == "$control_pid" && $(pid "$market") != "$market_pid" ]]
 market_probe "$app/market"
+[[ -f "$first_market/src/market/probe.ts" ]]
 if market_probe "$first_market" 2>/dev/null; then echo 'A market probe accepted a different running build' >&2; exit 1; fi
 assert_page v99.1.13
 
@@ -332,7 +396,9 @@ grep -q '已回退到 v99.1.6 并确认运行正常' "$fixture/out"
 assert_page v99.1.6
 control_pid=$(pid "$control")
 cp "$fixture/good-control" "$source/src/control/main.ts"
+fi
 
+if runs execution; then
 echo 'An executor-only upgrade restarts one writer, keeps the control PID and preserves stored sessions'
 printf '\nif (import.meta.main && !process.argv.includes("--check-config")) console.info("模拟执行面升级");\n' >>"$source/src/service/main.ts"
 build 8
@@ -360,7 +426,7 @@ grep -q '已回退到 v99.1.8 并确认运行正常' "$fixture/out"
 login
 assert_page v99.1.8
 if curl --noproxy '*' -s --max-time 1 -o /dev/null http://127.0.0.1:4720/api/ready; then echo 'Rollback left the old port listening' >&2; exit 1; fi
-printf '%s\n' 'NODE_USE_ENV_PROXY=1' 'NO_PROXY=127.0.0.1' 'COINGECKO_DEMO_API_KEY=fixture-market-key' 'CI_EXECUTION_ONLY=marker' >"$conf/environment"
+write_environment fixture-market-key
 install_release 8
 login
 assert_page v99.1.8
@@ -382,7 +448,9 @@ systemctl stop "$control"
 install_release 8
 [[ $(pid "$service") == "$executor_pid" && $(pid "$control") != "$control_pid" ]]
 assert_page v99.1.8
+fi
 
+if runs topology; then
 echo 'Downgrade frees TCP for the original unit and can migrate forward again'
 bash "$root/deploy/install.sh" --package "$old" >"$fixture/out" 2>&1
 [[ ! -e "$unitdir/$control.service" && ! -e "$app/control" && ! -e /run/trading-platform/execution.sock ]]
@@ -436,13 +504,17 @@ assert_page v0.64.0
 assert_market_absent
 [[ $(id -gn "$extra_user") == "$market-ipc" ]]
 userdel "$extra_user"
+fi
 
+if runs reconcile; then
 echo 'Reconciling a real old installer which changed current without updating the split deployment record'
+split_dir=$(cat "$app/.deployment/current")
+[[ $(readlink "$app/current") == "$split_dir" && -S /run/trading-platform/execution.sock ]]
 systemctl disable --now "$control"
 bash "$old/install.sh" --package "$old" >"$fixture/out" 2>&1
 legacy_pid=$(pid "$service")
 legacy_dir=$(readlink "$app/current")
-[[ $(cat "$app/.deployment/current") != "$legacy_dir" ]]
+[[ "$legacy_dir" != "$split_dir" && $(cat "$app/.deployment/current") == "$split_dir" ]]
 sed -i '1i if (import.meta.main && process.argv.includes("--check-config")) throw new Error("模拟配置预检失败");' "$source/src/service/main.ts"
 build 12
 if install_release 12; then echo 'Broken config check accepted' >&2; exit 1; fi
@@ -461,4 +533,6 @@ install_release 8
 login
 assert_page v99.1.8
 market_probe "$app/market"
-echo 'Independent activation, rollback and migration passed with real systemd'
+fi
+
+printf 'Real systemd acceptance passed (%s).\n' "$scenario"

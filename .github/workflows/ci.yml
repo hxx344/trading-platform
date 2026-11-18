@@ -59,9 +59,15 @@ jobs:
       - if: matrix.part == 'all'
         run: bash deploy/test-install.sh
 
-  platform-systemd:
+  platform-plan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run: ${{ steps.plan.outputs.run }}
+      scenarios: ${{ steps.plan.outputs.scenarios }}
     steps:
       - uses: actions/checkout@v4
       - name: 检查安装、单元及进程边界是否变化
@@ -70,7 +76,7 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           if [[ -n "$BASE" && ! "$BASE" =~ ^0+$ ]] && git fetch --no-tags --depth=1 origin "$BASE" &&
-              git diff --quiet "$BASE" HEAD -- .github/workflows/ci.yml 'deploy/trading-platform*' deploy/install.sh deploy/package.sh deploy/component-digests.mjs deploy/test-platform-systemd.sh \
+              git diff --quiet "$BASE" HEAD -- .github/workflows/ci.yml .github/actions/setup scripts/ci-systemd.mjs 'deploy/trading-platform*' deploy/install.sh deploy/package.sh deploy/component-digests.mjs deploy/test-platform-systemd.sh \
                 src/control src/market src/monitor/perpetual-feed.ts src/monitor/market-readers.ts 'src/vendor/perpetual-*-reader.mjs' 'src/service/remote-*.ts' \
                 'src/vendor/crossex/*-reader.mjs' src/vendor/crossex/terminal-feed.mjs src/vendor/crossex/funding-client.mjs \
                 'src/http*.ts' src/runtime.ts src/component-build.ts src/web-assets.ts src/data-dir.ts src/login-password.ts src/live/setup.ts \
@@ -79,12 +85,34 @@ jobs:
           else
             echo "run=true" >>"$GITHUB_OUTPUT"
           fi
-      - if: steps.affected.outputs.run == 'true'
-        uses: ./.github/actions/setup
-      - if: steps.affected.outputs.run == 'true'
-        run: npm run build:web
-      - if: steps.affected.outputs.run == 'true'
-        run: sudo env PATH="$PATH" TP_PLATFORM_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-platform-systemd.sh
+      - name: 核对同一提交已有的 Ubuntu 验收
+        id: plan
+        env:
+          AFFECTED: ${{ steps.affected.outputs.run }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/ci-systemd.mjs
+
+  platform-systemd:
+    name: platform-systemd (${{ matrix.scenario }})
+    needs: platform-plan
+    if: needs.platform-plan.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(needs.platform-plan.outputs.scenarios) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - id: build
+        run: |
+          npm run build:web
+          echo "image=${ImageOS:-}/${ImageVersion:-}/${RUNNER_ARCH:-}" >>"$GITHUB_OUTPUT"
+      - name: Verify real systemd (${{ steps.build.outputs.image }})
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+        run: sudo env PATH="$PATH" TP_PLATFORM_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-platform-systemd.sh "$SCENARIO"
 
   # scripts/test.ts deals the test files into shards by their CI durations (scripts/test-durations.json).
   test:

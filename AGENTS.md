@@ -30,6 +30,7 @@
 - 类型检查：`pnpm check`；测试：`pnpm test`；页面构建：`pnpm build:web`。
 - 测试文件列表在 `scripts/test.ts`，新增测试目录改那里。CI 用 `TEST_SHARD=i/n` 按 `scripts/test-durations.json` 里的耗时均衡分片；分片明显不均时手动运行 ci 工作流（`gh workflow run ci.yml --ref <分支>`），用 `durations` 任务产物里的 `test-durations.json` 替换这个文件；本机负载高时测出的比例不可靠。
 - 安装测试：`bash deploy/test-install.sh`，先 `pnpm build:web`。CI 分三部分并行（参数 1 安装升级、2 从工作台导入、3 巡检心跳），新检查放进对应的 `if part_is N` 块，不依赖别的部分留下的状态。改安装脚本时，手动运行 `ci.yml` 并选 `install_full=true` 可在 Ubuntu 上按完整顺序验证心跳、密码叠加在导入后的配置。涉及组件激活时，`platform-systemd` 在一次性 runner 上用真实服务验证迁移、独立升级和回退。
+- 真实 systemd 验收按迁移与导入、行情与控制、执行与端口、新旧拓扑、部署记录修复五组并行。每组使用独立 Ubuntu runner，组内按原顺序验证。主线推送可复用同仓库、同一提交及同一 runner 镜像上已成功的手动验收，`platform-plan` 摘要链接到原运行。缺少任一组的成功步骤就重新跑五组。手动运行始终实际执行。无参数的 `deploy/test-platform-systemd.sh` 仍可在一次性 runner 上按完整顺序运行。
 - 发布工作流（推送 `v*.*.*` 标签）只打包发布，不跑任何测试：它的 `ci` 任务用 `scripts/wait-ci.ts` 等该提交的 ci 运行通过，没通过、找不到或读不到都不发布。门禁只认推送到 main 或手动运行在该提交上跑的 ci，合并请求上的运行不算；推送到 main 时 ci 只跑那次推送的最新提交，所以标签要打在那个提交上，打在别的提交上时先 `gh workflow run ci.yml --ref <标签>`，通过后重跑发布运行里失败的任务。
 - 改页面时按 [docs/frontend.md](docs/frontend.md)《页面开发规则》第 7 条在浏览器里验证。
 

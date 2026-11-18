@@ -66,18 +66,21 @@ export function remoteOndoStream(market: MarketClient, options: OndoStreamOption
       let book = null;
       if (timestamp(at) && at >= since && at <= received && received - at <= 1500) {
         try { book = unpackBook(msg.book, depth); } catch { /* A malformed snapshot revokes protection immediately. */ }
-        if (book && (!book.bids.length || !book.asks.length || book.time <= (obsoleteThrough.get(name) ?? 0)
+        if (book && (book.time <= (obsoleteThrough.get(name) ?? 0)
           || !onTrade && book.time < (previousSource.get(name) ?? 0)
           || book.time > at + 1500 || received - book.time > 10000)) book = null;
       }
       if (book && timestamp(at)) {
         previousSource.set(name, Math.max(previousSource.get(name) ?? 0, book.time));
-        lastAt = Math.max(lastAt ?? 0, at);
-        onBook(name, book, at);
-      } else {
-        obsoleteThrough.set(name, previousSource.get(name) ?? 0);
-        onBook(name, null, received);
+        if (book.bids.length && book.asks.length) {
+          lastAt = Math.max(lastAt ?? 0, at);
+          onBook(name, book, at);
+          return;
+        }
       }
+      // A fresh empty side proves the previous depth disappeared at this venue time, even across reconnects.
+      obsoleteThrough.set(name, previousSource.get(name) ?? 0);
+      onBook(name, null, received);
       return;
     }
     if (msg.type === 'missed') {

@@ -956,11 +956,13 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
         current.observation?.book(name, book, at);
         const gap = market.bookAt > 0 && at - market.bookAt > BOOK_MAX_AGE_MS;
         const duplicate = book && market.book?.time === book.time;
-        const valid = book?.bids.length && book.asks.length && book.time <= at + BOOK_MAX_AGE_MS && at - book.time <= SOURCE_MAX_AGE_MS
-          && !(book.time < market.sourceAt);
+        const currentTime = book && book.time <= at + BOOK_MAX_AGE_MS && at - book.time <= SOURCE_MAX_AGE_MS
+          && (duplicate || book.time > (market.sourceAt ?? 0));
+        // A valid empty side records when protection vanished. Only a later complete depth can restore it.
+        if (currentTime) market.sourceAt = book.time;
+        const valid = currentTime && book.bids.length && book.asks.length;
         market.book = valid ? book : null;
         if (market.book) {
-          market.sourceAt = market.book.time;
           if (market.bookDebits.length) market.bookDebits = market.bookDebits.filter(debit => market.sourceAt <= debit.through);
           if (!duplicate) market.bookAt = at;
           market.mid = (book.bids[0][0] + book.asks[0][0]) / 2n;

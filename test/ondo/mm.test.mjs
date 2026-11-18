@@ -393,6 +393,40 @@ test('a one-sided frame invalidates both openings even if a full snapshot follow
   assert.deepEqual(v.calls.filter(([method]) => method === 'cancel').map(([, id]) => id).sort(), original);
 });
 
+for (const split of [false, true]) test(`a one-sided depth prevents re-quoting on older or equal venue time (${split ? 'market IPC' : 'direct feed'})`, async t => {
+  const { f, v, mm, count, link } = split ? splitMakerFixture(t) : fixture();
+  if (!split) t.after(() => mm.close(0));
+  await f.live();
+  const originals = v.orders.map(order => order.id);
+  assert.equal(originals.length, 2);
+  f.frozen = true;
+  const emptyAt = f.time += 20;
+  f.push([], ASKS, emptyAt);
+  await mm.tick();
+  assert.deepEqual(v.calls.filter(([method]) => method === 'cancel').map(([, id]) => id).sort(), originals.sort());
+  async function stillHeld(source) {
+    f.time++; f.push(BIDS, ASKS, source); await mm.tick();
+    assert.deepEqual([f.market().bid, f.market().bookAt, count('place')], [null, null, 2]);
+  }
+  await stillHeld(emptyAt - 1);
+  if (split) {
+    link.callbacks.data({ ...link.frame, book: null });
+    link.callbacks.down(); link.lease = 'second'; link.generation = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+    link.callbacks.data({ type: 'ready', generation: link.generation, at: ++f.time });
+  } else f.stream.onBook(MARKET, null, ++f.time);
+  await stillHeld(emptyAt - 1); await stillHeld(emptyAt);
+  let revoked;
+  v.beforeSend = input => {
+    if (revoked || input.side !== 'buy') return;
+    revoked = input.clientOrderId;
+    f.time += 20; f.push([], ASKS); f.time++; f.push(BIDS, ASKS, f.time - 2);
+    f.time++; f.push();
+  };
+  f.frozen = false; await f.rounds(6);
+  assert.ok(revoked && !v.calls.some(([method, order]) => method === 'place' && order.clientOrderId === revoked));
+  assert.deepEqual([count('place'), f.resting()], [4, ['buy 0.5@199.93', 'sell 0.49@200.11']]);
+});
+
 test('rate-limited account holds preserve the original wall-withdrawal timer through retries', async () => {
   const { f, v, mm } = fixture();
   await f.live({ wallUsd: '5000' });

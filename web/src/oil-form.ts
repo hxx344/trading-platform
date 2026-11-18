@@ -79,6 +79,14 @@ export const hedgeVenueOf = (form: { preset: FormPreset; venue: OilVenue; hedgeV
 /** The hedge leg's order fields; a chasing hedge carries its chase time in milliseconds. */
 export const hedgeOrder = (form: { hedgeOrderType: OilHedgeType; hedgeChaseSeconds: string }): { orderType: OilHedgeType; chaseTimeoutMs?: number } =>
   form.hedgeOrderType === 'local-chase' ? { orderType: 'local-chase', chaseTimeoutMs: Number(form.hedgeChaseSeconds.trim()) * 1000 } : { orderType: 'market' };
+/** The order types put back to market where the venue they now sit on does not offer them (a lead or hedge venue changed). */
+export function allowedOrderTypes<T extends { preset: FormPreset; venue: OilVenue; hedgeVenue: OilVenue; leadOrderType: OilLeadType; peerLeadOrderType: OilLeadType; hedgeOrderType: OilHedgeType }>(form: T): T {
+  const next = { ...form };
+  if (!leadTypeAllowed(next.venue, next.leadOrderType)) next.leadOrderType = 'market';
+  if (!leadTypeAllowed(next.hedgeVenue, next.peerLeadOrderType)) next.peerLeadOrderType = 'market';
+  if (!hedgeTypeAllowed(hedgeVenueOf(next), next.hedgeOrderType)) next.hedgeOrderType = 'market';
+  return next;
+}
 /** The first thing wrong with a two-leg form's hedge order fields (the executor's parsePairIntent checks the same), or null. */
 export function hedgeOrderError(form: { preset: FormPreset; venue: OilVenue; hedgeVenue: OilVenue; hedgeOrderType: OilHedgeType; hedgeChaseSeconds: string }): string | null {
   if (form.hedgeOrderType !== 'local-chase') return null;

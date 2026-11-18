@@ -297,7 +297,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
             {index === 1 ? <Choice label="下单方式" id="hynixHedgeType" value={form.hedgeOrderType} options={HEDGE_TYPES[leg.venue]} onChange={next => set('hedgeOrderType', next)} /> : null}
             {index === 1 && form.hedgeOrderType === 'local-chase' ? <label className="execution-amount">对冲追价时限 · 秒<input id="hynixHedgeChaseSeconds" type="text" inputMode="numeric" autoComplete="off" maxLength={3} value={form.hedgeChaseSeconds} onChange={event => set('hedgeChaseSeconds', event.target.value)} /></label> : null}
             {index === 0 && form.leadOrderType === 'local-chase' ? <label className="execution-amount">追价界限 · USDT（选填）<input id="hynixChaseLimit" type="text" inputMode="decimal" autoComplete="off" maxLength={24} value={form.chaseLimit} placeholder="留空用价格保护界限" onChange={event => set('chaseLimit', event.target.value)} /></label> : null}
-            <p className="execution-help execution-market-note">{index === 1 ? hedgeNote(form.hedgeOrderType, form.hedgeChaseSeconds, buys(form.action, leg.side), '比例数量')
+            <p className="execution-help execution-market-note">{index === 1 ? hedgeNote(form.hedgeOrderType, form.hedgeChaseSeconds, buys(form.action, leg.side), '按两腿计划比例')
               : form.leadOrderType === 'chase' ? 'Bybit 原生追价策略，按本方一档追价，直到成交或达到最长执行时间。'
               : form.leadOrderType === 'local-chase' ? `只挂单挂在${buys(form.action, leg.side) ? '买一' : '卖一'}，盘口变化后撤单重挂，${buys(form.action, leg.side) ? '最高' : '最低'}追到界限；不吃单，到最长执行时间未成交的部分撤销。`
               : '市价：按对手盘吃单成交，受价格保护界限约束。'}</p>

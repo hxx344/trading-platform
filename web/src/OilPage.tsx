@@ -2,7 +2,7 @@ import { ArrowRightLeft, ChevronDown, Clock3, LoaderCircle, RefreshCw, Square } 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from './api.ts';
 import { clock, label, stamp } from './labels.ts';
-import { ACTIVE_STATUSES, CONFIRM_ACKNOWLEDGE, CONFIRM_NOT_CREATED, CONFIRM_RELEASE, DEFAULT_FORM, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, describeFourLeg, describeIntent, draftFourLegs, fourLegFormToIntent, HEDGE_TYPES, hedgeTypeAllowed, hedgeVenueFor, hedgeVenueOf, leadTypeAllowed, draftLegs, formToIntent, jobActions, type OilForm, type OilFourLegIntent, type OilIntent, type OilLeadType, type OilSymbol, type OilVenue } from './oil-form.ts';
+import { ACTIVE_STATUSES, CONFIRM_ACKNOWLEDGE, CONFIRM_NOT_CREATED, CONFIRM_RELEASE, DEFAULT_FORM, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, describeFourLeg, describeIntent, draftFourLegs, fourLegFormToIntent, HEDGE_TYPES, allowedOrderTypes, hedgeVenueFor, leadTypeAllowed, draftLegs, formToIntent, jobActions, type OilForm, type OilFourLegIntent, type OilIntent, type OilLeadType, type OilSymbol, type OilVenue } from './oil-form.ts';
 import { bookTitle, crossPairs, type OilBook, type OilConfirmResult, type OilJob, type OilMarket, type OilPositionAccount, type OilPreview, type OilPreviewLeg, type OilState } from './oil-types.ts';
 import { groupJobs, groupStatus, isFourLegPreview, type FourLegConfirmResult, type FourLegPreview, type GroupState } from './four-leg.ts';
 import { RequestIds } from './request-ids.ts';
@@ -284,9 +284,9 @@ function FourLegGroup({ jobs, card }: { jobs: OilJob[]; card: (job: OilJob) => R
 }
 
 /** The hedge leg's note in a two-leg form: market, or a post-only chase that goes to market once its time is up (docs/oil.md 13). */
-export const hedgeNote = (type: 'market' | 'local-chase', seconds: string, buy: boolean, unit: string): string => type === 'local-chase'
-  ? `首腿成交后只挂单挂在${buy ? '买一' : '卖一'}跟上相同${unit}，盘口变化后撤单重挂，${buy ? '最高' : '最低'}追到价格保护界限；同一缺口超过 ${seconds.trim() || '?'} 秒未补齐时撤单，剩余按市价补齐。`
-  : `首腿成交后按市价跟上相同${unit}；首腿挂单期间的成交也会随时跟上。`;
+export const hedgeNote = (type: 'market' | 'local-chase', seconds: string, buy: boolean, amount: string): string => type === 'local-chase'
+  ? `首腿成交后只挂单挂在${buy ? '买一' : '卖一'}${amount}跟上，盘口变化后撤单重挂，${buy ? '最高' : '最低'}追到价格保护界限；同一缺口超过 ${seconds.trim() || '?'} 秒未补齐时撤单，剩余按市价补齐。对冲挂单期间首腿暂停改价、不发下一批。`
+  : `首腿成交后按市价${amount}跟上；首腿挂单期间的成交也会随时跟上。`;
 
 /** A native chase on either lead: the form then sends no batches (four legs: either venue's lead). */
 export const chased = (form: { preset: string; leadOrderType: OilLeadType; peerLeadOrderType: OilLeadType }): boolean => form.leadOrderType === 'chase' || (form.preset === 'four-leg' && form.peerLeadOrderType === 'chase');
@@ -310,10 +310,11 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   const cross = venues.length >= 2;
   // A venue that is no longer configured, or cross venue without two venues, falls back to what is possible.
   useEffect(() => {
-    if (venues.length && !venues.includes(form.venue)) { setForm(current => ({ ...current, venue: venues[0]! })); changed(); }
-    if (!cross && form.preset !== 'same-exchange') { setForm(current => ({ ...current, preset: 'same-exchange' })); changed(); }
+    // Each forced change also takes back an order type the new venue does not offer, as set() does.
+    if (venues.length && !venues.includes(form.venue)) { setForm(current => allowedOrderTypes({ ...current, venue: venues[0]! })); changed(); }
+    if (!cross && form.preset !== 'same-exchange') { setForm(current => allowedOrderTypes({ ...current, preset: 'same-exchange' })); changed(); }
     const hedge = hedgeVenueFor(venues, form.venue, form.hedgeVenue);
-    if (hedge && hedge !== form.hedgeVenue) { setForm(current => ({ ...current, hedgeVenue: hedge })); changed(); }
+    if (hedge && hedge !== form.hedgeVenue) { setForm(current => allowedOrderTypes({ ...current, hedgeVenue: hedge })); changed(); }
   }, [venues, cross, form.venue, form.hedgeVenue, form.preset]);
   // A new preview takes the focus, so the confirmation is what the keyboard and the screen reader reach first.
   useEffect(() => { if (preview) reviewRef.current?.querySelector<HTMLElement>('.execution-review')?.focus(); }, [preview]);
@@ -323,13 +324,11 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
       const next = { ...current, [key]: value };
       // Picking the hedge venue as the lead swaps the two, so a cross-venue pair stays on two venues.
       if (key === 'venue' && next.venue === current.hedgeVenue) next.hedgeVenue = current.venue;
-      // Each venue chases its own way (Bybit strategy, Binance and OKX local chase): moving the lead elsewhere takes the market order back.
-      if (!leadTypeAllowed(next.venue, next.leadOrderType)) next.leadOrderType = 'market';
-      // Four legs: the pair is listed in venue order (venuePairs), and the second venue's lead chases its own way too.
+      // Four legs: the pair is listed in venue order (venuePairs).
       if (key === 'preset' && value === 'four-leg' && OIL_VENUES.indexOf(next.venue) > OIL_VENUES.indexOf(next.hedgeVenue)) [next.venue, next.hedgeVenue] = [next.hedgeVenue, next.venue];
-      if (!leadTypeAllowed(next.hedgeVenue, next.peerLeadOrderType)) next.peerLeadOrderType = 'market';
-      // The hedge chases on Binance and OKX only (docs/oil.md 13): a hedge moved to Bybit goes back to market.
-      if (!hedgeTypeAllowed(hedgeVenueOf(next), next.hedgeOrderType)) next.hedgeOrderType = 'market';
+      // Each venue chases its own way (Bybit strategy, Binance and OKX local chase, the hedge only on Binance and OKX):
+      // an order type the new venue does not offer goes back to market.
+      Object.assign(next, allowedOrderTypes(next));
       // The four-leg direction names the first venue's spread, so it is picked afresh whenever the preset changes.
       if (key === 'preset') next.fourSpread = '';
       // A native chase is never batched; its batch fields are hidden, so they must not keep a stale count.
@@ -341,7 +340,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   const setPair = (pair: string): void => {
     const [venue, hedgeVenue] = pair.split(',') as [OilVenue, OilVenue];
     // Another first venue turns the same direction into the opposite trade: the direction is picked again.
-    setForm(current => ({ ...current, venue, hedgeVenue, fourSpread: current.venue === venue && current.hedgeVenue === hedgeVenue ? current.fourSpread : '', ...(leadTypeAllowed(venue, current.leadOrderType) ? {} : { leadOrderType: 'market' }), ...(leadTypeAllowed(hedgeVenue, current.peerLeadOrderType) ? {} : { peerLeadOrderType: 'market' }) }));
+    setForm(current => allowedOrderTypes({ ...current, venue, hedgeVenue, fourSpread: current.venue === venue && current.hedgeVenue === hedgeVenue ? current.fourSpread : '' }));
     changed();
   };
   const four = form.preset === 'four-leg';
@@ -465,7 +464,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
             {index === 1 ? <Choice label="下单方式" id="oilHedgeType" value={form.hedgeOrderType} options={HEDGE_TYPES[leg.venue]} onChange={next => set('hedgeOrderType', next)} /> : null}
             {index === 1 && form.hedgeOrderType === 'local-chase' ? <label className="execution-amount">对冲追价时限 · 秒<input id="oilHedgeChaseSeconds" type="text" inputMode="numeric" autoComplete="off" maxLength={3} value={form.hedgeChaseSeconds} onChange={event => set('hedgeChaseSeconds', event.target.value)} /></label> : null}
             {index === 0 && form.leadOrderType === 'local-chase' ? <label className="execution-amount">追价界限 · USDT（选填）<input id="oilChaseLimit" type="text" inputMode="decimal" autoComplete="off" maxLength={24} value={form.chaseLimit} placeholder="留空用价格保护界限" onChange={event => set('chaseLimit', event.target.value)} /></label> : null}
-            <p className="execution-help execution-market-note">{index === 1 ? hedgeNote(form.hedgeOrderType, form.hedgeChaseSeconds, buys(form.action, leg.side), '桶数')
+            <p className="execution-help execution-market-note">{index === 1 ? hedgeNote(form.hedgeOrderType, form.hedgeChaseSeconds, buys(form.action, leg.side), '按相同桶数')
               : form.leadOrderType === 'chase' ? 'Bybit 原生追价策略，按本方一档追价，直到成交或达到最长执行时间。'
               : form.leadOrderType === 'local-chase' ? `只挂单挂在${buys(form.action, leg.side) ? '买一' : '卖一'}，盘口变化后撤单重挂，${buys(form.action, leg.side) ? '最高' : '最低'}追到界限；不吃单，到最长执行时间未成交的部分撤销。`
               : '市价：按对手盘吃单成交，受价格保护界限约束。'}</p>
@@ -481,7 +480,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
               <label>批次间隔 · 秒<input id="oilBatchInterval" type="text" inputMode="numeric" autoComplete="off" maxLength={3} value={form.batchIntervalSeconds} disabled={Number(form.batchCount) <= 1} onChange={event => set('batchIntervalSeconds', event.target.value)} /></label>
             </> : null}
           </div>
-          <p className="execution-help">到最长执行时间仍未完成时，停止发送并撤销余单，已成交部分保留。分批时每批首腿成交并对冲后，等满间隔再发下一批；批次间隔合计须短于最长执行时间。价格保护按预览盘口计算界限：首腿超出界限的部分不成交；对冲腿市价成交时界限只在首腿发出前核对，本地追价时挂单不越过界限。</p>
+          <p className="execution-help">到最长执行时间仍未完成时，停止发送并撤销余单，已成交部分保留。分批时每批首腿成交并对冲后，等满间隔再发下一批；批次间隔合计须短于最长执行时间。价格保护按预览盘口计算界限：首腿超出界限的部分不成交；对冲腿市价成交时界限只在首腿发出前核对，本地追价时挂单不越过界限，超过对冲追价时限后剩余按市价补齐。</p>
         </details>
         <div className="execution-builder-footer">
           {preview ? <p>正在确认上方预览；返回修改参数后可重新填写。</p> : messageView ?? <p>预览会重新读取盘口、交易规则与持仓，不会下单。</p>}
@@ -524,7 +523,7 @@ function JobCard({ job, busy, strategyId, onStrategyId, onAction }: { job: OilJo
           : <span><strong>{leg.filledBarrels}</strong> / {leg.plannedBarrels} 桶<small>合约 {leg.filledQuantity} / {leg.plannedQuantity}{leg.attempts > 1 ? ` · ${leg.attempts} 笔` : ''}</small></span>}</td>
         <td data-label="成交均价">{leg.averagePrice ?? '—'}</td>
         <td data-label="当前委托 / 策略"><span className={leg.operation?.state === 'unknown' ? 'execution-warning' : undefined}>{leg.operation ? label(OP_STATE, leg.operation.state) : '未发送'}</span>
-          <small>{role(index)} · {label(ORDER_TYPE, leg.orderType)}{leg.orderType === 'local-chase' && leg.operation?.limitPrice ? ` 挂 ${leg.operation.limitPrice}` : ''} · 账户 {leg.accountId}{strategyText(leg) ? ` · ${strategyText(leg)}` : ''}</small>{leg.operation?.note ? <small>{leg.operation.note}</small> : null}</td>
+          <small>{role(index)} · {label(ORDER_TYPE, leg.orderType)}{leg.orderType === 'local-chase' && leg.operation ? leg.operation.limitPrice ? ` 挂 ${leg.operation.limitPrice}` : ' · 剩余已转市价' : ''} · 账户 {leg.accountId}{strategyText(leg) ? ` · ${strategyText(leg)}` : ''}</small>{leg.operation?.note ? <small>{leg.operation.note}</small> : null}</td>
         <td data-label="价格保护界限">{leg.orderType === 'local-chase' && leg.limitPrice ? <>{leg.limitPrice}<small>自填追价界限</small></> : leg.priceBound ?? '—'}</td>
       </tr>)}</tbody>
     </table></div>

@@ -1487,7 +1487,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
    */
   async function guardHedge(job: PairJob): Promise<void> {
     const leg = job.legs[1], binding = bindingStillValid(leg), snapshot = await readAccount(binding, leg.symbol);
-    const { baseline, positionMode } = checkLegAccount({ ...leg, quantity: '0' }, snapshot, job.action);
+    // This job's own orders may still show in a snapshot read just after they ended (as in guardLead): a chasing hedge's post cancelled a moment ago.
+    const own = opsOf(job.id).map(item => item.clientOrderId);
+    const { baseline, positionMode } = checkLegAccount({ ...leg, quantity: '0' }, snapshot, job.action, own);
     if (cmp(baseline, expectedPosition(job, 1)) !== 0 || positionMode !== leg.positionMode) reject('position_changed', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 持仓已变化，对冲腿未发送`, 409);
     admit(leg);
   }
@@ -1971,17 +1973,22 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       write(() => finish(readJob(job.id), 'attention', `${withdrawnFor(job)}首腿结束后未对冲 ${remaining}（按预览价约 ${notional(remaining)} USDT）低于${VENUE_NAMES[hedgeLeg.venue]}最小名义金额 ${hedgeLeg.instrument.minNotional}，无法开对冲单；可在首腿账户只减仓平掉这部分，需人工处理`));
       return;
     }
-    if (postedHedge) {
-      // Its time is up: withdrawn first, and the next pass sends the rest to market. Otherwise it follows the book and the lead's fills.
-      if (!hedgeChasing) await cancel(job, postedHedge, `对冲腿追价超过 ${(hedgeLeg.chaseTimeoutMs ?? HEDGE_CHASE_TIMEOUT_MS) / 1000} 秒，撤单后剩余按市价补齐`);
-      else await repriceHedge(job, postedHedge, hedgeNow);
-      return;
-    }
     // Escalation while a lead order rests withdraws it first; the job goes to a person once it has settled.
     const escalate = async (reason: string): Promise<void> => {
       if (resting) { holdLead(job.id, reason); await cancel(readJob(job.id), resting); return; }
       write(() => finish(readJob(job.id), 'attention', reason));
     };
+    if (postedHedge) {
+      // A post whose cancels all went unconfirmed may still rest: the lead stops and a person checks it, rather than waiting for the deadline.
+      if (postedHedge.cancelSent >= budgets.cancelAttempts && postedHedge.cancelRequestedAt !== null && now() - postedHedge.cancelRequestedAt >= budgets.cancelRetryMs) {
+        await escalate(`对冲腿追价挂单撤单 ${postedHedge.cancelSent} 次仍未确认，委托可能仍在挂单；首腿敞口保留，需人工核对`);
+        return;
+      }
+      // Its time is up: withdrawn first, and the next pass sends the rest to market. Otherwise it follows the book and the lead's fills.
+      if (!hedgeChasing) await cancel(job, postedHedge, `对冲腿追价${hedgeChaseOver(job, hedges, true) ? `超过 ${(hedgeLeg.chaseTimeoutMs ?? HEDGE_CHASE_TIMEOUT_MS) / 1000} 秒` : '结束'}，撤单后剩余按市价补齐`);
+      else await repriceHedge(job, postedHedge, hedgeNow);
+      return;
+    }
     if (!refused && !stop && cmp(hedgeNow, hedgeLeg.instrument.minQuantity) >= 0) {
       // Only hedge orders that fell short count: a job that hedges batch by batch or fill by fill sends many that fill in full.
       // A chasing hedge's posts end unfilled by design (reprices); they are bounded by the chase time and the order limit.
@@ -2154,6 +2161,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   async function repriceHedge(job: PairJob, op: Operation, wanted: string): Promise<void> {
     if (op.sentAt === null || now() - op.sentAt < budgets.chaseRepriceMs) return;
     const leg = job.legs[1], request = op.request as OrderRequest, posted = request.limitPrice as string, left = sub(request.quantity, op.filledQuantity);
+    // An opening post partly filled down to less than the venue's minimum notional could not be posted again: it rests where it is
+    // until it fills or its chase time is up (docs/oil.md 13.3); only more to hedge (the lead filled again) replaces it.
+    const tooSmall = job.action === 'open' && cmp(mul(exposure(left, leg.instrument), leg.quote.bid), leg.instrument.minNotional) < 0;
+    if (tooSmall && cmp(wanted, left) <= 0) return;
     let price: string;
     try {
       const quote = await readQuote(leg.venue, leg.symbol);
@@ -2167,14 +2178,17 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     else if (cmp(wanted, left) !== 0) await cancel(job, op, `对冲追价改量 ${left} → ${wanted}`);
   }
   /**
-   * Whether a chasing hedge must give up posting and send the rest to market: its gap chased past chaseTimeoutMs, or its last
-   * chaseFailureLimit posts neither rested nor filled (refused, not sent, not delivered or expired by the venue).
+   * Whether a chasing hedge must give up posting and send the rest to market: its gap chased past chaseTimeoutMs, its last
+   * chaseFailureLimit posts neither rested nor filled (refused, not sent, not delivered or expired by the venue), or its orders
+   * reached the job's order limit less the market hedges' attempts. timedOutOnly: the chase time alone (for the cancel note).
    */
-  function hedgeChaseOver(job: PairJob, hedges: readonly Operation[]): boolean {
+  function hedgeChaseOver(job: PairJob, hedges: readonly Operation[], timedOutOnly = false): boolean {
+    const timedOut = job.hedgeChaseSince != null && now() >= job.hedgeChaseSince + (job.legs[1].chaseTimeoutMs ?? HEDGE_CHASE_TIMEOUT_MS);
+    if (timedOutOnly) return timedOut;
     let misses = 0;
     for (const item of [...hedges].reverse()) { if (!isPostedHedge(item) || !missed(item)) break; misses += 1; }
-    if (misses >= budgets.chaseFailureLimit) return true;
-    return job.hedgeChaseSince != null && now() >= job.hedgeChaseSince + (job.legs[1].chaseTimeoutMs ?? HEDGE_CHASE_TIMEOUT_MS);
+    // The job's order limit keeps room for the market orders that hedge the rest.
+    return timedOut || misses >= budgets.chaseFailureLimit || hedges.length >= budgets.chaseOrderLimit - budgets.hedgeAttempts;
   }
 
   /**
@@ -2227,7 +2241,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         finish(job, 'completed', [note, short].filter(Boolean).join('；') || null);
         return;
       }
-      const why = refused?.state === 'rejected' ? `对冲腿被交易所拒绝（${(refused.note ?? '').slice(0, 80)}），不再补发；` : stopRequested(job.id) ? '已请求停止，不再补发对冲腿；' : '';
+      const why = refused?.state === 'rejected' && !isPostedHedge(refused) ? `对冲腿被交易所拒绝（${(refused.note ?? '').slice(0, 80)}），不再补发；` : stopRequested(job.id) ? '已请求停止，不再补发对冲腿；' : '';
       finish(job, 'attention', `${why}两腿成交不平衡：${legLabel(job.legs, 0)} ${filled(0)}，${legLabel(job.legs, 1)} ${filled(1)}，按计划比例对冲腿应为 ${target}，相差 ${missing}；敞口保留，需人工处理`);
       return;
     }
@@ -2239,7 +2253,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       finish(job, 'completed', [note, short].filter(Boolean).join('；') || null);
       return;
     }
-    const why = refused?.state === 'rejected' ? `对冲腿被交易所拒绝（${(refused.note ?? '').slice(0, 80)}），不再补发；` : stopRequested(job.id) ? '已请求停止，不再补发对冲腿；' : '';
+    const why = refused?.state === 'rejected' && !isPostedHedge(refused) ? `对冲腿被交易所拒绝（${(refused.note ?? '').slice(0, 80)}），不再补发；` : stopRequested(job.id) ? '已请求停止，不再补发对冲腿；' : '';
     finish(job, 'attention', `${why}两腿成交不平衡：${legLabel(job.legs, 0)} ${filled(0)}，${legLabel(job.legs, 1)} ${filled(1)}，未对冲 ${gap} 桶；敞口保留，需人工处理`);
   }
 

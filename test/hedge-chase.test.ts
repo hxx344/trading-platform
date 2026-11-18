@@ -6,6 +6,7 @@ import { ContractError, parseFourLegIntent, parseIntent, parsePairIntent } from 
 import { cmp } from '../src/decimal.ts';
 import { SIM_ACCOUNTS } from '../src/simulation.ts';
 import type { SimulatedVenue } from '../src/sim-venue.ts';
+import type { Budgets } from '../src/executor.ts';
 import { SESSION, bindAccounts, createHarness, previewAndConfirm, settle, type Harness } from './harness.ts';
 
 const code = (expected: string) => (error: unknown) => error instanceof ContractError && error.code === expected;
@@ -20,8 +21,8 @@ const hedgeIntent = ({ quantity = '1', timeoutMs = 60_000, chaseTimeoutMs, leadT
 const ordersOf = (venue: SimulatedVenue, symbol = 'CLUSDT') => [...venue.orders.values()].filter(order => order.request.symbol === symbol);
 const lastOrder = (venue: SimulatedVenue, symbol = 'CLUSDT') => ordersOf(venue, symbol).at(-1)!;
 const same = (a: string | null | undefined, b: string) => a != null && cmp(a, b) === 0;
-async function withHarness(run: (h: Harness) => Promise<void>) {
-  const h = createHarness();
+async function withHarness(run: (h: Harness) => Promise<void>, budgets: Partial<Budgets> = {}) {
+  const h = createHarness({ budgets });
   try { bindAccounts(h.ex); await run(h); } finally { h.dispose(); }
 }
 async function tick(h: Harness, ms = 1_000) { await h.ex.tick(); h.advance(ms); }
@@ -236,16 +237,96 @@ test('同所两腿都追价：首腿挂单成交后对冲挂单期间首腿不�
   assert.equal(h.binance.position(SIM_ACCOUNTS.binance, 'BZUSDT', 'short'), '1');
 }));
 
-test('对冲腿市价补齐被拒：照原规则转人工，挂单撤销不计入对冲失败次数', () => withHarness(async h => {
+test('对冲腿市价补齐被拒：照原规则转人工；改价撤掉的挂单不计入对冲失败次数，市价补齐照常发出', () => withHarness(async h => {
+  const { jobId } = await previewAndConfirm(h, hedgeIntent({ chaseTimeoutMs: 30_000 }));
+  await tick(h);
+  await tick(h);
+  // Three reprices: more cancelled posts than hedgeAttempts (2) allows short market hedges.
+  for (const [bid, ask] of [['69.90', '69.92'], ['69.80', '69.82'], ['69.70', '69.72']] as const) {
+    h.binance.setBook('CLUSDT', { bid, ask });
+    h.advance(2_000);
+    await tick(h);
+    await tick(h);
+  }
+  assert.ok(ordersOf(h.binance).filter(order => order.status === 'canceled').length >= 2, '至少两笔挂单被改价撤销');
+  // The chase times out; its market fallback is still sent, and its refusal ends hedging as before.
+  h.binance.inject({ operation: 'place', mode: 'reject', times: 1, clientOrderId: undefined });
+  const placed = h.binance.calls.place;
+  assert.equal(h.ex.jobView(jobId).status, 'running');
+  h.advance(30_000);
+  const view = await settle(h, jobId);
+  assert.equal(h.binance.calls.place, placed + 1, '市价补齐发出一次');
+  assert.equal(view.status, 'attention');
+  assert.match(view.reason ?? '', /对冲腿被交易所拒绝/);
+}, { hedgeAttempts: 2 }));
+
+test('对冲挂单撤销后账户快照仍列着它：视为本任务的委托，照常按市价补齐（L054）', () => withHarness(async h => {
   const { jobId } = await previewAndConfirm(h, hedgeIntent({ chaseTimeoutMs: 3_000 }));
   await tick(h);
   await tick(h);
-  // The chase times out; its market fallback is refused, which ends hedging as before.
-  h.binance.inject({ operation: 'place', mode: 'reject', times: 1, clientOrderId: undefined });
   const posted = lastOrder(h.binance);
-  h.advance(3_000);
+  h.binance.fillResting(posted.request.clientOrderId, '0.4');
+  const read = h.binance.account.bind(h.binance);
+  h.binance.account = async (...args: Parameters<typeof read>) => {
+    const snapshot = await read(...args);
+    // The venue still lists the post after it was cancelled.
+    return posted.status === 'canceled' ? { ...snapshot, openOrders: [...snapshot.openOrders, { symbol: 'CLUSDT', clientOrderId: posted.request.clientOrderId, remoteId: posted.remoteId }] } : snapshot;
+  };
+  const view = await settle(h, jobId);
+  assert.equal(view.status, 'completed', view.reason ?? '');
+  assert.deepEqual([lastOrder(h.binance).request.type, lastOrder(h.binance).request.quantity], ['market', '0.6']);
+  assert.equal(binanceShort(h), '1');
+}));
+
+test('对冲挂单撤单一直未确认：撤单次数用完即转人工，不等到截止', () => withHarness(async h => {
+  const { jobId } = await previewAndConfirm(h, hedgeIntent({ chaseTimeoutMs: 2_000, timeoutMs: 600_000 }));
+  await tick(h);
+  await tick(h);
+  const posted = lastOrder(h.binance);
+  h.binance.inject({ operation: 'cancel', mode: 'reject', times: 100 });
+  h.advance(2_000);
+  for (let i = 0; i < 12 && h.ex.jobView(jobId).status !== 'attention'; i++) await tick(h, 10_000);
+  const view = h.ex.jobView(jobId);
+  assert.equal(view.status, 'attention', view.reason ?? '');
+  assert.match(view.reason ?? '', /对冲腿追价挂单撤单 \d+ 次仍未确认/);
+  assert.equal(posted.status, 'new', '挂单仍在，交人工核对');
+  assert.equal(ordersOf(h.binance).length, 1, '没有发市价补齐');
+}));
+
+test('对冲委托数接近任务上限时不再挂单，剩下的名额用于市价补齐', () => withHarness(async h => {
+  const { jobId } = await previewAndConfirm(h, hedgeIntent({ chaseTimeoutMs: 600_000 }));
+  await tick(h);
+  await tick(h);
+  for (let i = 0; i < 10 && lastOrder(h.binance).request.type !== 'market'; i++) {
+    h.binance.setBook('CLUSDT', { bid: `69.${90 - i * 5}`, ask: `69.${92 - i * 5}` });
+    h.advance(2_000);
+    await tick(h);
+    await tick(h);
+  }
+  const view = await settle(h, jobId);
+  assert.equal(view.status, 'completed', view.reason ?? '');
+  const orders = ordersOf(h.binance);
+  assert.equal(orders.filter(order => order.request.timeInForce === 'gtx').length, 4, '上限 6 减市价名额 2');
+  assert.equal(orders.at(-1)!.request.type, 'market');
+  assert.equal(binanceShort(h), '1');
+}, { chaseOrderLimit: 6, hedgeAttempts: 2 }));
+
+test('开仓对冲挂单部分成交后剩余低于最小名义金额：不再改价撤单，到追价时限后撤单转人工', () => withHarness(async h => {
+  const { jobId } = await previewAndConfirm(h, hedgeIntent({ chaseTimeoutMs: 6_000 }));
+  await tick(h);
+  await tick(h);
+  const posted = lastOrder(h.binance);
+  h.binance.fillResting(posted.request.clientOrderId, '0.95');
+  h.binance.setBook('CLUSDT', { bid: '69.90', ask: '69.92' });
+  h.advance(2_000);
+  await tick(h);
+  await tick(h);
+  assert.equal(posted.status, 'partially-filled', '剩余 0.05（约 3.5 USDT）重挂会被拒，留在原价');
+  // It may still fill where it rests.
+  h.advance(4_000);
   const view = await settle(h, jobId);
   assert.equal(posted.status, 'canceled');
   assert.equal(view.status, 'attention');
-  assert.match(view.reason ?? '', /对冲腿被交易所拒绝/);
+  assert.match(view.reason ?? '', /低于Binance最小名义金额/);
+  assert.equal(ordersOf(h.binance).length, 1);
 }));

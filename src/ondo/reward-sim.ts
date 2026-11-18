@@ -6,7 +6,8 @@
 // which this model reads as half the market's pool per side. My share of a band is my score over everyone's.
 // Fills (a model, not a rule): the mid is a random walk with the measured one-minute volatility; the quote is filled when
 // the mid moves past its closest distance (minBps) within one reaction time τ, before it is moved away. A fill costs the
-// expected absolute move over the time to close the position (taken as wholly adverse) plus the maker fee twice.
+// expected absolute move over the time to close the position (taken as wholly adverse) plus the maker fee twice, and
+// takes the market's quotes down for that time: no reward and no further fill until the position is closed.
 import { BUCKET_BPS, BUCKETS } from './reward-types.ts';
 
 export const BANDS = [{ from: 0, to: 5, weight: 0.85 }, { from: 5, to: 10, weight: 0.10 }, { from: 10, to: 25, weight: 0.05 }] as const;
@@ -49,7 +50,10 @@ export interface SimResult {
   others: { bid: number; ask: number };
   /** My share of the band, per side (0–1). */
   share: { bid: number; ask: number };
+  /** After the time lost to closing filled positions. */
   rewardDay: number;
+  /** Share of the day not spent closing a filled position (1 without a volatility estimate). */
+  quoting: number;
   /** Null without a volatility estimate. */
   fillsDay: number | null;
   lossPerFill: number | null;
@@ -89,6 +93,14 @@ export function fillsPerDay(sigma1m: number, minBps: number, reactionSec: number
   return DAY_S / reactionSec * Math.min(1, 2 * (1 - normalCdf(z)));
 }
 
+/**
+ * Share of the day the quotes are up when each fill takes them down for holdSec: `rate` fills a day while quoting make
+ * rate × share fills, each followed by holdSec without quotes, rewards or further fills.
+ */
+export function quotingShare(rate: number, holdSec: number): number {
+  return rate > 0 && holdSec > 0 ? 1 / (1 + rate * holdSec / DAY_S) : 1;
+}
+
 export function simulate(market: SimMarket, params: SimParams): SimResult {
   const band = bandOf(params.distanceBps);
   const perSideDay = params.eligible > 0 ? params.poolUsd / params.eligible / 7 / 2 : 0;
@@ -101,14 +113,17 @@ export function simulate(market: SimMarket, params: SimParams): SimResult {
   const uptime = Math.min(1, Math.max(0, params.uptime));
   // One side quotes the bid only (a choice of the page, not of Ondo).
   const sideShares = params.sides === 2 ? share.bid + share.ask : share.bid;
-  const rewardDay = uptime * perSideDay * weight * sideShares;
+  const gross = uptime * perSideDay * weight * sideShares;
   const capDay = perSideDay * weight * params.sides;
-  if (market.sigma1m === null || !(market.sigma1m >= 0)) return { band, myScore, others, share, rewardDay, fillsDay: null, lossPerFill: null, lossDay: null, netDay: null, capDay };
-  const fillsDay = uptime * params.sides * fillsPerDay(market.sigma1m, params.minBps, params.reactionSec);
+  if (market.sigma1m === null || !(market.sigma1m >= 0)) return { band, myScore, others, share, rewardDay: gross, quoting: 1, fillsDay: null, lossPerFill: null, lossDay: null, netDay: null, capDay };
+  const rate = uptime * params.sides * fillsPerDay(market.sigma1m, params.minBps, params.reactionSec);
+  const quoting = quotingShare(rate, params.holdSec);
+  const fillsDay = rate * quoting;
+  const rewardDay = gross * quoting;
   const sigmaSec = market.sigma1m / Math.sqrt(60);
   const lossPerFill = params.sizeUsd * (sigmaSec * Math.sqrt(Math.max(0, params.holdSec)) * Math.sqrt(2 / Math.PI) + 2 * (market.makerFee ?? 0));
   const lossDay = fillsDay * lossPerFill;
-  return { band, myScore, others, share, rewardDay, fillsDay, lossPerFill, lossDay, netDay: rewardDay - lossDay, capDay };
+  return { band, myScore, others, share, rewardDay, quoting, fillsDay, lossPerFill, lossDay, netDay: rewardDay - lossDay, capDay };
 }
 
 /** The same quote at several distances (minBps keeps its gap below the distance, at least 0.5 bps). */

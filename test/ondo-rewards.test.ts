@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { BANDS, bandOf, bandScores, fillsPerDay, normalCdf, simulate, sweep, type SimMarket, type SimParams } from '../src/ondo/reward-sim.ts';
+import { BANDS, bandOf, bandScores, fillsPerDay, normalCdf, quotingShare, simulate, sweep, type SimMarket, type SimParams } from '../src/ondo/reward-sim.ts';
 import { observationEarnings } from '../src/ondo/observation-earnings.ts';
 import { ONDO_MM_DEFAULTS } from '../src/vendor/ondo/mm.mjs';
 import { BUCKETS } from '../src/ondo/reward-types.ts';
@@ -56,14 +56,25 @@ test('模拟：成交亏损按波动、平仓耗时与两次挂单手续费计',
   const market: SimMarket = { bid: empty(), ask: empty(), sigma1m: 0.0006, makerFee: 0.0001 };
   const result = simulate(market, params({ uptime: 0.9 }));
   const sigmaSec = 0.0006 / Math.sqrt(60);
-  close(result.fillsDay!, 0.9 * 2 * fillsPerDay(0.0006, 3, 1));
+  // Each fill takes the quotes down for the 60 s it takes to close: fewer fills and less reward than while quoting.
+  const rate = 0.9 * 2 * fillsPerDay(0.0006, 3, 1), quoting = 1 / (1 + rate * 60 / 86_400);
+  assert.ok(rate > 0 && quoting < 1);
+  close(result.quoting, quoting); close(quotingShare(rate, 60), quoting);
+  assert.deepEqual([quotingShare(0, 60), quotingShare(rate, 0)], [1, 1]);
+  close(result.fillsDay!, rate * quoting);
+  close(result.rewardDay, 0.9 * 125_000 / 20 / 7 / 2 * 0.85 * 2 * quoting);
   close(result.lossPerFill!, 100 * (sigmaSec * Math.sqrt(60) * Math.sqrt(2 / Math.PI) + 0.0002));
+  close(result.lossDay!, result.fillsDay! * result.lossPerFill!);
   close(result.netDay!, result.rewardDay - result.lossDay!);
+  // However often the quote would be hit, a day holds at most 86 400 / 60 closings.
+  const choppy = simulate({ ...market, sigma1m: 0.05 }, params());
+  assert.ok(choppy.fillsDay! < 1440 && choppy.fillsDay! > 1400);
+  assert.equal(simulate(market, params({ holdSec: 0 })).quoting, 1);
   // The sweep keeps the gap between the distance and the closest point (1 bps here), never under 0.5 bps.
   const rows = sweep(market, params(), [1, 4, 20]);
   assert.deepEqual(rows.map(row => row.distanceBps), [1, 4, 20]);
-  close(rows[0]!.result.fillsDay!, 2 * fillsPerDay(0.0006, 0.5, 1));
-  close(rows[2]!.result.fillsDay!, 2 * fillsPerDay(0.0006, 19, 1));
+  close(rows[0]!.result.fillsDay!, 2 * fillsPerDay(0.0006, 0.5, 1) * quotingShare(2 * fillsPerDay(0.0006, 0.5, 1), 60));
+  close(rows[2]!.result.fillsDay!, 2 * fillsPerDay(0.0006, 19, 1) * quotingShare(2 * fillsPerDay(0.0006, 19, 1), 60));
   assert.equal(rows[2]!.result.band, 2);
 });
 
@@ -83,8 +94,11 @@ test('观察收益：三档的买卖有效时长分别定权，手续费或波�
   assert.deepEqual(result.markets[0].tiers.map(tier => tier.distanceBps), [4, 8, 15]);
   assert.deepEqual([first.buyUptime, first.sellUptime, first.reason], [0.5, 0.75, null]);
   const myScore = 200 * Math.exp(-0.4), weight = Math.exp(-0.025);
-  close(first.rewardDay!, 1400 / 2 / 7 / 2 * 0.85 * (0.5 * myScore / (myScore + 2000 * weight) + 0.75 * myScore / (myScore + 600 * weight)));
-  close(first.lossDay!, 1.25 * fillsPerDay(0.004, 3, 1) * 200 * (0.004 / Math.sqrt(60) * 5 * Math.sqrt(2 / Math.PI) + 0.0002));
+  // Fills while quoting on either side take both quotes down for the 25 s exit horizon.
+  const rate = 1.25 * fillsPerDay(0.004, 3, 1), quoting = 1 / (1 + rate * 25 / 86_400);
+  close(first.rewardDay!, 1400 / 2 / 7 / 2 * 0.85 * (0.5 * myScore / (myScore + 2000 * weight) + 0.75 * myScore / (myScore + 600 * weight)) * quoting);
+  close(first.lossDay!, rate * quoting * 200 * (0.004 / Math.sqrt(60) * 5 * Math.sqrt(2 / Math.PI) + 0.0002));
+  assert.ok(first.lossDay! < 86_400 / 25 * 200 * (0.004 / Math.sqrt(60) * 5 * Math.sqrt(2 / Math.PI) + 0.0002));
   close(first.netDay!, first.rewardDay! - first.lossDay!); assert.ok(first.netDay! < 0);
   const tier = (fee: string | null, sigma1m: number | null) => observationEarnings(quote, pool, observed, [{ ...status, makerFee: fee }], [{ ...sample, sigma1m }], at).markets[0].tiers[0];
   assert.equal(tier(null, 0.004).rewardDay, first.rewardDay); assert.equal(tier(null, 0.004).netDay, null);

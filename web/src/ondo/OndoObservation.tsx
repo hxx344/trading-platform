@@ -96,6 +96,7 @@ function ObservationDetail({ rows, earnings, market, capital, stale }: {
         <p>每单 {number.format(earnings.orderUsd)} USD，每周奖池 {number.format(earnings.poolUsd)} USD，按 {earnings.eligible} 个市场分配。
           按各侧有效虚挂时长占会话时长、对应奖励档的盘口深度和衰减系数 {earnings.decayK} 估算日奖励。</p>
         <p>日损失按波动模型的预计成交次数、{earnings.reactionSec} 秒撤单反应时间、{earnings.holdSec} 秒平仓耗时和开平两次 Maker 手续费估算。
+          任一侧成交后，该市场在平仓耗时内两侧都不挂单，日奖励和成交次数已扣除这段时间；实盘成交后须人工重新启用，停机会更长。
           本市场 Maker 费率 {estimate.makerFee === null ? '未知' : percent(estimate.makerFee * 100)}。IOC 的 Taker 费用、滑点和跳空会影响实际收益。</p>
       </details>
     </> : <p className="muted oo-note">本次记录缺少该市场的奖励估算。</p>}

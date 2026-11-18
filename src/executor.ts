@@ -13,7 +13,7 @@ import {
 } from './connector.ts';
 import type { Store } from './store.ts';
 import { nearestBarrels, quantityForBarrels, splitBarrels } from './barrels.ts';
-import { fillGapText, fillGaps, type FillLeg } from './four-leg-fill.ts';
+import { fillGapText, fillGaps, hedgeSkippedQuantity, type FillLeg } from './four-leg-fill.ts';
 import { midOf, proportionalHedge, quantityForNotional, splitSteps } from './hynix/sizing.ts';
 import { pairBalance, rebalanceOrder, type HeldContract, type RebalanceMethod } from './hynix/balance.ts';
 import { createTransfers, type PairRecord, type TransferDeps } from './transfer.ts';
@@ -509,6 +509,11 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
   const stopRequested = (jobId: string): boolean => !!db.prepare('SELECT 1 FROM stop_requests WHERE job_id = ?').get(jobId);
   function finish(job: Job, status: JobStatus, reason: string | null, endCode?: Job['endCode']): void {
+    // An unresolved hedge can go to attention before the ordinary lead/hedge progression in this pass.
+    if (status === 'attention' && job.group && job.legs[0].orderType === 'local-chase') {
+      const leads = legOps(job.id, 0);
+      if (leads.length && leads.every(op => SETTLED.has(op.state))) rememberLeadSkip(job, nextLead(job, leads).skipped);
+    }
     job.status = status; job.reason = reason;
     if (endCode) job.endCode = endCode;
     saveJob(job);
@@ -518,13 +523,16 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (job.group && isPair(job)) {
       const venue = VENUE_NAMES[job.legs[0].venue];
       if (status !== 'completed') haltPeer(job, `${venue} 任务${STATUS_TEXT[status]}${reason ? `：${reason.slice(0, 120)}` : ''}`);
-      else if (!job.peerHalt) {
-        // Whatever of the lead is neither filled nor recorded as skipped by design went unsent because the lead ended early
-        // (a local chase that gave up, the deadline, a withdrawn lead): a deviation, which stops the other venue too. A job the
-        // other one halted stopped short because of that one.
-        const filled = add('0', ...opsOf(job.id).filter(item => item.leg === 0).map(item => item.filledQuantity));
-        const unsent = sub(sub(job.legs[0].quantity, filled), skippedOf(job));
-        if (cmp(unsent, '0') > 0) noteDeviation(job, `${venue} 首腿提前结束：计划 ${job.legs[0].quantity}，成交 ${filled}${isZero(skippedOf(job)) ? '' : `，按设计跳过 ${skippedOf(job)}`}，未发 ${unsent}`);
+      else if (!job.peerHalt && !job.leadDeviation) {
+        const lead = job.legs[0], leads = legOps(job.id, 0);
+        const filled = add('0', ...leads.map(item => item.filledQuantity)), skipped = skippedOf(job);
+        // An IOC or native chase sends a whole batch once. Its accepted order already has its own one-step deviation check;
+        // only a refused or never-submitted batch remains to account for here. Local reposts may cover the same quantity.
+        const accounted = lead.orderType === 'market' || lead.orderType === 'chase'
+          ? add('0', ...leads.filter(item => item.state === 'filled' || item.state === 'canceled').map(item => item.request.quantity))
+          : add(filled, skipped);
+        const unsent = sub(lead.quantity, accounted);
+        if (cmp(unsent, '0') > 0) noteDeviation(job, `${venue} 首腿提前结束：计划 ${lead.quantity}，成交 ${filled}${isZero(skipped) ? '' : `，按设计跳过 ${skipped}`}，未发 ${unsent}`);
       }
       checkGroupFills(job);
     }
@@ -557,10 +565,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   /** A job's two legs as four-leg-fill.ts compares them; the hedge's skip is the lead's scaled by the two legs' plans. */
   function fillLegs(job: PairJob): FillLeg[] {
     const ops = opsOf(job.id), skipped = skippedOf(job);
+    const hedgeSkipped = hedgeSkippedQuantity(skipped, job.legs[0].quantity, job.legs[1].quantity);
     return job.legs.map(leg => {
       const filled = add('0', ...ops.filter(item => item.leg === leg.index).map(item => item.filledQuantity));
-      const skip = leg.index === 0 || isZero(skipped) ? skipped : String(Number((Number(skipped) * Number(job.legs[1].quantity) / Number(job.legs[0].quantity)).toPrecision(12)));
-      return { venue: VENUE_NAMES[leg.venue], symbol: leg.symbol, filled, planned: leg.quantity, step: leg.instrument.quantityStep, skipped: skip,
+      return { venue: VENUE_NAMES[leg.venue], symbol: leg.symbol, filled, planned: leg.quantity, step: leg.instrument.quantityStep, skipped: leg.index === 0 ? skipped : hedgeSkipped,
         shown: marketOfJob(job) === 'oil' ? `${exposure(filled, leg.instrument)} / ${exposure(leg.quantity, leg.instrument)} 桶` : `${filled} / ${leg.quantity}` };
     });
   }
@@ -1805,6 +1813,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       }
     }
     if (resting && (resting.state !== 'open' || isStrategy(resting))) return;
+    // Once the last lead settles its batch remainder is known, even if a hedge is still unknown or new leads are prohibited.
+    const decision = resting ? null : nextLead(job, leads);
+    if (job.group && rememberLeadSkip(job, decision?.skipped)) write(() => saveJob(job));
     if (hedges.some(item => !SETTLED.has(item.state))) return;
     // Resume from what is on disk (L095): hedge what the lead filled minus what earlier hedge orders filled.
     const leadFilled = add('0', ...leads.map(item => item.filledQuantity));
@@ -1815,19 +1826,11 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     // An opening hedge below the venue's minimum notional is refused. While the lead goes on (an order of it rests, or a local chase
     // posts again after a reprice or for the next batch) and so may fill in pieces, a reserve worth 1.2 times that minimum stays
     // unhedged, so the last hedge is never too small; a hedge contract whose minimum quantity is already worth that needs none.
-    const upcoming = !resting && !refused && !withdraw && !deviation ? nextLead(job, leads) : null;
-    // Four legs: a local chase's batch that ends with a remainder too small to send records it as skipped by design (an early end
-    // does not: what it leaves is a deviation when the job completes).
-    if (job.group && job.legs[0].orderType === 'local-chase' && !resting && !refused && !withdraw && !(upcoming && 'end' in upcoming)) {
-      const { batch, left } = batchLeft(job, leads);
-      if (!(upcoming && upcoming.batch === batch) && cmp(left, '0') > 0 && job.leadSkipped?.[batch] !== left) {
-        write(() => { const current = readJob(job.id); current.leadSkipped = { ...current.leadSkipped, [batch]: left }; saveJob(current); });
-      }
-    }
+    const upcoming = !refused && !withdraw && !deviation ? decision : null;
     const notional = (quantity: string): string => mul(exposure(quantity, hedgeLeg.instrument), hedgeLeg.quote.bid);
     // A market lead's IOC may read as open for a pass, but it never goes on, so it holds no reserve.
     const leadGoesOn = reserveNeeded(hedgeLeg) && job.action === 'open' && !withdraw && !refused
-      && ((!!resting && job.legs[0].orderType !== 'market') || (job.legs[0].orderType === 'local-chase' && upcoming !== null && 'quantity' in upcoming));
+      && ((!!resting && job.legs[0].orderType !== 'market') || (job.legs[0].orderType === 'local-chase' && !!upcoming?.order));
     let hedgeNow = remaining;
     if (leadGoesOn) {
       const keep = reserveFor(hedgeLeg.instrument, hedgeLeg.quote.bid);
@@ -1877,8 +1880,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       if (job.legs[0].orderType === 'local-chase' && !withdraw) await reprice(job, resting);
       return;
     }
-    const next = refused || withdraw ? null : upcoming;
-    if (next && 'quantity' in next) {
+    const next = upcoming?.order;
+    if (next) {
       if (next.batch !== (leads.at(-1)?.batch ?? 0)) {
         // The interval counts from when the previous batch was found done, which survives a restart.
         const doneAt = job.batchDoneAt ?? now();
@@ -1905,7 +1908,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       write(() => { const current = readJob(job.id); if (current.batchDoneAt != null || current.reason !== null) { current.batchDoneAt = null; current.reason = null; saveJob(current); } });
       return;
     }
-    write(() => settleJob(readJob(job.id), next?.end ?? (job.peerHalt ? `四腿联动停止（${job.peerHalt}），首腿不再发送` : deviation ? `四腿首腿偏离计划（${deviation}），两所都不再发送首腿` : job.leadWithdraw ? '对冲腿一度无法发送，已撤销首腿挂单' : undefined)));
+    write(() => settleJob(readJob(job.id), upcoming?.end ?? (job.peerHalt ? `四腿联动停止（${job.peerHalt}），首腿不再发送` : deviation ? `四腿首腿偏离计划（${deviation}），两所都不再发送首腿` : job.leadWithdraw ? '对冲腿一度无法发送，已撤销首腿挂单' : undefined)));
   }
 
   /**
@@ -1947,33 +1950,33 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   const withdrawnFor = (job: Job): string => job.leadWithdraw ? `${isPair(job) ? '撤首腿挂单' : '撤调平委托'}（${job.leadWithdraw.slice(0, 120)}）时：` : '';
   /** A lead order that neither rested nor filled. */
   const missed = (op: Operation): boolean => isZero(op.filledQuantity) && (op.state === 'rejected' || op.state === 'not-sent' || op.state === 'not-created' || (op.state === 'canceled' && op.venueStatus === 'expired'));
-  /**
-   * Once nothing of the lead rests and the hedge has caught up: the rest of this batch for a local chase, else the next batch,
-   * or the end (null when every batch is done, end when the lead gives up early).
-   */
-  /** The batch of the latest lead order and what of it is still unfilled. */
-  function batchLeft(job: Job, leads: readonly Operation[]): { batch: number; left: string } {
-    const plan = job.batches ?? [job.legs[0].quantity], batch = (leads.at(-1) as Operation).batch ?? 0;
-    return { batch, left: sub(plan[batch] as string, add('0', ...leads.filter(item => (item.batch ?? 0) === batch).map(item => item.filledQuantity))) };
+  interface BatchQuantity { batch: number; quantity: string }
+  function rememberLeadSkip(job: Job, skipped?: BatchQuantity): boolean {
+    if (!skipped || job.leadSkipped?.[skipped.batch] === skipped.quantity) return false;
+    job.leadSkipped = { ...job.leadSkipped, [skipped.batch]: skipped.quantity };
+    return true;
   }
-  function nextLead(job: Job, leads: readonly Operation[]): { batch: number; quantity: string } | { end: string } | null {
+  /** Decide from settled leads alone. A local remainder skipped by size can coexist with an order for the following batch. */
+  function nextLead(job: Job, leads: readonly Operation[]): { order?: BatchQuantity; end?: string; skipped?: BatchQuantity } {
     const lead = job.legs[0], plan = job.batches ?? [lead.quantity], last = leads.at(-1) as Operation, batch = last.batch ?? 0;
     if (leads.length >= budgets.chaseOrderLimit) return { end: `首腿已发送 ${leads.length} 笔委托，达到上限，不再发送` };
+    let skipped: BatchQuantity | undefined;
     if (lead.orderType === 'local-chase') {
       let misses = 0;
       for (const item of [...leads].reverse()) { if (!missed(item)) break; misses += 1; }
       if (misses >= budgets.chaseFailureLimit) return { end: `首腿连续 ${misses} 次挂单未成功（${(last.note ?? last.venueStatus ?? last.state).slice(0, 80)}），停止追价` };
-      const { left } = batchLeft(job, leads);
+      const left = sub(plan[batch] as string, add('0', ...leads.filter(item => (item.batch ?? 0) === batch).map(item => item.filledQuantity)));
       // A remainder the venue would refuse as an opening order (minimum notional at the preview bid, with headroom once the batch
       // has partly filled; a whole batch passed the preview's own check) ends the batch.
       const margin = cmp(left, plan[batch] as string) < 0 ? MIN_NOTIONAL_MARGIN : '1';
       const refusable = job.action === 'open' && cmp(mul(exposure(left, lead.instrument), lead.quote.bid), mul(lead.instrument.minNotional, margin)) < 0;
-      if (cmp(left, lead.instrument.minQuantity) >= 0 && !refusable) return { batch, quantity: left };
+      if (cmp(left, lead.instrument.minQuantity) >= 0 && !refusable) return { order: { batch, quantity: left } };
+      if (cmp(left, '0') > 0) skipped = { batch, quantity: left };
     } else if (last.state === 'rejected' || last.state === 'not-sent' || last.state === 'not-created') {
       // A whole batch refused or never sent would be refused again; an IOC that found no price within the bound is not.
-      return isZero(last.filledQuantity) && leads.length > 1 ? { end: `第 ${batch + 1} 批首腿未发出（${(last.note ?? last.state).slice(0, 80)}），不再发送后续批次` } : null;
+      return isZero(last.filledQuantity) && leads.length > 1 ? { end: `第 ${batch + 1} 批首腿未发出（${(last.note ?? last.state).slice(0, 80)}），不再发送后续批次` } : {};
     }
-    return batch + 1 < plan.length ? { batch: batch + 1, quantity: plan[batch + 1] as string } : null;
+    return { skipped, order: batch + 1 < plan.length ? { batch: batch + 1, quantity: plan[batch + 1] as string } : undefined };
   }
   /** Moves a local chase order that has rested chaseRepriceMs once its target price moved; a book that cannot be read leaves it. */
   async function reprice(job: Job, op: Operation): Promise<void> {

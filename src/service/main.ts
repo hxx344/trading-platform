@@ -7,6 +7,7 @@ import { networkInterfaces } from 'node:os';
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import { parseArgs } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { openStore } from '../store.ts';
 import { createExecutor, type Executor } from '../executor.ts';
 import type { PairRecord } from '../transfer.ts';
@@ -15,8 +16,9 @@ import { holdAccountLocks } from '../live/setup.ts';
 import { AsterClient, RequestBudget, type AsterCredentials } from '../aster/client.ts';
 import { AsterTransferConnector } from '../aster/transfer.ts';
 import { AsterTradingConnector } from '../aster/trading.ts';
-import { loadWebApp, type WebApp } from '../web-assets.ts';
-import { runExecutor } from '../runtime.ts';
+import type { WebApp } from '../web-assets.ts';
+import { readComponentBuild } from '../component-build.ts';
+import { checkSocketOptions, runExecutor } from '../runtime.ts';
 import { assertDistinctSigners, checkIntervalBudget, enableBudget, idleWeight, loadServiceConfig, loadServiceSecrets, urlHost, type FeishuSecret, type ServiceConfig, type ServiceSecrets } from './config.ts';
 import { TRANSFER_CONFIG_KEYS, parseTransferConfig, type TransferConfig } from '../contracts.ts';
 import { PASSWORD_FILE, hashPassword, loadPasswordHash, type PasswordHash } from '../login-password.ts';
@@ -26,7 +28,7 @@ import type { AlertHooks, AlertRobot } from '../monitor/alerts.ts';
 import { createStreamStatus, runUserStream, type SocketLike } from './stream.ts';
 import { balanceWindow, createBalanceSamples, type BalanceSamples } from './balance-samples.ts';
 import { readImportResult, submitImportRequest } from './import-channel.ts';
-import { createUpdates, readInstalledVersion, updateReadyFile, type InstalledVersion, type UpdateFetch } from './update.ts';
+import type { UpdateFetch } from './update.ts';
 import { hynixBalanceCheck, hynixBusy, hynixViews, oilLoops, oilViews, openHynixBalance, openOilPnl, openOilRules, prepareOil, registerOilAccounts, strandedOilJobs, type OilRuntime } from './oil.ts';
 import { oilSummary } from './oil-config.ts';
 import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, settleMonitor, stopMonitor, type MonitorRuntime } from './monitor.ts';
@@ -208,12 +210,14 @@ export interface StartOptions {
   connect?: (url: string) => SocketLike;
   notifyFetch?: (url: string, init: RequestInit) => Promise<Response>;
   port?: number;
+  socketPath?: string;
+  executionBuild?: string;
   leaseWaitMs?: number;
   /** The hand-off directory of the root import helper (install.sh sets it up); without it the page offers no import. */
   importDir?: string;
   password?: PasswordHash;
-  /** The built page (loadWebApp); main reads it before the config check, so a release without it never switches in. */
-  app: WebApp;
+  /** The combined TCP service serves the built page. The private executor leaves it to the control service. */
+  app?: WebApp;
   /** Tests stand in for Binance/Bybit/OKX (only with config.oil). */
   oilFetch?: (url: string, init: RequestInit) => Promise<Response>;
   /** Tests stand in for the monitor's public venues (only with config.monitor). */
@@ -235,6 +239,9 @@ export interface StartOptions {
 
 /** Opens the data directory, wires the executor and runs it with the alerts and the user streams until shutdown. */
 export async function startService(options: StartOptions): Promise<ReturnType<typeof runExecutor>> {
+  if (options.socketPath !== undefined) checkSocketOptions(options.socketPath, options.port ?? options.config.port);
+  // Pin the private executor's component before taking any account locks.
+  const executionBuild = options.socketPath !== undefined ? options.executionBuild ?? readComponentBuild(fileURLToPath(new URL('../..', import.meta.url)), 'executor') : undefined;
   mkdirSync(options.dir, { recursive: true, mode: 0o700 });
   claimDataDirEnvironment(options.dir, 'mainnet');
   // From here on, what the service writes to stdout and stderr (both go to the journal) also lands in the page's log tab.
@@ -247,11 +254,12 @@ export async function startService(options: StartOptions): Promise<ReturnType<ty
   }
   catch (error) { process.stderr.write(`页面日志库无法打开，日志页不可用：${error instanceof Error ? error.message.slice(0, 200) : String(error)}\n`); }
   const closeLogs = () => { untee(); try { logs?.close(); } catch { /* best effort */ } };
-  try { return await startWired(options, logs, closeLogs); }
+  try { return await startWired({ ...options, executionBuild }, logs, closeLogs); }
   catch (error) { closeLogs(); throw error; }
 }
 
-async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, ondoOptions, watchOptions, updateFetch }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
+async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, socketPath, executionBuild, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, ondoOptions, watchOptions, updateFetch }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
+  const updates = socketPath === undefined ? (await import('./update.ts')).createServiceUpdates(importDir, updateFetch) : undefined;
   const session = keptSession(dir);
   // O7: the oil and hynix books come from the market monitor's perpetual collector when it has a recent one (oil/pushed.ts);
   // the monitor opens further down, so the source looks it up on each read (no collector: every leg is read over REST).
@@ -382,16 +390,8 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
 
   // The heartbeat for the second server's main-watch; made once the run loop can say whether it is ready.
   let watch: Watch | null = null;
-  // The online update (docs/update.md): versions from GitHub, and the root helper's hand-off in the import directory.
-  // A VERSION file that cannot be read costs only the update panel, never the start.
-  let installed: InstalledVersion, readyFile: string | null;
-  try { installed = readInstalledVersion(); }
-  catch (error) { process.stderr.write(`无法读取版本号，在线更新不可用：${error instanceof Error ? error.message : String(error)}\n`); installed = { version: 'v0.0.0', commit: null, packaged: false }; }
-  try { readyFile = updateReadyFile(); }
-  catch (error) { process.stderr.write(`无法确定程序目录，在线更新不可用：${error instanceof Error ? error.message : String(error)}\n`); readyFile = null; }
-  const updates = createUpdates({ current: installed, dir: importDir ?? null, readyFile, ...(updateFetch ? { fetchImpl: updateFetch } : {}) });
   return runExecutor({
-    executor, store, dir, port, app, session,
+    executor, store, dir, port, socketPath, executionBuild, app, session,
     ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: oil ? ['jobs', 'transfers', 'adl'] : ['transfers', 'adl'], drainMs: DRAIN_MS,
     views: {
       status: () => ({ budget: client.requestBudget.state(), idleWeight: idleWeight(config, executor.transferPairSettings()), streams: streams.view(), feishu: notifier.status(), summary: summary.status(), samples: { available: samples !== null, error: samplesError },
@@ -410,7 +410,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(crossex ? { crossex: crossex.views } : {}),
       ...(ondo ? { ondo: ondo.views } : {}),
       ...(logs ? { logs: (filter: 'all' | 'problems', before: number | null, limit: number) => logs.page({ filter, before, limit }) } : {}),
-      update: updates,
+      ...(updates ? { update: updates } : {}),
     },
     ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir) } } : {}),
     startedMessage: `ASTER 服务已启动（${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}）`,
@@ -424,13 +424,13 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
           await context.pause(NOTIFY_MS);
         }
       })(),
-      (async () => {
+      ...(updates ? [(async () => {
         while (!context.stopped()) {
           try { await updates.tick(); }
           catch (error) { process.stderr.write(`检查新版本出错：${error instanceof Error ? error.message : String(error)}\n`); }
           await context.pause(UPDATE_TICK_MS);
         }
-      })(),
+      })()] : []),
       (async () => {
         while (!context.stopped()) {
           try { await summary.tick(); }
@@ -463,7 +463,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       if (monitor) stopMonitor(monitor);
       // A beat or a version check in flight must not hold the stop for its timeout.
       watch?.abort();
-      updates.abort();
+      updates?.abort();
       // A CrossEx or options start in flight gives up rather than hold the shutdown up.
       crossex?.abort();
       options?.abort();
@@ -492,7 +492,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
 }
 
 async function main(): Promise<void> {
-  const { values } = parseArgs({ options: { config: { type: 'string' }, 'data-dir': { type: 'string' }, 'import-dir': { type: 'string' }, 'check-config': { type: 'boolean' }, 'hash-password': { type: 'boolean' } } });
+  const { values } = parseArgs({ options: { config: { type: 'string' }, 'data-dir': { type: 'string' }, 'import-dir': { type: 'string' }, socket: { type: 'string' }, 'check-config': { type: 'boolean' }, 'hash-password': { type: 'boolean' } } });
   if (values['hash-password']) {
     // install.sh --set-password: the password arrives on stdin (one line), only the digest leaves on stdout.
     const chunks: Buffer[] = [];
@@ -506,8 +506,8 @@ async function main(): Promise<void> {
   // Next to the config, written by install.sh --set-password; no file means no password.
   const password = loadPasswordHash(join(dirname(values.config), PASSWORD_FILE));
   // Part of the check: a release whose page is missing or would break under the CSP is refused before it switches in.
-  const app = loadWebApp();
   if (values['check-config']) {
+    const app = (await import('../web-assets.ts')).loadWebApp();
     // Read and validated offline (keys must derive their signers); nothing is sent anywhere.
     // Only noted, not refused: at boot or with Tailscale logged out the address is missing, and 127.0.0.1 still serves.
     const local = config.host === null || Object.values(networkInterfaces()).flat().some(item => item?.address === config.host);
@@ -519,7 +519,8 @@ async function main(): Promise<void> {
   const dir = assertDedicatedDataDir(values['data-dir']);
   const importDir = values['import-dir'];
   if (importDir !== undefined && !isAbsolute(importDir)) throw new Error('--import-dir 必须是绝对路径');
-  await startService({ config, secrets, dir, app, ...(importDir ? { importDir } : {}), ...(password ? { password } : {}) });
+  const app = values.socket === undefined ? (await import('../web-assets.ts')).loadWebApp() : undefined;
+  await startService({ config, secrets, dir, socketPath: values.socket, app, ...(importDir ? { importDir } : {}), ...(password ? { password } : {}) });
 }
 
 if (import.meta.main) main().catch(error => { process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; });

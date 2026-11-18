@@ -62,7 +62,7 @@ export function jobPhase(job: UpdateJob): 'running' | 'done' | 'failed' | 'inter
 }
 
 export const jobLabels = { running: '正在更新', done: '更新已完成', failed: '上次更新未完成', interrupted: '上次更新已中断' } as const;
-export const stepLabels = { download: '下载并核对安装脚本', install: '运行安装脚本（下载程序包、检查配置、重启服务）' } as const;
+export const stepLabels = { download: '下载并核对安装脚本', install: '下载程序包、检查配置并更新组件' } as const;
 
 export function reloading(state: UpdatePageState): boolean {
   const job = state.view?.job;
@@ -72,7 +72,7 @@ export function reloading(state: UpdatePageState): boolean {
 export function summaryOf(state: UpdatePageState): string {
   const { view } = state;
   if (reloading(state)) return '更新已完成，正在刷新页面';
-  if (state.offline) return updating(view) || state.watched ? '服务重启中' : '连接待恢复';
+  if (state.offline) return updating(view) || state.watched ? '更新中，等待重连' : '连接待恢复';
   if (updating(view) || state.busy === 'apply' || state.uncertain) return '更新进行中';
   if (view?.checking || state.busy === 'check') return '正在检查版本';
   if (!view) return '正在读取状态';

@@ -45,7 +45,7 @@ test('系统更新：请求等待取走或助手运行中算更新中；过期�
   assert.equal(updating(interrupted), false);
   assert.equal(summaryOf(page({ ...interrupted, available: true })), '发现新版本 v0.50.0');
   assert.equal(summaryOf(page({ ...interrupted, available: false })), '已是最新正式版，上次更新已中断');
-  assert.equal(summaryOf(page(base({ available: false, job: job('running') }), { offline: true, watched: 'job-1' })), '服务重启中');
+  assert.equal(summaryOf(page(base({ available: false, job: job('running') }), { offline: true, watched: 'job-1' })), '更新中，等待重连');
 });
 
 test('系统更新：只有本页提交或看到运行的任务成功后才刷新页面', () => {

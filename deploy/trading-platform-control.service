@@ -1,0 +1,44 @@
+# Browser requests go through the execution service's private socket. Both units can restart independently.
+[Unit]
+Description=统一交易平台页面与在线更新
+After=network-online.target tailscaled.service trading-platform.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=trading-platform
+Group=trading-platform
+EnvironmentFile=-@APP_DIR@/control-proxy.env
+WorkingDirectory=@APP_DIR@/control
+ExecStart=@NODE@ @APP_DIR@/control/src/control/main.ts --current @APP_DIR@/current --socket /run/trading-platform/execution.sock --listen-file @APP_DIR@/control-listen.json --import-dir @IMPORT_DIR@
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+InaccessiblePaths=@CONF_DIR@ @DATA_DIR@
+ReadWritePaths=-@IMPORT_DIR@
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

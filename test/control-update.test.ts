@@ -1,0 +1,67 @@
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { once } from 'node:events';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { request as httpRequest } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import { createControl } from '../src/control/main.ts';
+import { createExecutorServer } from '../src/http.ts';
+import { createHarness } from './harness.ts';
+
+test('在线更新经执行面授权，控制面校验原请求并沿用 root 助手的交接文件', async t => {
+  const h = createHarness();
+  t.after(() => h.dispose());
+  const root = join(h.dir, 'releases', 'installed'), handoff = join(h.dir, 'handoff');
+  mkdirSync(join(root, 'web', 'dist'), { recursive: true });
+  mkdirSync(handoff);
+  writeFileSync(join(root, 'web', 'dist', 'index.html'), '<title>控制面</title>');
+  writeFileSync(join(root, 'VERSION'), 'v0.64.0 0123456789ab\n');
+  writeFileSync(join(h.dir, '.update-helper'), 'enabled\n');
+  const socketPath = process.platform === 'win32' ? `\\\\.\\pipe\\tp-update-${randomUUID()}` : join(h.dir, 'execution.sock');
+  let checks = 0;
+  const control = createControl({ current: root, socketPath, importDir: handoff, updateFetch: async () => {
+    checks++;
+    return Response.json({ tag_name: 'v0.65.0', name: '页面更新' });
+  } });
+  control.server.listen(0, '127.0.0.1');
+  await once(control.server, 'listening');
+  const port = (control.server.address() as AddressInfo).port, base = `http://127.0.0.1:${port}`;
+  const engine = createExecutorServer({ executor: h.ex, browserPort: port, accessToken: 'update-test-login' });
+  engine.listen(socketPath);
+  await once(engine, 'listening');
+  t.after(async () => {
+    control.close();
+    await Promise.all([control.server, engine].map(server => new Promise<void>(resolve => server.close(() => resolve()))));
+  });
+  const login = await fetch(base + '/login?token=update-test-login', { redirect: 'manual' });
+  const cookie = login.headers.getSetCookie()[0].split(';')[0];
+  const headers = { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' };
+  const post = (path: string, headers: Record<string, string>, body: string) => fetch(base + path, { method: 'POST', headers, body });
+  assert.equal((await fetch(base + '/api/update', { headers: { 'x-trading-platform-control': '1' } })).status, 401);
+  const wrongHost = await new Promise<number | undefined>((resolve, reject) => {
+    httpRequest(base + '/', { headers: { cookie, host: 'invalid.example' } }, res => { res.resume(); resolve(res.statusCode); }).on('error', reject).end();
+  });
+  assert.equal(wrongHost, 421);
+  const check = '/api/update/check', apply = '/api/update/apply';
+  assert.equal((await post(check, { cookie }, '{}')).status, 403);
+  assert.equal((await post(check, headers, 'bad')).status, 400);
+  assert.equal((await post(check, headers, 'x'.repeat(16 * 1024 + 1))).status, 413);
+  assert.equal(checks, 0);
+  const checked = await post(check, headers, '{}');
+  assert.equal(checked.status, 200);
+  const view = await checked.json() as { current: { version: string }; enabled: boolean; available: boolean };
+  assert.deepEqual([view.current.version, view.enabled, view.available, checks], ['v0.64.0', true, true, 1]);
+  const file = join(handoff, 'update-request.json');
+  assert.equal((await post(apply, headers, '{"version":"v0.64.1"}')).status, 409);
+  assert.equal(existsSync(file), false);
+  const body = '{"version":"v0.65.0"}';
+  const accepted = await post(apply, headers, body);
+  assert.equal(accepted.status, 200);
+  const { pending } = await accepted.json() as { pending: { id: string } };
+  const saved = JSON.parse(readFileSync(file, 'utf8'));
+  assert.deepEqual([saved.id, saved.version], [pending.id, 'v0.65.0']);
+  assert.equal((await post(apply, headers, body)).status, 409);
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), saved);
+});

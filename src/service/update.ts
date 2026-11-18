@@ -7,7 +7,7 @@ import { closeSync, constants, existsSync, fsyncSync, openSync, readFileSync, re
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ContractError, exactKeys } from '../contracts.ts';
-import { readBounded } from './import-channel.ts';
+import { readBounded } from './handoff-file.ts';
 import type { InstalledVersion, ReleaseInfo, UpdateRequest, UpdateResult, UpdateView } from './update-types.ts';
 export type { InstalledVersion, ReleaseInfo, UpdatePhase, UpdateRequest, UpdateResult, UpdateView } from './update-types.ts';
 
@@ -289,6 +289,7 @@ export function createUpdates({ current, dir, readyFile, fetchImpl = fetch, now 
   }
 
   return {
+    setCurrent(version: InstalledVersion): void { current = version; },
     status,
     /** The page's 「检查更新」: at most once a minute, and never before GitHub's reset time. */
     async check(): Promise<UpdateView> {
@@ -337,3 +338,13 @@ export function createUpdates({ current, dir, readyFile, fetchImpl = fetch, now 
 }
 
 export type Updates = ReturnType<typeof createUpdates>;
+
+/** The combined TCP service reads its installed version once. An unreadable version or marker disables the update panel. */
+export function createServiceUpdates(dir: string | undefined, fetchImpl?: UpdateFetch): Updates {
+  let installed: InstalledVersion, readyFile: string | null;
+  try { installed = readInstalledVersion(); }
+  catch (error) { process.stderr.write(`无法读取版本号，在线更新不可用：${message(error)}\n`); installed = { version: 'v0.0.0', commit: null, packaged: false }; }
+  try { readyFile = updateReadyFile(); }
+  catch (error) { process.stderr.write(`无法确定程序目录，在线更新不可用：${message(error)}\n`); readyFile = null; }
+  return createUpdates({ current: installed, dir: dir ?? null, readyFile, fetchImpl });
+}

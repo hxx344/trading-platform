@@ -3,8 +3,10 @@
 // the request, reads the workbench, writes this service's two files, restarts the service and leaves its answer as one
 // result file. Only names, ids, account tails and reasons go through here; keys and webhooks never do.
 import { randomBytes, randomUUID } from 'node:crypto';
-import { closeSync, constants, fchownSync, fstatSync, fsyncSync, lstatSync, openSync, readSync, renameSync, rmSync, unlinkSync, writeSync, type Stats } from 'node:fs';
+import { closeSync, constants, fchownSync, fsyncSync, lstatSync, openSync, renameSync, rmSync, unlinkSync, writeSync, type Stats } from 'node:fs';
 import { join } from 'node:path';
+import { readBounded } from './handoff-file.ts';
+export { readBounded } from './handoff-file.ts';
 import { ContractError, PAIR_ID, exactKeys } from '../contracts.ts';
 import { MAX_PAIRS } from './config.ts';
 import type { ImportItem, OilItem, PreviewItem } from './import-workbench.ts';
@@ -126,27 +128,6 @@ export function parseImportRequest(raw: unknown): ImportRequest {
 export const lstatOrNull = (path: string): Stats | null => {
   try { return lstatSync(path); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
 };
-
-/** Reads at most `limit` bytes of a plain file without following a link; null when it is not there. */
-export function readBounded(path: string, limit: number, check?: (stat: Stats) => void): string | null {
-  let fd: number;
-  try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
-  catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT') return null;
-    throw new Error(code === 'ELOOP' ? `${path} 是符号链接` : `${path} 无法打开：${code ?? '未知错误'}`);
-  }
-  try {
-    const stat = fstatSync(fd);
-    if (!stat.isFile()) throw new Error(`${path} 不是普通文件`);
-    check?.(stat);
-    const buffer = Buffer.alloc(limit + 1);
-    let length = 0;
-    for (let read; length < buffer.length && (read = readSync(fd, buffer, length, buffer.length - length, null)) > 0;) length += read;
-    if (length > limit) throw new Error(`${path} 超过 ${limit} 字节`);
-    return buffer.toString('utf8', 0, length);
-  } finally { closeSync(fd); }
-}
 
 /** The helper's latest answer, as it wrote it; null before the first one. */
 export function readImportResult(dir: string): ImportResult | null {

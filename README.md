@@ -53,8 +53,9 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
   - 备选：手写 `config.json` 的 `monitor` / `asset` 段后执行 `sudo bash install.sh`，账本用 `sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts --from <工作台数据目录>/modules/asset/ledger.sqlite --owner <工作台用户名> --data-dir /var/lib/trading-platform` 单独导入（`trading-platform` 账户须能读到工作台的库）。
 - 期权账户（工作台期权模块 Greeks 的 Bybit 密钥与风险上限，见 [docs/options.md](docs/options.md)）：页面「从工作台导入」的预览同时列出工作台期权账户（打码 UID、能否导入及原因），勾选「导入期权账户」后随导入一起写入；命令行为 `sudo bash install.sh --import-workbench --options`（可与 `--oil`、`--pairs` 同用）。工作台开着自动开仓（`AUTO_OPEN`）、不是实盘主网、还有未结束的订单 / 执行任务 / RFQ，或还在跟踪一组策略时拒绝导入；导入时用密钥读一次 Bybit 账户 UID 并检查权限、绑定 IP 与统一账户。已配置 `options` 时不覆盖。导入后页面出现「期权」标签，导入写入的配置里定时开仓为关闭（要用时在期权页打开；数据目录里留有以前的 `options.sqlite`、且当时在页面打开过定时开仓时，沿用页面上的开关，导入后先在期权页确认），工作台期权模块此后不能再用这个账户下期权单。
 - 首次执行放好程序（`/opt/trading-platform`）、系统账号 `trading-platform`、数据目录 `/var/lib/trading-platform`、导入交接目录 `/var/lib/trading-platform-import`、示例配置和不含配对的空配置，并启动 systemd 服务 `trading-platform`。也可以按 `/etc/trading-platform/config.example.json` 与 `secrets.example.json` 手写配置后再执行一次。
-- 以后每次执行都是增量升级。脚本先只下载校验清单，程序、Node.js、单元和配置都没变就直接结束。有变化时先用新程序校验配置，不通过就保持原版本。重启后 90 秒内没有正常监听就自动回退到上一版本（自动回退到 v0.7.0 之前的版本同样会用 `config.json` 的 `transfer` 覆盖页面改过的参数，见下）。改了配置也是再执行一次让它生效（配对的 `transfer` 与 `adl` 除外，见下）。
-- 页面在线更新（v0.51.0 起）：侧栏「系统」组的「系统更新」查看最新正式版，确认后由服务器上的 root 更新助手执行一次 `install.sh --version <新版本>`（校验、重启、失败回退照旧）。从 v0.50.0 及更早版本升级时要先在服务器上手工执行一次上面的一键部署命令，页面才会从“待启用”变为可用。只能升级、不能在页面降级。详见 [docs/update.md](docs/update.md)。
+- 每次执行都是增量升级。v0.64.0 起，`trading-platform.service` 运行交易、划转、ADL 和行情采集，`trading-platform-control.service` 提供浏览器入口和在线更新。首次从单进程升级会有一次有序重启。此后只更新页面资源时刷新即可载入新版，控制面代码升级或单独执行 `sudo systemctl restart trading-platform-control` 时，浏览器可能短暂断开，后台交易继续运行。执行器代码、单元或生效配置变化时，安装器会有序重启执行器并验证启动。配置校验或启动失败的处理见 [docs/update.md](docs/update.md)。
+- 修改启动配置后，再运行一次安装命令使它生效。配对的 `transfer` 与 `adl` 以页面设置为准。回退到 v0.7.0 之前的版本会用 `config.json` 中的 `transfer` 覆盖页面改过的参数，见下文回退表。
+- 页面在线更新（v0.51.0 起）：侧栏「系统」组的「系统更新」查看最新正式版，确认后由服务器上的 root 助手执行 `install.sh --version <新版本>`，按组件激活并显示结果。从 v0.50.0 及更早版本升级时要先在服务器上手工执行一次上面的一键部署命令。指定旧版本回退使用命令行。
 - 指定或回退版本：`sudo bash install.sh --version v0.1.0`。服务器访问不了 GitHub 时，在别处下载 Release 的三个文件放进同一目录，然后执行 `sudo bash install.sh --package <目录>`。回退前先看下文《回退到旧版本》。
 - 打开页面：
   - **Tailscale（推荐）**：在 `/etc/trading-platform/config.json` 加一行 `"host": "<服务器的 Tailscale IP>"`（`tailscale ip -4` 查看，只能填本机的具体 IP，不能填 `0.0.0.0`），再执行一次 `sudo bash install.sh`，之后直接打开 `http://<Tailscale IP>:4720/`。该地址绑不上时（开机 Tailscale 还没连上、节点已登出）服务照常运行，持续重试，间隔最长 30 秒；配置检查会提示地址不在本机网卡上。
@@ -75,7 +76,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 - 需要代理时写 `/etc/trading-platform/environment`，例如 `NODE_USE_ENV_PROXY=1` 与 `HTTPS_PROXY=…`。
 - 合约价差的质量依据（可选）：CoinGecko 演示键 `COINGECKO_DEMO_API_KEY=…`、币种到 CoinGecko id 的覆盖 `PERPETUAL_COIN_IDS={"XXX":"coin-id"}` 也写在这个文件里，改后 `sudo systemctl restart trading-platform`；不设时走公开限额与自动匹配。
 - 只校验配置、不启动（`node` 用 `systemctl cat trading-platform` 里 ExecStart 的那个）：`sudo -u trading-platform node /opt/trading-platform/current/src/service/main.ts --config /etc/trading-platform/config.json --check-config`。
-- 日志：页面「日志」，或 `journalctl -u trading-platform -f`。
+- 执行日志可在页面「日志」或 `journalctl -u trading-platform -f` 查看。页面监听和资源切换记录在 `journalctl -u trading-platform-control`。
 - 外部巡检（v0.46.0 起）：`GET /api/ready` 不用登录，服务就绪时返回 200 `{"ready":true}`，否则返回 503 `{"ready":false}`，不带其他内容。
   - 就绪的条件：服务没在停止、持有写入租约，并且「运行状态」页列出的每个循环最近 3 分钟内都完成过一轮。这些循环是划转、ADL、持仓读取，以及历史清理（配了原油执行账户时换成两腿任务循环）。刚启动、还有循环没完成第一轮时是 503。原油规则、期权、行情监控、资产、飞书发件、用户推送等其他后台循环不参与判定。
   - 它判断的是进程在运行、持有租约、这些循环没卡住，**发现不了交易所连不上**：划转、ADL、持仓读取单轮里的交易所报错都记在各自的状态与事件里，这一轮仍算完成，接口照样是 200；这类故障由服务自己的飞书告警和页面提示处理。例外是配了原油、有未结束的两腿任务且交易所持续超时的时候，两腿任务循环一轮可能超过 3 分钟，接口会暂时变成 503。
@@ -95,6 +96,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 | 回退到早于 | 回退前要做的事 | 说明 | 详见 |
 | --- | --- | --- | --- |
+| v0.64.0 | 用 v0.64.0 或更新的安装器指定旧版本 | 安装器停止控制面、释放页面端口并恢复单进程。返回 v0.63.0 可直接沿用配置和业务库 | [docs/update.md](docs/update.md) |
 | v0.61.0 | 不用改配置 | 旧版本的 Ondo 奖励市场盘口改回每分钟向交易所读一次（REST），重启后平均值与波动重新累积 | [docs/ondo.md](docs/ondo.md) 第 5 节 |
 | v0.60.0 | 从 `config.json` 删掉 `ondo`、从 `secrets.json` 删掉 `ondo`；在实盘挂单的先在页面停止并确认撤单完成 | 旧版本不认识 `ondo`，配置检查失败、整个服务不启动；数据目录的 `ondo-mm/` 旧版本不读，留着即可 | [docs/ondo.md](docs/ondo.md) 第 9 节 |
 | v0.59.0 | 不用改配置 | 旧版本的原油、海力士盘口与自动开平仓全部向交易所读取（每 3 秒），合约价差页不再有 Binance 的 RWA 合约 | [docs/oil.md](docs/oil.md) 12.4 |

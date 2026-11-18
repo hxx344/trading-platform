@@ -1,7 +1,8 @@
 // The service's two operator files. config.json chooses the listen address and port, the request budget and the pairs by account name;
 // secrets.json holds each account's wallet triple and the Feishu robot. Both are read through the same owner-and-mode
 // check as the live canary files, and no message built here carries a key or a webhook.
-import { isIP } from 'node:net';
+import { parseListenConfig } from './listen-config.ts';
+export { DEFAULT_PORT, parseListenHost, urlHost } from './listen-config.ts';
 import { isAbsolute } from 'node:path';
 import { ContractError, PAIR_ID, VENUES, exactKeys, integer, parseTransferConfig, reject, type TransferConfig } from '../contracts.ts';
 import { IP_CEILING, parseAsterCredentials, type AsterCredentials } from '../aster/client.ts';
@@ -21,7 +22,6 @@ import { parseWatchConfig, parseWatchSecret, type WatchConfig, type WatchSecret 
 
 const ACCOUNT_NAME = /^[0-9A-Za-z_-]{1,64}$/;
 const FEISHU_HOOK = /^https:\/\/open\.(feishu\.cn|larksuite\.com)\/open-apis\/bot\/v2\/hook\/[0-9A-Za-z_-]{8,128}$/;
-export const DEFAULT_PORT = 4720;
 export const MAX_PAIRS = 20;
 /** Top-level blocks of modules besides the ASTER pairs; with any of them configured, pairs may be left out. */
 export const MODULE_KEYS = ['oil', 'options', 'monitor', 'asset', 'crossex', 'ondo'] as const;
@@ -128,24 +128,6 @@ export function enableBudget(config: ServiceConfig, pairs: readonly BudgetedPair
   reject('budget_exceeded', `配对 ${pairId} 不在 config.json 中，启用后按它的检查间隔 ${pair.config.checkIntervalMs} 毫秒计入，配对空闲时每分钟约需请求权重 ${after.needed}，超过每分钟上限 ${after.limitPerMinute} 减去 ADL 预留 ${after.adlReserve} 后的 ${after.available}；请先在设置页调大它的检查间隔，或把它写进 config.json 并调大 budget.limitPerMinute`, 409);
 }
 
-/**
- * One specific address of this server, normalised as a URL writes it (so it matches the browser's Host header). The
- * wildcard addresses are refused: the page would then answer on every interface, the public one included.
- */
-export function parseListenHost(value: unknown): string | null {
-  if (value === undefined || value === null) return null;
-  if (typeof value !== 'string' || isIP(value) === 0) throw new Error('host 须为本机的一个 IP 地址（例如 Tailscale 的 100.x.y.z），不能是域名');
-  const v6 = isIP(value) === 6;
-  const hostname = new URL(`http://${v6 ? `[${value}]` : value}/`).hostname;
-  const normalised = v6 ? hostname.slice(1, -1) : hostname;
-  if (/^0\./.test(normalised) || normalised === '::' || normalised === '::ffff:0:0' || normalised === '255.255.255.255') throw new Error('host 不能是 0.0.0.0、:: 等通配地址，须写本机的一个具体 IP');
-  // 127.0.0.1 is always listened on: the same port again would never bind.
-  if (/^127\./.test(normalised) || normalised === '::1' || /^::ffff:7f[0-9a-f]{2}:/.test(normalised)) throw new Error('host 不用写回环地址（总会监听 127.0.0.1），须写 Tailscale 等其它本机 IP');
-  return normalised;
-}
-/** The listen address as written in a URL or a Host header. */
-export const urlHost = (host: string): string => isIP(host) === 6 ? `[${host}]` : host;
-
 const fail = (name: string, error: unknown): Error => new Error(`${name}无效：${error instanceof ContractError || error instanceof Error ? error.message : '格式错误'}`);
 
 export function parseServiceConfig(raw: unknown): ServiceConfig {
@@ -161,8 +143,7 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   const ondo = modules.includes('ondo') ? parseOndoConfig(value.ondo) : undefined;
   const pairsInput: unknown = hasModule && value.pairs === undefined ? [] : value.pairs;
   if (typeof value.secretsFile !== 'string' || !isAbsolute(value.secretsFile)) throw new Error('secretsFile 必须是绝对路径');
-  const port = value.port === undefined ? DEFAULT_PORT : integer(value.port, 1_024, 65_535, '端口');
-  const host = parseListenHost(value.host);
+  const { port, host } = parseListenConfig(value);
   const budgetRaw = exactKeys(value.budget ?? {}, [], ['limitPerMinute', 'adlReserve']);
   // No pair at all is a valid start: the page is up, and pairs come in from the workbench import there.
   if (!Array.isArray(pairsInput) || pairsInput.length > MAX_PAIRS) throw new Error(`pairs 须为列表，最多 ${MAX_PAIRS} 个配对`);

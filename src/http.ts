@@ -4,9 +4,10 @@
 // write, so neither another site nor another process that merely reaches the port can drive it.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { isIP } from 'node:net';
 import { ContractError, TRANSFER_CONFIG_KEYS, VENUES, exactKeys, parsePage, type Venue } from './contracts.ts';
 import type { Executor } from './executor.ts';
-import { LIVE_PAGE, PAGE } from './page.ts';
+import { APP_HEADERS, ASSET_HEADERS, CLIENT_ADDRESS_HEADER, CONTROL_HEADER, EXECUTION_HEADER, PAGE_HEADERS, controlRoute, readJson, sendJson as send, sessionCookieName } from './http-public.ts';
 import { LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash } from './login-password.ts';
 import type { WebApp } from './web-assets.ts';
 import { ANTHROPIC_RETENTION_DAYS } from './vendor/anthropic-market.mjs';
@@ -21,7 +22,8 @@ import { AssetBackupError } from './asset/source-import.ts';
 import { IMPORT_MAX_BYTES } from './asset/source-ledger.ts';
 import { fillsQueryMarket } from './asset/fills-service.ts';
 
-const MAX_BODY_BYTES = 16 * 1024;
+export { sessionCookieName } from './http-public.ts';
+
 const MAX_LOGIN_BYTES = 4 * 1024;
 const LOOPBACK = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/;
 const UUID_PATH = /^\/api\/jobs\/([0-9a-f-]{36})(?:\/(stop|acknowledge|adopt-strategy|confirm-not-created|release-strategy))?$/i;
@@ -65,26 +67,11 @@ function assetWriteError(error: unknown): ContractError {
   return new ContractError(500, 'internal', '执行器内部错误');
 }
 
-const PAGE_HEADERS = {
-  'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer',
-  'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'",
-};
-// The built page (the ASTER service): its script and style come from /assets only, nothing inline runs.
-const APP_HEADERS = {
-  ...PAGE_HEADERS,
-  'content-security-policy': "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-};
-// Names carry a content hash, so a cached copy never goes stale; private, since only a logged-in browser fetches them.
-const ASSET_HEADERS = { 'cache-control': 'private, max-age=31536000, immutable', 'x-content-type-options': 'nosniff', 'cross-origin-resource-policy': 'same-origin' };
-const ASSET_PATH = /^\/assets\/([^/]{1,128})$/;
 const LOGIN_REQUIRED = '<!doctype html><meta charset="utf-8"><title>需要登录</title><p>请使用数据目录 access-url 中的登录链接打开（用 sudo bash install.sh --set-password 设置登录密码后可直接输入密码）。</p>';
 const loginForm = (notice: string): string => '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>登录</title>'
   + '<style>body{font:15px/1.5 system-ui,sans-serif;max-width:22rem;margin:4rem auto;padding:0 1rem}input,button{font:inherit;padding:.45rem .6rem;width:100%;box-sizing:border-box;margin:.3rem 0}.notice{color:#b42318}</style>'
   + '<h1>统一交易平台</h1><form method="post" action="/login"><label>登录密码<input type="password" name="password" autocomplete="current-password" required autofocus maxlength="' + 2 * MAX_PASSWORD_LENGTH + '"></label><button>登录</button></form>'
   + (notice ? `<p class="notice">${notice}</p>` : '');
-
-/** Instances on different ports of one host share the browser cookie jar for 127.0.0.1, so the name carries the port. */
-export const sessionCookieName = (port: number): string => `pa_executor_session_${port}`;
 
 /** The page's workbench import (the ASTER service only): leaves a request for the root helper and reads its answer. */
 export interface ImportChannel { submit(body: unknown): { id: string; at: number }; latest(): unknown }
@@ -183,6 +170,10 @@ export interface HttpOptions {
   password?: PasswordHash;
   /** The address listened on besides loopback, as written in a URL (an IPv6 one in brackets); accepted in Host. */
   host?: string;
+  /** The browser port when this server listens on the private control socket. */
+  browserPort?: number;
+  /** The executor component fingerprint of the running process, fixed until the next start. */
+  executionBuild?: string;
   /**
    * Answers the login-free GET /api/ready, which a watchdog on another host probes: true while the run is healthy.
    * Without it the path does not exist.
@@ -197,13 +188,17 @@ export interface HttpOptions {
 const sameSecret = (given: string, expected: string): boolean =>
   timingSafeEqual(createHash('sha256').update(given).digest(), createHash('sha256').update(expected).digest());
 
-export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, app, imports, views, password, host, ready, throttle = new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
+export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, app, imports, views, password, host, browserPort, executionBuild = 'development', ready, throttle = new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
   if (!accessToken) throw new Error('需要访问令牌');
   if (sameSecret(session, accessToken)) throw new Error('会话值不能与访问令牌相同');
   // The executor records which session asked for each command; it gets a digest, so the stored rows never hold the cookie.
   const sessionId = createHash('sha256').update(`executor-session:${session}`).digest('base64url');
-  // The name follows the port actually bound, which is only known once listening (port 0 in tests).
-  const cookieName = (request: IncomingMessage) => sessionCookieName(request.socket.localPort ?? 0);
+  const privateSocket = browserPort !== undefined;
+  const cookieName = (request: IncomingMessage) => sessionCookieName(browserPort ?? request.socket.localPort ?? 0);
+  const clientAddress = (request: IncomingMessage): string => {
+    const address = privateSocket ? request.headers[CLIENT_ADDRESS_HEADER] : request.socket.remoteAddress;
+    return typeof address === 'string' && isIP(address) ? address : '未知地址';
+  };
   const authorized = (request: IncomingMessage): boolean => {
     const name = cookieName(request);
     const value = (request.headers.cookie ?? '').split(';').map(part => part.trim()).find(part => part.startsWith(`${name}=`))?.slice(name.length + 1);
@@ -260,35 +255,22 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (!ok) {
       throttle.failed();
       const locked = throttle.waitMs();
-      log(`页面登录密码错误（来自 ${request.socket.remoteAddress ?? '未知地址'}）${locked ? `，已锁定 ${Math.ceil(locked / 1000)} 秒` : ''}`);
+      log(`页面登录密码错误（来自 ${clientAddress(request)}）${locked ? `，已锁定 ${Math.ceil(locked / 1000)} 秒` : ''}`);
       return loginPage(response, 401, locked ? `密码错误，已锁定 ${Math.ceil(locked / 1000)} 秒` : '密码错误');
     }
     throttle.succeeded();
-    log(`页面密码登录成功（来自 ${request.socket.remoteAddress ?? '未知地址'}）`);
+    log(`页面密码登录成功（来自 ${clientAddress(request)}）`);
     response.writeHead(303, { ...PAGE_HEADERS, location: '/', 'set-cookie': sessionCookie(request) });
     response.end();
   }
-  const send = (response: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) => {
-    const payload = JSON.stringify(body);
-    response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...headers });
-    response.end(payload);
+  const handOff = (response: ServerResponse): void => {
+    response.writeHead(204, { [CONTROL_HEADER]: '1', 'cache-control': 'no-store' });
+    response.end();
   };
-  const readJson = (request: IncomingMessage, maxBytes = MAX_BODY_BYTES, tooLarge = '请求体过大'): Promise<unknown> => new Promise((resolve, fail) => {
-    let size = 0; const chunks: Buffer[] = [];
-    const onData = (chunk: Buffer) => {
-      size += chunk.length;
-      if (size <= maxBytes) { chunks.push(chunk); return; }
-      // Drain instead of destroying so the client still receives the 413; the connection closes after it.
-      request.off('data', onData); request.resume();
-      fail(new ContractError(413, 'body_too_large', tooLarge));
-    };
-    request.on('data', onData);
-    request.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null')); } catch { fail(new ContractError(400, 'invalid_json', '请求体不是有效 JSON')); } });
-    request.on('error', fail);
-  });
 
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     if (!allowedHost(request.headers.host ?? '')) return send(response, 421, { code: 'host', message: '访问地址不在允许范围内' });
+    if (privateSocket && request.headers[EXECUTION_HEADER] !== executionBuild) return send(response, 503, { code: 'execution_version', message: '页面与执行器版本尚未匹配，请稍后重试' });
     const url = new URL(request.url ?? '/', 'http://localhost');
     if (request.method === 'POST' && url.pathname === '/login') return passwordLogin(request, response);
     if (request.method === 'GET' && url.pathname === '/login') {
@@ -305,19 +287,22 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     // learns that the service runs and nothing about accounts, balances, configuration or why it is not ready.
     if (ready && request.method === 'GET' && url.pathname === '/api/ready') {
       const ok = ready();
-      return send(response, ok ? 200 : 503, { ready: ok });
+      return send(response, ok ? 200 : 503, { ready: ok }, privateSocket ? { [EXECUTION_HEADER]: executionBuild } : {});
     }
-    if (request.method === 'GET' && url.pathname === '/') {
+    const kind = controlRoute(request.method, url.pathname);
+    if (kind === 'page') {
       if (!authorized(request)) return loginPage(response, 401);
+      if (privateSocket) return handOff(response);
       if (app) { response.writeHead(200, APP_HEADERS); response.end(app.index); return; }
+      const fallback = page ?? (await import('./page.ts'))[executor.environment === 'mainnet' ? 'LIVE_PAGE' : 'PAGE'];
       response.writeHead(200, PAGE_HEADERS);
-      response.end(page ?? (executor.environment === 'mainnet' ? LIVE_PAGE : PAGE));
+      response.end(fallback);
       return;
     }
-    const assetPath = app && request.method === 'GET' ? ASSET_PATH.exec(url.pathname) : null;
-    if (assetPath) {
+    if (kind === 'asset' && (app || privateSocket)) {
       if (!authorized(request)) return send(response, 401, { code: 'session', message: '需要登录' });
-      const asset = app!.assets.get(assetPath[1]!);
+      if (privateSocket) return handOff(response);
+      const asset = app?.assets.get(url.pathname.slice('/assets/'.length));
       if (!asset) return send(response, 404, { code: 'not_found', message: '不存在' });
       response.writeHead(200, { ...ASSET_HEADERS, 'content-type': asset.type, 'content-length': String(asset.body.length) });
       response.end(asset.body);
@@ -368,9 +353,9 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       return send(response, 200, target[2] === 'update' ? rules.update(target[1]!, body) : rules.act(target[1]!, target[2]!, body));
     }
     // M-3c: the market's switch, and the reads of a market switched off (its data is kept, nothing is collected).
-    const controlRoute = request.method === 'POST' ? /^\/api\/monitor\/(anthropic|oil|hynix|perpetual)\/control$/.exec(url.pathname) : null;
-    if (controlRoute) {
-      const market = controlRoute[1] as keyof typeof MONITOR_NAMES;
+    const monitorControl = request.method === 'POST' ? /^\/api\/monitor\/(anthropic|oil|hynix|perpetual)\/control$/.exec(url.pathname) : null;
+    if (monitorControl) {
+      const market = monitorControl[1] as keyof typeof MONITOR_NAMES;
       if (!views?.monitor?.setControl) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
       if (!views.monitor.state().markets.includes(market)) return send(response, 404, { code: 'not_found', message: `本服务没有配置${MONITOR_NAMES[market]}行情监控` });
       return send(response, 200, views.monitor.setControl(market, await readJson(request)));
@@ -661,10 +646,11 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       return send(response, 200, views.summary.setInterval(intervalMinutes));
     }
     if (url.pathname === '/api/update' || url.pathname === '/api/update/check' || url.pathname === '/api/update/apply') {
+      if (privateSocket && kind !== null) return handOff(response);
       if (!views?.update) return send(response, 404, { code: 'not_found', message: '本服务没有在线更新' });
-      if (request.method === 'GET' && url.pathname === '/api/update') return send(response, 200, views.update.status());
-      if (request.method === 'POST' && url.pathname === '/api/update/check') { exactKeys(await readJson(request), []); return send(response, 200, await views.update.check()); }
-      if (request.method === 'POST' && url.pathname === '/api/update/apply') return send(response, 200, views.update.apply(await readJson(request)));
+      if (kind === 'update') return send(response, 200, views.update.status());
+      if (kind === 'check') { exactKeys(await readJson(request), []); return send(response, 200, await views.update.check()); }
+      if (kind === 'apply') return send(response, 200, views.update.apply(await readJson(request)));
     }
     if (url.pathname === '/api/import') {
       if (!imports) return send(response, 404, { code: 'not_found', message: '本服务没有开启页面导入' });

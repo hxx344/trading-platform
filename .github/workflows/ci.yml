@@ -5,6 +5,11 @@ on:
   pull_request:
   # A manual run also measures each test file on a runner, for scripts/test-durations.json.
   workflow_dispatch:
+    inputs:
+      install_full:
+        description: 用不带参数的完整顺序验收安装，并运行真实 systemd 部署
+        type: boolean
+        default: false
 permissions:
   contents: read
 # A new push to a PR supersedes its running checks. Each run on main gets its own group, so none is queued or cancelled.
@@ -43,13 +48,39 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3]
+        part: ${{ fromJSON(inputs.install_full && '["all"]' || '[1,2,3]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
       # The package and its config check include the built page.
       - run: npm run build:web
-      - run: bash deploy/test-install.sh ${{ matrix.part }}
+      - if: matrix.part != 'all'
+        run: bash deploy/test-install.sh ${{ matrix.part }}
+      - if: matrix.part == 'all'
+        run: bash deploy/test-install.sh
+
+  platform-systemd:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - name: 检查安装、单元及进程边界是否变化
+        id: affected
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [[ -n "$BASE" && ! "$BASE" =~ ^0+$ ]] && git fetch --no-tags --depth=1 origin "$BASE" &&
+              git diff --quiet "$BASE" HEAD -- .github/workflows/ci.yml 'deploy/trading-platform*' deploy/install.sh deploy/package.sh deploy/test-platform-systemd.sh src/control 'src/http*.ts' src/runtime.ts src/web-assets.ts src/service/main.ts src/service/listen-config.ts 'src/service/update*.ts'; then
+            echo "run=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "run=true" >>"$GITHUB_OUTPUT"
+          fi
+      - if: steps.affected.outputs.run == 'true'
+        uses: ./.github/actions/setup
+      - if: steps.affected.outputs.run == 'true'
+        run: npm run build:web
+      - if: steps.affected.outputs.run == 'true'
+        run: sudo env PATH="$PATH" TP_PLATFORM_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-platform-systemd.sh
 
   # scripts/test.ts deals the test files into shards by their CI durations (scripts/test-durations.json).
   test:
@@ -85,7 +116,7 @@ jobs:
       - run: sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin TP_WATCH_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-watch-systemd.sh
 
   durations:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && !inputs.install_full
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

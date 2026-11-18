@@ -14,6 +14,8 @@
 
 ## 边界
 
+v0.64.0 起，正式安装的执行器由 `trading-platform.service` 独立运行，私有套接字接收控制面转发的浏览器请求。会话检查、写入租约、账户锁、在途订单以及划转、ADL 和行情循环均归执行器持有。升级与回退见 [在线更新](update.md)。
+
 - 独立入口、独立数据目录 `executor.sqlite`；拒绝含 `hub.sqlite`、`execution-control.sqlite`、`credentials.key` 或 `modules` 的目录，不读写工作台数据。实盘环境（金丝雀与服务入口）的库名是 `executor-live.sqlite`；服务入口的数据目录见 [plan.md](plan.md) 第 3 节。
 - HTTP 只监听 `127.0.0.1`，校验 Host；启动时把本次进程有效的登录链接写入数据目录的 `access-url`（权限 0600），`GET /login?token=` 换取会话 cookie `pa_executor_session_<端口>`（HttpOnly + SameSite=Strict，按端口隔离），无会话的页面与接口返回 401（例外：给外部巡检用的 `GET /api/ready` 不用登录，只答就绪与否，见 [frontend.md](frontend.md)；同一个判定连同原因由运行循环的 `notReady()` 给出，服务入口用它向副服务器推送巡检心跳，见 [watch.md](watch.md)）；写请求需 `x-pa-executor: 1` 与 JSON 体，体积上限 16 KiB。服务入口另可监听本机 Tailscale IP（`config.host`）并支持登录密码，见 [plan.md](plan.md) 第 1 节与第 7 节。
 

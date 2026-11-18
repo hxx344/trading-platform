@@ -25,7 +25,7 @@ function JobProgress({ job }: { job: UpdateJob }) {
     {phase === 'running' && job.step ? <p className="update-job-step">当前步骤：{stepLabels[job.step]}</p> : null}
     {job.output.length ? <details className="update-output" open={phase !== 'done'}><summary>安装脚本输出（最近 {job.output.length} 行）</summary><pre>{job.output.join('\n')}</pre></details> : null}
     {phase === 'failed' || phase === 'interrupted' ? <p className="update-progress-note">此处保留上次更新结果，当前版本见下方。</p> : null}
-    {phase === 'running' ? <small className="update-progress-note">可以关闭此面板；更新会继续，服务重启时页面会断开几十秒，重新打开即可查看进度。</small> : null}
+    {phase === 'running' ? <small className="update-progress-note">关闭面板后更新会继续。页面连接恢复后可查看进度。</small> : null}
   </section>;
 }
 
@@ -72,7 +72,7 @@ export function UpdateStatus({ onExpired, onOpen }: { onExpired: () => void; onO
   const wantActive = updating(view) || busy !== null || uncertain || !!view?.checking || (watched !== null && !reload);
   useEffect(() => { setActive(wantActive); }, [wantActive]);
 
-  // The restarted service and the new page bundle are only picked up by a full page load.
+  // A full page load picks up the activated bundle, including after a page-only release.
   useEffect(() => {
     if (!reload) return;
     const timer = setTimeout(() => location.reload(), RELOAD_DELAY);
@@ -154,7 +154,7 @@ export function UpdateStatus({ onExpired, onOpen }: { onExpired: () => void; onO
       <div className="update-body">
         {needsSetup ? <div className="update-message setup"><CircleAlert size={20} /><div><strong>先启用在线更新</strong><p>请在服务器上重新运行一次一键部署命令（README「部署（Linux 服务器，root）」），升级后即可在这里更新。</p></div></div>
           : <div className={`update-summary ${tone}`}><span className="update-summary-icon">{icon}</span><div><strong>{summary}</strong><p>{view?.checkedAt ? `上次检查 ${dateTime(view.checkedAt)}` : '检查本机可用的正式版本'}</p></div></div>}
-        {offline ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><div><strong>{watched ? '服务正在重启或暂时无法连接' : '暂时无法连接服务'}</strong><p>恢复连接后会自动读取服务器记录。</p><button type="button" className="text-button" onClick={() => void live.refresh()}>重新连接</button></div></div> : null}
+        {offline ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><div><strong>暂时无法连接页面服务</strong><p>恢复连接后会自动读取服务器记录。</p><button type="button" className="text-button" onClick={() => void live.refresh()}>重新连接</button></div></div> : null}
         {view?.error ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><div><strong>版本检查未完成</strong><p>{view.error}</p><p>目前无法确认是否为最新正式版本，请稍后重新检查。</p></div></div> : null}
         {view?.pending?.stale ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><div><strong>更新请求没有被执行</strong><p>服务器上的更新助手 2 分钟内没有取走请求。请确认 trading-platform-update.path 在运行（systemctl status trading-platform-update.path），或重新运行一次一键部署命令。</p></div></div> : null}
         {view?.jobError ? <div className="update-message warning" role="alert"><CircleAlert size={18} /><p>{view.jobError}</p></div> : null}
@@ -163,10 +163,10 @@ export function UpdateStatus({ onExpired, onOpen }: { onExpired: () => void; onO
         {view?.job ? <JobProgress job={view.job} /> : null}
         {view ? <section aria-labelledby="update-modules-title"><div className="update-section-heading"><h3 id="update-modules-title">版本</h3><span>GitHub 正式版</span></div><Versions view={view} /></section> : null}
         {review ? <section ref={reviewElement} tabIndex={-1} className="update-review" aria-labelledby="update-review-title"><h3 id="update-review-title">确认本次更新</h3>
-          <p>将从 {view?.current.version} 更新到 {review}：服务器下载该版本的安装脚本并核对校验和，再由安装脚本下载程序包、检查配置并重启服务；新版本启动不过时一般会自动回退到原版本，结果以安装脚本输出为准。</p>
-          <p>服务会重启，划转与 ADL 循环停几十秒，执行中的任务在重启后按已有恢复逻辑续上。请避开正在进行的手动操作。</p>
+          <p>将从 {view?.current.version} 更新到 {review}。服务器会校验程序包和配置，按组件更新。更新结果和回退情况可在此查看。</p>
+          <p>只更新页面或控制面时，交易、划转和 ADL 会继续运行。执行面需要重启时，任务会短暂停顿，随后按已保存的进度恢复。</p>
           {reviewInvalid ? <p role="alert">最新版本已变化，请返回重新查看。</p> : null}
-        </section> : view?.available && !running ? <p className="update-footnote">只能升级到比当前版本新的正式版；更新时服务会短暂重启。</p> : null}
+        </section> : view?.available && !running ? <p className="update-footnote">可在这里升级到最新正式版。</p> : null}
       </div>
       <footer className="update-footer">{review ? <>
         <button type="button" className="button secondary" disabled={busy === 'apply'} onClick={() => setReview(null)}>返回</button>

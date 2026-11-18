@@ -1,10 +1,11 @@
 // The run loop shared by the prototype entry and the ASTER service: lease heartbeat, WAL upkeep, the three passes on
 // their own schedules, the position reads, the loopback page and an orderly shutdown.
 import { randomBytes } from 'node:crypto';
-import { createServer as createNetServer, type AddressInfo } from 'node:net';
+import { isAbsolute } from 'node:path';
 import { WAIT_BUCKETS_MS, WAL_SIZE_LIMIT_BYTES, type Store } from './store.ts';
 import type { Executor } from './executor.ts';
 import { createExecutorServer, type ImportChannel, type ServiceViews } from './http.ts';
+import { listenPublic, type PublicListenOptions } from './http-public.ts';
 import { SESSION_LIFETIME_MS, writeAccessUrl } from './data-dir.ts';
 import type { PasswordHash } from './login-password.ts';
 import type { WebApp } from './web-assets.ts';
@@ -43,15 +44,18 @@ export interface RunOptions {
   store: Store;
   dir: string;
   port: number;
+  /** Listen only on this local socket. The control service owns the browser port. */
+  socketPath?: string;
+  executionBuild?: string;
   /** One more address to listen on besides 127.0.0.1 (the Tailscale IP), with its URL form (an IPv6 one in brackets). */
-  listen?: { address: string; urlHost: string };
+  listen?: PublicListenOptions['listen'];
   /** The login password's digest; without one only the access-url link logs in. */
   password?: PasswordHash;
   /**
    * Retry spacing for that address while it cannot be bound (Tailscale not connected yet, or logged out): doubling from
    * firstMs up to maxMs, for as long as it takes. It never stops the run; the page stays on 127.0.0.1 meanwhile.
    */
-  listenRetry?: { firstMs: number; maxMs: number };
+  listenRetry?: PublicListenOptions['listenRetry'];
   page?: string;
   /** The built page; takes the place of page. */
   app?: WebApp;
@@ -79,7 +83,13 @@ export interface RunOptions {
 
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
-export function runExecutor({ executor, store, dir, port, listen, password, listenRetry = { firstMs: 2_000, maxMs: 30_000 }, page, app, session, imports, views, passes = ['jobs', 'transfers', 'adl'], startedMessage, background, onStopping, onStopped, log = line => process.stderr.write(`${line}\n`), drainMs = 0 }: RunOptions): { shutdown(reason?: string, detail?: string): Promise<void>; done: Promise<void> } {
+export function checkSocketOptions(socketPath: string, port: number): void {
+  if (!isAbsolute(socketPath)) throw new Error('--socket 必须是绝对路径');
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('使用 --socket 时需要有效的页面端口');
+}
+
+export function runExecutor({ executor, store, dir, port, socketPath, executionBuild, listen, password, listenRetry, page, app, session, imports, views, passes = ['jobs', 'transfers', 'adl'], startedMessage, background, onStopping, onStopped, log = line => process.stderr.write(`${line}\n`), drainMs = 0 }: RunOptions): { shutdown(reason?: string, detail?: string): Promise<void>; done: Promise<void> } {
+  if (socketPath !== undefined) checkSocketOptions(socketPath, port);
   let stopping = false;
   let finished!: () => void;
   const done = new Promise<void>(resolve => { finished = resolve; });
@@ -152,36 +162,29 @@ export function runExecutor({ executor, store, dir, port, listen, password, list
     };
   };
   const ready = (): boolean => notReady() === null;
-  const server = createExecutorServer({ executor, accessToken, log, ready, ...(listen ? { host: listen.urlHost } : {}), ...(password ? { password } : {}), ...(page ? { page } : {}), ...(app ? { app } : {}), ...(session ? { session, sessionMaxAgeS: SESSION_MAX_AGE_S } : {}), ...(imports ? { imports } : {}), views: { ...views, status } });
-  // The chosen address feeds the same HTTP server, so both share one session, one login throttle and one Host check.
-  const extra = listen ? createNetServer(socket => { server.emit('connection', socket); }) : null;
-  server.on('error', error => {
-    // Once listening, an error is an accept failure (out of descriptors, say): the page stays up, the service runs on.
-    if (server.listening) { log(`HTTP 接受连接出错：${error.message}`); return; }
-    log(`HTTP 监听失败：${error.message}`); process.exitCode = 1; void shutdown('listen-failed', error.message); });
-  server.listen(port, '127.0.0.1', () => {
-    const bound = (server.address() as AddressInfo).port;
+  const server = createExecutorServer({ executor, accessToken, log, ready, ...(listen ? { host: listen.urlHost } : {}), ...(password ? { password } : {}),
+    ...(socketPath !== undefined ? { browserPort: port, executionBuild } : { page: page || undefined, app }), ...(session ? { session, sessionMaxAgeS: SESSION_MAX_AGE_S } : {}), ...(imports ? { imports } : {}), views: { ...views, status } });
+  const publishAccess = (bound: number) => {
     try { process.stdout.write(`${startedMessage}，登录链接已写入 ${writeAccessUrl(dir, bound, accessToken, listen?.urlHost)}\n`); }
-    catch (error) { log(`写入登录链接失败：${message(error)}`); process.exitCode = 1; void shutdown('listen-failed', message(error)); return; }
-    if (!extra || !listen) return;
-    let failures = 0, lastCode = '', delay = listenRetry.firstMs;
-    const attempt = () => { if (!stopping && !extra.listening) extra.listen(bound, listen.address); };
-    extra.on('error', (error: NodeJS.ErrnoException) => {
-      const code = error.code ?? error.message;
-      // Once listening, an error is an accept failure (out of descriptors, say): the listener stays, nothing to retry.
-      if (extra.listening) { log(`${listen.urlHost}:${bound} 接受连接出错：${code}`); return; }
-      if (code !== lastCode) log(`监听 ${listen.urlHost}:${bound} 失败（${code}${code === 'EADDRNOTAVAIL' ? '：该地址不在本机，Tailscale 可能尚未连上' : ''}），持续重试（间隔最长 ${listenRetry.maxMs / 1000} 秒）；127.0.0.1:${bound} 照常可用`);
-      lastCode = code; failures += 1;
-      setTimeout(attempt, delay).unref();
-      delay = Math.min(delay * 2, listenRetry.maxMs);
+    catch (error) { log(`写入登录链接失败：${message(error)}`); process.exitCode = 1; void shutdown('listen-failed', message(error)); }
+  };
+  const listenFailed = (error: Error) => { log(`HTTP 监听失败：${error.message}`); process.exitCode = 1; void shutdown('listen-failed', error.message); };
+  let closeListener: () => void;
+  if (socketPath !== undefined) {
+    server.on('error', error => {
+      if (stopping) return;
+      if (server.listening) log(`HTTP 接受连接出错：${error.message}`);
+      else listenFailed(error);
     });
-    extra.on('listening', () => {
-      // A retry that resolved after shutdown began is let go at once.
-      if (stopping) { extra.close(); return; }
-      if (failures > 0) log(`已开始监听 ${listen.urlHost}:${bound}（重试 ${failures} 次后）`);
+    // The service manager owns this private runtime directory. Never unlink another listener's socket.
+    server.listen({ path: socketPath }, () => {
+      if (stopping) { server.close(); return; }
+      publishAccess(port);
     });
-    attempt();
-  });
+    closeListener = () => { server.close(); };
+  } else {
+    closeListener = listenPublic(server, { port, listen, listenRetry, log, onListening: publishAccess, onError: listenFailed });
+  }
   const passFns = { jobs: ['两腿任务循环', executor.tickJobs], transfers: ['划转循环', executor.tickTransfers], adl: ['ADL 循环', executor.tickAdl] } as const;
   loops = passes.map(name => passLoop(passFns[name][0], passFns[name][1]));
   // The jobs pass prunes history; a process without it prunes on its own schedule.
@@ -204,8 +207,7 @@ export function runExecutor({ executor, store, dir, port, listen, password, list
     stopping = true;
     try { onStopping?.(reason, detail); } catch (error) { log(`停止通知失败：${message(error)}`); }
     clearInterval(walCheck);
-    server.close();
-    extra?.close();
+    closeListener();
     for (const wake of [...sleepers]) wake();
     if (drainMs > 0 && !executor.retired) {
       // Sends already out finish and are written; nothing new goes out meanwhile.
@@ -220,9 +222,12 @@ export function runExecutor({ executor, store, dir, port, listen, password, list
     await Promise.all(loops);
     try { await onStopped?.(); } catch (error) { log(`停止收尾失败：${message(error)}`); }
     store.close();
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
     finished();
   }
-  process.once('SIGINT', () => void shutdown());
-  process.once('SIGTERM', () => void shutdown());
+  function onSignal(): void { void shutdown(); }
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
   return { shutdown, done };
 }

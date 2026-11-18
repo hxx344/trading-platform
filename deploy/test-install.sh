@@ -2,7 +2,7 @@
 # shellcheck disable=SC2016,SC2034  # checks are eval-ed later on purpose
 # Runs install.sh as an ordinary user in test mode (temporary directories, no system account, no systemctl):
 # first install without config, unchanged rerun, permission repair, a config the new program rejects, an upgrade,
-# the watchdog heartbeat's switches, and a deterministic package. The systemd start, health check and rollback need root and are checked on the server.
+# the watchdog heartbeat's switches, and a deterministic package. The systemd start, health check and rollback run separately in test-platform-systemd.sh.
 # An optional part (1, 2 or 3) runs only that group after the shared setup and first install, so CI can run the three
 # groups in parallel: 1 install, upgrade, password and listen address; 2 importing from the workbench; 3 the watchdog
 # heartbeat. With no argument all of them run in file order.
@@ -39,7 +39,7 @@ mkdir -p "$tmp/src-b/deploy/main-watch" && cp "$root/deploy/main-watch/main_watc
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-b/"
 mkdir -p "$tmp/src-b/web" && cp -R "$root/web/dist" "$tmp/src-b/web/"
 mkdir -p "$tmp/src-b/scripts" && cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$root/scripts/import-workbook.py" "$tmp/src-b/scripts/"
-cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,trading-platform-update.service,trading-platform-update.path,config.example.json,secrets.example.json} "$tmp/src-b/deploy/"
+cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-control.service,trading-platform-import.service,trading-platform-import.path,trading-platform-update.service,trading-platform-update.path,config.example.json,secrets.example.json} "$tmp/src-b/deploy/"
 printf '\n升级测试\n' >>"$tmp/src-b/README.md"
 bash "$tmp/src-b/deploy/package.sh" "$tmp/b" >/dev/null
 fi
@@ -48,7 +48,7 @@ mkdir -p "$tmp/src-c/deploy/main-watch" && cp "$root/deploy/main-watch/main_watc
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-c/"
 mkdir -p "$tmp/src-c/web" && cp -R "$root/web/dist" "$tmp/src-c/web/"
 mkdir -p "$tmp/src-c/scripts" && cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$root/scripts/import-workbook.py" "$tmp/src-c/scripts/"
-cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,trading-platform-update.service,trading-platform-update.path,config.example.json,secrets.example.json} "$tmp/src-c/deploy/"
+cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-control.service,trading-platform-import.service,trading-platform-import.path,trading-platform-update.service,trading-platform-update.path,config.example.json,secrets.example.json} "$tmp/src-c/deploy/"
 sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { throw new Error('测试：配置检查失败');|" "$tmp/src-c/src/service/main.ts"
 bash "$tmp/src-c/deploy/package.sh" "$tmp/c" >/dev/null
 
@@ -63,7 +63,7 @@ check '测试模式不写在线更新就绪标记（只在 systemd 启用 .path 
 check '当前版本指向新包' '[[ -f "$TP_APP_DIR/current/src/service/main.ts" ]]'
 check '示例配置已放入' '[[ -f "$TP_CONF_DIR/config.example.json" && -f "$TP_CONF_DIR/secrets.example.json" ]]'
 check '数据目录权限 700' '[[ "$(stat -c %a "$TP_DATA_DIR")" == 700 ]]'
-check 'systemd 单元已填入路径' '! grep -q "@" "$TP_UNIT_FILE" && grep -q "ExecStart=$TP_NODE_BIN $TP_APP_DIR/current/src/service/main.ts --config $TP_CONF_DIR/config.json --data-dir $TP_DATA_DIR --import-dir $TP_IMPORT_DIR" "$TP_UNIT_FILE" && grep -q "ReadWritePaths=$TP_DATA_DIR -$TP_IMPORT_DIR" "$TP_UNIT_FILE"'
+check 'systemd 单元已填入路径' '! grep -q "@" "$TP_UNIT_FILE" && grep -q "ExecStart=$TP_NODE_BIN $TP_APP_DIR/executor/src/service/main.ts --config $TP_CONF_DIR/config.json --data-dir $TP_DATA_DIR --import-dir $TP_IMPORT_DIR --socket /run/trading-platform/execution.sock" "$TP_UNIT_FILE" && grep -q "ReadWritePaths=$TP_DATA_DIR -$TP_IMPORT_DIR" "$TP_UNIT_FILE"'
 first=$(readlink -f "$TP_APP_DIR/current")
 
 if part_is 1; then
@@ -169,7 +169,7 @@ mkdir -p "$tmp/src-d/deploy/main-watch" && cp "$root/deploy/main-watch/main_watc
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-d/"
 mkdir -p "$tmp/src-d/web" && cp -R "$root/web/dist" "$tmp/src-d/web/"
 mkdir -p "$tmp/src-d/scripts" && cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$root/scripts/import-workbook.py" "$tmp/src-d/scripts/"
-cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-import.service,trading-platform-import.path,trading-platform-update.service,trading-platform-update.path,config.example.json,secrets.example.json} "$tmp/src-d/deploy/"
+cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-control.service,trading-platform-import.service,trading-platform-import.path,trading-platform-update.service,trading-platform-update.path,config.example.json,secrets.example.json} "$tmp/src-d/deploy/"
 sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { (await import('node:fs')).writeFileSync(process.env.TP_TEST_MARK, ''); await new Promise(resolve => setTimeout(resolve, 1500));|" "$tmp/src-d/src/service/main.ts"
 bash "$tmp/src-d/deploy/package.sh" "$tmp/d" >/dev/null
 rm -f "$tmp/mark"

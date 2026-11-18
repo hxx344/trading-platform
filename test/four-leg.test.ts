@@ -796,3 +796,134 @@ test('接管旧四腿时在途任务的首腿终态数量损坏：该组保留�
   assert.deepEqual(healthy.map(job => [job.status, job.locked, job.legs[1].filledQuantity]), [['completed', false, '0.249'], ['completed', false, '0.24']]);
   assert.deepEqual(locks(h).map(item => item.job_id), [damaged.id, damaged.id]);
 }));
+
+for (const [damage, value, flag, restart] of [
+  ['fill', '2', null, true], ['fill', '-1', 'peerHalt', true], ['fill', 'broken', 'leadDeviation', true],
+  ['fill', '2', null, false], ['request', '0', null, true], ['request', '1e2', null, false],
+  ['leadPlan', '0', null, true], ['hedgePlan', 'broken', 'peerHalt', false], ['leadStep', '0', 'leadDeviation', true], ['hedgeStep', 'broken', null, false],
+] as const) {
+  test(`四腿执行前核对原委托：${restart ? '接管' : '正常推进'}的 ${damage}=${value}，已有 ${flag ?? '无'} 标记也不能据此补单`, () => withHarness(async h => {
+    const { ids } = await confirmFour(h);
+    await tick(h);
+    if (damage === 'fill' || damage === 'request') {
+      const path = damage === 'fill' ? '$.filledQuantity' : '$.request.quantity';
+      h.store.db.prepare('UPDATE operations SET json = json_set(json, ?, ?) WHERE job_id = ? AND leg = 0').run(path, value, ids[0]);
+    } else {
+      const path = `$.legs[${damage.startsWith('lead') ? 0 : 1}].${damage.endsWith('Plan') ? 'quantity' : 'instrument.quantityStep'}`;
+      h.store.db.prepare('UPDATE jobs SET json = json_set(json, ?, ?) WHERE id = ?').run(path, value, ids[0]);
+    }
+    if (flag) h.store.db.prepare('UPDATE jobs SET json = json_set(json, ?, ?) WHERE id = ?').run(`$.${flag}`, '旧任务记录', ids[0]);
+    if (restart) { h.clock.now += 61_000; h.restart(); assert.equal(h.ex.acquire(), true); }
+    await tick(h);
+    const [own, peer] = await settleAll(h, ids);
+    assert.deepEqual([own.status, own.locked, own.legs[1].attempts, h.binance.arrived.place], ['attention', true, 0, 1]);
+    assert.deepEqual([peer.status, peer.legs[1].filledQuantity], ['completed', '1']);
+    if (damage === 'fill' || damage === 'request') {
+      assert.equal(own.legs[0].filledQuantity, '无效');
+      if (damage === 'fill') assert.equal(own.legs[0].operation!.filledQuantity, value);
+      assert.ok(groupStatus(groupJobs(h.ex.recentJobs())[0].jobs).details.some(detail => detail.includes('无法比较')));
+    }
+  }));
+}
+
+test('四腿接管：两个子任务分别有过量的首腿与对冲回报，保留四把锁，独立市场照常完成', () => withHarness(async h => {
+  const oil = await confirmFour(h);
+  const hynix = await confirmFour(h, hynixIntent());
+  await tick(h); await tick(h);
+  h.store.db.prepare("UPDATE operations SET json = json_set(json, '$.filledQuantity', '2') WHERE job_id = ? AND leg = 0 OR job_id = ? AND leg = 1").run(oil.ids[0], oil.ids[1]);
+  const counts = [h.binance.arrived.place, h.bybit.arrived.place];
+  h.clock.now += 61_000; h.restart(); assert.equal(h.ex.acquire(), true);
+  const bad = oil.ids.map(id => h.ex.jobView(id));
+  assert.deepEqual(bad.map(job => [job.status, job.locked]), [['attention', true], ['attention', true]]);
+  assert.deepEqual([bad[0].legs[0].filledQuantity, bad[1].legs[1].filledQuantity], ['无效', '无效']);
+  assert.equal(groupStatus(groupJobs(h.ex.recentJobs(20, 'oil'))[0].jobs).details.filter(text => text.includes('无法比较')).length, 2);
+  assert.deepEqual((await settleAll(h, hynix.ids)).map(job => job.status), ['completed', 'completed']);
+  assert.deepEqual([h.binance.arrived.place, h.bybit.arrived.place], counts);
+  assert.equal(locks(h).length, 4);
+}));
+
+for (const identity of ['已核实', '不符'] as const) {
+  test(`四腿异常数量转人工：对冲限价单结果未知只查询，身份${identity}后按原单处理`, () => withHarness(async h => {
+    const intent = fourIntent();
+    Object.assign(intent.legs[1], { orderType: 'limit', limitPrice: '69.9' });
+    const { ids } = await confirmFour(h, intent);
+    await tick(h);
+    h.binance.inject({ operation: 'place', mode: 'lost-response' });
+    await tick(h);
+    const hedge = h.ex.jobView(ids[0]).legs[1].operation!;
+    assert.equal(hedge.state, 'unknown');
+    h.store.db.prepare("UPDATE operations SET json = json_set(json, '$.filledQuantity', '2') WHERE job_id = ? AND leg = 0").run(ids[0]);
+    if (identity === '不符') h.store.db.prepare("UPDATE operations SET json = json_set(json, '$.request.clientOrderId', 'foreign') WHERE job_id = ? AND leg = 1").run(ids[0]);
+    h.binance.inject({ operation: 'query', mode: 'read-fail', clientOrderId: hedge.clientOrderId });
+    h.clock.now += 61_000; h.restart(); assert.equal(h.ex.acquire(), true);
+    await tick(h);
+    assert.deepEqual([h.ex.jobView(ids[0]).status, h.binance.arrived.cancel, h.binance.arrived.place], ['attention', 0, 2]);
+    await tick(h); await tick(h);
+    const own = h.ex.jobView(ids[0]);
+    assert.deepEqual([own.locked, h.binance.arrived.cancel, h.binance.orders.get(hedge.clientOrderId)!.status, h.binance.arrived.place],
+      [true, identity === '已核实' ? 1 : 0, identity === '已核实' ? 'canceled' : 'new', 2]);
+  }));
+}
+
+test('本地追价重挂的跨单实际成交才受批量上界约束；活动委托新回报触及旧数据损坏时停止补单', () => withHarness(async h => {
+  const { ids } = await confirmFour(h, fourIntent({ binanceLead: 'local-chase' }));
+  await tick(h);
+  const first = leadOrderId(ids[0], 0), second = leadOrderId(ids[0], 1);
+  h.binance.fillResting(first, '0.3');
+  h.binance.setBook('BZUSDT', { bid: '74.05', ask: '74.07' });
+  for (let pass = 0; pass < 10 && !h.binance.orders.has(second); pass++) await tick(h);
+  assert.deepEqual([h.binance.orders.get(first)!.request.quantity, h.binance.orders.get(second)!.request.quantity], ['1', '0.7']);
+  h.store.db.prepare("UPDATE operations SET json = json_set(json, '$.filledQuantity', '0.6') WHERE client_order_id = ?").run(first);
+  h.binance.fillResting(second, '0.7');
+  const before = h.binance.arrived.place;
+  await tick(h);
+  const own = h.ex.jobView(ids[0]);
+  assert.deepEqual([own.status, own.locked, own.legs[0].filledQuantity, h.binance.arrived.place], ['attention', true, '无效', before]);
+}));
+
+for (const stop of ['预算', '人工确认'] as const) {
+  test(`四腿损坏组仍有本地追价挂单：撤单未送达按${stop}结束，不补单`, () => withHarness(async h => {
+    const { ids } = await confirmFour(h, fourIntent({ binanceLead: 'local-chase' }));
+    await tick(h);
+    const lead = leadOrderId(ids[0], 0);
+    h.binance.fillResting(lead, '0.3');
+    await tick(h);
+    h.store.db.prepare("UPDATE operations SET json = json_set(json, '$.filledQuantity', '3') WHERE job_id = ? AND leg = 1").run(ids[0]);
+    h.binance.inject({ operation: 'cancel', mode: 'not-sent', times: 10 });
+    const before = h.binance.arrived.place;
+    h.clock.now += 61_000; h.restart(); assert.equal(h.ex.acquire(), true);
+    await tick(h);
+    assert.deepEqual([h.ex.jobView(ids[0]).status, h.ex.jobView(ids[0]).locked, h.binance.calls.cancel], ['attention', true, 1]);
+    if (stop === '人工确认') h.ex.acknowledge(ids[0], randomUUID(), SESSION);
+    for (let n = 0; n < 4; n++) await tick(h);
+    assert.equal(h.binance.calls.cancel, stop === '预算' ? 2 : 1);
+    assert.equal(h.ex.jobView(ids[0]).locked, stop === '预算');
+    assert.deepEqual([h.binance.orders.get(lead)!.status, h.binance.arrived.place], ['partially-filled', before]);
+  }, { budgets: { cancelAttempts: 2, cancelRetryMs: 1_000 } }));
+}
+
+test('四腿损坏组的原生追价：仍在工作的原策略经身份核对后有界停止，不按坏计划发对冲', () => withHarness(async h => {
+  const intent = fourIntent(); intent.legs[2].orderType = 'chase';
+  h.bybit.inject({ operation: 'strategy-place', mode: 'partial', filled: '0.4' });
+  const { ids } = await confirmFour(h, intent);
+  await tick(h);
+  h.store.db.prepare("UPDATE jobs SET json = json_set(json, '$.legs[1].quantity', '0') WHERE id = ?").run(ids[1]);
+  h.clock.now += 61_000; h.restart(); assert.equal(h.ex.acquire(), true);
+  await tick(h); await tick(h);
+  const bad = h.ex.jobView(ids[1]);
+  assert.deepEqual([bad.status, bad.locked, bad.legs[0].operation!.state, bad.legs[0].filledQuantity, bad.legs[1].attempts], ['attention', true, 'canceled', '0.4', 0]);
+  assert.deepEqual([h.bybit.arrived['strategy-stop'], h.bybit.arrived.place], [1, 0]);
+}));
+
+test('本地追价已撤余且历史成交损坏：接管仍保留锁和原始回报，跳过量不能由坏成交推算', () => withHarness(async h => {
+  const { ids } = await confirmFour(h, fourIntent({ binanceLead: 'local-chase' }));
+  await tick(h);
+  h.binance.fillResting(leadOrderId(ids[0], 0), '1');
+  await tick(h);
+  h.store.db.prepare("UPDATE operations SET json = json_set(json, '$.filledQuantity', 'broken') WHERE job_id = ? AND leg = 0").run(ids[0]);
+  const before = h.binance.arrived.place;
+  h.clock.now += 61_000; h.restart(); assert.equal(h.ex.acquire(), true);
+  await tick(h);
+  const bad = h.ex.jobView(ids[0]);
+  assert.deepEqual([bad.status, bad.locked, bad.leadSkipped, bad.legs[0].filledQuantity, bad.legs[0].operation!.filledQuantity, h.binance.arrived.place], ['attention', true, null, '无效', 'broken', before]);
+}));

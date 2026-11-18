@@ -2,15 +2,16 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createServer, get, type IncomingMessage, type RequestListener } from 'node:http';
+import { createServer, get, request as httpRequest, type IncomingMessage, type RequestListener } from 'node:http';
 import { connect, type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { test, type TestContext } from 'node:test';
+import { setImmediate as nextTurn } from 'node:timers/promises';
 import { constants, createGunzip, createGzip, type Gzip } from 'node:zlib';
 import { createControl } from '../src/control/main.ts';
-import { UUID } from '../src/contracts.ts';
+import { ContractError, UUID } from '../src/contracts.ts';
 import { EXECUTION_HEADER, readJson, sendJson } from '../src/http-public.ts';
 import { api, ApiError } from '../web/src/api.ts';
 import { RequestIds } from '../web/src/request-ids.ts';
@@ -32,8 +33,73 @@ async function listener(t: TestContext, upstream: RequestListener) {
   });
   await Promise.all([once(engine.listen(socketPath), 'listening'), once(control.server.listen(0, '127.0.0.1'), 'listening')]);
   const port = (control.server.address() as AddressInfo).port;
-  return { dir, port, base: `http://127.0.0.1:${port}` };
+  return { dir, port, base: `http://127.0.0.1:${port}`, server: control.server };
 }
+
+test('定长写入的最后一段正文先到时，执行器等控制面结束请求后只处理一次', { timeout: 10_000 }, async t => {
+  const body = JSON.stringify({ requestId: randomUUID() });
+  let sawBody!: (message: IncomingMessage) => void, finish!: () => void;
+  const bodyReceived = new Promise<IncomingMessage>(resolve => { sawBody = resolve; });
+  const canFinish = new Promise<void>(resolve => { finish = resolve; });
+  let commands = 0;
+  const { base, server } = await listener(t, (request, response) => {
+    const chunks: Buffer[] = [];
+    let received = 0;
+    request.on('data', (chunk: Buffer) => {
+      chunks.push(chunk);
+      received += chunk.length;
+      if (received === Buffer.byteLength(body)) sawBody(request);
+    });
+    request.on('end', () => { commands++; sendJson(response, 200, JSON.parse(Buffer.concat(chunks).toString('utf8'))); });
+  });
+  // Drive the observed ordering without relying on Linux scheduling: deliver every body byte now, then release end.
+  server.prependOnceListener('request', request => {
+    const emit = request.emit.bind(request);
+    request.emit = (event: string | symbol, ...args: unknown[]) => {
+      if (event !== 'end') return emit(event, ...args);
+      void canFinish.then(() => emit('end'));
+      return true;
+    };
+  });
+  const [response] = await Promise.all([
+    fetch(base + '/api/confirm', { method: 'POST', headers: { 'content-length': String(Buffer.byteLength(body)) }, body }),
+    bodyReceived.then(async request => {
+      try {
+        await nextTurn();
+        assert.equal(request.complete, false, '私有请求的结束须与控制面的写入结束一致');
+        assert.equal(commands, 0);
+      } finally { finish(); }
+    }),
+  ]);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), JSON.parse(body));
+  assert.equal(commands, 1);
+});
+
+test('转发保留空正文和分块 JSON，执行器仍能明确拒绝非法或超限正文', async t => {
+  const { base } = await listener(t, async (request, response) => {
+    try { sendJson(response, 200, await readJson(request, 32)); }
+    catch (error) {
+      assert.ok(error instanceof ContractError);
+      sendJson(response, error.status, { code: error.code }, error.status === 413 ? { connection: 'close' } : {});
+    }
+  });
+  const url = base + '/api/confirm';
+  const empty = await fetch(url, { method: 'POST', body: '' });
+  assert.deepEqual([empty.status, await empty.json()], [200, null]);
+  const chunked = httpRequest(url, { method: 'POST', agent: false });
+  const received = once(chunked, 'response') as Promise<[IncomingMessage]>;
+  chunked.write('{"value":');
+  chunked.end('7}');
+  const [response] = await received;
+  const chunks: Buffer[] = [];
+  for await (const chunk of response) chunks.push(chunk as Buffer);
+  assert.deepEqual([response.statusCode, JSON.parse(Buffer.concat(chunks).toString())], [200, { value: 7 }]);
+  for (const [body, status, code] of [['{', 400, 'invalid_json'], ['x'.repeat(40), 413, 'body_too_large']] as const) {
+    const rejected = await fetch(url, { method: 'POST', body });
+    assert.deepEqual([rejected.status, await rejected.json()], [status, { code }]);
+  }
+});
 
 for (const [method, path] of [['POST', '/api/confirm'], ['PUT', '/api/crossex/settings']] as const) {
   test(`控制面 ${method} 已落盘但缺少响应头时，页面沿用原编号核对，业务拒绝保留 HTTP 状态`, async t => {

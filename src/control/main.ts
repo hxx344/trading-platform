@@ -27,7 +27,13 @@ function engineHeaders(request: IncomingMessage, executionBuild: string, withBod
     const value = request.headers[name];
     if (value !== undefined) headers[name] = value;
   }
-  if (withBody && request.headers['content-length'] !== undefined) headers['content-length'] = request.headers['content-length'];
+  const length = request.headers['content-length'];
+  if (withBody && (length !== undefined || request.headers['transfer-encoding'] !== undefined)) {
+    // A fast executor can answer a fixed-length body and close the Unix socket before pipe() ends its write.
+    // On this hop the final chunk marks the end of the write, even if the browser sent an exact byte count.
+    if (length === '0') headers['content-length'] = '0';
+    else headers['transfer-encoding'] = 'chunked';
+  }
   if (request.socket.remoteAddress) headers[CLIENT_ADDRESS_HEADER] = request.socket.remoteAddress;
   return headers;
 }

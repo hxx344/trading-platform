@@ -242,7 +242,8 @@ test('market IPC observation replays a late depth around an empty side at venue 
     mm.initialize(); mm.save(config({ mode: 'observe' }));
     await mm.start({ revision: mm.state().revision });
     const start = f.time;
-    for (const [arrival, source, bids] of [[0, 0, BIDS], [20, 20, []], [30, 30, BIDS], [32, 10, BIDS]]) {
+    // This delayed depth had too little bid protection for the 10 ms before the empty side.
+    for (const [arrival, source, bids] of [[0, 0, BIDS], [20, 20, []], [30, 30, BIDS], [32, 10, [['200.00', '0.01']]]]) {
       f.time = start + arrival; f.push(bids, ASKS, start + source);
       if (reconnect && source === 20) {
         f.time++;
@@ -264,7 +265,7 @@ test('market IPC observation replays a late depth around an empty side at venue 
   }
   for (const reconnect of [false, true]) {
     const direct = await replay(false, reconnect);
-    assert.deepEqual(direct, [30, 1, 1]);
+    assert.deepEqual(direct, [reconnect ? 30 : 20, 1, 1]);
     assert.deepEqual(await replay(true, reconnect), direct);
   }
 });

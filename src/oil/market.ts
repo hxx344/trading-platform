@@ -93,7 +93,7 @@ export function createMarketReader({ connectors, accounts, symbols, now = Date.n
         checkQuoteFresh(quote, now(), QUOTE_MAX_AGE_MS, QUOTE_FUTURE_MS);
         if (connector.quoteCurrent?.(quote) === false) throw new Error('行情连接已切换，等待新盘口');
         const at = Math.min(quote.sourceTime ?? quote.receivedAt, quote.receivedAt);
-        if (at < (target.sourceAt ?? target.receivedAt ?? -Infinity)) throw new Error('交易所返回了更早的盘口');
+        if (marketEpoch && at < (target.sourceAt ?? target.receivedAt ?? -Infinity)) throw new Error('交易所返回了更早的盘口');
         const freshEpoch = marketEpoch?.();
         if (freshEpoch) epochs.set(target, freshEpoch);
         Object.assign(target, { bid: quote.bid, ask: quote.ask, receivedAt: quote.receivedAt, sourceAt: at, source: 'rest', error: null });

@@ -17,7 +17,7 @@ interface VenueReaders {
   funding?: ReturnType<typeof createFundingClient>;
   candles?: ReturnType<typeof createCandleReader>;
   terminal?: ReturnType<typeof createTerminalFeed>;
-  resolveLighter?: (symbol: string) => Promise<unknown>;
+  resolveLighter?: (symbol: string, signal: AbortSignal) => Promise<unknown>;
 }
 
 /** Public collection only. No account files, API credentials, URL input or trading transports are accepted. */
@@ -30,23 +30,23 @@ export function createVenueFeeds(readers: VenueReaders = {}): MarketOperations {
   const depths = readers.depth ?? clients, funding = readers.funding ?? createFundingClient({ fetcher, signal: stopped.signal });
   const candles = readers.candles ?? createCandleReader({ fetcher }), terminal = readers.terminal ?? createTerminalFeed();
   const subscriptions = new Set<() => void>();
-  async function checkLighterMarket(q: Record<string, unknown>) {
+  async function checkLighterMarket(q: Record<string, unknown>, signal: AbortSignal) {
     if (q.exchange !== 'lighter') return;
     // These feeds can return a market ID alone. Verify its native symbol before using the channel or candle endpoint.
-    const resolved = await (readers.resolveLighter ?? clients.resolveManualQuote)(String(q.crossexSymbol));
+    const resolved = await (readers.resolveLighter ?? clients.resolveManualQuote)(String(q.crossexSymbol), signal);
     const native = resolved as Record<string, unknown> | null;
     if (!native || native.symbol !== q.symbol || native.marketId !== q.marketId) throw new Error('Lighter 行情合约身份已变化');
   }
-  async function read(op: string, input: unknown) {
+  async function read(op: string, input: unknown, signal: AbortSignal) {
     if (op === 'ondo.markets') {
       fields(input, []);
-      const rules = await ondo.markets();
+      const rules = await ondo.markets(signal);
       if (rules.size > 4096) throw new Error('Ondo 合约目录过大');
       return [...rules];
     }
     if (op === 'ondo.depth') {
       const p = fields(input, ['market', 'levels']), name = ondoName(p.market), limit = depthLimit(p.levels);
-      const depth = await ondo.depth(name, limit);
+      const depth = await ondo.depth(name, limit, signal);
       if (depth.market !== name || !timestamp(typeof depth.time === 'string' && depth.time.length <= 48 ? Date.parse(depth.time) : depth.time)) throw new Error('Ondo 盘口无效');
       const side = (rows: unknown) => {
         if (!Array.isArray(rows) || rows.length > limit) throw new Error('Ondo 盘口档数无效');
@@ -63,32 +63,33 @@ export function createVenueFeeds(readers: VenueReaders = {}): MarketOperations {
     if (op === 'crossex.depth' || op === 'crossex.manualDepth') {
       const p = fields(input, ['quote']), manual = op === 'crossex.manualDepth';
       const quote = checkIdentity(p.quote, manual ? 'manual' : 'comparable');
-      return manual ? depths.loadManualDepth(quote) : depths.loadDepth(quote);
+      return manual ? depths.loadManualDepth(quote, signal) : depths.loadDepth(quote, signal);
     }
     if (op === 'crossex.candles') {
       const p = fields(input, ['quote', 'interval']), quote = checkIdentity(p.quote, 'manual');
       if (typeof p.interval !== 'string' || !Object.hasOwn(INTERVALS, p.interval)) throw new Error('不支持的 K 线周期');
-      await checkLighterMarket(quote);
-      return candles(quote, p.interval);
+      await checkLighterMarket(quote, signal);
+      return candles(quote, p.interval, signal);
     }
     if (op === 'crossex.currentFunding') {
       const p = fields(input, ['quote']), quote = checkIdentity(p.quote, 'either');
-      await checkLighterMarket(quote);
-      return funding.current(quote);
+      await checkLighterMarket(quote, signal);
+      return funding.current(quote, signal);
     }
     if (op === 'crossex.fundingHistory') {
       const p = fields(input, ['quote', 'from', 'to']), quote = checkIdentity(p.quote, 'comparable');
       if (!timestamp(p.from) || !timestamp(p.to) || p.from < 1e12 || p.from > p.to || p.to > Date.now()
         || p.to - p.from > 366 * 86_400_000) throw new Error('公开资金费时间区间无效');
-      return funding.read(quote, p.from, p.to);
+      return funding.read(quote, p.from, p.to, signal);
     }
     throw new Error('未知公开行情操作');
   }
   return {
     async call(op, input, signal) {
-      signal.throwIfAborted(); stopped.signal.throwIfAborted();
-      const result = await read(op, input);
-      signal.throwIfAborted(); stopped.signal.throwIfAborted();
+      const active = AbortSignal.any([signal, stopped.signal]);
+      active.throwIfAborted();
+      const result = await read(op, input, active);
+      active.throwIfAborted();
       return result;
     },
     stream(op, input, emit, signal) {

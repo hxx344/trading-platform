@@ -1,12 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { createVenueFeeds } from '../src/market/venue-feeds.ts';
 import { unpackBook } from '../src/market/venue-protocol.ts';
 import type { MarketClient, MarketOperations } from '../src/market/ipc.ts';
 import { remoteCrossexReaders, remoteOndoClient, remoteOndoStream } from '../src/service/remote-venue-feeds.ts';
 import type { OndoStreamOptions } from '../src/vendor/ondo/stream.mjs';
+import { createOndoClient } from '../src/vendor/ondo/client.mjs';
+import { createPublicClients } from '../src/vendor/crossex/clients.mjs';
+import { createFundingClient } from '../src/vendor/crossex/funding-client.mjs';
+import { createCandleReader } from '../src/vendor/crossex/candle-reader.mjs';
 
 const symbol = 'NVDA-USD.P', controller = () => new AbortController();
+function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done; }); return { promise, resolve }; }
 const identity = { exchange: 'binance', symbol: 'BTCUSDT', base: 'BTC', rawBase: 'BTC', quoteCurrency: 'USDT', counterCurrency: 'USDT',
   settlementCurrency: 'USDT', collateralCurrency: 'USDT', crossexSymbol: 'BINANCE_FUTURE_BTC_USDT', contractKind: 'linear', multiplier: 1,
   identityVerified: true, identitySource: 'exchange-instrument-metadata', assetClass: 'crypto', identityScope: 'manual', nativeUnit: '1', comparable: true };
@@ -110,4 +116,71 @@ test('CrossEx binds the exact native identity and source timestamp to each confi
   at++; returned = 'ETHUSDT'; await assert.rejects(depth(identity), /身份/);
   returned = identity.symbol; const fresh = await depth(identity); assert.equal(fresh.isCurrent(), true);
   at -= 60_000; await assert.rejects(depth(identity), /过期/);
+});
+
+test('a cancelled Ondo IPC request leaves the rate queue immediately and an active request aborts its HTTP read', async t => {
+  const entered = deferred<AbortSignal>(), calls: string[] = [];
+  const ondo = createOndoClient({ rps: 1, fetchImpl: async (url, init) => {
+    calls.push(String(url)); const signal = init!.signal!; entered.resolve(signal);
+    return new Promise<Response>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  } });
+  const feeds = createVenueFeeds({ ondo }); t.after(() => feeds.close?.());
+  const first = controller(), queued = controller();
+  const active = feeds.call('ondo.depth', { market: symbol, levels: 50 }, first.signal), http = await entered.promise;
+  const second = feeds.call('ondo.markets', {}, queued.signal); queued.abort();
+  await assert.rejects(second); assert.equal(http.aborted, false);
+  first.abort(); await assert.rejects(active); assert.equal(http.aborted, true); assert.equal(calls.length, 1);
+});
+
+test('cancelled CrossEx readers preserve shared metadata until the remaining depth reader finishes', async t => {
+  const entered = deferred<AbortSignal>(), release = deferred<void>();
+  let catalogs = 0, depths = 0;
+  const clients = createPublicClients({ fetcher: async (url, init) => {
+    if (url.includes('exchangeInfo')) {
+      catalogs++; entered.resolve(init!.signal!); await release.promise; init!.signal!.throwIfAborted();
+      return Response.json({ symbols: [{ baseAsset: 'BTC', quoteAsset: 'USDT', marginAsset: 'USDT', symbol: 'BTCUSDT',
+        underlyingType: 'COIN', underlyingSubType: [], contractType: 'PERPETUAL', status: 'TRADING' }] });
+    }
+    depths++; return Response.json({ bids: [['100', '2']], asks: [['101', '2']], T: Date.now() });
+  } });
+  const feeds = createVenueFeeds({ depth: clients }); t.after(() => feeds.close?.());
+  const first = controller(), remaining = controller();
+  const a = feeds.call('crossex.manualDepth', { quote: identity }, first.signal);
+  const b = feeds.call('crossex.manualDepth', { quote: identity }, remaining.signal);
+  const upstream = await entered.promise; first.abort();
+  await assert.rejects(a); assert.equal(upstream.aborted, false);
+  release.resolve(); const book = await b as { symbol: string };
+  assert.equal(book.symbol, identity.symbol); assert.equal(catalogs, 1); assert.equal(depths, 1);
+});
+
+test('funding history aborts its native requests only after both callers cancel; private-free candles and temporary WS stop immediately', async t => {
+  const entered = deferred<void>(), requests: AbortSignal[] = [];
+  const fetcher = async (_url: string, init?: RequestInit): Promise<Response> => {
+    const signal = init!.signal!; requests.push(signal); if (requests.length === 3) entered.resolve();
+    return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  };
+  const opened = deferred<void>(); let terminated = 0;
+  class Socket extends EventEmitter {
+    constructor() { super(); queueMicrotask(() => this.emit('open')); }
+    send() { opened.resolve(); }
+    terminate() { terminated++; }
+  }
+  const candleStarted = deferred<AbortSignal>();
+  const candles = createCandleReader({ fetcher: async (_url, init) => {
+    const signal = init!.signal!; candleStarted.resolve(signal);
+    return new Promise<Response>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  } });
+  const feeds = createVenueFeeds({ funding: createFundingClient({ fetcher, WebSocketImpl: Socket }), candles,
+    resolveLighter: async () => ({ symbol: 'BTC', marketId: 1 }) }); t.after(() => feeds.close?.());
+  const end = Date.now(), query = { quote: { ...identity, identityScope: 'comparable' }, from: end - 60_000, to: end };
+  const a = controller(), b = controller();
+  const first = feeds.call('crossex.fundingHistory', query, a.signal), second = feeds.call('crossex.fundingHistory', query, b.signal);
+  await entered.promise; a.abort(); await assert.rejects(first); assert.ok(requests.every(s => !s.aborted));
+  b.abort(); await assert.rejects(second); assert.ok(requests.every(s => s.aborted));
+  const c = controller(), history = feeds.call('crossex.candles', { quote: identity, interval: '5m' }, c.signal);
+  const candleSignal = await candleStarted.promise; c.abort(); await assert.rejects(history); assert.equal(candleSignal.aborted, true);
+  const lighter = { ...identity, exchange: 'lighter', symbol: 'BTC', quoteCurrency: 'USDC', counterCurrency: 'USDC',
+    collateralCurrency: 'USDC', settlementCurrency: 'USDC', crossexSymbol: 'LIGHTER_FUTURE_BTC_USDC', marketId: 1 };
+  const d = controller(), current = feeds.call('crossex.currentFunding', { quote: lighter }, d.signal);
+  await opened.promise; d.abort(); await assert.rejects(current); assert.equal(terminated, 1);
 });

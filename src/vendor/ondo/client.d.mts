@@ -9,8 +9,8 @@ export interface OndoRules { tick: string; step: string; trading: boolean; maker
 export interface OndoDepth { market: string; time?: unknown; bids?: unknown; asks?: unknown }
 export interface OndoClient {
   cooldownUntil(): number;
-  markets(): Promise<Map<string, OndoRules>>;
-  depth(market: string, levels?: number): Promise<OndoDepth>;
+  markets(signal?: AbortSignal): Promise<Map<string, OndoRules>>;
+  depth(market: string, levels?: number, signal?: AbortSignal): Promise<OndoDepth>;
   close(): void;
 }
 export function createOndoClient(options?: {

@@ -48,6 +48,21 @@ async function confirmFour(h: Harness, intent: unknown = fourIntent()) {
   const result = h.ex.confirmFourLeg({ previewId: preview.id, requestId, confirmLive: true }, SESSION);
   return { preview, requestId, result, ids: result.jobs.map(job => job.id) };
 }
+
+test('四腿首次发送在签名中丢失行情依据时，另一所不能把明确未发送当作已受理', () => withHarness(async h => {
+  await confirmFour(h);
+  let delayed = false;
+  for (const venue of [h.binance, h.bybit]) {
+    const place = venue.place.bind(venue);
+    venue.place = (...args) => {
+      if (!delayed) { delayed = true; h.advance(h.ex.budgets.sendQuoteMaxAgeMs + 1); }
+      return place(...args);
+    };
+  }
+  await h.ex.tickJobs();
+  assert.equal(delayed, true);
+  assert.deepEqual([h.binance.arrived.place, h.bybit.arrived.place], [0, 0]);
+}));
 const locks = (h: Harness) => (h.store.db.prepare('SELECT resource, job_id FROM locks ORDER BY resource').all() as { resource: string; job_id: string }[]);
 const jobCount = (h: Harness) => (h.store.db.prepare('SELECT COUNT(*) AS n FROM jobs').get() as { n: number }).n;
 const pos = (venue: SimulatedVenue, symbol: string, side: Side) => venue.position(SIM_ACCOUNTS[venue.venue as 'binance' | 'bybit'], symbol, side);

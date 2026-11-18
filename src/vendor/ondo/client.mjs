@@ -74,10 +74,20 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
       timer?.unref?.();
     }
   }
-  function slot(urgent, timed) {
+  function slot(urgent, timed, signal) {
+    signal?.throwIfAborted();
     // A backlog means quotes are already stale: fresh ones are refused, cancels still queue.
     if (!urgent && queue.length >= MAX_QUEUE) return Promise.reject(new OndoError('local_backlog'));
-    return new Promise((resolve, reject) => { queue.push({ urgent, timed, resolve, reject }); pump(); });
+    return new Promise((resolve, reject) => {
+      const cancel = () => {
+        const index = queue.indexOf(item);
+        if (index >= 0) queue.splice(index, 1);
+        reject(signal.reason);
+      };
+      const item = { urgent, timed, resolve: value => { signal?.removeEventListener('abort', cancel); resolve(value); },
+        reject: error => { signal?.removeEventListener('abort', cancel); reject(error); } };
+      signal?.addEventListener('abort', cancel, { once: true }); queue.push(item); pump();
+    });
   }
   function cool(response, sentAt) {
     const header = Number(response.headers?.get?.('retry-after'));
@@ -101,10 +111,11 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
     sample(latency.elapsed, timing.market, timing.metric, timing.sent, sample(latency.stamp), success);
     timing.sent = null;
   }
-  async function request(method, path, { body, auth = true, urgent = false, write = false, cancel = false, canSend, timing } = {}, resigned = false) {
+  async function request(method, path, { body, auth = true, urgent = false, write = false, cancel = false, canSend, timing, signal } = {}, resigned = false) {
     refuse(cancel);
     const queued = timing && sample(latency.stamp);
-    const granted = await slot(urgent, !!queued);
+    const granted = await slot(urgent, !!queued, signal);
+    signal?.throwIfAborted();
     if (queued) sample(latency.elapsed, timing.market, 'restQueue', queued, granted);
     refuse(cancel);
     const text = body === undefined ? '' : JSON.stringify(body);
@@ -117,14 +128,16 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
     if (canSend && canSend() !== true) throw new OndoError('send_guard');
     const sentAt = now();
     const controller = new AbortController(); controllers.add(controller);
+    const active = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     const deadline = setTimeoutImpl(() => controller.abort(), timeoutMs);
     let response, payload = null;
     try {
       if (timing) timing.sent = sample(latency.stamp);
-      response = await fetchImpl(BASE + path, { method, headers, ...(text ? { body: text } : {}), signal: controller.signal, redirect: 'error', cache: 'no-store' });
-      try { payload = await readJsonResponse(response, { maxBytes: MAX_BYTES, signal: controller.signal }); }
-      catch (error) { if (error?.code === 'aborted' || controller.signal.aborted) throw error; }
+      response = await fetchImpl(BASE + path, { method, headers, ...(text ? { body: text } : {}), signal: active, redirect: 'error', cache: 'no-store' });
+      try { payload = await readJsonResponse(response, { maxBytes: MAX_BYTES, signal: active }); }
+      catch (error) { if (error?.code === 'aborted' || active.aborted) throw error; }
     } catch {
+      signal?.throwIfAborted();
       throw new OndoError(closed ? 'closed' : controller.signal.aborted ? 'timeout' : 'network', { uncertain: write });
     } finally { clearTimeoutImpl(deadline); controllers.delete(controller); }
     const status = response.status;
@@ -164,8 +177,8 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
   return {
     cooldownUntil: () => cooldownUntil,
     /** Trading rules of every perps market: Map market -> { tick, step, trading }. */
-    async markets() {
-      const pairs = (await request('GET', '/v1/markets', { auth: false })).result?.perps?.tradingPairs;
+    async markets(signal) {
+      const pairs = (await request('GET', '/v1/markets', { auth: false, signal })).result?.perps?.tradingPairs;
       if (!Array.isArray(pairs)) throw invalid();
       const rules = new Map();
       for (const pair of pairs) {
@@ -176,9 +189,9 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
       return rules;
     },
     /** 本服务：one public depth snapshot (GET /v1/perps/depth, at most 100 levels a side), unparsed: { time, bids, asks }. */
-    async depth(name, levels = 100) {
+    async depth(name, levels = 100, signal) {
       if (!Number.isInteger(levels) || levels < 1 || levels > 100) throw new TypeError('Invalid Ondo depth');
-      const result = (await request('GET', `/v1/perps/depth?market=${encodeURIComponent(market(name))}&depth=${levels}`, { auth: false })).result;
+      const result = (await request('GET', `/v1/perps/depth?market=${encodeURIComponent(market(name))}&depth=${levels}`, { auth: false, signal })).result;
       if (!object(result) || result.market !== name) throw invalid();
       return result;
     },

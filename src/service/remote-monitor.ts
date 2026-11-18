@@ -3,7 +3,7 @@ import type { MarketClient } from '../market/ipc.ts';
 import type { MarketReaders } from '../monitor/market-readers.ts';
 import type { HynixQuoteView } from '../monitor/hynix.ts';
 import type { FeedEvent, SubscribeFeed } from '../monitor/perpetual-feed.ts';
-import { unwrapMarketRead, type MarketRead, type FundingBatch, type MetricBatch, type FundamentalRow } from '../monitor/market-contract.ts';
+import { unwrapMarketRead, type MarketRead, type MetricBatch, type FundamentalRow } from '../monitor/market-contract.ts';
 import type { Exchange, ExchangeQuote, SpreadMarket } from '../vendor/exchange-comparison.mjs';
 import type { ExchangeFundingHistory } from '../vendor/exchange-funding-history.mjs';
 import type { VariationalPublicFunding } from '../vendor/variational-market.mjs';
@@ -11,6 +11,7 @@ import { createPerpetualEstimates } from '../vendor/perpetual-estimates.mjs';
 import { perpetualPriceIdentity, type PerpetualQuote } from '../vendor/perpetual-stream.mjs';
 import type { PerpetualExecutionService } from '../vendor/perpetual-depth.mjs';
 import type { FundamentalsClient } from '../vendor/perpetual-fundamentals.mjs';
+import { collectBitgetPages } from '../vendor/perpetual-funding-pages.ts';
 import type { PerpetualFundingReader } from '../vendor/perpetual-funding-reader.mjs';
 import { perpetualMetricsCacheKeys } from '../vendor/perpetual-metrics-reader.mjs';
 import { perpetualMetricsIdentity, type PerpetualMarketMetricsServiceOptions } from '../vendor/perpetual-market-metrics-service.mjs';
@@ -45,7 +46,7 @@ export function createRemoteMonitor(client: MarketClient, clock: () => number = 
     anthropicQuote: signal => read('anthropic.quote', null, signal),
     anthropicCandles: (starts, at, signal) => read('anthropic.candles', { starts, at }, signal),
     oilQuote: signal => read('oil.quote', null, signal),
-    oilCandles: (start, at, signal) => read('oil.candles', { start, at }, signal),
+    oilCandles: (start, end, signal) => read('oil.candles', { start, end }, signal),
     oilFunding: (start, end, at, signal) => read('oil.funding', { start, end, at }, signal),
     hynixQuote: signal => read('hynix.quote', null, signal),
     hynixCandles: (start, at, signal) => read('hynix.candles', { start, at }, signal),
@@ -92,10 +93,9 @@ export function createRemoteMonitor(client: MarketClient, clock: () => number = 
     },
     metrics,
     async funding(market, range, options) {
-      const batch = await read<FundingBatch>('perpetual.funding', { ...contract(market), range }, options?.signal);
-      // A later failing Bitget page still commits the contiguous portion the worker proved.
-      if (batch.progress) options?.onProgress?.(batch.progress);
-      return unwrapMarketRead(batch.records);
+      const input = { ...contract(market), range };
+      if (market.exchange !== 'bitget') return read('perpetual.funding', input, options?.signal);
+      return collectBitgetPages(range, cursor => read('perpetual.fundingPage', { ...input, cursor }, options?.signal), options?.onProgress);
     },
     price: (market, range, options) => read('perpetual.price', { ...contract(market), range }, options?.signal),
     fundamentals: {

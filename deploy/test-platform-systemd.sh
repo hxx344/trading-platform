@@ -363,10 +363,14 @@ install_release 8
 login
 assert_page v99.1.8
 market_probe "$app/market"
+echo 'Removing the market service still succeeds after an unrelated user joins its socket group'
+useradd --system --no-user-group --gid "$market-ipc" --no-create-home --shell /usr/sbin/nologin "$extra_user"
 bash "$root/deploy/install.sh" --package "$dual" >"$fixture/out" 2>&1
 login
 assert_page v0.64.0
 assert_market_absent
+[[ $(id -gn "$extra_user") == "$market-ipc" ]]
+userdel "$extra_user"
 
 echo 'Reconciling a real old installer which changed current without updating the split deployment record'
 systemctl disable --now "$control"

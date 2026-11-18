@@ -1,6 +1,6 @@
 // 复制自 project-aggregation 工作台 modules/monitor/server/perpetual-funding-reader.mjs（提交 c84ba27），只改导入路径：CEX 分页读取
 // 指向 perpetual-funding-cex.ts，Lighter 解析取 exchange-funding-history.mjs 的同名函数（与工作台 exchange-funding-service.ts 逐字一致）。
-import { createCexFundingHistoryReader } from './perpetual-funding-cex.ts';
+import { createCexFundingHistoryReader, readBitgetFundingPage } from './perpetual-funding-cex.ts';
 import { parseLighterFundingHistory } from './exchange-funding-history.mjs';
 
 const HOUR = 3_600_000;
@@ -85,7 +85,7 @@ function retryAfter(response, now) {
  * The owning service controls market authorization, host budgets and caching. */
 export function createPerpetualFundingReader({ fetchImpl = fetch, clock = Date.now, requestSpacingMs = 0 } = {}) {
   const lastRequest = new Map();
-  return async (market, range, { signal, onProgress } = {}) => {
+  async function read(market, range, { signal, onProgress, page } = {}) {
     validateMarket(market);
     const now = milliseconds(clock());
     const from = milliseconds(range?.from), to = milliseconds(range?.to);
@@ -116,6 +116,10 @@ export function createPerpetualFundingReader({ fetchImpl = fetch, clock = Date.n
       const data = await response.json();
       requestSignal.throwIfAborted();
       return data;
+    }
+    if (page) {
+      if (market.exchange !== 'bitget') throw Error('Bitget 资金费分页合约无效');
+      return readBitgetFundingPage(request, market.symbol, market.quoteCurrency === 'USDC' ? 'USDC-FUTURES' : 'USDT-FUTURES', range, now, page.cursor);
     }
     if (CEX_EXCHANGES.has(market.exchange)) {
       // The optional exact allowlist is created only from the server's verified
@@ -185,5 +189,6 @@ export function createPerpetualFundingReader({ fetchImpl = fetch, clock = Date.n
       cursor = newest + 1;
     }
     throw Error('Hyperliquid 历史资金费分页超限，不能返回截断记录');
-  };
+  }
+  return Object.assign(read, { bitgetPage: (market, range, cursor, options = {}) => read(market, range, { ...options, page: { cursor } }) });
 }

@@ -37,17 +37,16 @@ export function remoteOndoClient(market: MarketClient, options?: Parameters<type
 /** Joins two independent lifetimes. A public outage invalidates every book while the private socket still receives fills. */
 export function remoteOndoStream(market: MarketClient, options: OndoStreamOptions, privateFactory: OndoStreamFactory = createOndoStream) {
   const { markets, onBook, onTrade, onDown, latency, now = Date.now, depth = 50 } = options;
-  const wanted = new Set(markets), previousSource = new Map<string, number>(), beforeReconnect = new Map<string, number>();
+  const wanted = new Set(markets), previousSource = new Map<string, number>(), obsoleteThrough = new Map<string, number>();
   let generation: string | null = null, lease: string | null = null, since = 0, lastAt: number | null = null, closed = false;
   let error: string | null = null, unsubscribe: (() => void) | undefined;
   let clockOffset: number | undefined;
   const account = options.credentials ? privateFactory({ ...options, privateOnly: true, markets: [], onBook() {}, onTrade: undefined }) : null;
   const ready = () => !!generation && lease !== null && market.epoch() === lease;
-  const clockFloor = () => Math.max(0, now() - 1500);
   function down() {
     if (closed || !generation && error) return;
     generation = null; lease = null; error = 'public_feed_down'; lastAt = null; clockOffset = undefined;
-    for (const [name, at] of previousSource) beforeReconnect.set(name, at);
+    for (const [name, at] of previousSource) obsoleteThrough.set(name, at);
     sample(latency?.down); onDown?.('public_feed_down');
   }
   function data(value: unknown) {
@@ -60,6 +59,27 @@ export function remoteOndoStream(market: MarketClient, options: OndoStreamOption
     }
     if (msg.type === 'down') { if (msg.generation === generation) down(); return; }
     if (!ready() || msg.generation !== generation) return;
+    const received = now();
+    if (msg.type === 'book') {
+      if (typeof msg.market !== 'string' || !wanted.has(msg.market)) return;
+      const name = msg.market, at = msg.at;
+      let book = null;
+      if (timestamp(at) && at >= since && at <= received && received - at <= 1500) {
+        try { book = unpackBook(msg.book, depth); } catch { /* A malformed snapshot revokes protection immediately. */ }
+        if (book && (!book.bids.length || !book.asks.length || book.time <= (obsoleteThrough.get(name) ?? 0)
+          || !onTrade && book.time < (previousSource.get(name) ?? 0)
+          || book.time > at + 1500 || received - book.time > 10000)) book = null;
+      }
+      if (book && timestamp(at)) {
+        previousSource.set(name, Math.max(previousSource.get(name) ?? 0, book.time));
+        lastAt = Math.max(lastAt ?? 0, at);
+        onBook(name, book, at);
+      } else {
+        obsoleteThrough.set(name, previousSource.get(name) ?? 0);
+        onBook(name, null, received);
+      }
+      return;
+    }
     if (msg.type === 'missed') {
       if (Number.isInteger(msg.count) && Number(msg.count) > 0 && Number(msg.count) <= 1024) sample(latency?.missedPings, Number(msg.count));
       return;
@@ -73,7 +93,7 @@ export function remoteOndoStream(market: MarketClient, options: OndoStreamOption
       }
       return;
     }
-    if (typeof msg.market !== 'string' || !wanted.has(msg.market) || at < clockFloor()) return;
+    if (typeof msg.market !== 'string' || !wanted.has(msg.market) || at < received - 1500) return;
     const name = msg.market;
     lastAt = Math.max(lastAt ?? 0, at);
     if (msg.type === 'bbo') {
@@ -83,12 +103,6 @@ export function remoteOndoStream(market: MarketClient, options: OndoStreamOption
         clockOffset ??= stamp.mono - msg.mono;
         sample(latency?.book, name, msg.sourceAt, { wall: at, mono: msg.mono + clockOffset });
       }
-    } else if (msg.type === 'book') {
-      let book;
-      try { book = msg.book === null ? null : unpackBook(msg.book, depth); } catch { book = null; }
-      if (book && (book.time <= (beforeReconnect.get(name) ?? 0) || book.time > at + 1500 || now() - book.time > 10000)) return;
-      if (book) previousSource.set(name, Math.max(previousSource.get(name) ?? 0, book.time));
-      onBook(name, book, at);
     } else if (msg.type === 'trade' && onTrade) {
       try {
         const t = fields(msg.trade, ['id', 'price', 'time', 'aggressorSide']);

@@ -45,7 +45,17 @@ export function createMarketServer(groups: Readonly<Record<string, MarketOperati
     try {
       const input = await readInput(req);
       if (signal.aborted) return;
-      if (!streaming) { json(res, 200, await group!.call(op, input, signal)); return; }
+      if (!streaming) {
+        // The socket lifetime is bounded even if an adapter is still unwinding an upstream request.
+        let abort!: () => void;
+        const disconnected = new Promise<never>((_, reject) => {
+          abort = () => reject(new MarketError('行情读取已中止'));
+          signal.addEventListener('abort', abort, { once: true });
+        });
+        try { json(res, 200, await Promise.race([group!.call(op, input, signal), disconnected])); }
+        finally { signal.removeEventListener('abort', abort); }
+        return;
+      }
       let sequence = 0;
       const write = (bytes: string) => {
         if (signal.aborted) return;
@@ -58,7 +68,11 @@ export function createMarketServer(groups: Readonly<Record<string, MarketOperati
       heartbeat = setInterval(() => write('\n'), HEARTBEAT_MS);
       heartbeat.unref();
       // The owner may subscribe synchronously and register its cleanup on signal, or run an asynchronous feed.
-      if (group) await group.stream(op, input, value => write(JSON.stringify([++sequence, value]) + '\n'), signal);
+      if (group) await group.stream(op, input, value => {
+        if (signal.aborted) return;
+        try { write(JSON.stringify([++sequence, value]) + '\n'); }
+        catch { res.destroy(); finish(); }
+      }, signal);
       if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }));
     } finally {
       clearInterval(heartbeat); finish(); res.off('close', finish);

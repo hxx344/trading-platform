@@ -102,7 +102,8 @@ test('更换页面版本、杀掉并重启控制面期间，两腿交易、保�
   assert.equal(login.status, 303);
   const cookie = login.headers.getSetCookie()[0]?.split(';')[0];
   assert.ok(cookie);
-  const headers = { cookie, 'x-pa-executor': '1', 'content-type': 'application/json' };
+  // Do not borrow a pooled TCP socket to the deliberately killed control process for the post-restart identity check.
+  const headers = { cookie, 'x-pa-executor': '1', 'content-type': 'application/json', connection: 'close' };
   async function api<T>(path: string, body?: unknown): Promise<T> {
     const response = await fetch(base + path, { headers, ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}), signal: AbortSignal.timeout(5_000) });
     const payload = await response.text();
@@ -110,7 +111,7 @@ test('更换页面版本、杀掉并重启控制面期间，两腿交易、保�
     return JSON.parse(payload) as T;
   }
   async function page(path: string) {
-    const response = await fetch(base + path, { headers: { cookie } });
+    const response = await fetch(base + path, { headers: { cookie, connection: 'close' } });
     assert.equal(response.status, 200);
     return response.text();
   }

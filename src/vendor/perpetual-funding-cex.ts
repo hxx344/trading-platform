@@ -1,5 +1,6 @@
 // 复制自 project-aggregation 工作台 modules/monitor/lib/exchange-funding-cex.ts（提交 c84ba27；改名表明只供合约价差的资金费历史用，
 // M-2d 的 exchange-funding-history.mjs 另有一份去掉了 Aster、Bitget USDC、合约白名单与进度回调的改写），只改导入路径。
+import { collectBitgetPages, type BitgetCursor, type BitgetFundingPage } from './perpetual-funding-pages.ts';
 import { HISTORY_WINDOW_MS, type FundingHistoryRange, type SettledFundingRecord } from './exchange-funding-history.mjs';
 
 export type CexFundingExchange = 'binance' | 'bybit' | 'okx' | 'bitget' | 'aster';
@@ -87,14 +88,31 @@ function parseFundingPage(exchange: CexFundingExchange, symbol: string, input: u
   return [...records].sort(([a], [b]) => a - b).map(([time, rate]) => ({ time, rate }));
 }
 
+/** Bitget has numbered pages, without a time cursor. The next cursor is issued only after checking strict backwards progress. */
+export async function readBitgetFundingPage(request: ReaderOptions['request'], symbol: string, productType: string, range: FundingHistoryRange, now: number, cursor: BitgetCursor | null): Promise<BitgetFundingPage> {
+  const page = cursor?.page ?? 1, size = PAGE_SIZES.bitget;
+  if (!Number.isInteger(page) || page > MAX_PAGES) throw new Error('CEX funding history pagination exceeded page limit');
+  if (cursor && (page < 2 || !Number.isSafeInteger(cursor.before) || cursor.before < 1e12)) throw new Error('Invalid Bitget funding page cursor');
+  if (!['USDT-FUTURES', 'USDC-FUTURES'].includes(productType)) throw new Error('Invalid Bitget funding product type');
+  const url = new URL('https://api.bitget.com/api/v2/mix/market/history-fund-rate');
+  url.search = new URLSearchParams({ symbol, productType, pageSize: String(size), pageNo: String(page) }).toString();
+  const body = await request(url.toString()), count = rows('bitget', body).length;
+  if (!count) return { records: [], coverage: null, next: null };
+  if (count > size) throw new Error('Invalid CEX funding history page size');
+  const records = parseFundingPage('bitget', symbol, body, now), oldest = records[0]?.time;
+  if (oldest === undefined || (cursor && oldest >= cursor.before)) throw new Error('CEX funding history pagination did not advance');
+  const coverage = oldest <= range.to ? { from: Math.max(range.from, oldest), to: range.to } : null;
+  return { records, coverage, next: count < size || oldest <= range.from ? null : { page: page + 1, before: oldest } };
+}
+
 /** Read the complete requested settlement interval; transport owns HTTP checks/timeouts. */
 export function createCexFundingHistoryReader({ request, clock = Date.now, contracts = symbols, bitgetProductType = 'USDT-FUTURES', onProgress }: ReaderOptions) {
   return async (exchange: CexFundingExchange, symbol: string, range?: FundingHistoryRange): Promise<SettledFundingRecord[]> => {
     validateContract(exchange, symbol, contracts);
-    if (exchange === 'bitget' && !['USDT-FUTURES', 'USDC-FUTURES'].includes(bitgetProductType)) throw new Error('Invalid Bitget funding product type');
     const now = timestamp(clock());
     const from = timestamp(range?.from ?? now - HISTORY_WINDOW_MS), to = timestamp(range?.to ?? now);
     if (from > to || to > now) throw new Error('Invalid CEX funding history range');
+    if (exchange === 'bitget') return collectBitgetPages({ from, to }, cursor => readBitgetFundingPage(request, symbol, bitgetProductType, { from, to }, now, cursor), onProgress);
     const pageSize = PAGE_SIZES[exchange], records = new Map<number, number>();
     const forward = exchange === 'binance' || exchange === 'aster';
     let cursor = forward ? from : exchange === 'okx' ? to + 1 : to;
@@ -109,15 +127,10 @@ export function createCexFundingHistoryReader({ request, clock = Date.now, contr
       } else if (exchange === 'bybit') {
         url = new URL('https://api.bybit.com/v5/market/funding/history');
         url.search = new URLSearchParams({ category: 'linear', symbol, limit: String(pageSize), endTime: String(cursor) }).toString();
-      } else if (exchange === 'okx') {
+      } else {
         // OKX after means strictly earlier; to + 1 includes a settlement at to.
         url = new URL('https://www.okx.com/api/v5/public/funding-rate-history');
         url.search = new URLSearchParams({ instId: symbol, limit: String(pageSize), after: String(cursor) }).toString();
-      } else {
-        // Bitget has no time cursor. Deduplication also handles page offsets
-        // shifting when a new settlement appears during this read.
-        url = new URL('https://api.bitget.com/api/v2/mix/market/history-fund-rate');
-        url.search = new URLSearchParams({ symbol, productType: bitgetProductType, pageSize: String(pageSize), pageNo: String(page) }).toString();
       }
       const response = await request(url.toString()), rawCount = rows(exchange, response).length;
       if (!rawCount) break;
@@ -125,19 +138,13 @@ export function createCexFundingHistoryReader({ request, clock = Date.now, contr
       const settlements = parseFundingPage(exchange, symbol, response, now);
       if (!settlements.length) throw new Error('CEX funding history pagination did not advance');
       const oldest = settlements[0].time, newest = settlements[settlements.length - 1].time;
-      if (exchange !== 'bitget' && newest > to) throw new Error('Invalid CEX funding history page range');
+      if (newest > to) throw new Error('Invalid CEX funding history page range');
       for (const { time, rate } of settlements) {
         if (records.has(time) && records.get(time) !== rate) throw new Error('Conflicting CEX funding settlements');
         records.set(time, rate);
       }
       if (forward ? newest < cursor : oldest >= previousOldest || (exchange === 'bybit' && oldest > cursor) || (exchange === 'okx' && oldest >= cursor)) {
         throw new Error('CEX funding history pagination did not advance');
-      }
-      // Bitget lacks a time cursor. Save only the verified contiguous portion
-      // reached by this page, so a later page failure need not lose earlier work.
-      if (exchange === 'bitget' && onProgress && oldest <= to) {
-        const coverage = { from: Math.max(from, oldest), to };
-        onProgress({ coverage, records: [...records].filter(([time]) => time >= coverage.from && time <= to).sort(([a], [b]) => a - b).map(([time, rate]) => ({ time, rate })) });
       }
       if (rawCount < pageSize || (forward ? newest >= to : oldest <= from)) break;
       if (page === MAX_PAGES) throw new Error('CEX funding history pagination exceeded page limit');

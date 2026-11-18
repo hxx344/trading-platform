@@ -119,7 +119,7 @@ const price = value => {
 };
 
 /** Each spread observation pairs the two completed trade-candle closes at the same UTC start. */
-export function pairIntradayCandles(brent, wti, now = Date.now()) {
+export function pairIntradayCandles(brent, wti, now = Date.now(), allowEmptyLegs = false) {
   const collect = rows => {
     if (!Array.isArray(rows)) throw Error('Invalid oil candle response');
     const result = new Map();
@@ -132,26 +132,32 @@ export function pairIntradayCandles(brent, wti, now = Date.now()) {
     return result;
   };
   const left = collect(brent), right = collect(wti);
-  if (!left.size || !right.size) throw Error('No completed oil candles');
+  if (!allowEmptyLegs && (!left.size || !right.size)) throw Error('No completed oil candles');
   return [...new Set([...left.keys(), ...right.keys()])].sort((a, b) => a - b).map(time => ({ time, brent: left.get(time) ?? null, wti: right.get(time) ?? null }));
 }
 
 /** @param {'live' | 'snapshot'} status */
 export function createIntradaySnapshot(rows, fetchedAt, status = 'live') {
+  if (!['live', 'snapshot'].includes(status) || !rows?.length) throw Error('Invalid oil intraday snapshot');
+  const data = validateOilCandleRows(rows, fetchedAt);
+
+  const paired = data.filter(row => row.brent !== null && row.wti !== null);
+  if (!paired.length) throw Error('No paired 15-minute candles');
+  const first = paired[0].time, last = paired.at(-1).time, expected = (last - first) / OIL_CANDLE_MS + 1;
+  return { status, metadata: { source: SOURCE, api: API_URL, currency: 'USDT', symbols: [ASSETS.brent.coin, ASSETS.wti.coin], interval: OIL_CANDLE_INTERVAL, timezone: 'UTC', priceBasis: 'Paired completed 15-minute trade candle closes', fetchedAt, firstCommonObservation: new Date(first).toISOString(), lastCommonObservation: new Date(last).toISOString(), pairedObservationRows: paired.length, expectedObservationRows: expected, missingObservationRows: expected - paired.length }, data };
+}
+
+export function validateOilCandleRows(rows, fetchedAt) {
   const received = Date.parse(fetchedAt);
-  if (!Number.isFinite(received) || !['live', 'snapshot'].includes(status) || !Array.isArray(rows) || !rows.length) throw Error('Invalid oil intraday snapshot');
+  if (!Number.isFinite(received) || !Array.isArray(rows)) throw Error('Invalid oil intraday snapshot');
   let previous = -1;
-  const data = rows.map(row => {
+  return rows.map(row => {
     if (!Number.isSafeInteger(row.time) || row.time < HISTORY_START || row.time % OIL_CANDLE_MS || row.time + OIL_CANDLE_MS > received || row.time <= previous) throw Error('Invalid oil candle timestamp');
     previous = row.time;
     const brent = row.brent === null ? null : price(row.brent), wti = row.wti === null ? null : price(row.wti);
     if (brent === null && wti === null) throw Error('Empty oil candle');
     return { time: row.time, brent, wti };
   });
-  const paired = data.filter(row => row.brent !== null && row.wti !== null);
-  if (!paired.length) throw Error('No paired 15-minute candles');
-  const first = paired[0].time, last = paired.at(-1).time, expected = (last - first) / OIL_CANDLE_MS + 1;
-  return { status, metadata: { source: SOURCE, api: API_URL, currency: 'USDT', symbols: [ASSETS.brent.coin, ASSETS.wti.coin], interval: OIL_CANDLE_INTERVAL, timezone: 'UTC', priceBasis: 'Paired completed 15-minute trade candle closes', fetchedAt, firstCommonObservation: new Date(first).toISOString(), lastCommonObservation: new Date(last).toISOString(), pairedObservationRows: paired.length, expectedObservationRows: expected, missingObservationRows: expected - paired.length }, data };
 }
 
 export function validateIntradaySnapshot(input) {
@@ -204,19 +210,23 @@ export function oilCandleStart(rows) {
   return Math.max(0, earliestAvailable, rows.length ? Math.min(rows.at(-1).time - 96 * OIL_CANDLE_MS, missing) : earliestAvailable);
 }
 
-export async function fetchOilCandleBatch(startTime, options = {}) {
+export async function fetchOilCandleBatch(startTime, options = {}, allowEmptyLegs = false) {
   const now = options.now ?? Date.now();
   const [brent, wti] = await Promise.all(Object.values(ASSETS).map(asset => fetchCandles(asset.coin, OIL_CANDLE_INTERVAL, startTime, now, options)));
-  return pairIntradayCandles(brent, wti, now);
+  return pairIntradayCandles(brent, wti, now, allowEmptyLegs);
 }
 
 export function mergeOilCandleBatch(previous, rows, now) {
-  const merged = new Map((previous?.data ?? []).map(row => [row.time, row]));
+  return createIntradaySnapshot(mergeOilCandleRows(previous?.data ?? [], rows), new Date(now).toISOString());
+}
+
+export function mergeOilCandleRows(previous, rows) {
+  const merged = new Map(previous.map(row => [row.time, row]));
   for (const row of rows) {
     const old = merged.get(row.time);
     merged.set(row.time, { time: row.time, brent: row.brent ?? old?.brent ?? null, wti: row.wti ?? old?.wti ?? null });
   }
-  return createIntradaySnapshot([...merged.values()].sort((a, b) => a.time - b.time), new Date(now).toISOString());
+  return [...merged.values()].sort((a, b) => a.time - b.time);
 }
 
 /** `spread` is Brent − WTI in USDT per barrel; rows missing either leg are not charted. */

@@ -4,14 +4,14 @@
 // own timeout and is never retried within a round; a failed round keeps what was there and says why. The last quote and the
 // candles are kept in monitor.sqlite and read back at start, marked as a snapshot until a round succeeds.
 import {
-  OIL_CANDLE_MS, OIL_CANDLE_REFRESH_MS, createIntradaySnapshot, oilCandleStart, mergeOilCandleBatch, intradayWindow, validateMarket,
-  type OilCoverage, type OilFetcher, type OilIntraday, type OilIntradayWindow, type OilMarket,
+  OIL_CANDLE_MS, OIL_CANDLE_REFRESH_MS, createIntradaySnapshot, oilCandleStart, mergeOilCandleRows, validateOilCandleRows, intradayWindow, validateMarket,
+  type OilCandleRow, type OilCoverage, type OilFetcher, type OilIntraday, type OilIntradayWindow, type OilMarket,
 } from '../vendor/oil-market.mjs';
 import type { BinanceGate } from '../vendor/anthropic-market.mjs';
 import { OIL_FIRST_SETTLEMENT, OIL_FUNDING_MS, validateOilFundingRows, type OilFundingRow } from '../vendor/settled-funding.mjs';
 import { FUNDING_REFRESH_MS, createFundingHistory, type FundingView } from './funding.ts';
 import { CANDLE_STALE_MS, QUOTE_STALE_MS, type LoopContext } from './anthropic.ts';
-import { BinanceCooldown } from './market-contract.ts';
+import { BinanceCooldown, OIL_CANDLE_WINDOW_MS } from './market-contract.ts';
 import { createMarketReaders, type MarketReaders } from './market-readers.ts';
 export { parseOilQuote } from './market-readers.ts';
 import type { MonitorStore } from './store.ts';
@@ -63,7 +63,10 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
   // The stored rows could not be read back: the next successful round rewrites the table instead of adding to it.
   let replaceCandles = false;
   // Until this time, rounds read on from the last day only; the first round after a start reads every gap.
-  let gapRetryAt = 0;
+  let gapRetryAt = 0, resumeAt: number | null = null;
+  // Pre-listing windows may be empty or contain just one leg. Keep these rows until a paired chart can be projected.
+  let candleRows: OilCandleRow[] = [];
+  const chart = (rows: OilCandleRow[], stamp: string) => rows.some(row => row.brent !== null && row.wti !== null) ? createIntradaySnapshot(rows, stamp) : null;
   const windows = new Map<number | null, { source: OilIntraday; stale: boolean; value: OilIntraday | OilIntradayWindow }>();
 
   try {
@@ -71,12 +74,14 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
     if (saved) { quote = validateMarket(saved.value); quoteRestored = true; }
   } catch (error) { log(`原油上次报价无法读回，等待新报价：${detail(error)}`); }
   try {
-    const rows = store.oilCandles();
-    if (rows.length) {
-      const saved = store.readState(OIL_CANDLE_KEY);
+    const rows = store.oilCandles(), saved = store.readState(OIL_CANDLE_KEY);
+    if (rows.length || saved) {
       if (!saved) throw new Error('K 线轮次记录缺失');
-      candles = createIntradaySnapshot(rows, (saved.value as { fetchedAt?: unknown }).fetchedAt as string, 'snapshot');
-      candlesRestored = true;
+      const state = saved.value as { fetchedAt: string; resumeAt?: number | null };
+      const checked = validateOilCandleRows(rows, state.fetchedAt);
+      const cursor = state.resumeAt;
+      if (cursor != null && (!Number.isSafeInteger(cursor) || cursor % OIL_CANDLE_MS !== 0 || cursor < 0 || cursor > Date.parse(state.fetchedAt))) throw new Error('K 线回补进度无效');
+      candles = chart(checked, state.fetchedAt); candleRows = checked; resumeAt = cursor ?? null; candlesRestored = true;
     }
   } catch (error) { replaceCandles = true; log(`原油 K 线历史无法读回，将从 2026-04-01 重新回补：${detail(error)}`); }
 
@@ -118,46 +123,50 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
     const at = now();
     candleAttemptAt = at;
     const cutoff = at - OIL_RETENTION_DAYS * DAY_MS;
-    let next: OilIntraday;
     const full = !candles || at >= gapRetryAt;
-    try {
-      // Outside the hourly gap repair, only look for older gaps in the last day. Merge new legs over durable values.
-      let resumeRows = candles?.data ?? [];
-      if (!full && resumeRows.length) {
-        const from = resumeRows.at(-1)!.time - RESUME_MS;
-        const start = resumeRows.findIndex(row => row.time >= from && row.brent !== null && row.wti !== null);
-        if (start > 0) resumeRows = resumeRows.slice(start);
+    let history = candleRows;
+    if (!full && history.length) {
+      const from = history.at(-1)!.time - RESUME_MS;
+      const firstPair = history.findIndex(row => row.time >= from && row.brent !== null && row.wti !== null);
+      if (firstPair > 0) history = history.slice(firstPair);
+    }
+    const target = Math.floor(at / OIL_CANDLE_MS) * OIL_CANDLE_MS, stamp = new Date(at).toISOString();
+    let start = Math.max(resumeAt ?? oilCandleStart(history), Math.ceil(cutoff / OIL_CANDLE_MS) * OIL_CANDLE_MS);
+    while (start < target && !stopping.signal.aborted) {
+      const end = Math.min(start + OIL_CANDLE_WINDOW_MS, target);
+      let next: OilCandleRow[], projection: OilIntraday | null, changed: OilCandleRow[];
+      try {
+        const batch = await readers.oilCandles(start, end, stopping.signal);
+        if (stopping.signal.aborted) return;
+        const incoming = validateOilCandleRows(batch, new Date(end).toISOString());
+        if (incoming.some(row => row.time < start)) throw new Error('原油 K 线超出本轮范围');
+        next = mergeOilCandleRows(candleRows, incoming).filter(row => row.time >= cutoff);
+        projection = chart(next, stamp);
+        const previous = new Map(candleRows.map(row => [row.time, row]));
+        changed = replaceCandles ? next : next.filter(row => {
+          const old = previous.get(row.time);
+          return !old || old.brent !== row.brent || old.wti !== row.wti;
+        });
+      } catch (error) {
+        if (stopping.signal.aborted) return;
+        const reason = oilError(error);
+        candleError = `K 线读取失败：${reason}`;
+        candleReport.failed(reason, detail(error));
+        return;
       }
-      const batch = await readers.oilCandles(oilCandleStart(resumeRows), at, stopping.signal);
-      next = mergeOilCandleBatch(candles, batch, at);
-      // The kept history ends at the retention cut in memory as in the file.
-      if (next.data[0]!.time < cutoff) next = createIntradaySnapshot(next.data.filter(row => row.time >= cutoff), next.metadata.fetchedAt);
-    } catch (error) {
-      if (stopping.signal.aborted) return;
-      const reason = oilError(error);
-      candleError = `K 线读取失败：${reason}`;
-      candleReport.failed(reason, detail(error));
-      return;
+      // Commit the segment and its resume cursor together, including a verified empty segment. A failed write retries this exact segment.
+      const cursor = end < target ? end : null;
+      try { store.writeOilCandles({ rows: changed, cutoff, replace: replaceCandles, state: { key: OIL_CANDLE_KEY, value: { fetchedAt: stamp, resumeAt: cursor } } }); }
+      catch (error) {
+        candleError = 'K 线保存失败：monitor.sqlite 写入失败';
+        candleSave.failed('monitor.sqlite 写入失败', detail(error)); return;
+      }
+      resumeAt = cursor; candleRows = next; candles = projection; candlesRestored = cursor !== null;
+      replaceCandles = false; start = end; candleError = null;
     }
     if (stopping.signal.aborted) return;
-    candleReport.recovered();
-    const previous = new Map((candles?.data ?? []).map(row => [row.time, row]));
-    const changed = replaceCandles ? next.data : next.data.filter(row => {
-      const old = previous.get(row.time);
-      return !old || old.brent !== row.brent || old.wti !== row.wti;
-    });
-    try {
-      store.writeOilCandles({ rows: changed, cutoff, replace: replaceCandles, state: { key: OIL_CANDLE_KEY, value: { fetchedAt: next.metadata.fetchedAt } } });
-    } catch (error) {
-      // Memory stays with what is stored, so the next round reads on from there and writes the same rows again.
-      candleError = 'K 线保存失败：monitor.sqlite 写入失败';
-      candleSave.failed('monitor.sqlite 写入失败', detail(error));
-      return;
-    }
-    // The gaps count as re-read only once the round is stored; a failed write re-reads them next round.
     if (full) gapRetryAt = at + OIL_GAP_RETRY_MS;
-    candleSave.recovered();
-    candles = next; candlesRestored = false; candleError = null; replaceCandles = false;
+    candleSave.recovered(); candleReport.recovered();
   }
 
   return {

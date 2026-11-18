@@ -464,6 +464,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
 
   // --- orders --------------------------------------------------------------
   async function placeOrder(current, market, side, role, price, size, mode, replacements) {
+    const bookEpoch = market.bookEpoch;
     const clientId = `${current.prefix}${(current.seq++).toString(36)}`;
     const order = { clientId, id: null, side, role, price, size, remaining: size, state: 'sending', since: now(), attempts: 0, nextCheckAt: 0, nextCancelAt: 0, mode, positionBefore: market.position };
     market.orders.set(clientId, order); current.lastWriteAt = now();
@@ -473,7 +474,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
       if (recent.size > 32) recent.delete(recent.keys().next().value);
     }
     const canSend = () => {
-      if (session !== current || market.orders.get(clientId) !== order || order.protectionLost || holdOf(current, market) || market.dirty) return false;
+      if (session !== current || market.orders.get(clientId) !== order || market.bookEpoch !== bookEpoch || order.protectionLost || holdOf(current, market) || market.dirty) return false;
       updateExit(current, market);
       const next = decide(current, market, side, order);
       return next.type === 'place' && next.role === role && next.price === price && next.size === size && next.mode === mode;
@@ -897,7 +898,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     const current = { live, config: { ...structuredClone(config), markets: [...markets] }, prefix: `${PREFIX}${tag}-`, seq: 0, startedAt: now(), stopping: false, halt: null, incident: null, notices: new Set(),
       cfg: { target: units(config.targetBps), min: units(config.minBps), max: units(config.maxBps), wallEnabled: config.wallEnabled, wallMin: units(config.wallUsd),
         orderUsd: units(config.orderUsd), maxPosition: units(config.maxPositionUsd), maxTotal: units(config.maxTotalUsd) },
-      markets: new Map(markets.map(name => [name, { name, rules: null, listed: false, book: null, bookAt: 0, mid: null, orders: new Map(), bookDebits: [], foreign: [], position: 0n, positionKnown: !live,
+      markets: new Map(markets.map(name => [name, { name, rules: null, listed: false, book: null, bookAt: 0, bookEpoch: 0, mid: null, orders: new Map(), bookDebits: [], foreign: [], position: 0n, positionKnown: !live,
         dirty: live, dirtySeq: 0, pending: { buy: null, sell: null }, backoff: { buy: 0, sell: 0 }, rejects: { buy: 0, sell: 0 },
         view: { buy: { role: 'quote', state: 'none', reason: 'starting' }, sell: { role: 'quote', state: 'none', reason: 'starting' } }, hold: 'starting', busy: false, error: null, lastCancel: null }])),
       accountPositions: [], accountStale: false, orderEpoch: 0, emptyEpoch: null, awaiting: new Map(), evidenceSeq: 0, savedEvidence: null, syncing: false, syncAttemptAt: 0, syncOkAt: now(), syncError: null, remoteOurs: null, verifiedAt: 0, lastWriteAt: now(),
@@ -921,14 +922,15 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
         current.observation?.book(name, book, at);
         const gap = market.bookAt > 0 && at - market.bookAt > BOOK_MAX_AGE_MS;
         const duplicate = book && market.book?.time === book.time;
-        market.book = book && (book.time > at + BOOK_MAX_AGE_MS || book.time < market.sourceAt) ? null : book;
+        const valid = book?.bids.length && book.asks.length && book.time <= at + BOOK_MAX_AGE_MS && at - book.time <= SOURCE_MAX_AGE_MS
+          && !(book.time < market.sourceAt);
+        market.book = valid ? book : null;
         if (market.book) {
           market.sourceAt = market.book.time;
           if (market.bookDebits.length) market.bookDebits = market.bookDebits.filter(debit => market.sourceAt <= debit.through);
-        }
-        if (!duplicate) market.bookAt = at;
-        const valid = market.book?.bids.length && market.book.asks.length && at - market.book.time <= SOURCE_MAX_AGE_MS;
-        if (valid) market.mid = (book.bids[0][0] + book.asks[0][0]) / 2n;
+          if (!duplicate) market.bookAt = at;
+          market.mid = (book.bids[0][0] + book.asks[0][0]) / 2n;
+        } else { market.bookAt = 0; market.mid = null; market.bookEpoch++; }
         if (current.live) protectRestingQuotes(current, market, valid && !gap ? book : null);
         if (current.live && market.exit) updateExit(current, market);
       },
@@ -936,8 +938,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
         if (!activeFeed(names)) return;
         current.observation?.down(now());
         for (const market of current.markets.values()) {
-          market.book = null;
-          market.mid = null;
+          market.book = null; market.bookAt = 0; market.mid = null; market.bookEpoch++;
           if (current.live) protectRestingQuotes(current, market, null);
         }
         if (current.live) {

@@ -3,6 +3,7 @@ import { AppError, validIdentity, validManualIdentity } from './model.mjs';
 import { publicSnapshot } from './public-snapshot.mjs';
 import { D } from './money.mjs';
 import { positive, failure, HYPERLIQUID_INFO, sourceTime } from './public-values.mjs';
+import { readSignal } from './shared-read.mjs';
 
 function levels(rows, unit = 1) {
   if (!Array.isArray(rows) || !rows.length || rows.length > 20_000) throw failure('深度快照缺失或过大');
@@ -18,10 +19,12 @@ function levels(rows, unit = 1) {
   });
 }
 
-export function createDepthReader({ contract, get, info, clock, WebSocketImpl, timeoutMs, signal }) {
-  return async function depth(quote, manual) {
+export function createDepthReader({ contract, get: read, info: postInfo, clock, WebSocketImpl, timeoutMs, signal: lifetime }) {
+  return async function depth(quote, manual, request) {
+    const signal = readSignal(lifetime, request);
+    const get = (url, headers) => read(url, headers, signal), info = (type, coin) => postInfo(type, coin, signal);
     if (!(manual ? validManualIdentity(quote) : validIdentity(quote))) throw new AppError('不支持的深度合约');
-    const { exchange, symbol } = quote, encoded = encodeURIComponent(symbol), { row, unit, assetClass } = await contract(quote, manual);
+    const { exchange, symbol } = quote, encoded = encodeURIComponent(symbol), { row, unit, assetClass } = await contract(quote, manual, false, signal);
     if (manual && (quote.nativeUnit !== D(unit).toString() || quote.assetClass !== assetClass)) throw failure('合约原生身份或数量单位已变化，请重新预览');
     let data, bids, asks, at, source, transport = 'rest';
     if (exchange === 'binance') {

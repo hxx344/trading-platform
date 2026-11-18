@@ -293,9 +293,7 @@ if [[ -e "$release_dir/src/control" || -e "$release_dir/deploy/$CONTROL.service"
      "$(read_value "$release_dir/.executor-sha256")" =~ ^[0-9a-f]{64}$ && "$(read_value "$release_dir/.control-sha256")" =~ ^[0-9a-f]{64}$ ]] ||
     fail '控制面与执行面程序包不完整，未切换版本。'
 fi
-market_split=0
 if [[ -e "$release_dir/src/market" || -e "$release_dir/deploy/$MARKET.service" || -e "$release_dir/.market-sha256" ]]; then
-  market_split=1
   [[ "$split" == 1 && -f "$release_dir/src/market/main.ts" && -f "$release_dir/src/market/probe.ts" &&
      -f "$release_dir/deploy/$MARKET.service" && "$(read_value "$release_dir/.market-sha256")" =~ ^[0-9a-f]{64}$ ]] ||
     fail '公开行情组件程序包不完整，未切换版本。'
@@ -400,33 +398,40 @@ if ((split)) || [[ -f "$APP_DIR/control/.control-sha256" ]]; then
     as_root_dir "$UPDATE_DIR" 770 root "$CONTROL_USER"
   fi
 fi
-if [[ "$TEST_MODE" != 1 ]] && { ((market_split)) || [[ -f "$APP_DIR/market/.market-sha256" ]]; }; then
-  getent group "$MARKET_IPC_GROUP" >/dev/null || groupadd --system "$MARKET_IPC_GROUP"
+ensure_market_account() {
+  local target=$1 market_uid market_gid market_groups market_ipc_gid members member gid
+  local -a ipc_members
+  # Validate the release about to take ownership, including an automatic rollback. Removing the market unit
+  # must remain possible even if another local account has since joined its socket group.
+  [[ "$TEST_MODE" != 1 && -f "$target/.market-sha256" ]] || return 0
+  getent group "$MARKET_IPC_GROUP" >/dev/null || groupadd --system "$MARKET_IPC_GROUP" || return 1
   if ! getent passwd "$MARKET_USER" >/dev/null; then
-    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$MARKET_USER"
+    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$MARKET_USER" || return 1
     changes+=("系统账号 $MARKET_USER")
   fi
-  market_uid=$(id -u "$MARKET_USER")
-  market_gid=$(id -g "$MARKET_USER")
+  market_uid=$(id -u "$MARKET_USER") || return 1
+  market_gid=$(id -g "$MARKET_USER") || return 1
   IFS=: read -r _ _ market_ipc_gid members <<<"$(getent group "$MARKET_IPC_GROUP")"
-  [[ "$market_uid" != 0 && "$market_uid" != "$(id -u "$SERVICE_USER")" && "$market_uid" != "$CONTROL_UID" &&
+  [[ "$market_ipc_gid" =~ ^[0-9]+$ && "$market_uid" != 0 && "$market_uid" != "$(id -u "$SERVICE_USER")" && "$market_uid" != "$CONTROL_UID" &&
      "$market_gid" == "$(getent group "$MARKET_USER" | cut -d: -f3)" && "$market_gid" != "$market_ipc_gid" &&
-     " $(id -G "$CONTROL_USER") " != *" $market_ipc_gid "* ]] || fail '行情服务须使用独立的账户和通信组。'
+     " $(id -G "$CONTROL_USER") " != *" $market_ipc_gid "* ]] || { log '行情服务须使用独立的账户和通信组。'; return 1; }
   for gid in 0 "$(id -g "$SERVICE_USER")" "$CONTROL_GID" "$(getent group "$IPC_GROUP" | cut -d: -f3)"; do
-    [[ "$market_gid" != "$gid" && "$market_ipc_gid" != "$gid" ]] || fail '行情服务不能共用交易、控制或特权组。'
+    [[ "$market_gid" != "$gid" && "$market_ipc_gid" != "$gid" ]] || { log '行情服务不能共用交易、控制或特权组。'; return 1; }
   done
   # A pre-existing group can also grant socket access through an unrelated account's primary GID.
   IFS=, read -r -a ipc_members <<<"$members"
   for member in "${ipc_members[@]}"; do
-    [[ "$member" == "$MARKET_USER" || "$member" == "$SERVICE_USER" ]] || fail '行情通信组已授予其他账户，请恢复专用组后再安装。'
+    [[ "$member" == "$MARKET_USER" || "$member" == "$SERVICE_USER" ]] || { log '行情通信组已授予其他账户，请恢复专用组后再安装。'; return 1; }
   done
   getent passwd | awk -F: -v gid="$market_ipc_gid" -v market="$MARKET_USER" -v executor="$SERVICE_USER" \
-    '$4 == gid && $1 != market && $1 != executor { bad=1 } END { exit bad }' || fail '行情通信组已用作其他账户的主组，请恢复专用组后再安装。'
+    '$4 == gid && $1 != market && $1 != executor { bad=1 } END { exit bad }' || { log '行情通信组已用作其他账户的主组，请恢复专用组后再安装。'; return 1; }
   # systemd adds a user's login groups to its service groups. An existing account must not bring unrelated access.
-  for gid in $(id -G "$MARKET_USER"); do
-    [[ "$gid" == "$market_gid" || "$gid" == "$market_ipc_gid" ]] || fail '行情账户已加入其他组，请恢复专用账户后再安装。'
+  market_groups=$(id -G "$MARKET_USER") || return 1
+  for gid in $market_groups; do
+    [[ "$gid" == "$market_gid" || "$gid" == "$market_ipc_gid" ]] || { log '行情账户已加入其他组，请恢复专用账户后再安装。'; return 1; }
   done
-fi
+}
+ensure_market_account "$release_dir" || fail '目标版本的行情账户未通过核验，已保留当前服务。'
 for name in config secrets; do
   example="$release_dir/deploy/$name.example.json"
   if ! cmp -s "$example" "$CONF_DIR/$name.example.json"; then install -m 644 "$example" "$CONF_DIR/$name.example.json"; fi
@@ -997,6 +1002,7 @@ else
     fi
     fallback="$work_dir/fallback"
     mkdir -m 700 "$fallback" || fail '无法准备回退记录。'
+    ensure_market_account "$previous_dir" || fail "新版本 $new_version 启动失败，上一版本 $previous_version 的行情账户未通过核验，无法重新启用。"
     if prepare_record "$previous_dir" "$STATE" "$fallback" && activate "$fallback" "$candidate"; then
       save_record "$fallback" || fail '已切回上一版，但无法保存部署状态。'
       if [[ "$TEST_MODE" != 1 ]]; then ensure_import_path "$previous_dir"; fi

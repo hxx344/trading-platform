@@ -588,7 +588,12 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   async function peerFirstLeadEvidence(job: PairJob): Promise<Quote[] | string> {
     if (!job.group) return [];
     const peer = readJob(job.group.peer);
-    if (!isPair(peer) || FINAL_JOB.has(peer.status) || peer.peerHalt || peer.holdNewSends || stopRequested(peer.id) || legOps(peer.id, 0).length) return [];
+    if (!isPair(peer) || FINAL_JOB.has(peer.status) || peer.peerHalt || peer.holdNewSends || stopRequested(peer.id)) return [];
+    const leads = legOps(peer.id, 0);
+    if (leads.length) {
+      const accepted = leads.some(op => cmp(op.filledQuantity, '0') > 0 || (op.state === 'open' && (!isStrategy(op) || op.identityVerifiedAt != null)));
+      return accepted ? [] : `${VENUE_NAMES[peer.legs[0].venue]} 首腿尚无已受理的有效委托或成交`;
+    }
     try { return await guardLead(peer); }
     catch (error) {
       if (error instanceof WriterLostError) throw error;
@@ -1297,7 +1302,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   /**
    * Final send guard of a lead order: both books fresh, both accounts where this job left them (the preview baseline before
    * the first order). A local chase lead posts on its own side, so only the hedge's taker price is held to its bound here;
-   * its post price is checked by chaseTarget. Returns the lead's book.
+   * its post price is checked by chaseTarget. Both books remain evidence until transmission.
    */
   async function guardLead(job: PairJob): Promise<Quote[]> {
     if (now() >= job.deadlineAt) reject('deadline', '任务已超过最长执行时间，未发送', 409);
@@ -1325,13 +1330,18 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
   /**
    * Final send guard of a rebalance order: its book fresh and inside the preview bound, its account where the preview left it,
-   * and the other leg, which the quantity was worked out against, still exactly as the preview read it. Returns the book.
+   * and the other leg, which the quantity was worked out against, still supporting the confirmed direction and size.
    */
   async function guardRebalance(job: RebalanceJob): Promise<Quote[]> {
     if (now() >= job.deadlineAt) reject('deadline', '任务已超过最长执行时间，未发送', 409);
     const leg = job.legs[0], counter = job.rebalance.counter, binding = bindingStillValid(leg);
-    const [quote, snapshot, counterSnapshot] = await Promise.all([readQuote(leg.venue, leg.symbol), readAccount(binding, leg.symbol), readAccount(binding, counter.symbol)]);
-    checkBook(quote, now(), budgets.sendQuoteMaxAgeMs);
+    const [quote, otherQuote, counterRules, snapshot, counterSnapshot] = await Promise.all([
+      readQuote(leg.venue, leg.symbol), readQuote(leg.venue, counter.symbol), readInstrument(leg.venue, counter.symbol),
+      readAccount(binding, leg.symbol), readAccount(binding, counter.symbol),
+    ]);
+    const books = [quote, otherQuote], at = now();
+    for (const book of books) checkBook(book, at, budgets.sendQuoteMaxAgeMs);
+    if (!sameQuoteWindow(books, budgets.pairQuoteWindowMs)) reject('quote_window', '调平两腿盘口不在同一时间窗，请重新预览', 409);
     const price = leg.orderSide === 'buy' ? quote.ask : quote.bid, bound = leg.priceBound ?? null;
     if (bound !== null && (leg.orderSide === 'buy' ? cmp(price, bound) > 0 : cmp(price, bound) < 0)) reject('price_moved', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 盘口 ${price} 已越过价格保护界限 ${bound}，未发送`, 409);
     const own = opsOf(job.id).map(item => item.clientOrderId);
@@ -1341,8 +1351,16 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (cmp(positionOf(counterSnapshot, counter.symbol, counter.side), counter.quantity) !== 0 || !isZero(positionOf(counterSnapshot, counter.symbol, counter.side === 'long' ? 'short' : 'long'))
       || counterSnapshot.positionModes[counter.symbol] !== counter.positionMode) reject('position_changed', `${name}（另一腿）持仓已变化，调平委托未发送；请重新预览`, 409);
     if (counterSnapshot.openOrders.some(order => order.symbol === counter.symbol)) reject('external_orders', `${name} 存在本任务之外的活动委托`, 409);
+    const held = (symbol: string, account: AccountSnapshot, book: Quote, rules: Instrument): HeldContract => ({
+      symbol, long: positionOf(account, symbol, 'long'), short: positionOf(account, symbol, 'short'), price: midOf(book.bid, book.ask), contractSize: rules.contractSize,
+    });
+    const balance = pairBalance(held(leg.symbol, snapshot, quote, leg.instrument), held(counter.symbol, counterSnapshot, otherQuote, counterRules));
+    const order = balance.status === 'paired' ? rebalanceOrder(balance, job.rebalance.method, { [leg.symbol]: leg.instrument, [counter.symbol]: counterRules }) : null;
+    if (!order || 'error' in order || order.symbol !== leg.symbol || order.side !== leg.side || cmp(order.quantity, leg.quantity) < 0) {
+      reject('rebalance_changed', '当前两腿盘口已不支持原先确认的调平方向或数量，请重新预览', 409);
+    }
     admit(leg);
-    return [quote];
+    return books;
   }
   /** What this job has yet to fill on a leg; a close needs at least that much position left. */
   function unfilledOf(job: Job, index: 0 | 1): string {
@@ -1436,6 +1454,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       if (registered) control?.assertSend(registered, budgets.callTimeoutMs);
       if (books) {
         const at = now();
+        const current = readJob(job.id);
+        if (at >= job.deadlineAt || stopRequested(job.id) || current.holdNewSends || current.peerHalt || FINAL_JOB.has(current.status)) {
+          throw new VenueError('not-sent', '任务已停止、到期或不再允许发出新委托');
+        }
         try { for (const book of books) checkBook(book, at, budgets.sendQuoteMaxAgeMs); }
         catch (error) { throw new VenueError('not-sent', error instanceof Error ? error.message : '盘口已失效'); }
       }

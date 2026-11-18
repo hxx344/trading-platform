@@ -411,3 +411,16 @@ test('双向持仓模式账户上的减仓调平：预览记下双向模式，�
   assert.equal(h.binance.calls.place, 1);
   assert.equal(h.binance.position(BN, 'SKHYUSDT', 'short'), '2.43');
 }));
+test('手动调平在另一合约行情已过期或新价格使原方向越过平衡点时不下单', async () => {
+  for (const book of [{ ageMs: 60_000 }, { bid: '999', ask: '1000' }]) {
+    await withHarness(async h => {
+      holdUneven(h);
+      const preview = await h.ex.preview(rebalance('reduce'), SESSION);
+      const { job } = h.ex.confirm({ previewId: preview.id, requestId: randomUUID(), confirmLive: true }, SESSION);
+      h.binance.setBook('SKHYNIXUSDT', book);
+      await h.ex.tickJobs();
+      assert.equal(h.binance.arrived.place, 0);
+      assert.match(h.ex.jobView(job.id).reason ?? '', /过期|调平方向或数量/);
+    });
+  }
+});

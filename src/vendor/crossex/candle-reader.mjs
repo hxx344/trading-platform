@@ -4,11 +4,13 @@ import { getJson } from './clients.mjs';
 import { AppError } from './model.mjs';
 import { D, Decimal } from './money.mjs';
 import { numeric, normalizeCandles, failure, INTERVALS } from './terminal-data.mjs';
+import { readSignal } from './shared-read.mjs';
 
 const BARS = { '1m': '1', '5m': '5', '15m': '15', '30m': '30', '1h': '60', '4h': '240', '1d': 'D' };
 export function createCandleReader({ fetcher = fetch, clock = Date.now } = {}) {
-  const get = url => getJson(url, { fetcher, maxBytes: 4000000 });
-  return async function candles(q, interval) {
+  return async function candles(q, interval, signal) {
+    signal?.throwIfAborted();
+    const get = url => getJson(url, { fetcher, maxBytes: 4000000, signal });
     if (!Object.hasOwn(INTERVALS, interval)) throw new AppError('不支持的 K 线周期');
     const encoded = encodeURIComponent(q.symbol), end = clock(), start = end - INTERVALS[interval] * 240;
     let data, rows;
@@ -34,7 +36,7 @@ export function createCandleReader({ fetcher = fetch, clock = Date.now } = {}) {
       rows = data.candles?.map(r => ({ time: r.time, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume }));
     } else if (q.exchange === 'hyperliquid') {
       // Public read-only POST. No account, authentication or order payload exists here.
-      const response = await fetcher('https://api.hyperliquid.xyz/info', { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(8000), headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'candleSnapshot', req: { coin: q.symbol, interval, startTime: start, endTime: end } }) });
+      const response = await fetcher('https://api.hyperliquid.xyz/info', { method: 'POST', redirect: 'error', signal: readSignal(signal, AbortSignal.timeout(8000)), headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'candleSnapshot', req: { coin: q.symbol, interval, startTime: start, endTime: end } }) });
       if (!response.ok) { await response.body?.cancel(); throw failure(); }
       const chunks = []; let length = 0;
       for await (const chunk of response.body || []) { length += chunk.length; if (length > 4000000) throw failure(); chunks.push(chunk); }

@@ -83,7 +83,7 @@ export function createMarketReaders({ fetchImpl = fetch, now = Date.now, gate = 
     anthropicQuote: (signal: AbortSignal) => fetchAnthropicQuote({ fetcher: fetcher(signal), now: now(), gate, rh, clock: now }),
     anthropicCandles: (starts: AnthropicCandleStarts, at: number, signal: AbortSignal) => fetchAnthropicCandleBatch(starts, { fetcher: fetcher(signal), now: at, gate, rh, clock: now }),
     oilQuote,
-    oilCandles: (start: number, at: number, signal: AbortSignal) => fetchOilCandleBatch(start, { fetcher: oilFetcher(signal), now: at, timeout: 15_000 }),
+    oilCandles: (start: number, end: number, signal: AbortSignal) => fetchOilCandleBatch(start, { fetcher: oilFetcher(signal), now: end, timeout: 15_000 }, true),
     oilFunding: (start: number, end: number, at: number, signal: AbortSignal) => fetchOilFunding(start, { fetcher: oilFetcher(signal), timeout: 15_000, now: at, endTime: end }),
     hynixQuote: (signal: AbortSignal) => fetchHynixQuote({ fetcher: fetcher(signal), now, timeout: 5_000 }),
     hynixCandles: (start: number, at: number, signal: AbortSignal) => fetchHynixCandles(start, { fetcher: fetcher(signal), timeout: 10_000, now: at }),

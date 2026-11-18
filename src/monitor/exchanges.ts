@@ -301,13 +301,24 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSe
     async quote(market: SpreadMarket, exchange: Exchange, savedHynix?: ComparisonHynix | null): Promise<ExchangeQuote> {
       if (!supportsExchange(market, exchange)) throw new ExchangeReadError('不支持的交易所');
       const key = `${market}/${exchange}`;
+      // Check at request time, even if the previous 5-second live result is cached. A healthy connection can disappear during the remote read too.
+      const savedRow = () => {
+        if (market !== 'hynix' || exchange !== 'hyperliquid') return null;
+        const quote = savedHynix === undefined ? hynixQuote() : savedHynix;
+        if (!quote) throw new ExchangeReadError('尚未取得海力士报价，后台正在采集');
+        return quote.status === 'snapshot' ? hyperliquidHynixQuote(quote, null, true) : null;
+      };
+      const snapshot = savedRow();
+      if (snapshot) return snapshot;
       try {
         // A saved token starts a new result at once (the page reads again right after saving), not after the 5 s share.
         const revision = exchange === 'variational' && variationalSession ? `/${variationalSession.current().revision}` : '';
         const value = await shared(`result/${key}${revision}`, EXCHANGE_RESULT_TTL_MS, () => read(exchange, market, savedHynix));
         if (lastFailure.delete(key)) log(`交易所对比 ${key} 已恢复`);
-        return value;
+        return savedRow() ?? value;
       } catch (error) {
+        const snapshot = savedRow();
+        if (snapshot) return snapshot;
         // The reader's own reasons (a collector without a quote yet) are states, not failures worth a log line.
         if (error instanceof ExchangeReadError || remote && exchange !== 'variational') throw error;
         throw new ExchangeReadError(failed(key, error));

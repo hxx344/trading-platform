@@ -75,7 +75,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
   - 划转参数与 ADL 设置保存在数据库里，`config.json` 里的 `transfer` 与 `adl` 只在配对第一次登记时作为初始值，之后以页面为准（两边不一致时启动日志会列出页面当前值）；改短检查间隔使空闲请求权重超出「每分钟上限减 ADL 预留」时会被拒绝，并给出能用的最短间隔。
   - 余额走势来自数据目录里的 `samples.sqlite`（每分钟一条，保留 30 天；删掉只丢走势图）。
 - 需要代理时写 `/etc/trading-platform/environment`，例如 `NODE_USE_ENV_PROXY=1` 与 `HTTPS_PROXY=…`。
-- 合约价差的质量依据（可选）：CoinGecko 演示键 `COINGECKO_DEMO_API_KEY=…`、币种到 CoinGecko id 的覆盖 `PERPETUAL_COIN_IDS={"XXX":"coin-id"}` 也写在这个文件里，改后 `sudo systemctl restart trading-platform`；不设时走公开限额与自动匹配。
+- 合约价差的质量依据可选用 CoinGecko 演示键 `COINGECKO_DEMO_API_KEY=…` 和币种映射 `PERPETUAL_COIN_IDS={"XXX":"coin-id"}`。两项也写在这个文件里，未设置时使用公开限额与自动匹配。修改后用当前版本的安装脚本执行 `sudo bash install.sh --version "$(cut -d' ' -f1 /opt/trading-platform/current/VERSION)"`，安装器会重新生成 `market.env`，仅重启行情服务。
 - 只校验配置、不启动（`node` 用 `systemctl cat trading-platform` 里 ExecStart 的那个）：`sudo -u trading-platform node /opt/trading-platform/current/src/service/main.ts --config /etc/trading-platform/config.json --check-config`。
 - 执行日志可在页面「日志」或 `journalctl -u trading-platform -f` 查看。页面监听和资源切换记录在 `journalctl -u trading-platform-control`。
 - 外部巡检（v0.46.0 起）：`GET /api/ready` 不用登录，服务就绪时返回 200 `{"ready":true}`，否则返回 503 `{"ready":false}`，不带其他内容。

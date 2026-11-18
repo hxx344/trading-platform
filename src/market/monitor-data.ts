@@ -2,7 +2,7 @@
 import type { MarketOperations } from './ipc.ts';
 import { createPerpetualFeed } from '../monitor/perpetual-feed.ts';
 import { createMarketReaders } from '../monitor/market-readers.ts';
-import { marketRead, type FundingBatch } from '../monitor/market-contract.ts';
+import { OIL_CANDLE_WINDOW_MS, marketRead } from '../monitor/market-contract.ts';
 import { createExchangeReader } from '../monitor/exchanges.ts';
 import { perpetualQualityEnv } from '../monitor/quality-config.ts';
 import { createVariationalFetch } from '../monitor/variational-transport.ts';
@@ -74,10 +74,14 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
         for (const key of ANTHROPIC_LEG_KEYS) if (timestamp(starts[key]) > at) throw new Error('K 线回补范围无效');
         return readers.anthropicCandles(starts as AnthropicCandleStarts, at, signal);
       }
-      case 'monitor.hynix.candles':
       case 'monitor.oil.candles': {
+        const p = fields(input, ['start', 'end']), start = timestamp(p.start), end = timestamp(p.end);
+        if (end <= start || end > now() || end - start > OIL_CANDLE_WINDOW_MS) throw new Error('原油 K 线回补范围无效');
+        return readers.oilCandles(start, end, signal);
+      }
+      case 'monitor.hynix.candles': {
         const p = fields(input, ['start', 'at']), at = roundTime(p.at), { start } = range(p, at);
-        return op === 'monitor.oil.candles' ? readers.oilCandles(start, at, signal) : readers.hynixCandles(start, at, signal);
+        return readers.hynixCandles(start, at, signal);
       }
       case 'monitor.hynix.funding':
       case 'monitor.oil.funding': {
@@ -115,14 +119,19 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
         const reading = await marketRead(() => metric(market, { readerState: p.readerState, signal }));
         return { reading, cached: metric.cachedUntil?.(market) ?? [], retryAt: metric.retryAt(market) };
       }
+      case 'monitor.perpetual.fundingPage':
       case 'monitor.perpetual.funding':
       case 'monitor.perpetual.price': {
-        const p = fields(input, ['exchange', 'symbol', 'identity', 'range']), market = contract(p), bounds = fields(p.range, ['from', 'to']);
+        const page = op.endsWith('.fundingPage'), p = fields(input, page ? ['exchange', 'symbol', 'identity', 'range', 'cursor'] : ['exchange', 'symbol', 'identity', 'range']);
+        const market = contract(p), bounds = fields(p.range, ['from', 'to']);
         const window = { from: timestamp(bounds.from), to: timestamp(bounds.to) };
         if (op.endsWith('.price')) return price(market, window, { signal });
-        let progress: FundingBatch['progress'] = null;
-        const records = await marketRead(() => funding(market, window, { signal, onProgress: part => { progress = part; } }));
-        return { records, progress } satisfies FundingBatch;
+        if (!page) {
+          if (market.exchange === 'bitget') throw new Error('Bitget 资金费需逐页读取');
+          return funding(market, window, { signal });
+        }
+        const cursor = p.cursor === null ? null : fields(p.cursor, ['page', 'before']);
+        return funding.bitgetPage(market, window, cursor && { page: timestamp(cursor.page), before: timestamp(cursor.before) }, { signal });
       }
       case 'monitor.perpetual.positioning': {
         const p = fields(input, ['exchange', 'symbol', 'identity']);

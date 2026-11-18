@@ -78,40 +78,77 @@ function fixture(options = {}) {
 }
 const status = code => error => error.status === code;
 
-test('a public outage withdraws accepted Ondo quotes while the same private session keeps reconciling', async t => {
-  let callbacks, privateOptions, lease = 'first', generation = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', expired = 0;
-  const market = { epoch: () => lease, stream(_op, request, listener) {
+function splitMakerFixture(t) {
+  const link = { callbacks: null, privateOptions: null, lease: 'first', generation: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', expired: 0, frame: null };
+  const market = { epoch: () => link.lease, stream(_op, request, listener) {
     assert.deepEqual(request, { markets: [MARKET], depth: 50, trades: false, metrics: true });
-    callbacks = listener; callbacks.data({ type: 'ready', generation, at: f.time });
+    link.callbacks = listener; listener.data({ type: 'ready', generation: link.generation, at: f.time });
     return () => {};
   } };
   const { f, v, mm, count } = fixture({ manager: { streamFactory: options => remoteOndoStream(market, options, input => {
-    privateOptions = input;
-    return { start() {}, close() {}, expireOrders() { expired++; }, status: () => ({ connected: true, privateReady: true, deadManReady: true }) };
+    link.privateOptions = input;
+    return { start() {}, close() {}, expireOrders() { link.expired++; }, status: () => ({ connected: true, privateReady: true, deadManReady: true }) };
   }) } });
   t.after(() => mm.close(0));
   const wire = rows => rows.map(row => row.map(value => u(value).toString()));
-  let frame;
   f.push = (bids = BIDS, asks = ASKS, time = f.time) => {
     f.book = [bids, asks];
-    frame = { type: 'book', generation, market: MARKET, at: f.time, book: { time, bids: wire(bids), asks: wire(asks) } };
-    callbacks.data(frame);
+    link.frame = { type: 'book', generation: link.generation, market: MARKET, at: f.time, book: { time, bids: wire(bids), asks: wire(asks) } };
+    link.callbacks.data(link.frame);
   };
+  return { f, v, mm, count, link };
+}
+
+test('a public outage withdraws accepted Ondo quotes while the same private session keeps reconciling', async t => {
+  const { f, v, mm, count, link } = splitMakerFixture(t);
   await f.live(); assert.equal(count('place'), 2);
-  assert.equal(privateOptions.privateOnly, true); assert.deepEqual(privateOptions.markets, []);
-  const original = frame, ids = v.orders.map(order => order.id), reads = count('open');
-  lease = null; callbacks.down();
+  assert.equal(link.privateOptions.privateOnly, true); assert.deepEqual(link.privateOptions.markets, []);
+  const original = link.frame, ids = v.orders.map(order => order.id), reads = count('open');
+  link.lease = null; link.callbacks.down();
   // A late frame from the former socket cannot repopulate the book between scheduler ticks.
-  callbacks.data(original); f.frozen = true;
+  link.callbacks.data(original); f.frozen = true;
   await f.rounds(1, 1500);
   assert.equal(f.market().bid, null);
   assert.deepEqual(v.calls.filter(call => call[0] === 'cancel').map(call => call[1]).sort(), ids.sort());
-  assert.ok(count('open') > reads); assert.equal(expired, 0); assert.equal(mm.state().stream.deadManReady, true);
-  lease = 'second'; generation = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
-  callbacks.data({ type: 'ready', generation, at: f.time });
-  callbacks.data({ ...original, at: f.time }); callbacks.data({ ...original, generation, at: f.time });
+  assert.ok(count('open') > reads); assert.equal(link.expired, 0); assert.equal(mm.state().stream.deadManReady, true);
+  link.lease = 'second'; link.generation = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+  link.callbacks.data({ type: 'ready', generation: link.generation, at: f.time });
+  link.callbacks.data({ ...original, at: f.time }); link.callbacks.data({ ...original, generation: link.generation, at: f.time });
   await f.rounds(3); assert.equal(count('place'), 2); assert.equal(f.market().bid, null);
   f.frozen = false; await f.rounds(5); assert.equal(count('place'), 4);
+});
+
+test('an invalid snapshot in the current generation withdraws accepted quotes and revokes a queued create even after immediate recovery', async t => {
+  for (const damage of [
+    (frame, at) => { frame.book.time = at + 1501; },
+    (frame, at) => { frame.book.time = at - 10001; },
+    (frame, at) => { frame.book.time = at - 1; },
+    frame => { frame.book.bids = []; },
+    frame => { frame.book.asks[0][0] = 'invalid'; },
+    (frame, at) => { frame.at = at + 2000; },
+  ]) {
+    const { f, v, link } = splitMakerFixture(t);
+    const interruptBook = () => {
+      const invalid = structuredClone(link.frame); damage(invalid, f.time); link.callbacks.data(invalid);
+      assert.equal(f.market().bid, null); assert.equal(f.market().bookAt, null);
+      // A repeat of the formerly valid source time cannot refresh it.
+      link.callbacks.data(link.frame); assert.equal(f.market().bookAt, null);
+      f.time++; f.push(); assert.equal(f.market().bid, '200');
+    };
+    let queued;
+    v.beforeSend = input => {
+      if (queued || input.side !== 'buy') return;
+      queued = input.clientOrderId; interruptBook();
+    };
+    await f.live(); assert.ok(queued);
+    assert.ok(!v.calls.some(([method, order]) => method === 'place' && order.clientOrderId === queued));
+    await f.rounds(6);
+    const resting = v.orders.map(order => order.id); assert.equal(resting.length, 2);
+    const wrong = structuredClone(link.frame); wrong.generation = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'; damage(wrong, f.time);
+    link.callbacks.data(wrong); assert.equal(f.market().bid, '200');
+    interruptBook();
+    assert.ok(resting.every(id => v.calls.some(([method, value]) => method === 'cancel' && value === id)));
+  }
 });
 
 test('configuration is validated as a whole', () => {

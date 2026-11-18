@@ -5,6 +5,7 @@ import WebSocket from './node-ws.mjs';
 import { AppError, monitorUrl, validIdentity, validManualIdentity } from './model.mjs';
 import { createDepthReader } from './depth-reader.mjs';
 import { positive, failure, HYPERLIQUID_INFO, sourceTime } from './public-values.mjs';
+import { readSignal, sharedRead } from './shared-read.mjs';
 import { D } from './money.mjs';
 import { canonicalBase } from './asset-identity.mjs';
 
@@ -36,8 +37,9 @@ function binanceCrypto(row) {
       && !['stock', 'etf', 'commodities', 'commodity', 'forex', 'index', 'indices', 'tradfi'].includes(value.toLowerCase()));
 }
 
-async function readJson(url, init, { fetcher = fetch, maxBytes = MAX_BYTES, timeoutMs = 8000 } = {}) {
-  const response = await fetcher(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(timeoutMs) });
+async function readJson(url, init, { fetcher = fetch, maxBytes = MAX_BYTES, timeoutMs = 8000, signal } = {}) {
+  signal?.throwIfAborted();
+  const response = await fetcher(url, { ...init, redirect: 'error', signal: readSignal(signal, AbortSignal.timeout(timeoutMs)) });
   if (!response.ok) {
     await response.body?.cancel();
     const error = failure(response.status === 401 ? '来源认证失败，请检查价差模块登录信息' : `只读来源响应 ${response.status}`);
@@ -61,14 +63,15 @@ export function getJson(url, { headers = {}, ...options } = {}) {
 export function createPublicClients({ fetcher = fetch, WebSocketImpl = WebSocket, clock = Date.now, timeoutMs = 8000, signal } = {}) {
   const options = { fetcher, timeoutMs }, metadata = new Map();
   let fxSnapshot = null, fxFlight = null, fxAttemptAt = -Infinity;
-  const get = (url, headers) => getJson(url, { ...options, ...(headers ? { headers } : {}) });
-  const info = (type, coin) => {
+  const get = (url, headers, request) => getJson(url, { ...options, signal: readSignal(signal, request), ...(headers ? { headers } : {}) });
+  const info = (type, coin, request) => {
     if (!['meta', 'l2Book'].includes(type)) throw new AppError('不支持的公开查询');
-    return readJson(HYPERLIQUID_INFO, { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify(type === 'meta' ? { type } : { type, coin }) }, options);
+    return readJson(HYPERLIQUID_INFO, { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify(type === 'meta' ? { type } : { type, coin }) }, { ...options, signal: readSignal(signal, request) });
   };
-  async function cached(key, loader, refresh = false) {
+  async function cached(key, loader, refresh = false, request) {
+    request?.throwIfAborted();
     const previous = metadata.get(key), now = clock();
-    if (previous?.flight) return previous.flight;
+    if (previous?.flight && !previous.flight.signal.aborted) return previous.flight.wait(request);
     if (!refresh && previous?.value && now >= previous.at && now - previous.at < 300_000) return previous.value;
     if (metadata.size >= 128 && !metadata.has(key)) {
       const oldest = [...metadata].find(([, entry]) => !entry.flight);
@@ -76,53 +79,56 @@ export function createPublicClients({ fetcher = fetch, WebSocketImpl = WebSocket
       metadata.delete(oldest[0]);
     }
     const entry = { at: now, value: null, flight: null };
-    entry.flight = loader().then(value => { entry.value = value; entry.at = clock(); return value; }).finally(() => { entry.flight = null; });
-    metadata.set(key, entry); return entry.flight;
+    entry.flight = sharedRead(async shared => {
+      try { const value = await loader(shared); shared.throwIfAborted(); entry.value = value; entry.at = clock(); return value; }
+      finally { entry.flight = null; }
+    });
+    metadata.set(key, entry); return entry.flight.wait(request);
   }
-  async function contract(quote, manual = false, refresh = false) {
+  async function contract(quote, manual = false, refresh = false, request) {
     const { exchange, symbol, quoteCurrency } = quote, rawBase = quote.rawBase ?? quote.base;
     const baseName = name => canonicalBase(exchange, name), base = baseName(quote.base);
     const settle = quote.settlementCurrency ?? quote.collateralCurrency, encoded = encodeURIComponent(symbol);
-    const native = (key, loader) => cached(key, loader, refresh);
+    const native = (key, url) => cached(key, shared => get(url, undefined, shared), refresh, request);
     let row, unit = 1, assetClass = 'crypto';
     if (exchange === 'binance') {
-      const data = await native('binance', () => get(BINANCE_MARKETS));
+      const data = await native('binance', BINANCE_MARKETS);
       row = data.symbols?.find(item => item.symbol === symbol);
       if (!binanceCrypto(row) || row.baseAsset !== rawBase || baseName(row.baseAsset) !== base || row.quoteAsset !== quoteCurrency || row.marginAsset !== settle) throw failure('Binance 合约身份或交易状态未确认');
     } else if (exchange === 'bybit') {
-      const data = await native(`bybit:${symbol}`, () => get(`https://api.bybit.com/v5/market/instruments-info?category=linear&symbol=${encoded}`));
+      const data = await native(`bybit:${symbol}`, `https://api.bybit.com/v5/market/instruments-info?category=linear&symbol=${encoded}`);
       row = data.result?.list?.find(item => item.symbol === symbol);
       if (data.retCode !== 0 || data.result?.category !== 'linear' || !row || row.baseCoin !== rawBase || baseName(row.baseCoin) !== base || row.quoteCoin !== quoteCurrency || row.settleCoin !== settle || row.contractType !== 'LinearPerpetual' || row.status !== 'Trading' || row.isPreListing === true || Number(row.deliveryTime) > 0 || (typeof row.symbolType !== 'string' || !['', 'crypto', 'innovation'].includes(row.symbolType.toLowerCase())) || row.marketRegion || row.underlyingTicker) throw failure('Bybit 合约身份或交易状态未确认');
     } else if (exchange === 'okx') {
-      const data = await native(`okx:${symbol}`, () => get(`https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId=${encoded}`));
+      const data = await native(`okx:${symbol}`, `https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId=${encoded}`);
       row = data.data?.find(item => item.instId === symbol);
       if (data.code !== '0' || !row || row.instType !== 'SWAP' || row.ctType !== 'linear' || row.ctValCcy !== rawBase || baseName(row.ctValCcy) !== base || row.settleCcy !== settle || row.state !== 'live' || row.ruleType !== 'normal' || Number(row.expTime) > 0 || (manual ? !okxClasses.has(row.instCategory) : !['1', '2'].includes(row.instCategory)) || row.instId !== `${rawBase}-${quoteCurrency}-SWAP` || !positive(row.ctVal) || Number(row.ctMult) !== 1) throw failure('OKX 合约数量单位或身份未确认');
       unit = row.ctVal;
       if (manual) assetClass = okxClasses.get(row.instCategory);
     } else if (exchange === 'gate') {
-      row = await native(`gate:${symbol}`, () => get(`https://api.gateio.ws/api/v4/futures/usdt/contracts/${encoded}`));
+      row = await native(`gate:${symbol}`, `https://api.gateio.ws/api/v4/futures/usdt/contracts/${encoded}`);
       if (quoteCurrency !== 'USDT' || settle !== 'USDT' || row.name !== symbol || symbol !== `${rawBase}_USDT` || baseName(rawBase) !== base || row.type !== 'direct' || row.in_delisting !== false || (manual ? !gateClasses.has(row.contract_type) : !['', 'crypto'].includes(row.contract_type)) || row.is_pre_market !== false || (row.status !== undefined && row.status !== 'trading') || !positive(row.quanto_multiplier)) throw failure('Gate 合约数量单位或身份未确认');
       unit = row.quanto_multiplier;
       if (manual) assetClass = gateClasses.get(row.contract_type);
     } else if (exchange === 'kraken') {
-      const data = await native('kraken', () => get(KRAKEN_MARKETS));
+      const data = await native('kraken', KRAKEN_MARKETS);
       row = data.instruments?.find(item => item.symbol === symbol);
       if (data.result !== 'success' || !row || row.type !== 'flexible_futures' || row.tradeable !== true || row.isExpired !== false || row.postOnly === true || row.tradfi !== false || baseName(row.base) !== base || baseName(rawBase) !== base || row.quote !== 'USD' || quoteCurrency !== 'USD' || settle !== 'USD' || Number(row.contractSize) !== 1) throw failure('Kraken 线性永续合约身份或数量单位未确认');
     } else if (exchange === 'hyperliquid') {
-      const data = await native('hyperliquid', () => info('meta'));
+      const data = await cached('hyperliquid', shared => info('meta', undefined, shared), refresh, request);
       row = data.universe?.find(item => item.name === symbol);
       if (!row || row.name !== rawBase || baseName(row.name) !== base || row.isDelisted === true || !Number.isInteger(row.szDecimals) || row.szDecimals < 0 || !positive(row.maxLeverage) || data.collateralToken !== 0 || settle !== 'USDC' || quoteCurrency !== (['HYPE', 'PURR'].includes(symbol) ? 'USDC' : 'USDT')) throw failure('Hyperliquid 合约身份或结算币未确认');
     } else if (exchange === 'deribit') {
-      const data = await native(`deribit:${symbol}`, () => get(`https://www.deribit.com/api/v2/public/get_instrument?instrument_name=${encoded}`));
+      const data = await native(`deribit:${symbol}`, `https://www.deribit.com/api/v2/public/get_instrument?instrument_name=${encoded}`);
       row = data.result;
       if (data.error || !row || row.instrument_name !== symbol || row.kind !== 'future' || row.is_active !== true || (row.instrument_type ?? row.future_type) !== 'linear' || row.instrument_type && row.future_type && row.instrument_type !== row.future_type || row.underlying_type !== 'crypto' || row.state !== undefined && row.state !== 'open' || row.settlement_period !== 'perpetual' || row.base_currency !== base || row.quote_currency !== 'USDC' || row.settlement_currency !== 'USDC' || settle !== 'USDC' || quoteCurrency !== 'USDC') throw failure('Deribit 线性永续合约身份未确认');
     } else if (exchange === 'lighter') {
-      const data = await native('lighter', () => get(LIGHTER_MARKETS));
+      const data = await native('lighter', LIGHTER_MARKETS);
       row = data.order_book_details?.find(item => item.symbol === symbol && item.market_type === 'perp');
       if (data.code !== 200 || !row || row.symbol !== rawBase || baseName(row.symbol) !== base || row.status !== 'active' || row.is_frozen === true || row.market_config?.force_reduce_only === true || Number(row.funding_premium_multiplier) !== 100 || quoteCurrency !== 'USDC' || settle !== 'USDC' || Number(row.multiplier) !== 1 || !Number.isInteger(row.market_id) || row.market_id < 0 || row.market_id !== quote.marketId) throw failure('Lighter 合约身份、单位或 market_id 已变化');
     } else throw new AppError('不支持的深度合约');
     if (!manual && exchange !== 'binance') {
-      const independent = await cached('binance', () => get(BINANCE_MARKETS));
+      const independent = await cached('binance', shared => get(BINANCE_MARKETS, undefined, shared), false, request);
       if (!independent.symbols?.some(item => item.baseAsset === base && binanceCrypto(item))) throw failure('缺少当前独立 Binance COIN 基础币身份，不能确认跨所合约');
     }
     return { row, unit, assetClass };
@@ -168,7 +174,7 @@ export function createPublicClients({ fetcher = fetch, WebSocketImpl = WebSocket
   // Native manual identities are isolated from the cross-venue Monitor proof.
   // Re-read metadata at each manual resolution so preview confirmation cannot
   // silently retain a changed unit or instrument classification for five minutes.
-  async function resolveQuote(crossexSymbol, manual) {
+  async function resolveQuote(crossexSymbol, manual, request) {
     const match = /^(BINANCE|BYBIT|OKX|GATE|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_([A-Z0-9]{1,30})_(USDT|USDC|USD)$/.exec(crossexSymbol);
     if (!match) throw failure('该持仓合约不在支持的永续范围内');
     const exchange = match[1].toLowerCase(), base = match[2], counterCurrency = match[3];
@@ -185,19 +191,19 @@ export function createPublicClients({ fetcher = fetch, WebSocketImpl = WebSocket
       crossexSymbol, multiplier: 1, assetClass: 'crypto', identityVerified: true, identitySource: 'exchange-instrument-metadata',
       ...(manual ? { identityScope: 'manual', nativeUnit: '1', comparable: false } : {}) };
     if (exchange === 'lighter') {
-      const data = await cached('lighter', () => get(LIGHTER_MARKETS));
+      const data = await cached('lighter', shared => get(LIGHTER_MARKETS, undefined, shared), false, request);
       q.marketId = data.order_book_details?.find(item => item.symbol === symbol && item.market_type === 'perp')?.market_id;
     }
     if (!(manual ? validManualIdentity(q) : validIdentity(q))) throw failure('持仓的合约币种或数量身份不受支持');
-    const { unit, assetClass } = await contract(q, manual, manual);
+    const { unit, assetClass } = await contract(q, manual, manual, request);
     if (manual) Object.assign(q, { nativeUnit: D(unit).toString(), assetClass,
       comparable: assetClass === 'crypto' && !(exchange === 'gate' && base === 'EDGE') && !(exchange === 'lighter' && base === 'AI') });
     return q;
   }
-  const loadDepth = quote => depth(quote, false);
-  const loadManualDepth = quote => depth(quote, true);
-  const resolveCrossexQuote = symbol => resolveQuote(symbol, false);
-  const resolveManualQuote = symbol => resolveQuote(symbol, true);
+  const loadDepth = (quote, request) => depth(quote, false, request);
+  const loadManualDepth = (quote, request) => depth(quote, true, request);
+  const resolveCrossexQuote = (symbol, request) => resolveQuote(symbol, false, request);
+  const resolveManualQuote = (symbol, request) => resolveQuote(symbol, true, request);
   const loadCatalog = () => get(CATALOG_URL);
   // Monitor is not connected in this service yet; opportunities wait for 行情监控 M-4.
   async function loadFeed() { throw new AppError('行情监控未接入，机会列表待行情监控 M-4', 503); }

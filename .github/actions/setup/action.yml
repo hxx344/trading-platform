@@ -1,18 +1,33 @@
 name: setup
-description: Node 24.15.0 and node_modules. A cache hit on the lockfile skips pnpm entirely; package.json scripts then run through npm run.
+description: Node 24.15.0 and node_modules. A cache hit on the lockfile and manifest skips pnpm entirely; package.json scripts then run through npm run.
 runs:
   using: composite
   steps:
+    # The Node version is set once here. The manifest hash leaves out "version", which every release commit bumps, so
+    # main's pushes can reuse node_modules; any other change to package.json (dependencies, scripts, pnpm settings) still
+    # gives a new key.
+    - id: keys
+      shell: bash
+      run: |
+        # Assigned first so a failing jq fails the step instead of leaving the hash of empty input in the key.
+        manifest=$(jq -S 'del(.version)' package.json | sha256sum | cut -c1-64)
+        echo "node=24.15.0" >>"$GITHUB_OUTPUT"
+        echo "manifest=$manifest" >>"$GITHUB_OUTPUT"
+    # setup-node uses an exact version already in the tool cache instead of downloading and unpacking it.
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.tool_cache }}/node/${{ steps.keys.outputs.node }}
+        key: node-tool-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.node }}
     - id: node
       uses: actions/setup-node@v4
       with:
-        node-version: 24.15.0
-    # Exact key only: a node_modules from another lockfile is never restored.
+        node-version: ${{ steps.keys.outputs.node }}
+    # Exact key only: a node_modules from another lockfile or manifest is never restored.
     - id: modules
       uses: actions/cache@v4
       with:
         path: node_modules
-        key: node-modules-${{ runner.os }}-${{ runner.arch }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('pnpm-lock.yaml', 'package.json') }}
+        key: node-modules-${{ runner.os }}-${{ runner.arch }}-node${{ steps.node.outputs.node-version }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ steps.keys.outputs.manifest }}
     - if: steps.modules.outputs.cache-hit != 'true'
       uses: pnpm/action-setup@v4
     - if: steps.modules.outputs.cache-hit != 'true'

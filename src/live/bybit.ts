@@ -36,7 +36,7 @@ const MAX_STRATEGY_WINDOW_MS = 366 * 86_400_000;
 const MAX_REMEMBERED_STRATEGIES = 1_000;
 const ORDER_LINK_ID = /^[A-Za-z0-9_-]{1,36}$/;
 const ORDER_TERMINAL: Record<string, OrderStatus> = { Filled: 'filled', Cancelled: 'canceled', PartiallyFilledCanceled: 'canceled', Deactivated: 'canceled', Rejected: 'rejected' };
-const ORDER_WORKING: Record<string, OrderStatus> = { Created: 'new', New: 'new', PartiallyFilled: 'partially-filled' };
+const ORDER_PENDING: Record<string, OrderStatus> = { Created: 'acknowledged', New: 'new', PartiallyFilled: 'partially-filled' };
 /** Strategy status: 2 running, 3 and 4 ended, 5 and 6 paused by the venue. Child status 2 and 4 are still open. */
 const STRATEGY_STATES = [2, 3, 4, 5, 6] as const;
 const CHILD_STATES = [2, 3, 4, 5, 6, 7] as const;
@@ -237,7 +237,7 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
       if (typeof row.reduceOnly !== 'boolean' || row.reduceOnly !== request.reduceOnly || (idx !== 0 && idx !== (request.positionSide === 'long' ? 1 : 2))) throw new ShapeError('委托回报仓位方向或只减仓标记与请求不一致');
       const quantity = amount(row.qty, '委托数量'), filledQuantity = amount(row.cumExecQty, '成交数量', 'nonnegative');
       if (cmp(quantity, request.quantity) !== 0 || cmp(filledQuantity, quantity) > 0) throw new ShapeError('委托回报数量无效');
-      const statusText = row.orderStatus as string, status = ORDER_TERMINAL[statusText] ?? ORDER_WORKING[statusText];
+      const statusText = row.orderStatus as string, status = ORDER_TERMINAL[statusText] ?? ORDER_PENDING[statusText];
       if (typeof statusText !== 'string' || !status) throw new ShapeError(`委托状态 ${String(statusText).slice(0, 32)} 无法识别`);
       if (status === 'filled' && cmp(filledQuantity, quantity) !== 0) throw new ShapeError('全部成交的委托成交数量不足');
       const averagePrice = isZero(filledQuantity) ? null : optionalPrice(row.avgPrice, '成交均价');
@@ -438,7 +438,7 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
           const row = record(item, '活动委托');
           if (row.symbol !== symbol) throw new ShapeError('活动委托合约与请求不一致');
           const id = identifier(row.orderId, '交易所订单号'), status = row.orderStatus as string;
-          if (!Object.hasOwn(ORDER_TERMINAL, status) && !Object.hasOwn(ORDER_WORKING, status) && status !== 'Untriggered' && status !== 'Triggered') throw new ShapeError(`委托状态 ${String(status).slice(0, 32)} 无法识别`);
+          if (!Object.hasOwn(ORDER_TERMINAL, status) && !Object.hasOwn(ORDER_PENDING, status) && status !== 'Untriggered' && status !== 'Triggered') throw new ShapeError(`委托状态 ${String(status).slice(0, 32)} 无法识别`);
           if (seenOrders.has(id)) throw new ShapeError('活动委托重复');
           seenOrders.add(id);
           // A chase's resting order has an empty orderLinkId (createType CreateByChaseOrder) and counts as foreign.
@@ -486,8 +486,7 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
         if (ack.orderLinkId !== request.clientOrderId) throw new ShapeError('下单回执的客户订单号与请求不一致');
         remoteId = identifier(ack.orderId, '交易所订单号');
       } catch (error) { throw new VenueError('uncertain', `Bybit 下单回执无法使用：${describe(error)}`); }
-      // The create answers only an acknowledgement. One read gives the first state; when it fails the acceptance is
-      // reported as a new order with nothing filled, which the executor reconciles by client id like any working order.
+      // The asynchronous create returns IDs. Keep them for reconciliation even if the first order read is unavailable.
       // An order that is found but does not match is an identity conflict, not a fallback.
       let row: unknown = null;
       try { row = await findOrder(binding, request, signal); }
@@ -497,7 +496,7 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
         if (report.remoteId !== remoteId) throw new VenueError('uncertain', 'Bybit 同一客户订单号查到的委托编号与下单回执不一致');
         return report;
       }
-      return { clientOrderId: request.clientOrderId, remoteId, symbol: request.symbol, side: request.side, quantity: request.quantity, filledQuantity: '0', averagePrice: null, status: 'new', terminal: false, updatedAt: now() + offset };
+      return { clientOrderId: request.clientOrderId, remoteId, symbol: request.symbol, side: request.side, quantity: request.quantity, filledQuantity: '0', averagePrice: null, status: 'acknowledged', terminal: false, updatedAt: now() + offset };
     },
 
     async query(binding: AccountBinding, request: OrderRequest, { signal }: CallOptions): Promise<OrderReport | null> {

@@ -53,7 +53,8 @@ export interface OrderRequest {
   reduceOnly: boolean;
 }
 
-export type OrderStatus = 'new' | 'partially-filled' | 'filled' | 'canceled' | 'rejected' | 'expired';
+/** acknowledged means the venue assigned an ID; the working state and any fills still need an order report. */
+export type OrderStatus = 'acknowledged' | 'new' | 'partially-filled' | 'filled' | 'canceled' | 'rejected' | 'expired';
 export interface OrderReport {
   clientOrderId: string;
   remoteId: string;
@@ -67,7 +68,7 @@ export interface OrderReport {
   updatedAt: number;
 }
 
-export function parseOrderReport(value: unknown, request: Pick<OrderRequest, 'clientOrderId' | 'symbol' | 'side' | 'quantity'>): OrderReport {
+export function parseOrderReport(value: unknown, request: Pick<OrderRequest, 'clientOrderId' | 'symbol' | 'side' | 'quantity'>, expectedRemoteId: string | null = null): OrderReport {
   const raw = exactKeys(value, ['clientOrderId', 'remoteId', 'symbol', 'side', 'quantity', 'filledQuantity', 'averagePrice', 'status', 'terminal', 'updatedAt']);
   const report: OrderReport = {
     clientOrderId: text(raw.clientOrderId, '客户订单号'),
@@ -77,13 +78,15 @@ export function parseOrderReport(value: unknown, request: Pick<OrderRequest, 'cl
     quantity: decimalField(raw.quantity, '委托数量'),
     filledQuantity: decimalField(raw.filledQuantity, '成交数量', 'nonnegative'),
     averagePrice: raw.averagePrice === null ? null : decimalField(raw.averagePrice, '成交均价'),
-    status: oneOf(raw.status, ['new', 'partially-filled', 'filled', 'canceled', 'rejected', 'expired'] as const, '委托状态'),
+    status: oneOf(raw.status, ['acknowledged', 'new', 'partially-filled', 'filled', 'canceled', 'rejected', 'expired'] as const, '委托状态'),
     terminal: typeof raw.terminal === 'boolean' ? raw.terminal : reject('report_shape', '委托终态标记无效', 502),
     updatedAt: integer(raw.updatedAt, 0, Number.MAX_SAFE_INTEGER, '委托更新时间'),
   };
   // A report for another order, or one that overstates fills, never settles this operation.
+  if (expectedRemoteId !== null && report.remoteId !== expectedRemoteId) reject('report_identity', '回报与原交易所委托编号不一致，保留原单待核对', 409);
   if (report.clientOrderId !== request.clientOrderId || report.symbol !== request.symbol || report.side !== request.side || cmp(report.quantity, request.quantity) !== 0) reject('report_identity', '委托回报的身份或数量与本操作不一致', 409);
   if (cmp(report.filledQuantity, report.quantity) > 0) reject('report_overfill', '委托回报成交数量超过委托数量', 409);
+  if (report.status === 'acknowledged' && cmp(report.filledQuantity, '0') !== 0) reject('report_fill', '仅有订单受理编号的回报不能确认成交', 502);
   if (report.terminal !== ['filled', 'canceled', 'rejected', 'expired'].includes(report.status)) reject('report_terminal', '委托终态与状态不一致', 502);
   if ((report.averagePrice === null) !== (cmp(report.filledQuantity, '0') === 0)) reject('report_price', '成交均价与成交数量不一致', 502);
   return report;

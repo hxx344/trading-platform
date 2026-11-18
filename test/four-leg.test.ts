@@ -102,6 +102,35 @@ const jobCount = (h: Harness) => (h.store.db.prepare('SELECT COUNT(*) AS n FROM 
 const pos = (venue: SimulatedVenue, symbol: string, side: Side) => venue.position(SIM_ACCOUNTS[venue.venue as 'binance' | 'bybit'], symbol, side);
 const ordersOf = (venue: SimulatedVenue) => [...venue.orders.values()];
 
+for (const firstStatus of ['paused', 'terminal', 'working'] as const) {
+  test(`四腿原生追价零成交，首次查到 ${firstStatus} 时按实际工作记录放行另一所`, () => withHarness(async h => {
+    const intent = fourIntent();
+    intent.legs = [...intent.legs.slice(2), ...intent.legs.slice(0, 2)];
+    intent.legs[0].orderType = 'chase';
+    const { ids } = await confirmFour(h, intent);
+    h.bybit.inject({ operation: 'strategy-place', mode: 'partial', filled: '0' });
+    const place = h.bybit.placeChase.bind(h.bybit);
+    h.bybit.placeChase = async (...args) => {
+      const ack = await place(...args);
+      const strategy = h.bybit.strategies.get(ack.strategyId)!;
+      Object.assign(strategy, { status: firstStatus, childrenSettled: false, lagQueries: 2 });
+      // Delay the peer for one pass so its first send sees a strategy that has since begun ending.
+      if (firstStatus === 'working') h.binance.inject({ operation: 'quote', mode: 'read-fail' });
+      return ack;
+    };
+    await tick(h);
+    const lead = h.ex.jobView(ids[0]).legs[0].operation!;
+    assert.deepEqual([lead.state, lead.strategyStatus, lead.filledQuantity, lead.childrenSettled], ['open', firstStatus, '0', false]);
+    assert.equal(h.binance.arrived.place, 0);
+    if (firstStatus === 'working') {
+      h.bybit.strategies.get(lead.remoteId!)!.status = 'terminal';
+      await tick(h);
+      assert.equal(h.ex.jobView(ids[0]).legs[0].operation?.strategyStatus, 'terminal');
+      assert.equal(h.binance.arrived.place, 1, '此前已核实运行，另一所可以发首单');
+    }
+  }));
+}
+
 test('四腿意图：两个不同交易所、所内方向相反、同合约跨所方向相反、四腿同一桶数或名义金额', () => {
   const parsed = parseFourLegIntent(fourIntent());
   assert.deepEqual(parsed.parts.map(part => [part.preset, part.legs.map(item => `${item.venue}:${item.symbol}:${item.side}`)]), [

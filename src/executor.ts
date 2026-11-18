@@ -243,8 +243,8 @@ export interface Operation {
   filledQuantity: string;
   averagePrice: string | null;
   venueStatus: OrderReport['status'] | null;
-  /** A verified nonterminal venue report proved this order rested. An immediate post-only expiry never sets this. */
-  observedResting?: true;
+  /** Set by a venue report of a working order or strategy. Older open rows require another read. */
+  verifiedWorking?: true;
   preparedAt: number;
   sentAt: number | null;
   lastCheckedAt: number | null;
@@ -701,9 +701,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
    */
   function acceptedLead(op: Operation): boolean {
     const filled = boundedFill(op);
-    if (filled === null) return false;
-    if (filled > 0n) return true;
-    return isStrategy(op) ? op.state === 'open' && op.identityVerifiedAt != null : op.state === 'open' || op.observedResting === true;
+    return filled !== null && op.identityMismatchAt == null && (filled > 0n || op.verifiedWorking === true);
   }
   async function peerFirstLeadEvidence(job: PairJob): Promise<Quote[] | string> {
     if (!job.group || legOps(job.id, 0).some(acceptedLead)) return [];
@@ -1613,7 +1611,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       const answer = strategyId !== null && claimedStrategies().has(strategyId) ? { orphan: `回报的策略编号 ${strategyId} 已被其他委托认领` } : ack;
       if (report) applyReport(current, report);
       else if (answer && 'report' in answer) applyStrategy(current, answer.report);
-      else if (answer && 'unread' in answer) Object.assign(current, { state: 'open', remoteId: strategyId, strategyStatus: 'working', identityVerifiedAt: null, lastCheckedAt: now(), note: answer.unread });
+      else if (answer && 'unread' in answer) Object.assign(current, { state: 'open', remoteId: strategyId, strategyStatus: null, identityVerifiedAt: null, lastCheckedAt: now(), note: answer.unread });
       else if (failure instanceof VenueError && failure.kind === 'not-sent') Object.assign(current, { state: 'not-sent', note: failure.message.slice(0, 200) });
       else if (failure instanceof VenueError && failure.kind === 'rejected') Object.assign(current, { state: 'rejected', note: failure.message.slice(0, 200) });
       // Any other outcome, including a report that fails validation, leaves the result unknown.
@@ -1649,7 +1647,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     return state === 'rejected' || state === 'not-sent' || state === 'not-created' ? 'rejected' : 'unknown';
   }
 
-  /** A strategy is settled only once it is over and its children are too; anything else still rests. */
+  /** A paused strategy or one awaiting child settlement still needs reconciliation. */
   function applyStrategy(op: Operation, report: StrategyReport, reviewingQuantities = false): void {
     if ((!reviewingQuantities || boundedFill(op) !== null) && cmp(report.filledQuantity, op.filledQuantity) < 0) reject('report_regressed', '策略回报的成交数量回退，保留原状态', 409);
     // An ended strategy never runs again; a stale report saying otherwise would bring back stops and restart the children wait.
@@ -1657,17 +1655,20 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const settled = report.status === 'terminal' && report.childrenSettled;
     const state: OpState = settled ? (cmp(report.filledQuantity, op.request.quantity) === 0 ? 'filled' : 'canceled') : 'open';
     const lagging = report.status === 'terminal' && !report.childrenSettled;
+    if (report.status === 'working') op.verifiedWorking = true;
     Object.assign(op, { state, remoteId: report.strategyId, filledQuantity: report.filledQuantity, averagePrice: report.averagePrice, strategyStatus: report.status, childrenSettled: report.childrenSettled,
       childrenWaitSince: lagging ? op.childrenWaitSince ?? now() : null, identityVerifiedAt: now(), lastCheckedAt: now(), absentChecks: 0, absentAt: null });
     noteReportedShortLead(op);
   }
-  function applyReport(op: Operation, report: OrderReport, reviewingQuantities = false): void {
+  function applyReport(op: Operation, report: OrderReport, reviewingQuantities = false): boolean {
     // Cumulative fills never go backwards; a lower count is a stale or foreign answer.
     if ((!reviewingQuantities || boundedFill(op) !== null) && cmp(report.filledQuantity, op.filledQuantity) < 0) reject('report_regressed', '委托回报的成交数量回退，保留原状态', 409);
     const state: OpState = report.status === 'filled' ? 'filled' : report.terminal ? (report.status === 'rejected' && isZero(report.filledQuantity) ? 'rejected' : 'canceled') : 'open';
-    if (state === 'open') op.observedResting = true;
+    const working = report.status === 'new' || report.status === 'partially-filled';
+    if (working) op.verifiedWorking = true;
     Object.assign(op, { state, remoteId: report.remoteId, filledQuantity: report.filledQuantity, averagePrice: report.averagePrice, venueStatus: report.status, lastCheckedAt: now(), absentChecks: 0, absentAt: null });
     noteReportedShortLead(op);
+    return working;
   }
 
   // ---- reconciliation ----------------------------------------------------------
@@ -1702,7 +1703,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (isStrategy(op)) return reconcileStrategy(job, op, bindingOf(row));
     const binding = bindingOf(row), startedAt = now(), request = op.request as OrderRequest;
     let report: OrderReport | null;
-    try { const value = await callVenue('read', signal => connectorFor(op.venue).query(binding, request, { signal })); report = value === null ? null : parseOrderReport(value, request); }
+    try {
+      const value = await callVenue('read', signal => connectorFor(op.venue).query(binding, request, { signal }));
+      report = value === null ? null : parseOrderReport(value, request, op.remoteId);
+    }
     catch (error) {
       write(() => {
         const current = readOp(op.id);
@@ -1718,13 +1722,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       return write(() => {
         const current = readOp(op.id);
         if (SETTLED.has(current.state)) return;
-        if (job.fourLegQuantityIssue && current.remoteId !== null && current.remoteId !== found.remoteId) {
-          current.note = '核对回报与原交易所委托编号不一致，留待人工核对'; saveOp(current); return;
-        }
-        applyReport(current, found, !!job.fourLegQuantityIssue); current.note = null;
-        if (current.state === 'open') current.openCheckedFrom = startedAt;
+        const working = applyReport(current, found, !!job.fourLegQuantityIssue); current.note = null;
+        if (working) current.openCheckedFrom = startedAt;
         saveOp(current); event(job.id, 'operation-reconciled', { op: op.id, state: current.state });
-        return current.state === 'open';
+        return working;
       });
     }
     if (op.state === 'open') { write(() => { const current = readOp(op.id); current.note = '交易所查无已确认的委托，保留待人工核对'; saveOp(current); }); return; }
@@ -1878,9 +1879,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
           outcome = 'confirmed';
         } else {
           const request = op.request as OrderRequest;
-          const report = parseOrderReport(await callVenue('write', signal => connectorFor(op.venue).cancel(binding, request, { signal, beforeSend })), request);
-          outcome = 'confirmed';
+          const report = parseOrderReport(await callVenue('write', signal => connectorFor(op.venue).cancel(binding, request, { signal, beforeSend })), request, op.remoteId);
           write(() => { const current = readOp(op.id); if (SETTLED.has(current.state)) return; applyReport(current, report); saveOp(current); });
+          outcome = 'confirmed';
         }
       } catch (error) {
         outcome ??= error instanceof VenueError && (error.kind === 'not-sent' || error.kind === 'rejected') ? 'rejected' : 'unknown';

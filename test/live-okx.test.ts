@@ -235,7 +235,7 @@ test('OKX 连接器：时间戳过期（50102）同步时钟后同一 clOrdId �
   const second = setup();
   second.venue.script('GET /api/v5/trade/order', () => fail('50001', 'busy', 503));
   const accepted = await second.connector.place(binding(), order(), send());
-  assert.deepEqual([accepted.status, accepted.filledQuantity, accepted.terminal], ['new', '0', false]);
+  assert.deepEqual([accepted.status, accepted.filledQuantity, accepted.terminal, accepted.remoteId], ['acknowledged', '0', false, second.venue.orders.get(NATIVE)!.ordId]);
   // Query: 51603 is "no such order"; cancel without a readable order stays open.
   assert.equal(await second.connector.query(binding(), order({ clientOrderId: 'pa1-0123456789abcdef01234567-1' }), { signal: signal() }), null);
   // Only 51603 is "no such order": a success without a row proves nothing (L093).

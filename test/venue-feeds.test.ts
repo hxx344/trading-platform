@@ -130,7 +130,11 @@ test('a cancelled Ondo IPC request leaves the rate queue immediately and an acti
   const active = api.depth(symbol, 50, first.signal), http = await entered.promise;
   const second = api.markets(queued.signal); queued.abort();
   await assert.rejects(second); assert.equal(http.aborted, false);
-  first.abort(); await assert.rejects(active); assert.equal(http.aborted, true); assert.equal(calls.length, 1);
+  const reason = new Error('caller canceled depth');
+  first.abort(reason);
+  assert.equal(http.reason, reason);
+  await assert.rejects(active);
+  assert.equal(calls.length, 1);
 });
 
 test('cancelled CrossEx readers preserve shared metadata until the remaining depth reader finishes', async t => {

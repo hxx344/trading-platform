@@ -27,9 +27,11 @@ const contractCode = (expected: string) => (error: unknown) => error instanceof 
 test('委托回报：身份、超额成交、终态与均价不一致都不能结算操作', () => {
   assert.equal(parseOrderReport(report, request).status, 'filled');
   assert.throws(() => parseOrderReport({ ...report, clientOrderId: 'pa1-y-0' }, request), contractCode('report_identity'));
+  assert.throws(() => parseOrderReport(report, request, 'different-venue-id'), contractCode('report_identity'));
   assert.throws(() => parseOrderReport({ ...report, quantity: '2' }, request), contractCode('report_identity'));
   assert.throws(() => parseOrderReport({ ...report, filledQuantity: '1.5' }, request), contractCode('report_overfill'));
   assert.throws(() => parseOrderReport({ ...report, terminal: false }, request), contractCode('report_terminal'));
+  assert.throws(() => parseOrderReport({ ...report, status: 'acknowledged', terminal: false }, request), contractCode('report_fill'));
   assert.throws(() => parseOrderReport({ ...report, averagePrice: null }, request), contractCode('report_price'));
   assert.throws(() => parseOrderReport({ ...report, extra: 1 }, request), contractCode('unknown_field'));
 });

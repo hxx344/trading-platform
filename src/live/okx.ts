@@ -406,8 +406,7 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
         ordType: ordTypeOf(request), sz: request.quantity, ...(request.type === 'limit' ? { px: request.limitPrice } : {}), ...(mode === 'one-way' ? { reduceOnly: request.reduceOnly } : {}),
       };
       const remoteId = ackOf(await signed(binding, 'POST', '/api/v5/trade/order', body, { signal, beforeSend }), clOrdId, '下单');
-      // The create answers only an acknowledgement. One read gives the first state; when it fails the acceptance is
-      // reported as a new order with nothing filled, which the executor reconciles by client id like any working order.
+      // OKX assigns the ID before the matching engine can cancel a crossing post-only order.
       let row: unknown = null;
       try { row = await findOrder(binding, request, signal); }
       catch (error) { if (!(error instanceof VenueError && error.kind === 'read-failed')) throw error; }
@@ -416,7 +415,7 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
         if (report.remoteId !== remoteId) throw new VenueError('uncertain', 'OKX 同一客户订单号查到的委托编号与下单回执不一致');
         return report;
       }
-      return { clientOrderId: request.clientOrderId, remoteId, symbol: request.symbol, side: request.side, quantity: request.quantity, filledQuantity: '0', averagePrice: null, status: 'new', terminal: false, updatedAt: now() + offset };
+      return { clientOrderId: request.clientOrderId, remoteId, symbol: request.symbol, side: request.side, quantity: request.quantity, filledQuantity: '0', averagePrice: null, status: 'acknowledged', terminal: false, updatedAt: now() + offset };
     },
 
     async query(binding: AccountBinding, request: OrderRequest, { signal }: CallOptions): Promise<OrderReport | null> {

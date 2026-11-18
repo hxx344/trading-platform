@@ -81,10 +81,18 @@ test('Bybit 连接器：下单参数按持仓模式带 positionIdx；回执后�
   assert.deepEqual(venue.last('POST /v5/order/create').body, { category: 'linear', symbol: 'CLUSDT', side: 'Sell', orderType: 'Market', qty: '2', positionIdx: 0, reduceOnly: true, orderLinkId: 'pa1-market' });
   assert.deepEqual([sold.status, sold.filledQuantity], ['filled', '2']);
 
-  // The follow-up read failing leaves the acknowledgement as a working order with nothing filled.
+  // Both an unreadable order and a Created row preserve the receipt until the venue reports New.
   venue.script('GET /v5/order/realtime', () => fail(10016, 'server error', 500));
-  const acked = parseOrderReport(await connector.place(binding(), order({ clientOrderId: 'pa1-acked' }), send()), order({ clientOrderId: 'pa1-acked' }));
-  assert.deepEqual([acked.status, acked.terminal, acked.filledQuantity, acked.remoteId], ['new', false, '0', '0000-3']);
+  const pending = order({ clientOrderId: 'pa1-acked', timeInForce: 'gtc' });
+  const acked = parseOrderReport(await connector.place(binding(), pending, send()), pending);
+  assert.deepEqual([acked.status, acked.terminal, acked.filledQuantity, acked.remoteId], ['acknowledged', false, '0', '0000-3']);
+  const row = venue.orders.at(-1)!;
+  Object.assign(row, { orderStatus: 'Created', cumExecQty: '0', avgPrice: '' });
+  const created = parseOrderReport(await connector.query(binding(), pending, { signal: signal() }), pending);
+  assert.deepEqual([created.status, created.remoteId, created.filledQuantity], ['acknowledged', acked.remoteId, '0']);
+  row.orderStatus = 'New';
+  const working = parseOrderReport(await connector.query(binding(), pending, { signal: signal() }), pending);
+  assert.deepEqual([working.status, working.remoteId, working.filledQuantity], ['new', acked.remoteId, '0']);
   // A follow-up read that finds this client id with another venue id, or a row that does not match, is not a fallback.
   const echo = (change: Row) => (call: Call) => ok({ category: 'linear', list: venue.orders.filter(row => row.orderLinkId === call.params.get('orderLinkId')).map(row => ({ ...row, ...change })), nextPageCursor: '' });
   venue.script('GET /v5/order/realtime', echo({ orderId: 'someone-else' }));

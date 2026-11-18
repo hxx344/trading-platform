@@ -15,7 +15,7 @@ import { oilLoops, openOilRules, type OilRuntime } from '../src/service/oil.ts';
 import { RETRY_MS, beijingDay, thresholdBounds, type RuleExecutor, type RulePlan } from '../src/oil/rule-live.ts';
 import { comparePremium } from '../src/hynix/sizing.ts';
 import { SIM_ACCOUNTS } from '../src/simulation.ts';
-import { bindAccounts, createHarness, settle } from './harness.ts';
+import { SESSION, bindAccounts, createHarness, settle } from './harness.ts';
 
 const code = (expected: string) => (error: unknown) => error instanceof ContractError && error.code === expected;
 const hynix = (overrides: Record<string, unknown> = {}) => ({ market: 'hynix', name: '', venue: 'binance', direction: 'short', openThreshold: '2.5', closeThreshold: '0.5', notional: '100', confirmSamples: 2, maxOpensPerDay: 3, ...overrides });
@@ -231,14 +231,20 @@ test('海力士实盘：连续两份新盘口才开仓，同一份盘口不重�
   await rules.tick();
   assert.deepEqual([live(rules).phase, live(rules).held!.map(leg => leg.quantity)], ['holding', ['1.21', '0.125']]);
   assert.match(lastEvent(rules), /^部分平仓：ADR 1\.21、正股 0\.124，剩余 ADR 1\.21、正股 0\.125/);
+  assert.throws(() => rules.checkHynixRebalance('binance', ACCOUNT.accountKey), code('rebalance_rule_conflict'));
+  rules.checkHynixRebalance('binance', 'another-account');
   await feed(r, rules, CLOSE, 2);
   assert.deepEqual(ex.previews[2]!.intent.legs.map(leg => leg.quantity), ['1.21', '0.125']);
   ex.finish('completed', ['1.21', '0.125']);
   await rules.tick();
   assert.deepEqual([live(rules).phase, live(rules).held, live(rules).opensToday], ['idle', null, 1]);
+  rules.checkHynixRebalance('binance', ACCOUNT.accountKey);
   // One leg filled, the other not: review, not a held record the next close would trust.
   await openWith(r, ex, rules, 'completed', ['2.42', '0']);
   assert.deepEqual([live(rules).phase, live(rules).enabled], ['review', false]);
+  assert.throws(() => rules.checkHynixRebalance('binance', ACCOUNT.accountKey), code('rebalance_rule_conflict'));
+  rules.checkHynixRebalance('binance', 'replacement-account');
+  rules.checkHynixRebalance('bybit', 'bybit-account');
   assert.match(live(rules).reason!, /一腿没有成交（ADR 2\.42、正股 0）/);
 }));
 
@@ -249,6 +255,7 @@ test('海力士实盘：确认结果未知时保留待确认，重启后用同�
   r.now += 3_000; r.set(OPEN);
   await assert.rejects(initial.tick(), /应答丢失/);
   assert.deepEqual([live(initial).phase, live(initial).pending?.action, live(initial).job], ['opening', 'open', null]);
+  assert.throws(() => initial.checkHynixRebalance('binance', ACCOUNT.accountKey), code('rebalance_rule_conflict'));
   const rules = reopen();
   await rules.tick();
   assert.equal(ex.confirms.length, 2);
@@ -314,10 +321,84 @@ test('品种读不一致的持有记录转待核对：海力士规则的持仓�
   const rules = reopen();
   assert.deepEqual([live(rules).phase, live(rules).enabled, live(rules).held], ['review', false, null]);
   assert.match(live(rules).reason!, /持有记录无法读取/);
+  assert.throws(() => rules.checkHynixRebalance('binance', ACCOUNT.accountKey), code('rebalance_rule_conflict'));
+  rules.checkHynixRebalance('bybit', 'bybit-account');
 }));
 
-test('海力士实盘端到端：真实执行器与模拟交易所上分 2 批开仓、按持有量平仓，规则持有量与交易所仓位一致', async () => {
-  const h = createHarness();
+for (const mode of [undefined, 'observe']) {
+  test(`规则模式 ${String(mode)} 与持仓记录冲突：重启转待核对，观察轮不能覆盖持仓或放行调平`, () => withLive(async ({ r, ex, rules: initial, file, reopen }) => {
+    const id = goLive(initial);
+    await openWith(r, ex, initial, 'completed', ['2.42', '0.249']);
+    const raw = new DatabaseSync(file);
+    try {
+      const stored = JSON.parse(String(raw.prepare('SELECT state FROM rules WHERE id = ?').get(id)!.state));
+      stored.mode = mode;
+      stored.observing = true;
+      raw.prepare('UPDATE rules SET state = ? WHERE id = ?').run(JSON.stringify(stored), id);
+      const rules = reopen();
+      await feed(r, rules, CLOSE, 2);
+      assert.deepEqual([live(rules).phase, live(rules).enabled, ex.confirms.length], ['review', false, 1]);
+      assert.throws(() => rules.checkHynixRebalance('binance', ACCOUNT.accountKey), code('rebalance_rule_conflict'));
+      rules.checkHynixRebalance('binance', 'another-account');
+      const after = JSON.parse(String(raw.prepare('SELECT state FROM rules WHERE id = ?').get(id)!.state));
+      assert.deepEqual(after.live.held, stored.live.held);
+    } finally { raw.close(); }
+  }));
+}
+
+test('等待开仓与残缺的持仓或任务记录并存时，调平等待规则核对', () => withLive(async ({ rules, file }) => {
+  const id = goLive(rules);
+  const db = new DatabaseSync(file);
+  try {
+    const original = String(db.prepare('SELECT state FROM rules WHERE id = ?').get(id)!.state);
+    for (const field of ['held', 'pending', 'job']) {
+      const state = JSON.parse(original);
+      state.live[field] = { unreadable: true };
+      db.prepare('UPDATE rules SET state = ? WHERE id = ?').run(JSON.stringify(state), id);
+      assert.equal(live(rules).phase, 'review', field);
+      assert.throws(() => rules.checkHynixRebalance('binance', ACCOUNT.accountKey), code('rebalance_rule_conflict'));
+    }
+  } finally { db.close(); }
+}));
+
+for (const kind of ['pending', 'job'] as const) {
+  test(`模式冲突时，${kind} 的账户与原编号在重启、轮询和编辑后仍可核对`, () => withLive(async ({ r, ex, rules: initial, file, reopen }) => {
+    const id = goLive(initial);
+    ex.loseAnswer = kind === 'pending';
+    if (ex.loseAnswer) await assert.rejects(feed(r, initial, OPEN, 2), /应答丢失/);
+    else await feed(r, initial, OPEN, 2);
+    const db = new DatabaseSync(file);
+    try {
+      const read = () => JSON.parse(String(db.prepare('SELECT state FROM rules WHERE id = ?').get(id)!.state));
+      const stored = read();
+      const evidence = stored.live[kind];
+      assert.ok(evidence);
+      stored.mode = kind === 'pending' ? undefined : 'observe';
+      stored.observing = true;
+      db.prepare('UPDATE rules SET state = ? WHERE id = ?').run(JSON.stringify(stored), id);
+      let rules = reopen();
+      ex.confirmedJob = () => assert.fail('待核对规则不应重放待确认请求');
+      ex.jobView = () => assert.fail('待核对规则不应自动跟踪旧任务');
+      await feed(r, rules, OPEN, 2);
+      assert.equal(ex.confirms.length, 1);
+      rules.update(id, { revision: first(rules).revision, config: hynix({ name: '待核对的规则' }) });
+      assert.deepEqual(read().live[kind], evidence);
+      rules = reopen();
+      const view = live(rules);
+      assert.deepEqual([view.phase, view.enabled, view.pending, view.job], ['review', false, null, null]);
+      assert.ok(view.reason?.includes(kind === 'job' ? evidence.id : evidence.requestId));
+      assert.throws(() => rules.checkHynixRebalance('binance', ACCOUNT.accountKey), code('rebalance_rule_conflict'));
+      rules.checkHynixRebalance('binance', 'replacement-account');
+      rules.act(id, 'reset', { revision: first(rules).revision });
+      assert.equal(live(rules).phase, 'idle');
+      rules.checkHynixRebalance('binance', ACCOUNT.accountKey);
+    } finally { db.close(); }
+  }));
+}
+
+test('海力士规则分批开平仓只处理自身成交，开仓交接、停用和重启期间加减调平及旧预览确认均被拒绝', async () => {
+  let rules: Rules;
+  const h = createHarness({ checkHynixRebalance: (venue, key) => rules.checkHynixRebalance(venue, key) });
   const dir = mkdtempSync(join(tmpdir(), 'tp-hynix-rules-'));
   try {
     bindAccounts(h.ex);
@@ -326,20 +407,37 @@ test('海力士实盘端到端：真实执行器与模拟交易所上分 2 批�
       return { venue: 'binance', symbol, bid: book.bid, ask: book.ask, receivedAt: h.clock.now, error: null };
     });
     const executor: RuleExecutor = { preview: (intent, session) => h.ex.preview(intent, session), confirm: (body, session) => h.ex.confirm(body, session), jobView: id => h.ex.jobView(id), confirmedJob: (requestId, previewId, session) => h.ex.confirmedJob(requestId, previewId, session) };
-    const rules = createOilRules({ file: join(dir, 'oil-rules.sqlite'), venues: ['binance'], books, now: () => h.clock.now, executor });
+    const file = join(dir, 'oil-rules.sqlite');
+    const openRules = () => createOilRules({ file, venues: ['binance'], books, now: () => h.clock.now, executor });
+    rules = openRules();
     try {
-      // Binance ADR 41.20/41.24, ordinary 400.00/400.40: selling the premium gets ≈ 2.897 %.
-      goLive(rules, hynix({ closeThreshold: '1', batches: { count: 2, intervalMs: 0 } }));
+      const rebalance = (method: string) => h.ex.preview({ market: 'hynix', preset: 'rebalance', venue: 'binance', method, timeoutMs: 60_000 }, SESSION);
+      h.binance.setPosition(SIM_ACCOUNTS.binance, 'SKHYUSDT', 'short', '5');
+      h.binance.setPosition(SIM_ACCOUNTS.binance, 'SKHYNIXUSDT', 'long', '0.25');
+      const previews = await Promise.all([rebalance('add'), rebalance('reduce')]);
+      const id = goLive(rules, hynix({ closeThreshold: '1', batches: { count: 2, intervalMs: 0 } }));
       for (let i = 0; i < 2; i++) { h.advance(3_000); await rules.tick(); }
       const opening = live(rules);
       assert.equal(opening.phase, 'opening', lastEvent(rules));
       const opened = await settle(h, opening.job!.id);
       assert.equal(opened.status, 'completed', opened.reason ?? '');
       assert.equal(opened.batches?.count, 2);
+      // The executor released its locks; the rule still tracks the finished job until its next tick.
+      assert.equal(live(rules).phase, 'opening');
+      for (const preview of previews) {
+        assert.throws(() => h.ex.confirm({ requestId: randomUUID(), previewId: preview.id, confirmLive: true }, SESSION), code('rebalance_rule_conflict'));
+      }
+      assert.deepEqual(h.ex.unfinished(), []);
       await rules.tick();
       assert.deepEqual(live(rules).held!.map(leg => [leg.symbol, leg.side, leg.quantity]), [['SKHYUSDT', 'short', '2.42'], ['SKHYNIXUSDT', 'long', '0.249']]);
-      assert.equal(h.binance.position(SIM_ACCOUNTS.binance, 'SKHYUSDT', 'short'), '2.42');
-      assert.equal(h.binance.position(SIM_ACCOUNTS.binance, 'SKHYNIXUSDT', 'long'), '0.249');
+      assert.equal(h.binance.position(SIM_ACCOUNTS.binance, 'SKHYUSDT', 'short'), '7.42');
+      assert.equal(h.binance.position(SIM_ACCOUNTS.binance, 'SKHYNIXUSDT', 'long'), '0.499');
+      await assert.rejects(rebalance('reduce'), code('rebalance_rule_conflict'));
+      rules.act(id, 'disable', { revision: first(rules).revision });
+      rules.close();
+      rules = openRules();
+      for (const method of ['reduce', 'add']) await assert.rejects(rebalance(method), code('rebalance_rule_conflict'));
+      rules.act(id, 'enable', { revision: first(rules).revision, confirmLive: true });
       // Buying back: ADR ask 40.02 × 10 ÷ ordinary bid 400.00 − 1 = 0.05 % ≤ 1.
       h.binance.setBook('SKHYUSDT', { bid: '40.00', ask: '40.02' });
       for (let i = 0; i < 2; i++) { h.advance(3_000); await rules.tick(); }
@@ -349,8 +447,10 @@ test('海力士实盘端到端：真实执行器与模拟交易所上分 2 批�
       assert.equal(closed.status, 'completed', closed.reason ?? '');
       await rules.tick();
       assert.deepEqual([live(rules).phase, live(rules).held, live(rules).opensToday], ['idle', null, 1]);
-      assert.equal(cmp(h.binance.position(SIM_ACCOUNTS.binance, 'SKHYUSDT', 'short'), '0'), 0);
-      assert.equal(cmp(h.binance.position(SIM_ACCOUNTS.binance, 'SKHYNIXUSDT', 'long'), '0'), 0);
+      assert.equal(cmp(h.binance.position(SIM_ACCOUNTS.binance, 'SKHYUSDT', 'short'), '5'), 0);
+      assert.equal(cmp(h.binance.position(SIM_ACCOUNTS.binance, 'SKHYNIXUSDT', 'long'), '0.25'), 0);
+      await rebalance('add');
+      await rebalance('reduce');
     } finally { rules.close(); }
   } finally { h.dispose(); rmSync(dir, { recursive: true, force: true }); }
 });

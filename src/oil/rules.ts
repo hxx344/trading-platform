@@ -151,10 +151,12 @@ function stateOf(text: string, market: RuleMarket): RuleState {
     return record.kind !== 'signal' || (typeof record.value === 'string' && typeof record.threshold === 'string' && ['hits', 'bzAt', 'clAt'].every(key => Number.isFinite(record[key])));
   };
   const records = (value: unknown): RuleEvent[] => Array.isArray(value) ? value.filter(valid).slice(-MAX_EVENTS) : [];
-  // A state that cannot be read, or names no known mode, may belong to a live rule holding a position: it is held for review
-  // (not deletable until reset) rather than read as an observe rule. Rules from before live mode have no mode at all.
-  if (!raw || (raw.mode !== undefined && raw.mode !== 'observe' && raw.mode !== 'live')) {
-    return { mode: 'live', observing: false, live: { ...idleLive(), phase: 'review', reason: '规则状态无法读取；请在执行进度与交易所核对后重置' }, events: records(raw?.events), observations: [] };
+  // A legacy observer has no live position. Conflicting mode and position data must survive the next observation tick.
+  const saved = raw?.live && typeof raw.live === 'object' ? raw.live as Record<string, unknown> : null;
+  const positionOrJob = saved && (saved.held != null || saved.pending != null || saved.job != null || (saved.phase != null && saved.phase !== 'idle'));
+  if (!raw || (raw.mode !== undefined && raw.mode !== 'observe' && raw.mode !== 'live') || (raw.mode !== 'live' && positionOrJob)) {
+    const live = liveOf(saved, market);
+    return { mode: 'live', observing: false, live: { ...live, enabled: false, phase: 'review', reason: '规则状态无法读取；请在执行进度与交易所核对后重置' }, events: records(raw?.events), observations: [] };
   }
   const mode = raw.mode === 'live' ? 'live' : 'observe';
   // An observe rule keeps the day's opens it made while live, so switching modes does not clear the daily limit.
@@ -163,6 +165,29 @@ function stateOf(text: string, market: RuleMarket): RuleState {
 }
 
 export const ruleTitle = (config: RuleConfig): string => config.name || `${VENUE_NAMES[config.venue]} ${MARKET_LABELS[config.market]}${config.direction === 'short' ? '做空' : '做多'}${config.market === 'hynix' ? '溢价' : '价差'}`;
+
+/** An executor job releases its symbol locks before the rule consumes the result. Its pending/tracked accounts cover
+ * that handoff; held covers partial closes and disabled rules. Rotating credentials does not move the position. */
+function checkHynixRebalance(db: DatabaseSync, venue: Venue, accountKey: string): void {
+  let rows: { config: string; state: string }[];
+  try { rows = db.prepare('SELECT config, state FROM rules').all() as typeof rows; }
+  catch { throw new ContractError(503, 'rules_unavailable', '无法读取海力士规则持仓，暂不能手动调平'); }
+  for (const row of rows) {
+    let config: RuleConfig | null = null;
+    try { config = parseRuleConfig(JSON.parse(row.config), VENUES); } catch { /* Unknown market or venue may own a position. */ }
+    if (config?.market === 'oil') continue;
+    const { mode, live } = stateOf(row.state, 'hynix');
+    if (mode !== 'live' || live.phase === 'idle') continue;
+    const accounts = [...(live.held ?? []), ...(live.job?.accounts ?? []), ...(live.pending?.accounts ?? [])];
+    const owned = accounts.some(owner => owner.accountKey === accountKey);
+    const unknownOwner = accounts.length === 0 && (!config || config.venue === venue);
+    if (owned || unknownOwner) {
+      const name = config ? `「${ruleTitle(config)}」` : '（参数待核对）';
+      throw new ContractError(409, 'rebalance_rule_conflict', `海力士实盘规则${name}仍有持仓或待核对的任务，不能在该账户手动调平；请先核对规则与持仓`);
+    }
+  }
+}
+
 /** The value for records: oil as before (USDT per barrel, no unit), hynix in percent cut to four places. */
 export const spreadText = (market: RuleMarket, value: string): string => market === 'hynix' ? `${value.replace(/(\.\d{4})\d+$/, '$1')}%` : value;
 
@@ -294,12 +319,12 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
   const restart = (id: string) => { observed.delete(id); freshAfter.set(id, now()); };
   /** A live rule that judges books: enabled, waiting to open or holding, nothing pending or running. */
   const judging = (rule: Rule) => rule.state.mode === 'live' && rule.state.live.enabled && (rule.state.live.phase === 'idle' || rule.state.live.phase === 'holding') && !rule.state.live.pending && !rule.state.live.job;
-  const busy = (live: LiveState) => live.phase === 'opening' || live.phase === 'closing' || live.pending !== null || live.job !== null;
+  const busy = (live: LiveState) => live.phase === 'opening' || live.phase === 'closing';
 
   for (const rule of rows()) {
     freshAfter.set(rule.id, now());
     if (rule.state.observing || judging(rule)) { observation(rule.state, '服务重启，连续次数已清零，等待新盘口'); save(rule); }
-    else if (rule.state.live.pending) { event(rule.state, '服务重启：有待确认的下单，将用同一请求编号向执行器核对'); save(rule); }
+    else if (busy(rule.state.live) && rule.state.live.pending) { event(rule.state, '服务重启：有待确认的下单，将用同一请求编号向执行器核对'); save(rule); }
   }
 
   /** Clears the counts with a reason; the same reason in a row is recorded once. */
@@ -379,7 +404,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
   /** Stops the rule and keeps what it holds for a person to check on the venue. */
   function toReview(rule: Rule, text: string): void {
     const live = rule.state.live;
-    live.phase = 'review'; live.enabled = false; live.pending = null; live.job = null; live.reason = text;
+    live.phase = 'review'; live.enabled = false; live.reason = text;
     event(rule.state, text);
     save(rule);
   }
@@ -521,6 +546,8 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
 
   async function liveStep(rule: Rule, current: readonly BookRow[]): Promise<void> {
     const live = rule.state.live;
+    // In review, stored order identities are evidence for the operator and account guard. They are never replayed.
+    if (live.phase === 'review') { observed.delete(rule.id); return; }
     if ((live.pending || live.job || judging(rule)) && !executor) { hold(rule, '本服务没有接入执行器，实盘规则不能执行'); return; }
     if (live.pending) { if (live.enabled) submit(rule); else withdraw(rule); return; }
     if (live.job) { follow(rule); return; }
@@ -570,12 +597,15 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     return { value: reading.value, met: reading.met && !stale, side: reading.side, hits: stale ? 0 : reading.hits, signaled: reading.signaled && !stale, at: reading.at, stale };
   }
   function liveView(live: LiveState, time: number) {
+    const reviewing = live.phase === 'review';
+    const references = reviewing ? [live.job && `任务 ${live.job.id}`, live.pending && `确认请求 ${live.pending.requestId}`].filter(Boolean).join('，') : '';
     return {
       enabled: live.enabled, phase: live.phase, phaseName: PHASE_NAMES[live.phase],
       held: live.held?.map(({ symbol, side, quantity, barrels }) => ({ symbol, side, quantity, barrels })) ?? null,
-      pending: live.pending ? { action: live.pending.action, at: live.pending.at } : null,
-      job: live.job ? { id: live.job.id, action: live.job.action, at: live.job.at } : null,
-      opensToday: opensOn(live, beijingDay(time)), failures: live.failures, retryAt: live.retryAt !== null && live.retryAt > time ? live.retryAt : null, reason: live.reason,
+      pending: !reviewing && live.pending ? { action: live.pending.action, at: live.pending.at } : null,
+      job: !reviewing && live.job ? { id: live.job.id, action: live.job.action, at: live.job.at } : null,
+      opensToday: opensOn(live, beijingDay(time)), failures: live.failures, retryAt: live.retryAt !== null && live.retryAt > time ? live.retryAt : null,
+      reason: references ? `${live.reason ?? '规则待核对'}（${references}）` : live.reason,
     };
   }
   function ruleView(rule: Rule, time: number) {
@@ -696,6 +726,6 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     restart(id);
     return view();
   }
-  return { view, tick, create, update, act, close: () => db.close() };
+  return { view, tick, create, update, act, checkHynixRebalance: (venue: Venue, key: string) => checkHynixRebalance(db, venue, key), close: () => db.close() };
 }
 export type OilRules = ReturnType<typeof createOilRules>;

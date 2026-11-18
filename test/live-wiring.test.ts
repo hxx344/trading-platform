@@ -241,6 +241,11 @@ test('端到端：执行器用真实连接器对替身交易所跑完两腿开�
     const ex = createExecutor({ store, connectors, environment: 'mainnet', notionalLimits: LIMITS, now: () => clock.now });
     assert.ok(ex.acquire());
     for (const account of config.accounts) ex.registerAccount(account);
+    // A separate directory cannot establish that this live account has no holdings in the service's rules store.
+    for (const method of ['add', 'reduce']) {
+      await assert.rejects(ex.preview({ market: 'hynix', preset: 'rebalance', venue: 'binance', method, timeoutMs: 60_000 }, 'live-session'), code('rebalance_service_required'));
+    }
+    assert.deepEqual(ex.unfinished(), []);
     const run = async (intent: unknown, between?: () => void) => {
       const preview = await ex.preview(intent, 'live-session');
       const { job } = ex.confirm({ previewId: preview.id, requestId: randomUUID(), confirmLive: true }, 'live-session');

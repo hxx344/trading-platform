@@ -271,6 +271,7 @@ test('服务接线：规则库打不开时只读出原因、写入 503；每轮�
     assert.deepEqual(Object.keys(stub.view() as object), ['available', 'error', 'rules']);
     assert.equal((stub.view() as { available: boolean }).available, false);
     assert.throws(() => stub.create({}), code('rules_unavailable'));
+    assert.throws(() => stub.checkHynixRebalance('binance', 'any-account'), code('rules_unavailable'));
     assert.throws(() => stub.act('x', 'start', {}), (error: unknown) => error instanceof ContractError && error.status === 503);
     assert.match(logs[0]!, /原油自动规则库无法打开/);
     let ticks = 0, rounds = 0;

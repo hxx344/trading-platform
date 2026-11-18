@@ -89,12 +89,24 @@ function classify(reply: HttpReply): Failure | null {
   return { kind: KNOWN_REJECTIONS.has(code) ? 'rejected' : 'unknown', message };
 }
 
+interface RuleCatalog { instruments: Map<string, Instrument>; failures: Map<string, unknown> }
+/** Waits for a read another caller started, but no longer than this caller's own signal allows. */
+function untilAborted<T>(flight: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const stop = (): void => reject(new VenueError('read-failed', 'Binance 合约目录读取已取消'));
+    if (signal.aborted) return stop();
+    signal.addEventListener('abort', stop, { once: true });
+    flight.then(resolve, reject).finally(() => signal.removeEventListener('abort', stop));
+  });
+}
+
 export function createBinanceConnector(options: BinanceConnectorOptions): VenueConnector {
   const fetchImpl = options.fetchImpl ?? ((url, init) => fetch(url, init));
   const now = options.now ?? Date.now, timeoutMs = options.timeoutMs ?? 10_000, ruleTtlMs = options.ruleTtlMs ?? 60_000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 20_000) throw new Error('Binance 连接器单次请求超时须在 100–20000 毫秒之间');
   let offset = 0;
   const rules = new Map<string, { instrument: Instrument; expiresAt: number }>();
+  let ruleFlight: { read: Promise<RuleCatalog>; owner: AbortSignal } | null = null;
   const identities = new Map<string, { uid: string; at: number; apiKey: string }>();
   const modes = new Map<string, { mode: Mode; at: number; apiKey: string }>();
   const bindingKey = (binding: AccountBinding): string => `${accountKey(binding)}:${binding.credentialVersion}:${binding.accountMode}`;
@@ -224,6 +236,33 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
     }
   }
 
+  /**
+   * One exchangeInfo answer lists every contract, so one read serves all readable symbols and callers arriving while it
+   * is in flight wait for it. A symbol whose rules do not parse is not cached: its next read asks the venue again.
+   */
+  function loadRules(signal: AbortSignal): Promise<RuleCatalog> {
+    const flight = (async (): Promise<RuleCatalog> => {
+      const info = await publicRead('/fapi/v1/exchangeInfo', {}, signal, 16 * 1024 * 1024);
+      const expiresAt = now() + ruleTtlMs, loaded: RuleCatalog = { instruments: new Map(), failures: new Map() };
+      for (const symbol of VENUE_READ_SYMBOLS.binance) {
+        try {
+          const instrument = parseInstrument(info, symbol);
+          loaded.instruments.set(symbol, instrument);
+          rules.set(symbol, { instrument, expiresAt });
+        } catch (error) {
+          rules.delete(symbol);
+          loaded.failures.set(symbol, error);
+        }
+      }
+      return loaded;
+    })();
+    const current = { read: flight, owner: signal };
+    ruleFlight = current;
+    const clear = (): void => { if (ruleFlight === current) ruleFlight = null; };
+    flight.then(clear, clear);
+    return flight;
+  }
+
   function parseInstrument(info: unknown, symbol: string): Instrument {
     const matches = list(record(info, '合约目录').symbols, '合约目录').filter(row => (row as { symbol?: unknown })?.symbol === symbol);
     if (matches.length !== 1) throw new ShapeError(`合约目录里没有唯一的 ${symbol}`);
@@ -343,12 +382,22 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
 
     instrument: (symbol: string, { signal }: CallOptions) => reading(async () => {
       if (!VENUE_READ_SYMBOLS.binance.includes(symbol)) throw new VenueError('read-failed', `${symbol} 不在 Binance 可读合约内`);
-      const cached = rules.get(symbol), time = now();
-      if (cached && time >= cached.expiresAt - ruleTtlMs && time < cached.expiresAt) return { ...cached.instrument };
-      const info = await publicRead('/fapi/v1/exchangeInfo', {}, signal, 16 * 1024 * 1024);
-      const instrument = parseInstrument(info, symbol);
-      rules.set(symbol, { instrument, expiresAt: now() + ruleTtlMs });
-      return { ...instrument };
+      for (;;) {
+        const cached = rules.get(symbol), time = now();
+        if (cached && time >= cached.expiresAt - ruleTtlMs && time < cached.expiresAt) return { ...cached.instrument };
+        const joined = ruleFlight;
+        let loaded: RuleCatalog;
+        try { loaded = joined ? await untilAborted(joined.read, signal) : await loadRules(signal); }
+        catch (error) {
+          // The read died with the signal of the caller that started it: this one reads for itself. A refusal by the
+          // venue reaches every caller waiting for it, so a rate limit is not answered with more requests.
+          if (joined?.owner.aborted && !signal.aborted) continue;
+          throw error;
+        }
+        const failure = loaded.failures.get(symbol);
+        if (failure) throw failure;
+        return { ...loaded.instruments.get(symbol)! };
+      }
     }),
 
     quote: (symbol: string, { signal }: CallOptions) => reading(async () =>

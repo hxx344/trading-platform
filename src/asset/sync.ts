@@ -36,6 +36,7 @@ import { currentLedger } from './store.ts';
 import type { AsterAccountInput, ConnectionExchange, Credentials } from './validation.ts';
 import { mapConcurrent, settleIndependent } from './sources/concurrency.ts';
 import type { Fetcher } from './sources/http.ts';
+import { sharePublicReads } from './sources/shared-reads.ts';
 import type { Quote } from './sources/quotes.ts';
 import { quotes } from './sources/quotes.ts';
 import { syncBinance, syncBybit, type BinanceCredential, type BybitCredential } from './sources/exchanges.ts';
@@ -52,6 +53,8 @@ type Read = { total: number; details: Balance[] };
 type DatedRead = Read & { updatedAt: string };
 /** The external reads, as the workbench's lib modules export them. */
 export interface AssetSources {
+  /** Starts a sync round: public price reads asked for from here on are shared until the next round (sources/shared-reads.ts). */
+  beginRound?(): void;
   quotes(): Promise<Prices>;
   yuanQuote(now: number): Promise<{ rate: number; status: FxStatus }>;
   syncBinance(c: BinanceCredential, prices: Prices): Promise<Read>;
@@ -65,8 +68,12 @@ export interface AssetSources {
   syncRhLighter(c: RhLighterCredential): Promise<DatedRead>;
 }
 /** The copied readers over `fetcher`; Variational reads its portfolio through python3 (sources/variational-python.ts). */
-export function liveSources(fetcher: Fetcher = fetch): AssetSources {
+export function liveSources(source: Fetcher = fetch, shared = sharePublicReads(source)): AssetSources {
+  // One wrapper for the life of the store, the one its positions service also reads through: the Hyperliquid readers
+  // key their market and token-name caches by the fetcher they are given.
+  const { fetcher, reset } = shared;
   return {
+    beginRound: reset,
     quotes: () => quotes(fetcher),
     yuanQuote: now => yuanQuote(fetcher, now),
     syncBinance: (c, prices) => syncBinance(c, prices, fetcher),
@@ -245,6 +252,7 @@ export async function refresh(ctx: SyncContext, refreshPositions?: () => Promise
   if (last && ctx.now() - Number(last.value) < SYNC_THROTTLE_MS) return false;
   lease.write(() => saveSetting(database, 'last-attempt', String(ctx.now())));
   const stored = database.prepare('SELECT exchange,encrypted FROM connections').rows<Stored>();
+  sources.beginRound?.();
   // A source result is written only while its credential is still the one read here; the check shares the lease transaction.
   const sourceWrite = (row: Stored, statements: Run[]) => lease.write(() => {
     if (storedConnection(database, row.exchange)?.encrypted === row.encrypted) for (const run of statements) run();

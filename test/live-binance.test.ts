@@ -40,6 +40,56 @@ test('Binance 连接器：合约规则按目录解析（TRADIFI 永续、市价�
   await assert.rejects(connector.instrument('BTCUSDT', { signal: signal() }), kind('read-failed'));
 });
 
+test('Binance 连接器：合约目录一次读取供全部可读合约共用，并发读取合并成一次，过期后重读；读取失败与规则不完整不缓存', async () => {
+  const { venue, connector } = setup();
+  venue.info = [symbolInfo(), symbolInfo({ symbol: 'BZUSDT' }), symbolInfo({ symbol: 'SKHYNIXUSDT', status: 'SETTLING' })];
+  const [cl, bz, again] = await Promise.all([connector.instrument('CLUSDT', { signal: signal() }), connector.instrument('BZUSDT', { signal: signal() }), connector.instrument('CLUSDT', { signal: signal() })]);
+  assert.deepEqual([cl.symbol, bz.symbol, again], ['CLUSDT', 'BZUSDT', cl]);
+  assert.equal(venue.count('GET /fapi/v1/exchangeInfo'), 1);
+  // A symbol the same answer could not serve is asked again; the ones it served stay cached.
+  await assert.rejects(connector.instrument('SKHYNIXUSDT', { signal: signal() }), kind('read-failed'));
+  assert.equal(venue.count('GET /fapi/v1/exchangeInfo'), 2);
+  venue.info = [symbolInfo(), symbolInfo({ symbol: 'BZUSDT' }), symbolInfo({ symbol: 'SKHYNIXUSDT' })];
+  assert.equal((await connector.instrument('SKHYNIXUSDT', { signal: signal() })).symbol, 'SKHYNIXUSDT');
+  await connector.instrument('BZUSDT', { signal: signal() });
+  assert.equal(venue.count('GET /fapi/v1/exchangeInfo'), 3);
+  venue.clock += 60_000;
+  await Promise.all([connector.instrument('CLUSDT', { signal: signal() }), connector.instrument('BZUSDT', { signal: signal() })]);
+  assert.equal(venue.count('GET /fapi/v1/exchangeInfo'), 4);
+
+  // A failed read is not kept, and a caller that joined a read cancelled by its owner reads for itself.
+  venue.clock += 60_000;
+  venue.script('GET /fapi/v1/exchangeInfo', () => json({ code: -1003, msg: 'busy' }, 429));
+  await assert.rejects(connector.instrument('CLUSDT', { signal: signal() }), kind('read-failed'));
+  // A refusal reaches every caller that waited for the read; none of them asks again on its own.
+  venue.script('GET /fapi/v1/exchangeInfo', () => json({ code: -1003, msg: 'busy' }, 429));
+  const refused = await Promise.allSettled(['CLUSDT', 'BZUSDT', 'CLUSDT'].map(symbol => connector.instrument(symbol, { signal: signal() })));
+  assert.deepEqual(refused.map(result => result.status), ['rejected', 'rejected', 'rejected']);
+  assert.equal(venue.count('GET /fapi/v1/exchangeInfo'), 6);
+  const owner = new AbortController();
+  let release: (reply: Response) => void = () => undefined;
+  venue.script('GET /fapi/v1/exchangeInfo', () => new Promise<Response>(resolve => { release = resolve; }));
+  const first = connector.instrument('CLUSDT', { signal: owner.signal }), second = connector.instrument('BZUSDT', { signal: signal() });
+  await new Promise(resolve => setImmediate(resolve));
+  owner.abort();
+  await assert.rejects(first, kind('read-failed'));
+  assert.equal((await second).symbol, 'BZUSDT');
+  release(json({ symbols: [] }));
+  assert.equal(venue.count('GET /fapi/v1/exchangeInfo'), 8);
+
+  // A caller waiting on someone else's read still stops on its own signal.
+  venue.clock += 60_000;
+  venue.script('GET /fapi/v1/exchangeInfo', () => new Promise<Response>(resolve => { release = resolve; }));
+  const waiter = new AbortController();
+  const lead = connector.instrument('CLUSDT', { signal: signal() }), follow = connector.instrument('BZUSDT', { signal: waiter.signal });
+  await new Promise(resolve => setImmediate(resolve));
+  waiter.abort();
+  await assert.rejects(follow, kind('read-failed'));
+  release(json({ symbols: venue.info }));
+  assert.equal((await lead).symbol, 'CLUSDT');
+  assert.equal(venue.count('GET /fapi/v1/exchangeInfo'), 9);
+});
+
 test('Binance 连接器：盘口的接收时刻是本机收到应答的时刻，来源时间保留交易所时间', async () => {
   const { venue, connector } = setup();
   const quote = parseQuote(await connector.quote('CLUSDT', { signal: signal() }), 'binance', 'CLUSDT');

@@ -4,6 +4,7 @@ import { createPerpetualFeed } from '../monitor/perpetual-feed.ts';
 import { createMarketReaders } from '../monitor/market-readers.ts';
 import { OIL_CANDLE_WINDOW_MS, marketRead } from '../monitor/market-contract.ts';
 import { createExchangeReader } from '../monitor/exchanges.ts';
+import { createSharedMarketReads } from '../monitor/shared-reads.ts';
 import { perpetualQualityEnv } from '../monitor/quality-config.ts';
 import { createVariationalFetch } from '../monitor/variational-transport.ts';
 import type { PerpetualOptions } from '../monitor/perpetual.ts';
@@ -37,16 +38,18 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
 }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void; WebSocketImpl?: typeof WebSocket;
   perpetual?: PerpetualOptions; variationalFetch?: VariationalFetcher; env?: Record<string, string | undefined> } = {}): MarketOperations {
   const gate = createBinanceGate(), common = { now, ...(fetchImpl ? { fetchImpl } : {}) };
-  const readers = createMarketReaders({ ...common, gate });
-  const exchanges = createExchangeReader({ ...common, log, gate, oilQuote: () => null, hynixQuote: () => null, ...(WebSocketImpl ? { WebSocketImpl } : {}) });
   const feed = createPerpetualFeed({ ...common, log, ...options });
+  const stopped = new AbortController(), subscriptions = new Set<() => void>();
+  // The cards, the comparison and the collector live in this process, so they share what they would each read (monitor/shared-reads.ts).
+  const shared = createSharedMarketReads({ ...common, gate, quote: feed.quote, signal: stopped.signal });
+  const readers = createMarketReaders({ ...common, gate, shared });
+  const exchanges = createExchangeReader({ ...common, log, gate, shared, oilQuote: () => null, hynixQuote: () => null, ...(WebSocketImpl ? { WebSocketImpl } : {}) });
   const source = (fetcher = fetchImpl) => ({ clock: now, ...(fetcher ? { fetchImpl: fetcher } : {}) });
   const metric = createPerpetualMetricsReader(source(options.metrics?.fetchImpl));
   const funding = createPerpetualFundingReader({ ...source(options.fundingHistory?.fetchImpl), requestSpacingMs: 350 });
   const price = createPerpetualPriceReader({ ...source(options.priceHistory?.fetchImpl), requestSpacingMs: 350 });
   const aux = options.quality;
   const fundamentals = aux?.fundamentals ?? createFundamentalsClient({ ...source(aux?.fetchImpl), ...perpetualQualityEnv(env, log) });
-  const stopped = new AbortController(), subscriptions = new Set<() => void>();
   let execution: ReturnType<typeof createPerpetualExecutionService> | null = null;
 
   function roundTime(input: unknown): number {

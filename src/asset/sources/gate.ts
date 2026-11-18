@@ -1,9 +1,11 @@
 // Copied from project_aggregation modules/asset/lib/gate.ts at 0014655.
-// Changes: imports point at src/vendor and ../types.ts. Host, the 12 s timeout, body limits and balance logic are unchanged.
+// Changes: imports point at src/vendor and ../types.ts; the CoinGecko quote is asked at the address the other sources use
+// (./quotes.ts COINGECKO_QUOTES) so one sync shares the answer. Host, the 12 s timeout, body limits and balance logic are unchanged.
 // Error diagnostics differ from the workbench: SERVER_TIMEOUT and FAILED_RETRIEVE_ASSETS are listed, an unlisted label
 // that is a plain upper-case identifier is shown so it can be reported, and 5xx diagnostics without a listed label say to retry.
 import { gateAuthHeaders } from '../../vendor/gate.mjs';
 import type { Balance } from '../types.ts';
+import { COINGECKO_QUOTES } from './quotes.ts';
 import { ExchangeResponseError, readJsonResponse } from '../../vendor/response.mjs';
 
 export type GateCredential = { apiKey: string; apiSecret: string };
@@ -12,7 +14,7 @@ type Fetcher = typeof fetch;
 
 const BALANCE_PATH = '/api/v4/wallet/total_balance';
 const QUERY = 'currency=USDT';
-const COINGECKO = 'https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=usd&include_last_updated_at=true';
+const COINGECKO = COINGECKO_QUOTES;
 const COINBASE = 'https://api.coinbase.com/v2/exchange-rates?currency=USDT';
 const MAX_ACCOUNT_BYTES = 2 * 1024 * 1024;
 const QUOTE_FAILED = 'Gate USDT/USD 汇率读取失败或已过期；本次未更新资产数据';

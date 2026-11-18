@@ -150,6 +150,15 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
 - 未纳入：Variational 连接诊断（`/api/connections/variational-test`）、持仓与成交（A-5）、交易凭据导出与原表导入（A-6）。
 - **Gate 错误诊断（v0.29.1，与工作台不同）**：真实账户上 Gate 总资产接口返回过 HTTP 500 与本程序未收录的 `label`，页面只显示固定代号 `API_CODE_UNKNOWN`，看不出真实错误码。现在未收录的 `label` 只要是纯大写字母单词以下划线连接、3–40 个字符（密钥、签名、地址、网址与句子都不是这个形状），就原样显示在诊断里（如 `HTTP 500 · SOME_LABEL`）供反馈；其余形状仍只显示 `API_CODE_UNKNOWN`，`message` 等字段照旧不显示。补收录文档里的 `SERVER_TIMEOUT`、`FAILED_RETRIEVE_ASSETS`；5xx 的诊断加上“请稍后重试”。回滚 `sudo bash install.sh --version v0.29.0`，不用改配置。审查记录见 [reviews/2026-11-15-gate-unlisted-label.md](reviews/2026-11-15-gate-unlisted-label.md)。
 
+### 同步内共用公开价格（v0.68.0，R2）
+
+- 一轮同步里，多个数据源会各自读同一个公开价格地址：Gate、Hyperliquid、Variational 和行情各读一次 CoinGecko，汇率和行情回退各读一次 Coinbase，每个 Bybit 钱包按币种读现货价。`src/asset/sources/shared-reads.ts` 把这些读取合并：同一地址在一轮同步里只请求一次，同时到达的读取等同一个应答。
+- 只合并三类不带凭据的 GET：CoinGecko `simple/price`、Coinbase `exchange-rates`、Bybit 现货 `tickers`。带请求体、带 `accept` 以外请求头或不在清单里的请求照原样单独发出，所有签名请求都不经过共用。
+- 每轮同步开始时清空上一轮的应答；成功应答最多保留 30 秒，失败和非 2xx 应答不保留。应答超过 2 MB 时按失败处理。某个数据源超时或被取消只结束它自己的等待。
+- 三个数据源原来各带自己的 `ids=` 参数，现在统一用 `quotes.ts` 的 `COINGECKO_QUOTES`（VIRTUAL、USDT、USDC 三个币），各源只取自己需要的币，解析和失败回退不变。
+- Binance 持仓读取用的合约目录（10 分钟缓存）和 Aster 的 `exchangeInfo` 没有与执行器共用：它们在不同进程、用不同的解析和有效期。
+- 测试：`test/asset-shared-reads.test.ts`，以及 `test/asset-sources-{gate,hyperliquid,variational}.test.ts` 里更新后的地址。回退 v0.67.1 不用改配置或数据。
+
 ## A-5：持仓与成交（A04、A05）
 
 **范围**

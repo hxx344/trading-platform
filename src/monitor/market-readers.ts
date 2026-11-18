@@ -7,9 +7,12 @@ import { fetchHynixCandles, fetchHynixQuote } from '../vendor/hynix-market.mjs';
 import { fetchOilFunding, fetchHynixFunding } from '../vendor/settled-funding.mjs';
 
 import { boundedReply, BinanceCooldown } from './market-contract.ts';
+import { HYPERLIQUID_INFO, XYZ_CONTEXTS_BODY, type SharedMarketReads } from './shared-reads.ts';
 
 /** The workbench's limits (lib/exchange-service.ts parseBinanceQuote): a mark's source time near this clock, both legs close together. */
 const SOURCE_PAST_MS = 120_000, SOURCE_FUTURE_MS = 60_000, LEG_SKEW_MS = 15_000;
+/** The Anthropic quote is dated by the time it was asked for, so a shared xyz reply may be this old at most. */
+const ANTHROPIC_CONTEXTS_MAX_AGE_MS = 2_000;
 
 type Json = Record<string, unknown>;
 const record = (value: unknown): Json => { if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid Binance object'); return value as Json; };
@@ -51,12 +54,35 @@ export function parseOilQuote(brentTicker: unknown, wtiTicker: unknown, fundingI
   return validateMarket({ source: 'Binance', currency: 'USDT', fetchedAt: new Date(Math.min(...sources)).toISOString(), brent, wti });
 }
 
-export function createMarketReaders({ fetchImpl = fetch, now = Date.now, gate = createBinanceGate() }: {
+/** Ends this caller's wait on its own signal; the shared read goes on for the others. */
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const stop = (): void => reject(signal.reason);
+    if (signal.aborted) { work.catch(() => {}); return stop(); }
+    signal.addEventListener('abort', stop, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', stop));
+  });
+}
+
+export function createMarketReaders({ fetchImpl = fetch, now = Date.now, gate = createBinanceGate(), shared }: {
   fetchImpl?: AnthropicFetcher; now?: () => number; gate?: BinanceGate;
+  /** The market service's reads in common with the comparison and the collector (./shared-reads.ts); absent, every read is its own. */
+  shared?: SharedMarketReads;
 } = {}) {
   const rh = createRhLighterState();
-  const fetcher = (signal: AbortSignal): AnthropicFetcher => async (url, init) =>
-    boundedReply(await fetchImpl(url, { ...init, signal: init.signal ? AbortSignal.any([signal, init.signal]) : signal }));
+  const fetcher = (signal: AbortSignal): AnthropicFetcher => async (url, init) => {
+    if (shared && url === HYPERLIQUID_INFO && init.method === 'POST' && init.body === XYZ_CONTEXTS_BODY) {
+      // The Anthropic xyz leg and the comparison ask for the same reply; a refusal keeps its status for the leg's own handling.
+      const stop = init.signal ? AbortSignal.any([signal, init.signal]) : signal;
+      try { return Response.json((await untilAborted(shared.xyzContexts(ANTHROPIC_CONTEXTS_MAX_AGE_MS), stop)).reply); }
+      catch (error) {
+        const status = (error as { status?: unknown } | null)?.status;
+        if (typeof status === 'number' && status >= 400 && status <= 599) return new Response(null, { status });
+        throw error;
+      }
+    }
+    return boundedReply(await fetchImpl(url, { ...init, signal: init.signal ? AbortSignal.any([signal, init.signal]) : signal }));
+  };
   const oilFetcher = (signal: AbortSignal): AnthropicFetcher => {
     const read = fetcher(signal);
     return async (url, init) => {
@@ -70,6 +96,16 @@ export function createMarketReaders({ fetchImpl = fetch, now = Date.now, gate = 
   };
   async function oilQuote(signal: AbortSignal): Promise<OilMarket> {
     const options = { fetcher: oilFetcher(signal), timeout: 10_000 };
+    if (shared) {
+      // The funding terms stay optional, and marks the collector cannot vouch for are read from the venue as before.
+      const funding = shared.fundingInfo().catch(() => null), rows = shared.binanceMarks([ASSETS.brent.coin, ASSETS.wti.coin]);
+      if (rows) { try { return parseOilQuote(rows[0], rows[1], await funding, now()); } catch { /* read premiumIndex instead */ } }
+      const [brent, wti] = await Promise.all([
+        requestBinance('/fapi/v1/premiumIndex', { symbol: ASSETS.brent.coin }, options),
+        requestBinance('/fapi/v1/premiumIndex', { symbol: ASSETS.wti.coin }, options),
+      ]);
+      return parseOilQuote(brent, wti, await funding, now());
+    }
     const [brent, wti, funding] = await Promise.all([
       requestBinance('/fapi/v1/premiumIndex', { symbol: ASSETS.brent.coin }, options),
       requestBinance('/fapi/v1/premiumIndex', { symbol: ASSETS.wti.coin }, options),

@@ -6,7 +6,7 @@ import { readHyperliquidPositions, syncHyperliquid, HYPERLIQUID_ERRORS, NOTE_COI
 type RequestInfo = string | Request;
 
 const INFO = 'https://api.hyperliquid.xyz/info';
-const GECKO = 'https://api.coingecko.com/api/v3/simple/price?ids=usd-coin&vs_currencies=usd&include_last_updated_at=true';
+const GECKO = 'https://api.coingecko.com/api/v3/simple/price?ids=virtual-protocol,tether,usd-coin&vs_currencies=usd&include_last_updated_at=true';
 const COINBASE = 'https://api.coinbase.com/v2/exchange-rates?currency=USDC';
 const ADDRESS = '0x00000000000000000000000000000000000000Ab';
 const USER = ADDRESS.toLowerCase();

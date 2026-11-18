@@ -25,6 +25,7 @@ import type { HynixQuote } from '../vendor/hynix-market.mjs';
 import type { HynixQuoteView } from './hynix.ts';
 import type { OilQuoteView } from './oil.ts';
 import { boundedReply, BinanceCooldown } from './market-contract.ts';
+import type { SharedMarketReads } from './shared-reads.ts';
 import {
   VARIATIONAL_STATS, parseVariationalOilQuote, readVariationalAuthenticatedMarks, readVariationalPublicFunding, withVariationalFunding,
   type VariationalFetcher, type VariationalPublicFunding,
@@ -66,9 +67,11 @@ export function exchangeError(error: unknown): string {
 // JSON parse errors quote the reply, so only their name is logged.
 const detail = (error: unknown): string => error instanceof SyntaxError ? error.name : (error instanceof Error ? error.message : String(error)).slice(0, 200);
 
-export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSession, variationalFetch, remote, fetchImpl = fetch, now = Date.now, WebSocketImpl, log = line => process.stderr.write(`${line}\n`) }: {
+export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSession, variationalFetch, remote, shared: common, fetchImpl = fetch, now = Date.now, WebSocketImpl, log = line => process.stderr.write(`${line}\n`) }: {
   /** The Binance cooldown shared with the collectors: everything reads Binance from the same address. */
   gate: BinanceGate; remote?: RemoteComparison;
+  /** The market service's reads in common with the cards and the collector (./shared-reads.ts); absent, this reader keeps its own. */
+  shared?: SharedMarketReads;
   /** The collectors' current quotes (null when that market is not configured or has none yet). */
   oilQuote: () => OilQuoteView | null;
   hynixQuote: () => HynixQuoteView | null;
@@ -114,7 +117,7 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSe
   }
   const optional = <T>(read: Promise<T>): Promise<T | null> => read.catch(() => null);
 
-  const hyperliquidContexts = () => shared('hyperliquid/xyz', EXCHANGE_RESULT_TTL_MS, async () => ({
+  const hyperliquidContexts = () => common ? common.xyzContexts(EXCHANGE_RESULT_TTL_MS) : shared('hyperliquid/xyz', EXCHANGE_RESULT_TTL_MS, async () => ({
     reply: await request(HYPERLIQUID, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'metaAndAssetCtxs', dex: 'xyz' }) }),
     receivedAt: now(),
   }));
@@ -201,10 +204,14 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSe
           if (!quote) throw new ExchangeReadError('尚未取得原油报价，后台正在采集');
           return binanceOilExchangeQuote(quote, quote.status === 'snapshot');
         }
+        const fundingInfo = optional(common ? common.fundingInfo() : shared('binance/funding', FUNDING_TTL_MS, async () => { const reply = await request('https://fapi.binance.com/fapi/v1/fundingInfo'); if (!Array.isArray(reply)) throw new Error('Invalid fundingInfo'); return reply as unknown[]; }));
+        // Marks the spread collector received moments ago stand in for the two premiumIndex reads; otherwise read them.
+        const rows = common?.binanceMarks([contracts.left, contracts.right]);
+        if (rows) { try { return parseBinanceQuote(market, rows, await fundingInfo, now()); } catch { /* read premiumIndex instead */ } }
         const [left, right, funding] = await Promise.all([
           request(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${contracts.left}`),
           request(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${contracts.right}`),
-          optional(shared('binance/funding', FUNDING_TTL_MS, async () => { const reply = await request('https://fapi.binance.com/fapi/v1/fundingInfo'); if (!Array.isArray(reply)) throw new Error('Invalid fundingInfo'); return reply; })),
+          fundingInfo,
         ]);
         return parseBinanceQuote(market, [left, right], funding, now());
       }

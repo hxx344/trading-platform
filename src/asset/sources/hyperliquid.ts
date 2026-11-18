@@ -1,9 +1,11 @@
 // Copied from project_aggregation modules/asset/lib/hyperliquid.ts at 0014655.
-// Changes: imports point at ./concurrency.ts, src/vendor and ../types.ts. Logic, caches, the 12 s per-request timeout, the 40 s sync budget, limits and messages are unchanged.
+// Changes: imports point at ./concurrency.ts, src/vendor and ../types.ts; the CoinGecko quote is asked at the address the
+// other sources use (./quotes.ts COINGECKO_QUOTES) so one sync shares the answer. Logic, caches, the 12 s per-request timeout, the 40 s sync budget, limits and messages are unchanged.
 import type { Balance } from '../types.ts';
 import type { Position } from '../positions-types.ts';
 import { decimal as positionDecimal, isZero, optionalDecimal as optionalPositionDecimal, position, record, rows, text, uniquePositions } from '../positions-values.ts';
 import { mapConcurrent } from './concurrency.ts';
+import { COINGECKO_QUOTES } from './quotes.ts';
 import { ExchangeResponseError, readJsonResponse } from '../../vendor/response.mjs';
 
 export type HyperliquidCredential = { walletAddress: string };
@@ -13,7 +15,7 @@ type StaticMeta = { at: number; dexes: string[]; collateral: Map<string, number>
 type SpotMarket = { names: Map<number, string>; prices: Map<number, number> };
 
 const INFO_URL = 'https://api.hyperliquid.xyz/info';
-const COINGECKO = 'https://api.coingecko.com/api/v3/simple/price?ids=usd-coin&vs_currencies=usd&include_last_updated_at=true';
+const COINGECKO = COINGECKO_QUOTES;
 const COINBASE = 'https://api.coinbase.com/v2/exchange-rates?currency=USDC';
 const TIMEOUT_MS = 12_000;
 // One sync must finish well inside the page's 60-second request timeout, including the role check on connect.

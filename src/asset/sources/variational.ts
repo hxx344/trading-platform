@@ -1,8 +1,10 @@
 // Copied from project_aggregation modules/asset/lib/variational.ts at 0014655.
 // Changes: the diagnostic-only request headers (variationalRequestHeaders, GRID_USER_AGENT) are left out; the default
 // portfolio reader is ./variational-python.ts (the workbench's variational-python-client.ts, balance only); imports
-// point at src/vendor and ../types.ts. Pricing, the 12 s timeout, the 2 MB limit, conversion and messages are unchanged.
+// point at src/vendor and ../types.ts; the CoinGecko quote is asked at the address the other sources use (./quotes.ts
+// COINGECKO_QUOTES) so one sync shares the answer. Pricing, the 12 s timeout, the 2 MB limit, conversion and messages are unchanged.
 import type { Balance } from '../types.ts';
+import { COINGECKO_QUOTES } from './quotes.ts';
 import { readVariationalPythonBalance } from './variational-python.ts';
 import { validateVariationalCredential, variationalDecimal as decimal, VARIATIONAL_ERRORS } from './variational-shared.ts';
 import type { VariationalCredential } from './variational-shared.ts';
@@ -11,7 +13,7 @@ import { ExchangeResponseError, readJsonResponse } from '../../vendor/response.m
 export type { VariationalCredential } from './variational-shared.ts';
 export { hasValidVariationalBalance } from './variational-shared.ts';
 type Json = Record<string, unknown>;
-const COINGECKO = 'https://api.coingecko.com/api/v3/simple/price?ids=usd-coin&vs_currencies=usd&include_last_updated_at=true';
+const COINGECKO = COINGECKO_QUOTES;
 const COINBASE = 'https://api.coinbase.com/v2/exchange-rates?currency=USDC';
 const INVALID = VARIATIONAL_ERRORS.invalid_data;
 const FAILED = VARIATIONAL_ERRORS.network_error;

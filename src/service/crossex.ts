@@ -11,6 +11,8 @@ import { holdAccountLocks } from '../live/setup.ts';
 import type { FetchLike } from '../live/http.ts';
 import { describe, type LiveCredentials } from '../live/values.ts';
 import { openCrossexStore, type CrossexStore } from '../crossex/store.ts';
+import { createDisplayDepth, type DepthReader } from '../crossex/display-depth.ts';
+import { loadDepth, loadManualDepth } from '../vendor/crossex/clients.mjs';
 import { AppError } from '../vendor/crossex/model.mjs';
 import { createGateClient, type GateClientOptions } from '../vendor/crossex/live-client.mjs';
 import { createMarket, type CrossexMarket } from '../vendor/crossex/market.mjs';
@@ -164,9 +166,16 @@ export async function prepareCrossex(config: CrossexServiceConfig, credentials: 
       // host would not be seen by the lock, and its lease would be deleted here.
       if (store.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='live_owner'").get()) store.prepare('DELETE FROM live_owner').run();
       const remote = marketClient ? remoteCrossexReaders(marketClient) : undefined;
-      const market = parts.market = createMarket(store, { ...marketOptions, ...remote?.marketOptions });
+      // The capacity estimate and the terminal's book are display reads of the same depth and share it (crossex/display-depth.ts);
+      // previews and the checks before sending keep the market's own readers.
+      const marketReaders: Record<string, unknown> = { ...marketOptions, ...remote?.marketOptions }, terminalReaders: Record<string, unknown> = { ...terminalOptions, ...remote?.terminalOptions };
+      const display = createDisplayDepth(typeof marketReaders.clock === 'function' ? { now: marketReaders.clock as () => number } : {});
+      // The same default createMarket gives its manual reader.
+      const injected = marketReaders.depthReader;
+      const manualDepth = (marketReaders.manualDepthReader ?? (injected && injected !== loadDepth ? injected : loadManualDepth)) as DepthReader;
+      const market = parts.market = createMarket(store, { ...marketReaders, capacityDepthReader: display(manualDepth) });
       live = parts.live = createLiveRuntime(store, { ...liveOptions, market, clientFactory });
-      parts.terminal = createTerminalMarket({ ...terminalOptions, ...remote?.terminalOptions, market });
+      parts.terminal = createTerminalMarket({ ...terminalReaders, depthReader: display((terminalReaders.depthReader ?? loadManualDepth) as DepthReader), market });
     } catch (error) { throw new CrossexStartError('store', describe(error)); }
     let record = storedConnection(store);
     if (!record?.enabled || record.accountReference !== keyReference(secret.apiKey)) {

@@ -1,10 +1,13 @@
 // Copied from project_aggregation modules/asset/lib/exchanges.ts (Quote, coingeckoQuotes, quotes, usdPrice) at 0014655.
-// Changes: split out of exchanges.ts; readJson/finite come from ./http.ts. Logic, sources and messages are unchanged.
+// Changes: split out of exchanges.ts; readJson/finite come from ./http.ts; the CoinGecko address is exported for the other
+// sources. Logic, sources and messages are unchanged.
 import { finite, readJson, type Fetcher } from './http.ts';
 
 export type Quote = { price: number; at: string; source: string };
+/** One address for every source that prices through CoinGecko, so a sync shares a single answer (./shared-reads.ts). */
+export const COINGECKO_QUOTES = 'https://api.coingecko.com/api/v3/simple/price?ids=virtual-protocol,tether,usd-coin&vs_currencies=usd&include_last_updated_at=true';
 export async function coingeckoQuotes(fetcher: Fetcher = fetch): Promise<Record<string, Quote>> {
-  const data = await readJson('https://api.coingecko.com/api/v3/simple/price?ids=virtual-protocol,tether,usd-coin&vs_currencies=usd&include_last_updated_at=true', {}, fetcher);
+  const data = await readJson(COINGECKO_QUOTES, {}, fetcher);
   const result: Record<string, Quote> = {};
   for (const [symbol, id] of [['VIRTUAL','virtual-protocol'], ['USDT','tether'], ['USDC','usd-coin']]) {
     const item = data[id];

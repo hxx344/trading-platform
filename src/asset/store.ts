@@ -25,6 +25,7 @@ import { createFillsService, type FillsServiceOptions } from './fills-service.ts
 import type { HubPositions } from './positions-types.ts';
 import type { FillMarket, HubFills } from './fills-types.ts';
 import { liveSources, type AssetSources, type SyncContext } from './sync.ts';
+import { sharePublicReads } from './sources/shared-reads.ts';
 import type { Fetcher } from './sources/http.ts';
 import * as writes from './writes.ts';
 import { importSource, parseImportBody } from './source-import.ts';
@@ -180,9 +181,10 @@ export interface AssetStoreOptions {
   fills?: FillsServiceOptions;
 }
 export function createAssetStore(file: string, { now = Date.now, fetch: fetcher = fetch, sources: replaced = {}, positions: positionsOptions = {}, fills: fillsOptions = {} }: AssetStoreOptions = {}): AssetStore {
-  const sources: AssetSources = { ...liveSources(fetcher), ...replaced };
+  const shared = sharePublicReads(fetcher);
+  const sources: AssetSources = { ...liveSources(fetcher, shared), ...replaced };
   const vault = dataDirVault(dirname(file));
-  const positionsService = createPositionsService({ now, fetcher, ...positionsOptions });
+  const positionsService = createPositionsService({ now, fetcher: shared.fetcher, ...positionsOptions });
   const fillsService = createFillsService({ now, fetcher, ...fillsOptions });
   // Other ledger writes only peek. An asset sync refreshes the same cache alongside balance reads.
   const context = (database: AssetDb, lease: SyncLease): SyncContext => ({ database, lease, vault, sources, now, positions: positionsService.peek });

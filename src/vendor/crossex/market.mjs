@@ -1,4 +1,5 @@
-// Workbench CrossEx market (7745181), with local imports and a send-time guard for revalidated depth.
+// Workbench CrossEx market (7745181), with local imports, a send-time guard for revalidated depth, and a separate depth
+// reader for the open-capacity estimate (a display read the service lets share depth with the terminal).
 import { createHash } from 'node:crypto';
 import { AppError, defaults, configuration, validateFeed, validSignal, validManualPair, pairKey, quoteKey, contractIdentity,
   freshQuote, quoteTime, catalogRule, manualCatalogRule, displayCatalogRule, validateBooks, fxRate, referencePrice, settlement, SUPPORTED_VENUES, transferEligibility } from './model.mjs';
@@ -119,7 +120,8 @@ function budgetValue(leg, latestPrice, fx, now, budget) {
 export function createMarket(store, { catalogReader = loadCatalog, feedReader = loadFeed, depthReader = loadDepth,
   fxReader = loadFx, identityReader = resolveCrossexQuote,
   manualIdentityReader = identityReader === resolveCrossexQuote ? resolveManualQuote : identityReader,
-  manualDepthReader = depthReader === loadDepth ? loadManualDepth : depthReader, currentFundingReader = loadCurrentFunding, clock = Date.now } = {}) {
+  manualDepthReader = depthReader === loadDepth ? loadManualDepth : depthReader, capacityDepthReader = manualDepthReader,
+  currentFundingReader = loadCurrentFunding, clock = Date.now } = {}) {
   let feed = null, sourceError = '等待首次读取价差服务', sourceCheckedAt = null, sourceReceivedAt = null, sourceDurationMs = null;
   let catalog = store.get('catalog', { at: 0, items: [] }), catalogError = null, catalogAttempt = -Infinity;
   let sourceFlight = null, catalogFlight = null, generation = 0, stopping = false;
@@ -357,7 +359,7 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     const c = config(), marketRevision = revision();
     const resolved = await Promise.all(request.requests.map(r => resolveSymbol(r.symbol)));
     if (request.source === 'pair' && !validManualPair(resolved[0].quote, resolved[1].quote)) throw new AppError('双腿须为身份可比、同一基础币的不同交易所加密合约');
-    const { books, fx } = await booksAndFx(resolved.map(r => r.quote), true, manualDepthReader);
+    const { books, fx } = await booksAndFx(resolved.map(r => r.quote), true, capacityDepthReader);
     if (marketRevision !== revision()) throw new AppError('设置已变化，请重新读取开仓容量', 409);
     const notes = [...new Set(resolved.flatMap(r => r.rule.unverifiedConstraints))];
     let expiresAt = Math.min(catalog.at + 900000, ...books.map(b => b.at + 10000)), sourceAt = Math.min(...books.map(b => b.at));

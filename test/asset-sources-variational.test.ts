@@ -25,7 +25,7 @@ function fixture(balance: unknown = '125', options: { price?: number; quoteAt?: 
     assert.deepEqual(Object.fromEntries(new Headers(init.headers)), { accept: 'application/json' });
     assert.equal(JSON.stringify(init).includes(credential.vrToken), false);
     if (url.hostname === 'api.coingecko.com') {
-      assert.equal(url.href, 'https://api.coingecko.com/api/v3/simple/price?ids=usd-coin&vs_currencies=usd&include_last_updated_at=true');
+      assert.equal(url.href, 'https://api.coingecko.com/api/v3/simple/price?ids=virtual-protocol,tether,usd-coin&vs_currencies=usd&include_last_updated_at=true');
       return options.primaryFailure ? new Response('', { status: 503 }) : Response.json({ 'usd-coin': { usd: options.price ?? 0.99, last_updated_at: (options.quoteAt ?? Math.floor(Date.now() / 1000) * 1000) / 1000 } });
     }
     assert.equal(url.href, 'https://api.coinbase.com/v2/exchange-rates?currency=USDC');

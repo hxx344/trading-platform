@@ -301,7 +301,7 @@ test('Bitget 下一页在途时关闭行情服务，已确认的上一页留在�
   const config = parseServiceConfig({ secretsFile: '/secrets', monitor: { perpetual: {} } }).monitor!;
   const runtime = openMonitor(config, dir, { marketClient: instrumented, now, log: quiet }), collector = runtime.perpetual!;
   const pair = { base: 'BZ', longKey: 'bitget:BZUSDT', shortKey: 'binance:BZUSDT' };
-  const saved = () => runtime.perpetualCache!.loadFundingHistory(pair.longKey)[0]?.value as { records: { time: number }[]; coverage: { from: number; to: number } } | undefined;
+  const saved = () => runtime.perpetualCache!.loadFundingHistory(pair.longKey)[0]?.value as { status: string; records: { time: number }[]; coverage: { from: number; to: number } } | undefined;
   async function quotes() {
     await until(() => !!source.active('binance') && !!source.active('bitget'));
     for (const exchange of ['binance', 'bitget']) source.active(exchange)!.tick({ exchange, base: 'BZ', symbol: 'BZUSDT', bid: 74, ask: 75, sourceTime: now() });
@@ -311,7 +311,7 @@ test('Bitget 下一页在途时关闭行情服务，已确认的上一页留在�
     collector.start(); await quotes(); await collector.fundingHistory({ pairs: [pair] });
     await until(() => waiting); const edge = endOfData - 99 * HOUR;
     assert.deepEqual([saved()?.records.length, saved()?.coverage.from], [100, edge]);
-    daemon.close(); await until(() => !client.epoch());
+    daemon.close(); await until(() => !client.epoch() && saved()?.status === 'error');
     assert.equal(saved()?.coverage.from, edge);
     blockSecond = false; at += 6 * 60_000; inputs.length = 0;
     daemon = await listen(path, settings); await until(() => !!client.epoch()); await quotes();

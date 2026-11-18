@@ -1,6 +1,6 @@
 // 复制自 project-aggregation 工作台 modules/monitor/lib/exchange-funding-cex.ts（提交 c84ba27；改名表明只供合约价差的资金费历史用，
 // M-2d 的 exchange-funding-history.mjs 另有一份去掉了 Aster、Bitget USDC、合约白名单与进度回调的改写），只改导入路径。
-import { collectBitgetPages, type BitgetCursor, type BitgetFundingPage } from './perpetual-funding-pages.ts';
+import { MAX_FUNDING_PAGES, collectBitgetPages, type BitgetCursor, type BitgetFundingPage } from './perpetual-funding-pages.ts';
 import { HISTORY_WINDOW_MS, type FundingHistoryRange, type SettledFundingRecord } from './exchange-funding-history.mjs';
 
 export type CexFundingExchange = 'binance' | 'bybit' | 'okx' | 'bitget' | 'aster';
@@ -15,7 +15,6 @@ type ReaderOptions = {
   onProgress?: (progress: { coverage: FundingHistoryRange; records: SettledFundingRecord[] }) => void;
 };
 const PAGE_SIZES: Record<CexFundingExchange, number> = { binance: 1000, bybit: 200, okx: 400, bitget: 100, aster: 1000 };
-const MAX_PAGES = 32;
 const symbols: Record<CexFundingExchange, readonly string[]> = {
   binance: ['BZUSDT', 'CLUSDT', 'SKHYUSDT', 'SKHYNIXUSDT'],
   bybit: ['BZUSDT', 'CLUSDT', 'SKHYUSDT', 'SKHYNIXUSDT'],
@@ -91,7 +90,7 @@ function parseFundingPage(exchange: CexFundingExchange, symbol: string, input: u
 /** Bitget has numbered pages, without a time cursor. The next cursor is issued only after checking strict backwards progress. */
 export async function readBitgetFundingPage(request: ReaderOptions['request'], symbol: string, productType: string, range: FundingHistoryRange, now: number, cursor: BitgetCursor | null): Promise<BitgetFundingPage> {
   const page = cursor?.page ?? 1, size = PAGE_SIZES.bitget;
-  if (!Number.isInteger(page) || page > MAX_PAGES) throw new Error('CEX funding history pagination exceeded page limit');
+  if (!Number.isInteger(page) || page > MAX_FUNDING_PAGES) throw new Error('CEX funding history pagination exceeded page limit');
   if (cursor && (page < 2 || !Number.isSafeInteger(cursor.before) || cursor.before < 1e12)) throw new Error('Invalid Bitget funding page cursor');
   if (!['USDT-FUTURES', 'USDC-FUTURES'].includes(productType)) throw new Error('Invalid Bitget funding product type');
   const url = new URL('https://api.bitget.com/api/v2/mix/market/history-fund-rate');
@@ -117,7 +116,7 @@ export function createCexFundingHistoryReader({ request, clock = Date.now, contr
     const forward = exchange === 'binance' || exchange === 'aster';
     let cursor = forward ? from : exchange === 'okx' ? to + 1 : to;
     let previousOldest = Infinity;
-    for (let page = 1; page <= MAX_PAGES; page++) {
+    for (let page = 1; page <= MAX_FUNDING_PAGES; page++) {
       let url: URL;
       if (forward) {
         // Binance and Aster return the earliest results from an inclusive startTime.
@@ -147,7 +146,7 @@ export function createCexFundingHistoryReader({ request, clock = Date.now, contr
         throw new Error('CEX funding history pagination did not advance');
       }
       if (rawCount < pageSize || (forward ? newest >= to : oldest <= from)) break;
-      if (page === MAX_PAGES) throw new Error('CEX funding history pagination exceeded page limit');
+      if (page === MAX_FUNDING_PAGES) throw new Error('CEX funding history pagination exceeded page limit');
       previousOldest = oldest;
       cursor = forward ? newest + 1 : exchange === 'okx' ? oldest : oldest - 1;
     }

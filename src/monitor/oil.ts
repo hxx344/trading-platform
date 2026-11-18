@@ -63,7 +63,7 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
   // The stored rows could not be read back: the next successful round rewrites the table instead of adding to it.
   let replaceCandles = false;
   // Until this time, rounds read on from the last day only; the first round after a start reads every gap.
-  let gapRetryAt = 0, resumeAt: number | null = null;
+  let gapRetryAt = 0, checkedThrough = 0, resumeAt: number | null = null;
   // Pre-listing windows may be empty or contain just one leg. Keep these rows until a paired chart can be projected.
   let candleRows: OilCandleRow[] = [];
   const chart = (rows: OilCandleRow[], stamp: string) => rows.some(row => row.brent !== null && row.wti !== null) ? createIntradaySnapshot(rows, stamp) : null;
@@ -82,6 +82,7 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
       const cursor = state.resumeAt;
       if (cursor != null && (!Number.isSafeInteger(cursor) || cursor % OIL_CANDLE_MS !== 0 || cursor < 0 || cursor > Date.parse(state.fetchedAt))) throw new Error('K 线回补进度无效');
       candles = chart(checked, state.fetchedAt); candleRows = checked; resumeAt = cursor ?? null; candlesRestored = true;
+      checkedThrough = resumeAt ?? Math.floor(Date.parse(state.fetchedAt) / OIL_CANDLE_MS) * OIL_CANDLE_MS;
     }
   } catch (error) { replaceCandles = true; log(`原油 K 线历史无法读回，将从 2026-04-01 重新回补：${detail(error)}`); }
 
@@ -123,7 +124,7 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
     const at = now();
     candleAttemptAt = at;
     const cutoff = at - OIL_RETENTION_DAYS * DAY_MS;
-    const full = !candles || at >= gapRetryAt;
+    const full = at >= gapRetryAt;
     let history = candleRows;
     if (!full && history.length) {
       const from = history.at(-1)!.time - RESUME_MS;
@@ -131,7 +132,10 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
       if (firstPair > 0) history = history.slice(firstPair);
     }
     const target = Math.floor(at / OIL_CANDLE_MS) * OIL_CANDLE_MS, stamp = new Date(at).toISOString();
-    let start = Math.max(resumeAt ?? oilCandleStart(history), Math.ceil(cutoff / OIL_CANDLE_MS) * OIL_CANDLE_MS);
+    let suggested = oilCandleStart(history);
+    if (!full && (!candles || (history.at(-1)?.time ?? 0) < checkedThrough - RESUME_MS)) suggested = Math.max(suggested, checkedThrough - RESUME_MS);
+    let start = Math.max(resumeAt ?? suggested, Math.ceil(cutoff / OIL_CANDLE_MS) * OIL_CANDLE_MS);
+    let sawBrent = false, sawWti = false;
     while (start < target && !stopping.signal.aborted) {
       const end = Math.min(start + OIL_CANDLE_WINDOW_MS, target);
       let next: OilCandleRow[], projection: OilIntraday | null, changed: OilCandleRow[];
@@ -140,6 +144,7 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
         if (stopping.signal.aborted) return;
         const incoming = validateOilCandleRows(batch, new Date(end).toISOString());
         if (incoming.some(row => row.time < start)) throw new Error('原油 K 线超出本轮范围');
+        sawBrent ||= incoming.some(row => row.brent !== null); sawWti ||= incoming.some(row => row.wti !== null);
         next = mergeOilCandleRows(candleRows, incoming).filter(row => row.time >= cutoff);
         projection = chart(next, stamp);
         const previous = new Map(candleRows.map(row => [row.time, row]));
@@ -161,7 +166,8 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
         candleError = 'K 线保存失败：monitor.sqlite 写入失败';
         candleSave.failed('monitor.sqlite 写入失败', detail(error)); return;
       }
-      resumeAt = cursor; candleRows = next; candles = projection; candlesRestored = cursor !== null;
+      resumeAt = cursor; checkedThrough = end; candleRows = next; candles = projection;
+      candlesRestored = cursor !== null || !sawBrent || !sawWti;
       replaceCandles = false; start = end; candleError = null;
     }
     if (stopping.signal.aborted) return;

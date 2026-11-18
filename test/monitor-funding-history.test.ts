@@ -16,7 +16,7 @@ import {
 import { createBinanceGate } from '../src/vendor/anthropic-market.mjs';
 import { FUNDING_HISTORY_DEADLINE_MS, FUNDING_HISTORY_SNAPSHOT_MS, createExchangeReader } from '../src/monitor/exchanges.ts';
 import { parseServiceConfig } from '../src/service/config.ts';
-import { monitorViews, openMonitor, stopMonitor } from '../src/service/monitor.ts';
+import { closeMonitor, monitorViews, openMonitor, stopMonitor } from '../src/service/monitor.ts';
 import { createExecutorServer } from '../src/http.ts';
 import { createHarness } from './harness.ts';
 import { SETTLE_HOURS, fakeAnthropicVenues, venueSettledRate } from './monitor-fake.ts';
@@ -321,7 +321,7 @@ test('接口：未配置的市场与不支持的交易所 404；读取失败 503
   } finally {
     await new Promise(resolve => server.close(resolve));
     h.dispose();
-    stopMonitor(runtime);
+    stopMonitor(runtime); closeMonitor(runtime);
     rmSync(dir, { recursive: true, force: true });
   }
 });

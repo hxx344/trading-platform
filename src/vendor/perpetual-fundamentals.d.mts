@@ -10,6 +10,7 @@ export interface FundamentalsClient {
   /** Fetches the markets of the bases whose cache expired; rejects with `status` (and `retryAfter`) on an HTTP refusal. */
   refresh(bases: string[], options?: { signal?: AbortSignal }): Promise<unknown>;
   get(base: string): TokenFundamentals | null | undefined;
+  expiresAt?(base: string): number | null;
   describe(base: string): FundamentalsDescription;
 }
 export interface FundamentalsClientOptions {

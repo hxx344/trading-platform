@@ -18,6 +18,8 @@ import type { RuleExecutor } from '../oil/rule-live.ts';
 import type { PushedBooks } from '../oil/pushed.ts';
 import { ContractError } from '../contracts.ts';
 import { join } from 'node:path';
+import type { MarketClient } from '../market/ipc.ts';
+import { useMarketBooks } from './market-books.ts';
 import type { OilConfig } from './oil-config.ts';
 
 /** The shortest gap between two book rounds, so a round that took its whole timeout does not start the next at once. */
@@ -37,14 +39,15 @@ export interface OilRuntime {
  * runs their start checks (preflightLive: one signed read set per account, 30 s timeout each, no retry). Any failure
  * releases the locks and throws, which refuses start.
  */
-export async function prepareOil(config: OilConfig, keys: Map<Venue, LiveCredentials> | undefined, { fetchImpl, now = Date.now, preflightTimeoutMs, pushed }: { fetchImpl?: FetchLike; now?: () => number; preflightTimeoutMs?: number; pushed?: PushedBooks } = {}): Promise<OilRuntime> {
+export async function prepareOil(config: OilConfig, keys: Map<Venue, LiveCredentials> | undefined, { fetchImpl, now = Date.now, preflightTimeoutMs, pushed, marketClient }: { fetchImpl?: FetchLike; now?: () => number; preflightTimeoutMs?: number; pushed?: PushedBooks; marketClient?: MarketClient } = {}): Promise<OilRuntime> {
   if (!keys) throw new Error('配置了 oil，但密钥文件里没有对应交易所的密钥');
   const locks = await holdAccountLocks(config.accounts);
   try {
     const venues = new Set(config.accounts.map(account => account.venue));
     const connectors = createLiveConnectors(config, keys, { ...(fetchImpl ? { fetchImpl } : {}), now }).filter(connector => venues.has(connector.venue));
+    if (marketClient) for (const connector of connectors) useMarketBooks(connector, marketClient);
     await preflightLive(config, connectors, ...(preflightTimeoutMs === undefined ? [] : [preflightTimeoutMs]));
-    const books = { connectors, accounts: config.accounts, now, ...(pushed ? { pushed } : {}) };
+    const books = { connectors, accounts: config.accounts, now, ...(pushed ? { pushed } : {}), ...(marketClient ? { marketEpoch: () => marketClient.epoch() } : {}) };
     return { config, connectors, market: createOilMarket(books), hynix: createHynixMarket(books), locks };
   } catch (error) { locks.release(); throw new Error(`原油执行账户启动检查未通过，拒绝启动：${error instanceof Error ? error.message : String(error)}`); }
 }

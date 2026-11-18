@@ -4,7 +4,8 @@
 // O7: a leg whose book the market monitor's collector pushed within the last round is taken from there (src/oil/pushed.ts);
 // the other legs are read over REST as before. Each book says which (`source`).
 import { sub } from '../decimal.ts';
-import { OIL_SYMBOLS, VENUES, VENUE_NAMES, accountKey, parseAccountSnapshot, parseQuote, positionOf, type AccountBinding, type Venue } from '../contracts.ts';
+import { OIL_SYMBOLS, VENUES, VENUE_NAMES, accountKey, checkQuoteFresh, parseAccountSnapshot, parseQuote, positionOf, type AccountBinding, type Venue } from '../contracts.ts';
+import { QUOTE_FUTURE_MS, QUOTE_MAX_AGE_MS } from './rules.ts';
 import type { VenueConnector } from '../connector.ts';
 import type { PushedBook, PushedBooks } from './pushed.ts';
 
@@ -18,7 +19,7 @@ export const POSITIONS_TIMEOUT_MS = 10_000;
 const BZ = 'BZUSDT', CL = 'CLUSDT';
 /** `receivedAt` is this host's receive time for a REST read and the venue's book time for a pushed one (`source`). */
 export type BookSource = 'pushed' | 'rest';
-export interface BookSlot { bid: string | null; ask: string | null; receivedAt: number | null; source: BookSource | null; failedAt: number | null; error: string | null }
+export interface BookSlot { bid: string | null; ask: string | null; receivedAt: number | null; sourceAt?: number; source: BookSource | null; failedAt: number | null; error: string | null }
 interface PositionSlot { long: Record<string, string> | null; short: Record<string, string> | null; openOrders: number | null; receivedAt: number | null; failedAt: number | null; error: string | null }
 
 const message = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 160);
@@ -41,6 +42,7 @@ export interface OilMarketOptions {
   positionsTimeoutMs?: number;
   /** O7: the market monitor's pushed books; without it (or without a usable book for a leg) every leg is read over REST. */
   pushed?: PushedBooks;
+  marketEpoch?: () => string | null;
 }
 
 export interface MarketReaderOptions extends OilMarketOptions { symbols: readonly string[] }
@@ -49,13 +51,23 @@ export interface MarketReaderOptions extends OilMarketOptions { symbols: readonl
  * The books of these contracts on each configured venue and the accounts' positions in them, read on demand; a failed read
  * keeps the last good value. The oil and hynix views build their spreads on it.
  */
-export function createMarketReader({ connectors, accounts, symbols, now = Date.now, quoteTimeoutMs = MARKET_TIMEOUT_MS, positionsTimeoutMs = POSITIONS_TIMEOUT_MS, pushed }: MarketReaderOptions) {
+export function createMarketReader({ connectors, accounts, symbols, now = Date.now, quoteTimeoutMs = MARKET_TIMEOUT_MS, positionsTimeoutMs = POSITIONS_TIMEOUT_MS, pushed, marketEpoch }: MarketReaderOptions) {
   const venues = connectors.map(connector => connector.venue);
   const books = new Map<string, BookSlot>();
+  const epochs = new WeakMap<BookSlot, string>();
+  const pushedFor = (venue: Venue, symbol: string): PushedBook | null => {
+    try { return pushed?.(venue, symbol) ?? null; } catch { return null; }
+  };
   const slot = (venue: Venue, symbol: string): BookSlot => {
     const key = `${venue}:${symbol}`;
     let found = books.get(key);
     if (!found) { found = { bid: null, ask: null, receivedAt: null, source: null, failedAt: null, error: null }; books.set(key, found); }
+    if (marketEpoch && found.receivedAt !== null && !found.error) {
+      const epoch = marketEpoch();
+      if (!epoch || epochs.get(found) !== epoch || (found.source === 'pushed' && !pushedFor(venue, symbol))) {
+        found.error = '原盘口来源已失效，等待新盘口';
+      }
+    }
     return found;
   };
   const positions = new Map<string, PositionSlot>(accounts.map(account => [accountKey(account), { long: null, short: null, openOrders: null, receivedAt: null, failedAt: null, error: null }]));
@@ -68,16 +80,23 @@ export function createMarketReader({ connectors, accounts, symbols, now = Date.n
       // read may have landed after the venue time of the pushed book), and the page reads a failure as failedAt > receivedAt.
       // A failing lookup counts as no pushed book. A failed REST read is dated when it started: a read that times out lands
       // MARKET_TIMEOUT_MS later, and dating it then would leave a pushed book only the half-second gap before the next round.
-      let book: PushedBook | null = null;
-      try { book = pushed?.(connector.venue, symbol) ?? null; } catch { book = null; }
-      if (book && book.at >= Math.max(target.receivedAt ?? -Infinity, target.failedAt ?? -Infinity)) {
-        Object.assign(target, { bid: book.bid, ask: book.ask, receivedAt: book.at, source: 'pushed', error: null });
+      const book = pushedFor(connector.venue, symbol);
+      const epoch = marketEpoch?.();
+      if (book && (!marketEpoch || epoch) && book.at >= Math.max(target.receivedAt ?? -Infinity, target.failedAt ?? -Infinity)) {
+        if (epoch) epochs.set(target, epoch);
+        Object.assign(target, { bid: book.bid, ask: book.ask, receivedAt: book.at, sourceAt: book.at, source: 'pushed', error: null });
         return;
       }
       const startedAt = now();
       try {
         const quote = parseQuote(await bounded(signal => connector.quote(symbol, { signal }), quoteTimeoutMs), connector.venue, symbol);
-        Object.assign(target, { bid: quote.bid, ask: quote.ask, receivedAt: quote.receivedAt, source: 'rest', error: null });
+        checkQuoteFresh(quote, now(), QUOTE_MAX_AGE_MS, QUOTE_FUTURE_MS);
+        if (connector.quoteCurrent?.(quote) === false) throw new Error('行情连接已切换，等待新盘口');
+        const at = Math.min(quote.sourceTime ?? quote.receivedAt, quote.receivedAt);
+        if (at < (target.sourceAt ?? target.receivedAt ?? -Infinity)) throw new Error('交易所返回了更早的盘口');
+        const freshEpoch = marketEpoch?.();
+        if (freshEpoch) epochs.set(target, freshEpoch);
+        Object.assign(target, { bid: quote.bid, ask: quote.ask, receivedAt: quote.receivedAt, sourceAt: at, source: 'rest', error: null });
       } catch (error) { Object.assign(target, { failedAt: startedAt, error: message(error) }); }
     })));
     quotesReadAt = now();

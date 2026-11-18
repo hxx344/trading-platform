@@ -125,7 +125,7 @@ export async function followOrder(client: OptionsClient, spec: OrderSpec, hooks:
         if (!attempted) {
           attempted = true;
           try {
-            const answer = await client.create({ symbol: spec.symbol, side: spec.side, qty: spec.qty, price, link: spec.link, reduceOnly: spec.reduceOnly }, AbortSignal.timeout(CALL_MS));
+            const answer = await client.create({ symbol: spec.symbol, side: spec.side, qty: spec.qty, price, link: spec.link, reduceOnly: spec.reduceOnly }, AbortSignal.timeout(CALL_MS), () => { if (ticker) client.publicAt?.(ticker); });
             if (typeof answer.orderId === 'string') outcome.orderId = answer.orderId;
           } catch (error) {
             // A refusal, or a request that never left, proves no order exists to reconcile.
@@ -137,7 +137,7 @@ export async function followOrder(client: OptionsClient, spec: OrderSpec, hooks:
           hooks.record(outcome);
           hooks.checkStop();
         } else if (price !== lastPrice) {
-          await client.amend(spec.symbol, spec.link, price, AbortSignal.timeout(CALL_MS));
+          await client.amend(spec.symbol, spec.link, price, AbortSignal.timeout(CALL_MS), () => { if (ticker) client.publicAt?.(ticker); });
           lastPrice = price;
           outcome.price = price;
           hooks.checkStop();
@@ -182,7 +182,7 @@ export async function iocOrder(client: OptionsClient, spec: OrderSpec, hooks: Io
       // Set before the create is awaited: a lost answer can hide an accepted order.
       attempted = true;
       try {
-        const answer = await client.create({ symbol: spec.symbol, side: spec.side, qty: spec.qty, price, link: spec.link, reduceOnly: spec.reduceOnly, timeInForce: 'IOC' }, AbortSignal.timeout(CALL_MS));
+        const answer = await client.create({ symbol: spec.symbol, side: spec.side, qty: spec.qty, price, link: spec.link, reduceOnly: spec.reduceOnly, timeInForce: 'IOC' }, AbortSignal.timeout(CALL_MS), () => { if (ticker) client.publicAt?.(ticker); });
         if (typeof answer.orderId === 'string') outcome.orderId = answer.orderId;
       } catch (error) {
         if (error instanceof VenueError && (error.kind === 'rejected' || error.kind === 'not-sent')) attempted = false;

@@ -245,6 +245,18 @@ test('CrossEx books and mark prices remain usable when native identity and histo
   assert.equal(value.status, 'stale'); assert.equal(value.ticker.markPrice, null);
 });
 
+test('disconnect clears the terminal cache and a late message from the old socket cannot restore a live price', async t => {
+  const f = terminalFixture({ resolve: async () => { throw new AppError('原生合约暂未确认'); } });
+  t.after(() => f.service.stop()); await f.service.read(SYMBOL);
+  const socket = f.Socket.instances[0];
+  const tick = { s: SYMBOL, ts: NOW, bp: '100', ap: '101', lp: '100.5' };
+  frame(socket, 'ticker', tick);
+  assert.equal((await f.service.read(SYMBOL)).ticker.bidPrice, '100');
+  socket.close(); frame(socket, 'ticker', { ...tick, bp: '99' });
+  const after = await f.service.read(SYMBOL);
+  assert.equal(after.ticker.bidPrice, null); assert.equal(after.status, 'unavailable'); assert.equal(after.asOf, null);
+});
+
 test('native quantity confirmation converts cached raw books and prints together without mixing units', async t => {
   const symbol = 'GATE_FUTURE_ETH_USDT'; let available = false;
   const f = terminalFixture({ resolve: async () => { if (!available) throw new AppError('暂未确认单位'); return { quote: { ...quote('gate', 'ETH'), nativeUnit: '0.01' }, rule: {} }; } }); t.after(() => f.service.stop());

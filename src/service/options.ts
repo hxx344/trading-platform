@@ -1,3 +1,4 @@
+import type { MarketClient } from '../market/ipc.ts';
 // The options module inside the service (docs/options.md §3): started only when config.json has `options`; without it
 // the service runs exactly as before. Before anything is opened the Bybit account is locked on this host and its key
 // passes the start check (read-write, IP bound, options trading on, nothing else risky; unified account; UID as
@@ -83,13 +84,13 @@ export async function preflightOptions(client: OptionsClient, config: OptionsCon
  * Locks pa-options/bybit/<UID>, runs the start check (30 s, no retry; `signal` gives up at once) and opens options.sqlite.
  * Any failure releases the lock and throws an OptionsStartError.
  */
-export async function prepareOptions(config: OptionsConfig, credentials: LiveCredentials | undefined, dir: string, { fetchImpl, now = Date.now, preflightTimeoutMs, host, signal }: { fetchImpl?: FetchLike; now?: () => number; preflightTimeoutMs?: number; host?: string; signal?: AbortSignal } = {}): Promise<OptionsRuntime> {
+export async function prepareOptions(config: OptionsConfig, credentials: LiveCredentials | undefined, dir: string, { fetchImpl, now = Date.now, preflightTimeoutMs, host, signal, marketClient }: { marketClient?: MarketClient; fetchImpl?: FetchLike; now?: () => number; preflightTimeoutMs?: number; host?: string; signal?: AbortSignal } = {}): Promise<OptionsRuntime> {
   if (!credentials) throw new Error('配置了 options，但密钥文件里没有 bybitOptions');
   let locks: { release(): void };
   try { locks = await holdAccountLocks([{ venue: 'bybit', accountId: config.accountId }], 'pa-options'); }
   catch (error) { throw new OptionsStartError(describe(error).includes('已被本机另一个实盘执行器占用') ? 'locked' : 'other', describe(error)); }
   try {
-    const client = createOptionsClient({ credentials, now, ...(fetchImpl ? { fetchImpl } : {}), ...(host ? { host } : {}) });
+    const client = createOptionsClient({ credentials, now, marketClient, ...(fetchImpl ? { fetchImpl } : {}), ...(host ? { host } : {}) });
     try { await preflightOptions(client, config, preflightTimeoutMs, signal); }
     catch (error) { throw new OptionsStartError(error instanceof OptionsKeyProblem ? 'key' : 'unreachable', signal?.aborted ? '服务正在停止' : describe(error)); }
     if (signal?.aborted) throw new OptionsStartError('unreachable', '服务正在停止');
@@ -232,7 +233,7 @@ export interface OptionsSupervisor {
  * the config parser should have refused (no bybitOptions key).
  */
 export function createOptionsSupervisor(config: OptionsConfig, credentials: LiveCredentials | undefined, dir: string,
-  { retryMs = OPTIONS_RETRY_MS, fetchImpl, preflightTimeoutMs, now }: { retryMs?: number; fetchImpl?: FetchLike; preflightTimeoutMs?: number; now?: () => number } = {},
+  { retryMs = OPTIONS_RETRY_MS, fetchImpl, preflightTimeoutMs, now, marketClient }: { marketClient?: MarketClient; retryMs?: number; fetchImpl?: FetchLike; preflightTimeoutMs?: number; now?: () => number } = {},
   { notify, log }: { notify: (text: string) => void; log: (line: string) => void }): OptionsSupervisor {
   if (!credentials) throw new Error('配置了 options，但密钥文件里没有 bybitOptions');
   const aborter = new AbortController(), startedAt = Date.now(), every = retryMs >= 1000 ? `每 ${Math.round(retryMs / 1000)} 秒重试` : `每 ${retryMs} 毫秒重试`;
@@ -243,7 +244,7 @@ export function createOptionsSupervisor(config: OptionsConfig, credentials: Live
     return attempt ??= (async () => {
       const previous = problem?.reason;
       try {
-        const runtime = await prepareOptions(config, credentials, dir, { ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(preflightTimeoutMs === undefined ? {} : { preflightTimeoutMs }), signal: aborter.signal });
+        const runtime = await prepareOptions(config, credentials, dir, { marketClient, ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(preflightTimeoutMs === undefined ? {} : { preflightTimeoutMs }), signal: aborter.signal });
         let engine: OptionsEngine;
         try {
           if (aborter.signal.aborted) throw new OptionsStartError('unreachable', '服务正在停止');

@@ -14,7 +14,7 @@ export interface PerpetualMarketMetricsServiceOptions {
   getMarket?: (exchange: string, symbol: string) => PerpetualMarket | undefined | null;
   store?: PerpetualContractMetricsStore | null;
   clock?: () => number;
-  reader?: PerpetualMetricsReader;
+  reader?: ((...args: Parameters<PerpetualMetricsReader>) => ReturnType<PerpetualMetricsReader>) & Partial<Pick<PerpetualMetricsReader, 'stop' | 'retryAt' | 'isCached'>>;
   cacheLimit?: number; maxConcurrent?: number; hostSpacingMs?: number; intervalMs?: number;
 }
 export interface PerpetualMarketMetricsService {

@@ -616,6 +616,11 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
       if (order.state === 'open') void cancelOrder(current, market, order, order.protectionLost);
     }
   }
+  function freshBook(market, at) {
+    const book = market.book;
+    return book?.bids.length && book.asks.length && book.bids[0][0] < book.asks[0][0]
+      && market.bookAt <= at && at - market.bookAt <= BOOK_MAX_AGE_MS && book.time <= at + BOOK_MAX_AGE_MS && at - book.time <= SOURCE_MAX_AGE_MS;
+  }
   function holdOf(current, market) {
     if (current.stopping) return 'stopping';
     if (current.live) { const reason = gate(); if (reason) return reason; }
@@ -629,9 +634,9 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
       const stream = current.stream.status();
       if (!stream.privateReady) return 'private_stream';
       if (!stream.deadManReady) return 'dead_man_switch';
+      if (!stream.publicReady) return 'stale_book';
     }
-    const book = market.book;
-    if (!book || !book.bids.length || !book.asks.length || now() - market.bookAt > BOOK_MAX_AGE_MS || now() - book.time > SOURCE_MAX_AGE_MS) return 'stale_book';
+    if (!freshBook(market, now())) return 'stale_book';
     if ([...market.orders.values()].some(order => order.state === 'unknown' && (!current.incident || order.role === 'close'))) return 'unknown_order';
     return null;
   }
@@ -643,7 +648,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
       for (const order of market.orders.values()) if (order.role === 'quote' && order !== sending) total += notional(order.price, order.remaining);
       if (!market.positionKnown) return null;
       if (market.position === 0n) continue;
-      if (market.mid === null) return null;
+      if (market.mid === null || !freshBook(market, now())) return null;
       total += notional(market.mid, abs(market.position));
     }
     return total;
@@ -658,8 +663,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
       return;
     }
     const book = market.book;
-    const valid = book?.bids.length && book.asks.length && book.bids[0][0] < book.asks[0][0]
-      && at - market.bookAt <= BOOK_MAX_AGE_MS && at - book.time <= SOURCE_MAX_AGE_MS;
+    const valid = freshBook(market, at);
     const ext = valid ? withoutOrders(book, [...market.orders.values(), ...market.foreign, ...market.bookDebits]) : null;
     const touch = market.position > 0n ? ext?.bids[0]?.[0] : ext?.asks[0]?.[0];
     if (!market.dirty && exit.entry === null) notice(current, market.name, 'no-entry', '账户未给出有效入场均价，无法计算亏损阈值；最长持仓时间仍生效。');
@@ -928,16 +932,18 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
         if (current.live) protectRestingQuotes(current, market, valid && !gap ? book : null);
         if (current.live && market.exit) updateExit(current, market);
       },
-      onDown() {
+      onDown(reason) {
         if (!activeFeed(names)) return;
         current.observation?.down(now());
         for (const market of current.markets.values()) {
           market.book = null;
+          market.mid = null;
           if (current.live) protectRestingQuotes(current, market, null);
         }
         if (current.live) {
           markAllDirty(current);
-          if (!current.stopping) stopRenewal(current);
+          // The separate public feed can fail while the account socket still confirms orders and protects the account.
+          if (!current.stopping && reason !== 'public_feed_down') stopRenewal(current);
         }
       },
       onPrivate(channel, data) { if (session === current) hint(current, channel, data); } });

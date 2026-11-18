@@ -4,13 +4,16 @@
 // own timeout and is never retried within a round; a failed round keeps what was there and says why. The last quote and the
 // candles are kept in monitor.sqlite and read back at start, marked as a snapshot until a round succeeds.
 import {
-  ASSETS, OIL_CANDLE_MS, OIL_CANDLE_REFRESH_MS, createIntradaySnapshot, fetchIntradaySnapshot, intradayWindow, requestBinance, validateMarket,
-  type OilCandleRow, type OilCoverage, type OilFetcher, type OilIntraday, type OilIntradayWindow, type OilMarket,
+  OIL_CANDLE_MS, OIL_CANDLE_REFRESH_MS, createIntradaySnapshot, oilCandleStart, mergeOilCandleBatch, intradayWindow, validateMarket,
+  type OilCoverage, type OilFetcher, type OilIntraday, type OilIntradayWindow, type OilMarket,
 } from '../vendor/oil-market.mjs';
 import type { BinanceGate } from '../vendor/anthropic-market.mjs';
-import { OIL_FIRST_SETTLEMENT, OIL_FUNDING_MS, fetchOilFunding, validateOilFundingRows, type OilFundingRow } from '../vendor/settled-funding.mjs';
+import { OIL_FIRST_SETTLEMENT, OIL_FUNDING_MS, validateOilFundingRows, type OilFundingRow } from '../vendor/settled-funding.mjs';
 import { FUNDING_REFRESH_MS, createFundingHistory, type FundingView } from './funding.ts';
-import { CANDLE_STALE_MS, QUOTE_STALE_MS, boundedReply, type LoopContext } from './anthropic.ts';
+import { CANDLE_STALE_MS, QUOTE_STALE_MS, type LoopContext } from './anthropic.ts';
+import { BinanceCooldown } from './market-contract.ts';
+import { createMarketReaders, type MarketReaders } from './market-readers.ts';
+export { parseOilQuote } from './market-readers.ts';
 import type { MonitorStore } from './store.ts';
 
 export const OIL_QUOTE_REFRESH_MS = 10_000;
@@ -18,16 +21,13 @@ export const OIL_RETENTION_DAYS = 400;
 export const OIL_QUOTE_KEY = 'oil.quote';
 export const OIL_CANDLE_KEY = 'oil.candles';
 export const OIL_FUNDING_KEY = 'oil.funding';
-const QUOTE_TIMEOUT_MS = 10_000, CANDLE_TIMEOUT_MS = 15_000, DAY_MS = 86_400_000;
+const DAY_MS = 86_400_000;
 /**
  * How often a round also re-reads the gaps older than the last day. The vendored reader starts every round at the earliest
  * gap; a bar Binance never returns would make each round page from there to now (about 26 pages per leg after a year).
  */
 export const OIL_GAP_RETRY_MS = 3_600_000;
 const RESUME_MS = 96 * OIL_CANDLE_MS;
-/** The workbench's limits (lib/exchange-service.ts parseBinanceQuote): a mark's source time near this clock, both legs close together. */
-const SOURCE_PAST_MS = 120_000, SOURCE_FUTURE_MS = 60_000, LEG_SKEW_MS = 15_000;
-
 export interface OilQuoteView extends OilMarket {
   status: 'live' | 'snapshot';
   staleAfterMs: number;
@@ -35,11 +35,6 @@ export interface OilQuoteView extends OilMarket {
   lastError: string | null;
 }
 export type OilCandleView = OilIntradayWindow & { coverage: OilCoverage; lastAttemptAt: string | null; lastError: string | null };
-
-class BinanceCooldown extends Error {
-  readonly status: number;
-  constructor(status: number) { super(`Binance HTTP ${status} cooldown`); this.status = status; }
-}
 
 /** Short Chinese reason for a failed read; never echoes upstream bodies. */
 export function oilError(error: unknown): string {
@@ -51,67 +46,18 @@ export function oilError(error: unknown): string {
   return '响应无效或网络失败';
 }
 
-type Json = Record<string, unknown>;
-const record = (value: unknown): Json => { if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid Binance object'); return value as Json; };
-const finite = (value: unknown): number => {
-  if ((typeof value !== 'number' && typeof value !== 'string') || String(value).trim() === '' || !Number.isFinite(Number(value))) throw new Error('Invalid Binance number');
-  return Number(value);
-};
-const optional = (value: unknown): number | null => { try { return finite(value); } catch { return null; } };
-
-/**
- * The workbench's parseBinanceQuote for the oil pair, on the two per-symbol premiumIndex replies instead of the whole market
- * (and without the contract catalog). Funding terms missing on either leg leave both legs' rates empty; the prices stand.
- */
-export function parseOilQuote(brentTicker: unknown, wtiTicker: unknown, fundingInfo: unknown, now: number): OilMarket {
-  const funding = fundingInfo === null ? [] : (() => { if (!Array.isArray(fundingInfo)) throw new Error('Invalid Binance funding list'); return fundingInfo.map(record); })();
-  const sources: number[] = [];
-  const leg = (input: unknown, symbol: string) => {
-    const ticker = record(input);
-    if (ticker.symbol !== symbol) throw new Error('Unexpected Binance symbol');
-    const source = finite(ticker.time);
-    if (!Number.isSafeInteger(source) || source < now - SOURCE_PAST_MS || source > now + SOURCE_FUTURE_MS) throw new Error('Delayed or invalid Binance quote');
-    sources.push(source);
-    const specs = funding.filter(item => item.symbol === symbol);
-    if (specs.length > 1) throw new Error('Duplicate funding metadata');
-    const hours = optional(specs[0]?.fundingIntervalHours), rate = optional(ticker.lastFundingRate), next = optional(ticker.nextFundingTime);
-    return {
-      coin: symbol, markPx: finite(ticker.markPrice),
-      fundingRate: rate !== null && Math.abs(rate) <= 1 ? rate : null,
-      fundingIntervalHours: hours !== null && Number.isInteger(hours) && hours > 0 && hours <= 24 ? hours : null,
-      nextFundingAt: next !== null && next >= source - 60_000 && next <= now + 25 * 3_600_000 ? new Date(next).toISOString() : null,
-    };
-  };
-  let brent = leg(brentTicker, ASSETS.brent.coin), wti = leg(wtiTicker, ASSETS.wti.coin);
-  if (Math.abs(sources[0]! - sources[1]!) > LEG_SKEW_MS) throw new Error('Binance oil legs are not synchronized');
-  // Missing current settlement terms must not make up a funding estimate.
-  if (![brent, wti].every(item => item.fundingRate !== null && item.fundingIntervalHours !== null && item.nextFundingAt !== null)) {
-    brent = { ...brent, fundingRate: null }; wti = { ...wti, fundingRate: null };
-  }
-  return validateMarket({ source: 'Binance', currency: 'USDT', fetchedAt: new Date(Math.min(...sources)).toISOString(), brent, wti });
-}
-
 const iso = (ms: number | null): string | null => ms === null ? null : new Date(ms).toISOString();
 const detail = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 200);
 
-export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.now, log = line => process.stderr.write(`${line}\n`) }: {
+export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.now, readers = createMarketReaders({ fetchImpl, now, gate }), log = line => process.stderr.write(`${line}\n`) }: {
   store: MonitorStore;
   /** The Binance cooldown, shared with the Anthropic monitor: both read Binance from the same address. */
-  gate: BinanceGate;
+  gate: BinanceGate; readers?: MarketReaders;
   fetchImpl?: OilFetcher; now?: () => number; log?: (line: string) => void;
 }) {
   const stopping = new AbortController();
-  // The vendor module (and readQuote) put a timeout on every request; the stop signal is added so a shutdown does not wait
-  // one out. A 429 or 418 starts the cooldown, during which nothing is sent to Binance.
-  const fetcher: OilFetcher = async (url, init) => {
-    if (now() < gate.until) throw new BinanceCooldown(gate.status);
-    const response = boundedReply(await fetchImpl(url, { ...init, signal: init.signal ? AbortSignal.any([init.signal, stopping.signal]) : stopping.signal }));
-    if (response.status === 429 || response.status === 418) {
-      gate.until = Math.max(gate.until, now() + (response.status === 418 ? 120_000 : 60_000)); gate.status = response.status;
-    }
-    return response;
-  };
 
+  let quoteEpoch: string | null = null;
   let quote: OilMarket | null = null, quoteRestored = false, quoteAttemptAt: number | null = null, quoteError: string | null = null;
   let candles: OilIntraday | null = null, candlesRestored = false, candleAttemptAt: number | null = null, candleError: string | null = null;
   // The stored rows could not be read back: the next successful round rewrites the table instead of adding to it.
@@ -147,25 +93,14 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
     // Binance pages 1000 settlements (~167 days) a request: the whole retention is a few requests, no need to split.
     name: '原油', key: OIL_FUNDING_KEY, legs: ['brent', 'wti'], first: OIL_FIRST_SETTLEMENT, intervalMs: OIL_FUNDING_MS, spanMs: OIL_RETENTION_DAYS * DAY_MS,
     read: () => store.oilFunding(), readState: () => store.readState(OIL_FUNDING_KEY)?.value ?? null, write: write => store.writeOilFunding(write),
-    validate: validateOilFundingRows, fetch: (start, end, at) => fetchOilFunding(start, { fetcher, timeout: CANDLE_TIMEOUT_MS, now: at, endTime: end }),
+    validate: validateOilFundingRows, fetch: (start, end, at) => readers.oilFunding(start, end, at, stopping.signal),
     reason: oilError, aborted: () => stopping.signal.aborted, now, log,
   });
-
-  async function readQuote(): Promise<OilMarket> {
-    const options = { fetcher, timeout: QUOTE_TIMEOUT_MS };
-    const [brent, wti, funding] = await Promise.all([
-      requestBinance('/fapi/v1/premiumIndex', { symbol: ASSETS.brent.coin }, options),
-      requestBinance('/fapi/v1/premiumIndex', { symbol: ASSETS.wti.coin }, options),
-      // The funding terms are optional: without them the prices still count.
-      requestBinance('/fapi/v1/fundingInfo', {}, options).catch(() => null),
-    ]);
-    return parseOilQuote(brent, wti, funding, now());
-  }
 
   async function refreshQuote(): Promise<void> {
     quoteAttemptAt = now();
     let next: OilMarket;
-    try { next = await readQuote(); }
+    try { next = await readers.oilQuote(stopping.signal); }
     catch (error) {
       if (stopping.signal.aborted) return;
       quoteError = oilError(error);
@@ -173,7 +108,7 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
       return;
     }
     if (stopping.signal.aborted) return;
-    quote = next; quoteRestored = false; quoteError = null;
+    quote = next; quoteEpoch = readers.epoch?.() ?? null; quoteRestored = false; quoteError = null;
     quoteReport.recovered();
     try { store.writeState(OIL_QUOTE_KEY, next); quoteSave.recovered(); }
     catch (error) { quoteSave.failed('monitor.sqlite 写入失败', detail(error)); }
@@ -186,20 +121,15 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
     let next: OilIntraday;
     const full = !candles || at >= gapRetryAt;
     try {
-      // Between gap re-reads, the reader sees only the rows from the first paired one in the last day; the older rows are
-      // put back after it (the fetched rows take precedence where they overlap).
-      let base = candles, head: OilCandleRow[] = [];
-      if (candles && !full) {
-        const from = candles.data.at(-1)!.time - RESUME_MS;
-        const start = candles.data.findIndex(row => row.time >= from && row.brent !== null && row.wti !== null);
-        if (start > 0) { head = candles.data.slice(0, start); base = createIntradaySnapshot(candles.data.slice(start), candles.metadata.fetchedAt); }
+      // Outside the hourly gap repair, only look for older gaps in the last day. Merge new legs over durable values.
+      let resumeRows = candles?.data ?? [];
+      if (!full && resumeRows.length) {
+        const from = resumeRows.at(-1)!.time - RESUME_MS;
+        const start = resumeRows.findIndex(row => row.time >= from && row.brent !== null && row.wti !== null);
+        if (start > 0) resumeRows = resumeRows.slice(start);
       }
-      next = await fetchIntradaySnapshot(base, { fetcher, now: at, timeout: CANDLE_TIMEOUT_MS });
-      if (head.length) {
-        const merged = new Map(head.map(row => [row.time, row]));
-        for (const row of next.data) merged.set(row.time, row);
-        next = createIntradaySnapshot([...merged.values()].sort((a, b) => a.time - b.time), next.metadata.fetchedAt);
-      }
+      const batch = await readers.oilCandles(oilCandleStart(resumeRows), at, stopping.signal);
+      next = mergeOilCandleBatch(candles, batch, at);
       // The kept history ends at the retention cut in memory as in the file.
       if (next.data[0]!.time < cutoff) next = createIntradaySnapshot(next.data.filter(row => row.time >= cutoff), next.metadata.fetchedAt);
     } catch (error) {
@@ -236,7 +166,7 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
     /** The last quote with its freshness (by the marks' source time); null before any quote exists. */
     quote(): OilQuoteView | null {
       if (!quote) return null;
-      const stale = quoteRestored || now() - Date.parse(quote.fetchedAt) > QUOTE_STALE_MS;
+      const stale = quoteRestored || (readers.epoch && (!quoteEpoch || quoteEpoch !== readers.epoch())) || now() - Date.parse(quote.fetchedAt) > QUOTE_STALE_MS;
       return { ...quote, status: stale ? 'snapshot' : 'live', staleAfterMs: QUOTE_STALE_MS, lastAttemptAt: iso(quoteAttemptAt), lastError: quoteError };
     },
     /** The candles opening within `days` before the last paired bar (null: all of them), with the complete history's range; null before any row exists. */

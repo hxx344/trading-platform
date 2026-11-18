@@ -154,8 +154,10 @@ export function parseQuote(value: unknown, venue: Venue, symbol: string): Quote 
 export function checkQuoteFresh(quote: Quote, now: number, maxAgeMs: number, futureToleranceMs: number): void {
   const name = `${VENUE_NAMES[quote.venue]} ${quote.symbol}`;
   if (!quote.complete) reject('quote_incomplete', `${name} 盘口不完整（序列缺口或重建中），暂不下单`, 409);
-  if (quote.receivedAt - now > futureToleranceMs) reject('quote_future', `${name} 盘口时间超前，请检查时钟`, 409);
-  if (now - quote.receivedAt > maxAgeMs) reject('quote_stale', `${name} 盘口已过期（${now - quote.receivedAt} 毫秒，上限 ${maxAgeMs} 毫秒）`, 409);
+  const source = quote.sourceTime ?? quote.receivedAt;
+  if (Math.max(source, quote.receivedAt) - now > futureToleranceMs) reject('quote_future', `${name} 盘口时间超前，请检查时钟`, 409);
+  const age = now - Math.min(source, quote.receivedAt);
+  if (age > maxAgeMs) reject('quote_stale', `${name} 盘口已过期（${age} 毫秒，上限 ${maxAgeMs} 毫秒）`, 409);
 }
 
 export type PositionSide = 'long' | 'short';

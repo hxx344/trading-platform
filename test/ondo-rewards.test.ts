@@ -297,6 +297,27 @@ test('按需展开盘口时，缺少源时间的 REST 应答保留上次可信�
   } finally { rewards.close(); }
 });
 
+test('奖励推送断开时清除已显示和未采样的盘口，已完成的历史采样仍可查询', async () => {
+  const time = { now: 1_800_000_000_000 }, name = 'NVDA-USD.P', fake = fakeClient(time), feed = fakeFeeds();
+  const rewards = createOndoRewards({ dataDir: mkdtempSync(join(tmpdir(), 'tp-ondo-interrupted-')), clientFactory: () => fake.client, streamFactory: feed.factory, now: () => time.now });
+  rewards.initialize(); rewards.save({ markets: [name], poolUsd: '700', eligible: 1 });
+  let done = false, tick = 0;
+  try {
+    await rewards.run({ stopped: () => done, async pause(ms) {
+      time.now += ms;
+      if (ms !== 1000) { done = true; return; }
+      if (++tick === 1) feed.push(name, 100, time.now);
+      if (tick === 2) {
+        assert.equal(rewards.state().markets[0].mid, 100);
+        feed.push(name, 150, time.now);
+        feed.feeds.at(-1)!.options.onDown!('disconnected');
+      }
+    } });
+    const row = rewards.state().markets[0];
+    assert.equal(row.mid, null); assert.equal(row.avg.samples, 1); assert.equal(row.avg.to, 1_800_000_001_000);
+  } finally { rewards.close(); }
+});
+
 test('采集：推送全断时说明原因并全部走 REST；REST 撞上页面发起的读取时共用并记样本；停在推送中途关闭推送、不记样本', async () => {
   const dataDir = mkdtempSync(join(tmpdir(), 'tp-ondo-rewards-')), time = { now: 1_800_000_000_000 };
   let release: (() => void) | null = null;

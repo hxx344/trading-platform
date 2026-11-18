@@ -4,7 +4,7 @@ import { canonicalBase } from './asset-identity.mjs';
 // https://docs.kraken.com/api-reference/instrument-details/get-instruments
 // https://docs.kraken.com/exchange/api-reference/futures-websocket/ticker
 // https://support.kraken.com/articles/4844429542676-trading-multi-collateral-derivatives
-export const KRAKEN_EXCHANGE = Object.freeze({ id: 'kraken', name: 'Kraken', type: 'cex', website: 'https://www.kraken.com', docsUrl: 'https://docs.kraken.com/exchange/api-reference/futures-websocket/ticker' });
+export { KRAKEN_EXCHANGE } from './perpetual-venues.mjs';
 const API = 'https://futures.kraken.com/derivatives/api/v3/instruments';
 const finite = value => (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) && Number.isFinite(Number(value)) ? Number(value) : null;
 const positive = value => { const result = finite(value); return result !== null && result > 0 ? result : null; };

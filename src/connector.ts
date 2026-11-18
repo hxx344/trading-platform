@@ -166,6 +166,8 @@ export interface VenueConnector {
   readonly capabilities: ConnectorCapabilities;
   instrument(symbol: string, options: CallOptions): Promise<Instrument>;
   quote(symbol: string, options: CallOptions): Promise<Quote>;
+  /** Rechecked before a price-dependent send, including after signing or a venue clock retry. */
+  quoteCurrent?(quote: Quote): boolean;
   account(binding: AccountBinding, symbols: readonly string[], options: CallOptions): Promise<AccountSnapshot>;
   place(binding: AccountBinding, order: OrderRequest, options: SendOptions): Promise<OrderReport>;
   /** null means the venue answered that no order with this client id exists. */

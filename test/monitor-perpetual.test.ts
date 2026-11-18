@@ -15,7 +15,7 @@ import type { LoopContext } from '../src/monitor/anthropic.ts';
 import { parseServiceConfig } from '../src/service/config.ts';
 import { monitorSummary, parseMonitorConfig } from '../src/service/monitor-config.ts';
 import { planMonitor } from '../src/service/import-modules.ts';
-import { monitorLoops, monitorStatus, monitorViews, openMonitor } from '../src/service/monitor.ts';
+import { closeMonitor, settleMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor } from '../src/service/monitor.ts';
 import { createExecutorServer } from '../src/http.ts';
 import { EXCHANGES, createSubscriptions } from '../src/vendor/perpetual-exchanges.mjs';
 import type { PerpetualMarket, PerpetualUpdate } from '../src/vendor/perpetual-stream.mjs';
@@ -281,7 +281,7 @@ test('接口：合约表、概要与 SSE（首帧全量带 retry，其后按 bas
     assert.equal(runtime.perpetual!.running(), false, '服务停止时采集器停下');
     await new Promise(resolve => server.close(resolve));
     h.dispose();
-    runtime.store.close();
+    await settleMonitor(runtime); closeMonitor(runtime);
     rmSync(dir, { recursive: true, force: true });
   }
 });

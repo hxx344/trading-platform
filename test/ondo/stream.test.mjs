@@ -47,6 +47,20 @@ test('depth snapshots are parsed exactly and malformed or crossed ones become nu
   assert.equal(parseOndoBook({ time: '2026-11-12T18:30:26Z', asks: [['1', '0']], bids: [] }), null);
 });
 
+test('a private-only socket subscribes to the three account channels and the dead-man heartbeat', async () => {
+  const s = fixture({ credentials: { keyId: 'test-key', secret: 'test-secret' }, privateOnly: true, markets: [] });
+  s.stream.start(); const ws = s.sockets[0]; ws.emit('open');
+  assert.deepEqual(ws.sent.map(row => row.op), ['login']);
+  ws.frame({ type: 'loggedIn' });
+  const channels = ws.sent.filter(row => row.op === 'subscribe').map(row => row.channel);
+  assert.deepEqual(channels, ['ordersPerps', 'fillsPerps', 'positionsPerps', 'cancelAllOrdersAfterPerps']);
+  for (const channel of channels) ws.frame({ type: 'subscribed', channel });
+  ws.frame(s.depth()); ws.frame({ type: 'update', channel: 'fillsPerps', data: [{ market: 'NVDA-USD.P' }] });
+  assert.equal(s.books.length, 0); assert.equal(s.hints.length, 1);
+  await s.advance(5000); assert.equal(ws.sent.at(-1).op, 'ping');
+  assert.equal(s.stream.status().deadManReady, true); s.stream.close();
+});
+
 test('BBO latency samples complete market frames once, keeps clock lead, and restarts intervals on reconnect', async () => {
   const markets = ['NVDA-USD.P', 'TSLA-USD.P'];
   let wallOffset = 0;

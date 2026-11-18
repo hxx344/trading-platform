@@ -1,4 +1,4 @@
-// 复制自 project-aggregation 工作台 modules/crossex/server/market.mjs（提交 7745181），改动：仅把 import 路径 ../../../server/asset-identity.mjs 改为同目录 ./asset-identity.mjs。
+// Workbench CrossEx market (7745181), with local imports and a send-time guard for revalidated depth.
 import { createHash } from 'node:crypto';
 import { AppError, defaults, configuration, validateFeed, validSignal, validManualPair, pairKey, quoteKey, contractIdentity,
   freshQuote, quoteTime, catalogRule, manualCatalogRule, displayCatalogRule, validateBooks, fxRate, referencePrice, settlement, SUPPORTED_VENUES, transferEligibility } from './model.mjs';
@@ -249,6 +249,11 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     validateBooks(books.length === 1 ? [books[0], books[0]] : books, clock());
     return { books, fx };
   }
+  // Attached only to the in-memory confirmation, after fresh depth. Revocation also applies between the two writes.
+  function bindBooks(plan, books) {
+    plan.expiresAt = Math.min(plan.expiresAt ?? Infinity, ...books.map(book => book.at + 10000));
+    Object.defineProperty(plan, 'quotesCurrent', { configurable: true, value: () => books.every(book => !book.isCurrent || book.isCurrent()) });
+  }
   function buildLeg(q, side, positionSide, rule, book) {
     return { symbol: rule.symbol, exchange: q.exchange, base: q.base, side, positionSide,
       price: priceLimit(side === 'BUY' ? book.asks[0][0] : book.bids[0][0], side, rule, config().slippageBps),
@@ -313,6 +318,7 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     // Runtime rechecks total exposure, margin and risk tiers using these values.
     const values = plan.legs.map((leg, i) => budgetValue(leg, prices[i], fx, clock(), c.notionalPerLeg));
     plan.legs.forEach((leg, i) => Object.assign(leg, values[i]));
+    bindBooks(plan, books);
     return true;
   }
   // Manual ticket and A/B hedge concepts follow your-quantguy/gate-crossex,
@@ -427,6 +433,7 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     }
     if (revision() !== plan.marketRevision || config().entryPaused) throw new AppError('设置已变化，请重新预览', 409);
     plan.legs.forEach((leg, i) => Object.assign(leg, values[i]));
+    bindBooks(plan, books);
     return true;
   }
   async function resolvePositionPair(positions) {
@@ -489,6 +496,7 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     });
     if (revision() !== plan.marketRevision || increasing && config().entryPaused) throw new AppError('设置或开仓状态已变化，请重新预览', 409);
     plan.legs.forEach((leg, i) => Object.assign(leg, values[i]));
+    bindBooks(plan, books);
     return true;
   }
   async function previewClose(position, requestedQuantity) {
@@ -515,16 +523,19 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
   async function revalidateClose(plan) {
     await refreshCatalog();
     if (revision() !== plan.marketRevision) throw new AppError('设置已变化，请重新预览', 409);
+    const checked = [];
     for (const leg of plan.legs) {
       const { quote, rule } = await resolveSymbol(leg.symbol);
       if (contractIdentity(quote) !== contractIdentity(leg.quote)) throw new AppError('合约身份已变化，请重新预览');
       const { books } = await booksAndFx([quote], false, manualDepthReader);
+      checked.push(books[0]);
       checkPrice(leg.price, rule);
       checkQuantity(leg.quantity, leg.price, rule);
       const estimate = depthEstimate(books[0], leg.side, leg.quantity, leg.price);
       checkQuantity(leg.quantity, estimate.price, rule);
     }
     if (revision() !== plan.marketRevision) throw new AppError('设置已变化，请重新预览', 409);
+    bindBooks(plan, checked);
     return true;
   }
   async function positionsValuation(positions) {

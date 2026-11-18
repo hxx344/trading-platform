@@ -61,6 +61,21 @@ export function sanitizePerpetualMetricsReaderState(state, market, now) {
   return { version: 1, symbol: market.symbol, currency: market.quoteCurrency, candles: [...rows].sort(([a], [b]) => a - b) };
 }
 
+export function perpetualMetricsCacheKeys(market, now) {
+  const bucket = Math.floor(now / STEP) * STEP;
+  const ex = market.exchange;
+  if (ex === 'binance') return ['binance:tickers', `binance:oi:${market.symbol}:${bucket}`];
+  if (ex === 'okx') return ['okx:oi', `okx:candles:${market.symbol}:${bucket}`];
+  if (ex === 'bybit') return ['bybit:linear'];
+  if (ex === 'bitget') return [`bitget:${market.productType}`];
+  if (ex === 'gate') return ['gate:usdt'];
+  if (ex === 'kraken') return ['kraken:tickers'];
+  if (ex === 'hyperliquid' || ex === 'entropy') return [`hyperliquid:${ex === 'entropy' ? 'io' : ''}`];
+  if (Object.hasOwn(LIGHTER_HOSTS, ex)) return [`${ex}:details`];
+  if (ex === 'aster') return ['aster:tickers'];
+  return [];
+}
+
 /** Public API references checked 2026-10-08. Batch caches are shared across pairs,
  * failures are cached too, and callers never get to select an upstream host.
  * Binance: https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data
@@ -157,19 +172,6 @@ export function createPerpetualMetricsReader({ fetchImpl = fetch, clock = Date.n
   }
   const get = (key, url, signal, ttl) => cached(key, url, {}, signal, ttl);
   const sourceBucket = () => Math.floor(clock() / STEP) * STEP;
-  const keysFor = market => {
-    const ex = market.exchange;
-    if (ex === 'binance') return ['binance:tickers', `binance:oi:${market.symbol}:${sourceBucket()}`];
-    if (ex === 'okx') return ['okx:oi', `okx:candles:${market.symbol}:${sourceBucket()}`];
-    if (ex === 'bybit') return ['bybit:linear'];
-    if (ex === 'bitget') return [`bitget:${market.productType}`];
-    if (ex === 'gate') return ['gate:usdt'];
-    if (ex === 'kraken') return ['kraken:tickers'];
-    if (ex === 'hyperliquid' || ex === 'entropy') return [`hyperliquid:${ex === 'entropy' ? 'io' : ''}`];
-    if (Object.hasOwn(LIGHTER_HOSTS, ex)) return [`${ex}:details`];
-    if (ex === 'aster') return ['aster:tickers'];
-    return [];
-  };
   async function okxVolume(market, signal, state) {
     const key = `${market.symbol}:${market.quoteCurrency}`, end = Math.floor(clock() / STEP) * STEP;
     let saved = candleCache.get(key) ?? sanitizePerpetualMetricsReaderState(state, market, clock());
@@ -291,8 +293,12 @@ export function createPerpetualMetricsReader({ fetchImpl = fetch, clock = Date.n
   // Only already settled responses qualify for the collector's bounded fast
   // path. A cold per-contract request still uses the ordinary host queue.
   read.isCached = market => {
-    const keys = keysFor(market), now = clock();
+    const now = clock(), keys = perpetualMetricsCacheKeys(market, now);
     return keys.length > 0 && keys.every(key => { const entry = cache.get(key); return entry && !entry.promise && !entry.error && !entry.controller.signal.aborted && now < entry.expires; });
+  };
+  read.cachedUntil = market => {
+    const keys = perpetualMetricsCacheKeys(market, clock());
+    return read.isCached(market) ? keys.map(key => [key, cache.get(key).expires]) : [];
   };
   read.retryAt = market => rateLimitUntil.get(API_HOSTS[market.exchange]) ?? 0;
   read.stop = () => { clearTimeout(timer); for (const entry of cache.values()) if (entry.promise) entry.controller.abort(); for (const job of queue.splice(0)) job.reject(aborted()); };

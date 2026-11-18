@@ -12,4 +12,7 @@ export interface CrossexConfig {
   [key: string]: unknown;
 }
 export const defaults: Readonly<CrossexConfig>;
+export function validIdentity(quote: unknown): boolean;
+export function validManualIdentity(quote: unknown): boolean;
+export function validateBooks(books: unknown[], now: number): void;
 export function configuration(input: Record<string, unknown>, previous?: Record<string, unknown>): CrossexConfig;

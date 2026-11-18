@@ -25,7 +25,7 @@ async function together(reads) {
 }
 
 /** Fixed public endpoints only; no account identifier, key, signer or trading endpoint. */
-export function createFundingClient({ fetcher = fetch, clock = Date.now, timeoutMs = 8000, WebSocketImpl = WebSocket } = {}) {
+export function createFundingClient({ fetcher = fetch, clock = Date.now, timeoutMs = 8000, WebSocketImpl = WebSocket, signal } = {}) {
   const flights = new Map(), cache = new Map(), venueState = new Map(), currentCooldown = new Map();
   let intervals = null, intervalsFlight = null;
   async function json(url, body) {
@@ -109,7 +109,7 @@ export function createFundingClient({ fetcher = fetch, clock = Date.now, timeout
   async function lighterCurrent(q) {
     const id = q.marketId;
     if (!Number.isInteger(id) || id < 0) fail('Lighter market_id 无效');
-    const data = await publicSnapshot({ source: LIGHTER_STREAM, WebSocketImpl, timeoutMs: Math.min(8000, Math.max(1, timeoutMs)),
+    const data = await publicSnapshot({ source: LIGHTER_STREAM, WebSocketImpl, signal, timeoutMs: Math.min(8000, Math.max(1, timeoutMs)),
       subscription: { type: 'subscribe', channel: `market_stats/${id}` },
       accept: value => value.channel === `market_stats:${id}` && !!value.market_stats && typeof value.market_stats === 'object' });
     const stats = data.market_stats, row = stats.market_id !== undefined ? stats : stats[String(id)];

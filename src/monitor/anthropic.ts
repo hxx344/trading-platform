@@ -4,9 +4,10 @@
 // are kept in monitor.sqlite and read back at start, marked as a snapshot until a round succeeds.
 import {
   ANTHROPIC_CANDLE_REFRESH_MS, ANTHROPIC_INITIAL_DAYS, ANTHROPIC_LEG_KEYS, ANTHROPIC_QUOTE_REFRESH_MS, ANTHROPIC_RETENTION_DAYS,
-  anthropicCandleWindow, createAnthropicCandles, createBinanceGate, createRhLighterState, fetchAnthropicCandles, fetchAnthropicQuote, legError, validateAnthropicQuote,
+  anthropicCandleWindow, createAnthropicCandles, createBinanceGate, anthropicCandleStarts, mergeAnthropicCandleBatch, legError, validateAnthropicQuote,
   type AnthropicCandleCoverage, type AnthropicCandles, type BinanceGate, type AnthropicCandleWindow, type AnthropicFetcher, type AnthropicQuote,
 } from '../vendor/anthropic-market.mjs';
+import { createMarketReaders, type MarketReaders } from './market-readers.ts';
 import type { MonitorStore } from './store.ts';
 
 /** A quote older than this (by local receipt time) is shown as a snapshot; the venues give no source time for a mark. */
@@ -26,39 +27,20 @@ export interface AnthropicQuoteView extends AnthropicQuote {
 export type AnthropicCandleView = AnthropicCandleWindow & { coverage: AnthropicCandleCoverage; lastAttemptAt: string | null; lastError: string | null };
 export interface LoopContext { stopped(): boolean; pause(ms: number): Promise<void> }
 
-/** The largest reply read from a venue: a full candle page is well under 1 MiB, and the vendor module only limits Lighter RH itself. */
-export const MAX_REPLY_BYTES = 8 * 1024 * 1024;
-/** The reply with its body cut off (as a read error) once it passes MAX_REPLY_BYTES, so an oversized answer is never parsed whole in the trading process. */
-export function boundedReply(response: Response): Response {
-  const length = Number(response.headers.get('content-length'));
-  if (length > MAX_REPLY_BYTES) { void response.body?.cancel().catch(() => undefined); throw new Error('交易所应答超过大小上限'); }
-  if (!response.body) return response;
-  let size = 0;
-  const counted = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      size += chunk.byteLength;
-      if (size > MAX_REPLY_BYTES) controller.error(new Error('交易所应答超过大小上限'));
-      else controller.enqueue(chunk);
-    },
-  }));
-  return new Response(counted, { status: response.status, statusText: response.statusText, headers: response.headers });
-}
+export { boundedReply, MAX_REPLY_BYTES } from './market-contract.ts';
 
 const iso = (ms: number | null): string | null => ms === null ? null : new Date(ms).toISOString();
 const detail = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 200);
 
-export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetchImpl = fetch, now = Date.now, log = line => process.stderr.write(`${line}\n`) }: {
+export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetchImpl = fetch, now = Date.now, readers = createMarketReaders({ fetchImpl, now, gate }), log = line => process.stderr.write(`${line}\n`) }: {
   store: MonitorStore;
   /** The Binance cooldown; the service passes the one it shares with the oil monitor (same address, same limits). */
-  gate?: BinanceGate;
+  gate?: BinanceGate; readers?: MarketReaders;
   fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void;
 }) {
   const stopping = new AbortController();
-  // The vendor module puts its own timeout on every request; the stop signal is added so a shutdown does not wait one out.
-  const fetcher: AnthropicFetcher = async (url, init) => boundedReply(await fetchImpl(url, { ...init, signal: init.signal ? AbortSignal.any([init.signal, stopping.signal]) : stopping.signal }));
-  // Per service rather than the module's shared ones: the cooldowns and the Lighter RH market id belong to this service.
-  const rh = createRhLighterState();
 
+  let quoteEpoch: string | null = null;
   let quote: AnthropicQuote | null = null, quoteRestored = false, quoteAttemptAt: number | null = null, quoteError: string | null = null;
   let candles: AnthropicCandles | null = null, candlesRestored = false, candleAttemptAt: number | null = null, candleError: string | null = null;
   // The stored rows could not be read back: the next successful round rewrites the table instead of adding to it.
@@ -94,7 +76,7 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
     const at = now();
     quoteAttemptAt = at;
     let next: AnthropicQuote;
-    try { next = await fetchAnthropicQuote({ fetcher, now: at, gate, rh, clock: now }); }
+    try { next = await readers.anthropicQuote(stopping.signal); }
     catch (error) {
       if (stopping.signal.aborted) return;
       // Only thrown when no leg answered (or a reply fails validation); the last quote stays and turns into a snapshot.
@@ -104,7 +86,7 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
     }
     // A stop that cut some legs short still returns the others: such a round is dropped, not stored over a complete one.
     if (stopping.signal.aborted) return;
-    quote = next; quoteRestored = false; quoteError = null;
+    quote = next; quoteEpoch = readers.epoch?.() ?? null; quoteRestored = false; quoteError = null;
     quoteReport.recovered();
     try { store.writeState(QUOTE_KEY, next); quoteSave.recovered(); }
     catch (error) { quoteSave.failed('monitor.sqlite 写入失败', detail(error)); }
@@ -114,7 +96,7 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
     const at = now();
     candleAttemptAt = at;
     let next: AnthropicCandles;
-    try { next = await fetchAnthropicCandles(candles, { fetcher, now: at, gate, rh, clock: now }); }
+    try { next = mergeAnthropicCandleBatch(candles, await readers.anthropicCandles(anthropicCandleStarts(candles, at), at, stopping.signal)); }
     catch (error) {
       if (stopping.signal.aborted) return;
       const reason = legError(error);
@@ -147,7 +129,7 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
     /** The last quote with its freshness; null before any quote exists. */
     quote(): AnthropicQuoteView | null {
       if (!quote) return null;
-      const stale = quoteRestored || now() - Date.parse(quote.fetchedAt) > QUOTE_STALE_MS;
+      const stale = quoteRestored || (readers.epoch && (!quoteEpoch || quoteEpoch !== readers.epoch())) || now() - Date.parse(quote.fetchedAt) > QUOTE_STALE_MS;
       return { ...quote, status: stale ? 'snapshot' : 'live', staleAfterMs: QUOTE_STALE_MS, lastAttemptAt: iso(quoteAttemptAt), lastError: quoteError };
     },
     /** The candles opening within `days` before the last row (null: all of them), with the complete history's range; null before any row exists. */

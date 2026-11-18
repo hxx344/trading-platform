@@ -159,5 +159,9 @@ export function createFundamentalsClient({ fetchImpl = fetch, coinIds = {}, apiK
     queue = result.catch(() => {});
     return result;
   }
-  return { refresh, get, describe };
+  const expiresAt = base => {
+    const entry = cache.get(resolve(baseKey(base)).coinId);
+    return entry ? entry.fetchedAt + MARKETS_TTL_MS : null;
+  };
+  return { refresh, get, describe, expiresAt };
 }

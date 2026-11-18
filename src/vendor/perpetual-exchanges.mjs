@@ -7,23 +7,13 @@
  * Prices are per underlying coin; fundingRate is a decimal per funding interval.
  * parseMessage returns PARTIAL updates. Missing fields must never refresh old BBOs.
  */
-import { ADDITIONAL_EXCHANGES, discoverAdditionalMarkets, createAdditionalSubscriptions, parseAdditionalMessage, getAdditionalControlResponse } from './perpetual-additional-exchanges.mjs';
-import { KRAKEN_EXCHANGE, discoverKrakenMarkets, createKrakenSubscriptions, parseKrakenMessage } from './perpetual-kraken.mjs';
+import { discoverAdditionalMarkets, createAdditionalSubscriptions, parseAdditionalMessage, getAdditionalControlResponse } from './perpetual-additional-exchanges.mjs';
+import { discoverKrakenMarkets, createKrakenSubscriptions, parseKrakenMessage } from './perpetual-kraken.mjs';
 import { AUXILIARY_BOOK_POLL_MS, BULK_BOOK_CONFIRM_MS, LIGHTER_BOOK_CONFIRM_MS } from './perpetual-collection-policy.mjs';
 import { canonicalBase } from './asset-identity.mjs';
 
-export const EXCHANGES = Object.freeze([
-  { id: 'binance', name: 'Binance', type: 'cex', website: 'https://www.binance.com', docsUrl: 'https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public' },
-  { id: 'bybit', name: 'Bybit', type: 'cex', website: 'https://www.bybit.com', docsUrl: 'https://bybit-exchange.github.io/docs/v5/websocket/public/ticker' },
-  { id: 'okx', name: 'OKX', type: 'cex', website: 'https://www.okx.com', docsUrl: 'https://www.okx.com/docs-v5/en/' },
-  { id: 'bitget', name: 'Bitget', type: 'cex', website: 'https://www.bitget.com', docsUrl: 'https://www.bitget.com/api-doc/classic/contract/websocket/public/Tickers-Channel' },
-  { id: 'gate', name: 'Gate', type: 'cex', website: 'https://www.gate.com', docsUrl: 'https://www.gate.com/docs/developers/futures/ws/en/' },
-  KRAKEN_EXCHANGE,
-  { id: 'hyperliquid', name: 'Hyperliquid', type: 'dex', website: 'https://app.hyperliquid.xyz', docsUrl: 'https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions' },
-  { id: 'lighter', name: 'Lighter', type: 'dex', website: 'https://app.lighter.xyz', docsUrl: 'https://apidocs.lighter.xyz/docs/websocket-reference' },
-  { id: 'aster', name: 'Aster', type: 'dex', website: 'https://www.asterdex.com', docsUrl: 'https://asterdex.github.io/aster-api-website/futures/websocket-market-streams/' },
-  ...ADDITIONAL_EXCHANGES,
-].map(row => ({ ...row, kind: row.type })));
+import { ADDITIONAL_EXCHANGES } from './perpetual-venues.mjs';
+export { EXCHANGES } from './perpetual-venues.mjs';
 
 const HOUR = 3_600_000;
 const STABLE_QUOTES = new Set(['USDT', 'USDC', 'USD1']);

@@ -61,7 +61,7 @@ jobs:
 
   platform-systemd:
     runs-on: ubuntu-24.04
-    timeout-minutes: 18
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: 检查安装、单元及进程边界是否变化
@@ -70,8 +70,10 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           if [[ -n "$BASE" && ! "$BASE" =~ ^0+$ ]] && git fetch --no-tags --depth=1 origin "$BASE" &&
-              git diff --quiet "$BASE" HEAD -- .github/workflows/ci.yml 'deploy/trading-platform*' deploy/install.sh deploy/package.sh deploy/test-platform-systemd.sh \
-                src/control 'src/http*.ts' src/runtime.ts src/component-build.ts src/web-assets.ts src/data-dir.ts src/login-password.ts src/live/setup.ts \
+              git diff --quiet "$BASE" HEAD -- .github/workflows/ci.yml 'deploy/trading-platform*' deploy/install.sh deploy/package.sh deploy/component-digests.mjs deploy/test-platform-systemd.sh \
+                src/control src/market src/monitor/perpetual-feed.ts src/monitor/market-readers.ts 'src/vendor/perpetual-*-reader.mjs' 'src/service/remote-*.ts' \
+                'src/vendor/crossex/*-reader.mjs' src/vendor/crossex/terminal-feed.mjs src/vendor/crossex/funding-client.mjs \
+                'src/http*.ts' src/runtime.ts src/component-build.ts src/web-assets.ts src/data-dir.ts src/login-password.ts src/live/setup.ts \
                 src/service/main.ts 'src/service/*config*.ts' 'src/service/update*.ts' src/service/handoff-file.ts src/service/take-handoff.ts 'src/service/import-*.ts'; then
             echo "run=false" >>"$GITHUB_OUTPUT"
           else

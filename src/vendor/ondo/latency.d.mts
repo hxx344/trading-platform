@@ -12,6 +12,7 @@ export interface OndoLatencySnapshot {
   wsRtt: OndoLatencyMetric; markets: OndoLatencyMarket[];
 }
 export interface OndoLatencyStamp { wall: number; mono: number }
+export function sample<A extends unknown[], R>(fn: ((...args: A) => R) | undefined, ...args: A): R | undefined;
 export interface OndoLatencyObserver {
   stamp(): OndoLatencyStamp | null;
   missedPings?(count: number): void;

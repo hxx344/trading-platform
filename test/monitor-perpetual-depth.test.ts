@@ -10,7 +10,7 @@ import { PerpetualInspectionError, createPerpetualMonitor, type PerpetualOptions
 import { NodeWebSocket } from '../src/vendor/perpetual-depth.mjs';
 import type { PerpetualUpdate } from '../src/vendor/perpetual-stream.mjs';
 import { parseServiceConfig } from '../src/service/config.ts';
-import { monitorViews, openMonitor } from '../src/service/monitor.ts';
+import { closeMonitor, monitorViews, openMonitor, settleMonitor } from '../src/service/monitor.ts';
 import { createExecutorServer } from '../src/http.ts';
 import { createHarness } from './harness.ts';
 
@@ -140,7 +140,8 @@ test('接口：depth / exit 用 POST、fx 用 GET；拒绝带服务的原因与�
   const { options } = venues();
   const config = parseServiceConfig({ secretsFile: '/etc/tp/secrets.json', monitor: { hynix: {}, perpetual: {} } }).monitor!;
   const runtime = openMonitor(config, dir, { fetchImpl: async () => { throw new Error('offline'); }, log: () => undefined, perpetualOptions: options });
-  const bare = openMonitor(parseServiceConfig({ secretsFile: '/etc/tp/secrets.json', monitor: { hynix: {} } }).monitor!, mkdtempSync(join(tmpdir(), 'tp-perpetual-bare-')), { fetchImpl: async () => { throw new Error('offline'); }, log: () => undefined });
+  const bareDir = mkdtempSync(join(tmpdir(), 'tp-perpetual-bare-'));
+  const bare = openMonitor(parseServiceConfig({ secretsFile: '/etc/tp/secrets.json', monitor: { hynix: {} } }).monitor!, bareDir, { fetchImpl: async () => { throw new Error('offline'); }, log: () => undefined });
   const h = createHarness();
   const servers = [runtime, bare].map(item => createExecutorServer({ executor: h.ex, accessToken: 'perpetual-token-0001', views: { monitor: monitorViews(item) } }));
   try {
@@ -174,6 +175,8 @@ test('接口：depth / exit 用 POST、fx 用 GET；拒绝带服务的原因与�
   } finally {
     runtime.perpetual?.stop();
     await Promise.all(servers.map(server => new Promise<void>(resolve => server.close(() => resolve()))));
+    await settleMonitor(runtime); closeMonitor(runtime); closeMonitor(bare); h.dispose();
+    rmSync(bareDir, { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });
   }
 });

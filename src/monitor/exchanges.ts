@@ -18,17 +18,20 @@ import {
   parseBybitQuote, parseGateQuote, checkedReply, parseHyperliquidContexts, parseLighterOilMarkets, parseOkxQuote, readLighterOilSnapshot, supportsExchange,
   EXCHANGE_CONTRACTS, type Exchange, type ExchangeQuote, type HyperliquidContext, type LighterMarket, type SpreadMarket,
 } from '../vendor/exchange-comparison.mjs';
+import type { RemoteComparison } from '../service/remote-monitor.ts';
 import type { BinanceGate } from '../vendor/anthropic-market.mjs';
 import { HISTORY_REFRESH_MS, createFundingLegReader, mergeFundingHistory, supportsFundingHistory, type ExchangeFundingHistory } from '../vendor/exchange-funding-history.mjs';
+import type { HynixQuote } from '../vendor/hynix-market.mjs';
 import type { HynixQuoteView } from './hynix.ts';
 import type { OilQuoteView } from './oil.ts';
-import { boundedReply } from './anthropic.ts';
+import { boundedReply, BinanceCooldown } from './market-contract.ts';
 import {
   VARIATIONAL_STATS, parseVariationalOilQuote, readVariationalAuthenticatedMarks, readVariationalPublicFunding, withVariationalFunding,
   type VariationalFetcher, type VariationalPublicFunding,
 } from '../vendor/variational-market.mjs';
 import type { VariationalSession } from './variational-session.ts';
 
+type ComparisonHynix = HynixQuote & { status: HynixQuoteView['status'] };
 export type ExchangeFetcher = (url: string, init: RequestInit) => Promise<Response>;
 export const EXCHANGE_RESULT_TTL_MS = 5_000;
 const REQUEST_TIMEOUT_MS = 10_000, CATALOG_TTL_MS = 60_000, CATALOG_RETAIN_MS = 600_000, FUNDING_TTL_MS = 15_000;
@@ -38,11 +41,6 @@ const HYPERLIQUID = 'https://api.hyperliquid.xyz/info';
 
 /** A read that failed with a reason fit for the page. */
 export class ExchangeReadError extends Error {}
-
-class BinanceCooldown extends Error {
-  readonly status: number;
-  constructor(status: number) { super(`Binance HTTP ${status} cooldown`); this.status = status; }
-}
 
 /** Short Chinese reason for a failed read; never echoes upstream bodies. */
 export function exchangeError(error: unknown): string {
@@ -68,9 +66,9 @@ export function exchangeError(error: unknown): string {
 // JSON parse errors quote the reply, so only their name is logged.
 const detail = (error: unknown): string => error instanceof SyntaxError ? error.name : (error instanceof Error ? error.message : String(error)).slice(0, 200);
 
-export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSession, variationalFetch, fetchImpl = fetch, now = Date.now, WebSocketImpl, log = line => process.stderr.write(`${line}\n`) }: {
+export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSession, variationalFetch, remote, fetchImpl = fetch, now = Date.now, WebSocketImpl, log = line => process.stderr.write(`${line}\n`) }: {
   /** The Binance cooldown shared with the collectors: everything reads Binance from the same address. */
-  gate: BinanceGate;
+  gate: BinanceGate; remote?: RemoteComparison;
   /** The collectors' current quotes (null when that market is not configured or has none yet). */
   oilQuote: () => OilQuoteView | null;
   hynixQuote: () => HynixQuoteView | null;
@@ -125,7 +123,7 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSe
   // The parts of the Var row that fail without failing the row, each logged once per reason like an exchange.
   const VARIATIONAL_AUTH = 'oil/variational 认证行情', VARIATIONAL_FUNDING = 'oil/variational 公开资金费';
   const variationalSignal = () => AbortSignal.any([AbortSignal.timeout(REQUEST_TIMEOUT_MS), stopping.signal]);
-  const publicVariational = () => shared('variational/oil/public', 1_000, async () => parseVariationalOilQuote(await request(VARIATIONAL_STATS), now()));
+  const publicVariational = () => shared('variational/oil/public', 1_000, () => remote ? remote.variationalMarks(stopping.signal) : request(VARIATIONAL_STATS).then(reply => parseVariationalOilQuote(reply, now())));
   type SessionRead = ReturnType<VariationalSession['current']>;
   const sameSession = (before: SessionRead) => { const current = variationalSession!.current(); return current.revision === before.revision && current.token === before.token; };
   async function variationalMarks(): Promise<{ quote: ExchangeQuote; session: SessionRead | null }> {
@@ -165,7 +163,7 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSe
     const fetcher = variationalFetch;
     const [initialMarks, funding] = await Promise.all([
       variationalMarks(),
-      fetcher ? shared('variational/oil/public-funding', 1_000, () => readVariationalPublicFunding({ fetcher, clock: now, signal: variationalSignal() }))
+      (fetcher || remote) ? shared('variational/oil/public-funding', 1_000, () => remote ? remote.variationalFunding(variationalSignal()) : readVariationalPublicFunding({ fetcher: fetcher!, clock: now, signal: variationalSignal() }))
         .then(value => { recovered(VARIATIONAL_FUNDING); return { value, reason: '' }; }, (error: unknown) => ({ value: null, reason: failed(VARIATIONAL_FUNDING, error) }))
         : Promise.resolve({ value: null, reason: '' }),
     ]);
@@ -176,12 +174,16 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSe
     return withVariationalFunding(marks.quote, funding.value as VariationalPublicFunding | null, now(), funding.reason);
   }
 
-  async function read(exchange: Exchange, market: SpreadMarket): Promise<ExchangeQuote> {
+  async function read(exchange: Exchange, market: SpreadMarket, savedHynix?: ComparisonHynix | null): Promise<ExchangeQuote> {
+    // Binance oil is a pure projection of the persisted quote; only Var's authenticated marks use the token.
+    if (remote && exchange !== 'variational' && !(market === 'oil' && exchange === 'binance')) {
+      return remote.quote(market, exchange, market === 'hynix' && exchange === 'hyperliquid' ? hynixQuote() : null, stopping.signal);
+    }
     const contracts = EXCHANGE_CONTRACTS[market], bases = [contracts.leftBase, contracts.rightBase];
     switch (exchange) {
       case 'hyperliquid': {
         if (market === 'oil') { const { reply, receivedAt } = await hyperliquidContexts(); return hyperliquidOilQuote(reply, receivedAt); }
-        const quote = hynixQuote();
+        const quote = savedHynix === undefined ? hynixQuote() : savedHynix;
         if (!quote) throw new ExchangeReadError('尚未取得海力士报价，后台正在采集');
         const stale = quote.status === 'snapshot';
         // The funding joins only a current quote: a snapshot's time would be too far from the funding's.
@@ -294,25 +296,27 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSe
   };
   const recovered = (key: string) => { if (lastFailure.delete(key)) log(`交易所对比 ${key} 已恢复`); };
   return {
+    publicVariational,
     /** One exchange's current comparison row; rejects with an ExchangeReadError carrying the page's reason. */
-    async quote(market: SpreadMarket, exchange: Exchange): Promise<ExchangeQuote> {
+    async quote(market: SpreadMarket, exchange: Exchange, savedHynix?: ComparisonHynix | null): Promise<ExchangeQuote> {
       if (!supportsExchange(market, exchange)) throw new ExchangeReadError('不支持的交易所');
       const key = `${market}/${exchange}`;
       try {
         // A saved token starts a new result at once (the page reads again right after saving), not after the 5 s share.
         const revision = exchange === 'variational' && variationalSession ? `/${variationalSession.current().revision}` : '';
-        const value = await shared(`result/${key}${revision}`, EXCHANGE_RESULT_TTL_MS, () => read(exchange, market));
+        const value = await shared(`result/${key}${revision}`, EXCHANGE_RESULT_TTL_MS, () => read(exchange, market, savedHynix));
         if (lastFailure.delete(key)) log(`交易所对比 ${key} 已恢复`);
         return value;
       } catch (error) {
         // The reader's own reasons (a collector without a quote yet) are states, not failures worth a log line.
-        if (error instanceof ExchangeReadError) throw error;
+        if (error instanceof ExchangeReadError || remote && exchange !== 'variational') throw error;
         throw new ExchangeReadError(failed(key, error));
       }
     },
     /** One exchange's settled funding history (M-2d-3); rejects with an ExchangeReadError only when there is nothing to keep. */
     async fundingHistory(market: SpreadMarket, exchange: Exchange): Promise<ExchangeFundingHistory> {
       if (!supportsFundingHistory(market, exchange)) throw new ExchangeReadError('不支持的交易所');
+      if (remote) return remote.history(market, exchange, stopping.signal);
       const key = `${market}/${exchange}/funding-history`;
       let entry: HistoryEntry;
       try { entry = await readHistory(market, exchange, key); }

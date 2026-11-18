@@ -10,6 +10,7 @@ export interface PerpetualMetricsReading { volume24h: PerpetualMarketMetric; ope
 export interface PerpetualMetricsReader {
   (market: PerpetualMarket, options: { signal: AbortSignal; readerState?: unknown }): Promise<PerpetualMetricsReading>;
   isCached(market: PerpetualMarket): boolean;
+  cachedUntil?(market: PerpetualMarket): [string, number][];
   retryAt(market: PerpetualMarket): number;
   stop(): void;
   metrics(): { cacheEntries: number; queued: number; inFlight: number; candleEntries: number };
@@ -17,3 +18,5 @@ export interface PerpetualMetricsReader {
 export declare function sanitizePerpetualMetricsReaderState(state: unknown, market: PerpetualMarket, now: number): unknown;
 export declare function createPerpetualMetricsReader(options?: PerpetualMetricsReaderOptions): PerpetualMetricsReader;
 export declare const createPerpetualMarketMetricsReader: typeof createPerpetualMetricsReader;
+
+export declare function perpetualMetricsCacheKeys(market: PerpetualMarket, now: number): string[];

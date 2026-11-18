@@ -1,3 +1,4 @@
+import { createMarketClient, type MarketClient } from '../market/ipc.ts';
 // The ASTER service entry: margin-balance transfers and ADL emergency handling of the configured pairs on mainnet.
 // It owns a dedicated data directory, listens on loopback (and on the one address config.host names) and takes no pair over by itself: a configured pair is
 // registered switched off, and only switching it on in the page (after the takeover checks) hands its accounts to this
@@ -213,6 +214,7 @@ export interface StartOptions {
   notifyFetch?: (url: string, init: RequestInit) => Promise<Response>;
   port?: number;
   socketPath?: string;
+  marketSocketPath?: string;
   executionBuild?: string;
   configBuild?: string;
   leaseWaitMs?: number;
@@ -256,12 +258,13 @@ export async function startService(options: StartOptions): Promise<ReturnType<ty
     untee = () => { for (const step of undo) step(); };
   }
   catch (error) { process.stderr.write(`页面日志库无法打开，日志页不可用：${error instanceof Error ? error.message.slice(0, 200) : String(error)}\n`); }
-  const closeLogs = () => { untee(); try { logs?.close(); } catch { /* best effort */ } };
-  try { return await startWired({ ...options, executionBuild }, logs, closeLogs); }
+  const marketClient = options.marketSocketPath ? createMarketClient(options.marketSocketPath) : undefined;
+  const closeLogs = () => { marketClient?.close(); untee(); try { logs?.close(); } catch { /* best effort */ } };
+  try { return await startWired({ ...options, executionBuild, marketClient }, logs, closeLogs); }
   catch (error) { closeLogs(); throw error; }
 }
 
-async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, socketPath, executionBuild, configBuild, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, ondoOptions, watchOptions, updateFetch }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
+async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, socketPath, executionBuild, configBuild, marketClient, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, ondoOptions, watchOptions, updateFetch }: StartOptions & { marketClient?: MarketClient }, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
   const updates = socketPath === undefined ? (await import('./update.ts')).createServiceUpdates(importDir, updateFetch) : undefined;
   const session = keptSession(dir);
   // O7: the oil and hynix books come from the market monitor's perpetual collector when it has a recent one (oil/pushed.ts);
@@ -269,7 +272,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   let collector: PerpetualMonitor | null = null;
   const pushed = pushedBooks(() => collector, Date.now);
   // Oil accounts are locked and checked before the store opens: a failed check refuses start (oil.ts).
-  const oil = config.oil ? await prepareOil(config.oil, secrets.exchanges, { ...(oilFetch ? { fetchImpl: oilFetch } : {}), pushed }) : undefined;
+  const oil = config.oil ? await prepareOil(config.oil, secrets.exchanges, { ...(oilFetch ? { fetchImpl: oilFetch } : {}), pushed, marketClient }) : undefined;
   // Options is locked and checked too, but a failed start only disables options: it is retried in the background and the
   // rest of the service runs (options.ts createOptionsSupervisor). Its task messages wait here until the notifier exists.
   let optionsNotify: ((text: string) => void) | null = null;
@@ -277,7 +280,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   let options: OptionsSupervisor | undefined;
   try {
     options = config.options ? createOptionsSupervisor(config.options, secrets.bybitOptions, dir,
-      { ...(optionsFetch ? { fetchImpl: optionsFetch } : {}), ...(optionsPreflightMs === undefined ? {} : { preflightTimeoutMs: optionsPreflightMs }), ...(optionsRetryMs === undefined ? {} : { retryMs: optionsRetryMs }) },
+      { marketClient, ...(optionsFetch ? { fetchImpl: optionsFetch } : {}), ...(optionsPreflightMs === undefined ? {} : { preflightTimeoutMs: optionsPreflightMs }), ...(optionsRetryMs === undefined ? {} : { retryMs: optionsRetryMs }) },
       { notify: text => { if (optionsNotify) optionsNotify(text); else optionsEarly.push(text); }, log: line => process.stderr.write(`${line}\n`) }) : undefined;
     await options?.start();
   } catch (error) { oil?.locks.release(); throw error; }
@@ -295,7 +298,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
     void ondo?.close();
   };
   try {
-    crossex = config.crossex ? createCrossexSupervisor(config.crossex, secrets.gate, dir, crossexOptions) : undefined;
+    crossex = config.crossex ? createCrossexSupervisor(config.crossex, secrets.gate, dir, { ...crossexOptions, marketClient }) : undefined;
     await crossex?.start();
   } catch (error) { releaseOil(); throw error; }
   let store: ReturnType<typeof openStore>;
@@ -323,7 +326,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   } catch (error) { executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
   try {
     ondo = config.ondo ? await createOndoModule(config.ondo, secrets.ondo, dir, {
-      notifyRisk: (key, text) => notifier.notifyOnce(key, text), ...ondoOptions,
+      notifyRisk: (key, text) => notifier.notifyOnce(key, text), ...ondoOptions, marketClient,
     }) : undefined;
   } catch (error) { notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
   const streams = createStreamStatus(streamed);
@@ -368,7 +371,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   }
   if (config.monitor) {
     const alertHooks = marketAlertHooks({ secrets, notifier, monitorOutbox, monitorOutboxError, send: (secret, text) => sendFeishu(secret, { msg_type: 'text', content: { text } }, notifyFetch ? { fetchImpl: notifyFetch } : {}) });
-    try { monitor = openMonitor(config.monitor, dir, { ...(monitorFetch ? { fetchImpl: monitorFetch } : {}), alertHooks }); collector = monitor.perpetual; }
+    try { monitor = openMonitor(config.monitor, dir, { ...(monitorFetch ? { fetchImpl: monitorFetch } : {}), alertHooks, marketClient }); collector = monitor.perpetual; }
     catch (error) { monitorError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`行情监控库无法打开，行情监控页不可用：${monitorError}\n`); }
   }
   const closeMonitorStore = () => { if (monitor) closeMonitor(monitor); };
@@ -496,7 +499,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
 }
 
 async function main(): Promise<void> {
-  const { values } = parseArgs({ options: { config: { type: 'string' }, 'data-dir': { type: 'string' }, 'import-dir': { type: 'string' }, socket: { type: 'string' }, 'check-config': { type: 'boolean' }, 'hash-password': { type: 'boolean' } } });
+  const { values } = parseArgs({ options: { config: { type: 'string' }, 'data-dir': { type: 'string' }, 'import-dir': { type: 'string' }, socket: { type: 'string' }, 'market-socket': { type: 'string' }, 'check-config': { type: 'boolean' }, 'hash-password': { type: 'boolean' } } });
   if (values['hash-password']) {
     // install.sh --set-password: the password arrives on stdin (one line), only the digest leaves on stdout.
     const chunks: Buffer[] = [];
@@ -527,7 +530,9 @@ async function main(): Promise<void> {
   const importDir = values['import-dir'];
   if (importDir !== undefined && !isAbsolute(importDir)) throw new Error('--import-dir 必须是绝对路径');
   const app = values.socket === undefined ? (await import('../web-assets.ts')).loadWebApp() : undefined;
-  await startService({ config, secrets, dir, socketPath: values.socket, configBuild, app, ...(importDir ? { importDir } : {}), ...(password ? { password } : {}) });
+  const marketSocketPath = values['market-socket'];
+  if (marketSocketPath !== undefined && !isAbsolute(marketSocketPath)) throw new Error('--market-socket 必须是绝对路径');
+  await startService({ config, secrets, dir, socketPath: values.socket, marketSocketPath, configBuild, app, ...(importDir ? { importDir } : {}), ...(password ? { password } : {}) });
 }
 
 if (import.meta.main) main().catch(error => { process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; });

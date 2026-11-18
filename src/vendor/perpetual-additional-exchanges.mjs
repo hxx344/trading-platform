@@ -2,10 +2,7 @@
 // Public feeds only. Robinhood Lighter is a separate deployment and order book;
 // Entropy is the `io` HIP-3 namespace, not Hyperliquid's native perpetual venue.
 import { AUXILIARY_BOOK_POLL_MS, RH_LIGHTER_BOOK_CONFIRM_MS } from './perpetual-collection-policy.mjs';
-export const ADDITIONAL_EXCHANGES = [
-  { id: 'rh-lighter', name: 'rh-Lighter', type: 'dex', website: 'https://robinhoodchain.lighter.xyz', docsUrl: 'https://apidocs.rh.lighter.xyz/docs/websocket', description: 'Robinhood Chain 独立盘口 · USDG · WS 买卖一档' },
-  { id: 'entropy', name: 'Entropy', type: 'dex', website: 'https://entropy.io', docsUrl: 'https://docs.entropy.io', description: 'Hyperliquid HIP-3 io · USDC · WS 买卖一档；非标准合约独立展示' },
-];
+export { ADDITIONAL_EXCHANGES } from './perpetual-venues.mjs';
 
 const RH_API = 'https://api.rh.lighter.xyz';
 const HL_API = 'https://api.hyperliquid.xyz/info';

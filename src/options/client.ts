@@ -4,13 +4,15 @@
 // a timestamp refusal (10002), which proves the first one did not execute.
 import { bybitAuthHeaders } from '../vendor/bybit.mjs';
 import { VenueError } from '../connector.ts';
+import type { MarketClient } from '../market/ipc.ts';
+import type { OptionRead, OptionReply } from '../market/options-data.ts';
+import { bybitPages, MAX_PAGES } from './listing.ts';
 import { exchange, isRecord, type FetchLike, type HttpReply } from '../live/http.ts';
 import { describe, validCredentials, type LiveCredentials } from '../live/values.ts';
 
 export const BYBIT_HOST = 'https://api.bybit.com';
 const RECV_WINDOW = '5000';
 const MAX_CLOCK_OFFSET_MS = 300_000;
-const MAX_PAGES = 100;
 const DAY_MS = 86_400_000;
 
 // Only codes that prove a refusal before execution; anything else (server timeout or internal error, duplicate request,
@@ -55,6 +57,9 @@ function failureText(reply: HttpReply, code: number | undefined): string {
 
 export type Row = Record<string, unknown>;
 export interface OptionsClient {
+  /** Current market connection and the original time of an actual price read. */
+  marketEpoch?(): string | null;
+  publicAt?(data: object): number;
   syncClock(signal: AbortSignal): Promise<void>;
   instruments(signal: AbortSignal): Promise<Row[]>;
   tickers(signal: AbortSignal): Promise<Row[]>;
@@ -71,7 +76,7 @@ export interface OptionsClient {
   executions(link: string, signal: AbortSignal): Promise<Row[]>;
   closedPositions(symbol: string, startMs: number, endMs: number, signal: AbortSignal): Promise<Row[]>;
   /** A limit order: GTC (the default) follows the book; IOC is the bounded fallback for an opening leg's remainder. */
-  create(order: { symbol: string; side: 'Buy' | 'Sell'; qty: string; price: string; link: string; reduceOnly: boolean; timeInForce?: 'GTC' | 'IOC' }, signal: AbortSignal): Promise<Row>;
+  create(order: { symbol: string; side: 'Buy' | 'Sell'; qty: string; price: string; link: string; reduceOnly: boolean; timeInForce?: 'GTC' | 'IOC' }, signal: AbortSignal, beforeSend?: () => void): Promise<Row>;
   /** An order's fills by its id: a block trade (RFQ) leg has no orderLinkId of ours. */
   executionsByOrder(orderId: string, signal: AbortSignal): Promise<Row[]>;
   // ---- RFQ (G2c): this account as the requester -------------------------------------------------------------------
@@ -81,16 +86,16 @@ export interface OptionsClient {
   rfqs(by: { rfqId: string } | { rfqLinkId: string }, history: boolean, signal: AbortSignal): Promise<Row[]>;
   quotes(rfqId: string, signal: AbortSignal): Promise<Row[]>;
   /** quoteSide Sell: each leg trades in the direction the RFQ asked for (the docs: for the taker, a Sell quote executes as the legs say). */
-  executeQuote(rfqId: string, quoteId: string, signal: AbortSignal): Promise<Row>;
+  executeQuote(rfqId: string, quoteId: string, signal: AbortSignal, beforeSend?: () => void): Promise<Row>;
   cancelRfq(rfqId: string, signal: AbortSignal): Promise<Row>;
   rfqTrades(rfqId: string, signal: AbortSignal): Promise<Row[]>;
-  amend(symbol: string, link: string, price: string, signal: AbortSignal): Promise<Row>;
+  amend(symbol: string, link: string, price: string, signal: AbortSignal, beforeSend?: () => void): Promise<Row>;
   cancel(symbol: string, link: string, signal: AbortSignal): Promise<Row>;
 }
 
-export interface OptionsClientOptions { credentials: LiveCredentials; fetchImpl?: FetchLike; now?: () => number; timeoutMs?: number; host?: string }
+export interface OptionsClientOptions { marketClient?: MarketClient; credentials: LiveCredentials; fetchImpl?: FetchLike; now?: () => number; timeoutMs?: number; host?: string }
 
-export function createOptionsClient({ credentials, fetchImpl = (url, init) => fetch(url, init), now = Date.now, timeoutMs = 10_000, host = BYBIT_HOST }: OptionsClientOptions): OptionsClient {
+export function createOptionsClient({ credentials, marketClient, fetchImpl = (url, init) => fetch(url, init), now = Date.now, timeoutMs = 10_000, host = BYBIT_HOST }: OptionsClientOptions): OptionsClient {
   if (!validCredentials(credentials)) throw new Error('Bybit 期权密钥不完整或格式无效');
   let offset = 0;
 
@@ -100,11 +105,27 @@ export function createOptionsClient({ credentials, fetchImpl = (url, init) => fe
     return value;
   };
 
-  async function publicGet(path: string, params: Record<string, string>, signal: AbortSignal): Promise<Row> {
-    const reply = await exchange(fetchImpl, timeoutMs, { url: `${host}${path}?${new URLSearchParams(params)}`, method: 'GET' }, { signal });
-    const code = codeOf(reply);
-    if (reply.status < 200 || reply.status >= 300 || code !== 0) throw new VenueError('read-failed', failureText(reply, code));
-    return result(reply, 'read-failed');
+  const stamps = new WeakMap<object, { epoch: string | null; source: number; received: number }>();
+  function publicAt(data: object): number {
+    const stamp = stamps.get(data), time = now();
+    if (!stamp || (marketClient && (stamp.epoch === null || stamp.epoch !== marketClient.epoch()))
+      || Math.max(stamp.received, stamp.source) > time + 1000 || time - Math.min(stamp.received, stamp.source) > 30_000) {
+      throw new VenueError('not-sent', '期权盘口已过期或行情连接已切换');
+    }
+    return Math.min(stamp.received, stamp.source);
+  }
+  async function publicData(op: OptionRead, signal: AbortSignal, symbol?: string) {
+    const reply = marketClient ? await marketClient.call<OptionReply>('options.' + op, symbol === undefined ? {} : { symbol }, signal)
+      : await (await import('../market/options-data.ts')).readOptionData(op, symbol, signal, { fetchImpl, now, timeoutMs, host });
+    const value = reply?.value;
+    if ((op === 'instruments' || op === 'tickers') ? (!Array.isArray(value) || value.some(row => !isRecord(row)))
+      : (value === null ? op !== 'ticker' : !isRecord(value) || value.symbol !== (symbol ?? 'BTCUSDT'))) throw new VenueError('read-failed', 'Bybit 行情合约与请求不一致');
+    if (value && op !== 'instruments') {
+      if (!Number.isSafeInteger(reply.receivedAt) || (marketClient && !Number.isSafeInteger(reply.sourceAt))) throw new VenueError('read-failed', 'Bybit 行情缺少来源时间');
+      stamps.set(value, { epoch: marketClient?.epoch() ?? null, source: reply.sourceAt ?? reply.receivedAt, received: reply.receivedAt });
+      publicAt(value);
+    }
+    return value;
   }
 
   async function syncClock(signal: AbortSignal): Promise<void> {
@@ -118,7 +139,7 @@ export function createOptionsClient({ credentials, fetchImpl = (url, init) => fe
     offset = next;
   }
 
-  async function signed(method: 'GET' | 'POST', path: string, params: Record<string, unknown>, signal: AbortSignal): Promise<Row> {
+  async function signed(method: 'GET' | 'POST', path: string, params: Record<string, unknown>, signal: AbortSignal, guard?: () => void): Promise<Row> {
     const write = method === 'POST';
     const query = write ? '' : new URLSearchParams(params as Record<string, string>).toString();
     const body = write ? JSON.stringify(params) : undefined;
@@ -127,7 +148,7 @@ export function createOptionsClient({ credentials, fetchImpl = (url, init) => fe
       try { headers = { ...bybitAuthHeaders(credentials, { timestamp: String(Math.round(now() + offset)), recvWindow: RECV_WINDOW, payload: body ?? query }), ...(write ? { 'Content-Type': 'application/json' } : {}) }; }
       catch (error) { throw new VenueError(!write ? 'read-failed' : attempt > 0 ? 'rejected' : 'not-sent', `Bybit 请求签名失败：${describe(error)}`); }
       let reply: HttpReply;
-      try { reply = await exchange(fetchImpl, timeoutMs, { url: `${host}${path}${query ? `?${query}` : ''}`, method, headers, ...(body === undefined ? {} : { body }) }, { signal, ...(write ? { beforeSend: () => undefined } : {}) }); }
+      try { reply = await exchange(fetchImpl, timeoutMs, { url: `${host}${path}${query ? `?${query}` : ''}`, method, headers, ...(body === undefined ? {} : { body }) }, { signal, ...(write ? { beforeSend: guard ?? (() => undefined) } : {}) }); }
       catch (error) {
         // The first transmission was refused for its timestamp; a resend stopped before sending leaves that refusal.
         if (attempt > 0 && error instanceof VenueError && error.kind === 'not-sent') throw new BybitRefusal(10002, `Bybit 时间戳被拒后未重发：${error.message}`);
@@ -149,25 +170,8 @@ export function createOptionsClient({ credentials, fetchImpl = (url, init) => fe
   }
 
   /** Every page of a listing; a repeated or malformed cursor, a missing identity or too many pages fails the read. */
-  async function pages(path: string, params: Record<string, string>, identity: readonly string[], signal: AbortSignal, isPublic = false): Promise<Row[]> {
-    const rows: Row[] = [], seenRows = new Set<string>(), seenCursors = new Set<string>();
-    let cursor = '';
-    for (let page = 0; page < MAX_PAGES; page++) {
-      const query = { ...params, ...(cursor ? { cursor } : {}) };
-      const data = isPublic ? await publicGet(path, query, signal) : await signed('GET', path, query, signal);
-      if (!Array.isArray(data.list) || data.list.some(item => !isRecord(item))) throw new VenueError('read-failed', 'Bybit 列表格式无效');
-      for (const row of data.list as Row[]) {
-        const values = identity.map(field => row[field]);
-        if (values.some(value => typeof value !== 'string') || !values[0]) throw new VenueError('read-failed', 'Bybit 列表行缺少标识');
-        const key = JSON.stringify(values);
-        if (!seenRows.has(key)) { seenRows.add(key); rows.push(row); }
-      }
-      const next = data.nextPageCursor;
-      if (next === undefined || next === null || next === '') return rows;
-      if (typeof next !== 'string' || next.length > 2000 || seenCursors.has(next)) throw new VenueError('read-failed', 'Bybit 分页游标无效或重复');
-      seenCursors.add(next); cursor = next;
-    }
-    throw new VenueError('read-failed', `Bybit 列表超过 ${MAX_PAGES} 页`);
+  function pages(path: string, params: Record<string, string>, identity: readonly string[], signal: AbortSignal): Promise<Row[]> {
+    return bybitPages(cursor => signed('GET', path, { ...params, ...(cursor ? { cursor } : {}) }, signal), identity);
   }
 
   const listOf = (data: Row, name: string): Row[] => {
@@ -177,15 +181,12 @@ export function createOptionsClient({ credentials, fetchImpl = (url, init) => fe
 
   return {
     syncClock,
-    instruments: signal => pages('/v5/market/instruments-info', { category: 'option', baseCoin: 'BTC', limit: '1000' }, ['symbol'], signal, true),
-    tickers: async signal => listOf(await publicGet('/v5/market/tickers', { category: 'option', baseCoin: 'BTC' }, signal), '期权报价'),
-    ticker: async (symbol, signal) => listOf(await publicGet('/v5/market/tickers', { category: 'option', symbol }, signal), '期权报价').find(row => row.symbol === symbol) ?? null,
-    underlying: async signal => {
-      const rows = listOf(await publicGet('/v5/market/tickers', { category: 'linear', symbol: 'BTCUSDT' }, signal), 'BTC 指数');
-      const row = rows.find(item => item.symbol === 'BTCUSDT');
-      if (!row) throw new VenueError('read-failed', 'Bybit 没有返回 BTCUSDT 报价');
-      return row;
-    },
+    ...(marketClient ? { marketEpoch: () => marketClient.epoch() } : {}),
+    publicAt,
+    instruments: signal => publicData('instruments', signal) as Promise<Row[]>,
+    tickers: signal => publicData('tickers', signal) as Promise<Row[]>,
+    ticker: (symbol, signal) => publicData('ticker', signal, symbol) as Promise<Row | null>,
+    underlying: signal => publicData('underlying', signal) as Promise<Row>,
     queryApi: signal => signed('GET', '/v5/user/query-api', {}, signal),
     accountInfo: signal => signed('GET', '/v5/account/info', {}, signal),
     walletBalance: async signal => {
@@ -224,8 +225,8 @@ export function createOptionsClient({ credentials, fetchImpl = (url, init) => fe
       }
       return rows;
     },
-    create: ({ symbol, side, qty, price, link, reduceOnly, timeInForce = 'GTC' }, signal) => signed('POST', '/v5/order/create', { category: 'option', symbol, side, orderType: 'Limit', qty, price, timeInForce, orderLinkId: link, reduceOnly }, signal),
-    amend: (symbol, link, price, signal) => signed('POST', '/v5/order/amend', { category: 'option', symbol, orderLinkId: link, price }, signal),
+    create: ({ symbol, side, qty, price, link, reduceOnly, timeInForce = 'GTC' }, signal, guard) => signed('POST', '/v5/order/create', { category: 'option', symbol, side, orderType: 'Limit', qty, price, timeInForce, orderLinkId: link, reduceOnly }, signal, guard),
+    amend: (symbol, link, price, signal, guard) => signed('POST', '/v5/order/amend', { category: 'option', symbol, orderLinkId: link, price }, signal, guard),
     cancel: (symbol, link, signal) => signed('POST', '/v5/order/cancel', { category: 'option', symbol, orderLinkId: link }, signal),
     executionsByOrder: (orderId, signal) => pages('/v5/execution/list', { category: 'option', orderId, limit: '50' }, ['execId'], signal),
     rfqConfig: signal => signed('GET', '/v5/rfq/config', {}, signal),
@@ -233,7 +234,7 @@ export function createOptionsClient({ credentials, fetchImpl = (url, init) => fe
     // One RFQ per query (by id or link): no paging.
     rfqs: async (by, history, signal) => listOf(await signed('GET', history ? '/v5/rfq/rfq-list' : '/v5/rfq/rfq-realtime', { traderType: 'request', ...by }, signal), '询价'),
     quotes: async (rfqId, signal) => listOf(await signed('GET', '/v5/rfq/quote-realtime', { traderType: 'request', rfqId }, signal), '询价报价'),
-    executeQuote: (rfqId, quoteId, signal) => signed('POST', '/v5/rfq/execute-quote', { rfqId, quoteId, quoteSide: 'Sell' }, signal),
+    executeQuote: (rfqId, quoteId, signal, guard) => signed('POST', '/v5/rfq/execute-quote', { rfqId, quoteId, quoteSide: 'Sell' }, signal, guard),
     cancelRfq: (rfqId, signal) => signed('POST', '/v5/rfq/cancel-rfq', { rfqId }, signal),
     rfqTrades: async (rfqId, signal) => listOf(await signed('GET', '/v5/rfq/trade-list', { traderType: 'request', rfqId }, signal), '询价成交'),
   };

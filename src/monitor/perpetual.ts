@@ -31,7 +31,11 @@
 import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { constants as zlibConstants, createGzip, type Gzip } from 'node:zlib';
-import { EXCHANGES, createSubscriptions, discoverMarkets, getControlResponse, parseMessage, type PerpetualRequestOptions, type PerpetualSpec, type PerpetualVenue } from '../vendor/perpetual-exchanges.mjs';
+import type { RemotePerpetual } from '../service/remote-monitor.ts';
+import { STREAM_OBSERVATION_MS } from '../vendor/perpetual-collection-policy.mjs';
+import { EXCHANGES } from '../vendor/perpetual-venues.mjs';
+import { createPerpetualFeed, type FeedEvent, type FeedVenue, type PerpetualFeedOptions } from './perpetual-feed.ts';
+export { PERPETUAL_DISCOVERY_MS, PERPETUAL_OBSERVATION_MS, type PerpetualSocketFactory } from './perpetual-feed.ts';
 import { createPerpetualExecutionService, type PerpetualExecutionOptions, type PerpetualExecutionService } from '../vendor/perpetual-depth.mjs';
 import { createPerpetualMarketMetricsService, type PerpetualContractMetricsStore } from '../vendor/perpetual-market-metrics-service.mjs';
 import { createPerpetualFundingHistoryService, type PerpetualFundingHistoryStore } from '../vendor/perpetual-funding-history-service.mjs';
@@ -51,25 +55,11 @@ import type { PerpetualFundingHistoryReport } from '../vendor/perpetual-funding-
 import type { PerpetualScannerDataReport } from '../vendor/perpetual-scanner-data.ts';
 import { createPerpetualMetricsReader } from '../vendor/perpetual-metrics-reader.mjs';
 import type { PerpetualMarketMetricsReport } from '../vendor/perpetual-market-metrics.ts';
-import { MAX_FUTURE_MS, PERPETUAL_STALE_MS, createPerpetualChangedPatch, mergePerpetualQuote, withMarketMetadata, type PerpetualExchange, type PerpetualMarket, type PerpetualQuote, type PerpetualSnapshot, type PerpetualStatus, type PerpetualUpdate } from '../vendor/perpetual-stream.mjs';
+import { MAX_FUTURE_MS, PERPETUAL_STALE_MS, createPerpetualChangedPatch, perpetualPriceIdentity, type PerpetualExchange, type PerpetualMarket, type PerpetualQuote, type PerpetualSnapshot, type PerpetualStatus } from '../vendor/perpetual-stream.mjs';
 
-/** The workbench's collection policy (collection-policy.mjs). */
-export const PERPETUAL_DISCOVERY_MS = 300_000;
-export const PERPETUAL_OBSERVATION_MS = 1_000;
 /** A reader whose unsent frames pass this is dropped (the workbench's limit). */
 export const PERPETUAL_CLIENT_BACKLOG = 4_000_000;
-const CONNECT_TIMEOUT_MS = 20_000, SNAPSHOT_TIMEOUT_MS = 8_000, DISCOVERY_RETRY_MS = 30_000, DISCOVERY_ERROR = '合约列表获取失败，正在重试。';
-/** Directory fields that reach readers without a new price and without resubscribing (the workbench's catalogFields). */
-const CATALOG_FIELDS = new Set(['delisting', 'delistingAt', 'takerFeeRate', 'takerFeeAt', 'takerFeeSource', 'assetClass', 'identitySource', 'identityVerified']);
-
 type Fetcher = (url: string, init: RequestInit) => Promise<Response>;
-interface SocketLike {
-  readyState: number; binaryType?: string;
-  send(data: string): void; close(): void;
-  addEventListener(type: 'open' | 'error' | 'close', listener: () => void): void;
-  addEventListener(type: 'message', listener: (event: { data: unknown }) => void): void;
-}
-export type PerpetualSocketFactory = new (url: string, options?: { headers?: Record<string, string> }) => SocketLike;
 
 export interface PerpetualSummary {
   /** Always true, as the workbench's (its page's summary parser requires it); `running` says whether the collector runs. */
@@ -82,25 +72,9 @@ export interface PerpetualStatusView {
   venues: { id: string; status: PerpetualExchange['status']; marketCount: number; reconnects: number; lastMessageAt: number | null; error: string | null; lastProtocolError: string | null }[];
 }
 
-interface VenueState {
-  id: string; name: string; kind: PerpetualExchange['kind']; marketCount: number; lastMessageAt: number | null; error: string | null; snapshotError: string | null;
-  discovering: boolean; retryPending: boolean; discoveryFailing: boolean; markets?: Map<string, PerpetualMarket>; signature?: string; generation: number; reconnects: number; lastProtocolError: string | null;
-}
-interface Connection { exchange: string; socket: SocketLike | null; timers: Set<ReturnType<typeof setTimeout>>; closed: boolean; lastMessageAt: number; lastQuoteAt: number; snapshotController?: AbortController; dispose(): void }
-interface PollBudget { startedAt: number; sent: number; nextAt: number; blockedUntil: number; failures: number }
-type GenerationSpec = PerpetualSpec & { generation: number };
-
-export interface PerpetualOptions {
-  exchanges?: readonly Pick<PerpetualVenue, 'id' | 'name' | 'kind'>[];
-  discover?: (exchange: string, options: PerpetualRequestOptions) => Promise<PerpetualMarket[]>;
-  subscriptions?: (exchange: string, markets: PerpetualMarket[]) => PerpetualSpec[];
-  parse?: typeof parseMessage; control?: typeof getControlResponse;
-  /** Public REST reads (discovery, book snapshots); tests stand in for the venues. */
-  fetchImpl?: Fetcher;
-  WebSocketImpl?: PerpetualSocketFactory;
-  now?: () => number; log?: (line: string) => void;
-  staleAfterMs?: number; retryMs?: number; discoveryIntervalMs?: number; observationIntervalMs?: number; broadcastIntervalMs?: number;
-  watchdogIntervalMs?: number; quoteTimeoutMs?: number;
+export interface PerpetualOptions extends PerpetualFeedOptions {
+  /** IPC substitutes the complete venue collector and public data readers in the execution service. */
+  remote?: RemotePerpetual;
   /** The depth / exit / FX reads' venues (tests and the local preview stand in for them). */
   execution?: Pick<PerpetualExecutionOptions, 'fetchImpl' | 'WebSocketImpl' | 'maxMarkets' | 'cacheMs'>;
   /** M-5b1: the market-metrics reads' venues (tests and the local preview stand in for them) and the scheduler tick. */
@@ -147,24 +121,62 @@ export function acceptsGzip(header: string | string[] | undefined): boolean {
 
 const reason = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 200);
 
-export function createPerpetualMonitor({
-  exchanges = EXCHANGES, discover = discoverMarkets, subscriptions = createSubscriptions, parse = parseMessage, control = getControlResponse,
-  fetchImpl, WebSocketImpl = globalThis.WebSocket as unknown as PerpetualSocketFactory, now: clock = Date.now, log = line => process.stderr.write(`${line}\n`),
-  staleAfterMs = PERPETUAL_STALE_MS, retryMs = 5_000, discoveryIntervalMs = PERPETUAL_DISCOVERY_MS, observationIntervalMs = PERPETUAL_OBSERVATION_MS,
-  broadcastIntervalMs = PERPETUAL_OBSERVATION_MS, watchdogIntervalMs = 10_000, quoteTimeoutMs = 45_000, execution: executionOptions,
-  metrics: metricsOptions, fundingHistory: fundingOptions, priceHistory: priceOptions, quality: qualityOptions, cache = null, cacheUnavailable,
-  paper: paperOptions,
-}: PerpetualOptions = {}) {
-  const quotes = new Map<string, PerpetualQuote>(), pendingQuotes = new Map<string, PerpetualQuote>(), publishedQuotes = new Map<string, PerpetualQuote>(), publishDirty = new Set<string>();
-  const connections = new Set<Connection>(), timers = new Set<ReturnType<typeof setTimeout>>(), pollBudgets = new Map<string, PollBudget>();
-  const discoveries = new Map<string, { controller: AbortController; promise: Promise<void> }>();
+export function createPerpetualMonitor(options: PerpetualOptions = {}) {
+  const {
+    exchanges = EXCHANGES, now: clock = Date.now, log = line => process.stderr.write(`${line}\n`),
+    staleAfterMs = PERPETUAL_STALE_MS, broadcastIntervalMs = STREAM_OBSERVATION_MS, fetchImpl, execution: executionOptions,
+    metrics: metricsOptions, fundingHistory: fundingOptions, priceHistory: priceOptions, quality: qualityOptions, cache = null, cacheUnavailable,
+    paper: paperOptions, remote,
+  } = options;
+  const feed = remote ? null : createPerpetualFeed(options);
+  const quotes = new Map<string, PerpetualQuote>(), publishedQuotes = new Map<string, PerpetualQuote>(), publishDirty = new Set<string>();
   const clients = new Map<ServerResponse, { output: ServerResponse | Gzip; needsSnapshot: boolean }>();
-  const fresh = (): Map<string, VenueState> => new Map(exchanges.map(exchange => [exchange.id, { id: exchange.id, name: exchange.name, kind: exchange.kind, marketCount: 0, lastMessageAt: null, error: null, snapshotError: null, discovering: false, retryPending: false, discoveryFailing: false, generation: 0, reconnects: 0, lastProtocolError: null }]));
-  let states = fresh();
+  const fresh = () => new Map<string, FeedVenue>(exchanges.map(({ id, name, kind }) => [id, { id, name, kind, marketCount: 0, lastMessageAt: null, error: null, reconnects: 0, lastProtocolError: null, online: false }]));
+  let states = fresh(), connectionCount = 0, feedRun = 0, booksAfter = -Infinity;
+  let feedEpoch: string | null = null;
+  let unsubscribe: (() => void) | undefined;
+  const catalogs = new Map<string, Map<string, PerpetualMarket>>(), assembling = new Map<string, Map<string, PerpetualMarket>>();
+  const bookTimes = new Map<string, [number, number]>();
+  const getMarket = (exchange: string, symbol: string) => catalogs.get(exchange)?.get(symbol);
+  const connected = () => new Set([...states.values()].filter(state => state.online).map(state => state.id));
+  const venueLive = (id: string) => feed ? feed.online(id) : !!feedEpoch && remote?.epoch() === feedEpoch && states.get(id)?.online === true;
+  function receive(event: FeedEvent): void {
+    switch (event.type) {
+      case 'reset':
+        feedEpoch = remote?.epoch() ?? null;
+        for (const key of quotes.keys()) if (clients.size) publishDirty.add(key);
+        quotes.clear(); bookTimes.clear(); catalogs.clear(); assembling.clear(); states = fresh(); connectionCount = 0;
+        break;
+      case 'catalog': {
+        if (event.first) assembling.set(event.exchange, new Map());
+        const group = assembling.get(event.exchange);
+        if (!group) break;
+        for (const market of event.markets) group.set(market.symbol, market);
+        if (event.last) { catalogs.set(event.exchange, group); assembling.delete(event.exchange); }
+        break;
+      }
+      case 'quotes':
+        for (const [index, quote] of event.quotes.entries()) {
+          const key = `${quote.exchange}:${quote.symbol}`;
+          const times = event.bookTimes[index];
+          if (times) bookTimes.set(key, times); else bookTimes.delete(key);
+          quotes.set(key, quote); if (clients.size) publishDirty.add(key);
+        }
+        for (const key of event.removed) { quotes.delete(key); bookTimes.delete(key); if (clients.size) publishDirty.add(key); }
+        break;
+      case 'venues':
+        states = new Map(event.venues.map(state => [state.id, state])); connectionCount = event.connections;
+        break;
+    }
+  }
+  function disconnected(): void {
+    feedEpoch = null; booksAfter = clock(); connectionCount = 0; assembling.clear();
+    for (const [id, state] of states) states.set(id, { ...state, online: false, error: '行情服务连接中断，等待重新订阅。' });
+  }
   let running = false, sequence = 0, streamId = randomUUID();
   // A new one per start: stop() aborts its controller for good (the workbench's service is never restarted).
-  let execution: PerpetualExecutionService | null = null;
-  async function inspect<T>(read: (service: PerpetualExecutionService) => Promise<T>): Promise<T> {
+  let execution: Pick<PerpetualExecutionService, 'fx' | 'depth' | 'exit' | 'stop'> | null = null;
+  async function inspect<T>(read: (service: NonNullable<typeof execution>) => Promise<T>): Promise<T> {
     if (!execution) throw new PerpetualInspectionError(503, '合约价差采集未运行，开启后再查询盘口');
     try { return await read(execution); }
     catch (error) {
@@ -176,22 +188,22 @@ export function createPerpetualMonitor({
   // settle, then the dirty entries are written back), awaited by settled() before the cache file closes.
   const metricsFetch = metricsOptions?.fetchImpl ?? fetchImpl;
   const marketMetrics = createPerpetualMarketMetricsService({
-    getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket: (exchange, symbol) => states.get(exchange)?.markets?.get(symbol),
-    store: cache, clock, reader: createPerpetualMetricsReader({ clock, ...(metricsFetch ? { fetchImpl: metricsFetch } : {}) }),
+    getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket,
+    store: cache, clock, reader: remote?.metrics ?? createPerpetualMetricsReader({ clock, ...(metricsFetch ? { fetchImpl: metricsFetch } : {}) }),
     ...(metricsOptions?.intervalMs ? { intervalMs: metricsOptions.intervalMs } : {}),
   });
   const fundingFetch = fundingOptions?.fetchImpl ?? fetchImpl;
   const fundingHistory = createPerpetualFundingHistoryService({
-    getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket: (exchange, symbol) => states.get(exchange)?.markets?.get(symbol),
-    store: cache, clock, reader: createPerpetualFundingReader({ clock, requestSpacingMs: 350, ...(fundingFetch ? { fetchImpl: fundingFetch } : {}) }),
+    getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket,
+    store: cache, clock, reader: remote?.funding ?? createPerpetualFundingReader({ clock, requestSpacingMs: 350, ...(fundingFetch ? { fetchImpl: fundingFetch } : {}) }),
   });
   const priceFetch = priceOptions?.fetchImpl ?? fetchImpl;
   const priceHistory = createPerpetualPriceHistoryService({
-    getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket: (exchange, symbol) => states.get(exchange)?.markets?.get(symbol),
-    store: cache, clock, reader: createPerpetualPriceReader({ clock, requestSpacingMs: 350, ...(priceFetch ? { fetchImpl: priceFetch } : {}) }),
+    getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket,
+    store: cache, clock, reader: remote?.price ?? createPerpetualPriceReader({ clock, requestSpacingMs: 350, ...(priceFetch ? { fetchImpl: priceFetch } : {}) }),
   });
   const scannerData = createPerpetualScannerDataService({
-    getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket: (exchange, symbol) => states.get(exchange)?.markets?.get(symbol),
+    getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket,
     marketMetrics, fundingHistory, clock,
   });
   // M-5d2: the workbench's service; its snapshot is this collector's (status, staleAfterMs, venue statuses and quotes). The
@@ -200,16 +212,16 @@ export function createPerpetualMonitor({
   const qualityFetch = qualityOptions?.fetchImpl ?? fetchImpl;
   const quality = createPerpetualQualityService({
     getSnapshot: () => snapshot(), store: cache, clock, shouldDeferAuxiliary: () => false,
-    fundamentals: qualityOptions?.fundamentals ?? createFundamentalsClient({
+    fundamentals: remote?.fundamentals ?? qualityOptions?.fundamentals ?? createFundamentalsClient({
       clock, ...(qualityOptions?.coinIds ? { coinIds: qualityOptions.coinIds } : {}), ...(qualityOptions?.apiKey ? { apiKey: qualityOptions.apiKey } : {}), ...(qualityFetch ? { fetchImpl: qualityFetch } : {}),
     }),
-    positioningFetch: qualityOptions?.positioningFetch ?? (qualityFetch ? (quote, options) => fetchPositioning(quote, { ...options, fetchImpl: qualityFetch }) : fetchPositioning),
+    positioningFetch: remote?.positioning ?? qualityOptions?.positioningFetch ?? (qualityFetch ? (quote, options) => fetchPositioning(quote, { ...options, fetchImpl: qualityFetch }) : fetchPositioning),
   });
   // M-5e1: as the workbench's (perpetual-service.mjs): a leg is valued only while its venue has a connection open.
   let paperHealthy = true;
   const paperService = () => createPerpetualPaperService({
     store: paperOptions?.store, unavailableReason: paperOptions?.unavailableReason ?? (paperOptions?.store ? '' : '本服务没有配置持仓记录存放'),
-    getQuote: key => quotes.get(key), isVenueLive: id => [...connections].some(connection => connection.exchange === id && connection.socket?.readyState === 1), clock,
+    getQuote: key => quotes.get(key), isVenueLive: venueLive, clock,
   });
   // M-5e2: replaced when a pending import is merged (adoptPaper); `adopting` is the merge in progress, awaited by page writes.
   let paper = paperService(), adopting: Promise<void> | null = null;
@@ -244,20 +256,7 @@ export function createPerpetualMonitor({
       throw new PerpetualInspectionError(status === 400 ? 400 : 500, reason(error));
     }
   }
-  let observationTimer: ReturnType<typeof setInterval> | undefined, broadcastTimer: ReturnType<typeof setInterval> | undefined, refreshTimer: ReturnType<typeof setInterval> | undefined;
-  const venue = (exchange: string): VenueState => states.get(exchange)!;
-
-  function changedQuote(key: string, quote: PerpetualQuote): void { quotes.set(key, quote); if (clients.size) publishDirty.add(key); }
-  function observe(): void {
-    // Directory metadata may change after receipt but before this commit.
-    for (const [key, quote] of pendingQuotes) changedQuote(key, withMarketMetadata(quote, states.get(quote.exchange)?.markets?.get(quote.symbol)));
-    pendingQuotes.clear();
-  }
-  const later = (fn: () => void, ms: number): ReturnType<typeof setTimeout> => {
-    const timer = setTimeout(() => { timers.delete(timer); if (running) fn(); }, ms);
-    timer.unref?.(); timers.add(timer); return timer;
-  };
-  const connected = (): Set<string> => new Set([...connections].filter(connection => connection.socket?.readyState === 1).map(connection => connection.exchange));
+  let broadcastTimer: ReturnType<typeof setInterval> | undefined;
 
   function snapshot(): PerpetualSnapshot {
     const now = clock();
@@ -274,188 +273,10 @@ export function createPerpetualMonitor({
     const exchangeViews: PerpetualExchange[] = [...states.values()].map(state => {
       const own = counts.get(state.id) ?? { all: 0, fresh: 0, freshBook: 0, staleBook: 0, missingBook: 0 };
       const status = !running ? 'disabled' : live.has(state.id) && own.fresh ? 'live' : own.all ? 'stale' : state.error ? 'error' : 'connecting';
-      return { id: state.id, name: state.name, kind: state.kind, status, marketCount: state.marketCount, quoteCount: own.fresh, freshBookCount: own.freshBook, staleBookCount: own.staleBook, missingBookCount: own.missingBook, lastMessageAt: state.lastMessageAt, error: state.error || state.snapshotError || null };
+      return { id: state.id, name: state.name, kind: state.kind, status, marketCount: state.marketCount, quoteCount: own.fresh, freshBookCount: own.freshBook, staleBookCount: own.staleBook, missingBookCount: own.missingBook, lastMessageAt: state.lastMessageAt, error: state.error };
     });
     const liveCount = exchangeViews.filter(exchange => exchange.status === 'live').length;
     return { schemaVersion: 1, monitorId: 'perpetual', streamId, sequence, status: liveCount === states.size && liveCount > 0 ? 'live' : liveCount ? 'partial' : quotes.size ? 'snapshot' : running ? 'connecting' : 'unavailable', generatedAt: now, staleAfterMs, exchanges: exchangeViews, quotes: values, storageError: null };
-  }
-
-  function send(connection: Connection, value: unknown): void {
-    if (connection.socket?.readyState === 1) connection.socket.send(typeof value === 'string' ? value : JSON.stringify(value));
-  }
-
-  function connect(exchange: string, spec: GenerationSpec, attempt = 0): void {
-    const state = states.get(exchange);
-    if (!running || !state || spec.generation !== state.generation) return;
-    const connection: Connection = { exchange, socket: null, timers: new Set(), closed: false, lastMessageAt: clock(), lastQuoteAt: clock(), dispose: () => undefined };
-    const context = structuredClone(spec.context ?? {});
-    const pollHost = new URL(spec.url).host;
-    let pollCursor = 0;
-    if (spec.poll && !pollBudgets.has(pollHost)) pollBudgets.set(pollHost, { startedAt: clock(), sent: 0, nextAt: 0, blockedUntil: 0, failures: 0 });
-    const clear = () => { for (const timer of connection.timers) { clearTimeout(timer); clearInterval(timer); timers.delete(timer); } connections.delete(connection); };
-    const scheduleTask = (fn: () => void, ms: number) => { const timer = later(() => { connection.timers.delete(timer); if (!connection.closed) fn(); }, ms); connection.timers.add(timer); return timer; };
-    connection.dispose = () => { connection.closed = true; clear(); connection.snapshotController?.abort(); try { connection.socket?.close(); } catch { /* already closed */ } };
-    const fail = (message: string) => {
-      if (connection.closed) return;
-      state.error = message; state.reconnects++; connection.dispose();
-      if (running) later(() => connect(exchange, spec, attempt + 1), Math.min(60_000, retryMs * 2 ** Math.min(attempt, 4)) + Math.floor(Math.random() * retryMs / 4));
-    };
-    const acceptUpdates = (updates: PerpetualUpdate[], now: number, transport: 'ws' | 'rest' = 'ws') => {
-      for (const update of updates) {
-        if (update.exchange !== exchange) continue;
-        if (Number.isFinite(update.sourceTime) && now - update.sourceTime! < -MAX_FUTURE_MS) state.error = '行情时间领先服务器，请检查服务器时钟。';
-        const key = `${exchange}:${update.symbol}`, previous = pendingQuotes.get(key) ?? quotes.get(key);
-        const next = mergePerpetualQuote(previous, transport === 'rest' ? { ...update, transport } : update, now);
-        if (next && next !== previous) {
-          pendingQuotes.set(key, withMarketMetadata(next, state.markets?.get(update.symbol)));
-          if (observationIntervalMs <= 0) observe();
-          if (transport === 'ws') connection.lastQuoteAt = now;
-          state.lastMessageAt = now; state.error = null; attempt = 0;
-        }
-      }
-    };
-    const requestSnapshot = async () => {
-      const controller = new AbortController(); connection.snapshotController = controller;
-      try {
-        const updates = await spec.snapshot!({ signal: AbortSignal.any([controller.signal, AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS)]), now: clock(), ...(fetchImpl ? { fetchImpl } : {}) });
-        if (running && !connection.closed) { acceptUpdates(updates, clock(), 'rest'); state.snapshotError = null; }
-      } catch { if (running && !connection.closed) state.snapshotError = '盘口补充快照暂不可用，正在重试。'; }
-      finally { if (running && !connection.closed) scheduleTask(() => { void requestSnapshot(); }, spec.snapshotIntervalMs ?? 10_000); }
-    };
-    const poll = () => {
-      const plan = spec.poll!, started = clock(), messages = plan.messages, budget = pollBudgets.get(pollHost)!;
-      if (budget.blockedUntil > started) { scheduleTask(poll, budget.blockedUntil - started); return; }
-      let remaining = messages.length;
-      const next = () => {
-        const now = clock();
-        if (budget.blockedUntil > now) { scheduleTask(poll, budget.blockedUntil - now); return; }
-        if (plan.maxPerMinute && budget.nextAt > now) { scheduleTask(next, budget.nextAt - now); return; }
-        if (now < budget.startedAt || now - budget.startedAt >= 60_000) { budget.startedAt = now; budget.sent = 0; }
-        if (plan.maxPerMinute && budget.sent >= plan.maxPerMinute) { scheduleTask(poll, Math.max(100, budget.startedAt + 60_000 - now)); return; }
-        while (remaining > 0) {
-          const message = messages[pollCursor++ % messages.length]!; remaining--;
-          const symbol = message.request?.payload?.coin, quote = pendingQuotes.get(`${exchange}:${symbol}`) ?? quotes.get(`${exchange}:${symbol}`);
-          // A book still fresh from the stream needs no auxiliary read.
-          if (plan.staleBookAfterMs && quote && (quote.bid ?? 0) > 0 && (quote.ask ?? 0) >= quote.bid! && Number.isFinite(quote.bidAskAt)
-            && quote.bidAskAt! >= now - plan.staleBookAfterMs && quote.bidAskAt! <= now + MAX_FUTURE_MS) continue;
-          try {
-            send(connection, message); budget.sent++;
-            if (plan.maxPerMinute) budget.nextAt = now + Math.ceil(60_000 / plan.maxPerMinute);
-          } catch { fail('WebSocket 快照请求失败，正在重连。'); return; }
-          break;
-        }
-        if (remaining > 0) scheduleTask(next, plan.sendIntervalMs ?? 100);
-        else scheduleTask(poll, Math.max(plan.sendIntervalMs ?? 100, (plan.intervalMs ?? 10_000) - (clock() - started)));
-      };
-      if (messages.length) next();
-    };
-    try {
-      const socket = new WebSocketImpl(spec.url, spec.headers ? { headers: spec.headers } : undefined);
-      connection.socket = socket;
-      try { socket.binaryType = 'arraybuffer'; } catch { /* a stand-in without it */ }
-      connections.add(connection);
-      scheduleTask(() => { if (socket.readyState !== 1) fail('WebSocket 连接超时，正在重连。'); }, CONNECT_TIMEOUT_MS);
-      socket.addEventListener('open', () => {
-        if (connection.closed || !running) return connection.dispose();
-        (spec.subscribe ?? []).forEach((message, index) => scheduleTask(() => {
-          try { send(connection, message); } catch { fail('WebSocket 订阅失败，正在重连。'); }
-        }, index * (spec.sendIntervalMs ?? 100)));
-        if (spec.poll) scheduleTask(poll, ((spec.subscribe?.length ?? 0) + 1) * (spec.sendIntervalMs ?? 100));
-        if (spec.snapshot) scheduleTask(() => { void requestSnapshot(); }, 500);
-        if (spec.heartbeat) {
-          const heartbeat = setInterval(() => { try { send(connection, spec.heartbeat); } catch { fail('WebSocket 心跳失败，正在重连。'); } }, spec.heartbeatMs ?? 20_000);
-          heartbeat.unref?.(); connection.timers.add(heartbeat);
-        }
-        const watchdog = setInterval(() => {
-          if (clock() - connection.lastMessageAt > quoteTimeoutMs) fail('WebSocket 未收到数据，正在重连。');
-          else if (clock() - connection.lastQuoteAt > quoteTimeoutMs) fail('WebSocket 只有心跳，未收到有效行情，正在重订阅。');
-        }, watchdogIntervalMs);
-        watchdog.unref?.(); connection.timers.add(watchdog);
-      });
-      socket.addEventListener('message', event => {
-        if (connection.closed || !running) return;
-        const now = clock(); connection.lastMessageAt = now;
-        let payload: unknown;
-        try { payload = JSON.parse(typeof event.data === 'string' ? event.data : Buffer.from(event.data as ArrayBuffer).toString()); }
-        catch { payload = event.data; }
-        try {
-          // An auxiliary read's error (a 429) backs off only the shared-host poller, never the healthy book stream.
-          const post = payload as { channel?: string; data?: { response?: { type?: string; payload?: unknown } } } | null;
-          if (spec.poll && post?.channel === 'post' && post.data?.response?.type === 'error') {
-            const budget = pollBudgets.get(pollHost)!;
-            budget.failures++;
-            budget.blockedUntil = now + Math.min(300_000, 60_000 * 2 ** Math.min(budget.failures - 1, 3));
-            state.lastProtocolError = `${exchange} auxiliary snapshot: ${String(post.data.response.payload).slice(0, 230)}`;
-            return;
-          }
-          if (spec.poll && post?.channel === 'post' && post.data?.response?.type === 'info') pollBudgets.get(pollHost)!.failures = 0;
-          const reply = control(exchange, payload);
-          if (reply != null) send(connection, reply);
-          acceptUpdates(parse(exchange, payload, spec.markets ?? [], now, context), now);
-        } catch (error) { state.lastProtocolError = reason(error).slice(0, 300); fail('行情消息无效，正在重新订阅。'); }
-      });
-      socket.addEventListener('error', () => fail('WebSocket 暂不可用，正在重连。'));
-      socket.addEventListener('close', () => fail('WebSocket 已断开，正在重连。'));
-    } catch { fail('无法建立 WebSocket，正在重试。'); }
-  }
-
-  async function refresh(exchange: string): Promise<void> {
-    const state = venue(exchange);
-    if (!running || state.discovering) return;
-    state.discovering = true;
-    const controller = new AbortController(), owner = states;
-    const promise = (async () => {
-      try {
-        const markets = await discover(exchange, { signal: controller.signal, ...(fetchImpl ? { fetchImpl } : {}) });
-        if (!running || states !== owner) return;
-        if (!markets.length) throw new Error('No active markets');
-        const specs = subscriptions(exchange, markets);
-        if (!specs.length) throw new Error('No subscriptions');
-        if (state.discoveryFailing) { state.discoveryFailing = false; log(`合约价差：${state.name} 合约列表已恢复`); }
-        if (state.error === DISCOVERY_ERROR) state.error = null;
-        state.marketCount = markets.length;
-        // Funding intervals, multipliers and channel ids may change while symbols stay; lifecycle, fee and classification
-        // fields reach readers without a new price and without resubscribing.
-        const identities = new Map(markets.map(market => [market.symbol, market]));
-        const signature = JSON.stringify([...markets].sort((left, right) => left.symbol.localeCompare(right.symbol)), (key, value) => CATALOG_FIELDS.has(key) ? undefined : value);
-        state.markets = identities;
-        for (const [key, quote] of quotes) {
-          if (quote.exchange !== exchange || !identities.has(quote.symbol)) continue;
-          const current = withMarketMetadata(quote, identities.get(quote.symbol));
-          if (current !== quote) changedQuote(key, current);
-        }
-        if (signature === state.signature) return;
-        // A retired subscription generation must not publish a buffered quote of an old contract.
-        for (const [key, quote] of pendingQuotes) if (quote.exchange === exchange) pendingQuotes.delete(key);
-        for (const [key, quote] of quotes) {
-          if (quote.exchange !== exchange) continue;
-          const market = identities.get(quote.symbol);
-          if (!market || quote.base !== market.base || quote.quoteCurrency !== market.quoteCurrency || (quote.multiplier ?? 1) !== (market.multiplier ?? 1)
-            || (market.contractUnit && market.contractUnit !== quote.contractUnit) || (market.comparable === false && quote.comparable !== false)) {
-            quotes.delete(key); if (clients.size) publishDirty.add(key);
-          }
-        }
-        // Retire the previous generation's reconnect timers as well as its live connections.
-        state.generation++;
-        for (const connection of [...connections]) if (connection.exchange === exchange) connection.dispose();
-        state.signature = signature;
-        for (const spec of specs) {
-          const current = { ...spec, generation: state.generation };
-          later(() => connect(exchange, current), spec.startDelayMs ?? 0);
-        }
-      } catch (error) {
-        if (running && states === owner) {
-          // Logged once per run of failures (a venue blocked from this address fails every 30 s for good), apart from the
-          // status error, which an older generation's quotes clear while the directory keeps failing.
-          if (!state.discoveryFailing) log(`合约价差：${state.name} 合约列表获取失败（${reason(error)}），每 ${DISCOVERY_RETRY_MS / 1000} 秒重试，恢复前不再记录`);
-          state.discoveryFailing = true; state.error = DISCOVERY_ERROR;
-          // One pending retry per venue: the 5-minute refresh failing again must not start a second 30-second chain.
-          if (!state.retryPending) { state.retryPending = true; later(() => { state.retryPending = false; void refresh(exchange); }, DISCOVERY_RETRY_MS); }
-        }
-      } finally { state.discovering = false; if (discoveries.get(exchange)?.controller === controller) discoveries.delete(exchange); }
-    })();
-    discoveries.set(exchange, { controller, promise });
-    await promise;
   }
 
   function broadcast(): void {
@@ -486,25 +307,26 @@ export function createPerpetualMonitor({
      * ask times), for the oil and hynix book readers; null while stopped or without a book. Read only.
      */
     book(exchange: string, symbol: string): { bid: number; ask: number; at: number; multiplier: number } | null {
-      const quote = running ? quotes.get(`${exchange}:${symbol}`) : undefined;
-      if (!quote || quote.bid === null || quote.ask === null || !Number.isFinite(quote.bidAskAt)) return null;
-      return { bid: quote.bid, ask: quote.ask, at: quote.bidAskAt!, multiplier: quote.multiplier ?? 1 };
+      const key = `${exchange}:${symbol}`, quote = running ? quotes.get(key) : undefined;
+      const market = getMarket(exchange, symbol), times = bookTimes.get(key);
+      if (!times || !market || !quote?.historyIdentity || perpetualPriceIdentity(market) !== quote.historyIdentity || !venueLive(exchange) || quote.bid === null || quote.ask === null || times[0] <= booksAfter || times[1] > clock() + 1_000) return null;
+      return { bid: quote.bid, ask: quote.ask, at: times[0], multiplier: quote.multiplier ?? 1 };
     },
     /** Starts discovery and the connections; idempotent. */
     start(): void {
       if (running) return;
       running = true;
-      execution = createPerpetualExecutionService({
-        getQuote: (exchange, symbol) => quotes.get(`${exchange}:${symbol}`), getMarket: (exchange, symbol) => states.get(exchange)?.markets?.get(symbol),
+      const generation = ++feedRun;
+      const subscribe = remote?.subscribe ?? feed!.subscribe;
+      unsubscribe = subscribe(event => { if (running && generation === feedRun) receive(event); }, () => { if (running && generation === feedRun) disconnected(); });
+      execution = remote?.execution((exchange, symbol) => quotes.get(`${exchange}:${symbol}`)) ?? createPerpetualExecutionService({
+        getQuote: (exchange, symbol) => quotes.get(`${exchange}:${symbol}`), getMarket,
         clock, ...(fetchImpl ? { fetchImpl } : {}), ...executionOptions,
       });
       marketMetrics.start(); fundingHistory.start(); priceHistory.start(); quality.start();
       // A pending import is merged before the paper service starts (the merge starts the rebuilt one); a merge still running
       // from an earlier start starts it too.
       if (!adoptPaper()) paper.start();
-      if (observationIntervalMs > 0) { observationTimer = setInterval(observe, observationIntervalMs); observationTimer.unref?.(); }
-      for (const exchange of states.keys()) void refresh(exchange);
-      refreshTimer = setInterval(() => { for (const exchange of states.keys()) void refresh(exchange); }, discoveryIntervalMs);
       // The workbench checks the paper positions on its broadcast timer too; the service observes at most once a minute.
       broadcastTimer = setInterval(() => {
         // A failed save keeps the broadcast going; the log gets one line when saving starts or stops failing (the page shows it too).
@@ -517,7 +339,7 @@ export function createPerpetualMonitor({
         });
         broadcast();
       }, broadcastIntervalMs);
-      refreshTimer.unref?.(); broadcastTimer.unref?.();
+      broadcastTimer.unref?.();
     },
     /**
      * Stops everything (the switch turned off, or the service stopping): the readers' streams end, the connections close, and
@@ -530,13 +352,8 @@ export function createPerpetualMonitor({
       // A merge in progress is waited for, then the service it built is stopped (unless the collector was started again).
       const paperStopping = adopting ? adopting.then(() => (running ? undefined : paper.stop())) : paper.stop();
       metricsStopping = Promise.all([marketMetrics.stop(), fundingHistory.stop(), priceHistory.stop(), quality.stop(), paperStopping].map(stopping => stopping.catch(() => undefined))).then(() => undefined);
-      for (const timer of [observationTimer, refreshTimer, broadcastTimer]) clearInterval(timer);
-      for (const timer of timers) clearTimeout(timer);
-      timers.clear();
-      for (const item of discoveries.values()) item.controller.abort();
-      discoveries.clear();
-      for (const connection of [...connections]) connection.dispose();
-      quotes.clear(); pendingQuotes.clear(); pollBudgets.clear();
+      feedRun++; unsubscribe?.(); unsubscribe = undefined; clearInterval(broadcastTimer);
+      quotes.clear(); bookTimes.clear(); catalogs.clear(); assembling.clear(); connectionCount = 0; booksAfter = -Infinity;
       states = fresh(); sequence = 0; streamId = randomUUID();
     },
     snapshot,
@@ -570,8 +387,8 @@ export function createPerpetualMonitor({
     status(): PerpetualStatusView {
       const views = new Map(snapshot().exchanges.map(exchange => [exchange.id, exchange]));
       return {
-        running, quotes: quotes.size, clients: clients.size, connections: connections.size,
-        venues: [...states.values()].map(state => ({ id: state.id, status: views.get(state.id)!.status, marketCount: state.marketCount, reconnects: state.reconnects, lastMessageAt: state.lastMessageAt, error: state.error || state.snapshotError || null, lastProtocolError: state.lastProtocolError })),
+        running, quotes: quotes.size, clients: clients.size, connections: connectionCount,
+        venues: [...states.values()].map(state => ({ id: state.id, status: views.get(state.id)!.status, marketCount: state.marketCount, reconnects: state.reconnects, lastMessageAt: state.lastMessageAt, error: state.error, lastProtocolError: state.lastProtocolError })),
       };
     },
     /**

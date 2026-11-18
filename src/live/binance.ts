@@ -2,7 +2,7 @@
 // production client server/trading-execution-exchanges.mjs, which stays unchanged; only orders by client id are used here.
 import { createHash } from 'node:crypto';
 import { binanceSignedQuery } from '../vendor/binance.mjs';
-import { VENUE_EXECUTION_SYMBOLS, VENUE_READ_SYMBOLS, accountKey, type AccountBinding, type AccountSnapshot, type Instrument, type OpenOrder, type Position, type Quote } from '../contracts.ts';
+import { VENUE_EXECUTION_SYMBOLS, VENUE_READ_SYMBOLS, accountKey, type AccountBinding, type AccountSnapshot, type Instrument, type OpenOrder, type Position } from '../contracts.ts';
 import { VenueError, type CallOptions, type ConnectorCapabilities, type LedgerEntry, type LedgerKind, type OrderReport, type OrderRequest, type OrderStatus, type PnlPosition, type PnlSnapshot, type SendOptions, type VenueConnector } from '../connector.ts';
 import { cmp, isZero, sub } from '../decimal.ts';
 import { exchange, type FetchLike, type HttpReply } from './http.ts';
@@ -345,15 +345,8 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
       return { ...instrument };
     }),
 
-    quote: (symbol: string, { signal }: CallOptions) => reading(async (): Promise<Quote> => {
-      if (!VENUE_READ_SYMBOLS.binance.includes(symbol)) throw new VenueError('read-failed', `${symbol} 不在 Binance 可读合约内`);
-      const book = record(await publicRead('/fapi/v1/ticker/bookTicker', { symbol }, signal, 4096), '盘口');
-      const receivedAt = now();
-      if (book.symbol !== symbol) throw new ShapeError('盘口合约与请求不一致');
-      const bid = amount(book.bidPrice, '买一价'), ask = amount(book.askPrice, '卖一价');
-      amount(book.bidQty, '买一量'); amount(book.askQty, '卖一量');
-      return { venue: 'binance', symbol, bid, ask, sourceTime: millis(book.time, '盘口时间'), receivedAt, connectionGeneration: 0, sequence: null, complete: true };
-    }),
+    quote: (symbol: string, { signal }: CallOptions) => reading(async () =>
+      (await import('../market/books.ts')).readPublicBook('binance', symbol, signal, fetchImpl, now, timeoutMs)),
 
     account: (binding: AccountBinding, symbols: readonly string[], { signal }: CallOptions) => reading(async (): Promise<AccountSnapshot> => {
       if (symbols.length === 0 || symbols.some(symbol => !VENUE_READ_SYMBOLS.binance.includes(symbol))) throw new VenueError('read-failed', '账户快照的合约无效');

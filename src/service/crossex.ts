@@ -17,6 +17,8 @@ import { createMarket, type CrossexMarket } from '../vendor/crossex/market.mjs';
 import { createLiveRuntime, type CrossexLiveRuntime } from '../vendor/crossex/live-runtime.mjs';
 import { createTerminalMarket, type CrossexTerminalMarket } from '../vendor/crossex/terminal-market.mjs';
 import { limitProblem, type CrossexServiceConfig } from './crossex-config.ts';
+import type { MarketClient } from '../market/ipc.ts';
+import { remoteCrossexReaders } from './remote-venue-feeds.ts';
 
 export const CROSSEX_LOCK_VENUE = 'gate-crossex';
 const PREFLIGHT_MS = 30_000;
@@ -50,6 +52,7 @@ export interface CrossexRuntime {
 }
 
 export interface CrossexOptions {
+  marketClient?: MarketClient;
   /** Tests stand in for Gate (the start check and the runtime's signed reads); the network by default. */
   fetchImpl?: FetchLike;
   preflightTimeoutMs?: number;
@@ -139,7 +142,7 @@ async function stopParts(parts: Parts, waitMs = Infinity): Promise<void> {
  * makes sure its connection is this key on this UID. Any failure undoes what was opened (each part's stop waited at most
  * FAILED_STOP_WAIT_MS), releases the lock and throws a CrossexStartError.
  */
-export async function prepareCrossex(config: CrossexServiceConfig, credentials: LiveCredentials | undefined, dir: string, { fetchImpl, preflightTimeoutMs = PREFLIGHT_MS, marketOptions, terminalOptions, liveOptions, signal }: CrossexOptions = {}): Promise<CrossexRuntime> {
+export async function prepareCrossex(config: CrossexServiceConfig, credentials: LiveCredentials | undefined, dir: string, { fetchImpl, preflightTimeoutMs = PREFLIGHT_MS, marketOptions, terminalOptions, liveOptions, signal, marketClient }: CrossexOptions = {}): Promise<CrossexRuntime> {
   if (!credentials) throw new Error('配置了 crossex，但密钥文件里没有 gate');
   let locks: { release(): void };
   try { locks = await holdAccountLocks([{ venue: CROSSEX_LOCK_VENUE, accountId: config.accountUid }]); }
@@ -160,9 +163,10 @@ export async function prepareCrossex(config: CrossexServiceConfig, credentials: 
       // the per-UID host lock and on one data directory per UID: a second data directory for the same UID on another
       // host would not be seen by the lock, and its lease would be deleted here.
       if (store.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='live_owner'").get()) store.prepare('DELETE FROM live_owner').run();
-      const market = parts.market = createMarket(store, marketOptions);
+      const remote = marketClient ? remoteCrossexReaders(marketClient) : undefined;
+      const market = parts.market = createMarket(store, { ...marketOptions, ...remote?.marketOptions });
       live = parts.live = createLiveRuntime(store, { ...liveOptions, market, clientFactory });
-      parts.terminal = createTerminalMarket({ ...terminalOptions, market });
+      parts.terminal = createTerminalMarket({ ...terminalOptions, ...remote?.terminalOptions, market });
     } catch (error) { throw new CrossexStartError('store', describe(error)); }
     let record = storedConnection(store);
     if (!record?.enabled || record.accountReference !== keyReference(secret.apiKey)) {

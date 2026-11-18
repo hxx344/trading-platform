@@ -77,7 +77,8 @@ export function parseChain(instruments: Row[], tickers: Row[], now: number): { r
 }
 
 export function createOptionMarket(client: OptionsClient, { now = Date.now, log = (_line: string) => undefined }: { now?: () => number; log?: (line: string) => void } = {}) {
-  let snapshot: ChainSnapshot | null = null;
+  let snapshot: ChainSnapshot | null = null, epoch: string | null = null;
+  const current = () => !client.marketEpoch || (epoch !== null && epoch === client.marketEpoch()) ? snapshot : null;
   let instruments: { rows: Row[]; at: number } | null = null;
   let error: { message: string; at: number } | null = null;
   let running: Promise<ChainSnapshot | null> | null = null;
@@ -85,31 +86,33 @@ export function createOptionMarket(client: OptionsClient, { now = Date.now, log 
   async function load(forceInstruments: boolean): Promise<ChainSnapshot | null> {
     const time = now(), signal = AbortSignal.timeout(READ_TIMEOUT_MS * 2);
     try {
-      const stale = forceInstruments || !instruments || time - instruments.at >= INSTRUMENT_REFRESH_MS;
+      const stale = forceInstruments || !instruments || (client.marketEpoch && epoch !== client.marketEpoch()) || time - instruments.at >= INSTRUMENT_REFRESH_MS;
       const [rawInstruments, tickers, underlying] = await Promise.all([stale ? client.instruments(signal) : Promise.resolve(instruments!.rows), client.tickers(signal), client.underlying(signal)]);
       if (stale) instruments = { rows: rawInstruments, at: time };
       const { rows, greeks } = parseChain(rawInstruments, tickers, time);
       const usable = rows.filter(row => Math.abs(row.delta) > 0 && row.mark > 0);
       if (usable.length < 2 || new Set(usable.map(row => row.optionType)).size !== 2) throw new Error('Bybit 没有返回可用的 BTC 期权链');
       const index = number(underlying.indexPrice) || number(underlying.markPrice) || number(underlying.lastPrice);
-      snapshot = { rows, greeks, index: index > 0 ? index : null, at: time };
+      const at = Math.min(time, client.publicAt?.(tickers) ?? time, client.publicAt?.(underlying) ?? time);
+      epoch = client.marketEpoch?.() ?? null;
+      snapshot = { rows, greeks, index: index > 0 ? index : null, at };
       error = null;
-      return snapshot;
+      return current();
     } catch (failure) {
       error = { message: describe(failure), at: time };
       log(`期权行情刷新失败，保留上次结果：${error.message}`);
-      return snapshot;
+      return current();
     }
   }
 
   return {
     /** Re-reads unless the snapshot is younger than `fresherThanMs`; concurrent callers share one read. */
     async refresh({ fresherThanMs = 0, forceInstruments = false }: { fresherThanMs?: number; forceInstruments?: boolean } = {}): Promise<ChainSnapshot | null> {
-      if (snapshot && fresherThanMs > 0 && now() - snapshot.at < fresherThanMs) return snapshot;
+      if (current() && snapshot && fresherThanMs > 0 && now() - snapshot.at < fresherThanMs) return snapshot;
       running ??= load(forceInstruments).finally(() => { running = null; });
       return running;
     },
-    snapshot: (): ChainSnapshot | null => snapshot,
+    snapshot: current,
     error: () => error,
   };
 }

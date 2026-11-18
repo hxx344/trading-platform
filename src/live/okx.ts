@@ -3,7 +3,7 @@
 // server/trading-okx-execution.mjs at 7745181); the bill types follow server/trading-okx-readonly.mjs.
 import { okxAuthHeaders } from '../vendor/okx.mjs';
 import { createHash } from 'node:crypto';
-import { VENUE_EXECUTION_SYMBOLS, accountKey, type AccountBinding, type AccountSnapshot, type Instrument, type OpenOrder, type Position, type PositionSide, type Quote } from '../contracts.ts';
+import { VENUE_EXECUTION_SYMBOLS, accountKey, type AccountBinding, type AccountSnapshot, type Instrument, type OpenOrder, type Position, type PositionSide } from '../contracts.ts';
 import { VenueError, type CallOptions, type ConnectorCapabilities, type LedgerEntry, type OrderReport, type OrderRequest, type OrderStatus, type PnlPosition, type PnlSnapshot, type SendOptions, type VenueConnector } from '../connector.ts';
 import { cmp, isZero, mul, sub } from '../decimal.ts';
 import { exchange, isRecord, type FetchLike, type HttpReply } from './http.ts';
@@ -47,7 +47,8 @@ const PAGE_SIZE = 100;
 const MAX_ORDER_PAGES = 20;
 /** 60 pages at the 420 ms spacing (about 25 s) fit inside the PnL ledger timeout (LEDGER_TIMEOUT_MS, 30 s); more fails the window by name. */
 const BILL_MAX_PAGES = 60;
-export const INSTRUMENT_IDS: Record<string, string> = { CLUSDT: 'CL-USDT-SWAP', BZUSDT: 'BZ-USDT-SWAP', SKHYUSDT: 'SKHY-USDT-SWAP', SKHYNIXUSDT: 'SKHYNIX-USDT-SWAP' };
+import { INSTRUMENT_IDS } from './instrument-ids.ts';
+export { INSTRUMENT_IDS } from './instrument-ids.ts';
 /** Strategy orders of any of these kinds can trade on the account at any time; each one counts as foreign activity. */
 const ALGO_TYPES = ['conditional,oco', 'trigger', 'move_order_stop', 'iceberg', 'twap', 'chase'];
 /**
@@ -347,22 +348,8 @@ export function createOkxConnector(options: OkxConnectorOptions): VenueConnector
       return { ...instrument };
     }),
 
-    quote: (symbol: string, { signal }: CallOptions) => reading(async (): Promise<Quote> => {
-      const instId = instrumentId(symbol);
-      const data = await publicRead('/api/v5/market/books', { instId, sz: '1' }, signal);
-      const receivedAt = now();
-      if (data.length !== 1) throw new ShapeError('盘口不是一条记录');
-      const book = record(data[0], '盘口');
-      const level = (side: unknown, name: string): string => {
-        const levels = list(side, name, 1), top = list(levels[0], name, 4);
-        if (levels.length !== 1 || top.length < 2) throw new ShapeError(`${name}缺失`);
-        amount(top[1], `${name}数量`);
-        return amount(top[0], name);
-      };
-      const bid = level(book.bids, '买一价'), ask = level(book.asks, '卖一价');
-      if (cmp(bid, ask) >= 0) throw new ShapeError('盘口买一不低于卖一');
-      return { venue: 'okx', symbol, bid, ask, sourceTime: millis(book.ts, '盘口时间'), receivedAt, connectionGeneration: 0, sequence: null, complete: true };
-    }),
+    quote: (symbol: string, { signal }: CallOptions) => reading(async () =>
+      (await import('../market/books.ts')).readPublicBook('okx', symbol, signal, fetchImpl, now, timeoutMs)),
 
     account: (binding: AccountBinding, symbols: readonly string[], { signal }: CallOptions) => reading(async (): Promise<AccountSnapshot> => {
       if (symbols.length === 0 || symbols.some(symbol => !VENUE_EXECUTION_SYMBOLS.okx.includes(symbol))) throw new VenueError('read-failed', '账户快照的合约无效');

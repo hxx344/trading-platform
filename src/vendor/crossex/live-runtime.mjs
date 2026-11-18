@@ -240,6 +240,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     const active = activeSubmission, record = connectionRecord();
     if (!active || record?.version !== active.version || record?.accountUid !== active.accountUid
       || method !== active.method || (method === 'POST' ? hash(Object.entries(payload).sort()) !== active.payloadHash : path !== `/crossex/orders/${active.orderId}`)
+      || active.quotesCurrent && !active.quotesCurrent()
       || active.expiresAt !== undefined && (clock() >= active.expiresAt || remaining(active.deadline) <= 0 || configFingerprint() !== active.configFingerprint)) fail('连接或发送许可已变化');
     assertWriter(active.ticket);
   }
@@ -848,7 +849,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     const currentRisk = await withinDeadline(() => riskPreview(plan, record, cache), deadline);
     if (currentRisk && plan.risk && hash(currentRisk.legs.map(l => [l.symbol, l.leverage])) !== hash(plan.risk.legs.map(l => [l.symbol, l.leverage]))) fail('账户杠杆已变化，请重新预览');
     assertOwner();
-    if (remaining(deadline) <= 0 || clock() >= plan.expiresAt || connectionRecord()?.version !== record.version || configFingerprint() !== plan.configFingerprint) fail('预览或连接已变化，请重新预览');
+    if (remaining(deadline) <= 0 || clock() >= plan.expiresAt || plan.quotesCurrent && !plan.quotesCurrent() || connectionRecord()?.version !== record.version || configFingerprint() !== plan.configFingerprint) fail('预览、公开行情或连接已变化，请重新预览');
     const ticket = claimWriter(record);
     const execution = { id: id(), requestId, previewId: plan.id, kind: plan.kind, ...(plan.kind === 'position' ? { action: plan.action, strategy: plan.strategy, targetQuantity: plan.targetQuantity } : {}), base: plan.base, accountUid: record.accountUid, connectionVersion: record.version, createdAt: clock(), updatedAt: clock() };
     const legs = plan.legs.map((leg, index) => ({ id: id(), executionId: execution.id, index, text: `cx-${id()}`, version: record.version, status: 'PREPARED',
@@ -867,7 +868,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     for (const [index, order] of legs.entries()) {
       const legStarted = performance.now(), legPollMs = ['open', 'position'].includes(plan.kind) && legs.length > 1 ? confirmationPollMs : Math.min(confirmationPollMs, legs.length > 1 ? 1000 : 1500);
       const currentConnection = connectionRecord();
-      if (['open', 'position'].includes(plan.kind) && index && legs[index - 1].status !== 'FILLED' || remaining(deadline) <= 0 || clock() >= plan.expiresAt || !owns()
+      if (['open', 'position'].includes(plan.kind) && index && legs[index - 1].status !== 'FILLED' || remaining(deadline) <= 0 || clock() >= plan.expiresAt || plan.quotesCurrent && !plan.quotesCurrent() || !owns()
         || !currentConnection?.enabled || currentConnection.version !== record.version || currentConnection.accountUid !== record.accountUid || configFingerprint() !== plan.configFingerprint) {
         if (mayPersist(ticket)) { order.status = 'UNSENT'; order.error = '前腿未全成、确认超时或设置/连接已变化，此腿没有发送；请管理实际敞口'; writeOrder(order); } continue;
       }
@@ -877,7 +878,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
         const submissionTicket = operation ?? ticket;
         assertWriter(submissionTicket); order.status = 'SENDING'; writeOrder(order);
         activeSubmission = { ticket: submissionTicket, version: record.version, accountUid: record.accountUid, method: 'POST',
-          payloadHash: hash(Object.entries(createPayload(order)).sort()), expiresAt: plan.expiresAt, deadline, configFingerprint: plan.configFingerprint };
+          payloadHash: hash(Object.entries(createPayload(order)).sort()), expiresAt: plan.expiresAt, quotesCurrent: plan.quotesCurrent, deadline, configFingerprint: plan.configFingerprint };
         const response = await withinDeadline(() => { assertWriter(submissionTicket); invoked = true; return client.createOrder(createPayload(order)); }, deadline);
         if (mayPersist(ticket)) {
           if (object(response) && response.order_id && response.text === order.text && response.state === undefined) {

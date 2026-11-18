@@ -1,94 +1,19 @@
-// 复制自 project-aggregation 工作台 modules/crossex/server/terminal-market.mjs（提交 7745181），改动：仅把 npm 包 ws 的 import 改为本仓 ./node-ws.mjs（Node 24 全局 WebSocket 的 ws 兼容适配；ping() 为空操作，连接被对端关闭后由 read() 按原逻辑 5 秒后重连）。
 // Public terminal feeds adapted from your-quantguy/gate-crossex at 423356d.
 // Copyright (c) the original contributors. AGPL-3.0-only; see THIRD_PARTY_NOTICES.md.
-import WebSocket from './node-ws.mjs';
-import { getJson, loadManualDepth } from './clients.mjs';
+import { createTerminalFeed } from './terminal-feed.mjs';
+import { createCandleReader } from './candle-reader.mjs';
+import { bookChannel, numeric, time, TERMINAL_SYMBOL, normalizeCandles, INTERVALS } from './terminal-data.mjs';
+import { loadManualDepth } from './clients.mjs';
 import { AppError, validateBooks } from './model.mjs';
-import { D, Decimal } from './money.mjs';
+import { D } from './money.mjs';
 
-const WS_URL = 'wss://api.gateio.ws/ws/crossex/public';
-export const INTERVALS = Object.freeze({ '1m': 60000, '5m': 300000, '15m': 900000, '30m': 1800000, '1h': 3600000, '4h': 14400000, '1d': 86400000 });
-const BARS = { '1m': '1', '5m': '5', '15m': '15', '30m': '30', '1h': '60', '4h': '240', '1d': 'D' };
-const numeric = (v, positive = false) => { try { return ['string', 'number'].includes(typeof v) && String(v).trim() && D(v).isFinite() && (!positive || D(v).gt(0)) ? D(v).toString() : null; } catch { return null; } };
-const time = v => { if (typeof v !== 'number' && (typeof v !== 'string' || !/^[0-9]+$/.test(v))) return null; const n = Number(v); return Number.isSafeInteger(n) && n > 0 ? n : null; };
-const failure = () => new AppError('公开历史行情响应无效', 502);
-export function normalizeCandles(rows, interval, now, keep = 240) {
-  if (!Array.isArray(rows) || rows.length > 5000) throw failure();
-  const unique = new Map();
-  for (const row of rows) {
-    const candle = { time: time(row.time), open: numeric(row.open, true), high: numeric(row.high, true), low: numeric(row.low, true), close: numeric(row.close, true), volume: numeric(row.volume) };
-    if (!candle.time || candle.time > now + 1000 || candle.time % INTERVALS[interval] !== 0 || Object.values(candle).some(v => v === null) || D(candle.volume).lt(0)
-      || D(candle.high).lt(Decimal.max(candle.open, candle.close, candle.low)) || D(candle.low).gt(Decimal.min(candle.open, candle.close, candle.high))) throw failure();
-    if (unique.has(candle.time)) throw failure();
-    unique.set(candle.time, candle);
-  }
-  // Preserve genuine gaps. The chart must not manufacture missing candles.
-  return [...unique.values()].sort((a, b) => a.time - b.time).slice(-keep);
-}
-
-export function createCandleReader({ fetcher = fetch, clock = Date.now } = {}) {
-  const get = url => getJson(url, { fetcher, maxBytes: 4000000 });
-  return async function candles(q, interval) {
-    if (!Object.hasOwn(INTERVALS, interval)) throw new AppError('不支持的 K 线周期');
-    const encoded = encodeURIComponent(q.symbol), end = clock(), start = end - INTERVALS[interval] * 240;
-    let data, rows;
-    if (q.exchange === 'binance') {
-      data = await get(`https://fapi.binance.com/fapi/v1/klines?symbol=${encoded}&interval=${interval}&limit=240`);
-      rows = data?.map?.(r => ({ time: r[0], open: r[1], high: r[2], low: r[3], close: r[4], volume: r[5] }));
-    } else if (q.exchange === 'bybit') {
-      data = await get(`https://api.bybit.com/v5/market/kline?category=linear&symbol=${encoded}&interval=${BARS[interval]}&limit=240`);
-      if (data.retCode !== 0) throw failure();
-      rows = data.result?.list?.map(r => ({ time: r[0], open: r[1], high: r[2], low: r[3], close: r[4], volume: r[5] }));
-    } else if (q.exchange === 'okx') {
-      const bar = interval.endsWith('h') ? interval.toUpperCase() : interval === '1d' ? '1Dutc' : interval;
-      data = await get(`https://www.okx.com/api/v5/market/candles?instId=${encoded}&bar=${bar}&limit=240`);
-      if (data.code !== '0') throw failure();
-      // OKX's seventh column is volume in base currency; column six is contracts.
-      rows = data.data?.map(r => ({ time: r[0], open: r[1], high: r[2], low: r[3], close: r[4], volume: r[6] }));
-    } else if (q.exchange === 'gate') {
-      const [candles, contract] = await Promise.all([get(`https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract=${encoded}&interval=${interval}&limit=240`), get(`https://api.gateio.ws/api/v4/futures/usdt/contracts/${encoded}`)]);
-      if (!numeric(contract.quanto_multiplier, true) || contract.name !== q.symbol) throw failure();
-      rows = candles?.map?.(r => ({ time: Number(r.t) * 1000, open: r.o, high: r.h, low: r.l, close: r.c, volume: D(r.v).times(contract.quanto_multiplier).toString() }));
-    } else if (q.exchange === 'kraken') {
-      data = await get(`https://futures.kraken.com/api/charts/v1/trade/${encoded}/${interval}?count=240`);
-      rows = data.candles?.map(r => ({ time: r.time, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume }));
-    } else if (q.exchange === 'hyperliquid') {
-      // Public read-only POST. No account, authentication or order payload exists here.
-      const response = await fetcher('https://api.hyperliquid.xyz/info', { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(8000), headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'candleSnapshot', req: { coin: q.symbol, interval, startTime: start, endTime: end } }) });
-      if (!response.ok) { await response.body?.cancel(); throw failure(); }
-      const chunks = []; let length = 0;
-      for await (const chunk of response.body || []) { length += chunk.length; if (length > 4000000) throw failure(); chunks.push(chunk); }
-      data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      rows = data?.map?.(r => ({ time: r.t, open: r.o, high: r.h, low: r.l, close: r.c, volume: r.v }));
-    } else if (q.exchange === 'lighter') {
-      if (!Number.isInteger(q.marketId) || q.marketId < 0) throw failure();
-      data = await get(`https://mainnet.zklighter.elliot.ai/api/v1/candles?market_id=${q.marketId}&resolution=${interval}&start_timestamp=${start}&end_timestamp=${end}&count_back=240`);
-      rows = data.c?.map(r => ({ time: r.t, open: r.o, high: r.h, low: r.l, close: r.c, volume: r.v }));
-    } else if (q.exchange === 'deribit') {
-      data = await get(`https://www.deribit.com/api/v2/public/get_tradingview_chart_data?instrument_name=${encoded}&start_timestamp=${start}&end_timestamp=${end}&resolution=${interval === '4h' ? '60' : interval === '1d' ? '1D' : BARS[interval]}`);
-      const r = data.result;
-      if (data.error || !r || !['ok', 'no_data'].includes(r.status)) throw failure();
-      if (r.status === 'no_data') return [];
-      if (!Array.isArray(r.ticks) || ['open', 'high', 'low', 'close', 'volume'].some(k => r[k]?.length !== r.ticks.length)) throw failure();
-      rows = r.ticks.map((t, i) => ({ time: t, open: r.open[i], high: r.high[i], low: r.low[i], close: r.close[i], volume: r.volume[i] }));
-      if (interval === '4h') {
-        const hours = normalizeCandles(rows, '1h', clock(), 960), buckets = new Map();
-        for (const c of hours) { const t = Math.floor(c.time / INTERVALS['4h']) * INTERVALS['4h']; const list = buckets.get(t) || []; list.push(c); buckets.set(t, list); }
-        // Only complete four-hour groups or a contiguous current partial bar are shown.
-        rows = [...buckets].flatMap(([t, list]) => list[0].time === t && list.every((c, i) => c.time === t + i * INTERVALS['1h']) && (list.length === 4 || t + INTERVALS['4h'] > clock())
-          ? [{ time: t, open: list[0].open, high: Decimal.max(...list.map(c => c.high)).toString(), low: Decimal.min(...list.map(c => c.low)).toString(), close: list.at(-1).close, volume: list.reduce((v, c) => v.plus(c.volume), D(0)).toString() }] : []);
-      }
-    } else throw new AppError('不支持此公开行情来源');
-    return normalizeCandles(rows, interval, clock());
-  };
-}
+export { createCandleReader, normalizeCandles, INTERVALS };
 
 /** Authenticated HTTP readers share one bounded, credential-free public stream. */
-export function createTerminalMarket({ market, depthReader = loadManualDepth, candleReader = createCandleReader(), WebSocketImpl = WebSocket, clock = Date.now } = {}) {
-  const entries = new Map(), subscribed = new Set();
-  let socket = null, stopped = false, lastConnect = -Infinity;
+export function createTerminalMarket({ market, depthReader = loadManualDepth, candleReader = createCandleReader(), WebSocketImpl, clock = Date.now, publicFeed = createTerminalFeed({ WebSocketImpl, clock }) } = {}) {
+  const entries = new Map();
+  let stopped = false;
   const active = e => clock() - e.touched < 120000;
-  const bookChannel = symbol => symbol.startsWith('KRAKEN_') ? null : symbol.startsWith('BYBIT_') ? 'order_book_1' : 'order_book_5';
   const freshAt = (at, age = 10000) => time(at) && at <= clock() + 1000 && clock() - at <= age;
   const unitOf = e => ['gate', 'okx'].includes(e.display.quote.exchange) ? numeric(e.quote?.nativeUnit, true) : '1';
   // Keep the raw stream so a newly confirmed multiplier never mixes units.
@@ -103,29 +28,12 @@ export function createTerminalMarket({ market, depthReader = loadManualDepth, ca
     try { await Promise.race([promise, new Promise(resolve => { timer = setTimeout(resolve, 150); })]); }
     finally { clearTimeout(timer); }
   }
-  function send(event, symbols) {
-    if (socket?.readyState !== 1 || !symbols.length) return;
-    symbols = symbols.filter(s => event === 'subscribe' ? !subscribed.has(s) : subscribed.has(s));
-    if (!symbols.length) return;
-    for (const channel of ['ticker', 'trade', 'funding_rate', 'mark_price', 'order_book_1', 'order_book_5']) {
-      const payload = channel.startsWith('order_book_') ? symbols.filter(s => bookChannel(s) === channel) : symbols;
-      if (payload.length) socket.send(JSON.stringify({ time: Math.floor(clock() / 1000), event, channel, payload }));
-    }
-    for (const s of symbols) if (event === 'subscribe') subscribed.add(s); else subscribed.delete(s);
-  }
-  function ensureSocket() {
-    if (stopped || socket || clock() - lastConnect < 5000) return;
-    lastConnect = clock();
-    let current;
-    try { current = new WebSocketImpl(WS_URL, { maxPayload: 1000000, handshakeTimeout: 8000 }); } catch { return; }
-    socket = current;
-    current.on('open', () => { if (current === socket) send('subscribe', [...entries].filter(([, e]) => active(e) && e.display).map(([s]) => s)); });
-    current.on('error', () => { current.close(); });
-    current.on('close', () => { if (current === socket) { socket = null; subscribed.clear(); } });
-    current.on('message', raw => {
+  function watch(symbol, e) {
+    if (e.unsubscribe) return;
+    e.unsubscribe = publicFeed.subscribe(symbol, { data(m) {
       try {
-        const m = JSON.parse(String(raw)), r = m.result, e = entries.get(r?.s);
-        if (m.event !== 'update' || !e?.display || !active(e)) return;
+        const r = m.result;
+        if (stopped || entries.get(symbol) !== e || r?.s !== symbol || m.event !== 'update' || !e.display || !active(e)) return;
         if (m.channel === 'ticker' && numeric(r.lp, true) && numeric(r.bp, true) && numeric(r.ap, true) && time(r.ts) && r.ts <= clock() + 1000 && clock() - r.ts <= 10000) {
           if (e.tickerAt && r.ts < e.tickerAt || D(r.bp).gt(r.ap)) return;
           e.ticker = { ...e.ticker, lastPrice: numeric(r.lp), change24h: numeric(r.o, true) ? D(r.lp).div(r.o).minus(1).toString() : null,
@@ -151,36 +59,35 @@ export function createTerminalMarket({ market, depthReader = loadManualDepth, ca
           if (!e.trades.some(t => t.id === r.i)) e.trades = [{ id: r.i, price: numeric(r.p), quantity: numeric(r.q), side: r.S, at: time(r.ts) }, ...e.trades].sort((a, b) => b.at - a.at).slice(0, 60);
         }
       } catch { /* Invalid public frames never replace validated data. */ }
-    });
+    }, down() {
+      e.epoch++; e.ticker = {}; e.tickerAt = 0; e.streamBook = null; e.book = null; e.mark = null; e.funding = null; e.trades = [];
+      e.error = '公开行情连接已中断'; e.bookAttempt = -Infinity;
+    } });
   }
   const sweep = setInterval(() => {
-    const removed = [];
-    for (const [symbol, e] of entries) if (!active(e) && !e.flight && !e.displayFlight) { removed.push(symbol); entries.delete(symbol); }
-    send('unsubscribe', removed);
-    if (!entries.size) { socket?.close(); socket = null; subscribed.clear(); }
-    else if (socket?.readyState === 1) socket.ping();
+    for (const [symbol, e] of entries) if (!active(e) && !e.flight && !e.displayFlight) { e.unsubscribe?.(); entries.delete(symbol); }
   }, 25000); sweep.unref();
   async function read(symbol, interval = '5m') {
     if (stopped) throw new AppError('行情服务已停止', 503);
     if (!Object.hasOwn(INTERVALS, interval)) throw new AppError('不支持的 K 线周期');
-    if (typeof symbol !== 'string' || !/^(BINANCE|BYBIT|OKX|GATE|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_[A-Z0-9]{1,30}_(USDT|USDC|USD)$/.test(symbol)) throw new AppError('合约格式无效');
+    if (typeof symbol !== 'string' || !TERMINAL_SYMBOL.test(symbol)) throw new AppError('合约格式无效');
     let e = entries.get(symbol);
     if (!e) {
       if (entries.size >= 12) {
         const oldest = [...entries].filter(([, x]) => !x.flight && !x.displayFlight).sort((a, b) => a[1].touched - b[1].touched)[0];
         if (!oldest) throw new AppError('行情查询繁忙，请稍后重试', 429);
-        send('unsubscribe', [oldest[0]]); entries.delete(oldest[0]);
+        oldest[1].unsubscribe?.(); entries.delete(oldest[0]);
       }
-      e = { touched: clock(), book: null, bookAttempt: -Infinity, identityAttempt: -Infinity, flight: null, ticker: {}, tickerAt: 0, trades: [], candles: new Map() }; entries.set(symbol, e);
+      e = { touched: clock(), epoch: 0, book: null, bookAttempt: -Infinity, identityAttempt: -Infinity, flight: null, ticker: {}, tickerAt: 0, trades: [], candles: new Map() }; entries.set(symbol, e);
     }
     e.touched = clock();
     // A current CrossEx listing authorizes public subscription, not execution.
     if (!e.displayFlight) e.displayFlight = Promise.resolve().then(() => (market.resolveDisplaySymbol ?? market.resolveSymbol)(symbol)).finally(() => { e.displayFlight = null; });
     try { e.display = await e.displayFlight; }
-    catch (error) { if (entries.get(symbol) === e) { send('unsubscribe', [symbol]); entries.delete(symbol); } throw error; }
+    catch (error) { if (entries.get(symbol) === e) { e.unsubscribe?.(); entries.delete(symbol); } throw error; }
     if (stopped) throw new AppError('行情服务已停止', 503);
     if (entries.get(symbol) !== e) throw new AppError('行情查询已失效，请重试', 409);
-    ensureSocket(); send('subscribe', [symbol]);
+    watch(symbol, e);
     if (!e.flight && clock() - e.bookAttempt >= 1500) {
       e.bookAttempt = clock();
       e.flight = (async () => {
@@ -200,7 +107,9 @@ export function createTerminalMarket({ market, depthReader = loadManualDepth, ca
           if (stopped) return;
           e.tradingError = null;
           if (e.streamBook && freshAt(e.streamBook.at)) return;
-          const book = await depthReader(e.quote); validateBooks([book, book], clock());
+          const epoch = e.epoch, book = await depthReader(e.quote);
+          if (epoch !== e.epoch) return;
+          validateBooks([book, book], clock());
           if (e.book && book.at < e.book.at) throw new AppError('盘口来源时间回退');
           e.book = { bids: book.bids.map(r => r.map(String)), asks: book.asks.map(r => r.map(String)), at: book.at, quantityUnit: 'base' }; e.error = null;
         } catch (error) { e.error = error instanceof AppError ? error.message : '公开盘口暂不可用';
@@ -234,5 +143,5 @@ export function createTerminalMarket({ market, depthReader = loadManualDepth, ca
       book, candles: history?.data ?? [], candleError: history?.error ?? (!e.quote ? '尚未确认原生历史 K 线来源' : null), candleAsOf: history && Number.isFinite(history.at) ? history.at : null,
       trades: e.trades.filter(t => clock() - t.at < 300000).map(t => ({ ...t, quantity: unit ? D(t.quantity).times(unit).toString() : t.quantity, quantityUnit: unit ? 'base' : 'contracts' })), interval };
   }
-  return { read, async stop() { stopped = true; clearInterval(sweep); socket?.close(); socket = null; await Promise.allSettled([...entries.values()].flatMap(e => [e.displayFlight, e.flight, ...[...e.candles.values()].map(h => h.flight)])); entries.clear(); } };
+  return { read, async stop() { stopped = true; clearInterval(sweep); for (const e of entries.values()) e.unsubscribe?.(); publicFeed.close(); await Promise.allSettled([...entries.values()].flatMap(e => [e.displayFlight, e.flight, ...[...e.candles.values()].map(h => h.flight)])); entries.clear(); } };
 }

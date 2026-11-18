@@ -10,6 +10,8 @@ import { createOndoStream, type OndoStreamFactory } from '../vendor/ondo/stream.
 import { createOndoRewards, RewardInputError, type OndoRewards } from '../ondo/rewards.ts';
 import { OBSERVATION_WINDOW_MIN, observationEarnings } from '../ondo/observation-earnings.ts';
 import type { OndoCredentials, OndoServiceConfig } from './ondo-config.ts';
+import type { MarketClient } from '../market/ipc.ts';
+import { remoteOndoClient, remoteOndoStream } from './remote-venue-feeds.ts';
 
 /** How long a stop waits for a live session's quotes to be withdrawn; inside the 20 s drain (main.ts DRAIN_MS). */
 export const ONDO_CLOSE_WAIT_MS = 15_000;
@@ -50,6 +52,7 @@ export const ondoLockId = (keyId: string): string => createHash('sha256').update
 export async function createOndoModule(config: OndoServiceConfig, key: OndoCredentials | undefined, dataDir: string, options: {
   log?: Log; fetchImpl?: typeof fetch; WebSocketImpl?: unknown; rewardsClient?: () => OndoClient; rewardsStream?: OndoStreamFactory; mmIntervalMs?: number;
   notifyRisk?: (key: string, text: string) => void;
+  marketClient?: MarketClient;
   /** Simulator for the local preview. Only used when the entire module has no credentials. */
   observeFeed?: { client: () => OndoClient; stream: OndoStreamFactory };
   locks?: typeof holdAccountLocks;
@@ -72,6 +75,8 @@ export async function createOndoModule(config: OndoServiceConfig, key: OndoCrede
   let made: OndoMarketMaker | null = null;
   let mm: OndoMarketMaker, rewards: OndoRewards;
   try {
+    const market = options.marketClient;
+    const publicStream: OndoStreamFactory | undefined = market ? feed => remoteOndoStream(market, feed) : undefined;
     mm = made = createOndoMarketMaker({
       dataDir, readCredentials: () => key ?? null, ...(config.initial ? { initialConfig: config.initial } : {}), closeWaitMs: ONDO_CLOSE_WAIT_MS,
       createObservationEstimator: quote => {
@@ -81,11 +86,13 @@ export async function createOndoModule(config: OndoServiceConfig, key: OndoCrede
       log: { info: say('info'), warn: say('warn'), error: say('error'), debug: say('debug') },
       ...(options.notifyRisk ? { notifyRisk: options.notifyRisk } : {}),
       ...(!key && options.observeFeed ? { clientFactory: options.observeFeed.client, streamFactory: options.observeFeed.stream } : {}),
+      ...(market ? { clientFactory: input => remoteOndoClient(market, input), streamFactory: publicStream } : {}),
       ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}), ...(options.WebSocketImpl ? { WebSocketImpl: options.WebSocketImpl } : {}),
       ...(options.mmIntervalMs === undefined ? {} : { intervalMs: options.mmIntervalMs }),
     });
-    rewards = createOndoRewards({ dataDir, restingOrders: () => mm.restingOrders(), log, ...(options.rewardsClient ? { clientFactory: options.rewardsClient } : {}),
-      ...(options.rewardsStream ? { streamFactory: options.rewardsStream } : options.WebSocketImpl ? { streamFactory: feed => createOndoStream({ ...feed, WebSocketImpl: options.WebSocketImpl }) } : {}) });
+    rewards = createOndoRewards({ dataDir, restingOrders: () => mm.restingOrders(), log,
+      clientFactory: market ? () => remoteOndoClient(market) : options.rewardsClient,
+      streamFactory: publicStream ?? options.rewardsStream ?? (options.WebSocketImpl ? feed => createOndoStream({ ...feed, WebSocketImpl: options.WebSocketImpl }) : undefined) });
     mm.initialize();
     rewards.initialize();
   } catch (error) {

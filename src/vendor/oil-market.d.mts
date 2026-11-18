@@ -54,3 +54,7 @@ export function fetchIntradaySnapshot(existing?: OilIntraday | null, options?: O
 export function validatedIntradayChartRows(snapshot: OilIntraday): OilChartRow[];
 export function intradayChartRows(snapshot: unknown): OilChartRow[];
 export function recentIntradayChartRows(snapshot: unknown, durationMs: number): OilChartRow[];
+
+export function oilCandleStart(rows: readonly OilCandleRow[]): number;
+export function fetchOilCandleBatch(startTime: number, options?: OilRequestOptions): Promise<OilCandleRow[]>;
+export function mergeOilCandleBatch(previous: OilIntraday | null, rows: OilCandleRow[], now: number): OilIntraday;

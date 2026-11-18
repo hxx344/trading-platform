@@ -52,9 +52,13 @@ umask 022
 REPO=hxx344/trading-platform
 SERVICE=trading-platform
 CONTROL=$SERVICE-control
+MARKET=$SERVICE-market
 SERVICE_USER=trading-platform
 CONTROL_USER=trading-platform-control
+MARKET_USER=trading-platform-market
 IPC_GROUP=trading-platform-ipc
+MARKET_IPC_GROUP=trading-platform-market-ipc
+MARKET_SOCKET=/run/trading-platform-market/market.sock
 NODE_VERSION=24.15.0
 KEEP_RELEASES=3
 HEALTH_WAIT_S=90
@@ -289,6 +293,13 @@ if [[ -e "$release_dir/src/control" || -e "$release_dir/deploy/$CONTROL.service"
      "$(read_value "$release_dir/.executor-sha256")" =~ ^[0-9a-f]{64}$ && "$(read_value "$release_dir/.control-sha256")" =~ ^[0-9a-f]{64}$ ]] ||
     fail '控制面与执行面程序包不完整，未切换版本。'
 fi
+market_split=0
+if [[ -e "$release_dir/src/market" || -e "$release_dir/deploy/$MARKET.service" || -e "$release_dir/.market-sha256" ]]; then
+  market_split=1
+  [[ "$split" == 1 && -f "$release_dir/src/market/main.ts" && -f "$release_dir/src/market/probe.ts" &&
+     -f "$release_dir/deploy/$MARKET.service" && "$(read_value "$release_dir/.market-sha256")" =~ ^[0-9a-f]{64}$ ]] ||
+    fail '公开行情组件程序包不完整，未切换版本。'
+fi
 
 # ---- 2. Node.js -------------------------------------------------------------------
 node_supported() {
@@ -349,7 +360,7 @@ if ((split)) || [[ -f "$APP_DIR/control/.control-sha256" ]]; then
   fi
   [[ "$UPDATE_DIR" == /* ]] || fail '更新交接目录须为绝对路径。'
   update_path=$(realpath -m "$UPDATE_DIR")
-  protected_dirs=("$APP_DIR" "$CONF_DIR" "$DATA_DIR" "$IMPORT_DIR" /run/trading-platform)
+  protected_dirs=("$APP_DIR" "$CONF_DIR" "$DATA_DIR" "$IMPORT_DIR" /run/trading-platform /run/trading-platform-market)
   old_units=("$UNIT_FILE")
   if [[ "$TEST_MODE" != 1 ]]; then
     protected_dirs+=("$UNIT_DIR" /etc/systemd/system /opt/trading-platform /etc/trading-platform /var/lib/trading-platform /var/lib/trading-platform-import)
@@ -388,6 +399,33 @@ if ((split)) || [[ -f "$APP_DIR/control/.control-sha256" ]]; then
   else
     as_root_dir "$UPDATE_DIR" 770 root "$CONTROL_USER"
   fi
+fi
+if [[ "$TEST_MODE" != 1 ]] && { ((market_split)) || [[ -f "$APP_DIR/market/.market-sha256" ]]; }; then
+  getent group "$MARKET_IPC_GROUP" >/dev/null || groupadd --system "$MARKET_IPC_GROUP"
+  if ! getent passwd "$MARKET_USER" >/dev/null; then
+    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$MARKET_USER"
+    changes+=("系统账号 $MARKET_USER")
+  fi
+  market_uid=$(id -u "$MARKET_USER")
+  market_gid=$(id -g "$MARKET_USER")
+  IFS=: read -r _ _ market_ipc_gid members <<<"$(getent group "$MARKET_IPC_GROUP")"
+  [[ "$market_uid" != 0 && "$market_uid" != "$(id -u "$SERVICE_USER")" && "$market_uid" != "$CONTROL_UID" &&
+     "$market_gid" == "$(getent group "$MARKET_USER" | cut -d: -f3)" && "$market_gid" != "$market_ipc_gid" &&
+     " $(id -G "$CONTROL_USER") " != *" $market_ipc_gid "* ]] || fail '行情服务须使用独立的账户和通信组。'
+  for gid in 0 "$(id -g "$SERVICE_USER")" "$CONTROL_GID" "$(getent group "$IPC_GROUP" | cut -d: -f3)"; do
+    [[ "$market_gid" != "$gid" && "$market_ipc_gid" != "$gid" ]] || fail '行情服务不能共用交易、控制或特权组。'
+  done
+  # A pre-existing group can also grant socket access through an unrelated account's primary GID.
+  IFS=, read -r -a ipc_members <<<"$members"
+  for member in "${ipc_members[@]}"; do
+    [[ "$member" == "$MARKET_USER" || "$member" == "$SERVICE_USER" ]] || fail '行情通信组已授予其他账户，请恢复专用组后再安装。'
+  done
+  getent passwd | awk -F: -v gid="$market_ipc_gid" -v market="$MARKET_USER" -v executor="$SERVICE_USER" \
+    '$4 == gid && $1 != market && $1 != executor { bad=1 } END { exit bad }' || fail '行情通信组已用作其他账户的主组，请恢复专用组后再安装。'
+  # systemd adds a user's login groups to its service groups. An existing account must not bring unrelated access.
+  for gid in $(id -G "$MARKET_USER"); do
+    [[ "$gid" == "$market_gid" || "$gid" == "$market_ipc_gid" ]] || fail '行情账户已加入其他组，请恢复专用账户后再安装。'
+  done
 fi
 for name in config secrets; do
   example="$release_dir/deploy/$name.example.json"
@@ -572,6 +610,11 @@ if [[ ! -d "$STATE" ]] || ((external_legacy)); then
     cp "$UNIT_DIR/$CONTROL.service" "$initial/control.service"
     cp "$APP_DIR/control-listen.json" "$APP_DIR/control-proxy.env" "$initial/"
   fi
+  if [[ -n "$previous_dir" && -f "$previous_dir/.market-sha256" && -f "$UNIT_DIR/$MARKET.service" && -L "$APP_DIR/market" ]]; then
+    readlink -f "$APP_DIR/market" >"$initial/market"
+    cp "$UNIT_DIR/$MARKET.service" "$initial/market.service"
+    cp "$APP_DIR/market.env" "$initial/market.env"
+  fi
   for unit in "${HELPER_UNITS[@]}"; do
     [[ ! -f "$UNIT_DIR/$unit" ]] || cp "$UNIT_DIR/$unit" "$initial/$unit"
   done
@@ -580,6 +623,7 @@ fi
 previous_dir=$(read_value "$STATE/current")
 previous_executor=$(read_value "$STATE/executor")
 previous_control=$(read_value "$STATE/control")
+previous_market=$(read_value "$STATE/market")
 # Hash as the service account. File metadata matters too: a readable key file with the wrong mode must fail a fresh
 # check. Never read a service-configured key path as root, and store only the aggregate digest in the private record.
 config_hash() {
@@ -625,12 +669,53 @@ elif [[ -n "$previous_dir" ]]; then
   exit 0
 fi
 
-# ---- 5. 分别准备执行面、控制面与页面版本 ------------------------------------------------
+# ---- 5. 准备独立组件和页面版本 --------------------------------------------------------
 FLOCK_BIN=$(command -v flock)
 render_to() {
   [[ -f "$1" ]] && sed -e "s|@NODE@|$NODE_BIN|g" -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@CONF_DIR@|$CONF_DIR|g" -e "s|@DATA_DIR@|$DATA_DIR|g" \
     -e "s|@IMPORT_DIR@|$IMPORT_DIR|g" -e "s|@UPDATE_DIR@|$UPDATE_DIR|g" -e "s|@CONTROL_UID@|$CONTROL_UID|g" -e "s|@CONTROL_GID@|$CONTROL_GID|g" \
     -e "s|@FLOCK@|$FLOCK_BIN|g" -e "s|@WORKBENCH_ENV@|$WORKBENCH_ENV|g" "$1" >"$2" && [[ -s "$2" ]]
+}
+# Copy only whole EnvironmentFile assignments. An allowed-looking line inside a private quoted or continued
+# value belongs to the private key. Preserve quoting for systemd and never pass private values on a command line.
+project_environment() {
+  "$NODE_BIN" --input-type=module - "$CONF_DIR/environment" "$1" <<'JS'
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+const [file, out] = process.argv.slice(2);
+const source = existsSync(file) ? readFileSync(file, 'utf8').split('\0', 1)[0] : '';
+const proxyKeys = new Set(['NODE_USE_ENV_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy']);
+const marketKeys = new Set(['COINGECKO_DEMO_API_KEY', 'PERPETUAL_COIN_IDS']);
+const execution = createHash('sha256');
+let proxy = '', market = '';
+const newline = ch => ch === '\n' || ch === '\r';
+for (let start = 0; start < source.length;) {
+  let lineEnd = start;
+  while (lineEnd < source.length && !newline(source[lineEnd])) lineEnd++;
+  const line = source.slice(start, lineEnd), equals = line.indexOf('=');
+  if (equals < 0 || /^[\t\v\f ]*[#;]/.test(line)) { start = lineEnd + 1; continue; }
+  const key = line.slice(0, equals).trim();
+  let end = start + equals + 1, mode = 'leading';
+  for (; end < source.length; end++) {
+    const ch = source[end];
+    if (ch === '\\' && mode !== "'") { if (mode === 'leading') mode = 'raw'; end++; continue; }
+    if (mode === '"' || mode === "'") { if (ch === mode) mode = 'leading'; continue; }
+    if (newline(ch)) break;
+    if (mode === 'leading' && !/[\t\v\f ]/.test(ch)) mode = ch === '"' || ch === "'" ? ch : 'raw';
+  }
+  const record = source.slice(start, end) + '\n';
+  if (proxyKeys.has(key)) proxy += record;
+  if (proxyKeys.has(key) || marketKeys.has(key)) market += record;
+  if (!marketKeys.has(key)) execution.update(record);
+  start = end + 1;
+}
+writeFileSync(join(out, 'control-proxy.env'), proxy, { mode: 0o600 });
+if (existsSync(join(out, 'market'))) {
+  writeFileSync(join(out, 'market.env'), market, { mode: 0o600 });
+  writeFileSync(join(out, 'executor-env-key'), execution.digest('hex') + '\n', { mode: 0o600 });
+}
+JS
 }
 # Build both forward and rollback records against the configuration that will actually remain on disk. The fixed
 # code pins survive page releases; public listen settings and the expected runtime config must match the same files.
@@ -639,7 +724,8 @@ prepare_record() {
   printf '%s\n' "$target" >"$out/current" || return 1
   render_to "$target/deploy/trading-platform.service" "$out/executor.service" || return 1
   if [[ -f "$target/.control-sha256" ]]; then
-    for name in executor control; do
+    for name in executor control market; do
+      [[ -f "$target/.$name-sha256" ]] || continue
       existing=$(read_value "$pins/$name")
       if [[ -n "$existing" && -d "$existing" ]] && cmp -s "$target/.$name-sha256" "$existing/.$name-sha256"; then
         printf '%s\n' "$existing" >"$out/$name" || return 1
@@ -659,19 +745,21 @@ JS
     else printf '%s\n' '{"port":4720,"host":null}' >"$out/control-listen.json" || return 1; fi
     # Only the selected proxy settings reach the browser's separate UID. The main configuration and private key
     # files, including a key outside the config directory, remain readable only by the execution account.
-    : >"$out/control-proxy.env" || return 1
-    if [[ -f "$CONF_DIR/environment" ]]; then
-      awk '/^[[:blank:]]*(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy|NODE_USE_ENV_PROXY)=/{print}' \
-        "$CONF_DIR/environment" >"$out/control-proxy.env" || return 1
-    fi
+    project_environment "$out" || return 1
     { printf '%s\n' "$node_identity"; cat "$target/.control-sha256"; sha256sum <"$out/control.service"; sha256sum <"$out/control-listen.json"; sha256sum <"$out/control-proxy.env"; } \
       | sha256sum | cut -d' ' -f1 >"$out/control-key" || return 1
+    if [[ -f "$out/market" ]]; then
+      render_to "$target/deploy/$MARKET.service" "$out/market.service" || return 1
+      { printf '%s\n' "$node_identity"; cat "$target/.market-sha256"; sha256sum <"$out/market.service"; sha256sum <"$out/market.env"; } \
+        | sha256sum | cut -d' ' -f1 >"$out/market-key" || return 1
+    fi
   fi
   {
     printf '%s\n' "$node_identity"
     if [[ -f "$out/executor" ]]; then cat "$target/.executor-sha256"; else cat "$target/.package-sha256"; if ((configured)); then config_hash; fi; fi
     sha256sum <"$out/executor.service"
-    if [[ -f "$CONF_DIR/environment" ]]; then sha256sum <"$CONF_DIR/environment"; fi
+    if [[ -f "$out/executor-env-key" ]]; then cat "$out/executor-env-key";
+    elif [[ -f "$CONF_DIR/environment" ]]; then sha256sum <"$CONF_DIR/environment"; fi
   } | sha256sum | cut -d' ' -f1 >"$out/executor-key" || return 1
   for unit in "${HELPER_UNITS[@]}"; do
     if [[ -f "$target/deploy/$unit" ]]; then render_to "$target/deploy/$unit" "$out/$unit" || return 1
@@ -705,7 +793,7 @@ running_from() { # WorkingDirectory pins the real package of the running process
   local pid
   pid=$(systemctl show -p MainPID --value "$1") && [[ "$pid" =~ ^[1-9][0-9]*$ && "$(readlink "/proc/$pid/cwd")" == "$2" ]]
 }
-journal_tail() { steady journalctl -u "$SERVICE" -u "$CONTROL" -n 40 --no-pager -o cat 2>/dev/null || true; }
+journal_tail() { steady journalctl -u "$SERVICE" -u "$CONTROL" -u "$MARKET" -n 40 --no-pager -o cat 2>/dev/null || true; }
 healthy_executor() {
   local expected_dir=$1 deadline=$((SECONDS + HEALTH_WAIT_S)) pid
   while ((SECONDS < deadline)); do
@@ -743,18 +831,32 @@ healthy_control() {
   [[ ! -s "$work_dir/probe.log" ]] || log "$(tail -c 600 "$work_dir/probe.log")"
   return 1
 }
+probe_market() {
+  # Match the execution unit's UID and its dedicated group for this socket; ordinary login sessions lack that group.
+  (cd / && runuser -u "$SERVICE_USER" -g "$MARKET_IPC_GROUP" -- timeout --kill-after=1 4 "$NODE_BIN" \
+    "$1/src/market/probe.ts" --socket "$MARKET_SOCKET" --root "$2") >"$work_dir/market-probe.log" 2>&1
+}
+healthy_market() {
+  local target=$1 market=$2 deadline=$((SECONDS + HEALTH_WAIT_S))
+  while ((SECONDS < deadline)); do
+    if systemctl is-active --quiet "$MARKET" && running_from "$MARKET" "$market" && probe_market "$target" "$market"; then return 0; fi
+    steady sleep 0.5
+  done
+  return 1
+}
 enable_service() {
   systemctl is-enabled --quiet "$1" || { steady systemctl enable --quiet "$1" && changes+=("$1 开机自启"); }
 }
 # ---- 6. 激活（回退走同一条路径） ------------------------------------------------------
-# Compare the two component keys separately. A bad UI must never request an executor restart. Unit/filesystem drift
+# Compare component keys separately. An independent market or control update must keep a healthy executor running. Unit/filesystem drift
 # and a process running an unexpected release are also repaired, e.g. after a power cut between switching and starting.
 activate() {
-  local to=$1 from=$2 target exe ctl live changes_unit=0 moving=0 change_ex=0 change_ctl=0
-  local action_ex='' action_ctl='' unit name probe_status
+  local to=$1 from=$2 target exe ctl market live changes_unit=0 moving=0 change_ex=0 change_ctl=0 change_market=0
+  local action_ex='' action_ctl='' action_market='' unit name probe_status
   target=$(read_value "$to/current")
   exe=$(read_value "$to/executor")
   ctl=$(read_value "$to/control")
+  market=$(read_value "$to/market")
   live=$(readlink "$APP_DIR/current" 2>/dev/null || true)
   [[ "$live" == "$target" ]] || moving=1
   cmp -s "$to/executor-key" "$from/executor-key" || change_ex=1
@@ -771,11 +873,22 @@ activate() {
     rm -f "$UNIT_DIR/$CONTROL.service" "$APP_DIR/control" "$APP_DIR/executor" "$APP_DIR/control-listen.json" "$APP_DIR/control-proxy.env" "$APP_DIR/.restarting-control" || return 1
     changes_unit=1
   fi
+  if [[ -n "$market" ]]; then
+    cmp -s "$to/market-key" "$from/market-key" || change_market=1
+    [[ ! -e "$APP_DIR/.restarting-market" ]] || change_market=1
+    if ! cmp -s "$to/market.service" "$UNIT_DIR/$MARKET.service"; then changes_unit=1; change_market=1; fi
+    cmp -s "$to/market.env" "$APP_DIR/market.env" || change_market=1
+  elif [[ -f "$UNIT_DIR/$MARKET.service" || -L "$APP_DIR/market" ]]; then
+    if [[ "$TEST_MODE" != 1 && -f "$UNIT_DIR/$MARKET.service" ]]; then steady systemctl disable --now --quiet "$MARKET" || return 1; fi
+    rm -f "$UNIT_DIR/$MARKET.service" "$APP_DIR/market" "$APP_DIR/market.env" "$APP_DIR/.restarting-market" || return 1
+    changes_unit=1
+  fi
   # Persist a requested restart before changing its files. This covers interruption during rollback even when
   # the previous code directory is identical (for example an environment-only change with the same TCP port).
   if [[ "$TEST_MODE" != 1 ]] && ((configured)); then
     if ((change_ex)); then : >"$APP_DIR/.restarting-executor" || return 1; fi
     if [[ -n "$ctl" ]] && ((change_ctl)); then : >"$APP_DIR/.restarting-control" || return 1; fi
+    if [[ -n "$market" ]] && ((change_market)); then : >"$APP_DIR/.restarting-market" || return 1; fi
   fi
   put_file "$to/executor.service" "$UNIT_FILE" 644 || return 1
   helper_changed=0
@@ -791,12 +904,16 @@ activate() {
     put_file "$to/control.service" "$UNIT_DIR/$CONTROL.service" 644 && put_file "$to/control-listen.json" "$APP_DIR/control-listen.json" 644 &&
       put_file "$to/control-proxy.env" "$APP_DIR/control-proxy.env" 600 && switch_link "$exe" "$APP_DIR/executor" && switch_link "$ctl" "$APP_DIR/control" || return 1
   fi
+  if [[ -n "$market" ]]; then
+    put_file "$to/market.service" "$UNIT_DIR/$MARKET.service" 644 && put_file "$to/market.env" "$APP_DIR/market.env" 600 &&
+      switch_link "$market" "$APP_DIR/market" || return 1
+  fi
   switch_link "$target" "$APP_DIR/current" || return 1
   if ((moving)); then changes+=("程序 $(head -n1 "$target/VERSION")"); fi
   if ((changes_unit)); then changes+=('systemd 单元'); else skipped+=('systemd 单元（未变化）'); fi
   if [[ "$TEST_MODE" == 1 ]]; then skipped+=('systemctl（测试模式）'); return 0; fi
   if ((!changes_unit && !helper_changed)); then
-    for unit in "$SERVICE" "$CONTROL" "${HELPER_UNITS[@]}"; do
+    for unit in "$SERVICE" "$CONTROL" "$MARKET" "${HELPER_UNITS[@]}"; do
       [[ $(systemctl show -p NeedDaemonReload --value "$unit" 2>/dev/null) != yes ]] || { changes_unit=1; break; }
     done
   fi
@@ -821,6 +938,19 @@ activate() {
     if ! systemctl is-active --quiet "$CONTROL"; then action_ctl=start
     elif ((change_ctl)) || ! running_from "$CONTROL" "$ctl"; then action_ctl=restart
     elif ((moving)) || [[ "$(read_value "$from/current")" != "$target" ]]; then action_ctl=reload; fi
+  fi
+  # Confirm the market generation before touching a live writer or reloading the page. No service dependency
+  # binds their lifetimes; an independent market restart can be rolled back while existing orders reconcile.
+  if [[ -n "$market" ]]; then
+    enable_service "$MARKET" || return 1
+    if ! systemctl is-active --quiet "$MARKET"; then action_market=start
+    elif ((change_market)) || ! running_from "$MARKET" "$market" || ! probe_market "$target" "$market"; then action_market=restart; fi
+    if [[ -n "$action_market" ]]; then
+      steady systemctl reset-failed "$MARKET" 2>/dev/null || true
+      steady systemctl "$action_market" "$MARKET" && healthy_market "$target" "$market" || return 1
+      rm -f "$APP_DIR/.restarting-market" || return 1
+      changes+=("行情服务已$([[ $action_market == start ]] && echo 启动 || echo 重启)")
+    else skipped+=('行情服务（运行正常）'); fi
   fi
   if [[ -n "$action_ex" ]]; then
     touch "$work_dir/before-start" || return 1
@@ -877,6 +1007,7 @@ else
   fi
   if [[ "$TEST_MODE" != 1 ]]; then
     [[ ! -f "$UNIT_DIR/$CONTROL.service" ]] || steady systemctl disable --now --quiet "$CONTROL" || true
+    [[ ! -f "$UNIT_DIR/$MARKET.service" ]] || steady systemctl disable --now --quiet "$MARKET" || true
     steady systemctl disable --now --quiet "$SERVICE" || true
   fi
   fail '服务启动失败，尚无可运行的上一版；请按上面的日志检查配置后重新执行本脚本'
@@ -901,11 +1032,12 @@ fi
 current_dir=$(readlink -f "$APP_DIR/current")
 executor_dir=$(read_value "$STATE/executor")
 control_dir=$(read_value "$STATE/control")
+market_dir=$(read_value "$STATE/market")
 kept=0
 while IFS= read -r dir; do
   [[ -n "$dir" ]] || continue
-  if [[ "$dir" == "$current_dir" || "$dir" == "$executor_dir" || "$dir" == "$control_dir" || "$dir" == "$previous_dir" ||
-        "$dir" == "$previous_executor" || "$dir" == "$previous_control" ]] || ((kept < KEEP_RELEASES)); then kept=$((kept + 1)); continue; fi
+  if [[ "$dir" == "$current_dir" || "$dir" == "$executor_dir" || "$dir" == "$control_dir" || "$dir" == "$market_dir" || "$dir" == "$previous_dir" ||
+        "$dir" == "$previous_executor" || "$dir" == "$previous_control" || "$dir" == "$previous_market" ]] || ((kept < KEEP_RELEASES)); then kept=$((kept + 1)); continue; fi
   rm -rf "$dir"
 done < <(find "$APP_DIR/releases" -mindepth 1 -maxdepth 1 -type d ! -name '*.staging' -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
 find "$APP_DIR/releases" -mindepth 1 -maxdepth 1 -type d -name '*.staging' -exec rm -rf {} +

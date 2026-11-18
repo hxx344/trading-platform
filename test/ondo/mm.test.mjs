@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { createOndoMarketMaker, ONDO_MM_DEFAULTS, validateOndoMmConfig } from '../../src/vendor/ondo/mm.mjs';
 import { OndoError } from '../../src/vendor/ondo/client.mjs';
 import { decimalUnits as u } from '../../src/vendor/ondo/decimal.mjs';
+import { remoteOndoStream } from '../../src/service/remote-venue-feeds.ts';
 
 const silent = { info() {}, warn() {}, error() {}, debug() {} };
 const EPOCH = 1_800_000_000_000, MARKET = 'NVDA-USD.P';
@@ -76,6 +77,42 @@ function fixture(options = {}) {
   return { f, v, mm, count };
 }
 const status = code => error => error.status === code;
+
+test('a public outage withdraws accepted Ondo quotes while the same private session keeps reconciling', async t => {
+  let callbacks, privateOptions, lease = 'first', generation = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', expired = 0;
+  const market = { epoch: () => lease, stream(_op, request, listener) {
+    assert.deepEqual(request, { markets: [MARKET], depth: 50, trades: false, metrics: true });
+    callbacks = listener; callbacks.data({ type: 'ready', generation, at: f.time });
+    return () => {};
+  } };
+  const { f, v, mm, count } = fixture({ manager: { streamFactory: options => remoteOndoStream(market, options, input => {
+    privateOptions = input;
+    return { start() {}, close() {}, expireOrders() { expired++; }, status: () => ({ connected: true, privateReady: true, deadManReady: true }) };
+  }) } });
+  t.after(() => mm.close(0));
+  const wire = rows => rows.map(row => row.map(value => u(value).toString()));
+  let frame;
+  f.push = (bids = BIDS, asks = ASKS, time = f.time) => {
+    f.book = [bids, asks];
+    frame = { type: 'book', generation, market: MARKET, at: f.time, book: { time, bids: wire(bids), asks: wire(asks) } };
+    callbacks.data(frame);
+  };
+  await f.live(); assert.equal(count('place'), 2);
+  assert.equal(privateOptions.privateOnly, true); assert.deepEqual(privateOptions.markets, []);
+  const original = frame, ids = v.orders.map(order => order.id), reads = count('open');
+  lease = null; callbacks.down();
+  // A late frame from the former socket cannot repopulate the book between scheduler ticks.
+  callbacks.data(original); f.frozen = true;
+  await f.rounds(1, 1500);
+  assert.equal(f.market().bid, null);
+  assert.deepEqual(v.calls.filter(call => call[0] === 'cancel').map(call => call[1]).sort(), ids.sort());
+  assert.ok(count('open') > reads); assert.equal(expired, 0); assert.equal(mm.state().stream.deadManReady, true);
+  lease = 'second'; generation = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+  callbacks.data({ type: 'ready', generation, at: f.time });
+  callbacks.data({ ...original, at: f.time }); callbacks.data({ ...original, generation, at: f.time });
+  await f.rounds(3); assert.equal(count('place'), 2); assert.equal(f.market().bid, null);
+  f.frozen = false; await f.rounds(5); assert.equal(count('place'), 4);
+});
 
 test('configuration is validated as a whole', () => {
   assert.deepEqual(validateOndoMmConfig(config()), config());

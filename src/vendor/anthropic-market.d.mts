@@ -74,3 +74,9 @@ export function validateAnthropicCandles(input: unknown): AnthropicCandles;
 export function anthropicCandleWindow(snapshot: AnthropicCandles, days: number): AnthropicCandleWindow;
 export function fetchAnthropicCandles(existing?: unknown, options?: AnthropicReadOptions): Promise<AnthropicCandles>;
 export function anthropicChartRows(rows: readonly AnthropicCandleRow[], leg: AnthropicComparisonLeg, shares?: AnthropicShares | null): AnthropicChartRow[];
+
+export type AnthropicCandleStarts = Record<AnthropicLegKey, number>;
+export interface AnthropicCandleBatch { legs: Partial<Record<AnthropicLegKey, [number, number][]>>; errors: AnthropicLegErrors; at: number }
+export function anthropicCandleStarts(previous: AnthropicCandles | null, now: number): AnthropicCandleStarts;
+export function fetchAnthropicCandleBatch(starts: AnthropicCandleStarts, options?: AnthropicReadOptions): Promise<AnthropicCandleBatch>;
+export function mergeAnthropicCandleBatch(previous: AnthropicCandles | null, batch: AnthropicCandleBatch): AnthropicCandles;

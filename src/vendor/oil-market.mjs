@@ -189,17 +189,30 @@ export function intradayWindow(snapshot, days) {
  */
 export async function fetchIntradaySnapshot(existing = null, options = {}) {
   const now = options.now ?? Date.now(), previous = existing ? validateIntradaySnapshot(existing) : null;
+  const rows = await fetchOilCandleBatch(oilCandleStart(previous?.data ?? []), { ...options, now });
+  return mergeOilCandleBatch(previous, rows, now);
+}
+
+export function oilCandleStart(rows) {
   const earliestAvailable = HISTORY_START;
-  let missing = Infinity, expected = previous?.data[0]?.time;
-  for (const row of previous?.data ?? []) {
+  let missing = Infinity, expected = rows[0]?.time;
+  for (const row of rows) {
     if (row.time > expected && row.time > earliestAvailable) missing = Math.min(missing, Math.max(expected, earliestAvailable));
     if ((row.brent === null || row.wti === null) && row.time >= earliestAvailable) missing = Math.min(missing, row.time);
     expected = row.time + OIL_CANDLE_MS;
   }
-  const startTime = Math.max(0, earliestAvailable, previous ? Math.min(previous.data.at(-1).time - 96 * OIL_CANDLE_MS, missing) : earliestAvailable);
+  return Math.max(0, earliestAvailable, rows.length ? Math.min(rows.at(-1).time - 96 * OIL_CANDLE_MS, missing) : earliestAvailable);
+}
+
+export async function fetchOilCandleBatch(startTime, options = {}) {
+  const now = options.now ?? Date.now();
   const [brent, wti] = await Promise.all(Object.values(ASSETS).map(asset => fetchCandles(asset.coin, OIL_CANDLE_INTERVAL, startTime, now, options)));
+  return pairIntradayCandles(brent, wti, now);
+}
+
+export function mergeOilCandleBatch(previous, rows, now) {
   const merged = new Map((previous?.data ?? []).map(row => [row.time, row]));
-  for (const row of pairIntradayCandles(brent, wti, now)) {
+  for (const row of rows) {
     const old = merged.get(row.time);
     merged.set(row.time, { time: row.time, brent: row.brent ?? old?.brent ?? null, wti: row.wti ?? old?.wti ?? null });
   }

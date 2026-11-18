@@ -262,7 +262,12 @@ export function createOndoRewards({ dataDir, restingOrders = () => [], clientFac
     const listed = rules ? names.filter(name => rules!.has(name)) : names;
     const current = feed = streamFactory({ markets: listed, depth: FEED_LEVELS, now, onBook(market, book, at) {
       const target = slots.get(market);
-      if (target && book && current === feed) target.pushed = { book, at };
+      if (target && current === feed) target.pushed = book ? { book, at } : null;
+    }, onDown() {
+      if (current === feed) for (const name of listed) {
+        const target = slots.get(name);
+        if (target) { target.pushed = null; target.latest = null; }
+      }
     } });
     try {
       current.start();

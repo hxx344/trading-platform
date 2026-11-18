@@ -1,7 +1,7 @@
 // Types for perpetual-exchanges.mjs, gathered from its signatures and the subscription specs it returns.
-import type { PerpetualExchangeKind, PerpetualMarket, PerpetualUpdate } from './perpetual-stream.mjs';
+import type { PerpetualMarket, PerpetualUpdate } from './perpetual-stream.mjs';
 
-export interface PerpetualVenue { id: string; name: string; type: PerpetualExchangeKind; kind: PerpetualExchangeKind; website: string; docsUrl: string }
+export { EXCHANGES, type PerpetualVenue } from './perpetual-venues.mjs';
 type Fetcher = (url: string, init: RequestInit) => Promise<Response>;
 export interface PerpetualRequestOptions { fetchImpl?: Fetcher; signal?: AbortSignal; now?: number }
 /** One WebSocket connection's plan (exchanges.mjs createSubscriptions). */
@@ -12,7 +12,6 @@ export interface PerpetualSpec {
   snapshot?: (options: PerpetualRequestOptions) => Promise<PerpetualUpdate[]>; snapshotIntervalMs?: number;
 }
 
-export const EXCHANGES: readonly PerpetualVenue[];
 export function discoverMarkets(exchangeId: string, options?: PerpetualRequestOptions): Promise<PerpetualMarket[]>;
 export function createSubscriptions(exchangeId: string, markets: PerpetualMarket[]): PerpetualSpec[];
 export function getControlResponse(exchangeId: string, payload: unknown): unknown;

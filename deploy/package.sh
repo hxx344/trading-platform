@@ -21,53 +21,9 @@ cp -R "$root/src" "$root/package.json" "$root/README.md" "$pkg/"
 # scripts are development tools and stay out of the package.
 cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$root/scripts/import-workbook.py" "$pkg/scripts/"
 cp -R "$root/web/dist" "$pkg/web/"
-cp "$root/deploy/trading-platform.service" "$root/deploy/trading-platform-control.service" "$root/deploy/trading-platform-import.service" "$root/deploy/trading-platform-import.path" "$root/deploy/trading-platform-update.service" "$root/deploy/trading-platform-update.path" "$root/deploy/config.example.json" "$root/deploy/secrets.example.json" "$pkg/deploy/"
+cp "$root/deploy/trading-platform.service" "$root/deploy/trading-platform-control.service" "$root/deploy/trading-platform-market.service" "$root/deploy/trading-platform-import.service" "$root/deploy/trading-platform-import.path" "$root/deploy/trading-platform-update.service" "$root/deploy/trading-platform-update.path" "$root/deploy/config.example.json" "$root/deploy/secrets.example.json" "$pkg/deploy/"
 printf 'v%s %s\n' "$version" "$commit" >"$pkg/VERSION"
-# Both processes run Node directly from the package. Include shared imports in the control digest, even when the
-# dependency is several imports away. Unknown source files belong to the executor unless explicitly control-only.
-(cd "$pkg" && node --input-type=module <<'JS'
-import { createHash } from 'node:crypto';
-import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { registerHooks } from 'node:module';
-import { relative, sep } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-const root = process.cwd();
-const packagePath = file => relative(root, file).split(sep).join('/');
-const control = new Set();
-const executor = new Set();
-// These programs are launched by root or the install CLI. The live executor imports import-channel for its API.
-const helperOnly = new Set(['update-helper', 'take-handoff', 'watch-config', 'import-helper', 'import-workbench',
-  'import-modules', 'import-options', 'import-crossex', 'import-ondo', 'import-monitor-alerts',
-  'import-monitor-variational', 'import-monitor-paper'].map(name => 'src/service/' + name + '.ts'));
-const hooks = registerHooks({ resolve(specifier, context, next) {
-  const resolved = next(specifier, context);
-  if (resolved.url.startsWith('file:')) {
-    const path = packagePath(fileURLToPath(resolved.url));
-    if (!path.startsWith('src/')) throw new Error('控制面运行依赖不在程序包 src 中：' + path);
-    control.add(path);
-  }
-  return resolved;
-} });
-await import(pathToFileURL(root + '/src/control/main.ts'));
-hooks.deregister();
-for (const entry of readdirSync('src', { recursive: true, withFileTypes: true })) {
-  if (!entry.isFile()) continue;
-  const path = packagePath(entry.parentPath + '/' + entry.name);
-  if (path.startsWith('src/control/') || ['src/web-assets.ts', 'src/service/update.ts', 'src/service/update-types.ts'].includes(path)) control.add(path);
-  else if (!helperOnly.has(path)) executor.add(path);
-}
-for (const path of ['scripts/variational-balance.py', 'scripts/variational-request.py']) executor.add(path);
-const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
-const runtime = ['name', 'type', 'main', 'imports', 'exports', 'dependencies', 'optionalDependencies', 'engines'].map(k => [k, pkg[k]]);
-for (const [name, files] of Object.entries({ control, executor })) {
-  const hash = createHash('sha256').update(JSON.stringify(runtime) + '\n');
-  for (const path of [...files].sort()) {
-    hash.update(path + '\0').update(createHash('sha256').update(readFileSync(path)).digest());
-  }
-  writeFileSync('.' + name + '-sha256', hash.digest('hex') + '\n');
-}
-JS
-)
+node "$root/deploy/component-digests.mjs" "$pkg"
 tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner --mode='u+rwX,go+rX,go-w' -C "$stage" -cf - trading-platform \
   | gzip -n -9 >"$out/trading-platform.tar.gz"
 cp "$root/deploy/install.sh" "$out/install.sh"

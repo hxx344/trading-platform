@@ -68,7 +68,7 @@ interface RuleState { mode: 'observe' | 'live'; observing: boolean; live: LiveSt
 interface Rule { id: string; revision: number; createdAt: number; config: RuleConfig; state: RuleState }
 
 /** The slice of the oil and hynix market views a rule reads: one row per venue and contract. */
-export interface BookRow { venue: Venue; symbol: string; bid: string | null; ask: string | null; receivedAt: number | null; error: string | null }
+export interface BookRow { venue: Venue; symbol: string; bid: string | null; ask: string | null; receivedAt: number | null; sourceAt?: number; error: string | null }
 export interface Reading { value: string; met: boolean; side: 'sell' | 'buy'; sample: string; at: number; bzAt: number; clAt: number }
 interface Counted extends Reading { hits: number; signaled: boolean }
 interface Observed { open?: Counted; close?: Counted; note: string | null }
@@ -186,9 +186,11 @@ export function evaluateRule(config: RuleConfig, action: RuleAction, books: read
     const row = books.find(item => item.venue === config.venue && item.symbol === symbol);
     if (!row || row.bid === null || row.ask === null || row.receivedAt === null) return { error: `${symbol} 未取得盘口` };
     if (row.error) return { error: `${symbol} 盘口读取失败` };
-    if (row.receivedAt - now > QUOTE_FUTURE_MS) return { error: `${symbol} 盘口时间超前，请检查时钟` };
-    if (now - row.receivedAt > QUOTE_MAX_AGE_MS) return { error: `${symbol} 盘口已过期` };
-    return { bid: row.bid, ask: row.ask, at: row.receivedAt };
+    const sourceAt = row.sourceAt ?? row.receivedAt;
+    if (Math.max(sourceAt, row.receivedAt) - now > QUOTE_FUTURE_MS) return { error: `${symbol} 盘口时间超前，请检查时钟` };
+    const at = Math.min(sourceAt, row.receivedAt);
+    if (now - at > QUOTE_MAX_AGE_MS) return { error: `${symbol} 盘口已过期` };
+    return { bid: row.bid, ask: row.ask, at };
   };
   const premium = read(PREMIUM_LEG[config.market]), base = read(BASE_LEG[config.market]);
   if ('error' in premium) return premium;

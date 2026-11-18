@@ -8,6 +8,8 @@ export interface OndoStream { start(): void; status(): OndoStreamStatus; close()
 export interface OndoStreamOptions {
   markets: string[];
   credentials?: unknown;
+  privateOnly?: boolean;
+  onPublicReady?(at: number): void;
   latency?: import('./latency.mjs').OndoLatencyObserver;
   heartbeatAllowed?: () => boolean;
   /** Levels per side asked for. */

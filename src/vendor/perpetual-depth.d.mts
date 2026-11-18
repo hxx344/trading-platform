@@ -28,6 +28,7 @@ export interface PerpetualExecutionOptions {
   maxMarkets?: number; cacheMs?: number;
 }
 export interface PerpetualExecutionService {
+  books(keys: { exchange: string; symbol: string; identity: string }[]): Promise<import('./perpetual-estimates.mjs').MarketDepthResult[]>;
   fx(): Promise<PerpetualFxSnapshot>;
   peekFx(): PerpetualFxSnapshot | null;
   depth(input: unknown): Promise<PerpetualDepthEstimate>;

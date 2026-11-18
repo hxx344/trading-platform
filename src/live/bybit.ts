@@ -3,7 +3,7 @@
 // follow the real-account report in docs/unified-platform-phase0-inventory.md item 47.
 import { bybitAuthHeaders } from '../vendor/bybit.mjs';
 import { createHash } from 'node:crypto';
-import { VENUE_EXECUTION_SYMBOLS, accountKey, type AccountBinding, type AccountSnapshot, type Instrument, type OpenOrder, type Position, type PositionSide, type Quote } from '../contracts.ts';
+import { VENUE_EXECUTION_SYMBOLS, accountKey, type AccountBinding, type AccountSnapshot, type Instrument, type OpenOrder, type Position, type PositionSide } from '../contracts.ts';
 import {
   STRATEGY_ID, VenueError, type CallOptions, type ChaseConnector, type ConnectorCapabilities, type LedgerEntry, type OrderReport, type PnlPosition, type PnlSnapshot, type OrderRequest, type OrderStatus, type SendOptions,
   type StrategyAck, type StrategyReport, type StrategyRequest,
@@ -425,19 +425,8 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
       return { ...instrument };
     }),
 
-    quote: (symbol: string, { signal }: CallOptions) => reading(async (): Promise<Quote> => {
-      if (!VENUE_EXECUTION_SYMBOLS.bybit.includes(symbol)) throw new VenueError('read-failed', `${symbol} 不在 Bybit 可读合约内`);
-      const book = await publicRead('/v5/market/orderbook', { category: 'linear', symbol, limit: '1' }, signal);
-      const receivedAt = now();
-      const level = (side: unknown, name: string): string => {
-        const levels = list(side, name, 1), top = list(levels[0], name, 2);
-        if (levels.length !== 1 || top.length !== 2) throw new ShapeError(`${name}缺失`);
-        amount(top[1], `${name}数量`);
-        return amount(top[0], name);
-      };
-      if (book.s !== symbol) throw new ShapeError('盘口合约与请求不一致');
-      return { venue: 'bybit', symbol, bid: level(book.b, '买一价'), ask: level(book.a, '卖一价'), sourceTime: millis(book.ts, '盘口时间'), receivedAt, connectionGeneration: 0, sequence: null, complete: true };
-    }),
+    quote: (symbol: string, { signal }: CallOptions) => reading(async () =>
+      (await import('../market/books.ts')).readPublicBook('bybit', symbol, signal, fetchImpl, now, timeoutMs)),
 
     account: (binding: AccountBinding, symbols: readonly string[], { signal }: CallOptions) => reading(async (): Promise<AccountSnapshot> => {
       if (symbols.length === 0 || symbols.some(symbol => !VENUE_EXECUTION_SYMBOLS.bybit.includes(symbol))) throw new VenueError('read-failed', '账户快照的合约无效');

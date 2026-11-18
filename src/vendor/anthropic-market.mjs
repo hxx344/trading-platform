@@ -460,28 +460,45 @@ async function rhCandles(startTime, endTime, options) {
  * @param {{ fetcher?: typeof fetch, now?: number, timeout?: number, gate?: { until: number, status: number }, rh?: RhLighterState, clock?: () => number }} [options]
  */
 export async function fetchAnthropicCandles(existing = null, { fetcher = fetch, now = Date.now(), timeout = 15_000, gate = sharedBinanceGate, rh = sharedRhState, clock = Date.now } = {}) {
-  const previous = existing ? validateAnthropicCandles(existing) : null, options = { fetcher, timeout, gate, rh, clock };
+  const previous = existing ? validateAnthropicCandles(existing) : null;
+  const batch = await fetchAnthropicCandleBatch(anthropicCandleStarts(previous, now), { fetcher, now, timeout, gate, rh, clock });
+  return mergeAnthropicCandleBatch(previous, batch);
+}
+
+/** Each leg resumes from its own last confirmed close, overlapping a day. Only these four times cross IPC. */
+export function anthropicCandleStarts(previous, now) {
   const firstStart = Math.floor((now - ANTHROPIC_INITIAL_DAYS * DAY_MS) / ANTHROPIC_CANDLE_MS) * ANTHROPIC_CANDLE_MS;
-  const startOf = key => {
+  return Object.fromEntries(LEG_KEYS.map(key => {
     const last = previous?.data.findLast(row => row[key] !== null);
-    return last ? last.time - OVERLAP_BARS * ANTHROPIC_CANDLE_MS : previous ? Math.min(previous.data[0].time, firstStart) : firstStart;
-  };
-  const read = key => key === 'binance' ? binanceCandles(startOf(key), now, options) : key === 'rh' ? rhCandles(startOf(key), now, options) : hyperliquidCandles(key, startOf(key), now, options);
+    return [key, last ? last.time - OVERLAP_BARS * ANTHROPIC_CANDLE_MS : previous ? Math.min(previous.data[0].time, firstStart) : firstStart];
+  }));
+}
+
+export async function fetchAnthropicCandleBatch(starts, { fetcher = fetch, now = Date.now(), timeout = 15_000, gate = sharedBinanceGate, rh = sharedRhState, clock = Date.now } = {}) {
+  const options = { fetcher, timeout, gate, rh, clock };
+  const read = key => key === 'binance' ? binanceCandles(starts[key], now, options) : key === 'rh' ? rhCandles(starts[key], now, options) : hyperliquidCandles(key, starts[key], now, options);
   const reads = await Promise.allSettled(LEG_KEYS.map(read));
   if (reads.every(read => read.status === 'rejected')) throw reads[0].reason;
-  const merged = new Map((previous?.data ?? []).map(row => [row.time, { ...row }])), errors = {};
+  const legs = {}, errors = {};
   LEG_KEYS.forEach((key, index) => {
     const read = reads[index];
-    if (read.status !== 'fulfilled') { errors[key] = legError(read.reason); return; }
-    for (const [time, close] of read.value) {
+    if (read.status === 'fulfilled') legs[key] = [...read.value];
+    else errors[key] = legError(read.reason);
+  });
+  return { legs, errors, at: now };
+}
+
+export function mergeAnthropicCandleBatch(previous, { legs, errors, at }) {
+  const merged = new Map((previous?.data ?? []).map(row => [row.time, { ...row }]));
+  for (const key of LEG_KEYS) {
+    for (const [time, close] of legs[key] ?? []) {
       const row = merged.get(time) ?? Object.fromEntries([['time', time], ...LEG_KEYS.map(leg => [leg, null])]);
       row[key] = close;
       merged.set(time, row);
     }
-  });
-  const cutoff = now - ANTHROPIC_RETENTION_DAYS * DAY_MS;
-  const rows = [...merged.values()].filter(row => row.time >= cutoff).sort((a, b) => a.time - b.time);
-  return createAnthropicCandles(rows, new Date(now).toISOString(), 'live', errors);
+  }
+  const rows = [...merged.values()].filter(row => row.time >= at - ANTHROPIC_RETENTION_DAYS * DAY_MS).sort((a, b) => a.time - b.time);
+  return createAnthropicCandles(rows, new Date(at).toISOString(), 'live', errors);
 }
 
 /**

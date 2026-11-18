@@ -50,7 +50,7 @@ function parsePublicTrade(row) {
 // reopened after 1-30 s, 60 s after a refused login, without a retry limit:
 // reconnecting places no order. Private payloads are passed on unparsed; the
 // caller treats them as hints and reads the account over REST.
-export function createOndoStream({ markets, credentials = null, depth = 50, onBook, onTrade, latency, heartbeatAllowed = () => true, onPrivate = () => {}, onDown = () => {},
+export function createOndoStream({ markets, credentials = null, privateOnly = false, depth = 50, onBook, onTrade, onPublicReady, latency, heartbeatAllowed = () => true, onPrivate = () => {}, onDown = () => {},
   WebSocketImpl = globalThis.WebSocket, now = Date.now, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout } = {}) {
   const wanted = new Set(markets);
   const observeTrades = !credentials && typeof onTrade === 'function';
@@ -142,8 +142,10 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
         resumeAfterExpiry = null;
         heartbeatAckAt = lastFrame;
       }
+      const wasReady = publicReady();
       if (typeof message.channel === 'string') subscribed.add(message.channel);
-      if (publicReady() && (!credentials || privateReady())) { failures = 0; error = null; }
+      if (!privateOnly && !wasReady && publicReady()) onPublicReady?.(lastFrame);
+      if ((privateOnly || publicReady()) && (!credentials || privateReady())) { failures = 0; error = null; }
       return;
     }
     if (message.type === 'unsubscribed' && (message.channel === 'depthBooksPerps' || (observeTrades && message.channel === 'tradesPerps'))) {
@@ -159,7 +161,7 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
       return;
     }
     if (message.type !== 'update' || typeof message.channel !== 'string') return;
-    if (message.channel === 'depthBooksPerps') {
+    if (!privateOnly && message.channel === 'depthBooksPerps') {
       if (!Array.isArray(message.data)) throw new Error('shape');
       const frameEra = era;
       const frameBooks = received ? new Map() : null;
@@ -196,11 +198,11 @@ export function createOndoStream({ markets, credentials = null, depth = 50, onBo
     ws.addEventListener('open', () => {
       if (!active()) return;
       open = true; lastFrame = now();
-      if (!send({ op: 'subscribe', channel: 'depthBooksPerps', markets: [...wanted], limit: depth })) return;
+      if (!privateOnly && !send({ op: 'subscribe', channel: 'depthBooksPerps', markets: [...wanted], limit: depth })) return;
       if (observeTrades) {
         if (!send({ op: 'subscribe', channel: 'tradesPerps', markets: [...wanted], numPastTrades: 0 })) return;
-        schedule(() => { if (active() && !publicReady()) fail('public_timeout'); }, CONNECT_MS);
       }
+      if (observeTrades || onPublicReady) schedule(() => { if (active() && !publicReady()) fail('public_timeout'); }, CONNECT_MS);
       if (credentials) {
         let login;
         try { login = ondoWsLogin(credentials, String(Math.trunc(now()))); } catch { fail('login_refused', true); return; }

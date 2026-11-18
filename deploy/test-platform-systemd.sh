@@ -12,11 +12,14 @@ updates=/var/lib/trading-platform-update
 unitdir=/etc/systemd/system
 service=trading-platform
 control=trading-platform-control
-units=("$service.service" "$control.service" "$service-import.path" "$service-import.service" "$service-update.path" "$service-update.service")
-for path in "$app" "$conf" "$data" "$handoff" "$updates" /run/trading-platform "$unitdir/$service.service.d" "${units[@]/#/$unitdir/}"; do
+market=trading-platform-market
+extra_user=tp-market-ci-extra
+market_socket=/run/trading-platform-market/market.sock
+units=("$service.service" "$control.service" "$market.service" "$service-import.path" "$service-import.service" "$service-update.path" "$service-update.service")
+for path in "$app" "$conf" "$data" "$handoff" "$updates" /run/trading-platform /run/trading-platform-market "$unitdir/$service.service.d" "$unitdir/$market.service.d" "${units[@]/#/$unitdir/}"; do
   [[ ! -e "$path" && ! -L "$path" ]] || { echo "Fixture target already exists: $path" >&2; exit 1; }
 done
-for account in "$service" "$control" "$service-ipc"; do
+for account in "$service" "$control" "$service-ipc" "$market" "$market-ipc" "$extra_user"; do
   if getent passwd "$account" >/dev/null || getent group "$account" >/dev/null; then echo 'Fixture account already exists' >&2; exit 1; fi
 done
 fixture=$(mktemp -d /opt/trading-platform-ci-XXXXXXXX)
@@ -27,7 +30,7 @@ cleanup() {
     [[ ! -f "$fixture/out" ]] || tail -n 20 "$fixture/out"
     systemctl show "$service-update.path" "$service-update.service" "$service-import.path" "$service-import.service" \
       -p Id -p ActiveState -p SubState -p Result -p ExecMainStatus -p Paths -p Triggers --no-pager || true
-    journalctl -u "$service" -u "$control" -u "$service-update.path" -u "$service-update.service" \
+    journalctl -u "$service" -u "$control" -u "$market" -u "$service-update.path" -u "$service-update.service" \
       -u "$service-import.path" -u "$service-import.service" --no-pager -n 70 || true
     # Report only file type, owner/mode, the phase and an enumerated reason. Never open links or print a request,
     # access token, updater output array, password, or an arbitrary string written by a service account.
@@ -59,31 +62,36 @@ for (const [dir, files] of [[process.argv[2], ['update-request.json', 'update-re
 }
 JS
   fi
-  systemctl disable --now "$service-update.path" "$service-import.path" "$control" "$service" >/dev/null 2>&1 || true
+  systemctl disable --now "$service-update.path" "$service-import.path" "$control" "$market" "$service" >/dev/null 2>&1 || true
   rm -f "${units[@]/#/$unitdir/}"
   systemctl daemon-reload || true
-  userdel "$control" >/dev/null 2>&1 || true; userdel "$service" >/dev/null 2>&1 || true
-  for group in "$service" "$control" "$service-ipc"; do groupdel "$group" >/dev/null 2>&1 || true; done
-  rm -rf "$app" "$conf" "$data" "$handoff" "$updates" "$unitdir/$service.service.d" "$fixture"
+  for account in "$extra_user" "$market" "$control" "$service"; do userdel "$account" >/dev/null 2>&1 || true; done
+  for group in "$service" "$control" "$service-ipc" "$market" "$market-ipc"; do groupdel "$group" >/dev/null 2>&1 || true; done
+  rm -rf "$app" "$conf" "$data" "$handoff" "$updates" "$unitdir/$service.service.d" "$unitdir/$market.service.d" "$fixture"
   exit "$result"
 }
 trap cleanup EXIT
 umask 022
-mkdir "$fixture/old" "$fixture/source"
+mkdir "$fixture/source"
 # The actual page import below enables the observe-only Ondo module using an empty fixture, without any keys.
 # Keep the executor on loopback throughout this acceptance, including after its import-triggered restart.
-mkdir -p "$fixture/workbench/ondo-mm" "$unitdir/$service.service.d"
+mkdir -p "$fixture/workbench/ondo-mm" "$unitdir/$service.service.d" "$unitdir/$market.service.d"
 printf 'DATA_DIR=%s\n' "$fixture/workbench" >"$fixture/workbench.env"
 chmod 600 "$fixture/workbench.env"
 export TP_WORKBENCH_ENV="$fixture/workbench.env"
 printf '[Service]\nIPAddressDeny=any\nIPAddressAllow=localhost\n' >"$unitdir/$service.service.d/ci-loopback.conf"
-# The genuine last single-process release and its verified installer establish the migration baseline.
-old="$fixture/old"
-for asset in SHA256SUMS trading-platform.tar.gz install.sh; do
-  curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 10 --max-time 180 \
-    "https://github.com/hxx344/trading-platform/releases/download/v0.63.0/$asset" -o "$old/$asset"
+cp "$unitdir/$service.service.d/ci-loopback.conf" "$unitdir/$market.service.d/ci-loopback.conf"
+# Upgrade from genuine single-process and two-process releases, including their installers' on-disk state.
+old="$fixture/v0.63.0"
+dual="$fixture/v0.64.0"
+for version in v0.63.0 v0.64.0; do
+  mkdir "$fixture/$version"
+  for asset in SHA256SUMS trading-platform.tar.gz install.sh; do
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 10 --max-time 180 \
+      "https://github.com/hxx344/trading-platform/releases/download/$version/$asset" -o "$fixture/$version/$asset"
+  done
+  (cd "$fixture/$version" && awk '$2 == "install.sh" || $2 == "trading-platform.tar.gz"' SHA256SUMS >required && [[ $(wc -l <required) == 2 ]] && sha256sum -c --quiet required)
 done
-(cd "$old" && awk '$2 == "install.sh" || $2 == "trading-platform.tar.gz"' SHA256SUMS >required && [[ $(wc -l <required) == 2 ]] && sha256sum -c --quiet required)
 bash "$old/install.sh" --package "$old" >"$fixture/out" 2>&1
 pid() { local value; value=$(systemctl show -p MainPID --value "$1"); [[ "$value" =~ ^[1-9][0-9]*$ ]] && printf '%s\n' "$value"; }
 legacy_pid=$(pid "$service")
@@ -113,11 +121,19 @@ assert_page() {
   curl --noproxy '*' -fsS --max-time 3 -b "$fixture/cookie" "$(url /)" >"$fixture/index"
   cmp -s "$fixture/index" "$app/current/web/dist/index.html"
 }
+market_probe() {
+  runuser -u "$service" -g "$market-ipc" -- timeout 4 node "$1/src/market/probe.ts" --socket "$market_socket" --root "$1"
+}
+assert_market_absent() {
+  [[ ! -e "$unitdir/$market.service" && ! -e "$app/market" && ! -e "$app/market.env" && ! -e "$market_socket" ]]
+  if systemctl is-active --quiet "$market"; then echo 'Market still running after downgrade' >&2; return 1; fi
+}
 build 1
 echo 'Migrating the genuine single writer to the private socket and the browser service'
 install_release 1
 executor_pid=$(pid "$service")
 control_pid=$(pid "$control")
+market_pid=$(pid "$market")
 [[ "$executor_pid" != "$legacy_pid" && -S /run/trading-platform/execution.sock &&
    $(stat -c '%U:%G %a' /run/trading-platform) == "$service:$service-ipc 2750" &&
    $(stat -c '%U:%G %a' /run/trading-platform/execution.sock) == "$service:$service-ipc 660" ]]
@@ -126,9 +142,44 @@ control_pid=$(pid "$control")
 if runuser -u "$control" -- test -r "$conf/secrets.json" || runuser -u "$control" -- test -w "$handoff" ||
     runuser -u "$control" -- kill -0 "$executor_pid" 2>/dev/null; then echo 'Control UID reached execution credentials, import queue or signal permission' >&2; exit 1; fi
 systemctl is-enabled --quiet "$control"
+systemctl is-enabled --quiet "$market"
+[[ $(stat -c %U "/proc/$market_pid") == "$market" && -S "$market_socket" &&
+   $(stat -c '%U:%G %a' "/run/$market") == "$market:$market-ipc 2750" && $(stat -c '%U:%G %a' "$market_socket") == "$market:$market-ipc 660" ]]
+[[ ! -e "/proc/$market_pid/root$conf/config.json" && ! -e "/proc/$market_pid/root$data/access-url" &&
+   ! -e "/proc/$market_pid/root$data/executor-live.sqlite" && "$(stat -c '%U %a' "$app/market.env")" == 'root 600' ]]
+if runuser -u "$market" -g "$market-ipc" -- test -w "$data" || runuser -u "$market" -- test -r "$conf/secrets.json" ||
+    runuser -u "$market" -- test -w "$updates" || runuser -u "$market" -- test -w "$handoff" ||
+    runuser -u "$market" -- kill -0 "$executor_pid" 2>/dev/null; then echo 'Market UID reached private service resources' >&2; exit 1; fi
+# Try each disallowed socket from a service UID with the exact IPC group used by its unit.
+for recipient in "$market:$market-ipc:/run/trading-platform/execution.sock" "$control:$service-ipc:$market_socket"; do
+  IFS=: read -r account group socket <<<"$recipient"
+  runuser -u "$account" -g "$group" -- node -e '
+    const s = require("net").connect(process.argv[1]);
+    s.on("connect", () => { s.destroy(); process.exitCode = 1; });
+    s.on("error", e => { if (e.code !== "EACCES") process.exitCode = 1; });' "$socket"
+done
+market_probe "$app/market"
 [[ -e "$app/.update-helper" ]]
 login
 assert_page v99.1.1
+
+echo 'A killed market process restarts on its own; the logged-in page and the original execution generation continue'
+kill -KILL "$market_pid"
+assert_page v99.1.1
+for _ in {1..50}; do
+  if [[ $(pid "$market") != "$market_pid" ]] && market_probe "$app/market" 2>/dev/null; then break; fi
+  sleep 0.5
+done
+market_probe "$app/market"
+[[ $(pid "$market") != "$market_pid" && $(pid "$control") == "$control_pid" && $(pid "$service") == "$executor_pid" ]]
+market_pid=$(pid "$market")
+
+echo 'Rejecting an already shared market IPC group leaves all three processes running'
+useradd --system --no-user-group --gid "$market-ipc" --no-create-home --shell /usr/sbin/nologin "$extra_user"
+if install_release 1; then echo 'Accepted an unrelated user in the market IPC group' >&2; exit 1; fi
+grep -q '行情通信组已用作其他账户的主组' "$fixture/out"
+[[ $(pid "$market") == "$market_pid" && $(pid "$control") == "$control_pid" && $(pid "$service") == "$executor_pid" ]]
+userdel "$extra_user"
 
 echo 'Unsafe custom update parents are rejected before provisioning, preserving the live services'
 mkdir "$fixture/parent-group" "$fixture/parent-other" "$fixture/parent-user" "$fixture/parent-trusted"
@@ -181,19 +232,44 @@ flock -w 90 "$app/.install.lock" true
 echo 'Page and version changes preserve both real processes, cookies and their pinned packages across cleanup'
 first_executor=$(readlink "$app/executor")
 first_control=$(readlink "$app/control")
+first_market=$(readlink "$app/market")
 for version in 2 3 4 5; do
   printf '\n<!-- simulated page release %s -->\n' "$version" >>"$source/web/dist/index.html"
   build "$version"
   install_release "$version"
   [[ $(pid "$service") == "$executor_pid" && $(pid "$control") == "$control_pid" && -f "$first_executor/src/service/main.ts" && -f "$first_control/src/control/main.ts" ]]
+  [[ $(pid "$market") == "$market_pid" && -f "$first_market/src/market/main.ts" ]]
   assert_page "v99.1.$version"
 done
+
+echo 'Changing public subscriptions and historical/depth readers refreshes only the market generation and its reported identity'
+for reader in monitor/perpetual-feed.ts vendor/perpetual-exchanges.mjs vendor/perpetual-price-reader.mjs vendor/crossex/depth-reader.mjs; do
+  printf '\n// simulated public market reader upgrade\n' >>"$source/src/$reader"
+done
+build 13
+install_release 13
+[[ $(pid "$service") == "$executor_pid" && $(pid "$control") == "$control_pid" && $(pid "$market") != "$market_pid" ]]
+market_probe "$app/market"
+if market_probe "$first_market" 2>/dev/null; then echo 'A market probe accepted a different running build' >&2; exit 1; fi
+assert_page v99.1.13
+
+echo 'A broken market-only package restores the previous market and preserves both non-market PIDs'
+cp "$source/src/market/main.ts" "$fixture/good-market"
+sed -i '1i if (import.meta.main) throw new Error("模拟行情服务启动失败");' "$source/src/market/main.ts"
+build 14
+if install_release 14; then echo 'Broken market accepted' >&2; exit 1; fi
+grep -q '已回退到 v99.1.13 并确认运行正常' "$fixture/out"
+[[ $(pid "$service") == "$executor_pid" && $(pid "$control") == "$control_pid" ]]
+market_probe "$app/market"
+assert_page v99.1.13
+cp "$fixture/good-market" "$source/src/market/main.ts"
+market_pid=$(pid "$market")
 
 echo 'An update-helper-only package leaves both live process generations unchanged'
 printf '\n// simulated root helper update\n' >>"$source/src/service/update-helper.ts"
 build 11
 install_release 11
-[[ $(pid "$service") == "$executor_pid" && $(pid "$control") == "$control_pid" ]]
+[[ $(pid "$service") == "$executor_pid" && $(pid "$control") == "$control_pid" && $(pid "$market") == "$market_pid" ]]
 assert_page v99.1.11
 
 echo 'Control code changes restart only the browser service; a repeat is a healthy no-op'
@@ -245,15 +321,24 @@ grep -q '已回退到 v99.1.8 并确认运行正常' "$fixture/out"
 login
 assert_page v99.1.8
 if curl --noproxy '*' -s --max-time 1 -o /dev/null http://127.0.0.1:4720/api/ready; then echo 'Rollback left the old port listening' >&2; exit 1; fi
-printf '%s\n' 'NODE_USE_ENV_PROXY=1' 'NO_PROXY=127.0.0.1' 'CI_EXECUTION_ONLY=marker' >"$conf/environment"
+printf '%s\n' 'NODE_USE_ENV_PROXY=1' 'NO_PROXY=127.0.0.1' 'COINGECKO_DEMO_API_KEY=fixture-market-key' 'CI_EXECUTION_ONLY=marker' >"$conf/environment"
 install_release 8
 login
 assert_page v99.1.8
 control_pid=$(pid "$control")
 tr '\0' '\n' <"/proc/$control_pid/environ" >"$fixture/control-env"
 grep -qx 'NODE_USE_ENV_PROXY=1' "$fixture/control-env"
-if grep -q CI_EXECUTION_ONLY "$fixture/control-env"; then echo 'Executor environment reached control' >&2; exit 1; fi
+tr '\0' '\n' <"/proc/$(pid "$market")/environ" >"$fixture/market-env"
+grep -qx 'NODE_USE_ENV_PROXY=1' "$fixture/market-env"
+grep -qx 'COINGECKO_DEMO_API_KEY=fixture-market-key' "$fixture/market-env"
+if grep -q CI_EXECUTION_ONLY "$fixture/market-env" "$fixture/control-env" || grep -q COINGECKO_DEMO_API_KEY "$fixture/control-env"; then
+  echo 'The environment crossed a service boundary' >&2; exit 1
+fi
 executor_pid=$(pid "$service")
+market_pid=$(pid "$market")
+sed -i 's/^COINGECKO_DEMO_API_KEY=fixture-market-key$/COINGECKO_DEMO_API_KEY=changed-market-key/' "$conf/environment"
+install_release 8
+[[ $(pid "$market") != "$market_pid" && $(pid "$service") == "$executor_pid" && $(pid "$control") == "$control_pid" ]]
 systemctl stop "$control"
 install_release 8
 [[ $(pid "$service") == "$executor_pid" && $(pid "$control") != "$control_pid" ]]
@@ -262,14 +347,26 @@ assert_page v99.1.8
 echo 'Downgrade frees TCP for the original unit and can migrate forward again'
 bash "$root/deploy/install.sh" --package "$old" >"$fixture/out" 2>&1
 [[ ! -e "$unitdir/$control.service" && ! -e "$app/control" && ! -e /run/trading-platform/execution.sock ]]
+assert_market_absent
 grep -qF "PathChanged=$handoff/update-request.json" "$unitdir/$service-update.path"
 grep -qF -- "--dir $handoff --app-dir $app" "$unitdir/$service-update.service"
 if systemctl is-active --quiet "$control"; then echo 'Control still running on downgrade' >&2; exit 1; fi
 login
 assert_page v0.63.0
+
+echo 'Upgrade from the genuine two-process release and downgrade to its original public-data owner'
+bash "$dual/install.sh" --package "$dual" >"$fixture/out" 2>&1
+login
+assert_page v0.64.0
+assert_market_absent
 install_release 8
 login
 assert_page v99.1.8
+market_probe "$app/market"
+bash "$root/deploy/install.sh" --package "$dual" >"$fixture/out" 2>&1
+login
+assert_page v0.64.0
+assert_market_absent
 
 echo 'Reconciling a real old installer which changed current without updating the split deployment record'
 systemctl disable --now "$control"

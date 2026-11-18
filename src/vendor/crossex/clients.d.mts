@@ -9,5 +9,5 @@ export interface PublicClients {
   resolveCrossexQuote(symbol: string): Promise<unknown>;
   resolveManualQuote(symbol: string): Promise<unknown>;
 }
-export function createPublicClients(options?: { fetcher?: CrossexFetcher; WebSocketImpl?: unknown; clock?: () => number; timeoutMs?: number }): PublicClients;
+export function createPublicClients(options?: { fetcher?: CrossexFetcher; WebSocketImpl?: unknown; clock?: () => number; timeoutMs?: number; signal?: AbortSignal }): PublicClients;
 export const CATALOG_URL: string;

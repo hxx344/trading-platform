@@ -12,7 +12,7 @@ import type { OptionsClient, Row } from './client.ts';
 import { QUOTE_STALE_MS, isSunday, type ChainSnapshot, type OptionMarket, type OptionRow, type OptionType } from './market.ts';
 import { followOrder, iocOrder, reconcileOrder, roundToTick, type OrderOutcome, type OrderStatus } from './orders.ts';
 import { amountText, buildPerformance, exact, thinPoints, type PerformanceInput, type Sample } from './performance.ts';
-import { RFQ_STATUS_NAMES, chainFor, counterpartiesFrom, filledOrders, isTerminal, observe, parseQuotes, parseRfqRow, quoteProblem, quoteView, rfqFinished, sortQuotes, strategyTypeFor, validRfq, type RfqObservation, type RfqQuote, type RfqRecord } from './rfq.ts';
+import { QUOTE_MIN_LEFT_MS, RFQ_STATUS_NAMES, chainFor, counterpartiesFrom, filledOrders, isTerminal, observe, parseQuotes, parseRfqRow, quoteProblem, quoteView, rfqFinished, sortQuotes, strategyTypeFor, validRfq, type RfqObservation, type RfqQuote, type RfqRecord } from './rfq.ts';
 import type { OptionsStore } from './store.ts';
 import { StrategyError, buildStrategy, maximumLoss, reserveShortMargin, validateStructure, type Estimates, type MarginContext, type Preview, type RiskLeg, type Side, type StrategyMode } from './strategy.ts';
 
@@ -656,6 +656,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
         save();
         throw error;
       }
+      const approvedSnapshot = freshSnapshot(), approvedEpoch = client.marketEpoch?.();
       const executionChain = Object.fromEntries(rfq.legs.map(leg => [leg.symbol, chainFor(leg.side, rowOf(leg.symbol)) ?? leg.referencePrice]));
       Object.assign(rfq, {
         status: 'ExecutionUnknown', selectedQuoteId: chosen.quoteId, selectedDesk: chosen.deskCode, selectedPrices: prices, executionChain,
@@ -669,7 +670,11 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
         state.pmBaseline = priorBaseline;
       };
       try {
-        const reply = await client.executeQuote(rfqId, chosen.quoteId, AbortSignal.timeout(READ_MS));
+        const reply = await client.executeQuote(rfqId, chosen.quoteId, AbortSignal.timeout(READ_MS), () => {
+          const at = now();
+          if (approvedEpoch !== client.marketEpoch?.() || approvedSnapshot.at > at || at - approvedSnapshot.at > QUOTE_STALE_MS
+            || Math.min(rfq.expiresAt ?? 0, chosen.expiresAt) - at < QUOTE_MIN_LEFT_MS) throw new VenueError('not-sent', '询价或行情依据已经失效');
+        });
         // An answer naming another RFQ or quote proves nothing about this one: it stays unknown for the loop to settle.
         const foreign = (reply.rfqId !== undefined && reply.rfqId !== rfqId) || (reply.quoteId !== undefined && reply.quoteId !== chosen.quoteId);
         if (rfq.status !== 'ExecutionUnknown') { /* the loop settled it meanwhile */ }

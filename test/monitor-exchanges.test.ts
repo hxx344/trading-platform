@@ -13,7 +13,7 @@ import {
 import { createBinanceGate } from '../src/vendor/anthropic-market.mjs';
 import { EXCHANGE_RESULT_TTL_MS, createExchangeReader, exchangeError } from '../src/monitor/exchanges.ts';
 import { parseServiceConfig } from '../src/service/config.ts';
-import { monitorViews, openMonitor, stopMonitor } from '../src/service/monitor.ts';
+import { closeMonitor, monitorViews, openMonitor, stopMonitor } from '../src/service/monitor.ts';
 import { createExecutorServer } from '../src/http.ts';
 import { createHarness } from './harness.ts';
 import { fakeAnthropicVenues, venuePrice } from './monitor-fake.ts';
@@ -286,7 +286,7 @@ test('接口：未登录 401；未配置的市场与不支持的交易所 404；
   } finally {
     await new Promise(resolve => server.close(resolve));
     h.dispose();
-    stopMonitor(runtime);
+    stopMonitor(runtime); closeMonitor(runtime);
     rmSync(dir, { recursive: true, force: true });
   }
 });

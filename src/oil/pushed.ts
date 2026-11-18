@@ -2,7 +2,7 @@
 // collector (public WebSockets, src/monitor/perpetual.ts) when it has a recent one, and read the venue over REST otherwise.
 // This file maps a venue and contract to the collector's key and decides whether its book can stand in for a REST read.
 import type { Venue } from '../contracts.ts';
-import { INSTRUMENT_IDS } from '../live/okx.ts';
+import { INSTRUMENT_IDS } from '../live/instrument-ids.ts';
 import { QUOTE_FUTURE_MS } from './rules.ts';
 
 /** A pushed book is used only while its venue time is at most this old (one read round); older legs are read over REST. */

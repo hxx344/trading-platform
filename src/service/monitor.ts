@@ -1,6 +1,9 @@
 // The monitor module inside the ASTER service: read-only market monitors named in config.json `monitor`. Started only when
 // that block is there, and each market only when it is named. Their history sits in monitor.sqlite; a file that cannot be
 // opened costs only the monitor page.
+import type { MarketClient } from '../market/ipc.ts';
+import { createRemoteMonitor } from './remote-monitor.ts';
+import { perpetualQualityEnv } from '../monitor/quality-config.ts';
 import { join } from 'node:path';
 import { ALERT_CHECK_MS, createAlertService, createTestGate, type AlertHooks, type AlertMarket, type AlertService } from '../monitor/alerts.ts';
 import { createAnthropicMonitor, type AnthropicMonitor, type LoopContext } from '../monitor/anthropic.ts';
@@ -35,42 +38,27 @@ export interface MonitorRuntime {
   perpetualCache: PerpetualCache | null;
 }
 
-/**
- * M-5d2: the quality service's optional CoinGecko settings, as the workbench reads them (monitor-services.mjs):
- * PERPETUAL_COIN_IDS, a JSON object of base to CoinGecko id (at most 2000), and COINGECKO_DEMO_API_KEY. The workbench refuses to
- * start on an invalid PERPETUAL_COIN_IDS; here it is ignored with a log line (the built-in ids still apply). Values never logged.
- */
-export function perpetualQualityEnv(env: Record<string, string | undefined>, log: (line: string) => void): { coinIds?: Record<string, string>; apiKey?: string } {
-  let coinIds: Record<string, string> | undefined;
-  if (env.PERPETUAL_COIN_IDS) {
-    try {
-      const value: unknown = JSON.parse(env.PERPETUAL_COIN_IDS);
-      if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > 2000
-        || Object.entries(value).some(([base, id]) => !/^[A-Z0-9._-]{1,40}$/.test(base) || typeof id !== 'string' || !/^[a-z0-9-]{1,120}$/.test(id))) throw new Error();
-      coinIds = value as Record<string, string>;
-    } catch { log('PERPETUAL_COIN_IDS 必须为币种到 CoinGecko ID 的 JSON 对象，已忽略，只用内置的币种映射'); }
-  }
-  return { ...(coinIds ? { coinIds } : {}), ...(env.COINGECKO_DEMO_API_KEY ? { apiKey: env.COINGECKO_DEMO_API_KEY } : {}) };
-}
+export { perpetualQualityEnv } from '../monitor/quality-config.ts';
 
 /** Opens monitor.sqlite and reads the saved history back; throws when the file cannot be opened. */
-export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now, log, WebSocketImpl, alertHooks, variationalFetch, perpetualOptions, env = process.env }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void; WebSocketImpl?: typeof WebSocket; alertHooks?: AlertHooks;
+export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now, log, WebSocketImpl, alertHooks, variationalFetch, perpetualOptions, marketClient, env = process.env }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void; WebSocketImpl?: typeof WebSocket; alertHooks?: AlertHooks;
   /** The transport to omni.variational.io; python3 and scripts/variational-request.py unless given (tests, the local preview). */
-  variationalFetch?: VariationalFetcher;
+  variationalFetch?: VariationalFetcher; marketClient?: MarketClient;
   /** Stand-ins for the perpetual collector's venues (tests, the local preview). */
   perpetualOptions?: PerpetualOptions;
   /** M-5d2: where PERPETUAL_COIN_IDS and COINGECKO_DEMO_API_KEY are read (process.env unless given). */
   env?: Record<string, string | undefined> } = {}): MonitorRuntime {
   const store = createMonitorStore({ file: join(dir, MONITOR_FILE), ...(now ? { now } : {}) });
   try {
-    const base = { store, ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}) };
+    const remote = marketClient ? createRemoteMonitor(marketClient, now) : null;
+    const base = { store, ...(remote ? { readers: remote.rounds } : {}), ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}) };
     // One Binance cooldown for everything that reads Binance from the same address; the Hynix collector reads Hyperliquid only.
     const gate = createBinanceGate(), options = { ...base, gate };
     const oil = config.oil ? createOilMonitor(options) : null, hynix = config.hynix ? createHynixMonitor(base) : null;
     const varFetch = oil ? variationalFetch ?? createVariationalFetch() : undefined;
     const variational = oil && varFetch ? createVariationalSession({ dir, fetcher: varFetch, ...(now ? { now } : {}), ...(log ? { log } : {}) }) : null;
     const exchanges = oil || hynix ? createExchangeReader({
-      gate, oilQuote: () => oil?.quote() ?? null, hynixQuote: () => hynix?.quote() ?? null,
+      ...(remote ? { remote: remote.comparison } : {}), gate, oilQuote: () => oil?.quote() ?? null, hynixQuote: () => hynix?.quote() ?? null,
       ...(variational && varFetch ? { variationalSession: variational, variationalFetch: varFetch } : {}),
       ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}), ...(WebSocketImpl ? { WebSocketImpl } : {}),
     }) : null;
@@ -105,7 +93,7 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
     try {
       const perpetual = config.perpetual ? createPerpetualMonitor({ ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}), cache: perpetualCache,
         ...(perpetualCache ? {} : { cacheUnavailable: `缓存库 ${PERPETUAL_CACHE_FILE} 打不开，市场指标、历史资金费、成交价历史与质量样本只存内存，重启后重新采集。` }),
-        paper: { store: paperStore, unavailableReason: paperUnavailable }, ...perpetualOptions,
+        paper: { store: paperStore, unavailableReason: paperUnavailable }, ...perpetualOptions, ...(remote ? { remote: remote.perpetual } : {}),
         quality: { ...perpetualQualityEnv(env, log ?? (line => process.stderr.write(`${line}\n`))), ...perpetualOptions?.quality } }) : null;
       return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, hynix, exchanges, alerts, control, variational, perpetual, perpetualCache };
     } catch (error) { perpetualCache?.close(); throw error; }

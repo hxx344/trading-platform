@@ -4,12 +4,13 @@
 // timeout and is never retried within a round; a failed round keeps what was there and says why. The last quote and the
 // candles are kept in monitor.sqlite and read back at start, marked as a snapshot until a round succeeds.
 import {
-  FIRST_FULL_HOUR, fetchHynixCandles, fetchHynixQuote, hynixCandleStart, validateHynixQuote, validateHynixRows,
+  FIRST_FULL_HOUR, hynixCandleStart, validateHynixQuote, validateHynixRows,
   type HynixCandleRow, type HynixFetcher, type HynixQuote,
 } from '../vendor/hynix-market.mjs';
-import { HYNIX_FIRST_SETTLEMENT, HYNIX_FUNDING_MS, fetchHynixFunding, validateHynixFundingRows, type HynixFundingRow } from '../vendor/settled-funding.mjs';
+import { HYNIX_FIRST_SETTLEMENT, HYNIX_FUNDING_MS, validateHynixFundingRows, type HynixFundingRow } from '../vendor/settled-funding.mjs';
 import { FUNDING_REFRESH_MS, createFundingHistory, type FundingView } from './funding.ts';
-import { CANDLE_STALE_MS, QUOTE_STALE_MS, boundedReply, type LoopContext } from './anthropic.ts';
+import { CANDLE_STALE_MS, QUOTE_STALE_MS, type LoopContext } from './anthropic.ts';
+import { createMarketReaders, type MarketReaders } from './market-readers.ts';
 import type { MonitorStore } from './store.ts';
 
 export const HYNIX_QUOTE_REFRESH_MS = 10_000;
@@ -21,7 +22,7 @@ export const HYNIX_FUNDING_KEY = 'hynix.funding';
 /** The settlement range one funding round reads at most (see the funding history below). */
 export const HYNIX_FUNDING_SPAN_MS = 60 * 86_400_000;
 /** The workbench's timeouts (lib/quote-service.ts, lib/market-service.ts). */
-const QUOTE_TIMEOUT_MS = 5_000, CANDLE_TIMEOUT_MS = 10_000, DAY_MS = 86_400_000;
+const DAY_MS = 86_400_000;
 /**
  * How often a round also re-reads the gaps older than the last 48 hours. The workbench reads from the earliest gap every
  * round; an hour without trades on either leg has no candle, so that would page up to 5000 hours each minute.
@@ -53,13 +54,12 @@ export function hynixError(error: unknown): string {
 const iso = (ms: number | null): string | null => ms === null ? null : new Date(ms).toISOString();
 const detail = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 200);
 
-export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, log = line => process.stderr.write(`${line}\n`) }: {
-  store: MonitorStore; fetchImpl?: HynixFetcher; now?: () => number; log?: (line: string) => void;
+export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, readers = createMarketReaders({ fetchImpl, now }), log = line => process.stderr.write(`${line}\n`) }: {
+  store: MonitorStore; readers?: MarketReaders; fetchImpl?: HynixFetcher; now?: () => number; log?: (line: string) => void;
 }) {
   const stopping = new AbortController();
-  // The vendor module puts a timeout on every request; the stop signal is added so a shutdown does not wait one out.
-  const fetcher: HynixFetcher = async (url, init) => boundedReply(await fetchImpl(url, { ...init, signal: init.signal ? AbortSignal.any([init.signal, stopping.signal]) : stopping.signal }));
 
+  let quoteEpoch: string | null = null;
   let quote: HynixQuote | null = null, quoteRestored = false, quoteAttemptAt: number | null = null, quoteError: string | null = null;
   let rows: HynixCandleRow[] = [], fetchedAt: string | null = null, candlesRestored = false, candleAttemptAt: number | null = null, candleError: string | null = null;
   // The stored rows could not be read back: the next successful round rewrites the table instead of adding to it.
@@ -95,14 +95,14 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, l
     // where a 400-day backfill in one round would pass the limit and fail every round.
     name: '海力士', key: HYNIX_FUNDING_KEY, legs: ['adr', 'ordinary'], first: HYNIX_FIRST_SETTLEMENT, intervalMs: HYNIX_FUNDING_MS, spanMs: HYNIX_FUNDING_SPAN_MS,
     read: () => store.hynixFunding(), readState: () => store.readState(HYNIX_FUNDING_KEY)?.value ?? null, write: write => store.writeHynixFunding(write),
-    validate: validateHynixFundingRows, fetch: (start, end, at) => fetchHynixFunding(start, { fetcher, timeout: CANDLE_TIMEOUT_MS, now: at, endTime: end }),
+    validate: validateHynixFundingRows, fetch: (start, end, at) => readers.hynixFunding(start, end, at, stopping.signal),
     reason: hynixError, aborted: () => stopping.signal.aborted, now, log,
   });
 
   async function refreshQuote(): Promise<void> {
     quoteAttemptAt = now();
     let next: HynixQuote;
-    try { next = await fetchHynixQuote({ fetcher, timeout: QUOTE_TIMEOUT_MS, now }); }
+    try { next = await readers.hynixQuote(stopping.signal); }
     catch (error) {
       if (stopping.signal.aborted) return;
       quoteError = hynixError(error);
@@ -110,7 +110,7 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, l
       return;
     }
     if (stopping.signal.aborted) return;
-    quote = next; quoteRestored = false; quoteError = null;
+    quote = next; quoteEpoch = readers.epoch?.() ?? null; quoteRestored = false; quoteError = null;
     quoteReport.recovered();
     try { store.writeState(HYNIX_QUOTE_KEY, next); quoteSave.recovered(); }
     catch (error) { quoteSave.failed('monitor.sqlite 写入失败', detail(error)); }
@@ -123,7 +123,7 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, l
     const full = at >= gapRetryAt;
     let next: HynixCandleRow[];
     try {
-      const fetched = await fetchHynixCandles(hynixCandleStart(rows, at, full), { fetcher, timeout: CANDLE_TIMEOUT_MS, now: at });
+      const fetched = await readers.hynixCandles(hynixCandleStart(rows, at, full), at, stopping.signal);
       // The fetched hours take precedence over the stored ones they overlap; the kept history ends at the retention cut.
       const merged = new Map(rows.map(row => [row.time, row]));
       for (const row of fetched) merged.set(row.time, row);
@@ -163,7 +163,7 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, l
     /** The last quote with its freshness (by receipt time: allMids carries no source time); null before any quote exists. */
     quote(): HynixQuoteView | null {
       if (!quote) return null;
-      const stale = quoteRestored || now() - Date.parse(quote.fetchedAt) > QUOTE_STALE_MS;
+      const stale = quoteRestored || (readers.epoch && (!quoteEpoch || quoteEpoch !== readers.epoch())) || now() - Date.parse(quote.fetchedAt) > QUOTE_STALE_MS;
       return { ...quote, status: stale ? 'snapshot' : 'live', staleAfterMs: QUOTE_STALE_MS, lastAttemptAt: iso(quoteAttemptAt), lastError: quoteError };
     },
     /** The hours within `days` before the last stored one (null: all of them), with the complete history's range; null before any row exists. */

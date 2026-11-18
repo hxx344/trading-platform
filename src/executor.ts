@@ -289,6 +289,13 @@ const strategyIdentity = (op: Operation): StrategyIdentity => {
   return { symbol, side, positionSide, reduceOnly, quantity, maxChasePrice };
 };
 
+/** Compare original venue times as well as receipt times when determining the two-leg price window. */
+function sameQuoteWindow(books: readonly Quote[], window: number): boolean {
+  const received = books.map(book => book.receivedAt);
+  const source = books.map(book => book.sourceTime ?? book.receivedAt);
+  return Math.max(...received) - Math.min(...received) <= window && Math.max(...source) - Math.min(...source) <= window;
+}
+
 export interface ExecutorOptions {
   store: Store;
   connectors: readonly VenueConnector[];
@@ -578,11 +585,11 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
    * Before a group's first lead goes out, the other venue's job is checked too (L100): if its lead could not go out now, this
    * one waits, so one venue does not open alone. The text says why, or null when the other job is already past this point.
    */
-  async function peerFirstLeadBlocked(job: PairJob): Promise<string | null> {
-    if (!job.group) return null;
+  async function peerFirstLeadEvidence(job: PairJob): Promise<Quote[] | string> {
+    if (!job.group) return [];
     const peer = readJob(job.group.peer);
-    if (!isPair(peer) || FINAL_JOB.has(peer.status) || peer.peerHalt || peer.holdNewSends || stopRequested(peer.id) || legOps(peer.id, 0).length) return null;
-    try { await guardLead(peer); return null; }
+    if (!isPair(peer) || FINAL_JOB.has(peer.status) || peer.peerHalt || peer.holdNewSends || stopRequested(peer.id) || legOps(peer.id, 0).length) return [];
+    try { return await guardLead(peer); }
     catch (error) {
       if (error instanceof WriterLostError) throw error;
       return `${VENUE_NAMES[peer.legs[0].venue]}：${error instanceof Error ? error.message.slice(0, 160) : '发送前检查失败'}`;
@@ -643,6 +650,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (error instanceof ContractError) throw error;
     throw new ContractError(502, 'venue_read_failed', `交易所读取失败：${error instanceof Error ? error.message.slice(0, 160) : '未知错误'}`);
   };
+  function checkBook(quote: Quote, at: number, maxAge: number): void {
+    checkQuoteFresh(quote, at, maxAge, budgets.futureToleranceMs);
+    if (connectorFor(quote.venue).quoteCurrent?.(quote) === false) reject('quote_incomplete', '行情连接已切换，请等待新盘口', 409);
+  }
   async function readQuote(venue: Venue, symbol: string): Promise<Quote> {
     try { return parseQuote(await callVenue('read', signal => connectorFor(venue).quote(symbol, { signal })), venue, symbol); } catch (error) { return readFailure(error); }
   }
@@ -784,8 +795,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       reject('barrels_step', `${barrels} 桶换算不成整数倍的下单数量（${rules}）；按步长最近的桶数为 ${low} 或 ${high}（仍须满足最小名义金额与数量上限）`);
     }
     const at = now();
-    for (const { quote } of reads) checkQuoteFresh(quote, at, budgets.previewQuoteMaxAgeMs, budgets.futureToleranceMs);
-    if (Math.abs(reads[0].quote.receivedAt - reads[1].quote.receivedAt) > budgets.pairQuoteWindowMs) reject('quote_window', `两腿盘口接收时间相差超过 ${budgets.pairQuoteWindowMs} 毫秒，请重新预览`, 409);
+    for (const { quote } of reads) checkBook(quote, at, budgets.previewQuoteMaxAgeMs);
+    if (!sameQuoteWindow(reads.map(read => read.quote), budgets.pairQuoteWindowMs)) reject('quote_window', `两腿盘口时间相差超过 ${budgets.pairQuoteWindowMs} 毫秒，请重新预览`, 409);
     const slippageBps = intent.maxSlippageBps ?? budgets.maxSlippageBps;
     const legs = intent.legs.map((leg, index) => {
       const { binding, instrument, quote, snapshot } = reads[index];
@@ -876,8 +887,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       return { symbol, instrument, quote, snapshot };
     }));
     const at = now();
-    for (const { quote } of reads) checkQuoteFresh(quote, at, budgets.previewQuoteMaxAgeMs, budgets.futureToleranceMs);
-    if (Math.abs(reads[0].quote.receivedAt - reads[1].quote.receivedAt) > budgets.pairQuoteWindowMs) reject('quote_window', `两腿盘口接收时间相差超过 ${budgets.pairQuoteWindowMs} 毫秒，请重新预览`, 409);
+    for (const { quote } of reads) checkBook(quote, at, budgets.previewQuoteMaxAgeMs);
+    if (!sameQuoteWindow(reads.map(read => read.quote), budgets.pairQuoteWindowMs)) reject('quote_window', `两腿盘口时间相差超过 ${budgets.pairQuoteWindowMs} 毫秒，请重新预览`, 409);
     const held = reads.map(({ symbol, instrument, quote, snapshot }): HeldContract => (
       { symbol, long: positionOf(snapshot, symbol, 'long'), short: positionOf(snapshot, symbol, 'short'), price: midOf(quote.bid, quote.ask), contractSize: instrument.contractSize }));
     const balance = pairBalance(held[0], held[1]);
@@ -1288,7 +1299,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
    * the first order). A local chase lead posts on its own side, so only the hedge's taker price is held to its bound here;
    * its post price is checked by chaseTarget. Returns the lead's book.
    */
-  async function guardLead(job: PairJob): Promise<Quote> {
+  async function guardLead(job: PairJob): Promise<Quote[]> {
     if (now() >= job.deadlineAt) reject('deadline', '任务已超过最长执行时间，未发送', 409);
     const checks = await Promise.all(job.legs.map(async leg => {
       const binding = bindingStillValid(leg);
@@ -1297,8 +1308,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     }));
     const at = now();
     // A stale or broken book is a refusal; only two fresh books read too far apart are retried, like a failed read.
-    for (const { quote } of checks) checkQuoteFresh(quote, at, budgets.sendQuoteMaxAgeMs, budgets.futureToleranceMs);
-    if (Math.abs(checks[0].quote.receivedAt - checks[1].quote.receivedAt) > budgets.pairQuoteWindowMs) reject('quote_window', `两腿盘口接收时间相差超过 ${budgets.pairQuoteWindowMs} 毫秒，暂不发送`, 409);
+    for (const { quote } of checks) checkBook(quote, at, budgets.sendQuoteMaxAgeMs);
+    if (!sameQuoteWindow(checks.map(check => check.quote), budgets.pairQuoteWindowMs)) reject('quote_window', `两腿盘口时间相差超过 ${budgets.pairQuoteWindowMs} 毫秒，暂不发送`, 409);
     // This job's own orders may still show in a snapshot read just after they ended.
     const own = opsOf(job.id).map(item => item.clientOrderId);
     for (const { leg, quote, snapshot } of checks) {
@@ -1310,17 +1321,17 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     }
     // Both accounts: a lead whose hedge account cannot be written would leave an exposure nobody can close.
     for (const leg of job.legs) admit(leg);
-    return checks[0].quote;
+    return checks.map(check => check.quote);
   }
   /**
    * Final send guard of a rebalance order: its book fresh and inside the preview bound, its account where the preview left it,
    * and the other leg, which the quantity was worked out against, still exactly as the preview read it. Returns the book.
    */
-  async function guardRebalance(job: RebalanceJob): Promise<Quote> {
+  async function guardRebalance(job: RebalanceJob): Promise<Quote[]> {
     if (now() >= job.deadlineAt) reject('deadline', '任务已超过最长执行时间，未发送', 409);
     const leg = job.legs[0], counter = job.rebalance.counter, binding = bindingStillValid(leg);
     const [quote, snapshot, counterSnapshot] = await Promise.all([readQuote(leg.venue, leg.symbol), readAccount(binding, leg.symbol), readAccount(binding, counter.symbol)]);
-    checkQuoteFresh(quote, now(), budgets.sendQuoteMaxAgeMs, budgets.futureToleranceMs);
+    checkBook(quote, now(), budgets.sendQuoteMaxAgeMs);
     const price = leg.orderSide === 'buy' ? quote.ask : quote.bid, bound = leg.priceBound ?? null;
     if (bound !== null && (leg.orderSide === 'buy' ? cmp(price, bound) > 0 : cmp(price, bound) < 0)) reject('price_moved', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 盘口 ${price} 已越过价格保护界限 ${bound}，未发送`, 409);
     const own = opsOf(job.id).map(item => item.clientOrderId);
@@ -1331,7 +1342,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       || counterSnapshot.positionModes[counter.symbol] !== counter.positionMode) reject('position_changed', `${name}（另一腿）持仓已变化，调平委托未发送；请重新预览`, 409);
     if (counterSnapshot.openOrders.some(order => order.symbol === counter.symbol)) reject('external_orders', `${name} 存在本任务之外的活动委托`, 409);
     admit(leg);
-    return quote;
+    return [quote];
   }
   /** What this job has yet to fill on a leg; a close needs at least that much position left. */
   function unfilledOf(job: Job, index: 0 | 1): string {
@@ -1367,7 +1378,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     admit(leg);
   }
 
-  async function send(job: Job, index: 0 | 1, quantity: string, attempt = 0, lead: { batch: number; price: string | null } = { batch: 0, price: null }): Promise<void> {
+  async function send(job: Job, index: 0 | 1, quantity: string, attempt = 0, lead: { batch: number; price: string | null; books?: readonly Quote[] } = { batch: 0, price: null }): Promise<void> {
     const leg = legAt(job, index), orderType = leg.orderType, clientOrderId = clientOrderIdFor(job, index, attempt);
     let request: OrderRequest | ChaseRequest;
     if (orderType === 'local-chase') {
@@ -1391,9 +1402,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       preparedAt: now(), sentAt: null, lastCheckedAt: null, absentChecks: 0, absentAt: null, positionMismatchAt: null, cancelSent: 0, cancelRequestedAt: null, note: null,
       ...(request.type === 'chase' ? { strategyStatus: null, childrenSettled: false, childrenWaitSince: null, adoptedAt: null } : {}) };
     inFlight.add(op.id);
-    try { await sendPrepared(job, index, op, request); } finally { inFlight.delete(op.id); }
+    try { await sendPrepared(job, index, op, request, lead.books); } finally { inFlight.delete(op.id); }
   }
-  async function sendPrepared(job: Job, index: 0 | 1, op: Operation, request: OrderRequest | ChaseRequest): Promise<void> {
+  async function sendPrepared(job: Job, index: 0 | 1, op: Operation, request: OrderRequest | ChaseRequest, books?: readonly Quote[]): Promise<void> {
     const leg = legAt(job, index), quantity = request.quantity;
     const binding = write(() => {
       const current = readJob(job.id);
@@ -1420,7 +1431,15 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     try { write(() => { Object.assign(op, { state: 'sending', sentAt: now() }); saveOp(op); }); }
     catch (error) { if (registered) control?.finish(registered, 'rejected'); throw error; }
     let report: OrderReport | null = null, strategyId: string | null = null, failure: unknown = null;
-    const beforeSend = () => { assertWriter(); if (registered) control?.assertSend(registered, budgets.callTimeoutMs); };
+    const beforeSend = () => {
+      assertWriter();
+      if (registered) control?.assertSend(registered, budgets.callTimeoutMs);
+      if (books) {
+        const at = now();
+        try { for (const book of books) checkBook(book, at, budgets.sendQuoteMaxAgeMs); }
+        catch (error) { throw new VenueError('not-sent', error instanceof Error ? error.message : '盘口已失效'); }
+      }
+    };
     try {
       if (request.type === 'chase') strategyId = parseStrategyAck(await callVenue('write', signal => chaseConnector(leg.venue).placeChase(binding, strategyRequestOf(request), { signal, beforeSend }))).strategyId;
       else report = parseOrderReport(await callVenue('write', signal => connectorFor(leg.venue).place(binding, request, { signal, beforeSend })), request);
@@ -1767,7 +1786,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       if (job.peerHalt) { write(() => finish(readJob(job.id), 'stopped', `四腿联动停止（${job.peerHalt}），未发送任何委托`)); return; }
       if (job.holdNewSends) { write(() => finish(readJob(job.id), 'failed', '服务恢复后不再发送新委托')); return; }
       // Four legs: the other venue's job is checked alongside (in parallel, so this one's quote stays fresh for the send).
-      const [own, blocked] = await Promise.all([guardLead(job).then(value => ({ value }), (error: unknown) => ({ error })), peerFirstLeadBlocked(job)]);
+      const [own, peerEvidence] = await Promise.all([guardLead(job).then(value => ({ value }), (error: unknown) => ({ error })), peerFirstLeadEvidence(job)]);
       if ('error' in own) {
         const error = own.error;
         const reason = error instanceof Error ? error.message.slice(0, 200) : '发送前检查失败';
@@ -1778,8 +1797,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       }
       const quote = own.value;
       // The other venue's refusal ends that job in its own turn, which halts this one; until then this one only waits.
-      if (blocked) { const reason = `四腿另一交易所首腿暂不能发送（${blocked}），本所首腿等待`; write(() => { const current = readJob(job.id); if (current.reason !== reason) { current.reason = reason; saveJob(current); } }); return; }
-      try { await sendLead(job, quote, 0, 0); }
+      if (typeof peerEvidence === 'string') { const reason = `四腿另一交易所首腿暂不能发送（${peerEvidence}），本所首腿等待`; write(() => { const current = readJob(job.id); if (current.reason !== reason) { current.reason = reason; saveJob(current); } }); return; }
+      try { await sendLead(job, [...quote, ...peerEvidence], 0, 0); }
       catch (error) {
         if (!(error instanceof ContractError) || error.code !== 'price_moved') throw error;
         write(() => finish(readJob(job.id), 'failed', error.message.slice(0, 200), 'price_moved')); return;
@@ -1880,7 +1899,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         if (job.batchDoneAt == null) write(() => { const current = readJob(job.id); current.batchDoneAt = doneAt; saveJob(current); });
         if (now() < doneAt + (job.batchIntervalMs ?? 0)) return;
       }
-      let quote: Quote;
+      let quote: Quote[];
       try { quote = await guardLead(job); }
       catch (error) {
         if (error instanceof WriterLostError) throw error;
@@ -1912,7 +1931,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (orders.length === 0) {
       if (stop) { write(() => finish(readJob(job.id), 'stopped', '已停止，未发送任何委托')); return; }
       if (job.holdNewSends) { write(() => finish(readJob(job.id), 'failed', '服务恢复后不再发送新委托')); return; }
-      let quote: Quote;
+      let quote: Quote[];
       try { quote = await guardRebalance(job); }
       catch (error) {
         const reason = error instanceof Error ? error.message.slice(0, 200) : '发送前检查失败';
@@ -1928,9 +1947,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
 
   /** The lead's next order: a market or limit lead sends the batch whole, a local chase posts it at its target price. */
-  async function sendLead(job: Job, quote: Quote, batch: number, attempt: number, quantity = (job.batches ?? [job.legs[0].quantity])[0] as string): Promise<void> {
+  async function sendLead(job: Job, books: readonly Quote[], batch: number, attempt: number, quantity = (job.batches ?? [job.legs[0].quantity])[0] as string): Promise<void> {
     const lead = job.legs[0];
-    await send(job, 0, quantity, attempt, { batch, price: lead.orderType === 'local-chase' ? chaseTarget(lead, quote) : null });
+    await send(job, 0, quantity, attempt, { batch, price: lead.orderType === 'local-chase' ? chaseTarget(lead, books[0]) : null, books });
   }
   /** The job's lead order still resting at the venue (a strategy is handled by its own paths). */
   const restingLeadOrder = (jobId: string): Operation | undefined => legOps(jobId, 0).find(item => item.state === 'open' && !isStrategy(item));
@@ -1977,7 +1996,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     let target: string;
     try {
       const quote = await readQuote(leg.venue, leg.symbol);
-      checkQuoteFresh(quote, now(), budgets.sendQuoteMaxAgeMs, budgets.futureToleranceMs);
+      checkBook(quote, now(), budgets.sendQuoteMaxAgeMs);
       target = chaseTarget(leg, quote);
     } catch (error) {
       if (error instanceof WriterLostError) throw error;

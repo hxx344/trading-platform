@@ -251,6 +251,23 @@ test('partial first leg leaves real fill visible and never submits or resumes se
   assert.equal(f.runtime.view().live.executions[0].legs[0].executedQty, '0.5');
 });
 
+test('a market disconnect after Gate accepts the first leg still reconciles its ID and prevents sending the second leg', async t => {
+  const f = fixture(t); await f.connect();
+  let generation = 'first';
+  f.market.revalidateOpen = async plan => { const captured = generation; plan.quotesCurrent = () => generation === captured; };
+  const preview = await f.preview();
+  f.onOrderRead(() => { generation = null; });
+  const execution = await f.confirm(preview);
+  assert.deepEqual(execution.legs.map(order => order.status), ['FILLED', 'UNSENT']);
+  assert.equal(execution.legs[0].orderId, 'order-1');
+  generation = 'second'; f.onOrderRead(null);
+  const { reads } = f.calls;
+  await f.runtime.refresh({ includeView: false });
+  assert.ok(f.calls.reads > reads);
+  assert.equal((await f.confirm(preview)).id, execution.id);
+  assert.equal(f.calls.create.length, 1);
+});
+
 test('ACK without fill does not send second leg', async t => {
   const f = fixture(t); f.mode('NEW'); await f.connect(); const result = await f.confirm(await f.preview());
   assert.equal(f.calls.create.length, 1); assert.equal(result.legs[0].status, 'NEW'); assert.equal(result.legs[0].executedQty, '0');

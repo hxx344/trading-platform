@@ -29,6 +29,7 @@ check '同一源码打出的包校验和相同' 'cmp -s "$tmp/a/SHA256SUMS" "$tm
 tar -tzf "$tmp/a/trading-platform.tar.gz" >"$tmp/a.list"
 check '发布包含构建好的页面' 'grep -q "/web/dist/index.html$" "$tmp/a.list" && grep -q "/web/dist/assets/.*\.js$" "$tmp/a.list"'
 check '发布包含 Var 请求脚本（行情监控 M-3d）' 'grep -q "/scripts/variational-request.py$" "$tmp/a.list"'
+check '发布包含行情服务、探针、单元和独立组件摘要' '[[ $(grep -Exc "trading-platform/(src/market/(main|probe)\.ts|deploy/trading-platform-market\.service|\.market-sha256)" "$tmp/a.list") == 4 ]]'
 check '发布包含原表转换脚本（资产 A-6）' 'grep -q "/scripts/import-workbook.py$" "$tmp/a.list"'
 check '发布文件含副服务器巡检的安装脚本与程序，且与源码、校验清单一致' 'cmp -s "$root/deploy/install-watch.sh" "$tmp/a/install-watch.sh" && cmp -s "$root/deploy/main-watch/main_watch.py" "$tmp/a/main_watch.py" && (cd "$tmp/a" && sha256sum -c --quiet SHA256SUMS) && [[ "$(wc -l <"$tmp/a/SHA256SUMS")" == 4 ]]'
 fi
@@ -39,7 +40,7 @@ mkdir -p "$tmp/src-b/deploy/main-watch" && cp "$root/deploy/main-watch/main_watc
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-b/"
 mkdir -p "$tmp/src-b/web" && cp -R "$root/web/dist" "$tmp/src-b/web/"
 mkdir -p "$tmp/src-b/scripts" && cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$root/scripts/import-workbook.py" "$tmp/src-b/scripts/"
-cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-control.service,trading-platform-import.service,trading-platform-import.path,trading-platform-update.service,trading-platform-update.path,config.example.json,secrets.example.json} "$tmp/src-b/deploy/"
+cp "$root/deploy/"{package.sh,component-digests.mjs,install.sh,install-watch.sh,trading-platform.service,trading-platform-control.service,trading-platform-market.service,trading-platform-import.service,trading-platform-import.path,trading-platform-update.service,trading-platform-update.path,config.example.json,secrets.example.json} "$tmp/src-b/deploy/"
 printf '\n升级测试\n' >>"$tmp/src-b/README.md"
 bash "$tmp/src-b/deploy/package.sh" "$tmp/b" >/dev/null
 fi
@@ -48,7 +49,7 @@ mkdir -p "$tmp/src-c/deploy/main-watch" && cp "$root/deploy/main-watch/main_watc
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-c/"
 mkdir -p "$tmp/src-c/web" && cp -R "$root/web/dist" "$tmp/src-c/web/"
 mkdir -p "$tmp/src-c/scripts" && cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$root/scripts/import-workbook.py" "$tmp/src-c/scripts/"
-cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-control.service,trading-platform-import.service,trading-platform-import.path,trading-platform-update.service,trading-platform-update.path,config.example.json,secrets.example.json} "$tmp/src-c/deploy/"
+cp "$root/deploy/"{package.sh,component-digests.mjs,install.sh,install-watch.sh,trading-platform.service,trading-platform-control.service,trading-platform-market.service,trading-platform-import.service,trading-platform-import.path,trading-platform-update.service,trading-platform-update.path,config.example.json,secrets.example.json} "$tmp/src-c/deploy/"
 sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { throw new Error('测试：配置检查失败');|" "$tmp/src-c/src/service/main.ts"
 bash "$tmp/src-c/deploy/package.sh" "$tmp/c" >/dev/null
 
@@ -64,10 +65,11 @@ check '当前版本指向新包' '[[ -f "$TP_APP_DIR/current/src/service/main.ts
 check '示例配置已放入' '[[ -f "$TP_CONF_DIR/config.example.json" && -f "$TP_CONF_DIR/secrets.example.json" ]]'
 check '数据目录权限 700' '[[ "$(stat -c %a "$TP_DATA_DIR")" == 700 ]]'
 check 'systemd 单元已填入路径' '! grep -q "@" "$TP_UNIT_FILE" && grep -q "ExecStart=$TP_NODE_BIN $TP_APP_DIR/executor/src/service/main.ts --config $TP_CONF_DIR/config.json --data-dir $TP_DATA_DIR --import-dir $TP_IMPORT_DIR --socket /run/trading-platform/execution.sock" "$TP_UNIT_FILE" && grep -q "ReadWritePaths=$TP_DATA_DIR -$TP_IMPORT_DIR" "$TP_UNIT_FILE"'
+check '行情单元只接收专用环境，通过独立通信组向执行账户提供套接字' '! grep -q "@" "$tmp/trading-platform-market.service" && grep -Fqx "Group=trading-platform-market-ipc" "$tmp/trading-platform-market.service" && grep -Fqx "ExecStart=$TP_NODE_BIN $TP_APP_DIR/market/src/market/main.ts --socket /run/trading-platform-market/market.sock" "$tmp/trading-platform-market.service" && grep -Fqx "EnvironmentFile=-$TP_APP_DIR/market.env" "$tmp/trading-platform-market.service" && grep -Fq -- "--market-socket /run/trading-platform-market/market.sock" "$TP_UNIT_FILE" && [[ $(stat -c %a "$TP_APP_DIR/market.env") == 600 ]]'
 first=$(readlink -f "$TP_APP_DIR/current")
 
 if part_is 1; then
-for unsafe_queue in "$TP_APP_DIR/releases" "$TP_APP_DIR/runtime/updates" "$TP_CONF_DIR/queue" "$TP_DATA_DIR/queue" "$TP_IMPORT_DIR/queue" "$tmp"; do
+for unsafe_queue in "$TP_APP_DIR/releases" "$TP_APP_DIR/runtime/updates" "$TP_CONF_DIR/queue" "$TP_DATA_DIR/queue" "$TP_IMPORT_DIR/queue" "/run/trading-platform-market/update" "$tmp"; do
   before_mode=$(stat -c '%u:%g %a' "$unsafe_queue" 2>/dev/null || echo absent)
   TP_UPDATE_DIR="$unsafe_queue" run --package "$tmp/a" && status=0 || status=$?
   check '拒绝更新交接目录与运行目录重叠且保持其权限' '[[ $status -ne 0 && "$(stat -c "%u:%g %a" "$unsafe_queue" 2>/dev/null || echo absent)" == "$before_mode" ]] && grep -q "更新交接目录须与" "$tmp/out"'
@@ -77,6 +79,27 @@ TP_DATA_DIR="$tmp/other-data" TP_UPDATE_DIR="$unsafe_queue" run --package "$tmp/
 check '修改目录参数时保护已安装单元的交易数据目录' '[[ $status -ne 0 && ! -e "$TP_DATA_DIR/legacy-queue" ]] && grep -q "更新交接目录须与" "$tmp/out"'
 run --package "$tmp/a"
 check '重复执行无变化' 'grep -q "无变化" "$tmp/out" && grep -q "程序包（未变化）" "$tmp/out" && grep -q "systemd 单元（未变化）" "$tmp/out"'
+cat >"$TP_CONF_DIR/environment" <<'ENV'
+NO_PROXY=localhost
+COINGECKO_DEMO_API_KEY=first
+PERPETUAL_COIN_IDS='{"BTC":"bitcoin"}'
+PRIVATE_QUOTED='line one
+HTTPS_PROXY=private-marker
+COINGECKO_DEMO_API_KEY=private-marker
+line four'
+PRIVATE_CONTINUED=line-one\
+HTTP_PROXY=private-marker
+ENV
+run --package "$tmp/a"
+check '代理与公开行情变量分别投影，私有多行配置留在执行面' 'grep -Fxq "COINGECKO_DEMO_API_KEY=first" "$TP_APP_DIR/market.env" && [[ $(wc -l <"$TP_APP_DIR/market.env") == 3 && $(cat "$TP_APP_DIR/control-proxy.env") == "NO_PROXY=localhost" ]] && ! grep -q private-marker "$TP_APP_DIR/control-proxy.env" "$TP_APP_DIR/market.env"'
+cp "$TP_APP_DIR/.deployment/executor-key" "$tmp/exec.env.before"
+cp "$TP_APP_DIR/.deployment/control-key" "$tmp/control.env.before"
+cp "$TP_APP_DIR/.deployment/market-key" "$tmp/market.env.before"
+sed -i 's/^COINGECKO_DEMO_API_KEY=first$/COINGECKO_DEMO_API_KEY=second/' "$TP_CONF_DIR/environment"
+run --package "$tmp/a"
+check '只改公开行情键时只有行情组件配置摘要变化' 'cmp -s "$TP_APP_DIR/.deployment/executor-key" "$tmp/exec.env.before" && cmp -s "$TP_APP_DIR/.deployment/control-key" "$tmp/control.env.before" && ! cmp -s "$TP_APP_DIR/.deployment/market-key" "$tmp/market.env.before"'
+rm "$TP_CONF_DIR/environment"
+run --package "$tmp/a"
 fi
 
 if part_is 1; then
@@ -177,7 +200,7 @@ mkdir -p "$tmp/src-d/deploy/main-watch" && cp "$root/deploy/main-watch/main_watc
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$tmp/src-d/"
 mkdir -p "$tmp/src-d/web" && cp -R "$root/web/dist" "$tmp/src-d/web/"
 mkdir -p "$tmp/src-d/scripts" && cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$root/scripts/import-workbook.py" "$tmp/src-d/scripts/"
-cp "$root/deploy/"{package.sh,install.sh,install-watch.sh,trading-platform.service,trading-platform-control.service,trading-platform-import.service,trading-platform-import.path,trading-platform-update.service,trading-platform-update.path,config.example.json,secrets.example.json} "$tmp/src-d/deploy/"
+cp "$root/deploy/"{package.sh,component-digests.mjs,install.sh,install-watch.sh,trading-platform.service,trading-platform-control.service,trading-platform-market.service,trading-platform-import.service,trading-platform-import.path,trading-platform-update.service,trading-platform-update.path,config.example.json,secrets.example.json} "$tmp/src-d/deploy/"
 sed -i "s|if (values\['check-config'\]) {|if (values['check-config']) { (await import('node:fs')).writeFileSync(process.env.TP_TEST_MARK, ''); await new Promise(resolve => setTimeout(resolve, 1500));|" "$tmp/src-d/src/service/main.ts"
 bash "$tmp/src-d/deploy/package.sh" "$tmp/d" >/dev/null
 rm -f "$tmp/mark"

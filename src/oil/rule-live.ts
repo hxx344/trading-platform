@@ -249,6 +249,8 @@ export function liveOf(value: unknown, market: RuleMarket): LiveState {
     retryAt: Number.isFinite(raw.retryAt) ? raw.retryAt as number : null,
     reason: typeof raw.reason === 'string' ? raw.reason.slice(0, 400) : null,
   };
+  // Valid pending/job records in manual review identify the account and order; only opening/closing can run them.
+  if (phase === 'review') return { ...live, enabled: false };
   const busy = live.phase === 'opening' || live.phase === 'closing';
   const problem = phase === null ? '阶段'
     : raw.held != null && !live.held ? '持有记录'
@@ -260,6 +262,6 @@ export function liveOf(value: unknown, market: RuleMarket): LiveState {
     : live.pending && live.job ? '下单记录'
     : (live.pending && (live.pending.action === 'open') !== (live.phase === 'opening')) || (live.job && (live.job.action === 'open') !== (live.phase === 'opening')) ? '下单记录'
     : null;
-  if (problem) return { ...live, phase: 'review', enabled: false, pending: null, job: null, reason: `实盘状态的${problem}无法读取；请在执行进度与交易所核对后重置` };
+  if (problem) return { ...live, phase: 'review', enabled: false, reason: `实盘状态的${problem}无法读取；请在执行进度与交易所核对后重置` };
   return live;
 }

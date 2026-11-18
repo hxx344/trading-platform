@@ -360,6 +360,41 @@ test('等待开仓与残缺的持仓或任务记录并存时，调平等待规�
   } finally { db.close(); }
 }));
 
+for (const kind of ['pending', 'job'] as const) {
+  test(`模式冲突时，${kind} 的账户与原编号在重启、轮询和编辑后仍可核对`, () => withLive(async ({ r, ex, rules: initial, file, reopen }) => {
+    const id = goLive(initial);
+    ex.loseAnswer = kind === 'pending';
+    if (ex.loseAnswer) await assert.rejects(feed(r, initial, OPEN, 2), /应答丢失/);
+    else await feed(r, initial, OPEN, 2);
+    const db = new DatabaseSync(file);
+    try {
+      const read = () => JSON.parse(String(db.prepare('SELECT state FROM rules WHERE id = ?').get(id)!.state));
+      const stored = read();
+      const evidence = stored.live[kind];
+      assert.ok(evidence);
+      stored.mode = kind === 'pending' ? undefined : 'observe';
+      stored.observing = true;
+      db.prepare('UPDATE rules SET state = ? WHERE id = ?').run(JSON.stringify(stored), id);
+      let rules = reopen();
+      ex.confirmedJob = () => assert.fail('待核对规则不应重放待确认请求');
+      ex.jobView = () => assert.fail('待核对规则不应自动跟踪旧任务');
+      await feed(r, rules, OPEN, 2);
+      assert.equal(ex.confirms.length, 1);
+      rules.update(id, { revision: first(rules).revision, config: hynix({ name: '待核对的规则' }) });
+      assert.deepEqual(read().live[kind], evidence);
+      rules = reopen();
+      const view = live(rules);
+      assert.deepEqual([view.phase, view.enabled, view.pending, view.job], ['review', false, null, null]);
+      assert.ok(view.reason?.includes(kind === 'job' ? evidence.id : evidence.requestId));
+      assert.throws(() => rules.checkHynixRebalance('binance', ACCOUNT.accountKey), code('rebalance_rule_conflict'));
+      rules.checkHynixRebalance('binance', 'replacement-account');
+      rules.act(id, 'reset', { revision: first(rules).revision });
+      assert.equal(live(rules).phase, 'idle');
+      rules.checkHynixRebalance('binance', ACCOUNT.accountKey);
+    } finally { db.close(); }
+  }));
+}
+
 test('海力士规则分批开平仓只处理自身成交，开仓交接、停用和重启期间加减调平及旧预览确认均被拒绝', async () => {
   let rules: Rules;
   const h = createHarness({ checkHynixRebalance: (venue, key) => rules.checkHynixRebalance(venue, key) });

@@ -156,7 +156,7 @@ function stateOf(text: string, market: RuleMarket): RuleState {
   const positionOrJob = saved && (saved.held != null || saved.pending != null || saved.job != null || (saved.phase != null && saved.phase !== 'idle'));
   if (!raw || (raw.mode !== undefined && raw.mode !== 'observe' && raw.mode !== 'live') || (raw.mode !== 'live' && positionOrJob)) {
     const live = liveOf(saved, market);
-    return { mode: 'live', observing: false, live: { ...live, enabled: false, phase: 'review', pending: null, job: null, reason: '规则状态无法读取；请在执行进度与交易所核对后重置' }, events: records(raw?.events), observations: [] };
+    return { mode: 'live', observing: false, live: { ...live, enabled: false, phase: 'review', reason: '规则状态无法读取；请在执行进度与交易所核对后重置' }, events: records(raw?.events), observations: [] };
   }
   const mode = raw.mode === 'live' ? 'live' : 'observe';
   // An observe rule keeps the day's opens it made while live, so switching modes does not clear the daily limit.
@@ -317,12 +317,12 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
   const restart = (id: string) => { observed.delete(id); freshAfter.set(id, now()); };
   /** A live rule that judges books: enabled, waiting to open or holding, nothing pending or running. */
   const judging = (rule: Rule) => rule.state.mode === 'live' && rule.state.live.enabled && (rule.state.live.phase === 'idle' || rule.state.live.phase === 'holding') && !rule.state.live.pending && !rule.state.live.job;
-  const busy = (live: LiveState) => live.phase === 'opening' || live.phase === 'closing' || live.pending !== null || live.job !== null;
+  const busy = (live: LiveState) => live.phase === 'opening' || live.phase === 'closing';
 
   for (const rule of rows()) {
     freshAfter.set(rule.id, now());
     if (rule.state.observing || judging(rule)) { observation(rule.state, '服务重启，连续次数已清零，等待新盘口'); save(rule); }
-    else if (rule.state.live.pending) { event(rule.state, '服务重启：有待确认的下单，将用同一请求编号向执行器核对'); save(rule); }
+    else if (busy(rule.state.live) && rule.state.live.pending) { event(rule.state, '服务重启：有待确认的下单，将用同一请求编号向执行器核对'); save(rule); }
   }
 
   /** Clears the counts with a reason; the same reason in a row is recorded once. */
@@ -402,7 +402,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
   /** Stops the rule and keeps what it holds for a person to check on the venue. */
   function toReview(rule: Rule, text: string): void {
     const live = rule.state.live;
-    live.phase = 'review'; live.enabled = false; live.pending = null; live.job = null; live.reason = text;
+    live.phase = 'review'; live.enabled = false; live.reason = text;
     event(rule.state, text);
     save(rule);
   }
@@ -544,6 +544,8 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
 
   async function liveStep(rule: Rule, current: readonly BookRow[]): Promise<void> {
     const live = rule.state.live;
+    // In review, stored order identities are evidence for the operator and account guard. They are never replayed.
+    if (live.phase === 'review') { observed.delete(rule.id); return; }
     if ((live.pending || live.job || judging(rule)) && !executor) { hold(rule, '本服务没有接入执行器，实盘规则不能执行'); return; }
     if (live.pending) { if (live.enabled) submit(rule); else withdraw(rule); return; }
     if (live.job) { follow(rule); return; }
@@ -593,12 +595,15 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     return { value: reading.value, met: reading.met && !stale, side: reading.side, hits: stale ? 0 : reading.hits, signaled: reading.signaled && !stale, at: reading.at, stale };
   }
   function liveView(live: LiveState, time: number) {
+    const reviewing = live.phase === 'review';
+    const references = reviewing ? [live.job && `任务 ${live.job.id}`, live.pending && `确认请求 ${live.pending.requestId}`].filter(Boolean).join('，') : '';
     return {
       enabled: live.enabled, phase: live.phase, phaseName: PHASE_NAMES[live.phase],
       held: live.held?.map(({ symbol, side, quantity, barrels }) => ({ symbol, side, quantity, barrels })) ?? null,
-      pending: live.pending ? { action: live.pending.action, at: live.pending.at } : null,
-      job: live.job ? { id: live.job.id, action: live.job.action, at: live.job.at } : null,
-      opensToday: opensOn(live, beijingDay(time)), failures: live.failures, retryAt: live.retryAt !== null && live.retryAt > time ? live.retryAt : null, reason: live.reason,
+      pending: !reviewing && live.pending ? { action: live.pending.action, at: live.pending.at } : null,
+      job: !reviewing && live.job ? { id: live.job.id, action: live.job.action, at: live.job.at } : null,
+      opensToday: opensOn(live, beijingDay(time)), failures: live.failures, retryAt: live.retryAt !== null && live.retryAt > time ? live.retryAt : null,
+      reason: references ? `${live.reason ?? '规则待核对'}（${references}）` : live.reason,
     };
   }
   function ruleView(rule: Rule, time: number) {

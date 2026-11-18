@@ -36,6 +36,10 @@ export interface OilForm {
   peerLeadOrderType: OilLeadType;
   /** Local chase: the highest buy / lowest sell it chases to; empty takes the preview's price protection bound. */
   chaseLimit: string;
+  /** Two legs: the hedge goes to market, or chases with post-only orders on Binance or OKX (docs/oil.md 13). Four legs: market. */
+  hedgeOrderType: OilHedgeType;
+  /** Chasing hedge: seconds one unhedged gap may chase before the rest goes to market. */
+  hedgeChaseSeconds: string;
   /** Lead split into this many batches (1: one batch), each hedged before the next; market and local chase only. */
   batchCount: string;
   batchIntervalSeconds: string;
@@ -45,7 +49,8 @@ export interface OilForm {
 }
 
 export type OilLeadType = 'market' | 'chase' | 'local-chase';
-export interface OilLegIntent { venue: OilVenue; symbol?: OilSymbol; side: OilSide; orderType: OilLeadType; barrels: string; limitPrice?: string }
+export type OilHedgeType = 'market' | 'local-chase';
+export interface OilLegIntent { venue: OilVenue; symbol?: OilSymbol; side: OilSide; orderType: OilLeadType; barrels: string; limitPrice?: string; chaseTimeoutMs?: number }
 export interface OilIntent {
   market: 'oil'; preset: OilPreset; symbol?: OilSymbol; action: 'open' | 'close'; timeoutMs: number; maxSlippageBps?: number;
   legs: [OilLegIntent, OilLegIntent]; batches?: { count: number; intervalMs: number };
@@ -62,6 +67,25 @@ export const LEAD_TYPES: Record<OilVenue, readonly (readonly [OilLeadType, strin
   okx: [['market', '市价'], ['local-chase', '本地追价']],
 };
 export const leadTypeAllowed = (venue: OilVenue, type: OilLeadType): boolean => LEAD_TYPES[venue].some(([key]) => key === type);
+/** The hedge order types a venue offers: a local chase (going to market once its time is up) on Binance and OKX only. */
+export const HEDGE_TYPES: Record<OilVenue, readonly (readonly [OilHedgeType, string])[]> = {
+  binance: [['market', '市价'], ['local-chase', '本地追价']],
+  bybit: [['market', '市价']],
+  okx: [['market', '市价'], ['local-chase', '本地追价']],
+};
+export const hedgeTypeAllowed = (venue: OilVenue, type: OilHedgeType): boolean => HEDGE_TYPES[venue].some(([key]) => key === type);
+/** The hedge leg's venue of a two-leg form: the one venue of a same-venue pair, the other venue across venues. */
+export const hedgeVenueOf = (form: { preset: FormPreset; venue: OilVenue; hedgeVenue: OilVenue }): OilVenue => form.preset === 'cross-exchange' ? form.hedgeVenue : form.venue;
+/** The hedge leg's order fields; a chasing hedge carries its chase time in milliseconds. */
+export const hedgeOrder = (form: { hedgeOrderType: OilHedgeType; hedgeChaseSeconds: string }): { orderType: OilHedgeType; chaseTimeoutMs?: number } =>
+  form.hedgeOrderType === 'local-chase' ? { orderType: 'local-chase', chaseTimeoutMs: Number(form.hedgeChaseSeconds.trim()) * 1000 } : { orderType: 'market' };
+/** The first thing wrong with a two-leg form's hedge order fields (the executor's parsePairIntent checks the same), or null. */
+export function hedgeOrderError(form: { preset: FormPreset; venue: OilVenue; hedgeVenue: OilVenue; hedgeOrderType: OilHedgeType; hedgeChaseSeconds: string }): string | null {
+  if (form.hedgeOrderType !== 'local-chase') return null;
+  if (!hedgeTypeAllowed(hedgeVenueOf(form), 'local-chase')) return '对冲腿本地追价只用于 Binance 或 OKX';
+  const seconds = form.hedgeChaseSeconds.trim();
+  return /^[1-9]\d{0,2}$/.test(seconds) && Number(seconds) <= 600 ? null : '对冲追价时限须为 1–600 秒的整数';
+}
 
 export const VENUE_LABEL: Record<OilVenue, string> = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX' };
 /** Venue order on the page, as the service lists them (contracts.ts VENUES). */
@@ -77,7 +101,7 @@ const opposite = (side: OilSide): OilSide => (side === 'long' ? 'short' : 'long'
 
 export const DEFAULT_FORM: OilForm = {
   preset: 'same-exchange', venue: 'binance', hedgeVenue: 'bybit', action: 'open', spread: 'long', leadSymbol: 'CLUSDT', symbol: 'BZUSDT', leadSide: 'long',
-  barrels: '', leadOrderType: 'market', fourSpread: '', peerLeadOrderType: 'market', chaseLimit: '', batchCount: '1', batchIntervalSeconds: '0', timeoutSeconds: '60', slippageBps: '',
+  barrels: '', leadOrderType: 'market', fourSpread: '', peerLeadOrderType: 'market', chaseLimit: '', hedgeOrderType: 'market', hedgeChaseSeconds: '10', batchCount: '1', batchIntervalSeconds: '0', timeoutSeconds: '60', slippageBps: '',
 };
 
 const DECIMAL = /^(0|[1-9]\d{0,11})(\.\d{1,8})?$/;
@@ -101,6 +125,8 @@ export function formToIntent(form: OilForm): { intent: OilIntent } | { error: st
   if (form.leadOrderType === 'local-chase' && !leadTypeAllowed(form.venue, 'local-chase')) return { error: '本地追价只用于 Binance 或 OKX 首腿；Bybit 首腿请选追价策略' };
   if (form.preset === 'cross-exchange' && form.hedgeVenue === form.venue) return { error: '跨所组合的对冲腿须在另一个交易所' };
   if (form.preset === 'four-leg') return { error: '四腿组合用 fourLegFormToIntent' };
+  const hedgeError = hedgeOrderError(form);
+  if (hedgeError) return { error: hedgeError };
   const chaseLimit = form.leadOrderType === 'local-chase' ? form.chaseLimit.trim() : '';
   if (chaseLimit !== '' && (!DECIMAL.test(chaseLimit) || Number(chaseLimit) <= 0)) return { error: '追价界限须为正数价格，或留空用价格保护界限' };
   const count = form.batchCount.trim(), interval = form.batchIntervalSeconds.trim() || '0';
@@ -125,9 +151,9 @@ export function fourLegFormToIntent(form: OilForm): { intent: OilFourLegIntent }
   if (form.hedgeVenue === form.venue) return { error: '四腿须选择两个不同的交易所' };
   if (!form.fourSpread) return { error: '请先选择方向' };
   const spread = form.fourSpread;
-  const first = formToIntent({ ...form, preset: 'same-exchange', chaseLimit: '', spread });
+  const first = formToIntent({ ...form, preset: 'same-exchange', chaseLimit: '', hedgeOrderType: 'market', spread });
   if ('error' in first) return first;
-  const second = formToIntent({ ...form, preset: 'same-exchange', chaseLimit: '', venue: form.hedgeVenue, spread: opposite(spread), leadOrderType: form.peerLeadOrderType });
+  const second = formToIntent({ ...form, preset: 'same-exchange', chaseLimit: '', hedgeOrderType: 'market', venue: form.hedgeVenue, spread: opposite(spread), leadOrderType: form.peerLeadOrderType });
   if ('error' in second) return { error: `${VENUE_LABEL[form.hedgeVenue]}：${second.error}` };
   const { preset: _preset, legs, ...common } = first.intent;
   return { intent: { ...common, preset: 'four-leg', legs: [...legs, ...second.intent.legs] } };
@@ -135,7 +161,7 @@ export function fourLegFormToIntent(form: OilForm): { intent: OilFourLegIntent }
 
 /** The four legs a four-leg form describes for a picked spread, in the intent's order; the page shows them while the form is filled. */
 export function draftFourLegs(form: OilForm, spread: OilSide): [OilLegIntent, OilLegIntent, OilLegIntent, OilLegIntent] {
-  const same = { ...form, preset: 'same-exchange' as const, chaseLimit: '', spread };
+  const same = { ...form, preset: 'same-exchange' as const, chaseLimit: '', hedgeOrderType: 'market' as const, spread };
   return [...draftLegs(same), ...draftLegs({ ...same, venue: form.hedgeVenue, spread: opposite(spread), leadOrderType: form.peerLeadOrderType })];
 }
 
@@ -155,12 +181,12 @@ export function draftLegs(form: OilForm): [OilLegIntent, OilLegIntent] {
     const hedge = other(form.leadSymbol, ['CLUSDT', 'BZUSDT'] as const);
     return [
       { venue: form.venue, symbol: form.leadSymbol, side: sideOf(form.leadSymbol), orderType: form.leadOrderType, barrels, ...bound },
-      { venue: form.venue, symbol: hedge, side: sideOf(hedge), orderType: 'market', barrels },
+      { venue: form.venue, symbol: hedge, side: sideOf(hedge), ...hedgeOrder(form), barrels },
     ];
   }
   return [
     { venue: form.venue, side: form.leadSide, orderType: form.leadOrderType, barrels, ...bound },
-    { venue: form.hedgeVenue, side: opposite(form.leadSide), orderType: 'market', barrels },
+    { venue: form.hedgeVenue, side: opposite(form.leadSide), ...hedgeOrder(form), barrels },
   ];
 }
 

@@ -102,3 +102,21 @@ test('原油下单表单：本地追价只给 Binance 首腿，可填追价界�
   assert.match(error({ batchCount: '3', batchIntervalSeconds: '30' }) ?? '', /短于最长执行时间/);
   assert.equal(error({ batchCount: '3', batchIntervalSeconds: '29' }), null);
 });
+
+test('原油下单表单：对冲腿本地追价（Binance、OKX）带追价时限，通过执行器校验；Bybit 对冲腿、时限越界报错；四腿对冲腿仍为市价', async () => {
+  const same = build({ hedgeOrderType: 'local-chase', hedgeChaseSeconds: '15' });
+  assert.deepEqual(same.legs[1], { venue: 'binance', symbol: 'BZUSDT', side: 'long', orderType: 'local-chase', chaseTimeoutMs: 15_000, barrels: '10' });
+  assert.equal(parsePairIntent(same).legs[1].chaseTimeoutMs, 15_000);
+  const cross = build({ preset: 'cross-exchange', venue: 'bybit', hedgeVenue: 'okx', hedgeOrderType: 'local-chase' });
+  assert.deepEqual(cross.legs[1], { venue: 'okx', side: 'short', orderType: 'local-chase', chaseTimeoutMs: 10_000, barrels: '10' });
+  assert.equal(parsePairIntent(cross).legs[1].orderType, 'local-chase');
+  const error = (patch: Partial<OilForm>) => { const result = formToIntent({ ...DEFAULT_FORM, barrels: '10', ...patch }); return 'error' in result ? result.error : null; };
+  assert.match(error({ preset: 'cross-exchange', venue: 'binance', hedgeVenue: 'bybit', hedgeOrderType: 'local-chase' }) ?? '', /只用于 Binance 或 OKX/);
+  assert.match(error({ hedgeOrderType: 'local-chase', hedgeChaseSeconds: '0' }) ?? '', /1–600 秒/);
+  assert.match(error({ hedgeOrderType: 'local-chase', hedgeChaseSeconds: '601' }) ?? '', /1–600 秒/);
+  assert.equal(error({ hedgeOrderType: 'market', hedgeChaseSeconds: '' }), null, '市价对冲不看时限字段');
+  const { fourLegFormToIntent } = await import('../web/src/oil-form.ts');
+  const four = fourLegFormToIntent({ ...DEFAULT_FORM, barrels: '10', preset: 'four-leg', venue: 'binance', hedgeVenue: 'okx', fourSpread: 'long', hedgeOrderType: 'local-chase' });
+  assert.ok('intent' in four);
+  assert.deepEqual(four.intent.legs.map(leg => leg.orderType), ['market', 'market', 'market', 'market']);
+});

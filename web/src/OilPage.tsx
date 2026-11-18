@@ -2,7 +2,7 @@ import { ArrowRightLeft, ChevronDown, Clock3, LoaderCircle, RefreshCw, Square } 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from './api.ts';
 import { clock, label, stamp } from './labels.ts';
-import { ACTIVE_STATUSES, CONFIRM_ACKNOWLEDGE, CONFIRM_NOT_CREATED, CONFIRM_RELEASE, DEFAULT_FORM, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, describeFourLeg, describeIntent, draftFourLegs, fourLegFormToIntent, hedgeVenueFor, leadTypeAllowed, draftLegs, formToIntent, jobActions, type OilForm, type OilFourLegIntent, type OilIntent, type OilLeadType, type OilSymbol, type OilVenue } from './oil-form.ts';
+import { ACTIVE_STATUSES, CONFIRM_ACKNOWLEDGE, CONFIRM_NOT_CREATED, CONFIRM_RELEASE, DEFAULT_FORM, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, describeFourLeg, describeIntent, draftFourLegs, fourLegFormToIntent, HEDGE_TYPES, hedgeTypeAllowed, hedgeVenueFor, hedgeVenueOf, leadTypeAllowed, draftLegs, formToIntent, jobActions, type OilForm, type OilFourLegIntent, type OilIntent, type OilLeadType, type OilSymbol, type OilVenue } from './oil-form.ts';
 import { bookTitle, crossPairs, type OilBook, type OilConfirmResult, type OilJob, type OilMarket, type OilPositionAccount, type OilPreview, type OilPreviewLeg, type OilState } from './oil-types.ts';
 import { groupJobs, groupStatus, isFourLegPreview, type FourLegConfirmResult, type FourLegPreview, type GroupState } from './four-leg.ts';
 import { RequestIds } from './request-ids.ts';
@@ -24,7 +24,7 @@ export const JOB_STATUS: Record<string, string> = { accepted: '已受理', runni
 /** The workbench badge colours: running blue, completed green, waiting for a person amber. */
 const JOB_BADGE: Record<string, string> = { accepted: 'running', running: 'running', completed: 'completed', failed: 'attention', attention: 'attention' };
 const TRACKING_STATUS: Record<string, string> = {
-  accepted: '已受理，正在发送首腿。', running: '执行中：首腿成交后对冲腿按市价跟上。', completed: '已完成，两腿成交见下表。',
+  accepted: '已受理，正在发送首腿。', running: '执行中：首腿成交后对冲腿跟上。', completed: '已完成，两腿成交见下表。',
   failed: '执行失败，原因见下方；已成交部分保留。', stopped: '已停止，已成交部分保留。', attention: '需要人工处理，请按下方说明核对交易所。',
 };
 /** A hynix rebalance sends one order and nothing follows it. */
@@ -181,12 +181,12 @@ function PreviewCard({ preview, busy, unknown, onConfirm, onEdit }: { preview: O
       <tbody>{preview.legs.map(leg => <tr key={leg.index}>
         <th scope="row"><strong>{venueName(leg.venue)} {short(leg.symbol)}</strong><span className={`execution-side ${leg.side}`}>{operation(preview.intent.action, leg.side)}{leg.reduceOnly ? ' · 只减仓' : ''}</span></th>
         <td data-label="数量"><strong>{leg.quantity}</strong><small>每张 {leg.instrument.contractSize} 桶</small></td>
-        <td data-label="下单方式">{leg.index === 0 ? '首腿' : '对冲腿'} · {label(ORDER_TYPE, leg.orderType)}</td>
+        <td data-label="下单方式">{leg.index === 0 ? '首腿' : '对冲腿'} · {label(ORDER_TYPE, leg.orderType)}{leg.chaseTimeoutMs ? <small>超过 {leg.chaseTimeoutMs / 1000} 秒剩余转市价</small> : null}</td>
         <td data-label="价格保护界限">{leg.orderType === 'local-chase' && leg.limitPrice ? <>{leg.limitPrice}<small>自填追价界限</small></> : leg.priceBound ?? '—'}{leg.chaseCeiling ? <small>挂单上限 {leg.chaseCeiling}</small> : null}</td>
         <td data-label="买一 / 卖一">{leg.quote.bid} / {leg.quote.ask}<small>{clock(leg.quote.receivedAt)}</small></td>
       </tr>)}</tbody>
     </table></div>
-    <p className="execution-help">首腿按所选方式下单：市价时以价格保护界限为 IOC 限价，超出界限的部分不成交；追价时界限是最高追价（卖出时为最低），本地追价自填界限时以自填为准。对冲腿在首腿成交后按市价跟上，不受界限约束，它的界限只在首腿发出前核对一次。同一账户请勿同时在工作台下原油单或开启原油自动规则。</p>
+    <p className="execution-help">首腿按所选方式下单：市价时以价格保护界限为 IOC 限价，超出界限的部分不成交；追价时界限是最高追价（卖出时为最低），本地追价自填界限时以自填为准。对冲腿在首腿成交后跟上：市价时不受界限约束，它的界限只在首腿发出前核对一次；本地追价时只挂单且不越过界限，超过对冲追价时限后剩余按市价补齐。同一账户请勿同时在工作台下原油单或开启原油自动规则。</p>
     {preview.notes.length ? <ul className="execution-review-notes">{preview.notes.map((note, index) => <li key={index}>{note}</li>)}</ul> : null}
     {/* An unanswered confirm is checked by clicking confirm again with the same request id: the executor answers it by that id whether or not the preview has expired since. */}
     {unknown ? <p className="execution-warning">上次确认没有收到应答，可能已受理：请先再点“确认并实盘{action}”核对（沿用同一请求编号，不会重复下单）。</p>
@@ -229,7 +229,7 @@ export function FourLegPreviewCard({ preview, title, size, legName, quantityNote
       <tbody>{legs.map(leg => <tr key={`${leg.venue}:${leg.index}`}>
         <th scope="row"><strong>{venueName(leg.venue)} {legName(leg.symbol)}</strong><span className={`execution-side ${leg.side}`}>{operation(preview.intent.action, leg.side)}{leg.reduceOnly ? ' · 只减仓' : ''}</span></th>
         <td data-label="数量"><strong>{leg.quantity}</strong><small>{quantityNote(leg)}</small></td>
-        <td data-label="下单方式">{leg.index === 0 ? '首腿' : '对冲腿'} · {label(ORDER_TYPE, leg.orderType)}</td>
+        <td data-label="下单方式">{leg.index === 0 ? '首腿' : '对冲腿'} · {label(ORDER_TYPE, leg.orderType)}{leg.chaseTimeoutMs ? <small>超过 {leg.chaseTimeoutMs / 1000} 秒剩余转市价</small> : null}</td>
         <td data-label="价格保护界限">{leg.priceBound ?? '—'}{leg.chaseCeiling ? <small>挂单上限 {leg.chaseCeiling}</small> : null}</td>
         <td data-label="买一 / 卖一">{leg.quote.bid} / {leg.quote.ask}<small>{clock(leg.quote.receivedAt)}</small></td>
       </tr>)}</tbody>
@@ -283,6 +283,11 @@ function FourLegGroup({ jobs, card }: { jobs: OilJob[]; card: (job: OilJob) => R
   </section>;
 }
 
+/** The hedge leg's note in a two-leg form: market, or a post-only chase that goes to market once its time is up (docs/oil.md 13). */
+export const hedgeNote = (type: 'market' | 'local-chase', seconds: string, buy: boolean, unit: string): string => type === 'local-chase'
+  ? `首腿成交后只挂单挂在${buy ? '买一' : '卖一'}跟上相同${unit}，盘口变化后撤单重挂，${buy ? '最高' : '最低'}追到价格保护界限；同一缺口超过 ${seconds.trim() || '?'} 秒未补齐时撤单，剩余按市价补齐。`
+  : `首腿成交后按市价跟上相同${unit}；首腿挂单期间的成交也会随时跟上。`;
+
 /** A native chase on either lead: the form then sends no batches (four legs: either venue's lead). */
 export const chased = (form: { preset: string; leadOrderType: OilLeadType; peerLeadOrderType: OilLeadType }): boolean => form.leadOrderType === 'chase' || (form.preset === 'four-leg' && form.peerLeadOrderType === 'chase');
 
@@ -323,6 +328,8 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
       // Four legs: the pair is listed in venue order (venuePairs), and the second venue's lead chases its own way too.
       if (key === 'preset' && value === 'four-leg' && OIL_VENUES.indexOf(next.venue) > OIL_VENUES.indexOf(next.hedgeVenue)) [next.venue, next.hedgeVenue] = [next.hedgeVenue, next.venue];
       if (!leadTypeAllowed(next.hedgeVenue, next.peerLeadOrderType)) next.peerLeadOrderType = 'market';
+      // The hedge chases on Binance and OKX only (docs/oil.md 13): a hedge moved to Bybit goes back to market.
+      if (!hedgeTypeAllowed(hedgeVenueOf(next), next.hedgeOrderType)) next.hedgeOrderType = 'market';
       // The four-leg direction names the first venue's spread, so it is picked afresh whenever the preset changes.
       if (key === 'preset') next.fourSpread = '';
       // A native chase is never batched; its batch fields are hidden, so they must not keep a stale count.
@@ -455,8 +462,10 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
           return <section key={index} className="execution-leg-input" aria-label={`${index === 0 ? '首腿' : '对冲腿'} ${VENUE_LABEL[leg.venue]} ${short(symbol)} 交易参数`}>
             <header><strong>{VENUE_LABEL[leg.venue]} {short(symbol)}</strong><span className={`execution-side ${leg.side}`}>{operation(form.action, leg.side)}</span><small className="oil-leg-role">{index === 0 ? '首腿' : '对冲腿'}</small></header>
             {index === 0 ? <Choice label="下单方式" id="oilLeadType" value={form.leadOrderType} options={LEAD_TYPES[form.venue]} onChange={next => set('leadOrderType', next)} /> : null}
+            {index === 1 ? <Choice label="下单方式" id="oilHedgeType" value={form.hedgeOrderType} options={HEDGE_TYPES[leg.venue]} onChange={next => set('hedgeOrderType', next)} /> : null}
+            {index === 1 && form.hedgeOrderType === 'local-chase' ? <label className="execution-amount">对冲追价时限 · 秒<input id="oilHedgeChaseSeconds" type="text" inputMode="numeric" autoComplete="off" maxLength={3} value={form.hedgeChaseSeconds} onChange={event => set('hedgeChaseSeconds', event.target.value)} /></label> : null}
             {index === 0 && form.leadOrderType === 'local-chase' ? <label className="execution-amount">追价界限 · USDT（选填）<input id="oilChaseLimit" type="text" inputMode="decimal" autoComplete="off" maxLength={24} value={form.chaseLimit} placeholder="留空用价格保护界限" onChange={event => set('chaseLimit', event.target.value)} /></label> : null}
-            <p className="execution-help execution-market-note">{index === 1 ? '首腿成交后按市价跟上相同桶数；首腿挂单期间的成交也会随时跟上。'
+            <p className="execution-help execution-market-note">{index === 1 ? hedgeNote(form.hedgeOrderType, form.hedgeChaseSeconds, buys(form.action, leg.side), '桶数')
               : form.leadOrderType === 'chase' ? 'Bybit 原生追价策略，按本方一档追价，直到成交或达到最长执行时间。'
               : form.leadOrderType === 'local-chase' ? `只挂单挂在${buys(form.action, leg.side) ? '买一' : '卖一'}，盘口变化后撤单重挂，${buys(form.action, leg.side) ? '最高' : '最低'}追到界限；不吃单，到最长执行时间未成交的部分撤销。`
               : '市价：按对手盘吃单成交，受价格保护界限约束。'}</p>
@@ -472,7 +481,7 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
               <label>批次间隔 · 秒<input id="oilBatchInterval" type="text" inputMode="numeric" autoComplete="off" maxLength={3} value={form.batchIntervalSeconds} disabled={Number(form.batchCount) <= 1} onChange={event => set('batchIntervalSeconds', event.target.value)} /></label>
             </> : null}
           </div>
-          <p className="execution-help">到最长执行时间仍未完成时，停止发送并撤销余单，已成交部分保留。分批时每批首腿成交并对冲后，等满间隔再发下一批；批次间隔合计须短于最长执行时间。价格保护按预览盘口计算界限：首腿超出界限的部分不成交；对冲腿按市价成交，界限只在首腿发出前核对。</p>
+          <p className="execution-help">到最长执行时间仍未完成时，停止发送并撤销余单，已成交部分保留。分批时每批首腿成交并对冲后，等满间隔再发下一批；批次间隔合计须短于最长执行时间。价格保护按预览盘口计算界限：首腿超出界限的部分不成交；对冲腿市价成交时界限只在首腿发出前核对，本地追价时挂单不越过界限。</p>
         </details>
         <div className="execution-builder-footer">
           {preview ? <p>正在确认上方预览；返回修改参数后可重新填写。</p> : messageView ?? <p>预览会重新读取盘口、交易规则与持仓，不会下单。</p>}
@@ -627,7 +636,7 @@ export function OilPage({ onExpired }: { onExpired: () => void }) {
       ? <StatePanel kind="error" title="读取原油状态失败" detail={state.error?.message ?? '网络离线'} />
       : <StatePanel kind="loading" title="加载中…" />)
       : <section className="trading-panel execution-panel" aria-labelledby="oil-execution-title">
-        <header className="trading-panel-heading"><div><h2 id="oil-execution-title">原油组合交易</h2><p>同所 BZ − CL 价差 · 跨所同一合约 · 首腿市价或 Bybit 追价策略，成交后对冲腿市价跟上</p></div>
+        <header className="trading-panel-heading"><div><h2 id="oil-execution-title">原油组合交易</h2><p>同所 BZ − CL 价差 · 跨所同一合约 · 首腿市价或追价，成交后对冲腿市价或本地追价跟上</p></div>
           <button className="button secondary" type="button" onClick={() => void state.refresh()}><RefreshCw size={15} aria-hidden="true" />刷新执行状态</button></header>
         <SyncLine stale={stale} text={text} every={`每 ${refreshMs / 1000} 秒`} at={state.receivedAt} />
         <JobsSection jobs={state.data.jobs} stale={stale} tracked={tracked} onUntrack={() => setTracked(null)} onChanged={() => { void state.refresh(); }} />

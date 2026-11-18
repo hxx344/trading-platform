@@ -1,11 +1,11 @@
 // The SK hynix order form turned into the executor's intent (POST /api/preview, market 'hynix', docs/hynix.md). Kept free
 // of the DOM so the server-side tests import it.
-import { LEAD_TYPES, OIL_VENUES, VENUE_LABEL, hedgeVenueFor, leadTypeAllowed, type FormPreset, type OilLeadType, type OilPreset, type OilSide, type OilVenue } from './oil-form.ts';
+import { HEDGE_TYPES, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, hedgeOrder, hedgeOrderError, hedgeTypeAllowed, hedgeVenueFor, hedgeVenueOf, leadTypeAllowed, type FormPreset, type OilHedgeType, type OilLeadType, type OilPreset, type OilSide, type OilVenue } from './oil-form.ts';
 
 export type HynixSymbol = 'SKHYUSDT' | 'SKHYNIXUSDT';
 export const HYNIX_SYMBOLS: readonly HynixSymbol[] = ['SKHYUSDT', 'SKHYNIXUSDT'];
 export const HYNIX_LABEL: Record<HynixSymbol, string> = { SKHYUSDT: 'ADR', SKHYNIXUSDT: '正股' };
-export { LEAD_TYPES, OIL_VENUES, VENUE_LABEL, hedgeVenueFor, leadTypeAllowed };
+export { HEDGE_TYPES, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, hedgeTypeAllowed, hedgeVenueFor, hedgeVenueOf, leadTypeAllowed };
 
 export interface HynixForm {
   preset: FormPreset;
@@ -34,6 +34,9 @@ export interface HynixForm {
   /** Four legs: the second venue's lead order type (leadOrderType is the first venue's). */
   peerLeadOrderType: OilLeadType;
   chaseLimit: string;
+  /** Two legs: market, or a local chase on Binance or OKX that goes to market after hedgeChaseSeconds (docs/oil.md 13). */
+  hedgeOrderType: OilHedgeType;
+  hedgeChaseSeconds: string;
   timeoutSeconds: string;
   slippageBps: string;
   /** Lead market or local chase only: the lead split on its step, each batch's hedge in the planned proportion (docs/hynix.md 8.2). */
@@ -41,7 +44,7 @@ export interface HynixForm {
   batchIntervalSeconds: string;
 }
 
-export interface HynixLegIntent { venue: OilVenue; symbol?: HynixSymbol; side: OilSide; orderType: OilLeadType; notional?: string; quantity?: string; limitPrice?: string }
+export interface HynixLegIntent { venue: OilVenue; symbol?: HynixSymbol; side: OilSide; orderType: OilLeadType; notional?: string; quantity?: string; limitPrice?: string; chaseTimeoutMs?: number }
 export interface HynixIntent {
   market: 'hynix'; preset: OilPreset; symbol?: HynixSymbol; action: 'open' | 'close'; timeoutMs: number; maxSlippageBps?: number; batches?: { count: number; intervalMs: number };
   legs: [HynixLegIntent, HynixLegIntent];
@@ -54,7 +57,7 @@ export interface HynixFourLegIntent {
 
 export const DEFAULT_HYNIX_FORM: HynixForm = {
   preset: 'same-exchange', venue: 'binance', hedgeVenue: 'bybit', action: 'open', premium: 'short', leadSymbol: 'SKHYUSDT', symbol: 'SKHYUSDT', leadSide: 'long',
-  sizing: 'notional', notional: '', leadQuantity: '', hedgeQuantity: '', leadOrderType: 'market', fourPremium: '', peerLeadOrderType: 'market', chaseLimit: '', timeoutSeconds: '60', slippageBps: '',
+  sizing: 'notional', notional: '', leadQuantity: '', hedgeQuantity: '', leadOrderType: 'market', fourPremium: '', peerLeadOrderType: 'market', chaseLimit: '', hedgeOrderType: 'market', hedgeChaseSeconds: '10', timeoutSeconds: '60', slippageBps: '',
   batchCount: '1', batchIntervalSeconds: '0',
 };
 
@@ -75,12 +78,12 @@ export function draftHynixLegs(form: HynixForm): [HynixLegIntent, HynixLegIntent
     const hedge = other(form.leadSymbol, ['SKHYUSDT', 'SKHYNIXUSDT'] as const);
     return [
       { venue: form.venue, symbol: form.leadSymbol, side: sideOf(form.leadSymbol), orderType: form.leadOrderType, ...size(form.leadQuantity), ...bound },
-      { venue: form.venue, symbol: hedge, side: sideOf(hedge), orderType: 'market', ...size(form.hedgeQuantity) },
+      { venue: form.venue, symbol: hedge, side: sideOf(hedge), ...hedgeOrder(form), ...size(form.hedgeQuantity) },
     ];
   }
   return [
     { venue: form.venue, side: form.leadSide, orderType: form.leadOrderType, ...size(form.leadQuantity), ...bound },
-    { venue: form.hedgeVenue, side: opposite(form.leadSide), orderType: 'market', ...size(form.hedgeQuantity) },
+    { venue: form.hedgeVenue, side: opposite(form.leadSide), ...hedgeOrder(form), ...size(form.hedgeQuantity) },
   ];
 }
 
@@ -97,6 +100,8 @@ export function hynixFormToIntent(form: HynixForm): { intent: HynixIntent } | { 
   if (!leadTypeAllowed(form.venue, form.leadOrderType)) return { error: form.leadOrderType === 'chase' ? `追价策略只有 Bybit 支持；${VENUE_LABEL[form.venue]} 首腿请选市价或本地追价` : '本地追价只用于 Binance 或 OKX 首腿；Bybit 首腿请选追价策略' };
   if (form.preset === 'cross-exchange' && form.hedgeVenue === form.venue) return { error: '跨所组合的对冲腿须在另一个交易所' };
   if (form.preset === 'four-leg') return { error: '四腿组合用 hynixFourLegFormToIntent' };
+  const hedgeError = hedgeOrderError(form);
+  if (hedgeError) return { error: hedgeError };
   const chaseLimit = form.leadOrderType === 'local-chase' ? form.chaseLimit.trim() : '';
   if (chaseLimit !== '' && !positive(chaseLimit)) return { error: '追价界限须为正数价格，或留空用价格保护界限' };
   // The same checks as the oil form (oil-form.ts) and the executor's parseIntent.
@@ -123,9 +128,9 @@ export function hynixFourLegFormToIntent(form: HynixForm): { intent: HynixFourLe
   if (form.sizing !== 'notional') return { error: '四腿须按每腿相同的名义金额下单' };
   if (!form.fourPremium) return { error: '请先选择方向' };
   const premium = form.fourPremium;
-  const first = hynixFormToIntent({ ...form, preset: 'same-exchange', chaseLimit: '', premium });
+  const first = hynixFormToIntent({ ...form, preset: 'same-exchange', chaseLimit: '', hedgeOrderType: 'market', premium });
   if ('error' in first) return first;
-  const second = hynixFormToIntent({ ...form, preset: 'same-exchange', chaseLimit: '', venue: form.hedgeVenue, premium: opposite(premium), leadOrderType: form.peerLeadOrderType });
+  const second = hynixFormToIntent({ ...form, preset: 'same-exchange', chaseLimit: '', hedgeOrderType: 'market', venue: form.hedgeVenue, premium: opposite(premium), leadOrderType: form.peerLeadOrderType });
   if ('error' in second) return { error: `${VENUE_LABEL[form.hedgeVenue]}：${second.error}` };
   const { preset: _preset, symbol: _symbol, legs, ...common } = first.intent;
   return { intent: { ...common, preset: 'four-leg', legs: [...legs, ...second.intent.legs] } };
@@ -133,7 +138,7 @@ export function hynixFourLegFormToIntent(form: HynixForm): { intent: HynixFourLe
 
 /** The four legs a four-leg form describes for a picked premium, in the intent's order. */
 export function draftHynixFourLegs(form: HynixForm, premium: OilSide): [HynixLegIntent, HynixLegIntent, HynixLegIntent, HynixLegIntent] {
-  const same = { ...form, preset: 'same-exchange' as const, chaseLimit: '', sizing: 'notional' as const, premium };
+  const same = { ...form, preset: 'same-exchange' as const, chaseLimit: '', hedgeOrderType: 'market' as const, sizing: 'notional' as const, premium };
   return [...draftHynixLegs(same), ...draftHynixLegs({ ...same, venue: form.hedgeVenue, premium: opposite(premium), leadOrderType: form.peerLeadOrderType })];
 }
 

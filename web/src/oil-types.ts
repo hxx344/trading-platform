@@ -59,7 +59,7 @@ export interface OilState {
 }
 export interface OilPreviewLeg {
   index: number; venue: string; symbol: string; side: string; orderSide: string; quantity: string; orderType: string; reduceOnly: boolean;
-  accountId: string; accountMode: string; priceBound?: string | null; limitPrice?: string | null; chaseCeiling?: string; instrument: { contractSize: string; quantityStep: string };
+  accountId: string; accountMode: string; priceBound?: string | null; limitPrice?: string | null; chaseCeiling?: string; chaseTimeoutMs?: number; instrument: { contractSize: string; quantityStep: string };
   quote: { bid: string; ask: string; receivedAt: number };
 }
 /** batches: the lead quantity of each batch, when the intent asked for more than one. */

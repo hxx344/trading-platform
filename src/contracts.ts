@@ -198,7 +198,8 @@ export type OrderSide = 'buy' | 'sell';
 export type OrderType = 'market' | 'limit';
 /**
  * chase: a venue-native chase strategy, lead leg on Bybit only; it is a strategy, not an order.
- * local-chase: post-only limit orders the executor itself moves to the same-side best price, lead leg on Binance only.
+ * local-chase: post-only limit orders the executor itself moves to the same-side best price, on Binance or OKX; the lead,
+ * and the hedge of a two-leg intent (docs/oil.md 13), which goes to market once its chaseTimeoutMs has passed.
  */
 export type LegOrderType = OrderType | 'chase' | 'local-chase';
 export type Action = 'open' | 'close';
@@ -213,7 +214,8 @@ export const orderSideOf = (action: Action, side: PositionSide): OrderSide => (a
  * priceBound: a market leg's own price bound, only ever tighter than the preview's basis-point band (the spread rules pass
  * the bounds that keep the spread on their threshold, docs/hynix.md 8.2); absent on every manual order.
  */
-export interface LegIntent { venue: Venue; symbol: string; side: PositionSide; quantity: string | null; barrels: string | null; notional?: string | null; orderType: LegOrderType; limitPrice: string | null; priceBound?: string }
+/** chaseTimeoutMs: a chasing hedge only; how long one unhedged gap may chase before the rest goes to market (docs/oil.md 13). */
+export interface LegIntent { venue: Venue; symbol: string; side: PositionSide; quantity: string | null; barrels: string | null; notional?: string | null; orderType: LegOrderType; limitPrice: string | null; priceBound?: string; chaseTimeoutMs?: number }
 /**
  * cross-exchange: one contract (the top-level symbol), two venues, opposite sides. same-exchange: one venue, one BZUSDT and
  * one CLUSDT leg, opposite sides; each leg names its contract and there is no top-level symbol (null here).
@@ -238,6 +240,10 @@ export type Intent = PairIntent | RebalanceIntent;
 export const MAX_SLIPPAGE_BPS = 1_000;
 export const MAX_BATCHES = 20;
 export const MAX_BATCH_INTERVAL_MS = 600_000;
+/** A chasing hedge's default and allowed time to chase one unhedged gap before the rest goes to market. */
+export const HEDGE_CHASE_TIMEOUT_MS = 10_000;
+export const MIN_HEDGE_CHASE_TIMEOUT_MS = 1_000;
+export const MAX_HEDGE_CHASE_TIMEOUT_MS = 600_000;
 /** A hynix rebalance (preset 'rebalance') or a two-leg intent. */
 export function parseIntent(value: unknown): Intent {
   return isObject(value) && value.preset === 'rebalance' ? parseRebalanceIntent(value) : parsePairIntent(value);
@@ -259,7 +265,7 @@ export function parsePairIntent(value: unknown): PairIntent {
   if (!Array.isArray(raw.legs) || raw.legs.length !== 2) reject('leg_count', same ? '同所双腿需要正好两条腿' : '跨所双腿需要正好两条腿');
   const legs = (raw.legs as unknown[]).map(item => {
     // Oil sizes by barrels, hynix by USDT notional; each market refuses the other's field as unknown.
-    const leg = exactKeys(item, same ? ['venue', 'symbol', 'side', 'orderType'] : ['venue', 'side', 'orderType'], ['quantity', hynix ? 'notional' : 'barrels', 'limitPrice', 'priceBound']);
+    const leg = exactKeys(item, same ? ['venue', 'symbol', 'side', 'orderType'] : ['venue', 'side', 'orderType'], ['quantity', hynix ? 'notional' : 'barrels', 'limitPrice', 'priceBound', 'chaseTimeoutMs']);
     const venue = oneOf(leg.venue, VENUES, '交易所');
     const legSymbol = symbol ?? oneOf(leg.symbol, symbols, symbolName);
     if (!VENUE_EXECUTION_SYMBOLS[venue].includes(legSymbol)) reject('venue_symbol', `${VENUE_NAMES[venue]} 不支持 ${legSymbol} 执行`);
@@ -272,11 +278,12 @@ export function parsePairIntent(value: unknown): PairIntent {
     if (orderType !== 'local-chase' && (orderType === 'limit') !== (limitPrice !== null)) reject('limit_price', orderType === 'limit' ? '限价单需要限价' : orderType === 'chase' ? '追价策略不设限价（最高追价取预览的价格保护界限）' : '市价单不设限价');
     const priceBound = leg.priceBound === undefined ? undefined : decimalField(leg.priceBound, '价格界限');
     if (priceBound !== undefined && orderType !== 'market') reject('limit_price', '只有市价腿可以自带价格界限');
+    const chaseTimeoutMs = leg.chaseTimeoutMs === undefined || leg.chaseTimeoutMs === null ? undefined : integer(leg.chaseTimeoutMs, MIN_HEDGE_CHASE_TIMEOUT_MS, MAX_HEDGE_CHASE_TIMEOUT_MS, '对冲追价时限毫秒数');
     return {
       venue, symbol: legSymbol, side: oneOf(leg.side, ['long', 'short'] as const, '仓位方向'),
       quantity: leg.quantity == null ? null : decimalField(leg.quantity, '每腿数量'), barrels: leg.barrels == null ? null : decimalField(leg.barrels, '每腿桶数'),
       ...(hynix ? { notional: leg.notional == null ? null : decimalField(leg.notional, '每腿名义金额') } : {}),
-      orderType, limitPrice, ...(priceBound !== undefined ? { priceBound } : {}),
+      orderType, limitPrice, ...(priceBound !== undefined ? { priceBound } : {}), ...(chaseTimeoutMs !== undefined ? { chaseTimeoutMs } : {}),
     };
   }) as [LegIntent, LegIntent];
   if (same) {
@@ -293,8 +300,15 @@ export function parsePairIntent(value: unknown): PairIntent {
     // Quantities may differ only to close what is held; an open sized per leg could put almost all of it on one side.
     if (action === 'open' && a === null) reject('open_requires_notional', '海力士开仓须按每腿相同的名义金额下单；按各腿数量只用于平仓');
   }
-  // The hedge must go out at once for whatever the lead filled; a strategy that may rest or pause cannot do that.
-  if (legs[1].orderType === 'chase' || legs[1].orderType === 'local-chase') reject('chase_unsupported', '追价只能用于首腿，对冲腿按市价发送');
+  // The hedge must go out for whatever the lead filled; a strategy that may rest or pause cannot do that. A local chase can,
+  // since it goes to market once its time is up (docs/oil.md 13); it chases to the preview bound only.
+  if (legs[1].orderType === 'chase') reject('chase_unsupported', '原生追价只能用于首腿；对冲腿可用市价或本地追价（Binance、OKX）');
+  if (legs[1].orderType === 'local-chase') {
+    if (!LOCAL_CHASE_VENUES.includes(legs[1].venue)) reject('chase_unsupported', '对冲腿本地追价只用于 Binance 或 OKX');
+    if (legs[1].limitPrice !== null) reject('limit_price', '对冲腿追价不设界限：追到价格保护界限，超过追价时限后剩余按市价补齐');
+    legs[1].chaseTimeoutMs ??= HEDGE_CHASE_TIMEOUT_MS;
+  } else if (legs[1].chaseTimeoutMs !== undefined) reject('invalid_value', '只有本地追价的对冲腿可以设追价时限');
+  if (legs[0].chaseTimeoutMs !== undefined) reject('invalid_value', '追价时限只用于对冲腿');
   if (legs[0].orderType === 'chase' && legs[0].venue !== 'bybit') reject('chase_unsupported', '只有 Bybit 支持原生追价策略');
   if (legs[0].orderType === 'local-chase' && !LOCAL_CHASE_VENUES.includes(legs[0].venue)) reject('chase_unsupported', '本地追价只用于 Binance 或 OKX 首腿；Bybit 请用原生追价');
   const maxSlippageBps = raw.maxSlippageBps === undefined || raw.maxSlippageBps === null ? null : integer(raw.maxSlippageBps, 1, MAX_SLIPPAGE_BPS, '价格保护基点');
@@ -328,6 +342,7 @@ export function parseFourLegIntent(value: unknown): FourLegIntent {
   const legs = raw.legs as unknown[];
   const parts = [parsePairIntent({ ...common, legs: legs.slice(0, 2) }), parsePairIntent({ ...common, legs: legs.slice(2, 4) })] as [PairIntent, PairIntent];
   const [a, b] = parts, hynix = a.market === 'hynix';
+  if (parts.some(part => part.legs[1].orderType === 'local-chase')) reject('chase_unsupported', '四腿的对冲腿不支持本地追价');
   if (a.legs[0].venue === b.legs[0].venue) reject('same_venue', '四腿须选择两个不同交易所');
   for (const leg of a.legs) if (b.legs.find(other => other.symbol === leg.symbol)?.side === leg.side) reject('same_side', `四腿中 ${leg.symbol} 在两个交易所的方向必须相反`);
   const all = [...a.legs, ...b.legs] as FourLegIntent['legs'];

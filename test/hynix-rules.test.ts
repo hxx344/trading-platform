@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ContractError, exactKeys } from '../src/contracts.ts';
 import { cmp } from '../src/decimal.ts';
-import { checkStoredHynixRebalance, createOilRules, evaluateRule, parseRuleConfig, storedConfig, type BookRow } from '../src/oil/rules.ts';
+import { createOilRules, evaluateRule, parseRuleConfig, storedConfig, type BookRow } from '../src/oil/rules.ts';
 import { oilLoops, openOilRules, type OilRuntime } from '../src/service/oil.ts';
 import { RETRY_MS, beijingDay, thresholdBounds, type RuleExecutor, type RulePlan } from '../src/oil/rule-live.ts';
 import { comparePremium } from '../src/hynix/sizing.ts';
@@ -324,12 +324,39 @@ test('品种读不一致的持有记录转待核对：海力士规则的持仓�
   rules.checkHynixRebalance('bybit', 'bybit-account');
 }));
 
-test('独立实盘入口遇到较新版本的规则库时拒绝调平，并保留原来的版本', () => withLive(async ({ file }) => {
+for (const mode of [undefined, 'observe']) {
+  test(`规则模式 ${String(mode)} 与持仓记录冲突：重启转待核对，观察轮不能覆盖持仓或放行调平`, () => withLive(async ({ r, ex, rules: initial, file, reopen }) => {
+    const id = goLive(initial);
+    await openWith(r, ex, initial, 'completed', ['2.42', '0.249']);
+    const raw = new DatabaseSync(file);
+    try {
+      const stored = JSON.parse(String(raw.prepare('SELECT state FROM rules WHERE id = ?').get(id)!.state));
+      stored.mode = mode;
+      stored.observing = true;
+      raw.prepare('UPDATE rules SET state = ? WHERE id = ?').run(JSON.stringify(stored), id);
+      const rules = reopen();
+      await feed(r, rules, CLOSE, 2);
+      assert.deepEqual([live(rules).phase, live(rules).enabled, ex.confirms.length], ['review', false, 1]);
+      assert.throws(() => rules.checkHynixRebalance('binance', ACCOUNT.accountKey), code('rebalance_rule_conflict'));
+      rules.checkHynixRebalance('binance', 'another-account');
+      const after = JSON.parse(String(raw.prepare('SELECT state FROM rules WHERE id = ?').get(id)!.state));
+      assert.deepEqual(after.live.held, stored.live.held);
+    } finally { raw.close(); }
+  }));
+}
+
+test('等待开仓与残缺的持仓或任务记录并存时，调平等待规则核对', () => withLive(async ({ rules, file }) => {
+  const id = goLive(rules);
   const db = new DatabaseSync(file);
   try {
-    db.exec('PRAGMA user_version=999');
-    assert.throws(() => checkStoredHynixRebalance(file, 'binance', ACCOUNT.accountKey), code('rules_unavailable'));
-    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 999);
+    const original = String(db.prepare('SELECT state FROM rules WHERE id = ?').get(id)!.state);
+    for (const field of ['held', 'pending', 'job']) {
+      const state = JSON.parse(original);
+      state.live[field] = { unreadable: true };
+      db.prepare('UPDATE rules SET state = ? WHERE id = ?').run(JSON.stringify(state), id);
+      assert.equal(live(rules).phase, 'review', field);
+      assert.throws(() => rules.checkHynixRebalance('binance', ACCOUNT.accountKey), code('rebalance_rule_conflict'));
+    }
   } finally { db.close(); }
 }));
 
@@ -346,7 +373,6 @@ test('海力士规则分批开平仓只处理自身成交，开仓交接、停�
     const executor: RuleExecutor = { preview: (intent, session) => h.ex.preview(intent, session), confirm: (body, session) => h.ex.confirm(body, session), jobView: id => h.ex.jobView(id), confirmedJob: (requestId, previewId, session) => h.ex.confirmedJob(requestId, previewId, session) };
     const file = join(dir, 'oil-rules.sqlite');
     const openRules = () => createOilRules({ file, venues: ['binance'], books, now: () => h.clock.now, executor });
-    checkStoredHynixRebalance(file, 'binance', 'unused');
     rules = openRules();
     try {
       const rebalance = (method: string) => h.ex.preview({ market: 'hynix', preset: 'rebalance', venue: 'binance', method, timeoutMs: 60_000 }, SESSION);
@@ -375,8 +401,6 @@ test('海力士规则分批开平仓只处理自身成交，开仓交接、停�
       rules.close();
       rules = openRules();
       for (const method of ['reduce', 'add']) await assert.rejects(rebalance(method), code('rebalance_rule_conflict'));
-      assert.throws(() => checkStoredHynixRebalance(file, 'binance', previews[0]!.legs[0].accountKey), code('rebalance_rule_conflict'));
-      checkStoredHynixRebalance(file, 'binance', 'another-account');
       rules.act(id, 'enable', { revision: first(rules).revision, confirmLive: true });
       // Buying back: ADR ask 40.02 × 10 ÷ ordinary bid 400.00 − 1 = 0.05 % ≤ 1.
       h.binance.setBook('SKHYUSDT', { bid: '40.00', ask: '40.02' });

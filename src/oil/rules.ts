@@ -7,7 +7,6 @@
 // restart clears the count and waits for the next fresh books. Counts live in memory only; the rules and their records
 // live in oil-rules.sqlite beside the main database, which an older version never opens.
 import { randomUUID } from 'node:crypto';
-import { lstatSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { ContractError, MAX_BATCHES, MAX_BATCH_INTERVAL_MS, VENUES, VENUE_NAMES, exactKeys, integer, oneOf, reject, type Venue } from '../contracts.ts';
 import { cmp, decimal, sub } from '../decimal.ts';
@@ -152,10 +151,12 @@ function stateOf(text: string, market: RuleMarket): RuleState {
     return record.kind !== 'signal' || (typeof record.value === 'string' && typeof record.threshold === 'string' && ['hits', 'bzAt', 'clAt'].every(key => Number.isFinite(record[key])));
   };
   const records = (value: unknown): RuleEvent[] => Array.isArray(value) ? value.filter(valid).slice(-MAX_EVENTS) : [];
-  // A state that cannot be read, or names no known mode, may belong to a live rule holding a position: it is held for review
-  // (not deletable until reset) rather than read as an observe rule. Rules from before live mode have no mode at all.
-  if (!raw || (raw.mode !== undefined && raw.mode !== 'observe' && raw.mode !== 'live')) {
-    return { mode: 'live', observing: false, live: { ...idleLive(), phase: 'review', reason: '规则状态无法读取；请在执行进度与交易所核对后重置' }, events: records(raw?.events), observations: [] };
+  // A legacy observer has no live position. Conflicting mode and position data must survive the next observation tick.
+  const saved = raw?.live && typeof raw.live === 'object' ? raw.live as Record<string, unknown> : null;
+  const positionOrJob = saved && (saved.held != null || saved.pending != null || saved.job != null || (saved.phase != null && saved.phase !== 'idle'));
+  if (!raw || (raw.mode !== undefined && raw.mode !== 'observe' && raw.mode !== 'live') || (raw.mode !== 'live' && positionOrJob)) {
+    const live = liveOf(saved, market);
+    return { mode: 'live', observing: false, live: { ...live, enabled: false, phase: 'review', pending: null, job: null, reason: '规则状态无法读取；请在执行进度与交易所核对后重置' }, events: records(raw?.events), observations: [] };
   }
   const mode = raw.mode === 'live' ? 'live' : 'observe';
   // An observe rule keeps the day's opens it made while live, so switching modes does not clear the daily limit.
@@ -187,20 +188,6 @@ function checkHynixRebalance(db: DatabaseSync, venue: Venue, accountKey: string)
   }
 }
 
-/** The standalone live executor has no rule engine. An existing service directory may still hold a rule's position. */
-export function checkStoredHynixRebalance(file: string, venue: Venue, accountKey: string): void {
-  let db: DatabaseSync | undefined;
-  try {
-    if (!lstatSync(file, { throwIfNoEntry: false })) return;
-    db = new DatabaseSync(file, { readOnly: true });
-    const version = db.prepare('PRAGMA user_version').get()?.user_version;
-    if (version !== 1 && version !== RULES_SCHEMA_VERSION) throw new Error('unsupported rules database');
-    checkHynixRebalance(db, venue, accountKey);
-  } catch (error) {
-    if (error instanceof ContractError) throw error;
-    throw new ContractError(503, 'rules_unavailable', '无法核对海力士规则持仓，暂不能手动调平');
-  } finally { db?.close(); }
-}
 /** The value for records: oil as before (USDT per barrel, no unit), hynix in percent cut to four places. */
 export const spreadText = (market: RuleMarket, value: string): string => market === 'hynix' ? `${value.replace(/(\.\d{4})\d+$/, '$1')}%` : value;
 

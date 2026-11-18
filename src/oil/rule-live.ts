@@ -251,6 +251,8 @@ export function liveOf(value: unknown, market: RuleMarket): LiveState {
   };
   const busy = live.phase === 'opening' || live.phase === 'closing';
   const problem = phase === null ? '阶段'
+    : raw.held != null && !live.held ? '持有记录'
+    : (raw.pending != null && !live.pending) || (raw.job != null && !live.job) ? '下单记录'
     : busy && !live.pending && !live.job ? '下单记录'
     : (live.phase === 'holding' || live.phase === 'closing') && !live.held ? '持有记录'
     : (live.phase === 'idle' || live.phase === 'opening') && live.held ? '持有记录'

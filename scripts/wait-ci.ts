@@ -46,6 +46,13 @@ function verdict(run?: Run): Verdict {
   return run.conclusion === 'success' ? 'passed' : 'failed';
 }
 
+function atLeastAsRecent(run: Run | undefined, seen: Run | undefined): boolean {
+  if (!seen) return true;
+  if (!run) return false;
+  if (run.number !== seen.number) return run.number > seen.number;
+  return run.id === seen.id && run.attempt >= seen.attempt;
+}
+
 export function githubReads(request: typeof fetch, api: string, repo: string, sha: string, token: string, tag: string, releaseId: string) {
   async function get(path: string) {
     const response = await request(`${api}/repos/${repo}/${path}`, {
@@ -65,12 +72,6 @@ export function githubReads(request: typeof fetch, api: string, repo: string, sh
       }
       return timestamp(run.created_at);
     },
-    isHistorical: async () => {
-      const ref = await get('git/ref/heads/main') as { ref?: unknown; object?: { type?: unknown; sha?: unknown } } | null;
-      if (ref?.ref !== 'refs/heads/main' || ref.object?.type !== 'commit' || typeof ref.object.sha !== 'string'
-        || !/^[0-9a-f]{40}$/.test(ref.object.sha)) throw new Error('无法确认 main 当前提交');
-      return ref.object.sha !== sha;
-    },
   };
 }
 
@@ -78,7 +79,6 @@ export type WaitOptions = {
   read: () => Promise<Run[]>;
   tag: string;
   releaseCreatedAt: () => Promise<number>;
-  isHistorical: () => Promise<boolean>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
   wallNow?: () => number;
@@ -95,11 +95,9 @@ export async function waitForCi(options: WaitOptions): Promise<{ ok: boolean; re
   const started = now();
   let seen = false;
   let seenMain: Run | undefined;
+  let seenManual: Run | undefined;
   let releaseTime: number | undefined;
-  let confirmManual: Run | undefined;
   for (;;) {
-    const checkedManual = confirmManual;
-    confirmManual = undefined;
     let runs: Run[] = [];
     let state: Verdict | 'unreadable';
     try {
@@ -107,31 +105,23 @@ export async function waitForCi(options: WaitOptions): Promise<{ ok: boolean; re
       // run_number orders distinct invocations of this workflow; a rerun keeps its number and increments run_attempt.
       const ordered = runs.toSorted((a, b) => b.number - a.number || b.attempt - a.attempt);
       const main = ordered.find(run => run.event === 'push' && run.branch === 'main');
-      const manual = ordered.find(run => run.event === 'workflow_dispatch');
-      if (seenMain && (!main || main.number < seenMain.number || (main.number === seenMain.number && main.attempt < seenMain.attempt))) {
-        throw new Error('先前已见的主线运行或重跑缺失');
-      }
+      const manual = ordered.find(run => run.event === 'workflow_dispatch' && (main !== undefined || run.branch === options.tag));
+      if (!atLeastAsRecent(main, seenMain)) throw new Error('先前已见的主线运行或重跑缺失');
+      seenMain = main;
       state = verdict(main);
+      if (atLeastAsRecent(manual, seenManual)) seenManual = manual;
+      else if (state === 'missing' || state === 'failed') throw new Error('先前已见的手动运行或重跑缺失');
       if (main) {
-        seenMain = main;
         // Compare creation with the end of the main attempt. Rerunning an old manual preflight keeps its creation time.
         if (state === 'failed' && manual && manual.createdAt > main.updatedAt) state = verdict(manual);
-      } else if (manual && checkedManual) {
-        if (manual.id !== checkedManual.id || manual.attempt !== checkedManual.attempt) throw new Error('补验期间最新手动运行已变化');
-        state = verdict(manual);
       } else if (manual) {
-        releaseTime ??= await options.releaseCreatedAt();
-        const tagRecheck = manual.branch === options.tag && manual.createdAt > releaseTime;
-        const registrationWindowOver = wallNow() - releaseTime >= appearMs || now() - started >= appearMs;
-        // Give an atomic main/tag push time to register. Older manual results are usable only for a historical commit.
-        if ((tagRecheck && registrationWindowOver) || ((tagRecheck || registrationWindowOver) && await options.isHistorical())) {
-          state = verdict(manual);
-          if (state === 'passed') {
-            // A main push may have appeared during the release/ref lookups. Confirm the run list before publishing.
-            confirmManual = manual;
-            continue;
-          }
+        if (releaseTime === undefined) {
+          releaseTime = await options.releaseCreatedAt();
+          continue; // Get the current ci state after reading the immutable tag-push time.
         }
+        const registrationWindowOver = wallNow() - releaseTime >= appearMs || now() - started >= appearMs;
+        // A later branch tip cannot rule out a delayed push run. Only an explicit recheck on this tag can stand alone.
+        if (registrationWindowOver && manual.createdAt > releaseTime) state = verdict(manual);
       }
     } catch (error) {
       state = 'unreadable';

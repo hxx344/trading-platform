@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-test('main reuses successful real service steps only for the same repository, commit, attempt and runner image', async t => {
+test('main reuses successful real service steps only for the same repository, commit, attempt and systemd runtime', async t => {
   const dir = mkdtempDisposableSync(join(tmpdir(), 'tp-ci-plan-'));
   t.after(() => dir.remove());
   const repo = 'owner/platform', sha = 'a'.repeat(40), cases = ['migration', 'components', 'execution', 'topology', 'reconcile'];
@@ -16,7 +16,7 @@ test('main reuses successful real service steps only for the same repository, co
     path: '.github/workflows/ci.yml', repository: { full_name: repo }, head_repository: { full_name: repo } };
   const job = (name: string) => ({ name: `platform-systemd (${name})`, run_id: 97, run_attempt: 2, head_sha: sha,
     status: 'completed', conclusion: 'success', labels: ['ubuntu-24.04'],
-    steps: [{ name: 'Verify real systemd (ubuntu24/20261111.127.1/X64)', status: 'completed', conclusion: 'success' }] });
+    steps: [{ name: 'Verify real systemd (ubuntu24/X64/255.4-1ubuntu8.12)', status: 'completed', conclusion: 'success' }] });
   let run = structuredClone(candidate), jobs = cases.map(job), available = true;
   const calls: string[] = [];
   const server = createServer((req, res) => {
@@ -37,7 +37,7 @@ test('main reuses successful real service steps only for the same repository, co
     await promisify(execFile)(process.execPath, [fileURLToPath(new URL('../scripts/ci-systemd.mjs', import.meta.url))], { env: {
       ...process.env, GITHUB_API_URL: api, GITHUB_SERVER_URL: 'https://github.com',
       GITHUB_REPOSITORY: repo, GITHUB_SHA: sha, GITHUB_TOKEN: 'fixture-token', GITHUB_STEP_SUMMARY: summary, GITHUB_OUTPUT: output,
-      GITHUB_EVENT_NAME: 'push', GITHUB_REF: 'refs/heads/main', AFFECTED: 'true', ImageOS: 'ubuntu24', ImageVersion: '20261111.127.1', RUNNER_ARCH: 'X64', ...env,
+      GITHUB_EVENT_NAME: 'push', GITHUB_REF: 'refs/heads/main', AFFECTED: 'true', ImageOS: 'ubuntu24', SYSTEMD_VERSION: '255.4-1ubuntu8.12', RUNNER_ARCH: 'X64', ...env,
     } });
     const values = Object.fromEntries(readFileSync(output, 'utf8').trim().split('\n').map(line => line.split('=')));
     assert.deepEqual(JSON.parse(values.scenarios), cases);
@@ -52,7 +52,10 @@ test('main reuses successful real service steps only for the same repository, co
     assert.equal(await plan(), 'true');
   }
   jobs = cases.map(job);
-  assert.equal(await plan({ ImageVersion: 'different' }), 'true');
+  assert.equal(await plan({ ImageVersion: 'another-hosted-image-build' }), 'false');
+  for (const change of [{ SYSTEMD_VERSION: '255.4-1ubuntu8.13' }, { SYSTEMD_VERSION: '' }, { RUNNER_ARCH: 'ARM64' }, { ImageOS: 'ubuntu26' }]) {
+    assert.equal(await plan(change), 'true');
+  }
   for (const change of [{ head_repository: { full_name: 'other/platform' } }, { head_sha: 'b'.repeat(40) }, { event: 'pull_request' }, { conclusion: 'failure' }]) {
     run = { ...candidate, ...change }; assert.equal(await plan(), 'true');
   }

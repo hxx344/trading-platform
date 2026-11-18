@@ -17,7 +17,7 @@ const item = {
 };
 
 // Each entry answers one poll (the last one repeats); an Error is a failed read. Time only moves when the gate sleeps.
-function scripted(polls: Array<Run[] | Error>, historical = false, releaseTime = epoch + 10) {
+function scripted(polls: Array<Run[] | Error>, releaseTime = epoch + 10) {
   let clock = 0, reads = 0;
   const lines: string[] = [];
   return {
@@ -26,7 +26,7 @@ function scripted(polls: Array<Run[] | Error>, historical = false, releaseTime =
     elapsed: () => clock,
     options: {
       read: async () => { const poll = polls[Math.min(reads++, polls.length - 1)]; if (poll instanceof Error) throw poll; return poll; },
-      tag, releaseCreatedAt: async () => releaseTime, isHistorical: async () => historical,
+      tag, releaseCreatedAt: async () => releaseTime,
       sleep: async (ms: number) => { clock += ms; },
       now: () => clock,
       wallNow: () => epoch + 10 + clock,
@@ -37,9 +37,9 @@ function scripted(polls: Array<Run[] | Error>, historical = false, releaseTime =
 }
 
 test('发布门禁：只认同一提交的 main 推送和手动运行，按最新主线结果判定', async () => {
-  const outcome = async (runs: Run[]) => (await waitForCi(scripted([runs], true).options)).reason;
+  const outcome = async (runs: Run[]) => (await waitForCi(scripted([runs]).options)).reason;
   assert.equal(await outcome([run('push', 'completed', 'success')]), 'passed');
-  assert.equal(await outcome([run('workflow_dispatch', 'completed', 'success')]), 'passed');
+  assert.equal(await outcome([run('workflow_dispatch', 'completed', 'success')]), 'missing');
   assert.equal(await outcome([run('push', 'completed', 'success', 1, { branch: 'feature' })]), 'missing');
   assert.equal(await outcome([run('pull_request', 'completed', 'success')]), 'missing');
   assert.equal(await outcome([run('pull_request_target', 'completed', 'success'), run('schedule', 'completed', 'success')]), 'missing');
@@ -88,34 +88,61 @@ test('发布门禁：原子推送时旧预检先出现，仍等待最新 main；
   assert.equal(missed.elapsed(), 30);
   const oldTag = scripted([[{ ...candidate, branch: tag }]]);
   assert.equal((await waitForCi(oldTag.options)).reason, 'missing');
-  const lost = scripted([[candidate, main], [candidate]], true);
+  const lost = scripted([[candidate, main], [candidate]]);
   assert.equal((await waitForCi(lost.options)).reason, 'unreadable');
-  const registeredDuringLookup = scripted([[candidate], [candidate, { ...main, status: 'completed', conclusion: 'failure' }]], true, epoch - 100);
-  assert.equal((await waitForCi(registeredDuringLookup.options)).reason, 'failed');
 });
 
-test('发布门禁：历史提交复用已有手动结果，标签上明确补验后可直接恢复', async () => {
-  const candidate = run('workflow_dispatch', 'completed', 'success');
-  const historical = scripted([[candidate]], true);
-  assert.equal((await waitForCi(historical.options)).ok, true);
-  assert.equal(historical.elapsed(), 30);
+test('发布门禁：main 已从 A 快进到 B，A 的主线第 190 秒才登记，旧候选始终不能发布 A', async () => {
+  const oldCandidate = run('workflow_dispatch', 'completed', 'success');
+  const failedMain = run('push', 'completed', 'failure', 2);
+  const waiting = scripted([]);
+  waiting.options.appearMs = 180;
+  waiting.options.read = async () => waiting.elapsed() < 190 ? [oldCandidate] : [oldCandidate, failedMain];
+  assert.equal((await waitForCi(waiting.options)).reason, 'missing');
+  assert.equal(waiting.elapsed(), 180);
+  await waiting.options.sleep(10);
+  assert.equal((await waitForCi(waiting.options)).reason, 'failed');
+});
 
+test('发布门禁：主线失败后和历史标签的手动补验都不能退回较早的通过记录', async () => {
+  const failedMain = run('push', 'completed', 'failure', 1);
+  const running = run('workflow_dispatch', 'in_progress', null, 12, { branch: tag, attempt: 2 });
+  const failed = { ...running, status: 'completed', conclusion: 'failure' };
+  const oldAttempt = { ...running, attempt: 1, status: 'completed', conclusion: 'success' };
+  const oldRun = run('workflow_dispatch', 'completed', 'success', 11, { branch: tag });
+  for (const main of [[failedMain], []]) {
+    for (const stale of [oldAttempt, oldRun]) {
+      const waiting = scripted([[...main, running], [...main, stale], [...main, stale], [...main, failed]], epoch - 100);
+      assert.equal((await waitForCi(waiting.options)).reason, 'failed');
+      assert.equal(waiting.reads(), 4);
+    }
+  }
+  const mainPassed = run('push', 'completed', 'success', 20);
+  const independent = scripted([[running], [mainPassed, oldAttempt]], epoch - 100);
+  assert.equal((await waitForCi(independent.options)).ok, true);
+  assert.equal(independent.reads(), 2);
+});
+
+test('发布门禁：无主线记录时只认标签发布后的同标签补验，登记窗口过后可直接恢复', async () => {
   const recheck = run('workflow_dispatch', 'completed', 'success', 11, { branch: tag });
-  const direct = scripted([[recheck]], true);
+  const direct = scripted([[recheck]]);
   assert.equal((await waitForCi(direct.options)).ok, true);
-  assert.equal(direct.elapsed(), 0);
-  const retry = scripted([[recheck]], false, epoch - 100);
+  assert.equal(direct.elapsed(), 30);
+  const other = run('workflow_dispatch', 'completed', 'success', 12, { branch: 'other-tag' });
+  const retry = scripted([[other, recheck]], epoch - 100);
   assert.equal((await waitForCi(retry.options)).ok, true);
   assert.equal(retry.elapsed(), 0);
+  assert.equal((await waitForCi(scripted([[other]], epoch - 100).options)).reason, 'missing');
+  assert.equal((await waitForCi(scripted([[recheck]], recheck.createdAt).options)).reason, 'missing');
 
   const delayedMain = scripted([[recheck], [recheck, run('push', 'completed', 'failure', 12)]]);
   assert.equal((await waitForCi(delayedMain.options)).reason, 'failed');
-  const unreadable = scripted([[candidate]], true);
-  unreadable.options.isHistorical = async () => { throw new Error('HTTP 403'); };
+  const unreadable = scripted([[recheck]]);
+  unreadable.options.releaseCreatedAt = async () => { throw new Error('HTTP 403'); };
   assert.equal((await waitForCi(unreadable.options)).reason, 'unreadable');
 });
 
-test('发布门禁：按提交查询 ci 工作流，校验发布事件与 main 引用；不可读的证据拒绝', async () => {
+test('发布门禁：按提交查询 ci 工作流，校验发布事件，拒绝不可读的证据', async () => {
   const calls: Array<{ url: string; headers: Record<string, string> }> = [];
   const answer = (status: number, body: unknown) => (async (url: string | URL | Request, init?: RequestInit) => {
     calls.push({ url: String(url), headers: init?.headers as Record<string, string> });
@@ -134,13 +161,6 @@ test('发布门禁：按提交查询 ci 工作流，校验发布事件与 main �
   assert.equal(calls.at(-1)?.url, 'https://api.example/repos/owner/name/actions/runs/99');
   for (const mutation of [{ id: 3 }, { head_sha: 'b'.repeat(40) }, { event: 'workflow_dispatch' }, { head_branch: 'main' }]) {
     await assert.rejects(reads(200, { ...release, ...mutation }).releaseCreatedAt(), /不匹配/);
-  }
-  const ref = { ref: 'refs/heads/main', object: { type: 'commit', sha } };
-  assert.equal(await reads(200, ref).isHistorical(), false);
-  assert.equal(calls.at(-1)?.url, 'https://api.example/repos/owner/name/git/ref/heads/main');
-  assert.equal(await reads(200, { ...ref, object: { type: 'commit', sha: 'b'.repeat(40) } }).isHistorical(), true);
-  for (const invalid of [null, {}, { ...ref, ref: 'refs/heads/candidate' }, { ...ref, object: { type: 'tag', sha } }, { ...ref, object: { type: 'commit', sha: '???' } }]) {
-    await assert.rejects(reads(200, invalid).isHistorical(), /无法确认/);
   }
 });
 

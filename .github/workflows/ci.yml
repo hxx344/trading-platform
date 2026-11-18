@@ -90,7 +90,7 @@ jobs:
         env:
           AFFECTED: ${{ steps.affected.outputs.run }}
           GITHUB_TOKEN: ${{ github.token }}
-        run: node scripts/ci-systemd.mjs
+        run: SYSTEMD_VERSION="$(dpkg-query -W -f='${Version}' systemd || true)" node scripts/ci-systemd.mjs
 
   platform-systemd:
     name: platform-systemd (${{ matrix.scenario }})
@@ -108,8 +108,9 @@ jobs:
       - id: build
         run: |
           npm run build:web
-          echo "image=${ImageOS:-}/${ImageVersion:-}/${RUNNER_ARCH:-}" >>"$GITHUB_OUTPUT"
-      - name: Verify real systemd (${{ steps.build.outputs.image }})
+          systemd_version=$(dpkg-query -W -f='${Version}' systemd || true)
+          echo "runtime=${ImageOS:-}/${RUNNER_ARCH:-}/$systemd_version" >>"$GITHUB_OUTPUT"
+      - name: Verify real systemd (${{ steps.build.outputs.runtime }})
         env:
           SCENARIO: ${{ matrix.scenario }}
         run: sudo env PATH="$PATH" TP_PLATFORM_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-platform-systemd.sh "$SCENARIO"

@@ -347,6 +347,7 @@ if ((split)) || [[ -f "$APP_DIR/control/.control-sha256" ]]; then
        " $(id -G "$SERVICE_USER") " != *" $CONTROL_GID "* &&
        "$CONTROL_GID" == "$(getent group "$CONTROL_USER" | cut -d: -f3)" ]] || fail '两个服务须使用不同的专用账户及私有组。'
   fi
+  [[ "$UPDATE_DIR" == /* ]] || fail '更新交接目录须为绝对路径。'
   update_path=$(realpath -m "$UPDATE_DIR")
   protected_dirs=("$APP_DIR" "$CONF_DIR" "$DATA_DIR" "$IMPORT_DIR" /run/trading-platform)
   old_units=("$UNIT_FILE")
@@ -370,11 +371,18 @@ if ((split)) || [[ -f "$APP_DIR/control/.control-sha256" ]]; then
     [[ "$update_path" != / && "$update_path" != "$protected_path" && "$protected_path" != "$update_path/"* &&
        "$update_path" != "$protected_path/"* ]] || fail '更新交接目录须与程序、配置、执行数据和导入交接目录隔离。'
   done
+  # The root update helper uses lstat on the directory and its immediate parent. Check the same parent before
+  # provisioning the leaf: install -d would otherwise follow a link or create a missing directory chain.
+  expected_owner=0
+  [[ "$TEST_MODE" != 1 ]] || expected_owner=$(id -u)
+  update_parent=$(dirname -- "$UPDATE_DIR")
+  if [[ ! -d "$update_parent" || -L "$update_parent" || "$(stat -c %u -- "$update_parent")" != "$expected_owner" ]] ||
+      (( (8#$(stat -c %a -- "$update_parent") & 0022) != 0 )); then
+    fail "更新交接目录的父目录 $update_parent 须已存在、由安装账户所有，且不是符号链接，组和其他人不可写。"
+  fi
   # Never take over another existing directory (including paths used by an older install with other overrides).
   # An existing handoff is already provisioned for the dedicated group. Leave its ownership and mode untouched.
   if [[ -e "$UPDATE_DIR" || -L "$UPDATE_DIR" ]]; then
-    expected_owner=0
-    [[ "$TEST_MODE" != 1 ]] || expected_owner=$(id -u)
     [[ -d "$UPDATE_DIR" && ! -L "$UPDATE_DIR" && "$(stat -c '%u:%g %a' "$UPDATE_DIR")" == "$expected_owner:$CONTROL_GID 770" ]] ||
       fail "已有的 $UPDATE_DIR 不属于专用更新交接目录，请指定独立新目录。"
   else

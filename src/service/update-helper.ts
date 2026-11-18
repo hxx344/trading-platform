@@ -5,7 +5,7 @@
 // rollback as the one-line install. Its progress and the installer's last lines go to update-result.json for the page.
 //
 //   node update-helper.ts --dir /var/lib/trading-platform-update --app-dir /opt/trading-platform
-//                         --data-dir /var/lib/trading-platform [--recover]
+//                         --data-dir /var/lib/trading-platform --request-uid <control UID> --request-gid <control GID> [--recover]
 //
 // --recover (the unit's ExecStopPost) marks a result the helper left running as interrupted.
 import { spawn, spawnSync } from 'node:child_process';
@@ -31,7 +31,7 @@ export const RELEASE_BASE = `https://github.com/${RELEASE_REPO}/releases`;
 export interface Owner { uid: number; gid: number }
 
 export interface UpdateHelperOptions {
-  /** The import hand-off directory (root's, the service's group may write). */
+  /** The root-owned update hand-off directory, writable by the requesting account's private group. */
   dir: string;
   /** install.sh's APP_DIR: `current` there is the installed release. */
   appDir: string;

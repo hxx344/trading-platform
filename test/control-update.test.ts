@@ -56,17 +56,18 @@ test('在线更新经执行面授权，控制面校验原请求并沿用 root �
   assert.equal((await post(check, headers, 'bad')).status, 400);
   assert.equal((await post(check, headers, 'x'.repeat(16 * 1024 + 1))).status, 413);
   assert.equal(checks, 0);
-  const checked = await post(check, headers, '{}');
-  assert.equal(checked.status, 200);
-  const view = await checked.json() as { current: { version: string }; enabled: boolean; available: boolean };
-  assert.deepEqual([view.current.version, view.enabled, view.available, checks], ['v0.64.0', true, true, 1]);
-  const file = join(handoff, 'update-request.json');
   const oldJob = { id: randomUUID(), version: 'v0.64.0', from: 'v0.63.0', startedAt: Date.now(), at: Date.now(), phase: 'running', message: '正在切换', output: [] };
   const oldResult = join(legacyDir, 'update-result.json');
   const earlier = { ...oldJob, id: randomUUID(), startedAt: oldJob.startedAt - 1000, at: oldJob.at - 900, phase: 'done' };
   // A downgrade and a second migration leave a valid result from the first split installation behind.
   writeFileSync(join(handoff, 'update-result.json'), JSON.stringify(earlier));
   writeFileSync(oldResult, JSON.stringify(oldJob));
+  const checked = await post(check, headers, '{}');
+  assert.equal(checked.status, 200);
+  const view = await checked.json() as { current: { version: string }; enabled: boolean; available: boolean; job: typeof oldJob };
+  assert.deepEqual([view.current.version, view.enabled, view.available, checks], ['v0.64.0', true, true, 1]);
+  assert.deepEqual(view.job, oldJob, '手动检查与自动读取都跟踪本次迁移请求');
+  const file = join(handoff, 'update-request.json');
   const statusJob = async () => (await (await fetch(base + '/api/update', { headers })).json() as { job: typeof oldJob | null }).job;
   assert.deepEqual(await statusJob(), oldJob);
   assert.equal((await post(apply, headers, '{"version":"v0.65.0"}')).status, 409, '迁移更新仍在进行');

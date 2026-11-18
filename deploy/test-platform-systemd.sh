@@ -130,6 +130,17 @@ systemctl is-enabled --quiet "$control"
 login
 assert_page v99.1.1
 
+echo 'Unsafe custom update parents are rejected before provisioning, preserving the live services'
+mkdir "$fixture/parent-group" "$fixture/parent-other" "$fixture/parent-user" "$fixture/parent-trusted"
+chmod 0770 "$fixture/parent-group"; chmod 0757 "$fixture/parent-other"
+chown "$control:$control" "$fixture/parent-user"
+ln -s "$fixture/parent-trusted" "$fixture/parent-link"
+for parent in parent-group parent-other parent-user parent-link parent-missing; do
+  if TP_UPDATE_DIR="$fixture/$parent/updates" install_release 1; then echo "Accepted unsafe update parent $parent" >&2; exit 1; fi
+  grep -q '更新交接目录的父目录' "$fixture/out"
+  [[ ! -e "$fixture/$parent/updates" && $(pid "$service") == "$executor_pid" && $(pid "$control") == "$control_pid" ]]
+done
+
 echo 'The update path checks the request UID and returns its answer only to the control UID'
 request_id=9d827fe0-5725-4d18-a5ec-2573cc94166f
 update_reply() {

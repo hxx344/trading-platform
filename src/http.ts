@@ -657,9 +657,9 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     }
     if (url.pathname === '/api/update' || url.pathname === '/api/update/check' || url.pathname === '/api/update/apply') {
       if (privateSocket && kind !== null) {
-        if ((kind === 'update' || kind === 'apply') && request.headers[LEGACY_UPDATE_HEADER] === '1') {
+        if (request.headers[LEGACY_UPDATE_HEADER] === '1') {
           const job = imports?.legacyUpdate?.();
-          if (job && kind === 'update') return send(response, 200, { job }, { [CONTROL_HEADER]: '1' });
+          if (job && (kind === 'update' || kind === 'check')) return send(response, 200, { job }, { [CONTROL_HEADER]: '1' });
           const since = Number(request.headers['x-trading-platform-update-since'] ?? 0);
           if (job?.phase === 'running' && !job.stale && job.startedAt >= since) return send(response, 409, { code: 'update_busy', message: '正在更新，请等待结束' });
         }

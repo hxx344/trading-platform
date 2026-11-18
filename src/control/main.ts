@@ -85,7 +85,7 @@ export function createControl(options: {
     }
   }
 
-  async function serveLocal(route: NonNullable<ReturnType<typeof controlRoute>>, pathname: string, request: IncomingMessage, response: ServerResponse, release: typeof active) {
+  async function serveLocal(route: NonNullable<ReturnType<typeof controlRoute>>, pathname: string, request: IncomingMessage, response: ServerResponse, release: typeof active, legacyJob?: UpdateView['job']) {
     if (route === 'page') { response.writeHead(200, APP_HEADERS); response.end(release.app.index); return; }
     if (route === 'asset') {
       const name = ASSET_PATH.exec(pathname)![1]!;
@@ -96,10 +96,12 @@ export function createControl(options: {
       response.end(asset.body);
       return;
     }
-    if (route === 'update') { sendJson(response, 200, updates.status()); return; }
-    const body = await readJson(request);
-    if (route === 'check') { exactKeys(body, []); sendJson(response, 200, await updates.check()); return; }
-    sendJson(response, 200, updates.apply(body));
+    if (route === 'apply') { sendJson(response, 200, updates.apply(await readJson(request))); return; }
+    if (route === 'check') exactKeys(await readJson(request), []);
+    const view = route === 'check' ? await updates.check() : updates.status();
+    if (legacyJob && !view.pending && (!view.job || legacyJob.startedAt > view.job.startedAt ||
+        (legacyJob.id === view.job.id && legacyJob.at > view.job.at))) view.job = legacyJob;
+    sendJson(response, 200, view);
   }
 
   const server = createServer((request, response) => {
@@ -119,7 +121,7 @@ export function createControl(options: {
     const release = active;
     const headers = engineHeaders(request, release.executionBuild, route === null);
     // During the first online migration the v0.63 helper still finishes in the executor-owned hand-off directory.
-    const legacy = (route === 'update' || route === 'apply') && options.importDir;
+    const legacy = (route === 'update' || route === 'check' || route === 'apply') && options.importDir;
     if (legacy) {
       headers[LEGACY_UPDATE_HEADER] = '1';
       if (route === 'apply') headers['x-trading-platform-update-since'] = String(updates.status().job?.startedAt ?? 0);
@@ -139,8 +141,8 @@ export function createControl(options: {
         relay(upstream, response, probe && matched ? probeResponse(challenge, controlBuild, release.root, release.version) : undefined);
         return;
       }
-      if (legacy && route === 'update' && upstream.statusCode === 200 && upstream.headers[CONTROL_HEADER] === '1') {
-        void legacyStatus(upstream, response).catch(error => failure(response, error));
+      if (legacy && (route === 'update' || route === 'check') && upstream.statusCode === 200 && upstream.headers[CONTROL_HEADER] === '1') {
+        void readLegacyJob(upstream).then(job => serveLocal(route, pathname, request, response, release, job)).catch(error => failure(response, error));
         return;
       }
       if (upstream.statusCode === 204 && upstream.headers[CONTROL_HEADER] === '1') {
@@ -165,7 +167,7 @@ export function createControl(options: {
     if (route) backend.end(); // Authorize the original method and path. Its JSON body stays here.
     else request.pipe(backend);
   });
-  async function legacyStatus(upstream: IncomingMessage, response: ServerResponse): Promise<void> {
+  async function readLegacyJob(upstream: IncomingMessage): Promise<UpdateView['job']> {
     const chunks: Buffer[] = [];
     let bytes = 0;
     for await (const chunk of upstream) {
@@ -173,12 +175,7 @@ export function createControl(options: {
       if (bytes > 72 * 1024) throw new Error('旧更新结果过大');
       chunks.push(chunk);
     }
-    const view = updates.status();
-    if (!view.pending) {
-      const { job } = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Pick<UpdateView, 'job'>;
-      if (job && (!view.job || job.startedAt > view.job.startedAt || (job.id === view.job.id && job.at > view.job.at))) view.job = job;
-    }
-    sendJson(response, 200, view);
+    return (JSON.parse(Buffer.concat(chunks).toString('utf8')) as Pick<UpdateView, 'job'>).job;
   }
   const poll = setInterval(() => { void updates.tick().catch(error => log(`检查新版本出错：${error instanceof Error ? error.message : String(error)}`)); }, 15_000);
   poll.unref();

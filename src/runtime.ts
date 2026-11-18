@@ -1,6 +1,7 @@
 // The run loop shared by the prototype entry and the ASTER service: lease heartbeat, WAL upkeep, the three passes on
 // their own schedules, the position reads, the loopback page and an orderly shutdown.
 import { randomBytes } from 'node:crypto';
+import { chmodSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { WAIT_BUCKETS_MS, WAL_SIZE_LIMIT_BYTES, type Store } from './store.ts';
 import type { Executor } from './executor.ts';
@@ -47,6 +48,7 @@ export interface RunOptions {
   /** Listen only on this local socket. The control service owns the browser port. */
   socketPath?: string;
   executionBuild?: string;
+  configBuild?: string;
   /** One more address to listen on besides 127.0.0.1 (the Tailscale IP), with its URL form (an IPv6 one in brackets). */
   listen?: PublicListenOptions['listen'];
   /** The login password's digest; without one only the access-url link logs in. */
@@ -88,7 +90,7 @@ export function checkSocketOptions(socketPath: string, port: number): void {
   if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('使用 --socket 时需要有效的页面端口');
 }
 
-export function runExecutor({ executor, store, dir, port, socketPath, executionBuild, listen, password, listenRetry, page, app, session, imports, views, passes = ['jobs', 'transfers', 'adl'], startedMessage, background, onStopping, onStopped, log = line => process.stderr.write(`${line}\n`), drainMs = 0 }: RunOptions): { shutdown(reason?: string, detail?: string): Promise<void>; done: Promise<void> } {
+export function runExecutor({ executor, store, dir, port, socketPath, executionBuild, configBuild, listen, password, listenRetry, page, app, session, imports, views, passes = ['jobs', 'transfers', 'adl'], startedMessage, background, onStopping, onStopped, log = line => process.stderr.write(`${line}\n`), drainMs = 0 }: RunOptions): { shutdown(reason?: string, detail?: string): Promise<void>; done: Promise<void> } {
   if (socketPath !== undefined) checkSocketOptions(socketPath, port);
   let stopping = false;
   let finished!: () => void;
@@ -163,7 +165,7 @@ export function runExecutor({ executor, store, dir, port, socketPath, executionB
   };
   const ready = (): boolean => notReady() === null;
   const server = createExecutorServer({ executor, accessToken, log, ready, ...(listen ? { host: listen.urlHost } : {}), ...(password ? { password } : {}),
-    ...(socketPath !== undefined ? { browserPort: port, executionBuild } : { page: page || undefined, app }), ...(session ? { session, sessionMaxAgeS: SESSION_MAX_AGE_S } : {}), ...(imports ? { imports } : {}), views: { ...views, status } });
+    ...(socketPath !== undefined ? { browserPort: port, executionBuild, configBuild } : { page: page || undefined, app }), ...(session ? { session, sessionMaxAgeS: SESSION_MAX_AGE_S } : {}), ...(imports ? { imports } : {}), views: { ...views, status } });
   const publishAccess = (bound: number) => {
     try { process.stdout.write(`${startedMessage}，登录链接已写入 ${writeAccessUrl(dir, bound, accessToken, listen?.urlHost)}\n`); }
     catch (error) { log(`写入登录链接失败：${message(error)}`); process.exitCode = 1; void shutdown('listen-failed', message(error)); }
@@ -179,6 +181,11 @@ export function runExecutor({ executor, store, dir, port, socketPath, executionB
     // The service manager owns this private runtime directory. Never unlink another listener's socket.
     server.listen({ path: socketPath }, () => {
       if (stopping) { server.close(); return; }
+      // The setgid runtime directory grants its IPC group traverse access only. The data files keep UMask=0077.
+      if (process.platform !== 'win32') {
+        try { chmodSync(socketPath, 0o660); }
+        catch (error) { listenFailed(error as Error); return; }
+      }
       publishAccess(port);
     });
     closeListener = () => { server.close(); };

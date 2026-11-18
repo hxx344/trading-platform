@@ -50,10 +50,10 @@ export async function verifyPassword(password: string, stored: PasswordHash): Pr
 }
 
 /** The digest in `path`, or null when no password is set (the file is absent). */
-export function loadPasswordHash(path: string): PasswordHash | null {
+export function loadPasswordHash(path: string, read = readPrivateFile): PasswordHash | null {
   let text: string;
-  try { text = readPrivateFile(path, '登录密码文件'); }
-  catch (error) { if (/ENOENT/.test(error instanceof Error ? error.message : '')) return null; throw error; }
+  try { text = read(path, '登录密码文件'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
   return parsePasswordHash(text);
 }
 

@@ -203,8 +203,8 @@ function parseFeishu(raw: unknown, name: string): FeishuSecret | null {
   return { webhook: hook.webhook, secret: typeof hook.secret === 'string' ? hook.secret : null };
 }
 
-export function loadServiceConfig(path: string): ServiceConfig {
-  const raw = parsePrivateJson(readPrivateFile(path, '服务配置文件'), '服务配置文件');
+export function loadServiceConfig(path: string, read = readPrivateFile): ServiceConfig {
+  const raw = parsePrivateJson(read(path, '服务配置文件'), '服务配置文件');
   try { return parseServiceConfig(raw); } catch (error) { throw fail('服务配置文件', error); }
 }
 
@@ -221,8 +221,8 @@ export function assertDistinctSigners(config: ServiceConfig, secrets: ServiceSec
   }
 }
 
-export function loadServiceSecrets(config: ServiceConfig): ServiceSecrets {
-  const raw = parsePrivateJson(readPrivateFile(config.secretsFile, '密钥文件'), '密钥文件');
+export function loadServiceSecrets(config: ServiceConfig, read = readPrivateFile): ServiceSecrets {
+  const raw = parsePrivateJson(read(config.secretsFile, '密钥文件'), '密钥文件');
   // parseAsterCredentials never quotes a key; other messages name only account names and fields.
   try {
     const secrets = parseServiceSecrets(raw, [...new Set(config.pairs.flatMap(pair => [pair.main, pair.long, pair.short]))], config.oil?.accounts.map(account => account.venue) ?? [], config.options !== undefined, config.crossex !== undefined, config.ondo !== undefined);

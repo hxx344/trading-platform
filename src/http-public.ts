@@ -16,6 +16,10 @@ export const ASSET_PATH = /^\/assets\/([^/]{1,128})$/;
 export const CONTROL_HEADER = 'x-trading-platform-control';
 export const EXECUTION_HEADER = 'x-trading-platform-execution';
 export const CLIENT_ADDRESS_HEADER = 'x-trading-platform-client-address';
+export const CONFIG_CHECK_HEADER = 'x-trading-platform-config-check';
+export const CONFIG_MATCH_HEADER = 'x-trading-platform-config-match';
+export const LISTEN_HEADER = 'x-trading-platform-listen';
+export const LEGACY_UPDATE_HEADER = 'x-trading-platform-legacy-update';
 
 /** On the private socket these routes return a hand-off only after the executor's normal request checks. */
 export function controlRoute(method: string | undefined, pathname: string): 'page' | 'asset' | 'update' | 'check' | 'apply' | null {

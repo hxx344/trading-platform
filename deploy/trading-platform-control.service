@@ -7,11 +7,12 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=trading-platform
-Group=trading-platform
+User=trading-platform-control
+Group=trading-platform-control
+SupplementaryGroups=trading-platform-ipc
 EnvironmentFile=-@APP_DIR@/control-proxy.env
 WorkingDirectory=@APP_DIR@/control
-ExecStart=@NODE@ @APP_DIR@/control/src/control/main.ts --current @APP_DIR@/current --socket /run/trading-platform/execution.sock --listen-file @APP_DIR@/control-listen.json --import-dir @IMPORT_DIR@
+ExecStart=@NODE@ @APP_DIR@/control/src/control/main.ts --current @APP_DIR@/current --socket /run/trading-platform/execution.sock --listen-file @APP_DIR@/control-listen.json --import-dir @UPDATE_DIR@
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
@@ -20,8 +21,8 @@ UMask=0077
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-InaccessiblePaths=@CONF_DIR@ @DATA_DIR@
-ReadWritePaths=-@IMPORT_DIR@
+InaccessiblePaths=@CONF_DIR@ @DATA_DIR@ @IMPORT_DIR@
+ReadWritePaths=-@UPDATE_DIR@
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectProc=invisible

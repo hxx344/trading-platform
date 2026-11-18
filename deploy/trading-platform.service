@@ -11,11 +11,12 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 User=trading-platform
-Group=trading-platform
+Group=trading-platform-ipc
+SupplementaryGroups=trading-platform
 EnvironmentFile=-@CONF_DIR@/environment
 WorkingDirectory=@APP_DIR@/executor
 RuntimeDirectory=trading-platform
-RuntimeDirectoryMode=0700
+RuntimeDirectoryMode=2750
 ExecStart=@NODE@ @APP_DIR@/executor/src/service/main.ts --config @CONF_DIR@/config.json --data-dir @DATA_DIR@ --import-dir @IMPORT_DIR@ --socket /run/trading-platform/execution.sock
 Restart=always
 RestartSec=5

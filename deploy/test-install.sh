@@ -13,13 +13,13 @@ part_is() { [[ $part == all || $part == "$1" ]]; }
 root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-export TP_TEST_MODE=1 TP_NODE_BIN TP_APP_DIR="$tmp/opt" TP_CONF_DIR="$tmp/etc" TP_DATA_DIR="$tmp/var" TP_UNIT_FILE="$tmp/unit.service" TP_IMPORT_DIR="$tmp/import"
+export TP_TEST_MODE=1 TP_NODE_BIN TP_APP_DIR="$tmp/opt" TP_CONF_DIR="$tmp/etc" TP_DATA_DIR="$tmp/var" TP_UNIT_FILE="$tmp/unit.service" TP_IMPORT_DIR="$tmp/import" TP_UPDATE_DIR="$tmp/update"
 TP_NODE_BIN=$(command -v node)
 # Every install.sh run starts node on the same release files; the compile cache saves re-parsing them each time.
 export NODE_COMPILE_CACHE=${NODE_COMPILE_CACHE:-$tmp/node-compile-cache}
 install_sh="$root/deploy/install.sh"
 failures=0
-check() { if eval "$2"; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); fi; }
+check() { if eval "$2"; then printf 'ok   %s\n' "$1"; else printf 'FAIL %s\n' "$1"; if [[ -f "$tmp/out" ]]; then tail -n 8 "$tmp/out"; fi; failures=$((failures + 1)); fi; }
 run() { bash "$install_sh" "$@" >"$tmp/out" 2>&1; }
 
 bash "$root/deploy/package.sh" "$tmp/a" >/dev/null
@@ -58,7 +58,7 @@ check '首次安装生成空配置并通过检查' 'grep -q "\"pairs\": \[\]" "$
 check '首次安装提示在页面导入' 'grep -q "下一步：在页面「从工作台导入配对」" "$tmp/out"'
 check '导入目录权限 770' '[[ "$(stat -c %a "$TP_IMPORT_DIR")" == 770 ]]'
 check '导入助手单元已填入路径' '! grep -q "@" "$tmp/trading-platform-import.service" "$tmp/trading-platform-import.path" && grep -q "PathChanged=$TP_IMPORT_DIR/request.json" "$tmp/trading-platform-import.path" && grep -q "ExecStart=$(command -v flock) -w 100 $TP_APP_DIR/.install.lock $TP_NODE_BIN $TP_APP_DIR/current/src/service/import-helper.ts --dir $TP_IMPORT_DIR --config $TP_CONF_DIR/config.json --data-dir $TP_DATA_DIR" "$tmp/trading-platform-import.service" && grep -q "ExecStopPost=$(command -v flock) -w 60 $TP_APP_DIR/.install.lock $TP_NODE_BIN $TP_APP_DIR/current/src/service/import-helper.ts --recover --dir $TP_IMPORT_DIR" "$tmp/trading-platform-import.service"'
-check '在线更新助手单元已填入路径（docs/update.md）' '! grep -q "@" "$tmp/trading-platform-update.service" "$tmp/trading-platform-update.path" && grep -q "PathChanged=$TP_IMPORT_DIR/update-request.json" "$tmp/trading-platform-update.path" && grep -q "ExecStart=$TP_NODE_BIN $TP_APP_DIR/current/src/service/update-helper.ts --dir $TP_IMPORT_DIR --app-dir $TP_APP_DIR --data-dir $TP_DATA_DIR$" "$tmp/trading-platform-update.service" && grep -q "ExecStopPost=$TP_NODE_BIN $TP_APP_DIR/current/src/service/update-helper.ts --recover --dir $TP_IMPORT_DIR --app-dir $TP_APP_DIR --data-dir $TP_DATA_DIR$" "$tmp/trading-platform-update.service"'
+check '在线更新助手单元已填入路径（docs/update.md）' '! grep -q "@" "$tmp/trading-platform-update.service" "$tmp/trading-platform-update.path" && grep -q "PathChanged=$TP_UPDATE_DIR/update-request.json" "$tmp/trading-platform-update.path" && grep -q "ExecStart=$TP_NODE_BIN $TP_APP_DIR/current/src/service/update-helper.ts --dir $TP_UPDATE_DIR --app-dir $TP_APP_DIR --data-dir $TP_DATA_DIR --request-uid $(id -u) --request-gid $(id -g)$" "$tmp/trading-platform-update.service" && grep -q "ExecStopPost=$TP_NODE_BIN $TP_APP_DIR/current/src/service/update-helper.ts --recover --dir $TP_UPDATE_DIR --app-dir $TP_APP_DIR --data-dir $TP_DATA_DIR --request-uid $(id -u) --request-gid $(id -g)$" "$tmp/trading-platform-update.service"'
 check '测试模式不写在线更新就绪标记（只在 systemd 启用 .path 后写）' '[[ ! -e "$TP_APP_DIR/.update-helper" && ! -e "$TP_IMPORT_DIR/.update-helper" ]]'
 check '当前版本指向新包' '[[ -f "$TP_APP_DIR/current/src/service/main.ts" ]]'
 check '示例配置已放入' '[[ -f "$TP_CONF_DIR/config.example.json" && -f "$TP_CONF_DIR/secrets.example.json" ]]'

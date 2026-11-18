@@ -35,6 +35,10 @@ const root = process.cwd();
 const packagePath = file => relative(root, file).split(sep).join('/');
 const control = new Set();
 const executor = new Set();
+// These programs are launched by root or the install CLI. The live executor imports import-channel for its API.
+const helperOnly = new Set(['update-helper', 'watch-config', 'import-helper', 'import-workbench',
+  'import-modules', 'import-options', 'import-crossex', 'import-ondo', 'import-monitor-alerts',
+  'import-monitor-variational', 'import-monitor-paper'].map(name => 'src/service/' + name + '.ts'));
 const hooks = registerHooks({ resolve(specifier, context, next) {
   const resolved = next(specifier, context);
   if (resolved.url.startsWith('file:')) {
@@ -50,7 +54,7 @@ for (const entry of readdirSync('src', { recursive: true, withFileTypes: true })
   if (!entry.isFile()) continue;
   const path = packagePath(entry.parentPath + '/' + entry.name);
   if (path.startsWith('src/control/') || ['src/web-assets.ts', 'src/service/update.ts', 'src/service/update-types.ts'].includes(path)) control.add(path);
-  else executor.add(path);
+  else if (!helperOnly.has(path)) executor.add(path);
 }
 for (const path of ['scripts/variational-balance.py', 'scripts/variational-request.py']) executor.add(path);
 const pkg = JSON.parse(readFileSync('package.json', 'utf8'));

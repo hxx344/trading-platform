@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { createControl } from '../src/control/main.ts';
 import { createExecutorServer } from '../src/http.ts';
+import { legacyUpdateJob } from '../src/service/update-legacy.ts';
 import { createHarness } from './harness.ts';
 
 test('在线更新经执行面授权，控制面校验原请求并沿用 root 助手的交接文件', async t => {
@@ -28,7 +29,10 @@ test('在线更新经执行面授权，控制面校验原请求并沿用 root �
   control.server.listen(0, '127.0.0.1');
   await once(control.server, 'listening');
   const port = (control.server.address() as AddressInfo).port, base = `http://127.0.0.1:${port}`;
-  const engine = createExecutorServer({ executor: h.ex, browserPort: port, accessToken: 'update-test-login' });
+  const legacyDir = join(h.dir, 'old-import');
+  mkdirSync(legacyDir);
+  const engine = createExecutorServer({ executor: h.ex, browserPort: port, accessToken: 'update-test-login',
+    imports: { submit: () => { throw new Error('unexpected import'); }, latest: () => null, legacyUpdate: () => legacyUpdateJob(legacyDir) } });
   engine.listen(socketPath);
   await once(engine, 'listening');
   t.after(async () => {
@@ -54,6 +58,15 @@ test('在线更新经执行面授权，控制面校验原请求并沿用 root �
   const view = await checked.json() as { current: { version: string }; enabled: boolean; available: boolean };
   assert.deepEqual([view.current.version, view.enabled, view.available, checks], ['v0.64.0', true, true, 1]);
   const file = join(handoff, 'update-request.json');
+  const oldJob = { id: randomUUID(), version: 'v0.64.0', from: 'v0.63.0', startedAt: Date.now(), at: Date.now(), phase: 'running', message: '正在切换', output: [] };
+  const oldResult = join(legacyDir, 'update-result.json');
+  writeFileSync(oldResult, JSON.stringify(oldJob));
+  const statusJob = async () => (await (await fetch(base + '/api/update', { headers })).json() as { job: typeof oldJob | null }).job;
+  assert.deepEqual(await statusJob(), oldJob);
+  assert.equal((await post(apply, headers, '{"version":"v0.65.0"}')).status, 409, '迁移更新仍在进行');
+  oldJob.phase = 'done';
+  writeFileSync(oldResult, JSON.stringify(oldJob));
+  assert.deepEqual(await statusJob(), oldJob, '旧浏览器继续跟踪原请求编号');
   assert.equal((await post(apply, headers, '{"version":"v0.64.1"}')).status, 409);
   assert.equal(existsSync(file), false);
   const body = '{"version":"v0.65.0"}';
@@ -62,6 +75,7 @@ test('在线更新经执行面授权，控制面校验原请求并沿用 root �
   const { pending } = await accepted.json() as { pending: { id: string } };
   const saved = JSON.parse(readFileSync(file, 'utf8'));
   assert.deepEqual([saved.id, saved.version], [pending.id, 'v0.65.0']);
+  assert.equal(await statusJob(), null, '新目录已有待处理请求时不显示旧任务');
   assert.equal((await post(apply, headers, body)).status, 409);
   assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), saved);
 });

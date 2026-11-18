@@ -37,6 +37,8 @@ export interface UpdateHelperOptions {
   appDir: string;
   /** The service's data directory: its owner is the service account. */
   dataDir: string;
+  /** UID/GID rendered into the root-owned update unit. Older single-process units use the owner of dataDir. */
+  requestOwner?: Owner;
   releaseBase?: string;
   /** Fetches `url` to `target`; throws with the reason. curl by default. */
   download?: (url: string, target: string) => void;
@@ -139,8 +141,7 @@ export async function runUpdateHelper(options: UpdateHelperOptions): Promise<boo
   const { dir, appDir, dataDir, releaseBase = RELEASE_BASE, download = curl, runInstaller = bash, now = Date.now, log = line => process.stderr.write(`${line}\n`) } = options;
   if (![dir, appDir, dataDir].every(isAbsolute)) throw new Error('目录须为绝对路径');
   checkDir(dir);
-  const stat = statSync(dataDir);
-  const owner = { uid: stat.uid, gid: stat.gid };
+  const owner = options.requestOwner ?? statSync(dataDir);
   if (recoverUpdate(dir, appDir, owner, now())) log('上一次更新没有正常结束，已标为中断');
   const request = takeUpdateRequest(dir, owner);
   if (!request) return false;
@@ -212,19 +213,25 @@ export async function runUpdateHelper(options: UpdateHelperOptions): Promise<boo
 async function main(): Promise<void> {
   // Not strict: a helper rolled back by install.sh keeps working under a newer unit that passes options it does not know
   // (docs/update.md: the unit's options are only ever added).
-  const { values } = parseArgs({ strict: false, options: { dir: { type: 'string' }, 'app-dir': { type: 'string' }, 'data-dir': { type: 'string' }, recover: { type: 'boolean' } } });
+  const { values } = parseArgs({ strict: false, options: { dir: { type: 'string' }, 'app-dir': { type: 'string' }, 'data-dir': { type: 'string' },
+    'request-uid': { type: 'string' }, 'request-gid': { type: 'string' }, recover: { type: 'boolean' } } });
   const text = (value: string | boolean | undefined): string | undefined => typeof value === 'string' ? value : undefined;
   const dir = text(values.dir), appDir = text(values['app-dir']), dataDir = text(values['data-dir']);
   if (!dir || !appDir || !dataDir) throw new Error('需要 --dir、--app-dir 与 --data-dir');
+  const uid = text(values['request-uid']), gid = text(values['request-gid']);
+  let requestOwner: Owner | undefined;
+  if (uid !== undefined || gid !== undefined) {
+    if (![uid, gid].every(value => value && /^[1-9]\d{0,9}$/.test(value) && Number(value) < 0xffffffff)) throw new Error('控制面账户的 UID、GID 无效');
+    requestOwner = { uid: Number(uid), gid: Number(gid) };
+  }
   const log = (line: string): void => { process.stderr.write(`${line}\n`); };
   if (values.recover === true) {
     if (![dir, appDir, dataDir].every(isAbsolute)) throw new Error('目录须为绝对路径');
     checkDir(dir);
-    const stat = statSync(dataDir);
-    if (recoverUpdate(dir, appDir, { uid: stat.uid, gid: stat.gid })) log('更新助手被中断，已把未结束的更新标为中断');
+    if (recoverUpdate(dir, appDir, requestOwner ?? statSync(dataDir))) log('更新助手被中断，已把未结束的更新标为中断');
     return;
   }
-  await runUpdateHelper({ dir, appDir, dataDir, log });
+  await runUpdateHelper({ dir, appDir, dataDir, requestOwner, log });
 }
 
 if (import.meta.main) main().catch(error => { process.stderr.write(`更新助手失败：${message(error)}\n`); process.exitCode = 1; });

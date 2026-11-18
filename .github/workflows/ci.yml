@@ -70,7 +70,9 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           if [[ -n "$BASE" && ! "$BASE" =~ ^0+$ ]] && git fetch --no-tags --depth=1 origin "$BASE" &&
-              git diff --quiet "$BASE" HEAD -- .github/workflows/ci.yml 'deploy/trading-platform*' deploy/install.sh deploy/package.sh deploy/test-platform-systemd.sh src/control 'src/http*.ts' src/runtime.ts src/web-assets.ts src/service/main.ts src/service/listen-config.ts 'src/service/update*.ts'; then
+              git diff --quiet "$BASE" HEAD -- .github/workflows/ci.yml 'deploy/trading-platform*' deploy/install.sh deploy/package.sh deploy/test-platform-systemd.sh \
+                src/control 'src/http*.ts' src/runtime.ts src/component-build.ts src/web-assets.ts src/data-dir.ts src/login-password.ts src/live/setup.ts \
+                src/service/main.ts 'src/service/*config*.ts' 'src/service/update*.ts' src/service/handoff-file.ts 'src/service/import-*.ts'; then
             echo "run=false" >>"$GITHUB_OUTPUT"
           else
             echo "run=true" >>"$GITHUB_OUTPUT"

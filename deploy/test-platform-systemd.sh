@@ -8,14 +8,17 @@ app=/opt/trading-platform
 conf=/etc/trading-platform
 data=/var/lib/trading-platform
 handoff=/var/lib/trading-platform-import
+updates=/var/lib/trading-platform-update
 unitdir=/etc/systemd/system
 service=trading-platform
 control=trading-platform-control
 units=("$service.service" "$control.service" "$service-import.path" "$service-import.service" "$service-update.path" "$service-update.service")
-for path in "$app" "$conf" "$data" "$handoff" /run/trading-platform "${units[@]/#/$unitdir/}"; do
+for path in "$app" "$conf" "$data" "$handoff" "$updates" /run/trading-platform "$unitdir/$service.service.d" "${units[@]/#/$unitdir/}"; do
   [[ ! -e "$path" && ! -L "$path" ]] || { echo "Fixture target already exists: $path" >&2; exit 1; }
 done
-if getent passwd "$service" >/dev/null || getent group "$service" >/dev/null; then echo 'Fixture account already exists' >&2; exit 1; fi
+for account in "$service" "$control" "$service-ipc"; do
+  if getent passwd "$account" >/dev/null || getent group "$account" >/dev/null; then echo 'Fixture account already exists' >&2; exit 1; fi
+done
 fixture=$(mktemp -d /opt/trading-platform-ci-XXXXXXXX)
 cleanup() {
   result=$?
@@ -27,14 +30,21 @@ cleanup() {
   systemctl disable --now "$service-update.path" "$service-import.path" "$control" "$service" >/dev/null 2>&1 || true
   rm -f "${units[@]/#/$unitdir/}"
   systemctl daemon-reload || true
-  userdel "$service" >/dev/null 2>&1 || true
-  groupdel "$service" >/dev/null 2>&1 || true
-  rm -rf "$app" "$conf" "$data" "$handoff" "$fixture"
+  userdel "$control" >/dev/null 2>&1 || true; userdel "$service" >/dev/null 2>&1 || true
+  for group in "$service" "$control" "$service-ipc"; do groupdel "$group" >/dev/null 2>&1 || true; done
+  rm -rf "$app" "$conf" "$data" "$handoff" "$updates" "$unitdir/$service.service.d" "$fixture"
   exit "$result"
 }
 trap cleanup EXIT
 umask 022
 mkdir "$fixture/old" "$fixture/source"
+# The actual page import below enables the observe-only Ondo module using an empty fixture, without any keys.
+# Keep the executor on loopback throughout this acceptance, including after its import-triggered restart.
+mkdir -p "$fixture/workbench/ondo-mm" "$unitdir/$service.service.d"
+printf 'DATA_DIR=%s\n' "$fixture/workbench" >"$fixture/workbench.env"
+chmod 600 "$fixture/workbench.env"
+export TP_WORKBENCH_ENV="$fixture/workbench.env"
+printf '[Service]\nIPAddressDeny=any\nIPAddressAllow=localhost\n' >"$unitdir/$service.service.d/ci-loopback.conf"
 # The genuine last single-process release and its verified installer establish the migration baseline.
 old="$fixture/old"
 for asset in SHA256SUMS trading-platform.tar.gz install.sh; do
@@ -76,12 +86,48 @@ echo 'Migrating the genuine single writer to the private socket and the browser 
 install_release 1
 executor_pid=$(pid "$service")
 control_pid=$(pid "$control")
-[[ "$executor_pid" != "$legacy_pid" && -S /run/trading-platform/execution.sock && $(stat -c %a /run/trading-platform) == 700 ]]
+[[ "$executor_pid" != "$legacy_pid" && -S /run/trading-platform/execution.sock &&
+   $(stat -c '%U:%G %a' /run/trading-platform) == "$service:$service-ipc 2750" &&
+   $(stat -c '%U:%G %a' /run/trading-platform/execution.sock) == "$service:$service-ipc 660" ]]
+[[ $(stat -c '%U:%G %a' "$updates") == "root:$control 770" && $(stat -c %u "/proc/$control_pid") != "$(stat -c %u "/proc/$executor_pid")" ]]
 [[ ! -e "/proc/$control_pid/root$conf/config.json" && ! -e "/proc/$control_pid/root$data/access-url" ]]
+if runuser -u "$control" -- test -r "$conf/secrets.json" || runuser -u "$control" -- test -w "$handoff" ||
+    runuser -u "$control" -- kill -0 "$executor_pid" 2>/dev/null; then echo 'Control UID reached execution credentials, import queue or signal permission' >&2; exit 1; fi
 systemctl is-enabled --quiet "$control"
 [[ -e "$app/.update-helper" ]]
 login
 assert_page v99.1.1
+
+echo 'The update path checks the request UID and returns its answer only to the control UID'
+request_id=9d827fe0-5725-4d18-a5ec-2573cc94166f
+update_reply() {
+  local reason=$1
+  for _ in {1..80}; do
+    if [[ -f "$updates/update-result.json" ]] && grep -q "$reason" "$updates/update-result.json"; then
+      [[ $(stat -c '%U:%G %a' "$updates/update-result.json") == "$control:$control 600" ]] && return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+printf '{"id":"%s","version":"v99.1.1","at":%s}\n' "$request_id" "$(date +%s%3N)" >"$fixture/root-request"
+mv -T "$fixture/root-request" "$updates/update-request.json"
+update_reply '请求文件不属于服务账户'
+runuser -u "$control" -- node -e 'const fs=require("fs"), p=process.argv[1]; fs.writeFileSync(p+".next", JSON.stringify({id:process.argv[2],version:"v99.1.1",at:Date.now()}), {flag:"wx",mode:0o600}); fs.renameSync(p+".next",p);' "$updates/update-request.json" "$request_id"
+update_reply '不比已装版本'
+
+echo 'An actual page import restarts execution once and the subsequent page deployment keeps the imported generation'
+curl --noproxy '*' -fsS --max-time 3 -b "$fixture/cookie" -H 'x-pa-executor: 1' -H 'Content-Type: application/json' \
+  --data '{"action":"import","ondo":true}' "$(url /api/import)" >"$fixture/import-request"
+for _ in {1..120}; do
+  if [[ -f "$handoff/result.json" ]] && node -e 'const r = JSON.parse(require("fs").readFileSync(process.argv[1])); process.exit(r.phase === "done" ? 0 : 1)' "$handoff/result.json"; then break; fi
+  sleep 0.5
+done
+node -e 'const r = JSON.parse(require("fs").readFileSync(process.argv[1])); if (r.phase !== "done") throw new Error(r.message)' "$handoff/result.json"
+[[ $(pid "$service") != "$executor_pid" && $(pid "$control") == "$control_pid" ]]
+executor_pid=$(pid "$service")
+# Let the oneshot finish its current request and release the installer/import lock.
+flock -w 90 "$app/.install.lock" true
 
 echo 'Page and version changes preserve both real processes, cookies and their pinned packages across cleanup'
 first_executor=$(readlink "$app/executor")
@@ -93,6 +139,13 @@ for version in 2 3 4 5; do
   [[ $(pid "$service") == "$executor_pid" && $(pid "$control") == "$control_pid" && -f "$first_executor/src/service/main.ts" && -f "$first_control/src/control/main.ts" ]]
   assert_page "v99.1.$version"
 done
+
+echo 'An update-helper-only package leaves both live process generations unchanged'
+printf '\n// simulated root helper update\n' >>"$source/src/service/update-helper.ts"
+build 11
+install_release 11
+[[ $(pid "$service") == "$executor_pid" && $(pid "$control") == "$control_pid" ]]
+assert_page v99.1.11
 
 echo 'Control code changes restart only the browser service; a repeat is a healthy no-op'
 printf '\nif (import.meta.main) console.info("模拟控制面升级");\n' >>"$source/src/control/main.ts"
@@ -135,6 +188,14 @@ assert_page v99.1.8
 echo 'Changing the public port updates both effective configurations and repeated installation can repair a stopped unit'
 public_port=14720
 node -e 'const fs = require("fs"), file = process.argv[1], c = JSON.parse(fs.readFileSync(file)); c.port=Number(process.argv[2]); fs.writeFileSync(file, JSON.stringify(c));' "$conf/config.json" "$public_port"
+cp "$app/executor/src/service/main.ts" "$source/src/service/main.ts"
+sed -i '1i if (import.meta.main) throw new Error("模拟新端口下控制面启动失败");' "$source/src/control/main.ts"
+build 10
+if install_release 10; then echo 'Broken control with changed listen port accepted' >&2; exit 1; fi
+grep -q '已回退到 v99.1.8 并确认运行正常' "$fixture/out"
+login
+assert_page v99.1.8
+if curl --noproxy '*' -s --max-time 1 -o /dev/null http://127.0.0.1:4720/api/ready; then echo 'Rollback left the old port listening' >&2; exit 1; fi
 printf '%s\n' 'NODE_USE_ENV_PROXY=1' 'NO_PROXY=127.0.0.1' 'CI_EXECUTION_ONLY=marker' >"$conf/environment"
 install_release 8
 login
@@ -152,6 +213,8 @@ assert_page v99.1.8
 echo 'Downgrade frees TCP for the original unit and can migrate forward again'
 bash "$root/deploy/install.sh" --package "$old" >"$fixture/out" 2>&1
 [[ ! -e "$unitdir/$control.service" && ! -e "$app/control" && ! -e /run/trading-platform/execution.sock ]]
+grep -qF "PathChanged=$handoff/update-request.json" "$unitdir/$service-update.path"
+grep -qF -- "--dir $handoff --app-dir $app" "$unitdir/$service-update.service"
 if systemctl is-active --quiet "$control"; then echo 'Control still running on downgrade' >&2; exit 1; fi
 login
 assert_page v0.63.0

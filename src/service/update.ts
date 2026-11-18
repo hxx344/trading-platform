@@ -8,18 +8,17 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ContractError, exactKeys } from '../contracts.ts';
 import { readBounded } from './handoff-file.ts';
-import type { InstalledVersion, ReleaseInfo, UpdateRequest, UpdateResult, UpdateView } from './update-types.ts';
+import { UUID, VERSION, isVersion, readUpdateResult, updateJob } from './update-legacy.ts';
+export { UPDATE_RESULT_FILE, UPDATE_RUNNING_STALE_MS, isVersion, readUpdateResult } from './update-legacy.ts';
+import type { InstalledVersion, ReleaseInfo, UpdateRequest, UpdateView } from './update-types.ts';
 export type { InstalledVersion, ReleaseInfo, UpdatePhase, UpdateRequest, UpdateResult, UpdateView } from './update-types.ts';
 
 export const UPDATE_REQUEST_FILE = 'update-request.json';
-export const UPDATE_RESULT_FILE = 'update-result.json';
 /** Written by install.sh once trading-platform-update.path is enabled and running; without it the page offers no update. */
 export const UPDATE_READY_FILE = '.update-helper';
 export const RELEASE_REPO = 'hxx344/trading-platform';
 /** A request nobody took within this long (helper not armed, or it failed to start) no longer blocks a new one. */
 export const UPDATE_REQUEST_STALE_MS = 120_000;
-/** The helper unit's TimeoutStartSec (1800 s), its TimeoutStopSec (300 s) and a margin: a result still running past it was cut short. */
-export const UPDATE_RUNNING_STALE_MS = 2_160_000;
 /** The longest a rate limit stops the checks. */
 export const UPDATE_MAX_WAIT_MS = 3_600_000;
 export const UPDATE_CHECK_INTERVAL_MS = 30 * 60_000;
@@ -33,13 +32,8 @@ const UPDATE_CHECK_TIMEOUT_MS = 20_000;
 /** Backoff after failed automatic checks (not rate limits, which wait for GitHub's own reset time). */
 const BACKOFF_MS = [1, 2, 4, 8, 15].map(minutes => minutes * 60_000);
 const MAX_REQUEST_BYTES = 1024;
-const MAX_RESULT_BYTES = 64 * 1024;
 const MAX_RELEASE_BYTES = 1024 * 1024;
 const MAX_NOTES = 4000;
-const VERSION = /^v(\d{1,4})\.(\d{1,4})\.(\d{1,6})$/;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-
-export const isVersion = (value: unknown): value is string => typeof value === 'string' && VERSION.test(value);
 
 /** Orders two vX.Y.Z versions; neither may be anything else. */
 export function compareVersions(a: string, b: string): number {
@@ -127,15 +121,6 @@ export function parseUpdateRequest(raw: unknown): UpdateRequest {
   if (!isVersion(value.version)) throw new Error('目标版本无效');
   if (typeof value.at !== 'number' || !Number.isSafeInteger(value.at)) throw new Error('请求时间无效');
   return { id: value.id, version: value.version, at: value.at };
-}
-
-/** The helper's latest answer, as it wrote it; null before the first one. */
-export function readUpdateResult(dir: string): UpdateResult | null {
-  const text = readBounded(join(dir, UPDATE_RESULT_FILE), MAX_RESULT_BYTES);
-  if (text === null) return null;
-  const value = JSON.parse(text) as UpdateResult;
-  if (!value || typeof value !== 'object' || !['running', 'done', 'failed'].includes(value.phase)) throw new Error('更新结果格式不对');
-  return value;
 }
 
 /** Writes a small file under `dir` by a private temporary name and a rename, so a reader never sees half of it. */
@@ -263,7 +248,7 @@ export function createUpdates({ current, dir, readyFile, fetchImpl = fetch, now 
     try {
       const at = now();
       const raw = readUpdateResult(dir);
-      const job: UpdateView['job'] = raw && raw.phase === 'running' && at - raw.startedAt > UPDATE_RUNNING_STALE_MS ? { ...raw, stale: true } : raw;
+      const job = updateJob(raw, at);
       let pending: UpdateView['pending'] = null;
       const text = readBounded(join(dir, UPDATE_REQUEST_FILE), MAX_REQUEST_BYTES);
       if (text !== null) {

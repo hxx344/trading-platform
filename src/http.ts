@@ -7,9 +7,10 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { isIP } from 'node:net';
 import { ContractError, TRANSFER_CONFIG_KEYS, VENUES, exactKeys, parsePage, type Venue } from './contracts.ts';
 import type { Executor } from './executor.ts';
-import { APP_HEADERS, ASSET_HEADERS, CLIENT_ADDRESS_HEADER, CONTROL_HEADER, EXECUTION_HEADER, PAGE_HEADERS, controlRoute, readJson, sendJson as send, sessionCookieName } from './http-public.ts';
+import { APP_HEADERS, ASSET_HEADERS, CLIENT_ADDRESS_HEADER, CONFIG_CHECK_HEADER, CONFIG_MATCH_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, PAGE_HEADERS, controlRoute, readJson, sendJson as send, sessionCookieName } from './http-public.ts';
 import { LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash } from './login-password.ts';
 import type { WebApp } from './web-assets.ts';
+import type { UpdateView } from './service/update-types.ts';
 import { ANTHROPIC_RETENTION_DAYS } from './vendor/anthropic-market.mjs';
 import { supportsExchange, type Exchange } from './vendor/exchange-comparison.mjs';
 import { supportsFundingHistory } from './vendor/exchange-funding-history.mjs';
@@ -74,7 +75,7 @@ const loginForm = (notice: string): string => '<!doctype html><meta charset="utf
   + (notice ? `<p class="notice">${notice}</p>` : '');
 
 /** The page's workbench import (the ASTER service only): leaves a request for the root helper and reads its answer. */
-export interface ImportChannel { submit(body: unknown): { id: string; at: number }; latest(): unknown }
+export interface ImportChannel { submit(body: unknown): { id: string; at: number }; latest(): unknown; legacyUpdate?(): UpdateView['job'] }
 
 /** Read-only views a service adds to the page: its run status and its balance history. */
 export interface ServiceViews {
@@ -174,6 +175,8 @@ export interface HttpOptions {
   browserPort?: number;
   /** The executor component fingerprint of the running process, fixed until the next start. */
   executionBuild?: string;
+  /** Fingerprint of the configuration, credentials and password actually loaded by this process. */
+  configBuild?: string;
   /**
    * Answers the login-free GET /api/ready, which a watchdog on another host probes: true while the run is healthy.
    * Without it the path does not exist.
@@ -188,7 +191,7 @@ export interface HttpOptions {
 const sameSecret = (given: string, expected: string): boolean =>
   timingSafeEqual(createHash('sha256').update(given).digest(), createHash('sha256').update(expected).digest());
 
-export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, app, imports, views, password, host, browserPort, executionBuild = 'development', ready, throttle = new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
+export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, app, imports, views, password, host, browserPort, executionBuild = 'development', configBuild, ready, throttle = new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
   if (!accessToken) throw new Error('需要访问令牌');
   if (sameSecret(session, accessToken)) throw new Error('会话值不能与访问令牌相同');
   // The executor records which session asked for each command; it gets a digest, so the stored rows never hold the cookie.
@@ -270,7 +273,7 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
 
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     if (!allowedHost(request.headers.host ?? '')) return send(response, 421, { code: 'host', message: '访问地址不在允许范围内' });
-    if (privateSocket && request.headers[EXECUTION_HEADER] !== executionBuild) return send(response, 503, { code: 'execution_version', message: '页面与执行器版本尚未匹配，请稍后重试' });
+    if (privateSocket && request.headers[EXECUTION_HEADER] !== executionBuild) return send(response, 503, { code: 'execution_version', message: '页面与执行器版本尚未匹配，请稍后重试' }, { [EXECUTION_HEADER]: executionBuild });
     const url = new URL(request.url ?? '/', 'http://localhost');
     if (request.method === 'POST' && url.pathname === '/login') return passwordLogin(request, response);
     if (request.method === 'GET' && url.pathname === '/login') {
@@ -287,7 +290,14 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     // learns that the service runs and nothing about accounts, balances, configuration or why it is not ready.
     if (ready && request.method === 'GET' && url.pathname === '/api/ready') {
       const ok = ready();
-      return send(response, ok ? 200 : 503, { ready: ok }, privateSocket ? { [EXECUTION_HEADER]: executionBuild } : {});
+      const headers: Record<string, string> = {};
+      if (privateSocket) {
+        headers[EXECUTION_HEADER] = executionBuild;
+        headers[LISTEN_HEADER] = JSON.stringify([browserPort, host ?? null]);
+        const check = request.headers[CONFIG_CHECK_HEADER];
+        if (configBuild && typeof check === 'string' && /^[a-f0-9]{64}$/.test(check)) headers[CONFIG_MATCH_HEADER] = sameSecret(check, configBuild) ? '1' : '0';
+      }
+      return send(response, ok ? 200 : 503, { ready: ok }, headers);
     }
     const kind = controlRoute(request.method, url.pathname);
     if (kind === 'page') {
@@ -646,7 +656,14 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       return send(response, 200, views.summary.setInterval(intervalMinutes));
     }
     if (url.pathname === '/api/update' || url.pathname === '/api/update/check' || url.pathname === '/api/update/apply') {
-      if (privateSocket && kind !== null) return handOff(response);
+      if (privateSocket && kind !== null) {
+        if ((kind === 'update' || kind === 'apply') && request.headers[LEGACY_UPDATE_HEADER] === '1') {
+          const job = imports?.legacyUpdate?.();
+          if (job && kind === 'update') return send(response, 200, { job }, { [CONTROL_HEADER]: '1' });
+          if (job?.phase === 'running' && !job.stale) return send(response, 409, { code: 'update_busy', message: '正在更新，请等待结束' });
+        }
+        return handOff(response);
+      }
       if (!views?.update) return send(response, 404, { code: 'not_found', message: '本服务没有在线更新' });
       if (kind === 'update') return send(response, 200, views.update.status());
       if (kind === 'check') { exactKeys(await readJson(request), []); return send(response, 200, await views.update.check()); }

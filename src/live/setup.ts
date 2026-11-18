@@ -1,6 +1,6 @@
 // Live canary wiring (3.0c): the operator's config file, the key file and the startup checks. Keys stay in memory only;
 // no message built here carries a key, a secret or a fragment of the key file.
-import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readSync, type Stats } from 'node:fs';
 import { createServer } from 'node:net';
 import { isAbsolute } from 'node:path';
 import { ContractError, exactKeys, parseBinding, parseNotionalLimits, type AccountBinding, type NotionalLimits, type Venue } from '../contracts.ts';
@@ -19,12 +19,16 @@ const PREFLIGHT_TIMEOUT_MS = 30_000;
 export interface LiveConfig { notionalLimits: NotionalLimits; credentialsFile: string; accounts: AccountBinding[] }
 
 /** Reads a small regular file this user owns and nobody else can read or write; the open descriptor is checked, not the path. */
-export function readPrivateFile(path: string, name: string): string {
+export function readPrivateFile(path: string, name: string, onRead?: (bytes: Buffer, stat: Stats) => void): string {
   if (!isAbsolute(path)) throw new Error(`${name}必须是绝对路径`);
   if (process.platform !== 'linux' || typeof process.getuid !== 'function') throw new Error('实盘模式只在 Linux 上运行（需要检查文件属主与权限、按账户加进程锁）');
   let fd: number;
   // Non-blocking, so a FIFO in place of the file fails the regular-file check instead of hanging the start.
-  try { fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK); } catch (error) { throw new Error(`${name}无法打开：${(error as NodeJS.ErrnoException).code ?? '未知错误'}`); }
+  try { fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    throw Object.assign(new Error(`${name}无法打开：${code ?? '未知错误'}`), { code });
+  }
   try {
     const stat = fstatSync(fd);
     if (!stat.isFile()) throw new Error(`${name}不是普通文件`);
@@ -35,6 +39,7 @@ export function readPrivateFile(path: string, name: string): string {
     let length = 0;
     for (let read; length < buffer.length && (read = readSync(fd, buffer, length, buffer.length - length, null)) > 0;) length += read;
     if (length > MAX_FILE_BYTES) throw new Error(`${name}超过 64 KiB`);
+    onRead?.(buffer.subarray(0, length), stat);
     return buffer.toString('utf8', 0, length);
   } finally { closeSync(fd); }
 }

@@ -52,6 +52,8 @@ umask 022
 REPO=hxx344/trading-platform
 SERVICE=trading-platform
 SERVICE_USER=trading-platform
+CONTROL_USER=trading-platform-control
+IPC_GROUP=trading-platform-ipc
 NODE_VERSION=24.15.0
 KEEP_RELEASES=3
 HEALTH_WAIT_S=90
@@ -67,6 +69,8 @@ WORKBENCH_ENV=${TP_WORKBENCH_ENV:-/etc/project-aggregation.env}
 WATCH_SENDER=${TP_WATCH_SENDER:-/etc/main-watch/sender}
 # The page's import requests: root owns it, the service's group writes requests, the root helper writes results.
 IMPORT_DIR=${TP_IMPORT_DIR:-/var/lib/trading-platform-import}
+UPDATE_DIR=${TP_UPDATE_DIR:-/var/lib/trading-platform-update}
+if [[ "$TEST_MODE" == 1 && -z "${TP_UPDATE_DIR:-}" ]]; then UPDATE_DIR="$IMPORT_DIR-updates"; fi
 UNIT_DIR=$(dirname "$UNIT_FILE")
 IMPORT_UNITS=("$SERVICE-import.path" "$SERVICE-import.service")
 # The page's root helpers: the import above and the online update (docs/update.md), both watching the import directory.
@@ -172,7 +176,7 @@ if [[ -n "$watch_url" ]] || ((watch_import || watch_off)); then watch_change=1; 
 [[ "$(uname -s)" == Linux ]] || fail '只支持 Linux。'
 if [[ "$TEST_MODE" != 1 ]]; then
   [[ $EUID -eq 0 ]] || fail '需要 root 运行：sudo bash install.sh'
-  for cmd in systemctl useradd getent runuser; do command -v "$cmd" >/dev/null || fail "缺少命令 $cmd"; done
+  for cmd in systemctl useradd groupadd getent runuser; do command -v "$cmd" >/dev/null || fail "缺少命令 $cmd"; done
 fi
 for cmd in curl tar gzip sha256sum awk flock stat; do command -v "$cmd" >/dev/null || fail "缺少命令 $cmd"; done
 
@@ -200,7 +204,8 @@ fi
 as_root_dir() { # path mode [owner group]
   if [[ "$TEST_MODE" == 1 ]]; then install -d -m "$2" "$1"; else install -d -m "$2" -o "${3:-root}" -g "${4:-root}" "$1"; fi
 }
-as_service() { if [[ "$TEST_MODE" == 1 ]]; then (cd / && "$@"); else (cd / && runuser -u "$SERVICE_USER" -- "$@"); fi; }
+as_user() { local user=$1; shift; if [[ "$TEST_MODE" == 1 ]]; then (cd / && "$@"); else (cd / && runuser -u "$user" -- "$@"); fi; }
+as_service() { as_user "$SERVICE_USER" "$@"; }
 fetch() { # url target
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 600 --retry 3 --retry-delay 2 "$1" -o "$2" \
     || fail "下载失败：$1（网络不通时可在别处下载后用 --package 安装）"
@@ -215,7 +220,7 @@ flock -n 9 || fail '另一个安装进程正在运行。'
 work_dir=$(mktemp -d)
 # An exit that bypasses fail (set -e, a signal) still puts imported files back before the backup goes with work_dir;
 # the backup is cleared only once the service runs on them. A signal becomes an exit, so the EXIT trap runs.
-trap 'trap "" INT TERM HUP; restore_import; rm -rf "$work_dir"' EXIT
+trap 'trap "" INT TERM HUP; restore_import; rm -rf "$work_dir"; flock -u 9' EXIT
 trap 'exit 130' INT TERM HUP
 
 # ---- 1. 校验清单与程序包 ----------------------------------------------------------
@@ -275,6 +280,14 @@ else
   mv "$release_dir.staging" "$release_dir"
 fi
 new_version=$(head -n1 "$release_dir/VERSION")
+read_value() { if [[ -f "$1" ]]; then cat "$1"; fi; }
+split=0
+if [[ -e "$release_dir/src/control" || -e "$release_dir/deploy/$CONTROL.service" || -e "$release_dir/.control-sha256" ]]; then
+  split=1
+  [[ -f "$release_dir/src/control/main.ts" && -f "$release_dir/src/control/probe.ts" && -f "$release_dir/deploy/$CONTROL.service" &&
+     "$(read_value "$release_dir/.executor-sha256")" =~ ^[0-9a-f]{64}$ && "$(read_value "$release_dir/.control-sha256")" =~ ^[0-9a-f]{64}$ ]] ||
+    fail '控制面与执行面程序包不完整，未切换版本。'
+fi
 
 # ---- 2. Node.js -------------------------------------------------------------------
 node_supported() {
@@ -318,6 +331,29 @@ fi
 as_root_dir "$CONF_DIR" 750 root "$SERVICE_USER"
 as_root_dir "$DATA_DIR" 700 "$SERVICE_USER" "$SERVICE_USER"
 as_root_dir "$IMPORT_DIR" 770 root "$SERVICE_USER"
+CONTROL_UID='' CONTROL_GID=''
+if ((split)) || [[ -f "$APP_DIR/control/.control-sha256" ]]; then
+  if [[ "$TEST_MODE" == 1 ]]; then CONTROL_UID=$(id -u); CONTROL_GID=$(id -g)
+  else
+    getent group "$IPC_GROUP" >/dev/null || groupadd --system "$IPC_GROUP"
+    if ! getent passwd "$CONTROL_USER" >/dev/null; then
+      useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$CONTROL_USER"
+      changes+=("系统账号 $CONTROL_USER")
+    fi
+    CONTROL_UID=$(id -u "$CONTROL_USER"); CONTROL_GID=$(id -g "$CONTROL_USER")
+    [[ "$CONTROL_UID" != 0 && "$CONTROL_UID" != "$(id -u "$SERVICE_USER")" &&
+       " $(id -G "$CONTROL_USER") " != *" $(id -g "$SERVICE_USER") "* &&
+       " $(id -G "$SERVICE_USER") " != *" $CONTROL_GID "* &&
+       "$CONTROL_GID" == "$(getent group "$CONTROL_USER" | cut -d: -f3)" ]] || fail '两个服务须使用不同的专用账户及私有组。'
+  fi
+  update_path=$(realpath -m "$UPDATE_DIR")
+  for protected in "$APP_DIR" "$CONF_DIR" "$DATA_DIR" "$IMPORT_DIR"; do
+    protected_path=$(realpath -m "$protected")
+    [[ "$update_path" != / && "$update_path" != "$protected_path" && "$protected_path" != "$update_path/"* &&
+       ( "$protected" == "$APP_DIR" || "$update_path" != "$protected_path/"* ) ]] || fail '更新交接目录须与程序、配置、执行数据和导入交接目录隔离。'
+  done
+  as_root_dir "$UPDATE_DIR" 770 root "$CONTROL_USER"
+fi
 for name in config secrets; do
   example="$release_dir/deploy/$name.example.json"
   if ! cmp -s "$example" "$CONF_DIR/$name.example.json"; then install -m 644 "$example" "$CONF_DIR/$name.example.json"; fi
@@ -471,7 +507,6 @@ RECORDS="$APP_DIR/.deployments"
 as_root_dir "$RECORDS" 700
 candidate="$work_dir/candidate"
 mkdir -m 700 "$candidate"
-read_value() { if [[ -f "$1" ]]; then cat "$1"; fi; }
 switch_link() { # real directory, link in the root-owned application directory
   [[ "$(readlink "$2" 2>/dev/null || true)" != "$1" ]] || return 0
   ln -sfn "$1" "$2.next" && mv -Tf "$2.next" "$2"
@@ -483,30 +518,34 @@ save_record() {
   snapshot=$(mktemp -d "$RECORDS/state.XXXXXXXX") || return 1
   cp -a "$1/." "$snapshot/" && switch_link "$snapshot" "$STATE"
 }
-if [[ ! -d "$STATE" ]]; then
+# An explicitly restored monolith may have been activated by its own installer, which predates our record.
+external_legacy=0
+if [[ -d "$STATE" && -n "$previous_dir" && "$previous_dir" != "$(read_value "$STATE/current")" &&
+      ! -f "$previous_dir/.executor-sha256" && ! -e "$APP_DIR/.restarting-executor" ]] &&
+   grep -qF "$APP_DIR/current/src/service/main.ts" "$UNIT_FILE" &&
+   { [[ "$TEST_MODE" == 1 ]] || { systemctl is-active --quiet "$SERVICE" && ! systemctl is-active --quiet "$SERVICE-control"; }; }; then
+  external_legacy=1
+fi
+if [[ ! -d "$STATE" ]] || ((external_legacy)); then
   initial="$work_dir/previous"
   mkdir -m 700 "$initial"
   printf '%s\n' "$previous_dir" >"$initial/current"
   # Bootstrap an existing installation (v0.63.0 and older had only current and the main unit).
   if [[ -n "$previous_dir" ]]; then cp "$UNIT_FILE" "$initial/executor.service" || fail '找不到已安装的服务单元，未切换版本。'; fi
-  if [[ -n "$previous_dir" && -f "$UNIT_DIR/$CONTROL.service" && -L "$APP_DIR/executor" && -L "$APP_DIR/control" ]]; then
+  if [[ -n "$previous_dir" && -f "$previous_dir/.executor-sha256" && -f "$UNIT_DIR/$CONTROL.service" && -L "$APP_DIR/executor" && -L "$APP_DIR/control" ]]; then
     readlink -f "$APP_DIR/executor" >"$initial/executor"
     readlink -f "$APP_DIR/control" >"$initial/control"
     cp "$UNIT_DIR/$CONTROL.service" "$initial/control.service"
     cp "$APP_DIR/control-listen.json" "$APP_DIR/control-proxy.env" "$initial/"
   fi
+  for unit in "${HELPER_UNITS[@]}"; do
+    [[ ! -f "$UNIT_DIR/$unit" ]] || cp "$UNIT_DIR/$unit" "$initial/$unit"
+  done
   save_record "$initial" || fail '无法保存当前版本的回退信息，未切换版本。'
 fi
 previous_dir=$(read_value "$STATE/current")
 previous_executor=$(read_value "$STATE/executor")
 previous_control=$(read_value "$STATE/control")
-split=0
-if [[ -e "$release_dir/src/control" || -e "$release_dir/deploy/$CONTROL.service" || -e "$release_dir/.control-sha256" ]]; then
-  split=1
-  [[ -f "$release_dir/src/control/main.ts" && -f "$release_dir/src/control/probe.ts" && -f "$release_dir/deploy/$CONTROL.service" &&
-     "$(read_value "$release_dir/.executor-sha256")" =~ ^[0-9a-f]{64}$ && "$(read_value "$release_dir/.control-sha256")" =~ ^[0-9a-f]{64}$ ]] ||
-    fail '控制面与执行面程序包不完整，未切换版本。'
-fi
 # Hash as the service account. File metadata matters too: a readable key file with the wrong mode must fail a fresh
 # check. Never read a service-configured key path as root, and store only the aggregate digest in the private record.
 config_hash() {
@@ -539,8 +578,10 @@ if ((configured)); then
   if cmp -s "$candidate/check-key" "$STATE/check-key" && [[ -f "$STATE/check-output" ]]; then
     cp "$STATE/check-output" "$candidate/check-output"
     skipped+=('配置检查（已验证）')
-  elif ! as_service "$NODE_BIN" "$release_dir/src/service/main.ts" --config "$CONF_DIR/config.json" --check-config >"$candidate/check-output" 2>&1; then
-    fail "配置检查未通过，服务保持原版本：$(cat "$candidate/check-output")"
+  elif check=$(as_service "$NODE_BIN" "$release_dir/src/service/main.ts" --config "$CONF_DIR/config.json" --check-config 2>&1); then
+    printf '%s\n' "$check" >"$candidate/check-output"
+  else
+    fail "配置检查未通过，服务保持原版本：$check"
   fi
   check=$(cat "$candidate/check-output")
   log "$check"
@@ -554,74 +595,57 @@ fi
 FLOCK_BIN=$(command -v flock)
 render_to() {
   [[ -f "$1" ]] && sed -e "s|@NODE@|$NODE_BIN|g" -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@CONF_DIR@|$CONF_DIR|g" -e "s|@DATA_DIR@|$DATA_DIR|g" \
-    -e "s|@IMPORT_DIR@|$IMPORT_DIR|g" -e "s|@FLOCK@|$FLOCK_BIN|g" -e "s|@WORKBENCH_ENV@|$WORKBENCH_ENV|g" "$1" >"$2" && [[ -s "$2" ]]
+    -e "s|@IMPORT_DIR@|$IMPORT_DIR|g" -e "s|@UPDATE_DIR@|$UPDATE_DIR|g" -e "s|@CONTROL_UID@|$CONTROL_UID|g" -e "s|@CONTROL_GID@|$CONTROL_GID|g" \
+    -e "s|@FLOCK@|$FLOCK_BIN|g" -e "s|@WORKBENCH_ENV@|$WORKBENCH_ENV|g" "$1" >"$2" && [[ -s "$2" ]]
 }
-printf '%s\n' "$release_dir" >"$candidate/current"
-render_to "$release_dir/deploy/trading-platform.service" "$candidate/executor.service" || fail '无法从程序包生成 systemd 单元，未切换版本。'
-# Reuse the original release directories of unchanged components. In particular later lazy imports and Python
-# helpers still run from the executor's original package after any number of page releases.
-pin_component() {
-  local name=$1 pinned
-  pinned=$(read_value "$STATE/$name")
-  if [[ -n "$pinned" && -d "$pinned" ]] && cmp -s "$release_dir/.$name-sha256" "$pinned/.$name-sha256"; then
-    printf '%s\n' "$pinned"
-  else printf '%s\n' "$release_dir"; fi
-}
-if ((split)); then
-  pin_component executor >"$candidate/executor"
-  pin_component control >"$candidate/control"
-  render_to "$release_dir/deploy/$CONTROL.service" "$candidate/control.service" || fail '无法生成控制面单元，未切换版本。'
-  if ((configured)); then
-    # Use the same port and host validation as the two services, and copy only these two public fields.
-    as_service "$NODE_BIN" --input-type=module - "$CONF_DIR/config.json" "$release_dir/src/service/listen-config.ts" >"$candidate/control-listen.json" <<'JS'
+# Build both forward and rollback records against the configuration that will actually remain on disk. The fixed
+# code pins survive page releases; public listen settings and the expected runtime config must match the same files.
+prepare_record() {
+  local target=$1 pins=$2 out=$3 name existing unit
+  printf '%s\n' "$target" >"$out/current" || return 1
+  render_to "$target/deploy/trading-platform.service" "$out/executor.service" || return 1
+  if [[ -f "$target/.control-sha256" ]]; then
+    for name in executor control; do
+      existing=$(read_value "$pins/$name")
+      if [[ -n "$existing" && -d "$existing" ]] && cmp -s "$target/.$name-sha256" "$existing/.$name-sha256"; then
+        printf '%s\n' "$existing" >"$out/$name" || return 1
+      else printf '%s\n' "$target" >"$out/$name" || return 1; fi
+    done
+    render_to "$target/deploy/$CONTROL.service" "$out/control.service" || return 1
+    if ((configured)); then
+      as_service "$NODE_BIN" "$target/src/service/config-fingerprint.ts" "$CONF_DIR/config.json" >"$out/config-key" &&
+        [[ "$(read_value "$out/config-key")" =~ ^[0-9a-f]{64}$ ]] || return 1
+      as_service "$NODE_BIN" --input-type=module - "$CONF_DIR/config.json" "$target/src/service/listen-config.ts" >"$out/control-listen.json" <<'JS' || return 1
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 const { parseListenConfig } = await import(pathToFileURL(process.argv[3]));
 const { port, host } = parseListenConfig(JSON.parse(readFileSync(process.argv[2], 'utf8')));
 console.log(JSON.stringify({ port, host }));
 JS
-    # The default key is already hidden by the config directory. Cover a supported external key path (and any
-    # symlink target) too. Encode unit syntax rather than inserting a service-owned config string into a root unit.
-    as_service "$NODE_BIN" - "$CONF_DIR/config.json" "$CONF_DIR" "$DATA_DIR" >>"$candidate/control.service" <<'JS'
-const fs = require('node:fs'), path = require('node:path');
-const [, , config, ...hidden] = process.argv;
-const key = JSON.parse(fs.readFileSync(config, 'utf8')).secretsFile;
-for (const file of new Set([path.resolve(key), fs.realpathSync(key)])) {
-  if (hidden.some(dir => file.startsWith(dir + '/'))) continue;
-  const word = [...Buffer.from(file)].map(b => /[a-zA-Z0-9_./-]/.test(String.fromCharCode(b)) ? String.fromCharCode(b) : '\\x' + b.toString(16).padStart(2, '0')).join('').replace(/\\x25/g, '%%');
-  console.log('\n[Service]\nInaccessiblePaths=-' + word);
-}
-JS
-  else printf '%s\n' '{"port":4720,"host":null}' >"$candidate/control-listen.json"; fi
-  # systemd reads this root-only file before applying InaccessiblePaths. Pass only proxy settings to the browser
-  # service; the executor and the two root helpers continue to use the original EnvironmentFile.
-  : >"$candidate/control-proxy.env"
-  if [[ -f "$CONF_DIR/environment" ]]; then
-    awk '/^[[:blank:]]*(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy|NODE_USE_ENV_PROXY)=/{print}' \
-      "$CONF_DIR/environment" >"$candidate/control-proxy.env"
+    else printf '%s\n' '{"port":4720,"host":null}' >"$out/control-listen.json" || return 1; fi
+    # Only the selected proxy settings reach the browser's separate UID. The main configuration and private key
+    # files, including a key outside the config directory, remain readable only by the execution account.
+    : >"$out/control-proxy.env" || return 1
+    if [[ -f "$CONF_DIR/environment" ]]; then
+      awk '/^[[:blank:]]*(HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy|NODE_USE_ENV_PROXY)=/{print}' \
+        "$CONF_DIR/environment" >"$out/control-proxy.env" || return 1
+    fi
+    { printf '%s\n' "$node_identity"; cat "$target/.control-sha256"; sha256sum <"$out/control.service"; sha256sum <"$out/control-listen.json"; sha256sum <"$out/control-proxy.env"; } \
+      | sha256sum | cut -d' ' -f1 >"$out/control-key" || return 1
   fi
-  { printf '%s\n' "$node_identity"; cat "$release_dir/.control-sha256"; sha256sum <"$candidate/control.service"; sha256sum <"$candidate/control-listen.json"; sha256sum <"$candidate/control-proxy.env"; } \
-    | sha256sum | cut -d' ' -f1 >"$candidate/control-key"
-fi
-{
-  printf '%s\n' "$node_identity" "$applied"
-  if ((split)); then cat "$release_dir/.executor-sha256"; else printf '%s\n' "$expected"; fi
-  sha256sum <"$candidate/executor.service"
-  if [[ -f "$CONF_DIR/environment" ]]; then sha256sum <"$CONF_DIR/environment"; fi
-} | sha256sum | cut -d' ' -f1 >"$candidate/executor-key"
-
-# Older packages without a helper leave its installed units in place. Prepare all files before changing any of them.
-for unit in "${HELPER_UNITS[@]}"; do
-  if [[ -f "$release_dir/deploy/$unit" ]]; then render_to "$release_dir/deploy/$unit" "$work_dir/$unit" || fail "无法生成 $unit，未切换版本。"; fi
-done
+  {
+    printf '%s\n' "$node_identity"
+    if [[ -f "$out/executor" ]]; then cat "$target/.executor-sha256"; else cat "$target/.package-sha256"; if ((configured)); then config_hash; fi; fi
+    sha256sum <"$out/executor.service"
+    if [[ -f "$CONF_DIR/environment" ]]; then sha256sum <"$CONF_DIR/environment"; fi
+  } | sha256sum | cut -d' ' -f1 >"$out/executor-key" || return 1
+  for unit in "${HELPER_UNITS[@]}"; do
+    if [[ -f "$target/deploy/$unit" ]]; then render_to "$target/deploy/$unit" "$out/$unit" || return 1
+    elif [[ -f "$pins/$unit" ]]; then cp "$pins/$unit" "$out/$unit" || return 1; fi
+  done
+}
+prepare_record "$release_dir" "$STATE" "$candidate" || fail '无法准备所选版本的服务单元与生效配置，未切换版本。'
 helper_changed=0
-for unit in "${HELPER_UNITS[@]}"; do
-  [[ -f "$work_dir/$unit" ]] || continue
-  cmp -s "$work_dir/$unit" "$UNIT_DIR/$unit" && continue
-  install -m 644 "$work_dir/$unit" "$UNIT_DIR/$unit"
-  helper_changed=1
-done
-if ((helper_changed)); then changes+=('页面助手单元'); fi
 arm_path() { # unit, description
   local unit=$1 what=$2
   [[ -f "$UNIT_DIR/$unit" ]] || return 1
@@ -649,20 +673,25 @@ running_from() { # WorkingDirectory pins the real package of the running process
 }
 journal_tail() { steady journalctl -u "$SERVICE" -u "$CONTROL" -n 40 --no-pager -o cat 2>/dev/null || true; }
 healthy_executor() {
-  local deadline=$((SECONDS + HEALTH_WAIT_S)) pid
+  local expected_dir=$1 deadline=$((SECONDS + HEALTH_WAIT_S)) pid
   while ((SECONDS < deadline)); do
     if [[ "$DATA_DIR/access-url" -nt "$work_dir/before-start" ]] && systemctl is-active --quiet "$SERVICE"; then
       pid=$(systemctl show -p MainPID --value "$SERVICE")
       steady sleep 5
-      [[ "$pid" != 0 && "$(systemctl show -p MainPID --value "$SERVICE")" == "$pid" ]] && systemctl is-active --quiet "$SERVICE" && return 0
+      if [[ "$pid" != 0 && "$(systemctl show -p MainPID --value "$SERVICE")" == "$pid" ]] && systemctl is-active --quiet "$SERVICE" &&
+          { [[ -z "$expected_dir" ]] || running_from "$SERVICE" "$expected_dir"; }; then return 0; fi
     fi
     steady sleep 0.5
   done
   return 1
 }
 probe_control() {
-  as_service timeout --kill-after=1 4 "$NODE_BIN" "$1/src/control/probe.ts" --current "$APP_DIR/current" --listen-file "$APP_DIR/control-listen.json" \
+  as_user "$CONTROL_USER" timeout --kill-after=1 4 "$NODE_BIN" "$1/src/control/probe.ts" --current "$APP_DIR/current" --listen-file "$APP_DIR/control-listen.json" \
     >"$work_dir/probe.log" 2>&1
+}
+probe_execution_config() {
+  as_service timeout --kill-after=1 4 "$NODE_BIN" "$1/src/control/probe.ts" --current "$1" --socket /run/trading-platform/execution.sock --config-check "$2" \
+    >"$work_dir/config-probe.log" 2>&1
 }
 healthy_control() {
   local target=$1 deadline=$((SECONDS + HEALTH_WAIT_S))
@@ -681,7 +710,7 @@ enable_service() {
 # and a process running an unexpected release are also repaired, e.g. after a power cut between switching and starting.
 activate() {
   local to=$1 from=$2 target exe ctl live changes_unit=0 moving=0 change_ex=0 change_ctl=0
-  local action_ex='' action_ctl='' unit name
+  local action_ex='' action_ctl='' unit name probe_status
   target=$(read_value "$to/current")
   exe=$(read_value "$to/executor")
   ctl=$(read_value "$to/control")
@@ -708,6 +737,15 @@ activate() {
     if [[ -n "$ctl" ]] && ((change_ctl)); then : >"$APP_DIR/.restarting-control" || return 1; fi
   fi
   put_file "$to/executor.service" "$UNIT_FILE" 644 || return 1
+  helper_changed=0
+  for unit in "${HELPER_UNITS[@]}"; do
+    [[ -f "$to/$unit" ]] || continue
+    if ! cmp -s "$to/$unit" "$UNIT_DIR/$unit"; then
+      put_file "$to/$unit" "$UNIT_DIR/$unit" 644 || return 1
+      helper_changed=1
+    fi
+  done
+  if ((helper_changed)); then changes+=('页面助手单元'); fi
   if [[ -n "$ctl" ]]; then
     put_file "$to/control.service" "$UNIT_DIR/$CONTROL.service" 644 && put_file "$to/control-listen.json" "$APP_DIR/control-listen.json" 644 &&
       put_file "$to/control-proxy.env" "$APP_DIR/control-proxy.env" 600 && switch_link "$exe" "$APP_DIR/executor" && switch_link "$ctl" "$APP_DIR/control" || return 1
@@ -726,6 +764,21 @@ activate() {
   enable_service "$SERVICE" || return 1
   if ! systemctl is-active --quiet "$SERVICE"; then action_ex=start
   elif ((change_ex)) || { [[ -n "$exe" ]] && ! running_from "$SERVICE" "$exe"; }; then action_ex=restart; fi
+  # Page imports restart the executor independently of the installer. Compare the configuration in that process,
+  # including when the files have since been changed back to the last installed values.
+  if [[ -n "$exe" && -z "$action_ex" ]]; then
+    probe_status=0
+    probe_execution_config "$target" "$(read_value "$to/config-key")" || probe_status=$?
+    if ((probe_status != 0 && probe_status != 3)); then
+      steady sleep 1; probe_status=0
+      probe_execution_config "$target" "$(read_value "$to/config-key")" || probe_status=$?
+    fi
+    case $probe_status in
+      0) ;;
+      3) action_ex=restart ;;
+      *) log '暂时无法确认执行服务的实际配置，保留运行中的执行服务。'; return 1 ;;
+    esac
+  fi
   if [[ -n "$ctl" ]]; then
     enable_service "$CONTROL" || return 1
     if ! systemctl is-active --quiet "$CONTROL"; then action_ctl=start
@@ -735,7 +788,9 @@ activate() {
   if [[ -n "$action_ex" ]]; then
     touch "$work_dir/before-start" || return 1
     steady systemctl reset-failed "$SERVICE" 2>/dev/null || true
-    steady systemctl "$action_ex" "$SERVICE" && healthy_executor || return 1
+    # restart also starts an inactive unit. A plain start could race an automatic start after the state check:
+    # its access-url might already have been written before our marker, leaving a healthy generation unprovable.
+    steady systemctl restart "$SERVICE" && healthy_executor "$exe" || return 1
     rm -f "$APP_DIR/.restarting-executor" || return 1
     changes+=("执行服务已$([[ $action_ex == start ]] && echo 启动 || echo 重启)")
   else skipped+=('执行服务（继续运行）'); fi
@@ -766,11 +821,14 @@ else
   log '服务没有正常启动，最近日志：'; journal_tail
   restore_import
   if [[ -n "$previous_dir" && -d "$previous_dir" && -f "$CONF_DIR/config.json" ]]; then
-    previous_version=$(head -n1 "$previous_dir/VERSION")
+    read -r previous_version _ <"$previous_dir/VERSION"
     if ! previous_check=$(as_service "$NODE_BIN" "$previous_dir/src/service/main.ts" --config "$CONF_DIR/config.json" --check-config 2>&1); then
       fail "新版本 $new_version 启动失败；上一版本 $previous_version 不接受当前配置（$previous_check），未回退。请恢复兼容配置后重新执行本脚本"
     fi
-    if activate "$STATE" "$candidate"; then
+    fallback="$work_dir/fallback"
+    mkdir -m 700 "$fallback" || fail '无法准备回退记录。'
+    if prepare_record "$previous_dir" "$STATE" "$fallback" && activate "$fallback" "$candidate"; then
+      save_record "$fallback" || fail '已切回上一版，但无法保存部署状态。'
       if [[ "$TEST_MODE" != 1 ]]; then ensure_import_path "$previous_dir"; fi
       fail "新版本 $new_version 启动失败，已回退到 $previous_version 并确认运行正常；请按上面的日志处理"
     fi

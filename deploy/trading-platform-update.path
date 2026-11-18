@@ -3,7 +3,7 @@
 Description=统一交易平台：等待页面的在线更新请求
 
 [Path]
-PathChanged=@IMPORT_DIR@/update-request.json
+PathChanged=@UPDATE_DIR@/update-request.json
 Unit=trading-platform-update.service
 
 [Install]

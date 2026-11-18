@@ -10,8 +10,8 @@ Description=统一交易平台：在线更新（页面请求）
 Type=oneshot
 # The same proxy settings as the service: curl and install.sh read HTTPS_PROXY from here.
 EnvironmentFile=-@CONF_DIR@/environment
-ExecStart=@NODE@ @APP_DIR@/current/src/service/update-helper.ts --dir @IMPORT_DIR@ --app-dir @APP_DIR@ --data-dir @DATA_DIR@
-ExecStopPost=@NODE@ @APP_DIR@/current/src/service/update-helper.ts --recover --dir @IMPORT_DIR@ --app-dir @APP_DIR@ --data-dir @DATA_DIR@
+ExecStart=@NODE@ @APP_DIR@/current/src/service/update-helper.ts --dir @UPDATE_DIR@ --app-dir @APP_DIR@ --data-dir @DATA_DIR@ --request-uid @CONTROL_UID@ --request-gid @CONTROL_GID@
+ExecStopPost=@NODE@ @APP_DIR@/current/src/service/update-helper.ts --recover --dir @UPDATE_DIR@ --app-dir @APP_DIR@ --data-dir @DATA_DIR@ --request-uid @CONTROL_UID@ --request-gid @CONTROL_GID@
 TimeoutStartSec=1800
 # install.sh holds off TERM while it checks the restarted service and rolls back (about 95 s each): let it finish.
 TimeoutStopSec=300

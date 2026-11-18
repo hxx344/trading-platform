@@ -20,6 +20,7 @@ import type { WebApp } from '../web-assets.ts';
 import { readComponentBuild } from '../component-build.ts';
 import { checkSocketOptions, runExecutor } from '../runtime.ts';
 import { assertDistinctSigners, checkIntervalBudget, enableBudget, idleWeight, loadServiceConfig, loadServiceSecrets, urlHost, type FeishuSecret, type ServiceConfig, type ServiceSecrets } from './config.ts';
+import { configFingerprint, fingerprintReader } from './config-fingerprint.ts';
 import { TRANSFER_CONFIG_KEYS, parseTransferConfig, type TransferConfig } from '../contracts.ts';
 import { PASSWORD_FILE, hashPassword, loadPasswordHash, type PasswordHash } from '../login-password.ts';
 import { createTakeoverGuard } from './takeover.ts';
@@ -28,6 +29,7 @@ import type { AlertHooks, AlertRobot } from '../monitor/alerts.ts';
 import { createStreamStatus, runUserStream, type SocketLike } from './stream.ts';
 import { balanceWindow, createBalanceSamples, type BalanceSamples } from './balance-samples.ts';
 import { readImportResult, submitImportRequest } from './import-channel.ts';
+import { legacyUpdateJob } from './update-legacy.ts';
 import type { UpdateFetch } from './update.ts';
 import { hynixBalanceCheck, hynixBusy, hynixViews, oilLoops, oilViews, openHynixBalance, openOilPnl, openOilRules, prepareOil, registerOilAccounts, strandedOilJobs, type OilRuntime } from './oil.ts';
 import { oilSummary } from './oil-config.ts';
@@ -212,6 +214,7 @@ export interface StartOptions {
   port?: number;
   socketPath?: string;
   executionBuild?: string;
+  configBuild?: string;
   leaseWaitMs?: number;
   /** The hand-off directory of the root import helper (install.sh sets it up); without it the page offers no import. */
   importDir?: string;
@@ -258,7 +261,7 @@ export async function startService(options: StartOptions): Promise<ReturnType<ty
   catch (error) { closeLogs(); throw error; }
 }
 
-async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, socketPath, executionBuild, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, ondoOptions, watchOptions, updateFetch }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
+async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, socketPath, executionBuild, configBuild, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, ondoOptions, watchOptions, updateFetch }: StartOptions, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
   const updates = socketPath === undefined ? (await import('./update.ts')).createServiceUpdates(importDir, updateFetch) : undefined;
   const session = keptSession(dir);
   // O7: the oil and hynix books come from the market monitor's perpetual collector when it has a recent one (oil/pushed.ts);
@@ -391,7 +394,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   // The heartbeat for the second server's main-watch; made once the run loop can say whether it is ready.
   let watch: Watch | null = null;
   return runExecutor({
-    executor, store, dir, port, socketPath, executionBuild, app, session,
+    executor, store, dir, port, socketPath, executionBuild, configBuild, app, session,
     ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: oil ? ['jobs', 'transfers', 'adl'] : ['transfers', 'adl'], drainMs: DRAIN_MS,
     views: {
       status: () => ({ budget: client.requestBudget.state(), idleWeight: idleWeight(config, executor.transferPairSettings()), streams: streams.view(), feishu: notifier.status(), summary: summary.status(), samples: { available: samples !== null, error: samplesError },
@@ -412,7 +415,8 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(logs ? { logs: (filter: 'all' | 'problems', before: number | null, limit: number) => logs.page({ filter, before, limit }) } : {}),
       ...(updates ? { update: updates } : {}),
     },
-    ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir) } } : {}),
+    ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir),
+      ...(socketPath !== undefined ? { legacyUpdate: () => legacyUpdateJob(importDir) } : {}) } } : {}),
     startedMessage: `ASTER 服务已启动（${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}）`,
     background: context => [
       (async () => {
@@ -501,10 +505,13 @@ async function main(): Promise<void> {
     return;
   }
   if (!values.config) throw new Error('需要 --config <服务配置文件的绝对路径>');
-  const config = loadServiceConfig(values.config);
-  const secrets = loadServiceSecrets(config);
+  const files = values.socket !== undefined ? fingerprintReader() : undefined;
+  const config = loadServiceConfig(values.config, files?.read);
+  const secrets = loadServiceSecrets(config, files?.read);
   // Next to the config, written by install.sh --set-password; no file means no password.
-  const password = loadPasswordHash(join(dirname(values.config), PASSWORD_FILE));
+  const password = loadPasswordHash(join(dirname(values.config), PASSWORD_FILE), files?.read);
+  const configBuild = files?.digest();
+  if (configBuild !== undefined && configFingerprint(values.config) !== configBuild) throw new Error('读取期间服务配置、密钥或登录密码发生变化，请重新启动');
   // Part of the check: a release whose page is missing or would break under the CSP is refused before it switches in.
   if (values['check-config']) {
     const app = (await import('../web-assets.ts')).loadWebApp();
@@ -520,7 +527,7 @@ async function main(): Promise<void> {
   const importDir = values['import-dir'];
   if (importDir !== undefined && !isAbsolute(importDir)) throw new Error('--import-dir 必须是绝对路径');
   const app = values.socket === undefined ? (await import('../web-assets.ts')).loadWebApp() : undefined;
-  await startService({ config, secrets, dir, socketPath: values.socket, app, ...(importDir ? { importDir } : {}), ...(password ? { password } : {}) });
+  await startService({ config, secrets, dir, socketPath: values.socket, configBuild, app, ...(importDir ? { importDir } : {}), ...(password ? { password } : {}) });
 }
 
 if (import.meta.main) main().catch(error => { process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; });

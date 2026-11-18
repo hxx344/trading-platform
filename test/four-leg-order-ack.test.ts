@@ -16,9 +16,11 @@ const OKX_CREATE = 'POST /api/v5/trade/order', OKX_QUERY = 'GET /api/v5/trade/or
 const BYBIT_CREATE = 'POST /v5/order/create', BYBIT_QUERY = 'GET /v5/order/realtime';
 
 /** An oil four-leg group driven through the two production connectors, with all HTTP served by the venues below. */
-async function fourLeg(t: TestContext, first: 'okx' | 'bybit', firstBybitLookup: (venue: FakeBybit) => Response = () => bybitFail(10016, 'server error', 500)) {
+async function fourLeg(t: TestContext, first: 'okx' | 'bybit', { okxMode = 'net_mode', firstBybitLookup = () => bybitFail(10016, 'server error', 500) }:
+  { okxMode?: FakeOkx['posMode']; firstBybitLookup?: (venue: FakeBybit) => Response } = {}) {
   const okx = new FakeOkx(), bybit = new FakeBybit();
   okx.fill = 'rest';
+  okx.posMode = okxMode;
   bybit.instruments.push(instrumentRow({ symbol: 'BZUSDT', baseCoin: 'BZ' }));
   bybit.script(BYBIT_CREATE, call => {
     const receipt = bybit.create(call.body!);
@@ -48,7 +50,7 @@ async function fourLeg(t: TestContext, first: 'okx' | 'bybit', firstBybitLookup:
   const preview = await ex.previewFourLeg({ market: 'oil', preset: 'four-leg', action: 'open', timeoutMs: 60_000, legs }, SESSION);
   const { jobs } = ex.confirmFourLeg({ previewId: preview.id, requestId: randomUUID(), confirmLive: true }, SESSION);
   const tick = async (ms = 100) => { okx.clock += ms; bybit.clock = okx.clock; await ex.tickJobs(); };
-  return { okx, bybit, ex, store, tick, firstId: jobs[0].id, lead: () => ex.jobView(jobs[0].id).legs[0].operation! };
+  return { okx, bybit, ex, store, connectors, tick, firstId: jobs[0].id, lead: () => ex.jobView(jobs[0].id).legs[0].operation! };
 }
 
 /** Only the next book read is stale. The peer's own checks later in the same scheduler pass see fresh books. */
@@ -125,6 +127,9 @@ test('四腿 Bybit 限价单仅获编号或查到 Created 时 OKX 等待，同�
   await tick();
   assert.deepEqual([bybit.last(BYBIT_QUERY).params.get('orderId'), bybit.last(BYBIT_QUERY).params.has('orderLinkId')], [order.orderId, false]);
   assert.deepEqual([order.orderStatus, bybit.count(BYBIT_CREATE), okx.count(OKX_CREATE)], ['Created', 1, 0]);
+  bybit.script(BYBIT_QUERY, () => bybitOk({ category: 'linear', list: [{ ...order, orderStatus: 'New', positionIdx: 2 }], nextPageCursor: '' }));
+  await tick();
+  assert.deepEqual([lead().remoteId, lead().filledQuantity, okx.count(OKX_CREATE)], [order.orderId, '0', 0], '单向账户的空头回报须是 positionIdx 0');
   order.orderStatus = 'New';
   await tick();
   assert.deepEqual([bybit.count(BYBIT_CREATE), okx.count(OKX_CREATE), lead().filledQuantity], [1, 1, '0']);
@@ -166,11 +171,11 @@ test('四腿 OKX 首查前已保存 ordId，连续查到同客户号的另一单
 test('四腿 Bybit 首查前已保存 orderId，连续查到其他编号的成交和挂单都不计入，撤单按原编号送达', async t => {
   const otherId = '0000-99';
   let savedAtFirstRead: string | null = null;
-  const h = await fourLeg(t, 'bybit', venue => {
+  const h = await fourLeg(t, 'bybit', { firstBybitLookup(venue) {
     savedAtFirstRead = h.lead().remoteId;
     const original = venue.orders[0];
     return bybitOk({ category: 'linear', list: [{ ...original, orderId: otherId, orderStatus: 'Filled', cumExecQty: original.qty, avgPrice: '70.11' }], nextPageCursor: '' });
-  });
+  } });
   const { okx, bybit, ex, firstId, tick, lead } = h;
   await tick();
   const original = bybit.orders[0], other = { ...original, orderId: otherId, orderStatus: 'New' };
@@ -188,4 +193,85 @@ test('四腿 Bybit 首查前已保存 orderId，连续查到其他编号的成�
   await tick();
   assert.deepEqual(bybit.last('POST /v5/order/cancel').body, { symbol: original.symbol, category: 'linear', orderId: original.orderId });
   assert.deepEqual([original.orderStatus, other.orderStatus, lead().remoteId, lead().state, okx.count(OKX_CREATE)], ['Cancelled', 'New', original.orderId, 'canceled', 0]);
+});
+
+for (const [mode, expectedSide, otherSide] of [['net_mode', 'net', 'long'], ['long_short_mode', 'long', 'net']] as const) {
+  test(`四腿 OKX ${mode} 首查、核对及撤单回报均须匹配原始 posSide，错误模式的成交不对冲`, async t => {
+    const { okx, bybit, ex, firstId, tick, lead } = await fourLeg(t, 'okx', { okxMode: mode });
+    const wrongMode = (filled: boolean) => () => {
+      const row = [...okx.orders.values()][0];
+      return okxOk([{ ...row, posSide: otherSide, ...(filled ? { state: 'filled', accFillSz: row.sz, avgPx: '70.11' } : {}) }]);
+    };
+    okx.script(OKX_QUERY, wrongMode(false), wrongMode(true));
+    await tick();
+    const original = [...okx.orders.values()][0];
+    assert.equal(okx.last(OKX_CREATE).body!.posSide, expectedSide);
+    assert.deepEqual([lead().remoteId, lead().state, lead().filledQuantity, bybit.count(BYBIT_CREATE)], [original.ordId, 'open', '0', 0]);
+    await tick();
+    assert.deepEqual([lead().remoteId, lead().state, lead().filledQuantity, okx.count(OKX_CREATE), bybit.count(BYBIT_CREATE)], [original.ordId, 'open', '0', 1, 0]);
+    await tick();
+    assert.deepEqual([lead().remoteId, lead().state, lead().filledQuantity, okx.count(OKX_CREATE), bybit.count(BYBIT_CREATE)], [original.ordId, 'open', '0', 1, 1]);
+
+    // Stop queries the live order, sends its cancel, then gets a fill for the wrong position mode as the cancel's answer.
+    okx.script(OKX_QUERY, () => okxOk([original]), wrongMode(true));
+    ex.requestStop(firstId, randomUUID(), SESSION);
+    await tick();
+    assert.deepEqual([okx.count(OKX_CANCEL), original.state, lead().state, lead().filledQuantity, okx.count(OKX_CREATE)], [1, 'canceled', 'open', '0', 1]);
+    await tick();
+    assert.deepEqual([lead().remoteId, lead().state, lead().filledQuantity, okx.count(OKX_CREATE)], [original.ordId, 'canceled', '0', 1]);
+  });
+}
+
+test('四腿 OKX 已核实的 ordId 后来指向另一客户号，保留原成交并转人工，重启停止也不撤另一单', async t => {
+  const { okx, bybit, ex, store, connectors, firstId, tick, lead } = await fourLeg(t, 'okx');
+  okx.fill = 'partial';
+  okx.script(OKX_QUERY, () => {
+    // This first matching report is genuine. Bybit's own temporary book error keeps its first POST pending until the next tick.
+    bybit.script('GET /v5/market/orderbook', () => bybitFail(10016, 'busy', 503));
+    return okxOk([...okx.orders.values()]);
+  });
+  await tick();
+  const first = lead(), original = [...okx.orders.values()][0];
+  assert.deepEqual([toClOrdId(first.clientOrderId), first.remoteId, first.filledQuantity, first.averagePrice, bybit.count(BYBIT_CREATE)],
+    [original.clOrdId, original.ordId, '1', '70.11', 0]);
+
+  // A cancel keyed only by this ordId would now act on the other customer's partially filled order.
+  const foreign = { ...original, clOrdId: 'othercustomer', state: 'partially_filled', accFillSz: '7', avgPx: '70.20' };
+  okx.orders.delete(original.clOrdId as string);
+  okx.orders.set(foreign.clOrdId, foreign);
+  await tick();
+  assert.equal(okx.last(OKX_QUERY).params.get('ordId'), original.ordId);
+  assert.deepEqual([ex.jobView(firstId).status, ex.jobView(firstId).locked, bybit.count(BYBIT_CREATE)], ['attention', true, 0]);
+  assert.deepEqual([lead().clientOrderId, lead().remoteId, lead().filledQuantity, lead().averagePrice], [first.clientOrderId, first.remoteId, '1', '70.11']);
+
+  ex.close();
+  const reopened = openStore(store.file);
+  try {
+    const next = createExecutor({ store: reopened, environment: 'mainnet', connectors, now: () => okx.clock });
+    assert.ok(next.acquire());
+    next.requestStop(firstId, randomUUID(), SESSION);
+    await next.tickJobs();
+    const after = next.jobView(firstId), op = after.legs[0].operation!;
+    assert.deepEqual([after.status, after.locked, op.clientOrderId, op.remoteId, op.filledQuantity, op.averagePrice],
+      ['attention', true, first.clientOrderId, first.remoteId, '1', '70.11']);
+    assert.deepEqual([okx.count(OKX_CANCEL), foreign.state, bybit.count(BYBIT_CREATE)], [0, 'partially_filled', 0]);
+  } finally { reopened.close(); }
+});
+
+test('四腿 Bybit 停止前确认过客户号，按原 orderId 再查到另一客户的活单时不发撤单', async t => {
+  const { okx, bybit, ex, firstId, tick, lead } = await fourLeg(t, 'bybit', {
+    firstBybitLookup: venue => bybitOk({ category: 'linear', list: [venue.orders[0]], nextPageCursor: '' }),
+  });
+  await tick();
+  const first = lead(), original = bybit.orders[0];
+  assert.deepEqual([first.clientOrderId, first.remoteId, first.venueStatus, okx.count(OKX_CREATE)], [original.orderLinkId, original.orderId, 'acknowledged', 0]);
+  const foreign = { ...original, orderLinkId: 'other-customer', orderStatus: 'New' };
+  bybit.orders[0] = foreign;
+  ex.requestStop(firstId, randomUUID(), SESSION);
+  await tick();
+  await tick(2_000);
+  assert.equal(bybit.last(BYBIT_QUERY).params.get('orderId'), first.remoteId);
+  assert.deepEqual([bybit.count('POST /v5/order/cancel'), foreign.orderStatus, okx.count(OKX_CREATE)], [0, 'New', 0]);
+  assert.deepEqual([ex.jobView(firstId).status, ex.jobView(firstId).locked, lead().clientOrderId, lead().remoteId, lead().filledQuantity],
+    ['attention', true, first.clientOrderId, first.remoteId, '0']);
 });

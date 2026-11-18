@@ -17,6 +17,11 @@ export class VenueError extends Error {
   readonly kind: VenueErrorKind;
   constructor(kind: VenueErrorKind, message: string) { super(message); this.kind = kind; }
 }
+/** An order located by its known venue ID is explicitly attributed to a different client order. */
+export class OrderOwnerConflict extends VenueError {}
+export function checkOrderOwner(id: string, clientId: unknown, expectedId: string | null | undefined, expectedClientId: string | null, kind: 'read-failed' | 'uncertain'): void {
+  if (id === expectedId && typeof clientId === 'string' && clientId !== expectedClientId) throw new OrderOwnerConflict(kind, '原交易所编号返回了另一客户订单号，需人工核对');
+}
 
 export interface ConnectorCapabilities {
   /** live: a real venue (3.0b). The executor still refuses every transport but simulated until live wiring (3.0c). */
@@ -83,6 +88,7 @@ export function parseOrderReport(value: unknown, request: Pick<OrderRequest, 'cl
     updatedAt: integer(raw.updatedAt, 0, Number.MAX_SAFE_INTEGER, '委托更新时间'),
   };
   // A report for another order, or one that overstates fills, never settles this operation.
+  checkOrderOwner(report.remoteId, report.clientOrderId, expectedRemoteId, request.clientOrderId, 'read-failed');
   if (expectedRemoteId !== null && report.remoteId !== expectedRemoteId) reject('report_identity', '回报与原交易所委托编号不一致，保留原单待核对', 409);
   if (report.clientOrderId !== request.clientOrderId || report.symbol !== request.symbol || report.side !== request.side || cmp(report.quantity, request.quantity) !== 0) reject('report_identity', '委托回报的身份或数量与本操作不一致', 409);
   if (cmp(report.filledQuantity, report.quantity) > 0) reject('report_overfill', '委托回报成交数量超过委托数量', 409);
@@ -164,10 +170,13 @@ export interface SendOptions extends CallOptions {
   beforeSend: () => void;
 }
 export interface PlaceOptions extends SendOptions {
+  positionMode?: 'one-way' | 'hedge';
   /** Return an asynchronous create's receipt before its first status query, so the executor can save the venue ID. */
   ackOnly?: boolean;
 }
 export interface OrderLookupOptions extends CallOptions {
+  /** Use the mode that the original order was prepared for, including after a takeover. */
+  positionMode?: 'one-way' | 'hedge';
   /** A known venue ID is the lookup/cancel target. The returned order must still match the original client ID. */
   remoteId?: string | null;
 }

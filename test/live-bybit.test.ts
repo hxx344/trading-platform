@@ -106,6 +106,8 @@ test('Bybit 连接器：下单参数按持仓模式带 positionIdx；回执后�
   // Hedge mode: positionIdx follows the position side; reduceOnly must agree with it before anything is sent.
   const hedge = setup();
   hedge.venue.mode = 'hedge';
+  await assert.rejects(hedge.connector.place(binding(), order(), { ...send(), positionMode: 'one-way' }), kind('not-sent'));
+  assert.equal(hedge.venue.count('POST /v5/order/create'), 0);
   await hedge.connector.place(binding(), order({ side: 'sell', positionSide: 'short' }), send());
   assert.equal(hedge.venue.last('POST /v5/order/create').body!.positionIdx, 2);
   await assert.rejects(hedge.connector.place(binding(), order({ clientOrderId: 'pa1-bad', side: 'sell', positionSide: 'long', reduceOnly: false }), send()), kind('not-sent'));

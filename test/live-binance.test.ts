@@ -110,6 +110,8 @@ test('Binance 连接器：双向持仓用 positionSide 表达开平且不带 red
   const { venue, connector } = setup();
   venue.mode = 'hedge';
   const close = order({ side: 'sell', positionSide: 'long', reduceOnly: true });
+  await assert.rejects(connector.place(binding(), close, { ...send(), positionMode: 'one-way' }), kind('not-sent'));
+  assert.equal(venue.count('POST /fapi/v1/order'), 0);
   await connector.place(binding(), close, send());
   const params = venue.calls.find(call => call.method === 'POST')!.params;
   assert.deepEqual([params.get('positionSide'), params.has('reduceOnly')], ['LONG', false]);
@@ -259,15 +261,19 @@ test('Binance 标准与组合账户按已知 orderId 查撤，即使客户号已
     const other = { ...original, orderId: venue.nextOrderId++, status: 'NEW' };
     venue.orders.set(remoteId, original);
     venue.orders.set(request.clientOrderId, other);
-    const lookup = { signal: signal(), remoteId };
+    const lookup = { signal: signal(), remoteId, positionMode: 'one-way' as const };
     assert.equal((await connector.query(account, request, lookup))?.remoteId, remoteId);
-    venue.script('GET ' + path, () => json(other), () => json({ ...original, clientOrderId: 'someone-else' }));
+    venue.script('GET ' + path, () => json(other), () => json({ ...original, clientOrderId: 'someone-else' }), () => json({ ...original, positionSide: 'LONG' }));
     await assert.rejects(connector.query(account, request, lookup), kind('read-failed'));
     await assert.rejects(connector.query(account, request, lookup), kind('read-failed'));
-    const canceled = await connector.cancel(account, request, { ...send(), remoteId });
+    await assert.rejects(connector.query(account, request, lookup), kind('read-failed'));
+    const cancel = { ...send(), remoteId, positionMode: 'one-way' as const };
+    venue.script('DELETE ' + path, () => json({ ...original, positionSide: 'LONG', status: 'CANCELED' }));
+    await assert.rejects(connector.cancel(account, request, cancel), kind('uncertain'));
+    const canceled = await connector.cancel(account, request, cancel);
     assert.deepEqual([canceled.remoteId, canceled.status, original.status, other.status], ['9007199254740993', 'canceled', 'CANCELED', 'NEW']);
     const calls = venue.calls.filter(call => call.path === path && call.method !== 'POST');
-    assert.deepEqual(calls.map(call => call.method), ['GET', 'GET', 'GET', 'DELETE']);
+    assert.deepEqual(calls.map(call => call.method), ['GET', 'GET', 'GET', 'GET', 'DELETE', 'DELETE']);
     for (const { params } of calls) assert.deepEqual([params.get('symbol'), params.get('orderId'), params.has('origClientOrderId')], ['CLUSDT', remoteId, false]);
   }
 });

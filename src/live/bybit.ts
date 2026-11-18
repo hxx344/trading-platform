@@ -5,7 +5,7 @@ import { bybitAuthHeaders } from '../vendor/bybit.mjs';
 import { createHash } from 'node:crypto';
 import { VENUE_EXECUTION_SYMBOLS, accountKey, type AccountBinding, type AccountSnapshot, type Instrument, type OpenOrder, type Position, type PositionSide } from '../contracts.ts';
 import {
-  STRATEGY_ID, VenueError, type CallOptions, type ChaseConnector, type ConnectorCapabilities, type LedgerEntry, type OrderLookupOptions, type OrderReport, type PlaceOptions, type PnlPosition, type PnlSnapshot, type OrderRequest, type OrderStatus, type SendOptions,
+  STRATEGY_ID, VenueError, checkOrderOwner, type CallOptions, type ChaseConnector, type ConnectorCapabilities, type LedgerEntry, type OrderLookupOptions, type OrderReport, type PlaceOptions, type PnlPosition, type PnlSnapshot, type OrderRequest, type OrderStatus, type SendOptions,
   type StrategyAck, type StrategyReport, type StrategyRequest,
 } from '../connector.ts';
 import { add, cmp, isZero, sub } from '../decimal.ts';
@@ -227,13 +227,16 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
     return uid;
   }
 
-  function orderReport(value: unknown, request: OrderRequest, kind: 'uncertain' | 'read-failed', remoteId?: string | null): OrderReport {
+  function orderReport(value: unknown, request: OrderRequest, kind: 'uncertain' | 'read-failed', remoteId?: string | null, positionMode?: Mode): OrderReport {
     try {
       const row = record(value, '委托回报');
+      const id = checkedOrderId(row.orderId, remoteId);
+      checkOrderOwner(id, row.orderLinkId, remoteId, request.clientOrderId, kind);
       if (row.orderLinkId !== request.clientOrderId || row.symbol !== request.symbol || sideOf(row.side) !== request.side) throw new ShapeError('委托回报的客户订单号、合约或方向与请求不一致');
       if (row.orderType !== (request.type === 'market' ? 'Market' : 'Limit')) throw new ShapeError('委托回报类型与请求不一致');
       if (request.type === 'limit' && (row.timeInForce !== (request.timeInForce === 'ioc' ? 'IOC' : 'GTC') || request.limitPrice === null || cmp(amount(row.price, '委托价格'), request.limitPrice) !== 0)) throw new ShapeError('委托回报的价格或有效方式与请求不一致');
       const idx = numeric(row.positionIdx, [0, 1, 2] as const, '持仓方向编号');
+      if (positionMode !== undefined && positionMode !== (idx === 0 ? 'one-way' : 'hedge')) throw new ShapeError('委托回报持仓模式与原委托不一致');
       if (typeof row.reduceOnly !== 'boolean' || row.reduceOnly !== request.reduceOnly || (idx !== 0 && idx !== (request.positionSide === 'long' ? 1 : 2))) throw new ShapeError('委托回报仓位方向或只减仓标记与请求不一致');
       const quantity = amount(row.qty, '委托数量'), filledQuantity = amount(row.cumExecQty, '成交数量', 'nonnegative');
       if (cmp(quantity, request.quantity) !== 0 || cmp(filledQuantity, quantity) > 0) throw new ShapeError('委托回报数量无效');
@@ -243,7 +246,7 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
       const averagePrice = isZero(filledQuantity) ? null : optionalPrice(row.avgPrice, '成交均价');
       if (!isZero(filledQuantity) && averagePrice === null) throw new ShapeError('有成交但没有成交均价');
       return {
-        clientOrderId: request.clientOrderId, remoteId: checkedOrderId(row.orderId, remoteId), symbol: request.symbol, side: request.side, quantity, filledQuantity, averagePrice,
+        clientOrderId: request.clientOrderId, remoteId: id, symbol: request.symbol, side: request.side, quantity, filledQuantity, averagePrice,
         status, terminal: Object.hasOwn(ORDER_TERMINAL, statusText), updatedAt: millis(row.updatedTime ?? row.createdTime, '委托更新时间'),
       };
     } catch (error) {
@@ -465,7 +468,7 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
       return { venue: 'bybit', accountId, positionModes, positions, openOrders, receivedAt: now() };
     }),
 
-    async place(binding: AccountBinding, request: OrderRequest, { signal, beforeSend, ackOnly }: PlaceOptions): Promise<OrderReport> {
+    async place(binding: AccountBinding, request: OrderRequest, { signal, beforeSend, ackOnly, positionMode }: PlaceOptions): Promise<OrderReport> {
       const refuse = (message: string): never => { throw new VenueError('not-sent', `Bybit 委托未发送：${message}`); };
       if (!VENUE_EXECUTION_SYMBOLS.bybit.includes(request.symbol)) refuse(`${request.symbol} 不是可执行合约`);
       if (!ORDER_LINK_ID.test(request.clientOrderId)) refuse('客户订单号格式无效');
@@ -476,6 +479,8 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
       if (request.type === 'limit' && request.limitPrice === null) refuse('限价单缺少价格');
       credentialsOf(binding, true);
       const idx = await sideChecked(binding, request.symbol, request.side, request.positionSide, request.reduceOnly, signal);
+      const mode = idx === 0 ? 'one-way' : 'hedge';
+      if (positionMode !== undefined && positionMode !== mode) refuse('持仓模式与已确认的委托不一致');
       const body = {
         category: 'linear', symbol: request.symbol, side: sideText(request.side), orderType: request.type === 'market' ? 'Market' : 'Limit', qty: request.quantity,
         ...(request.type === 'limit' ? { price: request.limitPrice, timeInForce: request.timeInForce === 'ioc' ? 'IOC' : 'GTC' } : {}),
@@ -492,27 +497,28 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
       let row: unknown = null;
       try { row = await findOrder(binding, request, signal, remoteId); }
       catch (error) { if (!(error instanceof VenueError && error.kind === 'read-failed')) throw error; }
-      return row === null ? receipt : orderReport(row, request, 'uncertain', remoteId);
+      return row === null ? receipt : orderReport(row, request, 'uncertain', remoteId, mode);
     },
 
-    async query(binding: AccountBinding, request: OrderRequest, { signal, remoteId }: OrderLookupOptions): Promise<OrderReport | null> {
+    async query(binding: AccountBinding, request: OrderRequest, { signal, remoteId, positionMode }: OrderLookupOptions): Promise<OrderReport | null> {
       if (!VENUE_EXECUTION_SYMBOLS.bybit.includes(request.symbol)) throw new VenueError('read-failed', `${request.symbol} 不是可执行合约`);
       const row = await findOrder(binding, request, signal, remoteId);
-      return row === null ? null : orderReport(row, request, 'read-failed', remoteId);
+      return row === null ? null : orderReport(row, request, 'read-failed', remoteId, positionMode);
     },
 
-    async cancel(binding: AccountBinding, request: OrderRequest, { signal, beforeSend, remoteId }: SendOptions & OrderLookupOptions): Promise<OrderReport> {
+    async cancel(binding: AccountBinding, request: OrderRequest, { signal, beforeSend, remoteId, positionMode }: SendOptions & OrderLookupOptions): Promise<OrderReport> {
       if (!VENUE_EXECUTION_SYMBOLS.bybit.includes(request.symbol) || !ORDER_LINK_ID.test(request.clientOrderId)) throw new VenueError('not-sent', 'Bybit 撤单未发送：合约或客户订单号无效');
       const ack = await signed(binding, 'POST', '/v5/order/cancel', { category: 'linear', symbol: request.symbol, ...orderKey(request, remoteId) }, { signal, beforeSend });
-      if (ack.orderLinkId !== request.clientOrderId) throw new VenueError('uncertain', 'Bybit 撤单回执的客户订单号与请求不一致');
       let canceledId: string;
       try { canceledId = checkedOrderId(ack.orderId, remoteId); }
       catch (error) { throw new VenueError('uncertain', `Bybit 撤单回执无法使用：${describe(error)}`); }
+      if (ack.orderLinkId) checkOrderOwner(canceledId, ack.orderLinkId, remoteId, request.clientOrderId, 'uncertain');
+      if (ack.orderLinkId !== request.clientOrderId) throw new VenueError('uncertain', 'Bybit 撤单回执的客户订单号与请求不一致');
       // The cancel answers only an acknowledgement; without a readable order the outcome stays open and is read again later.
       let row: unknown;
       try { row = await findOrder(binding, request, signal, canceledId); } catch (error) { throw new VenueError('uncertain', `Bybit 撤单已受理，委托回报读取失败：${describe(error)}`); }
       if (row === null) throw new VenueError('uncertain', 'Bybit 撤单已受理，但查不到该委托');
-      return orderReport(row, request, 'uncertain', canceledId);
+      return orderReport(row, request, 'uncertain', canceledId, positionMode);
     },
 
     async placeChase(binding: AccountBinding, request: StrategyRequest, { signal, beforeSend }: SendOptions): Promise<StrategyAck> {

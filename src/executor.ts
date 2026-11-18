@@ -8,7 +8,7 @@ import {
   type AccountBinding, type BatchIntent, type NotionalLimits, type AccountSnapshot, type Action, type Environment, type FourLegIntent, type Instrument, type LegOrderType, type Market, type OrderSide, type PairIntent, type PositionSide, type Quote, type RebalanceIntent, type TransferConfig, type Venue,
 } from './contracts.ts';
 import {
-  STRATEGY_ID, VenueError, parseOrderReport, parseStrategyAck, parseStrategyReport, strategyRequestOf, supportsChase,
+  STRATEGY_ID, OrderOwnerConflict, VenueError, parseOrderReport, parseStrategyAck, parseStrategyReport, strategyRequestOf, supportsChase,
   type ChaseConnector, type ChaseRequest, type OrderReport, type OrderRequest, type StrategyIdentity, type StrategyReport, type StrategyStatus, type TransferConnector, type VenueConnector,
 } from './connector.ts';
 import type { Store } from './store.ts';
@@ -268,7 +268,7 @@ export interface Operation {
   adoptedAt?: number | null;
   /** Strategy only: last read that showed remoteId names this create. Only such an id is ever stopped. */
   identityVerifiedAt?: number | null;
-  /** Strategy only: a later read of a verified id described another strategy; nothing more is sent to it. */
+  /** The known venue ID was attributed to another order or strategy. Further writes require manual resolution. */
   identityMismatchAt?: number | null;
   /** Strategy only: a person released a create without an answer, accepting that it may have executed; it stays unknown and is never adopted or resent. */
   releasedAt?: number | null;
@@ -1596,7 +1596,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     };
     try {
       if (request.type === 'chase') strategyId = parseStrategyAck(await callVenue('write', signal => chaseConnector(leg.venue).placeChase(binding, strategyRequestOf(request), { signal, beforeSend }))).strategyId;
-      else report = parseOrderReport(await callVenue('write', signal => connectorFor(leg.venue).place(binding, request, { signal, beforeSend, ackOnly: true })), request);
+      else report = parseOrderReport(await callVenue('write', signal => connectorFor(leg.venue).place(binding, request, { signal, beforeSend, ackOnly: true, positionMode: leg.positionMode })), request);
     } catch (error) { failure = error; }
     const ackAt = now();
     if (strategyId !== null) {
@@ -1702,15 +1702,17 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     // Reconciling on another principal could find nothing and wrongly conclude not-created.
     if (!row || row.account_key !== leg.accountKey) { write(() => { const current = readOp(op.id); current.note = '账户绑定已变化，暂停核对'; saveOp(current); }); return; }
     if (isStrategy(op)) return reconcileStrategy(job, op, bindingOf(row));
+    if (op.identityMismatchAt != null) return;
     const binding = bindingOf(row), startedAt = now(), request = op.request as OrderRequest;
     let report: OrderReport | null;
     try {
-      const value = await callVenue('read', signal => connectorFor(op.venue).query(binding, request, { signal, remoteId: op.remoteId }));
+      const value = await callVenue('read', signal => connectorFor(op.venue).query(binding, request, { signal, remoteId: op.remoteId, positionMode: leg.positionMode }));
       report = value === null ? null : parseOrderReport(value, request, op.remoteId);
     }
     catch (error) {
       write(() => {
         const current = readOp(op.id);
+        if (error instanceof OrderOwnerConflict) return holdOrderOwnerConflict(job, current);
         current.note = `核对读取失败：${error instanceof Error ? error.message.slice(0, 160) : '未知'}`; current.lastCheckedAt = now();
         // Misses must be consecutive answers; a failed read in between starts the count again.
         if (current.state === 'unknown') { current.absentChecks = 0; current.absentAt = null; }
@@ -1821,6 +1823,16 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       if (!FINAL_JOB.has(latest.status)) finish(latest, 'attention', `${VENUE_NAMES[current.venue]} 追价策略编号 ${strategyId} 的查询回报与本委托身份不一致，不对其发送停止；需人工核对`);
     });
   }
+  /** Inside a write: keep the original receipt and stop both new exposure and cancels targeting the disputed ID. */
+  function holdOrderOwnerConflict(job: Job, op: Operation): void {
+    if (SETTLED.has(op.state) || op.identityMismatchAt != null) return;
+    op.identityMismatchAt = op.lastCheckedAt = now();
+    op.note = `${VENUE_NAMES[op.venue]} 原交易所委托编号 ${op.remoteId} 返回另一客户订单号，已暂停自动查撤，需人工核对`;
+    saveOp(op);
+    event(job.id, 'order-identity-mismatch', { op: op.id });
+    const latest = readJob(job.id);
+    if (!FINAL_JOB.has(latest.status)) finish(latest, 'attention', op.note);
+  }
   /**
    * Inside a write. An id no read has verified did not name this create, which is then as unknown as one without an
    * answer: it holds the job for a person exactly like that one, so the job cannot be acknowledged until it is resolved.
@@ -1842,10 +1854,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   const cancelDue = (op: Operation): boolean => op.cancelSent < budgets.cancelAttempts && (op.cancelRequestedAt === null || now() - op.cancelRequestedAt >= budgets.cancelRetryMs);
   /** For a strategy this is a stop, which only proves the venue accepted it; the strategy is read again whatever the answer. */
   async function cancel(job: Job, op: Operation, reason?: string): Promise<void> {
-    if (!cancelDue(op)) return;
+    if (!cancelDue(op) || op.identityMismatchAt != null) return;
     const strategyId = isStrategy(op) ? op.remoteId : undefined;
     // Checked here too, so no caller can stop a strategy id that no read has shown to be this create's.
-    if (strategyId === null || (strategyId !== undefined && (op.identityVerifiedAt == null || op.identityMismatchAt != null))) return;
+    if (strategyId === null || (strategyId !== undefined && op.identityVerifiedAt == null)) return;
     const leg = legAt(job, op.leg), binding = job.fourLegQuantityIssue ? bindingStillValid(leg) : bindingOf(accountFor(leg.venue) ?? reject('account_missing', '账户绑定缺失，保留待核对', 409));
     const seq = (op.cancelSeq ?? 0) + 1;
     let stopFailed: string | null = null;
@@ -1880,7 +1892,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
           outcome = 'confirmed';
         } else {
           const request = op.request as OrderRequest;
-          const report = parseOrderReport(await callVenue('write', signal => connectorFor(op.venue).cancel(binding, request, { signal, beforeSend, remoteId: op.remoteId })), request, op.remoteId);
+          const report = parseOrderReport(await callVenue('write', signal => connectorFor(op.venue).cancel(binding, request, { signal, beforeSend, remoteId: op.remoteId, positionMode: leg.positionMode })), request, op.remoteId);
           write(() => { const current = readOp(op.id); if (SETTLED.has(current.state)) return; applyReport(current, report); saveOp(current); });
           outcome = 'confirmed';
         }
@@ -1890,6 +1902,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         stopFailed = note;
         write(() => {
           const current = readOp(op.id);
+          if (error instanceof OrderOwnerConflict) return holdOrderOwnerConflict(job, current);
           if (error instanceof VenueError && error.kind === 'not-sent') current.cancelSent -= 1;
           current.note = note; saveOp(current);
         });
@@ -2442,7 +2455,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
           previewQuote: { bid: leg.quote.bid, ask: leg.quote.ask },
           attempts: mine.length, filledQuantity,
           operation: op ? { kind: op.kind ?? 'order', clientOrderId: op.clientOrderId, state: op.state, quantity: op.request?.quantity ?? '无效', limitPrice: (op.request as { limitPrice?: string | null })?.limitPrice ?? null, filledQuantity: op.filledQuantity, averagePrice: op.averagePrice, remoteId: op.remoteId,
-            venueStatus: op.venueStatus ?? null, verifiedWorking: op.verifiedWorking === true, strategyStatus: op.identityVerifiedAt != null && op.identityMismatchAt == null ? op.strategyStatus ?? null : null,
+            venueStatus: op.venueStatus ?? null, verifiedWorking: op.verifiedWorking === true && op.identityMismatchAt == null, strategyStatus: op.identityVerifiedAt != null && op.identityMismatchAt == null ? op.strategyStatus ?? null : null,
             childrenSettled: op.childrenSettled ?? null, adoptedAt: op.adoptedAt ?? null, releasedAt: op.releasedAt ?? null, ackStrategyId: op.ackStrategyId ?? null, note: op.note } : null };
       }),
       events,

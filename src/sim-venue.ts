@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { add, cmp, fromUnits, isMultiple, mul, sub, units } from './decimal.ts';
 import { VENUE_READ_SYMBOLS, type AccountBinding, type AccountSnapshot, type Instrument, type Quote, type Venue, type PositionSide } from './contracts.ts';
 import {
-  VenueError, type CallOptions, type ConnectorCapabilities, type LedgerEntry, type OrderReport, type PnlSnapshot, type OrderRequest, type SendOptions, type StrategyAck, type StrategyReport, type StrategyRequest, type StrategyStatus, type VenueConnector,
+  VenueError, checkOrderOwner, type CallOptions, type ConnectorCapabilities, type LedgerEntry, type OrderLookupOptions, type OrderReport, type PlaceOptions, type PnlSnapshot, type OrderRequest, type SendOptions, type StrategyAck, type StrategyReport, type StrategyRequest, type StrategyStatus, type VenueConnector,
 } from './connector.ts';
 
 export type Operation = 'instrument' | 'quote' | 'account' | 'pnl' | 'ledger' | 'place' | 'query' | 'cancel' | 'strategy-place' | 'strategy-query' | 'strategy-stop' | 'strategy-list';
@@ -25,7 +25,7 @@ export type FaultMode = 'reject' | 'not-sent' | 'lost-request' | 'lost-response'
 export interface Fault { operation: Operation; mode: FaultMode; times?: number; filled?: string; clientOrderId?: string; strategyId?: string }
 
 interface Book { bid: string; ask: string; ageMs: number; complete: boolean; sequence: number }
-interface SimOrder { request: OrderRequest; accountId: string; remoteId: string; filled: string; notional: string; status: OrderReport['status']; updatedAt: number }
+interface SimOrder { request: OrderRequest; accountId: string; positionMode: 'one-way' | 'hedge'; remoteId: string; filled: string; notional: string; status: OrderReport['status']; updatedAt: number }
 interface SimStrategy { id: string; accountId: string; request: StrategyRequest; filled: string; notional: string; status: StrategyStatus; childrenSettled: boolean; lagQueries: number; createdAt: number; updatedAt: number }
 /** costs: the entry value (quantity × entry price) of each position, for the PnL reads; ledger: its fills' realized PnL and fees, and injected funding. */
 interface SimAccount { accountId: string; positionModes: Record<string, 'one-way' | 'hedge'>; positions: Map<string, string>; costs: Map<string, string>; ledger: LedgerEntry[]; foreignOrders: { symbol: string; remoteId: string }[] }
@@ -219,8 +219,10 @@ export class SimulatedVenue implements VenueConnector {
     this.enter('ledger', signal); this.readFault('ledger');
     return this.requireAccount(binding.accountId).ledger.filter(entry => entry.symbol === symbol && entry.time >= window.from && entry.time <= window.to).map(entry => ({ ...entry }));
   }
-  async place(binding: AccountBinding, request: OrderRequest, { signal, beforeSend }: SendOptions): Promise<OrderReport> {
+  async place(binding: AccountBinding, request: OrderRequest, { signal, beforeSend, positionMode }: PlaceOptions): Promise<OrderReport> {
     this.enter('place', signal);
+    const account = this.requireAccount(binding.accountId), mode = account.positionModes[request.symbol];
+    if (positionMode !== undefined && positionMode !== mode) throw new VenueError('not-sent', '模拟持仓模式与委托不一致');
     try { beforeSend(); } catch (error) { throw new VenueError('not-sent', `发送前守卫拒绝：${(error as Error).message}`); }
     const fault = this.takeFault('place', request.clientOrderId);
     if (fault?.mode === 'not-sent') throw new VenueError('not-sent', '模拟本地限流，未发送');
@@ -229,7 +231,7 @@ export class SimulatedVenue implements VenueConnector {
       this.arrived.place++;
       const existing = this.orders.get(request.clientOrderId);
       if (existing) throw new VenueError('rejected', '客户订单号重复');
-      const account = this.requireAccount(binding.accountId), instrument = this.instruments.get(request.symbol), book = this.books.get(request.symbol);
+      const instrument = this.instruments.get(request.symbol), book = this.books.get(request.symbol);
       if (!instrument || !book || !isMultiple(request.quantity, instrument.quantityStep)) throw new VenueError('rejected', '数量或合约无效');
       if (request.reduceOnly && cmp(request.quantity, account.positions.get(`${request.symbol}:${request.positionSide}`) ?? '0') > 0) throw new VenueError('rejected', '只减仓数量超过持仓');
       // An opening order below the minimum notional is refused, like Binance -4164 and Bybit 110094.
@@ -238,7 +240,7 @@ export class SimulatedVenue implements VenueConnector {
       const crossing = request.type === 'market' || (request.side === 'buy' ? cmp(request.limitPrice as string, book.ask) >= 0 : cmp(request.limitPrice as string, book.bid) <= 0);
       // Post-only that would take liquidity is refused like Binance -5022 and never recorded.
       if (request.timeInForce === 'gtx' && (!this.capabilities.postOnly || crossing)) throw new VenueError('rejected', '只挂单会立即成交，交易所拒绝');
-      const order: SimOrder = { request: { ...request }, accountId: account.accountId, remoteId: `${this.venue}-${this.nextRemote++}`, filled: '0', notional: '0', status: 'new', updatedAt: this.clock() };
+      const order: SimOrder = { request: { ...request }, accountId: account.accountId, positionMode: mode, remoteId: `${this.venue}-${this.nextRemote++}`, filled: '0', notional: '0', status: 'new', updatedAt: this.clock() };
       this.orders.set(request.clientOrderId, order);
       const takerPrice = request.side === 'buy' ? book.ask : book.bid;
       if (crossing) {
@@ -249,23 +251,31 @@ export class SimulatedVenue implements VenueConnector {
       return this.report(order);
     }, fault);
   }
-  async query(_binding: AccountBinding, request: OrderRequest, { signal }: CallOptions): Promise<OrderReport | null> {
-    this.enter('query', signal);
+  private findOrder(binding: AccountBinding, request: OrderRequest, { remoteId, positionMode }: OrderLookupOptions, kind: 'read-failed' | 'uncertain'): SimOrder | undefined {
+    let order = this.orders.get(request.clientOrderId);
+    if (remoteId != null && order?.remoteId !== remoteId) order = [...this.orders.values()].find(item => item.remoteId === remoteId);
+    if (!order || order.accountId !== binding.accountId || order.request.symbol !== request.symbol) return;
+    checkOrderOwner(order.remoteId, order.request.clientOrderId, remoteId, request.clientOrderId, kind);
+    if (positionMode !== undefined && order.positionMode !== positionMode) throw new VenueError(kind, '模拟委托回报持仓模式不一致');
+    return order;
+  }
+  async query(binding: AccountBinding, request: OrderRequest, options: OrderLookupOptions): Promise<OrderReport | null> {
+    this.enter('query', options.signal);
     const fault = this.takeFault('query', request.clientOrderId);
     if (fault?.mode === 'read-fail') throw new VenueError('read-failed', '模拟查询失败');
-    const order = this.orders.get(request.clientOrderId);
-    if (!order || fault?.mode === 'not-found') return null;
-    return this.report(order);
+    if (fault?.mode === 'not-found') return null;
+    const order = this.findOrder(binding, request, options, 'read-failed');
+    return order ? this.report(order) : null;
   }
-  async cancel(_binding: AccountBinding, request: OrderRequest, { signal, beforeSend }: SendOptions): Promise<OrderReport> {
-    this.enter('cancel', signal);
-    try { beforeSend(); } catch (error) { throw new VenueError('not-sent', `发送前守卫拒绝：${(error as Error).message}`); }
+  async cancel(binding: AccountBinding, request: OrderRequest, options: SendOptions & OrderLookupOptions): Promise<OrderReport> {
+    this.enter('cancel', options.signal);
+    try { options.beforeSend(); } catch (error) { throw new VenueError('not-sent', `发送前守卫拒绝：${(error as Error).message}`); }
     const fault = this.takeFault('cancel', request.clientOrderId);
     if (fault?.mode === 'not-sent') throw new VenueError('not-sent', '模拟本地限流，未发送');
     if (fault?.mode === 'reject') { this.arrived.cancel++; throw new VenueError('rejected', '模拟交易所拒绝撤单'); }
     return this.answer(() => {
       this.arrived.cancel++;
-      const order = this.orders.get(request.clientOrderId);
+      const order = this.findOrder(binding, request, options, 'uncertain');
       if (!order) throw new VenueError('rejected', '委托不存在');
       if (!TERMINAL.has(order.status)) { order.status = 'canceled'; order.updatedAt = this.clock(); }
       return this.report(order);

@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { ContractError } from '../src/contracts.ts';
 import { createExecutor } from '../src/executor.ts';
+import { OrderOwnerConflict, type OrderRequest } from '../src/connector.ts';
+import { SIM_BINDINGS } from '../src/simulation.ts';
 import { openStore } from '../src/store.ts';
 import { SESSION, bindAccounts, createHarness, openIntent, previewAndConfirm, settle, type Harness } from './harness.ts';
 
@@ -12,6 +14,21 @@ async function withHarness(run: (h: Harness) => Promise<void>, options?: Paramet
   try { await run(h); } finally { h.dispose(); }
 }
 const opState = (h: Harness, jobId: string, leg: 0 | 1) => h.ex.jobView(jobId).legs[leg].operation?.state ?? null;
+
+test('模拟交易所按原交易所编号查撤，客户号改指另一单时两单各自核实', () => withHarness(async h => {
+  const request: OrderRequest = { clientOrderId: 'first', symbol: 'CLUSDT', side: 'buy', positionSide: 'long', quantity: '1', type: 'limit', limitPrice: '68', reduceOnly: false };
+  const second = { ...request, clientOrderId: 'second' };
+  const options = { signal: new AbortController().signal, beforeSend() {} }, binding = SIM_BINDINGS[0];
+  const first = await h.binance.place(binding, request, options);
+  const other = await h.binance.place(binding, second, options);
+  h.binance.orders.set(first.remoteId, h.binance.orders.get(request.clientOrderId)!);
+  h.binance.orders.set(request.clientOrderId, h.binance.orders.get(second.clientOrderId)!);
+  await assert.rejects(h.binance.cancel(binding, request, { ...options, remoteId: other.remoteId }), OrderOwnerConflict);
+  const original = { ...options, remoteId: first.remoteId };
+  assert.equal((await h.binance.query(binding, request, original))?.status, 'new');
+  assert.equal((await h.binance.cancel(binding, request, original)).remoteId, first.remoteId);
+  assert.deepEqual([h.binance.orders.get(first.remoteId)?.status, h.binance.orders.get(second.clientOrderId)?.status], ['canceled', 'new']);
+}));
 
 test('正常双腿：预览不下单，确认后先发首腿，按成交量对冲并完成', () => withHarness(async h => {
   bindAccounts(h.ex);

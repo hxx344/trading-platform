@@ -131,6 +131,8 @@ test('OKX 连接器：单向持仓发 posSide net 与 reduceOnly，市价 market
   venue.posMode = 'long_short_mode';
   venue.fill = 'full';
   const hedge = setup(fake => { fake.posMode = 'long_short_mode'; });
+  await assert.rejects(hedge.connector.place(binding(), order(), { ...send(), positionMode: 'one-way' }), kind('not-sent'));
+  assert.equal(hedge.venue.count('POST /api/v5/trade/order'), 0);
   await hedge.connector.place(binding(), order({ clientOrderId: 'pa1-0123456789abcdef01234567-0r2', side: 'sell', positionSide: 'short' }), send());
   assert.deepEqual(hedge.venue.last('POST /api/v5/trade/order').body, { instId: 'CL-USDT-SWAP', tdMode: 'cross', clOrdId: 'pa10123456789abcdef012345670r2', side: 'sell', posSide: 'short', ordType: 'ioc', sz: '20', px: '70.5' });
   await assert.rejects(hedge.connector.place(binding(), order({ clientOrderId: 'pa1-0123456789abcdef01234567-0r3', side: 'sell', positionSide: 'long', reduceOnly: false }), send()), kind('not-sent', /只减仓标记与仓位方向不一致/));

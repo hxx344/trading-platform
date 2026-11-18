@@ -12,6 +12,8 @@
 
 当前连接收到空侧、格式或时间异常的完整盘口时，立即使原盘口和已排队委托的发送许可失效，并撤回失去保护的开仓单。空侧快照的交易所时间有效时，恢复报价须等到交易所时间严格晚于它的完整盘口，重连后也沿用这个时间。已作废的委托由挂单引擎重新评估。公开 REST 查询取消后会退出限流队列或中止已发出的读取。
 
+观察模式按交易所时间回放有效的深度、空侧快照和逐笔成交。允许时间窗内的迟到盘口可用于还原虚拟挂单的有效时长和扫单次数。连接中断前已结束的观察区间不会重开。
+
 - 对照的工作台代码：`project-aggregation` main `7745181`，即 `server/automation/ondo-mm.mjs`、`server/trading-ondo-{client,quote,stream}.mjs`、`server/exchange-transport/ondo.mjs` 和页面 `src/OndoMarketMakerPage.tsx`。
 - 首发版本 v0.60.0；出问题回退 v0.59.0，做法见第 9 节。
 

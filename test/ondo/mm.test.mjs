@@ -83,7 +83,7 @@ function fixture(options = {}) {
 }
 const status = code => error => error.status === code;
 
-function splitMakerFixture(t) {
+function splitMakerFixture(t, observeTrades = false) {
   const link = { callbacks: null, top: null, privateOptions: null, lease: 'first', generation: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', topGeneration: 'cccccccc-cccc-cccc-cccc-cccccccccccc', expired: 0, frame: null };
   const market = { epoch: () => link.lease, stream(op, request, listener) {
     if (op === 'ondo.top') {
@@ -92,7 +92,7 @@ function splitMakerFixture(t) {
       return () => {};
     }
     assert.equal(op, 'ondo.public');
-    assert.deepEqual(request, { markets: [MARKET], depth: 50, trades: false, metrics: true });
+    assert.deepEqual(request, { markets: [MARKET], depth: 50, trades: observeTrades, metrics: true });
     link.callbacks = listener; listener.data({ type: 'ready', generation: link.generation, at: f.time });
     return () => {};
   } };
@@ -233,6 +233,40 @@ test('observe mode computes quotes and sends nothing', async () => {
   assert.equal(stopped.observation.rows.find(row => row.side === 'buy' && row.distanceBps === 4).sweeps, 1);
   f.time += 60_000;
   assert.deepEqual(mm.state().observation, stopped.observation);
+});
+
+test('market IPC observation replays a late depth around an empty side at venue time and preserves the next sweep', async t => {
+  async function replay(split, reconnect) {
+    const { f, v, mm, count, link } = split ? splitMakerFixture(t, true) : fixture();
+    if (!split) t.after(() => mm.close(0));
+    mm.initialize(); mm.save(config({ mode: 'observe' }));
+    await mm.start({ revision: mm.state().revision });
+    const start = f.time;
+    for (const [arrival, source, bids] of [[0, 0, BIDS], [20, 20, []], [30, 30, BIDS], [32, 10, BIDS]]) {
+      f.time = start + arrival; f.push(bids, ASKS, start + source);
+      if (reconnect && source === 20) {
+        f.time++;
+        if (split) {
+          link.callbacks.down(); link.lease = 'second'; link.generation = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+          link.callbacks.data({ type: 'ready', generation: link.generation, at: f.time });
+        } else f.stream.onDown();
+      }
+    }
+    f.time = start + 40;
+    const trade = { id: 'recovered-buy', time: f.time, price: u('199.90'), aggressorSide: 'sell' };
+    if (split) link.callbacks.data({ type: 'trade', generation: link.generation, market: MARKET, at: f.time,
+      trade: { ...trade, price: trade.price.toString() } });
+    else f.stream.onTrade(MARKET, trade, f.time);
+    const view = await mm.stop();
+    const row = view.observation.rows.find(item => item.side === 'buy' && item.distanceBps === 4);
+    assert.equal(v.calls.length, count('markets'));
+    return [row.activeMs, row.touches, row.sweeps];
+  }
+  for (const reconnect of [false, true]) {
+    const direct = await replay(false, reconnect);
+    assert.deepEqual(direct, [30, 1, 1]);
+    assert.deepEqual(await replay(true, reconnect), direct);
+  }
 });
 
 test('parallel observation subscribes listed and trading markets on one public feed without changing trading configuration', async () => {

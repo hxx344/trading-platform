@@ -37,6 +37,7 @@ export function remoteOndoClient(market: MarketClient, options?: Parameters<type
 /** Joins two independent lifetimes. A public outage invalidates every book while the private socket still receives fills. */
 export function remoteOndoStream(market: MarketClient, options: OndoStreamOptions, privateFactory: OndoStreamFactory = createOndoStream) {
   const { markets, onBook, onTrade, onDown, latency, now = Date.now, depth = 50 } = options;
+  const observing = !options.credentials && !!onTrade;
   const wanted = new Set(markets), previousSource = new Map<string, number>(), obsoleteThrough = new Map<string, number>();
   let generation: string | null = null, lease: string | null = null, since = 0, lastAt: number | null = null, closed = false;
   let error: string | null = null, unsubscribe: (() => void) | undefined;
@@ -66,13 +67,18 @@ export function remoteOndoStream(market: MarketClient, options: OndoStreamOption
       let book = null;
       if (timestamp(at) && at >= since && at <= received && received - at <= 1500) {
         try { book = unpackBook(msg.book, depth); } catch { /* A malformed snapshot revokes protection immediately. */ }
-        if (book && (book.time <= (obsoleteThrough.get(name) ?? 0)
-          || !onTrade && book.time < (previousSource.get(name) ?? 0)
+        if (book && book.time <= (obsoleteThrough.get(name) ?? 0)) {
+          // Replayed depth from before a disconnect must not close a newer observation interval.
+          if (observing) return;
+          book = null;
+        }
+        if (book && (!observing && book.time < (previousSource.get(name) ?? 0)
           || book.time > at + 1500 || received - book.time > 10000)) book = null;
       }
       if (book && timestamp(at)) {
         previousSource.set(name, Math.max(previousSource.get(name) ?? 0, book.time));
-        if (book.bids.length && book.asks.length) {
+        // Observation replays even an empty side at its venue time alongside trades that can arrive out of order.
+        if (observing || book.bids.length && book.asks.length) {
           lastAt = Math.max(lastAt ?? 0, at);
           onBook(name, book, at);
           return;

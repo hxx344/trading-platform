@@ -19,6 +19,7 @@
 | 行情监控（含海力士溢价监控与告警） | [docs/monitor.md](docs/monitor.md) |
 | 资产账本 | [docs/asset.md](docs/asset.md) |
 | 页面在线更新（系统更新）、`trading-platform-update.*` 单元、`update-helper.ts` | [docs/update.md](docs/update.md) |
+| 只读 MCP 接入、只读接口令牌 | [docs/mcp.md](docs/mcp.md) |
 | 副服务器巡检（main-watch）、心跳推送、`install-watch.sh` | [docs/watch.md](docs/watch.md) |
 | 真实账户上已核实与待实测的事项 | [docs/live-results.md](docs/live-results.md)、[docs/plan.md](docs/plan.md) 第 6 节 |
 | 新模块的启用与数据迁移（一律做进设置页「从工作台导入」面板及其命令行，不要求用户手改 `config.json`） | [docs/module-import.md](docs/module-import.md) |

@@ -270,7 +270,11 @@ test('position details retain the venue entry price, accept explicit neutral zer
 
 test('a cancel waits out a shorter, bounded part of a cooldown, and its own 429 is counted once per burst', async () => {
   const ok = () => json({ success: true, result: order({ status: 'canceled' }) });
-  const { client, calls, clock } = fixture([json({}, 429, { 'Retry-After': '120' }), ok(), json({}, 429), json({}, 429), ok()]);
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const held = async () => { await gate; return json({}, 429); };
+  const turn = () => new Promise(resolve => setImmediate(resolve));
+  const { client, calls, clock } = fixture([json({}, 429, { 'Retry-After': '120' }), ok(), held, held, ok()]);
   await assert.rejects(client.positions(), rejected('rate_limited'));
   clock.now += 14_999;
   await assert.rejects(client.cancel('abc123'), rejected('rate_limited'));
@@ -279,8 +283,10 @@ test('a cancel waits out a shorter, bounded part of a cooldown, and its own 429 
   await assert.rejects(client.place({ market: 'NVDA-USD.P', side: 'buy', price: '1', size: '1', clientOrderId: 'a' }), rejected('rate_limited'));
   await assert.rejects(client.openOrders(), rejected('rate_limited'));
   assert.equal(calls.length, 2);
-  // Two cancels sent together are both refused: one strike, the next cancel may go after 2 s.
-  const pair = await Promise.allSettled([client.cancel('abc123'), client.cancel('abc124')]);
+  // Two cancels in flight together (requested in different turns, so not one batch) are both refused: one strike, the next cancel may go after 2 s.
+  const sent = [client.cancel('abc123')];
+  await turn(); sent.push(client.cancel('abc124')); await turn(); release();
+  const pair = await Promise.allSettled(sent);
   assert.ok(pair.every(result => result.status === 'rejected' && result.reason.code === 'rate_limited'));
   assert.equal(client.cooldownUntil(), EPOCH + 120_000);
   clock.now += 1999;
@@ -297,4 +303,117 @@ test('venue codes of any case are kept, lower-cased, and a 2xx write without a v
   assert.equal(await client.orderByClientId('a'), null);
   assert.equal(await client.orderByClientId('a'), null);
   await assert.rejects(client.place(input), rejected('invalid_data', { uncertain: true }));
+});
+
+const canceled = (id, extra = {}) => order({ orderId: id, clientOrderId: `omm-${id}`, status: 'canceled', ...extra });
+const batch = (successfulCancels, failedCancels = []) => json({ success: true, result: { successfulCancels, failedCancels } });
+const BATCH = 'https://api.ondoperps.xyz/v1/perps/orders/batch?orderIDs=';
+const cancelAll = (client, ids, expected = { market: 'NVDA-USD.P' }) => Promise.allSettled(ids.map(id => client.cancel(id, expected)));
+
+test('cancels requested together travel as one signed batch and each order gets its own answer', async () => {
+  const { client, calls } = fixture([batch(
+    [canceled('b2'), canceled('b1'), canceled('b5', { market: 'TSLA-USD.P' }), canceled('b6', { status: 'open' }), canceled('b8'), canceled('b8')],
+    [{ orderId: 'b3', error: `gone ${keys.keyId}`, errorCode: 'Order_Already_Fully_Filled' }, { orderId: 'b4', error: 'boom', errorCode: '' }])]);
+  const results = await cancelAll(client, ['b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8']);
+  assert.equal(calls.length, 1);
+  const { url, init } = calls[0];
+  assert.equal(url, `${BATCH}b1,b2,b3,b4,b5,b6,b7,b8`); assert.equal(init.method, 'DELETE'); assert.equal(init.body, undefined);
+  assert.equal(init.headers['ONDO-SIGN'], createHmac('sha256', keys.secret).update(`${EPOCH}DELETE/v1/perps/orders/batch?orderIDs=b1,b2,b3,b4,b5,b6,b7,b8`).digest('hex'));
+  assert.deepEqual(results.slice(0, 2).map(result => [result.value.id, result.value.status]), [['b1', 'canceled'], ['b2', 'canceled']]);
+  assert.ok(rejected('order_already_fully_filled', { uncertain: false })(results[2].reason));
+  assert.ok(!results[2].reason.message.includes(keys.keyId));
+  // No code, another market, a nonterminal status, not listed at all, listed twice: the outcome is unknown.
+  for (const result of results.slice(3)) assert.ok(rejected('invalid_data', { uncertain: true })(result.reason));
+  assert.equal(client.batchCancels(), true);
+});
+
+test('a batch refused as a whole is asked again one by one, and an unsupported batch ends batching for the client', async () => {
+  const refusal = code => json({ success: false, error_code: code }, 400);
+  const one = id => json({ success: true, result: canceled(id) });
+  const { client, calls } = fixture([refusal('order_not_found'), one('b1'), refusal('order_not_found'), batch([canceled('b3'), canceled('b4')]),
+    refusal('batch_cancel_too_many_orders'), one('b5'), one('b6'), one('b7'), one('b8')]);
+  const first = await cancelAll(client, ['b1', 'b2']);
+  assert.equal(first[0].value.id, 'b1'); assert.ok(rejected('order_not_found', { uncertain: false })(first[1].reason));
+  assert.deepEqual(calls.map(call => call.url.split('/orders/')[1]), ['batch?orderIDs=b1,b2', 'b1', 'b2']);
+  // One order's state refused that batch: the next one is still sent as a batch.
+  assert.equal(client.batchCancels(), true);
+  assert.ok((await cancelAll(client, ['b3', 'b4'])).every(result => result.status === 'fulfilled')); assert.equal(calls.length, 4);
+  assert.ok((await cancelAll(client, ['b5', 'b6'])).every(result => result.status === 'fulfilled'));
+  assert.equal(calls.length, 7); assert.equal(client.batchCancels(), false);
+  assert.ok((await cancelAll(client, ['b7', 'b8'])).every(result => result.status === 'fulfilled'));
+  assert.deepEqual(calls.slice(7).map(call => call.url.split('/orders/')[1]), ['b7', 'b8']);
+});
+
+test('a batch whose outcome was not read leaves every order unknown and is never sent again', async () => {
+  const { client, calls, clock } = fixture([new Error('connection lost'), json({}, 502), json({ success: false, error_code: 'unauthorized' }, 401),
+    json({}, 429), json({ success: true, result: { successfulCancels: {} } })]);
+  for (const code of ['network', 'upstream']) {
+    assert.ok((await cancelAll(client, ['b1', 'b2'])).every(result => rejected(code, { uncertain: true })(result.reason)), code);
+  }
+  assert.ok((await cancelAll(client, ['b1', 'b2'])).every(result => rejected('unauthorized', { uncertain: false, status: 401 })(result.reason)));
+  assert.ok((await cancelAll(client, ['b1', 'b2'])).every(result => rejected('rate_limited', { uncertain: false })(result.reason)));
+  assert.equal(calls.length, 4); assert.equal(client.batchCancels(), true);
+  clock.now += 2000;
+  // The venue said success in a shape that names no order: unknown, and later cancels go one by one.
+  assert.ok((await cancelAll(client, ['b1', 'b2'])).every(result => rejected('invalid_data', { uncertain: true })(result.reason)));
+  assert.equal(calls.length, 5); assert.equal(client.batchCancels(), false);
+});
+
+test('a batch holds at most twenty distinct valid ids; a lone, repeated or invalid one keeps the single request', async () => {
+  const ids = Array.from({ length: 21 }, (_, index) => `c${index + 1}`);
+  const many = fixture([batch(ids.slice(0, 20).map(id => canceled(id))), json({ success: true, result: canceled('c21') })], { rps: 2 });
+  assert.ok((await cancelAll(many.client, ids)).every(result => result.status === 'fulfilled'));
+  assert.deepEqual(many.calls.map(call => call.url.split('/orders/')[1]), [`batch?orderIDs=${ids.slice(0, 20).join(',')}`, 'c21']);
+  const { client, calls } = fixture([json({ success: true, result: canceled('b1') }), json({ success: false, error_code: 'order_already_canceled' }, 400)]);
+  const results = await Promise.allSettled([client.cancel('bad id'), client.cancel('b1'), client.cancel('b1')]);
+  assert.ok(results[0].reason instanceof TypeError); assert.equal(results[1].value.id, 'b1');
+  assert.ok(rejected('order_already_canceled')(results[2].reason));
+  assert.deepEqual(calls.map(call => call.url.split('/orders/')[1]), ['b1', 'b1']);
+});
+
+test('a batch cancel is timed once per order and its queue wait once per market', async () => {
+  let mono = 0;
+  const markets = ['NVDA-USD.P', 'TSLA-USD.P'], now = () => EPOCH + mono;
+  const latency = createOndoLatency({ markets, mode: 'live', startedAt: EPOCH, now, monotonicNow: () => mono });
+  const client = createOndoClient({ credentials: keys, rps: 10, now, latency, fetchImpl: async () => {
+    mono += 9;
+    return batch([canceled('b1'), canceled('b2'), canceled('b3', { market: markets[1], filledSize: '0.1' })]);
+  } });
+  await Promise.all([client.cancel('b1', { market: markets[0] }), client.cancel('b2', { market: markets[0] }), client.cancel('b3', { market: markets[1] })]);
+  const [a, b] = latency.snapshot().markets;
+  assert.deepEqual([a.cancelAck.n, a.cancelAck.lastMs, a.restQueue.n], [2, 9, 1]);
+  // A cancel that reports a fill is not a clean acknowledgement.
+  assert.deepEqual([b.cancelAck.n, b.cancelAck.failed, b.restQueue.n], [0, 1, 1]);
+  client.close();
+});
+
+test('a batch answered with a code but no 4xx, re-signed, or cut off by close keeps every order honest', async () => {
+  // HTTP 200 with a code names no order: it must not become every order's "already filled".
+  const vague = fixture([json({ success: false, error_code: 'order_already_fully_filled' })]);
+  assert.ok((await cancelAll(vague.client, ['b1', 'b2'])).every(result => rejected('invalid_data', { uncertain: true })(result.reason)));
+  assert.equal(vague.calls.length, 1); assert.equal(vague.client.batchCancels(), false);
+  const blank = fixture([json({ success: false })]);
+  assert.ok((await cancelAll(blank.client, ['b1', 'b2'])).every(result => rejected('invalid_data', { uncertain: true })(result.reason)));
+  assert.equal(blank.client.batchCancels(), false);
+
+  let mono = 0;
+  const market = 'NVDA-USD.P', now = () => EPOCH + mono;
+  const latency = createOndoLatency({ markets: [market], mode: 'live', startedAt: EPOCH, now, monotonicNow: () => mono });
+  const replies = [json({ success: false, error_code: 'invalid_timestamp' }, 400, { Date: new Date(EPOCH + 30_000).toUTCString() }), batch([canceled('b1'), canceled('b2')])];
+  const stamps = [];
+  const client = createOndoClient({ credentials: keys, rps: 10, now, latency, fetchImpl: async (_, init) => { mono += 5; stamps.push(init.headers['ONDO-TIMESTAMP']); return replies.shift(); } });
+  const resigned = await cancelAll(client, ['b1', 'b2'], { market });
+  assert.ok(resigned.every(result => result.status === 'fulfilled'));
+  assert.equal(stamps.length, 2); assert.notEqual(stamps[0], stamps[1]);
+  const row = latency.snapshot().markets[0];
+  assert.deepEqual([row.cancelAck.n, row.cancelAck.failed], [2, 2]);
+  client.close();
+
+  let hang;
+  const open = fixture([() => new Promise((_, reject) => { hang = reject; })]);
+  const pending = cancelAll(open.client, ['b1', 'b2']);
+  await new Promise(resolve => setImmediate(resolve));
+  open.client.close(); hang(new Error('aborted'));
+  assert.ok((await pending).every(result => rejected('closed', { uncertain: true })(result.reason)));
+  assert.equal(open.calls.length, 1);
 });

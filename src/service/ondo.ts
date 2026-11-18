@@ -11,7 +11,7 @@ import { createOndoRewards, RewardInputError, type OndoRewards } from '../ondo/r
 import { OBSERVATION_WINDOW_MIN, observationEarnings } from '../ondo/observation-earnings.ts';
 import type { OndoCredentials, OndoServiceConfig } from './ondo-config.ts';
 import type { MarketClient } from '../market/ipc.ts';
-import { remoteOndoClient, remoteOndoStream } from './remote-venue-feeds.ts';
+import { remoteOndoClient, remoteOndoStream, remoteOndoTopStream } from './remote-venue-feeds.ts';
 
 /** How long a stop waits for a live session's quotes to be withdrawn; inside the 20 s drain (main.ts DRAIN_MS). */
 export const ONDO_CLOSE_WAIT_MS = 15_000;
@@ -86,7 +86,8 @@ export async function createOndoModule(config: OndoServiceConfig, key: OndoCrede
       log: { info: say('info'), warn: say('warn'), error: say('error'), debug: say('debug') },
       ...(options.notifyRisk ? { notifyRisk: options.notifyRisk } : {}),
       ...(!key && options.observeFeed ? { clientFactory: options.observeFeed.client, streamFactory: options.observeFeed.stream } : {}),
-      ...(market ? { clientFactory: input => remoteOndoClient(market, input), streamFactory: publicStream } : {}),
+      ...(market ? { clientFactory: input => remoteOndoClient(market, input), streamFactory: publicStream,
+        topStreamFactory: feed => remoteOndoTopStream(market, feed) } : {}),
       ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}), ...(options.WebSocketImpl ? { WebSocketImpl: options.WebSocketImpl } : {}),
       ...(options.mmIntervalMs === undefined ? {} : { intervalMs: options.mmIntervalMs }),
     });

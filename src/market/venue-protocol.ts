@@ -20,8 +20,8 @@ export function fixedUnits(value: unknown): bigint {
   if (typeof value !== 'string' || !/^[1-9]\d{0,77}$/.test(value)) throw new Error('Ondo 行情数量或价格无效');
   return BigInt(value);
 }
-export function packBook(book: OndoBook) {
-  const pack = (levels: OndoBook['bids']) => levels.map(([price, size]) => [price.toString(), size.toString()]);
+export function packBook(book: OndoBook, limit?: number) {
+  const pack = (levels: OndoBook['bids']) => (limit === undefined ? levels : levels.slice(0, limit)).map(([price, size]) => [price.toString(), size.toString()]);
   return { time: book.time, bids: pack(book.bids), asks: pack(book.asks) };
 }
 export function unpackBook(value: unknown, limit: number): OndoBook {

@@ -114,7 +114,7 @@ export function OndoRewards({ mmConfig, onExpired, windowMin, setWindowMin, reso
       <div className="om-form or-sim">
         <p className="muted or-note">奖励按 Ondo 公布的规则估算：每次随机快照按 挂单金额 × e^(−k·距中间价) 打分，0–5 / 5–10 / 10–25 bps 分别分 85% / 10% / 5%，
           每周奖池 {Number(view.config.poolUsd).toLocaleString()} USD 由 {view.config.eligible} 个市场均分，买卖两侧各算一半。成交按测得的 1 分钟波动率估算：撤单反应时间内中间价走过最近距离就算成交，
-          每笔亏损 = 平仓耗时内的平均波动 + 两次 Maker 手续费。k、奖池均为假设，结果只作比较。</p>
+          每笔亏损 = 平仓耗时内的平均波动 + 两次 Maker 手续费。每次成交后在平仓耗时内不挂单，这段时间不计奖励也不再成交。k、奖池均为假设，结果只作比较。</p>
         <div className="wb-grid or-grid">
           <Field label="每单金额（USD）" hint="每侧一单" value={shownForm.sizeUsd} onChange={value => change({ sizeUsd: value })} />
           <Field label="挂单距离（bps）" hint="决定档位与得分" value={shownForm.distanceBps} onChange={value => change({ distanceBps: value })} />

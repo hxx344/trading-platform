@@ -3,7 +3,7 @@ import { fields, fixedUnits, ondoName, publicIdentity, timestamp, unpackBook } f
 import { createOndoClient, type OndoClient, type OndoDepth, type OndoRules } from '../vendor/ondo/client.mjs';
 import { decimalUnits } from '../vendor/ondo/decimal.mjs';
 import { sample } from '../vendor/ondo/latency.mjs';
-import { createOndoStream, type OndoStreamFactory, type OndoStreamOptions } from '../vendor/ondo/stream.mjs';
+import { createOndoStream, type OndoBook, type OndoStreamFactory, type OndoStreamOptions, type OndoTopStream, type OndoTopStreamOptions } from '../vendor/ondo/stream.mjs';
 import { AppError, validateBooks } from '../vendor/crossex/model.mjs';
 import type { TerminalFeed } from '../vendor/crossex/terminal-feed.mjs';
 
@@ -124,6 +124,57 @@ export function remoteOndoStream(market: MarketClient, options: OndoStreamOption
     },
     expireOrders(confirmedClear: () => boolean) { account?.expireOrders?.(confirmedClear); },
     close() { closed = true; generation = null; unsubscribe?.(); account?.close(); },
+  };
+}
+
+/** Optional early cancellation feed. Neither its prices nor its connection state enter the depth or account stream. */
+export function remoteOndoTopStream(market: MarketClient, { markets, onTop, onReady, onDown, onState, now = Date.now }: OndoTopStreamOptions): OndoTopStream {
+  const wanted = new Set(markets), latest = new Map<string, { source: number; at: number }>();
+  let generation: string | null = null, lease: string | null = null, since = 0, lastAt: number | null = null;
+  let closed = false, steady = false, error: string | null = null, unsubscribe: (() => void) | undefined;
+  function down() {
+    if (closed || !lease) return;
+    lease = null; lastAt = null; error = 'public_feed_down';
+    const wasSteady = steady; steady = false;
+    sample(onDown);
+    if (wasSteady) sample(onState, false);
+  }
+  function data(value: unknown) {
+    if (closed || !value || typeof value !== 'object' || Array.isArray(value)) return;
+    const msg = value as Record<string, unknown>, epoch = market.epoch(), received = now();
+    if (lease !== epoch) down();
+    if (!epoch) return;
+    if (msg.type === 'ready') {
+      if (typeof msg.generation !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(msg.generation)
+        || msg.generation === generation || !timestamp(msg.at) || msg.at <= since || msg.at > received) return;
+      down(); generation = msg.generation; lease = epoch; since = msg.at; lastAt = since; error = null;
+      onReady?.(since);
+      return;
+    }
+    if (lease !== epoch || msg.generation !== generation) return;
+    if (msg.type === 'down') { down(); return; }
+    if (msg.type === 'steady') {
+      if (!steady) { steady = true; sample(onState, true); }
+      return;
+    }
+    if (msg.type !== 'top' || typeof msg.market !== 'string' || !wanted.has(msg.market)
+      || !timestamp(msg.at) || msg.at < since || msg.at > received || received - msg.at > 1500) return;
+    let book: OndoBook;
+    try { book = unpackBook(msg.book, 1); } catch { return; }
+    const previous = latest.get(msg.market);
+    // Keep the source watermark across upstream and IPC reconnects. Empty sides carry the venue's loss of protection.
+    if (book.time > msg.at + 1500 || received - book.time > 1500
+      || previous && (book.time <= previous.source || msg.at < previous.at)) return;
+    latest.set(msg.market, { source: book.time, at: msg.at }); lastAt = Math.max(lastAt ?? 0, msg.at);
+    onTop(msg.market, book, msg.at);
+  }
+  return {
+    start() { if (!closed && !unsubscribe) unsubscribe = market.stream('ondo.top', { markets }, { data, down }); },
+    status() {
+      const ready = lease !== null && lease === market.epoch();
+      return { connected: ready, ready, lastFrameAt: ready ? lastAt : null, error };
+    },
+    close() { if (!closed) { closed = true; lease = null; unsubscribe?.(); } },
   };
 }
 

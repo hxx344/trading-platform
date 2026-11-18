@@ -25,3 +25,18 @@ export interface OndoStreamOptions {
 }
 export type OndoStreamFactory = (options: OndoStreamOptions) => OndoStream;
 export const createOndoStream: OndoStreamFactory;
+export interface OndoTopStream { start(): void; status(): { connected: boolean; ready: boolean; lastFrameAt: number | null; error: string | null }; close(): void }
+export interface OndoTopStreamOptions {
+  markets: string[];
+  /** Best bid and ask only, or null when the row was malformed or crossed; `at` is when the frame arrived. */
+  onTop(market: string, top: OndoBook | null, at: number): void;
+  /** Acknowledgement and loss of the current subscription, including short-lived connections. */
+  onReady?(at: number): void;
+  onDown?(): void;
+  /** true once the subscription has stayed confirmed for ten seconds, false when such a one is lost. */
+  onState?(ready: boolean): void;
+  WebSocketImpl?: unknown;
+  now?: () => number;
+}
+export type OndoTopStreamFactory = (options: OndoTopStreamOptions) => OndoTopStream;
+export const createOndoTopStream: OndoTopStreamFactory;

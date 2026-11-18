@@ -3,7 +3,7 @@ import type { MarketOperations } from './protocol.ts';
 import { checkIdentity, depthLimit, fields, ondoName, packBook, timestamp } from './venue-protocol.ts';
 import { createOndoClient } from '../vendor/ondo/client.mjs';
 import { decimalUnits } from '../vendor/ondo/decimal.mjs';
-import { createOndoStream } from '../vendor/ondo/stream.mjs';
+import { createOndoStream, createOndoTopStream, type OndoBook } from '../vendor/ondo/stream.mjs';
 import { createPublicClients } from '../vendor/crossex/clients.mjs';
 import { createFundingClient } from '../vendor/crossex/funding-client.mjs';
 import { createCandleReader } from '../vendor/crossex/candle-reader.mjs';
@@ -13,6 +13,7 @@ import { createTerminalFeed } from '../vendor/crossex/terminal-feed.mjs';
 interface VenueReaders {
   ondo?: ReturnType<typeof createOndoClient>;
   ondoStream?: typeof createOndoStream;
+  ondoTopStream?: typeof createOndoTopStream;
   depth?: Pick<ReturnType<typeof createPublicClients>, 'loadManualDepth' | 'loadDepth'>;
   funding?: ReturnType<typeof createFundingClient>;
   candles?: ReturnType<typeof createCandleReader>;
@@ -26,6 +27,7 @@ export function createVenueFeeds(readers: VenueReaders = {}): MarketOperations {
   const fetcher: typeof fetch = (url, init) => fetch(url, { ...init, signal: init?.signal ? AbortSignal.any([stopped.signal, init.signal]) : stopped.signal });
   const ondo = readers.ondo ?? createOndoClient({ fetchImpl: fetcher, rps: 2, timeoutMs: 5000 });
   const ondoStream = readers.ondoStream ?? createOndoStream;
+  const ondoTopStream = readers.ondoTopStream ?? createOndoTopStream;
   const clients = createPublicClients({ fetcher, signal: stopped.signal });
   const depths = readers.depth ?? clients, funding = readers.funding ?? createFundingClient({ fetcher, signal: stopped.signal });
   const candles = readers.candles ?? createCandleReader({ fetcher }), terminal = readers.terminal ?? createTerminalFeed();
@@ -96,15 +98,20 @@ export function createVenueFeeds(readers: VenueReaders = {}): MarketOperations {
       signal.throwIfAborted(); stopped.signal.throwIfAborted();
       const send = (value: unknown) => { if (!signal.aborted && !stopped.signal.aborted) emit(value); };
       let release: () => void;
-      if (op === 'ondo.public') {
-        const p = fields(input, ['markets', 'depth', 'trades', 'metrics']), depth = depthLimit(p.depth);
-        if (!Array.isArray(p.markets) || !p.markets.length || p.markets.length > 40 || new Set(p.markets).size !== p.markets.length
-          || typeof p.trades !== 'boolean' || p.metrics !== undefined && typeof p.metrics !== 'boolean') throw new Error('Ondo 订阅无效');
+      if (op === 'ondo.public' || op === 'ondo.top') {
+        const top = op === 'ondo.top', p = fields(input, top ? ['markets'] : ['markets', 'depth', 'trades', 'metrics']);
+        if (!Array.isArray(p.markets) || !p.markets.length || p.markets.length > 40 || new Set(p.markets).size !== p.markets.length) throw new Error('Ondo 订阅无效');
+        if (!top && (typeof p.trades !== 'boolean' || p.metrics !== undefined && typeof p.metrics !== 'boolean')) throw new Error('Ondo 订阅无效');
         const markets = p.markets.map(ondoName);
         let generation: string | null = null;
-        const stream = ondoStream({ markets, depth,
-          onPublicReady(at) { generation = randomUUID(); send({ type: 'ready', generation, at }); },
-          onBook(market, book, at) { if (generation) send({ type: 'book', generation, market, at, book: book ? packBook(book) : null }); },
+        const ready = (at: number) => { generation = randomUUID(); send({ type: 'ready', generation, at }); };
+        const down = () => { send({ type: 'down', generation }); generation = null; };
+        const snapshot = (market: string, book: OndoBook | null, at: number) => {
+          if (generation) send({ type: top ? 'top' : 'book', generation, market, at, book: book ? packBook(book, top ? 1 : undefined) : null });
+        };
+        const stream = top ? ondoTopStream({ markets, onReady: ready, onDown: down, onTop: snapshot,
+          onState(steady) { if (steady && generation) send({ type: 'steady', generation }); },
+        }) : ondoStream({ markets, depth: depthLimit(p.depth), onPublicReady: ready, onBook: snapshot, onDown: down,
           ...(p.trades ? { onTrade(market, trade, at) {
             if (generation) send({ type: 'trade', generation, market, at, trade: { ...trade, price: trade.price.toString() } });
           } } : {}),
@@ -120,7 +127,6 @@ export function createVenueFeeds(readers: VenueReaders = {}): MarketOperations {
               },
             },
           } : {}),
-          onDown() { send({ type: 'down', generation }); generation = null; },
         });
         release = () => stream.close();
         stream.start();

@@ -54,7 +54,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 - 期权账户（工作台期权模块 Greeks 的 Bybit 密钥与风险上限，见 [docs/options.md](docs/options.md)）：页面「从工作台导入」的预览同时列出工作台期权账户（打码 UID、能否导入及原因），勾选「导入期权账户」后随导入一起写入；命令行为 `sudo bash install.sh --import-workbench --options`（可与 `--oil`、`--pairs` 同用）。工作台开着自动开仓（`AUTO_OPEN`）、不是实盘主网、还有未结束的订单 / 执行任务 / RFQ，或还在跟踪一组策略时拒绝导入；导入时用密钥读一次 Bybit 账户 UID 并检查权限、绑定 IP 与统一账户。已配置 `options` 时不覆盖。导入后页面出现「期权」标签，导入写入的配置里定时开仓为关闭（要用时在期权页打开；数据目录里留有以前的 `options.sqlite`、且当时在页面打开过定时开仓时，沿用页面上的开关，导入后先在期权页确认），工作台期权模块此后不能再用这个账户下期权单。
 - 首次执行放好程序（`/opt/trading-platform`）、系统账号 `trading-platform`、数据目录 `/var/lib/trading-platform`、导入交接目录 `/var/lib/trading-platform-import`、示例配置和不含配对的空配置，并启动 systemd 服务 `trading-platform`。也可以按 `/etc/trading-platform/config.example.json` 与 `secrets.example.json` 手写配置后再执行一次。
 - 每次执行都是增量升级。v0.64.0 起，`trading-platform.service` 运行交易、划转、ADL 和行情采集，`trading-platform-control.service` 提供浏览器入口和在线更新。首次从单进程升级会有一次有序重启。此后只更新页面资源时刷新即可载入新版，控制面代码升级或单独执行 `sudo systemctl restart trading-platform-control` 时，浏览器可能短暂断开，后台交易继续运行。执行器代码、单元或生效配置变化时，安装器会有序重启执行器并验证启动。配置校验或启动失败的处理见 [docs/update.md](docs/update.md)。
-- v0.66.0 起，`trading-platform-market.service` 单独运行公开盘口订阅、期权链和行情历史读取。它使用独立账户和本机套接字。单独重启或升级行情服务时，执行器继续订阅账户推送、核对原委托和处理已成交风险。需要盘口的新委托在发送前检查交易所时间、原始接收时间和行情连接代次。恢复后使用新连接取得的新鲜盘口。历史数据仍使用原 SQLite 文件，日志可用 `journalctl -u trading-platform-market` 查看。
+- v0.67.0 起，`trading-platform-market.service` 单独运行公开盘口订阅、期权链和行情历史读取。它使用独立账户和本机套接字。单独重启或升级行情服务时，执行器继续订阅账户推送、核对原委托和处理已成交风险。需要盘口的新委托在发送前检查交易所时间、原始接收时间和行情连接代次。恢复后使用新连接取得的新鲜盘口。历史数据仍使用原 SQLite 文件，日志可用 `journalctl -u trading-platform-market` 查看。
 - 修改启动配置后，再运行一次安装命令使它生效。配对的 `transfer` 与 `adl` 以页面设置为准。回退到 v0.7.0 之前的版本会用 `config.json` 中的 `transfer` 覆盖页面改过的参数，见下文回退表。
 - 页面在线更新（v0.51.0 起）：侧栏「系统」组的「系统更新」查看最新正式版，确认后由服务器上的 root 助手执行 `install.sh --version <新版本>`，按组件激活并显示结果。从 v0.50.0 及更早版本升级时要先在服务器上手工执行一次上面的一键部署命令。指定旧版本回退使用命令行。
 - 指定或回退版本：`sudo bash install.sh --version v0.1.0`。服务器访问不了 GitHub 时，在别处下载 Release 的三个文件放进同一目录，然后执行 `sudo bash install.sh --package <目录>`。回退前先看下文《回退到旧版本》。
@@ -97,7 +97,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 | 回退到早于 | 回退前要做的事 | 说明 | 详见 |
 | --- | --- | --- | --- |
-| v0.66.0 | 用支持独立行情服务的安装器指定旧版 | 回到 v0.65.0 或 v0.64 系列会停用行情单元，由旧执行进程接回采集，沿用原数据目录 | [docs/update.md](docs/update.md) |
+| v0.67.0 | 用支持独立行情服务的安装器指定旧版 | 回到 v0.66.0 等双进程版本会停用行情单元，由旧执行进程接回采集，沿用原数据目录 | [docs/update.md](docs/update.md) |
 | v0.64.0 | 用 v0.64.0 或更新的安装器指定旧版本 | 安装器停止控制面、释放页面端口并恢复单进程。返回 v0.63.0 可直接沿用配置和业务库 | [docs/update.md](docs/update.md) |
 | v0.61.0 | 不用改配置 | 旧版本的 Ondo 奖励市场盘口改回每分钟向交易所读一次（REST），重启后平均值与波动重新累积 | [docs/ondo.md](docs/ondo.md) 第 5 节 |
 | v0.60.0 | 从 `config.json` 删掉 `ondo`、从 `secrets.json` 删掉 `ondo`；在实盘挂单的先在页面停止并确认撤单完成 | 旧版本不认识 `ondo`，配置检查失败、整个服务不启动；数据目录的 `ondo-mm/` 旧版本不读，留着即可 | [docs/ondo.md](docs/ondo.md) 第 9 节 |

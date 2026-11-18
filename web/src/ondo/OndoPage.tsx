@@ -27,7 +27,7 @@ const HOLDS: Record<string, string> = {
 const REASONS: Record<string, string> = {
   ...HOLDS, in_flight: '请求处理中', duplicate: '重复挂单，撤销中', role_change: '持仓变化，换单中', position_cap: '持仓已到上限，不再加仓', total_cap: '总名义已到上限', total_unknown: '有市场的持仓暂时无法估值，不新挂单',
   too_close: '离中间价太近', too_far: '离中间价太远，等待确认后改价', unprotected: '前方保护量不足，不挂新单，立即撤销已有开仓单', own_order_in_way: '会碰到本账户的反向挂单',
-  no_book: '盘口不完整', no_price: '没有可挂的价位', no_tick_in_band: '价格步长太粗，区间内没有价位', size_too_small: '每单金额不足一个最小数量', syncing: '核对账户中',
+  no_book: '盘口不完整', no_price: '没有可挂的价位', no_tick_in_band: '价格步长太粗，区间内没有价位', size_too_small: '每单金额不足一个最小数量', syncing: '核对账户中', awaiting_depth: '最优价提前撤单后，等待更新的深度盘口',
   backoff: '下单被拒后等待重试', close_size: '持仓变化，调整平仓数量', close_follow: '跟随盘口平仓', dust_position: '持仓不足一个最小数量',
   incident: '风险锁已触发，停止开仓', exit: '撤单并核对剩余仓位', manual_exit: '等待人工处理余仓',
 };

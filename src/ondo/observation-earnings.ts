@@ -1,5 +1,5 @@
 import type { OndoMmConfig } from '../vendor/ondo/mm.mjs';
-import { BANDS, bandOf, simulate } from './reward-sim.ts';
+import { BANDS, bandOf, fillsPerDay, quotingShare, simulate } from './reward-sim.ts';
 import { BUCKETS, type OndoObservationEarnings, type OndoObservationTier, type OndoRewardConfig, type OndoRewardMarket } from './reward-types.ts';
 
 export const OBSERVATION_WINDOW_MIN = 60;
@@ -41,14 +41,18 @@ export function observationEarnings(config: OndoMmConfig, pool: OndoRewardConfig
       const band = BANDS[bandOf(distanceBps)!], { bid, ask, cover } = sample.avg;
       if ((cover.bid ?? 0) < band.to || (cover.ask ?? 0) < band.to) return { ...tier, reason: `买卖盘口需完整覆盖 ${band.to} bps 奖励档` };
 
-      // Unit uptime gives both sides' scores and the daily cost for two fully active sides. Weight each independently;
+      // Unit uptime gives both sides' scores and the cost of one fill. Weight each side's time independently;
       // observed touches are queue-dependent and cannot be counted as fills. The trial's inner bound is floored at 0.1 bps.
+      const minBps = Math.max(0.1, distanceBps - gapBps);
       const sim = simulate({ bid, ask, sigma1m, makerFee }, { poolUsd, eligible: pool.eligible, sizeUsd: orderUsd, distanceBps,
-        minBps: Math.max(0.1, distanceBps - gapBps), reactionSec: REACTION_SEC, holdSec: config.maxHoldSec, decayK: DECAY_K, uptime: 1, sides: 2 });
-      const rewardDay = sim.capDay / 2 * (sim.share.bid * buyUptime + sim.share.ask * sellUptime);
+        minBps, reactionSec: REACTION_SEC, holdSec: config.maxHoldSec, decayK: DECAY_K, uptime: 1, sides: 2 });
+      // A fill on either side takes both quotes down until the position is closed (holdSec).
+      const rate = sigma1m === null ? null : fillsPerDay(sigma1m, minBps, REACTION_SEC) * (buyUptime + sellUptime);
+      const quoting = rate === null ? 1 : quotingShare(rate, config.maxHoldSec);
+      const rewardDay = sim.capDay / 2 * (sim.share.bid * buyUptime + sim.share.ask * sellUptime) * quoting;
       if (makerFee === null) return { ...tier, rewardDay, reason: '公开 Maker 费率缺失' };
-      if (sim.lossDay === null) return { ...tier, rewardDay, reason: '波动率样本不足，需 20 个有效收益样本' };
-      const lossDay = sim.lossDay / 2 * (buyUptime + sellUptime);
+      if (rate === null || sim.lossPerFill === null) return { ...tier, rewardDay, reason: '波动率样本不足，需 20 个有效收益样本' };
+      const lossDay = rate * quoting * sim.lossPerFill;
       return { ...tier, rewardDay, lossDay, netDay: rewardDay - lossDay };
     });
     return { market, sampleAt, samples: sample?.avg.samples ?? 0, returns: sample?.returns ?? 0, makerFee, sigma1m, tiers };

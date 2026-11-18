@@ -12,11 +12,11 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { compareDecimals, decimal, decimalUnits as units, formatDecimalUnits as fmt } from './decimal.mjs';
 import { createOndoClient, OndoError, ONDO_MARKET } from './client.mjs';
-import { createOndoStream } from './stream.mjs';
+import { createOndoStream, createOndoTopStream } from './stream.mjs';
 import { createOndoObservation } from './observation.mjs';
 import { createOndoLatency, sample } from './latency.mjs';
 import { exitTrigger, iocLimit, EXIT_ATTEMPTS, EXIT_CONFIRM_MS } from './exit.mjs';
-import { assessQuote, closeMoves, closePrice, floorStep, frontNotional, notional, planQuote, quoteSize, withoutOrders } from './quote.mjs';
+import { assessQuote, assessTop, closeMoves, closePrice, floorStep, frontNotional, notional, planQuote, quoteSize, withoutOrders } from './quote.mjs';
 
 export class HttpError extends Error {
   constructor(status, message) { super(message); this.name = 'HttpError'; this.status = status; }
@@ -38,6 +38,7 @@ const BOOK_MAX_AGE_MS = 1500, SOURCE_MAX_AGE_MS = 10_000;
 const RULES_REFRESH_MS = 60_000, RULES_MAX_AGE_MS = 300_000;
 const SYNC_MS = 5000, SYNC_GAP_MS = 1000, SYNC_MAX_AGE_MS = 15_000;
 const MIN_REST_MS = 1000;
+const EARLY_NOTE_MS = 60_000, TOP_NOTES = 20;
 const UNKNOWN_CHECKS = 3, UNKNOWN_GAP_MS = 2000, UNKNOWN_MISSES = 5;
 const MAX_BACKOFF_MS = 60_000;
 const STRAY_CANCELS = 5;
@@ -135,6 +136,8 @@ function readBounded(file) {
 // only withdraws what the previous one left.
 export function createOndoMarketMaker({ dataDir, readCredentials = () => null, initialConfig = null, createObservationEstimator, closeWaitMs = CLOSE_WAIT_MS, readMaintenance = () => false, readAdmission = () => true, admit = operation => operation(), notifyRisk = () => {},
   log = console, now = Date.now, monotonicNow, intervalMs = 250, fetchImpl, WebSocketImpl, clientFactory = createOndoClient, streamFactory = createOndoStream,
+  // An injected stream stands for the venue: only the real one is joined by the real top-of-book socket.
+  topStreamFactory = streamFactory === createOndoStream ? createOndoTopStream : null,
   sleep = ms => new Promise(resolve => { setTimeout(resolve, ms).unref?.(); }) } = {}) {
   const directory = path.join(dataDir, 'ondo-mm');
   const configPath = path.join(directory, 'config.json'), sessionPath = path.join(directory, 'session.json');
@@ -622,6 +625,29 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     return book?.bids.length && book.asks.length && book.bids[0][0] < book.asks[0][0]
       && market.bookAt <= at && at - market.bookAt <= BOOK_MAX_AGE_MS && book.time <= at + BOOK_MAX_AGE_MS && at - book.time <= SOURCE_MAX_AGE_MS;
   }
+  // 本服务：the best bid and ask arrive ahead of the depth snapshot. A top newer than the last
+  // depth can only withdraw an opening order; prices and protection are still computed from depth
+  // alone, so the withdrawn side waits for a depth at least as new as this top before quoting again.
+  function protectFromTop(current, market, top, at) {
+    // A top stamped by a clock too far from ours is not kept as the newest one seen.
+    if (!top || Math.abs(at - top.time) > BOOK_MAX_AGE_MS || top.time <= market.topAt) return;
+    market.topAt = top.time;
+    if (current.stopping || !(top.time > (market.sourceAt ?? 0))) return;
+    for (const order of market.orders.values()) {
+      if (order.role !== 'quote' || order.protectionLost) continue;
+      const reason = assessTop(order.side, order.price, top, current.cfg.min);
+      if (!reason) continue;
+      order.protectionLost = reason;
+      market.topWait[order.side] = { time: top.time, until: at + BOOK_MAX_AGE_MS };
+      if (order.state !== 'open' || at < order.nextCancelAt) continue;
+      current.early += 1;
+      if (at - market.earlyNotedAt >= EARLY_NOTE_MS) {
+        market.earlyNotedAt = at;
+        event(market.name, 'cancel', `最优价提前撤单：${order.side === 'buy' ? '买' : '卖'}单${reason === 'too_close' ? '离中间价太近' : '前方已没有更优价位的挂单'}（本会话第 ${current.early} 次）`);
+      }
+      void cancelOrder(current, market, order, reason);
+    }
+  }
   function holdOf(current, market) {
     if (current.stopping) return 'stopping';
     if (current.live) { const reason = gate(); if (reason) return reason; }
@@ -728,6 +754,11 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
         return { type: 'cancel', order: existing, reason: verdict.reason, view: { ...view, reason: verdict.reason } };
       }
       if (!fresh) return none('syncing');
+      const wait = market.topWait[side];
+      if (wait) {
+        if (market.sourceAt >= wait.time || at >= wait.until) market.topWait[side] = null;
+        else return none('awaiting_depth');
+      }
       if (at < market.backoff[side]) return none('backoff');
       if (held + cfg.orderUsd > cfg.maxPosition) return none('position_cap');
       const plan = planQuote(side, ref, ext, tick, cfg, limit);
@@ -778,9 +809,9 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
   }
   async function run(current, market, replacements) {
     updateExit(current, market);
-    if (market.exit?.manual || market.exit?.trigger) {
-      for (const order of market.orders.values()) if (order.role === 'close') await cancelOrder(current, market, order, 'exit');
-    }
+    // Withdrawals that are due together are requested together: the client sends them as one batch.
+    const withdraw = (orders, reason) => Promise.all(orders.map(order => cancelOrder(current, market, order, reason)));
+    if (market.exit?.manual || market.exit?.trigger) await withdraw([...market.orders.values()].filter(order => order.role === 'close'), 'exit');
     if (current.live) await resolveUnknown(current, market);
     if (session !== current) return;
     const hold = holdOf(current, market);
@@ -788,17 +819,16 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     if (hold) {
       if (current.live) {
         const all = CANCEL_ALL.has(hold);
-        for (const order of [...market.orders.values()]) if (all || order.role === 'quote') await cancelOrder(current, market, order, hold);
+        await withdraw([...market.orders.values()].filter(order => all || order.role === 'quote'), hold);
       }
       restingView(market, hold);
       return;
     }
     // Withdrawals of both sides go out before either side's new order.
-    if (current.live) for (const side of SIDES) {
-      const action = decide(current, market, side);
-      if (action.type !== 'cancel') continue;
-      await cancelOrder(current, market, action.order, action.reason, replacements);
-      if (session !== current || holdOf(current, market)) return;
+    if (current.live) {
+      const due = SIDES.map(side => decide(current, market, side)).filter(action => action.type === 'cancel');
+      await Promise.all(due.map(action => cancelOrder(current, market, action.order, action.reason, replacements)));
+      if (due.length && (session !== current || holdOf(current, market))) return;
     }
     for (const side of SIDES) {
       let action = decide(current, market, side);
@@ -881,6 +911,10 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     const at = now(), work = [];
     if (!current.rulesAttemptAt || at - current.rulesAttemptAt >= RULES_REFRESH_MS) work.push(refreshRules(current));
     if (current.live) {
+      if (!current.batchNoted && current.client.batchCancels?.() === false) {
+        current.batchNoted = true;
+        event(null, 'error', '交易所拒绝了批量撤单或应答格式不符，本会话改为逐笔撤单');
+      }
       expireStaleAccount(current);
       // A lost cancellation can remain "unknown" without reaching another attempt during a REST outage.
       for (const market of current.markets.values()) for (const order of market.orders.values()) {
@@ -898,11 +932,11 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
     const current = { live, config: { ...structuredClone(config), markets: [...markets] }, prefix: `${PREFIX}${tag}-`, seq: 0, startedAt: now(), stopping: false, halt: null, incident: null, notices: new Set(),
       cfg: { target: units(config.targetBps), min: units(config.minBps), max: units(config.maxBps), wallEnabled: config.wallEnabled, wallMin: units(config.wallUsd),
         orderUsd: units(config.orderUsd), maxPosition: units(config.maxPositionUsd), maxTotal: units(config.maxTotalUsd) },
-      markets: new Map(markets.map(name => [name, { name, rules: null, listed: false, book: null, bookAt: 0, bookEpoch: 0, mid: null, orders: new Map(), bookDebits: [], foreign: [], position: 0n, positionKnown: !live,
+      markets: new Map(markets.map(name => [name, { name, rules: null, listed: false, book: null, bookAt: 0, bookEpoch: 0, mid: null, orders: new Map(), bookDebits: [], foreign: [], topAt: 0, topWait: { buy: null, sell: null }, earlyNotedAt: -Infinity, position: 0n, positionKnown: !live,
         dirty: live, dirtySeq: 0, pending: { buy: null, sell: null }, backoff: { buy: 0, sell: 0 }, rejects: { buy: 0, sell: 0 },
         view: { buy: { role: 'quote', state: 'none', reason: 'starting' }, sell: { role: 'quote', state: 'none', reason: 'starting' } }, hold: 'starting', busy: false, error: null, lastCancel: null }])),
       accountPositions: [], accountStale: false, orderEpoch: 0, emptyEpoch: null, awaiting: new Map(), evidenceSeq: 0, savedEvidence: null, syncing: false, syncAttemptAt: 0, syncOkAt: now(), syncError: null, remoteOurs: null, verifiedAt: 0, lastWriteAt: now(),
-      loadingRules: false, rulesAttemptAt: 0, rulesAt: 0, rulesError: null, totals: { placed: 0, canceled: 0, rejected: 0, postOnly: 0, fills: 0 }, client: null, stream: null };
+      loadingRules: false, rulesAttemptAt: 0, rulesAt: 0, rulesError: null, totals: { placed: 0, canceled: 0, rejected: 0, postOnly: 0, fills: 0 }, early: 0, topNotes: 0, batchNoted: false, client: null, stream: null };
     current.latency = createOndoLatency({ markets, mode: live ? 'live' : 'observe', startedAt: current.startedAt, prefix: current.prefix, now, monotonicNow });
     current.client = clientFactory(clientOptions({ credentials: keys, rps: config.rps, ...(live ? { latency: current.latency } : {}) }));
     current.observation = live ? null : createOndoObservation({
@@ -948,8 +982,21 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
         }
       },
       onPrivate(channel, data) { if (session === current) hint(current, channel, data); } });
-    if (live) current.stream = makeStream(markets);
-    else {
+    if (live) {
+      const main = makeStream(markets);
+      let top = null;
+      try {
+        top = topStreamFactory?.({ markets, ...(WebSocketImpl ? { WebSocketImpl } : {}), now,
+          onTop(name, book, at) { const market = current.markets.get(name); if (market && session === current) protectFromTop(current, market, book, at); },
+          onState(ready) {
+            if (session !== current || current.stopping || current.topNotes >= TOP_NOTES) return;
+            current.topNotes += 1;
+            event(null, 'session', `${ready ? '最优价连接已就绪，买一卖一变化可提前触发保护撤单' : '最优价连接断开，保护撤单暂时只由深度盘口触发'}${current.topNotes === TOP_NOTES ? '（本会话不再记录这条连接的状态）' : ''}`);
+          } }) ?? null;
+      } catch (error) { log.warn({ err: error, type: 'ondo-mm' }, 'Ondo 最优价连接无法建立'); }
+      // The top-of-book socket lives and dies with the session's stream and is never asked for status.
+      current.stream = top ? { ...main, start() { main.start(); top.start(); }, close() { main.close(); top.close(); } } : main;
+    } else {
       current.subscribeListed = () => {
         const listed = markets.filter(name => current.markets.get(name).rules?.trading);
         if (listed.length === subscribed.length && listed.every((name, i) => name === subscribed[i])) return;

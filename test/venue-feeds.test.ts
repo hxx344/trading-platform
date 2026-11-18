@@ -1,11 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { mkdtempDisposableSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createVenueFeeds } from '../src/market/venue-feeds.ts';
 import { unpackBook } from '../src/market/venue-protocol.ts';
 import type { MarketClient, MarketOperations } from '../src/market/ipc.ts';
-import { remoteCrossexReaders, remoteOndoClient, remoteOndoStream } from '../src/service/remote-venue-feeds.ts';
-import type { OndoStreamOptions } from '../src/vendor/ondo/stream.mjs';
+import { remoteCrossexReaders, remoteOndoClient, remoteOndoStream, remoteOndoTopStream } from '../src/service/remote-venue-feeds.ts';
+import { createOndoModule } from '../src/service/ondo.ts';
+import { ONDO_MM_DEFAULTS } from '../src/vendor/ondo/mm.mjs';
+import { createOndoStream, createOndoTopStream, type OndoBook, type OndoStreamOptions, type OndoStreamStatus } from '../src/vendor/ondo/stream.mjs';
 import { createOndoClient } from '../src/vendor/ondo/client.mjs';
 import { createPublicClients } from '../src/vendor/crossex/clients.mjs';
 import { createFundingClient } from '../src/vendor/crossex/funding-client.mjs';
@@ -16,7 +21,7 @@ function deferred<T>() { let resolve!: (value: T) => void; const promise = new P
 const identity = { exchange: 'binance', symbol: 'BTCUSDT', base: 'BTC', rawBase: 'BTC', quoteCurrency: 'USDT', counterCurrency: 'USDT',
   settlementCurrency: 'USDT', collateralCurrency: 'USDT', crossexSymbol: 'BINANCE_FUTURE_BTC_USDT', contractKind: 'linear', multiplier: 1,
   identityVerified: true, identitySource: 'exchange-instrument-metadata', assetClass: 'crypto', identityScope: 'manual', nativeUnit: '1', comparable: true };
-function connection(service: MarketOperations) {
+function connection(service: MarketOperations, observe?: (op: string, frame: Record<string, unknown>) => void) {
   let generation: string | null = 'one';
   const sent: { op: string; input: unknown }[] = [];
   const peer: MarketClient = {
@@ -26,7 +31,7 @@ function connection(service: MarketOperations) {
     },
     stream(op, input, { data }) {
       sent.push({ op, input }); const local = controller();
-      service.stream(op, input, frame => data(JSON.parse(JSON.stringify(frame))), local.signal);
+      service.stream(op, input, frame => { const wire = JSON.parse(JSON.stringify(frame)); observe?.(op, wire); data(wire); }, local.signal);
       return () => local.abort();
     },
   };
@@ -73,6 +78,104 @@ test('Ondo public observation and REST sampling cross JSON without credentials a
   upstream!.onBook(symbol, { bids: [prices], asks: [], time: now }, now); assert.equal(books, 1);
 });
 
+test('the installed Ondo module opens public depth and top at market, and only the protected account socket at execution', async t => {
+  class Socket extends EventEmitter {
+    sent: { op: string; channel?: string; markets?: string[] }[] = [];
+    closed = false;
+    addEventListener(name: string, fn: (...args: unknown[]) => void) { this.on(name, fn); }
+    send(text: string) { this.sent.push(JSON.parse(text)); }
+    frame(value: unknown) { this.emit('message', { data: JSON.stringify(value) }); }
+    close() { if (!this.closed) { this.closed = true; this.emit('close'); } }
+  }
+  const publicSockets: Socket[] = [], accountSockets: Socket[] = [];
+  class Public extends Socket { constructor() { super(); publicSockets.push(this); } }
+  class Account extends Socket { constructor() { super(); accountSockets.push(this); } }
+  const feeds = createVenueFeeds({
+    ondo: { close() {}, cooldownUntil: () => 0, async depth() { throw new Error('unexpected depth read'); },
+      async markets() { return new Map([[symbol, { tick: '0.01', step: '0.1', trading: true, makerFee: null }]]); } },
+    ondoStream: feed => createOndoStream({ ...feed, WebSocketImpl: Public }),
+    ondoTopStream: feed => createOndoTopStream({ ...feed, WebSocketImpl: Public }),
+  });
+  const wireTops: unknown[] = [], dir = mkdtempDisposableSync(join(tmpdir(), 'tp-ondo-venue-'));
+  const { peer, sent } = connection(feeds, (op, frame) => { if (op === 'ondo.top' && frame.type === 'top') wireTops.push(frame.book); });
+  const key = { keyId: 'ondo-key-fixture-only', secret: 'ondo-secret-fixture-only' };
+  const service = await createOndoModule({}, key, dir.path, { marketClient: peer, WebSocketImpl: Account, mmIntervalMs: 0,
+    log() {}, locks: async () => ({ release() {} }), fetchImpl: async (url, init) => {
+      assert.match(new URL(String(url)).pathname, /^\/v1\/perps\/(orders|positions)$/);
+      assert.equal(init?.method, 'GET'); assert.equal(new Headers(init.headers).get('ONDO-KEY-ID'), key.keyId);
+      return Response.json({ success: true, result: [] });
+    } });
+  t.after(async () => { try { await service.close(); } finally { feeds.close?.(); dir.remove(); } });
+  const { revision } = service.views.save({ config: { ...ONDO_MM_DEFAULTS, mode: 'live', markets: [symbol], rps: 10 } }) as { revision: number };
+  await service.views.start({ revision, confirmLive: true, confirmAccountWide: true });
+  const state = () => service.views.state() as { stream: OndoStreamStatus; markets: { bid: string | null }[]; incident: { market: string } | null };
+  assert.equal(publicSockets.length, 2); assert.equal(accountSockets.length, 1);
+  for (const socket of [...publicSockets, ...accountSockets]) socket.emit('open');
+  const [depth, top] = publicSockets;
+  assert.deepEqual(depth.sent, [{ op: 'subscribe', channel: 'depthBooksPerps', markets: [symbol], limit: 50 }]);
+  assert.deepEqual(top.sent, [{ op: 'subscribe', channel: 'topOfBooksPerps', markets: [symbol] }]);
+  assert.deepEqual(sent.find(request => request.op === 'ondo.top'), { op: 'ondo.top', input: { markets: [symbol] } });
+  const [account] = accountSockets;
+  assert.deepEqual(account.sent.map(row => row.op), ['login']); account.frame({ type: 'loggedIn' });
+  const channels = account.sent.slice(1).map(row => row.channel);
+  assert.deepEqual(channels, ['ordersPerps', 'fillsPerps', 'positionsPerps', 'cancelAllOrdersAfterPerps']);
+  for (const channel of channels) account.frame({ type: 'subscribed', channel });
+  for (const socket of publicSockets) socket.frame({ type: 'subscribed', channel: socket.sent[0].channel });
+  const row = { market: symbol, time: new Date().toISOString(), bids: [['199', '3']], asks: [['201', '2']] };
+  top.frame({ type: 'update', channel: 'topOfBooksPerps', data: [
+    { ...row, bids: [...row.bids, ['198', '2']], asks: [...row.asks, ['202', '3']] }, { ...row, bids: [], asks: [] }] });
+  assert.deepEqual(wireTops, [{ time: Date.parse(row.time), bids: [['199000000000000000000', '3000000000000000000']],
+    asks: [['201000000000000000000', '2000000000000000000']] }, { time: Date.parse(row.time), bids: [], asks: [] }]);
+  assert.equal(state().markets[0].bid, null);
+  top.close(); depth.frame({ type: 'update', channel: 'depthBooksPerps', data: [row] });
+  assert.equal(state().stream.publicReady, true); assert.equal(state().markets[0].bid, '199');
+  depth.close(); assert.equal(state().stream.publicReady, false); assert.equal(state().markets[0].bid, null);
+  assert.equal(state().stream.deadManReady, true);
+  account.frame({ type: 'update', channel: 'fillsPerps', data: [{ market: symbol, direction: 'openLong' }] });
+  assert.equal(state().incident?.market, symbol); assert.equal(account.closed, false);
+});
+
+test('remote Ondo tops require fresh monotonic snapshots on the confirmed generation and the current IPC epoch', () => {
+  let now = 1_800_000_000_000, epoch: string | null = 'first';
+  let feed!: Parameters<MarketClient['stream']>[2], stops = 0;
+  const peer: MarketClient = { epoch: () => epoch, async call() { throw new Error('unexpected call'); },
+    stream(op, args, listener) { assert.equal(op, 'ondo.top'); assert.deepEqual(args, { markets: [symbol] }); feed = listener; return () => { stops++; }; } };
+  const received: { book: OndoBook | null; at: number }[] = [], states: boolean[] = [];
+  const stream = remoteOndoTopStream(peer, { markets: [symbol], now: () => now, onState: state => states.push(state),
+    onTop(name, book, at) { assert.equal(name, symbol); received.push({ book, at }); } });
+  stream.start();
+  const first = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', second = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', third = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
+  const ready = (generation: string, at = now) => feed.data({ type: 'ready', generation, at });
+  const top = (generation: string, time = now, at = now) => ({ type: 'top', generation, market: symbol, at,
+    book: { time, bids: [['201000000000000000123', '1000000000000000001']], asks: [] as string[][] } });
+  feed.data(top(first)); ready('invalid'); ready(first, now + 1); assert.equal(stream.status().ready, false);
+  const started = now; ready(first); now += 50;
+  const valid = top(first, now - 1), source = valid.book.time;
+  for (const msg of [{ ...valid, market: 'TSLA-USD.P' }, { ...valid, type: 'bbo' }, { ...valid, generation: second },
+    { ...valid, at: started - 1 }, { ...valid, at: now + 1 }, top(first, now + 1501), top(first, now - 1501),
+    { ...valid, book: null }, { ...valid, book: { time: now, bids: [] } }, { ...valid, book: { ...valid.book, bids: [['-1', '3']] } },
+    { ...valid, book: { ...valid.book, asks: [['1', '5']] } }, { ...valid, book: { ...valid.book, bids: [...valid.book.bids, ['100', '3']] } }]) feed.data(msg);
+  assert.equal(received.length, 0);
+  feed.data(valid); feed.data(valid); feed.data(top(first, source - 1)); feed.data(top(first, source + 1, now - 1));
+  assert.deepEqual(received, [{ book: { time: source, bids: [[201000000000000000123n, 1000000000000000001n]], asks: [] }, at: now }]);
+  feed.data({ type: 'down', generation: first }); ready(first, started); feed.data(top(first));
+  assert.equal(stream.status().ready, false); assert.deepEqual(states, []);
+  ready(second, ++now); feed.data(top(first)); feed.data(top(second, source));
+  assert.equal(received.length, 1);
+  feed.data(top(second)); feed.data({ type: 'steady', generation: first }); feed.data({ type: 'steady', generation: second });
+  assert.equal(received.length, 2); assert.deepEqual(states, [true]);
+  epoch = null; assert.equal(stream.status().ready, false); feed.data(top(second, ++now)); feed.down();
+  epoch = 'second'; ready(second); feed.data(top(second)); ready(third, ++now); ready(first, started); feed.data(top(second));
+  assert.deepEqual(states, [true, false]); assert.equal(received.length, 2);
+  now += 2000;
+  feed.data(top(third, now - 1000, now - 1501)); feed.data(top(third, now - 1501, now - 1000)); feed.data(top(third, now + 1, now - 1500));
+  assert.equal(received.length, 2);
+  const empty = { time: now, bids: [], asks: [] };
+  feed.data({ ...top(third), book: empty }); assert.equal(received.length, 3); assert.deepEqual(received.at(-1), { at: now, book: empty });
+  stream.close(); stream.close(); feed.data(top(third, ++now));
+  assert.equal(stops, 1); assert.equal(stream.status().ready, false); assert.equal(received.length, 3);
+});
+
 test('public operations reject unknown fields, mixed identities, invalid intervals and unbounded history before a reader runs', async t => {
   const calls: string[] = [], read = async () => { calls.push('read'); return []; };
   const feeds = createVenueFeeds({ depth: { loadDepth: read, loadManualDepth: read }, candles: read,
@@ -93,6 +196,10 @@ test('public operations reject unknown fields, mixed identities, invalid interva
     ['crossex.orders', { url: 'https://invalid.example' }],
   ] as const) await assert.rejects(feeds.call(op, input, signal));
   assert.throws(() => feeds.stream('ondo.public', { markets: [symbol], depth: 10, trades: true, credentials: {} }, () => {}, signal));
+  for (const input of [{ markets: [symbol], credentials: {} }, { markets: [symbol], depth: 1 }, { markets: [symbol, symbol] },
+    { markets: [] }, { markets: ['ordersPerps'] }, { markets: Array.from({ length: 41 }, (_, i) => `M${i}-USD.P`) }]) {
+    assert.throws(() => feeds.stream('ondo.top', input, () => {}, signal));
+  }
   assert.throws(() => feeds.stream('crossex.terminal', { symbol: identity.crossexSymbol, channel: 'orders' }, () => {}, signal));
   for (const invalidPrice of [1, '01', '0x10', '1e9', '0', '-1', '1'.repeat(79)]) {
     assert.throws(() => unpackBook({ time: to, bids: [[invalidPrice, '1']], asks: [] }, 5));

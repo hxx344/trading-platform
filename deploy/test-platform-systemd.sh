@@ -84,8 +84,8 @@ cp "$unitdir/$service.service.d/ci-loopback.conf" "$unitdir/$market.service.d/ci
 # Upgrade from genuine single-process and two-process releases, including their installers' on-disk state.
 old="$fixture/v0.63.0"
 dual="$fixture/v0.64.0"
-previous="$fixture/v0.65.0"
-for version in v0.63.0 v0.64.0 v0.65.0; do
+previous="$fixture/v0.66.0"
+for version in v0.63.0 v0.64.0 v0.66.0; do
   mkdir "$fixture/$version"
   for asset in SHA256SUMS trading-platform.tar.gz install.sh; do
     curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 10 --max-time 180 \
@@ -452,10 +452,10 @@ assert_page v0.63.0
 install_release 8
 login
 assert_page v99.1.8
-echo 'Roll back to the shipped hedge-chase release and upgrade to the independent market again'
+echo 'Roll back to the last two-process release and upgrade to the independent market again'
 bash "$root/deploy/install.sh" --package "$previous" >"$fixture/out" 2>&1
 login
-assert_page v0.65.0
+assert_page v0.66.0
 assert_market_absent
 install_release 8
 login

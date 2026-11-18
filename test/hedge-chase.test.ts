@@ -461,6 +461,47 @@ for (const [outcome, refusals, attempts, leadStatus] of [
   assert.deepEqual([h.binance.arrived.cancel, lead.status, hedge.status, h.binance.arrived.place], [manual ? 0 : attempts, leadStatus, 'partially-filled', 2]);
 }, { cancelAttempts: 3 }));
 
+for (const handoff of [false, true]) test(`停止时首腿撤单回报才确认异主，对冲原单须重新查实后${handoff ? '在签名时尊重人工接手' : '按原编号有限重试撤销'}`, () => withHarness(async h => {
+  const { jobId, lead, hedge } = await bothResting(h, 10_000);
+  h.binance.fillResting(hedge.request.clientOrderId, '0.1');
+  await h.ex.tickJobs();
+  assert.deepEqual(h.ex.jobView(jobId).legs.map(leg => [leg.operation!.verifiedWorking, leg.filledQuantity]), [[true, '0.5'], [true, '0.1']]);
+  const leadClientId = lead.request.clientOrderId, hedgeClientId = hedge.request.clientOrderId;
+  lead.request = { ...lead.request, clientOrderId: 'foreign-lead-owner' };
+  let hedgeVisible = false, hedgeRechecked = false;
+  const query = h.binance.query.bind(h.binance);
+  const missing: string[] = [];
+  h.binance.query = async (binding, request, options) => {
+    if (!hedgeVisible) h.binance.inject({ operation: 'query', mode: 'not-found', clientOrderId: request.clientOrderId });
+    const report = await query(binding, request, options);
+    if (report === null) missing.push(request.clientOrderId);
+    if (report?.remoteId === hedge.remoteId && report.status === 'partially-filled') hedgeRechecked = true;
+    return report;
+  };
+  const cancel = h.binance.cancel.bind(h.binance);
+  const attempts: { id: string | null | undefined; rechecked: boolean }[] = [];
+  h.binance.cancel = (binding, request, options) => cancel(binding, request, { ...options, beforeSend() {
+    attempts.push({ id: options.remoteId, rechecked: hedgeRechecked });
+    if (handoff && options.remoteId === hedge.remoteId && hedgeRechecked) h.ex.acknowledge(jobId, randomUUID(), SESSION);
+    options.beforeSend();
+  } });
+  h.ex.requestStop(jobId, randomUUID(), SESSION);
+  await h.ex.tickJobs();
+  await tick(h, h.ex.budgets.cancelRetryMs);
+  assert.deepEqual(new Set(missing), new Set([leadClientId, hedgeClientId]));
+  assert.deepEqual(attempts, [{ id: lead.remoteId, rechecked: false }], '第一笔撤单发现归属冲突，历史挂单记录不能授权同轮撤第二笔');
+  assert.deepEqual([h.ex.jobView(jobId).status, h.binance.arrived.cancel, hedge.status], ['attention', 1, 'partially-filled']);
+
+  hedgeVisible = true;
+  if (!handoff) h.binance.inject({ operation: 'cancel', mode: 'reject', clientOrderId: hedgeClientId });
+  for (let i = 0; i < 3; i++) await tick(h, h.ex.budgets.cancelRetryMs);
+  const view = h.ex.jobView(jobId);
+  assert.deepEqual(attempts.slice(1), Array(handoff ? 1 : 2).fill({ id: hedge.remoteId, rechecked: true }));
+  assert.deepEqual([view.locked, lead.status, hedge.status, h.binance.arrived.cancel, h.binance.arrived.place],
+    handoff ? [false, 'partially-filled', 'partially-filled', 1, 2] : [true, 'partially-filled', 'canceled', 3, 2]);
+  assert.deepEqual(view.legs.map(leg => [leg.operation!.clientOrderId, leg.filledQuantity]), [[leadClientId, '0.5'], [hedgeClientId, '0.1']]);
+}, { cancelAttempts: 2 }));
+
 for (const via of ['timeout', 'stop'] as const) test(`对冲挂单撤单用尽而首腿仍挂着（${via === 'timeout' ? '追价超时' : '请求停止'}）：先撤首腿，首腿撤单结清后才转人工`, () => withHarness(async h => {
   const { jobId, lead, hedge } = await bothResting(h, 2_000);
   h.binance.inject({ operation: 'cancel', mode: 'reject', times: 100, clientOrderId: hedge.request.clientOrderId });

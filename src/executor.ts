@@ -1901,10 +1901,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       let outcome: WriteOutcome | null = null;
       const beforeSend = () => {
         assertWriter();
-        if (guardedWithdrawal) {
-          if (readJob(job.id).acknowledgedAt != null) reject('already_acknowledged', '已人工接管，停止自动撤单', 409);
-          bindingStillValid(leg);
-        }
+        const latest = readJob(job.id);
+        if (latest.acknowledgedAt != null) reject('already_acknowledged', '已人工接管，停止自动撤单', 409);
+        if (FINAL_JOB.has(latest.status) && !guardedWithdrawal) reject('withdrawal_changed', '任务已转入结清或人工核对，本次撤单停止', 409);
+        if (guardedWithdrawal) bindingStillValid(leg);
         if (registered) control?.assertSend(registered, budgets.callTimeoutMs);
       };
       try {
@@ -1970,7 +1970,12 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const pastDeadline = now() >= job.deadlineAt;
     // After a takeover nothing new is sent, so resting orders are withdrawn instead of waiting for the deadline; so too when the hedge cannot go on.
     const withdraw = stop || pastDeadline || job.holdNewSends || !!job.leadWithdraw || !!job.peerHalt;
-    for (const op of opsOf(job.id).filter(item => item.state === 'open')) if (wantsStop(op, withdraw)) await cancel(job, op, withdraw ? undefined : '追价策略被交易所暂停，已停止；按实际成交对冲');
+    for (const op of opsOf(job.id).filter(item => item.state === 'open')) {
+      if (!wantsStop(op, withdraw)) continue;
+      const latest = readJob(job.id);
+      if (FINAL_JOB.has(latest.status)) return;
+      await cancel(latest, op, withdraw ? undefined : '追价策略被交易所暂停，已停止；按实际成交对冲');
+    }
     job = readJob(job.id);
     const deviation = job.leadDeviation ?? null;
     if (FINAL_JOB.has(job.status)) return;

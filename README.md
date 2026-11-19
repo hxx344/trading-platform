@@ -83,6 +83,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
   - 它判断的是进程在运行、持有租约、这些循环没卡住，**发现不了交易所连不上**：划转、ADL、持仓读取单轮里的交易所报错都记在各自的状态与事件里，这一轮仍算完成，接口照样是 200；这类故障由服务自己的飞书告警和页面提示处理。例外是配了原油、有未结束的两腿任务且交易所持续超时的时候，两腿任务循环一轮可能超过 3 分钟，接口会暂时变成 503。
   - 只支持 GET（HEAD、OPTIONS 等方法照旧要登录，返回 401）。接口只在服务监听的地址上可达（`127.0.0.1` 与 `config.json` 的 `host`），Host 头检查照旧（须是本机回环地址或 `config.json` 的 `host`），不需要也不应该为它对公网开放端口。
   - 副服务器能直连本机（例如同在一个 Tailscale 网络）时，可以让副服务器的巡检直接探测 `http://<本机 Tailscale IP>:4720/api/ready`（`install-watch.sh --main <本机 Tailscale IP>:4720`）。连不到时用下一条的心跳。
+- EQN 快讯与异动行情（v0.71.0 起，见 [docs/news.md](docs/news.md)）：侧栏「快讯」页与行情监控「异动行情」页签，只读展示 eqn.news 的公开快讯。默认开启，服务器需能出站访问 `api.eqn.news:443`；不需要时在 `config.json` 写 `"news": false` 再执行一次 `sudo bash install.sh`。
 - 副服务器巡检心跳（v0.47.0 起，见 [docs/watch.md](docs/watch.md)）：本服务每 30 秒向副服务器推送一次签名心跳，带上是否就绪；副服务器 90 秒收不到或收到“未就绪”算一次失败，连续 3 次（约 3～5 分钟）发飞书告警。主服务器只有出站连接，不用开端口，也不用另装程序。
   - 副服务器：`curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/install-watch.sh && sudo bash install-watch.sh --heartbeat-listen 0.0.0.0:8792 --webhook <飞书机器人地址> --name 统一交易平台`，安全组放行 TCP 8792、来源只填本机公网 IP。已部署过（含工作台版本的 main-watch）时不带参数执行即升级，配置保留。
   - 本机：执行副服务器脚本结束时打印的命令 `sudo bash install.sh --watch-url http://<副服务器 IP>:8792/heartbeat --watch-token <令牌>`。本机装过工作台推送端的，用 `sudo bash install.sh --watch-import` 直接沿用它的地址与令牌，并停用它（之后副服务器只收到本服务的就绪情况，工作台不再上报）。关闭用 `sudo bash install.sh --watch-off`。这几个开关沿用当前已装版本，不联网升级。
@@ -97,6 +98,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 | 回退到早于 | 回退前要做的事 | 说明 | 详见 |
 | --- | --- | --- | --- |
+| v0.71.0 | 从 `config.json` 删掉 `news`（只在写过时） | 旧版本不认识 `news`，配置检查失败；快讯与异动行情不落库，没有数据要处理 | [docs/news.md](docs/news.md) 第 6 节 |
 | v0.67.0 | 用支持独立行情服务的安装器指定旧版 | 回到 v0.66.0 等双进程版本会停用行情单元，由旧执行进程接回采集，沿用原数据目录 | [docs/update.md](docs/update.md) |
 | v0.64.0 | 用 v0.64.0 或更新的安装器指定旧版本 | 安装器停止控制面、释放页面端口并恢复单进程。返回 v0.63.0 可直接沿用配置和业务库 | [docs/update.md](docs/update.md) |
 | v0.61.0 | 不用改配置 | 旧版本的 Ondo 奖励市场盘口改回每分钟向交易所读一次（REST），重启后平均值与波动重新累积 | [docs/ondo.md](docs/ondo.md) 第 5 节 |

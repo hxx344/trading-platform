@@ -158,6 +158,8 @@ export interface ServiceViews {
   ondo?: OndoViews;
   /** The online update (service/update.ts): versions, a manual check, and the request to the root update helper. */
   update?: { status(): unknown; check(): Promise<unknown>; apply(body: unknown): unknown };
+  /** EQN 快讯与异动行情（service/news.ts，docs/news.md）；config.json 写了 `"news": false` 时没有。读取在连接开始前为 null。 */
+  news?: { flash(): unknown; moves(): unknown };
 }
 
 /** accessToken is exchanged once per browser at /login; session is the cookie value and the executor session id. */
@@ -771,6 +773,11 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
         return send(response, failure.status, failure.body);
       }
       return send(response, 404, { code: 'not_found', message: '不存在' });
+    }
+    if (request.method === 'GET' && (url.pathname === '/api/news' || url.pathname === '/api/news/moves')) {
+      if (!views?.news) return send(response, 404, { code: 'not_found', message: '本服务没有开启 EQN 快讯' });
+      const view = url.pathname === '/api/news' ? views.news.flash() : views.news.moves();
+      return view === null ? send(response, 503, { code: 'not_ready', message: 'EQN 快讯正在启动' }) : send(response, 200, view);
     }
     if (request.method === 'GET' && (url.pathname === '/api/logs' || url.pathname === '/api/logs/problems')) {
       if (!views?.logs) return send(response, 404, { code: 'not_found', message: '本服务没有页面日志' });

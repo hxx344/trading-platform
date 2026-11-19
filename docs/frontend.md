@@ -29,7 +29,8 @@
 | --- | --- | --- | --- | --- |
 | 总览与资产 | 资产 | `#/asset` | `GET /api/asset/state` 不是 404（配置了 `asset`；账本读取失败时也显示） | 《资产页》《资产页写入》《资产页同步与交易所连接》 |
 | 总览与资产 | 持仓 | `#/positions` | 同资产（与资产页共用探测） | 《持仓页与成交标记（Asset A-5）》 |
-| 市场与机会 | 行情监控 | `#/monitor` | `GET /api/monitor/state` 有应答（配置了 `monitor`） | 《行情监控页》及其后 M-2a 至 M-3c 各节、《持仓页与成交标记（Asset A-5）》 |
+| 市场与机会 | 行情监控 | `#/monitor` | `GET /api/monitor/state` 有应答（配置了 `monitor`） | 《行情监控页》及其后 M-2a 至 M-3c 各节、《持仓页与成交标记（Asset A-5）》；「异动行情」页签见《EQN 快讯与异动行情》 |
+| 市场与机会 | 快讯 | `#/news` | `GET /api/news` 有应答或返回 503（默认开启，`config.json` 写 `"news": false` 时不显示） | 《EQN 快讯与异动行情》，做法见 [news.md](news.md) |
 | 交易中心 | 原油 | `#/oil` | `GET /api/oil/state` 有应答（配置了 `oil`） | 《原油页样式》《原油自动规则区块》《原油盈亏与资金费》，页面内容见 [oil.md](oil.md) 第 3 节 |
 | 交易中心 | 海力士 | `#/hynix` | 同原油（海力士与原油共用执行账户，沿用原油状态的探测，不另发请求） | 《海力士页》，页面内容见 [hynix.md](hynix.md) 第 3 节 |
 | 交易中心 | CrossEx | `#/crossex`，子页 `#/crossex/trade`、`#/crossex/hedge`、`#/crossex/orders`、`#/crossex/settings` | `GET /api/crossex/state` 有应答或返回 503（配置了 `crossex`；已配置但未启动、后台重试中也显示） | 《CrossEx 页》 |
@@ -689,3 +690,14 @@
 
 **回滚**：回退到 v0.68.1，面板与侧栏提示随之消失；`read-token.json` 留在数据目录不影响旧版本。
 
+## EQN 快讯与异动行情（v0.71.0）
+
+**对照的工作台页面**：工作台没有快讯页面。快讯页按日志页的 `panel` + `section-head` + 筛选框拼，连接状态用运行状态页的 `.connection`（`mint` / `amber`）；异动行情页签用行情监控页已有的 `table-panel`、`section-heading`、`segmented`。
+
+**页面**：侧栏「市场与机会」行情监控之后新增「快讯」（`#/news`，在 `.aster-module` 内）；行情监控页签最后新增「异动行情」，没有运行开关。两处共用 `web/src/NewsList.tsx`，数据校验与文案在 `web/src/news.ts`。内容与刷新间隔见 [news.md](news.md) 第 4 节。
+
+**样式**：`styles.css` 末尾的快讯一节，只用 `--foreground`、`--muted-foreground`、`--border`、`--primary` 和间距、圆角令牌，两处页面各取所在页的配色。行情监控页的 `.monitor-desk button` 给按钮 40px 最小高度并重设字体，币种标签用 `.news-list .news-coin` 还原成标签尺寸（只是筛选捷径，搜索框仍可用）。手机宽度时间放到标题上方。
+
+**验证**：`scripts/dev-monitor.ts` 预览接上替身 EQN（`test/news-fake.ts`），无头浏览器 1280 与 390 宽度：两处页面、频道与币种筛选、推送到达后经 REST 核对去掉“推送”标记，无横向滚动、无 CSP 报错。
+
+**回滚**：回退到 v0.70.2，入口与页签随之消失；`config.json` 写过 `"news"` 的先删掉。

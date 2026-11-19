@@ -13,7 +13,7 @@ export const workspaceLabels: Record<WorkspaceId, string> = {
   options: '期权', onchain: '链上', research: '研究室', system: '系统',
 };
 
-export type NavEntry = 'asset' | 'positions' | 'monitor' | 'oil' | 'hynix' | 'crossex' | 'ondo' | 'pairs' | 'options' | 'status' | 'logs' | 'settings';
+export type NavEntry = 'asset' | 'positions' | 'monitor' | 'news' | 'oil' | 'hynix' | 'crossex' | 'ondo' | 'pairs' | 'options' | 'status' | 'logs' | 'settings';
 
 /** Every entry of the side navigation, in its order inside the workspace. A new page is registered here. */
 export const navEntries: Record<NavEntry, { workspace: WorkspaceId; text: string; href: string }> = {
@@ -21,6 +21,8 @@ export const navEntries: Record<NavEntry, { workspace: WorkspaceId; text: string
   // 持仓页（A-5）：资产账本已连接账户的持仓，只读；与资产页同条件显示。
   positions: { workspace: 'overview', text: '持仓', href: '#/positions' },
   monitor: { workspace: 'market', text: '行情监控', href: '#/monitor' },
+  // EQN 快讯（docs/news.md）：/api/news 有应答时显示（config.json 写了 "news": false 时没有）。
+  news: { workspace: 'market', text: '快讯', href: '#/news' },
   oil: { workspace: 'trading', text: '原油', href: '#/oil' },
   hynix: { workspace: 'trading', text: '海力士', href: '#/hynix' },
   crossex: { workspace: 'trading', text: 'CrossEx', href: '#/crossex' },

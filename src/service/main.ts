@@ -51,6 +51,8 @@ import { createServiceLog, teeStream, type ServiceLog } from './service-log.ts';
 import { createReadTokens } from '../read-token.ts';
 import { createSummary, type Summary, type SummaryInput } from './summary.ts';
 import { createWatch, watchLoop, watchSummary, type Watch } from './watch.ts';
+import { newsLoop, newsViews, type NewsHolder } from './news.ts';
+import type { NewsOptions } from '../news/feed.ts';
 
 const NOTIFY_MS = 2_000;
 const SUMMARY_TICK_MS = 5_000;
@@ -247,6 +249,8 @@ export interface StartOptions {
   updateFetch?: UpdateFetch;
   /** Tests stand in for the second server's heartbeat receiver and shorten the cadence (only with config.watch). */
   watchOptions?: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; firstMs?: number; intervalMs?: number };
+  /** EQN 快讯与异动行情（docs/news.md）；不给就不连。命令行入口在 config.json 没写 `"news": false` 时给出。 */
+  news?: NewsOptions;
 }
 
 /** Opens the data directory, wires the executor and runs it with the alerts and the user streams until shutdown. */
@@ -271,7 +275,7 @@ export async function startService(options: StartOptions): Promise<ReturnType<ty
   catch (error) { closeLogs(); throw error; }
 }
 
-async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, socketPath, executionBuild, configBuild, marketClient, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, ondoOptions, watchOptions, updateFetch }: StartOptions & { marketClient?: MarketClient }, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
+async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, socketPath, executionBuild, configBuild, marketClient, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, ondoOptions, watchOptions, updateFetch, news: newsOptions }: StartOptions & { marketClient?: MarketClient }, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
   const updates = socketPath === undefined ? (await import('./update.ts')).createServiceUpdates(importDir, updateFetch) : undefined;
   const session = keptSession(dir);
   // O7: the oil and hynix books come from the market monitor's perpetual collector when it has a recent one (oil/pushed.ts);
@@ -406,6 +410,8 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   let watch: Watch | null = null;
   // The read-only API token (docs/mcp.md); without read-token.json no token is accepted.
   const readTokens = createReadTokens({ dir });
+  // 快讯连接随后台循环开关，启动失败时不会留下连接。
+  const news: NewsHolder | null = newsOptions ? { feed: null } : null;
   return runExecutor({
     executor, store, dir, port, socketPath, executionBuild, configBuild, app, session, readTokens,
     ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: oil ? ['jobs', 'transfers', 'adl'] : ['transfers', 'adl'], drainMs: DRAIN_MS,
@@ -427,6 +433,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(ondo ? { ondo: ondo.views } : {}),
       ...(logs ? { logs: (filter: 'all' | 'problems', before: number | null, limit: number) => logs.page({ filter, before, limit }) } : {}),
       ...(updates ? { update: updates } : {}),
+      ...(news ? { news: newsViews(news) } : {}),
     },
     ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir),
       ...(socketPath !== undefined ? { legacyUpdate: () => legacyUpdateJob(importDir) } : {}) } } : {}),
@@ -474,6 +481,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(crossex ? [crossex.loop(context, { notifyOnce: (key, text) => notifier.notifyOnce(key, text), notify: text => notifier.notify(text), log: line => process.stderr.write(`${line}\n`) })] : []),
       // Samples the reward markets; on stop it withdraws a live session's quotes inside the drain.
       ...(ondo ? [ondo.loop(context)] : []),
+      ...(news && newsOptions ? [newsLoop(news, newsOptions, context)] : []),
       ...(config.watch && secrets.watch ? [watchLoop(watch = createWatch({ config: config.watch, secret: secrets.watch, problem: context.notReady, ...(watchOptions?.fetchImpl ? { fetchImpl: watchOptions.fetchImpl } : {}), log: line => process.stderr.write(`${line}\n`) }), context, watchOptions)] : []),
     ],
     onStopping: (reason, detail) => {
@@ -549,7 +557,7 @@ async function main(): Promise<void> {
   const app = values.socket === undefined ? (await import('../web-assets.ts')).loadWebApp() : undefined;
   const marketSocketPath = values['market-socket'];
   if (marketSocketPath !== undefined && !isAbsolute(marketSocketPath)) throw new Error('--market-socket 必须是绝对路径');
-  await startService({ config, secrets, dir, socketPath: values.socket, marketSocketPath, configBuild, app, ...(importDir ? { importDir } : {}), ...(password ? { password } : {}) });
+  await startService({ config, secrets, dir, socketPath: values.socket, marketSocketPath, configBuild, app, ...(importDir ? { importDir } : {}), ...(password ? { password } : {}), ...(config.news === false ? {} : { news: {} }) });
 }
 
 if (import.meta.main) main().catch(error => { process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; });

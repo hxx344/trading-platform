@@ -12,6 +12,8 @@ import { linkedMonitorTab, withoutMonitorLink } from './monitor-link.ts';
 import { HynixPanel } from './MonitorHynix.tsx';
 import { OilPanel } from './MonitorOil.tsx';
 import { PerpetualPanel } from './MonitorPerpetual.tsx';
+import { MovesPanel } from './MonitorMoves.tsx';
+import { NEWS_PATH, NEWS_READ_TIMEOUT_MS, parseFlash, type FlashView } from './news.ts';
 import { StatePanel } from './StateViews.tsx';
 import { useLiveResource } from './use-live-resource.ts';
 import { mainQuoteRetention, quoteIsCurrent } from './monitor-display.ts';
@@ -52,13 +54,18 @@ const notReady = (error: Error | null) => error instanceof ApiError && error.sta
 // Validation errors are internal English text; only the service's (Chinese) messages are shown as they are.
 const readable = (error: Error, fallback: string) => /[一-鿿]/.test(error.message) ? error.message : fallback;
 
-const MARKET_TABS: Record<string, string> = { anthropic: 'Anthropic', oil: '原油', hynix: '海力士', perpetual: '合约价差' };
+const MARKET_TABS: Record<string, string> = { anthropic: 'Anthropic', oil: '原油', hynix: '海力士', perpetual: '合约价差', moves: '异动行情' };
+/** EQN 异动行情（docs/news.md）：不是服务端的监控市场，没有运行开关；/api/news 有应答时排在最后。 */
+const MOVES_TAB = 'moves';
 const TAB_KEY = 'monitor:market:v1';
 const savedTab = () => { try { return localStorage.getItem(TAB_KEY); } catch { return null; } };
 // M-5c: a pair-chart link opens its market over the saved tab, also on back / forward (monitor-link.ts).
 
 export function MonitorPage({ onExpired }: { onExpired: () => void }) {
   const state = useLiveResource<MonitorState>(MONITOR_STATE_PATH, { intervalMs: STATE_MS, timeoutMs: MONITOR_READ_TIMEOUT_MS, parse: parseMonitorState, onExpired });
+  // 与侧栏的快讯入口共用同一读取（同路径、同超时与校验），只决定异动行情页签是否显示；不读 /api/news/moves，免得没看时也触发轮询。
+  const news = useLiveResource<FlashView>(NEWS_PATH, { intervalMs: STATE_MS, timeoutMs: NEWS_READ_TIMEOUT_MS, parse: parseFlash, onExpired });
+  const newsOn = news.data !== null || (news.error instanceof ApiError && news.error.status === 503);
   const [chosen, setChosen] = useState<string | null>(() => linkedMonitorTab(location.href) ?? savedTab());
   const [pending, setPending] = useState<string | null>(null);
   const [switchError, setSwitchError] = useState<{ market: string; text: string } | null>(null);
@@ -92,7 +99,7 @@ export function MonitorPage({ onExpired }: { onExpired: () => void }) {
     return <StatePanel kind="error" title="读取行情监控失败" detail={state.error?.message ?? '网络离线'} />;
   if (!state.data) return <StatePanel kind="loading" title="加载中…" />;
   // Markets this page can show, in the service's order; a market a newer service adds stays hidden here.
-  const markets = state.data.markets.filter(market => market in MARKET_TABS);
+  const markets = [...state.data.markets.filter(market => market in MARKET_TABS && market !== MOVES_TAB), ...(newsOn ? [MOVES_TAB] : [])];
   if (!markets.length) return <StatePanel kind="empty" title="本服务没有启用行情监控" />;
   const active = chosen && markets.includes(chosen) ? chosen : markets[0];
   const choose = (market: string) => {
@@ -103,7 +110,7 @@ export function MonitorPage({ onExpired }: { onExpired: () => void }) {
   const control = state.data.controls?.[active];
   const busy = pending === active, failed = switchError?.market === active;
   // The run switch sits on the right of the market tabs, as in the workbench hub; with one market the row shows only it.
-  const controls = state.data.controls && <div className="hub-monitor-controls"><span>运行监控</span><button type="button" role="switch" aria-checked={control?.enabled ?? false} aria-busy={busy} aria-label={`${MARKET_TABS[active]}运行监控`} disabled={!control || pending !== null} onClick={() => void toggle(active)}><span>{switchLabel(control, busy, failed)}</span><i aria-hidden="true" /></button></div>;
+  const controls = state.data.controls && active !== MOVES_TAB && <div className="hub-monitor-controls"><span>运行监控</span><button type="button" role="switch" aria-checked={control?.enabled ?? false} aria-busy={busy} aria-label={`${MARKET_TABS[active]}运行监控`} disabled={!control || pending !== null} onClick={() => void toggle(active)}><span>{switchLabel(control, busy, failed)}</span><i aria-hidden="true" /></button></div>;
   const off = control?.enabled === false;
   // Only the shown market subscribes. Switching it off unmounts the panel and its readers.
   return <div className="monitor-desk">
@@ -112,7 +119,7 @@ export function MonitorPage({ onExpired }: { onExpired: () => void }) {
       {failed && <p className="hub-control-notice" role="alert">{switchError.text}</p>}
       {control?.error && <p className="hub-control-notice" role="alert">{control.error}</p>}
       {off ? <p className="notice" role="status">{disabledNotice(active)}</p>
-        : active === 'oil' ? <OilPanel onExpired={onExpired} /> : active === 'hynix' ? <HynixPanel onExpired={onExpired} /> : active === 'perpetual' ? <PerpetualPanel onExpired={onExpired} /> : shares && <AnthropicPanel outstanding={shares.outstanding} diluted={shares.diluted} onExpired={onExpired} />}
+        : active === MOVES_TAB ? <MovesPanel onExpired={onExpired} /> : active === 'oil' ? <OilPanel onExpired={onExpired} /> : active === 'hynix' ? <HynixPanel onExpired={onExpired} /> : active === 'perpetual' ? <PerpetualPanel onExpired={onExpired} /> : shares && <AnthropicPanel outstanding={shares.outstanding} diluted={shares.diluted} onExpired={onExpired} />}
     </div></div>
   </div>;
 }

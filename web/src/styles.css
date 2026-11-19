@@ -303,3 +303,37 @@ table.data.history{min-width:0}
 .read-token-commands{margin:0;padding:var(--space-sm) var(--space-md);background:var(--surface-2);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:.75rem;white-space:pre-wrap;overflow-wrap:anywhere}
 .read-token-original{font-family:var(--font-mono);overflow-wrap:anywhere;color:var(--text-primary)}
 [data-read-token-issued] input{font-family:var(--font-mono)}
+/* EQN 快讯（docs/news.md）：快讯页（.aster-module 里的面板）与行情监控「异动行情」页签共用的列表。只用两处都有的
+   --foreground、--muted-foreground、--border、--primary、--secondary 令牌，各自取所在页面的配色。 */
+.news-toolbar{display:flex;align-items:center;gap:var(--space-sm);padding:var(--space-md) 14px 0}
+.news-toolbar input{max-width:320px}
+.news-toolbar .muted{white-space:nowrap}
+.news-list{list-style:none;margin:var(--space-sm) 0 0;padding:0}
+.news-item{display:grid;grid-template-columns:5.5rem minmax(0,1fr);gap:var(--space-md);padding:var(--space-md) 14px;border-top:1px solid var(--border)}
+.news-item[data-pushed]{border-left:2px solid var(--primary)}
+.news-time{font-family:var(--font-mono);font-size:.75rem;color:var(--muted-foreground);font-variant-numeric:tabular-nums;padding-top:2px}
+.news-body{min-width:0}
+.news-title{margin:0;color:var(--foreground);font-size:.875rem;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}
+.news-en{margin:var(--space-xs) 0 0;color:var(--muted-foreground);font-size:.75rem;white-space:pre-wrap;overflow-wrap:anywhere}
+.news-points{margin:var(--space-xs) 0 0;padding-left:1.1rem;color:var(--foreground);font-size:.8125rem;line-height:1.6}
+.news-overview{margin-top:var(--space-xs);font-size:.75rem;color:var(--muted-foreground)}
+.news-overview>p{margin:var(--space-xs) 0 0;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65}
+.news-meta{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-xs) var(--space-sm);margin-top:var(--space-xs);font-size:.75rem;color:var(--muted-foreground)}
+.news-meta a{color:var(--primary)}
+.news-tag,.news-coin{display:inline-flex;align-items:center;padding:0 var(--space-xs);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:.6875rem;line-height:1.5;color:var(--muted-foreground);background:transparent}
+.news-coin{font-family:var(--font-mono);color:var(--foreground);cursor:pointer}
+/* 行情监控页的 .monitor-desk button 会重设字体、圆角并给 40px 最小高度；币种标签只是筛选捷径（搜索框仍可用），按标签尺寸还原。 */
+.news-list .news-coin{font:.6875rem/1.5 var(--font-mono);border-radius:var(--radius-sm);padding:0 var(--space-xs);min-height:0}
+span.news-coin{cursor:default}
+.news-coin:hover{border-color:var(--primary)}
+.news-coin:focus-visible{outline:2px solid var(--primary);outline-offset:1px}
+.moves-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-sm);padding:0 23px var(--space-sm)}
+.moves-toolbar input{max-width:240px}
+.moves-toolbar .segmented{flex-wrap:wrap}
+.moves-desk .news-item{padding-inline:23px}
+.moves-note{margin:0;padding:var(--space-md) 23px;border-top:1px solid var(--border);font-size:.75rem;color:var(--muted-foreground)}
+@media (max-width:720px){
+  .news-item{grid-template-columns:1fr;gap:var(--space-xs)}
+  .news-toolbar input,.moves-toolbar input{max-width:none;flex:1 1 160px}
+  .moves-toolbar,.moves-desk .news-item,.moves-note{padding-inline:16px}
+}

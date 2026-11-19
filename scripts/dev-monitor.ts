@@ -1,4 +1,4 @@
-// A local preview of the monitor page on the stand-in venues of test/monitor-fake.ts: a simulated executor, the built
+// A local preview of the monitor page (and the EQN news page, test/news-fake.ts) on the stand-in venues of test/monitor-fake.ts: a simulated executor, the built
 // page and the Anthropic, oil, Hynix and perpetual-spread collectors in a throwaway data directory, removed on exit. Nothing goes to the network. Unlike the
 // service it takes no account locks and writes no environment marker, so it also runs on Windows.
 //   pnpm build:web; node scripts/dev-monitor.ts [--port 4731]
@@ -15,6 +15,8 @@ import { parseMonitorConfig } from '../src/service/monitor-config.ts';
 import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, settleMonitor, stopMonitor } from '../src/service/monitor.ts';
 import { fakeAnthropicVenues } from '../test/monitor-fake.ts';
 import { fakePerpetualVenues } from '../test/perpetual-fake.ts';
+import { fakeNews } from '../test/news-fake.ts';
+import { newsLoop, newsViews } from '../src/service/news.ts';
 
 const { values } = parseArgs({ options: { port: { type: 'string', default: '4731' } } });
 const port = Number(values.port);
@@ -38,11 +40,13 @@ const { binance, bybit, aster, asterTrading } = createSimulatedVenues(Date.now);
 const executor = createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, positions: asterTrading });
 if (!executor.acquire()) throw new Error('写入租约被占用');
 
+// EQN 快讯与异动行情（docs/news.md）也用替身。
+const news = { feed: null };
 const run = runExecutor({
   executor, store, dir, port, app, passes: [],
-  views: { monitor: monitorViews(monitor), status: () => ({ monitor: { available: true, error: null, ...monitorStatus(monitor) } }) },
+  views: { monitor: monitorViews(monitor), news: newsViews(news), status: () => ({ monitor: { available: true, error: null, ...monitorStatus(monitor) } }) },
   startedMessage: `行情监控预览（替身行情）已启动，数据目录 ${dir}`,
-  background: context => monitorLoops(monitor, context),
+  background: context => [...monitorLoops(monitor, context), newsLoop(news, fakeNews(), context)],
   onStopping: () => stopMonitor(monitor),
   onStopped: async () => { await settleMonitor(monitor); closeMonitor(monitor); },
 });

@@ -17,6 +17,7 @@
 | 期权 Greeks | [docs/options.md](docs/options.md) |
 | Ondo 挂单奖励（挂单引擎、奖励市场盘口与收益模拟） | [docs/ondo.md](docs/ondo.md) |
 | 行情监控（含海力士溢价监控与告警） | [docs/monitor.md](docs/monitor.md) |
+| EQN 快讯、行情监控「异动行情」页签 | [docs/news.md](docs/news.md) |
 | 资产账本 | [docs/asset.md](docs/asset.md) |
 | 页面在线更新（系统更新）、`trading-platform-update.*` 单元、`update-helper.ts` | [docs/update.md](docs/update.md) |
 | 只读 MCP 接入、只读接口令牌 | [docs/mcp.md](docs/mcp.md) |

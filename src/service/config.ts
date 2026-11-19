@@ -51,6 +51,8 @@ export interface ServiceConfig {
   summary?: { intervalMinutes: number };
   /** Where the heartbeat for the second server's main-watch goes (watch.ts); absent: none is pushed. */
   watch?: WatchConfig;
+  /** EQN 快讯与异动行情（docs/news.md）；不写为开启，`"news": false` 关闭。 */
+  news?: boolean;
 }
 export interface FeishuSecret { webhook: string; secret: string | null }
 export interface ServiceSecrets {
@@ -134,7 +136,7 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   // pairs may be left out only when another module is there: at least one module must be configured.
   const modules = raw !== null && typeof raw === 'object' ? MODULE_KEYS.filter(key => Object.hasOwn(raw, key)) : [];
   const hasModule = modules.length > 0;
-  const value = exactKeys(raw, hasModule ? ['secretsFile'] : ['secretsFile', 'pairs'], ['port', 'host', 'budget', 'summary', 'watch', ...(hasModule ? ['pairs', ...modules] : [])]);
+  const value = exactKeys(raw, hasModule ? ['secretsFile'] : ['secretsFile', 'pairs'], ['port', 'host', 'budget', 'summary', 'watch', 'news', ...(hasModule ? ['pairs', ...modules] : [])]);
   const oil = modules.includes('oil') ? parseOilConfig(value.oil) : undefined;
   const options = modules.includes('options') ? parseOptionsConfig(value.options) : undefined;
   const monitor = modules.includes('monitor') ? parseMonitorConfig(value.monitor) : undefined;
@@ -173,7 +175,8 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   if (limitPerMinute - adlReserve < needed) throw new Error(`${pairs.length} 个配对每分钟约需请求权重 ${needed}，而每分钟上限 ${limitPerMinute} 减去 ADL 预留 ${adlReserve} 只剩 ${limitPerMinute - adlReserve}；请调大 budget.limitPerMinute 或去掉 budget 使用自动值`);
   const summary = value.summary === undefined ? undefined : { intervalMinutes: integer(exactKeys(value.summary, ['intervalMinutes'], []).intervalMinutes, 0, 1_440, '定时摘要间隔（分钟，0 为关闭）') };
   const watch = value.watch === undefined ? undefined : parseWatchConfig(value.watch);
-  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs, ...(oil ? { oil } : {}), ...(options ? { options } : {}), ...(monitor ? { monitor } : {}), ...(asset ? { asset } : {}), ...(summary ? { summary } : {}), ...(crossex ? { crossex } : {}), ...(ondo ? { ondo } : {}), ...(watch ? { watch } : {}) };
+  if (value.news !== undefined && typeof value.news !== 'boolean') throw new Error('news 须为 true 或 false（EQN 快讯，不写为开启）');
+  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs, ...(oil ? { oil } : {}), ...(options ? { options } : {}), ...(monitor ? { monitor } : {}), ...(asset ? { asset } : {}), ...(summary ? { summary } : {}), ...(crossex ? { crossex } : {}), ...(ondo ? { ondo } : {}), ...(watch ? { watch } : {}), ...(value.news === false ? { news: false } : {}) };
 }
 
 export function parseServiceSecrets(raw: unknown, needed: readonly string[], oilVenues: readonly Venue[] = [], options = false, crossex = false, ondo = false): ServiceSecrets {

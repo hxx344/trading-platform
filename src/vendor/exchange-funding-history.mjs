@@ -8,7 +8,7 @@
 // - 不带 Aster、Bitget USDC 合约、调用方自带合约目录与 onProgress（工作台其它页面才用）；
 // - 页面统一用 UTC：区间输入框按 UTC 解析与显示（工作台按北京时间）；
 // - Lighter 合约目录由调用方传入（读取器复用 M-2c 已缓存的目录），请求函数与时钟都由调用方注入；
-// - 两腿合并抽成 mergeFundingHistory（工作台写在读取器闭包里），不再接收 monitorId 默认值。
+// - 服务端按每腿已落盘的原始结算和完整区间投影快照。
 import { COMPARISON_EXCHANGES, exchangeDefinition, supportsExchange } from './exchange-comparison.mjs';
 
 export const HISTORY_REFRESH_MS = 300_000;
@@ -21,6 +21,7 @@ const EARLIEST = Date.UTC(2020, 0, 1);
 
 export const fundingHistoryExchanges = market => COMPARISON_EXCHANGES[market].filter(exchange => exchange !== 'variational');
 export const supportsFundingHistory = (market, exchange) => exchange !== 'variational' && supportsExchange(market, exchange);
+export const fundingLegStale = (leg, now) => leg.fetchedAt !== null && now > (leg.freshUntil ?? Date.parse(leg.fetchedAt) + HISTORY_STALE_MS);
 
 /** Preserve the original settlement timestamps; asynchronous legs are never paired by a time bucket. */
 export function normalizeSettledFunding(records, now) {
@@ -46,21 +47,33 @@ export function validateExchangeFundingHistory(input, exchange, monitorId) {
     const leg = value[side];
     if (!leg || leg.symbol !== symbol || typeof leg.error !== 'string' || (leg.fetchedAt !== null && (!stamp(leg.fetchedAt) || Date.parse(leg.fetchedAt) > now))) throw new Error('Invalid history leg metadata');
     const coverage = leg.coverage;
-    if (coverage != null && (!Number.isSafeInteger(coverage.from) || !Number.isSafeInteger(coverage.to) || coverage.from < EARLIEST || coverage.from > coverage.to || leg.fetchedAt === null || coverage.to > Date.parse(leg.fetchedAt))) throw new Error('Invalid funding query coverage');
+    if (leg.freshUntil !== undefined && (!coverage || !Number.isSafeInteger(leg.freshUntil) || leg.freshUntil < EARLIEST
+      || leg.freshUntil > coverage.to + 24 * 3_600_000 + HISTORY_STALE_MS)) throw new Error('Invalid history leg freshness');
+    const validRange = r => r && Number.isSafeInteger(r.from) && Number.isSafeInteger(r.to) && r.from >= EARLIEST && r.from <= r.to && leg.fetchedAt !== null && r.to <= Date.parse(leg.fetchedAt);
+    if (coverage != null && !validRange(coverage)) throw new Error('Invalid funding query coverage');
+    if (leg.ranges !== undefined && (!Array.isArray(leg.ranges) || leg.ranges.length < 2 || leg.ranges.length > HISTORY_LEG_LIMIT
+      || !leg.ranges.every((r, i) => validRange(r) && (!i || leg.ranges[i - 1].to < r.from))
+      || coverage?.from !== leg.ranges.at(-1).from || coverage?.to !== leg.ranges.at(-1).to)) throw new Error('Invalid funding query ranges');
   }
+  // A multi-page query is bounded by the requested end, while fetchedAt is the later real receipt.
+  // A legacy leg without stored query coverage uses its receipt as its only known bound.
+  const end = Math.max(...[value.left, value.right].map(leg => leg.coverage?.to ?? (leg.fetchedAt ? Date.parse(leg.fetchedAt) : 0)));
   const seen = new Set(), counts = { left: 0, right: 0 };
   for (const row of value.rows) {
-    if (!row || !Number.isSafeInteger(row.time) || row.time < now - HISTORY_WINDOW_MS || row.time > now || seen.has(row.time) || (row.leftRate === null && row.rightRate === null)) throw new Error('Invalid history settlement time');
+    if (!row || !Number.isSafeInteger(row.time) || row.time < end - HISTORY_WINDOW_MS || row.time > end || seen.has(row.time) || (row.leftRate === null && row.rightRate === null)) throw new Error('Invalid history settlement time');
     seen.add(row.time);
     for (const side of ['left', 'right']) {
       const rate = row[`${side}Rate`];
       if (rate === null) continue;
       if (typeof rate !== 'number' || !Number.isFinite(rate) || Math.abs(rate) > 1 || value[side].fetchedAt === null || row.time > Date.parse(value[side].fetchedAt) || ++counts[side] > HISTORY_LEG_LIMIT) throw new Error('Invalid settled funding rate');
       const coverage = value[side].coverage;
-      if (coverage != null && (row.time < coverage.from || row.time > coverage.to)) throw new Error('Settlement outside funding query coverage');
+      if (coverage != null && !(value[side].ranges ?? [coverage]).some(r => r.from <= row.time && r.to >= row.time)) throw new Error('Settlement outside funding query coverage');
     }
   }
-  const leg = side => ({ symbol: value[side].symbol, fetchedAt: value[side].fetchedAt, error: value[side].error, coverage: value[side].coverage == null ? null : { from: value[side].coverage.from, to: value[side].coverage.to } });
+  const copy = r => ({ from: r.from, to: r.to });
+  const leg = side => ({ symbol: value[side].symbol, fetchedAt: value[side].fetchedAt, error: value[side].error,
+    coverage: value[side].coverage == null ? null : copy(value[side].coverage), ...(value[side].ranges ? { ranges: value[side].ranges.map(copy) } : {}),
+    ...(value[side].freshUntil !== undefined ? { freshUntil: value[side].freshUntil } : {}) });
   return { exchange, monitorId, currency: definition.currency, fetchedAt: value.fetchedAt, status: value.status, reason: value.reason,
     left: leg('left'), right: leg('right'), rows: value.rows.map(row => ({ time: row.time, leftRate: row.leftRate, rightRate: row.rightRate })).sort((a, b) => b.time - a.time) };
 }
@@ -96,8 +109,8 @@ export function analyzeFundingRange(history, range, direction) {
     const rawRate = records.length ? (sum === 0 ? 0 : sum) : null;
     const short = side === 'left' ? direction === 'short' : direction === 'long';
     const positionRate = rawRate === null ? null : rawRate === 0 ? 0 : short ? rawRate : -rawRate;
-    const queried = metadata.coverage;
-    return { records, count: records.length, rawRate, positionRate, coverage: !queried ? 'unknown' : range.from >= queried.from && range.to - 1 <= queried.to ? 'queried' : 'partial', fetchedAt: metadata.fetchedAt, error: metadata.error };
+    const queried = metadata.ranges ?? (metadata.coverage ? [metadata.coverage] : []);
+    return { records, count: records.length, rawRate, positionRate, coverage: !queried.length ? 'unknown' : queried.some(r => range.from >= r.from && range.to - 1 <= r.to) ? 'queried' : 'partial', fetchedAt: metadata.fetchedAt, error: metadata.error };
   };
   return { left: leg('left'), right: leg('right') };
 }
@@ -154,7 +167,7 @@ function cexRows(exchange, input) {
 /** Rates are decimal amounts for the actual settlement, never hourly forecasts. */
 export function parseCexFundingHistory(exchange, symbol, input, now = Date.now()) {
   validateCexContract(exchange, symbol);
-  return parseCexPage(exchange, symbol, input, now);
+  return parseCexPage(exchange, symbol, input, now).map(({ time, rate }) => ({ time, rate }));
 }
 function parseCexPage(exchange, symbol, input, now) {
   cexTimestamp(now);
@@ -171,10 +184,11 @@ function parseCexPage(exchange, symbol, input, now) {
     const rate = cexNumber(exchange === 'okx' ? row.realizedRate : row.fundingRate);
     if (Math.abs(rate) > 1) throw new Error('Invalid CEX funding rate');
     if (time > now) continue;
-    if (records.has(time) && records.get(time) !== rate) throw new Error('Conflicting CEX funding settlements');
-    records.set(time, rate);
+    const special = exchange === 'binance' && row.rateType === 'Special', previous = records.get(time);
+    if (previous && (previous.rate !== rate || Boolean(previous.special) !== special)) throw new Error('Conflicting CEX funding settlements');
+    records.set(time, { time, rate, ...(special ? { special: true } : {}) });
   }
-  return [...records].sort(([a], [b]) => a - b).map(([time, rate]) => ({ time, rate }));
+  return [...records.values()].sort((a, b) => a.time - b.time);
 }
 
 const object = input => { if (!input || typeof input !== 'object' || Array.isArray(input)) throw Error('Invalid funding response'); return input; };
@@ -258,9 +272,10 @@ export function createFundingLegReader({ request, clock = Date.now, lighterMarke
       if (!settlements.length) throw new Error('CEX funding history pagination did not advance');
       const oldest = settlements[0].time, newest = settlements[settlements.length - 1].time;
       if (exchange !== 'bitget' && newest > to) throw new Error('Invalid CEX funding history page range');
-      for (const { time, rate } of settlements) {
-        if (records.has(time) && records.get(time) !== rate) throw new Error('Conflicting CEX funding settlements');
-        records.set(time, rate);
+      for (const record of settlements) {
+        const previous = records.get(record.time);
+        if (previous && (previous.rate !== record.rate || previous.special !== record.special)) throw new Error('Conflicting CEX funding settlements');
+        records.set(record.time, record);
       }
       if (forward ? newest < cursor : oldest >= previousOldest || (exchange === 'bybit' && oldest > cursor) || (exchange === 'okx' && oldest >= cursor)) {
         throw new Error('CEX funding history pagination did not advance');
@@ -270,7 +285,7 @@ export function createFundingLegReader({ request, clock = Date.now, lighterMarke
       previousOldest = oldest;
       cursor = forward ? newest + 1 : exchange === 'okx' ? oldest : oldest - 1;
     }
-    return [...records].filter(([time]) => time >= from && time <= to).sort(([a], [b]) => a - b).map(([time, rate]) => ({ time, rate }));
+    return [...records.values()].filter(row => row.time >= from && row.time <= to).sort((a, b) => a.time - b.time);
   }
 
   return async function readLeg(exchange, symbol, range) {
@@ -281,9 +296,9 @@ export function createFundingLegReader({ request, clock = Date.now, lighterMarke
       // https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint#pagination
       for (let page = 0; page < 10; page++) {
         const input = await request('https://api.hyperliquid.xyz/info', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'fundingHistory', coin: symbol, startTime: cursor, endTime: range.to }) });
+        if (!Array.isArray(input) || input.length > 500) throw Error('Invalid Hyperliquid funding page');
+        if (input.some(row => number(row?.time) < cursor || number(row.time) > range.to)) throw Error('Hyperliquid funding page outside requested range');
         const parsed = parseHyperliquidFundingHistory(input, symbol, range.to);
-        if (!Array.isArray(input)) throw Error('Invalid Hyperliquid funding page');
-        if (parsed.some(row => row.time < cursor)) throw Error('Hyperliquid funding pagination did not advance');
         records.push(...parsed);
         if (input.length < 500) return normalizeSettledFunding(records, range.to);
         if (!parsed.length) throw Error('Hyperliquid funding pagination did not advance');
@@ -340,43 +355,4 @@ export function createFundingLegReader({ request, clock = Date.now, lighterMarke
     if (Object.hasOwn(CEX_PAGE_SIZES, exchange)) return readCex(exchange, symbol, range);
     throw Error('Unsupported funding history exchange');
   };
-}
-
-/**
- * The next snapshot of one exchange's two legs: each leg reads from a day before its previous coverage end (the whole
- * 60-day window when there is none), keeps its old records and receipt time when its read fails, and the snapshot rejects
- * only when both legs fail.
- */
-export async function mergeFundingHistory({ exchange, monitorId, previous, readLeg, clock = Date.now }) {
-  const definition = exchangeDefinition(exchange, monitorId);
-  const startedAt = clock();
-  const old = previous ? validateExchangeFundingHistory(previous, exchange, monitorId) : null;
-  const coverage = { from: startedAt - HISTORY_WINDOW_MS, to: startedAt };
-  const ranges = ['left', 'right'].map(side => {
-    const previousCoverage = old?.[side].coverage;
-    // New snapshots backfill the whole window; later updates overlap a day.
-    const from = previousCoverage && previousCoverage.from <= coverage.from && previousCoverage.to >= coverage.from ? Math.max(coverage.from, previousCoverage.to - 86_400_000) : coverage.from;
-    return { from, to: coverage.to };
-  });
-  const results = await Promise.allSettled([readLeg(exchange, definition.left, ranges[0]), readLeg(exchange, definition.right, ranges[1])]);
-  if (results.every(result => result.status === 'rejected')) throw Error('Actual funding history unavailable');
-  // The snapshot is anchored to the requested end, excluding settlements that
-  // happened during pagination and keeping a stable 60-day window for all pages.
-  const fetchedAt = new Date(startedAt).toISOString(), rows = new Map();
-  const legs = ['left', 'right'].map((side, index) => {
-    const result = results[index], symbol = definition[side];
-    const previousRecords = (old?.rows ?? []).filter(row => row[`${side}Rate`] !== null).map(row => ({ time: row.time, rate: row[`${side}Rate`] }));
-    const merged = new Map(previousRecords.map(row => [row.time, row]));
-    if (result.status === 'fulfilled') for (const row of result.value) merged.set(row.time, row);
-    const records = normalizeSettledFunding([...merged.values()], startedAt);
-    for (const record of records) {
-      const row = rows.get(record.time) ?? { time: record.time, leftRate: null, rightRate: null };
-      row[`${side}Rate`] = record.rate; rows.set(record.time, row);
-    }
-    const previousCoverage = old?.[side].coverage;
-    // Expired rows were pruned above, so their former coverage cannot be claimed.
-    const retainedCoverage = previousCoverage && previousCoverage.to >= coverage.from ? { from: Math.max(previousCoverage.from, coverage.from), to: previousCoverage.to } : null;
-    return { symbol, fetchedAt: result.status === 'fulfilled' ? fetchedAt : old?.[side].fetchedAt ?? null, error: result.status === 'fulfilled' ? '' : '本合约历史结算费率暂时读取失败，保留上次成功记录。', coverage: result.status === 'fulfilled' ? coverage : retainedCoverage };
-  });
-  return validateExchangeFundingHistory({ exchange, monitorId, currency: definition.currency, fetchedAt, status: 'live', reason: legs.some(leg => leg.error) ? '部分合约更新失败，请查看各合约采集时间。' : '', left: legs[0], right: legs[1], rows: [...rows.values()] }, exchange, monitorId);
 }

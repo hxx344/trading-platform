@@ -72,8 +72,9 @@ export interface OptionsClient {
   positions(signal: AbortSignal): Promise<Row[]>;
   openOrders(signal: AbortSignal): Promise<Row[]>;
   /** The order by its link id from the open list, then the history; null when neither has it (unknown, not cancelled). */
-  order(symbol: string, link: string, signal: AbortSignal): Promise<Row | null>;
-  executions(link: string, signal: AbortSignal): Promise<Row[]>;
+  order(symbol: string, link: string, signal: AbortSignal, seen?: (id: string) => void, requireEnd?: boolean): Promise<Row | null>;
+  /** A completed page can already prove an order exists even if a later page fails. */
+  executions(link: string, signal: AbortSignal, onPage?: (rows: Row[]) => void): Promise<Row[]>;
   closedPositions(symbol: string, startMs: number, endMs: number, signal: AbortSignal): Promise<Row[]>;
   /** A limit order: GTC (the default) follows the book; IOC is the bounded fallback for an opening leg's remainder. */
   create(order: { symbol: string; side: 'Buy' | 'Sell'; qty: string; price: string; link: string; reduceOnly: boolean; timeInForce?: 'GTC' | 'IOC' }, signal: AbortSignal, beforeSend?: () => void): Promise<Row>;
@@ -170,8 +171,19 @@ export function createOptionsClient({ credentials, marketClient, fetchImpl = (ur
   }
 
   /** Every page of a listing; a repeated or malformed cursor, a missing identity or too many pages fails the read. */
-  function pages(path: string, params: Record<string, string>, identity: readonly string[], signal: AbortSignal): Promise<Row[]> {
-    return bybitPages(cursor => signed('GET', path, { ...params, ...(cursor ? { cursor } : {}) }, signal), identity);
+  function pages(path: string, params: Record<string, string>, identity: readonly string[], signal: AbortSignal, onPage?: (rows: Row[]) => void, requireEnd = false): Promise<Row[]> {
+    return bybitPages(async cursor => {
+      const data = await signed('GET', path, { ...params, ...(cursor ? { cursor } : {}) }, signal);
+      if ((requireEnd || (onPage && data.category !== undefined)) && data.category !== params.category) throw new VenueError('read-failed', 'Bybit 列表类别缺失或与请求不一致');
+      if ((onPage || requireEnd) && Array.isArray(data.list)) {
+        const rows = data.list.filter(isRecord); // Keep identifiable evidence even if another row fails bybitPages.
+        onPage?.(rows);
+        const next = data.nextPageCursor;
+        if (data.list.length > Number(params.limit) || ((requireEnd || data.list.length === Number(params.limit)) && typeof next !== 'string')
+          || (typeof next === 'string' && next !== '' && !next.trim())) throw new VenueError('read-failed', 'Bybit 返回的页大小或分页标记无效');
+      }
+      return data;
+    }, identity);
   }
 
   const listOf = (data: Row, name: string): Row[] => {
@@ -197,16 +209,24 @@ export function createOptionsClient({ credentials, marketClient, fetchImpl = (ur
     portfolioMargin: signal => signed('GET', '/v5/asset/portfolio-margin', { baseCoin: 'BTC' }, signal),
     positions: signal => pages('/v5/position/list', { category: 'option', baseCoin: 'BTC', limit: '200' }, ['symbol', 'side'], signal),
     openOrders: signal => pages('/v5/order/realtime', { category: 'option', baseCoin: 'BTC', limit: '50' }, ['orderId'], signal),
-    order: async (symbol, link, signal) => {
+    order: async (symbol, link, signal, seen, requireEnd) => {
       // Closed records can leave the open list after a venue restart; absence from both is unknown, never a cancellation.
       for (const path of ['/v5/order/realtime', '/v5/order/history']) {
-        const rows = listOf(await signed('GET', path, { category: 'option', symbol, orderLinkId: link }, signal), '订单');
-        const match = rows.find(row => row.orderLinkId === link && row.symbol === symbol);
-        if (match) return match;
+        let count = 0;
+        const rows = await pages(path, { category: 'option', symbol, orderLinkId: link, limit: '50' }, ['orderId'], signal, page => {
+          for (const row of page) if (row.orderLinkId === link) {
+            seen?.(row.symbol === symbol && typeof row.orderId === 'string' && row.orderId.trim() ? row.orderId : '');
+          }
+          count += page.length;
+          if (count > 1 || page.some(row => row.orderLinkId !== link || row.symbol !== symbol || typeof row.orderId !== 'string' || !row.orderId.trim())) {
+            throw new VenueError('read-failed', 'Bybit 按关联号查询的订单身份不一致、缺失或重复');
+          }
+        }, requireEnd);
+        if (rows.length) return rows[0]!;
       }
       return null;
     },
-    executions: (link, signal) => pages('/v5/execution/list', { category: 'option', baseCoin: 'BTC', orderLinkId: link, limit: '50' }, ['execId'], signal),
+    executions: (link, signal, onPage) => pages('/v5/execution/list', { category: 'option', baseCoin: 'BTC', orderLinkId: link, limit: '50' }, ['execId'], signal, onPage, true),
     closedPositions: async (symbol, startMs, endMs, signal) => {
       // At most seven days per query.
       const rows: Row[] = [];

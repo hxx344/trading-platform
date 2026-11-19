@@ -105,11 +105,15 @@ export function hynixCandleStart(rows, now, full) {
 }
 
 /** Both legs' completed hours from `startTime`, paired; a one-sided or misaligned reply fails the round. */
-export async function fetchHynixCandles(startTime, { fetcher = fetch, timeout = 10_000, now }) {
-  const candles = async coin => validCandles(await requestInfo({ type: 'candleSnapshot', req: { coin, interval: '1h', startTime, endTime: now } }, { fetcher, timeout }), coin);
+export async function fetchHynixCandles(startTime, { fetcher = fetch, timeout = 10_000, now, end }) {
+  const endTime = end ?? now;
+  const candles = async coin => {
+    const raw = await requestInfo({ type: 'candleSnapshot', req: { coin, interval: '1h', startTime, endTime } }, { fetcher, timeout });
+    return end !== undefined && Array.isArray(raw) && !raw.length ? [] : validCandles(raw, coin);
+  };
   const [ordinary, adr] = await Promise.all([candles(HYNIX_LEGS.ordinary), candles(HYNIX_LEGS.adr)]);
-  const rows = alignHynixCandles(ordinary, adr, now);
-  if (!rows.length) throw new Error('No shared closed candles');
+  const rows = alignHynixCandles(ordinary, adr, endTime);
+  if (end === undefined && !rows.length) throw new Error('No shared closed candles');
   return rows;
 }
 

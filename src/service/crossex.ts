@@ -175,7 +175,7 @@ export async function prepareCrossex(config: CrossexServiceConfig, credentials: 
       const manualDepth = (marketReaders.manualDepthReader ?? (injected && injected !== loadDepth ? injected : loadManualDepth)) as DepthReader;
       const market = parts.market = createMarket(store, { ...marketReaders, capacityDepthReader: display(manualDepth) });
       live = parts.live = createLiveRuntime(store, { ...liveOptions, market, clientFactory });
-      parts.terminal = createTerminalMarket({ ...terminalReaders, depthReader: display((terminalReaders.depthReader ?? loadManualDepth) as DepthReader), market });
+      parts.terminal = createTerminalMarket({ ...terminalReaders, depthReader: display((terminalReaders.depthReader ?? loadManualDepth) as DepthReader), market, store });
     } catch (error) { throw new CrossexStartError('store', describe(error)); }
     let record = storedConnection(store);
     if (!record?.enabled || record.accountReference !== keyReference(secret.apiKey)) {

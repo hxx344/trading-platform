@@ -24,6 +24,9 @@
 //   catch around both the read and the write); a refusal of the write itself (lease lost, imported again, database
 //   error) is not recorded as the source's failure but ends the sync with that refusal.
 import type { AssetDb } from './db.ts';
+import { historyGeneration } from './history-cache.ts';
+import { revisionOf } from './positions-service.ts';
+import { PositionsPermissionError } from './positions-values.ts';
 import { AssetConflict, type SyncLease } from './sync-lock.ts';
 import type { Asset, AsterAccount, Balance, FxStatus, Ledger } from './types.ts';
 import type { Vault } from './credentials.ts';
@@ -105,6 +108,7 @@ const assetStatement = (database: AssetDb, asset: Asset): Run => () => { databas
 const upsertAsset = (database: AssetDb, asset: Asset): Run => () => { database.prepare('INSERT INTO assets(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').bind(asset.id, JSON.stringify(asset)).run(); };
 const settingStatement = (database: AssetDb, key: string, value: unknown): Run => () => { saveSetting(database, key, value); };
 const saveConnection = (database: AssetDb, name: string, encrypted: string, at: number): Run => () => {
+  database.prepare('DELETE FROM asset_history_windows WHERE account = ?').bind(name).run();
   database.prepare('INSERT INTO connections(exchange,encrypted,updated_at) VALUES(?,?,?) ON CONFLICT(exchange) DO UPDATE SET encrypted=excluded.encrypted,updated_at=excluded.updated_at').bind(name, encrypted, iso(at)).run();
 };
 const deleteConnection = (database: AssetDb, name: string): Run => () => { database.prepare('DELETE FROM connections WHERE exchange = ?').bind(name).run(); };
@@ -171,6 +175,7 @@ export async function disconnect(ctx: SyncContext, exchange: ConnectionExchange)
   commit(ctx, [
     deleteConnection(database, exchange),
     () => { database.prepare('DELETE FROM fill_cache WHERE account = ?').bind(exchange).run(); },
+    () => { database.prepare('DELETE FROM asset_history_windows WHERE account = ?').bind(exchange).run(); },
     settingStatement(database, exchange + '-status', { configured: false, lastSync: ledger.connections[exchange].lastSync, error: null, scope: ledger.connections[exchange].scope }),
     ...(asset ? [assetStatement(database, { ...asset, status: '已断开 · 保留旧值', error: undefined })] : []),
   ]);
@@ -261,12 +266,18 @@ export async function refresh(ctx: SyncContext, refreshPositions?: () => Promise
   async function source(exchange: ConnectionExchange, read: (row: Stored, asset: Asset) => Promise<{ asset: Asset }>, failure: (error: unknown) => string): Promise<void> {
     const row = stored.find(item => item.exchange === exchange);
     if (!row) return;
+    const revision = revisionOf(row.encrypted);
+    const permission = (exchange === 'binance' || exchange === 'bybit' || exchange === 'okx') && storedConnection(database, exchange)?.encrypted === row.encrypted
+      ? historyGeneration(() => database, exchange, revision) : null;
     const asset = ledger.assets.find(a => a.mode === exchange);
     let outcome: { asset: Asset; at: number } | { error: string };
     try {
       if (!asset) throw new Error(exchange in DATED ? DATED[exchange as DatedSource].missing : '未找到交易所资产，请更新连接');
       outcome = { ...(await read(row, asset)), at: ctx.now() };
-    } catch (error) { outcome = { error: failure(error) }; }
+    } catch (error) {
+      if (error instanceof PositionsPermissionError && permission && storedConnection(database, exchange)?.encrypted === row.encrypted) permission.deny();
+      outcome = { error: failure(error) };
+    }
     const connection = ledger.connections[exchange];
     sourceWrite(row, 'error' in outcome
       ? [...(asset ? [assetStatement(database, { ...asset, status: '同步失败 · 保留旧值', error: outcome.error })] : []), settingStatement(database, exchange + '-status', { ...connection, error: outcome.error })]

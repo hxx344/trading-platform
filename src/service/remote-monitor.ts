@@ -5,7 +5,7 @@ import type { HynixQuoteView } from '../monitor/hynix.ts';
 import type { FeedEvent, SubscribeFeed } from '../monitor/perpetual-feed.ts';
 import { unwrapMarketRead, type MarketRead, type MetricBatch, type FundamentalRow } from '../monitor/market-contract.ts';
 import type { Exchange, ExchangeQuote, SpreadMarket } from '../vendor/exchange-comparison.mjs';
-import type { ExchangeFundingHistory } from '../vendor/exchange-funding-history.mjs';
+import type { ReadFundingLeg } from '../monitor/funding-archive.ts';
 import { variationalRequestError, type VariationalPublicFunding } from '../vendor/variational-market.mjs';
 import { createPerpetualEstimates } from '../vendor/perpetual-estimates.mjs';
 import { perpetualPriceIdentity, type PerpetualQuote } from '../vendor/perpetual-stream.mjs';
@@ -21,7 +21,7 @@ import type { PerpetualMarket } from '../vendor/perpetual-stream.mjs';
 
 export interface RemoteComparison {
   quote(market: SpreadMarket, exchange: Exchange, hynix: HynixQuoteView | null, signal: AbortSignal): Promise<ExchangeQuote>;
-  history(market: SpreadMarket, exchange: Exchange, signal: AbortSignal): Promise<ExchangeFundingHistory>;
+  history: ReadFundingLeg;
   variationalMarks(signal: AbortSignal): Promise<ExchangeQuote>;
   variationalFunding(signal: AbortSignal): Promise<VariationalPublicFunding>;
 }
@@ -41,20 +41,21 @@ export function createRemoteMonitor(client: MarketClient, clock: () => number = 
   async function read<T>(name: string, input: unknown, signal?: AbortSignal): Promise<T> {
     return unwrapMarketRead(await client.call<MarketRead<T>>('monitor.' + name, input, signal));
   }
+  const history: ReadFundingLeg = (market, exchange, side, range, signal) => read('exchange.historyLeg', { market, exchange, side, range }, signal);
   const rounds: MarketReaders = {
     epoch: () => client.epoch(),
     anthropicQuote: signal => read('anthropic.quote', null, signal),
-    anthropicCandles: (starts, at, signal) => read('anthropic.candles', { starts, at }, signal),
+    anthropicCandles: (starts, at, signal, ends) => read('anthropic.candles', { starts, at, ends }, signal),
     oilQuote: signal => read('oil.quote', null, signal),
     oilCandles: (start, end, signal) => read('oil.candles', { start, end }, signal),
-    oilFunding: (start, end, at, signal) => read('oil.funding', { start, end, at }, signal),
+    oilFunding: (side, range, signal) => history('oil', 'binance', side, range, signal),
     hynixQuote: signal => read('hynix.quote', null, signal),
-    hynixCandles: (start, at, signal) => read('hynix.candles', { start, at }, signal),
-    hynixFunding: (start, end, at, signal) => read('hynix.funding', { start, end, at }, signal),
+    hynixCandles: (start, at, signal, end) => read('hynix.candles', { start, at, end }, signal),
+    hynixFunding: (side, range, signal) => history('hynix', 'hyperliquid', side, range, signal),
   };
   const comparison: RemoteComparison = {
     quote: (market, exchange, hynix, signal) => read('exchange.quote', { market, exchange, hynix }, signal),
-    history: (market, exchange, signal) => read('exchange.history', { market, exchange }, signal),
+    history,
     variationalMarks: signal => read('variational.marks', null, signal),
     async variationalFunding(signal) {
       try { return await read<VariationalPublicFunding>('variational.funding', null, signal); }

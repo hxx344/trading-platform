@@ -8,7 +8,9 @@ export declare const HISTORY_LEG_LIMIT: number;
 
 export type FundingHistoryRange = { from: number; to: number };
 export type SettledFundingRecord = { time: number; rate: number };
-export type FundingHistoryLeg = { symbol: string; fetchedAt: string | null; error: string; coverage: FundingHistoryRange | null };
+export type FundingFact = SettledFundingRecord & { special?: true };
+export type FundingSide = 'left' | 'right';
+export type FundingHistoryLeg = { symbol: string; fetchedAt: string | null; error: string; coverage: FundingHistoryRange | null; ranges?: FundingHistoryRange[]; freshUntil?: number };
 export type ExchangeFundingHistory = {
   exchange: Exchange;
   monitorId: SpreadMarket;
@@ -30,10 +32,11 @@ export type FundingRangeLeg = {
   error: string;
 };
 export type FundingRequest = (url: string, init?: RequestInit) => Promise<unknown>;
-export type FundingLegReader = (exchange: Exchange, symbol: string, range: FundingHistoryRange) => Promise<SettledFundingRecord[]>;
+export type FundingLegReader = (exchange: Exchange, symbol: string, range: FundingHistoryRange) => Promise<FundingFact[]>;
 
 export declare function fundingHistoryExchanges(market: SpreadMarket): readonly Exchange[];
 export declare function supportsFundingHistory(market: string, exchange: string): boolean;
+export declare function fundingLegStale(leg: FundingHistoryLeg, now: number): boolean;
 export declare function normalizeSettledFunding(records: SettledFundingRecord[], now: number): SettledFundingRecord[];
 export declare function validateExchangeFundingHistory(input: unknown, exchange: Exchange, monitorId: SpreadMarket): ExchangeFundingHistory;
 export declare function fundingRangeInput(time: number): string;
@@ -44,4 +47,3 @@ export declare function parseHyperliquidFundingHistory(input: unknown, symbol: s
 export declare function parseLighterFundingHistory(input: unknown, marketId: number, now: number): SettledFundingRecord[];
 export declare function parseGateFundingHistory(input: unknown, now: number): SettledFundingRecord[];
 export declare function createFundingLegReader(options: { request: FundingRequest; clock?: () => number; lighterMarkets: () => Promise<LighterMarket[]> }): FundingLegReader;
-export declare function mergeFundingHistory(options: { exchange: Exchange; monitorId: SpreadMarket; previous?: ExchangeFundingHistory | null; readLeg: FundingLegReader; clock?: () => number }): Promise<ExchangeFundingHistory>;

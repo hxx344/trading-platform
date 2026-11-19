@@ -3,8 +3,7 @@
 // lib/hynix-funding-analysis.ts（8bc3bee）的 analyzeSettledFunding。与原文件不同的地方：
 // - 只保留结算行（time 与两腿每次结算费率），不再包一层 metadata 快照；配对、校验、合并规则不变；
 // - 请求函数接收 fetcher / timeout（原文件写死 fetch 与 10 秒、Date.now），海力士走 hynix-market.mjs 的 requestInfo；
-// - 续读起点多一个 full 开关：工作台每轮都从最早的缺口或单腿结算读起，这里只在 full 时这样做（采集器每小时一次），
-//   平时只从最后一次结算往前 48 小时读起；两边都从已存的第一行开始找缺口，起点不早于保留期；
+// - 回补边界由采集器按已存查询和实际缺腿给出，原始交易所时刻与整点图表分别保存；
 // - 首次回补从首个结算读起（工作台随包附带的结算存档不带）；
 // - 合并时新读到的单腿不覆盖已存的另一腿（与原文件相同），抽成 mergeFundingRows 两个市场共用；
 // - analyzeFundingWindow（原油按日汇总）与 retainFundingRows（React 状态复用）不带：页面统一用 analyzeSettledFunding。
@@ -19,8 +18,6 @@ export const OIL_FIRST_SETTLEMENT = Math.ceil(HISTORY_START / OIL_FUNDING_MS) * 
 export const HYNIX_FUNDING_MS = HOUR;
 /** Matches the end of the first full price hour of the spread chart. */
 export const HYNIX_FIRST_SETTLEMENT = FIRST_FULL_HOUR + HYNIX_FUNDING_MS;
-/** A normal round reads on from this far before the last stored settlement (both workbench readers use two days). */
-export const FUNDING_RESUME_MS = 48 * HOUR;
 
 /** Reject an unexpected schedule instead of relabeling it or inferring missing settlements as zero. */
 export function pairOilFunding(brent, wti, now) {
@@ -78,7 +75,7 @@ export async function fetchOilFundingHistory(symbol, startTime, endTime, options
   const result = [], limit = options.pageSize ?? 1000;
   for (let page = 0; page < 500 && cursor <= endTime; page++) {
     const rows = await requestBinance('/fapi/v1/fundingRate', { symbol, startTime: cursor, endTime, limit }, options);
-    if (!Array.isArray(rows)) throw Error('Invalid Binance funding page');
+    if (!Array.isArray(rows) || rows.length > limit) throw Error('Invalid Binance funding page');
     if (!rows.length) return result;
     let previous = cursor - 1;
     for (const row of rows) {
@@ -123,7 +120,7 @@ export async function fetchHynixFundingRecords(coin, startTime, endTime, { fetch
   let cursor = startTime;
   for (let page = 0; page < 100 && cursor <= endTime; page++) {
     const body = await requestInfo({ type: 'fundingHistory', coin, startTime: cursor, endTime }, { fetcher, timeout });
-    if (!Array.isArray(body)) throw Error('Invalid funding history response');
+    if (!Array.isArray(body) || body.length > 500) throw Error('Invalid funding history response');
     if (!body.length) return [...records.values()].sort((a, b) => a.time - b.time);
     let last = -Infinity;
     for (const value of body) {
@@ -141,25 +138,6 @@ export async function fetchHynixFundingRecords(coin, startTime, endTime, { fetch
   return [...records.values()].sort((a, b) => a.time - b.time);
 }
 
-/**
- * Where a round starts reading: the first settlement (not before the retention cut) when nothing is stored, otherwise two
- * days before the last stored settlement, and with `full` also the earliest gap or one-sided settlement in what is stored.
- */
-export function fundingStart(rows, { first, intervalMs, legs, cutoff, full, gapSince = -Infinity }) {
-  const floor = Math.max(first, cutoff);
-  if (!rows.length) return floor;
-  let start = rows.at(-1).time - FUNDING_RESUME_MS;
-  // Only gaps from `gapSince` on are read again: late records arrive within days, older gaps are taken as permanent.
-  const scan = full ? rows.filter(row => row.time >= gapSince) : [];
-  if (scan.length) {
-    let expected = scan[0].time;
-    for (const row of scan) {
-      if (row.time > expected || legs.some(leg => row[leg] === null)) { start = Math.min(start, Math.min(expected, row.time)); break; }
-      expected = row.time + intervalMs;
-    }
-  }
-  return Math.max(floor, start);
-}
 
 /** Fetched settlements replace stored ones by time; a fetched missing leg keeps the stored rate of that leg. */
 export function mergeFundingRows(previous, fetched, legs) {
@@ -172,16 +150,29 @@ export function mergeFundingRows(previous, fetched, legs) {
   return [...merged.values()].sort((a, b) => a.time - b.time);
 }
 
-/** The oil pair's settlements from `startTime` to `now`, both legs read together. */
-export async function fetchOilFunding(startTime, { fetcher, timeout = 15_000, now, endTime = now }) {
-  const [brent, wti] = await Promise.all([ASSETS.brent.coin, ASSETS.wti.coin].map(symbol => fetchOilFundingHistory(symbol, startTime, Math.min(endTime, now), { fetcher, timeout })));
-  return pairOilFunding(brent, wti, now);
+export async function fetchOilFundingFacts(side, range, options) {
+  const symbol = side === 'left' ? ASSETS.brent.coin : ASSETS.wti.coin;
+  const rows = await fetchOilFundingHistory(symbol, range.from, range.to, options);
+  return rows.map(row => {
+    if (row.rateType !== undefined && row.rateType !== 'Regular' && row.rateType !== 'Special') throw Error('Unsupported funding rate type');
+    const rate = numeric(row.fundingRate);
+    if (Math.abs(rate) > 1) throw Error('Invalid Binance funding rate');
+    return { time: row.fundingTime, rate, ...(row.rateType === 'Special' ? { special: true } : {}) };
+  });
 }
 
-/** The Hynix pair's settlements from `startTime` to `endTime` (default `now`), both legs read together. */
-export async function fetchHynixFunding(startTime, { fetcher, timeout = 10_000, now, endTime = now }) {
-  const [adr, ordinary] = await Promise.all([HYNIX_LEGS.adr, HYNIX_LEGS.ordinary].map(coin => fetchHynixFundingRecords(coin, startTime, Math.min(endTime, now), { fetcher, timeout })));
-  return pairHynixFunding(adr, ordinary, now);
+export async function fetchHynixFundingFacts(side, range, options) {
+  const rows = await fetchHynixFundingRecords(side === 'left' ? HYNIX_LEGS.adr : HYNIX_LEGS.ordinary, range.from, range.to, options);
+  return rows.map(row => ({ time: row.time, rate: row.fundingRate }));
+}
+
+export function projectOilFunding(left, right, at) {
+  const rows = (facts, symbol) => facts.map(fact => ({ symbol, fundingTime: fact.time, fundingRate: fact.rate, rateType: fact.special ? 'Special' : 'Regular' }));
+  return pairOilFunding(rows(left, ASSETS.brent.coin), rows(right, ASSETS.wti.coin), at);
+}
+export function projectHynixFunding(left, right, at) {
+  const rows = (facts, coin) => facts.map(fact => ({ coin, time: fact.time, fundingRate: fact.rate }));
+  return pairHynixFunding(rows(left, HYNIX_LEGS.adr), rows(right, HYNIX_LEGS.ordinary), at);
 }
 
 /**

@@ -4,13 +4,15 @@
 // timeout and is never retried within a round; a failed round keeps what was there and says why. The last quote and the
 // candles are kept in monitor.sqlite and read back at start, marked as a snapshot until a round succeeds.
 import {
-  FIRST_FULL_HOUR, hynixCandleStart, validateHynixQuote, validateHynixRows,
+  FIRST_FULL_HOUR, HYNIX_CANDLE_MS, HYNIX_MAX_CANDLES, validateHynixQuote, validateHynixRows,
   type HynixCandleRow, type HynixFetcher, type HynixQuote,
 } from '../vendor/hynix-market.mjs';
-import { HYNIX_FIRST_SETTLEMENT, HYNIX_FUNDING_MS, validateHynixFundingRows, type HynixFundingRow } from '../vendor/settled-funding.mjs';
-import { FUNDING_REFRESH_MS, createFundingHistory, type FundingView } from './funding.ts';
+import { HYNIX_FIRST_SETTLEMENT, HYNIX_FUNDING_MS, projectHynixFunding, validateHynixFundingRows, type HynixFundingRow } from '../vendor/settled-funding.mjs';
+import { FUNDING_REFRESH_MS, createFundingHistory, projectedFunding, type FundingView } from './funding.ts';
+import { createFundingArchive, type FundingArchive } from './funding-archive.ts';
 import { CANDLE_STALE_MS, QUOTE_STALE_MS, type LoopContext } from './anthropic.ts';
 import { createMarketReaders, type MarketReaders } from './market-readers.ts';
+import { afterCandleRange, candleCheckOverdue, candleCoverage, nextCandleRange, type CandleCoverage } from './candle-coverage.ts';
 import type { MonitorStore } from './store.ts';
 
 export const HYNIX_QUOTE_REFRESH_MS = 10_000;
@@ -21,13 +23,8 @@ export const HYNIX_CANDLE_KEY = 'hynix.candles';
 export const HYNIX_FUNDING_KEY = 'hynix.funding';
 /** The settlement range one funding round reads at most (see the funding history below). */
 export const HYNIX_FUNDING_SPAN_MS = 60 * 86_400_000;
-/** The workbench's timeouts (lib/quote-service.ts, lib/market-service.ts). */
 const DAY_MS = 86_400_000;
-/**
- * How often a round also re-reads the gaps older than the last 48 hours. The workbench reads from the earliest gap every
- * round; an hour without trades on either leg has no candle, so that would page up to 5000 hours each minute.
- */
-export const HYNIX_GAP_RETRY_MS = 3_600_000;
+export { CANDLE_GAP_RETRY_MS as HYNIX_GAP_RETRY_MS } from './candle-coverage.ts';
 
 export interface HynixQuoteView extends HynixQuote {
   status: 'live' | 'snapshot';
@@ -54,8 +51,8 @@ export function hynixError(error: unknown): string {
 const iso = (ms: number | null): string | null => ms === null ? null : new Date(ms).toISOString();
 const detail = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 200);
 
-export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, readers = createMarketReaders({ fetchImpl, now }), log = line => process.stderr.write(`${line}\n`) }: {
-  store: MonitorStore; readers?: MarketReaders; fetchImpl?: HynixFetcher; now?: () => number; log?: (line: string) => void;
+export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, readers = createMarketReaders({ fetchImpl, now }), archive = createFundingArchive(store, now), log = line => process.stderr.write(`${line}\n`) }: {
+  store: MonitorStore; archive?: FundingArchive; readers?: MarketReaders; fetchImpl?: HynixFetcher; now?: () => number; log?: (line: string) => void;
 }) {
   const stopping = new AbortController();
 
@@ -64,8 +61,7 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, r
   let rows: HynixCandleRow[] = [], fetchedAt: string | null = null, candlesRestored = false, candleAttemptAt: number | null = null, candleError: string | null = null;
   // The stored rows could not be read back: the next successful round rewrites the table instead of adding to it.
   let replaceCandles = false;
-  // Until this time, rounds read on from the last 48 hours only; the first round after a start reads every gap.
-  let gapRetryAt = 0;
+  let progress = candleCoverage(null, 0, HYNIX_CANDLE_MS, 0);
 
   try {
     const saved = store.readState(HYNIX_QUOTE_KEY);
@@ -73,11 +69,13 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, r
   } catch (error) { log(`海力士上次报价无法读回，等待新报价：${detail(error)}`); }
   try {
     const stored = store.hynixCandles();
-    if (stored.length) {
-      const saved = store.readState(HYNIX_CANDLE_KEY);
+    const saved = store.readState(HYNIX_CANDLE_KEY);
+    if (stored.length || saved) {
       if (!saved) throw new Error('K 线轮次记录缺失');
-      const at = (saved.value as { fetchedAt?: unknown }).fetchedAt as string;
-      rows = validateHynixRows(stored, at); fetchedAt = at; candlesRestored = true;
+      const { fetchedAt: at, coverage } = saved.value as { fetchedAt: string; coverage?: CandleCoverage };
+      const checked = validateHynixRows(stored, at), stamp = Date.parse(at);
+      progress = candleCoverage(coverage, Math.floor(stamp / HYNIX_CANDLE_MS) * HYNIX_CANDLE_MS, HYNIX_CANDLE_MS, stamp);
+      rows = checked; fetchedAt = at; candlesRestored = true;
     }
   } catch (error) { rows = []; fetchedAt = null; replaceCandles = true; log(`海力士 K 线历史无法读回，将重新回补：${detail(error)}`); }
 
@@ -95,7 +93,7 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, r
     // where a 400-day backfill in one round would pass the limit and fail every round.
     name: '海力士', key: HYNIX_FUNDING_KEY, legs: ['adr', 'ordinary'], first: HYNIX_FIRST_SETTLEMENT, intervalMs: HYNIX_FUNDING_MS, spanMs: HYNIX_FUNDING_SPAN_MS,
     read: () => store.hynixFunding(), readState: () => store.readState(HYNIX_FUNDING_KEY)?.value ?? null, write: write => store.writeHynixFunding(write),
-    validate: validateHynixFundingRows, fetch: (start, end, at) => readers.hynixFunding(start, end, at, stopping.signal),
+    validate: validateHynixFundingRows, fetch: projectedFunding(archive, 'hynix', 'hyperliquid', stopping.signal, readers.hynixFunding, projectHynixFunding),
     reason: hynixError, aborted: () => stopping.signal.aborted, now, log,
   });
 
@@ -118,12 +116,15 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, r
 
   async function refreshCandles(): Promise<void> {
     const at = now();
-    candleAttemptAt = at;
     const cutoff = Math.max(FIRST_FULL_HOUR, at - HYNIX_RETENTION_DAYS * DAY_MS);
-    const full = at >= gapRetryAt;
+    const first = Math.max(FIRST_FULL_HOUR, (Math.floor(at / HYNIX_CANDLE_MS) - HYNIX_MAX_CANDLES + 1) * HYNIX_CANDLE_MS);
+    const work = nextCandleRange(progress, rows, () => true, first, HYNIX_CANDLE_MS, at);
+    if (!work) { candlesRestored = false; return; }
+    candleAttemptAt = at;
     let next: HynixCandleRow[];
     try {
-      const fetched = await readers.hynixCandles(hynixCandleStart(rows, at, full), at, stopping.signal);
+      const fetched = validateHynixRows(await readers.hynixCandles(work.start, at, stopping.signal, work.end), new Date(work.end).toISOString());
+      if (fetched.some(row => row.time < work.start)) throw new Error('海力士 K 线超出本轮范围');
       // The fetched hours take precedence over the stored ones they overlap; the kept history ends at the retention cut.
       const merged = new Map(rows.map(row => [row.time, row]));
       for (const row of fetched) merged.set(row.time, row);
@@ -143,8 +144,9 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, r
       return !old || old.adr !== row.adr || old.ordinary !== row.ordinary;
     });
     const stamp = new Date(at).toISOString();
+    const nextProgress = afterCandleRange(progress, work, work.end, at);
     try {
-      store.writeHynixCandles({ rows: changed, cutoff, replace: replaceCandles, state: { key: HYNIX_CANDLE_KEY, value: { fetchedAt: stamp } } });
+      store.writeHynixCandles({ rows: changed, cutoff, replace: replaceCandles, state: { key: HYNIX_CANDLE_KEY, value: { fetchedAt: stamp, coverage: nextProgress } } });
     } catch (error) {
       // Memory stays with what is stored, so the next round reads on from there and writes the same rows again.
       candleError = 'K 线保存失败：monitor.sqlite 写入失败';
@@ -152,8 +154,7 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, r
       return;
     }
     candleSave.recovered();
-    // The gaps count as re-read only once the round is stored; a failed write re-reads them next round.
-    if (full) gapRetryAt = at + HYNIX_GAP_RETRY_MS;
+    progress = nextProgress;
     rows = next; fetchedAt = stamp; candlesRestored = false; candleError = null; replaceCandles = false;
   }
 
@@ -169,7 +170,8 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, r
     /** The hours within `days` before the last stored one (null: all of them), with the complete history's range; null before any row exists. */
     candles(days: number | null): HynixCandleView | null {
       if (!rows.length || fetchedAt === null) return null;
-      const stale = candlesRestored || candleError !== null || now() - Date.parse(fetchedAt) > CANDLE_STALE_MS;
+      const commonThrough = rows.at(-1)!.time + HYNIX_CANDLE_MS;
+      const stale = candlesRestored || candleError !== null || candleCheckOverdue(Math.min(progress.through, commonThrough), HYNIX_CANDLE_MS, now(), CANDLE_STALE_MS);
       const coverage = { firstObservation: new Date(rows[0]!.time).toISOString(), lastObservation: new Date(rows.at(-1)!.time).toISOString(), rows: rows.length };
       const from = days === null ? -Infinity : rows.at(-1)!.time - days * DAY_MS;
       const shown = days === null ? rows : rows.filter(row => row.time >= from);

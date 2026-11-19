@@ -17,12 +17,13 @@ import { POSITIONS_CATALOG } from './positions-catalog.ts';
 import type { PositionsExchangeId, ScopeDefinition } from './positions-catalog.ts';
 import type { HubPositions, Position, PositionCycle, PositionsScope } from './positions-types.ts';
 import type { SnapshotScope } from './daily-positions.ts';
-import { POSITIONS_FAILED } from './positions-values.ts';
+import { POSITIONS_FAILED, PositionsPermissionError } from './positions-values.ts';
+import { accountHistory, historyGeneration, historyPermission, type AccountHistory, type HistoryGeneration } from './history-cache.ts';
 import { cycleUnavailable } from './positions-cycle.ts';
 import { boundPositionEvidence } from './positions-evidence.ts';
 import { cycleSupported, CycleRetry, readPositionCycle } from './positions-cycle-readers.ts';
 import type { CycleRequest } from './positions-cycle-readers.ts';
-import { readBinancePositions, readBybitPositions, readOkxPositions, readAsterPositions } from './positions-readers.ts';
+import { readBinancePositions, readBybitPositions, readOkxPositions, readAsterPositions, verifyAssetPermission } from './positions-readers.ts';
 import type { BinanceScope, BybitScope } from './positions-readers.ts';
 import { readVariationalPythonPositions } from './sources/variational-python.ts';
 import { readRhLighterPositions } from './sources/rh-lighter.ts';
@@ -30,17 +31,17 @@ import { readHyperliquidPositions } from './sources/hyperliquid.ts';
 
 export type Database = Pick<AssetDb, 'prepare'>;
 /** The open asset.sqlite at the moment of the call; null before the first import. */
-export type DatabaseSource = () => Database | null;
+export type DatabaseSource = () => Pick<AssetDb, 'prepare' | 'transaction'> | null;
 export type ConnectionRow = { exchange: string; encrypted: string };
 export type SourceAccount = { id: string; name: string; exchange: PositionsExchangeId; key: string; row?: ConnectionRow };
 export type Unseal = (encrypted: string, name: string) => unknown;
 export type Fetcher = typeof fetch;
 type Read = (credentials: Credentials, scope: string, signal: AbortSignal) => Promise<Position[]>;
-type CycleRead = (credentials: Credentials, scope: string, request: CycleRequest, signal: AbortSignal) => Promise<PositionCycle>;
+type CycleRead = (credentials: Credentials, scope: string, request: CycleRequest, signal: AbortSignal, history: AccountHistory) => Promise<PositionCycle>;
 /** `entryPrice` joins the signature so a close and same-size reopen between two reads is not mistaken for the old cycle. */
 type CycleSlot = { side: Position['side']; quantity: string; entryPrice: string | null; cycle: PositionCycle; at: number };
 type Entry = { revision: string; scope: PositionsScope; attemptedAt: number; touchedAt: number; pending?: Promise<void>; abort?: AbortController;
-  cycles?: Map<string, CycleSlot>; cycleJob?: Promise<void>; cycleAbort?: AbortController };
+  cycles?: Map<string, CycleSlot>; cycleGeneration?: HistoryGeneration; cycleJob?: Promise<void>; cycleAbort?: AbortController };
 const TTL = 5_000;
 // Variational reads start a Python process per refresh. Lighter RH shares a 60-requests-per-minute limit with other
 // modules; its reader also reuses one account read per address for 30 seconds.
@@ -55,11 +56,11 @@ const CYCLE_TTL = 5 * 60_000, CYCLE_RETRY = 60_000, CYCLE_MIN_AGE = 30_000, CYCL
 const CYCLE_LOADING = '正在统计本轮平仓…';
 export const revisionOf = (value: string) => createHash('sha256').update(value).digest('hex');
 
-export async function defaultRead(credentials: Credentials, scope: string, signal: AbortSignal, fetcher: Fetcher = fetch): Promise<Position[]> {
+export async function defaultRead(credentials: Credentials, scope: string, signal: AbortSignal, fetcher: Fetcher = fetch, authorized?: () => void): Promise<Position[]> {
   switch (credentials.exchange) {
-    case 'binance': return readBinancePositions(credentials, fetcher, signal, scope as BinanceScope);
-    case 'bybit': return readBybitPositions(credentials, scope as BybitScope, fetcher, signal);
-    case 'okx': return readOkxPositions(credentials, scope as 'SWAP' | 'FUTURES', fetcher, signal);
+    case 'binance': return readBinancePositions(credentials, fetcher, signal, scope as BinanceScope, authorized);
+    case 'bybit': return readBybitPositions(credentials, scope as BybitScope, fetcher, signal, authorized);
+    case 'okx': return readOkxPositions(credentials, scope as 'SWAP' | 'FUTURES', fetcher, signal, authorized);
     case 'aster': return readAsterPositions(credentials, fetcher, signal);
     case 'variational': return readVariationalPythonPositions(credentials, signal);
     case 'rh-lighter': return readRhLighterPositions(credentials, fetcher, signal);
@@ -106,19 +107,19 @@ export function sourceAccounts(database: Database | null): SourceAccount[] {
   return accounts;
 }
 
-export type PositionsServiceOptions = { now?: () => number; ttl?: number; deadline?: number; concurrency?: number; read?: Read; cycle?: CycleRead | null; fetcher?: Fetcher };
+export type PositionsServiceOptions = { now?: () => number; ttl?: number; deadline?: number; concurrency?: number; read?: Read; cycle?: CycleRead | null; fetcher?: Fetcher; permission?: typeof verifyAssetPermission };
 export type PositionsService = ReturnType<typeof createPositionsService>;
 
 /** Process-local snapshots contain normalized public data only. Each poll reads current vault revisions. */
 export function createPositionsService(options: PositionsServiceOptions = {}) {
   const now = options.now ?? Date.now;
   const fetcher = options.fetcher ?? fetch;
-  async function readPositions(credentials: Credentials, scope: string, signal: AbortSignal) {
+  async function readPositions(credentials: Credentials, scope: string, signal: AbortSignal, authorized?: () => void) {
     if (!options.read && credentials.exchange === 'hyperliquid') return readHyperliquidPositions(credentials, scope, fetcher, signal, now);
-    const positions = await (options.read ?? defaultRead)(credentials, scope, signal, fetcher);
+    const positions = options.read ? await options.read(credentials, scope, signal) : await defaultRead(credentials, scope, signal, fetcher, authorized);
     return { positions, observedAt: new Date(now()).toISOString() };
   }
-  const defaultCycle: CycleRead = (credentials, scope, request, signal) => readPositionCycle(credentials, scope, request, { signal, fetcher });
+  const defaultCycle: CycleRead = (credentials, scope, request, signal, history) => readPositionCycle(credentials, scope, request, { signal, fetcher, now, history });
   // An injected position reader has no matching fill history unless a cycle reader is injected with it.
   const cycleRead = options.cycle !== undefined ? options.cycle : options.read ? null : defaultCycle;
   const cyclesFor = (exchange: PositionsExchangeId, scope: string) => !!cycleRead && cycleSupported(exchange, scope);
@@ -160,8 +161,10 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
     // A slot from the same side stays visible while a newer one loads; its updatedAt dates it.
     return slot && slot.side === item.side ? { ...slot.cycle } : cycleUnavailable(CYCLE_LOADING, null, 'loading');
   }
-  function scheduleCycles(database: DatabaseSource, account: SourceAccount, entry: Entry, key: string, credentials: Credentials, snapshotAt: number) {
+  function scheduleCycles(database: DatabaseSource, account: SourceAccount, entry: Entry, key: string, credentials: Credentials, snapshotAt: number, generation: HistoryGeneration) {
     if (!cycleRead) return;
+    if (!entry.cycleGeneration?.current()) entry.cycles?.clear();
+    entry.cycleGeneration = generation;
     const cycles = entry.cycles ??= new Map(), positions = entry.scope.positions, scope = entry.scope.id;
     for (const id of cycles.keys()) if (!positions.some(item => item.id === id)) cycles.delete(id);
     if (entry.cycleJob) return;
@@ -175,13 +178,17 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
     const abort = entry.cycleAbort = new AbortController();
     entry.cycleJob = cycleLimited(async () => {
       for (const item of due) {
-        if (entries.get(key) !== entry || abort.signal.aborted || !current(database, account, entry.revision)) return;
+        if (!generation.current() || entries.get(key) !== entry || abort.signal.aborted || !current(database, account, entry.revision)) return;
         // A position closed while its summary was read must not regain a slot.
         const store = (cycle: PositionCycle) => {
-          if (entries.get(key) === entry && entry.scope.positions.some(held => held.id === item.id)) cycles.set(item.id, { side: item.side, quantity: item.quantity, entryPrice: item.entryPrice, cycle, at: now() });
+          if (generation.current() && !abort.signal.aborted && entries.get(key) === entry && current(database, account, entry.revision) && entry.scope.positions.some(held => held.id === item.id)) {
+            cycles.set(item.id, { side: item.side, quantity: item.quantity, entryPrice: item.entryPrice, cycle, at: now() });
+          }
         };
         try {
-          store(await cycleRead(credentials, scope, { position: item, siblings: positions, snapshotAt }, AbortSignal.any([abort.signal, AbortSignal.timeout(CYCLE_DEADLINE)])));
+          const signal = AbortSignal.any([abort.signal, generation.signal, AbortSignal.timeout(CYCLE_DEADLINE)]);
+          const history = accountHistory(database, account.key, entry.revision, scope, () => !signal.aborted && entries.get(key) === entry && current(database, account, entry.revision), generation);
+          store(await cycleRead(credentials, scope, { position: item, siblings: positions, snapshotAt }, signal, history));
         } catch (error) {
           if (!(error instanceof CycleRetry) && !abort.signal.aborted) store(cycleUnavailable('本轮成交读取超时，稍后重试', new Date(now()).toISOString()));
         }
@@ -191,6 +198,7 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
   function refresh(database: DatabaseSource, account: SourceAccount, entry: Entry, key: string, unseal: Unseal) {
     if (entry.pending) return;
     entry.scope.refreshing = true;
+    const generation = historyGeneration(database, account.key, entry.revision);
     entry.pending = limited(async () => {
       if (entries.get(key) !== entry || !current(database, account, entry.revision)) return;
       const abort = new AbortController(); entry.abort = abort;
@@ -199,19 +207,26 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
         const startedAt = now();
         const work = async () => {
           const c = parseConnection(unseal(account.row!.encrypted, account.key));
-          if (c.exchange !== account.exchange || !current(database, account, entry.revision)) throw new Error(POSITIONS_FAILED);
-          return { c, ...await readPositions(c, entry.scope.id, abort.signal) };
+          if (!generation.current() || c.exchange !== account.exchange || !current(database, account, entry.revision)) throw new Error(POSITIONS_FAILED);
+          const signal = AbortSignal.any([abort.signal, generation.signal]);
+          if (c.exchange === 'binance' || c.exchange === 'bybit' || c.exchange === 'okx') {
+            await generation.verify(shared => (options.permission ?? verifyAssetPermission)(c, fetcher, shared));
+            if (signal.aborted || !current(database, account, entry.revision)) throw new Error(POSITIONS_FAILED);
+          }
+          return { c, ...await readPositions(c, entry.scope.id, signal, generation.assertVerified) };
         };
         const { c, positions, observedAt } = await Promise.race([work(), new Promise<never>((_, reject) => {
           timer = setTimeout(() => { abort.abort(); reject(new Error(POSITIONS_FAILED)); }, options.deadline ?? DEADLINE);
         })]);
         if (entries.get(key) !== entry || !current(database, account, entry.revision)) return;
+        if (!generation.current()) throw new Error(POSITIONS_FAILED);
         const previousObservation = c.exchange === 'hyperliquid' ? entry.scope.fetchedAt : null;
         if (previousObservation && observedAt < previousObservation) throw new Error(POSITIONS_FAILED);
         entry.scope = { ...entry.scope, positions: observedAt === previousObservation ? entry.scope.positions : positions,
           status: 'live', refreshing: false, fetchedAt: observedAt, error: null };
-        if (cyclesFor(account.exchange, entry.scope.id)) scheduleCycles(database, account, entry, key, c, startedAt);
-      } catch {
+        if (cyclesFor(account.exchange, entry.scope.id)) scheduleCycles(database, account, entry, key, c, startedAt, generation);
+      } catch (error) {
+        if (error instanceof PositionsPermissionError) generation.deny();
         let still = false;
         try { still = current(database, account, entry.revision); } catch { /* the file is gone: the next poll rebuilds */ }
         if (entries.get(key) === entry && still) {
@@ -227,6 +242,7 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
   async function read(database: DatabaseSource, unseal: Unseal, pending?: Set<Promise<void>>): Promise<HubPositions> {
     const accounts = sourceAccounts(database());
     const keep = new Set<string>();
+    const cycleViews: { account: SourceAccount; entry: Entry; positions: Position[] }[] = [];
     const exchanges = POSITIONS_CATALOG.map(exchange => ({ id: exchange.id, name: exchange.name,
       accounts: accounts.filter(account => account.exchange === exchange.id).map(account => {
         const revision = account.row ? revisionOf(account.row.encrypted) : null;
@@ -243,8 +259,8 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
           entry.touchedAt = now();
           if (!entry.pending && now() - entry.attemptedAt >= ttlFor(account.exchange)) refresh(database, account, entry, key, unseal);
           if (entry.pending) pending?.add(entry.pending);
-          const cycles = cyclesFor(account.exchange, scope.id), owned = entry;
-          const result = { ...entry.scope, positions: entry.scope.positions.map(item => cycles ? { ...item, cycle: cycleView(owned, item) } : { ...item }) };
+          const result = { ...entry.scope, positions: entry.scope.positions.map(item => ({ ...item })) };
+          if (result.positions.length && cyclesFor(account.exchange, scope.id)) cycleViews.push({ account, entry, positions: result.positions });
           if (result.status === 'live' && result.fetchedAt && now() - Date.parse(result.fetchedAt) >= STALE_AFTER) result.status = 'stale';
           return [result];
         }) };
@@ -261,6 +277,10 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
     for (const account of accounts) {
       const row = latest.find(item => item.exchange === account.key);
       if ((row?.encrypted ?? null) !== (account.row?.encrypted ?? null)) throw new Error(POSITIONS_FAILED);
+    }
+    for (const { account, entry, positions } of cycleViews) {
+      const allowed = entry.cycleGeneration?.current() && historyPermission(database(), account.key, entry.revision) === 'verified';
+      for (const item of positions) item.cycle = allowed ? cycleView(entry, item) : cycleUnavailable(CYCLE_LOADING, null, 'loading');
     }
     return boundPositionEvidence({ schemaVersion: 1, generatedAt: new Date(now()).toISOString(), exchanges });
   }
@@ -297,7 +317,7 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
             status: entry.scope.status === 'live' && now() - Date.parse(fetchedAt) < STALE_AFTER ? 'live' : 'stale',
             positions: entry.scope.positions.map(item => {
               // Unlike the live view, a snapshot keeps a summary only while it still describes the held size and entry.
-              const slot = cycles ? entry.cycles?.get(item.id) : undefined;
+              const slot = cycles && entry.cycleGeneration?.current() && historyPermission(database, account.key, revision) === 'verified' ? entry.cycles?.get(item.id) : undefined;
               const cycle = !cycles ? null : slot && slot.side === item.side && slot.quantity === item.quantity && slot.entryPrice === item.entryPrice
                 ? slot.cycle : cycleUnavailable(CYCLE_LOADING, null, 'loading');
               return { id: item.id, symbol: item.symbol, instrumentId: item.instrumentId, side: item.side, quantity: item.quantity, quantityUnit: item.quantityUnit,

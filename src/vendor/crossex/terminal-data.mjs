@@ -6,10 +6,18 @@ import { D, Decimal } from './money.mjs';
 export const TERMINAL_SYMBOL = /^(BINANCE|BYBIT|OKX|GATE|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_[A-Z0-9]{1,30}_(USDT|USDC|USD)$/;
 export const bookChannel = symbol => symbol.startsWith('KRAKEN_') ? null : symbol.startsWith('BYBIT_') ? 'order_book_1' : 'order_book_5';
 export const INTERVALS = Object.freeze({ '1m': 60000, '5m': 300000, '15m': 900000, '30m': 1800000, '1h': 3600000, '4h': 14400000, '1d': 86400000 });
+export const CANDLE_LIMIT = 240;
+// from is an opening time. to is inclusive and may fall inside the live candle.
+export function validCandleRange(interval, from, to, now) {
+  const step = INTERVALS[interval];
+  return typeof interval === 'string' && Object.hasOwn(INTERVALS, interval)
+    && Number.isSafeInteger(from) && from > 0 && from % step === 0
+    && Number.isSafeInteger(to) && to >= from && to <= now + 1000 && to - from < CANDLE_LIMIT * step;
+}
 export const numeric = (v, positive = false) => { try { return ['string', 'number'].includes(typeof v) && String(v).trim() && D(v).isFinite() && (!positive || D(v).gt(0)) ? D(v).toString() : null; } catch { return null; } };
 export const time = v => { if (typeof v !== 'number' && (typeof v !== 'string' || !/^[0-9]+$/.test(v))) return null; const n = Number(v); return Number.isSafeInteger(n) && n > 0 ? n : null; };
 export const failure = () => new AppError('公开历史行情响应无效', 502);
-export function normalizeCandles(rows, interval, now, keep = 240) {
+export function normalizeCandles(rows, interval, now, keep = CANDLE_LIMIT) {
   if (!Array.isArray(rows) || rows.length > 5000) throw failure();
   const unique = new Map();
   for (const row of rows) {

@@ -899,7 +899,8 @@ test('supplemental records deduplicate, preserve known details, survive restart 
   const f = fixture(t);
   const trade = { transaction_id: 'trade-1', order_id: 'external-1', symbol: symbols[0], side: 'BUY', qty: '1', price: '100', create_time: epoch, fee: '0.05', fee_currency: 'USDT' };
   let trades = [trade, trade], entries = [{ id: 'entry-1', coin: 'USDT', change: '-0.05', create_time: epoch }];
-  f.client.getTrades = async () => clone(trades); f.client.getAccountBook = async () => clone(entries);
+  f.client.getTrades = async () => clone(trades);
+  f.client.getAccountBook = async ({ from = 0, to }) => clone(entries.filter(e => e.create_time >= from && e.create_time <= to));
   await f.connect(); await f.runtime.refreshDetails();
   trades = [{ ...trade, fee: null, fee_currency: undefined }]; await f.runtime.refreshDetails();
   let live = f.runtime.view().live; assert.equal(live.recentTrades.length, 1); assert.equal(live.recentTrades[0].fee, '0.05'); assert.equal(live.accountBook.length, 1);
@@ -910,6 +911,103 @@ test('supplemental records deduplicate, preserve known details, survive restart 
   assert.equal(f.runtime.view().live.recentTrades.length, 0); assert.equal(f.runtime.view().live.accountBook.length, 0);
   assert.equal(f.store.db.prepare('SELECT count(*) n FROM live_trades').get().n, 1);
   assert.deepEqual(f.calls.create, []); assert.deepEqual(f.calls.cancel, []);
+});
+
+test('ledger advances only complete pages, covers same-millisecond records, and resumes the overlap after restart', async t => {
+  const f = fixture(t, { requestTimeoutMs: 1000 }), calls = [];
+  const entry = (id, create_time) => ({ id, create_time, coin: 'USDT', change: '0.01', user_id: '123' });
+  // An old database's displayed single-page timestamp alone is not proof of any covered range.
+  f.store.prepare('INSERT INTO live_supplemental VALUES (1,?)').run(JSON.stringify({ accountBookAsOf: epoch - 1 }));
+  const rows = Array.from({ length: 405 }, (_, i) => entry(`a${i}`, epoch - 5000));
+  let failSecond = true, repeatSecond = false;
+  f.client.getAccountBook = async ({ from = 0, to, limit, page = 1 }) => {
+    calls.push({ from, to, page }); if (failSecond && page === 2) throw Error('page unavailable');
+    const offset = (repeatSecond && page === 2 ? 0 : page - 1) * limit;
+    return rows.filter(row => row.create_time >= from && row.create_time <= to).slice(offset, offset + limit);
+  };
+  const total = () => f.store.prepare('SELECT count(*) n FROM live_account_book WHERE version=1').get().n;
+  const details = () => JSON.parse(f.store.prepare('SELECT json FROM live_supplemental WHERE version=1').get().json);
+  await f.connect(); await f.runtime.refreshDetails();
+  assert.equal(calls[0].from, epoch - 86400000);
+  assert.equal(total(), 0); assert.equal(details().accountBookSync.through, null); assert.ok(details().accountBookError);
+  failSecond = false; calls.length = 0; await f.runtime.refreshDetails();
+  assert.deepEqual(calls.map(c => c.page), [1, 2, 3]); assert.equal(total(), 405);
+  assert.equal(f.runtime.view().live.accountBook.length, 200); assert.equal(details().accountBookAsOf, epoch);
+  await f.reopen(); f.advance(30_000);
+  rows.push(entry('late', epoch - 50_000)); calls.length = 0; await f.runtime.refreshDetails();
+  assert.equal(calls[0].from, epoch - 60_000); assert.ok(calls.every(c => c.to === f.now));
+  assert.equal(total(), 406); assert.equal(details().accountBookAsOf, f.now);
+  const through = f.now; f.advance(5000); repeatSecond = true;
+  await f.runtime.refreshDetails();
+  assert.equal(details().accountBookSync.through, through); assert.ok(details().accountBookError);
+  assert.ok(details().accountBookSync.pending.to < f.now); assert.equal(total(), 406);
+  repeatSecond = false; calls.length = 0; await f.reopen(); await f.runtime.refreshDetails();
+  assert.ok(calls[0].to < f.now); await f.runtime.refreshDetails();
+  assert.equal(details().accountBookSync.through, f.now); assert.equal(details().accountBookError, null);
+  rows.push({ ...entry('wrong-account', f.now), user_id: '456' }); f.advance(1000);
+  await f.runtime.refreshDetails(); assert.equal(details().accountBookSync.through, through + 5000);
+  assert.equal(f.store.prepare("SELECT count(*) n FROM live_account_book WHERE id='wrong-account'").get().n, 0);
+  await f.runtime.refresh();
+  assert.ok(f.runtime.view().live.tradingAllowed);
+});
+
+test('ledger caps dense reads and keeps a quiet account\'s older recent entries outside verified coverage', async t => {
+  const f = fixture(t, { requestTimeoutMs: 1000 }), day = 86_400_000;
+  const old = { id: 'older', create_time: epoch - 7 * day, user_id: '123' }, calls = [];
+  let dense = false;
+  f.client.getAccountBook = async query => {
+    calls.push(query);
+    if (dense) return Array.from({ length: query.limit }, (_, i) => ({
+      id: `p${query.page}-${i}`, create_time: query.to, user_id: '123',
+    }));
+    return old.create_time >= (query.from ?? 0) && old.create_time <= query.to ? [old] : [];
+  };
+  await f.connect(); await f.runtime.refreshDetails();
+  assert.deepEqual(f.runtime.view().live.accountBook, [old]);
+  const stored = () => JSON.parse(f.store.prepare('SELECT json FROM live_supplemental WHERE version=1').get().json);
+  assert.equal(stored().accountBookSync.since, epoch - day);
+  dense = true; f.advance(30_000); calls.length = 0; await f.runtime.refreshDetails();
+  assert.equal(calls.length, 8); assert.equal(stored().accountBookSync.through, epoch);
+  assert.ok(stored().accountBookSync.pending); assert.deepEqual(f.runtime.view().live.accountBook, [old]);
+  dense = false; f.store.db.exec("CREATE TRIGGER ledger_unwritable BEFORE INSERT ON live_account_book BEGIN SELECT RAISE(ABORT, 'disk'); END");
+  f.client.getAccountBook = async query => [{ ...old, create_time: query.to, id: 'new' }];
+  await f.runtime.refreshDetails();
+  assert.equal(stored().accountBookSync.through, epoch); assert.ok(stored().accountBookError);
+  assert.deepEqual(f.runtime.view().live.accountBook, [old]);
+});
+
+test('a failed older display page leaves the recent ledger committed and resumes separately after a runtime restart', async t => {
+  const f = fixture(t, { requestTimeoutMs: 1000 }), calls = [], day = 86_400_000;
+  const recent = { id: 'new', user_id: '123', create_time: epoch - 1000 };
+  const older = { id: 'old', user_id: '123', create_time: epoch - 2 * day };
+  const next = { id: 'next', user_id: '123', create_time: epoch + 1000 };
+  let offline = true;
+  f.client.getAccountBook = async query => {
+    calls.push(query);
+    if (query.from === undefined) {
+      if (offline) throw Error('older page unavailable');
+      return [older];
+    }
+    return [recent, next].filter(row => row.create_time >= query.from && row.create_time <= query.to);
+  };
+  const details = () => JSON.parse(f.store.prepare('SELECT json FROM live_supplemental WHERE version=1').get().json);
+  await f.connect(); await f.runtime.refreshDetails();
+  assert.deepEqual(f.runtime.view().live.accountBook, [recent]);
+  assert.equal(details().accountBookSync.through, epoch); assert.equal(details().accountBookAsOf, epoch);
+  assert.equal(details().accountBookSync.olderLimit, 199); assert.match(details().accountBookError, /较早/);
+  await f.reopen(); f.advance(5000); calls.length = 0; offline = false;
+  f.store.db.exec("CREATE TRIGGER reject_old_page BEFORE INSERT ON live_account_book WHEN NEW.id='old' BEGIN SELECT RAISE(ABORT,'disk'); END");
+  await f.runtime.refreshDetails();
+  assert.deepEqual(calls, [{ from: epoch - 60000, to: f.now, page: 1, limit: 200 }, { to: epoch - day - 1, limit: 199 }]);
+  assert.deepEqual(f.runtime.view().live.accountBook, [next, recent]);
+  assert.equal(details().accountBookSync.through, f.now); assert.equal(details().accountBookSync.olderLimit, 199);
+  await f.reopen(); f.store.db.exec('DROP TRIGGER reject_old_page');
+  await f.runtime.refreshDetails();
+  assert.deepEqual(f.runtime.view().live.accountBook, [next, recent, older]);
+  assert.equal(details().accountBookSync.since, epoch - day); assert.equal(details().accountBookSync.olderLimit, 0);
+  assert.equal(details().accountBookError, null);
+  calls.length = 0; await f.runtime.refreshDetails();
+  assert.equal(calls.length, 1); assert.ok(calls[0].from > epoch - day);
 });
 
 test('supplemental failures remain independent and cannot block a verified reduce-only close', async t => {

@@ -330,6 +330,8 @@ test('account book maps statement_type and millisecond range while preserving si
   assert.deepEqual(await f.client.getAccountBook({ coin: 'USDT', type: 'FUNDING_FEE', from: NOW - 2000, to: NOW, limit: 2 }), records);
   assert.equal(f.calls[0].url, 'https://api.gateio.ws/api/v4/crossex/account_book?page=1&limit=2&coin=USDT&statement_type=FUNDING_FEE&from=1699999998123&to=1700000000123');
   assert.equal(f.calls[0].init.headers.SIGN, '8faf07839d998b79cecbddf2452bf8886007827f0e2652c9319563b905826c1d9c6c64c97719526a7dd63b3ea13fae613ef518464f6dcaf094233ece6ddae590');
+  assert.deepEqual(await f.client.getAccountBook({ from: NOW - 2000, to: NOW, page: 2, limit: 200 }), records);
+  assert.equal(new URL(f.calls[1].url).searchParams.toString(), `page=2&limit=200&from=${NOW - 2000}&to=${NOW}`);
   await assert.rejects(f.client.getAccountBook({ coin: 'USDC' }), { code: 'GATE_INVALID_RESPONSE' });
   await assert.rejects(f.client.getAccountBook({ type: 'TRADING_FEE' }), { code: 'GATE_INVALID_RESPONSE' });
   await assert.rejects(f.client.getAccountBook({ from: NOW }), { code: 'GATE_INVALID_RESPONSE' });

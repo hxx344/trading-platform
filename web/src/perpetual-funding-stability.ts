@@ -1,7 +1,7 @@
 // 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-funding-stability.ts（提交 c84ba27），只改导入路径（本仓库的
 // exchange-funding-history 副本是 .mjs 加类型声明）。
 import type { SettledFundingRecord } from '../../src/vendor/exchange-funding-history.mjs';
-import { PERPETUAL_FUNDING_STALE_MS, type FundingWindowHours, type FundingWindowTotal, type PerpetualFundingLeg } from '../../src/vendor/perpetual-funding-history.ts';
+import { fundingFreshUntil, type FundingWindowHours, type FundingWindowTotal, type PerpetualFundingLeg } from '../../src/vendor/perpetual-funding-history.ts';
 
 const DAY_MS = 86_400_000;
 export type FundingStabilityDays = 3 | 7 | 30;
@@ -113,7 +113,8 @@ export function analyzeFundingStability(longInput: PerpetualFundingLeg | undefin
   const asOf = Math.min(long.coverage.to, short.coverage.to), from = asOf - days * DAY_MS;
   result.asOf = result.to = total.asOf = asOf; result.from = from;
   if (asOf > now + 5_000) return finish('stale', '历史截止时间超前，暂不计算稳定度');
-  const stale = now - asOf > PERPETUAL_FUNDING_STALE_MS;
+  total.freshUntil = fundingFreshUntil(long, short);
+  const stale = now > total.freshUntil;
   const pending = long.backfillComplete === false || short.backfillComplete === false || long.status === 'pending' || short.status === 'pending';
   const state = (complete: boolean): { status: FundingStabilityStatus; reason: string } => {
     if (stale) return { status: 'stale', reason: '历史已过期，保留已取得的结算数据' };

@@ -6,7 +6,7 @@
 // connect and Aster account paths, the sealed rows, and the HTTP answers (403, 400, 409, 503) with no credential in any.
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -82,6 +82,8 @@ function imported(t: TestContext, { emptyAster = true } = {}) {
   writeWorkbenchLedger(from, { now: NOW });
   const load = () => importLedger({ from, owner: OWNER, dataDir, now: () => NOW });
   load();
+  // Sync exercises verified connections against an existing key. Windows cannot fsync a directory on first key creation.
+  if (process.platform === 'win32') writeFileSync(join(dataDir, CREDENTIAL_KEY_FILE), '1'.repeat(64) + '\n', { mode: 0o600, flag: 'wx' });
   // The fixture's Aster account has a non-UUID id the page could not address; these tests add their own.
   const writable = (run: (database: AssetDb) => void) => { const database = openAssetDb(file, { mode: 'service' }); try { run(database); } finally { database.close(); } };
   if (emptyAster) writable(database => database.prepare("UPDATE settings SET value = '[]' WHERE key = 'aster-accounts'").run());

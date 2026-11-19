@@ -41,6 +41,7 @@ export class FakeOptions {
   marginMode = 'REGULAR_MARGIN';
   calls: { method: string; path: string; params: URLSearchParams; body: Row | null }[] = [];
   creates = 0;
+  tickerGate?: Promise<void>;
   /** How an IOC (the fallback) fares: fill, partial, rest (cancelled at once, nothing filled) or lost (fills, but the answer is a 5xx and the order cannot be read). */
   iocMode: 'fill' | 'partial' | 'rest' | 'lost' = 'fill';
   /** 组合询价 (G2c): the one RFQ, its quotes and trades. */
@@ -126,13 +127,14 @@ export class FakeOptions {
     const parsed = new URL(url), path = parsed.pathname, params = parsed.searchParams;
     const body = typeof init.body === 'string' ? JSON.parse(init.body) as Row : null;
     this.calls.push({ method: init.method ?? 'GET', path, params, body });
-    const list = (rows: Row[]) => ok({ list: rows, nextPageCursor: '' });
+    const list = (rows: Row[]) => ok({ ...(params.has('category') ? { category: params.get('category') } : {}), list: rows, nextPageCursor: '' });
     switch (path) {
       case '/v5/market/time': return ok({ timeNano: `${BigInt(Date.now()) * 1_000_000n}` });
       case '/v5/market/instruments-info': return list(this.rows().map(row => ({ symbol: row.symbol, deliveryTime: String(row.expiry), optionsType: row.type === 'C' ? 'Call' : 'Put', lotSizeFilter: { minOrderQty: '0.01', qtyStep: '0.01', maxOrderQty: '500' }, priceFilter: { tickSize: '5' } })));
       case '/v5/market/tickers': {
         if (params.get('category') === 'linear') return list([{ symbol: 'BTCUSDT', indexPrice: String(this.index), markPrice: String(this.index) }]);
         const symbol = params.get('symbol');
+        if (symbol && this.tickerGate) await this.tickerGate;
         return list((symbol ? [symbol] : this.rows().map(row => row.symbol as string)).map(item => this.quote(item)));
       }
       case '/v5/user/query-api': return ok({ readOnly: 0, permissions: this.permissions, ips: this.ips, userID: this.uid });
@@ -146,7 +148,12 @@ export class FakeOptions {
         const show = order && order.visible && (path === '/v5/order/realtime' ? open : !open);
         return list(show ? [{ symbol: order.symbol, side: order.side, qty: order.qty, orderLinkId: order.link, orderId: order.orderId, orderStatus: order.status, cumExecQty: order.cumExecQty, price: order.price }] : []);
       }
-      case '/v5/execution/list': if (this.failExecutions) return fail(10016, 503); return list(this.executions.filter(row => params.has('orderId') ? row.orderId === params.get('orderId') : row.orderLinkId === params.get('orderLinkId')));
+      case '/v5/execution/list': {
+        if (this.failExecutions) return fail(10016, 503);
+        const matches = this.executions.filter(row => params.has('orderId') ? row.orderId === params.get('orderId') : row.orderLinkId === params.get('orderLinkId'));
+        const start = Number(params.get('cursor') ?? '0'), end = start + Number(params.get('limit') ?? '50');
+        return ok({ category: 'option', list: matches.slice(start, end), nextPageCursor: end < matches.length ? String(end) : '' });
+      }
       case '/v5/rfq/config': return ok({ deskCode: 'ME', maxLegs: 25, maxLP: 2, maxProviders: 25, counterparties: [{ traderName: 'a', deskCode: 'DESK1', type: 'LP' }, { traderName: 'b', deskCode: 'DESK2', type: 'LP' }, { traderName: 'c', deskCode: 'DESK3', type: 'LP' }], strategyTypes: [{ strategyName: 'Iron_Condor' }, { strategyName: 'Strangle' }] });
       case '/v5/rfq/create-rfq': {
         const refused = this.rfqWriteFails();

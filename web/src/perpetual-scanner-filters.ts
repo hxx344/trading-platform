@@ -1,6 +1,6 @@
 // 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-scanner-filters.ts（提交 c84ba27）。改动：资金费历史与市场指标指向 src/vendor 的副本。
 import { quoteCurrencyFx, type PerpetualFxSnapshot } from "./perpetual-fx.ts";
-import { PERPETUAL_FUNDING_STALE_MS, type FundingWindowHours, type FundingWindowTotal } from "../../src/vendor/perpetual-funding-history.ts";
+import { fundingTotalIsFresh, type FundingWindowHours, type FundingWindowTotal } from "../../src/vendor/perpetual-funding-history.ts";
 import { PERPETUAL_MARKET_METRICS_STALE_MS, type PerpetualMarketMetricsLeg } from "../../src/vendor/perpetual-market-metrics.ts";
 import { annualizedFundingPercent } from "./perpetual-scanner.ts";
 import { normalizedFunding8h, type PerpetualSpread } from "./perpetual-spreads.ts";
@@ -129,7 +129,7 @@ export function scannerHistoryValue(row: PerpetualSpread, hours: FundingWindowHo
   const total = data.history?.[scannerHistoryPairKey(row)]?.[hours];
   if (!total || total.status === "pending") return "pending";
   if (total.status !== "ready" || total.hours !== hours || total.netPercent === null || !Number.isFinite(total.netPercent)
-    || !fresh(total.asOf, data.now, PERPETUAL_FUNDING_STALE_MS)) return "missing";
+    || !fundingTotalIsFresh(total, data.now)) return "missing";
   return legKey(row.long) < legKey(row.short) ? total.netPercent : -total.netPercent;
 }
 

@@ -324,8 +324,10 @@ export function createGateClient({ apiKey, apiSecret, fetcher = fetch, clock = D
     async getAccountBook(options = {}) {
       let query;
       try {
-        object(options); requireValue(Object.keys(options).every(key => ['coin', 'type', 'from', 'to', 'limit'].includes(key)));
-        query = { page: 1, limit: options.limit ?? 100 };
+        object(options); requireValue(Object.keys(options).every(key => ['coin', 'type', 'from', 'to', 'page', 'limit'].includes(key)));
+        query = { page: options.page ?? 1, limit: options.limit ?? 100 };
+        requireValue(Number.isInteger(query.page) && query.page >= 1 && query.page <= MAX_PAGES
+          && (query.page === 1 || options.from !== undefined && options.to !== undefined));
         requireValue(Number.isInteger(query.limit) && query.limit > 0 && query.limit <= 1000);
         if (options.coin !== undefined) { requireValue(typeof options.coin === 'string' && /^[A-Z0-9][A-Z0-9_.-]{0,79}$/.test(options.coin)); query.coin = options.coin; }
         if (options.type !== undefined) query.statement_type = enumValue(options.type, BOOK_TYPES);
@@ -334,7 +336,7 @@ export function createGateClient({ apiKey, apiSecret, fetcher = fetch, clock = D
         for (const field of ['from', 'to']) if (query[field] !== undefined) requireValue(Number.isSafeInteger(query[field]) && query[field] >= 0);
         requireValue(query.from === undefined || query.from <= query.to);
       } catch { throw inputError(); }
-      // A bounded recent ledger page, not a claim of complete account history.
+      // The runtime verifies that all pages of a pinned time interval have been read.
       return request('GET', '/crossex/account_book', query, undefined, data => list(data, row => {
         const result = accountBookRecord(row);
         requireValue((query.coin === undefined || result.coin === query.coin) && (query.statement_type === undefined || result.statement_type === query.statement_type));

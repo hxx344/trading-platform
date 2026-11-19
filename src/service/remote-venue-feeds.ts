@@ -1,4 +1,5 @@
 import type { MarketClient } from '../market/ipc.ts';
+import type { CandleRange } from '../vendor/crossex/candle-reader.mjs';
 import { fields, fixedUnits, ondoName, publicIdentity, timestamp, unpackBook } from '../market/venue-protocol.ts';
 import { createOndoClient, type OndoClient, type OndoDepth, type OndoRules } from '../vendor/ondo/client.mjs';
 import { decimalUnits } from '../vendor/ondo/decimal.mjs';
@@ -191,7 +192,7 @@ export function remoteCrossexReaders(market: MarketClient) {
   const stopped = new AbortController();
   const signal = () => AbortSignal.any([stopped.signal, AbortSignal.timeout(25_000)]);
   const previousBooks = new Map<string, { lease: string; at: number }>();
-  const call = <T>(op: string, input: unknown) => market.call<T>(op, input, signal()).catch(error => {
+  const call = <T>(op: string, input: unknown, request?: AbortSignal) => market.call<T>(op, input, request ? AbortSignal.any([request, signal()]) : signal()).catch(error => {
     const status = typeof error?.status === 'number' && error.status >= 400 && error.status <= 599 ? error.status : 503;
     throw new AppError('CrossEx 公开行情读取失败', status);
   });
@@ -225,6 +226,7 @@ export function remoteCrossexReaders(market: MarketClient) {
     marketOptions: { depthReader: depth('crossex.depth'), manualDepthReader,
       currentFundingReader: (quote: Record<string, unknown>) => call('crossex.currentFunding', { quote: publicIdentity(quote) }) },
     terminalOptions: { publicFeed, depthReader: manualDepthReader,
-      candleReader: (quote: Record<string, unknown>, interval: string) => call('crossex.candles', { quote: publicIdentity(quote), interval }) },
+      candleReader: (quote: Record<string, unknown>, interval: string, request?: AbortSignal, range?: CandleRange) =>
+        call('crossex.candles', { quote: publicIdentity(quote), interval, ...range }, request) },
   };
 }

@@ -76,7 +76,7 @@ export function fetchAnthropicCandles(existing?: unknown, options?: AnthropicRea
 export function anthropicChartRows(rows: readonly AnthropicCandleRow[], leg: AnthropicComparisonLeg, shares?: AnthropicShares | null): AnthropicChartRow[];
 
 export type AnthropicCandleStarts = Record<AnthropicLegKey, number>;
-export interface AnthropicCandleBatch { legs: Partial<Record<AnthropicLegKey, [number, number][]>>; errors: AnthropicLegErrors; at: number }
+export interface AnthropicCandleBatch { legs: Partial<Record<AnthropicLegKey, [number, number][]>>; errors: AnthropicLegErrors; through?: Partial<AnthropicCandleStarts>; at: number }
 export function anthropicCandleStarts(previous: AnthropicCandles | null, now: number): AnthropicCandleStarts;
-export function fetchAnthropicCandleBatch(starts: AnthropicCandleStarts, options?: AnthropicReadOptions): Promise<AnthropicCandleBatch>;
+export function fetchAnthropicCandleBatch(starts: AnthropicCandleStarts, options?: AnthropicReadOptions & { ends?: AnthropicCandleStarts }): Promise<AnthropicCandleBatch>;
 export function mergeAnthropicCandleBatch(previous: AnthropicCandles | null, batch: AnthropicCandleBatch): AnthropicCandles;

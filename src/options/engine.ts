@@ -82,7 +82,14 @@ export interface JournalEntry {
   status: OrderStatus; terminal: boolean; filledQty: string; orderId: string; createdAt: number; updatedAt: number; message?: string; price?: string;
   /** An IOC fallback for a leg's remainder, or a leg of a filled RFQ (G2c, read by orderId); absent for the book-following order. */
   kind?: 'ioc' | 'rfq';
+  /** Last possible create transmission, including a retry after the exchange rejected the timestamp. */
+  lastPossibleSendAt?: number;
+  /** A signed response named this link. Two different venue ids for it require manual reconciliation. */
+  orderSeen?: true;
+  conflictingOrderId?: string;
+  conflictingExecutionId?: string;
 }
+interface ArchivedFills { qty: bigint; orderId: string; conflict: boolean }
 /**
  * The Friday auto-open: enabled is the page's switch (null: config.json decides); lastOpenWeek the ISO week a scheduled
  * opening was admitted in (once per week); attemptWeek / lastError the last refused attempt, notifiedWeek the week whose
@@ -180,6 +187,11 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
   if (unarchived.length) { store.saveExecutions(unarchived); for (const record of unarchived) ledger.set(record.execId, record); }
   const samples = store.samples();
   const backfillAt = new Map<string, number>();
+  // Only this running process can prove a journaled intent has not reached the transport yet.
+  const awaitingFirstSend = new Set<string>();
+  let archivedQuantities: Map<string, ArchivedFills> | null = null;
+  const executionReads = new Map<string, Promise<boolean>>();
+  const confirmingTerminal = new Set<string>();
   let performanceError: string | null = null;
   const autoOpen = settings.autoOpen ?? DEFAULT_AUTO_OPEN;
   const autoOpenEnabled = (): boolean => state.schedule.enabled ?? autoOpen.enabled;
@@ -213,6 +225,11 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
   for (const task of Object.values(state.tasks)) {
     if (!isActive(task.status)) continue;
     Object.assign(task, { status: 'recovering', stopRequested: true, stopRequestedAt: task.stopRequestedAt ?? now() });
+    restarted = true;
+  }
+  // Older journals recorded the intent before waiting for a price. The previous process could have sent until restart.
+  for (const entry of Object.values(state.journal)) if (!entry.terminal && entry.lastPossibleSendAt === undefined) {
+    entry.lastPossibleSendAt = Math.max(entry.createdAt, entry.updatedAt, now());
     restarted = true;
   }
   if (restarted) save();
@@ -956,15 +973,64 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     if (sortedJson(merged) !== sortedJson(task.risk)) { task.risk = merged; save(); }
   }
 
+  function orderSeen(link: string, id: string): void {
+    const entry = state.journal[link]!;
+    const archive = id && !entry.orderId ? archivedByOrder().get(link) : undefined;
+    const knownId = entry.orderId || archive?.orderId;
+    if (id && knownId && id !== knownId) {
+      if (!entry.conflictingOrderId) {
+        Object.assign(entry, { orderSeen: true, orderId: knownId, conflictingOrderId: id });
+        archivedQuantities = null;
+        save();
+      }
+      throw new Error('同一关联号出现不同的交易所订单号，须核对委托');
+    }
+    if (entry.orderSeen && (!id || entry.orderId === id)) return;
+    entry.orderSeen = true;
+    if (id && !entry.orderId) { entry.orderId = id; if (archive) archivedQuantities = null; }
+    save();
+  }
+
+  function transmitted(link: string): void {
+    state.journal[link]!.lastPossibleSendAt = now();
+    save(); // Synchronous with the transport guard, before fetch.
+    awaitingFirstSend.delete(link);
+  }
+
   /** filledQty never falls; each new fill moves the tracked strategy (a reduce-only fill shrinks the opposite side). */
-  function recordOrder(link: string, outcome: OrderOutcome): void {
+  function recordOrder(link: string, outcome: OrderOutcome, keepPending = false): void {
     const entry = state.journal[link];
     if (!entry) return;
+    if (outcome.orderId && entry.orderId && outcome.orderId !== entry.orderId) orderSeen(link, outcome.orderId);
+    if (outcome.terminal) {
+      const advances = cmp(outcome.filledQty, entry.filledQty) > 0;
+      if (keepPending && !advances) return;
+      const archive = archivedByOrder().get(link);
+      const id = outcome.orderId || entry.orderId;
+      if (entry.conflictingOrderId || entry.conflictingExecutionId || archive?.conflict || (id && archive?.orderId && archive.orderId !== id)
+        || cmp(outcome.filledQty, entry.filledQty) < 0 || exact(outcome.filledQty) < (archive?.qty ?? 0n)) {
+        throw new Error('委托终态与已见订单号或累计成交数量不一致');
+      }
+      if (outcome.status === 'not_submitted' && (id || entry.orderSeen || !isZero(entry.filledQty) || archive)) throw new Error('已有此单的委托或成交证据');
+      const readingFills = executionReads.has(link) && cmp(outcome.filledQty, entry.qty) < 0;
+      if (keepPending || readingFills) {
+        // The validated cumulative quantity stays durable even if the pending fill read fails or the next order reply lags.
+        if (advances) saveOrderOutcome(link, entry, { ...outcome, status: 'unknown', terminal: false });
+        if (!keepPending) throw new Error('该单成交明细仍在读取，待核对终态');
+        return;
+      }
+    }
+    saveOrderOutcome(link, entry, outcome);
+  }
+
+  function saveOrderOutcome(link: string, entry: JournalEntry, outcome: OrderOutcome): void {
     const filled = cmp(outcome.filledQty, entry.filledQty) < 0 ? entry.filledQty : decimal(outcome.filledQty);
     const next: Partial<JournalEntry> = { status: outcome.status, terminal: outcome.terminal, filledQty: filled, orderId: outcome.orderId || entry.orderId };
     if (outcome.message !== undefined) next.message = outcome.message;
     if (outcome.price !== undefined) next.price = outcome.price;
     if (Object.entries(next).every(([key, value]) => entry[key as keyof JournalEntry] === value)) return;
+    if (next.orderId !== entry.orderId && archivedQuantities?.has(link)) archivedQuantities = null;
+    if (outcome.terminal || outcome.orderId) awaitingFirstSend.delete(link);
     const delta = sub(filled, entry.filledQty);
     Object.assign(entry, next, { updatedAt: now() });
     const task = state.tasks[entry.taskId];
@@ -992,14 +1058,16 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     const created = now();
     state.journal[link] = { taskId: task.id, symbol: leg.symbol, side: leg.side, qty: leg.qty, reduceOnly: task.type === 'close', tick: row.tick, status: 'unknown', terminal: false, filledQty: '0', orderId: '', createdAt: created, updatedAt: created };
     save(); // The intent is durable before the order can exist.
+    awaitingFirstSend.add(link);
     return followOrder(client, { symbol: leg.symbol, side: leg.side, qty: leg.qty, link, reduceOnly: task.type === 'close', tick: row.tick }, {
       now, deadline: created + settings.orderTimeoutMs, pollMs,
       checkStop: () => checkStop(task),
       checkPrice: price => reservePrice(task, link, leg.symbol, price),
+      transmitted: () => transmitted(link), seen: id => orderSeen(link, id),
       pause: ms => pause(task, ms),
       record: outcome => recordOrder(link, outcome),
       sleep, log,
-    });
+    }).finally(() => awaitingFirstSend.delete(link));
   }
 
   /**
@@ -1016,7 +1084,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
       if (task.netBlocked || task.riskBlocked) return outcome;
       await pause(task, FALLBACK_DELAY_MS);
       const previous: OrderOutcome = { orderId: entry.orderId, status: entry.status, terminal: entry.terminal, filledQty: entry.filledQty, ...(entry.price ? { price: entry.price } : {}) };
-      const confirmed = await reconcileOrder(client, { ...entry, link }, previous, false, { record: item => recordOrder(link, item), sleep, log });
+      const confirmed = await reconcileOrder(client, { ...entry, link }, previous, false, { record: item => recordOrder(link, item), seen: id => orderSeen(link, id), sleep, log });
       // A read that failed proves nothing new: the order stays as it ended, and nothing more is sent.
       if (!confirmed.terminal) return { ...outcome, message: '兜底前未能再次读到原订单，未发 IOC 兜底' };
       recordOrder(link, confirmed);
@@ -1032,12 +1100,14 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
       state.journal[iocLink] = { taskId: task.id, symbol: leg.symbol, side: leg.side, qty: remaining, reduceOnly: false, tick: row.tick, status: 'unknown', terminal: false, filledQty: '0', orderId: '', createdAt: created, updatedAt: created, kind: 'ioc' };
       save();
       log(`期权任务 ${task.id}：${leg.symbol} 剩余 ${remaining}，尝试 IOC 兜底（先核对净价与风险限制）`);
+      awaitingFirstSend.add(iocLink);
       const ioc = await iocOrder(client, { symbol: leg.symbol, side: leg.side, qty: remaining, link: iocLink, reduceOnly: false, tick: row.tick }, {
         checkStop: () => checkStop(task),
         checkPrice: price => reservePrice(task, iocLink, leg.symbol, price),
+        transmitted: () => transmitted(iocLink), seen: id => orderSeen(iocLink, id),
         record: item => recordOrder(iocLink, item),
         sleep, log,
-      });
+      }).finally(() => awaitingFirstSend.delete(iocLink));
       const filled = add(confirmed.filledQty, ioc.filledQty);
       const status: OrderStatus = !ioc.terminal ? 'unknown' : cmp(filled, leg.qty) === 0 ? 'filled' : isZero(filled) ? 'timeout_cancelled' : 'partial';
       return { orderId: confirmed.orderId, status, terminal: ioc.terminal, filledQty: filled, ...(ioc.message ? { message: `IOC 兜底：${ioc.message}` } : {}) };
@@ -1131,46 +1201,106 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     } catch (error) { log(`开仓前组合保证金基线读取失败：${describe(error)}`); }
   }
 
-  /** Reads the fills of the given orders into the ledger and the recent list; answers how many reads failed. */
-  async function loadExecutions(links: readonly string[]): Promise<number> {
-    const signal = AbortSignal.timeout(READ_MS);
-    // An RFQ leg (G2c) is a block trade without our orderLinkId: it is read by its order id and filed under its journal link.
-    const targets = [...new Set(links)].map(link => ({ link, rfq: Object.hasOwn(state.journal, link) && state.journal[link]!.kind === 'rfq' ? state.journal[link]!.orderId : null }));
-    const groups = await Promise.allSettled(targets.map(({ link, rfq }) => rfq === null ? client.executions(link, signal) : rfq ? client.executionsByOrder(rfq, signal) : Promise.resolve([]))); // An RFQ tracked without order ids has no fills to read.
-    const records: ExecutionRecord[] = [];
-    let failed = 0;
-    for (const [index, group] of groups.entries()) {
-      if (group.status === 'rejected') { failed += 1; log(`部分期权成交明细读取失败，保留已有记录：${describe(group.reason)}`); continue; }
-      const target = targets[index]!;
-      for (const row of group.value) {
+  // Quantities come from the complete SQLite ledger, including fills outside the recent-100 view.
+  function matchesJournal(record: Pick<ExecutionRecord, 'symbol' | 'side' | 'orderId'>, entry: JournalEntry) {
+    return record.symbol === entry.symbol && record.side === entry.side && (!entry.orderId || !record.orderId || entry.orderId === record.orderId);
+  }
+  function archivedByOrder() {
+    if (archivedQuantities) return archivedQuantities;
+    const totals = new Map<string, ArchivedFills>();
+    for (const record of ledger.values()) {
+      const entry = state.journal[record.orderLinkId];
+      if (!entry || (record.execType !== 'Trade' && record.execType !== 'BlockTrade')) continue;
+      const proof = totals.get(record.orderLinkId) ?? { qty: 0n, orderId: '', conflict: false };
+      totals.set(record.orderLinkId, proof);
+      if (!matchesJournal(record, entry) || !Number.isFinite(record.execQty) || record.execQty <= 0) { proof.conflict = true; continue; }
+      if (record.orderId && proof.orderId && record.orderId !== proof.orderId) proof.conflict = true;
+      proof.orderId ||= record.orderId;
+      proof.qty += exact(record.execQty);
+    }
+    return archivedQuantities = totals;
+  }
+
+  function archiveExecutionPage(link: string, entry: JournalEntry, rows: Row[]): void {
+    const records = new Map<string, ExecutionRecord>();
+    let issue: unknown;
+    for (const row of rows) {
+      try {
+        if (entry.kind !== 'rfq' && !entry.terminal && row.orderLinkId === link) orderSeen(link, '');
         const parsed = parseExecution(row);
-        if (target.rfq !== null && parsed.orderId !== target.rfq) continue;
-        const record = target.rfq === null ? parsed : { ...parsed, orderLinkId: target.link };
-        const owner = Object.hasOwn(state.journal, record.orderLinkId) ? state.journal[record.orderLinkId] : undefined;
-        const task = owner ? state.tasks[owner.taskId] : undefined;
+        if (entry.kind === 'rfq' ? parsed.orderId !== entry.orderId : parsed.orderLinkId !== link) throw new Error('按委托查询的成交缺少对应关联号或订单号');
+        if (entry.kind !== 'rfq' && !entry.terminal && parsed.symbol === entry.symbol && parsed.side === entry.side
+          && (parsed.execType === 'Trade' || parsed.execType === 'BlockTrade')) orderSeen(link, parsed.orderId);
+        if (!matchesJournal(parsed, entry)) throw new Error('成交合约、方向或订单号与委托不一致');
+        const record = entry.kind === 'rfq' ? { ...parsed, orderLinkId: link } : parsed;
+        const prior = records.get(record.execId) ?? ledger.get(record.execId);
+        const priorEntry = prior && state.journal[prior.orderLinkId];
+        if (prior && priorEntry && matchesJournal(prior, priorEntry) && (prior.execType === 'Trade' || prior.execType === 'BlockTrade')
+          && (prior.orderLinkId !== link || prior.execQty !== record.execQty || (record.execType !== 'Trade' && record.execType !== 'BlockTrade'))) {
+          // Retain an identified fill if another page or sampler returns a different order or quantity for the same id.
+          for (const owner of [priorEntry, entry]) if (!owner.terminal && !owner.conflictingExecutionId) { owner.conflictingExecutionId = record.execId; save(); }
+          throw new Error('同一成交编号对应的委托或成交数量有冲突');
+        }
+        const task = state.tasks[entry.taskId];
         const reduceOnly = task?.type === 'close' || record.orderLinkId.startsWith('tpo-close-');
         const baseline = reduceOnly ? undefined : task?.legs[record.symbol];
         const chainPrice = baseline?.chainPrice ?? null;
         const chainPriceDiff = chainPrice !== null && baseline ? (baseline.side === 'Sell' ? 1 : -1) * (record.execPrice - chainPrice) * record.execQty : null;
-        records.push({ ...record, reduceOnly, taskId: task?.id ?? null, openingGroup: task?.openingGroup ?? null, chainPrice, chainPriceDiff });
-      }
+        records.set(record.execId, { ...record, reduceOnly, taskId: task?.id ?? null, openingGroup: task?.openingGroup ?? null, chainPrice, chainPriceDiff });
+      } catch (error) { issue = error; }
     }
-    if (!records.length) return failed;
-    const changed = records.filter(record => sortedJson(ledger.get(record.execId)) !== sortedJson(record));
-    if (changed.length) { store.saveExecutions(changed); for (const record of changed) ledger.set(record.execId, record); }
-    const merged = new Map(state.executions.map(item => [item.execId, item]));
-    for (const record of records) merged.set(record.execId, record);
-    const next = [...merged.values()].sort((a, b) => b.execTime - a.execTime).slice(0, EXECUTIONS_KEPT);
-    if (sortedJson(next) === sortedJson(state.executions)) return failed;
-    state.executions = next;
-    save();
-    return failed;
+    const changed = [...records.values()].filter(record => sortedJson(ledger.get(record.execId)) !== sortedJson(record));
+    if (changed.length) {
+      store.saveExecutions(changed);
+      for (const record of changed) ledger.set(record.execId, record);
+      archivedQuantities = null;
+    }
+    if (records.size) {
+      const merged = new Map(state.executions.map(item => [item.execId, item]));
+      for (const record of records.values()) merged.set(record.execId, record);
+      const next = [...merged.values()].sort((a, b) => b.execTime - a.execTime).slice(0, EXECUTIONS_KEPT);
+      if (sortedJson(next) !== sortedJson(state.executions)) { state.executions = next; save(); }
+    }
+    if (issue) throw issue;
+  }
+
+  /** Shared through persistence. True means the unfiltered, fully paginated response actually contained zero rows. */
+  function readExecutions(link: string, entry: JournalEntry): Promise<boolean> {
+    const active = executionReads.get(link);
+    if (active) return active;
+    const signal = AbortSignal.timeout(READ_MS);
+    const read = (async () => {
+      let paged = false;
+      const rows = entry.kind === 'rfq' ? await client.executionsByOrder(entry.orderId, signal) : await client.executions(link, signal, page => {
+        paged = true;
+        archiveExecutionPage(link, entry, page);
+      });
+      if (!paged) archiveExecutionPage(link, entry, rows);
+      return rows.length === 0;
+    })().finally(() => executionReads.delete(link));
+    executionReads.set(link, read);
+    return read;
+  }
+
+  /** Reads active orders and terminal orders with missing fills into the ledger. */
+  async function loadExecutions(links: readonly string[]): Promise<number> {
+    const archived = archivedByOrder();
+    const requests = [...new Set(links)].flatMap(link => {
+      const entry = state.journal[link];
+      if (!entry || awaitingFirstSend.has(link) || confirmingTerminal.has(link) || (entry.terminal && exact(entry.filledQty) === (archived.get(link)?.qty ?? 0n))) return [];
+      if (entry.kind === 'rfq' && !entry.orderId) return [];
+      return [readExecutions(link, entry)];
+    });
+    const failures = (await Promise.allSettled(requests)).filter(result => result.status === 'rejected');
+    for (const failure of failures) log(`部分期权成交明细读取失败，保留已有记录：${describe(failure.reason)}`);
+    return failures.length;
   }
 
   // ---- 收益 (G2b) ------------------------------------------------------------------------------------------------
   function performanceInput(at: number): PerformanceInput {
     const fresh = positions !== null && at - positions.at >= 0 && at - positions.at <= POSITIONS_FRESH_MS ? positions.rows : null;
-    return { groups: state.tasks, executions: [...ledger.values()], journal: state.journal, positions: fresh, samples, sampleSeconds: PERFORMANCE_SAMPLE_MS / 1000 };
+    const executions = [...ledger.values()].filter(row => !state.journal[row.orderLinkId] || matchesJournal(row, state.journal[row.orderLinkId]!));
+    return { groups: state.tasks, executions, journal: state.journal, positions: fresh, samples, sampleSeconds: PERFORMANCE_SAMPLE_MS / 1000 };
   }
 
   /**
@@ -1182,14 +1312,15 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     if (shutdown) return;
     const errors: string[] = [];
     try {
-      const archived = new Map<string, bigint>();
-      for (const record of ledger.values()) archived.set(record.orderLinkId, (archived.get(record.orderLinkId) ?? 0n) + exact(record.execQty));
+      const archived = archivedByOrder();
       const at = now();
-      const missing = Object.entries(state.journal)
-        .filter(([link, entry]) => entry.terminal && at - entry.createdAt <= BACKFILL_WINDOW_MS && at - (backfillAt.get(link) ?? -Infinity) >= BACKFILL_RETRY_MS && exact(entry.filledQty) > (archived.get(link) ?? 0n))
+      const orders = Object.entries(state.journal);
+      const recovering = orders.filter(([, entry]) => !entry.terminal && !workers.has(entry.taskId)).map(([link]) => link);
+      const missing = orders
+        .filter(([link, entry]) => entry.terminal && at - entry.createdAt <= BACKFILL_WINDOW_MS && at - (backfillAt.get(link) ?? -Infinity) >= BACKFILL_RETRY_MS && exact(entry.filledQty) > (archived.get(link)?.qty ?? 0n))
         .sort(([, a], [, b]) => b.createdAt - a.createdAt).slice(0, BACKFILL_PER_ROUND).map(([link]) => link);
       for (const link of missing) backfillAt.set(link, at);
-      if (missing.length && await loadExecutions(missing)) errors.push('部分订单的成交明细补读失败，下次再读');
+      if ((recovering.length || missing.length) && await loadExecutions([...recovering, ...missing])) errors.push('部分订单的成交明细补读失败，下次再读');
     } catch (error) { errors.push(`成交明细补读失败：${describe(error)}`); }
     try {
       const at = now();
@@ -1211,17 +1342,51 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
   }
 
   // ---- reconciliation --------------------------------------------------------------------------------------------
+  async function confirmRecoveredTerminal(link: string, entry: JournalEntry, outcome: OrderOutcome): Promise<void> {
+    // A full execution reported by the order has no missing remainder. A partial/zero terminal must account for an
+    // in-flight sampler: join its bounded read, and commit against the resulting ledger before the next sampler starts.
+    if (cmp(outcome.filledQty, entry.qty) === 0) { recordOrder(link, outcome); return; }
+    recordOrder(link, outcome, true);
+    confirmingTerminal.add(link);
+    try {
+      await readExecutions(link, entry);
+      recordOrder(link, outcome);
+    } finally { confirmingTerminal.delete(link); }
+  }
+
+  function canSettleMissing(link: string, entry: JournalEntry): boolean {
+    const at = now(), age = at - entry.createdAt, sinceSend = at - (entry.lastPossibleSendAt ?? entry.createdAt);
+    return state.journal[link] === entry && !entry.terminal && !entry.orderId && !entry.orderSeen && !entry.conflictingOrderId && !entry.conflictingExecutionId && isZero(entry.filledQty)
+      && age >= 0 && age <= MISSING_SETTLE_MAX_AGE_MS && sinceSend >= missingSettleMs && !archivedByOrder().has(link);
+  }
+
+  async function settleMissing(link: string, entry: JournalEntry): Promise<OrderOutcome | null> {
+    if (!canSettleMissing(link, entry)) return null;
+    // A sampler that began before the last order lookup may still be archiving evidence. Then start a fresh final read.
+    const pending = executionReads.get(link);
+    if (pending) { await pending; if (!canSettleMissing(link, entry)) return null; }
+    if (!await readExecutions(link, entry) || executionReads.has(link) || !canSettleMissing(link, entry)) return null;
+    const outcome: OrderOutcome = { orderId: '', status: 'not_submitted', terminal: true, filledQty: '0', message: '下单应答丢失，交易所查无委托及成交，按未下单结算' };
+    recordOrder(link, outcome); // No await between checking the journal, ledger and time and committing the decision.
+    log(`期权订单 ${link} 超过接收时限且查无委托及成交，按未下单结算`);
+    return outcome;
+  }
+
   /** Unfinished orders are cancelled and read back; recovered tasks end; positions sync and closed legs retire. */
   async function reconcileOnce(): Promise<void> {
     await locked(async () => {
       const errors: string[] = [];
       try {
         const pending = Object.entries(state.journal).filter(([, entry]) => !entry.terminal);
-        await Promise.all(pending.map(async ([link, entry]) => {
+        const results = await Promise.allSettled(pending.map(async ([link, entry]) => {
           const previous: OrderOutcome = { orderId: entry.orderId, status: entry.status, terminal: entry.terminal, filledQty: entry.filledQty, ...(entry.price ? { price: entry.price } : {}) };
-          const outcome = await reconcileOrder(client, { ...entry, link }, previous, true, { record: item => recordOrder(link, item), sleep, log }, now() - entry.createdAt >= missingSettleMs && now() - entry.createdAt <= MISSING_SETTLE_MAX_AGE_MS);
+          const outcome = await reconcileOrder(client, { ...entry, link }, previous, true, {
+            record: item => recordOrder(link, item), seen: id => orderSeen(link, id), confirmTerminal: item => confirmRecoveredTerminal(link, entry, item), sleep, log,
+            settleMissing: canSettleMissing(link, entry) ? () => settleMissing(link, entry) : undefined,
+          });
           recordOrder(link, outcome);
         }));
+        for (const result of results) if (result.status === 'rejected') errors.push(describe(result.reason));
         for (const task of Object.values(state.tasks)) if ((task.status === 'recovering' || task.status === 'recovery_needed') && !workers.has(task.id)) finishTask(task.id);
         if (Object.values(state.journal).some(entry => !entry.terminal)) throw new Error('仍有未确认的期权订单，交易前请到交易所核对');
       } catch (error) { errors.push(describe(error)); }

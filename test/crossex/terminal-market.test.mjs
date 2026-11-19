@@ -2,6 +2,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { mkdtempDisposableSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { openCrossexStore } from '../../src/crossex/store.ts';
 import { createCandleReader, createTerminalMarket, normalizeCandles, INTERVALS } from '../../src/vendor/crossex/terminal-market.mjs';
 import { AppError } from '../../src/vendor/crossex/model.mjs';
 
@@ -38,9 +42,10 @@ function terminalFixture(options = {}) {
     ping() { this.pings++; }
   }
   const service = createTerminalMarket({
+    store: options.store,
     market: { resolveDisplaySymbol: async symbol => { if (options.display) return options.display(symbol); return { quote: quote(symbol.split('_')[0].toLowerCase(), symbol.split('_')[2]), rule: {} }; }, resolveSymbol: async symbol => { calls.resolve.push(symbol); if (options.resolve) return options.resolve(symbol); const q = quote(symbol.split('_')[0].toLowerCase(), symbol.split('_')[2]); return { quote: { ...q, nativeUnit: '0.01' }, rule: { contract_size: null } }; } },
     depthReader: async q => { calls.depth.push(q); return options.depth ? options.depth(q, now) : book(q, now); },
-    candleReader: async (q, interval) => { calls.candles.push({ q, interval }); return options.candles ? options.candles(q, interval, now) : [bar(Math.floor(now / INTERVALS[interval]) * INTERVALS[interval])]; },
+    candleReader: async (q, interval, signal, range) => { calls.candles.push({ q, interval, range }); return options.candles ? options.candles(q, interval, now, range, signal) : [bar(Math.floor(now / INTERVALS[interval]) * INTERVALS[interval])]; },
     WebSocketImpl: Socket, clock: () => now,
   });
   return { service, calls, Socket, advance(ms) { now += ms; }, setNow(value) { now = value; }, now: () => now };
@@ -67,6 +72,206 @@ test('all eight candle adapters preserve native timestamps and base volumes with
     if (exchange === 'kraken') assert.ok(calls[0].url.includes('/PF_XBTUSD/1m?'));
     if (exchange === 'deribit') assert.equal(new URL(calls[0].url).searchParams.get('instrument_name'), 'BTC_USDC-PERPETUAL');
   }
+});
+
+test('incremental native candle requests bound all eight venues to the requested opening times', async () => {
+  const from = NOW - 5 * 60000, to = from + 2 * 60000 - 1;
+  for (const exchange of ['binance', 'bybit', 'okx', 'gate', 'kraken', 'hyperliquid', 'lighter', 'deribit']) {
+    const q = quote(exchange), requests = [];
+    const read = createCandleReader({ clock: () => NOW, fetcher: async (url, init) => {
+      if (url.includes('/contracts/')) return json({ name: q.symbol, quanto_multiplier: '0.0001' });
+      const params = Object.fromEntries(new URL(url).searchParams);
+      requests.push(exchange === 'hyperliquid' ? JSON.parse(init.body).req : params);
+      return json(rawCandles(exchange, q, from));
+    } });
+    assert.deepEqual(await read(q, '1m', undefined, { from, to }), [bar(from)], exchange);
+    const actual = requests[0];
+    const expected = { binance: { startTime: from, endTime: to, limit: 2 }, bybit: { start: from, end: to, limit: 2 },
+      okx: { before: from - 1, after: to + 1, limit: 2 }, gate: { from: from / 1000, to: Math.floor(to / 1000) },
+      kraken: { from: from / 1000, to: Math.floor(to / 1000), count: 2 }, hyperliquid: { startTime: from, endTime: to },
+      lighter: { start_timestamp: from, end_timestamp: to + 1, count_back: 2 }, deribit: { start_timestamp: from, end_timestamp: to } }[exchange];
+    for (const [key, value] of Object.entries(expected)) assert.equal(Number(actual[key]), value, exchange);
+    if (exchange === 'gate') assert.equal(actual.limit, undefined);
+  }
+  const changed = createCandleReader({ clock: () => NOW, fetcher: async url => json(url.includes('/contracts/')
+    ? { name: 'BTC_USDT', quanto_multiplier: '0.001' } : rawCandles('gate', quote('gate'), from)) });
+  await assert.rejects(changed({ ...quote('gate'), nativeUnit: '0.01' }, '1m', undefined, { from, to }));
+});
+
+test('terminal reopens stored closes, repairs only a gap and the tail, and keeps the open bar in memory', async () => {
+  using dir = mkdtempDisposableSync(join(tmpdir(), 'tp-terminal-history-'));
+  const open = () => openCrossexStore(dir.path, { secret: { apiKey: 'test-key', apiSecret: 'test-secret' }, limits: {} });
+  const step = INTERVALS['1m'], gap = NOW - 62 * step, first = NOW - 239 * step;
+  const rows = Array.from({ length: 240 }, (_, i) => bar(first + i * step));
+  let store = open(), terminal = terminalFixture({ store, candles: () => rows.filter(c => c.time !== gap) });
+  try {
+    const view = await terminal.service.read(SYMBOL, '1m');
+    assert.equal(view.candles.length, 239);
+    assert.equal(view.candles.at(-1).closed, false); assert.equal(view.candles.at(-2).closed, true);
+    assert.equal(store.prepare('SELECT COUNT(*) n FROM terminal_candles').get().n, 238);
+    await terminal.service.stop(); store.close(); store = open();
+    const gate = deferred();
+    let nativeUnit = '0.01', reject = false;
+    terminal = terminalFixture({ store, resolve: async () => ({ quote: { ...quote('binance'), nativeUnit }, rule: {} }),
+      candles: async (_q, _i, _now, range) => {
+        await gate.promise;
+        if (reject) throw Error('offline');
+        return rows.filter(c => c.time >= range.from && c.time <= range.to).map(c => ({ ...c, close: '101' }));
+      } });
+    terminal.advance(10_000);
+    const saved = await terminal.service.read(SYMBOL, '1m');
+    assert.equal(saved.candleAsOf, NOW); assert.equal(saved.candles.length, 238);
+    assert.equal(saved.candles.at(-1).time, NOW - step); assert.equal(saved.candles.at(-1).close, '102');
+    assert.deepEqual(terminal.calls.candles.map(c => c.range), [{ from: NOW, to: NOW + 10_000 }]);
+    gate.resolve(); await new Promise(setImmediate);
+    const repaired = await terminal.service.read(SYMBOL, '1m');
+    assert.deepEqual(terminal.calls.candles[1].range, { from: gap, to: gap + step - 1 });
+    assert.equal(repaired.candles.length, 240); assert.equal(repaired.candles.at(-1).close, '101');
+    assert.equal(store.prepare('SELECT COUNT(*) n FROM terminal_candles WHERE opened_at=?').get(NOW).n, 0);
+    assert.equal(repaired.candleAsOf, NOW + 10_000);
+    reject = true; terminal.advance(60_000);
+    await terminal.service.read(SYMBOL, '1m'); await new Promise(setImmediate);
+    const failed = await terminal.service.read(SYMBOL, '1m');
+    assert.ok(failed.candleError); assert.equal(failed.candleAsOf, repaired.candleAsOf);
+    assert.equal(failed.candles.at(-1).time, NOW - step); // prior live bar was never promoted
+    nativeUnit = '1'; terminal.advance(31_000);
+    const other = await terminal.service.read(SYMBOL, '1m');
+    assert.equal(other.candles.length, 0); assert.equal(other.candleAsOf, null);
+    assert.equal(other.tradingAvailable, true);
+  } finally { await terminal.service.stop(); store.close(); }
+});
+
+test('terminal retains verified closes and source time if SQLite rejects a correction', async () => {
+  using dir = mkdtempDisposableSync(join(tmpdir(), 'tp-terminal-rollback-'));
+  const store = openCrossexStore(dir.path, { secret: { apiKey: 'test-key', apiSecret: 'test-secret' }, limits: {} });
+  let close = '102';
+  const f = terminalFixture({ store, candles: () => [bar(NOW - 60000, { close }), bar(NOW, { close })] });
+  try {
+    const original = await f.service.read(SYMBOL, '1m');
+    assert.equal(original.candleAsOf, NOW);
+    store.db.exec("CREATE TRIGGER candle_unwritable BEFORE INSERT ON terminal_candles BEGIN SELECT RAISE(ABORT,'disk'); END");
+    close = '100'; f.advance(60_000);
+    await f.service.read(SYMBOL, '1m'); await new Promise(setImmediate);
+    const failed = await f.service.read(SYMBOL, '1m');
+    assert.ok(failed.candleError); assert.equal(failed.candleAsOf, NOW);
+    assert.deepEqual(failed.candles, original.candles.filter(c => c.closed));
+    assert.equal(JSON.parse(store.prepare('SELECT json FROM terminal_candles').get().json).close, '102');
+  } finally { await f.service.stop(); store.close(); }
+});
+
+test('a later observation repairing an older candle protects the archive across a clock rollback and restart', async () => {
+  using dir = mkdtempDisposableSync(join(tmpdir(), 'tp-terminal-clock-'));
+  const open = () => openCrossexStore(dir.path, { secret: { apiKey: 'test-key', apiSecret: 'test-secret' }, limits: {} });
+  const step = INTERVALS['1m'], gap = NOW - 5 * step, repairedAt = NOW + 5 * step + 1;
+  const rows = Array.from({ length: 240 }, (_, i) => bar(NOW - (239 - i) * step));
+  const candles = (_q, _i, now, range) => {
+    if (now === NOW) return rows.filter(c => c.time !== gap);
+    if (now === repairedAt && range.to === now) throw Error('tail offline');
+    return [gap, Math.floor(now / step) * step].filter(t => t >= range.from && t <= range.to).map(t => bar(t, { close: '101' }));
+  };
+  let store = open(), f = terminalFixture({ store, candles });
+  try {
+    await f.service.read(SYMBOL, '1m');
+    f.setNow(repairedAt);
+    await f.service.read(SYMBOL, '1m'); await new Promise(setImmediate);
+    const repaired = await f.service.read(SYMBOL, '1m');
+    assert.equal(repaired.candleAsOf, NOW); assert.equal(repaired.candles.find(c => c.time === gap).close, '101');
+    assert.equal(store.prepare('SELECT observed_at FROM terminal_candles WHERE opened_at=?').get(gap).observed_at, repairedAt);
+    const requests = f.calls.candles.length; f.setNow(NOW + 20_000);
+    const rolledBack = await f.service.read(SYMBOL, '1m');
+    assert.match(rolledBack.candleError, /本机时间/); assert.equal(rolledBack.candleAsOf, NOW);
+    assert.equal(f.calls.candles.length, requests); assert.ok(rolledBack.candles.every(c => c.closed));
+    await f.service.stop(); store.close(); store = open(); f = terminalFixture({ store, candles });
+    f.setNow(NOW + 25_000);
+    const restored = await f.service.read(SYMBOL, '1m');
+    assert.equal(f.calls.candles.length, 0); assert.match(restored.candleError, /本机时间/);
+    assert.deepEqual(restored.candles, rolledBack.candles); assert.equal(restored.candleAsOf, NOW);
+    f.setNow(repairedAt + step); await f.service.read(SYMBOL, '1m'); await new Promise(setImmediate);
+    assert.equal((await f.service.read(SYMBOL, '1m')).candleAsOf, repairedAt + step);
+  } finally { await f.service.stop(); store.close(); }
+});
+
+test('after a five-minute clock rollback and restart all 239 stored closes reappear before the venue answers', async () => {
+  using dir = mkdtempDisposableSync(join(tmpdir(), 'tp-terminal-clock-catch-up-'));
+  const open = () => openCrossexStore(dir.path, { secret: { apiKey: 'test-key', apiSecret: 'test-secret' }, limits: {} });
+  const step = INTERVALS['1m'], rows = Array.from({ length: 240 }, (_, i) => bar(NOW - (239 - i) * step));
+  const expected = rows.slice(0, -1).map(c => ({ ...c, closed: true }));
+  let store = open(), f = terminalFixture({ store, candles: () => rows }), hold;
+  try {
+    await f.service.read(SYMBOL, '1m');
+    assert.equal(store.prepare('SELECT count(*) n FROM terminal_candles').get().n, 239);
+    for (const mode of ['current only', 'empty', 'offline']) {
+      await f.service.stop(); store.close(); store = open(); hold = deferred();
+      f = terminalFixture({ store, candles: async () => {
+        await hold.promise;
+        if (mode === 'offline') throw Error('unavailable');
+        return mode === 'empty' ? [] : [bar(NOW)];
+      } });
+      f.setNow(NOW - 5 * step);
+      const rolledBack = await f.service.read(SYMBOL, '1m');
+      assert.deepEqual(rolledBack.candles, expected.slice(0, -5));
+      assert.match(rolledBack.candleError, /本机时间/); assert.equal(f.calls.candles.length, 0);
+      f.setNow(NOW - 3 * step);
+      assert.deepEqual((await f.service.read(SYMBOL, '1m')).candles, expected.slice(0, -3));
+      assert.equal(f.calls.candles.length, 0);
+      f.setNow(NOW + 1000);
+      const beforeResponse = await f.service.read(SYMBOL, '1m');
+      assert.deepEqual(beforeResponse.candles, expected);
+      assert.deepEqual(f.calls.candles.map(c => c.range), [{ from: NOW, to: NOW + 1000 }]);
+      hold.resolve(); await new Promise(setImmediate);
+      const recovered = await f.service.read(SYMBOL, '1m');
+      assert.deepEqual(recovered.candles.filter(c => c.closed), expected, mode);
+      assert.equal(recovered.candles.length, mode === 'current only' ? 240 : 239);
+      assert.equal(recovered.candleAsOf, mode === 'current only' ? NOW + 1000 : NOW);
+      assert.equal(!!recovered.candleError, mode === 'offline');
+    }
+  } finally { hold?.resolve(); await f.service.stop(); store.close(); }
+});
+
+test('restart respects the latest observation of this contract even when the repaired candle is outside the 240 displayed closes', async () => {
+  using dir = mkdtempDisposableSync(join(tmpdir(), 'tp-terminal-archive-clock-'));
+  const open = () => openCrossexStore(dir.path, { secret: { apiKey: 'test-key', apiSecret: 'test-secret' }, limits: {} });
+  const step = INTERVALS['1m'], ancient = NOW - 500 * step, repairedAt = NOW + 8 * step;
+  const rows = Array.from({ length: 240 }, (_, i) => bar(NOW - (239 - i) * step));
+  let store = open(), f = terminalFixture({ store, candles: () => rows });
+  try {
+    await f.service.read(SYMBOL, '1m');
+    const { identity } = store.prepare('SELECT identity FROM terminal_candles LIMIT 1').get();
+    const insert = store.prepare('INSERT INTO terminal_candles VALUES (?,?,?,?,?)');
+    insert.run(identity, '1m', NOW - 240 * step, NOW, JSON.stringify(bar(NOW - 240 * step)));
+    insert.run(identity, '1m', ancient, repairedAt, JSON.stringify(bar(ancient)));
+    await f.service.stop(); store.close(); store = open();
+    f = terminalFixture({ store, candles: (_q, _i, now) => [bar(Math.floor(now / step) * step)] });
+    f.setNow(NOW + step);
+    const restored = await f.service.read(SYMBOL, '1m');
+    assert.equal(restored.candles.length, 240); assert.ok(restored.candles.every(c => c.time > ancient));
+    assert.equal(restored.candleAsOf, NOW); assert.match(restored.candleError, /本机时间/); assert.equal(f.calls.candles.length, 0);
+    f.setNow(repairedAt); await f.service.read(SYMBOL, '1m'); await new Promise(setImmediate);
+    assert.equal((await f.service.read(SYMBOL, '1m')).candleAsOf, repairedAt);
+  } finally { await f.service.stop(); store.close(); }
+});
+
+test('the terminal publishes SQLite’s winning revision when a late candle loses the conditional upsert', async () => {
+  using dir = mkdtempDisposableSync(join(tmpdir(), 'tp-terminal-revision-'));
+  const store = openCrossexStore(dir.path, { secret: { apiKey: 'test-key', apiSecret: 'test-secret' }, limits: {} });
+  const step = INTERVALS['1m'], preceding = NOW - step, later = NOW + 2 * step, release = deferred();
+  const f = terminalFixture({ store, candles: async (_q, _i, now, range) => {
+    if (now === NOW) return Array.from({ length: 240 }, (_, i) => bar(NOW - (239 - i) * step));
+    await release.promise;
+    return [preceding, NOW, now].filter(t => t >= range.from).map(t => bar(t, { close: '100' }));
+  } });
+  try {
+    await f.service.read(SYMBOL, '1m'); f.advance(step);
+    await f.service.read(SYMBOL, '1m');
+    assert.deepEqual(f.calls.candles.at(-1).range, { from: preceding, to: NOW + step });
+    store.prepare('UPDATE terminal_candles SET observed_at=?, json=? WHERE opened_at=?')
+      .run(later, JSON.stringify(bar(preceding, { close: '101' })), preceding);
+    release.resolve(); await new Promise(setImmediate);
+    const result = await f.service.read(SYMBOL, '1m');
+    assert.match(result.candleError, /本机时间/); assert.equal(result.candleAsOf, later);
+    assert.equal(result.candles.at(-1).close, '101');
+    assert.equal(store.prepare('SELECT count(*) n FROM terminal_candles WHERE opened_at=?').get(NOW).n, 0);
+  } finally { release.resolve(); await f.service.stop(); store.close(); }
 });
 
 test('native interval aliases and explicit no-data responses remain accurate', async () => {

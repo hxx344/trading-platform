@@ -21,14 +21,16 @@ import { connectionRow, connectionRows, defaultRead, revisionOf, sourceAccounts 
 import type { DatabaseSource, Fetcher, SourceAccount, Unseal } from './positions-service.ts';
 import { CYCLE_LOOKBACK_MS } from './positions-cycle.ts';
 import { MAX_REQUESTS } from './positions-history.ts';
+import { accountHistory, historyGeneration, historyPermission, invalidateHistory, onHistoryPermissionDenied, HISTORY_OVERLAP, type AccountHistory } from './history-cache.ts';
+import { verifyAssetPermission } from './positions-readers.ts';
 import { PositionsPermissionError } from './positions-values.ts';
 import { fillsSupported, readFills } from './fills-readers.ts';
 import type { FillsRequest } from './fills-readers.ts';
-import { FillConflict, fillsNewestFirst, mergeFills, replayFills } from './fills-replay.ts';
+import { FillConflict, fillsNewestFirst, mergeFills, replayFills, verifyFill } from './fills-replay.ts';
 import { FILL_MARKETS, FILLS_PERMISSION } from './fills-types.ts';
 import type { FillMarket, FillsScope, HubFills, ReadFill } from './fills-types.ts';
 
-const TTL = 5 * 60_000, RETRY = 60_000, IDLE = 15 * 60_000, DEADLINE = 45_000, OVERLAP = 10 * 60_000;
+const TTL = 5 * 60_000, RETRY = 60_000, IDLE = 15 * 60_000, DEADLINE = 45_000;
 const SKEW_RETRY = 30_000, MAX_AUTO_RETRIES = 10;
 export const FILLS_FAILED = '成交读取失败，请检查连接、读取权限及服务器时间；已保留上次数据';
 /** A-5 review: the key has write permission. Fixed text; the stored fills of the account are dropped. */
@@ -37,10 +39,10 @@ export { FILLS_PERMISSION };
 const CONFLICT = '成交记录存在冲突，暂时无法更新';
 const UNSUPPORTED: Record<FillMarket, string> = { oil: '此交易所或产品范围暂不支持原油成交读取', hynix: '此交易所或产品范围暂不支持海力士成交读取' };
 type ReadPositions = (credentials: Credentials, scope: string, signal: AbortSignal, fetcher: Fetcher) => Promise<Position[]>;
-type ReadFills = (credentials: Credentials, scope: string, request: FillsRequest, options: { signal: AbortSignal; fetcher: Fetcher }) => Promise<ReadFill[]>;
+type ReadFills = (credentials: Credentials, scope: string, request: FillsRequest, options: { signal: AbortSignal; fetcher: Fetcher; history: AccountHistory; verify: (fill: ReadFill) => void }) => Promise<ReadFill[]>;
 type Entry = {
   market: FillMarket; revision: string; scope: FillsScope; raw: ReadFill[]; touchedAt: number; retryAt: number; cursor: number | null;
-  historyCursor: number | null; cacheInvalidated?: boolean;
+  historyCursor: number | null; cacheInvalidated?: boolean; restorePending?: boolean;
   snapshotOkAt?: number; snapshotHealthy?: boolean; pending?: Promise<void>; abort?: AbortController;
   timer?: ReturnType<typeof setTimeout>; retryScheduled: boolean; automaticRetries: number;
 };
@@ -73,11 +75,11 @@ function current(database: DatabaseSource, account: SourceAccount, revision: str
   const row = connectionRow(database(), account.key);
   return !!row && revisionOf(row.encrypted) === revision;
 }
-function parseStored(value: string, definition: ScopeDefinition): Stored | null {
+function parseStored(value: string, id: string): Stored | null {
   try {
     const data = JSON.parse(value) as Stored;
     const finite = (item: unknown) => typeof item === 'number' && Number.isFinite(item);
-    if (data?.version !== FILL_CACHE_FORMAT || data.scope?.id !== definition.id || !Array.isArray(data.raw) || !Array.isArray(data.scope.fills)
+    if (data?.version !== FILL_CACHE_FORMAT || data.scope?.id !== id || !Array.isArray(data.raw) || !Array.isArray(data.scope.fills)
       || data.cursor !== null && !finite(data.cursor) || !finite(data.retryAt)
       || data.historyCursor !== undefined && data.historyCursor !== null
         && (!Number.isSafeInteger(data.historyCursor) || data.historyCursor < 0 || data.historyCursor > 8.64e15)) return null;
@@ -93,12 +95,12 @@ export function fillsQueryMarket(params: URLSearchParams): FillMarket | null {
   return valid && Object.hasOwn(FILL_MARKETS, market) ? market as FillMarket : null;
 }
 
-export type FillsServiceOptions = { now?: () => number; deadline?: number; read?: ReadPositions; fills?: ReadFills; fetcher?: Fetcher };
+export type FillsServiceOptions = { now?: () => number; deadline?: number; read?: ReadPositions; fills?: ReadFills; fetcher?: Fetcher; permission?: typeof verifyAssetPermission };
 export type FillsService = ReturnType<typeof createFillsService>;
 
 /** Credentials never enter the cache. Replaced/deleted credentials abort work and invalidate cache at every poll.
  * Each successful refresh is stored in fill_cache (account fills in plain text, like ledger snapshots) under its
- * credential revision, so a restart or an entry idle for 15m (evicted from memory) serves the stored fills at once
+ * credential revision, so a restart or an entry idle for 15m serves stored fills after a positive read-only check
  * and resumes from the complete history read's cursor with a 10m overlap, even if position replay is uncertain.
  * The legacy cursor still records successful replay. Binance mode evidence older than 15m is not restored.
  * Successes refresh after 5m, failures after 60s; failed attempts also persist their retry deadline and prior rows.
@@ -107,8 +109,29 @@ export type FillsService = ReturnType<typeof createFillsService>;
 export function createFillsService(options: FillsServiceOptions = {}) {
   const now = options.now ?? Date.now, entries = new Map<string, Entry>(), jobs = new Set<Promise<void>>();
   let closed = false;
+  let observed: ReturnType<DatabaseSource> = null, unsubscribe: (() => void) | undefined;
+  let permissionChanges = 0;
+  function observe(database: DatabaseSource) {
+    const file = database();
+    if (observed === file) return;
+    unsubscribe?.();
+    if (observed) for (const [key, entry] of entries) remove(key, entry);
+    observed = file;
+    if (!file) return;
+    unsubscribe = onHistoryPermissionDenied(file, (account, revision) => {
+      permissionChanges++;
+      for (const [key, entry] of entries) {
+        if (entry.revision !== revision || (JSON.parse(key) as [string])[0] !== account) continue;
+        entry.cacheInvalidated = true; entry.restorePending = true; entry.raw = []; entry.cursor = null; entry.historyCursor = null;
+        entry.snapshotOkAt = undefined; entry.snapshotHealthy = false; entry.retryScheduled = false; entry.automaticRetries = 0;
+        entry.scope = { ...entry.scope, status: 'error', fills: [], fetchedAt: null, refreshing: false, truncated: false, coverageStart: null, coverageEnd: null, error: FILLS_PERMISSION };
+        entry.retryAt = now() + RETRY;
+      }
+    });
+  }
   // A failed cache write only costs the next cold read a full history read.
   function save(database: DatabaseSource, account: SourceAccount, entry: Entry) {
+    if (historyPermission(database(), account.key, entry.revision) !== 'verified') return;
     const { market, scope, raw, cursor, historyCursor, retryAt, snapshotOkAt, snapshotHealthy } = entry;
     const stored: Stored = { version: FILL_CACHE_FORMAT, scope: { ...scope, refreshing: false }, raw, cursor, historyCursor, retryAt, snapshotOkAt, snapshotHealthy };
     try {
@@ -119,12 +142,37 @@ export function createFillsService(options: FillsServiceOptions = {}) {
   function forget(database: DatabaseSource, account: string, slot: string, revision: string) {
     try { database()?.prepare('DELETE FROM fill_cache WHERE account = ? AND scope = ? AND revision = ?').bind(account, slot, revision).run(); } catch { /* retried on the next read */ }
   }
-  function forgetAccount(database: DatabaseSource, account: string, revision: string) {
-    try { database()?.prepare('DELETE FROM fill_cache WHERE account = ? AND revision = ?').bind(account, revision).run(); } catch { /* retried on the next read */ }
+  function storedSlot(database: DatabaseSource, account: string, market: FillMarket, id: string, revision: string) {
+    if (historyPermission(database(), account, revision) !== 'verified') return null;
+    const slot = slotOf(market, id);
+    try {
+      const row = database()?.prepare('SELECT data FROM fill_cache WHERE account = ? AND scope = ? AND revision = ?').bind(account, slot, revision).get<{ data: string }>();
+      if (!row) return null;
+      const stored = parseStored(row.data, id);
+      if (!stored) forget(database, account, slot, revision);
+      return stored;
+    } catch { return null; }
+  }
+  function hydrate(entry: Entry, stored: Stored) {
+    const tick = now();
+    entry.raw = stored.raw; entry.scope = { ...stored.scope, label: entry.scope.label };
+    entry.retryAt = Math.min(stored.retryAt, tick + TTL); entry.cursor = stored.cursor;
+    entry.historyCursor = stored.historyCursor === undefined ? stored.cursor : stored.historyCursor;
+    if (stored.snapshotOkAt !== undefined && tick - stored.snapshotOkAt < IDLE) {
+      entry.snapshotOkAt = stored.snapshotOkAt; entry.snapshotHealthy = stored.snapshotHealthy;
+    }
+    entry.cacheInvalidated = false;
+  }
+  function restoreVerified(database: DatabaseSource, account: string, entry: Entry) {
+    if (!entry.restorePending || historyPermission(database(), account, entry.revision) !== 'verified') return false;
+    entry.restorePending = false;
+    const stored = storedSlot(database, account, entry.market, entry.scope.id, entry.revision);
+    if (!stored) return false;
+    hydrate(entry, stored); return true;
   }
   /** Stored scopes of one market for configured accounts that are not in memory; rows of replaced or removed credentials are deleted. */
   function restore(database: DatabaseSource, accounts: SourceAccount[], market: FillMarket) {
-    const restored = new Map<string, Stored>();
+    const restored = new Map<string, Stored | null>();
     let rows: { account: string; scope: string; revision: string }[] = [];
     try { rows = database()?.prepare('SELECT account,scope,revision FROM fill_cache').rows<{ account: string; scope: string; revision: string }>() ?? []; } catch { /* no cache */ }
     for (const row of rows) {
@@ -136,11 +184,7 @@ export function createFillsService(options: FillsServiceOptions = {}) {
       // A hidden Binance mode never gets an entry; skip it rather than parse its row on every poll.
       const key = cacheKey(row.account, market, slot.scope);
       if (slot.market !== market || entries.has(key) || inactive(account, market, slot.scope, row.revision)) continue;
-      let data: { data: string } | null = null;
-      try { data = database()?.prepare('SELECT data FROM fill_cache WHERE account = ? AND scope = ? AND revision = ?').bind(row.account, row.scope, row.revision).get<{ data: string }>() ?? null; } catch { /* treated as missing */ }
-      const stored = data && parseStored(data.data, definition);
-      if (stored) restored.set(key, { ...stored, scope: { ...stored.scope, label: definition.label } });
-      else forget(database, row.account, row.scope, row.revision);
+      restored.set(key, storedSlot(database, row.account, market, slot.scope, row.revision));
     }
     return restored;
   }
@@ -176,13 +220,15 @@ export function createFillsService(options: FillsServiceOptions = {}) {
     clearTimeout(entry.timer); entry.timer = undefined; entry.retryScheduled = false;
     entry.automaticRetries = automatic ? entry.automaticRetries + 1 : 0;
     const abort = entry.abort = new AbortController();
+    const generation = historyGeneration(database, account.key, entry.revision);
+    const signal = AbortSignal.any([abort.signal, generation.signal]);
     entry.scope.refreshing = true;
     const valid = () => {
       if (closed || entries.get(key) !== entry || abort.signal.aborted) return false;
       if (now() >= entry.touchedAt + IDLE || !current(database, account, entry.revision)) {
         remove(key, entry); return false;
       }
-      return !closed && entries.get(key) === entry && !abort.signal.aborted;
+      return generation.current();
     };
     const job = serial(account.exchange, async () => {
       if (!valid() || inactive(account, entry.market, entry.scope.id, entry.revision)) return;
@@ -193,14 +239,22 @@ export function createFillsService(options: FillsServiceOptions = {}) {
           const credentials = parseConnection(unseal(account.row!.encrypted, account.key));
           if (credentials.exchange !== account.exchange || !valid()) throw new Error(FILLS_FAILED);
           let requests = 0;
-          const fetcher: Fetcher = async (input, init) => {
-            if (abort.signal.aborted || ++requests > MAX_REQUESTS) throw new Error(FILLS_FAILED);
-            return (options.fetcher ?? fetch)(input, { ...init, signal: AbortSignal.any([abort.signal, ...(init?.signal ? [init.signal] : [])]) });
+          const budgeted: Fetcher = (input, init) => {
+            if (++requests > MAX_REQUESTS) throw new Error(FILLS_FAILED);
+            return (options.fetcher ?? fetch)(input, init);
+          };
+          await generation.verify(shared => (options.permission ?? verifyAssetPermission)(credentials, budgeted, shared));
+          if (!valid()) throw new Error(FILLS_FAILED);
+          if (restoreVerified(database, account.key, entry) && entry.retryAt > now()) return null;
+          const fetcher: Fetcher = (input, init) => {
+            if (signal.aborted) throw new Error(FILLS_FAILED);
+            return budgeted(input, { ...init, signal: AbortSignal.any([signal, ...(init?.signal ? [init.signal] : [])]) });
           };
           const snapshotStart = now();
           let positions: Position[] | null = null;
           try {
-            positions = await (options.read ?? defaultRead)(credentials, entry.scope.id, abort.signal, fetcher);
+            positions = options.read ? await options.read(credentials, entry.scope.id, signal, fetcher)
+              : await defaultRead(credentials, entry.scope.id, signal, fetcher, generation.assertVerified);
             if (!valid()) throw new Error(FILLS_FAILED);
             entry.snapshotOkAt = snapshotStart; entry.snapshotHealthy = true;
           } catch (error) {
@@ -213,8 +267,12 @@ export function createFillsService(options: FillsServiceOptions = {}) {
           // This local completion time only anchors older windows; the newest query has no local upper bound.
           const snapshotAt = Math.max(snapshotStart, now());
           const lookback = snapshotAt - CYCLE_LOOKBACK_MS;
-          const start = Math.max(lookback, entry.historyCursor === null ? lookback : Math.min(entry.historyCursor, snapshotAt) - OVERLAP);
-          const incoming = await (options.fills ?? readFills)(credentials, entry.scope.id, { market: entry.market, start, end: snapshotAt }, { signal: abort.signal, fetcher });
+          const start = Math.max(lookback, entry.historyCursor === null ? lookback : Math.min(entry.historyCursor, snapshotAt) - HISTORY_OVERLAP);
+          const history = accountHistory(database, account.key, entry.revision, entry.scope.id, valid, generation);
+          const known = new Map(entry.raw.filter(fill => Date.parse(fill.time) >= lookback).map(fill => [fill.id, fill]));
+          const verify = (fill: ReadFill) => { verifyFill(known.get(fill.id), fill); known.set(fill.id, fill); };
+          const incoming = await (options.fills ?? readFills)(credentials, entry.scope.id, { market: entry.market, start, end: snapshotAt }, { signal, fetcher, history, verify });
+          if (!valid()) throw new Error(FILLS_FAILED);
           const raw = mergeFills(entry.raw, incoming, lookback);
           if (raw.some(fill => Date.parse(fill.time) > now() + 60_000)) throw new Error(FILLS_FAILED);
           const replayed = replayFills(raw, positions, snapshotStart, account.exchange);
@@ -226,7 +284,7 @@ export function createFillsService(options: FillsServiceOptions = {}) {
           timer = setTimeout(() => abort.abort(), options.deadline ?? DEADLINE);
           if (abort.signal.aborted) onAbort();
         })]);
-        if (!valid()) return;
+        if (!result || !valid()) return;
         const { raw, replayed, snapshotAt, positions, lookback } = result;
         const truncated = raw.length > 2000 || (entry.scope.truncated && Date.parse(entry.scope.coverageStart ?? '') > lookback);
         entry.raw = raw.slice(0, 2000);
@@ -246,28 +304,20 @@ export function createFillsService(options: FillsServiceOptions = {}) {
         entry.retryScheduled = replayed.skew && entry.automaticRetries < MAX_AUTO_RETRIES;
         if (entries.get(key) === entry && !abort.signal.aborted) save(database, account, entry);
       } catch (error) {
+        if (error instanceof PositionsPermissionError) {
+          generation.deny();
+          return;
+        }
+        if (!generation.current()) return;
+        if (historyPermission(database(), account.key, entry.revision) === 'denied') { entry.retryAt = now() + RETRY; return; }
         // A conflicting stored history must not outlive this process; the next cold read starts over.
         if (error instanceof FillConflict) {
-          entry.cacheInvalidated = true;
-          forget(database, account.key, slotOf(entry.market, entry.scope.id), entry.revision);
-        }
-        const denied = error instanceof PositionsPermissionError;
-        if (denied) {
-          // Every stored scope of this credential goes, not only this one: the rows of every market and scope, and the
-          // in-memory history of its other entries, so a later failure of those entries cannot save the old fills back.
-          for (const [other, item] of entries) {
-            if ((JSON.parse(other) as [string])[0] !== account.key || item.revision !== entry.revision) continue;
-            item.cacheInvalidated = true; item.raw = []; item.cursor = null; item.historyCursor = null;
-          }
-          entry.cacheInvalidated = true; entry.raw = []; entry.cursor = null; entry.historyCursor = null;
-          forgetAccount(database, account.key, entry.revision);
+          entry.cacheInvalidated = true; entry.cursor = null; entry.historyCursor = null;
+          invalidateHistory(database(), account.key, entry.revision, { scope: entry.scope.id, slot: slotOf(entry.market, entry.scope.id), records: error.records });
         }
         let still = false;
         try { still = current(database, account, entry.revision); } catch { /* the file is gone */ }
-        if (entries.get(key) === entry && still && denied) {
-          entry.scope = { ...entry.scope, status: 'error', fills: [], truncated: false, coverageStart: null, coverageEnd: null, error: FILLS_PERMISSION };
-          entry.retryAt = now() + RETRY;
-        } else if (entries.get(key) === entry && still) {
+        if (entries.get(key) === entry && still) {
           entry.scope = { ...entry.scope, status: error instanceof FillConflict ? 'error' : entry.scope.fetchedAt ? 'stale' : 'error',
             error: error instanceof FillConflict ? CONFLICT : FILLS_FAILED };
           entry.retryAt = now() + RETRY;
@@ -276,7 +326,7 @@ export function createFillsService(options: FillsServiceOptions = {}) {
         }
       } finally { clearTimeout(timer); if (onAbort) abort.signal.removeEventListener('abort', onAbort); }
     }).catch(() => {
-      if (entries.get(key) === entry) { entry.scope.status = entry.scope.fetchedAt ? 'stale' : 'error'; entry.scope.error = FILLS_FAILED; entry.retryAt = now() + RETRY; }
+      if (generation.current() && entries.get(key) === entry) { entry.scope.status = entry.scope.fetchedAt ? 'stale' : 'error'; entry.scope.error = FILLS_FAILED; entry.retryAt = now() + RETRY; }
     }).finally(() => {
       entry.pending = undefined; entry.abort = undefined; jobs.delete(job);
       entry.scope.refreshing = entry.retryScheduled;
@@ -284,9 +334,11 @@ export function createFillsService(options: FillsServiceOptions = {}) {
     });
     entry.pending = job; jobs.add(job);
   }
-  return {
+  const service = {
     async read(database: DatabaseSource, unseal: Unseal, market: FillMarket = 'oil'): Promise<HubFills> {
       if (closed) throw new Error(FILLS_FAILED);
+      observe(database);
+      const permissionVersion = permissionChanges;
       const accounts = sourceAccounts(database()), tick = now(), keep = new Set<string>();
       for (const [key, entry] of entries) {
         const [accountKey] = JSON.parse(key) as [string];
@@ -307,17 +359,20 @@ export function createFillsService(options: FillsServiceOptions = {}) {
             if (!supported) return [empty(definition, true, false, market)];
             let entry = entries.get(key);
             if (!entry) {
-              // Old mode evidence would pin a Binance account to both modes; a clock set back must not postpone refresh.
-              const stored = restored.get(key), recent = stored?.snapshotOkAt !== undefined && tick - stored.snapshotOkAt < IDLE;
-              entry = stored ? { market, revision, scope: stored.scope, raw: stored.raw, touchedAt: tick,
-                retryAt: Math.min(stored.retryAt, tick + TTL),
-                cursor: stored.cursor, historyCursor: stored.historyCursor === undefined ? stored.cursor : stored.historyCursor,
-                ...(recent ? { snapshotOkAt: stored.snapshotOkAt, snapshotHealthy: stored.snapshotHealthy } : {}), retryScheduled: false, automaticRetries: 0 }
-                : { market, revision, scope: empty(definition, true, true, market), raw: [], touchedAt: tick, retryAt: -Infinity, cursor: null, historyCursor: null,
-                  retryScheduled: false, automaticRetries: 0 };
+              const stored = restored.get(key);
+              entry = { market, revision, scope: empty(definition, true, true, market), raw: [], touchedAt: tick, retryAt: -Infinity,
+                cursor: null, historyCursor: null, retryScheduled: false, automaticRetries: 0,
+                restorePending: stored === null };
+              if (stored) hydrate(entry, stored);
+              if (historyPermission(database(), account.key, revision) === 'denied') {
+                entry.scope.status = 'error'; entry.scope.error = FILLS_PERMISSION; entry.cacheInvalidated = true;
+              }
               entries.set(key, entry);
             }
             entry.touchedAt = tick;
+            if (!entry.pending && historyPermission(database(), account.key, revision) === 'verified') {
+              if (!restoreVerified(database, account.key, entry) && entry.scope.error === FILLS_PERMISSION) entry.retryAt = -Infinity;
+            }
             if (!entry.pending && tick >= entry.retryAt) refresh(database, account, entry, key, unseal, entry.retryScheduled);
             else arm(database, account, entry, key, unseal);
             const scope = { ...entry.scope, refreshing: !!entry.pending || entry.retryScheduled,
@@ -337,6 +392,7 @@ export function createFillsService(options: FillsServiceOptions = {}) {
       // the re-check below only covers writes already queued as microtasks; a replaced key is kept out by the revision in
       // every cache key and by the current() checks before and after each refresh, not by this yield.
       await Promise.resolve();
+      if (permissionVersion !== permissionChanges) return service.read(database, unseal, market);
       const latest = connectionRows(database());
       for (const account of accounts) {
         const row = latest.find(item => item.exchange === account.key);
@@ -360,6 +416,7 @@ export function createFillsService(options: FillsServiceOptions = {}) {
       return { schemaVersion: 1, generatedAt: iso(tick), lookbackStart: iso(tick - CYCLE_LOOKBACK_MS), exchanges };
     },
     async idle() { while (jobs.size) await Promise.allSettled([...jobs]); },
-    close() { closed = true; for (const [key, entry] of entries) remove(key, entry); },
+    close() { closed = true; unsubscribe?.(); for (const [key, entry] of entries) remove(key, entry); },
   };
+  return service;
 }

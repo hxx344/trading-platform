@@ -449,7 +449,7 @@ async function rhCandles(startTime, endTime, options) {
     }
     cursor = end;
   }
-  return result;
+  return { rows: result, through: Math.min(cursor, closedEnd) };
 }
 
 /**
@@ -474,18 +474,24 @@ export function anthropicCandleStarts(previous, now) {
   }));
 }
 
-export async function fetchAnthropicCandleBatch(starts, { fetcher = fetch, now = Date.now(), timeout = 15_000, gate = sharedBinanceGate, rh = sharedRhState, clock = Date.now } = {}) {
+export async function fetchAnthropicCandleBatch(starts, { fetcher = fetch, now = Date.now(), timeout = 15_000, gate = sharedBinanceGate, rh = sharedRhState, clock = Date.now, ends } = {}) {
   const options = { fetcher, timeout, gate, rh, clock };
-  const read = key => key === 'binance' ? binanceCandles(starts[key], now, options) : key === 'rh' ? rhCandles(starts[key], now, options) : hyperliquidCandles(key, starts[key], now, options);
-  const reads = await Promise.allSettled(LEG_KEYS.map(read));
-  if (reads.every(read => read.status === 'rejected')) throw reads[0].reason;
-  const legs = {}, errors = {};
-  LEG_KEYS.forEach((key, index) => {
+  const selected = LEG_KEYS.filter(key => !ends || starts[key] < ends[key]);
+  const read = async key => {
+    const end = ends?.[key] ?? now;
+    if (key === 'rh') return rhCandles(starts[key], end, options);
+    const rows = key === 'binance' ? await binanceCandles(starts[key], end, options) : await hyperliquidCandles(key, starts[key], end, options);
+    return { rows, through: Math.floor(end / ANTHROPIC_CANDLE_MS) * ANTHROPIC_CANDLE_MS };
+  };
+  const reads = await Promise.allSettled(selected.map(read));
+  if (reads.length === LEG_KEYS.length && reads.every(read => read.status === 'rejected')) throw reads[0].reason;
+  const legs = {}, errors = {}, through = {};
+  selected.forEach((key, index) => {
     const read = reads[index];
-    if (read.status === 'fulfilled') legs[key] = [...read.value];
+    if (read.status === 'fulfilled') { legs[key] = [...read.value.rows]; through[key] = read.value.through; }
     else errors[key] = legError(read.reason);
   });
-  return { legs, errors, at: now };
+  return { legs, errors, through, at: now };
 }
 
 export function mergeAnthropicCandleBatch(previous, { legs, errors, at }) {

@@ -14,7 +14,7 @@ export function isFundingHistoryReport(value: unknown): value is PerpetualFundin
       || key !== `${leg.exchange}:${leg.symbol}` || !["pending", "ready", "error", "unsupported"].includes(leg.status)
       || (leg.fetchedAt !== null && !timestamp(leg.fetchedAt)) || typeof leg.error !== "string"
       || (leg.backfillComplete !== undefined && typeof leg.backfillComplete !== "boolean")
-      || (leg.nextRefreshAt !== undefined && !timestamp(leg.nextRefreshAt)) || (leg.cacheUpdatedAt !== undefined && !timestamp(leg.cacheUpdatedAt))
+      || (leg.nextRefreshAt !== undefined && !timestamp(leg.nextRefreshAt)) || (leg.freshUntil !== undefined && !timestamp(leg.freshUntil)) || (leg.cacheUpdatedAt !== undefined && !timestamp(leg.cacheUpdatedAt))
       || (leg.coverage !== null && (!timestamp(leg.coverage?.from) || !timestamp(leg.coverage?.to) || leg.coverage.from > leg.coverage.to))
       || !Array.isArray(leg.records) || leg.records.length > 2000 || (!leg.coverage && (leg.records.length > 0 || leg.status === "ready"))) return false;
     const times = new Set<number>();

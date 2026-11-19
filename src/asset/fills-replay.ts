@@ -7,7 +7,10 @@ import { add, compare, negate, sign, subtract } from './positions-cycle.ts';
 // Use that conservative clock bound, and no upper bound: fills read after the snapshot may already be reflected.
 const SNAPSHOT_CLOCK_BOUND_MS = 60_000;
 
-export class FillConflict extends Error {}
+export class FillConflict extends Error {
+  readonly records: readonly ReadFill[];
+  constructor(previous: ReadFill, incoming: ReadFill) { super(); this.records = [previous, incoming]; }
+}
 const numericId = (fill: ReadFill) => fill.id.slice(fill.id.lastIndexOf(':') + 1);
 export function fillsNewestFirst(a: ReadFill, b: ReadFill) {
   const time = Date.parse(b.time) - Date.parse(a.time);
@@ -21,13 +24,17 @@ function identity(fill: ReadFill) {
   return JSON.stringify([fill.id, fill.symbol, fill.base, fill.time, fill.side, fill.positionSide, fill.quantity, fill.quantityUnit,
     fill.price, fill.priceCurrency, fill.fee, fill.feeCurrency, fill.realizedPnl, fill.sizeAfter ?? null]);
 }
+export function verifyFill(existing: ReadFill | undefined, fill: ReadFill) {
+  if (existing && (identity(existing) !== identity(fill) || (existing.orderId && fill.orderId && existing.orderId !== fill.orderId))) {
+    throw new FillConflict(existing, fill);
+  }
+}
 export function mergeFills(previous: readonly ReadFill[], incoming: readonly ReadFill[], lookbackStart: number) {
   const byId = new Map<string, ReadFill>();
   for (const fill of [...previous, ...incoming]) {
     if (Date.parse(fill.time) < lookbackStart) continue;
     const existing = byId.get(fill.id);
-    if (existing && identity(existing) !== identity(fill)) throw new FillConflict();
-    if (existing?.orderId && fill.orderId && existing.orderId !== fill.orderId) throw new FillConflict();
+    verifyFill(existing, fill);
     byId.set(fill.id, existing?.orderId && !fill.orderId ? { ...fill, orderId: existing.orderId } : fill);
   }
   return [...byId.values()].sort(fillsNewestFirst);

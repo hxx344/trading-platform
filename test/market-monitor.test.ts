@@ -9,8 +9,13 @@ import { createMarketClient, type MarketClient } from '../src/market/ipc.ts';
 import { createMarketServer } from '../src/market/server.ts';
 import { createMonitorData } from '../src/market/monitor-data.ts';
 import { exchangeError } from '../src/monitor/exchanges.ts';
+import { fundingLegStale } from '../src/vendor/exchange-funding-history.mjs';
 import { OIL_CANDLE_WINDOW_MS } from '../src/monitor/market-contract.ts';
-import { OIL_CANDLE_KEY } from '../src/monitor/oil.ts';
+import { OIL_CANDLE_KEY, createOilMonitor } from '../src/monitor/oil.ts';
+import { createHynixMonitor } from '../src/monitor/hynix.ts';
+import { createAnthropicMonitor } from '../src/monitor/anthropic.ts';
+import { createMonitorStore } from '../src/monitor/store.ts';
+import { createBinanceGate } from '../src/vendor/anthropic-market.mjs';
 import { HISTORY_START, OIL_CANDLE_MS } from '../src/vendor/oil-market.mjs';
 import { createRemoteMonitor } from '../src/service/remote-monitor.ts';
 import { closeMonitor, openMonitor, settleMonitor, stopMonitor } from '../src/service/monitor.ts';
@@ -29,6 +34,28 @@ async function until(condition: () => boolean | Promise<boolean>) {
 function socketPath(dir: string): string {
   return process.platform === 'win32' ? '\\\\.\\pipe\\tp-monitor-' + randomUUID() : join(dir, 'market.sock');
 }
+
+test('三组价差历史从 SQLite 恢复后连续十分钟无新收盘，八条腿都不向交易所重读', async () => {
+  let at = Date.UTC(2026, 9, 1, 8, 1);
+  const now = () => at, venues = fakeAnthropicVenues({ now });
+  const store = createMonitorStore({ file: ':memory:' });
+  const settings = { store, now, gate: createBinanceGate(), fetchImpl: venues.fetch, log: quiet };
+  const open = () => [createAnthropicMonitor(settings), createOilMonitor(settings), createHynixMonitor(settings)];
+  try {
+    const cold = open();
+    await Promise.all(cold.map(m => m.refreshCandles()));
+    const stored = [store.candles(), store.oilCandles(), store.hynixCandles()];
+    assert.ok(stored.every(rows => rows.length > 0));
+    const restored = open();
+    venues.requests.clear();
+    for (let min = 0; min < 10; min++) {
+      at += 60_000;
+      await Promise.all(restored.map(m => m.refreshCandles()));
+    }
+    assert.deepEqual([...venues.requests], []);
+    assert.deepEqual([store.candles(), store.oilCandles(), store.hynixCandles()], stored);
+  } finally { store.close(); }
+});
 async function listen(path: string, options: Parameters<typeof createMonitorData>[0]) {
   const worker = createMarketServer({ monitor: createMonitorData(options) }, 'test-market');
   await new Promise<void>((resolve, reject) => { worker.server.once('error', reject); worker.server.listen(path, resolve); });
@@ -71,9 +98,8 @@ test('独立行情经本机套接字整轮回补；各腿原时间、落盘检�
     runtime = openMonitor(config, dir, options);
     assert.deepEqual([runtime.anthropic!.candles(null)?.status, runtime.anthropic!.candles(null)?.metadata.fetchedAt], ['snapshot', expected]);
     await runtime.anthropic!.refreshCandles();
-    const resume = sent.filter(item => item.op === 'monitor.anthropic.candles').at(-1)!;
-    assert.notDeepEqual(first.input, resume.input, '从已存的腿检查点续读');
-    assert.ok(JSON.stringify(resume.input).length < 180, 'IPC 只提交四个起点与截止时间');
+    assert.equal(sent.filter(item => item.op === 'monitor.anthropic.candles').at(-1), first, '从已核实的收盘区间恢复，重启不重读');
+    assert.equal(runtime.anthropic!.candles(null)?.metadata.fetchedAt, expected, '命中缓存保留采集时间');
 
     const token = fakeVariationalToken(at + DAY);
     await runtime.variational!.update({ token, revision: 0 });
@@ -104,6 +130,64 @@ test('独立行情经本机套接字整轮回补；各腿原时间、落盘检�
   } finally {
     stopMonitor(runtime); closeMonitor(runtime); conn.close(); worker.close(); rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('对比面板和双腿共用执行端原始结算，双进程重启保留采集时间，Special 只被对比口径接受', async () => {
+  const nextSettlement = Date.UTC(2026, 10, 15, 12);
+  let at = nextSettlement - 3.5 * HOUR, specialAt = 0;
+  const now = () => at, dir = mkdtempSync(join(tmpdir(), 'tp-funding-ipc-')), venues = fakeAnthropicVenues({ now });
+  const reads: { symbol: string; from: number; to: number }[] = [];
+  const fetchImpl = async (href: string, init: RequestInit) => {
+    const url = new URL(href), reply = await venues.fetch(href, init);
+    if (url.pathname === '/fapi/v1/fundingRate') {
+      const symbol = url.searchParams.get('symbol')!, from = Number(url.searchParams.get('startTime')), to = Number(url.searchParams.get('endTime'));
+      reads.push({ symbol, from, to });
+      if (symbol === 'BZUSDT' && specialAt >= from && specialAt <= to && reply.ok) {
+        const rows = await reply.json() as { fundingTime: number }[];
+        return Response.json([...rows, { symbol, fundingTime: specialAt, fundingRate: '0.005', rateType: 'Special' }].sort((a, b) => a.fundingTime - b.fundingTime));
+      }
+    }
+    return reply;
+  };
+  const config = parseServiceConfig({ secretsFile: '/secrets', monitor: { oil: {}, hynix: {} } }).monitor!;
+  async function start() {
+    const socket = socketPath(dir), worker = await listen(socket, { now, fetchImpl, log: quiet }), client = createMarketClient(socket);
+    const runtime = openMonitor(config, dir, { now, marketClient: client, log: quiet, fetchImpl: async () => { throw Error('unexpected executor fetch'); } });
+    return { runtime, end() { stopMonitor(runtime); closeMonitor(runtime); client.close(); worker.close(); } };
+  }
+  let app = await start();
+  try {
+    const oil = await app.runtime.exchanges!.fundingHistory('oil', 'binance');
+    const from = oil.left.coverage!.from;
+    assert.equal(oil.rows[0]!.time % (4 * HOUR), 7);
+    reads.length = 0;
+    await app.runtime.oil!.refreshFunding();
+    assert.equal(app.runtime.oil!.funding()!.rows.at(-1)!.time, oil.rows[0]!.time - 7);
+    assert.ok(reads.length && reads.every(read => read.to < from), '原油仅补面板范围之前的区间');
+    for (let i = 0; i < 3; i++) await app.runtime.hynix!.refreshFunding();
+    const before = venues.requests.get('settled:skhy');
+    const hynix = await app.runtime.exchanges!.fundingHistory('hynix', 'hyperliquid');
+    assert.equal(hynix.rows[0]!.time % HOUR, 3);
+    assert.equal(venues.requests.get('settled:skhy'), before, '海力士已读完，面板直接读取原始时刻');
+    app.end(); app = await start(); reads.length = 0;
+    for (let poll = 0; poll < 3; poll++) {
+      at += 5 * 60_000;
+      const cached = await app.runtime.exchanges!.fundingHistory('oil', 'binance');
+      assert.equal(cached.fetchedAt, oil.fetchedAt); assert.deepEqual(cached.left.coverage, oil.left.coverage);
+      assert.equal(fundingLegStale(cached.left, at), false);
+      assert.equal(fundingLegStale(cached.left, nextSettlement + 11 * 60_000), true);
+      assert.equal(reads.length, 0, '08:35、08:40、08:45 两腿都已有 08:00 结算');
+    }
+    const kept = app.runtime.oil!.funding()!;
+    specialAt = at + HOUR + 17; at = nextSettlement + 60_000;
+    const next = await app.runtime.exchanges!.fundingHistory('oil', 'binance');
+    assert.equal(next.rows.find(row => row.time === specialAt)!.leftRate, .005);
+    assert.deepEqual([next.rows[0]!.time, reads.length, Date.parse(next.fetchedAt)], [nextSettlement + 7, 2, at]);
+    assert.ok(reads.every(read => read.from > Date.parse(oil.fetchedAt)), '面板只读取原始缺失尾段');
+    reads.length = 0;
+    await app.runtime.oil!.refreshFunding();
+    assert.deepEqual([app.runtime.oil!.funding()!.status, app.runtime.oil!.funding()!.fetchedAt, reads], ['snapshot', kept.fetchedAt, []]);
+  } finally { app.end(); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('Var 公开资金费在真实 IPC 调用中直到执行端 10 秒截止才中止，比较行保留超时原因和公开价格', async () => {

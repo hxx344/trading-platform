@@ -92,7 +92,7 @@ function hynixEnv(listedAt?: number) {
   return Object.assign(env, { dir, venues, store, starts, monitor, dispose: () => { store.close(); rmSync(dir, { recursive: true, force: true }); } });
 }
 
-test('采集：首轮从上市首个整点读起（替身上市 30 天）；报价超过 35 秒、K 线超过 615 秒标为快照；重启读回为快照，续读只从最后 48 小时读起', async () => {
+test('采集：首轮从上市首个整点读起，重启优先填新收盘，旧缺口独立修复', async () => {
   const env = hynixEnv();
   try {
     const monitor = env.monitor();
@@ -113,7 +113,7 @@ test('采集：首轮从上市首个整点读起（替身上市 30 天）；报�
     assert.deepEqual(plain(env.store.hynixCandles()), plain(all.rows));
     const week = monitor.candles(7)!;
     assert.deepEqual([week.windowDays, week.rows[0]!.time, week.coverage], [7, lastHour - 7 * DAY, all.coverage]);
-    env.clock += CANDLE_STALE_MS + 1;
+    env.clock = Math.floor(env.clock / HOUR) * HOUR + HOUR + CANDLE_STALE_MS + 1;
     assert.equal(monitor.candles(null)!.status, 'snapshot');
 
     const restarted = env.monitor();
@@ -121,14 +121,12 @@ test('采集：首轮从上市首个整点读起（替身上市 30 天）；报�
     env.starts.length = 0;
     env.clock += 2 * HOUR;
     await restarted.refreshCandles();
-    // The stand-in lists 30 days back, later than the real first hour, so the hours before it count as missing.
-    assert.deepEqual(env.starts, [FIRST_FULL_HOUR, FIRST_FULL_HOUR], '启动后第一轮整轮补读：从最早缺口（上市首个整点）读起');
+    assert.deepEqual(env.starts, [lastHour, lastHour], '续读最后一根及新收盘');
     env.starts.length = 0;
     env.clock += 60_000;
     await restarted.refreshCandles();
-    const last = restarted.candles(null)!.rows.at(-1)!.time;
-    assert.deepEqual(env.starts, [last - 48 * HOUR, last - 48 * HOUR], '之后续读从最后一小时前 48 小时');
-    assert.deepEqual([restarted.candles(null)!.status, restarted.candles(null)!.rows.length], ['live', all.rows.length + 2]);
+    assert.deepEqual(env.starts, [FIRST_FULL_HOUR, FIRST_FULL_HOUR], '替身上市时间较晚，调度旧的未成交时段');
+    assert.deepEqual([restarted.candles(null)!.status, restarted.candles(null)!.rows.length], ['live', all.rows.length + 3]);
   } finally { env.dispose(); }
 });
 
@@ -138,7 +136,7 @@ test('采集失败：报价失败本轮作废并说明原因（日志只记一�
     const monitor = env.monitor();
     await monitor.refreshQuote(); await monitor.refreshCandles();
     const fetchedAt = monitor.quote()!.fetchedAt, rows = monitor.candles(null)!.rows.length;
-    env.clock += 60_000;
+    env.clock += HOUR;
     env.venues.down.add('skhy');
     await monitor.refreshQuote(); await monitor.refreshQuote(); await monitor.refreshCandles();
     assert.deepEqual([monitor.quote()!.fetchedAt, monitor.quote()!.lastError], [fetchedAt, '接口返回 HTTP 500']);
@@ -156,7 +154,7 @@ test('采集失败：报价失败本轮作废并说明原因（日志只记一�
     assert.equal(env.logs.filter(line => line === '海力士报价读取已恢复').length, 1);
     assert.ok(env.logs.includes('海力士K 线读取已恢复'));
     assert.ok(env.logs.includes('海力士K 线读取失败：接口返回 HTTP 500（Hyperliquid HTTP 500）'), '日志不重复“K 线读取失败”');
-    assert.deepEqual(monitor.status(), { quoteAt: monitor.quote()!.fetchedAt, quoteError: null, candlesAt: monitor.candles(null)!.fetchedAt, candleRows: rows, candleError: null, fundingAt: null, fundingRows: 0, fundingError: null });
+    assert.deepEqual(monitor.status(), { quoteAt: monitor.quote()!.fetchedAt, quoteError: null, candlesAt: monitor.candles(null)!.fetchedAt, candleRows: rows + 1, candleError: null, fundingAt: null, fundingRows: 0, fundingError: null });
   } finally { env.dispose(); }
 });
 
@@ -205,6 +203,24 @@ test('读回与写入失败：库里的报价无法解析时等新报价；K 线
   } finally { env.dispose(); }
 });
 
+test('已查询的空小时推进读取进度，最后共同收盘超期时图表仍显示快照', async () => {
+  const env = hynixEnv(FIRST_FULL_HOUR);
+  try {
+    const collector = env.monitor();
+    await collector.refreshCandles();
+    const last = collector.candles(null)!.rows.at(-1)!.time;
+    for (let hour = 1; hour <= 3; hour++) {
+      env.venues.hynixMissing.add(last + hour * HOUR);
+      env.clock = last + (hour + 1) * HOUR + CANDLE_STALE_MS + 1;
+      await collector.refreshCandles();
+      const view = collector.candles(null)!;
+      assert.equal(view.rows.at(-1)!.time, last);
+      assert.equal(view.status, 'snapshot');
+      assert.equal(view.fetchedAt, new Date(env.clock).toISOString());
+    }
+  } finally { env.dispose(); }
+});
+
 test('永久缺口：没有成交的整点不让每轮都从缺口处读起，每小时补读一次', async () => {
   const env = hynixEnv(FIRST_FULL_HOUR);
   try {
@@ -217,16 +233,15 @@ test('永久缺口：没有成交的整点不让每轮都从缺口处读起，�
     env.clock += 60_000;
     await collector.refreshCandles();
     const last = collector.candles(null)!.rows.at(-1)!.time;
-    assert.deepEqual(env.starts, [last - 48 * HOUR, last - 48 * HOUR], '一小时内只续读最后 48 小时');
+    assert.deepEqual(env.starts, [], '新的整点之前不重读');
     env.starts.length = 0;
     env.clock += HYNIX_GAP_RETRY_MS;
     await collector.refreshCandles();
-    assert.deepEqual(env.starts, [gap, gap], '满一小时从缺口处补读');
+    assert.deepEqual(env.starts, [last, last], '整点先查最新收盘');
     env.starts.length = 0;
     env.clock += 60_000;
     await collector.refreshCandles();
-    const after = collector.candles(null)!.rows.at(-1)!.time;
-    assert.deepEqual(env.starts, [after - 48 * HOUR, after - 48 * HOUR]);
+    assert.deepEqual(env.starts, [gap, gap], '随后修复缺口');
   } finally { env.dispose(); }
 });
 
@@ -240,6 +255,8 @@ test('永久缺口：补读那一轮写入失败时，下一轮照样从缺口�
     const collector = env.monitor({ store: flaky });
     await collector.refreshCandles();
     env.clock += HYNIX_GAP_RETRY_MS;
+    await collector.refreshCandles();
+    env.clock += 60_000;
     failing = true;
     env.starts.length = 0;
     await collector.refreshCandles();

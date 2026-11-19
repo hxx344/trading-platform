@@ -4,7 +4,9 @@ import { createBinanceGate, createRhLighterState, fetchAnthropicCandleBatch, fet
   type AnthropicCandleStarts, type AnthropicFetcher, type BinanceGate } from '../vendor/anthropic-market.mjs';
 import { ASSETS, fetchOilCandleBatch, requestBinance, validateMarket, type OilMarket } from '../vendor/oil-market.mjs';
 import { fetchHynixCandles, fetchHynixQuote } from '../vendor/hynix-market.mjs';
-import { fetchOilFunding, fetchHynixFunding } from '../vendor/settled-funding.mjs';
+import { fetchOilFundingFacts, fetchHynixFundingFacts } from '../vendor/settled-funding.mjs';
+import type { FundingHistoryRange } from '../vendor/exchange-funding-history.mjs';
+import type { FundingSide } from './funding-archive.ts';
 
 import { boundedReply, BinanceCooldown } from './market-contract.ts';
 import { HYPERLIQUID_INFO, XYZ_CONTEXTS_BODY, type SharedMarketReads } from './shared-reads.ts';
@@ -117,13 +119,13 @@ export function createMarketReaders({ fetchImpl = fetch, now = Date.now, gate = 
 
   return {
     anthropicQuote: (signal: AbortSignal) => fetchAnthropicQuote({ fetcher: fetcher(signal), now: now(), gate, rh, clock: now }),
-    anthropicCandles: (starts: AnthropicCandleStarts, at: number, signal: AbortSignal) => fetchAnthropicCandleBatch(starts, { fetcher: fetcher(signal), now: at, gate, rh, clock: now }),
+    anthropicCandles: (starts: AnthropicCandleStarts, at: number, signal: AbortSignal, ends?: AnthropicCandleStarts) => fetchAnthropicCandleBatch(starts, { fetcher: fetcher(signal), now: at, ends, gate, rh, clock: now }),
     oilQuote,
     oilCandles: (start: number, end: number, signal: AbortSignal) => fetchOilCandleBatch(start, { fetcher: oilFetcher(signal), now: end, timeout: 15_000 }, true),
-    oilFunding: (start: number, end: number, at: number, signal: AbortSignal) => fetchOilFunding(start, { fetcher: oilFetcher(signal), timeout: 15_000, now: at, endTime: end }),
+    oilFunding: (side: FundingSide, range: FundingHistoryRange, signal: AbortSignal) => fetchOilFundingFacts(side, range, { fetcher: oilFetcher(signal), timeout: 15_000 }),
     hynixQuote: (signal: AbortSignal) => fetchHynixQuote({ fetcher: fetcher(signal), now, timeout: 5_000 }),
-    hynixCandles: (start: number, at: number, signal: AbortSignal) => fetchHynixCandles(start, { fetcher: fetcher(signal), timeout: 10_000, now: at }),
-    hynixFunding: (start: number, end: number, at: number, signal: AbortSignal) => fetchHynixFunding(start, { fetcher: fetcher(signal), timeout: 10_000, now: at, endTime: end }),
+    hynixCandles: (start: number, at: number, signal: AbortSignal, end?: number) => fetchHynixCandles(start, { fetcher: fetcher(signal), timeout: 10_000, now: at, end }),
+    hynixFunding: (side: FundingSide, range: FundingHistoryRange, signal: AbortSignal) => fetchHynixFundingFacts(side, range, { fetcher: fetcher(signal), timeout: 10_000 }),
   };
 }
 export type MarketReaders = ReturnType<typeof createMarketReaders> & { epoch?: () => string | null };

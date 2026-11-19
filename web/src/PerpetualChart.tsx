@@ -5,7 +5,7 @@ import { ArrowLeft, ArrowLeftRight, ChevronLeft, ChevronRight, Copy } from 'luci
 import { usePerpetualFundingHistory } from './use-perpetual-funding-history.ts';
 import { usePerpetualPriceHistory } from './use-perpetual-price-history.ts';
 import { analyzeFundingStability, type FundingStabilityDay, type FundingStabilityReport } from './perpetual-funding-stability.ts';
-import { PERPETUAL_FUNDING_STALE_MS, type FundingHistoryPairRequest } from '../../src/vendor/perpetual-funding-history.ts';
+import { fundingFreshUntil, type FundingHistoryPairRequest } from '../../src/vendor/perpetual-funding-history.ts';
 import { perpetualChartUrl, type PerpetualChartSelection } from './perpetual-chart-state.ts';
 import { perpetualPriceIdentity, PRICE_HOUR_MS, PRICE_HISTORY_STALE_MS, type PerpetualPriceLeg } from '../../src/vendor/perpetual-price-history.ts';
 import { quoteIsFresh, quotePrice, quotePriceTime } from './perpetual-spreads.ts';
@@ -151,7 +151,8 @@ function PerpetualChart({ selection, snapshot, active, now, onSelectionChange, o
   const [longHistory, shortHistory] = histories;
   const commonEnd = longHistory?.coverage && shortHistory?.coverage ? Math.min(longHistory.coverage.to, shortHistory.coverage.to) : null;
   // Clock ticks only change these analyses when freshness crosses a boundary.
-  const analysisClock = commonEnd === null ? 0 : commonEnd > clock + 5000 ? commonEnd - 5001 : clock - commonEnd > PERPETUAL_FUNDING_STALE_MS ? commonEnd + PERPETUAL_FUNDING_STALE_MS + 1 : commonEnd;
+  const freshUntil = fundingFreshUntil(longHistory, shortHistory);
+  const analysisClock = commonEnd === null ? 0 : commonEnd > clock + 5000 ? commonEnd - 5001 : clock > freshUntil ? Math.max(commonEnd, freshUntil + 1) : commonEnd;
   const analyses = useMemo(() => WINDOWS.map(days => analyzeFundingStability(longHistory, shortHistory, days, analysisClock)), [longHistory, shortHistory, analysisClock]);
   const analysis = analyses.find(item => item.days === selection.days)!;
   const end = analysis.asOf !== null && analysis.asOf <= clock + 5000 ? analysis.asOf : clock, start = end - selection.days * DAY;

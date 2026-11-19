@@ -3,6 +3,7 @@
 import { okxAuthHeaders } from '../../vendor/okx.mjs';
 import { readJsonResponse } from '../../vendor/response.mjs';
 import type { Balance } from '../types.ts';
+import { PositionsPermissionError } from '../positions-values.ts';
 
 export type OkxCredential = { apiKey: string; apiSecret: string; passphrase: string };
 type Json = Record<string, unknown>;
@@ -71,8 +72,9 @@ export async function okxGet(c: OkxCredential, path: string, fetcher: Fetcher = 
 }
 
 export async function syncOkx(c: OkxCredential, fetcher: Fetcher = fetch): Promise<{ total: number; details: Balance[]; updatedAt: string }> {
-  const config = singleAccount(await okxGet(c, CONFIG_PATH, fetcher));
-  if (config.perm !== 'read_only') throw new Error('此 OKX API 无法确认只读权限，请使用仅启用读取的 API');
+  const config = await okxGet(c, CONFIG_PATH, fetcher);
+  if (config.length !== 1 || !isObject(config[0])) throw new PositionsPermissionError(INCOMPLETE);
+  if (config[0].perm !== 'read_only') throw new PositionsPermissionError('此 OKX API 无法确认只读权限，请使用仅启用读取的 API');
   const valuation = singleAccount(await okxGet(c, VALUATION_PATH, fetcher));
   const total = usdValue(valuation.totalBal);
   if (typeof valuation.ts !== 'string' || !/^\d{1,16}$/.test(valuation.ts)) throw new Error('OKX 估值时间无效或已过期；已保留上次数据');

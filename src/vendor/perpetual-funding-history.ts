@@ -21,6 +21,8 @@ export interface PerpetualFundingLeg {
   /** A successful recent window can be read while older chunks are still backfilling. */
   backfillComplete?: boolean;
   nextRefreshAt?: number;
+  /** Freshness deadline based on the next expected settlement and its publication grace. */
+  freshUntil?: number;
   cacheUpdatedAt?: number;
 }
 export interface PerpetualFundingHistoryReport {
@@ -32,6 +34,7 @@ export interface PerpetualFundingHistoryReport {
 export interface FundingWindowTotal {
   hours: FundingWindowHours;
   asOf: number | null;
+  freshUntil?: number;
   longPercent: number | null;
   shortPercent: number | null;
   netPercent: number | null;
@@ -39,6 +42,15 @@ export interface FundingWindowTotal {
   shortCount: number;
   status: 'ready' | 'pending' | 'partial' | 'stale' | 'error' | 'unsupported';
   reason: string;
+}
+
+export function fundingFreshUntil(long?: PerpetualFundingLeg, short?: PerpetualFundingLeg): number {
+  const deadline = (leg?: PerpetualFundingLeg) => leg?.freshUntil ?? ((leg?.coverage?.to ?? 0) + PERPETUAL_FUNDING_STALE_MS);
+  return Math.min(deadline(long), deadline(short));
+}
+
+export function fundingTotalIsFresh(total: Pick<FundingWindowTotal, 'asOf' | 'freshUntil'>, now: number): boolean {
+  return total.asOf !== null && total.asOf <= now + 5_000 && now <= (total.freshUntil ?? total.asOf + PERPETUAL_FUNDING_STALE_MS);
 }
 
 /** Exact rolling (from, to] settlements; a positive net means receipts for this direction.
@@ -52,6 +64,7 @@ export function fundingWindowTotal(long: PerpetualFundingLeg | undefined, short:
   if (!long.coverage || !short.coverage) return { ...result, status: long.status === 'error' || short.status === 'error' ? 'error' : 'pending', reason: long.error || short.error || result.reason };
   const asOf = Math.min(long.coverage.to, short.coverage.to), from = asOf - hours * 3_600_000;
   result.asOf = asOf;
+  result.freshUntil = fundingFreshUntil(long, short);
   const totals = [long, short].map(leg => {
     const rows = leg.records.filter(row => row.time > from && row.time <= asOf);
     const covered = leg.coverage!.from <= from && leg.coverage!.to >= asOf && leg.records.some(row => row.time <= from) && rows.length > 0;
@@ -61,7 +74,7 @@ export function fundingWindowTotal(long: PerpetualFundingLeg | undefined, short:
   [result.longPercent, result.shortPercent] = totals.map(total => total.percent);
   if (totals.some(total => total.percent === null)) return { ...result, status: long.backfillComplete === false || short.backfillComplete === false ? 'pending' : 'partial', reason: long.backfillComplete === false || short.backfillComplete === false ? '正在回补历史结算' : '历史不足或窗口内无结算记录' };
   result.netPercent = result.shortPercent! - result.longPercent!;
-  if (asOf > now + 5_000 || now - asOf > PERPETUAL_FUNDING_STALE_MS) return { ...result, status: 'stale', reason: '历史已过期，保留上次累计' };
+  if (!fundingTotalIsFresh(result, now)) return { ...result, status: 'stale', reason: '历史已过期，保留上次累计' };
   if (long.error || short.error) return { ...result, status: 'error', reason: '更新失败，保留上次累计' };
   return { ...result, status: 'ready', reason: '' };
 }

@@ -91,8 +91,9 @@ test('reads reuse one contract cache while bounded chunks backfill once, then on
   for (let read = 0; read < 10; read++) f.read();
   await turn(); await f.service.collect(); assert.equal(f.calls(), 16);
   f.advance(300_001); f.read(); await turn(); assert.equal(f.calls(), 16, 'Reading a cache does not trigger its refresh');
-  await f.service.collect(); assert.equal(f.calls(), 18);
-  assert.equal(ranges.at(-1).from, NOW - 2 * HOUR); assert.equal(ranges.at(-1).to, NOW + 300_001);
+  await f.service.collect(); assert.equal(f.calls(), 16, 'No settlement is due');
+  f.advance(HOUR + 60_000 - 300_001); await f.service.collect(); assert.equal(f.calls(), 18);
+  assert.equal(ranges.at(-1).from, NOW); assert.equal(ranges.at(-1).to, NOW + HOUR + 60_000);
   assert.equal(f.read().legs['binance:BTCUSDT'].records.length, 768);
 });
 
@@ -186,10 +187,11 @@ test('durable complete caches restart without downloads, then refresh even with 
   const restarted = fixture(t, { service: { store }, reader: async (_market, range) => { ranges.push(range); return within(range); } });
   await turn(); await restarted.service.collect(); assert.equal(restarted.calls(), 0);
   assert.equal(restarted.read().legs['binance:BTCUSDT'].backfillComplete, true);
-  restarted.advance(300_001); await restarted.service.collect();
+  restarted.advance(300_001); await restarted.service.collect(); assert.equal(restarted.calls(), 0);
+  restarted.advance(HOUR + 60_000 - 300_001); await restarted.service.collect();
   assert.equal(restarted.calls(), 2);
-  assert.equal(ranges[0].from, NOW - 2 * HOUR);
-  assert.equal(disk.get('binance:BTCUSDT').value.coverage.to, NOW + 300_001);
+  assert.equal(ranges[0].from, NOW);
+  assert.equal(disk.get('binance:BTCUSDT').value.coverage.to, NOW + HOUR + 60_000);
 });
 
 test('durable partial caches resume backfill and evicted contracts reload from disk', async t => {
@@ -205,6 +207,43 @@ test('durable partial caches resume backfill and evicted contracts reload from d
   const late = fixture(t, { service: { store: { ...store, loadFundingHistory: key => key ? store.loadFundingHistory(key) : [] } } });
   assert.equal(late.read().legs['binance:BTCUSDT'].coverage.from, NOW - 12 * 24 * HOUR);
   assert.equal(late.calls(), 0);
+});
+
+test('published 8h terms keep both legs current without new coverage and retry only the late settlement', async t => {
+  const quotes = ['binance', 'bybit'].map(exchange => quote(exchange, 'BTCUSDT', { fundingIntervalHours: 8, nextFundingAt: NOW + 8 * HOUR }));
+  const ranges = []; let late = true;
+  const f = fixture(t, { quotes, reader: async (market, range) => {
+    ranges.push({ exchange: market.exchange, ...range });
+    return within(range).filter(row => (row.time - NOW) % (8 * HOUR) === 0 && !(late && market.exchange === 'binance' && row.time === NOW + 8 * HOUR));
+  } });
+  f.read();
+  for (let chunk = 0; chunk < 8; chunk++) await f.service.collect();
+  const report = () => Object.values(f.read().legs);
+  ranges.length = 0; f.advance(7 * HOUR); await f.service.collect();
+  const [long, short] = report();
+  assert.equal(fundingWindowTotal(long, short, 24, NOW + 7 * HOUR).status, 'ready');
+  assert.equal(long.fetchedAt, NOW); assert.equal(long.coverage.to, NOW); assert.deepEqual(ranges, []);
+  f.advance(HOUR + 60_000); await f.service.collect();
+  assert.deepEqual(ranges.map(({ from, to }) => [from, to]), Array(2).fill([NOW, NOW + 8 * HOUR + 60_000]));
+  ranges.length = 0; f.advance(PERPETUAL_FUNDING_STALE_MS);
+  assert.equal(fundingWindowTotal(...report(), 24, NOW + 8 * HOUR + 60_000 + PERPETUAL_FUNDING_STALE_MS).status, 'stale');
+  late = false; await f.service.collect();
+  assert.deepEqual(ranges.map(({ exchange, from }) => [exchange, from]), [['binance', NOW + 8 * HOUR]]);
+  assert.equal(fundingWindowTotal(...report(), 24, NOW + 8 * HOUR + 60_000 + PERPETUAL_FUNDING_STALE_MS).status, 'ready');
+});
+
+test('a missing settlement in an otherwise paged contract gets a bounded repair independently of the other leg', async t => {
+  const hole = NOW - 6 * 24 * HOUR, calls = [];
+  let absent = true;
+  const f = fixture(t, { reader: async (market, range) => {
+    calls.push({ exchange: market.exchange, ...range });
+    return within(range).filter(row => !(absent && market.exchange === 'bybit' && row.time === hole));
+  } });
+  f.read(); for (let chunk = 0; chunk < 8; chunk++) await f.service.collect();
+  calls.length = 0; f.advance(HOUR); absent = false; await f.service.collect();
+  assert.deepEqual(calls, [{ exchange: 'bybit', from: hole, to: hole + HOUR - 1 }]);
+  assert.ok(f.read().legs['bybit:BTCUSDT'].records.some(row => row.time === hole));
+  assert.equal(f.read().legs['bybit:BTCUSDT'].coverage.to, NOW);
 });
 
 test('persist retries do not fetch again and untrusted/corrupt persisted data is never exposed', async t => {

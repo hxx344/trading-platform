@@ -5,10 +5,8 @@
 // Oil on Binance comes from the oil collector's quote and Hynix on Hyperliquid from the Hynix collector's mids, so they cost
 // no extra Binance or allMids reads.
 // M-2d-3: one exchange's settled funding history (60 days, both legs), read only while a page has its panel open. A snapshot
-// is shared for 5 minutes; the next read starts a day before each leg's last coverage end, so only the first read pages the
-// whole window. The whole read has a 60 s deadline on top of each request's 10 s timeout, pages are capped per leg, and no
-// request is retried. A leg that fails keeps its previous records and coverage; when both fail the previous snapshot is
-// served for 15 s marked as a snapshot, and without one the read answers with a short Chinese reason. Kept in memory only.
+// is shared for 5 minutes. The executor stores each leg's original settlements and completed windows. Both the comparison
+// and the scheduled collector page only what is missing, and keep independently verified legs when their peer fails.
 // M-3d: Variational (oil only), as the workbench's lib/oil-dex.ts createOilDexReader (8470785): with a usable saved token the
 // authenticated marks, otherwise (or when they fail) the public metadata/stats marks; the public predicted funding joins
 // either. A read that finds the token changed meanwhile is dropped and read again (twice at most, then the public marks),
@@ -16,11 +14,14 @@
 import {
   LIGHTER_ORIGIN, binanceOilExchangeQuote, bybitInstruments, hyperliquidHynixQuote, hyperliquidOilQuote, parseBinanceQuote, parseBitgetQuote,
   parseBybitQuote, parseGateQuote, checkedReply, parseHyperliquidContexts, parseLighterOilMarkets, parseOkxQuote, readLighterOilSnapshot, supportsExchange,
-  EXCHANGE_CONTRACTS, type Exchange, type ExchangeQuote, type HyperliquidContext, type LighterMarket, type SpreadMarket,
+  EXCHANGE_CONTRACTS, exchangeDefinition, type Exchange, type ExchangeQuote, type HyperliquidContext, type LighterMarket, type SpreadMarket,
 } from '../vendor/exchange-comparison.mjs';
 import type { RemoteComparison } from '../service/remote-monitor.ts';
 import type { BinanceGate } from '../vendor/anthropic-market.mjs';
-import { HISTORY_REFRESH_MS, createFundingLegReader, mergeFundingHistory, supportsFundingHistory, type ExchangeFundingHistory } from '../vendor/exchange-funding-history.mjs';
+import { HISTORY_REFRESH_MS, HISTORY_STALE_MS, HISTORY_WINDOW_MS, createFundingLegReader, supportsFundingHistory, validateExchangeFundingHistory, type ExchangeFundingHistory, type FundingFact, type FundingHistoryRange } from '../vendor/exchange-funding-history.mjs';
+import { FUNDING_PUBLICATION_GRACE_MS, fundingGap, settlementSchedule, settlementSlot } from '../vendor/funding-schedule.ts';
+import { createFundingArchive, FundingArchiveWriteError, type FundingArchive, type FundingSide, type ReadFundingLeg } from './funding-archive.ts';
+import { createMarketReaders } from './market-readers.ts';
 import type { HynixQuote } from '../vendor/hynix-market.mjs';
 import type { HynixQuoteView } from './hynix.ts';
 import type { OilQuoteView } from './oil.ts';
@@ -46,6 +47,7 @@ export class ExchangeReadError extends Error {}
 /** Short Chinese reason for a failed read; never echoes upstream bodies. */
 export function exchangeError(error: unknown): string {
   if (error instanceof ExchangeReadError) return error.message;
+  if (error instanceof FundingArchiveWriteError) return 'monitor.sqlite 写入失败';
   if (error instanceof BinanceCooldown) return `接口限流冷却中（HTTP ${error.status}）`;
   const value = error as { name?: string; message?: unknown } | null;
   const message = String(value?.message ?? '');
@@ -67,9 +69,9 @@ export function exchangeError(error: unknown): string {
 // JSON parse errors quote the reply, so only their name is logged.
 const detail = (error: unknown): string => error instanceof SyntaxError ? error.name : (error instanceof Error ? error.message : String(error)).slice(0, 200);
 
-export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSession, variationalFetch, remote, shared: common, fetchImpl = fetch, now = Date.now, WebSocketImpl, log = line => process.stderr.write(`${line}\n`) }: {
+export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSession, variationalFetch, remote, shared: common, fetchImpl = fetch, now = Date.now, archive = createFundingArchive(undefined, now), WebSocketImpl, log = line => process.stderr.write(`${line}\n`) }: {
   /** The Binance cooldown shared with the collectors: everything reads Binance from the same address. */
-  gate: BinanceGate; remote?: RemoteComparison;
+  gate: BinanceGate; remote?: RemoteComparison; archive?: FundingArchive;
   /** The market service's reads in common with the cards and the collector (./shared-reads.ts); absent, this reader keeps its own. */
   shared?: SharedMarketReads;
   /** The collectors' current quotes (null when that market is not configured or has none yet). */
@@ -255,6 +257,76 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSe
   }
 
   const lighterMarkets = () => retained('lighter/markets', async () => parseLighterOilMarkets(await request(`${LIGHTER_ORIGIN}/api/v1/orderBookDetails`))) as Promise<LighterMarket[]>;
+  const primary = createMarketReaders({ gate, fetchImpl, now });
+  const rawFunding: ReadFundingLeg = (market, exchange, side, range, signal) => {
+    if (remote) return remote.history(market, exchange, side, range, signal);
+    if (market === 'oil' && exchange === 'binance') return primary.oilFunding(side, range, signal);
+    if (market === 'hynix' && exchange === 'hyperliquid') return primary.hynixFunding(side, range, signal);
+    const reader = createFundingLegReader({ request: (url, init) => request(url, { ...init, signal }), clock: now, lighterMarkets });
+    return reader(exchange, exchangeDefinition(exchange, market)[side], range);
+  };
+
+  async function updateHistory(market: SpreadMarket, exchange: Exchange, at: number, signal: AbortSignal) {
+    const requested = { from: at - HISTORY_WINDOW_MS, to: at }, sides = ['left', 'right'] as const;
+    const definition = exchangeDefinition(exchange, market);
+    const cadence = exchange === 'hyperliquid' || exchange === 'lighter' ? 1 : market === 'oil' && exchange === 'binance' ? 4 : null;
+    function timing(records: FundingFact[], through: number) {
+      const regular = records.filter(row => !row.special), schedule = settlementSchedule(regular, cadence);
+      const last = regular.at(-1), due = last && schedule ? settlementSlot(last.time, schedule) + schedule.interval : null;
+      const readAt = due !== null && through < due + FUNDING_PUBLICATION_GRACE_MS ? due + FUNDING_PUBLICATION_GRACE_MS : through + HISTORY_REFRESH_MS;
+      return { regular, schedule, readAt, freshUntil: (due ?? through) + HISTORY_STALE_MS };
+    }
+    const results = await Promise.allSettled(sides.map(async side => {
+      const saved = archive.inspect(market, exchange, side, requested);
+      const latest = saved.proofs.at(-1)?.to;
+      // A settled tail is current until the next publication. Always fill unqueried intervals earlier in the window.
+      const to = latest !== undefined && at < timing(saved.records, latest).readAt ? Math.min(latest, at) : at;
+      const leg = await archive.read(market, exchange, side, { from: requested.from, to }, rawFunding, signal);
+      const { regular, schedule } = timing(leg.records, to);
+      if (!schedule) return;
+      const lastDue = settlementSlot(to - FUNDING_PUBLICATION_GRACE_MS, schedule);
+      // A completed but empty publication at the tail gets another chance. Older holes need at most one repair per read.
+      const last = regular.at(-1), late = !last || settlementSlot(last.time, schedule) < lastDue;
+      const cutoff = at - (late ? HISTORY_REFRESH_MS : 3_600_000) + 1;
+      const checked = leg.proofs.filter(p => p.checkedAt >= cutoff);
+      // Skip slots just verified by either consumer, even if the venue still has no record.
+      const gap = late ? lastDue : fundingGap(regular, schedule, requested.from, lastDue, 0, checked);
+      if (gap !== null && gap >= requested.from) {
+        await archive.read(market, exchange, side, { from: gap, to: Math.min(to, gap + schedule.interval - 1) }, rawFunding, signal, cutoff);
+      }
+    }));
+    // Freeze the displayed 60 days at their actual latest query end. Receipts can follow that end by several pages.
+    const end = Math.min(at, Math.max(...sides.map(side => archive.inspect(market, exchange, side, requested).proofs.at(-1)?.to ?? 0)));
+    const window = { from: end - HISTORY_WINDOW_MS, to: end };
+    const rows = new Map<number, ExchangeFundingHistory['rows'][number]>();
+    let checkAt = at + HISTORY_REFRESH_MS;
+    const leg = (side: FundingSide, i: number) => {
+      const saved = archive.inspect(market, exchange, side, window);
+      const ranges: FundingHistoryRange[] = [];
+      for (const proof of saved.proofs) {
+        const last = ranges.at(-1), to = Math.min(end, proof.to);
+        if (last && last.to + 1 >= proof.from) last.to = to;
+        else ranges.push({ from: Math.max(window.from, proof.from), to });
+      }
+      for (const fact of saved.records) {
+        const row = rows.get(fact.time) ?? { time: fact.time, leftRate: null, rightRate: null };
+        row[`${side}Rate`] = fact.rate; rows.set(fact.time, row);
+      }
+      const coverage = ranges.at(-1) ?? null, terms = coverage && timing(saved.records, coverage.to);
+      if (terms && terms.readAt > at) checkAt = Math.min(checkAt, terms.readAt);
+      return { symbol: definition[side], coverage, ...(terms ? { freshUntil: terms.freshUntil } : {}), ...(ranges.length > 1 ? { ranges } : {}),
+        fetchedAt: saved.fetchedAt ? new Date(saved.fetchedAt).toISOString() : null, error: results[i]!.status === 'rejected' ? '本合约历史结算费率暂时读取失败，保留上次成功记录。' : '' };
+    };
+    const left = leg('left', 0), right = leg('right', 1);
+    const failure = results.find(result => result.status === 'rejected')?.reason as unknown;
+    if (!left.fetchedAt && !right.fetchedAt) throw failure ?? Error('Actual funding history unavailable');
+    const bothFailed = results.every(result => result.status === 'rejected');
+    const reason = bothFailed ? '历史结算费率暂时更新失败，保留上次成功记录。' : failure ? '部分合约更新失败，请查看各合约采集时间。' : '';
+    const fetchedAt = new Date(Math.max(...[left, right].map(side => side.fetchedAt ? Date.parse(side.fetchedAt) : 0))).toISOString();
+    const value = validateExchangeFundingHistory({ exchange, monitorId: market, currency: definition.currency, fetchedAt, left, right,
+      rows: [...rows.values()], status: bothFailed ? 'snapshot' : 'live', reason }, exchange, market);
+    return { value, until: failure ? at + FUNDING_HISTORY_SNAPSHOT_MS : checkAt, failure };
+  }
   // Settled histories by market/exchange: the last good snapshot stays as the base of the next incremental read. `failure`
   // is why the round behind the entry failed (both legs, or one leg of a live snapshot), for the log. A failure with nothing
   // to keep is held for the snapshot interval too, so pages retrying every 30 s do not each start a 60-day read.
@@ -268,23 +340,18 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSe
     if (held && now() < held.until) return Promise.reject(held.error);
     let operation = historyPending.get(key);
     if (!operation) {
-      const deadline = AbortSignal.timeout(FUNDING_HISTORY_DEADLINE_MS);
-      const legErrors: unknown[] = [];
-      const reader = createFundingLegReader({ request: (url, init = {}) => request(url, { ...init, signal: deadline }), clock: now, lighterMarkets });
-      const readLeg: typeof reader = (...args) => reader(...args).catch(error => { legErrors.push(error); throw error; });
-      operation = mergeFundingHistory({ exchange, monitorId: market, previous: previous?.value ?? null, readLeg, clock: now }).then(value => {
-        const entry = { value, until: now() + HISTORY_REFRESH_MS, failure: legErrors[0] ?? null };
+      const deadline = AbortSignal.any([stopping.signal, AbortSignal.timeout(FUNDING_HISTORY_DEADLINE_MS)]);
+      operation = updateHistory(market, exchange, now(), deadline).then(entry => {
         histories.set(key, entry);
         historyFailures.delete(key);
         return entry;
       }, error => {
         if (!previous) {
-          const failure = legErrors[0] ?? error;
-          historyFailures.set(key, { until: now() + FUNDING_HISTORY_SNAPSHOT_MS, error: failure });
-          throw failure;
+          historyFailures.set(key, { until: now() + FUNDING_HISTORY_SNAPSHOT_MS, error });
+          throw error;
         }
         // The previous snapshot answers for a short while; its records keep their own receipt times.
-        const entry = { value: { ...previous.value, status: 'snapshot' as const, reason: '历史结算费率暂时更新失败，保留上次成功记录。' }, until: now() + FUNDING_HISTORY_SNAPSHOT_MS, failure: legErrors[0] ?? error };
+        const entry = { value: { ...previous.value, status: 'snapshot' as const, reason: '历史结算费率暂时更新失败，保留上次成功记录。' }, until: now() + FUNDING_HISTORY_SNAPSHOT_MS, failure: error };
         histories.set(key, entry);
         return entry;
       }).finally(() => historyPending.delete(key));
@@ -303,7 +370,7 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSe
   };
   const recovered = (key: string) => { if (lastFailure.delete(key)) log(`交易所对比 ${key} 已恢复`); };
   return {
-    publicVariational,
+    publicVariational, rawFunding,
     /** One exchange's current comparison row; rejects with an ExchangeReadError carrying the page's reason. */
     async quote(market: SpreadMarket, exchange: Exchange, savedHynix?: ComparisonHynix | null): Promise<ExchangeQuote> {
       if (!supportsExchange(market, exchange)) throw new ExchangeReadError('不支持的交易所');
@@ -334,7 +401,6 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSe
     /** One exchange's settled funding history (M-2d-3); rejects with an ExchangeReadError only when there is nothing to keep. */
     async fundingHistory(market: SpreadMarket, exchange: Exchange): Promise<ExchangeFundingHistory> {
       if (!supportsFundingHistory(market, exchange)) throw new ExchangeReadError('不支持的交易所');
-      if (remote) return remote.history(market, exchange, stopping.signal);
       const key = `${market}/${exchange}/funding-history`;
       let entry: HistoryEntry;
       try { entry = await readHistory(market, exchange, key); }

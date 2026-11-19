@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { ALERT_CHECK_MS, createAlertService, createTestGate, type AlertHooks, type AlertMarket, type AlertService } from '../monitor/alerts.ts';
 import { createAnthropicMonitor, type AnthropicMonitor, type LoopContext } from '../monitor/anthropic.ts';
 import { createExchangeReader, type ExchangeReader } from '../monitor/exchanges.ts';
+import { createFundingArchive } from '../monitor/funding-archive.ts';
 import { createHynixMonitor, type HynixMonitor } from '../monitor/hynix.ts';
 import { createOilMonitor, type OilMonitor } from '../monitor/oil.ts';
 import { createPerpetualMonitor, type PerpetualMonitor, type PerpetualOptions } from '../monitor/perpetual.ts';
@@ -51,14 +52,15 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
   const store = createMonitorStore({ file: join(dir, MONITOR_FILE), ...(now ? { now } : {}) });
   try {
     const remote = marketClient ? createRemoteMonitor(marketClient, now) : null;
-    const base = { store, ...(remote ? { readers: remote.rounds } : {}), ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}) };
+    const archive = createFundingArchive(store, now);
+    const base = { store, archive, ...(remote ? { readers: remote.rounds } : {}), ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}) };
     // One Binance cooldown for everything that reads Binance from the same address; the Hynix collector reads Hyperliquid only.
     const gate = createBinanceGate(), options = { ...base, gate };
     const oil = config.oil ? createOilMonitor(options) : null, hynix = config.hynix ? createHynixMonitor(base) : null;
     const varFetch = oil ? variationalFetch ?? createVariationalFetch() : undefined;
     const variational = oil && varFetch ? createVariationalSession({ dir, fetcher: varFetch, ...(now ? { now } : {}), ...(log ? { log } : {}) }) : null;
     const exchanges = oil || hynix ? createExchangeReader({
-      ...(remote ? { remote: remote.comparison } : {}), gate, oilQuote: () => oil?.quote() ?? null, hynixQuote: () => hynix?.quote() ?? null,
+      ...(remote ? { remote: remote.comparison } : {}), gate, archive, oilQuote: () => oil?.quote() ?? null, hynixQuote: () => hynix?.quote() ?? null,
       ...(variational && varFetch ? { variationalSession: variational, variationalFetch: varFetch } : {}),
       ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}), ...(WebSocketImpl ? { WebSocketImpl } : {}),
     }) : null;

@@ -7,6 +7,7 @@ import type { AnthropicCandleRow } from '../vendor/anthropic-market.mjs';
 import type { HynixCandleRow } from '../vendor/hynix-market.mjs';
 import type { OilCandleRow } from '../vendor/oil-market.mjs';
 import type { HynixFundingRow, OilFundingRow } from '../vendor/settled-funding.mjs';
+import type { FundingFact, FundingProof } from './funding-archive.ts';
 
 export const MONITOR_FILE = 'monitor.sqlite';
 
@@ -30,6 +31,8 @@ export function createMonitorStore({ file, now = Date.now }: { file: string; now
     CREATE TABLE IF NOT EXISTS hynix_candles (time INTEGER PRIMARY KEY, adr REAL NOT NULL, ordinary REAL NOT NULL);
     CREATE TABLE IF NOT EXISTS oil_funding (time INTEGER PRIMARY KEY, brent REAL, wti REAL);
     CREATE TABLE IF NOT EXISTS hynix_funding (time INTEGER PRIMARY KEY, adr REAL, ordinary REAL);
+    CREATE TABLE IF NOT EXISTS funding_facts (series TEXT NOT NULL, time INTEGER NOT NULL, rate REAL NOT NULL, special INTEGER NOT NULL, PRIMARY KEY(series, time));
+    CREATE TABLE IF NOT EXISTS funding_reads (series TEXT NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL, checked_at INTEGER NOT NULL, PRIMARY KEY(series, start));
     CREATE TABLE IF NOT EXISTS monitor_state (key TEXT PRIMARY KEY, json TEXT NOT NULL, updated_at INTEGER NOT NULL);`);
   } catch (error) { db.close(); throw error; }
   const upsertCandle = db.prepare(`INSERT INTO anthropic_candles(time, binance, xyz, io, rh) VALUES (?, ?, ?, ?, ?)
@@ -65,6 +68,24 @@ export function createMonitorStore({ file, now = Date.now }: { file: string; now
   }
 
   return {
+    loadFundingFacts(series: string): { records: FundingFact[]; proofs: FundingProof[] } {
+      const rows = db.prepare('SELECT time, rate, special FROM funding_facts WHERE series=? ORDER BY time').all(series) as unknown as { time: number; rate: number; special: number }[];
+      const proofs = db.prepare('SELECT start AS "from", end AS "to", checked_at AS checkedAt FROM funding_reads WHERE series=? ORDER BY start').all(series) as unknown as FundingProof[];
+      return { records: rows.map(({ time, rate, special }) => ({ time, rate, ...(special ? { special: true } : {}) })), proofs };
+    },
+    writeFundingFacts(series: string, added: FundingFact[], cutoff: number, removed: FundingProof[], confirmed: FundingProof[]): void {
+      const insert = db.prepare('INSERT INTO funding_facts(series, time, rate, special) VALUES (?, ?, ?, ?)');
+      const remove = db.prepare('DELETE FROM funding_reads WHERE series=? AND start=?');
+      const confirm = db.prepare('INSERT INTO funding_reads(series, start, end, checked_at) VALUES (?, ?, ?, ?)');
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        for (const row of added) insert.run(series, row.time, row.rate, Number(Boolean(row.special)));
+        for (const range of removed) remove.run(series, range.from);
+        for (const range of confirmed) confirm.run(series, range.from, range.to, range.checkedAt);
+        db.prepare('DELETE FROM funding_facts WHERE series=? AND time<?').run(series, cutoff);
+        db.exec('COMMIT');
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
     /** Every stored candle row, oldest first. */
     candles(): AnthropicCandleRow[] {
       return db.prepare('SELECT time, binance, xyz, io, rh FROM anthropic_candles ORDER BY time').all() as unknown as AnthropicCandleRow[];

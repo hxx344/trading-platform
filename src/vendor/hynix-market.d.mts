@@ -23,6 +23,6 @@ export function fetchHynixQuote(options?: { fetcher?: HynixFetcher; timeout?: nu
 export function validateHynixQuote(input: unknown): HynixQuote;
 export function alignHynixCandles(ordinary: readonly { t: number; T: number; c: string }[], adr: readonly { t: number; T: number; c: string }[], now: number): HynixCandleRow[];
 export function hynixCandleStart(rows: readonly HynixCandleRow[], now: number, full: boolean): number;
-export function fetchHynixCandles(startTime: number, options: { fetcher?: HynixFetcher; timeout?: number; now: number }): Promise<HynixCandleRow[]>;
+export function fetchHynixCandles(startTime: number, options: { fetcher?: HynixFetcher; timeout?: number; now: number; end?: number }): Promise<HynixCandleRow[]>;
 export function validateHynixRows(input: unknown, fetchedAt: string): HynixCandleRow[];
 export function hynixChartRows(rows: readonly HynixCandleRow[]): HynixChartRow[];

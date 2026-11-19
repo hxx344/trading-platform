@@ -11,8 +11,11 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { openAssetDb } from '../src/asset/db.ts';
-import { FILLS_PERMISSION, createFillsService } from '../src/asset/fills-service.ts';
+import { FILLS_PERMISSION, createFillsService as fillsService, type FillsServiceOptions } from '../src/asset/fills-service.ts';
 import { readFills } from '../src/asset/fills-readers.ts';
+import { accountHistory } from '../src/asset/history-cache.ts';
+import { readPositionCycle } from '../src/asset/positions-cycle-readers.ts';
+import { createPositionsService, revisionOf } from '../src/asset/positions-service.ts';
 import { FillConflict, mergeFills, replayFills } from '../src/asset/fills-replay.ts';
 import { CYCLE_LOOKBACK_MS } from '../src/asset/positions-cycle.ts';
 import { historyContext } from '../src/asset/positions-history.ts';
@@ -23,6 +26,7 @@ import type { Credentials } from '../src/asset/validation.ts';
 
 const at = Date.parse('2026-10-01T00:00:00.000Z'), minute = 60_000, day = 86_400_000;
 const keys = { apiKey: 'synthetic-key', apiSecret: 'synthetic-secret' };
+const createFillsService = (options: FillsServiceOptions) => fillsService(options.read ? { permission: async () => {}, ...options } : options);
 const okx: Credentials = { exchange: 'okx', ...keys, passphrase: 'synthetic-pass' };
 const binance: Credentials = { exchange: 'binance', ...keys };
 const bybit: Credentials = { exchange: 'bybit', ...keys, region: 'global' };
@@ -208,6 +212,59 @@ test('incremental refresh overlaps ten minutes, deduplicates, recomputes all cac
   batch = 2; clock += 5 * minute; await service.read(() => f.database, f.unseal); await service.idle();
   result = scope(await service.read(() => f.database, f.unseal));
   assert.equal(result.status, 'error'); assert.equal(result.fills.length, 2); assert.match(result.error!, /冲突/);
+});
+
+test('a disputed OKX bill is refetched after restart and cannot return from another pending cycle', async t => {
+  for (const alreadyStored of [false, true]) await t.test(alreadyStored ? 'conflicting raw interval' : 'conflicting exchange interval', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'tp-disputed-fill-')), file = path.join(dir, 'asset.sqlite');
+    const f = fixture(file); let db = f.database;
+    await f.save(okx);
+    const revision = revisionOf(db.prepare("SELECT encrypted FROM connections WHERE exchange='okx'").get<{ encrypted: string }>()!.encrypted);
+    const symbol = 'CL-USDT-SWAP', time = at - 9 * minute;
+    let clock = at, price = '80';
+    const venue = mock(url => {
+      if (url.pathname.endsWith('/config')) return { code: '0', data: [{ perm: 'read_only' }] };
+      if (url.pathname.endsWith('/positions') || url.pathname.endsWith('/bills-archive')) return { code: '0', data: [] };
+      assert.ok(url.pathname.endsWith('/fills-history'));
+      const { start, end } = historyBounds(url, 'okx', clock);
+      return { code: '0', data: url.searchParams.get('instId') === symbol && time >= start && time <= end
+        ? [{ billId: '1', instId: symbol, ts: String(time), side: 'buy', posSide: 'net', fillSz: '1', fillPx: price, fillPnl: '0', fee: '-0.1', feeCcy: 'USDT' }] : [] };
+    });
+    const service = () => createFillsService({ now: () => clock, fetcher: venue.fetcher,
+      fills: (credentials, product, request, options) => readFills(credentials, product, request, { ...options, spacing: false }) });
+    let fills = service();
+    const read = () => fills.read(() => db, f.unseal);
+    const rawAt = () => db.prepare('SELECT data FROM asset_history_windows WHERE instrument=? AND source=? AND start<=? AND end>=?')
+      .bind(symbol, 'okx-fills', time, time).get<{ data: string }>()?.data;
+    const cycle = (fetcher: typeof fetch) => readPositionCycle(okx, 'SWAP', { position: { ...held('1'), pnlCurrency: 'USDT' }, siblings: [], snapshotAt: clock },
+      { now: () => clock, spacing: false, fetcher, history: accountHistory(() => db, 'okx', revision, 'SWAP', () => true) });
+    const waiting = deferred<void>(), arrived = deferred<void>();
+    let pending: ReturnType<typeof cycle> | undefined;
+    try {
+      await read(); await fills.idle(); assert.equal(scope(await read()).fills[0].price, '80');
+      assert.equal(rawAt(), undefined, 'the initial observation is still in the overlap');
+      clock += 5 * minute; price = '999';
+      pending = cycle(async (input, init) => { arrived.resolve(); await waiting.promise; return venue.fetcher(input, init); });
+      await arrived.promise;
+      if (alreadyStored) { assert.equal((await cycle(venue.fetcher)).status, 'complete'); assert.match(rawAt()!, /999/); }
+      db.prepare('CREATE TABLE suspect_writes(value INTEGER)').run();
+      db.prepare("CREATE TRIGGER detect_suspect AFTER INSERT ON asset_history_windows WHEN instr(NEW.data,'999')>0 BEGIN INSERT INTO suspect_writes VALUES(1); END").run();
+      await read(); await fills.idle();
+      const rejected = scope(await read());
+      assert.equal(rejected.status, 'error'); assert.match(rejected.error!, /冲突/); assert.equal(rejected.fills[0].price, '80');
+      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM suspect_writes').get<{ n: number }>()!.n, 0, 'the display must verify immutable fields before saving a raw window');
+      assert.equal(rawAt(), undefined);
+      assert.ok(db.prepare("SELECT 1 FROM asset_history_windows WHERE instrument='BZ-USDT-SWAP'").get(), 'another contract stays covered');
+      waiting.resolve(); assert.equal((await pending).status, 'unavailable'); assert.equal(rawAt(), undefined);
+      fills.close(); db.close(); db = openAssetDb(file, { mode: 'service' });
+      price = '80'; venue.calls.length = 0; fills = service();
+      assert.equal(scope(await read()).fills.length, 0); await fills.idle();
+      const restored = scope(await read());
+      assert.equal(restored.status, 'live'); assert.equal(restored.fills[0].price, '80');
+      assert.ok(venue.calls.some(url => url.pathname.endsWith('/fills-history') && url.searchParams.get('instId') === symbol
+        && historyBounds(url, 'okx', clock).start <= time && historyBounds(url, 'okx', clock).end >= time));
+    } finally { waiting.resolve(); await pending; fills.close(); db.close(); await rm(dir, { recursive: true, force: true }); }
+  });
 });
 
 test('skew retries after 30 seconds reuse complete history while replay stays unknown', async t => {
@@ -418,7 +475,8 @@ test('a key that fails the read-only check reads no history, drops every stored 
   const f = fixture(); t.after(() => f.database.close()); await f.save();
   let denied = false, offline = false, historyReads = 0, offlineReads = 0;
   const service = createFillsService({ now: () => clock,
-    read: async () => { if (offline) { offlineReads++; throw new Error('network'); } if (denied) throw new PositionsPermissionError(); return [held('1')]; },
+    permission: async () => { if (offline) { offlineReads++; throw new Error('network'); } if (denied) throw new PositionsPermissionError(); },
+    read: async () => [held('1')],
     fills: async () => { if (offline) throw new Error('network'); historyReads++; return [fill('1', at - minute - 1, 'buy', '1')]; } });
   let clock = at;
   await service.read(() => f.database, f.unseal); await service.idle();
@@ -444,6 +502,163 @@ test('a key that fails the read-only check reads no history, drops every stored 
   const cold = scope(await restarted.read(() => f.database, f.unseal)); await restarted.idle();
   assert.deepEqual(cold.fills, []); assert.equal(historyReads, before);
   assert.equal(scope(await restarted.read(() => f.database, f.unseal)).error, FILLS_PERMISSION);
+});
+
+test('a positions denial clears both warm fill markets and their disk rows even when a fill snapshot is still pending', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'tp-warm-revocation-')), file = path.join(root, 'asset.sqlite'), f = fixture(file);
+  let db = f.database, clock = at, pause = false, offline = false, price = '80';
+  await f.save(okx);
+  const source = () => db;
+  const unseal = (value: string, context: string) => value === 'replacement' ? { ...okx, apiKey: 'replacement-key' } : f.unseal(value, context);
+  const arrived = deferred<void>(), release = deferred<void>(), delayed = deferred<void>(), resume = deferred<void>();
+  const venue = mock(async url => {
+    if (url.pathname.endsWith('/config')) {
+      if (offline) throw new Error('network');
+      return { code: '0', data: [{ perm: 'read_only' }] };
+    }
+    if (url.pathname.endsWith('/positions')) {
+      if (pause) { arrived.resolve(); await release.promise; }
+      return { code: '0', data: [] };
+    }
+    assert.ok(url.pathname.endsWith('/fills-history'));
+    const symbol = url.searchParams.get('instId'), { start, end } = historyBounds(url, 'okx', clock), time = at - day;
+    return { code: '0', data: ['CL-USDT-SWAP', 'SKHY-USDT-SWAP'].includes(symbol!) && time >= start && time <= end
+      ? [{ instId: symbol, billId: '1', ts: String(time), side: 'buy', posSide: 'net', fillSz: '1', fillPx: price, fillPnl: '0', fee: '-0.1', feeCcy: 'USDT' }] : [] };
+  });
+  const fillService = (fetcher = venue.fetcher) => createFillsService({ now: () => clock, fetcher,
+    fills: (credentials, product, request, options) => readFills(credentials, product, request, { ...options, spacing: false }) });
+  const deny = () => Response.json({ code: '0', data: [{ perm: 'read_only,trade' }] });
+  let fills = fillService(), observer = fillService(), positions = createPositionsService({ now: () => clock, fetcher: async () => deny() });
+  const markets = ['oil', 'hynix'] as const;
+  const disk = () => db.prepare("SELECT scope,revision FROM fill_cache WHERE account='okx' ORDER BY scope").rows<{ scope: string; revision: string }>();
+  try {
+    for (const market of markets) {
+      await fills.read(source, unseal, market); await fills.idle();
+      assert.equal(scope(await fills.read(source, unseal, market)).fills[0]?.price, '80');
+      assert.equal(scope(await observer.read(source, unseal, market)).fills[0]?.price, '80');
+    }
+    assert.equal(disk().length, markets.length);
+    assert.ok(db.prepare('SELECT 1 FROM asset_history_windows').get());
+    clock += 5 * minute; pause = true;
+    await fills.read(source, unseal); await arrived.promise;
+    await positions.read(source, unseal); await positions.idle();
+    assert.deepEqual(disk(), []); assert.equal(db.prepare('SELECT 1 FROM asset_history_windows').get(), null);
+    for (const service of [fills, observer]) for (const market of markets) {
+      const report = scope(await service.read(source, unseal, market));
+      assert.deepEqual([report.status, report.error, report.fetchedAt, report.coverageStart, report.coverageEnd, report.fills], ['error', FILLS_PERMISSION, null, null, null, []]);
+    }
+    release.resolve(); await fills.idle();
+    assert.deepEqual(disk(), []);
+    const calls = venue.calls.filter(url => url.pathname.endsWith('/fills-history')).length;
+    offline = true; clock += minute;
+    await fills.read(source, unseal); await fills.idle();
+    assert.equal(scope(await fills.read(source, unseal)).error, FILLS_PERMISSION);
+    assert.equal(venue.calls.filter(url => url.pathname.endsWith('/fills-history')).length, calls, 'an offline permission retry cannot grant access');
+    fills.close(); observer.close(); positions.close(); db.close();
+    db = openAssetDb(file, { mode: 'service' }); fills = fillService(async () => deny());
+    assert.deepEqual(scope(await fills.read(source, unseal, 'hynix')).fills, []); await fills.idle();
+    assert.equal(scope(await fills.read(source, unseal, 'hynix')).error, FILLS_PERMISSION);
+    assert.deepEqual(disk(), []);
+    positions = createPositionsService({ now: () => clock, fetcher: async () => { delayed.resolve(); await resume.promise; return deny(); } });
+    await positions.read(source, unseal); await delayed.promise;
+    db.prepare("UPDATE connections SET encrypted='replacement' WHERE exchange='okx'").run();
+    pause = false; offline = false; price = '81'; observer = fillService();
+    await observer.read(source, unseal); await observer.idle();
+    resume.resolve(); await positions.idle();
+    assert.equal(scope(await observer.read(source, unseal)).fills[0].price, '81');
+    assert.deepEqual(disk().map(row => row.revision), [revisionOf('replacement')], 'a delayed response for the old key cannot delete the replacement cache');
+  } finally {
+    release.resolve(); resume.resolve(); fills.close(); observer.close(); positions.close();
+    await Promise.all([fills.idle(), observer.idle(), positions.idle()]); db.close(); await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('an unconfirmed key cannot open persistent fills after a failed SQLite purge, eviction or restart', async t => {
+  for (const failure of ['read-only', 'writer lock']) await t.test(failure, async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'tp-fill-permission-')), file = path.join(directory, 'asset.sqlite');
+    const f = fixture(file); await f.save();
+    let db = f.database, writer: typeof db | undefined, clock = at, permission = 'read_only', holdingsOffline = false;
+    const markets = ['oil', 'hynix'] as const, database = () => db;
+    const venue = mock(url => {
+      if (url.pathname.endsWith('/config')) {
+        if (permission === 'offline') throw new Error('unreachable');
+        return { code: '0', data: [{ perm: permission }] };
+      }
+      if (url.pathname.endsWith('/positions')) {
+        if (holdingsOffline) throw new Error('positions unavailable');
+        return { code: '0', data: [] };
+      }
+      assert.ok(url.pathname.endsWith('/fills-history'));
+      const symbol = url.searchParams.get('instId'), { start, end } = historyBounds(url, 'okx', clock), time = at - day;
+      return { code: '0', data: ['CL-USDT-SWAP', 'SKHY-USDT-SWAP'].includes(symbol!) && start <= time && time <= end
+        ? [{ instId: symbol, billId: '1', ts: String(time), side: 'buy', posSide: 'net', fillSz: '1', fillPx: '80', fillPnl: '0', fee: '-0.1', feeCcy: 'USDT' }] : [] };
+    });
+    const startFills = () => createFillsService({ now: () => clock, fetcher: venue.fetcher,
+      fills: (c, scope, request, options) => readFills(c, scope, request, { ...options, spacing: false }) });
+    const startPositions = () => createPositionsService({ now: () => clock, fetcher: venue.fetcher });
+    let fills = startFills(), positions = startPositions();
+    const report = async (market: typeof markets[number]) => scope(await fills.read(database, f.unseal, market));
+    const cold = (value: Awaited<ReturnType<typeof report>>) => assert.deepEqual(
+      [value.fills, value.fetchedAt, value.coverageStart, value.coverageEnd, value.truncated], [[], null, null, null, false]);
+    const close = async () => { fills.close(); positions.close(); await Promise.all([fills.idle(), positions.idle()]); db.close(); };
+    const reopen = () => {
+      db = openAssetDb(file, failure === 'read-only' ? { readOnly: true } : { mode: 'service' });
+      db.prepare('PRAGMA busy_timeout=1').run();
+      fills = startFills(); positions = startPositions();
+    };
+    const rawCount = () => db.prepare('SELECT COUNT(*) AS n FROM asset_history_windows').get<{ n: number }>()!.n;
+    const displays = () => db.prepare('SELECT scope,data FROM fill_cache ORDER BY scope').rows<{ scope: string; data: string }>();
+    const permissions = () => venue.calls.filter(url => url.pathname.endsWith('/config')).length;
+    const history = () => venue.calls.filter(url => url.pathname.endsWith('/fills-history'));
+    try {
+      await Promise.all([...markets.map(report), positions.read(database, f.unseal)]);
+      await Promise.all([fills.idle(), positions.idle()]);
+      assert.equal(permissions(), 1, 'the two markets and positions shared one real permission endpoint');
+      for (const market of markets) assert.equal((await report(market)).fills[0].price, '80');
+      const persisted = displays(), covered = rawCount();
+      assert.equal(persisted.length, 2); assert.ok(covered > 0);
+      await close(); reopen(); venue.calls.length = 0;
+      cold(await report('oil')); await fills.idle();
+      assert.equal((await report('oil')).fills[0].price, '80');
+      assert.equal(permissions(), 1); assert.equal(history().length, 0, 'fresh display resumes after confirmation without a history request');
+      if (failure === 'writer lock') {
+        writer = openAssetDb(file, { mode: 'service' }); writer.prepare('BEGIN IMMEDIATE').run();
+      }
+      permission = 'read_only,trade';
+      await positions.read(database, f.unseal); await positions.idle();
+      const revoked = await report('oil'); cold(revoked); assert.equal(revoked.error, FILLS_PERMISSION);
+      assert.deepEqual(displays(), persisted); assert.equal(rawCount(), covered, 'the purge really failed');
+      permission = 'offline';
+      const unseen = await report('hynix'); cold(unseen); assert.equal(unseen.error, FILLS_PERMISSION);
+      await fills.idle();
+      clock += 16 * minute;
+      cold(await report('oil')); await fills.idle();
+      assert.equal((await report('oil')).error, FILLS_PERMISSION, 'evicting a scope cannot erase the denial');
+      assert.equal(history().length, 0); assert.deepEqual(displays(), persisted);
+      writer?.close(); writer = undefined;
+      await close(); reopen(); venue.calls.length = 0;
+      let privateReads = 0; const prepare = db.prepare;
+      db.prepare = sql => {
+        if (sql.includes('SELECT data FROM fill_cache') || sql.includes('SELECT start,end,data FROM asset_history_windows')) privateReads++;
+        return prepare(sql);
+      };
+      const [first] = await Promise.all([Promise.all(markets.map(report)), positions.read(database, f.unseal)]); first.forEach(cold);
+      await Promise.all([fills.idle(), positions.idle()]); for (const market of markets) cold(await report(market));
+      assert.equal(permissions(), 1); assert.equal(privateReads, 0); assert.equal(history().length, 0);
+      assert.deepEqual(displays(), persisted, 'a failed initial permission check preserves the durable cursor');
+      permission = 'read_only'; holdingsOffline = true; clock += minute; venue.calls.length = 0;
+      await Promise.all(markets.map(report)); await fills.idle();
+      for (const market of markets) {
+        const restored = await report(market);
+        assert.equal(restored.fills[0].price, '80'); assert.equal(restored.status, 'stale');
+      }
+      assert.equal(permissions(), 1); assert.ok(privateReads > 0); assert.ok(history().length > 0);
+      assert.ok(history().every(url => Number(url.searchParams.get('begin')) === at - 10 * minute),
+        'a confirmed read-only key recovers its cursors and reads only the tail even when holdings are offline');
+    } finally {
+      writer?.close(); await close(); await rm(directory, { recursive: true, force: true });
+    }
+  });
 });
 
 test('scope cap replays before trimming and response cap keeps the globally newest 5000', async t => {
@@ -731,6 +946,8 @@ test('stored history resumes incrementally after database reopen even while posi
     assert.equal(first.fills.length, 2); assert.ok(first.fills.every(row => row.positionBefore === null));
     service.close(); await service.idle(); database.close(); database = openAssetDb(filename);
     clock += 20_000; service = createFillsService(options);
+    assert.deepEqual(scope(await service.read(() => database, f.unseal, market)).fills, []);
+    await service.idle();
     const restored = scope(await service.read(() => database, f.unseal, market));
     assert.deepEqual(restored.fills, first.fills); assert.equal(restored.fetchedAt, first.fetchedAt);
     await service.idle(); assert.equal(reads, 1, 'opening stored history does not call the exchange before its retry time');

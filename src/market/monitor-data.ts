@@ -73,9 +73,13 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
       case 'monitor.oil.quote': none(input); return readers.oilQuote(signal);
       case 'monitor.hynix.quote': none(input); return readers.hynixQuote(signal);
       case 'monitor.anthropic.candles': {
-        const p = fields(input, ['starts', 'at']), at = roundTime(p.at), starts = fields(p.starts, [...ANTHROPIC_LEG_KEYS]);
-        for (const key of ANTHROPIC_LEG_KEYS) if (timestamp(starts[key]) > at) throw new Error('K 线回补范围无效');
-        return readers.anthropicCandles(starts as AnthropicCandleStarts, at, signal);
+        const p = fields(input, ['starts', 'at', 'ends']), at = roundTime(p.at), starts = fields(p.starts, [...ANTHROPIC_LEG_KEYS]);
+        const ends = p.ends === undefined ? undefined : fields(p.ends, [...ANTHROPIC_LEG_KEYS]);
+        for (const key of ANTHROPIC_LEG_KEYS) {
+          const end = ends ? timestamp(ends[key]) : at;
+          if (timestamp(starts[key]) > end || end > at) throw new Error('K 线回补范围无效');
+        }
+        return readers.anthropicCandles(starts as AnthropicCandleStarts, at, signal, ends as AnthropicCandleStarts | undefined);
       }
       case 'monitor.oil.candles': {
         const p = fields(input, ['start', 'end']), start = timestamp(p.start), end = timestamp(p.end);
@@ -83,23 +87,21 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
         return readers.oilCandles(start, end, signal);
       }
       case 'monitor.hynix.candles': {
-        const p = fields(input, ['start', 'at']), at = roundTime(p.at), { start } = range(p, at);
-        return readers.hynixCandles(start, at, signal);
-      }
-      case 'monitor.hynix.funding':
-      case 'monitor.oil.funding': {
-        const p = fields(input, ['start', 'end', 'at']), at = roundTime(p.at), { start, end } = range(p, at);
-        if (end - start > (op === 'monitor.oil.funding' ? 400 : 60) * DAY) throw new Error('资金费回补范围无效');
-        return op === 'monitor.oil.funding' ? readers.oilFunding(start, end, at, signal) : readers.hynixFunding(start, end, at, signal);
+        const p = fields(input, ['start', 'at', 'end']), at = roundTime(p.at), { start, end } = range(p, at);
+        return readers.hynixCandles(start, at, signal, p.end === undefined ? undefined : end);
       }
       case 'monitor.variational.marks': none(input); return exchanges.publicVariational();
       case 'monitor.variational.funding': none(input); return readVariationalPublicFunding({ clock: now, fetcher: variationalFetch, signal });
       case 'monitor.exchange.quote':
-      case 'monitor.exchange.history': {
-        const p = fields(input, op.endsWith('.quote') ? ['market', 'exchange', 'hynix'] : ['market', 'exchange']);
+      case 'monitor.exchange.historyLeg': {
+        const p = fields(input, op.endsWith('.quote') ? ['market', 'exchange', 'hynix'] : ['market', 'exchange', 'side', 'range']);
         if ((p.market !== 'hynix' && p.market !== 'oil') || typeof p.exchange !== 'string' || p.exchange === 'variational' || !supportsExchange(p.market, p.exchange)) throw new Error('不支持的交易所');
         const exchange = p.exchange as Exchange;
-        if (op.endsWith('.history')) return exchanges.fundingHistory(p.market, exchange);
+        if (op.endsWith('.historyLeg')) {
+          const bounds = fields(p.range, ['from', 'to']), from = timestamp(bounds.from), to = timestamp(bounds.to);
+          if ((p.side !== 'left' && p.side !== 'right') || from > to || to > now() || to - from > (p.market === 'oil' && exchange === 'binance' ? 400 : 60) * DAY) throw Error('资金费回补范围无效');
+          return exchanges.rawFunding(p.market, exchange, p.side, { from, to }, signal);
+        }
         const saved = p.hynix == null ? null : fields(p.hynix, ['source', 'fetchedAt', 'adr', 'ordinary', 'equivalent', 'spread', 'premium', 'status', 'staleAfterMs', 'lastAttemptAt', 'lastError']);
         const quote = saved ? { ...validateHynixQuote(saved), status: saved.status === 'live' ? 'live' as const : 'snapshot' as const } : null;
         return exchanges.quote(p.market, exchange, quote);

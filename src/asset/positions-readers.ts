@@ -14,7 +14,8 @@ import { signAsterMessage } from '../aster/eip712.ts';
 import type { BinanceCredential, BybitCredential } from './sources/exchanges.ts';
 import type { OkxCredential } from './sources/okx.ts';
 import type { Position } from './positions-types.ts';
-import { absolute, decimal, isZero, multiplyDecimals, optionalDecimal, position, positionId, record, rows, text, timestamp, uniquePositions, POSITIONS_FAILED, POSITIONS_INVALID, PositionsPermissionError } from './positions-values.ts';
+import type { Credentials } from './validation.ts';
+import { absolute, binanceReadOnly, bybitReadOnly, decimal, isZero, multiplyDecimals, optionalDecimal, position, positionId, record, rows, text, timestamp, uniquePositions, POSITIONS_FAILED, POSITIONS_INVALID, PositionsPermissionError } from './positions-values.ts';
 
 type Fetcher = typeof fetch;
 type Json = Record<string, unknown>;
@@ -143,11 +144,28 @@ function normalizeLinear(data: unknown, metadata: unknown): Position[] {
 }
 
 export type BinanceScope = 'um' | 'pm-um' | 'cm' | 'pm-cm';
-export async function readBinancePositions(c: BinanceCredential, fetcher: Fetcher = fetch, signal?: AbortSignal, scope: BinanceScope = 'um'): Promise<Position[]> {
+async function binancePermission(c: BinanceCredential, fetcher: Fetcher, signal?: AbortSignal) {
   const permissions = record(await positionsGet('binance', c, '/sapi/v1/account/apiRestrictions', new URLSearchParams(), fetcher, signal));
-  const writes = ['enableWithdrawals', 'enableInternalTransfer', 'enableMargin', 'enableFutures', 'permitsUniversalTransfer', 'enableVanillaOptions', 'enableSpotAndMarginTrading'];
-  if (permissions.enableReading !== true || writes.some(key => permissions[key] !== false)
-    || ['enableFixApiTrade', 'enablePortfolioMarginTrading'].some(key => Object.hasOwn(permissions, key) && permissions[key] !== false)) throw new PositionsPermissionError();
+  if (!binanceReadOnly(permissions)) throw new PositionsPermissionError();
+}
+async function bybitPermission(c: BybitCredential, fetcher: Fetcher, signal?: AbortSignal) {
+  const info = record(await positionsGet('bybit', c, '/v5/user/query-api', new URLSearchParams(), fetcher, signal));
+  if (!bybitReadOnly(info.readOnly)) throw new PositionsPermissionError();
+}
+async function okxPermission(c: OkxCredential, fetcher: Fetcher, signal?: AbortSignal) {
+  const config = rows(await positionsGet('okx', c, '/api/v5/account/config', new URLSearchParams(), fetcher, signal));
+  if (config.length !== 1 || config[0].perm !== 'read_only') throw new PositionsPermissionError();
+}
+export async function verifyAssetPermission(c: Credentials, fetcher: Fetcher, signal: AbortSignal) {
+  switch (c.exchange) {
+    case 'binance': return binancePermission(c, fetcher, signal);
+    case 'bybit': return bybitPermission(c, fetcher, signal);
+    case 'okx': return okxPermission(c, fetcher, signal);
+    default: throw new Error(POSITIONS_INVALID);
+  }
+}
+export async function readBinancePositions(c: BinanceCredential, fetcher: Fetcher = fetch, signal?: AbortSignal, scope: BinanceScope = 'um', authorized?: () => void): Promise<Position[]> {
+  if (authorized) authorized(); else await binancePermission(c, fetcher, signal);
   const coinMargined = scope === 'cm' || scope === 'pm-cm', portfolioMargin = scope.startsWith('pm-');
   const path = portfolioMargin ? '/papi/v1/' + (coinMargined ? 'cm' : 'um') + '/positionRisk' : coinMargined ? '/dapi/v1/positionRisk' : '/fapi/v3/positionRisk';
   const data = await positionsGet('binance', c, path, new URLSearchParams(), fetcher, signal);
@@ -179,9 +197,8 @@ function normalizeBinanceInverse(data: unknown, metadata: unknown): Position[] {
 }
 
 export type BybitScope = 'linear-usdt' | 'linear-usdc' | 'inverse' | 'option';
-export async function readBybitPositions(c: BybitCredential, scope: BybitScope, fetcher: Fetcher = fetch, signal?: AbortSignal): Promise<Position[]> {
-  const info = record(await positionsGet('bybit', c, '/v5/user/query-api', new URLSearchParams(), fetcher, signal));
-  if (Number(info.readOnly) !== 1) throw new PositionsPermissionError();
+export async function readBybitPositions(c: BybitCredential, scope: BybitScope, fetcher: Fetcher = fetch, signal?: AbortSignal, authorized?: () => void): Promise<Position[]> {
+  if (authorized) authorized(); else await bybitPermission(c, fetcher, signal);
   const category = scope.startsWith('linear-') ? 'linear' : scope;
   const settleCoin = scope === 'linear-usdt' ? 'USDT' : scope === 'linear-usdc' ? 'USDC' : undefined;
   const params = new URLSearchParams({ category, limit: '200', ...(settleCoin ? { settleCoin } : {}) });
@@ -217,9 +234,8 @@ export async function readBybitPositions(c: BybitCredential, scope: BybitScope, 
   return uniquePositions(result);
 }
 
-export async function readOkxPositions(c: OkxCredential, scope: 'SWAP' | 'FUTURES', fetcher: Fetcher = fetch, signal?: AbortSignal): Promise<Position[]> {
-  const config = rows(await positionsGet('okx', c, '/api/v5/account/config', new URLSearchParams(), fetcher, signal));
-  if (config.length !== 1 || config[0].perm !== 'read_only') throw new PositionsPermissionError();
+export async function readOkxPositions(c: OkxCredential, scope: 'SWAP' | 'FUTURES', fetcher: Fetcher = fetch, signal?: AbortSignal, authorized?: () => void): Promise<Position[]> {
+  if (authorized) authorized(); else await okxPermission(c, fetcher, signal);
   const data = rows(await positionsGet('okx', c, '/api/v5/account/positions', new URLSearchParams({ instType: scope }), fetcher, signal));
   const metadata = new Map<string, Json>(), result: Position[] = [];
   for (const row of data) {

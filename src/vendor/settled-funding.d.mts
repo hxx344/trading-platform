@@ -7,7 +7,6 @@ export const OIL_FUNDING_MS: number;
 export const OIL_FIRST_SETTLEMENT: number;
 export const HYNIX_FUNDING_MS: number;
 export const HYNIX_FIRST_SETTLEMENT: number;
-export const FUNDING_RESUME_MS: number;
 
 /** One oil settlement (`time` = the four-hour grid point), each leg's settled rate or null when that leg has none. */
 export interface OilFundingRow { time: number; brent: number | null; wti: number | null }
@@ -20,10 +19,13 @@ export function validateHynixFundingRows(rows: unknown, fetchedAt: string): Hyni
 export function fetchOilFundingHistory(symbol: string, startTime: number, endTime: number, options?: { fetcher?: FundingFetcher; timeout?: number; pageSize?: number }): Promise<unknown[]>;
 export function pairHynixFunding(adrRecords: readonly unknown[], ordinaryRecords: readonly unknown[], now: number): HynixFundingRow[];
 export function fetchHynixFundingRecords(coin: string, startTime: number, endTime: number, options?: { fetcher?: FundingFetcher; timeout?: number }): Promise<{ coin: string; time: number; fundingRate: number }[]>;
-export function fundingStart<Row extends { time: number }>(rows: readonly Row[], options: { first: number; intervalMs: number; legs: readonly (keyof Row & string)[]; cutoff: number; full: boolean; gapSince?: number }): number;
 export function mergeFundingRows<Row extends { time: number }>(previous: readonly Row[], fetched: readonly Row[], legs: readonly (keyof Row & string)[]): Row[];
-export function fetchOilFunding(startTime: number, options: { fetcher: FundingFetcher; timeout?: number; now: number; endTime?: number }): Promise<OilFundingRow[]>;
-export function fetchHynixFunding(startTime: number, options: { fetcher: FundingFetcher; timeout?: number; now: number; endTime?: number }): Promise<HynixFundingRow[]>;
+import type { FundingFact, FundingSide, FundingHistoryRange } from './exchange-funding-history.mjs';
+type FundingFactReader = (side: FundingSide, range: FundingHistoryRange, options: { fetcher: FundingFetcher; timeout?: number }) => Promise<FundingFact[]>;
+export const fetchOilFundingFacts: FundingFactReader;
+export const fetchHynixFundingFacts: FundingFactReader;
+export function projectOilFunding(left: FundingFact[], right: FundingFact[], at: number): OilFundingRow[];
+export function projectHynixFunding(left: FundingFact[], right: FundingFact[], at: number): HynixFundingRow[];
 
 export interface FundingChartPoint {
   time: number; shortRate: number | null; longRate: number | null; shortCumulative: number | null; longCumulative: number | null;

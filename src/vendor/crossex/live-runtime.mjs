@@ -4,6 +4,7 @@ import { AppError } from './model.mjs';
 import { D } from './money.mjs';
 import { createGateClient, GATE_EXCHANGES } from './live-client.mjs';
 import { capacityRequest, capacityResult, calculateCapacity } from './open-capacity.mjs';
+import { syncAccountBook } from './account-book-sync.mjs';
 import { canonicalBase, isBaseBlocked } from './asset-identity.mjs';
 import { bindPositionAction, positionKey, positionDirection, validatePositionLegs } from './position-actions.mjs';
 
@@ -51,7 +52,8 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     CREATE TABLE IF NOT EXISTS live_requests (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, kind TEXT NOT NULL, result TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS live_supplemental (version INTEGER PRIMARY KEY, json TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS live_trades (version INTEGER NOT NULL, transaction_id TEXT NOT NULL, created_at INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY(version,transaction_id));
-    CREATE TABLE IF NOT EXISTS live_account_book (version INTEGER NOT NULL, id TEXT NOT NULL, created_at INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY(version,id));`);
+    CREATE TABLE IF NOT EXISTS live_account_book (version INTEGER NOT NULL, id TEXT NOT NULL, created_at INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY(version,id));
+    CREATE INDEX IF NOT EXISTS live_account_book_created ON live_account_book(version,created_at DESC);`);
   const readSingleton = table => { const row = store.prepare(`SELECT json FROM ${table} WHERE singleton=1`).get(); return row ? JSON.parse(row.json) : null; };
   const putSingleton = (table, value) => store.prepare(`INSERT INTO ${table} VALUES (1,?) ON CONFLICT(singleton) DO UPDATE SET json=excluded.json`).run(JSON.stringify(value));
   const connectionRecord = () => readSingleton('live_connection');
@@ -425,14 +427,22 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (!record?.enabled || !owns() || !force && clock() - supplementalAttempt < 30000) return Promise.resolve();
     const client = getClient(record), startedAt = clock(), previous = supplementalRecord(record.version);
     supplementalAttempt = startedAt;
-    const current = () => owns() && connectionRecord()?.version === record.version;
+    const current = () => {
+      if (!owns()) return false;
+      const connection = connectionRecord();
+      return connection?.enabled && connection.version === record.version && connection.accountUid === record.accountUid;
+    };
+    const deadline = performance.now() + requestTimeoutMs;
+    const ledger = syncAccountBook({ record, previous, now: startedAt, current, store, verifyUid, timeLeft: () => remaining(deadline),
+      read: query => withinDeadline(() => client.getAccountBook(query), deadline),
+      save: values => saveSupplemental(record.version, values),
+    }).catch(() => { if (current()) saveSupplemental(record.version, { accountBookError: '补充账户流水暂未更新，保留已核实记录' }); });
     const parts = [
       ['recentTrades', () => client.getTrades({ from: Math.max(0, (previous.recentTradesAsOf || startedAt - 86400000) - 60000), to: startedAt })],
-      ['accountBook', () => client.getAccountBook({ limit: 200 })],
       ['fees', () => client.getFees()],
       ['adl', () => client.getAdlRanks([...new Set(cacheRecord().positions.filter(p => !D(p.position_qty).isZero()).map(p => p.symbol))])],
     ];
-    supplementalFlight = Promise.all(parts.map(async ([name, read]) => {
+    const details = parts.map(async ([name, read]) => {
       try {
         const values = await bounded(Promise.resolve().then(read));
         if (!Array.isArray(values)) throw new Error('INVALID_SUPPLEMENTAL');
@@ -452,17 +462,13 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
             store.prepare('INSERT INTO live_trades VALUES (?,?,?,?) ON CONFLICT(version,transaction_id) DO UPDATE SET json=excluded.json')
               .run(record.version, String(trade.transaction_id), Number(trade.create_time) || 0, JSON.stringify(completeTrade));
           }
-          if (name === 'accountBook') for (const entry of values) {
-            if (!entry.id) throw new Error('INVALID_ACCOUNT_ENTRY');
-            store.prepare('INSERT INTO live_account_book VALUES (?,?,?,?) ON CONFLICT(version,id) DO UPDATE SET json=excluded.json')
-              .run(record.version, String(entry.id), Number(entry.create_time) || 0, JSON.stringify(entry));
-          }
           saveSupplemental(record.version, { ...(name === 'fees' || name === 'adl' ? { [name]: values } : {}), [`${name}AsOf`]: startedAt, [`${name}Error`]: null });
         });
       } catch {
         if (current()) saveSupplemental(record.version, { [`${name}Error`]: '补充账户资料暂未更新，保留已核实记录' });
       }
-    })).finally(() => { supplementalFlight = null; });
+    });
+    supplementalFlight = Promise.all([ledger, ...details]).finally(() => { supplementalFlight = null; });
     return supplementalFlight;
   }
   async function refreshInternal({ deadline = Infinity, reconcile = true, includeView = true } = {}) {

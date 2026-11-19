@@ -2,6 +2,7 @@
 // Changes: split out of exchanges.ts (Aster lives in ./aster.ts, readJson in ./http.ts, quotes in ./quotes.ts);
 // signing imports point at src/vendor. Logic, hosts, read-only path allowlists and messages are unchanged.
 import type { Balance } from '../types.ts';
+import { binanceReadOnly, bybitReadOnly, PositionsPermissionError } from '../positions-values.ts';
 import { binanceSignedQuery } from '../../vendor/binance.mjs';
 import { bybitAuthHeaders } from '../../vendor/bybit.mjs';
 import { finite, readJson, type Fetcher, type Json } from './http.ts';
@@ -19,7 +20,7 @@ export async function bybitGet(c: BybitCredential, path: string, query: string, 
 }
 export async function syncBybit(c: BybitCredential, prices: Record<string,Quote>, fetcher: Fetcher = fetch): Promise<{total:number;details:Balance[]}> {
   const info = await bybitGet(c, '/v5/user/query-api', '', fetcher);
-  if (Number(info.readOnly) !== 1) throw new Error('此 Bybit API 不是只读密钥，请重新创建只读 API');
+  if (!bybitReadOnly(info.readOnly)) throw new PositionsPermissionError('此 Bybit API 不是只读密钥，请重新创建只读 API');
   const [wallet, funding] = await Promise.all([
     bybitGet(c,'/v5/account/wallet-balance','accountType=UNIFIED',fetcher),
     bybitGet(c,'/v5/asset/transfer/query-account-coins-balance','accountType=FUND',fetcher),
@@ -40,8 +41,6 @@ export async function syncBybit(c: BybitCredential, prices: Record<string,Quote>
 }
 export type BinanceCredential = { apiKey: string; apiSecret: string };
 const BINANCE_READ_PATHS = new Set(['/sapi/v1/account/apiRestrictions', '/sapi/v1/asset/wallet/balance']);
-const BINANCE_CORE_WRITE_PERMISSIONS = ['enableWithdrawals', 'enableInternalTransfer', 'enableMargin', 'enableFutures', 'permitsUniversalTransfer', 'enableVanillaOptions', 'enableSpotAndMarginTrading'];
-const BINANCE_NEW_WRITE_PERMISSIONS = ['enableFixApiTrade', 'enablePortfolioMarginTrading'];
 export async function binanceGet(c: BinanceCredential, path: string, fetcher: Fetcher = fetch): Promise<unknown> {
   if (!BINANCE_READ_PATHS.has(path)) throw new Error('仅支持 Binance 只读账户接口');
   if (typeof c?.apiKey !== 'string' || !c.apiKey.trim() || typeof c?.apiSecret !== 'string' || !c.apiSecret.trim()) throw new Error('Binance API Key 与 Secret 不能为空');
@@ -69,10 +68,7 @@ export async function syncBinance(c: BinanceCredential, prices: Record<string, Q
   const quoteAt = typeof quote?.at === 'string' ? Date.parse(quote.at) : NaN;
   if (typeof quote?.price !== 'number' || !Number.isFinite(quote.price) || quote.price <= 0 || !Number.isFinite(quoteAt) || Date.now() - quoteAt > 900000 || quoteAt - Date.now() > 60000) throw new Error('USDT 美元行情无效或已过期；已保留上次数据');
   const info = await binanceGet(c, '/sapi/v1/account/apiRestrictions', fetcher) as Json;
-  if (Array.isArray(info) || info.enableReading !== true || BINANCE_CORE_WRITE_PERMISSIONS.some(field => info[field] !== false)) throw new Error('此 Binance API 无法确认只读权限，请使用仅启用读取的 API');
-  // Older responses omit FIX/portfolio fields. Missing new fields are accepted, but present
-  // write permissions must be strictly false; FIX read-only permission may be true or false.
-  if (BINANCE_NEW_WRITE_PERMISSIONS.some(field => Object.hasOwn(info, field) && info[field] !== false) || (Object.hasOwn(info, 'enableFixReadOnly') && typeof info.enableFixReadOnly !== 'boolean')) throw new Error('此 Binance API 无法确认只读权限，请使用仅启用读取的 API');
+  if (Array.isArray(info) || !binanceReadOnly(info)) throw new PositionsPermissionError('此 Binance API 无法确认只读权限，请使用仅启用读取的 API');
   const wallets = await binanceGet(c, '/sapi/v1/asset/wallet/balance', fetcher);
   if (!Array.isArray(wallets) || wallets.length === 0) throw new Error('Binance 钱包数据不完整；已保留上次数据');
   const names = new Set<string>();

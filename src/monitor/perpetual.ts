@@ -195,6 +195,7 @@ export function createPerpetualMonitor(options: PerpetualOptions = {}) {
   const fundingFetch = fundingOptions?.fetchImpl ?? fetchImpl;
   const fundingHistory = createPerpetualFundingHistoryService({
     getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket,
+    getQuote: (exchange, symbol) => quotes.get(`${exchange}:${symbol}`),
     store: cache, clock, reader: remote?.funding ?? createPerpetualFundingReader({ clock, requestSpacingMs: 350, ...(fundingFetch ? { fetchImpl: fundingFetch } : {}) }),
   });
   const priceFetch = priceOptions?.fetchImpl ?? fetchImpl;

@@ -6,4 +6,4 @@ export interface CrossexTerminalMarket {
   stop(): Promise<void>;
 }
 export { createCandleReader } from './candle-reader.mjs';
-export function createTerminalMarket(options: { market: CrossexMarket; depthReader?: unknown; candleReader?: unknown; publicFeed?: import('./terminal-feed.mjs').TerminalFeed; WebSocketImpl?: unknown; clock?: () => number }): CrossexTerminalMarket;
+export function createTerminalMarket(options: { market: CrossexMarket; store?: import('../../crossex/store.ts').CrossexStore; depthReader?: unknown; candleReader?: unknown; publicFeed?: import('./terminal-feed.mjs').TerminalFeed; WebSocketImpl?: unknown; clock?: () => number }): CrossexTerminalMarket;

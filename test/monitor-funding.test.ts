@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import {
-  FUNDING_RESUME_MS, HYNIX_FIRST_SETTLEMENT, OIL_FIRST_SETTLEMENT, analyzeSettledFunding, fundingStart, mergeFundingRows, pairHynixFunding, pairOilFunding,
+  HYNIX_FIRST_SETTLEMENT, OIL_FIRST_SETTLEMENT, analyzeSettledFunding, mergeFundingRows, pairHynixFunding, pairOilFunding,
   validateOilFundingRows, type OilFundingRow,
 } from '../src/vendor/settled-funding.mjs';
 import { createBinanceGate } from '../src/vendor/anthropic-market.mjs';
@@ -71,16 +71,8 @@ test('结算配对：原油只收 4 小时整点后 60 秒内的常规结算，�
   assert.throws(() => pairHynixFunding([record('xyz:SKHX', h)], [], h + DAY), /Unexpected/);
 });
 
-test('续读起点与合并：没有记录从首个结算读起（不早于保留期）；平时从最后一次结算前 48 小时；整轮补读从最早的缺口或单腿结算；新读到的空腿不覆盖已存费率', () => {
+test('合并新结算时保留先前已存的一腿', () => {
   const t = OIL_FIRST_SETTLEMENT + 100 * FOUR, legs = ['brent', 'wti'] as const;
-  const options = { first: OIL_FIRST_SETTLEMENT, intervalMs: FOUR, legs, cutoff: 0, full: false };
-  assert.equal(fundingStart([], options), OIL_FIRST_SETTLEMENT);
-  assert.equal(fundingStart([], { ...options, cutoff: t }), t, '保留期晚于首个结算');
-  const rows = [0, 1, 3, 4, 20].map(i => ({ time: t + i * FOUR, brent: 0.0001, wti: i === 4 ? null : 0.0002 }));
-  assert.equal(fundingStart(rows, options), t + 20 * FOUR - FUNDING_RESUME_MS);
-  assert.equal(fundingStart(rows, { ...options, full: true }), t + 2 * FOUR, '整轮补读：缺口在第 2 次结算');
-  assert.equal(fundingStart(rows.filter(row => row.time !== t + 3 * FOUR).slice(2), { ...options, full: true }), t + 4 * FOUR, '整轮补读：单腿结算');
-  assert.equal(fundingStart(rows.slice(-1), { ...options, full: true }), t + 20 * FOUR - FUNDING_RESUME_MS, '没有缺口时与平时相同');
   const stored: OilFundingRow[] = [{ time: t, brent: 0.0001, wti: 0.0002 }], fetched: OilFundingRow[] = [{ time: t, brent: null, wti: 0.0003 }, { time: t - FOUR, brent: 0.0004, wti: null }];
   assert.deepEqual(mergeFundingRows(stored, fetched, legs),
     [{ time: t - FOUR, brent: 0.0004, wti: null }, { time: t, brent: 0.0001, wti: 0.0003 }]);
@@ -103,16 +95,17 @@ test('区间计算（手算）：净费率 = (A − B) ÷ 2，小时费率再除
   assert.deepEqual([day.firstTime, day.expectedHours, day.count], [t + 2 * FOUR, 6, 0]);
 });
 
-test('采集：原油首轮从首个结算回补（替身上市 30 天）、海力士分页读完；存入 monitor.sqlite；超过约 3 轮未更新标为快照；重启读回为快照，之后只从最后 48 小时读起', async () => {
+test('采集：分页及空段的检查点跨重启恢复；未到下次结算沿用原采集时间，超过应到时间标快照，补新时只查新段', async () => {
   const env = fundingEnv();
   try {
-    const oil = env.oil(), hynix = env.hynix();
+    const oil = env.oil(); let hynix = env.hynix();
     assert.deepEqual([oil.funding(), hynix.funding()], [null, null]);
     await oil.refreshFunding();
     // Hynix reads 60 days a round from its first settlement: the first segment lies before the stand-in listing (30 days
     // ago) and holds nothing, the second reaches into it but not to now (it ends an hour short: records carry milliseconds past the hour, the next segment starts at the bound), the third finishes.
     await hynix.refreshFunding();
     assert.equal(hynix.funding(), null);
+    hynix = env.hynix();
     await hynix.refreshFunding();
     assert.deepEqual([hynix.funding()!.complete, hynix.funding()!.rows.at(-1)!.time], [false, HYNIX_FIRST_SETTLEMENT + 2 * HYNIX_FUNDING_SPAN_MS - HOUR]);
     await hynix.refreshFunding();
@@ -130,24 +123,26 @@ test('采集：原油首轮从首个结算回补（替身上市 30 天）、海�
     const hourly = hynix.funding()!;
     assert.deepEqual([hourly.status, hourly.intervalHours, hourly.complete, hourly.rows[0]!.time, hourly.rows.at(-1)!.time, hourly.rows.length], ['live', 1, true, firstHynix, lastHynix, (lastHynix - firstHynix) / HOUR + 1]);
     assert.deepEqual([env.starts.skhy.length, env.venues.requests.get('settled:skhx')], [6, 6]);
-    assert.deepEqual([env.starts.skhy[0], env.starts.skhy[1], env.starts.skhy[4]], [HYNIX_FIRST_SETTLEMENT, HYNIX_FIRST_SETTLEMENT + HYNIX_FUNDING_SPAN_MS, HYNIX_FIRST_SETTLEMENT + 2 * HYNIX_FUNDING_SPAN_MS]);
+    assert.deepEqual([env.starts.skhy[0], env.starts.skhy[1], env.starts.skhy[4]], [HYNIX_FIRST_SETTLEMENT, HYNIX_FIRST_SETTLEMENT + HYNIX_FUNDING_SPAN_MS + 1, HYNIX_FIRST_SETTLEMENT + 2 * HYNIX_FUNDING_SPAN_MS + 2]);
     assert.deepEqual(plain(env.store.hynixFunding()), plain(hourly.rows));
     assert.deepEqual([monitorStatusLike(oil.status()), monitorStatusLike(hynix.status())], [[view.rows.length, null], [hourly.rows.length, null]]);
 
     env.clock += FUNDING_STALE_MS + 1;
-    assert.deepEqual([oil.funding()!.status, hynix.funding()!.status], ['snapshot', 'snapshot']);
+    assert.deepEqual([oil.funding()!.status, hynix.funding()!.status], ['live', 'live']);
     const again = env.oil();
-    assert.deepEqual([again.funding()!.status, again.funding()!.rows.length], ['snapshot', view.rows.length]);
     env.clear();
-    env.clock += FOUR;
     await again.refreshFunding();
-    assert.deepEqual(env.starts.brent, [lastOil - FUNDING_RESUME_MS], '没有缺口：整轮补读也只从最后 48 小时读起');
+    assert.deepEqual([again.funding()!.status, again.funding()!.fetchedAt, env.starts.brent], ['live', view.fetchedAt, []]);
+    env.clock += FOUR;
+    assert.equal(again.funding()!.status, 'snapshot');
+    await again.refreshFunding();
+    assert.deepEqual(env.starts.brent, [START + 1], '查询边界来自已完成区间的最后一毫秒');
     assert.deepEqual([again.funding()!.status, again.funding()!.rows.length], ['live', view.rows.length + 1]);
   } finally { env.dispose(); }
 });
 const monitorStatusLike = (status: { fundingRows: number; fundingError: string | null }) => [status.fundingRows, status.fundingError];
 
-test('缺口：一腿缺的结算保留为单腿、计入缺失；只在启动后第一轮和之后每小时一轮从那里补读，补到后配齐', async () => {
+test('缺口：一腿缺的结算按小时补读该腿；已有另一腿、尚未到期的尾段都不重复请求', async () => {
   const env = fundingEnv();
   try {
     // Older than the two days every round reads again.
@@ -161,13 +156,13 @@ test('缺口：一腿缺的结算保留为单腿、计入缺失；只在启动�
     env.clear();
     env.clock += 5 * 60_000;
     await oil.refreshFunding();
-    const last = oil.funding()!.rows.at(-1)!.time;
-    assert.deepEqual(env.starts.wti, [last - FUNDING_RESUME_MS], '一小时内只续读最后 48 小时');
+    assert.deepEqual(env.starts.wti, [], '缺口尚未到重试时刻');
     env.venues.settledMissing.clear();
     env.clear();
     env.clock = START + FUNDING_GAP_RETRY_MS;
     await oil.refreshFunding();
     assert.deepEqual(env.starts.wti, [gap], '每小时一轮从单腿结算处补读');
+    assert.deepEqual(env.starts.brent, []);
     assert.deepEqual([oil.funding()!.coverage.pairedRows, oil.funding()!.rows.find(row => row.time === gap)!.wti], [oil.funding()!.rows.length, fakeSettledRate('wti', gap)]);
   } finally { env.dispose(); }
 });
@@ -179,7 +174,7 @@ test('失败：读取失败保留已存记录并说明原因（日志只记一�
     await oil.refreshFunding();
     const kept = oil.funding()!.rows.length;
     env.venues.down.add('settled');
-    env.clock += 5 * 60_000;
+    env.clock += FOUR;
     await oil.refreshFunding();
     await oil.refreshFunding();
     await hynix.refreshFunding();
@@ -192,6 +187,7 @@ test('失败：读取失败保留已存记录并说明原因（日志只记一�
     assert.deepEqual([oil.funding()!.status, env.logs.filter(line => line === '原油资金费读取已恢复').length], ['live', 1]);
 
     env.venues.oilStatus = 429;
+    env.clock += FOUR;
     await oil.refreshFunding();
     env.venues.oilStatus = null;
     await oil.refreshFunding();
@@ -201,12 +197,11 @@ test('失败：读取失败保留已存记录并说明原因（日志只记一�
     // A failed write leaves memory with what is stored; the next round writes the same settlement again.
     const write = env.store.writeOilFunding;
     env.store.writeOilFunding = () => { throw new Error('disk full'); };
-    env.clock += FOUR;
     await oil.refreshFunding();
-    assert.deepEqual([oil.funding()!.rows.length, oil.funding()!.lastError], [kept, '资金费保存失败：monitor.sqlite 写入失败']);
+    assert.deepEqual([oil.funding()!.rows.length, oil.funding()!.lastError], [kept + 1, '资金费保存失败：monitor.sqlite 写入失败']);
     env.store.writeOilFunding = write;
     await oil.refreshFunding();
-    assert.deepEqual([oil.funding()!.rows.length, env.store.oilFunding().length, oil.funding()!.lastError], [kept + 1, kept + 1, null]);
+    assert.deepEqual([oil.funding()!.rows.length, env.store.oilFunding().length, oil.funding()!.lastError], [kept + 2, kept + 2, null]);
 
     // The round record is gone: the history cannot be trusted, so the next round rewrites the table.
     env.store.writeState(OIL_FUNDING_KEY, { other: 1 });
@@ -215,12 +210,12 @@ test('失败：读取失败保留已存记录并说明原因（日志只记一�
     assert.equal(reopened.funding(), null);
     assert.ok(env.logs.some(line => line.startsWith('原油资金费历史无法读回，将重新回补')));
     await reopened.refreshFunding();
-    assert.deepEqual([env.store.oilFunding().length, env.store.oilFunding()[0]!.time === OIL_FIRST_SETTLEMENT], [kept + 1, false]);
+    assert.deepEqual([env.store.oilFunding().length, env.store.oilFunding()[0]!.time === OIL_FIRST_SETTLEMENT], [kept + 2, false]);
     assert.equal(env.store.readState(HYNIX_FUNDING_KEY), null);
   } finally { env.dispose(); }
 });
 
-test('分段回补与缺口范围：一轮最多读 spanMs（海力士 60 天），分几轮续读完，未读完时标未完成；每小时整轮只补读最近 7 天内的缺口', async () => {
+test('分段回补：每轮最多读 spanMs，按真实毫秒续读；回补完后逐个复查历史缺口', async () => {
   const H = HOUR, first = Date.UTC(2026, 0, 1);
   let clock = first + 100 * DAY + 30 * 60_000;
   const calls: [number, number][] = [], missing = new Set<number>();
@@ -242,19 +237,21 @@ test('分段回补与缺口范围：一轮最多读 spanMs（海力士 60 天）
   assert.deepEqual(calls, [[first, first + 30 * DAY]]);
   assert.deepEqual([history.view()!.complete, history.view()!.rows.at(-1)!.time], [false, first + 30 * DAY]);
   for (let round = 0; round < 3; round++) { clock += 5 * 60_000; await history.refresh(); }
-  assert.deepEqual(calls.slice(1).map(([start]) => start), [first + 30 * DAY, first + 60 * DAY, first + 90 * DAY]);
+  assert.deepEqual(calls.slice(1).map(([start]) => start), [first + 30 * DAY + 1, first + 60 * DAY + 2, first + 90 * DAY + 3]);
   assert.deepEqual([history.view()!.complete, history.view()!.rows.at(-1)!.time, history.view()!.rows.length], [true, Math.floor(clock / H) * H, (Math.floor(clock / H) * H - first) / H + 1]);
 
-  // A gap older than seven days stays: the hourly round no longer reads from it; a recent one is read again.
+  // Start with the nearby hole. Once checked, the other missing slot gets its own bounded range.
   const old = first + 10 * DAY, recent = Math.floor(clock / H) * H - 3 * DAY;
   stored = stored.map(row => row.time === old || row.time === recent ? { ...row, b: null } : row);
   const reopened = createFundingHistory({ ...({} as Parameters<typeof createFundingHistory>[0]), name: '测试', key: 'test.funding', legs: ['a', 'b'], first, intervalMs: H, spanMs: 30 * DAY,
     read: () => stored, readState: () => state, write: () => 0, validate: rows => rows as never, fetch: async (start: number, end: number) => { calls.push([start, end]); return []; },
     reason: () => '失败', aborted: () => false, now: () => clock, log: () => undefined });
   calls.length = 0;
+  clock = first + 100 * DAY + 95 * 60_000;
+  await reopened.refresh(); // 先补新到期的一小时。
   await reopened.refresh();
   assert.ok(old < clock - FUNDING_GAP_LOOKBACK_MS && recent > clock - FUNDING_GAP_LOOKBACK_MS);
-  assert.deepEqual(calls, [[recent, Math.min(clock, recent + 30 * DAY)]]);
+  assert.deepEqual(calls.at(-1), [recent, recent + HOUR - 1]);
   assert.equal(HYNIX_FUNDING_SPAN_MS, 60 * DAY);
 });
 

@@ -4,6 +4,7 @@ import type { OkxCredential } from './sources/okx.ts';
 import { positionsGet } from './positions-readers.ts';
 import { decimal, record, rows, POSITIONS_FAILED, POSITIONS_INVALID } from './positions-values.ts';
 import { CYCLE_LOOKBACK_MS, sign } from './positions-cycle.ts';
+import type { AccountHistory } from './history-cache.ts';
 
 export const WEEK = 7 * 86_400_000;
 export const SNAPSHOT_SKEW_MS = 2_000;
@@ -15,7 +16,7 @@ const SPACING: Record<string, number> = {
 };
 export const TOO_MANY = '成交记录过多，未能统计本轮';
 export class CycleUnavailable extends Error {}
-export type HistoryOptions = { fetcher?: typeof fetch; signal?: AbortSignal; now?: () => number; spacing?: boolean };
+export type HistoryOptions = { fetcher?: typeof fetch; signal?: AbortSignal; now?: () => number; spacing?: boolean; history?: AccountHistory };
 export type HistoryContext = { now: () => number; get: (path: string, params: Record<string, string>) => Promise<unknown> };
 type Json = Record<string, unknown>;
 const lastCall = new Map<string, number>();
@@ -35,6 +36,7 @@ export function historyContext(exchange: 'binance' | 'bybit' | 'okx', credential
   return {
     now: options.now ?? Date.now,
     async get(path, params) {
+      options.history?.check();
       if (++used > MAX_REQUESTS) throw new CycleUnavailable(TOO_MANY);
       if (options.spacing !== false) {
         const key = exchange + path, at = Math.max(Date.now(), (lastCall.get(key) ?? -Infinity) + (SPACING[path] ?? 0));
@@ -42,6 +44,7 @@ export function historyContext(exchange: 'binance' | 'bybit' | 'okx', credential
         if (at > Date.now()) await sleep(at - Date.now(), options.signal);
       }
       if (options.signal?.aborted) throw new Error(POSITIONS_FAILED);
+      options.history?.check();
       return positionsGet(exchange, credential, path, new URLSearchParams(params), options.fetcher ?? fetch, options.signal);
     },
   };
@@ -98,28 +101,33 @@ export function latestOpenWindows<T>(start: number, end: number, latestWindow: n
 /** A full Binance page does not prove coverage; split until both inclusive subwindows fit. */
 export async function binanceRange(ctx: HistoryContext, path: string, params: Record<string, string>, start: number, end: number, depth = 0, openEnd = false): Promise<Json[]> {
   const list = rows(await ctx.get(path, { ...params, startTime: String(start), ...(openEnd ? {} : { endTime: String(end) }), limit: '1000' }));
+  if (list.length > 1000 || list.some(row => millis(row.time) < start || (!openEnd && millis(row.time) > end))) throw new Error(POSITIONS_INVALID);
   if (list.length < 1000) return list;
   if (depth >= MAX_SPLITS || end - start < 2) throw new CycleUnavailable(TOO_MANY);
   const middle = Math.floor((start + end) / 2);
   return [...await binanceRange(ctx, path, params, middle + 1, end, depth + 1, openEnd), ...await binanceRange(ctx, path, params, start, middle, depth + 1)];
 }
-export async function bybitPages(ctx: HistoryContext, params: Record<string, string>, collect: (row: Json) => void, strictCursor = false) {
+export async function bybitPages(ctx: HistoryContext, params: Record<string, string>, collect: (row: Json) => void) {
   const cursors = new Set<string>();
   let cursor = '';
   do {
     const data = record(await ctx.get('/v5/account/transaction-log', { ...params, limit: '50', ...(cursor ? { cursor } : {}) }));
-    if (strictCursor && typeof data.nextPageCursor !== 'string') throw new Error(POSITIONS_INVALID);
-    for (const row of rows(data.list)) collect(row);
-    cursor = typeof data.nextPageCursor === 'string' ? data.nextPageCursor : '';
+    if (typeof data.nextPageCursor !== 'string') throw new Error(POSITIONS_INVALID);
+    const page = rows(data.list);
+    if (page.length > 50) throw new Error(POSITIONS_INVALID);
+    for (const row of page) collect(row);
+    cursor = data.nextPageCursor;
     if (cursor && (cursors.has(cursor) || cursor.length > 4096)) throw new Error(POSITIONS_INVALID);
     cursors.add(cursor);
   } while (cursor);
 }
-export function okxFillPages(ctx: HistoryContext, instId: string, start: number, end?: number) {
-  let cursor = '', exhausted = false;
+export function okxHistoryPages(ctx: HistoryContext, instId: string, start: number, end: number | null, funding: boolean, after = '') {
+  let cursor = after, exhausted = false;
   return async () => {
     if (exhausted) return null;
-    const list = rows(await ctx.get('/api/v5/trade/fills-history', { instType: 'SWAP', instId, begin: String(start), ...(end === undefined ? {} : { end: String(end) }), limit: '100', ...(cursor ? { after: cursor } : {}) }));
+    const path = funding ? '/api/v5/account/bills-archive' : '/api/v5/trade/fills-history';
+    const list = rows(await ctx.get(path, { instType: 'SWAP', instId, ...(funding ? { type: '8' } : {}), begin: String(start), ...(end === null ? {} : { end: String(end) }), limit: '100', ...(cursor ? { after: cursor } : {}) }));
+    if (list.length > 100) throw new Error(POSITIONS_INVALID);
     for (const row of list) {
       const id = identifier(row.billId);
       if (!/^\d+$/.test(id) || (cursor && BigInt(id) >= BigInt(cursor)) || row.instId !== instId) throw new Error(POSITIONS_INVALID);

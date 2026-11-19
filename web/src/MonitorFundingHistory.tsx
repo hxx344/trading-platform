@@ -2,7 +2,7 @@ import { RefreshCw, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { EXCHANGE_CONTRACTS, EXCHANGE_NAMES, exchangeDefinition, type Exchange, type SpreadMarket } from '../../src/vendor/exchange-comparison.mjs';
 import {
-  HISTORY_PAGE_SIZE, HISTORY_REFRESH_MS, HISTORY_STALE_MS, HISTORY_WINDOW_MS, analyzeFundingRange, fundingRangeInput, parseFundingRangeInput,
+  HISTORY_PAGE_SIZE, HISTORY_REFRESH_MS, HISTORY_WINDOW_MS, analyzeFundingRange, fundingLegStale, fundingRangeInput, parseFundingRangeInput,
   validateExchangeFundingHistory, type ExchangeFundingHistory,
 } from '../../src/vendor/exchange-funding-history.mjs';
 import { date } from './MonitorChart.tsx';
@@ -62,7 +62,7 @@ export function FundingHistoryPanel({ id, market, selection, now, onClose, onExp
   const definition = exchangeDefinition(exchange, market);
   const contracts = EXCHANGE_CONTRACTS[market];
   const loading = !history && !error;
-  const stale = Boolean(history && (history.status === 'snapshot' || Date.parse(history.fetchedAt) < now - HISTORY_STALE_MS || error));
+  const stale = Boolean(history && (history.status === 'snapshot' || fundingLegStale(history.left, now) || fundingLegStale(history.right, now) || error));
   async function refresh() {
     setRefreshing(true);
     try { await live.refresh(); } finally { setRefreshing(false); }
@@ -126,7 +126,7 @@ export function FundingHistoryPanel({ id, market, selection, now, onClose, onExp
         const page = Math.min(pageCount, pages.key === pageKey ? pages[side] : 1);
         const records = result.records.slice((page - 1) * HISTORY_PAGE_SIZE, page * HISTORY_PAGE_SIZE);
         const name = side === 'left' ? contracts.leftLabel : contracts.rightLabel;
-        const legStale = Boolean(leg.fetchedAt && now - Date.parse(leg.fetchedAt) > HISTORY_STALE_MS);
+        const legStale = fundingLegStale(leg, now);
         return <article key={side} className="exchange-funding-leg" data-funding-leg={side}>
           <h4>{name} · {short ? '做空' : '做多'}<span>{leg.symbol}</span></h4>
           {leg.error ? <p className="exchange-stale">{leg.error}</p> : null}

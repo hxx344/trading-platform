@@ -3,16 +3,17 @@
 // retried within a round. A failed round only keeps what was there and says why. The last quote and the candle history
 // are kept in monitor.sqlite and read back at start, marked as a snapshot until a round succeeds.
 import {
-  ANTHROPIC_CANDLE_REFRESH_MS, ANTHROPIC_INITIAL_DAYS, ANTHROPIC_LEG_KEYS, ANTHROPIC_QUOTE_REFRESH_MS, ANTHROPIC_RETENTION_DAYS,
-  anthropicCandleWindow, createAnthropicCandles, createBinanceGate, anthropicCandleStarts, mergeAnthropicCandleBatch, legError, validateAnthropicQuote,
-  type AnthropicCandleCoverage, type AnthropicCandles, type BinanceGate, type AnthropicCandleWindow, type AnthropicFetcher, type AnthropicQuote,
+  ANTHROPIC_CANDLE_MS, ANTHROPIC_CANDLE_REFRESH_MS, ANTHROPIC_INITIAL_DAYS, ANTHROPIC_LEG_KEYS, ANTHROPIC_QUOTE_REFRESH_MS, ANTHROPIC_RETENTION_DAYS,
+  anthropicCandleWindow, createAnthropicCandles, createBinanceGate, mergeAnthropicCandleBatch, legError, validateAnthropicQuote,
+  type AnthropicCandleCoverage, type AnthropicCandles, type BinanceGate, type AnthropicCandleWindow, type AnthropicFetcher, type AnthropicQuote, type AnthropicLegKey, type AnthropicLegErrors,
 } from '../vendor/anthropic-market.mjs';
 import { createMarketReaders, type MarketReaders } from './market-readers.ts';
+import { afterCandleRange, candleCheckOverdue, candleCoverage, nextCandleRange, type CandleCoverage } from './candle-coverage.ts';
 import type { MonitorStore } from './store.ts';
 
 /** A quote older than this (by local receipt time) is shown as a snapshot; the venues give no source time for a mark. */
 export const QUOTE_STALE_MS = 35_000;
-/** The workbench's stored-candle age limit: about ten missed candle rounds. */
+/** Grace for receiving a newly closed bar before the candle view falls back to a snapshot. */
 export const CANDLE_STALE_MS = 615_000;
 const DAY_MS = 86_400_000;
 export const QUOTE_KEY = 'anthropic.quote';
@@ -31,6 +32,8 @@ export { boundedReply, MAX_REPLY_BYTES } from './market-contract.ts';
 
 const iso = (ms: number | null): string | null => ms === null ? null : new Date(ms).toISOString();
 const detail = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 200);
+const perLeg = <T>(value: (leg: AnthropicLegKey) => T): Record<AnthropicLegKey, T> =>
+  Object.fromEntries(ANTHROPIC_LEG_KEYS.map(leg => [leg, value(leg)])) as Record<AnthropicLegKey, T>;
 
 export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetchImpl = fetch, now = Date.now, readers = createMarketReaders({ fetchImpl, now, gate }), log = line => process.stderr.write(`${line}\n`) }: {
   store: MonitorStore;
@@ -45,6 +48,8 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
   let candles: AnthropicCandles | null = null, candlesRestored = false, candleAttemptAt: number | null = null, candleError: string | null = null;
   // The stored rows could not be read back: the next successful round rewrites the table instead of adding to it.
   let replaceCandles = false;
+  let progress = perLeg(() => candleCoverage(null, 0, ANTHROPIC_CANDLE_MS, 0));
+  let legErrors: AnthropicLegErrors = {};
   const windows = new Map<number | null, { source: AnthropicCandles; stale: boolean; value: AnthropicCandles | AnthropicCandleWindow }>();
 
   try {
@@ -53,11 +58,18 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
   } catch (error) { log(`Anthropic 上次报价无法读回，等待新报价：${detail(error)}`); }
   try {
     const rows = store.candles();
-    if (rows.length) {
-      const saved = store.readState(CANDLE_KEY);
+    const saved = store.readState(CANDLE_KEY);
+    if (rows.length || saved) {
       if (!saved) throw new Error('K 线轮次记录缺失');
-      const round = saved.value as { fetchedAt?: unknown; errors?: unknown };
-      candles = createAnthropicCandles(rows, round.fetchedAt as string, 'snapshot', round.errors ?? {});
+      const round = saved.value as { fetchedAt: string; errors?: AnthropicLegErrors; coverage?: Partial<Record<AnthropicLegKey, CandleCoverage>> };
+      const fetched = Date.parse(round.fetchedAt);
+      if (!Number.isFinite(fetched)) throw new Error('K 线轮次时间无效');
+      const restored = rows.length ? createAnthropicCandles(rows, round.fetchedAt, 'snapshot', round.errors ?? {}) : null;
+      progress = perLeg(key => {
+        const last = rows.findLast(row => row[key] !== null);
+        return candleCoverage(round.coverage?.[key], last ? last.time + ANTHROPIC_CANDLE_MS : 0, ANTHROPIC_CANDLE_MS, fetched);
+      });
+      candles = restored; legErrors = round.errors ?? {};
       candlesRestored = true;
     }
   } catch (error) { replaceCandles = true; log(`Anthropic K 线历史无法读回，将从 ${ANTHROPIC_INITIAL_DAYS} 天前重新回补：${detail(error)}`); }
@@ -94,9 +106,41 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
 
   async function refreshCandles(): Promise<void> {
     const at = now();
+    const step = ANTHROPIC_CANDLE_MS, target = Math.floor(at / step) * step;
+    const rows = candles?.data ?? [];
+    const work = perLeg(key => {
+      const sourceFloor = target - ((key === 'xyz' || key === 'io') ? ANTHROPIC_INITIAL_DAYS : ANTHROPIC_RETENTION_DAYS) * DAY_MS;
+      const first = progress[key].through ? Math.max(sourceFloor, rows.find(row => row[key] !== null)?.time ?? target - ANTHROPIC_INITIAL_DAYS * DAY_MS)
+        : target - ANTHROPIC_INITIAL_DAYS * DAY_MS;
+      return nextCandleRange(progress[key], rows, row => row[key] !== null, first, step, at);
+    });
+    if (ANTHROPIC_LEG_KEYS.every(key => !work[key])) { candlesRestored = false; return; }
     candleAttemptAt = at;
-    let next: AnthropicCandles;
-    try { next = mergeAnthropicCandleBatch(candles, await readers.anthropicCandles(anthropicCandleStarts(candles, at), at, stopping.signal)); }
+    const nextProgress = { ...progress }, errors = { ...legErrors };
+    let next: AnthropicCandles | null;
+    try {
+      const batch = await readers.anthropicCandles(perLeg(key => work[key]?.start ?? target), at, stopping.signal, perLeg(key => work[key]?.end ?? target));
+      if (stopping.signal.aborted) return;
+      for (const key of ANTHROPIC_LEG_KEYS) {
+        const range = work[key];
+        if (!range) continue;
+        if (batch.errors[key]) { errors[key] = batch.errors[key]; continue; }
+        const end = batch.through?.[key], values = batch.legs[key];
+        if (!values || end === undefined || !Number.isSafeInteger(end) || end % step || end <= range.start || end > range.end
+          || values.some(([time]) => time < range.start || time >= end)) throw new Error('K 线回补进度无效');
+        nextProgress[key] = afterCandleRange(progress[key], range, end, at);
+        delete errors[key];
+      }
+      // A failed retry of just the missing legs says nothing new about the healthy, already closed legs.
+      if (!ANTHROPIC_LEG_KEYS.some(key => work[key] && !batch.errors[key])) {
+        legErrors = errors;
+        if (candles) candles = { ...candles, metadata: { ...candles.metadata, errors } };
+        candlesRestored = false;
+        return;
+      }
+      next = candles || ANTHROPIC_LEG_KEYS.some(key => batch.legs[key]?.length)
+        ? mergeAnthropicCandleBatch(candles, { ...batch, errors }) : null;
+    }
     catch (error) {
       if (stopping.signal.aborted) return;
       const reason = legError(error);
@@ -107,12 +151,14 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
     if (stopping.signal.aborted) return;
     candleReport.recovered();
     const previous = new Map((candles?.data ?? []).map(row => [row.time, row]));
-    const changed = replaceCandles ? next.data : next.data.filter(row => {
+    const data = next?.data ?? [];
+    const changed = replaceCandles ? data : data.filter(row => {
       const old = previous.get(row.time);
       return !old || ANTHROPIC_LEG_KEYS.some(key => old[key] !== row[key]);
     });
     try {
-      store.writeCandles({ rows: changed, cutoff: at - ANTHROPIC_RETENTION_DAYS * DAY_MS, replace: replaceCandles, state: { key: CANDLE_KEY, value: { fetchedAt: next.metadata.fetchedAt, errors: next.metadata.errors } } });
+      store.writeCandles({ rows: changed, cutoff: at - ANTHROPIC_RETENTION_DAYS * DAY_MS, replace: replaceCandles,
+        state: { key: CANDLE_KEY, value: { fetchedAt: iso(at), errors, coverage: nextProgress } } });
     } catch (error) {
       // Memory stays with what is stored, so the next round reads on from there and writes the same rows again.
       candleError = 'K 线保存失败：monitor.sqlite 写入失败';
@@ -120,7 +166,7 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
       return;
     }
     candleSave.recovered();
-    candles = next; candlesRestored = false; candleError = null; replaceCandles = false;
+    candles = next; progress = nextProgress; legErrors = errors; candlesRestored = false; candleError = null; replaceCandles = false;
   }
 
   return {
@@ -135,7 +181,9 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
     /** The candles opening within `days` before the last row (null: all of them), with the complete history's range; null before any row exists. */
     candles(days: number | null): AnthropicCandleView | null {
       if (!candles) return null;
-      const stale = candlesRestored || candleError !== null || now() - Date.parse(candles.metadata.fetchedAt) > CANDLE_STALE_MS;
+      const current = now(), lastClose = Date.parse(candles.metadata.lastObservation) + ANTHROPIC_CANDLE_MS;
+      const stale = candlesRestored || candleError !== null || candleCheckOverdue(lastClose, ANTHROPIC_CANDLE_MS, current, CANDLE_STALE_MS)
+        || ANTHROPIC_LEG_KEYS.every(key => candleCheckOverdue(progress[key].through, ANTHROPIC_CANDLE_MS, current, CANDLE_STALE_MS));
       const snapshot: AnthropicCandles = { ...candles, status: stale ? 'snapshot' : 'live' };
       const { firstObservation, lastObservation, rows } = snapshot.metadata;
       // Cutting a window validates every stored row; it is redone only when a round stored new candles or the freshness changed.

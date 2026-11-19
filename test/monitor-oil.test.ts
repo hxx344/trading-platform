@@ -141,7 +141,7 @@ function oilEnv() {
   return Object.assign(env, { dir, venues, store, gate, monitor, dispose: () => { store.close(); rmSync(dir, { recursive: true, force: true }); } });
 }
 
-test('采集：首轮从上市起回补；报价超过 35 秒、K 线超过 615 秒标为快照；重启读回为快照，续读只从最后一天读起', async () => {
+test('采集：首轮从上市起回补，错过收盘后的宽限标为快照，重启按收盘进度续读', async () => {
   const env = oilEnv();
   try {
     const monitor = env.monitor();
@@ -160,7 +160,7 @@ test('采集：首轮从上市起回补；报价超过 35 秒、K 线超过 615 
     const week = monitor.candles(7)!;
     assert.deepEqual([week.windowDays, week.coverage.pairedObservationRows], [7, all.metadata.pairedObservationRows]);
     assert.ok(week.data.length < all.data.length);
-    env.clock += CANDLE_STALE_MS + 1;
+    env.clock = Math.floor(env.clock / BAR) * BAR + BAR + CANDLE_STALE_MS + 1;
     assert.equal(monitor.candles(null)!.status, 'snapshot');
 
     const restarted = env.monitor();
@@ -173,7 +173,7 @@ test('采集：首轮从上市起回补；报价超过 35 秒、K 线超过 615 
       return env.venues.fetch(url, init);
     } });
     await watched.refreshCandles();
-    assert.deepEqual(seen, [lastStart - 96 * BAR, lastStart - 96 * BAR], '续读从最后一根往前 96 根');
+    assert.deepEqual(seen, [lastStart, lastStart], '续读取新收盘和最后一根的修订');
     assert.equal(watched.candles(null)!.status, 'live');
   } finally { env.dispose(); }
 });
@@ -184,7 +184,7 @@ test('采集失败：报价任一腿失败本轮作废并说明原因；资金�
     const monitor = env.monitor();
     await monitor.refreshQuote(); await monitor.refreshCandles();
     const fetchedAt = monitor.quote()!.fetchedAt, rows = monitor.candles(null)!.data.length;
-    env.clock += 60_000;
+    env.clock += BAR;
     env.venues.down.add('wti');
     await monitor.refreshQuote(); await monitor.refreshCandles();
     assert.deepEqual([monitor.quote()!.fetchedAt, monitor.quote()!.status, monitor.quote()!.lastError], [fetchedAt, 'snapshot', '接口返回 HTTP 500']);
@@ -277,15 +277,17 @@ test('原油日常续读严格限制在已查截止前一天，较早的共同�
     assert.equal(collector.candles(null)!.status, 'snapshot');
     const through = Math.floor(at / BAR) * BAR;
     at += 60_000; starts.length = 0; await collector.refreshCandles();
-    assert.deepEqual(starts, [through - DAY, through - DAY]);
+    assert.deepEqual(starts, [through - BAR, through - BAR], '刚收盘缺腿时只重试缺失的一根');
     assert.equal(collector.candles(null)!.status, 'snapshot');
 
     starts.length = 0; at += OIL_GAP_RETRY_MS; await collector.refreshCandles();
-    assert.equal(Math.min(...starts), START, '小时轮仍从历史缺腿处补读');
+    assert.deepEqual(starts, [through - BAR, through - BAR], '新收盘优先更新');
+    starts.length = 0; at += 3 * 60_000; await collector.refreshCandles();
+    assert.equal(Math.min(...starts), START, '旧缺腿单独回补');
     assert.equal(collector.candles(null)!.status, 'snapshot');
     starts.length = 0; const repairedThrough = Math.floor(at / BAR) * BAR;
     recovered = true; at += BAR; await collector.refreshCandles();
-    assert.deepEqual(starts, [repairedThrough - DAY, repairedThrough - DAY]);
+    assert.deepEqual(starts, [repairedThrough - BAR, repairedThrough - BAR]);
     assert.equal(collector.candles(null)!.status, 'live');
     assert.equal(Date.parse(collector.candles(null)!.metadata.lastCommonObservation), Math.floor(at / BAR) * BAR - BAR);
   } finally { collector.stop(); store.close(); }
@@ -309,16 +311,16 @@ test('永久缺口：交易所始终不给的 K 线不让每轮都从缺口处�
     read();
     env.clock += 60_000;
     await collector.refreshCandles();
-    assert.deepEqual(read(), [first.data.at(-1)!.time + BAR - DAY], '一小时内只从最后验证边界之前一天续读');
+    assert.deepEqual(read(), [], '已覆盖当前收盘区间');
     assert.deepEqual([collector.candles(null)!.data[0], collector.candles(null)!.metadata.missingObservationRows], [first.data[0], 1], '更早的行原样保留');
     assert.deepEqual(plain(env.store.oilCandles()), plain(collector.candles(null)!.data));
     env.clock += OIL_GAP_RETRY_MS;
     await collector.refreshCandles();
-    assert.deepEqual(read(), [gap], '满一小时从缺口处补读');
-    const afterRetry = collector.candles(null)!.data.at(-1)!.time;
+    assert.deepEqual(read(), [first.data.at(-1)!.time], '先读新收盘');
     env.clock += 60_000;
     await collector.refreshCandles();
-    assert.deepEqual(read(), [afterRetry + BAR - DAY], '补读之后又是一小时只续读最后一天');
+    assert.deepEqual(read(), [gap], '只读未覆盖的旧缺口');
+    await collector.refreshCandles(); assert.deepEqual(read(), [], '永久缺口有独立的退避时间');
   } finally { env.dispose(); }
 });
 

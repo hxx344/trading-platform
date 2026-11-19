@@ -8,7 +8,7 @@ import { ContractError } from '../src/contracts.ts';
 import { createExecutorServer } from '../src/http.ts';
 import { bybitPermissionProblem } from '../src/live/permissions.ts';
 import { createOptionsClient } from '../src/options/client.ts';
-import { createOptionsEngine, isoWeek, type AutoOpenSettings, type OptionsEngine, type TaskStatus } from '../src/options/engine.ts';
+import { createOptionsEngine, isoWeek, MISSING_SETTLE_MAX_AGE_MS, type AutoOpenSettings, type OptionsEngine, type OptionsState, type TaskStatus } from '../src/options/engine.ts';
 import { createOptionMarket } from '../src/options/market.ts';
 import { openOptionsStore, type OptionsStore } from '../src/options/store.ts';
 import { DEFAULT_ESTIMATES, type StrategyMode } from '../src/options/strategy.ts';
@@ -16,14 +16,14 @@ import { parseServiceConfig, parseServiceSecrets } from '../src/service/config.t
 import { optionsSummary, parseOptionsConfig } from '../src/service/options-config.ts';
 import { optionsViews, preflightOptions } from '../src/service/options.ts';
 import { bindAccounts, createHarness } from './harness.ts';
-import { EXPIRY, FRIDAY, FakeOptions, UID, symbolOf, type FillMode, type Row } from './options-fake.ts';
+import { EXPIRY, FRIDAY, FakeOptions, UID, fail, ok, symbolOf, type FillMode, type Row } from './options-fake.ts';
 
 const CREDENTIALS = { apiKey: 'options-test-key', apiSecret: 'options-test-secret' };
 const TERMINAL: TaskStatus[] = ['completed', 'partial', 'stopped', 'failed'];
 
 interface Setup { fake: FakeOptions; market: ReturnType<typeof createOptionMarket>; engine: OptionsEngine; store: OptionsStore; notes: string[]; logs: string[]; dir: string; now: () => number; make(store: OptionsStore): OptionsEngine; dispose(): void;
   /** skewMs moves the engine's clock; onNote runs inside notify (synchronously, as the engine sends). */
-  hooks: { skewMs: number; onNote?: (text: string) => void } }
+  hooks: { skewMs: number; onNote?: (text: string) => void; reply?: (url: URL, init: RequestInit) => Response | Promise<Response> | undefined } }
 
 function setup({ mode = 'iron_condor', fill = 'fill', maxRiskUsd = 50_000, maxMarginUsd = 50_000, orderTimeoutMs = 600, base = FRIDAY, missingSettleMs, autoOpen, marketFallback }: { mode?: StrategyMode; fill?: FillMode; maxRiskUsd?: number; maxMarginUsd?: number; orderTimeoutMs?: number; base?: number; missingSettleMs?: number; autoOpen?: AutoOpenSettings; marketFallback?: boolean } = {}): Setup {
   const started = Date.now();
@@ -31,7 +31,7 @@ function setup({ mode = 'iron_condor', fill = 'fill', maxRiskUsd = 50_000, maxMa
   const now = () => base + (Date.now() - started) + hooks.skewMs;
   const fake = new FakeOptions(now);
   fake.fillMode = fill;
-  const client = createOptionsClient({ credentials: CREDENTIALS, fetchImpl: fake.fetch });
+  const client = createOptionsClient({ credentials: CREDENTIALS, fetchImpl: async (url, init) => hooks.reply?.(new URL(url), init) ?? fake.fetch(url, init) });
   const market = createOptionMarket(client, { now });
   const dir = mkdtempSync(join(tmpdir(), 'options-test-'));
   const store = openOptionsStore(join(dir, 'options.sqlite'));
@@ -87,6 +87,31 @@ test('期权：铁鹰开仓四腿全部成交，跟踪数量、成交明细与�
     // A tracked strategy blocks another opening.
     await assert.rejects(s.engine.createPlan({ operation: 'open' }), refused('strategy_open'));
   } finally { s.dispose(); }
+});
+
+test('成交采样只查询已发送且仍在途或台账待补齐的委托', async () => {
+  const s = setup({ orderTimeoutMs: 12_000 });
+  s.fake.modes.set(symbolOf(116000, 'C'), 'rest');
+  let release = () => {};
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  try {
+    s.fake.tickerGate = gate;
+    const { started } = await open(s);
+    await until(() => Object.keys(s.engine.state().journal).length === 2);
+    await new Promise(resolve => setTimeout(resolve, 125));
+    assert.equal(s.fake.creates, 0);
+    assert.ok(!s.fake.calls.some(call => call.path === '/v5/execution/list'), '首笔委托还在等盘口时跳过成交采样');
+    release();
+    await until(() => s.store.executions().length === 1);
+    const resting = [...s.fake.orders.values()].find(order => order.status === 'New')!.link;
+    const offset = s.fake.calls.length;
+    const samples = () => s.fake.calls.slice(offset).filter(call => call.path === '/v5/execution/list');
+    await until(() => samples().length >= 2);
+    assert.ok(samples().every(call => call.params.get('orderLinkId') === resting));
+    assert.ok(s.fake.calls.slice(offset).some(call => call.path === '/v5/order/realtime'), '在途状态继续实时查询');
+    s.engine.stopTask(started.taskId);
+    await finished(s, started.taskId);
+  } finally { release(); await s.engine.close(); s.dispose(); }
 });
 
 test('期权：平仓只平跟踪数量、reduceOnly，全部成交后策略结束并清空跟踪', async () => {
@@ -197,10 +222,15 @@ test('期权 IOC 兜底：部分成交只补剩余数量；默认净价限制挡
   } finally { tight.dispose(); }
 });
 
-test('期权 IOC 兜底：IOC 应答丢失且读不到时卖腿不下、转待核对；重启后对账结算 IOC，跟踪数量计入其成交，不补发卖腿', async () => {
+const uncertainIocCancel = (url: URL, init: RequestInit): Response | undefined => {
+  if (url.pathname === '/v5/order/cancel' && String(JSON.parse(String(init.body)).orderLinkId).startsWith('tpo-ioc-')) return fail(10016, 503);
+};
+
+test('期权 IOC 兜底：应答丢失仍保存撤单返回的订单号，重启过 121 秒委托和成交查无也不解锁，终态恢复后计入跟踪', async () => {
   const s = setup({ marketFallback: true });
   s.fake.modes.set(symbolOf(116000, 'C'), 'rest');
   s.fake.iocMode = 'lost';
+  s.fake.failExecutions = true;
   const second = openOptionsStore(join(s.dir, 'second.sqlite'));
   try {
     const plan = await s.engine.createPlan({ operation: 'open' });
@@ -209,12 +239,24 @@ test('期权 IOC 兜底：IOC 应答丢失且读不到时卖腿不下、转待�
     assert.equal(s.engine.state().tasks[started.taskId]!.status, 'recovery_needed');
     const [link, entry] = Object.entries(s.engine.state().journal).find(([key]) => key.startsWith('tpo-ioc-'))!;
     assert.deepEqual([entry.terminal, entry.status], [false, 'unknown']);
+    assert.equal(entry.orderId, s.fake.orders.get(link)!.orderId, '唯一已收到的正面证据是此前的撤单应答');
     assert.ok([...s.fake.orders.values()].every(order => order.side === 'Buy'));
     const creates = s.fake.creates;
     // The process dies with the IOC unresolved; the next one restores it and reconciliation reads it back.
     second.save(structuredClone(s.store.load()));
+    s.hooks.skewMs += 121_000;
+    s.hooks.reply = uncertainIocCancel;
+    s.fake.failExecutions = false;
+    const fills = s.fake.executions;
+    s.fake.executions = [];
     const restarted = s.make(second);
+    await restarted.reconcileOnce();
     await assert.rejects(restarted.createPlan({ operation: 'open' }), refused('orders_unresolved'));
+    s.fake.executions = fills;
+    const previous = s.fake.calls.length;
+    await restarted.performanceTick();
+    assert.ok(s.fake.calls.slice(previous).some(call => call.path === '/v5/execution/list' && call.params.get('orderLinkId') === link));
+    assert.equal(restarted.state().journal[link]!.terminal, false, '恢复期即使能读到成交，也须单独实时确认委托终态');
     s.fake.orders.get(link)!.visible = true;
     await restarted.reconcileOnce();
     const settled = restarted.state().journal[link]!;
@@ -224,6 +266,170 @@ test('期权 IOC 兜底：IOC 应答丢失且读不到时卖腿不下、转待�
     assert.equal(s.fake.creates, creates);
     assert.ok([...s.fake.orders.values()].every(order => order.side === 'Buy'));
   } finally { second.close(); s.dispose(); }
+});
+
+test('期权 IOC 的创建和撤单都丢失应答，最终成交查询的前页有成交、后页失败：跨重启保留台账，冲突终态不丢仓', async () => {
+  const s = setup({ marketFallback: true });
+  s.fake.modes.set(symbolOf(116000, 'C'), 'rest');
+  s.fake.iocMode = 'lost';
+  s.fake.failExecutions = true;
+  s.hooks.reply = uncertainIocCancel;
+  try {
+    const { started } = await open(s, { minNetIncomeUsd: 0 });
+    await finished(s, started.taskId);
+    const [link, entry] = Object.entries(s.engine.state().journal).find(([, item]) => item.kind === 'ioc')!;
+    assert.deepEqual([entry.terminal, entry.orderId, entry.filledQty], [false, '', '0']);
+    const creates = s.fake.creates, fill = s.fake.executions.find(row => row.orderLinkId === link)!;
+    await s.engine.close();
+    s.hooks.skewMs += 121_000;
+    let pages = 0;
+    s.hooks.reply = (url, init) => {
+      if (url.pathname !== '/v5/execution/list' || url.searchParams.get('orderLinkId') !== link) return uncertainIocCancel(url, init);
+      pages++;
+      return url.searchParams.has('cursor') ? fail(10016, 503) : ok({ category: 'option', list: [fill], nextPageCursor: 'next-page' });
+    };
+    const restarted = s.make(s.store);
+    await restarted.reconcileOnce();
+    assert.equal(pages, 2, '必须在恢复对账本轮用原关联号实时读取成交');
+    assert.equal(restarted.state().journal[link]!.terminal, false);
+    assert.equal(s.store.executions().find(row => row.execId === fill.execId)?.execQty, 1);
+    await restarted.close();
+
+    // A pre-fix journal can have neither an id nor a recent fill, while the full SQLite ledger still has the trade.
+    const legacy = s.store.load() as OptionsState;
+    legacy.journal[link]!.orderId = '';
+    delete legacy.journal[link]!.orderSeen;
+    legacy.executions = [];
+    s.store.save(legacy);
+    s.hooks.reply = uncertainIocCancel;
+    s.fake.failExecutions = false;
+    s.fake.executions = [];
+    const restored = s.make(s.store);
+    const order = s.fake.orders.get(link)!;
+    await restored.performanceTick();
+    await restored.reconcileOnce();
+    assert.equal(restored.state().journal[link]!.terminal, false, '完整台账中的成交不会因接口暂空而消失');
+    Object.assign(order, { visible: true, status: 'Cancelled', cumExecQty: '0' });
+    await restored.reconcileOnce();
+    assert.equal(restored.state().journal[link]!.terminal, false, '声称零成交的撤单终态低于已见的一张');
+    await assert.rejects(restored.createPlan({ operation: 'open' }), refused('orders_unresolved'));
+    Object.assign(order, { status: 'Filled', cumExecQty: '1' });
+    s.fake.failExecutions = true; // A consistent full order receipt can settle independently of an unavailable fill list.
+    await restored.reconcileOnce();
+    assert.deepEqual([restored.state().journal[link]!.status, restored.state().tracked.sizes[`${order.symbol}|Buy`]], ['filled', '1']);
+    assert.equal(restored.state().tasks[started.taskId]!.status, 'partial');
+    assert.equal(s.fake.creates, creates);
+    assert.ok([...s.fake.orders.values()].every(item => item.side === 'Buy'));
+    await restored.close();
+  } finally { await s.engine.close(); s.dispose(); }
+});
+
+test('期权恢复：成交多次 503 前已保存委托累计 0.5，重启拒绝旧的零成交回报，同周期慢采样成功后只计入一次', async () => {
+  const s = setup();
+  const symbol = symbolOf(116000, 'C');
+  s.fake.modes.set(symbol, 'partial');
+  s.fake.failExecutions = true;
+  s.hooks.reply = url => {
+    if (url.pathname.startsWith('/v5/order/') && url.searchParams.get('symbol') === symbol) return ok({ category: 'option', list: [], nextPageCursor: '' });
+  };
+  let release = () => {};
+  const response = new Promise<void>(resolve => { release = resolve; });
+  try {
+    const { started } = await open(s);
+    await finished(s, started.taskId);
+    const order = [...s.fake.orders.values()].find(item => item.symbol === symbol)!;
+    assert.equal(order.status, 'PartiallyFilledCanceled');
+    assert.equal(s.store.executions().some(row => row.orderLinkId === order.link), false);
+    assert.equal(s.engine.state().journal[order.link]!.filledQty, '0');
+    await s.engine.close();
+    const first = s.make(s.store), key = `${symbol}|Buy`;
+    const atRead: unknown[] = [];
+    s.hooks.reply = url => {
+      if (url.pathname === '/v5/execution/list' && url.searchParams.get('orderLinkId') === order.link) {
+        const saved = s.store.load() as OptionsState, entry = saved.journal[order.link]!;
+        atRead.push([entry.filledQty, entry.terminal, saved.tracked.sizes[key]]);
+        return fail(10016, 503);
+      }
+    };
+    await first.reconcileOnce();
+    assert.deepEqual(atRead, Array(5).fill(['0.5', false, '0.5']), '每次成交读取之前，SQLite 都已有委托累计量，订单仍待核对');
+    await first.close();
+    const restarted = s.make(s.store);
+    s.fake.failExecutions = false;
+    Object.assign(order, { status: 'Cancelled', cumExecQty: '0' });
+    s.hooks.reply = url => {
+      if (url.pathname === '/v5/execution/list') return ok({ category: 'option', list: [], nextPageCursor: '' });
+    };
+    await restarted.performanceTick();
+    await restarted.reconcileOnce();
+    const pending = restarted.state().journal[order.link]!;
+    assert.deepEqual([pending.filledQty, pending.terminal, restarted.state().tracked.sizes[key]], ['0.5', false, '0.5']);
+    await assert.rejects(restarted.createPlan({ operation: 'open' }), refused('orders_unresolved'));
+    Object.assign(order, { status: 'PartiallyFilledCanceled', cumExecQty: '0.5' });
+    let reads = 0;
+    s.hooks.reply = url => {
+      if (url.pathname === '/v5/execution/list' && url.searchParams.get('orderLinkId') === order.link) {
+        reads++;
+        return response.then(() => ok({ category: 'option', list: s.fake.executions.filter(row => row.orderLinkId === order.link), nextPageCursor: '' }));
+      }
+    };
+    const sampler = restarted.performanceTick();
+    await until(() => reads === 1);
+    const offset = s.fake.calls.length, recovery = restarted.reconcileOnce();
+    await until(() => s.fake.calls.slice(offset).some(call => call.path === '/v5/order/history' && call.params.get('orderLinkId') === order.link));
+    const nextSampler = restarted.performanceTick();
+    await new Promise(resolve => setTimeout(resolve, 35)); // longer than five of the fake reconciliation polls
+    assert.equal(restarted.state().journal[order.link]!.terminal, false);
+    release();
+    await Promise.all([sampler, nextSampler, recovery]);
+    assert.equal(reads, 1);
+    const confirmed = restarted.state().journal[order.link]!;
+    assert.deepEqual([confirmed.terminal, confirmed.status, confirmed.filledQty], [true, 'partial', '0.5']);
+    assert.equal(restarted.state().tracked.sizes[key], '0.5');
+    assert.equal(restarted.state().tasks[started.taskId]!.status, 'partial');
+    await restarted.close();
+  } finally { release(); await s.engine.close(); s.dispose(); }
+});
+
+test('期权跟价：成交查询在途时读到部分终态，旧零成交回报不能抹掉已见的 0.5', async () => {
+  const s = setup({ orderTimeoutMs: 5_000 });
+  const symbol = symbolOf(116000, 'C'), key = `${symbol}|Buy`;
+  s.fake.modes.set(symbol, 'partial');
+  let reading = false, sawPartial = false, oldReply = false, release = () => {};
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  s.hooks.reply = url => {
+    const link = url.searchParams.get('orderLinkId') ?? '', order = s.fake.orders.get(link);
+    if (order?.symbol !== symbol) return;
+    const page = (list: Row[]) => ok({ category: 'option', list, nextPageCursor: '' });
+    if (url.pathname === '/v5/execution/list') {
+      if (oldReply) return page([]);
+      reading = true;
+      return pending.then(() => fail(10016, 503));
+    }
+    if (url.pathname !== '/v5/order/realtime' && url.pathname !== '/v5/order/history') return;
+    if (!reading) return page([]);
+    oldReply = sawPartial;
+    sawPartial = true;
+    if (oldReply) release();
+    return page([{ orderId: order.orderId, orderLinkId: link, symbol, side: order.side, qty: order.qty,
+      cumExecQty: oldReply ? '0' : '0.5', orderStatus: oldReply ? 'Cancelled' : 'PartiallyFilledCanceled' }]);
+  };
+  try {
+    const { started } = await open(s);
+    await finished(s, started.taskId);
+    assert.ok(sawPartial && oldReply);
+    const order = [...s.fake.orders.values()].find(item => item.symbol === symbol)!;
+    await s.engine.reconcileOnce();
+    const saved = s.store.load() as OptionsState, entry = saved.journal[order.link]!;
+    assert.deepEqual([entry.status, entry.terminal, entry.filledQty, saved.tracked.sizes[key]], ['unknown', false, '0.5', '0.5']);
+    assert.equal(s.store.executions().some(row => row.orderLinkId === order.link), false);
+    await assert.rejects(s.engine.createPlan({ operation: 'open' }), refused('orders_unresolved'));
+    s.hooks.reply = undefined;
+    await s.engine.reconcileOnce();
+    assert.equal(s.engine.state().journal[order.link]!.status, 'partial');
+    assert.equal(s.engine.state().tracked.sizes[key], '0.5');
+    assert.equal(s.fake.creates, 2);
+  } finally { release(); await s.engine.close(); s.dispose(); }
 });
 
 test('期权 IOC 兜底：兜底等待期间停止不发 IOC；兜底前读不到原单时原单保持终态、不发 IOC', async () => {
@@ -481,21 +687,140 @@ test('期权：订单查不到时转人工核对、拒绝新计划；对账读�
   } finally { s.dispose(); }
 });
 
-test('期权：下单请求没到交易所、查无此单且没有订单号：超过接收时限后对账按未下单结算，可以再下计划', async () => {
-  const s = setup({ fill: 'dropped', missingSettleMs: 0 });
+test('期权：真实漏发经过接收时限后仍需完整委托和成交查询，失败、分页或时钟越界保留未决，完整查空后可以再下计划', async () => {
+  const s = setup({ fill: 'dropped' });
   try {
     const { started } = await open(s);
     await finished(s, started.taskId);
     assert.equal(s.engine.state().tasks[started.taskId]!.status, 'recovery_needed');
     await assert.rejects(s.engine.createPlan({ operation: 'open' }), refused('orders_unresolved'));
+    const pending = () => Object.values(s.engine.state().journal).every(entry => !entry.terminal && entry.filledQty === '0');
+    await s.engine.reconcileOnce();
+    assert.ok(pending(), '两分钟以内的空读不能解锁');
+    s.hooks.skewMs = 121_000;
+    s.fake.failExecutions = true;
+    await s.engine.reconcileOnce();
+    assert.ok(pending(), '最后的成交读取失败');
+    s.fake.failExecutions = false;
+    s.hooks.reply = url => {
+      if (url.pathname === '/v5/order/realtime') return ok({ category: 'option', list: [{ symbol: url.searchParams.get('symbol'), orderId: 'foreign' }], nextPageCursor: '' });
+    };
+    await s.engine.reconcileOnce();
+    assert.ok(pending(), '缺少关联号的委托行');
+    let secondPages = 0;
+    s.hooks.reply = url => {
+      if (url.pathname !== '/v5/order/history') return;
+      if (url.searchParams.has('cursor')) { secondPages++; return fail(10016, 503); }
+      return ok({ category: 'option', list: [], nextPageCursor: 'next-order-page' });
+    };
+    await s.engine.reconcileOnce();
+    assert.ok(secondPages >= 2 && pending(), '历史委托第二页读取失败');
+    s.hooks.reply = url => {
+      if (url.pathname === '/v5/execution/list') return ok({ category: 'option', list: [], nextPageCursor: 'repeated-cursor' });
+    };
+    await s.engine.reconcileOnce();
+    assert.ok(pending(), '成交分页游标重复');
+    s.hooks.reply = url => {
+      if (url.pathname === '/v5/execution/list') return ok({ category: 'option', list: [{ execId: 'unidentified' }], nextPageCursor: '' });
+    };
+    await s.engine.reconcileOnce();
+    assert.ok(pending(), '无法归属的成交行');
+    for (const path of ['/v5/order/realtime', '/v5/order/history', '/v5/execution/list']) {
+      for (const result of [{ list: [], nextPageCursor: '' }, { category: 'linear', list: [], nextPageCursor: '' }, { category: 'option', list: [] }, { category: 'option', list: [], nextPageCursor: null }]) {
+        s.hooks.reply = url => url.pathname === path ? ok(result) : undefined;
+        await s.engine.reconcileOnce();
+        assert.ok(pending(), `${path} 的空页缺少期权类别或明确的末页标记`);
+      }
+    }
+    s.hooks.reply = url => {
+      if (url.pathname === '/v5/execution/list') { s.hooks.skewMs = MISSING_SETTLE_MAX_AGE_MS + 120_000; return ok({ category: 'option', list: [], nextPageCursor: '' }); }
+    };
+    await s.engine.reconcileOnce();
+    assert.ok(pending(), '最终读完时已经超出默认历史窗口');
+    s.hooks.reply = undefined;
+    s.hooks.skewMs = 121_000;
+    const offset = s.fake.calls.length;
     await s.engine.reconcileOnce();
     const orders = Object.values(s.engine.state().journal).filter(entry => entry.taskId === started.taskId);
     assert.deepEqual(orders.map(entry => [entry.status, entry.terminal, entry.filledQty]), Array(2).fill(['not_submitted', true, '0']));
+    for (const link of Object.keys(s.engine.state().journal)) {
+      const reads = s.fake.calls.slice(offset).filter(call => call.params.get('orderLinkId') === link).map(call => call.path);
+      assert.deepEqual(reads.slice(-3), ['/v5/order/realtime', '/v5/order/history', '/v5/execution/list']);
+    }
     assert.ok(TERMINAL.includes(s.engine.state().tasks[started.taskId]!.status));
     assert.ok(s.logs.some(line => line.includes('按未下单结算')));
     s.fake.fillMode = 'fill';
     await s.engine.createPlan({ operation: 'open' });
     assert.equal(s.fake.creates, 2);
+  } finally { s.dispose(); }
+});
+
+test('期权：判无等待更早开始的采样收齐，同一笔成交数量前后冲突时保留原台账和未决状态', async () => {
+  const s = setup({ fill: 'dropped' });
+  let release = () => {};
+  const response = new Promise<void>(resolve => { release = resolve; });
+  try {
+    const { started } = await open(s);
+    await finished(s, started.taskId);
+    const [[link, entry], [other]] = Object.entries(s.engine.state().journal);
+    s.hooks.skewMs += 121_000;
+    const fill = { execId: 'late-fill', orderId: 'late-order', orderLinkId: link, symbol: entry.symbol, side: entry.side, execType: 'Trade', execQty: '0.5', execPrice: '100', execFee: '0', execTime: String(entry.createdAt) };
+    let startedRead = false;
+    s.hooks.reply = url => {
+      if (url.pathname === '/v5/execution/list' && url.searchParams.get('orderLinkId') === link) {
+        startedRead = true;
+        return response.then(() => ok({ category: 'option', list: [fill], nextPageCursor: '' }));
+      }
+    };
+    const sampler = s.engine.performanceTick();
+    await until(() => startedRead);
+    const offset = s.fake.calls.length, recovery = s.engine.reconcileOnce();
+    await until(() => s.fake.calls.slice(offset).filter(call => call.path === '/v5/order/history' && call.params.get('orderLinkId') === link).length === 5);
+    release();
+    await Promise.all([sampler, recovery]);
+    assert.equal(entry.terminal, false);
+    assert.equal(s.engine.state().journal[other]!.status, 'not_submitted');
+    assert.equal(s.store.executions().find(row => row.execId === fill.execId)?.execQty, 0.5);
+    fill.execQty = '0.25';
+    await s.engine.performanceTick();
+    assert.equal(s.store.executions().find(row => row.execId === fill.execId)?.execQty, 0.5, '同一已知成交不能被矛盾的小数量覆盖');
+    assert.equal(entry.conflictingExecutionId, fill.execId);
+    s.hooks.reply = url => {
+      if (url.pathname === '/v5/order/history' && url.searchParams.get('orderLinkId') === link) {
+        return ok({ category: 'option', list: [{ orderId: fill.orderId, orderLinkId: link, symbol: entry.symbol, side: entry.side, qty: entry.qty, cumExecQty: '0.5', orderStatus: 'Cancelled' }], nextPageCursor: '' });
+      }
+    };
+    await s.engine.close();
+    const restarted = s.make(s.store);
+    await restarted.reconcileOnce();
+    assert.equal(restarted.state().journal[link]!.terminal, false, '跨重启的成交编号冲突仍需核对');
+    await restarted.close();
+  } finally { release(); await s.engine.close(); s.dispose(); }
+});
+
+test('期权：旧版委托从恢复时起观察两分钟，无订单号但已有正累计量的一腿持续待核对', async () => {
+  const s = setup({ fill: 'dropped' });
+  try {
+    const { started } = await open(s);
+    await finished(s, started.taskId);
+    await s.engine.close();
+    const legacy = s.store.load() as OptionsState;
+    const [[link, entry], [other, empty]] = Object.entries(legacy.journal);
+    delete entry.lastPossibleSendAt;
+    delete empty.lastPossibleSendAt;
+    entry.filledQty = '0.25';
+    legacy.tracked = { groupId: started.taskId, sizes: { [`${entry.symbol}|${entry.side}`]: '0.25' } };
+    s.store.save(legacy);
+    s.hooks.skewMs += 121_000;
+    const restarted = s.make(s.store);
+    await restarted.reconcileOnce();
+    assert.equal(restarted.state().journal[other]!.terminal, false);
+    s.hooks.skewMs += 121_000;
+    await restarted.reconcileOnce();
+    assert.equal(restarted.state().journal[other]!.status, 'not_submitted');
+    assert.deepEqual([restarted.state().journal[link]!.terminal, restarted.state().journal[link]!.filledQty], [false, '0.25']);
+    assert.deepEqual(restarted.state().tracked, legacy.tracked);
+    await restarted.close();
   } finally { s.dispose(); }
 });
 
@@ -636,6 +961,33 @@ test('期权收益：成交明细读取失败时按订单补读（5 分钟内不
       // Compared as JSON: a -0 price difference comes back from the table as 0.
       assert.equal(JSON.stringify(after.groups.find(row => row.id === started.taskId)), JSON.stringify(before));
     } finally { reopened.close(); }
+  } finally { s.dispose(); }
+});
+
+test('成交方向冲突与交割事件均不能满足订单台账，跨重启后仍按原订单补读', async () => {
+  const s = setup();
+  try {
+    s.fake.failExecutions = true;
+    const { started } = await open(s);
+    await finished(s, started.taskId);
+    s.fake.failExecutions = false;
+    const fill = s.fake.executions[0]!, actual = fill.side;
+    fill.side = actual === 'Buy' ? 'Sell' : 'Buy';
+    await s.engine.performanceTick();
+    assert.ok(!s.store.executions().some(row => row.execId === fill.execId));
+    fill.side = actual;
+    s.hooks.skewMs += 300_001;
+    await s.engine.performanceTick();
+    const saved = s.store.executions().find(row => row.execId === fill.execId)!;
+    assert.equal(saved.side, actual);
+    await s.engine.close();
+    s.store.saveExecutions([{ ...saved, side: actual === 'Buy' ? 'Sell' : 'Buy' }, { ...saved, execId: 'settlement', execType: 'Delivery' }]);
+    const recovered = s.make(s.store), offset = s.fake.calls.length;
+    try {
+      await recovered.performanceTick();
+      assert.deepEqual(s.fake.calls.slice(offset).filter(c => c.path === '/v5/execution/list').map(c => c.params.get('orderLinkId')), [saved.orderLinkId]);
+      assert.equal(s.store.executions().find(row => row.execId === fill.execId)!.side, actual);
+    } finally { await recovered.close(); }
   } finally { s.dispose(); }
 });
 

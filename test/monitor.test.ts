@@ -11,6 +11,7 @@ import { CANDLE_STALE_MS, MAX_REPLY_BYTES, QUOTE_KEY, QUOTE_STALE_MS, boundedRep
 import { MODULE_KEYS, parseServiceConfig } from '../src/service/config.ts';
 import { monitorSummary } from '../src/service/monitor-config.ts';
 import { ANTHROPIC_LEG_KEYS, type AnthropicCandleRow } from '../src/vendor/anthropic-market.mjs';
+import { createMarketReaders } from '../src/monitor/market-readers.ts';
 import { fakeAnthropicPrice, fakeAnthropicVenues } from './monitor-fake.ts';
 import { FakeAster } from './aster-fake.ts';
 import { createHarness } from './harness.ts';
@@ -104,10 +105,10 @@ test('采集：报价超过 35 秒、K 线超过 615 秒转为快照；库里读
     assert.equal(week.windowDays, 7);
     assert.deepEqual(week.coverage, { firstObservation: all.metadata.firstObservation, lastObservation: all.metadata.lastObservation, rows: all.data.length });
     assert.ok(week.data[0]!.time >= all.data.at(-1)!.time - 7 * DAY && week.data.length < all.data.length);
-    env.clock = fetched + CANDLE_STALE_MS;
+    env.clock = Math.floor(fetched / BAR) * BAR + BAR + CANDLE_STALE_MS;
     assert.equal(monitor.candles(null)!.status, 'live');
     env.clock += 1;
-    assert.equal(monitor.candles(null)!.status, 'snapshot', '超过 615 秒没有新一轮 K 线');
+    assert.equal(monitor.candles(null)!.status, 'snapshot', '超过下一次应收盘时间和宽限仍未更新');
 
     // A restart reads both back as a snapshot, however recent they are.
     const restored = env.monitor({ now: () => fetched });
@@ -119,7 +120,7 @@ test('采集：报价超过 35 秒、K 线超过 615 秒转为快照；库里读
     await restored.refreshCandles();
     assert.equal(restored.quote()!.status, 'live');
     assert.equal(restored.candles(null)!.status, 'live');
-    assert.equal(env.venues.requests.get('candles:binance'), before! + 1, '读回后从上次的收盘接着取，一页即可');
+    assert.equal(env.venues.requests.get('candles:binance'), before, '同一收盘区间从 SQLite 恢复，无上游读取');
     assert.deepEqual(env.logs, []);
   } finally { env.dispose(); }
 });
@@ -150,7 +151,7 @@ test('采集：单腿失败只标出该腿原因；四条腿都失败时保留�
     assert.equal(env.logs.filter(line => line.includes('报价读取失败')).length, 1, '同一原因只记一次日志');
 
     const rows = monitor.candles(null)!.data;
-    env.clock += 60_000;
+    env.clock += BAR;
     await monitor.refreshCandles();
     let candles = monitor.candles(null)!;
     assert.deepEqual([candles.status, candles.lastError, candles.lastAttemptAt], ['snapshot', 'K 线读取失败：接口返回 HTTP 500', iso(env.clock)]);
@@ -170,6 +171,35 @@ test('采集：单腿失败只标出该腿原因；四条腿都失败时保留�
     assert.ok(candles.data.at(-1)!.io === null && candles.data[0]!.io !== null, '失败的腿保留旧收盘，不再向前');
     assert.ok(env.logs.some(line => line === 'Anthropic 报价读取已恢复'));
     assert.ok(env.logs.some(line => line === 'Anthropic K 线读取已恢复'));
+    const restored = env.monitor();
+    await restored.refreshCandles();
+    const partial = restored.candles(null)!;
+    assert.deepEqual([partial.status, partial.metadata.fetchedAt, partial.metadata.errors], ['live', candles.metadata.fetchedAt, { io: '接口返回 HTTP 500' }]);
+    env.venues.down.clear(); env.venues.requests.clear();
+    await restored.refreshCandles();
+    assert.deepEqual([...env.venues.requests.keys()], ['candles:io'], '重启后只查未追到收盘的腿');
+    assert.ok(restored.candles(null)!.data.at(-1)!.io);
+    assert.deepEqual(restored.candles(null)!.metadata.errors, {});
+  } finally { env.dispose(); }
+});
+
+test('四腿确认的空区间可以续读，不能给旧收盘续鲜', async () => {
+  const env = setup();
+  try {
+    const first = env.monitor();
+    await first.refreshCandles();
+    const prior = first.candles(null)!.metadata.lastObservation;
+    const empty = createAnthropicMonitor({ store: env.store, now: () => env.clock, readers: {
+      ...createMarketReaders({ fetchImpl: env.venues.fetch }), async anthropicCandles(_starts, at, _signal, ends) {
+        return { at, errors: {}, legs: { binance: [], io: [], xyz: [], rh: [] }, through: ends! };
+      },
+    } });
+    for (let i = 0; i < 3; i++) {
+      env.clock = Math.floor(env.clock / BAR) * BAR + BAR + CANDLE_STALE_MS + 1;
+      await empty.refreshCandles();
+      const view = empty.candles(null)!;
+      assert.deepEqual([view.status, view.metadata.lastObservation, view.metadata.fetchedAt], ['snapshot', prior, iso(env.clock)]);
+    }
   } finally { env.dispose(); }
 });
 
@@ -211,7 +241,7 @@ test('采集循环：报价与 K 线两类轮次各自不重叠，停止后循�
     const context = { stopped: () => stopped, pause: async (ms: number) => { pauses.push(ms); await sleep(1); } };
     const monitor = env.monitor();
     const loops = monitor.loops(context);
-    await until(() => (env.venues.requests.get('quote:binance') ?? 0) >= 5 && (env.venues.requests.get('candles:xyz') ?? 0) >= 3, '几轮采集');
+    await until(() => (env.venues.requests.get('quote:binance') ?? 0) >= 5 && monitor.candles(null) !== null, '几轮采集');
     stopped = true;
     await Promise.all(loops);
     for (const kind of ['quote:binance', 'quote:xyz', 'quote:io', 'candles:binance', 'candles:xyz', 'candles:io', 'candles:rh']) assert.equal(env.venues.maxInFlight.get(kind), 1, kind);
@@ -221,6 +251,7 @@ test('采集循环：报价与 K 线两类轮次各自不重叠，停止后循�
     assert.equal([...env.venues.requests.values()].reduce((sum, value) => sum + value, 0), total, '停止后不再发请求');
 
     env.venues.hold = new Promise(() => undefined);
+    env.clock += BAR;
     const held = env.monitor();
     const rounds = [held.refreshQuote(), held.refreshCandles()];
     await sleep(20);
@@ -357,13 +388,15 @@ test('服务进程：配置 monitor 时提供三个只读接口与状态；未�
       assert.deepEqual([status.monitor.available, status.monitor.error, status.monitor.anthropic.quoteAt, status.monitor.anthropic.candleRows], [true, null, quote.fetchedAt, all.metadata.rows]);
     } finally { await run.shutdown(); await run.done; rmSync(join(data, 'access-url'), { force: true }); }
 
-    // The venues stop answering: what was saved is served at once, marked as a snapshot, and shutdown does not wait.
+    // The blocked quote stays a snapshot. A verified closed-bar range is served without contacting the venues.
     venues.hold = new Promise(() => undefined);
     run = await start();
     try {
       const get = await login(data, port);
       assert.equal((await get('/api/monitor/anthropic/quote')).body.status, 'snapshot');
-      assert.equal((await get('/api/monitor/anthropic/candles')).body.status, 'snapshot');
+      const restored = (await get('/api/monitor/anthropic/candles')).body;
+      assert.equal(restored.status, 'live');
+      assert.ok(restored.coverage.rows > 0);
     } finally {
       const started = Date.now();
       await run.shutdown(); await run.done;

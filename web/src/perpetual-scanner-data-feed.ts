@@ -26,7 +26,7 @@ export function isPerpetualScannerDataReport(input: unknown): input is Perpetual
       return Object.entries(windows).every(([hours, raw]) => {
         if (!HOURS.includes(Number(hours) as FundingWindowHours) || !object(raw) || raw.hours !== Number(hours)
           || !['ready', 'pending', 'partial', 'stale', 'error', 'unsupported'].includes(String(raw.status)) || typeof raw.reason !== 'string'
-          || (raw.asOf !== null && !timestamp(raw.asOf)) || !timestamp(raw.longCount) || !timestamp(raw.shortCount)) return false;
+          || (raw.asOf !== null && !timestamp(raw.asOf)) || (raw.freshUntil !== undefined && !timestamp(raw.freshUntil)) || !timestamp(raw.longCount) || !timestamp(raw.shortCount)) return false;
         return ['longPercent', 'shortPercent', 'netPercent'].every(field => raw[field] === null || (typeof raw[field] === 'number' && Number.isFinite(raw[field])))
           && (raw.status !== 'ready' || (raw.asOf !== null && raw.longPercent !== null && raw.shortPercent !== null && raw.netPercent !== null));
       });

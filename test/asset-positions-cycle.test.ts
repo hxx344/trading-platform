@@ -2,6 +2,12 @@
 // repository's copies (src/asset/positions-cycle.ts, positions-cycle-readers.ts). Every read goes to a fake fetch.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { openAssetDb } from '../src/asset/db.ts';
+import { accountHistory, historyGeneration, HISTORY_OVERLAP } from '../src/asset/history-cache.ts';
+import { readFills } from '../src/asset/fills-readers.ts';
 import { CYCLE_MISMATCH, locateCycle, newestFirst, summarizeCycle } from '../src/asset/positions-cycle.ts';
 import type { CycleFill } from '../src/asset/positions-cycle.ts';
 import { position } from '../src/asset/positions-values.ts';
@@ -9,6 +15,11 @@ import { CycleRetry, readPositionCycle } from '../src/asset/positions-cycle-read
 import type { Credentials } from '../src/asset/validation.ts';
 
 const at = Date.parse('2026-06-01T00:00:00.000Z');
+async function authorizedHistory(database: ReturnType<typeof openAssetDb>, exchange: string, revision: string, scope: string) {
+  const generation = historyGeneration(() => database, exchange, revision);
+  await generation.verify(async () => {});
+  return accountHistory(() => database, exchange, revision, scope, () => true, generation);
+}
 const hour = 3_600_000, day = 24 * hour;
 const fill = (id: string, time: number, side: 'buy' | 'sell', quantity: string, price: string, realizedPnl = '0', fee = '0', extra: Partial<CycleFill> = {}): CycleFill =>
   ({ id, time, side, quantity, price, realizedPnl, fee, feeCurrency: 'USDT', ...extra });
@@ -58,6 +69,94 @@ function mock(handler: (url: URL) => unknown) {
 }
 const inRange = (url: URL, time: number) => time >= Number(url.searchParams.get('startTime') ?? url.searchParams.get('begin') ?? 0)
   && time <= Number(url.searchParams.get('endTime') ?? url.searchParams.get('end') ?? Infinity);
+
+test('the cycle reopens its raw ledger, retains a reversal and late funding, and fetches only a missing day and the tail', async t => {
+  for (const exchange of ['binance', 'bybit', 'okx'] as const) await t.test(exchange, async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'tp-cycle-history-')), file = join(directory, 'asset.sqlite');
+    let db = openAssetDb(file), clock = at, late = false;
+    try {
+      const scope = exchange === 'binance' ? 'um' : exchange === 'bybit' ? 'linear-usdt' : 'SWAP';
+      const symbol = exchange === 'okx' ? 'CL-USDT-SWAP' : 'CLUSDT';
+      const credentials: Credentials = exchange === 'binance' ? { exchange, ...keys }
+        : exchange === 'bybit' ? { exchange, ...keys, region: 'global' } : { exchange, ...keys, passphrase: 'synthetic' };
+      const trades = [{ time: at - 2 * day, id: '3', side: 'sell', qty: '1', after: '2', pnl: '4', cost: '0.1' },
+        { time: at - 15 * day, id: '1', side: 'buy', qty: '5', after: '3', pnl: '-7', cost: '1' }];
+      const venue = mock(url => {
+        const funding = [{ time: at - 4 * day + hour, value: '0.4', id: '2' },
+          ...(late ? [{ time: at - 60_000, value: '0.3', id: '5' }] : [])].filter(row => inRange(url, row.time));
+        const fills = trades.filter(row => inRange(url, row.time));
+        if (exchange === 'binance') return url.pathname.endsWith('income')
+          ? funding.map(row => ({ symbol, tranId: row.id, time: row.time, incomeType: 'FUNDING_FEE', asset: 'USDT', income: row.value }))
+          : fills.map(row => ({ symbol, id: row.id, time: row.time, side: row.side.toUpperCase(), positionSide: 'BOTH', qty: row.qty, price: '80',
+            commission: row.cost, commissionAsset: 'USDT', realizedPnl: row.pnl, privateNote: 'must-not-be-stored' }));
+        if (exchange === 'bybit') return { retCode: 0, result: { nextPageCursor: '', list: [
+          ...funding.map(row => ({ symbol, id: row.id, transactionTime: String(row.time), currency: 'USDT', type: 'SETTLEMENT', funding: row.value, cashFlow: '0' })),
+          ...fills.map(row => ({ symbol, id: row.id, transactionTime: String(row.time), currency: 'USDT', type: 'TRADE',
+            side: row.side === 'sell' ? 'Sell' : 'Buy', qty: row.qty, tradePrice: '80', size: row.after, cashFlow: row.pnl, fee: row.cost }))] } };
+        return { code: '0', data: url.pathname.endsWith('bills-archive')
+          ? funding.reverse().map(row => ({ instId: symbol, billId: row.id, ts: String(row.time), type: '8', subType: '174', pnl: row.value, ccy: 'USDT' }))
+          : fills.map(row => ({ instId: symbol, billId: row.id, ts: String(row.time), side: row.side, posSide: 'net', fillSz: row.qty, fillPx: '80', fillPnl: row.pnl, fee: '-' + row.cost, feeCcy: 'USDT' })) };
+      });
+      const cycle = async (revision = 'first') => readPositionCycle(credentials, scope, { position: held('long', '2', symbol, 'CL'), siblings: [], snapshotAt: clock },
+        { now: () => clock, fetcher: venue.fetcher, spacing: false, history: await authorizedHistory(db, exchange, revision, scope) });
+      const cold = await cycle();
+      assert.equal(cold.status, 'complete'); assert.equal(cold.net, '3.7'); assert.equal(cold.fees, '-0.7');
+      assert.ok(!JSON.stringify(db.prepare('SELECT data FROM asset_history_windows').rows()).includes('must-not-be-stored'));
+      db.close(); db = openAssetDb(file, { mode: 'service' }); clock += 5 * 60_000; late = true;
+      venue.calls.length = 0;
+      const hot = await cycle();
+      assert.equal(hot.status, 'complete'); assert.equal(hot.since, cold.since); assert.equal(hot.net, '4');
+      const from = (url: URL) => Number(url.searchParams.get('startTime') ?? url.searchParams.get('begin'));
+      assert.deepEqual(venue.calls.map(from), Array(exchange === 'bybit' ? 1 : 2).fill(at - HISTORY_OVERLAP));
+      const deleted = db.prepare('DELETE FROM asset_history_windows WHERE start=?').bind(at - 4 * day).run(); assert.ok(deleted);
+      venue.calls.length = 0;
+      assert.equal((await cycle()).net, '4');
+      assert.ok(venue.calls.some(url => from(url) === at - 4 * day));
+      assert.ok(venue.calls.every(url => from(url) === at - 4 * day || from(url) >= clock - HISTORY_OVERLAP));
+      venue.calls.length = 0;
+      assert.equal((await cycle('replacement')).net, '4');
+      assert.ok(venue.calls.some(url => from(url) <= at - 15 * day), 'a changed credential reads its own history');
+    } finally { db.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+});
+
+test('a malformed Bybit cursor leaves the old interval open and a retry resumes after the completed newer interval', async t => {
+  const db = openAssetDb(':memory:'); t.after(() => db.close());
+  let fail = true;
+  const job = mock(url => {
+    const start = Number(url.searchParams.get('startTime'));
+    if (fail && start < at - day) return { retCode: 0, result: { list: [] } };
+    const row = { symbol: 'CLUSDT', id: 'a', transactionTime: String(at - 3 * day), type: 'TRADE', currency: 'USDT',
+      side: 'Buy', qty: '1', tradePrice: '81', fee: '0.1', size: '1', cashFlow: '0' };
+    return { retCode: 0, result: { nextPageCursor: '', list: inRange(url, Number(row.transactionTime)) ? [row] : [] } };
+  });
+  const read = async () => readPositionCycle({ exchange: 'bybit', region: 'global', ...keys }, 'linear-usdt',
+    { position: held('long', '1', 'CLUSDT', 'CL'), siblings: [], snapshotAt: at },
+    { now: () => at, spacing: false, fetcher: job.fetcher, history: await authorizedHistory(db, 'bybit', 'one', 'linear-usdt') });
+  assert.equal((await read()).status, 'unavailable');
+  assert.ok(db.prepare('SELECT MIN(start) AS start FROM asset_history_windows').get<{ start: number }>()!.start > at - day);
+  fail = false; job.calls.length = 0;
+  assert.equal((await read()).net, '-0.1');
+  assert.deepEqual(job.calls.map(url => Number(url.searchParams.get('startTime'))), [at - HISTORY_OVERLAP, at - 23 * hour - 7 * day]);
+});
+
+test('cycle uses all 2,100 raw fills read for the display, including the opening missing from its capped result', async t => {
+  const db = openAssetDb(':memory:'); t.after(() => db.close());
+  const history = await authorizedHistory(db, 'binance', 'current', 'um'), symbol = 'CLUSDT';
+  const trades = Array.from({ length: 2100 }, (_, index) => ({ symbol, id: index + 1, time: at - 4 * day + index * 65_000,
+    side: 'BUY', positionSide: 'BOTH', qty: '1', price: '80', realizedPnl: '0', commission: '0.01', commissionAsset: 'USDT' }));
+  const venue = mock(url => url.pathname.endsWith('income') || url.searchParams.get('symbol') !== symbol ? []
+    : trades.filter(row => inRange(url, row.time)).slice(0, 1000));
+  const credentials: Credentials = { exchange: 'binance', ...keys };
+  const opts = { now: () => at, spacing: false, history, fetcher: venue.fetcher };
+  const raw = await readFills(credentials, 'um', { market: 'oil', start: at - 85 * day, end: at }, opts);
+  assert.equal(raw.length, 2100);
+  db.prepare("INSERT INTO fill_cache VALUES('binance','um','current','{}',?)").bind(at).run();
+  venue.calls.length = 0;
+  const cycle = await readPositionCycle(credentials, 'um', { position: held('long', '2100', symbol, 'CL'), siblings: [], snapshotAt: at }, opts);
+  assert.equal(cycle.status, 'complete'); assert.equal(cycle.fees, '-21'); assert.equal(cycle.evidence!.totalRows, 2100);
+  assert.deepEqual(venue.calls.filter(url => url.pathname.endsWith('userTrades')).map(url => Number(url.searchParams.get('startTime'))), [at - HISTORY_OVERLAP]);
+});
 
 test('Binance walks weekly windows back to the opening fill, follows the hedge side and reads funding from the opening', async () => {
   const trades = [
@@ -187,4 +286,41 @@ test('OKX refuses a summary when cross and isolated positions share a contract a
   const own = { ...held('long', '1', 'ETH-USDT-SWAP', '张（ETH/张）'), id: 'cross' }, other = { ...own, id: 'isolated' };
   const cycle = await readPositionCycle({ exchange: 'okx', ...keys, passphrase: 'synthetic' }, 'SWAP', { position: own, siblings: [own, other], snapshotAt: at }, { fetcher, now: () => at, spacing: false });
   assert.equal(cycle.status, 'unavailable'); assert.match(cycle.note!, /同向仓位/); assert.equal(calls.length, 0);
+});
+
+test('OKX confirms a full page through the opening timestamp before using the local range', async t => {
+  const db = openAssetDb(':memory:'); t.after(() => db.close());
+  const symbol = 'CL-USDT-SWAP';
+  const row = (id: number, age: number, side: string, posSide = 'net') => ({
+    instId: symbol, billId: String(id), ts: String(at - age * hour), side, posSide, fillSz: '1', fillPx: '80',
+    fillPnl: side === 'sell' ? '2' : '0', fee: '-0.1', feeCcy: 'USDT',
+  });
+  // A smaller bill id arrives with a later timestamp. The initial 100 records by themselves suggest a different opening.
+  const rows = [row(1001, 2, 'buy'), ...Array.from({ length: 99 }, (_, i) => row(1000 - i, 6, 'sell', 'short')), row(901, 1, 'sell'), row(900, 4, 'buy')];
+  const venue = mock(url => ({ code: '0', data: !url.pathname.endsWith('fills-history') ? [] : rows.filter(entry =>
+    (!url.searchParams.has('after') || Number(entry.billId) < Number(url.searchParams.get('after'))) && inRange(url, Number(entry.ts))).slice(0, 100) }));
+  const history = await authorizedHistory(db, 'okx', 'one', 'SWAP');
+  const read = () => readPositionCycle({ exchange: 'okx', ...keys, passphrase: 'synthetic' }, 'SWAP', { position: held('long', '1', symbol), siblings: [], snapshotAt: at },
+    { spacing: false, now: () => at, history, fetcher: venue.fetcher });
+  const first = await read();
+  assert.equal(first.status, 'complete'); assert.equal(first.since, new Date(at - 4 * hour).toISOString()); assert.equal(first.net, '1.7');
+  assert.ok(venue.calls.some(url => url.searchParams.get('begin') === String(at - 2 * hour) && url.searchParams.get('after') === '902'));
+  venue.calls.length = 0; assert.equal((await read()).net, '1.7');
+  assert.ok(venue.calls.every(url => Number(url.searchParams.get('begin')) === at - HISTORY_OVERLAP));
+});
+
+test('a failed SQLite write never publishes coverage from a partially inserted window', async t => {
+  const db = openAssetDb(':memory:'); t.after(() => db.close());
+  db.prepare("CREATE TRIGGER fail_day BEFORE INSERT ON asset_history_windows WHEN NEW.start > " + (at - 3 * day) + " BEGIN SELECT RAISE(ABORT, 'full'); END").run();
+  const history = await authorizedHistory(db, 'binance', 'one', 'um');
+  const venue = mock(url => url.pathname.endsWith('income') || !inRange(url, at - 2 * day) ? []
+    : [{ symbol: 'CLUSDT', id: 1, time: at - 2 * day, side: 'BUY', positionSide: 'BOTH', qty: '1', price: '80', realizedPnl: '0', commission: '1', commissionAsset: 'USDT' }]);
+  const read = () => readPositionCycle({ exchange: 'binance', ...keys }, 'um', { position: held('long', '1', 'CLUSDT', 'CL'), siblings: [], snapshotAt: at },
+    { spacing: false, now: () => at, history, fetcher: venue.fetcher });
+  assert.equal((await read()).net, '-1');
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM asset_history_windows').get<{ n: number }>()!.n, 0);
+  db.prepare('DROP TRIGGER fail_day').run(); venue.calls.length = 0;
+  assert.equal((await read()).net, '-1');
+  assert.ok(venue.calls.some(url => Number(url.searchParams.get('startTime')) <= at - 2 * day));
+  assert.ok(db.prepare('SELECT COUNT(*) AS n FROM asset_history_windows').get<{ n: number }>()!.n > 0);
 });

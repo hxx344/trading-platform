@@ -9,9 +9,9 @@ import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { exchangeDefinition, type Exchange, type SpreadMarket } from '../src/vendor/exchange-comparison.mjs';
 import {
-  HISTORY_LEG_LIMIT, HISTORY_REFRESH_MS, HISTORY_WINDOW_MS, analyzeFundingRange, createFundingLegReader, fundingHistoryExchanges, fundingRangeInput, mergeFundingHistory,
+  HISTORY_LEG_LIMIT, HISTORY_REFRESH_MS, HISTORY_WINDOW_MS, analyzeFundingRange, createFundingLegReader, fundingHistoryExchanges, fundingLegStale, fundingRangeInput,
   normalizeSettledFunding, parseCexFundingHistory, parseFundingRangeInput, parseGateFundingHistory, parseHyperliquidFundingHistory, parseLighterFundingHistory,
-  validateExchangeFundingHistory, type ExchangeFundingHistory, type FundingLegReader,
+  validateExchangeFundingHistory, type ExchangeFundingHistory,
 } from '../src/vendor/exchange-funding-history.mjs';
 import { createBinanceGate } from '../src/vendor/anthropic-market.mjs';
 import { FUNDING_HISTORY_DEADLINE_MS, FUNDING_HISTORY_SNAPSHOT_MS, createExchangeReader } from '../src/monitor/exchanges.ts';
@@ -79,9 +79,15 @@ test('快照校验：合约、币种、未来结算、重复时间、覆盖范�
     assert.throws(() => validateExchangeFundingHistory({ ...value, ...patch }, 'hyperliquid', 'oil'), JSON.stringify(patch));
   }
   for (const coverage of [{ from: NOW, to: NOW - 1 }, { from: NOW - HOUR, to: NOW + 1 }, { from: NOW - 1, to: NOW }]) assert.throws(() => validateExchangeFundingHistory({ ...value, left: { ...value.left, coverage } }, 'hyperliquid', 'oil'));
+  assert.throws(() => validateExchangeFundingHistory({ ...value, left: { ...value.left, freshUntil: NOW + 2 * DAY } }, 'hyperliquid', 'oil'), /freshness/);
   assert.throws(() => validateExchangeFundingHistory(value, 'variational', 'oil'), /Unsupported/);
   assert.throws(() => validateExchangeFundingHistory(snapshot('gate', NOW, 'hynix'), 'gate', 'oil'), /Unsupported/);
   assert.equal(validateExchangeFundingHistory(JSON.parse(JSON.stringify(snapshot('gate', NOW, 'hynix'))), 'gate', 'hynix').left.symbol, 'SKHY_USDT');
+  const ranges = [{ from: NOW - 2 * HOUR, to: NOW - HOUR + 100 }, { from: NOW - 60_000, to: NOW }];
+  const disjoint = validateExchangeFundingHistory({ ...value, left: { ...value.left, coverage: ranges[1], ranges } }, 'hyperliquid', 'oil');
+  assert.equal(analyzeFundingRange(disjoint, { from: NOW - 2 * HOUR, to: NOW }, 'short').left.coverage, 'partial');
+  assert.equal(analyzeFundingRange(disjoint, ranges[0]!, 'short').left.count, 1);
+  assert.equal(analyzeFundingRange(disjoint, ranges[0]!, 'short').left.coverage, 'queried');
 });
 
 test('区间统计：UTC 输入；含开始不含结束；超过 200 条全部累计；无记录不是零费率；覆盖不全如实标注', () => {
@@ -109,37 +115,6 @@ test('区间统计：UTC 输入；含开始不含结束；超过 200 条全部�
   assert.throws(() => analyzeFundingRange(history, { from: NOW, to: NOW }, 'short'));
 });
 
-test('两腿合并：一腿失败保留旧记录与旧采集时间、覆盖随 60 天窗口收缩；两腿都失败才报错；增量只回读最后一天', async () => {
-  let now = NOW, fail = '';
-  const ranges: Record<string, { from: number; to: number }[]> = {};
-  const readLeg: FundingLegReader = async (_exchange, symbol, range) => {
-    (ranges[symbol] ??= []).push(range);
-    if (fail === 'all' || symbol === fail) throw new Error('Exchange market HTTP 503');
-    return [{ time: now - HOUR + (symbol.endsWith('CL') ? 32 : 21), rate: symbol.endsWith('CL') ? -0.0001 : 0 }];
-  };
-  const initial = await mergeFundingHistory({ exchange: 'hyperliquid', monitorId: 'oil', readLeg, clock: () => now });
-  assert.equal(initial.rows.length, 2);
-  assert.ok(initial.rows.every(row => (row.leftRate === null) !== (row.rightRate === null)), '两腿各自的结算时间，不按时间桶配对');
-  assert.deepEqual(ranges['xyz:CL']![0], { from: NOW - HISTORY_WINDOW_MS, to: NOW });
-  now += HISTORY_REFRESH_MS; fail = 'xyz:CL';
-  const partial = await mergeFundingHistory({ exchange: 'hyperliquid', monitorId: 'oil', previous: initial, readLeg, clock: () => now });
-  assert.deepEqual(ranges['xyz:BRENTOIL']![1], { from: NOW - DAY, to: now }, '增量从上次覆盖终点前一天读起');
-  assert.equal(partial.left.fetchedAt, new Date(now).toISOString());
-  assert.equal(partial.right.fetchedAt, initial.right.fetchedAt);
-  assert.ok(partial.right.error && partial.reason);
-  assert.deepEqual(partial.right.coverage, { from: now - HISTORY_WINDOW_MS, to: NOW });
-  assert.deepEqual(partial.rows.find(row => row.rightRate !== null), initial.rows.find(row => row.rightRate !== null));
-  const fresh = await mergeFundingHistory({ exchange: 'hyperliquid', monitorId: 'oil', readLeg, clock: () => now });
-  assert.equal(fresh.right.fetchedAt, null);
-  assert.equal(fresh.right.coverage, null);
-  // Once the old coverage leaves the window, the failed leg claims nothing and its expired rows are gone.
-  now = NOW + HISTORY_WINDOW_MS + HOUR;
-  const expired = await mergeFundingHistory({ exchange: 'hyperliquid', monitorId: 'oil', previous: partial, readLeg, clock: () => now });
-  assert.equal(expired.right.coverage, null);
-  assert.ok(expired.rows.every(row => row.rightRate === null));
-  fail = 'all';
-  await assert.rejects(mergeFundingHistory({ exchange: 'hyperliquid', monitorId: 'oil', previous: partial, readLeg, clock: () => now }), /unavailable/);
-});
 
 test('分页：Bybit 按 endTime 往前翻到覆盖起点；空历史算查过；超大页、不前进、页数上限都按读取不完整报错', async () => {
   const urls: string[] = [];
@@ -162,6 +137,8 @@ test('分页：Bybit 按 endTime 往前翻到覆盖起点；空历史算查过�
   assert.equal((await reader('binance', 'SKHYUSDT', range)).length, 1441);
   assert.equal(urls.length, 2);
   assert.equal(new URL(urls[1]!).searchParams.get('startTime'), String(NOW - HISTORY_WINDOW_MS + 999 * HOUR + 1), 'Binance 下一页从本页最新一条后 1 毫秒读起');
+  page = () => [{ symbol: 'SKHYUSDT', fundingTime: NOW, fundingRate: '-0.002', rateType: 'Special' }];
+  assert.deepEqual(await reader('binance', 'SKHYUSDT', range), [{ time: NOW, rate: -0.002, special: true }]);
   page = url => ({ code: '0', data: grid(NOW - 70 * DAY, Number(url.searchParams.get('after')) - 1).reverse().slice(0, 400).map(t => ({ instId: 'SKHY-USDT-SWAP', instType: 'SWAP', fundingTime: String(t), fundingRate: '0.0001', realizedRate: '0.0001', method: 'current_period' })) });
   urls.length = 0;
   assert.equal((await reader('okx', 'SKHY-USDT-SWAP', range)).length, 1441);
@@ -213,7 +190,7 @@ test('各交易所：替身上逐家读出两腿 60 天实际结算，费率来�
   }
 });
 
-test('缓存：同一交易所 5 分钟内共用、并发只读一次；之后只回读最后一天，记录保留', async () => {
+test('缓存：并发共用结果，两次已知结算之间不查新段，到期后只增加实际结算', async () => {
   const { venues, reader, advance } = setup();
   const count = () => venues.requests.get('exchange:bybit') ?? 0;
   const [a, b] = await Promise.all([reader.fundingHistory('hynix', 'bybit'), reader.fundingHistory('hynix', 'bybit')]);
@@ -228,14 +205,75 @@ test('缓存：同一交易所 5 分钟内共用、并发只读一次；之后�
   assert.equal(count(), first + 2);
   assert.ok(next.rows.length >= a.rows.length, '增量合并不丢旧记录');
   assert.ok(Date.parse(next.fetchedAt) > Date.parse(a.fetchedAt));
-  // The hourly Hyperliquid history pages 500 at a time on the first read, then reads one page.
+  // The hourly Hyperliquid history pages 500 at a time on the first read.
   const before = venues.requests.get('settled:skhy') ?? 0;
   await reader.fundingHistory('hynix', 'hyperliquid');
   const pages = (venues.requests.get('settled:skhy') ?? 0) - before;
   assert.ok(pages >= 2, `首次分页 ${pages}`);
   advance(HISTORY_REFRESH_MS);
   await reader.fundingHistory('hynix', 'hyperliquid');
-  assert.equal((venues.requests.get('settled:skhy') ?? 0) - before, pages + 1);
+  assert.equal((venues.requests.get('settled:skhy') ?? 0) - before, pages);
+});
+
+test('跨多页的 60 天窗口固定在请求终点，最早的整点后 7 毫秒仍保留，采集时间使用实际回包', async () => {
+  const end = Date.UTC(2026, 10, 15, 8), first = end - HISTORY_WINDOW_MS + 7;
+  let clock = end, requests = 0;
+  const reader = createExchangeReader({ gate: createBinanceGate(), now: () => clock, oilQuote: () => null, hynixQuote: () => null, log: () => {},
+    fetchImpl: async (_url, init) => {
+      const { coin, startTime, endTime } = JSON.parse(String(init.body)) as { coin: string; startTime: number; endTime: number };
+      const rows = [];
+      for (let time = first + Math.max(0, Math.ceil((startTime - first) / HOUR)) * HOUR; time <= endTime && rows.length < 500; time += HOUR) rows.push({ coin, time, fundingRate: '0.0001' });
+      requests++; clock += 2_000;
+      return Response.json(rows);
+    } });
+  const history = await reader.fundingHistory('hynix', 'hyperliquid');
+  assert.ok(requests > 4 && Date.parse(history.fetchedAt) >= end + 2_000);
+  assert.deepEqual(history.left.coverage, { from: end - HISTORY_WINDOW_MS, to: end });
+  assert.equal(history.rows.at(-1)!.time, first);
+  assert.deepEqual(validateExchangeFundingHistory(JSON.parse(JSON.stringify(history)), 'hyperliquid', 'hynix'), history);
+});
+
+test('记录不足以判断结算周期时，五分钟后复查尚未查询的尾段', async () => {
+  let clock = NOW, calls = 0;
+  const reader = createExchangeReader({ gate: createBinanceGate(), now: () => clock, oilQuote: () => null, hynixQuote: () => null, log: () => {},
+    fetchImpl: async href => {
+      const url = new URL(href); calls++;
+      return Response.json({ retCode: 0, result: { list: [{ symbol: url.searchParams.get('symbol'), fundingRateTimestamp: String(NOW - HOUR), fundingRate: '0' }] } });
+    } });
+  const first = await reader.fundingHistory('hynix', 'bybit');
+  clock += HISTORY_REFRESH_MS - 1; await reader.fundingHistory('hynix', 'bybit'); assert.equal(calls, 2);
+  clock++; const next = await reader.fundingHistory('hynix', 'bybit'); assert.equal(calls, 4);
+  assert.equal(first.left.coverage!.to, NOW); assert.equal(next.left.coverage!.to, clock);
+  assert.equal(fundingLegStale(next.left, clock + 11 * 60_000), true);
+});
+
+test('逐腿覆盖能跨重启补缺；持久化失败的区间仍会重试，一条腿的成功不被另一条腿推进', async () => {
+  let at = NOW;
+  const dir = mkdtempSync(join(tmpdir(), 'tp-funding-leg-')), now = () => at;
+  const config = parseServiceConfig({ secretsFile: '/secrets', monitor: { hynix: {} } }).monitor!;
+  const venues = fakeAnthropicVenues({ now }), symbols: string[] = [];
+  const fetchImpl = async (url: string, init: RequestInit) => { symbols.push(new URL(url).searchParams.get('symbol')!); return venues.fetch(url, init); };
+  const open = () => openMonitor(config, dir, { now, fetchImpl, log: () => {} });
+  let runtime = open();
+  const read = () => runtime.exchanges!.fundingHistory('hynix', 'bybit');
+  try {
+    venues.historyDown.add('bybit:SKHYNIX');
+    const first = await read();
+    assert.ok(first.left.coverage); assert.equal(first.right.coverage, null);
+    stopMonitor(runtime); closeMonitor(runtime); runtime = open(); symbols.length = 0;
+    venues.historyDown.clear();
+    const save = runtime.store.writeFundingFacts;
+    runtime.store.writeFundingFacts = () => { throw Error('disk full'); };
+    at += 20_000;
+    const failed = await read();
+    assert.equal(failed.left.fetchedAt, first.left.fetchedAt); assert.equal(failed.right.coverage, null);
+    assert.deepEqual(symbols, ['SKHYNIXUSDT']);
+    runtime.store.writeFundingFacts = save; symbols.length = 0; at += 20_000;
+    const recovered = await read();
+    assert.deepEqual(symbols, ['SKHYNIXUSDT']); assert.equal(recovered.left.fetchedAt, first.left.fetchedAt);
+    assert.deepEqual(recovered.right.coverage, { from: at - HISTORY_WINDOW_MS, to: at });
+    assert.equal(recovered.right.error, '');
+  } finally { stopMonitor(runtime); closeMonitor(runtime); rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('失败：一腿失败给部分快照并记日志；两腿都失败时有旧快照就标旧 15 秒，没有就给中文原因；恢复记一次', async () => {
@@ -249,7 +287,7 @@ test('失败：一腿失败给部分快照并记日志；两腿都失败时有�
   assert.match(logs.at(-1)!, /接口返回 HTTP 500/);
   venues.historyDown.delete('okx:SKHYNIX');
   venues.exchangeDown.add('okx');
-  advance(HISTORY_REFRESH_MS);
+  advance(8 * HOUR);
   const kept = await reader.fundingHistory('hynix', 'okx');
   assert.deepEqual([kept.status, kept.reason, kept.rows], ['snapshot', '历史结算费率暂时更新失败，保留上次成功记录。', partial.rows]);
   assert.equal(logs.filter(line => line.includes('hynix/okx/funding-history')).length, 1, '原因不变不重复记');

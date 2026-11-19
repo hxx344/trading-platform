@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, once } from 'node:events';
+import { randomUUID } from 'node:crypto';
 import { mkdtempDisposableSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createVenueFeeds } from '../src/market/venue-feeds.ts';
 import { unpackBook } from '../src/market/venue-protocol.ts';
-import type { MarketClient, MarketOperations } from '../src/market/ipc.ts';
+import { createMarketClient, type MarketClient, type MarketOperations } from '../src/market/ipc.ts';
+import { createMarketServer } from '../src/market/server.ts';
 import { remoteCrossexReaders, remoteOndoClient, remoteOndoStream, remoteOndoTopStream } from '../src/service/remote-venue-feeds.ts';
 import { createOndoModule } from '../src/service/ondo.ts';
 import { ONDO_MM_DEFAULTS } from '../src/vendor/ondo/mm.mjs';
@@ -188,6 +190,8 @@ test('public operations reject unknown fields, mixed identities, invalid interva
   for (const [op, input] of [
     ['ondo.depth', { market: symbol, levels: 101 }], ['ondo.markets', { credentials: { secret: 'invalid' } }],
     ['crossex.candles', { quote: identity, interval: '2s' }], ['crossex.candles', { quote: lighter, interval: '1h' }],
+    ['crossex.candles', { quote: identity, interval: '1m', from: to }], ['crossex.candles', { quote: identity, interval: '1m', to }],
+    ['crossex.candles', { quote: identity, interval: '1m', from: Math.floor(to / 60000) * 60000 - 240 * 60000, to }],
     ['crossex.manualDepth', { quote: { ...identity, crossexSymbol: 'BYBIT_FUTURE_BTC_USDT' } }],
     ['crossex.manualDepth', { quote: { ...identity, apiKey: 'invalid' } }],
     ['crossex.fundingHistory', { quote: comparable, from: to + 1, to }],
@@ -207,6 +211,28 @@ test('public operations reject unknown fields, mixed identities, invalid interva
   assert.deepEqual(calls, []);
   await feeds.call('crossex.fundingHistory', { quote: comparable, from: to - 60000, to }, signal);
   assert.equal(calls.length, 1);
+});
+
+test('CrossEx requests the exact missing candle range through the market socket and the native reader', async () => {
+  using dir = mkdtempDisposableSync(join(tmpdir(), 'tp-crossex-candles-'));
+  const socket = process.platform === 'win32' ? `\\\\.\\pipe\\candles-${randomUUID()}` : join(dir.path, 'rpc.sock');
+  const from = Math.floor(Date.now() / 60000) * 60000 - 91 * 60000, to = from + 119999;
+  const requests: URL[] = [];
+  const candles = createCandleReader({ fetcher: async url => {
+    requests.push(new URL(url));
+    return Response.json([[from, '1', '2', '1', '2', '3'], [from + 60000, '2', '2', '1', '1', '4']]);
+  } });
+  const feeds = createVenueFeeds({ candles });
+  const server = createMarketServer({ crossex: feeds }, 'fixture');
+  server.server.listen(socket); await once(server.server, 'listening');
+  const peer = createMarketClient(socket), remote = remoteCrossexReaders(peer);
+  try {
+    const result = await remote.terminalOptions.candleReader(identity, '1m', undefined, { from, to });
+    assert.deepEqual(result, [{ time: from, open: '1', high: '2', low: '1', close: '2', volume: '3' },
+      { time: from + 60000, open: '2', high: '2', low: '1', close: '1', volume: '4' }]);
+    assert.equal(requests.length, 1);
+    assert.deepEqual(Object.fromEntries(requests[0]!.searchParams), { symbol: 'BTCUSDT', interval: '1m', limit: '2', startTime: String(from), endTime: String(to) });
+  } finally { remote.terminalOptions.publicFeed.close(); peer.close(); server.close(); }
 });
 
 test('CrossEx binds the exact native identity and source timestamp to each confirmation generation', async t => {

@@ -3,19 +3,25 @@
 import { createTerminalFeed } from './terminal-feed.mjs';
 import { createCandleReader } from './candle-reader.mjs';
 import { bookChannel, numeric, time, TERMINAL_SYMBOL, normalizeCandles, INTERVALS } from './terminal-data.mjs';
+import { createTerminalHistory } from './terminal-history.mjs';
 import { loadManualDepth } from './clients.mjs';
-import { AppError, validateBooks } from './model.mjs';
+import { AppError, contractIdentity, validateBooks } from './model.mjs';
 import { D } from './money.mjs';
 
 export { createCandleReader, normalizeCandles, INTERVALS };
 
 /** Authenticated HTTP readers share one bounded, credential-free public stream. */
-export function createTerminalMarket({ market, depthReader = loadManualDepth, candleReader = createCandleReader(), WebSocketImpl, clock = Date.now, publicFeed = createTerminalFeed({ WebSocketImpl, clock }) } = {}) {
-  const entries = new Map();
+export function createTerminalMarket({ market, store, depthReader = loadManualDepth, candleReader = createCandleReader(), WebSocketImpl, clock = Date.now, publicFeed = createTerminalFeed({ WebSocketImpl, clock }) } = {}) {
+  const entries = new Map(), historyFlights = new Set(), archive = createTerminalHistory(store, candleReader, clock);
   let stopped = false;
   const active = e => clock() - e.touched < 120000;
   const freshAt = (at, age = 10000) => time(at) && at <= clock() + 1000 && clock() - at <= age;
   const unitOf = e => ['gate', 'okx'].includes(e.display.quote.exchange) ? numeric(e.quote?.nativeUnit, true) : '1';
+  function clearCandles(e) {
+    for (const history of e.candles.values()) history.controller.abort();
+    e.candles.clear();
+  }
+  function release(e) { e.unsubscribe?.(); clearCandles(e); }
   // Keep the raw stream so a newly confirmed multiplier never mixes units.
   const streamBook = e => {
     if (!e.streamBook) return null;
@@ -65,7 +71,7 @@ export function createTerminalMarket({ market, depthReader = loadManualDepth, ca
     } });
   }
   const sweep = setInterval(() => {
-    for (const [symbol, e] of entries) if (!active(e) && !e.flight && !e.displayFlight) { e.unsubscribe?.(); entries.delete(symbol); }
+    for (const [symbol, e] of entries) if (!active(e) && !e.flight && !e.displayFlight) { release(e); entries.delete(symbol); }
   }, 25000); sweep.unref();
   async function read(symbol, interval = '5m') {
     if (stopped) throw new AppError('行情服务已停止', 503);
@@ -76,7 +82,7 @@ export function createTerminalMarket({ market, depthReader = loadManualDepth, ca
       if (entries.size >= 12) {
         const oldest = [...entries].filter(([, x]) => !x.flight && !x.displayFlight).sort((a, b) => a[1].touched - b[1].touched)[0];
         if (!oldest) throw new AppError('行情查询繁忙，请稍后重试', 429);
-        oldest[1].unsubscribe?.(); entries.delete(oldest[0]);
+        release(oldest[1]); entries.delete(oldest[0]);
       }
       e = { touched: clock(), epoch: 0, book: null, bookAttempt: -Infinity, identityAttempt: -Infinity, flight: null, ticker: {}, tickerAt: 0, trades: [], candles: new Map() }; entries.set(symbol, e);
     }
@@ -84,7 +90,7 @@ export function createTerminalMarket({ market, depthReader = loadManualDepth, ca
     // A current CrossEx listing authorizes public subscription, not execution.
     if (!e.displayFlight) e.displayFlight = Promise.resolve().then(() => (market.resolveDisplaySymbol ?? market.resolveSymbol)(symbol)).finally(() => { e.displayFlight = null; });
     try { e.display = await e.displayFlight; }
-    catch (error) { if (entries.get(symbol) === e) { e.unsubscribe?.(); entries.delete(symbol); } throw error; }
+    catch (error) { if (entries.get(symbol) === e) { release(e); entries.delete(symbol); } throw error; }
     if (stopped) throw new AppError('行情服务已停止', 503);
     if (entries.get(symbol) !== e) throw new AppError('行情查询已失效，请重试', 409);
     watch(symbol, e);
@@ -98,9 +104,11 @@ export function createTerminalMarket({ market, depthReader = loadManualDepth, ca
             e.identityAttempt = clock();
             let resolved;
             try { resolved = await market.resolveSymbol(symbol); }
-            catch (error) { e.quote = null; e.tradingError = error instanceof AppError ? error.message : '原生合约身份暂未确认'; throw error; }
+            catch (error) { e.quote = null; clearCandles(e); e.tradingError = error instanceof AppError ? error.message : '原生合约身份暂未确认'; throw error; }
             const { quote, rule } = resolved;
-            if (e.quote && (e.quote.symbol !== quote.symbol || e.quote.nativeUnit !== quote.nativeUnit)) { e.book = null; e.candles.clear(); }
+            const identity = contractIdentity(quote);
+            if (e.identity && e.identity !== identity) { e.book = null; clearCandles(e); }
+            e.identity = identity; e.identityAt = e.identityAttempt;
             e.quote = quote; e.rule = rule;
           }
           if (!e.quote) throw new AppError(e.tradingError || '原生合约身份暂未确认');
@@ -119,15 +127,20 @@ export function createTerminalMarket({ market, depthReader = loadManualDepth, ca
     }
     await briefly(e.flight);
     if (stopped) throw new AppError('行情服务已停止', 503);
-    let history = e.candles.get(interval);
-    if (e.quote && (!history || clock() - history.at >= 15000)) {
-      if (!history) { history = { data: [], at: -Infinity, flight: null, error: null }; e.candles.set(interval, history); }
-      if (!history.flight) {
-        history.at = clock();
-        history.flight = Promise.resolve().then(() => candleReader(e.quote, interval)).then(rows => { history.data = normalizeCandles(rows, interval, clock()); history.error = null; }, () => { history.error = '历史 K 线暂不可用'; }).catch(() => { history.error = '历史 K 线响应无效'; }).finally(() => { history.flight = null; });
+    let history, historyError = null;
+    if (e.quote && clock() - e.identityAt < 30000) {
+      history = e.candles.get(interval);
+      try { history = archive.restore(e.identity, interval, history); e.candles.set(interval, history); }
+      catch { historyError = '已保存的历史 K 线暂不可读'; }
+      if (history && !historyError && !history.flight && (clock() < history.attempt || clock() - history.attempt >= 15000)) {
+        const h = history;
+        h.attempt = clock();
+        const flight = archive.refresh(h, e.identity, e.quote, interval).finally(() => { h.flight = null; historyFlights.delete(flight); });
+        h.flight = flight; historyFlights.add(flight);
       }
-    }
-    await briefly(history?.flight);
+      if (!history?.closed.size) await briefly(history?.flight);
+      if (!e.quote || e.candles.get(interval) !== history) history = null;
+    } else historyError = '尚未确认原生历史 K 线来源';
     const publicBook = streamBook(e), book = publicBook && (!e.book || publicBook.at >= e.book.at) ? publicBook : e.book;
     const bookFresh = book && freshAt(book.at), tickerFresh = freshAt(e.tickerAt);
     const currentBbo = tickerFresh && (!bookFresh || e.tickerAt > book.at);
@@ -140,8 +153,8 @@ export function createTerminalMarket({ market, depthReader = loadManualDepth, ca
         bidPrice: currentBbo ? e.ticker.bidPrice : book?.bids[0]?.[0] ?? null, askPrice: currentBbo ? e.ticker.askPrice : book?.asks[0]?.[0] ?? null,
         markPrice: e.mark && freshAt(e.mark.at) ? e.mark.price : null, markPriceAt: e.mark && freshAt(e.mark.at) ? e.mark.at : null,
         ...(e.funding && freshAt(e.funding.at, 60000) && e.funding.nextFundingAt > clock() ? { fundingRate: e.funding.fundingRate, nextFundingAt: e.funding.nextFundingAt } : { fundingRate: null, nextFundingAt: null }) },
-      book, candles: history?.data ?? [], candleError: history?.error ?? (!e.quote ? '尚未确认原生历史 K 线来源' : null), candleAsOf: history && Number.isFinite(history.at) ? history.at : null,
+      book, candles: history ? archive.data(history, interval) : [], candleError: historyError ?? history?.error ?? null, candleAsOf: history?.asOf ?? null,
       trades: e.trades.filter(t => clock() - t.at < 300000).map(t => ({ ...t, quantity: unit ? D(t.quantity).times(unit).toString() : t.quantity, quantityUnit: unit ? 'base' : 'contracts' })), interval };
   }
-  return { read, async stop() { stopped = true; clearInterval(sweep); for (const e of entries.values()) e.unsubscribe?.(); publicFeed.close(); await Promise.allSettled([...entries.values()].flatMap(e => [e.displayFlight, e.flight, ...[...e.candles.values()].map(h => h.flight)])); entries.clear(); } };
+  return { read, async stop() { stopped = true; clearInterval(sweep); for (const e of entries.values()) release(e); publicFeed.close(); await Promise.allSettled([...historyFlights, ...[...entries.values()].flatMap(e => [e.displayFlight, e.flight])]); entries.clear(); } };
 }

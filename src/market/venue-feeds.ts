@@ -7,7 +7,7 @@ import { createOndoStream, createOndoTopStream, type OndoBook } from '../vendor/
 import { createPublicClients } from '../vendor/crossex/clients.mjs';
 import { createFundingClient } from '../vendor/crossex/funding-client.mjs';
 import { createCandleReader } from '../vendor/crossex/candle-reader.mjs';
-import { INTERVALS, TERMINAL_SYMBOL } from '../vendor/crossex/terminal-data.mjs';
+import { INTERVALS, TERMINAL_SYMBOL, validCandleRange } from '../vendor/crossex/terminal-data.mjs';
 import { createTerminalFeed } from '../vendor/crossex/terminal-feed.mjs';
 
 interface VenueReaders {
@@ -68,10 +68,15 @@ export function createVenueFeeds(readers: VenueReaders = {}): MarketOperations {
       return manual ? depths.loadManualDepth(quote, signal) : depths.loadDepth(quote, signal);
     }
     if (op === 'crossex.candles') {
-      const p = fields(input, ['quote', 'interval']), quote = checkIdentity(p.quote, 'manual');
+      const p = fields(input, ['quote', 'interval', 'from', 'to']), quote = checkIdentity(p.quote, 'manual');
       if (typeof p.interval !== 'string' || !Object.hasOwn(INTERVALS, p.interval)) throw new Error('不支持的 K 线周期');
+      let range;
+      if (p.from !== undefined || p.to !== undefined) {
+        if (!timestamp(p.from) || !timestamp(p.to) || !validCandleRange(p.interval, p.from, p.to, Date.now())) throw new Error('K 线时间区间无效');
+        range = { from: p.from, to: p.to };
+      }
       await checkLighterMarket(quote, signal);
-      return candles(quote, p.interval, signal);
+      return candles(quote, p.interval, signal, range);
     }
     if (op === 'crossex.currentFunding') {
       const p = fields(input, ['quote']), quote = checkIdentity(p.quote, 'either');

@@ -12,6 +12,7 @@ export interface PerpetualFundingHistoryStore {
 export interface PerpetualFundingHistoryServiceOptions {
   getSnapshot: () => { quotes: PerpetualQuote[] };
   getMarket?: (exchange: string, symbol: string) => PerpetualMarket | undefined | null;
+  getQuote?: (exchange: string, symbol: string) => PerpetualQuote | undefined;
   store?: PerpetualFundingHistoryStore | null;
   clock?: () => number;
   reader?: PerpetualFundingReader;

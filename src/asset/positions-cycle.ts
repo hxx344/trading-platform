@@ -55,10 +55,10 @@ export function divide(left: string, right: string, scale = 12) {
   return render({ digits: a.digits * BigInt(10) ** BigInt(scale + b.scale) / (b.digits * BigInt(10) ** BigInt(a.scale)), scale });
 }
 const sum = (values: string[]) => values.reduce(add, '0');
-const delta = (fill: CycleFill) => fill.side === 'buy' ? fill.quantity : negate(fill.quantity);
+const delta = (fill: Pick<CycleFill, 'side' | 'quantity'>) => fill.side === 'buy' ? fill.quantity : negate(fill.quantity);
 
 /** Fills are newest first. Walks the current signed position back to the fill that opened it from zero. */
-export function locateCycle(current: string, fills: readonly CycleFill[]): { index: number; openingFraction: string | null } | null {
+export function locateCycle(current: string, fills: readonly Pick<CycleFill, 'side' | 'quantity'>[]): { index: number; openingFraction: string | null } | null {
   let after = current;
   for (let index = 0; index < fills.length; index++) {
     const before = subtract(after, delta(fills[index]));

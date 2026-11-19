@@ -5,13 +5,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { openAssetDb } from '../src/asset/db.ts';
-import { createPositionsService } from '../src/asset/positions-service.ts';
-import { position, POSITIONS_FAILED } from '../src/asset/positions-values.ts';
+import { createPositionsService as positionsService, type PositionsServiceOptions } from '../src/asset/positions-service.ts';
+import { createFillsService } from '../src/asset/fills-service.ts';
+import { position, POSITIONS_FAILED, PositionsPermissionError } from '../src/asset/positions-values.ts';
+import { HISTORY_OVERLAP } from '../src/asset/history-cache.ts';
 import type { HubPositions, Position } from '../src/asset/positions-types.ts';
 import type { Credentials } from '../src/asset/validation.ts';
 import { CycleRetry } from '../src/asset/positions-cycle-readers.ts';
 
 const credential: Credentials = { exchange: 'binance', apiKey: 'synthetic-key', apiSecret: 'synthetic-secret' };
+const createPositionsService = (options: PositionsServiceOptions) => positionsService(options.read ? { permission: async () => {}, ...options } : options);
 const at = Date.parse('2026-10-01T00:00:00.000Z');
 const sample = [position('BTCUSDT', 'long', '1.000000000000000001', 'BTC')];
 const flush = () => new Promise<void>(resolve => setImmediate(resolve));
@@ -27,6 +30,93 @@ function fixture() {
   const unseal = (value: string) => credentials.get(value);
   return { database, save, unseal };
 }
+
+test('the default position reader rechecks account permissions and positions on a warm ledger and a denied fill refresh invalidates its in-flight cycle', async t => {
+  const f = fixture(); t.after(() => f.database.close());
+  await f.save('owner', 'okx', { exchange: 'okx', apiKey: 'synthetic', apiSecret: 'synthetic', passphrase: 'synthetic' });
+  let clock = at, heldRead = false;
+  const waiting = deferred<void>(), arrived = deferred<void>(), calls: URL[] = [], symbol = 'CL-USDT-SWAP';
+  const fetcher: typeof fetch = async input => {
+    const url = new URL(String(input)); calls.push(url);
+    if (url.pathname.endsWith('/config')) return Response.json({ code: '0', data: [{ perm: 'read_only' }] });
+    if (url.pathname.endsWith('/positions')) return Response.json({ code: '0', data: url.searchParams.get('instType') === 'SWAP'
+      ? (heldRead ? ['CL', 'BZ'] : ['CL']).map(base => ({ instType: 'SWAP', instId: base + '-USDT-SWAP', posId: base, pos: '1', posSide: 'net', mgnMode: 'cross' })) : [] });
+    if (url.pathname.endsWith('/instruments')) {
+      const instId = url.searchParams.get('instId')!;
+      return Response.json({ code: '0', data: [{ instId, instType: 'SWAP', uly: instId.slice(0, -5), settleCcy: 'USDT', ctVal: '1', ctMult: '1', ctValCcy: instId.split('-')[0] }] });
+    }
+    if (url.pathname.endsWith('/bills-archive')) return Response.json({ code: '0', data: [] });
+    assert.ok(url.pathname.endsWith('/fills-history'));
+    if (heldRead) { arrived.resolve(); await waiting.promise; }
+    const time = at - 2 * 86_400_000;
+    return Response.json({ code: '0', data: time >= Number(url.searchParams.get('begin')) && time <= Number(url.searchParams.get('end') ?? Infinity)
+      ? [{ instId: symbol, billId: '1', ts: String(time), side: 'buy', posSide: 'net', fillSz: '1', fillPx: '80', fillPnl: '0', fee: '-0.1', feeCcy: 'USDT' }] : [] });
+  };
+  const service = () => createPositionsService({ now: () => clock, fetcher });
+  let positions = service(); t.after(() => positions.close());
+  const read = () => positions.read(() => f.database, f.unseal);
+  await read(); await positions.idle();
+  assert.equal(scope(await read(), 'okx', 'default', 'SWAP').positions[0].cycle?.net, '-0.1');
+  assert.ok(f.database.prepare('DELETE FROM asset_history_windows WHERE start=?').bind(at - 2 * 86_400_000).run());
+  positions.close(); positions = service(); clock += 360_000; calls.length = 0;
+  await read(); await positions.idle();
+  assert.equal(scope(await read(), 'okx', 'default', 'SWAP').positions[0].cycle?.net, '-0.1');
+  for (const path of ['/config', '/positions', '/fills-history', '/bills-archive']) assert.ok(calls.some(url => url.pathname.endsWith(path)), path);
+  assert.deepEqual([...new Set(calls.filter(url => url.searchParams.has('begin')).map(url => Number(url.searchParams.get('begin'))))].sort(),
+    [at - HISTORY_OVERLAP, at - 2 * 86_400_000].sort());
+  const count = () => f.database.prepare('SELECT COUNT(*) AS count FROM asset_history_windows').get<{ count: number }>()!.count;
+  assert.ok(count() > 0);
+  clock += 360_000; heldRead = true;
+  await read(); await arrived.promise;
+  const fills = createFillsService({ now: () => clock, permission: async () => { throw new PositionsPermissionError(); } });
+  try { await fills.read(() => f.database, f.unseal); await fills.idle(); assert.equal(count(), 0); }
+  finally { fills.close(); waiting.resolve(); }
+  await positions.idle();
+  assert.equal(count(), 0, 'the old cycle cannot restore the revoked history after its HTTP response arrives');
+  assert.equal(scope(await read(), 'okx', 'default', 'SWAP').positions[0].cycle?.net, null);
+  assert.ok(!calls.some(url => url.pathname.endsWith('/fills-history') && url.searchParams.get('instId') === 'BZ-USDT-SWAP'),
+    'the second held position belongs to the same pre-denial snapshot');
+});
+
+test('permission loss while an OKX snapshot is pending cancels its historical work and earlier queued reads', async t => {
+  for (const pending of ['fills', 'positions'] as const) await t.test(pending, async () => {
+    const f = fixture(); await f.save('owner', 'okx', { exchange: 'okx', apiKey: 'synthetic', apiSecret: 'synthetic', passphrase: 'synthetic' });
+    const ready = deferred<void>(), release = deferred<void>(), paths: string[] = [];
+    const fetcher: typeof fetch = async input => {
+      const url = new URL(String(input)); paths.push(url.pathname);
+      if (url.pathname.endsWith('/config')) return Response.json({ code: '0', data: [{ perm: 'read_only' }] });
+      if (url.pathname.endsWith('/positions')) {
+        const swap = url.searchParams.get('instType') === 'SWAP';
+        if (swap) { ready.resolve(); await release.promise; }
+        return Response.json({ code: '0', data: swap ? ['CL', 'BZ'].map(base => ({ instType: 'SWAP', instId: base + '-USDT-SWAP',
+          posId: base, pos: '1', posSide: 'net', mgnMode: 'cross' })) : [] });
+      }
+      if (url.pathname.endsWith('/instruments')) {
+        const instId = url.searchParams.get('instId')!;
+        return Response.json({ code: '0', data: [{ instId, instType: 'SWAP', uly: instId.slice(0, -5), settleCcy: 'USDT', ctVal: '1', ctMult: '1', ctValCcy: instId.split('-')[0] }] });
+      }
+      return Response.json({ code: '0', data: [] });
+    };
+    const revoked: typeof fetch = async () => Response.json({ code: '0', data: [{ perm: 'trade,read_only' }] });
+    const positions = createPositionsService({ now: () => at, fetcher: pending === 'positions' ? fetcher : revoked });
+    const fills = createFillsService({ now: () => at, fetcher: pending === 'fills' ? fetcher : revoked });
+    const db = () => f.database;
+    try {
+      if (pending === 'positions') await positions.read(db, f.unseal); else await fills.read(db, f.unseal, 'oil');
+      await ready.promise;
+      if (pending === 'positions') { await fills.read(db, f.unseal); await fills.idle(); }
+      else {
+        await fills.read(db, f.unseal, 'hynix'); // Shares an exchange queue with the pending oil snapshot.
+        await positions.read(db, f.unseal); await positions.idle();
+      }
+      const permissions = paths.filter(path => path.endsWith('/config')).length;
+      release.resolve(); await Promise.all([positions.idle(), fills.idle()]);
+      assert.equal(paths.filter(path => path.endsWith('/config')).length, permissions, 'work queued before the denial cannot acquire a new generation');
+      assert.ok(!paths.some(path => path.endsWith('/fills-history') || path.endsWith('/bills-archive')));
+      for (const table of ['asset_history_windows', 'fill_cache']) assert.equal(f.database.prepare('SELECT COUNT(*) AS n FROM ' + table).get<{ n: number }>()!.n, 0);
+    } finally { release.resolve(); positions.close(); fills.close(); f.database.close(); }
+  });
+});
 
 test('Asset catalog includes every positions exchange before setup and never exposes credentials', async t => {
   const f = fixture(); t.after(() => f.database.close());

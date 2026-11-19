@@ -117,7 +117,8 @@ export interface ExecutionRecord {
 
 export function parseExecution(row: Row): Omit<ExecutionRecord, 'reduceOnly' | 'taskId' | 'openingGroup' | 'chainPrice' | 'chainPriceDiff'> {
   const qty = Number(row.execQty), price = Number(row.execPrice), fee = Number(row.execFee), time = Number(row.execTime);
-  if (typeof row.execId !== 'string' || !row.execId || typeof row.symbol !== 'string' || !(qty > 0) || !(price >= 0) || !Number.isFinite(fee) || !Number.isSafeInteger(time) || (row.side !== 'Buy' && row.side !== 'Sell')) throw new Error('成交记录格式无效');
+  if (typeof row.execId !== 'string' || !row.execId || typeof row.symbol !== 'string' || !Number.isFinite(qty) || !(qty > 0)
+    || !Number.isFinite(price) || !(price >= 0) || !Number.isFinite(fee) || !Number.isSafeInteger(time) || (row.side !== 'Buy' && row.side !== 'Sell')) throw new Error('成交记录格式无效');
   const text = (value: unknown) => typeof value === 'string' ? value : '';
   return {
     execId: row.execId, symbol: row.symbol, side: row.side, orderId: text(row.orderId), orderLinkId: text(row.orderLinkId), execFee: fee, feeCurrency: text(row.feeCurrency),

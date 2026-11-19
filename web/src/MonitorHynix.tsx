@@ -1,9 +1,10 @@
 import { Activity, ArrowDownRight, ArrowUpRight, ChevronDown, Clock3, Info, MoveRight, RefreshCw } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { ApiError } from './api.ts';
 import { SpreadChart, date, stamp } from './MonitorChart.tsx';
 import { dailyPoints, ranges, selectRange, type ChartMode, type Point } from './monitor-history.ts';
-import { HYNIX_SPREAD_CHART, HYNIX_WARMUP_DAYS, coversHynixRange, hynixHistory, hynixQuote, hynixWarnings, type HynixHistory, type HynixQuote } from './monitor-hynix.ts';
+import { HYNIX_SPREAD_CHART, HYNIX_WARMUP_DAYS, hynixQuote, hynixWarnings, type HynixQuote } from './monitor-hynix.ts';
+import { hynixCandles, useMonitorCandles } from './use-monitor-candles.ts';
 import { ExchangeComparison } from './MonitorExchanges.tsx';
 import { HynixFundingPanel } from './MonitorFunding.tsx';
 import { AlertSettings } from './MonitorAlerts.tsx';
@@ -16,10 +17,8 @@ import type { VenueSpreads } from './monitor-related.ts';
 // the hub, where its top bar is hidden; the exchange comparison (M-2c) sits under the chart, the settled funding (M-2d)
 // under it, sharing the chart's range. Left out: the hub summary card. The asset ledger's fills mark the chart and the related positions sit in the right column (A-5;
 // MonitorTrades.tsx, MonitorRelated.tsx). The service collects; the page reads what it saved.
-const QUOTE_PATH = '/api/monitor/hynix/quote', CANDLE_PATH = '/api/monitor/hynix/candles';
-const QUOTE_MS = 10_000, CANDLE_MS = 60_000, READ_TIMEOUT_MS = 10_000;
-// The complete history is at most 400 days of hourly rows, well under a megabyte.
-const CANDLE_TIMEOUT_MS = 30_000;
+const QUOTE_PATH = '/api/monitor/hynix/quote';
+const QUOTE_MS = 10_000, READ_TIMEOUT_MS = 10_000;
 const EMPTY_POINTS: Point[] = [];
 const money = (v: number | undefined) => v === undefined ? '—' : new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(v);
 const percent = (v: number | undefined) => v === undefined ? '—' : `${v > 0 ? '+' : ''}${v.toFixed(2)}%`;
@@ -28,18 +27,14 @@ const notReady = (error: Error | null) => error instanceof ApiError && error.sta
 const readable = (error: Error, fallback: string) => /[一-鿿]/.test(error.message) ? error.message : fallback;
 
 export function HynixPanel({ onExpired }: { onExpired: () => void }) {
-  const [range, setRange] = useState<number | null>(null);
+  const [requestedRange, setRange] = useState<number | null>(null);
   const [mode, setMode] = useState<ChartMode>('premium');
   const [details, setDetails] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   // Read only the selected range plus the indicator warmup; 全部 (the workbench's default here) reads the complete history.
-  const windowDays = range === null ? null : range + HYNIX_WARMUP_DAYS;
   const quoteLive = useLiveResource<HynixQuote>(QUOTE_PATH, { intervalMs: QUOTE_MS, timeoutMs: READ_TIMEOUT_MS, parse: hynixQuote, onExpired });
-  const candleLive = useLiveResource<HynixHistory>(windowDays === null ? CANDLE_PATH : `${CANDLE_PATH}?days=${windowDays}`, { intervalMs: CANDLE_MS, timeoutMs: CANDLE_TIMEOUT_MS, parse: hynixHistory, onExpired });
-  // A newly chosen range reads its own window; until it arrives, an earlier read that already covers it stays on screen.
-  const [kept, setKept] = useState<HynixHistory | null>(null);
-  useEffect(() => { if (candleLive.data) setKept(candleLive.data); }, [candleLive.data]);
-  const data = candleLive.data ?? (kept && coversHynixRange(kept, range) ? kept : null);
+  const candleLive = useMonitorCandles(hynixCandles, requestedRange, HYNIX_WARMUP_DAYS, onExpired, quoteLive.error);
+  const { data, range } = candleLive;
   const quote = quoteLive.data;
   const quoteFailed = quoteLive.error !== null && !(quote === null && notReady(quoteLive.error));
   const quoteError = quoteFailed ? '实时报价更新失败，10 秒后自动重试；请留意报价获取时间。'
@@ -74,7 +69,9 @@ export function HynixPanel({ onExpired }: { onExpired: () => void }) {
     <div className="data-status" role="status"><span className="status-left"><Clock3 size={14} aria-hidden="true" />{quote ? `${quoteError ? '实时更新中断 · 上次获取' : '实时报价 · 获取于'} ${date(quote.fetchedAt, true)} ${new Date(quote.fetchedAt).toISOString().slice(11, 19)} UTC` : quoteFailed ? '实时报价暂不可用 · 每 10 秒自动重试' : '正在获取实时报价 · 每 10 秒自动刷新'}</span><span className="status-right">USD · 1 股正股 = 10 份 ADR</span></div>
     {quoteError && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />{quoteError}</div>}
     {error && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />历史行情：{error}{data ? ' 当前保留上次成功加载的数据。' : ''}</div>}
-    {data?.status === 'snapshot' && <div className="notice"><Info size={16} aria-hidden="true" />K 线采集暂停{data.lastError ? `（${data.lastError}）` : ''}，图表展示 {stamp(data.fetchedAt)} 保存的行情。</div>}
+    {candleLive.notice && <div className="notice" role="status"><Info size={16} aria-hidden="true" />{candleLive.notice}</div>}
+    {candleLive.cached && data ? <div className="notice"><Info size={16} aria-hidden="true" />图表显示本地缓存，行情采集于 {stamp(data.fetchedAt)}。</div>
+      : data?.status === 'snapshot' && <div className="notice"><Info size={16} aria-hidden="true" />K 线采集暂停{data.lastError ? `（${data.lastError}）` : ''}，图表展示 {stamp(data.fetchedAt)} 保存的行情。</div>}
     {warnings.map(w => <div className="notice" key={w}><Info size={16} aria-hidden="true" />{w}</div>)}
     <div className="hynix-chart-group"><section className="metrics readout" aria-label="最新价差概览">
       <article className="metric primary-metric"><div className="metric-label">当前 ADR 溢价率<Activity size={16} aria-hidden="true" /></div><div className={`metric-value ${direction}`}>{percent(current?.premium)}</div><div className="metric-foot">每份价差 <b className={direction}>{signedMoney(current?.spread)}</b></div></article>
@@ -85,7 +82,7 @@ export function HynixPanel({ onExpired }: { onExpired: () => void }) {
     <SpreadChart data={chartPoints} loading={historyPending} range={range} onRangeChange={setRange} mode={mode} onModeChange={setMode} config={HYNIX_SPREAD_CHART} trades={trades} tradeMarket="hynix" />
     <p className="chart-footnote"><Info size={13} aria-hidden="true" />缺失时段曲线断开，不补 0 · 采样 1 小时</p></div>
     <ExchangeComparison market="hynix" onExpired={onExpired} onSpreads={setVenueSpreads} />
-    <HynixFundingPanel range={range} onRangeChange={setRange} onExpired={onExpired} />
+    <HynixFundingPanel range={requestedRange} onRangeChange={setRange} onExpired={onExpired} />
     <AlertSettings market="hynix" onExpired={onExpired} />
     <div className="bottom-grid"><section className="table-panel"><div className="section-heading"><h2>近期观察</h2><span>每日最后共同小时 · 起点 UTC</span></div><div className="table-scroll"><table><thead><tr><th>日期</th><th>ADR</th><th>正股 ÷ 10</th><th>每份价差</th><th>溢价率</th></tr></thead><tbody>{recent.map(p => <tr key={p.time}><td>{date(p.time, true)}<small>{new Date(p.time).toISOString().slice(11, 16)}</small></td><td>{money(p.adr)}</td><td>{money(p.equivalent)}</td><td>{signedMoney(p.spread)}</td><td><span className={`premium-pill ${p.premium >= 0 ? 'positive' : 'negative'}`}>{p.premium >= 0 ? <ArrowUpRight size={13} aria-hidden="true" /> : <ArrowDownRight size={13} aria-hidden="true" />}{percent(p.premium)}</span></td></tr>)}{!recent.length && <tr><td colSpan={5} className="empty-table">{historyPending ? '正在加载记录…' : '暂无记录'}</td></tr>}</tbody></table></div></section>
     <aside className="method-panel"><div className="section-heading"><h2>如何比较</h2><span className="info-icon"><Info size={17} aria-hidden="true" /></span></div><div className="conversion"><div><span className="instrument-label">韩国正股</span><strong>1 <small>股</small></strong><span>000660 · KRX</span></div><MoveRight size={22} aria-hidden="true" /><div><span className="instrument-label">美国 ADR</span><strong>10 <small>份</small></strong><span>SKHY · NASDAQ</span></div></div><div className="formula"><span>ADR 溢价率</span><code>(ADR ÷ (正股美元价 ÷ 10) − 1) × 100%</code></div><p className="method-note">正数表示 ADR 溢价，负数表示折价。两条行情均来自 Hyperliquid 永续合约；价差包含合约基差，并非交易所现货价差。</p><div className="listing-note"><span>ADR 首次交易</span><b>2026.07.10</b></div></aside></div>

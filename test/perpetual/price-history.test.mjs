@@ -9,8 +9,9 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPerpetualPriceHistoryService } from '../../src/vendor/perpetual-price-history-service.mjs';
+import { candleKnown, mergeCandleBlocks } from '../../src/candle-blocks.ts';
 import { openPerpetualCache } from '../../src/monitor/perpetual-cache.ts';
-import { validatePerpetualPriceHistory, priceHistoryIsStale, perpetualPriceIdentity } from '../../src/vendor/perpetual-price-history.ts';
+import { validatePerpetualPriceHistory, priceHistoryIsStale, perpetualPriceIdentity, PRICE_BLOCK_MS } from '../../src/vendor/perpetual-price-history.ts';
 
 const HOUR = 3_600_000, NOW = Date.UTC(2026, 9, 11, 12), quote = exchange => ({ exchange, symbol: 'BTCUSDT', base: 'BTC', quoteCurrency: 'USDT', multiplier: 1 });
 const pair = { base: 'BTC', longKey: 'binance:BTCUSDT', shortKey: 'aster:BTCUSDT' };
@@ -57,6 +58,93 @@ test('a later official revision replaces the overlapping cached close and keeps 
   f.advance(HOUR); f.read(); await f.service.collect();
   const latest = f.read().legs[pair.longKey];
   assert.equal(latest.status, 'ready'); assert.equal(latest.to, NOW + 2 * HOUR); assert.deepEqual(latest.points.at(-1), { time: NOW + 2 * HOUR, close: 101 });
+});
+
+test('known UTC blocks omit rows for warm legs, transfer new and revised closes and expire the first hour', async t => {
+  let revised = false;
+  const f = setup(t, { reader: async (market, range) => points(range, revised && market.exchange === 'binance' ? 101 : 100) });
+  f.read(); await finish(f);
+  const compact = knownBlocks => f.service.read({ pair, days: 3, knownBlocks });
+  const first = compact({});
+  assert.equal(first.blockSpanMs, PRICE_BLOCK_MS);
+  const cache = {}, known = {};
+  for (const [key, leg] of Object.entries(first.legs)) {
+    assert.equal(leg.points, undefined);
+    cache[key] = mergeCandleBlocks([], leg, PRICE_BLOCK_MS);
+    assert.deepEqual(cache[key].flatMap(block => block.rows), f.read().legs[key].points);
+    known[leg.identity] = candleKnown(cache[key]);
+  }
+  const warm = compact(known);
+  assert.ok(Object.values(warm.legs).every(leg => leg.blocks.every(block => block.rows === undefined)));
+  revised = true; f.advance(HOUR + 1000); f.read(); await f.service.collect();
+  const updated = compact(known);
+  for (const [key, leg] of Object.entries(updated.legs)) {
+    const sent = leg.blocks.flatMap(block => block.rows ?? []);
+    assert.deepEqual(sent.map(row => row.time), key === pair.longKey ? [NOW, NOW + HOUR] : [NOW + HOUR]);
+    const points = mergeCandleBlocks(cache[key], leg, PRICE_BLOCK_MS).flatMap(block => block.rows);
+    assert.deepEqual(points, f.read().legs[key].points);
+    assert.equal(points.length, 720);
+  }
+  const newMarket = { ...f.quotes[0], marketId: 42 };
+  f.markets.set(pair.longKey, newMarket); f.quotes[0] = { ...newMarket, historyIdentity: first.legs[pair.longKey].identity };
+  assert.throws(() => compact(known), { status: 400 });
+  f.quotes[0].historyIdentity = perpetualPriceIdentity(newMarket);
+  const changedIdentity = compact(known).legs[pair.longKey];
+  assert.equal(changedIdentity.identity, f.quotes[0].historyIdentity); assert.deepEqual(changedIdentity.blocks, []);
+  await finish(f);
+  assert.equal(compact(known).legs[pair.longKey].blocks.flatMap(block => block.rows ?? []).length, 720, 'old identity tags cannot suppress new rows');
+});
+
+test('older missing hours rotate across restarts, permanent gaps cool down and new closed hours take priority', async t => {
+  const older = NOW - 16 * 24 * HOUR, newer = NOW - 5 * 24 * HOUR, missing = new Set([older, newer]), saved = new Map();
+  const settings = {
+    reader: async (market, range) => points(range).filter(point => market.exchange !== 'binance' || !missing.has(point.time)),
+    service: { store: { savePriceHistory: entry => saved.set(entry.key, structuredClone(entry)), loadPriceHistory: key => [saved.get(key)] } },
+  };
+  const f = setup(t, settings); f.read(); await finish(f);
+  assert.equal(f.read().legs[pair.longKey].points.length, 718);
+  const cold = f.service.read({ pair, days: 30, knownBlocks: {} }).legs[pair.longKey];
+  const cache = mergeCandleBlocks([], cold, PRICE_BLOCK_MS), knownBlocks = { [cold.identity]: candleKnown(cache) };
+  f.advance(300_000); f.read(); await f.service.collect();
+  assert.deepEqual(f.calls.at(-1).range, { from: older - HOUR, to: older });
+  await f.service.stop();
+  const restarted = setup(t, settings); restarted.advance(300_000); restarted.read(); await restarted.service.collect();
+  assert.equal(restarted.calls.length, 0, 'restoring a permanent gap keeps its cooldown');
+  missing.delete(newer);
+  restarted.advance(300_000); restarted.read(); await restarted.service.collect();
+  assert.deepEqual(restarted.calls.map(call => call.range), [{ from: newer - HOUR, to: newer }]);
+  const repaired = restarted.service.read({ pair, days: 30, knownBlocks }).legs[pair.longKey];
+  assert.deepEqual(repaired.blocks.flatMap(block => block.rows ?? []), [{ time: newer, close: 100 }]);
+  assert.equal(repaired.fetchedAt, NOW, 'repairing old prices does not advance the latest price timestamp');
+  restarted.advance(300_000); restarted.read(); await restarted.service.collect();
+  assert.equal(restarted.calls.length, 1, 'the complete round backs off the remaining no-trade gap');
+  restarted.advance(6 * HOUR); restarted.read(); await restarted.service.collect();
+  assert.deepEqual(restarted.calls.slice(1).map(call => call.range), Array(2).fill({ from: NOW - HOUR, to: NOW + 6 * HOUR }));
+});
+
+test('a transient failure on the only old gap preserves its cursor and retries after a minute, even across a new close', async t => {
+  const missing = NOW - 10 * 24 * HOUR, saved = new Map();
+  let fill = false;
+  const f = setup(t, {
+    service: { store: { savePriceHistory: entry => saved.set(entry.key, structuredClone(entry)), loadPriceHistory: () => [] } },
+    reader: async (market, range) => {
+      if (market.exchange === 'binance' && range.from === missing - HOUR && range.to === missing && !fill) throw Error('timeout');
+      return points(range).filter(point => market.exchange !== 'binance' || point.time !== missing || fill);
+    },
+  });
+  f.read(); await finish(f);
+  f.advance(HOUR - 30_000); f.read(); await f.service.collect();
+  const failed = saved.get(pair.longKey);
+  assert.equal(failed.value.status, 'error'); assert.equal(failed.gapThrough, 0);
+  assert.equal(failed.gapAfter, NOW + HOUR + 30_000);
+  fill = true;
+  f.advance(30_000); f.read(); await f.service.collect();
+  assert.ok(f.read().legs[pair.longKey].points.some(point => point.time === NOW + HOUR), 'current close is collected before the historical retry');
+  assert.equal(f.read().legs[pair.longKey].points.some(point => point.time === missing), false);
+  f.advance(60_000); f.read(); await f.service.collect();
+  const recovered = saved.get(pair.longKey);
+  assert.ok(recovered.value.points.some(point => point.time === missing)); assert.equal(recovered.gapThrough, missing);
+  assert.equal(recovered.gapAfter, NOW + 7 * HOUR + 60_000);
 });
 test('current directory validation rejects unknown/obsolete/mismatched pair atomically', async t => {
   const f = setup(t);

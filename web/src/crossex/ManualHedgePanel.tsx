@@ -51,7 +51,7 @@ export default function ManualHedgePanel({ instruments, catalogError, live, budg
     if (next !== base) { setBase(next); setQuantity(''); }
   }, [bases, base]);
   const long = instruments.find(i => i.symbol === longSymbol), short = instruments.find(i => i.symbol === shortSymbol);
-  const a = useMarket(longSymbol, '5m', active, background), b = useMarket(shortSymbol, '5m', active, background);
+  const a = useMarket(long, '5m', active, background, 'none'), b = useMarket(short, '5m', active, background, 'none');
   const sameCurrency = !!long && !!short && long.quoteCurrency === short.quoteCurrency;
   const spread = sameCurrency ? nativeSpread(a.data?.ticker?.askPrice, b.data?.ticker?.bidPrice) : null;
   const ready = !!long && !!short && instrumentBase(long) === base && instrumentBase(short) === base && long.exchange !== short.exchange && positiveQuantity(quantity) && a.data?.status === 'live' && b.data?.status === 'live' && a.data?.tradingAvailable !== false && b.data?.tradingAvailable !== false;

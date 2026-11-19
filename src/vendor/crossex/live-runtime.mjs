@@ -693,6 +693,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
       if (observedUids.size > 1) throw new Error('INCONSISTENT_CAPACITY_ACCOUNT');
       const now = clock(), expiresAt = Math.min(cache.asOf + freshnessMs, heldValuation.expiresAt, ...symbolReads.map(r => r.expiresAt), ...isolatedReads.map(r => r.expiresAt));
       if (stamp !== capacitySignature() || !owns()) return capacityResult(request, now, record.version, 'unavailable', '账户、持仓或设置已变化，请重新读取容量');
+      if (context.marketCurrent?.() === false) return capacityResult(request, now, record.version, 'unavailable', '合约目录或原生身份已变化，请重新读取容量');
       if (now >= expiresAt || now >= context.expiresAt) return capacityResult(request, now, record.version, 'unavailable', '容量依赖的账户、盘口或风险快照已过期');
       const risk = symbolReads.map(row => {
         const venue = row.value.symbol.split('_')[0], isolated = isolatedReads.find(r => r.value.venue === venue);

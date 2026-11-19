@@ -43,7 +43,7 @@ import { createPerpetualFundingReader } from '../vendor/perpetual-funding-reader
 import { createPerpetualScannerDataService } from '../vendor/perpetual-scanner-data-service.mjs';
 import { createPerpetualPriceHistoryService, type PerpetualPriceHistoryStore } from '../vendor/perpetual-price-history-service.mjs';
 import { createPerpetualPriceReader } from '../vendor/perpetual-price-reader.mjs';
-import type { PerpetualPriceHistoryReport } from '../vendor/perpetual-price-history.ts';
+import type { PriceHistoryReply } from '../vendor/perpetual-price-history.ts';
 import { createPerpetualQualityService, type PerpetualQualityStore } from '../vendor/perpetual-quality-service.mjs';
 import { createFundamentalsClient, type FundamentalsClient } from '../vendor/perpetual-fundamentals.mjs';
 import { fetchPositioning, type PositioningFetch } from '../vendor/perpetual-positioning.mjs';
@@ -443,7 +443,7 @@ export function createPerpetualMonitor(options: PerpetualOptions = {}) {
      * M-5c: the hourly trade closes of one current pair's two legs (the workbench's price-history action) for a 3, 7 or 30 day
      * chart; leases both legs for 10 minutes and answers from the cache at once. 503 while stopped, 400 for an invalid pair.
      */
-    async priceHistory(input: unknown): Promise<PerpetualPriceHistoryReport> {
+    async priceHistory<I>(input: I): Promise<PriceHistoryReply<I>> {
       return cachedRead('合约价差采集未运行，开启后再读取成交价历史', () => priceHistory.read(input));
     },
     /**

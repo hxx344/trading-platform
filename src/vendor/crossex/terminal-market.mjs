@@ -1,9 +1,13 @@
 // Public terminal feeds adapted from your-quantguy/gate-crossex at 423356d.
 // Copyright (c) the original contributors. AGPL-3.0-only; see THIRD_PARTY_NOTICES.md.
+import { terminalIdentity } from './terminal-identity.mjs';
+import { readDisplayDepth } from '../../crossex/display-depth.ts';
+import { encodeCandleBlocks } from '../../candle-blocks-server.ts';
 import { createTerminalFeed } from './terminal-feed.mjs';
 import { createCandleReader } from './candle-reader.mjs';
 import { bookChannel, numeric, time, TERMINAL_SYMBOL, normalizeCandles, INTERVALS } from './terminal-data.mjs';
 import { createTerminalHistory } from './terminal-history.mjs';
+import { CANDLE_LIMIT, terminalBlockSpan } from './terminal-intervals.ts';
 import { loadManualDepth } from './clients.mjs';
 import { AppError, contractIdentity, validateBooks } from './model.mjs';
 import { D } from './money.mjs';
@@ -21,7 +25,15 @@ export function createTerminalMarket({ market, store, depthReader = loadManualDe
     for (const history of e.candles.values()) history.controller.abort();
     e.candles.clear();
   }
-  function release(e) { e.unsubscribe?.(); clearCandles(e); }
+  function unsubscribe(e) {
+    e.watcher = null; e.unsubscribe?.(); e.unsubscribe = null;
+  }
+  function clearQuotes(e) {
+    e.epoch++; e.ticker = {}; e.tickerAt = 0; e.streamBook = null; e.book = null; e.mark = null; e.funding = null; e.trades = [];
+  }
+  function release(e) { unsubscribe(e); clearQuotes(e); clearCandles(e); }
+  const entry = (replaced = false) => ({ touched: clock(), epoch: 0, book: null, bookAttempt: -Infinity, identityAttempt: -Infinity,
+    flight: null, ticker: {}, tickerAt: 0, trades: [], candles: new Map(), requireBook: true, bookFrom: replaced ? clock() : null, streamAfter: replaced ? clock() + 1000 : null });
   // Keep the raw stream so a newly confirmed multiplier never mixes units.
   const streamBook = e => {
     if (!e.streamBook) return null;
@@ -36,10 +48,14 @@ export function createTerminalMarket({ market, store, depthReader = loadManualDe
   }
   function watch(symbol, e) {
     if (e.unsubscribe) return;
+    const watcher = e.watcher = {};
+    const current = () => !stopped && entries.get(symbol) === e && e.watcher === watcher && e.marketCurrent?.() !== false;
     e.unsubscribe = publicFeed.subscribe(symbol, { data(m) {
       try {
         const r = m.result;
-        if (stopped || entries.get(symbol) !== e || r?.s !== symbol || m.event !== 'update' || !e.display || !active(e)) return;
+        if (!current() || r?.s !== symbol || m.event !== 'update' || !e.display || !active(e)) return;
+        // A shared socket can still deliver a frame queued by a previous subscription. Include the allowed future skew.
+        if (e.streamAfter !== null && time(['mark_price', 'funding_rate'].includes(m.channel) ? m.time_ms : r.ts) <= e.streamAfter) return;
         if (m.channel === 'ticker' && numeric(r.lp, true) && numeric(r.bp, true) && numeric(r.ap, true) && time(r.ts) && r.ts <= clock() + 1000 && clock() - r.ts <= 10000) {
           if (e.tickerAt && r.ts < e.tickerAt || D(r.bp).gt(r.ap)) return;
           e.ticker = { ...e.ticker, lastPrice: numeric(r.lp), change24h: numeric(r.o, true) ? D(r.lp).div(r.o).minus(1).toString() : null,
@@ -66,15 +82,18 @@ export function createTerminalMarket({ market, store, depthReader = loadManualDe
         }
       } catch { /* Invalid public frames never replace validated data. */ }
     }, down() {
-      e.epoch++; e.ticker = {}; e.tickerAt = 0; e.streamBook = null; e.book = null; e.mark = null; e.funding = null; e.trades = [];
+      if (!current()) return;
+      clearQuotes(e);
       e.error = '公开行情连接已中断'; e.bookAttempt = -Infinity;
     } });
   }
   const sweep = setInterval(() => {
     for (const [symbol, e] of entries) if (!active(e) && !e.flight && !e.displayFlight) { release(e); entries.delete(symbol); }
   }, 25000); sweep.unref();
-  async function read(symbol, interval = '5m') {
+  async function read(symbol, interval = '5m', options = {}, retry = true) {
     if (stopped) throw new AppError('行情服务已停止', 503);
+    const mode = options.candles ?? 'full';
+    if (!['full', 'blocks', 'none'].includes(mode)) throw new AppError('不支持的 K 线读取方式');
     if (!Object.hasOwn(INTERVALS, interval)) throw new AppError('不支持的 K 线周期');
     if (typeof symbol !== 'string' || !TERMINAL_SYMBOL.test(symbol)) throw new AppError('合约格式无效');
     let e = entries.get(symbol);
@@ -84,7 +103,7 @@ export function createTerminalMarket({ market, store, depthReader = loadManualDe
         if (!oldest) throw new AppError('行情查询繁忙，请稍后重试', 429);
         release(oldest[1]); entries.delete(oldest[0]);
       }
-      e = { touched: clock(), epoch: 0, book: null, bookAttempt: -Infinity, identityAttempt: -Infinity, flight: null, ticker: {}, tickerAt: 0, trades: [], candles: new Map() }; entries.set(symbol, e);
+      e = entry(); entries.set(symbol, e);
     }
     e.touched = clock();
     // A current CrossEx listing authorizes public subscription, not execution.
@@ -93,7 +112,14 @@ export function createTerminalMarket({ market, store, depthReader = loadManualDe
     catch (error) { if (entries.get(symbol) === e) { release(e); entries.delete(symbol); } throw error; }
     if (stopped) throw new AppError('行情服务已停止', 503);
     if (entries.get(symbol) !== e) throw new AppError('行情查询已失效，请重试', 409);
-    watch(symbol, e);
+    const listing = e.display.candleListing ?? null;
+    const rebind = () => {
+      release(e); entries.set(symbol, entry(true));
+      if (!retry) throw new AppError('行情合约身份已变化，请重试', 409);
+      return read(symbol, interval, options, false);
+    };
+    if (e.listing !== undefined && listing !== e.listing || e.marketCurrent?.() === false) return rebind();
+    e.listing = listing;
     if (!e.flight && clock() - e.bookAttempt >= 1500) {
       e.bookAttempt = clock();
       e.flight = (async () => {
@@ -106,18 +132,32 @@ export function createTerminalMarket({ market, store, depthReader = loadManualDe
             try { resolved = await market.resolveSymbol(symbol); }
             catch (error) { e.quote = null; clearCandles(e); e.tradingError = error instanceof AppError ? error.message : '原生合约身份暂未确认'; throw error; }
             const { quote, rule } = resolved;
+            if (stopped || entries.get(symbol) !== e) return;
+            if (resolved.candleListing !== undefined && resolved.candleListing !== listing) {
+              release(e); entries.set(symbol, entry(true)); return;
+            }
+            e.marketCurrent = resolved.marketCurrent;
+            if (e.marketCurrent?.() === false) return;
+            // Native OHLCV and its SQLite key outlive Gate directory revisions. The browser validates both identities.
             const identity = contractIdentity(quote);
-            if (e.identity && e.identity !== identity) { e.book = null; clearCandles(e); }
+            if (e.unsubscribe && (!e.quote || e.identity !== identity || e.marketVersion !== resolved.marketVersion)) {
+              // A subscription that ran while native identity was unknown is display-only, including its queued frames.
+              release(e); e.requireBook = true; e.bookFrom = clock(); e.streamAfter = clock() + 1000;
+            }
+            if (identity !== e.identity) e.candleIdentity = terminalIdentity(listing, identity);
             e.identity = identity; e.identityAt = e.identityAttempt;
-            e.quote = quote; e.rule = rule;
+            e.quote = quote; e.rule = rule; e.marketVersion = resolved.marketVersion;
+            if (e.bookFrom !== null && Number.isFinite(resolved.marketSince)) e.bookFrom = resolved.marketSince;
+            watch(symbol, e);
           }
           if (!e.quote) throw new AppError(e.tradingError || '原生合约身份暂未确认');
           if (stopped) return;
           e.tradingError = null;
           if (e.streamBook && freshAt(e.streamBook.at)) return;
-          const epoch = e.epoch, book = await depthReader(e.quote);
-          if (epoch !== e.epoch) return;
+          const epoch = e.epoch, book = await readDisplayDepth(depthReader, e.quote, e.marketVersion ?? e.candleIdentity);
+          if (stopped || entries.get(symbol) !== e || epoch !== e.epoch || e.marketCurrent?.() === false) return;
           validateBooks([book, book], clock());
+          if (e.bookFrom !== null && book.at < e.bookFrom) throw new AppError('等待新合约的有效盘口');
           if (e.book && book.at < e.book.at) throw new AppError('盘口来源时间回退');
           e.book = { bids: book.bids.map(r => r.map(String)), asks: book.asks.map(r => r.map(String)), at: book.at, quantityUnit: 'base' }; e.error = null;
         } catch (error) { e.error = error instanceof AppError ? error.message : '公开盘口暂不可用';
@@ -127,8 +167,12 @@ export function createTerminalMarket({ market, store, depthReader = loadManualDe
     }
     await briefly(e.flight);
     if (stopped) throw new AppError('行情服务已停止', 503);
+    if (entries.get(symbol) !== e) throw new AppError('行情查询已失效，请重试', 409);
+    if (e.marketCurrent?.() === false) return rebind();
+    watch(symbol, e);
     let history, historyError = null;
-    if (e.quote && clock() - e.identityAt < 30000) {
+    const verified = () => e.quote && clock() - e.identityAt < 30000;
+    if (mode !== 'none' && verified()) {
       history = e.candles.get(interval);
       try { history = archive.restore(e.identity, interval, history); e.candles.set(interval, history); }
       catch { historyError = '已保存的历史 K 线暂不可读'; }
@@ -140,20 +184,34 @@ export function createTerminalMarket({ market, store, depthReader = loadManualDe
       }
       if (!history?.closed.size) await briefly(history?.flight);
       if (!e.quote || e.candles.get(interval) !== history) history = null;
-    } else historyError = '尚未确认原生历史 K 线来源';
+    } else if (mode !== 'none') historyError = '尚未确认原生历史 K 线来源';
+    if (entries.get(symbol) !== e) throw new AppError('行情查询已失效，请重试', 409);
+    if (e.marketCurrent?.() === false) return rebind();
+    const snapshot = history && archive.snapshot(history, interval);
+    const candles = snapshot?.partial ? [snapshot.partial] : [];
+    const candleError = historyError ?? history?.error ?? null;
+    const candleIdentity = verified() ? e.candleIdentity : null;
+    const meta = mode === 'full' ? {} : { candleListing: listing, candleIdentity, candlePartialAsOf: snapshot?.partial ? history.partialAt : null };
+    if (mode === 'blocks') {
+      // While restoring or offline, an empty local view cannot invalidate known closes from the same source.
+      meta.candleBlocks = candleIdentity && snapshot && (snapshot.closed.length || !history.flight && !candleError)
+        ? encodeCandleBlocks(snapshot.closed, terminalBlockSpan(interval), options.identity === candleIdentity ? options.known ?? '' : '')
+        : null;
+    }
     const publicBook = streamBook(e), book = publicBook && (!e.book || publicBook.at >= e.book.at) ? publicBook : e.book;
     const bookFresh = book && freshAt(book.at), tickerFresh = freshAt(e.tickerAt);
     const currentBbo = tickerFresh && (!bookFresh || e.tickerAt > book.at);
     const fresh = (bookFresh && (book === publicBook || !e.error)) || tickerFresh, asOf = currentBbo ? e.tickerAt : book?.at ?? null;
-    const unit = unitOf(e), tradingAvailable = !!e.quote && !e.tradingError;
+    if (bookFresh && (book === publicBook || !e.error)) e.requireBook = false;
+    const unit = unitOf(e), tradingAvailable = !!verified() && !e.tradingError && !e.requireBook;
     return { symbol, exchange: e.quote?.exchange ?? symbol.split('_')[0].toLowerCase(), base: e.quote?.base ?? symbol.split('_')[2], quoteCurrency: e.quote?.quoteCurrency ?? symbol.split('_').at(-1),
       status: fresh ? 'live' : book ? 'stale' : 'unavailable', asOf, error: fresh ? null : e.error ?? '等待公开盘口',
-      tradingAvailable, tradingReason: tradingAvailable ? null : `暂不可交易：${e.tradingError || '正在确认原生合约身份和数量单位'}`,
+      tradingAvailable, tradingReason: tradingAvailable ? null : `暂不可交易：${e.tradingError || (e.requireBook ? '等待新合约的有效盘口' : '正在确认原生合约身份和数量单位')}`,
       ticker: { lastPrice: null, change24h: null, volume24h: null, ...(tickerFresh ? e.ticker : {}),
         bidPrice: currentBbo ? e.ticker.bidPrice : book?.bids[0]?.[0] ?? null, askPrice: currentBbo ? e.ticker.askPrice : book?.asks[0]?.[0] ?? null,
         markPrice: e.mark && freshAt(e.mark.at) ? e.mark.price : null, markPriceAt: e.mark && freshAt(e.mark.at) ? e.mark.at : null,
         ...(e.funding && freshAt(e.funding.at, 60000) && e.funding.nextFundingAt > clock() ? { fundingRate: e.funding.fundingRate, nextFundingAt: e.funding.nextFundingAt } : { fundingRate: null, nextFundingAt: null }) },
-      book, candles: history ? archive.data(history, interval) : [], candleError: historyError ?? history?.error ?? null, candleAsOf: history?.asOf ?? null,
+      book, ...meta, candles: mode === 'full' && snapshot ? [...snapshot.closed, ...candles].slice(-CANDLE_LIMIT) : candles, candleError, candleAsOf: history?.asOf ?? null,
       trades: e.trades.filter(t => clock() - t.at < 300000).map(t => ({ ...t, quantity: unit ? D(t.quantity).times(unit).toString() : t.quantity, quantityUnit: unit ? 'base' : 'contracts' })), interval };
   }
   return { read, async stop() { stopped = true; clearInterval(sweep); for (const e of entries.values()) release(e); publicFeed.close(); await Promise.allSettled([...historyFlights, ...[...entries.values()].flatMap(e => [e.displayFlight, e.flight])]); entries.clear(); } };

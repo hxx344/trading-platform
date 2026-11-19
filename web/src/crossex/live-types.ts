@@ -65,21 +65,22 @@ export type PositionActionInput = { kind: 'position'; action: 'add' | 'balance';
   positions: { positionId: string; expectedQuantity: string; expectedSide: 'LONG' | 'SHORT' }[];
   quantity?: string; strategy?: 'reduce' | 'increase' | 'target'; targetQuantity?: string };
 export type PreviewInput = { kind: 'open'; signalId: string }
-  | { kind: 'open'; order: { symbol: string; side: 'BUY' | 'SELL'; quantity: string; orderType: 'LIMIT' | 'MARKET'; price?: string; timeInForce: 'GTC' | 'IOC' | 'FOK' | 'POC' } }
+  | { kind: 'open'; order: { symbol: string; side: 'BUY' | 'SELL'; quantity: string; orderType: 'LIMIT' | 'MARKET'; price?: string; timeInForce: 'GTC' | 'IOC' | 'FOK' | 'POC'; expectedMarketIdentity?: string } }
   | { kind: 'open'; pair: { longSymbol: string; shortSymbol: string; quantity: string } }
   | ({ kind: 'close' } & CloseLeg) | { kind: 'close'; positions: CloseLeg[] } | PositionActionInput;
 
 export type Instrument = {
   symbol: string; exchange: string; base: string; quoteCurrency: string; settlementCurrency: string;
   lot_size: string; tick_size: string; min_size: string; min_notional?: string | null;
-  max_limit_size?: string | null; max_market_size?: string | null; contract_size?: string | null; state?: string;
+  max_limit_size?: string | null; max_market_size?: string | null; contract_size?: string | null; state?: string; candleListing?: string;
 };
+export type TerminalCandle = { time: number; open: string; high: string; low: string; close: string; volume: string; closed?: boolean };
 export type MarketData = {
   symbol: string; exchange: string; base: string; quoteCurrency: string;
   status: 'live' | 'stale' | 'unavailable' | 'connecting'; asOf: number | null; error?: string | null; tradingAvailable?: boolean; tradingReason?: string | null;
   ticker: { lastPrice: string | null; bidPrice: string | null; askPrice: string | null; markPrice?: string | null; markPriceAt?: number | null; change24h?: string | null; fundingRate?: string | null; nextFundingAt?: number | null; volume24h?: string | null } | null;
   book: { bids: [string, string][]; asks: [string, string][]; at: number | null; quantityUnit: 'base' | 'contracts' } | null;
-  candles: { time: number; open: string; high: string; low: string; close: string; volume: string }[];
+  candles: TerminalCandle[];
   trades: { id: string; price: string; quantity: string; side: string; at: number; quantityUnit?: 'base' | 'contracts' }[]; interval: string;
-  candleError?: string | null; candleAsOf?: number | null;
+  candleError?: string | null; candleAsOf?: number | null; candleIdentity?: string | null; candlePartialAsOf?: number | null;
 };

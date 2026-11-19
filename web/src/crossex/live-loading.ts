@@ -33,5 +33,6 @@ export function createTimedCache<T>(ttl: number, clock = Date.now) {
   return {
     peek: () => ({ value, fresh: value !== null && clock() < expiresAt, remaining: Math.max(0, expiresAt - clock()) }),
     put(next: T) { value = next; expiresAt = clock() + ttl; },
+    invalidate() { expiresAt = 0; },
   };
 }

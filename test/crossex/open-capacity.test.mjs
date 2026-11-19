@@ -39,7 +39,7 @@ async function fixture(t, options = {}) {
     business_type: 'FUTURE', state: 'live', min_size: '0.001', lot_size: '0.001', tick_size: '0.01', min_notional: '5',
     max_market_size: '10000', max_limit_size: '10000', delist_time: '0' }));
   const market = createMarket(store, { clock: () => remote.now, catalogReader: async () => clone(rules),
-    manualIdentityReader: async symbol => quote(symbol, remote.now),
+    manualIdentityReader: async symbol => ({ ...quote(symbol, remote.now), nativeUnit: remote.nativeUnit ?? '1' }),
     manualDepthReader: async q => {
       if (remote.depthHook) await remote.depthHook();
       return { at: remote.depthAt ?? remote.now, bids: [[q.bid, remote.depthSize]], asks: [[q.ask, remote.depthSize]] };
@@ -245,6 +245,17 @@ test('account, settings and connection races discard late capacity reads without
     release.resolve(); const result = await pending;
     assert.equal(result.status, 'unavailable', scenario); assert.equal(result.maxQuantity, null, scenario); f.assertReadOnly();
   }
+});
+
+test('a capacity estimate waiting for private risk cannot return the retired market even after its native unit is restored', async t => {
+  const f = await fixture(t), entered = deferred(), release = deferred();
+  f.remote.leverageHook = async () => { entered.resolve(); await release.promise; };
+  const pending = f.runtime.openCapacity(order()); await entered.promise;
+  f.remote.nativeUnit = '2'; await f.market.resolveSymbol(symbols[0]);
+  f.remote.nativeUnit = '1'; await f.market.resolveSymbol(symbols[0]);
+  release.resolve(); const retired = await pending;
+  assert.equal(retired.status, 'unavailable'); assert.equal(retired.maxQuantity, null); assert.match(retired.reason, /原生身份已变化/);
+  assert.equal((await f.runtime.openCapacity(order())).status, 'ready'); f.assertReadOnly();
 });
 
 test('capacity rejects an isolated venue whose UID differs from the refresh-bound identity', async t => {

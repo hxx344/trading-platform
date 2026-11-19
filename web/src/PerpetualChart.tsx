@@ -24,9 +24,9 @@ interface Props {
 }
 type Point = { time: number; value: number | null };
 type Series = { label: string; color: string; points: Point[]; dashed?: boolean; step?: boolean };
-type DataStatus = FundingStabilityReport['status'] | 'loading';
+type DataStatus = FundingStabilityReport['status'] | 'loading' | 'cached';
 const DAY = 86_400_000, WINDOWS = [3, 7, 30] as const;
-const labels: Record<DataStatus, string> = { ready: '完整', pending: '采集中', partial: '历史不足', stale: '已过期', error: '更新失败', unsupported: '暂不支持', loading: '加载中' };
+const labels: Record<DataStatus, string> = { ready: '完整', pending: '采集中', partial: '历史不足', stale: '已过期', error: '更新失败', unsupported: '暂不支持', loading: '加载中', cached: '上次缓存' };
 const stampFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 const dayFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit' });
 const stamp = (time: number | null | undefined) => time && Number.isFinite(time) ? stampFormat.format(time) : '—';
@@ -121,7 +121,7 @@ function QuoteBrief({ quote, contract, side, name, now, staleAfter }: { quote: P
 }
 
 function priceState(leg: PerpetualPriceLeg | undefined, start: number, end: number, now: number, failed: boolean, count: number, expected: number): DataStatus {
-  if (!leg) return 'pending';
+  if (!leg) return failed ? 'error' : 'pending';
   if (leg.status === 'unsupported') return 'unsupported';
   if (failed || leg.status === 'error') return 'error';
   if (leg.to !== null && (leg.to > now + 5000 || now - leg.to > PRICE_HISTORY_STALE_MS)) return 'stale';
@@ -142,7 +142,7 @@ function PerpetualChart({ selection, snapshot, active, now, onSelectionChange, o
   const [longQuote, shortQuote] = quotes;
   const usable = Boolean(longQuote && shortQuote && longQuote.comparable !== false && shortQuote.comparable !== false && longQuote.historyIdentity !== null && shortQuote.historyIdentity !== null);
   const funding = usePerpetualFundingHistory(pairs, active && usable, onExpired);
-  const prices = usePerpetualPriceHistory(pair, selection.days, active && usable, onExpired);
+  const prices = usePerpetualPriceHistory(usable ? pair : null, selection.days, active && usable, onExpired, longQuote?.historyIdentity, shortQuote?.historyIdentity);
   const clock = now > 0 ? now : snapshot?.generatedAt ?? 0;
   const histories = [selection.longKey, selection.shortKey].map((key, index) => {
     const leg = funding.report?.legs[key], quote = quotes[index];
@@ -165,7 +165,9 @@ function PerpetualChart({ selection, snapshot, active, now, onSelectionChange, o
     const hours: number[] = [];
     for (let time = (Math.floor(start / PRICE_HOUR_MS) + 1) * PRICE_HOUR_MS; time <= Math.min(end, closedHour); time += PRICE_HOUR_MS) hours.push(time);
     const points = legs.map(leg => {
-      const byTime = new Map((leg?.points ?? []).filter(point => point.time <= closedHour && point.time > start && point.time <= end).map(point => [point.time, point.close]));
+      const cached = leg && prices.report?.unscanned[leg.key];
+      const rows = leg && cached?.length ? [...cached, ...leg.points] : leg?.points ?? [];
+      const byTime = new Map(rows.filter(point => point.time <= closedHour && point.time > start && point.time <= end).map(point => [point.time, point.close]));
       return hours.map(time => ({ time, value: byTime.get(time) ?? null }));
     });
     const currencies = legs.map((leg, index) => leg?.currency ?? quotes[index]?.quoteCurrency ?? '');
@@ -187,7 +189,8 @@ function PerpetualChart({ selection, snapshot, active, now, onSelectionChange, o
   const selectedSpread = valueAt(priceData.spread, cursor), selectedPrices = priceData.points.map(points => valueAt(points, cursor));
   const selectedCumulative = valueAt(fundingPoints, cursor, true), selectedDay = analysis.daily.find(day => cursor > day.from && cursor <= day.to);
   const priceStates = priceData.legs.map((leg, index) => priceState(leg, start, end, clock, Boolean(prices.error), priceData.points[index].filter(point => point.value !== null).length, priceData.hours.length));
-  const priceStatus = (['error', 'unsupported', 'stale', 'pending', 'partial', 'ready'] as const).find(status => priceStates.includes(status)) ?? 'pending';
+  const priceStatus = (['error', 'unsupported', 'stale'] as const).find(status => priceStates.includes(status))
+    ?? (prices.fromCache ? 'cached' : (['pending', 'partial', 'ready'] as const).find(status => priceStates.includes(status)) ?? 'pending');
   const fundingStatus = funding.error ? 'error' : analysis.status;
   const fundingReason = funding.error || analysis.reason;
   const names = [selection.longKey, selection.shortKey].map(key => snapshot?.exchanges.find(exchange => exchange.id === key.split(':')[0])?.name ?? key.split(':')[0]);

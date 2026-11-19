@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createStore } from './fixtures.mjs';
 import { createMarket } from '../../src/vendor/crossex/market.mjs';
+import { createTerminalMarket } from '../../src/vendor/crossex/terminal-market.mjs';
+import { createDisplayDepth } from '../../src/crossex/display-depth.ts';
 import { feed, quote, book, catalog, epoch } from './fixtures.mjs';
 import { largeMarketData, memoryMarketStore } from './live-market-performance-fixture.mjs';
 
@@ -25,6 +27,165 @@ function manualQuote(exchange, extra = {}) {
     crossexSymbol: `${exchange.toUpperCase()}_FUTURE_BTC_USDT`, identityScope: 'manual', nativeUnit: '1',
     identitySource: 'exchange-instrument-metadata', comparable: true, ...extra });
 }
+
+test('direct preview and repreview bind the clicked terminal listing and native quantity unit', async t => {
+  let unit = '1';
+  const f = fixture(t, { manualIdentityReader: async () => manualQuote('binance', { nativeUnit: unit }) });
+  const terminal = createTerminalMarket({ market: f.market, clock: f.now, depthReader: q => book(q, f.now()),
+    publicFeed: { subscribe() { return () => {}; }, close() {} } });
+  t.after(() => terminal.stop());
+  const input = { symbol: 'BINANCE_FUTURE_BTC_USDT', side: 'BUY', quantity: '0.25', orderType: 'LIMIT', price: '98', timeInForce: 'GTC' };
+  const selected = async () => ({ ...input, expectedMarketIdentity: (await terminal.read(input.symbol, '1m', { candles: 'none' })).candleIdentity });
+  const first = await selected();
+  const original = await f.market.previewDirect(first);
+  assert.equal(original.legs[0].price, '98');
+  // The new metadata reaches the actual preview reader before the next terminal poll.
+  unit = '2';
+  await assert.rejects(f.market.previewDirect(first), /所选合约身份已变化/);
+  f.advance(31000);
+  await assert.rejects(f.market.previewDirect(first), /所选合约身份已变化/);
+  const second = await selected(); assert.notEqual(second.expectedMarketIdentity, first.expectedMarketIdentity);
+  assert.equal((await f.market.previewDirect(second)).legs[0].quote.nativeUnit, '2');
+  f.setRules(catalog.map(r => ({ ...r, max_limit_size: '10000', version: 'changed' }))); f.advance(300001);
+  await assert.rejects(f.market.previewDirect(second), /所选合约身份已变化/);
+  const current = await selected(); assert.ok(await f.market.previewDirect(current));
+  assert.ok(await f.market.previewDirect(input), 'legacy clients omit the binding');
+  await assert.rejects(f.market.previewDirect({ ...current, expectedMarketIdentity: null }), /无效/);
+});
+
+test('terminal and capacity share current depth but a new listing cannot adopt cached or in-flight books from its predecessor', async t => {
+  for (const pending of [false, true]) await t.test(pending ? 'in flight' : 'cached', async t => {
+    const entered = Promise.withResolvers(), release = Promise.withResolvers();
+    let f, calls = 0;
+    const shared = createDisplayDepth({ now: () => f.now() })(async () => {
+      const at = f.now(), first = ++calls === 1;
+      if (first) { entered.resolve(); if (pending) await release.promise; }
+      return { at, bids: [[first ? 99 : 20, 100]], asks: [[first ? 100 : 21, 100]] };
+    });
+    f = fixture(t, { capacityDepthReader: shared });
+    const terminal = createTerminalMarket({ market: f.market, clock: f.now, depthReader: shared,
+      publicFeed: { subscribe() { return () => {}; }, close() {} } });
+    t.after(async () => { release.resolve(); await terminal.stop(); });
+    const symbol = 'BINANCE_FUTURE_BTC_USDT', read = () => terminal.read(symbol, '1m', { candles: 'none' });
+    const capacity = () => f.market.openCapacityContext({ source: 'direct', requests: [{ symbol, side: 'BUY', orderType: 'LIMIT', timeInForce: 'GTC' }] });
+    await f.market.refreshCatalog(); f.advance(299990);
+    const aCapacity = capacity(); await entered.promise;
+    if (!pending) await aCapacity;
+    const a = await read(); assert.equal(calls, 1);
+    assert.equal(a.tradingAvailable, !pending);
+    if (!pending) assert.equal(a.book.bids[0][0], '99');
+    f.setRules(catalog.map(r => ({ ...r, max_limit_size: '10000', min_size: '0.002' }))); f.advance(20);
+    const b = await read();
+    assert.notEqual(b.candleIdentity, a.candleIdentity); assert.equal(b.tradingAvailable, true);
+    assert.equal(b.book.at, f.now()); assert.equal(b.book.bids[0][0], '20');
+    assert.equal((await capacity()).sourceAt, b.book.at); assert.equal(calls, 2);
+    release.resolve(); if (pending) await assert.rejects(aCapacity, /合约目录或原生身份已变化/);
+    assert.equal((await read()).book.bids[0][0], '20'); assert.equal(calls, 2);
+  });
+});
+
+test('a stored bound direct plan is revoked when a live rule changes before or during confirmation', async t => {
+  const f = fixture(t), terminal = createTerminalMarket({ market: f.market, clock: f.now, depthReader: q => book(q, f.now()),
+    publicFeed: { subscribe() { return () => {}; }, close() {} } });
+  t.after(() => terminal.stop());
+  await f.market.refreshCatalog(); f.advance(290000);
+  const input = { symbol: 'BINANCE_FUTURE_BTC_USDT', side: 'BUY', quantity: '0.25', orderType: 'LIMIT', price: '98', timeInForce: 'GTC' };
+  const { candleIdentity } = await terminal.read(input.symbol, '1m', { candles: 'none' });
+  const bound = JSON.parse(JSON.stringify(await f.market.previewDirect({ ...input, expectedMarketIdentity: candleIdentity })));
+  const legacy = await f.market.previewDirect(input);
+  assert.equal(bound.expectedMarketIdentity, candleIdentity); assert.equal(legacy.expectedMarketIdentity, undefined);
+  const validated = structuredClone(bound); assert.equal(await f.market.revalidateOpen(validated), true); assert.equal(validated.quotesCurrent(), true);
+  const started = Promise.withResolvers(), release = Promise.withResolvers();
+  f.setDepth(async q => { started.resolve(); await release.promise; return book(q, f.now()); });
+  const waiting = f.market.revalidateOpen(structuredClone(bound)); await started.promise;
+  f.advance(10001); f.setRules(catalog.map(r => ({ ...r, max_limit_size: '10000', min_size: '0.002' })));
+  await f.market.refreshCatalog(); release.resolve();
+  assert.equal(bound.expiresAt - f.now(), 19999); assert.equal(validated.quotesCurrent(), false);
+  await assert.rejects(waiting, /所选合约身份已变化/);
+  await assert.rejects(f.market.revalidateOpen(bound), /所选合约身份已变化/);
+  assert.equal(await f.market.revalidateOpen(legacy), true);
+});
+
+test('a capacity observation of a new native unit retires pending reads, the terminal book and a previously validated direct plan', async t => {
+  const symbol = 'BINANCE_FUTURE_BTC_USDT', enteredDisplay = Promise.withResolvers(), enteredPrivate = Promise.withResolvers(), release = Promise.withResolvers();
+  let f, unit = '1', wait = false, displayReads = 0;
+  const depth = async (q, entered) => {
+    if (wait && q.nativeUnit === '1') { entered.resolve(); await release.promise; }
+    const bid = q.nativeUnit === '1' ? 99 : 20;
+    return { at: f.now(), bids: [[bid, 10]], asks: [[bid + 1, 10]] };
+  };
+  const shared = createDisplayDepth({ now: () => f.now() })(q => { displayReads++; return depth(q, enteredDisplay); });
+  f = fixture(t, { manualIdentityReader: async () => manualQuote('binance', { nativeUnit: unit }), capacityDepthReader: shared,
+    manualDepthReader: q => depth(q, enteredPrivate) });
+  const terminal = createTerminalMarket({ market: f.market, clock: f.now, depthReader: shared,
+    publicFeed: { subscribe() { return () => {}; }, close() {} } });
+  t.after(async () => { release.resolve(); await terminal.stop(); });
+  const read = () => terminal.read(symbol, '1m', { candles: 'none' });
+  const capacity = () => f.market.openCapacityContext({ source: 'direct', requests: [{ symbol, side: 'BUY', orderType: 'LIMIT', timeInForce: 'GTC' }] });
+  const first = await read(), input = { symbol, side: 'BUY', quantity: '0.25', orderType: 'LIMIT', price: '98', timeInForce: 'GTC', expectedMarketIdentity: first.candleIdentity };
+  const plan = JSON.parse(JSON.stringify(await f.market.previewDirect(input))), checked = structuredClone(plan);
+  await f.market.revalidateOpen(checked); await capacity(); assert.equal(checked.quotesCurrent(), true); assert.equal(displayReads, 1);
+  f.advance(1600); wait = true;
+  const pending = Promise.allSettled([capacity(), f.market.revalidateOpen(structuredClone(plan)), f.market.previewDirect(input), read()]);
+  await Promise.all([enteredDisplay.promise, enteredPrivate.promise]);
+  unit = '2'; await capacity(); assert.equal(checked.quotesCurrent(), false);
+  const current = await read(); assert.equal(current.book.bids[0][0], '20'); assert.equal(current.tradingAvailable, true); assert.equal(displayReads, 3);
+  release.resolve(); const [oldCapacity, oldConfirm, oldPreview, oldRead] = await pending;
+  for (const retired of [oldCapacity, oldConfirm, oldPreview]) { assert.equal(retired.status, 'rejected'); assert.match(retired.reason.message, /身份已变化/); }
+  if (oldRead.status === 'fulfilled') assert.equal(oldRead.value.book.bids[0][0], '20');
+  else assert.match(oldRead.reason.message, /失效|变化/);
+  wait = false; unit = '1'; await capacity();
+  assert.equal(displayReads, 4, 'the restored native identity has its own current book even within the one-second cache');
+  const restored = await read(); assert.equal(restored.candleIdentity, first.candleIdentity, 'public candle archives retain their stable identity');
+  assert.equal(restored.book.bids[0][0], '99'); assert.equal(checked.quotesCurrent(), false);
+  await assert.rejects(f.market.revalidateOpen(plan), /身份已变化/);
+  assert.equal(await f.market.revalidateOpen(await f.market.previewDirect(input)), true);
+});
+
+test('late native resolves cannot reverse an observed change or restore a retired generation after relisting', async t => {
+  let unit = '1', hold = false;
+  const entered = Promise.withResolvers(), release = Promise.withResolvers(), symbol = 'BINANCE_FUTURE_BTC_USDT';
+  const f = fixture(t, { manualIdentityReader: async () => {
+    const value = unit; if (hold) { hold = false; entered.resolve(); await release.promise; }
+    return manualQuote('binance', { nativeUnit: value });
+  } });
+  const resolve = () => f.market.resolveSymbol(symbol), initial = await resolve();
+  hold = true; const older = resolve(); await entered.promise;
+  unit = '2'; const changed = await resolve(); assert.equal(initial.marketCurrent(), false); assert.equal(changed.marketCurrent(), true);
+  unit = '1'; const again = await resolve(); assert.equal(changed.marketCurrent(), false);
+  release.resolve(); assert.equal((await older).marketCurrent(), false); assert.equal(again.marketCurrent(), true);
+  assert.equal((await resolve()).marketVersion, again.marketVersion);
+  f.setRules(catalog.slice(1).map(r => ({ ...r, max_limit_size: '10000' }))); f.advance(300001); await f.market.refreshCatalog();
+  assert.equal(again.marketCurrent(), false);
+  f.setRules(catalog.map(r => ({ ...r, max_limit_size: '10000' }))); f.advance(300001);
+  const relisted = await resolve(); assert.equal(relisted.marketIdentity, again.marketIdentity); assert.notEqual(relisted.marketVersion, again.marketVersion); assert.equal(again.marketCurrent(), false);
+});
+
+test('held funding reads native identity without a directory and revokes a live binding when a matching listing exists', async t => {
+  const symbol = 'BINANCE_FUTURE_BTC_USDT', held = 'BYBIT_FUTURE_BTC_USDT';
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  let unit = '1', directoryReads = 0, pause = false;
+  const f = fixture(t, {
+    catalogReader: async () => { directoryReads++; return catalog.map(r => ({ ...r, max_limit_size: '10000' })); },
+    manualIdentityReader: async s => {
+      const nativeUnit = unit; if (pause) { pause = false; entered.resolve(); await release.promise; }
+      return manualQuote(s === held ? 'bybit' : 'binance', { nativeUnit });
+    },
+    currentFundingReader: async q => ({ rate: q.nativeUnit === '2' ? '0.002' : '0.001', intervalHours: 8, nextFundingAt: epoch + 3600000, sourceAt: epoch }),
+  });
+  const rates = s => f.market.view({ includeOpportunities: false, includePositionFunding: true, positionSymbols: [s] }).positionFundingRates;
+  rates(held); await new Promise(setImmediate);
+  assert.equal(rates(held)[0].rate, 0.001); assert.equal(directoryReads, 0, 'native held funding needs no Gate request');
+  const selection = await f.market.resolveSymbol(symbol);
+  const plan = await f.market.previewDirect({ symbol, side: 'BUY', quantity: '0.25', orderType: 'LIMIT', price: '98', timeInForce: 'GTC', expectedMarketIdentity: selection.marketIdentity });
+  await f.market.revalidateOpen(plan); assert.equal(plan.quotesCurrent(), true);
+  pause = true; const older = f.market.resolveSymbol(symbol); await entered.promise;
+  unit = '2'; rates(symbol); await new Promise(setImmediate);
+  assert.equal(rates(symbol)[0].rate, 0.002); assert.equal(directoryReads, 1);
+  release.resolve(); assert.equal((await older).marketCurrent(), false);
+  assert.equal(plan.quotesCurrent(), false); assert.equal(selection.marketCurrent(), false);
+  await assert.rejects(f.market.revalidateOpen(plan), /身份已变化/);
+});
 
 test('manual market never uses saved paper positions or enabled automation', async t => {
   const f = fixture(t);
@@ -374,6 +535,10 @@ test('display resolution requires an exact live CrossEx rule but never requires 
   f.setRules([rule]); const resolved = await f.market.resolveDisplaySymbol(symbol);
   assert.deepEqual(resolved.quote, { exchange: 'okx', base: 'CL', quoteCurrency: 'USDC', settlementCurrency: 'USDC', crossexSymbol: symbol });
   assert.equal(resolved.rule.symbol, symbol); assert.equal(nativeReads, 0);
+  const catalogVersion = (await f.market.instruments()).items.find(i => i.symbol === symbol).candleListing;
+  assert.equal(resolved.candleListing, catalogVersion);
+  f.advance(300000); f.setRules([{ ...rule, version: 'new-listing', contract_size: '2' }]);
+  assert.notEqual((await f.market.resolveDisplaySymbol(symbol)).candleListing, catalogVersion);
   await assert.rejects(f.market.resolveSymbol(symbol), /native unavailable/); assert.equal(nativeReads, 1);
   for (const changes of [{ state: 'suspend' }, { tick_size: '0' }, { exchange_type: 'GATE' }, { delist_time: '1' }]) {
     f.advance(300000); f.setRules([{ ...rule, ...changes }]);

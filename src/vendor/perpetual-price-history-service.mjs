@@ -1,12 +1,38 @@
-// 复制自 project-aggregation 工作台 modules/monitor/server/perpetual-price-history.mjs（提交 c84ba27），只改导入路径。
+// 来自 project-aggregation 工作台 modules/monitor/server/perpetual-price-history.mjs（提交 c84ba27）。
+import { encodeCandleBlocks } from '../candle-blocks-server.ts';
 import { createPerpetualPriceReader } from './perpetual-price-reader.mjs';
-import { perpetualPriceIdentity, validatePerpetualPriceHistory, PRICE_HOUR_MS as HOUR, PRICE_HISTORY_LOOKBACK_MS as LOOKBACK } from './perpetual-price-history.ts';
+import { perpetualPriceIdentity, validatePerpetualPriceHistory, PRICE_BLOCK_MS, PRICE_HOUR_MS as HOUR, PRICE_HISTORY_LOOKBACK_MS as LOOKBACK } from './perpetual-price-history.ts';
 
 const keyOf = market => `${market.exchange}:${market.symbol}`;
 const hostOf = exchange => exchange === 'entropy' ? 'hyperliquid' : exchange;
 const invalid = () => Object.assign(Error('成交价历史请求必须包含一个有效的当前合约组合，以及 3、7 或 30 天窗口。'), { status: 400 });
 const empty = market => ({ key: keyOf(market), identity: perpetualPriceIdentity(market), exchange: market.exchange, symbol: market.symbol, currency: market.quoteCurrency, status: 'pending', fetchedAt: null, from: null, to: null, points: [], error: '', backfillComplete: false });
 const reportOf = (legs, now) => ({ schemaVersion: 1, generatedAt: now, intervalMs: HOUR, legs });
+const GAP_SPACING = 5 * 60_000, GAP_ROUND_DELAY = 6 * HOUR;
+
+function responseLeg(leg, known) {
+  if (known === undefined) return structuredClone(leg);
+  const { points, ...metadata } = leg;
+  const tags = Object.hasOwn(known, leg.identity) && typeof known[leg.identity] === 'string' ? known[leg.identity] : '';
+  return { ...metadata, ...encodeCandleBlocks(points, PRICE_BLOCK_MS, tags) };
+}
+
+/** A successful page may have genuine no-trade hours. Rotate through missing intervals, one day per request. */
+function gapTask(entry, now) {
+  const { points, from, to } = entry.value;
+  if (now < entry.gapAfter || points.length === (to - from) / HOUR) return null;
+  const present = new Set(points.map(point => point.time));
+  function nextMissing(after) {
+    for (let time = Math.max(from, after) + HOUR; time <= to; time += HOUR) if (!present.has(time)) return time;
+    return null;
+  }
+  const first = nextMissing(entry.gapThrough) ?? nextMissing(from);
+  if (first === null) return null;
+  let last = first;
+  while (last < to && last < first + 23 * HOUR && !present.has(last + HOUR)) last += HOUR;
+  return { from: first - HOUR, to: last, gapDelay: nextMissing(last) === null ? GAP_ROUND_DELAY : GAP_SPACING };
+}
+
 function abortable(promise, signal) {
   return new Promise((resolve, reject) => {
     const abort = () => { signal.removeEventListener('abort', abort); reject(signal.reason); };
@@ -25,16 +51,21 @@ export function createPerpetualPriceHistoryService({ getSnapshot, getMarket, sto
   const cache = new Map(), jobs = new Set(), busyHosts = new Set(), hostUntil = new Map();
   let running = false, timer, storageError = '';
   function freshEntry(market, now) {
-    return { key: keyOf(market), identity: perpetualPriceIdentity(market), market, value: empty(market), lastAccessAt: now, activeUntil: now + activeLeaseMs, nextAt: 0, failures: 0, controller: null, dirty: false };
+    return { key: keyOf(market), identity: perpetualPriceIdentity(market), market, value: empty(market), lastAccessAt: now, activeUntil: now + activeLeaseMs, nextAt: 0, gapThrough: 0, gapAfter: now + GAP_SPACING, failures: 0, controller: null, dirty: false };
   }
   function restore(saved, market, now) {
     if (!saved || saved.key !== keyOf(market) || saved.identity !== perpetualPriceIdentity(market) || saved.value?.identity !== saved.identity || !validatePerpetualPriceHistory(reportOf({ [saved.key]: saved.value }, now), now)) return null;
-    return { ...freshEntry(market, now), value: saved.value, nextAt: Number.isFinite(saved.nextAt) ? Math.min(saved.nextAt, now + 300_000) : 0 };
+    const entry = freshEntry(market, now);
+    entry.value = saved.value;
+    entry.nextAt = Number.isFinite(saved.nextAt) ? Math.min(saved.nextAt, now + (saved.value.status === 'unsupported' ? HOUR : 300_000)) : 0;
+    if (Number.isSafeInteger(saved.gapThrough) && saved.gapThrough % HOUR === 0 && saved.gapThrough <= now) entry.gapThrough = saved.gapThrough;
+    if (Number.isSafeInteger(saved.gapAfter)) entry.gapAfter = Math.min(saved.gapAfter, now + GAP_ROUND_DELAY);
+    return entry;
   }
   function persist(entry) {
     if (!entry.dirty) return;
     try {
-      store?.savePriceHistory?.({ key: entry.key, identity: entry.identity, value: entry.value, lastAccessAt: entry.lastAccessAt, nextAt: entry.nextAt });
+      store?.savePriceHistory?.({ key: entry.key, identity: entry.identity, value: entry.value, lastAccessAt: entry.lastAccessAt, nextAt: entry.nextAt, gapThrough: entry.gapThrough, gapAfter: entry.gapAfter });
       entry.dirty = false; storageError = '';
     } catch { storageError = '成交价缓存保存失败，当前保留内存记录。'; }
   }
@@ -52,7 +83,7 @@ export function createPerpetualPriceHistoryService({ getSnapshot, getMarket, sto
     if (value.to === null || value.to <= from) return { from: to - 72 * HOUR, to, replace: true };
     if (value.to < to) return { from: Math.max(from, value.to - HOUR), to: Math.min(to, value.to + 168 * HOUR), replace: false };
     if (value.from > from) return { from: Math.max(from, value.from - 168 * HOUR), to: value.from, replace: false };
-    return null;
+    return gapTask(entry, now);
   }
   function accept(entry, incoming, task) {
     const now = clock();
@@ -72,14 +103,16 @@ export function createPerpetualPriceHistoryService({ getSnapshot, getMarket, sto
     // duplicates within one response still reject the entire batch atomically.
     for (const [time, close] of verified) combined.set(time, close);
     const complete = to - keptFrom === LOOKBACK;
-    const value = { ...entry.value, status: complete ? 'ready' : 'pending', fetchedAt: now, from: keptFrom, to, points: [...combined].filter(([time]) => time > keptFrom && time <= to).sort(([a], [b]) => a - b).map(([time, close]) => ({ time, close })), error: '', backfillComplete: complete };
+    const points = task.gapDelay && !verified.size ? entry.value.points : [...combined].filter(([time]) => time > keptFrom && time <= to).sort(([a], [b]) => a - b).map(([time, close]) => ({ time, close }));
+    const value = { ...entry.value, status: complete ? 'ready' : 'pending', fetchedAt: task.gapDelay ? entry.value.fetchedAt : now, from: keptFrom, to, points, error: '', backfillComplete: complete };
     if (!validatePerpetualPriceHistory(reportOf({ [entry.key]: value }, now), now)) throw Error('成交价历史验证失败');
-    entry.value = value; entry.failures = 0; entry.nextAt = complete ? now + 60_000 : 0; entry.dirty = true; persist(entry);
+    if (task.gapDelay) { entry.gapAfter = now + task.gapDelay; entry.gapThrough = task.to; }
+    entry.value = value; entry.failures = 0; entry.nextAt = complete ? Math.min(now + 60_000, (Math.floor(now / HOUR) + 1) * HOUR) : 0; entry.dirty = true; persist(entry);
   }
   async function collect() {
     if (!running) return;
-    const launched = [], now = clock();
-    for (const entry of [...cache.values()].sort((a, b) => b.lastAccessAt - a.lastAccessAt)) {
+    const launched = [], candidates = [], now = clock();
+    for (const entry of cache.values()) {
       persist(entry);
       if (entry.controller || now < entry.nextAt || now > entry.activeUntil) continue;
       if (!currentMarket(entry)) {
@@ -87,9 +120,15 @@ export function createPerpetualPriceHistoryService({ getSnapshot, getMarket, sto
         // only a new authorized read may register the new identity.
         cache.delete(entry.key); continue;
       }
-      const task = taskFor(entry, now), host = hostOf(entry.market.exchange);
-      if (!task || busyHosts.has(host) || now < (hostUntil.get(host) ?? 0)) continue;
+      const task = taskFor(entry, now);
+      if (task) candidates.push({ entry, task });
+    }
+    // Across all leased contracts, current closes and the first backfill take the available slots first.
+    candidates.sort((a, b) => Number(Boolean(a.task.gapDelay)) - Number(Boolean(b.task.gapDelay)) || b.entry.lastAccessAt - a.entry.lastAccessAt);
+    for (const { entry, task } of candidates) {
       if (jobs.size >= maxConcurrent) break;
+      const host = hostOf(entry.market.exchange);
+      if (busyHosts.has(host) || now < (hostUntil.get(host) ?? 0)) continue;
       const controller = new AbortController(); entry.controller = controller;
       busyHosts.add(host); hostUntil.set(host, now + hostSpacingMs);
       const current = () => running && !controller.signal.aborted && cache.get(entry.key) === entry && Boolean(currentMarket(entry));
@@ -99,8 +138,11 @@ export function createPerpetualPriceHistoryService({ getSnapshot, getMarket, sto
         if (!current()) return;
         const unsupported = error?.code === 'UNSUPPORTED';
         entry.value = { ...entry.value, status: unsupported ? 'unsupported' : 'error', error: unsupported ? error.message : '成交价历史更新失败，保留已完成记录。' };
-        entry.nextAt = clock() + (unsupported ? HOUR : Math.min(300_000, 60_000 * 2 ** Math.min(entry.failures++, 3)));
-        if ([429, 418].includes(error?.status)) hostUntil.set(host, entry.nextAt);
+        const retryAt = clock() + (unsupported ? HOUR : Math.min(300_000, 60_000 * 2 ** Math.min(entry.failures++, 3)));
+        const rateLimited = [429, 418].includes(error?.status);
+        if (task.gapDelay && !unsupported) entry.gapAfter = retryAt;
+        entry.nextAt = task.gapDelay && !unsupported && !rateLimited ? 0 : retryAt;
+        if (rateLimited) hostUntil.set(host, retryAt);
         entry.dirty = true; persist(entry);
       }).finally(() => { if (entry.controller === controller) entry.controller = null; busyHosts.delete(host); jobs.delete(job); });
       jobs.add(job); launched.push(job);
@@ -112,14 +154,15 @@ export function createPerpetualPriceHistoryService({ getSnapshot, getMarket, sto
     async stop() { running = false; clearInterval(timer); for (const entry of cache.values()) entry.controller?.abort(); await Promise.allSettled([...jobs]); for (const entry of cache.values()) persist(entry); },
     collect,
     read(input) {
-      const pair = input?.pair;
+      const pair = input?.pair, known = input?.knownBlocks;
       if (!pair || ![3, 7, 30].includes(input.days) || typeof pair.base !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(pair.base) || typeof pair.longKey !== 'string' || typeof pair.shortKey !== 'string' || pair.longKey.length > 160 || pair.shortKey.length > 160 || pair.longKey === pair.shortKey) throw invalid();
+      if (known !== undefined && (!known || typeof known !== 'object' || Array.isArray(known))) throw invalid();
       const quotes = new Map(getSnapshot().quotes.map(quote => [keyOf(quote), quote])), requested = new Map();
       // Both current quotes and the current directory must agree. A persisted
       // quote alone is never permission to fetch an arbitrary contract.
       for (const key of [pair.longKey, pair.shortKey]) {
         const quote = quotes.get(key), market = quote && getMarket?.(quote.exchange, quote.symbol);
-        if (!quote || !market || keyOf(market) !== key || quote.base !== pair.base || market.base !== pair.base || quote.quoteCurrency !== market.quoteCurrency || quote.comparable === false || market.comparable === false || (quote.multiplier ?? 1) !== (market.multiplier ?? 1)) throw invalid();
+        if (!quote || !market || keyOf(market) !== key || quote.base !== pair.base || market.base !== pair.base || quote.quoteCurrency !== market.quoteCurrency || quote.comparable === false || market.comparable === false || (quote.multiplier ?? 1) !== (market.multiplier ?? 1) || (quote.contractUnit ?? null) !== (market.contractUnit ?? null) || (quote.historyIdentity !== undefined && quote.historyIdentity !== perpetualPriceIdentity(market))) throw invalid();
         requested.set(key, market);
       }
       if (requested.get(pair.longKey).exchange === requested.get(pair.shortKey).exchange) throw invalid();
@@ -129,16 +172,16 @@ export function createPerpetualPriceHistoryService({ getSnapshot, getMarket, sto
         if (entry && entry.identity !== perpetualPriceIdentity(market)) { entry.controller?.abort(); cache.delete(key); entry = null; }
         if (!entry) {
           prune(requested);
-          if (cache.size >= cacheLimit) { legs[key] = { ...empty(market), error: '成交价历史队列繁忙，请稍后重试。' }; continue; }
+          if (cache.size >= cacheLimit) { legs[key] = responseLeg({ ...empty(market), error: '成交价历史队列繁忙，请稍后重试。' }, known); continue; }
           try { entry = restore(store?.loadPriceHistory?.(key)?.[0], market, now); }
           catch { storageError = '成交价缓存读取失败，重新读取公开历史。'; }
           entry ??= freshEntry(market, now); cache.set(key, entry);
         }
         entry.lastAccessAt = now; entry.activeUntil = now + activeLeaseMs; entry.market = market;
-        legs[key] = structuredClone(entry.value);
+        legs[key] = responseLeg(entry.value, known);
       }
       if (running) queueMicrotask(() => { void collect(); });
-      return { ...reportOf(legs, now), ...(storageError ? { storageError } : {}) };
+      return { ...reportOf(legs, now), ...(known !== undefined ? { blockSpanMs: PRICE_BLOCK_MS } : {}), ...(storageError ? { storageError } : {}) };
     },
     metrics: () => ({ cached: cache.size, inFlight: jobs.size, storageError }),
   };

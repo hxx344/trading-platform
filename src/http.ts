@@ -14,6 +14,8 @@ import type { Redactor } from './read-redact.ts';
 import type { WebApp } from './web-assets.ts';
 import type { UpdateView } from './service/update-types.ts';
 import { ANTHROPIC_RETENTION_DAYS } from './vendor/anthropic-market.mjs';
+import { encodeCandleBlocks } from './candle-blocks-server.ts';
+import { MONITOR_CANDLE_BLOCK_MS, monitorCandleField, type MonitorCandleUpdate } from './monitor/candle-window.ts';
 import { supportsExchange, type Exchange } from './vendor/exchange-comparison.mjs';
 import { supportsFundingHistory } from './vendor/exchange-funding-history.mjs';
 import type { AssetStore } from './asset/store.ts';
@@ -590,7 +592,18 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       if (days !== null && (!/^[1-9]\d{0,2}$/.test(days) || Number(days) > MONITOR_MAX_DAYS)) return send(response, 400, { code: 'invalid_days', message: `days 须为 1–${MONITOR_MAX_DAYS} 的整数` });
       const candles = views.monitor.candles(market, days === null ? null : Number(days));
       if (candles === undefined) return send(response, 404, { code: 'not_found', message: `本服务没有配置${name}行情监控` });
-      return candles === null ? send(response, 503, { code: 'not_ready', message: `尚未取得${name} K 线，后台正在采集` }) : send(response, 200, candles);
+      if (candles === null) return send(response, 503, { code: 'not_ready', message: `尚未取得${name} K 线，后台正在采集` });
+      const known = url.searchParams.get('known');
+      if (known === null) return send(response, 200, candles);
+      const field = monitorCandleField(market);
+      type History = Record<typeof field, { time: number }[]> & { windowDays?: number };
+      const { [field]: selected, ...header } = candles as History;
+      // Use complete UTC blocks, including the start of the first week. Its content tag survives
+      // moving the visible boundary and widening the window to include the preceding weeks.
+      const full = header.windowDays === undefined ? selected : (views.monitor.candles(market, null) as History)[field];
+      const first = selected[0]!.time;
+      const update: MonitorCandleUpdate = { first, header, candles: encodeCandleBlocks(full, MONITOR_CANDLE_BLOCK_MS, known, first) };
+      return send(response, 200, update);
     }
     if (request.method === 'GET' && url.pathname.startsWith('/api/asset/')) {
       const asset = views?.asset;
@@ -679,7 +692,9 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
         if ((request.method === 'PUT' || request.method === 'POST') && path === 'settings') return send(response, 200, crossex.settings(await readJson(request)));
         if (request.method === 'POST' && path === 'refresh') { await readJson(request); return send(response, 200, await crossex.refresh()); }
         if (request.method === 'GET' && path === 'instruments') return send(response, 200, await crossex.instruments());
-        if (request.method === 'GET' && path === 'market') return send(response, 200, await crossex.market(url.searchParams.get('symbol'), url.searchParams.get('interval') || '5m'));
+        if (request.method === 'GET' && path === 'market') return send(response, 200, await crossex.market(url.searchParams.get('symbol'), url.searchParams.get('interval') || '5m', {
+          candles: url.searchParams.get('candles'), identity: url.searchParams.get('identity'), known: url.searchParams.get('known'),
+        }));
         if (request.method === 'POST' && path === 'preview') return send(response, 200, await crossex.preview(await readJson(request)));
         if (request.method === 'POST' && path === 'open-capacity') return send(response, 200, await crossex.openCapacity(await readJson(request)));
         if (request.method === 'POST' && path === 'confirm') return send(response, 200, await crossex.confirm(await readJson(request)));

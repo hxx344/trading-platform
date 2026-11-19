@@ -2,7 +2,9 @@ import { Activity, ArrowDownRight, ArrowUpRight, ChevronDown, Clock3, Info, Move
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ANTHROPIC_COMPARISON_LEGS, ANTHROPIC_LEGS, anthropicPremium, anthropicSharesPerUnit, perShare, type AnthropicComparisonLeg, type AnthropicShares } from '../../src/vendor/anthropic-market.mjs';
 import { api, ApiError } from './api.ts';
-import { ANTHROPIC_WARMUP_DAYS, anthropicChartConfig, anthropicHistory, anthropicPoints, anthropicQuote, coversAnthropicRange, dailyPoints, ranges, selectRange, type AnthropicHistory, type AnthropicQuote, type ChartMode, type Point } from './monitor-history.ts';
+import { ANTHROPIC_WARMUP_DAYS, anthropicChartConfig, anthropicPoints, anthropicQuote, dailyPoints, ranges, selectRange, type AnthropicQuote, type ChartMode, type Point } from './monitor-history.ts';
+import { candleReadDenied } from './monitor-candle-cache.ts';
+import { anthropicCandles, useMonitorCandles } from './use-monitor-candles.ts';
 import { SpreadChart, date, stamp } from './MonitorChart.tsx';
 import { disabledNotice, parseControl, parseControls, switchFailure, switchLabel, toggleBody, type MonitorControls } from './monitor-control.ts';
 import { DetailLayout, RelatedPositions } from './MonitorRelated.tsx';
@@ -21,10 +23,8 @@ import './monitor.css';
 // Every read goes through useLiveResource; the service collects in the background, the page only reads what it saved.
 export const MONITOR_STATE_PATH = '/api/monitor/state';
 export const MONITOR_READ_TIMEOUT_MS = 10_000;
-const QUOTE_PATH = '/api/monitor/anthropic/quote', CANDLE_PATH = '/api/monitor/anthropic/candles';
-const STATE_MS = 60_000, CONTROL_TIMEOUT_MS = 15_000, QUOTE_MS = 10_000, CANDLE_MS = 60_000;
-// The complete history is up to 400 days of 15-minute rows, a few megabytes.
-const CANDLE_TIMEOUT_MS = 30_000;
+const QUOTE_PATH = '/api/monitor/anthropic/quote';
+const STATE_MS = 60_000, CONTROL_TIMEOUT_MS = 15_000, QUOTE_MS = 10_000;
 
 // controls is null from a service older than M-3c (no run switch): the page then shows the markets as before.
 export type MonitorState = { markets: string[]; anthropic: { shares: AnthropicShares } | null; controls: MonitorControls | null };
@@ -87,9 +87,9 @@ export function MonitorPage({ onExpired }: { onExpired: () => void }) {
       if (!answered || error.code === 'control_conflict') void refresh();
     } finally { setPending(null); }
   }, [current, pending, commit, refresh, onExpired]);
-  if (!state.data) return state.status === 'error' || state.status === 'offline'
-    ? <StatePanel kind="error" title="读取行情监控失败" detail={state.error?.message ?? '网络离线'} />
-    : <StatePanel kind="loading" title="加载中…" />;
+  if (candleReadDenied(state.error) || (!state.data && (state.status === 'error' || state.status === 'offline')))
+    return <StatePanel kind="error" title="读取行情监控失败" detail={state.error?.message ?? '网络离线'} />;
+  if (!state.data) return <StatePanel kind="loading" title="加载中…" />;
   // Markets this page can show, in the service's order; a market a newer service adds stays hidden here.
   const markets = state.data.markets.filter(market => market in MARKET_TABS);
   if (!markets.length) return <StatePanel kind="empty" title="本服务没有启用行情监控" />;
@@ -104,8 +104,7 @@ export function MonitorPage({ onExpired }: { onExpired: () => void }) {
   // The run switch sits on the right of the market tabs, as in the workbench hub; with one market the row shows only it.
   const controls = state.data.controls && <div className="hub-monitor-controls"><span>运行监控</span><button type="button" role="switch" aria-checked={control?.enabled ?? false} aria-busy={busy} aria-label={`${MARKET_TABS[active]}运行监控`} disabled={!control || pending !== null} onClick={() => void toggle(active)}><span>{switchLabel(control, busy, failed)}</span><i aria-hidden="true" /></button></div>;
   const off = control?.enabled === false;
-  // Only the shown market reads: switching remounts its panel, which reads again at once. A market switched off shows
-  // the notice instead, so its panel stops reading (the service answers 423 for it anyway).
+  // Only the shown market subscribes. Switching it off unmounts the panel and its readers.
   return <div className="monitor-desk">
     <div className="site-shell" data-monitor={active}><div className="monitor-main">
       {(markets.length > 1 || controls) && <div className="hub-nav-row">{markets.length > 1 ? <div className="hub-market-nav" role="tablist" aria-label="选择监控市场">{markets.map(market => <button type="button" role="tab" key={market} aria-selected={active === market} data-state={active === market ? 'active' : 'inactive'} className="hub-market-tab" onClick={() => choose(market)}>{MARKET_TABS[market]}</button>)}</div> : <span />}{controls}</div>}
@@ -118,19 +117,15 @@ export function MonitorPage({ onExpired }: { onExpired: () => void }) {
 }
 
 function AnthropicPanel({ outstanding, diluted, onExpired }: { outstanding: number; diluted: number; onExpired: () => void }) {
-  const [range, setRange] = useState<number | null>(7);
+  const [requestedRange, setRange] = useState<number | null>(7);
   const [leg, setLeg] = useState<AnthropicComparisonLeg>('xyz');
   const [mode, setMode] = useState<ChartMode>('premium');
   const [details, setDetails] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const shares = useMemo<AnthropicShares>(() => ({ outstanding, diluted }), [outstanding, diluted]);
-  const windowDays = range === null ? null : range + ANTHROPIC_WARMUP_DAYS;
   const quoteLive = useLiveResource<AnthropicQuote>(QUOTE_PATH, { intervalMs: QUOTE_MS, timeoutMs: MONITOR_READ_TIMEOUT_MS, parse: anthropicQuote, onExpired });
-  const candleLive = useLiveResource<AnthropicHistory>(windowDays === null ? CANDLE_PATH : `${CANDLE_PATH}?days=${windowDays}`, { intervalMs: CANDLE_MS, timeoutMs: CANDLE_TIMEOUT_MS, parse: anthropicHistory, onExpired });
-  // A newly chosen range reads its own window; until it arrives, an earlier read that already covers it stays on screen.
-  const [kept, setKept] = useState<AnthropicHistory | null>(null);
-  useEffect(() => { if (candleLive.data) setKept(candleLive.data); }, [candleLive.data]);
-  const data = candleLive.data ?? (kept && coversAnthropicRange(kept, range) ? kept : null);
+  const candleLive = useMonitorCandles(anthropicCandles, requestedRange, ANTHROPIC_WARMUP_DAYS, onExpired, quoteLive.error);
+  const { data, range } = candleLive;
   const quote = quoteLive.data;
   const quoteFailed = quoteLive.error !== null && !(quote === null && notReady(quoteLive.error));
   const quoteError = quoteFailed ? '实时报价更新失败，10 秒后自动重试；请留意报价获取时间。' : quote?.status === 'snapshot' ? '后台尚未取得新报价，显示上次保存的数据；请留意采集时间。' : '';
@@ -170,7 +165,9 @@ function AnthropicPanel({ outstanding, diluted, onExpired }: { outstanding: numb
       {legErrors.length > 0 && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />部分行情缺失：{legErrors.join('；')}。缺失一侧时不计算溢价。</div>}
       {error && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />历史更新中断：{error}{data ? ' 当前保留上次成功加载的数据。' : ''}</div>}
       {candleErrors.length > 0 && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />K 线更新失败：{candleErrors.join('；')}。图表保留已保存的收盘价，之后的时段会断开，下一轮自动重试。</div>}
-      {data?.status === 'snapshot' && <div className="notice"><Info size={16} aria-hidden="true" />K 线采集暂停，图表展示 {stamp(data.fetchedAt)} 保存的行情。</div>}
+      {candleLive.notice && <div className="notice" role="status"><Info size={16} aria-hidden="true" />{candleLive.notice}</div>}
+      {candleLive.cached && data ? <div className="notice"><Info size={16} aria-hidden="true" />图表显示本地缓存，行情采集于 {stamp(data.fetchedAt)}。</div>
+        : data?.status === 'snapshot' && <div className="notice"><Info size={16} aria-hidden="true" />K 线采集暂停，图表展示 {stamp(data.fetchedAt)} 保存的行情。</div>}
       <div className="hynix-chart-group"><section className="metrics readout" aria-label="最新溢价概览">
         <article className="metric primary-metric"><div className="metric-label">当前溢价<Activity size={16} aria-hidden="true" /></div><div className={`metric-value ${direction}`}>{signed(premium)}</div><div className="metric-foot">Binance ÷ {contract.name} − 1 <span>· 每股</span></div></article>
         <article className="metric"><div className="metric-label"><span className="legend-dot adr" />Binance<span className="ticker">ANTHROPICUSDT</span></div><div className="metric-value">{usd(binance ? perShare('binance', binance.markPx, shares) : null)}</div><div className="metric-foot">标记价 {native(binance?.markPx)} USDT ÷ {shares.outstanding} <span>· 资金费 {fundingText(binance?.fundingRate)} / 期</span></div></article>

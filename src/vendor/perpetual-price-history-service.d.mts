@@ -1,5 +1,5 @@
 // Types for perpetual-price-history-service.mjs (the workbench's perpetual-price-history.mjs, c84ba27).
-import type { PerpetualPriceHistoryReport } from './perpetual-price-history.ts';
+import type { PriceHistoryReply } from './perpetual-price-history.ts';
 import type { PerpetualPriceReader } from './perpetual-price-reader.mjs';
 import type { PerpetualContractCacheEntry } from './perpetual-market-metrics-service.mjs';
 import type { PerpetualMarket, PerpetualQuote } from './perpetual-stream.mjs';
@@ -22,7 +22,7 @@ export interface PerpetualPriceHistoryService {
   stop(): Promise<void>;
   collect(): Promise<void>;
   /** Throws an Error with `status: 400` for an invalid pair or window. */
-  read(input: unknown): PerpetualPriceHistoryReport;
+  read<I>(input: I): PriceHistoryReply<I>;
   metrics(): { cached: number; inFlight: number; storageError: string };
 }
 export declare function createPerpetualPriceHistoryService(options: PerpetualPriceHistoryServiceOptions): PerpetualPriceHistoryService;

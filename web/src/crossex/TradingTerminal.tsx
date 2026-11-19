@@ -12,8 +12,18 @@ import OpenCapacityPanel from './OpenCapacityPanel.tsx';
 import type { CapacityContext } from './use-open-capacity.ts';
 import type { OpenCapacityInput } from './open-capacity.ts';
 import { FillBar } from './FillBar.tsx';
+import { INTERVALS } from '../../../src/vendor/crossex/terminal-intervals.ts';
+import { visibleTerminalCandles } from './terminal-candles.ts';
 
 const D = Decimal.clone({ precision: 100 });
+const SELECTION_KEY = 'crossex-terminal-selection-v1';
+function initialSelection(): { symbol: string; interval: string } {
+  try {
+    const value = JSON.parse(sessionStorage.getItem(SELECTION_KEY) ?? 'null');
+    if (typeof value?.symbol === 'string' && typeof value.interval === 'string' && Object.hasOwn(INTERVALS, value.interval)) return value;
+  } catch { /* Storage is optional. */ }
+  return { symbol: '', interval: '5m' };
+}
 export function MarketSelector({ instruments, value, onChange, label = '交易合约' }: { instruments: Instrument[]; value: string; onChange: (symbol: string) => void; label?: string }) {
   const [query, setQuery] = useState(''), [exchange, setExchange] = useState('');
   const choices = useMemo(() => instruments.filter(i => (!exchange || i.exchange === exchange) && `${i.base} ${i.symbol}`.toUpperCase().includes(query.trim().toUpperCase())), [instruments, exchange, query]);
@@ -22,32 +32,39 @@ export function MarketSelector({ instruments, value, onChange, label = '交易�
 }
 
 export default function TradingTerminal({ instruments, catalogError, live, budget, active, background, disabled, preview, capacityContext }: { instruments: Instrument[]; catalogError: string; live: LiveView; budget: number; active: boolean; background: boolean; disabled: boolean; preview: (input: PreviewInput) => Promise<boolean>; capacityContext: CapacityContext }) {
-  const [symbol, setSymbol] = useState(''), [interval, setInterval] = useState('5m');
-  useEffect(() => { if (!symbol && instruments.length) setSymbol((instruments.find(i => i.base === 'BTC' && i.exchange === 'gate') || instruments.find(i => i.base === 'BTC') || instruments[0]).symbol); }, [instruments, symbol]);
-  const instrument = instruments.find(i => i.symbol === symbol), { data, error } = useMarket(symbol, interval, active, background);
-  const [pickedPrice, setPickedPrice] = useState<{ price: string; key: number } | null>(null);
-  return <div className="terminal-view"><section className="market-heading panel"><MarketSelector instruments={instruments} value={symbol} onChange={value => { setSymbol(value); setPickedPrice(null); }}/><div className="market-current"><span>{instrument ? `${instrument.base} / ${instrument.quoteCurrency}` : '选择交易合约'}</span><strong><DecimalValue value={data?.ticker?.lastPrice} kind="price"/></strong><small>{instrument ? venue(instrument.exchange) + ' 永续' : 'CrossEx 合约目录'}</small></div><div className="market-stat"><span>标记价格</span><strong><DecimalValue value={data?.ticker?.markPrice} kind="price"/></strong><small>{instrument?.quoteCurrency || '—'}</small></div><div className="market-stat"><span>24h 涨跌</span><strong className={amountClass(data?.ticker?.change24h)}>{percentage(data?.ticker?.change24h)}</strong><small>交易所返回值</small></div><div className="market-stat"><span>资金费率</span><strong>{percentage(data?.ticker?.fundingRate)}</strong><small>下次 {time(data?.ticker?.nextFundingAt)}</small></div><div className="market-stat market-freshness"><span className={data?.status === 'live' ? 'positive' : 'warning'}>{liveStatus(data?.status || 'connecting')}</span><small>{time(data?.asOf)}</small></div></section>
+  const [initial] = useState(initialSelection), [symbol, setSymbol] = useState(initial.symbol), [interval, setInterval] = useState(initial.interval);
+  const instrument = instruments.find(i => i.symbol === symbol);
+  useEffect(() => {
+    if (!symbol && instruments.length) setSymbol((instruments.find(i => i.base === 'BTC' && i.exchange === 'gate') || instruments.find(i => i.base === 'BTC') || instruments[0]).symbol);
+    if (instrument) try { sessionStorage.setItem(SELECTION_KEY, JSON.stringify({ symbol, interval })); } catch { /* Optional preference. */ }
+  }, [instruments, instrument, symbol, interval]);
+  const { data, chart, marketIdentity, error } = useMarket(instrument, interval, active, background, 'blocks');
+  const current = Math.floor(capacityContext.now / INTERVALS[interval]) * INTERVALS[interval];
+  const candles = useMemo(() => visibleTerminalCandles(chart, interval, current, active && !background), [chart, interval, current, active, background]);
+  return <div className="terminal-view"><section className="market-heading panel"><MarketSelector instruments={instruments} value={symbol} onChange={setSymbol}/><div className="market-current"><span>{instrument ? `${instrument.base} / ${instrument.quoteCurrency}` : '选择交易合约'}</span><strong><DecimalValue value={data?.ticker?.lastPrice} kind="price"/></strong><small>{instrument ? venue(instrument.exchange) + ' 永续' : 'CrossEx 合约目录'}</small></div><div className="market-stat"><span>标记价格</span><strong><DecimalValue value={data?.ticker?.markPrice} kind="price"/></strong><small>{instrument?.quoteCurrency || '—'}</small></div><div className="market-stat"><span>24h 涨跌</span><strong className={amountClass(data?.ticker?.change24h)}>{percentage(data?.ticker?.change24h)}</strong><small>交易所返回值</small></div><div className="market-stat"><span>资金费率</span><strong>{percentage(data?.ticker?.fundingRate)}</strong><small>下次 {time(data?.ticker?.nextFundingAt)}</small></div><div className="market-stat market-freshness"><span className={data?.status === 'live' ? 'positive' : 'warning'}>{liveStatus(data?.status || 'connecting')}</span><small>{time(data?.asOf)}</small></div></section>
     {(catalogError || error || data?.error) && <p className="inline-state warning">{catalogError || error || data?.error}</p>}
-    <div className="terminal-grid"><section className="panel chart-panel"><div className="panel-tabs"><span className="active tab-label"><CandlestickChart size={15}/>价格图表</span><span className="panel-unit">{instrument?.quoteCurrency || '原计价币'}</span></div><div className="chart-toolbar">{['1m', '5m', '15m', '1h', '4h', '1d'].map(value => <button key={value} className={interval === value ? 'active' : ''} onClick={() => setInterval(value)}>{value}</button>)}<span>真实交易所 K 线</span></div><CandleChart candles={data?.candles || []} base={instrument?.base || ''} quote={instrument?.quoteCurrency || ''} error={data?.candleError} asOf={data?.candleAsOf} interval={interval}/></section>
-      <OrderBook data={data} base={instrument?.base || ''} quote={instrument?.quoteCurrency || ''} pick={price => setPickedPrice({ price, key: Date.now() })}/>
-      <OrderTicket key={symbol} instrument={instrument} data={data} live={live} budget={budget} disabled={disabled} pickedPrice={pickedPrice} preview={preview} capacityContext={capacityContext}/>
+    <div className="terminal-grid"><section className="panel chart-panel"><div className="panel-tabs"><span className="active tab-label"><CandlestickChart size={15}/>价格图表</span><span className="panel-unit">{chart?.quote || instrument?.quoteCurrency || '原计价币'}</span></div><div className="chart-toolbar">{['1m', '5m', '15m', '1h', '4h', '1d'].map(value => <button key={value} className={interval === value ? 'active' : ''} onClick={() => setInterval(value)}>{value}</button>)}<span>真实交易所 K 线</span></div><CandleChart candles={candles} base={chart?.base || instrument?.base || ''} quote={chart?.quote || instrument?.quoteCurrency || ''} error={chart?.error} asOf={chart?.asOf} interval={interval}/></section>
+      <OrderTicket key={marketIdentity} instrument={instrument} data={data} live={live} budget={budget} disabled={disabled} preview={preview} capacityContext={capacityContext}/>
     </div><section className="panel recent-prints"><div className="section-heading"><h2>最新市场成交</h2><span className="muted">{instrument ? venue(instrument.exchange) : '—'} · {symbol || '未选择合约'}</span></div>{data?.trades.length ? <div className="prints-grid">{data.trades.slice(0, 15).map((trade, index) => <div key={trade.id || index}><span className={trade.side.toUpperCase() === 'BUY' ? 'positive' : 'negative'}><DecimalValue value={trade.price} kind="price"/> <small>{instrument?.quoteCurrency}</small></span><span><DecimalValue value={trade.quantity}/> <small>{trade.quantityUnit === 'contracts' ? '张' : instrument?.base}</small></span><small>{time(trade.at)}</small></div>)}</div> : <p className="empty compact">等待真实市场成交；连接后产生的成交将在这里显示。</p>}</section>
   </div>;
 }
 
-function OrderTicket({ instrument: i, data, live, budget, disabled, pickedPrice, preview, capacityContext }: { instrument?: Instrument; data: MarketData | null; live: LiveView; budget: number; disabled: boolean; pickedPrice: { price: string; key: number } | null; preview: (input: PreviewInput) => Promise<boolean>; capacityContext: CapacityContext }) {
+function OrderTicket({ instrument: i, data, live, budget, disabled, preview, capacityContext }: { instrument?: Instrument; data: MarketData | null; live: LiveView; budget: number; disabled: boolean; preview: (input: PreviewInput) => Promise<boolean>; capacityContext: CapacityContext }) {
   const [side, setSide] = useState<'BUY' | 'SELL'>('BUY'), [orderType, setOrderType] = useState<'LIMIT' | 'MARKET'>('LIMIT');
   const [quantity, setQuantity] = useState(''), [price, setPrice] = useState(''), [timeInForce, setTimeInForce] = useState<'GTC' | 'IOC' | 'FOK' | 'POC'>('GTC');
-  useEffect(() => { if (pickedPrice) { setPrice(pickedPrice.price); setOrderType('LIMIT'); } }, [pickedPrice]);
   const referencePrice = orderType === 'LIMIT' ? price : side === 'BUY' ? data?.ticker?.askPrice : data?.ticker?.bidPrice;
   const notional = positiveQuantity(quantity) && referencePrice && positiveQuantity(referencePrice) ? new D(quantity).mul(referencePrice).toFixed() : null;
   const ready = !!i && positiveQuantity(quantity) && (orderType === 'MARKET' || positiveQuantity(price));
-  const current = !!data && data.status === 'live', tradable = data?.tradingAvailable !== false;
+  const current = capacityContext.active && !capacityContext.background && data?.status === 'live', tradable = data?.tradingAvailable !== false && data?.candleIdentity !== null;
+  const bookAt = data?.book?.at;
+  const freshBook = typeof bookAt === 'number' && bookAt <= capacityContext.now + 1000 && capacityContext.now - bookAt <= 10_000;
   const fee = instrumentFees(live.fees, i?.symbol);
   const capacityInput: OpenCapacityInput | null = i && (!quantity || positiveQuantity(quantity)) && (orderType === 'MARKET' || !price || positiveQuantity(price))
     ? { order: { symbol: i.symbol, side, orderType, timeInForce: orderType === 'MARKET' ? 'IOC' : timeInForce,
       ...(quantity ? { quantity } : {}), ...(orderType === 'LIMIT' && price ? { price } : {}) } } : null;
-  return <section className="panel order-ticket"><div className="ticket-heading"><h2>手动委托</h2><span className="tag live-tag">实盘</span></div><form onSubmit={e => { e.preventDefault(); if (ready && !disabled && current && tradable) void preview({ kind: 'open', order: { symbol: i!.symbol, side, quantity, orderType, ...(orderType === 'LIMIT' ? { price } : {}), timeInForce: orderType === 'MARKET' ? 'IOC' : timeInForce } }); }}>
+  return <><OrderBook data={data} base={i?.base || ''} quote={i?.quoteCurrency || ''}
+    pick={current && tradable && freshBook ? value => { setPrice(value); setOrderType('LIMIT'); } : undefined}/>
+    <section className="panel order-ticket"><div className="ticket-heading"><h2>手动委托</h2><span className="tag live-tag">实盘</span></div><form onSubmit={e => { e.preventDefault(); if (ready && !disabled && current && tradable) void preview({ kind: 'open', order: { symbol: i!.symbol, ...(data?.candleIdentity ? { expectedMarketIdentity: data.candleIdentity } : {}), side, quantity, orderType, ...(orderType === 'LIMIT' ? { price } : {}), timeInForce: orderType === 'MARKET' ? 'IOC' : timeInForce } }); }}>
     <div className="side-toggle"><button type="button" className={side === 'BUY' ? 'active buy' : ''} onClick={() => setSide('BUY')}>买入 / 做多</button><button type="button" className={side === 'SELL' ? 'active sell' : ''} onClick={() => setSide('SELL')}>卖出 / 做空</button></div>
     <div className="ticket-types">{(['LIMIT', 'MARKET'] as const).map(value => <button type="button" className={orderType === value ? 'active' : ''} key={value} onClick={() => setOrderType(value)}>{value === 'LIMIT' ? '限价' : '市价'}</button>)}</div>
     {orderType === 'LIMIT' && <label>委托价格<div className="input-unit"><input inputMode="decimal" value={price} onChange={e => setPrice(e.target.value)} placeholder="输入价格或点击盘口" required/><span>{i?.quoteCurrency || '—'}</span></div></label>}
@@ -56,7 +73,7 @@ function OrderTicket({ instrument: i, data, live, budget, disabled, pickedPrice,
     <OpenCapacityPanel input={capacityInput} context={capacityContext} base={i?.base || ''}/>
     <dl className="ticket-details"><div><dt>参考名义额</dt><dd><DecimalValue value={notional} kind="amount"/> <small>{i?.quoteCurrency}</small></dd></div><div><dt>单腿名义额上限</dt><dd><DecimalValue value={String(budget)} kind="amount"/> USDT</dd></div>{live.account?.account_mode === 'CROSS_EXCHANGE' && <div><dt>共享可用保证金 (USDT)</dt><dd><DecimalValue value={decimalField(live.account, 'available_margin')} kind="amount"/></dd></div>}<div><dt>数量步长</dt><dd><DecimalValue value={i?.lot_size} full/> {i?.base}</dd></div><div><dt>价格步长</dt><dd><DecimalValue value={i?.tick_size} kind="price" full/> {i?.quoteCurrency}</dd></div><div><dt>最小名义额</dt><dd><DecimalValue value={i?.min_notional} kind="amount" full/> {i?.quoteCurrency}</dd></div><div><dt>手续费 Maker / Taker</dt><dd>{percentage(fee.maker)} / {percentage(fee.taker)}</dd></div></dl>
     <button type="submit" className={'submit-order ' + (side === 'BUY' ? 'buy' : 'sell')} disabled={disabled || !ready || !current || !tradable}>{disabled ? '当前不可开仓' : !tradable ? '合约暂不可交易' : !current ? '等待有效行情' : '预览' + (side === 'BUY' ? '买入' : '卖出') + '委托'}</button>{data?.tradingReason && <p className="inline-state warning">{data.tradingReason}</p>}<p className="ticket-note">上限约束名义额，不是保证金。参考金额未计入保护价格、盘口深度与汇率影响，以预览中的 USDT 校验金额为准。</p>
-  </form></section>;
+  </form></section></>;
 }
 
 export function OrderBook({ data, base, quote, pick }: { data: MarketData | null; base: string; quote: string; pick?: (price: string) => void }) {
@@ -77,7 +94,7 @@ function CandleChart({ candles, base, quote, error, asOf, interval }: { candles:
   const low = Decimal.min(...valid.map(c => c.low)), high = Decimal.max(...valid.map(c => c.high));
   const padding = high.sub(low).gt(0) ? high.sub(low).mul('0.08') : high.abs().mul('0.01').add('0.00000001');
   const min = low.sub(padding), max = high.add(padding), range = max.sub(min), maxVolume = Decimal.max(...valid.map(c => c.volume), '1');
-  const duration = ({ '1m': 60_000, '5m': 300_000, '15m': 900_000, '1h': 3_600_000, '4h': 14_400_000, '1d': 86_400_000 } as Record<string, number>)[interval] || 300_000;
+  const duration = INTERVALS[interval];
   const gaps = valid.filter((c, index) => index > 0 && c.time - valid[index - 1].time > duration * 1.5).length;
   const w = 820, h = 358, left = 12, right = 78, top = 12, priceBottom = 266, volumeTop = 285, bottom = 329, plotWidth = w - left - right;
   const firstTime = valid[0].time - duration / 2, span = valid.at(-1)!.time - valid[0].time + duration;

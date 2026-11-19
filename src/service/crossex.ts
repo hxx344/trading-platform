@@ -17,7 +17,7 @@ import { AppError } from '../vendor/crossex/model.mjs';
 import { createGateClient, type GateClientOptions } from '../vendor/crossex/live-client.mjs';
 import { createMarket, type CrossexMarket } from '../vendor/crossex/market.mjs';
 import { createLiveRuntime, type CrossexLiveRuntime } from '../vendor/crossex/live-runtime.mjs';
-import { createTerminalMarket, type CrossexTerminalMarket } from '../vendor/crossex/terminal-market.mjs';
+import { createTerminalMarket, type CrossexTerminalMarket, type TerminalCandleRequest } from '../vendor/crossex/terminal-market.mjs';
 import { limitProblem, type CrossexServiceConfig } from './crossex-config.ts';
 import type { MarketClient } from '../market/ipc.ts';
 import { remoteCrossexReaders } from './remote-venue-feeds.ts';
@@ -332,7 +332,7 @@ export interface CrossexViews {
   settings(body: unknown): unknown;
   refresh(): Promise<unknown>;
   instruments(): Promise<unknown>;
-  market(symbol: string | null, interval: string): Promise<unknown>;
+  market(symbol: string | null, interval: string, options?: TerminalCandleRequest): Promise<unknown>;
   preview(body: unknown): Promise<unknown>;
   openCapacity(body: unknown): Promise<unknown>;
   confirm(body: unknown): Promise<unknown>;
@@ -356,7 +356,7 @@ export function crossexViews(runtime: CrossexRuntime): CrossexViews {
     },
     async refresh() { await live.refresh({ includeView: false }); return { ...live.view({ includeOpportunities: false }), limits: limits() }; },
     instruments: () => market.instruments(),
-    market: (symbol, interval) => terminal.read(symbol, interval),
+    market: (symbol, interval, options) => terminal.read(symbol, interval, options),
     preview: body => live.preview(body),
     openCapacity: body => live.openCapacity(body),
     confirm: body => live.confirm(body),
@@ -426,7 +426,7 @@ export function createCrossexSupervisor(config: CrossexServiceConfig, credential
       settings: body => current().settings(body),
       refresh: async () => current().refresh(),
       instruments: async () => current().instruments(),
-      market: async (symbol, interval) => current().market(symbol, interval),
+      market: async (symbol, interval, options) => current().market(symbol, interval, options),
       preview: async body => current().preview(body),
       openCapacity: async body => current().openCapacity(body),
       confirm: async body => current(true).confirm(body),

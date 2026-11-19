@@ -3,13 +3,18 @@
 // contract here: callers arriving while it is in flight wait for it, and its book serves others for at most one second, with
 // the venue's own source time left on it, so every freshness check downstream still sees the true age. Previews and the
 // checks before an order is sent do not come through here: they read their own depth (LESSONS L100).
+import { contractIdentity } from '../vendor/crossex/model.mjs';
+
 type Quote = Record<string, unknown>;
 type Book = Record<string, unknown> & { isCurrent?: () => boolean };
-export type DepthReader = (quote: Quote) => Promise<Book>;
+export type DepthReader = ((quote: Quote) => Promise<Book>) & { forMarket?: (quote: Quote, marketIdentity: string) => Promise<Book> };
 
 export const DISPLAY_DEPTH_TTL_MS = 1_000;
 const MAX_CONTRACTS = 64;
-const identity = (quote: Quote): string => JSON.stringify(['exchange', 'symbol', 'base', 'quoteCurrency', 'crossexSymbol', 'nativeUnit', 'assetClass', 'marketId'].map(key => quote?.[key] ?? null));
+/** Raw venue readers take only a quote. A sharing reader also accepts the caller's verified directory/native identity. */
+export function readDisplayDepth(reader: DepthReader, quote: Quote, marketIdentity: string): Promise<Book> {
+  return reader.forMarket ? reader.forMarket(quote, marketIdentity) : reader(quote);
+}
 
 /** One sharing reader per underlying reader: consumers given the same reader share its books. */
 export function createDisplayDepth({ now = Date.now, ttlMs = DISPLAY_DEPTH_TTL_MS }: { now?: () => number; ttlMs?: number } = {}): (reader: DepthReader) => DepthReader {
@@ -18,8 +23,8 @@ export function createDisplayDepth({ now = Date.now, ttlMs = DISPLAY_DEPTH_TTL_M
     let sharing = wrapped.get(reader);
     if (sharing) return sharing;
     const kept = new Map<string, { book: Book; at: number }>(), pending = new Map<string, Promise<Book>>();
-    sharing = quote => {
-      const key = identity(quote), time = now(), previous = kept.get(key);
+    const forMarket = (quote: Quote, key: string) => {
+      const time = now(), previous = kept.get(key);
       if (previous && time >= previous.at && time - previous.at < ttlMs && previous.book.isCurrent?.() !== false) return Promise.resolve(previous.book);
       let flight = pending.get(key);
       if (!flight) {
@@ -33,6 +38,7 @@ export function createDisplayDepth({ now = Date.now, ttlMs = DISPLAY_DEPTH_TTL_M
       }
       return flight;
     };
+    sharing = Object.assign((quote: Quote) => forMarket(quote, contractIdentity(quote)), { forMarket });
     wrapped.set(reader, sharing);
     return sharing;
   };

@@ -1,8 +1,9 @@
 // Types for terminal-market.mjs, only what the service's TypeScript uses; loose on purpose.
 import type { CrossexMarket } from './market.mjs';
 export { INTERVALS } from './terminal-data.mjs';
+export interface TerminalCandleRequest { candles?: string | null; identity?: string | null; known?: string | null }
 export interface CrossexTerminalMarket {
-  read(symbol: string | null, interval: string): Promise<unknown>;
+  read(symbol: string | null, interval: string, options?: TerminalCandleRequest): Promise<unknown>;
   stop(): Promise<void>;
 }
 export { createCandleReader } from './candle-reader.mjs';

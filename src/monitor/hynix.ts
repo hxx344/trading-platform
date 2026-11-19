@@ -59,6 +59,7 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, r
   let quoteEpoch: string | null = null;
   let quote: HynixQuote | null = null, quoteRestored = false, quoteAttemptAt: number | null = null, quoteError: string | null = null;
   let rows: HynixCandleRow[] = [], fetchedAt: string | null = null, candlesRestored = false, candleAttemptAt: number | null = null, candleError: string | null = null;
+  const windows = new Map<number, HynixCandleRow[]>();
   // The stored rows could not be read back: the next successful round rewrites the table instead of adding to it.
   let replaceCandles = false;
   let progress = candleCoverage(null, 0, HYNIX_CANDLE_MS, 0);
@@ -155,7 +156,8 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, r
     }
     candleSave.recovered();
     progress = nextProgress;
-    rows = next; fetchedAt = stamp; candlesRestored = false; candleError = null; replaceCandles = false;
+    if (changed.length || next.length !== rows.length) { rows = next; windows.clear(); }
+    fetchedAt = stamp; candlesRestored = false; candleError = null; replaceCandles = false;
   }
 
   return {
@@ -173,8 +175,19 @@ export function createHynixMonitor({ store, fetchImpl = fetch, now = Date.now, r
       const commonThrough = rows.at(-1)!.time + HYNIX_CANDLE_MS;
       const stale = candlesRestored || candleError !== null || candleCheckOverdue(Math.min(progress.through, commonThrough), HYNIX_CANDLE_MS, now(), CANDLE_STALE_MS);
       const coverage = { firstObservation: new Date(rows[0]!.time).toISOString(), lastObservation: new Date(rows.at(-1)!.time).toISOString(), rows: rows.length };
-      const from = days === null ? -Infinity : rows.at(-1)!.time - days * DAY_MS;
-      const shown = days === null ? rows : rows.filter(row => row.time >= from);
+      let shown = rows;
+      if (days !== null) {
+        const from = rows.at(-1)!.time - days * DAY_MS;
+        if (rows[0]!.time < from) {
+          const cached = windows.get(days);
+          if (cached) shown = cached;
+          else {
+            shown = rows.filter(row => row.time >= from);
+            if (windows.size >= 8) windows.clear();
+            windows.set(days, shown);
+          }
+        }
+      }
       return { rows: shown, fetchedAt, status: stale ? 'snapshot' : 'live', ...(days === null ? {} : { windowDays: days }), coverage, lastAttemptAt: iso(candleAttemptAt), lastError: candleError };
     },
     refreshFunding: funding.refresh,

@@ -28,6 +28,7 @@ export function createTerminalHistory(store, candleReader, clock) {
 
   function applySaved(history, durable) {
     history.closed = durable.closed;
+    history.window = null;
     history.asOf = Math.max(history.asOf ?? 0, durable.asOf ?? 0) || null;
     history.lastObservedAt = Math.max(history.lastObservedAt, durable.lastObservedAt);
     history.nextArchivedClose = durable.nextArchivedClose;
@@ -42,11 +43,15 @@ export function createTerminalHistory(store, candleReader, clock) {
       attempt: -Infinity, gaps: new Map(), error: null, flight: null, controller: new AbortController() };
   }
 
-  function data(history, interval) {
-    const now = clock(), step = INTERVALS[interval], partial = history.partial;
-    const bars = [...history.closed.values()].filter(c => c.time + step <= now);
-    if (partial && partial.time <= now && partial.time + step > now) bars.push(partial);
-    return bars.sort((a, b) => a.time - b.time).slice(-CANDLE_LIMIT).map(c => ({ ...c, closed: c !== partial }));
+  function snapshot(history, interval) {
+    const step = INTERVALS[interval], current = Math.floor(clock() / step) * step;
+    if (history.window?.current !== current) {
+      const closed = [...history.closed.values()].filter(c => c.time < current).sort((a, b) => a.time - b.time)
+        .slice(-CANDLE_LIMIT).map(c => ({ ...c, closed: true }));
+      history.window = { current, closed };
+    }
+    const partial = history.partial?.time === current ? { ...history.partial, closed: false } : null;
+    return { closed: history.window.closed, partial };
   }
 
   async function refresh(history, identity, quote, interval) {
@@ -89,12 +94,14 @@ export function createTerminalHistory(store, candleReader, clock) {
           }
         });
         for (const c of closed) history.closed.set(c.time, c);
+        if (closed.length) history.window = null;
         if (history.closed.size > CANDLE_LIMIT) {
           const times = [...history.closed.keys()].sort((a, b) => b - a);
           for (const t of times.slice(CANDLE_LIMIT)) history.closed.delete(t);
         }
         if (range.to === now) {
           history.partial = rows.find(c => c.time === current) ?? null;
+          history.partialAt = history.partial ? now : null;
           if (rows.length) history.asOf = now;
         }
         if (rows.length) history.lastObservedAt = now;
@@ -115,11 +122,12 @@ export function createTerminalHistory(store, candleReader, clock) {
           return;
         }
         failed = true;
+        if (range.to === now) history.partial = null;
         // A broken older range must leave the next round's repair budget available to other gaps.
         if (range.to < current) for (let t = range.from; t <= range.to; t += step) history.gaps.set(t, now);
       }
     }
     history.error = failed ? '历史 K 线暂未更新，保留已核实数据' : null;
   }
-  return { restore, refresh, data };
+  return { restore, refresh, snapshot };
 }

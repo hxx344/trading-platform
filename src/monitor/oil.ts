@@ -157,6 +157,7 @@ export function createOilMonitor({ store, gate, fetchImpl = fetch, now = Date.no
         candleError = 'K 线保存失败：monitor.sqlite 写入失败';
         candleSave.failed('monitor.sqlite 写入失败', detail(error)); return;
       }
+      if (projection && candles && !changed.length && projection.data.length === candles.data.length) projection.data = candles.data;
       resumeAt = cursor; progress = nextCoverage; candleRows = next; candles = projection;
       candlesRestored = cursor !== null;
       replaceCandles = false; start = end; candleError = null;

@@ -166,6 +166,7 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
       return;
     }
     candleSave.recovered();
+    if (next && candles && !changed.length && next.data.length === candles.data.length) next.data = candles.data;
     candles = next; progress = nextProgress; legErrors = errors; candlesRestored = false; candleError = null; replaceCandles = false;
   }
 

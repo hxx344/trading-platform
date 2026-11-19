@@ -7,7 +7,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openCrossexStore } from '../../src/crossex/store.ts';
 import { createCandleReader, createTerminalMarket, normalizeCandles, INTERVALS } from '../../src/vendor/crossex/terminal-market.mjs';
-import { AppError } from '../../src/vendor/crossex/model.mjs';
+import { AppError, contractIdentity } from '../../src/vendor/crossex/model.mjs';
+import { acceptTerminalRead, lastTerminalObservation, marketReadPath, pauseTerminalRead, readTerminalChart, rememberTerminalObservation, terminalObservation, visibleTerminalCandles } from '../../web/src/crossex/terminal-candles.ts';
 
 const NOW = Date.UTC(2026, 9, 8, 8), SYMBOL = 'BINANCE_FUTURE_BTC_USDT';
 const bar = (time = NOW, changes = {}) => ({ time, open: '100', high: '103', low: '99', close: '102', volume: '0.125', ...changes });
@@ -46,11 +47,196 @@ function terminalFixture(options = {}) {
     market: { resolveDisplaySymbol: async symbol => { if (options.display) return options.display(symbol); return { quote: quote(symbol.split('_')[0].toLowerCase(), symbol.split('_')[2]), rule: {} }; }, resolveSymbol: async symbol => { calls.resolve.push(symbol); if (options.resolve) return options.resolve(symbol); const q = quote(symbol.split('_')[0].toLowerCase(), symbol.split('_')[2]); return { quote: { ...q, nativeUnit: '0.01' }, rule: { contract_size: null } }; } },
     depthReader: async q => { calls.depth.push(q); return options.depth ? options.depth(q, now) : book(q, now); },
     candleReader: async (q, interval, signal, range) => { calls.candles.push({ q, interval, range }); return options.candles ? options.candles(q, interval, now, range, signal) : [bar(Math.floor(now / INTERVALS[interval]) * INTERVALS[interval])]; },
-    WebSocketImpl: Socket, clock: () => now,
+    WebSocketImpl: Socket, clock: () => now, ...(options.publicFeed ? { publicFeed: options.publicFeed } : {}),
   });
   return { service, calls, Socket, advance(ms) { now += ms; }, setNow(value) { now = value; }, now: () => now };
 }
 const frame = (socket, channel, result, event = 'update') => socket.emit('message', Buffer.from(JSON.stringify({ channel, event, result })));
+
+test('hedge legs read live books without restoring or scheduling any candles', async t => {
+  const f = terminalFixture(); t.after(() => f.service.stop());
+  const symbols = [SYMBOL, 'BYBIT_FUTURE_BTC_USDT'];
+  for (const symbol of symbols) {
+    const query = new URL(marketReadPath(symbol, '5m', 'none'), 'http://localhost').searchParams;
+    const result = await f.service.read(query.get('symbol'), query.get('interval'), Object.fromEntries(query));
+    assert.equal(result.status, 'live'); assert.equal(result.book.at, NOW); assert.equal(result.ticker.askPrice, '101');
+    assert.deepEqual(result.candles, []); assert.equal(result.candleBlocks, undefined);
+  }
+  assert.equal(f.calls.candles.length, 0); assert.equal(f.calls.depth.length, 2);
+});
+
+test('terminal block negotiation reuses verified history, sends a repaired gap and never promotes an expired live candle', async t => {
+  const step = INTERVALS['1m'], gap = NOW - 43 * step;
+  let repair = false, unit = '1';
+  const f = terminalFixture({
+    resolve: async () => ({ rule: {}, quote: { ...quote('binance'), nativeUnit: unit } }),
+    depth: (q, now) => ({ ...book(q, now), bids: [[now === NOW ? 99 : 100, 2]] }),
+    candles: (_q, _interval, now, range) => Array.from({ length: Math.floor((range.to - range.from) / step) + 1 }, (_, i) => bar(range.from + i * step, { close: now === NOW ? '100' : '101' })).filter(c => repair || c.time !== gap),
+  });
+  t.after(() => f.service.stop());
+  const read = async previous => {
+    const query = new URL(marketReadPath(SYMBOL, '1m', 'blocks', previous), 'http://localhost').searchParams;
+    return f.service.read(SYMBOL, '1m', Object.fromEntries(query));
+  };
+  const full = await f.service.read(SYMBOL, '1m'), cold = await read();
+  const initial = readTerminalChart(cold); assert.equal(initial.saved.blocks.flatMap(b => b.rows).length, 238);
+  assert.deepEqual(visibleTerminalCandles(initial.chart, '1m', NOW), full.candles);
+  assert.deepEqual(visibleTerminalCandles(initial.chart, '1m', NOW, false), full.candles.filter(c => c.closed));
+  assert.ok(initial.saved.blocks.every(b => b.rows.every(c => c.closed)));
+  f.advance(2000);
+  const warm = await read(initial.saved), next = readTerminalChart(warm, initial.saved);
+  assert.equal(next.saved, initial.saved); assert.ok(warm.candleBlocks.blocks.every(b => !b.rows));
+  assert.equal(warm.book.bids[0][0], '100'); assert.equal(warm.book.at, NOW + 2000); assert.equal(warm.candles.length, 1);
+  assert.equal(visibleTerminalCandles(next.chart, '1m', NOW + step).at(-1).time, NOW - step);
+  repair = true; f.advance(5 * step);
+  await read(initial.saved); await new Promise(setImmediate);
+  const fixed = await read(initial.saved), merged = readTerminalChart(fixed, initial.saved);
+  const transferred = fixed.candleBlocks.blocks.flatMap(b => b.rows ?? []);
+  assert.ok(transferred.some(c => c.time === gap)); assert.ok(transferred.length < 25);
+  assert.deepEqual(visibleTerminalCandles(merged.chart, '1m', NOW + 5 * step), (await f.service.read(SYMBOL, '1m')).candles);
+  unit = '0.01'; f.advance(31_000);
+  const other = await read(merged.saved);
+  assert.notEqual(other.candleIdentity, fixed.candleIdentity); assert.ok(other.candleBlocks.blocks.every(b => b.rows && !b.base));
+  assert.deepEqual(readTerminalChart({ ...other, candleIdentity: null, candleBlocks: null }, merged.saved).chart.closed, []);
+  assert.ok((await read()).candleBlocks.blocks.every(b => b.rows), 'an empty browser cache receives the full replacement');
+});
+
+test('native archives survive an offline v0.70.0 upgrade and remain readable after rollback with a versioned Gate listing', async () => {
+  using dir = mkdtempDisposableSync(join(tmpdir(), 'tp-terminal-upgrade-'));
+  const store = openCrossexStore(dir.path, { secret: { apiKey: 'test-key', apiSecret: 'test-secret' }, limits: {} });
+  const step = INTERVALS['1m'], native = { ...quote('binance'), nativeUnit: '0.01' };
+  const legacyKey = contractIdentity(native), legacyRow = bar(NOW - step);
+  let listing = 'version-1', online = false;
+  const rule = { contract_size: '0.01', list_time: '1746000000' };
+  const f = terminalFixture({ store,
+    display: () => ({ quote: native, rule, candleListing: listing }),
+    resolve: () => ({ quote: native, rule }),
+    candles: () => { if (!online) throw Error('offline'); return [bar(NOW, { close: '101' })]; },
+  });
+  try {
+    store.prepare('INSERT INTO terminal_candles VALUES (?,?,?,?,?)').run(legacyKey, '1m', legacyRow.time, NOW, JSON.stringify(legacyRow));
+    const old = await f.service.read(SYMBOL, '1m', { candles: 'blocks' });
+    assert.deepEqual(readTerminalChart(old).chart.closed, [{ ...legacyRow, closed: true }]);
+    listing = 'version-2';
+    const relisted = await f.service.read(SYMBOL, '1m', { candles: 'blocks', identity: old.candleIdentity, known: '' });
+    assert.notEqual(relisted.candleIdentity, old.candleIdentity);
+    assert.deepEqual(readTerminalChart(relisted).chart.closed, [{ ...legacyRow, closed: true }]);
+    online = true; f.advance(step);
+    await f.service.read(SYMBOL, '1m'); await new Promise(setImmediate);
+    const legacyRows = store.prepare('SELECT json FROM terminal_candles WHERE identity=? AND interval=? AND opened_at<? ORDER BY opened_at DESC LIMIT 240')
+      .all(legacyKey, '1m', NOW + step).map(row => JSON.parse(row.json));
+    assert.deepEqual(legacyRows, [bar(NOW, { close: '101' }), legacyRow]);
+  } finally { await f.service.stop(); store.close(); }
+});
+
+test('a resumed terminal waits for a new observation of an identical open candle, even when an HTTP snapshot succeeds', async t => {
+  let online = true;
+  const f = terminalFixture({
+    candles: () => { if (!online) throw Error('offline'); return [bar(NOW - 60000), bar(NOW)]; },
+    depth: (q, now) => { if (!online) throw Error('offline'); return book(q, now); },
+  });
+  t.after(() => f.service.stop());
+  const read = async previous => {
+    const data = await f.service.read(SYMBOL, '1m', { candles: 'blocks' });
+    return acceptTerminalRead(previous, { scope: '1m', listingScope: SYMBOL, data, chart: readTerminalChart(data).chart });
+  };
+  const first = await read(null); assert.equal(first.data.candlePartialAsOf, NOW);
+  rememberTerminalObservation(first.scope, terminalObservation(first.data, first.chart));
+  f.advance(2000);
+  const continuous = await read(first); assert.deepEqual(continuous.chart.partial, first.chart.partial);
+  const onMount = lastTerminalObservation(first.scope, continuous.data.candleIdentity);
+  assert.equal(acceptTerminalRead(null, continuous, onMount).chart.partial, undefined);
+  const paused = pauseTerminalRead(continuous); assert.equal(paused.chart.partial, undefined);
+  const retained = await read(paused); assert.equal(retained.data.status, 'live'); assert.equal(retained.chart.partial, undefined);
+  online = false; f.advance(14000);
+  await read(retained); await new Promise(setImmediate);
+  const unavailable = await read(retained); assert.equal(unavailable.data.status, 'stale'); assert.equal(unavailable.data.candleAsOf, NOW);
+  assert.equal(unavailable.data.candlePartialAsOf, null); assert.equal(unavailable.chart.partial, undefined);
+  assert.deepEqual(unavailable.chart.closed, first.chart.closed);
+  online = true; f.advance(15000); await read(unavailable); await new Promise(setImmediate);
+  const recovered = await read(unavailable); assert.equal(recovered.data.candlePartialAsOf, f.now());
+  assert.deepEqual(recovered.chart.partial, first.chart.partial);
+  assert.deepEqual(acceptTerminalRead(null, recovered, onMount).chart.partial, recovered.chart.partial);
+});
+
+test('a Lighter market ID change fences queued stream callbacks and waits for the new native or subscribed book', async t => {
+  const symbol = 'LIGHTER_FUTURE_BTC_USDC';
+  for (const depthWorks of [false, true]) {
+    const listeners = [];
+    let id = 7;
+    const f = terminalFixture({
+      publicFeed: { subscribe(_s, listener) { listeners.push(listener); return () => {}; }, close() {} },
+      display: () => ({ quote: quote('lighter'), rule: {}, candleListing: 'unchanged' }),
+      resolve: () => ({ quote: { ...quote('lighter'), marketId: id }, rule: {} }),
+      depth: (q, now) => { if (q.marketId === 8 && !depthWorks) throw Error('new depth unavailable');
+        const bid = q.marketId === 8 ? 20 : 100; return { ...book(q, now), bids: [[bid, 1]], asks: [[bid + 1, 1]] }; },
+    });
+    t.after(() => f.service.stop());
+    const read = () => f.service.read(symbol, '1m', { candles: 'none' });
+    const push = (to, channel, fields, at = f.now()) => to.data({ event: 'update', channel, time_ms: at, result: { s: symbol, ts: at, ...fields } });
+    const initial = await read(); f.advance(29000);
+    const old = listeners[0], rawBook = { b: [['100', '2']], a: [['101', '2']] };
+    push(old, 'order_book_5', rawBook); push(old, 'ticker', { bp: '100', ap: '101', lp: '100.5' });
+    push(old, 'trade', { i: 'old-print', p: '100', q: '2', S: 'BUY' }); push(old, 'mark_price', { mp: '101' });
+    push(old, 'funding_rate', { r: '0.01', T: NOW + 90000 });
+    assert.equal((await read()).trades.length, 1);
+    f.advance(2100); id = 8;
+    const changed = await read(); assert.notEqual(changed.candleIdentity, initial.candleIdentity);
+    assert.deepEqual(f.calls.depth.map(q => q.marketId), [7, 8]);
+    assert.equal(changed.tradingAvailable, depthWorks); assert.equal(changed.ticker.bidPrice, depthWorks ? '20' : null);
+    assert.equal(changed.ticker.lastPrice, null); assert.equal(changed.ticker.markPrice, null); assert.equal(changed.ticker.fundingRate, null);
+    assert.deepEqual(changed.trades, []); assert.equal(listeners.length, 2);
+    const active = listeners[1]; f.advance(1100);
+    push(old, 'order_book_5', rawBook); push(old, 'ticker', { bp: '100', ap: '101', lp: '100.5' }); old.down();
+    push(active, 'order_book_5', rawBook, NOW + 29000);
+    assert.equal((await read()).ticker.bidPrice, depthWorks ? '20' : null);
+    push(active, 'ticker', { bp: '21', ap: '22', lp: '21.5' });
+    assert.equal((await read()).tradingAvailable, depthWorks);
+    push(active, 'order_book_5', { b: [['21', '2']], a: [['22', '2']] });
+    const recovered = await read(); assert.equal(recovered.book.bids[0][0], '21'); assert.equal(recovered.tradingAvailable, true);
+  }
+});
+
+test('an initial Lighter resolve cannot authorize the unverified socket book received before the native market was known', async t => {
+  const pending = deferred(), listeners = [], symbol = 'LIGHTER_FUTURE_BTC_USDC';
+  let marketId = 7, available = false;
+  const f = terminalFixture({
+    publicFeed: { subscribe(_s, listener) { listeners.push(listener); return () => {}; }, close() {} },
+    display: () => ({ quote: quote('lighter'), rule: {}, candleListing: 'stable' }),
+    resolve: async () => { await pending.promise; return { quote: { ...quote('lighter'), marketId }, rule: {}, candleListing: 'stable' }; },
+    depth: (q, at) => { if (!available) throw Error('new depth unavailable'); return { ...book(q, at), bids: [[20, 1]], asks: [[21, 1]] }; },
+  });
+  t.after(async () => { pending.resolve(); await f.service.stop(); });
+  const read = () => f.service.read(symbol, '1m', { candles: 'none' });
+  const push = listener => listener.data({ event: 'update', channel: 'order_book_5', result: { s: symbol, ts: f.now(), b: [['100', '2']], a: [['101', '2']] } });
+  assert.equal((await read()).tradingAvailable, false);
+  const provisional = listeners[0]; push(provisional);
+  const display = await read(); assert.equal(display.book.bids[0][0], '100'); assert.equal(display.tradingAvailable, false);
+  f.advance(50); marketId = 8; pending.resolve(); await new Promise(setImmediate);
+  push(provisional); push(listeners[1]);
+  const verified = await read(); assert.ok(verified.candleIdentity); assert.equal(verified.tradingAvailable, false); assert.equal(verified.book, null);
+  assert.deepEqual(f.calls.depth.map(q => q.marketId), [8]);
+  available = true; f.advance(1500);
+  const fresh = await read(); assert.equal(fresh.tradingAvailable, true); assert.equal(fresh.book.bids[0][0], '20');
+});
+
+test('a late native lookup for a retired directory cannot arm its old book or subscription', async t => {
+  let listing = 'a'; const pending = deferred(), seen = [];
+  const f = terminalFixture({
+    publicFeed: { subscribe(s, cb) { seen.push(cb); return () => {}; }, close() {} },
+    display: () => ({ quote: quote('lighter'), rule: {}, candleListing: listing }),
+    resolve: async () => { const before = listing; if (before === 'a') await pending.promise;
+      return { quote: { ...quote('lighter'), marketId: before === 'a' ? 7 : 8 }, rule: {}, candleListing: before }; },
+  });
+  t.after(async () => { pending.resolve(); await f.service.stop(); });
+  const read = () => f.service.read('LIGHTER_FUTURE_BTC_USDC', '1m', { candles: 'none' });
+  assert.equal((await read()).tradingAvailable, false);
+  listing = 'b'; const active = await read();
+  pending.resolve(); await new Promise(setImmediate);
+  seen[0].down(); const final = await read();
+  assert.equal(final.candleIdentity, active.candleIdentity); assert.equal(final.status, 'live');
+  assert.deepEqual(f.calls.depth.map(q => q.marketId), [8]); assert.equal(seen.length, 2);
+});
 
 test('all eight candle adapters preserve native timestamps and base volumes without private requests', async () => {
   for (const exchange of ['binance', 'bybit', 'okx', 'gate', 'kraken', 'hyperliquid', 'lighter', 'deribit']) {
@@ -462,7 +648,7 @@ test('disconnect clears the terminal cache and a late message from the old socke
   assert.equal(after.ticker.bidPrice, null); assert.equal(after.status, 'unavailable'); assert.equal(after.asOf, null);
 });
 
-test('native quantity confirmation converts cached raw books and prints together without mixing units', async t => {
+test('raw books are display-only until a freshly bound native market supplies its own book and prints', async t => {
   const symbol = 'GATE_FUTURE_ETH_USDT'; let available = false;
   const f = terminalFixture({ resolve: async () => { if (!available) throw new AppError('暂未确认单位'); return { quote: { ...quote('gate', 'ETH'), nativeUnit: '0.01' }, rule: {} }; } }); t.after(() => f.service.stop());
   await f.service.read(symbol); const socket = f.Socket.instances[0];
@@ -470,8 +656,13 @@ test('native quantity confirmation converts cached raw books and prints together
   frame(socket, 'trade', { s: symbol, ts: NOW, p: '3000', q: '0.75', S: 'BUY', i: 'eth-1' });
   assert.equal((await f.service.read(symbol)).book.quantityUnit, 'contracts');
   available = true; f.advance(30001); frame(socket, 'order_book_5', { s: symbol, ts: f.now(), b: [['3000', '0.75']], a: [['3001', '125']] }); const value = await f.service.read(symbol);
-  assert.equal(value.book.quantityUnit, 'base'); assert.equal(value.book.bids[0][1], '0.0075'); assert.equal(value.trades[0].quantity, '0.0075'); assert.equal(value.tradingAvailable, true);
-  assert.equal(f.calls.depth.length, 0);
+  assert.equal(value.book.quantityUnit, 'base'); assert.equal(value.book.bids[0][0], '100'); assert.deepEqual(value.trades, []); assert.equal(value.tradingAvailable, true);
+  assert.equal(f.calls.depth.length, 1);
+  f.advance(1100); const confirmed = f.Socket.instances.at(-1);
+  frame(confirmed, 'order_book_5', { s: symbol, ts: f.now(), b: [['2999', '0.75']], a: [['3000', '125']] });
+  frame(confirmed, 'trade', { s: symbol, ts: f.now(), p: '2999', q: '0.75', S: 'BUY', i: 'new-print' });
+  const fresh = await f.service.read(symbol);
+  assert.equal(fresh.book.bids[0][1], '0.0075'); assert.equal(fresh.trades[0].quantity, '0.0075');
 });
 
 test('malformed, regressed and wrong-channel public books never replace a validated snapshot', async t => {

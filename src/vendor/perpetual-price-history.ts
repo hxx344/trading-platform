@@ -1,7 +1,8 @@
-// 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-price-history.ts（提交 c84ba27）。改动：页面读取节流
-// startPerpetualPriceHistoryFeed 拆到 web/src/perpetual-price-history-feed.ts（服务端不引入页面的读取节流），其余原样。
+// 来自 project-aggregation 工作台 modules/monitor/lib/perpetual-price-history.ts（提交 c84ba27）。轮询留在页面，服务和页面共用合约身份与收盘记录校验。
+import type { CandleBlocks } from '../candle-blocks.ts';
 
 export const PRICE_HOUR_MS = 3_600_000;
+export const PRICE_BLOCK_MS = 24 * PRICE_HOUR_MS;
 export const PRICE_HISTORY_LOOKBACK_MS = 30 * 24 * PRICE_HOUR_MS;
 export const PRICE_HISTORY_STALE_MS = 75 * 60_000;
 export type PriceHistoryDays = 3 | 7 | 30;
@@ -28,6 +29,13 @@ export interface PerpetualPriceHistoryReport {
   legs: Record<string, PerpetualPriceLeg>;
   storageError?: string;
 }
+/** UTC day manifests for the two current identities. Existing readers still receive complete legs. */
+export interface PerpetualPriceBlockReport extends Omit<PerpetualPriceHistoryReport, 'legs'> {
+  blockSpanMs: number;
+  legs: Record<string, Omit<PerpetualPriceLeg, 'points'> & CandleBlocks<PerpetualPricePoint>>;
+}
+export type PriceHistoryReply<I> = I extends { knownBlocks: unknown } ? PerpetualPriceBlockReport
+  : I extends { pair: unknown; days: unknown } ? PerpetualPriceHistoryReport : PerpetualPriceHistoryReport | PerpetualPriceBlockReport;
 interface PriceMarketIdentity {
   exchange: string; symbol: string; base: string; quoteCurrency: string;
   marketId?: number; multiplier?: number; contractUnit?: string; collateralCurrency?: string;

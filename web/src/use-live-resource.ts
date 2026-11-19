@@ -19,6 +19,8 @@ type Options<T> = {
   timeoutMs?: number;
   // 边界校验：抛错按读取失败处理，不覆盖上次结果。
   parse?: (raw: unknown) => T;
+  // A conditional history read can use its own transport while sharing the same polling lifecycle.
+  read?: (signal: AbortSignal) => Promise<T>;
   // false 时不订阅，保留本组件上次看到的数据，状态为 paused。
   enabled?: boolean;
   onExpired: () => void;
@@ -28,7 +30,7 @@ const initial = <T,>(enabled: boolean): ResourceSnapshot<T> => ({ data: null, er
 
 // 同一 path 的订阅者共享请求与结果，读取函数、超时与校验以第一个订阅者为准，
 // 所以共享同一 path 的页面须使用相同的 timeoutMs 与 parse。
-export function useLiveResource<T>(path: string, { intervalMs, timeoutMs = 10_000, parse, enabled = true, onExpired }: Options<T>): LiveResource<T> {
+export function useLiveResource<T>(path: string, { intervalMs, timeoutMs = 10_000, parse, read: customRead, enabled = true, onExpired }: Options<T>): LiveResource<T> {
   const [state, setState] = useState<{ path: string; snapshot: ResourceSnapshot<T> }>(() => ({ path, snapshot: initial<T>(enabled) }));
   const expired = useRef(onExpired);
   expired.current = onExpired;
@@ -44,6 +46,7 @@ export function useLiveResource<T>(path: string, { intervalMs, timeoutMs = 10_00
       return undefined;
     }
     const read = async (signal: AbortSignal) => {
+      if (customRead) return customRead(signal);
       const raw = await api<unknown>(path, { signal, timeoutMs });
       return parser.current ? parser.current(raw) : raw as T;
     };
@@ -57,7 +60,7 @@ export function useLiveResource<T>(path: string, { intervalMs, timeoutMs = 10_00
     });
     subscription.current = current;
     return () => { if (subscription.current === current) subscription.current = null; current(); };
-  }, [path, enabled, timeoutMs]);
+  }, [path, enabled, timeoutMs, customRead]);
   // 间隔随页面状态变化时只调整计时，不重新订阅。
   useEffect(() => { subscription.current?.retune(intervalMs); }, [intervalMs]);
   const refresh = useCallback(() => store.refresh(path), [path]);

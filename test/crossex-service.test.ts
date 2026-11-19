@@ -169,6 +169,22 @@ test('路由：没有 crossex 时 404；须登录；写请求须带请求标记'
   assert.equal((await call('GET', '/api/crossex/bootstrap', undefined, { cookie: false })).status, 401);
 }));
 
+test('CrossEx 行情路由把终端版本和对冲只读盘口模式传到实际读取器', async () => {
+  const terminal: CrossexRuntime['terminal'] = { async read(symbol, interval, options) { return { symbol, interval, options }; }, async stop() {} };
+  const symbol = 'BINANCE_FUTURE_BTC_USDT';
+  await withServer({ crossex: crossexViews({ terminal } as CrossexRuntime) }, async call => {
+    for (const mode of ['blocks', 'none'] as const) {
+      const params = new URLSearchParams({ symbol, interval: '1m', candles: mode });
+      if (mode === 'blocks') { params.set('identity', 'native-v1'); params.set('known', '0:known'); }
+      const response = await call('GET', `/api/crossex/market?${params}`);
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), { symbol, interval: '1m', options: {
+        candles: mode, identity: mode === 'blocks' ? 'native-v1' : null, known: mode === 'blocks' ? '0:known' : null,
+      } });
+    }
+  });
+});
+
 test('路由：bootstrap / state 不含密钥；超过上限的设置 400；页面设置可保存；未知路径 404', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tp-crossex-routes-')), uid = nextUid();
   const runtime = await started(uid, dir);

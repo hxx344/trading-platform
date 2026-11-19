@@ -2,11 +2,11 @@
 // Copyright (c) the original contributors. AGPL-3.0-only; see THIRD_PARTY_NOTICES.md.
 import { AppError } from './model.mjs';
 import { D, Decimal } from './money.mjs';
+import { INTERVALS, CANDLE_LIMIT } from './terminal-intervals.ts';
+export { INTERVALS, CANDLE_LIMIT };
 
 export const TERMINAL_SYMBOL = /^(BINANCE|BYBIT|OKX|GATE|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_[A-Z0-9]{1,30}_(USDT|USDC|USD)$/;
 export const bookChannel = symbol => symbol.startsWith('KRAKEN_') ? null : symbol.startsWith('BYBIT_') ? 'order_book_1' : 'order_book_5';
-export const INTERVALS = Object.freeze({ '1m': 60000, '5m': 300000, '15m': 900000, '30m': 1800000, '1h': 3600000, '4h': 14400000, '1d': 86400000 });
-export const CANDLE_LIMIT = 240;
 // from is an opening time. to is inclusive and may fall inside the live candle.
 export function validCandleRange(interval, from, to, now) {
   const step = INTERVALS[interval];

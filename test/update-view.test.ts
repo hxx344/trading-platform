@@ -113,8 +113,9 @@ test('系统更新：连续读不到满 10 分钟停止后台读取，读到后�
   const following = page(base({ job: job('running') }), { loaded: 'v0.49.1', watched: 'job-1', offline: true });
   assert.equal(readsInBackground(following, BACKGROUND_SILENCE_MS), true);
   assert.equal(readsInBackground(following, BACKGROUND_SILENCE_MS + 1), false);
+  assert.equal(readsInBackground({ ...following, offline: false }, BACKGROUND_SILENCE_MS + 1), false, '停读后状态成为 paused（不算 offline），仍保持停读');
   assert.equal(readsInBackground(page(null, { offline: true }), BACKGROUND_SILENCE_MS + 1), false);
-  assert.equal(readsInBackground({ ...following, offline: false }, BACKGROUND_SILENCE_MS + 1), true, '这次读到了就恢复');
+  assert.equal(readsInBackground(following, 0), true, '读到了（不再失败）就恢复');
 });
 
 test('系统更新：载入版本只取第一次读到的服务版本，之后的读取和写入应答都不改它', () => {

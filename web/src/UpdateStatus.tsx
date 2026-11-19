@@ -78,8 +78,10 @@ export function UpdateStatus({ onExpired, onOpen }: { onExpired: () => void; onO
   const reload = reloading(state);
   const wantActive = updating(view) || busy !== null || uncertain || !!view?.checking || (watched !== null && !reload);
   useEffect(() => { setActive(wantActive); }, [wantActive]);
-  // Every read re-renders, so a service silent past the limit turns the hidden reads off on the next failed read.
-  const wantBackground = readsInBackground(state, Date.now() - (live.receivedAt ?? mountedAt));
+  // Every read re-renders, so a service silent past the limit turns the hidden reads off on the next failed read. The
+  // kept error (not the status, which turns 'paused') says the last read failed; a successful read clears it.
+  const silentMs = live.error ? Date.now() - (live.receivedAt ?? mountedAt) : 0;
+  const wantBackground = readsInBackground(state, silentMs);
   useEffect(() => { setBackground(wantBackground); }, [wantBackground]);
 
   // A full page load picks up the activated bundle, including after a page-only release.

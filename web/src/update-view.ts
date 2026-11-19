@@ -84,11 +84,12 @@ export const BACKGROUND_SILENCE_MS = 10 * 60_000;
 /**
  * Reads go on while the page is hidden as long as this page follows an update, so its success reloads the page, and
  * until the page has read its loaded version, so a tab opened in the background still notices a later update.
- * `silentMs` is how long ago the last successful read was (or the page mounted, before any); a service that stays
- * unreachable that long ends the hidden reads.
+ * `silentMs` is, while the last read failed, how long ago the last successful read was (or the page mounted, before
+ * any), and 0 otherwise; a service that stays unreachable that long ends the hidden reads. It must not follow the read
+ * status: a hidden read that stops reports 'paused' with the failure kept, which would turn the reads straight back on.
  */
 export function readsInBackground(state: UpdatePageState, silentMs: number): boolean {
-  if (state.offline && silentMs > BACKGROUND_SILENCE_MS) return false;
+  if (silentMs > BACKGROUND_SILENCE_MS) return false;
   return !state.loaded || state.watched !== null || updating(state.view) || state.busy === 'apply' || !!state.uncertain;
 }
 

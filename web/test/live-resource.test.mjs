@@ -192,3 +192,20 @@ test('live-resource：隐藏时带后台读取的订阅者加入已暂停的共�
   assert.equal(reads, 2);
   assert.equal(snapshots.at(-1).status, 'ready');
 });
+
+test('live-resource：读取失败后因隐藏暂停时保留错误，读成功才清空（系统更新据此判断连续读不到）', async () => {
+  const fake = fakeEnvironment();
+  const store = createResourceStore(fake.env);
+  let fail = true;
+  const read = async () => { if (fail) throw new Error('down'); return 1; };
+  const snapshots = [];
+  store.subscribe('/a', { read, intervalMs: 1_000 }, snapshot => snapshots.push(snapshot));
+  await fake.settle();
+  await fake.setHidden(true);
+  assert.equal(snapshots.at(-1).status, 'paused');
+  assert.equal(snapshots.at(-1).error?.message, 'down');
+  fail = false;
+  await fake.setHidden(false);
+  assert.equal(snapshots.at(-1).status, 'ready');
+  assert.equal(snapshots.at(-1).error, null);
+});

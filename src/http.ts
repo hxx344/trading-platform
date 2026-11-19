@@ -7,8 +7,10 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { isIP } from 'node:net';
 import { ContractError, TRANSFER_CONFIG_KEYS, VENUES, exactKeys, parsePage, type Venue } from './contracts.ts';
 import type { Executor } from './executor.ts';
-import { APP_HEADERS, ASSET_HEADERS, CLIENT_ADDRESS_HEADER, CONFIG_CHECK_HEADER, CONFIG_MATCH_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, PAGE_HEADERS, controlRoute, readJson, sendJson as send, sessionCookieName } from './http-public.ts';
+import { APP_HEADERS, ASSET_HEADERS, CLIENT_ADDRESS_HEADER, CONFIG_CHECK_HEADER, CONFIG_MATCH_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, PAGE_HEADERS, controlRoute, readJson, sendJson, sendJsonText, sessionCookieName } from './http-public.ts';
 import { LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash } from './login-password.ts';
+import { READ_TOKEN_MAX_BYTES, readTokenAllows, type ReadTokens } from './read-token.ts';
+import type { Redactor } from './read-redact.ts';
 import type { WebApp } from './web-assets.ts';
 import type { UpdateView } from './service/update-types.ts';
 import { ANTHROPIC_RETENTION_DAYS } from './vendor/anthropic-market.mjs';
@@ -184,6 +186,12 @@ export interface HttpOptions {
   ready?: () => boolean;
   /** Tests set the clock; one throttle per server otherwise. */
   throttle?: LoginThrottle;
+  /**
+   * The read-only API token (docs/mcp.md): without it a request with an Authorization header gets 401, as before.
+   * tokenThrottle counts wrong tokens apart from wrong passwords.
+   */
+  readTokens?: ReadTokens;
+  tokenThrottle?: LoginThrottle;
   log?: (line: string) => void;
 }
 
@@ -191,7 +199,7 @@ export interface HttpOptions {
 const sameSecret = (given: string, expected: string): boolean =>
   timingSafeEqual(createHash('sha256').update(given).digest(), createHash('sha256').update(expected).digest());
 
-export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, app, imports, views, password, host, browserPort, executionBuild = 'development', configBuild, ready, throttle = new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
+export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, app, imports, views, password, host, browserPort, executionBuild = 'development', configBuild, ready, throttle = new LoginThrottle(), readTokens, tokenThrottle = new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
   if (!accessToken) throw new Error('需要访问令牌');
   if (sameSecret(session, accessToken)) throw new Error('会话值不能与访问令牌相同');
   // The executor records which session asked for each command; it gets a digest, so the stored rows never hold the cookie.
@@ -266,6 +274,56 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     response.writeHead(303, { ...PAGE_HEADERS, location: '/', 'set-cookie': sessionCookie(request) });
     response.end();
   }
+  // A read-only token's answers are masked and size-capped on their way out; a session's pass unchanged (docs/mcp.md 3).
+  const tokenAnswers = new WeakMap<ServerResponse, { redact: Redactor; bytes: number }>();
+  const send = (response: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void => {
+    const answer = tokenAnswers.get(response);
+    if (!answer) return sendJson(response, status, body, headers);
+    const payload = JSON.stringify(answer.redact(body));
+    const bytes = Buffer.byteLength(payload);
+    if (bytes > READ_TOKEN_MAX_BYTES) {
+      const refusal = JSON.stringify({ code: 'too_large', message: `应答超过 ${READ_TOKEN_MAX_BYTES / 1024} KiB，请缩小查询范围（如减小 limit）` });
+      answer.bytes = Buffer.byteLength(refusal);
+      return sendJsonText(response, 413, refusal);
+    }
+    answer.bytes = bytes;
+    sendJsonText(response, status, payload, headers);
+  };
+  /**
+   * A request with an Authorization header (docs/mcp.md 3): never a session, only a valid token, only a GET on the
+   * whitelist, within the limits. Each step answers on its own and the whitelist check comes before any route runs.
+   */
+  async function tokenRoute(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+    request.resume();
+    const started = performance.now();
+    let tokenId: string | null = null;
+    // One line per request, in the service log (logs.sqlite, 14 days); never the token itself.
+    response.once('close', () => {
+      readTokens?.record();
+      const bytes = tokenAnswers.get(response)?.bytes ?? Number(response.getHeader('content-length') ?? 0);
+      const outcome = response.writableFinished ? `${response.statusCode}，${bytes} 字节` : '连接中断';
+      log(`只读令牌${tokenId ? ` ${tokenId}` : '（无效）'} ${request.method ?? '?'} ${url.pathname} → ${outcome}，${Math.round(performance.now() - started)} ms（来自 ${clientAddress(request)}）`);
+    });
+    if (request.headers.cookie !== undefined) return sendJson(response, 403, { code: 'token_cookie', message: '令牌请求不能同时带会话 cookie' });
+    const wait = tokenThrottle.waitMs();
+    if (wait > 0) return sendJson(response, 429, { code: 'token_locked', message: `令牌错误次数过多，请 ${Math.ceil(wait / 1000)} 秒后再试` }, { 'retry-after': String(Math.ceil(wait / 1000)) });
+    const bearer = /^Bearer ([^\s]{1,200})$/.exec(String(request.headers.authorization));
+    const checked = readTokens && bearer ? readTokens.check(bearer[1]!) : { ok: false as const, reason: 'invalid' as const };
+    if (!checked.ok) {
+      tokenThrottle.failed();
+      return sendJson(response, 401, { code: 'token', message: checked.reason === 'expired' ? '令牌已到期，请在设置页重新生成' : '令牌无效或已吊销' });
+    }
+    tokenThrottle.succeeded();
+    tokenId = checked.id;
+    if (request.method !== 'GET' || !readTokenAllows(url)) return sendJson(response, 403, { code: 'read_only', message: '只读令牌不能访问这个接口' });
+    const release = readTokens!.admit();
+    if (!release) return sendJson(response, 429, { code: 'token_rate', message: '请求过于频繁：每分钟最多 30 次，同时最多 2 个' }, { 'retry-after': '5' });
+    response.once('close', release);
+    const redact = readTokens!.redactor();
+    if (!redact) { release(); return sendJson(response, 401, { code: 'token', message: '令牌无效或已吊销' }); }
+    tokenAnswers.set(response, { redact, bytes: 0 });
+    return serve(request, response, url, controlRoute(request.method, url.pathname));
+  }
   const handOff = (response: ServerResponse): void => {
     response.writeHead(204, { [CONTROL_HEADER]: '1', 'cache-control': 'no-store' });
     response.end();
@@ -275,6 +333,8 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (!allowedHost(request.headers.host ?? '')) return send(response, 421, { code: 'host', message: '访问地址不在允许范围内' });
     if (privateSocket && request.headers[EXECUTION_HEADER] !== executionBuild) return send(response, 503, { code: 'execution_version', message: '页面与执行器版本尚未匹配，请稍后重试' }, { [EXECUTION_HEADER]: executionBuild });
     const url = new URL(request.url ?? '/', 'http://localhost');
+    // Before the login and the cookie: a token never logs in, opens the page or acts as a session.
+    if (request.headers.authorization !== undefined) return tokenRoute(request, response, url);
     if (request.method === 'POST' && url.pathname === '/login') return passwordLogin(request, response);
     if (request.method === 'GET' && url.pathname === '/login') {
       const token = url.searchParams.get('token');
@@ -321,7 +381,24 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (!url.pathname.startsWith('/api/')) return send(response, 404, { code: 'not_found', message: '不存在' });
     if (!authorized(request)) return send(response, 401, { code: 'session', message: password ? '会话无效，请刷新页面重新登录' : '会话无效，请使用数据目录 access-url 中的登录链接重新打开' });
     if (request.method === 'POST' && (request.headers['x-pa-executor'] !== '1' || !String(request.headers['content-type'] ?? '').startsWith('application/json'))) return send(response, 403, { code: 'csrf', message: '缺少本页面请求标记' });
+    // The token's own management: the logged-in page only, never the token (docs/mcp.md 2).
+    if (url.pathname === '/api/read-token' || url.pathname.startsWith('/api/read-token/')) {
+      if (!readTokens) return send(response, 404, { code: 'not_found', message: '本服务没有只读接口令牌' });
+      if (request.method === 'GET' && url.pathname === '/api/read-token') return send(response, 200, readTokens.view());
+      if (request.method === 'POST' && url.pathname === '/api/read-token/generate') { exactKeys(await readJson(request), []); return send(response, 200, readTokens.generate()); }
+      if (request.method === 'POST' && url.pathname === '/api/read-token/revoke') { exactKeys(await readJson(request), []); return send(response, 200, readTokens.revoke()); }
+      if (request.method === 'POST' && url.pathname === '/api/read-token/lookup') {
+        const { alias } = exactKeys(await readJson(request), ['alias']);
+        if (typeof alias !== 'string' || !/^(acct|addr|tx)-[0-9a-f]{8}$/.test(alias.trim())) return send(response, 400, { code: 'invalid_alias', message: '别名格式应为 acct-、addr- 或 tx- 加 8 位十六进制' });
+        return send(response, 200, { alias: alias.trim(), original: readTokens.lookup(alias) });
+      }
+      return send(response, 404, { code: 'not_found', message: '不存在' });
+    }
+    return serve(request, response, url, kind);
+  }
 
+  /** The routes behind the session (or the read-only token's whitelist), once the caller is let in. */
+  async function serve(request: IncomingMessage, response: ServerResponse, url: URL, kind: ReturnType<typeof controlRoute>): Promise<void> {
     if (request.method === 'GET' && url.pathname === '/api/state') {
       return send(response, 200, { generation: executor.generation, retired: executor.retired, transport: executor.environment === 'mainnet' ? 'live' : 'simulated', accounts: executor.accounts(), notionalLimits: executor.notionalLimits(), jobs: executor.recentJobs(20),
         transfers: { pairs: executor.transferPairs(), corruptPairs: executor.corruptTransferPairs(), recent: executor.recentTransfers(20) },

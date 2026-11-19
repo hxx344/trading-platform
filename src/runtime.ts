@@ -9,6 +9,7 @@ import { createExecutorServer, type ImportChannel, type ServiceViews } from './h
 import { listenPublic, type PublicListenOptions } from './http-public.ts';
 import { SESSION_LIFETIME_MS, writeAccessUrl } from './data-dir.ts';
 import type { PasswordHash } from './login-password.ts';
+import type { ReadTokens } from './read-token.ts';
 import type { WebApp } from './web-assets.ts';
 
 const TICK_MS = 1_000;
@@ -64,6 +65,8 @@ export interface RunOptions {
   /** A session (cookie value) kept across restarts, so the open page stays logged in; random per start when absent. */
   session?: string;
   imports?: ImportChannel;
+  /** The read-only API token (docs/mcp.md); absent, a request with a token gets 401. */
+  readTokens?: ReadTokens;
   /** The service's own read-only views; the status one is shown under the run's health (start, database, loops). */
   views?: ServiceViews;
   /** Which passes run; the service has no two-leg jobs. */
@@ -90,7 +93,7 @@ export function checkSocketOptions(socketPath: string, port: number): void {
   if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('使用 --socket 时需要有效的页面端口');
 }
 
-export function runExecutor({ executor, store, dir, port, socketPath, executionBuild, configBuild, listen, password, listenRetry, page, app, session, imports, views, passes = ['jobs', 'transfers', 'adl'], startedMessage, background, onStopping, onStopped, log = line => process.stderr.write(`${line}\n`), drainMs = 0 }: RunOptions): { shutdown(reason?: string, detail?: string): Promise<void>; done: Promise<void> } {
+export function runExecutor({ executor, store, dir, port, socketPath, executionBuild, configBuild, listen, password, listenRetry, page, app, session, imports, readTokens, views, passes = ['jobs', 'transfers', 'adl'], startedMessage, background, onStopping, onStopped, log = line => process.stderr.write(`${line}\n`), drainMs = 0 }: RunOptions): { shutdown(reason?: string, detail?: string): Promise<void>; done: Promise<void> } {
   if (socketPath !== undefined) checkSocketOptions(socketPath, port);
   let stopping = false;
   let finished!: () => void;
@@ -165,7 +168,7 @@ export function runExecutor({ executor, store, dir, port, socketPath, executionB
   };
   const ready = (): boolean => notReady() === null;
   const server = createExecutorServer({ executor, accessToken, log, ready, ...(listen ? { host: listen.urlHost } : {}), ...(password ? { password } : {}),
-    ...(socketPath !== undefined ? { browserPort: port, executionBuild, configBuild } : { page: page || undefined, app }), ...(session ? { session, sessionMaxAgeS: SESSION_MAX_AGE_S } : {}), ...(imports ? { imports } : {}), views: { ...views, status } });
+    ...(socketPath !== undefined ? { browserPort: port, executionBuild, configBuild } : { page: page || undefined, app }), ...(session ? { session, sessionMaxAgeS: SESSION_MAX_AGE_S } : {}), ...(imports ? { imports } : {}), ...(readTokens ? { readTokens } : {}), views: { ...views, status } });
   const publishAccess = (bound: number) => {
     try { process.stdout.write(`${startedMessage}，登录链接已写入 ${writeAccessUrl(dir, bound, accessToken, listen?.urlHost)}\n`); }
     catch (error) { log(`写入登录链接失败：${message(error)}`); process.exitCode = 1; void shutdown('listen-failed', message(error)); }

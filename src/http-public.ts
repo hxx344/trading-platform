@@ -39,7 +39,11 @@ export function controlRoute(method: string | undefined, pathname: string): 'pag
 export const sessionCookieName = (port: number): string => `pa_executor_session_${port}`;
 
 export function sendJson(response: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const payload = JSON.stringify(body);
+  sendJsonText(response, status, JSON.stringify(body), headers);
+}
+
+/** sendJson for a body already serialized. */
+export function sendJsonText(response: ServerResponse, status: number, payload: string, headers: Record<string, string> = {}): void {
   response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...headers });
   response.end(payload);
 }

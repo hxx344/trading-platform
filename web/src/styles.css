@@ -297,3 +297,9 @@ table.data.history{min-width:0}
   .oo-options .checkbox-field{min-height:2.5rem}
   .oo-summary th,.oo-summary td{padding:var(--space-sm)}
 }
+
+/* 只读接口令牌（docs/mcp.md）：侧栏「设置」下的到期提示、生成后的命令与别名查询结果。 */
+.app-shell > .sidebar .nav-item .nav-notice{display:block;font-size:.6875rem;color:var(--warning);margin-top:1px}
+.read-token-commands{margin:0;padding:var(--space-sm) var(--space-md);background:var(--surface-2);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:.75rem;white-space:pre-wrap;overflow-wrap:anywhere}
+.read-token-original{font-family:var(--font-mono);overflow-wrap:anywhere;color:var(--text-primary)}
+[data-read-token-issued] input{font-family:var(--font-mono)}

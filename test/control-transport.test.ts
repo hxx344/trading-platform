@@ -197,3 +197,21 @@ test('HTTP/1.0 没有 Host 的请求通过控制面时仍返回 421', async t =>
   for await (const chunk of socket) chunks.push(chunk as Buffer);
   assert.match(Buffer.concat(chunks).toString('utf8'), /^HTTP\/1\.[01] 421 /);
 });
+
+test('控制面把只读令牌的 Authorization 头原样转给执行面；执行面不可达时返回 503 且不带内部细节', async t => {
+  const seen: (string | undefined)[] = [];
+  const { base, dir } = await listener(t, (request, response) => {
+    seen.push(request.headers.authorization);
+    sendJson(response, 200, { ok: true });
+  });
+  const token = `tpr_${'A'.repeat(43)}`;
+  assert.equal((await fetch(`${base}/api/status`, { headers: { authorization: `Bearer ${token}` } })).status, 200);
+  assert.deepEqual(seen, [`Bearer ${token}`]);
+  const down = createControl({ current: dir, socketPath: join(dir, 'missing.sock') });
+  t.after(() => { down.close(); down.server.close(); });
+  await once(down.server.listen(0, '127.0.0.1'), 'listening');
+  const response = await fetch(`http://127.0.0.1:${(down.server.address() as AddressInfo).port}/api/status`, { headers: { authorization: `Bearer ${token}` } });
+  assert.equal(response.status, 503);
+  const body = await response.text();
+  assert.doesNotMatch(body, /missing\.sock|ENOENT|tpr_/);
+});

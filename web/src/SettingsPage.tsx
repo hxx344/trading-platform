@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import { api } from './api.ts';
 import { ImportPanel } from './ImportPanel.tsx';
+import { ReadTokenSettings } from './ReadTokenSettings.tsx';
+import { READ_TOKEN_PATH, READ_TOKEN_REFRESH_MS, type ReadTokenView } from './read-token-form.ts';
 import { stamp } from './labels.ts';
 import { useLiveResource } from './use-live-resource.ts';
 import type { ServiceStatus, SummaryStatus } from './types.ts';
@@ -75,9 +77,11 @@ function SummarySettings({ summary, refresh }: { summary: SummaryStatus | undefi
 
 export function SettingsPage({ onChanged, onExpired }: { onChanged: () => void; onExpired: () => void }) {
   const { data, refresh } = useLiveResource<ServiceStatus>('/api/status', { intervalMs: STATUS_REFRESH_MS, onExpired });
+  const readToken = useLiveResource<ReadTokenView>(READ_TOKEN_PATH, { intervalMs: READ_TOKEN_REFRESH_MS, onExpired });
   return <div className="feature-stack">
     <ImportPanel onImported={onChanged} />
     <SummarySettings summary={data?.summary} refresh={refresh} />
+    <ReadTokenSettings resource={readToken} />
     <Weight weight={data?.idleWeight} />
   </div>;
 }

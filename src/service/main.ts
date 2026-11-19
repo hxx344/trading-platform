@@ -48,6 +48,7 @@ import { crossexSummary } from './crossex-config.ts';
 import { createOndoModule, type OndoModule } from './ondo.ts';
 import { ondoSummary } from './ondo-config.ts';
 import { createServiceLog, teeStream, type ServiceLog } from './service-log.ts';
+import { createReadTokens } from '../read-token.ts';
 import { createSummary, type Summary, type SummaryInput } from './summary.ts';
 import { createWatch, watchLoop, watchSummary, type Watch } from './watch.ts';
 
@@ -403,8 +404,10 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
 
   // The heartbeat for the second server's main-watch; made once the run loop can say whether it is ready.
   let watch: Watch | null = null;
+  // The read-only API token (docs/mcp.md); without read-token.json no token is accepted.
+  const readTokens = createReadTokens({ dir });
   return runExecutor({
-    executor, store, dir, port, socketPath, executionBuild, configBuild, app, session,
+    executor, store, dir, port, socketPath, executionBuild, configBuild, app, session, readTokens,
     ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: oil ? ['jobs', 'transfers', 'adl'] : ['transfers', 'adl'], drainMs: DRAIN_MS,
     views: {
       status: () => ({ budget: client.requestBudget.state(), idleWeight: idleWeight(config, executor.transferPairSettings()), streams: streams.view(), feishu: notifier.status(), summary: summary.status(), samples: { available: samples !== null, error: samplesError },
@@ -431,6 +434,8 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
     background: context => [
       (async () => {
         while (!context.stopped()) {
+          try { for (const text of readTokens.dueReminders()) notifier.notify(text); }
+          catch (error) { process.stderr.write(`只读接口令牌到期提醒失败：${error instanceof Error ? error.message : String(error)}\n`); }
           try { notifier.poll(); await notifier.flush(); }
           catch (error) { process.stderr.write(`告警处理失败：${error instanceof Error ? error.message : String(error)}\n`); }
           try { await monitorOutbox?.flush(); }
@@ -487,6 +492,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       try { notifier.poll(); } catch { /* best effort */ }
       await Promise.race([Promise.all([notifier.flush(), monitorOutbox?.flush()]), new Promise(resolve => setTimeout(resolve, FINAL_FLUSH_MS).unref())]);
       if (monitor) await settleMonitor(monitor);
+      readTokens.flush();
       notifier.close();
       monitorOutbox?.close();
       summary.close();

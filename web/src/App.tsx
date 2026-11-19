@@ -13,6 +13,7 @@ import { useRoute } from './route.ts';
 import { SettingsPage } from './SettingsPage.tsx';
 import { StatusPage } from './StatusPage.tsx';
 import { UpdateStatus } from './UpdateStatus.tsx';
+import { READ_TOKEN_PATH, READ_TOKEN_REFRESH_MS, navNotice, type ReadTokenView } from './read-token-form.ts';
 import { Callout, StatePanel } from './StateViews.tsx';
 import { clock } from './labels.ts';
 import { useLiveResource } from './use-live-resource.ts';
@@ -65,6 +66,9 @@ export function App() {
   const crossex = useLiveResource<unknown>(`${CROSSEX_STATE_PATH}?opportunities=0`, { intervalMs: OIL_CHECK_MS, timeoutMs: CROSSEX_READ_TIMEOUT_MS, onExpired });
   // The Ondo page reads the same path at the same timeout; here it only decides whether the entry shows.
   const ondo = useLiveResource<unknown>(ONDO_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: ONDO_READ_TIMEOUT_MS, onExpired });
+  // The read-only token's expiry hint under 设置 (docs/mcp.md); a service without tokens answers 404 and shows none.
+  const readToken = useLiveResource<ReadTokenView>(READ_TOKEN_PATH, { intervalMs: READ_TOKEN_REFRESH_MS, onExpired });
+  const tokenNotice = navNotice(readToken.data, Date.now());
   const available = new Set<NavEntry>([...ALWAYS, ...(oil.data !== null ? ['oil' as const, 'hynix' as const] : []), ...(options.data !== null || (options.error instanceof ApiError && options.error.status === 503) ? ['options' as const] : []), ...(monitor.data !== null ? ['monitor' as const] : []), ...(asset.data !== null || (asset.error instanceof ApiError && asset.error.status === 500) ? ['asset' as const, 'positions' as const] : []),
     ...(crossex.data !== null || (crossex.error instanceof ApiError && crossex.error.status === 503) ? ['crossex' as const] : []), ...(ondo.data !== null ? ['ondo' as const] : [])]);
   const current = entryOf(route), crumb = breadcrumbOf(route);
@@ -110,7 +114,7 @@ export function App() {
         <div className="nav-label" aria-hidden="true">{group.label}</div>
         {group.entries.map(entry => {
           const Icon = ICONS[entry], active = entry === current;
-          return <a key={entry} href={navEntries[entry].href} className={`nav-item ${active ? 'active' : ''}`} aria-current={active ? 'page' : undefined} onClick={menuOpen ? closeMenu : undefined}><Icon size={17} aria-hidden="true" /><span className="nav-text">{navEntries[entry].text}</span></a>;
+          return <a key={entry} href={navEntries[entry].href} className={`nav-item ${active ? 'active' : ''}`} aria-current={active ? 'page' : undefined} onClick={menuOpen ? closeMenu : undefined}><Icon size={17} aria-hidden="true" /><span className="nav-text">{navEntries[entry].text}{entry === 'settings' && tokenNotice ? <small className="nav-notice" data-read-token-nav>{tokenNotice}</small> : null}</span></a>;
         })}
         {/* The online update sits after the system pages, as in the workbench (docs/update.md). */}
         {group.id === 'system' ? <UpdateStatus onExpired={onExpired} onOpen={menuOpen ? closeMenu : undefined} /> : null}

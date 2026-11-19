@@ -373,9 +373,9 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     }) };
   }
   async function readNativeMarket(symbol, requireListing) {
-    const order = ++nativeRequest;
     if (requireListing) await refreshCatalog();
     const source = nativeMarket(symbol);
+    const order = ++nativeRequest;
     const quote = await manualIdentityReader(symbol);
     // Held funding follows the native venue even when Gate has no valid listing. Such a read supplies no trading identity.
     if (!source && !requireListing) return { quote };

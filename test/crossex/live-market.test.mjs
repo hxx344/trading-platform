@@ -187,6 +187,33 @@ test('held funding reads native identity without a directory and revokes a live 
   await assert.rejects(f.market.revalidateOpen(plan), /身份已变化/);
 });
 
+test('a directory wait does not place a later native observation behind an earlier funding read', async t => {
+  const symbol = 'BINANCE_FUTURE_BTC_USDT', catalogStarted = Promise.withResolvers(), releaseCatalog = Promise.withResolvers();
+  let unit = '1', delayCatalog = false;
+  const observed = [];
+  const f = fixture(t, {
+    catalogReader: async () => {
+      if (delayCatalog) { catalogStarted.resolve(); await releaseCatalog.promise; }
+      return catalog.map(r => ({ ...r, max_limit_size: '10000' }));
+    },
+    manualIdentityReader: async () => { observed.push(unit); return manualQuote('binance', { nativeUnit: unit }); },
+    currentFundingReader: async () => ({ rate: '0.001', intervalHours: 8, nextFundingAt: f.now() + 3600000, sourceAt: f.now() }),
+  });
+  await f.market.resolveSymbol(symbol); f.advance(299990);
+  const before = await f.market.resolveSymbol(symbol);
+  const order = { symbol, side: 'BUY', quantity: '0.25', orderType: 'LIMIT', price: '98', timeInForce: 'GTC', expectedMarketIdentity: before.marketIdentity };
+  const plan = await f.market.previewDirect(order); await f.market.revalidateOpen(plan);
+  f.advance(20); delayCatalog = true;
+  const terminal = f.market.resolveSymbol(symbol); await catalogStarted.promise;
+  const events = observed.length;
+  f.market.view({ includeOpportunities: false, includePositionFunding: true, positionSymbols: [symbol] });
+  await new Promise(setImmediate); assert.deepEqual(observed.slice(events), ['1']);
+  unit = '2'; releaseCatalog.resolve();
+  const latest = await terminal;
+  assert.deepEqual(observed.slice(events), ['1', '2']);
+  assert.equal(latest.marketCurrent(), true); assert.equal(before.marketCurrent(), false); assert.equal(plan.quotesCurrent(), false);
+});
+
 test('manual market never uses saved paper positions or enabled automation', async t => {
   const f = fixture(t);
   f.store.set('config', { enabled: true, executionMode: 'staged' });

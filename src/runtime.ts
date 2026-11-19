@@ -76,8 +76,8 @@ export interface RunOptions {
   background?: (context: RunContext) => Promise<void>[];
   /** Why the run is ending, before anything is closed: 'signal', 'lease-lost', 'pass-failed', 'listen-failed'. */
   onStopping?: (reason: string, detail: string) => void;
-  /** Runs after the executor is closed and before the store is. */
-  onStopped?: () => Promise<void> | void;
+  /** Runs before the store closes. Includes a loss first detected while draining an already announced stop. */
+  onStopped?: (lateLeaseLoss: string | null) => Promise<void> | void;
   log?: (line: string) => void;
   /**
    * How long a stop waits, still renewing the lease, for running passes to finish before closing the executor.
@@ -100,7 +100,7 @@ export function runExecutor({ executor, store, dir, port, socketPath, executionB
   const done = new Promise<void>(resolve => { finished = resolve; });
   // Lease renewal runs apart from the passes so a slow venue call cannot let the lease lapse.
   const heartbeat = setInterval(() => {
-    try { if (!executor.acquire() && !stopping) { log('执行器已失去写入租约，停止'); process.exitCode = 1; void shutdown('lease-lost', '写入租约已失去'); } }
+    try { if (!executor.acquire() && !stopping) void shutdown('lease-lost'); }
     catch (error) { log(`续租失败：${message(error)}`); }
   }, Math.floor(executor.budgets.leaseTtlMs / 3));
   // Automatic checkpoints cannot reset the WAL while some reader is always active; the owner truncates it past a threshold.
@@ -152,7 +152,10 @@ export function runExecutor({ executor, store, dir, port, socketPath, executionB
       if (context.stopped()) break;
       await pause(TICK_MS * (failures + 1));
     }
-    if (!stopping) { process.exitCode = 1; void shutdown(executor.retired ? 'lease-lost' : 'pass-failed', executor.retired ? '写入租约已失去' : `${label}连续失败：${last}`); }
+    if (!stopping) {
+      if (executor.retired) void shutdown('lease-lost');
+      else { process.exitCode = 1; void shutdown('pass-failed', `${label}连续失败：${last}`); }
+    }
   })();
   const accessToken = randomBytes(32).toString('base64url');
   const status = (): Record<string, unknown> => {
@@ -215,6 +218,12 @@ export function runExecutor({ executor, store, dir, port, socketPath, executionB
   async function shutdown(reason = 'signal', detail = ''): Promise<void> {
     if (stopping) return done;
     stopping = true;
+    if (executor.leaseLossDetail || reason === 'lease-lost') {
+      reason = 'lease-lost';
+      process.exitCode = 1;
+      detail = executor.leaseLossDetail ?? '写入租约已失去';
+      log(detail);
+    }
     try { onStopping?.(reason, detail); } catch (error) { log(`停止通知失败：${message(error)}`); }
     clearInterval(walCheck);
     closeListener();
@@ -230,7 +239,9 @@ export function runExecutor({ executor, store, dir, port, socketPath, executionB
     clearInterval(heartbeat);
     executor.close();
     await Promise.all(loops);
-    try { await onStopped?.(); } catch (error) { log(`停止收尾失败：${message(error)}`); }
+    const lateLeaseLoss = reason === 'lease-lost' ? null : executor.leaseLossDetail ?? null;
+    if (lateLeaseLoss) log(lateLeaseLoss);
+    try { await onStopped?.(lateLeaseLoss); } catch (error) { log(`停止收尾失败：${message(error)}`); }
     store.close();
     process.off('SIGINT', onSignal);
     process.off('SIGTERM', onSignal);

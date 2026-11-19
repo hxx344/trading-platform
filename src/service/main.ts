@@ -478,7 +478,8 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
     ],
     onStopping: (reason, detail) => {
       const text = reason === 'signal' ? '【服务停止】收到停止信号，正常退出' : `【服务异常停止】${detail || reason}；systemd 会在 5 秒后自动重启，请查看日志`;
-      try { notifier.poll(); notifier.notify(text); } catch { /* best effort */ }
+      try { notifier.poll(); } catch { /* A failed event read must not suppress the stop alert. */ }
+      try { notifier.notify(text); } catch { /* best effort */ }
       if (monitor) stopMonitor(monitor);
       // A beat or a version check in flight must not hold the stop for its timeout.
       watch?.abort();
@@ -487,9 +488,12 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       crossex?.abort();
       options?.abort();
     },
-    onStopped: async () => {
+    onStopped: async lateLeaseLoss => {
       // Events from the drain (an unknown transfer, an ADL batch) go out now rather than at the next start.
       try { notifier.poll(); } catch { /* best effort */ }
+      if (lateLeaseLoss) {
+        try { notifier.notify(`【停止期间写入租约失效】${lateLeaseLoss}`); } catch { /* best effort */ }
+      }
       await Promise.race([Promise.all([notifier.flush(), monitorOutbox?.flush()]), new Promise(resolve => setTimeout(resolve, FINAL_FLUSH_MS).unref())]);
       if (monitor) await settleMonitor(monitor);
       readTokens.flush();

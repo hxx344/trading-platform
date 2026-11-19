@@ -94,6 +94,15 @@ export const DEFAULT_BUDGETS: Readonly<Budgets> = Object.freeze({
 
 export class WriterLostError extends ContractError { constructor(message: string) { super(503, 'writer_lost', message); } }
 
+type WriterLeaseRow = { owner: string; generation: number; expires_at: number };
+
+/** Match the Beijing time shown to the operator, including milliseconds at the expiry boundary. */
+function leaseTime(ms: number): string {
+  if (!Number.isSafeInteger(ms)) return '未知';
+  const local = new Date(ms + 8 * 3600_000);
+  return Number.isFinite(local.getTime()) ? local.toISOString().slice(0, -1).replace('T', ' ') : '未知';
+}
+
 /** The passes the entry schedules apart: two-leg jobs, margin transfers and ADL incidents. */
 export type LoopName = 'jobs' | 'transfers' | 'adl';
 export type JobStatus = 'accepted' | 'running' | 'completed' | 'failed' | 'stopped' | 'attention';
@@ -434,6 +443,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   const db = store.db;
   const owner = randomUUID();
   let generation = 0, held = false, retired = false, closed = false, heldSince = 0;
+  let lastLease: { at: number; expiresAt: number; initial: boolean } | null = null;
+  let leaseLossDetail: string | null = null;
   /** One pass at a time per loop; a second call while one runs joins it. */
   const passes: Record<'all' | LoopName, Promise<void> | null> = { all: null, jobs: null, transfers: null, adl: null };
   const singleFlight = (name: 'all' | LoopName, run: () => Promise<void>): Promise<void> => {
@@ -449,7 +460,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   const inFlight = new Set<string>();
   /** Operations whose cancel is running in this process. */
   const cancelling = new Set<string>();
-  const control = controlOptions ? createAccountControl({ ...controlOptions, lost: (message: string): never => { retired = true; throw new WriterLostError(message); } }) : null;
+  const control = controlOptions ? createAccountControl({ ...controlOptions, lost: (message: string): never => {
+    retireLease('共享账户写入登记失效', undefined, now());
+    throw new WriterLostError(message);
+  } }) : null;
 
   const connectorFor = (venue: Venue): VenueConnector => venues.get(venue) ?? reject('venue_unavailable', `${VENUE_NAMES[venue]} 连接器不可用`, 503);
   const chaseConnector = (venue: Venue): ChaseConnector => {
@@ -460,36 +474,60 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     db.prepare('INSERT INTO events(job_id, type, at, json) VALUES (?, ?, ?, ?)').run(jobId, type, now(), JSON.stringify(detail));
 
   // ---- writer lease and fence --------------------------------------------------
+  const readWriter = () => db.prepare('SELECT owner, generation, expires_at FROM writer WHERE id = 1').get() as WriterLeaseRow | undefined;
+
+  function retireLease(reason: string, row: WriterLeaseRow | undefined, at: number): void {
+    retired = true;
+    if (leaseLossDetail !== null) return;
+    const holder = !row ? '变化情况未知' : row.owner === owner ? '未变化' : '已变化';
+    let renewal = '无成功记录';
+    if (lastLease) renewal = lastLease.initial ? `尚未续租（首次获租 ${leaseTime(lastLease.at)}）` : leaseTime(lastLease.at);
+    const localExpiry = lastLease ? leaseTime(lastLease.expiresAt) : '未知';
+    const observed = row && row.expires_at !== lastLease?.expiresAt ? `，检测时库内租约到期 ${leaseTime(row.expires_at)}` : '';
+    leaseLossDetail = `写入租约已失去（${reason}），持有者${holder}。上次成功续租 ${renewal}，本实例租约到期 ${localExpiry}${observed}，检测时间 ${leaseTime(at)}（北京时间）`;
+  }
+
+  function checkHeldLease(row: WriterLeaseRow | undefined, at: number): boolean {
+    let reason: string;
+    if (!row) reason = '租约记录缺失';
+    else if (row.owner !== owner) reason = '其他实例已接管';
+    else if (row.generation !== generation) reason = '租约代次已变化';
+    else if (row.expires_at <= at) reason = '续租超时';
+    else return true;
+    retireLease(reason, row, at);
+    return false;
+  }
+
   function assertWriter(): void {
     if (retired) throw new WriterLostError('执行器已失去写入权，请重启后核对');
-    const row = db.prepare('SELECT owner, generation, expires_at FROM writer WHERE id = 1').get() as { owner: string; generation: number; expires_at: number } | undefined;
-    if (!held || !row || row.owner !== owner || row.generation !== generation || row.expires_at <= now()) {
-      if (held) retired = true;
-      throw new WriterLostError(held ? '执行器写入租约已失效或被接管，本实例停止写入' : '执行器尚未取得写入租约');
-    }
+    if (!held) throw new WriterLostError('执行器尚未取得写入租约');
+    if (!checkHeldLease(readWriter(), now())) throw new WriterLostError('执行器写入租约已失效或被接管，本实例停止写入');
   }
   const write = <T>(operation: () => T): T => store.tx(() => { assertWriter(); return operation(); });
 
   /** Takes or renews the single-writer lease. A lapsed lease is never revived by the same instance. */
   function acquire(): boolean {
     if (closed || retired) return false;
-    const renewed = store.tx(() => {
-      const row = db.prepare('SELECT owner, generation, expires_at FROM writer WHERE id = 1').get() as { owner: string; generation: number; expires_at: number } | undefined;
+    const lease = store.tx(() => {
+      const row = readWriter();
+      const at = now(), expiresAt = at + budgets.leaseTtlMs, initial = !held;
       if (held) {
-        if (!row || row.owner !== owner || row.generation !== generation || row.expires_at <= now()) { retired = true; return false; }
-        db.prepare('UPDATE writer SET expires_at = ? WHERE id = 1').run(now() + budgets.leaseTtlMs);
-        return true;
+        if (!checkHeldLease(row, at)) return null;
+        db.prepare('UPDATE writer SET expires_at = ? WHERE id = 1').run(expiresAt);
+      } else {
+        if (row && row.expires_at > at) return null;
+        generation = (row?.generation ?? 0) + 1;
+        db.prepare('INSERT INTO writer(id, owner, generation, expires_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET owner = excluded.owner, generation = excluded.generation, expires_at = excluded.expires_at')
+          .run(owner, generation, expiresAt);
+        held = true; heldSince = now();
+        recoverAfterTakeover();
       }
-      if (row && row.expires_at > now()) return false;
-      generation = (row?.generation ?? 0) + 1;
-      db.prepare('INSERT INTO writer(id, owner, generation, expires_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET owner = excluded.owner, generation = excluded.generation, expires_at = excluded.expires_at')
-        .run(owner, generation, now() + budgets.leaseTtlMs);
-      held = true; heldSince = now();
-      recoverAfterTakeover();
-      return true;
+      return { at, expiresAt, initial };
     });
-    if (renewed && control) { try { control.keepAlive(); } catch (error) { if (!(error instanceof WriterLostError)) throw error; } }
-    return renewed && !retired;
+    if (!lease) return false;
+    lastLease = lease; // Only report grants and renewals that actually committed.
+    if (control) { try { control.keepAlive(); } catch (error) { if (!(error instanceof WriterLostError)) throw error; } }
+    return !retired;
   }
 
   /**
@@ -2578,6 +2616,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     owner,
     get generation() { return generation; },
     get retired() { return retired; },
+    get leaseLossDetail() { return leaseLossDetail; },
     budgets,
     acquire,
     prune,

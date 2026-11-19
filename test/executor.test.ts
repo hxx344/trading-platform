@@ -366,6 +366,10 @@ test('C05/C06 发送中崩溃并被接管：新写者把发送中记为未知，
   assert.equal(h.ex.jobView(jobId).holdNewSends, true);
   await assert.rejects(pending, (error: unknown) => error instanceof ContractError && error.code === 'writer_lost');
   assert.equal(old.retired, true);
+  const loss = old.leaseLossDetail!;
+  assert.match(loss, /其他实例已接管.*持有者已变化/);
+  assert.match(loss, /本实例租约到期 2026-11-12 09:01:00\.000，检测时库内租约到期 2026-11-12 09:02:01\.000/);
+  assert.ok(!loss.includes(old.owner) && !loss.includes(next.owner));
   assert.equal(opState(h, jobId, 0), 'unknown', '旧实例的迟到结果不得写回');
   const view = await settle(h, jobId);
   assert.equal(view.legs[0].operation?.state, 'filled');
@@ -420,14 +424,49 @@ test('C06 写者租约：有效期内第二实例取不到写入权；租约过�
   const second = createExecutor({ store: secondStore, connectors: [h.binance, h.bybit], now: () => h.clock.now, budgets: { callTimeoutMs: 50 } });
   assert.equal(second.acquire(), false);
   await assert.rejects(second.preview(openIntent(), SESSION), code('writer_lost'));
+  assert.equal(second.leaseLossDetail, null, '尚未获租的竞争者没有失租现场');
   h.clock.now += 60_001;
   assert.equal(first.acquire(), false);
   assert.equal(first.retired, true);
+  const loss = first.leaseLossDetail!;
+  assert.match(loss, /续租超时.*持有者未变化/);
+  assert.match(loss, /尚未续租（首次获租 2026-11-12 09:00:00\.000）/);
   assert.throws(() => first.registerAccount({ venue: 'binance', environment: 'simulated', accountId: 'BN1001', accountMode: 'standard', credentialVersion: 9 }), code('writer_lost'));
   assert.equal(second.acquire(), true);
   assert.equal(second.generation, 2);
+  assert.equal(first.acquire(), false);
+  assert.equal(first.leaseLossDetail, loss, '后续接管不改写首次失效现场');
   } finally { secondStore.close(); }
 }));
+
+test('C06 续租事务回滚后，到期边界的写入校验仍报告最后一次已提交的续租', () => withHarness(async h => {
+  h.clock.now += 12_345;
+  assert.equal(h.ex.acquire(), true);
+  const tx = h.store.tx;
+  h.clock.now += 5_000;
+  h.store.tx = operation => tx(() => { operation(); throw new Error('模拟提交失败'); });
+  try { assert.throws(() => h.ex.acquire(), /模拟提交失败/); } finally { h.store.tx = tx; }
+  assert.equal(h.ex.leaseLossDetail, null);
+  h.clock.now += 55_000;
+  assert.throws(() => h.ex.registerAccount(SIM_BINDINGS[0]!), code('writer_lost'));
+  const loss = h.ex.leaseLossDetail!;
+  assert.match(loss, /续租超时.*持有者未变化/);
+  assert.match(loss, /上次成功续租 2026-11-12 09:00:12\.345，本实例租约到期 2026-11-12 09:01:12\.345，检测时间 2026-11-12 09:01:12\.345（北京时间）/);
+  assert.equal(h.ex.acquire(), false);
+}));
+
+for (const [mutation, expected] of [
+  ['DELETE FROM writer', /租约记录缺失.*持有者变化情况未知/],
+  ['UPDATE writer SET generation = generation + 1', /租约代次已变化.*持有者未变化/],
+] as const) {
+  test(`C06 租约记录异常时保留本实例的到期时间：${mutation}`, () => withHarness(async h => {
+    h.store.db.exec(mutation);
+    assert.equal(h.ex.acquire(), false);
+    assert.match(h.ex.leaseLossDetail!, expected);
+    assert.match(h.ex.leaseLossDetail!, /本实例租约到期 2026-11-12 09:01:00\.000/);
+    assert.throws(() => h.ex.registerAccount(SIM_BINDINGS[0]!), code('writer_lost'));
+  }));
+}
 
 test('停止：发送前停止不发任何委托；停止请求幂等', () => withHarness(async h => {
   bindAccounts(h.ex);

@@ -223,6 +223,7 @@ test('写者登记失效（写者已关闭）时执行器整体停止写入', ()
   registry.current().close();
   await assert.rejects(h.ex.tick(), code('writer_lost'));
   assert.equal(h.ex.retired, true);
+  assert.match(h.ex.leaseLossDetail!, /共享账户写入登记失效.*持有者变化情况未知/);
   assert.equal(h.binance.calls.place, 0);
   assert.equal(h.ex.jobView(jobId).status, 'accepted');
 }));

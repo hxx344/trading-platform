@@ -510,6 +510,45 @@ test('服务装配：配对登记为停用，启用前做接管检查（含两�
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('服务进程：执行循环发现接管，事件读取失败时仍将同一份现场写入日志并发给飞书', {
+  timeout: 10_000, skip: process.platform !== 'linux' && '正式服务使用 Linux 账户进程锁',
+}, async t => {
+  const dir = tempDir(), sent: string[] = [];
+  const exitCode = process.exitCode;
+  const { startService } = await import('../src/service/main.ts');
+  let run: Awaited<ReturnType<typeof startService>> | undefined;
+  t.after(async () => {
+    try { await run?.shutdown(); } finally { process.exitCode = exitCode; rmSync(dir, { recursive: true, force: true }); }
+  });
+  run = await startService({
+    config: parseServiceConfig(configRaw([])), dir, port: 0, app: APP,
+    secrets: { accounts: new Map(), feishu: { webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/abcdefgh', secret: null } },
+    fetchImpl: new FakeAster().fetch,
+    notifyFetch: async (_url, init) => {
+      const payload = JSON.parse(String(init.body));
+      if (payload.msg_type === 'text') sent.push(...payload.content.text.split('\n'));
+      return json({ code: 0 });
+    },
+  });
+  const successor = randomUUID();
+  const other = new DatabaseSync(join(dir, 'executor-live.sqlite'));
+  try {
+    other.prepare('UPDATE writer SET owner = ?, generation = generation + 1, expires_at = ?').run(successor, Date.now() + 120_000);
+    other.exec('ALTER TABLE events RENAME TO unavailable_events');
+  } finally { other.close(); }
+  await run.done;
+  const alerts = sent.filter(line => line.startsWith('【服务异常停止】'));
+  assert.equal(alerts.length, 1);
+  assert.match(alerts[0]!, /其他实例已接管.*持有者已变化.*上次成功续租 \d{4}-.*本实例租约到期 \d{4}-.*检测时库内租约到期 \d{4}-.*北京时间/);
+  assert.ok(!alerts[0]!.includes(successor));
+  const logs = new DatabaseSync(join(dir, 'logs.sqlite'), { readOnly: true });
+  try {
+    const text = (logs.prepare("SELECT text FROM lines WHERE text LIKE '写入租约已失去%'").get()?.text) as string;
+    assert.ok(text && alerts[0]!.includes(text));
+    assert.ok(logs.prepare('SELECT 1 FROM lines WHERE text = ?').get(`告警：${alerts[0]}`));
+  } finally { logs.close(); }
+});
+
 test('服务进程：本机页面只含 ASTER 部分，状态接口可读，用户推送按子账户建立，停止后全部收尾', async () => {
   const dir = tempDir();
   const fake = new FakeAster();

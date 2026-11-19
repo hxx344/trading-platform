@@ -382,19 +382,64 @@ test('停服时 REST 在途：请求被中止，之后不写入也不再排读�
 
 test('429 没有 Retry-After 或是日期格式时暂停 10 秒', async t => {
   for (const retryAfter of [null, 'Wed, 21 Oct 2026 07:28:00 GMT']) {
-    const h = harness({ status: 429, retryAfter });
-    await settle();
-    h.state.status = 200;
-    const moves = () => h.feed.moves().channels[0]!.error;
-    h.feed.moves();
-    await settle();
-    assert.match(moves()!, /限流，10 秒后重试/);
-    await advance(10_000 + MOVES_POLL_MS);
-    assert.equal(moves(), null);
-    h.feed.close();
-    mock.timers.reset();
+    await t.test(`Retry-After: ${retryAfter ?? '无'}`, async t => {
+      const h = harness({ status: 429, retryAfter });
+      t.after(() => { h.feed.close(); mock.timers.reset(); });
+      await settle();
+      h.state.status = 200;
+      const error = () => h.feed.moves().channels[0]!.error;
+      h.feed.moves();
+      await settle();
+      assert.match(error()!, /限流，10 秒后重试/);
+      await advance(10_000 + MOVES_POLL_MS);
+      assert.equal(error(), null);
+    });
   }
-  t.diagnostic('两种情况都按 10 秒');
+});
+
+test('同标题的旧快讯不会顶掉新推送；标题对上且时间相近才算同一条', async t => {
+  const h = harness({ pages: { main: [restItem(700, T0 - 3 * 3_600_000, { zh: '某所将上线 XYZ', en: null })] } });
+  t.after(() => { h.feed.close(); mock.timers.reset(); });
+  await settle();
+  h.sockets[0]!.emit('open');
+  await settle();
+  h.sockets[0]!.emit('message', frame(701, '某所将上线 XYZ'));
+  await advance(2_000);
+  assert.deepEqual(h.feed.flash().items.map(item => [item.no, item.pushed]), [[701, true], [700, false]]);
+  // REST 收录时编号不同（上游改号）但时间相近：按标题换掉推送条目。
+  h.state.pages.main = [restItem(702, T0 + 1_000, { zh: '某所将上线 XYZ', en: null }), restItem(700, T0 - 3 * 3_600_000, { zh: '某所将上线 XYZ', en: null })];
+  await advance(13_000);
+  assert.deepEqual(h.feed.flash().items.map(item => [item.no, item.pushed]), [[702, false], [700, false]]);
+});
+
+test('连着时补读失败按 60 秒重试，不等 5 分钟', async t => {
+  const h = harness({ status: 500 });
+  t.after(() => { h.feed.close(); mock.timers.reset(); });
+  await settle();
+  h.sockets[0]!.emit('open');
+  await settle();
+  assert.equal(h.feed.flash().rest.error, 'EQN 快讯接口返回 500');
+  const base = h.requests.length;
+  h.state.status = 200;
+  await advance(60_000);
+  assert.equal(h.requests.length, base + 1);
+  assert.equal(h.feed.flash().rest.error, null);
+  // 成功后回到 5 分钟一次。
+  await advance(60_000);
+  assert.equal(h.requests.length, base + 1);
+});
+
+test('应答的 content-length 超过上限时不读正文直接报错', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'Date'], now: T0 });
+  t.after(() => mock.timers.reset());
+  let read = false, cancelled = false;
+  const fetchImpl = async () => ({ status: 200, ok: true, headers: new Headers({ 'content-length': '2000001' }), body: { cancel: async () => { cancelled = true; } }, text: async () => { read = true; return '{}'; } });
+  const feed = createNewsFeed({ fetchImpl: fetchImpl as unknown as typeof fetch, connect: url => new FakeSocket(url), random: () => 0.5, log: () => {} });
+  t.after(() => feed.close());
+  await settle();
+  assert.equal(feed.flash().rest.error, 'EQN 快讯应答过大');
+  assert.equal(read, false);
+  assert.equal(cancelled, true);
 });
 
 test('异动行情：停止后再读能重新开始，同一时刻只跑一轮；列表有上限', async t => {

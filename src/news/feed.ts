@@ -58,7 +58,7 @@ export const MOVES_POLL_MS = 15_000;
 export const MOVES_INTEREST_MS = 90_000;
 const REST_TIMEOUT_MS = 8_000;
 const BODY_MAX = 2_000_000, FRAME_MAX = 64 * 1024;
-const KEEP = 200, FLASH_VIEW = 100, MOVES_VIEW = 200;
+const KEEP = 200, FLASH_VIEW = 100, MOVES_VIEW = 200, TITLE_MATCH_MS = 10 * 60_000;
 
 const key = (item: NewsItem) => item.no !== null ? `n${item.no}` : `p${item.time}:${item.zh ?? item.en}`;
 
@@ -134,10 +134,18 @@ export function createNewsFeed({ fetchImpl = fetch, connect = url => new WebSock
     })();
     return flashReading;
   }
-  /** REST 记录到了：替换同编号的推送条目；推送条目的标题对上 REST 记录也去掉（编号缺失或对不上时）。 */
+  /**
+   * REST 记录到了：替换同编号的推送条目；推送条目的标题对上一条时间相近（前后 10 分钟）的 REST 记录也去掉
+   * （编号缺失或对不上时）。同一模板的旧快讯时间相差远，不会顶掉新推送。
+   */
   function reconcile(items: readonly NewsItem[]): void {
-    const titles = new Set(items.flatMap(item => [item.zh, item.en]).filter((title): title is string => title !== null));
-    for (const [id, item] of flashItems) if (item.pushed && titles.has((item.zh ?? item.en)!)) flashItems.delete(id);
+    const titles = new Map<string, number[]>();
+    for (const item of items) for (const title of [item.zh, item.en]) if (title !== null) (titles.get(title) ?? titles.set(title, []).get(title)!).push(item.time);
+    for (const [id, item] of flashItems) {
+      if (!item.pushed) continue;
+      const times = titles.get((item.zh ?? item.en)!);
+      if (times?.some(time => Math.abs(time - item.time) <= TITLE_MATCH_MS)) flashItems.delete(id);
+    }
     merge(flashItems, items);
   }
   /**

@@ -477,7 +477,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(config.watch && secrets.watch ? [watchLoop(watch = createWatch({ config: config.watch, secret: secrets.watch, problem: context.notReady, ...(watchOptions?.fetchImpl ? { fetchImpl: watchOptions.fetchImpl } : {}), log: line => process.stderr.write(`${line}\n`) }), context, watchOptions)] : []),
     ],
     onStopping: (reason, detail) => {
-      const text = reason === 'signal' ? '【服务停止】收到停止信号，正常退出' : `【服务异常停止】${detail || reason}；systemd 会在 5 秒后自动重启，请查看日志`;
+      const text = reason === 'signal' ? '【服务停止】收到停止信号，正常退出' : `【服务异常停止】${detail || reason}。请查看服务日志和运行状态`;
       try { notifier.poll(); } catch { /* A failed event read must not suppress the stop alert. */ }
       try { notifier.notify(text); } catch { /* best effort */ }
       if (monitor) stopMonitor(monitor);

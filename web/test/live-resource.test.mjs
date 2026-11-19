@@ -209,3 +209,30 @@ test('live-resource：读取失败后因隐藏暂停时保留错误，读成功�
   assert.equal(snapshots.at(-1).status, 'ready');
   assert.equal(snapshots.at(-1).error, null);
 });
+
+test('live-resource 与系统更新的后台读取条件串联：连续读不到满 10 分钟后停读，不因暂停状态反复重开', async () => {
+  const { readsInBackground, BACKGROUND_SILENCE_MS } = await import('../src/update-view.ts');
+  const fake = fakeEnvironment();
+  const store = createResourceStore(fake.env);
+  let reads = 0;
+  const read = async () => { reads++; throw new Error('502'); };
+  let snapshot = null;
+  // 照 UpdateStatus：每次快照后按保留的错误与上次成功时间算 silentMs，下一拍调整后台开关。
+  const subscription = store.subscribe('/api/update', { read, intervalMs: 2_000, background: true }, next => { snapshot = next; });
+  const drive = () => {
+    const silentMs = snapshot.error ? fake.env.now() - (snapshot.receivedAt ?? 0) : 0;
+    const offline = snapshot.status === 'error' || snapshot.status === 'offline';
+    subscription.setBackground(readsInBackground({ view: null, offline, busy: null, watched: 'job-1', loaded: 'v0.70.1' }, silentMs));
+  };
+  await fake.settle();
+  await fake.setHidden(true);
+  for (let i = 0; i < 400; i++) { drive(); await fake.advance(2_000); }
+  assert.ok(fake.env.now() > BACKGROUND_SILENCE_MS);
+  const stopped = reads;
+  for (let i = 0; i < 200; i++) { drive(); await fake.settle(); }
+  await fake.advance(60_000);
+  drive(); await fake.settle();
+  assert.equal(reads, stopped, '停读后不再发读取');
+  assert.equal(snapshot.status, 'paused');
+  assert.ok(stopped <= BACKGROUND_SILENCE_MS / 2_000 + 2, `停读前读了 ${stopped} 次`);
+});

@@ -1,16 +1,17 @@
-// 复制自 project-aggregation 工作台 src/live-resource.ts（提交 056e9c3），未改动。
+// 改编自 project-aggregation 工作台 src/live-resource.ts（提交 056e9c3）：增加订阅者的后台读取开关（background）。
 // 只读页面共用的读取层：同一地址的多个订阅者共享一个请求和一份结果。
 // 读取约定：
 // - 同一 key 同时只有一个在途读取；间隔取所有订阅者的最小值，读取结束后再排下一次，不重叠。
 // - 页面隐藏或离线时中止在途读取并暂停；恢复后立即读取，旧结果保留但状态不再是 ready。
+//   有订阅者要求后台读取（background）的条目在页面隐藏时照常轮询，离线时仍暂停（如系统更新进行中，见 docs/update.md）。
 // - 失败保留上次结果并报告错误，按原间隔重试；401 不再自动重试，由页面处理登录过期。
 // - 写操作（commit、refresh）使之前发出的读取失效，迟到的旧响应不能覆盖写入结果（L089）。
 // - 缓存只在仍有订阅者时存在：最后一个订阅者离开即中止读取并丢弃结果，不跨页面或会话复用。
 
 export type ResourceStatus = 'loading' | 'ready' | 'error' | 'paused' | 'offline';
 export type ResourceSnapshot<T> = { data: T | null; error: Error | null; status: ResourceStatus; receivedAt: number | null };
-export type ResourceSource<T> = { read: (signal: AbortSignal) => Promise<T>; intervalMs: number | null };
-export type Subscription = (() => void) & { retune: (intervalMs: number | null) => void };
+export type ResourceSource<T> = { read: (signal: AbortSignal) => Promise<T>; intervalMs: number | null; background?: boolean };
+export type Subscription = (() => void) & { retune: (intervalMs: number | null) => void; setBackground: (background: boolean) => void };
 
 export type ResourceEnvironment = {
   now: () => number;
@@ -22,7 +23,7 @@ export type ResourceEnvironment = {
   listen: (wake: () => void) => () => void;
 };
 
-type Subscriber = { intervalMs: number | null; listener: (snapshot: ResourceSnapshot<unknown>) => void };
+type Subscriber = { intervalMs: number | null; background: boolean; listener: (snapshot: ResourceSnapshot<unknown>) => void };
 type Entry = {
   read: (signal: AbortSignal) => Promise<unknown>;
   subscribers: Set<Subscriber>;
@@ -59,7 +60,11 @@ const unauthorized = (error: unknown) => !!error && typeof error === 'object' &&
 export function createResourceStore(env: ResourceEnvironment) {
   const entries = new Map<string, Entry>();
   let unlisten: (() => void) | null = null;
-  const readable = () => !env.hidden() && env.online();
+  const background = (entry: Entry) => {
+    for (const subscriber of entry.subscribers) if (subscriber.background) return true;
+    return false;
+  };
+  const readable = (entry: Entry) => env.online() && (!env.hidden() || background(entry));
   const interval = (entry: Entry) => {
     let min: number | null = null;
     for (const subscriber of entry.subscribers) if (subscriber.intervalMs !== null) min = min === null ? subscriber.intervalMs : Math.min(min, subscriber.intervalMs);
@@ -78,14 +83,14 @@ export function createResourceStore(env: ResourceEnvironment) {
   const schedule = (key: string, entry: Entry) => {
     env.clearTimer(entry.timer); entry.timer = undefined;
     const ms = interval(entry);
-    if (ms === null || entry.stopped || entry.request || !readable()) return;
+    if (ms === null || entry.stopped || entry.request || !readable(entry)) return;
     const wait = entry.lastAttemptAt === null ? 0 : Math.max(0, entry.lastAttemptAt + ms - env.now());
     entry.timer = env.setTimer(() => { entry.timer = undefined; void start(key, entry); }, wait);
   };
   const start = (key: string, entry: Entry): Promise<void> => {
     if (entries.get(key) !== entry) return Promise.resolve();
     // 不可读时记下这次显式要求的重读（如写入后的 refresh），恢复后补读，不能被吞掉。
-    if (!readable()) { entry.stopped = false; entry.interrupted = true; suspend(entry); return Promise.resolve(); }
+    if (!readable(entry)) { entry.stopped = false; entry.interrupted = true; suspend(entry); return Promise.resolve(); }
     cancel(entry);
     entry.stopped = false; entry.interrupted = false;
     const version = entry.generation;
@@ -121,20 +126,20 @@ export function createResourceStore(env: ResourceEnvironment) {
     if (entry.lastAttemptAt === null || ms !== null && env.now() - entry.lastAttemptAt >= ms) void start(key, entry);
     else schedule(key, entry);
   };
-  const wake = () => {
-    for (const [key, entry] of entries) {
-      if (!readable()) { suspend(entry); continue; }
-      const suspended = entry.snapshot.status === 'paused' || entry.snapshot.status === 'offline';
-      // 登录过期后不自动重试，恢复前台时仍显示为读取失败。
-      if (entry.stopped) { if (suspended) publish(entry, { status: 'error' }); continue; }
-      if (entry.request) continue;
-      const ms = interval(entry);
-      // 后台计时器可能被浏览器节流：恢复前台时补读已到期的资源；轮询资源暂停后一律重读。
-      if (suspended && (ms !== null || entry.interrupted) || ms !== null && (entry.lastAttemptAt === null || env.now() - entry.lastAttemptAt >= ms)) void start(key, entry);
-      else if (suspended) publish(entry, { status: entry.snapshot.error ? 'error' : 'ready' });
-      else schedule(key, entry);
-    }
+  // 可见性、网络或后台开关变化后按当前条件恢复或暂停一个条目。
+  const revive = (key: string, entry: Entry) => {
+    if (!readable(entry)) { suspend(entry); return; }
+    const suspended = entry.snapshot.status === 'paused' || entry.snapshot.status === 'offline';
+    // 登录过期后不自动重试，恢复前台时仍显示为读取失败。
+    if (entry.stopped) { if (suspended) publish(entry, { status: 'error' }); return; }
+    if (entry.request) return;
+    const ms = interval(entry);
+    // 后台计时器可能被浏览器节流：恢复前台时补读已到期的资源；轮询资源暂停后一律重读。
+    if (suspended && (ms !== null || entry.interrupted) || ms !== null && (entry.lastAttemptAt === null || env.now() - entry.lastAttemptAt >= ms)) void start(key, entry);
+    else if (suspended) publish(entry, { status: entry.snapshot.error ? 'error' : 'ready' });
+    else schedule(key, entry);
   };
+  const wake = () => { for (const [key, entry] of entries) revive(key, entry); };
 
   return {
     subscribe<T>(key: string, source: ResourceSource<T>, listener: (snapshot: ResourceSnapshot<T>) => void): Subscription {
@@ -144,15 +149,16 @@ export function createResourceStore(env: ResourceEnvironment) {
         entries.set(key, entry);
         unlisten ??= env.listen(wake);
       }
-      const subscriber: Subscriber = { intervalMs: source.intervalMs, listener: listener as Subscriber['listener'] };
+      const subscriber: Subscriber = { intervalMs: source.intervalMs, background: source.background === true, listener: listener as Subscriber['listener'] };
       entry.subscribers.add(subscriber);
       const current = entry;
-      if (!readable()) suspend(current);
+      if (!readable(current)) suspend(current);
       else catchUp(key, current);
       listener(current.snapshot as ResourceSnapshot<T>);
       const leave = () => {
         if (!current.subscribers.delete(subscriber)) return;
-        if (current.subscribers.size) { schedule(key, current); return; }
+        // 留下的订阅者都不要求后台读取时，隐藏中的条目就此暂停。
+        if (current.subscribers.size) { if (readable(current)) schedule(key, current); else suspend(current); return; }
         cancel(current); entries.delete(key);
         if (!entries.size) { unlisten?.(); unlisten = null; }
       };
@@ -160,9 +166,15 @@ export function createResourceStore(env: ResourceEnvironment) {
       const retune = (ms: number | null) => {
         if (subscriber.intervalMs === ms || !current.subscribers.has(subscriber)) return;
         subscriber.intervalMs = ms;
-        if (readable()) catchUp(key, current);
+        if (readable(current)) catchUp(key, current);
       };
-      return Object.assign(leave, { retune });
+      // 打开或关闭本订阅者的后台读取；页面隐藏时打开即按间隔补读，关闭即暂停。
+      const setBackground = (on: boolean) => {
+        if (subscriber.background === on || !current.subscribers.has(subscriber)) return;
+        subscriber.background = on;
+        revive(key, current);
+      };
+      return Object.assign(leave, { retune, setBackground });
     },
     // 立即重新读取：之前发出的读取作废，结束后恢复轮询。
     refresh(key: string): Promise<void> {

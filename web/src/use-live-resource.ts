@@ -1,4 +1,4 @@
-// 改编自 project-aggregation 工作台 src/use-live-resource.ts（提交 056e9c3）：请求层换成本服务的 api.ts。
+// 改编自 project-aggregation 工作台 src/use-live-resource.ts（提交 056e9c3）：请求层换成本服务的 api.ts；增加 background。
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from './api.ts';
 import { browserEnvironment, createResourceStore, type ResourceSnapshot, type Subscription } from './live-resource.ts';
@@ -23,6 +23,8 @@ type Options<T> = {
   read?: (signal: AbortSignal) => Promise<T>;
   // false 时不订阅，保留本组件上次看到的数据，状态为 paused。
   enabled?: boolean;
+  // true 时页面隐藏也照常轮询（离线仍暂停）；变化时只调整本订阅者，不重新订阅。
+  background?: boolean;
   onExpired: () => void;
 };
 
@@ -30,7 +32,7 @@ const initial = <T,>(enabled: boolean): ResourceSnapshot<T> => ({ data: null, er
 
 // 同一 path 的订阅者共享请求与结果，读取函数、超时与校验以第一个订阅者为准，
 // 所以共享同一 path 的页面须使用相同的 timeoutMs 与 parse。
-export function useLiveResource<T>(path: string, { intervalMs, timeoutMs = 10_000, parse, read: customRead, enabled = true, onExpired }: Options<T>): LiveResource<T> {
+export function useLiveResource<T>(path: string, { intervalMs, timeoutMs = 10_000, parse, read: customRead, enabled = true, background = false, onExpired }: Options<T>): LiveResource<T> {
   const [state, setState] = useState<{ path: string; snapshot: ResourceSnapshot<T> }>(() => ({ path, snapshot: initial<T>(enabled) }));
   const expired = useRef(onExpired);
   expired.current = onExpired;
@@ -39,6 +41,8 @@ export function useLiveResource<T>(path: string, { intervalMs, timeoutMs = 10_00
   const handled = useRef<Error | null>(null);
   const interval = useRef(intervalMs);
   interval.current = intervalMs;
+  const inBackground = useRef(background);
+  inBackground.current = background;
   const subscription = useRef<Subscription | null>(null);
   useEffect(() => {
     if (!enabled) {
@@ -50,7 +54,7 @@ export function useLiveResource<T>(path: string, { intervalMs, timeoutMs = 10_00
       const raw = await api<unknown>(path, { signal, timeoutMs });
       return parser.current ? parser.current(raw) : raw as T;
     };
-    const current = store.subscribe<T>(path, { read, intervalMs: interval.current }, snapshot => {
+    const current = store.subscribe<T>(path, { read, intervalMs: interval.current, background: inBackground.current }, snapshot => {
       if (snapshot.error instanceof ApiError && snapshot.error.status === 401 && snapshot.error !== handled.current) { handled.current = snapshot.error; expired.current(); }
       setState(current => {
         // 共享条目刚建立、还没有结果时，保留本组件上次看到的数据；状态以共享条目为准。
@@ -63,6 +67,7 @@ export function useLiveResource<T>(path: string, { intervalMs, timeoutMs = 10_00
   }, [path, enabled, timeoutMs, customRead]);
   // 间隔随页面状态变化时只调整计时，不重新订阅。
   useEffect(() => { subscription.current?.retune(intervalMs); }, [intervalMs]);
+  useEffect(() => { subscription.current?.setBackground(background); }, [background]);
   const refresh = useCallback(() => store.refresh(path), [path]);
   const commit = useCallback((data: T) => store.commit(path, data), [path]);
   return { ...(state.path === path ? state.snapshot : initial<T>(enabled)), refresh, commit };

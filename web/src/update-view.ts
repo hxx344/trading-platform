@@ -18,6 +18,8 @@ export interface UpdatePageState {
   watched: string | null;
   /** A confirm went out without an answer: blocked until a read shows what the server has. */
   uncertain?: boolean;
+  /** The service's version in the first view this page load read; null until then. */
+  loaded?: string | null;
 }
 
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -64,9 +66,21 @@ export function jobPhase(job: UpdateJob): 'running' | 'done' | 'failed' | 'inter
 export const jobLabels = { running: '正在更新', done: '更新已完成', failed: '上次更新未完成', interrupted: '上次更新已中断' } as const;
 export const stepLabels = { download: '下载并核对安装脚本', install: '下载程序包、检查配置并更新组件' } as const;
 
+/**
+ * The page reloads after the job it watched succeeds, or when the service runs another version than the one this page
+ * loaded with and no update is under way (an update started from another page or device, or a page-only switch the
+ * page never saw running). The first view sets the loaded version, so a reload cannot repeat itself.
+ */
 export function reloading(state: UpdatePageState): boolean {
-  const job = state.view?.job;
-  return !!job && job.phase === 'done' && job.id !== null && job.id === state.watched;
+  const { view } = state;
+  const job = view?.job;
+  if (job && job.phase === 'done' && job.id !== null && job.id === state.watched) return true;
+  return !!view && !!state.loaded && view.current.version !== state.loaded && !updating(view);
+}
+
+/** Reads go on while the page is hidden as long as this page follows an update, so its success reloads the page. */
+export function readsInBackground(state: UpdatePageState): boolean {
+  return state.watched !== null || updating(state.view) || state.busy === 'apply' || !!state.uncertain;
 }
 
 export function summaryOf(state: UpdatePageState): string {

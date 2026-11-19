@@ -1,7 +1,7 @@
 // The 系统更新 button's wording and when the page lets the update start (web/src/update-view.ts, docs/update.md).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { blockedReason, nextWatched, parseUpdateView, reloading, summaryOf, toneOf, updating, type UpdatePageState, type UpdateView } from '../web/src/update-view.ts';
+import { blockedReason, nextWatched, parseUpdateView, readsInBackground, reloading, summaryOf, toneOf, updating, type UpdatePageState, type UpdateView } from '../web/src/update-view.ts';
 
 const base = (over: Partial<UpdateView> = {}): UpdateView => ({
   current: { version: 'v0.49.1', commit: 'abcdef123456', packaged: true },
@@ -83,4 +83,25 @@ test('系统更新：应答形状不对按读取失败处理；结果未知、�
   assert.equal(toneOf(page(base({ jobError: 'x' }))), 'attention');
   assert.equal(toneOf(page(base(), { offline: true })), 'attention');
   assert.equal(summaryOf(page(base(), { offline: true })), '连接待恢复');
+});
+
+test('系统更新：服务换成页面载入时以外的版本且没有更新在进行时刷新页面（别处发起的更新）', () => {
+  const moved = base({ current: { version: 'v0.50.0', commit: null, packaged: true } });
+  assert.equal(reloading(page(moved, { loaded: 'v0.49.1' })), true);
+  assert.equal(summaryOf(page(moved, { loaded: 'v0.49.1' })), '更新已完成，正在刷新页面');
+  assert.equal(reloading(page(moved, { loaded: 'v0.50.0' })), false, '版本未变不刷新');
+  assert.equal(reloading(page(moved, { loaded: null })), false, '还没读到载入时的版本不刷新');
+  assert.equal(reloading(page(base({ current: moved.current, job: job('running') }), { loaded: 'v0.49.1' })), false, '更新还在进行（可能回退）时等结果');
+  assert.equal(reloading(page(base({ current: moved.current, pending: { id: 'r-1', version: 'v0.50.0', at: 1, stale: false } }), { loaded: 'v0.49.1' })), false);
+  assert.equal(reloading(page(base({ current: moved.current, job: job('running', { stale: true }) }), { loaded: 'v0.49.1' })), true, '超时的运行结果不算进行中');
+});
+
+test('系统更新：本页跟着一次更新时后台也继续读取，其余时候随页面暂停', () => {
+  assert.equal(readsInBackground(page(base())), false);
+  assert.equal(readsInBackground(page(base(), { watched: 'job-1' })), true);
+  assert.equal(readsInBackground(page(base({ job: job('running') }))), true);
+  assert.equal(readsInBackground(page(base(), { busy: 'apply' })), true);
+  assert.equal(readsInBackground(page(base(), { uncertain: true })), true);
+  assert.equal(readsInBackground(page(base(), { busy: 'check' })), false);
+  assert.equal(readsInBackground(page(null)), false);
 });

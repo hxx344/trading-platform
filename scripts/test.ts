@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const durationsFile = fileURLToPath(new URL('test-durations.json', import.meta.url));
-const patterns = ['test/*.test.ts', 'test/crossex/*.test.mjs', 'web/test/crossex/*.test.mjs', 'test/perpetual/*.test.mjs', 'test/ondo/*.test.mjs', 'web/test/perpetual/*.test.mjs'];
+const patterns = ['test/*.test.ts', 'test/crossex/*.test.mjs', 'web/test/*.test.mjs', 'web/test/crossex/*.test.mjs', 'test/perpetual/*.test.mjs', 'test/ondo/*.test.mjs', 'web/test/perpetual/*.test.mjs'];
 const files = [...new Set(patterns.flatMap(pattern => globSync(pattern, { cwd: root })))].sort();
 
 export function shardFiles(all: readonly string[], durations: Record<string, number>, index: number, total: number): string[] {

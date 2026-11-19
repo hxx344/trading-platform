@@ -690,7 +690,7 @@
 
 **回滚**：回退到 v0.68.1，面板与侧栏提示随之消失；`read-token.json` 留在数据目录不影响旧版本。
 
-## EQN 快讯与异动行情（v0.71.0）
+## EQN 快讯与异动行情（v0.72.0）
 
 **对照的工作台页面**：工作台没有快讯页面。快讯页按日志页的 `panel` + `section-head` + 筛选框拼，连接状态用运行状态页的 `.connection`（`mint` / `amber`）；异动行情页签用行情监控页已有的 `table-panel`、`section-heading`、`segmented`。
 
@@ -700,4 +700,4 @@
 
 **验证**：`scripts/dev-monitor.ts` 预览接上替身 EQN（`test/news-fake.ts`），无头浏览器 1280 与 390 宽度：两处页面、频道与币种筛选、推送到达后经 REST 核对去掉“推送”标记，无横向滚动、无 CSP 报错。
 
-**回滚**：回退到 v0.70.2，入口与页签随之消失；`config.json` 写过 `"news"` 的先删掉。
+**回滚**：回退到 v0.71.0，入口与页签随之消失；`config.json` 写过 `"news"` 的先删掉。

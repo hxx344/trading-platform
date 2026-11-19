@@ -58,9 +58,12 @@ test('开关：默认开启，切换按版本号保存并在重开后保留；�
     assert.throws(() => broken.update('oil', { enabled: true, revision: 1 }), (error: unknown) => code(503, 'control_unsaved')(error) && /disk I\/O error/.test((error as Error).message));
     assert.deepEqual(broken.view('oil'), { market: 'oil', enabled: false, revision: 1, error: null });
     store.close();
-    const reopened = createMonitorControl({ store: createMonitorStore({ file }), markets: ['oil', 'hynix'] });
-    assert.deepEqual([reopened.view('oil'), reopened.enabled('hynix')], [{ market: 'oil', enabled: false, revision: 1, error: null }, true]);
-    assert.deepEqual(reopened.update('oil', { enabled: true, revision: 1 }), { market: 'oil', enabled: true, revision: 2, error: null });
+    const reopenedStore = createMonitorStore({ file });
+    try {
+      const reopened = createMonitorControl({ store: reopenedStore, markets: ['oil', 'hynix'] });
+      assert.deepEqual([reopened.view('oil'), reopened.enabled('hynix')], [{ market: 'oil', enabled: false, revision: 1, error: null }, true]);
+      assert.deepEqual(reopened.update('oil', { enabled: true, revision: 1 }), { market: 'oil', enabled: true, revision: 2, error: null });
+    } finally { reopenedStore.close(); }
   } finally { try { store.close(); } catch { /* closed above */ } dispose(); }
 });
 

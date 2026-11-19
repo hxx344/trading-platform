@@ -1,6 +1,6 @@
 // Copied from project_aggregation modules/asset/lib/fx.ts at 0014655.
 // Changes: imports point at ./http.ts and ../types.ts. Logic, sources and messages are unchanged.
-import { finite, readJson } from './http.ts';
+import { finite, readDatedJson } from './http.ts';
 import type { FxStatus } from '../types.ts';
 
 type FxQuote = { rate: number; status: FxStatus };
@@ -11,18 +11,17 @@ function validRate(value: unknown) {
 }
 
 export async function yuanQuote(fetcher: typeof fetch = fetch, now = Date.now()): Promise<FxQuote> {
-  const fetchedAt = new Date(now).toISOString();
   try {
-    const data = await readJson('https://api.coinbase.com/v2/exchange-rates?currency=USD', { cache: 'no-store' }, fetcher);
+    const { data, receivedAt } = await readDatedJson('https://api.coinbase.com/v2/exchange-rates?currency=USD', { cache: 'no-store' }, fetcher, now);
     if (data.data?.currency !== 'USD') throw new Error('汇率基础币种错误');
-    return { rate: validRate(data.data?.rates?.CNY), status: { source: 'Coinbase', fetchedAt, rateDate: null, error: null } };
+    return { rate: validRate(data.data?.rates?.CNY), status: { source: 'Coinbase', fetchedAt: new Date(receivedAt).toISOString(), rateDate: null, error: null } };
   } catch {
     try {
-      const data = await readJson('https://api.frankfurter.dev/v2/rate/USD/CNY?providers=ecb', { cache: 'no-store' }, fetcher);
+      const { data, receivedAt } = await readDatedJson('https://api.frankfurter.dev/v2/rate/USD/CNY?providers=ecb', { cache: 'no-store' }, fetcher, now);
       if (data.base !== 'USD' || data.quote !== 'CNY' || typeof data.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(data.date)) throw new Error('汇率币种或日期错误');
       const date = new Date(data.date + 'T00:00:00Z');
       if (!Number.isFinite(date.getTime()) || date.toISOString().slice(0, 10) !== data.date || date.getTime() > now || now - date.getTime() > 7 * 86400000) throw new Error('参考汇率日期无效或过期');
-      return { rate: validRate(data.rate), status: { source: 'Frankfurter', fetchedAt, rateDate: data.date, error: null } };
+      return { rate: validRate(data.rate), status: { source: 'Frankfurter', fetchedAt: new Date(receivedAt).toISOString(), rateDate: data.date, error: null } };
     } catch { throw new Error('人民币汇率更新失败，保留上次汇率'); }
   }
 }

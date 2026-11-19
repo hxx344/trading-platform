@@ -130,6 +130,30 @@ test('Asset catalog includes every positions exchange before setup and never exp
   }
 });
 
+test('资产库无法写入时两个只读入口仍共用五秒内的持仓，写锁失败只试一次', async t => {
+  const f = fixture(); t.after(() => f.database.close());
+  await f.save('owner', 'okx', { exchange: 'okx', apiKey: 'fixture', apiSecret: 'fixture', passphrase: 'fixture' });
+  const prepare = f.database.prepare; let writes = 0, extraReads = 0, clock = at;
+  f.database.prepare = sql => {
+    if (sql.startsWith('INSERT INTO asset_position_snapshots')) { writes++; throw new Error('SQLite busy'); }
+    return prepare(sql);
+  };
+  const db = () => f.database;
+  const positions = createPositionsService({ now: () => clock, read: async () => sample });
+  const fills = createFillsService({ now: () => clock, permission: async () => {}, read: async () => { extraReads++; return []; }, fills: async () => [] });
+  try {
+    await positions.read(db, f.unseal); await positions.idle();
+    assert.equal(writes, 1);
+    await fills.read(db, f.unseal, 'oil'); await fills.idle();
+    assert.equal(extraReads, 0);
+    const swap = (await fills.read(db, f.unseal, 'oil')).exchanges.find(e => e.id === 'okx')!.accounts[0].scopes.find(item => item.id === 'SWAP')!;
+    assert.equal(swap.status, 'live'); assert.equal(swap.fetchedAt, new Date(at).toISOString());
+    clock += 5_000;
+    await fills.read(db, f.unseal, 'hynix'); await fills.idle();
+    assert.equal(extraReads, 1); assert.equal(writes, 2);
+  } finally { positions.close(); fills.close(); }
+});
+
 test('Hyperliquid cache preserves an observation when the venue repeats or rolls back its time', async t => {
   const f = fixture(); t.after(() => f.database.close());
   await f.save('owner', 'hyperliquid', { exchange: 'hyperliquid', walletAddress: '0x00000000000000000000000000000000000000ab' });

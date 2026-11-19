@@ -18,7 +18,7 @@ export async function bybitGet(c: BybitCredential, path: string, query: string, 
   if (data.retCode !== 0) throw new Error(`Bybit 读取失败（${Number(data.retCode) || '未知代码'}），请检查权限、IP 白名单及地区`);
   return data.result;
 }
-export async function syncBybit(c: BybitCredential, prices: Record<string,Quote>, fetcher: Fetcher = fetch): Promise<{total:number;details:Balance[]}> {
+export async function syncBybit(c: BybitCredential, prices: Record<string,Quote>, fetcher: Fetcher = fetch): Promise<{total:number;details:Balance[];updatedAt:string}> {
   const info = await bybitGet(c, '/v5/user/query-api', '', fetcher);
   if (!bybitReadOnly(info.readOnly)) throw new PositionsPermissionError('此 Bybit API 不是只读密钥，请重新创建只读 API');
   const [wallet, funding] = await Promise.all([
@@ -28,16 +28,18 @@ export async function syncBybit(c: BybitCredential, prices: Record<string,Quote>
   const unified = wallet.list?.find((x: Json)=>x.accountType==='UNIFIED');
   if (!unified || !Array.isArray(unified.coin) || !Array.isArray(funding.balance)) throw new Error('Bybit 返回的账户数据不完整');
   const totalUnified = finite(unified.totalEquity, 'Bybit 统一账户权益');
+  let valuedAt = Date.now();
+  const usedAt = (at: number) => { valuedAt = Math.min(valuedAt, at); };
   const details: Balance[] = unified.coin.map((c: Json)=>{
     const quantity=finite(c.equity,'币种权益'), value=finite(c.usdValue,'美元权益');
     return {coin:String(c.coin),account:'统一账户（净权益）',quantity,value,price:quantity===0?0:value/quantity};
   });
   const funds = await Promise.all(funding.balance.map(async (coin:Json)=>{
     const quantity = finite(coin.walletBalance,'资金账户余额');
-    const price = quantity===0 ? 0 : await usdPrice(String(coin.coin),prices,fetcher);
+    const price = quantity===0 ? 0 : await usdPrice(String(coin.coin),prices,fetcher,usedAt);
     return {coin:String(coin.coin),account:'资金账户',quantity,price,value:quantity*price};
   }));
-  return {total:totalUnified+funds.reduce((s:number,a:Balance)=>s+a.value,0),details:[...details,...funds].filter(a=>a.quantity!==0||a.value!==0)};
+  return {total:totalUnified+funds.reduce((s:number,a:Balance)=>s+a.value,0),details:[...details,...funds].filter(a=>a.quantity!==0||a.value!==0),updatedAt:new Date(valuedAt).toISOString()};
 }
 export type BinanceCredential = { apiKey: string; apiSecret: string };
 const BINANCE_READ_PATHS = new Set(['/sapi/v1/account/apiRestrictions', '/sapi/v1/asset/wallet/balance']);
@@ -63,7 +65,7 @@ export async function binanceGet(c: BinanceCredential, path: string, fetcher: Fe
   }
   return data;
 }
-export async function syncBinance(c: BinanceCredential, prices: Record<string, Quote>, fetcher: Fetcher = fetch): Promise<{total:number;details:Balance[]}> {
+export async function syncBinance(c: BinanceCredential, prices: Record<string, Quote>, fetcher: Fetcher = fetch): Promise<{total:number;details:Balance[];updatedAt?:string}> {
   const quote = prices.USDT;
   const quoteAt = typeof quote?.at === 'string' ? Date.parse(quote.at) : NaN;
   if (typeof quote?.price !== 'number' || !Number.isFinite(quote.price) || quote.price <= 0 || !Number.isFinite(quoteAt) || Date.now() - quoteAt > 900000 || quoteAt - Date.now() > 60000) throw new Error('USDT 美元行情无效或已过期；已保留上次数据');
@@ -93,5 +95,5 @@ export async function syncBinance(c: BinanceCredential, prices: Record<string, Q
     // This endpoint is the sole balance source: do not add spot, futures or P&L again.
     details.push({ coin: 'USDT', account: name + '（折合 USDT）', quantity: quantity === 0 ? 0 : quantity, price: quote.price, value: value === 0 ? 0 : value });
   }
-  return { total, details };
+  return { total, details, ...(details.some(row => row.quantity !== 0) ? { updatedAt: new Date(Math.min(Date.now(), quoteAt)).toISOString() } : {}) };
 }

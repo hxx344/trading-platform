@@ -3,12 +3,13 @@
 // selectRange and dailyPoints from lib/market.ts (8470785), ranges from lib/chart-ranges.ts (8470785), sampleChartPoints
 // from lib/chart-sampling.ts (7581e78, unchanged).
 import { ANTHROPIC_CANDLE_MS, ANTHROPIC_LEGS, anthropicChartRows, validateAnthropicCandles, validateAnthropicQuote, type AnthropicChartRow, type AnthropicComparisonLeg, type AnthropicShares } from '../../src/vendor/anthropic-market.mjs';
+import { quoteStatus } from './monitor-display.ts';
 
 export type Point = AnthropicChartRow;
 type Snapshot = ReturnType<typeof validateAnthropicCandles>;
 export type AnthropicRow = Snapshot['data'][number];
 type Coverage = Pick<Snapshot['metadata'], 'firstObservation' | 'lastObservation' | 'rows'>;
-export type AnthropicQuote = ReturnType<typeof validateAnthropicQuote> & { status: 'live' | 'snapshot' };
+export type AnthropicQuote = ReturnType<typeof validateAnthropicQuote> & ReturnType<typeof quoteStatus>;
 /** A windowed read keeps only its last `windowDays` days in `rows`; `coverage` is always the complete history's range. */
 export type AnthropicHistory = { rows: AnthropicRow[]; status: 'live' | 'snapshot'; fetchedAt: string; windowDays: number | null; coverage: Coverage; errors: Snapshot['metadata']['errors'] };
 
@@ -22,7 +23,7 @@ const ANTHROPIC_BARS_PER_DAY = 86_400_000 / ANTHROPIC_CANDLE_MS;
 /** The quote as the service sends it: the venues' marks, and whether the service still counts them as current. */
 export function anthropicQuote(input: unknown): AnthropicQuote {
   const quote = validateAnthropicQuote(input);
-  return { ...quote, status: (input as { status?: unknown }).status === 'live' ? 'live' : 'snapshot' };
+  return { ...quote, ...quoteStatus(input) };
 }
 
 export function anthropicHistory(input: unknown): AnthropicHistory {

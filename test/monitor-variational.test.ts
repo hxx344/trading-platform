@@ -17,6 +17,7 @@ import {
   parseVariationalFunding, parseVariationalMark, parseVariationalOilQuote, readVariationalAuthenticatedMarks, requestVariational, variationalTokenExpiry,
 } from '../src/vendor/variational-market.mjs';
 import { createExchangeReader } from '../src/monitor/exchanges.ts';
+import { createMonitorStore } from '../src/monitor/store.ts';
 import { VARIATIONAL_SESSION_FILE, createVariationalSession, type VariationalSession } from '../src/monitor/variational-session.ts';
 import { VARIATIONAL_HELPER, createVariationalFetch, type SpawnImpl } from '../src/monitor/variational-transport.ts';
 import { parseServiceConfig } from '../src/service/config.ts';
@@ -178,12 +179,14 @@ test('读取器：认证读取途中 token 被换掉时丢弃旧结果重读，�
     if (carried.includes(tokens[0]!)) { revision = 2; return new Response('{}', { status: 401, headers: { 'x-omni-auth': 'r' } }); }
     return venues.variationalFetch(url, init);
   };
-  const reader = createExchangeReader({ gate: createBinanceGate(), now: () => T0, log: () => undefined, fetchImpl: venues.fetch, oilQuote: () => null, hynixQuote: () => null, variationalSession: session, variationalFetch: fetcher });
+  const store = createMonitorStore({ file: ':memory:', now: () => T0 });
+  const reader = createExchangeReader({ gate: createBinanceGate(), quoteStore: store, now: () => T0, log: () => undefined, fetchImpl: venues.fetch, oilQuote: () => null, hynixQuote: () => null, variationalSession: session, variationalFetch: fetcher });
   try {
     const quote = await reader.quote('oil', 'variational');
     assert.equal(quote.timestampBasis, 'source', '用新 token 的认证价格');
     assert.deepEqual(reports, [[2, 'ready']]);
-  } finally { reader.stop(); }
+    assert.equal(store.readState('comparison.v1.oil.variational'), null);
+  } finally { reader.stop(); store.close(); }
 });
 
 test('token 文件：保存前先经 /me 确认，写成 600；版本冲突 409、过期 400、3 秒内重复 429、/me 被拒或被拦截时原配置不变', async () => {

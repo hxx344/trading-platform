@@ -8,6 +8,7 @@ import { supportsFundingHistory } from '../../src/vendor/exchange-funding-histor
 import { FundingHistoryPanel, utc, type FundingHistorySelection } from './MonitorFundingHistory.tsx';
 import { VariationalSessionForm } from './MonitorVariationalSession.tsx';
 import { useLiveResource } from './use-live-resource.ts';
+import { displayExchangeQuote, exchangeQuoteRetention } from './monitor-display.ts';
 import type { VenueSpreads } from './monitor-related.ts';
 
 // The multi-exchange comparison under the oil and Hynix charts, laid out as the workbench's modules/monitor/app/
@@ -17,7 +18,7 @@ import type { VenueSpreads } from './monitor-related.ts';
 // (MonitorFundingHistory.tsx, M-2d-3), except Variational's (M-3d-1), which has no settlement record to check: its row reads
 // like the others and carries the workbench's 更新 Var token form (MonitorVariationalSession.tsx) on the row below it.
 const READ_TIMEOUT_MS = 20_000;
-type RowState = { quote: ExchangeQuote | null; error: string };
+type RowState = { quote: ExchangeQuote | null; error: string; previous: boolean };
 
 const signed = (value: number | null | undefined, digits = 2, suffix = '') => { if (value == null) return '—'; const rounded = Number(value.toFixed(digits)); return `${rounded > 0 ? '+' : rounded < 0 ? '−' : ''}${Math.abs(rounded).toFixed(digits)}${suffix}`; };
 const tone = (value: number | null | undefined) => value == null || value === 0 ? '' : value > 0 ? 'positive' : 'negative';
@@ -60,7 +61,7 @@ export function ExchangeComparison({ market, onExpired, onSpreads }: { market: S
     const quote = states[exchange]?.quote ?? null;
     let metrics: ReturnType<typeof calculateExchangeSpread> | null = null;
     try { metrics = quote ? calculateExchangeSpread(quote) : null; } catch { metrics = null; }
-    return [exchange, (oil ? metrics?.spread : metrics?.premium) ?? null, Boolean(quote && (states[exchange]?.error || externalQuoteStale(quote, now)))];
+    return [exchange, (oil ? metrics?.spread : metrics?.premium) ?? null, Boolean(quote && (states[exchange]?.previous || states[exchange]?.error || externalQuoteStale(quote, now)))];
   }));
   useEffect(() => {
     if (!onSpreads) return;
@@ -69,7 +70,7 @@ export function ExchangeComparison({ market, onExpired, onSpreads }: { market: S
   }, [onSpreads, spreadKey]);
   const rightHeading = oil ? 'WTI' : '正股 ÷ 10';
   return <div className="hub-exchange-comparison"><section className="exchange-comparison" aria-label={`${oil ? '原油' : '海力士'}交易所实时对比`} data-exchange-market={market}>
-    <div className="exchange-heading"><div><h2>交易所实时对比</h2><p>{oil ? '布伦特 − WTI · 资金费按等桶数' : 'ADR − 正股 ÷ 10 · 10 份 ADR 对 1 股正股'}</p></div><div><span>各平台每 15 秒更新 · 结果 5 秒内共用</span><button type="button" className="refresh-button" onClick={refresh} disabled={refreshing} aria-label={`刷新${oil ? '原油' : '海力士'}交易所报价`}><RefreshCw size={14} className={refreshing ? 'spinning' : ''} aria-hidden="true" />{refreshing ? '更新中' : '刷新'}</button></div></div>
+    <div className="exchange-heading"><div><h2>交易所实时对比</h2><p>{oil ? '布伦特 − WTI · 资金费按等桶数' : 'ADR − 正股 ÷ 10 · 10 份 ADR 对 1 股正股'}</p></div><div><span>各平台每 15 秒更新</span><button type="button" className="refresh-button" onClick={refresh} disabled={refreshing} aria-label={`刷新${oil ? '原油' : '海力士'}交易所报价`}><RefreshCw size={14} className={refreshing ? 'spinning' : ''} aria-hidden="true" />{refreshing ? '更新中' : '刷新'}</button></div></div>
     <table className="exchange-table">
       <thead><tr><th>交易所 / 报价口径</th><th>{contracts.leftLabel} / {rightHeading}</th><th>{oil ? '价差 (USDT/桶)' : '价差'}</th>{!oil && <th>ADR 溢价率</th>}<th>做空价差年化</th><th>做多价差年化</th></tr></thead>
       <tbody>{exchanges.filter(exchange => supportsExchange(market, exchange)).map(exchange => <ExchangeRow key={exchange} market={market} exchange={exchange} now={now} onExpired={onExpired} onReport={report} onRegister={register} history={historySelection?.exchange === exchange ? historySelection.direction : null} historyId={historyId} onHistory={selectHistory} />)}</tbody>
@@ -99,16 +100,17 @@ function ExchangeRow({ market, exchange, now, onExpired, onReport, onRegister, h
   onHistory: (exchange: Exchange, direction: FundingHistorySelection['direction'], trigger: HTMLButtonElement) => void;
 }) {
   const parse = useCallback((raw: unknown) => validateExchangeQuote(raw, exchange, market), [exchange, market]);
-  const live = useLiveResource<ExchangeQuote>(`/api/monitor/${market}/exchanges/${exchange}`, { intervalMs: EXCHANGE_REFRESH_MS, timeoutMs: READ_TIMEOUT_MS, parse, onExpired });
-  const quote = live.data, error = readable(live.error, live.data !== null);
+  const live = useLiveResource<ExchangeQuote>(`/api/monitor/${market}/exchanges/${exchange}`, { intervalMs: EXCHANGE_REFRESH_MS, timeoutMs: READ_TIMEOUT_MS, parse, retain: exchange === 'variational' ? undefined : exchangeQuoteRetention, onExpired });
+  const quote = displayExchangeQuote(live), error = readable(live.error, quote !== null);
+  const previous = !!live.cached || live.status !== 'ready';
   const { refresh } = live;
   useEffect(() => { onRegister(exchange, refresh); return () => onRegister(exchange, null); }, [exchange, refresh, onRegister]);
-  useEffect(() => { onReport(exchange, { quote, error }); }, [exchange, quote, error, onReport]);
+  useEffect(() => { onReport(exchange, { quote, error, previous }); }, [exchange, quote, error, previous, onReport]);
   const definition = exchangeDefinition(exchange, market), contracts = EXCHANGE_CONTRACTS[market], oil = market === 'oil';
   let metrics: ReturnType<typeof calculateExchangeSpread> | null = null;
   try { metrics = quote ? calculateExchangeSpread(quote) : null; } catch { metrics = null; }
-  const stale = Boolean(quote && (error || externalQuoteStale(quote, now)));
-  const status = !quote ? error ? '暂不可用' : '等待首次采集' : stale ? '保留数据 · 待更新' : quote.fundingError ? '价格已更新 · 资金费缺失' : '已更新';
+  const stale = Boolean(quote && (previous || error || externalQuoteStale(quote, now)));
+  const status = !quote ? error ? '暂不可用' : '等待首次采集' : live.cached ? '上次报价' : stale ? '保留数据 · 待更新' : quote.fundingError ? '价格已更新 · 资金费缺失' : '已更新';
   const pairLabel = `${contracts.leftLabel} / ${oil ? 'WTI' : '正股 ÷ 10'}`;
   // Variational: the token form opens on the row below; its annualized figures are plain text (no settlement history).
   const hasSession = oil && exchange === 'variational', settled = supportsFundingHistory(market, exchange);

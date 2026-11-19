@@ -21,6 +21,7 @@ import { readFills } from '../src/asset/fills-readers.ts';
 import { FILLS_PERMISSION } from '../src/asset/fills-types.ts';
 import type { FxStatus } from '../src/asset/types.ts';
 import { position } from '../src/asset/positions-values.ts';
+import { verifyAssetPermission } from '../src/asset/positions-readers.ts';
 import type { PositionsCapture } from '../src/asset/daily-positions.ts';
 import type { HubPositions, Position, PositionCycle } from '../src/asset/positions-types.ts';
 import type { HubFills, ReadFill } from '../src/asset/fills-types.ts';
@@ -70,6 +71,8 @@ function world(t: TestContext, options: Omit<AssetStoreOptions, 'now'> = {}, { i
   const read = <T>(run: (database: AssetDb) => T): T => { const database = openAssetDb(file, { readOnly: true }); try { return run(database); } finally { database.close(); } };
   const fillRows = () => read(database => database.prepare('SELECT account, scope FROM fill_cache ORDER BY scope').rows<{ account: string; scope: string }>());
   const historyCount = () => read(database => database.prepare('SELECT COUNT(*) AS count FROM asset_history_windows').get<{ count: number }>()!.count);
+  const positionRows = () => read(database => database.prepare('SELECT scope,started_at,completed_at FROM asset_position_snapshots ORDER BY scope')
+    .rows<{ scope: string; started_at: number; completed_at: number }>());
   const seedHistory = () => {
     const db = openAssetDb(file, { mode: 'service' });
     try { db.prepare("INSERT INTO asset_history_windows VALUES('binance','old','pm-um','CLUSDT','trades',1,2,'[]')").run(); }
@@ -77,9 +80,93 @@ function world(t: TestContext, options: Omit<AssetStoreOptions, 'now'> = {}, { i
   };
   const latestDaily = () => read(database => JSON.parse(database.prepare("SELECT data FROM snapshots WHERE date GLOB '[0-9]*' ORDER BY date DESC LIMIT 1").get<{ data: string }>()!.data) as Record<string, unknown>);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  return { root, file, dataDir, from, store, clock, urls, fillRows, historyCount, seedHistory, latestDaily };
+  return { root, file, dataDir, from, store, clock, urls, fillRows, historyCount, positionRows, seedHistory, latestDaily };
 }
 async function idle(store: AssetStore, rounds = 20) { for (let i = 0; i < rounds; i++) await settle(); void store; }
+
+const okx = { exchange: 'okx', apiKey: 'okx-fixture', apiSecret: 'secret-fixture', passphrase: 'phrase-fixture' };
+const okxSources = { ...sources, syncOkx: async () => ({ total: 10, details: [], updatedAt: new Date(NOW).toISOString() }) };
+
+test('持仓和两个成交市场共享一次 SWAP 读取，入出场与覆盖区间使用原查询起止时间', async t => {
+  const started = deferred(), release = deferred(), ends = new Map<string, number>();
+  const calls: string[] = [];
+  const w = world(t, { sources: okxSources, positions: { cycle: null, read: async (_c, scope) => {
+    calls.push(scope);
+    if (scope !== 'SWAP') return [];
+    started.resolve(); await release.promise;
+    return ['CL', 'SKHY'].map(base => position(base + '-USDT-SWAP', 'long', '1', '张'));
+  } }, fills: { read: async () => { calls.push('duplicate'); return []; }, fills: async (_c, _scope, request) => {
+    ends.set(request.market, request.end);
+    const base = request.market === 'oil' ? 'CL' : 'SKHY';
+    return [{ ...oilFill(base, NOW - 59_500), base, symbol: base + '-USDT-SWAP', quantityUnit: '张' }];
+  } } });
+  await w.store.connect(okx);
+  try {
+    await w.store.positions(); await started.promise;
+    await w.store.fills('oil'); await idle(w.store);
+    assert.equal(ends.size, 0);
+    w.clock.at += 1_000; release.resolve(); await idle(w.store);
+    assert.equal(ends.get('oil'), NOW + 1_000);
+    w.clock.at = NOW + 4_000;
+    await w.store.fills('hynix'); await idle(w.store);
+    const later = fillScope(await w.store.fills('hynix'), 'okx', 'SWAP');
+    assert.equal(ends.get('hynix'), NOW + 1_000);
+    assert.equal(later.fetchedAt, new Date(NOW + 1_000).toISOString());
+    assert.equal(later.fills[0].positionBefore, null, '该成交与原持仓查询相隔不到 60 秒');
+    assert.deepEqual(calls.sort(), ['FUTURES', 'SWAP']);
+    const stored = w.positionRows().find(row => row.scope === 'SWAP')!;
+    assert.deepEqual([stored.started_at, stored.completed_at], [NOW, NOW + 1_000]);
+    w.clock.at = NOW + 5_100;
+    await w.store.positions(); await idle(w.store);
+    assert.equal(calls.filter(scope => scope === 'SWAP').length, 2);
+  } finally { release.resolve(); }
+});
+
+test('重开账本先核验只读权限，旧快照标为过期，拒权后的在途读取不能把持仓写回', async t => {
+  const sample = [position('CL-USDT-SWAP', 'long', '3', '张')];
+  const w = world(t, { sources: okxSources, positions: { read: async (_c, scope) => scope === 'SWAP' ? sample : [] } });
+  await w.store.connect(okx); await w.store.positions(); await idle(w.store); w.store.close();
+  w.clock.at += 1_000;
+  let checks = 0, redundant = 0;
+  const fresh = createAssetStore(w.file, { now: () => w.clock.at, fetch: async input => {
+    assert.equal(new URL(String(input)).pathname, '/api/v5/account/config'); checks++;
+    return Response.json({ code: '0', data: [{ perm: 'read_only' }] });
+  }, positions: { read: async () => { redundant++; return []; } } });
+  try {
+    const initial = scopeOf(await fresh.positions(), 'okx', 'SWAP');
+    assert.equal(initial.status, 'loading'); assert.deepEqual(initial.positions, []);
+    await idle(fresh);
+    const verified = scopeOf(await fresh.positions(), 'okx', 'SWAP');
+    assert.equal(verified.status, 'live'); assert.equal(verified.positions[0].quantity, '3');
+    assert.equal(verified.fetchedAt, new Date(NOW).toISOString()); assert.equal(checks, 1); assert.equal(redundant, 0);
+  } finally { fresh.close(); }
+  w.clock.at = NOW + 90_000;
+  const probe = deferred(), confirm = deferred(), reading = deferred(), finish = deferred();
+  let allow = true, calls = 0, cycles = 0;
+  const reopened = createAssetStore(w.file, { now: () => w.clock.at, fetch: async input => {
+    assert.equal(new URL(String(input)).pathname, '/api/v5/account/config');
+    probe.resolve(); await confirm.promise;
+    return Response.json({ code: '0', data: [{ perm: allow ? 'read_only' : 'trade,read_only' }] });
+  }, positions: { permission: verifyAssetPermission, read: async (_c, scope) => {
+    calls++;
+    if (scope !== 'SWAP') return [];
+    reading.resolve(); await finish.promise; return sample;
+  }, cycle: async () => { cycles++; throw new Error('revoked'); } } });
+  const view = async () => scopeOf(await reopened.positions(), 'okx', 'SWAP');
+  try {
+    assert.deepEqual((await view()).positions, []); await probe.promise;
+    assert.equal((await view()).fetchedAt, null); assert.equal(calls, 0);
+    confirm.resolve(); await reading.promise;
+    const stale = await view();
+    assert.equal(stale.status, 'stale'); assert.equal(stale.refreshing, true);
+    assert.equal(stale.positions[0].quantity, '3'); assert.equal(stale.fetchedAt, new Date(NOW).toISOString()); assert.equal(cycles, 0);
+    allow = false; await reopened.fills('oil'); await idle(reopened);
+    assert.equal(fillScope(await reopened.fills('oil'), 'okx', 'SWAP').error, FILLS_PERMISSION);
+    assert.deepEqual((await view()).positions, []); assert.deepEqual(w.positionRows(), []);
+    finish.resolve(); await idle(reopened);
+    assert.deepEqual(w.positionRows(), []); assert.equal(cycles, 0);
+  } finally { confirm.resolve(); finish.resolve(); reopened.close(); }
+});
 
 test('余额同步的只读拒绝立即关闭已保存账户的历史，候选密钥试连失败保留原账户', async t => {
   let denied = false, hold = false, signal: AbortSignal | undefined;
@@ -288,6 +375,7 @@ test('成交：读取写入 fill_cache；换密钥后旧成交作废，断开连
   w.seedHistory();
   await w.store.connect({ exchange: 'binance', apiKey: 'binance-key-N3W1', apiSecret: 'binance-secret-0002' });
   assert.equal(w.historyCount(), 0);
+  assert.deepEqual(w.positionRows(), []);
   const replaced = fillScope(await w.store.fills('oil'), 'binance', 'pm-um');
   assert.equal(replaced.status, 'loading'); assert.deepEqual(replaced.fills, []);
   await idle(w.store, 40);
@@ -302,14 +390,16 @@ test('成交：读取写入 fill_cache；换密钥后旧成交作废，断开连
 test('A-5 之前导入的库没有 fill_cache：服务打开时补表，成交照常读取；重新导入时清空', async t => {
   const w = world(t, { positions: { read: async () => [] }, fills: { read: async () => [], fills: async () => [oilFill('a', NOW - 60_000)] } });
   const raw = new DatabaseSync(w.file);
-  raw.exec('DROP TABLE fill_cache; DROP TABLE asset_history_windows'); raw.close();
+  raw.exec('DROP TABLE fill_cache; DROP TABLE asset_history_windows; DROP TABLE asset_position_snapshots'); raw.close();
   await w.store.connect({ exchange: 'binance', apiKey: KEY, apiSecret: SECRET });
   await w.store.fills('oil'); await idle(w.store, 40);
   assert.ok(w.fillRows().length > 0);
+  assert.ok(w.positionRows().length > 0);
   w.seedHistory();
   w.store.close();
   importLedger({ from: w.from, owner: OWNER, dataDir: w.dataDir, now: () => NOW });
   assert.deepEqual(w.fillRows(), []);
+  assert.deepEqual(w.positionRows(), []);
   assert.equal(w.historyCount(), 0);
   for (const name of readdirSync(w.dataDir)) chmodSync(join(w.dataDir, name), 0o644);
 });

@@ -1,3 +1,7 @@
+import { isDisplayRead, READ_CACHE } from '../../src/read-view.ts';
+import { notifyReadSessionExpired } from './read-cache-events.ts';
+import { invalidateMutationReads, invalidateReadViews, readDisplayView } from './read-view-client.ts';
+
 // Requests to this service. Every write carries the x-pa-executor header the server requires, besides the session cookie;
 // errors come back as { code, message }. ApiError carries the HTTP status; a network failure or timeout has none, so
 // callers can tell "the server answered no" from "the answer is unknown".
@@ -13,26 +17,38 @@ export class ApiError extends Error {
 // A write is a POST unless the route takes another method (CrossEx settings: PUT); either way it carries x-pa-executor.
 export async function api<T>(path: string, { body, signal, timeoutMs = 15_000, method = 'POST' }: { body?: unknown; signal?: AbortSignal; timeoutMs?: number; method?: 'POST' | 'PUT' } = {}): Promise<T> {
   const controller = new AbortController();
-  const writing = body !== undefined;
+  const verb = body === undefined ? 'GET' : method;
+  const pathname = path.split('?', 1)[0];
+  const display = isDisplayRead(verb, pathname);
+  const query = verb === 'POST' && /^\/api\/(?:monitor\/perpetual\/(?:price-history|depth|exit)|crossex\/open-capacity)$/.test(pathname);
+  const writing = verb !== 'GET' && !display && !query;
+  const payload = body === undefined ? undefined : JSON.stringify(body);
+  const key = display ? path + '\n' + verb + '\n' + (payload ?? '') : undefined;
   const timeout = () => new DOMException(writing ? '请求超时，结果未知；请刷新核对后再操作' : '数据读取超时，稍后自动重试', 'TimeoutError');
   const abort = () => controller.abort(signal?.reason);
   if (signal?.aborted) abort();
   else signal?.addEventListener('abort', abort, { once: true });
   const timer = setTimeout(() => controller.abort(timeout()), timeoutMs);
-  try {
-    let response: Response;
-    try {
-      response = await fetch(path, writing
-        ? { method, credentials: 'same-origin', signal: controller.signal, headers: { 'content-type': 'application/json', 'x-pa-executor': '1' }, body: JSON.stringify(body) }
-        : { credentials: 'same-origin', signal: controller.signal });
-    } catch (error) {
-      if (controller.signal.aborted && controller.signal.reason instanceof Error) throw controller.signal.reason;
-      throw error instanceof Error ? error : new Error(String(error));
-    }
+  async function request(known?: string): Promise<Response> {
+    const headers: Record<string, string> = {};
+    if (verb !== 'GET') { headers['content-type'] = 'application/json'; headers['x-pa-executor'] = '1'; }
+    if (known) headers[READ_CACHE] = known;
+    const response = await fetch(path, { method: verb === 'GET' ? undefined : verb, credentials: 'same-origin', signal: controller.signal, headers, body: payload });
+    if (response.ok) return response;
+    if (response.status === 401) {
+      invalidateReadViews();
+      notifyReadSessionExpired();
+    } else if (key && [403, 404, 409, 423].includes(response.status)) invalidateReadViews(key);
     const data = await response.json().catch(() => null) as { message?: unknown; code?: unknown } | null;
-    // Cut off while the body was arriving: like a lost answer, the outcome is unknown.
-    if (controller.signal.aborted) throw controller.signal.reason instanceof Error ? controller.signal.reason : new Error('请求已中止');
-    if (!response.ok) throw new ApiError(typeof data?.message === 'string' && data.message ? data.message : `请求失败（HTTP ${response.status}）`, response.status, typeof data?.code === 'string' ? data.code : undefined, data);
+    controller.signal.throwIfAborted();
+    throw new ApiError(typeof data?.message === 'string' && data.message ? data.message : `请求失败（HTTP ${response.status}）`, response.status, typeof data?.code === 'string' ? data.code : undefined, data);
+  }
+  if (writing) invalidateMutationReads(pathname, false);
+  try {
+    if (key) return await readDisplayView<T>(key, request, controller.signal);
+    const response = await request();
+    const data = await response.json().catch(() => null);
+    controller.signal.throwIfAborted();
     // A write answered with success went through even if its body cannot be read; the page refreshes to show it. A read
     // without a readable body has no result: it fails without a status, like a lost answer, and the last data stays.
     if (data === null) {
@@ -40,7 +56,11 @@ export async function api<T>(path: string, { body, signal, timeoutMs = 15_000, m
       throw new Error('响应无法解析，稍后自动重试');
     }
     return data as T;
+  } catch (error) {
+    if (controller.signal.aborted && controller.signal.reason instanceof Error) throw controller.signal.reason;
+    throw error instanceof Error ? error : new Error(String(error));
   } finally {
+    if (writing) invalidateMutationReads(pathname, true);
     clearTimeout(timer);
     signal?.removeEventListener('abort', abort);
   }

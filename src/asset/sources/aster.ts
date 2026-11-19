@@ -51,19 +51,21 @@ export async function asterGet(c:AsterCredential,path:AsterReadPath,fetcher:Fetc
   if(typeof data.code==='number'&&data.code<0)throw new Error(`Aster 读取失败（${data.code}），请检查 API Pro 钱包授权和服务器时间`);
   return data;
 }
-export async function syncAster(c:AsterCredential,prices:Record<string,Quote>,fetcher:Fetcher=fetch):Promise<{total:number;details:Balance[]}>{
+export async function syncAster(c:AsterCredential,prices:Record<string,Quote>,fetcher:Fetcher=fetch):Promise<{total:number;details:Balance[];updatedAt:string}>{
   const [account,spot]=await Promise.all([asterGet(c,'/fapi/v3/accountWithJoinMargin',fetcher),c.includeSpot?asterGet(c,'/api/v3/account',fetcher):null]);
   if(!Array.isArray(account.assets)||(spot&&!Array.isArray(spot.balances)))throw new Error('Aster 账户数据不完整，本次不覆盖旧值');
+  let valuedAt = Date.now();
+  const usedAt = (at: number) => { valuedAt = Math.min(valuedAt, at); };
   const details:Balance[]=await Promise.all(account.assets.map(async(a:Json)=>{
     // marginBalance already includes unrealized P&L, including isolated positions.
     const quantity=finite(a.marginBalance,'Aster 币种净权益');
-    const price=quantity===0?0:await usdPrice(String(a.asset),prices,fetcher);
+    const price=quantity===0?0:await usdPrice(String(a.asset),prices,fetcher,usedAt);
     return {coin:String(a.asset),account:'合约净权益（含未实现盈亏）',quantity,price,value:quantity*price};
   }));
   if(spot){details.push(...await Promise.all(spot.balances.map(async(a:Json)=>{
     const quantity=finite(a.free,'现货可用余额')+finite(a.locked,'现货冻结余额');
-    const price=quantity===0?0:await usdPrice(String(a.asset),prices,fetcher);
+    const price=quantity===0?0:await usdPrice(String(a.asset),prices,fetcher,usedAt);
     return {coin:String(a.asset),account:'现货钱包',quantity,price,value:quantity*price};
   })));}
-  return {total:details.reduce((s,a)=>s+a.value,0),details:details.filter(a=>a.quantity!==0)};
+  return {total:details.reduce((s,a)=>s+a.value,0),details:details.filter(a=>a.quantity!==0),updatedAt:new Date(valuedAt).toISOString()};
 }

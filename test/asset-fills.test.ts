@@ -639,7 +639,7 @@ test('an unconfirmed key cannot open persistent fills after a failed SQLite purg
       await close(); reopen(); venue.calls.length = 0;
       let privateReads = 0; const prepare = db.prepare;
       db.prepare = sql => {
-        if (sql.includes('SELECT data FROM fill_cache') || sql.includes('SELECT start,end,data FROM asset_history_windows')) privateReads++;
+        if (sql.includes('SELECT data FROM fill_cache') || sql.includes('SELECT start,end,data FROM asset_history_windows') || sql.includes('FROM asset_position_snapshots')) privateReads++;
         return prepare(sql);
       };
       const [first] = await Promise.all([Promise.all(markets.map(report)), positions.read(database, f.unseal)]); first.forEach(cold);

@@ -52,12 +52,10 @@ import { syncVariational, type VariationalCredential } from './sources/variation
 import { yuanQuote } from './sources/fx.ts';
 
 type Prices = Record<string, Quote>;
-type Read = { total: number; details: Balance[] };
+type Read = { total: number; details: Balance[]; updatedAt?: string };
 type DatedRead = Read & { updatedAt: string };
 /** The external reads, as the workbench's lib modules export them. */
 export interface AssetSources {
-  /** Starts a sync round: public price reads asked for from here on are shared until the next round (sources/shared-reads.ts). */
-  beginRound?(): void;
   quotes(): Promise<Prices>;
   yuanQuote(now: number): Promise<{ rate: number; status: FxStatus }>;
   syncBinance(c: BinanceCredential, prices: Prices): Promise<Read>;
@@ -74,9 +72,8 @@ export interface AssetSources {
 export function liveSources(source: Fetcher = fetch, shared = sharePublicReads(source)): AssetSources {
   // One wrapper for the life of the store, the one its positions service also reads through: the Hyperliquid readers
   // key their market and token-name caches by the fetcher they are given.
-  const { fetcher, reset } = shared;
+  const { fetcher } = shared;
   return {
-    beginRound: reset,
     quotes: () => quotes(fetcher),
     yuanQuote: now => yuanQuote(fetcher, now),
     syncBinance: (c, prices) => syncBinance(c, prices, fetcher),
@@ -109,6 +106,7 @@ const upsertAsset = (database: AssetDb, asset: Asset): Run => () => { database.p
 const settingStatement = (database: AssetDb, key: string, value: unknown): Run => () => { saveSetting(database, key, value); };
 const saveConnection = (database: AssetDb, name: string, encrypted: string, at: number): Run => () => {
   database.prepare('DELETE FROM asset_history_windows WHERE account = ?').bind(name).run();
+  database.prepare('DELETE FROM asset_position_snapshots WHERE account = ?').bind(name).run();
   database.prepare('INSERT INTO connections(exchange,encrypted,updated_at) VALUES(?,?,?) ON CONFLICT(exchange) DO UPDATE SET encrypted=excluded.encrypted,updated_at=excluded.updated_at').bind(name, encrypted, iso(at)).run();
 };
 const deleteConnection = (database: AssetDb, name: string): Run => () => { database.prepare('DELETE FROM connections WHERE exchange = ?').bind(name).run(); };
@@ -176,6 +174,7 @@ export async function disconnect(ctx: SyncContext, exchange: ConnectionExchange)
     deleteConnection(database, exchange),
     () => { database.prepare('DELETE FROM fill_cache WHERE account = ?').bind(exchange).run(); },
     () => { database.prepare('DELETE FROM asset_history_windows WHERE account = ?').bind(exchange).run(); },
+    () => { database.prepare('DELETE FROM asset_position_snapshots WHERE account = ?').bind(exchange).run(); },
     settingStatement(database, exchange + '-status', { configured: false, lastSync: ledger.connections[exchange].lastSync, error: null, scope: ledger.connections[exchange].scope }),
     ...(asset ? [assetStatement(database, { ...asset, status: '已断开 · 保留旧值', error: undefined })] : []),
   ]);
@@ -219,7 +218,7 @@ export async function connectAsterAccount(ctx: SyncContext, input: AsterAccountI
   const encrypted = vault.seal(credentials, key);
   const result = await sources.syncAster(credentials, await sources.quotes());
   const at = ctx.now(), now = iso(at);
-  const account: AsterAccount = { id: input.id, name: input.name, includeSpot: input.includeSpot, walletAddress: wallet.address, configured: true, lastSync: now, updatedAt: now, error: null, scope: input.includeSpot ? 'API Pro · 合约 + 现货' : 'API Pro · 合约净权益', label: wallet.address.slice(-4), value: result.total, details: result.details };
+  const account: AsterAccount = { id: input.id, name: input.name, includeSpot: input.includeSpot, walletAddress: wallet.address, configured: true, lastSync: now, updatedAt: result.updatedAt ?? now, error: null, scope: input.includeSpot ? 'API Pro · 合约 + 现货' : 'API Pro · 合约净权益', label: wallet.address.slice(-4), value: result.total, details: result.details };
   commit(ctx, asterStatements(database, existing ? accounts.map(a => a.id === input.id ? account : a) : [...accounts, account], asset, at, { key, encrypted }));
 }
 
@@ -257,7 +256,6 @@ export async function refresh(ctx: SyncContext, refreshPositions?: () => Promise
   if (last && ctx.now() - Number(last.value) < SYNC_THROTTLE_MS) return false;
   lease.write(() => saveSetting(database, 'last-attempt', String(ctx.now())));
   const stored = database.prepare('SELECT exchange,encrypted FROM connections').rows<Stored>();
-  sources.beginRound?.();
   // A source result is written only while its credential is still the one read here; the check shares the lease transaction.
   const sourceWrite = (row: Stored, statements: Run[]) => lease.write(() => {
     if (storedConnection(database, row.exchange)?.encrypted === row.encrypted) for (const run of statements) run();
@@ -307,7 +305,7 @@ export async function refresh(ctx: SyncContext, refreshPositions?: () => Promise
       if (!prices) throw new Error(marketError);
       const c = vault.unseal(row.encrypted, row.exchange);
       const result = await (exchange === 'binance' ? sources.syncBinance(c as BinanceCredential, prices) : sources.syncBybit(c as BybitCredential, prices));
-      return { asset: { ...asset, quantity: result.total, price: 1, value: result.total, details: result.details, updatedAt: iso(ctx.now()), status: '只读同步', error: undefined } };
+      return { asset: { ...asset, quantity: result.total, price: 1, value: result.total, details: result.details, updatedAt: result.updatedAt ?? iso(ctx.now()), status: '只读同步', error: undefined } };
     }, error => message(error, '同步暂时失败'));
     const asterSync = async () => {
       if (!ledger.asterAccounts.length) return;
@@ -318,7 +316,7 @@ export async function refresh(ctx: SyncContext, refreshPositions?: () => Promise
           if (!prices) throw new Error(marketError);
           const credentials = vault.unseal(row.encrypted, row.exchange) as AsterCredential;
           const result = await sources.syncAster(credentials, prices), now = iso(ctx.now());
-          return { id: account.id, credential: row.encrypted, patch: { walletAddress: credentials.walletAddress, value: result.total, details: result.details, lastSync: now, updatedAt: now, error: null } };
+          return { id: account.id, credential: row.encrypted, patch: { walletAddress: credentials.walletAddress, value: result.total, details: result.details, lastSync: now, updatedAt: result.updatedAt ?? now, error: null } };
         } catch (error) { return { id: account.id, credential: row.encrypted, patch: { error: message(error, '同步暂时失败') } }; }
       });
       const asterRow = ledger.assets.find(a => a.mode === 'aster');

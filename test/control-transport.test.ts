@@ -101,6 +101,19 @@ test('转发保留空正文和分块 JSON，执行器仍能明确拒绝非法或
   }
 });
 
+test('控制面把展示数据版本原样交给执行器，并保留其无正文的确认', async t => {
+  const version = 'v1-' + 'a'.repeat(32) + '.3';
+  const { base } = await listener(t, (request, response) => {
+    assert.equal(request.headers['x-pa-read-cache'], version);
+    response.writeHead(204, { 'x-pa-read-version': version, 'cache-control': 'no-store' });
+    response.end();
+  });
+  const checked = await fetch(base + '/api/asset/positions', { headers: { 'x-pa-read-cache': version } });
+  assert.equal(checked.status, 204);
+  assert.equal(checked.headers.get('x-pa-read-version'), version);
+  assert.equal(await checked.text(), '');
+});
+
 for (const [method, path] of [['POST', '/api/confirm'], ['PUT', '/api/crossex/settings']] as const) {
   test(`控制面 ${method} 已落盘但缺少响应头时，页面沿用原编号核对，业务拒绝保留 HTTP 状态`, async t => {
     const arrivals: string[] = [];

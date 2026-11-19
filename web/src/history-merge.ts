@@ -16,7 +16,7 @@ export const emptyHistory = <R extends Row>(): HistoryView<R> => ({ rows: new Ma
  * in between were never read: the list restarts from the live page, so "load older" fills that stretch first.
  */
 export function mergeLive<R extends Row>(view: HistoryView<R>, page: { items: R[]; next: string | null }): HistoryView<R> {
-  if (page.next !== null && view.rows.size && !page.items.some(row => view.rows.has(row.id))) {
+  if (page.next === null || view.rows.size && !page.items.some(row => view.rows.has(row.id))) {
     return { rows: new Map(page.items.map(row => [row.id, row])), next: page.next, olderLoaded: false };
   }
   const rows = new Map(view.rows);

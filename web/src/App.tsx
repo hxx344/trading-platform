@@ -16,7 +16,8 @@ import { UpdateStatus } from './UpdateStatus.tsx';
 import { READ_TOKEN_PATH, READ_TOKEN_REFRESH_MS, navNotice, type ReadTokenView } from './read-token-form.ts';
 import { Callout, StatePanel } from './StateViews.tsx';
 import { clock } from './labels.ts';
-import { useLiveResource } from './use-live-resource.ts';
+import { invalidateMonitorDisplay, useLiveResource } from './use-live-resource.ts';
+import { readAccessDenied } from './live-resource.ts';
 import { ApiError } from './api.ts';
 import type { ServiceState } from './types.ts';
 import type { OilState } from './oil-types.ts';
@@ -59,6 +60,21 @@ export function App() {
   const oil = useLiveResource<OilState>(OIL_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: OIL_READ_TIMEOUT_MS, onExpired });
   const options = useLiveResource<OptionsState>(OPTIONS_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: OPTIONS_READ_TIMEOUT_MS, onExpired });
   const monitor = useLiveResource<MonitorState>(MONITOR_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: MONITOR_READ_TIMEOUT_MS, parse: parseMonitorState, onExpired });
+  const lastMonitor = useRef<MonitorState | null>(null);
+  useEffect(() => {
+    const previous = lastMonitor.current, next = monitor.data;
+    if (!next && !readAccessDenied(monitor.error)) return;
+    lastMonitor.current = next;
+    for (const market of ['anthropic', 'oil', 'hynix']) {
+      const control = next?.controls?.[market];
+      if (!next?.markets.includes(market) || control?.enabled === false) {
+        invalidateMonitorDisplay(market, monitor.error ?? new ApiError('行情监控已关闭或未配置', 423));
+      } else if (previous?.controls?.[market]?.enabled && previous.controls[market].revision !== control?.revision) {
+        // Another tab may have stopped and restarted this collector between two reads.
+        invalidateMonitorDisplay(market, null, true);
+      }
+    }
+  }, [monitor.data, monitor.error]);
   // The asset page reads the same path at the same pace and timeout (the shared read keeps the first subscriber's).
   const asset = useLiveResource<AssetState>(ASSET_STATE_PATH, { intervalMs: ASSET_CHECK_MS, timeoutMs: ASSET_READ_TIMEOUT_MS, onExpired });
   // The CrossEx page reads its state on its own (tab-specific paths, paused around writes); this only decides whether the entry

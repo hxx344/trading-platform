@@ -7,6 +7,7 @@ import {
 } from '../../src/vendor/exchange-funding-history.mjs';
 import { date } from './MonitorChart.tsx';
 import { useLiveResource } from './use-live-resource.ts';
+import { exchangeHistoryRetention } from './monitor-display.ts';
 
 // The settlement history under the comparison table (M-2d-3), laid out as the workbench's modules/monitor/app/
 // exchange-funding-history.tsx (7896143): opened from a row's annualized figure, it reads that exchange's 60 days of actual
@@ -36,7 +37,7 @@ export function FundingHistoryPanel({ id, market, selection, now, onClose, onExp
   const { exchange, direction } = selection;
   const parse = useCallback((raw: unknown) => validateExchangeFundingHistory(raw, exchange, market), [exchange, market]);
   const [retry, setRetry] = useState(false);
-  const live = useLiveResource<ExchangeFundingHistory>(`/api/monitor/${market}/exchanges/${exchange}/funding-history`, { intervalMs: retry ? RETRY_MS : HISTORY_REFRESH_MS, timeoutMs: READ_TIMEOUT_MS, parse, onExpired });
+  const live = useLiveResource<ExchangeFundingHistory>(`/api/monitor/${market}/exchanges/${exchange}/funding-history`, { intervalMs: retry ? RETRY_MS : HISTORY_REFRESH_MS, timeoutMs: READ_TIMEOUT_MS, parse, retain: exchangeHistoryRetention, onExpired });
   const history = live.data ?? undefined, error = readable(live.error, live.data !== null);
   useEffect(() => { setRetry(live.data === null && live.error !== null); }, [live.data, live.error]);
   const [refreshing, setRefreshing] = useState(false);
@@ -62,7 +63,7 @@ export function FundingHistoryPanel({ id, market, selection, now, onClose, onExp
   const definition = exchangeDefinition(exchange, market);
   const contracts = EXCHANGE_CONTRACTS[market];
   const loading = !history && !error;
-  const stale = Boolean(history && (history.status === 'snapshot' || fundingLegStale(history.left, now) || fundingLegStale(history.right, now) || error));
+  const stale = Boolean(history && (live.cached || live.status !== 'ready' || history.status === 'snapshot' || fundingLegStale(history.left, now) || fundingLegStale(history.right, now) || error));
   async function refresh() {
     setRefreshing(true);
     try { await live.refresh(); } finally { setRefreshing(false); }

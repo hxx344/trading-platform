@@ -4,6 +4,7 @@
 // service's validated Binance market plus whether the service still counts it as current.
 import { OIL_CANDLE_MS, validateIntradaySnapshot, validateMarket, validatedIntradayChartRows, type OilIntradayMetadata, type OilMarket } from '../../src/vendor/oil-market.mjs';
 import type { Point, SpreadChartConfig } from './monitor-history.ts';
+import { quoteStatus } from './monitor-display.ts';
 
 /** The widest oil indicator window (Bollinger bands and Z-score, M-2e). */
 export const OIL_BANDS_DAYS = 20;
@@ -12,7 +13,7 @@ export const OIL_WARMUP_DAYS = OIL_BANDS_DAYS + 1;
 const OIL_BARS_PER_DAY = 86_400_000 / OIL_CANDLE_MS;
 
 /** `lastError`: why the service's latest read failed, null when it succeeded. */
-export type OilQuote = OilMarket & { status: 'live' | 'snapshot'; lastError: string | null };
+export type OilQuote = OilMarket & ReturnType<typeof quoteStatus>;
 type Coverage = Pick<OilIntradayMetadata, 'firstCommonObservation' | 'lastCommonObservation' | 'pairedObservationRows'>;
 /**
  * Paired 15-minute closes on the shared chart shape: `adr` = Brent, `equivalent` = WTI.
@@ -24,7 +25,7 @@ const lastError = (input: unknown) => { const value = (input as { lastError?: un
 
 export function oilQuote(input: unknown): OilQuote {
   const quote = validateMarket(input);
-  return { ...quote, status: (input as { status?: unknown }).status === 'live' ? 'live' : 'snapshot', lastError: lastError(input) };
+  return { ...quote, ...quoteStatus(input) };
 }
 
 function readCoverage(input: unknown, metadata: OilIntradayMetadata): Coverage {

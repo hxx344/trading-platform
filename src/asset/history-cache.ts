@@ -101,6 +101,7 @@ export function invalidateHistory(database: Database | null, account: string, re
       if (!dispute) {
         database.prepare('DELETE FROM fill_cache WHERE account=? AND revision=?').bind(account, revision).run();
         database.prepare('DELETE FROM asset_history_windows WHERE account=? AND revision=?').bind(account, revision).run();
+        database.prepare('DELETE FROM asset_position_snapshots WHERE account=? AND revision=?').bind(account, revision).run();
         return;
       }
       database.prepare('DELETE FROM fill_cache WHERE account=? AND revision=? AND scope=?').bind(account, revision, dispute.slot).run();

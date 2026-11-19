@@ -5,6 +5,7 @@
 // COINGECKO_QUOTES) so one sync shares the answer. Pricing, the 12 s timeout, the 2 MB limit, conversion and messages are unchanged.
 import type { Balance } from '../types.ts';
 import { COINGECKO_QUOTES } from './quotes.ts';
+import { priceReceivedAt } from './shared-reads.ts';
 import { readVariationalPythonBalance } from './variational-python.ts';
 import { validateVariationalCredential, variationalDecimal as decimal, VARIATIONAL_ERRORS } from './variational-shared.ts';
 import type { VariationalCredential } from './variational-shared.ts';
@@ -27,7 +28,7 @@ function object(value: unknown): value is Json {
 }
 
 // Pricing remains in Node; these requests never receive session credentials.
-async function read(url: string, headers: Record<string, string>, fetcher: typeof fetch): Promise<Json> {
+async function read(url: string, headers: Record<string, string>, fetcher: typeof fetch): Promise<{ data: Json; at: number }> {
   try {
     const response = await fetcher(url, { method: 'GET', headers, redirect: 'manual', cache: 'no-store', signal: AbortSignal.timeout(12000) });
     const rejectResponse = async (message: string): Promise<never> => {
@@ -52,7 +53,7 @@ async function read(url: string, headers: Record<string, string>, fetcher: typeo
       throw error;
     }
     if (!object(data)) throw new Error(INVALID);
-    return data;
+    return { data, at: priceReceivedAt(response) };
   } catch (error) {
     // Whitelist our own errors; never echo raw HTTP, JSON, transport or credential content.
     if (error instanceof Error && SAFE_ERRORS.has(error.message)) throw error;
@@ -63,7 +64,7 @@ async function read(url: string, headers: Record<string, string>, fetcher: typeo
 
 async function usdcQuote(fetcher: typeof fetch): Promise<{ price: number; at: number }> {
   try {
-    const data = await read(COINGECKO, { Accept: 'application/json' }, fetcher);
+    const { data } = await read(COINGECKO, { Accept: 'application/json' }, fetcher);
     const coin = data['usd-coin'];
     if (!object(coin) || typeof coin.usd !== 'number' || !Number.isFinite(coin.usd) || coin.usd <= 0 || typeof coin.last_updated_at !== 'number') throw new Error(INVALID);
     const at = coin.last_updated_at * 1000;
@@ -71,11 +72,11 @@ async function usdcQuote(fetcher: typeof fetch): Promise<{ price: number; at: nu
     return { price: coin.usd, at };
   } catch {
     try {
-      const data = await read(COINBASE, { Accept: 'application/json' }, fetcher);
+      const { data, at } = await read(COINBASE, { Accept: 'application/json' }, fetcher);
       if (!object(data.data) || data.data.currency !== 'USDC' || !object(data.data.rates)) throw new Error(INVALID);
       const price = decimal(data.data.rates.USD);
       if (price <= 0) throw new Error(INVALID);
-      return { price, at: Date.now() };
+      return { price, at };
     } catch { throw new Error('Var USDC/USD 汇率读取失败；已保留上次数据'); }
   }
 }

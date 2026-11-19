@@ -4,6 +4,7 @@
 // the service still counts it as current; the candles are the stored hourly closes, converted here.
 import { HYNIX_CANDLE_MS, hynixChartRows, validateHynixQuote, validateHynixRows, type HynixQuote as Quote } from '../../src/vendor/hynix-market.mjs';
 import { rangeGaps, type Point, type SpreadChartConfig } from './monitor-history.ts';
+import { quoteStatus } from './monitor-display.ts';
 
 /** The widest Hynix indicator window (Bollinger bands and Z-score), as in the workbench's HYNIX_SPREAD_CHART. */
 const HYNIX_BANDS_DAYS = 20;
@@ -11,7 +12,7 @@ const HYNIX_BANDS_DAYS = 20;
 export const HYNIX_WARMUP_DAYS = HYNIX_BANDS_DAYS + 1;
 
 /** `lastError`: why the service's latest read failed, null when it succeeded. */
-export type HynixQuote = Quote & { status: 'live' | 'snapshot'; lastError: string | null };
+export type HynixQuote = Quote & ReturnType<typeof quoteStatus>;
 type Coverage = { firstObservation: string; lastObservation: string; rows: number };
 /** A windowed read keeps only its last `windowDays` days in `points`; `coverage` is always the complete history's range. */
 export type HynixHistory = { points: Point[]; status: 'live' | 'snapshot'; fetchedAt: string; windowDays: number | null; coverage: Coverage; lastError: string | null };
@@ -19,7 +20,7 @@ export type HynixHistory = { points: Point[]; status: 'live' | 'snapshot'; fetch
 const lastError = (input: unknown) => { const value = (input as { lastError?: unknown } | null)?.lastError; return typeof value === 'string' && value ? value : null; };
 
 export function hynixQuote(input: unknown): HynixQuote {
-  return { ...validateHynixQuote(input), status: (input as { status?: unknown }).status === 'live' ? 'live' : 'snapshot', lastError: lastError(input) };
+  return { ...validateHynixQuote(input), ...quoteStatus(input) };
 }
 
 /**

@@ -79,7 +79,9 @@ export function externalQuoteStale(quote, now) {
   const maxAge = quote.exchange === 'hyperliquid' ? quote.monitorId === 'oil' ? 75_000 : 25_000 : EXCHANGE_STALE_MS;
   // OKX publishes funding snapshots every 30–90s; quote freshness stays at 45s.
   const fundingMaxAge = quote.exchange === 'okx' ? 120_000 : maxAge;
-  return quote.status === 'snapshot' || now - Date.parse(quote.fetchedAt) > maxAge || (quote.fundingFetchedAt !== null && now - Date.parse(quote.fundingFetchedAt) > fundingMaxAge);
+  return quote.status === 'snapshot' || now - Date.parse(quote.fetchedAt) > maxAge
+    || (quote.fundingFetchedAt !== null && now - Date.parse(quote.fundingFetchedAt) > fundingMaxAge)
+    || [quote.left, quote.right].some(leg => leg.fundingRate !== null && leg.nextFundingAt !== null && Date.parse(leg.nextFundingAt) <= now);
 }
 
 /** Runtime boundary shared by the service and the page. Derived numbers are recomputed. */

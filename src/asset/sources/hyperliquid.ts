@@ -6,6 +6,7 @@ import type { Position } from '../positions-types.ts';
 import { decimal as positionDecimal, isZero, optionalDecimal as optionalPositionDecimal, position, record, rows, text, uniquePositions } from '../positions-values.ts';
 import { mapConcurrent } from './concurrency.ts';
 import { COINGECKO_QUOTES } from './quotes.ts';
+import { priceReceivedAt } from './shared-reads.ts';
 import { ExchangeResponseError, readJsonResponse } from '../../vendor/response.mjs';
 
 export type HyperliquidCredential = { walletAddress: string };
@@ -248,28 +249,28 @@ export async function readHyperliquidPositions(c: HyperliquidCredential, dex: st
   return { positions: uniquePositions(positions), observedAt };
 }
 
-async function quoteJson(url: string, fetcher: Fetcher, deadline: AbortSignal): Promise<Json> {
+async function quoteJson(url: string, fetcher: Fetcher, deadline: AbortSignal): Promise<{ data: Json; at: number }> {
   // Public pricing requests are separate and never carry the account address.
   const response = await fetcher(url, { method: 'GET', headers: { Accept: 'application/json' }, redirect: 'manual', cache: 'no-store', signal: AbortSignal.any([AbortSignal.timeout(TIMEOUT_MS), deadline]) });
   if (!response.ok || response.redirected) { void response.body?.cancel().catch(() => {}); fail(HYPERLIQUID_ERRORS.quote); }
   const data = await boundedJson(response, QUOTE_MAX_BYTES);
-  return object(data) ? data : fail(HYPERLIQUID_ERRORS.quote);
+  return object(data) ? { data, at: priceReceivedAt(response) } : fail(HYPERLIQUID_ERRORS.quote);
 }
 async function usdcQuote(fetcher: Fetcher, deadline: AbortSignal): Promise<{ price: number; at: number }> {
   try {
-    const coin = (await quoteJson(COINGECKO, fetcher, deadline))['usd-coin'];
+    const coin = (await quoteJson(COINGECKO, fetcher, deadline)).data['usd-coin'];
     if (!object(coin) || typeof coin.usd !== 'number' || !Number.isFinite(coin.usd) || coin.usd <= 0 || typeof coin.last_updated_at !== 'number') fail(HYPERLIQUID_ERRORS.quote);
     const at = (coin as Json).last_updated_at as number * 1000;
     if (!Number.isSafeInteger(at) || at <= 0 || Date.now() - at > QUOTE_MAX_AGE_MS || at - Date.now() > FUTURE_TOLERANCE_MS) fail(HYPERLIQUID_ERRORS.quote);
     return { price: (coin as Json).usd as number, at };
   } catch {
     try {
-      const data = await quoteJson(COINBASE, fetcher, deadline);
+      const { data, at } = await quoteJson(COINBASE, fetcher, deadline);
       if (!object(data.data) || data.data.currency !== 'USDC' || !object(data.data.rates)) fail(HYPERLIQUID_ERRORS.quote);
       const price = decimal(((data.data as Json).rates as Json).USD, HYPERLIQUID_ERRORS.quote);
       if (price <= 0) fail(HYPERLIQUID_ERRORS.quote);
       // Coinbase publishes no rate timestamp here; keep the retrieval time.
-      return { price, at: Date.now() };
+      return { price, at };
     } catch { return fail(HYPERLIQUID_ERRORS.quote); }
   }
 }

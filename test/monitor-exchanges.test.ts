@@ -8,15 +8,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import {
-  COMPARISON_EXCHANGES, LIGHTER_SOCKET, calculateExchangeSpread, readLighterOilSnapshot, supportsExchange, validateExchangeQuote, type Exchange, type SpreadMarket,
+  COMPARISON_EXCHANGES, EXCHANGE_REFRESH_MS, LIGHTER_SOCKET, calculateExchangeSpread, readLighterOilSnapshot, supportsExchange, validateExchangeQuote, type Exchange, type SpreadMarket,
 } from '../src/vendor/exchange-comparison.mjs';
 import { createBinanceGate } from '../src/vendor/anthropic-market.mjs';
 import { EXCHANGE_RESULT_TTL_MS, createExchangeReader, exchangeError } from '../src/monitor/exchanges.ts';
+import { createStoredExchangeQuotes } from '../src/monitor/exchange-quote-cache.ts';
+import { createMonitorStore } from '../src/monitor/store.ts';
+import type { VariationalSession } from '../src/monitor/variational-session.ts';
+import type { RemoteComparison } from '../src/service/remote-monitor.ts';
 import { parseServiceConfig } from '../src/service/config.ts';
 import { closeMonitor, monitorViews, openMonitor, stopMonitor } from '../src/service/monitor.ts';
 import { createExecutorServer } from '../src/http.ts';
 import { createHarness } from './harness.ts';
-import { fakeAnthropicVenues, venuePrice } from './monitor-fake.ts';
+import { fakeAnthropicVenues, fakeVariationalToken, venuePrice } from './monitor-fake.ts';
 
 const close = (actual: number, expected: number, label = '') => assert.ok(Math.abs(actual - expected) < 1e-9, `${label} ${actual} ≈ ${expected}`);
 const count = (venues: ReturnType<typeof fakeAnthropicVenues>, key: string) => venues.requests.get(key) ?? 0;
@@ -109,6 +113,191 @@ test('缓存：同一交易所 5 秒内共用一次读取、并发只发一次�
   assert.equal(count(venues, 'exchange:gate'), before + 2, '失败不缓存');
   assert.equal(logs.at(-1), '交易所对比 hynix/gate 已恢复');
   assert.equal(logs.length, 2);
+});
+
+test('服务端对比报价：页面共用刷新周期；重启先恢复原价与资金费，后台单次核实；停采不写入迟到应答', async () => {
+  let t = Date.UTC(2026, 10, 13, 9, 0, 7);
+  const now = () => t, dir = mkdtempSync(join(tmpdir(), 'tp-comparison-'));
+  const venues = fakeAnthropicVenues({ now });
+  const config = parseServiceConfig({ secretsFile: '/etc/tp/secrets.json', monitor: { hynix: {} } });
+  const open = () => openMonitor(config.monitor!, dir, { now, fetchImpl: venues.fetch, log() {} });
+  let monitor = open();
+  const quote = () => monitor.exchanges!.quote('hynix', 'gate');
+  const state = () => monitor.store.readState('comparison.v1.hynix.gate');
+  const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+  try {
+    const first = await quote(), stored = state();
+    assert.deepEqual(stored?.value, first);
+    t += EXCHANGE_REFRESH_MS - 1;
+    assert.deepEqual(await quote(), first);
+    assert.equal(count(venues, 'exchange:gate'), 2);
+    t++;
+    venues.exchangeDown.add('gate');
+    const kept = await quote();
+    assert.deepEqual(kept, { ...first, status: 'snapshot' });
+    assert.equal(count(venues, 'exchange:gate'), 4);
+    assert.deepEqual(await quote(), kept);
+    assert.equal(count(venues, 'exchange:gate'), 4, '暂时失败时第二个页面不重复请求');
+    assert.deepEqual(state(), stored);
+
+    stopMonitor(monitor); closeMonitor(monitor);
+    monitor = open();
+    t += 60_000;
+    venues.exchangeDown.clear();
+    let release!: () => void;
+    venues.hold = new Promise<void>(resolve => { release = resolve; });
+    assert.deepEqual(await Promise.all([quote(), quote()]), [kept, kept], '两个页面都无需等待冷启动的外部读取');
+    assert.equal(count(venues, 'exchange:gate'), 6, '后台双腿共一轮');
+    monitor.control.update('hynix', { enabled: false, revision: 0 });
+    release(); venues.hold = null; await tick();
+    assert.deepEqual(state(), stored, '关闭前在途的应答不能覆盖已保存行情');
+    monitor.control.update('hynix', { enabled: true, revision: 1 });
+    assert.deepEqual(await quote(), kept);
+    await tick();
+    const next = await quote();
+    assert.equal(next.status, 'live');
+    assert.equal(next.fetchedAt, new Date(t).toISOString());
+    assert.equal(count(venues, 'exchange:gate'), 8);
+    assert.deepEqual(state()?.value, next);
+  } finally { stopMonitor(monitor); closeMonitor(monitor); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('相同来源采样不重写 SQLite；同时间修订可覆盖，行情连接断开或切换时只能先读快照', async () => {
+  const { reader, now } = setup();
+  const first = await reader.quote('hynix', 'gate'); reader.stop();
+  let sample = first, t = now(), calls = 0, epoch: string | null = 'one';
+  const store = createMonitorStore({ file: ':memory:', now: () => t });
+  const cache = createStoredExchangeQuotes({ store, read: async () => { calls++; return sample; }, scope: () => 'enabled', epoch: () => epoch,
+    signal: new AbortController().signal, now: () => t, log() {} });
+  const quote = () => cache.read('hynix', 'gate');
+  const state = () => store.readState('comparison.v1.hynix.gate');
+  try {
+    await quote(); const firstWrite = state()!.updatedAt;
+    t += EXCHANGE_REFRESH_MS; await quote();
+    assert.equal(state()!.updatedAt, firstWrite);
+    const price = sample.left.price + 1;
+    sample = { ...first, left: { ...first.left, price, fundingPrice: price } };
+    t += EXCHANGE_REFRESH_MS;
+    assert.deepEqual(await quote(), sample);
+    assert.equal(state()!.updatedAt, t);
+    assert.equal(calls, 3);
+    epoch = null;
+    assert.deepEqual(await quote(), { ...sample, status: 'snapshot' });
+    assert.equal(calls, 3, '断开时不使用上一次连接的实时身份，也不等待 IPC');
+    epoch = 'two';
+    assert.equal((await quote()).status, 'snapshot');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal((await quote()).status, 'live');
+    assert.equal(calls, 4);
+    assert.equal(state()!.updatedAt, t);
+  } finally { store.close(); }
+});
+
+test('Var 公共行情可恢复；认证价格不落库，凭据失效后只能复用公开价格', async () => {
+  let t = Date.UTC(2026, 10, 13, 9, 0, 7), token: string | null = null, revision = 0;
+  const now = () => t, venues = fakeAnthropicVenues({ now });
+  const store = createMonitorStore({ file: ':memory:', now });
+  const session = { current: () => ({ token, revision, status: token ? 'ready' : 'expired' }), report() {} } as unknown as VariationalSession;
+  const reader = createExchangeReader({ gate: createBinanceGate(), quoteStore: store, now, log() {}, variationalSession: session,
+    fetchImpl: venues.fetch, variationalFetch: venues.variationalFetch, oilQuote: () => null, hynixQuote: () => null });
+  const quote = () => reader.quote('oil', 'variational');
+  try {
+    const first = await quote();
+    assert.equal(first.timestampBasis, 'received');
+    const saved = store.readState('comparison.v1.oil.variational');
+    token = fakeVariationalToken(t + 86_400_000); revision++;
+    const auth = await quote();
+    assert.equal(auth.timestampBasis, 'source');
+    assert.notEqual(auth.left.price, first.left.price);
+    assert.deepEqual(store.readState('comparison.v1.oil.variational'), saved);
+    t += 1_000;
+    const beforeExpiry = quote();
+    token = null; venues.exchangeDown.add('variational');
+    assert.deepEqual(await beforeExpiry, { ...first, status: 'snapshot' }, '过期之前订阅了认证缓存也不能在过期后交付');
+    assert.deepEqual(await quote(), { ...first, status: 'snapshot' }, '同一修订号失去认证时立即弃用认证价格');
+  } finally { reader.stop(); store.close(); }
+});
+
+test('Var 认证失败可当次恢复公开快照；换凭据时只交付新认证价，监控重开和停服作废迟到结果', async () => {
+  for (const action of ['denied', 'reenabled', 'rotated', 'rotated-failed', 'stopped'] as const) {
+    let t = Date.UTC(2026, 10, 13, 9, 0, 7), run = 0, revision = 0, token: string | null = null;
+    const now = () => t, venues = fakeAnthropicVenues({ now }), store = createMonitorStore({ file: ':memory:', now });
+    const session = { current: () => ({ token, revision, status: token ? 'ready' : 'missing' }),
+      report(seen: number, status: string) { if (seen === revision && status === 'rejected') token = null; } } as unknown as VariationalSession;
+    let entered!: () => void, release!: () => void, hold = false;
+    const publicStarted = new Promise<void>(resolve => { entered = resolve; });
+    const resume = new Promise<void>(resolve => { release = resolve; });
+    const reader = createExchangeReader({ gate: createBinanceGate(), quoteStore: store, controlRevision: () => run, now, log() {},
+      variationalSession: session, variationalFetch: venues.variationalFetch, oilQuote: () => null, hynixQuote: () => null,
+      fetchImpl: async (url, init) => {
+        if (hold) { entered(); await resume; return new Response('{}', { status: 500 }); }
+        return venues.fetch(url, init);
+      } });
+    const quote = () => reader.quote('oil', 'variational');
+    try {
+      const first = await quote();
+      t += 2_000; revision++; token = fakeVariationalToken(t + 86_400_000);
+      hold = true; venues.variationalMode = 'reject';
+      const pending = quote();
+      await publicStarted;
+      assert.equal(token, null, '同一请求内交易所明确拒绝了认证');
+      if (action === 'reenabled') run += 2;
+      if (action === 'rotated' || action === 'rotated-failed') {
+        revision++; token = fakeVariationalToken(t + 86_400_000, 'another');
+        venues.variationalMode = action === 'rotated' ? 'accept' : 'reject';
+      }
+      if (action === 'stopped') reader.stop();
+      release();
+      if (action === 'denied') assert.deepEqual(await pending, { ...first, status: 'snapshot' });
+      else if (action === 'rotated') {
+        const fresh = await pending;
+        assert.equal(fresh.timestampBasis, 'source');
+        assert.notEqual(fresh.left.price, first.left.price);
+      } else await assert.rejects(pending, action === 'reenabled' ? /监控开关已切换/ : action === 'stopped' ? /abort|中止|停止|超时/i : /HTTP 500/);
+      assert.deepEqual(store.readState('comparison.v1.oil.variational')?.value, first);
+    } finally { release(); reader.stop(); store.close(); }
+  }
+});
+
+test('Var 认证价格可继续显示；等待交付期间跨结算或资金费来源断开、换代都撤下旧费率', async () => {
+  for (const when of ['cache-settled', 'cache-epoch', 'marks-disconnected', 'marks-reconnected'] as const) {
+    let t = Date.UTC(2026, 10, 13, 9, 0, 7), epoch: string | null = 'one';
+    const now = () => t, venues = fakeAnthropicVenues({ now }), store = createMonitorStore({ file: ':memory:', now });
+    const token = fakeVariationalToken(t + 86_400_000);
+    const session = { current: () => ({ token, revision: 1, status: 'ready' }), report() {} } as unknown as VariationalSession;
+    let fundingRead!: () => void, release!: () => void, fundingCount = 0;
+    const started = new Promise<void>(resolve => { fundingRead = resolve; });
+    const resume = new Promise<void>(resolve => { release = resolve; });
+    const cacheHit = when.startsWith('cache');
+    const unused = () => { throw new Error('unexpected source'); };
+    const remote: RemoteComparison = { quote: unused, history: unused, variationalMarks: unused,
+      async variationalFunding() {
+        fundingCount++; fundingRead();
+        const nextFundingAt = new Date(t + 750).toISOString(), rate = { fundingRate: 0.0002, fundingIntervalHours: 8, nextFundingAt };
+        return { left: rate, right: rate, fetchedAt: new Date(t).toISOString() };
+      } };
+    const reader = createExchangeReader({ gate: createBinanceGate(), quoteStore: store, remote, epoch: () => epoch, now, log() {}, variationalSession: session,
+      variationalFetch: async (url, init) => { if (!cacheHit) await resume; return venues.variationalFetch(url, init); },
+      oilQuote: () => null, hynixQuote: () => null });
+    const quote = () => reader.quote('oil', 'variational');
+    try {
+      if (cacheHit) {
+        const first = await quote(); assert.equal(first.left.fundingRate, 0.0002);
+      }
+      const pending = quote();
+      await started;
+      if (!cacheHit) await new Promise<void>(resolve => setImmediate(resolve));
+      if (when === 'cache-settled') t += 750;
+      else epoch = when === 'marks-disconnected' ? null : 'two';
+      release();
+      const result = await pending;
+      assert.deepEqual([result.status, result.timestampBasis, result.left.fundingRate, result.right.fundingRate, result.left.nextFundingAt, result.fundingFetchedAt],
+        ['live', 'source', null, null, null, null], when);
+      assert.match(result.fundingError, when === 'cache-settled' ? /结算时间已到/ : /行情服务连接已切换/);
+      assert.equal(calculateExchangeSpread(result).shortAnnualized, null);
+      assert.equal(fundingCount, 1, '同一轮只读取一次公开资金费');
+    } finally { release(); reader.stop(); store.close(); }
+  }
 });
 
 test('合约目录：60 秒后才重读；重读失败时 10 分钟内沿用旧目录，超过后整行失败', async () => {

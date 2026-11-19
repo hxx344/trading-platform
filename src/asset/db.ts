@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { QueryDatabase, QueryStatement, QueryValue } from './query.ts';
 import { HISTORY_TABLE } from './history-cache.ts';
+import { POSITION_SNAPSHOT_TABLE } from './position-snapshots.ts';
 
 export const ASSET_DB_FILE = 'asset.sqlite';
 const LOCK_TABLE = 'CREATE TABLE IF NOT EXISTS sync_locks (id INTEGER PRIMARY KEY CHECK (id = 1), expires INTEGER NOT NULL, token TEXT NOT NULL);';
@@ -24,6 +25,7 @@ CREATE TABLE IF NOT EXISTS snapshots (date TEXT PRIMARY KEY NOT NULL, data TEXT 
 ${LOCK_TABLE}
 ${CONNECTIONS_TABLE}
 ${FILL_CACHE_TABLE}
+${POSITION_SNAPSHOT_TABLE}
 ${HISTORY_TABLE}`;
 
 class Statement implements QueryStatement {
@@ -70,7 +72,7 @@ const SETUP: Record<AssetDbMode, string> = {
   read: 'PRAGMA busy_timeout = 5000;',
   // node:sqlite waits synchronously, so the service, which also runs ADL and transfers, waits at most a second for an
   // import's transaction (the import itself waits 5 s); a write that cannot get the file in time answers 503.
-  service: `PRAGMA busy_timeout = 1000; ${LOCK_TABLE} ${CONNECTIONS_TABLE} ${FILL_CACHE_TABLE} ${HISTORY_TABLE} DELETE FROM sync_locks WHERE 0;`,
+  service: `PRAGMA busy_timeout = 1000; ${LOCK_TABLE} ${CONNECTIONS_TABLE} ${FILL_CACHE_TABLE} ${POSITION_SNAPSHOT_TABLE} ${HISTORY_TABLE} DELETE FROM sync_locks WHERE 0;`,
 };
 
 export function openAssetDb(file: string, { readOnly = false, mode = readOnly ? 'read' : 'import' }: { readOnly?: boolean; mode?: AssetDbMode } = {}): AssetDb {

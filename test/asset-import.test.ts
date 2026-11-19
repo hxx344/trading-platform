@@ -38,7 +38,7 @@ test('资产导入：只取指定用户，设置按白名单复制并去掉钱�
     const summary = importLedger({ from: w.from, owner: OWNER, dataDir: w.dataDir, now: () => NOW });
     assert.deepEqual([summary.owner, summary.file, summary.assets, summary.snapshots, summary.importedAt], [OWNER, 'ledger.sqlite', 6, 10, new Date(NOW).toISOString()]);
     const saved = contents(w.target);
-    assert.deepEqual(saved.tables, ['asset_history_windows', 'assets', 'connections', 'fill_cache', 'settings', 'snapshots', 'sync_locks']);
+    assert.deepEqual(saved.tables, ['asset_history_windows', 'asset_position_snapshots', 'assets', 'connections', 'fill_cache', 'settings', 'snapshots', 'sync_locks']);
     assert.equal(saved.assets.length, 6);
     assert.equal(saved.snapshots.length, 10, '9 个日快照与 1 条导入前记录');
     const keys = Object.keys(saved.settings).sort();

@@ -25,7 +25,7 @@ function loadRelease(root: string, controlBuild: string) {
 // The Host is always the browser's value. Internal headers and client addresses are supplied by this process.
 function engineHeaders(request: IncomingMessage, executionBuild: string, withBody: boolean): OutgoingHttpHeaders {
   const headers: OutgoingHttpHeaders = { host: request.headers.host ?? '', [EXECUTION_HEADER]: executionBuild };
-  for (const name of ['cookie', 'authorization', 'origin', 'sec-fetch-site', 'x-pa-executor', 'content-type', 'accept', 'accept-encoding', 'last-event-id']) {
+  for (const name of ['cookie', 'authorization', 'origin', 'sec-fetch-site', 'x-pa-executor', 'x-pa-read-cache', 'content-type', 'accept', 'accept-encoding', 'last-event-id']) {
     const value = request.headers[name];
     if (value !== undefined) headers[name] = value;
   }

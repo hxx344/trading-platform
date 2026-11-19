@@ -14,6 +14,7 @@ import { OilPanel } from './MonitorOil.tsx';
 import { PerpetualPanel } from './MonitorPerpetual.tsx';
 import { StatePanel } from './StateViews.tsx';
 import { useLiveResource } from './use-live-resource.ts';
+import { mainQuoteRetention, quoteIsCurrent } from './monitor-display.ts';
 import './monitor.css';
 
 // The market monitor page, laid out as the workbench's Anthropic detail (modules/monitor/app/anthropic-panel.tsx and
@@ -123,10 +124,11 @@ function AnthropicPanel({ outstanding, diluted, onExpired }: { outstanding: numb
   const [details, setDetails] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const shares = useMemo<AnthropicShares>(() => ({ outstanding, diluted }), [outstanding, diluted]);
-  const quoteLive = useLiveResource<AnthropicQuote>(QUOTE_PATH, { intervalMs: QUOTE_MS, timeoutMs: MONITOR_READ_TIMEOUT_MS, parse: anthropicQuote, onExpired });
+  const quoteLive = useLiveResource<AnthropicQuote>(QUOTE_PATH, { intervalMs: QUOTE_MS, timeoutMs: MONITOR_READ_TIMEOUT_MS, parse: anthropicQuote, retain: mainQuoteRetention, onExpired });
   const candleLive = useMonitorCandles(anthropicCandles, requestedRange, ANTHROPIC_WARMUP_DAYS, onExpired, quoteLive.error);
   const { data, range } = candleLive;
   const quote = quoteLive.data;
+  const currentQuote = quoteIsCurrent(quoteLive, QUOTE_MS);
   const quoteFailed = quoteLive.error !== null && !(quote === null && notReady(quoteLive.error));
   const quoteError = quoteFailed ? '实时报价更新失败，10 秒后自动重试；请留意报价获取时间。' : quote?.status === 'snapshot' ? '后台尚未取得新报价，显示上次保存的数据；请留意采集时间。' : '';
   const historyFailed = candleLive.error !== null && !(data === null && notReady(candleLive.error));
@@ -159,7 +161,7 @@ function AnthropicPanel({ outstanding, diluted, onExpired }: { outstanding: numb
   const comparisonShares = anthropicSharesPerUnit(leg, shares);
   return <DetailLayout side={<RelatedPositions market="anthropic" onExpired={onExpired} />}>
       <div className="page-heading detail-toolbar"><div className="toolbar-identity"><div className="eyebrow">ANTHROPIC <span>/</span> ANTHROPICUSDT · {contract.label}</div><h1>Anthropic 价差<span className="small-tag">每股口径</span></h1><p>Binance 相对 {contract.label} 的每股溢价 · 15 分钟 K 线</p></div><div className="refresh-area"><div className="segmented" role="group" aria-label="对比合约">{ANTHROPIC_COMPARISON_LEGS.map(key => <button type="button" key={key} aria-pressed={leg === key} className={leg === key ? 'active' : ''} onClick={() => setLeg(key)}>{ANTHROPIC_LEGS[key].name}</button>)}</div><button type="button" className="refresh-button" onClick={refresh} disabled={loading}><RefreshCw size={15} className={loading ? 'spinning' : ''} aria-hidden="true" />{loading ? '加载行情' : '刷新行情'}</button><span>每 10 秒自动刷新</span></div></div>
-      <div className="data-status" role="status"><span className="status-left"><Clock3 size={14} aria-hidden="true" />{quote ? `${quoteError ? '实时更新中断 · 上次获取' : '实时报价 · 获取于'} ${date(quote.fetchedAt, true)} ${new Date(quote.fetchedAt).toISOString().slice(11, 19)} UTC` : quoteFailed ? '实时报价暂不可用 · 每 10 秒自动重试' : '正在获取实时报价 · 每 10 秒自动刷新'}</span><span className="status-right">USD · 每股标记价格</span></div>
+      <div className="data-status" role="status"><span className="status-left"><Clock3 size={14} aria-hidden="true" />{quote ? `${quoteError ? '实时更新中断 · 上次获取' : currentQuote ? '实时报价 · 获取于' : '上次报价 · 采集于'} ${date(quote.fetchedAt, true)} ${new Date(quote.fetchedAt).toISOString().slice(11, 19)} UTC` : quoteFailed ? '实时报价暂不可用 · 每 10 秒自动重试' : '正在获取实时报价 · 每 10 秒自动刷新'}</span><span className="status-right">USD · 每股标记价格</span></div>
       <div className="notice" role="status"><Info size={16} aria-hidden="true" />{sharesNote}</div>
       {quoteError && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />{quoteError}</div>}
       {legErrors.length > 0 && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />部分行情缺失：{legErrors.join('；')}。缺失一侧时不计算溢价。</div>}

@@ -6,6 +6,7 @@
 import { gateAuthHeaders } from '../../vendor/gate.mjs';
 import type { Balance } from '../types.ts';
 import { COINGECKO_QUOTES } from './quotes.ts';
+import { priceReceivedAt } from './shared-reads.ts';
 import { ExchangeResponseError, readJsonResponse } from '../../vendor/response.mjs';
 
 export type GateCredential = { apiKey: string; apiSecret: string };
@@ -172,7 +173,7 @@ function usdtAmount(account: unknown): number {
   return result === 0 ? 0 : result;
 }
 
-async function quoteJson(url: string, fetcher: Fetcher): Promise<Json> {
+async function quoteJson(url: string, fetcher: Fetcher): Promise<{ data: Json; at: number }> {
   // Public pricing requests are constructed separately and never receive Gate headers.
   const response = await fetcher(url, {
     method: 'GET', headers: { Accept: 'application/json' },
@@ -186,12 +187,12 @@ async function quoteJson(url: string, fetcher: Fetcher): Promise<Json> {
   try { data = await readJsonResponse(response, { maxBytes: 128 * 1024 }); }
   catch { throw new Error(QUOTE_FAILED); }
   if (!isObject(data)) throw new Error(QUOTE_FAILED);
-  return data;
+  return { data, at: priceReceivedAt(response) };
 }
 
 async function usdtQuote(fetcher: Fetcher): Promise<{ price: number; at: number }> {
   try {
-    const data = await quoteJson(COINGECKO, fetcher);
+    const { data } = await quoteJson(COINGECKO, fetcher);
     const coin = data.tether;
     if (!isObject(coin) || typeof coin.usd !== 'number' || !Number.isFinite(coin.usd) || coin.usd <= 0 || typeof coin.last_updated_at !== 'number') throw new Error(QUOTE_FAILED);
     const at = coin.last_updated_at * 1000;
@@ -199,14 +200,14 @@ async function usdtQuote(fetcher: Fetcher): Promise<{ price: number; at: number 
     return { price: coin.usd, at };
   } catch {
     try {
-      const data = await quoteJson(COINBASE, fetcher);
+      const { data, at } = await quoteJson(COINBASE, fetcher);
       if (!isObject(data.data) || data.data.currency !== 'USDT' || !isObject(data.data.rates)) throw new Error(QUOTE_FAILED);
       const rate = data.data.rates.USD;
       if (typeof rate !== 'string' || !/^\d+(?:\.\d+)?$/.test(rate)) throw new Error(QUOTE_FAILED);
       const price = Number(rate);
       if (!Number.isFinite(price) || price <= 0) throw new Error(QUOTE_FAILED);
       // Coinbase publishes no rate timestamp here; retain the local retrieval time.
-      return { price, at: Date.now() };
+      return { price, at };
     } catch { throw new Error(QUOTE_FAILED); }
   }
 }

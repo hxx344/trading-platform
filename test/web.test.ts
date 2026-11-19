@@ -224,9 +224,10 @@ test('历史列表合并：滑出最新页的记录保留；加载过更早页�
   // More than a page of new rows (after the page sat in the background): rows between were never read.
   view = mergeLive(view, { items: [{ id: 'j' }, { id: 'i' }], next: 'i1' });
   assert.deepEqual([ids(view), view.next, view.olderLoaded], [['i', 'j'], 'i1', false]);
-  // The live page is the whole list: no gap is possible, nothing is dropped.
+  // A complete first page is authoritative, including after deletion or the retention cutoff.
   const whole = mergeLive(view, { items: [{ id: 'k' }], next: null });
-  assert.deepEqual(ids(whole), ['i', 'j', 'k']);
+  assert.deepEqual(ids(whole), ['k']);
+  assert.deepEqual(ids(mergeLive(whole, { items: [], next: null })), []);
 });
 
 test('设置页划转表单：秒与毫秒互换，非法或超出范围的秒数在本地拦下（按秒提示），其余原样交服务端校验；改动项列出改前改后；默认值与服务端一致', async () => {

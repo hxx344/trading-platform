@@ -74,10 +74,12 @@ export function fillItems(data: HubFills, now: number, market: FillMarket): Omit
     truncated ||= scope.truncated;
     incomplete ||= scope.truncated || scope.status === 'stale' || scope.status === 'error' || scope.status === 'live' && old;
     const status = scope.status === 'live' && stale ? 'stale' : scope.status;
-    const error = status === 'unsupported' ? '数据源暂不支持此产品范围的成交读取'
+    const denied = status === 'error' && scope.error === FILLS_PERMISSION;
+    const error = denied ? FILLS_PERMISSION : status === 'unsupported' ? '数据源暂不支持此产品范围的成交读取'
       : status === 'error' ? '资产账本读取此范围失败，请在资产页检查连接与权限'
         : status === 'stale' ? '成交数据已过期，等待资产账本更新' : null;
     coverage.push({ sourceId, source, exchangeId: exchange.id, exchange: exchange.name, account: account.name, scope: scope.id, status, fetchedAt: scope.fetchedAt, coverageStart: scope.coverageStart, coverageEnd: scope.coverageEnd, error });
+    if (denied) continue;
     for (const fill of scope.fills) {
       if (!bases.includes(fill.base)) continue;
       incomplete ||= fill.positionBefore === null || fill.positionAfter === null;

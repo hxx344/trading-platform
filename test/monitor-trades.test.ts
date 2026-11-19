@@ -123,6 +123,9 @@ test('the asset ledger reply is flattened per market, newest first, with stale a
   assert.equal(late.coverage[0]!.status, 'stale'); assert.ok(late.items.every(item => item.stale));
   const loading = fillItems(reply({ status: 'loading', fetchedAt: null, fills: [] }), now, 'oil');
   assert.equal(loading.pending, true); assert.equal(loading.items.length, 0);
+  const denied = fillItems(reply({ status: 'error', error: FILLS_PERMISSION }), now, 'oil');
+  assert.equal(denied.coverage[0]?.error, FILLS_PERMISSION);
+  assert.deepEqual(denied.items, [], 'a permission refusal hides earlier fills still present in the reply');
   const many = fillItems(reply({ fills: Array.from({ length: MAX_FILL_ITEMS + 1 }, (_, i) => serverFill(String(i))) }), now, 'oil');
   assert.equal(many.items.length, MAX_FILL_ITEMS); assert.equal(many.truncated, true); assert.equal(many.incomplete, true);
 });

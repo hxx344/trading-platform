@@ -181,7 +181,7 @@ export interface AssetStoreOptions {
   fills?: FillsServiceOptions;
 }
 export function createAssetStore(file: string, { now = Date.now, fetch: fetcher = fetch, sources: replaced = {}, positions: positionsOptions = {}, fills: fillsOptions = {} }: AssetStoreOptions = {}): AssetStore {
-  const shared = sharePublicReads(fetcher);
+  const shared = sharePublicReads(fetcher, now);
   const sources: AssetSources = { ...liveSources(fetcher, shared), ...replaced };
   const vault = dataDirVault(dirname(file));
   const positionsService = createPositionsService({ now, fetcher: shared.fetcher, ...positionsOptions });
@@ -361,6 +361,6 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     },
     async positions() { return positionsService.read(await source(), vault.unseal); },
     async fills(market) { return fillsService.read(await source(), vault.unseal, market); },
-    close() { positionsService.close(); fillsService.close(); drop(); },
+    close() { positionsService.close(); fillsService.close(); shared.reset(); drop(); },
   };
 }

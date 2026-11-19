@@ -164,6 +164,8 @@ test('监控 K 线真实 HTTP：缩放与重新打开、旧行修订和恢复权
 
 test('会话、配置或开关明确失效才清掉历史；迟到应答不能重新填入', async () => {
   for (const status of [401, 403, 404, 423]) assert.equal(candleReadDenied(new ApiError('', status)), true);
+  assert.equal(candleReadDenied(new ApiError('', 409, 'monitor_changed')), true);
+  assert.equal(candleReadDenied(new ApiError('', 409, 'control_conflict')), false);
   for (const status of [429, 502, 503]) assert.equal(candleReadDenied(new ApiError('', status)), false);
   const disk = new Map<string, SavedMonitorCandles>();
   const started = deferred<void>(), released = deferred<unknown>();

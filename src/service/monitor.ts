@@ -52,6 +52,7 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
   const store = createMonitorStore({ file: join(dir, MONITOR_FILE), ...(now ? { now } : {}) });
   try {
     const remote = marketClient ? createRemoteMonitor(marketClient, now) : null;
+    const control = createMonitorControl({ store, markets: monitorMarkets(config), ...(log ? { log } : {}) });
     const archive = createFundingArchive(store, now);
     const base = { store, archive, ...(remote ? { readers: remote.rounds } : {}), ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}) };
     // One Binance cooldown for everything that reads Binance from the same address; the Hynix collector reads Hyperliquid only.
@@ -60,7 +61,9 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
     const varFetch = oil ? variationalFetch ?? createVariationalFetch() : undefined;
     const variational = oil && varFetch ? createVariationalSession({ dir, fetcher: varFetch, ...(now ? { now } : {}), ...(log ? { log } : {}) }) : null;
     const exchanges = oil || hynix ? createExchangeReader({
-      ...(remote ? { remote: remote.comparison } : {}), gate, archive, oilQuote: () => oil?.quote() ?? null, hynixQuote: () => hynix?.quote() ?? null,
+      ...(remote && marketClient ? { remote: remote.comparison, epoch: () => marketClient.epoch() } : {}),
+      gate, archive, quoteStore: store, controlRevision: market => control.enabled(market) ? control.view(market).revision : null,
+      oilQuote: () => oil?.quote() ?? null, hynixQuote: () => hynix?.quote() ?? null,
       ...(variational && varFetch ? { variationalSession: variational, variationalFetch: varFetch } : {}),
       ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}), ...(WebSocketImpl ? { WebSocketImpl } : {}),
     }) : null;
@@ -70,7 +73,6 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
       if (oil) alerts.oil = createAlertService({ ...common, market: 'oil', quote: () => oil.quote() });
       if (hynix) alerts.hynix = createAlertService({ ...common, market: 'hynix', quote: () => hynix.quote() });
     }
-    const control = createMonitorControl({ store, markets: monitorMarkets(config), ...(log ? { log } : {}) });
     // Built here, started by its loop once the switch is on (monitorLoops).
     // A cache that cannot be opened costs only the cached figures: the metrics then live in memory, the log says so and
     // every metrics report carries the notice (the page shows it under the table).

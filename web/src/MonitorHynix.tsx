@@ -9,6 +9,7 @@ import { ExchangeComparison } from './MonitorExchanges.tsx';
 import { HynixFundingPanel } from './MonitorFunding.tsx';
 import { AlertSettings } from './MonitorAlerts.tsx';
 import { useLiveResource } from './use-live-resource.ts';
+import { mainQuoteRetention, quoteIsCurrent } from './monitor-display.ts';
 import { useFills } from './MonitorTrades.tsx';
 import { DetailLayout, RelatedPositions } from './MonitorRelated.tsx';
 import type { VenueSpreads } from './monitor-related.ts';
@@ -32,10 +33,11 @@ export function HynixPanel({ onExpired }: { onExpired: () => void }) {
   const [details, setDetails] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   // Read only the selected range plus the indicator warmup; 全部 (the workbench's default here) reads the complete history.
-  const quoteLive = useLiveResource<HynixQuote>(QUOTE_PATH, { intervalMs: QUOTE_MS, timeoutMs: READ_TIMEOUT_MS, parse: hynixQuote, onExpired });
+  const quoteLive = useLiveResource<HynixQuote>(QUOTE_PATH, { intervalMs: QUOTE_MS, timeoutMs: READ_TIMEOUT_MS, parse: hynixQuote, retain: mainQuoteRetention, onExpired });
   const candleLive = useMonitorCandles(hynixCandles, requestedRange, HYNIX_WARMUP_DAYS, onExpired, quoteLive.error);
   const { data, range } = candleLive;
   const quote = quoteLive.data;
+  const currentQuote = quoteIsCurrent(quoteLive, QUOTE_MS);
   const quoteFailed = quoteLive.error !== null && !(quote === null && notReady(quoteLive.error));
   const quoteError = quoteFailed ? '实时报价更新失败，10 秒后自动重试；请留意报价获取时间。'
     : quote?.status === 'snapshot' ? `后台尚未取得新报价${quote.lastError ? `（${quote.lastError}）` : ''}，显示上次保存的数据；请留意采集时间。` : '';
@@ -66,7 +68,7 @@ export function HynixPanel({ onExpired }: { onExpired: () => void }) {
   const [venueSpreads, setVenueSpreads] = useState<VenueSpreads>({});
   return <DetailLayout side={<RelatedPositions market="hynix" spreads={venueSpreads} onExpired={onExpired} />}>
     <div className="page-heading detail-toolbar"><div className="toolbar-identity"><div className="eyebrow">SK HYNIX <span>/</span> 000660 · SKHY</div><h1>海力士 ADR 价差<span className="small-tag">上市以来</span></h1><p>正股与 ADR 同口径比较 · Hyperliquid 永续合约</p></div><div className="refresh-area"><button type="button" className="refresh-button" onClick={refresh} disabled={loading}><RefreshCw size={15} className={loading ? 'spinning' : ''} aria-hidden="true" />{loading ? '加载行情' : '刷新行情'}</button><span>每 10 秒自动刷新</span></div></div>
-    <div className="data-status" role="status"><span className="status-left"><Clock3 size={14} aria-hidden="true" />{quote ? `${quoteError ? '实时更新中断 · 上次获取' : '实时报价 · 获取于'} ${date(quote.fetchedAt, true)} ${new Date(quote.fetchedAt).toISOString().slice(11, 19)} UTC` : quoteFailed ? '实时报价暂不可用 · 每 10 秒自动重试' : '正在获取实时报价 · 每 10 秒自动刷新'}</span><span className="status-right">USD · 1 股正股 = 10 份 ADR</span></div>
+    <div className="data-status" role="status"><span className="status-left"><Clock3 size={14} aria-hidden="true" />{quote ? `${quoteError ? '实时更新中断 · 上次获取' : currentQuote ? '实时报价 · 获取于' : '上次报价 · 采集于'} ${date(quote.fetchedAt, true)} ${new Date(quote.fetchedAt).toISOString().slice(11, 19)} UTC` : quoteFailed ? '实时报价暂不可用 · 每 10 秒自动重试' : '正在获取实时报价 · 每 10 秒自动刷新'}</span><span className="status-right">USD · 1 股正股 = 10 份 ADR</span></div>
     {quoteError && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />{quoteError}</div>}
     {error && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />历史行情：{error}{data ? ' 当前保留上次成功加载的数据。' : ''}</div>}
     {candleLive.notice && <div className="notice" role="status"><Info size={16} aria-hidden="true" />{candleLive.notice}</div>}

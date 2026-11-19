@@ -19,6 +19,7 @@ import type { HubPositions, Position, PositionCycle, PositionsScope } from './po
 import type { SnapshotScope } from './daily-positions.ts';
 import { POSITIONS_FAILED, PositionsPermissionError } from './positions-values.ts';
 import { accountHistory, historyGeneration, historyPermission, type AccountHistory, type HistoryGeneration } from './history-cache.ts';
+import { POSITION_DISPLAY_AGE, POSITION_TTL, verifiedPositionSnapshot } from './position-snapshots.ts';
 import { cycleUnavailable } from './positions-cycle.ts';
 import { boundPositionEvidence } from './positions-evidence.ts';
 import { cycleSupported, CycleRetry, readPositionCycle } from './positions-cycle-readers.ts';
@@ -41,8 +42,7 @@ type CycleRead = (credentials: Credentials, scope: string, request: CycleRequest
 /** `entryPrice` joins the signature so a close and same-size reopen between two reads is not mistaken for the old cycle. */
 type CycleSlot = { side: Position['side']; quantity: string; entryPrice: string | null; cycle: PositionCycle; at: number };
 type Entry = { revision: string; scope: PositionsScope; attemptedAt: number; touchedAt: number; pending?: Promise<void>; abort?: AbortController;
-  cycles?: Map<string, CycleSlot>; cycleGeneration?: HistoryGeneration; cycleJob?: Promise<void>; cycleAbort?: AbortController };
-const TTL = 5_000;
+  restoredUnder?: HistoryGeneration; cycles?: Map<string, CycleSlot>; cycleGeneration?: HistoryGeneration; cycleJob?: Promise<void>; cycleAbort?: AbortController };
 // Variational reads start a Python process per refresh. Lighter RH shares a 60-requests-per-minute limit with other
 // modules; its reader also reuses one account read per address for 30 seconds.
 const SLOW_TTL: Partial<Record<PositionsExchangeId, number>> = { variational: 30_000, 'rh-lighter': 30_000, hyperliquid: 30_000 };
@@ -110,21 +110,17 @@ export function sourceAccounts(database: Database | null): SourceAccount[] {
 export type PositionsServiceOptions = { now?: () => number; ttl?: number; deadline?: number; concurrency?: number; read?: Read; cycle?: CycleRead | null; fetcher?: Fetcher; permission?: typeof verifyAssetPermission };
 export type PositionsService = ReturnType<typeof createPositionsService>;
 
-/** Process-local snapshots contain normalized public data only. Each poll reads current vault revisions. */
+/** Each poll reads current vault revisions. Only normalized positions of positively verified connections can be restored. */
 export function createPositionsService(options: PositionsServiceOptions = {}) {
   const now = options.now ?? Date.now;
   const fetcher = options.fetcher ?? fetch;
-  async function readPositions(credentials: Credentials, scope: string, signal: AbortSignal, authorized?: () => void) {
-    if (!options.read && credentials.exchange === 'hyperliquid') return readHyperliquidPositions(credentials, scope, fetcher, signal, now);
-    const positions = options.read ? await options.read(credentials, scope, signal) : await defaultRead(credentials, scope, signal, fetcher, authorized);
-    return { positions, observedAt: new Date(now()).toISOString() };
-  }
   const defaultCycle: CycleRead = (credentials, scope, request, signal, history) => readPositionCycle(credentials, scope, request, { signal, fetcher, now, history });
   // An injected position reader has no matching fill history unless a cycle reader is injected with it.
   const cycleRead = options.cycle !== undefined ? options.cycle : options.read ? null : defaultCycle;
   const cyclesFor = (exchange: PositionsExchangeId, scope: string) => !!cycleRead && cycleSupported(exchange, scope);
-  const ttlFor = (exchange: PositionsExchangeId) => options.ttl ?? SLOW_TTL[exchange] ?? TTL;
+  const ttlFor = (exchange: PositionsExchangeId) => options.ttl ?? SLOW_TTL[exchange] ?? POSITION_TTL;
   const entries = new Map<string, Entry>();
+  let activeFile: Database | null = null;
   function limiter(limit: number) {
     let active = 0;
     const queue: (() => void)[] = [];
@@ -137,10 +133,25 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
   const limited = limiter(Math.max(1, Math.min(3, options.concurrency ?? 3))), cycleLimited = limiter(1);
   const stop = (entry: Entry) => { entry.abort?.abort(); entry.cycleAbort?.abort(); };
   const cacheKey = (key: string, scope: string) => JSON.stringify([key, scope]);
+  function selectFile(file: Database | null) {
+    if (file === activeFile) return;
+    for (const entry of entries.values()) stop(entry);
+    entries.clear(); activeFile = file;
+  }
+  function hideRevoked(scope: PositionsScope) {
+    scope.status = 'error'; scope.positions = []; scope.fetchedAt = null; scope.error = POSITIONS_FAILED;
+  }
+  function checkRestored(entry: Entry) {
+    if (!entry.restoredUnder) return;
+    const age = now() - Date.parse(entry.scope.fetchedAt ?? '');
+    if (entry.restoredUnder.current() && age >= 0 && age < POSITION_DISPLAY_AGE) return;
+    hideRevoked(entry.scope); entry.restoredUnder = undefined;
+  }
   function inactiveScopes(account: SourceAccount, scopes: ScopeDefinition[], revision: string | null) {
     const healthyMode = (mode: ScopeDefinition['accountMode']) => scopes.some(scope => {
       if (!mode || scope.accountMode !== mode) return false;
       const entry = entries.get(cacheKey(account.key, scope.id));
+      if (entry) checkRestored(entry);
       return !!revision && entry?.revision === revision && entry.scope.status === 'live';
     });
     // Binance account modes are exclusive; suppress an unread mode only if its counterpart is working.
@@ -203,25 +214,38 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
       if (entries.get(key) !== entry || !current(database, account, entry.revision)) return;
       const abort = new AbortController(); entry.abort = abort;
       let timer: ReturnType<typeof setTimeout> | undefined;
+      let sampleStartedAt: number | undefined;
       try {
-        const startedAt = now();
         const work = async () => {
           const c = parseConnection(unseal(account.row!.encrypted, account.key));
           if (!generation.current() || c.exchange !== account.exchange || !current(database, account, entry.revision)) throw new Error(POSITIONS_FAILED);
           const signal = AbortSignal.any([abort.signal, generation.signal]);
+          const scope = entry.scope.id;
+          const read = (s: AbortSignal) => options.read ? options.read(c, scope, s) : defaultRead(c, scope, s, fetcher, generation.assertVerified);
           if (c.exchange === 'binance' || c.exchange === 'bybit' || c.exchange === 'okx') {
             await generation.verify(shared => (options.permission ?? verifyAssetPermission)(c, fetcher, shared));
-            if (signal.aborted || !current(database, account, entry.revision)) throw new Error(POSITIONS_FAILED);
+            const snapshot = await verifiedPositionSnapshot({ database, account, scope, revision: entry.revision, generation, signal, now, maxAge: ttlFor(c.exchange) }, read,
+              entry.scope.fetchedAt ? undefined : saved => {
+                entry.restoredUnder = generation;
+                entry.scope = { ...entry.scope, status: 'stale', positions: saved.positions, fetchedAt: new Date(saved.completedAt).toISOString(), error: null };
+              });
+            return { c, positions: snapshot.positions, startedAt: snapshot.startedAt, observedAt: new Date(snapshot.completedAt).toISOString(), restored: snapshot.restored };
           }
-          return { c, ...await readPositions(c, entry.scope.id, signal, generation.assertVerified) };
+          const startedAt = now();
+          if (!options.read && c.exchange === 'hyperliquid') {
+            return { c, ...await readHyperliquidPositions(c, scope, fetcher, signal, now), startedAt, restored: false };
+          }
+          return { c, positions: await read(signal), startedAt, observedAt: new Date(now()).toISOString(), restored: false };
         };
-        const { c, positions, observedAt } = await Promise.race([work(), new Promise<never>((_, reject) => {
+        const { c, positions, startedAt, observedAt, restored } = await Promise.race([work(), new Promise<never>((_, reject) => {
           timer = setTimeout(() => { abort.abort(); reject(new Error(POSITIONS_FAILED)); }, options.deadline ?? DEADLINE);
         })]);
         if (entries.get(key) !== entry || !current(database, account, entry.revision)) return;
         if (!generation.current()) throw new Error(POSITIONS_FAILED);
         const previousObservation = c.exchange === 'hyperliquid' ? entry.scope.fetchedAt : null;
         if (previousObservation && observedAt < previousObservation) throw new Error(POSITIONS_FAILED);
+        entry.restoredUnder = restored ? generation : undefined;
+        if (c.exchange === 'binance' || c.exchange === 'bybit' || c.exchange === 'okx') sampleStartedAt = startedAt;
         entry.scope = { ...entry.scope, positions: observedAt === previousObservation ? entry.scope.positions : positions,
           status: 'live', refreshing: false, fetchedAt: observedAt, error: null };
         if (cyclesFor(account.exchange, entry.scope.id)) scheduleCycles(database, account, entry, key, c, startedAt, generation);
@@ -230,18 +254,21 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
         let still = false;
         try { still = current(database, account, entry.revision); } catch { /* the file is gone: the next poll rebuilds */ }
         if (entries.get(key) === entry && still) {
-          entry.scope = { ...entry.scope, status: 'error', refreshing: false, error: POSITIONS_FAILED };
+          checkRestored(entry);
+          entry.scope = { ...entry.scope, status: entry.scope.status === 'stale' ? 'stale' : 'error', refreshing: false, error: POSITIONS_FAILED };
         }
       } finally {
-        clearTimeout(timer); entry.attemptedAt = now(); entry.scope.refreshing = false; entry.abort = undefined;
+        clearTimeout(timer); entry.attemptedAt = sampleStartedAt ?? now(); entry.scope.refreshing = false; entry.abort = undefined;
       }
     }).catch(() => {
       if (entries.get(key) === entry) entry.scope = { ...entry.scope, status: 'error', refreshing: false, error: POSITIONS_FAILED };
     }).finally(() => { entry.pending = undefined; });
   }
   async function read(database: DatabaseSource, unseal: Unseal, pending?: Set<Promise<void>>): Promise<HubPositions> {
-    const accounts = sourceAccounts(database());
+    const file = database(); selectFile(file);
+    const accounts = sourceAccounts(file);
     const keep = new Set<string>();
+    const restoredViews: { scope: PositionsScope; generation: HistoryGeneration }[] = [];
     const cycleViews: { account: SourceAccount; entry: Entry; positions: Position[] }[] = [];
     const exchanges = POSITIONS_CATALOG.map(exchange => ({ id: exchange.id, name: exchange.name,
       accounts: accounts.filter(account => account.exchange === exchange.id).map(account => {
@@ -257,9 +284,11 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
             entry = { revision, scope: empty(scope, true), attemptedAt: -Infinity, touchedAt: now() }; entries.set(key, entry);
           }
           entry.touchedAt = now();
+          checkRestored(entry);
           if (!entry.pending && now() - entry.attemptedAt >= ttlFor(account.exchange)) refresh(database, account, entry, key, unseal);
           if (entry.pending) pending?.add(entry.pending);
           const result = { ...entry.scope, positions: entry.scope.positions.map(item => ({ ...item })) };
+          if (entry.restoredUnder) restoredViews.push({ scope: result, generation: entry.restoredUnder });
           if (result.positions.length && cyclesFor(account.exchange, scope.id)) cycleViews.push({ account, entry, positions: result.positions });
           if (result.status === 'live' && result.fetchedAt && now() - Date.parse(result.fetchedAt) >= STALE_AFTER) result.status = 'stale';
           return [result];
@@ -273,11 +302,13 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
     // the re-check below only covers writes already queued as microtasks; a replaced key is kept out by the revision in
     // every cache key and by the current() checks before and after each refresh, not by this yield.
     await Promise.resolve();
+    if (database() !== file) throw new Error(POSITIONS_FAILED);
     const latest = connectionRows(database());
     for (const account of accounts) {
       const row = latest.find(item => item.exchange === account.key);
       if ((row?.encrypted ?? null) !== (account.row?.encrypted ?? null)) throw new Error(POSITIONS_FAILED);
     }
+    for (const restored of restoredViews) if (!restored.generation.current()) hideRevoked(restored.scope);
     for (const { account, entry, positions } of cycleViews) {
       const allowed = entry.cycleGeneration?.current() && historyPermission(database(), account.key, entry.revision) === 'verified';
       for (const item of positions) item.cycle = allowed ? cycleView(entry, item) : cycleUnavailable(CYCLE_LOADING, null, 'loading');
@@ -298,6 +329,7 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
     },
     /** Cached scopes for daily snapshots; never starts a read and does not keep idle entries alive. */
     peek(database: Database | null): SnapshotScope[] {
+      selectFile(database);
       const scopes: SnapshotScope[] = [];
       for (const account of sourceAccounts(database)) {
         if (!account.row) continue;
@@ -306,6 +338,7 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
         for (const definition of catalog.scopes) {
           if (definition.unsupported || inactive.has(definition.id)) continue;
           const cached = entries.get(cacheKey(account.key, definition.id)), entry = cached?.revision === revision ? cached : undefined;
+          if (entry) checkRestored(entry);
           const fetchedAt = entry?.scope.fetchedAt;
           if (!entry || !fetchedAt) {
             // Keep evidence of unread configured scopes so a successful read elsewhere can't turn missing data into zero.

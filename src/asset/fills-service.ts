@@ -24,6 +24,7 @@ import { MAX_REQUESTS } from './positions-history.ts';
 import { accountHistory, historyGeneration, historyPermission, invalidateHistory, onHistoryPermissionDenied, HISTORY_OVERLAP, type AccountHistory } from './history-cache.ts';
 import { verifyAssetPermission } from './positions-readers.ts';
 import { PositionsPermissionError } from './positions-values.ts';
+import { verifiedPositionSnapshot } from './position-snapshots.ts';
 import { fillsSupported, readFills } from './fills-readers.ts';
 import type { FillsRequest } from './fills-readers.ts';
 import { FillConflict, fillsNewestFirst, mergeFills, replayFills, verifyFill } from './fills-replay.ts';
@@ -250,22 +251,27 @@ export function createFillsService(options: FillsServiceOptions = {}) {
             if (signal.aborted) throw new Error(FILLS_FAILED);
             return budgeted(input, { ...init, signal: AbortSignal.any([signal, ...(init?.signal ? [init.signal] : [])]) });
           };
-          const snapshotStart = now();
+          let snapshotStart = now(), snapshotAt: number;
           let positions: Position[] | null = null;
           try {
-            positions = options.read ? await options.read(credentials, entry.scope.id, signal, fetcher)
-              : await defaultRead(credentials, entry.scope.id, signal, fetcher, generation.assertVerified);
+            const scope = entry.scope.id;
+            const snapshot = await verifiedPositionSnapshot({ database, account, scope, revision: entry.revision, generation, signal, now }, shared => {
+              const sourceFetch: Fetcher = (input, init) => budgeted(input, { ...init, signal: AbortSignal.any([shared, ...(init?.signal ? [init.signal] : [])]) });
+              return options.read ? options.read(credentials, scope, shared, sourceFetch)
+                : defaultRead(credentials, scope, shared, sourceFetch, generation.assertVerified);
+            });
             if (!valid()) throw new Error(FILLS_FAILED);
+            positions = snapshot.positions; snapshotStart = snapshot.startedAt; snapshotAt = snapshot.completedAt;
             entry.snapshotOkAt = snapshotStart; entry.snapshotHealthy = true;
           } catch (error) {
             entry.snapshotHealthy = false;
             // Unlike the workbench (hub-fills.ts reads history anyway), a key that fails the read-only check reads nothing more.
             if (error instanceof PositionsPermissionError) throw error;
             if (abort.signal.aborted) throw new Error(FILLS_FAILED);
+            snapshotAt = Math.max(snapshotStart, now());
           }
           if (!valid()) throw new Error(FILLS_FAILED);
-          // This local completion time only anchors older windows; the newest query has no local upper bound.
-          const snapshotAt = Math.max(snapshotStart, now());
+          // The real observation anchors older windows; the newest history query has no local upper bound.
           const lookback = snapshotAt - CYCLE_LOOKBACK_MS;
           const start = Math.max(lookback, entry.historyCursor === null ? lookback : Math.min(entry.historyCursor, snapshotAt) - HISTORY_OVERLAP);
           const history = accountHistory(database, account.key, entry.revision, entry.scope.id, valid, generation);
@@ -292,7 +298,7 @@ export function createFillsService(options: FillsServiceOptions = {}) {
         entry.scope = { ...entry.scope, fills, truncated, refreshing: false,
           status: positions === null ? entry.scope.fetchedAt ? 'stale' : 'error' : 'live',
           error: positions === null ? '持仓快照读取失败，成交开平仓方向暂不可用' : null,
-          fetchedAt: positions === null ? entry.scope.fetchedAt : iso(now()),
+          fetchedAt: positions === null ? entry.scope.fetchedAt : iso(snapshotAt),
           coverageStart: truncated && fills.length ? fills[fills.length - 1]!.time : iso(lookback),
           // Coverage includes exchange-clock fills ahead of local snapshot completion (bounded above by now+60s).
           coverageEnd: iso(Math.max(snapshotAt, raw.length ? Date.parse(raw[0]!.time) : snapshotAt)) };

@@ -136,7 +136,13 @@ test('只读令牌：应答按值与按字段打码，原值不出现；同一�
   try {
     const token = await s.generate();
     const status = await (await s.read(token, '/api/status')).text();
-    const logs = await (await s.read(token, '/api/logs')).text();
+    const unmasked = await fetch(s.base + '/api/logs', { headers: { cookie: s.cookie, 'x-pa-read-cache': '1' } });
+    const pageVersion = unmasked.headers.get('x-pa-read-version');
+    assert.ok(pageVersion);
+    const maskedLogs = await s.read(token, '/api/logs', { headers: { 'x-pa-read-cache': pageVersion } });
+    assert.equal(maskedLogs.status, 200);
+    assert.equal(maskedLogs.headers.get('x-pa-read-version'), null);
+    const logs = await maskedLogs.text();
     const oil = await (await s.read(token, '/api/oil/state')).text();
     for (const body of [status, logs, oil]) {
       assert.doesNotMatch(body, HEX_RUN, body);

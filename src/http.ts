@@ -15,6 +15,8 @@ import type { WebApp } from './web-assets.ts';
 import type { UpdateView } from './service/update-types.ts';
 import { ANTHROPIC_RETENTION_DAYS } from './vendor/anthropic-market.mjs';
 import { encodeCandleBlocks } from './candle-blocks-server.ts';
+import { isDisplayRead, READ_CACHE, ReadViewCache, versionLength } from './read-view.ts';
+import { readViewReply } from './read-view-server.ts';
 import { MONITOR_CANDLE_BLOCK_MS, monitorCandleField, type MonitorCandleUpdate } from './monitor/candle-window.ts';
 import { supportsExchange, type Exchange } from './vendor/exchange-comparison.mjs';
 import { supportsFundingHistory } from './vendor/exchange-funding-history.mjs';
@@ -102,7 +104,7 @@ export interface ServiceViews {
   };
   /** The read-only market monitors; a market's reads give undefined when it is not configured and null until there is data. Absent without config.monitor. */
   monitor?: {
-    state(): { markets: readonly string[] }; quote(market: CandleMarket): unknown; candles(market: CandleMarket, days: number | null): unknown;
+    state(): { markets: readonly string[]; controls?: Partial<Record<keyof typeof MONITOR_NAMES, { enabled: boolean; revision: number }>> }; quote(market: CandleMarket): unknown; candles(market: CandleMarket, days: number | null): unknown;
     /** The settled funding history of oil or Hynix (M-2d); before any settlement `{ notReady: <reason> | null }`. */
     funding?(market: 'oil' | 'hynix'): unknown;
     /** M-2c: one exchange's comparison row, read on demand; undefined when the market is not configured; rejects with the page's reason. */
@@ -280,9 +282,34 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
   }
   // A read-only token's answers are masked and size-capped on their way out; a session's pass unchanged (docs/mcp.md 3).
   const tokenAnswers = new WeakMap<ServerResponse, { redact: Redactor; bytes: number }>();
+  const readViews = new ReadViewCache();
+  const negotiated = new WeakMap<ServerResponse, { key: string; known: string }>();
+  const monitorReads = new WeakMap<ServerResponse, { market: keyof typeof MONITOR_NAMES; revision?: number }>();
+  function negotiate(request: IncomingMessage, response: ServerResponse, url: URL, body?: unknown): void {
+    const known = request.headers[READ_CACHE];
+    if (typeof known !== 'string' || (known !== '1' && versionLength(known) < 0) || !isDisplayRead(request.method!, url.pathname)) return;
+    const key = createHash('sha256').update(JSON.stringify([request.method, url.pathname, url.search, body])).digest('base64url');
+    negotiated.set(response, { key, known });
+  }
   const send = (response: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void => {
+    const observation = monitorReads.get(response);
+    if (observation && views?.monitor && status !== 401 && status !== 403) {
+      const { market, revision } = observation;
+      const state = views.monitor.state(), control = state.controls?.[market];
+      if (!state.markets.includes(market)) { status = 404; body = { code: 'not_found', message: '该行情监控未配置' }; }
+      else if (control?.enabled === false || views.monitor.enabled?.(market) === false) { status = 423; body = { code: 'monitor_disabled', message: '行情监控已关闭' }; }
+      else if (revision !== control?.revision) { status = 409; body = { code: 'monitor_changed', message: '行情监控已重新开启，请重新读取' }; }
+    }
     const answer = tokenAnswers.get(response);
-    if (!answer) return sendJson(response, status, body, headers);
+    if (!answer) {
+      const read = negotiated.get(response);
+      if (read && status === 200) {
+        const reply = readViewReply(readViews, read.key, read.known, body);
+        return sendJsonText(response, reply.status, reply.text, { ...headers, ...reply.headers });
+      }
+      if (read && [401, 403, 404, 409, 423].includes(status)) readViews.delete(read.key);
+      return sendJson(response, status, body, headers);
+    }
     const payload = JSON.stringify(answer.redact(body));
     const bytes = Buffer.byteLength(payload);
     if (bytes > READ_TOKEN_MAX_BYTES) {
@@ -413,6 +440,7 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       }
       return send(response, 404, { code: 'not_found', message: '不存在' });
     }
+    if (request.method === 'GET') negotiate(request, response, url);
     return serve(request, response, url, kind);
   }
 
@@ -467,8 +495,12 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       return send(response, 200, views.monitor.setControl(market, await readJson(request)));
     }
     const marketRead = /^\/api\/monitor\/(anthropic|oil|hynix|perpetual)\//.exec(url.pathname)?.[1] as keyof typeof MONITOR_NAMES | undefined;
-    if (marketRead && views?.monitor?.enabled && views.monitor.state().markets.includes(marketRead) && !views.monitor.enabled(marketRead)) {
-      return send(response, 423, { code: 'monitor_disabled', message: marketRead === 'perpetual' ? '合约价差监控已关闭，行情采集已暂停；开启后重新采集' : `${MONITOR_NAMES[marketRead]}监控已关闭，行情采集与自动告警已暂停；开启后恢复` });
+    if (marketRead && views?.monitor) {
+      const state = views.monitor.state();
+      if (state.markets.includes(marketRead)) {
+        if (views.monitor.enabled?.(marketRead) === false) return send(response, 423, { code: 'monitor_disabled', message: marketRead === 'perpetual' ? '合约价差监控已关闭，行情采集已暂停；开启后重新采集' : `${MONITOR_NAMES[marketRead]}监控已关闭，行情采集与自动告警已暂停；开启后恢复` });
+        if (isDisplayRead(request.method!, url.pathname)) monitorReads.set(response, { market: marketRead, revision: state.controls?.[marketRead]?.revision });
+      }
     }
     // M-4a: the perpetual table (whole), its summary, and the SSE stream of patches (frames as the workbench's).
     const perpetualRoute = request.method === 'GET' ? /^\/api\/monitor\/perpetual\/(quote|summary|stream)$/.exec(url.pathname)?.[1] : undefined;
@@ -494,6 +526,7 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
         : inspection === 'price-history' ? perpetual?.priceHistory?.bind(perpetual) : inspection === 'quality' ? perpetual?.quality?.bind(perpetual) : perpetual?.exit?.bind(perpetual);
       if (!read) return send(response, 404, { code: 'not_found', message: '本服务没有配置合约价差行情监控' });
       const body = inspection === 'fx' ? undefined : await readJson(request);
+      if (request.method === 'POST') negotiate(request, response, url, body);
       try { return send(response, 200, await read(body)); }
       catch (error) {
         const status = (error as { status?: unknown })?.status;

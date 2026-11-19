@@ -1,6 +1,7 @@
 import { candleKnown, mergeCandleBlocks, type CandleBlockCache } from '../../src/candle-blocks.ts';
 import { MONITOR_CANDLE_BLOCK_MS, monitorCandleField, type MonitorCandleMarket, type MonitorCandleUpdate } from '../../src/monitor/candle-window.ts';
 import { api, ApiError } from './api.ts';
+import { readAccessDenied } from './live-resource.ts';
 import { ranges } from './monitor-history.ts';
 
 type Row = { time: number };
@@ -16,7 +17,7 @@ type Store = {
   put(key: string, value: SavedMonitorCandles): void;
   remove(key: string): void;
 };
-export const candleReadDenied = (error: unknown) => error instanceof ApiError && [401, 403, 404, 423].includes(error.status);
+export const candleReadDenied = (error: unknown) => error instanceof ApiError && readAccessDenied(error);
 const coversCandleDays = (history: History, days: number | null) => history.windowDays === null || (days !== null && history.windowDays >= days);
 
 /** During expansion the chart, indicator and statistics must all keep the same previously covered range. */

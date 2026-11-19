@@ -10,6 +10,7 @@ import { ExchangeComparison } from './MonitorExchanges.tsx';
 import { OilFundingPanel } from './MonitorFunding.tsx';
 import { AlertSettings } from './MonitorAlerts.tsx';
 import { useLiveResource } from './use-live-resource.ts';
+import { mainQuoteRetention, quoteIsCurrent } from './monitor-display.ts';
 import { useFills } from './MonitorTrades.tsx';
 import { DetailLayout, RelatedPositions } from './MonitorRelated.tsx';
 import type { VenueSpreads } from './monitor-related.ts';
@@ -33,10 +34,11 @@ export function OilPanel({ onExpired }: { onExpired: () => void }) {
   const [details, setDetails] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   // Read only the selected range plus the indicator warmup; 全部 reads the complete history.
-  const quoteLive = useLiveResource<OilQuote>(QUOTE_PATH, { intervalMs: QUOTE_MS, timeoutMs: READ_TIMEOUT_MS, parse: oilQuote, onExpired });
+  const quoteLive = useLiveResource<OilQuote>(QUOTE_PATH, { intervalMs: QUOTE_MS, timeoutMs: READ_TIMEOUT_MS, parse: oilQuote, retain: mainQuoteRetention, onExpired });
   const candleLive = useMonitorCandles(oilCandles, requestedRange, OIL_WARMUP_DAYS, onExpired, quoteLive.error);
   const { data, range } = candleLive;
   const quote = quoteLive.data;
+  const currentQuote = quoteIsCurrent(quoteLive, QUOTE_MS);
   const quoteFailed = quoteLive.error !== null && !(quote === null && notReady(quoteLive.error));
   const quoteError = quoteFailed ? '实时报价更新失败，10 秒后自动重试；请留意报价获取时间。'
     : quote?.status === 'snapshot' ? `后台尚未取得新报价${quote.lastError ? `（${quote.lastError}）` : ''}，显示上次保存的数据；请留意采集时间。` : '';
@@ -68,7 +70,7 @@ export function OilPanel({ onExpired }: { onExpired: () => void }) {
   const [venueSpreads, setVenueSpreads] = useState<VenueSpreads>({});
   return <DetailLayout side={<RelatedPositions market="oil" spreads={venueSpreads} onExpired={onExpired} />}>
     <div className="page-heading detail-toolbar"><div className="toolbar-identity"><div className="eyebrow">BRENT / WTI <span>/</span> BZUSDT · CLUSDT</div><h1>原油价差<span className="small-tag">4 月 1 日以来</span></h1><p>布伦特 − WTI · Binance 永续合约 15 分钟 K 线</p></div><div className="refresh-area"><button type="button" className="refresh-button" onClick={refresh} disabled={loading}><RefreshCw size={15} className={loading ? 'spinning' : ''} aria-hidden="true" />{loading ? '加载行情' : '刷新行情'}</button><span>每 10 秒自动刷新</span></div></div>
-    <div className="data-status" role="status"><span className="status-left"><Clock3 size={14} aria-hidden="true" />{quote ? `${quoteError ? '实时更新中断 · 上次获取' : '实时报价 · 获取于'} ${date(quote.fetchedAt, true)} ${new Date(quote.fetchedAt).toISOString().slice(11, 19)} UTC` : quoteFailed ? '实时报价暂不可用 · 每 10 秒自动重试' : '正在获取实时报价 · 每 10 秒自动刷新'}</span><span className="status-right">USDT · 每桶标记价格</span></div>
+    <div className="data-status" role="status"><span className="status-left"><Clock3 size={14} aria-hidden="true" />{quote ? `${quoteError ? '实时更新中断 · 上次获取' : currentQuote ? '实时报价 · 获取于' : '上次报价 · 采集于'} ${date(quote.fetchedAt, true)} ${new Date(quote.fetchedAt).toISOString().slice(11, 19)} UTC` : quoteFailed ? '实时报价暂不可用 · 每 10 秒自动重试' : '正在获取实时报价 · 每 10 秒自动刷新'}</span><span className="status-right">USDT · 每桶标记价格</span></div>
     {quoteError && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />{quoteError}</div>}
     {error && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />历史更新中断：{error}{data ? ' 当前保留上次成功加载的数据。' : ''}</div>}
     {candleLive.notice && <div className="notice" role="status"><Info size={16} aria-hidden="true" />{candleLive.notice}</div>}
@@ -84,7 +86,7 @@ export function OilPanel({ onExpired }: { onExpired: () => void }) {
     <SpreadChart data={chartPoints} loading={historyPending} range={range} onRangeChange={setRange} mode={mode} onModeChange={setMode} config={OIL_SPREAD_CHART} trades={trades} tradeMarket="oil" />
     <p className="chart-footnote"><Info size={13} aria-hidden="true" />缺失时段曲线断开，不补 0 · 采样 15 分钟</p></div>
     <ExchangeComparison market="oil" onExpired={onExpired} onSpreads={setVenueSpreads} />
-    <OilFundingPanel range={requestedRange} onRangeChange={setRange} quote={quote} onExpired={onExpired} />
+    <OilFundingPanel range={requestedRange} onRangeChange={setRange} quote={currentQuote ? quote : null} onExpired={onExpired} />
     <AlertSettings market="oil" onExpired={onExpired} />
     <div className="bottom-grid"><section className="table-panel"><div className="section-heading"><h2>近期观察</h2><span>每日最后共同 15 分钟 K 线 · 起点 UTC</span></div><div className="table-scroll"><table><thead><tr><th>日期</th><th>布伦特</th><th>WTI</th><th>价差</th></tr></thead><tbody>{recent.map(p => <tr key={p.time}><td>{date(p.time, true)}<small>{new Date(p.time).toISOString().slice(11, 16)}</small></td><td>{usdt(p.adr)}</td><td>{usdt(p.equivalent)}</td><td><span className={`premium-pill ${p.spread >= 0 ? 'positive' : 'negative'}`}>{p.spread >= 0 ? <ArrowUpRight size={13} aria-hidden="true" /> : <ArrowDownRight size={13} aria-hidden="true" />}{signedUsdt(p.spread)}</span></td></tr>)}{!recent.length && <tr><td colSpan={4} className="empty-table">{historyPending ? '正在加载记录…' : '暂无记录'}</td></tr>}</tbody></table></div></section>
     <aside className="method-panel"><div className="section-heading"><h2>如何比较</h2><span className="info-icon"><Info size={17} aria-hidden="true" /></span></div><div className="conversion"><div><span className="instrument-label">布伦特原油</span><strong>1 <small>桶</small></strong><span>BZUSDT · Binance</span></div><MoveRight size={22} aria-hidden="true" /><div><span className="instrument-label">WTI 原油</span><strong>1 <small>桶</small></strong><span>CLUSDT · Binance</span></div></div><div className="formula"><span>价差</span><code>布伦特 − WTI（USDT / 桶）</code></div><p className="method-note">正数表示布伦特较贵。做空价差对应空布伦特、多 WTI；等桶数配仓时，每桶价格损益等于价差变化，资金费另行计算。两条行情均为 USDT 计价的永续合约，价差包含合约基差。</p><div className="listing-note"><span>历史起点</span><b>2026.04.01</b></div></aside></div>

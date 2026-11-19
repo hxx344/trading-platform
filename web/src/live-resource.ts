@@ -6,11 +6,12 @@
 //   有订阅者要求后台读取（background）的条目在页面隐藏时照常轮询，离线时仍暂停（如系统更新进行中，见 docs/update.md）。
 // - 失败保留上次结果并报告错误，按原间隔重试；401 不再自动重试，由页面处理登录过期。
 // - 写操作（commit、refresh）使之前发出的读取失效，迟到的旧响应不能覆盖写入结果（L089）。
-// - 缓存只在仍有订阅者时存在：最后一个订阅者离开即中止读取并丢弃结果，不跨页面或会话复用。
+// - 最后一个订阅者离开即中止读取和计时。只有明确指定 retain 的展示资源可在本页会话内复用。
 
 export type ResourceStatus = 'loading' | 'ready' | 'error' | 'paused' | 'offline';
-export type ResourceSnapshot<T> = { data: T | null; error: Error | null; status: ResourceStatus; receivedAt: number | null };
-export type ResourceSource<T> = { read: (signal: AbortSignal) => Promise<T>; intervalMs: number | null; background?: boolean };
+export type ResourceSnapshot<T> = { data: T | null; error: Error | null; status: ResourceStatus; receivedAt: number | null; cached?: boolean };
+export type DisplayRetention<T> = { fresh: (value: T, now: number) => boolean; history?: boolean };
+export type ResourceSource<T> = { read: (signal: AbortSignal) => Promise<T>; intervalMs: number | null; retain?: DisplayRetention<T>; background?: boolean };
 export type Subscription = (() => void) & { retune: (intervalMs: number | null) => void; setBackground: (background: boolean) => void };
 
 export type ResourceEnvironment = {
@@ -26,6 +27,8 @@ export type ResourceEnvironment = {
 type Subscriber = { intervalMs: number | null; background: boolean; listener: (snapshot: ResourceSnapshot<unknown>) => void };
 type Entry = {
   read: (signal: AbortSignal) => Promise<unknown>;
+  retain?: DisplayRetention<unknown>;
+  reuseUntil: number | null;
   subscribers: Set<Subscriber>;
   snapshot: ResourceSnapshot<unknown>;
   generation: number;
@@ -37,34 +40,26 @@ type Entry = {
   interrupted: boolean;
 };
 
-export function browserEnvironment(): ResourceEnvironment {
-  return {
-    now: () => Date.now(),
-    hidden: () => document.hidden,
-    online: () => navigator.onLine,
-    setTimer: (callback, ms) => setTimeout(callback, ms),
-    clearTimer: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
-    listen: wake => {
-      document.addEventListener('visibilitychange', wake);
-      for (const name of ['online', 'offline', 'focus', 'pageshow']) window.addEventListener(name, wake);
-      return () => {
-        document.removeEventListener('visibilitychange', wake);
-        for (const name of ['online', 'offline', 'focus', 'pageshow']) window.removeEventListener(name, wake);
-      };
-    },
-  };
-}
-
-const unauthorized = (error: unknown) => !!error && typeof error === 'object' && (error as { status?: unknown }).status === 401;
+const httpStatus = (error: unknown) => (error as { status?: number } | null)?.status;
+export const monitorGenerationChanged = (error: unknown) => httpStatus(error) === 409 && (error as { code?: unknown }).code === 'monitor_changed';
+export const readAccessDenied = (error: unknown) => [401, 403, 404, 423].includes(httpStatus(error) ?? 0) || monitorGenerationChanged(error);
+const empty = (): ResourceSnapshot<unknown> => ({ data: null, error: null, status: 'loading', receivedAt: null });
+const MAX_RETAINED = 32, HISTORY_RETENTION_MS = 30 * 60_000;
+type Retained = { snapshot: ResourceSnapshot<unknown>; nextReadAt: number; lastAttemptAt: number; history: boolean };
 
 export function createResourceStore(env: ResourceEnvironment) {
   const entries = new Map<string, Entry>();
+  const retained = new Map<string, Retained>();
   let unlisten: (() => void) | null = null;
   const background = (entry: Entry) => {
     for (const subscriber of entry.subscribers) if (subscriber.background) return true;
     return false;
   };
   const readable = (entry: Entry) => env.online() && (!env.hidden() || background(entry));
+  const foreground = () => !env.hidden() && env.online();
+  const releaseEnvironment = () => {
+    if (!entries.size && !retained.size) { unlisten?.(); unlisten = null; }
+  };
   const interval = (entry: Entry) => {
     let min: number | null = null;
     for (const subscriber of entry.subscribers) if (subscriber.intervalMs !== null) min = min === null ? subscriber.intervalMs : Math.min(min, subscriber.intervalMs);
@@ -84,7 +79,7 @@ export function createResourceStore(env: ResourceEnvironment) {
     env.clearTimer(entry.timer); entry.timer = undefined;
     const ms = interval(entry);
     if (ms === null || entry.stopped || entry.request || !readable(entry)) return;
-    const wait = entry.lastAttemptAt === null ? 0 : Math.max(0, entry.lastAttemptAt + ms - env.now());
+    const wait = entry.lastAttemptAt === null ? 0 : Math.max(0, Math.min(entry.lastAttemptAt + ms, entry.reuseUntil ?? Infinity) - env.now());
     entry.timer = env.setTimer(() => { entry.timer = undefined; void start(key, entry); }, wait);
   };
   const start = (key: string, entry: Entry): Promise<void> => {
@@ -92,6 +87,7 @@ export function createResourceStore(env: ResourceEnvironment) {
     // 不可读时记下这次显式要求的重读（如写入后的 refresh），恢复后补读，不能被吞掉。
     if (!readable(entry)) { entry.stopped = false; entry.interrupted = true; suspend(entry); return Promise.resolve(); }
     cancel(entry);
+    entry.reuseUntil = null;
     entry.stopped = false; entry.interrupted = false;
     const version = entry.generation;
     // 先登记在途请求再发起读取：读取函数同步抛错时也不会留下无人清理的请求标记。
@@ -104,10 +100,10 @@ export function createResourceStore(env: ResourceEnvironment) {
       try { value = await entry.read(request.controller.signal); ok = true; } catch (error) { failure = error; }
       if (request.controller.signal.aborted || version !== entry.generation || entry.request !== request || entries.get(key) !== entry) return;
       entry.request = null;
-      if (ok) publish(entry, { data: value, error: null, status: 'ready', receivedAt: env.now() });
+      if (ok) publish(entry, { data: value, error: null, status: 'ready', receivedAt: env.now(), cached: false });
       else {
-        entry.stopped = unauthorized(failure);
-        publish(entry, { error: failure instanceof Error ? failure : new Error('读取失败，请稍后重试。'), status: 'error' });
+        entry.stopped = httpStatus(failure) === 401;
+        publish(entry, { ...(readAccessDenied(failure) ? empty() : {}), error: failure instanceof Error ? failure : new Error('读取失败，请稍后重试。'), status: 'error' });
       }
       schedule(key, entry);
     })();
@@ -139,13 +135,39 @@ export function createResourceStore(env: ResourceEnvironment) {
     else if (suspended) publish(entry, { status: entry.snapshot.error ? 'error' : 'ready' });
     else schedule(key, entry);
   };
-  const wake = () => { for (const [key, entry] of entries) revive(key, entry); };
+  const wake = () => {
+    if (!foreground()) {
+      for (const [key, saved] of retained) {
+        if (saved.history) saved.nextReadAt = 0;
+        else retained.delete(key);
+      }
+      releaseEnvironment();
+    }
+    for (const [key, entry] of entries) revive(key, entry);
+  };
+
+  const remember = (key: string, entry: Entry, intervalMs: number | null) => {
+    const { retain, snapshot, lastAttemptAt } = entry;
+    if (!retain || intervalMs === null || lastAttemptAt === null || snapshot.data === null || snapshot.receivedAt === null) return;
+    const now = env.now();
+    if (now < snapshot.receivedAt || now - snapshot.receivedAt >= HISTORY_RETENTION_MS) return;
+    const nextReadAt = snapshot.status === 'ready' && !snapshot.error && foreground() && retain.fresh(snapshot.data, now) ? Math.min(lastAttemptAt + intervalMs, entry.reuseUntil ?? Infinity) : 0;
+    if (!retain.history && nextReadAt <= now) return;
+    retained.set(key, { snapshot: { ...snapshot, cached: true }, nextReadAt, lastAttemptAt, history: retain.history === true });
+    if (retained.size > MAX_RETAINED) retained.delete(retained.keys().next().value!);
+  };
 
   return {
     subscribe<T>(key: string, source: ResourceSource<T>, listener: (snapshot: ResourceSnapshot<T>) => void): Subscription {
       let entry = entries.get(key);
       if (!entry) {
-        entry = { read: source.read, subscribers: new Set(), snapshot: { data: null, error: null, status: 'loading', receivedAt: null }, generation: 0, request: null, timer: undefined, lastAttemptAt: null, stopped: false, interrupted: false };
+        const saved = retained.get(key);
+        retained.delete(key);
+        const now = env.now();
+        const available = saved?.snapshot.receivedAt != null && now >= saved.snapshot.receivedAt && now - saved.snapshot.receivedAt < HISTORY_RETENTION_MS;
+        const fresh = available && foreground() && source.intervalMs !== null && now < Math.min(saved.nextReadAt, saved.lastAttemptAt + source.intervalMs) && source.retain?.fresh(saved.snapshot.data as T, now);
+        const snapshot = fresh || (available && source.retain?.history) ? saved.snapshot : empty();
+        entry = { read: source.read, retain: source.retain as DisplayRetention<unknown> | undefined, reuseUntil: fresh ? saved.nextReadAt : null, subscribers: new Set(), snapshot, generation: 0, request: null, timer: undefined, lastAttemptAt: fresh ? saved.lastAttemptAt : null, stopped: false, interrupted: false };
         entries.set(key, entry);
         unlisten ??= env.listen(wake);
       }
@@ -161,8 +183,9 @@ export function createResourceStore(env: ResourceEnvironment) {
         if (!current.subscribers.delete(subscriber)) return;
         // 留下的订阅者都不要求后台读取时，隐藏中的条目就此暂停。
         if (current.subscribers.size) { if (readable(current)) schedule(key, current); else suspend(current); return; }
+        remember(key, current, subscriber.intervalMs);
         cancel(current); entries.delete(key);
-        if (!entries.size) { unlisten?.(); unlisten = null; }
+        releaseEnvironment();
       };
       // 调整本订阅者的间隔（如探测运行中改为 3 秒），不中止在途读取、不丢弃结果。
       const retune = (ms: number | null) => {
@@ -178,6 +201,25 @@ export function createResourceStore(env: ResourceEnvironment) {
       };
       return Object.assign(leave, { retune, setBackground });
     },
+    // Clear both retained copies and live requests. A late reply from the old scope cannot restore the data.
+    invalidate(matches: (key: string) => boolean, error: Error | null, reload = false) {
+      for (const key of retained.keys()) if (matches(key)) retained.delete(key);
+      for (const [key, entry] of entries) {
+        if (!matches(key)) continue;
+        cancel(entry);
+        entry.reuseUntil = null;
+        entry.lastAttemptAt = reload ? null : env.now();
+        entry.stopped = httpStatus(error) === 401;
+        entry.interrupted = true;
+        publish(entry, { ...empty(), error, status: error ? 'error' : 'paused', cached: false });
+        if (reload) void start(key, entry);
+        else schedule(key, entry);
+      }
+      releaseEnvironment();
+    },
+    resumeSession() {
+      for (const [key, entry] of entries) if (entry.stopped && httpStatus(entry.snapshot.error) === 401) void start(key, entry);
+    },
     // 立即重新读取：之前发出的读取作废，结束后恢复轮询。
     refresh(key: string): Promise<void> {
       const entry = entries.get(key);
@@ -188,8 +230,9 @@ export function createResourceStore(env: ResourceEnvironment) {
       const entry = entries.get(key);
       if (!entry) return;
       cancel(entry);
+      entry.reuseUntil = null;
       entry.stopped = false; entry.interrupted = false; entry.lastAttemptAt = env.now();
-      publish(entry, { data, error: null, status: 'ready', receivedAt: env.now() });
+      publish(entry, { data, error: null, status: 'ready', receivedAt: env.now(), cached: false });
       schedule(key, entry);
     },
   };

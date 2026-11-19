@@ -148,7 +148,7 @@ export function writeLedger(dataDir: string, ledger: PreparedLedger, connections
   const database = openAssetDb(resolve(dataDir, ASSET_DB_FILE));
   try {
     database.replace(() => {
-      for (const table of ['assets', 'settings', 'snapshots', 'connections', 'fill_cache', 'asset_history_windows']) database.prepare(`DELETE FROM ${table}`).run();
+      for (const table of ['assets', 'settings', 'snapshots', 'connections', 'fill_cache', 'asset_history_windows', 'asset_position_snapshots']) database.prepare(`DELETE FROM ${table}`).run();
       for (const row of connections) database.prepare('INSERT INTO connections (exchange, encrypted, updated_at) VALUES (?, ?, ?)').bind(row.exchange, row.encrypted, new Date(at).toISOString()).run();
       for (const row of ledger.assets) database.prepare('INSERT INTO assets (id, data) VALUES (?, ?)').bind(row.id, row.data).run();
       for (const row of ledger.snapshots) database.prepare('INSERT INTO snapshots (date, data) VALUES (?, ?)').bind(row.date, row.data).run();

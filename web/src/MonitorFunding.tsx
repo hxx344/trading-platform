@@ -9,6 +9,7 @@ import type { OilQuote } from './monitor-oil.ts';
 import { SvgPlot, type PlotLayer } from './svg-plot.tsx';
 import { niceAxis, plotValue } from './svg-plot-geometry.ts';
 import { useLiveResource } from './use-live-resource.ts';
+import { fundingRetention } from './monitor-display.ts';
 
 // The settled funding of the oil and Hynix pages (M-2d): the workbench's modules/monitor/app/settled-funding-panel.tsx
 // (8bc3bee) with the configs of oil-funding-panel.tsx and hynix-funding-panel.tsx (8bc3bee) and the 5-minute polling of
@@ -25,7 +26,7 @@ const stamp = (value: number | string | null) => value === null ? '尚无记录'
 const fundingTick = (value: number) => `${Number((value * 100).toPrecision(3))}%`;
 const zeroLine = [{ y: 0, color: 'var(--muted-foreground)', dash: '4 4' }];
 
-type SettledFundingFeed = { history: FundingHistory | null; error: string; loading: boolean; refreshing: boolean; refresh: () => void };
+type SettledFundingFeed = { history: FundingHistory | null; previous: boolean; error: string; loading: boolean; refreshing: boolean; refresh: () => void };
 type SettledFundingConfig = {
   label: string; short: string; long: string;
   /** "个共同结算小时" / "次共同结算" and the matching missing unit. */
@@ -85,9 +86,10 @@ function SettledFundingPanel({ market, range, onRangeChange, feed, current }: { 
   }, [summary.chart, selectedMode]);
   const unit = mode === 'rate' ? '% / 小时' : mode === 'annualized' ? '% / 年 · 简单年化' : '% · 区间累计';
   const snapshot = history?.status === 'snapshot';
-  const stale = Boolean(error) || snapshot;
+  const stale = Boolean(error) || snapshot || feed.previous;
   const readings = [{ key: 'short', name: '做空价差', position: config.short, annualized: summary.shortAnnualized, cumulative: summary.shortCumulative }, { key: 'long', name: '做多价差', position: config.long, annualized: summary.longAnnualized, cumulative: summary.longCumulative }];
   const status = error || (snapshot ? `后台资金费采集暂停${history?.lastError ? `（${history.lastError}）` : ''}，显示上次保存的结算记录。` : '')
+    || (feed.previous && history ? '上次结算快照' : '')
     || (history && !history.complete && loaded ? `正在分段回补历史结算，已到 ${stamp(rows.at(-1)!.time)}，每 5 分钟续读一段。` : '');
   return <section className="chart-panel hynix-funding-panel" aria-label={config.label}>
     <div className="chart-heading"><div><div className="section-kicker">SETTLED FUNDING</div><h2>多空价差资金费</h2><p className="history-timestamp">已结算资金费 · 按小时折算 · 两腿等名义金额</p></div><div className="segmented range-control" aria-label="资金费时间范围">{ranges.map(item => <button type="button" key={item.label} aria-pressed={range === item.days} className={range === item.days ? 'active' : ''} onClick={() => onRangeChange(item.days)}>{item.label}</button>)}</div></div>
@@ -110,7 +112,7 @@ function SettledFundingPanel({ market, range, onRangeChange, feed, current }: { 
 /** One market's settlements every 5 minutes; a backfill still running (503 not_ready) counts as loading, not as a failure;
  * a first round that failed (503 funding_unavailable) shows the service's reason. */
 function useFunding(market: FundingMarket, onExpired: () => void): SettledFundingFeed {
-  const live = useLiveResource<FundingHistory>(`/api/monitor/${market}/funding`, { intervalMs: FUNDING_MS, timeoutMs: FUNDING_TIMEOUT_MS, parse: market === 'oil' ? oilFunding : hynixFunding, onExpired });
+  const live = useLiveResource<FundingHistory>(`/api/monitor/${market}/funding`, { intervalMs: FUNDING_MS, timeoutMs: FUNDING_TIMEOUT_MS, parse: market === 'oil' ? oilFunding : hynixFunding, retain: fundingRetention[market], onExpired });
   const [refreshing, setRefreshing] = useState(false);
   const notReady = live.error instanceof ApiError && live.error.status === 503 && live.data === null ? live.error : null;
   const backfilling = notReady?.code === 'not_ready';
@@ -120,7 +122,7 @@ function useFunding(market: FundingMarket, onExpired: () => void): SettledFundin
     : '';
   const { refresh: reread } = live;
   return {
-    history: live.data, error,
+    history: live.data, previous: !!live.cached || live.status !== 'ready', error,
     loading: refreshing || live.status === 'loading' || backfilling,
     refreshing: refreshing || live.status === 'loading',
     refresh: () => { setRefreshing(true); void reread().finally(() => setRefreshing(false)); },

@@ -214,8 +214,8 @@ test('live-resource 与系统更新的后台读取条件串联：连续读不到
   const { readsInBackground, BACKGROUND_SILENCE_MS } = await import('../src/update-view.ts');
   const fake = fakeEnvironment();
   const store = createResourceStore(fake.env);
-  let reads = 0;
-  const read = async () => { reads++; throw new Error('502'); };
+  let reads = 0, down = true;
+  const read = async () => { reads++; if (down) throw new Error('502'); return 1; };
   let snapshot = null;
   // 照 UpdateStatus：每次快照后按保留的错误与上次成功时间算 silentMs，下一拍调整后台开关。
   const subscription = store.subscribe('/api/update', { read, intervalMs: 2_000, background: true }, next => { snapshot = next; });
@@ -234,5 +234,14 @@ test('live-resource 与系统更新的后台读取条件串联：连续读不到
   drive(); await fake.settle();
   assert.equal(reads, stopped, '停读后不再发读取');
   assert.equal(snapshot.status, 'paused');
-  assert.ok(stopped <= BACKGROUND_SILENCE_MS / 2_000 + 2, `停读前读了 ${stopped} 次`);
+  assert.ok(stopped >= BACKGROUND_SILENCE_MS / 2_000 && stopped <= BACKGROUND_SILENCE_MS / 2_000 + 3, `停读前读了 ${stopped} 次（应在后台按 2 秒间隔读满 10 分钟）`);
+  // 服务恢复后回到前台：读到结果清空错误，再隐藏时照常按间隔后台读取。
+  down = false;
+  await fake.setHidden(false);
+  assert.equal(snapshot.error, null);
+  drive(); await fake.settle();
+  await fake.setHidden(true);
+  const resumed = reads;
+  for (let i = 0; i < 5; i++) { drive(); await fake.advance(2_000); }
+  assert.equal(reads - resumed, 5);
 });

@@ -152,6 +152,8 @@
 
 **失败时与回滚**：后台读取出错时与前台一样保留上次结果、按间隔重试；距上次成功读取（或页面载入）满 10 分钟仍读不到时停止后台读取（`BACKGROUND_SILENCE_MS`），回到前台再按前台规则继续。回滚版本 v0.70.1（`sudo bash install.sh --version v0.70.1`，不用改配置）。
 
-**测试**：`web/test/live-resource.test.mjs`（隐藏时普通订阅暂停、后台订阅照常轮询且离线暂停、隐藏时开关后台读取、打开它的订阅者离开后暂停）；`test/update-view.test.ts` 新增版本变化刷新与后台读取条件两项。
+**测试**：`web/test/live-resource.test.mjs`（隐藏时普通订阅暂停、后台订阅照常轮询且离线暂停、隐藏时开关后台读取、打开它的订阅者离开后暂停、在途读取、401、读取中关闭、加入已暂停的共享条目、暂停时保留错误，以及与 `readsInBackground()` 串联的停读与恢复）；`test/update-view.test.ts` 新增版本变化刷新、后台读取条件、10 分钟停读与载入版本四项。
 
 **未在本机验证**：真实浏览器后台标签页里的节流间隔与服务器上的真实更新，首次在服务器上更新时实测并回填 [live-results.md](live-results.md)。
+
+审查记录：[reviews/2026-11-19-update-background-reload.md](reviews/2026-11-19-update-background-reload.md)。

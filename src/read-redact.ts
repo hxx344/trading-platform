@@ -29,7 +29,7 @@ export const identifierField = (name: string): boolean => IDENTIFIER_FIELDS.has(
 // a unit follows it (`子账户 50000 USDT` is an amount).
 const HEX_RUN = /0x[0-9a-fA-F]{40,}/g;
 const MASKED_ID = /\*{3}[0-9A-Za-z]{1,8}\b/g;
-const NAMED_NUMBER = /(UID|uid|Uid|用户|账户|子账户|account|Account)(\s*[:：#=]?\s*)(\d{5,})(?![\d.,])(?!\s*(?:USDT|USDC|USD|BTC|ETH|U\b|美元|元|%|个|张|笔|次|秒|ms\b))/g;
+const NAMED_NUMBER = /(UID|uid|Uid|用户|账户|子账户|account|Account)(\s*[:：#=]?\s*)(\d{5,})(?!\d|[.,]\d)(?!\s*(?:(?:USDT|USDC|USD|BTC|ETH|U|ms)(?![A-Za-z0-9\u4e00-\u9fff-])|美元|元|%))/g;
 // A number in an identifier field is aliased only when the name says it is an id (`users: 3` is a count).
 const NUMERIC_ID = /(id|ids|uid|user|account|owner|trader|signer)$/;
 

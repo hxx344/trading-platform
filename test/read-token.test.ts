@@ -271,17 +271,22 @@ test('打码：字段名不分大小写与下划线；地址类字段里的地�
   const words = redact({ text: '子账户 50000 USDT 已划转；UID 88776655 已暂停；账户 1234567 的余额 12.5%', users: 3, user: 123456 }) as Record<string, unknown>;
   assert.match(String(words.text), /^子账户 50000 USDT 已划转；UID acct-[0-9a-f]{8} 已暂停；账户 acct-[0-9a-f]{8} 的余额/, '数字后跟单位是金额，不打码');
   assert.equal(words.users, 3, '计数字段的数字不打码');
+  for (const text of ['UID 88776655, not configured', 'account 12345678.', 'uid=12345678.', 'Binance account 12345678 USDT-M', 'UID 1234567 U本位', '子账户 12345678 个人', 'account 12345678 BTCUSDT', 'UID 12345678 次日'])
+    assert.ok(!(redact({ text }) as { text: string }).text.includes(/\d{5,}/.exec(text)![0]), text);
+  assert.equal((redact({ text: '账户 12345678.5 USDT，UID 1,234,567 元' }) as { text: string }).text, '账户 12345678.5 USDT，UID 1,234,567 元', '小数与千分位是金额');
   assert.match(String(words.user), /^acct-/);
   assert.equal(seen.get(String(out.wallet)), ADDRESS);
   assert.ok(identifierField('walletAddress') && identifierField('sub-account-id') && !identifierField('pairId'));
 });
 
+// Identifier-named fields known to hold a count, not an id; any other number under an identifier field counts as an original.
+const COUNT_FIELDS = new Set(['users', 'signers', 'addresses']);
 /** Every original a masked answer must not carry: values under identifier fields and 0x runs, from the session's answer. */
 function originals(value: unknown, field = '', out = new Set<string>()): Set<string> {
   if (typeof value === 'string') {
     for (const run of value.match(/0x[0-9a-fA-F]{40,}/g) ?? []) out.add(run);
     if (identifierField(field) && value.length >= 4) out.add(value);
-  } else if (typeof value === 'number' && identifierField(field) && /(id|ids|uid|user|account)$/i.test(field) && String(value).length >= 4) out.add(String(value));
+  } else if (typeof value === 'number' && identifierField(field) && !COUNT_FIELDS.has(field) && String(value).length >= 4) out.add(String(value));
   else if (Array.isArray(value)) for (const item of value) originals(item, field, out);
   else if (value !== null && typeof value === 'object') for (const [name, item] of Object.entries(value)) { originals(name, '', out); originals(item, name, out); }
   return out;
@@ -295,12 +300,13 @@ const UPDATE: UpdateView = {
   job: { id: 'job-1', version: '0.69.1', from: '0.69.0', startedAt: 3, at: 4, phase: 'running', step: 'install', message: '正在安装 /home/svc-trader', output: ['/home/svc-trader/trading-platform/data 已备份'] },
 };
 
-test('只读令牌：真实视图逐个读取，应答里没有会话应答中的任何标识原值，读取过程不向外发请求；在线更新只给投影', async () => {
+test('只读令牌：执行器状态、划转、ADL 与 Ondo 用真实视图读取，应答里没有会话应答中的任何标识原值，读取不调用交易所客户端；在线更新只给投影', async () => {
   clock.now = Date.UTC(2026, 10, 19);
   const dataDir = mkdtempSync(join(tmpdir(), 'tp-read-token-ondo-'));
+  const clientCalls: string[] = [];
   const client = {
-    async markets() { return new Map([['NVDA-USD.P', { tick: '0.01', step: '0.01', trading: true, makerFee: null }]]); },
-    async depth(name: string) { return { market: name, time: Date.now(), bids: [['100.00', '3']], asks: [['100.02', '4']] }; },
+    async markets() { clientCalls.push('markets'); return new Map([['NVDA-USD.P', { tick: '0.01', step: '0.01', trading: true, makerFee: null }]]); },
+    async depth(name: string) { clientCalls.push(`depth ${name}`); return { market: name, time: Date.now(), bids: [['100.00', '3']], asks: [['100.02', '4']] }; },
     close() {},
   } as unknown as OndoClient;
   const ondo = await createOndoModule({ initial: { ...structuredClone(ONDO_MM_DEFAULTS), mode: 'observe', markets: ['NVDA-USD.P'], orderUsd: '250', maxPositionUsd: '250' } as never }, undefined, dataDir, { log: () => {}, rewardsClient: () => client, mmIntervalMs: 0 });
@@ -308,13 +314,7 @@ test('只读令牌：真实视图逐个读取，应答里没有会话应答中�
   const realFetch = globalThis.fetch;
   try {
     const token = await s.generate();
-    const outbound: string[] = [];
-    const local = new URL(s.base).host;
-    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-      const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
-      if (url.host !== local) outbound.push(url.href);
-      return realFetch(input, init);
-    }) as typeof fetch;
+    const before = clientCalls.length;
     // The executor's own state (accounts, jobs, transfers, ADL) and the modules wired here, through the real views.
     const checked = new Set<string>();
     for (const path of ['/api/state', '/api/status', '/api/logs', '/api/oil/state', '/api/ondo/state', '/api/transfer-pairs/xau/history', '/api/adl/pairs/xau/incidents']) {
@@ -325,7 +325,7 @@ test('只读令牌：真实视图逐个读取，应答里没有会话应答中�
       if (session.headers.get('content-type')?.includes('json')) for (const original of originals(JSON.parse(plain))) { checked.add(`${path} ${original}`); assert.ok(!text.includes(original), `${path} 含原值 ${original}`); }
       assert.doesNotMatch(text, HEX_RUN, path);
     }
-    assert.deepEqual(outbound, [], '令牌读取不向外发请求');
+    assert.deepEqual(clientCalls.slice(before), [], '令牌读取 Ondo 状态不调用交易所客户端');
     assert.ok([...checked].some(item => item.startsWith('/api/state ')), `执行器状态里的账户标识也核对过：${[...checked].join('；')}`);
     // The update status: versions, state and times only; no install output, message, notes or links.
     const update = await (await s.read(token, '/api/update')).json() as Record<string, unknown>;
@@ -336,7 +336,6 @@ test('只读令牌：真实视图逐个读取，应答里没有会话应答中�
     });
     assert.match(await (await realFetch(`${s.base}/api/update`, { headers: { cookie: s.cookie } })).text(), /svc-trader/, '会话仍看到完整内容');
   } finally {
-    globalThis.fetch = realFetch;
     await s.close(); await ondo.close(); rmSync(dataDir, { recursive: true, force: true });
   }
 });

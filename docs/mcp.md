@@ -164,6 +164,6 @@
 - **到期提醒**：服务主循环每轮取 `dueReminders()`，在到期前 7 天和前 1 天经飞书各发一次；已发过的记在文件里，重启后不重发。
 - **页面**：设置页「只读接口令牌」面板（`web/src/ReadTokenSettings.tsx`，文案与校验在 `read-token-form.ts`）；侧栏「设置」入口下显示到期提示，与面板共用 `/api/read-token` 的订阅，每分钟刷新。
 - **MCP 服务端**：没有采用官方 SDK，改为无依赖的实现，避免为一个只在客户端机器运行的脚本引入依赖树。
-- **测试**：`test/read-token.test.ts`（令牌分支、白名单穷举、打码、限额、到期与吊销、会话专用管理接口；用真实视图逐个读取执行器状态、日志、Ondo 等接口，断言应答里没有会话应答中的任何标识原值且读取不向外发请求）、`test/mcp-readonly.test.ts`（七个工具对真实执行进程、参数校验、stdio、令牌文件）、`test/read-token-form.test.ts`（面板文案）、`test/control-transport.test.ts`（转发 `Authorization`、执行进程不可达、拆分部署下 `/api/update` 只答投影）。
-- **登记的 P2**：CrossEx、期权、行情监控、原油与海力士四组接口的令牌读取还没有用各自的真实视图（替身交易所连接）做上面那种逐个核对，目前靠字段表与按值规则覆盖；下一次改这几个模块的状态应答时一并补上（审查记录 [reviews/2026-11-19-mcp-readonly.md](reviews/2026-11-19-mcp-readonly.md)）。
+- **测试**：`test/read-token.test.ts`（令牌分支、白名单穷举、打码、限额、到期与吊销、会话专用管理接口；执行器状态、划转历史、ADL 事件用测试执行器、Ondo 状态用真实模块加替身客户端读取，断言令牌应答里没有会话应答中的任何标识原值，且读取 Ondo 状态不调用交易所客户端；`/api/status`、`/api/logs`、原油状态仍是手写夹具）、`test/mcp-readonly.test.ts`（七个工具对真实执行进程、参数校验、stdio、令牌文件）、`test/read-token-form.test.ts`（面板文案）、`test/control-transport.test.ts`（转发 `Authorization`、执行进程不可达、拆分部署下 `/api/update` 只答投影）。
+- **登记的 P2**：`/api/status`、`/api/logs`（真实 `logs.sqlite` 写入交易所错误原文）以及 CrossEx、期权、行情监控、原油与海力士的令牌读取还没有用各自的真实视图（替身交易所连接）做上面那种逐个核对，目前靠字段表与按值规则覆盖；下一次改这几个模块的状态应答时一并补上（审查记录 [reviews/2026-11-19-mcp-readonly.md](reviews/2026-11-19-mcp-readonly.md)）。
 - **待实测**：第 5 节最后一条“真实环境”，需在服务器上生成令牌，从另一台机器经 Tailscale 调用，登记在 [live-results.md](live-results.md)。

@@ -12,7 +12,7 @@ import { setImmediate as nextTurn } from 'node:timers/promises';
 import { constants, createGunzip, createGzip, type Gzip } from 'node:zlib';
 import { createControl } from '../src/control/main.ts';
 import { ContractError, UUID } from '../src/contracts.ts';
-import { EXECUTION_HEADER, readJson, sendJson } from '../src/http-public.ts';
+import { CONTROL_HEADER, EXECUTION_HEADER, readJson, sendJson } from '../src/http-public.ts';
 import { api, ApiError } from '../web/src/api.ts';
 import { RequestIds } from '../web/src/request-ids.ts';
 
@@ -215,3 +215,16 @@ test('控制面把只读令牌的 Authorization 头原样转给执行面；执�
   const body = await response.text();
   assert.doesNotMatch(body, /missing\.sock|ENOENT|tpr_/);
 });
+
+test('拆分部署：执行面校验令牌后交回的 /api/update，控制面对令牌只答投影，会话照旧得到完整状态', async t => {
+  const { base } = await listener(t, (request, response) => {
+    request.resume();
+    response.writeHead(204, { [CONTROL_HEADER]: '1' });
+    response.end();
+  });
+  const full = await (await fetch(`${base}/api/update`)).json() as Record<string, unknown>;
+  assert.ok('manualAt' in full && 'error' in full, '没有令牌时是完整状态');
+  const masked = await (await fetch(`${base}/api/update`, { headers: { authorization: `Bearer tpr_${'A'.repeat(43)}` } })).json() as Record<string, unknown>;
+  assert.deepEqual(Object.keys(masked).sort(), ['available', 'checkFailed', 'checkedAt', 'checking', 'current', 'enabled', 'job', 'latest', 'pending']);
+});
+

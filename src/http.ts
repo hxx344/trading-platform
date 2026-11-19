@@ -9,7 +9,7 @@ import { ContractError, TRANSFER_CONFIG_KEYS, VENUES, exactKeys, parsePage, type
 import type { Executor } from './executor.ts';
 import { APP_HEADERS, ASSET_HEADERS, CLIENT_ADDRESS_HEADER, CONFIG_CHECK_HEADER, CONFIG_MATCH_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, PAGE_HEADERS, controlRoute, readJson, sendJson, sendJsonText, sessionCookieName } from './http-public.ts';
 import { LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash } from './login-password.ts';
-import { READ_TOKEN_MAX_BYTES, readTokenAllows, type ReadTokens } from './read-token.ts';
+import { READ_TOKEN_MAX_BYTES, readTokenAllows, readTokenUpdateView, type ReadTokens } from './read-token.ts';
 import type { Redactor } from './read-redact.ts';
 import type { WebApp } from './web-assets.ts';
 import type { UpdateView } from './service/update-types.ts';
@@ -188,18 +188,20 @@ export interface HttpOptions {
   throttle?: LoginThrottle;
   /**
    * The read-only API token (docs/mcp.md): without it a request with an Authorization header gets 401, as before.
-   * tokenThrottle counts wrong tokens apart from wrong passwords.
+   * Wrong tokens are counted per client address, apart from wrong passwords; tests give the throttles a clock.
    */
   readTokens?: ReadTokens;
-  tokenThrottle?: LoginThrottle;
+  tokenThrottle?: () => LoginThrottle;
   log?: (line: string) => void;
 }
+
+const TOKEN_THROTTLES = 1_024;
 
 // Hashing first gives equal-length inputs, so the comparison does not leak the token length either.
 const sameSecret = (given: string, expected: string): boolean =>
   timingSafeEqual(createHash('sha256').update(given).digest(), createHash('sha256').update(expected).digest());
 
-export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, app, imports, views, password, host, browserPort, executionBuild = 'development', configBuild, ready, throttle = new LoginThrottle(), readTokens, tokenThrottle = new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
+export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, app, imports, views, password, host, browserPort, executionBuild = 'development', configBuild, ready, throttle = new LoginThrottle(), readTokens, tokenThrottle = () => new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
   if (!accessToken) throw new Error('需要访问令牌');
   if (sameSecret(session, accessToken)) throw new Error('会话值不能与访问令牌相同');
   // The executor records which session asked for each command; it gets a digest, so the stored rows never hold the cookie.
@@ -296,24 +298,28 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
   async function tokenRoute(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
     request.resume();
     const started = performance.now();
+    const address = clientAddress(request);
     let tokenId: string | null = null;
-    // One line per request, in the service log (logs.sqlite, 14 days); never the token itself.
+    // A locked address is answered without a log line, so wrong tokens cannot fill the log (as with the password).
+    const throttle = throttleFor(address);
+    const wait = throttle.waitMs();
+    if (wait > 0) return sendJson(response, 429, { code: 'token_locked', message: `令牌错误次数过多，请 ${Math.ceil(wait / 1000)} 秒后再试` }, { 'retry-after': String(Math.ceil(wait / 1000)) });
+    // One line per request, in the service log (logs.sqlite, 14 days); never the token itself. Only a request with the
+    // valid token counts as a use on the page.
     response.once('close', () => {
-      readTokens?.record();
+      if (tokenId) readTokens?.record();
       const bytes = tokenAnswers.get(response)?.bytes ?? Number(response.getHeader('content-length') ?? 0);
       const outcome = response.writableFinished ? `${response.statusCode}，${bytes} 字节` : '连接中断';
-      log(`只读令牌${tokenId ? ` ${tokenId}` : '（无效）'} ${request.method ?? '?'} ${url.pathname} → ${outcome}，${Math.round(performance.now() - started)} ms（来自 ${clientAddress(request)}）`);
+      log(`只读令牌${tokenId ? ` ${tokenId}` : '（无效）'} ${request.method ?? '?'} ${url.pathname} → ${outcome}，${Math.round(performance.now() - started)} ms（来自 ${address}）`);
     });
     if (request.headers.cookie !== undefined) return sendJson(response, 403, { code: 'token_cookie', message: '令牌请求不能同时带会话 cookie' });
-    const wait = tokenThrottle.waitMs();
-    if (wait > 0) return sendJson(response, 429, { code: 'token_locked', message: `令牌错误次数过多，请 ${Math.ceil(wait / 1000)} 秒后再试` }, { 'retry-after': String(Math.ceil(wait / 1000)) });
     const bearer = /^Bearer ([^\s]{1,200})$/.exec(String(request.headers.authorization));
     const checked = readTokens && bearer ? readTokens.check(bearer[1]!) : { ok: false as const, reason: 'invalid' as const };
     if (!checked.ok) {
-      tokenThrottle.failed();
+      throttle.failed();
       return sendJson(response, 401, { code: 'token', message: checked.reason === 'expired' ? '令牌已到期，请在设置页重新生成' : '令牌无效或已吊销' });
     }
-    tokenThrottle.succeeded();
+    throttle.succeeded();
     tokenId = checked.id;
     if (request.method !== 'GET' || !readTokenAllows(url)) return sendJson(response, 403, { code: 'read_only', message: '只读令牌不能访问这个接口' });
     const release = readTokens!.admit();
@@ -324,6 +330,17 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     tokenAnswers.set(response, { redact, bytes: 0 });
     return serve(request, response, url, controlRoute(request.method, url.pathname));
   }
+  // One throttle per client address, at most TOKEN_THROTTLES of them (the oldest goes first).
+  const tokenThrottles = new Map<string, LoginThrottle>();
+  const throttleFor = (address: string): LoginThrottle => {
+    let throttle = tokenThrottles.get(address);
+    if (!throttle) {
+      throttle = tokenThrottle();
+      tokenThrottles.set(address, throttle);
+      if (tokenThrottles.size > TOKEN_THROTTLES) tokenThrottles.delete(tokenThrottles.keys().next().value!);
+    }
+    return throttle;
+  };
   const handOff = (response: ServerResponse): void => {
     response.writeHead(204, { [CONTROL_HEADER]: '1', 'cache-control': 'no-store' });
     response.end();
@@ -743,7 +760,7 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
         return handOff(response);
       }
       if (!views?.update) return send(response, 404, { code: 'not_found', message: '本服务没有在线更新' });
-      if (kind === 'update') return send(response, 200, views.update.status());
+      if (kind === 'update') { const view = views.update.status(); return send(response, 200, tokenAnswers.has(response) ? readTokenUpdateView(view as UpdateView) : view); }
       if (kind === 'check') { exactKeys(await readJson(request), []); return send(response, 200, await views.update.check()); }
       if (kind === 'apply') return send(response, 200, views.update.apply(await readJson(request)));
     }

@@ -7,6 +7,7 @@ import { parseArgs } from 'node:util';
 import { readComponentBuild } from '../component-build.ts';
 import { ContractError, exactKeys } from '../contracts.ts';
 import { APP_HEADERS, ASSET_HEADERS, ASSET_PATH, CLIENT_ADDRESS_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, controlRoute, listenPublic, readJson, sendJson } from '../http-public.ts';
+import { readTokenUpdateView } from '../read-token.ts';
 import { parseListenConfig, urlHost } from '../service/listen-config.ts';
 import { createUpdates, readInstalledVersion, updateReadyFile, type UpdateFetch, type UpdateView } from '../service/update.ts';
 import { loadWebApp } from '../web-assets.ts';
@@ -108,7 +109,9 @@ export function createControl(options: {
     const view = route === 'check' ? await updates.check() : updates.status();
     if (legacyJob && !view.pending && (!view.job || legacyJob.startedAt > view.job.startedAt ||
         (legacyJob.id === view.job.id && legacyJob.at > view.job.at))) view.job = legacyJob;
-    sendJson(response, 200, view);
+    // The executor hands a read-only token's GET over only after checking the token; this answer skips its masking, so a
+    // token gets the projection without free text (docs/mcp.md 3.1).
+    sendJson(response, 200, request.headers.authorization !== undefined && route === 'update' ? readTokenUpdateView(view) : view);
   }
 
   const server = createServer((request, response) => {

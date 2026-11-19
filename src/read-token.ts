@@ -6,6 +6,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createRedactor, type Redactor } from './read-redact.ts';
+import type { UpdateView } from './service/update-types.ts';
 
 export const READ_TOKEN_FILE = 'read-token.json';
 export const READ_TOKEN_TTL_MS = 90 * 86_400_000;
@@ -225,4 +226,20 @@ export function readTokenAllows(url: URL): boolean {
   if (!route) return false;
   for (const name of url.searchParams.keys()) if (!route.query.includes(name)) return false;
   return true;
+}
+
+/**
+ * What a token reads of the online update: versions, state and times, without the install output, messages and release
+ * notes. In split mode the control process answers this itself, past the masking, so it carries no free text at all.
+ */
+export function readTokenUpdateView(view: UpdateView): unknown {
+  const job = view.job;
+  return {
+    current: view.current ? { version: view.current.version, commit: view.current.commit, packaged: view.current.packaged } : null,
+    latest: view.latest ? { version: view.latest.version, publishedAt: view.latest.publishedAt } : null,
+    checkedAt: view.checkedAt ?? null, checking: view.checking ?? false, checkFailed: Boolean(view.error), available: view.available ?? false,
+    enabled: view.enabled ?? false,
+    pending: view.pending ? { version: view.pending.version, at: view.pending.at, stale: view.pending.stale } : null,
+    job: job ? { version: job.version, from: job.from, startedAt: job.startedAt, at: job.at, phase: job.phase, step: job.step ?? null, installed: job.installed ?? null, stale: job.stale ?? false } : null,
+  };
 }

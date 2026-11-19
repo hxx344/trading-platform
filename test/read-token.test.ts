@@ -10,6 +10,10 @@ import { createExecutorServer, type ServiceViews } from '../src/http.ts';
 import { LoginThrottle } from '../src/login-password.ts';
 import { READ_TOKEN_FILE, READ_TOKEN_ROUTES, READ_TOKEN_TTL_MS, createReadTokens, readTokenAllows } from '../src/read-token.ts';
 import { createRedactor, identifierField } from '../src/read-redact.ts';
+import { createOndoModule } from '../src/service/ondo.ts';
+import type { UpdateView } from '../src/service/update-types.ts';
+import { ONDO_MM_DEFAULTS } from '../src/vendor/ondo/mm.mjs';
+import type { OndoClient } from '../src/vendor/ondo/client.mjs';
 import { bindAccounts, createHarness } from './harness.ts';
 
 const TOKEN = 'read-token-access-0001';
@@ -38,7 +42,7 @@ async function start({ now = () => clock.now, extra = {} as Partial<ServiceViews
   const lines: string[] = [];
   const tokens = readTokens ? createReadTokens({ dir, now, log: line => lines.push(line) }) : undefined;
   const server = createExecutorServer({ executor: h.ex, accessToken: TOKEN, session: SESSION, views: views(extra), log: line => lines.push(line),
-    ...(tokens ? { readTokens: tokens } : {}), tokenThrottle: new LoginThrottle(now) });
+    ...(tokens ? { readTokens: tokens } : {}), tokenThrottle: () => new LoginThrottle(now) });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const login = await fetch(`${base}/login?token=${TOKEN}`, { redirect: 'manual' });
@@ -64,12 +68,20 @@ test('只读令牌：没有令牌文件、令牌错误一律 401；连续错误�
     assert.equal((await s.read(`tpr_${'A'.repeat(43)}`, '/api/status')).status, 401, '尚未生成');
     const token = await s.generate();
     assert.equal((await s.read(token, '/api/status')).status, 200);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const used = s.tokens!.view();
+    clock.now += 1_000;
     assert.equal((await s.read(`${token}x`, '/api/status')).status, 401);
     assert.equal((await fetch(`${s.base}/api/status`, { headers: { authorization: token } })).status, 401, '缺少 Bearer');
     let locked = false;
     for (let i = 0; i < 12 && !locked; i += 1) locked = (await s.read(`tpr_${'B'.repeat(43)}`, '/api/status')).status === 429;
     assert.ok(locked, '连续错误后锁定');
-    assert.equal((await s.read(token, '/api/status')).status, 429, '锁定期间正确令牌也要等');
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.deepEqual([s.tokens!.view().lastUsedAt, s.tokens!.view().requests24h], [used.lastUsedAt, used.requests24h], '被拒的请求不算使用');
+    const logged = s.lines.length;
+    for (let i = 0; i < 5; i += 1) assert.equal((await s.read(`tpr_${'B'.repeat(43)}`, '/api/status')).status, 429);
+    assert.equal(s.lines.length, logged, '锁定期间的请求不写日志');
+    assert.equal((await s.read(token, '/api/status')).status, 429, '同一来源锁定期间正确令牌也要等');
     clock.now += 10 * 60_000;
     assert.equal((await s.read(token, '/api/status')).status, 200, '锁定结束后恢复');
     assert.ok(s.lines.every(line => !line.includes(token) && !line.includes('B'.repeat(43))), '日志不含令牌');
@@ -256,6 +268,76 @@ test('打码：字段名不分大小写与下划线；地址类字段里的地�
   assert.equal(out.at, '1970-01-01T00:00:00.000Z');
   assert.equal(out.price, '1.25');
   assert.equal(out.label, 'xau');
+  const words = redact({ text: '子账户 50000 USDT 已划转；UID 88776655 已暂停；账户 1234567 的余额 12.5%', users: 3, user: 123456 }) as Record<string, unknown>;
+  assert.match(String(words.text), /^子账户 50000 USDT 已划转；UID acct-[0-9a-f]{8} 已暂停；账户 acct-[0-9a-f]{8} 的余额/, '数字后跟单位是金额，不打码');
+  assert.equal(words.users, 3, '计数字段的数字不打码');
+  assert.match(String(words.user), /^acct-/);
   assert.equal(seen.get(String(out.wallet)), ADDRESS);
   assert.ok(identifierField('walletAddress') && identifierField('sub-account-id') && !identifierField('pairId'));
 });
+
+/** Every original a masked answer must not carry: values under identifier fields and 0x runs, from the session's answer. */
+function originals(value: unknown, field = '', out = new Set<string>()): Set<string> {
+  if (typeof value === 'string') {
+    for (const run of value.match(/0x[0-9a-fA-F]{40,}/g) ?? []) out.add(run);
+    if (identifierField(field) && value.length >= 4) out.add(value);
+  } else if (typeof value === 'number' && identifierField(field) && /(id|ids|uid|user|account)$/i.test(field) && String(value).length >= 4) out.add(String(value));
+  else if (Array.isArray(value)) for (const item of value) originals(item, field, out);
+  else if (value !== null && typeof value === 'object') for (const [name, item] of Object.entries(value)) { originals(name, '', out); originals(item, name, out); }
+  return out;
+}
+
+const UPDATE: UpdateView = {
+  current: { version: '0.69.0', commit: 'abc1234', packaged: true },
+  latest: { version: '0.69.1', name: 'v0.69.1', notes: '更新说明：发布说明正文', publishedAt: '2026-11-19T00:00:00Z', url: 'https://github.com/example/releases/v0.69.1' },
+  checkedAt: 1, checking: false, error: null, retryAt: null, manualAt: 0, available: true, enabled: true,
+  pending: { id: 'req-1', version: '0.69.1', at: 2, stale: false },
+  job: { id: 'job-1', version: '0.69.1', from: '0.69.0', startedAt: 3, at: 4, phase: 'running', step: 'install', message: '正在安装 /home/svc-trader', output: ['/home/svc-trader/trading-platform/data 已备份'] },
+};
+
+test('只读令牌：真实视图逐个读取，应答里没有会话应答中的任何标识原值，读取过程不向外发请求；在线更新只给投影', async () => {
+  clock.now = Date.UTC(2026, 10, 19);
+  const dataDir = mkdtempSync(join(tmpdir(), 'tp-read-token-ondo-'));
+  const client = {
+    async markets() { return new Map([['NVDA-USD.P', { tick: '0.01', step: '0.01', trading: true, makerFee: null }]]); },
+    async depth(name: string) { return { market: name, time: Date.now(), bids: [['100.00', '3']], asks: [['100.02', '4']] }; },
+    close() {},
+  } as unknown as OndoClient;
+  const ondo = await createOndoModule({ initial: { ...structuredClone(ONDO_MM_DEFAULTS), mode: 'observe', markets: ['NVDA-USD.P'], orderUsd: '250', maxPositionUsd: '250' } as never }, undefined, dataDir, { log: () => {}, rewardsClient: () => client, mmIntervalMs: 0 });
+  const s = await start({ extra: { ondo: ondo.views, update: { status: () => structuredClone(UPDATE), check: async () => ({}), apply: () => ({}) } } });
+  const realFetch = globalThis.fetch;
+  try {
+    const token = await s.generate();
+    const outbound: string[] = [];
+    const local = new URL(s.base).host;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
+      if (url.host !== local) outbound.push(url.href);
+      return realFetch(input, init);
+    }) as typeof fetch;
+    // The executor's own state (accounts, jobs, transfers, ADL) and the modules wired here, through the real views.
+    const checked = new Set<string>();
+    for (const path of ['/api/state', '/api/status', '/api/logs', '/api/oil/state', '/api/ondo/state', '/api/transfer-pairs/xau/history', '/api/adl/pairs/xau/incidents']) {
+      const session = await realFetch(s.base + path, { headers: { cookie: s.cookie } });
+      const masked = await s.read(token, path);
+      assert.equal(masked.status, session.status, path);
+      const plain = await session.text(), text = await masked.text();
+      if (session.headers.get('content-type')?.includes('json')) for (const original of originals(JSON.parse(plain))) { checked.add(`${path} ${original}`); assert.ok(!text.includes(original), `${path} 含原值 ${original}`); }
+      assert.doesNotMatch(text, HEX_RUN, path);
+    }
+    assert.deepEqual(outbound, [], '令牌读取不向外发请求');
+    assert.ok([...checked].some(item => item.startsWith('/api/state ')), `执行器状态里的账户标识也核对过：${[...checked].join('；')}`);
+    // The update status: versions, state and times only; no install output, message, notes or links.
+    const update = await (await s.read(token, '/api/update')).json() as Record<string, unknown>;
+    assert.deepEqual(update, {
+      current: { version: '0.69.0', commit: 'abc1234', packaged: true }, latest: { version: '0.69.1', publishedAt: '2026-11-19T00:00:00Z' },
+      checkedAt: 1, checking: false, checkFailed: false, available: true, enabled: true, pending: { version: '0.69.1', at: 2, stale: false },
+      job: { version: '0.69.1', from: '0.69.0', startedAt: 3, at: 4, phase: 'running', step: 'install', installed: null, stale: false },
+    });
+    assert.match(await (await realFetch(`${s.base}/api/update`, { headers: { cookie: s.cookie } })).text(), /svc-trader/, '会话仍看到完整内容');
+  } finally {
+    globalThis.fetch = realFetch;
+    await s.close(); await ondo.close(); rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+

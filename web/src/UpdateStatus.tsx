@@ -10,7 +10,7 @@ import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { ArrowRight, Check, ChevronRight, CircleAlert, Download, LoaderCircle, RefreshCw, X } from 'lucide-react';
 import { api, ApiError } from './api.ts';
-import { blockedReason, dateTime, jobLabels, jobPhase, nextWatched, parseUpdateView, readsInBackground, reloading, stepLabels, summaryOf, toneOf, updating, type UpdateJob, type UpdatePageState, type UpdateView } from './update-view.ts';
+import { blockedReason, dateTime, jobLabels, jobPhase, nextLoaded, nextWatched, parseUpdateView, readsInBackground, reloading, stepLabels, summaryOf, toneOf, updating, type UpdateJob, type UpdatePageState, type UpdateView } from './update-view.ts';
 import { useLiveResource } from './use-live-resource.ts';
 import './updates.css';
 
@@ -51,6 +51,7 @@ export function UpdateStatus({ onExpired, onOpen }: { onExpired: () => void; onO
   const [watched, setWatched] = useState<string | null>(null);
   // The service's version when this page load first read it; a later view on another version reloads the page.
   const [loaded, setLoaded] = useState<string | null>(null);
+  const [mountedAt] = useState(() => Date.now());
   // When a confirm went out without an answer; a read received after it settles what the server has.
   const [uncertainAt, setUncertainAt] = useState<number | null>(null);
   const [notice, setNotice] = useState('');
@@ -70,14 +71,15 @@ export function UpdateStatus({ onExpired, onOpen }: { onExpired: () => void; onO
   // A service without the update answers 404: the button goes away and the reads stop.
   useEffect(() => { if (live.error instanceof ApiError && live.error.status === 404) setMissing(true); }, [live.error]);
   useEffect(() => { if (view) setWatched(current => nextWatched(current, view)); }, [view]);
-  useEffect(() => { if (view) setLoaded(current => current ?? view.current.version); }, [view]);
+  useEffect(() => { if (view) setLoaded(current => nextLoaded(current, view)); }, [view]);
   useEffect(() => { if (uncertainAt !== null && !uncertain) setUncertainAt(null); }, [uncertainAt, uncertain]);
 
   const state: UpdatePageState = { view, offline, busy, watched, uncertain, loaded };
   const reload = reloading(state);
   const wantActive = updating(view) || busy !== null || uncertain || !!view?.checking || (watched !== null && !reload);
   useEffect(() => { setActive(wantActive); }, [wantActive]);
-  const wantBackground = readsInBackground(state);
+  // Every read re-renders, so a service silent past the limit turns the hidden reads off on the next failed read.
+  const wantBackground = readsInBackground(state, Date.now() - (live.receivedAt ?? mountedAt));
   useEffect(() => { setBackground(wantBackground); }, [wantBackground]);
 
   // A full page load picks up the activated bundle, including after a page-only release.

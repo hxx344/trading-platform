@@ -78,9 +78,23 @@ export function reloading(state: UpdatePageState): boolean {
   return !!view && !!state.loaded && view.current.version !== state.loaded && !updating(view);
 }
 
-/** Reads go on while the page is hidden as long as this page follows an update, so its success reloads the page. */
-export function readsInBackground(state: UpdatePageState): boolean {
-  return state.watched !== null || updating(state.view) || state.busy === 'apply' || !!state.uncertain;
+/** Reads that fail for this long in a row stop going on in a hidden tab; the next visible read starts them again. */
+export const BACKGROUND_SILENCE_MS = 10 * 60_000;
+
+/**
+ * Reads go on while the page is hidden as long as this page follows an update, so its success reloads the page, and
+ * until the page has read its loaded version, so a tab opened in the background still notices a later update.
+ * `silentMs` is how long ago the last successful read was (or the page mounted, before any); a service that stays
+ * unreachable that long ends the hidden reads.
+ */
+export function readsInBackground(state: UpdatePageState, silentMs: number): boolean {
+  if (state.offline && silentMs > BACKGROUND_SILENCE_MS) return false;
+  return !state.loaded || state.watched !== null || updating(state.view) || state.busy === 'apply' || !!state.uncertain;
+}
+
+/** The loaded version is the service's version in the first view; later views never move it. */
+export function nextLoaded(loaded: string | null, view: UpdateView): string {
+  return loaded ?? view.current.version;
 }
 
 export function summaryOf(state: UpdatePageState): string {

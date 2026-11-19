@@ -1,7 +1,7 @@
 // The 系统更新 button's wording and when the page lets the update start (web/src/update-view.ts, docs/update.md).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { blockedReason, nextWatched, parseUpdateView, readsInBackground, reloading, summaryOf, toneOf, updating, type UpdatePageState, type UpdateView } from '../web/src/update-view.ts';
+import { BACKGROUND_SILENCE_MS, blockedReason, nextLoaded, nextWatched, parseUpdateView, readsInBackground, reloading, summaryOf, toneOf, updating, type UpdatePageState, type UpdateView } from '../web/src/update-view.ts';
 
 const base = (over: Partial<UpdateView> = {}): UpdateView => ({
   current: { version: 'v0.49.1', commit: 'abcdef123456', packaged: true },
@@ -96,12 +96,29 @@ test('系统更新：服务换成页面载入时以外的版本且没有更新�
   assert.equal(reloading(page(base({ current: moved.current, job: job('running', { stale: true }) }), { loaded: 'v0.49.1' })), true, '超时的运行结果不算进行中');
 });
 
-test('系统更新：本页跟着一次更新时后台也继续读取，其余时候随页面暂停', () => {
-  assert.equal(readsInBackground(page(base())), false);
-  assert.equal(readsInBackground(page(base(), { watched: 'job-1' })), true);
-  assert.equal(readsInBackground(page(base({ job: job('running') }))), true);
-  assert.equal(readsInBackground(page(base(), { busy: 'apply' })), true);
-  assert.equal(readsInBackground(page(base(), { uncertain: true })), true);
-  assert.equal(readsInBackground(page(base(), { busy: 'check' })), false);
-  assert.equal(readsInBackground(page(null)), false);
+test('系统更新：本页跟着一次更新或还没读到载入版本时后台也继续读取，其余时候随页面暂停', () => {
+  const at = (state: UpdatePageState) => readsInBackground(state, 0);
+  const loaded = { loaded: 'v0.49.1' };
+  assert.equal(at(page(base(), loaded)), false);
+  assert.equal(at(page(base(), { ...loaded, watched: 'job-1' })), true);
+  assert.equal(at(page(base({ job: job('running') }), loaded)), true);
+  assert.equal(at(page(base(), { ...loaded, busy: 'apply' })), true);
+  assert.equal(at(page(base(), { ...loaded, uncertain: true })), true);
+  assert.equal(at(page(base(), { ...loaded, busy: 'check' })), false);
+  assert.equal(at(page(null)), true, '在后台打开的页面先读到载入版本');
+  assert.equal(at(page(base(), { loaded: null })), true);
+});
+
+test('系统更新：连续读不到满 10 分钟停止后台读取，读到后恢复', () => {
+  const following = page(base({ job: job('running') }), { loaded: 'v0.49.1', watched: 'job-1', offline: true });
+  assert.equal(readsInBackground(following, BACKGROUND_SILENCE_MS), true);
+  assert.equal(readsInBackground(following, BACKGROUND_SILENCE_MS + 1), false);
+  assert.equal(readsInBackground(page(null, { offline: true }), BACKGROUND_SILENCE_MS + 1), false);
+  assert.equal(readsInBackground({ ...following, offline: false }, BACKGROUND_SILENCE_MS + 1), true, '这次读到了就恢复');
+});
+
+test('系统更新：载入版本只取第一次读到的服务版本，之后的读取和写入应答都不改它', () => {
+  const first = nextLoaded(null, base());
+  assert.equal(first, 'v0.49.1');
+  assert.equal(nextLoaded(first, base({ current: { version: 'v0.50.0', commit: null, packaged: true } })), 'v0.49.1');
 });

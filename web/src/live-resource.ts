@@ -153,6 +153,8 @@ export function createResourceStore(env: ResourceEnvironment) {
       entry.subscribers.add(subscriber);
       const current = entry;
       if (!readable(current)) suspend(current);
+      // 暂停中的共享条目因本订阅者的后台读取变得可读：与开关后台读取同样恢复。
+      else if (current.snapshot.status === 'paused' || current.snapshot.status === 'offline') revive(key, current);
       else catchUp(key, current);
       listener(current.snapshot as ResourceSnapshot<T>);
       const leave = () => {
@@ -168,7 +170,7 @@ export function createResourceStore(env: ResourceEnvironment) {
         subscriber.intervalMs = ms;
         if (readable(current)) catchUp(key, current);
       };
-      // 打开或关闭本订阅者的后台读取；页面隐藏时打开即按间隔补读，关闭即暂停。
+      // 打开或关闭本订阅者的后台读取；页面隐藏时打开即补读一次并恢复轮询，关闭即暂停。
       const setBackground = (on: boolean) => {
         if (subscriber.background === on || !current.subscribers.has(subscriber)) return;
         subscriber.background = on;

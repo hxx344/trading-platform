@@ -110,3 +110,85 @@ test('live-resource：共享条目中要求后台读取的订阅者离开后，�
   await fake.advance(5_000);
   assert.equal(reads(), 3);
 });
+
+// A read that stays in flight until the test settles it; aborts are recorded.
+function pendingReads() {
+  const calls = [];
+  const read = signal => new Promise((resolve, reject) => {
+    const call = { resolve, reject, aborted: false };
+    signal.addEventListener('abort', () => { call.aborted = true; reject(new Error('aborted')); });
+    calls.push(call);
+  });
+  return { calls, read };
+}
+
+test('live-resource：后台读取时页面切到隐藏，在途读取不被中止、也不多发', async () => {
+  const fake = fakeEnvironment();
+  const store = createResourceStore(fake.env);
+  const { calls, read } = pendingReads();
+  const snapshots = [];
+  store.subscribe('/a', { read, intervalMs: 1_000, background: true }, snapshot => snapshots.push(snapshot));
+  await fake.settle();
+  assert.equal(calls.length, 1);
+  await fake.setHidden(true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].aborted, false);
+  calls[0].resolve(7);
+  await fake.settle();
+  assert.equal(snapshots.at(-1).data, 7);
+  assert.equal(snapshots.at(-1).status, 'ready');
+});
+
+test('live-resource：读取在途时关闭后台读取会中止它，回到前台重读', async () => {
+  const fake = fakeEnvironment();
+  const store = createResourceStore(fake.env);
+  const { calls, read } = pendingReads();
+  const snapshots = [];
+  const subscription = store.subscribe('/a', { read, intervalMs: 1_000, background: true }, snapshot => snapshots.push(snapshot));
+  await fake.setHidden(true);
+  await fake.settle();
+  assert.equal(calls.length, 1);
+  subscription.setBackground(false);
+  await fake.settle();
+  assert.equal(calls[0].aborted, true);
+  assert.equal(snapshots.at(-1).status, 'paused');
+  await fake.advance(5_000);
+  assert.equal(calls.length, 1);
+  await fake.setHidden(false);
+  assert.equal(calls.length, 2);
+});
+
+test('live-resource：后台读取遇到 401 后不自动重试，隐藏与恢复都只显示失败', async () => {
+  const fake = fakeEnvironment();
+  const store = createResourceStore(fake.env);
+  let reads = 0;
+  const read = async () => { reads++; throw Object.assign(new Error('expired'), { status: 401 }); };
+  const snapshots = [];
+  const subscription = store.subscribe('/a', { read, intervalMs: 1_000, background: true }, snapshot => snapshots.push(snapshot));
+  await fake.settle();
+  assert.equal(reads, 1);
+  await fake.setHidden(true);
+  await fake.advance(5_000);
+  subscription.setBackground(false);
+  subscription.setBackground(true);
+  await fake.setHidden(false);
+  await fake.advance(5_000);
+  assert.equal(reads, 1);
+  assert.equal(snapshots.at(-1).status, 'error');
+});
+
+test('live-resource：隐藏时带后台读取的订阅者加入已暂停的共享条目，立即恢复读取', async () => {
+  const fake = fakeEnvironment();
+  const store = createResourceStore(fake.env);
+  let reads = 0;
+  const read = async () => ++reads;
+  const snapshots = [];
+  store.subscribe('/a', { read, intervalMs: 60_000 }, snapshot => snapshots.push(snapshot));
+  await fake.settle();
+  await fake.setHidden(true);
+  assert.equal(snapshots.at(-1).status, 'paused');
+  store.subscribe('/a', { read, intervalMs: 60_000, background: true }, () => {});
+  await fake.settle();
+  assert.equal(reads, 2);
+  assert.equal(snapshots.at(-1).status, 'ready');
+});

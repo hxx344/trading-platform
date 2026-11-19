@@ -24,7 +24,7 @@ export function NewsPage({ onExpired }: { onExpired: () => void }) {
       <h2>EQN 快讯</h2>
       {connection ? <span className={`connection ${connection.tone === 'ok' ? 'mint' : connection.tone === 'warn' ? 'amber' : ''}`} data-news-connection={data!.connection.state}><i />{connection.text}</span> : null}
     </div>
-    <p className="panel-note">eqn.news 方程式新闻主频道：上新、公告与要闻。内容由程序抓取和翻译，AI 摘要由 AI 生成，仅供参考，不构成投资建议。服务器上只保留最近 200 条，重启后补回最新 50 条。</p>
+    <p className="panel-note">eqn.news 方程式新闻主频道：上新、公告与要闻。内容由程序抓取和翻译，AI 摘要由 AI 生成，仅供参考，不构成投资建议。这里显示最近 100 条，服务重启后补回最新 50 条。</p>
     {error && data ? <p className="panel-note err">刷新失败：{error.message}（停留在 {clock(receivedAt)}）</p> : null}
     {problem ? <p className="panel-note err">{problem}</p> : null}
     {!data

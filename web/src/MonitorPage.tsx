@@ -101,6 +101,8 @@ export function MonitorPage({ onExpired }: { onExpired: () => void }) {
   // Markets this page can show, in the service's order; a market a newer service adds stays hidden here.
   const markets = [...state.data.markets.filter(market => market in MARKET_TABS && market !== MOVES_TAB), ...(newsOn ? [MOVES_TAB] : [])];
   if (!markets.length) return <StatePanel kind="empty" title="本服务没有启用行情监控" />;
+  // 记住的是异动行情、快讯第一次读取还没回来：先等，免得先挂上第一个市场并开始它的读取。
+  if (chosen === MOVES_TAB && !newsOn && news.data === null && news.error === null && news.status === 'loading') return <StatePanel kind="loading" title="加载中…" />;
   const active = chosen && markets.includes(chosen) ? chosen : markets[0];
   const choose = (market: string) => {
     setChosen(market); try { localStorage.setItem(TAB_KEY, market); } catch { /* the choice only lasts this visit */ }

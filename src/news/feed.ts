@@ -96,11 +96,14 @@ export function createNewsFeed({ fetchImpl = fetch, connect = url => new WebSock
     if (wait > 0) throw new Error(`EQN 接口限流，${Math.ceil(wait / 1_000)} 秒后重试`);
     const response = await fetchImpl(`${EQN_REST}/news?channel=${encodeURIComponent(channel)}&limit=${limit}`, { headers: { accept: 'application/json' }, signal: AbortSignal.any([stopped.signal, AbortSignal.timeout(REST_TIMEOUT_MS)]) });
     if (response.status === 429) {
-      const retry = Number(response.headers.get('retry-after'));
+      // 没有 Retry-After 或不是秒数（HTTP 日期）时按 10 秒。
+      const header = response.headers.get('retry-after'), retry = header === null || header.trim() === '' ? NaN : Number(header);
       cooldownUntil = now() + Math.min(120, Math.max(5, Number.isFinite(retry) ? retry : 10)) * 1_000;
       throw new Error('EQN 接口限流（429），稍后重试');
     }
     if (!response.ok) throw new Error(`EQN 快讯接口返回 ${response.status}`);
+    // 先按 content-length 拒掉大应答；没有这个头时读完再按字符数比较（读取受 8 秒超时约束）。
+    if (Number(response.headers.get('content-length')) > BODY_MAX) { await response.body?.cancel().catch(() => {}); throw new Error('EQN 快讯应答过大'); }
     const body = await response.text();
     if (body.length > BODY_MAX) throw new Error('EQN 快讯应答过大');
     let parsed: unknown;
@@ -131,15 +134,18 @@ export function createNewsFeed({ fetchImpl = fetch, connect = url => new WebSock
     })();
     return flashReading;
   }
-  /** REST 记录到了：替换同编号的推送条目；没有编号的推送条目按标题对上就去掉。 */
+  /** REST 记录到了：替换同编号的推送条目；推送条目的标题对上 REST 记录也去掉（编号缺失或对不上时）。 */
   function reconcile(items: readonly NewsItem[]): void {
     const titles = new Set(items.flatMap(item => [item.zh, item.en]).filter((title): title is string => title !== null));
-    for (const [id, item] of flashItems) if (item.pushed && item.no === null && titles.has((item.zh ?? item.en)!)) flashItems.delete(id);
+    for (const [id, item] of flashItems) if (item.pushed && titles.has((item.zh ?? item.en)!)) flashItems.delete(id);
     merge(flashItems, items);
   }
-  /** 刚读完时按连接状态重排；断开时只会提前，反复断开也不会把补读一直往后推。 */
+  /**
+   * 刚读完时按连接状态重排；断开时只会提前，反复断开也不会把补读一直往后推。
+   * 上次读取失败（如重连补读撞上 429 暂停）时按断开的间隔重试，不等 5 分钟。
+   */
   function scheduleFlashPoll(afterRead: boolean): void {
-    const at = now() + (connection.state === 'open' ? FLASH_POLL_UP_MS : FLASH_POLL_DOWN_MS);
+    const at = now() + (connection.state === 'open' && flashRest.error === null ? FLASH_POLL_UP_MS : FLASH_POLL_DOWN_MS);
     if (!afterRead && flashPoll && flashPollAt <= at) return;
     cancel(flashPoll);
     flashPollAt = at;
@@ -150,6 +156,8 @@ export function createNewsFeed({ fetchImpl = fetch, connect = url => new WebSock
   const connection = { state: 'connecting' as ConnectionState, since: now(), lastPushAt: null as number | null, closeCode: null as number | null, reconnects: 0 };
   let socket: NewsSocket | null = null, generation = 0, attempt = 0, openedAt = 0, lastSeen = 0, downSince: number | null = null;
   let pingTimer: ReturnType<typeof setTimeout> | undefined, openTimer: ReturnType<typeof setTimeout> | undefined;
+  // 推送后的 REST 核对：2 秒那次已排上就不再排（连续推送时最多每 2 秒一次），15 秒那次按最后一条推送重排。
+  let pushSoon: ReturnType<typeof setTimeout> | undefined, pushLate: ReturnType<typeof setTimeout> | undefined;
   const setState = (state: ConnectionState) => { if (connection.state !== state) { connection.state = state; connection.since = now(); } };
 
   function open(): void {
@@ -184,7 +192,9 @@ export function createNewsFeed({ fetchImpl = fetch, connect = url => new WebSock
       if (!item) return;
       connection.lastPushAt = now();
       merge(flashItems, [item]);
-      for (const ms of PUSH_CHECK_MS) later(ms, () => void refreshFlash());
+      if (!pushSoon) pushSoon = later(PUSH_CHECK_MS[0], () => { pushSoon = undefined; void refreshFlash(); });
+      cancel(pushLate);
+      pushLate = later(PUSH_CHECK_MS[1], () => { pushLate = undefined; void refreshFlash(); });
     });
     current.addEventListener('error', () => { /* close 随后带关闭码到达 */ });
     current.addEventListener('close', event => { if (mine()) down(id, typeof event.code === 'number' ? event.code : null); });
@@ -214,7 +224,8 @@ export function createNewsFeed({ fetchImpl = fetch, connect = url => new WebSock
     }
     setState('retrying');
     const backoff = Math.min(RETRY_MAX_MS, 1_000 * 2 ** attempt++) * (0.8 + 0.4 * random());
-    const delay = code === 1012 ? 1_000 + 4_000 * random() : code === 1008 || code === 1013 ? Math.max(15_000, backoff) : backoff;
+    // 1012（上游重启）先快速重连，连续出现时随退避增长。
+    const delay = code === 1012 ? Math.max(1_000 + 4_000 * random(), backoff) : code === 1008 || code === 1013 ? Math.max(15_000, backoff) : backoff;
     later(Math.round(delay), open);
     scheduleFlashPoll(false);
   }

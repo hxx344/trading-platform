@@ -59,7 +59,9 @@ const words = (value: unknown): string[] => Array.isArray(value)
 
 /** 快讯页地址末尾的编号（https://eqn.news/main/15970 → 15970）。 */
 export function numberFromUrl(url: string | null): number | null {
-  const match = url ? /\/(\d{1,12})\/?$/.exec(new URL(url).pathname) : null;
+  // 只认 eqn.news 自己的快讯页（https://eqn.news/main/16010）；原公告地址末尾的数字不是 EQN 编号。
+  const parsed = url ? new URL(url) : null;
+  const match = parsed && parsed.hostname === 'eqn.news' ? /\/(\d{1,12})\/?$/.exec(parsed.pathname) : null;
   return match ? Number(match[1]) : null;
 }
 

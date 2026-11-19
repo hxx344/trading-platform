@@ -275,3 +275,151 @@ test('接口：没开快讯 404，循环开始前 503，之后返回快讯与异
     assert.equal(moves.channels.length, 4);
   } finally { holder.feed?.close(); await new Promise(resolve => server.close(resolve)); h.dispose(); }
 });
+
+// ---- 审查补充（docs/reviews/2026-11-19-eqn-news.md）----
+
+const frame = (no: number | null, title: string, host = 'eqn.news') => ({ data: JSON.stringify({ source_name: 'A', news_title: title, coins_included: [], url: no === null ? null : `https://${host}/main/${no}`, timestamp: T0 / 1_000 }) });
+
+test('推送密集时 REST 核对有上限：2 秒那次排上就不再排，15 秒那次按最后一条推送重排', async t => {
+  const h = harness({ pages: { main: [] } });
+  t.after(() => { h.feed.close(); mock.timers.reset(); });
+  await settle();
+  h.sockets[0]!.emit('open');
+  await settle();
+  const base = h.requests.length;
+  // 10 秒内每 0.5 秒一条推送。
+  for (let i = 0; i < 20; i++) { h.sockets[0]!.emit('message', frame(300 + i, `推送 ${i}`)); await advance(500); }
+  const during = h.requests.length - base;
+  assert.ok(during >= 4 && during <= 5, `10 秒内核对 ${during} 次，应约每 2 秒一次`);
+  // 最后一条推送 15 秒后还有一次核对，之后安静。
+  await advance(14_000);
+  const late = h.requests.length;
+  await advance(1_000);
+  assert.equal(h.requests.length, late + 1);
+  await advance(60_000);
+  assert.equal(h.requests.length, late + 1);
+});
+
+test('推送编号只认 eqn.news 的链接；别处链接按标题与 REST 记录对上', async t => {
+  assert.equal(numberFromUrl('https://upbit.com/service_center/notice/5678'), null);
+  const h = harness({ pages: { main: [] } });
+  t.after(() => { h.feed.close(); mock.timers.reset(); });
+  await settle();
+  h.sockets[0]!.emit('open');
+  await settle();
+  h.sockets[0]!.emit('message', frame(5678, '中文标题 400', 'upbit.com'));
+  assert.deepEqual(h.feed.flash().items.map(item => [item.no, item.pushed]), [[null, true]]);
+  h.state.pages.main = [restItem(400, T0)];
+  await advance(2_000);
+  assert.deepEqual(h.feed.flash().items.map(item => [item.no, item.pushed]), [[400, false]]);
+});
+
+test('重连：error 与 close 连发、超时后旧连接的 close 迟到，都只重连一次', async t => {
+  const h = harness();
+  t.after(() => { h.feed.close(); mock.timers.reset(); });
+  await settle();
+  h.sockets[0]!.emit('open');
+  await settle();
+  h.sockets[0]!.emit('error');
+  h.sockets[0]!.emit('close', { code: 1006 });
+  h.sockets[0]!.emit('close', { code: 1006 });
+  await advance(30_000);
+  assert.equal(h.sockets.length, 2);
+  // 第二条连接 10 秒没连上：超时重连，随后它的 close 迟到。
+  await advance(10_000);
+  assert.ok(h.sockets[1]!.closed);
+  h.sockets[1]!.emit('close', { code: 1006 });
+  await advance(30_000);
+  assert.equal(h.sockets.length, 3, '迟到的 close 不再触发重连');
+  h.sockets[2]!.emit('open');
+  await settle();
+  // 旧连接的消息不进列表。
+  h.sockets[0]!.emit('message', frame(500, '旧连接'));
+  assert.equal(h.feed.flash().items.some(item => item.no === 500), false);
+});
+
+test('关闭码 1012 先快速重连，连续出现时随退避增长', async t => {
+  const h = harness();
+  t.after(() => { h.feed.close(); mock.timers.reset(); });
+  await settle();
+  const waits: number[] = [];
+  for (let i = 0; i < 6; i++) {
+    const count = h.sockets.length;
+    h.sockets.at(-1)!.emit('close', { code: 1012 });
+    let waited = 0;
+    while (h.sockets.length === count) { await advance(500); waited += 500; }
+    waits.push(waited);
+  }
+  // random = 0.5：1012 的下限 3 秒；退避 1、2、4、8、16、30 秒。
+  assert.deepEqual(waits, [3_000, 3_000, 4_000, 8_000, 16_000, 30_000]);
+});
+
+test('停服时 REST 在途：请求被中止，之后不写入也不再排读取', async t => {
+  mock.timers.enable({ apis: ['setTimeout', 'Date'], now: T0 });
+  t.after(() => mock.timers.reset());
+  let calls = 0;
+  const pending: (() => void)[] = [];
+  const fetchImpl = (_url: string, init?: RequestInit) => {
+    calls++;
+    return new Promise<Response>((resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal!.reason));
+      pending.push(() => resolve(new Response(JSON.stringify({ items: [restItem(600, T0)], next_cursor: null }))));
+    });
+  };
+  const feed = createNewsFeed({ fetchImpl: fetchImpl as typeof fetch, connect: url => new FakeSocket(url), random: () => 0.5, log: () => {} });
+  await settle();
+  assert.equal(calls, 1);
+  feed.close();
+  await settle();
+  for (const resolve of pending) resolve();
+  await settle();
+  const view = feed.flash();
+  assert.deepEqual(view.items, []);
+  assert.equal(view.rest.error, null, '停服中止不算读取失败');
+  await advance(10 * 60_000);
+  assert.equal(calls, 1);
+});
+
+test('429 没有 Retry-After 或是日期格式时暂停 10 秒', async t => {
+  for (const retryAfter of [null, 'Wed, 21 Oct 2026 07:28:00 GMT']) {
+    const h = harness({ status: 429, retryAfter });
+    await settle();
+    h.state.status = 200;
+    const moves = () => h.feed.moves().channels[0]!.error;
+    h.feed.moves();
+    await settle();
+    assert.match(moves()!, /限流，10 秒后重试/);
+    await advance(10_000 + MOVES_POLL_MS);
+    assert.equal(moves(), null);
+    h.feed.close();
+    mock.timers.reset();
+  }
+  t.diagnostic('两种情况都按 10 秒');
+});
+
+test('异动行情：停止后再读能重新开始，同一时刻只跑一轮；列表有上限', async t => {
+  const many = Array.from({ length: 250 }, (_, i) => ({ ...restItem(1_000 + i, T0 - i * 1_000), channels: ['pricechange'], url: `https://eqn.news/monitor/${1_000 + i}` }));
+  const h = harness({ pages: { pricechange: many } });
+  t.after(() => { h.feed.close(); mock.timers.reset(); });
+  await settle();
+  const movesRequests = () => h.requests.filter(url => !url.includes('channel=main')).length;
+  h.feed.moves();
+  h.feed.moves();
+  await settle();
+  assert.equal(movesRequests(), 4, '连读两次只跑一轮');
+  const view = h.feed.moves();
+  assert.equal(view.items.length, 200);
+  assert.equal(view.items[0]!.no, 1_000);
+  await advance(MOVES_INTEREST_MS + 2 * MOVES_POLL_MS);
+  const stopped = movesRequests();
+  await advance(3 * MOVES_POLL_MS);
+  assert.equal(movesRequests(), stopped);
+  h.feed.moves();
+  await settle();
+  assert.equal(movesRequests(), stopped + 4, '停止后再读重新开始');
+  // 快讯接口只返回最新 100 条。
+  const socket = h.sockets.at(-1)!;
+  socket.emit('open');
+  for (let i = 0; i < 150; i++) socket.emit('message', frame(2_000 + i, `推送 ${i}`));
+  assert.equal(h.feed.flash().items.length, 100);
+});

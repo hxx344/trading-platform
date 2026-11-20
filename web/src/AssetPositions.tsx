@@ -5,6 +5,7 @@
 //   代替工作台的 positions-cache 与它自己的唤醒/离线处理；
 // - 筛选只放在页面状态里（工作台写进地址栏查询参数，本服务的路由在 hash 里）；
 // - 服务没有配置资产账本（404）时显示与资产页相同含义的空状态。
+import './positions.css';
 import { memo, useState } from 'react';
 import { ArrowUpRight, ChevronDown, CircleAlert, LoaderCircle, RefreshCw, ShieldCheck } from 'lucide-react';
 import { Callout, StatePanel } from './StateViews.tsx';

@@ -176,6 +176,13 @@ table.data.log-table td.log-text{white-space:pre-wrap;word-break:break-word;font
 .svg-plot-tick{fill:var(--text-tertiary);font-size:11px}
 .svg-plot-tooltip{position:absolute;top:4px;z-index:2;padding:8px 10px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);background:var(--surface-3);box-shadow:var(--shadow-md);pointer-events:none}
 table.data.history{min-width:0}
+/* 原油、海力士与设置页共用的字段网格，来自 trading.css 同一工作台版本。 */
+.execution-review-settings{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:0;padding:14px 0;border-block:1px solid var(--execution-border)}
+.execution-review-settings dt{font-size:11px;color:var(--execution-muted);letter-spacing:.02em}
+.execution-review-settings dd{font-family:var(--font-mono);font-size:.8125rem;font-variant-numeric:tabular-nums;margin:5px 0 0;color:var(--text-primary)}
+@media(max-width:1080px){
+  .execution-review-settings{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
 /* The oil page: what the copied workbench trading styles (trading.css) leave to the page itself. */
 .visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 .execution-presets.oil-presets button:disabled{opacity:.55;cursor:not-allowed}

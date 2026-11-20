@@ -59,7 +59,8 @@ test('页面文件：仓库里的构建产物能通过同一检查', { skip: exi
 });
 
 test('HTTP：构建出的页面与 /assets 须登录，页面 CSP 不放行内联脚本和样式', async () => {
-  const dir = fixture();
+  const css = '.panel{display:block}'.repeat(80);
+  const dir = fixture(dir => writeFileSync(join(dir, 'assets', 'index-b2.css'), css));
   const h = createHarness();
   bindAccounts(h.ex);
   const server = createExecutorServer({ executor: h.ex, accessToken: 'web-access-token-0001', session: 'web-session-value-0001', app: loadWebApp(dir) });
@@ -90,6 +91,15 @@ test('HTTP：构建出的页面与 /assets 须登录，页面 CSP 不放行内�
     assert.equal(script.headers.get('content-type'), 'text/javascript; charset=utf-8');
     assert.equal(script.headers.get('cache-control'), 'private, max-age=31536000, immutable');
     assert.equal(script.headers.get('x-content-type-options'), 'nosniff');
+    for (const [accept, encoding] of [['gzip', 'gzip'], ['br, *;q=0.5', 'gzip'], ['*;q=1, gzip;q=0', null], ['br', null], ['gzip;q=.3, identity;q=1', null]] as const) {
+      const style = await fetch(`${base}/assets/index-b2.css`, { headers: { cookie, 'accept-encoding': accept } });
+      assert.equal(style.headers.get('content-encoding'), encoding, accept);
+      assert.equal(style.headers.get('vary'), 'Accept-Encoding');
+      assert.equal(Number(style.headers.get('content-length')) < css.length, encoding === 'gzip');
+      assert.equal(await style.text(), css);
+    }
+    assert.equal((await fetch(`${base}/assets/index-b2.css`, { headers: { cookie, 'accept-encoding': '*;q=0' } })).status, 406);
+    assert.equal((await fetch(`${base}/assets/index-b2.css`, { headers: { 'accept-encoding': 'gzip' } })).status, 401);
     assert.equal((await fetch(`${base}/assets/missing.js`, { headers: { cookie } })).status, 404);
     assert.equal((await fetch(`${base}/assets/%2e%2e%2findex.html`, { headers: { cookie } })).status, 404);
     assert.equal((await fetch(`${base}/assets/x/index-a1.js`, { headers: { cookie } })).status, 404);
@@ -101,6 +111,30 @@ test('HTTP：构建出的页面与 /assets 须登录，页面 CSP 不放行内�
     h.dispose();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('页面导航只在会话内显示已接入模块和采集代次，免读账单、快讯与交易明细', async t => {
+  const h = createHarness();
+  t.after(() => h.dispose());
+  const unread = () => assert.fail('导航不应读取业务视图');
+  const server = createExecutorServer({ executor: h.ex, accessToken: 'shell-login', views: {
+    news: { flash: unread, moves: unread }, oil: { market: unread, state: unread },
+    monitor: { state: () => ({ markets: ['oil'], controls: { oil: { enabled: false, revision: 7, error: '仅监控页显示' } } }), quote: unread, candles: unread },
+  } });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  assert.equal((await fetch(base + '/api/shell')).status, 401);
+  const login = await fetch(base + '/login?token=shell-login', { redirect: 'manual' });
+  const cookie = login.headers.getSetCookie()[0]!.split(';')[0]!;
+  const reply = await fetch(base + '/api/shell', { headers: { cookie } });
+  assert.equal(reply.status, 200);
+  assert.equal(reply.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(await reply.json(), {
+    generation: h.ex.generation, retired: h.ex.retired, transport: 'simulated',
+    modules: { oil: true, options: false, asset: false, crossex: false, ondo: false, news: true },
+    monitor: { oil: { enabled: false, revision: 7 } },
+  });
 });
 
 test('页面请求号：应答前重试沿用同一编号；有应答（含拒绝）或输入变化后换新编号；格式是服务端接受的 UUID', async () => {

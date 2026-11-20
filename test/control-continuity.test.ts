@@ -76,7 +76,7 @@ function release(dir: string, version: string, script: string): string {
   writeFileSync(join(root, 'VERSION'), `${version} 0123456789ab\n`);
   writeFileSync(join(root, '.executor-sha256'), EXECUTION_BUILD);
   writeFileSync(join(dist, 'index.html'), `<!doctype html><title>${version}</title><script src="/assets/${script}"></script>`);
-  writeFileSync(join(dist, 'assets', script), `document.title = "${version}";`);
+  writeFileSync(join(dist, 'assets', script), `document.title = "${version}";\n`.repeat(32));
   return root;
 }
 
@@ -172,6 +172,9 @@ test('更换页面版本、杀掉并重启控制面期间，两腿交易、保�
   await until('同一控制进程提供新页面', async () => { original.check(); return (await page('/')).includes('/assets/new.js') ? true : null; });
   assert.match(await page('/assets/new.js'), /v0\.64\.1/);
   assert.match(await page('/assets/old.js'), /v0\.64\.0/, '切换前已发出的 HTML 仍能载入自己的脚本');
+  const oldAsset = await fetch(base + '/assets/old.js', { headers: { cookie, 'accept-encoding': 'gzip' } });
+  assert.equal(oldAsset.headers.get('content-encoding'), 'gzip');
+  assert.match(await oldAsset.text(), /v0\.64\.0/);
   assert.equal((await api<State>('/api/state')).jobs[0].id, active.job.id);
   await original.kill();
   pendingReply.destroy();

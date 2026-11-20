@@ -1,6 +1,7 @@
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createServer as createNetServer, type AddressInfo } from 'node:net';
 import { ContractError } from './contracts.ts';
+import type { WebAsset } from './web-assets.ts';
 
 export const PAGE_HEADERS = {
   'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer',
@@ -12,6 +13,30 @@ export const APP_HEADERS = {
   'content-security-policy': "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
 };
 export const ASSET_HEADERS = { 'cache-control': 'private, max-age=31536000, immutable', 'x-content-type-options': 'nosniff', 'cross-origin-resource-policy': 'same-origin' };
+
+/** Both authenticated static-file paths serve the same in-memory representations. */
+export function sendWebAsset(response: ServerResponse, asset: WebAsset, acceptEncoding: string | undefined): void {
+  const weights = new Map<string, number>();
+  for (const part of (acceptEncoding ?? '').toLowerCase().split(',')) {
+    const [name, ...parameters] = part.trim().split(';');
+    const parameter = parameters.map(item => item.trim()).find(item => /^q\s*=/.test(item));
+    const weight = parameter === undefined ? 1 : Number(parameter.slice(parameter.indexOf('=') + 1).trim());
+    weights.set(name!.trim(), Number.isFinite(weight) && weight >= 0 && weight <= 1 ? weight : 0);
+  }
+  const wildcard = weights.get('*');
+  const gzipWeight = weights.get('gzip') ?? wildcard ?? 0;
+  const identityWeight = weights.get('identity');
+  const compressed = gzipWeight > 0 && gzipWeight >= (identityWeight ?? 0) ? asset.gzip : undefined;
+  if (!compressed && (identityWeight ?? (wildcard === 0 ? 0 : 1)) === 0) {
+    response.writeHead(406, { 'cache-control': 'no-store', vary: 'Accept-Encoding' });
+    response.end();
+    return;
+  }
+  const body = compressed ?? asset.body;
+  response.writeHead(200, { ...ASSET_HEADERS, vary: 'Accept-Encoding', 'content-type': asset.type, 'content-length': body.length,
+    ...(compressed ? { 'content-encoding': 'gzip' } : {}) });
+  response.end(body);
+}
 export const ASSET_PATH = /^\/assets\/([^/]{1,128})$/;
 export const CONTROL_HEADER = 'x-trading-platform-control';
 export const EXECUTION_HEADER = 'x-trading-platform-execution';

@@ -1,21 +1,21 @@
 import { Activity, ArrowDownRight, ArrowUpRight, ChevronDown, Clock3, Info, MoveRight, RefreshCw } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ANTHROPIC_COMPARISON_LEGS, ANTHROPIC_LEGS, anthropicPremium, anthropicSharesPerUnit, perShare, type AnthropicComparisonLeg, type AnthropicShares } from '../../src/vendor/anthropic-market.mjs';
 import { api, ApiError } from './api.ts';
 import { ANTHROPIC_WARMUP_DAYS, anthropicChartConfig, anthropicPoints, anthropicQuote, dailyPoints, ranges, selectRange, type AnthropicQuote, type ChartMode, type Point } from './monitor-history.ts';
 import { candleReadDenied } from './monitor-candle-cache.ts';
 import { anthropicCandles, useMonitorCandles } from './use-monitor-candles.ts';
 import { SpreadChart, date, stamp } from './MonitorChart.tsx';
-import { disabledNotice, parseControl, parseControls, switchFailure, switchLabel, toggleBody, type MonitorControls } from './monitor-control.ts';
+import { disabledNotice, parseControl, parseControls, switchFailure, switchLabel, toggleBody, type MonitorControl, type MonitorControls } from './monitor-control.ts';
 import { DetailLayout, RelatedPositions } from './MonitorRelated.tsx';
 import { linkedMonitorTab, withoutMonitorLink } from './monitor-link.ts';
 import { HynixPanel } from './MonitorHynix.tsx';
 import { OilPanel } from './MonitorOil.tsx';
 import { PerpetualPanel } from './MonitorPerpetual.tsx';
 import { MovesPanel } from './MonitorMoves.tsx';
-import { NEWS_PATH, NEWS_READ_TIMEOUT_MS, parseFlash, type FlashView } from './news.ts';
 import { StatePanel } from './StateViews.tsx';
-import { useLiveResource } from './use-live-resource.ts';
+import { useLiveResource, type LiveResource } from './use-live-resource.ts';
+import { shellMarkets, type MonitorScopes, type ShellView } from '../../src/shell-view.ts';
 import { mainQuoteDisplay, mainQuoteRetention, monitorReadError } from './monitor-display.ts';
 import './monitor.css';
 
@@ -57,32 +57,27 @@ const TAB_KEY = 'monitor:market:v1';
 const savedTab = () => { try { return localStorage.getItem(TAB_KEY); } catch { return null; } };
 // M-5c: a pair-chart link opens its market over the saved tab, also on back / forward (monitor-link.ts).
 
-export function MonitorPage({ onExpired }: { onExpired: () => void }) {
-  const state = useLiveResource<MonitorState>(MONITOR_STATE_PATH, { intervalMs: STATE_MS, timeoutMs: MONITOR_READ_TIMEOUT_MS, parse: parseMonitorState, onExpired });
-  // 与侧栏的快讯入口共用同一读取（同路径、同超时与校验），只决定异动行情页签是否显示；不读 /api/news/moves，免得没看时也触发轮询。
-  const news = useLiveResource<FlashView>(NEWS_PATH, { intervalMs: STATE_MS, timeoutMs: NEWS_READ_TIMEOUT_MS, parse: parseFlash, onExpired });
-  const newsOn = news.data !== null || (news.error instanceof ApiError && news.error.status === 503);
+export function MonitorPage({ shell, scopes, onControlChanged, onExpired }: {
+  shell: LiveResource<ShellView>; scopes: MonitorScopes | null; onControlChanged: (market: string, control: MonitorControl) => Promise<void>; onExpired: () => void;
+}) {
+  // The first full snapshot must be read after the shell establishes the collector generations.
+  const state = useLiveResource<MonitorState>(MONITOR_STATE_PATH, { intervalMs: STATE_MS, timeoutMs: MONITOR_READ_TIMEOUT_MS, parse: parseMonitorState, enabled: scopes !== null, onExpired });
   const [chosen, setChosen] = useState<string | null>(() => linkedMonitorTab(location.href) ?? savedTab());
   const [pending, setPending] = useState<string | null>(null);
   const [switchError, setSwitchError] = useState<{ market: string; text: string } | null>(null);
-  const { data: current, commit, refresh } = state;
+  const { data: current, refresh } = state;
   useEffect(() => {
     const follow = () => { const linked = linkedMonitorTab(location.href); if (linked) setChosen(linked); };
     window.addEventListener('popstate', follow);
     return () => window.removeEventListener('popstate', follow);
   }, []);
-  // The answer is merged into the latest state, not the one at the click: a state read landing meanwhile keeps the other markets.
-  const latest = useRef(current);
-  latest.current = current;
   const toggle = useCallback(async (market: string) => {
     const control = current?.controls?.[market];
     if (!current || !control || pending) return;
     setPending(market); setSwitchError(null);
     try {
       const view = parseControl(await api<unknown>(`/api/monitor/${market}/control`, { body: toggleBody(control), timeoutMs: CONTROL_TIMEOUT_MS }));
-      // The answer is the saved switch: it shows at once, without waiting for the next minute's read.
-      const base = latest.current ?? current;
-      commit({ ...base, controls: { ...base.controls, [market]: view } });
+      await onControlChanged(market, view);
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) { onExpired(); return; }
       const answered = error instanceof ApiError;
@@ -90,33 +85,44 @@ export function MonitorPage({ onExpired }: { onExpired: () => void }) {
       // A conflict or an unknown outcome: read the switch again so the page shows what the service has.
       if (!answered || error.code === 'control_conflict') void refresh();
     } finally { setPending(null); }
-  }, [current, pending, commit, refresh, onExpired]);
+  }, [current, pending, refresh, onControlChanged, onExpired]);
+  if (!shell.data && (shell.error || shell.status === 'offline')) return <StatePanel kind="error" title="读取行情监控失败" detail={shell.error?.message ?? '网络离线'} />;
+  if (shell.data?.monitor === null) return <StatePanel kind="empty" title="本服务没有启用行情监控" />;
   if (candleReadDenied(state.error) || (!state.data && (state.status === 'error' || state.status === 'offline')))
     return <StatePanel kind="error" title="读取行情监控失败" detail={state.error?.message ?? '网络离线'} />;
-  if (!state.data) return <StatePanel kind="loading" title="加载中…" />;
+  if (!current) return <StatePanel kind="loading" title="加载中…" />;
+  const readFailure = state.error?.message ?? shell.error?.message;
+  const checking = <StatePanel kind={readFailure ? 'error' : 'loading'} title={readFailure ? '行情开关状态待核对' : '正在核对行情开关…'} detail={readFailure}>{readFailure && <button type="button" onClick={() => { void refresh(); void shell.refresh(); }}>重新读取</button>}</StatePanel>;
   // Markets this page can show, in the service's order; a market a newer service adds stays hidden here.
-  const markets = [...state.data.markets.filter(market => market in MARKET_TABS && market !== MOVES_TAB), ...(newsOn ? [MOVES_TAB] : [])];
+  const sharedMarkets = current.markets.filter(market => scopes && Object.hasOwn(scopes, market));
+  const movesAvailable = shell.data?.modules.news;
+  if (!sharedMarkets.length && !(movesAvailable && chosen === MOVES_TAB)
+    && shellMarkets.some(market => scopes?.[market] || current.markets.includes(market))) return checking;
+  const markets = movesAvailable ? [...sharedMarkets, MOVES_TAB] : sharedMarkets;
   if (!markets.length) return <StatePanel kind="empty" title="本服务没有启用行情监控" />;
-  // 记住的是异动行情、快讯第一次读取还没回来：先等，免得先挂上第一个市场并开始它的读取。
-  if (chosen === MOVES_TAB && !newsOn && news.data === null && news.error === null && news.status === 'loading') return <StatePanel kind="loading" title="加载中…" />;
   const active = chosen && markets.includes(chosen) ? chosen : markets[0];
   const choose = (market: string) => {
     setChosen(market); try { localStorage.setItem(TAB_KEY, market); } catch { /* the choice only lasts this visit */ }
     if (market !== 'perpetual' && linkedMonitorTab(location.href)) history.replaceState(history.state, '', withoutMonitorLink(location.href));
   };
-  const shares = state.data.anthropic?.shares;
-  const control = state.data.controls?.[active];
+  const shares = current.anthropic?.shares;
+  const control = current.controls?.[active];
+  const market = shellMarkets.find(item => item === active);
+  const scope = market && scopes?.[market];
+  // Either read can arrive first. Only mount this market after its cached generation and full view agree.
+  const confirmed = active === MOVES_TAB || (!!scope && scope.enabled === (control?.enabled ?? true) && scope.revision === (control?.revision ?? null));
   const busy = pending === active, failed = switchError?.market === active;
   // The run switch sits on the right of the market tabs, as in the workbench hub; with one market the row shows only it.
-  const controls = state.data.controls && active !== MOVES_TAB && <div className="hub-monitor-controls"><span>运行监控</span><button type="button" role="switch" aria-checked={control?.enabled ?? false} aria-busy={busy} aria-label={`${MARKET_TABS[active]}运行监控`} disabled={!control || pending !== null} onClick={() => void toggle(active)}><span>{switchLabel(control, busy, failed)}</span><i aria-hidden="true" /></button></div>;
+  const controls = confirmed && current.controls && active !== MOVES_TAB && <div className="hub-monitor-controls"><span>运行监控</span><button type="button" role="switch" aria-checked={control?.enabled ?? false} aria-busy={busy} aria-label={`${MARKET_TABS[active]}运行监控`} disabled={!control || pending !== null} onClick={() => void toggle(active)}><span>{switchLabel(control, busy, failed)}</span><i aria-hidden="true" /></button></div>;
   const off = control?.enabled === false;
   // Only the shown market subscribes. Switching it off unmounts the panel and its readers.
   return <div className="monitor-desk">
     <div className="site-shell" data-monitor={active}><div className="monitor-main">
       {(markets.length > 1 || controls) && <div className="hub-nav-row">{markets.length > 1 ? <div className="hub-market-nav" role="tablist" aria-label="选择监控市场">{markets.map(market => <button type="button" role="tab" key={market} aria-selected={active === market} data-state={active === market ? 'active' : 'inactive'} className="hub-market-tab" onClick={() => choose(market)}>{MARKET_TABS[market]}</button>)}</div> : <span />}{controls}</div>}
       {failed && <p className="hub-control-notice" role="alert">{switchError.text}</p>}
-      {control?.error && <p className="hub-control-notice" role="alert">{control.error}</p>}
-      {off ? <p className="notice" role="status">{disabledNotice(active)}</p>
+      {confirmed && control?.error && <p className="hub-control-notice" role="alert">{control.error}</p>}
+      {!confirmed ? checking
+        : off ? <p className="notice" role="status">{disabledNotice(active)}</p>
         : active === MOVES_TAB ? <MovesPanel onExpired={onExpired} /> : active === 'oil' ? <OilPanel onExpired={onExpired} /> : active === 'hynix' ? <HynixPanel onExpired={onExpired} /> : active === 'perpetual' ? <PerpetualPanel onExpired={onExpired} /> : shares && <AnthropicPanel outstanding={shares.outstanding} diluted={shares.diluted} onExpired={onExpired} />}
     </div></div>
   </div>;

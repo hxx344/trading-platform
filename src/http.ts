@@ -7,7 +7,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { isIP } from 'node:net';
 import { ContractError, TRANSFER_CONFIG_KEYS, VENUES, exactKeys, parsePage, type Venue } from './contracts.ts';
 import type { Executor } from './executor.ts';
-import { APP_HEADERS, ASSET_HEADERS, CLIENT_ADDRESS_HEADER, CONFIG_CHECK_HEADER, CONFIG_MATCH_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, PAGE_HEADERS, controlRoute, readJson, sendJson, sendJsonText, sessionCookieName } from './http-public.ts';
+import { APP_HEADERS, CLIENT_ADDRESS_HEADER, CONFIG_CHECK_HEADER, CONFIG_MATCH_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, PAGE_HEADERS, controlRoute, readJson, sendJson, sendJsonText, sendWebAsset, sessionCookieName } from './http-public.ts';
 import { LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash } from './login-password.ts';
 import { READ_TOKEN_MAX_BYTES, readTokenAllows, readTokenUpdateView, type ReadTokens } from './read-token.ts';
 import type { Redactor } from './read-redact.ts';
@@ -17,6 +17,7 @@ import { ANTHROPIC_RETENTION_DAYS } from './vendor/anthropic-market.mjs';
 import { encodeCandleBlocks } from './candle-blocks-server.ts';
 import { isDisplayRead, READ_CACHE, ReadViewCache, versionLength } from './read-view.ts';
 import { readViewReply } from './read-view-server.ts';
+import { monitorScopes, type ShellView } from './shell-view.ts';
 import { MONITOR_CANDLE_BLOCK_MS, monitorCandleField, type MonitorCandleUpdate } from './monitor/candle-window.ts';
 import { supportsExchange, type Exchange } from './vendor/exchange-comparison.mjs';
 import { supportsFundingHistory } from './vendor/exchange-funding-history.mjs';
@@ -422,8 +423,7 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       if (privateSocket) return handOff(response);
       const asset = app?.assets.get(url.pathname.slice('/assets/'.length));
       if (!asset) return send(response, 404, { code: 'not_found', message: '不存在' });
-      response.writeHead(200, { ...ASSET_HEADERS, 'content-type': asset.type, 'content-length': String(asset.body.length) });
-      response.end(asset.body);
+      sendWebAsset(response, asset, request.headers['accept-encoding']);
       return;
     }
     if (!url.pathname.startsWith('/api/')) return send(response, 404, { code: 'not_found', message: '不存在' });
@@ -448,6 +448,14 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
 
   /** The routes behind the session (or the read-only token's whitelist), once the caller is let in. */
   async function serve(request: IncomingMessage, response: ServerResponse, url: URL, kind: ReturnType<typeof controlRoute>): Promise<void> {
+    if (request.method === 'GET' && url.pathname === '/api/shell') {
+      return send(response, 200, {
+        generation: executor.generation, retired: executor.retired, transport: executor.environment === 'mainnet' ? 'live' : 'simulated',
+        modules: { oil: !!views?.oil, options: !!views?.options, asset: !!views?.asset,
+          crossex: !!views?.crossex, ondo: !!views?.ondo, news: !!views?.news },
+        monitor: monitorScopes(views?.monitor?.state()),
+      } satisfies ShellView);
+    }
     if (request.method === 'GET' && url.pathname === '/api/state') {
       return send(response, 200, { generation: executor.generation, retired: executor.retired, transport: executor.environment === 'mainnet' ? 'live' : 'simulated', accounts: executor.accounts(), notionalLimits: executor.notionalLimits(), jobs: executor.recentJobs(20),
         transfers: { pairs: executor.transferPairs(), corruptPairs: executor.corruptTransferPairs(), recent: executor.recentTransfers(20) },

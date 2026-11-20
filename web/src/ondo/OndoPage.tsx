@@ -3,6 +3,7 @@
 // - API Key 不在页面填写：只读显示 secrets.json 里的 Key 尾号，导入或修改的方法写在卡片里；
 // - 文案里的「工作台服务器」改为「本服务」；
 // - 页面末尾加「奖励市场盘口与收益模拟」（OndoRewards.tsx）。
+import './ondo.css';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { LoaderCircle, Play, RefreshCw, Save, Square } from 'lucide-react';
 import { api, ApiError } from '../api.ts';

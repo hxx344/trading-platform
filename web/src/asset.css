@@ -2,7 +2,7 @@
    改动：每条选择器前加 ".asset-desk " 限定范围；:root 调色板与字体移到 .asset-desk（与 styles.css、aster.css 同名的
    --card、--primary、--border、--warning 等在资产页内按工作台取值）；body 的字体与字号放到 .asset-desk 本身；工作台
    在 hub 内嵌（.hub-embedded）时的 .ledger-head、.page 规则直接作为资产页的规则，并去掉左右留白（外层 .workspace 已留）；
-   本文件在 main.tsx 里排在 aster.css 之后，同优先级的 ".aster-desk .panel" 等由这里覆盖。
+   本文件随资产页面加载，排在外壳的 aster.css 之后，同优先级的 ".aster-desk .panel" 等由这里覆盖。
    末尾两节分别是 shadcn 表格、标签组件（components/ui/table.tsx、tabs.tsx）的 Tailwind 类名换算成的普通 CSS，以及
    本服务只读版本自己加的少量规则（弹窗改为原位展开的面板、导入命令、资金流列表）。 */
 

@@ -4,6 +4,7 @@
 // 设置页不填写或移除 API 密钥，未连接账户时顶部按钮是「账户设置」；内容区是 div.crossex-main（外壳已有 <main>）；页脚「源代码」
 // 指向本仓库（运行版本的源代码）；写入只在服务明确拒绝时换请求编号（write-outcome.ts），401 立即提示重新登录。
 // 子页面地址为 #/crossex[/trade|/hedge|/orders|/settings]。
+import './crossex.css';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertCircle, AlertTriangle, ArrowLeftRight, RefreshCw, LayoutDashboard, CandlestickChart, ListOrdered, Settings2 } from 'lucide-react';
 import { api } from '../api.ts';

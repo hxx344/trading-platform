@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { readComponentBuild } from '../component-build.ts';
 import { ContractError, exactKeys } from '../contracts.ts';
-import { APP_HEADERS, ASSET_HEADERS, ASSET_PATH, CLIENT_ADDRESS_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, controlRoute, listenPublic, readJson, sendJson } from '../http-public.ts';
+import { APP_HEADERS, ASSET_PATH, CLIENT_ADDRESS_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, controlRoute, listenPublic, readJson, sendJson, sendWebAsset } from '../http-public.ts';
 import { readTokenUpdateView } from '../read-token.ts';
 import { parseListenConfig, urlHost } from '../service/listen-config.ts';
 import { createUpdates, readInstalledVersion, updateReadyFile, type UpdateFetch, type UpdateView } from '../service/update.ts';
@@ -100,8 +100,7 @@ export function createControl(options: {
       // An index already sent to the browser can ask for its hashed scripts just after a page-only switch.
       const asset = release.app.assets.get(name) ?? previousAssets?.get(name);
       if (!asset) { sendJson(response, 404, { code: 'not_found', message: '不存在' }); return; }
-      response.writeHead(200, { ...ASSET_HEADERS, 'content-type': asset.type, 'content-length': asset.body.length });
-      response.end(asset.body);
+      sendWebAsset(response, asset, request.headers['accept-encoding']);
       return;
     }
     if (route === 'apply') { sendJson(response, 200, updates.apply(await readJson(request))); return; }

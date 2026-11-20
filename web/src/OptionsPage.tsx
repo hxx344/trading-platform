@@ -1,3 +1,4 @@
+import './options.css';
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { api, ApiError } from './api.ts';
 import {

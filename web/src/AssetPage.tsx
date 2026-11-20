@@ -4,6 +4,7 @@
 // ledger (A-2, docs/asset.md); the sync and the connections view are A-3 (AssetConnections.tsx); the workbook import
 // dialog is A-6 (AssetImport.tsx, opened from the example-data notice); dialogs became panels opened in place; the toasts
 // are a status line under the alerts.
+import './asset.css';
 import { Check, ChevronRight, Eye, Info, Pencil, Plus, RefreshCw, ShieldCheck, Trash2, TriangleAlert, X } from 'lucide-react';
 import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { api, ApiError } from './api.ts';

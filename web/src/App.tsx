@@ -1,32 +1,17 @@
 import { Activity, ArrowLeftRight, Cpu, ChevronRight, Coins, Gauge, Layers, Menu, Newspaper, RefreshCw, ScrollText, Server, Settings2, ShieldCheck, Sigma, Wallet, type LucideIcon } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { OIL_READ_TIMEOUT_MS, OIL_STATE_PATH, OilPage } from './OilPage.tsx';
-import { HynixPage } from './HynixPage.tsx';
-import { ASSET_READ_TIMEOUT_MS, ASSET_STATE_PATH, AssetPage } from './AssetPage.tsx';
-import { AssetPositions } from './AssetPositions.tsx';
-import { LogsPage } from './LogsPage.tsx';
-import { NewsPage } from './NewsPage.tsx';
-import { NEWS_PATH, NEWS_READ_TIMEOUT_MS, parseFlash, type FlashView } from './news.ts';
-import { MONITOR_READ_TIMEOUT_MS, MONITOR_STATE_PATH, MonitorPage, parseMonitorState, type MonitorState } from './MonitorPage.tsx';
-import { OPTIONS_READ_TIMEOUT_MS, OPTIONS_STATE_PATH, OptionsPage } from './OptionsPage.tsx';
-import type { OptionsState } from './options-types.ts';
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { shellMarkets, type MarketScope, type MonitorScopes, type ShellView } from '../../src/shell-view.ts';
+import { LazyBoundary } from './LazyBoundary.tsx';
 import { PairsWorkspace } from './PairsWorkspace.tsx';
 import { useRoute } from './route.ts';
-import { SettingsPage } from './SettingsPage.tsx';
-import { StatusPage } from './StatusPage.tsx';
 import { UpdateStatus } from './UpdateStatus.tsx';
 import { READ_TOKEN_PATH, READ_TOKEN_REFRESH_MS, navNotice, type ReadTokenView } from './read-token-form.ts';
 import { Callout, StatePanel } from './StateViews.tsx';
 import { clock } from './labels.ts';
-import { invalidateMonitorDisplay, useLiveResource } from './use-live-resource.ts';
-import { readAccessDenied } from './live-resource.ts';
+import { invalidateMonitorDisplay, revalidateMonitorState, useLiveResource } from './use-live-resource.ts';
+import { readAccessDenied, type ResourceSnapshot } from './live-resource.ts';
 import { ApiError } from './api.ts';
 import type { ServiceState } from './types.ts';
-import type { OilState } from './oil-types.ts';
-import type { AssetState } from '../../src/asset/views.ts';
-import { CrossexPage } from './crossex/CrossexPage.tsx';
-import { CROSSEX_READ_TIMEOUT_MS, CROSSEX_STATE_PATH } from './crossex/crossex-api.ts';
-import { ONDO_READ_TIMEOUT_MS, ONDO_STATE_PATH, OndoPage } from './ondo/OndoPage.tsx';
 import { breadcrumbOf, entryOf, navEntries, workspaceGroups, type NavEntry } from './workspace-nav.ts';
 
 // The shell follows the workbench's main interface (src/App.tsx, 31242e0): a side navigation grouped by the workspaces
@@ -38,12 +23,26 @@ import { breadcrumbOf, entryOf, navEntries, workspaceGroups, type NavEntry } fro
 const REFRESH_MS = 2_000;
 const READ_TIMEOUT_MS = 10_000;
 
-const OIL_CHECK_MS = 60_000;
-const ASSET_CHECK_MS = 60_000;
-/** Shown on every service; the oil and monitor entries only where their state path answers (a service without that
- * module returns 404 there), the asset entry unless /api/asset/state answers 404 (a ledger that cannot be read keeps
- * the entry, and the page says why), the CrossEx and options entries where their state path answers or answers 503
- * (configured but not started, retrying: the page says why). */
+// Keep the default pair workspace ready while its first state request is in flight.
+const AssetPage = lazy(() => import('./AssetPage.tsx').then(m => ({ default: m.AssetPage })));
+const AssetPositions = lazy(() => import('./AssetPositions.tsx').then(m => ({ default: m.AssetPositions })));
+const MonitorPage = lazy(() => import('./MonitorPage.tsx').then(m => ({ default: m.MonitorPage })));
+const NewsPage = lazy(() => import('./NewsPage.tsx').then(m => ({ default: m.NewsPage })));
+const OilPage = lazy(() => import('./OilPage.tsx').then(m => ({ default: m.OilPage })));
+const HynixPage = lazy(() => import('./HynixPage.tsx').then(m => ({ default: m.HynixPage })));
+const CrossexPage = lazy(() => import('./crossex/CrossexPage.tsx').then(m => ({ default: m.CrossexPage })));
+const OndoPage = lazy(() => import('./ondo/OndoPage.tsx').then(m => ({ default: m.OndoPage })));
+const OptionsPage = lazy(() => import('./OptionsPage.tsx').then(m => ({ default: m.OptionsPage })));
+const StatusPage = lazy(() => import('./StatusPage.tsx').then(m => ({ default: m.StatusPage })));
+const LogsPage = lazy(() => import('./LogsPage.tsx').then(m => ({ default: m.LogsPage })));
+const SettingsPage = lazy(() => import('./SettingsPage.tsx').then(m => ({ default: m.SettingsPage })));
+
+function isStale(read: ResourceSnapshot<unknown>) {
+  const old = read.receivedAt !== null && Date.now() - read.receivedAt > 2 * REFRESH_MS + READ_TIMEOUT_MS;
+  return read.data !== null && (read.status === 'error' || read.status === 'offline' || read.status === 'paused'
+    || (read.status === 'loading' && (read.error !== null || old)));
+}
+
 const ALWAYS: readonly NavEntry[] = ['pairs', 'status', 'logs', 'settings'];
 const ICONS: Record<NavEntry, LucideIcon> = { asset: Wallet, positions: Layers, monitor: Activity, news: Newspaper, oil: ArrowLeftRight, hynix: Cpu, crossex: Gauge, ondo: Coins, pairs: ShieldCheck, options: Sigma, status: Server, logs: ScrollText, settings: Settings2 };
 /** Below this width the side navigation is a drawer (the workbench's 760px breakpoint, shell.css). */
@@ -55,42 +54,55 @@ export function App() {
   const route = useRoute();
   const [expired, setExpired] = useState(false);
   const onExpired = useCallback(() => setExpired(true), []);
-  const live = useLiveResource<ServiceState>('/api/state', { intervalMs: REFRESH_MS, timeoutMs: READ_TIMEOUT_MS, onExpired });
-  const { data: state, status, error, receivedAt, refresh } = live;
-  // The oil page reads the same path faster while it is open; here it only decides whether the tab shows. SK hynix rides
-  // on oil's execution accounts (its state answers exactly where oil's does), so the same read decides its tab too.
-  const oil = useLiveResource<OilState>(OIL_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: OIL_READ_TIMEOUT_MS, onExpired });
-  const options = useLiveResource<OptionsState>(OPTIONS_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: OPTIONS_READ_TIMEOUT_MS, onExpired });
-  const monitor = useLiveResource<MonitorState>(MONITOR_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: MONITOR_READ_TIMEOUT_MS, parse: parseMonitorState, onExpired });
-  const lastMonitor = useRef<MonitorState | null>(null);
-  useEffect(() => {
-    const previous = lastMonitor.current, next = monitor.data;
-    if (!next && !readAccessDenied(monitor.error)) return;
+  const shell = useLiveResource<ShellView>('/api/shell', { intervalMs: REFRESH_MS, timeoutMs: READ_TIMEOUT_MS, onExpired });
+  const { data: state, status, error, receivedAt, refresh } = shell;
+  const pairPage = route.page === 'overview' || route.page === 'pair';
+  const pairs = useLiveResource<ServiceState>('/api/state', { intervalMs: REFRESH_MS, timeoutMs: READ_TIMEOUT_MS, enabled: pairPage, onExpired });
+
+  // Retained public quotes are valid only for the observed collector generation, including while another page is open.
+  const lastMonitor = useRef<MonitorScopes | null | undefined>(undefined);
+  const [appliedScopes, setAppliedScopes] = useState<MonitorScopes | null>(null);
+  const observeMonitor = useCallback((next: MonitorScopes | null, failure: Error | null) => {
+    const previous = lastMonitor.current;
     lastMonitor.current = next;
-    for (const market of ['anthropic', 'oil', 'hynix']) {
-      const control = next?.controls?.[market];
-      if (!next?.markets.includes(market) || control?.enabled === false) {
-        invalidateMonitorDisplay(market, monitor.error ?? new ApiError('行情监控已关闭或未配置', 423));
-      } else if (previous?.controls?.[market]?.enabled && previous.controls[market].revision !== control?.revision) {
-        // Another tab may have stopped and restarted this collector between two reads.
-        invalidateMonitorDisplay(market, null, true);
-      }
+    let changed = (previous == null) !== (next == null);
+    for (const market of shellMarkets) {
+      const before = previous?.[market], after = next?.[market];
+      if (before?.enabled === after?.enabled && before?.revision === after?.revision) continue;
+      changed = true;
+      if (market === 'perpetual') continue;
+      if (!after?.enabled) invalidateMonitorDisplay(market, failure ?? new ApiError('行情监控已关闭或未配置', 423));
+      else if (previous !== undefined && before?.revision !== after.revision) invalidateMonitorDisplay(market, null, true);
     }
-  }, [monitor.data, monitor.error]);
-  // The asset page reads the same path at the same pace and timeout (the shared read keeps the first subscriber's).
-  const asset = useLiveResource<AssetState>(ASSET_STATE_PATH, { intervalMs: ASSET_CHECK_MS, timeoutMs: ASSET_READ_TIMEOUT_MS, onExpired });
-  // The CrossEx page reads its state on its own (tab-specific paths, paused around writes); this only decides whether the entry
-  // shows, so it asks for the light view without the opportunity list.
-  const crossex = useLiveResource<unknown>(`${CROSSEX_STATE_PATH}?opportunities=0`, { intervalMs: OIL_CHECK_MS, timeoutMs: CROSSEX_READ_TIMEOUT_MS, onExpired });
-  // The Ondo page reads the same path at the same timeout; here it only decides whether the entry shows.
-  const ondo = useLiveResource<unknown>(ONDO_STATE_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: ONDO_READ_TIMEOUT_MS, onExpired });
-  // 快讯页读同一路径（每 2 秒），这里只决定入口是否显示；503（正在启动）也显示。
-  const news = useLiveResource<FlashView>(NEWS_PATH, { intervalMs: OIL_CHECK_MS, timeoutMs: NEWS_READ_TIMEOUT_MS, parse: parseFlash, onExpired });
+    if (changed) setAppliedScopes(next);
+    return previous !== undefined && changed;
+  }, []);
+  useLayoutEffect(() => {
+    if (status === 'ready' && state) {
+      if (observeMonitor(state.monitor, null)) void revalidateMonitorState();
+    } else if (readAccessDenied(error)) observeMonitor(null, error);
+  }, [state, status, error, observeMonitor]);
+  const controlChanged = useCallback(async (market: string, control: MarketScope) => {
+    const known = shellMarkets.find(item => item === market);
+    const before = known && lastMonitor.current?.[known];
+    if (known && before && (before.revision ?? 0) <= (control.revision ?? 0)) {
+      observeMonitor({ ...lastMonitor.current, [known]: control }, null);
+    }
+    // Re-read all switches: an acknowledgment for one market cannot confirm the others.
+    await Promise.all([revalidateMonitorState(), refresh()]);
+  }, [observeMonitor, refresh]);
   // The read-only token's expiry hint under 设置 (docs/mcp.md); a service without tokens answers 404 and shows none.
   const readToken = useLiveResource<ReadTokenView>(READ_TOKEN_PATH, { intervalMs: READ_TOKEN_REFRESH_MS, onExpired });
   const tokenNotice = navNotice(readToken.data, Date.now());
-  const available = new Set<NavEntry>([...ALWAYS, ...(oil.data !== null ? ['oil' as const, 'hynix' as const] : []), ...(options.data !== null || (options.error instanceof ApiError && options.error.status === 503) ? ['options' as const] : []), ...(monitor.data !== null ? ['monitor' as const] : []), ...(asset.data !== null || (asset.error instanceof ApiError && asset.error.status === 500) ? ['asset' as const, 'positions' as const] : []),
-    ...(crossex.data !== null || (crossex.error instanceof ApiError && crossex.error.status === 503) ? ['crossex' as const] : []), ...(ondo.data !== null ? ['ondo' as const] : []), ...(news.data !== null || (news.error instanceof ApiError && news.error.status === 503) ? ['news' as const] : [])]);
+  const available = new Set<NavEntry>(ALWAYS);
+  if (state) {
+    for (const entry of ['oil', 'options', 'asset', 'crossex', 'ondo', 'news'] as const) {
+      if (state.modules[entry]) available.add(entry);
+    }
+    if (state.modules.oil) available.add('hynix');
+    if (state.modules.asset) available.add('positions');
+    if (state.monitor !== null) available.add('monitor');
+  }
   const current = entryOf(route), crumb = breadcrumbOf(route);
   // The phone drawer, as in the workbench: focus moves into it, Tab cycles inside, Escape or the backdrop closes it and
   // gives focus back to the menu button. Widening the window past the breakpoint closes it too.
@@ -118,15 +130,34 @@ export function App() {
   }, [menuOpen, closeMenu]);
   // A read that succeeds again (after logging in from another tab) clears the notice.
   useEffect(() => { if (status === 'ready') setExpired(false); }, [status]);
-  const changed = useCallback(() => { void refresh(); }, [refresh]);
-  // The last result stays on screen after a failed read, but must not read as current. Every read passes through
-  // loading; one that follows a failure keeps the error until it succeeds.
-  // A result older than two refreshes and a read timeout is stale too: the first read after the page comes back from
-  // the background has no error yet, and the rows may be hours old.
-  const old = receivedAt !== null && Date.now() - receivedAt > 2 * REFRESH_MS + READ_TIMEOUT_MS;
-  const stale = state !== null && (status === 'error' || status === 'offline' || status === 'paused' || (status === 'loading' && (error !== null || old)));
+  const refreshPairs = pairs.refresh;
+  const changed = useCallback(() => {
+    void refresh();
+    if (pairPage) void refreshPairs();
+  }, [refresh, pairPage, refreshPairs]);
+  const stale = isStale(shell);
   const failed = status === 'error' || status === 'offline';
-  const aster = route.page !== 'oil' && route.page !== 'hynix' && route.page !== 'options' && route.page !== 'monitor' && route.page !== 'asset' && route.page !== 'positions' && route.page !== 'crossex' && route.page !== 'ondo' && route.page !== 'news';
+  const aster = pairPage || ['status', 'logs', 'settings', 'news'].includes(route.page);
+  function pageContent() {
+    switch (route.page) {
+      case 'settings': return <SettingsPage onChanged={changed} onExpired={onExpired} />;
+      case 'status': return <StatusPage onExpired={onExpired} />;
+      case 'logs': return <LogsPage onExpired={onExpired} />;
+      case 'news': return <NewsPage onExpired={onExpired} />;
+      case 'monitor': return <MonitorPage shell={shell} scopes={appliedScopes} onControlChanged={controlChanged} onExpired={onExpired} />;
+      case 'options': return <OptionsPage tab={route.tab} onExpired={onExpired} />;
+      case 'asset': return <AssetPage onExpired={onExpired} />;
+      case 'positions': return <AssetPositions onExpired={onExpired} />;
+      case 'ondo': return <OndoPage onExpired={onExpired} />;
+      case 'crossex': return <CrossexPage tab={route.tab} onExpired={onExpired} />;
+      case 'hynix': return <HynixPage onExpired={onExpired} />;
+      case 'oil': return <OilPage onExpired={onExpired} />;
+      default:
+        if (pairs.data) return <PairsWorkspace state={pairs.data} pairId={route.page === 'pair' ? route.pairId : null} stale={isStale(pairs)} onChanged={changed} onExpired={onExpired} />;
+        if (pairs.status === 'error' || pairs.status === 'offline') return <StatePanel kind="error" title="读取服务状态失败" detail={pairs.error?.message ?? '网络离线'} />;
+        return <StatePanel kind="loading" title="加载中…" />;
+    }
+  }
   return <div className="app-shell">
     {menuOpen ? <button type="button" className="nav-backdrop" aria-label="关闭导航" onClick={closeMenu} /> : null}
     <aside ref={sidebar} className={`sidebar ${menuOpen ? 'open' : ''}`}><Brand /><nav aria-label="主导航">
@@ -168,16 +199,12 @@ export function App() {
         </div>
         <div className="feature-stack">
           {expired ? <Callout tone="warning" action={{ label: '刷新页面', onClick: () => location.reload() }}>会话已失效，请刷新页面重新登录（或用数据目录 access-url 里的登录链接）。</Callout> : null}
-          {aster ? <div className="aster-module">
-            {route.page === 'status' ? <StatusPage onExpired={onExpired} /> : route.page === 'logs' ? <LogsPage onExpired={onExpired} /> : route.page === 'settings'
-              // The import does not need the state: it stays usable when the state cannot be read (the way to add the first pair).
-              ? <SettingsPage onChanged={changed} onExpired={onExpired} />
-              : !state ? (failed
-                ? <StatePanel kind="error" title="读取服务状态失败" detail={error?.message ?? '网络离线'} />
-                : <StatePanel kind="loading" title="加载中…" />)
-                : <PairsWorkspace state={state} pairId={route.page === 'pair' ? route.pairId : null} stale={stale} onChanged={changed} onExpired={onExpired} />}
-          </div> : route.page === 'options' ? <OptionsPage tab={route.tab} onExpired={onExpired} /> : route.page === 'monitor' ? <MonitorPage onExpired={onExpired} /> : route.page === 'asset' ? <AssetPage onExpired={onExpired} /> : route.page === 'positions' ? <AssetPositions onExpired={onExpired} />
-            : route.page === 'news' ? <div className="aster-module"><NewsPage onExpired={onExpired} /></div> : route.page === 'ondo' ? <OndoPage onExpired={onExpired} /> : route.page === 'crossex' ? <CrossexPage tab={route.tab} onExpired={onExpired} /> : route.page === 'hynix' ? <HynixPage onExpired={onExpired} /> : <OilPage onExpired={onExpired} />}
+          {error instanceof ApiError && error.status === 404 ? <Callout tone="warning" action={{ label: '刷新页面', onClick: () => location.reload() }}>服务版本已切换，请刷新以载入对应的页面。</Callout> : null}
+          <LazyBoundary key={current} what={crumb.page}>
+            <Suspense fallback={<StatePanel kind="loading" title="加载中…" />}>
+              {aster ? <div className="aster-module">{pageContent()}</div> : pageContent()}
+            </Suspense>
+          </LazyBoundary>
         </div>
       </div></div></main>
     </div>

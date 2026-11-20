@@ -4,8 +4,9 @@
 import { lstatSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gzipSync } from 'node:zlib';
 
-export interface WebAsset { body: Buffer; type: string }
+export interface WebAsset { body: Buffer; type: string; gzip?: Buffer }
 export interface WebApp { index: Buffer; assets: Map<string, WebAsset> }
 
 /** Where the release keeps the build: web/dist next to src/, in the repository and in the installed package alike. */
@@ -58,7 +59,9 @@ export function loadWebApp(dir: string = WEB_DIST): WebApp {
     if (size > MAX_ASSET_BYTES) throw new Error(`页面文件过大：assets/${name}`);
     total += size;
     if (total > MAX_TOTAL_BYTES) throw new Error('页面文件合计过大');
-    assets.set(name, { body: readFileSync(path), type });
+    const body = readFileSync(path);
+    const gzip = extension === 'js' || extension === 'css' ? gzipSync(body) : undefined;
+    assets.set(name, { body, type, ...(gzip && gzip.length < body.length ? { gzip } : {}) });
   }
   // Every file the page names must be there, or it would load without its script or style.
   for (const [, name] of index.toString('utf8').matchAll(/(?:src|href)="\/assets\/([^"]+)"/g)) {

@@ -27,6 +27,9 @@ export function invalidateMonitorDisplay(market: string, error: Error | null, re
   store.invalidate(key => key.startsWith(prefix), error, reload);
 }
 
+/** Replace the in-flight read, keeping metadata for markets whose collector has not changed. */
+export const revalidateMonitorState = () => store.refresh('/api/monitor/state');
+
 export type LiveResource<T> = ResourceSnapshot<T> & {
   // 立即重读，之前发出的读取作废。
   refresh: () => Promise<void>;
@@ -87,7 +90,7 @@ export function useLiveResource<T>(path: string, { intervalMs, timeoutMs = 10_00
     };
     const current = store.subscribe<T>(path, { read, retain, intervalMs: interval.current, background: inBackground.current }, snapshot => {
       if (snapshot.error instanceof ApiError && snapshot.error.status === 401 && snapshot.error !== handled.current) { handled.current = snapshot.error; expired.current(); }
-      if (path === '/api/state' && snapshot.status === 'ready') store.resumeSession();
+      if (path === '/api/shell' && snapshot.status === 'ready') store.resumeSession();
       setState({ path, snapshot });
     });
     subscription.current = current;

@@ -1,6 +1,6 @@
 /* CrossEx 页的样式入口，按工作台的加载顺序排列：组件样式（按 App.tsx 的引用顺序先加载），再是 main.tsx 引入的
    styles.css（先 design-tokens.css、dark-theme.css）与 relayout.css。每个文件都包在 .aster-desk .crossex-page 里。
-   在 main.tsx 里排在 aster.css 之后：选择器权重相同时 CrossEx 页自己的规则胜出。 */
+   随 CrossEx 页面加载，排在外壳的 aster.css 之后：选择器权重相同时 CrossEx 页自己的规则胜出。 */
 @import './adl-indicator.css';
 @import './position-metrics.css';
 @import './position-actions.css';

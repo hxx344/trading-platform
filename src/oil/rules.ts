@@ -12,7 +12,7 @@ import { ContractError, MAX_BATCHES, MAX_BATCH_INTERVAL_MS, VENUES, VENUE_NAMES,
 import { cmp, decimal, sub } from '../decimal.ts';
 import { comparePremium, premiumPercent } from '../hynix/sizing.ts';
 import {
-  BASE_LEG, FAILURE_LIMIT, JOB_TIMEOUT_MS, LEG_LABELS, MARKET_LABELS, MAX_RULE_JOB_MS, PHASE_NAMES, PREMIUM_LEG, RETRY_MS, RULE_LEGS, RULE_MARKETS, actionName, beijingDay, idleLive, isFinal, liveOf, opensOn, planLegs, planRows, ruleIntent, ruleSession, sameAccount, settleJob, thresholdBounds,
+  BASE_LEG, BLOCKED_GAP_MS, BLOCKED_NOTIFY_MS, FAILURE_LIMIT, JOB_TIMEOUT_MS, LEG_LABELS, MARKET_LABELS, MAX_RULE_JOB_MS, PHASE_NAMES, PREMIUM_LEG, RETRY_MS, RULE_LEGS, RULE_MARKETS, actionName, beijingDay, idleLive, isFinal, liveOf, opensOn, planLegs, planRows, ruleIntent, ruleSession, sameAccount, settleJob, thresholdBounds,
   type LiveState, type RuleExecutor, type RuleMarket, type Tracked,
 } from './rule-live.ts';
 
@@ -383,12 +383,34 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     const rule = find(id);
     return rule && rule.revision === revision && judging(rule) && rule.state.live.phase === phase && !invalid.has(id) ? rule : null;
   }
-  /** After a rejection: a locked contract waits, moved books count again, anything else is a failure (three disable). */
+  /** After a rejection: a locked contract or another position on it waits, moved books count again, anything else is a failure (three disable). */
   function rejected(rule: Rule, action: RuleAction, step: string, error: unknown): void {
     const live = rule.state.live, code = error instanceof ContractError ? error.code : '';
     const text = `${actionName(action)}${step}未通过：${message(error)}`;
+    // Refused for anything else: whatever blocked the rule before is not what stops it now.
+    if (code !== 'implicit_reduce') live.blocked = null;
     // A locked contract, or an executor that lost its writer (stopping or replaced), says nothing about the rule: wait.
     if (code === 'symbol_locked' || code === 'writer_lost') { live.retryAt = now() + RETRY_MS; event(rule.state, `${text}；等待 ${RETRY_MS / 1000} 秒，不计失败`); }
+    // A one-way account holding the other side of this contract, e.g. the oil leg of a gold-oil job (docs/goldoil.md 2):
+    // not the rule's failure, and it may last as long as that position does, so it waits without disabling (L110); the
+    // note is written once while the reason stays the same, so a long wait does not push the rule's other events out.
+    // Waiting BLOCKED_NOTIFY_MS in a row (refusals no more than BLOCKED_GAP_MS apart) writes one notice for a person,
+    // handed to the service's notifier (notices()).
+    else if (code === 'implicit_reduce') {
+      const time = now();
+      if (live.blocked && time - live.blocked.lastAt > BLOCKED_GAP_MS) live.blocked = null;
+      const fresh = !live.blocked, blocked = live.blocked ??= { since: time, lastAt: time, notice: null, notified: false };
+      blocked.lastAt = time;
+      live.retryAt = time + RETRY_MS;
+      const other = rule.config.market === 'oil' ? '同合约有其他仓位（可能是金油任务）' : '同合约有其他仓位';
+      const note = `${text}；${other}，等待 ${RETRY_MS / 1000} 秒，不计失败`;
+      if (fresh || rule.state.events.at(-1)?.message !== note) event(rule.state, note);
+      if (blocked.notice === null && time - blocked.since >= BLOCKED_NOTIFY_MS) {
+        const minutes = Math.floor((time - blocked.since) / 60_000);
+        blocked.notice = `【${MARKET_LABELS[rule.config.market]}自动规则受阻】${ruleTitle(rule.config)}：${actionName(action)}已连续 ${minutes} 分钟被同合约反向仓位阻塞（${other}）；规则不停用，每 ${RETRY_MS / 1000} 秒重试，请核对该账户在交易所的仓位。最近一次：${message(error)}`;
+        event(rule.state, `已连续 ${minutes} 分钟被同合约反向仓位阻塞，已生成通知交给通知队列；规则继续等待，不停用`);
+      }
+    }
     else if (RECOUNT.has(code)) event(rule.state, `${text}；重新计数，不计失败`);
     else {
       live.failures += 1;
@@ -404,7 +426,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
   /** Stops the rule and keeps what it holds for a person to check on the venue. */
   function toReview(rule: Rule, text: string): void {
     const live = rule.state.live;
-    live.phase = 'review'; live.enabled = false; live.reason = text;
+    live.phase = 'review'; live.enabled = false; live.reason = text; live.blocked = null;
     event(rule.state, text);
     save(rule);
   }
@@ -487,6 +509,11 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     hold(rule, `${actionName(action)}已处理，等待新盘口`);
     if (!current) return;
     const live = current.state.live, legs = planLegs(plan, current.config.market);
+    // A preview that passes ends a wait on another position: one record, written with whatever this try saves next.
+    if (live.blocked) {
+      event(current.state, `同合约反向仓位阻塞已解除（持续约 ${Math.max(1, Math.round((now() - live.blocked.since) / 60_000))} 分钟），${actionName(action)}预览已通过，恢复正常判断`);
+      live.blocked = null;
+    }
     if (!legs) { rejected(current, action, '预览', new Error(`预览的两腿不是 ${RULE_LEGS[current.config.market].join('、')}`)); return; }
     const time = now(), day = beijingDay(time);
     // Recheck on the books the plan was priced on: the executor protects the price, this protects the threshold.
@@ -605,6 +632,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
       pending: !reviewing && live.pending ? { action: live.pending.action, at: live.pending.at } : null,
       job: !reviewing && live.job ? { id: live.job.id, action: live.job.action, at: live.job.at } : null,
       opensToday: opensOn(live, beijingDay(time)), failures: live.failures, retryAt: live.retryAt !== null && live.retryAt > time ? live.retryAt : null,
+      blocked: live.enabled && !reviewing && live.blocked ? { since: live.blocked.since, lastAt: live.blocked.lastAt, notified: live.blocked.notified } : null,
       reason: references ? `${live.reason ?? '规则待核对'}（${references}）` : live.reason,
     };
   }
@@ -726,6 +754,26 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     restart(id);
     return view();
   }
-  return { view, tick, create, update, act, checkHynixRebalance: (venue: Venue, key: string) => checkHynixRebalance(db, venue, key), close: () => db.close() };
+  const noticeKey = (rule: Rule): string => `oil-rule-blocked:${rule.id}:${rule.state.live.blocked!.since}`;
+  /** Blocked-rule notices not yet handed to the notifier, each keyed once per wait (the notifier sends a key once). */
+  function notices(): { key: string; text: string }[] {
+    return rows().flatMap(rule => {
+      const blocked = rule.state.mode === 'live' ? rule.state.live.blocked : null;
+      return blocked?.notice && !blocked.notified ? [{ key: noticeKey(rule), text: blocked.notice }] : [];
+    });
+  }
+  /**
+   * Marks a notice as taken by the notifier, once it is in the notifier's outbox. A rule the page changed meanwhile keeps
+   * it unmarked; the next hand-over is dropped by the notifier's key.
+   */
+  function noticeSent(key: string): void {
+    for (const rule of rows()) {
+      const blocked = rule.state.mode === 'live' ? rule.state.live.blocked : null;
+      if (!blocked?.notice || blocked.notified || noticeKey(rule) !== key) continue;
+      blocked.notified = true;
+      writeState.run(JSON.stringify(rule.state), rule.id, rule.revision);
+    }
+  }
+  return { view, tick, create, update, act, notices, noticeSent, checkHynixRebalance: (venue: Venue, key: string) => checkHynixRebalance(db, venue, key), close: () => db.close() };
 }
 export type OilRules = ReturnType<typeof createOilRules>;

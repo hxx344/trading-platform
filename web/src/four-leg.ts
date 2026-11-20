@@ -46,7 +46,7 @@ export function groupStatus(jobs: readonly OilJob[]): { status: GroupState; text
   if (!running) {
     const [a, b] = jobs as [OilJob, OilJob];
     const legs = (job: OilJob): FillLeg[] => job.legs.map(leg => ({ venue: venueText(leg.venue), symbol: leg.symbol, filled: leg.filledQuantity, planned: leg.plannedQuantity, step: leg.quantityStep ?? '0', skipped: leg.skippedQuantity ?? '0',
-      shown: job.market === 'hynix' ? `${leg.filledQuantity} / ${leg.plannedQuantity}` : `${leg.filledBarrels} / ${leg.plannedBarrels} 桶` }));
+      shown: job.market && job.market !== 'oil' ? `${leg.filledQuantity} / ${leg.plannedQuantity}` : `${leg.filledBarrels} / ${leg.plannedBarrels} 桶` }));
     const found = fillGaps(legs(a), legs(b));
     gaps = found.length;
     details.push(...found.map(fillGapText));

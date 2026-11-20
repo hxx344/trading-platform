@@ -356,7 +356,7 @@ test('接口：读取、保存（409 / 400）、测试消息；须带页面请�
     // The page's boundary check takes what the service answers.
     const page = alertView((await call('/api/monitor/oil/alerts')).body);
     assert.deepEqual([page.revision, page.history[0]!.status, historyText('oil', page.history[0]!)], [1, 'sent', '测试消息']);
-    assert.deepEqual(Object.keys(monitorStatus(runtime).alerts ?? {}), ['oil', 'hynix']);
+    assert.deepEqual(Object.keys(monitorStatus(runtime).alerts ?? {}), ['oil', 'goldoil', 'hynix']);
   } finally {
     await new Promise(resolve => server.close(resolve));
     h.dispose();

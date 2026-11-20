@@ -1,6 +1,6 @@
 import type { CandleBlocks } from '../candle-blocks.ts';
 
-export type MonitorCandleMarket = 'anthropic' | 'oil' | 'hynix';
+export type MonitorCandleMarket = 'anthropic' | 'oil' | 'goldoil' | 'hynix';
 export const MONITOR_CANDLE_BLOCK_MS = 7 * 86_400_000;
 export const monitorCandleField = (market: MonitorCandleMarket) => market === 'hynix' ? 'rows' : 'data';
 

@@ -1,8 +1,9 @@
 // The alert tiers of the oil and Hynix monitors (M-3a): the page's description of each market (the workbench's oilAlerts /
 // hynixAlerts adapters in modules/monitor/lib/monitor-alerts.ts, ef09438, with the service's field names) and the boundary
-// check of GET /api/monitor/<market>/alerts. Limits must match src/monitor/alerts.ts ALERT_SPECS; the service checks again.
+// check of GET /api/monitor/<market>/alerts. M-2f adds the gold/oil ratio (the workbench's goldOilAlerts / goldOilBzAlerts in
+// the same file at 584ebc8, both oil legs as two metrics of one market). Limits must match src/monitor/alerts.ts ALERT_SPECS; the service checks again.
 
-export type AlertMarket = 'oil' | 'hynix';
+export type AlertMarket = 'oil' | 'goldoil' | 'hynix';
 export type AlertOperator = 'gte' | 'lte' | 'both';
 export interface AlertRule { id: string; label: string; metric: string; operator: AlertOperator; threshold: number; cooldownMinutes: number; hysteresis: number; enabled: boolean }
 export interface AlertConfig { enabled: boolean; rules: AlertRule[] }
@@ -39,6 +40,16 @@ export const ALERT_MARKETS: Record<AlertMarket, AlertMarketSpec> = {
     example: '价差＝布伦特 − WTI，单位 USDT/桶。阈值 4、回差 0.1：触发后需回落到 3.9 以下，再次达到 4 且冷却结束才提醒。',
     market: values => values ? `服务器最近报价 · 布伦特 ${values.brent?.toFixed(4)} · WTI ${values.wti?.toFixed(4)} · 价差 ${values.spread?.toFixed(4)} USDT/桶` : '服务器尚未取得有效行情。',
   },
+  goldoil: {
+    title: '金油比',
+    metrics: [
+      { id: 'clRatio', label: '金油比 XAU / CL', unit: '桶/盎司', hysteresisUnit: '桶/盎司', min: 0, max: 1e6 },
+      { id: 'bzRatio', label: '金油比 XAU / BZ', unit: '桶/盎司', hysteresisUnit: '桶/盎司', min: 0, max: 1e6 },
+    ],
+    maxRules: 50, labelMax: 60, cooldownMax: 10_080, hysteresisMax: 1e6, grid: { from: 50, to: 80, step: 5 }, defaults: { cooldownMinutes: 30, hysteresis: 0.5 },
+    example: '金油比＝黄金标记价 ÷ 原油标记价（WTI 为 CL，布伦特为 BZ），单位桶/盎司。阈值 50、回差 0.5：触发后需回落到 49.5 以下，再次达到 50 且冷却结束才提醒。',
+    market: values => values ? `服务器最近报价 · 黄金 ${values.xau?.toFixed(2)} USDT/盎司 · 金油比 XAU / CL ${values.clRatio?.toFixed(4)} · XAU / BZ ${values.bzRatio?.toFixed(4)} 桶/盎司` : '服务器尚未取得有效行情。',
+  },
   hynix: {
     title: '海力士',
     metrics: [{ id: 'premium', label: 'ADR 溢价率', unit: '%', hysteresisUnit: '百分点', min: -100, max: 10_000 }],
@@ -71,7 +82,7 @@ function rule(raw: unknown): AlertRule {
 /** GET /api/monitor/<market>/alerts, checked; a shape it does not know fails the read and keeps the last view. */
 export function alertView(raw: unknown): AlertView {
   const view = object(raw), config = object(view.config);
-  const market = view.market === 'oil' || view.market === 'hynix' ? view.market : bad();
+  const market = view.market === 'oil' || view.market === 'goldoil' || view.market === 'hynix' ? view.market : bad();
   if (!Number.isSafeInteger(view.revision) || typeof config.enabled !== 'boolean' || !Array.isArray(config.rules) || typeof view.robotConfigured !== 'boolean' || !Array.isArray(view.history)) bad();
   // Absent from a service before M-3b: the robot it had was `feishu`.
   const robot = view.robot === undefined ? (view.robotConfigured ? 'feishu' : null) : view.robot === null || view.robot === 'feishu' || view.robot === 'feishuMonitor' ? view.robot : bad();
@@ -108,6 +119,6 @@ export function historyText(market: AlertMarket, item: AlertHistoryItem): string
   return item.rules.map(r => {
     const metric = metrics.find(m => m.id === r.metric);
     const unit = metric?.unit === '%' ? '%' : ` ${metric?.unit ?? ''}`;
-    return `${r.label}：${r.value.toFixed(market === 'oil' ? 4 : 2)} ${r.operator === 'gte' ? '≥' : '≤'} ${r.threshold}${unit}`;
+    return `${r.label}：${r.value.toFixed(market === 'hynix' ? 2 : 4)} ${r.operator === 'gte' ? '≥' : '≤'} ${r.threshold}${unit}`;
   }).join('；');
 }

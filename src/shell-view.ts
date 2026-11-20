@@ -1,5 +1,5 @@
 /** Browser navigation and the public collectors whose display data can outlive a page. */
-export const shellMarkets = ['anthropic', 'oil', 'hynix', 'perpetual'] as const;
+export const shellMarkets = ['anthropic', 'oil', 'goldoil', 'hynix', 'perpetual'] as const;
 export type ShellMarket = typeof shellMarkets[number];
 export type MarketScope = { enabled: boolean; revision: number | null };
 export type MonitorScopes = Partial<Record<ShellMarket, MarketScope>>;

@@ -21,7 +21,7 @@ export function invalidateReadViews(key?: string): void {
 
 // A completed edit can use its last body as a delta base. Changing the account, login or monitor scope drops it.
 export function invalidateMutationReads(path: string, finished: boolean): void {
-  const monitor = /^\/api\/monitor\/(oil|hynix|anthropic|perpetual)\//.exec(path);
+  const monitor = /^\/api\/monitor\/(oil|goldoil|hynix|anthropic|perpetual)\//.exec(path);
   const prefix = path.startsWith('/api/asset/') ? '/api/asset/' : monitor?.[0] ?? '/api/';
   const changesScope = /^\/api\/(?:asset\/(?:connections|aster-accounts|import)(?:\/|$)|import$)/.test(path) ||
     Boolean(monitor && /\/(?:control|variational\/session)$/.test(path));

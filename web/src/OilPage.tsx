@@ -129,8 +129,10 @@ function MarketPanel({ live }: { live: LiveResource<OilMarket> }) {
 }
 
 /** Which contracts a positions panel lists and how it names them: oil by default, hynix from its page. */
-export interface PositionsKind { name: string; symbols: readonly string[]; contract: (symbol: string) => string; id: string }
-const OIL_POSITIONS: PositionsKind = { name: '原油', symbols: SYMBOLS, contract: short, id: 'oilPositions' };
+/** note: one more line under the heading, e.g. what else the amounts include. */
+export interface PositionsKind { name: string; symbols: readonly string[]; contract: (symbol: string) => string; id: string; note?: string }
+// The gold-oil page trades CL / BZ on the same accounts (docs/goldoil.md 2): the amounts here are the accounts' whole positions.
+const OIL_POSITIONS: PositionsKind = { name: '原油', symbols: SYMBOLS, contract: short, id: 'oilPositions', note: 'CL / BZ 为账户合计，含金油任务的油腿' };
 
 export function PositionsPanel({ state, stale, kind = OIL_POSITIONS }: { state: Pick<OilState, 'positions'>; stale: boolean; kind?: PositionsKind }) {
   const view = state.positions;
@@ -142,7 +144,7 @@ export function PositionsPanel({ state, stale, kind = OIL_POSITIONS }: { state: 
   const amount = (side: Record<string, string> | null, symbol: string): string | null => side ? side[symbol] ?? '0' : null;
   const cell = (value: string | null, side: 'long' | 'short'): ReactNode => value === null ? '—' : Number(value) ? <span className={`trading-side ${side}`}>{value}</span> : <span className="trading-muted">0</span>;
   return <section className="trading-panel trading-overview" id={kind.id} aria-labelledby={`${kind.id}-title`}>
-    <header className="trading-panel-heading"><div><h2 id={`${kind.id}-title`}>{kind.name}持仓</h2><p>执行账户的 {kind.symbols.map(kind.contract).join(' / ')} 合约数量与{kind.name}挂单 · 每 {Math.round(view.readEveryMs / 1000)} 秒读取</p></div></header>
+    <header className="trading-panel-heading"><div><h2 id={`${kind.id}-title`}>{kind.name}持仓</h2><p>执行账户的 {kind.symbols.map(kind.contract).join(' / ')} 合约数量与{kind.name}挂单 · 每 {Math.round(view.readEveryMs / 1000)} 秒读取{kind.note ? ` · ${kind.note}` : ''}</p></div></header>
     {view.accounts.length ? <div className="trading-position-scroll"><table className="trading-position-table" aria-label={`${kind.name}持仓`}>
       <thead><tr><th scope="col">合约 / 账户</th><th scope="col">多头<small>合约数量</small></th><th scope="col">空头<small>合约数量</small></th><th scope="col">{kind.name}挂单</th><th scope="col">读取时间<small>北京时间</small></th></tr></thead>
       <tbody>{view.accounts.flatMap(account => kind.symbols.map((symbol, index) => {
@@ -499,10 +501,11 @@ type ActionKind = 'stop' | 'acknowledge' | 'adopt' | 'notcreated' | 'release';
 
 function JobCard({ job, busy, strategyId, onStrategyId, onAction }: { job: OilJob; busy: boolean; strategyId: string; onStrategyId: (value: string) => void; onAction: (job: OilJob, kind: ActionKind) => void }) {
   const actions = jobActions(job);
-  const hynix = job.market === 'hynix';
+  // Hynix and gold-oil legs are sized in contract quantities; oil in barrels.
+  const hynix = job.market === 'hynix', goldoil = job.market === 'goldoil', byQuantity = hynix || goldoil;
   const rebalance = isRebalance(job);
   const title = rebalance ? `${venueName(job.legs[0]?.venue ?? '')} 调平 · ${job.rebalance?.method === 'add' ? '加仓' : '减仓'}`
-    : `${job.preset === 'same-exchange' ? `${venueName(job.legs[0]?.venue ?? '')} 同所${hynix ? '溢价' : '价差'}` : '跨所同合约'}${job.action === 'open' ? '开仓' : '平仓'}`;
+    : `${job.preset === 'same-exchange' ? `${venueName(job.legs[0]?.venue ?? '')} 同所${hynix ? '溢价' : goldoil ? '金油比' : '价差'}` : '跨所同合约'}${job.action === 'open' ? '开仓' : '平仓'}`;
   const role = (index: number): string => rebalance ? '调平腿' : index === 0 ? '首腿' : '对冲腿';
   const legName = (symbol: string): string => hynix ? HYNIX_CONTRACT[symbol] ?? short(symbol) : short(symbol);
   const strategyLeg = job.legs.find(leg => leg.operation?.kind === 'strategy');
@@ -513,10 +516,10 @@ function JobCard({ job, busy, strategyId, onStrategyId, onAction }: { job: OilJo
     </div>{actions.stop ? <button className="button secondary execution-stop" type="button" data-oil-stop={job.id} disabled={busy} onClick={() => onAction(job, 'stop')}><Square size={14} aria-hidden="true" />停止并撤销余单</button> : null}</header>
     {job.reason ? <p className="execution-job-reason" role={job.status === 'attention' ? 'alert' : undefined}>{job.reason}</p> : null}
     <div className="execution-table-wrap"><table className="execution-progress-table">
-      <thead><tr><th scope="col">交易腿</th><th scope="col">已成交 / 计划<small>{hynix ? '合约数量' : '桶'}</small></th><th scope="col">成交均价<small>USDT</small></th><th scope="col">当前委托 / 策略</th><th scope="col">价格保护界限<small>USDT</small></th></tr></thead>
+      <thead><tr><th scope="col">交易腿</th><th scope="col">已成交 / 计划<small>{byQuantity ? '合约数量' : '桶'}</small></th><th scope="col">成交均价<small>USDT</small></th><th scope="col">当前委托 / 策略</th><th scope="col">价格保护界限<small>USDT</small></th></tr></thead>
       <tbody>{job.legs.map((leg, index) => <tr key={index}>
         <th scope="row"><strong>{venueName(leg.venue)} {legName(leg.symbol)}</strong><span className={`execution-side ${leg.side}`}>{operation(job.action, leg.side)}</span></th>
-        <td data-label="已成交 / 计划">{hynix
+        <td data-label="已成交 / 计划">{byQuantity
           ? <span><strong>{leg.filledQuantity}</strong> / {leg.plannedQuantity}<small>{leg.symbol}{leg.attempts > 1 ? ` · ${leg.attempts} 笔` : ''}</small></span>
           : <span><strong>{leg.filledBarrels}</strong> / {leg.plannedBarrels} 桶<small>合约 {leg.filledQuantity} / {leg.plannedQuantity}{leg.attempts > 1 ? ` · ${leg.attempts} 笔` : ''}</small></span>}</td>
         <td data-label="成交均价">{leg.averagePrice ?? '—'}</td>

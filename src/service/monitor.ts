@@ -12,6 +12,7 @@ import { createExchangeReader, type ExchangeReader } from '../monitor/exchanges.
 import { createFundingArchive } from '../monitor/funding-archive.ts';
 import { createHynixMonitor, type HynixMonitor } from '../monitor/hynix.ts';
 import { createOilMonitor, type OilMonitor } from '../monitor/oil.ts';
+import { createGoldOilMonitor, type GoldOilMonitor } from '../monitor/goldoil.ts';
 import { createPerpetualMonitor, type PerpetualMonitor, type PerpetualOptions } from '../monitor/perpetual.ts';
 import { createMonitorControl, type MonitorControl } from '../monitor/control.ts';
 import { PERPETUAL_CACHE_FILE, openPerpetualCache, type PerpetualCache } from '../monitor/perpetual-cache.ts';
@@ -26,9 +27,11 @@ import { monitorMarkets, type MonitorConfig, type MonitorMarket } from './monito
 
 export interface MonitorRuntime {
   config: MonitorConfig; store: MonitorStore; anthropic: AnthropicMonitor | null; oil: OilMonitor | null; hynix: HynixMonitor | null;
+  /** M-2f: the gold/oil ratio collector; present when `goldoil` is configured. */
+  goldoil: GoldOilMonitor | null;
   /** The on-demand multi-exchange comparison (M-2c); present when oil or Hynix runs. */
   exchanges: ExchangeReader | null;
-  /** M-3a: each running oil / Hynix market's threshold alerts; absent without the Feishu outbox hooks (tests of the collectors). */
+  /** M-3a: each running oil / gold-oil / Hynix market's threshold alerts; absent without the Feishu outbox hooks (tests of the collectors). */
   alerts: Partial<Record<AlertMarket, AlertService>>;
   /** M-3c: each configured market's run switch. */
   control: MonitorControl;
@@ -59,6 +62,7 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
     // One Binance cooldown for everything that reads Binance from the same address; the Hynix collector reads Hyperliquid only.
     const gate = createBinanceGate(), options = { ...base, gate };
     const oil = config.oil ? createOilMonitor(options) : null, hynix = config.hynix ? createHynixMonitor(base) : null;
+    const goldoil = config.goldoil ? createGoldOilMonitor(options) : null;
     const varFetch = oil ? variationalFetch ?? createVariationalFetch() : undefined;
     const variational = oil && varFetch ? createVariationalSession({ dir, fetcher: varFetch, ...(now ? { now } : {}), ...(log ? { log } : {}) }) : null;
     const exchanges = oil || hynix ? createExchangeReader({
@@ -72,6 +76,7 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
     if (alertHooks) {
       const gate = createTestGate(now ?? Date.now), common = { store, hooks: alertHooks, gate, ...(now ? { now } : {}), ...(log ? { log } : {}) };
       if (oil) alerts.oil = createAlertService({ ...common, market: 'oil', quote: () => oil.quote() });
+      if (goldoil) alerts.goldoil = createAlertService({ ...common, market: 'goldoil', quote: () => goldoil.quote() });
       if (hynix) alerts.hynix = createAlertService({ ...common, market: 'hynix', quote: () => hynix.quote() });
     }
     // Built here, started by its loop once the switch is on (monitorLoops).
@@ -100,7 +105,7 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
         ...(perpetualCache ? {} : { cacheUnavailable: `缓存库 ${PERPETUAL_CACHE_FILE} 打不开，市场指标、历史资金费、成交价历史与质量样本只存内存，重启后重新采集。` }),
         paper: { store: paperStore, unavailableReason: paperUnavailable }, ...perpetualOptions, ...(remote ? { remote: remote.perpetual } : {}),
         quality: { ...perpetualQualityEnv(env, log ?? (line => process.stderr.write(`${line}\n`))), ...perpetualOptions?.quality } }) : null;
-      return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, hynix, exchanges, alerts, control, variational, perpetual, perpetualCache };
+      return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, goldoil, hynix, exchanges, alerts, control, variational, perpetual, perpetualCache };
     } catch (error) { perpetualCache?.close(); throw error; }
   } catch (error) { store.close(); throw error; }
 }
@@ -153,9 +158,9 @@ export function monitorViews(monitor: MonitorRuntime) {
 type CandleMarket = Exclude<MonitorMarket, 'perpetual'>;
 
 /** For the status page: each configured market's last reads and errors, and the alerts when the service runs them. */
-export const monitorStatus = (monitor: MonitorRuntime) => ({ anthropic: monitor.anthropic?.status() ?? null, oil: monitor.oil?.status() ?? null, hynix: monitor.hynix?.status() ?? null,
+export const monitorStatus = (monitor: MonitorRuntime) => ({ anthropic: monitor.anthropic?.status() ?? null, oil: monitor.oil?.status() ?? null, goldoil: monitor.goldoil?.status() ?? null, hynix: monitor.hynix?.status() ?? null,
   perpetual: monitor.perpetual ? { ...monitor.perpetual.status(), summary: monitor.perpetual.summary() } : null, controls: monitor.control.views(),
-  ...(Object.keys(monitor.alerts).length ? { alerts: { oil: monitor.alerts.oil?.status() ?? null, hynix: monitor.alerts.hynix?.status() ?? null } } : {}) });
+  ...(Object.keys(monitor.alerts).length ? { alerts: { oil: monitor.alerts.oil?.status() ?? null, goldoil: monitor.alerts.goldoil?.status() ?? null, hynix: monitor.alerts.hynix?.status() ?? null } } : {}) });
 
 /** How often a switched-off market looks at its switch again: a market turned back on resumes within this. */
 export const CONTROL_POLL_MS = 1_000;
@@ -214,7 +219,7 @@ function perpetualLoop(perpetual: PerpetualMonitor, context: LoopContext, on: ()
 export const monitorLoops = (monitor: MonitorRuntime, context: LoopContext, log: (line: string) => void = line => process.stderr.write(`${line}\n`)): Promise<void>[] => {
   const on = (market: MonitorMarket) => () => monitor.control.enabled(market);
   return [
-    ...(['anthropic', 'oil', 'hynix'] as const).flatMap(market => {
+    ...(['anthropic', 'oil', 'goldoil', 'hynix'] as const).flatMap(market => {
       const collector = monitor[market];
       return collector ? [marketLoops(loopContext => collector.loops(loopContext), context, on(market), log)] : [];
     }),
@@ -224,7 +229,7 @@ export const monitorLoops = (monitor: MonitorRuntime, context: LoopContext, log:
 };
 
 /** Ends the requests in flight (at stopping), so the loops finish within the drain. */
-export const stopMonitor = (monitor: MonitorRuntime): void => { monitor.anthropic?.stop(); monitor.oil?.stop(); monitor.hynix?.stop(); monitor.exchanges?.stop(); monitor.variational?.stop(); monitor.perpetual?.stop(); };
+export const stopMonitor = (monitor: MonitorRuntime): void => { monitor.anthropic?.stop(); monitor.oil?.stop(); monitor.goldoil?.stop(); monitor.hynix?.stop(); monitor.exchanges?.stop(); monitor.variational?.stop(); monitor.perpetual?.stop(); };
 export const closeMonitor = (monitor: MonitorRuntime): void => {
   try { monitor.store.close(); } catch { /* best effort */ }
   try { monitor.perpetualCache?.close(); } catch { /* best effort */ }

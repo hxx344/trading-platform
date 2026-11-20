@@ -4,7 +4,7 @@ export const READ_VERSION = 'x-pa-read-version';
 export const READ_BASE = 'x-pa-read-base';
 
 const displayGets = [
-  /^\/api\/monitor\/(?:oil|hynix|anthropic)\/quote$/,
+  /^\/api\/monitor\/(?:oil|goldoil|hynix|anthropic)\/quote$/,
   /^\/api\/monitor\/(?:oil|hynix)\/(?:funding|exchanges\/[a-z]{1,20}(?:\/funding-history)?)$/,
   /^\/api\/monitor\/perpetual\/(?:quote|summary|fx|paper)$/,
   /^\/api\/asset\/(?:positions|fills|state|ledger|period|history|daily-changes|withdrawals|cash-flows)$/,

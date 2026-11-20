@@ -89,3 +89,12 @@
 - 两腿组合对冲腿选“本地追价”：首腿成交后对冲腿只挂单挂在同侧最优价，盘口变化 2 秒后改价重挂，补齐后任务完成。
 - 对冲追价时限到期：撤单后剩余按市价 IOC 补齐；撤单刚确认时 `openOrders` 是否仍列着这笔委托（执行器已按本任务委托放行）。
 - 默认 10 秒的时限在真实盘口下是否合适（对冲延迟与挂单成交率）。
+
+## 待实测：行情监控金油比（monitor.md「M-2f」，v0.74.0）
+
+只在替身 Binance（`test/monitor-fake.ts`）上验证过，本机访问 Binance 返回 451。部署后确认，结果回填本节与 [monitor.md](monitor.md) 的 M-2f 实施记录：
+
+- `exchangeInfo` 里 `XAUUSDT`、`CLUSDT`、`BZUSDT` 的 `contractType`（实现接受 `PERPETUAL` 与 `TRADIFI_PERPETUAL`）、`baseAsset`、`onboardDate`；不符时金油比页显示「合约类型、状态或计价资产不符」。
+- 三腿 `premiumIndex` 的 `time` 是否通常在 15 秒内对齐；若经常显示「三条腿的报价时间相差超过 15 秒，本轮不采用」，需调整口径。
+- `markPriceKlines` 对 `XAUUSDT` 的历史深度与缺口；首次回补从三个合约较晚的上架时间起，看页面「全部」范围的起点与缺口提示。
+- 设一档金油比告警，越线后飞书是否收到「【金油比阈值告警】」及报价行格式。

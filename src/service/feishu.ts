@@ -40,7 +40,7 @@ export interface JobSummary {
   status: string;
   reason: string | null;
   /** Absent in summaries made before hynix existed: oil. */
-  market?: 'oil' | 'hynix';
+  market?: 'oil' | 'hynix' | 'goldoil';
   /** One of the two jobs of a four-leg confirm (docs/oil.md 11); absent or null on every other job. */
   group?: { id: string; index: 0 | 1; peer: string } | null;
   legs: { venue: string; symbol: string; side: 'long' | 'short'; orderSide: 'buy' | 'sell'; plannedBarrels: string; filledBarrels: string; plannedQuantity?: string; filledQuantity?: string; averagePrice: string | null; previewQuote: { bid: string; ask: string } }[];
@@ -147,6 +147,7 @@ export function describeJob(summary: JobSummary | null, jobId: string, status: s
 }
 function describePairJob(summary: JobSummary | null, jobId: string, status: string, reason: string | null): string {
   if (summary?.market === 'hynix') return describeHynixJob(summary, jobId, status, reason);
+  if (summary?.market === 'goldoil') return describeGoldOilJob(summary, jobId, status, reason);
   const tail = reason ? `：${clip(reason, 240)}` : '';
   // Without the job's details its market is unknown: the title names no product rather than a wrong one.
   if (!summary || summary.legs.length !== 2) return `【${(JOB_TITLES[status] ?? `原油任务${status}`).replace(/^原油/, '')}】任务 ${short(jobId)}（详情读取失败）${tail}`;
@@ -172,6 +173,43 @@ function describePairJob(summary: JobSummary | null, jobId: string, status: stri
     const fills = [high, low].map(leg => `${label(leg)} ${clip(leg.filledBarrels, 24)} 桶${leg.averagePrice ? ` 均价 ${price(leg.averagePrice)}` : ''}`).join('、');
     const spread = high.averagePrice && low.averagePrice ? minus(high.averagePrice, low.averagePrice) : null;
     numbers = `计划每腿 ${clip(a.plannedBarrels, 24)} 桶；成交 ${fills}${spread === null ? '' : `；成交价差 ${spreadName} ${spread} USDT/桶`}`;
+  }
+  return `【${title}】${where}，${numbers}（任务 ${short(jobId)}）${tail}`;
+}
+
+/** gold ÷ oil, three decimals; null when either price is missing or not positive (docs/goldoil.md 2). */
+const goldOilRatio = (gold: string | null | undefined, oil: string | null | undefined): string | null => {
+  const g = Number(gold), o = Number(oil);
+  return gold && oil && g > 0 && o > 0 ? (g / o).toFixed(3) : null;
+};
+/**
+ * One line per gold-oil job state (docs/goldoil.md): venue, contracts and sides with the ratio direction (long the ratio is
+ * long gold, short oil), each leg's quantity, then the fills' average prices and the ratio gold ÷ oil they make; across
+ * venues the price difference of gold.
+ */
+function describeGoldOilJob(summary: JobSummary, jobId: string, status: string, reason: string | null): string {
+  const title = `金油${(JOB_TITLES[status] ?? `原油任务${status}`).replace(/^原油/, '')}`;
+  const tail = reason ? `：${clip(reason, 240)}` : '';
+  if (summary.legs.length !== 2) return `【${title}】任务 ${short(jobId)}（详情读取失败）${tail}`;
+  const [a, b] = summary.legs as [JobSummary['legs'][0], JobSummary['legs'][0]];
+  const sideText = (side: string) => side === 'long' ? '多' : '空';
+  const action = summary.action === 'open' ? '开仓' : '平仓';
+  const same = summary.preset === 'same-exchange';
+  const gold = same ? (a.symbol === 'XAUUSDT' ? a : b) : null, oil = same ? (a.symbol === 'XAUUSDT' ? b : a) : null;
+  const where = same
+    ? `${VENUE_TEXT[a.venue] ?? a.venue} 同所 ${action} ${gold!.side === 'long' ? '做多金油比' : '做空金油比'}（${sideText(gold!.side)} XAUUSDT、${sideText(oil!.side)} ${oil!.symbol}）`
+    : `${a.symbol} 跨所 ${action}（${VENUE_TEXT[a.venue] ?? a.venue} ${sideText(a.side)}、${VENUE_TEXT[b.venue] ?? b.venue} ${sideText(b.side)}）`;
+  const label = (leg: typeof a) => same ? leg.symbol : VENUE_TEXT[leg.venue] ?? leg.venue;
+  let numbers: string;
+  if (status === 'accepted') {
+    const at = (leg: typeof a) => leg.orderSide === 'buy' ? leg.previewQuote.ask : leg.previewQuote.bid;
+    const legsText = [a, b].map(leg => `${label(leg)} ${clip(leg.plannedQuantity ?? leg.plannedBarrels, 24)} 可成交价 ${price(at(leg))}`).join('、');
+    const value = same ? goldOilRatio(at(gold!), at(oil!)) : minus(at(a), at(b));
+    numbers = `计划 ${legsText}${value === null ? '' : same ? `，金油比 ${value}` : `，价差 ${label(a)}−${label(b)} ${value} USDT`}`;
+  } else {
+    const fills = [a, b].map(leg => `${label(leg)} ${clip(leg.filledQuantity ?? leg.filledBarrels, 24)}${leg.averagePrice ? ` 均价 ${price(leg.averagePrice)}` : ''}`).join('、');
+    const value = same ? goldOilRatio(gold!.averagePrice, oil!.averagePrice) : a.averagePrice && b.averagePrice ? minus(a.averagePrice, b.averagePrice) : null;
+    numbers = `成交 ${fills}${value === null ? '' : same ? `；成交金油比 ${value}` : `；成交价差 ${label(a)}−${label(b)} ${value} USDT`}`;
   }
   return `【${title}】${where}，${numbers}（任务 ${short(jobId)}）${tail}`;
 }

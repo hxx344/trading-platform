@@ -72,6 +72,14 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
       case 'monitor.anthropic.quote': none(input); return readers.anthropicQuote(signal);
       case 'monitor.oil.quote': none(input); return readers.oilQuote(signal);
       case 'monitor.hynix.quote': none(input); return readers.hynixQuote(signal);
+      case 'monitor.goldoil.quote': none(input); return readers.goldOilQuote(signal);
+      case 'monitor.goldoil.listing': none(input); return readers.goldOilListing(signal);
+      case 'monitor.goldoil.candles': {
+        // The reader checks the range again (aligned bars, at most one 14-day window, closed by now).
+        const p = fields(input, ['start', 'end']), start = timestamp(p.start), end = timestamp(p.end);
+        if (end <= start || end > now() || end - start > OIL_CANDLE_WINDOW_MS) throw new Error('金油比 K 线回补范围无效');
+        return readers.goldOilCandles(start, end, signal);
+      }
       case 'monitor.anthropic.candles': {
         const p = fields(input, ['starts', 'at', 'ends']), at = roundTime(p.at), starts = fields(p.starts, [...ANTHROPIC_LEG_KEYS]);
         const ends = p.ends === undefined ? undefined : fields(p.ends, [...ANTHROPIC_LEG_KEYS]);

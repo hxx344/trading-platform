@@ -25,6 +25,7 @@
 - M-5e2（从工作台导入持仓记录：导入面板勾选项与 `--monitor-paper`、待载入文件 `perpetual-paper-positions.import.json`）随 v0.45.0；替身导入验证（见 M-5e2 实施记录）。
 - M14（原油、海力士详情的成交标记与关联交易）随资产账本 A-5 做完（见「M14：成交标记与关联交易」节），版本号随 A-5 发布时填写。
 - 「异动行情」页签（EQN 价格异动、OI 价格异动、大幅波动、美股重大行情）随 v0.72.0，不属于 Monitor 采集器，不受监控开关控制，见 [news.md](news.md)。
+- M-2f（金油比：Binance XAU ÷ WTI / 布伦特标记价，报价、15 分钟 K 线、页面与阈值告警，从工作台导入时自动补上）随 v0.74.0；替身行情验证，未接真实 Binance（见「M-2f」节）。
 - 未开始：M-5f、M13（见下表与「M-5」节）。
 - M-1 没做：股数从交易中心同步、概览卡片与告警（均线 / 布林带 / Z-score 随 M-2e 补上，成交标记随 A-5 / M14 补上）。
 
@@ -33,7 +34,7 @@
 | 批次 | 内容 | 风险 | 状态 |
 | --- | --- | --- | --- |
 | M-1 | Anthropic 价差（M03）：Binance、Hyperliquid（xyz:ANT、io:ANTH）、Lighter RH 四条腿的报价与 15 分钟 K 线，每股口径溢价；只读公开接口，无凭据、无告警 | R2 | 完成（Linux CI 通过），随 v0.12.0 发布 |
-| M-2 | 原油价差与海力士行情（M01、M02），分 M-2a–M-2e 五小批（见下文），Var 腿先降级为“未接入” | R2 | M-2a 已发布（v0.20.0），M-2b 已发布（v0.21.0），M-2c 已发布（v0.23.0），M-2d 已发布（v0.24.0），M-2e 已发布（v0.25.0），M-2d-3 已发布（v0.27.0） |
+| M-2 | 原油价差与海力士行情（M01、M02），分 M-2a–M-2e 五小批（见下文），Var 腿先降级为“未接入” | R2 | M-2a 已发布（v0.20.0），M-2b 已发布（v0.21.0），M-2c 已发布（v0.23.0），M-2d 已发布（v0.24.0），M-2e 已发布（v0.25.0），M-2d-3 已发布（v0.27.0），M-2f 金油比已发布（v0.74.0） |
 | M-3 | 告警规则、飞书通知、监控开关、Var 会话 token（M09–M12），分 M-3a–M-3d 四小批（见下文） | R3 | M-3a 完成（v0.29.0），M-3b 完成（v0.30.0），M-3c 完成（v0.31.0），M-3d-1 完成（v0.33.0），M-3d-2 完成（v0.34.0） |
 | M-4 | 永续全市场报价（M04：11 家交易所公共 WS、SSE 增量），分 M-4a（采集器与接口）、M-4b（页面与导入） | R2 | 完成（M-4a v0.36.0，M-4b v0.37.0） |
 | M-5 | 依赖 M04 的页面（M05–M08），分 M-5a–M-5f 小批（M-5b、M-5d 再拆两批，见「M-5」节） | R2 | M-5a（v0.38.0）、M-5b1（v0.39.0）、M-5b2（v0.40.0）、M-5c（v0.41.0）、M-5d1（v0.42.0）、M-5d2（v0.43.0）、M-5e1（v0.44.0）、M-5e2（v0.45.0）完成，其余未开始 |
@@ -369,6 +370,47 @@ CEX 对比读取最多 32 页。共享的原油 Binance、海力士 Hyperliquid 
 **本批没做**：Variational、四腿资金费对冲模拟、告警（M-3）。真实交易所未验证（本机访问 Binance 返回 451）。
 
 **回滚**：`sudo bash install.sh --version v0.26.0`，不用改配置（没有新配置字段、没有新表）。
+
+### M-2f：金油比（v0.74.0）
+
+对照（工作台 `modules/monitor`，只读）：`lib/gold-oil.ts`、`lib/gold-oil-service.ts`（`61eaae1`），`app/gold-oil-panel.tsx`、`lib/monitor-alerts.ts`（`584ebc8`），`app/gold-oil-svg-chart.tsx`、`server/gold-oil/alerts.mjs`、`lib/gold-oil-analysis.ts`（`8470785`）。风险 R2：只读公开行情，新增一张表和一个配置键，告警复用 M-3a 的出站队列。
+
+**范围**：行情监控新增「金油比」标签。Binance `XAUUSDT` 与 `CLUSDT`（WTI）、`BZUSDT`（布伦特）三个永续合约的标记价，页面可在 CL / BZ 之间切换；采集、存储、两个读取接口、页面、阈值告警，从工作台导入时自动补上。
+
+**口径**：
+
+- 金油比 = XAU 标记价 ÷ 油标记价，单位「桶/盎司」；黄金「USDT/盎司」，油价「USDT/桶」。
+- 报价：三腿 `premiumIndex` 标记价（优先用共享的 `binanceMarks` 一次读回，失败再逐个读）。任意两腿的源时间相差超过 15 秒时整轮不采用，保留上次报价并写明原因；源时间早于 75 秒前或超前 5 秒以上的拒收（与告警端的容差一致，工作台为 1 秒）。报价时刻取三腿中最早的一个。
+- 合约：三个合约各一条，`TRADING`，`contractType` 为 `PERPETUAL` 或 `TRADIFI_PERPETUAL`（Binance 把 XAU 等 RWA 合约标为后者，同原油 O7），USDT 计价与保证金；不符时不采集并保留已存数据。
+- 刷新：报价每 30 秒，K 线每 60 秒检查；超过 75 秒没有新报价，页面显示为快照，告警暂停判断。
+- 时间范围：1 天 / 1 周（默认）/ 1 月 / 全部；K 线 15 分钟标记价收盘（`markPriceKlines`，只取已收盘的）。
+
+**采集与存储**（`src/monitor/goldoil-market.ts` 纯解析、`src/monitor/goldoil.ts` 采集器）：
+
+- 历史起点 = 三个合约 `onboardDate` 中较晚者，向上取整到 15 分钟；与保留期（400 天）取较晚者。每轮从上次写到的位置往后补，每段最多 14 天（同原油 `OIL_CANDLE_WINDOW_MS`），三腿各自分页后按时刻合并：`limit` 取区间内的根数（最多 1500），一页即可读完一段；满页时从最后一根往后续读，超过 3 页仍未读完按读取不完整报错。报价与 K 线两轮同时读合约目录时合并为一次请求。
+- 表 `goldoil_candles(time, xau, wti, brent)`，缺腿存 NULL；数据与覆盖状态在同一事务写入。只有黄金且至少一条油腿的时段进图，缺口保留、画图时断开，不插值。
+- 报价与 K 线的检查点存 `monitor_state`（`goldoil.quote`、`goldoil.candles`）；重启后先作为快照读回，下一轮成功后恢复实时。
+- 公开行情进程（R3 拆分后）新增 `monitor.goldoil.quote|listing|candles` 三个读取；执行服务经 `remote-monitor` 调用，与原油共用 Binance 冷却。
+
+**接口**：`GET /api/monitor/goldoil/quote`、`GET /api/monitor/goldoil/candles?days=N`（同原油：未配置 404、首轮前 503、关闭监控 423、带 `known` 时走块编码）；告警 `GET|POST /api/monitor/goldoil/alerts`、`POST …/alerts/test`；开关 `POST /api/monitor/goldoil/control`。只读令牌与 MCP 同原油：只放行 `/api/monitor/goldoil/alerts`，MCP `monitor` 工具的市场改为 `oil|goldoil|hynix`。
+
+**配置**：`monitor.goldoil`，不带设置（写 `{}`）。设置页「从工作台导入」在启用行情监控时自动补上（说明文字与 ImportPanel 的市场名称同步）。
+
+**告警**：`AlertMarket` 增加 `goldoil`，两个指标 `clRatio`（金油比 XAU / CL）、`bzRatio`（金油比 XAU / BZ），阈值须大于 0 且不超过 1e6，最多 50 档，默认冷却 30 分钟、回差 0.5，批量生成默认 50–80、步长 5；只判 75 秒内的实时报价，比值由各腿重新计算。飞书文案以「【金油比阈值告警】」开头，报价行列出黄金、WTI、布伦特与两个比值及报价时刻。工作台的金油比告警档位不导入（M-3b 只导原油与海力士），需在页面上重新设置。
+
+**页面**（`web/src/MonitorGoldOil.tsx`、`web/src/monitor-goldoil.ts`）：CL / BZ 切换；四个读数（金油比、黄金、所选油价、区间变化）；「金油比」与「标记价格」两个视图（价格视图上下两张图共用悬停）；均值参考线；区间速览表；如何计算；数据来源。不用内联样式，样式在 `monitor.css` 的 `goldoil-*`。
+
+**后置**（本批不做，只登记）：Bybit 变体、资金费面板与历史多空资金费、月度金油比、15 分钟明细表、交易所对比、技术指标、成交标记。
+
+**回滚**：`sudo bash install.sh --version v0.73.0`。v0.73.0 的 `parseMonitorConfig` 拒绝未知键（报「monitor 无效：不支持的字段：goldoil」），回退前须先从 `config.json` 删去 `monitor.goldoil`；只配了金油比时删去整个 `monitor`。`goldoil_candles` 表与 `monitor_state` 里的 `goldoil.*`、`control.goldoil`、`alerts.goldoil` 等记录留着无害，旧版本不读。
+
+### M-2f 实施记录（与上文不同或补充的地方）
+
+- **与工作台的差别**：工作台按所选油种各存一份历史；这里一张表同时存 WTI 与布伦特，页面切换不重新读取。缺口提示把所选油腿或黄金为空的时段也算作缺失。工作台只认 `PERPETUAL`，这里另收 `TRADIFI_PERPETUAL`（同原油 O7）。窗口读取总带 `windowDays` 与全量 `coverage`，与原油一致。工作台最近一轮采集出错即暂停告警；本服务只看报价是否在 75 秒内且为实时（与原油相同），某一轮失败但上次报价仍在 75 秒内时照常判断。
+- **错误文案**：`goldOilError` 把两腿不同步、源时间过旧、合约不符、上架时间无效翻成中文，其余沿用 `oilError`。
+- **测试**：新增 `test/monitor-goldoil.test.ts`（7 个：合约校验与上架起点、报价时间差与过期、K 线校验配对与缺口、采集器写入读回与重启快照、配置与接口及只读令牌 / MCP、告警判断与飞书文案、页面数据的统计缺口与断线）；更新导入、开关、状态键顺序相关的既有断言。
+- **浏览器**：替身后端 `scripts/dev-monitor.ts`，headless Chromium 在 1280 与 390 宽度走 CL / BZ、两个视图、四个范围、添加并保存告警档位；无横向溢出、无 CSP 报错。390 宽度下范围按钮原先被挤成竖排，已改为标题区换行。
+- **未实测**：Binance `XAUUSDT` 的合约类型与真实接口未在本机核对（本机访问 Binance 返回 451），登记在 [live-results.md](live-results.md)。
 
 ## M14：成交标记与关联交易（随资产账本 A-5）
 

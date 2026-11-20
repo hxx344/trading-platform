@@ -7,7 +7,9 @@
 // hourly, 70 days back, paged as each venue pages). Prices follow slow waves (~95 USD per share, Brent ~74 and WTI ~70 USDT per barrel, SKHX ~230 USD
 // with the ADR 2–8 % above a tenth of it) so the charts have shape. M-3d adds Variational: the public metadata/stats on `fetch`,
 // and on `variationalFetch` (standing in for the Python transport) /api/me, the authenticated indicative marks (5 cents above
-// the public marks, so a test can tell them apart) and the public predicted funding.
+// the public marks, so a test can tell them apart) and the public predicted funding. M-2f adds the gold/oil reads: Binance
+// exchangeInfo (XAUUSDT, CLUSDT, BZUSDT), the XAUUSDT mark (gold ~2,400 USDT per ounce) and the three legs' 15-minute
+// markPriceKlines; CLUSDT and BZUSDT marks are the oil marks above.
 import type { AnthropicLegKey } from '../src/vendor/anthropic-market.mjs';
 
 const BAR = 900_000, HOUR = 3_600_000, DAY = 86_400_000;
@@ -94,19 +96,31 @@ const held = (hold: Promise<void>, signal: AbortSignal | null | undefined) => ne
   void hold.then(() => { signal?.removeEventListener('abort', abort); resolve(); });
 });
 
+/** Gold mark or close at `time`, on the 0.01 tick: about 2,340–2,460 USDT per ounce. */
+export function fakeGoldPrice(time: number): number {
+  return Math.round((2400 + 60 * Math.sin(time / (4 * DAY))) * 100) / 100;
+}
+type FakeGoldOilLeg = 'xau' | FakeOilLeg;
+const GOLDOIL_SYMBOLS: Record<string, FakeGoldOilLeg> = { XAUUSDT: 'xau', CLUSDT: 'wti', BZUSDT: 'brent' };
+
 export interface FakeVenueOptions {
   /** The venues' clock; candles end at the last completed bar before it. */
   now?: () => number;
-  /** First bar each leg has (default: 60 days before the first request; Lighter RH 20 days; oil 2026-04-01 09:00 UTC or 30 days, the later; Hynix 30 days). */
-  listedAt?: Partial<Record<AnthropicLegKey | FakeOilLeg | FakeHynixLeg, number>>;
+  /** First bar each leg has (default: 60 days before the first request; Lighter RH 20 days; oil 2026-04-01 09:00 UTC or 30 days, the later; Hynix 30 days; gold 30 days). */
+  listedAt?: Partial<Record<AnthropicLegKey | FakeOilLeg | FakeHynixLeg | 'xau', number>>;
 }
 
 export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenueOptions = {}) {
   const start = now();
-  const listed = (leg: AnthropicLegKey | FakeOilLeg | FakeHynixLeg) => listedAt[leg] ?? (leg === 'brent' || leg === 'wti' ? Math.max(Date.UTC(2026, 3, 1, 9), start - 30 * DAY) : leg === 'skhy' || leg === 'skhx' ? Math.ceil((start - 30 * DAY) / HOUR) * HOUR : start - (leg === 'rh' ? 20 : 60) * DAY);
+  const listed = (leg: AnthropicLegKey | FakeOilLeg | FakeHynixLeg | 'xau') => listedAt[leg] ?? (leg === 'xau' ? Math.ceil((start - 30 * DAY) / BAR) * BAR : leg === 'brent' || leg === 'wti' ? Math.max(Date.UTC(2026, 3, 1, 9), start - 30 * DAY) : leg === 'skhy' || leg === 'skhx' ? Math.ceil((start - 30 * DAY) / HOUR) * HOUR : start - (leg === 'rh' ? 20 : 60) * DAY);
   const state = {
     /** Legs answering HTTP 500 ('funding': the oil funding terms). */
-    down: new Set<AnthropicLegKey | FakeOilLeg | FakeHynixLeg | 'funding' | 'settled'>(),
+    down: new Set<AnthropicLegKey | FakeOilLeg | FakeHynixLeg | 'funding' | 'settled' | 'xau' | 'catalog'>(),
+    /** M-2f: XAUUSDT's contract type in exchangeInfo, how far its mark's source time lags the clock, and 15-minute bars a
+     * gold/oil leg does not have, as `${leg}:${time}` ('xau:1775030400000'). */
+    xauContractType: 'TRADIFI_PERPETUAL',
+    xauLagMs: 0,
+    goldOilMissing: new Set<string>(),
     /** Settlements a leg does not have, as `${leg}:${time}` ('brent:1775030400000'). */
     settledMissing: new Set<string>(),
     /** HTTP status the oil legs answer instead (429, 418, ...); null: normal answers. */
@@ -136,7 +150,7 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
     maxInFlight: new Map<string, number>(),
   };
   const inFlight = new Map<string, number>();
-  const bars = (leg: AnthropicLegKey | FakeOilLeg, from: number, to: number) => {
+  const bars = (leg: AnthropicLegKey | FakeOilLeg | 'xau', from: number, to: number) => {
     const out: number[] = [];
     for (let t = Math.ceil(Math.max(from, listed(leg)) / BAR) * BAR; t < to && t <= now(); t += BAR) out.push(t);
     return out;
@@ -335,6 +349,26 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
       if (state.delayMs) await wait(state.delayMs, init.signal);
       if (state.oilStatus !== null) return fail(state.oilStatus);
       return state.exchangeDown.has('binance') ? fail(500) : comparison('binance', url);
+    }
+    const goldOilLeg = url.hostname === 'fapi.binance.com' ? url.pathname === '/fapi/v1/exchangeInfo' ? 'catalog' as const
+      : url.pathname === '/fapi/v1/markPriceKlines' || url.searchParams.get('symbol') === 'XAUUSDT' ? GOLDOIL_SYMBOLS[url.searchParams.get('symbol') ?? ''] : undefined : undefined;
+    if (goldOilLeg) {
+      const key = `goldoil:${goldOilLeg === 'catalog' ? 'catalog' : url.pathname === '/fapi/v1/markPriceKlines' ? 'candles' : 'quote'}${goldOilLeg === 'catalog' ? '' : `:${goldOilLeg}`}`;
+      state.requests.set(key, (state.requests.get(key) ?? 0) + 1);
+      if (state.hold) await held(state.hold, init.signal);
+      if (state.delayMs) await wait(state.delayMs, init.signal);
+      if (state.down.has(goldOilLeg)) return fail(500);
+      if (state.oilStatus !== null) return fail(state.oilStatus);
+      if (goldOilLeg === 'catalog') {
+        const spec = (symbol: string, baseAsset: string, leg: FakeGoldOilLeg, contractType: string) => ({ symbol, status: 'TRADING', contractType, baseAsset, quoteAsset: 'USDT', marginAsset: 'USDT', onboardDate: listed(leg) });
+        return ok({ symbols: [spec('BTCUSDT', 'BTC', 'xau', 'PERPETUAL'), spec('XAUUSDT', 'XAU', 'xau', state.xauContractType), spec('CLUSDT', 'CL', 'wti', 'TRADIFI_PERPETUAL'), spec('BZUSDT', 'BZ', 'brent', 'TRADIFI_PERPETUAL')] });
+      }
+      const price = (time: number) => goldOilLeg === 'xau' ? fakeGoldPrice(time) : fakeOilPrice(goldOilLeg, time);
+      if (url.pathname === '/fapi/v1/premiumIndex') return ok({ symbol: 'XAUUSDT', markPrice: String(fakeGoldPrice(now())), lastFundingRate: '0.00001', nextFundingTime: Math.ceil(now() / 14_400_000) * 14_400_000, time: now() - state.xauLagMs });
+      const from = Number(url.searchParams.get('startTime')), to = Number(url.searchParams.get('endTime')), limit = Number(url.searchParams.get('limit'));
+      // Only closed bars, as Binance: a bar is served once its close time has passed.
+      return ok(bars(goldOilLeg, from, to + 1).filter(t => t + BAR <= now() && !state.goldOilMissing.has(`${goldOilLeg}:${t}`)).slice(0, limit)
+        .map(t => [t, '1', '1', '1', String(price(t)), '1', t + BAR - 1]));
     }
     const oilLeg = url.hostname === 'fapi.binance.com' ? url.pathname === '/fapi/v1/fundingInfo' ? 'funding' as const : OIL_SYMBOLS[url.searchParams.get('symbol') ?? ''] : undefined;
     if (oilLeg) {

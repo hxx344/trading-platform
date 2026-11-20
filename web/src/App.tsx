@@ -1,4 +1,4 @@
-import { Activity, ArrowLeftRight, Cpu, ChevronRight, Coins, Gauge, Layers, Menu, Newspaper, RefreshCw, ScrollText, Server, Settings2, ShieldCheck, Sigma, Wallet, type LucideIcon } from 'lucide-react';
+import { Activity, ArrowLeftRight, Cpu, ChevronRight, Coins, Gauge, Layers, Menu, Newspaper, RefreshCw, Scale, ScrollText, Server, Settings2, ShieldCheck, Sigma, Wallet, type LucideIcon } from 'lucide-react';
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { shellMarkets, type MarketScope, type MonitorScopes, type ShellView } from '../../src/shell-view.ts';
 import { LazyBoundary } from './LazyBoundary.tsx';
@@ -30,6 +30,7 @@ const MonitorPage = lazy(() => import('./MonitorPage.tsx').then(m => ({ default:
 const NewsPage = lazy(() => import('./NewsPage.tsx').then(m => ({ default: m.NewsPage })));
 const OilPage = lazy(() => import('./OilPage.tsx').then(m => ({ default: m.OilPage })));
 const HynixPage = lazy(() => import('./HynixPage.tsx').then(m => ({ default: m.HynixPage })));
+const GoldOilPage = lazy(() => import('./GoldOilPage.tsx').then(m => ({ default: m.GoldOilPage })));
 const CrossexPage = lazy(() => import('./crossex/CrossexPage.tsx').then(m => ({ default: m.CrossexPage })));
 const OndoPage = lazy(() => import('./ondo/OndoPage.tsx').then(m => ({ default: m.OndoPage })));
 const OptionsPage = lazy(() => import('./OptionsPage.tsx').then(m => ({ default: m.OptionsPage })));
@@ -44,7 +45,7 @@ function isStale(read: ResourceSnapshot<unknown>) {
 }
 
 const ALWAYS: readonly NavEntry[] = ['pairs', 'status', 'logs', 'settings'];
-const ICONS: Record<NavEntry, LucideIcon> = { asset: Wallet, positions: Layers, monitor: Activity, news: Newspaper, oil: ArrowLeftRight, hynix: Cpu, crossex: Gauge, ondo: Coins, pairs: ShieldCheck, options: Sigma, status: Server, logs: ScrollText, settings: Settings2 };
+const ICONS: Record<NavEntry, LucideIcon> = { asset: Wallet, positions: Layers, monitor: Activity, news: Newspaper, oil: ArrowLeftRight, hynix: Cpu, goldoil: Scale, crossex: Gauge, ondo: Coins, pairs: ShieldCheck, options: Sigma, status: Server, logs: ScrollText, settings: Settings2 };
 /** Below this width the side navigation is a drawer (the workbench's 760px breakpoint, shell.css). */
 const DRAWER_QUERY = '(max-width: 760px)';
 
@@ -99,7 +100,7 @@ export function App() {
     for (const entry of ['oil', 'options', 'asset', 'crossex', 'ondo', 'news'] as const) {
       if (state.modules[entry]) available.add(entry);
     }
-    if (state.modules.oil) available.add('hynix');
+    if (state.modules.oil) { available.add('hynix'); available.add('goldoil'); }
     if (state.modules.asset) available.add('positions');
     if (state.monitor !== null) available.add('monitor');
   }
@@ -151,6 +152,7 @@ export function App() {
       case 'ondo': return <OndoPage onExpired={onExpired} />;
       case 'crossex': return <CrossexPage tab={route.tab} onExpired={onExpired} />;
       case 'hynix': return <HynixPage onExpired={onExpired} />;
+      case 'goldoil': return <GoldOilPage onExpired={onExpired} />;
       case 'oil': return <OilPage onExpired={onExpired} />;
       default:
         if (pairs.data) return <PairsWorkspace state={pairs.data} pairId={route.page === 'pair' ? route.pairId : null} stale={isStale(pairs)} onChanged={changed} onExpired={onExpired} />;

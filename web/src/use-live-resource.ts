@@ -81,7 +81,7 @@ export function useLiveResource<T>(path: string, { intervalMs, timeoutMs = 10_00
         const raw = await api<unknown>(path, { signal, timeoutMs });
         return parser.current ? parser.current(raw) : raw as T;
       } catch (error) {
-        const market = /^\/api\/monitor\/(anthropic|oil|hynix)\//.exec(path)?.[1];
+        const market = /^\/api\/monitor\/(anthropic|oil|goldoil|hynix)\//.exec(path)?.[1];
         if (market && !signal.aborted && error instanceof ApiError && (error.status === 423 || monitorGenerationChanged(error) || path.endsWith('/quote') && readAccessDenied(error))) {
           store.invalidate(key => key !== path && key.startsWith(`/api/monitor/${market}/`), error);
         }

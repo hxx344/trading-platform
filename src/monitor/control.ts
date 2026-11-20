@@ -10,7 +10,7 @@ export interface MarketControl { enabled: boolean; revision: number }
 export interface ControlView extends MarketControl { market: MonitorMarket; error: string | null }
 
 export const controlKey = (market: MonitorMarket): string => `control.${market}`;
-const NAMES: Record<MonitorMarket, string> = { anthropic: 'Anthropic', oil: '原油', hynix: '海力士', perpetual: '合约价差' };
+const NAMES: Record<MonitorMarket, string> = { anthropic: 'Anthropic', oil: '原油', goldoil: '金油比', hynix: '海力士', perpetual: '合约价差' };
 const reason = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 200);
 
 function parseSaved(value: unknown): MarketControl {

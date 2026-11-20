@@ -11,8 +11,13 @@ import { join } from 'node:path';
 import { ContractError } from '../src/contracts.ts';
 import { cmp } from '../src/decimal.ts';
 import { createOilRules, type BookRow, type RuleConfig } from '../src/oil/rules.ts';
-import { RETRY_MS, beijingDay, type RuleExecutor, type RulePlan } from '../src/oil/rule-live.ts';
+import { BLOCKED_NOTIFY_MS, RETRY_MS, beijingDay, type RuleExecutor, type RulePlan } from '../src/oil/rule-live.ts';
 import { SIM_ACCOUNTS } from '../src/simulation.ts';
+import { handOver, oilLoops, type OilRulesRuntime, type OilRuntime } from '../src/service/oil.ts';
+import { SIM_BINDINGS } from '../src/simulation.ts';
+import { createOilMarket } from '../src/oil/market.ts';
+import { createHynixMarket } from '../src/hynix/market.ts';
+import { createGoldOilMarket } from '../src/goldoil/market.ts';
 import { ruleActions, type OilRule } from '../web/src/oil-rules-form.ts';
 import { bindAccounts, createHarness, settle } from './harness.ts';
 
@@ -183,7 +188,7 @@ test('实盘：下单前按预览的两腿盘口复核阈值，不满足不确�
   assert.equal(ex.previews.length, 1, '复核失败后重新计数');
 }));
 
-test('实盘：预览拒绝——合约被占或执行器失去写入权等 60 秒不计失败，盘口过期重新计数，其它拒绝连续 3 次停用', () => withLive(async ({ r, ex, rules }) => {
+test('实盘：预览拒绝——合约被占、执行器失去写入权或同合约有反向仓位（隐式减仓）等 60 秒不计失败，盘口过期重新计数，其它拒绝连续 3 次停用', () => withLive(async ({ r, ex, rules }) => {
   goLive(rules);
   ex.previewError = new ContractError(409, 'symbol_locked', '所选合约已有未结束任务');
   await feed(r, rules, OPEN, 2);
@@ -197,9 +202,21 @@ test('实盘：预览拒绝——合约被占或执行器失去写入权等 60 �
   await feed(r, rules, OPEN, 2);
   assert.deepEqual([ex.previews.length, live(rules).failures, live(rules).retryAt !== null], [2, 0, true]);
   r.now += RETRY_MS;
+  // The other side of the contract held on a one-way account (e.g. a gold-oil job's oil leg): waits, never disables, and
+  // the same note is written once however long it lasts.
+  ex.previewError = new ContractError(409, 'implicit_reduce', 'Binance CLUSDT 单向模式已有反向仓位，开仓会变成隐式减仓');
+  const notes = first(rules).events.length;
+  for (let i = 0; i < 4; i++) {
+    await feed(r, rules, OPEN, 2);
+    assert.deepEqual([live(rules).failures, live(rules).enabled, live(rules).retryAt !== null], [0, true, true]);
+    r.now += RETRY_MS;
+  }
+  assert.equal(ex.previews.length, 6);
+  assert.match(lastEvent(rules), /隐式减仓；同合约有其他仓位（可能是金油任务），等待 60 秒，不计失败$/);
+  assert.equal(first(rules).events.length, notes + 1, '原因不变时只记一条');
   ex.previewError = new ContractError(409, 'quote_stale', '盘口已过期');
   await feed(r, rules, OPEN, 2);
-  assert.deepEqual([ex.previews.length, live(rules).failures, live(rules).retryAt], [3, 0, null]);
+  assert.deepEqual([ex.previews.length, live(rules).failures, live(rules).retryAt], [7, 0, null]);
   assert.match(lastEvent(rules), /重新计数，不计失败/);
   ex.previewError = new ContractError(409, 'account_missing', 'Binance 尚未绑定已核验的账户');
   for (let i = 1; i <= 3; i++) {
@@ -211,8 +228,118 @@ test('实盘：预览拒绝——合约被占或执行器失去写入权等 60 �
   assert.deepEqual([state.enabled, state.phase], [false, 'idle']);
   assert.match(state.reason!, /^连续 3 次失败，规则已停用：Binance 尚未绑定已核验的账户/);
   await feed(r, rules, OPEN, 3);
-  assert.equal(ex.previews.length, 6, '停用后不再预览');
+  assert.equal(ex.previews.length, 10, '停用后不再预览');
 }));
+
+test('实盘：被同合约反向仓位阻塞满 30 分钟发一次持久通知（重启不丢、交给通知队列后不重发），页面显示阻塞；预览通过后恢复并只记一条恢复', () => withLive(async ({ r, ex, rules: initial, reopen }) => {
+  let rules = initial;
+  goLive(rules);
+  ex.previewError = new ContractError(409, 'implicit_reduce', 'Binance CLUSDT 单向模式已有反向仓位，开仓会变成隐式减仓');
+  await feed(r, rules, OPEN, 2);
+  const since = (live(rules) as unknown as { blocked: { since: number; notified: boolean } }).blocked;
+  assert.deepEqual(since, { since: r.now, lastAt: r.now, notified: false });
+  while (r.now - since.since < BLOCKED_NOTIFY_MS - RETRY_MS) {
+    r.now += RETRY_MS;
+    await feed(r, rules, OPEN, 2);
+    assert.deepEqual(rules.notices(), [], '不满 30 分钟不通知');
+  }
+  r.now += RETRY_MS;
+  await feed(r, rules, OPEN, 2);
+  assert.deepEqual([live(rules).enabled, live(rules).failures], [true, 0]);
+  const [notice, ...more] = rules.notices();
+  assert.equal(more.length, 0);
+  assert.equal(notice!.key, `oil-rule-blocked:${first(rules).id}:${since.since}`);
+  assert.match(notice!.text, /^【原油自动规则受阻】.*开仓已连续 3\d 分钟被同合约反向仓位阻塞（同合约有其他仓位（可能是金油任务））；规则不停用/);
+  assert.match(lastEvent(rules), /已生成通知交给通知队列；规则继续等待，不停用$/);
+  // Written with the rule: a restart before the notifier took it still hands it over.
+  rules = reopen();
+  assert.deepEqual(rules.notices(), [notice]);
+  // A failed hand-over keeps it; a taken one is marked and not offered again.
+  const lines: string[] = [], sent: string[] = [];
+  handOver(rules, () => { throw new Error('outbox locked'); }, line => lines.push(line));
+  assert.deepEqual([rules.notices().length, lines.length], [1, 1]);
+  handOver(rules, (key, text) => sent.push(`${key} ${text}`), line => lines.push(line));
+  assert.deepEqual([sent.length, rules.notices().length], [1, 0]);
+  assert.equal((live(rules) as unknown as { blocked: { notified: boolean } }).blocked.notified, true);
+  r.now += RETRY_MS;
+  await feed(r, rules, OPEN, 2);
+  assert.deepEqual(rules.notices(), [], '同一次阻塞只通知一次');
+  // The position is gone: the next preview passes, one recovery record, and the rule goes on to confirm.
+  const events = first(rules).events.length;
+  ex.previewError = null;
+  r.now += RETRY_MS;
+  await feed(r, rules, OPEN, 2);
+  const added = first(rules).events.slice(events).map(item => item.message);
+  assert.equal(added.filter(text => /同合约反向仓位阻塞已解除/.test(text)).length, 1);
+  assert.equal((live(rules) as unknown as { blocked: unknown }).blocked, null);
+  assert.equal(ex.confirms.length, 1);
+  // Blocked again after that open ended unfilled: a new wait with its own key, notified once more after 30 minutes.
+  ex.finish('failed', ['0', '0']);
+  await rules.tick();
+  ex.previewError = new ContractError(409, 'implicit_reduce', 'Binance CLUSDT 单向模式已有反向仓位，开仓会变成隐式减仓');
+  r.now += RETRY_MS;
+  await feed(r, rules, OPEN, 2);
+  const again = blockedOf(rules)!;
+  assert.ok(again.since > since.since);
+  for (let i = 0; i < 31; i++) { r.now += RETRY_MS; await feed(r, rules, OPEN, 2); }
+  assert.deepEqual(rules.notices().map(item => item.key), [`oil-rule-blocked:${first(rules).id}:${again.since}`]);
+}));
+
+const blockedOf = (rules: Rules) => (live(rules) as unknown as { blocked: { since: number; lastAt: number; notified: boolean } | null }).blocked;
+test('实盘：受阻间隔超过两个重试周期按新的一次阻塞重新计时；因其他原因被拒清除阻塞', () => withLive(async ({ r, ex, rules }) => {
+  goLive(rules);
+  ex.previewError = new ContractError(409, 'implicit_reduce', 'Binance CLUSDT 单向模式已有反向仓位，开仓会变成隐式减仓');
+  await feed(r, rules, OPEN, 2);
+  const start = r.now;
+  r.now += RETRY_MS;
+  await feed(r, rules, OPEN, 2);
+  assert.deepEqual(blockedOf(rules), { since: start, lastAt: r.now, notified: false }, '间隔一个重试周期仍是同一次');
+  // Nothing refused for three retry periods (the spread fell back, say): the next refusal is a new wait.
+  r.now += 3 * RETRY_MS;
+  await feed(r, rules, OPEN, 2);
+  assert.deepEqual(blockedOf(rules), { since: r.now, lastAt: r.now, notified: false });
+  // 29 minutes on, then a gap: no notice for the two waits added together.
+  for (let i = 0; i < 26; i++) { r.now += RETRY_MS; await feed(r, rules, OPEN, 2); }
+  r.now += 3 * RETRY_MS;
+  await feed(r, rules, OPEN, 2);
+  assert.deepEqual(rules.notices(), []);
+  // Refused for another reason: no longer blocked.
+  r.now += RETRY_MS;
+  ex.previewError = new ContractError(409, 'symbol_locked', '所选合约已有未结束任务');
+  await feed(r, rules, OPEN, 2);
+  assert.equal(blockedOf(rules), null);
+}));
+
+test('服务循环交接规则通知：读通知抛错只记日志（限频）、循环照常、无未处理拒绝；带 notifyOnce 时交给队列后标记', async () => {
+  const h = createHarness();
+  const rejections: unknown[] = [];
+  const onRejection = (reason: unknown) => { rejections.push(reason); };
+  process.on('unhandledRejection', onRejection);
+  try {
+    bindAccounts(h.ex);
+    const options = { connectors: [h.binance, h.bybit] as never, accounts: SIM_BINDINGS as never, now: () => h.clock.now };
+    const oil = { config: { accounts: SIM_BINDINGS }, market: createOilMarket(options), hynix: createHynixMarket(options), goldoil: createGoldOilMarket(options) } as unknown as OilRuntime;
+    const run = async (rules: OilRulesRuntime, notifyOnce: (key: string, text: string) => unknown) => {
+      const logs: string[] = [];
+      let rounds = 0;
+      await Promise.all(oilLoops(oil, { stopped: () => rounds >= 12, pause: async () => { rounds++; await new Promise(resolve => setImmediate(resolve)); } }, line => logs.push(line), rules, undefined, undefined, notifyOnce));
+      return { logs, rounds };
+    };
+    let ticks = 0;
+    const broken = { tick: async () => { ticks++; }, notices: () => { throw new Error('rules store locked'); }, noticeSent: () => {} } as unknown as OilRulesRuntime;
+    const failed = await run(broken, () => true);
+    assert.ok(ticks >= 2, '读通知抛错后仍继续判断');
+    assert.equal(failed.logs.filter(line => /通知读取失败：rules store locked/.test(line)).length, 1, '一分钟内只记一次');
+    // The service's wiring: notices go to notifyOnce, then are marked; a marked one is not offered again.
+    const queue: string[] = [], sent: string[] = [];
+    let waiting = [{ key: 'oil-rule-blocked:r1:1', text: '【原油自动规则受阻】…' }];
+    const rules = { tick: async () => {}, notices: () => waiting, noticeSent: (key: string) => { sent.push(key); waiting = waiting.filter(item => item.key !== key); } } as unknown as OilRulesRuntime;
+    await run(rules, (key, text) => { queue.push(`${key} ${text}`); return true; });
+    assert.deepEqual([queue, sent], [['oil-rule-blocked:r1:1 【原油自动规则受阻】…'], ['oil-rule-blocked:r1:1']]);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(rejections, []);
+  } finally { process.off('unhandledRejection', onRejection); h.dispose(); }
+});
 
 test('实盘：确认结果未知时保留待确认，下一轮与重启后用同一请求编号核对，不另发任务；确认已失效则退回', () => withLive(async ({ r, ex, rules: initial, reopen }) => {
   goLive(initial);

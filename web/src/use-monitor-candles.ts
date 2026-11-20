@@ -2,14 +2,16 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'r
 import { anthropicHistory } from './monitor-history.ts';
 import { hynixHistory } from './monitor-hynix.ts';
 import { oilHistory } from './monitor-oil.ts';
+import { goldOilHistory } from './monitor-goldoil.ts';
 import { MONITOR_CANDLE_CHECK_MS, candleReadDenied, createMonitorCandleReader, monitorCandleSelection, type SavedMonitorCandles } from './monitor-candle-cache.ts';
 import { createPublicCandleCache } from './public-candle-cache.ts';
 import { useLiveResource } from './use-live-resource.ts';
 
-const cache = createPublicCandleCache<SavedMonitorCandles>('monitor-spread-v1', 3);
+const cache = createPublicCandleCache<SavedMonitorCandles>('monitor-spread-v1', 4);
 export const anthropicCandles = createMonitorCandleReader('anthropic', anthropicHistory, cache);
 export const hynixCandles = createMonitorCandleReader('hynix', hynixHistory, cache);
 export const oilCandles = createMonitorCandleReader('oil', oilHistory, cache);
+export const goldOilCandles = createMonitorCandleReader('goldoil', goldOilHistory, cache);
 
 export function useMonitorCandles<T extends { windowDays: number | null }>(reader: ReturnType<typeof createMonitorCandleReader<T>>, range: number | null, warmup: number,
   onExpired: () => void, quoteError: Error | null) {

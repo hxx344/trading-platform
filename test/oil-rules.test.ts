@@ -266,7 +266,7 @@ test('服务接线：规则库打不开时只读出原因、写入 503；每轮�
   const dir = mkdtempSync(join(tmpdir(), 'tp-oil-rules-'));
   try {
     const logs: string[] = [];
-    const oil = { config: { notionalLimits: { perJob: '1', openPer24h: '1' }, accounts: [{ venue: 'binance' }] }, market: { view: () => ({ books: [] }), refreshQuotes: async () => {}, refreshPositions: async () => {} }, hynix: { refreshQuotes: async () => {}, refreshPositions: async () => {} } } as unknown as OilRuntime;
+    const oil = { config: { notionalLimits: { perJob: '1', openPer24h: '1' }, accounts: [{ venue: 'binance' }] }, market: { view: () => ({ books: [] }), refreshQuotes: async () => {}, refreshPositions: async () => {} }, hynix: { refreshQuotes: async () => {}, refreshPositions: async () => {} }, goldoil: { refreshQuotes: async () => {}, refreshPositions: async () => {} } } as unknown as OilRuntime;
     const stub = openOilRules(oil, join(dir, 'missing', 'deeper'), { log: line => logs.push(line) });
     assert.deepEqual(Object.keys(stub.view() as object), ['available', 'error', 'rules']);
     assert.equal((stub.view() as { available: boolean }).available, false);

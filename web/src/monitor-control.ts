@@ -35,7 +35,7 @@ export function switchLabel(control: MonitorControl | undefined, pending: boolea
   return control.enabled ? '已开启' : '已关闭';
 }
 
-const NAMES: Record<string, string> = { anthropic: 'Anthropic', oil: '原油', hynix: '海力士', perpetual: '合约价差' };
+const NAMES: Record<string, string> = { anthropic: 'Anthropic', oil: '原油', goldoil: '金油比', hynix: '海力士', perpetual: '合约价差' };
 /** Shown in place of the market's panel while it is off. Anthropic has no automatic alerts. */
 export function disabledNotice(market: string): string {
   // The perpetual quotes live in memory only (M-4a): nothing is kept while it is off.

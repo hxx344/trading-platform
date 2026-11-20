@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import type { AnthropicCandleRow } from '../vendor/anthropic-market.mjs';
 import type { HynixCandleRow } from '../vendor/hynix-market.mjs';
 import type { OilCandleRow } from '../vendor/oil-market.mjs';
+import type { GoldOilCandleRow } from './goldoil-market.ts';
 import type { HynixFundingRow, OilFundingRow } from '../vendor/settled-funding.mjs';
 import type { FundingFact, FundingProof } from './funding-archive.ts';
 
@@ -28,6 +29,7 @@ export function createMonitorStore({ file, now = Date.now }: { file: string; now
     db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=2000;
     CREATE TABLE IF NOT EXISTS anthropic_candles (time INTEGER PRIMARY KEY, binance REAL, xyz REAL, io REAL, rh REAL);
     CREATE TABLE IF NOT EXISTS oil_candles (time INTEGER PRIMARY KEY, brent REAL, wti REAL);
+    CREATE TABLE IF NOT EXISTS goldoil_candles (time INTEGER PRIMARY KEY, xau REAL, wti REAL, brent REAL);
     CREATE TABLE IF NOT EXISTS hynix_candles (time INTEGER PRIMARY KEY, adr REAL NOT NULL, ordinary REAL NOT NULL);
     CREATE TABLE IF NOT EXISTS oil_funding (time INTEGER PRIMARY KEY, brent REAL, wti REAL);
     CREATE TABLE IF NOT EXISTS hynix_funding (time INTEGER PRIMARY KEY, adr REAL, ordinary REAL);
@@ -41,6 +43,9 @@ export function createMonitorStore({ file, now = Date.now }: { file: string; now
   const upsertOil = db.prepare(`INSERT INTO oil_candles(time, brent, wti) VALUES (?, ?, ?)
     ON CONFLICT(time) DO UPDATE SET brent = excluded.brent, wti = excluded.wti`);
   const pruneOil = db.prepare('DELETE FROM oil_candles WHERE time < ?');
+  const upsertGoldOil = db.prepare(`INSERT INTO goldoil_candles(time, xau, wti, brent) VALUES (?, ?, ?, ?)
+    ON CONFLICT(time) DO UPDATE SET xau = excluded.xau, wti = excluded.wti, brent = excluded.brent`);
+  const pruneGoldOil = db.prepare('DELETE FROM goldoil_candles WHERE time < ?');
   const upsertHynix = db.prepare(`INSERT INTO hynix_candles(time, adr, ordinary) VALUES (?, ?, ?)
     ON CONFLICT(time) DO UPDATE SET adr = excluded.adr, ordinary = excluded.ordinary`);
   const pruneHynix = db.prepare('DELETE FROM hynix_candles WHERE time < ?');
@@ -97,6 +102,11 @@ export function createMonitorStore({ file, now = Date.now }: { file: string; now
       return db.prepare('SELECT time, brent, wti FROM oil_candles ORDER BY time').all() as unknown as OilCandleRow[];
     },
     writeOilCandles: (write: CandleWrite<OilCandleRow>): number => writeRows('oil_candles', row => upsertOil.run(row.time, row.brent, row.wti), pruneOil, write),
+    /** M-2f: every stored gold/oil row (XAU, WTI and Brent 15-minute mark closes, null where a leg had no bar), oldest first. */
+    goldOilCandles(): GoldOilCandleRow[] {
+      return db.prepare('SELECT time, xau, wti, brent FROM goldoil_candles ORDER BY time').all() as unknown as GoldOilCandleRow[];
+    },
+    writeGoldOilCandles: (write: CandleWrite<GoldOilCandleRow>): number => writeRows('goldoil_candles', row => upsertGoldOil.run(row.time, row.xau, row.wti, row.brent), pruneGoldOil, write),
     /** Every stored Hynix hour (ADR and ordinary-share closes), oldest first. */
     hynixCandles(): HynixCandleRow[] {
       return db.prepare('SELECT time, adr, ordinary FROM hynix_candles ORDER BY time').all() as unknown as HynixCandleRow[];

@@ -118,7 +118,7 @@ export function OilPnl({ onExpired }: { onExpired: () => void }) {
   const rows = data.entries.rows;
   return <>
     <section className="trading-panel trading-pnl" id="oilPnl" aria-labelledby="oil-pnl-title">
-      <div className="trading-panel-heading"><div><h2 id="oil-pnl-title">原油总盈亏</h2><p>持仓浮盈亏＋区间平仓盈亏＋手续费（扣费为负）＋已结算资金费 · 仅本服务的原油执行账户</p></div>
+      <div className="trading-panel-heading"><div><h2 id="oil-pnl-title">原油总盈亏</h2><p>持仓浮盈亏＋区间平仓盈亏＋手续费（扣费为负）＋已结算资金费 · 仅本服务的原油执行账户 · CL / BZ 为账户合计，含金油任务的油腿</p></div>
         <div className="trading-range" role="group" aria-label="盈亏与资金费时间范围">{RANGES.map(([value, text]) => <button key={value} type="button" aria-pressed={range === value} onClick={() => changeRange(value)}>{text}</button>)}</div></div>
       {pending ? <p className="trading-window-loading" role="status">{live.status === 'error' || live.status === 'offline' ? `所选区间或分页读取失败：${live.error?.message ?? '网络离线'}；` : '正在读取所选区间或分页；'}下方仍显示上一次的数据。</p> : null}
       <p className="trading-caption">累计起点：{date(data.start)}（北京时间）{data.start > data.requestedStart ? '，账单从这时起才有记录，早于它的不计' : ''}；每个采样点只累计到各账户自己的持仓读取时刻。</p>

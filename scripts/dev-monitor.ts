@@ -1,5 +1,5 @@
 // A local preview of the monitor page (and the EQN news page, test/news-fake.ts) on the stand-in venues of test/monitor-fake.ts: a simulated executor, the built
-// page and the Anthropic, oil, Hynix and perpetual-spread collectors in a throwaway data directory, removed on exit. Nothing goes to the network. Unlike the
+// page and the Anthropic, oil, gold/oil, Hynix and perpetual-spread collectors in a throwaway data directory, removed on exit. Nothing goes to the network. Unlike the
 // service it takes no account locks and writes no environment marker, so it also runs on Windows.
 //   pnpm build:web; node scripts/dev-monitor.ts [--port 4731]
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -34,7 +34,7 @@ const alertHooks = {
   robot: () => 'feishuMonitor' as const,
   test: async (text: string) => { process.stdout.write(`[替身飞书·测试] ${text}\n`); },
 };
-const monitor = openMonitor(parseMonitorConfig({ anthropic: {}, oil: {}, hynix: {}, perpetual: {} }), dir, { fetchImpl: venues.fetch, WebSocketImpl: venues.WebSocket, variationalFetch: venues.variationalFetch, alertHooks, perpetualOptions: fakePerpetualVenues() });
+const monitor = openMonitor(parseMonitorConfig({ anthropic: {}, oil: {}, goldoil: {}, hynix: {}, perpetual: {} }), dir, { fetchImpl: venues.fetch, WebSocketImpl: venues.WebSocket, variationalFetch: venues.variationalFetch, alertHooks, perpetualOptions: fakePerpetualVenues() });
 const store = openStore(join(dir, 'executor.sqlite'));
 const { binance, bybit, aster, asterTrading } = createSimulatedVenues(Date.now);
 const executor = createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, positions: asterTrading });

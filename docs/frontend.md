@@ -41,6 +41,7 @@
 | 市场与机会 | 快讯 | `#/news` | 已启用快讯，后台启动期间也显示 | 《EQN 快讯与异动行情》，做法见 [news.md](news.md) |
 | 交易中心 | 原油 | `#/oil` | 服务已接入原油执行 | 《原油页样式》《原油自动规则区块》《原油盈亏与资金费》，页面内容见 [oil.md](oil.md) 第 3 节 |
 | 交易中心 | 海力士 | `#/hynix` | 同原油，两者共用执行账户 | 《海力士页》，页面内容见 [hynix.md](hynix.md) 第 3 节 |
+| 交易中心 | 金油 | `#/goldoil` | 同原油，三者共用执行账户 | 《金油页（G1，v0.74.0）》，页面内容见 [goldoil.md](goldoil.md) 第 3 节 |
 | 交易中心 | CrossEx | `#/crossex`，子页 `#/crossex/trade`、`#/crossex/hedge`、`#/crossex/orders`、`#/crossex/settings` | 已配置 CrossEx，后台重试期间也显示 | 《CrossEx 页》 |
 | 交易中心 | Ondo 挂单奖励 | `#/ondo` | 服务已接入 Ondo | 《Ondo 挂单奖励页》 |
 | 策略与风险 | 配对组 | `#/`、`#/pair/<配对>` | 总是 | F1–F3、《ASTER 页面按工作台重排（F4）》 |
@@ -672,6 +673,23 @@
 
 **回滚**：`sudo bash install.sh --version v0.52.1`；回退前先停用并处理全部海力士规则与分批规则（[hynix.md](hynix.md) 第 8.3 节）。
 
+## 金油页（G1，v0.74.0）
+
+**对照的页面**：本仓库 `web/src/HynixPage.tsx`（v0.73.0）。工作台没有金油执行页面，版式照海力士页，不做两腿名义平衡、四腿与自动规则（[goldoil.md](goldoil.md) 第 7 节）。
+
+**页面**：`web/src/GoldOilPage.tsx`，侧栏交易中心组排在海力士之后。自上而下：
+- 金油比实时行情：每所每个油品一行，列为 XAU 买一 / 卖一、油买一 / 卖一、金油比（中间价）、卖出比值（XAU 买一 ÷ 油卖一）、买入比值（XAU 卖一 ÷ 油买一），保留 3 位小数；跨所 XAU 价差折叠。
+- 金油持仓：XAU、CL、BZ 三个合约。油腿是账户该合约的全部持仓，含原油页的仓位。
+- 执行面板：任务列表只列金油任务，下单表单有同所金油比（选油品与首腿）和跨所 XAU 两个预设，开仓按每腿等金额，平仓可按数量或按持仓填入，可分批。
+
+持仓表、任务卡片、同步行和确认的请求编号逻辑从 `OilPage.tsx` 导出复用；任务卡片按 `market` 显示合约数量。表单换算在 `web/src/goldoil-form.ts`，由 `test/goldoil.test.ts` 覆盖。
+
+**样式**：没有新增规则，沿用 `trading.css`。
+
+**验证**：`scripts/dev-hynix.ts` 模拟 Binance / Bybit 上的临时预览服务，无头浏览器 1280 与 390 宽度，见 [goldoil.md](goldoil.md) 第 5 节。
+
+**回滚**：见 README 回退表 v0.74.0 一行（先确认没有未结束的金油任务）。
+
 ## Ondo 挂单奖励页
 
 **对照的工作台页面**：工作台 `src/OndoMarketMakerPage.tsx`（提交 `7745181`）；回退版本 v0.59.0。代码在 `web/src/ondo/`，内容与参数见 [ondo.md](ondo.md) 第 6、7 节。
@@ -709,3 +727,13 @@
 **验证**：`scripts/dev-monitor.ts` 预览接上替身 EQN（`test/news-fake.ts`），无头浏览器 1280 与 390 宽度：两处页面、频道与币种筛选、推送到达后经 REST 核对去掉“推送”标记，无横向滚动、无 CSP 报错。
 
 **回滚**：回退到 v0.71.0，入口与页签随之消失；`config.json` 写过 `"news"` 的先删掉。
+
+## 行情监控页：金油比（Monitor M-2f，v0.74.0）
+
+**对照的工作台页面**：`modules/monitor/app/gold-oil-panel.tsx`（`584ebc8`）与 `app/gold-oil-svg-chart.tsx`（`8470785`）。回滚版本 v0.73.0（回退前先删 `monitor.goldoil`，见 [monitor.md](monitor.md) 的 M-2f）。
+
+**页面**：行情监控页签「原油」之后新增「金油比」（`web/src/MonitorGoldOil.tsx`，数据整理在不依赖 React 的 `web/src/monitor-goldoil.ts`）。自上而下：标题与刷新、原油合约 CL / BZ 切换、状态行、四个读数、走势图（时间范围 1 天 / 1 周 / 1 月 / 全部，「金油比」与「标记价格」两个视图，价格视图上下两张图共用悬停）、告警面板（`<AlertSettings market="goldoil">`）、区间速览表与「如何计算」、数据来源。图表沿用原油页的 `SvgPlot`、`createHoverStore`、`niceAxis`、`sampleChartPoints`；缺口处插入空行断线，不插值。
+
+**样式**：`monitor.css` 末尾 `goldoil-*` 一节，只用已有颜色与间距令牌，无内联样式。700px 以下图表标题区换行，范围按钮不折字。
+
+**验证**：`scripts/dev-monitor.ts` 替身后端，headless Chromium 在 1280 与 390 宽度走 CL / BZ、两个视图、四个范围，添加并保存告警档位（POST 200）；两种宽度都没有横向溢出，没有 CSP 报错（只有预览环境本来就没有的 `/api/update`、`/api/read-token`、`/api/asset/positions` 返回 404）。截图环境缺中文字体，中文显示为方框，只核对了版式。

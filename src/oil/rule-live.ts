@@ -12,6 +12,14 @@ export type Phase = typeof PHASES[number];
 export const FAILURE_LIMIT = 3;
 /** How long a rule waits after a failure, a locked contract or a job that filled nothing before it judges again. */
 export const RETRY_MS = 60_000;
+/**
+ * A rule whose open or close keeps being refused because the account holds the other side of the contract
+ * (implicit_reduce, e.g. a gold-oil job's oil leg) keeps waiting without being disabled; once it has waited this long in a
+ * row a person is notified, once per wait (docs/oil.md 7.3).
+ */
+export const BLOCKED_NOTIFY_MS = 30 * 60_000;
+/** Refusals further apart than this are two waits, not one: the rule was judging (or not meeting its threshold) in between. */
+export const BLOCKED_GAP_MS = 2 * RETRY_MS;
 /** An automatic job's longest run; the executor ends it at this deadline. */
 export const JOB_TIMEOUT_MS = 60_000;
 /** An automatic job's longest run including its batch intervals; the intent allows up to an hour. */
@@ -51,7 +59,16 @@ export interface LiveState {
   retryAt: number | null;
   /** Why the rule stopped or waits for review. */
   reason: string | null;
+  /**
+   * Refused for another position on the contract (implicit_reduce) since `since`, last at `lastAt`. Cleared when a preview
+   * passes, when the rule is refused or fails for another reason, or goes to review; a refusal more than BLOCKED_GAP_MS
+   * after the last one starts a new wait (new since, new notice key). notice: the message for a person once the wait lasted
+   * BLOCKED_NOTIFY_MS, kept until it was handed to the notifier's outbox (notified), so a restart in between neither loses
+   * nor repeats it (L110).
+   */
+  blocked: Blocked | null;
 }
+export interface Blocked { since: number; lastAt: number; notice: string | null; notified: boolean }
 
 /** The slices of the executor a rule uses (src/executor.ts). */
 export interface RulePlanLeg extends AccountRef { symbol: string; quantity: string; quote: { bid: string; ask: string; receivedAt: number } }
@@ -66,7 +83,7 @@ export interface RuleExecutor {
   confirmedJob(requestId: string, previewId: string, session: string): string | null;
 }
 
-export const idleLive = (): LiveState => ({ enabled: false, phase: 'idle', pending: null, job: null, held: null, opens: { day: '', count: 0 }, failures: 0, retryAt: null, reason: null });
+export const idleLive = (): LiveState => ({ enabled: false, phase: 'idle', pending: null, job: null, held: null, opens: { day: '', count: 0 }, failures: 0, retryAt: null, reason: null, blocked: null });
 export const isFinal = (status: string): boolean => FINAL.includes(status);
 export const ruleSession = (id: string): string => `oil-rule:${id}`;
 /** Beijing calendar day (UTC+8, no daylight saving) of a time. */
@@ -238,6 +255,11 @@ function heldOf(value: unknown, market: RuleMarket): HeldLeg[] | null {
 }
 
 /** A live rule's stored state; one that does not add up is held for review with what can still be read. */
+function blockedOf(value: unknown): Blocked | null {
+  const raw = object(value);
+  if (!raw || !Number.isFinite(raw.since)) return null;
+  return { since: raw.since as number, lastAt: Number.isFinite(raw.lastAt) ? raw.lastAt as number : raw.since as number, notice: typeof raw.notice === 'string' ? raw.notice.slice(0, 600) : null, notified: raw.notified === true };
+}
 export function liveOf(value: unknown, market: RuleMarket): LiveState {
   const raw = object(value) ?? {};
   const phase = (PHASES as readonly unknown[]).includes(raw.phase) ? raw.phase as Phase : null;
@@ -248,6 +270,7 @@ export function liveOf(value: unknown, market: RuleMarket): LiveState {
     failures: Number.isSafeInteger(raw.failures) && (raw.failures as number) >= 0 ? raw.failures as number : 0,
     retryAt: Number.isFinite(raw.retryAt) ? raw.retryAt as number : null,
     reason: typeof raw.reason === 'string' ? raw.reason.slice(0, 400) : null,
+    blocked: blockedOf(raw.blocked),
   };
   // Valid pending/job records in manual review identify the account and order; only opening/closing can run them.
   if (phase === 'review') return { ...live, enabled: false };

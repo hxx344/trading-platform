@@ -127,6 +127,10 @@ test('只读令牌：白名单外的 GET、所有 POST、页面、静态资源�
     assert.equal(page.headers.get('set-cookie'), null, '令牌换不到 cookie');
     // The list itself: only GET reads, none of them an asset, import, exchange or stream route.
     for (const { path } of READ_TOKEN_ROUTES) assert.doesNotMatch(String(path), /asset|import|observe|exchanges|stream|balances|rewards|market|preview|rfq|bootstrap|instruments|session|read-token|check|apply/);
+    // Gold-oil as hynix: its state (accounts, positions, jobs) is readable, its books are not.
+    assert.equal(readTokenAllows(new URL('/api/goldoil/state', 'http://x')), true);
+    assert.equal(readTokenAllows(new URL('/api/goldoil/market', 'http://x')), false);
+    assert.equal((await s.read(token, '/api/goldoil/market')).status, 403);
   } finally { await s.close(); }
 });
 

@@ -3,6 +3,9 @@
 // then delivers it with its own retries. The rules are the workbench's oil rules (server/oil/config.mjs at 31242e0), shared by
 // both markets: one alert per crossing, a hysteresis band before the next one, a cooldown across crossings, and two-way tiers
 // that report crossings only. Config, crossing states and the recent history sit in monitor.sqlite's key-value table.
+// M-2f: the gold/oil ratio (XAU ÷ CL and XAU ÷ BZ, barrels per ounce) joins with the same rules; its tiers, units, 75 s age
+// limit and message follow the workbench's gold-oil alerts (lib/monitor-alerts.ts at 584ebc8, server/gold-oil/alerts.mjs at
+// 8470785), both oil legs in one market (the workbench kept one config per leg).
 // M-3b: tiers imported from the workbench wait under `alerts.<market>.import` (written by import-writer.ts as the service
 // account); the running service applies them on its next check and removes the key in the same transaction.
 import { randomUUID } from 'node:crypto';
@@ -10,7 +13,7 @@ import { ContractError } from '../contracts.ts';
 import { oilSpread } from '../vendor/oil-market.mjs';
 import type { MonitorStore } from './store.ts';
 
-export type AlertMarket = 'oil' | 'hynix';
+export type AlertMarket = 'oil' | 'goldoil' | 'hynix';
 export type AlertOperator = 'gte' | 'lte' | 'both';
 export interface AlertRule { id: string; label: string; metric: string; operator: AlertOperator; threshold: number; cooldownMinutes: number; hysteresis: number; enabled: boolean }
 export interface AlertConfig { enabled: boolean; rules: AlertRule[] }
@@ -58,6 +61,14 @@ export const ALERT_SPECS: Record<AlertMarket, MarketSpec> = {
       wti: { label: 'WTI', unit: 'USDT/桶', min: 0, max: 1e6, positive: true },
     },
     defaults: () => ({ enabled: false, rules: [3, 4, 5].map((threshold, index) => ({ id: `spread-${index + 1}`, label: `价差 ${threshold} USDT`, metric: 'spread', operator: 'gte' as const, threshold, cooldownMinutes: 30, hysteresis: 0.1, enabled: true })) }),
+  },
+  goldoil: {
+    title: '金油比', maxRules: 50, labelMax: 60, cooldownMax: 10_080, hysteresisMax: 1e6, maxAgeMs: 75_000,
+    metrics: {
+      clRatio: { label: '金油比 XAU / CL', unit: '桶/盎司', min: 0, max: 1e6, positive: true },
+      bzRatio: { label: '金油比 XAU / BZ', unit: '桶/盎司', min: 0, max: 1e6, positive: true },
+    },
+    defaults: () => ({ enabled: false, rules: [] }),
   },
   hynix: {
     title: '海力士', maxRules: 20, labelMax: 40, cooldownMax: 1_440, hysteresisMax: 100, maxAgeMs: 30_000,
@@ -139,19 +150,27 @@ function markAlerted(state: RuleState, operator: 'gte' | 'lte', at: number): voi
 }
 
 interface OilLike { status?: unknown; fetchedAt?: unknown; brent?: { markPx?: unknown }; wti?: { markPx?: unknown } }
+interface GoldOilLike { xau?: { price?: unknown }; cl?: { price?: unknown }; bz?: { price?: unknown } }
 interface HynixLike { status?: unknown; fetchedAt?: unknown; adr?: unknown; ordinary?: unknown; equivalent?: unknown; spread?: unknown; premium?: unknown }
 export type AlertValues = Record<string, number>;
 
 /** The judged values of a live quote, or the reason it cannot be judged. */
 export function quoteValues(market: AlertMarket, quote: unknown, now: number): { values: AlertValues; fetchedAt: string; quote: Record<string, number> } | { reason: string } {
   if (!quote) return { reason: '尚未取得实时报价，暂停阈值判断' };
-  const raw = quote as OilLike & HynixLike;
+  const raw = quote as OilLike & HynixLike & GoldOilLike;
   const at = typeof raw.fetchedAt === 'string' ? Date.parse(raw.fetchedAt) : NaN;
   if (raw.status !== 'live' || !Number.isFinite(at) || now - at > ALERT_SPECS[market].maxAgeMs || at - now > FUTURE_MS) return { reason: '实时报价已过期，暂停阈值判断，下一轮自动重试' };
   if (market === 'oil') {
     const brent = raw.brent?.markPx, wti = raw.wti?.markPx, spread = oilSpread(brent, wti);
     if (!finite(brent) || !finite(wti) || spread === null) return { reason: '行情价格无效，暂停阈值判断' };
     return { values: { spread, brent, wti }, fetchedAt: raw.fetchedAt as string, quote: { brent, wti, spread } };
+  }
+  if (market === 'goldoil') {
+    // The ratios are recomputed from the legs: the quote's own `ratio` is display only.
+    const xau = raw.xau?.price, wti = raw.cl?.price, brent = raw.bz?.price;
+    if (![xau, wti, brent].every(value => finite(value) && value > 0)) return { reason: '行情价格无效，暂停阈值判断' };
+    const clRatio = (xau as number) / (wti as number), bzRatio = (xau as number) / (brent as number);
+    return { values: { clRatio, bzRatio }, fetchedAt: raw.fetchedAt as string, quote: { xau: xau as number, wti: wti as number, brent: brent as number, clRatio, bzRatio } };
   }
   const { adr, equivalent, spread, premium } = raw;
   if (![adr, equivalent, spread, premium].every(finite) || (adr as number) <= 0 || (equivalent as number) <= 0) return { reason: '行情价格无效，暂停阈值判断' };
@@ -180,6 +199,10 @@ export function alertMessage(market: AlertMarket, due: readonly { rule: AlertRul
   if (market === 'oil') {
     const line = `布伦特 ${fixed(quote.brent!, 4)} · WTI ${fixed(quote.wti!, 4)} · 价差 ${fixed(quote.spread!, 4)} USDT/桶（Binance BZUSDT / CLUSDT 标记价，报价时刻 ${fetchedAt}）`;
     return `${fit('【原油阈值告警】', due.map(({ rule, operator, value }) => `${rule.label}${crossing(rule, operator)}：${spec.metrics[rule.metric]!.label} ${fixed(value, 4)} ${sign(operator)} ${rule.threshold} USDT/桶`), line.length + 1)}\n${line}`;
+  }
+  if (market === 'goldoil') {
+    const line = `黄金 ${fixed(quote.xau!, 2)} USDT/盎司 · WTI ${fixed(quote.wti!, 4)} · 布伦特 ${fixed(quote.brent!, 4)} USDT/桶 · XAU/CL ${fixed(quote.clRatio!, 4)} · XAU/BZ ${fixed(quote.bzRatio!, 4)} 桶/盎司（Binance XAUUSDT / CLUSDT / BZUSDT 永续标记价，金油比＝XAU ÷ 油，报价时刻 ${fetchedAt}）`;
+    return `${fit('【金油比阈值告警】', due.map(({ rule, operator, value }) => `${rule.label}${crossing(rule, operator)}：${spec.metrics[rule.metric]!.label} ${fixed(value, 4)} ${sign(operator)} ${rule.threshold} 桶/盎司`), line.length + 1)}\n${line}`;
   }
   const line = `ADR $${fixed(quote.adr!, 2)} · 正股 ÷ 10 $${fixed(quote.equivalent!, 2)} · 每份价差 $${fixed(quote.spread!, 2)}（Hyperliquid xyz:SKHY / xyz:SKHX，获取时刻 ${fetchedAt}）`;
   return `${fit('【海力士价差告警】', due.map(({ rule, operator, value }) => `${rule.label}${crossing(rule, operator)}：ADR 溢价率 ${fixed(value, 2)}% ${sign(operator)} ${rule.threshold}%`), line.length + 1)}\n${line}`;
@@ -427,7 +450,7 @@ export function createAlertService({ market, store, quote, hooks, gate, now = Da
       gate.take();
       const at = now(), time = new Date(at).toISOString();
       let failure: string | null = null;
-      try { await hooks.test(`【行情监控】飞书连接测试：原油 / 海力士阈值告警使用此机器人（secrets.json 的 ${hooks.robot()}）。${time}`); }
+      try { await hooks.test(`【行情监控】飞书连接测试：原油 / 金油比 / 海力士阈值告警使用此机器人（secrets.json 的 ${hooks.robot()}）。${time}`); }
       catch (error) { failure = brief(error); }
       record({ id: randomUUID(), time, kind: 'test', status: failure ? 'failed' : 'sent', ...(failure ? { error: failure } : {}) });
       write();

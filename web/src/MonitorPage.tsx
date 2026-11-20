@@ -11,6 +11,7 @@ import { DetailLayout, RelatedPositions } from './MonitorRelated.tsx';
 import { linkedMonitorTab, withoutMonitorLink } from './monitor-link.ts';
 import { HynixPanel } from './MonitorHynix.tsx';
 import { OilPanel } from './MonitorOil.tsx';
+import { GoldOilMonitorPanel } from './MonitorGoldOil.tsx';
 import { PerpetualPanel } from './MonitorPerpetual.tsx';
 import { MovesPanel } from './MonitorMoves.tsx';
 import { StatePanel } from './StateViews.tsx';
@@ -50,7 +51,7 @@ const signed = (v: number | null | undefined, suffix = '%') => v == null ? '—'
 const fundingText = (v: number | null | undefined) => v == null ? '—' : `${v >= 0 ? '' : '−'}${Math.abs(v * 100).toFixed(4)}%`;
 const legName = (key: string) => ANTHROPIC_LEGS[key as keyof typeof ANTHROPIC_LEGS]?.name ?? key;
 
-const MARKET_TABS: Record<string, string> = { anthropic: 'Anthropic', oil: '原油', hynix: '海力士', perpetual: '合约价差', moves: '异动行情' };
+const MARKET_TABS: Record<string, string> = { anthropic: 'Anthropic', oil: '原油', goldoil: '金油比', hynix: '海力士', perpetual: '合约价差', moves: '异动行情' };
 /** EQN 异动行情（docs/news.md）：不是服务端的监控市场，没有运行开关；/api/news 有应答时排在最后。 */
 const MOVES_TAB = 'moves';
 const TAB_KEY = 'monitor:market:v1';
@@ -123,7 +124,7 @@ export function MonitorPage({ shell, scopes, onControlChanged, onExpired }: {
       {confirmed && control?.error && <p className="hub-control-notice" role="alert">{control.error}</p>}
       {!confirmed ? checking
         : off ? <p className="notice" role="status">{disabledNotice(active)}</p>
-        : active === MOVES_TAB ? <MovesPanel onExpired={onExpired} /> : active === 'oil' ? <OilPanel onExpired={onExpired} /> : active === 'hynix' ? <HynixPanel onExpired={onExpired} /> : active === 'perpetual' ? <PerpetualPanel onExpired={onExpired} /> : shares && <AnthropicPanel outstanding={shares.outstanding} diluted={shares.diluted} onExpired={onExpired} />}
+        : active === MOVES_TAB ? <MovesPanel onExpired={onExpired} /> : active === 'oil' ? <OilPanel onExpired={onExpired} /> : active === 'goldoil' ? <GoldOilMonitorPanel onExpired={onExpired} /> : active === 'hynix' ? <HynixPanel onExpired={onExpired} /> : active === 'perpetual' ? <PerpetualPanel onExpired={onExpired} /> : shares && <AnthropicPanel outstanding={shares.outstanding} diluted={shares.diluted} onExpired={onExpired} />}
     </div></div>
   </div>;
 }

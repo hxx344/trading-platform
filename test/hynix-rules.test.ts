@@ -511,6 +511,7 @@ test('服务接线：规则读原油与海力士两组盘口；海力士盘口�
       },
       refreshPositions: async () => {},
     },
+    goldoil: { refreshQuotes: async () => {}, refreshPositions: async () => {} },
   } as unknown as OilRuntime;
   const rules = openOilRules(oil, dir, { now: () => clock.now });
   try {
@@ -558,6 +559,11 @@ test('阈值界限：两腿各分一半余量，按界限成交时组合价差�
   assert.equal(ex.previews.length, 1);
   assert.deepEqual([live(rules).failures, live(rules).phase], [0, 'idle']);
   assert.match(lastEvent(rules), /重新计数，不计失败/);
+  // Another position on the contract: a hynix rule does not name gold-oil, which trades no hynix contract.
+  r.now += 60_000;
+  ex.previewError = new ContractError(409, 'implicit_reduce', 'Binance SKHYUSDT 单向模式已有反向仓位，开仓会变成隐式减仓');
+  await feed(r, rules, OPEN, 2);
+  assert.match(lastEvent(rules), /隐式减仓；同合约有其他仓位，等待 60 秒，不计失败$/);
 }));
 
 test('任务因阈值界限零成交（发送前越过界限、首腿 IOC 在界限上没成交）重新计数：不计失败、不停用、开仓退回当日次数，平仓留在持仓中；其他零成交照旧计失败', () => withLive(async ({ r, ex, rules }) => {

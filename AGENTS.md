@@ -13,6 +13,7 @@
 | 执行器、划转、ADL 语义 | [docs/executor.md](docs/executor.md) |
 | 原油双腿 | [docs/oil.md](docs/oil.md) |
 | 海力士双腿交易 | [docs/hynix.md](docs/hynix.md) |
+| 金油双腿交易（XAU 对 CL / BZ） | [docs/goldoil.md](docs/goldoil.md) |
 | Gate CrossEx 跨所交易 | [docs/crossex.md](docs/crossex.md) |
 | 期权 Greeks | [docs/options.md](docs/options.md) |
 | Ondo 挂单奖励（挂单引擎、奖励市场盘口与收益模拟） | [docs/ondo.md](docs/ondo.md) |

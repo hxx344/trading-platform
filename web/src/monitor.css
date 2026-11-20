@@ -570,3 +570,17 @@
   .monitor-desk .exchange-comparison[data-exchange-market="hynix"]{overflow-x:auto}
   .monitor-desk .exchange-comparison[data-exchange-market="hynix"] .exchange-table{min-width:740px}
 }
+/* Monitor M-2f 金油比：油腿切换、价格视图的上下两图与图例，由工作台 modules/monitor/app/gold-oil-panel.tsx（584ebc8）extraStyles
+   的 .gold-oil-selector / .gold-chart 改写为本页配色；其余沿用上方的读数、图表与表格样式。 */
+.monitor-desk .goldoil-controls{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin:-6px 0 14px}
+.monitor-desk .goldoil-controls>span{font-size:12px;color:var(--muted-foreground)}
+.monitor-desk .goldoil-oil{background:var(--chart-5)}
+.monitor-desk .goldoil-average-line{display:inline-block;width:16px;border-top:1px dashed var(--muted-foreground);margin:0 6px 3px 12px;vertical-align:middle}
+.monitor-desk .goldoil-price-charts{padding:6px 0 0}
+.monitor-desk .goldoil-plot-label{display:flex;align-items:center;gap:7px;padding:4px 25px 0;font-size:12px;color:var(--foreground)}
+.monitor-desk .goldoil-plot-label>span:last-child{color:var(--muted-foreground);margin-left:auto}
+.monitor-desk .goldoil-price-chart{height:160px;padding:0 13px 0 19px}
+.monitor-desk .goldoil-chart-heading{gap:12px 16px}
+.monitor-desk .goldoil-chart-heading .range-control{flex:none}
+.monitor-desk .goldoil-chart-heading .range-control button{white-space:nowrap}
+@media(max-width:700px){.monitor-desk .goldoil-chart-heading{flex-wrap:wrap;align-items:flex-start}.monitor-desk .goldoil-price-chart{height:140px;padding-left:5px;padding-right:0}.monitor-desk .goldoil-plot-label{padding:4px 16px 0}}

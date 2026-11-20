@@ -272,7 +272,7 @@ test('导入助手：预览列出持仓记录；勾选后写待载入文件、�
     for (const path of [conf, dir, join(f.root, 'proc')]) mkdirSync(path, { recursive: true });
     writeFileSync(join(f.root, 'workbench.env'), `DATA_DIR=${f.wb}\n`);
     const configFile = join(conf, 'config.json'), secretsFile = join(conf, 'secrets.json');
-    const config = fileText({ secretsFile, pairs: [], monitor: { anthropic: {}, oil: {}, hynix: {}, perpetual: {} } });
+    const config = fileText({ secretsFile, pairs: [], monitor: { anthropic: {}, oil: {}, goldoil: {}, hynix: {}, perpetual: {} } });
     writeFileSync(secretsFile, fileText({ accounts: {} }), { mode: 0o600 });
     writeFileSync(configFile, config, { mode: 0o600 });
     const restarts: number[] = [];

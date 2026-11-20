@@ -23,8 +23,11 @@ export function createSimulatedVenues(clock: () => number): { binance: Simulated
   binance.listInstrument({ ...rules, symbol: 'SKHYNIXUSDT', quantityStep: '0.001', minQuantity: '0.001' }, { bid: '400.00', ask: '400.40' });
   bybit.listInstrument({ ...rules, symbol: 'SKHYUSDT', quantityStep: '0.1', minQuantity: '0.1' }, { bid: '41.22', ask: '41.26' });
   bybit.listInstrument({ ...rules, symbol: 'SKHYNIXUSDT', quantityStep: '0.01', minQuantity: '0.01' }, { bid: '400.10', ask: '400.50' });
-  binance.openAccount(SIM_ACCOUNTS.binance, { CLUSDT: 'one-way', BZUSDT: 'one-way', ANTHROPICUSDT: 'one-way', SKHYUSDT: 'one-way', SKHYNIXUSDT: 'one-way' });
-  bybit.openAccount(SIM_ACCOUNTS.bybit, { CLUSDT: 'one-way', BZUSDT: 'one-way', SKHYUSDT: 'one-way', SKHYNIXUSDT: 'one-way' });
+  // Gold against oil (docs/goldoil.md): XAUUSDT at about 37.9 times CL.
+  binance.listInstrument({ ...rules, symbol: 'XAUUSDT', quantityStep: '0.001', minQuantity: '0.001' }, { bid: '2650.00', ask: '2650.60' });
+  bybit.listInstrument({ ...rules, symbol: 'XAUUSDT', quantityStep: '0.01', minQuantity: '0.01' }, { bid: '2650.20', ask: '2650.80' });
+  binance.openAccount(SIM_ACCOUNTS.binance, { CLUSDT: 'one-way', BZUSDT: 'one-way', ANTHROPICUSDT: 'one-way', SKHYUSDT: 'one-way', SKHYNIXUSDT: 'one-way', XAUUSDT: 'one-way' });
+  bybit.openAccount(SIM_ACCOUNTS.bybit, { CLUSDT: 'one-way', BZUSDT: 'one-way', SKHYUSDT: 'one-way', SKHYNIXUSDT: 'one-way', XAUUSDT: 'one-way' });
   const aster = new SimulatedAster(clock);
   aster.openSubAccount(SIM_TRANSFER_PAIR.mainAccountId, SIM_TRANSFER_PAIR.long, { available: '600' });
   aster.openSubAccount(SIM_TRANSFER_PAIR.mainAccountId, SIM_TRANSFER_PAIR.short, { available: '400' });

@@ -70,7 +70,7 @@ const ACTION_ICONS: Partial<Record<RuleAction, typeof Power>> = { stop: Power, d
 
 const RuleCard = memo(function RuleCard({ rule, disabled, evidenceValid, liveAvailable, onAction, onEdit }: { rule: OilRule; disabled: boolean; evidenceValid: boolean; liveAvailable: boolean; onAction: (rule: OilRule, action: RuleAction) => void; onEdit: (rule: OilRule) => void }) {
   const { config } = rule, live = rule.live, allowed = ruleActions(rule, liveAvailable), market = config.market, text = RULE_MARKET_TEXT[market];
-  const badge = !evidenceValid ? '状态待更新' : live ? `实盘 · ${live.phaseName}${live.enabled ? '' : ' · 已停用'}` : rule.observing ? '只观察中' : '观察已停止';
+  const badge = !evidenceValid ? '状态待更新' : live ? `实盘 · ${live.phaseName}${live.enabled ? (live.blocked ? ' · 被同合约反向仓位阻塞' : '') : ' · 已停用'}` : rule.observing ? '只观察中' : '观察已停止';
   const running = evidenceValid && (live ? live.enabled : rule.observing);
   // Live rules judge one condition at a time: open while waiting, close while holding.
   const shown = live ? (live.phase === 'idle' ? 'open' : live.phase === 'holding' ? 'close' : null) : null;
@@ -86,6 +86,7 @@ const RuleCard = memo(function RuleCard({ rule, disabled, evidenceValid, liveAva
           {live.job ? <p>{live.job.action === 'open' ? '开仓' : '平仓'}任务 {live.job.id} 执行中，进度见上方「{PANEL[market].execution}」的执行进度。</p> : null}
           {live.pending ? <p className="execution-warning">{live.pending.action === 'open' ? '开仓' : '平仓'}确认结果待核对：服务器每轮用同一请求编号向执行器核对，不会另发任务。</p> : null}
           {live.reason ? <p className="execution-warning" role="alert">{live.reason}</p> : null}
+          {live.blocked ? <p className="execution-warning" role="alert">被同合约反向仓位阻塞：自 {stamp(live.blocked.since)} 起{market === 'oil' ? '账户在该合约上有其他仓位（可能是金油任务）' : '账户在该合约上有其他仓位'}，最近一次受阻 {stamp(live.blocked.lastAt)}；规则不停用，每分钟重试{live.blocked.notified ? '；通知已交给通知队列（未配置飞书机器人时只写服务日志，不会送达）' : '；持续 30 分钟会生成通知'}。</p> : null}
           {live.failures > 0 && live.enabled ? <p className="execution-warning">已连续失败 {live.failures} 次，达到上限后停用。</p> : null}
           {!live.enabled && live.phase !== 'review' && !live.job && !live.pending ? <p>实盘规则已停用，不判断条件。</p>
             : rule.observation?.note ? <p className="execution-warning">{rule.observation.note}</p>

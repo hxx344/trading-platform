@@ -32,6 +32,11 @@ export interface OilRuleLive {
   held: { symbol: string; side: 'long' | 'short'; quantity: string; barrels: string }[] | null;
   pending: { action: 'open' | 'close'; at: number } | null; job: { id: string; action: 'open' | 'close'; at: number } | null;
   opensToday: number; failures: number; retryAt: number | null; reason: string | null;
+  /**
+   * Refused for another position on the contract since `since`, last at `lastAt`; notified: the 30-minute notice was handed
+   * to the notifier's outbox (without a Feishu robot it is only logged). Absent from older services.
+   */
+  blocked?: { since: number; lastAt: number; notified: boolean } | null;
 }
 export interface OilRule {
   id: string; revision: number; createdAt: number; title: string; mode: 'observe' | 'live'; observing: boolean; config: OilRuleConfig; problem: string | null;

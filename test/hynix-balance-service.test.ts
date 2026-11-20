@@ -382,7 +382,7 @@ test('告警：通知抛错只记日志、不当作已发，下一轮再发；�
 
   const logs: string[] = [];
   let positions = 0, checks = 0;
-  const oil = { market: { refreshQuotes: async () => {}, refreshPositions: async () => {} }, hynix: { refreshQuotes: async () => {}, refreshPositions: async () => { positions++; } } } as unknown as OilRuntime;
+  const oil = { market: { refreshQuotes: async () => {}, refreshPositions: async () => {} }, hynix: { refreshQuotes: async () => {}, refreshPositions: async () => { positions++; } }, goldoil: { refreshQuotes: async () => {}, refreshPositions: async () => {} } } as unknown as OilRuntime;
   let rounds = 0;
   const context = { stopped: () => checks >= 2 || rounds >= 100, pause: async () => { rounds++; } };
   await Promise.all(oilLoops(oil, context, line => logs.push(line), undefined, undefined, () => { checks++; throw new Error('坏了'); }));

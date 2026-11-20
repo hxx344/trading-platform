@@ -4,7 +4,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { add, bandEdge, cmp, DecimalError, floorToStep, isMultiple, isZero, mul, sub, units, fromUnits } from './decimal.ts';
 import {
-  ContractError, HEDGE_CHASE_TIMEOUT_MS, HYNIX_SYMBOLS, MAX_SLIPPAGE_BPS, UUID, marketOfSymbol, MARKET_SYMBOLS, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, exactKeys, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseNotionalLimits, parseInstrument, parseIntent, parseFourLegIntent, parseQuote, positionOf, reject, text,
+  ContractError, HEDGE_CHASE_TIMEOUT_MS, GOLD_SYMBOL, HYNIX_SYMBOLS, MAX_SLIPPAGE_BPS, UUID, marketOfSymbols, MARKET_SYMBOLS, OIL_SYMBOLS, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, exactKeys, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseNotionalLimits, parseInstrument, parseIntent, parseFourLegIntent, parseQuote, positionOf, reject, text,
   type AccountBinding, type BatchIntent, type NotionalLimits, type AccountSnapshot, type Action, type Environment, type FourLegIntent, type Instrument, type LegOrderType, type Market, type OrderSide, type PairIntent, type PositionSide, type Quote, type RebalanceIntent, type TransferConfig, type Venue,
 } from './contracts.ts';
 import {
@@ -238,6 +238,8 @@ const lockResources = (value: { legs: readonly PlannedLeg[]; rebalance?: { count
   [...value.legs.map(leg => `${leg.accountKey}:${leg.symbol}`), ...(value.rebalance && value.legs[0] ? [`${value.legs[0].accountKey}:${value.rebalance.counter.symbol}`] : [])];
 /** A leg by its operation index; a rebalance job only has leg 0, which every path of its own uses. */
 const legAt = (job: Pick<Job, 'legs'>, index: 0 | 1): PlannedLeg => (index === 0 ? job.legs[0] : job.legs.length === 2 ? job.legs[1] : undefined) ?? reject('leg_missing', '任务没有该腿', 500);
+/** A gold-oil job's net holding on one account (goldoilHeld): amounts by side and contract, and the contracts whose fills are unverified. */
+export interface GoldOilHeld { long: Record<string, string>; short: Record<string, string>; uncertain: { long: string[]; short: string[] } }
 export interface Operation {
   id: string;
   jobId: string;
@@ -881,7 +883,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
   /** Lead quantity of each batch. Every batch is checked as an order on both legs, so no batch is refused at send for its size. */
   function planBatches(legs: [PlannedLeg, PlannedLeg], count: number, quotes: readonly Quote[], action: Action): string[] {
-    if (marketOfSymbol(legs[0].symbol) === 'hynix') return planHynixBatches(legs, count, quotes, action);
+    // Hynix and gold-oil legs differ in units and hedge in the planned proportion; only oil splits by barrels.
+    if (marketOfJob({ legs }) !== 'oil') return planHynixBatches(legs, count, quotes, action);
     const barrels = exposure(legs[0].quantity, legs[0].instrument);
     const parts = splitBarrels(barrels, count, legs.map(leg => leg.instrument)) ?? reject('batch_size', `${barrels} 桶分不成 ${count} 批：每批须是两腿共同桶数步长的整数倍`);
     for (const part of parts) {
@@ -961,8 +964,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     }));
     // Barrels become each leg's native quantity here, from the contract rules just read; a count that is not a whole number
     // of every leg's steps is refused with the nearest counts both legs can take.
-    // Hynix notional becomes each leg's quantity at the book midpoint just read, floored to the step (docs/hynix.md 2).
-    const hynix = intent.market === 'hynix';
+    // Hynix and gold-oil notional becomes each leg's quantity at the book midpoint just read, floored to the step
+    // (docs/hynix.md 2, docs/goldoil.md 2). `byNotional`: every market but oil sizes by notional, oil by barrels.
+    const byNotional = intent.market !== 'oil';
     const quantities = intent.legs.map((leg, index) => leg.quantity
       ?? (leg.notional != null ? quantityForNotional(leg.notional, midOf(reads[index].quote.bid, reads[index].quote.ask), reads[index].instrument) : quantityForBarrels(leg.barrels as string, reads[index].instrument)));
     intent.legs.forEach((leg, index) => {
@@ -1010,9 +1014,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       return result;
     }) as [PlannedLeg, PlannedLeg];
     // Oil settlement completes only on equal barrels, so the plan must already be equal; a tolerance here would end every such
-    // job in attention. Hynix legs hedge equal notional, so their units differ and they settle in the planned proportion.
+    // job in attention. Hynix and gold-oil legs hedge equal notional, so their units differ and they settle in the planned
+    // proportion.
     const [a, b] = legs.map(leg => units(exposure(leg.quantity, leg.instrument)));
-    if (!hynix && a !== b) reject('unbalanced', `两腿桶数不相等：${fromUnits(a)} 与 ${fromUnits(b)}`);
+    if (!byNotional && a !== b) reject('unbalanced', `两腿桶数不相等：${fromUnits(a)} 与 ${fromUnits(b)}`);
     const batches = intent.batches ? fitBatches(legs, intent.batches, reads.map(read => read.quote), intent.action) : null;
     const bounded = intent.legs.some(leg => leg.priceBound !== undefined);
     const notional = jobNotional(legs);
@@ -1020,15 +1025,15 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const capNote = !limits ? null
       : `名义金额按价格保护界限计 ${notional} USDT；单笔上限 ${limits.perJob} USDT，累计开仓上限 ${limits.totalOpen} USDT（确认时按当时累计再核一次，超限拒绝；对冲腿市价成交可能高于此估算）。`;
     const value: PairPreview = {
-      id: randomUUID(), expiresAt: at + budgets.previewTtlMs, writerGeneration: generation, intent, legs, notional, ...(hynix ? {} : { barrels: fromUnits(a) }), ...(batches ? { batches } : {}),
+      id: randomUUID(), expiresAt: at + budgets.previewTtlMs, writerGeneration: generation, intent, legs, notional, ...(byNotional ? {} : { barrels: fromUnits(a) }), ...(batches ? { batches } : {}),
       notes: [
-        hynix
+        byNotional
           ? `先发送 ${legLabel(legs, 0)} 腿，成交确认后按计划比例（对冲腿 ${legs[1].quantity} ÷ 首腿 ${legs[0].quantity}）换算其成交量，向下取整到步长后发送 ${legLabel(legs, 1)} 对冲腿；取整留下的差额不超过对冲腿一个数量步长 ${legs[1].instrument.quantityStep}。`
           : `先发送 ${legLabel(legs, 0)} 腿，成交确认后按其成交量发送 ${legLabel(legs, 1)} 对冲腿。`,
-        ...(hynix ? [`按预览中间价估算：${legs.map(leg => `${legLabel(legs, leg.index)} ${leg.quantity} 约 ${mul(exposure(leg.quantity, leg.instrument), midOf(leg.quote.bid, leg.quote.ask)).replace(/(\.\d{2})\d+$/, '$1')} USDT`).join('，')}。`] : []),
+        ...(byNotional ? [`按预览中间价估算：${legs.map(leg => `${legLabel(legs, leg.index)} ${leg.quantity} 约 ${mul(exposure(leg.quantity, leg.instrument), midOf(leg.quote.bid, leg.quote.ask)).replace(/(\.\d{2})\d+$/, '$1')} USDT`).join('，')}。`] : []),
         ...(intent.batches && (batches?.length ?? 1) < intent.batches.count ? [`持有量分不成 ${intent.batches.count} 批，按能分开的最多 ${batches?.length ?? 1} 批平仓。`] : []),
         ...(bounded ? [`价格界限：${legs.map(leg => `${legLabel(legs, leg.index)} ${leg.orderSide === 'buy' ? '买入不高于' : '卖出不低于'} ${leg.priceBound}`).join('，')}（自带价格界限与 ${slippageBps} 基点界限取较紧者）；每一批发送前任一腿盘口越过界限即不发送。`] : []),
-        ...(batches && intent.batches ? [`分 ${batches.length} 批，首腿每批 ${hynix ? `${batches.join(' / ')}（${legs[0].symbol} 合约数量），对冲腿每批按计划比例` : `${batches.map(quantity => exposure(quantity, legs[0].instrument)).join(' / ')} 桶`}；一批首腿结束并补齐对冲后，等 ${intent.batches.intervalMs / 1000} 秒再发下一批。后续批次发送前盘口或持仓不满足条件时等待到截止，不追加；截止或停止时未发的批次不再发送。`] : []),
+        ...(batches && intent.batches ? [`分 ${batches.length} 批，首腿每批 ${byNotional ? `${batches.join(' / ')}（${legs[0].symbol} 合约数量），对冲腿每批按计划比例` : `${batches.map(quantity => exposure(quantity, legs[0].instrument)).join(' / ')} 桶`}；一批首腿结束并补齐对冲后，等 ${intent.batches.intervalMs / 1000} 秒再发下一批。后续批次发送前盘口或持仓不满足条件时等待到截止，不追加；截止或停止时未发的批次不再发送。`] : []),
         legs[0].orderType === 'local-chase'
           ? `首腿本地追价：只挂单挂在${legs[0].orderSide === 'buy' ? '买一' : '卖一'}，盘口变化后撤单重挂（挂满 ${budgets.chaseRepriceMs / 1000} 秒后才改价），${legs[0].orderSide === 'buy' ? '最高' : '最低'}追到 ${legs[0].limitPrice ?? legs[0].priceBound}${legs[0].limitPrice ? '（自填界限）' : `（${slippageBps} 基点价格保护界限）`}${legs[0].chaseCeiling ? `，最高挂到 ${legs[0].chaseCeiling}` : ''}；挂单期间的成交每轮按比例对冲。首腿最多 ${budgets.chaseOrderLimit} 笔委托（各批合计）；连续 ${budgets.chaseFailureLimit} 次挂单失败或到截止时间时撤单结束追价，按实际成交对冲后结束；请求停止则撤单且不再补发对冲腿。发送前对冲腿盘口越过界限 ${legs[1].priceBound} 即不发送。`
           : legs[0].orderType === 'market'
@@ -2349,7 +2354,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
   const orphanReason = (orphan: Operation): string => `${VENUE_NAMES[orphan.venue]} 追价策略创建结果未知（交易所无客户编号，无法自动核对；${(orphan.note ?? '无回报').slice(0, 100)}），不再发送；需人工填写策略编号认领、在观察窗后确认未创建，或强制释放`;
 
-  const marketOfJob = (job: Pick<Job, 'legs'>): Market => marketOfSymbol(job.legs[0].symbol);
+  /** From all the legs, never the first alone: a gold-oil job may lead with CLUSDT (docs/goldoil.md 2). */
+  const marketOfJob = (job: { legs: readonly { symbol: string }[] }): Market => marketOfSymbols(job.legs.map(leg => leg.symbol));
   /** Hedge the lead's actual fill in the planned proportion, floored to the hedge venue's step. */
   function hedgeQuantityFor(job: PairJob, leadFilled: string): string {
     const [lead, hedge] = job.legs;
@@ -2371,8 +2377,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       finish(job, stopped ? 'stopped' : 'failed', `首腿未成交（${note ?? lead?.state ?? '未发送'}），未发送对冲腿`, expired && !stopped ? 'lead_unfilled' : undefined);
       return;
     }
-    if (marketOfJob(job) === 'hynix') {
-      // Hynix legs hedge in the planned proportion: done when the hedge filled exactly what the lead's fill asks for.
+    if (marketOfJob(job) !== 'oil') {
+      // Hynix and gold-oil legs hedge in the planned proportion: done when the hedge filled exactly what the lead's fill asks for.
       const target = hedgeQuantityFor(job, filled(0)), missing = sub(target, filled(1));
       if (isZero(missing)) {
         const short = cmp(filled(0), job.legs[0].quantity) < 0 ? `首腿成交 ${filled(0)}，计划 ${job.legs[0].quantity}；对冲腿按比例成交 ${filled(1)}` : null;
@@ -2584,6 +2590,49 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     return singleFlight('all', async () => { await tickJobs(); await tickTransfers(); await tickAdl(); });
   }
 
+  /**
+   * What the gold-oil jobs hold, netted over every one of them (not the recentJobs window): per account key, side and
+   * contract, taken job by job in creation order, an open's fills added and a close's taken off, floored at 0 after each
+   * job. An account's CL / BZ position also holds what oil jobs and rules opened (docs/goldoil.md 2): the page closes by
+   * holdings no larger than this. A leg whose fills the executor cannot vouch for (an order still unknown in a finished
+   * job, a chase strategy released as possibly executed) marks its side and contract uncertain instead of guessing.
+   *
+   * The page polls this every few seconds, so each job's part is kept and recomputed only when the job's or one of its
+   * operations' version changed (both bump on every write); only rows inserted since the last call are scanned for a
+   * gold leg.
+   */
+  const goldoilCache = { scanned: 0, jobs: new Map<string, { order: [number, number]; key: string; legs: { accountKey: string; side: PositionSide; symbol: string; delta: string; uncertain: boolean }[] }>() };
+  function goldoilHeld(): Record<string, GoldOilHeld> {
+    const cache = goldoilCache;
+    const newer = db.prepare(`SELECT rowid AS row, id, created_at AS createdAt FROM jobs WHERE rowid > ? AND EXISTS (SELECT 1 FROM json_each(jobs.json, '$.legs') WHERE json_extract(value, '$.symbol') = ?) ORDER BY rowid`).all(cache.scanned, GOLD_SYMBOL) as { row: number; id: string; createdAt: number }[];
+    for (const row of newer) cache.jobs.set(row.id, { order: [row.createdAt, row.row], key: '', legs: [] });
+    cache.scanned = Math.max(cache.scanned, (db.prepare('SELECT COALESCE(MAX(rowid), 0) AS row FROM jobs').get() as { row: number }).row);
+    const versions = db.prepare(`SELECT id, version || ':' || (SELECT COALESCE(SUM(version), 0) || ':' || COUNT(*) FROM operations WHERE job_id = jobs.id) AS key FROM jobs WHERE id IN (SELECT value FROM json_each(?))`).all(JSON.stringify([...cache.jobs.keys()])) as { id: string; key: string }[];
+    const seen = new Set<string>();
+    for (const { id, key } of versions) {
+      seen.add(id);
+      const entry = cache.jobs.get(id)!;
+      if (entry.key === key) continue;
+      const job = readJob(id), ops = opsOf(id), final = FINAL_JOB.has(job.status);
+      entry.key = key;
+      entry.legs = job.legs.map(leg => {
+        const mine = ops.filter(item => item.leg === leg.index), filled = add('0', ...mine.map(item => item.filledQuantity));
+        const uncertain = mine.some(item => item.releasedAt != null || (final && !SETTLED.has(item.state)));
+        return { accountKey: leg.accountKey, side: leg.side, symbol: leg.symbol, delta: job.action === 'open' ? filled : sub('0', filled), uncertain };
+      });
+    }
+    for (const id of [...cache.jobs.keys()]) if (!seen.has(id)) cache.jobs.delete(id);
+    const held: Record<string, GoldOilHeld> = {};
+    const ordered = [...cache.jobs.values()].sort((a, b) => a.order[0] - b.order[0] || a.order[1] - b.order[1]);
+    for (const entry of ordered) for (const leg of entry.legs) {
+      const sides = held[leg.accountKey] ??= { long: {}, short: {}, uncertain: { long: [], short: [] } };
+      const next = add(sides[leg.side][leg.symbol] ?? '0', leg.delta);
+      sides[leg.side][leg.symbol] = cmp(next, '0') < 0 ? '0' : next;
+      if (leg.uncertain && !sides.uncertain[leg.side].includes(leg.symbol)) sides.uncertain[leg.side].push(leg.symbol);
+    }
+    return held;
+  }
+
   function jobView(id: string) {
     const job = readJob(id), ops = opsOf(id);
     const events = (db.prepare('SELECT type, at, json FROM events WHERE job_id = ? ORDER BY seq DESC LIMIT 40').all(id) as { type: string; at: number; json: string }[]).reverse().map(row => ({ type: row.type, at: row.at, ...JSON.parse(row.json) }));
@@ -2664,12 +2713,19 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     /** null when no caps are configured. */
     environment,
     notionalLimits: notionalView,
-    /** The latest jobs, of one market when it is named (a job's market is its first leg's contract). */
+    /**
+     * The latest jobs, of one market when it is named, by the same rule as marketOfJob: a gold leg anywhere is gold-oil;
+     * oil is an oil first leg with no gold leg (a gold-oil job may lead with CLUSDT); hynix is a hynix first leg.
+     */
     recentJobs: (limit = 20, market?: Market) => {
       const count = Math.min(Math.max(1, Math.trunc(limit)), 100);
-      const rows = market
-        ? db.prepare(`SELECT id FROM jobs WHERE json_extract(json, '$.legs[0].symbol') IN (${MARKET_SYMBOLS[market].map(() => '?').join(', ')}) ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(...MARKET_SYMBOLS[market], count)
-        : db.prepare('SELECT id FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?').all(count);
+      const gold = `EXISTS (SELECT 1 FROM json_each(jobs.json, '$.legs') WHERE json_extract(value, '$.symbol') = ?)`;
+      const firstIn = (symbols: readonly string[]) => `json_extract(json, '$.legs[0].symbol') IN (${symbols.map(() => '?').join(', ')})`;
+      const order = 'ORDER BY created_at DESC, rowid DESC LIMIT ?';
+      const rows = market === 'goldoil' ? db.prepare(`SELECT id FROM jobs WHERE ${gold} ${order}`).all(GOLD_SYMBOL, count)
+        : market === 'oil' ? db.prepare(`SELECT id FROM jobs WHERE ${firstIn(OIL_SYMBOLS)} AND NOT ${gold} ${order}`).all(...OIL_SYMBOLS, GOLD_SYMBOL, count)
+        : market ? db.prepare(`SELECT id FROM jobs WHERE ${firstIn(MARKET_SYMBOLS[market])} ${order}`).all(...MARKET_SYMBOLS[market], count)
+        : db.prepare(`SELECT id FROM jobs ${order}`).all(count);
       // A four-leg job whose other job fell outside the limit brings it along, so the page always shows the group whole.
       const views = (rows as { id: string }[]).map(row => jobView(row.id));
       // A row that is gone is skipped: the page then shows the group as "另一所未列出" rather than no list at all.
@@ -2679,6 +2735,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       }
       return views;
     },
+    goldoilHeld,
     /** Principal ids are masked: the page needs to tell accounts apart, not to see who they are. */
     accounts: () => (db.prepare('SELECT * FROM accounts WHERE environment = ? ORDER BY venue').all(environment) as unknown as AccountRow[])
       .map(row => ({ venue: row.venue, accountMode: row.account_mode, credentialVersion: row.credential_version, accountId: maskId(row.account_id) })),

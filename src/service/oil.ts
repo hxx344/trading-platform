@@ -2,13 +2,14 @@
 // that block is there; the service without it runs exactly as before. Before anything is opened the accounts are locked
 // on this host and every account passes its venue's key and identity check, so a bad key or a second process refuses start.
 import type { VenueConnector } from '../connector.ts';
-import { MARKET_NAMES, VENUE_NAMES, marketOfSymbol, type Venue } from '../contracts.ts';
+import { MARKET_NAMES, VENUE_NAMES, accountKey, marketOfSymbols, type Venue } from '../contracts.ts';
 import type { Executor } from '../executor.ts';
 import { createLiveConnectors, holdAccountLocks, preflightLive } from '../live/setup.ts';
 import type { FetchLike } from '../live/http.ts';
 import type { LiveCredentials } from '../live/values.ts';
 import { createOilMarket, MARKET_READ_MS, POSITIONS_READ_MS, type OilMarket } from '../oil/market.ts';
 import { createHynixMarket, type HynixMarket } from '../hynix/market.ts';
+import { createGoldOilMarket, type GoldOilMarket } from '../goldoil/market.ts';
 import { DEFAULT_BALANCE_SETTINGS, type BalanceSettings } from '../hynix/balance.ts';
 import { createBalanceStore, HYNIX_DATABASE } from '../hynix/balance-store.ts';
 import { createBalanceAlerts } from '../hynix/balance-alert.ts';
@@ -31,6 +32,8 @@ export interface OilRuntime {
   market: OilMarket;
   /** SK hynix trades on the same accounts and executor (docs/hynix.md); its books and positions are read apart. */
   hynix: HynixMarket;
+  /** Gold against oil trades on the same accounts and executor too (docs/goldoil.md); read apart, display only. */
+  goldoil: GoldOilMarket;
   locks: { release(): void };
 }
 
@@ -48,7 +51,7 @@ export async function prepareOil(config: OilConfig, keys: Map<Venue, LiveCredent
     if (marketClient) for (const connector of connectors) useMarketBooks(connector, marketClient);
     await preflightLive(config, connectors, ...(preflightTimeoutMs === undefined ? [] : [preflightTimeoutMs]));
     const books = { connectors, accounts: config.accounts, now, ...(pushed ? { pushed } : {}), ...(marketClient ? { marketEpoch: () => marketClient.epoch() } : {}) };
-    return { config, connectors, market: createOilMarket(books), hynix: createHynixMarket(books), locks };
+    return { config, connectors, market: createOilMarket(books), hynix: createHynixMarket(books), goldoil: createGoldOilMarket(books), locks };
   } catch (error) { locks.release(); throw new Error(`原油执行账户启动检查未通过，拒绝启动：${error instanceof Error ? error.message : String(error)}`); }
 }
 
@@ -67,7 +70,7 @@ export function strandedOilJobs(executor: Pick<Executor, 'unfinished' | 'jobView
     const legs = executor.jobView(id).legs, missing = [...new Set(legs.map(leg => leg.venue))].filter(venue => !configured.has(venue));
     if (!missing.length) return [];
     const where = config ? `没有 ${missing.map(venue => VENUE_NAMES[venue]).join('、')} 执行账户` : '已没有 oil';
-    return [`${MARKET_NAMES[marketOfSymbol(legs[0]!.symbol)]}任务 ${id} 尚未结束，但配置里${where}：本服务不再推进或核对它，交易所上可能仍有敞口；请把配置加回后重启，处理完再删除`];
+    return [`${MARKET_NAMES[marketOfSymbols(legs.map(leg => leg.symbol))]}任务 ${id} 尚未结束，但配置里${where}：本服务不再推进或核对它，交易所上可能仍有敞口；请把配置加回后重启，处理完再删除`];
   });
 }
 
@@ -79,6 +82,9 @@ export interface OilRulesRuntime {
   update(id: string, body: unknown): unknown;
   act(id: string, action: string, body: unknown): unknown;
   tick(stopped?: () => boolean): Promise<void>;
+  /** Blocked-rule notices waiting for the notifier, and the hand-over of one (src/oil/rules.ts). */
+  notices(): { key: string; text: string }[];
+  noticeSent(key: string): void;
   close(): void;
 }
 
@@ -93,7 +99,7 @@ export function openOilRules(oil: OilRuntime, dir: string, { now = Date.now, log
     const reason = `原油自动规则库无法打开，自动规则和海力士手动调平暂不可用：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`;
     log(reason);
     const refuse = () => { throw new ContractError(503, 'rules_unavailable', reason); };
-    return { view: () => ({ available: false, error: reason, rules: [] }), create: refuse, update: refuse, act: refuse, checkHynixRebalance: refuse, tick: async () => {}, close: () => {} };
+    return { view: () => ({ available: false, error: reason, rules: [] }), create: refuse, update: refuse, act: refuse, checkHynixRebalance: refuse, tick: async () => {}, notices: () => [], noticeSent: () => {}, close: () => {} };
   }
 }
 
@@ -103,6 +109,31 @@ export interface OilPnlRuntime {
   sample(): Promise<void>;
   syncLedgers(stopped?: () => boolean): Promise<void>;
   close(): void;
+}
+
+/** A failure of the same kind (the read, or one notice's key) is logged at most this often. */
+const HAND_OVER_LOG_MS = 60_000;
+/**
+ * Hands each blocked-rule notice to the notifier's outbox (sent once per key) and only then marks it taken: a failed
+ * hand-over keeps the notice for the next round, a mark lost after it is dropped by the key (L110). It never throws: it
+ * runs at the end of each judging round (every 3 s), so a store or outbox that keeps failing is logged once a minute per
+ * kind (`logged` keeps the times between calls).
+ */
+export function handOver(rules: Pick<OilRulesRuntime, 'notices' | 'noticeSent'>, notifyOnce: (key: string, text: string) => unknown, log: (line: string) => void, logged = new Map<string, number>(), now: () => number = Date.now): void {
+  const quiet = (kind: string, line: string) => {
+    const time = now();
+    if (time - (logged.get(kind) ?? -Infinity) < HAND_OVER_LOG_MS) return;
+    logged.set(kind, time);
+    try { log(line); } catch { /* logging must not end the round */ }
+  };
+  const text = (error: unknown) => error instanceof Error ? error.message : String(error);
+  let notices: { key: string; text: string }[];
+  try { notices = rules.notices(); }
+  catch (error) { quiet('read', `原油自动规则通知读取失败：${text(error)}`); return; }
+  for (const notice of notices) {
+    try { notifyOnce(notice.key, notice.text); rules.noticeSent(notice.key); }
+    catch (error) { quiet(notice.key, `原油自动规则通知未能写入发送队列（${notice.key}）：${text(error)}`); }
+  }
 }
 
 /** Opens oil-pnl.sqlite in the data directory. A failure is logged and shown on the page; orders, jobs and rules run on. */
@@ -195,11 +226,24 @@ export function hynixViews(oil: OilRuntime, executor: Executor, balance: HynixBa
   };
 }
 
+/** The page's gold-oil reads (docs/goldoil.md): the books and ratios, the accounts, gold-oil positions and gold-oil jobs. */
+export function goldoilViews(oil: OilRuntime, executor: Executor) {
+  return {
+    market: () => oil.goldoil.view(),
+    state: () => {
+      const held = executor.goldoilHeld();
+      // By venue as the positions table is: one execution account per venue, an account no longer configured left out.
+      const goldoilHeld = oil.config.accounts.map(account => ({ venue: account.venue, ...(held[accountKey(account)] ?? { long: {}, short: {}, uncertain: { long: [], short: [] } }) }));
+      return { accounts: executor.accounts(), positions: oil.goldoil.positionsView(), goldoilHeld, jobs: executor.recentJobs(20, 'goldoil') };
+    },
+  };
+}
+
 /**
  * The market loops: oil and hynix books every 3 s (each round then the spread rules), positions every 15 s; with PnL, its positions every minute
  * and its ledgers every five minutes. Each round's reads carry their own timeout; a failure only marks the view.
  */
-export function oilLoops(oil: OilRuntime, context: { stopped(): boolean; pause(ms: number): Promise<void> }, log: (line: string) => void, rules?: OilRulesRuntime, pnl?: OilPnlRuntime, hynixCheck?: () => void): Promise<void>[] {
+export function oilLoops(oil: OilRuntime, context: { stopped(): boolean; pause(ms: number): Promise<void> }, log: (line: string) => void, rules?: OilRulesRuntime, pnl?: OilPnlRuntime, hynixCheck?: () => void, notifyOnce?: (key: string, text: string) => unknown): Promise<void>[] {
   const every = (spacingMs: number, name: string, round: () => Promise<void>) => (async () => {
     while (!context.stopped()) {
       const started = Date.now();
@@ -213,10 +257,12 @@ export function oilLoops(oil: OilRuntime, context: { stopped(): boolean; pause(m
   // starts on the books read after this one ends. Both markets' book rounds start a judging round (one at a time), so a
   // hynix rule counts each fresh hynix sample even when the oil read lags; samples already counted are not counted again.
   let judging: Promise<void> | null = null;
+  const handed = new Map<string, number>();
   const judge = () => {
     if (rules && !judging) {
       judging = Promise.resolve().then(() => rules.tick(context.stopped))
         .catch(error => log(`原油自动规则判断失败：${error instanceof Error ? error.message : String(error)}`))
+        .then(() => { if (notifyOnce) handOver(rules, notifyOnce, log, handed); })
         .finally(() => { judging = null; });
     }
   };
@@ -230,7 +276,9 @@ export function oilLoops(oil: OilRuntime, context: { stopped(): boolean; pause(m
     if (!hynixCheck) return;
     try { hynixCheck(); } catch (error) { log(`海力士两腿平衡告警判断失败：${error instanceof Error ? error.message : String(error)}`); }
   };
+  // Gold-oil is display only: its rounds start no judging and never wait on one.
   return [books, every(POSITIONS_READ_MS, '原油持仓读取', oil.market.refreshPositions),
     hynixBooks, every(POSITIONS_READ_MS, '海力士持仓读取', hynixPositions),
+    every(MARKET_READ_MS, '金油盘口读取', oil.goldoil.refreshQuotes), every(POSITIONS_READ_MS, '金油持仓读取', oil.goldoil.refreshPositions),
     ...(pnl ? [every(PNL_SAMPLE_MS, '原油盈亏采样', () => pnl.sample()), every(LEDGER_SYNC_MS, '原油账单同步', () => pnl.syncLedgers(context.stopped))] : [])];
 }

@@ -43,8 +43,8 @@ const ADL_RESTART_PATH = /^\/api\/adl\/incidents\/([0-9a-f-]{36})\/restart$/;
 const PAIR_READ_PATH = /^\/api\/transfer-pairs\/([0-9A-Za-z_-]{1,64})\/(balances|history)$/;
 const ADL_HISTORY_PATH = /^\/api\/adl\/pairs\/([0-9A-Za-z_-]{1,64})\/incidents$/;
 const TRANSFER_PAGE_MAX = 50, ADL_PAGE_MAX = 20;
-const MONITOR_PATHS = new Set(['/api/monitor/state', '/api/monitor/anthropic/quote', '/api/monitor/anthropic/candles', '/api/monitor/oil/quote', '/api/monitor/oil/candles', '/api/monitor/hynix/quote', '/api/monitor/hynix/candles']);
-const MONITOR_NAMES = { anthropic: 'Anthropic', oil: '原油', hynix: '海力士', perpetual: '合约价差' } as const;
+const MONITOR_PATHS = new Set(['/api/monitor/state', '/api/monitor/anthropic/quote', '/api/monitor/anthropic/candles', '/api/monitor/oil/quote', '/api/monitor/oil/candles', '/api/monitor/goldoil/quote', '/api/monitor/goldoil/candles', '/api/monitor/hynix/quote', '/api/monitor/hynix/candles']);
+const MONITOR_NAMES = { anthropic: 'Anthropic', oil: '原油', goldoil: '金油比', hynix: '海力士', perpetual: '合约价差' } as const;
 type CandleMarket = Exclude<keyof typeof MONITOR_NAMES, 'perpetual'>;
 const MONITOR_MAX_DAYS = ANTHROPIC_RETENTION_DAYS;
 const ASSET_READS = { '/api/asset/state': 'state', '/api/asset/ledger': 'ledger', '/api/asset/history': 'history', '/api/asset/daily-changes': 'dailyChanges', '/api/asset/withdrawals': 'withdrawals', '/api/asset/cash-flows': 'cashFlows' } as const;
@@ -103,6 +103,8 @@ export interface ServiceViews {
     /** The balance thresholds (docs/hynix.md 7.4); a store that could not open refuses with 503. */
     saveBalanceSettings?(body: unknown): unknown;
   };
+  /** Gold against oil on the oil accounts (docs/goldoil.md): books and ratios; accounts, positions, gold-oil jobs. Absent without oil. */
+  goldoil?: { market(): unknown; state(): unknown };
   /** The read-only market monitors; a market's reads give undefined when it is not configured and null until there is data. Absent without config.monitor. */
   monitor?: {
     state(): { markets: readonly string[]; controls?: Partial<Record<keyof typeof MONITOR_NAMES, { enabled: boolean; revision: number }>> }; quote(market: CandleMarket): unknown; candles(market: CandleMarket, days: number | null): unknown;
@@ -113,7 +115,7 @@ export interface ServiceViews {
     /** M-2d-3: one exchange's settled funding history (60 days, both legs); undefined when the market is not configured; rejects with the page's reason. */
     fundingHistory?(market: 'oil' | 'hynix', exchange: Exchange): Promise<unknown> | undefined;
     /** M-3a: the market's threshold alerts; undefined when the market is not configured (or the service runs without alerts). */
-    alerts?(market: 'oil' | 'hynix'): { view(): unknown; update(body: unknown): unknown; test(): Promise<unknown> } | undefined;
+    alerts?(market: 'oil' | 'goldoil' | 'hynix'): { view(): unknown; update(body: unknown): unknown; test(): Promise<unknown> } | undefined;
     /** M-3c: false for a configured market switched off (its reads answer 423); the page's switch. */
     enabled?(market: keyof typeof MONITOR_NAMES): boolean;
     setControl?(market: keyof typeof MONITOR_NAMES, body: unknown): unknown;
@@ -477,6 +479,10 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       if (!views?.hynix?.saveBalanceSettings) return send(response, 404, { code: 'not_found', message: '本服务没有配置海力士执行（与原油共用执行账户）' });
       return send(response, 200, views.hynix.saveBalanceSettings(await readJson(request)));
     }
+    if (request.method === 'GET' && (url.pathname === '/api/goldoil/market' || url.pathname === '/api/goldoil/state')) {
+      if (!views?.goldoil) return send(response, 404, { code: 'not_found', message: '本服务没有配置金油执行（与原油共用执行账户）' });
+      return send(response, 200, url.pathname === '/api/goldoil/market' ? views.goldoil.market() : views.goldoil.state());
+    }
     if (request.method === 'GET' && url.pathname === '/api/oil/pnl') {
       if (!views?.oil?.pnl) return send(response, 404, { code: 'not_found', message: '本服务没有配置原油执行' });
       const page = Number(url.searchParams.get('page') ?? '0');
@@ -497,14 +503,14 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       return send(response, 200, target[2] === 'update' ? rules.update(target[1]!, body) : rules.act(target[1]!, target[2]!, body));
     }
     // M-3c: the market's switch, and the reads of a market switched off (its data is kept, nothing is collected).
-    const monitorControl = request.method === 'POST' ? /^\/api\/monitor\/(anthropic|oil|hynix|perpetual)\/control$/.exec(url.pathname) : null;
+    const monitorControl = request.method === 'POST' ? /^\/api\/monitor\/(anthropic|oil|goldoil|hynix|perpetual)\/control$/.exec(url.pathname) : null;
     if (monitorControl) {
       const market = monitorControl[1] as keyof typeof MONITOR_NAMES;
       if (!views?.monitor?.setControl) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
       if (!views.monitor.state().markets.includes(market)) return send(response, 404, { code: 'not_found', message: `本服务没有配置${MONITOR_NAMES[market]}行情监控` });
       return send(response, 200, views.monitor.setControl(market, await readJson(request)));
     }
-    const marketRead = /^\/api\/monitor\/(anthropic|oil|hynix|perpetual)\//.exec(url.pathname)?.[1] as keyof typeof MONITOR_NAMES | undefined;
+    const marketRead = /^\/api\/monitor\/(anthropic|oil|goldoil|hynix|perpetual)\//.exec(url.pathname)?.[1] as keyof typeof MONITOR_NAMES | undefined;
     if (marketRead && views?.monitor) {
       const state = views.monitor.state();
       if (state.markets.includes(marketRead)) {
@@ -562,9 +568,9 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
         return send(response, status, { code, message: status === 500 ? '持仓记录处理失败' : error instanceof Error ? error.message : '持仓记录处理失败' });
       }
     }
-    const alertRoute = /^\/api\/monitor\/(oil|hynix)\/alerts(\/test)?$/.exec(url.pathname);
+    const alertRoute = /^\/api\/monitor\/(oil|goldoil|hynix)\/alerts(\/test)?$/.exec(url.pathname);
     if (alertRoute && (request.method === 'GET' ? !alertRoute[2] : request.method === 'POST')) {
-      const market = alertRoute[1] as 'oil' | 'hynix', name = MONITOR_NAMES[market];
+      const market = alertRoute[1] as 'oil' | 'goldoil' | 'hynix', name = MONITOR_NAMES[market];
       if (!views?.monitor) return send(response, 404, { code: 'not_found', message: '本服务没有配置行情监控' });
       const alerts = views.monitor.state().markets.includes(market) ? views.monitor.alerts?.(market) : undefined;
       if (!alerts) return send(response, 404, { code: 'not_found', message: `本服务没有配置${name}行情监控` });

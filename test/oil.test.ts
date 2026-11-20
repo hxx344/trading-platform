@@ -245,6 +245,16 @@ test('服务进程：配置 oil 时启动检查失败则拒绝启动并释放账
       const hynixMarket = await get('/api/hynix/market');
       assert.equal(hynixMarket.status, 200);
       assert.deepEqual((hynixMarket.body.books as { symbol: string }[]).map(item => item.symbol), ['SKHYUSDT', 'SKHYNIXUSDT']);
+      // Gold-oil rides on them too (docs/goldoil.md): its own jobs list, its own books (gold first, then the two oil contracts).
+      const goldoilState = await get('/api/goldoil/state');
+      assert.equal(goldoilState.status, 200);
+      assert.deepEqual(goldoilState.body.jobs, []);
+      assert.deepEqual((goldoilState.body.accounts as { venue: string }[]).map(item => item.venue), ['binance']);
+      assert.equal((await fetch(`http://127.0.0.1:${port}/api/goldoil/market`)).status, 401, '金油接口须登录');
+      const goldoilMarket = await get('/api/goldoil/market');
+      assert.equal(goldoilMarket.status, 200);
+      assert.deepEqual((goldoilMarket.body.books as { symbol: string }[]).map(item => item.symbol), ['XAUUSDT', 'CLUSDT', 'BZUSDT']);
+      assert.deepEqual((goldoilMarket.body.sameExchange as { venue: string; oilSymbol: string }[]).map(item => [item.venue, item.oilSymbol]), [['binance', 'CLUSDT'], ['binance', 'BZUSDT']]);
       // A same-venue preview through the page goes to the live connector with each leg's own contract.
       const previewed = await fetch(`http://127.0.0.1:${port}/api/preview`, { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }, body: JSON.stringify(sameIntent()) });
       const preview = await previewed.json() as { legs: { venue: string; symbol: string; quantity: string; accountId: string }[]; barrels: string };

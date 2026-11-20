@@ -48,6 +48,8 @@ test('MCP：七个工具经令牌读取白名单接口，应答已打码；未�
     }
     assert.match((await call(get, 'logs', { filter: 'problems', limit: 5, before: '100' })).result!.content[0]!.text, /签名者 addr-[0-9a-f]{8} before=100 limit=5/);
     assert.match((await call(get, 'oil_hynix', { view: 'pnl', range: '30d', page: 2 })).result!.content[0]!.text, /"range":"30d","page":2/);
+    // No oil configured: oil, hynix and gold-oil each say unavailable instead of failing the call.
+    assert.match((await call(get, 'oil_hynix')).result!.content[0]!.text, /"goldoil":\{"unavailable":"[^"]*404/);
     assert.match((await call(get, 'monitor')).result!.content[0]!.text, /unavailable/);
     // The session still sees the original, so the masking happened on the server.
     assert.match(await (await fetch(`${p.base}/api/status`, { headers: { cookie: p.cookie } })).text(), new RegExp(ADDRESS));

@@ -74,8 +74,8 @@
 | `/api/transfer-pairs/<id>/history` | 配对的划转记录 |
 | `/api/adl/pairs/<id>/incidents` | 配对的 ADL 事件 |
 | `/api/logs`、`/api/logs/problems` | 页面日志（带 `before`、`limit` 参数） |
-| `/api/oil/state`、`/api/hynix/state`、`/api/oil/pnl`、`/api/oil/rules` | 原油与海力士的任务、盈亏、自动规则 |
-| `/api/monitor/state`、`/api/monitor/<oil\|hynix>/alerts` | 行情监控状态与告警记录 |
+| `/api/oil/state`、`/api/hynix/state`、`/api/goldoil/state`、`/api/oil/pnl`、`/api/oil/rules` | 原油、海力士与金油的任务，原油的盈亏与自动规则 |
+| `/api/monitor/state`、`/api/monitor/<oil\|goldoil\|hynix>/alerts` | 行情监控状态与告警记录 |
 | `/api/options/state`、`/api/options/performance` | 期权状态与收益 |
 | `/api/crossex/state`、`/api/ondo/state` | CrossEx、Ondo 状态（CrossEx 只放行 `opportunities` 参数；`funding` 会请求交易所，不放行） |
 | `/api/update` | 在线更新状态（只读，不含 `check`、`apply`） |
@@ -118,7 +118,7 @@
   | `platform_status` | `/api/status`、`/api/state` 的摘要 |
   | `logs` | `/api/logs` 或 `/problems`，支持按级别、条数翻页 |
   | `aster_pair` | 指定配对的划转记录与 ADL 事件 |
-  | `oil_hynix` | 原油与海力士的状态、盈亏、规则 |
+  | `oil_hynix` | 原油、海力士与金油的状态，原油的盈亏与规则 |
   | `monitor` | 行情监控状态与告警记录 |
   | `module_state` | options、crossex、ondo 三者之一的状态 |
   | `update_status` | 在线更新状态 |

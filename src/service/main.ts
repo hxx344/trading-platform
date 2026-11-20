@@ -32,7 +32,7 @@ import { balanceWindow, createBalanceSamples, type BalanceSamples } from './bala
 import { readImportResult, submitImportRequest } from './import-channel.ts';
 import { legacyUpdateJob } from './update-legacy.ts';
 import type { UpdateFetch } from './update.ts';
-import { hynixBalanceCheck, hynixBusy, hynixViews, oilLoops, oilViews, openHynixBalance, openOilPnl, openOilRules, prepareOil, registerOilAccounts, strandedOilJobs, type OilRulesRuntime, type OilRuntime } from './oil.ts';
+import { goldoilViews, hynixBalanceCheck, hynixBusy, hynixViews, oilLoops, oilViews, openHynixBalance, openOilPnl, openOilRules, prepareOil, registerOilAccounts, strandedOilJobs, type OilRulesRuntime, type OilRuntime } from './oil.ts';
 import { oilSummary } from './oil-config.ts';
 import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, settleMonitor, stopMonitor, type MonitorRuntime } from './monitor.ts';
 import type { PerpetualMonitor } from '../monitor/perpetual.ts';
@@ -418,13 +418,13 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
     views: {
       status: () => ({ budget: client.requestBudget.state(), idleWeight: idleWeight(config, executor.transferPairSettings()), streams: streams.view(), feishu: notifier.status(), summary: summary.status(), samples: { available: samples !== null, error: samplesError },
         ...(watch ? { watch: watch.status() } : {}),
-        ...(config.monitor ? { monitor: { available: monitor !== null, error: monitorError, ...(monitor ? monitorStatus(monitor) : { anthropic: null, oil: null, hynix: null, perpetual: null }) } } : {}) }),
+        ...(config.monitor ? { monitor: { available: monitor !== null, error: monitorError, ...(monitor ? monitorStatus(monitor) : { anthropic: null, oil: null, goldoil: null, hynix: null, perpetual: null }) } } : {}) }),
       balanceHistory: (pairId, range) => {
         if (samples) return samples.history(pairId, range);
         const window = balanceWindow(range, Date.now());
         return window && { pairId, range, ...window, points: [], unavailable: `余额采样库无法打开，走势图不可用：${samplesError ?? '未知原因'}（不影响划转与 ADL）` };
       },
-      ...(oil ? { oil: oilViews(oil, executor, oilRules, oilPnl), hynix: hynixViews(oil, executor, hynixBalance!) } : {}),
+      ...(oil ? { oil: oilViews(oil, executor, oilRules, oilPnl), hynix: hynixViews(oil, executor, hynixBalance!), goldoil: goldoilViews(oil, executor) } : {}),
       ...(monitor ? { monitor: monitorViews(monitor) } : {}),
       summary: { setInterval: (minutes: number) => summary.setInterval(minutes), sendNow: () => summary.sendNow() },
       ...(asset ? { asset } : {}),
@@ -475,7 +475,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
         client, credentials: byAddress.get(accountId)!, accountId, stopped: context.stopped, pause: context.pause, ...(connect ? { connect } : {}),
         push: (id, event) => { streams.onMessage(id); trading.push(id, event); }, onState: (connected, reason) => streams.onState(accountId, connected, reason),
       })),
-      ...(oil ? oilLoops(oil, context, line => process.stderr.write(`${line}\n`), oilRules, oilPnl, hynixCheck) : []),
+      ...(oil ? oilLoops(oil, context, line => process.stderr.write(`${line}\n`), oilRules, oilPnl, hynixCheck, (key, text) => notifier.notifyOnce(key, text)) : []),
       ...(monitor ? monitorLoops(monitor, context) : []),
       ...(options ? [options.loop(context, { notifyOnce: (key, text) => notifier.notifyOnce(key, text), notify: text => notifier.notify(text) })] : []),
       ...(crossex ? [crossex.loop(context, { notifyOnce: (key, text) => notifier.notifyOnce(key, text), notify: text => notifier.notify(text), log: line => process.stderr.write(`${line}\n`) })] : []),

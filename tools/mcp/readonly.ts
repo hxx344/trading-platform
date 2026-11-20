@@ -114,12 +114,12 @@ export const TOOLS: readonly Tool[] = [
   },
   {
     name: 'oil_hynix',
-    description: `原油与海力士：view=state 为两者的任务、持仓与账户；pnl 为原油盈亏（range 如 24h、7d、30d，page 翻页）；rules 为原油自动规则。${DATA_NOTE}`,
+    description: `原油、海力士与金油：view=state 为三者的任务、持仓与账户；pnl 为原油盈亏（range 如 24h、7d、30d，page 翻页）；rules 为原油自动规则。${DATA_NOTE}`,
     inputSchema: schema({ view: { type: 'string', enum: ['state', 'pnl', 'rules'] }, range: { type: 'string', pattern: '^[0-9a-z]{1,8}$' }, page: { type: 'integer', minimum: 0, maximum: 1000 } }),
     run: async (args, get) => {
       const view = pick(args, 'view', ['state', 'pnl', 'rules'], 'state');
       if (view !== 'pnl' && (args.range !== undefined || args.page !== undefined)) throw new ToolInputError('range 与 page 只适用于 view=pnl');
-      if (view === 'state') return { oil: await optional(get, '/api/oil/state'), hynix: await optional(get, '/api/hynix/state') };
+      if (view === 'state') return { oil: await optional(get, '/api/oil/state'), hynix: await optional(get, '/api/hynix/state'), goldoil: await optional(get, '/api/goldoil/state') };
       if (view === 'rules') return optional(get, '/api/oil/rules');
       const range = args.range ?? '7d';
       if (typeof range !== 'string' || !/^[0-9a-z]{1,8}$/.test(range)) throw new ToolInputError('range 须为如 24h、7d、30d 的区间');
@@ -128,10 +128,10 @@ export const TOOLS: readonly Tool[] = [
   },
   {
     name: 'monitor',
-    description: `行情监控：各市场的开关与采集状态，以及原油、海力士的阈值告警设置与告警记录。market 不填时两者都读。${DATA_NOTE}`,
-    inputSchema: schema({ market: { type: 'string', enum: ['oil', 'hynix'] } }),
+    description: `行情监控：各市场的开关与采集状态，以及原油、金油比、海力士的阈值告警设置与告警记录。market 不填时三者都读。${DATA_NOTE}`,
+    inputSchema: schema({ market: { type: 'string', enum: ['oil', 'goldoil', 'hynix'] } }),
     run: async (args, get) => {
-      const markets = args.market === undefined ? ['oil', 'hynix'] as const : [pick(args, 'market', ['oil', 'hynix'] as const, 'oil')];
+      const markets = args.market === undefined ? ['oil', 'goldoil', 'hynix'] as const : [pick(args, 'market', ['oil', 'goldoil', 'hynix'] as const, 'oil')];
       const alerts: Record<string, unknown> = {};
       for (const market of markets) alerts[market] = await optional(get, `/api/monitor/${market}/alerts`);
       return { state: await optional(get, '/api/monitor/state'), alerts };

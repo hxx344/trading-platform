@@ -265,7 +265,7 @@ test('planImport：告警跟在行情监控之后；只换档位时配置不变�
   const fresh = planImport(source, null, { secretsFile: '/x/secrets.json', only: [], monitor: { workbench: true }, monitorAlerts: sourceOf() });
   assert.deepEqual([fresh.monitor?.status, fresh.monitorAlerts?.status, Object.keys(fresh.alertWrite ?? {})], ['added', 'added', ['oil', 'hynix']]);
   assert.deepEqual(fresh.secrets.feishuMonitor, { webhook: HOOK, secret: SIGN });
-  const existing = { config: { secretsFile: '/x/secrets.json', pairs: [], monitor: { anthropic: {}, oil: {}, hynix: {}, perpetual: {} } }, secrets: { accounts: {}, feishuMonitor: { webhook: HOOK, secret: SIGN } } };
+  const existing = { config: { secretsFile: '/x/secrets.json', pairs: [], monitor: { anthropic: {}, oil: {}, goldoil: {}, hynix: {}, perpetual: {} } }, secrets: { accounts: {}, feishuMonitor: { webhook: HOOK, secret: SIGN } } };
   const again = planImport(source, existing, { secretsFile: '/x/secrets.json', only: [], monitor: { workbench: true }, monitorAlerts: sourceOf() });
   assert.deepEqual([again.monitor?.status, again.monitorAlerts?.status, again.monitorAlerts?.robot.changes], ['skipped', 'added', false]);
   assert.ok(filesUnchanged(again, existing), '只换档位');
@@ -280,7 +280,7 @@ test('导入助手：预览列出告警；只换档位不重启；机器人变�
     for (const path of [conf, dir, join(w.root, 'proc')]) mkdirSync(path, { recursive: true });
     writeFileSync(join(w.root, 'workbench.env'), `DATA_DIR=${w.wb}\n`);
     const configFile = join(conf, 'config.json'), secretsFile = join(conf, 'secrets.json');
-    const first = fileText({ secretsFile, pairs: [], monitor: { anthropic: {}, oil: {}, hynix: {}, perpetual: {} } });
+    const first = fileText({ secretsFile, pairs: [], monitor: { anthropic: {}, oil: {}, goldoil: {}, hynix: {}, perpetual: {} } });
     writeFileSync(secretsFile, fileText({ accounts: {} }), { mode: 0o600 });
     writeFileSync(configFile, first, { mode: 0o600 });
     const restarts: string[] = [], writes: string[][] = [];

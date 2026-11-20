@@ -8,13 +8,18 @@ import { fetchOilFundingFacts, fetchHynixFundingFacts } from '../vendor/settled-
 import type { FundingHistoryRange } from '../vendor/exchange-funding-history.mjs';
 import type { FundingSide } from './funding-archive.ts';
 
-import { boundedReply, BinanceCooldown } from './market-contract.ts';
+import { boundedReply, BinanceCooldown, OIL_CANDLE_WINDOW_MS } from './market-contract.ts';
+import { GOLDOIL_CANDLE_MS, GOLDOIL_SYMBOLS, goldOilKlinePage, goldOilListing, pairGoldOilRows, parseGoldOilQuote, type GoldOilCandleRow, type GoldOilQuote } from './goldoil-market.ts';
 import { HYPERLIQUID_INFO, XYZ_CONTEXTS_BODY, type SharedMarketReads } from './shared-reads.ts';
 
 /** The workbench's limits (lib/exchange-service.ts parseBinanceQuote): a mark's source time near this clock, both legs close together. */
 const SOURCE_PAST_MS = 120_000, SOURCE_FUTURE_MS = 60_000, LEG_SKEW_MS = 15_000;
 /** The Anthropic quote is dated by the time it was asked for, so a shared xyz reply may be this old at most. */
 const ANTHROPIC_CONTEXTS_MAX_AGE_MS = 2_000;
+/** M-2f: the gold/oil contracts are checked (and their common listing read) at most this often, as the workbench's metadata(). */
+const GOLDOIL_CATALOG_MS = 300_000;
+/** The shared catalog read's own limit (no caller's signal stops it). */
+const GOLDOIL_CATALOG_TIMEOUT_MS = 20_000;
 
 type Json = Record<string, unknown>;
 const record = (value: unknown): Json => { if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid Binance object'); return value as Json; };
@@ -117,12 +122,66 @@ export function createMarketReaders({ fetchImpl = fetch, now = Date.now, gate = 
     return parseOilQuote(brent, wti, funding, now());
   }
 
+  // M-2f: the workbench's gold-oil reader (lib/gold-oil-service.ts, 61eaae1) on the three contracts at once.
+  let catalog: { start: number; until: number } | null = null;
+  // The quote and candle rounds both start with the catalog: one read in flight serves both. It runs on its own signal, capped
+  // by its own time limit, so one caller giving up (each market-process call has its own signal) never fails the others;
+  // each caller waits on its own signal and only it returns early.
+  let catalogRead: Promise<number> | null = null;
+  function goldOilCatalog(signal: AbortSignal): Promise<number> {
+    if (catalog && now() < catalog.until) return Promise.resolve(catalog.start);
+    catalogRead ??= (async () => {
+      try {
+        const info = await requestBinance('/fapi/v1/exchangeInfo', {}, { fetcher: oilFetcher(AbortSignal.timeout(GOLDOIL_CATALOG_TIMEOUT_MS)), timeout: 15_000 });
+        const start = goldOilListing(info, now());
+        catalog = { start, until: now() + GOLDOIL_CATALOG_MS };
+        return start;
+      } finally { catalogRead = null; }
+    })();
+    return untilAborted(catalogRead, signal);
+  }
+  async function goldOilQuote(signal: AbortSignal): Promise<GoldOilQuote> {
+    await goldOilCatalog(signal);
+    const symbols = [GOLDOIL_SYMBOLS.xau, GOLDOIL_SYMBOLS.cl, GOLDOIL_SYMBOLS.bz];
+    const rows = shared?.binanceMarks(symbols);
+    if (rows) { try { return parseGoldOilQuote(rows[0], rows[1], rows[2], now()); } catch { /* read premiumIndex instead */ } }
+    const options = { fetcher: oilFetcher(signal), timeout: 10_000 };
+    const [xau, cl, bz] = await Promise.all(symbols.map(symbol => requestBinance('/fapi/v1/premiumIndex', { symbol }, options)));
+    return parseGoldOilQuote(xau, cl, bz, now());
+  }
+  /** The closed 15-minute mark bars of the three legs in [start, end), paired by time; a leg without a bar there is null. */
+  async function goldOilCandles(start: number, end: number, signal: AbortSignal): Promise<GoldOilCandleRow[]> {
+    if (start % GOLDOIL_CANDLE_MS || end % GOLDOIL_CANDLE_MS || end <= start || end - start > OIL_CANDLE_WINDOW_MS || end > now()) throw new Error('金油比 K 线范围无效');
+    await goldOilCatalog(signal);
+    const options = { fetcher: oilFetcher(signal), timeout: 15_000 };
+    // A window is at most 1,344 bars, so one page (limit = the bars left, at most 1,500) reads it. A full page continues
+    // after its last bar; a short one is the end. Still unread after 3 pages: the read is incomplete and fails.
+    const leg = async (symbol: string) => {
+      const bars: [number, number][] = [];
+      let cursor = start;
+      for (let page = 0; page < 3 && cursor < end; page++) {
+        const limit = Math.min(1500, (end - cursor) / GOLDOIL_CANDLE_MS);
+        const batch = goldOilKlinePage(await requestBinance('/fapi/v1/markPriceKlines', { symbol, interval: '15m', startTime: cursor, endTime: end - 1, limit }, options), cursor, end);
+        bars.push(...batch);
+        if (batch.length < limit) return bars;
+        cursor = batch.at(-1)![0] + GOLDOIL_CANDLE_MS;
+      }
+      if (cursor < end) throw new Error('Binance pagination limit exceeded');
+      return bars;
+    };
+    const [xau, wti, brent] = await Promise.all([leg(GOLDOIL_SYMBOLS.xau), leg(GOLDOIL_SYMBOLS.cl), leg(GOLDOIL_SYMBOLS.bz)]);
+    return pairGoldOilRows(xau, wti, brent);
+  }
+
   return {
     anthropicQuote: (signal: AbortSignal) => fetchAnthropicQuote({ fetcher: fetcher(signal), now: now(), gate, rh, clock: now }),
     anthropicCandles: (starts: AnthropicCandleStarts, at: number, signal: AbortSignal, ends?: AnthropicCandleStarts) => fetchAnthropicCandleBatch(starts, { fetcher: fetcher(signal), now: at, ends, gate, rh, clock: now }),
     oilQuote,
     oilCandles: (start: number, end: number, signal: AbortSignal) => fetchOilCandleBatch(start, { fetcher: oilFetcher(signal), now: end, timeout: 15_000 }, true),
     oilFunding: (side: FundingSide, range: FundingHistoryRange, signal: AbortSignal) => fetchOilFundingFacts(side, range, { fetcher: oilFetcher(signal), timeout: 15_000 }),
+    goldOilQuote,
+    goldOilListing: goldOilCatalog,
+    goldOilCandles,
     hynixQuote: (signal: AbortSignal) => fetchHynixQuote({ fetcher: fetcher(signal), now, timeout: 5_000 }),
     hynixCandles: (start: number, at: number, signal: AbortSignal, end?: number) => fetchHynixCandles(start, { fetcher: fetcher(signal), timeout: 10_000, now: at, end }),
     hynixFunding: (side: FundingSide, range: FundingHistoryRange, signal: AbortSignal) => fetchHynixFundingFacts(side, range, { fetcher: fetcher(signal), timeout: 10_000 }),

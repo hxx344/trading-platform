@@ -2,6 +2,7 @@
 // that block is there, and each market only when it is named. Their history sits in monitor.sqlite; a file that cannot be
 // opened costs only the monitor page.
 import type { MarketClient } from '../market/ipc.ts';
+import { ContractError } from '../contracts.ts';
 import { createRemoteMonitor } from './remote-monitor.ts';
 import { perpetualQualityEnv } from '../monitor/quality-config.ts';
 import { join } from 'node:path';
@@ -106,17 +107,27 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
 
 /**
  * The page's reads: which markets run, and each market's quote and candles. A market that is not configured gives undefined
- * (the endpoint answers 404); one without data yet gives null (503).
+ * (404). Before any data arrives, distinguish an initial wait from a collector failure (both 503).
  */
 export function monitorViews(monitor: MonitorRuntime) {
-  const collector = (market: CandleMarket) => monitor[market];
+  function read(market: CandleMarket, kind: 'quote' | 'candles', days: number | null = null) {
+    const collector = monitor[market];
+    if (!collector) return undefined;
+    const value = kind === 'quote' ? collector.quote() : collector.candles(days);
+    if (value === null) {
+      const status = collector.status();
+      const reason = kind === 'quote' ? status.quoteError : status.candleError;
+      if (reason) throw new ContractError(503, `${kind}_unavailable`, reason);
+    }
+    return value;
+  }
   return {
     state: () => ({ markets: monitorMarkets(monitor.config), anthropic: monitor.config.anthropic ? { shares: monitor.config.anthropic.shares } : null, controls: monitor.control.views() }),
     /** M-3c: whether a configured market runs (its reads answer 423 while it is off), and the page's switch. */
     enabled: (market: MonitorMarket): boolean => monitor.control.enabled(market),
     setControl: (market: MonitorMarket, body: unknown): unknown => monitor.control.update(market, body),
-    quote: (market: CandleMarket): unknown => collector(market)?.quote(),
-    candles: (market: CandleMarket, days: number | null): unknown => collector(market)?.candles(days),
+    quote: (market: CandleMarket): unknown => read(market, 'quote'),
+    candles: (market: CandleMarket, days: number | null): unknown => read(market, 'candles', days),
     /** M-4a: the perpetual collector (snapshot, summary, the SSE stream); undefined when it is not configured. */
     perpetual: (): PerpetualMonitor | undefined => monitor.perpetual ?? undefined,
     /** The settled funding history (M-2d); undefined when the market is not configured; before any settlement

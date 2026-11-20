@@ -79,8 +79,8 @@
 **接口**（都要登录，只读）
 
 - `GET /api/monitor/state`：`{ markets: ["anthropic"], anthropic: { shares } }`；没配置 `monitor` 时 404（页面据此不显示入口）。
-- `GET /api/monitor/anthropic/quote`：工作台同名接口的内容（四条腿的标记价、资金费、各腿错误、`fetchedAt`）加 `status`、`staleAfterMs`、`lastAttemptAt`、`lastError`；还没有任何报价时 503 `not_ready`。
-- `GET /api/monitor/anthropic/candles?days=<1–400>`：最近若干天的 K 线快照，带完整历史的覆盖范围（`coverage`）；不带 `days` 返回全部；参数非法 400；还没有数据时 503 `not_ready`。
+- `GET /api/monitor/anthropic/quote` 返回各腿标记价、资金费、错误及采集时间。尚待首次采集时返回 503 `not_ready`。尚无报价且已确认采集失败时返回 503 `quote_unavailable` 及采集器记录的简短原因。已有报价带 `status`、`staleAfterMs`、`lastAttemptAt`、`lastError`。
+- `GET /api/monitor/anthropic/candles?days=<1–400>` 返回最近若干天的 K 线与完整覆盖范围（`coverage`）。无 `days` 返回全部，参数非法返回 400。尚待首次采集时返回 503 `not_ready`，已有失败原因且仍无历史时返回 503 `candles_unavailable`。原油与海力士的报价、K 线采用同一规则。页面显示失败原因并按原周期重试，浏览器缓存保留实际采集时间。
 
 **页面**
 

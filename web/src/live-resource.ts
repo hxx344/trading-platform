@@ -10,6 +10,9 @@
 
 export type ResourceStatus = 'loading' | 'ready' | 'error' | 'paused' | 'offline';
 export type ResourceSnapshot<T> = { data: T | null; error: Error | null; status: ResourceStatus; receivedAt: number | null; cached?: boolean };
+/** A pending retry keeps the last failure visible until a read actually succeeds. */
+export const readFailure = (resource: Pick<ResourceSnapshot<unknown>, 'error' | 'status'>) =>
+  resource.status === 'offline' ? '网络离线' : resource.error?.message ?? null;
 export type DisplayRetention<T> = { fresh: (value: T, now: number) => boolean; history?: boolean };
 export type ResourceSource<T> = { read: (signal: AbortSignal) => Promise<T>; intervalMs: number | null; retain?: DisplayRetention<T>; background?: boolean };
 export type Subscription = (() => void) & { retune: (intervalMs: number | null) => void; setBackground: (background: boolean) => void };

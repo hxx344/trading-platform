@@ -10,6 +10,7 @@ import { api, ApiError } from './api.ts';
 import { newRequestId } from './request-ids.ts';
 import { StatePanel } from './StateViews.tsx';
 import { useLiveResource } from './use-live-resource.ts';
+import { readFailure } from './live-resource.ts';
 import { AssetTrend } from './AssetTrend.tsx';
 import { CONNECTIONS_PATH, ConnectionsView, SIDE_EXCHANGES, pendingText, type CardExchange } from './AssetConnections.tsx';
 import { startRefreshLoop } from './asset-refresh-loop.ts';
@@ -86,9 +87,9 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
     return () => loop.stop();
   }, [imported, gate]);
 
-  const failed = (status: string) => status === 'error' || status === 'offline';
-  if (!state.data) return <div className="asset-desk"><div className="page">{failed(state.status)
-    ? <StatePanel kind="error" title="读取资产账本失败" detail={state.error?.message ?? '网络离线'} />
+  const stateError = readFailure(state), ledgerError = readFailure(ledger);
+  if (!state.data) return <div className="asset-desk"><div className="page">{stateError
+    ? <StatePanel kind="error" title="读取资产账本失败" detail={stateError} />
     : <StatePanel kind="loading" title="加载中…" />}</div></div>;
   if (!state.data.imported) return <div className="asset-desk"><div className="page">
     <StatePanel kind="empty" title="尚未导入资产账本" detail="本服务的资产页数据来自工作台资产账本的一次导入。到「设置」页的「从工作台导入」点「读取工作台」，勾选「导入资产账本」并选择工作台用户即可（不重启服务）；导入完成后本页一分钟内显示。也可在服务器上运行下面的命令（参数见 README 的 asset 一节）。">
@@ -103,10 +104,16 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
   const connect = (exchange: CardExchange | 'aster') => { writer.clear(); setView('connections'); setImportOpen(false); setConnecting(exchange === 'aster' ? null : exchange); window.scrollTo({ top: 0 }); };
   const pending = data?.ledger ? Object.values(data.ledger.connections).filter(item => !item.configured).length : 0;
   const counts: Partial<Record<View, string>> = { history: history.data?.imported ? String(history.data.periods.length) : undefined, withdrawals: data?.ledger ? String(data.ledger.withdrawals.length) : undefined, connections: pending ? pending + ' 待连接' : undefined };
-  const readErrors = [state, ledger, view === 'withdrawals' ? withdrawals : history].filter(item => failed(item.status) && item.error).map(item => item.error!.message);
+  const reads = [
+    { label: '账本状态', resource: state }, { label: '资产明细', resource: ledger },
+    view === 'withdrawals' ? { label: '出金记录', resource: withdrawals } : { label: '历史记录', resource: history },
+  ];
   const alerts: { key: string; role: 'alert' | 'status'; text: string; tone: 'error' | 'warn' }[] = [
-    ...(writer.syncError ? [{ key: 'sync', role: 'alert' as const, text: '同步失败：' + writer.syncError + '。当前显示上次同步的数据。', tone: 'error' as const }] : []),
-    ...[...new Set(readErrors)].map(text => ({ key: 'read:' + text, role: 'alert' as const, text: '读取失败：' + text + '。当前显示上次读取的数据。', tone: 'error' as const })),
+    ...(writer.syncError ? [{ key: 'sync', role: 'alert' as const, text: '同步失败：' + writer.syncError + (data?.ledger ? '。当前显示已读取的账本。' : ''), tone: 'error' as const }] : []),
+    ...reads.flatMap(({ label, resource }) => {
+      const error = readFailure(resource);
+      return error ? [{ key: label, role: 'alert' as const, text: label + '读取失败：' + error + (resource.data ? '。保留上次读取结果。' : ''), tone: 'error' as const }] : [];
+    }),
     ...(data?.ledger?.fxStatus.error ? [{ key: 'fx', role: 'status' as const, text: data.ledger.fxStatus.error + '，人民币折算暂用 1 USD = ' + money(data.ledger.fx, 4) + ' CNY。', tone: 'warn' as const }] : []),
     ...(data?.summary?.valuation.partial ? [{ key: 'valuation', role: 'status' as const, text: data.summary.valuation.missingValues + ' 项资产估值缺失，汇总仅包含已知金额，当前为部分估值。', tone: 'warn' as const }] : []),
     ...(data?.ledger?.assets ?? []).filter(asset => asset.error).map(asset => ({ key: 'asset-' + asset.id, role: 'status' as const, text: asset.project + '：' + asset.error, tone: 'warn' as const })),
@@ -127,12 +134,12 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
     <div className="page">
       <div className="notice info" role="status"><Info size={15} aria-hidden="true" /><div>账本于 {fullStamp(info.importedAt)} 从工作台导入（工作台用户 {info.source?.owner ?? '—'}，资产 {info.assets} 行、日快照 {info.snapshots.count} 份）。页面打开时每 60 秒同步交易所余额、行情单价与人民币汇率；编辑、出金与资金流登记保存在本服务的账本。重新导入会整体替换本服务的账本，本页做过的修改一并被覆盖。</div></div>
       {writer.saved ? <p className="notice saved-notice" role="status"><Check size={15} aria-hidden="true" />{writer.saved}</p> : null}
-      {!data?.ledger || !data.summary ? (failed(ledger.status) ? <StatePanel kind="error" title="读取资产明细失败" detail={ledger.error?.message ?? '网络离线'} /> : <StatePanel kind="loading" title="加载中…" />)
+      {!data?.ledger || !data.summary ? (ledgerError ? <StatePanel kind="error" title="读取资产明细失败" detail={ledgerError} /> : <StatePanel kind="loading" title="加载中…" />)
         : <>
           {view !== 'overview' ? example : null}
-          {view === 'overview' ? <Overview data={data as LoadedLedger} history={history.data?.imported ? history.data : null} historyError={failed(history.status) ? history.error?.message ?? '网络离线' : null} version={version} example={example} writer={writer} onHistory={() => navigate('history')} onWithdrawals={() => navigate('withdrawals')} onConnect={connect} onExpired={onExpired} />
-            : view === 'history' ? <History history={history.data?.imported ? history.data : null} error={failed(history.status) ? history.error?.message ?? '网络离线' : null} />
-            : view === 'withdrawals' ? <Withdrawals view={withdrawals.data?.imported ? withdrawals.data : null} today={data.today} error={failed(withdrawals.status) ? withdrawals.error?.message ?? '网络离线' : null} writer={writer} />
+          {view === 'overview' ? <Overview data={data as LoadedLedger} history={history.data?.imported ? history.data : null} historyError={readFailure(history)} version={version} example={example} writer={writer} onHistory={() => navigate('history')} onWithdrawals={() => navigate('withdrawals')} onConnect={connect} onExpired={onExpired} />
+            : view === 'history' ? <History history={history.data?.imported ? history.data : null} error={readFailure(history)} />
+            : view === 'withdrawals' ? <Withdrawals view={withdrawals.data?.imported ? withdrawals.data : null} today={data.today} error={readFailure(withdrawals)} writer={writer} />
             : <ConnectionsView connections={data.ledger.connections} accounts={data.ledger.asterAccounts} now={Date.now()} writer={writer} opened={connecting} onOpen={setConnecting} />}
           <footer className="page-footer">{VIEW_DESCRIPTIONS[view]} · {data.ledger.dataKind === 'example' ? '示例账本 · 尚未导入原表' : '源自《资产统计.xlsx》'} · 起始持仓 {data.ledger.baselineDate} · 自 {data.ledger.startedAt} 开始更新</footer>
         </>}
@@ -174,7 +181,7 @@ function useWriter({ onExpired, onLedger, onWritten }: { onExpired: () => void; 
       if (reason instanceof ApiError && reason.status === 401) { onExpired(); return; }
       setError({ path, text: reason instanceof Error ? reason.message : '保存失败，输入已保留' });
       // A conflict (another write, a new import) or an unknown outcome: show what the ledger holds now.
-      if (!(reason instanceof ApiError) || reason.status === 409 || reason.status >= 500) { onWritten(false); setWrites(count => count + 1); }
+      if (!options?.preview && (!(reason instanceof ApiError) || reason.status === 409 || reason.status >= 500)) { onWritten(false); setWrites(count => count + 1); }
     } finally {
       running.current = false;
       if (mounted.current) setBusy(false);

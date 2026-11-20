@@ -293,6 +293,11 @@ test('配置与接口：monitor.hynix 不带设置；只配海力士时其他市
     assert.deepEqual([(await get('/api/monitor/hynix/quote')).status, (await get('/api/monitor/hynix/quote')).body.message], [503, '尚未取得海力士报价，后台正在采集']);
     assert.equal((await get('/api/monitor/hynix/candles?days=7')).status, 503);
     for (const days of ['0', 'x', '401']) assert.equal((await get(`/api/monitor/hynix/candles?days=${days}`)).body.code, 'invalid_days', days);
+    venues.hynixStatus = 429;
+    await Promise.all([runtime.hynix!.refreshQuote(), runtime.hynix!.refreshCandles()]);
+    assert.deepEqual(await get('/api/monitor/hynix/quote'), { status: 503, body: { code: 'quote_unavailable', message: '接口限流（HTTP 429）' } });
+    assert.deepEqual(await get('/api/monitor/hynix/candles?known='), { status: 503, body: { code: 'candles_unavailable', message: 'K 线读取失败：接口限流（HTTP 429）' } });
+    venues.hynixStatus = null;
     await runtime.hynix!.refreshQuote();
     await runtime.hynix!.refreshCandles();
     const quote = await get('/api/monitor/hynix/quote');

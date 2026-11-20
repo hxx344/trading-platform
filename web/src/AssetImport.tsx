@@ -40,7 +40,9 @@ export function ImportPanel({ writer, gate, onClose }: { writer: Writer; gate: I
   useEffect(() => { panel.current?.scrollIntoView({ block: 'nearest' }); }, []);
   // Held while mounted: the automatic sync pauses and resumes however the panel goes away (asset-import-gate.ts).
   useEffect(() => gate.hold(), [gate]);
-  async function choose(file?: File) {
+  async function choose(input: HTMLInputElement) {
+    const file = input.files?.[0];
+    input.value = ''; // Let the user select the same file again after a failed preview.
     setSource(undefined); setPreview(null); setFileError(''); writer.clear();
     if (!file) return;
     let data: unknown;
@@ -59,7 +61,7 @@ export function ImportPanel({ writer, gate, onClose }: { writer: Writer; gate: I
     <h2>导入原表数据</h2>
     <p className="help">选择从《资产统计.xlsx》生成的 JSON 文件，先核对内容，再导入到当前账本。</p>
     <div className="form-grid">
-      <label>原表导入文件（JSON）<input type="file" accept=".json,application/json" disabled={writer.busy} onChange={event => void choose(event.target.files?.[0])} /></label>
+      <label>原表导入文件（JSON）<input type="file" accept=".json,application/json" disabled={writer.busy} onChange={event => void choose(event.currentTarget)} /></label>
       {preview ? <div className="import-summary"><strong>{preview.summary.source}</strong>{summaryLines(preview.summary).map(line => <p key={line}>{line}</p>)}</div> : null}
       <p className="help">已有手动修改、只读 API 连接及同步余额会保留。导入前自动备份；旧示例快照保留在历史记录，不参与真实资产曲线。当前估值会随实时行情变化。</p>
       <p className="help">导入文件由随本服务安装的脚本生成：它在安装目录下的 <code>{IMPORT_SCRIPT_PATH}</code>（默认安装目录 <code>{DEFAULT_APP_DIR}</code>），复制到装有 openpyxl 的电脑上运行 <code>{IMPORT_SCRIPT}</code>，得到 imported-ledger.json。</p>

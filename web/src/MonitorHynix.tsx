@@ -1,6 +1,5 @@
 import { Activity, ArrowDownRight, ArrowUpRight, ChevronDown, Clock3, Info, MoveRight, RefreshCw } from 'lucide-react';
 import { useCallback, useMemo, useState } from 'react';
-import { ApiError } from './api.ts';
 import { SpreadChart, date, stamp } from './MonitorChart.tsx';
 import { dailyPoints, ranges, selectRange, type ChartMode, type Point } from './monitor-history.ts';
 import { HYNIX_SPREAD_CHART, HYNIX_WARMUP_DAYS, hynixQuote, hynixWarnings, type HynixQuote } from './monitor-hynix.ts';
@@ -9,7 +8,7 @@ import { ExchangeComparison } from './MonitorExchanges.tsx';
 import { HynixFundingPanel } from './MonitorFunding.tsx';
 import { AlertSettings } from './MonitorAlerts.tsx';
 import { useLiveResource } from './use-live-resource.ts';
-import { mainQuoteRetention, quoteIsCurrent } from './monitor-display.ts';
+import { mainQuoteDisplay, mainQuoteRetention, monitorReadError } from './monitor-display.ts';
 import { useFills } from './MonitorTrades.tsx';
 import { DetailLayout, RelatedPositions } from './MonitorRelated.tsx';
 import type { VenueSpreads } from './monitor-related.ts';
@@ -24,8 +23,6 @@ const EMPTY_POINTS: Point[] = [];
 const money = (v: number | undefined) => v === undefined ? '—' : new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(v);
 const percent = (v: number | undefined) => v === undefined ? '—' : `${v > 0 ? '+' : ''}${v.toFixed(2)}%`;
 const signedMoney = (v: number | undefined) => v === undefined ? '—' : `${v > 0 ? '+' : v < 0 ? '−' : ''}${money(Math.abs(v))}`;
-const notReady = (error: Error | null) => error instanceof ApiError && error.status === 503;
-const readable = (error: Error, fallback: string) => /[一-鿿]/.test(error.message) ? error.message : fallback;
 
 export function HynixPanel({ onExpired }: { onExpired: () => void }) {
   const [requestedRange, setRange] = useState<number | null>(null);
@@ -37,12 +34,8 @@ export function HynixPanel({ onExpired }: { onExpired: () => void }) {
   const candleLive = useMonitorCandles(hynixCandles, requestedRange, HYNIX_WARMUP_DAYS, onExpired, quoteLive.error);
   const { data, range } = candleLive;
   const quote = quoteLive.data;
-  const currentQuote = quoteIsCurrent(quoteLive, QUOTE_MS);
-  const quoteFailed = quoteLive.error !== null && !(quote === null && notReady(quoteLive.error));
-  const quoteError = quoteFailed ? '实时报价更新失败，10 秒后自动重试；请留意报价获取时间。'
-    : quote?.status === 'snapshot' ? `后台尚未取得新报价${quote.lastError ? `（${quote.lastError}）` : ''}，显示上次保存的数据；请留意采集时间。` : '';
-  const historyFailed = candleLive.error !== null && !(data === null && notReady(candleLive.error));
-  const error = historyFailed && candleLive.error ? readable(candleLive.error, '小时 K 线校验失败，将在下一轮自动重试。') : '';
+  const quoteDisplay = mainQuoteDisplay(quoteLive, QUOTE_MS);
+  const error = monitorReadError(candleLive.error, data !== null, '小时 K 线校验失败，将在下一轮自动重试。');
   const loading = refreshing || (quote === null && quoteLive.error === null) || (data === null && candleLive.error === null);
   const { refresh: refreshQuote } = quoteLive, { refresh: refreshCandles } = candleLive;
   const refresh = useCallback(() => {
@@ -62,14 +55,14 @@ export function HynixPanel({ onExpired }: { onExpired: () => void }) {
   // Current metrics always come from the live quote, never from the last hourly close.
   const current = quote ?? undefined;
   const direction = !current || current.premium >= 0 ? 'positive' : 'negative';
-  const historyPending = data === null && !historyFailed;
+  const historyPending = data === null && !error;
   const trades = useFills('hynix', onExpired);
   // The related pairs' current spread per venue, reported by the exchange comparison below (the workbench hub's oilSpreads / hynixSpreads).
   const [venueSpreads, setVenueSpreads] = useState<VenueSpreads>({});
   return <DetailLayout side={<RelatedPositions market="hynix" spreads={venueSpreads} onExpired={onExpired} />}>
     <div className="page-heading detail-toolbar"><div className="toolbar-identity"><div className="eyebrow">SK HYNIX <span>/</span> 000660 · SKHY</div><h1>海力士 ADR 价差<span className="small-tag">上市以来</span></h1><p>正股与 ADR 同口径比较 · Hyperliquid 永续合约</p></div><div className="refresh-area"><button type="button" className="refresh-button" onClick={refresh} disabled={loading}><RefreshCw size={15} className={loading ? 'spinning' : ''} aria-hidden="true" />{loading ? '加载行情' : '刷新行情'}</button><span>每 10 秒自动刷新</span></div></div>
-    <div className="data-status" role="status"><span className="status-left"><Clock3 size={14} aria-hidden="true" />{quote ? `${quoteError ? '实时更新中断 · 上次获取' : currentQuote ? '实时报价 · 获取于' : '上次报价 · 采集于'} ${date(quote.fetchedAt, true)} ${new Date(quote.fetchedAt).toISOString().slice(11, 19)} UTC` : quoteFailed ? '实时报价暂不可用 · 每 10 秒自动重试' : '正在获取实时报价 · 每 10 秒自动刷新'}</span><span className="status-right">USD · 1 股正股 = 10 份 ADR</span></div>
-    {quoteError && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />{quoteError}</div>}
+    <div className="data-status" role="status"><span className="status-left"><Clock3 size={14} aria-hidden="true" />{quoteDisplay.label}{quote && ` ${date(quote.fetchedAt, true)} ${new Date(quote.fetchedAt).toISOString().slice(11, 19)} UTC`}</span><span className="status-right">USD · 1 股正股 = 10 份 ADR</span></div>
+    {quoteDisplay.notice && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />{quoteDisplay.notice}</div>}
     {error && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />历史行情：{error}{data ? ' 当前保留上次成功加载的数据。' : ''}</div>}
     {candleLive.notice && <div className="notice" role="status"><Info size={16} aria-hidden="true" />{candleLive.notice}</div>}
     {candleLive.cached && data ? <div className="notice"><Info size={16} aria-hidden="true" />图表显示本地缓存，行情采集于 {stamp(data.fetchedAt)}。</div>

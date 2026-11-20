@@ -7,6 +7,7 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { SvgPlot, type PlotLayer } from './svg-plot.tsx';
 import { niceAxis } from './svg-plot-geometry.ts';
 import { useLiveResource } from './use-live-resource.ts';
+import { readFailure } from './live-resource.ts';
 import { MIN_MONTHLY_SPAN_DAYS, formatGain, formatReturnRate, performanceTone } from '../../src/asset/performance-metrics.ts';
 import { DAILY_CHANGE_DAYS } from '../../src/asset/daily-changes.ts';
 import { POSITION_GROUPS, type PositionAnalysis } from '../../src/asset/daily-positions.ts';
@@ -118,6 +119,7 @@ function DailyChanges({ version, writer, onExpired }: { version: string; writer:
   // A change while closed is read when the report opens again.
   useEffect(() => { if (!open || seen.current === version) return; seen.current = version; void refresh(); }, [version, open, refresh]);
   const loading = open && status === 'loading';
+  const failure = readFailure({ error, status });
   const days = report?.days ?? [];
   return <details className="performance-monthly daily-changes" onToggle={event => setOpen(event.currentTarget.open)}>
     <summary>每日波动 <span>（近 {DAILY_CHANGE_DAYS} 天{report ? ' · ' + days.length + ' 日' : ''}）</span>与来源</summary>
@@ -125,8 +127,8 @@ function DailyChanges({ version, writer, onExpired }: { version: string; writer:
       {open ? <CashFlows version={version} writer={writer} onExpired={onExpired} /> : null}
       <p className="performance-note">逐日对比上一份已有快照，缺失日期不补造。来源为各资产行估值变化，展开可看交易所按账户、币种的分项；出金单列并加回，与“剔除出金影响”口径一致。入金未剔除，资产变化不等于投资收益。</p>
       <p className="performance-note">持仓影响按资产已接入的合约分组，Hyperliquid 覆盖 xyz 和 io。金额以 USD 显示，含浮盈亏变化和可比的已实现盈亏、手续费及资金费。“部分”表示只统计了能核对的金额，“—”表示缺少可比数据。</p>
-      {open && error && !loading ? <p className="error-text" role="alert">{error.message}{report ? '，当前显示上次读取结果' : null} <button type="button" className="text-button" onClick={() => void refresh()}>重试</button></p> : null}
-      {!report ? (loading ? <p className="help" role="status">读取每日波动…</p> : null)
+      {open && failure ? <p className="error-text" role="alert">{failure}{report ? '，当前显示上次读取结果' : null} <button type="button" className="text-button" disabled={loading || status === 'offline'} onClick={() => void refresh()}>{loading ? '正在重试' : '重试'}</button></p> : null}
+      {!report ? (loading && !failure ? <p className="help" role="status">读取每日波动…</p> : null)
         : !days.length ? <p className="help">近 {DAILY_CHANGE_DAYS} 天不足两份快照，暂无逐日变化。</p>
         : <ol className="daily-change-list" aria-label="每日波动明细，按日期从新到旧" aria-busy={loading}>{days.map(day => {
           const all = dailyItems(day), isOpen = expanded === day.date, shown = isOpen ? all : all.slice(0, 3);
@@ -166,6 +168,7 @@ function AuditTrail({ id, audit }: { id: string; audit: readonly CashFlowRecord[
 /** The workbench's 净资金流标注 (cash-flows-panel.tsx at 0014655): the audit, newest business day first, 20 a page. */
 function CashFlows({ version, writer, onExpired }: { version: string; writer: Writer; onExpired: () => void }) {
   const { data, error, status, refresh, commit } = useLiveResource<AssetCashFlowsView>(CASH_FLOWS_PATH, { intervalMs: null, timeoutMs: READ_TIMEOUT_MS, onExpired });
+  const failure = readFailure({ error, status });
   const [page, setPage] = useState(0), [draft, setDraft] = useState<CashFlowInput | null>(null);
   const seen = useRef(version);
   useEffect(() => { if (seen.current === version) return; seen.current = version; void refresh(); }, [version, refresh]);
@@ -176,7 +179,7 @@ function CashFlows({ version, writer, onExpired }: { version: string; writer: Wr
   const save = () => { if (draft) void writer.run<AssetCashFlowsView>(CASH_FLOWS_PATH, draft, result => { if (result && 'audit' in result) commit(result); setDraft(null); }); };
   return <section className="cash-flows" aria-label="净资金流标注">
     <h4>净资金流标注</h4><p className="performance-note">账户用稳定、可辨认的标识；日期按北京时间。正数为流入、负数为流出。仅标注已有凭证，不会转账或修改余额。内部转账使用相同配对编号，单侧、重复候选或跨日保持待配对。旧出金登记独立保留。</p>
-    {error && status !== 'loading' ? <p role="alert" className="error-text">{error.message} <button type="button" className="text-button" onClick={() => void refresh()}>重新读取</button></p> : null}
+    {failure ? <p role="alert" className="error-text">{failure}{data ? '，当前显示上次读取结果' : null} <button type="button" className="text-button" disabled={status === 'loading' || status === 'offline'} onClick={() => void refresh()}>{status === 'loading' ? '正在重试' : '重新读取'}</button></p> : null}
     {!draft ? <p><button type="button" className="button" disabled={writer.busy || !data} onClick={() => open({ id: newRequestId(), revision: 0, date: businessDay(Date.now()), account: '', currency: 'USD', amount: '', kind: 'external', transferId: null, usdRate: null, rateAt: null, reference: '', reason: '', void: false })}>登记资金流</button></p> : null}
     {draft ? <div className="panel edit-panel" role="group" aria-label={draft.revision > 0 ? '修改资金流标注' : '登记资金流'}>
       <form className="form-grid" onSubmit={event => { event.preventDefault(); save(); }}>
@@ -195,7 +198,7 @@ function CashFlows({ version, writer, onExpired }: { version: string; writer: Wr
         <div className="form-actions"><button type="button" className="button" disabled={writer.busy} onClick={() => setDraft(null)}>取消</button><button className="button primary" disabled={writer.busy}>{writer.busy ? '保存中…' : '保存标注'}</button></div>
       </form>
     </div> : null}
-    {!data && !error ? <p className="help" role="status">读取资金流标注…</p> : null}
+    {!data && !failure ? <p className="help" role="status">读取资金流标注…</p> : null}
     {data && !rows.length ? <p className="help">还没有资金流标注。</p> : null}
     <ol start={current * CASH_FLOW_PAGE + 1}>{rows.slice(current * CASH_FLOW_PAGE, (current + 1) * CASH_FLOW_PAGE).map(row => <li key={row.id}>
       {row.date} · {row.account} · {row.amount} {row.currency} · {evidenceStatus(row)} · {row.reference}

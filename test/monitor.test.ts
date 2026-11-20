@@ -318,6 +318,11 @@ test('HTTP：行情监控三个接口未登录 401、未配置 404、尚无数�
       const bad = await get(`/api/monitor/anthropic/candles?days=${days}`);
       assert.deepEqual([bad.status, bad.body.code], [400, 'invalid_days'], days);
     }
+    for (const leg of ['binance', 'xyz', 'io', 'rh'] as const) venues.down.add(leg);
+    await Promise.all([runtime.anthropic!.refreshQuote(), runtime.anthropic!.refreshCandles()]);
+    assert.equal((await get('/api/monitor/anthropic/quote')).body.code, 'quote_unavailable');
+    assert.equal((await get('/api/monitor/anthropic/candles?known=')).body.code, 'candles_unavailable');
+    venues.down.clear();
     await runtime.anthropic!.refreshQuote();
     await runtime.anthropic!.refreshCandles();
     const quote = await get('/api/monitor/anthropic/quote');

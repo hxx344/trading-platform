@@ -135,6 +135,7 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
       if (!ANTHROPIC_LEG_KEYS.some(key => work[key] && !batch.errors[key])) {
         legErrors = errors;
         if (candles) candles = { ...candles, metadata: { ...candles.metadata, errors } };
+        else candleError = '本轮请求的行情源均未取得 K 线';
         candlesRestored = false;
         return;
       }

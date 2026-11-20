@@ -64,7 +64,7 @@ export function AssetPositions({ onExpired }: { onExpired: () => void }) {
   if (live.error instanceof ApiError && live.error.status === 404) return <StatePanel kind="empty" title="本服务没有配置资产账本" detail="在「设置」页「从工作台导入」启用资产账本后，这里显示各交易所账户的持仓。" />;
   const offline = status === 'offline';
   const reading = status === 'loading';
-  const error = status === 'error' && live.error ? live.error.message : '';
+  const error = offline ? '网络已断开，恢复连接后自动更新。' : live.error?.message;
   const changeFilter = (key: keyof Filters, value: string) => setFilters({ ...filters, [key]: value, ...(key === 'exchange' ? { account: '' } : {}) });
   const now = Date.now();
   const stale = offline || status === 'paused' || !!error || !!data && oldTime(data.generatedAt, now);
@@ -77,9 +77,8 @@ export function AssetPositions({ onExpired }: { onExpired: () => void }) {
   const issues = exchanges.some(exchange => exchange.accounts.some(account => account.scopes.some(scope => scope.status !== 'live' || oldTime(scope.fetchedAt, now))));
   return <div className="positions-page">
     <div className="trading-toolbar"><p className="positions-readonly"><ShieldCheck size={15} /><span>资产账本已接入的持仓 · 只读查看，账户在资产页管理</span></p><button type="button" className="button secondary" onClick={() => void live.refresh()} disabled={reading || offline}>{reading ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}刷新仓位</button></div>
-    {offline ? <Callout tone="warning" role="status">网络已断开，当前显示最后读取的旧值；连接恢复后自动更新。</Callout> : null}
-    {error ? <Callout tone="warning">{error}{data ? ' 当前保留上次数据，已标记为旧值。' : ''}</Callout> : null}
-    {data && reading ? <Callout tone="info">已显示上次读取的仓位，正在后台更新。</Callout> : null}
+    {data && error ? <Callout tone="warning">{error} 当前保留上次数据，已标记为旧值。</Callout> : null}
+    {data && reading && !error ? <Callout tone="info">已显示上次读取的仓位，正在后台更新。</Callout> : null}
     {data ? <>
       <div className={`positions-overview ${stale || issues ? 'attention' : ''}`} role="status"><span>{stale ? '当前显示旧值' : issues ? '部分账户待核对' : '仓位状态已更新'}</span><small>服务读取：{formatDate(data.generatedAt)}（北京时间）· 每 5 秒检查更新</small></div>
       <div className="positions-sources" aria-label="资产账本数据来源"><section className="positions-source"><div><strong>本服务资产账本</strong><span className={`positions-status ${stale ? 'stale' : 'live'}`}>{stale ? '来源旧值' : '来源已连接'}</span></div><p>来源读取：{formatDate(data.generatedAt)}（北京时间）</p><a className="positions-project-link" href="#/asset" aria-label="在资产页管理账户">在资产页管理账户<ArrowUpRight size={15} /></a></section></div>

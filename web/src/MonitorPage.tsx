@@ -16,7 +16,7 @@ import { MovesPanel } from './MonitorMoves.tsx';
 import { NEWS_PATH, NEWS_READ_TIMEOUT_MS, parseFlash, type FlashView } from './news.ts';
 import { StatePanel } from './StateViews.tsx';
 import { useLiveResource } from './use-live-resource.ts';
-import { mainQuoteRetention, quoteIsCurrent } from './monitor-display.ts';
+import { mainQuoteDisplay, mainQuoteRetention, monitorReadError } from './monitor-display.ts';
 import './monitor.css';
 
 // The market monitor page, laid out as the workbench's Anthropic detail (modules/monitor/app/anthropic-panel.tsx and
@@ -49,10 +49,6 @@ const native = (v: number | null | undefined) => v == null ? '—' : v.toLocaleS
 const signed = (v: number | null | undefined, suffix = '%') => v == null ? '—' : `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(v).toFixed(2)}${suffix}`;
 const fundingText = (v: number | null | undefined) => v == null ? '—' : `${v >= 0 ? '' : '−'}${Math.abs(v * 100).toFixed(4)}%`;
 const legName = (key: string) => ANTHROPIC_LEGS[key as keyof typeof ANTHROPIC_LEGS]?.name ?? key;
-// 503 means the service has not collected anything yet: still loading rather than failed.
-const notReady = (error: Error | null) => error instanceof ApiError && error.status === 503;
-// Validation errors are internal English text; only the service's (Chinese) messages are shown as they are.
-const readable = (error: Error, fallback: string) => /[一-鿿]/.test(error.message) ? error.message : fallback;
 
 const MARKET_TABS: Record<string, string> = { anthropic: 'Anthropic', oil: '原油', hynix: '海力士', perpetual: '合约价差', moves: '异动行情' };
 /** EQN 异动行情（docs/news.md）：不是服务端的监控市场，没有运行开关；/api/news 有应答时排在最后。 */
@@ -137,11 +133,8 @@ function AnthropicPanel({ outstanding, diluted, onExpired }: { outstanding: numb
   const candleLive = useMonitorCandles(anthropicCandles, requestedRange, ANTHROPIC_WARMUP_DAYS, onExpired, quoteLive.error);
   const { data, range } = candleLive;
   const quote = quoteLive.data;
-  const currentQuote = quoteIsCurrent(quoteLive, QUOTE_MS);
-  const quoteFailed = quoteLive.error !== null && !(quote === null && notReady(quoteLive.error));
-  const quoteError = quoteFailed ? '实时报价更新失败，10 秒后自动重试；请留意报价获取时间。' : quote?.status === 'snapshot' ? '后台尚未取得新报价，显示上次保存的数据；请留意采集时间。' : '';
-  const historyFailed = candleLive.error !== null && !(data === null && notReady(candleLive.error));
-  const error = historyFailed && candleLive.error ? readable(candleLive.error, '15 分钟 K 线校验失败，将在下一轮自动重试。') : '';
+  const quoteDisplay = mainQuoteDisplay(quoteLive, QUOTE_MS);
+  const error = monitorReadError(candleLive.error, data !== null, '15 分钟 K 线校验失败，将在下一轮自动重试。');
   const loading = refreshing || (quote === null && quoteLive.error === null) || (data === null && candleLive.error === null);
   const { refresh: refreshQuote } = quoteLive, { refresh: refreshCandles } = candleLive;
   const refresh = useCallback(() => {
@@ -165,14 +158,14 @@ function AnthropicPanel({ outstanding, diluted, onExpired }: { outstanding: numb
   const legErrors = quote ? Object.entries(quote.errors).map(([key, message]) => `${legName(key)}：${message}`) : [];
   // Candle reads fail per leg; only the legs this chart compares matter here.
   const candleErrors = data ? (['binance', leg] as const).flatMap(key => data.errors[key] ? [`${legName(key)}：${data.errors[key]}`] : []) : [];
-  const historyPending = data === null && !historyFailed;
+  const historyPending = data === null && !error;
   const contract = ANTHROPIC_LEGS[leg], symbol = contract.symbol, rhLeg = leg === 'rh';
   const comparisonShares = anthropicSharesPerUnit(leg, shares);
   return <DetailLayout side={<RelatedPositions market="anthropic" onExpired={onExpired} />}>
       <div className="page-heading detail-toolbar"><div className="toolbar-identity"><div className="eyebrow">ANTHROPIC <span>/</span> ANTHROPICUSDT · {contract.label}</div><h1>Anthropic 价差<span className="small-tag">每股口径</span></h1><p>Binance 相对 {contract.label} 的每股溢价 · 15 分钟 K 线</p></div><div className="refresh-area"><div className="segmented" role="group" aria-label="对比合约">{ANTHROPIC_COMPARISON_LEGS.map(key => <button type="button" key={key} aria-pressed={leg === key} className={leg === key ? 'active' : ''} onClick={() => setLeg(key)}>{ANTHROPIC_LEGS[key].name}</button>)}</div><button type="button" className="refresh-button" onClick={refresh} disabled={loading}><RefreshCw size={15} className={loading ? 'spinning' : ''} aria-hidden="true" />{loading ? '加载行情' : '刷新行情'}</button><span>每 10 秒自动刷新</span></div></div>
-      <div className="data-status" role="status"><span className="status-left"><Clock3 size={14} aria-hidden="true" />{quote ? `${quoteError ? '实时更新中断 · 上次获取' : currentQuote ? '实时报价 · 获取于' : '上次报价 · 采集于'} ${date(quote.fetchedAt, true)} ${new Date(quote.fetchedAt).toISOString().slice(11, 19)} UTC` : quoteFailed ? '实时报价暂不可用 · 每 10 秒自动重试' : '正在获取实时报价 · 每 10 秒自动刷新'}</span><span className="status-right">USD · 每股标记价格</span></div>
+      <div className="data-status" role="status"><span className="status-left"><Clock3 size={14} aria-hidden="true" />{quoteDisplay.label}{quote && ` ${date(quote.fetchedAt, true)} ${new Date(quote.fetchedAt).toISOString().slice(11, 19)} UTC`}</span><span className="status-right">USD · 每股标记价格</span></div>
       <div className="notice" role="status"><Info size={16} aria-hidden="true" />{sharesNote}</div>
-      {quoteError && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />{quoteError}</div>}
+      {quoteDisplay.notice && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />{quoteDisplay.notice}</div>}
       {legErrors.length > 0 && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />部分行情缺失：{legErrors.join('；')}。缺失一侧时不计算溢价。</div>}
       {error && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />历史更新中断：{error}{data ? ' 当前保留上次成功加载的数据。' : ''}</div>}
       {candleErrors.length > 0 && <div className="notice error" role="alert"><Info size={16} aria-hidden="true" />K 线更新失败：{candleErrors.join('；')}。图表保留已保存的收盘价，之后的时段会断开，下一轮自动重试。</div>}

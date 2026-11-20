@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createResourceStore, type DisplayRetention, type ResourceSnapshot } from '../web/src/live-resource.ts';
-import { displayExchangeQuote, exchangeHistoryRetention, exchangeQuoteRetention, fundingRetention, mainQuoteRetention, quoteIsCurrent } from '../web/src/monitor-display.ts';
+import { createResourceStore, readFailure, type DisplayRetention, type ResourceSnapshot } from '../web/src/live-resource.ts';
+import { displayExchangeQuote, exchangeHistoryRetention, exchangeQuoteRetention, fundingRetention, mainQuoteDisplay, mainQuoteRetention, quoteIsCurrent } from '../web/src/monitor-display.ts';
+import { ApiError } from '../web/src/api.ts';
 import { hyperliquidOilQuote } from '../src/vendor/exchange-comparison.mjs';
 import type { ExchangeFundingHistory } from '../src/vendor/exchange-funding-history.mjs';
 
@@ -10,6 +11,23 @@ const iso = (time: number) => new Date(time).toISOString();
 const flush = () => new Promise<void>(resolve => setImmediate(resolve));
 const sample = (fetchedAt = base) => ({ fetchedAt: iso(fetchedAt), status: 'live' as const, lastError: null, staleAfterMs: 35_000 });
 type Sample = ReturnType<typeof sample>;
+
+test('报价首读区分等待、采集失败和连接失败，旧报价重试时沿用来源时间', () => {
+  const live: ResourceSnapshot<Sample> = { data: null, status: 'loading', error: null, receivedAt: null };
+  assert.match(mainQuoteDisplay(live, 10_000).label, /正在获取/);
+  live.error = new ApiError('后台正在采集', 503, 'not_ready');
+  assert.match(mainQuoteDisplay(live, 10_000).label, /等待后台首次报价/);
+  for (const code of ['quote_unavailable', 'execution_unavailable']) {
+    live.error = new ApiError('行情暂不可用', 503, code);
+    assert.deepEqual(mainQuoteDisplay(live, 10_000), { current: false, label: '实时报价暂不可用 · 每 10 秒自动重试', notice: '行情暂不可用' });
+  }
+  live.data = sample();
+  assert.match(mainQuoteDisplay(live, 10_000).label, /上次获取/);
+  live.error = null;
+  live.status = 'ready';
+  assert.equal(mainQuoteDisplay({ ...live, data: { ...sample(), status: 'snapshot' } }, 10_000).current, false);
+  assert.equal(mainQuoteDisplay({ ...live, data: sample(Date.now()) }, 10_000).current, true);
+});
 
 function fixture() {
   let now = base, online = true, wake: (() => void) | undefined;
@@ -110,6 +128,20 @@ test('private subscriptions always recheck on entry, and retained history is bou
   const old = h.watch('hynix', history); h.requests.at(-1)!.resolve(sample()); await flush(); old.leave();
   h.advance(30 * 60_000);
   assert.equal(h.watch('hynix', history).value().data, null);
+});
+
+test('旧成交和关联持仓在失败后的补读期间仍显示读取失败，直到新结果到达', async () => {
+  const h = fixture(), trades = h.watch('/api/asset/fills?market=hynix');
+  h.requests[0].resolve(sample()); await flush();
+  h.advance(10_000);
+  h.requests[1].reject(new Error('读取暂不可用')); await flush();
+  h.advance(10_000);
+  assert.equal(trades.value().status, 'loading');
+  assert.equal(trades.value().data?.fetchedAt, iso(base));
+  assert.equal(readFailure(trades.value()), '读取暂不可用');
+  h.requests[2].resolve(sample(base + 20_000)); await flush();
+  assert.equal(readFailure(trades.value()), null);
+  trades.leave();
 });
 
 test('quote errors, settlement boundaries and individual source deadlines constrain reuse', () => {

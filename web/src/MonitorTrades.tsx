@@ -8,6 +8,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { ApiError } from './api.ts';
 import { useLiveResource } from './use-live-resource.ts';
+import { readFailure } from './live-resource.ts';
 import { FILLS_FOLLOW_UP_MS, FILLS_REFRESH_MS, FOLLOW_UP_IDLE, TRADE_TEXT, TRADE_TYPES, emptyFillsView, fillsPending, followUpStep, fillItems, fillsStatusText, spreadText, summarizeTradeEvents, tradeDetailLines, type FillsView, type SpreadTradeMarker, type TradeSummary, type TradeType } from './monitor-trades.ts';
 import type { FillMarket, HubFills } from '../../src/asset/fills-types.ts';
 
@@ -29,7 +30,7 @@ export function useFills(market: FillMarket, onExpired: () => void): FillsView {
     setFollowUp(step.current.follow);
   }, [receivedAt, error]); // once per reply: data is read with the reply it came with
   const missing = live.error instanceof ApiError && live.error.status === 404;
-  const failed = live.status === 'error' || live.status === 'offline';
+  const failed = readFailure(live) !== null;
   return useMemo(() => missing ? emptyFillsView('missing') : data ? { status: 'ok', ...fillItems(data, Date.now(), market), retained: failed } : failed ? emptyFillsView('unavailable') : emptyFillsView('loading'), [missing, data, failed, market]);
 }
 

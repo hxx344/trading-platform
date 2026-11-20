@@ -192,3 +192,142 @@ test('首次进入资产页可在慢同步完成前读取保存的账本与历�
     assert.deepEqual(await Promise.all([ledger, history]), [{ source: '/api/asset/ledger' }, { source: '/api/asset/history' }]);
   } finally { finish(); await background; }
 });
+
+function gate() {
+  let open!: () => void;
+  const wait = new Promise<void>(resolve => { open = resolve; });
+  return { wait, open };
+}
+
+test('估值同步完成或切页取消时，受影响的展示读在原时限内重新核对，行情读继续', async t => {
+  for (const cancelled of [false, true]) await t.test(cancelled ? '切出资产页' : '同步完成', async t => {
+    const reads = ['/api/asset/positions', '/api/asset/fills?market=hynix', '/api/asset/ledger', '/api/monitor/hynix/quote'];
+    const oldReads = gate(), finishSync = gate();
+    const signals = new Map<string, AbortSignal[]>();
+    t.mock.method(globalThis, 'fetch', async (path: string, init: RequestInit) => {
+      if (path === '/api/asset/sync') { await finishSync.wait; init.signal!.throwIfAborted(); return Response.json({}); }
+      const attempts = signals.get(path) ?? [];
+      signals.set(path, attempts);
+      attempts.push(init.signal!);
+      const observed = attempts.length;
+      if (observed === 1) await oldReads.wait;
+      return Response.json({ observed });
+    });
+    const controller = new AbortController();
+    const sync = api('/api/asset/sync', { body: {}, signal: controller.signal });
+    const results = reads.map(path => api<{ observed: number }>(path));
+    if (cancelled) controller.abort();
+    finishSync.open();
+    if (cancelled) await assert.rejects(sync, { name: 'AbortError' });
+    else await sync;
+    oldReads.open();
+    assert.deepEqual((await Promise.all(results)).map(view => view.observed), [2, 2, 2, 1]);
+    for (const path of reads.slice(0, 3)) {
+      const attempts = signals.get(path)!;
+      assert.equal(attempts.length, 2);
+      assert.equal(attempts[0], attempts[1]);
+    }
+  });
+});
+
+test('补读再次遇到写入时有界退出，拒绝访问、换账户或页面中止时不重放迟到应答', async t => {
+  const path = '/api/asset/positions';
+  for (const event of ['write', 'denied', 'account', 'abort'] as const) await t.test(event, async t => {
+    const oldRead = gate(), retryStarted = gate(), finishRetry = gate();
+    const controller = new AbortController();
+    let reads = 0;
+    t.mock.method(globalThis, 'fetch', async (url: string) => {
+      if (url !== path) return Response.json({});
+      reads++;
+      if (reads === 1) { await oldRead.wait; return Response.json({ owner: 'previous' }); }
+      retryStarted.open();
+      await finishRetry.wait;
+      return event === 'denied' ? Response.json({ code: 'forbidden' }, { status: 403 }) : Response.json({ owner: 'current' });
+    });
+    const result = api(path, { signal: controller.signal });
+    await api('/api/asset/sync', { body: {} });
+    oldRead.open();
+    await Promise.race([retryStarted.wait, result.then(() => assert.fail('过时应答应触发补读'))]);
+    if (event === 'write') await api('/api/asset/sync', { body: {} });
+    if (event === 'account') await api('/api/asset/connections/delete', { body: {} });
+    if (event === 'abort') controller.abort();
+    finishRetry.open();
+    if (event === 'denied') await assert.rejects(result, (error: unknown) => error instanceof ApiError && error.status === 403);
+    else if (event === 'abort') await assert.rejects(result, { name: 'AbortError' });
+    else await assert.rejects(result, event === 'write' ? /持续更新/ : /重新读取/);
+    assert.equal(reads, 2);
+  });
+});
+
+test('旧正文解码时发生写入，补读得到服务端新值；随后换账户直接撤销待补读', async t => {
+  for (const changeAccount of [false, true]) await t.test(changeAccount ? '更换账户' : '保持账户', async t => {
+    const decoding = gate(), finishBody = gate();
+    let reads = 0;
+    t.mock.method(globalThis, 'fetch', async (path: string) => {
+      if (path !== '/api/asset/history') return Response.json({});
+      if (++reads > 1) return Response.json({ amount: 2 });
+      const response = Response.json({ amount: 1 });
+      t.mock.method(response, 'text', async () => { decoding.open(); await finishBody.wait; return '{"amount":1}'; });
+      return response;
+    });
+    const result = api('/api/asset/history');
+    await decoding.wait;
+    await api('/api/asset/sync', { body: {} });
+    if (changeAccount) await api('/api/asset/connections/delete', { body: {} });
+    finishBody.open();
+    if (changeAccount) await assert.rejects(result, /重新读取/);
+    else assert.deepEqual(await result, { amount: 2 });
+    assert.equal(reads, changeAccount ? 1 : 2);
+  });
+});
+
+test('同范围写入之后迟到的短时失败可重读，拒权或范围变更直接交付服务端状态', async t => {
+  for (const status of [503, 401, 403, 404, 409, 423]) await t.test(String(status), async t => {
+    const oldRead = gate();
+    let reads = 0;
+    t.mock.method(globalThis, 'fetch', async (path: string) => {
+      if (path !== '/api/asset/positions') return Response.json({});
+      if (++reads > 1) return Response.json({ fresh: true });
+      await oldRead.wait;
+      return Response.json({ message: '上一轮应答' }, { status });
+    });
+    const result = api('/api/asset/positions');
+    await api('/api/asset/sync', { body: {} });
+    oldRead.open();
+    if (status === 503) assert.deepEqual(await result, { fresh: true });
+    else await assert.rejects(result, (error: unknown) => error instanceof ApiError && error.status === status);
+    assert.equal(reads, status === 503 ? 2 : 1);
+  });
+});
+
+test('原表预览允许账本历史继续读取，确认导入撤销旧账本的应答', async t => {
+  const path = '/api/asset/history';
+  for (const apply of [false, true]) await t.test(apply ? '确认导入' : '只读预览', async t => {
+    const oldRead = gate();
+    let reads = 0;
+    t.mock.method(globalThis, 'fetch', async (url: string) => {
+      if (url !== path) return Response.json({ preview: !apply });
+      reads++; await oldRead.wait;
+      return Response.json({ owner: 'old' });
+    });
+    const read = api(path);
+    await api('/api/asset/import', { body: { source: {}, apply } });
+    oldRead.open();
+    if (apply) await assert.rejects(read, /重新读取/);
+    else assert.deepEqual(await read, { owner: 'old' });
+    assert.equal(reads, 1);
+  });
+});
+
+test('一次性原表预览的坏正文和超时提示重选文件，确认导入超时保留结果未知', async t => {
+  const path = '/api/asset/import';
+  const mock = t.mock.method(globalThis, 'fetch', async () => new Response(''));
+  await assert.rejects(api(path, { body: { apply: false } }), /重新选择文件/);
+  mock.mock.mockImplementation((_url: unknown, init: RequestInit = {}) => new Promise<Response>((_, reject) => {
+    const signal = init.signal;
+    assert.ok(signal);
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+  }));
+  await assert.rejects(api(path, { body: { apply: false }, timeoutMs: 5 }), /预览超时，请重新选择文件/);
+  await assert.rejects(api(path, { body: { apply: true }, timeoutMs: 5 }), /结果未知/);
+});

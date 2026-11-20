@@ -13,6 +13,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { ArrowUpRight, Link2 } from 'lucide-react';
 import { ApiError } from './api.ts';
 import { useLiveResource } from './use-live-resource.ts';
+import { readFailure } from './live-resource.ts';
 import { RELATED_SYMBOLS, pairedMarket, positionItems, relatedSpreadPairs, type RelatedMarket, type RealizedStatus, type RelatedItem, type SpreadPair, type UnpairedReason, type VenueSpreads } from './monitor-related.ts';
 import type { FillMarket } from '../../src/asset/fills-types.ts';
 import type { CycleEvidence, HubPositions } from '../../src/asset/positions-types.ts';
@@ -136,7 +137,7 @@ export function RelatedPositions({ market, spreads, onExpired }: { market: Relat
   const [followUp, setFollowUp] = useState(false);
   const live = useLiveResource<HubPositions>(RELATED_PATH, { intervalMs: followUp ? POSITIONS_FOLLOW_UP_MS : POSITIONS_REFRESH_MS, timeoutMs: POSITIONS_TIMEOUT_MS, onExpired });
   const missing = live.error instanceof ApiError && live.error.status === 404;
-  const failed = live.status === 'error' || live.status === 'offline';
+  const failed = readFailure(live) !== null;
   const snapshot = live.data ? { generatedAt: live.data.generatedAt, ...positionItems(live.data, RELATED_SYMBOLS[market], Date.now()) } : null;
   const shown = snapshot?.items ?? [];
   // A leg whose current-round statistics are still being read is read again sooner (the workbench's positionsFollowUp).

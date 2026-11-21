@@ -62,7 +62,8 @@ export function planMonitor(source: MonitorSource, config: Json, fits: (candidat
     item.markets = monitorMarkets(parsed);
     current = config.monitor as Json;
   }
-  const missing = MONITOR_MARKETS.filter(market => current[market] === undefined);
+  // `oil` already runs the gold/oil ratio (monitor-config.ts, M-2g): no explicit `goldoil` is written beside it.
+  const missing = MONITOR_MARKETS.filter(market => current[market] === undefined && !(market === 'goldoil' && current.oil !== undefined));
   const names = (markets: readonly string[]) => markets.map(market => MONITOR_LABELS[market as keyof typeof MONITOR_LABELS]).join('、');
   if (!missing.length) {
     item.detail = `已启用（${names(item.markets)}；流通 ${item.shares.outstanding} / 完全稀释 ${item.shares.diluted} 十亿股），保留现有设置`;
@@ -79,7 +80,7 @@ export function planMonitor(source: MonitorSource, config: Json, fits: (candidat
       : market === 'goldoil' ? '金油比（每 30 秒读报价、每 60 秒读 K 线，Binance 的公开行情）'
       : market === 'hynix' ? '海力士溢价（每 10 秒读报价、每 60 秒读 K 线，Hyperliquid 的公开行情）'
         : '合约价差（11 家交易所永续合约的公开盘口，常驻约 20 条 WebSocket，报价只在内存，不写数据库）');
-  item.detail = `${item.enabled ? `补上 ${reads.join('、')}，已有的${names(MONITOR_MARKETS.filter(market => current[market] !== undefined))}保留现有设置` : reads.join('、')}；不需要密钥`;
+  item.detail = `${item.enabled ? `补上 ${reads.join('、')}，已有的${names(MONITOR_MARKETS.filter(market => current[market] !== undefined || (market === 'goldoil' && current.oil !== undefined)))}保留现有设置` : reads.join('、')}；不需要密钥`;
   if (missing.includes('anthropic')) notes.push('行情监控的股数取默认值：工作台的股数设置只存在浏览器里，没有带过来；要改股数请改 config.json 的 monitor.anthropic.shares 后执行 sudo bash install.sh');
   if (source.workbench && missing.some(market => market !== 'perpetual')) notes.push('工作台 Monitor 模块的本地行情记录不导入；本服务启用后从交易所回补（Anthropic 最近约 50 天，原油从 2026-04-01 起，金油比从三个合约的共同上架时间起，海力士从 2026-07-10 上市起，最多最近 5000 小时）');
   return item;

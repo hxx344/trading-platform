@@ -149,6 +149,10 @@ test('配置与接口：monitor.goldoil 不带设置；未配置 404，首轮前
   const config = parseServiceConfig({ secretsFile, monitor: { goldoil: {} } });
   assert.deepEqual(config.monitor, { goldoil: {} });
   assert.equal(monitorSummary(config.monitor), '，行情监控 金油比（Binance XAU ÷ WTI / 布伦特）');
+  // M-2g: the oil spread brings the ratio along unless goldoil is written; the summary lists it.
+  assert.deepEqual(parseServiceConfig({ secretsFile, monitor: { oil: {} } }).monitor, { oil: {}, goldoil: {} });
+  assert.deepEqual(parseServiceConfig({ secretsFile, monitor: { hynix: {} } }).monitor, { hynix: {} });
+  assert.match(monitorSummary(parseServiceConfig({ secretsFile, monitor: { oil: {} } }).monitor), /原油价差.*金油比/);
   for (const goldoil of [{ refreshMs: 1 }, null, 1, []]) assert.throws(() => parseServiceConfig({ secretsFile, monitor: { goldoil } }), /monitor/, JSON.stringify(goldoil));
 
   const dir = mkdtempSync(join(tmpdir(), 'tp-monitor-goldoil-http-'));

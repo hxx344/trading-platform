@@ -327,9 +327,9 @@ test('永久缺口：交易所始终不给的 K 线不让每轮都从缺口处�
 test('配置与接口：monitor.oil 不带设置；只配原油时 Anthropic 接口 404；原油接口 503 → 200，days 校验同 Anthropic', async () => {
   const secretsFile = '/etc/tp/secrets.json';
   const config = parseServiceConfig({ secretsFile, monitor: { oil: {} } });
-  assert.deepEqual([config.monitor, config.pairs], [{ oil: {} }, []]);
-  assert.equal(monitorSummary(config.monitor), '，行情监控 原油价差（Binance 布伦特 − WTI）');
-  assert.equal(monitorSummary(parseServiceConfig({ secretsFile, monitor: { anthropic: {}, oil: {} } }).monitor), '，行情监控 Anthropic 价差（流通股 12.7 十亿、完全稀释 16.7 十亿股）、原油价差（Binance 布伦特 − WTI）');
+  assert.deepEqual([config.monitor, config.pairs], [{ oil: {}, goldoil: {} }, []], '原油隐含金油比（M-2g）');
+  assert.equal(monitorSummary(config.monitor), '，行情监控 原油价差（Binance 布伦特 − WTI）、金油比（Binance XAU ÷ WTI / 布伦特）');
+  assert.equal(monitorSummary(parseServiceConfig({ secretsFile, monitor: { anthropic: {}, oil: {} } }).monitor), '，行情监控 Anthropic 价差（流通股 12.7 十亿、完全稀释 16.7 十亿股）、原油价差（Binance 布伦特 − WTI）、金油比（Binance XAU ÷ WTI / 布伦特）');
   for (const oil of [{ refreshMs: 1 }, null, 1, []]) assert.throws(() => parseServiceConfig({ secretsFile, monitor: { oil } }), /monitor/, JSON.stringify(oil));
 
   const dir = mkdtempSync(join(tmpdir(), 'tp-monitor-oil-'));
@@ -343,7 +343,7 @@ test('配置与接口：monitor.oil 不带设置；只配原油时 Anthropic 接
     const cookie = ((await fetch(`${base}/login?token=monitor-token-0002`, { redirect: 'manual' })).headers.get('set-cookie') ?? '').split(';')[0]!;
     const get = async (path: string) => { const response = await fetch(base + path, { headers: { cookie } }); return { status: response.status, body: await response.json() as Record<string, any> }; };
     assert.equal((await fetch(`${base}/api/monitor/oil/quote`)).status, 401);
-    assert.deepEqual(await get('/api/monitor/state'), { status: 200, body: { markets: ['oil'], anthropic: null, controls: { oil: { market: 'oil', enabled: true, revision: 0, error: null } } } });
+    assert.deepEqual(await get('/api/monitor/state'), { status: 200, body: { markets: ['oil', 'goldoil'], anthropic: null, controls: { oil: { market: 'oil', enabled: true, revision: 0, error: null }, goldoil: { market: 'goldoil', enabled: true, revision: 0, error: null } } } });
     for (const path of ['/api/monitor/anthropic/quote', '/api/monitor/anthropic/candles', '/api/monitor/anthropic/candles?days=x']) assert.deepEqual([(await get(path)).status, (await get(path)).body.message], [404, '本服务没有配置Anthropic行情监控'], path);
     assert.deepEqual([(await get('/api/monitor/oil/quote')).status, (await get('/api/monitor/oil/quote')).body.message], [503, '尚未取得原油报价，后台正在采集']);
     assert.equal((await get('/api/monitor/oil/candles?days=7')).status, 503);

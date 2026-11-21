@@ -13,7 +13,7 @@ import { createMonitorStore, MONITOR_FILE } from '../src/monitor/store.ts';
 import type { LoopContext } from '../src/monitor/anthropic.ts';
 import { parseServiceConfig } from '../src/service/config.ts';
 import { pendingImportKey } from '../src/monitor/alerts.ts';
-import { monitorLoops, monitorStatus, monitorViews, openMonitor, type MonitorRuntime } from '../src/service/monitor.ts';
+import { monitorLoops, monitorStatus, monitorViews, openMonitor, stopMonitor, type MonitorRuntime } from '../src/service/monitor.ts';
 import { createExecutorServer } from '../src/http.ts';
 import { disabledNotice, parseControl, parseControls, switchFailure, switchLabel, toggleBody } from '../web/src/monitor-control.ts';
 import { fakeAnthropicVenues } from './monitor-fake.ts';
@@ -171,7 +171,7 @@ test('接口：POST 开关须带页面请求标记，返回保存后的开关；
     assert.notEqual((await call('/api/monitor/hynix/alerts')).status, 423, '其他市场不受影响');
     const state = await call('/api/monitor/state');
     assert.deepEqual([state.status, state.body.controls.oil.enabled, state.body.controls.hynix.enabled], [200, false, true]);
-    assert.deepEqual(parseControls(state.body.controls, state.body.markets), { oil: { enabled: false, revision: 1, error: null }, hynix: { enabled: true, revision: 0, error: null } });
+    assert.deepEqual(parseControls(state.body.controls, state.body.markets), { oil: { enabled: false, revision: 1, error: null }, goldoil: { enabled: true, revision: 0, error: null }, hynix: { enabled: true, revision: 0, error: null } }, '原油隐含金油比，开关各自独立');
     assert.deepEqual(monitorStatus(runtime).controls?.oil, { market: 'oil', enabled: false, revision: 1, error: null });
     runtime.store.close();
     runtime = openMonitor(config, dir, { fetchImpl: venues.fetch, WebSocketImpl: venues.WebSocket, log: () => undefined, alertHooks: hooks });
@@ -212,7 +212,10 @@ test('循环：真实原油采集器关闭期间不发任何上游请求，开�
   const hooks = { notify: () => 1, delivery: () => new Map(), robot: () => 'feishu' as const, test: async () => undefined };
   const runtime = openMonitor(config, dir, { fetchImpl, WebSocketImpl: venues.WebSocket, log: () => undefined, alertHooks: hooks });
   try {
+    // `oil` brings the gold/oil ratio along (M-2g): it reads Binance too, so it is switched off for the count.
+    assert.ok(runtime.goldoil, '原油隐含金油比');
     runtime.control.update('oil', { enabled: false, revision: 0 });
+    runtime.control.update('goldoil', { enabled: false, revision: 0 });
     const before = runtime.alerts.oil!.view().revision;
     runtime.store.writeState(pendingImportKey('oil'), { version: 1, importedAt: new Date().toISOString(), source: 'workbench', config: { enabled: false, rules: [] } });
     const { context, stop } = fastContext();
@@ -224,7 +227,7 @@ test('循环：真实原油采集器关闭期间不发任何上游请求，开�
     runtime.control.update('oil', { enabled: true, revision: 1 });
     await until(() => requests > 0, '开启后恢复采集');
     stop();
-    runtime.oil?.stop();
+    stopMonitor(runtime);
     await Promise.all(loops);
-  } finally { runtime.store.close(); rmSync(dir, { recursive: true, force: true }); }
+  } finally { stopMonitor(runtime); runtime.store.close(); rmSync(dir, { recursive: true, force: true }); }
 });

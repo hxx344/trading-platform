@@ -1,6 +1,8 @@
 // The optional monitor part of config.json: which read-only market monitors run (M-1: the Anthropic premium, M-2a: the oil
 // spread, M-2b: the Hynix ADR premium, M-2f: the gold/oil ratio). No key is needed; the venues' public endpoints are read.
 // A release before M-2f (v0.73.0 and older) refuses `monitor.goldoil` as an unknown key: remove it before rolling back.
+// M-2g: `oil` brings the gold/oil ratio along when `goldoil` is not written (the ratio reads the same Binance oil contracts), so
+// a service that enabled monitoring before M-2f gets the tab without editing config.json; the page's switch turns it off.
 import { ContractError, exactKeys } from '../contracts.ts';
 import { ANTHROPIC_SHARES, type AnthropicShares } from '../vendor/anthropic-market.mjs';
 
@@ -9,7 +11,7 @@ export interface MonitorConfig {
   anthropic?: { shares: AnthropicShares };
   /** Brent − WTI on Binance; takes no settings. */
   oil?: Record<string, never>;
-  /** M-2f: XAU ÷ WTI and XAU ÷ Brent on Binance marks (XAUUSDT, CLUSDT, BZUSDT); takes no settings. */
+  /** M-2f: XAU ÷ WTI and XAU ÷ Brent on Binance marks (XAUUSDT, CLUSDT, BZUSDT); takes no settings. Implied by `oil` (M-2g). */
   goldoil?: Record<string, never>;
   /** Hyperliquid xyz:SKHY against xyz:SKHX; takes no settings. */
   hynix?: Record<string, never>;
@@ -28,7 +30,7 @@ const billions = (value: unknown, name: string): number => {
   return value;
 };
 
-/** { anthropic?: { shares?: { outstanding, diluted } }, oil?: {}, goldoil?: {}, hynix?: {}, perpetual?: {} }; at least one market. The share bounds are the workbench's. */
+/** { anthropic?: { shares?: { outstanding, diluted } }, oil?: {}, goldoil?: {}, hynix?: {}, perpetual?: {} }; at least one market; `oil` implies `goldoil`. The share bounds are the workbench's. */
 export function parseMonitorConfig(value: unknown): MonitorConfig {
   let raw: Record<string, unknown>;
   try { raw = exactKeys(value, [], [...MONITOR_MARKETS]); } catch (error) { throw new Error(`monitor 无效：${reason(error)}`); }
@@ -40,6 +42,7 @@ export function parseMonitorConfig(value: unknown): MonitorConfig {
     try { exactKeys(raw[market], []); } catch (error) { throw new Error(`monitor.${market} 无效（不带设置，写 {}）：${reason(error)}`); }
     config[market] = {};
   }
+  if (config.oil && !config.goldoil) config.goldoil = {};
   return config;
 }
 

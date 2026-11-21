@@ -57,8 +57,13 @@ test('行情监控导入：没有 monitor 时写入全部市场（默认股数�
   assert.match(kept.detail, /已启用（Anthropic 价差、原油价差、金油比、海力士溢价、合约价差.*保留现有设置/);
   // Only the oil spread configured: the Anthropic premium comes with the default shares.
   const oilOnly = { secretsFile: '/x/secrets.json', monitor: { oil: {} } };
-  assert.equal(planMonitor({ workbench: false }, oilOnly, fits, []).status, 'added');
-  assert.deepEqual(oilOnly.monitor, { oil: {}, anthropic: {}, goldoil: {}, hynix: {}, perpetual: {} });
+  const oilAdded = planMonitor({ workbench: false }, oilOnly, fits, []);
+  assert.equal(oilAdded.status, 'added');
+  assert.match(oilAdded.detail, /已有的原油价差、金油比保留现有设置/, '金油比随原油运行');
+  // The gold/oil ratio runs with the oil spread (M-2g), so no explicit goldoil key is written beside it.
+  const oilPlan = planMonitor({ workbench: false }, oilOnly, fits, []);
+  assert.deepEqual(oilOnly.monitor, { oil: {}, anthropic: {}, hynix: {}, perpetual: {} });
+  assert.deepEqual([oilPlan.status, oilPlan.markets], ['skipped', ['anthropic', 'oil', 'goldoil', 'hynix', 'perpetual']]);
   const broken = { secretsFile: '/x/secrets.json', monitor: { oil: { x: 1 } } };
   const refusedOld = planMonitor({ workbench: false }, broken, fits, []);
   assert.deepEqual([refusedOld.status, broken.monitor], ['skipped', { oil: { x: 1 } }]);

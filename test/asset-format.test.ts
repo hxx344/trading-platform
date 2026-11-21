@@ -2,7 +2,7 @@
 // the trend headline, the monthly hint, the order of the daily change lines and the wallet detail lines.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { badge, dailyItems, detailLine, fxView, monthlyHint, periodSource, statusTone, trendSummary } from '../web/src/asset-format.ts';
+import { badge, dailyItems, detailLine, fxView, monthlyHint, periodSource, statusTone, trendPlotPoints, trendSummary } from '../web/src/asset-format.ts';
 import type { Asset, Period } from '../src/asset/types.ts';
 import type { DailyChange } from '../src/asset/daily-changes.ts';
 import type { MonthlyPerformance } from '../src/asset/performance-metrics.ts';
@@ -38,6 +38,24 @@ test('资产页文案：走势首末点有缺失估值时不给变化额并说�
   assert.deepEqual([gap.change, gap.incomplete], [null, '起点 2026-11-01 有 2 项估值缺失']);
   assert.deepEqual(trendSummary([point('2026-11-01', 100, 1)]).incomplete, '起点 2026-11-01 有 1 项估值缺失', '只有一点时不重复说终点');
   assert.equal(trendSummary([]).change, null);
+});
+
+test('资产走势作图：跨度超过两个月每 3 天、超过半年每 7 天取一点，留首点、优先完整快照，不改数值', () => {
+  const at = (date: string, adjusted: number, missingValues = 0) => ({ date, time: Date.parse(date + 'T00:00:00+08:00'), adjusted, missingValues }) as unknown as TrendPoint;
+  const days = (from: string, count: number) => Array.from({ length: count }, (_, i) => at(new Date(Date.parse(from + 'T00:00:00Z') + i * 86_400_000).toISOString().slice(0, 10), 100 + i));
+  const short = days('2026-09-01', 60);
+  assert.equal(trendPlotPoints(short).length, 60, '两个月内保留每日');
+  const year = days('2026-01-01', 300);
+  const weekly = trendPlotPoints(year);
+  assert.equal(weekly[0], year[0]);
+  assert.equal(weekly.at(-1), year.at(-1));
+  assert.deepEqual(weekly.slice(1).map(point => point.adjusted).slice(-3), [385, 392, 399], '桶以最新快照为终点，每 7 天一点');
+  assert.equal(weekly.length, 44);
+  const mid = trendPlotPoints(days('2026-06-01', 90));
+  assert.deepEqual(mid.slice(-2).map(point => point.adjusted), [186, 189]);
+  const partial = [...year.slice(0, -1), at('2026-10-27', 1, 3)];
+  assert.equal(trendPlotPoints(partial).at(-1)!.adjusted, 398, '桶内最新快照估值不全时取较早的完整快照');
+  assert.deepEqual(trendPlotPoints([]), []);
 });
 
 test('资产页文案：上月表现的提示按快照数、间隔与收益率是否可算区分', () => {

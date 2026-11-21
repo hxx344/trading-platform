@@ -95,6 +95,30 @@ export function trendSummary(trend: readonly TrendPoint[]): { first: TrendPoint 
   return { first, last, change, incomplete };
 }
 
+const DAY_MS = 86_400_000;
+
+/** Days per chart point: weekly past half a year, every 3 days past two months, otherwise daily. */
+export const trendStepDays = (spanDays: number): number => spanDays > 180 ? 7 : spanDays > 60 ? 3 : 1;
+
+/**
+ * Thins the curve for drawing only, so the dense daily snapshots match the sparse imported columns. Buckets of
+ * trendStepDays end at the newest snapshot; each keeps its newest complete snapshot (its newest one if none is
+ * complete), and the first snapshot stays. The kept points are real snapshots, so a step from a deposit is not smeared.
+ */
+export function trendPlotPoints(trend: readonly TrendPoint[]): TrendPoint[] {
+  const first = trend[0], last = trend.at(-1);
+  if (!first || !last) return [];
+  const step = trendStepDays((last.time - first.time) / DAY_MS) * DAY_MS;
+  if (step === DAY_MS) return [...trend];
+  const kept = new Map<number, TrendPoint>();
+  for (const point of trend) {
+    const bucket = Math.floor((last.time - point.time) / step), held = kept.get(bucket);
+    if (!held || !point.missingValues || held.missingValues) kept.set(bucket, point);
+  }
+  const points = [...kept.values()];
+  return points[0] === first ? points : [first, ...points];
+}
+
 export function monthlyHint(month: MonthlyPerformance | null): string {
   return !month ? '上个自然月没有快照'
     : month.snapshotCount < 2 || month.daysSpan < MIN_MONTHLY_SPAN_DAYS ? `需要两个不同日期，首末快照间隔至少 ${MIN_MONTHLY_SPAN_DAYS} 天`

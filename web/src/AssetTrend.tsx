@@ -15,7 +15,7 @@ import { businessDay, type CashFlowInput, type CashFlowRecord } from '../../src/
 import { newRequestId } from './request-ids.ts';
 import type { Writer } from './AssetPage.tsx';
 import type { AssetCashFlowsView, AssetDailyChangesView, AssetHistoryView, TrendPoint } from '../../src/asset/views.ts';
-import { CASH_FLOW_PAGE, amountTick, auditLine, dailyItems, dayTick, evidenceStatus, monthlyHint, signed, trendSummary, zhMoney } from './asset-format.ts';
+import { CASH_FLOW_PAGE, amountTick, auditLine, dailyItems, dayTick, evidenceStatus, monthlyHint, signed, trendPlotPoints, trendStepDays, trendSummary, zhMoney } from './asset-format.ts';
 
 export const DAILY_CHANGES_PATH = '/api/asset/daily-changes';
 export const CASH_FLOWS_PATH = '/api/asset/cash-flows';
@@ -37,11 +37,13 @@ function TrendTip({ point }: { point: TrendPoint }) {
 export const AssetTrend = memo(function AssetTrend({ history, version, writer, onHistory, onExpired }: { history: AssetHistoryView; version: string; writer: Writer; onHistory: () => void; onExpired: () => void }) {
   const { trend, monthly, annualized, today } = history;
   const { first, last, change, incomplete } = trendSummary(trend);
-  const axis = useMemo(() => { const values = trend.flatMap(point => [point.adjusted, point.held]); return niceAxis(Math.min(...values), Math.max(...values)); }, [trend]);
+  const plotted = useMemo(() => trendPlotPoints(trend), [trend]);
+  const step = first && last ? trendStepDays((last.time - first.time) / 86_400_000) : 1;
+  const axis = useMemo(() => { const values = plotted.flatMap(point => [point.adjusted, point.held]); return niceAxis(Math.min(...values), Math.max(...values)); }, [plotted]);
   const layers = useMemo(() => lines(trend.length === 1), [trend.length]);
   const month = annualized?.monthlyPeriod ?? null;
   return <section className="panel trend-panel">
-    <div className="panel-h"><h2>资产变化</h2><span className="panel-h-right">北京时间 · USD</span></div>
+    <div className="panel-h"><h2>资产变化</h2><span className="panel-h-right">北京时间 · USD{step > 1 ? ` · 每 ${step} 天一点` : null}</span></div>
     <div className="trend-summary">
       <span>剔除出金影响的区间变化</span>
       <strong className={change === null ? undefined : performanceTone(change)}>{change === null ? '—' : '$ ' + signed(change)}</strong>
@@ -49,8 +51,8 @@ export const AssetTrend = memo(function AssetTrend({ history, version, writer, o
     </div>
     <div className="trend-key"><span><i className="adjusted-line" />剔除出金影响</span><span><i className="held-line" />实际持有资产</span></div>
     {first && last ? <div className="chart">
-      <SvgPlot rows={trend} xDomain={[first.time, last.time]} yDomain={axis.domain} yTicks={axis.ticks} yTick={amountTick} xTick={dayTick} layers={layers}
-        margin={{ top: 10, right: 48, bottom: 28 }} height={220} label="资产变化折线图：实线为剔除出金影响后的资产，虚线为实际持有资产。详细数值见历史记录。"
+      <SvgPlot rows={plotted} xDomain={[first.time, last.time]} yDomain={axis.domain} yTicks={axis.ticks} yTick={amountTick} xTick={dayTick} layers={layers}
+        margin={{ top: 10, right: 48, bottom: 28 }} height={220} label="资产变化折线图：实线为剔除出金影响后的资产，虚线为实际持有资产；跨度超过两个月时每 3 天、超过半年时每 7 天取一份快照。详细数值见历史记录。"
         tooltip={row => <TrendTip point={row as TrendPoint} />} />
     </div> : <div className="empty-state">导入的账本还没有可画的快照</div>}
     {trend.length >= 2 && annualized ? <section className="performance-metrics" aria-label="资产变化指标">

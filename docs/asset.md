@@ -88,7 +88,8 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
 - 对照工作台 `modules/asset/app/dashboard.tsx`、`asset-trend.tsx`、`daily-changes.tsx`、`withdrawals-panel.tsx`、`cash-flows-panel.tsx`（`0014655`）：三个子页“资产总览”（六格汇总、资产变化走势与年化 / 上月指标、每月表现、每日波动与资金流标注、资产明细表（全部 / 自动更新 / 手动维护筛选，交易所行可展开分项）、分交易所合计）、“历史记录”、“出金记录”。
 - 与工作台不同的地方：历史记录的“查看明细”在表格上方原位展开一个面板（工作台是弹窗）；每日波动在展开时才读取；资金流只列记录与审计历史，没有登记表单。
 - 页面顶部固定提示：本批只读，数据停留在导入时刻（写明时刻与工作台用户），同步与编辑尚未接入。所有写入入口（同步、添加资产、改汇率、记出金、登记资金流、连接交易所）本批不显示。没导入时显示空状态和导入命令。
-- 走势图用本仓库的 `svg-plot.tsx`。样式：`web/src/asset.css` 复制自工作台 `modules/asset/app/globals.css` 里这些页面用到的规则，每条选择器前加 `.asset-desk ` 限定范围（详见 [frontend.md](frontend.md)《资产页》）。
+- 走势图用本仓库的 `svg-plot.tsx`。v0.76.0 起只在作图时抽稀（`web/src/asset-format.ts` 的 `trendPlotPoints`）：首末快照跨度超过 60 天每 3 天一点、超过 180 天每 7 天一点，区间以最新快照为终点，每段取最新的完整快照（全不完整时取最新一份），首份快照保留；点仍是真实快照，不取均值，入金等台阶不被抹平。区间变化、月度表现与年化指标照旧按全部快照计算，标题右侧注明当前粒度。
+- 走势图样式：`web/src/asset.css` 复制自工作台 `modules/asset/app/globals.css` 里这些页面用到的规则，每条选择器前加 `.asset-desk ` 限定范围（详见 [frontend.md](frontend.md)《资产页》）。
 
 **测试**
 

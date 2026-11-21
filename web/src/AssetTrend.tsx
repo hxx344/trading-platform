@@ -58,7 +58,7 @@ export const AssetTrend = memo(function AssetTrend({ history, version, writer, o
     {trend.length >= 2 && annualized ? <section className="performance-metrics" aria-label="资产变化指标">
       <div className="performance-annualized">
         <div className="performance-card">
-          <span className="performance-label">上月资产变化年化 <small>{annualized.referenceMonth}</small></span>
+          <span className="performance-label">当月资产变化年化 <small>{annualized.referenceMonth}</small></span>
           <strong className={performanceTone(annualized.monthlyAnnualized, 100)}>{formatReturnRate(annualized.monthlyAnnualized)}</strong>
           <p>{monthlyHint(month)}</p>
         </div>
@@ -73,7 +73,7 @@ export const AssetTrend = memo(function AssetTrend({ history, version, writer, o
         <summary>每月表现 <span>（{monthly.length} 个月）</span>与计算口径</summary>
         <div className="performance-monthly-body">
           <div className="performance-heading"><h3>资产变化指标</h3><span>全历史 · 单利年化</span></div>
-          <p className="performance-note">基于调整后资产，入金未剔除。上月首末快照间隔至少 {MIN_MONTHLY_SPAN_DAYS} 天才计算上月资产变化年化；按实际相隔天数及各年 365 / 366 天折算，不计复利。</p>
+          <p className="performance-note">基于调整后资产，入金未剔除。当月首末快照间隔至少 {MIN_MONTHLY_SPAN_DAYS} 天才计算当月资产变化年化；按实际相隔天数及各年 365 / 366 天折算，不计复利。</p>
           <div className="performance-table-scroll" role="region" aria-label="每月表现明细，可横向滚动" tabIndex={0}>
             <table className="performance-table">
               <caption>各月按月内首末已有快照计算，不补齐缺失日期。金额单位：USD。</caption>

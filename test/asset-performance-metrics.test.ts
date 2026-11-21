@@ -1,5 +1,5 @@
-// Copied from project_aggregation modules/asset/tests/performance-metrics.test.ts at 0014655; the expectations are unchanged.
-// Changes: imports point at src/asset.
+// Copied from project_aggregation modules/asset/tests/performance-metrics.test.ts at 0014655.
+// Changes: imports point at src/asset; the monthly figure reads the current month to date with a 7-day minimum.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { calculateMonthlyPerformance, calculateAnnualizedReturns, formatGain, formatReturnRate } from '../src/asset/performance-metrics.ts';
@@ -7,7 +7,7 @@ import { assetTrend, chinaDay } from '../src/asset/withdrawals.ts';
 import type { Period, Withdrawal } from '../src/asset/types.ts';
 
 const point = (date: string, adjusted: number) => ({ date, adjusted });
-const annualized = (data: ReturnType<typeof point>[], today = '2024-02-15') =>
+const annualized = (data: ReturnType<typeof point>[], today = '2024-01-31') =>
   calculateAnnualizedReturns(data, calculateMonthlyPerformance(data), today);
 const close = (actual: number | null, expected: number) => assert.ok(actual !== null && Math.abs(actual - expected) < 1e-10, `${actual} != ${expected}`);
 
@@ -74,25 +74,26 @@ test('annualization uses elapsed days and actual calendar-year lengths', () => {
   close(annualized([point('2024-01-01', 100), point('2025-01-01', 110)]).overallAnnualized, 0.1);
   close(annualized([point('2023-01-01', 100), point('2024-01-01', 110)]).overallAnnualized, 0.1);
   close(annualized([point('2023-12-31', 100), point('2024-01-02', 101)]).overallAnnualized, 0.01 / (1 / 365 + 1 / 366));
-  close(annualized([point('2024-02-01', 100), point('2024-02-29', 101)], '2024-03-01').monthlyAnnualized, 0.01 * 366 / 28);
-  close(annualized([point('2023-12-01', 100), point('2023-12-31', 101)], '2024-01-01').monthlyAnnualized, 0.01 * 365 / 30);
+  close(annualized([point('2024-02-01', 100), point('2024-02-29', 101)], '2024-02-29').monthlyAnnualized, 0.01 * 366 / 28);
+  close(annualized([point('2023-12-01', 100), point('2023-12-31', 101)], '2023-12-31').monthlyAnnualized, 0.01 * 365 / 30);
 });
 
-test('monthly annualization selects the previous Beijing calendar month, never a stale fallback', () => {
+test('monthly annualization selects the current Beijing calendar month to date, never a stale fallback', () => {
   const data = [point('2024-01-01', 100), point('2024-01-31', 101), point('2024-02-01', 102), point('2024-02-29', 103)];
   const beforeRollover = annualized(data.slice(0, 2), chinaDay(new Date('2024-01-31T15:59:59Z')));
-  assert.equal(beforeRollover.referenceMonth, '2023-12');
-  assert.equal(beforeRollover.monthlyAnnualized, null);
-  const afterRollover = annualized(data, chinaDay(new Date('2024-01-31T16:00:00Z')));
-  assert.equal(afterRollover.referenceMonth, '2024-01');
-  close(afterRollover.monthlyAnnualized, 0.01 * 366 / 30);
+  assert.equal(beforeRollover.referenceMonth, '2024-01');
+  close(beforeRollover.monthlyAnnualized, 0.01 * 366 / 30);
+  const afterRollover = annualized(data.slice(0, 3), chinaDay(new Date('2024-01-31T16:00:00Z')));
+  assert.equal(afterRollover.referenceMonth, '2024-02');
+  assert.equal(afterRollover.monthlyAnnualized, null, '新月份只有一份快照时不沿用上月');
+  assert.equal(afterRollover.monthlyPeriod?.snapshotCount, 1);
   assert.equal(annualized(data, '2024-04-15').monthlyAnnualized, null);
   assert.equal(annualized(data, '2024-04-15').monthlyPeriod, null);
 });
 
-test('previous-month observation threshold is 25 elapsed days, not number of samples', () => {
-  assert.equal(annualized([point('2024-01-01', 100), point('2024-01-25', 101)]).monthlyAnnualized, null);
-  close(annualized([point('2024-01-01', 100), point('2024-01-26', 101)]).monthlyAnnualized, 0.01 * 366 / 25);
+test('current-month observation threshold is 7 elapsed days, not number of samples', () => {
+  assert.equal(annualized([point('2024-01-01', 100), point('2024-01-07', 101)]).monthlyAnnualized, null);
+  close(annualized([point('2024-01-01', 100), point('2024-01-08', 101)]).monthlyAnnualized, 0.01 * 366 / 7);
   const sparse = [point('2023-12-31', 100), point('2024-01-31', 101)];
   assert.equal(annualized(sparse).monthlyAnnualized, null);
   assert.notEqual(annualized(sparse).overallAnnualized, null);

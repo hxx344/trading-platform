@@ -58,11 +58,11 @@ test('资产走势作图：跨度超过两个月每 3 天、超过半年每 7 �
   assert.deepEqual(trendPlotPoints([]), []);
 });
 
-test('资产页文案：上月表现的提示按快照数、间隔与收益率是否可算区分', () => {
+test('资产页文案：当月表现的提示按快照数、间隔与收益率是否可算区分', () => {
   const month = (extra: Partial<MonthlyPerformance>) => ({ snapshotCount: 5, daysSpan: 28, returnRate: 0.0123, startDate: '2026-10-01', endDate: '2026-10-29', ...extra }) as MonthlyPerformance;
-  assert.equal(monthlyHint(null), '上个自然月没有快照');
-  assert.match(monthlyHint(month({ snapshotCount: 1 })), /需要两个不同日期，首末快照间隔至少 25 天/);
-  assert.match(monthlyHint(month({ daysSpan: 10 })), /至少 25 天/);
+  assert.equal(monthlyHint(null), '本月还没有快照');
+  assert.match(monthlyHint(month({ snapshotCount: 1 })), /需要两个不同日期，首末快照间隔至少 7 天/);
+  assert.match(monthlyHint(month({ daysSpan: 6 })), /至少 7 天/);
   assert.match(monthlyHint(month({ returnRate: null })), /估值须完整/);
   assert.equal(monthlyHint(month({})), '当月 +1.23% · 2026-10-01 — 2026-10-29 · 28 天');
 });

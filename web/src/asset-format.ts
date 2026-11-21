@@ -120,7 +120,7 @@ export function trendPlotPoints(trend: readonly TrendPoint[]): TrendPoint[] {
 }
 
 export function monthlyHint(month: MonthlyPerformance | null): string {
-  return !month ? '上个自然月没有快照'
+  return !month ? '本月还没有快照'
     : month.snapshotCount < 2 || month.daysSpan < MIN_MONTHLY_SPAN_DAYS ? `需要两个不同日期，首末快照间隔至少 ${MIN_MONTHLY_SPAN_DAYS} 天`
     : month.returnRate === null ? '首末快照估值须完整，起始调整后资产须大于 0，变化率需为有效数值'
     : `当月 ${formatReturnRate(month.returnRate)} · ${month.startDate} — ${month.endDate} · ${month.daysSpan} 天`;

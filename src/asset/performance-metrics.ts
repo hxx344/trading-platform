@@ -1,4 +1,5 @@
-// Copied from project_aggregation modules/asset/lib/performance-metrics.ts at 0014655. The calculation is unchanged.
+// Copied from project_aggregation modules/asset/lib/performance-metrics.ts at 0014655. Change: the monthly
+// annualization reads the current Beijing month to date (the workbench read the previous month), and needs 7 days, not 25.
 /** Performance of Beijing daily snapshots, using held assets plus withdrawals. */
 export type PerformancePoint = { date: string; adjusted: number; missingValues?: number };
 
@@ -24,7 +25,7 @@ export type AnnualizedMetrics = {
 };
 
 const DAY_MS = 86_400_000;
-export const MIN_MONTHLY_SPAN_DAYS = 25;
+export const MIN_MONTHLY_SPAN_DAYS = 7;
 
 // These are civil dates from assetTrend(), not timestamps in the browser zone.
 function dayTime(date: string): number {
@@ -82,15 +83,14 @@ export function calculateMonthlyPerformance(trendData: readonly PerformancePoint
   });
 }
 
-/** Simple annualization; the reference month is always the month before today. */
+/** Simple annualization; the reference month is always the month of today, to date. */
 export function calculateAnnualizedReturns(
   trendData: readonly PerformancePoint[],
   monthlyPerformance: readonly MonthlyPerformance[],
   today: string,
 ): AnnualizedMetrics {
   const days = normalizedDays(trendData);
-  const referenceMonth = Number.isFinite(dayTime(today))
-    ? new Date(dayTime(today.slice(0, 7) + '-01') - DAY_MS + 8 * 3_600_000).toISOString().slice(0, 7) : '';
+  const referenceMonth = Number.isFinite(dayTime(today)) ? today.slice(0, 7) : '';
   const monthlyPeriod = monthlyPerformance.find(period => period.month === referenceMonth) ?? null;
   const first = days[0], last = days.at(-1);
   const daysSpan = first && last ? daysBetween(first.date, last.date) : 0;

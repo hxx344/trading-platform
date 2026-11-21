@@ -89,7 +89,7 @@ test('legacy unknown valuations become partial on read without rewriting stored 
   assert.equal(history[0].missingValues, 1);
   assert.ok(history.every(row => !Object.hasOwn(row, 'assets')));
   const trend = assetTrend({ history, withdrawals: [], baselineDate: '2024-01-01' }, '2024-02-15');
-  const metrics = calculateAnnualizedReturns(trend, calculateMonthlyPerformance(trend), '2024-02-15');
+  const metrics = calculateAnnualizedReturns(trend, calculateMonthlyPerformance(trend), '2024-01-31');
   assert.equal(metrics.monthlyAnnualized, null);
   assert.equal(metrics.overallAnnualized, null);
   const stored = await database.prepare('SELECT data FROM snapshots WHERE date = ?').bind(rows[1].date).first<{ data: string }>();
@@ -118,7 +118,7 @@ test('legacy market zeros suppress endpoint returns despite complete metadata, w
     const monthly = calculateMonthlyPerformance(trend);
     assert.equal(monthly[0].gain, quantity === null ? null : 50);
     assert.equal(monthly[0].returnRate, quantity === null ? null : 0.5);
-    const annualized = calculateAnnualizedReturns(trend, monthly, '2024-02-15');
+    const annualized = calculateAnnualizedReturns(trend, monthly, '2024-01-31');
     if (quantity === null) {
       assert.equal(annualized.monthlyAnnualized, null);
       assert.equal(annualized.overallAnnualized, null);

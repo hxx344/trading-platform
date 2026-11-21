@@ -75,6 +75,34 @@ function SummarySettings({ summary, refresh }: { summary: SummaryStatus | undefi
   </section>;
 }
 
+type SessionView = { createdAt: number; expiresAt: number | null; count: number };
+
+/** The page's own login: when it ends, and logging out here or on every device (docs/plan.md, page sessions). */
+function SessionSettings({ onExpired }: { onExpired: () => void }) {
+  const { data } = useLiveResource<SessionView>('/api/session', { intervalMs: STATUS_REFRESH_MS, onExpired });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const leave = async (all: boolean) => {
+    if (all && !window.confirm(`注销全部 ${data?.count ?? ''} 个登录会话？所有浏览器（包括本页）都要重新登录。`)) return;
+    setBusy(true); setError(null);
+    try {
+      await api(all ? '/api/session/logout-all' : '/api/session/logout', { body: {} });
+      window.location.assign('/');
+    } catch (failure) { setError(errorText(failure)); setBusy(false); }
+  };
+  return <section className="panel" aria-label="登录会话">
+    <div className="section-head"><h2>登录会话</h2><span className="small-note">{data ? `共 ${data.count} 个会话` : '读取中'}</span></div>
+    <div className="execution-live-state form-stack">
+      <p className="muted">本浏览器登录于 {data ? stamp(data.createdAt) : '—'}{data?.expiresAt ? `，不再使用时于 ${stamp(data.expiresAt)} 失效` : ''}。每次登录各自一个会话，7 天未使用或登录满 30 天即失效；设置新登录密码时全部失效。</p>
+      {error ? <p className="message message-error" role="alert">{error}</p> : null}
+      <div className="form-actions">
+        <button type="button" className="button secondary" data-slot="button" disabled={busy} onClick={() => void leave(false)}>退出登录</button>
+        <button type="button" className="button secondary" data-slot="button" disabled={busy || !data} onClick={() => void leave(true)}>注销全部设备</button>
+      </div>
+    </div>
+  </section>;
+}
+
 export function SettingsPage({ onChanged, onExpired }: { onChanged: () => void; onExpired: () => void }) {
   const { data, refresh } = useLiveResource<ServiceStatus>('/api/status', { intervalMs: STATUS_REFRESH_MS, onExpired });
   const readToken = useLiveResource<ReadTokenView>(READ_TOKEN_PATH, { intervalMs: READ_TOKEN_REFRESH_MS, onExpired });
@@ -82,6 +110,7 @@ export function SettingsPage({ onChanged, onExpired }: { onChanged: () => void; 
     <ImportPanel onImported={onChanged} />
     <SummarySettings summary={data?.summary} refresh={refresh} />
     <ReadTokenSettings resource={readToken} />
+    <SessionSettings onExpired={onExpired} />
     <Weight weight={data?.idleWeight} />
   </div>;
 }

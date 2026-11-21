@@ -12,6 +12,7 @@ import { parseListenConfig, urlHost } from '../service/listen-config.ts';
 import { createUpdates, readInstalledVersion, updateReadyFile, type UpdateFetch, type UpdateView } from '../service/update.ts';
 import { loadWebApp } from '../web-assets.ts';
 import { PROBE_HEADER, probeResponse } from './probe.ts';
+import { installCrashGuard } from '../crash-guard.ts';
 
 const CODE_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 
@@ -208,5 +209,6 @@ function main(): void {
 }
 
 if (import.meta.main) {
+  installCrashGuard('控制面');
   try { main(); } catch (error) { process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; }
 }

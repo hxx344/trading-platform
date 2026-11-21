@@ -78,7 +78,7 @@ const balanceLine = (pair: PairState): string => {
   const readAt = new Date(Math.min(pair.balances.long.receivedAt, pair.balances.short.receivedAt) + 8 * 3600_000).toISOString().slice(11, 19);
   return `两侧可用余额 多 ${clip(pair.balances.long.available, 40)} / 空 ${clip(pair.balances.short.available, 40)} USD1，差额 ${gap} USD1，划转门槛 ${clip(pair.threshold, 40)} USD1（${readAt} 读取${pair.balancesFresh ? '' : '，早于最近一笔划转结算'}）`;
 };
-const lasted = (ms: number): string => ms < 120_000 ? `${Math.round(ms / 1000)} 秒` : `${Math.round(ms / 60_000)} 分钟`;
+export const lasted = (ms: number): string => ms < 120_000 ? `${Math.round(ms / 1000)} 秒` : `${Math.round(ms / 60_000)} 分钟`;
 export interface NotifierOptions {
   file: string;
   /** Reads events after a sequence number, oldest first. */
@@ -319,6 +319,15 @@ export function describeEvent(row: EventRow, incidentPair: (id: string) => strin
     case 'four-leg-unbalanced':
       // Written once both jobs of a four-leg group are over (docs/oil.md 11.3); one message per group.
       return { text: `【四腿成交不等】四腿组 ${short(detail.group)}（任务 ${short(row.jobId)} 与 ${short(detail.peer)}）：${Array.isArray(detail.details) ? detail.details.map(item => clip(item)).join('；') : '?'}${detail.attention ? '；有任务需人工处理，委托仍在核对，成交以结束时为准' : '（以两个任务结束时为准）'}；请到交易所核对两所敞口`, onceKey: `four-leg:${clip(detail.group, 64)}` };
+    // Two-leg jobs that stopped short of a decision: nothing finishes them, so without these a person hears nothing.
+    case 'operation-mismatch':
+      return { text: `【委托待人工核对】任务 ${short(row.jobId)}：查无原委托，但当前持仓或挂单与已知成交不一致，委托保留为待核对；请在交易页核对持仓后处理`, onceKey: `operation-mismatch:${clip(detail.op, 64)}` };
+    case 'strategy-identity-mismatch':
+      return { text: `【追价策略身份不一致】任务 ${short(row.jobId)}：策略编号 ${clip(detail.strategyId, 40)} 的查询回报与本委托身份不一致，${detail.verified ? '不再对其发送停止，任务转人工处理' : '该委托按结果未知处理，需人工核对'}`, onceKey: `strategy-mismatch:${clip(detail.op, 64)}` };
+    case 'four-leg-deviation':
+      return { text: `【四腿首腿偏离计划】任务 ${short(row.jobId)}：${clip(detail.reason)}；另一交易所的任务随之暂停新首腿`, onceKey: `four-leg-deviation:${clip(row.jobId, 64)}` };
+    case 'four-leg-halted':
+      return { text: `【四腿另一任务已暂停】任务 ${short(row.jobId)}（因任务 ${short(detail.by)}：${clip(detail.reason)}）：不再发送新的首腿，撤销首腿挂单，已成交部分照常对冲`, onceKey: `four-leg-halted:${clip(row.jobId, 64)}` };
     case 'adl-tick-failed':
       return { text: `【ADL 循环出错】${clip(detail.reason)}`, repeatKey: `adl-tick:${clip(detail.reason, 80)}` };
     case 'adl-push-dropped':

@@ -160,7 +160,7 @@ export function openStore(file: string, { busyTimeoutMs = 5000, walResetBytes = 
     return { action: busy ? 'busy' : 'reset', walBytes: walBytes(), ms: performance.now() - started };
   }
 
-  try { migrate(db, tx); } catch (error) { db.close(); throw error; }
+  try { migrate(db, tx); db.exec(READ_INDEXES); } catch (error) { db.close(); throw error; }
   return {
     db, file,
     schemaVersion: () => (db.prepare('SELECT IFNULL(MAX(version), 0) AS version FROM schema_migrations').get() as { version: number }).version,
@@ -169,6 +169,17 @@ export function openStore(file: string, { busyTimeoutMs = 5000, walResetBytes = 
     close: () => { if (db.isOpen) db.close(); },
   };
 }
+
+/**
+ * Indexes for the page's frequent reads (the executor's unsettled orders every second, the recent jobs and transfers
+ * every two seconds). They sit outside the numbered migrations on purpose: an older release opens the file as it is and
+ * simply does not use them, so rolling back needs nothing. Names start with read_ so a later migration never collides.
+ */
+export const READ_INDEXES = `
+CREATE INDEX IF NOT EXISTS read_operations_unsettled ON operations(settled) WHERE settled = 0;
+CREATE INDEX IF NOT EXISTS read_jobs_created ON jobs(created_at);
+CREATE INDEX IF NOT EXISTS read_transfers_created ON transfers(created_at);
+`;
 
 function migrate(db: DatabaseSync, tx: <T>(operation: () => T) => T): void {
   db.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, sql_sha256 TEXT NOT NULL, applied_at INTEGER NOT NULL)');

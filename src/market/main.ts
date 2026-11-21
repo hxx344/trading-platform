@@ -8,6 +8,7 @@ import { createMonitorData } from './monitor-data.ts';
 import { createOptionData } from './options-data.ts';
 import { createVenueFeeds } from './venue-feeds.ts';
 import { createMarketServer } from './server.ts';
+import { installCrashGuard } from '../crash-guard.ts';
 
 function main(): void {
   const { values } = parseArgs({ options: { socket: { type: 'string' } } });
@@ -28,5 +29,6 @@ function main(): void {
 }
 
 if (import.meta.main) {
+  installCrashGuard('行情服务');
   try { main(); } catch (error) { process.stderr.write(`${error instanceof Error ? error.message : '行情服务启动失败'}\n`); process.exitCode = 1; }
 }

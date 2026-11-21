@@ -344,3 +344,12 @@ span.news-coin{cursor:default}
   .news-toolbar input,.moves-toolbar input{max-width:none;flex:1 1 160px}
   .moves-toolbar,.moves-desk .news-item,.moves-note{padding-inline:16px}
 }
+
+/* 顶栏服务器负载与连线（topbar-status.css 之外本服务另加的）：详情里的服务连线列表，以及连线有异常时摘要上的提示点。 */
+.app-shell > .workspace > .topbar > .topbar-right .host-open{display:inline-block}
+.app-shell > .workspace > .topbar > .topbar-right .connection-details .connection-section{display:block;margin-top:10px}
+.app-shell > .workspace > .topbar > .topbar-right .connection-links-list{margin:4px 0 0;padding:0;list-style:none}
+.app-shell > .workspace > .topbar > .topbar-right .connection-links-list li{margin-top:4px;overflow-wrap:anywhere}
+.app-shell > .workspace > .topbar > .topbar-right .connection-links{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:var(--radius-pill);font-size:.6875rem;font-weight:700;color:var(--surface-0)}
+.app-shell > .workspace > .topbar > .topbar-right .connection-links.warn{background:var(--warning)}
+.app-shell > .workspace > .topbar > .topbar-right .connection-links.alert{background:var(--error)}

@@ -5,6 +5,8 @@ import { LazyBoundary } from './LazyBoundary.tsx';
 import { PairsWorkspace } from './PairsWorkspace.tsx';
 import { useRoute } from './route.ts';
 import { UpdateStatus } from './UpdateStatus.tsx';
+import { HostStatusBadge } from './HostStatusBadge.tsx';
+import { ConnectionStatus } from './ConnectionStatus.tsx';
 import { READ_TOKEN_PATH, READ_TOKEN_REFRESH_MS, navNotice, type ReadTokenView } from './read-token-form.ts';
 import { Callout, StatePanel } from './StateViews.tsx';
 import { clock } from './labels.ts';
@@ -177,7 +179,7 @@ export function App() {
       <header className="topbar"><div className="breadcrumb">
         <button ref={menuButton} type="button" className="icon-button mobile-menu" aria-label="打开导航" aria-expanded={menuOpen} onClick={() => setMenuOpen(true)}><Menu size={21} aria-hidden="true" /></button>
         <span>{crumb.workspace}</span><ChevronRight size={13} aria-hidden="true" /><strong>{crumb.page}</strong>
-      </div></header>
+      </div><div className="topbar-right"><HostStatusBadge onExpired={onExpired} /><ConnectionStatus onExpired={onExpired} /></div></header>
       <main className="aster-desk"><div className="desk focused-desk"><div className="workspace">
         <div className="page-heading">
           <div className="page-title">

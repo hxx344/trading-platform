@@ -766,7 +766,7 @@ test('存储：已有 v3 库升级到 v4 只新增 ADL 四张表与索引，原�
   const store = openStore(file);
   try {
     assert.equal(store.schemaVersion(), 4);
-    assert.deepEqual(names(store.db).filter(name => !before.includes(name)), ['adl_batches', 'adl_batches_incident', 'adl_batches_open', 'adl_batches_pair', 'adl_evidence', 'adl_evidence_pair',
+    assert.deepEqual(names(store.db).filter(name => !before.includes(name) && !name.startsWith('read_')), ['adl_batches', 'adl_batches_incident', 'adl_batches_open', 'adl_batches_pair', 'adl_evidence', 'adl_evidence_pair',
       'adl_evidence_pending', 'adl_incidents', 'adl_incidents_created', 'adl_incidents_open', 'adl_incidents_pair', 'adl_pairs']);
     store.db.prepare("INSERT INTO adl_pairs VALUES ('sim-pair', 1, 1, '{}')").run();
     store.db.prepare("INSERT INTO adl_incidents VALUES ('i1', 'sim-pair', 'completed', 1, 1, 1, '{}')").run();
@@ -774,7 +774,8 @@ test('存储：已有 v3 库升级到 v4 只新增 ADL 四张表与索引，原�
     store.db.prepare("INSERT INTO commands VALUES ('r1', 'adl-config', 'd', 's', 'sim-pair', 1), ('r2', 'adl-restart', 'd', 's', 'i1', 1)").run();
     store.db.exec(ADL_ROLLBACK_SQL);
     assert.equal(store.schemaVersion(), 3);
-    assert.deepEqual(names(store.db), before);
+    // The read indexes (store.ts READ_INDEXES) stay after a rollback; older releases do not mind them.
+    assert.deepEqual(names(store.db).filter(name => !name.startsWith('read_')), before);
     assert.deepEqual((store.db.prepare('SELECT request_id FROM commands').all() as { request_id: string }[]).map(row => row.request_id), ['r0']);
     assert.equal((store.db.prepare('SELECT COUNT(*) AS n FROM transfer_pairs').get() as { n: number }).n, 1);
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }

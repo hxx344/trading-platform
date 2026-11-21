@@ -64,9 +64,18 @@ const MAX_LOCK_MS = 15 * 60_000;
 /** A run of wrong passwords ends after this long without one, so old slips do not add up over days. */
 export const FAILURE_MEMORY_MS = 60 * 60_000;
 
+export interface ThrottleLimits { freeFailures: number; firstLockMs: number; maxLockMs: number }
+/** One client address: five tries, then 30 s doubling up to 15 min. */
+export const ADDRESS_LOGIN_LIMITS: ThrottleLimits = { freeFailures: FREE_FAILURES, firstLockMs: FIRST_LOCK_MS, maxLockMs: MAX_LOCK_MS };
 /**
- * One counter for the process: after FREE_FAILURES wrong passwords in a row, each further one locks login for 30 s,
- * doubling up to 15 min. A right password or the access-url link clears it, and so does an hour without a wrong one.
+ * Every address together: only a guesser spread over many addresses gets here, and it is slowed, never locked out for
+ * long, so the owner's own address is at worst kept waiting a minute.
+ */
+export const GLOBAL_LOGIN_LIMITS: ThrottleLimits = { freeFailures: 50, firstLockMs: 5_000, maxLockMs: 60_000 };
+
+/**
+ * A counter of wrong passwords: after freeFailures of them in a row, each further one locks login for firstLockMs,
+ * doubling up to maxLockMs. A right password or the access-url link clears it, and so does an hour without a wrong one.
  * A restart clears it too, which systemd's restart delay bounds.
  */
 export class LoginThrottle {
@@ -74,14 +83,16 @@ export class LoginThrottle {
   private lockedUntil = 0;
   private lastFailure = 0;
   private readonly now: () => number;
-  constructor(now: () => number = Date.now) { this.now = now; }
+  private readonly limits: ThrottleLimits;
+  constructor(now: () => number = Date.now, limits: ThrottleLimits = ADDRESS_LOGIN_LIMITS) { this.now = now; this.limits = limits; }
   /** Milliseconds until the next attempt is accepted; 0 when it is now. */
   waitMs(): number { return Math.max(0, this.lockedUntil - this.now()); }
   failed(): void {
     if (this.now() - this.lastFailure > FAILURE_MEMORY_MS) this.failures = 0;
     this.lastFailure = this.now();
     this.failures += 1;
-    if (this.failures >= FREE_FAILURES) this.lockedUntil = this.now() + Math.min(MAX_LOCK_MS, FIRST_LOCK_MS * 2 ** (this.failures - FREE_FAILURES));
+    const { freeFailures, firstLockMs, maxLockMs } = this.limits;
+    if (this.failures >= freeFailures) this.lockedUntil = this.now() + Math.min(maxLockMs, firstLockMs * 2 ** Math.min(30, this.failures - freeFailures));
   }
   succeeded(): void { this.failures = 0; this.lockedUntil = 0; }
 }

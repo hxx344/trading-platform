@@ -8,7 +8,8 @@ import { isIP } from 'node:net';
 import { ContractError, TRANSFER_CONFIG_KEYS, VENUES, exactKeys, parsePage, type Venue } from './contracts.ts';
 import type { Executor } from './executor.ts';
 import { APP_HEADERS, CLIENT_ADDRESS_HEADER, CONFIG_CHECK_HEADER, CONFIG_MATCH_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, PAGE_HEADERS, controlRoute, readJson, sendJson, sendJsonText, sendWebAsset, sessionCookieName } from './http-public.ts';
-import { LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash } from './login-password.ts';
+import { GLOBAL_LOGIN_LIMITS, LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash, type ThrottleLimits } from './login-password.ts';
+import { openSessionStore, type SessionInfo, type SessionStore } from './sessions.ts';
 import { READ_TOKEN_MAX_BYTES, readTokenAllows, readTokenUpdateView, type ReadTokens } from './read-token.ts';
 import type { Redactor } from './read-redact.ts';
 import type { WebApp } from './web-assets.ts';
@@ -87,6 +88,8 @@ export interface ImportChannel { submit(body: unknown): { id: string; at: number
 /** Read-only views a service adds to the page: its run status and its balance history. */
 export interface ServiceViews {
   status?(): Record<string, unknown>;
+  /** Server load and what the service is connected to, for the page's top bar (host-status.ts). */
+  host?(): Promise<unknown>;
   /** null for an unknown range. */
   balanceHistory?(pairId: string, range: string): unknown;
   /** The oil module's reads (books and spreads; accounts, positions, jobs, caps); absent when the service runs no oil. */
@@ -165,13 +168,14 @@ export interface ServiceViews {
   news?: { flash(): unknown; moves(): unknown };
 }
 
-/** accessToken is exchanged once per browser at /login; session is the cookie value and the executor session id. */
+/** accessToken is exchanged at /login for a session of its own, as is the password (sessions.ts). */
 export interface HttpOptions {
   executor: Executor;
   accessToken: string;
+  /** The page sessions; without them a store that lives as long as the server, holding `session` if given. */
+  sessions?: SessionStore;
+  /** A cookie value that is a session from the start, for a store made here (tests). */
   session?: string;
-  /** Set with a session that outlives restarts: the cookie then outlives the browser session too. */
-  sessionMaxAgeS?: number;
   /** Page served at /; defaults by environment. */
   page?: string;
   /** The built page with its files under /assets; takes the place of page. */
@@ -193,8 +197,11 @@ export interface HttpOptions {
    * Without it the path does not exist.
    */
   ready?: () => boolean;
-  /** Tests set the clock; one throttle per server otherwise. */
-  throttle?: LoginThrottle;
+  /**
+   * Wrong passwords are counted per client address, so a guesser elsewhere cannot lock the owner out; a loose counter over
+   * all addresses only slows a guesser who has many. Tests give the throttles a clock.
+   */
+  throttle?: (limits?: ThrottleLimits) => LoginThrottle;
   /**
    * The read-only API token (docs/mcp.md): without it a request with an Authorization header gets 401, as before.
    * Wrong tokens are counted per client address, apart from wrong passwords; tests give the throttles a clock.
@@ -210,25 +217,56 @@ const TOKEN_THROTTLES = 1_024;
 const sameSecret = (given: string, expected: string): boolean =>
   timingSafeEqual(createHash('sha256').update(given).digest(), createHash('sha256').update(expected).digest());
 
-export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url'), sessionMaxAgeS, page, app, imports, views, password, host, browserPort, executionBuild = 'development', configBuild, ready, throttle = new LoginThrottle(), readTokens, tokenThrottle = () => new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
+export function createExecutorServer({ executor, accessToken, sessions: given, session, page, app, imports, views, password, host, browserPort, executionBuild = 'development', configBuild, ready, throttle: makeThrottle = limits => new LoginThrottle(Date.now, limits), readTokens, tokenThrottle = () => new LoginThrottle(), log = line => process.stderr.write(`${line}\n`) }: HttpOptions): Server {
   if (!accessToken) throw new Error('需要访问令牌');
-  if (sameSecret(session, accessToken)) throw new Error('会话值不能与访问令牌相同');
+  if (session !== undefined && sameSecret(session, accessToken)) throw new Error('会话值不能与访问令牌相同');
+  const sessions = given ?? openSessionStore({ seed: session === undefined ? [] : [session] });
   // The executor records which session asked for each command; it gets a digest, so the stored rows never hold the cookie.
-  const sessionId = createHash('sha256').update(`executor-session:${session}`).digest('base64url');
+  const requestSessions = new WeakMap<IncomingMessage, SessionInfo>();
+  const sessionId = (request: IncomingMessage): string => {
+    const found = requestSessions.get(request);
+    if (!found) throw new ContractError(401, 'session', '需要登录');
+    return found.id;
+  };
   const privateSocket = browserPort !== undefined;
   const cookieName = (request: IncomingMessage) => sessionCookieName(browserPort ?? request.socket.localPort ?? 0);
   const clientAddress = (request: IncomingMessage): string => {
     const address = privateSocket ? request.headers[CLIENT_ADDRESS_HEADER] : request.socket.remoteAddress;
     return typeof address === 'string' && isIP(address) ? address : '未知地址';
   };
-  const authorized = (request: IncomingMessage): boolean => {
+  const cookieValue = (request: IncomingMessage): string | undefined => {
     const name = cookieName(request);
-    const value = (request.headers.cookie ?? '').split(';').map(part => part.trim()).find(part => part.startsWith(`${name}=`))?.slice(name.length + 1);
-    return value !== undefined && sameSecret(value, session);
+    return (request.headers.cookie ?? '').split(';').map(part => part.trim()).find(part => part.startsWith(`${name}=`))?.slice(name.length + 1);
+  };
+  /** Whether the request carries a live session; the session is then remembered for the request (sessionId). */
+  const authorized = (request: IncomingMessage): boolean => {
+    const value = cookieValue(request);
+    const found = value === undefined ? null : sessions.check(value);
+    if (found) requestSessions.set(request, found);
+    return found !== null;
   };
   // Loopback by any port (a tunnel may map it), the chosen address by itself or with a port.
   const allowedHost = (value: string): boolean => LOOPBACK.test(value) || (host !== undefined && (value === host || (value.startsWith(`${host}:`) && /^\d{1,5}$/.test(value.slice(host.length + 1)))));
-  const sessionCookie = (request: IncomingMessage): string => `${cookieName(request)}=${session}; HttpOnly; SameSite=Strict; Path=/${sessionMaxAgeS ? `; Max-Age=${sessionMaxAgeS}` : ''}`;
+  /** A new session for the browser, with its cookie; the one the browser still carried, if any, ends (it is replaced). */
+  const sessionCookie = (request: IncomingMessage): string => {
+    const previous = cookieValue(request);
+    if (previous) sessions.remove(previous);
+    return `${cookieName(request)}=${sessions.create()}; HttpOnly; SameSite=Strict; Path=/${sessions.maxAgeS ? `; Max-Age=${sessions.maxAgeS}` : ''}`;
+  };
+  const clearedCookie = (request: IncomingMessage): string => `${cookieName(request)}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`;
+  // Wrong passwords per client address (at most TOKEN_THROTTLES of them, the oldest goes first), and a loose count over all.
+  const loginThrottles = new Map<string, LoginThrottle>();
+  const globalThrottle = makeThrottle(GLOBAL_LOGIN_LIMITS);
+  const loginThrottleFor = (address: string): LoginThrottle => {
+    let found = loginThrottles.get(address);
+    if (!found) {
+      found = makeThrottle();
+      loginThrottles.set(address, found);
+      if (loginThrottles.size > TOKEN_THROTTLES) loginThrottles.delete(loginThrottles.keys().next().value!);
+    }
+    return found;
+  };
+  const loginWaitMs = (address: string): number => Math.max(loginThrottleFor(address).waitMs(), globalThrottle.waitMs());
   // The form's own page sends its real Origin with the post (no-referrer would make it "null", as sandboxed pages send).
   const loginPage = (response: ServerResponse, status: number, notice = '') => {
     response.writeHead(status, { ...PAGE_HEADERS, 'referrer-policy': 'same-origin' });
@@ -258,8 +296,9 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
   async function passwordLogin(request: IncomingMessage, response: ServerResponse): Promise<void> {
     if (!password) { request.resume(); return loginPage(response, 401); }
     if (!sameOrigin(request) || !String(request.headers['content-type'] ?? '').startsWith('application/x-www-form-urlencoded')) { request.resume(); return loginPage(response, 403, '请从登录页提交'); }
-    const busy = () => loginPage(response, 429, `尝试次数过多，请 ${Math.max(1, Math.ceil(throttle.waitMs() / 1000))} 秒后再试`);
-    if (throttle.waitMs() > 0) { request.resume(); return busy(); }
+    const address = clientAddress(request), throttle = loginThrottleFor(address);
+    const busy = () => loginPage(response, 429, `尝试次数过多，请 ${Math.max(1, Math.ceil(loginWaitMs(address) / 1000))} 秒后再试`);
+    if (loginWaitMs(address) > 0) { request.resume(); return busy(); }
     // The body is read before taking the check, so a client that sends it slowly holds up nobody else.
     const form = await readForm(request);
     if (response.writableEnded || request.socket.destroyed) return;
@@ -269,20 +308,21 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       return;
     }
     // One check at a time, so parallel guesses cannot outrun the counter.
-    if (throttle.waitMs() > 0 || verifying) return busy();
+    if (loginWaitMs(address) > 0 || verifying) return busy();
     verifying = true;
     let ok: boolean;
     try { ok = form !== null && await verifyPassword(form.get('password') ?? '', password); }
     finally { verifying = false; }
     if (!ok) {
-      throttle.failed();
-      const locked = throttle.waitMs();
-      log(`页面登录密码错误（来自 ${clientAddress(request)}）${locked ? `，已锁定 ${Math.ceil(locked / 1000)} 秒` : ''}`);
+      throttle.failed(); globalThrottle.failed();
+      const locked = loginWaitMs(address);
+      log(`页面登录密码错误（来自 ${address}）${locked ? `，已锁定 ${Math.ceil(locked / 1000)} 秒` : ''}`);
       return loginPage(response, 401, locked ? `密码错误，已锁定 ${Math.ceil(locked / 1000)} 秒` : '密码错误');
     }
     throttle.succeeded();
-    log(`页面密码登录成功（来自 ${clientAddress(request)}）`);
-    response.writeHead(303, { ...PAGE_HEADERS, location: '/', 'set-cookie': sessionCookie(request) });
+    const cookie = sessionCookie(request);
+    log(`页面密码登录成功（来自 ${address}，当前 ${sessions.count()} 个会话）`);
+    response.writeHead(303, { ...PAGE_HEADERS, location: '/', 'set-cookie': cookie });
     response.end();
   }
   // A read-only token's answers are masked and size-capped on their way out; a session's pass unchanged (docs/mcp.md 3).
@@ -391,9 +431,12 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       const token = url.searchParams.get('token');
       // Without a token it is the password form (or the access-url notice when no password is set).
       if (token === null || !sameSecret(token, accessToken)) return loginPage(response, token === null && password ? 200 : 401, token === null ? '' : '登录链接无效或已过期');
-      // Whoever reads access-url may lift a lockout a guesser left.
-      throttle.succeeded();
-      response.writeHead(303, { ...PAGE_HEADERS, location: '/', 'set-cookie': sessionCookie(request) });
+      // Whoever reads access-url may lift a lockout a guesser left, anywhere.
+      for (const item of loginThrottles.values()) item.succeeded();
+      globalThrottle.succeeded();
+      const cookie = sessionCookie(request);
+      log(`登录链接登录成功（来自 ${clientAddress(request)}，当前 ${sessions.count()} 个会话）`);
+      response.writeHead(303, { ...PAGE_HEADERS, location: '/', 'set-cookie': cookie });
       response.end();
       return;
     }
@@ -431,6 +474,18 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (!url.pathname.startsWith('/api/')) return send(response, 404, { code: 'not_found', message: '不存在' });
     if (!authorized(request)) return send(response, 401, { code: 'session', message: password ? '会话无效，请刷新页面重新登录' : '会话无效，请使用数据目录 access-url 中的登录链接重新打开' });
     if (request.method === 'POST' && (request.headers['x-pa-executor'] !== '1' || !String(request.headers['content-type'] ?? '').startsWith('application/json'))) return send(response, 403, { code: 'csrf', message: '缺少本页面请求标记' });
+    // The page's own session: what it is, logging this browser out, or every browser (sessions.ts).
+    if (url.pathname === '/api/session' && request.method === 'GET') {
+      const current = requestSessions.get(request)!;
+      return send(response, 200, { createdAt: current.createdAt, expiresAt: current.expiresAt === Number.MAX_SAFE_INTEGER ? null : current.expiresAt, count: sessions.count() });
+    }
+    if (request.method === 'POST' && (url.pathname === '/api/session/logout' || url.pathname === '/api/session/logout-all')) {
+      exactKeys(await readJson(request), []);
+      const all = url.pathname.endsWith('-all');
+      const removed = all ? sessions.removeAll() : Number(sessions.remove(cookieValue(request) ?? ''));
+      log(`${all ? `已注销全部 ${removed} 个页面会话` : '页面会话已退出'}（来自 ${clientAddress(request)}）`);
+      return send(response, 200, { removed }, { 'set-cookie': clearedCookie(request) });
+    }
     // The token's own management: the logged-in page only, never the token (docs/mcp.md 2).
     if (url.pathname === '/api/read-token' || url.pathname.startsWith('/api/read-token/')) {
       if (!readTokens) return send(response, 404, { code: 'not_found', message: '本服务没有只读接口令牌' });
@@ -462,6 +517,10 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       return send(response, 200, { generation: executor.generation, retired: executor.retired, transport: executor.environment === 'mainnet' ? 'live' : 'simulated', accounts: executor.accounts(), notionalLimits: executor.notionalLimits(), jobs: executor.recentJobs(20),
         transfers: { pairs: executor.transferPairs(), corruptPairs: executor.corruptTransferPairs(), recent: executor.recentTransfers(20) },
         adl: { pairs: executor.adlPairs(), recent: executor.recentAdlIncidents(10) }, positions: executor.asterPositions() });
+    }
+    if (request.method === 'GET' && url.pathname === '/api/host') {
+      if (!views?.host) return send(response, 404, { code: 'not_found', message: '本服务没有服务器状态' });
+      return send(response, 200, await views.host());
     }
     if (request.method === 'GET' && url.pathname === '/api/status') {
       if (!views?.status) return send(response, 404, { code: 'not_found', message: '本服务没有运行状态' });
@@ -843,31 +902,31 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       if (!(VENUES as readonly string[]).includes(venue)) return send(response, 400, { code: 'venue', message: '交易所无效' });
       return send(response, 200, await executor.observe(venue as Venue, symbol));
     }
-    if (request.method === 'POST' && url.pathname === '/api/preview') return send(response, 200, executor.publicPreview(await executor.preview(await readJson(request), sessionId)));
-    if (request.method === 'POST' && url.pathname === '/api/confirm') return send(response, 200, executor.confirm(await readJson(request), sessionId));
+    if (request.method === 'POST' && url.pathname === '/api/preview') return send(response, 200, executor.publicPreview(await executor.preview(await readJson(request), sessionId(request))));
+    if (request.method === 'POST' && url.pathname === '/api/confirm') return send(response, 200, executor.confirm(await readJson(request), sessionId(request)));
     // Four legs (docs/oil.md 11.3): one preview of both venues' plans, one confirm that creates both jobs or neither.
-    if (request.method === 'POST' && url.pathname === '/api/four-leg/preview') return send(response, 200, executor.publicFourLegPreview(await executor.previewFourLeg(await readJson(request), sessionId)));
-    if (request.method === 'POST' && url.pathname === '/api/four-leg/confirm') return send(response, 200, executor.confirmFourLeg(await readJson(request), sessionId));
+    if (request.method === 'POST' && url.pathname === '/api/four-leg/preview') return send(response, 200, executor.publicFourLegPreview(await executor.previewFourLeg(await readJson(request), sessionId(request))));
+    if (request.method === 'POST' && url.pathname === '/api/four-leg/confirm') return send(response, 200, executor.confirmFourLeg(await readJson(request), sessionId(request)));
     const pair = request.method === 'POST' ? PAIR_PATH.exec(url.pathname) : null;
     if (pair) {
       const body = exactKeys(await readJson(request), ['requestId']);
-      return send(response, 200, await executor.setTransferEnabled({ pairId: pair[1], enabled: pair[2] === 'enable', requestId: body.requestId }, sessionId));
+      return send(response, 200, await executor.setTransferEnabled({ pairId: pair[1], enabled: pair[2] === 'enable', requestId: body.requestId }, sessionId(request)));
     }
     const pairConfig = request.method === 'POST' ? PAIR_CONFIG_PATH.exec(url.pathname) : null;
     if (pairConfig) {
       // `expected` is the stored settings the page's draft started from; a mismatch is refused as changed elsewhere.
       const { requestId, expected, ...config } = exactKeys(await readJson(request), ['requestId', 'expected', ...TRANSFER_CONFIG_KEYS]);
-      return send(response, 200, executor.setTransferConfig({ pairId: pairConfig[1], requestId, expected, config }, sessionId));
+      return send(response, 200, executor.setTransferConfig({ pairId: pairConfig[1], requestId, expected, config }, sessionId(request)));
     }
     const adlConfig = request.method === 'POST' ? ADL_CONFIG_PATH.exec(url.pathname) : null;
     if (adlConfig) {
       const body = exactKeys(await readJson(request), ['requestId', 'autoReduce', 'batchNotional']);
-      return send(response, 200, executor.setAdlConfig({ pairId: adlConfig[1], ...body }, sessionId));
+      return send(response, 200, executor.setAdlConfig({ pairId: adlConfig[1], ...body }, sessionId(request)));
     }
     const adlRestart = request.method === 'POST' ? ADL_RESTART_PATH.exec(url.pathname) : null;
     if (adlRestart) {
       const body = exactKeys(await readJson(request), ['requestId']);
-      return send(response, 200, executor.restartAdl({ incidentId: adlRestart[1], requestId: body.requestId }, sessionId));
+      return send(response, 200, executor.restartAdl({ incidentId: adlRestart[1], requestId: body.requestId }, sessionId(request)));
     }
     const match = UUID_PATH.exec(url.pathname);
     // The path match is case-insensitive, so the action is compared lowercased; otherwise /STOP would fall through to acknowledge.
@@ -875,20 +934,20 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (match && request.method === 'GET' && !action) return send(response, 200, executor.jobView(match[1]));
     if (match && request.method === 'POST' && action === 'adopt-strategy') {
       const body = exactKeys(await readJson(request), ['requestId', 'strategyId']);
-      return send(response, 200, await executor.adoptStrategy({ jobId: match[1], requestId: body.requestId, strategyId: body.strategyId }, sessionId));
+      return send(response, 200, await executor.adoptStrategy({ jobId: match[1], requestId: body.requestId, strategyId: body.strategyId }, sessionId(request)));
     }
     if (match && request.method === 'POST' && action === 'confirm-not-created') {
       const body = exactKeys(await readJson(request), ['requestId']);
-      return send(response, 200, await executor.confirmNotCreated({ jobId: match[1], requestId: body.requestId }, sessionId));
+      return send(response, 200, await executor.confirmNotCreated({ jobId: match[1], requestId: body.requestId }, sessionId(request)));
     }
     if (match && request.method === 'POST' && action === 'release-strategy') {
       const body = exactKeys(await readJson(request), ['requestId'], ['acknowledgeRisk']);
-      return send(response, 200, executor.releaseStrategy({ jobId: match[1], requestId: body.requestId, acknowledgeRisk: body.acknowledgeRisk }, sessionId));
+      return send(response, 200, executor.releaseStrategy({ jobId: match[1], requestId: body.requestId, acknowledgeRisk: body.acknowledgeRisk }, sessionId(request)));
     }
     if (match && request.method === 'POST' && (action === 'stop' || action === 'acknowledge')) {
       const body = await readJson(request) as { requestId?: unknown } | null;
       const requestId = typeof body?.requestId === 'string' ? body.requestId : '';
-      return send(response, 200, action === 'stop' ? executor.requestStop(match[1], requestId, sessionId) : executor.acknowledge(match[1], requestId, sessionId));
+      return send(response, 200, action === 'stop' ? executor.requestStop(match[1], requestId, sessionId(request)) : executor.acknowledge(match[1], requestId, sessionId(request)));
     }
     return send(response, 404, { code: 'not_found', message: '不存在' });
   }

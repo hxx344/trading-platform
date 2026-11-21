@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { createServer as createNetServer, type AddressInfo } from 'node:net';
 import { createExecutorServer, sessionCookieName } from '../src/http.ts';
 import { writeAccessUrl } from '../src/data-dir.ts';
-import { FAILURE_MEMORY_MS, FREE_FAILURES, LoginThrottle, checkPasswordStrength, hashPassword, loadPasswordHash, parsePasswordHash, verifyPassword } from '../src/login-password.ts';
+import { FAILURE_MEMORY_MS, FREE_FAILURES, GLOBAL_LOGIN_LIMITS, LoginThrottle, checkPasswordStrength, hashPassword, loadPasswordHash, parsePasswordHash, verifyPassword } from '../src/login-password.ts';
 import { parseListenHost, parseServiceConfig, urlHost } from '../src/service/config.ts';
 import { runExecutor } from '../src/runtime.ts';
 import type { Executor } from '../src/executor.ts';
@@ -76,7 +76,7 @@ async function withPasswordServer(run: (base: string, port: number, clock: { now
   bindAccounts(h.ex);
   const clock = { now: 1_000_000 };
   const lines: string[] = [];
-  const server = createExecutorServer({ executor: h.ex, accessToken: TOKEN, session: SESSION, password: stored, throttle: new LoginThrottle(() => clock.now), log: line => lines.push(line), ...(host ? { host } : {}) });
+  const server = createExecutorServer({ executor: h.ex, accessToken: TOKEN, session: SESSION, password: stored, throttle: limits => new LoginThrottle(() => clock.now, limits), log: line => lines.push(line), ...(host ? { host } : {}) });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const port = (server.address() as AddressInfo).port;
   try { await run(`http://127.0.0.1:${port}`, port, clock); }
@@ -103,7 +103,7 @@ test('HTTP 密码登录：未登录显示密码表单；输对下发会话 cooki
   assert.equal(right.status, 303);
   assert.equal(right.headers.get('location'), '/');
   const cookie = (right.headers.get('set-cookie') ?? '').split(';')[0];
-  assert.equal(cookie, `${sessionCookieName(port)}=${SESSION}`);
+  assert.match(cookie, new RegExp(`^${sessionCookieName(port)}=[A-Za-z0-9_-]{43}$`));
   assert.match(right.headers.get('set-cookie') ?? '', /HttpOnly; SameSite=Strict/);
   assert.equal((await fetch(`${base}/api/state`, { headers: { cookie } })).status, 200);
 
@@ -150,6 +150,55 @@ test('HTTP 密码登录：连续输错后锁定，锁定期间正确密码也被
   assert.equal((await form(base, PASSWORD)).status, 429);
   assert.equal((await fetch(`${base}/login?token=${TOKEN}`, { redirect: 'manual' })).status, 303);
   assert.equal((await form(base, PASSWORD)).status, 303);
+}));
+
+/** A password form posted from another loopback address, so the server sees another client. */
+function formFrom(base: string, local: string, password: string): Promise<number> {
+  const url = new URL(base);
+  const body = new URLSearchParams({ password }).toString();
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({ host: url.hostname, port: url.port, path: '/login', method: 'POST', localAddress: local,
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'content-length': Buffer.byteLength(body) } }, response => { response.resume(); resolve(response.statusCode ?? 0); });
+    request.on('error', reject);
+    request.end(body);
+  });
+}
+
+test('HTTP 密码登录：按来源地址分别限速，一处的猜测锁不住别处；全部来源合计只放慢不长锁', () => withPasswordServer(async (base, _port, clock) => {
+  for (let i = 0; i < FREE_FAILURES; i++) assert.equal(await formFrom(base, '127.0.0.3', `guess-${i}-xxxx`), 401);
+  assert.equal(await formFrom(base, '127.0.0.3', PASSWORD), 429, '猜测的来源被锁');
+  assert.equal(await formFrom(base, '127.0.0.4', PASSWORD), 303, '别的来源照常登录');
+  // Many addresses together reach the loose limit: everyone waits a little, at most a minute.
+  for (let i = 0; i < GLOBAL_LOGIN_LIMITS.freeFailures; i++) await formFrom(base, `127.0.${1 + Math.floor(i / 4)}.${10 + (i % 4)}`, `spread-${i}-xxxx`);
+  assert.equal(await formFrom(base, '127.0.0.5', PASSWORD), 429);
+  clock.now += GLOBAL_LOGIN_LIMITS.maxLockMs;
+  assert.equal(await formFrom(base, '127.0.0.5', PASSWORD), 303);
+}));
+
+test('HTTP 会话：每次登录各一个；退出只结束本浏览器并清 cookie，注销全部让所有浏览器重新登录；须请求标记', () => withPasswordServer(async (base, port) => {
+  const login = async () => ((await fetch(`${base}/login?token=${TOKEN}`, { redirect: 'manual' })).headers.get('set-cookie') ?? '').split(';')[0]!;
+  const first = await login(), second = await login(), third = await login();
+  assert.notEqual(first, second);
+  const read = (cookie: string) => fetch(`${base}/api/session`, { headers: { cookie } });
+  const info = await (await read(first)).json() as { createdAt: number; expiresAt: number | null; count: number };
+  assert.equal(info.count, 4, '三次登录加预置的一个');
+  assert.equal(typeof info.createdAt, 'number');
+  const post = (path: string, cookie: string, headers: Record<string, string> = { 'x-pa-executor': '1' }) =>
+    fetch(`${base}${path}`, { method: 'POST', headers: { cookie, 'content-type': 'application/json', ...headers }, body: '{}' });
+  assert.equal((await post('/api/session/logout', first, {})).status, 403);
+  const out = await post('/api/session/logout', first);
+  assert.equal(out.status, 200);
+  assert.match(out.headers.get('set-cookie') ?? '', new RegExp(`^${sessionCookieName(port)}=; .*Max-Age=0`));
+  assert.equal((await read(first)).status, 401);
+  assert.equal((await read(second)).status, 200);
+  // Logging in again from a browser that still has a session replaces it.
+  const renewed = ((await fetch(`${base}/login?token=${TOKEN}`, { redirect: 'manual', headers: { cookie: third } })).headers.get('set-cookie') ?? '').split(';')[0]!;
+  assert.equal((await read(third)).status, 401);
+  assert.equal((await read(renewed)).status, 200);
+  assert.deepEqual(await (await post('/api/session/logout-all', second)).json(), { removed: 3 });
+  assert.equal((await read(renewed)).status, 401);
+  assert.equal((await read(third)).status, 401);
+  assert.equal((await read(`${sessionCookieName(port)}=${SESSION}`)).status, 401);
 }));
 
 test('HTTP 密码登录：同时提交的多个猜测只受理一个', () => withPasswordServer(async base => {
@@ -307,4 +356,22 @@ test('页面：不依赖只在 HTTPS 或 localhost 才有的 crypto.randomUUID�
   const ids = new Set(Array.from({ length: 200 }, () => newRequestId()));
   assert.equal(ids.size, 200);
   for (const id of ids) assert.match(id, UUID);
+});
+
+test('HTTP 服务器状态：/api/host 须登录，只读令牌也拿不到；没有提供时 404', async () => {
+  const h = createHarness();
+  const host = { generatedAt: 1, cpu: { usagePercent: 12 }, connections: [] };
+  const server = createExecutorServer({ executor: h.ex, accessToken: TOKEN, session: SESSION, views: { host: async () => host } });
+  const bare = createExecutorServer({ executor: h.ex, accessToken: TOKEN, session: SESSION });
+  await Promise.all([server, bare].map(item => new Promise<void>(resolve => item.listen(0, '127.0.0.1', resolve))));
+  try {
+    const port = (server.address() as AddressInfo).port, other = (bare.address() as AddressInfo).port;
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/host`)).status, 401);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/host`, { headers: { authorization: 'Bearer tp_read_x' } })).status, 401);
+    assert.deepEqual(await (await fetch(`http://127.0.0.1:${port}/api/host`, { headers: { cookie: `${sessionCookieName(port)}=${SESSION}` } })).json(), host);
+    assert.equal((await fetch(`http://127.0.0.1:${other}/api/host`, { headers: { cookie: `${sessionCookieName(other)}=${SESSION}` } })).status, 404);
+  } finally {
+    await Promise.all([server, bare].map(item => new Promise(resolve => item.close(resolve))));
+    h.dispose();
+  }
 });

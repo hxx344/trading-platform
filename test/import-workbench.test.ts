@@ -12,7 +12,6 @@ import { parseEnv } from 'node:util';
 import { fileText, planImport, readWorkbench, readerIdentity } from '../src/service/import-workbench.ts';
 import { REQUEST_FILE, RESULT_FILE, RUNNING_STALE_MS, parseImportBody, readImportResult, submitImportRequest, takeImportRequest, writeImportResult } from '../src/service/import-channel.ts';
 import { runImportHelper } from '../src/service/import-helper.ts';
-import { keptSession } from '../src/data-dir.ts';
 import { parseServiceConfig } from '../src/service/config.ts';
 import { LONG, MAIN, SHORT } from './aster-fake.ts';
 import { addressOf } from '../src/aster/eip712.ts';
@@ -446,18 +445,3 @@ test('页面导入：预览逐个列出工作台配对能否导入；导入写�
   } finally { rmSync(wb.root, { recursive: true, force: true }); }
 });
 
-test('页面会话：数据目录里保留一份，重启沿用；格式不对时换新', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tp-session-'));
-  try {
-    const first = keptSession(dir);
-    assert.match(first, /^[A-Za-z0-9_-]{43}$/);
-    assert.equal(statSync(join(dir, 'http-session')).mode & 0o777, 0o600);
-    assert.equal(keptSession(dir), first);
-    writeFileSync(join(dir, 'http-session'), 'short\n');
-    const second = keptSession(dir);
-    assert.notEqual(second, first);
-    // Replaced once older than the cookie's 30 days.
-    assert.equal(keptSession(dir, Date.now() + 29 * 86_400_000), second);
-    assert.notEqual(keptSession(dir, Date.now() + 31 * 86_400_000), second);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
-});

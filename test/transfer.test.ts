@@ -1216,7 +1216,8 @@ test('存储：已有 v2 库升级到 v3 只新增划转的两张表与两个索
   const names = (db: DatabaseSync) => (db.prepare("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name").all() as { name: string }[]).map(row => row.name);
   const before = names(old);
   old.close();
-  const added = ['transfer_pairs', 'transfers', 'transfers_pair', 'transfers_unsettled'];
+  // read_*: the read indexes every open adds (store.ts READ_INDEXES), not part of migration 3.
+  const added = ['read_jobs_created', 'read_operations_unsettled', 'read_transfers_created', 'transfer_pairs', 'transfers', 'transfers_pair', 'transfers_unsettled'];
   const store = openStore(file);
   try {
     // Migration 4 (ADL) has its own upgrade test; this one checks migration 3 alone.
@@ -1228,7 +1229,8 @@ test('存储：已有 v2 库升级到 v3 只新增划转的两张表与两个索
     store.db.prepare("INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES ('r1', 'transfer-enable', 'd', 's', 'sim-pair', 1), ('r2', 'transfer-config', 'd', 's', 'sim-pair', 1)").run();
     store.db.exec(ROLLBACK_SQL);
     assert.equal(store.schemaVersion(), 2);
-    assert.deepEqual(names(store.db), before);
+    // The read indexes on tables the rollback keeps stay; older releases do not mind them (docs/observability.md 4).
+    assert.deepEqual(names(store.db).filter(name => !name.startsWith('read_')), before);
     assert.equal((store.db.prepare('SELECT COUNT(*) AS n FROM commands').get() as { n: number }).n, 0);
     assert.equal((store.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'legacy'").get() as { n: number }).n, 1);
   } finally { store.close(); }

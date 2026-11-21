@@ -737,3 +737,12 @@
 **样式**：`monitor.css` 末尾 `goldoil-*` 一节，只用已有颜色与间距令牌，无内联样式。700px 以下图表标题区换行，范围按钮不折字。
 
 **验证**：`scripts/dev-monitor.ts` 替身后端，headless Chromium 在 1280 与 390 宽度走 CL / BZ、两个视图、四个范围，添加并保存告警档位（POST 200）；两种宽度都没有横向溢出，没有 CSP 报错（只有预览环境本来就没有的 `/api/update`、`/api/read-token`、`/api/asset/positions` 返回 404）。截图环境缺中文字体，中文显示为方框，只核对了版式。
+
+## 顶栏服务器负载与连线（v0.75.0）
+
+- 对照工作台顶栏右侧的 `HostStatusBadge` 与 `ConnectionStatus`（project-aggregation `src/HostStatusBadge.tsx`、`src/ConnectionStatus.tsx`、`src/server-status-types.ts`，提交 `52337a9`），本服务对应 `web/src/HostStatusBadge.tsx`、`web/src/ConnectionStatus.tsx`、`web/src/host-status.ts`，挂在 `App.tsx` 顶栏面包屑右侧，顺序同工作台：先负载，后连线。
+- 两个徽章共用一个 `/api/host` 订阅（`use-live-resource.ts`，每 3 秒，页面隐藏时暂停），这次读取的往返耗时就是“本机 → 服务器”延迟，分级同工作台（≤150 ms 良好、≤500 ms 一般、更慢为较慢；读取失败为无法连接，浏览器离线为本机离线）。负载 ≥75% 黄、≥90% 红；手机宽度只显示三项里最高的一个。
+- 与工作台不同：负载详情加交易服务进程的内存与事件循环延迟，「查看详情」改为打开运行状态页；连线详情加“服务连线”列表（行情服务、控制面、ASTER 用户推送、永续行情、副服务器心跳），有断开时摘要上显示红色提示点，有异常时黄色。后端见 [observability.md](observability.md) 第 3 节。
+- 样式：`web/src/topbar-status.css` 复制自工作台 `src/styles.css`（提交 `52337a9`）第 171–195、409、421–425 行，选择器加 `.app-shell > .workspace > .topbar > .topbar-right` 限定，手机断点用外壳的 760px；服务连线列表与提示点写在 `styles.css` 末尾《本服务》。
+- 设置页加「登录会话」：显示本浏览器的登录时间与失效时间、会话总数，「退出登录」「注销全部设备」（后者先确认），完成后回到登录页。
+- 验证：替身后端上 1280 与 390 宽度截图，展开两个详情，无横向溢出、无 CSP 报错。回滚版本 v0.74.0。

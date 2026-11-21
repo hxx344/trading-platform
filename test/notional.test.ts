@@ -2,6 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { ContractError } from '../src/contracts.ts';
 import { add, cmp } from '../src/decimal.ts';
 import { createExecutor } from '../src/executor.ts';
@@ -114,4 +115,23 @@ test('已配置上限时拒绝卖出方向的追价首腿；买入追价照常�
   await assert.rejects(h.ex.preview(sell, SESSION), code('notional_chase_sell'));
   const buy = await h.ex.preview(chaseIntent(), SESSION);
   assert.equal(cmp(buy.notional, buy.legs[0].priceBound as string) >= 0, true);
+}, { perJob: '100', totalOpen: '1000' }));
+
+test('累计已用的缓存：别的连接提交的改动与本连接的写入都让它重算，回滚的事务不改变结果', () => withHarness(async h => {
+  bindAccounts(h.ex);
+  const first = await previewAndConfirm(h);
+  const used = () => h.ex.notionalLimits()!.openUsed;
+  assert.equal(used(), first.preview.notional);
+  assert.equal(used(), first.preview.notional, '没有写入时复用');
+  // Another connection (another process) turns the job into a close: committed elsewhere, seen here.
+  const other = new DatabaseSync(h.file);
+  try { other.prepare("UPDATE jobs SET json = json_set(json, '$.action', 'close') WHERE id = ?").run(first.jobId); } finally { other.close(); }
+  assert.equal(used(), '0');
+  // This connection: a rolled-back change leaves the sum, a committed one moves it.
+  h.store.db.exec('BEGIN');
+  h.store.db.prepare("UPDATE jobs SET json = json_set(json, '$.action', 'open') WHERE id = ?").run(first.jobId);
+  h.store.db.exec('ROLLBACK');
+  assert.equal(used(), '0');
+  h.store.db.prepare("UPDATE jobs SET json = json_set(json, '$.action', 'open') WHERE id = ?").run(first.jobId);
+  assert.equal(used(), first.preview.notional);
 }, { perJob: '100', totalOpen: '1000' }));

@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import { createExecutorServer, sessionCookieName } from '../src/http.ts';
+import { openSessionStore } from '../src/sessions.ts';
 import { assertDedicatedDataDir, writeAccessUrl } from '../src/main.ts';
 import { SIM_TRANSFER_PAIR } from '../src/simulation.ts';
 import { bindAccounts, chaseIntent, createHarness, openIntent, settle } from './harness.ts';
@@ -60,10 +61,12 @@ test('HTTP：正确令牌 303 下发按端口命名的会话 cookie；登录后�
   assert.equal(loginResponse.headers.get('referrer-policy'), 'no-referrer');
   assert.equal(loginResponse.headers.get('cache-control'), 'no-store');
   const setCookie = loginResponse.headers.get('set-cookie') ?? '';
-  assert.ok(setCookie.startsWith(`pa_executor_session_${port}=${SESSION};`), setCookie);
+  // Each login is a session of its own, with a fresh cookie value.
+  assert.match(setCookie, new RegExp(`^pa_executor_session_${port}=[A-Za-z0-9_-]{43};`), setCookie);
+  assert.notEqual(setCookie.split(';')[0], cookie);
   assert.match(setCookie, /; HttpOnly; SameSite=Strict; Path=\//);
   assert.doesNotMatch(setCookie, new RegExp(TOKEN));
-  assert.equal(cookie, `pa_executor_session_${port}=${SESSION}`);
+  assert.match(cookie, new RegExp(`^pa_executor_session_${port}=[A-Za-z0-9_-]{43}$`));
   const page = await fetch(base + '/', { headers: { cookie } });
   assert.equal(page.status, 200);
   assert.equal(page.headers.get('set-cookie'), null);
@@ -313,7 +316,7 @@ test('HTTP：页面导入只在服务提供时开放，读写都要会话与请�
   const submitted: unknown[] = [];
   const imports = { submit: (body: unknown) => { submitted.push(body); return { id: 'req-1', at: 1 }; }, latest: () => ({ id: 'req-1', phase: 'done' }) };
   const open = async () => {
-    const server = createExecutorServer({ executor: h.ex, accessToken: randomUUID(), session: SESSION, sessionMaxAgeS: 600, imports });
+    const server = createExecutorServer({ executor: h.ex, accessToken: TOKEN, sessions: openSessionStore({ file: join(h.dir, 'http-session'), epoch: 'e' }), imports });
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
     return server;
   };
@@ -323,19 +326,21 @@ test('HTTP：页面导入只在服务提供时开放，读写都要会话与请�
     const plainCookie = await login(plain.base);
     assert.equal((await fetch(plain.base + '/api/import', { headers: { cookie: plainCookie } })).status, 404, '没有导入通道时不开放');
 
-    const port = (server.address() as AddressInfo).port, base = `http://127.0.0.1:${port}`, cookie = `${sessionCookieName(port)}=${SESSION}`;
+    const port = (server.address() as AddressInfo).port, base = `http://127.0.0.1:${port}`, cookie = await login(base);
     assert.equal((await fetch(base + '/api/import')).status, 401);
     assert.deepEqual(await (await fetch(base + '/api/import', { headers: { cookie } })).json(), { result: { id: 'req-1', phase: 'done' } });
     assert.equal((await fetch(base + '/api/import', { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: '{}' })).status, 403);
     assert.deepEqual(await (await post(base, '/api/import', { action: 'preview' }, { cookie })).json(), { id: 'req-1', at: 1 });
     assert.deepEqual(submitted, [{ action: 'preview' }]);
 
-    // A restart brings a new access token but the same kept session: the open page's cookie still works.
+    // A restart reads the kept sessions back: the open page's cookie still works.
     await new Promise(resolve => server.close(resolve));
     server = await open();
     const again = (server.address() as AddressInfo).port;
-    const response = await fetch(`http://127.0.0.1:${again}/api/state`, { headers: { cookie: `${sessionCookieName(again)}=${SESSION}` } });
+    const value = cookie.split('=')[1];
+    const response = await fetch(`http://127.0.0.1:${again}/api/state`, { headers: { cookie: `${sessionCookieName(again)}=${value}` } });
     assert.equal(response.status, 200);
+    assert.doesNotMatch(readFileSync(join(h.dir, 'http-session'), 'utf8'), new RegExp(value!), '文件里只有摘要');
   } finally {
     await new Promise(resolve => server.close(resolve));
     await new Promise(resolve => plain.server.close(resolve));
@@ -346,7 +351,7 @@ test('HTTP：页面导入只在服务提供时开放，读写都要会话与请�
 test('HTTP：保留会话的登录 cookie 带 Max-Age，随机会话的不带', async () => {
   const h = createHarness();
   const token = 'kept-token-000001';
-  const server = createExecutorServer({ executor: h.ex, accessToken: token, session: SESSION, sessionMaxAgeS: 2_592_000 });
+  const server = createExecutorServer({ executor: h.ex, accessToken: token, sessions: openSessionStore({ file: join(h.dir, 'http-session'), epoch: 'e' }) });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const plain = await startServer(h);
   try {

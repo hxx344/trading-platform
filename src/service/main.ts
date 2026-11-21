@@ -12,7 +12,8 @@ import { fileURLToPath } from 'node:url';
 import { openStore } from '../store.ts';
 import { createExecutor, type Executor } from '../executor.ts';
 import type { PairRecord } from '../transfer.ts';
-import { DATABASE_FILES, assertDedicatedDataDir, claimDataDirEnvironment, keptSession } from '../data-dir.ts';
+import { DATABASE_FILES, assertDedicatedDataDir, claimDataDirEnvironment } from '../data-dir.ts';
+import { openSessionStore, sessionEpoch } from '../sessions.ts';
 import { holdAccountLocks } from '../live/setup.ts';
 import { AsterClient, RequestBudget, type AsterCredentials } from '../aster/client.ts';
 import { AsterTransferConnector } from '../aster/transfer.ts';
@@ -51,6 +52,9 @@ import { createServiceLog, teeStream, type ServiceLog } from './service-log.ts';
 import { createReadTokens } from '../read-token.ts';
 import { createSummary, type Summary, type SummaryInput } from './summary.ts';
 import { createWatch, watchLoop, watchSummary, type Watch } from './watch.ts';
+import { installCrashGuard, takeCrashRecord } from '../crash-guard.ts';
+import { createHostStatus, processLoopHistogram } from '../host-status.ts';
+import { HEALTH_TICK_MS, createHealthWatch, type HealthWatch } from './health-watch.ts';
 import { newsLoop, newsViews, type NewsHolder } from './news.ts';
 import type { NewsOptions } from '../news/feed.ts';
 
@@ -275,9 +279,10 @@ export async function startService(options: StartOptions): Promise<ReturnType<ty
   catch (error) { closeLogs(); throw error; }
 }
 
-async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, socketPath, executionBuild, configBuild, marketClient, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, ondoOptions, watchOptions, updateFetch, news: newsOptions }: StartOptions & { marketClient?: MarketClient }, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
+async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, socketPath, executionBuild, configBuild, marketClient, marketSocketPath, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, ondoOptions, watchOptions, updateFetch, news: newsOptions }: StartOptions & { marketClient?: MarketClient }, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
   const updates = socketPath === undefined ? (await import('./update.ts')).createServiceUpdates(importDir, updateFetch) : undefined;
-  const session = keptSession(dir);
+  // Bound to the password, so `install.sh --set-password` ends every session (sessions.ts).
+  const sessions = openSessionStore({ file: join(dir, 'http-session'), epoch: sessionEpoch(password) });
   // O7: the oil and hynix books come from the market monitor's perpetual collector when it has a recent one (oil/pushed.ts);
   // the monitor opens further down, so the source looks it up on each read (no collector: every leg is read over REST).
   let collector: PerpetualMonitor | null = null;
@@ -402,21 +407,31 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   const hynixCheck = oil && hynixBalance ? hynixBalanceCheck(oil, hynixBalance, { notify: text => notifier.notify(text), busy: hynixBusy(executor), log: line => process.stderr.write(`${line}\n`) }) : undefined;
   const oilText = `${oil ? `；原油执行账户 ${oil.config.accounts.length} 个` : ''}${options ? `；期权账户 1 个${options.running() ? '' : '（未启动，后台重试）'}` : ''}${crossex ? `；CrossEx 账户 1 个${crossex.runtime() ? '' : '（未启动，后台重试）'}` : ''}`;
   try {
+    // A crash skips the stop alert (crash-guard.ts): its marker is reported here, before the start alert.
+    const crash = takeCrashRecord(dir);
+    if (crash) notifier.notify(`【服务上次异常退出】北京时间 ${new Date(crash.at + 8 * 3600_000).toISOString().slice(0, 19).replace('T', ' ')}，${crash.kind === 'unhandledRejection' ? '未处理的 Promise 拒绝' : '未捕获的异常'}：${crash.message}${crash.stack ? `（${crash.stack.split('\n').slice(0, 3).join(' ← ')}）` : ''}。已由 systemd 重启，进行中的委托与划转按启动核对处理`);
     notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}`);
     for (const text of warnings) notifier.notify(`【配置未生效】${text}`);
   } catch (error) { hynixBalance?.close(); oilPnl?.close(); oilRules?.close(); closeMonitorStore(); monitorOutbox?.close(); asset?.close(); samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
 
   // The heartbeat for the second server's main-watch; made once the run loop can say whether it is ready.
   let watch: Watch | null = null;
+  // The market and control processes, the user streams and the perpetual venues (health-watch.ts).
+  const host = createHostStatus({ dataDir: dir, loop: processLoopHistogram() });
+  const health: HealthWatch = createHealthWatch({
+    ...(marketSocketPath ? { marketSocketPath } : {}), ...(socketPath !== undefined ? { controlPort: port } : {}),
+    streams: () => streams.view(), perpetual: () => monitor?.perpetual?.status() ?? null, notify: text => notifier.notify(text),
+  });
   // The read-only API token (docs/mcp.md); without read-token.json no token is accepted.
   const readTokens = createReadTokens({ dir });
   // 快讯连接随后台循环开关，启动失败时不会留下连接。
   const news: NewsHolder | null = newsOptions ? { feed: null } : null;
   return runExecutor({
-    executor, store, dir, port, socketPath, executionBuild, configBuild, app, session, readTokens,
+    executor, store, dir, port, socketPath, executionBuild, configBuild, app, sessions, readTokens,
     ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: oil ? ['jobs', 'transfers', 'adl'] : ['transfers', 'adl'], drainMs: DRAIN_MS,
     views: {
-      status: () => ({ budget: client.requestBudget.state(), idleWeight: idleWeight(config, executor.transferPairSettings()), streams: streams.view(), feishu: notifier.status(), summary: summary.status(), samples: { available: samples !== null, error: samplesError },
+      host: async () => ({ ...await host.read(), connections: health.connections(watch?.status() ?? null) }),
+      status: () => ({ dependencies: health.view(), budget: client.requestBudget.state(), idleWeight: idleWeight(config, executor.transferPairSettings()), streams: streams.view(), feishu: notifier.status(), summary: summary.status(), samples: { available: samples !== null, error: samplesError },
         ...(watch ? { watch: watch.status() } : {}),
         ...(config.monitor ? { monitor: { available: monitor !== null, error: monitorError, ...(monitor ? monitorStatus(monitor) : { anthropic: null, oil: null, goldoil: null, hynix: null, perpetual: null }) } } : {}) }),
       balanceHistory: (pairId, range) => {
@@ -457,6 +472,13 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
           await context.pause(UPDATE_TICK_MS);
         }
       })()] : []),
+      (async () => {
+        while (!context.stopped()) {
+          try { await health.tick(); }
+          catch (error) { process.stderr.write(`依赖健康检查出错：${error instanceof Error ? error.message : String(error)}\n`); }
+          await context.pause(HEALTH_TICK_MS);
+        }
+      })(),
       (async () => {
         while (!context.stopped()) {
           try { await summary.tick(); }
@@ -552,6 +574,7 @@ async function main(): Promise<void> {
   }
   if (!values['data-dir']) throw new Error('需要 --data-dir <独立目录的绝对路径>');
   const dir = assertDedicatedDataDir(values['data-dir']);
+  installCrashGuard('交易服务', { dir });
   const importDir = values['import-dir'];
   if (importDir !== undefined && !isAbsolute(importDir)) throw new Error('--import-dir 必须是绝对路径');
   const app = values.socket === undefined ? (await import('../web-assets.ts')).loadWebApp() : undefined;

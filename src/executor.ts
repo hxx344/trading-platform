@@ -927,10 +927,19 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
    * given back by fills, cancels or a close; only a job that ended without any order leaving this process (every operation
    * not-sent, or none) is left out. Jobs are never pruned, so the sum survives restarts and cap changes.
    */
+  let notionalCache: { key: string; value: string } | null = null;
+  const dbStateKey = (): string => `${(db.prepare('SELECT total_changes() AS n').get() as { n: number }).n}:${(db.prepare('PRAGMA data_version').get() as { data_version: number }).data_version}`;
   function openNotionalUsed(): string {
+    // The page reads this every two seconds and it parses every opening job ever made. Outside a transaction the sum can
+    // only change with a committed write, by this connection (total_changes) or another (data_version), so it is reused
+    // until either moves. Inside a transaction (a confirm) it is always computed afresh, as that one may still roll back.
+    const key = db.isTransaction ? null : dbStateKey();
+    if (key !== null && notionalCache?.key === key) return notionalCache.value;
     const rows = db.prepare(`SELECT json FROM jobs WHERE json_extract(json, '$.action') = 'open'
       AND NOT (final = 1 AND NOT EXISTS (SELECT 1 FROM operations WHERE operations.job_id = jobs.id AND operations.state <> 'not-sent'))`).all() as { json: string }[];
-    return add('0', ...rows.map(row => jobNotional((JSON.parse(row.json) as Job).legs)));
+    const value = add('0', ...rows.map(row => jobNotional((JSON.parse(row.json) as Job).legs)));
+    if (key !== null) notionalCache = { key, value };
+    return value;
   }
   /** Closing jobs only meet the per-job cap: the running total bounds new exposure, and closing must stay possible. */
   function checkNotional(notional: string, action: Action): void {

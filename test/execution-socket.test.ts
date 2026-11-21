@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
+import { openSessionStore } from '../src/sessions.ts';
 import { CLIENT_ADDRESS_HEADER, CONFIG_CHECK_HEADER, CONFIG_MATCH_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, sessionCookieName } from '../src/http-public.ts';
 import { PASSWORD_FILE, hashPassword, loadPasswordHash, parsePasswordHash } from '../src/login-password.ts';
 import { runExecutor } from '../src/runtime.ts';
@@ -38,7 +39,7 @@ test('拆分执行器只监听本地套接字，沿用浏览器端口和会话�
   const socketPath = socketFor(h.dir);
   const build = 'a'.repeat(64);
   const configBuild = 'b'.repeat(64);
-  const host = `100.101.102.103:${port}`, session = 'k'.repeat(43);
+  const host = `100.101.102.103:${port}`;
   const forwarded = { host, [EXECUTION_HEADER]: build };
   const imported: unknown[] = [];
   const logs: string[] = [];
@@ -47,7 +48,7 @@ test('拆分执行器只监听本地套接字，沿用浏览器端口和会话�
   const firstRead = new Promise<void>(resolve => { allowPositions = resolve; });
   const refresh = h.ex.refreshPositions;
   h.ex.refreshPositions = async () => { await firstRead; return refresh(); };
-  const run = runExecutor({ executor: h.ex, store: h.store, dir: h.dir, port, socketPath, executionBuild: build, configBuild, session, startedMessage: 'test',
+  const run = runExecutor({ executor: h.ex, store: h.store, dir: h.dir, port, socketPath, executionBuild: build, configBuild, sessions: openSessionStore({ file: join(h.dir, 'http-session'), epoch: 'e' }), startedMessage: 'test',
     password, log: line => logs.push(line), listen: { address: '100.101.102.103', urlHost: '100.101.102.103' },
     imports: { latest: () => null, submit: body => { imported.push(body); return { id: 'test', at: 1 }; }, legacyUpdate: () => legacyUpdateJob(h.dir) } });
   try {
@@ -89,15 +90,16 @@ test('拆分执行器只监听本地套接字，沿用浏览器端口和会话�
     const login = await call(socketPath, tailnet.pathname + tailnet.search, forwarded);
     assert.equal(login.status, 303);
     const cookie = login.headers['set-cookie']![0]!.split(';')[0]!;
-    assert.equal(cookie, `${sessionCookieName(port)}=${session}`);
+    assert.match(cookie, new RegExp(`^${sessionCookieName(port)}=[A-Za-z0-9_-]{43}$`));
     assert.match(login.headers['set-cookie']![0]!, /HttpOnly; SameSite=Strict; Path=\/; Max-Age=/);
     const form = { ...forwarded, origin: `http://${host}`, 'content-type': 'application/x-www-form-urlencoded' };
     const badPassword = await call(socketPath, '/login', { ...form, [CLIENT_ADDRESS_HEADER]: 'arbitrary text' }, 'POST', 'password=wrong');
     assert.equal(badPassword.status, 401);
     assert.ok(logs.some(line => line.includes('密码错误（来自 未知地址）')));
     const byPassword = await call(socketPath, '/login', { ...form, [CLIENT_ADDRESS_HEADER]: '100.99.98.97' }, 'POST', 'password=test-local-login');
-    assert.equal(byPassword.headers['set-cookie']![0], login.headers['set-cookie']![0]);
-    assert.ok(logs.some(line => line.includes('密码登录成功（来自 100.99.98.97）')));
+    assert.match(byPassword.headers['set-cookie']![0]!, /HttpOnly; SameSite=Strict; Path=\/; Max-Age=/);
+    assert.notEqual(byPassword.headers['set-cookie']![0], login.headers['set-cookie']![0], '每次登录各自一个会话');
+    assert.ok(logs.some(line => line.includes('密码登录成功（来自 100.99.98.97，')));
     const authorized = { ...forwarded, cookie };
     const write = { ...authorized, 'x-pa-executor': '1', 'content-type': 'application/json' };
     for (const [path, method] of [['/', 'GET'], ['/assets/app.js', 'GET'], ['/api/update', 'GET'], ['/api/update/check', 'POST'], ['/api/update/apply', 'POST']]) {

@@ -9,14 +9,21 @@
 // O(1) however many requests share a source. How long a source holds a result depends on its deadline:
 // - With `timeoutMs`, the result is held strongly until it aborts (a source aborted or the timer fired), as Node holds an
 //   AbortSignal.timeout() signal; the timer bounds the hold.
-// - Without one, the source holds the result weakly and a FinalizationRegistry unlinks it once collected, so a result whose
-//   request ended without any source aborting does not pin memory on a long-lived source. The result must stay reachable
-//   for as long as its abort matters: read after an await, captured by a live closure, or handed to a consumer that holds
-//   it while in flight (fetch, http.request, untilAborted). A listener on the result alone does not hold it, nor does a
-//   local that optimized code no longer reads after the await. test/any-signal.test.ts checks fetch and http.request.
+// - Without one, the result is held strongly while it has 'abort' listeners of its own and weakly otherwise, as Node
+//   does for AbortSignal.any(): a consumer that only listens (a promise settled by the abort alone) still sees the abort,
+//   and once the listeners are gone (fetch removes its listener when the request is collected, readers in finally) a
+//   result whose request ended without any source aborting is unlinked when collected instead of pinning ~1.6 KB on a
+//   long-lived source. The forwarding listener of a result used as another call's source does not count. Listeners are
+//   seen through the instance's addEventListener/removeEventListener (fetch, http.request, events.once, addAbortListener
+//   and `onabort =` all go through them; EventTarget.prototype.addEventListener.call does not), and a listener left on
+//   a result pins it with its sources until a source aborts, so remove listeners on success (`onabort = null` does not).
+//   A result with no listener must stay reachable for as long as its abort matters: referenced from a frame or closure
+//   that live I/O or a timer still reaches. test/any-signal.test.ts checks fetch, http.request and listener-only waits.
 // Unlike the native implementation, a result aborts from its source's listener: source listeners registered before the
 // first anySignal() call on that source see the result still pending, and one calling stopImmediatePropagation() would
 // stop the forwarding (no code here does).
+
+import { getEventListeners } from 'node:events';
 
 /** @typedef {{ sources: AbortSignal[]; timer: ReturnType<typeof setTimeout> | null; held: AbortController | null; result: WeakRef<AbortSignal> | null }} Link */
 
@@ -24,6 +31,30 @@
 const hubs = new WeakMap();
 /** @type {WeakMap<AbortSignal, AbortController>} Keeps a weakly held result's controller alive exactly as long as its signal. */
 const owners = new WeakMap();
+
+/** Holds an untimed result strongly exactly while it has 'abort' listeners besides its own forwarding one. @param {Link} link @param {AbortSignal} signal */
+function track(link, signal) {
+  if (!link.result) return;
+  const own = getEventListeners(signal, 'abort').length - (hubs.has(signal) ? 1 : 0);
+  link.held = own > 0 ? owners.get(signal) ?? null : null;
+}
+
+/** @param {Link} link @param {AbortSignal} signal */
+function watchListeners(link, signal) {
+  const add = signal.addEventListener, remove = signal.removeEventListener;
+  Object.defineProperties(signal, {
+    addEventListener: { configurable: true, writable: true, value(/** @type {[string, ...unknown[]]} */ ...args) {
+      const result = Reflect.apply(add, this, args);
+      if (args[0] === 'abort') track(link, signal);
+      return result;
+    } },
+    removeEventListener: { configurable: true, writable: true, value(/** @type {[string, ...unknown[]]} */ ...args) {
+      const result = Reflect.apply(remove, this, args);
+      if (args[0] === 'abort') track(link, signal);
+      return result;
+    } },
+  });
+}
 
 /** @param {Link} link */
 function unlink(link) {
@@ -76,6 +107,7 @@ export function anySignal(sources, timeoutMs) {
   } else if (list.length) {
     owners.set(signal, controller);
     collected.register(signal, link, link);
+    watchListeners(link, signal);
   }
   for (const source of list) hubOf(source).add(link);
   return signal;

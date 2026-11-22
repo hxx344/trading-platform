@@ -78,21 +78,42 @@ test('anySignal：带超时的结果只被自身监听器引用时，回收后�
   assert.equal(aborted, 100);
 });
 
-test('anySignal：不带超时、请求结束时没有来源中止的组合，回收后不留在长期来源上', async () => {
+test('anySignal：不带超时、请求结束时没有来源中止的组合，监听器移除并回收后不留在长期来源上', async () => {
   setFlagsFromString('--expose-gc');
   const gc = runInNewContext('gc') as () => void;
   const stopped = new AbortController();
   const heap = async () => { for (let i = 0; i < 3; i++) { gc(); await settle(20); } return process.memoryUsage().heapUsed; };
   const round = () => {
-    for (let i = 0; i < 30_000; i++) anySignal([stopped.signal, new AbortController().signal]).addEventListener('abort', () => {});
+    for (let i = 0; i < 30_000; i++) {
+      // A finished request: its reader listened and stopped listening (fetch does so once the request is collected).
+      const signal = anySignal([stopped.signal, new AbortController().signal]), listener = () => {};
+      signal.addEventListener('abort', listener);
+      signal.removeEventListener('abort', listener);
+      anySignal([stopped.signal, anySignal([stopped.signal])]);
+    }
   };
   round();
   const before = await heap();
   for (let i = 0; i < 3; i++) { round(); await heap(); }
   const grown = (await heap()) - before;
-  // Holding these strongly keeps about 1.6 KB per call: 90 000 calls would add ~140 MB.
-  assert.ok(grown < 20 * 2 ** 20, `9 万次组合后堆增长 ${(grown / 2 ** 20).toFixed(1)} MiB`);
+  // Holding these strongly keeps about 1.6 KB per combination: 90 000 rounds (270 000 calls) would add well over 100 MB.
+  assert.ok(grown < 20 * 2 ** 20, `9 万轮组合后堆增长 ${(grown / 2 ** 20).toFixed(1)} MiB`);
   stopped.abort('stop');
+});
+
+test('anySignal：不带超时的结果只被等待中止的监听器引用时（Promise 只靠中止结束），回收后仍能收到中止', { timeout: 10_000 }, async () => {
+  setFlagsFromString('--expose-gc');
+  const gc = runInNewContext('gc') as () => void;
+  const stopped = new AbortController();
+  // The signal, its listener, the promise and the suspended frame only reference each other, as with a fake fetch.
+  const wait = async () => {
+    const signal = anySignal([stopped.signal, new AbortController().signal]);
+    await new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+  };
+  const outcomes = Array.from({ length: 50 }, () => wait().catch((error: unknown) => error));
+  for (let i = 0; i < 3; i++) { gc(); await settle(20); }
+  stopped.abort('stop');
+  assert.deepEqual(new Set(await Promise.all(outcomes)), new Set(['stop']));
 });
 
 test('anySignal：不带超时的结果只交给在途的 fetch、http.request 时，回收后仍能把来源的中止传过去', { timeout: 20_000 }, async () => {

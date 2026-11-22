@@ -21,6 +21,7 @@ export function parsePairKey(key: string): { venue: Venue; symbol: string } | nu
 }
 /** 配对键里的代码；不是配对键时原样返回。 */
 export const tickerOf = (key: string): string => parsePairKey(key)?.symbol ?? key;
+export const venueOf = (key: string): Venue => parsePairKey(key)?.venue ?? 'rh';
 
 /**
  * 两边合约规格已核对一致（同一标的、每股或每枚计价）的代码，2026-11-22 按两边公开目录（Var metadata/stats 的 name、

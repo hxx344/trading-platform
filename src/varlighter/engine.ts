@@ -1,19 +1,24 @@
 // Var/Lighter 价差模块的运行时（docs/varlighter.md）：采集对齐样本、维护各标的基线、跑模拟盘，并给页面出视图。
 // 只读公开行情、只写自己的 varlighter.sqlite；不碰执行器、不下任何真实订单。
+import { anySignal } from '../any-signal.mjs';
 import { backtestRequest, runBacktest } from './backtest.ts';
 import { LighterStream, MAX_DEPTH_MARKETS, depthAt, fetchDepth, fetchRhMarkets, fetchVarListings, type Connect, type DepthSnapshot, type FetchLike } from './feeds.ts';
-import { KIND_NAMES, PAIR_KEY, REGIME_NAMES, VENUES, VENUE_NAMES, bucketOf, midBasis, pairMarkets, regimeOf, regimesOf, sortPairs, spreadOf, tickerOf, type PairInfo, type RhMarket, type Sample, type VarListing, type Venue } from './model.ts';
+import { KIND_NAMES, PAIR_KEY, REGIME_NAMES, VENUES, VENUE_NAMES, bucketOf, midBasis, pairMarkets, regimeOf, regimesOf, sortPairs, spreadOf, tickerOf, venueOf, type PairInfo, type RhMarket, type Sample, type VarListing, type Venue } from './model.ts';
 import { orderPlan, type OrderPlan } from './plan.ts';
 import { BaselineTracker, suggestedEntryBps, symbolStats, type Baseline, type RegimeStats } from './stats.ts';
-import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, ParamsError, closePosition, decide, fundingEstimate, markToMarket, openBlocker, openPosition, readGlobalParams, readSymbolParams,
+import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, ParamsError, closePosition, decide, positionSpread, fundingEstimate, markToMarket, openBlocker, openPosition, readGlobalParams, readSymbolParams,
   CLOSE_REASON_NAMES, DIRECTION_NAMES, type ClosedTrade, type Direction, type GlobalParams, type Position, type SymbolParams } from './strategy.ts';
 import type { VarLighterStore } from './store.ts';
-import type { BacktestView, DepthStatus, PaperView, PollStats, ReadinessItem, ReadinessView, Settings, SourceState, StateView, SymbolPoint, SymbolView, VenueStatus } from './views.ts';
+import type { BacktestView, DepthStatus, OrphanRow, PaperView, PollStats, ReadinessItem, ReadinessView, Settings, SourceState, StateView, SymbolPoint, SymbolView, VenueStatus } from './views.ts';
 
 export const VAR_POLL_MS = 60_000;
 export const CATALOG_MS = 10 * 60_000;
 const PRUNE_MS = 3_600_000;
+const PRUNE_BATCH = 2_000;
+const RECOUNT_MS = 10 * 60_000;
 const REQUEST_TIMEOUT_MS = 20_000;
+/** 参数里最多保存这么多个配对键（含已停用的）。 */
+const MAX_SAVED_SYMBOLS = 500;
 /** 上线前核对清单的门槛。 */
 export const READY_BASELINE_DAYS = 3;
 export const READY_PAPER_TRADES = 20;
@@ -47,7 +52,12 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   const lastQuoteAt = new Map<string, number>(), latest = new Map<string, Sample>();
   const trackers = new Map<string, BaselineTracker>();
   const positions = new Map<string, Position>();
-  const cooldown = new Map<string, number>();
+  const cooldown = new Map<string, number>(Object.entries(store.state<Record<string, number>>('cooldown') ?? {}).filter(([key, until]) => PAIR_KEY.test(key) && Number.isFinite(until)));
+  const saveCooldown = () => store.setState('cooldown', Object.fromEntries([...cooldown].filter(([, until]) => until > now())), now());
+  /** 近 24 小时每个配对的样本数（按主键数，10 分钟内只数一次，其间随写入累加），每个配对首条样本时刻与全库首条（清理后重读）。 */
+  const recent = new Map<string, { at: number; count: number }>();
+  const firsts = new Map<string, number | null>();
+  let firstSample: number | null | undefined;
   const ages: number[] = [];
   const startedAt = now();
   let sequence = 0;
@@ -170,6 +180,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     // 先预热基线（只含库里已有的样本），再写入这批样本，避免当前样本被计入自己的基线。
     for (const { pair } of fresh) tracker(pair);
     stats.written = store.addSamples(fresh.map(item => item.sample));
+    noteSamples(fresh.map(item => item.sample));
     for (const { pair, sample } of fresh) {
       latest.set(pair.key, sample);
       step(pair, sample);
@@ -199,19 +210,46 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     track.push(sample);
   }
 
-  function finish(position: Position, sample: Sample, spread: NonNullable<ReturnType<typeof spreadOf>>, reason: ClosedTrade['reason']): ClosedTrade {
+  function finish(position: Position, sample: Sample, spread: NonNullable<ReturnType<typeof spreadOf>>, reason: ClosedTrade['reason'], note = ''): ClosedTrade {
     const trade = closePosition(position, sample.t, spread, reason, settings.global, fundingEstimate(position, sample.t, sample.varFunding, sample.rhFunding));
     positions.delete(position.symbol);
     cooldown.set(position.symbol, sample.t + paramsOf(position.symbol).cooldownMinutes * 60_000);
-    store.closePosition(trade, { at: now(), kind: 'close', message: `${CLOSE_REASON_NAMES[reason]}：净 ${fmt(trade.netUsd, 2)} 美元（${fmt(trade.netBps, 1)} 基点），持有 ${fmt((trade.closedAt - trade.openedAt) / 60_000, 0)} 分钟` });
+    saveCooldown();
+    store.closePosition(trade, { at: now(), kind: 'close', message: `${note}${CLOSE_REASON_NAMES[reason]}${spread.estimated ? '（Lighter 价为估算）' : ''}：净 ${fmt(trade.netUsd, 2)} 美元（${fmt(trade.netBps, 1)} 基点），持有 ${fmt((trade.closedAt - trade.openedAt) / 60_000, 0)} 分钟` });
     return trade;
+  }
+
+  function noteSamples(samples: readonly Sample[]): void {
+    for (const sample of samples) {
+      const counted = recent.get(sample.symbol);
+      if (counted) counted.count++;
+      if (firsts.get(sample.symbol) === null) firsts.set(sample.symbol, sample.t);
+      if (firstSample === null) firstSample = sample.t;
+    }
+  }
+  function recentCount(key: string, time: number): number {
+    const counted = recent.get(key);
+    if (counted && time - counted.at < RECOUNT_MS) return counted.count;
+    const count = store.countSince(key, time - 86_400_000);
+    recent.set(key, { at: time, count });
+    return count;
+  }
+  /** 分批删过期样本，批间让出事件循环（满量时一小时约 1.3 万条）；停服时停下。 */
+  async function pruneSamples(time: number, stopped: () => boolean): Promise<void> {
+    while (!stopped() && store.pruneSamples(time, PRUNE_BATCH) === PRUNE_BATCH) await new Promise(resolve => setImmediate(resolve));
+    store.pruneEvents(time);
+    firsts.clear(); firstSample = undefined;
+  }
+  function firstOf(key: string): number | null {
+    if (!firsts.has(key)) firsts.set(key, store.firstAt(key));
+    return firsts.get(key)!;
   }
 
   // ---- 视图 ----
   function baselineOf(pair: PairInfo, time: number): Baseline | null { return tracker(pair).value(regimeOf(pair.kind, time), time); }
 
   function state(): StateView {
-    const time = now(), counts = store.counts(time - 86_400_000), firsts = store.counts(0);
+    const time = now();
     const open = [...positions.values()];
     const rows = pairs.map(pair => {
       const sample = latest.get(pair.key) ?? null, params = paramsOf(pair.key);
@@ -219,6 +257,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       const spread = sample ? spreadOf(sample, bucketOf(params.notionalUsd)) : null;
       const mid = sample ? midBasis(sample) : null;
       const position = positions.get(pair.key) ?? null;
+      const held = position && sample ? positionSpread(sample, position.notionalUsd) : null;
       return {
         key: pair.key, venue: pair.venue, venueName: VENUE_NAMES[pair.venue], symbol: pair.symbol, name: pair.name, kind: pair.kind, kindName: KIND_NAMES[pair.kind], identity: pair.identity, eligible: eligible(pair), gapBps: pair.gapBps,
         regime: regimeOf(pair.kind, time), sampleAt: sample?.t ?? null, mid, sellVar: spread?.sellVar ?? null, buyVar: spread?.buyVar ?? null, estimated: spread?.estimated ?? null,
@@ -226,9 +265,9 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
         baseline: baseline ? { median: baseline.median, sigma: baseline.sigma, samples: baseline.samples, regime: baseline.regime, fallback: baseline.fallback } : null,
         z: baseline && mid !== null ? (mid - baseline.median) / baseline.sigma : null,
         rich: baseline && spread ? spread.sellVar - baseline.median : null, cheap: baseline && spread ? baseline.median - spread.buyVar : null,
-        samples24h: counts.get(pair.key)?.samples ?? 0, firstAt: firsts.get(pair.key)?.first ?? null,
+        samples24h: recentCount(pair.key, time), firstAt: firstOf(pair.key),
         enabled: params.enabled, entryBps: params.entryBps, exitBps: params.exitBps,
-        position: position && spread ? { direction: position.direction, pnlBps: markToMarket(position, spread).pnlBps, openedAt: position.openedAt } : position ? { direction: position.direction, pnlBps: null, openedAt: position.openedAt } : null,
+        position: position ? { direction: position.direction, pnlBps: held ? markToMarket(position, held).pnlBps : null, openedAt: position.openedAt } : null,
         varFunding: sample?.varFunding ?? null, rhFunding: sample?.rhFunding ?? null,
       };
     });
@@ -244,12 +283,31 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
           pairs: pairs.filter(pair => pair.venue === runtime.venue).length,
         })),
       },
-      firstSampleAt: store.firstSampleAt(),
+      firstSampleAt: firstSample === undefined ? (firstSample = store.firstSampleAt()) : firstSample,
       rows,
+      orphans: orphans(),
       settings,
       paper: { open: open.length, openNotionalUsd: open.reduce((sum, item) => sum + item.notionalUsd, 0), todayNetUsd: store.netSince(dayStart(time)), ...store.totals() },
       regimeNames: REGIME_NAMES,
     };
+  }
+
+  /**
+   * 已启用或有模拟持仓、但不在当前配对里的键（下架、Var 不再报价、规格改判等）：总览里列出来，可以停用或按最后样本平仓。
+   * 目录或 Var 报价还没取到时不判断，免得启动时把全部都列成失联。
+   */
+  function orphans(): OrphanRow[] {
+    if (!listings.size) return [];
+    const live = new Set(pairs.map(pair => pair.key));
+    const keys = [...new Set([...Object.entries(settings.symbols).filter(([, params]) => params.enabled).map(([key]) => key), ...positions.keys()])].sort();
+    return keys.filter(key => !live.has(key) && !!venues.get(venueOf(key))?.markets.length).map(key => {
+      const position = positions.get(key) ?? null, sample = latest.get(key) ?? null;
+      const held = position && sample ? positionSpread(sample, position.notionalUsd) : null;
+      return {
+        key, venue: venueOf(key), venueName: VENUE_NAMES[venueOf(key)], symbol: tickerOf(key), enabled: settings.symbols[key]?.enabled === true, lastSampleAt: sample?.t ?? null,
+        position: position ? { direction: position.direction, openedAt: position.openedAt, pnlBps: held ? markToMarket(position, held).pnlBps : null } : null,
+      };
+    });
   }
 
   function symbolView(key: unknown, hoursRaw: unknown): SymbolView {
@@ -274,7 +332,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     }
     const stats: RegimeStats[] = symbolStats(pair.kind, inRange, params.entryBps, bucket);
     const sample = latest.get(pair.key) ?? store.latest(pair.key);
-    const plans: OrderPlan[] = sample ? (['var_rich', 'var_cheap'] as Direction[]).map(direction => orderPlan(pair, sample, direction, params.notionalUsd, Math.max(10, params.entryBps))) : [];
+    const plans: OrderPlan[] = sample ? (['var_rich', 'var_cheap'] as Direction[]).map(direction => orderPlan(pair, sample, direction, params.notionalUsd, Math.max(10, params.entryBps), time)) : [];
     const position = positions.get(pair.key) ?? null;
     return {
       key: pair.key, venue: pair.venue, venueName: VENUE_NAMES[pair.venue], symbol: pair.symbol, name: pair.name, kind: pair.kind, kindName: KIND_NAMES[pair.kind], identity: pair.identity, eligible: eligible(pair), gapBps: pair.gapBps,
@@ -288,7 +346,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   }
 
   function markOf(position: Position, sample: Sample): { netUsd: number; pnlBps: number; at: number } | null {
-    const spread = spreadOf(sample, bucketOf(position.notionalUsd));
+    const spread = positionSpread(sample, position.notionalUsd);
     if (!spread) return null;
     const trade = closePosition(position, sample.t, spread, 'manual', settings.global, null);
     return { netUsd: trade.netUsd, pnlBps: markToMarket(position, spread).pnlBps, at: sample.t };
@@ -343,6 +401,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
           symbols[key] = readSymbolParams(value, symbols[key] ?? DEFAULT_SYMBOL);
         }
       }
+      if (Object.keys(symbols).length > MAX_SAVED_SYMBOLS) reject('too_many', `最多保存 ${MAX_SAVED_SYMBOLS} 个标的的参数，先删掉不用的`);
       let confirmed = settings.confirmed;
       if (body.confirmed !== undefined) {
         if (!Array.isArray(body.confirmed) || body.confirmed.length > 400 || body.confirmed.some(item => typeof item !== 'string' || !PAIR_KEY.test(item))) reject('invalid_body', '已确认标的列表无效');
@@ -387,17 +446,21 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   function closeManual(body: unknown) {
     if (!isObject(body) || typeof body.symbol !== 'string' || Object.keys(body).some(key => key !== 'symbol')) return reject('invalid_body', '请求格式无效（symbol 为配对键）');
     const position = positions.get(body.symbol) ?? reject('not_found', '该标的没有模拟持仓', 404);
-    const sample = latest.get(position.symbol);
-    if (!sample || now() - sample.t > 10 * 60_000) return reject('no_quote', '没有 10 分钟内的报价，无法按市价平仓', 409);
-    const spread = spreadOf(sample, bucketOf(position.notionalUsd)) ?? reject('no_quote', '该档位缺少可成交价', 409);
-    const trade = finish(position, sample, spread, 'manual');
+    const sample = latest.get(position.symbol) ?? store.latest(position.symbol);
+    // 配对已不在目录里（下架、Var 不再报价）时等不到新报价：按最后一个样本结算并在事件里注明。
+    const orphan = !pairOf(position.symbol);
+    if (!sample) return reject('no_quote', '没有任何报价，无法平仓；可清空模拟盘', 409);
+    if (!orphan && now() - sample.t > 10 * 60_000) return reject('no_quote', '没有 10 分钟内的报价，无法按市价平仓', 409);
+    const spread = positionSpread(sample, position.notionalUsd) ?? reject('no_quote', '该档位缺少可成交价', 409);
+    const stale = now() - sample.t > 10 * 60_000;
+    const trade = finish(position, sample, spread, 'manual', stale ? `配对已不在目录里，按最后样本（${new Date(sample.t).toISOString().slice(0, 16).replace('T', ' ')} UTC）结算；` : '');
     updateDepth();
     return trade;
   }
 
   function resetPaper(body: unknown) {
     if (!isObject(body) || body.confirm !== 'RESET' || Object.keys(body).length !== 1) return reject('invalid_body', '需要确认文字 RESET');
-    positions.clear(); cooldown.clear();
+    positions.clear(); cooldown.clear(); saveCooldown();
     store.resetPaper(now());
     updateDepth();
     return { ok: true };
@@ -445,19 +508,25 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       running = true;
       syncStreams();
       let nextVar = now() + 5_000, nextPrune = now() + 60_000;
+      // 停服时中断进行中的请求，不等各自的超时：pause 在停服时立即返回。
+      const stop = new AbortController();
+      let done = false;
+      const watcher = (async () => { while (!done && !context.stopped()) await context.pause(1_000); stop.abort(); })();
+      const request = () => anySignal([stop.signal], REQUEST_TIMEOUT_MS);
       try {
         while (!context.stopped()) {
           const time = now();
           for (const runtime of venues.values()) {
             if (!runtime.stream || time < runtime.nextCatalog) continue;
-            await refreshCatalog(AbortSignal.timeout(REQUEST_TIMEOUT_MS), runtime.venue);
+            await refreshCatalog(request(), runtime.venue);
+            if (context.stopped()) break;
             runtime.nextCatalog = time + (runtime.catalog.error ? 60_000 : CATALOG_MS);
           }
-          if (time >= nextVar && [...venues.values()].some(runtime => runtime.markets.length)) { nextVar = time + VAR_POLL_MS; await pollVar(AbortSignal.timeout(REQUEST_TIMEOUT_MS)).catch(error => { varSource.error = message(error); }); }
-          if (time >= nextPrune) { nextPrune = time + PRUNE_MS; try { store.prune(time); } catch (error) { log(`varlighter: 清理样本失败：${message(error)}`); } }
+          if (time >= nextVar && [...venues.values()].some(runtime => runtime.markets.length)) { nextVar = time + VAR_POLL_MS; await pollVar(request()).catch(error => { varSource.error = message(error); }); }
+          if (time >= nextPrune) { nextPrune = time + PRUNE_MS; try { await pruneSamples(time, context.stopped); } catch (error) { log(`varlighter: 清理样本失败：${message(error)}`); } }
           await context.pause(1_000);
         }
-      } finally { running = false; syncStreams(); }
+      } finally { done = true; running = false; syncStreams(); await watcher; }
     },
     close(): void { running = false; syncStreams(); store.close(); },
   };

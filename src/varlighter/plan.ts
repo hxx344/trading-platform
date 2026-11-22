@@ -20,7 +20,11 @@ export interface OrderPlan {
 const floorTo = (value: number, decimals: number) => { const scale = 10 ** decimals; return Math.floor(value * scale + 1e-9) / scale; };
 const roundTo = (value: number, decimals: number, up: boolean) => { const scale = 10 ** decimals; return (up ? Math.ceil(value * scale - 1e-9) : Math.floor(value * scale + 1e-9)) / scale; };
 
-export function orderPlan(pair: PairInfo, sample: Sample, direction: Direction, notionalUsd: number, maxSlippageBps: number): OrderPlan {
+/** 下单前报价须足够新、两边须对得上：Var 报价距现在与 Lighter 一档距 Var 报价时刻的上限。 */
+export const PLAN_MAX_QUOTE_AGE_MS = 90_000;
+export const PLAN_MAX_ALIGN_MS = 75_000;
+
+export function orderPlan(pair: PairInfo, sample: Sample, direction: Direction, notionalUsd: number, maxSlippageBps: number, now: number): OrderPlan {
   const spec = pair.rh, checks: PlanCheck[] = [], venue = VENUE_NAMES[pair.venue];
   const spread = spreadOf(sample, bucketOf(notionalUsd));
   const rich = direction === 'var_rich';
@@ -36,6 +40,9 @@ export function orderPlan(pair: PairInfo, sample: Sample, direction: Direction, 
   checks.push({ ok: qty >= spec.minBase, label: `不小于 ${venue} 最小数量 ${spec.minBase}` });
   checks.push({ ok: qty * rhExpected >= spec.minQuote, label: `不小于 ${venue} 最小金额 ${spec.minQuote} USDC` });
   checks.push({ ok: !!spread, label: spread ? `${bucketOf(notionalUsd)} 档两边都有可成交价${spread.estimated ? '（Lighter 用一档价估算）' : ''}` : `该档位缺少可成交价（100k 档需要 ${venue} 盘口快照）` });
+  const quoteAge = now - sample.t, align = Math.abs(sample.t - sample.rhAt);
+  checks.push({ ok: quoteAge >= 0 && quoteAge <= PLAN_MAX_QUOTE_AGE_MS, label: `Var 报价 ${Math.round(quoteAge / 1000)} 秒前（不超过 ${PLAN_MAX_QUOTE_AGE_MS / 1000} 秒）` });
+  checks.push({ ok: align <= PLAN_MAX_ALIGN_MS, label: `${venue} 一档与 Var 报价相差 ${Math.round(align / 1000)} 秒（不超过 ${PLAN_MAX_ALIGN_MS / 1000} 秒）` });
   checks.push({ ok: pair.identity !== 'mismatch', label: pair.identity === 'verified' ? '两边合约规格已核对' : pair.identity === 'review' ? '两边合约规格待人工确认' : '两边价格差距过大，规格不同' });
   checks.push({ ok: false, label: `${venue} 下单连接器（该场所的账户、API 密钥与签名器）尚未接入` });
   checks.push({ ok: false, label: 'Var 下单接口尚未接入' });

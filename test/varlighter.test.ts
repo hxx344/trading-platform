@@ -7,12 +7,13 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pairMarkets, parsePairKey, parseRhMarkets, parseVarListings, parseVarQuote, regimeOf, spreadOf, midBasis, type Sample } from '../src/varlighter/model.ts';
 import { BaselineTracker, RollingWindow, regimeStats, suggestedEntryBps } from '../src/varlighter/stats.ts';
-import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, closePosition, decide, openBlocker, openPosition, readGlobalParams, readSymbolParams, type SymbolParams } from '../src/varlighter/strategy.ts';
+import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, closePosition, decide, openBlocker, openPosition, positionSpread, readGlobalParams, readSymbolParams, type Position, type SymbolParams } from '../src/varlighter/strategy.ts';
 import { backtestRequest, runBacktest } from '../src/varlighter/backtest.ts';
-import { DEPTH_MAX_GAP_MS, LighterStream, depthAt, depthSnapshot, parseBookOrders, vwap, type SocketLike } from '../src/varlighter/feeds.ts';
+import { CONNECT_TIMEOUT_MS, DEPTH_MAX_GAP_MS, LighterStream, depthAt, depthSnapshot, parseBookOrders, vwap, type SocketLike } from '../src/varlighter/feeds.ts';
 import { orderPlan } from '../src/varlighter/plan.ts';
 import { openVarLighterStore } from '../src/varlighter/store.ts';
 import { createVarLighterEngine, downsample } from '../src/varlighter/engine.ts';
+import { openVarLighter, varLighterLoop, varLighterViews } from '../src/service/varlighter.ts';
 
 const T0 = Date.parse('2026-11-23T15:00:00Z'); // 周一纽约 10:00（盘中）
 
@@ -268,7 +269,7 @@ test('Lighter 行情流：快照后的一档可按时刻回看，定期重订阅
 test('下单预演：按 Lighter 精度向下取整，核对最小数量与金额，连接器未接入时不就绪', () => {
   const rh = { symbol: 'BTC', marketId: 1, mark: 100, sizeDecimals: 2, priceDecimals: 2, minBase: 0.5, minQuote: 10, takerFeeBps: 0, makerFeeBps: 0 };
   const pair = { key: 'lighter:BTC', venue: 'lighter' as const, symbol: 'BTC', name: 'Bitcoin', kind: 'crypto' as const, identity: 'verified' as const, gapBps: 1, marketId: 1, rh };
-  const plan = orderPlan(pair, sample(T0, 100.3, 100), 'var_rich', 999.7, 20);
+  const plan = orderPlan(pair, sample(T0, 100.3, 100), 'var_rich', 999.7, 20, T0 + 30_000);
   assert.equal(plan.legs[1].qty, '9.99');
   assert.equal(plan.legs[1].side, 'buy');
   assert.equal(plan.legs[0].side, 'sell');
@@ -278,7 +279,7 @@ test('下单预演：按 Lighter 精度向下取整，核对最小数量与金�
   assert.ok(plan.checks.filter(check => !check.ok).every(check => /尚未接入/.test(check.label)));
   assert.equal(plan.symbol, 'lighter:BTC');
   assert.ok(plan.sequence.some(line => line.includes('Lighter（市场 1）')), '计划写明对手场所与市场编号');
-  const small = orderPlan(pair, sample(T0, 100.3, 100), 'var_cheap', 20, 20);
+  const small = orderPlan(pair, sample(T0, 100.3, 100), 'var_cheap', 20, 20, T0 + 30_000);
   assert.ok(small.checks.some(check => !check.ok && /最小数量/.test(check.label)));
 });
 
@@ -422,4 +423,212 @@ test('引擎重启：库里已启用的配对在第一次拉 Var 时就取盘口
     const depth = engine.views.state().sources.venues.find(item => item.venue === 'rh')!.depth;
     assert.deepEqual(depth.map(item => [item.key, item.at, item.error]), [['rh:BTC', T0, null]]);
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ---- 审查补充（docs/reviews/2026-11-22-varlighter.md）----
+
+test('持仓取价：100k 档缺盘口快照时退回 1k 档估算，超时与止损照常判断', () => {
+  const params: SymbolParams = { ...DEFAULT_SYMBOL, notionalUsd: 5_000, maxHoldMinutes: 30, stopBps: 50 };
+  const position: Position = { id: 'p', symbol: 'BTC', direction: 'var_rich', openedAt: T0, qty: 50, notionalUsd: 5_000, entrySpread: 25, entryBaseline: 0, entryRegime: 'all', varEntry: 100.25, rhEntry: 100.02, estimated: false };
+  const now = sample(T0 + 5 * 60_000, 100.3);
+  assert.equal(spreadOf(now, '100k'), null, '100k 档缺 Lighter 盘口');
+  const spread = positionSpread(now, 5_000)!;
+  assert.equal(spread.estimated, true);
+  assert.deepEqual(spread, { ...spreadOf(now, '1k')!, estimated: true });
+  assert.equal(decide(now, null, params, position).kind, 'hold');
+  const late = decide(sample(T0 + 31 * 60_000, 100.3), null, params, position);
+  assert.equal(late.kind === 'close' && late.reason, 'timeout', '缺 100k 档也按时超时平仓');
+  const crash = decide(sample(T0 + 6 * 60_000, 100.9), null, params, position);
+  assert.equal(crash.kind === 'close' && crash.reason, 'stop');
+  assert.equal(decide(now, null, params, null).kind, 'wait', '开仓仍要求该档完整报价');
+});
+
+test('Lighter 行情流：握手不完成按超时重连，沉默重连，退避增长且封顶 60 秒', t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  let clock = T0;
+  const sockets: FakeSocket[] = [];
+  const stream = new LighterStream({ venue: 'rh', connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now: () => clock });
+  try {
+    stream.start();
+    clock += CONNECT_TIMEOUT_MS + 1; t.mock.timers.tick(1_000);
+    assert.equal(stream.status(0).lastError, '连接超时');
+    assert.equal(sockets[0].readyState, 3, '放弃的连接被关掉');
+    t.mock.timers.tick(1_000);
+    assert.equal(sockets.length, 2, '1 秒后重连');
+    sockets[1].open();
+    sockets[1].push({ type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: {} });
+    clock += 21_000; t.mock.timers.tick(1_000);
+    assert.equal(stream.status(0).lastError, '长时间没有消息');
+    t.mock.timers.tick(1_000);
+    assert.equal(sockets.length, 3, '收到过快照，退避从 1 秒重新开始');
+    clock += CONNECT_TIMEOUT_MS + 1; t.mock.timers.tick(1_000);
+    t.mock.timers.tick(1_000);
+    assert.equal(sockets.length, 3, '连续失败：第二次等 2 秒');
+    t.mock.timers.tick(1_000);
+    assert.equal(sockets.length, 4);
+    (stream as unknown as { attempt: number }).attempt = 20;
+    clock += CONNECT_TIMEOUT_MS + 1; t.mock.timers.tick(1_000);
+    t.mock.timers.tick(59_999);
+    assert.equal(sockets.length, 4);
+    t.mock.timers.tick(1);
+    assert.equal(sockets.length, 5, '退避封顶 60 秒');
+    assert.equal(stream.status(0).reconnects, 4);
+  } finally { stream.close(); }
+  assert.equal(stream.running, false);
+});
+
+function seededEngine(seed: (store: ReturnType<typeof openVarLighterStore>) => void, options: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; clock?: () => number } = {}) {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-'));
+  const file = path.join(dir, 'varlighter.sqlite');
+  const seeded = openVarLighterStore(file);
+  seed(seeded);
+  seeded.close();
+  const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, min_base_amount: '0.001', min_quote_amount: '10', taker_fee: '0', maker_fee: '0', mark_price: '100' };
+  const now = options.clock ?? (() => T0);
+  const fetchImpl = options.fetchImpl ?? (async (url: string) => {
+    if (url.includes('orderBookDetails')) return Response.json({ code: 200, order_book_details: [market] });
+    if (url.includes('orderBookOrders')) return Response.json({ code: 200, bids: [{ price: '99.99', remaining_base_amount: '100' }], asks: [{ price: '100.01', remaining_base_amount: '100' }] });
+    return Response.json({ listings: [{ ticker: 'BTC', name: 'Bitcoin', mark_price: '100.2', quotes: { updated_at: new Date(now() - 2_000).toISOString(), base: { bid: '100.19', ask: '100.21' } } }] });
+  });
+  const engine = createVarLighterEngine({ store: openVarLighterStore(file), fetchImpl, connect: () => new FakeSocket(), now });
+  return { dir, file, engine, dispose(keep = false) { engine.close(); if (!keep) rmSync(dir, { recursive: true, force: true }); } };
+}
+
+test('失联配对：总览列出，可停用，持仓按最后样本平仓并记明；手动平仓的错误码；冷却重启后仍在', async () => {
+  const position = (symbol: string): Position => ({ id: `p-${symbol}`, symbol, direction: 'var_rich', openedAt: T0 - 3_600_000, qty: 10, notionalUsd: 1_000, entrySpread: 20, entryBaseline: 0, entryRegime: 'rth', varEntry: 100.3, rhEntry: 100.01, estimated: false });
+  const { dir, file, engine, dispose } = seededEngine(store => {
+    store.setState('settings', { revision: 3, global: DEFAULT_GLOBAL, symbols: { 'rh:BTC': { ...DEFAULT_SYMBOL, enabled: true }, 'rh:GONE': { ...DEFAULT_SYMBOL, enabled: true, cooldownMinutes: 120 } }, confirmed: [], venues: ['rh'] }, T0);
+    store.addSamples([{ ...sample(T0 - 30 * 60_000, 100.1), symbol: 'rh:GONE' }, { ...sample(T0 - 20 * 60_000, 100.1), symbol: 'rh:BTC' }]);
+    store.savePosition(position('rh:GONE'));
+    store.savePosition(position('rh:BTC'));
+  });
+  try {
+    assert.deepEqual(engine.views.state().orphans, [], '目录与 Var 报价还没取到时不判断');
+    await engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
+    await engine.pollVar(AbortSignal.timeout(1000));
+    const [orphan] = engine.views.state().orphans;
+    assert.deepEqual({ ...orphan, position: { ...orphan.position!, pnlBps: null } }, { key: 'rh:GONE', venue: 'rh', venueName: 'Lighter RH', symbol: 'GONE', enabled: true, lastSampleAt: T0 - 30 * 60_000,
+      position: { direction: 'var_rich', openedAt: T0 - 3_600_000, pnlBps: null } });
+    assert.equal(typeof orphan.position!.pnlBps, 'number');
+    assert.equal(engine.views.state().rows.find(row => row.key === 'rh:BTC')?.samples24h, 1, '近 24 小时计数含启动前的样本');
+
+    const code = (work: () => unknown) => { try { work(); } catch (error) { return [(error as { status: number }).status, (error as { code: string }).code]; } return null; };
+    assert.deepEqual(code(() => engine.views.close({ symbol: 'rh:ETH' })), [404, 'not_found']);
+    assert.deepEqual(code(() => engine.views.close({ symbol: 'rh:BTC', extra: 1 })), [400, 'invalid_body']);
+    assert.deepEqual(code(() => engine.views.close({ symbol: 'rh:BTC' })), [409, 'no_quote'], '还在目录里的配对要 10 分钟内的报价');
+    const trade = engine.views.close({ symbol: 'rh:GONE' });
+    assert.equal(trade.closedAt, T0 - 30 * 60_000, '失联配对按最后样本结算');
+    assert.match(engine.views.paper().events[0].message, /配对已不在目录里，按最后样本/);
+    const disabled = engine.views.settings({ revision: 3, symbols: { 'rh:GONE': { ...DEFAULT_SYMBOL, enabled: false } } });
+    assert.equal(disabled.symbols['rh:GONE'].enabled, false);
+    assert.deepEqual(engine.views.state().orphans, [], '停用并平仓后不再列出');
+
+    let revision = disabled.revision;
+    for (let batch = 0; batch < 2; batch++) revision = engine.views.settings({ revision, symbols: Object.fromEntries(Array.from({ length: 200 }, (_, index) => [`rh:K${batch}X${index}`, { ...DEFAULT_SYMBOL }])) }).revision;
+    assert.deepEqual(code(() => engine.views.settings({ revision, symbols: Object.fromEntries(Array.from({ length: 200 }, (_, index) => [`rh:K9X${index}`, { ...DEFAULT_SYMBOL }])) })), [400, 'too_many'], '保存的配对键有上限');
+  } finally { dispose(true); }
+  const reopened = openVarLighterStore(file);
+  try { assert.equal(reopened.state<Record<string, number>>('cooldown')?.['rh:GONE'], T0 - 30 * 60_000 + 120 * 60_000, '冷却写进库，重启后仍在'); } finally { reopened.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('后台循环：停服时中断进行中的请求、关掉行情流；启动时已在停服也关库', async () => {
+  let aborted = false;
+  const hang = (_url: string, init: RequestInit) => new Promise<Response>((_, reject) => init.signal!.addEventListener('abort', () => { aborted = true; reject(init.signal!.reason); }));
+  const { engine, dispose } = seededEngine(() => {}, { fetchImpl: hang, clock: Date.now });
+  let stopped = false;
+  const sleepers = new Set<() => void>();
+  const context = { stopped: () => stopped, pause: (ms: number) => new Promise<void>(resolve => {
+    if (stopped) { resolve(); return; }
+    const wake = () => { clearTimeout(timer); sleepers.delete(wake); resolve(); };
+    const timer = setTimeout(wake, ms);
+    sleepers.add(wake);
+  }) };
+  try {
+    const loop = engine.loop(context);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.ok(engine.stream('rh'), '循环里连上行情流');
+    assert.equal(aborted, false, '目录请求挂着');
+    const started = Date.now();
+    stopped = true;
+    for (const wake of [...sleepers]) wake();
+    await loop;
+    assert.ok(Date.now() - started < 2_000, `停服不等 20 秒超时（${Date.now() - started} ms）`);
+    assert.equal(aborted, true);
+    assert.equal(engine.stream('rh'), null);
+  } finally { dispose(); }
+
+  const dir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-'));
+  try {
+    const holder = openVarLighter(dir, { fetchImpl: hang, connect: () => new FakeSocket() }, () => {});
+    const engine = holder.engine!;
+    await varLighterLoop(holder, { stopped: () => true, pause: async () => {} });
+    assert.equal(holder.engine, null);
+    assert.throws(() => engine.views.state(), /not open|closed|finalized/i, '库已关闭');
+    assert.equal(varLighterViews(holder).failure(new Error('x')).status, 500);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('接口：未登录 401、POST 缺页面标记 403、只读令牌不能读写、模块关闭 404、内部错误 500 不带原文', async () => {
+  const { createExecutorServer } = await import('../src/http.ts');
+  const { LoginThrottle } = await import('../src/login-password.ts');
+  const { createReadTokens } = await import('../src/read-token.ts');
+  const { bindAccounts, createHarness } = await import('./harness.ts');
+  const dir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-api-'));
+  const h = createHarness();
+  bindAccounts(h.ex);
+  const holder = openVarLighter(dir, { fetchImpl: async () => Response.json({}), connect: () => new FakeSocket() }, () => {});
+  const views: { varlighter?: ReturnType<typeof varLighterViews> } = {};
+  const lines: string[] = [];
+  const server = createExecutorServer({ executor: h.ex, accessToken: 'vl-token-000001', session: 'vl-session-000001', views, log: line => lines.push(line),
+    readTokens: createReadTokens({ dir, now: Date.now, log: () => {} }), tokenThrottle: () => new LoginThrottle(Date.now) });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}`;
+  const stderr = process.stderr.write;
+  try {
+    const cookie = ((await fetch(`${base}/login?token=vl-token-000001`, { redirect: 'manual' })).headers.get('set-cookie') ?? '').split(';')[0]!;
+    const get = (route: string, headers: Record<string, string> = { cookie }) => fetch(base + route, { headers });
+    const post = (route: string, body: unknown, headers: Record<string, string> = { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }) => fetch(base + route, { method: 'POST', headers, body: JSON.stringify(body) });
+    assert.equal((await get('/api/varlighter/state')).status, 404, '模块关闭');
+    views.varlighter = varLighterViews(holder);
+    assert.equal((await get('/api/varlighter/state', {})).status, 401);
+    assert.equal((await get('/api/varlighter/state')).status, 200);
+    assert.equal((await post('/api/varlighter/paper/reset', { confirm: 'RESET' }, { cookie, 'content-type': 'application/json' })).status, 403, '缺页面请求标记');
+    const unknown = await post('/api/varlighter/paper/close', { symbol: 'rh:BTC' });
+    assert.equal(unknown.status, 404);
+    assert.equal((await unknown.json() as { code: string }).code, 'not_found');
+    const generated = await post('/api/read-token/generate', {});
+    assert.equal(generated.status, 200);
+    const token = (await generated.json() as { token: string }).token;
+    const bearer = { authorization: `Bearer ${token}` };
+    assert.notEqual((await get('/api/varlighter/state', bearer)).status, 200, '只读令牌读不到本模块');
+    assert.notEqual((await post('/api/varlighter/paper/reset', { confirm: 'RESET' }, { ...bearer, 'content-type': 'application/json', 'x-pa-executor': '1' })).status, 200, '只读令牌不能写');
+    views.varlighter = { ...varLighterViews(holder), state: () => { throw new Error('secret /path/inside'); } };
+    const written: string[] = [];
+    process.stderr.write = ((chunk: string) => { written.push(String(chunk)); return true; }) as typeof process.stderr.write;
+    const failed = await get('/api/varlighter/state');
+    process.stderr.write = stderr;
+    assert.equal(failed.status, 500);
+    assert.doesNotMatch(await failed.text(), /secret/);
+    assert.ok(written.some(line => line.includes('secret')), '原文只进服务端日志');
+  } finally {
+    process.stderr.write = stderr;
+    await new Promise(resolve => server.close(resolve)); h.dispose(); holder.engine?.close(); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('样本库：过期样本分批删、只删保留期以前的；近期计数按配对', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-'));
+  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
+  try {
+    const old = T0 - 15 * 86_400_000;
+    store.addSamples([0, 1, 2].flatMap(minute => ['rh:A', 'lighter:A'].map(symbol => ({ ...sample(old + minute * 60_000, 100), symbol }))));
+    store.addSamples([{ ...sample(T0 - 60_000, 100), symbol: 'rh:A' }]);
+    assert.equal(store.pruneSamples(T0, 4), 4, '一批最多 4 条');
+    assert.equal(store.pruneSamples(T0, 4), 2);
+    assert.equal(store.pruneSamples(T0, 4), 0);
+    assert.equal(store.countSince('rh:A', T0 - 86_400_000), 1);
+    assert.equal(store.countSince('lighter:A', 0), 0);
+    assert.equal(store.firstSampleAt(), T0 - 60_000);
+    assert.equal(store.firstAt('rh:A'), T0 - 60_000);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
 });

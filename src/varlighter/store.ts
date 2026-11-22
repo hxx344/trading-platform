@@ -5,7 +5,7 @@ import type { Regime, Sample } from './model.ts';
 import type { ClosedTrade, Position } from './strategy.ts';
 
 export const VARLIGHTER_FILE = 'varlighter.sqlite';
-/** 样本保留天数：约 60 个标的每分钟一条，每天约 2 万条、20MB 上下。 */
+/** 样本保留天数：两个场所约 210 个配对每分钟各一条，每天约 30 万条；14 天约 420 万条（库文件大小见 docs/varlighter.md 第 7 节）。 */
 export const SAMPLE_RETENTION_DAYS = 14;
 
 const COLUMNS = ['symbol', 't', 'received_at', 'regime', 'var_mark', 'var_bid0', 'var_ask0', 'var_bid1k', 'var_ask1k', 'var_bid100k', 'var_ask100k', 'var_funding',
@@ -35,6 +35,7 @@ export function openVarLighterStore(file: string) {
       var_mark REAL NOT NULL, var_bid0 REAL NOT NULL, var_ask0 REAL NOT NULL, var_bid1k REAL NOT NULL, var_ask1k REAL NOT NULL, var_bid100k REAL, var_ask100k REAL, var_funding REAL,
       rh_at INTEGER NOT NULL, rh_bid0 REAL NOT NULL, rh_ask0 REAL NOT NULL, rh_mark REAL, rh_index REAL, rh_funding REAL, rh_bid1k REAL, rh_ask1k REAL, rh_bid100k REAL, rh_ask100k REAL,
       PRIMARY KEY (symbol, t)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS samples_t ON samples(t);
     CREATE TABLE IF NOT EXISTS paper_positions (id TEXT PRIMARY KEY, symbol TEXT NOT NULL, json TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS paper_trades (id TEXT PRIMARY KEY, symbol TEXT NOT NULL, closed_at INTEGER NOT NULL, net_usd REAL NOT NULL, json TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS paper_trades_closed ON paper_trades(closed_at);
@@ -44,10 +45,10 @@ export function openVarLighterStore(file: string) {
   const insertSample = db.prepare(`INSERT OR IGNORE INTO samples(${COLUMNS.join(', ')}) VALUES (${COLUMNS.map(() => '?').join(', ')})`);
   const selectRange = db.prepare(`SELECT ${COLUMNS.join(', ')} FROM samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t`);
   const selectLatest = db.prepare(`SELECT ${COLUMNS.join(', ')} FROM samples WHERE symbol = ? ORDER BY t DESC LIMIT 1`);
-  const countSince = db.prepare('SELECT symbol, COUNT(*) AS n, MIN(t) AS first FROM samples WHERE t >= ? GROUP BY symbol');
+  const countSince = db.prepare('SELECT COUNT(*) AS n FROM samples WHERE symbol = ? AND t >= ?');
   const firstSample = db.prepare('SELECT MIN(t) AS first FROM samples');
-  const symbolsWithSamples = db.prepare('SELECT DISTINCT symbol FROM samples');
-  const prune = db.prepare('DELETE FROM samples WHERE symbol = ? AND t < ?');
+  const firstOf = db.prepare('SELECT MIN(t) AS first FROM samples WHERE symbol = ?');
+  const pruneBatch = db.prepare('DELETE FROM samples WHERE (symbol, t) IN (SELECT symbol, t FROM samples WHERE t < ? ORDER BY t LIMIT ?)');
   const upsertPosition = db.prepare('INSERT INTO paper_positions(id, symbol, json) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET json = excluded.json');
   const deletePosition = db.prepare('DELETE FROM paper_positions WHERE id = ?');
   const allPositions = db.prepare('SELECT json FROM paper_positions');
@@ -74,18 +75,16 @@ export function openVarLighterStore(file: string) {
     },
     samples(symbol: string, from: number, to: number): Sample[] { return (selectRange.all(symbol, from, to) as Row[]).map(fromRow); },
     latest(symbol: string): Sample | null { const row = selectLatest.get(symbol) as Row | undefined; return row ? fromRow(row) : null; },
-    counts(since: number): Map<string, { samples: number; first: number }> {
-      return new Map((countSince.all(since) as { symbol: string; n: number; first: number }[]).map(row => [row.symbol, { samples: row.n, first: row.first }]));
-    },
+    /** 某配对某时刻以来的样本数（走主键；满量时 210 个配对合计约 60 ms，引擎缓存 10 分钟）。 */
+    countSince(symbol: string, since: number): number { return (countSince.get(symbol, since) as { n: number }).n; },
+    /** 最早的样本时刻（走 t 索引）。 */
     firstSampleAt(): number | null { return ((firstSample.get() as { first: number | null } | undefined)?.first) ?? null; },
-    /** 删掉保留期以前的样本与 30 天前的事件。 */
-    prune(now: number): void {
-      const cutoff = now - SAMPLE_RETENTION_DAYS * 86_400_000;
-      transaction(() => {
-        for (const { symbol } of symbolsWithSamples.all() as { symbol: string }[]) prune.run(symbol, cutoff);
-        pruneEvents.run(now - 30 * 86_400_000);
-      });
-    },
+    /** 某配对最早的样本时刻（走主键）。 */
+    firstAt(symbol: string): number | null { return ((firstOf.get(symbol) as { first: number | null } | undefined)?.first) ?? null; },
+    /** 删掉保留期以前最早的至多 limit 条样本，返回删除条数；调用方分批删、批间让出事件循环。 */
+    pruneSamples(now: number, limit: number): number { return Number(pruneBatch.run(now - SAMPLE_RETENTION_DAYS * 86_400_000, limit).changes); },
+    /** 删掉 30 天前的事件。 */
+    pruneEvents(now: number): void { pruneEvents.run(now - 30 * 86_400_000); },
     positions(): Position[] { return (allPositions.all() as { json: string }[]).map(row => JSON.parse(row.json) as Position); },
     savePosition(position: Position): void { upsertPosition.run(position.id, position.symbol, JSON.stringify(position)); },
     /** 平仓：删持仓、记成交、记事件在同一事务里。 */

@@ -91,7 +91,12 @@ const now = Date.now();
     'rh:AAPL': { ...DEFAULT_SYMBOL, enabled: true, entryBps: 9, exitBps: 1 }, 'rh:BTC': { ...DEFAULT_SYMBOL, enabled: true, entryBps: 5, exitBps: 0.5 },
     'lighter:ETH': { ...DEFAULT_SYMBOL, enabled: true, entryBps: 7, exitBps: 1 },
   };
-  store.setState('settings', { revision: 1, global, symbols, confirmed: [], venues: ['rh', 'lighter'] }, now);
+  // 一个已下架的配对（不在目录里）：已启用、有持仓，演示总览的「不在当前配对里的标的」。
+  const gone = { ...history.get('rh:AAPL')!.at(-120)!, symbol: 'rh:DELISTED' };
+  store.addSamples([gone]);
+  store.savePosition({ id: 'preview-delisted', symbol: 'rh:DELISTED', direction: 'var_rich', openedAt: gone.t - 600_000, qty: 5, notionalUsd: 1000, entrySpread: 12, entryBaseline: 2,
+    entryRegime: gone.regime, varEntry: gone.varBid1k, rhEntry: gone.rhAsk0, estimated: false });
+  store.setState('settings', { revision: 1, global, symbols: { ...symbols, 'rh:DELISTED': { ...DEFAULT_SYMBOL, enabled: true } }, confirmed: [], venues: ['rh', 'lighter'] }, now);
   for (const [key, params] of Object.entries(symbols)) {
     const result = runBacktest(key, kindOf(key.split(':')[1]!), history.get(key)!, now - 3 * 86_400_000, now, params, global);
     for (const trade of result.trades.map(item => ({ ...item, id: `preview-${key}-${item.id}` }))) store.closePosition(trade, { at: trade.closedAt, kind: 'close', message: `（预览）${trade.reason} 净 ${trade.netUsd.toFixed(2)} 美元` });

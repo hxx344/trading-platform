@@ -52,7 +52,8 @@ export function varLighterViews(holder: VarLighterHolder): VarLighterViews {
 }
 
 export async function varLighterLoop(holder: VarLighterHolder, context: { stopped(): boolean; pause(ms: number): Promise<void> }): Promise<void> {
-  if (!holder.engine || context.stopped()) return;
+  if (!holder.engine) return;
   const engine = holder.engine;
-  try { await engine.loop(context); } finally { holder.engine = null; holder.error = '服务正在停止'; engine.close(); }
+  // 启动时已在停服也要关库。
+  try { if (!context.stopped()) await engine.loop(context); } finally { holder.engine = null; holder.error = '服务正在停止'; engine.close(); }
 }

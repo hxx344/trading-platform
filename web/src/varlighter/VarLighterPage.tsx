@@ -3,16 +3,17 @@
 // 页签与配对（场所:代码）在地址里，刷新或分享链接回到同一处。Var 的对手有两个场所：Lighter RH 与 Lighter 主网，同一代码在两个场所是两行。
 import './varlighter.css';
 import { useDeferredValue, useState } from 'react';
-import { StatePanel, TableEmpty } from '../StateViews.tsx';
+import { api } from '../api.ts';
+import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { useLiveResource } from '../use-live-resource.ts';
-import type { StateRow, StateView, VenueStatus } from '../../../src/varlighter/views.ts';
-import { Badge, Metric } from './parts.tsx';
+import type { OrphanRow, StateRow, StateView, VenueStatus } from '../../../src/varlighter/views.ts';
+import { Badge, Metric, useWrite } from './parts.tsx';
 import { VarLighterDetail } from './VarLighterDetail.tsx';
 import { VarLighterPaper } from './VarLighterPaper.tsx';
 import { VarLighterReady } from './VarLighterReady.tsx';
 import {
   DIRECTION_LABELS, DIRECTION_SHORT, IDENTITY_LABELS, REGIME_LABELS, SORT_LABELS, VARLIGHTER_BASE, VARLIGHTER_TABS, VENUE_OPTIONS, age, bps, fundingAnnual, matchesQuery, matchesVenue, plain,
-  signal, signedUsd, sortRows, tone, usd, varLighterHref, venueShort, type SortKey, type VarLighterTab, type VenueFilter,
+  settingsBody, signal, signedUsd, sortRows, tone, usd, varLighterHref, venueShort, type SortKey, type VarLighterTab, type VenueFilter,
 } from './varlighter-form.ts';
 
 export const STATE_PATH = `${VARLIGHTER_BASE}/state`;
@@ -42,7 +43,7 @@ export function VarLighterPage({ tab, symbol, onExpired }: { tab: VarLighterTab;
     {error && data ? <p className="vl-note err" role="status">刷新失败：{error.message}（数据停留在 {receivedAt ? new Date(receivedAt).toLocaleTimeString() : '—'}）</p> : null}
     {!data
       ? status === 'error' || status === 'offline' ? <StatePanel kind="error" title="读取价差模块失败" detail={error?.message ?? '网络离线'} /> : <StatePanel kind="loading" title="加载中…" />
-      : tab === 'overview' ? <Overview view={data} />
+      : tab === 'overview' ? <Overview view={data} onChanged={live.refresh} />
         : tab === 'detail' ? <VarLighterDetail view={data} symbol={symbol} onChanged={live.refresh} onExpired={onExpired} />
           : tab === 'paper' ? <VarLighterPaper view={data} onChanged={live.refresh} onExpired={onExpired} />
             : <VarLighterReady view={data} onChanged={live.refresh} onExpired={onExpired} />}
@@ -68,7 +69,7 @@ function VenueChip({ status, now }: { status: VenueStatus; now: number }) {
   return <span className={`vl-chip ${chipTone}`} title={detail || undefined}><i />{status.name} {stream?.connected ? `${status.pairs} 对` : '未连接'}{status.depth.length ? ` · 盘口 ${status.depth.length - staleDepth}/${status.depth.length}` : ''}</span>;
 }
 
-function Overview({ view }: { view: StateView }) {
+function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promise<void> }) {
   const [sort, setSort] = useState<{ key: SortKey; descending: boolean }>({ key: 'gap', descending: true });
   const [query, setQuery] = useState('');
   const [onlyEnabled, setOnlyEnabled] = useState(false);
@@ -89,6 +90,7 @@ function Overview({ view }: { view: StateView }) {
       <Metric label="采集起点" value={view.firstSampleAt ? age(view.firstSampleAt, view.now) : '—'} foot={view.firstSampleAt ? new Date(view.firstSampleAt).toLocaleString() : '还没有样本'} />
       <Metric label="模拟盘净盈亏" value={signedUsd(paper.netUsd)} tone={tone(paper.netUsd)} foot={`${paper.trades} 笔 · 今日 ${signedUsd(paper.todayNetUsd)} · 持仓 ${paper.open} 笔 ${usd(paper.openNotionalUsd, 0)}`} />
     </section>
+    {view.orphans?.length ? <Orphans view={view} rows={view.orphans} onChanged={onChanged} /> : null}
     <section className="panel" aria-label="价差总览">
       <div className="panel-heading"><h2>价差总览</h2><span className="muted">每分钟一个 Var 报价，按报价时刻对齐 Lighter 盘口 · 单位基点（1 = 0.01%）</span></div>
       <div className="vl-toolbar">
@@ -110,6 +112,39 @@ function Overview({ view }: { view: StateView }) {
         信号列是离入场最近的一侧：偏离 − 入场阈值，≥ 0 即达到开仓条件。资金费只作参考：Var 为公开接口的年化费率，Lighter 为当前小时费率折年化。</p>
     </section>
   </>;
+}
+
+/** 已启用或有持仓、但不在当前配对里的键：可停用，持仓按最后样本平仓。 */
+function Orphans({ view, rows, onChanged }: { view: StateView; rows: OrphanRow[]; onChanged: () => Promise<void> }) {
+  const write = useWrite();
+  const label = (row: OrphanRow) => `${row.symbol}（${row.venueName}）`;
+  const disable = (row: OrphanRow) => {
+    const params = view.settings.symbols[row.key];
+    if (!params) return;
+    void write.run(`disable:${row.key}`, () => api(`${VARLIGHTER_BASE}/settings`, { body: settingsBody(view.settings, { symbol: { symbol: row.key, params: { ...params, enabled: false } } }) }),
+      () => { void onChanged(); return `${label(row)} 已停用`; });
+  };
+  const close = (row: OrphanRow) => {
+    if (!confirm(`${label(row)} 已不在当前配对里，按最后一个样本平掉模拟持仓？`)) return;
+    void write.run(`close:${row.key}`, () => api<{ netUsd: number }>(`${VARLIGHTER_BASE}/paper/close`, { body: { symbol: row.key } }),
+      trade => { void onChanged(); return `${label(row)} 已平仓，净 ${signedUsd(trade.netUsd)}`; });
+  };
+  return <section className="panel" aria-label="不在当前配对里的标的">
+    <div className="panel-heading"><h2>不在当前配对里的标的</h2><span className="muted">下架、Var 不再报价或规格改判；不再采集，也不会自动平仓</span></div>
+    {write.message ? <div className="vl-actions"><Callout tone={write.message.tone}>{write.message.text}</Callout></div> : null}
+    <div className="vl-table"><table>
+      <thead><tr><th>标的</th><th>状态</th><th>最后样本</th><th /></tr></thead>
+      <tbody>{rows.map(row => <tr key={row.key}>
+        <td><span className="vl-symbol">{row.symbol}</span><small>{row.venueName}</small></td>
+        <td className="wrap">{row.enabled ? <Badge tone="warn">已启用</Badge> : null} {row.position ? <>{DIRECTION_SHORT[row.position.direction]} 持仓{row.position.pnlBps === null ? '' : ` ${bps(row.position.pnlBps)} 基点`}</> : null}</td>
+        <td>{age(row.lastSampleAt, view.now)}</td>
+        <td><div className="vl-actions">
+          {row.enabled ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => disable(row)}>停用</button> : null}
+          {row.position ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => close(row)}>按最后样本平仓</button> : null}
+        </div></td>
+      </tr>)}</tbody>
+    </table></div>
+  </section>;
 }
 
 function Row({ row, now, multi }: { row: StateRow; now: number; multi: boolean }) {

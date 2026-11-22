@@ -87,7 +87,7 @@ function SourcesPanel({ view, onChanged }: { view: StateView; onChanged: () => P
       {venues.map(status => <VenueRow key={status.venue} status={status} now={now} busy={write.busy}
         locked={status.enabled && enabled.length === 1} onToggle={() => toggle(status)} />)}
     </tbody></table></div>
-    <p className="vl-note">行情流订阅全部市场的一档价，流量按解码后的文本折算（线上有压缩，实际约为其四分之一到二分之一）。已启用或有持仓的配对每分钟各取一次盘口快照（约 22 KB），每个场所最多 10 个。
+    <p className="vl-note">行情流订阅全部市场的一档价，流量按解码后的文本折算（线上有压缩，实测约为其四分之一到五分之一）。已启用或有持仓的配对每分钟各取一次盘口快照（约 22 KB），每个场所最多 10 个。
       停采前先停用该场所上的标的并平掉模拟持仓。</p>
   </section>;
 }

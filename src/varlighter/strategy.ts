@@ -121,9 +121,20 @@ export function markToMarket(position: Position, spread: Spread): { exitSpread: 
     : { exitSpread: spread.sellVar, pnlBps: spread.sellVar - position.entrySpread };
 }
 
+/**
+ * 持仓按开仓档位取平仓价。100k 档缺价（缺盘口快照或 Var 没给 100k 报价）时退回 1k 档并标为估算，
+ * 止损、超时与手动平仓照常进行，不会因为缺一份快照而一直卡住。
+ */
+export function positionSpread(sample: Sample, notionalUsd: number): Spread | null {
+  const bucket = bucketOf(notionalUsd), spread = spreadOf(sample, bucket);
+  if (spread || bucket === '1k') return spread;
+  const fallback = spreadOf(sample, '1k');
+  return fallback ? { ...fallback, estimated: true } : null;
+}
+
 /** 已有持仓：回归、止损、超时；没有持仓：按方向与偏离开仓。时段、报价时效与风控限制由调用方在开仓前另外判断。 */
 export function decide(sample: Sample, baseline: Baseline | null, params: SymbolParams, position: Position | null): Decision {
-  const spread = spreadOf(sample, bucketOf(position?.notionalUsd ?? params.notionalUsd));
+  const spread = position ? positionSpread(sample, position.notionalUsd) : spreadOf(sample, bucketOf(params.notionalUsd));
   if (!spread) return { kind: 'wait', reason: '该档位缺少可成交价格（100k 档需要 Lighter 完整盘口）' };
   if (position) {
     const { pnlBps } = markToMarket(position, spread);

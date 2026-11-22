@@ -85,6 +85,7 @@ export function backtestRequest(body: unknown, saved: Readonly<Record<string, Sy
   const hours = raw.hours;
   if (typeof hours !== 'number' || !Number.isInteger(hours) || hours < 1 || hours > 24 * 14) fail('回测时长须为 1 到 336 小时的整数');
   const symbol = raw.symbol as string;
+  if (raw.params !== undefined && (raw.params === null || typeof raw.params !== 'object' || Array.isArray(raw.params))) fail('回测参数须为对象');
   const params = readSymbolParams({ ...(raw.params === undefined ? {} : raw.params as object), enabled: true }, saved[symbol] ?? DEFAULT_SYMBOL);
   return { symbol, hours: hours as number, params, global: raw.global === undefined ? global : readGlobalParams(raw.global, global) };
 }

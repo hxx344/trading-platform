@@ -2,6 +2,7 @@
 // WebSocket（market_stats/all 的全市场一档与资金费）与启用配对的盘口快照（REST，每分钟一次）。只读公开接口，不带任何凭据。
 // Lighter 的一档按本机收到时刻记成历史，Var 报价最多晚一分多钟才拿到，对齐时回看那一刻的 Lighter 状态。
 // 完整盘口不走 WebSocket 订阅：主网 BTC 一个市场的增量压缩后约 550 MB/天，快照每分钟一次约 22 KB。
+import { readJsonResponse } from '../vendor/response.mjs';
 import { VARIATIONAL_STATS, VARIATIONAL_USER_AGENT } from '../vendor/variational-market.mjs';
 import { VENUE_NAMES, parseRhMarkets, parseVarListings, type RhMarket, type VarListing, type Venue } from './model.ts';
 
@@ -15,10 +16,8 @@ export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 
 async function readJson(fetchImpl: FetchLike, url: string, signal: AbortSignal, limit: number, headers: Record<string, string>): Promise<unknown> {
   const response = await fetchImpl(url, { headers: { accept: 'application/json', ...headers }, signal });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  const text = await response.text();
-  if (text.length > limit) throw new Error('响应过大');
-  return JSON.parse(text) as unknown;
+  if (!response.ok) { void response.body?.cancel().catch(() => {}); throw new Error(`HTTP ${response.status}`); }
+  return await readJsonResponse(response, { maxBytes: limit, signal }) as unknown;
 }
 export async function fetchVarListings(fetchImpl: FetchLike, signal: AbortSignal, now: () => number): Promise<VarListing[]> {
   const body = await readJson(fetchImpl, VARIATIONAL_STATS, signal, 4_000_000, { 'user-agent': VARIATIONAL_USER_AGENT });
@@ -95,6 +94,8 @@ export const STATS_REFRESH_MS = 60_000;
 export const TOP_MAX_AGE_MS = STATS_REFRESH_MS + 15_000;
 /** 这么久没有任何消息就认为连接已断，主动重连。 */
 const SILENCE_MS = 20_000;
+/** 发起连接后这么久还没连上就放弃重连。 */
+export const CONNECT_TIMEOUT_MS = 20_000;
 const PING_MS = 25_000;
 const LIVE_SLACK_MS = 5_000;
 const decimal = (value: unknown): number | null => {
@@ -130,7 +131,7 @@ function prune<T extends { at: number }>(points: T[], cutoff: number): void {
 export interface StreamStatus {
   connected: boolean; connectedAt: number | null; lastMessageAt: number | null; reconnects: number; lastError: string | null;
   /** 目录里的市场数。 */ markets: number;
-  /** 本次启动以来收到的消息文本字节数（解压后；线上实际流量约为它的 1/4–1/5）与开始计数的时刻。 */ bytes: number; bytesSince: number | null;
+  /** 本次启动以来收到的消息文本字节数（解压后；实测线上流量约为它的 1/4.5）与开始计数的时刻。 */ bytes: number; bytesSince: number | null;
 }
 
 /**
@@ -150,6 +151,8 @@ export class LighterStream {
   private state: Omit<StreamStatus, 'markets'> = { connected: false, connectedAt: null, lastMessageAt: null, reconnects: 0, lastError: null, bytes: 0, bytesSince: null };
   private lastPing: number | null = null;
   private lastRefresh: number | null = null;
+  /** 本次连接发起的时刻；握手迟迟不完成也不报错时按它超时重连。 */
+  private connectingAt: number | null = null;
 
   private readonly options: { url?: string; venue?: Venue; connect: Connect; now?: () => number; log?: (line: string) => void };
   constructor(options: { url?: string; venue?: Venue; connect: Connect; now?: () => number; log?: (line: string) => void }) { this.options = options; }
@@ -162,6 +165,7 @@ export class LighterStream {
     let socket: SocketLike;
     try { socket = this.options.connect(this.options.url ?? LIGHTER_ENDPOINTS[this.options.venue ?? 'rh'].stream); } catch (error) { this.fail(error); return; }
     this.socket = socket;
+    this.connectingAt = this.now();
     this.state.bytesSince ??= this.now();
     socket.onopen = () => {
       this.state.connected = true; this.state.connectedAt = this.now(); this.state.lastMessageAt = this.now();
@@ -209,6 +213,7 @@ export class LighterStream {
   private tick(): void {
     const now = this.now();
     if (this.state.connected && this.state.lastMessageAt !== null && now - this.state.lastMessageAt > SILENCE_MS) { this.drop('长时间没有消息'); return; }
+    if (!this.state.connected && this.socket && this.connectingAt !== null && now - this.connectingAt > CONNECT_TIMEOUT_MS) { this.drop('连接超时'); return; }
     if (this.state.connected && now - (this.lastPing ?? 0) >= PING_MS) { this.lastPing = now; this.send({ type: 'ping' }); }
     if (this.state.connected && now - (this.lastRefresh ?? now) >= STATS_REFRESH_MS) {
       this.lastRefresh = now;

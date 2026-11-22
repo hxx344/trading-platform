@@ -33,11 +33,17 @@ export interface StateRow {
   position: { direction: Direction; pnlBps: number | null; openedAt: number } | null;
   varFunding: number | null; rhFunding: number | null;
 }
+export interface OrphanRow {
+  key: string; venue: Venue; venueName: string; symbol: string; enabled: boolean; lastSampleAt: number | null;
+  position: { direction: Direction; openedAt: number; pnlBps: number | null } | null;
+}
 export interface StateView {
   now: number; startedAt: number;
   sources: { var: SourceState & { poll: PollStats | null; quoteAgeMedianMs: number | null }; venues: VenueStatus[] };
   firstSampleAt: number | null;
   rows: StateRow[];
+  /** 已启用或有持仓、但不在当前配对里的键。 */
+  orphans: OrphanRow[];
   settings: Settings;
   paper: PaperTotals & { open: number; openNotionalUsd: number; todayNetUsd: number };
   regimeNames: Record<Regime, string>;

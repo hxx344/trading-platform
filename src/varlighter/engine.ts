@@ -16,6 +16,8 @@ export const CATALOG_MS = 10 * 60_000;
 const PRUNE_MS = 3_600_000;
 const PRUNE_BATCH = 2_000;
 const RECOUNT_MS = 10 * 60_000;
+/** 数据源都正常、单个配对却这么久没有新样本，就算失联。 */
+export const LOST_MS = 30 * 60_000;
 const REQUEST_TIMEOUT_MS = 20_000;
 /** 参数里最多保存这么多个配对键（含已停用的）。 */
 const MAX_SAVED_SYMBOLS = 500;
@@ -215,7 +217,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     positions.delete(position.symbol);
     cooldown.set(position.symbol, sample.t + paramsOf(position.symbol).cooldownMinutes * 60_000);
     saveCooldown();
-    store.closePosition(trade, { at: now(), kind: 'close', message: `${note}${CLOSE_REASON_NAMES[reason]}${spread.estimated ? '（Lighter 价为估算）' : ''}：净 ${fmt(trade.netUsd, 2)} 美元（${fmt(trade.netBps, 1)} 基点），持有 ${fmt((trade.closedAt - trade.openedAt) / 60_000, 0)} 分钟` });
+    store.closePosition(trade, { at: now(), kind: 'close', message: `${note}${CLOSE_REASON_NAMES[reason]}${spread.estimated ? '（按 1k 档估算）' : ''}：净 ${fmt(trade.netUsd, 2)} 美元（${fmt(trade.netBps, 1)} 基点），持有 ${fmt((trade.closedAt - trade.openedAt) / 60_000, 0)} 分钟` });
     return trade;
   }
 
@@ -265,7 +267,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
         baseline: baseline ? { median: baseline.median, sigma: baseline.sigma, samples: baseline.samples, regime: baseline.regime, fallback: baseline.fallback } : null,
         z: baseline && mid !== null ? (mid - baseline.median) / baseline.sigma : null,
         rich: baseline && spread ? spread.sellVar - baseline.median : null, cheap: baseline && spread ? baseline.median - spread.buyVar : null,
-        samples24h: recentCount(pair.key, time), firstAt: firstOf(pair.key),
+        samples24h: recentCount(pair.key, time), firstAt: firstOf(pair.key), cooldownUntil: (cooldown.get(pair.key) ?? 0) > time ? cooldown.get(pair.key)! : null,
         enabled: params.enabled, entryBps: params.entryBps, exitBps: params.exitBps,
         position: position ? { direction: position.direction, pnlBps: held ? markToMarket(position, held).pnlBps : null, openedAt: position.openedAt } : null,
         varFunding: sample?.varFunding ?? null, rhFunding: sample?.rhFunding ?? null,
@@ -296,15 +298,34 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
    * 已启用或有模拟持仓、但不在当前配对里的键（下架、Var 不再报价、规格改判等）：总览里列出来，可以停用或按最后样本平仓。
    * 目录或 Var 报价还没取到时不判断，免得启动时把全部都列成失联。
    */
+  const lastSample = (key: string) => latest.get(key) ?? store.latest(key);
+  /**
+   * 配对失联的原因：不在目录里、改判为规格不同，或数据源都正常而 30 分钟没有新样本（Var 不再报价、对手盘口缺失）。
+   * 数据源本身没就绪或在故障（启动期、Var 拉取失败、场所目录未取到、行情流断开）时返回 null，不把整体故障当成单个配对失联。
+   */
+  function lostReason(key: string, time: number): string | null {
+    if (!listings.size || varSource.ok === null || time - varSource.ok > 3 * VAR_POLL_MS) return null;
+    const runtime = venues.get(venueOf(key));
+    if (!runtime?.markets.length) return null;
+    const pair = pairOf(key);
+    if (!pair) return '配对已不在目录里';
+    if (pair.identity === 'mismatch') return '两边价格相差超过 5%，已改判为规格不同';
+    if (!runtime.stream?.status(runtime.markets.length).connected) return null;
+    const sampleAt = lastSample(key)?.t ?? null;
+    if (sampleAt === null ? time - startedAt <= LOST_MS : time - sampleAt <= LOST_MS) return null;
+    return `超过 ${LOST_MS / 60_000} 分钟没有新样本（Var 无报价或对手盘口缺失）`;
+  }
+
   function orphans(): OrphanRow[] {
-    if (!listings.size) return [];
-    const live = new Set(pairs.map(pair => pair.key));
+    const time = now();
     const keys = [...new Set([...Object.entries(settings.symbols).filter(([, params]) => params.enabled).map(([key]) => key), ...positions.keys()])].sort();
-    return keys.filter(key => !live.has(key) && !!venues.get(venueOf(key))?.markets.length).map(key => {
-      const position = positions.get(key) ?? null, sample = latest.get(key) ?? null;
+    return keys.flatMap(key => {
+      const reason = lostReason(key, time);
+      if (reason === null) return [];
+      const position = positions.get(key) ?? null, sample = lastSample(key);
       const held = position && sample ? positionSpread(sample, position.notionalUsd) : null;
       return {
-        key, venue: venueOf(key), venueName: VENUE_NAMES[venueOf(key)], symbol: tickerOf(key), enabled: settings.symbols[key]?.enabled === true, lastSampleAt: sample?.t ?? null,
+        key, venue: venueOf(key), venueName: VENUE_NAMES[venueOf(key)], symbol: tickerOf(key), reason, enabled: settings.symbols[key]?.enabled === true, lastSampleAt: sample?.t ?? null,
         position: position ? { direction: position.direction, openedAt: position.openedAt, pnlBps: held ? markToMarket(position, held).pnlBps : null } : null,
       };
     });
@@ -446,14 +467,13 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   function closeManual(body: unknown) {
     if (!isObject(body) || typeof body.symbol !== 'string' || Object.keys(body).some(key => key !== 'symbol')) return reject('invalid_body', '请求格式无效（symbol 为配对键）');
     const position = positions.get(body.symbol) ?? reject('not_found', '该标的没有模拟持仓', 404);
-    const sample = latest.get(position.symbol) ?? store.latest(position.symbol);
-    // 配对已不在目录里（下架、Var 不再报价）时等不到新报价：按最后一个样本结算并在事件里注明。
-    const orphan = !pairOf(position.symbol);
+    const time = now(), sample = lastSample(position.symbol);
     if (!sample) return reject('no_quote', '没有任何报价，无法平仓；可清空模拟盘', 409);
-    if (!orphan && now() - sample.t > 10 * 60_000) return reject('no_quote', '没有 10 分钟内的报价，无法按市价平仓', 409);
+    // 失联的配对等不到新报价：按最后一个样本结算并在事件里注明原因。数据源整体故障不算失联，等恢复。
+    const stale = time - sample.t > 10 * 60_000, reason = stale ? lostReason(position.symbol, time) : null;
+    if (stale && reason === null) return reject('no_quote', '没有 10 分钟内的报价，无法按市价平仓；数据源恢复后再试', 409);
     const spread = positionSpread(sample, position.notionalUsd) ?? reject('no_quote', '该档位缺少可成交价', 409);
-    const stale = now() - sample.t > 10 * 60_000;
-    const trade = finish(position, sample, spread, 'manual', stale ? `配对已不在目录里，按最后样本（${new Date(sample.t).toISOString().slice(0, 16).replace('T', ' ')} UTC）结算；` : '');
+    const trade = finish(position, sample, spread, 'manual', reason ? `${reason}，按最后样本（${new Date(sample.t).toISOString().slice(0, 16).replace('T', ' ')} UTC）结算；` : '');
     updateDepth();
     return trade;
   }
@@ -523,7 +543,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
             runtime.nextCatalog = time + (runtime.catalog.error ? 60_000 : CATALOG_MS);
           }
           if (time >= nextVar && [...venues.values()].some(runtime => runtime.markets.length)) { nextVar = time + VAR_POLL_MS; await pollVar(request()).catch(error => { varSource.error = message(error); }); }
-          if (time >= nextPrune) { nextPrune = time + PRUNE_MS; try { await pruneSamples(time, context.stopped); } catch (error) { log(`varlighter: 清理样本失败：${message(error)}`); } }
+          if (time >= nextPrune) { nextPrune = time + PRUNE_MS; try { await pruneSamples(time, () => context.stopped()); } catch (error) { log(`varlighter: 清理样本失败：${message(error)}`); } }
           await context.pause(1_000);
         }
       } finally { done = true; running = false; syncStreams(); await watcher; }

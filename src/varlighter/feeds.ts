@@ -17,7 +17,10 @@ export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 async function readJson(fetchImpl: FetchLike, url: string, signal: AbortSignal, limit: number, headers: Record<string, string>): Promise<unknown> {
   const response = await fetchImpl(url, { headers: { accept: 'application/json', ...headers }, signal });
   if (!response.ok) { void response.body?.cancel().catch(() => {}); throw new Error(`HTTP ${response.status}`); }
-  return await readJsonResponse(response, { maxBytes: limit, signal }) as unknown;
+  try { return await readJsonResponse(response, { maxBytes: limit, signal }) as unknown; } catch (error) {
+    const code = (error as { code?: unknown })?.code;
+    throw code === 'response_limit' ? new Error('响应过大') : code === 'invalid_data' ? new Error('响应不是有效的 JSON') : code === 'aborted' ? new Error('请求已中止') : error;
+  }
 }
 export async function fetchVarListings(fetchImpl: FetchLike, signal: AbortSignal, now: () => number): Promise<VarListing[]> {
   const body = await readJson(fetchImpl, VARIATIONAL_STATS, signal, 4_000_000, { 'user-agent': VARIATIONAL_USER_AGENT });

@@ -21,7 +21,9 @@ export function VarLighterPaper({ view, onChanged, onExpired }: { view: StateVie
   const totals = data.totals, limits = data.limits;
   const close = (symbol: string) => {
     const label = `${pairLabel(symbol).symbol}（${pairLabel(symbol).short || '—'}）`;
-    if (!confirm(`按最新报价平掉 ${label} 的模拟持仓？`)) return;
+    const lost = view.orphans?.find(row => row.key === symbol);
+    const text = lost ? `${label}：${lost.reason}。按最后一个样本（${lost.lastSampleAt ? new Date(lost.lastSampleAt).toLocaleString() : '—'}）平掉模拟持仓？` : `按最新报价平掉 ${label} 的模拟持仓？`;
+    if (!confirm(text)) return;
     void write.run(`close:${symbol}`, () => api<{ netUsd: number }>(`${PAPER_PATH}/close`, { body: { symbol } }), trade => { void refresh(); return `${label} 已平仓，净 ${signedUsd(trade.netUsd)}`; });
   };
   const reset = () => {

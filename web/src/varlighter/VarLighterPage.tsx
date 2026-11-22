@@ -73,6 +73,7 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
   const [sort, setSort] = useState<{ key: SortKey; descending: boolean }>({ key: 'gap', descending: true });
   const [query, setQuery] = useState('');
   const [onlyEnabled, setOnlyEnabled] = useState(false);
+  const orphanWrite = useWrite();
   const [venue, setVenue] = useState<VenueFilter>('all');
   const deferred = useDeferredValue(query);
   const rows = sortRows(view.rows.filter(row => matchesQuery(row, deferred) && matchesVenue(row, venue) && (!onlyEnabled || row.enabled || row.position)), sort.key, sort.descending);
@@ -90,7 +91,8 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
       <Metric label="采集起点" value={view.firstSampleAt ? age(view.firstSampleAt, view.now) : '—'} foot={view.firstSampleAt ? new Date(view.firstSampleAt).toLocaleString() : '还没有样本'} />
       <Metric label="模拟盘净盈亏" value={signedUsd(paper.netUsd)} tone={tone(paper.netUsd)} foot={`${paper.trades} 笔 · 今日 ${signedUsd(paper.todayNetUsd)} · 持仓 ${paper.open} 笔 ${usd(paper.openNotionalUsd, 0)}`} />
     </section>
-    {view.orphans?.length ? <Orphans view={view} rows={view.orphans} onChanged={onChanged} /> : null}
+    {view.orphans?.length ? <Orphans view={view} rows={view.orphans} write={orphanWrite} onChanged={onChanged} />
+      : orphanWrite.message ? <div className="vl-actions"><Callout tone={orphanWrite.message.tone}>{orphanWrite.message.text}</Callout></div> : null}
     <section className="panel" aria-label="价差总览">
       <div className="panel-heading"><h2>价差总览</h2><span className="muted">每分钟一个 Var 报价，按报价时刻对齐 Lighter 盘口 · 单位基点（1 = 0.01%）</span></div>
       <div className="vl-toolbar">
@@ -115,8 +117,7 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
 }
 
 /** 已启用或有持仓、但不在当前配对里的键：可停用，持仓按最后样本平仓。 */
-function Orphans({ view, rows, onChanged }: { view: StateView; rows: OrphanRow[]; onChanged: () => Promise<void> }) {
-  const write = useWrite();
+function Orphans({ view, rows, write, onChanged }: { view: StateView; rows: OrphanRow[]; write: ReturnType<typeof useWrite>; onChanged: () => Promise<void> }) {
   const label = (row: OrphanRow) => `${row.symbol}（${row.venueName}）`;
   const disable = (row: OrphanRow) => {
     const params = view.settings.symbols[row.key];
@@ -125,18 +126,18 @@ function Orphans({ view, rows, onChanged }: { view: StateView; rows: OrphanRow[]
       () => { void onChanged(); return `${label(row)} 已停用`; });
   };
   const close = (row: OrphanRow) => {
-    if (!confirm(`${label(row)} 已不在当前配对里，按最后一个样本平掉模拟持仓？`)) return;
+    if (!confirm(`${label(row)}：${row.reason}。按最后一个样本（${row.lastSampleAt ? new Date(row.lastSampleAt).toLocaleString() : '—'}）平掉模拟持仓？`)) return;
     void write.run(`close:${row.key}`, () => api<{ netUsd: number }>(`${VARLIGHTER_BASE}/paper/close`, { body: { symbol: row.key } }),
       trade => { void onChanged(); return `${label(row)} 已平仓，净 ${signedUsd(trade.netUsd)}`; });
   };
   return <section className="panel" aria-label="不在当前配对里的标的">
-    <div className="panel-heading"><h2>不在当前配对里的标的</h2><span className="muted">下架、Var 不再报价或规格改判；不再采集，也不会自动平仓</span></div>
+    <div className="panel-heading"><h2>不在当前配对里的标的</h2><span className="muted">下架、Var 长时间不报价或规格改判；不会自动平仓，可停用或按最后样本平仓</span></div>
     {write.message ? <div className="vl-actions"><Callout tone={write.message.tone}>{write.message.text}</Callout></div> : null}
     <div className="vl-table"><table>
       <thead><tr><th>标的</th><th>状态</th><th>最后样本</th><th /></tr></thead>
       <tbody>{rows.map(row => <tr key={row.key}>
         <td><span className="vl-symbol">{row.symbol}</span><small>{row.venueName}</small></td>
-        <td className="wrap">{row.enabled ? <Badge tone="warn">已启用</Badge> : null} {row.position ? <>{DIRECTION_SHORT[row.position.direction]} 持仓{row.position.pnlBps === null ? '' : ` ${bps(row.position.pnlBps)} 基点`}</> : null}</td>
+        <td className="wrap">{row.reason}<small>{row.enabled ? <Badge tone="warn">已启用</Badge> : null} {row.position ? <>{DIRECTION_SHORT[row.position.direction]} 持仓{row.position.pnlBps === null ? '' : ` ${bps(row.position.pnlBps)} 基点`}</> : null}</small></td>
         <td>{age(row.lastSampleAt, view.now)}</td>
         <td><div className="vl-actions">
           {row.enabled ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => disable(row)}>停用</button> : null}
@@ -165,6 +166,6 @@ function Row({ row, now, multi }: { row: StateRow; now: number; multi: boolean }
     <td className="num">{funding.var} / {funding.rh}<small>Var / Lighter</small></td>
     <td className="num">{row.samples24h}</td>
     <td>{row.position ? <><Badge tone="info">持仓</Badge><small title={DIRECTION_LABELS[row.position.direction]}>{DIRECTION_SHORT[row.position.direction]} · {row.position.pnlBps === null ? '—' : `${bps(row.position.pnlBps)} 基点`}</small></>
-      : row.enabled ? <Badge tone="ok">已启用</Badge> : <span className="vl-dim">未启用</span>}</td>
+      : row.enabled ? <><Badge tone="ok">已启用</Badge>{row.cooldownUntil ? <small>冷却至 {new Date(row.cooldownUntil).toLocaleTimeString()}</small> : null}</> : <span className="vl-dim">未启用</span>}</td>
   </tr>;
 }

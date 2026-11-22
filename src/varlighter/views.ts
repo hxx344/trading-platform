@@ -29,12 +29,13 @@ export interface StateRow {
   baseline: BaselineView | null;
   /** 中间价偏离基线的 σ 倍数；rich / cheap 是两个方向可成交价差相对基线的偏离（基点）。 */ z: number | null; rich: number | null; cheap: number | null;
   samples24h: number; firstAt: number | null;
+  /** 平仓后的冷却截止时刻，已过期为 null。 */ cooldownUntil: number | null;
   enabled: boolean; entryBps: number; exitBps: number;
   position: { direction: Direction; pnlBps: number | null; openedAt: number } | null;
   varFunding: number | null; rhFunding: number | null;
 }
 export interface OrphanRow {
-  key: string; venue: Venue; venueName: string; symbol: string; enabled: boolean; lastSampleAt: number | null;
+  key: string; venue: Venue; venueName: string; symbol: string; reason: string; enabled: boolean; lastSampleAt: number | null;
   position: { direction: Direction; openedAt: number; pnlBps: number | null } | null;
 }
 export interface StateView {

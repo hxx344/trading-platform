@@ -2,7 +2,7 @@
 // WebSocket（market_stats/all 的全市场一档与资金费）与启用配对的盘口快照（REST，每分钟一次）。只读公开接口，不带任何凭据。
 // Lighter 的一档按本机收到时刻记成历史，Var 报价最多晚一分多钟才拿到，对齐时回看那一刻的 Lighter 状态。
 // 完整盘口不走 WebSocket 订阅：主网 BTC 一个市场的增量压缩后约 550 MB/天，快照每分钟一次约 22 KB。
-import { readJsonResponse } from '../vendor/response.mjs';
+import { ExchangeResponseError, readJsonResponse } from '../vendor/response.mjs';
 import { VARIATIONAL_STATS, VARIATIONAL_USER_AGENT } from '../vendor/variational-market.mjs';
 import { VENUE_NAMES, parseRhMarkets, parseVarListings, type RhMarket, type VarListing, type Venue } from './model.ts';
 
@@ -18,7 +18,8 @@ async function readJson(fetchImpl: FetchLike, url: string, signal: AbortSignal, 
   const response = await fetchImpl(url, { headers: { accept: 'application/json', ...headers }, signal });
   if (!response.ok) { void response.body?.cancel().catch(() => {}); throw new Error(`HTTP ${response.status}`); }
   try { return await readJsonResponse(response, { maxBytes: limit, signal }) as unknown; } catch (error) {
-    const code = (error as { code?: unknown })?.code;
+    if (!(error instanceof ExchangeResponseError)) throw error;
+    const code = error.code;
     throw code === 'response_limit' ? new Error('响应过大') : code === 'invalid_data' ? new Error('响应不是有效的 JSON') : code === 'aborted' ? new Error('请求已中止') : error;
   }
 }

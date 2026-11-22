@@ -24,7 +24,7 @@ const roundTo = (value: number, decimals: number, up: boolean) => { const scale 
 export const PLAN_MAX_QUOTE_AGE_MS = 90_000;
 /** 采集时已按 75 秒对齐，这里是兜底，防止用库里拼出的旧样本。 */
 export const PLAN_MAX_ALIGN_MS = 75_000;
-/** Var 报价时刻最多比本机早到 5 秒（时钟差），这段负值不算失败。 */
+/** 时钟差：Var 报价时刻晚于本机不超过 5 秒时按 0 秒算，不判失败。 */
 const CLOCK_SKEW_MS = 5_000;
 
 export function orderPlan(pair: PairInfo, sample: Sample, direction: Direction, notionalUsd: number, maxSlippageBps: number, now: number): OrderPlan {
@@ -44,7 +44,7 @@ export function orderPlan(pair: PairInfo, sample: Sample, direction: Direction, 
   checks.push({ ok: qty * rhExpected >= spec.minQuote, label: `不小于 ${venue} 最小金额 ${spec.minQuote} USDC` });
   checks.push({ ok: !!spread, label: spread ? `${bucketOf(notionalUsd)} 档两边都有可成交价${spread.estimated ? '（Lighter 用一档价估算）' : ''}` : `该档位缺少可成交价（100k 档需要 ${venue} 盘口快照）` });
   const quoteAge = Math.max(0, now - sample.t), ahead = sample.t - now > CLOCK_SKEW_MS, align = Math.abs(sample.t - sample.rhAt);
-  checks.push({ ok: !ahead && quoteAge <= PLAN_MAX_QUOTE_AGE_MS, label: `Var 报价 ${Math.round(quoteAge / 1000)} 秒前（不超过 ${PLAN_MAX_QUOTE_AGE_MS / 1000} 秒）` });
+  checks.push({ ok: !ahead && quoteAge <= PLAN_MAX_QUOTE_AGE_MS, label: ahead ? `Var 报价时刻超前本机 ${Math.round((sample.t - now) / 1000)} 秒` : `Var 报价 ${Math.round(quoteAge / 1000)} 秒前（不超过 ${PLAN_MAX_QUOTE_AGE_MS / 1000} 秒）` });
   checks.push({ ok: align <= PLAN_MAX_ALIGN_MS, label: `${venue} 一档与 Var 报价相差 ${Math.round(align / 1000)} 秒（不超过 ${PLAN_MAX_ALIGN_MS / 1000} 秒）` });
   checks.push({ ok: pair.identity !== 'mismatch', label: pair.identity === 'verified' ? '两边合约规格已核对' : pair.identity === 'review' ? '两边合约规格待人工确认' : '两边价格差距过大，规格不同' });
   checks.push({ ok: false, label: `${venue} 下单连接器（该场所的账户、API 密钥与签名器）尚未接入` });

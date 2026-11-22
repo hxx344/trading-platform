@@ -92,7 +92,7 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
       <Metric label="模拟盘净盈亏" value={signedUsd(paper.netUsd)} tone={tone(paper.netUsd)} foot={`${paper.trades} 笔 · 今日 ${signedUsd(paper.todayNetUsd)} · 持仓 ${paper.open} 笔 ${usd(paper.openNotionalUsd, 0)}`} />
     </section>
     {view.orphans?.length ? <Orphans view={view} rows={view.orphans} write={orphanWrite} onChanged={onChanged} />
-      : orphanWrite.message ? <div className="vl-actions"><Callout tone={orphanWrite.message.tone}>{orphanWrite.message.text}</Callout></div> : null}
+      : orphanWrite.message ? <div className="vl-actions"><Callout tone={orphanWrite.message.tone}>{orphanWrite.message.text}</Callout><button type="button" className="button secondary" onClick={orphanWrite.clear}>知道了</button></div> : null}
     <section className="panel" aria-label="价差总览">
       <div className="panel-heading"><h2>价差总览</h2><span className="muted">每分钟一个 Var 报价，按报价时刻对齐 Lighter 盘口 · 单位基点（1 = 0.01%）</span></div>
       <div className="vl-toolbar">
@@ -116,7 +116,7 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
   </>;
 }
 
-/** 已启用或有持仓、但不在当前配对里的键：可停用，持仓按最后样本平仓。 */
+/** 已启用或有持仓、但已失联的键（下架、规格改判、长时间无样本）：可停用，持仓按最后样本平仓。 */
 function Orphans({ view, rows, write, onChanged }: { view: StateView; rows: OrphanRow[]; write: ReturnType<typeof useWrite>; onChanged: () => Promise<void> }) {
   const label = (row: OrphanRow) => `${row.symbol}（${row.venueName}）`;
   const disable = (row: OrphanRow) => {
@@ -127,11 +127,11 @@ function Orphans({ view, rows, write, onChanged }: { view: StateView; rows: Orph
   };
   const close = (row: OrphanRow) => {
     if (!confirm(`${label(row)}：${row.reason}。按最后一个样本（${row.lastSampleAt ? new Date(row.lastSampleAt).toLocaleString() : '—'}）平掉模拟持仓？`)) return;
-    void write.run(`close:${row.key}`, () => api<{ netUsd: number }>(`${VARLIGHTER_BASE}/paper/close`, { body: { symbol: row.key } }),
-      trade => { void onChanged(); return `${label(row)} 已平仓，净 ${signedUsd(trade.netUsd)}`; });
+    void write.run(`close:${row.key}`, () => api<{ netUsd: number; closedAt: number }>(`${VARLIGHTER_BASE}/paper/close`, { body: { symbol: row.key } }),
+      trade => { void onChanged(); return `${label(row)} 已按 ${new Date(trade.closedAt).toLocaleString()} 的样本平仓，净 ${signedUsd(trade.netUsd)}`; });
   };
-  return <section className="panel" aria-label="不在当前配对里的标的">
-    <div className="panel-heading"><h2>不在当前配对里的标的</h2><span className="muted">下架、Var 长时间不报价或规格改判；不会自动平仓，可停用或按最后样本平仓</span></div>
+  return <section className="panel" aria-label="失联的标的">
+    <div className="panel-heading"><h2>失联的标的</h2><span className="muted">下架、规格改判或长时间无样本；没有新样本就不会自动止损或超时平仓，可停用或按最后样本平仓</span></div>
     {write.message ? <div className="vl-actions"><Callout tone={write.message.tone}>{write.message.text}</Callout></div> : null}
     <div className="vl-table"><table>
       <thead><tr><th>标的</th><th>状态</th><th>最后样本</th><th /></tr></thead>
@@ -147,6 +147,9 @@ function Orphans({ view, rows, write, onChanged }: { view: StateView; rows: Orph
     </table></div>
   </section>;
 }
+
+/** 当天只写时刻，跨日带日期。 */
+const clockOrDate = (at: number, now: number) => new Date(at).toDateString() === new Date(now).toDateString() ? new Date(at).toLocaleTimeString() : new Date(at).toLocaleString();
 
 function Row({ row, now, multi }: { row: StateRow; now: number; multi: boolean }) {
   const hit = signal(row);
@@ -166,6 +169,6 @@ function Row({ row, now, multi }: { row: StateRow; now: number; multi: boolean }
     <td className="num">{funding.var} / {funding.rh}<small>Var / Lighter</small></td>
     <td className="num">{row.samples24h}</td>
     <td>{row.position ? <><Badge tone="info">持仓</Badge><small title={DIRECTION_LABELS[row.position.direction]}>{DIRECTION_SHORT[row.position.direction]} · {row.position.pnlBps === null ? '—' : `${bps(row.position.pnlBps)} 基点`}</small></>
-      : row.enabled ? <><Badge tone="ok">已启用</Badge>{row.cooldownUntil ? <small>冷却至 {new Date(row.cooldownUntil).toLocaleTimeString()}</small> : null}</> : <span className="vl-dim">未启用</span>}</td>
+      : row.enabled ? <><Badge tone="ok">已启用</Badge>{row.cooldownUntil ? <small>冷却至 {clockOrDate(row.cooldownUntil, now)}</small> : null}</> : <span className="vl-dim">未启用</span>}</td>
   </tr>;
 }

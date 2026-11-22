@@ -62,6 +62,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   let firstSample: number | null | undefined;
   const ages: number[] = [];
   const startedAt = now();
+  /** Var 拉取最近一次从未就绪或故障（超过 3 分钟没成功）恢复的时刻。 */
+  let varHealthySince = startedAt;
   let sequence = 0;
   for (const position of store.positions()) positions.set(position.symbol, position);
   for (const symbol of positions.keys()) { const sample = store.latest(symbol); if (sample) latest.set(symbol, sample); }
@@ -152,6 +154,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     let fetched: VarListing[];
     try { fetched = await fetchVarListings(fetchImpl, signal, now); } catch (error) { varSource.error = message(error); return; }
     const receivedAt = now();
+    if (varSource.ok === null || receivedAt - varSource.ok > 3 * VAR_POLL_MS) varHealthySince = receivedAt;
     varSource.ok = receivedAt; varSource.error = null; varSource.count = fetched.length;
     listings = new Map(fetched.map(listing => [listing.ticker, listing]));
     rebuildPairs();
@@ -294,14 +297,12 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     };
   }
 
-  /**
-   * 已启用或有模拟持仓、但不在当前配对里的键（下架、Var 不再报价、规格改判等）：总览里列出来，可以停用或按最后样本平仓。
-   * 目录或 Var 报价还没取到时不判断，免得启动时把全部都列成失联。
-   */
   const lastSample = (key: string) => latest.get(key) ?? store.latest(key);
   /**
    * 配对失联的原因：不在目录里、改判为规格不同，或数据源都正常而 30 分钟没有新样本（Var 不再报价、对手盘口缺失）。
    * 数据源本身没就绪或在故障（启动期、Var 拉取失败、场所目录未取到、行情流断开）时返回 null，不把整体故障当成单个配对失联。
+   * 30 分钟从「最后样本」与「数据源连续正常的起点」（启动、Var 恢复、行情流连上三者取最晚）中较晚的一个算起：
+   * 停机或故障前的旧样本不会在恢复后第一轮还没写入新样本时就被判失联。
    */
   function lostReason(key: string, time: number): string | null {
     if (!listings.size || varSource.ok === null || time - varSource.ok > 3 * VAR_POLL_MS) return null;
@@ -311,10 +312,13 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     if (!pair) return '配对已不在目录里';
     if (pair.identity === 'mismatch') return '两边价格相差超过 5%，已改判为规格不同';
     if (!runtime.stream?.status(runtime.markets.length).connected) return null;
-    const sampleAt = lastSample(key)?.t ?? null;
-    if (sampleAt === null ? time - startedAt <= LOST_MS : time - sampleAt <= LOST_MS) return null;
-    return `超过 ${LOST_MS / 60_000} 分钟没有新样本（Var 无报价或对手盘口缺失）`;
+    const healthyFrom = Math.max(startedAt, varHealthySince, runtime.stream.status(runtime.markets.length).connectedAt ?? time);
+    if (time - Math.max(lastSample(key)?.t ?? -Infinity, healthyFrom) <= LOST_MS) return null;
+    const closed = pair.kind !== 'crypto' && ['weekend', 'overnight'].includes(regimeOf(pair.kind, time));
+    return `超过 ${LOST_MS / 60_000} 分钟没有新样本（${closed ? '可能休市；' : ''}Var 无报价或对手盘口缺失）`;
   }
+
+  /** 已启用或有模拟持仓、但已失联的键：总览里列出来，可以停用或按最后样本平仓。 */
 
   function orphans(): OrphanRow[] {
     const time = now();

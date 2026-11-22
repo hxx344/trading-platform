@@ -24,7 +24,7 @@ export function VarLighterPaper({ view, onChanged, onExpired }: { view: StateVie
     const lost = view.orphans?.find(row => row.key === symbol);
     const text = lost ? `${label}：${lost.reason}。按最后一个样本（${lost.lastSampleAt ? new Date(lost.lastSampleAt).toLocaleString() : '—'}）平掉模拟持仓？` : `按最新报价平掉 ${label} 的模拟持仓？`;
     if (!confirm(text)) return;
-    void write.run(`close:${symbol}`, () => api<{ netUsd: number }>(`${PAPER_PATH}/close`, { body: { symbol } }), trade => { void refresh(); return `${label} 已平仓，净 ${signedUsd(trade.netUsd)}`; });
+    void write.run(`close:${symbol}`, () => api<{ netUsd: number; closedAt: number }>(`${PAPER_PATH}/close`, { body: { symbol } }), trade => { void refresh(); return `${label} 已${Date.now() - trade.closedAt > 10 * 60_000 ? `按 ${new Date(trade.closedAt).toLocaleString()} 的样本` : ''}平仓，净 ${signedUsd(trade.netUsd)}`; });
   };
   const reset = () => {
     void write.run('reset', () => api(`${PAPER_PATH}/reset`, { body: { confirm: resetText } }), () => { setResetText(''); void refresh(); return '模拟盘已清空：持仓、成交与冷却全部清除，参数保留'; });

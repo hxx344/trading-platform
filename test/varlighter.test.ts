@@ -533,8 +533,8 @@ test('失联配对：总览列出，可停用，持仓按最后样本平仓并�
   try { assert.equal(reopened.state<Record<string, number>>('cooldown')?.['rh:GONE'], T0 - 30 * 60_000 + 120 * 60_000, '冷却写进库，重启后仍在'); } finally { reopened.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('失联判定：规格改判、数据源正常而 30 分钟无样本才算；Var 拉取失败或行情流断开时不算，平仓等恢复；冷却重启后照样挡开仓', async () => {
-  const COOLDOWN_MIN = 120;
+test('失联判定：规格改判、数据源连续正常 30 分钟仍无样本才算；Var 失败、目录未取到、行情流断开、刚重启都不算，平仓等恢复；冷却重启后照样挡开仓', async () => {
+  const COOLDOWN_MIN = 600;
   let time = T0, varMark = '100.2', varFails = false, full = false;
   const fetchImpl = async (url: string) => {
     if (url.includes('orderBookDetails')) return Response.json({ code: 200, order_book_details: [{ symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, min_base_amount: '0.001', min_quote_amount: '10', taker_fee: '0', maker_fee: '0', mark_price: '100' }] });
@@ -544,63 +544,92 @@ test('失联判定：规格改判、数据源正常而 30 分钟无样本才算�
     return Response.json({ listings: [{ ticker: 'BTC', name: 'Bitcoin', mark_price: varMark, quotes: { updated_at: new Date(time - 2_000).toISOString(), base: { bid: '100.29', ask: '100.31' }, ...tiers } }] });
   };
   const position: Position = { id: 'p-btc', symbol: 'rh:BTC', direction: 'var_rich', openedAt: T0 - 3_600_000, qty: 10, notionalUsd: 1_000, entrySpread: 20, entryBaseline: 0, entryRegime: 'rth', varEntry: 100.3, rhEntry: 100.01, estimated: false };
-  const { file, engine, sockets, dispose } = seededEngine(store => {
-    store.setState('settings', { revision: 1, global: { ...DEFAULT_GLOBAL, minSamples: 10 }, symbols: { 'rh:BTC': { ...DEFAULT_SYMBOL, enabled: true, entryBps: 1, exitBps: 0, cooldownMinutes: COOLDOWN_MIN } }, confirmed: [], venues: ['rh'] }, T0);
-    store.addSamples(Array.from({ length: 12 }, (_, index) => ({ ...sample(T0 - (75 - index * 5) * 60_000, 100.1), symbol: 'rh:BTC' })));
-    store.savePosition(position);
-  }, { fetchImpl, clock: () => time });
-  const status = (work: () => unknown) => { try { work(); } catch (error) { return (error as { status: number }).status; } return 200; };
-  const reasons = () => engine.views.state().orphans.map(row => row.reason);
-  try {
-    engine.startStreams();
-    sockets[0].open();
-    await engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
-    await engine.pollVar(AbortSignal.timeout(1000));
-    assert.deepEqual(reasons(), [], '最后样本 20 分钟前，还不算失联');
-    assert.equal(status(() => engine.views.close({ symbol: 'rh:BTC' })), 409);
-    time = T0 + 11 * 60_000;
-    await engine.pollVar(AbortSignal.timeout(1000));
-    assert.deepEqual(reasons(), ['超过 30 分钟没有新样本（Var 无报价或对手盘口缺失）'], 'Var 有目录没报价');
-    varFails = true; time = T0 + 15 * 60_000;
-    await engine.pollVar(AbortSignal.timeout(1000));
-    assert.deepEqual(reasons(), [], 'Var 拉取失败超过 3 分钟，整体故障不算单个配对失联');
-    assert.equal(status(() => engine.views.close({ symbol: 'rh:BTC' })), 409, '数据源故障时不按旧样本结算');
-    varFails = false;
-    await engine.pollVar(AbortSignal.timeout(1000));
-    sockets[0].onclose?.({});
-    assert.deepEqual(reasons(), [], '行情流断开也不算');
-    engine.close();
-  } catch (error) { dispose(); throw error; }
-
-  // 重启：规格改判后可按最后样本平仓，冷却写库，重启后照样挡开仓。
-  const restart = () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-')), file = path.join(dir, 'varlighter.sqlite');
+  const engines: ReturnType<typeof createVarLighterEngine>[] = [];
+  /** 启动一个引擎并连上行情流；advance 拨时钟并推一条消息（行情流按消息间隔判沉默）。 */
+  const start = () => {
     const sockets: FakeSocket[] = [];
     const engine = createVarLighterEngine({ store: openVarLighterStore(file), fetchImpl, connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now: () => time });
+    engines.push(engine);
     engine.startStreams();
     sockets[0].open();
     sockets[0].push({ type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: '99.99', best_ask_price: '100.01', mark_price: '100' } } });
-    return { engine, tick: (index: number) => sockets[0].push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, mark_price: String(100 + index * 0.0001) } } }) };
+    let tick = 0;
+    const advance = (ms: number) => { time += ms; tick++; sockets[0].push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, mark_price: String(100 + tick * 0.0001) } } }); };
+    /** 按服务节奏每分钟拉一次 Var。 */
+    const run = async (minutes: number) => { for (let index = 0; index < minutes; index++) { advance(60_000); await engine.pollVar(AbortSignal.timeout(1000)); } };
+    return { engine, socket: sockets[0], advance, run };
   };
-  varMark = '120';
-  const again = restart().engine;
+  const poll = (engine: ReturnType<typeof createVarLighterEngine>) => engine.pollVar(AbortSignal.timeout(1000));
+  const status = (work: () => unknown) => { try { work(); } catch (error) { return (error as { status: number }).status; } return 200; };
+  const reasons = (engine: ReturnType<typeof createVarLighterEngine>) => engine.views.state().orphans.map(row => row.reason);
+  const NO_SAMPLE = '超过 30 分钟没有新样本（Var 无报价或对手盘口缺失）';
   try {
-    await again.refreshCatalog(AbortSignal.timeout(1000), 'rh');
-    await again.pollVar(AbortSignal.timeout(1000));
-    assert.deepEqual(again.views.state().orphans.map(row => row.reason), ['两边价格相差超过 5%，已改判为规格不同']);
-    const trade = again.views.close({ symbol: 'rh:BTC' });
+    const seed = openVarLighterStore(file);
+    seed.setState('settings', { revision: 1, global: { ...DEFAULT_GLOBAL, minSamples: 10 }, symbols: { 'rh:BTC': { ...DEFAULT_SYMBOL, enabled: true, entryBps: 1, exitBps: 0, cooldownMinutes: COOLDOWN_MIN } }, confirmed: [], venues: ['rh'] }, T0);
+    seed.addSamples(Array.from({ length: 12 }, (_, index) => ({ ...sample(T0 - (75 - index * 5) * 60_000, 100.1), symbol: 'rh:BTC' })));
+    seed.savePosition(position);
+    seed.close();
+
+    // 刚启动：库里最后样本 20 分钟前；Var 已拉到但场所目录未取到，也不算。
+    const first = start();
+    await poll(first.engine);
+    assert.deepEqual(reasons(first.engine), [], '场所目录未取到不判断');
+    assert.equal(status(() => first.engine.views.close({ symbol: 'rh:BTC' })), 409, '启动期不按旧样本结算');
+    await first.engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
+    await first.run(11);
+    assert.deepEqual(reasons(first.engine), [], '最后样本 31 分钟前，但数据源正常才 11 分钟');
+    await first.run(20);
+    assert.deepEqual(reasons(first.engine), [NO_SAMPLE], '数据源连续正常 31 分钟仍无样本：Var 有目录没报价');
+    varFails = true; first.advance(4 * 60_000); await poll(first.engine);
+    assert.deepEqual(reasons(first.engine), [], 'Var 拉取失败超过 3 分钟，整体故障不算单个配对失联');
+    assert.equal(status(() => first.engine.views.close({ symbol: 'rh:BTC' })), 409, '数据源故障时不按旧样本结算');
+    varFails = false; await poll(first.engine);
+    assert.deepEqual(reasons(first.engine), [], 'Var 刚恢复，从恢复时刻重新计时');
+    await first.run(31);
+    assert.deepEqual(reasons(first.engine), [NO_SAMPLE], '恢复后 31 分钟仍无样本');
+    first.socket.onclose?.({});
+    assert.deepEqual(reasons(first.engine), [], '行情流断开不算');
+    assert.equal(status(() => first.engine.views.close({ symbol: 'rh:BTC' })), 409);
+    first.engine.close();
+
+    // 停机很久后重启：第一轮 Var 报价早于行情流快照，没写入新样本，旧样本不算失联。
+    time += 3_600_000;
+    const restarted = start();
+    await restarted.engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
+    await poll(restarted.engine);
+    assert.equal(restarted.engine.views.state().sources.var.poll?.written, 0, '第一轮没有新样本');
+    assert.deepEqual(reasons(restarted.engine), [], '重启后第一轮');
+    assert.equal(status(() => restarted.engine.views.close({ symbol: 'rh:BTC' })), 409);
+    restarted.engine.close();
+
+    // 规格改判：按最后样本平仓并注明原因。
+    varMark = '120';
+    const mismatch = start();
+    await mismatch.engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
+    await poll(mismatch.engine);
+    assert.deepEqual(reasons(mismatch.engine), ['两边价格相差超过 5%，已改判为规格不同']);
+    const trade = mismatch.engine.views.close({ symbol: 'rh:BTC' });
     assert.equal(trade.closedAt, T0 - 20 * 60_000);
-    assert.match(again.views.paper().events[0].message, /规格不同，按最后样本/);
-  } finally { again.close(); }
-  varMark = '100.3'; full = true;
-  const third = restart();
-  try {
+    assert.match(mismatch.engine.views.paper().events[0].message, /规格不同，按最后样本/);
+    mismatch.engine.close();
+
+    // 冷却写库，重启后照样挡开仓；清空模拟盘（连冷却一起清）后同样的行情会开仓，作为对照。
+    varMark = '100.3'; full = true;
+    const third = start();
     await third.engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
-    for (let index = 1; index <= 3; index++) { time += 60_000; third.tick(index); await third.engine.pollVar(AbortSignal.timeout(1000)); }
+    await third.run(3);
     const row = third.engine.views.state().rows[0];
     assert.equal(row.cooldownUntil, T0 - 20 * 60_000 + COOLDOWN_MIN * 60_000, '重启后读回冷却');
     assert.ok(third.engine.views.state().sources.var.poll!.written > 0 && row.baseline !== null && (row.rich ?? 0) > row.entryBps, '有新样本且达到入场条件');
     assert.equal(third.engine.views.paper().positions.length, 0, '冷却中不开仓');
-  } finally { third.engine.close(); rmSync(path.dirname(file), { recursive: true, force: true }); }
+    third.engine.views.reset({ confirm: 'RESET' });
+    await third.run(1);
+    assert.equal(third.engine.views.paper().positions.length, 1, '对照：没有冷却就开仓');
+  } finally {
+    for (const engine of engines) { try { engine.close(); } catch { /* 已关闭 */ } }
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('后台循环：停服时中断进行中的请求、关掉行情流；启动时已在停服也关库', async () => {

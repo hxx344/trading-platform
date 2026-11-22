@@ -1,0 +1,128 @@
+/* Var/Lighter 价差页（web/src/varlighter/VarLighterPage.tsx，docs/frontend.md《Var/Lighter 价差页》）。
+   工作台没有对应页面：骨架沿用 styles.css 的 wb-page / wb-heading / panel / panel-heading / callout，
+   表格规则照 ondo.css 的 .om-table（工作台 src/ondo-mm.css 提交 7745181）改名为 .vl-table；其余为本页新增，只用设计令牌。 */
+.vl-page{display:flex;flex-direction:column;gap:16px;min-width:0}
+.vl-page input:not([type=checkbox]),.vl-page select{height:32px;min-width:0;border:1px solid var(--surface-5);border-radius:var(--radius-sm);padding:4px 10px;color:var(--text-primary);background:var(--surface-1);font-size:.8125rem;font-variant-numeric:tabular-nums}
+.vl-page input:focus-visible,.vl-page select:focus-visible,.vl-page button:focus-visible,.vl-page a:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.vl-page .button:disabled{opacity:.55;cursor:not-allowed}
+
+/* 顶部：来源状态与页签 */
+.vl-sources{display:flex;flex-wrap:wrap;gap:6px}
+.vl-chip{display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border:1px solid var(--surface-5);border-radius:var(--radius-pill);background:var(--surface-1);color:var(--text-secondary);font-size:.75rem;white-space:nowrap}
+.vl-chip i{width:7px;height:7px;border-radius:var(--radius-circle);background:var(--off)}
+.vl-chip.ok i{background:var(--emerald)}
+.vl-chip.warn i{background:var(--warning)}
+.vl-chip.bad i{background:var(--error)}
+.vl-tabs{display:flex;gap:2px;padding:3px;border:1px solid var(--surface-4);border-radius:var(--radius-md);background:var(--surface-1);overflow-x:auto;max-width:100%;align-self:flex-start}
+.vl-tabs a{display:inline-flex;align-items:center;gap:6px;min-height:30px;padding:0 14px;border-radius:var(--radius-sm);color:var(--text-secondary);font-size:.8125rem;white-space:nowrap}
+.vl-tabs a:hover{background:var(--surface-3);color:var(--text-primary)}
+.vl-tabs a[aria-current=page]{background:var(--surface-4);color:var(--text-primary);font-weight:600}
+
+/* 指标卡 */
+.vl-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+.vl-metrics.inset{padding:14px}
+.vl-metric{display:flex;flex-direction:column;gap:4px;min-width:0;padding:12px 14px;border:1px solid var(--surface-4);border-radius:var(--radius-md);background:var(--surface-2)}
+.vl-metric span{color:var(--text-tertiary);font-size:.75rem}
+.vl-metric strong{font-size:1.125rem;font-weight:650;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.vl-metric small{color:var(--text-tertiary);font-size:.6875rem;line-height:1.5}
+
+/* 表格 */
+.vl-table{overflow-x:auto}
+.vl-table table{width:100%;border-collapse:collapse;font-size:.8125rem}
+.vl-table th,.vl-table td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--surface-4);vertical-align:top;white-space:nowrap}
+.vl-table th{font-weight:500;color:var(--text-tertiary);font-size:.75rem}
+.vl-table tr:last-child td{border-bottom:0}
+.vl-table .num{text-align:right;font-variant-numeric:tabular-nums}
+.vl-table small{display:block;color:var(--text-tertiary);font-size:.6875rem}
+.vl-table td.wrap{white-space:normal;min-width:220px}
+.vl-table th button{border:0;background:none;padding:0;color:inherit;font:inherit;cursor:pointer}
+.vl-table th button[aria-pressed=true]{color:var(--text-primary);font-weight:600}
+.vl-table tbody tr.vl-hit{background:var(--accent-subtle)}
+.vl-symbol{color:var(--text-primary);font-weight:600}
+a.vl-symbol:hover{color:var(--accent)}
+.vl-up{color:var(--emerald)}
+.vl-down{color:var(--error)}
+.vl-warn{color:var(--warning)}
+.vl-dim{color:var(--text-tertiary)}
+
+.vl-badge{display:inline-flex;align-items:center;height:18px;padding:0 6px;margin-left:6px;border-radius:4px;background:var(--surface-3);color:var(--text-secondary);font-size:.6875rem;font-weight:500;vertical-align:middle}
+.vl-badge.ok{background:var(--emerald-soft);color:var(--emerald)}
+.vl-badge.warn{background:var(--warning-soft);color:var(--warning)}
+.vl-badge.bad{background:var(--error-soft);color:var(--error)}
+.vl-badge.info{background:var(--info-soft);color:var(--info)}
+
+/* 工具栏与表单 */
+.vl-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding:10px 14px;border-bottom:1px solid var(--surface-4)}
+.vl-toolbar label{display:inline-flex;align-items:center;gap:6px;color:var(--text-secondary);font-size:.75rem}
+.vl-toolbar .grow{flex:1}
+.vl-seg{display:inline-flex;padding:2px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);background:var(--surface-1)}
+.vl-seg button{min-height:26px;padding:0 10px;border:0;border-radius:4px;background:transparent;color:var(--text-secondary);font-size:.75rem}
+.vl-seg button[aria-pressed=true]{background:var(--surface-4);color:var(--text-primary);font-weight:600}
+.vl-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px 18px;padding:14px}
+.vl-field{display:flex;flex-direction:column;gap:5px;min-width:0;color:var(--text-secondary);font-size:.75rem}
+.vl-field input,.vl-field select{width:100%}
+.vl-field small{color:var(--text-tertiary);font-size:.6875rem;line-height:1.55}
+.vl-options{display:flex;flex-wrap:wrap;gap:6px 14px;padding:0 14px 12px;color:var(--text-secondary);font-size:.75rem}
+.vl-options b{width:100%;font-weight:500;color:var(--text-tertiary)}
+.vl-options label{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
+.vl-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:0 14px 14px}
+.vl-actions .callout{flex-basis:100%}
+.vl-actions.vl-pause{padding-top:14px}
+.vl-note{padding:10px 14px;color:var(--text-tertiary);font-size:.75rem;line-height:1.65}
+.vl-note.err{color:var(--error)}
+
+/* 布局 */
+.vl-columns{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:16px;align-items:start}
+.vl-stack{display:flex;flex-direction:column;gap:16px;min-width:0}
+
+/* 走势图 */
+.vl-chart{height:320px;padding:10px 4px 4px 14px}
+.vl-chart.small{height:200px}
+.vl-legend{display:flex;flex-wrap:wrap;gap:6px 14px;padding:8px 14px 12px;color:var(--text-tertiary);font-size:.6875rem}
+.vl-legend span{display:inline-flex;align-items:center;gap:6px}
+.vl-legend i{display:inline-block;width:14px;height:0;border-top:2px solid var(--text-tertiary)}
+.vl-legend i.mid{border-color:var(--accent)}
+.vl-legend i.sell{border-color:var(--emerald)}
+.vl-legend i.buy{border-color:var(--error)}
+.vl-legend i.median{border-top-style:dashed;border-color:var(--text-secondary)}
+.vl-legend i.band{height:8px;border:0;background:var(--accent-subtle)}
+.vl-legend i.open{width:8px;height:8px;border:2px solid var(--warning);border-radius:var(--radius-circle)}
+.vl-legend i.close{width:8px;height:8px;border:0;border-radius:var(--radius-circle);background:var(--warning)}
+.vl-marker-open{fill:none;stroke:var(--warning);stroke-width:2}
+.vl-marker-close{fill:var(--warning)}
+.vl-tip{display:grid;grid-template-columns:auto auto;gap:2px 12px;font-size:.6875rem;color:var(--text-secondary);font-variant-numeric:tabular-nums}
+.vl-tip b{grid-column:1/-1;color:var(--text-primary);font-weight:600}
+.vl-tip span:nth-child(odd){color:var(--text-tertiary)}
+
+/* 核对清单、下单预演、事件 */
+.vl-checklist{list-style:none;margin:0;padding:4px 14px}
+.vl-checklist li{display:grid;grid-template-columns:20px minmax(0,1fr);gap:10px;padding:10px 0;border-bottom:1px solid var(--surface-4);font-size:.8125rem}
+.vl-checklist li:last-child{border-bottom:0}
+.vl-checklist li>svg{margin-top:2px}
+.vl-checklist .ok>svg{color:var(--emerald)}
+.vl-checklist .warn>svg{color:var(--warning)}
+.vl-checklist .todo>svg{color:var(--text-tertiary)}
+.vl-checklist p{margin-top:3px;color:var(--text-tertiary);font-size:.75rem;line-height:1.6;overflow-wrap:anywhere}
+.vl-plans{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0}
+.vl-plan{min-width:0;padding:12px 14px;border-right:1px solid var(--surface-4)}
+.vl-plan:last-child{border-right:0}
+.vl-plan h3{font-size:.8125rem;font-weight:600;margin-bottom:8px}
+.vl-plan ol{margin:8px 0 0;padding-left:18px;color:var(--text-tertiary);font-size:.75rem;line-height:1.6}
+.vl-plan code{font-family:var(--font-mono);font-size:.6875rem;color:var(--text-secondary);overflow-wrap:anywhere}
+.vl-events{list-style:none;margin:0;padding:4px 14px 12px;max-height:420px;overflow-y:auto;font-size:.75rem}
+.vl-events li{display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px;padding:6px 0;border-bottom:1px solid var(--surface-4);overflow-wrap:anywhere}
+.vl-events li:last-child{border-bottom:0}
+.vl-events time{color:var(--text-tertiary);font-variant-numeric:tabular-nums}
+.vl-events b{font-weight:500;margin-right:6px}
+
+@media (max-width:1100px){.vl-columns{grid-template-columns:minmax(0,1fr)}.vl-fields{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:650px){
+  .vl-fields{grid-template-columns:minmax(0,1fr)}
+  .vl-page input:not([type=checkbox]),.vl-page select{height:40px;font-size:16px}
+  .vl-plans{grid-template-columns:minmax(0,1fr)}
+  .vl-plan{border-right:0;border-bottom:1px solid var(--surface-4)}
+  .vl-chart{height:260px;padding-left:6px}
+  .vl-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .vl-events li{grid-template-columns:minmax(0,1fr);gap:2px}
+}
+.vl-venue-toggle{display:flex;margin-top:6px;white-space:nowrap}

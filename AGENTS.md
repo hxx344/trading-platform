@@ -17,6 +17,7 @@
 | Gate CrossEx 跨所交易 | [docs/crossex.md](docs/crossex.md) |
 | 期权 Greeks | [docs/options.md](docs/options.md) |
 | Ondo 挂单奖励（挂单引擎、奖励市场盘口与收益模拟） | [docs/ondo.md](docs/ondo.md) |
+| Var / Lighter 价差回归（Lighter RH 与主网，采集、基线、回测、模拟盘、实盘准备） | [docs/varlighter.md](docs/varlighter.md) |
 | 行情监控（含海力士溢价监控与告警） | [docs/monitor.md](docs/monitor.md) |
 | EQN 快讯、行情监控「异动行情」页签 | [docs/news.md](docs/news.md) |
 | 资产账本 | [docs/asset.md](docs/asset.md) |

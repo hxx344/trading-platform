@@ -25,6 +25,7 @@ import { supportsFundingHistory } from './vendor/exchange-funding-history.mjs';
 import type { AssetStore } from './asset/store.ts';
 import type { CrossexViews } from './service/crossex.ts';
 import type { OndoViews } from './service/ondo.ts';
+import type { VarLighterViews } from './service/varlighter.ts';
 import { AssetConflict } from './asset/sync-lock.ts';
 import { AssetInputError, INPUT_INVALID } from './asset/validation.ts';
 import { AssetBackupError } from './asset/source-import.ts';
@@ -166,6 +167,8 @@ export interface ServiceViews {
   update?: { status(): unknown; check(): Promise<unknown>; apply(body: unknown): unknown };
   /** EQN 快讯与异动行情（service/news.ts，docs/news.md）；config.json 写了 `"news": false` 时没有。读取在连接开始前为 null。 */
   news?: { flash(): unknown; moves(): unknown };
+  /** Var 与 Lighter（RH、主网）价差采集与模拟盘（service/varlighter.ts，docs/varlighter.md）；config.json 写了 `"varLighter": false` 时没有。 */
+  varlighter?: VarLighterViews;
 }
 
 /** accessToken is exchanged at /login for a session of its own, as is the password (sessions.ts). */
@@ -509,7 +512,7 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
       return send(response, 200, {
         generation: executor.generation, retired: executor.retired, transport: executor.environment === 'mainnet' ? 'live' : 'simulated',
         modules: { oil: !!views?.oil, options: !!views?.options, asset: !!views?.asset,
-          crossex: !!views?.crossex, ondo: !!views?.ondo, news: !!views?.news },
+          crossex: !!views?.crossex, ondo: !!views?.ondo, news: !!views?.news, varlighter: !!views?.varlighter },
         monitor: monitorScopes(views?.monitor?.state()),
       } satisfies ShellView);
     }
@@ -843,6 +846,26 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
         if (error instanceof ContractError) throw error;
         const failure = ondo.failure(error);
         if (failure.internal) process.stderr.write(`Ondo 接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}\n`);
+        return send(response, failure.status, failure.body);
+      }
+      return send(response, 404, { code: 'not_found', message: '不存在' });
+    }
+    if (url.pathname.startsWith('/api/varlighter/')) {
+      if (!views?.varlighter) return send(response, 404, { code: 'not_found', message: '本服务没有开启 Var/Lighter 价差模块' });
+      const varlighter = views.varlighter, path = url.pathname.slice('/api/varlighter/'.length);
+      try {
+        if (request.method === 'GET' && path === 'state') return send(response, 200, varlighter.state());
+        if (request.method === 'GET' && path === 'symbol') return send(response, 200, varlighter.symbol(url.searchParams.get('symbol'), url.searchParams.get('hours')));
+        if (request.method === 'GET' && path === 'paper') return send(response, 200, varlighter.paper());
+        if (request.method === 'GET' && path === 'readiness') return send(response, 200, varlighter.readiness());
+        if (request.method === 'POST' && path === 'backtest') return send(response, 200, varlighter.backtest(await readJson(request)));
+        if (request.method === 'POST' && path === 'settings') return send(response, 200, varlighter.settings(await readJson(request, 64 * 1024)));
+        if (request.method === 'POST' && path === 'paper/close') return send(response, 200, varlighter.close(await readJson(request)));
+        if (request.method === 'POST' && path === 'paper/reset') return send(response, 200, varlighter.reset(await readJson(request)));
+      } catch (error) {
+        if (error instanceof ContractError) throw error;
+        const failure = varlighter.failure(error);
+        if (failure.internal) process.stderr.write(`Var/Lighter 接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}\n`);
         return send(response, failure.status, failure.body);
       }
       return send(response, 404, { code: 'not_found', message: '不存在' });

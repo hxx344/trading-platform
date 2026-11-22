@@ -44,6 +44,7 @@
 | 交易中心 | 金油 | `#/goldoil` | 同原油，三者共用执行账户 | 《金油页（G1，v0.74.0）》，页面内容见 [goldoil.md](goldoil.md) 第 3 节 |
 | 交易中心 | CrossEx | `#/crossex`，子页 `#/crossex/trade`、`#/crossex/hedge`、`#/crossex/orders`、`#/crossex/settings` | 已配置 CrossEx，后台重试期间也显示 | 《CrossEx 页》 |
 | 交易中心 | Ondo 挂单奖励 | `#/ondo` | 服务已接入 Ondo | 《Ondo 挂单奖励页》 |
+| 交易中心 | Var/Lighter 价差 | `#/varlighter`，子页 `#/varlighter/detail/<场所:代码>`、`#/varlighter/paper`、`#/varlighter/ready` | 服务开启了 Var/Lighter 模块（默认开启，`"varLighter": false` 关闭） | 《Var/Lighter 价差页》，内容见 [varlighter.md](varlighter.md) 第 10 节 |
 | 策略与风险 | 配对组 | `#/`、`#/pair/<配对>` | 总是 | F1–F3、《ASTER 页面按工作台重排（F4）》 |
 | 期权 | 期权 | `#/options`，子页 `#/options/positions`、`#/options/orders`、`#/options/performance`、`#/options/rfq` | 已配置期权，后台重试期间也显示 | 《期权页》 |
 | 系统 | 运行状态 | `#/status` | 总是 | F2、《日志页与定时摘要状态》 |
@@ -703,6 +704,18 @@
 观察区按市场列出 4、8、15 bps 三档净 APR。下拉选择查看日奖励、日损失、净收益、有效虚挂时长和触价次数。各市场独立使用同一参考本金，默认取每单名义金额的两倍，用户可以在浏览器修改。停止后，这个浏览器保留本轮分母，下一次观察的本金可另行设置。会话状态接口随采样返回各市场测算和缺样本原因，切换明细与本金均在本地完成。
 
 「行情与订单延迟」按市场显示近五分钟的最近值、P50、P95、成功样本数与未计入耗时的次数。观察显示公开盘口和共享心跳，实盘增加 REST 排队、下单、撤单和改挂。页面从后台恢复时，APR 与延迟保留上次读数并标明陈旧，收到新会话状态后恢复。回退到 v0.62.1 即可恢复原页面，回退前按 [ondo.md](ondo.md) 的要求停止会话。
+
+## Var/Lighter 价差页
+
+**对照的工作台页面**：工作台没有这个页面，骨架照本仓库的 Ondo 页（`wb-heading`、`panel`、`callout`、表格样式同 `ondo.css` 的 `.om-table`）；回退版本 v0.79.1。代码在 `web/src/varlighter/`，内容见 [varlighter.md](varlighter.md) 第 9、10 节；`config.json` 写 `"varLighter": false` 时左侧栏没有入口。
+
+- 左侧栏入口在「交易中心」组 Ondo 之后。四个页签都在地址里：`#/varlighter`、`#/varlighter/detail/<场所:代码>`（如 `rh:AAPL`；旧的只有代码的地址回到默认配对）、`#/varlighter/paper`、`#/varlighter/ready`。
+- 页头右侧每个来源一枚状态：Var 报价时效、每个采集中的 Lighter 场所（行情流、配对数、盘口快照新鲜度，悬停看错误）、模拟盘暂停。
+- 价差总览：四个读数卡、筛选（代码或名称、对手场所、只看已启用或有持仓）、可排序表格；同一代码在两个场所是两行，带「RH / 主网」标签。信号列写 Var 一侧的方向简写（悬停看两腿全称）。
+- 标的详情：下拉按「代码 · 场所 · 名称」选配对；读数、走势图（中间价基差、两个方向的可成交价差、基线与入场带、开平仓点）、按时段统计、参数与回测、下单预演、该配对的成交。
+- 模拟盘：汇总卡、持仓（可手动平仓）、累计净盈亏、按日汇总、成交、事件、清空（输入 RESET）。权益图刻度间隔小于 1 美元时带小数。
+- 实盘准备：核对清单、全局参数与风控、采集状态（每个场所的行情流、流量折算、目录、盘口快照，及停采 / 开采按钮，至少保留一个场所）、规格核对（按配对确认）。
+- 窄屏（390 px）时表格在面板内横向滚动，不撑宽页面。本地预览：`pnpm build:web` 后 `node scripts/dev-varlighter.ts`（替身行情，两个场所都有）。
 
 ## 只读接口令牌（v0.69.0）
 

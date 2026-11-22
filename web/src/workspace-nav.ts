@@ -13,7 +13,7 @@ export const workspaceLabels: Record<WorkspaceId, string> = {
   options: '期权', onchain: '链上', research: '研究室', system: '系统',
 };
 
-export type NavEntry = 'asset' | 'positions' | 'monitor' | 'news' | 'oil' | 'hynix' | 'goldoil' | 'crossex' | 'ondo' | 'pairs' | 'options' | 'status' | 'logs' | 'settings';
+export type NavEntry = 'asset' | 'positions' | 'monitor' | 'news' | 'oil' | 'hynix' | 'goldoil' | 'crossex' | 'ondo' | 'varlighter' | 'pairs' | 'options' | 'status' | 'logs' | 'settings';
 
 /** Every entry of the side navigation, in its order inside the workspace. A new page is registered here. */
 export const navEntries: Record<NavEntry, { workspace: WorkspaceId; text: string; href: string }> = {
@@ -29,6 +29,8 @@ export const navEntries: Record<NavEntry, { workspace: WorkspaceId; text: string
   goldoil: { workspace: 'trading', text: '金油', href: '#/goldoil' },
   crossex: { workspace: 'trading', text: 'CrossEx', href: '#/crossex' },
   ondo: { workspace: 'trading', text: 'Ondo 挂单奖励', href: '#/ondo' },
+  // Var/Lighter 价差回归（docs/varlighter.md）：config.json 写了 "varLighter": false 时没有。
+  varlighter: { workspace: 'trading', text: 'Var/Lighter 价差', href: '#/varlighter' },
   pairs: { workspace: 'strategy', text: '配对组', href: '#/' },
   options: { workspace: 'options', text: '期权', href: '#/options' },
   status: { workspace: 'system', text: '运行状态', href: '#/status' },

@@ -53,6 +53,8 @@ export interface ServiceConfig {
   watch?: WatchConfig;
   /** EQN 快讯与异动行情（docs/news.md）；不写为开启，`"news": false` 关闭。 */
   news?: boolean;
+  /** Var 与 Lighter（RH、主网）价差采集与模拟盘（docs/varlighter.md）；不写为开启，`"varLighter": false` 关闭。 */
+  varLighter?: boolean;
 }
 export interface FeishuSecret { webhook: string; secret: string | null }
 export interface ServiceSecrets {
@@ -136,7 +138,7 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   // pairs may be left out only when another module is there: at least one module must be configured.
   const modules = raw !== null && typeof raw === 'object' ? MODULE_KEYS.filter(key => Object.hasOwn(raw, key)) : [];
   const hasModule = modules.length > 0;
-  const value = exactKeys(raw, hasModule ? ['secretsFile'] : ['secretsFile', 'pairs'], ['port', 'host', 'budget', 'summary', 'watch', 'news', ...(hasModule ? ['pairs', ...modules] : [])]);
+  const value = exactKeys(raw, hasModule ? ['secretsFile'] : ['secretsFile', 'pairs'], ['port', 'host', 'budget', 'summary', 'watch', 'news', 'varLighter', ...(hasModule ? ['pairs', ...modules] : [])]);
   const oil = modules.includes('oil') ? parseOilConfig(value.oil) : undefined;
   const options = modules.includes('options') ? parseOptionsConfig(value.options) : undefined;
   const monitor = modules.includes('monitor') ? parseMonitorConfig(value.monitor) : undefined;
@@ -176,7 +178,8 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   const summary = value.summary === undefined ? undefined : { intervalMinutes: integer(exactKeys(value.summary, ['intervalMinutes'], []).intervalMinutes, 0, 1_440, '定时摘要间隔（分钟，0 为关闭）') };
   const watch = value.watch === undefined ? undefined : parseWatchConfig(value.watch);
   if (value.news !== undefined && typeof value.news !== 'boolean') throw new Error('news 须为 true 或 false（EQN 快讯，不写为开启）');
-  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs, ...(oil ? { oil } : {}), ...(options ? { options } : {}), ...(monitor ? { monitor } : {}), ...(asset ? { asset } : {}), ...(summary ? { summary } : {}), ...(crossex ? { crossex } : {}), ...(ondo ? { ondo } : {}), ...(watch ? { watch } : {}), ...(value.news === false ? { news: false } : {}) };
+  if (value.varLighter !== undefined && typeof value.varLighter !== 'boolean') throw new Error('varLighter 须为 true 或 false（Var/Lighter 价差，不写为开启）');
+  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs, ...(oil ? { oil } : {}), ...(options ? { options } : {}), ...(monitor ? { monitor } : {}), ...(asset ? { asset } : {}), ...(summary ? { summary } : {}), ...(crossex ? { crossex } : {}), ...(ondo ? { ondo } : {}), ...(watch ? { watch } : {}), ...(value.news === false ? { news: false } : {}), ...(value.varLighter === false ? { varLighter: false } : {}) };
 }
 
 export function parseServiceSecrets(raw: unknown, needed: readonly string[], oilVenues: readonly Venue[] = [], options = false, crossex = false, ondo = false): ServiceSecrets {

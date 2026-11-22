@@ -12,6 +12,7 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { ContractError } from '../contracts.ts';
 import { VARIATIONAL_EXPIRY_MARGIN_MS, requestVariational, variationalReasonNote, variationalTokenExpiry, type VariationalFetcher } from '../vendor/variational-market.mjs';
+import { anySignal } from '../any-signal.mjs';
 
 export const VARIATIONAL_SESSION_FILE = 'monitor-variational-session.json';
 /** Two saves this close together are refused: each one asks Variational once. */
@@ -140,7 +141,7 @@ export function createVariationalSession({ dir, fetcher, now = Date.now, log = l
         if (now() - lastAttempt < VARIATIONAL_SAVE_INTERVAL_MS) throw new ContractError(429, 'session_rate_limited', '验证过于频繁，请稍等 3 秒再试。');
         lastAttempt = now();
         let result: unknown;
-        try { result = await requestVariational('/me', token as string, { fetcher, signal: AbortSignal.any([AbortSignal.timeout(12_000), stopping.signal]) }); }
+        try { result = await requestVariational('/me', token as string, { fetcher, signal: anySignal([stopping.signal], 12_000) }); }
         catch (error) {
           const failure = error as { message?: string; status?: number; variational?: boolean };
           const message = failure?.variational ? failure.message : 'Variational 暂不可用，请稍后重试。';

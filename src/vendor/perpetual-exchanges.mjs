@@ -1,4 +1,4 @@
-// 复制自 project-aggregation 工作台 modules/monitor/modules/perpetual/exchanges.mjs（提交 c84ba27），改了相对导入路径；另有两处本服务的修正：
+// 复制自 project-aggregation 工作台 modules/monitor/modules/perpetual/exchanges.mjs（提交 c84ba27），改了相对导入路径，AbortSignal.any 改用 ../any-signal.mjs（Node 24.15 下与长期信号组合会泄漏内存）；另有两处本服务的修正：
 // OKX 改连 443 端口（8443 将停用），OKX 的 notice 消息不当作订阅失败（工作台会因此反复重连、取不到 OKX 行情）。
 // O7（docs/oil.md 第 12 节）：Binance 合约发现另收 TRADIFI_PERPETUAL（原油、海力士等），原油与海力士的自动规则复用这些盘口；工作台排除它们。
 // 11 家交易所的公开合约目录、WebSocket 订阅、消息解析与 REST 盘口快照；本服务的采集器在 src/monitor/perpetual.ts。
@@ -13,6 +13,7 @@ import { AUXILIARY_BOOK_POLL_MS, BULK_BOOK_CONFIRM_MS, LIGHTER_BOOK_CONFIRM_MS }
 import { canonicalBase } from './asset-identity.mjs';
 
 import { ADDITIONAL_EXCHANGES } from './perpetual-venues.mjs';
+import { anySignal } from '../any-signal.mjs';
 export { EXCHANGES } from './perpetual-venues.mjs';
 
 const HOUR = 3_600_000;
@@ -159,8 +160,7 @@ function assertArray(value, exchange) {
 }
 
 async function request(url, { fetchImpl, signal }, body) {
-  const timeout = AbortSignal.timeout(15_000);
-  const response = await fetchImpl(url, { credentials: 'omit', signal: signal ? AbortSignal.any([signal, timeout]) : timeout, ...(body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}) });
+  const response = await fetchImpl(url, { credentials: 'omit', signal: anySignal([signal], 15_000), ...(body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}) });
   if (!response.ok) throw new Error(`${new URL(url).hostname}: HTTP ${response.status}`);
   const data = await response.json();
   if (data?.retCode !== undefined && data.retCode !== 0) throw new Error(`Bybit: ${data.retMsg || data.retCode}`);

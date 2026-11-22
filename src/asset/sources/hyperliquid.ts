@@ -8,6 +8,7 @@ import { mapConcurrent } from './concurrency.ts';
 import { COINGECKO_QUOTES } from './quotes.ts';
 import { priceReceivedAt } from './shared-reads.ts';
 import { ExchangeResponseError, readJsonResponse } from '../../vendor/response.mjs';
+import { anySignal } from '../../any-signal.mjs';
 
 export type HyperliquidCredential = { walletAddress: string };
 type Json = Record<string, unknown>;
@@ -93,7 +94,7 @@ async function info(body: Json, fetcher: Fetcher, deadline: AbortSignal): Promis
   try {
     const response = await fetcher(INFO_URL, {
       method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-      redirect: 'manual', cache: 'no-store', signal: AbortSignal.any([AbortSignal.timeout(TIMEOUT_MS), deadline]),
+      redirect: 'manual', cache: 'no-store', signal: anySignal([deadline], TIMEOUT_MS),
     });
     if (!response.ok || response.redirected) {
       void response.body?.cancel().catch(() => {});
@@ -251,7 +252,7 @@ export async function readHyperliquidPositions(c: HyperliquidCredential, dex: st
 
 async function quoteJson(url: string, fetcher: Fetcher, deadline: AbortSignal): Promise<{ data: Json; at: number }> {
   // Public pricing requests are separate and never carry the account address.
-  const response = await fetcher(url, { method: 'GET', headers: { Accept: 'application/json' }, redirect: 'manual', cache: 'no-store', signal: AbortSignal.any([AbortSignal.timeout(TIMEOUT_MS), deadline]) });
+  const response = await fetcher(url, { method: 'GET', headers: { Accept: 'application/json' }, redirect: 'manual', cache: 'no-store', signal: anySignal([deadline], TIMEOUT_MS) });
   if (!response.ok || response.redirected) { void response.body?.cancel().catch(() => {}); fail(HYPERLIQUID_ERRORS.quote); }
   const data = await boundedJson(response, QUOTE_MAX_BYTES);
   return object(data) ? { data, at: priceReceivedAt(response) } : fail(HYPERLIQUID_ERRORS.quote);
@@ -283,7 +284,7 @@ export async function syncHyperliquid(c: HyperliquidCredential, fetcher: Fetcher
   const user = address(c?.walletAddress);
   // Aborting on exit stops reads that no longer matter once the outcome is decided, sparing the shared rate limit.
   const done = new AbortController();
-  const deadline = AbortSignal.any([done.signal, AbortSignal.timeout(options.budgetMs ?? SYNC_BUDGET_MS)]);
+  const deadline = anySignal([done.signal], options.budgetMs ?? SYNC_BUDGET_MS);
   try { return await collect(user, fetcher, deadline, !!options.verifyRole); } finally { done.abort(); }
 }
 async function collect(user: string, fetcher: Fetcher, deadline: AbortSignal, checkRole: boolean): Promise<{ total: number; details: Balance[]; updatedAt: string }> {

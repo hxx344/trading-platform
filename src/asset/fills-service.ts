@@ -30,6 +30,7 @@ import type { FillsRequest } from './fills-readers.ts';
 import { FillConflict, fillsNewestFirst, mergeFills, replayFills, verifyFill } from './fills-replay.ts';
 import { FILL_MARKETS, FILLS_PERMISSION } from './fills-types.ts';
 import type { FillMarket, FillsScope, HubFills, ReadFill } from './fills-types.ts';
+import { anySignal } from '../any-signal.mjs';
 
 const TTL = 5 * 60_000, RETRY = 60_000, IDLE = 15 * 60_000, DEADLINE = 45_000;
 const SKEW_RETRY = 30_000, MAX_AUTO_RETRIES = 10;
@@ -222,7 +223,7 @@ export function createFillsService(options: FillsServiceOptions = {}) {
     entry.automaticRetries = automatic ? entry.automaticRetries + 1 : 0;
     const abort = entry.abort = new AbortController();
     const generation = historyGeneration(database, account.key, entry.revision);
-    const signal = AbortSignal.any([abort.signal, generation.signal]);
+    const signal = anySignal([abort.signal, generation.signal]);
     entry.scope.refreshing = true;
     const valid = () => {
       if (closed || entries.get(key) !== entry || abort.signal.aborted) return false;
@@ -249,14 +250,14 @@ export function createFillsService(options: FillsServiceOptions = {}) {
           if (restoreVerified(database, account.key, entry) && entry.retryAt > now()) return null;
           const fetcher: Fetcher = (input, init) => {
             if (signal.aborted) throw new Error(FILLS_FAILED);
-            return budgeted(input, { ...init, signal: AbortSignal.any([signal, ...(init?.signal ? [init.signal] : [])]) });
+            return budgeted(input, { ...init, signal: anySignal([signal, init?.signal]) });
           };
           let snapshotStart = now(), snapshotAt: number;
           let positions: Position[] | null = null;
           try {
             const scope = entry.scope.id;
             const snapshot = await verifiedPositionSnapshot({ database, account, scope, revision: entry.revision, generation, signal, now }, shared => {
-              const sourceFetch: Fetcher = (input, init) => budgeted(input, { ...init, signal: AbortSignal.any([shared, ...(init?.signal ? [init.signal] : [])]) });
+              const sourceFetch: Fetcher = (input, init) => budgeted(input, { ...init, signal: anySignal([shared, init?.signal]) });
               return options.read ? options.read(credentials, scope, shared, sourceFetch)
                 : defaultRead(credentials, scope, shared, sourceFetch, generation.assertVerified);
             });

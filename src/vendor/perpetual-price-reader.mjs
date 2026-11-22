@@ -1,5 +1,6 @@
-// 复制自 project-aggregation 工作台 modules/monitor/server/perpetual-price-reader.mjs（提交 c84ba27），只改导入路径。
+// 复制自 project-aggregation 工作台 modules/monitor/server/perpetual-price-reader.mjs（提交 c84ba27），只改导入路径，AbortSignal.any 改用 ../any-signal.mjs（Node 24.15 下与长期信号组合会泄漏内存）。
 import { PRICE_HOUR_MS as HOUR } from './perpetual-price-history.ts';
+import { anySignal } from '../any-signal.mjs';
 
 const SUPPORTED = new Set(['binance', 'aster', 'bybit', 'gate', 'okx', 'bitget', 'hyperliquid', 'entropy']);
 const MAX_CHUNK = 168 * HOUR;
@@ -90,7 +91,7 @@ export function createPerpetualPriceReader({ fetchImpl = fetch, clock = Date.now
         if (signal?.aborted) abort();
       });
       signal?.throwIfAborted(); lastRequest.set(host, clock());
-      const timeout = AbortSignal.timeout(10_000), requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+      const requestSignal = anySignal([signal], 10_000);
       const response = await fetchImpl(params ? `${base}?${new URLSearchParams(params)}` : base, { ...init, signal: requestSignal, credentials: 'omit', redirect: 'error', cache: 'no-store' });
       requestSignal.throwIfAborted();
       if (!response.ok) throw Object.assign(Error(`成交价历史请求失败（HTTP ${response.status}）`), { status: response.status });

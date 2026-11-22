@@ -1,7 +1,8 @@
-// 复制自 project-aggregation 工作台 modules/monitor/modules/perpetual/additional-exchanges.mjs（提交 c84ba27），只改了相对导入路径。
+// 复制自 project-aggregation 工作台 modules/monitor/modules/perpetual/additional-exchanges.mjs（提交 c84ba27），只改了相对导入路径，AbortSignal.any 改用 ../any-signal.mjs（Node 24.15 下与长期信号组合会泄漏内存）。
 // Public feeds only. Robinhood Lighter is a separate deployment and order book;
 // Entropy is the `io` HIP-3 namespace, not Hyperliquid's native perpetual venue.
 import { AUXILIARY_BOOK_POLL_MS, RH_LIGHTER_BOOK_CONFIRM_MS } from './perpetual-collection-policy.mjs';
+import { anySignal } from '../any-signal.mjs';
 export { ADDITIONAL_EXCHANGES } from './perpetual-venues.mjs';
 
 const RH_API = 'https://api.rh.lighter.xyz';
@@ -24,8 +25,7 @@ function quote(market, receivedAt, sourceTime, fields) {
   return { id: market.id, exchange: market.exchange, symbol: market.symbol, base: market.base, displayBase: market.displayBase, quoteCurrency: market.quoteCurrency, collateralCurrency: market.collateralCurrency, multiplier: market.multiplier, ...(typeof market.contractUnit === 'string' ? { contractUnit: market.contractUnit } : {}), ...(typeof market.comparable === 'boolean' ? { comparable: market.comparable } : {}), receivedAt, sourceTime, transport: 'ws', ...fields };
 }
 async function request(url, options, fetchImpl, signal) {
-  const timeout = AbortSignal.timeout(15000);
-  const response = await fetchImpl(url, { ...options, signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+  const response = await fetchImpl(url, { ...options, signal: anySignal([signal], 15000) });
   if (!response.ok) throw new Error(`公开合约目录请求失败 (${response.status})`);
   return response.json();
 }

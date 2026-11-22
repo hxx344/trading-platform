@@ -1,3 +1,5 @@
+import { anySignal } from '../../any-signal.mjs';
+
 /** One source read can have multiple IPC or local consumers. The last consumer leaving cancels the upstream request. */
 export function sharedRead(load) {
   const upstream = new AbortController();
@@ -24,5 +26,5 @@ export function sharedRead(load) {
 }
 
 export function readSignal(lifetime, request) {
-  return lifetime && request ? AbortSignal.any([lifetime, request]) : lifetime ?? request;
+  return lifetime && request ? anySignal([lifetime, request]) : lifetime ?? request;
 }

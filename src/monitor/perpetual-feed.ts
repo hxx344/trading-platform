@@ -2,6 +2,7 @@
 // Subscribers receive a baseline and bounded incremental batches. Receipt in another process never timestamps a book.
 import { EXCHANGES, createSubscriptions, discoverMarkets, getControlResponse, parseMessage, type PerpetualRequestOptions, type PerpetualSpec, type PerpetualVenue } from '../vendor/perpetual-exchanges.mjs';
 import { MAX_FUTURE_MS, mergePerpetualQuote, withMarketMetadata, type PerpetualExchange, type PerpetualMarket, type PerpetualQuote, type PerpetualUpdate } from '../vendor/perpetual-stream.mjs';
+import { anySignal } from '../any-signal.mjs';
 
 export const PERPETUAL_DISCOVERY_MS = 300_000;
 export const PERPETUAL_OBSERVATION_MS = 1_000;
@@ -168,7 +169,7 @@ export function createPerpetualFeed({
     const requestSnapshot = async () => {
       const controller = new AbortController(); connection.snapshotController = controller;
       try {
-        const updates = await spec.snapshot!({ signal: AbortSignal.any([controller.signal, AbortSignal.timeout(SNAPSHOT_TIMEOUT_MS)]), now: clock(), ...(fetchImpl ? { fetchImpl } : {}) });
+        const updates = await spec.snapshot!({ signal: anySignal([controller.signal], SNAPSHOT_TIMEOUT_MS), now: clock(), ...(fetchImpl ? { fetchImpl } : {}) });
         if (running && !connection.closed) { acceptUpdates(updates, clock(), 'rest'); state.snapshotError = null; }
       } catch { if (running && !connection.closed) state.snapshotError = '盘口补充快照暂不可用，正在重试。'; }
       finally { if (running && !connection.closed) scheduleTask(() => { void requestSnapshot(); }, spec.snapshotIntervalMs ?? 10_000); }

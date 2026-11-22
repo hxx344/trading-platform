@@ -9,6 +9,7 @@ import { createFundingClient } from '../vendor/crossex/funding-client.mjs';
 import { createCandleReader } from '../vendor/crossex/candle-reader.mjs';
 import { INTERVALS, TERMINAL_SYMBOL, validCandleRange } from '../vendor/crossex/terminal-data.mjs';
 import { createTerminalFeed } from '../vendor/crossex/terminal-feed.mjs';
+import { anySignal } from '../any-signal.mjs';
 
 interface VenueReaders {
   ondo?: ReturnType<typeof createOndoClient>;
@@ -24,7 +25,7 @@ interface VenueReaders {
 /** Public collection only. No account files, API credentials, URL input or trading transports are accepted. */
 export function createVenueFeeds(readers: VenueReaders = {}): MarketOperations {
   const stopped = new AbortController();
-  const fetcher: typeof fetch = (url, init) => fetch(url, { ...init, signal: init?.signal ? AbortSignal.any([stopped.signal, init.signal]) : stopped.signal });
+  const fetcher: typeof fetch = (url, init) => fetch(url, { ...init, signal: init?.signal ? anySignal([stopped.signal, init.signal]) : stopped.signal });
   const ondo = readers.ondo ?? createOndoClient({ fetchImpl: fetcher, rps: 2, timeoutMs: 5000 });
   const ondoStream = readers.ondoStream ?? createOndoStream;
   const ondoTopStream = readers.ondoTopStream ?? createOndoTopStream;
@@ -93,7 +94,7 @@ export function createVenueFeeds(readers: VenueReaders = {}): MarketOperations {
   }
   return {
     async call(op, input, signal) {
-      const active = AbortSignal.any([signal, stopped.signal]);
+      const active = anySignal([signal, stopped.signal]);
       active.throwIfAborted();
       const result = await read(op, input, active);
       active.throwIfAborted();

@@ -4,6 +4,7 @@ import type { DatabaseSource, SourceAccount } from './positions-service.ts';
 import type { Position } from './positions-types.ts';
 import { decimal, POSITIONS_FAILED, rows, uniquePositions } from './positions-values.ts';
 import { untilAborted } from './sources/shared-reads.ts';
+import { anySignal } from '../any-signal.mjs';
 
 export const POSITION_TTL = 5_000;
 export const POSITION_DISPLAY_AGE = 24 * 60 * 60_000;
@@ -96,7 +97,7 @@ export async function verifiedPositionSnapshot(ctx: Context, read: (signal: Abor
   scopes.set(ctx.scope, cache);
   let job = cache.pending;
   if (!job || job.controller.signal.aborted) {
-    const controller = new AbortController(), signal = AbortSignal.any([key, controller.signal]);
+    const controller = new AbortController(), signal = anySignal([key, controller.signal]);
     const result = (async () => {
       const startedAt = ctx.now();
       const positions = await read(signal), completedAt = ctx.now();

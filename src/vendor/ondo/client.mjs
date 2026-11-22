@@ -1,8 +1,9 @@
-// 来源：project-aggregation 工作台 server/trading-ondo-client.mjs（提交 7745181）。改动：import 路径；新增 depth()（公开 REST 盘口）与 markets() 的 makerFee，奖励分析用（docs/ondo.md §5）。
+// 来源：project-aggregation 工作台 server/trading-ondo-client.mjs（提交 7745181）。改动：import 路径；AbortSignal.any 改用 ../../any-signal.mjs，请求结束时中止本次的局部控制器以解除与调用方信号的关联；新增 depth()（公开 REST 盘口）与 markets() 的 makerFee，奖励分析用（docs/ondo.md §5）。
 import { ondoAuthHeaders } from './transport.mjs';
 import { readJsonResponse } from '../response.mjs';
 import { compareDecimals, decimal } from './decimal.mjs';
 import { cleanOrderAck, markRetriedReport, sample } from './latency.mjs';
+import { anySignal } from '../../any-signal.mjs';
 
 const BASE = 'https://api.ondoperps.xyz';
 const MAX_BYTES = 4 * 1024 * 1024;
@@ -133,7 +134,7 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
     if (canSend && canSend() !== true) throw new OndoError('send_guard');
     const sentAt = now();
     const controller = new AbortController(); controllers.add(controller);
-    const active = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    const active = signal ? anySignal([signal, controller.signal]) : controller.signal;
     const deadline = setTimeoutImpl(() => controller.abort(), timeoutMs);
     let response, payload = null;
     try {
@@ -144,7 +145,7 @@ export function createOndoClient({ credentials = null, fetchImpl = fetch, now = 
     } catch {
       signal?.throwIfAborted();
       throw new OndoError(closed ? 'closed' : controller.signal.aborted ? 'timeout' : 'network', { uncertain: write });
-    } finally { clearTimeoutImpl(deadline); controllers.delete(controller); }
+    } finally { clearTimeoutImpl(deadline); controllers.delete(controller); controller.abort(); }
     const status = response.status;
     if (status === 429) { cool(response, sentAt); throw new OndoError('rate_limited', { status, retryAt: cooldownUntil }); }
     if (status >= 500) throw new OndoError('upstream', { status, uncertain: write });

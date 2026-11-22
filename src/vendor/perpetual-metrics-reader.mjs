@@ -1,5 +1,6 @@
-// 复制自 project-aggregation 工作台 modules/monitor/server/perpetual-metrics-reader.mjs（提交 c84ba27），只改导入路径。
+// 复制自 project-aggregation 工作台 modules/monitor/server/perpetual-metrics-reader.mjs（提交 c84ba27），只改导入路径，AbortSignal.any 改用 ../any-signal.mjs（Node 24.15 下与长期信号组合会泄漏内存）。
 import { PERPETUAL_MARKET_METRICS_REFRESH_MS } from './perpetual-market-metrics.ts';
+import { anySignal } from '../any-signal.mjs';
 
 const STEP = 300_000, DAY = 86_400_000;
 const LIGHTER_HOSTS = { lighter: 'https://mainnet.zklighter.elliot.ai', 'rh-lighter': 'https://api.rh.lighter.xyz' };
@@ -125,7 +126,7 @@ export function createPerpetualMetricsReader({ fetchImpl = fetch, clock = Date.n
   async function request(url, init, signal) {
     return schedule(url, signal, async () => {
       signal.throwIfAborted();
-      const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
+      const requestSignal = anySignal([signal], 10_000);
       const response = await fetchImpl(url, { ...init, credentials: 'omit', redirect: 'error', cache: 'no-store', signal: requestSignal });
       requestSignal.throwIfAborted();
       if (!response.ok) {

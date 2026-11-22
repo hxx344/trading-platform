@@ -16,6 +16,7 @@ import type { OkxCredential } from './sources/okx.ts';
 import type { Position } from './positions-types.ts';
 import type { Credentials } from './validation.ts';
 import { absolute, binanceReadOnly, bybitReadOnly, decimal, isZero, multiplyDecimals, optionalDecimal, position, positionId, record, rows, text, timestamp, uniquePositions, POSITIONS_FAILED, POSITIONS_INVALID, PositionsPermissionError } from './positions-values.ts';
+import { anySignal } from '../any-signal.mjs';
 
 type Fetcher = typeof fetch;
 type Json = Record<string, unknown>;
@@ -31,7 +32,7 @@ const ENDPOINTS = {
 
 async function getJson(url: string, headers: Record<string, string>, fetcher: Fetcher, signal?: AbortSignal): Promise<unknown> {
   try {
-    const limit = signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000);
+    const limit = anySignal([signal], 10_000);
     const response = await fetcher(url, { method: 'GET', headers, redirect: 'manual', cache: 'no-store', signal: limit });
     if (!response.ok || response.redirected) throw new Error();
     return await readJsonResponse(response, { maxBytes: 2_000_000, signal: limit });

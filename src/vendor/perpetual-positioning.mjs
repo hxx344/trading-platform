@@ -1,4 +1,4 @@
-// 复制自 project-aggregation 工作台 modules/monitor/server/perpetual-positioning.mjs（提交 c84ba27），原样（无导入）。
+// 复制自 project-aggregation 工作台 modules/monitor/server/perpetual-positioning.mjs（提交 c84ba27），除AbortSignal.any 改用 ../any-signal.mjs（Node 24.15 下与长期信号组合会泄漏内存）外原样。
 // Official public account ratios, sampled on demand by the caller. No timers,
 // global scans, top-trader substitutions, or synthetic position-size estimates.
 // Binance: https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Long-Short-Ratio
@@ -6,6 +6,7 @@
 // OKX: https://www.okx.com/docs-v5/en/#trading-statistics-rest-api-get-contract-long-short-ratio
 // Bitget: https://www.bitget.com/zh-CN/api-doc/common/apidata/Long-Short
 // Gate: https://www.gate.com/docs/developers/apiv4/zh_CN/futures/#listfuturescontractstats
+import { anySignal } from '../any-signal.mjs';
 
 const SCOPE = '合约全体持仓账户（5 分钟）';
 const MAX_FUTURE_MS = 5_000;
@@ -128,8 +129,7 @@ function timestamp(value, seconds, now) {
 export async function fetchPositioning(quote, { fetchImpl = fetch, signal, now = Date.now() } = {}) {
   const { source, reason } = sourceFor(quote);
   if (reason) return null;
-  const deadline = AbortSignal.timeout(10_000);
-  const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  const requestSignal = anySignal([signal], 10_000);
   const response = await fetchImpl(source, { signal: requestSignal, headers: { Accept: 'application/json' } });
   if (!response.ok) {
     const error = upstreamError(quote.exchange, `HTTP ${response.status}`, response.status);

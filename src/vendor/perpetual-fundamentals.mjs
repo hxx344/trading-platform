@@ -1,4 +1,5 @@
-// 复制自 project-aggregation 工作台 modules/monitor/server/perpetual-fundamentals.mjs（提交 c84ba27），原样（无导入）。
+// 复制自 project-aggregation 工作台 modules/monitor/server/perpetual-fundamentals.mjs（提交 c84ba27），除 AbortSignal.any 改用 ../any-signal.mjs（Node 24.15 下与长期信号组合会泄漏内存）外原样。
+import { anySignal } from '../any-signal.mjs';
 const API_ROOT = 'https://api.coingecko.com/api/v3';
 const DIRECTORY_TTL_MS = 24 * 60 * 60_000;
 const MARKETS_TTL_MS = 30 * 60_000;
@@ -46,7 +47,7 @@ export function createFundamentalsClient({ fetchImpl = fetch, coinIds = {}, apiK
   let directory = null, directoryAt = null, queue = Promise.resolve();
 
   async function request(path, signal) {
-    const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]) : AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    const requestSignal = anySignal([signal], REQUEST_TIMEOUT_MS);
     try {
       requestSignal.throwIfAborted();
       const headers = { Accept: 'application/json' };

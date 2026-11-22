@@ -5,8 +5,10 @@
 //   NodeWebSocket：复用本仓库的 ws 兼容适配（crossex/node-ws.mjs，消息同 ws 以 Buffer 交付，文本帧与二进制帧都能
 //   String() 解码），选项取原文件的 maxPayload 8 MB 与握手 20 秒。Node 的 WebSocket 与 fetch 一样走全局 dispatcher，
 //   设了 NODE_USE_ENV_PROXY=1 与 HTTPS_PROXY（README）时同样经过代理。
+// - AbortSignal.any 改用 ../any-signal.mjs（Node 24.15 下与长期信号组合会泄漏内存）。
 import { quoteCurrencyFx } from './perpetual-fx.ts';
 import { createPerpetualEstimates, positive, failure, validTime } from './perpetual-estimates.mjs';
+import { anySignal } from '../any-signal.mjs';
 export { estimateDepthPair, estimateExitPair } from './perpetual-estimates.mjs';
 import { perpetualContractIdentity } from './perpetual-exit.ts';
 import WsCompatibleSocket from './crossex/node-ws.mjs';
@@ -82,7 +84,7 @@ export function createPerpetualExecutionService({ getQuote, getMarket = () => nu
   let fxSnapshot = null, fxFlight = null, fxAttemptAt = -Infinity;
   async function json(url, body) {
     return budget.run(async () => {
-      const response = await fetchImpl(url, { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(8_000)]), headers: { Accept: 'application/json', ...(body ? { 'Content-Type': 'application/json' } : {}) }, ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}) });
+      const response = await fetchImpl(url, { signal: anySignal([controller.signal], 8_000), headers: { Accept: 'application/json', ...(body ? { 'Content-Type': 'application/json' } : {}) }, ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}) });
       if (!response.ok) {
         if ([418, 429].includes(response.status)) budget.backoff((positive(response.headers?.get?.('retry-after')) ?? 30) * 1_000);
         throw failure(`公开接口 HTTP ${response.status}`, 502);

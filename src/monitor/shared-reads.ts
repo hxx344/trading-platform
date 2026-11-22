@@ -11,6 +11,7 @@
 import type { BinanceGate } from '../vendor/anthropic-market.mjs';
 import type { PerpetualQuote } from '../vendor/perpetual-stream.mjs';
 import { boundedReply, BinanceCooldown } from './market-contract.ts';
+import { anySignal } from '../any-signal.mjs';
 
 export const HYPERLIQUID_INFO = 'https://api.hyperliquid.xyz/info';
 export const XYZ_CONTEXTS_BODY = JSON.stringify({ type: 'metaAndAssetCtxs', dex: 'xyz' });
@@ -34,7 +35,7 @@ export function createSharedMarketReads({ fetchImpl = fetch, now = Date.now, gat
   async function request(url: string, init: RequestInit = {}): Promise<unknown> {
     const binance = new URL(url).hostname === 'fapi.binance.com';
     if (binance && now() < gate.until) throw new BinanceCooldown(gate.status);
-    const response = boundedReply(await fetchImpl(url, { ...init, cache: 'no-store', signal: AbortSignal.any([AbortSignal.timeout(REQUEST_TIMEOUT_MS), signal]) }));
+    const response = boundedReply(await fetchImpl(url, { ...init, cache: 'no-store', signal: anySignal([signal], REQUEST_TIMEOUT_MS) }));
     if (binance && (response.status === 429 || response.status === 418)) {
       gate.until = Math.max(gate.until, now() + (response.status === 418 ? 120_000 : 60_000)); gate.status = response.status;
     }

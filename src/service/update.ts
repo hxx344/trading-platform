@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { ContractError, exactKeys } from '../contracts.ts';
 import { readBounded } from './handoff-file.ts';
 import { UUID, VERSION, isVersion, readUpdateResult, updateJob } from './update-legacy.ts';
+import { anySignal } from '../any-signal.mjs';
 export { UPDATE_RESULT_FILE, UPDATE_RUNNING_STALE_MS, isVersion, readUpdateResult } from './update-legacy.ts';
 import type { InstalledVersion, ReleaseInfo, UpdateRequest, UpdateView } from './update-types.ts';
 export type { InstalledVersion, ReleaseInfo, UpdatePhase, UpdateRequest, UpdateResult, UpdateView } from './update-types.ts';
@@ -165,7 +166,7 @@ export function createUpdates({ current, dir, readyFile, fetchImpl = fetch, now 
     try {
       response = await fetchImpl(`https://api.github.com/repos/${repo}/releases/latest`, {
         headers: { accept: 'application/vnd.github+json', 'user-agent': 'trading-platform-updater', 'x-github-api-version': '2022-11-28' },
-        redirect: 'follow', signal: AbortSignal.any([stop.signal, AbortSignal.timeout(UPDATE_CHECK_TIMEOUT_MS)]),
+        redirect: 'follow', signal: anySignal([stop.signal], UPDATE_CHECK_TIMEOUT_MS),
       });
     } catch (cause) {
       throw new Error(cause instanceof Error && cause.name === 'TimeoutError' ? '连接 GitHub 超时' : `连接 GitHub 失败：${message(cause).slice(0, 200)}`);
@@ -219,7 +220,7 @@ export function createUpdates({ current, dir, readyFile, fetchImpl = fetch, now 
       try {
         response = await fetchImpl(`https://github.com/${repo}/releases/latest`, {
           method: 'HEAD', headers: { 'user-agent': 'trading-platform-updater' },
-          redirect: 'manual', signal: AbortSignal.any([stop.signal, AbortSignal.timeout(UPDATE_CHECK_TIMEOUT_MS)]),
+          redirect: 'manual', signal: anySignal([stop.signal], UPDATE_CHECK_TIMEOUT_MS),
         });
       } catch (cause) {
         throw new Error(cause instanceof Error && cause.name === 'TimeoutError' ? '连接 GitHub 超时' : `连接 GitHub 失败：${message(cause).slice(0, 200)}`);

@@ -17,6 +17,7 @@ import { MARKET_REFRESH_MS, createOptionMarket, type OptionMarket } from '../opt
 import { openOptionsStore, type OptionsStore } from '../options/store.ts';
 import { DEFAULT_ESTIMATES, STRATEGY_MODES, type StrategyMode } from '../options/strategy.ts';
 import type { OptionsConfig } from './options-config.ts';
+import { anySignal } from '../any-signal.mjs';
 
 export const OPTIONS_DATABASE = 'options.sqlite';
 const PREFLIGHT_MS = 30_000;
@@ -62,7 +63,7 @@ export interface OptionsRuntime {
  * change. The start check and the workbench import (import-options.ts) share it.
  */
 export async function readOptionsAccount(client: OptionsClient, timeoutMs = PREFLIGHT_MS, stop?: AbortSignal): Promise<string> {
-  const signal = stop ? AbortSignal.any([AbortSignal.timeout(timeoutMs), stop]) : AbortSignal.timeout(timeoutMs);
+  const signal = anySignal([stop], timeoutMs);
   await client.syncClock(signal);
   const info = await client.queryApi(signal);
   const problem = bybitPermissionProblem(info, { options: true }) ?? bybitIpProblem(info);

@@ -20,6 +20,7 @@ import { createPerpetualPriceReader } from '../vendor/perpetual-price-reader.mjs
 import { createFundamentalsClient } from '../vendor/perpetual-fundamentals.mjs';
 import { fetchPositioning } from '../vendor/perpetual-positioning.mjs';
 import { readVariationalPublicFunding, type VariationalFetcher } from '../vendor/variational-market.mjs';
+import { anySignal } from '../any-signal.mjs';
 
 const DAY = 86_400_000;
 function fields(input: unknown, names: string[]): Record<string, unknown> {
@@ -163,7 +164,7 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
   }
   return {
     async call(op, input, signal) {
-      const life = AbortSignal.any([signal, stopped.signal]); life.throwIfAborted();
+      const life = anySignal([signal, stopped.signal]); life.throwIfAborted();
       const result = await marketRead(() => read(op, input, life));
       life.throwIfAborted();
       return result;

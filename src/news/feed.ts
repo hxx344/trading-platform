@@ -11,6 +11,7 @@
 // 限流（文档）：所有公开接口合计每 10 秒 30 次，REST 每秒 10 次。这里最多每 15 秒 4 次加快讯的少量补读；429 时按
 // Retry-After（5–120 秒）暂停全部 REST。
 import { EQN_REST, EQN_WS, FLASH_CHANNEL, MOVE_CHANNELS, newestFirst, parsePushFrame, parseRestPage, type MoveChannel, type NewsItem } from './eqn.ts';
+import { anySignal } from '../any-signal.mjs';
 
 export interface NewsSocket {
   addEventListener(type: 'open', listener: () => void): void;
@@ -94,7 +95,7 @@ export function createNewsFeed({ fetchImpl = fetch, connect = url => new WebSock
   async function readPage(channel: string, limit: number): Promise<NewsItem[]> {
     const wait = cooldownUntil - now();
     if (wait > 0) throw new Error(`EQN 接口限流，${Math.ceil(wait / 1_000)} 秒后重试`);
-    const response = await fetchImpl(`${EQN_REST}/news?channel=${encodeURIComponent(channel)}&limit=${limit}`, { headers: { accept: 'application/json' }, signal: AbortSignal.any([stopped.signal, AbortSignal.timeout(REST_TIMEOUT_MS)]) });
+    const response = await fetchImpl(`${EQN_REST}/news?channel=${encodeURIComponent(channel)}&limit=${limit}`, { headers: { accept: 'application/json' }, signal: anySignal([stopped.signal], REST_TIMEOUT_MS) });
     if (response.status === 429) {
       // 没有 Retry-After 或不是秒数（HTTP 日期）时按 10 秒。
       const header = response.headers.get('retry-after'), retry = header === null || header.trim() === '' ? NaN : Number(header);

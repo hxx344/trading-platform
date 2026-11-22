@@ -34,6 +34,7 @@ import {
 import type { VariationalSession } from './variational-session.ts';
 import { createStoredExchangeQuotes } from './exchange-quote-cache.ts';
 import type { MonitorStore } from './store.ts';
+import { anySignal } from '../any-signal.mjs';
 
 type ComparisonHynix = HynixQuote & { status: HynixQuoteView['status'] };
 export type ExchangeFetcher = (url: string, init: RequestInit) => Promise<Response>;
@@ -93,7 +94,7 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSe
   async function request(url: string, init: RequestInit = {}): Promise<unknown> {
     const binance = new URL(url).hostname === 'fapi.binance.com';
     if (binance && now() < gate.until) throw new BinanceCooldown(gate.status);
-    const signal = AbortSignal.any([AbortSignal.timeout(REQUEST_TIMEOUT_MS), stopping.signal, ...init.signal ? [init.signal] : []]);
+    const signal = anySignal([stopping.signal, init.signal], REQUEST_TIMEOUT_MS);
     const response = boundedReply(await fetchImpl(url, { ...init, cache: 'no-store', signal }));
     if (binance && (response.status === 429 || response.status === 418)) {
       gate.until = Math.max(gate.until, now() + (response.status === 418 ? 120_000 : 60_000)); gate.status = response.status;
@@ -134,7 +135,7 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSe
   // ---- Variational (oil) ----
   // The parts of the Var row that fail without failing the row, each logged once per reason like an exchange.
   const VARIATIONAL_AUTH = 'oil/variational 认证行情', VARIATIONAL_FUNDING = 'oil/variational 公开资金费';
-  const variationalSignal = () => AbortSignal.any([AbortSignal.timeout(REQUEST_TIMEOUT_MS), stopping.signal]);
+  const variationalSignal = () => anySignal([stopping.signal], REQUEST_TIMEOUT_MS);
   const marketEpoch = () => epoch ? epoch() ?? 'offline' : 'local';
   const variationalRun = () => controlRevision ? controlRevision('oil') : 0;
   const checkVariationalRun = (run: number | null) => {
@@ -370,7 +371,7 @@ export function createExchangeReader({ gate, oilQuote, hynixQuote, variationalSe
     if (held && now() < held.until) return Promise.reject(held.error);
     let operation = historyPending.get(key);
     if (!operation) {
-      const deadline = AbortSignal.any([stopping.signal, AbortSignal.timeout(FUNDING_HISTORY_DEADLINE_MS)]);
+      const deadline = anySignal([stopping.signal], FUNDING_HISTORY_DEADLINE_MS);
       operation = updateHistory(market, exchange, now(), deadline).then(entry => {
         histories.set(key, entry);
         historyFailures.delete(key);

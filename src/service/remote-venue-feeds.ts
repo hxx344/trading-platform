@@ -7,11 +7,12 @@ import { sample } from '../vendor/ondo/latency.mjs';
 import { createOndoStream, type OndoBook, type OndoStreamFactory, type OndoStreamOptions, type OndoTopStream, type OndoTopStreamOptions } from '../vendor/ondo/stream.mjs';
 import { AppError, validateBooks } from '../vendor/crossex/model.mjs';
 import type { TerminalFeed } from '../vendor/crossex/terminal-feed.mjs';
+import { anySignal } from '../any-signal.mjs';
 
 /** Signed REST stays on the executor. Observation/reward clients only need these two public reads. */
 export function remoteOndoClient(market: MarketClient, options?: Parameters<typeof createOndoClient>[0]): OndoClient {
   const account = options?.credentials ? createOndoClient(options) : null, stopped = new AbortController();
-  const signal = (caller?: AbortSignal) => AbortSignal.any([stopped.signal, AbortSignal.timeout(5500), ...(caller ? [caller] : [])]);
+  const signal = (caller?: AbortSignal) => anySignal([stopped.signal, caller], 5500);
   return { ...account, cooldownUntil: () => account?.cooldownUntil() ?? 0,
     async markets(caller) {
       const rows = await market.call<unknown>('ondo.markets', {}, signal(caller)), rules = new Map<string, OndoRules>();
@@ -190,9 +191,9 @@ export function remoteOndoTopStream(market: MarketClient, { markets, onTop, onRe
 
 export function remoteCrossexReaders(market: MarketClient) {
   const stopped = new AbortController();
-  const signal = () => AbortSignal.any([stopped.signal, AbortSignal.timeout(25_000)]);
+  const signal = () => anySignal([stopped.signal], 25_000);
   const previousBooks = new Map<string, { lease: string; at: number }>();
-  const call = <T>(op: string, input: unknown, request?: AbortSignal) => market.call<T>(op, input, request ? AbortSignal.any([request, signal()]) : signal()).catch(error => {
+  const call = <T>(op: string, input: unknown, request?: AbortSignal) => market.call<T>(op, input, request ? anySignal([request, signal()]) : signal()).catch(error => {
     const status = typeof error?.status === 'number' && error.status >= 400 && error.status <= 599 ? error.status : 503;
     throw new AppError('CrossEx 公开行情读取失败', status);
   });

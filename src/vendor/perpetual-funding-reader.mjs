@@ -1,7 +1,8 @@
-// 复制自 project-aggregation 工作台 modules/monitor/server/perpetual-funding-reader.mjs（提交 c84ba27），只改导入路径：CEX 分页读取
+// 复制自 project-aggregation 工作台 modules/monitor/server/perpetual-funding-reader.mjs（提交 c84ba27），除AbortSignal.any 改用 ../any-signal.mjs（Node 24.15 下与长期信号组合会泄漏内存）外只改导入路径：CEX 分页读取
 // 指向 perpetual-funding-cex.ts，Lighter 解析取 exchange-funding-history.mjs 的同名函数（与工作台 exchange-funding-service.ts 逐字一致）。
 import { createCexFundingHistoryReader, readBitgetFundingPage } from './perpetual-funding-cex.ts';
 import { parseLighterFundingHistory } from './exchange-funding-history.mjs';
+import { anySignal } from '../any-signal.mjs';
 
 const HOUR = 3_600_000;
 const MAX_RANGE_MS = 4 * 24 * HOUR;
@@ -103,8 +104,7 @@ export function createPerpetualFundingReader({ fetchImpl = fetch, clock = Date.n
         signal?.addEventListener('abort', abort, { once: true });
       });
       signal?.throwIfAborted(); lastRequest.set(host, clock());
-      const timeout = AbortSignal.timeout(10_000);
-      const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+      const requestSignal = anySignal([signal], 10_000);
       const response = await fetchImpl(url, { ...init, credentials: 'omit', redirect: 'error', cache: 'no-store', signal: requestSignal });
       requestSignal.throwIfAborted();
       if (!response.ok) {

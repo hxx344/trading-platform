@@ -29,6 +29,7 @@ import type { BinanceScope, BybitScope } from './positions-readers.ts';
 import { readVariationalPythonPositions } from './sources/variational-python.ts';
 import { readRhLighterPositions } from './sources/rh-lighter.ts';
 import { readHyperliquidPositions } from './sources/hyperliquid.ts';
+import { anySignal } from '../any-signal.mjs';
 
 export type Database = Pick<AssetDb, 'prepare'>;
 /** The open asset.sqlite at the moment of the call; null before the first import. */
@@ -197,7 +198,7 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
           }
         };
         try {
-          const signal = AbortSignal.any([abort.signal, generation.signal, AbortSignal.timeout(CYCLE_DEADLINE)]);
+          const signal = anySignal([abort.signal, generation.signal], CYCLE_DEADLINE);
           const history = accountHistory(database, account.key, entry.revision, scope, () => !signal.aborted && entries.get(key) === entry && current(database, account, entry.revision), generation);
           store(await cycleRead(credentials, scope, { position: item, siblings: positions, snapshotAt }, signal, history));
         } catch (error) {
@@ -219,7 +220,7 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
         const work = async () => {
           const c = parseConnection(unseal(account.row!.encrypted, account.key));
           if (!generation.current() || c.exchange !== account.exchange || !current(database, account, entry.revision)) throw new Error(POSITIONS_FAILED);
-          const signal = AbortSignal.any([abort.signal, generation.signal]);
+          const signal = anySignal([abort.signal, generation.signal]);
           const scope = entry.scope.id;
           const read = (s: AbortSignal) => options.read ? options.read(c, scope, s) : defaultRead(c, scope, s, fetcher, generation.assertVerified);
           if (c.exchange === 'binance' || c.exchange === 'bybit' || c.exchange === 'okx') {

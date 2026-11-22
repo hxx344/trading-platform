@@ -11,6 +11,7 @@ import type { FundingSide } from './funding-archive.ts';
 import { boundedReply, BinanceCooldown, OIL_CANDLE_WINDOW_MS } from './market-contract.ts';
 import { GOLDOIL_CANDLE_MS, GOLDOIL_SYMBOLS, goldOilKlinePage, goldOilListing, pairGoldOilRows, parseGoldOilQuote, type GoldOilCandleRow, type GoldOilQuote } from './goldoil-market.ts';
 import { HYPERLIQUID_INFO, XYZ_CONTEXTS_BODY, type SharedMarketReads } from './shared-reads.ts';
+import { anySignal } from '../any-signal.mjs';
 
 /** The workbench's limits (lib/exchange-service.ts parseBinanceQuote): a mark's source time near this clock, both legs close together. */
 const SOURCE_PAST_MS = 120_000, SOURCE_FUTURE_MS = 60_000, LEG_SKEW_MS = 15_000;
@@ -80,7 +81,7 @@ export function createMarketReaders({ fetchImpl = fetch, now = Date.now, gate = 
   const fetcher = (signal: AbortSignal): AnthropicFetcher => async (url, init) => {
     if (shared && url === HYPERLIQUID_INFO && init.method === 'POST' && init.body === XYZ_CONTEXTS_BODY) {
       // The Anthropic xyz leg and the comparison ask for the same reply; a refusal keeps its status for the leg's own handling.
-      const stop = init.signal ? AbortSignal.any([signal, init.signal]) : signal;
+      const stop = init.signal ? anySignal([signal, init.signal]) : signal;
       try { return Response.json((await untilAborted(shared.xyzContexts(ANTHROPIC_CONTEXTS_MAX_AGE_MS), stop)).reply); }
       catch (error) {
         const status = (error as { status?: unknown } | null)?.status;
@@ -88,7 +89,7 @@ export function createMarketReaders({ fetchImpl = fetch, now = Date.now, gate = 
         throw error;
       }
     }
-    return boundedReply(await fetchImpl(url, { ...init, signal: init.signal ? AbortSignal.any([signal, init.signal]) : signal }));
+    return boundedReply(await fetchImpl(url, { ...init, signal: init.signal ? anySignal([signal, init.signal]) : signal }));
   };
   const oilFetcher = (signal: AbortSignal): AnthropicFetcher => {
     const read = fetcher(signal);

@@ -1,6 +1,7 @@
-// 复制自 project-aggregation 工作台 modules/monitor/modules/perpetual/kraken.mjs（提交 c84ba27），只改了相对导入路径。
+// 复制自 project-aggregation 工作台 modules/monitor/modules/perpetual/kraken.mjs（提交 c84ba27），只改了相对导入路径，AbortSignal.any 改用 ../any-signal.mjs（Node 24.15 下与长期信号组合会泄漏内存）。
 // Public Kraken Multi-M perpetual feeds only. No account or trading endpoints.
 import { canonicalBase } from './asset-identity.mjs';
+import { anySignal } from '../any-signal.mjs';
 // https://docs.kraken.com/api-reference/instrument-details/get-instruments
 // https://docs.kraken.com/exchange/api-reference/futures-websocket/ticker
 // https://support.kraken.com/articles/4844429542676-trading-multi-collateral-derivatives
@@ -12,8 +13,7 @@ const baseAlias = base => canonicalBase('kraken', base);
 const validTime = (value, now) => { const result = positive(value); return Number.isSafeInteger(result) && result >= 1e12 && result <= now + 5_000 ? result : null; };
 
 export async function discoverKrakenMarkets({ fetchImpl = fetch, signal, now = Date.now() } = {}) {
-  const timeout = AbortSignal.timeout(15_000);
-  const response = await fetchImpl(API, { credentials: 'omit', signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+  const response = await fetchImpl(API, { credentials: 'omit', signal: anySignal([signal], 15_000) });
   if (!response.ok) throw new Error(`Kraken: HTTP ${response.status}`);
   const data = await response.json();
   if (data?.result !== 'success' || !Array.isArray(data.instruments)) throw new Error('Kraken: invalid market list');

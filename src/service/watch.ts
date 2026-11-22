@@ -4,6 +4,7 @@
 // {sent_at, ready, detail} and its HMAC-SHA256 under the shared token; the token itself is never sent.
 import { createHmac } from 'node:crypto';
 import { exactKeys } from '../contracts.ts';
+import { anySignal } from '../any-signal.mjs';
 
 export const WATCH_INTERVAL_MS = 30_000;
 /** The first beat waits for the loops' first rounds, so a restart does not report itself as not ready. */
@@ -86,7 +87,7 @@ export function createWatch({ config, secret, problem, fetchImpl = fetch, now = 
       const body = heartbeatBody(sentAt, reason);
       try {
         const response = await fetchImpl(config.url, {
-          method: 'POST', body, redirect: 'manual', signal: AbortSignal.any([stop.signal, AbortSignal.timeout(WATCH_TIMEOUT_MS)]),
+          method: 'POST', body, redirect: 'manual', signal: anySignal([stop.signal], WATCH_TIMEOUT_MS),
           headers: { 'content-type': 'application/json; charset=utf-8', [SIGNATURE_HEADER]: heartbeatSignature(secret.token, body) },
         });
         await response.body?.cancel().catch(() => undefined);

@@ -2,6 +2,7 @@ import { once, EventEmitter } from 'node:events';
 import { request, type IncomingMessage } from 'node:http';
 import { setTimeout as pause } from 'node:timers/promises';
 import { FRAME_LIMIT, INPUT_LIMIT, INSTANCE_HEADER, MARKET_PATH, MarketError, OPERATION_NAME, OUTPUT_LIMIT, RPC_TIMEOUT_MS, STREAM_TIMEOUT_MS } from './protocol.ts';
+import { anySignal } from '../any-signal.mjs';
 
 export type { MarketOperations } from './protocol.ts';
 export { MarketError } from './protocol.ts';
@@ -117,10 +118,10 @@ export function createMarketClient(socketPath: string): MarketClient & { close()
     epoch: () => active?.key ?? null,
     async call<T>(op: string, input: unknown, signal?: AbortSignal): Promise<T> {
       const body = encode(op, input);
-      const deadline = AbortSignal.any([stopped.signal, AbortSignal.timeout(RPC_TIMEOUT_MS), ...(signal ? [signal] : [])]);
+      const deadline = anySignal([stopped.signal, signal], RPC_TIMEOUT_MS);
       try {
-        const lease = await connection(AbortSignal.any([deadline, AbortSignal.timeout(1500)]));
-        const res = await open(socketPath, MARKET_PATH + 'call/' + op, body, AbortSignal.any([deadline, lease.life.signal]));
+        const lease = await connection(anySignal([deadline], 1500));
+        const res = await open(socketPath, MARKET_PATH + 'call/' + op, body, anySignal([deadline, lease.life.signal]));
         // Historical backfill can legitimately take longer than a stream heartbeat to produce the first byte.
         res.setTimeout(0);
         if (instanceOf(res) !== lease.instance) { res.destroy(); throw new MarketError('行情服务已切换'); }
@@ -136,12 +137,12 @@ export function createMarketClient(socketPath: string): MarketClient & { close()
     },
     stream(op, input, callbacks) {
       const body = encode(op, input), local = new AbortController();
-      const signal = AbortSignal.any([local.signal, stopped.signal]);
+      const signal = anySignal([local.signal, stopped.signal]);
       let online = false;
       const offline = () => { if (online) { online = false; callbacks.down(); } };
       void follow(signal, async () => {
         const lease = await connection(signal);
-        const res = await open(socketPath, MARKET_PATH + 'stream/' + op, body, AbortSignal.any([signal, lease.life.signal]));
+        const res = await open(socketPath, MARKET_PATH + 'stream/' + op, body, anySignal([signal, lease.life.signal]));
         try {
           if (res.statusCode !== 200 || instanceOf(res) !== lease.instance || active !== lease) throw new MarketError('行情订阅未就绪');
           online = true;

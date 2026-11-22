@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { FRAME_LIMIT, HEARTBEAT_MS, INPUT_LIMIT, INSTANCE_HEADER, MARKET_PATH, MarketError, OPERATION_NAME, OUTPUT_LIMIT, RPC_TIMEOUT_MS, type MarketOperations } from './protocol.ts';
+import { anySignal } from '../any-signal.mjs';
 
 async function readInput(req: IncomingMessage): Promise<unknown> {
   const pieces: Buffer[] = []; let bytes = 0;
@@ -37,7 +38,7 @@ export function createMarketServer(groups: Readonly<Record<string, MarketOperati
     if (!group && !(streaming && op === 'system.epoch')) return json(res, 404, { message: '未知行情操作' });
     if (streaming ? streams >= 128 : calls >= maxCalls) return json(res, 429, { message: '行情任务已满，请稍后再试' });
     const lifetime = new AbortController();
-    const signal = AbortSignal.any([stopped.signal, lifetime.signal, ...(streaming ? [] : [AbortSignal.timeout(callTimeoutMs)])]);
+    const signal = anySignal([stopped.signal, lifetime.signal], streaming ? undefined : callTimeoutMs);
     const finish = () => lifetime.abort();
     res.once('close', finish);
     if (streaming) streams++; else calls++;

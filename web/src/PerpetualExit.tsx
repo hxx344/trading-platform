@@ -4,8 +4,8 @@
 // 登记按钮，字段、默认值、校验与幂等 requestId 与工作台相同。
 import { memo, useEffect, useId, useRef, useState } from "react";
 import { api, ApiError } from "./api.ts";
-import type { PerpetualQuote } from "./perpetual-types.ts";
-import { resolveTakerFee, type QualityBudget } from "./perpetual-fees.ts";
+import type { PerpetualQuote } from "../../src/vendor/perpetual-types.ts";
+import { resolveTakerFee, type QualityBudget } from "../../src/vendor/perpetual-fees.ts";
 import { exitEstimateExpired, perpetualExitIdentity, validatePerpetualExitPosition, type PerpetualExitEstimate, type PerpetualExitInput } from "../../src/vendor/perpetual-exit.ts";
 import type { PerpetualPaperView } from "../../src/vendor/perpetual-paper.ts";
 import "./perpetual-exit.css";

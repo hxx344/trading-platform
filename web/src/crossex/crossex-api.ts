@@ -8,7 +8,6 @@ export const CROSSEX_API = '/api/crossex';
 export const CROSSEX_STATE_PATH = `${CROSSEX_API}/state`;
 export const CROSSEX_BOOTSTRAP_PATH = `${CROSSEX_API}/bootstrap`;
 export const CROSSEX_SETTINGS_PATH = `${CROSSEX_API}/settings`;
-export const CROSSEX_READ_TIMEOUT_MS = 10_000;
 
 /** The server proved a write never left it (workbench: requestStatus "not_submitted" on the error body). */
 export function writeNotSubmitted(error: unknown): boolean {

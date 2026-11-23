@@ -2,9 +2,9 @@
 
 import { memo, useMemo, useState } from "react";
 import { estimatePerpetualHoldingScenario } from "./perpetual-opportunity.ts";
-import type { QualityBudget } from "./perpetual-fees.ts";
-import type { PerpetualSpread } from "./perpetual-spreads.ts";
-import type { PerpetualPriceMode } from "./perpetual-types.ts";
+import type { QualityBudget } from "../../src/vendor/perpetual-fees.ts";
+import type { PerpetualSpread } from "../../src/vendor/perpetual-spreads.ts";
+import type { PerpetualPriceMode } from "../../src/vendor/perpetual-types.ts";
 
 const pct = (value: number | null) => value === null ? "—" : `${value > 0 ? "+" : ""}${value.toFixed(4)}%`;
 const time = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });

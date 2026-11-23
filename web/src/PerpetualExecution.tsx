@@ -2,7 +2,7 @@
 // /api/monitor/perpetual/depth，请求走 api.ts（带页面请求标记；401 转登录，失败给服务的原因）；lib 从 src/vendor 引入。
 import { memo, useEffect, useId, useRef, useState } from "react";
 import { api, ApiError } from "./api.ts";
-import type { PerpetualQuote } from "./perpetual-types.ts";
+import type { PerpetualQuote } from "../../src/vendor/perpetual-types.ts";
 import { depthEstimateExpired, type PerpetualDepthEstimate } from "../../src/vendor/perpetual-execution.ts";
 import "./perpetual-execution.css";
 

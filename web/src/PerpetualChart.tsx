@@ -8,8 +8,8 @@ import { analyzeFundingStability, type FundingStabilityDay, type FundingStabilit
 import { fundingFreshUntil, type FundingHistoryPairRequest } from '../../src/vendor/perpetual-funding-history.ts';
 import { perpetualChartUrl, type PerpetualChartSelection } from './perpetual-chart-state.ts';
 import { perpetualPriceIdentity, PRICE_HOUR_MS, PRICE_HISTORY_STALE_MS, type PerpetualPriceLeg } from '../../src/vendor/perpetual-price-history.ts';
-import { quoteIsFresh, quotePrice, quotePriceTime } from './perpetual-spreads.ts';
-import type { PerpetualQuote, PerpetualSnapshot } from './perpetual-types.ts';
+import { quoteIsFresh, quotePrice, quotePriceTime } from '../../src/vendor/perpetual-spreads.ts';
+import type { PerpetualQuote, PerpetualSnapshot } from '../../src/vendor/perpetual-types.ts';
 import './perpetual-chart.css';
 
 interface Props {

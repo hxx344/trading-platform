@@ -1,5 +1,5 @@
-// 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-feed.ts（提交 c84ba27），未改动。
-import type { PerpetualDelta, PerpetualExchange, PerpetualPatch, PerpetualQuote, PerpetualSnapshot } from "./perpetual-types.ts";
+// 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-feed.ts（提交 c84ba27）。改动：perpetual-types / spreads / fees / fx 的导入指向 src/vendor 的同名文件。
+import type { PerpetualDelta, PerpetualExchange, PerpetualPatch, PerpetualQuote, PerpetualSnapshot } from "../../src/vendor/perpetual-types.ts";
 
 export type PerpetualConnection = "connecting" | "stream" | "polling" | "error" | "paused";
 interface SnapshotStream {

@@ -4,7 +4,7 @@ import { DEFAULT_CAPITAL_ASSUMPTIONS, type CapitalAssumptions } from "../../src/
 import { scannerCapitalMetrics } from "./perpetual-capital.ts";
 import { scannerAmountValue, scannerCurrencyValue, scannerHistoryValue, type ScannerRangeData, type ScannerRangeValue } from "./perpetual-scanner-filters.ts";
 import { annualizedFundingPercent } from "./perpetual-scanner.ts";
-import { normalizedFunding8h, perpetualSpreadKey, quoteIsFresh, type PerpetualFilters, type PerpetualSpread } from "./perpetual-spreads.ts";
+import { normalizedFunding8h, perpetualSpreadKey, quoteIsFresh, type PerpetualFilters, type PerpetualSpread } from "../../src/vendor/perpetual-spreads.ts";
 
 export type ScannerSortColumn = "fundingSpread" | "annualized" | "volume" | "openInterest" | "quote" | "spread" | "capital" | "roc" | "history24h" | "history7d" | "history30d";
 export interface ScannerSort { column: ScannerSortColumn; direction: "asc" | "desc"; leg?: "long" | "short" }

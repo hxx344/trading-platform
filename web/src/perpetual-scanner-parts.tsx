@@ -3,10 +3,10 @@
 // 来源浮层，M-5b2 加上资金费历史的 ScannerHistory，内容未改；改了导入路径。
 import { useCallback, useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import type { PerpetualQuote } from './perpetual-types.ts';
+import type { PerpetualQuote } from '../../src/vendor/perpetual-types.ts';
 import { fundingWindowTotal, fundingTotalIsFresh, type FundingWindowTotal, type PerpetualFundingLeg } from '../../src/vendor/perpetual-funding-history.ts';
 import { PERPETUAL_MARKET_METRICS_STALE_MS, type PerpetualMarketMetricsLeg } from '../../src/vendor/perpetual-market-metrics.ts';
-import { normalizedFunding8h } from './perpetual-spreads.ts';
+import { normalizedFunding8h } from '../../src/vendor/perpetual-spreads.ts';
 
 
 const dateFormat = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });

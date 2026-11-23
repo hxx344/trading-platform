@@ -3,7 +3,7 @@
 // 一直可读，本服务同样只看 active，页面隐藏时不额外放慢（间隔本来就是 60 秒）。
 import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from './api.ts';
-import type { PerpetualFxSnapshot } from './perpetual-fx.ts';
+import type { PerpetualFxSnapshot } from '../../src/vendor/perpetual-fx.ts';
 
 export const PERPETUAL_FX_PATH = '/api/monitor/perpetual/fx';
 const fallback = '换汇行情暂不可用，缺失或过期汇率的组合暂不参与排名。';

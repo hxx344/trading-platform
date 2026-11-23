@@ -94,7 +94,6 @@ export function readGlobalParams(value: unknown, base: GlobalParams = DEFAULT_GL
 }
 
 // ---- 开平仓 ----
-export interface OpenLeg { side: 'buy' | 'sell'; price: number }
 export interface Position {
   id: string; symbol: string; direction: Direction; openedAt: number; qty: number; notionalUsd: number;
   /** 开仓时的可成交价差（基点）与基线。 */ entrySpread: number; entryBaseline: number; entryRegime: Regime;

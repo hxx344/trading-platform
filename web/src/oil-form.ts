@@ -103,7 +103,6 @@ export const isOilVenue = (value: string): value is OilVenue => (OIL_VENUES as r
 export const hedgeVenueFor = (venues: readonly OilVenue[], lead: OilVenue, current: OilVenue): OilVenue | null =>
   current !== lead && venues.includes(current) ? current : venues.find(venue => venue !== lead) ?? null;
 export const SIDE_LABEL: Record<OilSide, string> = { long: '多', short: '空' };
-export const SYMBOL_LABEL: Record<OilSymbol, string> = { BZUSDT: 'BZ（布伦特）', CLUSDT: 'CL（WTI）' };
 const other = <T extends string>(value: T, pair: readonly [T, T]): T => (value === pair[0] ? pair[1] : pair[0]);
 const opposite = (side: OilSide): OilSide => (side === 'long' ? 'short' : 'long');
 

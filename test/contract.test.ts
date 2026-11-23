@@ -191,8 +191,3 @@ test('契约探测：等待替换只对测试替身生效，指向其他 fetch �
   await sleep(450);
   assert.ok(performance.now() - started >= 400);
 });
-
-test('契约探测：探测脚本自带的十进制运算与执行器的 src/decimal.ts 逐字节相同', () => {
-  // The ASTER probe keeps its own copy so it runs without loading the executor.
-  assert.equal(readFileSync(new URL('../probes/lib/decimal.ts', import.meta.url), 'utf8'), readFileSync(new URL('../src/decimal.ts', import.meta.url), 'utf8'));
-});

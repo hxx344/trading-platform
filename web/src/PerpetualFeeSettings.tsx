@@ -2,7 +2,7 @@
 
 import { memo, type Dispatch, type SetStateAction } from 'react';
 import { ChevronDown } from 'lucide-react';
-import { defaultQualityBudget, takerFeeVenues, validFeePercent, type QualityBudget, type TakerFeeVenue } from './perpetual-fees.ts';
+import { defaultQualityBudget, takerFeeVenues, validFeePercent, type QualityBudget, type TakerFeeVenue } from '../../src/vendor/perpetual-fees.ts';
 
 function PerpetualFeeSettings({ budget, onChange }: { budget: QualityBudget; onChange: Dispatch<SetStateAction<QualityBudget>> }) {
   function updateFee(venue: TakerFeeVenue, text: string) {

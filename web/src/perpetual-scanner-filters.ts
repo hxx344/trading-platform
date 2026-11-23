@@ -1,10 +1,10 @@
 // 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-scanner-filters.ts（提交 c84ba27）。改动：资金费历史与市场指标指向 src/vendor 的副本。
-import { quoteCurrencyFx, type PerpetualFxSnapshot } from "./perpetual-fx.ts";
+import { quoteCurrencyFx, type PerpetualFxSnapshot } from "../../src/vendor/perpetual-fx.ts";
 import { fundingTotalIsFresh, type FundingWindowHours, type FundingWindowTotal } from "../../src/vendor/perpetual-funding-history.ts";
 import { PERPETUAL_MARKET_METRICS_STALE_MS, type PerpetualMarketMetricsLeg } from "../../src/vendor/perpetual-market-metrics.ts";
 import { annualizedFundingPercent } from "./perpetual-scanner.ts";
-import { normalizedFunding8h, type PerpetualSpread } from "./perpetual-spreads.ts";
-import type { PerpetualQuote } from "./perpetual-types.ts";
+import { normalizedFunding8h, type PerpetualSpread } from "../../src/vendor/perpetual-spreads.ts";
+import type { PerpetualQuote } from "../../src/vendor/perpetual-types.ts";
 
 export const SCANNER_RANGE_IDS = [
   "longVolume", "shortVolume", "longOpenInterest", "shortOpenInterest", "spread",

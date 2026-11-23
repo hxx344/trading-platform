@@ -1,6 +1,6 @@
 // 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-capital.ts（提交 c84ba27）。改动：capital-metrics 指向 src/vendor 的副本。
 import { estimatePairCapital, estimatePairRoc, type CapitalAssumptions } from "../../src/vendor/capital-metrics.mjs";
-import { normalizedFunding8h, quoteIsFresh, type PerpetualFilters, type PerpetualSpread } from "./perpetual-spreads.ts";
+import { normalizedFunding8h, quoteIsFresh, type PerpetualFilters, type PerpetualSpread } from "../../src/vendor/perpetual-spreads.ts";
 
 /** Display and sorting share the same price, currency and funding-time checks. */
 export function scannerCapitalMetrics(row: PerpetualSpread, assumptions: CapitalAssumptions, data: {

@@ -1,7 +1,7 @@
 // Ported from project-aggregation 工作台 modules/monitor/tests/perpetual-funding.test.mjs (commit c84ba27). Changes: import paths only.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createPerpetualRankingSelector, defaultPerpetualFilters, normalizedFunding8h, parsePerpetualPreferences, perpetualSpreadKey, rankBestPerpetualSpreads, rankPerpetualSpreads } from "../../src/perpetual-spreads.ts";
+import { createPerpetualRankingSelector, defaultPerpetualFilters, normalizedFunding8h, parsePerpetualPreferences, perpetualSpreadKey, rankBestPerpetualSpreads, rankPerpetualSpreads } from "../../../src/vendor/perpetual-spreads.ts";
 import { estimatePerpetualHoldingScenario } from "../../src/perpetual-opportunity.ts";
 
 const now = 1_800_000_000_000;

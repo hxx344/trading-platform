@@ -2,7 +2,7 @@
 // service's own rules are the workbench's tests (test/perpetual/*.test.mjs); these cover what this service adds.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -19,12 +19,6 @@ async function until(check: () => boolean, what: string): Promise<void> {
   for (let i = 0; i < 500; i++) { if (check()) return; await sleep(4); }
   assert.fail(`等待超时：${what}`);
 }
-const body = (path: string) => readFileSync(new URL(path, import.meta.url), 'utf8').split('\n').slice(1).join('\n');
-
-test('副本：页面与服务端的工作台 lib 除头注释外一致', () => {
-  for (const name of ['types', 'fx', 'fees']) assert.equal(body(`../web/src/perpetual-${name}.ts`), body(`../src/vendor/perpetual-${name}.ts`), name);
-});
-
 test('NodeWebSocket：ws 兼容（文本帧与二进制帧都交付可 String() 解码的 Buffer，超过 8 MB 断开）', () => {
   const original = globalThis.WebSocket;
   type Record = { url: string; binaryType: string; listeners: Map<string, (event: { data?: unknown; code?: number }) => void>; sent: string[]; closed: number };

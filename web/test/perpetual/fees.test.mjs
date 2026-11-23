@@ -1,7 +1,7 @@
 // Ported from project-aggregation 工作台 modules/monitor/tests/perpetual-fees.test.mjs (commit c84ba27). Changes: import paths only.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { contractFeeMaxAgeMs, defaultQualityBudget, pairTakerFees, parseQualityBudget, resolveTakerFee } from '../../src/perpetual-fees.ts';
+import { contractFeeMaxAgeMs, defaultQualityBudget, pairTakerFees, parseQualityBudget, resolveTakerFee } from '../../../src/vendor/perpetual-fees.ts';
 
 const NOW = Date.UTC(2026, 8, 21, 8);
 const quote = (exchange, patch = {}) => ({ exchange, symbol: 'BTCUSDT', base: 'BTC', quoteCurrency: 'USDT', ...patch });

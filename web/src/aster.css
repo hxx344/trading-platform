@@ -317,9 +317,6 @@
   margin-left: 14px;
   margin-right: 14px;
 }
-.aster-desk .pair-adl-panel > .pair-adl-notification {
-  margin-bottom: 18px;
-}
 .aster-desk .pair-adl-summary {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
@@ -335,13 +332,6 @@
 .aster-desk .pair-adl-incident {
   border-top: 1px solid var(--border);
   padding-top: 12px;
-  margin-top: 12px;
-}
-.aster-desk .pair-adl-notification {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
   margin-top: 12px;
 }
 @media (max-width: 640px) {
@@ -776,9 +766,6 @@
   margin-bottom: 8px;
   line-height: 1.6;
 }
-.aster-desk .pair-aside .pair-adl-panel > .pair-adl-notification {
-  margin-bottom: 12px;
-}
 .aster-desk .pair-aside .execution-live-state {
   padding: 10px 14px 2px;
 }
@@ -915,9 +902,6 @@
   font-size: 12px;
   margin: 0 0 16px;
 }
-.aster-desk .full-width {
-  width: 100%;
-}
 .aster-desk .settings-toggle {
   display: flex;
   align-items: center;
@@ -1000,10 +984,6 @@
   display: flex;
   gap: 8px;
   margin-top: 16px;
-}
-.aster-desk .form-actions .full-width {
-  width: auto;
-  flex: 1;
 }
 
 /* shadcn 输入框与开关（components/ui/input.tsx、switch.tsx 深色模式）的 Tailwind 类名换算 */

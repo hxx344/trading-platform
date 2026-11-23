@@ -3,7 +3,7 @@
 .trading-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px 16px;flex-wrap:wrap;margin-bottom:14px}
 .trading-toolbar>.button{flex-shrink:0;margin-left:auto}
 
-.trading-center button:focus-visible,.trading-center select:focus-visible,.positions-table-scroll:focus-visible,.positions-details summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.positions-table-scroll:focus-visible,.positions-details summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
 .positions-page{min-width:0}
 .positions-readonly{display:flex;align-items:center;gap:6px;margin:0;font-size:.75rem;color:var(--text-tertiary);line-height:1.6}

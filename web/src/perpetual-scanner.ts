@@ -1,6 +1,6 @@
-// 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-scanner.ts（提交 c84ba27），未改动。
-import type { PerpetualSpread } from "./perpetual-spreads.ts";
-import type { PerpetualQuote } from "./perpetual-types.ts";
+// 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-scanner.ts（提交 c84ba27）。改动：perpetual-types / spreads / fees / fx 的导入指向 src/vendor 的同名文件。
+import type { PerpetualSpread } from "../../src/vendor/perpetual-spreads.ts";
+import type { PerpetualQuote } from "../../src/vendor/perpetual-types.ts";
 
 export const SCANNER_COLUMNS = [
   { id: "type", label: "类型", defaultVisible: true },

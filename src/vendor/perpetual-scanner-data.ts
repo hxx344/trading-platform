@@ -1,5 +1,5 @@
 // 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-scanner-data.ts（提交 c84ba27）。改动：服务端也用，放在 src/vendor；
-// 页面的 PerpetualSpread 在 web/src，这里只取它用到的 base / long / short 三个字段（结构相同，页面行可直接传入）。
+// PerpetualSpread 在同目录的 perpetual-spreads.ts，这里只取它用到的 base / long / short 三个字段（结构相同，页面行可直接传入）。
 import type { FundingHistoryPairRequest, FundingWindowHours, FundingWindowTotal } from './perpetual-funding-history.ts';
 import type { PerpetualMarketMetricsLeg } from './perpetual-market-metrics.ts';
 import type { PerpetualQuote } from './perpetual-types.ts';

@@ -12,7 +12,7 @@
 import { addressOf, pythonUrlencode, signAsterMessage } from './lib/eip712.ts';
 import { HttpFailure, NotSent, ProbeAbort, boundedInteger, createReport, environment, exchange, ignoreInterrupt, liveAllowed, positiveDecimal, readFlags, registerSecrets, reserveReport, safeText, saveReport, sleep, step, watchSignals } from './lib/common.ts';
 import type { HttpResult, Report } from './lib/common.ts';
-import { add, cmp, mul, sub } from './lib/decimal.ts';
+import { add, cmp, mul, sub } from '../src/decimal.ts';
 
 const BASE = 'https://fapi.asterdex.com';
 const ASSET = 'USD1';

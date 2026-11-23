@@ -1,8 +1,8 @@
-// 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-manual-pairs.ts（提交 c84ba27），未改动。
-import type { PerpetualPriceMode, PerpetualQuote, PerpetualSnapshot } from './perpetual-types.ts';
-import { normalizedFunding8h, quoteIsFresh, quotePrice, quotePriceTime } from './perpetual-spreads.ts';
-import { pairTakerFees, validFeePercent, type QualityBudget } from './perpetual-fees.ts';
-import { quoteCurrencyFx, type PerpetualFxSnapshot } from './perpetual-fx.ts';
+// 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-manual-pairs.ts（提交 c84ba27）。改动：perpetual-types / spreads / fees / fx 的导入指向 src/vendor 的同名文件。
+import type { PerpetualPriceMode, PerpetualQuote, PerpetualSnapshot } from '../../src/vendor/perpetual-types.ts';
+import { normalizedFunding8h, quoteIsFresh, quotePrice, quotePriceTime } from '../../src/vendor/perpetual-spreads.ts';
+import { pairTakerFees, validFeePercent, type QualityBudget } from '../../src/vendor/perpetual-fees.ts';
+import { quoteCurrencyFx, type PerpetualFxSnapshot } from '../../src/vendor/perpetual-fx.ts';
 
 export const maxManualPairs = 20;
 export interface ManualPair { id: string; first: string; second: string; firstFactor: number; secondFactor: number }

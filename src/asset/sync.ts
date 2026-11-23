@@ -354,6 +354,3 @@ export async function refresh(ctx: SyncContext, refreshPositions?: () => Promise
   lease.write(() => snapshotNow(ctx, at));
   return true;
 }
-
-/** A refusal of the ledger's state (lease lost, imported again) must end the sync, never be recorded as a source's error. */
-export const isConflict = (error: unknown): error is AssetConflict => error instanceof AssetConflict;

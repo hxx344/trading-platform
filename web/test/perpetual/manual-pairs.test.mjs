@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { evaluateManualPair, parseManualPairs, validManualPair, manualQuoteKey, maxManualPairs } from '../../src/perpetual-manual-pairs.ts';
-import { rankPerpetualSpreads, defaultPerpetualFilters } from '../../src/perpetual-spreads.ts';
+import { rankPerpetualSpreads, defaultPerpetualFilters } from '../../../src/vendor/perpetual-spreads.ts';
 
 const now = 1_800_000_000_000;
 const pair = { id: 'pair', first: 'aster:POLYMARKETUSD1', second: 'gate:POLYMARKET_USDT', firstFactor: 1, secondFactor: 10 };

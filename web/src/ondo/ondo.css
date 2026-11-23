@@ -42,19 +42,11 @@
 .wb-field input{width:100%;min-width:0;height:36px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);padding:7px 10px;color:var(--text-primary);background:var(--surface-1);font-variant-numeric:tabular-nums}
 .wb-field input:disabled{color:var(--text-tertiary);background:var(--surface-2)}
 .wb-field small{font-size:.6875rem;line-height:1.65;color:var(--text-tertiary)}
-.wb-key-actions{display:flex;gap:8px;flex-wrap:wrap}
-.wb-key{display:flex;flex-direction:column;gap:12px;padding:0 20px 18px}
-.wb-events{list-style:none;margin:0;padding:0 20px 14px;max-height:420px;overflow-y:auto}
-.wb-events li{display:grid;grid-template-columns:120px 90px minmax(0,1fr);gap:10px;padding:8px 0;border-bottom:1px solid var(--surface-4);font-size:.75rem;align-items:baseline}
-.wb-events li:last-child{border-bottom:0}
-.wb-events time{color:var(--text-tertiary);font-variant-numeric:tabular-nums}
-.wb-events li.bad strong{color:var(--error)}
 @media(max-width:1100px){.wb-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.wb-field.wide{grid-column:span 2}}
 @media(max-width:650px){
   .wb-heading{flex-direction:column}.wb-status{padding:16px}
   .wb-grid{grid-template-columns:minmax(0,1fr);gap:14px}.wb-field.wide{grid-column:auto}.wb-field input{height:40px;font-size:16px}
-  .wb-section fieldset,.wb-key,.wb-events{padding-left:16px;padding-right:16px}
-  .wb-events li{grid-template-columns:minmax(0,1fr);gap:2px}
+  .wb-section fieldset{padding-left:16px;padding-right:16px}
 }
 @media(prefers-reduced-motion:reduce){.wb-page .spin{animation:none}}
 

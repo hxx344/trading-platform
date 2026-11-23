@@ -9,8 +9,6 @@ import type { CallOptions, SendOptions } from './connector.ts';
 export const ADL_CLIENT_ID = 'adl_autoclose';
 /** ASTER lists contracts such as 币安人生USDT and B-MONEYUSDT; any name without control or space characters is taken. */
 export const ADL_SYMBOL = /^[^\p{C}\p{Z}]{1,64}$/u;
-/** `adl-` + 28 hex: unique per batch, under the 36-character client id limit of Binance-style venues. */
-export const ADL_ORDER_ID = /^adl-[0-9a-f]{28}$/;
 export type AdlPositionSide = 'LONG' | 'SHORT' | 'BOTH';
 export type Direction = 'long' | 'short';
 export const DIRECTION_NAMES: Record<Direction, string> = { long: '多', short: '空' };

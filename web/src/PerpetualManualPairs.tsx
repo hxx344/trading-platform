@@ -3,8 +3,8 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { usePerpetualFx } from './use-perpetual-fx.ts';
 import { evaluateManualPair, manualQuoteKey, maxManualPairs, parseManualPairs, validManualPair, type ManualPair } from './perpetual-manual-pairs.ts';
-import type { PerpetualPriceMode, PerpetualSnapshot } from './perpetual-types.ts';
-import type { QualityBudget } from './perpetual-fees.ts';
+import type { PerpetualPriceMode, PerpetualSnapshot } from '../../src/vendor/perpetual-types.ts';
+import type { QualityBudget } from '../../src/vendor/perpetual-fees.ts';
 import './perpetual-manual-pairs.css';
 
 const storageKey = 'market-monitor:perpetual-manual-pairs:v1';

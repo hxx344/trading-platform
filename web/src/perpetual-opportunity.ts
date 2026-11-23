@@ -1,7 +1,7 @@
-// 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-opportunity.ts（提交 c84ba27），未改动。
-import { pairTakerFees, validFeePercent, type QualityBudget } from "./perpetual-fees.ts";
-import { quoteIsFresh, quotePrice, type PerpetualSpread } from "./perpetual-spreads.ts";
-import type { PerpetualQuote } from "./perpetual-types.ts";
+// 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-opportunity.ts（提交 c84ba27）。改动：perpetual-types / spreads / fees / fx 的导入指向 src/vendor 的同名文件。
+import { pairTakerFees, validFeePercent, type QualityBudget } from "../../src/vendor/perpetual-fees.ts";
+import { quoteIsFresh, quotePrice, type PerpetualSpread } from "../../src/vendor/perpetual-spreads.ts";
+import type { PerpetualQuote } from "../../src/vendor/perpetual-types.ts";
 
 export interface PerpetualHoldingInput {
   holdingHours: number;

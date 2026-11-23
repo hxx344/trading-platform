@@ -805,7 +805,7 @@ CrossEx 的机会来源（C5）与导入预填属 M13，按 R3 单独做（见 [
 
 按上面的计划实现，差别与补充：
 
-- 工作台 `lib/perpetual-{types,fx,fees,execution,exit}.ts` 原样复制到 `src/vendor/`（发布包不含 `web/src`，服务端要用就得放在 `src`）；`server/perpetual-depth.mjs` 复制为 `src/vendor/perpetual-depth.mjs`，只改导入路径，并把默认的 `ws` 库换成 `NodeWebSocket`：继承本仓库已有的 ws 兼容适配 `src/vendor/crossex/node-ws.mjs`（`binaryType = 'arraybuffer'`，文本帧与二进制帧都以 `Buffer` 交付，原文件的 `String(raw)` 照常解码），选项取工作台 `PerpetualWebSocket` 的 `maxPayload` 8 MB 与握手 20 秒。页面的 `web/src/perpetual-{types,fx,fees}.ts` 与 `src/vendor` 的副本由测试比对一致；页面新文件直接从 `src/vendor` 引入 execution 与 exit。
+- 工作台 `lib/perpetual-{types,fx,fees,execution,exit}.ts` 原样复制到 `src/vendor/`（发布包不含 `web/src`，服务端要用就得放在 `src`）；`server/perpetual-depth.mjs` 复制为 `src/vendor/perpetual-depth.mjs`，只改导入路径，并把默认的 `ws` 库换成 `NodeWebSocket`：继承本仓库已有的 ws 兼容适配 `src/vendor/crossex/node-ws.mjs`（`binaryType = 'arraybuffer'`，文本帧与二进制帧都以 `Buffer` 交付，原文件的 `String(raw)` 照常解码），选项取工作台 `PerpetualWebSocket` 的 `maxPayload` 8 MB 与握手 20 秒。页面直接从 `src/vendor` 引入 types、fx、fees、execution 与 exit（早先 `web/src/` 另有 types、fx、fees 的副本并由测试比对，已删除，见下文 M-5d 的「单份来源」）。
 - 汇率按需读取：工作台在服务端每 60 秒常驻刷新一次汇率（供机会列表的 `peekFx`）；本批只有页面要汇率，改为请求时读、缓存 60 秒，常驻刷新留到 M-5f 需要 `peekFx` 时再加。
 - 页面：`web/src/PerpetualExecution.tsx`、`PerpetualExit.tsx`、`PerpetualManualPairs.tsx`、`use-perpetual-fx.ts`；请求走 `api()`（带页面请求标记，401 转登录，失败显示服务给的原因）。平仓测算的输入字段与默认值同工作台模拟仓位（展开时快照的多腿卖一、空腿买一，1000 USDT），去掉登记方式切换与登记按钮。
 - 样式：三份组件 css 原样复制；`perpetual.css` 按新增的类重新过滤（展开列、详情行、页签、汇率提示），末列恢复为展开按钮后，M-4b 删去的 `th:last-child` 规则也照工作台保留。补了一段：工作台的监控模块在 iframe 里，详情按 `100vw` 限宽；本服务左侧有导航栏，改为按表格容器宽度（容器查询 `100cqw`），否则 1280 宽度下详情右侧被裁掉。
@@ -983,7 +983,7 @@ CrossEx 的机会来源（C5）与导入预填属 M13，按 R3 单独做（见 [
 - 替身：`test/perpetual-fake.ts` 加 CoinGecko 与多空比替身（BTC、ETH 有基本面；Binance、Bybit 有多空比；OKX 无数据；DEX 显示未接入）。
 - 测试：移植 `test/perpetual/{quality,quality-service,fundamentals,positioning,positioning-summary}.test.mjs` 与 `web/test/perpetual/{quality-cache,quality-feed}.test.mjs`（只改导入；`quality-service` 里一处用例把工作台的报价表读写换成本仓库的 `saveContractMetrics` / `loadContractMetrics`，见文件头）；工作台依赖其整体 HTTP 的用例（如“quality POST retains shared HTTP authentication”）不搬，由 `test/monitor-perpetual-quality.test.ts` 改测本仓库采集器、缓存表与接口。
 - 启动时的空分钟：本仓库关闭时清空报价、重启后不恢复报价（工作台从 `market.sqlite` 恢复），恢复样本结束时取的那一分钟是空样本，第一个有效样本要等下一分钟；不影响统计（这段时间本来就没有报价）。
-- 两份副本：`perpetual-spreads.ts`、`perpetual-fees.ts`、`perpetual-types.ts` 在 `src/vendor/` 与 `web/src/` 各有一份（内容相同），页面的质量计算经 `src/vendor/perpetual-quality.ts` 用前者，排名用后者；更新工作台版本时两份一起换（审查登记，后续让页面直接引用 `src/vendor/`）。
+- 单份来源：`perpetual-spreads.ts`、`perpetual-fees.ts`、`perpetual-types.ts`、`perpetual-fx.ts` 只保留 `src/vendor/` 一份，页面与页面测试直接从 `src/vendor/` 导入（早先 `web/src/` 另有一份内容相同的副本，已删除）；更新工作台版本时只换这一份。
 
 ### M-5e1：模拟与手工持仓跟踪
 

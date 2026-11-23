@@ -1,5 +1,5 @@
-// 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-display.ts（提交 c84ba27），未改动。
-import type { PerpetualSnapshot } from './perpetual-types.ts';
+// 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-display.ts（提交 c84ba27）。改动：perpetual-types / spreads / fees / fx 的导入指向 src/vendor 的同名文件。
+import type { PerpetualSnapshot } from '../../src/vendor/perpetual-types.ts';
 
 export const PERPETUAL_DISPLAY_INTERVAL_MS = 20_000;
 

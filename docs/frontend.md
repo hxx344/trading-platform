@@ -478,7 +478,7 @@
 
 ## 行情监控页：合约价差（Monitor M-4b，v0.37.0）
 
-**对照的工作台页面**：`modules/monitor/app/perpetual-panel.tsx` 的「发现机会」工作区（提交 `c84ba27`），零件取自 `app/perpetual-scanner-parts.tsx`，读取 hook 改写自 `hooks/use-perpetual-feed.ts`；`lib/perpetual-{types,feed,display,spreads,fees,fx,scanner}.ts` 原样复制到 `web/src/`，文件头写明来源与提交。
+**对照的工作台页面**：`modules/monitor/app/perpetual-panel.tsx` 的「发现机会」工作区（提交 `c84ba27`），零件取自 `app/perpetual-scanner-parts.tsx`，读取 hook 改写自 `hooks/use-perpetual-feed.ts`；`lib/perpetual-{feed,display,scanner}.ts` 复制到 `web/src/`，文件头写明来源与提交；`lib/perpetual-{types,spreads,fees,fx}.ts` 只保留 `src/vendor/` 一份，页面直接从那里导入（见 [monitor.md](monitor.md) 的「单份来源」）。
 
 **页面**：`web/src/MonitorPerpetual.tsx`。行情页加「合约价差」标签（排在海力士之后，同工作台 `lib/monitors.ts` 的名称）；面板照工作台排版：标题“合约价差套利”与刷新按钮；工具栏（价格套利 / 资金费套利 / 全部报价、交易所多选、币种搜索、RWA / 加密 / 类别）；状态行；排名表（类型、组合、资金费率、资金费差、年化、报价、开仓价差、报价时间）与分页（每页 30 条）；全部报价表（含下架提示）；“监控工具与设置 → 更多筛选与排序设置”里的价差排序、报价口径、平台组合与重置。表格在自己的框内横向滚动，390 宽度的全部报价表按工作台改为卡片。
 

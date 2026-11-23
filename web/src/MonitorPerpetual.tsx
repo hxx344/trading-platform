@@ -17,7 +17,7 @@ import { fundingWindowTotal, type PerpetualFundingLeg } from '../../src/vendor/p
 import { scannerCapitalMetrics } from './perpetual-capital.ts';
 import { nextScannerSort, parseScannerSort, scannerSortRequirements, sortScannerRows, type ScannerSort, type ScannerSortColumn } from './perpetual-scanner-sort.ts';
 import { normalizeCapitalAssumptions, parseCapitalAssumptions, type CapitalAssumptions } from '../../src/vendor/capital-metrics.mjs';
-import { parseQualityBudget, type QualityBudget } from './perpetual-fees.ts';
+import { parseQualityBudget, type QualityBudget } from '../../src/vendor/perpetual-fees.ts';
 import { estimatePerpetualHoldingScenario } from './perpetual-opportunity.ts';
 import PerpetualFeeSettings from './PerpetualFeeSettings.tsx';
 import { PerpetualExecution } from './PerpetualExecution.tsx';
@@ -26,8 +26,8 @@ import PerpetualManualPairs from './PerpetualManualPairs.tsx';
 import { perpetualChartUrl, readPerpetualChartSelection, type PerpetualChartSelection } from './perpetual-chart-state.ts';
 import { perpetualWorkspaceLink } from './monitor-link.ts';
 import { LazyBoundary } from './LazyBoundary.tsx';
-import { classifyPerpetualQuote, createPerpetualQuoteSelector, createPerpetualRankingSelector, defaultPerpetualFilters, normalizedFunding8h, parsePerpetualPreferences, perpetualSpreadKey, quotePriceTime, type PerpetualFilters, type PerpetualSpread } from './perpetual-spreads.ts';
-import type { PerpetualExchange, PerpetualPairMode, PerpetualPriceMode, PerpetualQuote, PerpetualSnapshot } from './perpetual-types.ts';
+import { classifyPerpetualQuote, createPerpetualQuoteSelector, createPerpetualRankingSelector, defaultPerpetualFilters, normalizedFunding8h, parsePerpetualPreferences, perpetualSpreadKey, quotePriceTime, type PerpetualFilters, type PerpetualSpread } from '../../src/vendor/perpetual-spreads.ts';
+import type { PerpetualExchange, PerpetualPairMode, PerpetualPriceMode, PerpetualQuote, PerpetualSnapshot } from '../../src/vendor/perpetual-types.ts';
 import { SCANNER_CATEGORIES, SCANNER_COLUMNS, annualizedFundingPercent, defaultScannerPreferences, parseScannerPreferences, scannerPairCategory, scannerQuoteCategory, type ScannerCategoryId, type ScannerColumnId, type ScannerPreferences } from './perpetual-scanner.ts';
 import { ScannerFundingRate, ScannerHistory, ScannerLeg, ScannerMarketMetric, ScannerMenu, scannerPercent, scannerPolarity } from './perpetual-scanner-parts.tsx';
 

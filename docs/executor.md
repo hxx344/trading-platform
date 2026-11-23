@@ -71,7 +71,7 @@ node src/main.ts --data-dir /home/<用户>/pa-executor-live --port 4711 --live-c
 
 ## ASTER 划转探测脚本
 
-`probes/aster-transfer.ts`（共用代码在 `probes/lib/`，离线测试 `test/contract.test.ts`）是操作者手动运行的探测脚本，用真实账户核实划转接口的行为。它不属于执行器，不读写执行器的库。默认只读；发送真实划转必须同时带 `--live` 与 `--confirm <短语>`，短语由只读运行打印。
+`probes/aster-transfer.ts`（共用代码在 `probes/lib/`，十进制运算与签名直接用 `src/decimal.ts`、`src/aster/eip712.ts`，离线测试 `test/contract.test.ts`）是操作者手动运行的探测脚本，用真实账户核实划转接口的行为。它不属于执行器，不读写执行器的库。默认只读；发送真实划转必须同时带 `--live` 与 `--confirm <短语>`，短语由只读运行打印。
 
 ```bash
 node probes/aster-transfer.ts --env-file <环境文件> --master-prefix <主账户前缀> --a-prefix <子账户 A 前缀> --b-prefix <子账户 B 前缀>

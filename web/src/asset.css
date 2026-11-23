@@ -353,9 +353,6 @@
 
 /* 本服务自己的规则 */
 .asset-desk .import-command { display: block; max-width: 100%; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--secondary); color: var(--foreground); font-family: var(--font-number); font-size: 12px; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere }
-.asset-desk .exchange-total { margin-left: auto; text-align: right; font-family: var(--font-number); font-size: 12px; font-weight: 600; white-space: nowrap }
-.asset-desk .exchange-total small { display: block; font-family: var(--font-ui); font-weight: 400 }
-.asset-desk .exchange-empty { padding: 10px 14px }
 .asset-desk .holdings .detail-row:hover { background: none }
 .asset-desk .holdings .detail-row > [data-slot=table-cell] { padding: 0 12px 12px; white-space: normal }
 .asset-desk .account-detail { padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--background) }

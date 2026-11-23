@@ -2,8 +2,8 @@
 // QualityEvidence 三个组件（第 139–197 行）与它们用到的格式化常量（第 61–74 行）；只给两个组件加 export、改导入；本仓库面板文件已较长，单独成文件。
 import { ChevronDown } from "lucide-react";
 import { pairQualityHistory, type OpportunityQuality, type PerpetualQualityReport } from "../../src/vendor/perpetual-quality.ts";
-import type { PerpetualSpread } from "./perpetual-spreads.ts";
-import type { PerpetualExchange } from "./perpetual-types.ts";
+import type { PerpetualSpread } from "../../src/vendor/perpetual-spreads.ts";
+import type { PerpetualExchange } from "../../src/vendor/perpetual-types.ts";
 
 const positioningVenues = [{ id: "binance", name: "Binance" }, { id: "bybit", name: "Bybit" }, { id: "okx", name: "OKX" }, { id: "bitget", name: "Bitget" }, { id: "gate", name: "Gate" }];
 const positioningStatusLabels = { fresh: "已纳入", stale: "未纳入", pending: "采集中", unsupported: "不支持", unavailable: "暂无资料", error: "更新失败", "rate-limited": "请求限流" };

@@ -7,7 +7,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from './api.ts';
 import { createPerpetualClock, parsePerpetualSnapshot, PerpetualRequestError, startPerpetualFeed, type PerpetualConnection } from './perpetual-feed.ts';
 import { createPerpetualDisplay, PERPETUAL_DISPLAY_INTERVAL_MS } from './perpetual-display.ts';
-import type { PerpetualSnapshot } from './perpetual-types.ts';
+import type { PerpetualSnapshot } from '../../src/vendor/perpetual-types.ts';
 
 export const PERPETUAL_STREAM_PATH = '/api/monitor/perpetual/stream';
 export const PERPETUAL_QUOTE_PATH = '/api/monitor/perpetual/quote';

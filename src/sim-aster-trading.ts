@@ -2,7 +2,6 @@
 // reduce-only market orders and ADL closes (pushed and in the force-order
 // history), for offline simulation and fault injection of the ADL handling.
 // It has no network code.
-import { randomBytes } from 'node:crypto';
 import { add, cmp, isZero, min, mul, sub } from './decimal.ts';
 import { VenueError, type CallOptions, type SendOptions } from './connector.ts';
 import { ADL_CLIENT_ID, type AdlCapabilities, type AdlConnector, type AdlOrderRequest, type AdlPositionSide } from './adl-contracts.ts';
@@ -272,6 +271,3 @@ export class SimulatedAsterTrading implements AdlConnector, AsterPositionsConnec
     if (fault?.mode === 'hang') { await new Promise<void>(resolve => this.hung.push(resolve)); throw new VenueError('read-failed', message); }
   }
 }
-
-/** A fresh batch client id: `adl-` + 28 hex. */
-export const newAdlClientOrderId = (): string => `adl-${randomBytes(14).toString('hex')}`;

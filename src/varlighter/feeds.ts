@@ -10,8 +10,6 @@ export const LIGHTER_ENDPOINTS: Record<Venue, { rest: string; stream: string }> 
   rh: { rest: 'https://api.rh.lighter.xyz/api/v1', stream: 'wss://api.rh.lighter.xyz/stream?readonly=true' },
   lighter: { rest: 'https://mainnet.zklighter.elliot.ai/api/v1', stream: 'wss://mainnet.zklighter.elliot.ai/stream?readonly=true' },
 };
-export const RH_REST = `${LIGHTER_ENDPOINTS.rh.rest}/orderBookDetails`;
-export const RH_STREAM = LIGHTER_ENDPOINTS.rh.stream;
 export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 
 async function readJson(fetchImpl: FetchLike, url: string, signal: AbortSignal, limit: number, headers: Record<string, string>): Promise<unknown> {

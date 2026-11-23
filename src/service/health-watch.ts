@@ -24,14 +24,21 @@ export interface IncidentView { key: string; title: string; subject: string; pro
 /**
  * Open problems by key. observe() with a problem starts or keeps one, posting it once it has lasted afterMs (and again
  * every repeatMs, when given); observe() with null ends it, posting the recovery only if the problem had been posted.
+ * A post counts only once notify() returned (the notifier queued it durably): one that throws leaves the incident as it
+ * was, so the next observe() tries the same post again, and a recovery is never posted for an alert that was not.
  */
-export function createIncidents({ notify, now = Date.now }: { notify: (text: string) => void; now?: () => number }) {
+export function createIncidents({ notify, now = Date.now, log = line => process.stderr.write(`${line}\n`) }: { notify: (text: string) => void; now?: () => number; log?: (line: string) => void }) {
   const open = new Map<string, IncidentView & { sentAt: number | null }>();
+  const queued = (text: string): boolean => {
+    try { notify(text); return true; }
+    catch (error) { log(`依赖巡检告警未能入队，下一轮重试：${error instanceof Error ? error.message.slice(0, 160) : String(error)}`); return false; }
+  };
   return {
     observe(key: string, title: string, subject: string, problem: string | null, { afterMs, repeatMs }: { afterMs: number; repeatMs: number | null }): void {
       const at = now(), entry = open.get(key);
       if (problem === null) {
-        if (entry?.sentAt != null) notify(`【${title}恢复】${subject}，异常共约 ${lasted(at - entry.since)}`);
+        // Kept open until its recovery is queued.
+        if (entry?.sentAt != null && !queued(`【${title}恢复】${subject}，异常共约 ${lasted(at - entry.since)}`)) return;
         open.delete(key);
         return;
       }
@@ -40,11 +47,10 @@ export function createIncidents({ notify, now = Date.now }: { notify: (text: str
       open.set(key, current);
       if (current.sentAt === null) {
         if (at - current.since < afterMs) return;
+        if (!queued(`【${title}】${subject}：${problem}，已持续约 ${lasted(at - current.since)}`)) return;
         current.sentAt = at; current.alerted = true;
-        notify(`【${title}】${subject}：${problem}，已持续约 ${lasted(at - current.since)}`);
       } else if (repeatMs !== null && at - current.sentAt >= repeatMs) {
-        current.sentAt = at;
-        notify(`【${title}仍未恢复】${subject}：${problem}，已持续约 ${lasted(at - current.since)}`);
+        if (queued(`【${title}仍未恢复】${subject}：${problem}，已持续约 ${lasted(at - current.since)}`)) current.sentAt = at;
       }
     },
     /** Drops the problems under a key prefix without a recovery post: what they watched was switched off. */
@@ -77,8 +83,10 @@ export interface HealthWatchOptions {
   streams: () => readonly StreamRow[];
   /** The perpetual collector's status while it runs; null when there is none or it is switched off. */
   perpetual?: () => PerpetualStatusView | null;
+  /** Queues a message durably; throws when it could not (health-watch then tries again on a later tick). */
   notify: (text: string) => void;
   now?: () => number;
+  log?: (line: string) => void;
   probeMarket?: (socketPath: string) => Promise<unknown>;
   probeControl?: (port: number) => Promise<void>;
 }
@@ -93,8 +101,10 @@ async function probeControlPort(port: number): Promise<void> {
   await response.body?.cancel();
 }
 
-export function createHealthWatch({ marketSocketPath, controlPort, streams, perpetual, notify, now = Date.now, probeMarket = marketHealth, probeControl = probeControlPort }: HealthWatchOptions) {
-  const incidents = createIncidents({ notify, now });
+export function createHealthWatch({ marketSocketPath, controlPort, streams, perpetual, notify, now = Date.now, log = line => process.stderr.write(`${line}\n`), probeMarket = marketHealth, probeControl = probeControlPort }: HealthWatchOptions) {
+  const incidents = createIncidents({ notify, now, log });
+  /** A market restart seen but not yet queued (retried on the next tick). */
+  let restartPending = false;
   const blank = (): ProcessHealth => ({ ok: null, checkedAt: null, lastOkAt: null, error: null, restarts: 0 });
   const market = marketSocketPath ? blank() : null, control = controlPort !== undefined ? blank() : null;
   let marketInstance: string | null = null;
@@ -110,12 +120,14 @@ export function createHealthWatch({ marketSocketPath, controlPort, streams, perp
       const status = await probeMarket(marketSocketPath) as { instance?: unknown } | null;
       const instance = typeof status?.instance === 'string' ? status.instance : null;
       record(market, null);
-      if (instance && marketInstance && instance !== marketInstance) {
-        market.restarts += 1;
-        notify('【行情服务已重启】公开行情进程（trading-platform-market）换了新实例，期间的行情订阅已重新建立；如非升级所致，请查看该服务日志');
-      }
+      if (instance && marketInstance && instance !== marketInstance) { market.restarts += 1; restartPending = true; }
       if (instance) marketInstance = instance;
     } catch (error) { record(market, error); }
+    // Outside the probe: a notifier that cannot queue is not a market that cannot be reached.
+    if (restartPending) {
+      try { notify('【行情服务已重启】公开行情进程（trading-platform-market）换了新实例，期间的行情订阅已重新建立；如非升级所致，请查看该服务日志'); restartPending = false; }
+      catch (error) { log(`行情服务重启通知未能入队，下一轮重试：${error instanceof Error ? error.message.slice(0, 160) : String(error)}`); }
+    }
     incidents.observe('market', '行情服务不可用', '公开行情进程（trading-platform-market）', market.ok ? null : `无法连接：${market.error}`, { afterMs: PROCESS_DOWN_AFTER_MS, repeatMs: HEALTH_REPEAT_MS });
   }
 

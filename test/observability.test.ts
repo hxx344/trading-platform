@@ -6,14 +6,14 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
 import { join } from 'node:path';
-import { CRASH_FILE, installCrashGuard, takeCrashRecord } from '../src/crash-guard.ts';
+import { CRASH_FILE, clearCrashRecord, crashReportKey, installCrashGuard, readCrashRecord } from '../src/crash-guard.ts';
 import { FEED_DOWN_AFTER_MS, HEALTH_REPEAT_MS, PROCESS_DOWN_AFTER_MS, STREAM_DOWN_AFTER_MS, createHealthWatch, type StreamRow } from '../src/service/health-watch.ts';
 import { describeEvent } from '../src/service/feishu.ts';
 import type { PerpetualStatusView } from '../src/monitor/perpetual.ts';
 import { LOOP_WINDOW_MS, createHostStatus } from '../src/host-status.ts';
 import { connectionQuality, formatBytes, formatUptime, hostLevel, hostWorst, servicesTone, type HostView, type ServiceConnection } from '../web/src/host-status.ts';
 
-test('崩溃兜底：未捕获的异常写一行日志和标记文件后退出；下次启动读出并删除标记，坏标记也删除', () => {
+test('崩溃兜底：未捕获的异常写一行日志和标记文件后退出；下次启动读出标记、入队后才删除，坏标记读时即删除', () => {
   const dir = mkdtempSync(join(tmpdir(), 'tp-crash-'));
   const lines: string[] = [], exits: number[] = [], source = new EventEmitter();
   const remove = installCrashGuard('交易服务', { dir, log: line => lines.push(line), exit: code => exits.push(code), now: () => 1234, source });
@@ -23,13 +23,18 @@ test('崩溃兜底：未捕获的异常写一行日志和标记文件后退出�
     assert.deepEqual(exits, [1, 1], '第二次只退出');
     assert.equal(lines.length, 1);
     assert.match(lines[0]!, /^【交易服务异常退出】未捕获的异常：TypeError: boom\n/);
-    const record = takeCrashRecord(dir);
+    const record = readCrashRecord(dir);
     assert.deepEqual([record?.at, record?.process, record?.kind, record?.message], [1234, '交易服务', 'uncaughtException', 'TypeError: boom']);
     assert.match(record!.stack, /observability\.test\.ts/);
+    assert.equal(existsSync(join(dir, CRASH_FILE)), true, '读出不删除');
+    assert.deepEqual(readCrashRecord(dir), record, '未确认前再次启动仍能读出同一条');
+    assert.equal(crashReportKey(readCrashRecord(dir)!), crashReportKey(record!), '同一标记的入队键稳定');
+    clearCrashRecord(dir);
     assert.equal(existsSync(join(dir, CRASH_FILE)), false);
-    assert.equal(takeCrashRecord(dir), null);
+    assert.equal(readCrashRecord(dir), null);
+    clearCrashRecord(dir);
     writeFileSync(join(dir, CRASH_FILE), '{"at":"x"}');
-    assert.equal(takeCrashRecord(dir), null);
+    assert.equal(readCrashRecord(dir), null);
     assert.equal(existsSync(join(dir, CRASH_FILE)), false);
   } finally { remove(); rmSync(dir, { recursive: true, force: true }); }
 });
@@ -179,4 +184,100 @@ test('顶栏：负载取 CPU、内存与最满的可读磁盘中最高的；往�
     ['good', 'fair', 'slow', 'unreachable', 'offline', 'checking']);
   const link = (state: ServiceConnection['state']) => ({ id: state, label: '', state, detail: '' });
   assert.deepEqual([servicesTone([link('ok'), link('unknown')]), servicesTone([link('warn')]), servicesTone([link('warn'), link('down')])], ['', 'warn', 'alert']);
+});
+
+test('崩溃兜底：标记的报告第一次入队失败时保留标记；下次启动入队成功后删除，同一标记重复读出也只入队一次', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-crash-'));
+  const source = new EventEmitter();
+  const remove = installCrashGuard('交易服务', { dir, log: () => undefined, exit: () => undefined, now: () => 99, source });
+  // The service's start sequence (service/main.ts): read, queue keyed, then clear.
+  const queued = new Set<string>(), sent: string[] = [];
+  let failing = true;
+  const notifyOnce = (key: string, text: string) => { if (failing) throw new Error('database is locked'); if (queued.has(key)) return false; queued.add(key); sent.push(text); return true; };
+  const start = () => { const crash = readCrashRecord(dir); if (crash) { notifyOnce(crashReportKey(crash), crash.message); clearCrashRecord(dir); } };
+  try {
+    source.emit('uncaughtException', new Error('boom'));
+    assert.throws(start, /database is locked/);
+    assert.equal(existsSync(join(dir, CRASH_FILE)), true, '入队失败时标记保留');
+    failing = false;
+    start();
+    assert.deepEqual(sent, ['Error: boom']);
+    assert.equal(existsSync(join(dir, CRASH_FILE)), false);
+    start();
+    // A marker that could not be removed after its report was queued: read again, dropped by its key.
+    remove();
+    const again = installCrashGuard('交易服务', { dir, log: () => undefined, exit: () => undefined, now: () => 99, source });
+    source.emit('uncaughtException', new Error('boom'));
+    again();
+    start();
+    assert.deepEqual(sent, ['Error: boom'], '同一标记不重复报告');
+  } finally { remove(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('依赖巡检：告警入队失败时不记作已发，下一轮补发首报且只一次；恢复只跟在已入队的首报之后，入队失败也会重试', async () => {
+  const clock = { now: 0 };
+  const sent: string[] = [], logs: string[] = [];
+  let failing = false;
+  const state = { market: true, instance: 'm1', streams: [] as StreamRow[], perpetual: null as PerpetualStatusView | null };
+  const watch = createHealthWatch({
+    marketSocketPath: '/run/market.sock', now: () => clock.now, log: line => logs.push(line),
+    notify: text => { if (failing) throw new Error('database is locked'); sent.push(text); },
+    streams: () => state.streams, perpetual: () => state.perpetual,
+    probeMarket: async () => { if (!state.market) throw new Error('connect ECONNREFUSED'); return { instance: state.instance }; },
+  });
+  const step = async (ms: number) => { clock.now += ms; await watch.tick(); };
+  const venue = (status: string) => ({ running: true, venues: [{ id: 'binance', status, lastMessageAt: null, error: null }] } as unknown as PerpetualStatusView);
+
+  // Perpetual feed stalls (no repeat): the first post fails, the next tick posts it, once.
+  state.perpetual = venue('stale');
+  await step(0);
+  failing = true;
+  await step(FEED_DOWN_AFTER_MS);
+  assert.equal(sent.length, 0);
+  assert.equal(watch.view().incidents[0]?.alerted, false, '入队失败不算已告警');
+  assert.match(logs.at(-1)!, /未能入队/);
+  failing = false;
+  await step(1_000);
+  assert.equal(sent.filter(text => text.startsWith('【永续行情断流】')).length, 1);
+  await step(HEALTH_REPEAT_MS);
+  assert.equal(sent.filter(text => text.startsWith('【永续行情断流】')).length, 1, '无重复设置时不再发');
+  // Recovery fails to queue: kept open and retried, posted once.
+  failing = true;
+  state.perpetual = venue('live');
+  await step(1_000);
+  assert.equal(watch.view().incidents.length, 1, '恢复未入队前保留');
+  failing = false;
+  await step(1_000);
+  assert.equal(sent.filter(text => text.startsWith('【永续行情断流恢复】')).length, 1);
+  assert.equal(watch.view().incidents.length, 0);
+  await step(1_000);
+  assert.equal(sent.filter(text => text.startsWith('【永续行情断流恢复】')).length, 1);
+
+  // A user stream down: a failed first post is retried on the next tick, not after HEALTH_REPEAT_MS.
+  sent.length = 0;
+  state.streams = [{ account: 'a1', connected: false, since: null, lastError: null }];
+  await step(0);
+  failing = true;
+  await step(STREAM_DOWN_AFTER_MS);
+  failing = false;
+  await step(1_000);
+  assert.equal(sent.filter(text => text.startsWith('【ASTER 用户推送断开】')).length, 1);
+  // A recovery with no queued alert posts nothing.
+  state.streams = [{ account: 'a2', connected: false, since: null, lastError: null }];
+  await step(1_000);
+  state.streams = [{ account: 'a2', connected: true, since: 1, lastError: null }];
+  await step(1_000);
+  assert.ok(!sent.some(text => text.includes('账户 a2')), '未告警过的恢复不发');
+
+  // A market restart whose notice cannot be queued: the market still reads as up, the notice goes out next tick.
+  sent.length = 0;
+  failing = true;
+  state.instance = 'm2';
+  await step(1_000);
+  assert.equal(watch.view().market?.ok, true, '通知失败不当作行情不可达');
+  failing = false;
+  await step(1_000);
+  assert.equal(sent.filter(text => text.startsWith('【行情服务已重启】')).length, 1);
+  await step(1_000);
+  assert.equal(sent.filter(text => text.startsWith('【行情服务已重启】')).length, 1);
 });

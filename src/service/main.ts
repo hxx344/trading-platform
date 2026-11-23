@@ -52,7 +52,7 @@ import { createServiceLog, teeStream, type ServiceLog } from './service-log.ts';
 import { createReadTokens } from '../read-token.ts';
 import { createSummary, type Summary, type SummaryInput } from './summary.ts';
 import { createWatch, watchLoop, watchSummary, type Watch } from './watch.ts';
-import { installCrashGuard, takeCrashRecord } from '../crash-guard.ts';
+import { clearCrashRecord, crashReportKey, installCrashGuard, readCrashRecord } from '../crash-guard.ts';
 import { createHostStatus, processLoopHistogram } from '../host-status.ts';
 import { HEALTH_TICK_MS, createHealthWatch, type HealthWatch } from './health-watch.ts';
 import { newsLoop, newsViews, type NewsHolder } from './news.ts';
@@ -410,9 +410,11 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   const hynixCheck = oil && hynixBalance ? hynixBalanceCheck(oil, hynixBalance, { notify: text => notifier.notify(text), busy: hynixBusy(executor), log: line => process.stderr.write(`${line}\n`) }) : undefined;
   const oilText = `${oil ? `；原油执行账户 ${oil.config.accounts.length} 个` : ''}${options ? `；期权账户 1 个${options.running() ? '' : '（未启动，后台重试）'}` : ''}${crossex ? `；CrossEx 账户 1 个${crossex.runtime() ? '' : '（未启动，后台重试）'}` : ''}`;
   try {
-    // A crash skips the stop alert (crash-guard.ts): its marker is reported here, before the start alert.
-    const crash = takeCrashRecord(dir);
-    if (crash) notifier.notify(`【服务上次异常退出】北京时间 ${new Date(crash.at + 8 * 3600_000).toISOString().slice(0, 19).replace('T', ' ')}，${crash.kind === 'unhandledRejection' ? '未处理的 Promise 拒绝' : '未捕获的异常'}：${crash.message}${crash.stack ? `（${crash.stack.split('\n').slice(0, 3).join(' ← ')}）` : ''}。已由 systemd 重启，进行中的委托与划转按启动核对处理`);
+    // A crash skips the stop alert (crash-guard.ts): its marker is reported here, before the start alert, and removed only
+    // once the report is queued. Keyed, so a marker that could not be removed is not reported again next start.
+    const crash = readCrashRecord(dir);
+    if (crash) notifier.notifyOnce(crashReportKey(crash), `【服务上次异常退出】北京时间 ${new Date(crash.at + 8 * 3600_000).toISOString().slice(0, 19).replace('T', ' ')}，${crash.kind === 'unhandledRejection' ? '未处理的 Promise 拒绝' : '未捕获的异常'}：${crash.message}${crash.stack ? `（${crash.stack.split('\n').slice(0, 3).join(' ← ')}）` : ''}。已由 systemd 重启，进行中的委托与划转按启动核对处理`);
+    if (crash) clearCrashRecord(dir);
     notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}`);
     for (const text of warnings) notifier.notify(`【配置未生效】${text}`);
   } catch (error) { hynixBalance?.close(); oilPnl?.close(); oilRules?.close(); closeMonitorStore(); monitorOutbox?.close(); asset?.close(); samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }

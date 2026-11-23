@@ -61,16 +61,27 @@ export function installCrashGuard(name: string, { dir, log = line => process.std
   return () => { source.off('uncaughtException', onException); source.off('unhandledRejection', onRejection); };
 }
 
-/** Reads and removes the marker a crashed run left; null when there is none or it is unreadable (it is removed then too). */
-export function takeCrashRecord(dir: string): CrashRecord | null {
+/**
+ * The marker a crashed run left, kept until clearCrashRecord(): the caller removes it only once the report is queued, so
+ * a start whose notifier fails reports it on the next start. Null when there is none; an unreadable one is removed.
+ */
+export function readCrashRecord(dir: string): CrashRecord | null {
   const path = join(dir, CRASH_FILE);
   let text: string;
   try { text = readFileSync(path, 'utf8'); } catch { return null; }
-  try { rmSync(path, { force: true }); } catch { /* reported again next start at worst */ }
+  const unreadable = () => { clearCrashRecord(dir); return null; };
   try {
     const value = JSON.parse(text) as Partial<CrashRecord>;
     if (typeof value.at !== 'number' || typeof value.process !== 'string' || typeof value.message !== 'string'
-      || (value.kind !== 'uncaughtException' && value.kind !== 'unhandledRejection')) return null;
+      || (value.kind !== 'uncaughtException' && value.kind !== 'unhandledRejection')) return unreadable();
     return { at: value.at, process: value.process.slice(0, 40), kind: value.kind, message: value.message.slice(0, 300), stack: typeof value.stack === 'string' ? value.stack.slice(0, 1_200) : '' };
-  } catch { return null; }
+  } catch { return unreadable(); }
 }
+
+/** Removes the marker once its report is queued; a failure leaves it for the next start (whose report is keyed, crashReportKey). */
+export function clearCrashRecord(dir: string): void {
+  try { rmSync(join(dir, CRASH_FILE), { force: true }); } catch { /* reported to the notifier again next start, which drops it by key */ }
+}
+
+/** The once-key of a crash report: the same marker read on two starts is queued once. */
+export const crashReportKey = (record: CrashRecord) => `crash:${record.process}:${record.at}`;

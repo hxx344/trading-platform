@@ -211,10 +211,12 @@ export interface Sample {
    * 行情流当时不可用或 v0.81.0 以前的样本为 null。
    */
   rhBidRx: number | null; rhAskRx: number | null;
+  /** 判断时刻用 Var token 按名义金额询到的买卖价与 Var 给的报价时刻；没有 token、询价失败或该类别不询价时为 null（v0.82.0 起记录）。 */
+  varBidTk: number | null; varAskTk: number | null; varTkAt: number | null;
 }
 
 /**
- * 按判断时刻的 Lighter 一档重算的样本：Var 价不变，Lighter 各档整体平移到那一刻的一档上（冲击沿用对齐时的）。
+ * 按判断时刻的价重算的样本：Lighter 各档整体平移到那一刻的一档上（冲击沿用对齐时的）；Var 价在有 token 询价时换成询价，否则不变。
  * 没有记录那一刻的一档时返回 null。
  */
 export function executionSample(sample: Sample): Sample | null {
@@ -222,8 +224,15 @@ export function executionSample(sample: Sample): Sample | null {
   if (bid === null || ask === null || !(bid > 0) || ask < bid) return null;
   const down = (value: number | null) => value === null ? null : bid - Math.max(0, sample.rhBid0 - value);
   const up = (value: number | null) => value === null ? null : ask + Math.max(0, value - sample.rhAsk0);
-  return { ...sample, rhBid0: bid, rhAsk0: ask, rhBid1k: down(sample.rhBid1k), rhAsk1k: up(sample.rhAsk1k), rhBid100k: down(sample.rhBid100k), rhAsk100k: up(sample.rhAsk100k) };
+  const moved: Sample = { ...sample, rhBid0: bid, rhAsk0: ask, rhBid1k: down(sample.rhBid1k), rhAsk1k: up(sample.rhAsk1k), rhBid100k: down(sample.rhBid100k), rhAsk100k: up(sample.rhAsk100k) };
+  // 有 Var token 询价时 Var 一侧也换成判断时刻的价：它是按这个配对的名义金额询的，所以各档都用它。
+  const varBid = sample.varBidTk, varAsk = sample.varAskTk;
+  if (varBid === null || varAsk === null || !(varBid > 0) || varAsk < varBid) return moved;
+  return { ...moved, varBid0: varBid, varAsk0: varAsk, varBid1k: varBid, varAsk1k: varAsk, varBid100k: varBid, varAsk100k: varAsk };
 }
+
+/** 样本带不带可用的 Var token 询价。 */
+export const hasTokenQuote = (sample: Sample): boolean => sample.varBidTk !== null && sample.varAskTk !== null && sample.varBidTk > 0 && sample.varAskTk >= sample.varBidTk;
 
 export type SizeBucket = '1k' | '100k';
 /** 名义金额对应的报价档：不超过 1000 美元用 1k 档，更大用 100k 档（偏保守）。 */

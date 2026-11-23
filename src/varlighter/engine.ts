@@ -1,9 +1,10 @@
 // Var/Lighter 价差模块的运行时（docs/varlighter.md）：采集对齐样本、维护各标的基线、跑模拟盘，并给页面出视图。
 // 只读公开行情、只写自己的 varlighter.sqlite；不碰执行器、不下任何真实订单。
 import { anySignal } from '../any-signal.mjs';
+import { TOKEN_QUOTE_CONCURRENCY, TOKEN_QUOTE_MAX_AGE_MS, type TokenQuote, type VarQuoter } from './varquote.ts';
 import { backtestRequest, runBacktest } from './backtest.ts';
 import { LighterStream, MAX_DEPTH_MARKETS, depthAt, fetchDepth, fetchRhMarkets, fetchVarListings, type Connect, type DepthSnapshot, type FetchLike } from './feeds.ts';
-import { KIND_NAMES, PAIR_KEY, REGIME_NAMES, VENUES, VENUE_NAMES, bucketOf, midBasis, pairMarkets, regimeOf, regimesOf, sortPairs, spreadOf, tickerOf, venueOf, type PairInfo, type RhMarket, type Sample, type VarListing, type Venue } from './model.ts';
+import { KIND_NAMES, PAIR_KEY, REGIME_NAMES, VENUES, VENUE_NAMES, bucketOf, hasTokenQuote, midBasis, pairMarkets, regimeOf, regimesOf, sortPairs, spreadOf, tickerOf, venueOf, type PairInfo, type RhMarket, type Sample, type VarListing, type Venue } from './model.ts';
 import { orderPlan, type OrderPlan } from './plan.ts';
 import { BaselineTracker, suggestedEntryBps, symbolStats, type Baseline, type RegimeStats } from './stats.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, ParamsError, closePosition, closeSpread, confirmOpen, decide, openEconomics, slippageBudgetBps, positionSpread, fundingEstimate, markToMarket, openBlocker, openPosition, readGlobalParams, readSymbolParams,
@@ -35,7 +36,7 @@ export type { Settings } from './views.ts';
 const DEFAULT_SETTINGS: Settings = { revision: 0, global: DEFAULT_GLOBAL, symbols: {}, confirmed: [], venues: [...VENUES] };
 
 
-export interface EngineOptions { store: VarLighterStore; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; log?: (line: string) => void }
+export interface EngineOptions { store: VarLighterStore; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; log?: (line: string) => void; /** Var token 询价；不给就只用公开报价。 */ quoter?: VarQuoter }
 
 const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const dayStart = (time: number) => Math.floor(time / 86_400_000) * 86_400_000;
@@ -43,7 +44,7 @@ const dayStart = (time: number) => Math.floor(time / 86_400_000) * 86_400_000;
 /** 一个 Lighter 场所的运行状态：行情流（停用时为 null）、目录与盘口快照。 */
 interface VenueRuntime { venue: Venue; stream: LighterStream | null; markets: RhMarket[]; catalog: SourceState; nextCatalog: number; depth: Map<string, { marketId: number; snapshot: DepthSnapshot | null; error: string | null }> }
 
-export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now = Date.now, log = () => {} }: EngineOptions) {
+export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now = Date.now, log = () => {}, quoter }: EngineOptions) {
   const open = connect ?? (url => new WebSocket(url) as unknown as ReturnType<Connect>);
   let settings: Settings = normalizeSettings(store.state<Settings>('settings'));
   const venues = new Map<Venue, VenueRuntime>(VENUES.map(venue => [venue, { venue, stream: null, markets: [], catalog: { at: null, ok: null, error: null, count: 0 }, nextCatalog: 0, depth: new Map() }]));
@@ -151,6 +152,24 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     await Promise.all(jobs);
   }
 
+  /**
+   * 给要取盘口快照的配对（已启用或有持仓）各询一次 Var token 价，数量按该配对的名义金额与公开标记价折算。
+   * 没有可用 token 时一个请求也不发；单个失败只少这一个配对的询价，原因在询价状态里。
+   */
+  async function tokenQuotes(signal: AbortSignal, stats: PollStats): Promise<Map<string, TokenQuote>> {
+    const result = new Map<string, TokenQuote>();
+    if (!quoter?.usable()) return result;
+    const jobs: (() => Promise<void>)[] = [];
+    for (const runtime of venues.values()) for (const key of runtime.depth.keys()) {
+      const pair = pairOf(key), listing = pair && listings.get(pair.symbol);
+      if (!pair || !listing) continue;
+      jobs.push(() => quoter.quote(pair.kind, pair.symbol, paramsOf(key).notionalUsd, listing.mark, signal).then(quote => { result.set(key, quote); stats.tokenOk++; }, () => { stats.tokenFailed++; }));
+    }
+    const workers = Array.from({ length: Math.min(TOKEN_QUOTE_CONCURRENCY, jobs.length) }, async () => { for (let job = jobs.shift(); job; job = jobs.shift()) await job(); });
+    await Promise.all(workers);
+    return result;
+  }
+
   /** 拉一次 Var 报价：每个共同标的的新报价按报价时刻对齐 Lighter 当时的盘口，写库、计入基线、跑模拟盘。 */
   async function pollVar(signal: AbortSignal): Promise<void> {
     varSource.at = now();
@@ -161,8 +180,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     varSource.ok = receivedAt; varSource.error = null; varSource.count = fetched.length;
     listings = new Map(fetched.map(listing => [listing.ticker, listing]));
     rebuildPairs();
-    await refreshDepth(signal);
-    const stats: PollStats = { at: receivedAt, listings: fetched.length, fresh: 0, unchanged: 0, noQuote: 0, noLighter: 0, written: 0, noLive: 0, blocked: {} };
+    const stats: PollStats = { at: receivedAt, listings: fetched.length, fresh: 0, unchanged: 0, noQuote: 0, noLighter: 0, written: 0, noLive: 0, blocked: {}, tokenOk: 0, tokenFailed: 0 };
+    const [, asked] = await Promise.all([refreshDepth(signal), tokenQuotes(signal, stats)]);
     const fresh: { pair: PairInfo; sample: Sample }[] = [];
     for (const pair of pairs) {
       if (pair.identity === 'mismatch') continue;
@@ -177,12 +196,14 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       // 判断就发生在现在：记下这一刻的 Lighter 一档，模拟盘按它成交并复核信号。
       const live = runtime.stream?.topAt(pair.marketId, now()) ?? null;
       if (!live) stats.noLive++;
+      const token = asked.get(pair.key), tokenFresh = token && now() - token.at <= TOKEN_QUOTE_MAX_AGE_MS ? token : null;
       fresh.push({ pair, sample: {
         symbol: pair.key, t: quote.at, receivedAt, regime: regimeOf(pair.kind, quote.at),
         varMark: listing.mark, varBid0: quote.bid0, varAsk0: quote.ask0, varBid1k: quote.bid1k, varAsk1k: quote.ask1k, varBid100k: quote.bid100k, varAsk100k: quote.ask100k, varFunding: listing.fundingRate,
         rhAt: top.at, rhBid0: top.bid, rhAsk0: top.ask, rhMark: top.mark, rhIndex: top.index, rhFunding: top.funding,
         rhBid1k: depth?.bid1k ?? null, rhAsk1k: depth?.ask1k ?? null, rhBid100k: depth?.bid100k ?? null, rhAsk100k: depth?.ask100k ?? null,
         rhBidRx: live?.bid ?? null, rhAskRx: live?.ask ?? null,
+        varBidTk: tokenFresh?.bid ?? null, varAskTk: tokenFresh?.ask ?? null, varTkAt: tokenFresh?.at ?? null,
       } });
       ages.push(receivedAt - quote.at);
     }
@@ -228,7 +249,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
         const opened = openPosition(`p${now().toString(36)}-${(++sequence).toString(36)}`, confirmed.sample, params, confirmed.decision, baseline);
         positions.set(pair.key, opened);
         updateDepth();
-        store.openPosition(opened, { at: now(), kind: 'open', message: `${DIRECTION_NAMES[opened.direction]} ${fmt(opened.notionalUsd, 0)} 美元，价差 ${fmt(opened.entrySpread, 1)} 基点，基线 ${fmt(baseline.median, 1)}，偏离 ${fmt(confirmed.decision.deviation, 1)}（报价时刻 ${fmt(decision.deviation, 1)}）` });
+        store.openPosition(opened, { at: now(), kind: 'open', message: `${DIRECTION_NAMES[opened.direction]} ${fmt(opened.notionalUsd, 0)} 美元，价差 ${fmt(opened.entrySpread, 1)} 基点，基线 ${fmt(baseline.median, 1)}，偏离 ${fmt(confirmed.decision.deviation, 1)}（报价时刻 ${fmt(decision.deviation, 1)}）${hasTokenQuote(sample) ? '，Var 按 token 询价' : ''}` });
       }
     }
     track.push(sample);
@@ -300,7 +321,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     return {
       now: time, startedAt,
       sources: {
-        var: { ...varSource, poll: lastPoll, quoteAgeMedianMs: sortedAges.length ? sortedAges[Math.floor(sortedAges.length / 2)] : null },
+        var: { ...varSource, poll: lastPoll, quoteAgeMedianMs: sortedAges.length ? sortedAges[Math.floor(sortedAges.length / 2)] : null, token: quoter?.view() ?? null },
         venues: [...venues.values()].map((runtime): VenueStatus => ({
           venue: runtime.venue, name: VENUE_NAMES[runtime.venue], enabled: settings.venues.includes(runtime.venue), catalog: runtime.catalog,
           stream: runtime.stream?.status(runtime.markets.length) ?? null,
@@ -536,11 +557,16 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     const totals = store.totals();
     items.push({ key: 'paper', status: totals.trades >= READY_PAPER_TRADES && totals.netUsd > 0 ? 'ok' : 'warn', label: `模拟盘至少 ${READY_PAPER_TRADES} 笔且净盈利`, detail: `${totals.trades} 笔，净 ${fmt(totals.netUsd, 2)} 美元，胜率 ${totals.trades ? fmt(totals.wins / totals.trades * 100, 0) : '-'}%` });
     const age = view.sources.var.quoteAgeMedianMs;
-    items.push({ key: 'latency', status: age !== null && age < 45_000 ? 'ok' : 'warn', label: 'Var 报价时效', detail: age === null ? '还没有样本' : `公开报价收到时已过去 ${fmt(age / 1000, 0)} 秒（中位数）；实盘须改用登录后的实时询价` });
+    // 有 token 询价且最近三轮内成功过，就按询价的延迟算；否则仍看公开报价的中位延迟。
+    const token = view.sources.var.token, tokenLive = token?.status === 'ready' && token.okAt !== null && time - token.okAt <= 3 * VAR_POLL_MS && token.lagMs !== null;
+    const publicAge = age === null ? '还没有样本' : `公开报价收到时已过去 ${fmt(age / 1000, 0)} 秒（中位数）`;
+    items.push({ key: 'latency', status: tokenLive || (age !== null && age < 45_000) ? 'ok' : 'warn', label: 'Var 报价时效', detail: tokenLive
+      ? `判断时刻用 token 询价，收到时距 Var 报价时刻 ${fmt(token.lagMs! / 1000, 1)} 秒；信号仍按公开报价发现，${publicAge}`
+      : `${publicAge}；${token ? `Var token 询价${token.statusName}${token.error ? `（${token.error}）` : ''}，` : ''}实盘须用登录后的实时询价` });
     items.push({ key: 'limits', status: 'ok', label: '风控限额', detail: `最多 ${settings.global.maxOpenPositions} 笔，名义合计 ≤ ${fmt(settings.global.maxTotalNotionalUsd, 0)} 美元，当日亏损 ≤ ${fmt(settings.global.dailyLossLimitUsd, 0)} 美元` });
     const orderVenues = [...new Set(enabled.map(row => row.venueName))];
     items.push({ key: 'lighter_order', status: 'todo', label: 'Lighter 下单连接器', detail: `RH 链与主网是两套账户：各需账户编号、API 密钥编号与私钥，以及签名器（官方 Go 签名库或 WASM）；${orderVenues.length ? `已启用标的用到 ${orderVenues.join('、')}；` : ''}尚未接入` });
-    items.push({ key: 'var_order', status: 'todo', label: 'Var 下单接口', detail: 'Var 没有公开交易接口；需要确认登录会话的询价与成交接口、各类标的的合约参数格式；尚未接入' });
+    items.push({ key: 'var_order', status: 'todo', label: 'Var 下单接口', detail: 'Var 没有公开交易接口；询价已可用 token 读取（各类标的的写法以实盘准备页的询价状态为准），成交接口尚未确认、尚未接入' });
     items.push({ key: 'funding', status: 'todo', label: '两边账户资金', detail: '两边各需 USDC 保证金；按单笔名义金额与杠杆核算，并留出单腿风险的余量' });
     items.push({ key: 'monitor', status: 'todo', label: '实盘监控与告警', detail: '单腿、持仓不一致、亏损上限触发时的飞书告警，接入下单后补上' });
     return { now: time, items, ready: items.every(item => item.status === 'ok') };

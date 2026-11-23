@@ -22,12 +22,32 @@ PATHS = {
 MAX_INPUT_BYTES = 32_768
 MAX_BODY_BYTES = 2_000_000
 RESPONSE_HEADERS = ("content-type", "x-omni-auth", "cf-mitigated")
+UNDERLYING = re.compile(r"[A-Z0-9]{1,16}\Z")
+QTY = re.compile(r"(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,8})?\Z")
 COOKIE = re.compile(r"vr-token=[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\Z")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def indicative_instrument(instrument):
+    """The only instruments a quote may name, rebuilt field by field: the oil pair, and the three shapes
+    the Var/Lighter module quotes (src/monitor/variational-transport.ts checks the same)."""
+    if not isinstance(instrument, dict) or instrument.get("settlement_asset") != "USDC":
+        raise ValueError()
+    underlying = instrument.get("underlying")
+    if not isinstance(underlying, str) or UNDERLYING.fullmatch(underlying) is None:
+        raise ValueError()
+    kind, interval = instrument.get("kind"), instrument.get("funding_interval_s")
+    if (instrument.get("instrument_type") == "perpetual_rwa_future" and isinstance(kind, str) and kind in ("commodity", "equity")
+            and set(instrument) == {"underlying", "instrument_type", "settlement_asset", "kind"}):
+        return {"underlying": underlying, "instrument_type": "perpetual_rwa_future", "settlement_asset": "USDC", "kind": kind}
+    if (instrument.get("instrument_type") == "perpetual_future" and type(interval) is int and interval == 3600
+            and set(instrument) == {"underlying", "instrument_type", "settlement_asset", "funding_interval_s"}):
+        return {"underlying": underlying, "instrument_type": "perpetual_future", "settlement_asset": "USDC", "funding_interval_s": 3600}
+    raise ValueError()
 
 
 def request_definition(value):
@@ -57,16 +77,13 @@ def request_definition(value):
     body = None
     if method == "POST":
         submitted = value["body"]
-        if not isinstance(submitted, dict) or set(submitted) != {"instrument", "qty"} or submitted["qty"] != "1":
+        if not isinstance(submitted, dict) or set(submitted) != {"instrument", "qty"}:
             raise ValueError()
-        instrument = submitted["instrument"]
-        if not isinstance(instrument, dict) or instrument.get("underlying") not in ("BZ", "CL"):
+        fixed = indicative_instrument(submitted["instrument"])
+        qty = submitted["qty"]
+        if not isinstance(qty, str) or QTY.fullmatch(qty) is None or re.search(r"[1-9]", qty) is None:
             raise ValueError()
-        fixed = {"underlying": instrument["underlying"], "instrument_type": "perpetual_rwa_future",
-                 "settlement_asset": "USDC", "kind": "commodity"}
-        if instrument != fixed:
-            raise ValueError()
-        body = json.dumps({"instrument": fixed, "qty": "1"}, separators=(",", ":")).encode("utf-8")
+        body = json.dumps({"instrument": fixed, "qty": qty}, separators=(",", ":")).encode("utf-8")
     elif value["body"] is not None:
         raise ValueError()
     return urllib.request.Request(value["url"], data=body, headers=expected, method=method)

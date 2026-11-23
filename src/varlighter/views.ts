@@ -10,7 +10,11 @@ import type { ClosedTrade, Direction, GlobalParams, Position, SymbolParams } fro
 export interface Settings { revision: number; global: GlobalParams; symbols: Record<string, SymbolParams>; confirmed: string[]; venues: Venue[] }
 export interface SourceState { at: number | null; ok: number | null; error: string | null; count: number }
 export interface PollStats { at: number; listings: number; fresh: number; unchanged: number; noQuote: number; noLighter: number; written: number;
-  /** 新样本里没取到判断时刻 Lighter 一档的条数，以及这一轮达到入场偏离却没开仓的次数（按原因）。 */ noLive: number; blocked: Record<string, number> }
+  /** 新样本里没取到判断时刻 Lighter 一档的条数，以及这一轮达到入场偏离却没开仓的次数（按原因）。 */ noLive: number; blocked: Record<string, number>;
+  /** 这一轮的 Var token 询价：成功、失败的次数（没有可用 token 时都是 0）。 */ tokenOk: number; tokenFailed: number }
+export type TokenStatus = 'missing' | 'expired' | 'ready' | 'rejected' | 'unavailable';
+/** Var token 询价的状态：不含 token。`lagMs` 是最近一次成功询价收到时距 Var 报价时刻的毫秒数。 */
+export interface TokenView { status: TokenStatus; statusName: string; expiresAt: number | null; error: string | null; okAt: number | null; lagMs: number | null }
 export interface LighterStatus {
   connected: boolean; connectedAt: number | null; lastMessageAt: number | null; reconnects: number; lastError: string | null;
   markets: number; bytes: number; bytesSince: number | null;
@@ -41,7 +45,7 @@ export interface OrphanRow {
 }
 export interface StateView {
   now: number; startedAt: number;
-  sources: { var: SourceState & { poll: PollStats | null; quoteAgeMedianMs: number | null }; venues: VenueStatus[] };
+  sources: { var: SourceState & { poll: PollStats | null; quoteAgeMedianMs: number | null; /** 没有接询价（如预览）时为 null。 */ token: TokenView | null }; venues: VenueStatus[] };
   firstSampleAt: number | null;
   rows: StateRow[];
   /** 已启用或有持仓、但不在当前配对里的键。 */

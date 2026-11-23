@@ -1,6 +1,6 @@
-// 价差回归策略（docs/varlighter.md 第 5 节）：参数、开平仓判断与盈亏。回测（backtest.ts）与模拟盘（paper.ts）共用，
+// 价差回归策略（docs/varlighter.md 第 5 节）：参数、开平仓判断与盈亏。回测（backtest.ts）与模拟盘（engine.ts）共用，
 // 只有纯计算，不读写存储。
-import { REGIMES, bucketOf, spreadOf, type Regime, type Sample, type Spread } from './model.ts';
+import { REGIMES, bucketOf, executionSample, spreadOf, type Regime, type Sample, type Spread } from './model.ts';
 import type { Baseline } from './stats.ts';
 
 /** var_rich：Var 相对偏贵，卖 Var、买 Lighter；var_cheap：买 Var、卖 Lighter。 */
@@ -25,6 +25,7 @@ export interface GlobalParams {
   /** 两边每次成交的手续费（基点）。公开目录 2026-11-22 显示 Lighter RH 标准账户为 0；Var 不收交易手续费，价差即成本。 */
   varFeeBps: number; rhFeeBps: number;
   /** Var 报价收到时已过去的时间上限（秒），超过不开仓。 */ maxQuoteAgeSec: number;
+  /** 预期净利（偏离 − 出场 − 半个往返成本 − 四次成交的滑点与手续费，基点）低于这个数不开仓。 */ minNetBps: number;
   maxOpenPositions: number;
   /** 所有持仓名义金额合计上限（美元）。 */ maxTotalNotionalUsd: number;
   /** 当日（UTC）已实现净亏损达到这个数（美元）后当天不再开仓。 */ dailyLossLimitUsd: number;
@@ -32,7 +33,7 @@ export interface GlobalParams {
 }
 
 export const DEFAULT_SYMBOL: SymbolParams = { enabled: false, notionalUsd: 1000, entryBps: 15, exitBps: 0, stopBps: 60, maxHoldMinutes: 720, cooldownMinutes: 10, regimes: [...REGIMES], directions: ['var_rich', 'var_cheap'] };
-export const DEFAULT_GLOBAL: GlobalParams = { windowHours: 24, minSamples: 120, slippageBps: 1, varFeeBps: 0, rhFeeBps: 0, maxQuoteAgeSec: 90, maxOpenPositions: 5, maxTotalNotionalUsd: 10_000, dailyLossLimitUsd: 100, paused: false };
+export const DEFAULT_GLOBAL: GlobalParams = { windowHours: 24, minSamples: 120, slippageBps: 1, varFeeBps: 0, rhFeeBps: 0, maxQuoteAgeSec: 30, minNetBps: 3, maxOpenPositions: 5, maxTotalNotionalUsd: 10_000, dailyLossLimitUsd: 100, paused: false };
 
 export class ParamsError extends Error { readonly status = 400; }
 const fail = (message: string): never => { throw new ParamsError(message); };
@@ -86,6 +87,7 @@ export function readGlobalParams(value: unknown, base: GlobalParams = DEFAULT_GL
     varFeeBps: num(pick('varFeeBps'), 0, 100, 'Var 手续费'),
     rhFeeBps: num(pick('rhFeeBps'), 0, 100, 'Lighter 手续费'),
     maxQuoteAgeSec: num(pick('maxQuoteAgeSec'), 5, 600, '报价时效', true),
+    minNetBps: num(pick('minNetBps'), 0, 500, '最低预期净利'),
     maxOpenPositions: num(pick('maxOpenPositions'), 1, 100, '最多持仓数', true),
     maxTotalNotionalUsd: num(pick('maxTotalNotionalUsd'), 10, 10_000_000, '名义合计上限'),
     dailyLossLimitUsd: num(pick('dailyLossLimitUsd'), 1, 10_000_000, '当日亏损上限'),
@@ -193,16 +195,64 @@ export function fundingEstimate(position: Position, until: number, varAnnual: nu
   return varUsd + rhUsd;
 }
 
-/** 开仓前的风控与时效检查；返回不开仓的原因，可以开则为 null。回测与模拟盘共用。 */
-/** varBusy：同一个 Var 代码已在另一个 Lighter 场所有持仓。Var 的持仓按代码合并，两笔反向会互相抵消，所以每个代码同时只开一笔。 */
-export interface GateContext { openPositions: number; openNotionalUsd: number; dailyNetUsd: number; cooldownUntil: number; eligible: boolean; varBusy?: boolean }
+/**
+ * 这次开仓的预期净利（基点）：平仓时中间价回到「基线 + 出场偏离」，可成交价还差半个往返成本，再扣四次成交
+ * （两腿开平各一次）的滑点与手续费。往返成本按开仓时的算。
+ */
+export function expectedNetBps(decision: Extract<Decision, { kind: 'open' }>, params: Pick<SymbolParams, 'exitBps'>, global: Pick<GlobalParams, 'slippageBps' | 'varFeeBps' | 'rhFeeBps'>): number {
+  const halfCost = (decision.spread.buyVar - decision.spread.sellVar) / 2;
+  return decision.deviation - params.exitBps - halfCost - 4 * global.slippageBps - 2 * (global.varFeeBps + global.rhFeeBps);
+}
+
+/**
+ * 实盘每条腿每次成交的限价保护（基点）：偏离刚好等于入场线时，四次成交把保护用满后仍剩最低净利，
+ * 即（入场 − 出场 − 半个往返成本 − 手续费 − 最低净利）÷ 4，限在 1 到 10 基点。算出来不足 1 时取 1，
+ * 这时保护用满会低于最低净利（这样的机会本来也过不了预期净利门槛）。
+ */
+export function slippageBudgetBps(params: Pick<SymbolParams, 'entryBps' | 'exitBps'>, global: Pick<GlobalParams, 'minNetBps' | 'varFeeBps' | 'rhFeeBps'>, halfCostBps: number): number {
+  return Math.min(10, Math.max(1, (params.entryBps - params.exitBps - Math.max(0, halfCostBps) - 2 * (global.varFeeBps + global.rhFeeBps) - global.minNetBps) / 4));
+}
+
+export const DECAYED = '拿到报价时信号已消失', NO_LIVE_TOP = '缺少判断时刻的 Lighter 一档';
+/**
+ * 开仓复核：信号按 Var 报价时刻的样本算出，拿到报价时已过去约 20 秒。按判断时刻的 Lighter 一档重算，
+ * 方向不变且仍达到入场偏离才开，并按那一刻的价成交。requireLive 为假（回测旧样本）时没有记录就沿用原样本。
+ * 返回字符串是不开仓的原因。
+ */
+export function confirmOpen(sample: Sample, baseline: Baseline, params: SymbolParams, decision: Extract<Decision, { kind: 'open' }>, requireLive: boolean): { sample: Sample; decision: Extract<Decision, { kind: 'open' }> } | string {
+  const live = executionSample(sample);
+  if (!live) return requireLive ? NO_LIVE_TOP : { sample, decision };
+  const again = decide(live, baseline, params, null);
+  return again.kind === 'open' && again.direction === decision.direction ? { sample: live, decision: again } : DECAYED;
+}
+/** 平仓成交价：有判断时刻的 Lighter 一档就按它算，没有则用样本本身的。 */
+export function closeSpread(sample: Sample, position: Position, fallback: Spread): Spread {
+  const live = executionSample(sample);
+  return (live && positionSpread(live, position.notionalUsd)) ?? fallback;
+}
+
+/**
+ * 开仓前的风控与时效检查；返回不开仓的原因，可以开则为 null。回测与模拟盘共用。
+ * varBusy：同一个 Var 代码已在另一个 Lighter 场所有持仓。Var 的持仓按代码合并，两笔反向会互相抵消，所以每个代码同时只开一笔。
+ * fallbackBaseline：本时段样本不足、基线退回了全天窗口。时段刚切换（周一开盘、进周末）时全天窗口里是上一个时段的基差，不开仓。
+ * expectedNetBps：见 expectedNetBps()。costBps：开仓时的往返成本（买 Var 价差 − 卖 Var 价差）；开仓后按可成交价的浮亏
+ * 一开始就等于它，达到止损线的话下一个样本就止损，所以不开。
+ */
+export interface GateContext { openPositions: number; openNotionalUsd: number; dailyNetUsd: number; cooldownUntil: number; eligible: boolean; varBusy?: boolean; fallbackBaseline?: boolean; expectedNetBps?: number; costBps?: number }
+export const FALLBACK_BLOCK = '本时段基线样本不足（全天基线不开仓）', THIN_BLOCK = '预期净利不足', COST_BLOCK = '往返成本已达止损线';
+/** 复核后的开仓决定对应的两个门槛读数。 */
+export const openEconomics = (decision: Extract<Decision, { kind: 'open' }>, params: Pick<SymbolParams, 'exitBps'>, global: Pick<GlobalParams, 'slippageBps' | 'varFeeBps' | 'rhFeeBps'>) =>
+  ({ expectedNetBps: expectedNetBps(decision, params, global), costBps: decision.spread.buyVar - decision.spread.sellVar });
 export function openBlocker(sample: Sample, params: SymbolParams, global: GlobalParams, context: GateContext): string | null {
   if (global.paused) return '已暂停';
   if (!params.enabled) return '未启用';
   if (!context.eligible) return '规格未确认';
   if (!params.regimes.includes(sample.regime)) return '当前时段不开仓';
+  if (context.fallbackBaseline) return FALLBACK_BLOCK;
   if (sample.receivedAt - sample.t > global.maxQuoteAgeSec * 1000) return 'Var 报价过旧';
   if (sample.t < context.cooldownUntil) return '冷却中';
+  if (context.costBps !== undefined && context.costBps >= params.stopBps) return COST_BLOCK;
+  if (context.expectedNetBps !== undefined && context.expectedNetBps < global.minNetBps) return THIN_BLOCK;
   if (context.varBusy) return '同一 Var 代码已在另一场所持仓';
   if (context.openPositions >= global.maxOpenPositions) return '持仓数已满';
   if (context.openNotionalUsd + params.notionalUsd > global.maxTotalNotionalUsd) return '名义合计将超上限';

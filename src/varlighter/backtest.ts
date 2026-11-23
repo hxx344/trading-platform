@@ -2,7 +2,7 @@
 // 基线在每个样本判断之后才把该样本计入，不看未来；from 之前的样本只用来预热基线。
 import { PAIR_KEY, bucketOf, spreadOf, type AssetKind, type Sample } from './model.ts';
 import { BaselineTracker } from './stats.ts';
-import { DEFAULT_SYMBOL, ParamsError, closePosition, decide, fundingEstimate, openBlocker, openPosition, readGlobalParams, readSymbolParams, type ClosedTrade, type GlobalParams, type Position, type SymbolParams } from './strategy.ts';
+import { DEFAULT_SYMBOL, ParamsError, closePosition, closeSpread, confirmOpen, decide, fundingEstimate, openEconomics, openBlocker, openPosition, readGlobalParams, readSymbolParams, type ClosedTrade, type GlobalParams, type Position, type SymbolParams } from './strategy.ts';
 
 export interface BacktestSummary {
   trades: number; wins: number; winRate: number | null;
@@ -27,6 +27,7 @@ export function runBacktest(symbol: string, kind: AssetKind, samples: readonly S
   let position: Position | null = null, cooldownUntil = 0, evaluated = 0, counted = 0, cumulative = 0, peak = 0, maxDrawdown = 0;
   let day = -1, dayNet = 0, sequence = 0;
   let last: Sample | null = null;
+  const liveFrom = samples.find(sample => sample.rhBidRx !== null && sample.rhAskRx !== null)?.t ?? Infinity;
   for (const sample of samples) {
     if (sample.t > to) break;
     if (sample.t >= from) {
@@ -37,7 +38,7 @@ export function runBacktest(symbol: string, kind: AssetKind, samples: readonly S
       if (baseline) evaluated++;
       const decision = decide(sample, baseline, effective, position);
       if (decision.kind === 'close' && position) {
-        const trade = closePosition(position, sample.t, decision.spread, decision.reason, settings, fundingEstimate(position, sample.t, sample.varFunding, sample.rhFunding));
+        const trade = closePosition(position, sample.t, closeSpread(sample, position, decision.spread), decision.reason, settings, fundingEstimate(position, sample.t, sample.varFunding, sample.rhFunding));
         trades.push(trade);
         cumulative += trade.netUsd; dayNet += trade.netUsd;
         peak = Math.max(peak, cumulative); maxDrawdown = Math.max(maxDrawdown, peak - cumulative);
@@ -45,9 +46,13 @@ export function runBacktest(symbol: string, kind: AssetKind, samples: readonly S
         position = null;
         cooldownUntil = sample.t + params.cooldownMinutes * 60_000;
       } else if (decision.kind === 'open' && baseline) {
-        const reason = openBlocker(sample, effective, settings, { openPositions: 0, openNotionalUsd: 0, dailyNetUsd: dayNet, cooldownUntil, eligible: true });
+        // 与模拟盘同序：先按判断时刻的 Lighter 一档复核，再过风控。开始记录那一刻一档（liveFrom）之前的旧样本沿用样本本身；
+        // 之后的样本没有它说明当时行情流不可用，与模拟盘一样不开仓。
+        const confirmed = confirmOpen(sample, baseline, effective, decision, sample.t >= liveFrom);
+        const reason = typeof confirmed === 'string' ? confirmed : openBlocker(sample, effective, settings, {
+          openPositions: 0, openNotionalUsd: 0, dailyNetUsd: dayNet, cooldownUntil, eligible: true, fallbackBaseline: baseline.fallback, ...openEconomics(confirmed.decision, effective, settings) });
         if (reason) blocked[reason] = (blocked[reason] ?? 0) + 1;
-        else position = openPosition(`bt-${++sequence}`, sample, effective, decision, baseline);
+        else if (typeof confirmed !== 'string') position = openPosition(`bt-${++sequence}`, confirmed.sample, effective, confirmed.decision, baseline);
       }
       last = sample;
     }
@@ -55,7 +60,7 @@ export function runBacktest(symbol: string, kind: AssetKind, samples: readonly S
   }
   let openMarkUsd: number | null = null;
   if (position && last) {
-    const spread = spreadOf(last, bucketOf(position.notionalUsd));
+    const quoted = spreadOf(last, bucketOf(position.notionalUsd)), spread = quoted && closeSpread(last, position, quoted);
     if (spread) openMarkUsd = closePosition(position, last.t, spread, 'manual', settings, null).netUsd;
   }
   const wins = trades.filter(trade => trade.netUsd > 0).length;

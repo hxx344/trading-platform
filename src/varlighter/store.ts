@@ -9,12 +9,12 @@ export const VARLIGHTER_FILE = 'varlighter.sqlite';
 export const SAMPLE_RETENTION_DAYS = 14;
 
 const COLUMNS = ['symbol', 't', 'received_at', 'regime', 'var_mark', 'var_bid0', 'var_ask0', 'var_bid1k', 'var_ask1k', 'var_bid100k', 'var_ask100k', 'var_funding',
-  'rh_at', 'rh_bid0', 'rh_ask0', 'rh_mark', 'rh_index', 'rh_funding', 'rh_bid1k', 'rh_ask1k', 'rh_bid100k', 'rh_ask100k'] as const;
+  'rh_at', 'rh_bid0', 'rh_ask0', 'rh_mark', 'rh_index', 'rh_funding', 'rh_bid1k', 'rh_ask1k', 'rh_bid100k', 'rh_ask100k', 'rh_bid_rx', 'rh_ask_rx'] as const;
 type Row = Record<typeof COLUMNS[number], unknown>;
 
 const toRow = (sample: Sample): (string | number | null)[] => [sample.symbol, sample.t, sample.receivedAt, sample.regime, sample.varMark, sample.varBid0, sample.varAsk0,
   sample.varBid1k, sample.varAsk1k, sample.varBid100k, sample.varAsk100k, sample.varFunding, sample.rhAt, sample.rhBid0, sample.rhAsk0, sample.rhMark, sample.rhIndex,
-  sample.rhFunding, sample.rhBid1k, sample.rhAsk1k, sample.rhBid100k, sample.rhAsk100k];
+  sample.rhFunding, sample.rhBid1k, sample.rhAsk1k, sample.rhBid100k, sample.rhAsk100k, sample.rhBidRx, sample.rhAskRx];
 const nullable = (value: unknown): number | null => typeof value === 'number' ? value : null;
 const fromRow = (row: Row): Sample => ({
   symbol: row.symbol as string, t: row.t as number, receivedAt: row.received_at as number, regime: row.regime as Regime,
@@ -22,6 +22,7 @@ const fromRow = (row: Row): Sample => ({
   varBid100k: nullable(row.var_bid100k), varAsk100k: nullable(row.var_ask100k), varFunding: nullable(row.var_funding),
   rhAt: row.rh_at as number, rhBid0: row.rh_bid0 as number, rhAsk0: row.rh_ask0 as number, rhMark: nullable(row.rh_mark), rhIndex: nullable(row.rh_index), rhFunding: nullable(row.rh_funding),
   rhBid1k: nullable(row.rh_bid1k), rhAsk1k: nullable(row.rh_ask1k), rhBid100k: nullable(row.rh_bid100k), rhAsk100k: nullable(row.rh_ask100k),
+  rhBidRx: nullable(row.rh_bid_rx), rhAskRx: nullable(row.rh_ask_rx),
 });
 
 export interface StoredEvent { id: number; at: number; kind: string; symbol: string | null; message: string }
@@ -41,6 +42,9 @@ export function openVarLighterStore(file: string) {
     CREATE INDEX IF NOT EXISTS paper_trades_closed ON paper_trades(closed_at);
     CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, kind TEXT NOT NULL, symbol TEXT, message TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, json TEXT NOT NULL, updated_at INTEGER NOT NULL);`);
+    // v0.81.0：判断时刻的 Lighter 一档。只加可空列；旧版本按列名读写，回退后照常用（docs/varlighter.md 第 11 节）。
+    const existing = new Set((db.prepare('PRAGMA table_info(samples)').all() as { name: string }[]).map(column => column.name));
+    for (const column of ['rh_bid_rx', 'rh_ask_rx']) if (!existing.has(column)) db.exec(`ALTER TABLE samples ADD COLUMN ${column} REAL`);
   } catch (error) { db.close(); throw error; }
   const insertSample = db.prepare(`INSERT OR IGNORE INTO samples(${COLUMNS.join(', ')}) VALUES (${COLUMNS.map(() => '?').join(', ')})`);
   const selectRange = db.prepare(`SELECT ${COLUMNS.join(', ')} FROM samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t`);

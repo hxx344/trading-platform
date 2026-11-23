@@ -82,7 +82,7 @@ function SourcesPanel({ view, onChanged }: { view: StateView; onChanged: () => P
     {write.message ? <div className="vl-actions"><Callout tone={write.message.tone}>{write.message.text}</Callout></div> : null}
     <div className="vl-table"><table><tbody>
       <tr><td>Var 公开报价</td><td className="wrap">{varSource.error ? <span className="vl-down">{varSource.error}</span> : `${age(varSource.ok, now)} · ${varSource.count} 个标的`}
-        {poll ? <small>上次：新报价 {poll.fresh}，未变 {poll.unchanged}，无报价 {poll.noQuote}，Lighter 无盘口 {poll.noLighter}，写入 {poll.written}</small> : null}
+        {poll ? <small>上次：新报价 {poll.fresh}，未变 {poll.unchanged}，无报价 {poll.noQuote}，Lighter 无盘口 {poll.noLighter}，写入 {poll.written}，缺判断时刻一档 {poll.noLive ?? 0}{Object.entries(poll.blocked ?? {}).map(([reason, count]) => `；${reason} ${count}`).join('')}</small> : null}
         <small>报价收到时已过去 {varSource.quoteAgeMedianMs === null ? '—' : `${plain(varSource.quoteAgeMedianMs / 1000, 0)} 秒`}（中位数）</small></td></tr>
       {venues.map(status => <VenueRow key={status.venue} status={status} now={now} busy={write.busy}
         locked={status.enabled && enabled.length === 1} onToggle={() => toggle(status)} />)}

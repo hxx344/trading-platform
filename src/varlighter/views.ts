@@ -9,7 +9,8 @@ import type { ClosedTrade, Direction, GlobalParams, Position, SymbolParams } fro
 /** symbols 与 confirmed 都按配对键「场所:代码」；venues 是正在采集的 Lighter 场所。 */
 export interface Settings { revision: number; global: GlobalParams; symbols: Record<string, SymbolParams>; confirmed: string[]; venues: Venue[] }
 export interface SourceState { at: number | null; ok: number | null; error: string | null; count: number }
-export interface PollStats { at: number; listings: number; fresh: number; unchanged: number; noQuote: number; noLighter: number; written: number }
+export interface PollStats { at: number; listings: number; fresh: number; unchanged: number; noQuote: number; noLighter: number; written: number;
+  /** 新样本里没取到判断时刻 Lighter 一档的条数，以及这一轮达到入场偏离却没开仓的次数（按原因）。 */ noLive: number; blocked: Record<string, number> }
 export interface LighterStatus {
   connected: boolean; connectedAt: number | null; lastMessageAt: number | null; reconnects: number; lastError: string | null;
   markets: number; bytes: number; bytesSince: number | null;

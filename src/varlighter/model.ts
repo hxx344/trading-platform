@@ -206,6 +206,23 @@ export interface Sample {
   /** 每小时资金费率（小数），正数多头付费。 */ rhFunding: number | null;
   /** 1k / 100k 美元的成交均价：对齐的一档价加上最近一次盘口快照里的冲击（见 feeds.ts）；没有快照时为 null。 */
   rhBid1k: number | null; rhAsk1k: number | null; rhBid100k: number | null; rhAsk100k: number | null;
+  /**
+   * 本机拿到这条 Var 报价、开始判断那一刻的 Lighter 一档（比 rhAt 晚约 20 秒以上）。模拟盘与回测按它成交并复核信号；
+   * 行情流当时不可用或 v0.81.0 以前的样本为 null。
+   */
+  rhBidRx: number | null; rhAskRx: number | null;
+}
+
+/**
+ * 按判断时刻的 Lighter 一档重算的样本：Var 价不变，Lighter 各档整体平移到那一刻的一档上（冲击沿用对齐时的）。
+ * 没有记录那一刻的一档时返回 null。
+ */
+export function executionSample(sample: Sample): Sample | null {
+  const bid = sample.rhBidRx, ask = sample.rhAskRx;
+  if (bid === null || ask === null || !(bid > 0) || ask < bid) return null;
+  const down = (value: number | null) => value === null ? null : bid - Math.max(0, sample.rhBid0 - value);
+  const up = (value: number | null) => value === null ? null : ask + Math.max(0, value - sample.rhAsk0);
+  return { ...sample, rhBid0: bid, rhAsk0: ask, rhBid1k: down(sample.rhBid1k), rhAsk1k: up(sample.rhAsk1k), rhBid100k: down(sample.rhBid100k), rhAsk100k: up(sample.rhAsk100k) };
 }
 
 export type SizeBucket = '1k' | '100k';

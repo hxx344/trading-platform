@@ -5,6 +5,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { COST_BLOCK, DECAYED, FALLBACK_BLOCK, NO_LIVE_TOP, THIN_BLOCK, closeSpread, confirmOpen, expectedNetBps, slippageBudgetBps } from '../src/varlighter/strategy.ts';
+import { executionSample } from '../src/varlighter/model.ts';
 import { pairMarkets, parsePairKey, parseRhMarkets, parseVarListings, parseVarQuote, regimeOf, spreadOf, midBasis, type Sample } from '../src/varlighter/model.ts';
 import { BaselineTracker, RollingWindow, regimeStats, suggestedEntryBps } from '../src/varlighter/stats.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, closePosition, decide, openBlocker, openPosition, positionSpread, readGlobalParams, readSymbolParams, type Position, type SymbolParams } from '../src/varlighter/strategy.ts';
@@ -22,7 +25,7 @@ function sample(t: number, varMid: number, rhMid = 100, extra: Partial<Sample> =
     symbol: 'BTC', t, receivedAt: t + 1_000, regime: 'all', varMark: varMid,
     varBid0: varMid - 0.01, varAsk0: varMid + 0.01, varBid1k: varMid - 0.02, varAsk1k: varMid + 0.02, varBid100k: varMid - 0.05, varAsk100k: varMid + 0.05, varFunding: 0.1,
     rhAt: t - 500, rhBid0: rhMid - 0.01, rhAsk0: rhMid + 0.01, rhMark: rhMid, rhIndex: rhMid, rhFunding: 0.0001,
-    rhBid1k: rhMid - 0.02, rhAsk1k: rhMid + 0.02, rhBid100k: null, rhAsk100k: null, ...extra,
+    rhBid1k: rhMid - 0.02, rhAsk1k: rhMid + 0.02, rhBid100k: null, rhAsk100k: null, rhBidRx: rhMid - 0.01, rhAskRx: rhMid + 0.01, ...extra,
   };
 }
 
@@ -190,6 +193,119 @@ test('回测：基差冲高时卖 Var，回到基线平仓；只用当时以前�
   assert.equal(backtestRequest({ symbol: 'lighter:BTC', hours: 24, params: { entryBps: 30 } }, {}, DEFAULT_GLOBAL).params.entryBps, 30);
 });
 
+test('开仓复核：按判断时刻的 Lighter 一档重算，信号消失不开、仍成立按那一刻的价成交；全天基线与预期净利不足不开仓；滑点预算', () => {
+  const params: SymbolParams = { ...DEFAULT_SYMBOL, enabled: true, entryBps: 10, exitBps: 0, regimes: ['all'] };
+  const baseline = { regime: 'all' as const, median: 0, sigma: 2, samples: 500, since: T0, fallback: false };
+  const context = { openPositions: 0, openNotionalUsd: 0, dailyNetUsd: 0, cooldownUntil: 0, eligible: true };
+  const open = (value: Sample) => { const decision = decide(value, baseline, params, null); assert.equal(decision.kind, 'open'); return decision as Extract<typeof decision, { kind: 'open' }>; };
+  // 报价时刻卖 Var 价差 26 基点；拿到报价时 Lighter 已涨到 100.2，只剩约 6 基点。
+  const gone = sample(T0, 100.3, 100, { rhBidRx: 100.19, rhAskRx: 100.21 });
+  assert.equal(confirmOpen(gone, baseline, params, open(gone), true), DECAYED);
+  // Lighter 只涨了 5 分：仍有约 21 基点，按 100.07（那一刻的一档加原来的冲击）买入。
+  const still = sample(T0, 100.3, 100, { rhBidRx: 100.04, rhAskRx: 100.06 });
+  const confirmed = confirmOpen(still, baseline, params, open(still), true);
+  assert.ok(typeof confirmed !== 'string');
+  if (typeof confirmed === 'string') return;
+  assert.ok(Math.abs(confirmed.sample.rhAsk1k! - 100.07) < 1e-9);
+  assert.ok(Math.abs(confirmed.decision.deviation - (100.28 - 100.07) / 100.05 * 1e4) < 1e-6);
+  const position = openPosition('p1', confirmed.sample, params, confirmed.decision, baseline);
+  assert.ok(Math.abs(position.rhEntry - 100.07) < 1e-9);
+  // 没有记录那一刻的一档：模拟盘不开，回测旧样本沿用样本本身。
+  const legacy = sample(T0, 100.3, 100, { rhBidRx: null, rhAskRx: null });
+  assert.equal(executionSample(legacy), null);
+  assert.equal(confirmOpen(legacy, baseline, params, open(legacy), true), NO_LIVE_TOP);
+  assert.equal((confirmOpen(legacy, baseline, params, open(legacy), false) as { sample: Sample }).sample, legacy);
+  // 平仓同样按那一刻的价：卖出 Lighter 用 100.04 − 0.01。
+  const exit = closeSpread(still, position, spreadOf(still, '1k')!);
+  assert.ok(Math.abs(exit.prices.rhBid - 100.03) < 1e-9);
+  // 预期净利：偏离 26 − 出场 0 − 半个往返成本 4 − 四次滑点 4 = 18 基点。
+  const plain = sample(T0, 100.3), net = expectedNetBps(open(plain), params, DEFAULT_GLOBAL);
+  assert.ok(Math.abs(net - 18) < 1e-6);
+  assert.equal(openBlocker(plain, params, DEFAULT_GLOBAL, { ...context, expectedNetBps: net }), null);
+  assert.equal(openBlocker(plain, params, { ...DEFAULT_GLOBAL, minNetBps: 19 }, { ...context, expectedNetBps: net }), THIN_BLOCK);
+  assert.equal(openBlocker(plain, params, DEFAULT_GLOBAL, { ...context, fallbackBaseline: true }), FALLBACK_BLOCK);
+  assert.equal(openBlocker({ ...plain, receivedAt: plain.t + 31_000 }, params, DEFAULT_GLOBAL, context), 'Var 报价过旧', '默认时效 30 秒');
+  assert.equal(openBlocker(plain, params, DEFAULT_GLOBAL, { ...context, expectedNetBps: 50, costBps: 60 }), COST_BLOCK, '往返成本达到止损线，偏离再大也不开');
+  // 滑点预算：偏离刚好等于入场线、四次成交把保护用满后仍剩最低净利；每腿 1 到 10 基点。
+  const fees = { minNetBps: 3, varFeeBps: 0, rhFeeBps: 0 };
+  assert.equal(slippageBudgetBps({ entryBps: 15, exitBps: 0 }, fees, 4), 2);
+  assert.equal(15 - 0 - 4 - 4 * 2, 3, '用满后正好剩最低净利');
+  assert.equal(slippageBudgetBps({ entryBps: 15, exitBps: 0 }, { ...fees, varFeeBps: 1, rhFeeBps: 1 }, 0), 2);
+  assert.equal(slippageBudgetBps({ entryBps: 4, exitBps: 2 }, fees, 4), 1);
+  assert.equal(slippageBudgetBps({ entryBps: 200, exitBps: 0 }, fees, 4), 10);
+});
+
+test('回测与模拟盘同规则：按判断时刻的价开平仓，信号消失、净利不足、成本达止损线、全天基线、当时没有一档都不开', () => {
+  const params: SymbolParams = { ...DEFAULT_SYMBOL, entryBps: 15, exitBps: 2, cooldownMinutes: 0 };
+  const global = { ...DEFAULT_GLOBAL, windowHours: 2, minSamples: 30 };
+  const run = (samples: Sample[], symbol: Partial<SymbolParams> = {}, extra: Partial<typeof global> = {}, kind: 'crypto' | 'equity' = 'crypto') =>
+    runBacktest('BTC', kind, samples, T0 + 60 * 60_000, T0 + 600 * 60_000, { ...params, ...symbol }, { ...global, ...extra });
+  const spike = (index: number) => index % 30 === 15;
+  // 冲高时 Lighter 只涨 5 分，其余时刻 Lighter 在 99.95：开仓买在 100.07，平仓卖在 99.93，都不是报价时刻的价。
+  const moved = oscillating(600).map((item, index) => spike(index) ? { ...item, rhBidRx: 100.04, rhAskRx: 100.06 } : { ...item, rhBidRx: 99.94, rhAskRx: 99.96 });
+  const filled = run(moved);
+  assert.ok(filled.trades.length >= 15);
+  assert.ok(filled.trades.every(trade => Math.abs(trade.rhEntry - 100.07) < 1e-9 && Math.abs(trade.rhExit - 99.93) < 1e-9));
+  // 同样的行情：复核后的预期净利约 6 基点、往返成本约 8 基点。
+  const thin = run(moved, {}, { minNetBps: 7 });
+  assert.equal(thin.trades.length, 0);
+  assert.ok(thin.summary.blocked[THIN_BLOCK] >= 15);
+  const costly = run(moved, { stopBps: 7.9 });
+  assert.equal(costly.trades.length, 0);
+  assert.ok(costly.summary.blocked[COST_BLOCK] >= 15);
+  // 每次冲高在拿到报价时 Lighter 都已跟上。
+  const chased = run(oscillating(600).map((item, index) => spike(index) ? { ...item, rhBidRx: 100.24, rhAskRx: 100.26 } : item));
+  assert.equal(chased.trades.length, 0);
+  assert.ok(chased.summary.blocked[DECAYED] >= 15);
+  // 已开始记录判断时刻的一档之后，冲高时没有它（行情流当时不可用）不开；整段都没有的旧样本沿用样本本身。
+  const gaps = run(oscillating(600).map((item, index) => spike(index) ? { ...item, rhBidRx: null, rhAskRx: null } : item));
+  assert.equal(gaps.trades.length, 0);
+  assert.ok(gaps.summary.blocked[NO_LIVE_TOP] >= 15);
+  assert.ok(run(oscillating(600).map(item => ({ ...item, rhBidRx: null, rhAskRx: null }))).trades.length >= 15);
+  // 美股：第 200 分钟从夜盘切到盘中，第 225 分钟的冲高时盘中样本只有 25 个，基线退回全天，不开；第 255 分钟照常开。
+  const equity = run(oscillating(600).map((item, index) => ({ ...item, regime: index < 200 ? 'overnight' as const : 'rth' as const })), {}, {}, 'equity');
+  assert.equal(equity.summary.blocked[FALLBACK_BLOCK], 1);
+  assert.equal(equity.trades.some(trade => trade.openedAt === T0 + 225 * 60_000), false);
+  assert.equal(equity.trades.some(trade => trade.openedAt === T0 + 255 * 60_000), true);
+});
+
+test('参数重开：globalExtra 里只取认识的键，多出的字段或不合法的值不让整份参数退回默认', () => {
+  const { minNetBps: _minNetBps, ...legacy } = DEFAULT_GLOBAL;
+  const seeded = (globalExtra: unknown) => seededEngine(store => store.setState('settings', { revision: 3, global: legacy, symbols: { 'rh:BTC': { ...DEFAULT_SYMBOL, enabled: true } }, confirmed: [], venues: ['rh'], globalExtra }, T0));
+  for (const [extra, expected] of [[{ minNetBps: 8, futureParam: 1, paused: true }, 8], [{ minNetBps: 'x' }, 3], [{ minNetBps: -1 }, 3], [null, 3], [undefined, 3]] as const) {
+    const context = seeded(extra);
+    try {
+      const settings = context.engine.views.state().settings;
+      assert.equal(settings.revision, 3);
+      assert.equal(settings.symbols['rh:BTC'].enabled, true);
+      assert.equal(settings.global.minNetBps, expected);
+      assert.equal(settings.global.paused, false);
+    } finally { context.dispose(); }
+  }
+});
+
+test('样本库升级：旧库补上判断时刻一档的两列，旧样本读成空，重复打开不报错', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-'));
+  const file = path.join(dir, 'varlighter.sqlite');
+  try {
+    const old = new DatabaseSync(file);
+    old.exec(`CREATE TABLE samples (symbol TEXT NOT NULL, t INTEGER NOT NULL, received_at INTEGER NOT NULL, regime TEXT NOT NULL,
+      var_mark REAL NOT NULL, var_bid0 REAL NOT NULL, var_ask0 REAL NOT NULL, var_bid1k REAL NOT NULL, var_ask1k REAL NOT NULL, var_bid100k REAL, var_ask100k REAL, var_funding REAL,
+      rh_at INTEGER NOT NULL, rh_bid0 REAL NOT NULL, rh_ask0 REAL NOT NULL, rh_mark REAL, rh_index REAL, rh_funding REAL, rh_bid1k REAL, rh_ask1k REAL, rh_bid100k REAL, rh_ask100k REAL,
+      PRIMARY KEY (symbol, t)) WITHOUT ROWID;
+      INSERT INTO samples(symbol, t, received_at, regime, var_mark, var_bid0, var_ask0, var_bid1k, var_ask1k, rh_at, rh_bid0, rh_ask0) VALUES ('rh:BTC', 1000, 2000, 'all', 100, 99.9, 100.1, 99.8, 100.2, 900, 99.95, 100.05);`);
+    old.close();
+    for (let round = 0; round < 2; round++) {
+      const store = openVarLighterStore(file);
+      try {
+        assert.equal(store.samples('rh:BTC', 0, 1500)[0].rhBidRx, null);
+        if (round === 0) assert.equal(store.addSamples([sample(5000, 100.2, 100, { symbol: 'rh:BTC' })]), 1);
+        assert.equal(store.latest('rh:BTC')!.rhAskRx, 100.01);
+      } finally { store.close(); }
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('按金额的成交均价：深度不足为空', () => {
   assert.equal(vwap([[100, 5], [101, 5]], 500), 100);
   assert.ok(Math.abs(vwap([[100, 5], [101, 5]], 1000)! - 1000 / (5 + 500 / 101)) < 1e-9);
@@ -333,8 +449,13 @@ test('引擎：两个场所各自对齐样本写库，盘口快照，模拟盘�
     assert.throws(() => engine.views.settings({ revision: initial.settings.revision, symbols: { 'rh:OPENAI': { enabled: true } } }), /规格不同/);
     assert.throws(() => engine.views.settings({ revision: initial.settings.revision, symbols: { BTC: { enabled: true } } }), /配对键无效/);
     const enable = { enabled: true, entryBps: 15, exitBps: 2, cooldownMinutes: 0, regimes: ['all'] };
-    const saved = engine.views.settings({ revision: initial.settings.revision, global: { minSamples: 10, windowHours: 2 }, symbols: { 'rh:BTC': enable, 'lighter:BTC': enable } });
+    const saved = engine.views.settings({ revision: initial.settings.revision, global: { minSamples: 10, windowHours: 2, minNetBps: 5 }, symbols: { 'rh:BTC': enable, 'lighter:BTC': enable } });
     assert.equal(saved.revision, 1);
+    // 新加的全局参数另存，v0.80.x 回退后读 global 不会遇到不认识的字段；重开后读回。
+    const persisted = store.state<{ global: Record<string, unknown>; globalExtra: Record<string, unknown> }>('settings')!;
+    assert.equal('minNetBps' in persisted.global, false);
+    assert.deepEqual(persisted.globalExtra, { minNetBps: 5 });
+    assert.equal(createVarLighterEngine({ store, fetchImpl, connect: () => new FakeSocket(), now: () => clock }).views.state().settings.global.minNetBps, 5);
     assert.throws(() => engine.views.settings({ revision: 0 }), (error: unknown) => (error as { status?: number }).status === 409);
     let tick = 0;
     /** 过一分钟：两个场所各推一条变化（真实行情每秒都有消息），再拉一次 Var。 */
@@ -369,6 +490,41 @@ test('引擎：两个场所各自对齐样本写库，盘口快照，模拟盘�
     assert.equal(paper.trades[0].reason, 'revert');
     assert.ok(paper.trades[0].netUsd > 0);
     assert.ok(paper.events.some(event => event.kind === 'open') && paper.events.some(event => event.kind === 'close'));
+    // Var 再次冲高，但拿到报价时两个场所的一档都已跟到 100.3：报价时刻有信号，复核后不开仓；样本记下了那一刻的一档。
+    /** lag：推完行情后再过这么久才拉 Var（超过 5 秒就取不到判断时刻的一档）。 */
+    const chase = async (mid: number, top: number, lag = 0) => {
+      clock += 60_000; tick++; varMid = mid;
+      const stats = (id: number) => ({ market_id: id, best_bid_price: (top - 0.01).toFixed(2), best_ask_price: (top + 0.01).toFixed(2), mark_price: String(100 + tick * 0.0001) });
+      rh().push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: stats(1) } });
+      main().push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 7: stats(7), 8: { market_id: 8, mark_price: String(10 + tick * 0.0001) } } });
+      clock += lag;
+      await engine.pollVar(signal);
+    };
+    await chase(100.5, 100.3);
+    const chased = store.latest('rh:BTC')!;
+    assert.deepEqual([chased.rhBid0, chased.rhAsk0, chased.rhBidRx, chased.rhAskRx], [99.99, 100.01, 100.29, 100.31]);
+    assert.ok(spreadOf(chased, '1k')!.sellVar - 20 >= 15, '报价时刻的样本本身达到入场偏离');
+    assert.equal(engine.views.paper().positions.length, 0);
+    assert.equal(engine.views.state().sources.var.poll?.blocked[DECAYED], 2, '两个场所各记一次');
+    await chase(100.2, 100);
+    assert.equal(engine.views.paper().positions.length, 0);
+    assert.equal(engine.views.paper().trades.length, 1);
+    // 行情流 6 秒没有消息：报价时刻有信号，但取不到判断时刻的一档，不开仓。
+    await chase(100.5, 100, 6_000);
+    assert.equal(store.latest('rh:BTC')!.rhBidRx, null);
+    assert.equal(engine.views.paper().positions.length, 0);
+    assert.deepEqual([engine.views.state().sources.var.poll?.noLive, engine.views.state().sources.var.poll?.blocked[NO_LIVE_TOP]], [3, 2]);
+    await chase(100.2, 100);
+    // 拿到报价时 Lighter 只涨了 4 分：信号还在，按那一刻的卖一 100.05 买入；平仓、浮盈同样按判断时刻的买一。
+    await chase(100.5, 100.04);
+    const held = engine.views.paper().positions;
+    assert.deepEqual(held.map(item => [item.symbol, item.rhEntry]), [['rh:BTC', 100.05]]);
+    assert.ok(Math.abs(row('rh:BTC')!.position!.pnlBps! - (held[0].entrySpread - (100.52 - 100.03) / 100.04 * 1e4)) < 1e-6, '浮盈按判断时刻的一档');
+    await chase(100.2, 100.04);
+    assert.deepEqual(engine.views.paper().trades.map(item => [item.reason, item.rhEntry, item.rhExit]).slice(0, 1), [['revert', 100.05, 100.03]]);
+    await chase(100.2, 100);
+    assert.equal(engine.views.paper().positions.length, 0);
+    assert.equal(engine.views.paper().trades.length, 2);
     // 同一报价时刻不重复计入。
     const before = row('rh:BTC')!.samples24h;
     await engine.pollVar(signal);
@@ -378,7 +534,7 @@ test('引擎：两个场所各自对齐样本写库，盘口快照，模拟盘�
     assert.equal(detail.venueName, 'Lighter RH');
     assert.deepEqual(detail.stats.map(item => item.regime), ['all']);
     assert.equal(detail.plans.length, 2);
-    assert.equal(detail.trades.length, 1);
+    assert.equal(detail.trades.length, 2);
     assert.throws(() => engine.views.symbol('BTC', '24'), /不是两边共有的标的/);
     const bt = engine.views.backtest({ symbol: 'rh:BTC', hours: 1 });
     assert.equal(bt.symbol, 'rh:BTC');

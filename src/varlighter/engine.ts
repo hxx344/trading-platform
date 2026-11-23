@@ -6,7 +6,7 @@ import { LighterStream, MAX_DEPTH_MARKETS, depthAt, fetchDepth, fetchRhMarkets, 
 import { KIND_NAMES, PAIR_KEY, REGIME_NAMES, VENUES, VENUE_NAMES, bucketOf, midBasis, pairMarkets, regimeOf, regimesOf, sortPairs, spreadOf, tickerOf, venueOf, type PairInfo, type RhMarket, type Sample, type VarListing, type Venue } from './model.ts';
 import { orderPlan, type OrderPlan } from './plan.ts';
 import { BaselineTracker, suggestedEntryBps, symbolStats, type Baseline, type RegimeStats } from './stats.ts';
-import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, ParamsError, closePosition, decide, positionSpread, fundingEstimate, markToMarket, openBlocker, openPosition, readGlobalParams, readSymbolParams,
+import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, ParamsError, closePosition, closeSpread, confirmOpen, decide, openEconomics, slippageBudgetBps, positionSpread, fundingEstimate, markToMarket, openBlocker, openPosition, readGlobalParams, readSymbolParams,
   CLOSE_REASON_NAMES, DIRECTION_NAMES, type ClosedTrade, type Direction, type GlobalParams, type Position, type SymbolParams } from './strategy.ts';
 import type { VarLighterStore } from './store.ts';
 import type { BacktestView, DepthStatus, OrphanRow, PaperView, PollStats, ReadinessItem, ReadinessView, Settings, SourceState, StateView, SymbolPoint, SymbolView, VenueStatus } from './views.ts';
@@ -74,7 +74,10 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       const symbols: Record<string, SymbolParams> = {};
       for (const [key, params] of Object.entries(saved.symbols ?? {})) if (PAIR_KEY.test(key)) symbols[key] = readSymbolParams(params);
       const venues = Array.isArray(saved.venues) ? VENUES.filter(venue => saved.venues.includes(venue)) : [...VENUES];
-      return { revision: Number.isSafeInteger(saved.revision) ? saved.revision : 0, global: readGlobalParams(saved.global ?? {}), symbols, confirmed: (saved.confirmed ?? []).filter(key => PAIR_KEY.test(key)), venues };
+      // globalExtra 里只取本版本认识的键，值不合法就用默认：更新的版本往里加了字段再回退到这一版，不能因此丢掉整份参数。
+      const extra = (saved as { globalExtra?: unknown }).globalExtra, minNet = isObject(extra) ? extra.minNetBps : undefined;
+      const known = typeof minNet === 'number' && Number.isFinite(minNet) && minNet >= 0 && minNet <= 500 ? { minNetBps: minNet } : {};
+      return { revision: Number.isSafeInteger(saved.revision) ? saved.revision : 0, global: readGlobalParams({ ...(saved.global ?? {}), ...known }), symbols, confirmed: (saved.confirmed ?? []).filter(key => PAIR_KEY.test(key)), venues };
     } catch (error) {
       log(`varlighter: 已保存的参数无效，改用默认值：${error instanceof Error ? error.message : String(error)}`);
       return { ...DEFAULT_SETTINGS, revision: Number.isSafeInteger(saved.revision) ? saved.revision : 0 };
@@ -159,7 +162,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     listings = new Map(fetched.map(listing => [listing.ticker, listing]));
     rebuildPairs();
     await refreshDepth(signal);
-    const stats: PollStats = { at: receivedAt, listings: fetched.length, fresh: 0, unchanged: 0, noQuote: 0, noLighter: 0, written: 0 };
+    const stats: PollStats = { at: receivedAt, listings: fetched.length, fresh: 0, unchanged: 0, noQuote: 0, noLighter: 0, written: 0, noLive: 0, blocked: {} };
     const fresh: { pair: PairInfo; sample: Sample }[] = [];
     for (const pair of pairs) {
       if (pair.identity === 'mismatch') continue;
@@ -171,11 +174,15 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       if (!top) { stats.noLighter++; continue; }
       lastQuoteAt.set(pair.key, quote.at);
       const depth = depthAt(runtime.depth.get(pair.key)?.snapshot, top, quote.at);
+      // 判断就发生在现在：记下这一刻的 Lighter 一档，模拟盘按它成交并复核信号。
+      const live = runtime.stream?.topAt(pair.marketId, now()) ?? null;
+      if (!live) stats.noLive++;
       fresh.push({ pair, sample: {
         symbol: pair.key, t: quote.at, receivedAt, regime: regimeOf(pair.kind, quote.at),
         varMark: listing.mark, varBid0: quote.bid0, varAsk0: quote.ask0, varBid1k: quote.bid1k, varAsk1k: quote.ask1k, varBid100k: quote.bid100k, varAsk100k: quote.ask100k, varFunding: listing.fundingRate,
         rhAt: top.at, rhBid0: top.bid, rhAsk0: top.ask, rhMark: top.mark, rhIndex: top.index, rhFunding: top.funding,
         rhBid1k: depth?.bid1k ?? null, rhAsk1k: depth?.ask1k ?? null, rhBid100k: depth?.bid100k ?? null, rhAsk100k: depth?.ask100k ?? null,
+        rhBidRx: live?.bid ?? null, rhAskRx: live?.ask ?? null,
       } });
       ages.push(receivedAt - quote.at);
     }
@@ -188,31 +195,44 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     noteSamples(fresh.map(item => item.sample));
     for (const { pair, sample } of fresh) {
       latest.set(pair.key, sample);
-      step(pair, sample);
+      const blocker = step(pair, sample);
+      if (blocker) stats.blocked[blocker] = (stats.blocked[blocker] ?? 0) + 1;
     }
     lastPoll = stats;
   }
 
-  /** 模拟盘的一步：先用之前的样本判断，再把这个样本计入基线（与回测同序）。 */
-  function step(pair: PairInfo, sample: Sample): void {
+  /** 持仓按判断时刻的 Lighter 一档估的平仓价差（没有那一刻的一档用样本本身的）；自动平仓、手动平仓与浮盈同一口径。 */
+  function heldSpread(position: Position, sample: Sample) {
+    const quoted = positionSpread(sample, position.notionalUsd);
+    return quoted && closeSpread(sample, position, quoted);
+  }
+
+  /** 模拟盘的一步：先用之前的样本判断，再把这个样本计入基线（与回测同序）。已启用的配对达到入场偏离却没开仓时返回原因。 */
+  function step(pair: PairInfo, sample: Sample): string | null {
+    let blocked: string | null = null;
     const track = tracker(pair), params = paramsOf(pair.key), position = positions.get(pair.key) ?? null;
     const baseline = track.value(sample.regime, sample.t);
     const decision = decide(sample, baseline, params, position);
-    if (decision.kind === 'close' && position) finish(position, sample, decision.spread, decision.reason);
+    if (decision.kind === 'close' && position) finish(position, sample, closeSpread(sample, position, decision.spread), decision.reason);
     else if (decision.kind === 'open' && baseline) {
+      // 信号是按 Var 报价时刻算的；按现在的 Lighter 一档复核，仍成立才按现在的价开仓。
+      const confirmed = confirmOpen(sample, baseline, params, decision, true);
       const open = [...positions.values()];
-      const blocker = openBlocker(sample, params, settings.global, {
+      const blocker = typeof confirmed === 'string' ? confirmed : openBlocker(sample, params, settings.global, {
         openPositions: open.length, openNotionalUsd: open.reduce((sum, item) => sum + item.notionalUsd, 0),
         dailyNetUsd: store.netSince(dayStart(sample.t)), cooldownUntil: cooldown.get(pair.key) ?? 0, eligible: eligible(pair), varBusy: varBusy(pair),
+        fallbackBaseline: baseline.fallback, ...openEconomics(confirmed.decision, params, settings.global),
       });
-      if (!blocker) {
-        const opened = openPosition(`p${now().toString(36)}-${(++sequence).toString(36)}`, sample, params, decision, baseline);
+      if (blocker && params.enabled) blocked = blocker;
+      if (!blocker && typeof confirmed !== 'string') {
+        const opened = openPosition(`p${now().toString(36)}-${(++sequence).toString(36)}`, confirmed.sample, params, confirmed.decision, baseline);
         positions.set(pair.key, opened);
         updateDepth();
-        store.openPosition(opened, { at: now(), kind: 'open', message: `${DIRECTION_NAMES[opened.direction]} ${fmt(opened.notionalUsd, 0)} 美元，价差 ${fmt(opened.entrySpread, 1)} 基点，基线 ${fmt(baseline.median, 1)}，偏离 ${fmt(decision.deviation, 1)}` });
+        store.openPosition(opened, { at: now(), kind: 'open', message: `${DIRECTION_NAMES[opened.direction]} ${fmt(opened.notionalUsd, 0)} 美元，价差 ${fmt(opened.entrySpread, 1)} 基点，基线 ${fmt(baseline.median, 1)}，偏离 ${fmt(confirmed.decision.deviation, 1)}（报价时刻 ${fmt(decision.deviation, 1)}）` });
       }
     }
     track.push(sample);
+    return blocked;
   }
 
   function finish(position: Position, sample: Sample, spread: NonNullable<ReturnType<typeof spreadOf>>, reason: ClosedTrade['reason'], note = ''): ClosedTrade {
@@ -262,7 +282,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       const spread = sample ? spreadOf(sample, bucketOf(params.notionalUsd)) : null;
       const mid = sample ? midBasis(sample) : null;
       const position = positions.get(pair.key) ?? null;
-      const held = position && sample ? positionSpread(sample, position.notionalUsd) : null;
+      const held = position && sample ? heldSpread(position, sample) : null;
       return {
         key: pair.key, venue: pair.venue, venueName: VENUE_NAMES[pair.venue], symbol: pair.symbol, name: pair.name, kind: pair.kind, kindName: KIND_NAMES[pair.kind], identity: pair.identity, eligible: eligible(pair), gapBps: pair.gapBps,
         regime: regimeOf(pair.kind, time), sampleAt: sample?.t ?? null, mid, sellVar: spread?.sellVar ?? null, buyVar: spread?.buyVar ?? null, estimated: spread?.estimated ?? null,
@@ -329,7 +349,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       const reason = lostReason(key, time);
       if (reason === null) return [];
       const position = positions.get(key) ?? null, sample = lastSample(key);
-      const held = position && sample ? positionSpread(sample, position.notionalUsd) : null;
+      const held = position && sample ? heldSpread(position, sample) : null;
       return {
         key, venue: venueOf(key), venueName: VENUE_NAMES[venueOf(key)], symbol: tickerOf(key), reason, enabled: settings.symbols[key]?.enabled === true, lastSampleAt: sample?.t ?? null,
         position: position ? { direction: position.direction, openedAt: position.openedAt, pnlBps: held ? markToMarket(position, held).pnlBps : null } : null,
@@ -359,7 +379,9 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     }
     const stats: RegimeStats[] = symbolStats(pair.kind, inRange, params.entryBps, bucket);
     const sample = latest.get(pair.key) ?? store.latest(pair.key);
-    const plans: OrderPlan[] = sample ? (['var_rich', 'var_cheap'] as Direction[]).map(direction => orderPlan(pair, sample, direction, params.notionalUsd, Math.max(10, params.entryBps), time)) : [];
+    const quoted = sample ? spreadOf(sample, bucket) : null;
+    const protection = slippageBudgetBps(params, settings.global, quoted ? (quoted.buyVar - quoted.sellVar) / 2 : 0);
+    const plans: OrderPlan[] = sample ? (['var_rich', 'var_cheap'] as Direction[]).map(direction => orderPlan(pair, sample, direction, params.notionalUsd, protection, time)) : [];
     const position = positions.get(pair.key) ?? null;
     return {
       key: pair.key, venue: pair.venue, venueName: VENUE_NAMES[pair.venue], symbol: pair.symbol, name: pair.name, kind: pair.kind, kindName: KIND_NAMES[pair.kind], identity: pair.identity, eligible: eligible(pair), gapBps: pair.gapBps,
@@ -373,7 +395,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   }
 
   function markOf(position: Position, sample: Sample): { netUsd: number; pnlBps: number; at: number } | null {
-    const spread = positionSpread(sample, position.notionalUsd);
+    const spread = heldSpread(position, sample);
     if (!spread) return null;
     const trade = closePosition(position, sample.t, spread, 'manual', settings.global, null);
     return { netUsd: trade.netUsd, pnlBps: markToMarket(position, spread).pnlBps, at: sample.t };
@@ -458,7 +480,9 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       const windowChanged = global.windowHours !== settings.global.windowHours || global.minSamples !== settings.global.minSamples;
       const venuesChanged = venueList.join() !== settings.venues.join();
       settings = { revision: settings.revision + 1, global, symbols, confirmed, venues: venueList };
-      store.setState('settings', settings, now());
+      // v0.80.x 读参数时遇到 global 里不认识的字段会整份改用默认值：新加的全局参数另存在 globalExtra，回退后旧版本照常读。
+      const { minNetBps, ...legacyGlobal } = settings.global;
+      store.setState('settings', { ...settings, global: legacyGlobal, globalExtra: { minNetBps } }, now());
       store.event(now(), 'settings', null, `参数已更新（版本 ${settings.revision}）${venuesChanged ? `，采集场所：${venueList.map(venue => VENUE_NAMES[venue]).join('、')}` : ''}`);
       if (windowChanged) trackers.clear();
       if (venuesChanged) { syncStreams(); rebuildPairs(); }
@@ -478,7 +502,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     // 失联的配对等不到新报价：按最后一个样本结算并在事件里注明原因。数据源整体故障不算失联，等恢复。
     const stale = time - sample.t > 10 * 60_000, reason = stale ? lostReason(position.symbol, time) : null;
     if (stale && reason === null) return reject('no_quote', '没有 10 分钟内的报价，无法按市价平仓；数据源恢复后再试', 409);
-    const spread = positionSpread(sample, position.notionalUsd) ?? reject('no_quote', '该档位缺少可成交价', 409);
+    const spread = heldSpread(position, sample) ?? reject('no_quote', '该档位缺少可成交价', 409);
     const trade = finish(position, sample, spread, 'manual', reason ? `${reason}，按最后样本（${new Date(sample.t).toISOString().slice(0, 16).replace('T', ' ')} UTC）结算；` : '');
     updateDepth();
     return trade;

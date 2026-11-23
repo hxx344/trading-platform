@@ -128,11 +128,12 @@ export const SYMBOL_FIELDS: readonly NumberField<Exclude<keyof SymbolParams, 'en
 ];
 export const GLOBAL_FIELDS: readonly NumberField<Exclude<keyof GlobalParams, 'paused'>>[] = [
   { key: 'windowHours', label: '基线窗口', min: 1, max: 720, integer: true, unit: '小时', hint: '修改后各标的基线按新窗口重建' },
-  { key: 'minSamples', label: '基线最少样本', min: 10, max: 50_000, integer: true, unit: '个', hint: '同时段样本不足时改用全天基线' },
+  { key: 'minSamples', label: '基线最少样本', min: 10, max: 50_000, integer: true, unit: '个', hint: '同时段样本不足时改用全天基线，只展示、不开仓' },
   { key: 'slippageBps', label: '滑点', min: 0, max: 100, unit: '基点 / 每腿每次' },
   { key: 'varFeeBps', label: 'Var 手续费', min: 0, max: 100, unit: '基点' },
   { key: 'rhFeeBps', label: 'Lighter 手续费', min: 0, max: 100, unit: '基点' },
-  { key: 'maxQuoteAgeSec', label: '报价时效上限', min: 5, max: 600, integer: true, unit: '秒' },
+  { key: 'maxQuoteAgeSec', label: '报价时效上限', min: 5, max: 600, integer: true, unit: '秒', hint: '收到时 Var 报价已过去的时间，超过不开仓' },
+  { key: 'minNetBps', label: '最低预期净利', min: 0, max: 500, unit: '基点', hint: '偏离 − 出场 − 半个往返成本 − 滑点与手续费，低于这个数不开仓' },
   { key: 'maxOpenPositions', label: '最多持仓数', min: 1, max: 100, integer: true, unit: '笔' },
   { key: 'maxTotalNotionalUsd', label: '名义合计上限', min: 10, max: 10_000_000, unit: '美元' },
   { key: 'dailyLossLimitUsd', label: '当日亏损上限', min: 1, max: 10_000_000, unit: '美元', hint: '按 UTC 日计' },

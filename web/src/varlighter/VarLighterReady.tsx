@@ -88,7 +88,7 @@ function SourcesPanel({ view, onChanged }: { view: StateView; onChanged: () => P
         <small>报价收到时已过去 {varSource.quoteAgeMedianMs === null ? '—' : `${plain(varSource.quoteAgeMedianMs / 1000, 0)} 秒`}（中位数）</small></td></tr>
       {token ? <tr><td>Var token 询价</td><td className="wrap">{token.status === 'ready' ? token.statusName : <span className="vl-down">{token.statusName}</span>}
         {token.okAt === null ? ' · 还没有成功过' : ` · 最近成功 ${age(token.okAt, now)}${token.lagMs === null ? '' : `，收到时距 Var 报价时刻 ${plain(token.lagMs / 1000, 1)} 秒`}`}
-        {poll ? <small>上次：成功 {poll.tokenOk ?? 0}，失败 {poll.tokenFailed ?? 0}{token.expiresAt === null ? '' : `；token 到期 ${new Date(token.expiresAt).toLocaleString('zh-CN', { hour12: false })}`}</small> : null}
+        {poll ? <small>上次：成功 {poll.tokenOk ?? 0}，失败 {poll.tokenFailed ?? 0}，未询 {poll.tokenSkipped ?? 0}{token.expiresAt === null ? '' : `；token 到期 ${new Date(token.expiresAt).toLocaleString('zh-CN', { hour12: false })}`}</small> : null}
         {token.error ? <small className="vl-down">{token.error}</small> : null}
         {token.status === 'ready' ? null : <small>token 在「行情监控 → 原油」页的 Var token 表单里保存；没有可用 token 时开平仓只按公开报价。</small>}</td></tr> : null}
       {venues.map(status => <VenueRow key={status.venue} status={status} now={now} busy={write.busy}

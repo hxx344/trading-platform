@@ -11,7 +11,8 @@ export interface Settings { revision: number; global: GlobalParams; symbols: Rec
 export interface SourceState { at: number | null; ok: number | null; error: string | null; count: number }
 export interface PollStats { at: number; listings: number; fresh: number; unchanged: number; noQuote: number; noLighter: number; written: number;
   /** 新样本里没取到判断时刻 Lighter 一档的条数，以及这一轮达到入场偏离却没开仓的次数（按原因）。 */ noLive: number; blocked: Record<string, number>;
-  /** 这一轮的 Var token 询价：成功、失败的次数（没有可用 token 时都是 0）。 */ tokenOk: number; tokenFailed: number }
+  /** 这一轮的 Var token 询价：成功、失败的次数（没有可用 token 时都是 0）。 */ tokenOk: number; tokenFailed: number;
+  /** 该询而没询的配对数：类别的写法没确认、失败后暂停中、这一轮中途 token 不可用或到了阶段时限（v0.82.0 起；没有可用 token 时为 0）。 */ tokenSkipped: number }
 export type TokenStatus = 'missing' | 'expired' | 'ready' | 'rejected' | 'unavailable';
 /** Var token 询价的状态：不含 token。`lagMs` 是最近一次成功询价收到时距 Var 报价时刻的毫秒数。 */
 export interface TokenView { status: TokenStatus; statusName: string; expiresAt: number | null; error: string | null; okAt: number | null; lagMs: number | null }

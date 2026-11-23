@@ -23,7 +23,11 @@ export interface TokenQuote { bid: number; ask: number; mark: number; qty: numbe
 export interface VarQuoter {
   /** 当前能不能询价（有可用 token 且不在被拦截后的暂停里）；读一次 token 文件，不发请求。 */ usable(): boolean;
   /** 这个标的这一轮要不要询：类别的写法确认过，且不在失败后的暂停里。 */ wants(kind: AssetKind, symbol: string): boolean;
-  /** 询一次价；失败抛出固定文案的错误（不含 token 与应答正文）。 */ quote(kind: AssetKind, symbol: string, notionalUsd: number, referencePrice: number, signal: AbortSignal): Promise<TokenQuote>;
+  /**
+   * 询一次价；失败抛出固定文案的错误（不含 token 与应答正文）。`signal` 交给传输层；`stop` 是调用方自己的中止信号（不给就是 `signal`）：
+   * 只有它中止才算调用方不要了、不记失败。引擎给 `signal` 加了阶段时限，到时限而 `stop` 没中止的请求按超时记失败并暂停该标的。
+   */
+  quote(kind: AssetKind, symbol: string, notionalUsd: number, referencePrice: number, signal: AbortSignal, stop?: AbortSignal): Promise<TokenQuote>;
   view(): TokenView;
 }
 
@@ -68,7 +72,7 @@ export function parseTokenQuote(input: unknown, instrument: Instrument, qty: str
  * `dir` 是服务的数据目录（token 文件所在）。被 Var 拒绝的 token 记在内存里不再用，直到文件换成别的 token；
  * 判定只落在发请求时用的那个 token 上，请求途中文件换了新 token 不会把新的标成失效。
  * 退避：被拦截（403 或质询）后这个 token 停 5 分钟；单个标的询价失败（超时、非 2xx、应答对不上）后这个标的停 5 分钟，
- * 写法不对的合约不会每分钟重试。调用方中止的请求不算失败。
+ * 写法不对的合约不会每分钟重试。调用方中止（`stop`）的请求不算失败；引擎的阶段时限到了而请求还没回来，按超时算。
  */
 export function createVarQuoter({ dir, fetcher, now = Date.now }: { dir: string; fetcher: VariationalFetcher; now?: () => number }): VarQuoter {
   const file = join(dir, VARIATIONAL_SESSION_FILE);
@@ -87,7 +91,7 @@ export function createVarQuoter({ dir, fetcher, now = Date.now }: { dir: string;
   return {
     usable: () => { const { token } = read(); return token !== '' && !(token === pausedToken && now() < pausedUntil); },
     wants: (kind, symbol) => varInstrument(kind, symbol) !== null && !((symbolPause.get(symbol) ?? 0) > now()),
-    async quote(kind, symbol, notionalUsd, referencePrice, signal) {
+    async quote(kind, symbol, notionalUsd, referencePrice, signal, stop = signal) {
       const instrument = varInstrument(kind, symbol), qty = quoteQty(notionalUsd, referencePrice);
       if (!instrument) throw new Error('该类别的 Var 询价格式未确认');
       if (!qty) throw new Error('算不出询价数量');
@@ -99,8 +103,9 @@ export function createVarQuoter({ dir, fetcher, now = Date.now }: { dir: string;
         // requestVariational 抛出的已经是分类后的错误（固定文案，带 rejected / blocked）；别的才再分类一次。
         const known = caught as { variational?: boolean; rejected?: boolean; blocked?: boolean; message?: string } | null;
         const classified = known && typeof known === 'object' && known.variational === true ? known : variationalRequestError(caught);
-        const message = String(classified.message);
-        if (signal.aborted) throw new Error(message);
+        if (stop.aborted) throw new Error(String(classified.message));
+        // 被拒与被拦截是整个 token 的事；其余（超时、非 2xx、缺 Python）记在标的上，原因带标的代码。
+        const message = classified.rejected || classified.blocked ? String(classified.message) : `${symbol}：${String(classified.message)}`;
         if (classified.rejected) rejected = token;
         else {
           unavailableToken = token;

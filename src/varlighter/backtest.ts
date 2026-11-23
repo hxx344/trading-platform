@@ -1,6 +1,6 @@
 // 单标的回测（docs/varlighter.md 第 6 节）：用已采集的对齐样本按时间重放，与模拟盘同一套基线、开平仓与风控规则。
 // 基线在每个样本判断之后才把该样本计入，不看未来；from 之前的样本只用来预热基线。
-import { PAIR_KEY, bucketOf, spreadOf, type AssetKind, type Sample } from './model.ts';
+import { hasTokenQuote, PAIR_KEY, bucketOf, spreadOf, type AssetKind, type Sample } from './model.ts';
 import { BaselineTracker } from './stats.ts';
 import { DEFAULT_SYMBOL, ParamsError, closePosition, closeSpread, confirmOpen, decide, fundingEstimate, openEconomics, openBlocker, openPosition, readGlobalParams, readSymbolParams, type ClosedTrade, type GlobalParams, type Position, type SymbolParams } from './strategy.ts';
 
@@ -50,7 +50,7 @@ export function runBacktest(symbol: string, kind: AssetKind, samples: readonly S
         // 之后的样本没有它说明当时行情流不可用，与模拟盘一样不开仓。
         const confirmed = confirmOpen(sample, baseline, effective, decision, sample.t >= liveFrom);
         const reason = typeof confirmed === 'string' ? confirmed : openBlocker(sample, effective, settings, {
-          openPositions: 0, openNotionalUsd: 0, dailyNetUsd: dayNet, cooldownUntil, eligible: true, fallbackBaseline: baseline.fallback, ...openEconomics(confirmed.decision, effective, settings, decision) });
+          openPositions: 0, openNotionalUsd: 0, dailyNetUsd: dayNet, cooldownUntil, eligible: true, fallbackBaseline: baseline.fallback, ...openEconomics(confirmed.decision, effective, settings, hasTokenQuote(sample) ? decision : undefined) });
         if (reason) blocked[reason] = (blocked[reason] ?? 0) + 1;
         else if (typeof confirmed !== 'string') position = openPosition(`bt-${++sequence}`, confirmed.sample, effective, confirmed.decision, baseline);
       }

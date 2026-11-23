@@ -1044,6 +1044,10 @@ test('Var 询价器：没有 token 不发请求；被拒的 token 不再用、�
     reply = () => { throw Object.assign(new Error('aborted'), { name: 'AbortError' }); };
     await assert.rejects(quoter.quote('crypto', 'BTC', 1000, 100.2, stopped.signal));
     assert.deepEqual([quoter.view().status, quoter.view().error, quoter.wants('crypto', 'BTC')], ['ready', null, true]);
+    // 传输用的信号中止了（引擎的阶段时限）而调用方自己的没中止：按超时记失败，标的暂停，原因带标的代码。
+    await assert.rejects(quoter.quote('crypto', 'BTC', 1000, 100.2, stopped.signal, new AbortController().signal), /BTC：Variational 请求超时/);
+    assert.deepEqual([quoter.view().status, quoter.wants('crypto', 'BTC'), quoter.usable()], ['unavailable', false, true]);
+    assert.match(quoter.view().error ?? '', /^BTC：/);
     reply = () => new Response('', { status: 403 });
     await assert.rejects(ask(), /被拦截/);
     clock += TOKEN_BLOCK_PAUSE_MS;
@@ -1111,7 +1115,7 @@ test('判断时刻的样本：有 Var 询价时 Var 各档都换成询价，询�
   const wide = { ...decision, spread: { ...decision.spread, buyVar: decision.spread.sellVar + 70 } };
   const narrow = confirmed.decision.spread.buyVar - confirmed.decision.spread.sellVar;
   assert.ok(narrow < 10 && Math.abs(openEconomics(confirmed.decision, params, DEFAULT_GLOBAL, wide).costBps - 70) < 1e-9);
-  assert.equal(openEconomics(confirmed.decision, params, DEFAULT_GLOBAL).costBps, narrow);
+  assert.equal(openEconomics(confirmed.decision, params, DEFAULT_GLOBAL).costBps, narrow, '不带询价时不传报价时刻的决定，与 v0.81.0 相同');
   assert.equal(openBlocker(confirmed.sample, { ...params, stopBps: 60 }, DEFAULT_GLOBAL, { openPositions: 0, openNotionalUsd: 0, dailyNetUsd: 0, cooldownUntil: 0, eligible: true, ...openEconomics(confirmed.decision, params, DEFAULT_GLOBAL, wide) }), COST_BLOCK);
   const later = sample(T0 + 60_000, 100.0, 100, { varBidTk: 100.02, varAskTk: 100.04 });
   const spread = closeSpread(later, position, positionSpread(later, position.notionalUsd)!);
@@ -1254,6 +1258,13 @@ test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与
     mode = 'ok'; skipped.add('BTC');
     poll = await minute();
     assert.deepEqual([asked.length, poll.tokenOk, poll.tokenFailed], [before + 2, 0, 0]);
-    assert.match(latency().detail, /上一轮没有询价/);
+    assert.equal(poll.tokenSkipped, 1);
+    assert.match(latency().detail, /成功 0、失败 0、未询 1/);
+    // 上一次拉取太久以前：不再按它判断。
+    skipped.clear();
+    await minute();
+    assert.match(latency().detail, /判断时刻用 token 询价/);
+    clock += 4 * 60_000;
+    assert.doesNotMatch(latency().detail, /判断时刻用 token 询价/);
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });

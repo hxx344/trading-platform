@@ -242,7 +242,7 @@ export interface GateContext { openPositions: number; openNotionalUsd: number; d
 export const FALLBACK_BLOCK = '本时段基线样本不足（全天基线不开仓）', THIN_BLOCK = '预期净利不足', COST_BLOCK = '往返成本已达止损线';
 /** 复核后的开仓决定对应的两个门槛读数。 */
 /**
- * `quoted`：报价时刻（复核前）的开仓决定。开仓后的止损仍按公开报价的样本判断，所以成本门槛取复核后与报价时刻两种口径里
+ * `quoted`：报价时刻（复核前）的开仓决定，只在样本带 Var token 询价时传（不带询价时与 v0.81.0 相同，只看复核后的）。开仓后的止损仍按公开报价的样本判断，所以成本门槛取复核后与报价时刻两种口径里
  * 较大的往返成本：按 token 询价复核后成本很小、公开档位成本却已到止损线的仓，开了下一个样本就会止损。
  */
 export const openEconomics = (decision: Extract<Decision, { kind: 'open' }>, params: Pick<SymbolParams, 'exitBps'>, global: Pick<GlobalParams, 'slippageBps' | 'varFeeBps' | 'rhFeeBps'>, quoted?: Extract<Decision, { kind: 'open' }>) =>

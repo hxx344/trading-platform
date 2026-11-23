@@ -163,10 +163,12 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     const jobs: (() => Promise<void>)[] = [], phase = anySignal([signal], TOKEN_QUOTE_PHASE_MS);
     for (const runtime of venues.values()) for (const key of runtime.depth.keys()) {
       const pair = pairOf(key), listing = pair && listings.get(pair.symbol);
-      if (!pair || !listing || !quoter.wants(pair.kind, pair.symbol)) continue;
+      if (!pair || !listing) continue;
+      if (!quoter.wants(pair.kind, pair.symbol)) { stats.tokenSkipped++; continue; }
       jobs.push(async () => {
-        if (phase.aborted) return;
-        await quoter.quote(pair.kind, pair.symbol, paramsOf(key).notionalUsd, listing.mark, phase).then(quote => { result.set(key, quote); stats.tokenOk++; }, () => { stats.tokenFailed++; });
+        // 到了阶段时限，或这一轮里前面的请求让 token 不可用了（被拒、被拦截）：剩下的不再发。
+        if (phase.aborted || !quoter.usable()) { stats.tokenSkipped++; return; }
+        await quoter.quote(pair.kind, pair.symbol, paramsOf(key).notionalUsd, listing.mark, phase, signal).then(quote => { result.set(key, quote); stats.tokenOk++; }, () => { stats.tokenFailed++; });
       });
     }
     const workers = Array.from({ length: Math.min(TOKEN_QUOTE_CONCURRENCY, jobs.length) }, async () => { for (let job = jobs.shift(); job; job = jobs.shift()) await job(); });
@@ -184,7 +186,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     varSource.ok = receivedAt; varSource.error = null; varSource.count = fetched.length;
     listings = new Map(fetched.map(listing => [listing.ticker, listing]));
     rebuildPairs();
-    const stats: PollStats = { at: receivedAt, listings: fetched.length, fresh: 0, unchanged: 0, noQuote: 0, noLighter: 0, written: 0, noLive: 0, blocked: {}, tokenOk: 0, tokenFailed: 0 };
+    const stats: PollStats = { at: receivedAt, listings: fetched.length, fresh: 0, unchanged: 0, noQuote: 0, noLighter: 0, written: 0, noLive: 0, blocked: {}, tokenOk: 0, tokenFailed: 0, tokenSkipped: 0 };
     const [, asked] = await Promise.all([refreshDepth(signal), tokenQuotes(signal, stats)]);
     const fresh: { pair: PairInfo; sample: Sample }[] = [];
     for (const pair of pairs) {
@@ -246,7 +248,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       const blocker = typeof confirmed === 'string' ? confirmed : openBlocker(sample, params, settings.global, {
         openPositions: open.length, openNotionalUsd: open.reduce((sum, item) => sum + item.notionalUsd, 0),
         dailyNetUsd: store.netSince(dayStart(sample.t)), cooldownUntil: cooldown.get(pair.key) ?? 0, eligible: eligible(pair), varBusy: varBusy(pair),
-        fallbackBaseline: baseline.fallback, ...openEconomics(confirmed.decision, params, settings.global, decision),
+        fallbackBaseline: baseline.fallback, ...openEconomics(confirmed.decision, params, settings.global, hasTokenQuote(sample) ? decision : undefined),
       });
       if (blocker && params.enabled) blocked = blocker;
       if (!blocker && typeof confirmed !== 'string') {
@@ -562,11 +564,11 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     items.push({ key: 'paper', status: totals.trades >= READY_PAPER_TRADES && totals.netUsd > 0 ? 'ok' : 'warn', label: `模拟盘至少 ${READY_PAPER_TRADES} 笔且净盈利`, detail: `${totals.trades} 笔，净 ${fmt(totals.netUsd, 2)} 美元，胜率 ${totals.trades ? fmt(totals.wins / totals.trades * 100, 0) : '-'}%` });
     const age = view.sources.var.quoteAgeMedianMs;
     // 有 token 询价且最近三轮内成功过，就按询价的延迟算；否则仍看公开报价的中位延迟。
-    // 询价算数的条件：上一轮要询的配对全部询到。只询到一部分时仍按公开报价的时效判断，并写出成功与失败数。
-    const token = view.sources.var.token, asked = view.sources.var.poll;
-    const tokenLive = token?.status === 'ready' && token.lagMs !== null && !!asked && asked.tokenOk > 0 && asked.tokenFailed === 0;
+    // 询价算数的条件：最近三轮内的上一次拉取里，已启用或有持仓的配对全部询到。有失败或没询的仍按公开报价的时效判断，并写出各有几个。
+    const token = view.sources.var.token, last = view.sources.var.poll, asked = last && time - last.at <= 3 * VAR_POLL_MS ? last : null;
+    const tokenLive = token?.status === 'ready' && token.lagMs !== null && !!asked && asked.tokenOk > 0 && asked.tokenFailed === 0 && asked.tokenSkipped === 0;
     const tokenNote = !token ? '' : token.status !== 'ready' ? `Var token 询价${token.statusName}${token.error ? `（${token.error}）` : ''}，`
-      : asked && asked.tokenOk + asked.tokenFailed > 0 ? `Var token 询价上一轮成功 ${asked.tokenOk}、失败 ${asked.tokenFailed}${token.error ? `（${token.error}）` : ''}，` : 'Var token 已配置但上一轮没有询价（没有启用的可询价配对），';
+      : asked && asked.tokenOk + asked.tokenFailed + asked.tokenSkipped > 0 ? `Var token 询价上一轮成功 ${asked.tokenOk}、失败 ${asked.tokenFailed}、未询 ${asked.tokenSkipped}${token.error ? `（${token.error}）` : ''}，` : 'Var token 已配置但上一轮没有要询价的配对，';
     const publicAge = age === null ? '还没有样本' : `公开报价收到时已过去 ${fmt(age / 1000, 0)} 秒（中位数）`;
     items.push({ key: 'latency', status: tokenLive || (age !== null && age < 45_000) ? 'ok' : 'warn', label: 'Var 报价时效', detail: tokenLive
       ? `判断时刻用 token 询价，收到时距 Var 报价时刻 ${fmt(token.lagMs! / 1000, 1)} 秒；信号仍按公开报价发现，${publicAge}`

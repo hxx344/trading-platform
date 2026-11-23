@@ -12,10 +12,17 @@ export const TOKEN_STATUS_NAMES: Record<TokenStatus, string> = { missing: '未�
 export const TOKEN_QUOTE_MAX_AGE_MS = 15_000;
 /** 一轮里同时发出的询价数（每个请求起一个 python3 子进程）。 */
 export const TOKEN_QUOTE_CONCURRENCY = 4;
+/** 一轮询价的总时限：到点就用已经拿到的，不让慢的询价拖住这一轮的样本。 */
+export const TOKEN_QUOTE_PHASE_MS = 8_000;
+/** 被拦截后整个 token 暂停、单个标的失败后该标的暂停的时长。 */
+export const TOKEN_BLOCK_PAUSE_MS = 5 * 60_000, TOKEN_SYMBOL_PAUSE_MS = 5 * 60_000;
+/** 最近一次失败的原因在状态里保留多久。 */
+export const TOKEN_ERROR_KEEP_MS = 90_000;
 
 export interface TokenQuote { bid: number; ask: number; mark: number; qty: number; /** Var 给的报价时刻。 */ at: number; /** 本机收到的时刻。 */ receivedAt: number }
 export interface VarQuoter {
-  /** 当前能不能询价；读一次 token 文件，不发请求。 */ usable(): boolean;
+  /** 当前能不能询价（有可用 token 且不在被拦截后的暂停里）；读一次 token 文件，不发请求。 */ usable(): boolean;
+  /** 这个标的这一轮要不要询：类别的写法确认过，且不在失败后的暂停里。 */ wants(kind: AssetKind, symbol: string): boolean;
   /** 询一次价；失败抛出固定文案的错误（不含 token 与应答正文）。 */ quote(kind: AssetKind, symbol: string, notionalUsd: number, referencePrice: number, signal: AbortSignal): Promise<TokenQuote>;
   view(): TokenView;
 }
@@ -23,7 +30,7 @@ export interface VarQuoter {
 type Instrument = Record<string, string | number>;
 /**
  * 各类别在 Var 的合约定义。股票与商品的写法在公开价格流上逐个试出（2026-11-23：`kind: equity` 订阅成功），加密货币同（`funding_interval_s: 3600`）。
- * 询价接口是否接受同样的写法只有商品（原油监控在用）核实过，其余待服务器上实测；别的类别没有确认过写法，不询价。
+ * 询价接口是否接受同样的写法只有商品（原油监控在用）核实过，其余待服务器上实测；别的类别（ETF、贵金属、未上市、其他）没有确认过写法，不询价。
  */
 export function varInstrument(kind: AssetKind, symbol: string): Instrument | null {
   if (!/^[A-Z0-9]{1,16}$/.test(symbol)) return null;
@@ -36,12 +43,15 @@ export function varInstrument(kind: AssetKind, symbol: string): Instrument | nul
 export function quoteQty(notionalUsd: number, price: number): string | null {
   const raw = notionalUsd / price;
   if (!Number.isFinite(raw) || raw <= 0 || raw >= 1e12) return null;
-  const fixed = Number(raw.toPrecision(4)).toFixed(8);
+  const rounded = Number(raw.toPrecision(4));
+  if (rounded >= 1e12) return null;
+  const fixed = rounded.toFixed(8);
   const text = fixed.includes('.') ? fixed.replace(/0+$/, '').replace(/\.$/, '') : fixed;
   return /[1-9]/.test(text) ? text : null;
 }
 
-const positive = (value: unknown): number => { const parsed = typeof value === 'string' || typeof value === 'number' ? Number(value) : NaN; return Number.isFinite(parsed) && parsed > 0 ? parsed : NaN; };
+/** 正的十进制数：数值，或纯十进制文本（不收十六进制、指数与带空格的写法）。 */
+const positive = (value: unknown): number => { const parsed = typeof value === 'number' ? value : typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value) ? Number(value) : NaN; return Number.isFinite(parsed) && parsed > 0 ? parsed : NaN; };
 /** 解析询价应答：标的与数量要对得上请求，买卖价有效，报价时刻在 [现在 − 15 秒, 现在 + 2 秒] 内。 */
 export function parseTokenQuote(input: unknown, instrument: Instrument, qty: string, now: number): TokenQuote {
   const value = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
@@ -57,20 +67,26 @@ export function parseTokenQuote(input: unknown, instrument: Instrument, qty: str
 /**
  * `dir` 是服务的数据目录（token 文件所在）。被 Var 拒绝的 token 记在内存里不再用，直到文件换成别的 token；
  * 判定只落在发请求时用的那个 token 上，请求途中文件换了新 token 不会把新的标成失效。
+ * 退避：被拦截（403 或质询）后这个 token 停 5 分钟；单个标的询价失败（超时、非 2xx、应答对不上）后这个标的停 5 分钟，
+ * 写法不对的合约不会每分钟重试。调用方中止的请求不算失败。
  */
 export function createVarQuoter({ dir, fetcher, now = Date.now }: { dir: string; fetcher: VariationalFetcher; now?: () => number }): VarQuoter {
   const file = join(dir, VARIATIONAL_SESSION_FILE);
-  let rejected = '', error: string | null = null, okAt: number | null = null, lagMs: number | null = null, unavailable = false;
+  let rejected = '', unavailableToken = '', pausedToken = '', pausedUntil = 0;
+  let failure: { token: string; at: number; message: string } | null = null;
+  let success: { token: string; at: number; lagMs: number } | null = null;
+  const symbolPause = new Map<string, number>();
   const read = (): { token: string; status: TokenStatus; expiresAt: number | null; problem: string } => {
     const { state, problem } = readVariationalSessionFile(file);
     if (!state.token) return { token: '', status: 'missing', expiresAt: null, problem };
     const expiresAt = variationalTokenExpiry(state.token);
     if (expiresAt <= now() + VARIATIONAL_EXPIRY_MARGIN_MS) return { token: '', status: 'expired', expiresAt, problem: '' };
     if (state.token === rejected) return { token: '', status: 'rejected', expiresAt, problem: '' };
-    return { token: state.token, status: unavailable ? 'unavailable' : 'ready', expiresAt, problem: '' };
+    return { token: state.token, status: unavailableToken === state.token ? 'unavailable' : 'ready', expiresAt, problem: '' };
   };
   return {
-    usable: () => read().token !== '',
+    usable: () => { const { token } = read(); return token !== '' && !(token === pausedToken && now() < pausedUntil); },
+    wants: (kind, symbol) => varInstrument(kind, symbol) !== null && !((symbolPause.get(symbol) ?? 0) > now()),
     async quote(kind, symbol, notionalUsd, referencePrice, signal) {
       const instrument = varInstrument(kind, symbol), qty = quoteQty(notionalUsd, referencePrice);
       if (!instrument) throw new Error('该类别的 Var 询价格式未确认');
@@ -79,26 +95,40 @@ export function createVarQuoter({ dir, fetcher, now = Date.now }: { dir: string;
       if (!token) throw new Error('没有可用的 Var token');
       let answer: unknown;
       try { answer = await requestVariational('/quotes/indicative', token, { fetcher, signal, body: { instrument, qty } }); }
-      catch (failure) {
-        const classified = variationalRequestError(failure);
-        if (classified.rejected) rejected = token; else unavailable = true;
-        error = classified.message;
-        throw new Error(classified.message);
+      catch (caught) {
+        // requestVariational 抛出的已经是分类后的错误（固定文案，带 rejected / blocked）；别的才再分类一次。
+        const known = caught as { variational?: boolean; rejected?: boolean; blocked?: boolean; message?: string } | null;
+        const classified = known && typeof known === 'object' && known.variational === true ? known : variationalRequestError(caught);
+        const message = String(classified.message);
+        if (signal.aborted) throw new Error(message);
+        if (classified.rejected) rejected = token;
+        else {
+          unavailableToken = token;
+          if (classified.blocked) { pausedToken = token; pausedUntil = now() + TOKEN_BLOCK_PAUSE_MS; }
+          else symbolPause.set(symbol, now() + TOKEN_SYMBOL_PAUSE_MS);
+        }
+        failure = { token, at: now(), message };
+        throw new Error(message);
       }
       try {
         const quote = parseTokenQuote(answer, instrument, qty, now());
-        unavailable = false; error = null; okAt = quote.receivedAt; lagMs = quote.receivedAt - quote.at;
+        if (unavailableToken === token) unavailableToken = '';
+        success = { token, at: quote.receivedAt, lagMs: quote.receivedAt - quote.at };
         return quote;
-      } catch (failure) {
+      } catch (caught) {
         // 应答读到了但内容不对：多半是这类标的的请求写法或应答格式与预期不同，不算 token 或网络的问题。
-        error = failure instanceof Error ? failure.message : 'Var 询价应答无法解析';
-        throw new Error(error);
+        const message = `${symbol}：${caught instanceof Error ? caught.message : 'Var 询价应答无法解析'}`;
+        symbolPause.set(symbol, now() + TOKEN_SYMBOL_PAUSE_MS);
+        failure = { token, at: now(), message };
+        throw new Error(message);
       }
     },
     view() {
-      const current = read();
-      return { status: current.status, statusName: TOKEN_STATUS_NAMES[current.status], expiresAt: current.expiresAt,
-        error: current.problem || (current.status === 'ready' || current.status === 'unavailable' ? error : null), okAt, lagMs };
+      const current = read(), live = current.status === 'ready' || current.status === 'unavailable';
+      // 一轮里有成功也有失败时两边都留着：最近一次失败的原因保留 90 秒（一轮多一点），不被同一轮里别的成功盖掉。
+      const error = live && failure && failure.token === current.token && now() - failure.at < TOKEN_ERROR_KEEP_MS ? failure.message : null;
+      const ok = live && success && success.token === current.token ? success : null;
+      return { status: current.status, statusName: TOKEN_STATUS_NAMES[current.status], expiresAt: current.expiresAt, error: current.problem || error, okAt: ok?.at ?? null, lagMs: ok?.lagMs ?? null };
     },
   };
 }

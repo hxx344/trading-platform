@@ -49,6 +49,7 @@
 - GitHub CI（分支 `claude/fixable-issues-fcc357`）：
   - [45228613057](https://github.com/hxx344/trading-platform/actions/runs/45228613057)（4a49821）：test (3) 因上述 P1 失败，其余通过。
   - [45230169494](https://github.com/hxx344/trading-platform/actions/runs/45230169494)（1f061b9）：全部通过，含 test 六个分片、install 三部分与 platform-systemd 五组。
+  - [45230904470](https://github.com/hxx344/trading-platform/actions/runs/45230904470)（变基到 v0.82.0 后的 5afa45b）：全部通过（`durations` 按新配置跳过）。
 - 实现子代理在本机跑过资产相关的几个测试文件（违背了本机不跑测试的约定）；结论以 CI 为准。
 
 ## 未运行

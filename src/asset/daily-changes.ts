@@ -3,9 +3,9 @@
 // - the database type is QueryDatabase (query.ts) instead of the workbench openDatabase wrapper;
 // - no owner: this service has one user, so the owner parameter and the `owner = ?` conditions are gone.
 import type { QueryDatabase } from './query.ts';
-import type { Asset, Withdrawal } from './types.ts';
+import type { Asset, QuoteEvidence, Withdrawal } from './types.ts';
 import { assetMeasures, compareEmbeddedWithdrawals, embeddedWithdrawals } from './withdrawals.ts';
-import { analyzePositions, positionsOf, type PositionAnalysis, type PositionsCapture } from './daily-positions.ts';
+import { analyzePositions, positionsOf, quoteOf, type PositionAnalysis, type PositionsCapture } from './daily-positions.ts';
 import { knownAssetValue, knownWorkbookValue, sumKnownValues } from './asset-values.ts';
 import { CASH_FLOW_KEY, intervalCashFlows, readCashFlowAudit, type CashFlowRecord } from './cash-flows.ts';
 
@@ -15,7 +15,7 @@ const DAY_MS = 86_400_000;
 const CENT = 0.005;
 
 type DetailRow = { coin: string; account: string; value: number; price: number };
-type ChangeRow = Pick<Asset, 'id' | 'project' | 'kind' | 'value'> & { mode?: string; quantity?: number | null; details?: DetailRow[] };
+type ChangeRow = Pick<Asset, 'id' | 'project' | 'kind' | 'value'> & { mode?: string; quantity?: number | null; details?: DetailRow[]; quote?: QuoteEvidence };
 export type ChangeSnapshot = { id: string; date: string; total: number; withdrawn?: number; partial?: boolean; future?: boolean; archived?: boolean; rows: ChangeRow[]; positions?: PositionsCapture | null };
 /** Balance lines inside one exchange row, matched by account and coin. */
 export type DetailChange = { label: string; previous: number | null; current: number | null; change: number };
@@ -118,7 +118,7 @@ export function calculateDailyChanges(input: { snapshots: readonly ChangeSnapsho
       positions,
       attribution: { cashFlows, knownPositionChange,
         unexplained: after.adjusted - before.adjusted - withdrawnChange - (cashFlows.knownNetUsd ?? 0) - (knownPositionChange ?? 0),
-        note: '总变化 = 已标注净资金流 + 已知持仓贡献 + 出金加回 + 未解释差额。缺失分项未被认定为零；差额包含未登记资金流、估值和周期证据缺口，不命名为交易收益。快照内兑 USD 价格缺少独立时效元数据，无法证明其当时新鲜。' },
+        note: '总变化 = 已标注净资金流 + 已知持仓贡献 + 出金加回 + 未解释差额。缺失分项未被认定为零；差额包含未登记资金流、估值和周期证据缺口，不命名为交易收益。快照内余额明细的兑 USD 价格缺少独立时效元数据，无法证明其当时新鲜；带独立报价证据的行（Hyperliquid 的 USDC/USD）按持仓采样时刻核对时效，不新鲜即为未知。' },
     });
   }
   return { today: input.today, windowStart, days: result.reverse() };
@@ -133,6 +133,7 @@ const detailsOf = (details: unknown): DetailRow[] | undefined => Array.isArray(d
   !!row && typeof row.coin === 'string' && typeof row.account === 'string' && finite(row.value)).map(row => ({
   coin: row.coin, account: row.account, value: row.value, price: finite(row.price) ? row.price : 0,
 })) : undefined;
+const withQuote = (value: unknown): { quote?: QuoteEvidence } => { const quote = quoteOf(value); return quote ? { quote } : {}; };
 const rowsOf = (rows: unknown, workbook = false): ChangeRow[] => Array.isArray(rows) ? rows.filter((row): row is ChangeRow =>
   !!row && typeof row.id === 'string' && typeof row.project === 'string').map(row => ({
   id: row.id, project: row.project, kind: typeof row.kind === 'string' ? row.kind : '',
@@ -140,6 +141,8 @@ const rowsOf = (rows: unknown, workbook = false): ChangeRow[] => Array.isArray(r
   ...(typeof row.mode === 'string' ? { mode: row.mode } : {}),
   ...(row.quantity === null || finite(row.quantity) ? { quantity: row.quantity } : {}),
   ...(Array.isArray(row.details) ? { details: detailsOf(row.details) } : {}),
+  // The quote evidence a sync kept with the row (issue #63); a malformed one is dropped, a row without one reads as before.
+  ...withQuote(row.quote),
 })) : [];
 
 export async function readDailyChanges(database: ChangeDatabase, now = Date.now(), days = DAILY_CHANGE_DAYS): Promise<DailyChangeReport> {

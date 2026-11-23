@@ -1,5 +1,6 @@
 // Adapted from project_aggregation modules/asset/lib/daily-positions.ts at 0014655.
 import type { Position, PositionCycle } from './positions-types.ts';
+import type { QuoteEvidence } from './types.ts';
 
 /** Positions as cached when a daily snapshot was written; balances and holdings share that moment. */
 export type SnapshotCycle = Pick<PositionCycle, 'status' | 'since' | 'realizedPnl' | 'fees' | 'funding' | 'net' | 'currency' | 'updatedAt'>;
@@ -28,7 +29,7 @@ export type GroupImpact = { id: GroupId; label: string; change: number | null; c
 /** `groups` is empty until two captures can be compared; `recorded` says the current snapshot holds any scope. */
 export type PositionAnalysis = { compared: boolean; recorded: boolean; capturedAt: string; previousCapturedAt: string | null; groups: GroupImpact[] };
 export const POSITION_GROUPS: ReadonlyArray<{ id: GroupId; label: string }> = [...COMBOS.map(({ id, label }) => ({ id, label })), { id: 'other', label: '其他持仓' }];
-type BalanceRow = { mode?: string; value: number | null; details?: { coin: string; value: number; price: number }[] };
+type BalanceRow = { mode?: string; value: number | null; details?: { coin: string; value: number; price: number }[]; quote?: QuoteEvidence };
 
 const CENT = 0.005;
 // Cycle summaries refresh every few minutes, so a flow landing just before a capture can shift to the next day; anything older means the summary stalled.
@@ -59,12 +60,38 @@ const amount = (value: string | null | undefined) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 };
-/** USD per unit of `currency`, from the snapshot's own balance details so the rate matches the balances. */
-function usdRate(currency: string | null, rows: BalanceRow[], exchange: string) {
+/** Rows whose sync stores quote evidence (sync.ts withQuote); evidence on any other row is not trusted. */
+const QUOTE_EVIDENCE_MODES = new Set(['hyperliquid']);
+// The source accepts a quote up to 15 minutes old when it reads it (sources/hyperliquid.ts QUOTE_MAX_AGE_MS); the holdings
+// of the same snapshot are a live read of the last 90 s, so a quote received more than 5 minutes from that observation came
+// from another sync (a later failed read keeps the old row and its quote) and is not this snapshot's price.
+const QUOTE_SOURCE_MAX_AGE = 15 * 60_000, QUOTE_RECEIPT_WINDOW = 5 * 60_000, QUOTE_FUTURE_TOLERANCE = 60_000;
+/** The evidence's USD price when it was fresh at the holdings' observation time `at`; null when it was not. */
+function evidencedRate(quote: QuoteEvidence, at: string): number | null {
+  const observed = Date.parse(at), priced = Date.parse(quote.at), received = Date.parse(quote.receivedAt);
+  if (![observed, priced, received].every(Number.isFinite)) return null;
+  if (priced - received > QUOTE_FUTURE_TOLERANCE || received - priced > QUOTE_SOURCE_MAX_AGE) return null;
+  return Math.abs(received - observed) <= QUOTE_RECEIPT_WINDOW ? quote.usd : null;
+}
+/**
+ * USD per unit of `currency`, from the snapshot's own rows so the rate matches the balances: a row's quote evidence for
+ * that coin (issue #63) decides for its row (its balance details were priced with the same quote, so a stale quote
+ * proves nothing through them either); other rows, and snapshots written before the evidence existed, use the balance
+ * details as before. Only the current snapshot's rows are passed in: a quote never carries over from another snapshot.
+ */
+function usdRate(currency: string | null, rows: BalanceRow[], exchange: string, at: string) {
   if (currency === 'USD') return 1;
   if (!currency) return null;
   const candidates = [...rows.filter(row => row.mode === exchange), ...rows.filter(row => row.mode !== exchange)];
-  for (const row of candidates) for (const detail of row.details ?? []) if (detail.coin === currency && detail.price > 0) return detail.price;
+  for (const row of candidates) {
+    const quote = row.mode !== undefined && QUOTE_EVIDENCE_MODES.has(row.mode) ? quoteOf(row.quote) : undefined;
+    if (quote?.coin === currency) {
+      const rate = evidencedRate(quote, at);
+      if (rate !== null) return rate;
+      continue;
+    }
+    for (const detail of row.details ?? []) if (detail.coin === currency && detail.price > 0) return detail.price;
+  }
   return null;
 }
 const scopeKey = (scope: Pick<SnapshotScope, 'exchange' | 'account' | 'generation' | 'scope'>) => JSON.stringify([scope.exchange, scope.account, scope.generation, scope.scope]);
@@ -118,7 +145,7 @@ export function comparePositions(input: CompareInput): { positions: PositionChan
     const nextPositions = new Map((next?.positions ?? []).map(item => [item.id, item]));
     for (const id of new Set([...nextPositions.keys(), ...oldPositions.keys()])) {
       positions.push(positionChange(oldPositions.get(id), nextPositions.get(id), { usable, previous: previous ? old?.fetchedAt ?? previous.capturedAt : null, current: next?.fetchedAt ?? current.capturedAt },
-        currency => usdRate(currency, input.rows, scope.exchange), scope, JSON.stringify([key, id])));
+        currency => usdRate(currency, input.rows, scope.exchange, next?.fetchedAt ?? current.capturedAt), scope, JSON.stringify([key, id])));
     }
   }
   return { positions, readable };
@@ -140,6 +167,16 @@ export function analyzePositions(input: Omit<CompareInput, 'current'> & { curren
 
 const isText = (value: unknown, max = 200): value is string => typeof value === 'string' && value.length <= max;
 const decimalOrNull = (value: unknown) => isText(value, 128) && /^-?\d+(?:\.\d+)?$/.test(value) ? value : null;
+const isTime = (value: unknown): value is string => isText(value, 40) && Number.isFinite(Date.parse(value));
+/** A row's stored quote evidence (issue #63), re-validated on read; malformed evidence is dropped, never repaired. */
+export function quoteOf(value: unknown): QuoteEvidence | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const raw = value as Record<string, unknown>;
+  if (!isText(raw.coin, 20) || !raw.coin || typeof raw.usd !== 'number' || !Number.isFinite(raw.usd) || raw.usd <= 0
+    || !isText(raw.source, 100) || !raw.source || !isTime(raw.at) || !isTime(raw.receivedAt)) return undefined;
+  return { coin: raw.coin, usd: raw.usd, source: raw.source, at: raw.at, receivedAt: raw.receivedAt };
+}
+
 /** Stored JSON is re-validated on read; malformed captures are dropped rather than trusted. */
 export function positionsOf(value: unknown): PositionsCapture | null {
   if (!value || typeof value !== 'object') return null;

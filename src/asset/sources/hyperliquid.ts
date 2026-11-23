@@ -1,7 +1,8 @@
 // Copied from project_aggregation modules/asset/lib/hyperliquid.ts at 0014655.
 // Changes: imports point at ./concurrency.ts, src/vendor and ../types.ts; the CoinGecko quote is asked at the address the
-// other sources use (./quotes.ts COINGECKO_QUOTES) so one sync shares the answer. Logic, caches, the 12 s per-request timeout, the 40 s sync budget, limits and messages are unchanged.
-import type { Balance } from '../types.ts';
+// other sources use (./quotes.ts COINGECKO_QUOTES) so one sync shares the answer; the sync also returns the USDC/USD quote it
+// used, with its source and times (issue #63). Logic, caches, the 12 s per-request timeout, the 40 s sync budget, limits and messages are unchanged.
+import type { Balance, QuoteEvidence } from '../types.ts';
 import type { Position } from '../positions-types.ts';
 import { decimal as positionDecimal, isZero, optionalDecimal as optionalPositionDecimal, position, record, rows, text, uniquePositions } from '../positions-values.ts';
 import { mapConcurrent } from './concurrency.ts';
@@ -257,13 +258,17 @@ async function quoteJson(url: string, fetcher: Fetcher, deadline: AbortSignal): 
   const data = await boundedJson(response, QUOTE_MAX_BYTES);
   return object(data) ? { data, at: priceReceivedAt(response) } : fail(HYPERLIQUID_ERRORS.quote);
 }
-async function usdcQuote(fetcher: Fetcher, deadline: AbortSignal): Promise<{ price: number; at: number }> {
+/** The USDC/USD price, the source's time of it (`at`), when it was received and from where (kept as the row's QuoteEvidence). */
+type UsdcQuote = { price: number; at: number; receivedAt: number; source: string };
+export const HYPERLIQUID_QUOTE_SOURCES = { coingecko: 'CoinGecko / USD', coinbase: 'Coinbase / USD（获取时间）' } as const;
+async function usdcQuote(fetcher: Fetcher, deadline: AbortSignal): Promise<UsdcQuote> {
   try {
-    const coin = (await quoteJson(COINGECKO, fetcher, deadline)).data['usd-coin'];
+    const { data, at: receivedAt } = await quoteJson(COINGECKO, fetcher, deadline);
+    const coin = data['usd-coin'];
     if (!object(coin) || typeof coin.usd !== 'number' || !Number.isFinite(coin.usd) || coin.usd <= 0 || typeof coin.last_updated_at !== 'number') fail(HYPERLIQUID_ERRORS.quote);
     const at = (coin as Json).last_updated_at as number * 1000;
     if (!Number.isSafeInteger(at) || at <= 0 || Date.now() - at > QUOTE_MAX_AGE_MS || at - Date.now() > FUTURE_TOLERANCE_MS) fail(HYPERLIQUID_ERRORS.quote);
-    return { price: (coin as Json).usd as number, at };
+    return { price: (coin as Json).usd as number, at, receivedAt, source: HYPERLIQUID_QUOTE_SOURCES.coingecko };
   } catch {
     try {
       const { data, at } = await quoteJson(COINBASE, fetcher, deadline);
@@ -271,23 +276,26 @@ async function usdcQuote(fetcher: Fetcher, deadline: AbortSignal): Promise<{ pri
       const price = decimal(((data.data as Json).rates as Json).USD, HYPERLIQUID_ERRORS.quote);
       if (price <= 0) fail(HYPERLIQUID_ERRORS.quote);
       // Coinbase publishes no rate timestamp here; keep the retrieval time.
-      return { price, at };
+      return { price, at, receivedAt: at, source: HYPERLIQUID_QUOTE_SOURCES.coinbase };
     } catch { return fail(HYPERLIQUID_ERRORS.quote); }
   }
 }
 
+export type HyperliquidBalance = { total: number; details: Balance[]; updatedAt: string; quote: QuoteEvidence };
 /**
  * The total is Hyperliquid's account value (spot, every perp DEX, vault equity and staked HYPE) converted once.
  * Only the portfolio value and the USDC quote decide whether a sync succeeds; detail reads that fail leave a note row instead.
+ * The quote the total was converted with comes back on its own (`quote`), so it survives detail rows that failed or hold no
+ * USDC (issue #63: the daily position attribution needs the USDC/USD price of this read).
  */
-export async function syncHyperliquid(c: HyperliquidCredential, fetcher: Fetcher = fetch, options: { verifyRole?: boolean; budgetMs?: number } = {}): Promise<{ total: number; details: Balance[]; updatedAt: string }> {
+export async function syncHyperliquid(c: HyperliquidCredential, fetcher: Fetcher = fetch, options: { verifyRole?: boolean; budgetMs?: number } = {}): Promise<HyperliquidBalance> {
   const user = address(c?.walletAddress);
   // Aborting on exit stops reads that no longer matter once the outcome is decided, sparing the shared rate limit.
   const done = new AbortController();
   const deadline = anySignal([done.signal], options.budgetMs ?? SYNC_BUDGET_MS);
   try { return await collect(user, fetcher, deadline, !!options.verifyRole); } finally { done.abort(); }
 }
-async function collect(user: string, fetcher: Fetcher, deadline: AbortSignal, checkRole: boolean): Promise<{ total: number; details: Balance[]; updatedAt: string }> {
+async function collect(user: string, fetcher: Fetcher, deadline: AbortSignal, checkRole: boolean): Promise<HyperliquidBalance> {
   const read: Read = body => info(body, fetcher, deadline);
   const startedAt = Date.now();
   const role = checkRole ? settle(verifyRole(user, read)) : null;
@@ -337,5 +345,8 @@ async function collect(user: string, fetcher: Fetcher, deadline: AbortSignal, ch
     ...((separate && !perpRead?.ok) || !spot.ok || !vaults.ok || !staked.ok ? [note('部分明细读取失败；总额不受影响')] : []),
     ...(marketRead && !marketRead.ok ? [note('现货报价读取失败，非 USDC 代币未估值；总额不受影响')] : []),
   ];
-  return { total: usd(value.quantity, quote.price), details, updatedAt: new Date(Math.min(fetchedAt, value.at, quote.at)).toISOString() };
+  return {
+    total: usd(value.quantity, quote.price), details, updatedAt: new Date(Math.min(fetchedAt, value.at, quote.at)).toISOString(),
+    quote: { coin: 'USDC', usd: quote.price, source: quote.source, at: new Date(quote.at).toISOString(), receivedAt: new Date(quote.receivedAt).toISOString() },
+  };
 }

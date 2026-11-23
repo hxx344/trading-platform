@@ -82,6 +82,15 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
 - `GET /api/asset/withdrawals`、`GET /api/asset/cash-flows`：只读列表（资金流含有效记录、全部审计版本与作废记录）。
 - 还没导入时这些接口返回 200 与空数据并标明 `imported: false`，不报错。库读取出错时返回 500 `asset_unreadable` 并带原因（库内数据格式无效时只说明需要重新导入，不带内容）；这时“资产”标签照常显示。审查记录见 [reviews/2026-11-13-asset-a1.md](reviews/2026-11-13-asset-a1.md)。
 
+**一次应答读同一份账本**（issue #11，A-1 审查登记的建议项）
+
+- 问题：一次应答由多条 SELECT 拼成（先读 `import-info`，再分别读资产、设置、连接、快照），没有包在同一读事务里。另一个进程（「从工作台导入」）恰好在两条之间提交整体替换时，同一应答会混有新旧两代：导入时刻属于旧账本，资产或历史已经是新账本。
+- 做法：`store.ts` 在服务原有连接之外，另开一个只读连接（`db.ts` 的 `snapshot` 模式，`busy_timeout` 1 秒，同服务连接），读接口（state、ledger、history、period、daily-changes、withdrawals、cash-flows，以及写入后返回的账本视图）都经 `db.ts` 的 `snapshot()`：`BEGIN` 后在同一个同步调用里依次读 `import-info` 和该接口的全部查询，然后 `COMMIT`。WAL 下读事务看到的是第一条查询时已提交的状态，期间别的连接照常提交，不等待；事务从不跨 `await`，也不在共享写连接上持锁，不卡交易循环。出错时先 `ROLLBACK` 再抛出，`store.ts` 还会关掉这个只读连接，下次读取重新打开。
+- 拷来的读取函数（`readLedger`、`readSnapshotHistory`、`readDailyChanges`、`loadCashFlows`、`readPeriodRows`）是 async 的，但它们在第一次 `await` 之前就把全部查询发出（`Promise.all`）。`readPeriodRows` 原来分两次 `await` 读，改为同时发出。读取事务结束后再发出的查询直接报错（`SNAPSHOT_CLOSED`），不会读到更新的状态；以后改这些函数时，查询要在第一次 `await` 之前全部发出。
+- 写入（A-2 起的编辑、同步、导入原表）仍在服务连接上、同步锁里读写，不变；写入提交后再经只读连接读应答，能看到刚写的内容。
+- 库结构不变，没有数据迁移；回退到之前的版本照常读库。
+- 测试：`test/asset-store.test.ts` 两例。一例用两套可区分的账本 A（alice）与 B（bob），在每个接口读完 `import-info`、发出下一条查询之前由另一连接提交 B，要求应答整份等于 A、下一次读取整份等于 B（去掉读事务时这一例失败）；另一例验证 `import-info` 损坏时读取报错且事务释放（随后的导入立即可见），`snapshot()` 结束后发出的查询报错、抛错时回滚、事务进行中另一连接可以提交且本事务看不到它。
+
 **页面**
 
 - 地址 `#/asset`，标签“资产”，只在 `/api/asset/state` 有应答时显示；页面在 `.aster-module` 之外，自带 `.asset-desk` 外壳。
@@ -254,6 +263,15 @@ Binance、Bybit 和 OKX 的持仓页用实时账户快照确定当前方向和�
 - 每两份快照按合约标的归入原油、海力士、ANT 或其他持仓，单腿也归入对应标的。Hyperliquid 使用资产里保存的钱包地址读取 `xyz`、`io` 永续仓位，按合约全名识别原油、海力士和 ANT，并保留交易所采样时间。中心化交易所的 ANT 按基础名 `ANTHROPIC` 或 `ANT` 识别（v0.80.3 起 Binance 上的 `ANT` 也算：Binance 在 2026-11-17 把 `ANTHROPICUSDT` 换成 `ANTUSDT`，见 [monitor.md](monitor.md)「Binance 腿改读 ANTUSDT」）；旧快照里 Binance 的 `ANTUSDT` 持仓随之从其他持仓改归 ANT，其他交易所的同名合约不变。两处目前提供浮盈亏，按快照内可核实的结算币价格折 USD，显示为部分贡献。
 - 已配置范围读取失败、持仓快照缺失、换连接以及重复采样时保留未知。已平仓或本轮盈亏不可比时只计能核对的部分。旧快照已有的持仓按新规则归类，缺少覆盖记录的组保留未知。资产总额、资金流和出金沿用现有口径。
 - 回滚版本为 v0.62.0。快照增加可选的持仓覆盖标记，旧版本可继续读取。
+
+**Hyperliquid 的 USDC/USD 报价随快照保存**（issue #63）
+
+- 问题：Hyperliquid 的总额由 USDC 余额按当时的 USDC/USD 报价折算，但报价只用在总额上，没有留在行里。余额明细读取失败或明细里没有 USDC 时，归因找不到兑 USD 价格，只能记为未知；而明细里的价格本身也没有独立时效。
+- 做法：`sources/hyperliquid.ts` 的读取结果带回本次折算用的报价证据 `quote`：`coin`（`USDC`）、`usd`（报价，不写死 1）、`source`（`CoinGecko / USD`，或 CoinGecko 失败时的 `Coinbase / USD（获取时间）`）、`at`（报价源给出的时间；Coinbase 没有，用获取时间）、`receivedAt`（收到报价的时间）。`sync.ts` 把它存进该资产行（`types.ts` 的 `Asset.quote`），随行进入当天快照；同步失败保留旧值时连同旧证据一起保留，新读取没有报价时去掉旧证据，不会留下与余额不对应的报价。
+- 归因（`daily-positions.ts`）只信 `hyperliquid` 模式行自带的证据，并且只用当前这份快照里这一行的证据，不跨快照、不跨行借用，也不拿现价回填历史。证据要通过格式校验（`quoteOf`：币种、正的有限报价、来源、可解析的两个时间），且按持仓采样时刻（`fetchedAt`，缺失时用快照时间）核对时效：报价源时间晚于收到时间不超过 60 秒、早于收到时间不超过 15 分钟，收到时间与持仓采样相差不超过 5 分钟。任一不满足就把这一行当作没有兑 USD 价格（结果为未知，不按 0 计）；证据存在且币种相符时，它代替这一行的明细价格。没有证据的旧快照和其他交易所的行沿用原来的明细口径。
+- 换连接、重复或倒序的采样仍不可比，有报价也不变。
+- 库结构不变。行与快照的 JSON 增加可选的 `quote` 字段，旧版本忽略它；回退后旧版本会把行里的旧 `quote` 原样留着，升级回来时它因时间对不上持仓采样而不被采用。
+- 测试：`test/asset-sources-hyperliquid.test.ts`「the USDC/USD quote of the total comes back with its source and times even when no detail row holds USDC (#63)」；`test/asset-sync.test.ts`「Hyperliquid keeps the USDC/USD quote of each read with its row and daily snapshot; a read without one drops it (#63)」；`test/asset-daily-changes.test.ts` 中 4 例：明细失败时按非 1 报价折算且只计一次；缺失、过期、错位或格式错误的证据保持未知，旧快照照旧；有效报价不让换连接和重复、倒序采样变得可比；证据经快照存取往返后来源与时间不变，损坏的被丢弃。
 
 ## A-6：原表导入（A08）
 

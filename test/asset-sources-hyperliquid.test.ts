@@ -261,6 +261,20 @@ test('one overall deadline bounds every request, including the quote fallback', 
   await assert.rejects(syncHyperliquid({ walletAddress: ADDRESS }, slowQuote, { budgetMs: 60 }), { message: HYPERLIQUID_ERRORS.quote });
 });
 
+test('the USDC/USD quote of the total comes back with its source and times even when no detail row holds USDC (#63)', async t => {
+  const now = Date.parse('2026-11-07T08:00:00.500Z');
+  t.mock.timers.enable({ apis: ['Date'], now });
+  const down = () => new Response('down', { status: 500 });
+  const result = await sync({ userAbstraction: () => 'unifiedAccount', spotClearinghouseState: down, userVaultEquities: down, delegatorSummary: down },
+    () => Response.json({ 'usd-coin': { usd: 0.9987, last_updated_at: Math.floor(now / 1000) - 60 } }));
+  assert.equal(result.details.some(row => row.coin === 'USDC'), false, 'every balance detail failed');
+  close(result.total, 150.5 * 0.9987);
+  assert.deepEqual(result.quote, { coin: 'USDC', usd: 0.9987, source: 'CoinGecko / USD', at: new Date(Math.floor(now / 1000) * 1000 - 60_000).toISOString(), receivedAt: new Date(now).toISOString() });
+  const fallback = await sync({}, url => url === GECKO ? down() : Response.json({ data: { currency: 'USDC', rates: { USD: '1.0002' } } }));
+  // Coinbase publishes no rate time: the receipt time is both.
+  assert.deepEqual(fallback.quote, { coin: 'USDC', usd: 1.0002, source: 'Coinbase / USD（获取时间）', at: new Date(now).toISOString(), receivedAt: new Date(now).toISOString() });
+});
+
 test('USDC/USD falls back to Coinbase and fails closed when no current quote exists', async () => {
   close((await sync({}, url => url === GECKO ? new Response('down', { status: 503 }) : Response.json({ data: { currency: 'USDC', rates: { USD: '0.999' } } }))).total, 150.5 * 0.999);
   await assert.rejects(sync({}, url => url === GECKO ? Response.json({ 'usd-coin': { usd: 1, last_updated_at: Math.floor(Date.now() / 1000) - 3600 } }) : new Response('down', { status: 500 })), { message: HYPERLIQUID_ERRORS.quote });

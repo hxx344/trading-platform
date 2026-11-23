@@ -7,6 +7,7 @@ import { comboOf, comparePositions, type GroupId, type PositionAnalysis, type Po
 import { openAssetDb, type AssetDb } from '../src/asset/db.ts';
 import { readSnapshotHistory } from '../src/asset/snapshot-history.ts';
 import { CASH_FLOW_KEY } from '../src/asset/cash-flows.ts';
+import type { QuoteEvidence } from '../src/asset/types.ts';
 import { randomUUID } from 'node:crypto';
 
 const batch = (database: AssetDb, statements: { run(): number }[]) => database.replace(() => { for (const statement of statements) statement.run(); });
@@ -502,4 +503,86 @@ test('ANT follows existing complete, partial and unknown rules for daily holding
   const empty = group(analyze(capture(previous.capturedAt, []), capture(current.capturedAt, [])), 'anthropic');
   assert.equal(empty.change, 0); assert.equal(empty.complete, true);
   assert.deepEqual(analyze(undefined, current).groups, [], 'the first capture does not invent previous holdings');
+});
+
+// Issue #63: Hyperliquid keeps the USDC/USD quote of its read with the row, so holdings can be valued when the balance
+// details failed or hold no USDC. Evidence must be fresh at the holdings' observation time and belong to that snapshot.
+const T0 = '2026-10-21T15:00:00.000Z', T1 = '2026-10-22T15:00:00.000Z';
+const minutes = (at: string, delta: number) => new Date(Date.parse(at) + delta * 60_000).toISOString();
+const evidence = (usd: number, at: string, receivedAt = at): QuoteEvidence => ({ coin: 'USDC', usd, source: 'CoinGecko / USD', at, receivedAt });
+type HlRow = ChangeSnapshot['rows'][number];
+const FAILED_DETAILS = [{ coin: '—', account: '部分明细读取失败；总额不受影响', value: 0, price: 0 }];
+const hlRow = (value: number, quote?: unknown, details: { coin: string; account: string; value: number; price: number }[] = FAILED_DETAILS) =>
+  ({ id: 'row-7', project: 'Hyperliquid', kind: '资产', value, mode: 'hyperliquid', details, ...(quote === undefined ? {} : { quote }) }) as HlRow;
+const hlLeg = (upnl: string) => ({ id: 'xyz:CL', symbol: 'xyz:CL', instrumentId: 'xyz:CL', side: 'long' as const, quantity: '2', quantityUnit: '标的', unrealizedPnl: upnl, pnlCurrency: 'USDC', cycle: null });
+const hlCapture = (at: string, upnl: string, generation = 'g1'): PositionsCapture => ({ capturedAt: at, scopeCoverage: 'configured', scopes: [
+  { exchange: 'hyperliquid', account: 'hyperliquid', accountName: 'Hyperliquid', generation, scope: 'xyz', status: 'live', fetchedAt: at, positions: [hlLeg(upnl)] },
+] });
+const hlDay = (previousRow: HlRow, currentRow: HlRow, previous = hlCapture(T0, '10'), current = hlCapture(T1, '30')) =>
+  calculateDailyChanges({ ...base, snapshots: [snap('2026-10-21', [previousRow], { positions: previous }), snap('2026-10-22', [currentRow], { positions: current })] }).days[0]!;
+const oilOf = (day: ReturnType<typeof hlDay>) => group(day.positions!, 'oil');
+
+test('#63 the row quote values Hyperliquid holdings when the balance details failed, at a non-1 rate, counted once', () => {
+  // A stored row as a later read sees it (rowsOf re-validates the evidence).
+  const day = hlDay(hlRow(1000), hlRow(1050, evidence(0.999, minutes(T1, -1), minutes(T1, -0.1))));
+  const oil = oilOf(day);
+  assert.ok(Math.abs(oil.change! - 20 * 0.999) < 1e-9, 'unrealized change in USDC at the snapshot quote');
+  assert.equal(oil.complete, false, 'funding and fees are not in the change');
+  assert.equal(day.change, 50, 'the total change is the balance change, never the position change added again');
+  assert.ok(Math.abs(day.attribution.knownPositionChange! - 19.98) < 1e-9);
+  assert.ok(Math.abs(day.attribution.unexplained - (50 - 19.98)) < 1e-9);
+  // Each snapshot uses its own quote: the previous snapshot's 0.5 is never applied to the current holdings.
+  const own = hlDay(hlRow(1000, evidence(0.5, minutes(T0, -1))), hlRow(1050, evidence(1.0004, minutes(T1, -2))));
+  assert.ok(Math.abs(oilOf(own).change! - 20 * 1.0004) < 1e-9);
+  const onlyPrevious = hlDay(hlRow(1000, evidence(0.999, minutes(T0, -1))), hlRow(1050));
+  assert.equal(oilOf(onlyPrevious).change, null, 'a quote never carries over from the previous snapshot');
+});
+
+test('#63 a missing, stale, misplaced or malformed quote stays unknown, never zero; old snapshots read as before', () => {
+  const unknown = (currentRow: HlRow, message: string) => {
+    const day = hlDay(hlRow(1000), currentRow);
+    assert.deepEqual([oilOf(day).change, oilOf(day).complete], [null, false], message);
+    // Only the groups proven empty (read live at both captures, no legs) count, as zero; the unknown leg adds nothing.
+    assert.equal(day.attribution.knownPositionChange, 0, message);
+    assert.equal(day.attribution.unexplained, 50, message);
+  };
+  unknown(hlRow(1050), 'an old snapshot without evidence and without a USDC detail');
+  unknown(hlRow(1050, evidence(0.999, minutes(T1, -16), minutes(T1, -16))), 'received more than 5 minutes before the holdings were observed');
+  unknown(hlRow(1050, evidence(0.999, minutes(T1, 6), minutes(T1, 6))), 'received more than 5 minutes after them');
+  unknown(hlRow(1050, evidence(0.999, minutes(T1, -20), minutes(T1, -1))), 'older than the source allows when it was received');
+  unknown(hlRow(1050, evidence(0.999, minutes(T1, 3), minutes(T1, 1))), 'priced after it was received');
+  unknown(hlRow(1050, { ...evidence(0.999, T1), usd: '0.999' }), 'a malformed price');
+  unknown(hlRow(1050, { ...evidence(0.999, T1), usd: 0 }), 'a zero price');
+  unknown(hlRow(1050, { ...evidence(0.999, T1), coin: 'USDT' }), 'a quote of another coin');
+  unknown(hlRow(1050, { ...evidence(0.999, T1), receivedAt: 'yesterday' }), 'an unreadable time');
+  unknown({ ...hlRow(1050, evidence(0.999, T1)), mode: 'manual' }, 'evidence on a row whose sync does not write it');
+  // A stale quote also discredits the details its read priced with it.
+  unknown(hlRow(1050, evidence(0.999, minutes(T1, -30)), [{ coin: 'USDC', account: '现货余额', value: 50, price: 0.999 }]), 'stale evidence with a USDC detail of the same read');
+  const [leg] = comparePositions({ previous: hlCapture(T0, '10'), current: hlCapture(T1, '30'), rows: [hlRow(1050)] }).positions;
+  assert.deepEqual([leg!.change, leg!.note], [null, '缺少 USDC 兑 USD 价格']);
+  // A snapshot written before the evidence existed still uses its USDC detail.
+  const old = hlDay(hlRow(1000), hlRow(1050, undefined, [{ coin: 'USDC', account: '现货余额', value: 50, price: 0.998 }]));
+  assert.ok(Math.abs(oilOf(old).change! - 20 * 0.998) < 1e-9);
+});
+
+test('#63 a valid quote does not make replaced connections or repeated and reversed observations comparable', () => {
+  assert.equal(oilOf(hlDay(hlRow(1000), hlRow(1050, evidence(0.999, T1)), hlCapture(T0, '10'), hlCapture(T1, '30', 'replaced'))).change, null, 'a new connection generation');
+  assert.equal(oilOf(hlDay(hlRow(1000), hlRow(1050, evidence(0.999, T0)), hlCapture(T0, '10'), hlCapture(T0, '30'))).change, null, 'the same observation time twice');
+  const earlier = minutes(T0, -60);
+  assert.equal(oilOf(hlDay(hlRow(1000), hlRow(1050, evidence(0.999, earlier)), hlCapture(T0, '10'), hlCapture(earlier, '30'))).change, null, 'an observation older than the previous one');
+});
+
+test('#63 the quote evidence survives the stored snapshot round trip with its source and times; a broken one is dropped', async t => {
+  const database = openAssetDb(':memory:'); t.after(() => database.close());
+  const quote = evidence(0.9995, minutes(T1, -1), minutes(T1, -0.5));
+  const insert = (date: string, row: HlRow, positions: PositionsCapture) => database.prepare('INSERT OR REPLACE INTO snapshots VALUES(?,?)')
+    .bind(date, JSON.stringify({ id: 'daily-' + date, date, total: row.value, withdrawn: 0, assets: [row], positions })).run();
+  insert('2026-10-21', hlRow(1000), hlCapture(T0, '10'));
+  insert('2026-10-22', hlRow(1050, quote), hlCapture(T1, '30'));
+  const stored = JSON.parse(database.prepare("SELECT data FROM snapshots WHERE date = '2026-10-22'").get<{ data: string }>()!.data);
+  assert.deepEqual(stored.assets[0].quote, quote, 'price, source, source time and receipt time are kept');
+  const read = async () => (await readDailyChanges(database, Date.parse('2026-10-23T04:00:00Z'))).days[0]!;
+  assert.ok(Math.abs(oilOf(await read()).change! - 20 * 0.9995) < 1e-9);
+  insert('2026-10-22', hlRow(1050, { ...quote, source: 42 }), hlCapture(T1, '30'));
+  assert.equal(oilOf(await read()).change, null, 'a malformed stored quote is not trusted');
 });

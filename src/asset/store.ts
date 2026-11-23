@@ -1,12 +1,15 @@
 // The service's reads and writes of asset.sqlite. The file is opened on first use and only if it exists, so a service
 // started before the first import serves "not imported" and picks the data up once import.ts has written it (WAL lets
-// the import commit while this connection stays open). Since A-2 it is opened read-write (one connection, so a write
-// shows in the next read) and falls back to read-only when the service cannot write it; the writes (writes.ts) run under
-// the sync lock (sync-lock.ts). Since A-5 it also holds the positions and fills services (positions-service.ts,
+// the import commit while this connection stays open). Since A-2 it is opened read-write and falls back to read-only
+// when the service cannot write it; the writes (writes.ts) run under the sync lock (sync-lock.ts). The answers of the
+// read endpoints come from a second, read-only connection to the same file, each in one short synchronous read
+// transaction (db.ts snapshot()): the import record and the data of one answer are read from one committed state, so an
+// import committed by another process between two of its statements cannot mix two ledgers (issue #11). A write commits
+// before its answer is read, so the answer shows it. Since A-5 it also holds the positions and fills services (positions-service.ts,
 // fills-service.ts): they read the saved connections of the open file on every use and live as long as the store.
 import { statSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { assertOwnFiles, openAssetDb, type AssetDb } from './db.ts';
+import { assertOwnFiles, openAssetDb, type AssetDb, type SnapshotDb } from './db.ts';
 import type { QueryDatabase } from './query.ts';
 import type { Asset, Connection, Ledger } from './types.ts';
 import { seedLedger, type SourceLedger } from './seed.ts';
@@ -71,6 +74,7 @@ function assembleLedger(rows: LedgerRows, includeHistory: boolean, at: number): 
 /** A file imported before A-3 and opened read-only has no connections table: nothing is connected. */
 const noConnectionsTable = (error: unknown): string[] => { if (error instanceof Error && /no such table: connections/.test(error.message)) return []; throw error; };
 const CONNECTION_NAMES = 'SELECT exchange FROM connections';
+const IMPORT_INFO = "SELECT value FROM settings WHERE key = 'import-info'";
 
 export async function readLedger(database: QueryDatabase, includeHistory: boolean, at = Date.now()): Promise<Ledger> {
   const [rows, settings, connections, snapshotRows] = await Promise.all([
@@ -104,12 +108,15 @@ export async function loadCashFlows(database: QueryDatabase): Promise<CashFlowRe
  * (0014655): no owner; null where the workbench answers 404.
  */
 export async function readPeriodRows(database: QueryDatabase, id: string): Promise<Asset[] | null> {
-  const source = await database.prepare("SELECT value FROM settings WHERE key = 'source-ledger'").first<{ value: string }>();
+  const recorded = /^daily-\d{4}-\d{2}-\d{2}$/.test(id) || /^archive-[a-f0-9-]{36}-\d+$/.test(id);
+  // Both statements start before the first await, so a snapshot read (db.ts) runs them in one read transaction.
+  const [source, row] = await Promise.all([
+    database.prepare("SELECT value FROM settings WHERE key = 'source-ledger'").first<{ value: string }>(),
+    recorded ? database.prepare('SELECT data FROM snapshots WHERE date = ?').bind(id.startsWith('daily-') ? id.slice(6) : id).first<{ data: string }>() : Promise.resolve(null),
+  ]);
   const raw: SourceLedger | null = source ? JSON.parse(source.value) : null;
   const original = raw?.periods.find(p => p.id === id);
   if (original) return original.rows.map(row => ({ ...row, value: knownAssetValue(row) })) as Asset[];
-  if (!/^daily-\d{4}-\d{2}-\d{2}$/.test(id) && !/^archive-[a-f0-9-]{36}-\d+$/.test(id)) return null;
-  const row = await database.prepare('SELECT data FROM snapshots WHERE date = ?').bind(id.startsWith('daily-') ? id.slice(6) : id).first<{ data: string }>();
   if (!row) return null;
   const rows = JSON.parse(row.data).assets as Asset[] | undefined;
   return rows?.map(asset => ({ ...asset, value: knownAssetValue(asset) })) ?? [];
@@ -191,13 +198,16 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
   const peek = positionsService.peek;
   // Why the open handle is read-only: the files are not the service's to write, or another writer held the file too long.
   let handle: AssetDb | null = null, opened = '', writable = false, busy = false;
+  /** The read-only connection the read answers come from (snapshot() below); opened after `handle`, closed with it. */
+  let reader: AssetDb | null = null;
+  const dropReader = () => { const open = reader; reader = null; open?.close(); };
   /** Which file is at the path: a file deleted and imported again is a new one, and the open handle would keep reading the deleted one. */
   const identity = (): string | null => {
     try { const stat = statSync(file, { bigint: true }); return `${stat.dev}:${stat.ino}`; }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
   };
   const today = (): string => chinaDay(new Date(now()));
-  const drop = () => { handle?.close(); handle = null; writable = false; busy = false; };
+  const drop = () => { dropReader(); handle?.close(); handle = null; writable = false; busy = false; };
   /** Read-write when the service owns the files and can write them; otherwise read-only, so the reads still work. */
   function open(present: string) {
     try { assertOwnFiles(dirname(file)); }
@@ -211,19 +221,40 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     }
     opened = present;
   }
-  /** The open file and its import record; null until an import has committed. */
-  async function current(): Promise<{ database: AssetDb; info: ImportInfo } | null> {
+  /** Opens the file at the path (again, once it was replaced); false while there is none. */
+  function attach(): boolean {
     const present = identity();
     if (handle && present !== opened) drop();
     if (!handle) {
-      if (present === null) return null;
+      if (present === null) return false;
       open(present);
     }
+    return true;
+  }
+  /** The import record; null until an import has committed (an import creating the file has the tables only then). */
+  function importInfo(database: Pick<AssetDb, 'prepare'> | SnapshotDb): ImportInfo | null {
     let row: { value: string } | null;
-    // An import creating the file has the tables only once it commits.
-    try { row = await handle!.prepare("SELECT value FROM settings WHERE key = 'import-info'").first<{ value: string }>(); }
+    try { row = database.prepare(IMPORT_INFO).get<{ value: string }>(); }
     catch (error) { if (error instanceof Error && /no such table/.test(error.message)) return null; throw error; }
-    return row ? { database: handle!, info: parseImportInfo(row.value) } : null;
+    return row ? parseImportInfo(row.value) : null;
+  }
+  /** The open file and its import record, for the writes and the positions and fills services. */
+  async function current(): Promise<{ database: AssetDb; info: ImportInfo } | null> {
+    if (!attach()) return null;
+    const info = importInfo(handle!);
+    return info ? { database: handle!, info } : null;
+  }
+  /**
+   * One read answer from one committed state of the file: the import record and every statement `read` starts before
+   * returning run in one read transaction of the read-only connection; null until an import has committed. A failure
+   * closes that connection (closing ends any transaction left open); the next read opens it again.
+   */
+  function snapshot<T>(read: (database: SnapshotDb, info: ImportInfo) => Promise<T>): Promise<T> | null {
+    if (!attach()) return null;
+    try {
+      reader ??= openAssetDb(file, { mode: 'snapshot' });
+      return reader.snapshot(database => { const info = importInfo(database); return info ? read(database, info) : null; });
+    } catch (error) { dropReader(); throw error; }
   }
   /** The file for a write; a read-only handle is opened again once (its owner may have been fixed since). */
   async function forWrite(): Promise<AssetDb> {
@@ -248,58 +279,51 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
   }
   const stamp = (info: ImportInfo) => ({ imported: true, importedAt: info.importedAt });
   async function ledger(): Promise<AssetLedgerView> {
-    const found = await current(), day = today();
-    if (!found) return notImported.ledger(day);
-    return { ...stamp(found.info), today: day, ...ledgerView(await readLedger(found.database, false), day) };
+    const day = today();
+    return await snapshot(async (database, info) => ({ ...stamp(info), today: day, ...ledgerView(await readLedger(database, false), day) })) ?? notImported.ledger(day);
   }
   async function cashFlows(): Promise<AssetCashFlowsView> {
-    const found = await current();
-    if (!found) return notImported.cashFlows();
-    return { ...stamp(found.info), ...cashFlowsView(await loadCashFlows(found.database)) };
+    return await snapshot(async (database, info) => ({ ...stamp(info), ...cashFlowsView(await loadCashFlows(database)) })) ?? notImported.cashFlows();
   }
   return {
     async state() {
-      const found = await current();
-      if (!found) return notImported.state();
-      const { database, info } = found;
-      const [assets, daily, archived, source] = await Promise.all([
-        database.prepare('SELECT COUNT(*) AS count FROM assets').first<{ count: number }>(),
-        database.prepare(`SELECT COUNT(*) AS count, MIN(date) AS first, MAX(date) AS last FROM snapshots WHERE ${DAILY_KEY}`).first<{ count: number; first: string | null; last: string | null }>(),
-        database.prepare(`SELECT COUNT(*) AS count FROM snapshots WHERE NOT (${DAILY_KEY})`).first<{ count: number }>(),
-        database.prepare("SELECT json_extract(value, '$.source') AS source FROM settings WHERE key = 'source-ledger'").first<{ source: string | null }>(),
-      ]);
-      return {
-        ...stamp(info), source: { file: info.file, owner: info.owner },
-        dataKind: !source ? null : source.source === EXAMPLE_SOURCE ? 'example' : 'personal',
-        assets: Number(assets?.count ?? 0),
-        snapshots: { count: Number(daily?.count ?? 0), first: daily?.first ?? null, last: daily?.last ?? null, archived: Number(archived?.count ?? 0) },
-      };
+      return await snapshot(async (database, info): Promise<AssetState> => {
+        const [assets, daily, archived, source] = await Promise.all([
+          database.prepare('SELECT COUNT(*) AS count FROM assets').first<{ count: number }>(),
+          database.prepare(`SELECT COUNT(*) AS count, MIN(date) AS first, MAX(date) AS last FROM snapshots WHERE ${DAILY_KEY}`).first<{ count: number; first: string | null; last: string | null }>(),
+          database.prepare(`SELECT COUNT(*) AS count FROM snapshots WHERE NOT (${DAILY_KEY})`).first<{ count: number }>(),
+          database.prepare("SELECT json_extract(value, '$.source') AS source FROM settings WHERE key = 'source-ledger'").first<{ source: string | null }>(),
+        ]);
+        return {
+          ...stamp(info), source: { file: info.file, owner: info.owner },
+          dataKind: !source ? null : source.source === EXAMPLE_SOURCE ? 'example' : 'personal',
+          assets: Number(assets?.count ?? 0),
+          snapshots: { count: Number(daily?.count ?? 0), first: daily?.first ?? null, last: daily?.last ?? null, archived: Number(archived?.count ?? 0) },
+        };
+      }) ?? notImported.state();
     },
     ledger,
     async history() {
-      const found = await current(), day = today();
-      if (!found) return notImported.history(day);
-      return { ...stamp(found.info), today: day, ...historyView(await readLedger(found.database, true), day) };
+      const day = today();
+      return await snapshot(async (database, info) => ({ ...stamp(info), today: day, ...historyView(await readLedger(database, true), day) })) ?? notImported.history(day);
     },
     async dailyChanges() {
-      const found = await current();
-      if (!found) {
-        const day = today();
-        return { imported: false, importedAt: null, today: day, windowStart: shiftDay(day, -(DAILY_CHANGE_DAYS - 1)), days: [] };
-      }
-      return { ...stamp(found.info), ...await readDailyChanges(found.database, now()) };
+      const at = now();
+      const found = snapshot(async (database, info) => ({ ...stamp(info), ...await readDailyChanges(database, at) }));
+      if (found) return found;
+      const day = today();
+      return { imported: false, importedAt: null, today: day, windowStart: shiftDay(day, -(DAILY_CHANGE_DAYS - 1)), days: [] };
     },
     async withdrawals() {
-      const found = await current();
-      if (!found) return notImported.withdrawals();
-      return { ...stamp(found.info), ...withdrawalsView(await readLedger(found.database, false)) };
+      return await snapshot(async (database, info) => ({ ...stamp(info), ...withdrawalsView(await readLedger(database, false)) })) ?? notImported.withdrawals();
     },
     cashFlows,
     async period(id) {
-      const found = await current();
-      if (!found) return { imported: false, importedAt: null, rows: [] };
-      const rows = await readPeriodRows(found.database, id);
-      return rows === null ? null : { ...stamp(found.info), rows };
+      const found = snapshot(async (database, info) => {
+        const rows = await readPeriodRows(database, id);
+        return rows === null ? null : { ...stamp(info), rows };
+      });
+      return found ? await found : { imported: false, importedAt: null, rows: [] };
     },
     async editAsset(body) {
       const input = parseEdit(body);

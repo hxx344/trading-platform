@@ -17,6 +17,8 @@
 // - the timestamps come from the injected clock;
 // - disconnect clears the fill cache of that connection in the same transaction (A-5), as the workbench does;
 // - the daily snapshot carries the cached positions through the context's peek (A-5; writes.ts saveSnapshot);
+// - a read that returns the quote it converted with (Hyperliquid's USDC/USD) stores it on the row as `quote`, so every
+//   later daily snapshot of that row keeps the price, its source and times for the position attribution (issue #63);
 // - an Aster account write needs the ledger's Aster row: without one it is refused with the connect message
 //   '未找到交易所资产' before anything is read (the workbench would fail on the missing row while writing);
 // - the market row is refreshed only when the ledger has one (the workbench assumes it);
@@ -28,7 +30,7 @@ import { historyGeneration } from './history-cache.ts';
 import { revisionOf } from './positions-service.ts';
 import { PositionsPermissionError } from './positions-values.ts';
 import { AssetConflict, type SyncLease } from './sync-lock.ts';
-import type { Asset, AsterAccount, Balance, FxStatus, Ledger } from './types.ts';
+import type { Asset, AsterAccount, Balance, FxStatus, Ledger, QuoteEvidence } from './types.ts';
 import type { Vault } from './credentials.ts';
 import { asterKey, aggregateAster, mergeAsterRefresh, readAsterAccounts, type AsterRefresh } from './aster-accounts.ts';
 import { knownAssetValue, refreshMarketAsset } from './asset-values.ts';
@@ -52,7 +54,7 @@ import { syncVariational, type VariationalCredential } from './sources/variation
 import { yuanQuote } from './sources/fx.ts';
 
 type Prices = Record<string, Quote>;
-type Read = { total: number; details: Balance[]; updatedAt?: string };
+type Read = { total: number; details: Balance[]; updatedAt?: string; quote?: QuoteEvidence };
 type DatedRead = Read & { updatedAt: string };
 /** The external reads, as the workbench's lib modules export them. */
 export interface AssetSources {
@@ -99,6 +101,14 @@ export interface SyncContext {
 }
 type Run = () => void;
 const iso = (at: number) => new Date(at).toISOString();
+/**
+ * A read's values with the quote evidence of that same read (issue #63): a read without one drops the row's earlier
+ * evidence, so a quote never stays with values it did not price. A failed read keeps the old values and their evidence.
+ */
+const withQuote = (asset: Asset, result: Pick<Read, 'quote'>): Asset => {
+  const { quote: _previous, ...rest } = asset;
+  return result.quote ? { ...rest, quote: result.quote } : rest;
+};
 const message = (error: unknown, fallback: string) => error instanceof Error ? error.message : fallback;
 
 const assetStatement = (database: AssetDb, asset: Asset): Run => () => { database.prepare('UPDATE assets SET data = ? WHERE id = ?').bind(JSON.stringify(asset), asset.id).run(); };
@@ -159,7 +169,7 @@ export async function connect(ctx: SyncContext, input: Credentials): Promise<voi
   const at = ctx.now(), now = iso(at);
   const updatedAt = result.updatedAt ?? now;
   const status = input.exchange === 'gate' || input.exchange === 'hyperliquid' ? '只读同步 · 估值时间' : input.exchange === 'variational' || input.exchange === 'rh-lighter' ? '只读同步 · 获取时间' : '只读同步';
-  const next: Asset = { ...asset, mode: input.exchange, quantity: result.total, price: 1, value: result.total, status, updatedAt, error: undefined, details: result.details };
+  const next: Asset = { ...withQuote(asset, result), mode: input.exchange, quantity: result.total, price: 1, value: result.total, status, updatedAt, error: undefined, details: result.details };
   const label = input.exchange === 'variational' ? {} : { label: input.exchange === 'hyperliquid' || input.exchange === 'rh-lighter' ? input.walletAddress.slice(-4) : input.apiKey.slice(-4) };
   const connection = { configured: true, lastSync: now, error: null, scope: ledger.connections[input.exchange].scope, ...label };
   // Persist a verified connection and its balance together; failed verification changes neither.
@@ -284,7 +294,7 @@ export async function refresh(ctx: SyncContext, refreshPositions?: () => Promise
   const dated = (exchange: DatedSource, read: (credentials: never) => Promise<DatedRead>) => source(exchange, async (row, asset) => {
     const credentials = vault.unseal(row.encrypted, exchange) as never;
     const result = await read(credentials);
-    return { asset: { ...asset, quantity: result.total, price: 1, value: result.total, details: result.details, updatedAt: result.updatedAt, status: DATED[exchange].status, error: undefined } };
+    return { asset: { ...withQuote(asset, result), quantity: result.total, price: 1, value: result.total, details: result.details, updatedAt: result.updatedAt, status: DATED[exchange].status, error: undefined } };
   }, error => {
     const { prefix, hidden } = DATED[exchange];
     if (prefix === null) return message(error, hidden);

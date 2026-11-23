@@ -17,7 +17,7 @@ import { createAssetStore, currentLedger } from '../src/asset/store.ts';
 import { acquireSyncLock, LEDGER_REIMPORTED, LOCK_BUSY, LOCK_LOST } from '../src/asset/sync-lock.ts';
 import { CREDENTIAL_KEY_FILE, credentialKey, unseal } from '../src/asset/credentials.ts';
 import type { AssetSources } from '../src/asset/sync.ts';
-import type { Balance, FxStatus } from '../src/asset/types.ts';
+import type { Balance, FxStatus, QuoteEvidence } from '../src/asset/types.ts';
 import { bindAccounts, createHarness } from './harness.ts';
 import { OWNER, writeWorkbenchLedger } from './asset-fixture.ts';
 
@@ -39,6 +39,7 @@ function fakeSources() {
   const control = {
     held: new Set<string>(), values: new Map<string, number>(), pending: [] as Pending[], usdc: 1,
     hyperliquid: 0 as number | Error, hyperliquidCalls: [] as { walletAddress: string; verifyRole: boolean }[],
+    hyperliquidQuote: undefined as QuoteEvidence | undefined,
     rhLighter: 0 as number | Error, rhLighterCalls: [] as string[],
     binance: 0 as number | Error, okx: 0 as number | Error | 'hold', okxPending: [] as Deferred[],
     reads: 0,
@@ -56,7 +57,7 @@ function fakeSources() {
     async syncHyperliquid(c, options) {
       control.hyperliquidCalls.push({ walletAddress: c.walletAddress, verifyRole: !!options.verifyRole });
       if (control.hyperliquid instanceof Error) throw control.hyperliquid;
-      return { total: control.hyperliquid, details: [], updatedAt: now() };
+      return { total: control.hyperliquid, details: [], updatedAt: now(), ...(control.hyperliquidQuote ? { quote: control.hyperliquidQuote } : {}) };
     },
     async syncRhLighter(c) {
       control.rhLighterCalls.push(c.walletAddress);
@@ -209,6 +210,38 @@ test('Hyperliquid connects by address, keeps the last value on failed refreshes 
   ledger = (await w.store.disconnect({ exchange: 'hyperliquid' })).ledger!;
   asset = ledger.assets.find(a => a.mode === 'hyperliquid')!;
   assert.deepEqual([ledger.connections.hyperliquid.configured, asset.value, asset.status], [false, 200, '已断开 · 保留旧值']);
+});
+
+test('Hyperliquid keeps the USDC/USD quote of each read with its row and daily snapshot; a read without one drops it (#63)', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setInterval'], now: NOW + 10_800_000 });
+  const w = imported(t), walletAddress = '0x' + 'ab'.repeat(19) + 'c2';
+  const quote = (usd: number): QuoteEvidence => ({ coin: 'USDC', usd, source: 'CoinGecko / USD', at: new Date(Date.now() - 60_000).toISOString(), receivedAt: new Date(Date.now()).toISOString() });
+  const stored = () => w.full().assets.find(a => a.mode === 'hyperliquid')!;
+  const snapshotRow = () => (JSON.parse(w.latestDaily()!.data) as { assets: { mode: string; quote?: QuoteEvidence }[] }).assets.find(a => a.mode === 'hyperliquid')!;
+  w.control.hyperliquid = 99.9;
+  const first = quote(0.999);
+  w.control.hyperliquidQuote = first;
+  await w.store.connect({ exchange: 'hyperliquid', walletAddress });
+  assert.deepEqual(stored().quote, first, 'the row keeps the quote even with no USDC balance detail');
+  assert.deepEqual(snapshotRow().quote, first, 'the daily snapshot keeps price, source and both times');
+
+  t.mock.timers.tick(31_000);
+  w.control.hyperliquid = new Error('Hyperliquid 读取受到限流（HTTP 429）：请稍后重试并减少手动刷新；已保留上次数据');
+  await w.store.sync({});
+  assert.deepEqual([stored().value, stored().quote], [99.9, first], 'a failed read keeps the old value with the quote that priced it');
+
+  t.mock.timers.tick(31_000);
+  const second = quote(1.0004);
+  w.control.hyperliquid = 120;
+  w.control.hyperliquidQuote = second;
+  await w.store.sync({});
+  assert.deepEqual([stored().value, stored().quote, snapshotRow().quote], [120, second, second], 'a new read replaces the evidence with its own');
+
+  t.mock.timers.tick(31_000);
+  w.control.hyperliquidQuote = undefined;
+  await w.store.sync({});
+  assert.equal('quote' in stored(), false, 'a read without a quote leaves no older quote on the row');
+  assert.equal('quote' in snapshotRow(), false);
 });
 
 test('Lighter RH connects by address, keeps the last value on failed refreshes and hides unexpected errors', async t => {

@@ -11,7 +11,7 @@ import { cmp, sub } from '../decimal.ts';
 const SEND_TIMEOUT_MS = 10_000;
 const RETRY_BASE_MS = 5_000;
 const RETRY_MAX_MS = 5 * 60_000;
-const RETENTION_MS = 7 * 24 * 3_600_000;
+const RETENTION_MS = 7 * 24 * 3_600_000, PRUNE_EVERY_MS = 3_600_000;
 const EVENTS_PER_POLL = 500;
 /** Messages joined into one robot post; the robot allows a few posts per second at most. */
 const LINES_PER_POST = 10;
@@ -400,17 +400,21 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
     await sendFeishu(feishu, { msg_type: 'text', content: { text } }, { fetchImpl, now });
   }
 
-  let sending = false;
+  let sending = false, pruneAt = 0;
   /** Sends what is due, oldest first, several messages per post; a failure backs off the whole batch. */
   async function flush(): Promise<void> {
     if (sending) return;
     sending = true;
     try {
       const at = now();
-      // Kept to the retention also without a robot (an outbox left after its robot was removed).
-      db.prepare('DELETE FROM outbox WHERE created_at < ?').run(at - RETENTION_MS);
-      db.prepare('DELETE FROM repeats WHERE at < ?').run(at - RETENTION_MS);
-      db.prepare('DELETE FROM once WHERE at < ?').run(at - RETENTION_MS);
+      // Kept to the retention also without a robot (an outbox left after its robot was removed). Once an hour, and on the
+      // first flush after a start: the retention is seven days, and each DELETE scans its table.
+      if (at >= pruneAt) {
+        pruneAt = at + PRUNE_EVERY_MS;
+        db.prepare('DELETE FROM outbox WHERE created_at < ?').run(at - RETENTION_MS);
+        db.prepare('DELETE FROM repeats WHERE at < ?').run(at - RETENTION_MS);
+        db.prepare('DELETE FROM once WHERE at < ?').run(at - RETENTION_MS);
+      }
       if (!feishu) return;
       const due = db.prepare('SELECT id, text, attempts FROM outbox WHERE sent_at IS NULL AND next_at <= ? ORDER BY id LIMIT ?').all(at, LINES_PER_POST) as { id: number; text: string; attempts: number }[];
       if (!due.length) return;

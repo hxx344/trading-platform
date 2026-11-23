@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { MIGRATIONS, StoreError, openStore } from '../src/store.ts';
+import { MIGRATIONS, READ_INDEXES, StoreError, openStore } from '../src/store.ts';
 
 function withDir(run: (file: string) => void) {
   const dir = mkdtempSync(join(tmpdir(), 'pa-store-'));
@@ -149,4 +149,40 @@ test('存储：事务中不做 WAL 截断；连续放弃后的重试间隔最长
     reader.exec('COMMIT');
     assert.equal(store.maintainWal(now).action, 'reset');
   } finally { reader.close(); store.close(); }
+}));
+
+const indexNames = (db: DatabaseSync) => (db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'aux_%' ORDER BY name").all() as { name: string }[]).map(row => row.name);
+const planOf = (db: DatabaseSync, sql: string, ...values: (string | number)[]) => (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...values) as { detail: string }[]).map(row => row.detail).join(' | ');
+const insertJob = (db: DatabaseSync, id: string, at: number, json: string) => db.prepare('INSERT INTO jobs VALUES (?, ?, 1, 1, ?, ?, ?)').run(id, 'completed', at, at, json);
+
+test('存储：读取索引不升结构版本，最近任务的两条查询都走索引', () => withDir(file => {
+  const store = openStore(file);
+  try {
+    assert.equal(store.schemaVersion(), MIGRATIONS.at(-1)!.version, '读取索引不记入迁移，旧版本照常能打开');
+    assert.deepEqual(indexNames(store.db), READ_INDEXES.map(index => index.name).sort());
+    for (let i = 0; i < 30; i++) insertJob(store.db, `oil-${i}`, i, JSON.stringify({ legs: [{ symbol: 'CLUSDT' }, { symbol: 'BZUSDT' }] }));
+    for (let i = 0; i < 3; i++) insertJob(store.db, `hynix-${i}`, 100 + i, JSON.stringify({ legs: [{ symbol: 'SKHYNIXUSDT' }] }));
+    // The two statements of the executor's recentJobs.
+    const all = 'SELECT id FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?';
+    const market = "SELECT id FROM jobs WHERE json_extract(json, '$.legs[0].symbol') IN (?, ?) ORDER BY created_at DESC, rowid DESC LIMIT ?";
+    assert.match(planOf(store.db, all, 20), /USING (COVERING )?INDEX aux_jobs_created/);
+    assert.match(planOf(store.db, market, 'SKHYNIXUSDT', 'X', 20), /USING (COVERING )?INDEX aux_jobs_/);
+    assert.deepEqual((store.db.prepare(market).all('SKHYNIXUSDT', 'X', 20) as { id: string }[]).map(row => row.id), ['hynix-2', 'hynix-1', 'hynix-0']);
+    assert.deepEqual((store.db.prepare(all).all(2) as { id: string }[]).map(row => row.id), ['hynix-2', 'hynix-1']);
+  } finally { store.close(); }
+  const again = openStore(file);
+  try { assert.deepEqual(indexNames(again.db), READ_INDEXES.map(index => index.name).sort(), '再次打开不重复建立'); } finally { again.close(); }
+}));
+
+test('存储：读取索引建不成时照常打开，查询结果不变', () => withDir(file => {
+  openStore(file).close();
+  const raw = new DatabaseSync(file);
+  raw.exec('DROP INDEX aux_jobs_market');
+  insertJob(raw, 'broken', 1, '{not json');
+  raw.close();
+  const store = openStore(file);
+  try {
+    assert.deepEqual(indexNames(store.db), ['aux_jobs_created'], '有一行解析不了时这一个索引建不成，其余照常');
+    assert.deepEqual((store.db.prepare('SELECT id FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?').all(5) as { id: string }[]).map(row => row.id), ['broken']);
+  } finally { store.close(); }
 }));

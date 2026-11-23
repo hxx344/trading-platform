@@ -68,6 +68,18 @@ CREATE INDEX adl_batches_open ON adl_batches(pair_id) WHERE settled = 0;
 CREATE INDEX adl_batches_pair ON adl_batches(pair_id, created_at);
 `,
 }]);
+/**
+ * Read-path indexes kept outside MIGRATIONS on purpose: a migration raises the schema version, and an older release refuses
+ * a newer one (newer_schema), which would break rolling back. These are created when missing on every open; an older
+ * release opens a file that has them and keeps them up to date without knowing, and dropping one loses nothing but speed.
+ * Add only indexes here, never tables or columns.
+ */
+export const READ_INDEXES: readonly { name: string; sql: string }[] = Object.freeze([
+  // The latest jobs of all markets: walked newest first instead of sorting the whole table.
+  { name: 'aux_jobs_created', sql: 'CREATE INDEX IF NOT EXISTS aux_jobs_created ON jobs(created_at)' },
+  // The latest jobs of one market (executor recentJobs): the expression is the one that query filters on, character for character.
+  { name: 'aux_jobs_market', sql: "CREATE INDEX IF NOT EXISTS aux_jobs_market ON jobs(json_extract(json, '$.legs[0].symbol'), created_at)" },
+]);
 export const sqlHash = (sql: string): string => createHash('sha256').update(sql).digest('hex');
 
 export class StoreError extends Error {
@@ -161,6 +173,15 @@ export function openStore(file: string, { busyTimeoutMs = 5000, walResetBytes = 
   }
 
   try { migrate(db, tx); } catch (error) { db.close(); throw error; }
+  // After the migrations, so the tables exist. A failure (a busy file, a row whose JSON does not parse) costs only the
+  // speed-up: the queries return the same rows without the index, and the next open tries again.
+  try {
+    const existing = new Set((db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as { name: string }[]).map(row => row.name));
+    for (const index of READ_INDEXES) {
+      if (existing.has(index.name)) continue;
+      try { db.exec(index.sql); } catch (error) { process.stderr.write(`未能建立读取索引 ${index.name}（${(error as Error).message}），照常运行\n`); }
+    }
+  } catch (error) { process.stderr.write(`未能检查读取索引（${(error as Error).message}），照常运行\n`); }
   return {
     db, file,
     schemaVersion: () => (db.prepare('SELECT IFNULL(MAX(version), 0) AS version FROM schema_migrations').get() as { version: number }).version,

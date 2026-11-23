@@ -32,7 +32,7 @@ test('成交有新增、删除、同时间修订，元数据更新后仅传差�
 test('展示资料的版本协商仅适用于列出的读取，执行盘口、在途单、预览与写入实时查询', () => {
   for (const path of ['/api/asset/positions', '/api/asset/fills', '/api/asset/cash-flows', '/api/oil/pnl', '/api/options/performance',
     '/api/monitor/hynix/quote', '/api/monitor/oil/exchanges/bybit/funding-history', '/api/transfer-pairs/oil/balances',
-    '/api/adl/pairs/gold/incidents', '/api/logs/problems', '/api/ondo/rewards']) {
+    '/api/adl/pairs/gold/incidents', '/api/logs/problems', '/api/ondo/rewards', '/api/news', '/api/news/moves']) {
     assert.ok(isDisplayRead('GET', path), path);
     assert.equal(isDisplayRead('POST', path), false, path);
   }

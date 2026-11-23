@@ -11,7 +11,7 @@ import { performance } from 'node:perf_hooks';
 import { DatabaseSync } from 'node:sqlite';
 import { ContractError, parseTransferConfig } from '../src/contracts.ts';
 import { DEFAULT_BUDGETS, WriterLostError, createExecutor, type Budgets } from '../src/executor.ts';
-import { MIGRATIONS, openStore, sqlHash } from '../src/store.ts';
+import { MIGRATIONS, READ_INDEXES, openStore, sqlHash } from '../src/store.ts';
 import { SimulatedAster } from '../src/sim-aster.ts';
 import { REGISTRY_ASTER_EXPIRY_MS, type AccountWriterPort } from '../src/account-control.ts';
 import type { PairRecord } from '../src/transfer.ts';
@@ -1216,7 +1216,7 @@ test('存储：已有 v2 库升级到 v3 只新增划转的两张表与两个索
   const names = (db: DatabaseSync) => (db.prepare("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name").all() as { name: string }[]).map(row => row.name);
   const before = names(old);
   old.close();
-  const added = ['transfer_pairs', 'transfers', 'transfers_pair', 'transfers_unsettled'];
+  const added = ['transfer_pairs', 'transfers', 'transfers_pair', 'transfers_unsettled', ...READ_INDEXES.map(index => index.name)];
   const store = openStore(file);
   try {
     // Migration 4 (ADL) has its own upgrade test; this one checks migration 3 alone.

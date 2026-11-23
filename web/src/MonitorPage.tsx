@@ -1,5 +1,5 @@
 import { Activity, ArrowDownRight, ArrowUpRight, ChevronDown, Clock3, Info, MoveRight, RefreshCw } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import { ANTHROPIC_COMPARISON_LEGS, ANTHROPIC_LEGS, anthropicPremium, anthropicSharesPerUnit, perShare, type AnthropicComparisonLeg, type AnthropicShares } from '../../src/vendor/anthropic-market.mjs';
 import { api, ApiError } from './api.ts';
 import { ANTHROPIC_WARMUP_DAYS, anthropicChartConfig, anthropicPoints, anthropicQuote, dailyPoints, ranges, selectRange, type AnthropicQuote, type ChartMode, type Point } from './monitor-history.ts';
@@ -9,15 +9,26 @@ import { SpreadChart, date, stamp } from './MonitorChart.tsx';
 import { disabledNotice, parseControl, parseControls, switchFailure, switchLabel, toggleBody, type MonitorControl, type MonitorControls } from './monitor-control.ts';
 import { DetailLayout, RelatedPositions } from './MonitorRelated.tsx';
 import { linkedMonitorTab, withoutMonitorLink } from './monitor-link.ts';
-import { HynixPanel } from './MonitorHynix.tsx';
-import { OilPanel } from './MonitorOil.tsx';
-import { PerpetualPanel } from './MonitorPerpetual.tsx';
-import { MovesPanel } from './MonitorMoves.tsx';
+import { LazyBoundary } from './LazyBoundary.tsx';
 import { StatePanel } from './StateViews.tsx';
 import { useLiveResource, type LiveResource } from './use-live-resource.ts';
 import { shellMarkets, type MonitorScopes, type ShellView } from '../../src/shell-view.ts';
 import { mainQuoteDisplay, mainQuoteRetention, monitorReadError } from './monitor-display.ts';
+// The scanner's styles stay in this chunk and ahead of monitor.css, the order they had while the panel was imported here:
+// rules of the two files with equal specificity (the focus outlines, for one) are decided by that order.
+import './perpetual.css';
+import './perpetual-execution.css';
+import './perpetual-exit.css';
+import './perpetual-manual-pairs.css';
 import './monitor.css';
+
+// One market shows at a time, so each of the other panels loads when its tab is first opened. The scanner and the moves
+// list take only onExpired and keep their own clocks, so they are memoized against this page's re-renders (the shell read
+// re-renders it twice every two seconds); the oil and hynix panels age their quotes while rendering and are left as they were.
+const HynixPanel = lazy(() => import('./MonitorHynix.tsx').then(m => ({ default: m.HynixPanel })));
+const OilPanel = lazy(() => import('./MonitorOil.tsx').then(m => ({ default: m.OilPanel })));
+const PerpetualPanel = lazy(() => import('./MonitorPerpetual.tsx').then(m => ({ default: memo(m.PerpetualPanel) })));
+const MovesPanel = lazy(() => import('./MonitorMoves.tsx').then(m => ({ default: memo(m.MovesPanel) })));
 
 // The market monitor page, laid out as the workbench's Anthropic detail (modules/monitor/app/anthropic-panel.tsx and
 // spread-chart.tsx, styles copied in monitor.css) as it shows inside the workbench hub, where the top bar is hidden. Left
@@ -123,7 +134,12 @@ export function MonitorPage({ shell, scopes, onControlChanged, onExpired }: {
       {confirmed && control?.error && <p className="hub-control-notice" role="alert">{control.error}</p>}
       {!confirmed ? checking
         : off ? <p className="notice" role="status">{disabledNotice(active)}</p>
-        : active === MOVES_TAB ? <MovesPanel onExpired={onExpired} /> : active === 'oil' ? <OilPanel onExpired={onExpired} /> : active === 'hynix' ? <HynixPanel onExpired={onExpired} /> : active === 'perpetual' ? <PerpetualPanel onExpired={onExpired} /> : shares && <AnthropicPanel outstanding={shares.outstanding} diluted={shares.diluted} onExpired={onExpired} />}
+        : active !== MOVES_TAB && active !== 'oil' && active !== 'hynix' && active !== 'perpetual' ? shares && <AnthropicPanel outstanding={shares.outstanding} diluted={shares.diluted} onExpired={onExpired} />
+        : <LazyBoundary key={active} what={MARKET_TABS[active]!} className="notice">
+          <Suspense fallback={<StatePanel kind="loading" title="加载中…" />}>
+            {active === MOVES_TAB ? <MovesPanel onExpired={onExpired} /> : active === 'oil' ? <OilPanel onExpired={onExpired} /> : active === 'hynix' ? <HynixPanel onExpired={onExpired} /> : <PerpetualPanel onExpired={onExpired} />}
+          </Suspense>
+        </LazyBoundary>}
     </div></div>
   </div>;
 }

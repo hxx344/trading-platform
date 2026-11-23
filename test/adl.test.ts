@@ -14,7 +14,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { ContractError } from '../src/contracts.ts';
 import { createExecutor, type Budgets } from '../src/executor.ts';
 import { createExecutorServer } from '../src/http.ts';
-import { MIGRATIONS, openStore, sqlHash } from '../src/store.ts';
+import { MIGRATIONS, READ_INDEXES, openStore, sqlHash } from '../src/store.ts';
 import type { AccountWriterPort } from '../src/account-control.ts';
 import { planReductions } from '../src/adl.ts';
 import { SimulatedAsterTrading } from '../src/sim-aster-trading.ts';
@@ -766,7 +766,7 @@ test('存储：已有 v3 库升级到 v4 只新增 ADL 四张表与索引，原�
   const store = openStore(file);
   try {
     assert.equal(store.schemaVersion(), 4);
-    assert.deepEqual(names(store.db).filter(name => !before.includes(name)), ['adl_batches', 'adl_batches_incident', 'adl_batches_open', 'adl_batches_pair', 'adl_evidence', 'adl_evidence_pair',
+    assert.deepEqual(names(store.db).filter(name => !before.includes(name) && !READ_INDEXES.some(index => index.name === name)), ['adl_batches', 'adl_batches_incident', 'adl_batches_open', 'adl_batches_pair', 'adl_evidence', 'adl_evidence_pair',
       'adl_evidence_pending', 'adl_incidents', 'adl_incidents_created', 'adl_incidents_open', 'adl_incidents_pair', 'adl_pairs']);
     store.db.prepare("INSERT INTO adl_pairs VALUES ('sim-pair', 1, 1, '{}')").run();
     store.db.prepare("INSERT INTO adl_incidents VALUES ('i1', 'sim-pair', 'completed', 1, 1, 1, '{}')").run();

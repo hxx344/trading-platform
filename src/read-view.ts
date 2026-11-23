@@ -11,6 +11,8 @@ const displayGets = [
   /^\/api\/(?:oil\/pnl|options\/performance|ondo\/rewards|crossex\/instruments|logs(?:\/problems)?)$/,
   /^\/api\/transfer-pairs\/[\w-]{1,64}\/(?:history|balances)$/,
   /^\/api\/adl\/pairs\/[\w-]{1,64}\/incidents$/,
+  // The page reads these every 2 and 5 seconds, and between two reads the lists mostly stay as they were.
+  /^\/api\/news(?:\/moves)?$/,
 ];
 const displayPost = /^\/api\/monitor\/perpetual\/(?:metrics|funding-history|scanner-data|quality)$/;
 

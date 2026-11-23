@@ -457,7 +457,11 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
       } satisfies ShellView);
     }
     if (request.method === 'GET' && url.pathname === '/api/state') {
-      return send(response, 200, { generation: executor.generation, retired: executor.retired, transport: executor.environment === 'mainnet' ? 'live' : 'simulated', accounts: executor.accounts(), notionalLimits: executor.notionalLimits(), jobs: executor.recentJobs(20),
+      // The built page shows neither the jobs nor the notional limits of this view and reads it every two seconds, so it
+      // passes jobs=0. The fallback page, the read-only MCP tool and every other caller get the full view.
+      const withJobs = url.searchParams.get('jobs') !== '0';
+      return send(response, 200, { generation: executor.generation, retired: executor.retired, transport: executor.environment === 'mainnet' ? 'live' : 'simulated', accounts: executor.accounts(),
+        ...(withJobs ? { notionalLimits: executor.notionalLimits(), jobs: executor.recentJobs(20) } : {}),
         transfers: { pairs: executor.transferPairs(), corruptPairs: executor.corruptTransferPairs(), recent: executor.recentTransfers(20) },
         adl: { pairs: executor.adlPairs(), recent: executor.recentAdlIncidents(10) }, positions: executor.asterPositions() });
     }

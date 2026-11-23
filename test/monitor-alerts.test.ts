@@ -318,6 +318,26 @@ test('飞书队列：notify 返回消息编号，按编号读送达状态，没�
   } finally { notifier.close(); off.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('飞书队列：过期记录在启动后的第一次发送时清理，之后每小时清理一次', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-alerts-prune-'));
+  let at = T0;
+  const notifier = createNotifier({ events: () => [], latestSeq: () => 0, pairs: () => [], incidentPair: () => null, now: () => at, log: () => undefined, file: join(dir, 'notify.sqlite'), feishu: null });
+  try {
+    // A key written eight days ago (the clock is set back only to write it).
+    const old = (key: string) => { const keep = at; at = T0 - 8 * 86_400_000; try { return notifier.notifyOnce(key, 'x'); } finally { at = keep; } };
+    assert.equal(old('first'), true);
+    await notifier.flush();
+    assert.equal(old('first'), true, '第一次发送就清理');
+    assert.equal(old('later'), true);
+    at = T0 + 3_600_000 - 1;
+    await notifier.flush();
+    assert.equal(old('later'), false, '一小时内不再清理');
+    at = T0 + 3_600_000;
+    await notifier.flush();
+    assert.equal(old('later'), true, '满一小时再清理');
+  } finally { notifier.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('接口：读取、保存（409 / 400）、测试消息；须带页面请求标记；未配置的市场 404', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tp-alerts-http-'));
   const venues = fakeAnthropicVenues();

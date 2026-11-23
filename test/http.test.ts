@@ -107,6 +107,10 @@ test('HTTP：预览、确认、重复确认返回原任务；状态页只显示�
   } finally { recorded.close(); }
   const state = await (await fetch(base + '/api/state', { headers: { cookie } })).json() as { jobs: { id: string; status: string }[]; accounts: { accountId: string }[] };
   assert.equal(state.jobs[0].status, 'completed');
+  // The built page's read leaves out what it does not show; everything else stays.
+  const slim = await (await fetch(base + '/api/state?jobs=0', { headers: { cookie } })).json() as Record<string, unknown>;
+  assert.deepEqual(Object.keys(slim).sort(), Object.keys(state).filter(key => key !== 'jobs' && key !== 'notionalLimits').sort());
+  assert.ok('jobs' in state && 'notionalLimits' in state);
   assert.ok(state.accounts.every(account => account.accountId.startsWith('***')));
   assert.doesNotMatch(JSON.stringify(state), /BN1001|BY2002/);
   assert.equal((await fetch(base + '/api/observe?venue=bybit&symbol=ANTUSDT', { headers: { cookie } })).status, 400);

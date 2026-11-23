@@ -1,5 +1,5 @@
 import { Activity, ArrowLeftRight, Cpu, ChevronRight, Coins, Gauge, Layers, Menu, Newspaper, RefreshCw, Scale, ScrollText, Server, Settings2, ShieldCheck, Sigma, Wallet, Waves, type LucideIcon } from 'lucide-react';
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { shellMarkets, type MarketScope, type MonitorScopes, type ShellView } from '../../src/shell-view.ts';
 import { LazyBoundary } from './LazyBoundary.tsx';
 import { PairsWorkspace } from './PairsWorkspace.tsx';
@@ -26,10 +26,14 @@ const REFRESH_MS = 2_000;
 const READ_TIMEOUT_MS = 10_000;
 
 // Keep the default pair workspace ready while its first state request is in flight.
+// The shell read below re-renders App twice every two seconds (loading, then the answer), and every page with it. Most
+// pages lean on that: a countdown, a task's elapsed time or a preview's expiry is computed while rendering and has no
+// timer of its own. Only the pages that show nothing of the kind are memoized (their props, onExpired, never change);
+// before memoizing another, give each of its time-dependent texts its own timer.
 const AssetPage = lazy(() => import('./AssetPage.tsx').then(m => ({ default: m.AssetPage })));
 const AssetPositions = lazy(() => import('./AssetPositions.tsx').then(m => ({ default: m.AssetPositions })));
 const MonitorPage = lazy(() => import('./MonitorPage.tsx').then(m => ({ default: m.MonitorPage })));
-const NewsPage = lazy(() => import('./NewsPage.tsx').then(m => ({ default: m.NewsPage })));
+const NewsPage = lazy(() => import('./NewsPage.tsx').then(m => ({ default: memo(m.NewsPage) })));
 const OilPage = lazy(() => import('./OilPage.tsx').then(m => ({ default: m.OilPage })));
 const HynixPage = lazy(() => import('./HynixPage.tsx').then(m => ({ default: m.HynixPage })));
 const GoldOilPage = lazy(() => import('./GoldOilPage.tsx').then(m => ({ default: m.GoldOilPage })));
@@ -38,7 +42,7 @@ const OndoPage = lazy(() => import('./ondo/OndoPage.tsx').then(m => ({ default: 
 const VarLighterPage = lazy(() => import('./varlighter/VarLighterPage.tsx').then(m => ({ default: m.VarLighterPage })));
 const OptionsPage = lazy(() => import('./OptionsPage.tsx').then(m => ({ default: m.OptionsPage })));
 const StatusPage = lazy(() => import('./StatusPage.tsx').then(m => ({ default: m.StatusPage })));
-const LogsPage = lazy(() => import('./LogsPage.tsx').then(m => ({ default: m.LogsPage })));
+const LogsPage = lazy(() => import('./LogsPage.tsx').then(m => ({ default: memo(m.LogsPage) })));
 const SettingsPage = lazy(() => import('./SettingsPage.tsx').then(m => ({ default: m.SettingsPage })));
 
 function isStale(read: ResourceSnapshot<unknown>) {
@@ -61,7 +65,7 @@ export function App() {
   const shell = useLiveResource<ShellView>('/api/shell', { intervalMs: REFRESH_MS, timeoutMs: READ_TIMEOUT_MS, onExpired });
   const { data: state, status, error, receivedAt, refresh } = shell;
   const pairPage = route.page === 'overview' || route.page === 'pair';
-  const pairs = useLiveResource<ServiceState>('/api/state', { intervalMs: REFRESH_MS, timeoutMs: READ_TIMEOUT_MS, enabled: pairPage, onExpired });
+  const pairs = useLiveResource<ServiceState>('/api/state?jobs=0', { intervalMs: REFRESH_MS, timeoutMs: READ_TIMEOUT_MS, enabled: pairPage, onExpired });
 
   // Retained public quotes are valid only for the observed collector generation, including while another page is open.
   const lastMonitor = useRef<MonitorScopes | null | undefined>(undefined);

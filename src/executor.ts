@@ -15,7 +15,7 @@ import type { Store } from './store.ts';
 import { nearestBarrels, quantityForBarrels, splitBarrels } from './barrels.ts';
 import { fillGapText, fillGaps, hedgeSkippedQuantity, type FillLeg } from './four-leg-fill.ts';
 import { midOf, proportionalHedge, quantityForNotional, splitSteps } from './hynix/sizing.ts';
-import { pairBalance, rebalanceOrder, type HeldContract, type RebalanceMethod } from './hynix/balance.ts';
+import { pairBalance, rebalanceOrder, rebalanceStillFits, type HeldContract, type RebalanceMethod } from './hynix/balance.ts';
 import { createTransfers, type PairRecord, type TransferDeps } from './transfer.ts';
 import { DEFAULT_ADL_BUDGETS, createAdl, type Adl, type AdlBudgets } from './adl.ts';
 import type { AdlConnector } from './adl-contracts.ts';
@@ -1133,7 +1133,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       },
       notes: [
         `${method === 'reduce' ? '减仓调平' : '加仓调平'}：${action === 'close' ? '平' : '加'} ${venueName} ${order.symbol} ${sideName(order.side)} ${order.quantity}${action === 'close' ? '（只减仓）' : ''}，只发这一笔，未成交部分不补发。`,
-        `按预览中间价：多头 ${balance.long.symbol} 约 ${cents(balance.long.notional)} USDT，空头 ${balance.short.symbol} 约 ${cents(balance.short.notional)} USDT，净敞口 ${cents(balance.gap)} USDT（${sideName(balance.netSide)}多出 ${cents(balance.percent)}%）；全部成交后估算净敞口约 ${cents(afterGap)} USDT${afterSide ? `（${sideName(afterSide)}多出）` : ''}。`,
+        `按预览中间价：多头 ${balance.long.symbol} 约 ${cents(balance.long.notional)} USDT，空头 ${balance.short.symbol} 约 ${cents(balance.short.notional)} USDT，净敞口 ${cents(balance.gap)} USDT（${sideName(balance.netSide)}多出 ${cents(balance.percent)}%）；全部成交后估算净敞口约 ${cents(afterGap)} USDT${afterSide ? `（${sideName(afterSide)}多出）` : ''}。张数确认后不变，盘口在发送前变动时净方向可能小幅反过来，反向超过当时净敞口一半则不发送。`,
         `价格保护 ${slippageBps} 基点：以 IOC 限价 ${priceBound} 发送，未即时成交的部分由交易所撤销；发送前盘口越过界限，或两腿持仓与预览时不一致，即不发送，任务失败。部分成交记为完成，可重新预览再调。`,
         `另一腿 ${other.symbol}（${sideName(otherLeg.side)} ${otherLeg.quantity}）不下单，但任务期间与本合约一起锁定，其他任务不能改动。`,
         ...(capNote ? [capNote] : []),
@@ -1554,8 +1554,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       symbol, long: positionOf(account, symbol, 'long'), short: positionOf(account, symbol, 'short'), price: midOf(book.bid, book.ask), contractSize: rules.contractSize,
     });
     const balance = pairBalance(held(leg.symbol, snapshot, quote, targetRules), held(counter.symbol, counterSnapshot, otherQuote, counterRules));
-    const order = balance.status === 'paired' ? rebalanceOrder(balance, job.rebalance.method, { [leg.symbol]: targetRules, [counter.symbol]: counterRules }) : null;
-    if (!order || 'error' in order || order.symbol !== leg.symbol || order.side !== leg.side || cmp(order.quantity, leg.quantity) < 0) {
+    // The confirmed quantity sits right at the preview's balance point: a small crossing is let through, see rebalanceStillFits.
+    if (!rebalanceStillFits(balance, job.rebalance.method, leg, targetRules.contractSize)) {
       reject('rebalance_changed', '当前两腿盘口已不支持原先确认的调平方向或数量，请重新预览', 409);
     }
     admit(leg);

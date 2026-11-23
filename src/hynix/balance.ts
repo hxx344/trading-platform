@@ -77,3 +77,17 @@ export function rebalanceOrder(balance: Extract<PairBalance, { status: 'paired' 
   if (cmp(quantity, instrument.minQuantity) < 0) return { error: `两腿名义差额 ${balance.gap.replace(/(\.\d{2})\d+$/, '$1')} USDT 不足 ${leg.symbol} 最小下单量 ${instrument.minQuantity}` };
   return { symbol: leg.symbol, side: leg.side, action: method === 'reduce' ? 'close' : 'open', quantity };
 }
+
+/**
+ * Whether a confirmed rebalance order still fits the balance read just before sending. The preview floors the quantity
+ * right at the balance point, so any slight narrowing of the gap makes the fixed quantity cross it; refusing every such
+ * crossing fails about every other order. It fits while the method still targets the confirmed leg and side and the
+ * order's notional at the current price is at most 1.5 × the current gap, which leaves at most half the gap on the other side.
+ */
+export function rebalanceStillFits(balance: PairBalance, method: RebalanceMethod, order: Pick<RebalanceOrder, 'symbol' | 'side' | 'quantity'>, contractSize: string): boolean {
+  if (balance.status !== 'paired' || balance.netSide === null) return false;
+  const larger = balance.netSide === 'long' ? balance.long : balance.short, smaller = balance.netSide === 'long' ? balance.short : balance.long;
+  const leg = method === 'reduce' ? larger : smaller;
+  if (leg.symbol !== order.symbol || leg.side !== order.side) return false;
+  return cmp(mul(mul(mul(order.quantity, contractSize), leg.price), '2'), mul(balance.gap, '3')) <= 0;
+}

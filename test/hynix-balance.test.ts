@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ContractError } from '../src/contracts.ts';
-import { DEFAULT_BALANCE_SETTINGS, balanceLevel, pairBalance, parseBalanceSettings, rebalanceOrder, type HeldContract, type PairBalance } from '../src/hynix/balance.ts';
+import { DEFAULT_BALANCE_SETTINGS, balanceLevel, pairBalance, parseBalanceSettings, rebalanceOrder, rebalanceStillFits, type HeldContract, type PairBalance } from '../src/hynix/balance.ts';
 
 const adr = (long: string, short: string, price = '125.74'): HeldContract => ({ symbol: 'SKHYUSDT', long, short, price, contractSize: '1' });
 const ordinary = (long: string, short: string, price = '843.6'): HeldContract => ({ symbol: 'SKHYNIXUSDT', long, short, price, contractSize: '1' });
@@ -65,4 +65,23 @@ test('平衡设置：调平线 0.1 起且低于硬上限，硬上限不超过 50
   refused({ rebalancePercent: '2', hardPercent: '5', minGapUsdt: '-1' });
   refused({ rebalancePercent: '2', hardPercent: '5', minGapUsdt: '50', extra: 1 });
   refused({ rebalancePercent: '2', hardPercent: '5' });
+});
+
+test('发送前复核：确认张数的名义不超过当前差额 1.5 倍且合约、方向仍对得上时才算相容', () => {
+  // 4000 against 3600: gap 400, so 600 of notional is the limit on either leg.
+  for (const [net, other] of [['short', 'long'], ['long', 'short']] as const) {
+    const balance = pairBalance(net === 'short' ? adr('0', '100', '40') : adr('100', '0', '40'), net === 'short' ? ordinary('9', '0', '400') : ordinary('0', '9', '400'));
+    const fits = (method: 'reduce' | 'add', symbol: string, side: 'long' | 'short', quantity: string) => rebalanceStillFits(balance, method, { symbol, side, quantity }, '1');
+    assert.deepEqual([fits('reduce', 'SKHYUSDT', net, '10'), fits('reduce', 'SKHYUSDT', net, '15'), fits('reduce', 'SKHYUSDT', net, '15.01')], [true, true, false], net);
+    assert.deepEqual([fits('add', 'SKHYNIXUSDT', other, '1'), fits('add', 'SKHYNIXUSDT', other, '1.5'), fits('add', 'SKHYNIXUSDT', other, '1.501')], [true, true, false], net);
+    // The method now points at the other contract or the other side: the net direction changed since the preview.
+    assert.deepEqual([fits('reduce', 'SKHYNIXUSDT', other, '0.1'), fits('add', 'SKHYUSDT', net, '1'), fits('reduce', 'SKHYUSDT', other, '1'), fits('add', 'SKHYNIXUSDT', net, '0.1')], [false, false, false, false], net);
+  }
+  // The contract size counts: 0.15 × 10 × 400 = 600.
+  const sized = pairBalance(adr('100', '0', '40'), { ...ordinary('0', '0.9', '400'), contractSize: '10' });
+  assert.deepEqual(['0.15', '0.151'].map(quantity => rebalanceStillFits(sized, 'add', { symbol: 'SKHYNIXUSDT', side: 'short', quantity }, '10')), [true, false]);
+  const order = { symbol: 'SKHYUSDT', side: 'long', quantity: '0.01' } as const;
+  assert.equal(rebalanceStillFits(pairBalance(adr('10', '0', '40'), ordinary('0', '1', '400')), 'reduce', order, '1'), false);
+  assert.equal(rebalanceStillFits(pairBalance(adr('0', '0'), ordinary('0', '0')), 'reduce', order, '1'), false);
+  assert.equal(rebalanceStillFits(pairBalance(adr('10', '0', '40'), ordinary('0', '0')), 'reduce', order, '1'), false);
 });

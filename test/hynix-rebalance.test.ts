@@ -425,6 +425,43 @@ test('手动调平在另一合约行情已过期或新价格使原方向越过�
   }
 });
 
+test('确认后差额略有缩小、原张数小幅越过平衡点时照常发送；差额缩到原张数名义的三分之二以下时不发', async () => {
+  // Confirmed: buy back 2.57 short ADR (105.94 USDT at mid 41.22) against a 106.05 gap.
+  // Ordinary mid 420 → long 105, gap 101.1: the order crosses by 4.84, well inside half the gap. Mid 560 → long 140, gap 66.1 < 105.94 ÷ 1.5.
+  for (const [book, sent] of [[{ bid: '419.9', ask: '420.1' }, true], [{ bid: '559.9', ask: '560.1' }, false]] as const) {
+    await withHarness(async h => {
+      holdUneven(h);
+      const preview = await h.ex.preview(rebalance('reduce'), SESSION);
+      assert.equal(preview.legs[0].quantity, '2.57');
+      const { job } = h.ex.confirm({ previewId: preview.id, requestId: randomUUID(), confirmLive: true }, SESSION);
+      h.binance.setBook('SKHYNIXUSDT', book);
+      if (sent) {
+        const done = await settle(h, job.id);
+        assert.equal(done.status, 'completed', done.reason ?? '');
+        assert.equal(lastOrder(h).quantity, '2.57');
+        assert.equal(h.binance.position(BN, 'SKHYUSDT', 'short'), '2.43');
+      } else {
+        await h.ex.tickJobs();
+        assert.equal(h.binance.arrived.place, 0);
+        assert.match(h.ex.jobView(job.id).reason ?? '', /调平方向或数量/);
+      }
+    });
+  }
+});
+
+test('加仓调平确认后差额略有缩小时照常发送（真实账户上连续两笔未发送的情形）', () => withHarness(async h => {
+  holdUneven(h);
+  const preview = await h.ex.preview(rebalance('add'), SESSION);
+  assert.equal(preview.legs[0].quantity, '0.264');
+  const { job } = h.ex.confirm({ previewId: preview.id, requestId: randomUUID(), confirmLive: true }, SESSION);
+  // ADR mid 40.5 → short 202.5 against 100.05: gap 102.45, under the 105.65 the confirmed 0.264 is worth.
+  h.binance.setBook('SKHYUSDT', { bid: '40.49', ask: '40.51' });
+  const done = await settle(h, job.id);
+  assert.equal(done.status, 'completed', done.reason ?? '');
+  assert.equal(lastOrder(h).quantity, '0.264');
+  assert.equal(h.binance.position(BN, 'SKHYNIXUSDT', 'long'), '0.514');
+}));
+
 test('调平保持原张数时发送前须重新核对目标合约面值', () => withHarness(async h => {
   holdUneven(h);
   const preview = await h.ex.preview(rebalance('add'), SESSION);

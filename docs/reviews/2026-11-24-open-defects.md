@@ -1,13 +1,13 @@
-# 2026-11-24 开放缺陷修复：会话撤销、通知入队确认、原油阻塞通知、资产读取快照与汇率证据（v0.81.1）
+# 2026-11-24 开放缺陷修复：会话撤销、通知入队确认、原油阻塞通知、资产读取快照与汇率证据（v0.82.1）
 
-- 范围：提交 fe75ff0（#69）、eb9a792（#71）、7a65973（#70）、4a49821（#11、#63）、1f061b9（第一轮审查修复），相对 v0.81.0（f16df4f）。
+- 范围：提交 fe75ff0（#69）、eb9a792（#71）、7a65973（#70）、4a49821（#11、#63）、1f061b9（第一轮审查修复），相对 v0.82.0（6dfcef6，变基后）。变基后对应 f2e8ec8、006ee1a、3271986、47daf7b、a8dbc6f，内容不变；main 期间只进了 Var/Lighter 与 CI 配置的改动，与本批文件不重叠。
   - #69：`src/sessions.ts`、`src/http.ts`、`web/src/SettingsPage.tsx`、`test/sessions.test.ts`、`test/http.test.ts`、`docs/plan.md`。
   - #71：`src/service/health-watch.ts`、`src/crash-guard.ts`、`src/service/main.ts`，同类路径 `src/service/feishu.ts`（保证金平衡告警）、`src/read-token.ts`（到期提醒）；`test/observability.test.ts`、`test/service.test.ts`、`test/read-token.test.ts`、`docs/observability.md`。
   - #70：`src/oil/rules.ts`、`src/oil/rule-live.ts`、`src/service/oil.ts`、`test/oil-rules-live.test.ts`、`docs/oil.md`。
   - #11、#63：`src/asset/{db,store,types,sync,daily-positions,daily-changes}.ts`、`src/asset/sources/hyperliquid.ts`、`test/asset-{store,sync,daily-changes,sources-hyperliquid}.test.ts`、`docs/asset.md`。
 - 等级：R3（#69 属鉴权：会话撤销的持久化与接口应答）。其余为 R2：通知与恢复、规则状态里的通知待办（不改规则判断与下单）、只读接口与采集数据（不改数据库结构）。
 - 审查方式：作者自审；三路独立只读审查子代理分别审 #69 与 #71、#70、#11 与 #63；第一轮修复后新开审查者复核 1f061b9。#70 与 #11、#63 的实现由作者派出的实现子代理完成，审查者与实现者不同。
-- 回滚版本：v0.81.0。会话文件格式不变；`last-crash.json` 格式不变；原油规则状态 JSON 多一个可选的 `unsent`，旧版本忽略并在下一次写状态时丢掉（已解除阻塞而未交出的通知不再补发）；资产行 JSON 多一个可选的 `quote`，旧版本忽略；没有表结构变化。
+- 回滚版本：v0.82.0。会话文件格式不变；`last-crash.json` 格式不变；原油规则状态 JSON 多一个可选的 `unsent`，旧版本忽略并在下一次写状态时丢掉（已解除阻塞而未交出的通知不再补发）；资产行 JSON 多一个可选的 `quote`，旧版本忽略；没有表结构变化。
 
 ## 改动
 

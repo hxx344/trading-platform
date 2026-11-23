@@ -329,7 +329,7 @@ test('配置与接口：monitor.oil 不带设置；只配原油时 Anthropic 接
   const config = parseServiceConfig({ secretsFile, monitor: { oil: {} } });
   assert.deepEqual([config.monitor, config.pairs], [{ oil: {}, goldoil: {} }, []], '原油隐含金油比（M-2g）');
   assert.equal(monitorSummary(config.monitor), '，行情监控 原油价差（Binance 布伦特 − WTI）、金油比（Binance XAU ÷ WTI / 布伦特）');
-  assert.equal(monitorSummary(parseServiceConfig({ secretsFile, monitor: { anthropic: {}, oil: {} } }).monitor), '，行情监控 Anthropic 价差（流通股 12.7 十亿、完全稀释 16.7 十亿股）、原油价差（Binance 布伦特 − WTI）、金油比（Binance XAU ÷ WTI / 布伦特）');
+  assert.equal(monitorSummary(parseServiceConfig({ secretsFile, monitor: { anthropic: {}, oil: {} } }).monitor), '，行情监控 Anthropic 价差（流通股 13.116 十亿、完全稀释 17.68 十亿股）、原油价差（Binance 布伦特 − WTI）、金油比（Binance XAU ÷ WTI / 布伦特）');
   for (const oil of [{ refreshMs: 1 }, null, 1, []]) assert.throws(() => parseServiceConfig({ secretsFile, monitor: { oil } }), /monitor/, JSON.stringify(oil));
 
   const dir = mkdtempSync(join(tmpdir(), 'tp-monitor-oil-'));

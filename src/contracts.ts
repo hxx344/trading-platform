@@ -33,7 +33,7 @@ export const marketOfSymbols = (symbols: readonly string[]): Market => symbols.i
   : symbols.some(symbol => (HYNIX_SYMBOLS as readonly string[]).includes(symbol)) ? 'hynix' : 'oil';
 const EXECUTION_SYMBOLS = [...OIL_SYMBOLS, ...HYNIX_SYMBOLS, GOLD_SYMBOL];
 export const VENUE_EXECUTION_SYMBOLS: Record<Venue, readonly string[]> = { binance: EXECUTION_SYMBOLS, bybit: EXECUTION_SYMBOLS, okx: EXECUTION_SYMBOLS };
-export const VENUE_READ_SYMBOLS: Record<Venue, readonly string[]> = { binance: [...EXECUTION_SYMBOLS, 'ANTHROPICUSDT'], bybit: EXECUTION_SYMBOLS, okx: EXECUTION_SYMBOLS };
+export const VENUE_READ_SYMBOLS: Record<Venue, readonly string[]> = { binance: [...EXECUTION_SYMBOLS, 'ANTUSDT'], bybit: EXECUTION_SYMBOLS, okx: EXECUTION_SYMBOLS };
 export const ACCOUNT_MODES: Record<Venue, readonly string[]> = { binance: ['standard', 'portfolio-margin'], bybit: ['unified'], okx: ['cross', 'isolated'] };
 /** Venues whose connector places post-only limit orders, so a local chase lead may run there (docs/oil.md sections 8 and 10). */
 export const LOCAL_CHASE_VENUES: readonly Venue[] = ['binance', 'okx'];

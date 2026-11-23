@@ -9,7 +9,7 @@
 
 第三个模块“期权 Greeks”（Bybit BTC 期权铁鹰 / 卖出宽跨：手动开平仓、周五定时开仓、收益页、组合询价）自 v0.11.0 起可用，方案与进度见 [docs/options.md](docs/options.md)；只在 `config.json` 有 `options` 时启用，启用在设置页「从工作台导入」里完成（见下文部署一节）。
 
-第四个模块“行情监控”（工作台 Monitor 分批接入，方案与进度见 [docs/monitor.md](docs/monitor.md)）第一批是 Anthropic 价差：Binance、Hyperliquid（xyz:ANT、io:ANTH）、Lighter RH 的报价与 15 分钟 K 线，按每股口径算溢价，只读公开行情，不需要密钥。在设置页「从工作台导入」里勾选「启用行情监控」即可启用（命令行 `sudo bash install.sh --import-workbench --monitor`，见下文部署一节），写入的是 `"monitor": { "anthropic": {} }`；也可以手写这一段（可加 `"shares": { "outstanding": 12.7, "diluted": 16.7 }`，十亿股，不写用这两个默认值，须满足 1 ≤ 流通 ≤ 完全稀释 ≤ 100）；只配 `monitor` 时 `pairs` 可以省略。第二批起加了原油价差（Binance BZUSDT / CLUSDT 标记价与 15 分钟 K 线，布伦特 − WTI，USDT / 桶），配置写 `"oil": {}`，导入时随「启用行情监控」一起写入，已启用的配置会补上缺的市场。没有 `monitor` 时不采集、不显示页面，行为与之前相同。启用后服务器会定时访问 Binance、Hyperliquid、Lighter RH 的公开行情接口（`deploy/config.example.json` 带了这一项，安装脚本生成的配置不带）；服务器所在地区被某家交易所限制时，那一家读不到，页面显示为快照或暂无数据，其余功能不受影响。
+第四个模块“行情监控”（工作台 Monitor 分批接入，方案与进度见 [docs/monitor.md](docs/monitor.md)）第一批是 Anthropic 价差：Binance、Hyperliquid（xyz:ANT、io:ANTH）、Lighter RH 的报价与 15 分钟 K 线，按每股口径算溢价，只读公开行情，不需要密钥。在设置页「从工作台导入」里勾选「启用行情监控」即可启用（命令行 `sudo bash install.sh --import-workbench --monitor`，见下文部署一节），写入的是 `"monitor": { "anthropic": {} }`；也可以手写这一段（可加 `"shares": { "outstanding": 13.116, "diluted": 17.68 }`，十亿股，不写用这两个默认值，须满足 1 ≤ 流通 ≤ 完全稀释 ≤ 100）；只配 `monitor` 时 `pairs` 可以省略。第二批起加了原油价差（Binance BZUSDT / CLUSDT 标记价与 15 分钟 K 线，布伦特 − WTI，USDT / 桶），配置写 `"oil": {}`，导入时随「启用行情监控」一起写入，已启用的配置会补上缺的市场。没有 `monitor` 时不采集、不显示页面，行为与之前相同。启用后服务器会定时访问 Binance、Hyperliquid、Lighter RH 的公开行情接口（`deploy/config.example.json` 带了这一项，安装脚本生成的配置不带）；服务器所在地区被某家交易所限制时，那一家读不到，页面显示为快照或暂无数据，其余功能不受影响。
 
 第五个模块“资产账本”（工作台 Asset）分批接入：第一批（v0.12.0）是从工作台导入的账本、资产走势、日变化归因、出金与资金流的只读展示，第二批（v0.16.0）可在页面编辑手动资产、修改汇率、登记出金与资金流，第三批（v0.19.0）连接交易所并在页面打开时每 60 秒同步余额、行情与人民币汇率（凭据加密保存在数据目录）。方案与进度见 [docs/asset.md](docs/asset.md)；只在 `config.json` 有 `asset` 时启用，启用与导入账本都在设置页「从工作台导入」里完成（见下文部署一节）。
 
@@ -46,7 +46,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 - 行情监控与资产账本（见 [docs/module-import.md](docs/module-import.md)）：
   - 页面「从工作台导入」的预览同时列出行情监控（本项目是否已启用、股数取默认值）与资产账本（工作台 `<工作台数据目录>/modules/asset/ledger.sqlite` 里每个用户的资产与快照条数、能否导入及原因，以及本项目上次导入），勾选「启用行情监控」「导入资产账本」（多个用户时选一个）后随导入一起写入，只勾这两项也可以。
   - 命令行为 `sudo bash install.sh --import-workbench --monitor --asset [--asset-owner <用户>]`（两项可分开用，也可与 `--oil`、`--options`、`--pairs` 同用；账本有多个用户时须加 `--asset-owner`）。
-  - 行情监控写入默认股数（流通 12.7、完全稀释 16.7 十亿股；工作台的股数设置只存在浏览器里，带不过来），已启用时保留现有设置。
+  - 行情监控写入默认股数（流通 13.116、完全稀释 17.68 十亿股；工作台的股数设置只存在浏览器里，带不过来），已启用时保留现有设置。
   - 资产账本先写入数据目录的 `asset.sqlite`（以服务账户身份写入，600），再写配置并重启；账本写入失败时什么都不改；配置检查或启动失败时恢复导入前的配置，已写入的账本保留，重新勾选导入即可。
   - 已启用 `asset` 时再导入只整体替换账本、不重启服务，页面下次读取就是新数据。
   - 账本行不带凭据、钱包地址与密钥尾号；工作台保存的交易所连接（v0.19.0 起）由以工作台库属主身份运行的子进程用工作台资产模块 `config.json` 的 `credentialKey` 解开，经管道直接交给写入子进程，用本服务的密钥（数据目录 `asset-credential.key`）重新加密，与账本在同一事务写入；预览与结果只列连接名，工作台密钥缺失或解不开时只导入账本并写明原因（规则见 [docs/asset.md](docs/asset.md) A-3/A-4）。重新导入会整体替换账本与已保存的连接，页面上做过的修改一并被覆盖。

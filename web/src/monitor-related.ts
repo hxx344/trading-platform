@@ -14,8 +14,10 @@ export const MAX_POSITION_ITEMS = 50;
 export const POSITIONS_STALE_AFTER_MS = 90_000;
 /** The detail pages that show related positions; only oil and Hynix pair their legs. */
 export type RelatedMarket = FillMarket | 'anthropic';
-/** Hyperliquid names the ordinary-share leg SKHX; the CEX contracts use SKHYNIX. Anthropic: Binance ANTHROPICUSDT, Lighter RH ANTHROPIC (rh-lighter), io:ANTH, xyz:ANT. */
-export const RELATED_SYMBOLS: Record<RelatedMarket, readonly string[]> = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHX', 'SKHYNIX'], anthropic: ['ANTHROPIC', 'IOANTH', 'XYZANT'] };
+/** Hyperliquid names the ordinary-share leg SKHX; the CEX contracts use SKHYNIX. Anthropic: Binance ANTUSDT (ANTHROPICUSDT until it settled on 2026-11-17), Lighter RH ANTHROPIC and ANT (rh-lighter), io:ANTH, xyz:ANT. */
+export const RELATED_SYMBOLS: Record<RelatedMarket, readonly string[]> = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHX', 'SKHYNIX'], anthropic: ['ANTHROPIC', 'ANT', 'IOANTH', 'XYZANT'] };
+/** A base that names the market's asset on these venues only: Binance's ANTUSDT is Anthropic, an ANT contract elsewhere is not assumed to be. Same table as src/asset/daily-positions.ts. */
+export const VENUE_ONLY_BASES: Readonly<Record<string, readonly string[]>> = { ANT: ['binance'] };
 export const pairedMarket = (market: RelatedMarket): market is FillMarket => market !== 'anthropic';
 export type RelatedItem = {
   key: string; source: string; exchange: string; exchangeId?: string; symbol: string; base: string; side: 'long' | 'short';
@@ -47,7 +49,7 @@ export function positionItems(data: HubPositions, bases: readonly string[], now:
     if (stale && !positions.length && !['unconfigured', 'unsupported'].includes(scope.status)) sourcesIncomplete = true;
     for (const position of positions) {
       const base = matchBase(position.symbol, bases) ?? matchBase(position.instrumentId, bases);
-      if (!base) continue;
+      if (!base || !(VENUE_ONLY_BASES[base]?.includes(exchange.id) ?? true)) continue;
       matchedCount++;
       if (items.length >= MAX_POSITION_ITEMS) continue;
       const identity = `${exchange.id}:${position.symbol}:${position.side}`, count = (seen.get(identity) ?? 0) + 1;

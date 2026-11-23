@@ -12,7 +12,7 @@ export type ComboId = 'oil' | 'hynix' | 'anthropic';
 export const COMBOS: { id: ComboId; label: string; bases: string[] }[] = [
   { id: 'oil', label: '原油套利', bases: ['CL', 'BZ', 'BRENTOIL', 'WTI'] },
   { id: 'hynix', label: '海力士套利', bases: ['SKHY', 'SKHX', 'SKHYNIX'] },
-  { id: 'anthropic', label: 'ANT 套利', bases: ['ANTHROPIC'] },
+  { id: 'anthropic', label: 'ANT 套利', bases: ['ANTHROPIC', 'ANT'] },
 ];
 export type PositionChange = {
   key: string; account: string; symbol: string; side: Position['side']; combo: ComboId | null;
@@ -42,13 +42,16 @@ export function matchBase(symbol: string, bases: readonly string[]): string | nu
   for (const base of bases) if (normalized.startsWith(base) && SUFFIXES.has(normalized.slice(base.length)) && (!match || base.length > match.length)) match = base;
   return match;
 }
+/** A base that names the combo's asset on these venues only: Binance's ANTUSDT is Anthropic, an ANT contract elsewhere is not assumed to be. */
+export const VENUE_ONLY_BASES: Readonly<Record<string, readonly string[]>> = { ANT: ['binance'] };
+const basesAt = (bases: readonly string[], exchange: string) => bases.filter(base => VENUE_ONLY_BASES[base]?.includes(exchange) ?? true);
 const HYPERLIQUID_COMBOS = new Map<string, ComboId>([
   ['XYZ:CL', 'oil'], ['XYZ:BRENTOIL', 'oil'], ['XYZ:SKHY', 'hynix'], ['XYZ:SKHX', 'hynix'],
   ['XYZ:ANT', 'anthropic'], ['IO:ANTH', 'anthropic'],
 ]);
 export function comboOf(position: Pick<Position, 'symbol' | 'instrumentId'>, exchange: string): ComboId | null {
   if (exchange === 'hyperliquid') return HYPERLIQUID_COMBOS.get(position.symbol.toUpperCase()) ?? HYPERLIQUID_COMBOS.get(position.instrumentId.toUpperCase()) ?? null;
-  return COMBOS.find(combo => matchBase(position.symbol, combo.bases) || matchBase(position.instrumentId, combo.bases))?.id ?? null;
+  return COMBOS.find(combo => { const bases = basesAt(combo.bases, exchange); return matchBase(position.symbol, bases) || matchBase(position.instrumentId, bases); })?.id ?? null;
 }
 
 const amount = (value: string | null | undefined) => {

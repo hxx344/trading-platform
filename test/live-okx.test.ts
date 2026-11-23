@@ -53,7 +53,7 @@ test('OKX 连接器：合约规则按张解析（面值 × 乘数），市价上
     venue.instruments = venue.instruments.map(row => row.instId === INST[symbol] ? { ...row, ...change } : row);
     await assert.rejects(connector.instrument(symbol, { signal: signal() }), kind('read-failed', /不可交易/), symbol);
   }
-  await assert.rejects(connector.instrument('ANTHROPICUSDT', { signal: signal() }), kind('read-failed'));
+  await assert.rejects(connector.instrument('ANTUSDT', { signal: signal() }), kind('read-failed'));
   const quote = await connector.quote('BZUSDT', { signal: signal() });
   assert.deepEqual([quote.venue, quote.bid, quote.ask, quote.sourceTime, quote.receivedAt], ['okx', '70.1', '70.12', venue.clock - 250, venue.clock]);
   assert.equal(venue.last('GET /api/v5/market/books').params.get('instId'), 'BZ-USDT-SWAP');

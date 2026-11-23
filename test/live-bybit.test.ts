@@ -66,7 +66,7 @@ test('Bybit 连接器：账户快照先读委托与追价策略、后读持仓�
     await assert.rejects(connector.account(binding(), ['CLUSDT'], { signal: signal() }), kind('read-failed'));
   }
   await assert.rejects(connector.account(binding({ environment: 'simulated' }), ['CLUSDT'], { signal: signal() }), kind('read-failed'));
-  await assert.rejects(connector.account(binding(), ['ANTHROPICUSDT'], { signal: signal() }), kind('read-failed'));
+  await assert.rejects(connector.account(binding(), ['ANTUSDT'], { signal: signal() }), kind('read-failed'));
 });
 
 test('Bybit 连接器：下单参数按持仓模式带 positionIdx；回执后读一次委托取首个状态，读不到时按已受理未成交报告', async () => {

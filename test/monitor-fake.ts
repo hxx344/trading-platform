@@ -10,17 +10,17 @@
 // the public marks, so a test can tell them apart) and the public predicted funding. M-2f adds the gold/oil reads: Binance
 // exchangeInfo (XAUUSDT, CLUSDT, BZUSDT), the XAUUSDT mark (gold ~2,400 USDT per ounce) and the three legs' 15-minute
 // markPriceKlines; CLUSDT and BZUSDT marks are the oil marks above.
-import type { AnthropicLegKey } from '../src/vendor/anthropic-market.mjs';
+import { ANTHROPIC_SHARES, type AnthropicLegKey } from '../src/vendor/anthropic-market.mjs';
 
 const BAR = 900_000, HOUR = 3_600_000, DAY = 86_400_000;
 const ok = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 const fail = (status: number) => new Response('{}', { status });
 
-/** Native price of a leg at `time`: per-share price times the leg's shares per unit (12.7, 1, 16.7, 16.7). */
+/** Native price of a leg at `time`: per-share price times the leg's shares per unit (1 on Binance and xyz, the default diluted count on io and Lighter RH). */
 export function fakeAnthropicPrice(leg: AnthropicLegKey, time: number): number {
   const share = 95 + 4 * Math.sin(time / (5 * DAY));
   const premium = 0.02 + 0.015 * Math.sin(time / (2 * DAY) + (leg === 'io' ? 1 : leg === 'rh' ? 2 : 0));
-  const value = leg === 'binance' ? share * 12.7 : share / (1 + premium) * (leg === 'xyz' ? 1 : 16.7);
+  const value = leg === 'binance' ? share : share / (1 + premium) * (leg === 'xyz' ? 1 : ANTHROPIC_SHARES.diluted);
   return Math.round(value * 100) / 100;
 }
 
@@ -199,7 +199,7 @@ export function fakeAnthropicVenues({ now = Date.now, listedAt = {} }: FakeVenue
   const answer = (leg: AnthropicLegKey, url: URL, body: Record<string, any> | null): Response => {
     if (state.down.has(leg)) return fail(500);
     if (leg === 'binance') {
-      if (url.pathname === '/fapi/v1/premiumIndex') return ok({ symbol: 'ANTHROPICUSDT', markPrice: String(fakeAnthropicPrice('binance', now())), lastFundingRate: '0.0001', nextFundingTime: Math.ceil(now() / 28_800_000) * 28_800_000 });
+      if (url.pathname === '/fapi/v1/premiumIndex') return ok({ symbol: 'ANTUSDT', markPrice: String(fakeAnthropicPrice('binance', now())), lastFundingRate: '0.0001', nextFundingTime: Math.ceil(now() / 28_800_000) * 28_800_000 });
       const from = Number(url.searchParams.get('startTime')), to = Number(url.searchParams.get('endTime')), limit = Number(url.searchParams.get('limit'));
       return ok(bars(leg, from, to + 1).slice(0, limit).map(t => [t, '1', '1', '1', String(fakeAnthropicPrice(leg, t)), '1', t + BAR - 1]));
     }

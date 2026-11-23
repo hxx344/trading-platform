@@ -11,7 +11,7 @@
 
 - 工作台每个内置模块的数据目录是 `<DATA_DIR>/modules/<模块>`（工作台 `server/modules/runtime.mjs` 第 131 行 `moduleData = path.join(dataDir, 'modules', id)`）。`DATA_DIR` 的取法与配对、原油、期权导入相同：`--workbench-data`，否则工作台环境文件 `/etc/project-aggregation.env` 的 `DATA_DIR`，否则 `/var/lib/project-aggregation`。
 - 资产账本：`<DATA_DIR>/modules/asset/ledger.sqlite`（工作台 `server/recovery/data-catalog.mjs` 第 43 行；`server/modules/asset.mjs` 把 `ASSET_DATA_DIR` 设为模块数据目录，`modules/asset/lib/sqlite.ts` 第 98 行在其中打开 `ledger.sqlite`，WAL 模式）。
-- 行情监控：模块数据在 `<DATA_DIR>/modules/monitor/`（`market.sqlite`、`perpetual/market.sqlite`，data-catalog.mjs 第 41–42 行）。Anthropic 股数设置只存在浏览器 localStorage 的 `workbench:anthropic-shares:v1`（工作台 `src/trading-preferences.ts` 第 8 行），由工作台主页面经桥接能力 `anthropic-shares` 交给 Monitor 页面，服务器上没有保存。所以导入时一律用默认股数（流通 12.7、完全稀释 16.7 十亿股），预览里写明；要改股数仍在 `config.json` 的 `monitor.anthropic.shares` 改（这是调参，不是启用）。
+- 行情监控：模块数据在 `<DATA_DIR>/modules/monitor/`（`market.sqlite`、`perpetual/market.sqlite`，data-catalog.mjs 第 41–42 行）。Anthropic 股数设置只存在浏览器 localStorage 的 `workbench:anthropic-shares:v1`（工作台 `src/trading-preferences.ts` 第 8 行），由工作台主页面经桥接能力 `anthropic-shares` 交给 Monitor 页面，服务器上没有保存。所以导入时一律用默认股数（流通 13.116、完全稀释 17.68 十亿股），预览里写明；要改股数仍在 `config.json` 的 `monitor.anthropic.shares` 改（这是调参，不是启用）。
 
 ## 2 预览
 

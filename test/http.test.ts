@@ -109,8 +109,8 @@ test('HTTP：预览、确认、重复确认返回原任务；状态页只显示�
   assert.equal(state.jobs[0].status, 'completed');
   assert.ok(state.accounts.every(account => account.accountId.startsWith('***')));
   assert.doesNotMatch(JSON.stringify(state), /BN1001|BY2002/);
-  assert.equal((await fetch(base + '/api/observe?venue=bybit&symbol=ANTHROPICUSDT', { headers: { cookie } })).status, 400);
-  assert.equal((await fetch(base + '/api/observe?venue=binance&symbol=ANTHROPICUSDT', { headers: { cookie } })).status, 200);
+  assert.equal((await fetch(base + '/api/observe?venue=bybit&symbol=ANTUSDT', { headers: { cookie } })).status, 400);
+  assert.equal((await fetch(base + '/api/observe?venue=binance&symbol=ANTUSDT', { headers: { cookie } })).status, 200);
   const stale = await post(base, '/api/confirm', { ...body, requestId: randomUUID() }, { cookie });
   assert.equal(stale.status, 409);
   assert.equal(((await stale.json()) as { code: string }).code, 'preview_invalid');

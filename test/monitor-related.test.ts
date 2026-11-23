@@ -80,11 +80,12 @@ test('missing legs, same sides, duplicates and incomplete lists never pair', () 
   assert.ok(pending && pending.status === 'paired'); assert.equal(pending.totals.realizedStatus, 'loading'); assert.equal(pending.closing, null);
 });
 
-test('anthropic picks the ANTHROPIC legs only and never pairs them', () => {
+test('anthropic picks the ANTHROPIC and Binance ANT legs only and never pairs them', () => {
   for (const symbol of ['ANTHROPICUSDT', 'ANTHROPIC-USDT-SWAP', 'ANTHROPIC']) assert.equal(matchBase(symbol, RELATED_SYMBOLS.anthropic), 'ANTHROPIC', symbol);
-  for (const symbol of ['ANTUSDT', 'ANTHUSDT', 'ANT-USDT-SWAP', '1000ANTHROPICUSDT', 'ANTHROPIC2USDT']) assert.equal(matchBase(symbol, RELATED_SYMBOLS.anthropic), null, `${symbol} is another asset`);
-  const data = reply(['binance', scope([position('ANTHROPICUSDT', 'short', '480'), position('ANTUSDT', 'long', '1')])], ['rh-lighter', scope([position('ANTHROPIC', 'long', '30')])]);
+  for (const symbol of ['ANTUSDT', 'ANT-USDT-SWAP', 'ANT']) assert.equal(matchBase(symbol, RELATED_SYMBOLS.anthropic), 'ANT', symbol);
+  for (const symbol of ['ANTHUSDT', 'ANTSUSDT', '1000ANTHROPICUSDT', 'ANTHROPIC2USDT']) assert.equal(matchBase(symbol, RELATED_SYMBOLS.anthropic), null, `${symbol} is another asset`);
+  const data = reply(['binance', scope([position('ANTHROPICUSDT', 'short', '480'), position('ANTUSDT', 'long', '1'), position('ANTSUSDT', 'long', '1')])], ['rh-lighter', scope([position('ANTHROPIC', 'long', '30'), position('ANT', 'long', '5')])], ['okx', scope([position('ANT-USDT-SWAP', 'long', '2')])]);
   const picked = positionItems(data, RELATED_SYMBOLS.anthropic, now).items;
-  assert.deepEqual(picked.map(item => `${item.exchangeId}:${item.symbol}`), ['binance:ANTHROPICUSDT', 'rh-lighter:ANTHROPIC']);
+  assert.deepEqual(picked.map(item => `${item.exchangeId}:${item.symbol}`), ['binance:ANTHROPICUSDT', 'binance:ANTUSDT', 'rh-lighter:ANTHROPIC'], 'ANT counts on Binance only');
   assert.equal(pairedMarket('anthropic'), false, 'opposite Binance and Lighter RH legs stay unpaired: ANT totals are not done');
 });

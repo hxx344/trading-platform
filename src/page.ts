@@ -40,7 +40,7 @@ table{border-collapse:collapse;width:100%} td,th{border-bottom:1px solid #eaeef2
 <h2>ASTER ADL 应急处理（模拟）</h2>
 <p class="muted">交易所自动减仓后，配对两侧多空总量偏差超过较大一侧的 0.5% 时，按只减仓市价单分批减少多出的一侧，直到两侧相等后自动结束；偏差在 0.5% 内不减仓、直接完成。结果未知的减仓单不重发，有界核对后按新现场继续；不足最小下单量的残差记为完成。</p>
 <div id="adlPairs" class="muted">—</div><div id="adlRecent"></div>
-<h2>ANT 只读（Binance ANTHROPICUSDT）</h2><div id="ant" class="muted">—</div>
+<h2>ANT 只读（Binance ANTUSDT）</h2><div id="ant" class="muted">—</div>
 <script>
 const SHOW_ANT = true;
 const $ = id => document.getElementById(id);
@@ -339,7 +339,7 @@ async function refresh() {
     if (positionsShownAt && !positionsCurrent) $('positionsNotice').innerHTML = '<span class="err">页面刷新失败，下方持仓停留在 ' + esc(clock(positionsShownAt)) + ' 的结果，不代表当前</span>';
   }
   if (SHOW_ANT) try {
-    const ant = await api('/api/observe?venue=binance&symbol=ANTHROPICUSDT');
+    const ant = await api('/api/observe?venue=binance&symbol=ANTUSDT');
     $('ant').textContent = '买一 ' + ant.quote.bid + ' / 卖一 ' + ant.quote.ask + ' · 年龄 ' + ant.ageMs + ' 毫秒 · 持仓 多 ' + (ant.position?.long ?? '—') + ' 空 ' + (ant.position?.short ?? '—') + ' · 只读，不可执行';
   } catch (error) { $('ant').innerHTML = '<span class="err">' + esc(error.message) + '</span>'; }
 }

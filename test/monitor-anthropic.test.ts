@@ -66,13 +66,14 @@ test('quote converts every leg to per-share prices and keeps a failed leg as a r
   assert.equal(quote.xyz.markPx, 95);
   assert.equal(quote.io.markPx, 1603.2);
   assert.equal(quote.fetchedAt, new Date(NOW).toISOString());
-  // 1206.5 / 12.7 = 95 per share, 1603.2 / 16.7 = 96 per share.
-  assert.ok(Math.abs(anthropicPremium(1206.5, 95, 'xyz')!) < 1e-9);
-  assert.ok(Math.abs(anthropicPremium(1206.5, 1603.2, 'io')! - (95 / 96 - 1) * 100) < 1e-9);
+  // Binance and xyz are one share per unit; with 16.7 billion diluted shares 1603.2 / 16.7 = 96 per share.
+  const basis = { outstanding: 12.7, diluted: 16.7 };
+  assert.ok(Math.abs(anthropicPremium(95, 95, 'xyz', basis)!) < 1e-9);
+  assert.ok(Math.abs(anthropicPremium(95, 1603.2, 'io', basis)! - (95 / 96 - 1) * 100) < 1e-9);
   assert.equal(anthropicPremium(null, 95, 'xyz'), null);
   await assert.rejects(fetchAnthropicQuote({ now: NOW, fetcher: fetcher({ binance: () => fail(500), hl: () => fail(500) }) }), /No Anthropic quote/);
   // Wrong market names are rejected rather than read as Anthropic.
-  const wrong: Any = await fetchAnthropicQuote({ now: NOW, fetcher: fetcher({ binance: () => ok({ symbol: 'ANTHROPICUSDT', markPrice: '1200', lastFundingRate: '0.0001', nextFundingTime: NOW + 3_600_000 }), hl: () => ok(hlContext('xyz:OTHER', 1)) }) });
+  const wrong: Any = await fetchAnthropicQuote({ now: NOW, fetcher: fetcher({ binance: () => ok({ symbol: 'ANTUSDT', markPrice: '1200', lastFundingRate: '0.0001', nextFundingTime: NOW + 3_600_000 }), hl: () => ok(hlContext('xyz:OTHER', 1)) }) });
   assert.equal(wrong.binance.markPx, 1200); assert.equal(wrong.xyz, null); assert.equal(wrong.io, null);
   assert.throws(() => validateAnthropicQuote({ ...wrong, binance: { markPx: -1 } }));
 });
@@ -112,9 +113,9 @@ test('Binance candle pages continue until a short page', async () => {
 });
 
 test('chart rows and windowed reads keep the per-share premium and coverage', async () => {
-  const rows = [0, 1, 2, 3].map(index => ({ time: lastClosed - (3 - index) * DAY, binance: 1270, xyz: index === 1 ? null : 100, io: 1670 }));
+  const rows = [0, 1, 2, 3].map(index => ({ time: lastClosed - (3 - index) * DAY, binance: 100, xyz: index === 1 ? null : 100, io: 1670 }));
   const snapshot = createAnthropicCandles(rows, new Date(NOW).toISOString());
-  const chart = anthropicChartRows(snapshot.data, 'xyz');
+  const chart = anthropicChartRows(snapshot.data, 'xyz', { outstanding: 12.7, diluted: 16.7 });
   assert.equal(chart.length, 3);
   assert.deepEqual(chart[0], { time: rows[0]!.time, adr: 100, ordinary: 100, equivalent: 100, spread: 0, premium: 0 });
   assert.equal(anthropicChartRows(snapshot.data, 'io').length, 4);
@@ -165,21 +166,22 @@ test('a failed candle leg is reported in the snapshot, survives window validatio
 });
 
 test('Lighter RH reads the ANTHROPIC perpetual by symbol, then one market per round, priced per fully diluted share', async () => {
-  const rh = createRhLighterState(), venue = fetcher({ binance: () => ok({ symbol: 'ANTHROPICUSDT', markPrice: '1270', lastFundingRate: '0.0001', nextFundingTime: NOW }), hl: () => fail(500), rh: rhVenue({ id: 51, mark: '1670' }) });
+  const rh = createRhLighterState(), venue = fetcher({ binance: () => ok({ symbol: 'ANTUSDT', markPrice: '100', lastFundingRate: '0.0001', nextFundingTime: NOW }), hl: () => fail(500), rh: rhVenue({ id: 51, mark: '1670' }) });
   const first: Any = await fetchAnthropicQuote({ now: NOW, fetcher: venue, rh });
   assert.deepEqual(first.rh, { markPx: 1670, fundingRate: null, indexPx: 1502.5 });
   assert.deepEqual(rhCalls(venue.calls).map(call => call.params), [{}], 'the first round discovers the market from the catalog only');
   const second: Any = await fetchAnthropicQuote({ now: NOW + 10_000, fetcher: venue, rh });
   assert.equal(second.rh.markPx, 1670);
   assert.deepEqual(rhCalls(venue.calls).map(call => call.params), [{}, { market_id: '51' }], 'later rounds read only the discovered market');
-  // 1270 / 12.7 = 100 per share on Binance, 1670 / 16.7 = 100 per share on Lighter RH.
-  assert.ok(Math.abs(anthropicPremium(first.binance.markPx, first.rh.markPx, 'rh')!) < 1e-9);
-  assert.ok(Math.abs(anthropicPremium(1270, 1503, 'rh')! - (100 / (1503 / 16.7) - 1) * 100) < 1e-9);
-  assert.deepEqual(anthropicChartRows([{ time: 0, binance: 1270, xyz: null, io: null, rh: 1503 }], 'rh').map(row => row.equivalent), [1503 / 16.7]);
+  // Binance is one share per unit; with 16.7 billion diluted shares 1670 / 16.7 = 100 per share on Lighter RH.
+  const basis = { outstanding: 12.7, diluted: 16.7 };
+  assert.ok(Math.abs(anthropicPremium(first.binance.markPx, first.rh.markPx, 'rh', basis)!) < 1e-9);
+  assert.ok(Math.abs(anthropicPremium(100, 1503, 'rh', basis)! - (100 / (1503 / 16.7) - 1) * 100) < 1e-9);
+  assert.deepEqual(anthropicChartRows([{ time: 0, binance: 100, xyz: null, io: null, rh: 1503 }], 'rh', basis).map(row => row.equivalent), [1503 / 16.7]);
 });
 
 test('a missing, delisted or reassigned Lighter RH market fails only that leg and is looked up again', async () => {
-  const healthy = { binance: () => ok({ symbol: 'ANTHROPICUSDT', markPrice: '1270' }), hl: (body: Any) => ok(hlContext(body.dex === 'xyz' ? 'xyz:ANT' : 'io:ANTH', 95)) };
+  const healthy = { binance: () => ok({ symbol: 'ANTUSDT', markPrice: '1270' }), hl: (body: Any) => ok(hlContext(body.dex === 'xyz' ? 'xyz:ANT' : 'io:ANTH', 95)) };
   const missing: Any = await fetchAnthropicQuote({ now: NOW, rh: createRhLighterState(), fetcher: fetcher({ ...healthy, rh: rhVenue({ symbol: 'OPENAI' }) }) });
   assert.equal(missing.rh, null); assert.equal(missing.errors.rh, '合约缺失');
   assert.equal(missing.binance.markPx, 1270); assert.equal(missing.xyz.markPx, 95); assert.equal(missing.io.markPx, 95);
@@ -202,7 +204,7 @@ test('a missing, delisted or reassigned Lighter RH market fails only that leg an
 test('Lighter RH 429 or 405 pauses its quote and candle requests for 60 s without touching other venues', async () => {
   for (const status of [429, 405]) {
     const rh = createRhLighterState(), gate = createBinanceGate();
-    const limited = fetcher({ binance: () => ok({ symbol: 'ANTHROPICUSDT', markPrice: '1270' }), hl: () => fail(500), rh: () => fail(status) });
+    const limited = fetcher({ binance: () => ok({ symbol: 'ANTUSDT', markPrice: '1270' }), hl: () => fail(500), rh: () => fail(status) });
     const first = await fetchAnthropicQuote({ now: NOW, fetcher: limited, rh, gate, clock: () => NOW });
     assert.equal(first.errors.rh, `接口返回 HTTP ${status}`);
     const cooled = await fetchAnthropicQuote({ now: NOW + 59_000, fetcher: limited, rh, gate, clock: () => NOW + 59_000 });
@@ -219,7 +221,7 @@ test('Lighter RH 429 or 405 pauses its quote and candle requests for 60 s withou
 test('Lighter RH code 23000, as HTTP 400 or inside a 200 body, cools down like a firewall 429', async () => {
   for (const status of [400, 200]) {
     const rh = createRhLighterState(), gate = createBinanceGate();
-    const limited = fetcher({ binance: () => ok({ symbol: 'ANTHROPICUSDT', markPrice: '1270' }), hl: () => fail(500), rh: () => ok({ code: 23000, message: 'Too Many Requests' }, status) });
+    const limited = fetcher({ binance: () => ok({ symbol: 'ANTUSDT', markPrice: '1270' }), hl: () => fail(500), rh: () => ok({ code: 23000, message: 'Too Many Requests' }, status) });
     const first = await fetchAnthropicQuote({ now: NOW, fetcher: limited, rh, gate, clock: () => NOW });
     assert.equal(first.errors.rh, '接口限流冷却中（代码 23000）');
     const cooled = await fetchAnthropicQuote({ now: NOW + 59_000, fetcher: limited, rh, gate, clock: () => NOW + 59_000 });
@@ -229,7 +231,7 @@ test('Lighter RH code 23000, as HTTP 400 or inside a 200 body, cools down like a
 });
 
 test('a Lighter RH response over 2 MiB is refused, whether announced by Content-Length or only seen while streaming', async () => {
-  const binance = () => ok({ symbol: 'ANTHROPICUSDT', markPrice: '1270' });
+  const binance = () => ok({ symbol: 'ANTUSDT', markPrice: '1270' });
   const padded = (size: number) => async (url: URL) => { const body = await rhVenue()(url).json() as Record<string, unknown>; return ok({ ...body, pad: 'x'.repeat(size) }); };
   const read = (rh: (url: URL) => Response | Promise<Response>) => fetchAnthropicQuote({ now: NOW, fetcher: fetcher({ binance, hl: () => fail(500), rh }), rh: createRhLighterState(), gate: createBinanceGate(), clock: () => NOW });
   const small = await read(padded(1024 * 1024));
@@ -275,21 +277,21 @@ test('Lighter RH candles page forward from the listing, at most four pages a rou
   assert.equal(rejected.data.at(-1)!.binance, 1270, 'an invalid Lighter RH page fails only that leg');
 });
 
-test('history saved before the Lighter RH leg validates, gains an empty leg and backfills it', async () => {
-  const rows = [0, 1, 2].map(index => ({ time: lastClosed - (2 - index) * BAR, binance: 1270, xyz: 100, io: 1670 }));
+test('history naming the settled Binance contract or missing a leg is rejected; an empty Lighter RH leg backfills', async () => {
+  const rows = [0, 1, 2].map(index => ({ time: lastClosed - (2 - index) * BAR, binance: 100, xyz: 100, io: 1670, rh: null }));
   const fetchedAt = new Date(NOW).toISOString();
-  const legacy = { status: 'live', metadata: { source: 'Binance + Hyperliquid', symbols: ['ANTHROPICUSDT', 'xyz:ANT', 'io:ANTH'], interval: '15m', timezone: 'UTC', priceBasis: 'Completed 15-minute trade candle closes', fetchedAt, firstObservation: new Date(rows[0]!.time).toISOString(), lastObservation: new Date(rows[2]!.time).toISOString(), rows: 3, errors: { io: '请求超时' } }, data: rows };
+  const legacy = { status: 'live', metadata: { source: 'Binance + Hyperliquid + rh-Lighter', symbols: ['ANTUSDT', 'xyz:ANT', 'io:ANTH', 'ANTHROPIC'], interval: '15m', timezone: 'UTC', priceBasis: 'Completed 15-minute trade candle closes', fetchedAt, firstObservation: new Date(rows[0]!.time).toISOString(), lastObservation: new Date(rows[2]!.time).toISOString(), rows: 3, errors: { io: '请求超时' } }, data: rows };
   const migrated = validateAnthropicCandles(JSON.parse(JSON.stringify(legacy)));
   assert.deepEqual(migrated.data.map(row => row.rh), [null, null, null]);
-  assert.equal(migrated.metadata.source, 'Binance + Hyperliquid + rh-Lighter');
-  assert.deepEqual(migrated.metadata.symbols, ['ANTHROPICUSDT', 'xyz:ANT', 'io:ANTH', 'ANTHROPIC']);
+  assert.deepEqual(migrated.metadata.symbols, ['ANTUSDT', 'xyz:ANT', 'io:ANTH', 'ANTHROPIC']);
   assert.deepEqual(migrated.metadata.errors, { io: '请求超时' });
   assert.equal(anthropicCandleWindow(legacy as unknown as AnthropicCandles, 1).data.length, 3);
-  assert.throws(() => validateAnthropicCandles({ ...legacy, metadata: { ...legacy.metadata, symbols: ['ANTHROPICUSDT', 'xyz:ANT'] } }), /source/);
-  assert.throws(() => validateAnthropicCandles({ ...legacy, metadata: { ...legacy.metadata, source: 'Binance + Hyperliquid + rh-Lighter' } }), /source/);
+  assert.throws(() => validateAnthropicCandles({ ...legacy, metadata: { ...legacy.metadata, symbols: ['ANTUSDT', 'xyz:ANT'] } }), /source/);
+  assert.throws(() => validateAnthropicCandles({ ...legacy, metadata: { ...legacy.metadata, symbols: ['ANTHROPICUSDT', 'xyz:ANT', 'io:ANTH', 'ANTHROPIC'] } }), /source/, 'a browser cache of the settled contract is refetched');
+  assert.throws(() => validateAnthropicCandles({ ...legacy, metadata: { ...legacy.metadata, source: 'Binance + Hyperliquid', symbols: ['ANTUSDT', 'xyz:ANT', 'io:ANTH'] } }), /source/);
 
   // The workbench reads each round's input back from its store; here it goes through JSON the same way.
-  const venue = fetcher({ binance: url => ok([kline(Number(url.searchParams.get('startTime')), 1270)]), hl: body => ok([candle(body.req.coin, lastClosed, body.req.coin === 'io:ANTH' ? 1670 : 100)]), rh: rhVenue({ close: () => 1503 }) });
+  const venue = fetcher({ binance: url => ok([kline(Number(url.searchParams.get('startTime')), 100)]), hl: body => ok([candle(body.req.coin, lastClosed, body.req.coin === 'io:ANTH' ? 1670 : 100)]), rh: rhVenue({ close: () => 1503 }) });
   const rh = createRhLighterState(), gate = createBinanceGate();
   let next = await fetchAnthropicCandles(JSON.parse(JSON.stringify(legacy)), { now: NOW, fetcher: venue, rh, gate });
   const firstPage = rhCalls(venue.calls).find(call => call.rh === '/api/v1/candles')!;

@@ -160,6 +160,6 @@ export function anthropicChartConfig(leg: AnthropicComparisonLeg): SpreadChartCo
     tabs: { premium: '溢价率', spread: '每股价差', price: '每股价格' }, units: { premium: `% · Binance 相对 ${name}`, spread: 'USD / 股', price: 'USD / 股' },
     premiumName: 'Binance 溢价率', spreadName: '每股价差', legs: ['Binance', name], zeroLabel: '0 = 同价', domainStep: 1, digits: 2, price: usd,
     tick: { premium: v => `${Number(v.toFixed(2))}%`, spread: v => `$${Number(v.toFixed(2))}`, price: v => `$${Number(v.toFixed(1))}` },
-    emptyText: { loading: '正在载入 15 分钟 K 线', hint: `Binance ANTHROPICUSDT / ${label} 同一时段已收盘 K 线` },
+    emptyText: { loading: '正在载入 15 分钟 K 线', hint: `${ANTHROPIC_LEGS.binance.label} / ${label} 同一时段已收盘 K 线` },
   };
 }

@@ -59,7 +59,7 @@ function createRegistry(): Registry & { dispose(): void } {
 }
 
 function bindNumeric(h: Harness): void {
-  h.binance.openAccount(ACCOUNTS.binance, { CLUSDT: 'one-way', BZUSDT: 'one-way', ANTHROPICUSDT: 'one-way' });
+  h.binance.openAccount(ACCOUNTS.binance, { CLUSDT: 'one-way', BZUSDT: 'one-way', ANTUSDT: 'one-way' });
   h.bybit.openAccount(ACCOUNTS.bybit, { CLUSDT: 'one-way', BZUSDT: 'one-way' });
   h.ex.registerAccount({ venue: 'binance', environment: 'simulated', accountId: ACCOUNTS.binance, accountMode: 'standard', credentialVersion: 1 });
   h.ex.registerAccount({ venue: 'bybit', environment: 'simulated', accountId: ACCOUNTS.bybit, accountMode: 'unified', credentialVersion: 1 });

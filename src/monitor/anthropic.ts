@@ -2,10 +2,12 @@
 // (quotes every 10 s, completed 15-minute candles every 60 s); every request carries its own timeout there and is never
 // retried within a round. A failed round only keeps what was there and says why. The last quote and the candle history
 // are kept in monitor.sqlite and read back at start, marked as a snapshot until a round succeeds.
+// The Binance leg is ANTUSDT (one share per unit) since the contract change below; closes stored from ANTHROPICUSDT are
+// converted once when they are read back, and a reply that does not name ANTUSDT never reaches the stored history.
 import {
-  ANTHROPIC_CANDLE_MS, ANTHROPIC_CANDLE_REFRESH_MS, ANTHROPIC_INITIAL_DAYS, ANTHROPIC_LEG_KEYS, ANTHROPIC_QUOTE_REFRESH_MS, ANTHROPIC_RETENTION_DAYS,
+  ANTHROPIC_LEGS, ANTHROPIC_CANDLE_MS, ANTHROPIC_CANDLE_REFRESH_MS, ANTHROPIC_INITIAL_DAYS, ANTHROPIC_LEG_KEYS, ANTHROPIC_QUOTE_REFRESH_MS, ANTHROPIC_RETENTION_DAYS,
   anthropicCandleWindow, createAnthropicCandles, createBinanceGate, mergeAnthropicCandleBatch, legError, validateAnthropicQuote,
-  type AnthropicCandleCoverage, type AnthropicCandles, type BinanceGate, type AnthropicCandleWindow, type AnthropicFetcher, type AnthropicQuote, type AnthropicLegKey, type AnthropicLegErrors,
+  type AnthropicCandleCoverage, type AnthropicCandleRow, type AnthropicCandles, type BinanceGate, type AnthropicCandleWindow, type AnthropicFetcher, type AnthropicQuote, type AnthropicLegKey, type AnthropicLegErrors,
 } from '../vendor/anthropic-market.mjs';
 import { createMarketReaders, type MarketReaders } from './market-readers.ts';
 import { afterCandleRange, candleCheckOverdue, candleCoverage, nextCandleRange, type CandleCoverage } from './candle-coverage.ts';
@@ -18,6 +20,28 @@ export const CANDLE_STALE_MS = 615_000;
 const DAY_MS = 86_400_000;
 export const QUOTE_KEY = 'anthropic.quote';
 export const CANDLE_KEY = 'anthropic.candles';
+/**
+ * Binance settled ANTHROPICUSDT (valuation per 1B outstanding shares) and listed ANTUSDT (one share) on 2026-11-17,
+ * dividing the contract by `factor`. The old contract's last traded 15-minute bar opened 08:45 UTC; from `from` on its
+ * candles only repeat that close, and ANTUSDT trades from 10:30 UTC. Between its listing and `from` the old contract
+ * stayed within 1,221–2,228 and one share below 170, so a close at or above `oldUnitFloor` before `from` is in the old unit.
+ */
+export const BINANCE_REBASE = Object.freeze({ factor: 13.116, from: Date.UTC(2026, 10, 17, 9), oldUnitFloor: 400 });
+const BINANCE_SYMBOL = ANTHROPIC_LEGS.binance.symbol;
+const OTHER_CONTRACT = '行情服务读取的不是当前 Binance 合约，等待其更新';
+
+/**
+ * Stored closes in ANTUSDT's unit: old-unit closes before the change are divided by the contract factor, and the old
+ * contract's repeated closes from the change on are dropped so they are read again from ANTUSDT. Applying it twice changes nothing more.
+ */
+export function rebaseBinanceCandles(rows: readonly AnthropicCandleRow[]): AnthropicCandleRow[] {
+  return rows.flatMap(row => {
+    const binance = row.time >= BINANCE_REBASE.from ? null
+      : row.binance !== null && row.binance >= BINANCE_REBASE.oldUnitFloor ? row.binance / BINANCE_REBASE.factor : row.binance;
+    const next = { ...row, binance };
+    return ANTHROPIC_LEG_KEYS.every(key => next[key] === null) ? [] : [next];
+  });
+}
 
 export interface AnthropicQuoteView extends AnthropicQuote {
   status: 'live' | 'snapshot';
@@ -54,21 +78,34 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
 
   try {
     const saved = store.readState(QUOTE_KEY);
-    if (saved) { quote = validateAnthropicQuote(saved.value); quoteRestored = true; }
+    if (saved) {
+      const restored = validateAnthropicQuote(saved.value);
+      // A quote saved while Binance was read from ANTHROPICUSDT keeps its other legs only.
+      const current = restored.binanceSymbol === BINANCE_SYMBOL ? restored
+        : { ...restored, binanceSymbol: BINANCE_SYMBOL, binance: null, errors: { ...restored.errors, binance: 'Binance 合约已更换，等待新报价' } };
+      if (ANTHROPIC_LEG_KEYS.some(key => current[key] !== null)) { quote = current; quoteRestored = true; }
+    }
   } catch (error) { log(`Anthropic 上次报价无法读回，等待新报价：${detail(error)}`); }
   try {
     const rows = store.candles();
     const saved = store.readState(CANDLE_KEY);
     if (rows.length || saved) {
       if (!saved) throw new Error('K 线轮次记录缺失');
-      const round = saved.value as { fetchedAt: string; errors?: AnthropicLegErrors; coverage?: Partial<Record<AnthropicLegKey, CandleCoverage>> };
+      const round = saved.value as { fetchedAt: string; errors?: AnthropicLegErrors; coverage?: Partial<Record<AnthropicLegKey, CandleCoverage>>; binance?: string };
       const fetched = Date.parse(round.fetchedAt);
       if (!Number.isFinite(fetched)) throw new Error('K 线轮次时间无效');
-      const restored = rows.length ? createAnthropicCandles(rows, round.fetchedAt, 'snapshot', round.errors ?? {}) : null;
+      // The history was stored while Binance was read from ANTHROPICUSDT: convert it here and rewrite the table with the
+      // next round's rows and this marker in one transaction. Until then every start converts the same stored rows again.
+      const rebase = round.binance !== BINANCE_SYMBOL;
+      const stored = rebase ? rebaseBinanceCandles(rows) : rows;
+      const restored = stored.length ? createAnthropicCandles(stored, round.fetchedAt, 'snapshot', round.errors ?? {}) : null;
       progress = perLeg(key => {
-        const last = rows.findLast(row => row[key] !== null);
-        return candleCoverage(round.coverage?.[key], last ? last.time + ANTHROPIC_CANDLE_MS : 0, ANTHROPIC_CANDLE_MS, fetched);
+        const last = stored.findLast(row => row[key] !== null);
+        const coverage = candleCoverage(round.coverage?.[key], last ? last.time + ANTHROPIC_CANDLE_MS : 0, ANTHROPIC_CANDLE_MS, fetched);
+        // ANTUSDT is read on from the change, whatever the old contract's progress was.
+        return rebase && key === 'binance' ? { ...coverage, through: Math.min(coverage.through, BINANCE_REBASE.from), repairCursor: Math.min(coverage.repairCursor, BINANCE_REBASE.from) } : coverage;
       });
+      if (rebase) { replaceCandles = true; log(`Anthropic 已保存的 Binance K 线按 ${BINANCE_SYMBOL} 口径换算（旧合约收盘价 ÷ ${BINANCE_REBASE.factor}），${new Date(BINANCE_REBASE.from).toISOString()} 起从新合约重新读取`); }
       candles = restored; legErrors = round.errors ?? {};
       candlesRestored = true;
     }
@@ -98,6 +135,11 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
     }
     // A stop that cut some legs short still returns the others: such a round is dropped, not stored over a complete one.
     if (stopping.signal.aborted) return;
+    if (next.binanceSymbol !== BINANCE_SYMBOL) {
+      // A market service that has not been updated still reads the settled contract, whose price is in another unit.
+      next = { ...next, binanceSymbol: BINANCE_SYMBOL, binance: null, errors: { ...next.errors, binance: OTHER_CONTRACT } };
+      if (ANTHROPIC_LEG_KEYS.every(key => next[key] === null)) { quoteError = OTHER_CONTRACT; quoteReport.failed(quoteError, 'binanceSymbol'); return; }
+    }
     quote = next; quoteEpoch = readers.epoch?.() ?? null; quoteRestored = false; quoteError = null;
     quoteReport.recovered();
     try { store.writeState(QUOTE_KEY, next); quoteSave.recovered(); }
@@ -119,8 +161,13 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
     const nextProgress = { ...progress }, errors = { ...legErrors };
     let next: AnthropicCandles | null;
     try {
-      const batch = await readers.anthropicCandles(perLeg(key => work[key]?.start ?? target), at, stopping.signal, perLeg(key => work[key]?.end ?? target));
+      let batch = await readers.anthropicCandles(perLeg(key => work[key]?.start ?? target), at, stopping.signal, perLeg(key => work[key]?.end ?? target));
       if (stopping.signal.aborted) return;
+      // Closes read from another Binance contract are in another unit: that leg fails this round and nothing of it is merged.
+      if (batch.binanceSymbol !== BINANCE_SYMBOL) {
+        const { binance: _dropped, ...legs } = batch.legs;
+        batch = { ...batch, legs, errors: { ...batch.errors, binance: OTHER_CONTRACT } };
+      }
       for (const key of ANTHROPIC_LEG_KEYS) {
         const range = work[key];
         if (!range) continue;
@@ -159,7 +206,7 @@ export function createAnthropicMonitor({ store, gate = createBinanceGate(), fetc
     });
     try {
       store.writeCandles({ rows: changed, cutoff: at - ANTHROPIC_RETENTION_DAYS * DAY_MS, replace: replaceCandles,
-        state: { key: CANDLE_KEY, value: { fetchedAt: iso(at), errors, coverage: nextProgress } } });
+        state: { key: CANDLE_KEY, value: { fetchedAt: iso(at), errors, coverage: nextProgress, binance: BINANCE_SYMBOL } } });
     } catch (error) {
       // Memory stays with what is stored, so the next round reads on from there and writes the same rows again.
       candleError = 'K 线保存失败：monitor.sqlite 写入失败';

@@ -405,12 +405,14 @@ test('a stalled cycle summary is not mixed with fresh unrealized PnL', () => {
   assert.equal(group(day.positions!, 'oil').complete, false);
 });
 
-test('ANT uses the Anthropic contract name, never the unrelated ANT token or a loose prefix', () => {
-  for (const symbol of ['ANTHROPICUSDT', 'ANTHROPIC-USDT-SWAP', 'ANTHROPIC']) {
+test('ANT uses the Anthropic contract names (ANTHROPIC, and ANT on Binance only), never a loose prefix', () => {
+  for (const symbol of ['ANTHROPICUSDT', 'ANTHROPIC-USDT-SWAP', 'ANTHROPIC', 'ANT', 'ANTUSDT', 'ANT-USDT-SWAP']) {
     assert.equal(comboOf({ symbol, instrumentId: symbol }, 'binance'), 'anthropic', symbol);
-    assert.equal(comboOf({ symbol: 'display-name', instrumentId: symbol }, 'rh-lighter'), 'anthropic', 'native instrument identity');
+    if (symbol.startsWith('ANTHROPIC')) assert.equal(comboOf({ symbol: 'display-name', instrumentId: symbol }, 'rh-lighter'), 'anthropic', 'native instrument identity');
   }
-  for (const symbol of ['ANT', 'ANTUSDT', 'ANT-USDT-SWAP', 'ANTHROPICXUSDT', 'XANTHROPICUSDT', 'xyz:ANT', 'io:ANTH']) {
+  for (const symbol of ['ANT', 'ANTUSDT', 'ANT-USDT-SWAP']) for (const exchange of ['okx', 'bybit', 'rh-lighter']) assert.equal(comboOf({ symbol, instrumentId: symbol }, exchange), null, `${exchange} ${symbol} is not assumed to be Anthropic`);
+  assert.equal(comboOf({ symbol: 'ANTHROPIC-USDT-SWAP', instrumentId: 'ANTHROPIC-USDT-SWAP' }, 'okx'), 'anthropic');
+  for (const symbol of ['ANTH', 'ANTSUSDT', 'ANTHROPICXUSDT', 'XANTHROPICUSDT', 'xyz:ANT', 'io:ANTH']) {
     assert.equal(comboOf({ symbol, instrumentId: symbol }, 'binance'), null, symbol);
   }
   assert.equal(comboOf({ symbol: 'ANT', instrumentId: 'xyz:ANT' }, 'hyperliquid'), 'anthropic');
@@ -451,7 +453,7 @@ test('stored ANT holdings move out of other and use each settlement currency pri
   const holdings = (at: string, next: boolean): PositionsCapture => {
     const result: PositionsCapture = capture(at, [
       leg('ANTHROPICUSDT', 'long', '1', next ? '20' : '10', { since, net: next ? '3' : '2' }),
-      leg('ANTUSDT', 'long', '1', next ? '6' : '1', { since, net: '0' }),
+      leg('ANTSUSDT', 'long', '1', next ? '6' : '1', { since, net: '0' }),
     ]);
     result.scopes.push({ ...result.scopes[0], exchange: 'okx', scope: 'SWAP', positions: [
       leg('ANTHROPIC-USDT-SWAP', 'short', '10', next ? '3' : '0', { since, net: next ? '-1' : '0', updatedAt: at }),
@@ -474,7 +476,7 @@ test('stored ANT holdings move out of other and use each settlement currency pri
     assert.equal(ant.legs, 3);
     assert.ok(Math.abs(ant.change! - ((10 + 1 + 3 - 1) * 0.99 - 2 * 1.02)) < 1e-9);
     assert.equal(ant.complete, false, 'RH has no comparable cycle; its known unrealized change is retained as partial');
-    assert.equal(other.legs, 1, 'the unrelated ANT token stays in other; Anthropic legs are not counted twice');
+    assert.equal(other.legs, 1, 'a look-alike symbol stays in other; Anthropic legs are not counted twice');
     assert.ok(Math.abs(other.change! - 5 * 0.99) < 1e-9);
     assert.equal(other.complete, true);
     assert.equal(day.change, 10, 'position attribution is not added to the asset total again');

@@ -83,12 +83,12 @@ test('C03 重复确认只返回同一任务；换会话、换载荷、已消费�
 test('C01 能力与身份：ANT 不可执行、Bybit ANT 不可读、跨所与方向约束、身份与凭据绑定', () => withHarness(async h => {
   bindAccounts(h.ex);
   const intent = openIntent();
-  await assert.rejects(h.ex.preview({ ...intent, symbol: 'ANTHROPICUSDT' }, SESSION), code('invalid_value'));
+  await assert.rejects(h.ex.preview({ ...intent, symbol: 'ANTUSDT' }, SESSION), code('invalid_value'));
   await assert.rejects(h.ex.preview({ ...intent, legs: [intent.legs[0], { ...intent.legs[1], venue: 'binance' }] }, SESSION), code('same_venue'));
   await assert.rejects(h.ex.preview({ ...intent, legs: [intent.legs[0], { ...intent.legs[1], side: 'long' }] }, SESSION), code('same_side'));
   await assert.rejects(h.ex.preview({ ...intent, legs: [{ ...intent.legs[0], orderType: 'limit' }, intent.legs[1]] }, SESSION), code('limit_price'));
-  await assert.rejects(h.ex.observe('bybit', 'ANTHROPICUSDT'), code('venue_symbol'));
-  const ant = await h.ex.observe('binance', 'ANTHROPICUSDT');
+  await assert.rejects(h.ex.observe('bybit', 'ANTUSDT'), code('venue_symbol'));
+  const ant = await h.ex.observe('binance', 'ANTUSDT');
   assert.equal(ant.instrument.quantityStep, '0.001');
   assert.deepEqual(ant.position, { long: '0', short: '0' });
 

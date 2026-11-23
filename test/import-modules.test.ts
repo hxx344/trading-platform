@@ -40,7 +40,7 @@ const fits = (): void => undefined;
 test('行情监控导入：没有 monitor 时写入全部市场（默认股数），已有时保留现有设置、只补缺少的市场', () => {
   const config: Record<string, unknown> = { secretsFile: '/x/secrets.json', pairs: [] }, notes: string[] = [];
   const item = planMonitor({ workbench: true }, config, fits, notes);
-  assert.deepEqual([item.status, item.enabled, item.shares, item.markets], ['added', false, { outstanding: 12.7, diluted: 16.7 }, ['anthropic', 'oil', 'goldoil', 'hynix', 'perpetual']]);
+  assert.deepEqual([item.status, item.enabled, item.shares, item.markets], ['added', false, { outstanding: 13.116, diluted: 17.68 }, ['anthropic', 'oil', 'goldoil', 'hynix', 'perpetual']]);
   assert.deepEqual(config.monitor, { anthropic: {}, oil: {}, goldoil: {}, hynix: {}, perpetual: {} });
   assert.match(item.detail, /Anthropic 价差（股数取默认值.*原油价差（每 10 秒读报价.*金油比（每 30 秒读报价.*海力士溢价（每 10 秒读报价.*合约价差（11 家交易所.*不需要密钥/);
   assert.match(notes.join(), /股数设置只存在浏览器里/);

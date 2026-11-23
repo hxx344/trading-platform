@@ -7,7 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createMonitorStore, MONITOR_FILE, type MonitorStore } from '../src/monitor/store.ts';
-import { CANDLE_STALE_MS, MAX_REPLY_BYTES, QUOTE_KEY, QUOTE_STALE_MS, boundedReply, createAnthropicMonitor } from '../src/monitor/anthropic.ts';
+import { BINANCE_REBASE, CANDLE_KEY, CANDLE_STALE_MS, MAX_REPLY_BYTES, QUOTE_KEY, QUOTE_STALE_MS, boundedReply, createAnthropicMonitor, rebaseBinanceCandles } from '../src/monitor/anthropic.ts';
 import { MODULE_KEYS, parseServiceConfig } from '../src/service/config.ts';
 import { monitorSummary } from '../src/service/monitor-config.ts';
 import { ANTHROPIC_LEG_KEYS, type AnthropicCandleRow } from '../src/vendor/anthropic-market.mjs';
@@ -191,7 +191,7 @@ test('四腿确认的空区间可以续读，不能给旧收盘续鲜', async ()
     const prior = first.candles(null)!.metadata.lastObservation;
     const empty = createAnthropicMonitor({ store: env.store, now: () => env.clock, readers: {
       ...createMarketReaders({ fetchImpl: env.venues.fetch }), async anthropicCandles(_starts, at, _signal, ends) {
-        return { at, errors: {}, legs: { binance: [], io: [], xyz: [], rh: [] }, through: ends! };
+        return { at, errors: {}, legs: { binance: [], io: [], xyz: [], rh: [] }, through: ends!, binanceSymbol: 'ANTUSDT' };
       },
     } });
     for (let i = 0; i < 3; i++) {
@@ -229,6 +229,137 @@ test('采集：写库失败时内存停在库里的状态；库里的历史读�
     await monitor.refreshCandles();
     assert.ok(!env.store.candles().some(row => row.time === old), '读不回的旧行被清掉');
     assert.deepEqual(plain(env.store.candles()), monitor.candles(null)!.data);
+  } finally { env.dispose(); }
+});
+
+test('Binance 腿换到 ANTUSDT：旧合约的历史收盘价除以 13.116，切换时刻之后的清空，重复换算结果不变', () => {
+  const cut = BINANCE_REBASE.from;
+  const rows: AnthropicCandleRow[] = [
+    { time: cut - 2 * BAR, binance: 1311.6, xyz: 99, io: 1700, rh: 1690 },
+    { time: cut - BAR, binance: 1252.52, xyz: null, io: null, rh: null },
+    { time: cut, binance: 1252.52, xyz: 95, io: null, rh: null },
+    { time: cut + BAR, binance: 1252.52, xyz: null, io: null, rh: null },
+    { time: cut + 6 * BAR, binance: 87.5, xyz: 88, io: 1560, rh: 1544 },
+  ];
+  const once = rebaseBinanceCandles(rows);
+  assert.deepEqual(once.map(row => row.time), [cut - 2 * BAR, cut - BAR, cut, cut + 6 * BAR], '只剩旧合约收盘的行整行去掉');
+  assert.ok(Math.abs(once[0]!.binance! - 100) < 1e-9 && Math.abs(once[1]!.binance! - 1252.52 / 13.116) < 1e-9);
+  assert.deepEqual([once[2]!.binance, once[3]!.binance], [null, null], '切换时刻起的 Binance 收盘等新合约重新读取');
+  assert.deepEqual({ ...once[0], binance: 0 }, { ...rows[0], binance: 0 }, '其余三条腿不动');
+  assert.deepEqual(rebaseBinanceCandles(once), once, '已是每股口径的价格不再除');
+});
+
+test('采集：库里是旧合约 ANTHROPICUSDT 的历史时，启动后按每股口径读回，下一轮连同标记整表重写', async () => {
+  const env = setup();
+  try {
+    const first = env.monitor();
+    await first.refreshQuote();
+    await first.refreshCandles();
+    const fresh = first.candles(null)!.data;
+    // Put the store back to what the previous version left: old-contract closes, no contract marker on either record.
+    const raw = new DatabaseSync(join(env.dir, MONITOR_FILE));
+    raw.prepare('UPDATE anthropic_candles SET binance = binance * 13.116 WHERE binance IS NOT NULL').run();
+    raw.close();
+    const round = env.store.readState(CANDLE_KEY)!.value as Record<string, unknown>;
+    assert.equal(round.binance, 'ANTUSDT');
+    const { binance: _marker, ...oldRound } = round;
+    env.store.writeState(CANDLE_KEY, oldRound);
+    const { binanceSymbol: _symbol, ...oldQuote } = env.store.readState(QUOTE_KEY)!.value as Record<string, unknown>;
+    env.store.writeState(QUOTE_KEY, oldQuote);
+
+    const upgraded = env.monitor();
+    assert.equal(env.logs.filter(line => /按 ANTUSDT 口径换算/.test(line)).length, 1);
+    const restored = upgraded.candles(null)!.data;
+    assert.equal(restored.length, fresh.length);
+    for (const [index, row] of restored.entries()) {
+      const want = fresh[index]!;
+      assert.deepEqual({ ...row, binance: null }, { ...want, binance: null });
+      assert.ok(row.binance === want.binance || Math.abs(row.binance! - want.binance!) < 1e-9, '旧合约收盘价换回每股口径');
+    }
+    assert.equal(upgraded.quote()!.binance, null, '旧合约的报价不再显示');
+    assert.match(upgraded.quote()!.errors.binance!, /合约已更换/);
+    assert.equal(upgraded.quote()!.xyz!.markPx, fakeAnthropicPrice('xyz', NOW), '其余腿照常读回');
+    assert.ok(env.store.candles().some(row => row.binance !== null && row.binance >= BINANCE_REBASE.oldUnitFloor), '换算只在内存里，库还没动');
+
+    env.clock += BAR;
+    await upgraded.refreshQuote();
+    await upgraded.refreshCandles();
+    assert.equal(upgraded.quote()!.binance!.markPx, fakeAnthropicPrice('binance', env.clock));
+    assert.equal((env.store.readState(CANDLE_KEY)!.value as { binance?: string }).binance, 'ANTUSDT');
+    assert.ok(env.store.candles().every(row => row.binance === null || row.binance < BINANCE_REBASE.oldUnitFloor), '整表已按每股口径重写');
+    assert.deepEqual(plain(env.store.candles()), upgraded.candles(null)!.data);
+    env.logs.length = 0;
+    env.monitor();
+    assert.deepEqual(env.logs, [], '带标记的历史不再换算');
+  } finally { env.dispose(); }
+});
+
+test('采集：切换之后才升级时，旧合约冻结的收盘被清掉，Binance 腿从切换时刻起由 ANTUSDT 重新读回', async () => {
+  const env = setup();
+  try {
+    env.clock = Date.UTC(2026, 10, 23, 12, 7);
+    const first = env.monitor();
+    await first.refreshCandles();
+    const fresh = first.candles(null)!.data;
+    assert.ok(fresh.some(row => row.time >= BINANCE_REBASE.from && row.binance !== null) && fresh[0]!.time < BINANCE_REBASE.from);
+    // What v0.80.1 left: per-valuation closes up to the settlement, the frozen settlement price after it, no marker.
+    const raw = new DatabaseSync(join(env.dir, MONITOR_FILE));
+    raw.prepare('UPDATE anthropic_candles SET binance = binance * 13.116 WHERE binance IS NOT NULL AND time < ?').run(BINANCE_REBASE.from);
+    raw.prepare('UPDATE anthropic_candles SET binance = 1252.52 WHERE time >= ?').run(BINANCE_REBASE.from);
+    raw.close();
+    const { binance: _marker, ...oldRound } = env.store.readState(CANDLE_KEY)!.value as Record<string, unknown>;
+    env.store.writeState(CANDLE_KEY, oldRound);
+
+    const upgraded = env.monitor();
+    const restored = upgraded.candles(null)!.data;
+    assert.ok(restored.every(row => row.time < BINANCE_REBASE.from ? true : row.binance === null), '冻结的结算价不显示');
+    const before = env.venues.requests.get('candles:binance') ?? 0;
+    await upgraded.refreshCandles();
+    assert.ok((env.venues.requests.get('candles:binance') ?? 0) > before, 'Binance 腿的进度退回切换时刻后重新读取');
+    const healed = upgraded.candles(null)!.data;
+    assert.equal(healed.length, fresh.length);
+    for (const [index, row] of healed.entries()) {
+      const want = fresh[index]!;
+      // Lighter RH keeps backfilling a few pages per round, so only the other legs are compared.
+      assert.deepEqual([row.time, row.xyz, row.io], [want.time, want.xyz, want.io]);
+      assert.ok(row.binance === want.binance || Math.abs(row.binance! - want.binance!) < 1e-9, iso(row.time));
+    }
+    assert.deepEqual(plain(env.store.candles()), healed, '整表重写');
+    const saved = env.store.readState(CANDLE_KEY)!.value as { binance?: string; coverage: { binance: { through: number } } };
+    assert.equal(saved.binance, 'ANTUSDT');
+    assert.ok(saved.coverage.binance.through > BINANCE_REBASE.from);
+    assert.deepEqual(upgraded.candles(null)!.metadata.errors, {});
+  } finally { env.dispose(); }
+});
+
+test('采集：行情服务还在读旧合约（应答没有 ANTUSDT 标记）时，不采用它的 Binance 报价与 K 线', async () => {
+  const env = setup();
+  try {
+    const real = createMarketReaders({ fetchImpl: env.venues.fetch, now: () => env.clock });
+    let symbol: string | undefined;
+    const monitor = createAnthropicMonitor({ store: env.store, now: () => env.clock, log: line => env.logs.push(line), readers: {
+      ...real,
+      anthropicQuote: async signal => ({ ...await real.anthropicQuote(signal), binanceSymbol: symbol }),
+      anthropicCandles: async (starts, at, signal, ends) => ({ ...await real.anthropicCandles(starts, at, signal, ends), binanceSymbol: symbol }),
+    } });
+    for (symbol of [undefined, 'ANTHROPICUSDT']) {
+      await monitor.refreshQuote();
+      await monitor.refreshCandles();
+      assert.equal(monitor.quote()!.binance, null, String(symbol));
+      assert.match(monitor.quote()!.errors.binance!, /不是当前 Binance 合约/);
+      assert.equal(monitor.quote()!.xyz!.markPx, fakeAnthropicPrice('xyz', env.clock));
+      const view = monitor.candles(null)!;
+      assert.ok(view.data.length > 0 && view.data.every(row => row.binance === null), '旧合约的收盘价不入库');
+      assert.match(view.metadata.errors.binance!, /不是当前 Binance 合约/);
+      assert.ok(env.store.candles().every(row => row.binance === null));
+      env.clock += 10_000;
+    }
+    symbol = 'ANTUSDT';
+    await monitor.refreshQuote();
+    await monitor.refreshCandles();
+    assert.equal(monitor.quote()!.binance!.markPx, fakeAnthropicPrice('binance', env.clock));
+    assert.deepEqual(monitor.candles(null)!.metadata.errors, {});
+    assert.ok(monitor.candles(null)!.data.at(-1)!.binance !== null, '行情服务更新后从头补回 Binance 腿');
   } finally { env.dispose(); }
 });
 
@@ -270,8 +401,8 @@ test('服务配置：monitor 段的默认股数与校验；只配 monitor 时 pa
   const config = parseServiceConfig({ secretsFile, monitor: { anthropic: {} } });
   assert.deepEqual(config.pairs, []);
   assert.equal(config.oil, undefined);
-  assert.deepEqual(config.monitor, { anthropic: { shares: { outstanding: 12.7, diluted: 16.7 } } });
-  assert.equal(monitorSummary(config.monitor), '，行情监控 Anthropic 价差（流通股 12.7 十亿、完全稀释 16.7 十亿股）');
+  assert.deepEqual(config.monitor, { anthropic: { shares: { outstanding: 13.116, diluted: 17.68 } } });
+  assert.equal(monitorSummary(config.monitor), '，行情监控 Anthropic 价差（流通股 13.116 十亿、完全稀释 17.68 十亿股）');
   assert.equal(monitorSummary(undefined), '');
   for (const shares of [{ outstanding: 13, diluted: 13 }, { outstanding: 1, diluted: 100 }]) {
     assert.deepEqual(parseServiceConfig({ secretsFile, monitor: { anthropic: { shares } } }).monitor!.anthropic!.shares, shares);
@@ -311,7 +442,7 @@ test('HTTP：行情监控三个接口未登录 401、未配置 404、尚无数�
     assert.equal((await fetch(`${withMonitor!.base}/api/monitor/state`)).status, 401);
     for (const path of ['/api/monitor/state', '/api/monitor/anthropic/quote', '/api/monitor/anthropic/candles']) assert.equal((await without!.get(path)).status, 404, path);
     const get = withMonitor!.get;
-    assert.deepEqual(await get('/api/monitor/state'), { status: 200, body: { markets: ['anthropic'], anthropic: { shares: { outstanding: 12.7, diluted: 16.7 } }, controls: { anthropic: { market: 'anthropic', enabled: true, revision: 0, error: null } } } });
+    assert.deepEqual(await get('/api/monitor/state'), { status: 200, body: { markets: ['anthropic'], anthropic: { shares: { outstanding: 13.116, diluted: 17.68 } }, controls: { anthropic: { market: 'anthropic', enabled: true, revision: 0, error: null } } } });
     assert.deepEqual([(await get('/api/monitor/anthropic/quote')).status, (await get('/api/monitor/anthropic/quote')).body.code], [503, 'not_ready']);
     assert.deepEqual([(await get('/api/monitor/anthropic/candles')).status, (await get('/api/monitor/anthropic/candles')).body.code], [503, 'not_ready']);
     for (const days of ['0', 'x', '401', '007', '1.5', '-1', '']) {

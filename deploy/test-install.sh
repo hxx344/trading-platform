@@ -269,7 +269,7 @@ mkdir -p "$tmp/wb/data/modules/asset"
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor --asset && status=0 || status=$?
 check '账本有多个用户时须指定 --asset-owner，不改任何文件' '[[ $status -ne 0 && ! -e "$TP_DATA_DIR/asset.sqlite" ]] && grep -q "有多个用户（alice、bob），请用 --asset-owner <用户> 指定，未改动任何文件" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json"'
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor --asset --asset-owner alice && status=0 || status=$?
-check '--monitor --asset 启用行情监控、导入资产账本并通过配置检查' '[[ $status -eq 0 ]] && grep -q "启用行情监控 Anthropic 价差" "$tmp/out" && grep -q "已写入资产账本 $TP_DATA_DIR/asset.sqlite：用户 alice" "$tmp/out" && grep -q "行情监控 Anthropic 价差（流通股 12.7 十亿" "$tmp/out" && grep -q "资产账本已启用" "$tmp/out"'
+check '--monitor --asset 启用行情监控、导入资产账本并通过配置检查' '[[ $status -eq 0 ]] && grep -q "启用行情监控 Anthropic 价差" "$tmp/out" && grep -q "已写入资产账本 $TP_DATA_DIR/asset.sqlite：用户 alice" "$tmp/out" && grep -q "行情监控 Anthropic 价差（流通股 13.116 十亿" "$tmp/out" && grep -q "资产账本已启用" "$tmp/out"'
 check '导入的资产账本仅服务账户可读写且不含凭据' '[[ "$(stat -c %a "$TP_DATA_DIR/asset.sqlite")" == 600 ]] && ! grep -q "ciphertext-\|tail-k3y9" "$TP_DATA_DIR/asset.sqlite" "$tmp/out"'
 cp "$TP_CONF_DIR/config.json" "$tmp/config.before"
 TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor --asset --asset-owner bob && status=0 || status=$?

@@ -18,6 +18,8 @@ export interface RhLighterLegQuote { markPx: number; fundingRate: number | null;
 export type AnthropicLegErrors = Partial<Record<AnthropicLegKey, string>>;
 export interface AnthropicQuote {
   fetchedAt: string;
+  /** The Binance contract the reader asked; absent on a quote from before ANTUSDT replaced ANTHROPICUSDT. */
+  binanceSymbol?: string;
   binance: BinanceLegQuote | null;
   xyz: HyperliquidLegQuote | null;
   io: HyperliquidLegQuote | null;
@@ -76,7 +78,7 @@ export function fetchAnthropicCandles(existing?: unknown, options?: AnthropicRea
 export function anthropicChartRows(rows: readonly AnthropicCandleRow[], leg: AnthropicComparisonLeg, shares?: AnthropicShares | null): AnthropicChartRow[];
 
 export type AnthropicCandleStarts = Record<AnthropicLegKey, number>;
-export interface AnthropicCandleBatch { legs: Partial<Record<AnthropicLegKey, [number, number][]>>; errors: AnthropicLegErrors; through?: Partial<AnthropicCandleStarts>; at: number }
+export interface AnthropicCandleBatch { legs: Partial<Record<AnthropicLegKey, [number, number][]>>; errors: AnthropicLegErrors; through?: Partial<AnthropicCandleStarts>; at: number; binanceSymbol?: string }
 export function anthropicCandleStarts(previous: AnthropicCandles | null, now: number): AnthropicCandleStarts;
 export function fetchAnthropicCandleBatch(starts: AnthropicCandleStarts, options?: AnthropicReadOptions & { ends?: AnthropicCandleStarts }): Promise<AnthropicCandleBatch>;
 export function mergeAnthropicCandleBatch(previous: AnthropicCandles | null, batch: AnthropicCandleBatch): AnthropicCandles;

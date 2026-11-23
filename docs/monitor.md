@@ -49,7 +49,7 @@
 "monitor": { "anthropic": {} }
 ```
 
-- `monitor.anthropic` 可带 `shares: { "outstanding": 12.7, "diluted": 16.7 }`（十亿股）；不写用这两个默认值。校验与工作台一致：`1 ≤ outstanding ≤ diluted ≤ 100`。
+- `monitor.anthropic` 可带 `shares: { "outstanding": 13.116, "diluted": 17.68 }`（十亿股）；不写用这两个默认值。默认股数：2026-11 由上线时的假设 12.7 / 16.7 改为 13.116 / 17.68。流通取 Binance 调整合约时引用的 S-1/A 股数 13,116,075,288；完全稀释 17.68 是第三方测算，与 io:ANTH ÷ xyz:ANT 的实时比值（约 17.67）吻合，招股书原文未核对。`config.json` 里写了 `shares` 的服务不受影响；没写的升级后按新值换算，历史 K 线存的是各腿原始价，图表随之整体按新股数重算。Binance 腿改读 ANTUSDT 之后（见下文同名小节）只有 `diluted` 参与换算（io:ANTH 与 Lighter RH），`outstanding` 仍按原规则校验和保存，但不再用于任何换算。校验与工作台一致：`1 ≤ outstanding ≤ diluted ≤ 100`。
 - 配置了 `monitor`（或 `oil`、`asset`）时 `pairs` 可以省略。
 - 不需要任何密钥。
 - 启用方式：在设置页「从工作台导入」里点「读取工作台」，勾选「启用行情监控」后导入（命令行：`sudo bash install.sh --import-workbench --monitor`），写入的就是上面这一段（默认股数），已启用时保留现有设置；方案见 [module-import.md](module-import.md)。手写 `config.json` 后执行 `sudo bash install.sh` 仍可用，作为备选；改股数仍在 `shares` 里改。
@@ -112,6 +112,42 @@
 - **测试**：`test/monitor-anthropic.test.ts`（vendor 行为，14 个）、`test/monitor.test.ts`（存储、采集、配置、导入、HTTP 层与两个整服务用例，9 个）、`test/monitor-web.test.ts`（页面数据规则，6 个）、`test/web.test.ts` 补 `#/monitor` 路由。两个整服务用例（`startService`）与仓库原有服务进程用例一样，在 Windows 上因数据目录 fsync 报 EPERM 跑不了，需在 Linux（CI）上验证。
 
 **本批没做**：成交标记（后随 A-5 / M14 补上）、均线 / 布林带 / Z-score、股数从交易中心同步、概览卡片与告警（M-3）。
+
+### Binance 腿改读 ANTUSDT（v0.80.3）
+
+**背景（2026-11-23 用 Binance 公开接口核实）**：Binance 在 2026-11-17 把按“每 10 亿流通股估值”报价的 `ANTHROPICUSDT` 结算下线（`status: SETTLING`，最后一根有成交的 15 分钟 K 线开于 08:45 UTC，标记价停在 1252.337），同日上线按股报价的 `ANTUSDT`（`TRADIFI_PERPETUAL`，06:00 UTC 上线，成交 K 线从 10:30 UTC 起）。两者相差的系数正好是流通股数 13.116（十亿）。旧合约的报价接口仍然应答那个冻结的价格，所以升级前页面上 Binance 腿看起来有数，实际已不变。
+
+**用户可见的变化**
+
+- Binance 腿的报价、K 线、资金费与页面外链都改读 `ANTUSDT`，1 单位 = 1 股，与 xyz:ANT 同口径，不再除以流通股数。页面“如何比较”与来源说明同步改写。
+- 已保存的历史不丢：2026-11-17 09:00 UTC 之前的 Binance 收盘价除以 13.116 换成每股口径；从那一刻起的 Binance 收盘清空，由新合约重新读取。09:00–10:30 UTC 这一个半小时两个合约都没有成交，Binance 腿留空。
+- 持仓归类：Binance 的 `ANTUSDT` 持仓在行情监控的关联持仓和资产账本的每日持仓变化里归入 ANT（基础名 `ANT` 只在 Binance 上算 Anthropic，与各交易所通用的 `ANTHROPIC` 并列）。其他交易所的同名 `ANT` 合约不归入，仍在其他持仓里；两处用同一张表 `VENUE_ONLY_BASES`（`src/asset/daily-positions.ts`、`web/src/monitor-related.ts`）。
+- 只读观察合约 `VENUE_READ_SYMBOLS.binance` 与下单页的只读入口由 `ANTHROPICUSDT` 改为 `ANTUSDT`；ANT 仍然只读，不能下单。
+
+**做法**
+
+- `src/vendor/anthropic-market.mjs`：`ANTHROPIC_LEGS.binance` 改为 `ANTUSDT`、`sharesPerUnit: 1`；报价与 K 线批次的应答带 `binanceSymbol`；`validateAnthropicCandles` 只认当前四个合约名，浏览器里按旧合约缓存的 K 线校验不过即重新读取。
+- `src/monitor/anthropic.ts`：
+  - 升级期间行情服务与执行服务可能不是同一版本。采集端只在应答的 `binanceSymbol` 是 `ANTUSDT` 时采用 Binance 腿，否则该腿按失败处理（原因“行情服务读取的不是当前 Binance 合约，等待其更新”），其余三条腿照常。反过来（行情服务已是新版、采集端还是 v0.80.2 及更早）没有保护：旧采集端不看这个字段，会把每股价再除以流通股数，页面上 Binance 腿约为实际的 1/13，溢价约 −92%，并把这些收盘写进库；采集端升级后，切换时刻之后的 Binance 收盘全部清空重读，自行恢复。安装脚本一次升级两个服务，这个窗口只有重启先后的几秒到几十秒；单独回退执行服务时会持续出现。
+  - K 线轮次记录（`monitor_state` 的 `anthropic.candles`）多一个 `binance: "ANTUSDT"` 标记。启动时没有这个标记，就在内存里用 `rebaseBinanceCandles` 换算读回的行，把 Binance 腿的进度退回切换时刻，并让下一轮成功的写入整表重写（同一事务里写入标记）。不直接改库：写入失败时库保持原样，下次启动重新换算。
+  - 换算只对切换时刻之前、且不小于 400 的价格做除法（旧合约历史最低 1221，新口径约 90），所以重复换算、中途失败重来的结果相同。
+  - 保存的报价没有 `binanceSymbol` 时，读回只保留其余三条腿。
+
+**影响面与回滚（按 R3 处理：改写 `monitor.sqlite` 已有行）**
+
+- 只动 `monitor.sqlite` 的 `anthropic_candles` 与两条状态记录，都是可从交易所重新回补的行情缓存；不涉及资金、凭据、下单与主库。
+- 回滚版本 v0.80.2：`sudo bash install.sh --version v0.80.2`，不需要改配置。旧版本会把库里已换算的每股价格再除以流通股数，Binance 腿的历史价差在回滚期间是错的（新读到的也只是结算后冻结的价格）；需要正确的旧口径历史时删掉 `monitor.sqlite`，由旧版本重新回补约 50 天。旧版本写入时会去掉标记，再升级回来时重新换算，数值不受影响。
+- 完全失败时的表现：Binance 腿显示为缺失并给出原因，其余三条腿的报价照常显示；溢价都以 Binance 为基准，所以没有 Binance 数据的时段不出溢价和图表点。
+
+**没做**
+
+- Lighter RH 仍读 `ANTHROPIC`（按完全稀释估值报价，仍在交易）。RH 另有按股报价的 `ANT`，是否换过去未定。
+- 50 天以外、此前从未采集过的 Binance 历史不回补：`ANTUSDT` 的成交 K 线只从上线那天开始。切换前旧历史里原有的 Binance 缺口同样补不回来。2026-11-17 09:00–10:30 UTC 的空档会被缺口修复每小时重问一次，直到滚出 400 天保留期，请求量可忽略。
+- 启动摘要（`--check-config`）与导入面板仍显示“流通股 X 十亿”，这个数已不参与换算，文字未改。
+- `config.json` 里照旧示例写了 `shares: { 12.7, 16.7 }` 的部署不会自动拿到新默认值，io:ANTH 与 Lighter RH 仍按 16.7 换算（与 17.68 差约 5.9%），需要手动改成 17.68 或删掉 `shares`。
+- 旧行情服务 + 新执行服务的几秒里，下单页的 ANT 只读观察（`/api/observe?symbol=ANTUSDT`）会被行情服务拒绝，行情服务更新后恢复。
+- `ANTUSDT` 的 `exchangeInfo` 是否满足实盘适配器的合约校验未在真实账户上验证；解析失败只影响这一个只读合约。
+- 模拟执行器里 `ANTUSDT` 的示例价格仍是 410.5，未按真实价位调整。
 
 ## M-2：原油价差与海力士行情
 

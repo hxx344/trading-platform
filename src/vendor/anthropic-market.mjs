@@ -1,6 +1,8 @@
 // 复制自 project-aggregation 工作台 modules/monitor/modules/anthropic/market.mjs（提交 35ebb94）。
 // 两个请求函数原本从 ../oil/binance.mjs（提交 8470785）与 ../oil/hyperliquid.mjs（提交 c534894）导入，这里内联到文件顶部，
 // 函数体只把各自的 API_URL 改名为 BINANCE_API_URL / HYPERLIQUID_API_URL（两个来源文件里同名不同值）；其余内容未改。
+// 本仓库的改动（2026-11，见 docs/monitor.md「Binance 腿改读 ANTUSDT」）：Binance 腿由已结算的 ANTHROPICUSDT 改为按股报价的 ANTUSDT（1 股 / 单位），
+// 报价与 K 线批次带上 binanceSymbol 供采集器核对；默认股数由 12.7 / 16.7 改为 13.116 / 17.68（十亿股）；不再接受只有三条腿的旧快照。
 const BINANCE_API_URL = 'https://fapi.binance.com';
 const HYPERLIQUID_API_URL = 'https://api.hyperliquid.xyz/info';
 
@@ -23,23 +25,23 @@ async function requestInfo(payload, { fetcher = fetch, timeout = 15_000 } = {}) 
 }
 /**
  * Anthropic pre-IPO perpetuals on Binance, Hyperliquid and Lighter RH quote different units, so every
- * comparison is per share. Standalone defaults mirror the trading page defaults
- * (src/trading-anthropic.ts DEFAULT_SHARES, server/trading-execution-plan.mjs SHARE_BASIS):
- * Binance quotes valuation per 1B outstanding shares (12.7B outstanding -> 12.7 shares per unit),
- * Entropy io:ANTH per 1B fully diluted shares (16.7B -> 16.7 shares), trade.xyz xyz:ANT is one share.
+ * comparison is per share. Binance ANTUSDT and trade.xyz xyz:ANT quote one share. Binance replaced
+ * ANTHROPICUSDT (valuation per 1B outstanding shares) with ANTUSDT on 2026-11-17, dividing the contract
+ * by 13.116; `outstanding` is kept in the settings for existing configurations and no longer converts a leg.
+ * Entropy io:ANTH quotes valuation per 1B fully diluted shares (17.68B -> 17.68 shares).
  * Lighter RH (Lighter on Robinhood Chain, an independent order book collateralised in USDG) quotes
  * Pre-IPO markets as valuation per 1B assumed shares and settles after an IPO at
- * share price x fully diluted shares / 1B, so one unit is 16.7 shares like io:ANTH.
+ * share price x fully diluted shares / 1B, so one unit is 17.68 shares like io:ANTH.
  * https://docs.lighter.xyz/trading/real-world-assets-rwas/pre-ipo-markets
  * These are listing assumptions, not exchange facts; a different share count shifts the premium.
  */
 /** @typedef {{ outstanding: number, diluted: number }} AnthropicShares */
-export const ANTHROPIC_SHARES = Object.freeze({ outstanding: 12.7, diluted: 16.7 });
+export const ANTHROPIC_SHARES = Object.freeze({ outstanding: 13.116, diluted: 17.68 });
 export const ANTHROPIC_LEGS = Object.freeze({
-  binance: Object.freeze({ exchange: 'binance', symbol: 'ANTHROPICUSDT', name: 'Binance', venue: 'Binance', label: 'Binance ANTHROPICUSDT', sharesPerUnit: ANTHROPIC_SHARES.outstanding, basis: '流通股 127 亿' }),
+  binance: Object.freeze({ exchange: 'binance', symbol: 'ANTUSDT', name: 'Binance', venue: 'Binance', label: 'Binance ANTUSDT', sharesPerUnit: 1, basis: '1 股' }),
   xyz: Object.freeze({ exchange: 'hyperliquid', symbol: 'xyz:ANT', dex: 'xyz', name: 'xyz:ANT', venue: 'Hyperliquid', label: 'Hyperliquid xyz:ANT', sharesPerUnit: 1, basis: '1 股' }),
-  io: Object.freeze({ exchange: 'hyperliquid', symbol: 'io:ANTH', dex: 'io', name: 'io:ANTH', venue: 'Hyperliquid', label: 'Hyperliquid io:ANTH', sharesPerUnit: ANTHROPIC_SHARES.diluted, basis: '完全稀释 167 亿股' }),
-  rh: Object.freeze({ exchange: 'rh-lighter', symbol: 'ANTHROPIC', name: 'Lighter RH', venue: 'Lighter RH', label: 'Lighter RH ANTHROPIC', sharesPerUnit: ANTHROPIC_SHARES.diluted, basis: '完全稀释 167 亿股' }),
+  io: Object.freeze({ exchange: 'hyperliquid', symbol: 'io:ANTH', dex: 'io', name: 'io:ANTH', venue: 'Hyperliquid', label: 'Hyperliquid io:ANTH', sharesPerUnit: ANTHROPIC_SHARES.diluted, basis: '完全稀释 176.8 亿股' }),
+  rh: Object.freeze({ exchange: 'rh-lighter', symbol: 'ANTHROPIC', name: 'Lighter RH', venue: 'Lighter RH', label: 'Lighter RH ANTHROPIC', sharesPerUnit: ANTHROPIC_SHARES.diluted, basis: '完全稀释 176.8 亿股' }),
 });
 /**
  * @typedef {'xyz' | 'io' | 'rh'} AnthropicComparisonLeg
@@ -64,8 +66,6 @@ const LEG_KEYS = ANTHROPIC_LEG_KEYS;
 const SYMBOLS = LEG_KEYS.map(key => ANTHROPIC_LEGS[key].symbol);
 // Stored in saved candle snapshots and checked when they load, so it keeps the venue's earlier spelling.
 export const ANTHROPIC_SOURCE = 'Binance + Hyperliquid + rh-Lighter';
-/** Candle snapshots saved before the Lighter RH leg existed; they validate with that leg empty. */
-const LEGACY_CANDLE_SOURCE = Object.freeze({ source: 'Binance + Hyperliquid', symbols: JSON.stringify(['ANTHROPICUSDT', 'xyz:ANT', 'io:ANTH']) });
 export const ANTHROPIC_QUOTE_REFRESH_MS = 10_000;
 export const ANTHROPIC_CANDLE_ACTION = 'candles/15m';
 export const ANTHROPIC_CANDLE_MS = 900_000;
@@ -123,7 +123,7 @@ export function legError(error) {
 export function anthropicSharesPerUnit(leg, shares = ANTHROPIC_SHARES) {
   if (!shares || !Number.isFinite(shares.outstanding) || !Number.isFinite(shares.diluted)
     || shares.outstanding < 1 || shares.diluted > 100 || shares.diluted < shares.outstanding) return null;
-  return leg === 'binance' ? shares.outstanding : leg === 'xyz' ? 1 : shares.diluted;
+  return leg === 'binance' || leg === 'xyz' ? 1 : shares.diluted;
 }
 /** Per-share price of a native quote. @param {AnthropicLegKey} leg @param {number} price @param {AnthropicShares | null} shares */
 export function perShare(leg, price, shares = ANTHROPIC_SHARES) {
@@ -167,6 +167,11 @@ export function validateAnthropicQuote(input) {
   const quote = record(input), fetchedAt = stamp(quote.fetchedAt), errors = record(quote.errors ?? {});
   /** @type {any} */
   const result = { fetchedAt, errors: {} };
+  // Which Binance contract the reader asked; absent on quotes saved or served before ANTUSDT replaced ANTHROPICUSDT.
+  if (quote.binanceSymbol !== undefined) {
+    if (typeof quote.binanceSymbol !== 'string' || !/^[A-Z0-9]{1,40}$/.test(quote.binanceSymbol)) throw Error('Invalid Anthropic Binance symbol');
+    result.binanceSymbol = quote.binanceSymbol;
+  }
   for (const key of LEG_KEYS) {
     result[key] = validateLegQuote(key, quote[key] ?? null);
     const error = errors[key];
@@ -327,7 +332,7 @@ async function readRhQuote(options) {
 export async function fetchAnthropicQuote({ fetcher = fetch, now = Date.now(), timeout = 10_000, gate = sharedBinanceGate, rh = sharedRhState, clock = Date.now } = {}) {
   const options = { fetcher, timeout, gate, rh, clock };
   const reads = await Promise.allSettled([readBinanceQuote(options), ...HYPERLIQUID_LEGS.map(key => readHyperliquidQuote(key, options)), readRhQuote(options)]);
-  const quote = { fetchedAt: new Date(now).toISOString(), errors: {} };
+  const quote = { fetchedAt: new Date(now).toISOString(), binanceSymbol: ANTHROPIC_LEGS.binance.symbol, errors: {} };
   LEG_KEYS.forEach((key, index) => {
     const read = reads[index];
     quote[key] = read.status === 'fulfilled' ? read.value : null;
@@ -366,14 +371,13 @@ export function createAnthropicCandles(rows, fetchedAt, status = 'live', errors 
 }
 
 /**
- * Snapshots saved before the Lighter RH leg existed are accepted and returned in the current shape with that leg empty.
+ * A snapshot naming other contracts is refused: one saved while Binance was read from ANTHROPICUSDT holds that leg in another unit.
  * @param {unknown} input @returns {AnthropicCandles}
  */
 export function validateAnthropicCandles(input) {
   const value = record(input), metadata = record(value.metadata), symbols = JSON.stringify(metadata.symbols);
   const current = metadata.source === ANTHROPIC_SOURCE && symbols === JSON.stringify(SYMBOLS);
-  const legacy = metadata.source === LEGACY_CANDLE_SOURCE.source && symbols === LEGACY_CANDLE_SOURCE.symbols;
-  if (!(current || legacy) || metadata.interval !== '15m' || metadata.timezone !== 'UTC') throw Error('Unexpected Anthropic candle source');
+  if (!current || metadata.interval !== '15m' || metadata.timezone !== 'UTC') throw Error('Unexpected Anthropic candle source');
   const snapshot = createAnthropicCandles(/** @type {unknown[]} */ (value.data), /** @type {string} */ (metadata.fetchedAt), /** @type {'live' | 'snapshot'} */ (value.status), metadata.errors ?? {});
   for (const field of ['firstObservation', 'lastObservation', 'rows']) if (snapshot.metadata[field] !== metadata[field]) throw Error('Anthropic candle metadata mismatch');
   return snapshot;
@@ -491,7 +495,7 @@ export async function fetchAnthropicCandleBatch(starts, { fetcher = fetch, now =
     if (read.status === 'fulfilled') { legs[key] = [...read.value.rows]; through[key] = read.value.through; }
     else errors[key] = legError(read.reason);
   });
-  return { legs, errors, through, at: now };
+  return { legs, errors, through, at: now, binanceSymbol: ANTHROPIC_LEGS.binance.symbol };
 }
 
 export function mergeAnthropicCandleBatch(previous, { legs, errors, at }) {

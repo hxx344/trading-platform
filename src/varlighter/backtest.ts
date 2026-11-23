@@ -50,7 +50,7 @@ export function runBacktest(symbol: string, kind: AssetKind, samples: readonly S
         // 之后的样本没有它说明当时行情流不可用，与模拟盘一样不开仓。
         const confirmed = confirmOpen(sample, baseline, effective, decision, sample.t >= liveFrom);
         const reason = typeof confirmed === 'string' ? confirmed : openBlocker(sample, effective, settings, {
-          openPositions: 0, openNotionalUsd: 0, dailyNetUsd: dayNet, cooldownUntil, eligible: true, fallbackBaseline: baseline.fallback, ...openEconomics(confirmed.decision, effective, settings) });
+          openPositions: 0, openNotionalUsd: 0, dailyNetUsd: dayNet, cooldownUntil, eligible: true, fallbackBaseline: baseline.fallback, ...openEconomics(confirmed.decision, effective, settings, decision) });
         if (reason) blocked[reason] = (blocked[reason] ?? 0) + 1;
         else if (typeof confirmed !== 'string') position = openPosition(`bt-${++sequence}`, confirmed.sample, effective, confirmed.decision, baseline);
       }

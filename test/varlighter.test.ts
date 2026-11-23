@@ -6,9 +6,10 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { openEconomics } from '../src/varlighter/strategy.ts';
 import { COST_BLOCK, DECAYED, FALLBACK_BLOCK, NO_LIVE_TOP, THIN_BLOCK, closeSpread, confirmOpen, expectedNetBps, slippageBudgetBps } from '../src/varlighter/strategy.ts';
 import { executionSample, hasTokenQuote } from '../src/varlighter/model.ts';
-import { TOKEN_QUOTE_MAX_AGE_MS, createVarQuoter, parseTokenQuote, quoteQty, varInstrument, type VarQuoter } from '../src/varlighter/varquote.ts';
+import { TOKEN_BLOCK_PAUSE_MS, TOKEN_ERROR_KEEP_MS, TOKEN_SYMBOL_PAUSE_MS, TOKEN_QUOTE_MAX_AGE_MS, createVarQuoter, parseTokenQuote, quoteQty, varInstrument, type VarQuoter } from '../src/varlighter/varquote.ts';
 import { VARIATIONAL_SESSION_FILE } from '../src/monitor/variational-session.ts';
 import { fakeVariationalToken } from './monitor-fake.ts';
 import { pairMarkets, parsePairKey, parseRhMarkets, parseVarListings, parseVarQuote, regimeOf, spreadOf, midBasis, type Sample } from '../src/varlighter/model.ts';
@@ -958,7 +959,8 @@ test('Var 询价：各类别的合约写法、名义金额折数量、应答核�
   assert.equal(varInstrument('other', 'XYZ'), null, '没确认过写法的类别不询价');
   assert.equal(varInstrument('crypto', 'btc/usd'), null);
   assert.deepEqual([quoteQty(1000, 100.2), quoteQty(1000, 65_000), quoteQty(1000, 0.00012345), quoteQty(500, 250)], ['9.98', '0.01538', '8100000', '2']);
-  assert.deepEqual([quoteQty(1000, 0), quoteQty(1000, NaN), quoteQty(10, 1e12), quoteQty(-5, 10), quoteQty(1e15, 1)], [null, null, null, null, null]);
+  assert.deepEqual([quoteQty(1000, 0), quoteQty(1000, NaN), quoteQty(10, 1e12), quoteQty(-5, 10), quoteQty(1e15, 1), quoteQty(999_999_999_999, 1)], [null, null, null, null, null, null]);
+  assert.equal(quoteQty(999_900_000_000, 1), '999900000000');
 
   const instrument = varInstrument('crypto', 'BTC')!;
   const answer = (extra: Record<string, unknown> = {}) => ({ instrument, qty: '9.98', bid: '100.19', ask: '100.21', mark_price: '100.2', timestamp: new Date(T0 - 400).toISOString(), ...extra });
@@ -967,7 +969,7 @@ test('Var 询价：各类别的合约写法、名义金额折数量、应答核�
   for (const wrong of [{ qty: '1' }, { instrument: { ...instrument, underlying: 'ETH' } }, { instrument: { ...instrument, instrument_type: 'perpetual_rwa_future' } }, { instrument: null }]) {
     assert.throws(() => parseTokenQuote(answer(wrong), instrument, '9.98', T0), /标的或数量与请求不符/);
   }
-  for (const wrong of [{ ask: '100.18' }, { bid: '0' }, { bid: null }, { mark_price: 'x' }, { ask: [] }]) assert.throws(() => parseTokenQuote(answer(wrong), instrument, '9.98', T0), /价格无效/);
+  for (const wrong of [{ ask: '100.18' }, { bid: '0' }, { bid: null }, { mark_price: 'x' }, { ask: [] }, { bid: '0x64' }, { ask: '1e3' }, { mark_price: ' 100.2' }]) assert.throws(() => parseTokenQuote(answer(wrong), instrument, '9.98', T0), /价格无效/);
   for (const stamp of [new Date(T0 - TOKEN_QUOTE_MAX_AGE_MS - 1).toISOString(), new Date(T0 + 2_001).toISOString(), '2026-11-23T15:00:00', 'x', 1]) {
     assert.throws(() => parseTokenQuote(answer({ timestamp: stamp }), instrument, '9.98', T0), /时间无效或已过期/);
   }
@@ -1008,13 +1010,43 @@ test('Var 询价器：没有 token 不发请求；被拒的 token 不再用、�
     // 应答读到了但内容不对：记下原因，token 仍可用。
     reply = () => good({ qty: '1' });
     await assert.rejects(ask(), /标的或数量与请求不符/);
-    assert.deepEqual([quoter.usable(), quoter.view().status, quoter.view().error], [true, 'ready', 'Var 询价应答的标的或数量与请求不符']);
+    assert.deepEqual([quoter.usable(), quoter.view().status, quoter.view().error], [true, 'ready', 'BTC：Var 询价应答的标的或数量与请求不符']);
+    // 这个标的停 5 分钟，别的标的与没确认写法的类别不受影响；同一轮里别的成功不盖掉原因，过 90 秒才消失。
+    assert.deepEqual([quoter.wants('crypto', 'BTC'), quoter.wants('crypto', 'ETH'), quoter.wants('etf', 'QQQ'), quoter.wants('other', 'XYZ')], [false, true, false, false]);
+    reply = () => good();
+    await ask();
+    assert.match(quoter.view().error ?? '', /与请求不符/);
+    clock += TOKEN_ERROR_KEEP_MS;
+    assert.equal(quoter.view().error, null);
+    clock += TOKEN_SYMBOL_PAUSE_MS;
+    assert.equal(quoter.wants('crypto', 'BTC'), true);
 
     // 被拦截（403 或 Cloudflare 质询）：暂不可用，下一轮照常再试，成功后恢复。
     reply = () => new Response('', { status: 403 });
     await assert.rejects(ask(), /被拦截/);
-    assert.deepEqual([quoter.usable(), quoter.view().status], [true, 'unavailable']);
+    assert.deepEqual([quoter.usable(), quoter.view().status, quoter.wants('crypto', 'BTC')], [false, 'unavailable', true], '被拦截后整个 token 停 5 分钟，不记在标的上');
     assert.match(quoter.view().error ?? '', /被拦截/);
+    clock += TOKEN_BLOCK_PAUSE_MS;
+    assert.equal(quoter.usable(), true);
+    // 缺 python3 与超时各有原因；调用方中止的请求不算失败。
+    reply = () => { throw Object.assign(new Error('spawn python3 ENOENT'), { code: 'VARIATIONAL_PYTHON_MISSING' }); };
+    await assert.rejects(ask(), /需要 Python 3/);
+    assert.match(quoter.view().error ?? '', /需要 Python 3/);
+    reply = () => { throw Object.assign(new Error('slow'), { name: 'TimeoutError' }); };
+    await assert.rejects(ask(), /超时/);
+    assert.deepEqual([quoter.view().status, quoter.wants('crypto', 'BTC'), quoter.usable()], ['unavailable', false, true]);
+    clock += TOKEN_SYMBOL_PAUSE_MS;
+    reply = () => good();
+    await ask();
+    clock += TOKEN_ERROR_KEEP_MS;
+    const stopped = new AbortController();
+    stopped.abort();
+    reply = () => { throw Object.assign(new Error('aborted'), { name: 'AbortError' }); };
+    await assert.rejects(quoter.quote('crypto', 'BTC', 1000, 100.2, stopped.signal));
+    assert.deepEqual([quoter.view().status, quoter.view().error, quoter.wants('crypto', 'BTC')], ['ready', null, true]);
+    reply = () => new Response('', { status: 403 });
+    await assert.rejects(ask(), /被拦截/);
+    clock += TOKEN_BLOCK_PAUSE_MS;
     reply = () => good();
     await ask();
     assert.deepEqual([quoter.view().status, quoter.view().error], ['ready', null]);
@@ -1075,6 +1107,12 @@ test('判断时刻的样本：有 Var 询价时 Var 各档都换成询价，询�
   if (typeof confirmed === 'string') return;
   const position = openPosition('p1', confirmed.sample, params, confirmed.decision, baseline);
   assert.equal(position.varEntry, 100.25);
+  // 成本门槛取复核后与报价时刻两种口径里较大的往返成本（止损仍按公开报价判断）。
+  const wide = { ...decision, spread: { ...decision.spread, buyVar: decision.spread.sellVar + 70 } };
+  const narrow = confirmed.decision.spread.buyVar - confirmed.decision.spread.sellVar;
+  assert.ok(narrow < 10 && Math.abs(openEconomics(confirmed.decision, params, DEFAULT_GLOBAL, wide).costBps - 70) < 1e-9);
+  assert.equal(openEconomics(confirmed.decision, params, DEFAULT_GLOBAL).costBps, narrow);
+  assert.equal(openBlocker(confirmed.sample, { ...params, stopBps: 60 }, DEFAULT_GLOBAL, { openPositions: 0, openNotionalUsd: 0, dailyNetUsd: 0, cooldownUntil: 0, eligible: true, ...openEconomics(confirmed.decision, params, DEFAULT_GLOBAL, wide) }), COST_BLOCK);
   const later = sample(T0 + 60_000, 100.0, 100, { varBidTk: 100.02, varAskTk: 100.04 });
   const spread = closeSpread(later, position, positionSpread(later, position.notionalUsd)!);
   assert.equal(closePosition(position, later.t, spread, 'revert', { slippageBps: 1, varFeeBps: 0, rhFeeBps: 0 }, null).varExit, 100.04);
@@ -1118,8 +1156,10 @@ test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与
   // 询价替身：tokenMid 为 null 时跟公开价；mode 决定这一轮的表现。
   const asked: [string, string, number, number][] = [];
   let usable = true, tokenMid: number | null = null, mode: 'ok' | 'fail' | 'stale' = 'ok';
+  const skipped = new Set<string>();
   const quoter: VarQuoter = {
     usable: () => usable,
+    wants: (kind, symbol) => kind === 'crypto' && !skipped.has(symbol),
     async quote(kind, symbol, notionalUsd, referencePrice) {
       asked.push([kind, symbol, notionalUsd, referencePrice]);
       if (mode === 'fail') throw new Error('Variational 暂不可用，请稍后重试。');
@@ -1201,9 +1241,19 @@ test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与
     assert.ok(Math.abs(fallback[0].varEntry - 100.48) < 1e-9, '按公开报价的 1k 档');
     const opens = engine.views.paper().events.filter(event => event.kind === 'open');
     assert.deepEqual([opens.length, opens.filter(event => event.message.includes('token 询价')).length], [2, 1]);
-    // 有持仓的配对在有 token 后继续询价。
+    // 有持仓的配对在有 token 后继续询价；只有上一轮要询的都询到，就绪项才按询价的延迟算。
     usable = true;
     await minute();
     assert.equal(asked.length, before + 1);
+    const latency = () => engine.views.readiness().items.find(item => item.key === 'latency')!;
+    assert.match(latency().detail, /判断时刻用 token 询价/);
+    mode = 'fail';
+    await minute();
+    assert.match(latency().detail, /上一轮成功 0、失败 1/);
+    // 询价器不要的标的（写法没确认的类别、失败后暂停中的）不询也不计失败。
+    mode = 'ok'; skipped.add('BTC');
+    poll = await minute();
+    assert.deepEqual([asked.length, poll.tokenOk, poll.tokenFailed], [before + 2, 0, 0]);
+    assert.match(latency().detail, /上一轮没有询价/);
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });

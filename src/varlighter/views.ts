@@ -45,7 +45,7 @@ export interface OrphanRow {
 }
 export interface StateView {
   now: number; startedAt: number;
-  sources: { var: SourceState & { poll: PollStats | null; quoteAgeMedianMs: number | null; /** 没有接询价（如预览）时为 null。 */ token: TokenView | null }; venues: VenueStatus[] };
+  sources: { var: SourceState & { poll: PollStats | null; quoteAgeMedianMs: number | null; /** 引擎没有接询价器时为 null。 */ token: TokenView | null }; venues: VenueStatus[] };
   firstSampleAt: number | null;
   rows: StateRow[];
   /** 已启用或有持仓、但不在当前配对里的键。 */

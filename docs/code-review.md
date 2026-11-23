@@ -176,7 +176,7 @@ feat(monitor): 一句中文摘要
 建议：
 ```
 
-`/review <范围>` 只在 Claude Code 里可用，命令定义在 `.claude/commands/review.md`。其他代理没有这个命令，按本节把固定的差异范围、本文件与待核查重点交给只读审查者。
+`/review <范围>` 只在 Claude Code 里可用，定义在 `.claude/skills/review/SKILL.md`，在独立子代理里运行，看不到作者的对话。R3 改动另可交给 `r3-reviewer` 子代理（`.claude/agents/r3-reviewer.md`），它预置了资金与执行方向的审查重点和 LESSONS 条目。其他代理没有这两项，按本节把固定的差异范围、本文件与待核查重点交给只读审查者。
 
 ### 修复与复核
 

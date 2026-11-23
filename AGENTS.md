@@ -46,6 +46,12 @@
 - 动手前按该文件第 2 节定级 R1/R2/R3；R3（资金、凭据与鉴权、部署激活、数据库结构、唯一写者边界）先写清影响面与回滚再改代码。
 - 合入与发布不开合并请求：改动提交与改版本号的发布提交在本地备齐，本地检查与独立审查通过后，用 `git push --atomic origin HEAD:main v<版本>` 一次推送 main 与标签。这样 main 上只跑一次 ci，发布等的就是这一次；分开推送或走合并请求会让同样的代码多跑几次。ci 没通过时不会发布：偶发失败就重跑 ci 再重跑发布运行里失败的任务，代码有问题就在 main 上修复后用新版本号重新发布。只合入不发布时同样直接推 main。Claude Code 里用 `/release` 按这套流程执行，定义在 `.claude/skills/release/SKILL.md`，规则改动时两处一起改。
 
+### Claude Code 的项目配置
+
+- 技能：`/review`（独立子代理审查）、`/release`（合入与发布）、`/new-module`（接入新模块），在 `.claude/skills/`。子代理 `r3-reviewer` 在 `.claude/agents/`。
+- Hooks（`.claude/settings.json`）：运行 `probes/`、Variational 凭据桥、真实服务入口或 `ssh`/`scp` 前要用户确认，自动放行模式下改为拒绝，用户在聊天里同意后加 `TP_LIVE_CONFIRMED=1` 重跑；结束前有未提交的 TypeScript 改动时自动跑一遍与 `pnpm check` 相同的类型检查。
+- 这些文件与本文件、`docs/code-review.md` 的规则冲突时，以本文件和 `docs/code-review.md` 为准，并把配置改成一致。
+
 ### 按改动取用经验
 
 改动前只读 [LESSONS.md](LESSONS.md) 里相关的条目，并核对当前源码。

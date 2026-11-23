@@ -131,8 +131,11 @@ export function handOver(rules: Pick<OilRulesRuntime, 'notices' | 'noticeSent'>,
   try { notices = rules.notices(); }
   catch (error) { quiet('read', `原油自动规则通知读取失败：${text(error)}`); return; }
   for (const notice of notices) {
-    try { notifyOnce(notice.key, notice.text); rules.noticeSent(notice.key); }
-    catch (error) { quiet(notice.key, `原油自动规则通知未能写入发送队列（${notice.key}）：${text(error)}`); }
+    try { notifyOnce(notice.key, notice.text); }
+    catch (error) { quiet(notice.key, `原油自动规则通知未能写入发送队列（${notice.key}）：${text(error)}`); continue; }
+    // In the outbox but not marked: offered again next round, where notifyOnce drops it by its key.
+    try { rules.noticeSent(notice.key); }
+    catch (error) { quiet(notice.key, `原油自动规则通知已写入发送队列，但未能标记已交出（${notice.key}），下一轮按键去重：${text(error)}`); }
   }
 }
 

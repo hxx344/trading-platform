@@ -64,7 +64,14 @@ export interface RuleEvent {
   clAt?: number;
   revision?: number;
 }
-interface RuleState { mode: 'observe' | 'live'; observing: boolean; live: LiveState; events: RuleEvent[]; observations: RuleEvent[] }
+/** A blocked-rule notice generated but not yet taken by the notifier's outbox; `key` names the rule and the wait's start. */
+interface PendingNotice { key: string; text: string }
+/**
+ * unsent: notices generated and not yet handed over, kept apart from `live.blocked` so a wait that ends (preview passes,
+ * another refusal, review, a new wait, a mode change or reset) before the notifier takes its notice does not lose it.
+ * Only noticeSent removes one. Older versions ignore the field (and drop it on their next write).
+ */
+interface RuleState { mode: 'observe' | 'live'; observing: boolean; live: LiveState; events: RuleEvent[]; observations: RuleEvent[]; unsent: PendingNotice[] }
 interface Rule { id: string; revision: number; createdAt: number; config: RuleConfig; state: RuleState }
 
 /** The slice of the oil and hynix market views a rule reads: one row per venue and contract. */
@@ -75,6 +82,11 @@ interface Observed { open?: Counted; close?: Counted; note: string | null }
 
 const CONFIG_KEYS = ['name', 'venue', 'direction', 'openThreshold', 'closeThreshold', 'confirmSamples', 'maxOpensPerDay'] as const;
 const OPTIONAL_KEYS = ['market', 'barrels', 'notional', 'batches'] as const;
+/** At most this many unsent notices per rule (one per wait of 30 minutes or more: ten hours of a failing outbox); the oldest go first. */
+export const MAX_UNSENT = 20;
+const NOTICE_KEY = /^oil-rule-blocked:[^:]{1,80}:\d{1,16}$/;
+/** The notifier's key of one wait's notice: the rule and the wait's start, so a new wait gets a new key. */
+export const noticeKey = (id: string, since: number): string => `oil-rule-blocked:${id}:${since}`;
 const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
 
 function bounded(value: unknown, name: string, low: string, high: string, sign: 'any' | 'positive'): string {
@@ -151,17 +163,23 @@ function stateOf(text: string, market: RuleMarket): RuleState {
     return record.kind !== 'signal' || (typeof record.value === 'string' && typeof record.threshold === 'string' && ['hits', 'bzAt', 'clAt'].every(key => Number.isFinite(record[key])));
   };
   const records = (value: unknown): RuleEvent[] => Array.isArray(value) ? value.filter(valid).slice(-MAX_EVENTS) : [];
+  const unsent = (value: unknown): PendingNotice[] => Array.isArray(value)
+    ? value.flatMap((item: unknown) => {
+      const record = item && typeof item === 'object' ? item as Record<string, unknown> : null;
+      return record && typeof record.key === 'string' && NOTICE_KEY.test(record.key) && typeof record.text === 'string' ? [{ key: record.key, text: record.text.slice(0, 600) }] : [];
+    }).slice(-MAX_UNSENT)
+    : [];
   // A legacy observer has no live position. Conflicting mode and position data must survive the next observation tick.
   const saved = raw?.live && typeof raw.live === 'object' ? raw.live as Record<string, unknown> : null;
   const positionOrJob = saved && (saved.held != null || saved.pending != null || saved.job != null || (saved.phase != null && saved.phase !== 'idle'));
   if (!raw || (raw.mode !== undefined && raw.mode !== 'observe' && raw.mode !== 'live') || (raw.mode !== 'live' && positionOrJob)) {
     const live = liveOf(saved, market);
-    return { mode: 'live', observing: false, live: { ...live, enabled: false, phase: 'review', reason: '规则状态无法读取；请在执行进度与交易所核对后重置' }, events: records(raw?.events), observations: [] };
+    return { mode: 'live', observing: false, live: { ...live, enabled: false, phase: 'review', reason: '规则状态无法读取；请在执行进度与交易所核对后重置' }, events: records(raw?.events), observations: [], unsent: unsent(raw?.unsent) };
   }
   const mode = raw.mode === 'live' ? 'live' : 'observe';
   // An observe rule keeps the day's opens it made while live, so switching modes does not clear the daily limit.
   const live = mode === 'live' ? liveOf(raw.live, market) : { ...idleLive(), opens: liveOf(raw.live, market).opens };
-  return { mode, observing: mode === 'observe' && raw.observing === true, live, events: records(raw.events), observations: records(raw.observations) };
+  return { mode, observing: mode === 'observe' && raw.observing === true, live, events: records(raw.events), observations: records(raw.observations), unsent: unsent(raw.unsent) };
 }
 
 export const ruleTitle = (config: RuleConfig): string => config.name || `${VENUE_NAMES[config.venue]} ${MARKET_LABELS[config.market]}${config.direction === 'short' ? '做空' : '做多'}${config.market === 'hynix' ? '溢价' : '价差'}`;
@@ -300,6 +318,12 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     }
     // The held legs are read against the rule's market, so a record of other contracts is held for review.
     const state = stateOf(row.state, config.market);
+    // A store written before `unsent` keeps a generated, not handed-over notice only on the wait itself: it moves over.
+    const blocked = state.live.blocked;
+    if (blocked?.notice && !blocked.notified) {
+      const key = noticeKey(row.id, blocked.since);
+      if (!state.unsent.some(item => item.key === key)) state.unsent = [...state.unsent, { key, text: blocked.notice }].slice(-MAX_UNSENT);
+    }
     return { id: row.id, revision: Number(row.revision), createdAt: Number(row.createdAt), config, state };
   };
   const rows = (): Rule[] => (selectAll.all() as Row[]).map(row => parse(row)!);
@@ -407,7 +431,11 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
       if (fresh || rule.state.events.at(-1)?.message !== note) event(rule.state, note);
       if (blocked.notice === null && time - blocked.since >= BLOCKED_NOTIFY_MS) {
         const minutes = Math.floor((time - blocked.since) / 60_000);
-        blocked.notice = `【${MARKET_LABELS[rule.config.market]}自动规则受阻】${ruleTitle(rule.config)}：${actionName(action)}已连续 ${minutes} 分钟被同合约反向仓位阻塞（${other}）；规则不停用，每 ${RETRY_MS / 1000} 秒重试，请核对该账户在交易所的仓位。最近一次：${message(error)}`;
+        const notice = `【${MARKET_LABELS[rule.config.market]}自动规则受阻】${ruleTitle(rule.config)}：${actionName(action)}已连续 ${minutes} 分钟被同合约反向仓位阻塞（${other}）；规则不停用，每 ${RETRY_MS / 1000} 秒重试，请核对该账户在交易所的仓位。最近一次：${message(error)}`;
+        blocked.notice = notice;
+        // Kept apart from the wait, so it is handed over even when the wait ends first (only noticeSent removes it).
+        const key = noticeKey(rule.id, blocked.since);
+        if (!rule.state.unsent.some(item => item.key === key)) rule.state.unsent = [...rule.state.unsent, { key, text: notice }].slice(-MAX_UNSENT);
         event(rule.state, `已连续 ${minutes} 分钟被同合约反向仓位阻塞，已生成通知交给通知队列；规则继续等待，不停用`);
       }
     }
@@ -659,7 +687,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     const observing = raw.observing === true, id = randomUUID();
     // Only observe rules are created: live is entered with its own confirmation and a revision, so a resent create can never
     // add a live rule.
-    const state: RuleState = { mode: 'observe', observing, live: idleLive(), events: [], observations: [] };
+    const state: RuleState = { mode: 'observe', observing, live: idleLive(), events: [], observations: [], unsent: [] };
     event(state, '规则已创建（观察模式，不下单）');
     observation(state, observing ? '开始只观察，等待新盘口' : '观察规则已保存，尚未开始');
     insert.run(id, 0, now(), storedConfig(config), JSON.stringify(state));
@@ -702,6 +730,8 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     }
     if (action === 'delete') {
       if (isLive && (busy(live) || live.phase !== 'idle' || live.held)) refuse('rule_holding', '只有等待开仓且没有持仓的规则能删除');
+      // Unsent blocked notices go with the rule: deleting it is a person acting on that very rule (only an idle one without a
+      // position can be deleted), and a notice asking to check a rule that no longer exists has nothing left to act on.
       remove.run(id);
       observed.delete(id); freshAfter.delete(id); invalid.delete(id);
       return view();
@@ -754,23 +784,25 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     restart(id);
     return view();
   }
-  const noticeKey = (rule: Rule): string => `oil-rule-blocked:${rule.id}:${rule.state.live.blocked!.since}`;
-  /** Blocked-rule notices not yet handed to the notifier, each keyed once per wait (the notifier sends a key once). */
+  /**
+   * Blocked-rule notices not yet handed to the notifier, each keyed once per wait (the notifier sends a key once). Read from
+   * each rule's unsent list, not its current wait, so a notice generated before the wait ended is still offered.
+   */
   function notices(): { key: string; text: string }[] {
-    return rows().flatMap(rule => {
-      const blocked = rule.state.mode === 'live' ? rule.state.live.blocked : null;
-      return blocked?.notice && !blocked.notified ? [{ key: noticeKey(rule), text: blocked.notice }] : [];
-    });
+    return rows().flatMap(rule => rule.state.unsent.map(({ key, text }) => ({ key, text })));
   }
   /**
-   * Marks a notice as taken by the notifier, once it is in the notifier's outbox. A rule the page changed meanwhile keeps
-   * it unmarked; the next hand-over is dropped by the notifier's key.
+   * Marks a notice as taken by the notifier, once it is in the notifier's outbox: it leaves the unsent list, and the current
+   * wait shows it handed over when it is that wait's notice. A write that loses to a page action keeps it unsent; the next
+   * hand-over is dropped by the notifier's key.
    */
   function noticeSent(key: string): void {
     for (const rule of rows()) {
-      const blocked = rule.state.mode === 'live' ? rule.state.live.blocked : null;
-      if (!blocked?.notice || blocked.notified || noticeKey(rule) !== key) continue;
-      blocked.notified = true;
+      const blocked = rule.state.live.blocked;
+      const current = blocked !== null && blocked.notice !== null && !blocked.notified && noticeKey(rule.id, blocked.since) === key;
+      if (!current && !rule.state.unsent.some(item => item.key === key)) continue;
+      rule.state.unsent = rule.state.unsent.filter(item => item.key !== key);
+      if (current) blocked.notified = true;
       writeState.run(JSON.stringify(rule.state), rule.id, rule.revision);
     }
   }

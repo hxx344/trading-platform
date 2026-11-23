@@ -310,6 +310,185 @@ test('实盘：受阻间隔超过两个重试周期按新的一次阻塞重新�
   assert.equal(blockedOf(rules), null);
 }));
 
+// ---- blocked notices outliving their wait (issue #70) ----------------------------------------------------------------
+const implicitReduce = () => new ContractError(409, 'implicit_reduce', 'Binance CLUSDT 单向模式已有反向仓位，开仓会变成隐式减仓');
+/** Stands in for the notifier's outbox (feishu notifyOnce): a key is queued once; while `failing` the write throws and nothing is queued. */
+function outbox() {
+  const keys = new Set<string>();
+  const box = {
+    queued: [] as string[], failing: false, logs: [] as string[],
+    notifyOnce(key: string, _text: string): boolean {
+      if (box.failing) throw new Error('outbox locked');
+      if (keys.has(key)) return false;
+      keys.add(key); box.queued.push(key);
+      return true;
+    },
+    /** One hand-over as the service runs it, with a fresh log limiter so every failure is seen. */
+    handOver(rules: Pick<Rules, 'notices' | 'noticeSent'>) { handOver(rules, box.notifyOnce, line => box.logs.push(line)); },
+  };
+  return box;
+}
+/** Refuses the rule's opens for another position until a new blocked notice is generated; returns it. */
+async function blockUntilNotice(r: Rig, ex: FakeExecutor, rules: Rules): Promise<{ key: string; text: string }> {
+  const before = rules.notices().length;
+  ex.previewError = implicitReduce();
+  r.now += RETRY_MS;
+  await feed(r, rules, OPEN, 2);
+  for (let i = 0; i < 40 && rules.notices().length === before; i++) { r.now += RETRY_MS; await feed(r, rules, OPEN, 2); }
+  const all = rules.notices();
+  assert.equal(all.length, before + 1, '满 30 分钟生成一条新通知');
+  return all.at(-1)!;
+}
+
+test('实盘：阻塞通知首次入队失败后预览通过解除阻塞，通知仍待交接，队列恢复后只入队一次', () => withLive(async ({ r, ex, rules }) => {
+  const id = goLive(rules);
+  const notice = await blockUntilNotice(r, ex, rules);
+  assert.equal(notice.key, `oil-rule-blocked:${id}:${blockedOf(rules)!.since}`);
+  const box = outbox();
+  box.failing = true;
+  box.handOver(rules);
+  assert.deepEqual([box.queued, rules.notices(), box.logs.length], [[], [notice], 1]);
+  // The position is gone before the outbox recovers: the wait ends, the notice does not.
+  ex.previewError = null;
+  r.now += RETRY_MS;
+  await feed(r, rules, OPEN, 2);
+  assert.deepEqual([blockedOf(rules), ex.confirms.length], [null, 1], '预览通过、照常确认一次开仓');
+  assert.deepEqual(rules.notices(), [notice]);
+  box.failing = false;
+  box.handOver(rules);
+  box.handOver(rules);
+  assert.deepEqual([box.queued, rules.notices()], [[notice.key], []]);
+  assert.equal(ex.confirms.length, 1, '交接通知不额外下单');
+}));
+
+test('实盘：阻塞通知连续入队失败后换成其他拒绝码清除阻塞，通知仍待交接、只入队一次；规则判断照常', () => withLive(async ({ r, ex, rules }) => {
+  goLive(rules);
+  const notice = await blockUntilNotice(r, ex, rules);
+  const box = outbox();
+  box.failing = true;
+  for (let i = 0; i < 3; i++) { box.handOver(rules); r.now += RETRY_MS; await feed(r, rules, OPEN, 2); }
+  assert.deepEqual([box.queued, rules.notices()], [[], [notice]]);
+  // Refused for another reason: the wait is cleared, the rule waits for the locked contract as before.
+  ex.previewError = new ContractError(409, 'symbol_locked', '所选合约已有未结束任务');
+  r.now += RETRY_MS;
+  await feed(r, rules, OPEN, 2);
+  assert.deepEqual([blockedOf(rules), live(rules).failures, live(rules).enabled], [null, 0, true]);
+  assert.match(lastEvent(rules), /symbol_locked|所选合约已有未结束任务/);
+  box.handOver(rules);
+  assert.deepEqual(rules.notices(), [notice], '队列仍失败时保留');
+  box.failing = false;
+  box.handOver(rules);
+  box.handOver(rules);
+  assert.deepEqual([box.queued, rules.notices()], [[notice.key], []]);
+}));
+
+test('实盘：阻塞通知入队失败后间隔超过两个重试周期重新受阻，新阻塞用新键；两条各只入队一次', () => withLive(async ({ r, ex, rules }) => {
+  const id = goLive(rules);
+  const older = await blockUntilNotice(r, ex, rules);
+  const box = outbox();
+  box.failing = true;
+  box.handOver(rules);
+  // No refusal for three retry periods: the next one starts a new wait, which keeps the old notice unsent.
+  r.now += 3 * RETRY_MS;
+  await feed(r, rules, OPEN, 2);
+  const again = blockedOf(rules)!;
+  assert.deepEqual(rules.notices(), [older]);
+  assert.equal(again.notified, false);
+  box.handOver(rules);
+  const second = await blockUntilNotice(r, ex, rules);
+  assert.equal(second.key, `oil-rule-blocked:${id}:${again.since}`);
+  assert.notEqual(second.key, older.key);
+  assert.deepEqual(rules.notices(), [older, second]);
+  box.failing = false;
+  box.handOver(rules);
+  box.handOver(rules);
+  assert.deepEqual([box.queued, rules.notices()], [[older.key, second.key], []]);
+  assert.equal(blockedOf(rules)!.notified, true, '当前阻塞显示已交出');
+  r.now += RETRY_MS;
+  await feed(r, rules, OPEN, 2);
+  assert.deepEqual(rules.notices(), [], '同一次阻塞不再生成');
+}));
+
+test('实盘：阻塞通知入队失败、阻塞清除并停用改回观察后重启，通知仍在、只入队一次', () => withLive(async ({ r, ex, rules: initial, reopen }) => {
+  let rules = initial;
+  goLive(rules);
+  const notice = await blockUntilNotice(r, ex, rules);
+  const box = outbox();
+  box.failing = true;
+  box.handOver(rules);
+  ex.previewError = new ContractError(409, 'symbol_locked', '所选合约已有未结束任务');
+  r.now += RETRY_MS;
+  await feed(r, rules, OPEN, 2);
+  assert.equal(blockedOf(rules), null);
+  // A person stops the rule and turns it back to observe: the live state is replaced, the unsent notice stays.
+  rules.act(first(rules).id, 'disable', { revision: first(rules).revision });
+  rules.act(first(rules).id, 'observe', { revision: first(rules).revision });
+  assert.deepEqual([first(rules).mode, rules.notices()], ['observe', [notice]]);
+  rules = reopen();
+  assert.deepEqual(rules.notices(), [notice], '重启后仍待交接');
+  box.handOver(rules);
+  box.failing = false;
+  box.handOver(rules);
+  rules = reopen();
+  box.handOver(rules);
+  assert.deepEqual([box.queued, rules.notices()], [[notice.key], []]);
+}));
+
+test('实盘：阻塞通知已入队但标记交出失败，阻塞清除与重启后再次交接由队列按键去重，只入队一次', () => withLive(async ({ r, ex, rules: initial, reopen }) => {
+  let rules = initial;
+  goLive(rules);
+  const notice = await blockUntilNotice(r, ex, rules);
+  const box = outbox();
+  box.handOver({ notices: () => rules.notices(), noticeSent: () => { throw new Error('rules store locked'); } });
+  assert.deepEqual([box.queued, rules.notices()], [[notice.key], [notice]]);
+  assert.match(box.logs[0]!, /已写入发送队列，但未能标记已交出.*rules store locked/);
+  ex.previewError = null;
+  r.now += RETRY_MS;
+  await feed(r, rules, OPEN, 2);
+  assert.equal(blockedOf(rules), null);
+  rules = reopen();
+  assert.deepEqual(rules.notices(), [notice]);
+  box.handOver(rules);
+  assert.deepEqual([box.queued, rules.notices()], [[notice.key], []]);
+}));
+
+test('实盘：旧版本只存在阻塞状态里的未交出通知迁入待交接，阻塞清除后仍能交出；已交出的不再交', () => withLive(async ({ r, ex, rules: initial, file, reopen }) => {
+  const id = goLive(initial);
+  initial.create({ config: settings({ name: '已交出' }) });
+  const other = (initial.view() as { rules: RuleView[] }).rules[1]!, sentId = other.id;
+  initial.act(sentId, 'live', { revision: other.revision, confirmLive: true });
+  const since = r.now - BLOCKED_NOTIFY_MS;
+  const db = new DatabaseSync(file);
+  const old = (notified: boolean) => JSON.stringify({ since, lastAt: r.now, notice: '【原油自动规则受阻】旧通知', notified });
+  db.prepare("UPDATE rules SET state = json_remove(json_set(state, '$.live.blocked', json(?)), '$.unsent') WHERE id = ?").run(old(false), id);
+  db.prepare("UPDATE rules SET state = json_remove(json_set(state, '$.live.blocked', json(?)), '$.unsent') WHERE id = ?").run(old(true), sentId);
+  db.close();
+  let rules = reopen();
+  const notice = { key: `oil-rule-blocked:${id}:${since}`, text: '【原油自动规则受阻】旧通知' };
+  assert.deepEqual(rules.notices(), [notice]);
+  assert.deepEqual(blockedOf(rules), { since, lastAt: r.now, notified: false }, '页面阻塞字段不变');
+  // The wait ends before the hand-over, written in the new form; the notice survives it and another restart.
+  ex.previewError = new ContractError(409, 'symbol_locked', '所选合约已有未结束任务');
+  await feed(r, rules, OPEN, 2);
+  assert.equal(blockedOf(rules), null);
+  rules = reopen();
+  const box = outbox();
+  box.handOver(rules);
+  box.handOver(rules);
+  assert.deepEqual([box.queued, rules.notices()], [[notice.key], []]);
+}));
+
+test('删除规则时未交出的阻塞通知随规则一起删除', () => withLive(async ({ r, ex, rules }) => {
+  goLive(rules);
+  await blockUntilNotice(r, ex, rules);
+  ex.previewError = new ContractError(409, 'symbol_locked', '所选合约已有未结束任务');
+  r.now += RETRY_MS;
+  await feed(r, rules, OPEN, 2);
+  rules.act(first(rules).id, 'disable', { revision: first(rules).revision });
+  rules.act(first(rules).id, 'delete', { revision: first(rules).revision });
+  assert.deepEqual(rules.notices(), []);
+}));
+
 test('服务循环交接规则通知：读通知抛错只记日志（限频）、循环照常、无未处理拒绝；带 notifyOnce 时交给队列后标记', async () => {
   const h = createHarness();
   const rejections: unknown[] = [];

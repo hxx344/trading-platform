@@ -63,8 +63,8 @@ export interface LiveState {
    * Refused for another position on the contract (implicit_reduce) since `since`, last at `lastAt`. Cleared when a preview
    * passes, when the rule is refused or fails for another reason, or goes to review; a refusal more than BLOCKED_GAP_MS
    * after the last one starts a new wait (new since, new notice key). notice: the message for a person once the wait lasted
-   * BLOCKED_NOTIFY_MS, kept until it was handed to the notifier's outbox (notified), so a restart in between neither loses
-   * nor repeats it (L110).
+   * BLOCKED_NOTIFY_MS; notified once the notifier's outbox took it. The notice to hand over is also kept in the rule's
+   * unsent list (rules.ts), which outlives this wait, so neither a restart nor the wait ending first loses or repeats it (L110).
    */
   blocked: Blocked | null;
 }

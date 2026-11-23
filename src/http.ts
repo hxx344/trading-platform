@@ -490,7 +490,7 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
       // is reported as done: otherwise a restart would bring them back (sessions.ts persisted()).
       if (!sessions.persisted()) {
         log(`${all ? `注销全部 ${removed} 个页面会话` : '页面会话退出'}未能写入会话文件，服务重启后可能恢复（来自 ${clientAddress(request)}）`);
-        return send(response, 500, { code: 'session_not_persisted', message: `${all ? '已注销的会话' : '本会话'}在当前服务中已失效，但会话文件写入和删除都失败，服务重启后可能恢复。请检查数据目录的写权限后再操作一次，或在重启服务前手动删除数据目录中的 http-session 文件。` }, { 'set-cookie': clearedCookie(request) });
+        return send(response, 500, { code: 'session_not_persisted', message: `${all ? '已注销的会话' : '本会话'}在当前服务中已失效，但会话文件无法写入、删除或改写，服务重启后可能恢复。请修复数据目录的写权限后重新登录（登录时会补写会话文件），或在重启服务前手动删除数据目录中的 http-session 文件。` }, { 'set-cookie': clearedCookie(request) });
       }
       log(`${all ? `已注销全部 ${removed} 个页面会话` : '页面会话已退出'}（来自 ${clientAddress(request)}）`);
       return send(response, 200, { removed }, { 'set-cookie': clearedCookie(request) });

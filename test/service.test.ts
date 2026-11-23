@@ -257,6 +257,36 @@ test('飞书告警：事件转消息，同一持续问题 30 分钟内只发一�
     pairs = [{ ...pairs[0]!, enabled: false }];
     notifier.poll();
     assert.equal(notifier.pending(), before + 6);
+
+    // An alert whose insert fails is not counted as posted: the next poll posts the first alert (not a repeat 2 minutes
+    // later), and a recovery with no alert queued posts nothing (#71, same path in feishu.ts).
+    const outboxDb = new DatabaseSync(join(dir, 'notify.sqlite'));
+    const breakOutbox = (broken: boolean) => outboxDb.exec(broken ? "CREATE TRIGGER fail_outbox BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END;" : 'DROP TRIGGER fail_outbox');
+    try {
+      pairs = pair('3000', '1000');
+      notifier.poll();
+      clock += FAULT_AFTER_MS;
+      breakOutbox(true);
+      const logged = lines.length;
+      notifier.poll();
+      assert.equal(notifier.pending(), before + 6, '入队失败不算已发');
+      assert.ok(lines.slice(logged).some(line => /保证金平衡告警未能入队/.test(line)));
+      assert.ok(!lines.slice(logged).some(line => line.startsWith('告警：')), '回滚的插入不记作已告警');
+      breakOutbox(false);
+      clock += 1_000;
+      notifier.poll();
+      assert.equal(notifier.pending(), before + 7);
+      assert.match(texts().at(-1)!, /^【保证金平衡异常】配对 p1/);
+      // The recovery fails once: kept, posted on the next poll, once.
+      pairs = pair('2000', '1500');
+      breakOutbox(true);
+      notifier.poll();
+      breakOutbox(false);
+      assert.equal(notifier.pending(), before + 7);
+      notifier.poll(); notifier.poll();
+      assert.equal(notifier.pending(), before + 8);
+      assert.match(texts().at(-1)!, /^【保证金平衡恢复】配对 p1/);
+    } finally { outboxDb.close(); }
     await notifier.flush();
     notifier.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }

@@ -20,6 +20,7 @@ export const HEALTH_REPEAT_MS = 30 * 60_000;
 const PROBE_TIMEOUT_MS = 3_000;
 
 export interface IncidentView { key: string; title: string; subject: string; problem: string; since: number; alerted: boolean }
+type Incident = IncidentView & { sentAt: number | null; owed: boolean; failing: boolean };
 
 /**
  * Open problems by key. observe() with a problem starts or keeps one, posting it once it has lasted afterMs (and again
@@ -28,34 +29,45 @@ export interface IncidentView { key: string; title: string; subject: string; pro
  * was, so the next observe() tries the same post again, and a recovery is never posted for an alert that was not.
  */
 export function createIncidents({ notify, now = Date.now, log = line => process.stderr.write(`${line}\n`) }: { notify: (text: string) => void; now?: () => number; log?: (line: string) => void }) {
-  const open = new Map<string, IncidentView & { sentAt: number | null }>();
-  const queued = (text: string): boolean => {
-    try { notify(text); return true; }
-    catch (error) { log(`依赖巡检告警未能入队，下一轮重试：${error instanceof Error ? error.message.slice(0, 160) : String(error)}`); return false; }
+  const open = new Map<string, Incident>();
+  // One log line per incident while its posts keep failing (every 10 s otherwise), another once one goes through.
+  const queued = (entry: Incident, text: string): boolean => {
+    try {
+      notify(text);
+      if (entry.failing) log(`依赖巡检告警已恢复入队：${entry.title}，${entry.subject}`);
+      entry.failing = false;
+      return true;
+    } catch (error) {
+      if (!entry.failing) log(`依赖巡检告警未能入队，之后每轮重试：${entry.title}，${entry.subject}：${error instanceof Error ? error.message.slice(0, 160) : String(error)}`);
+      entry.failing = true;
+      return false;
+    }
   };
   return {
     observe(key: string, title: string, subject: string, problem: string | null, { afterMs, repeatMs }: { afterMs: number; repeatMs: number | null }): void {
       const at = now(), entry = open.get(key);
       if (problem === null) {
-        // Kept open until its recovery is queued.
-        if (entry?.sentAt != null && !queued(`【${title}恢复】${subject}，异常共约 ${lasted(at - entry.since)}`)) return;
+        // Kept open until its recovery is queued. An alert that came due but never got queued is posted now with its
+        // recovery, so the problem is not lost because it ended before the queue came back.
+        if (entry?.sentAt != null && !queued(entry, `【${title}恢复】${subject}，异常共约 ${lasted(at - entry.since)}`)) return;
+        if (entry?.sentAt === null && entry.owed && !queued(entry, `【${title}（已恢复）】${subject}：${entry.problem}，共约 ${lasted(at - entry.since)}，告警当时未能入队，现已恢复`)) return;
         open.delete(key);
         return;
       }
-      const current = entry ?? { key, title, subject, problem, since: at, alerted: false, sentAt: null };
+      const current = entry ?? { key, title, subject, problem, since: at, alerted: false, sentAt: null, owed: false, failing: false };
       current.problem = problem;
       open.set(key, current);
       if (current.sentAt === null) {
         if (at - current.since < afterMs) return;
-        if (!queued(`【${title}】${subject}：${problem}，已持续约 ${lasted(at - current.since)}`)) return;
-        current.sentAt = at; current.alerted = true;
+        if (!queued(current, `【${title}】${subject}：${problem}，已持续约 ${lasted(at - current.since)}`)) { current.owed = true; return; }
+        current.sentAt = at; current.alerted = true; current.owed = false;
       } else if (repeatMs !== null && at - current.sentAt >= repeatMs) {
-        if (queued(`【${title}仍未恢复】${subject}：${problem}，已持续约 ${lasted(at - current.since)}`)) current.sentAt = at;
+        if (queued(current, `【${title}仍未恢复】${subject}：${problem}，已持续约 ${lasted(at - current.since)}`)) current.sentAt = at;
       }
     },
     /** Drops the problems under a key prefix without a recovery post: what they watched was switched off. */
     forget(prefix: string): void { for (const key of [...open.keys()]) if (key.startsWith(prefix)) open.delete(key); },
-    view: (): IncidentView[] => [...open.values()].map(({ sentAt: _, ...item }) => item),
+    view: (): IncidentView[] => [...open.values()].map(({ sentAt: _, owed: _owed, failing: _failing, ...item }) => item),
   };
 }
 
@@ -104,7 +116,7 @@ async function probeControlPort(port: number): Promise<void> {
 export function createHealthWatch({ marketSocketPath, controlPort, streams, perpetual, notify, now = Date.now, log = line => process.stderr.write(`${line}\n`), probeMarket = marketHealth, probeControl = probeControlPort }: HealthWatchOptions) {
   const incidents = createIncidents({ notify, now, log });
   /** A market restart seen but not yet queued (retried on the next tick). */
-  let restartPending = false;
+  let restartPending: boolean | 'failing' = false;
   const blank = (): ProcessHealth => ({ ok: null, checkedAt: null, lastOkAt: null, error: null, restarts: 0 });
   const market = marketSocketPath ? blank() : null, control = controlPort !== undefined ? blank() : null;
   let marketInstance: string | null = null;
@@ -126,7 +138,7 @@ export function createHealthWatch({ marketSocketPath, controlPort, streams, perp
     // Outside the probe: a notifier that cannot queue is not a market that cannot be reached.
     if (restartPending) {
       try { notify('【行情服务已重启】公开行情进程（trading-platform-market）换了新实例，期间的行情订阅已重新建立；如非升级所致，请查看该服务日志'); restartPending = false; }
-      catch (error) { log(`行情服务重启通知未能入队，下一轮重试：${error instanceof Error ? error.message.slice(0, 160) : String(error)}`); }
+      catch (error) { if (restartPending !== 'failing') log(`行情服务重启通知未能入队，之后每轮重试：${error instanceof Error ? error.message.slice(0, 160) : String(error)}`); restartPending = 'failing'; }
     }
     incidents.observe('market', '行情服务不可用', '公开行情进程（trading-platform-market）', market.ok ? null : `无法连接：${market.error}`, { afterMs: PROCESS_DOWN_AFTER_MS, repeatMs: HEALTH_REPEAT_MS });
   }

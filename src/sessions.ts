@@ -164,6 +164,9 @@ export function openSessionStore({ file, epoch = '', seed = [], now = Date.now, 
   }
   prune();
   if (dirty) save(true);
+  // What load and the first prune drop (another password, a malformed file, expired sessions) is dropped again on every
+  // load, so a failed write here leaves nothing a restart could revive.
+  pendingSince = null;
 
   return {
     maxAgeS: file ? SESSION_LIFETIME_MS / 1000 : undefined,

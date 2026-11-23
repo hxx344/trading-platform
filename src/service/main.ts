@@ -463,7 +463,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
     background: context => [
       (async () => {
         while (!context.stopped()) {
-          try { for (const text of readTokens.dueReminders()) notifier.notify(text); }
+          try { readTokens.dueReminders(text => notifier.notify(text)); }
           catch (error) { process.stderr.write(`只读接口令牌到期提醒失败：${error instanceof Error ? error.message : String(error)}\n`); }
           try { notifier.poll(); await notifier.flush(); }
           catch (error) { process.stderr.write(`告警处理失败：${error instanceof Error ? error.message : String(error)}\n`); }

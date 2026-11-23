@@ -371,8 +371,10 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
   };
   /** The queued message's id, or null without a robot (the text is only logged then). */
   const insert = (text: string, at: number): number | null => {
+    // Logged once the row is in (a rolled-back insert would otherwise read as an alert that went out).
+    const id = feishu ? Number(db.prepare('INSERT INTO outbox(created_at, text, next_at) VALUES (?, ?, ?)').run(at, text.slice(0, MAX_TEXT), at).lastInsertRowid) : null;
     log(`告警：${text}`);
-    return feishu ? Number(db.prepare('INSERT INTO outbox(created_at, text, next_at) VALUES (?, ?, ?)').run(at, text.slice(0, MAX_TEXT), at).lastInsertRowid) : null;
+    return id;
   };
   /** False when the same ongoing problem was already posted within REPEAT_MS. */
   const fresh = (key: string, at: number): boolean => {
@@ -419,19 +421,23 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
       const problem = marginProblem(pair);
       const entry = stuck.get(pair.id);
       if (problem === 'unknown') continue;
+      // Each post counts once its row is queued: a failed insert leaves the entry as it was for the next poll, and the
+      // other pairs are still checked this round.
+      const queued = (text: string): boolean => {
+        try { tx(() => insert(text, at)); return true; }
+        catch (error) { log(`保证金平衡告警未能入队，下一轮重试：${error instanceof Error ? error.message.slice(0, 160) : String(error)}`); return false; }
+      };
       if (!problem) {
-        if (entry?.sentAt != null) tx(() => insert(`【保证金平衡恢复】配对 ${pair.id}，异常共约 ${lasted(at - entry.began)}：${balanceLine(pair)}`, at));
+        if (entry?.sentAt != null && !queued(`【保证金平衡恢复】配对 ${pair.id}，异常共约 ${lasted(at - entry.began)}：${balanceLine(pair)}`)) continue;
         stuck.delete(pair.id);
         continue;
       }
       if (!entry) { stuck.set(pair.id, { since: at, began: at, sentAt: null }); continue; }
       if (at - entry.since < FAULT_AFTER_MS) continue;
       if (entry.sentAt === null) {
-        entry.sentAt = at;
-        tx(() => insert(`【保证金平衡异常】配对 ${pair.id} 已持续 ${lasted(at - entry.began)}：${clip(problem)}。${balanceLine(pair)}。持续 ${FAULT_AFTER_MS / 1000} 秒告警，未恢复每 ${FAULT_REPEAT_MS / 1000} 秒重复提醒，恢复后通知一次`, at));
+        if (queued(`【保证金平衡异常】配对 ${pair.id} 已持续 ${lasted(at - entry.began)}：${clip(problem)}。${balanceLine(pair)}。持续 ${FAULT_AFTER_MS / 1000} 秒告警，未恢复每 ${FAULT_REPEAT_MS / 1000} 秒重复提醒，恢复后通知一次`)) entry.sentAt = at;
       } else if (at - entry.sentAt >= FAULT_REPEAT_MS) {
-        entry.sentAt = at;
-        tx(() => insert(`【保证金平衡仍异常】配对 ${pair.id} 已持续 ${lasted(at - entry.began)}：${clip(problem)}。${balanceLine(pair)}`, at));
+        if (queued(`【保证金平衡仍异常】配对 ${pair.id} 已持续 ${lasted(at - entry.began)}：${clip(problem)}。${balanceLine(pair)}`)) entry.sentAt = at;
       }
     }
     for (const id of [...stuck.keys()]) if (!seen.has(id)) stuck.delete(id);

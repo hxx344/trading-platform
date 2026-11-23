@@ -85,7 +85,7 @@ sudo -u trading-platform node /opt/trading-platform/current/src/asset/import.ts 
 **一次应答读同一份账本**（issue #11，A-1 审查登记的建议项）
 
 - 问题：一次应答由多条 SELECT 拼成（先读 `import-info`，再分别读资产、设置、连接、快照），没有包在同一读事务里。另一个进程（「从工作台导入」）恰好在两条之间提交整体替换时，同一应答会混有新旧两代：导入时刻属于旧账本，资产或历史已经是新账本。
-- 做法：`store.ts` 在服务原有连接之外，另开一个只读连接（`db.ts` 的 `snapshot` 模式，`busy_timeout` 1 秒，同服务连接），读接口（state、ledger、history、period、daily-changes、withdrawals、cash-flows，以及写入后返回的账本视图）都经 `db.ts` 的 `snapshot()`：`BEGIN` 后在同一个同步调用里依次读 `import-info` 和该接口的全部查询，然后 `COMMIT`。WAL 下读事务看到的是第一条查询时已提交的状态，期间别的连接照常提交，不等待；事务从不跨 `await`，也不在共享写连接上持锁，不卡交易循环。出错时先 `ROLLBACK` 再抛出，`store.ts` 还会关掉这个只读连接，下次读取重新打开。
+- 做法：`store.ts` 在服务原有连接之外，另开一个只读连接（`db.ts` 的 `snapshot` 模式，`busy_timeout` 1 秒，同服务连接），读接口（state、ledger、history、period、daily-changes、withdrawals、cash-flows，以及写入后返回的账本视图）都经 `db.ts` 的 `snapshot()`：`BEGIN` 后在同一个同步调用里依次读 `import-info` 和该接口的全部查询，然后 `COMMIT`。WAL 下读事务看到的是第一条查询时已提交的状态，期间别的连接照常提交，不等待；事务从不跨 `await`，也不在共享写连接上持锁，不卡交易循环。同步阶段出错时先 `ROLLBACK` 再抛出，`store.ts` 还会关掉这个只读连接，下次读取重新打开；事务提交后组装应答时出的错不涉及事务，连接保留。
 - 拷来的读取函数（`readLedger`、`readSnapshotHistory`、`readDailyChanges`、`loadCashFlows`、`readPeriodRows`）是 async 的，但它们在第一次 `await` 之前就把全部查询发出（`Promise.all`）。`readPeriodRows` 原来分两次 `await` 读，改为同时发出。读取事务结束后再发出的查询直接报错（`SNAPSHOT_CLOSED`），不会读到更新的状态；以后改这些函数时，查询要在第一次 `await` 之前全部发出。
 - 写入（A-2 起的编辑、同步、导入原表）仍在服务连接上、同步锁里读写，不变；写入提交后再经只读连接读应答，能看到刚写的内容。
 - 库结构不变，没有数据迁移；回退到之前的版本照常读库。
@@ -268,7 +268,7 @@ Binance、Bybit 和 OKX 的持仓页用实时账户快照确定当前方向和�
 
 - 问题：Hyperliquid 的总额由 USDC 余额按当时的 USDC/USD 报价折算，但报价只用在总额上，没有留在行里。余额明细读取失败或明细里没有 USDC 时，归因找不到兑 USD 价格，只能记为未知；而明细里的价格本身也没有独立时效。
 - 做法：`sources/hyperliquid.ts` 的读取结果带回本次折算用的报价证据 `quote`：`coin`（`USDC`）、`usd`（报价，不写死 1）、`source`（`CoinGecko / USD`，或 CoinGecko 失败时的 `Coinbase / USD（获取时间）`）、`at`（报价源给出的时间；Coinbase 没有，用获取时间）、`receivedAt`（收到报价的时间）。`sync.ts` 把它存进该资产行（`types.ts` 的 `Asset.quote`），随行进入当天快照；同步失败保留旧值时连同旧证据一起保留，新读取没有报价时去掉旧证据，不会留下与余额不对应的报价。
-- 归因（`daily-positions.ts`）只信 `hyperliquid` 模式行自带的证据，并且只用当前这份快照里这一行的证据，不跨快照、不跨行借用，也不拿现价回填历史。证据要通过格式校验（`quoteOf`：币种、正的有限报价、来源、可解析的两个时间），且按持仓采样时刻（`fetchedAt`，缺失时用快照时间）核对时效：报价源时间晚于收到时间不超过 60 秒、早于收到时间不超过 15 分钟，收到时间与持仓采样相差不超过 5 分钟。任一不满足就把这一行当作没有兑 USD 价格（结果为未知，不按 0 计）；证据存在且币种相符时，它代替这一行的明细价格。没有证据的旧快照和其他交易所的行沿用原来的明细口径。
+- 归因（`daily-positions.ts`）只信 `hyperliquid` 模式行自带的证据，并且只用当前这份快照里的证据，不跨快照借用，也不拿现价回填历史；同一快照里其他交易所的 USDC 计价持仓，在本行明细没有 USDC 价格时也可以用这份已核对时效的报价。证据要通过格式校验（`quoteOf`：币种、正的有限报价、来源、可解析的两个时间），且按持仓采样时刻（`fetchedAt`，缺失时用快照时间）核对时效：报价源时间晚于收到时间不超过 60 秒、早于收到时间不超过 15 分钟，收到时间与持仓采样相差不超过 5 分钟。任一不满足就把这一行当作没有兑 USD 价格（结果为未知，不按 0 计）；证据存在且币种相符时，它代替这一行的明细价格。没有证据的旧快照和其他交易所的行沿用原来的明细口径。Hyperliquid 行带了报价而报价已不新鲜时（例如上次同步 5 分钟以后手动编辑或登记出金重写了当天快照），这一行不再改用明细价格，持仓变化显示为未知。
 - 换连接、重复或倒序的采样仍不可比，有报价也不变。
 - 库结构不变。行与快照的 JSON 增加可选的 `quote` 字段，旧版本忽略它；回退后旧版本会把行里的旧 `quote` 原样留着，升级回来时它因时间对不上持仓采样而不被采用。
 - 测试：`test/asset-sources-hyperliquid.test.ts`「the USDC/USD quote of the total comes back with its source and times even when no detail row holds USDC (#63)」；`test/asset-sync.test.ts`「Hyperliquid keeps the USDC/USD quote of each read with its row and daily snapshot; a read without one drops it (#63)」；`test/asset-daily-changes.test.ts` 中 4 例：明细失败时按非 1 报价折算且只计一次；缺失、过期、错位或格式错误的证据保持未知，旧快照照旧；有效报价不让换连接和重复、倒序采样变得可比；证据经快照存取往返后来源与时间不变，损坏的被丢弃。

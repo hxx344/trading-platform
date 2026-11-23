@@ -252,6 +252,23 @@ test('只读令牌：文件只存摘要且为 600；吊销后立即 401；到期
   } finally { await s.close(); }
 });
 
+test('只读令牌：到期提醒交给通知后才标记已发，通知抛错时下次仍提醒（#71 同类路径）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-read-token-'));
+  const at = { now: Date.UTC(2026, 10, 19) };
+  const open = () => createReadTokens({ dir, now: () => at.now, log: () => {} });
+  try {
+    open().generate();
+    at.now += READ_TOKEN_TTL_MS - 7 * 86_400_000 + 1000;
+    assert.throws(() => open().dueReminders(() => { throw new Error('database is locked'); }), /database is locked/);
+    const sent: string[] = [];
+    assert.equal(open().dueReminders(text => sent.push(text)).length, 1);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0]!, /7 天内到期/);
+    assert.deepEqual(open().dueReminders(text => sent.push(text)), []);
+    assert.equal(sent.length, 1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('只读令牌：生成与吊销只接受会话与请求标记；令牌文件损坏时不接受任何令牌并在页面说明', async () => {
   clock.now = Date.UTC(2026, 10, 19);
   const s = await start();

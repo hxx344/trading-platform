@@ -68,8 +68,11 @@ export interface ReadTokens {
   redactor(): Redactor | null;
   /** The original behind an alias handed out with the current token. */
   lookup(alias: string): string | null;
-  /** Expiry reminders now due, each returned once (kept across restarts). */
-  dueReminders(): string[];
+  /**
+   * Expiry reminders now due, each returned once (kept across restarts). With `send`, each is passed to it first and
+   * marked only once it returned: a send that throws leaves the reminder due for the next call.
+   */
+  dueReminders(send?: (text: string) => void): string[];
   flush(): void;
 }
 
@@ -177,18 +180,20 @@ export function createReadTokens({ dir, now = Date.now, log = line => process.st
     },
     redactor: () => redact,
     lookup: alias => aliases.get(alias.trim()) ?? null,
-    dueReminders() {
+    dueReminders(send) {
       if (!stored) return [];
       const at = now(), left = stored.expiresAt - at;
       if (left <= 0) return [];
       // Only the nearest reminder due: a token generated 3 days before expiry gets the 1-day one, not both at once.
       const due = REMINDERS.filter(reminder => left <= reminder.beforeMs).at(-1);
       if (!due || stored.reminded.includes(due.key)) return [];
+      const days = Math.max(1, Math.ceil(left / 86_400_000));
+      const text = `【只读接口令牌即将到期】编号 ${stored.id} 将在 ${days} 天内到期（${new Date(stored.expiresAt).toISOString().replace('T', ' ').slice(0, 16)} UTC）。到期后 MCP 客户端无法读取，请在「设置 → 只读接口令牌」重新生成并更新客户端的令牌文件。`;
+      send?.(text);
       // Marking the farther ones too keeps a restart from sending the 7-day one after the 1-day one.
       for (const reminder of REMINDERS) if (reminder.beforeMs >= due.beforeMs && !stored.reminded.includes(reminder.key)) stored.reminded.push(reminder.key);
       dirty = true; flush();
-      const days = Math.max(1, Math.ceil(left / 86_400_000));
-      return [`【只读接口令牌即将到期】编号 ${stored.id} 将在 ${days} 天内到期（${new Date(stored.expiresAt).toISOString().replace('T', ' ').slice(0, 16)} UTC）。到期后 MCP 客户端无法读取，请在「设置 → 只读接口令牌」重新生成并更新客户端的令牌文件。`];
+      return [text];
     },
     flush,
   };

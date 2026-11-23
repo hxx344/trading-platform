@@ -201,7 +201,7 @@ test('崩溃兜底：标记的报告第一次入队失败时保留标记；下�
     assert.equal(existsSync(join(dir, CRASH_FILE)), true, '入队失败时标记保留');
     failing = false;
     start();
-    assert.deepEqual(sent, ['Error: boom']);
+    assert.deepEqual(sent, ['boom']);
     assert.equal(existsSync(join(dir, CRASH_FILE)), false);
     start();
     // A marker that could not be removed after its report was queued: read again, dropped by its key.
@@ -210,7 +210,7 @@ test('崩溃兜底：标记的报告第一次入队失败时保留标记；下�
     source.emit('uncaughtException', new Error('boom'));
     again();
     start();
-    assert.deepEqual(sent, ['Error: boom'], '同一标记不重复报告');
+    assert.deepEqual(sent, ['boom'], '同一标记不重复报告');
   } finally { remove(); rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -268,6 +268,23 @@ test('依赖巡检：告警入队失败时不记作已发，下一轮补发首�
   state.streams = [{ account: 'a2', connected: true, since: 1, lastError: null }];
   await step(1_000);
   assert.ok(!sent.some(text => text.includes('账户 a2')), '未告警过的恢复不发');
+  // An alert that came due but never got queued, for a problem that ended before the queue came back: posted once with
+  // its recovery; repeated failures log once.
+  state.streams = [{ account: 'a3', connected: false, since: null, lastError: null }];
+  await step(0);
+  failing = true;
+  const logged = logs.length;
+  await step(STREAM_DOWN_AFTER_MS);
+  await step(1_000);
+  assert.equal(logs.slice(logged).filter(line => /未能入队/.test(line)).length, 1, '连续失败只记一行');
+  state.streams = [{ account: 'a3', connected: true, since: 1, lastError: null }];
+  await step(1_000);
+  assert.equal(watch.view().incidents.some(item => item.key === 'stream:a3'), true, '补报未入队前保留');
+  failing = false;
+  await step(1_000);
+  assert.equal(sent.filter(text => text.startsWith('【ASTER 用户推送断开（已恢复）】账户 a3')).length, 1);
+  await step(1_000);
+  assert.equal(sent.filter(text => text.includes('账户 a3')).length, 1);
 
   // A market restart whose notice cannot be queued: the market still reads as up, the notice goes out next tick.
   sent.length = 0;

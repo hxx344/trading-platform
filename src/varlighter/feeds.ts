@@ -100,6 +100,8 @@ export const TOP_MAX_AGE_MS = STATS_REFRESH_MS + 15_000;
 const SILENCE_MS = 20_000;
 /** 发起连接后这么久还没连上就放弃重连。 */
 export const CONNECT_TIMEOUT_MS = 20_000;
+/** 断线不超过这么久再续上，「一档连续可用」的起点不重新计（与 Var 拉取失败的口径一致）。 */
+export const STREAM_GAP_MS = 3 * 60_000;
 const PING_MS = 25_000;
 const LIVE_SLACK_MS = 5_000;
 const decimal = (value: unknown): number | null => {
@@ -152,6 +154,7 @@ export class LighterStream {
   private readonly current = new Map<number, Omit<TopPoint, 'at'>>();
   /** 一档数据的有效区间：快照（subscribed）开始，断线或沉默结束。 */
   private readonly topSegments: Segment[] = [];
+  private since: number | null = null;
   private state: Omit<StreamStatus, 'markets'> = { connected: false, connectedAt: null, lastMessageAt: null, reconnects: 0, lastError: null, bytes: 0, bytesSince: null };
   private lastPing: number | null = null;
   private lastRefresh: number | null = null;
@@ -190,6 +193,9 @@ export class LighterStream {
   }
 
   status(markets: number): StreamStatus { return { ...this.state, markets }; }
+
+  /** 一档连续可用的起点：断线或还没收到快照时为 null；断线不超过 STREAM_GAP_MS 再续上的沿用之前的起点。 */
+  healthySince(): number | null { return this.topSegments.at(-1)?.end === null ? this.since : null; }
 
   /** t 时刻有效的一档状态：t 落在某个连续区间内，且该区间内最近一次确认不早于 TOP_MAX_AGE_MS。 */
   topAt(marketId: number, t: number): TopPoint | null {
@@ -243,7 +249,10 @@ export class LighterStream {
       if (type === 'subscribed/market_stats') {
         // 快照之后的状态才可用；首个快照开新区间，定期重订阅的快照延续当前区间。
         const last = this.topSegments.at(-1);
-        if (!last || last.end !== null) this.topSegments.push({ start: now, end: null });
+        if (!last || last.end !== null) {
+          if (!last || now - last.end! > STREAM_GAP_MS) this.since = now;
+          this.topSegments.push({ start: now, end: null });
+        }
         this.lastRefresh = now;
         this.attempt = 0;
       }

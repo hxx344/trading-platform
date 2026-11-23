@@ -594,11 +594,11 @@ test('失联判定：规格改判、数据源连续正常 30 分钟仍无样本�
     first.engine.close();
 
     // 停机很久后重启：第一轮 Var 报价早于行情流快照，没写入新样本，旧样本不算失联。
-    time += 3_600_000;
+    time += 3_600_000; full = true;
     const restarted = start();
     await restarted.engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
     await poll(restarted.engine);
-    assert.equal(restarted.engine.views.state().sources.var.poll?.written, 0, '第一轮没有新样本');
+    assert.deepEqual([restarted.engine.views.state().sources.var.poll?.written, restarted.engine.views.state().sources.var.poll?.noLighter], [0, 1], '第一轮没有新样本：报价时刻行情流还没有快照');
     assert.deepEqual(reasons(restarted.engine), [], '重启后第一轮');
     assert.equal(status(() => restarted.engine.views.close({ symbol: 'rh:BTC' })), 409);
     restarted.engine.close();
@@ -628,6 +628,62 @@ test('失联判定：规格改判、数据源连续正常 30 分钟仍无样本�
     assert.equal(third.engine.views.paper().positions.length, 1, '对照：没有冷却就开仓');
   } finally {
     for (const engine of engines) { try { engine.close(); } catch { /* 已关闭 */ } }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('失联计时：行情流短暂断线再续上不重新计，断开超过 3 分钟才从续上的时刻算起；连上但没收到快照不判断', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  let time = T0;
+  const fetchImpl = async (url: string) => {
+    if (url.includes('orderBookDetails')) return Response.json({ code: 200, order_book_details: [{ symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, min_base_amount: '0.001', min_quote_amount: '10', taker_fee: '0', maker_fee: '0', mark_price: '100' }] });
+    if (url.includes('orderBookOrders')) return Response.json({ code: 200, bids: [{ price: '99.99', remaining_base_amount: '1000' }], asks: [{ price: '100.01', remaining_base_amount: '1000' }] });
+    // Var 有目录、没有完整报价：一直不产生新样本。
+    return Response.json({ listings: [{ ticker: 'BTC', name: 'Bitcoin', mark_price: '100.2', quotes: { updated_at: new Date(time - 2_000).toISOString(), base: { bid: '100.29', ask: '100.31' } } }] });
+  };
+  const dir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-')), file = path.join(dir, 'varlighter.sqlite');
+  const seed = openVarLighterStore(file);
+  seed.setState('settings', { revision: 1, global: DEFAULT_GLOBAL, symbols: { 'rh:BTC': { ...DEFAULT_SYMBOL, enabled: true } }, confirmed: [], venues: ['rh'] }, T0);
+  seed.addSamples([{ ...sample(T0 - 40 * 60_000, 100.1), symbol: 'rh:BTC' }]);
+  seed.close();
+  const sockets: FakeSocket[] = [];
+  const engine = createVarLighterEngine({ store: openVarLighterStore(file), fetchImpl, connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now: () => time });
+  const snapshot = { type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: '99.99', best_ask_price: '100.01', mark_price: '100' } } };
+  /** 每分钟拉一次 Var；行情流连着时每分钟推一条消息。 */
+  const run = async (minutes: number) => { for (let index = 0; index < minutes; index++) { time += 60_000; sockets.at(-1)!.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, mark_price: String(100 + time % 1000 / 1e6) } } }); await engine.pollVar(AbortSignal.timeout(1000)); } };
+  const lost = () => engine.views.state().orphans.length;
+  try {
+    engine.startStreams();
+    sockets[0].open();
+    sockets[0].push(snapshot);
+    await engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
+    await engine.pollVar(AbortSignal.timeout(1000));
+    await run(30);
+    assert.equal(lost(), 0, '数据源正常刚满 30 分钟');
+    await run(1);
+    assert.equal(lost(), 1, '数据源连续正常 31 分钟没有样本');
+
+    sockets[0].onclose?.({});
+    assert.equal(lost(), 0, '断开时不判断');
+    time += 5_000; t.mock.timers.tick(1_000);
+    assert.equal(sockets.length, 2, '1 秒后重连');
+    sockets[1].open();
+    assert.equal(lost(), 0, '连上但还没收到快照，仍不判断');
+    sockets[1].push(snapshot);
+    assert.equal(lost(), 1, '断开 5 秒再续上，不重新计时');
+
+    sockets[1].onclose?.({});
+    await run(4);
+    t.mock.timers.tick(1_000);
+    sockets[2].open();
+    sockets[2].push(snapshot);
+    assert.equal(lost(), 0, '断开 4 分钟后续上，从续上的时刻重新计时');
+    await run(30);
+    assert.equal(lost(), 0, '续上后刚满 30 分钟');
+    await run(1);
+    assert.equal(lost(), 1, '续上后 31 分钟仍无样本');
+  } finally {
+    try { engine.close(); } catch { /* 已关闭 */ }
     rmSync(dir, { recursive: true, force: true });
   }
 });

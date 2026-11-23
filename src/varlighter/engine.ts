@@ -300,9 +300,10 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   const lastSample = (key: string) => latest.get(key) ?? store.latest(key);
   /**
    * 配对失联的原因：不在目录里、改判为规格不同，或数据源都正常而 30 分钟没有新样本（Var 不再报价、对手盘口缺失）。
-   * 数据源本身没就绪或在故障（启动期、Var 拉取失败、场所目录未取到、行情流断开）时返回 null，不把整体故障当成单个配对失联。
-   * 30 分钟从「最后样本」与「数据源连续正常的起点」（启动、Var 恢复、行情流连上三者取最晚）中较晚的一个算起：
+   * 数据源本身没就绪或在故障（启动期、Var 拉取失败、场所目录未取到、行情流断开或还没收到快照）时返回 null，不把整体故障当成单个配对失联。
+   * 30 分钟从「最后样本」与「数据源连续正常的起点」（启动、Var 恢复、行情流收到快照三者取最晚）中较晚的一个算起：
    * 停机或故障前的旧样本不会在恢复后第一轮还没写入新样本时就被判失联。
+   * 两个数据源中断不超过 3 分钟再恢复的都不重新计时，否则频繁的短暂断线会让没有报价的持仓一直处理不了。
    */
   function lostReason(key: string, time: number): string | null {
     if (!listings.size || varSource.ok === null || time - varSource.ok > 3 * VAR_POLL_MS) return null;
@@ -311,8 +312,9 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     const pair = pairOf(key);
     if (!pair) return '配对已不在目录里';
     if (pair.identity === 'mismatch') return '两边价格相差超过 5%，已改判为规格不同';
-    if (!runtime.stream?.status(runtime.markets.length).connected) return null;
-    const healthyFrom = Math.max(startedAt, varHealthySince, runtime.stream.status(runtime.markets.length).connectedAt ?? time);
+    const streamFrom = runtime.stream?.healthySince() ?? null;
+    if (streamFrom === null) return null;
+    const healthyFrom = Math.max(startedAt, varHealthySince, streamFrom);
     if (time - Math.max(lastSample(key)?.t ?? -Infinity, healthyFrom) <= LOST_MS) return null;
     const closed = pair.kind !== 'crypto' && ['weekend', 'overnight'].includes(regimeOf(pair.kind, time));
     return `超过 ${LOST_MS / 60_000} 分钟没有新样本（${closed ? '可能休市；' : ''}Var 无报价或对手盘口缺失）`;

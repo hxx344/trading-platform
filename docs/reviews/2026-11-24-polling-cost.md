@@ -1,6 +1,6 @@
 # 2026-11-24 轮询开销与监控面板分块（v0.82.2）
 
-- 范围：提交 ec115fd 与其后的审查修复提交，相对 v0.82.1（6efbe30）。
+- 范围：提交 ec115fd、4678835（审查修复），相对 v0.82.1（6efbe30）。
   - `src/http.ts`、`src/read-view.ts`、`src/service/feishu.ts`
   - `web/src/App.tsx`、`web/src/MonitorPage.tsx`
   - `test/http.test.ts`、`test/read-view.test.ts`、`test/monitor-alerts.test.ts`、`test/news-feed.test.ts`
@@ -40,7 +40,7 @@
 - 浏览器：`scripts/dev-monitor.ts` 预览，无头 Chrome 在 1280 与 390 宽度依次打开六个监控页签、快讯、日志、运行状态、总览；无横向溢出，各面板分块在点开页签时才加载，控制台只有预览服务没有的接口 404（`/api/host`、`/api/update`、`/api/read-token`、`/api/asset/*`、`/api/logs`）。
 - GitHub CI（分支 `claude/polling-cost-v2`）：
   - [45242215228](https://github.com/hxx344/trading-platform/actions/runs/45242215228)（ec115fd，带 `measure_durations`）：`watch` 第一次在「损坏的部署被修复」一步失败，重跑通过，其余一次通过；本批没有改 `deploy/` 与巡检脚本，判断为偶发。
-  - 审查修复后的运行见提交信息。
+  - [45243181013](https://github.com/hxx344/trading-platform/actions/runs/45243181013)（4678835，审查修复后）：全部通过。
 
 ## 未运行
 

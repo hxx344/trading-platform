@@ -11,7 +11,7 @@ import {
   STRATEGY_ID, OrderOwnerConflict, VenueError, parseOrderReport, parseStrategyAck, parseStrategyReport, strategyRequestOf, supportsChase,
   type ChaseConnector, type ChaseRequest, type OrderReport, type OrderRequest, type StrategyIdentity, type StrategyReport, type StrategyStatus, type TransferConnector, type VenueConnector,
 } from './connector.ts';
-import type { Store } from './store.ts';
+import { JOB_MARKET_SQL, type Store } from './store.ts';
 import { nearestBarrels, quantityForBarrels, splitBarrels } from './barrels.ts';
 import { fillGapText, fillGaps, hedgeSkippedQuantity, type FillLeg } from './four-leg-fill.ts';
 import { midOf, proportionalHedge, quantityForNotional, splitSteps } from './hynix/sizing.ts';
@@ -2668,7 +2668,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     recentJobs: (limit = 20, market?: Market) => {
       const count = Math.min(Math.max(1, Math.trunc(limit)), 100);
       const rows = market
-        ? db.prepare(`SELECT id FROM jobs WHERE json_extract(json, '$.legs[0].symbol') IN (${MARKET_SYMBOLS[market].map(() => '?').join(', ')}) ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(...MARKET_SYMBOLS[market], count)
+        ? db.prepare(`SELECT id FROM jobs WHERE ${JOB_MARKET_SQL} IN (${MARKET_SYMBOLS[market].map(() => '?').join(', ')}) ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(...MARKET_SYMBOLS[market], count)
         : db.prepare('SELECT id FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?').all(count);
       // A four-leg job whose other job fell outside the limit brings it along, so the page always shows the group whole.
       const views = (rows as { id: string }[]).map(row => jobView(row.id));

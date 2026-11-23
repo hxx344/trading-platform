@@ -774,7 +774,8 @@ test('存储：已有 v3 库升级到 v4 只新增 ADL 四张表与索引，原�
     store.db.prepare("INSERT INTO commands VALUES ('r1', 'adl-config', 'd', 's', 'sim-pair', 1), ('r2', 'adl-restart', 'd', 's', 'i1', 1)").run();
     store.db.exec(ADL_ROLLBACK_SQL);
     assert.equal(store.schemaVersion(), 3);
-    assert.deepEqual(names(store.db), before);
+    // The read indexes are not part of any migration and stay through a rollback.
+    assert.deepEqual(names(store.db), [...before, ...READ_INDEXES.map(index => index.name)].sort());
     assert.deepEqual((store.db.prepare('SELECT request_id FROM commands').all() as { request_id: string }[]).map(row => row.request_id), ['r0']);
     assert.equal((store.db.prepare('SELECT COUNT(*) AS n FROM transfer_pairs').get() as { n: number }).n, 1);
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }

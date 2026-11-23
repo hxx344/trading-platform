@@ -229,7 +229,8 @@ DELETE FROM schema_migrations WHERE version = 4;
 
 - 旧版本可以直接打开带这两个索引的库，写入时由 SQLite 照常维护，回退不需要任何操作。想去掉时停服后执行 `DROP INDEX IF EXISTS aux_jobs_created; DROP INDEX IF EXISTS aux_jobs_market;`，只损失速度。
 - 建不成时（库正忙，或某一行任务的 JSON 无法解析）只在日志里写一行「未能建立读取索引」，服务照常启动，查询结果不变，下次打开再试。
-- 首次打开时建立索引要读一遍 `jobs` 表；之后每次保存任务多维护两个索引项。
+- 首次打开时建立索引要读一遍 `jobs` 表，库被别的进程占着写锁时每个索引最多等 5 秒。之后每次保存任务要对新旧 JSON 各算一次首腿合约并更新 `aux_jobs_market`，常见大小下是几十微秒。
+- `aux_jobs_market` 存在期间，`jobs.json` 写入非法 JSON 会被 SQLite 拒绝（代码里的写入都是 `JSON.stringify`）。停服手工修改某一行任务之前先删掉这个索引，下次启动会重建。
 - 这里只允许加索引，不加表和列。
 
 ## 已知限制

@@ -1228,7 +1228,8 @@ test('存储：已有 v2 库升级到 v3 只新增划转的两张表与两个索
     store.db.prepare("INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES ('r1', 'transfer-enable', 'd', 's', 'sim-pair', 1), ('r2', 'transfer-config', 'd', 's', 'sim-pair', 1)").run();
     store.db.exec(ROLLBACK_SQL);
     assert.equal(store.schemaVersion(), 2);
-    assert.deepEqual(names(store.db), before);
+    // The read indexes are not part of any migration and stay through a rollback.
+    assert.deepEqual(names(store.db), [...before, ...READ_INDEXES.map(index => index.name)].sort());
     assert.equal((store.db.prepare('SELECT COUNT(*) AS n FROM commands').get() as { n: number }).n, 0);
     assert.equal((store.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'legacy'").get() as { n: number }).n, 1);
   } finally { store.close(); }

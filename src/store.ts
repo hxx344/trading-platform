@@ -74,11 +74,13 @@ CREATE INDEX adl_batches_pair ON adl_batches(pair_id, created_at);
  * release opens a file that has them and keeps them up to date without knowing, and dropping one loses nothing but speed.
  * Add only indexes here, never tables or columns.
  */
+/** A job's market is its first leg's contract. The executor's recentJobs filters on this text and aux_jobs_market indexes it: one constant, so the two cannot drift apart. */
+export const JOB_MARKET_SQL = "json_extract(json, '$.legs[0].symbol')";
 export const READ_INDEXES: readonly { name: string; sql: string }[] = Object.freeze([
   // The latest jobs of all markets: walked newest first instead of sorting the whole table.
   { name: 'aux_jobs_created', sql: 'CREATE INDEX IF NOT EXISTS aux_jobs_created ON jobs(created_at)' },
-  // The latest jobs of one market (executor recentJobs): the expression is the one that query filters on, character for character.
-  { name: 'aux_jobs_market', sql: "CREATE INDEX IF NOT EXISTS aux_jobs_market ON jobs(json_extract(json, '$.legs[0].symbol'), created_at)" },
+  // The latest jobs of one market (executor recentJobs). While it exists, a jobs row whose json is not valid JSON is refused on write.
+  { name: 'aux_jobs_market', sql: `CREATE INDEX IF NOT EXISTS aux_jobs_market ON jobs(${JOB_MARKET_SQL}, created_at)` },
 ]);
 export const sqlHash = (sql: string): string => createHash('sha256').update(sql).digest('hex');
 

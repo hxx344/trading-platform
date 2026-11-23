@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { MIGRATIONS, READ_INDEXES, StoreError, openStore } from '../src/store.ts';
+import { JOB_MARKET_SQL, MIGRATIONS, READ_INDEXES, StoreError, openStore } from '../src/store.ts';
 
 function withDir(run: (file: string) => void) {
   const dir = mkdtempSync(join(tmpdir(), 'pa-store-'));
@@ -164,9 +164,9 @@ test('存储：读取索引不升结构版本，最近任务的两条查询都�
     for (let i = 0; i < 3; i++) insertJob(store.db, `hynix-${i}`, 100 + i, JSON.stringify({ legs: [{ symbol: 'SKHYNIXUSDT' }] }));
     // The two statements of the executor's recentJobs.
     const all = 'SELECT id FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?';
-    const market = "SELECT id FROM jobs WHERE json_extract(json, '$.legs[0].symbol') IN (?, ?) ORDER BY created_at DESC, rowid DESC LIMIT ?";
+    const market = `SELECT id FROM jobs WHERE ${JOB_MARKET_SQL} IN (?, ?) ORDER BY created_at DESC, rowid DESC LIMIT ?`;
     assert.match(planOf(store.db, all, 20), /USING (COVERING )?INDEX aux_jobs_created/);
-    assert.match(planOf(store.db, market, 'SKHYNIXUSDT', 'X', 20), /USING (COVERING )?INDEX aux_jobs_/);
+    assert.match(planOf(store.db, market, 'SKHYNIXUSDT', 'X', 20), /USING (COVERING )?INDEX aux_jobs_market/);
     assert.deepEqual((store.db.prepare(market).all('SKHYNIXUSDT', 'X', 20) as { id: string }[]).map(row => row.id), ['hynix-2', 'hynix-1', 'hynix-0']);
     assert.deepEqual((store.db.prepare(all).all(2) as { id: string }[]).map(row => row.id), ['hynix-2', 'hynix-1']);
   } finally { store.close(); }

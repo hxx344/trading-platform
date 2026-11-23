@@ -273,6 +273,21 @@ test('接口：没开快讯 404，循环开始前 503，之后返回快讯与异
     assert.equal(flash.connection.state, 'connecting');
     const moves = await (await get('/api/news/moves')).json() as { channels: unknown[] };
     assert.equal(moves.channels.length, 4);
+    // 展示读取的版本协商：列表没变回 204，但视图每次都照常生成（异动行情靠这次读取判断“有人在看”）。
+    let produced = 0;
+    const real = views.news;
+    views.news = { flash: () => { produced++; return real.flash(); }, moves: () => { produced++; return real.moves(); } };
+    for (const path of ['/api/news', '/api/news/moves']) {
+      const known = (path: string, version: string) => fetch(base + path, { headers: { cookie, 'x-pa-read-cache': version } });
+      const first = await known(path, '1');
+      assert.equal(first.status, 200);
+      const version = first.headers.get('x-pa-read-version')!;
+      assert.ok(version);
+      const before = produced, same = await known(path, version);
+      assert.equal(same.status, 204);
+      assert.equal(await same.text(), '');
+      assert.equal(produced, before + 1, '204 时也生成了视图');
+    }
   } finally { holder.feed?.close(); await new Promise(resolve => server.close(resolve)); h.dispose(); }
 });
 

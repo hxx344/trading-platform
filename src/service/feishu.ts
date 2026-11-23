@@ -461,8 +461,9 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
     try {
       const at = now();
       // Kept to the retention also without a robot (an outbox left after its robot was removed). Once an hour, and on the
-      // first flush after a start: the retention is seven days, and each DELETE scans its table.
-      if (at >= pruneAt) {
+      // first flush after a start: the retention is seven days, and each DELETE scans its table. A clock set back by
+      // more than the interval prunes at once instead of waiting for the old time to come round again.
+      if (at >= pruneAt || at < pruneAt - PRUNE_EVERY_MS) {
         pruneAt = at + PRUNE_EVERY_MS;
         db.prepare('DELETE FROM outbox WHERE created_at < ?').run(at - RETENTION_MS);
         db.prepare('DELETE FROM repeats WHERE at < ?').run(at - RETENTION_MS);

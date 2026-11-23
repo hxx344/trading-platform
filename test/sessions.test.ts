@@ -111,3 +111,80 @@ test('页面会话：退出或注销全部时文件写不进去，就删掉文�
   assert.equal(again.check(a), null);
   assert.equal(again.check(b), null);
 }));
+
+test('页面会话：文件既写不进也删不掉时原地改写；三者都失败则注销未落盘（persisted 为假），之后的写入补上，重启不复活', () => withDir(file => {
+  const lines: string[] = [];
+  const clock = { now: 1_000_000 };
+  const broken = { write: false, remove: false, overwrite: false };
+  const open = () => openSessionStore({ file, epoch: 'e', now: () => clock.now, log: line => lines.push(line),
+    writeTemp: (path, text) => { if (broken.write) throw new Error('EROFS: read-only file system'); writeFileSync(path, text, { mode: 0o600, flag: 'wx' }); },
+    removeFile: path => { if (broken.remove) throw new Error('EACCES: permission denied'); rmSync(path, { force: true }); },
+    overwrite: (path, text) => { if (broken.overwrite) throw new Error('EROFS: read-only file system'); writeFileSync(path, text); } });
+
+  // Directory read-only, file itself writable: overwritten in place, the logout holds across a restart.
+  let store = open();
+  const a = store.create(), b = store.create();
+  Object.assign(broken, { write: true, remove: true });
+  assert.equal(store.remove(a), true);
+  assert.equal(store.persisted(), true);
+  assert.match(lines.at(-1)!, /已原地改写/);
+  Object.assign(broken, { write: false, remove: false });
+  store = open();
+  assert.equal(store.check(a), null, '原地改写后重启不复活');
+  assert.ok(store.check(b));
+
+  // Nothing can be written: the logout is in memory only and says so.
+  const c = store.create();
+  Object.assign(broken, { write: true, remove: true, overwrite: true });
+  assert.equal(store.removeAll(), 2);
+  assert.equal(store.persisted(), false, '未落盘的注销不报告为已持久');
+  assert.equal(store.check(b), null, '当前进程仍拒绝被注销的会话');
+  assert.match(lines.at(-1)!, /服务重启后可能恢复/);
+  assert.doesNotMatch(lines.join('\n'), new RegExp(`${b}|${c}`), '日志不含 cookie');
+  // Logging out again while still broken: still not persisted.
+  assert.equal(store.remove(b), false);
+  assert.equal(store.persisted(), false);
+  // What a restart now would read back: the sessions are still in the file (the danger the flag reports).
+  assert.ok(open().check(c), '文件仍含旧会话：这正是 persisted() 为假时报告的风险');
+  // Storage back: the next write (a new login here) carries the removal, and a restart no longer revives them.
+  Object.assign(broken, { write: false, remove: false, overwrite: false });
+  const d = store.create();
+  assert.equal(store.persisted(), true);
+  assert.match(lines.join('\n'), /此前未落盘的退出与注销已生效/);
+  store = open();
+  assert.equal(store.check(b), null);
+  assert.equal(store.check(c), null);
+  assert.ok(store.check(d));
+}));
+
+test('页面会话：注销未落盘时，存储恢复后的请求与再次退出都会重试写入', () => withDir(file => {
+  const clock = { now: 1_000_000 };
+  let broken = false;
+  const fail = () => { if (broken) throw new Error('EROFS: read-only file system'); };
+  const open = () => openSessionStore({ file, epoch: 'e', now: () => clock.now, log: () => undefined,
+    writeTemp: (path, text) => { fail(); writeFileSync(path, text, { mode: 0o600, flag: 'wx' }); },
+    removeFile: path => { fail(); rmSync(path, { force: true }); },
+    overwrite: (path, text) => { fail(); writeFileSync(path, text); } });
+  const store = open();
+  const a = store.create(), b = store.create();
+  broken = true;
+  assert.equal(store.remove(a), true);
+  assert.equal(store.persisted(), false);
+  broken = false;
+  // A request within the retry interval does not write; one after it does.
+  assert.ok(store.check(b));
+  assert.equal(store.persisted(), false);
+  clock.now += 60_000;
+  assert.ok(store.check(b));
+  assert.equal(store.persisted(), true);
+  assert.equal(open().check(a), null);
+
+  // Logging the same browser out again also retries.
+  broken = true;
+  assert.equal(store.remove(b), true);
+  assert.equal(store.persisted(), false);
+  broken = false;
+  assert.equal(store.remove(b), false);
+  assert.equal(store.persisted(), true);
+  assert.equal(open().check(b), null);
+}));

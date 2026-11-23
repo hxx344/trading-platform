@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { api } from './api.ts';
+import { api, ApiError } from './api.ts';
 import { ImportPanel } from './ImportPanel.tsx';
 import { ReadTokenSettings } from './ReadTokenSettings.tsx';
 import { READ_TOKEN_PATH, READ_TOKEN_REFRESH_MS, type ReadTokenView } from './read-token-form.ts';
@@ -88,7 +88,12 @@ function SessionSettings({ onExpired }: { onExpired: () => void }) {
     try {
       await api(all ? '/api/session/logout-all' : '/api/session/logout', { body: {} });
       window.location.assign('/');
-    } catch (failure) { setError(errorText(failure)); setBusy(false); }
+    } catch (failure) {
+      // Gone from the running service but not from disk: the cookie is already cleared, so the page would soon fall back
+      // to the login form and hide an inline message. Say it before leaving.
+      if (failure instanceof ApiError && failure.code === 'session_not_persisted') { window.alert(failure.message); window.location.assign('/'); return; }
+      setError(errorText(failure)); setBusy(false);
+    }
   };
   return <section className="panel" aria-label="登录会话">
     <div className="section-head"><h2>登录会话</h2><span className="small-note">{data ? `共 ${data.count} 个会话` : '读取中'}</span></div>

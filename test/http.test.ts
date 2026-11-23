@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { request as httpRequest } from 'node:http';
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
@@ -344,6 +344,41 @@ test('HTTP：页面导入只在服务提供时开放，读写都要会话与请�
   } finally {
     await new Promise(resolve => server.close(resolve));
     await new Promise(resolve => plain.server.close(resolve));
+    h.dispose();
+  }
+});
+
+test('HTTP：会话文件写入与删除都失败时，退出与注销全部返回 500 且清 cookie，不报告为已注销；存储恢复后再操作成功', async () => {
+  const h = createHarness();
+  const lines: string[] = [];
+  let broken = false;
+  const fail = () => { if (broken) throw new Error('EROFS: read-only file system'); };
+  const sessions = openSessionStore({ file: join(h.dir, 'http-session'), epoch: 'e', log: line => lines.push(line),
+    writeTemp: (path, text) => { fail(); writeFileSync(path, text, { mode: 0o600, flag: 'wx' }); },
+    removeFile: path => { fail(); rmSync(path, { force: true }); },
+    overwrite: (path, text) => { fail(); writeFileSync(path, text); } });
+  const server = createExecutorServer({ executor: h.ex, accessToken: TOKEN, sessions, log: line => lines.push(line) });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const first = await login(base), second = await login(base);
+    broken = true;
+    const out = await post(base, '/api/session/logout', {}, { cookie: first });
+    assert.equal(out.status, 500);
+    assert.equal((await out.json() as { code: string }).code, 'session_not_persisted');
+    assert.match(out.headers.get('set-cookie') ?? '', /Max-Age=0/);
+    assert.equal((await fetch(base + '/api/state', { headers: { cookie: first } })).status, 401, '当前进程已拒绝');
+    const all = await post(base, '/api/session/logout-all', {}, { cookie: second });
+    assert.equal(all.status, 500);
+    assert.ok(!lines.some(line => line.startsWith('已注销全部')), '没有写成已注销');
+    assert.ok(!lines.some(line => line.includes(first.split('=')[1]!) || line.includes(second.split('=')[1]!)), '日志不含 cookie');
+    broken = false;
+    const third = await login(base);
+    const done = await post(base, '/api/session/logout-all', {}, { cookie: third });
+    assert.equal(done.status, 200);
+    assert.equal(sessions.persisted(), true);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
     h.dispose();
   }
 });

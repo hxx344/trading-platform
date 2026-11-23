@@ -486,6 +486,12 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
       exactKeys(await readJson(request), []);
       const all = url.pathname.endsWith('-all');
       const removed = all ? sessions.removeAll() : Number(sessions.remove(cookieValue(request) ?? ''));
+      // The sessions are gone from this process either way, so the cookie is cleared either way. Only a removal on disk
+      // is reported as done: otherwise a restart would bring them back (sessions.ts persisted()).
+      if (!sessions.persisted()) {
+        log(`${all ? `注销全部 ${removed} 个页面会话` : '页面会话退出'}未能写入会话文件，服务重启后可能恢复（来自 ${clientAddress(request)}）`);
+        return send(response, 500, { code: 'session_not_persisted', message: `${all ? '已注销的会话' : '本会话'}在当前服务中已失效，但会话文件写入和删除都失败，服务重启后可能恢复。请检查数据目录的写权限后再操作一次，或在重启服务前手动删除数据目录中的 http-session 文件。` }, { 'set-cookie': clearedCookie(request) });
+      }
       log(`${all ? `已注销全部 ${removed} 个页面会话` : '页面会话已退出'}（来自 ${clientAddress(request)}）`);
       return send(response, 200, { removed }, { 'set-cookie': clearedCookie(request) });
     }

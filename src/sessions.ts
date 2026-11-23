@@ -42,6 +42,11 @@ export interface SessionStore {
   remove(token: string): boolean;
   /** Ends every session; how many there were. */
   removeAll(): number;
+  /**
+   * False while a removal (logout, logout-all, expiry) is only in memory: the file could be neither replaced, deleted
+   * nor overwritten, so a restart would bring the removed sessions back. Every later write retries it.
+   */
+  persisted(): boolean;
   count(): number;
   /** The cookie's Max-Age in seconds; undefined for a store that does not outlive the process (a browser-session cookie). */
   readonly maxAgeS: number | undefined;
@@ -64,10 +69,19 @@ export interface SessionStoreOptions {
   log?: (line: string) => void;
   /** Writes the new file's text to a temporary path (tests make it fail). */
   writeTemp?: (path: string, text: string) => void;
+  /** Deletes the file when the new one cannot replace it (tests make it fail). */
+  removeFile?: (path: string) => void;
+  /** Overwrites the file in place, the last resort when it can be neither replaced nor deleted (tests make it fail). */
+  overwrite?: (path: string, text: string) => void;
 }
 
+/** While a removal is not on disk, check() retries the write at most this often. */
+const RETRY_PERSIST_MS = 60_000;
+
 export function openSessionStore({ file, epoch = '', seed = [], now = Date.now, log = line => process.stderr.write(`${line}\n`),
-  writeTemp = (path, text) => writeFileSync(path, text, { mode: 0o600, flag: 'wx' }) }: SessionStoreOptions = {}): SessionStore {
+  writeTemp = (path, text) => writeFileSync(path, text, { mode: 0o600, flag: 'wx' }),
+  removeFile = path => rmSync(path, { force: true }),
+  overwrite = (path, text) => writeFileSync(path, text, { mode: 0o600 }) }: SessionStoreOptions = {}): SessionStore {
   const sessions = new Map<string, Entry>();
   const permanent = new Set<string>();
   for (const token of seed) {
@@ -76,6 +90,8 @@ export function openSessionStore({ file, epoch = '', seed = [], now = Date.now, 
     sessions.set(key, { executorId: executorSessionId(token), createdAt: now(), seenAt: now(), writtenSeenAt: now() });
   }
   let dirty = false;
+  /** When a removal that is only in memory began (persisted()), and when the file was last written. */
+  let pendingSince: number | null = null, lastAttempt = 0;
   if (file) dirty = load(file);
 
   function load(path: string): boolean {
@@ -101,25 +117,43 @@ export function openSessionStore({ file, epoch = '', seed = [], now = Date.now, 
     } catch { return true; }
   }
 
-  /** `ending`: the write drops sessions (logout, expiry); if it fails the file goes, so a restart cannot bring them back. */
+  /**
+   * `ending`: the write drops sessions (logout, expiry). If the file cannot be replaced it is deleted, and failing that
+   * overwritten in place, so a restart cannot bring them back; if all three fail the removal stays pending (persisted()
+   * false) and every later write retries it.
+   */
   function save(ending = false): void {
     dirty = false;
     if (!file) return;
+    if (pendingSince !== null) ending = true;
+    lastAttempt = now();
     const rows = [...sessions].filter(([key]) => !permanent.has(key)).map(([key, entry]) => {
       entry.writtenSeenAt = entry.seenAt;
       return { key, executorId: entry.executorId, createdAt: entry.createdAt, seenAt: entry.seenAt };
     });
+    const text = `${JSON.stringify({ version: FILE_VERSION, epoch, sessions: rows })}\n`;
     const temp = join(dirname(file), `.${basename(file)}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
+    const settled = (line?: string) => {
+      if (line) log(line);
+      if (pendingSince !== null) log('页面会话文件已更新，此前未落盘的退出与注销已生效');
+      pendingSince = null;
+    };
     try {
-      writeTemp(temp, `${JSON.stringify({ version: FILE_VERSION, epoch, sessions: rows })}\n`);
+      writeTemp(temp, text);
       renameSync(temp, file);
+      settled();
+      return;
     } catch (error) {
       try { rmSync(temp, { force: true }); } catch { /* nothing more to do */ }
       const reason = error instanceof Error ? error.message.slice(0, 160) : String(error);
       if (!ending) { log(`页面会话文件写入失败：${reason}`); return; }
       // The file still lists the ended sessions: without it a restart logs every browser out instead of reviving them.
-      try { rmSync(file, { force: true }); log(`页面会话文件写入失败，已删除该文件（下次重启后需重新登录）：${reason}`); }
-      catch { log(`页面会话文件写入失败且无法删除，重启前请手动删除 ${basename(file)}：${reason}`); }
+      try { removeFile(file); settled(`页面会话文件写入失败，已删除该文件（下次重启后需重新登录）：${reason}`); return; } catch { /* try in place */ }
+      // A directory the service can no longer write to may still leave the file itself writable. Not atomic: a torn
+      // write reads as malformed on load, which drops every session rather than reviving any.
+      try { overwrite(file, text); settled(`页面会话文件无法替换或删除，已原地改写：${reason}`); return; } catch { /* nothing more to do */ }
+      if (pendingSince === null) pendingSince = now();
+      log(`页面会话文件写入失败且无法删除或改写，已退出的会话在服务重启后可能恢复；请修复数据目录写权限，或在重启前手动删除 ${basename(file)}：${reason}`);
     }
   }
 
@@ -152,13 +186,17 @@ export function openSessionStore({ file, epoch = '', seed = [], now = Date.now, 
       if (!permanent.has(key)) {
         if (at >= expiresAt(entry)) { sessions.delete(key); save(true); return null; }
         entry.seenAt = at;
-        if (at - entry.writtenSeenAt >= SEEN_WRITE_MS) save();
+        if (at - entry.writtenSeenAt >= SEEN_WRITE_MS || (pendingSince !== null && at - lastAttempt >= RETRY_PERSIST_MS)) save();
       }
       return { id: entry.executorId, createdAt: entry.createdAt, seenAt: entry.seenAt, expiresAt: permanent.has(key) ? Number.MAX_SAFE_INTEGER : expiresAt(entry) };
     },
     remove(token: string): boolean {
       const key = digest(token);
-      if (!sessions.delete(key)) return false;
+      if (!sessions.delete(key)) {
+        // Logging out again after a removal that did not reach the file retries the write.
+        if (pendingSince !== null) save(true);
+        return false;
+      }
       permanent.delete(key);
       save(true);
       return true;
@@ -169,6 +207,7 @@ export function openSessionStore({ file, epoch = '', seed = [], now = Date.now, 
       save(true);
       return count;
     },
+    persisted: () => pendingSince === null,
     count: () => sessions.size,
   };
 }

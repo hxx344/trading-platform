@@ -55,7 +55,7 @@
 ## 已运行
 
 - `pnpm check`、`pnpm build:web`：通过。
-- 分支上手动运行的 ci，都含 6 个测试分片、3 组安装测试、5 组真实 systemd 验收：提交 6da41d3（第一轮审查前）全部通过，https://github.com/hxx344/trading-platform/actions/runs/45224188527 ；提交 3cb9b94（第一轮修复后）全部通过，https://github.com/hxx344/trading-platform/actions/runs/45226410204 。第二轮修复后的结果由主线 ci 把关，见发布提交。
+- 分支上手动运行的 ci，都含 6 个测试分片、3 组安装测试、5 组真实 systemd 验收：提交 6da41d3（第一轮审查前）全部通过，https://github.com/hxx344/trading-platform/actions/runs/45224188527 ；提交 3cb9b94（第一轮修复后）全部通过，https://github.com/hxx344/trading-platform/actions/runs/45226410204 。提交 1d49ebf（第二轮修复后）全部通过，https://github.com/hxx344/trading-platform/actions/runs/45227608809 。之后变基到 main 的 e9c59cb（只多了 Claude Code 配置与文档，没有代码），变基后本机重跑了 `pnpm check` 与 `pnpm build:web`，全量测试由主线 ci 把关。
 - 浏览器验证（`node scripts/dev-varlighter.ts` 替身预览，实盘准备页，1280 与 375 宽）：「Var token 询价」一行显示「未配置 · 还没有成功过」、计数与提示；「Var 报价时效」与「Var 下单接口」两项的新文案；375 宽无横向溢出。控制台只有预览脚本没提供的接口的 404。
 
 ## 未运行

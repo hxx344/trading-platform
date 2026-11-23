@@ -26,6 +26,27 @@ const plainObject = (value: unknown): value is Record<string, unknown> => !!valu
 const sameKeys = (value: unknown, names: string[]): value is Record<string, unknown> => plainObject(value) && Object.keys(value).length === names.length && names.every(name => Object.hasOwn(value, name));
 const jwtCookie = (value: string | null): boolean => typeof value === 'string' && value.length <= 8201 && /^vr-token=[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
 
+/**
+ * The only instruments an indicative quote may name, rebuilt field by field (scripts/variational-request.py checks again):
+ * the oil pair as before (M-3d), and since v0.82.0 the three shapes the Var/Lighter module quotes (docs/varlighter.md 第 3 节).
+ */
+const UNDERLYING = /^[A-Z0-9]{1,16}$/;
+function indicativeInstrument(definition: unknown): Record<string, string | number> {
+  if (!plainObject(definition) || typeof definition.underlying !== 'string' || !UNDERLYING.test(definition.underlying) || definition.settlement_asset !== 'USDC') throw invalid();
+  if (definition.instrument_type === 'perpetual_rwa_future' && sameKeys(definition, ['underlying', 'instrument_type', 'settlement_asset', 'kind']) && (definition.kind === 'commodity' || definition.kind === 'equity')) {
+    return { underlying: definition.underlying, instrument_type: 'perpetual_rwa_future', settlement_asset: 'USDC', kind: definition.kind };
+  }
+  if (definition.instrument_type === 'perpetual_future' && sameKeys(definition, ['underlying', 'instrument_type', 'settlement_asset', 'funding_interval_s']) && definition.funding_interval_s === 3600) {
+    return { underlying: definition.underlying, instrument_type: 'perpetual_future', settlement_asset: 'USDC', funding_interval_s: 3600 };
+  }
+  throw invalid();
+}
+/** A positive decimal with at most 12 integer and 8 fraction digits. */
+function indicativeQty(qty: unknown): string {
+  if (typeof qty !== 'string' || !/^(?:0|[1-9]\d{0,11})(?:\.\d{1,8})?$/.test(qty) || !/[1-9]/.test(qty)) throw invalid();
+  return qty;
+}
+
 function requestPayload(input: string, init: RequestInit): string {
   try {
     const url = new URL(input), path = url.pathname + url.search, method = PATHS.get(path);
@@ -46,9 +67,9 @@ function requestPayload(input: string, init: RequestInit): string {
     let body: unknown = null;
     if (method === 'POST') {
       if (typeof init.body !== 'string' || Buffer.byteLength(init.body) > 16_384) throw invalid();
-      const submitted: unknown = JSON.parse(init.body), definition = plainObject(submitted) ? submitted.instrument : undefined;
-      if (!sameKeys(submitted, ['instrument', 'qty']) || submitted.qty !== '1' || !sameKeys(definition, ['underlying', 'instrument_type', 'settlement_asset', 'kind']) || !['BZ', 'CL'].includes(definition.underlying as string) || definition.instrument_type !== 'perpetual_rwa_future' || definition.settlement_asset !== 'USDC' || definition.kind !== 'commodity') throw invalid();
-      body = { instrument: { underlying: definition.underlying, instrument_type: 'perpetual_rwa_future', settlement_asset: 'USDC', kind: 'commodity' }, qty: '1' };
+      const submitted: unknown = JSON.parse(init.body);
+      if (!sameKeys(submitted, ['instrument', 'qty'])) throw invalid();
+      body = { instrument: indicativeInstrument(submitted.instrument), qty: indicativeQty(submitted.qty) };
       headers['Content-Type'] = 'application/json';
     } else if (init.body !== undefined && init.body !== null) throw invalid();
     return JSON.stringify({ url: `${ORIGIN}${path}`, method, headers, body });

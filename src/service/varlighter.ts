@@ -1,12 +1,16 @@
 // Var/Lighter 价差模块接进执行服务（docs/varlighter.md）：与 EQN 快讯一样默认开启，config.json 写 `"varLighter": false` 关闭。
-// 模块只读公开行情、只写自己的 varlighter.sqlite，打不开库或采集出错都不影响执行服务本身。
+// 模块只读公开行情与（有 Var token 时）登录后的询价、只写自己的 varlighter.sqlite，打不开库或采集出错都不影响执行服务本身。
 import { join } from 'node:path';
 import { createVarLighterEngine, VarLighterError, type VarLighterEngine } from '../varlighter/engine.ts';
 import type { Connect, FetchLike } from '../varlighter/feeds.ts';
 import { openVarLighterStore, VARLIGHTER_FILE } from '../varlighter/store.ts';
 import { ParamsError } from '../varlighter/strategy.ts';
+import { createVarQuoter } from '../varlighter/varquote.ts';
+import { createVariationalFetch } from '../monitor/variational-transport.ts';
+import type { VariationalFetcher } from '../vendor/variational-market.mjs';
 
-export interface VarLighterOptions { fetchImpl?: FetchLike; connect?: Connect; now?: () => number }
+/** `variationalFetch`：Var token 询价的传输（默认经 python3 传输脚本），测试里换成替身。 */
+export interface VarLighterOptions { fetchImpl?: FetchLike; connect?: Connect; now?: () => number; variationalFetch?: VariationalFetcher }
 export interface VarLighterHolder { engine: VarLighterEngine | null; error: string | null }
 
 export interface VarLighterViews {
@@ -24,7 +28,10 @@ export interface VarLighterViews {
 export function openVarLighter(dir: string, options: VarLighterOptions, log: (line: string) => void): VarLighterHolder {
   try {
     const store = openVarLighterStore(join(dir, VARLIGHTER_FILE));
-    return { engine: createVarLighterEngine({ store, ...options, log }), error: null };
+    const { variationalFetch, ...engineOptions } = options;
+    // token 文件（行情监控保存的那一份）在数据目录里；没有文件时询价不发任何请求。
+    const quoter = createVarQuoter({ dir, fetcher: variationalFetch ?? createVariationalFetch(), ...(options.now ? { now: options.now } : {}) });
+    return { engine: createVarLighterEngine({ store, ...engineOptions, log, quoter }), error: null };
   } catch (error) {
     const message = error instanceof Error ? error.message.slice(0, 200) : String(error);
     log(`varlighter: 打不开 ${VARLIGHTER_FILE}，模块停用：${message}`);

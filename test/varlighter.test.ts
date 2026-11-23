@@ -2,12 +2,15 @@
 // 行情都是假的：fetch 与 WebSocket 由测试替换，不连任何外部服务。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { COST_BLOCK, DECAYED, FALLBACK_BLOCK, NO_LIVE_TOP, THIN_BLOCK, closeSpread, confirmOpen, expectedNetBps, slippageBudgetBps } from '../src/varlighter/strategy.ts';
-import { executionSample } from '../src/varlighter/model.ts';
+import { executionSample, hasTokenQuote } from '../src/varlighter/model.ts';
+import { TOKEN_QUOTE_MAX_AGE_MS, createVarQuoter, parseTokenQuote, quoteQty, varInstrument, type VarQuoter } from '../src/varlighter/varquote.ts';
+import { VARIATIONAL_SESSION_FILE } from '../src/monitor/variational-session.ts';
+import { fakeVariationalToken } from './monitor-fake.ts';
 import { pairMarkets, parsePairKey, parseRhMarkets, parseVarListings, parseVarQuote, regimeOf, spreadOf, midBasis, type Sample } from '../src/varlighter/model.ts';
 import { BaselineTracker, RollingWindow, regimeStats, suggestedEntryBps } from '../src/varlighter/stats.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, closePosition, decide, openBlocker, openPosition, positionSpread, readGlobalParams, readSymbolParams, type Position, type SymbolParams } from '../src/varlighter/strategy.ts';
@@ -25,7 +28,7 @@ function sample(t: number, varMid: number, rhMid = 100, extra: Partial<Sample> =
     symbol: 'BTC', t, receivedAt: t + 1_000, regime: 'all', varMark: varMid,
     varBid0: varMid - 0.01, varAsk0: varMid + 0.01, varBid1k: varMid - 0.02, varAsk1k: varMid + 0.02, varBid100k: varMid - 0.05, varAsk100k: varMid + 0.05, varFunding: 0.1,
     rhAt: t - 500, rhBid0: rhMid - 0.01, rhAsk0: rhMid + 0.01, rhMark: rhMid, rhIndex: rhMid, rhFunding: 0.0001,
-    rhBid1k: rhMid - 0.02, rhAsk1k: rhMid + 0.02, rhBid100k: null, rhAsk100k: null, rhBidRx: rhMid - 0.01, rhAskRx: rhMid + 0.01, ...extra,
+    rhBid1k: rhMid - 0.02, rhAsk1k: rhMid + 0.02, rhBid100k: null, rhAsk100k: null, rhBidRx: rhMid - 0.01, rhAskRx: rhMid + 0.01, varBidTk: null, varAskTk: null, varTkAt: null, ...extra,
   };
 }
 
@@ -944,4 +947,263 @@ test('样本库：过期样本分批删、只删保留期以前的；近期计�
     assert.equal(store.firstSampleAt(), T0 - 60_000);
     assert.equal(store.firstAt('rh:A'), T0 - 60_000);
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+// —— Var token 询价（v0.82.0，docs/varlighter.md 第 3 节）——
+
+test('Var 询价：各类别的合约写法、名义金额折数量、应答核对标的、数量、价格与时刻', () => {
+  assert.deepEqual(varInstrument('crypto', 'BTC'), { underlying: 'BTC', instrument_type: 'perpetual_future', settlement_asset: 'USDC', funding_interval_s: 3600 });
+  assert.deepEqual(varInstrument('equity', 'AAPL'), { underlying: 'AAPL', instrument_type: 'perpetual_rwa_future', settlement_asset: 'USDC', kind: 'equity' });
+  assert.deepEqual(varInstrument('commodity', 'CL'), { underlying: 'CL', instrument_type: 'perpetual_rwa_future', settlement_asset: 'USDC', kind: 'commodity' });
+  assert.equal(varInstrument('other', 'XYZ'), null, '没确认过写法的类别不询价');
+  assert.equal(varInstrument('crypto', 'btc/usd'), null);
+  assert.deepEqual([quoteQty(1000, 100.2), quoteQty(1000, 65_000), quoteQty(1000, 0.00012345), quoteQty(500, 250)], ['9.98', '0.01538', '8100000', '2']);
+  assert.deepEqual([quoteQty(1000, 0), quoteQty(1000, NaN), quoteQty(10, 1e12), quoteQty(-5, 10), quoteQty(1e15, 1)], [null, null, null, null, null]);
+
+  const instrument = varInstrument('crypto', 'BTC')!;
+  const answer = (extra: Record<string, unknown> = {}) => ({ instrument, qty: '9.98', bid: '100.19', ask: '100.21', mark_price: '100.2', timestamp: new Date(T0 - 400).toISOString(), ...extra });
+  assert.deepEqual(parseTokenQuote(answer(), instrument, '9.98', T0), { bid: 100.19, ask: 100.21, mark: 100.2, qty: 9.98, at: T0 - 400, receivedAt: T0 });
+  assert.equal(parseTokenQuote(answer({ qty: 9.98 }), instrument, '9.98', T0).qty, 9.98, '数量按数值比较');
+  for (const wrong of [{ qty: '1' }, { instrument: { ...instrument, underlying: 'ETH' } }, { instrument: { ...instrument, instrument_type: 'perpetual_rwa_future' } }, { instrument: null }]) {
+    assert.throws(() => parseTokenQuote(answer(wrong), instrument, '9.98', T0), /标的或数量与请求不符/);
+  }
+  for (const wrong of [{ ask: '100.18' }, { bid: '0' }, { bid: null }, { mark_price: 'x' }, { ask: [] }]) assert.throws(() => parseTokenQuote(answer(wrong), instrument, '9.98', T0), /价格无效/);
+  for (const stamp of [new Date(T0 - TOKEN_QUOTE_MAX_AGE_MS - 1).toISOString(), new Date(T0 + 2_001).toISOString(), '2026-11-23T15:00:00', 'x', 1]) {
+    assert.throws(() => parseTokenQuote(answer({ timestamp: stamp }), instrument, '9.98', T0), /时间无效或已过期/);
+  }
+  assert.throws(() => parseTokenQuote(null, instrument, '9.98', T0), /标的或数量与请求不符/);
+});
+
+test('Var 询价器：没有 token 不发请求；被拒的 token 不再用、换新后恢复；被拦截只标暂不可用；应答不对不算 token 的问题；请求途中换 token 不误判', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-token-'));
+  const file = path.join(dir, VARIATIONAL_SESSION_FILE);
+  const save = (token: string, revision: number) => writeFileSync(file, JSON.stringify({ version: 1, revision, token, updatedAt: new Date(T0).toISOString() }), { mode: 0o600 });
+  let clock = T0;
+  const sent: { url: string; cookie: string; body: unknown }[] = [];
+  let reply: () => Response | Promise<Response> = () => new Response('{}');
+  const fetcher = async (url: string | URL | Request, init?: RequestInit) => {
+    sent.push({ url: String(url), cookie: String((init?.headers as Record<string, string>).Cookie), body: JSON.parse(String(init?.body)) });
+    return reply();
+  };
+  const good = (extra: Record<string, unknown> = {}) => Response.json({ instrument: varInstrument('crypto', 'BTC'), qty: '9.98', bid: '100.19', ask: '100.21', mark_price: '100.2', timestamp: new Date(clock - 400).toISOString(), ...extra });
+  const quoter = createVarQuoter({ dir, fetcher: fetcher as typeof fetch, now: () => clock });
+  const ask = () => quoter.quote('crypto', 'BTC', 1000, 100.2, AbortSignal.timeout(1000));
+  try {
+    assert.deepEqual([quoter.usable(), quoter.view().status, quoter.view().statusName], [false, 'missing', '未配置']);
+    await assert.rejects(ask(), /没有可用的 Var token/);
+    assert.equal(sent.length, 0);
+
+    const first = fakeVariationalToken(T0 + 86_400_000, 'a'), second = fakeVariationalToken(T0 + 2 * 86_400_000, 'b');
+    save(first, 1);
+    assert.deepEqual([quoter.usable(), quoter.view().status, quoter.view().expiresAt], [true, 'ready', Math.floor((T0 + 86_400_000) / 1000) * 1000]);
+    reply = () => good();
+    assert.deepEqual(await ask(), { bid: 100.19, ask: 100.21, mark: 100.2, qty: 9.98, at: T0 - 400, receivedAt: T0 });
+    assert.deepEqual(sent[0], { url: 'https://omni.variational.io/api/quotes/indicative', cookie: `vr-token=${first}`, body: { instrument: varInstrument('crypto', 'BTC'), qty: '9.98' } });
+    assert.deepEqual([quoter.view().okAt, quoter.view().lagMs, quoter.view().error], [T0, 400, null]);
+    assert.ok(!JSON.stringify(quoter.view()).includes(first), '状态里不带 token');
+    await assert.rejects(quoter.quote('other', 'XYZ', 1000, 10, AbortSignal.timeout(1000)), /格式未确认/);
+    await assert.rejects(quoter.quote('crypto', 'BTC', 1000, 0, AbortSignal.timeout(1000)), /算不出询价数量/);
+    assert.equal(sent.length, 1);
+
+    // 应答读到了但内容不对：记下原因，token 仍可用。
+    reply = () => good({ qty: '1' });
+    await assert.rejects(ask(), /标的或数量与请求不符/);
+    assert.deepEqual([quoter.usable(), quoter.view().status, quoter.view().error], [true, 'ready', 'Var 询价应答的标的或数量与请求不符']);
+
+    // 被拦截（403 或 Cloudflare 质询）：暂不可用，下一轮照常再试，成功后恢复。
+    reply = () => new Response('', { status: 403 });
+    await assert.rejects(ask(), /被拦截/);
+    assert.deepEqual([quoter.usable(), quoter.view().status], [true, 'unavailable']);
+    assert.match(quoter.view().error ?? '', /被拦截/);
+    reply = () => good();
+    await ask();
+    assert.deepEqual([quoter.view().status, quoter.view().error], ['ready', null]);
+
+    // 401 且 x-omni-auth: r：这个 token 不再用，也不再发请求；文件换成新 token 后恢复。
+    reply = () => new Response('', { status: 401, headers: { 'x-omni-auth': 'r' } });
+    await assert.rejects(ask(), /未通过会话认证/);
+    assert.deepEqual([quoter.usable(), quoter.view().status, quoter.view().statusName], [false, 'rejected', '会话已失效']);
+    const before = sent.length;
+    await assert.rejects(ask(), /没有可用的 Var token/);
+    assert.equal(sent.length, before);
+    save(second, 2);
+    reply = () => good();
+    await ask();
+    assert.deepEqual([quoter.view().status, sent.at(-1)!.cookie], ['ready', `vr-token=${second}`]);
+
+    // 请求途中文件换了 token：旧 token 的拒绝不落到新 token 上（L089）。
+    let release = (_: Response) => {};
+    reply = () => new Promise<Response>(resolve => { release = resolve; });
+    const pending = ask();
+    await new Promise(resolve => setImmediate(resolve));
+    const third = fakeVariationalToken(T0 + 3 * 86_400_000, 'c');
+    save(third, 3);
+    release(new Response('', { status: 401, headers: { 'x-omni-auth': 'r' } }));
+    await assert.rejects(pending, /未通过会话认证/);
+    assert.deepEqual([quoter.usable(), quoter.view().status], [true, 'ready']);
+
+    // 临近到期与文件损坏。
+    clock = T0 + 3 * 86_400_000;
+    assert.deepEqual([quoter.usable(), quoter.view().status], [false, 'expired']);
+    clock = T0;
+    writeFileSync(file, 'not json', { mode: 0o600 });
+    assert.deepEqual([quoter.usable(), quoter.view().status], [false, 'missing']);
+    assert.match(quoter.view().error ?? '', /无法读取或内容无效/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('判断时刻的样本：有 Var 询价时 Var 各档都换成询价，询价不完整或倒挂时不换', () => {
+  const base = sample(T0, 100.3, 100, { rhBidRx: 100.04, rhAskRx: 100.06 });
+  const quoted = executionSample({ ...base, varBidTk: 100.11, varAskTk: 100.13, varTkAt: T0 + 900 })!;
+  assert.deepEqual([quoted.varBid0, quoted.varAsk0, quoted.varBid1k, quoted.varAsk1k, quoted.varBid100k, quoted.varAsk100k], [100.11, 100.13, 100.11, 100.13, 100.11, 100.13]);
+  assert.equal(quoted.rhAsk0, 100.06, 'Lighter 一侧照旧换成判断时刻的一档');
+  for (const extra of [{ varBidTk: 100.11 }, { varAskTk: 100.13 }, { varBidTk: 100.2, varAskTk: 100.1 }, { varBidTk: 0, varAskTk: 100.1 }] as Partial<Sample>[]) {
+    assert.equal(executionSample({ ...base, ...extra })!.varBid1k, base.varBid1k);
+    assert.equal(hasTokenQuote({ ...base, ...extra }), false);
+  }
+  assert.equal(hasTokenQuote({ ...base, varBidTk: 100.11, varAskTk: 100.13 }), true);
+  assert.equal(executionSample({ ...base, rhBidRx: null, varBidTk: 100.11, varAskTk: 100.13 }), null, '没有 Lighter 一档时仍不出判断时刻的样本');
+  // 开仓复核与平仓都按询价：公开报价偏贵 26 基点，询价只剩约 6 基点时不开。
+  const params: SymbolParams = { ...DEFAULT_SYMBOL, enabled: true, entryBps: 10, exitBps: 0, regimes: ['all'] };
+  const baseline = { regime: 'all' as const, median: 0, sigma: 2, samples: 500, since: T0, fallback: false };
+  const decision = decide(base, baseline, params, null);
+  assert.equal(decision.kind, 'open');
+  if (decision.kind !== 'open') return;
+  assert.equal(confirmOpen({ ...base, varBidTk: 100.11, varAskTk: 100.13 }, baseline, params, decision, true), DECAYED);
+  const confirmed = confirmOpen({ ...base, varBidTk: 100.25, varAskTk: 100.27 }, baseline, params, decision, true);
+  assert.ok(typeof confirmed !== 'string');
+  if (typeof confirmed === 'string') return;
+  const position = openPosition('p1', confirmed.sample, params, confirmed.decision, baseline);
+  assert.equal(position.varEntry, 100.25);
+  const later = sample(T0 + 60_000, 100.0, 100, { varBidTk: 100.02, varAskTk: 100.04 });
+  const spread = closeSpread(later, position, positionSpread(later, position.notionalUsd)!);
+  assert.equal(closePosition(position, later.t, spread, 'revert', { slippageBps: 1, varFeeBps: 0, rhFeeBps: 0 }, null).varExit, 100.04);
+});
+
+test('样本库升级：v0.81 的库补上 Var 询价的三列，旧样本读成空，新样本读回，重复打开不报错', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-'));
+  const file = path.join(dir, 'varlighter.sqlite');
+  try {
+    const old = new DatabaseSync(file);
+    old.exec(`CREATE TABLE samples (symbol TEXT NOT NULL, t INTEGER NOT NULL, received_at INTEGER NOT NULL, regime TEXT NOT NULL,
+      var_mark REAL NOT NULL, var_bid0 REAL NOT NULL, var_ask0 REAL NOT NULL, var_bid1k REAL NOT NULL, var_ask1k REAL NOT NULL, var_bid100k REAL, var_ask100k REAL, var_funding REAL,
+      rh_at INTEGER NOT NULL, rh_bid0 REAL NOT NULL, rh_ask0 REAL NOT NULL, rh_mark REAL, rh_index REAL, rh_funding REAL, rh_bid1k REAL, rh_ask1k REAL, rh_bid100k REAL, rh_ask100k REAL, rh_bid_rx REAL, rh_ask_rx REAL,
+      PRIMARY KEY (symbol, t)) WITHOUT ROWID;
+      INSERT INTO samples(symbol, t, received_at, regime, var_mark, var_bid0, var_ask0, var_bid1k, var_ask1k, rh_at, rh_bid0, rh_ask0, rh_bid_rx, rh_ask_rx) VALUES ('rh:BTC', 1000, 2000, 'all', 100, 99.9, 100.1, 99.8, 100.2, 900, 99.95, 100.05, 99.96, 100.04);`);
+    old.close();
+    for (let round = 0; round < 2; round++) {
+      const store = openVarLighterStore(file);
+      try {
+        const before = store.samples('rh:BTC', 0, 1500)[0];
+        assert.deepEqual([before.rhBidRx, before.varBidTk, before.varAskTk, before.varTkAt], [99.96, null, null, null]);
+        if (round === 0) assert.equal(store.addSamples([sample(5000, 100.2, 100, { symbol: 'rh:BTC', varBidTk: 100.18, varAskTk: 100.22, varTkAt: 5900 })]), 1);
+        const latest = store.latest('rh:BTC')!;
+        assert.deepEqual([latest.varBidTk, latest.varAskTk, latest.varTkAt], [100.18, 100.22, 5900]);
+      } finally { store.close(); }
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与开平仓，询价失败、过旧或没有 token 时退回公开报价', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-'));
+  let clock = T0, varMid = 100.2, tick = 0;
+  const sockets = new Map<string, FakeSocket>();
+  const market = (symbol: string, id: number) => ({ symbol, market_id: id, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, min_base_amount: '0.001', min_quote_amount: '10', taker_fee: '0', maker_fee: '0', mark_price: '100' });
+  const fetchImpl = async (url: string) => {
+    if (url.includes('orderBookDetails')) return Response.json({ code: 200, order_book_details: [market('BTC', url.includes('api.rh.lighter.xyz') ? 1 : 7)] });
+    if (url.includes('orderBookOrders')) return Response.json({ code: 200, bids: [{ price: '99.99', remaining_base_amount: '100' }], asks: [{ price: '100.01', remaining_base_amount: '100' }] });
+    return Response.json({ listings: [{ ticker: 'BTC', name: 'Bitcoin', mark_price: String(varMid), funding_rate: '0.1', funding_interval_s: 28800,
+      quotes: { updated_at: new Date(clock - 2_000).toISOString(), base: { bid: String(varMid - 0.01), ask: String(varMid + 0.01) }, size_1k: { bid: String(varMid - 0.02), ask: String(varMid + 0.02) } } }] });
+  };
+  // 询价替身：tokenMid 为 null 时跟公开价；mode 决定这一轮的表现。
+  const asked: [string, string, number, number][] = [];
+  let usable = true, tokenMid: number | null = null, mode: 'ok' | 'fail' | 'stale' = 'ok';
+  const quoter: VarQuoter = {
+    usable: () => usable,
+    async quote(kind, symbol, notionalUsd, referencePrice) {
+      asked.push([kind, symbol, notionalUsd, referencePrice]);
+      if (mode === 'fail') throw new Error('Variational 暂不可用，请稍后重试。');
+      const mid = tokenMid ?? varMid;
+      return { bid: mid - 0.005, ask: mid + 0.005, mark: mid, qty: 9.98, at: clock - (mode === 'stale' ? TOKEN_QUOTE_MAX_AGE_MS + 1 : 300), receivedAt: clock };
+    },
+    view: () => ({ status: 'ready', statusName: '正常', expiresAt: T0 + 86_400_000, error: null, okAt: clock, lagMs: 300 }),
+  };
+  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
+  const engine = createVarLighterEngine({ store, fetchImpl, connect: url => { const socket = new FakeSocket(); sockets.set(url.includes('mainnet') ? 'lighter' : 'rh', socket); return socket; }, now: () => clock, quoter });
+  const signal = AbortSignal.timeout(5000);
+  const minute = async () => {
+    clock += 60_000; tick++;
+    sockets.get('rh')!.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, mark_price: String(100 + tick * 0.0001) } } });
+    sockets.get('lighter')!.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 7: { market_id: 7, mark_price: String(100 + tick * 0.0001) } } });
+    await engine.pollVar(signal);
+    return engine.views.state().sources.var.poll!;
+  };
+  try {
+    engine.startStreams();
+    for (const [name, id] of [['rh', 1], ['lighter', 7]] as const) {
+      sockets.get(name)!.open();
+      sockets.get(name)!.push({ type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: { [id]: { market_id: id, best_bid_price: '99.99', best_ask_price: '100.01', mark_price: '100' } } });
+    }
+    await engine.refreshCatalog(signal, 'rh');
+    await engine.refreshCatalog(signal, 'lighter');
+    await engine.pollVar(signal);
+    await minute();
+    assert.equal(asked.length, 0, '没有启用的配对不询价');
+    assert.deepEqual(engine.views.state().sources.var.token, quoter.view());
+    engine.views.settings({ revision: engine.views.state().settings.revision, global: { minSamples: 10, windowHours: 2, minNetBps: 5 }, symbols: { 'rh:BTC': { enabled: true, entryBps: 15, exitBps: 2, cooldownMinutes: 0, regimes: ['all'] } } });
+    let poll = await minute();
+    assert.deepEqual(asked, [['crypto', 'BTC', 1000, 100.2]], '只询已启用的 rh:BTC，数量按它的名义金额与公开标记价');
+    assert.deepEqual([poll.tokenOk, poll.tokenFailed], [1, 0]);
+    let latest = store.latest('rh:BTC')!;
+    assert.deepEqual([latest.varBidTk, latest.varAskTk, latest.varTkAt], [100.2 - 0.005, 100.2 + 0.005, clock - 300]);
+    assert.equal(store.latest('lighter:BTC')!.varBidTk, null, '没启用的配对样本不带询价');
+    for (let index = 0; index < 11; index++) await minute();
+
+    // 公开报价冲到 100.5，但询价显示 Var 仍在 100.22：报价时刻有信号，按询价复核后不开。
+    varMid = 100.5; tokenMid = 100.22;
+    poll = await minute();
+    assert.equal(engine.views.paper().positions.length, 0);
+    assert.equal(poll.blocked[DECAYED], 1);
+    // 询价也在 100.47：开仓，Var 腿按询价的买价成交，不是公开报价 1k 档的 100.48。
+    tokenMid = 100.47;
+    await minute();
+    const opened = engine.views.paper().positions;
+    assert.deepEqual(opened.map(item => [item.symbol, item.direction]), [['rh:BTC', 'var_rich']]);
+    assert.ok(Math.abs(opened[0].varEntry - 100.465) < 1e-9);
+    assert.match(engine.views.paper().events.find(event => event.kind === 'open')!.message, /Var 按 token 询价/);
+    // 回落：平仓的 Var 腿按询价的卖价。
+    varMid = 100.2; tokenMid = 100.21;
+    await minute();
+    const trades = engine.views.paper().trades;
+    assert.deepEqual([trades.length, trades[0].reason], [1, 'revert']);
+    assert.ok(Math.abs(trades[0].varExit - 100.215) < 1e-9);
+
+    // 询价失败：这一轮的样本不带询价，统计里记失败。
+    tokenMid = null; mode = 'fail';
+    poll = await minute();
+    assert.deepEqual([poll.tokenOk, poll.tokenFailed], [0, 1]);
+    assert.equal(store.latest('rh:BTC')!.varBidTk, null);
+    // 询价的报价时刻过旧：不用。
+    mode = 'stale';
+    poll = await minute();
+    assert.deepEqual([poll.tokenOk, store.latest('rh:BTC')!.varBidTk], [1, null]);
+    // 没有可用 token：一个请求也不发，按公开报价照常开仓。
+    mode = 'ok'; usable = false;
+    const before = asked.length;
+    varMid = 100.5;
+    poll = await minute();
+    assert.equal(asked.length, before);
+    assert.deepEqual([poll.tokenOk, poll.tokenFailed], [0, 0]);
+    latest = store.latest('rh:BTC')!;
+    assert.equal(latest.varBidTk, null);
+    const fallback = engine.views.paper().positions;
+    assert.equal(fallback.length, 1);
+    assert.ok(Math.abs(fallback[0].varEntry - 100.48) < 1e-9, '按公开报价的 1k 档');
+    const opens = engine.views.paper().events.filter(event => event.kind === 'open');
+    assert.deepEqual([opens.length, opens.filter(event => event.message.includes('token 询价')).length], [2, 1]);
+    // 有持仓的配对在有 token 后继续询价。
+    usable = true;
+    await minute();
+    assert.equal(asked.length, before + 1);
+  } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });

@@ -69,6 +69,8 @@ function GlobalPanel({ view, onChanged }: { view: StateView; onChanged: () => Pr
 
 function SourcesPanel({ view, onChanged }: { view: StateView; onChanged: () => Promise<void> }) {
   const { var: varSource, venues } = view.sources, poll = varSource.poll, now = view.now;
+  // 旧版本服务端没有这一项；预览没接询价时为 null。
+  const token = varSource.token ?? null;
   const write = useWrite();
   const enabled = venues.filter(item => item.enabled).map(item => item.venue);
   const toggle = (status: VenueStatus) => {
@@ -84,10 +86,15 @@ function SourcesPanel({ view, onChanged }: { view: StateView; onChanged: () => P
       <tr><td>Var 公开报价</td><td className="wrap">{varSource.error ? <span className="vl-down">{varSource.error}</span> : `${age(varSource.ok, now)} · ${varSource.count} 个标的`}
         {poll ? <small>上次：新报价 {poll.fresh}，未变 {poll.unchanged}，无报价 {poll.noQuote}，Lighter 无盘口 {poll.noLighter}，写入 {poll.written}，缺判断时刻一档 {poll.noLive ?? 0}{Object.entries(poll.blocked ?? {}).map(([reason, count]) => `；${reason} ${count}`).join('')}</small> : null}
         <small>报价收到时已过去 {varSource.quoteAgeMedianMs === null ? '—' : `${plain(varSource.quoteAgeMedianMs / 1000, 0)} 秒`}（中位数）</small></td></tr>
+      {token ? <tr><td>Var token 询价</td><td className="wrap">{token.status === 'ready' ? token.statusName : <span className="vl-down">{token.statusName}</span>}
+        {token.okAt === null ? ' · 还没有成功过' : ` · 最近成功 ${age(token.okAt, now)}${token.lagMs === null ? '' : `，收到时距 Var 报价时刻 ${plain(token.lagMs / 1000, 1)} 秒`}`}
+        {poll ? <small>上次：成功 {poll.tokenOk ?? 0}，失败 {poll.tokenFailed ?? 0}{token.expiresAt === null ? '' : `；token 到期 ${new Date(token.expiresAt).toLocaleString('zh-CN', { hour12: false })}`}</small> : null}
+        {token.error ? <small className="vl-down">{token.error}</small> : null}
+        {token.status === 'ready' ? null : <small>token 在「行情监控 → 原油」页的 Var token 表单里保存；没有可用 token 时开平仓只按公开报价。</small>}</td></tr> : null}
       {venues.map(status => <VenueRow key={status.venue} status={status} now={now} busy={write.busy}
         locked={status.enabled && enabled.length === 1} onToggle={() => toggle(status)} />)}
     </tbody></table></div>
-    <p className="vl-note">行情流订阅全部市场的一档价，流量按解码后的文本折算（线上有压缩，实测约为其四分之一到五分之一）。已启用或有持仓的配对每分钟各取一次盘口快照（约 22 KB），每个场所最多 10 个。
+    <p className="vl-note">行情流订阅全部市场的一档价，流量按解码后的文本折算（线上有压缩，实测约为其四分之一到五分之一）。已启用或有持仓的配对每分钟各取一次盘口快照（约 22 KB），每个场所最多 10 个；有可用的 Var token 时同一批配对各询一次价。
       停采前先停用该场所上的标的并平掉模拟持仓。</p>
   </section>;
 }

@@ -685,7 +685,7 @@ Anthropic 详情的成交标记不做（A-5 范围外，登记在 asset.md）；
 
 **影响面（R3）**：
 
-- 凭据：新增页面写入的会话凭据文件；token 只发往 `omni.variational.io` 的 `/api/me` 与 `/api/quotes/indicative`（固定路径、固定请求体，传输脚本再核对一遍），公开接口不带 token。vr-token 是网页会话凭据，本服务只发只读请求。
+- 凭据：新增页面写入的会话凭据文件；token 只发往 `omni.variational.io` 的 `/api/me` 与 `/api/quotes/indicative`（固定路径、固定请求体，传输脚本再核对一遍），公开接口不带 token。v0.82.0 起 Var / Lighter 模块也只读这个文件，用同一个 token 询价，询价请求体的白名单从「BZ、CL，数量 1」放宽为三种逐字段重建的合约写法与正的十进制数量，见 [varlighter.md](varlighter.md) 第 1 节《Var token 询价》。vr-token 是网页会话凭据，本服务只发只读请求。
 - 新增 `python3` 子进程（资产账本的 Var 余额已在用同样的做法），一次读取通常四个（两腿认证标记价、两腿预测资金费），token 轮换重读时认证读取最多四轮（有上限），各 10 秒内结束。子进程只拿到 `PATH`（同资产账本），服务环境里的代理设置不用于 Var 请求。
 - 读取接口、缓存与日志沿用 M-2c；不碰交易、划转、通知队列、`monitor.sqlite` 与配置格式。
 

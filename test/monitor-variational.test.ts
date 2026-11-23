@@ -279,10 +279,28 @@ test('传输：白名单外的地址、请求头与请求体不启动子进程�
     ['https://omni.variational.io/api/me', { ...me, redirect: 'follow' as const }],
     ['https://omni.variational.io/api/me', { method: 'GET', headers: {} }],
     ['https://omni.variational.io/api/funding/v2?underlying=BZ&instrument_type=perpetual_rwa_future', me],
-    ['https://omni.variational.io/api/quotes/indicative', { method: 'POST', headers: me.headers, body: JSON.stringify({ instrument: { underlying: 'BTC', instrument_type: 'perpetual_rwa_future', settlement_asset: 'USDC', kind: 'commodity' }, qty: '1' }) }],
   ] as const;
   for (const [url, init] of invalid) await assert.rejects(fetcher(url, init as RequestInit), /不支持的 Variational 数据请求/, url);
+  // 询价的请求体：只认三种合约写法（商品、股票、加密永续）与正的十进制数量，多一个字段、换一个取值都不发。
+  const quoteUrl = 'https://omni.variational.io/api/quotes/indicative';
+  const post = (instrument: unknown, qty: unknown) => fetcher(quoteUrl, { method: 'POST', headers: me.headers, body: JSON.stringify({ instrument, qty }), redirect: 'error' });
+  const rwa = (underlying: string, kind: string) => ({ underlying, instrument_type: 'perpetual_rwa_future', settlement_asset: 'USDC', kind });
+  const perp = (underlying: string, interval: unknown = 3600) => ({ underlying, instrument_type: 'perpetual_future', settlement_asset: 'USDC', funding_interval_s: interval });
+  const refused: [unknown, unknown][] = [
+    [rwa('CL', 'fx'), '1'], [rwa('btc', 'commodity'), '1'], [rwa('BTC/USD', 'equity'), '1'], [rwa('A'.repeat(17), 'equity'), '1'],
+    [{ ...rwa('CL', 'commodity'), extra: 1 }, '1'], [{ ...rwa('CL', 'commodity'), settlement_asset: 'USDT' }, '1'], [{ ...rwa('CL', 'commodity'), instrument_type: 'spot' }, '1'],
+    [perp('BTC', 28800), '1'], [perp('BTC', '3600'), '1'], [{ ...perp('BTC'), kind: 'equity' }, '1'], [{ ...rwa('AAPL', 'equity'), funding_interval_s: 3600 }, '1'],
+    [rwa('CL', 'commodity'), '0'], [rwa('CL', 'commodity'), '0.0'], [rwa('CL', 'commodity'), '-1'], [rwa('CL', 'commodity'), '1e3'], [rwa('CL', 'commodity'), 1],
+    [rwa('CL', 'commodity'), '1.123456789'], [rwa('CL', 'commodity'), '1234567890123'], [rwa('CL', 'commodity'), '01'], [rwa('CL', 'commodity'), ' 1'], [null, '1'],
+  ];
+  for (const [instrument, qty] of refused) await assert.rejects(post(instrument, qty), /不支持的 Variational 数据请求/, JSON.stringify([instrument, qty]));
   assert.equal(ok.calls.length, 1, '无效请求不启动子进程');
+  const accepted: [Record<string, unknown>, string][] = [[rwa('CL', 'commodity'), '1'], [rwa('AAPL', 'equity'), '5.25'], [perp('BTC'), '0.01538'], [perp('1000PEPE'), '8100000']];
+  for (const [index, [instrument, qty]] of accepted.entries()) {
+    await post(instrument, qty);
+    const sent = JSON.parse(ok.calls[index + 1]!.input);
+    assert.deepEqual([sent.url, sent.method, sent.body], [quoteUrl, 'POST', { instrument, qty }]);
+  }
 
   const exit = createVariationalFetch({ spawnImpl: fakeSpawn(child => { child.stderr.end(`Traceback ${token}`); child.emit('close', 2); }).spawnImpl });
   await assert.rejects(exit('https://omni.variational.io/api/me', me), (error: Error) => error.message === 'Variational 标准行情传输暂不可用，请稍后重试。');
@@ -342,6 +360,44 @@ test('传输脚本：真实 python3 收到白名单外或格式不对的输入�
     const run = spawnSync('python3', ['-I', '-B', VARIATIONAL_HELPER], { input, encoding: 'utf8', timeout: 10_000 });
     assert.deepEqual([run.status, run.stdout, run.stderr], [2, '', ''], input.slice(0, 40));
   }
+});
+
+test('传输脚本：真实 python3 对询价请求体的判断与 TS 一侧一致，接受的三种合约写法逐字段重建', { skip: spawnSync('python3', ['--version']).status !== 0 && '本机没有 python3' }, async () => {
+  const token = fakeVariationalToken(T0 + DAY);
+  // 先让 TS 一侧生成它会交给脚本的输入，再改动其中的请求体交给脚本自己的检查函数。
+  const captured = fakeSpawn(child => { child.stdout.end(JSON.stringify({ status: 200, headers: {}, body: '' })); child.emit('close', 0); });
+  await createVariationalFetch({ spawnImpl: captured.spawnImpl })('https://omni.variational.io/api/quotes/indicative', { method: 'POST', redirect: 'error',
+    headers: { Accept: 'application/json', Cookie: `vr-token=${token}` }, body: JSON.stringify({ instrument: { underlying: 'CL', instrument_type: 'perpetual_rwa_future', settlement_asset: 'USDC', kind: 'commodity' }, qty: '1' }) });
+  const base = JSON.parse(captured.calls[0]!.input);
+  const rwa = (underlying: string, kind: string) => ({ underlying, instrument_type: 'perpetual_rwa_future', settlement_asset: 'USDC', kind });
+  const perp = (underlying: string, interval: unknown = 3600) => ({ underlying, instrument_type: 'perpetual_future', settlement_asset: 'USDC', funding_interval_s: interval });
+  const cases: { body: unknown; ok: boolean }[] = [
+    { body: { instrument: rwa('CL', 'commodity'), qty: '1' }, ok: true }, { body: { instrument: rwa('AAPL', 'equity'), qty: '5.25' }, ok: true },
+    { body: { instrument: perp('BTC'), qty: '0.01538' }, ok: true }, { body: { instrument: perp('1000PEPE'), qty: '8100000' }, ok: true },
+    ...[
+      { instrument: rwa('CL', 'fx'), qty: '1' }, { instrument: rwa('btc', 'commodity'), qty: '1' }, { instrument: rwa('BTC/USD', 'equity'), qty: '1' },
+      { instrument: { ...rwa('CL', 'commodity'), extra: 1 }, qty: '1' }, { instrument: { ...rwa('CL', 'commodity'), settlement_asset: 'USDT' }, qty: '1' },
+      { instrument: perp('BTC', 28800), qty: '1' }, { instrument: perp('BTC', '3600'), qty: '1' }, { instrument: perp('BTC', true), qty: '1' }, { instrument: perp('BTC', 3600.5), qty: '1' },
+      { instrument: { ...perp('BTC'), kind: 'equity' }, qty: '1' }, { instrument: rwa('CL', 'commodity'), qty: '0' }, { instrument: rwa('CL', 'commodity'), qty: '0.0' },
+      { instrument: rwa('CL', 'commodity'), qty: '-1' }, { instrument: rwa('CL', 'commodity'), qty: '1e3' }, { instrument: rwa('CL', 'commodity'), qty: 1 },
+      { instrument: rwa('CL', 'commodity'), qty: '1.123456789' }, { instrument: rwa('CL', 'commodity'), qty: '1234567890123' }, { instrument: rwa('CL', 'commodity'), qty: '1\n' },
+      { instrument: rwa('CL', 'commodity'), qty: '1', extra: 1 }, { instrument: null, qty: '1' },
+    ].map(body => ({ body, ok: false })),
+  ];
+  const script = `
+import json, runpy, sys
+check = runpy.run_path(sys.argv[1], run_name="helper")["request_definition"]
+out = []
+for value in json.load(sys.stdin):
+    try:
+        out.append(json.loads(check(value).data))
+    except ValueError:
+        out.append(None)
+print(json.dumps(out))
+`;
+  const run = spawnSync('python3', ['-I', '-B', '-c', script, VARIATIONAL_HELPER], { input: JSON.stringify(cases.map(item => ({ ...base, body: item.body }))), encoding: 'utf8', timeout: 10_000 });
+  assert.equal(run.status, 0, run.stderr);
+  assert.deepEqual(JSON.parse(run.stdout), cases.map(item => item.ok ? item.body : null));
 });
 
 test('接口：状态与保存在登录之后，保存须带页面请求标记；状态不带 token；原油关闭时 423；只有海力士时 404；Var 没有结算历史', async () => {

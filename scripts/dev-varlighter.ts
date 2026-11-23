@@ -68,7 +68,7 @@ function samplesAt(market: Market, t: number): { varMid: number; varFunding: num
       varMark: varMid, varBid0: varMid - varHalf, varAsk0: varMid + varHalf, varBid1k: varMid - varHalf1k, varAsk1k: varMid + varHalf1k, varBid100k: varMid - varHalf100k, varAsk100k: varMid + varHalf100k, varFunding,
       rhAt: t, rhBid0: rhMid - rhHalf, rhAsk0: rhMid + rhHalf, rhMark: rhMid, rhIndex: rhMid, rhFunding: crypto ? 0.0000125 : 0.000005,
       rhBid1k: rhMid - rhHalf * 1.2, rhAsk1k: rhMid + rhHalf * 1.2, rhBid100k: rhMid - rhHalf * 3, rhAsk100k: rhMid + rhHalf * 3,
-      rhBidRx: rhMid - rhHalf, rhAskRx: rhMid + rhHalf,
+      rhBidRx: rhMid - rhHalf, rhAskRx: rhMid + rhHalf, varBidTk: null, varAskTk: null, varTkAt: null,
     };
   }) };
 }

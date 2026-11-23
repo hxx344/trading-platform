@@ -3,9 +3,13 @@ on:
   push:
     branches: [main]
   pull_request:
-  # A manual run also measures each test file on a runner, for scripts/test-durations.json.
   workflow_dispatch:
     inputs:
+      # Measures each test file on a runner, for scripts/test-durations.json. Off by default: it is the longest job.
+      measure_durations:
+        description: 逐文件测量测试耗时，产出 test-durations.json
+        type: boolean
+        default: false
       install_full:
         description: 用不带参数的完整顺序验收安装，并运行真实 systemd 部署
         type: boolean
@@ -149,7 +153,7 @@ jobs:
       - run: sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin TP_WATCH_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-watch-systemd.sh
 
   durations:
-    if: github.event_name == 'workflow_dispatch' && !inputs.install_full
+    if: github.event_name == 'workflow_dispatch' && inputs.measure_durations
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

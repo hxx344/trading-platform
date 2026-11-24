@@ -49,7 +49,7 @@ function reachable(entry, installedExecutor = false) {
 }
 const executor = reachable(entries.executor, true), control = reachable(entries.control), market = reachable(entries.market);
 // Helpers run at import/installation time. The execution API's import-channel is a runtime dependency.
-const helperOnly = new Set(['update-helper', 'take-handoff', 'watch-config', 'import-helper', 'import-workbench',
+const helperOnly = new Set(['update-helper', 'take-handoff', 'watch-config', 'mev-setup', 'import-helper', 'import-workbench',
   'import-modules', 'import-options', 'import-crossex', 'import-ondo', 'import-monitor-alerts',
   'import-monitor-variational', 'import-monitor-paper'].map(name => 'src/service/' + name + '.ts'));
 helperOnly.add('src/market/probe.ts');

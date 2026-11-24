@@ -12,6 +12,7 @@ test('every address keeps its entry and gets the workspace of the plan', () => {
     ['#/crossex', 'crossex', '交易中心'], ['#/crossex/trade', 'crossex', '交易中心'], ['#/crossex/hedge', 'crossex', '交易中心'],
     ['#/crossex/orders', 'crossex', '交易中心'], ['#/crossex/settings', 'crossex', '交易中心'],
     ['#/varlighter', 'varlighter', '交易中心'], ['#/varlighter/detail/rh:AAPL', 'varlighter', '交易中心'], ['#/varlighter/paper', 'varlighter', '交易中心'], ['#/varlighter/ready', 'varlighter', '交易中心'],
+    ['#/mev', 'mev', '链上'], ['#/mev/opportunities', 'mev', '链上'], ['#/mev/transactions', 'mev', '链上'], ['#/mev/pools', 'mev', '链上'], ['#/mev/settings', 'mev', '链上'], ['#/mev/unknown', 'pairs', '策略与风险'],
     ['#/options', 'options', '期权'], ['#/options/rfq', 'options', '期权'], ['#/options/performance', 'options', '期权'],
     ['#/status', 'status', '系统'], ['#/logs', 'logs', '系统'], ['#/settings', 'settings', '系统'], ['#/unknown', 'pairs', '策略与风险'],
   ];
@@ -28,11 +29,12 @@ test('entries keep the addresses the pages had before the regrouping', () => {
 
 test('groups follow the plan order and leave out workspaces without an entry', () => {
   const all = workspaceGroups(new Set(Object.keys(navEntries) as NavEntry[]));
-  assert.deepEqual(all.map(group => group.label), ['总览与资产', '市场与机会', '交易中心', '策略与风险', '期权', '系统']);
+  assert.deepEqual(all.map(group => group.label), ['总览与资产', '市场与机会', '交易中心', '策略与风险', '期权', '链上', '系统']);
+  assert.deepEqual(all.find(group => group.id === 'onchain')!.entries, ['mev']);
   assert.deepEqual(all[0]!.entries, ['asset', 'positions'], '持仓在资产之后');
   assert.deepEqual(all.at(-1)!.entries, ['status', 'logs', 'settings']);
   assert.deepEqual(all.find(group => group.id === 'trading')!.entries, ['oil', 'hynix', 'goldoil', 'crossex', 'ondo', 'varlighter'], '海力士在原油之后，金油在海力士之后、CrossEx 之前，Ondo 之后是 Var/Lighter 价差');
-  assert.deepEqual(all.map(group => group.id), ['overview', 'market', 'trading', 'strategy', 'options', 'system']);
+  assert.deepEqual(all.map(group => group.id), ['overview', 'market', 'trading', 'strategy', 'options', 'onchain', 'system']);
   // A service with only the ASTER pairs (no oil, options, monitor, asset or CrossEx configured).
   const bare = workspaceGroups(new Set<NavEntry>(['pairs', 'status', 'logs', 'settings']));
   assert.deepEqual(bare.map(group => [group.label, group.entries]), [['策略与风险', ['pairs']], ['系统', ['status', 'logs', 'settings']]]);

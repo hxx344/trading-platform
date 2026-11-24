@@ -98,6 +98,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 
 | 回退到早于 | 回退前要做的事 | 说明 | 详见 |
 | --- | --- | --- | --- |
+| v0.83.0 | 开过 MEV 套利的：先在「MEV 套利」页停止实盘，再执行 `sudo bash install.sh --unset-mev`（在当前版本下执行），然后回退 | 旧版本不认识 `config.json` 与密钥文件里的 `mev`，配置检查失败；`mev.sqlite` 旧版本不读，留着即可；链上合约与热钱包不受影响 | [docs/mev.md](docs/mev.md) 1.5 |
 | v0.74.0 | 从 `config.json` 删掉 `monitor.goldoil`（只配了金油比时删去整个 `monitor`）；先在「金油」页确认没有未结束或待人工处理的金油任务 | 旧版本不认识 `monitor.goldoil`，配置检查失败；也不认识 `XAUUSDT` 与金油任务，无法推进、核对或释放这些任务。`monitor.sqlite` 多出的 `goldoil_candles` 表与 `goldoil.*` 状态记录旧版本不读；执行库结构未变 | [docs/goldoil.md](docs/goldoil.md) 第 0、4 节、[docs/monitor.md](docs/monitor.md)「M-2f」 |
 | v0.72.0 | 从 `config.json` 删掉 `news`（只在写过时） | 旧版本不认识 `news`，配置检查失败；快讯与异动行情不落库，没有数据要处理 | [docs/news.md](docs/news.md) 第 6 节 |
 | v0.67.0 | 用支持独立行情服务的安装器指定旧版 | 回到 v0.66.0 等双进程版本会停用行情单元，由旧执行进程接回采集，沿用原数据目录 | [docs/update.md](docs/update.md) |

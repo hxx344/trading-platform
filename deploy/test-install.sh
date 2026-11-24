@@ -370,6 +370,48 @@ TP_RELEASE_BASE=https://127.0.0.1:9/none run --watch-url "$watch_to" --watch-tok
 check '只开心跳时沿用已装版本、不联网' '[[ $status -eq 0 && "$(readlink -f "$TP_APP_DIR/current")" == "$current_before" ]] && grep -q "程序包（未变化）" "$tmp/out" && grep -q "，巡检心跳推送到 $watch_to" "$tmp/out"'
 TP_RELEASE_BASE=https://127.0.0.1:9/none run --watch-off && status=0 || status=$?
 check '只关心跳时沿用已装版本、不联网' '[[ $status -eq 0 && "$(readlink -f "$TP_APP_DIR/current")" == "$current_before" ]] && grep -q "巡检心跳已关闭" "$tmp/out"'
+
+# MEV arbitrage (docs/mev.md): the two addresses land in config.json, the node address and the hot wallet's key in the
+# key file (from stdin, never printed), the new program checks both, and --unset-mev takes them out again.
+mev_key=0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318
+mev_executor=0x00000000000000000000000000000000004D4556
+mev_owner=0x000000000000000000000000000000000000B0B0
+mev_rpc=https://base.example.invalid/v2/rpc-key-secret
+mev_field() { "$TP_NODE_BIN" -p "JSON.parse(require(\"fs\").readFileSync(process.argv[1], \"utf8\")).mev?.[process.argv[2]] ?? \"\"" "$1" "$2"; }
+cp -p "$TP_CONF_DIR/config.json" "$tmp/config.before"; cp -p "$TP_CONF_DIR/secrets.json" "$tmp/secrets.before"
+run --package "$tmp/a" --mev-executor "$mev_executor" && status=0 || status=$?
+check '--mev-executor 须和 --set-mev 一起用' '[[ $status -ne 0 ]] && grep -q -- "须和 --set-mev 一起使用" "$tmp/out"'
+run --package "$tmp/a" --set-mev --mev-stdin --mev-executor "$mev_executor" </dev/null && status=0 || status=$?
+check '--set-mev 缺地址被拒' '[[ $status -ne 0 ]] && grep -q "须同时给出 --mev-executor 与 --mev-owner" "$tmp/out"'
+run --package "$tmp/a" --set-mev --unset-mev --mev-executor "$mev_executor" --mev-owner "$mev_owner" </dev/null && status=0 || status=$?
+check '--set-mev 与 --unset-mev 不能同用' '[[ $status -ne 0 ]] && grep -q "只能用一个" "$tmp/out"'
+run --package "$tmp/a" --set-mev --mev-executor "$mev_executor" --mev-owner "$mev_owner" </dev/null && status=0 || status=$?
+check '不在终端且没有 --mev-stdin 时不读私钥' '[[ $status -ne 0 ]] && grep -q "加 --mev-stdin 从标准输入读三行" "$tmp/out"'
+printf '%s\n\n%s\n' "$mev_rpc" not-a-key-0123 | run --package "$tmp/a" --set-mev --mev-stdin --mev-executor "$mev_executor" --mev-owner "$mev_owner" && status=0 || status=$?
+check '格式不对的私钥被拒且不回显，不改任何文件' '[[ $status -ne 0 ]] && grep -q "mev 的私钥格式无效" "$tmp/out" && ! grep -q "not-a-key-0123\|rpc-key-secret" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json" && cmp -s "$tmp/secrets.before" "$TP_CONF_DIR/secrets.json"'
+printf '%s\n\n%s\n' "http://203.0.113.9:8545/rpc-key-secret" "$mev_key" | run --package "$tmp/a" --set-mev --mev-stdin --mev-executor "$mev_executor" --mev-owner "$mev_owner" && status=0 || status=$?
+check '公网明文 http 的节点地址被拒且不回显' '[[ $status -ne 0 ]] && grep -q "节点地址须为 https 地址" "$tmp/out" && ! grep -q "rpc-key-secret\|203.0.113.9:8545" "$tmp/out" && cmp -s "$tmp/secrets.before" "$TP_CONF_DIR/secrets.json"'
+printf '\n\n%s\n' "$mev_key" | run --package "$tmp/a" --set-mev --mev-stdin --mev-executor "$mev_executor" --mev-owner "$mev_owner" && status=0 || status=$?
+check '第一次开启没给节点地址被拒' '[[ $status -ne 0 ]] && grep -q "还没有保存过节点地址" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json"'
+printf '%s\n\n%s\n' "$mev_rpc" "$mev_key" | run --package "$tmp/a" --set-mev --mev-stdin --mev-executor "$mev_executor" --mev-owner "$mev_executor" && status=0 || status=$?
+check '合约与 owner 同一地址被拒' '[[ $status -ne 0 ]] && grep -q "不能是同一个地址" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json"'
+current_before=$(readlink -f "$TP_APP_DIR/current")
+printf '%s\n\n%s\n' "$mev_rpc" "$mev_key" | run --package "$tmp/c" --set-mev --mev-stdin --mev-executor "$mev_executor" --mev-owner "$mev_owner" && status=0 || status=$?
+check '开启 MEV 后配置检查失败时恢复两个文件、仍是原版本' '[[ $status -ne 0 ]] && grep -q "已恢复设置 MEV 套利前的配置文件" "$tmp/out" && cmp -s "$tmp/config.before" "$TP_CONF_DIR/config.json" && cmp -s "$tmp/secrets.before" "$TP_CONF_DIR/secrets.json" && [[ "$(readlink -f "$TP_APP_DIR/current")" == "$current_before" ]]'
+printf '%s\n\n%s\n' "$mev_rpc" "$mev_key" | run --package "$tmp/a" --set-mev --mev-stdin --mev-executor "$mev_executor" --mev-owner "$mev_owner" && status=0 || status=$?
+check '--set-mev 写入地址、节点与私钥并通过配置检查' '[[ $status -eq 0 ]] && grep -q "MEV 套利：执行合约 0x00000000000000000000000000000000004d4556，利润收款 0x000000000000000000000000000000000000b0b0，热钱包 0x[0-9a-f]\{40\}，节点 base.example.invalid" "$tmp/out" && grep -q "，MEV 套利（Base，执行合约 0x0000…4556，热钱包 0x" "$tmp/out" && [[ "$(mev_field "$TP_CONF_DIR/config.json" executor)" == 0x00000000000000000000000000000000004d4556 && "$(mev_field "$TP_CONF_DIR/secrets.json" rpcUrl)" == "$mev_rpc" && "$(mev_field "$TP_CONF_DIR/secrets.json" privateKey)" == "$mev_key" ]]'
+check '私钥与节点地址只在密钥文件里，两个文件仍为 600' '! grep -q "${mev_key#0x}\|rpc-key-secret" "$tmp/out" "$TP_CONF_DIR/config.json" && [[ "$(stat -c %a "$TP_CONF_DIR/config.json")" == 600 && "$(stat -c %a "$TP_CONF_DIR/secrets.json")" == 600 ]]'
+check '开启 MEV 不动其余配置' '[[ "$("$TP_NODE_BIN" -e "const f = p => { const v = JSON.parse(require(\"fs\").readFileSync(p, \"utf8\")); delete v.mev; return JSON.stringify(v); }; process.stdout.write(String(f(process.argv[1]) === f(process.argv[2]) && f(process.argv[3]) === f(process.argv[4])))" "$tmp/config.before" "$TP_CONF_DIR/config.json" "$tmp/secrets.before" "$TP_CONF_DIR/secrets.json")" == true ]]'
+printf '%s\n\n%s\n' "$mev_rpc" "$mev_key" | run --package "$tmp/a" --set-mev --mev-stdin --mev-executor "$mev_executor" --mev-owner "$mev_owner" && status=0 || status=$?
+check '重复开启 MEV 不改动配置' '[[ $status -eq 0 ]] && grep -q "与现有配置相同，未改动" "$tmp/out" && grep -q "无变化" "$tmp/out"'
+printf '\nhttps://send.example.invalid/key-two\n\n' | run --package "$tmp/a" --set-mev --mev-stdin --mev-executor "$mev_executor" --mev-owner 0x000000000000000000000000000000000000C0C0 && status=0 || status=$?
+check '只换 owner 与发送节点时沿用已存的节点地址与私钥' '[[ $status -eq 0 ]] && grep -q "发送走 send.example.invalid" "$tmp/out" && ! grep -q "key-two" "$tmp/out" && [[ "$(mev_field "$TP_CONF_DIR/config.json" owner)" == 0x000000000000000000000000000000000000c0c0 && "$(mev_field "$TP_CONF_DIR/secrets.json" rpcUrl)" == "$mev_rpc" && "$(mev_field "$TP_CONF_DIR/secrets.json" privateKey)" == "$mev_key" && "$(mev_field "$TP_CONF_DIR/secrets.json" sendRpcUrl)" == https://send.example.invalid/key-two ]]'
+printf '\n-\n\n' | TP_RELEASE_BASE=https://127.0.0.1:9/none run --set-mev --mev-stdin --mev-executor "$mev_executor" --mev-owner "$mev_owner" && status=0 || status=$?
+check '只改 MEV 时沿用已装版本、不联网；- 去掉发送节点' '[[ $status -eq 0 && "$(readlink -f "$TP_APP_DIR/current")" == "$current_before" ]] && grep -q "程序包（未变化）" "$tmp/out" && [[ -z "$(mev_field "$TP_CONF_DIR/secrets.json" sendRpcUrl)" ]]'
+TP_RELEASE_BASE=https://127.0.0.1:9/none run --unset-mev && status=0 || status=$?
+check '--unset-mev 去掉地址、节点与私钥，配置回到开启前' '[[ $status -eq 0 ]] && grep -q "MEV 套利已关闭" "$tmp/out" && ! grep -q "，MEV 套利（" "$tmp/out" && ! grep -q "\"mev\"" "$TP_CONF_DIR/config.json" "$TP_CONF_DIR/secrets.json" && [[ "$("$TP_NODE_BIN" -e "const f = p => JSON.stringify(JSON.parse(require(\"fs\").readFileSync(p, \"utf8\"))); process.stdout.write(String(f(process.argv[1]) === f(process.argv[2]) && f(process.argv[3]) === f(process.argv[4])))" "$tmp/config.before" "$TP_CONF_DIR/config.json" "$tmp/secrets.before" "$TP_CONF_DIR/secrets.json")" == true ]]'
+run --package "$tmp/a" --unset-mev && status=0 || status=$?
+check '重复关闭 MEV 不改动配置' '[[ $status -eq 0 ]] && grep -q "MEV 套利本来就没有开启，配置未改动" "$tmp/out"'
 fi
 
 if part_is 1; then

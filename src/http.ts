@@ -26,6 +26,7 @@ import type { AssetStore } from './asset/store.ts';
 import type { CrossexViews } from './service/crossex.ts';
 import type { OndoViews } from './service/ondo.ts';
 import type { VarLighterViews } from './service/varlighter.ts';
+import type { MevViews } from './service/mev.ts';
 import { AssetConflict } from './asset/sync-lock.ts';
 import { AssetInputError, INPUT_INVALID } from './asset/validation.ts';
 import { AssetBackupError } from './asset/source-import.ts';
@@ -169,6 +170,8 @@ export interface ServiceViews {
   news?: { flash(): { items: readonly { url: string | null }[] } | null; moves(): { items: readonly { url: string | null }[] } | null };
   /** Var 与 Lighter（RH、主网）价差采集与模拟盘（service/varlighter.ts，docs/varlighter.md）；config.json 写了 `"varLighter": false` 时没有。 */
   varlighter?: VarLighterViews;
+  /** MEV 套利（service/mev.ts，docs/mev.md）；config.json 没有 `mev` 时没有。 */
+  mev?: MevViews;
 }
 
 /** accessToken is exchanged at /login for a session of its own, as is the password (sessions.ts). */
@@ -518,7 +521,7 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
       return send(response, 200, {
         generation: executor.generation, retired: executor.retired, transport: executor.environment === 'mainnet' ? 'live' : 'simulated',
         modules: { oil: !!views?.oil, options: !!views?.options, asset: !!views?.asset,
-          crossex: !!views?.crossex, ondo: !!views?.ondo, news: !!views?.news, varlighter: !!views?.varlighter },
+          crossex: !!views?.crossex, ondo: !!views?.ondo, news: !!views?.news, varlighter: !!views?.varlighter, mev: !!views?.mev },
         monitor: monitorScopes(views?.monitor?.state()),
       } satisfies ShellView);
     }
@@ -877,6 +880,24 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
         if (error instanceof ContractError) throw error;
         const failure = varlighter.failure(error);
         if (failure.internal) process.stderr.write(`Var/Lighter 接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}\n`);
+        return send(response, failure.status, failure.body);
+      }
+      return send(response, 404, { code: 'not_found', message: '不存在' });
+    }
+    if (url.pathname.startsWith('/api/mev/')) {
+      if (!views?.mev) return send(response, 404, { code: 'not_found', message: '本服务没有配置 MEV 套利模块' });
+      const mev = views.mev, path = url.pathname.slice('/api/mev/'.length);
+      try {
+        if (request.method === 'GET' && path === 'state') return send(response, 200, mev.state());
+        if (request.method === 'POST' && path === 'settings') return send(response, 200, mev.settings(await readJson(request)));
+        if (request.method === 'POST' && path === 'live/start') return send(response, 200, await mev.start(await readJson(request)));
+        if (request.method === 'POST' && path === 'live/stop') { await readJson(request); return send(response, 200, mev.stop()); }
+        if (request.method === 'POST' && path === 'tokens') return send(response, 200, await mev.tokens(await readJson(request)));
+      } catch (error) {
+        if (error instanceof ContractError) throw error;
+        const failure = mev.failure(error);
+        if (failure.internal) process.stderr.write(`MEV 接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}
+`);
         return send(response, failure.status, failure.body);
       }
       return send(response, 404, { code: 'not_found', message: '不存在' });

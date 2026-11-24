@@ -1,0 +1,13 @@
+/* MEV 套利页（web/src/mev/MevPage.tsx，docs/frontend.md《MEV 套利页》）。
+   工作台没有对应页面：骨架、页签、指标卡、表格、表单沿用 Var/Lighter 价差页的 varlighter.css（.vl-*，本页一并引入），
+   这里只有本页另需的几条，只用设计令牌。 */
+.mev-mode{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;padding:14px}
+.mev-mode strong{font-size:1rem;font-weight:650}
+.mev-mode .grow{flex:1}
+.mev-facts{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:8px 16px;margin:0;padding:4px 14px 14px;font-size:.8125rem}
+.mev-facts dt{color:var(--text-tertiary)}
+.mev-facts dd{margin:0;min-width:0;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
+.mev-mono{font-family:var(--font-mono);font-size:.75rem}
+.mev-group{padding:12px 14px 0;color:var(--text-tertiary);font-size:.75rem;font-weight:500}
+.mev-path{white-space:normal;min-width:240px}
+@media (max-width:650px){.mev-facts{grid-template-columns:minmax(0,1fr);gap:2px 0}.mev-facts dd{margin-bottom:8px}}

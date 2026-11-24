@@ -56,6 +56,8 @@ import { clearCrashRecord, crashReportKey, installCrashGuard, readCrashRecord } 
 import { createHostStatus, processLoopHistogram } from '../host-status.ts';
 import { HEALTH_TICK_MS, createHealthWatch, type HealthWatch } from './health-watch.ts';
 import { newsLoop, newsViews, type NewsHolder } from './news.ts';
+import { mevLoop, mevViews, openMev, type MevHolder, type MevOptions } from './mev.ts';
+import { mevSummary } from './mev-config.ts';
 import { openVarLighter, varLighterLoop, varLighterViews, type VarLighterHolder, type VarLighterOptions } from './varlighter.ts';
 import type { NewsOptions } from '../news/feed.ts';
 
@@ -258,6 +260,8 @@ export interface StartOptions {
   news?: NewsOptions;
   /** Var 与 Lighter（RH、主网）价差（docs/varlighter.md）；不给就不开。命令行入口在 config.json 没写 `"varLighter": false` 时给出；测试可替换行情来源。 */
   varLighter?: VarLighterOptions;
+  /** 测试替换 MEV 套利模块的节点传输（只在 config.mev 存在时有用）。 */
+  mevOptions?: MevOptions;
 }
 
 /** Opens the data directory, wires the executor and runs it with the alerts and the user streams until shutdown. */
@@ -282,7 +286,7 @@ export async function startService(options: StartOptions): Promise<ReturnType<ty
   catch (error) { closeLogs(); throw error; }
 }
 
-async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, socketPath, executionBuild, configBuild, marketClient, marketSocketPath, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, ondoOptions, watchOptions, updateFetch, news: newsOptions, varLighter: varLighterOptions }: StartOptions & { marketClient?: MarketClient }, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
+async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, socketPath, executionBuild, configBuild, marketClient, marketSocketPath, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, ondoOptions, watchOptions, updateFetch, news: newsOptions, varLighter: varLighterOptions, mevOptions }: StartOptions & { marketClient?: MarketClient }, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
   const updates = socketPath === undefined ? (await import('./update.ts')).createServiceUpdates(importDir, updateFetch) : undefined;
   // Bound to the password, so `install.sh --set-password` ends every session (sessions.ts).
   const sessions = openSessionStore({ file: join(dir, 'http-session'), epoch: sessionEpoch(password) });
@@ -432,6 +436,9 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   // 快讯连接随后台循环开关，启动失败时不会留下连接。
   const news: NewsHolder | null = newsOptions ? { feed: null } : null;
   const varLighter: VarLighterHolder | null = varLighterOptions ? openVarLighter(dir, varLighterOptions, line => process.stderr.write(`${line}\n`)) : null;
+  // MEV 套利（docs/mev.md）：启动后只观察；实盘从页面开始。打不开库只停用本模块。
+  const mev: MevHolder | null = config.mev && secrets.mev ? openMev(config.mev, secrets.mev, dir, mevOptions ?? {}, { log: line => process.stderr.write(`${line}
+`), notify: (key, text) => notifier.notifyOnce(key, text) }) : null;
   return runExecutor({
     executor, store, dir, port, socketPath, executionBuild, configBuild, app, sessions, readTokens,
     ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: oil ? ['jobs', 'transfers', 'adl'] : ['transfers', 'adl'], drainMs: DRAIN_MS,
@@ -456,6 +463,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(updates ? { update: updates } : {}),
       ...(news ? { news: newsViews(news) } : {}),
       ...(varLighter ? { varlighter: varLighterViews(varLighter) } : {}),
+      ...(mev ? { mev: mevViews(mev) } : {}),
     },
     ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir),
       ...(socketPath !== undefined ? { legacyUpdate: () => legacyUpdateJob(importDir) } : {}) } } : {}),
@@ -512,6 +520,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(ondo ? [ondo.loop(context)] : []),
       ...(news && newsOptions ? [newsLoop(news, newsOptions, context)] : []),
       ...(varLighter ? [varLighterLoop(varLighter, context)] : []),
+      ...(mev ? [mevLoop(mev, context)] : []),
       ...(config.watch && secrets.watch ? [watchLoop(watch = createWatch({ config: config.watch, secret: secrets.watch, problem: context.notReady, ...(watchOptions?.fetchImpl ? { fetchImpl: watchOptions.fetchImpl } : {}), log: line => process.stderr.write(`${line}\n`) }), context, watchOptions)] : []),
     ],
     onStopping: (reason, detail) => {
@@ -576,7 +585,7 @@ async function main(): Promise<void> {
     // Read and validated offline (keys must derive their signers); nothing is sent anywhere.
     // Only noted, not refused: at boot or with Tailscale logged out the address is missing, and 127.0.0.1 still serves.
     const local = config.host === null || Object.values(networkInterfaces()).flat().some(item => item?.address === config.host);
-    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、') || '尚未导入'}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}，监听 127.0.0.1${config.host ? ` 与 ${urlHost(config.host)}` : ''}，登录密码${password ? '已设置' : '未设置'}，页面 ${app.assets.size} 个文件${oilSummary(config.oil)}${optionsSummary(config.options)}${monitorSummary(config.monitor)}${assetSummary(config.asset)}${crossexSummary(config.crossex)}${ondoSummary(config.ondo, secrets.ondo)}${watchSummary(config.watch)}\n`);
+    process.stdout.write(`配置有效：${config.pairs.length} 个配对（${config.pairs.map(pair => pair.id).join('、') || '尚未导入'}），${secrets.accounts.size} 个账户，端口 ${config.port}，飞书${secrets.feishu ? '已配置' : '未配置'}，监听 127.0.0.1${config.host ? ` 与 ${urlHost(config.host)}` : ''}，登录密码${password ? '已设置' : '未设置'}，页面 ${app.assets.size} 个文件${oilSummary(config.oil)}${optionsSummary(config.options)}${monitorSummary(config.monitor)}${assetSummary(config.asset)}${crossexSummary(config.crossex)}${ondoSummary(config.ondo, secrets.ondo)}${mevSummary(config.mev, secrets.mev)}${watchSummary(config.watch)}\n`);
     if (!local) process.stdout.write(`注意：${config.host} 现在不在本机网卡上（地址写错，或 Tailscale 尚未连接）；服务会持续重试，在此之前页面只能经 127.0.0.1 打开\n`);
     return;
   }

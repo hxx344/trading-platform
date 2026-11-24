@@ -1,4 +1,4 @@
-import { Activity, ArrowLeftRight, Cpu, ChevronRight, Coins, Gauge, Layers, Menu, Newspaper, RefreshCw, Scale, ScrollText, Server, Settings2, ShieldCheck, Sigma, Wallet, Waves, type LucideIcon } from 'lucide-react';
+import { Activity, ArrowLeftRight, Cpu, ChevronRight, Coins, Gauge, Layers, Menu, Newspaper, RefreshCw, Scale, ScrollText, Server, Settings2, ShieldCheck, Sigma, Wallet, Waves, Zap, type LucideIcon } from 'lucide-react';
 import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { shellMarkets, type MarketScope, type MonitorScopes, type ShellView } from '../../src/shell-view.ts';
 import { LazyBoundary } from './LazyBoundary.tsx';
@@ -40,6 +40,7 @@ const GoldOilPage = lazy(() => import('./GoldOilPage.tsx').then(m => ({ default:
 const CrossexPage = lazy(() => import('./crossex/CrossexPage.tsx').then(m => ({ default: m.CrossexPage })));
 const OndoPage = lazy(() => import('./ondo/OndoPage.tsx').then(m => ({ default: m.OndoPage })));
 const VarLighterPage = lazy(() => import('./varlighter/VarLighterPage.tsx').then(m => ({ default: m.VarLighterPage })));
+const MevPage = lazy(() => import('./mev/MevPage.tsx').then(m => ({ default: m.MevPage })));
 const OptionsPage = lazy(() => import('./OptionsPage.tsx').then(m => ({ default: m.OptionsPage })));
 const StatusPage = lazy(() => import('./StatusPage.tsx').then(m => ({ default: m.StatusPage })));
 const LogsPage = lazy(() => import('./LogsPage.tsx').then(m => ({ default: memo(m.LogsPage) })));
@@ -52,7 +53,7 @@ function isStale(read: ResourceSnapshot<unknown>) {
 }
 
 const ALWAYS: readonly NavEntry[] = ['pairs', 'status', 'logs', 'settings'];
-const ICONS: Record<NavEntry, LucideIcon> = { asset: Wallet, positions: Layers, monitor: Activity, news: Newspaper, oil: ArrowLeftRight, hynix: Cpu, goldoil: Scale, crossex: Gauge, ondo: Coins, varlighter: Waves, pairs: ShieldCheck, options: Sigma, status: Server, logs: ScrollText, settings: Settings2 };
+const ICONS: Record<NavEntry, LucideIcon> = { asset: Wallet, positions: Layers, monitor: Activity, news: Newspaper, oil: ArrowLeftRight, hynix: Cpu, goldoil: Scale, crossex: Gauge, ondo: Coins, varlighter: Waves, pairs: ShieldCheck, options: Sigma, mev: Zap, status: Server, logs: ScrollText, settings: Settings2 };
 /** Below this width the side navigation is a drawer (the workbench's 760px breakpoint, shell.css). */
 const DRAWER_QUERY = '(max-width: 760px)';
 
@@ -104,7 +105,7 @@ export function App() {
   const tokenNotice = navNotice(readToken.data, Date.now());
   const available = new Set<NavEntry>(ALWAYS);
   if (state) {
-    for (const entry of ['oil', 'options', 'asset', 'crossex', 'ondo', 'news', 'varlighter'] as const) {
+    for (const entry of ['oil', 'options', 'asset', 'crossex', 'ondo', 'news', 'varlighter', 'mev'] as const) {
       if (state.modules[entry]) available.add(entry);
     }
     if (state.modules.oil) { available.add('hynix'); available.add('goldoil'); }
@@ -158,6 +159,7 @@ export function App() {
       case 'positions': return <AssetPositions onExpired={onExpired} />;
       case 'ondo': return <OndoPage onExpired={onExpired} />;
       case 'varlighter': return <VarLighterPage tab={route.tab} symbol={route.symbol} onExpired={onExpired} />;
+      case 'mev': return <MevPage tab={route.tab} onExpired={onExpired} />;
       case 'crossex': return <CrossexPage tab={route.tab} onExpired={onExpired} />;
       case 'hynix': return <HynixPage onExpired={onExpired} />;
       case 'goldoil': return <GoldOilPage onExpired={onExpired} />;

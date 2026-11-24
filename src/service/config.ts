@@ -18,13 +18,14 @@ import { parseAssetConfig, type AssetConfig } from './asset-config.ts';
 import { parseOptionsConfig, parseOptionsSecrets, type OptionsConfig } from './options-config.ts';
 import { parseCrossexConfig, parseCrossexSecrets, type CrossexServiceConfig } from './crossex-config.ts';
 import { parseOndoConfig, parseOndoSecrets, type OndoCredentials, type OndoServiceConfig } from './ondo-config.ts';
+import { assertDedicatedWallet, parseMevConfig, parseMevSecrets, type MevSecrets, type MevServiceConfig } from './mev-config.ts';
 import { parseWatchConfig, parseWatchSecret, type WatchConfig, type WatchSecret } from './watch.ts';
 
 const ACCOUNT_NAME = /^[0-9A-Za-z_-]{1,64}$/;
 const FEISHU_HOOK = /^https:\/\/open\.(feishu\.cn|larksuite\.com)\/open-apis\/bot\/v2\/hook\/[0-9A-Za-z_-]{8,128}$/;
 export const MAX_PAIRS = 20;
 /** Top-level blocks of modules besides the ASTER pairs; with any of them configured, pairs may be left out. */
-export const MODULE_KEYS = ['oil', 'options', 'monitor', 'asset', 'crossex', 'ondo'] as const;
+export const MODULE_KEYS = ['oil', 'options', 'monitor', 'asset', 'crossex', 'ondo', 'mev'] as const;
 
 /** `adl` seeds the pair's ADL settings when it is first registered; afterwards the page owns them. */
 export interface ServicePair { id: string; main: string; long: string; short: string; transfer: TransferConfig; adl?: AdlConfig }
@@ -47,6 +48,8 @@ export interface ServiceConfig {
   crossex?: CrossexServiceConfig;
   /** The Ondo maker-reward module; absent means none (ondo-config.ts). */
   ondo?: OndoServiceConfig;
+  /** MEV 套利（Base 同链 DEX 原子套利，docs/mev.md）；没有就不开。 */
+  mev?: MevServiceConfig;
   /** The scheduled ASTER summary card (summary.ts); absent: every 60 minutes. 0 turns it off. */
   summary?: { intervalMinutes: number };
   /** Where the heartbeat for the second server's main-watch goes (watch.ts); absent: none is pushed. */
@@ -67,6 +70,7 @@ export interface ServiceSecrets {
   /** The options module's Bybit key; only with options configured. */ bybitOptions?: LiveCredentials;
   /** The CrossEx module's Gate key; only with crossex configured. */ gate?: LiveCredentials;
   /** The Ondo API key; optional even with ondo configured. */ ondo?: OndoCredentials;
+  /** MEV 套利的节点地址与热钱包私钥；config.json 配了 mev 时必须有。 */ mev?: MevSecrets;
   /** The heartbeat's shared token; needed with config.json `watch`. */ watch?: WatchSecret;
 }
 
@@ -145,6 +149,7 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   const asset = modules.includes('asset') ? parseAssetConfig(value.asset) : undefined;
   const crossex = modules.includes('crossex') ? parseCrossexConfig(value.crossex) : undefined;
   const ondo = modules.includes('ondo') ? parseOndoConfig(value.ondo) : undefined;
+  const mev = modules.includes('mev') ? parseMevConfig(value.mev) : undefined;
   const pairsInput: unknown = hasModule && value.pairs === undefined ? [] : value.pairs;
   if (typeof value.secretsFile !== 'string' || !isAbsolute(value.secretsFile)) throw new Error('secretsFile 必须是绝对路径');
   const { port, host } = parseListenConfig(value);
@@ -179,11 +184,11 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
   const watch = value.watch === undefined ? undefined : parseWatchConfig(value.watch);
   if (value.news !== undefined && typeof value.news !== 'boolean') throw new Error('news 须为 true 或 false（EQN 快讯，不写为开启）');
   if (value.varLighter !== undefined && typeof value.varLighter !== 'boolean') throw new Error('varLighter 须为 true 或 false（Var/Lighter 价差，不写为开启）');
-  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs, ...(oil ? { oil } : {}), ...(options ? { options } : {}), ...(monitor ? { monitor } : {}), ...(asset ? { asset } : {}), ...(summary ? { summary } : {}), ...(crossex ? { crossex } : {}), ...(ondo ? { ondo } : {}), ...(watch ? { watch } : {}), ...(value.news === false ? { news: false } : {}), ...(value.varLighter === false ? { varLighter: false } : {}) };
+  return { port, host, budget: { limitPerMinute, adlReserve }, secretsFile: value.secretsFile, pairs, ...(oil ? { oil } : {}), ...(options ? { options } : {}), ...(monitor ? { monitor } : {}), ...(asset ? { asset } : {}), ...(summary ? { summary } : {}), ...(crossex ? { crossex } : {}), ...(ondo ? { ondo } : {}), ...(mev ? { mev } : {}), ...(watch ? { watch } : {}), ...(value.news === false ? { news: false } : {}), ...(value.varLighter === false ? { varLighter: false } : {}) };
 }
 
 export function parseServiceSecrets(raw: unknown, needed: readonly string[], oilVenues: readonly Venue[] = [], options = false, crossex = false, ondo = false): ServiceSecrets {
-  const value = exactKeys(raw, ['accounts'], ['feishu', 'feishuScheduled', 'feishuMonitor', 'watch', ...(oilVenues.length ? VENUES : []), ...(options ? ['bybitOptions'] : []), ...(crossex ? ['gate'] : []), ...(ondo ? ['ondo'] : [])]);
+  const value = exactKeys(raw, ['accounts'], ['feishu', 'feishuScheduled', 'feishuMonitor', 'watch', 'mev', ...(oilVenues.length ? VENUES : []), ...(options ? ['bybitOptions'] : []), ...(crossex ? ['gate'] : []), ...(ondo ? ['ondo'] : [])]);
   if (value.accounts === null || typeof value.accounts !== 'object' || Array.isArray(value.accounts)) throw new Error('accounts 须为 { 账户名: { user, signer, privateKey } }');
   const accounts = new Map<string, AsterCredentials>();
   for (const [name, item] of Object.entries(value.accounts as Record<string, unknown>)) {
@@ -198,7 +203,9 @@ export function parseServiceSecrets(raw: unknown, needed: readonly string[], oil
   const feishuMonitor = parseFeishu(value.feishuMonitor, 'feishuMonitor');
   const watch = value.watch === undefined ? undefined : parseWatchSecret(value.watch);
   const ondoKey = ondo ? parseOndoSecrets(value) : undefined;
-  return { accounts, feishu, ...(watch ? { watch } : {}), ...(feishuScheduled ? { feishuScheduled } : {}), ...(feishuMonitor ? { feishuMonitor } : {}), ...(oilVenues.length ? { exchanges: parseOilSecrets(value, oilVenues) } : {}), ...(options ? { bybitOptions: parseOptionsSecrets(value) } : {}), ...(crossex ? { gate: parseCrossexSecrets(value) } : {}), ...(ondoKey ? { ondo: ondoKey } : {}) };
+  // `mev` 不随配置开关：从工作台导入等只带部分模块标志的调用方读到已有的 mev 密钥时不应报「不支持的字段」。
+  const mev = parseMevSecrets(value);
+  return { accounts, feishu, ...(watch ? { watch } : {}), ...(feishuScheduled ? { feishuScheduled } : {}), ...(feishuMonitor ? { feishuMonitor } : {}), ...(oilVenues.length ? { exchanges: parseOilSecrets(value, oilVenues) } : {}), ...(options ? { bybitOptions: parseOptionsSecrets(value) } : {}), ...(crossex ? { gate: parseCrossexSecrets(value) } : {}), ...(ondoKey ? { ondo: ondoKey } : {}), ...(mev ? { mev } : {}) };
 }
 
 function parseFeishu(raw: unknown, name: string): FeishuSecret | null {
@@ -234,6 +241,10 @@ export function loadServiceSecrets(config: ServiceConfig, read = readPrivateFile
     const secrets = parseServiceSecrets(raw, [...new Set(config.pairs.flatMap(pair => [pair.main, pair.long, pair.short]))], config.oil?.accounts.map(account => account.venue) ?? [], config.options !== undefined, config.crossex !== undefined, config.ondo !== undefined);
     assertDistinctSigners(config, secrets);
     if (config.watch && !secrets.watch) throw new Error('config.json 配了 watch，密钥文件须有 watch.token');
+    if (config.mev) {
+      if (!secrets.mev) throw new Error('config.json 配了 mev，密钥文件须有 mev（rpcUrl、privateKey）');
+      assertDedicatedWallet(config.mev, secrets.mev, [...secrets.accounts.values()].flatMap(account => [account.user, account.signer]));
+    }
     return secrets;
   } catch (error) { throw fail('密钥文件', error); }
 }

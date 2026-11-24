@@ -1,6 +1,8 @@
-// The page's views live in the address hash (#/pair/<pair>, #/status, #/logs, #/settings, #/oil, #/hynix, #/goldoil, #/options[/positions|/orders|/performance|/rfq], #/monitor, #/asset, #/positions, #/crossex[/trade|/hedge|/orders|/settings], #/ondo, #/news, #/varlighter[/detail[/<场所:代码>]|/paper|/ready]), so a reload or a shared
+// The page's views live in the address hash (#/pair/<pair>, #/status, #/logs, #/settings, #/oil, #/hynix, #/goldoil, #/options[/positions|/orders|/performance|/rfq], #/monitor, #/asset, #/positions, #/crossex[/trade|/hedge|/orders|/settings], #/ondo, #/news, #/varlighter[/detail[/<场所:代码>]|/paper|/ready], #/mev[/opportunities|/transactions|/pools|/settings]), so a reload or a shared
 // link opens the same view. Kept free of the DOM so the server-side tests can import it.
-export type Route = { page: 'overview' } | { page: 'pair'; pairId: string | null } | { page: 'status' } | { page: 'logs' } | { page: 'settings' } | { page: 'oil' } | { page: 'hynix' } | { page: 'goldoil' } | { page: 'options'; tab: 'desk' | 'positions' | 'orders' | 'performance' | 'rfq' } | { page: 'monitor' } | { page: 'asset' } | { page: 'positions' } | { page: 'crossex'; tab: CrossexTab } | { page: 'ondo' } | { page: 'news' } | { page: 'varlighter'; tab: VarLighterTab; symbol: string | null };
+export type Route = { page: 'overview' } | { page: 'pair'; pairId: string | null } | { page: 'status' } | { page: 'logs' } | { page: 'settings' } | { page: 'oil' } | { page: 'hynix' } | { page: 'goldoil' } | { page: 'options'; tab: 'desk' | 'positions' | 'orders' | 'performance' | 'rfq' } | { page: 'monitor' } | { page: 'asset' } | { page: 'positions' } | { page: 'crossex'; tab: CrossexTab } | { page: 'ondo' } | { page: 'news' } | { page: 'varlighter'; tab: VarLighterTab; symbol: string | null } | { page: 'mev'; tab: MevTab };
+export type MevTab = 'overview' | 'opportunities' | 'transactions' | 'pools' | 'settings';
+const MEV_TABS: readonly MevTab[] = ['opportunities', 'transactions', 'pools', 'settings'];
 export type VarLighterTab = 'overview' | 'detail' | 'paper' | 'ready';
 export type CrossexTab = 'positions' | 'trade' | 'hedge' | 'orders' | 'settings';
 const CROSSEX_TABS: readonly CrossexTab[] = ['trade', 'hedge', 'orders', 'settings'];
@@ -33,6 +35,8 @@ export function parseRoute(hash: string): Route {
     try { symbol = decodeURIComponent(symbol); } catch { symbol = ''; }
     return { page: 'varlighter', tab: 'detail', symbol: /^(rh|lighter):[A-Z0-9]{1,20}$/.test(symbol) ? symbol : null };
   }
+  if (hash === '#/mev') return { page: 'mev', tab: 'overview' };
+  if (hash.startsWith('#/mev/')) { const tab = MEV_TABS.find(item => hash === `#/mev/${item}`); if (tab) return { page: 'mev', tab }; }
   if (hash.startsWith('#/crossex/')) { const tab = CROSSEX_TABS.find(item => hash === `#/crossex/${item}`); if (tab) return { page: 'crossex', tab }; }
   if (hash === '#/pair' || hash === '#/pair/') return { page: 'pair', pairId: null };
   if (hash.startsWith('#/pair/')) {

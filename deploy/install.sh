@@ -38,6 +38,12 @@
 #   sudo bash install.sh --watch-import       同上，地址与令牌取自本机工作台版本的心跳推送端配置 /etc/main-watch/sender，并停用那个推送端
 #   sudo bash install.sh --watch-off          关闭巡检心跳（回退到 v0.46.0 及更早版本前须先执行）。这三项与 --set-password 一样
 #                                             沿用当前已装版本、不联网升级（已装版本早于 v0.47.0 时先升级到最新版）
+#   sudo bash install.sh --set-mev --mev-executor <合约地址> --mev-owner <利润收款地址>
+#                                             开启或修改 MEV 套利（Base 链上原子套利，docs/mev.md）：随后依次询问 Base 节点地址、
+#                                             发送用节点地址（可留空）、专用热钱包私钥，都不回显、不进命令行；留空沿用已保存的值。
+#                                             脚本化时加 --mev-stdin，从标准输入读这三行（发送用节点地址填 - 表示去掉）。
+#                                             开启后是观察模式，实盘在页面上核对后手动开始；沿用当前已装版本，不联网升级
+#   sudo bash install.sh --unset-mev          关闭 MEV 套利并去掉节点地址与热钱包私钥（回退到不含该模块的版本前须先执行）
 #
 # 页面总在 127.0.0.1 监听（用 SSH 隧道打开）；在 config.json 写 "host": "<本机 Tailscale IP>" 后也在该地址监听，直接打开。
 # 删除 /etc/trading-platform/login-password 再执行本脚本即取消密码，只能用数据目录 access-url 里的链接登录。
@@ -107,7 +113,7 @@ restore_import() {
   if ((${#failed[@]} == 0)); then log "已恢复${backup_what}前的配置文件。"
   else printf '恢复%s前的配置失败：%s 可能仍是%s后的内容，请检查后手工改回\n' "$backup_what" "$(join "${failed[@]}")" "$backup_what" >&2; fi
 }
-usage() { sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 version=''
 package_dir=''
@@ -130,6 +136,11 @@ watch_url=''
 watch_token=''
 watch_import=0
 watch_off=0
+set_mev=0
+unset_mev=0
+mev_stdin=0
+mev_executor=''
+mev_owner=''
 while (($#)); do
   case "$1" in
     --import-workbench) import_workbench=1; shift ;;
@@ -151,6 +162,11 @@ while (($#)); do
     --watch-token) [[ $# -ge 2 && -n "$2" ]] || usage 2; watch_token=$2; shift 2 ;;
     --watch-import) watch_import=1; shift ;;
     --watch-off) watch_off=1; shift ;;
+    --set-mev) set_mev=1; shift ;;
+    --unset-mev) unset_mev=1; shift ;;
+    --mev-stdin) mev_stdin=1; shift ;;
+    --mev-executor) [[ $# -ge 2 && -n "$2" ]] || usage 2; mev_executor=$2; shift 2 ;;
+    --mev-owner) [[ $# -ge 2 && -n "$2" ]] || usage 2; mev_owner=$2; shift 2 ;;
     --version) [[ $# -ge 2 ]] || usage 2; version=$2; shift 2 ;;
     --package) [[ $# -ge 2 ]] || usage 2; package_dir=$2; shift 2 ;;
     -h|--help) usage 0 ;;
@@ -177,6 +193,13 @@ if [[ -n "$watch_url" ]] || ((watch_import || watch_off)); then watch_change=1; 
 ((!watch_import || !watch_off)) || fail '--watch-url、--watch-import、--watch-off 只能用一个'
 [[ -z "$watch_token" || -n "$watch_url" ]] || fail '--watch-token 须和 --watch-url 一起使用'
 [[ -z "$watch_token" || "$watch_token" =~ ^[A-Za-z0-9_-]{32,256}$ ]] || fail '--watch-token 须为 32~256 位字母、数字、- 或 _（副服务器 /etc/main-watch/config 的 HEARTBEAT_TOKEN）'
+mev_change=0
+if ((set_mev || unset_mev)); then mev_change=1; fi
+((!set_mev || !unset_mev)) || fail '--set-mev 与 --unset-mev 只能用一个'
+((set_mev)) || [[ -z "$mev_executor$mev_owner" ]] || fail '--mev-executor 与 --mev-owner 须和 --set-mev 一起使用'
+((set_mev || !mev_stdin)) || fail '--mev-stdin 须和 --set-mev 一起使用'
+((!set_mev)) || [[ "$mev_executor" =~ ^0x[0-9a-fA-F]{40}$ && "$mev_owner" =~ ^0x[0-9a-fA-F]{40}$ ]] || fail '--set-mev 须同时给出 --mev-executor 与 --mev-owner（0x 开头的 40 位十六进制地址）'
+((!mev_stdin || !password_stdin)) || fail '--mev-stdin 与 --password-stdin 都读标准输入，请分两次执行'
 
 [[ "$(uname -s)" == Linux ]] || fail '只支持 Linux。'
 if [[ "$TEST_MODE" != 1 ]]; then
@@ -203,6 +226,26 @@ if ((set_password)); then
     fail '标准输入不是终端：请在终端里执行，或加 --password-stdin 从标准输入读一行密码'
   fi
   ((${#new_password} >= 8)) || fail '密码至少 8 个字符'
+fi
+# The node address (it may carry the provider's key) and the hot wallet's key are asked for the same way: hidden
+# prompts on a terminal, three lines with --mev-stdin. Neither is ever an argument, so neither shows in ps or history.
+mev_input=''
+if ((set_mev)); then
+  if ((mev_stdin)); then
+    [[ -f "$0" ]] || fail '脚本本身从标准输入读入时不能用 --mev-stdin：先下载 install.sh 再执行'
+    IFS= read -r mev_rpc || true
+    IFS= read -r mev_send || true
+    IFS= read -r mev_key || true
+  elif [[ -t 0 ]]; then
+    IFS= read -rs -p 'Base 节点地址（https，不回显；留空沿用已保存的）：' mev_rpc; printf '\n' >&2
+    IFS= read -rs -p '发送交易用的节点地址（不回显；留空沿用已保存的或与上一项相同，填 - 去掉）：' mev_send; printf '\n' >&2
+    IFS= read -rs -p '专用热钱包私钥（64 位十六进制，不回显；留空沿用已保存的）：' mev_key; printf '\n' >&2
+  else
+    [[ -f "$0" ]] || fail '标准输入不是终端：请先下载 install.sh，再在终端里执行 sudo bash install.sh --set-mev …'
+    fail '标准输入不是终端：请在终端里执行，或加 --mev-stdin 从标准输入读三行（节点地址、发送用节点地址、热钱包私钥）'
+  fi
+  mev_input=$(printf '%s\n%s\n%s' "$mev_rpc" "$mev_send" "$mev_key")
+  unset mev_rpc mev_send mev_key
 fi
 
 
@@ -234,7 +277,10 @@ trap 'exit 130' INT TERM HUP
 installed_sha=$(cat "$APP_DIR/current/.package-sha256" 2>/dev/null || true)
 keep_installed=0
 if [[ -z "$version$package_dir" && "$installed_sha" =~ ^[a-f0-9]{64}$ ]]; then
-  if ((set_password)) || { ((watch_change)) && [[ -f "$APP_DIR/current/src/service/watch-config.ts" ]]; }; then keep_installed=1; fi
+  if ((set_password)) || { ((watch_change)) && [[ -f "$APP_DIR/current/src/service/watch-config.ts" ]]; } ||
+     { ((mev_change)) && [[ -f "$APP_DIR/current/src/service/mev-setup.ts" ]]; }; then keep_installed=1; fi
+  # Turning the module on needs a release that has it: an installed one from before it existed takes the latest.
+  if ((set_mev)) && [[ ! -f "$APP_DIR/current/src/service/mev-setup.ts" ]]; then keep_installed=0; fi
 fi
 if ((keep_installed)); then
   printf '%s  trading-platform.tar.gz\n' "$installed_sha" >"$work_dir/SHA256SUMS"
@@ -531,6 +577,22 @@ if ((watch_change)); then
   if [[ -n "$watch_url" ]]; then printf '%s\n' "$watch_token" | set_watch || fail '设置巡检心跳失败'
   else set_watch </dev/null || fail '设置巡检心跳失败'; fi
   watch_token=''
+fi
+# MEV arbitrage (docs/mev.md): the contract and owner addresses go into config.json, the node address and the hot
+# wallet's key into the key file. Run as root like the import; the secrets reach the program on stdin only.
+if ((mev_change)); then
+  if [[ ! -f "$release_dir/src/service/mev-setup.ts" ]]; then
+    # Turning off what a release without the module cannot hold needs nothing from that release.
+    ((set_mev)) && fail "版本 $new_version 不支持 MEV 套利，请用最新版本"
+    grep -q '"mev"' "$CONF_DIR/config.json" 2>/dev/null && fail "版本 $new_version 不含 MEV 套利模块：先在当前版本上执行 sudo bash install.sh --unset-mev，再安装它"
+  else
+    [[ -f "$CONF_DIR/config.json" ]] || fail "尚无 $CONF_DIR/config.json，无法设置 MEV 套利"
+    backup_conf_files '设置 MEV 套利'
+    set_mev_files() { (cd / && "$NODE_BIN" "$release_dir/src/service/mev-setup.ts" --config "$CONF_DIR/config.json" "$@" 9>&-); }
+    if ((unset_mev)); then set_mev_files --off </dev/null || fail '关闭 MEV 套利失败'
+    else printf '%s\n' "$mev_input" | set_mev_files --executor "$mev_executor" --owner "$mev_owner" || fail '设置 MEV 套利失败'; fi
+  fi
+  mev_input=''
 fi
 configured=0
 if [[ -f "$CONF_DIR/config.json" ]]; then

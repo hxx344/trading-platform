@@ -75,6 +75,8 @@ const WEI = 1e18;
 export const weiToEth = (wei: bigint): number => Number(wei) / WEI;
 /** 小费下限：0.001 gwei。Base 的基础费常在这个量级，零小费的交易排在同区块的最后。 */
 export const MIN_TIP_WEI = 1_000_000n;
+/** 单笔小费合计（按 gas 上限计）最多占每日 gas 预算的比例。 */
+export const MAX_TIP_BUDGET_SHARE = 0.25;
 /** gas 上限取估算值的 1.3 倍：状态在两个区块之间会变，路径上的 tick 穿越数不同。 */
 const gasLimitOf = (estimate: bigint): bigint => estimate * 13n / 10n;
 
@@ -106,6 +108,10 @@ export function planTransaction({ profit, startDecimals, startUsd, ethUsd, gasEs
   if (gasLimit > BigInt(settings.maxGasLimit)) return fail(`预估 gas ${gasLimit} 超过单笔上限 ${settings.maxGasLimit}`);
   const profitWei = BigInt(Math.floor(profitUsd / ethUsd * WEI));
   let tip = profitWei * BigInt(Math.round(settings.tipShare * 10_000)) / 10_000n / gasEstimate;
+  // 一笔的小费合计不超过每日预算的 MAX_TIP_BUDGET_SHARE：利润（或被操纵的现货价）再大，也不会一笔花光当日预算，
+  // 大机会按封顶的小费发出，而不是因为放不进预算被整笔跳过。
+  const tipCap = BigInt(Math.floor(settings.dailyGasBudgetEth * MAX_TIP_BUDGET_SHARE * WEI)) / gasLimit;
+  if (tip > tipCap) tip = tipCap;
   if (tip < MIN_TIP_WEI) tip = MIN_TIP_WEI;
   let maxFee = baseFee * 3n + tip;
   if (feeFloor) {

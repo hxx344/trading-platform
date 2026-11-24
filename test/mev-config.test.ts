@@ -59,7 +59,7 @@ test('热钱包必须专用：不能是 owner、执行合约或任何 ASTER 账�
 
 test('服务配置：有 mev 才开模块；配了 mev 而密钥文件没有时拒绝，报错不带密钥', () => {
   const base = { secretsFile: '/etc/tp/secrets.json' };
-  assert.ok(!('mev' in parseServiceConfig(base)), '没有 mev 时配置与之前相同');
+  assert.ok(!('mev' in parseServiceConfig({ ...base, pairs: [] })), '没有 mev 时配置与之前相同');
   const config = parseServiceConfig({ ...base, mev: { executor: EXECUTOR, owner: OWNER } });
   assert.deepEqual(config.mev, { executor: EXECUTOR, owner: OWNER });
   assert.throws(() => parseServiceConfig({ ...base, mev: {} }), /mev 无效/);
@@ -70,7 +70,7 @@ test('服务配置：有 mev 才开模块；配了 mev 而密钥文件没有时�
   assert.match(text, /私钥格式无效/);
   assert.ok(!text.includes('4c0883a6') && !text.includes('rpc-key-secret'), text);
   // 没配 mev 的服务读到留在密钥文件里的 mev 不报「不支持的字段」。
-  assert.deepEqual(loadServiceSecrets(parseServiceConfig(base), () => JSON.stringify({ accounts: {}, mev: { rpcUrl: RPC, privateKey: KEY } })).mev, { rpcUrl: RPC, privateKey: KEY });
+  assert.deepEqual(loadServiceSecrets(parseServiceConfig({ ...base, pairs: [] }), () => JSON.stringify({ accounts: {}, mev: { rpcUrl: RPC, privateKey: KEY } })).mev, { rpcUrl: RPC, privateKey: KEY });
 });
 
 test('设置助手：第一次须给全，之后空项沿用已保存的值，结果不含私钥与节点地址原文', () => {
@@ -141,13 +141,14 @@ test('/api/mev：没配模块时 404；配了以后状态不带私钥与节点�
     const base = `http://127.0.0.1:${port}`;
     return {
       get: (route: string) => fetch(base + route, { headers: { cookie } }),
+      raw: (route: string, init: { method: string; headers: Record<string, string>; body: string }) => fetch(base + route, { ...init, headers: { ...init.headers, cookie } }),
       post: (route: string, body: unknown) => fetch(base + route, { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }, body: JSON.stringify(body) }),
     };
   };
 
   {
     const port = await freePort(), data = join(dir, 'plain');
-    const run = await startService({ config: parseServiceConfig({ secretsFile: '/etc/tp/secrets.json' }), secrets: { accounts: new Map(), feishu: null }, dir: data, port, fetchImpl: outside, app });
+    const run = await startService({ config: parseServiceConfig({ secretsFile: '/etc/tp/secrets.json', pairs: [] }), secrets: { accounts: new Map(), feishu: null }, dir: data, port, fetchImpl: outside, app });
     try {
       const { get } = await session(data, port);
       const missing = await get('/api/mev/state');
@@ -170,7 +171,7 @@ test('/api/mev：没配模块时 404；配了以后状态不带私钥与节点�
     secrets: { accounts: new Map(), feishu: null, mev: { rpcUrl: RPC, privateKey: KEY } }, dir: data, port, fetchImpl: outside, app, mevOptions: { fetchImpl: chain.fetchImpl, pollMs: 20 },
   });
   try {
-    const { get, post } = await session(data, port);
+    const { get, post, raw } = await session(data, port);
     assert.equal(((await (await get('/api/shell')).json()) as { modules: { mev: boolean } }).modules.mev, true);
     const answer = await get('/api/mev/state');
     assert.equal(answer.status, 200);
@@ -188,7 +189,11 @@ test('/api/mev：没配模块时 404；配了以后状态不带私钥与节点�
     assert.equal(((await wrong.json()) as { code: string }).code, 'confirm_required');
     // 不带执行头的写入被拒绝，和其他模块一样。
     const bare = await fetch(`http://127.0.0.1:${port}/api/mev/live/stop`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
-    assert.ok(bare.status === 401 || bare.status === 403, String(bare.status));
+    assert.equal(bare.status, 401);
+    // 登录了但不带执行头的写入按 csrf 拒绝。
+    const headless = await raw('/api/mev/live/stop', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    assert.equal(headless.status, 403);
+    assert.equal(((await headless.json()) as { code: string }).code, 'csrf');
     assert.equal((await post('/api/mev/live/stop', {})).status, 200);
     assert.equal(((await (await get('/api/mev/state')).json()) as { mode: string }).mode, 'observe');
   } finally { await run.shutdown(); await run.done; }

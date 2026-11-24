@@ -65,7 +65,7 @@ function Overview({ view, write, onChanged }: { view: MevStateView; write: Write
   const profitUsd = today.profits.reduce((sum, item) => sum + (item.usd ?? 0), 0);
   const start = () => {
     if (!confirm(startConfirmText(view))) return;
-    void write.run('start', () => api(`${MEV_BASE}/live/start`, { body: { confirm: view.operator } }), () => { void onChanged(); return '实盘已开始'; });
+    void write.run('start', () => api(`${MEV_BASE}/live/start`, { body: { confirm: view.operator, fault: view.fault, haltReason: view.haltReason } }), () => { void onChanged(); return '实盘已开始'; });
   };
   const stop = () => { void write.run('stop', () => api(`${MEV_BASE}/live/stop`, { body: {} }), () => { void onChanged(); return '已停止实盘，回到观察模式；未结清的交易继续核对'; }); };
   return <>

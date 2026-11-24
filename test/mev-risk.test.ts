@@ -4,10 +4,10 @@ import assert from 'node:assert/strict';
 import { KIND_AERO_V2, KIND_V3 } from '../src/mev/chain.ts';
 import { cycleEdgeBps, enumerateCycles, poolDepthUsd, rankCandidates, tokenPricesUsd } from '../src/mev/cycles.ts';
 import type { Pool, PoolState } from '../src/mev/pools.ts';
-import { DEFAULT_SETTINGS, MIN_TIP_WEI, SettingsError, gate, parseSettings, planTransaction, storedSettings, utcDayStart, type PlanInput } from '../src/mev/risk.ts';
+import { DEFAULT_SETTINGS, MAX_TIP_BUDGET_SHARE, MIN_TIP_WEI, SettingsError, gate, parseSettings, planTransaction, storedSettings, utcDayStart, type PlanInput } from '../src/mev/risk.ts';
 import { gridSizes, refineSizes } from '../src/mev/simulate.ts';
 
-const base: PlanInput = { profit: 2n * 10n ** 15n, startDecimals: 18, startUsd: 3_400, ethUsd: 3_400, gasEstimate: 380_000n, baseFee: 5_000_000n, l1Fee: 2_000_000_000n, settings: DEFAULT_SETTINGS };
+const base: PlanInput = { profit: 2n * 10n ** 15n, startDecimals: 18, startUsd: 3_400, ethUsd: 3_400, gasEstimate: 380_000n, baseFee: 5_000_000n, l1Fee: 2_000_000_000n, settings: { ...DEFAULT_SETTINGS, dailyGasBudgetEth: 0.01 } };
 
 test('出价：小费取利润的一份，净利过两道门槛才发；链上最低利润不低于费用', () => {
   const plan = planTransaction(base);
@@ -43,6 +43,23 @@ test('出价：净利不足、gas 超限、依据无效、费用超过利润时�
   const floor = planTransaction({ ...base, profit: 10n ** 12n, settings: { ...DEFAULT_SETTINGS, minNetUsd: 0.01, gasMultiple: 1 } });
   assert.ok(!floor.ok, '利润太小时小费取下限，净利为负');
   assert.equal(MIN_TIP_WEI, 1_000_000n);
+});
+
+test('出价：单笔小费合计封顶在每日预算的一份，大利润（或被读低的 ETH 价）不会一笔花光预算', () => {
+  const budget = BigInt(Math.floor(DEFAULT_SETTINGS.dailyGasBudgetEth * MAX_TIP_BUDGET_SHARE * 1e18));
+  const capped = planTransaction({ ...base, settings: DEFAULT_SETTINGS });
+  assert.ok(capped.ok);
+  if (!capped.ok) return;
+  const cap = budget / capped.gasLimit;
+  assert.equal(capped.maxPriorityFeePerGas, cap, '默认预算下利润的三成已超过封顶');
+  // 利润大 50 倍、ETH 价被读低 100 倍：小费不变，这一笔仍放得进当日预算。
+  for (const input of [{ ...base, profit: 10n ** 17n }, { ...base, ethUsd: 34 }]) {
+    const big = planTransaction({ ...input, settings: DEFAULT_SETTINGS });
+    assert.ok(big.ok);
+    if (!big.ok) return;
+    assert.equal(big.maxPriorityFeePerGas, cap);
+    assert.ok(big.gasLimit * big.maxPriorityFeePerGas <= budget);
+  }
 });
 
 test('出价：同一个 nonce 上的替换交易两项费用都比上一笔高出 25% 以上', () => {

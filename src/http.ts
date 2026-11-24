@@ -896,8 +896,7 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
       } catch (error) {
         if (error instanceof ContractError) throw error;
         const failure = mev.failure(error);
-        if (failure.internal) process.stderr.write(`MEV 接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}
-`);
+        if (failure.internal) process.stderr.write(`MEV 接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}\n`);
         return send(response, failure.status, failure.body);
       }
       return send(response, 404, { code: 'not_found', message: '不存在' });

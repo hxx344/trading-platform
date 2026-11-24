@@ -42,8 +42,8 @@
 #                                             开启或修改 MEV 套利（Base 链上原子套利，docs/mev.md）：随后依次询问 Base 节点地址、
 #                                             发送用节点地址（可留空）、专用热钱包私钥，都不回显、不进命令行；留空沿用已保存的值。
 #                                             脚本化时加 --mev-stdin，从标准输入读这三行（发送用节点地址填 - 表示去掉）。
-#                                             开启后是观察模式，实盘在页面上核对后手动开始；沿用当前已装版本，不联网升级
-#   sudo bash install.sh --unset-mev          关闭 MEV 套利并去掉节点地址与热钱包私钥（回退到不含该模块的版本前须先执行）
+#                                             开启后是观察模式，实盘在页面上核对后手动开始；沿用当前已装版本、不联网升级（已装版本不带本模块时先升级到最新版）
+#   sudo bash install.sh --unset-mev          关闭 MEV 套利并去掉节点地址与热钱包私钥（回退到不含该模块的版本前须先执行）；不换版本、不联网
 #
 # 页面总在 127.0.0.1 监听（用 SSH 隧道打开）；在 config.json 写 "host": "<本机 Tailscale IP>" 后也在该地址监听，直接打开。
 # 删除 /etc/trading-platform/login-password 再执行本脚本即取消密码，只能用数据目录 access-url 里的链接登录。
@@ -281,6 +281,8 @@ if [[ -z "$version$package_dir" && "$installed_sha" =~ ^[a-f0-9]{64}$ ]]; then
      { ((mev_change)) && [[ -f "$APP_DIR/current/src/service/mev-setup.ts" ]]; }; then keep_installed=1; fi
   # Turning the module on needs a release that has it: an installed one from before it existed takes the latest.
   if ((set_mev)) && [[ ! -f "$APP_DIR/current/src/service/mev-setup.ts" ]]; then keep_installed=0; fi
+  # Turning it off never changes the release: on one from before the module there is nothing to remove.
+  if ((unset_mev)); then keep_installed=1; fi
 fi
 if ((keep_installed)); then
   printf '%s  trading-platform.tar.gz\n' "$installed_sha" >"$work_dir/SHA256SUMS"

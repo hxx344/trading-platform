@@ -437,8 +437,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   const news: NewsHolder | null = newsOptions ? { feed: null } : null;
   const varLighter: VarLighterHolder | null = varLighterOptions ? openVarLighter(dir, varLighterOptions, line => process.stderr.write(`${line}\n`)) : null;
   // MEV 套利（docs/mev.md）：启动后只观察；实盘从页面开始。打不开库只停用本模块。
-  const mev: MevHolder | null = config.mev && secrets.mev ? openMev(config.mev, secrets.mev, dir, mevOptions ?? {}, { log: line => process.stderr.write(`${line}
-`), notify: (key, text) => notifier.notifyOnce(key, text) }) : null;
+  const mev: MevHolder | null = config.mev && secrets.mev ? openMev(config.mev, secrets.mev, dir, mevOptions ?? {}, { log: line => process.stderr.write(`${line}\n`), notify: (key, text) => notifier.notifyOnce(key, text) }) : null;
   return runExecutor({
     executor, store, dir, port, socketPath, executionBuild, configBuild, app, sessions, readTokens,
     ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: oil ? ['jobs', 'transfers', 'adl'] : ['transfers', 'adl'], drainMs: DRAIN_MS,
@@ -534,6 +533,8 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       // A CrossEx or options start in flight gives up rather than hold the shutdown up.
       crossex?.abort();
       options?.abort();
+      // MEV：先让引擎不再发新交易，再中止在途的节点请求，这一轮不占满停服的等待时间。
+      if (mev) { mev.engine?.quiesce(); mev.stop.abort(); }
     },
     onStopped: async lateLeaseLoss => {
       // Events from the drain (an unknown transfer, an ADL batch) go out now rather than at the next start.

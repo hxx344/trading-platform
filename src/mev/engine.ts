@@ -50,6 +50,11 @@ export const DEADLINE_BLOCKS = 2;
 export const SEND_REJECT_LIMIT = 3;
 /** 模拟后没有任何一档盈利的环路，这么久之内不再模拟（现货价差多半来自很浅的池子，占着每区块的模拟名额）。 */
 export const UNPROFITABLE_COOLDOWN_MS = 30_000;
+/** 过期交易在这么久之内还按「可能仍在节点的交易池里」对待：同 nonce 的新交易以它的费用为底加价。更早的不再抬高底价；
+ * 节点若仍留着它，会以 replacement underpriced 拒收，那时再按全部过期交易加价。 */
+export const FEE_FLOOR_WINDOW_MS = 10 * 60_000;
+/** 实盘中多久重新核对一次执行合约（owner 可能换掉了 operator）。 */
+export const REVERIFY_MS = 10 * 60_000;
 /** 同一条环路多久记一次机会（发送的那次不受限）。 */
 const RECORD_EVERY_MS = 30_000;
 
@@ -79,6 +84,10 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
   let fault = store.readState<string | null>('fault') ?? null;
   let verification: { ok: boolean; reason: string | null; checkedAt: number } = { ok: false, reason: '尚未核对合约', checkedAt: 0 };
   let live = false, liveSince: number | null = null, haltReason: string | null = null, sendRejects = 0;
+  /** 白名单每改一次加一：在途的目录刷新据此知道自己读的名单已经过时。 */
+  let tokenGeneration = 0;
+  /** 节点以 replacement underpriced 拒收过的 nonce：这个 nonce 上按全部过期交易加价。 */
+  let underpricedNonce: number | null = null;
   let head: { number: number; timestamp: number; baseFee: bigint; seenAt: number } | null = null;
   let account: ChainAccount | null = null;
   let lagging = false, lastError: string | null = null, lastOkAt = 0;
@@ -90,6 +99,21 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
   // 首次启动：起始代币与默认的中间代币进白名单（中间代币的符号与精度在第一次刷新目录时从链上读）。
   if (!store.tokens().length) for (const token of START_TOKENS) store.putToken(token, now());
   let seedPending = store.readState<boolean>('seeded') !== true;
+
+  // 库绑定热钱包与合约：--set-mev 换了其中之一后，旧钱包留下的未结清交易按新钱包的 nonce 核对不出结论，
+  // 这里直接结清（旧钱包上它们最多因过期回滚、花旧钱包的 gas），连续回滚计数与故障记录也不带到新钱包。
+  {
+    const identity = `${operator}:${executor}`, bound = store.readState<string>('identity');
+    if (bound !== null && bound !== identity) {
+      const stale = store.openTxs();
+      store.transaction(() => { for (const tx of stale) store.settleTx(tx.hash, 'lost', now(), { error: '热钱包或执行合约已更换，这笔交易不再核对' }); });
+      consecutiveReverts = 0; fault = null;
+      store.writeState('consecutiveReverts', 0, now()); store.writeState('fault', null, now());
+      log(`mev: 热钱包或执行合约已更换，结清旧配置留下的 ${stale.length} 笔未结清交易`);
+    }
+    if (bound !== identity) store.writeState('identity', identity, now());
+  }
+  let stopping = false;
 
   const tokenMap = (): Map<string, TokenInfo> => new Map(store.tokens().map(token => [token.address, token]));
   const persist = (key: string, value: unknown) => store.writeState(key, value, now());
@@ -128,8 +152,12 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
     if (!verification.ok) halt(verification.reason ?? '合约核对未通过');
   }
 
+  /** 只留两种代币都在白名单里的池子。 */
+  const allowedPools = (list: readonly Pool[]): Pool[] => { const allowed = new Set(store.tokens().map(token => token.address)); return list.filter(pool => allowed.has(pool.token0) && allowed.has(pool.token1)); };
+  const rebuildCycles = (): void => { cycles = enumerateCycles(pools, START_TOKENS.map(token => token.address)); cooldownUntil.clear(); recordedAt.clear(); };
+
   async function refreshDirectory(): Promise<void> {
-    const at = now();
+    const at = now(), generation = tokenGeneration;
     try {
       if (seedPending) {
         for (const address of DEFAULT_MIDDLE_TOKENS) { const token = await readToken(rpc, address); if (token) store.putToken(token, at); }
@@ -144,10 +172,12 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
       // 刷新失败沿用上一份目录；下个周期再试。
       directoryError = errorText(error);
     }
-    cycles = enumerateCycles(pools, START_TOKENS.map(token => token.address));
-    cooldownUntil.clear(); recordedAt.clear();
+    // 刷新失败沿用的旧目录、刷新期间白名单又变了的新目录，都按此刻的白名单过滤：移出的代币立即不再参与。
+    pools = allowedPools(pools);
+    rebuildCycles();
     directoryAt = at;
-    directoryStale = false;
+    // 刷新期间白名单变过：这份目录是按旧名单查的，下一轮重查。
+    directoryStale = generation !== tokenGeneration;
   }
 
   /** 未结清交易按最坏情况预留的费用：同一个 nonce 上只可能有一笔上链，取其中最大的。 */
@@ -188,9 +218,12 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
     if (!costs) return;
     const open = store.openTxs();
     const atNonce = open.filter(tx => tx.nonce === account!.nonce);
-    const feeFloor = atNonce.length ? {
-      maxFeePerGas: atNonce.reduce((max, tx) => tx.maxFeePerGas > max ? tx.maxFeePerGas : max, 0n),
-      maxPriorityFeePerGas: atNonce.reduce((max, tx) => tx.maxPriorityFeePerGas > max ? tx.maxPriorityFeePerGas : max, 0n),
+    // 加价的底：近期的同 nonce 交易可能还在节点的交易池里。久远的不再抬高底价，否则一笔高小费的过期交易会让之后的
+    // 小机会永远「净利不足」；节点真的还留着它时会拒收，underpricedNonce 记下后改按全部加价。
+    const floorFrom = underpricedNonce === account.nonce ? atNonce : atNonce.filter(tx => now() - tx.createdAt < FEE_FLOOR_WINDOW_MS);
+    const feeFloor = floorFrom.length ? {
+      maxFeePerGas: floorFrom.reduce((max, tx) => tx.maxFeePerGas > max ? tx.maxFeePerGas : max, 0n),
+      maxPriorityFeePerGas: floorFrom.reduce((max, tx) => tx.maxPriorityFeePerGas > max ? tx.maxPriorityFeePerGas : max, 0n),
     } : undefined;
     const plan: Plan = planTransaction({ profit: best.profit, startDecimals: start.decimals, startUsd, ethUsd, gasEstimate: costs.gas, baseFee: block.baseFee, l1Fee: costs.l1Fee, settings, ...(feeFloor ? { feeFloor } : {}) });
     const at = now();
@@ -204,12 +237,20 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
       store.addOpportunity({ ...entry, outcome, reason });
     };
     if (!plan.ok) return record('thin', plan.reason);
-    if (!live) return record('observed', null);
+    if (!live || stopping) return record('observed', null);
     if (sentThisBlock.value) return record('blocked', '本区块已发送一笔');
     if (at - block.seenAt > SEND_WINDOW_MS) return record('blocked', '模拟完成时区块状态已旧');
     if (open.some(tx => tx.status !== 'expired')) return record('blocked', '上一笔交易还没有结论');
     if (open.some(tx => tx.nonce !== account!.nonce)) return record('blocked', '有 nonce 对不上的未结清交易，等待核对');
-    if (atNonce.length >= MAX_OPEN_PER_NONCE) { halt(`同一个 nonce 上已有 ${atNonce.length} 笔交易过期未上链，费用或节点可能有问题`); return record('blocked', '同一 nonce 过期交易过多'); }
+    // 白名单在本轮开始之后可能被改过：路径上的代币以此刻的名单为准。
+    const allowedNow = new Set(store.tokens().map(token => token.address));
+    if (!cycle.hops.every(hop => allowedNow.has(hop.tokenIn) && allowedNow.has(hop.tokenOut))) return record('blocked', '路径上的代币已移出白名单');
+    // 回执与账户读数可能来自高度不同的后端：读到的 nonce 不比本模块已上链的大，说明读数是旧的，这一轮不发。
+    const mined = store.maxMinedNonce();
+    if (mined !== null && account.nonce <= mined) return record('blocked', '节点返回的 nonce 落后于已上链的交易，等待下一轮');
+    // 只数本次实盘会话里过期的：熔断后用户处理完节点或费用问题、重新开始实盘，可以在这个 nonce 上再试。
+    const expiredThisSession = atNonce.filter(tx => liveSince !== null && tx.createdAt >= liveSince).length;
+    if (expiredThisSession >= MAX_OPEN_PER_NONCE) { halt(`同一个 nonce 上本次实盘已有 ${expiredThisSession} 笔交易过期未上链，费用或节点可能有问题`); return record('blocked', '同一 nonce 过期交易过多'); }
     const { feeWei: spentTodayWei } = store.settledSince(utcDayStart(at));
     const blocked = gate({ settings, spentTodayWei, reservedWei: reservedWei(open), worstCostWei: plan.worstCostWei, walletWei: account.balance, consecutiveReverts });
     if (blocked) { if (blocked.halt) halt(blocked.reason); return record('blocked', blocked.reason); }
@@ -229,6 +270,7 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
     const sent = await sendRecorded(sendRpc, store, signed);
     if (sent.accepted) { sendRejects = 0; log(`mev: 已发送 ${signed.hash}，预期净利 ${plan.netUsd.toFixed(4)} 美元`); return; }
     log(`mev: 发送 ${signed.hash} 没有被确认接受：${sent.error}`);
+    if (sent.rejected && /underpriced/i.test(sent.error ?? '')) underpricedNonce = account.nonce;
     if (sent.rejected && ++sendRejects >= SEND_REJECT_LIMIT) halt(`节点连续 ${sendRejects} 次拒绝发送：${sent.error}`);
   }
 
@@ -259,8 +301,10 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
     counters.blocks++;
     lagging = at / 1000 - block.timestamp > MAX_HEAD_LAG_SEC;
     dailySummary(at);
-    if (!verification.ok) return true;
+    // 未结清的交易不论合约核对是否通过都继续核对：预留的费用不会一直占着。
     await settle(at);
+    if (live && at - verification.checkedAt >= REVERIFY_MS) await verify();
+    if (!verification.ok) return true;
     if (directoryStale || at - directoryAt >= DIRECTORY_REFRESH_MS) { await refreshDirectory(); store.prune(at); return true; }
     if (lagging || !pools.length) return true;
     const tag = toQuantity(block.number);
@@ -332,6 +376,10 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
       if (!account || !head) throw new MevError(409, 'not_ready', '还没有读到链上状态，稍后再试');
       if (lagging) throw new MevError(409, 'lagging', '节点的最新区块落后，暂不能开始');
       if (weiToEth(account.balance) < settings.minWalletEth) throw new MevError(409, 'low_balance', `热钱包余额低于下限 ${settings.minWalletEth} ETH`);
+      // 确认要绑定操作者看到的状态：页面数据可能是几秒前的，另一个标签页可能停在故障发生之前。
+      // 请求带上页面所见的故障记录与停止原因，和现在的不一样就不清除、不开始，让页面刷新后重新确认。
+      const seen = requireBody(body);
+      if ((seen.fault ?? null) !== fault || (seen.haltReason ?? null) !== haltReason) throw new MevError(409, 'stale', '页面上的故障记录或停止原因已不是最新的，请刷新后重新确认');
       consecutiveReverts = 0; sendRejects = 0; fault = null; haltReason = null;
       persist('consecutiveReverts', 0); persist('fault', null);
       live = true; liveSince = now();
@@ -358,13 +406,18 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
         if (!token) throw new MevError(400, 'not_token', '这个地址上读不到 ERC-20 的符号与精度');
         store.putToken(token, now());
       } else throw new MevError(400, 'invalid_action', 'action 须为 add 或 remove');
+      // 移出立即生效：内存里的目录与环路当场按新名单过滤，不等目录刷新成功。加入的代币等下一次刷新查到池子。
+      tokenGeneration++;
       directoryStale = true;
+      if (action === 'remove') { pools = allowedPools(pools); rebuildCycles(); }
       return { tokens: store.tokens() };
     },
   };
 
   return {
     views, tick, verify, operator,
+    /** 停服：不再发新交易，不发通知。之后在途的节点请求由调用方中止。 */
+    quiesce(): void { stopping = true; live = false; liveSince = null; },
     isLive: (): boolean => live,
     async loop(context: { stopped(): boolean; pause(ms: number): Promise<void> }): Promise<void> {
       await verify();

@@ -119,6 +119,7 @@ export function openMevStore(file: string) {
   const openTxs = db.prepare(`SELECT * FROM transactions WHERE status IN (${placeholders}) ORDER BY nonce, created_at`);
   const recentTxs = db.prepare('SELECT * FROM transactions ORDER BY created_at DESC LIMIT ?');
   const settledSince = db.prepare("SELECT fee_wei, profit, start, status FROM transactions WHERE settled_at >= ? AND status IN ('success', 'reverted')");
+  const maxMined = db.prepare("SELECT MAX(nonce) AS n FROM transactions WHERE status IN ('success', 'reverted')");
   const totals = db.prepare("SELECT status, COUNT(*) AS n FROM transactions GROUP BY status");
   const readState = db.prepare('SELECT json FROM state WHERE key = ?');
   const writeState = db.prepare('INSERT INTO state(key, json, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at');
@@ -169,6 +170,8 @@ export function openMevStore(file: string) {
       }
       return { feeWei, profits, success, reverted };
     },
+    /** 本模块已上链（成功或回滚）的交易里最大的 nonce；没有时为 null。 */
+    maxMinedNonce(): number | null { return (maxMined.get() as { n: number | null }).n; },
     txTotals(): Record<string, number> { return Object.fromEntries((totals.all() as { status: string; n: number }[]).map(row => [row.status, row.n])); },
     readState<T>(key: string): T | null {
       const row = readState.get(key) as { json: string } | undefined;

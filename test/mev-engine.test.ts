@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { Transaction } from 'ethers';
 import { BASE_CHAIN_ID, FACTORIES, KIND_AERO_V2, USDC, WETH, type FactoryInfo, type TokenInfo } from '../src/mev/chain.ts';
 import { AbiReader, addressOf, signTransaction } from '../src/mev/codec.ts';
-import { DEADLINE_BLOCKS, MevError, createMevEngine } from '../src/mev/engine.ts';
+import { DEADLINE_BLOCKS, FEE_FLOOR_WINDOW_MS, MevError, createMevEngine } from '../src/mev/engine.ts';
 import { createFakeChain, type FakeExecute, type FakePool } from '../src/mev/fake-chain.ts';
 import { DEFAULT_SETTINGS, SettingsError, type Settings } from '../src/mev/risk.ts';
 import { createRpc } from '../src/mev/rpc.ts';
@@ -69,7 +69,7 @@ function setup(t: TestContext, options: { dir?: string; profit?: (call: FakeExec
     closeFirst(): void { closed = true; first.engine.close(); },
     /** 核对合约并走到目录就绪。 */
     async ready(engine = first.engine): Promise<void> { await engine.verify(); await step(engine); await step(engine); },
-    async goLive(engine = first.engine): Promise<void> { assert.deepEqual(await engine.views.start({ confirm: OPERATOR }), { mode: 'live' }); },
+    async goLive(engine = first.engine): Promise<void> { const seen = engine.views.state(); assert.deepEqual(await engine.views.start({ confirm: OPERATOR, fault: seen.fault, haltReason: seen.haltReason }), { mode: 'live' }); },
   };
 }
 const sends = (chain: ReturnType<typeof createFakeChain>): number => chain.state.calls.filter(method => method === 'eth_sendRawTransaction').length;
@@ -196,6 +196,51 @@ test('节点拒绝发送：记为结果不明并等过期；连续拒绝到上�
   assert.equal(s.engine.isLive(), false);
   assert.match(s.engine.views.state().haltReason ?? '', /连续 3 次拒绝发送/);
   assert.ok(s.notices.some(text => text.includes('已停止实盘')));
+});
+
+test('久远的过期交易不再抬高加价的底', async t => {
+  const s = setup(t);
+  await s.ready();
+  await s.goLive();
+  s.chain.state.send = 'drop';
+  await s.step();
+  const [old] = s.store.openTxs();
+  assert.ok(old);
+  await s.step(s.engine, DEADLINE_BLOCKS + EXPIRE_GRACE_BLOCKS + 1);
+  assert.equal(s.store.openTxs()[0]!.status, 'expired');
+  // 过了加价窗口：新的一笔按正常费用出价，不以那笔过期交易为底。
+  s.advanceClock(FEE_FLOOR_WINDOW_MS);
+  await s.step();
+  const fresh = s.store.recentTxs(1)[0]!;
+  assert.notEqual(fresh.hash, old.hash);
+  assert.ok(fresh.maxPriorityFeePerGas < old.maxPriorityFeePerGas * 5n / 4n, '没有按 25% 加价');
+});
+
+test('开始实盘的确认绑定页面所见：故障记录或停止原因已变时拒绝，不清除故障', async t => {
+  const s = setup(t);
+  await s.ready();
+  await s.goLive();
+  s.engine.views.stop();
+  const halted = s.engine.views.state().haltReason;
+  assert.ok(halted);
+  // 旧页面（还没看到停止原因）的请求。
+  await assert.rejects(async () => s.engine.views.start({ confirm: OPERATOR }), rejectsWith('stale', 409));
+  await assert.rejects(async () => s.engine.views.start({ confirm: OPERATOR, fault: '别的故障', haltReason: halted }), rejectsWith('stale', 409));
+  assert.equal(s.engine.isLive(), false);
+  assert.equal(s.engine.views.state().haltReason, halted);
+  await s.goLive();
+  assert.equal(s.engine.isLive(), true);
+});
+
+test('停服：quiesce 之后不再发送', async t => {
+  const s = setup(t);
+  await s.ready();
+  await s.goLive();
+  s.engine.quiesce();
+  for (let i = 0; i < 3; i++) await s.step();
+  assert.equal(sends(s.chain), 0);
+  assert.equal(s.store.recentTxs(5).length, 0);
+  assert.ok(!s.notices.some(text => text.includes('已停止实盘')), '停服不发熔断通知');
 });
 
 test('连续上链回滚到上限即停实盘；重新开始后计数清零', async t => {

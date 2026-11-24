@@ -10,4 +10,5 @@
 .mev-mono{font-family:var(--font-mono);font-size:.75rem}
 .mev-group{padding:12px 14px 0;color:var(--text-tertiary);font-size:.75rem;font-weight:500}
 .mev-path{white-space:normal;min-width:240px}
+[data-mev] .vl-toolbar input{min-width:0;max-width:100%}
 @media (max-width:650px){.mev-facts{grid-template-columns:minmax(0,1fr);gap:2px 0}.mev-facts dd{margin-bottom:8px}}

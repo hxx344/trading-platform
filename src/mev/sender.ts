@@ -53,6 +53,8 @@ export async function settleOpen(rpc: RpcClient, store: MevStore, operator: stri
   const receipts = open.map((tx, index) => parseReceipt(results[3 + index], tx.hash, executor));
   const settled: Settled[] = [];
   let fault: string | null = null;
+  // 库里已上链的最大 nonce：回执与账户读数可能来自高度不同的后端，本模块自己上过链的 nonce 不会是「被别人占用」。
+  const ownMined = store.maxMinedNonce() ?? -1;
   store.transaction(() => {
     const minedNonces = new Set<number>();
     open.forEach((tx, index) => {
@@ -64,7 +66,7 @@ export async function settleOpen(rpc: RpcClient, store: MevStore, operator: stri
     });
     open.forEach((tx, index) => {
       if (receipts[index]) return;
-      if (minedNonces.has(tx.nonce)) { store.settleTx(tx.hash, 'replaced', now, { error: tx.error }); settled.push({ tx, status: 'replaced' }); return; }
+      if (minedNonces.has(tx.nonce) || tx.nonce <= ownMined) { store.settleTx(tx.hash, 'replaced', now, { error: tx.error }); settled.push({ tx, status: 'replaced' }); return; }
       if (tx.nonce < account.nonce) {
         // nonce 已被占用，但这一笔没有回执：可能是回执索引滞后，也可能是别的交易占了这个 nonce。
         const checks = tx.missingChecks + 1;

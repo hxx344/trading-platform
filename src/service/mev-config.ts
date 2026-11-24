@@ -17,14 +17,14 @@ export function parseMevConfig(value: unknown): MevServiceConfig {
   return { executor: lower(raw.executor), owner: lower(raw.owner) };
 }
 
-/** 节点地址：https，或本机 / 内网自建节点的 http。不带账号密码段。 */
+/** 节点地址：https，或本机 / 内网自建节点的 http（127.0.0.1、10/8、192.168/16、100.64/10 的 Tailscale 段）。不带账号密码段。 */
 function validRpcUrl(value: unknown): value is string {
   if (typeof value !== 'string' || value.length > 512) return false;
   let url: URL;
   try { url = new URL(value); } catch { return false; }
   if (url.username || url.password || url.hash) return false;
   if (url.protocol === 'https:') return true;
-  return url.protocol === 'http:' && /^(localhost|127\.0\.0\.1|\[::1\]|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|100\.\d+\.\d+\.\d+)$/.test(url.hostname);
+  return url.protocol === 'http:' && /^(localhost|127\.0\.0\.1|\[::1\]|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+)$/.test(url.hostname);
 }
 
 /** secrets.json 的 `mev`；没有这个键返回 undefined。 */

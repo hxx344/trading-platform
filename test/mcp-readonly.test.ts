@@ -8,7 +8,8 @@ import { PassThrough } from 'node:stream';
 import type { AddressInfo } from 'node:net';
 import { createExecutorServer } from '../src/http.ts';
 import { createReadTokens } from '../src/read-token.ts';
-import { OUTPUT_MAX_BYTES, PlatformError, TOOLS, handle, loadSettings, platformGet, serve, tokenScopes, toolText, type Get } from '../tools/mcp/readonly.ts';
+import { OUTPUT_MAX_BYTES, PlatformError, TOOLS, handle, loadSettings, platformGet, serve, snapshotFor, tokenScopes, toolText, type Get } from '../tools/mcp/readonly.ts';
+import { SNAPSHOT_CACHE_MS, createSnapshot, type Snapshot } from '../tools/mcp/snapshot.ts';
 import { bindAccounts, createHarness } from './harness.ts';
 
 const ADDRESS = `0x${'cd34'.repeat(10)}`;
@@ -138,7 +139,14 @@ test('MCP：只列出令牌范围内的工具，范围外的调用写明缺哪�
     const scopes = tokenScopes(get);
     assert.deepEqual(await scopes(), ['system']);
     const listed = await handle({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, get, scopes) as { result: { tools: { name: string }[] } };
-    assert.deepEqual(listed.result.tools.map(tool => tool.name), ['platform_status', 'host_status', 'update_status']);
+    assert.deepEqual(listed.result.tools.map(tool => tool.name), ['platform_status', 'host_status', 'snapshot', 'update_status']);
+    // snapshot keeps to the token's groups; this platform has no /api/host, so both system groups say why.
+    const snap = await call(get, 'snapshot', {}, scopes);
+    assert.equal(snap.result?.isError, undefined, snap.result?.content[0]?.text);
+    const groups = (JSON.parse(snap.result!.content[0]!.text) as { groups: { id: string; status: string; message: string }[] }).groups;
+    assert.deepEqual(groups.map(group => [group.id, group.status]), [['system.host', 'unavailable'], ['system.runtime', 'unavailable']]);
+    assert.match(groups[0]!.message, /404/);
+    assert.match((await call(get, 'snapshot', { groups: ['market.monitor'] }, scopes)).result!.content[0]!.text, /没有 public 范围/);
     const refused = await call(get, 'varlighter', {}, scopes);
     assert.equal(refused.result?.isError, true);
     assert.match(refused.result!.content[0]!.text, /portfolio/);
@@ -186,7 +194,7 @@ test('MCP：只有 portfolio 的令牌也列出 platform_status，运行状态�
     const scopes = tokenScopes(get);
     const listed = await handle({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, get, scopes) as { result: { tools: { name: string }[] } };
     const names = listed.result.tools.map(tool => tool.name);
-    assert.ok(names.includes('platform_status') && names.includes('logs') && !names.includes('host_status') && !names.includes('news'), names.join());
+    assert.ok(names.includes('platform_status') && names.includes('logs') && !names.includes('host_status') && !names.includes('news') && !names.includes('snapshot'), names.join());
     const status = await call(get, 'platform_status', {}, scopes);
     assert.equal(status.result?.isError, undefined, status.result?.content[0]?.text);
     assert.match(status.result!.content[0]!.text, /"status":\{"unavailable":"[^"]*system/);
@@ -207,4 +215,135 @@ test('MCP：platform_status 一半遇到非范围错误（401、429）时整次�
   const neither = await call(async path => { throw scope(path); }, 'platform_status');
   assert.equal(neither.result?.isError, true);
   assert.match(neither.result!.content[0]!.text, /既没有 system 也没有 portfolio/);
+});
+
+// snapshot (docs/mcp.md 8.5): a stand-in platform with every source, counted reads and a settable clock.
+const T0 = Date.UTC(2026, 10, 25, 8);
+function snapshotPlatform(clock: { now: number }) {
+  const reads: string[] = [];
+  const fail: Record<string, PlatformError> = {};
+  const host = () => ({
+    generatedAt: clock.now, uptimeSeconds: 86_400, secretHost: 'web-01',
+    cpu: { usagePercent: 12.5, cores: 4, loadAverage: [0.5, 0.4, 0.3] },
+    memory: { totalBytes: 8e9, availableBytes: 6e9, usedBytes: 2e9, usedPercent: 25, swap: null },
+    disks: [{ id: 'data', label: '/var/lib/x', totalBytes: 1e11, availableBytes: 5e10, usedBytes: 5e10, usedPercent: 50 }, { id: 'root', label: '/', error: '无法读取' }, { id: 'other', usedPercent: 1 }],
+    process: { rssBytes: 3e8, heapUsedBytes: 1e8, uptimeSeconds: 3600, loopDelayMs: { mean: 1.2, p99: 8, max: 20 } },
+    connections: [{ id: 'market', label: '行情服务', state: 'ok', detail: '正常' }, { id: 'streams', label: 'ASTER 用户推送', state: 'down', detail: '断开：acct-1 原因原文' }, { id: 'mystery', state: 'ok' }],
+  });
+  const status = () => ({
+    health: { startedAt: clock.now - 7_200_000, now: clock.now, retired: false, walBytes: 1024, walLimitBytes: 1 << 26, writes: { busy: 0, maxWaitMs: 3, maxHoldMs: 4 },
+      loops: [{ name: '划转', lastOkAt: clock.now - 4000, failures: 0, lastErrorAt: null }, { name: 'ADL', lastOkAt: null, failures: 2, lastErrorAt: clock.now }, 'odd'] },
+    dependencies: { market: { ok: true, checkedAt: clock.now, lastOkAt: clock.now, error: null, restarts: 1 }, control: { ok: false, checkedAt: clock.now, lastOkAt: null, error: '连接被拒绝', restarts: 0 }, incidents: [{ key: 'control', problem: '原文' }] },
+    feishu: { configured: true },
+  });
+  const fetched = () => new Date(clock.now).toISOString();
+  const quotes: Record<string, () => unknown> = {
+    oil: () => ({ source: 'Binance', fetchedAt: fetched(), status: 'live', staleAfterMs: 90_000, brent: { coin: 'BZUSDT', markPx: 70.5, fundingRate: 0.0001 }, wti: { coin: 'CLUSDT', markPx: 67.25, fundingRate: null }, extraField: 99 }),
+    goldoil: () => ({ fetchedAt: fetched(), status: 'snapshot', staleAfterMs: 90_000, xau: { price: 4000 }, cl: { price: 67 }, bz: { price: 70 }, ratio: { cl: 59.7, bz: 57.1 } }),
+    hynix: () => ({ fetchedAt: fetched(), status: 'live', staleAfterMs: 120_000, adr: 50, ordinary: 480, equivalent: 48, spread: 2, premium: 4.1667 }),
+    anthropic: () => ({ fetchedAt: fetched(), status: 'live', staleAfterMs: 60_000, binance: { markPx: 300, fundingRate: 0.0002 }, xyz: null, io: { markPx: 301, fundingRate: null }, rh: { markPx: 299, fundingRate: 0.0001 }, errors: { xyz: '原文' } }),
+  };
+  const get: Get = async path => {
+    reads.push(path);
+    if (fail[path]) throw fail[path];
+    if (path === '/api/host') return host();
+    if (path === '/api/status') return status();
+    const market = /^\/api\/monitor\/(\w+)\/quote$/.exec(path)?.[1];
+    if (market && quotes[market]) return quotes[market]!();
+    throw new Error(`unexpected ${path}`);
+  };
+  return { get, reads, fail };
+}
+const rowOf = (snap: Snapshot, entity: string, metric: string) => snap.groups.flatMap(group => group.rows).find(row => row.entity === entity && row.metric === metric);
+
+test('MCP snapshot：每行带单位、取值时间、是否过期与状态，逐字段取值；来源新增的字段与连线原文不出现', async () => {
+  // Through the tool, whose clock is the real one.
+  const clock = { now: Date.now() };
+  const p = snapshotPlatform(clock);
+  const text = (await call(p.get, 'snapshot', {}, async () => ['public', 'system'])).result!.content[0]!.text;
+  const snap = JSON.parse(text) as Snapshot;
+  assert.equal(snap.schemaVersion, 1);
+  assert.deepEqual(snap.groups.map(group => [group.id, group.scope, group.status]), [['system.host', 'system', 'ok'], ['system.runtime', 'system', 'ok'], ['market.monitor', 'public', 'ok']]);
+  for (const row of snap.groups.flatMap(group => group.rows)) {
+    assert.deepEqual(Object.keys(row), ['entity', 'metric', 'label', 'value', 'unit', 'asOf', 'stale', 'status']);
+    assert.ok(row.value === null || (typeof row.value === 'number' && Number.isFinite(row.value)), `${row.entity} ${row.metric}`);
+  }
+  assert.deepEqual(rowOf(snap, 'host', 'cpu.usage'), { entity: 'host', metric: 'cpu.usage', label: 'CPU 占用', value: 12.5, unit: '%', asOf: new Date(clock.now).toISOString(), stale: false, status: 'ok' });
+  assert.deepEqual([rowOf(snap, 'host', 'swap.used')?.value, rowOf(snap, 'host', 'swap.used')?.status], [null, 'unknown'], '没有交换区信息时是 null，不是 0');
+  assert.equal(rowOf(snap, 'disk:data', 'used_percent')?.value, 50);
+  assert.equal(rowOf(snap, 'disk:root', 'used_percent')?.value, null);
+  assert.equal(rowOf(snap, 'disk:other', 'used_percent'), undefined, '名单外的磁盘不列');
+  assert.deepEqual([rowOf(snap, 'loop:ADL', 'failures')?.value, rowOf(snap, 'loop:ADL', 'failures')?.status], [2, 'warn']);
+  assert.equal(rowOf(snap, 'loop:划转', 'since_ok')?.value, 4);
+  assert.equal(rowOf(snap, 'loop:ADL', 'since_ok')?.value, null);
+  assert.deepEqual([rowOf(snap, 'process:control', 'up')?.value, rowOf(snap, 'process:control', 'up')?.status], [0, 'down']);
+  assert.equal(rowOf(snap, 'service', 'incidents.open')?.value, 1);
+  assert.equal(rowOf(snap, 'service', 'uptime')?.value, 7200);
+  assert.equal(rowOf(snap, 'process:trading', 'loop_delay.p99')?.value, 8);
+  assert.deepEqual([rowOf(snap, 'connection:streams', 'state')?.value, rowOf(snap, 'connection:streams', 'state')?.status], [0, 'down']);
+  assert.equal(rowOf(snap, 'connection:mystery', 'state'), undefined);
+  assert.equal(rowOf(snap, 'monitor:oil', 'spread')?.value, 3.25);
+  assert.equal(rowOf(snap, 'monitor:oil', 'wti.funding')?.value, null);
+  assert.equal(rowOf(snap, 'monitor:goldoil', 'ratio.cl')?.stale, true, 'status 不是 live 的报价算过期');
+  assert.equal(rowOf(snap, 'monitor:anthropic', 'xyz.price')?.value, null);
+  assert.equal(rowOf(snap, 'monitor:hynix', 'premium')?.unit, '%');
+  assert.doesNotMatch(text, /extraField|secretHost|web-01|\/var\/lib|原因原文|连接被拒绝|原文|mystery/);
+});
+
+test('MCP snapshot：5 秒内不重复读取；单个来源 503 时只有该组不可用，报价缺一个市场为 partial；401 整次报错', async () => {
+  const clock = { now: T0 };
+  const p = snapshotPlatform(clock);
+  const build = createSnapshot(async path => { try { return { ok: true, value: await p.get(path) }; } catch (error) { if (error instanceof PlatformError && error.status !== 401) return { ok: false, message: error.message }; throw error; } }, () => clock.now);
+  const all = ['system.host', 'system.runtime', 'market.monitor'] as const;
+  await build(all);
+  assert.equal(p.reads.length, 6, '/api/host 两组共用一次');
+  clock.now += SNAPSHOT_CACHE_MS - 1;
+  const cached = await build(all);
+  assert.equal(p.reads.length, 6, '5 秒内复用');
+  assert.equal(rowOf(cached, 'host', 'cpu.usage')?.stale, false);
+  clock.now = T0 + SNAPSHOT_CACHE_MS;
+  p.fail['/api/host'] = new PlatformError('平台拒绝 /api/host：503 读取失败', 503);
+  p.fail['/api/monitor/hynix/quote'] = new PlatformError('平台拒绝 /api/monitor/hynix/quote：404 未配置', 404);
+  const partial = await build(all);
+  assert.equal(p.reads.length, 12);
+  assert.deepEqual(partial.groups.map(group => group.status), ['unavailable', 'unavailable', 'partial']);
+  assert.deepEqual(partial.groups[0]!.rows, []);
+  assert.match(partial.groups[1]!.message!, /503/);
+  assert.match(partial.groups[2]!.message!, /hynix：.*404/);
+  assert.equal(rowOf(partial, 'monitor:hynix', 'premium'), undefined);
+  assert.equal(rowOf(partial, 'monitor:oil', 'brent.price')?.value, 70.5);
+  delete p.fail['/api/host'];
+  p.fail['/api/status'] = new PlatformError('平台拒绝 /api/status：401 令牌无效', 401);
+  clock.now += SNAPSHOT_CACHE_MS;
+  await assert.rejects(build(['system.runtime']), /401/);
+});
+
+test('MCP snapshot：缓存里的读取按调用时刻判定过期', async () => {
+  const clock = { now: T0 };
+  const reads: string[] = [];
+  const build = createSnapshot(async path => { reads.push(path); return { ok: true, value: { fetchedAt: new Date(T0).toISOString(), status: 'live', staleAfterMs: 2000, brent: { markPx: 1 }, wti: { markPx: 1 } } }; }, () => clock.now);
+  assert.equal(rowOf(await build(['market.monitor']), 'monitor:oil', 'brent.price')?.stale, false);
+  clock.now = T0 + 2001;
+  assert.equal(rowOf(await build(['market.monitor']), 'monitor:oil', 'brent.price')?.stale, true);
+  assert.equal(reads.length, 4, '同一次读取，过期按当前时间判定');
+});
+
+test('MCP snapshot：按令牌范围筛选分组；groups 校验；旧版平台（范围未知）给出全部分组', async () => {
+  const clock = { now: T0 };
+  const p = snapshotPlatform(clock);
+  const groupsOf = async (args: unknown, scopes: readonly ('public' | 'system' | 'portfolio')[] | null) => {
+    const answer = await call(p.get, 'snapshot', args, async () => scopes);
+    return answer.result!.isError ? answer.result!.content[0]!.text : (JSON.parse(answer.result!.content[0]!.text) as Snapshot).groups.map(group => group.id);
+  };
+  assert.deepEqual(await groupsOf({}, ['public']), ['market.monitor']);
+  assert.deepEqual(await groupsOf({}, ['system', 'portfolio']), ['system.host', 'system.runtime']);
+  assert.deepEqual(await groupsOf({}, null), ['system.host', 'system.runtime', 'market.monitor']);
+  assert.deepEqual(await groupsOf({ groups: ['market.monitor', 'system.host'] }, null), ['system.host', 'market.monitor']);
+  assert.match(String(await groupsOf({ groups: ['system.host'] }, ['public'])), /没有 system 范围/);
+  for (const groups of [[], ['system.host', 'system.host'], ['nope'], 'system.host', [1]]) {
+    assert.match(String(await groupsOf({ groups }, null)), /groups 须为/, JSON.stringify(groups));
+  }
+  const listed = await handle({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, p.get, async () => ['portfolio']) as { result: { tools: { name: string }[] } };
+  assert.ok(!listed.result.tools.some(tool => tool.name === 'snapshot'), 'portfolio 令牌不列 snapshot');
+  assert.equal(snapshotFor(p.get), snapshotFor(p.get), '同一连接共用一份缓存');
 });

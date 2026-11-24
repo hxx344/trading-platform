@@ -49,4 +49,5 @@
 - 分支 ci：
   - 6287da5 工具列表断言没有加 `snapshot`：https://github.com/hxx344/trading-platform/actions/runs/45475927193
   - 48e5dcd 全部通过：https://github.com/hxx344/trading-platform/actions/runs/45478045161
-  - 3beb402：https://github.com/hxx344/trading-platform/actions/runs/45479067472
+  - 3beb402 全部通过：https://github.com/hxx344/trading-platform/actions/runs/45479067472
+  - 变基到 v0.86.0 之后（6b66bae）全部通过：https://github.com/hxx344/trading-platform/actions/runs/45479582260

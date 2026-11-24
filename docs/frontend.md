@@ -741,6 +741,49 @@
 
 **回滚**：回退到 v0.68.1，面板与侧栏提示随之消失；`read-token.json` 留在数据目录不影响旧版本。
 
-**多个令牌（v0.85.0）**：面板改为令牌列表（`table-wrap` 里的 `data` 表格：名称与编号、范围、状态、生成与到期、最近使用与近 24 小时，每行一个「吊销」按钮，吊销前确认）。下方「生成令牌」表单填名称（1–40 个字）并勾选范围（`public` 公开行情、`system` 系统状态、`portfolio` 账户与策略，默认全选），满 8 个时按钮停用并说明。新令牌只显示一次，写明是哪个名称的。到期提醒与侧栏提示逐个写名称，多个到期时侧栏写个数。校验与文案在 `read-token-form.ts` 的 `generateBody`、`expiryNotice`、`navNotice`。样式只新增 `.read-token-scopes`（范围复选框竖排，说明文字换行）。回滚到 v0.84.0 时面板回到单令牌，令牌文件按 [mcp.md](mcp.md) 第 8.4 节处理。
+**多个令牌（v0.85.0）**：面板改为令牌列表（`table-wrap` 里的 `data` 表格：名称与编号、范围、状态、生成与到期、最近使用与近 24 小时，每行一个「吊销」按钮，吊销前确认）。下方「生成令牌」表单填名称（1–40 个字）并勾选范围（`public` 公开行情、`system` 系统状态（不含日志与飞书消息原文）、`portfolio` 账户与策略（含日志），默认全选），满 8 个时按钮停用并说明。新令牌只显示一次，写明是哪个名称的。到期提醒与侧栏提示逐个写名称，多个到期时侧栏写个数。校验与文案在 `read-token-form.ts` 的 `generateBody`、`expiryNotice`、`navNotice`。样式只新增 `.read-token-scopes`（范围复选框竖排，说明文字换行）。回滚到 v0.84.0 时面板回到单令牌，令牌文件按 [mcp.md](mcp.md) 第 8.4 节处理。
 
 **验证（v0.85.0）**：`scripts/dev-varlighter.ts` 加上令牌（临时副本，未提交）在回环地址启动，内置浏览器 1280 与 390 宽度：页面上生成全选范围与只选「系统状态」的两个令牌，列表两行；只选系统的令牌读 `self` 200、`/api/status` 200、`/api/varlighter/state` 403 `token_scope`；吊销它后读 `self` 401，列表剩一行，刚生成的令牌框随之收起。两种宽度页面都没有横向溢出，390 宽时表格在 `table-wrap` 内横向滚动。验证时发现复选框按基线对齐偏上，改为居中。
+
+## EQN 快讯与异动行情（v0.72.0）
+
+**对照的工作台页面**：工作台没有快讯页面。快讯页按日志页的 `panel` + `section-head` + 筛选框拼，连接状态用运行状态页的 `.connection`（`mint` / `amber`）；异动行情页签用行情监控页已有的 `table-panel`、`section-heading`、`segmented`。
+
+**页面**：侧栏「市场与机会」行情监控之后新增「快讯」（`#/news`，在 `.aster-module` 内）；行情监控页签最后新增「异动行情」，没有运行开关。两处共用 `web/src/NewsList.tsx`，数据校验与文案在 `web/src/news.ts`。内容与刷新间隔见 [news.md](news.md) 第 4 节。
+
+**样式**：`styles.css` 末尾的快讯一节，只用 `--foreground`、`--muted-foreground`、`--border`、`--primary` 和间距、圆角令牌，两处页面各取所在页的配色。行情监控页的 `.monitor-desk button` 给按钮 40px 最小高度并重设字体，币种标签用 `.news-list .news-coin` 还原成标签尺寸（只是筛选捷径，搜索框仍可用）。手机宽度时间放到标题上方。
+
+**验证**：`scripts/dev-monitor.ts` 预览接上替身 EQN（`test/news-fake.ts`），无头浏览器 1280 与 390 宽度：两处页面、频道与币种筛选、推送到达后经 REST 核对去掉“推送”标记，无横向滚动、无 CSP 报错。
+
+**回滚**：回退到 v0.71.0，入口与页签随之消失；`config.json` 写过 `"news"` 的先删掉。
+
+## 行情监控页：金油比（Monitor M-2f，v0.74.0）
+
+**对照的工作台页面**：`modules/monitor/app/gold-oil-panel.tsx`（`584ebc8`）与 `app/gold-oil-svg-chart.tsx`（`8470785`）。回滚版本 v0.73.0（回退前先删 `monitor.goldoil`，见 [monitor.md](monitor.md) 的 M-2f）。
+
+**页面**：行情监控页签「原油」之后新增「金油比」（`web/src/MonitorGoldOil.tsx`，数据整理在不依赖 React 的 `web/src/monitor-goldoil.ts`）。自上而下：标题与刷新、原油合约 CL / BZ 切换、状态行、四个读数、走势图（时间范围 1 天 / 1 周 / 1 月 / 全部，「金油比」与「标记价格」两个视图，价格视图上下两张图共用悬停）、告警面板（`<AlertSettings market="goldoil">`）、区间速览表与「如何计算」、数据来源。图表沿用原油页的 `SvgPlot`、`createHoverStore`、`niceAxis`、`sampleChartPoints`；缺口处插入空行断线，不插值。
+
+**样式**：`monitor.css` 末尾 `goldoil-*` 一节，只用已有颜色与间距令牌，无内联样式。700px 以下图表标题区换行，范围按钮不折字。
+
+**验证**：`scripts/dev-monitor.ts` 替身后端，headless Chromium 在 1280 与 390 宽度走 CL / BZ、两个视图、四个范围，添加并保存告警档位（POST 200）；两种宽度都没有横向溢出，没有 CSP 报错（只有预览环境本来就没有的 `/api/update`、`/api/read-token`、`/api/asset/positions` 返回 404）。截图环境缺中文字体，中文显示为方框，只核对了版式。
+
+## 顶栏服务器负载与连线（v0.75.0）
+
+- 对照工作台顶栏右侧的 `HostStatusBadge` 与 `ConnectionStatus`（project-aggregation `src/HostStatusBadge.tsx`、`src/ConnectionStatus.tsx`、`src/server-status-types.ts`，提交 `52337a9`），本服务对应 `web/src/HostStatusBadge.tsx`、`web/src/ConnectionStatus.tsx`、`web/src/host-status.ts`，挂在 `App.tsx` 顶栏面包屑右侧，顺序同工作台：先负载，后连线。
+- 两个徽章共用一个 `/api/host` 订阅（`use-live-resource.ts`，每 3 秒，页面隐藏时暂停），这次读取的往返耗时就是“本机 → 服务器”延迟，分级同工作台（≤150 ms 良好、≤500 ms 一般、更慢为较慢；读取失败为无法连接，浏览器离线为本机离线）。负载 ≥75% 黄、≥90% 红；手机宽度只显示三项里最高的一个。
+- 与工作台不同：负载详情加交易服务进程的内存与事件循环延迟，「查看详情」改为打开运行状态页；连线详情加“服务连线”列表（行情服务、控制面、ASTER 用户推送、永续行情、副服务器心跳），有断开时摘要上显示红色提示点，有异常时黄色。后端见 [observability.md](observability.md) 第 3 节。
+- 样式：`web/src/topbar-status.css` 复制自工作台 `src/styles.css`（提交 `52337a9`）第 171–195、409、421–425 行，选择器加 `.app-shell > .workspace > .topbar > .topbar-right` 限定，手机断点用外壳的 760px；服务连线列表与提示点写在 `styles.css` 末尾《本服务》。
+- 设置页加「登录会话」：显示本浏览器的登录时间与失效时间、会话总数，「退出登录」「注销全部设备」（后者先确认），完成后回到登录页。
+- 验证：替身后端上 1280 与 390 宽度截图，展开两个详情，无横向溢出、无 CSP 报错。回滚版本 v0.74.0。
+
+## 轮询开销与监控面板分块（v0.82.2）
+
+不改页面外观与交互，只减少重复工作。没有对照的工作台页面。
+
+- `/api/state?jobs=0`：配对组与配对详情每 2 秒读一次执行器视图，页面不显示其中的近期任务与名义上限，带 `jobs=0` 时服务端不再查询这两项。不带参数的应答不变（旧版回退页 `src/page.ts`、只读 MCP 的 `platform_status` 照旧拿完整视图）；只读令牌的路由表不接受查询参数，令牌读取不受影响。
+- 快讯（每 2 秒）与异动行情（每 5 秒）的读取加入展示读取的版本协商（`src/read-view.ts` 的 `displayGets`）：列表没变时服务端回 204，页面沿用上一份数据并照常更新“停留在”时刻。服务端仍每次鉴权并生成当前视图，异动“90 秒内有人读才轮询”的判断不受影响。
+- 行情监控页的原油、金油比、海力士、合约价差、异动行情面板改为打开对应页签时才加载（`LazyBoundary` + `Suspense`，加载失败显示可重试的提示）。`MonitorPage` 分块由约 368 kB 降到约 112 kB（gzip 111 kB → 37 kB）。合约价差的四个样式文件仍在 `MonitorPage.tsx` 里、排在 `monitor.css` 之前引入：两边有同权重的规则（焦点轮廓等），顺序变了结果会变；构建出的 `MonitorPage` 样式文件与改动前逐字节相同。
+- `App` 每 2 秒因 `/api/shell` 重渲染两次。只有不在渲染时取当前时间的组件加了 `memo`：快讯页、日志页、合约价差面板、异动行情面板。其余页面（期权任务耗时、RFQ 剩余秒数、原油、金油、海力士预览与报价时效、运行状态页的“多久前”、资产数据时效）靠这次重渲染更新时间文字，没有自己的定时器，不能直接加 `memo`；要加先给这些文字各自的定时器。
+- 飞书出站队列的过期清理（保留 7 天）由每次发送都执行改为启动后第一次发送时执行、之后每小时一次，`once` 去重键因此最多多留 1 小时。
+- 评估过、这次不做的：`connector.account()` 的读取合并（R3，读取顺序是有意的，需要在真实账户上核对限频）；合约价差扫描每秒重算（照工作台移植的行为，先在浏览器里量再动）；JSON 应答压缩与 brotli（静态资源已缓存一年，压缩 JSON 会占执行器线程）。
+- 验证：`scripts/dev-monitor.ts` 预览，无头浏览器 1280 与 390 宽度依次打开各监控页签、快讯、日志、运行状态与总览，无横向溢出、无 CSP 与控制台报错，各面板分块按页签加载。回滚版本 v0.82.1，无数据或配置迁移。

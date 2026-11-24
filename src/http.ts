@@ -10,7 +10,7 @@ import type { Executor } from './executor.ts';
 import { APP_HEADERS, CLIENT_ADDRESS_HEADER, CONFIG_CHECK_HEADER, CONFIG_MATCH_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, PAGE_HEADERS, controlRoute, readJson, sendJson, sendJsonText, sendWebAsset, sessionCookieName } from './http-public.ts';
 import { GLOBAL_LOGIN_LIMITS, LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash, type ThrottleLimits } from './login-password.ts';
 import { openSessionStore, type SessionInfo, type SessionStore } from './sessions.ts';
-import { READ_SCOPE_NAMES, READ_TOKEN_MAX_BYTES, ReadTokenError, readTokenNewsView, readTokenScope, readTokenUpdateView, type ReadTokens } from './read-token.ts';
+import { READ_SCOPE_NAMES, READ_TOKEN_MAX_BYTES, ReadTokenError, readTokenNewsView, readTokenScope, readTokenSystemStatus, readTokenUpdateView, type ReadScope, type ReadTokens } from './read-token.ts';
 import type { Redactor } from './read-redact.ts';
 import type { WebApp } from './web-assets.ts';
 import type { UpdateView } from './service/update-types.ts';
@@ -332,7 +332,7 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     response.end();
   }
   // A read-only token's answers are masked and size-capped on their way out; a session's pass unchanged (docs/mcp.md 3).
-  const tokenAnswers = new WeakMap<ServerResponse, { redact: Redactor; bytes: number }>();
+  const tokenAnswers = new WeakMap<ServerResponse, { redact: Redactor; bytes: number; scopes: readonly ReadScope[] }>();
   const readViews = new ReadViewCache();
   const negotiated = new WeakMap<ServerResponse, { key: string; known: string }>();
   const monitorReads = new WeakMap<ServerResponse, { market: keyof typeof MONITOR_NAMES; revision?: number }>();
@@ -402,19 +402,21 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     throttle.succeeded();
     tokenId = checked.id;
     // The token's own name, scopes and expiry, for the MCP server to list only the tools it may call; the session gets 404.
-    if (request.method === 'GET' && url.pathname === '/api/read-token/self' && !url.search) {
-      const self = readTokens!.self(checked.id);
-      return self ? sendJson(response, 200, self) : sendJson(response, 401, { code: 'token', message: '令牌无效或已吊销' });
-    }
-    const scope = request.method === 'GET' ? readTokenScope(url) : null;
-    if (scope === null) return sendJson(response, 403, { code: 'read_only', message: '只读令牌不能访问这个接口' });
-    if (!checked.scopes.includes(scope)) return sendJson(response, 403, { code: 'token_scope', scope, message: `这个令牌没有「${READ_SCOPE_NAMES[scope]}」（${scope}）范围，请在设置页生成带这个范围的令牌` });
+    // Not on the whitelist and needing no scope, but under the same limits as every other token request.
+    const self = request.method === 'GET' && url.pathname === '/api/read-token/self' && !url.search;
+    const scope = !self && request.method === 'GET' ? readTokenScope(url) : null;
+    if (!self && scope === null) return sendJson(response, 403, { code: 'read_only', message: '只读令牌不能访问这个接口' });
+    if (scope !== null && !checked.scopes.includes(scope)) return sendJson(response, 403, { code: 'token_scope', scope, message: `这个令牌没有「${READ_SCOPE_NAMES[scope]}」（${scope}）范围，请在设置页生成带这个范围的令牌` });
     const release = readTokens!.admit(checked.id);
     if (!release) return sendJson(response, 429, { code: 'token_rate', message: '请求过于频繁：每个令牌每分钟最多 30 次、同时 2 个，全部令牌同时最多 4 个' }, { 'retry-after': '5' });
     response.once('close', release);
+    if (self) {
+      const answer = readTokens!.self(checked.id);
+      return answer ? sendJson(response, 200, answer) : sendJson(response, 401, { code: 'token', message: '令牌无效或已吊销' });
+    }
     const redact = readTokens!.redactor();
     if (!redact) { release(); return sendJson(response, 401, { code: 'token', message: '令牌无效或已吊销' }); }
-    tokenAnswers.set(response, { redact, bytes: 0 });
+    tokenAnswers.set(response, { redact, bytes: 0, scopes: checked.scopes });
     return serve(request, response, url, controlRoute(request.method, url.pathname));
   }
   // One throttle per client address, at most TOKEN_THROTTLES of them (the oldest goes first).
@@ -522,8 +524,11 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
         return manage(() => readTokens.generate({ name, scopes }));
       }
       if (request.method === 'POST' && url.pathname === '/api/read-token/revoke') {
-        const { id } = exactKeys(await readJson(request), [], ['id']);
-        if (id !== undefined && (typeof id !== 'string' || !/^[0-9a-f]{8}$/.test(id))) return send(response, 400, { code: 'token_input', message: 'id 须为令牌编号（8 位十六进制）' });
+        // One token by its id, or every token only when asked for in so many words: an empty body (a page from before
+        // v0.85.0 revoking its single token) is refused rather than taken as "all".
+        const { id, all } = exactKeys(await readJson(request), [], ['id', 'all']);
+        if (all === true && id === undefined) return manage(() => readTokens.revoke());
+        if (all !== undefined || typeof id !== 'string' || !/^[0-9a-f]{8}$/.test(id)) return send(response, 400, { code: 'token_input', message: '须给出 id（令牌编号，8 位十六进制），或只给 all: true 吊销全部' });
         return manage(() => readTokens.revoke(id));
       }
       if (request.method === 'POST' && url.pathname === '/api/read-token/lookup') {
@@ -562,7 +567,9 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     }
     if (request.method === 'GET' && url.pathname === '/api/status') {
       if (!views?.status) return send(response, 404, { code: 'not_found', message: '本服务没有运行状态' });
-      return send(response, 200, views.status());
+      const view = views.status();
+      const token = tokenAnswers.get(response);
+      return send(response, 200, token && !token.scopes.includes('portfolio') ? readTokenSystemStatus(view) : view);
     }
     if (request.method === 'GET' && (url.pathname === '/api/oil/market' || url.pathname === '/api/oil/state')) {
       if (!views?.oil) return send(response, 404, { code: 'not_found', message: '本服务没有配置原油执行' });

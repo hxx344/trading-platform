@@ -21,7 +21,7 @@ test('只读令牌页面：到期前 7 天起提示剩余天数，到期后提�
   assert.equal(navNotice(view({ warn: true }), 90 * DAY), '只读令牌已到期');
   assert.equal(expiryNotice(view(), 0), null);
   assert.equal(expiryNotice(null, 0), null);
-  const many = view({ id: 'a', name: '甲', state: 'expired' }, { id: 'b', name: '乙', state: 'expired' }, { id: 'c', name: '丙', warn: true, expiresAt: 95 * DAY }, { id: 'd', name: '丁' });
+  const many = view({ id: 'a', name: '甲', state: 'expired' }, { id: 'b', name: '乙', state: 'expired' }, { id: 'c', name: '丙', warn: true, expiresAt: 95 * DAY }, { id: 'd', name: '丁', expiresAt: 200 * DAY });
   const text = expiryNotice(many, 91 * DAY)!;
   assert.match(text, /「甲」「乙」已到期/);
   assert.match(text, /「丙」将在 4 天内到期/);

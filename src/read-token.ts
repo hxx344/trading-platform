@@ -156,11 +156,17 @@ export function createReadTokens({ dir, now = Date.now, log = line => process.st
     } catch (error) { rmSync(temp, { force: true }); throw error; }
   };
   const forget = () => { stored = null; redact = null; dirty = false; aliases.clear(); limits.clear(); };
+  /**
+   * Deleted from outside (install.sh --set-password, or by hand) revokes every token: each entry point that reads or
+   * writes the tokens checks this first, so none of them shows, reminds about or writes back a revoked token.
+   */
+  const vanished = () => {
+    if (stored && !existsSync(file)) { log('只读接口令牌文件已被删除，全部令牌已吊销'); forget(); }
+  };
   const flush = () => {
+    vanished();
     if (!dirty || !stored) return;
     dirty = false; flushedAt = now();
-    // Deleted from outside (install.sh --set-password, or by hand): every token is revoked, never written back.
-    if (!existsSync(file)) { log('只读接口令牌文件已被删除，全部令牌已吊销'); forget(); return; }
     try { write(stored); } catch (error) { log(`只读接口令牌统计写入失败：${error instanceof Error ? error.message : String(error)}`); }
   };
   const touch = () => { dirty = true; if (now() - flushedAt >= FLUSH_MS) flush(); };
@@ -187,6 +193,7 @@ export function createReadTokens({ dir, now = Date.now, log = line => process.st
     };
   };
   const view = (): ReadTokenView => {
+    vanished();
     const at = now();
     return { tokens: stored ? stored.tokens.map(token => item(token, at)) : [], max: READ_TOKEN_MAX, error: stored ? null : loadError };
   };
@@ -194,6 +201,7 @@ export function createReadTokens({ dir, now = Date.now, log = line => process.st
   return {
     view,
     generate({ name: rawName, scopes: rawScopes }) {
+      vanished();
       const name = readTokenName(rawName), scopes = readTokenScopes(rawScopes);
       if (name === null) throw new ReadTokenError('token_input', `名称须为 1–${NAME_MAX} 个字，不含控制字符`);
       if (scopes === null) throw new ReadTokenError('token_input', `范围须从 ${READ_SCOPES.join('、')} 中至少选一个`);
@@ -214,6 +222,7 @@ export function createReadTokens({ dir, now = Date.now, log = line => process.st
       return { token, id, view: view() };
     },
     revoke(id) {
+      vanished();
       if (id !== undefined && !find(id)) throw new ReadTokenError('token_unknown', `没有编号为 ${id} 的令牌`);
       const gone = stored ? stored.tokens.filter(token => id === undefined || token.id === id) : [];
       const left = stored ? stored.tokens.filter(token => !gone.includes(token)) : [];
@@ -231,7 +240,7 @@ export function createReadTokens({ dir, now = Date.now, log = line => process.st
     },
     check(token) {
       // Deleted from outside: refused from the next request on, not only after a restart.
-      if (stored && !existsSync(file)) { log('只读接口令牌文件已被删除，全部令牌已吊销'); forget(); }
+      vanished();
       if (!stored) return { ok: false, reason: 'none' };
       if (!READ_TOKEN_PATTERN.test(token)) return { ok: false, reason: 'invalid' };
       const digest = digestOf(token);
@@ -267,8 +276,9 @@ export function createReadTokens({ dir, now = Date.now, log = line => process.st
       touch();
     },
     redactor: () => redact,
-    lookup: alias => aliases.get(alias.trim()) ?? null,
+    lookup: alias => { vanished(); return aliases.get(alias.trim()) ?? null; },
     dueReminders(send) {
+      vanished();
       if (!stored) return [];
       const at = now(), texts: string[] = [];
       for (const token of stored.tokens) {
@@ -303,8 +313,8 @@ export const READ_TOKEN_ROUTES: readonly { path: string | RegExp; scope: ReadSco
   { path: '/api/state', scope: 'portfolio', query: [] },
   { path: /^\/api\/transfer-pairs\/[0-9A-Za-z_-]{1,64}\/history$/, scope: 'portfolio', query: ['before', 'limit'] },
   { path: /^\/api\/adl\/pairs\/[0-9A-Za-z_-]{1,64}\/incidents$/, scope: 'portfolio', query: ['before', 'limit'] },
-  { path: '/api/logs', scope: 'system', query: ['before', 'limit'] },
-  { path: '/api/logs/problems', scope: 'system', query: ['before', 'limit'] },
+  { path: '/api/logs', scope: 'portfolio', query: ['before', 'limit'] },
+  { path: '/api/logs/problems', scope: 'portfolio', query: ['before', 'limit'] },
   { path: '/api/oil/state', scope: 'portfolio', query: [] },
   { path: '/api/hynix/state', scope: 'portfolio', query: [] },
   { path: '/api/goldoil/state', scope: 'portfolio', query: [] },
@@ -340,6 +350,25 @@ export const READ_TOKEN_ROUTES: readonly { path: string | RegExp; scope: ReadSco
  */
 export function readTokenNewsView<T extends { items: readonly { url: string | null }[] }>(view: T): unknown {
   return { ...view, items: view.items.map(({ url, ...item }) => ({ ...item, link: url })) };
+}
+
+/**
+ * What a token without the portfolio scope reads of /api/status (docs/mcp.md 8.4): only the listed fields. The full
+ * answer carries the Feishu outbox's recent texts (fills, alerts, executions), the account streams, the transfer
+ * settings and the monitors' summaries, which are account and strategy data; a field added later stays out.
+ */
+export function readTokenSystemStatus(view: Record<string, unknown>): Record<string, unknown> {
+  const pick = (value: unknown, keys: readonly string[]) => value !== null && typeof value === 'object'
+    ? Object.fromEntries(keys.filter(key => Object.hasOwn(value, key)).map(key => [key, (value as Record<string, unknown>)[key]])) : value ?? null;
+  return {
+    health: view.health ?? null,
+    dependencies: view.dependencies ?? null,
+    samples: view.samples ?? null,
+    ...(view.watch !== undefined ? { watch: view.watch } : {}),
+    feishu: pick(view.feishu, ['configured', 'pending', 'retrying', 'lastSentAt', 'lastError', 'nextRetryAt', 'retentionMs']),
+    ...(view.monitor !== undefined ? { monitor: pick(view.monitor, ['available', 'error']) } : {}),
+    omitted: '令牌没有 portfolio 范围：飞书消息原文、账户行情流、划转设置与各监控摘要不提供',
+  };
 }
 
 /** The scope a read-only token needs to GET this URL, or null when no token may: the path in READ_TOKEN_ROUTES and only its query parameters. */

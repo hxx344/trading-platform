@@ -138,7 +138,7 @@ test('MCP：只列出令牌范围内的工具，范围外的调用写明缺哪�
     const scopes = tokenScopes(get);
     assert.deepEqual(await scopes(), ['system']);
     const listed = await handle({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, get, scopes) as { result: { tools: { name: string }[] } };
-    assert.deepEqual(listed.result.tools.map(tool => tool.name), ['platform_status', 'logs', 'host_status', 'update_status']);
+    assert.deepEqual(listed.result.tools.map(tool => tool.name), ['platform_status', 'host_status', 'update_status']);
     const refused = await call(get, 'varlighter', {}, scopes);
     assert.equal(refused.result?.isError, true);
     assert.match(refused.result!.content[0]!.text, /portfolio/);
@@ -160,12 +160,21 @@ test('MCP：读不到令牌范围（v0.85.0 之前的平台、网络错误）时
     if (fail) throw new PlatformError('403 只读令牌不能访问这个接口', 403, null, 'read_only');
     return { id: '1a2b3c4d', name: 'x', scopes: ['public', 'bogus'], expiresAt: 0 };
   };
-  const scopes = tokenScopes(get);
+  const clock = { now: 0 };
+  const scopes = tokenScopes(get, () => clock.now);
   assert.equal(await scopes(), null);
   const all = await handle({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, get, scopes) as { result: { tools: unknown[] } };
   assert.equal(all.result.tools.length, TOOLS.length);
+  assert.equal(calls, 1, '旧版平台的 403 记住 5 分钟，不每次都问');
   fail = false;
+  assert.equal(await scopes(), null);
+  clock.now = 5 * 60_000;
   assert.deepEqual(await scopes(), ['public']);
   assert.deepEqual(await scopes(), ['public']);
-  assert.equal(calls, 3, '读到之后不再请求');
+  assert.equal(calls, 2, '读到之后不再请求');
+  // A network error is asked again on the next call.
+  let down = 0;
+  const flaky = tokenScopes(async () => { down += 1; throw new PlatformError('无法连接平台：超时'); }, () => 0);
+  await flaky(); await flaky();
+  assert.equal(down, 2);
 });

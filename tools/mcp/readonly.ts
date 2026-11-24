@@ -113,7 +113,7 @@ export const TOOLS: readonly Tool[] = [
     run: async (_args, get) => ({ status: await get('/api/status'), state: await outOfScope(get, '/api/state') }),
   },
   {
-    name: 'logs', scope: 'system',
+    name: 'logs', scope: 'portfolio',
     description: `服务日志，新的在前；filter=problems 只看告警与问题行。翻页时把上一页的 next 作为 before。${DATA_NOTE}`,
     inputSchema: schema({ filter: { type: 'string', enum: ['all', 'problems'] }, limit: { type: 'integer', minimum: 1, maximum: 200 }, before: { type: 'string' } }),
     run: async (args, get) => get(`/api/logs${pick(args, 'filter', ['all', 'problems'], 'all') === 'problems' ? '/problems' : ''}?limit=${int(args, 'limit', 1, 200, 50)}${cursor(args)}`),
@@ -313,17 +313,24 @@ const SCOPES: readonly Scope[] = ['public', 'system', 'portfolio'];
  * The token's scopes from GET /api/read-token/self, read once it succeeds. A platform before v0.85.0 refuses that path
  * (403), and then (as on any failure) null: every tool is listed and the platform's own 403 stays the limit.
  */
-export function tokenScopes(get: Get): () => Promise<readonly Scope[] | null> {
+export function tokenScopes(get: Get, now: () => number = Date.now): () => Promise<readonly Scope[] | null> {
   let known: readonly Scope[] | null = null;
+  let oldUntil = 0;
   return async () => {
     if (known) return known;
+    // An old platform answers 403 read_only every time: asked again only after a few minutes, not on every call.
+    if (now() < oldUntil) return null;
     try {
       const self = await get('/api/read-token/self') as { scopes?: unknown };
       if (Array.isArray(self.scopes)) known = SCOPES.filter(scope => (self.scopes as unknown[]).includes(scope));
       return known;
-    } catch { return null; }
+    } catch (error) {
+      if (error instanceof PlatformError && error.status === 403 && error.code === 'read_only') oldUntil = now() + OLD_PLATFORM_RETRY_MS;
+      return null;
+    }
   };
 }
+const OLD_PLATFORM_RETRY_MS = 5 * 60_000;
 
 /** Serves stdin/stdout until stdin ends; replies may finish out of order, each carries its id. */
 export function serve(get: Get, input: NodeJS.ReadableStream = process.stdin, output: NodeJS.WritableStream = process.stdout): Promise<void> {

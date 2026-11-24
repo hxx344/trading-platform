@@ -238,8 +238,8 @@ R3：改动令牌的权限范围，第 8.4 节还会改 `read-token.json` 的格
 - `read-token.json` 升到 `version: 2`，保存最多 8 枚令牌，每枚有编号、名称（1–40 字）、范围、摘要、生成与到期时间、最近使用、按小时的请求计数。打码密钥和别名对照改为整个文件共用一份，不同令牌读到的别名一致；全部吊销后清空对照并换密钥。
 - 范围三种，可多选：
   - `public`：行情报价、快讯与异动。
-  - `system`：`/api/status`、`/api/host`、`/api/logs`、`/api/logs/problems`、`/api/update`。
-  - `portfolio`：其余现有白名单（执行器状态、划转与 ADL、原油、海力士、金油、行情监控告警、期权、CrossEx、Ondo），以及 Var/Lighter 的全部读取（模拟盘的参数与成交属于策略数据，与账户数据同列）。
+  - `system`：`/api/status`、`/api/host`、`/api/update`。没有 `portfolio` 的令牌读 `/api/status` 只得到列出的字段（`readTokenSystemStatus`：`health`、`dependencies`、`samples`、`watch`，飞书只给计数与最近错误，行情监控只给可用与否），飞书消息原文（含成交、告警、执行提醒）、账户行情流、划转设置与各监控摘要都不给，应答里的 `omitted` 写明这一点；以后新增的字段也不给。
+  - `portfolio`：其余现有白名单（`/api/logs` 与 `/api/logs/problems`——服务日志里有成交、持仓与额度——执行器状态、划转与 ADL、原油、海力士、金油、行情监控告警、期权、CrossEx、Ondo），以及 Var/Lighter 的全部读取（模拟盘的参数与成交属于策略数据，与账户数据同列）。
 - `READ_TOKEN_ROUTES` 每条写明所属范围。令牌校验通过、路径在白名单里但范围不含时，返回 403 `token_scope`。
 - 升级时，已有的 v1 令牌原样迁移为一枚名为「MCP」、范围为三者全选的令牌，编号、到期时间、打码密钥、别名对照都保留，客户端不用改。
 - 限额按令牌分别计算：每分钟 30 次、同时 2 个。另加全进程同时 4 个的上限，不让多个令牌合起来挤占交易处理。
@@ -249,12 +249,12 @@ R3：改动令牌的权限范围，第 8.4 节还会改 `read-token.json` 的格
 
 **实施记录（v0.85.0）**
 
-- `src/read-token.ts`：`generate({ name, scopes })` 返回令牌明文与编号；`revoke(id?)` 不带编号时吊销全部；`check` 返回编号、名称与范围；`admit(id)` 按令牌限额，另有合计 4 个的并发上限（`READ_TOKEN_TOTAL_CONCURRENT`）。第一次生成（或全部吊销之后、文件损坏之后）新建打码密钥与空的别名对照。`check` 与落盘前都核对文件是否还在，被外部删除时清空内存里的令牌，不把统计写回。
-- `src/http.ts`：生成要 `{ name, scopes }`，名称或范围不对 400 `token_input`，已满 409 `token_limit`；吊销接受可选的 `id`（8 位十六进制），未知编号 404 `token_unknown`。`/api/read-token/self` 在白名单判断之前处理，只要令牌有效就答，不计入每分钟次数，也不进使用统计；带查询参数时按白名单外处理。
-- `tools/mcp/readonly.ts`：每个工具标注范围；`platform_status` 的执行器状态属于 `portfolio`，只有 `system` 范围时写明 `unavailable`，其余照常返回。读到 `self` 后记住范围，读不到时下次调用再试。
+- `src/read-token.ts`：`generate({ name, scopes })` 返回令牌明文与编号；`revoke(id?)` 不带编号时吊销全部；`check` 返回编号、名称与范围；`admit(id)` 按令牌限额，另有合计 4 个的并发上限（`READ_TOKEN_TOTAL_CONCURRENT`）。第一次生成（或全部吊销之后、文件损坏之后）新建打码密钥与空的别名对照。每个读写入口（`view`、`generate`、`revoke`、`check`、`lookup`、`dueReminders`、落盘）都先核对文件是否还在，被外部删除时清空内存里的令牌、密钥与别名，之后生成按全新文件处理，不把旧令牌或统计写回，也不再发到期提醒。
+- `src/http.ts`：生成要 `{ name, scopes }`，名称或范围不对 400 `token_input`，已满 409 `token_limit`；吊销给 `id`（8 位十六进制）吊销一枚，未知编号 404 `token_unknown`；吊销全部要显式给 `{ "all": true }`，空的请求体（升级前没刷新的旧页面发的就是空体）400，不当作全部。`/api/read-token/self` 不需要范围，但和其他令牌请求一样受每分钟次数与并发限额，计入使用统计；带查询参数时按白名单外处理。
+- `tools/mcp/readonly.ts`：每个工具标注范围；`platform_status` 的执行器状态属于 `portfolio`，只有 `system` 范围时写明 `unavailable`，其余照常返回。`logs` 属于 `portfolio`。读到 `self` 后记住范围；旧版平台对 `self` 回 403 `read_only` 时 5 分钟内不再问，网络错误下次调用再试。
 - 页面：令牌列表、生成表单（名称与范围多选）、逐枚吊销；到期提醒与侧栏提示逐枚写名称（[frontend.md](frontend.md)《只读接口令牌》）。
 - 安装脚本：`--set-password` 删除 `read-token.json`；`deploy/test-install.sh` 断言配置检查失败时不删、设置成功后删除。
-- 测试：`test/read-token.test.ts`（范围 403、`self`、8 枚上限与输入校验、逐枚吊销、v1 迁移、全部吊销换密钥、外部删除、逐枚提醒、按令牌与合计并发）、`test/read-token-form.test.ts`（生成请求校验、多枚提醒文案）、`test/mcp-readonly.test.ts`（按范围列工具、范围外调用、读不到范围时列出全部）。
+- 测试：`test/read-token.test.ts`（范围 403、`self` 及其限额、8 枚上限与输入校验、逐枚吊销与显式全部吊销、v1 迁移、全部吊销换密钥、外部删除后各入口不写回、`system` 令牌的状态投影、逐枚提醒、按令牌与合计并发）、`test/read-token-form.test.ts`（生成请求校验、多枚提醒文案）、`test/mcp-readonly.test.ts`（按范围列工具、范围外调用、读不到范围时列出全部、旧版平台的 403 记住 5 分钟）。
 
 **回退**：回退到 v0.84.0。v0.84.0 与之前的版本只认 `version: 1`，读到 `version: 2` 会当作文件损坏，拒绝所有令牌，面板显示损坏原因，不会放宽权限。回退后在面板重新生成即可覆盖；想保留原令牌，可在回退前从备份恢复 v1 文件。回退后 `--set-password` 不再删除令牌文件。
 

@@ -180,7 +180,7 @@ test('只读令牌：应答按值与按字段打码，原值不出现；同一�
     assert.equal((await s.read(token, '/api/status')).status, 200, '多个令牌并存');
     assert.ok((await (await s.read(second, '/api/status')).text()).includes(addr), '各令牌别名一致');
     // All revoked: the aliases and the key go, the next token reads new aliases.
-    assert.equal((await s.sessionPost('/api/read-token/revoke')).status, 200);
+    assert.equal((await s.sessionPost('/api/read-token/revoke', { all: true })).status, 200);
     assert.equal((await s.read(token, '/api/status')).status, 401);
     assert.equal((await (await s.sessionPost('/api/read-token/lookup', { alias: addr })).json() as { original: unknown }).original, null);
     const next = await s.generate();
@@ -228,7 +228,7 @@ test('只读令牌：每个令牌同时最多 2 个请求在处理，全部令�
   const c1 = tokens.admit('c');
   assert.ok(c1);
   second(); third(); b2(); c1();
-  for (let i = 0; i < 26; i += 1) tokens.admit('a')!();
+  for (let i = 0; i < 27; i += 1) tokens.admit('a')!();   // 3 admitted above, refusals do not count
   assert.equal(tokens.admit('a'), null, '令牌 a 这一分钟已用满 30 次');
   assert.ok(tokens.admit('d'), '令牌 d 不受影响');
 });
@@ -265,7 +265,7 @@ test('只读令牌：文件只存摘要且为 600；吊销后立即 401；到期
     clock.now = Date.UTC(2026, 10, 19);
     const fresh = await s.generate();
     assert.equal((await s.read(fresh, '/api/status')).status, 200);
-    assert.equal((await s.sessionPost('/api/read-token/revoke')).status, 200);
+    assert.equal((await s.sessionPost('/api/read-token/revoke', { all: true })).status, 200);
     assert.equal((await s.read(fresh, '/api/status')).status, 401, '吊销立即生效');
     assert.throws(() => statSync(file), /ENOENT/);
   } finally { await s.close(); }
@@ -481,7 +481,7 @@ test('只读令牌：全部吊销后别名与密钥一起换掉；令牌文件�
     const key = keyOf();
     await s.generate(['public'], '乙');
     assert.equal(keyOf(), key, '再生成不换密钥');
-    assert.equal((await s.sessionPost('/api/read-token/revoke')).status, 200);
+    assert.equal((await s.sessionPost('/api/read-token/revoke', { all: true })).status, 200);
     assert.deepEqual(s.tokens!.view().tokens, []);
     const third = await s.generate(['system'], '丙');
     assert.notEqual(keyOf(), key, '全部吊销后再生成换密钥');
@@ -515,4 +515,72 @@ test('只读令牌：到期提醒按令牌分别发，文字写明名称与编�
     assert.match(second[0]!, new RegExp(`「乙」（编号 ${b.id}）`));
     assert.deepEqual(open().dueReminders(), []);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('只读令牌：文件被外部删除后，不经令牌请求直接生成、逐个吊销或看列表，都不把旧令牌写回；到期提醒不再发', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-read-token-'));
+  const at = { now: Date.UTC(2026, 10, 19) };
+  const lines: string[] = [];
+  const tokens = createReadTokens({ dir, now: () => at.now, log: line => lines.push(line) });
+  try {
+    const file = join(dir, READ_TOKEN_FILE);
+    const old = tokens.generate({ name: '旧', scopes: ['system'] });
+    const oldKey = (JSON.parse(readFileSync(file, 'utf8')) as { redactKey: string }).redactKey;
+    rmSync(file);
+    assert.deepEqual(tokens.view().tokens, [], '列表随之清空');
+    const fresh = tokens.generate({ name: '新', scopes: ['system'] });
+    const written = JSON.parse(readFileSync(file, 'utf8')) as { redactKey: string; tokens: { id: string }[] };
+    assert.deepEqual(written.tokens.map(token => token.id), [fresh.id], '文件里只有新令牌');
+    assert.notEqual(written.redactKey, oldKey, '新密钥');
+    assert.deepEqual(tokens.check(old.token), { ok: false, reason: 'invalid' });
+    assert.equal(tokens.check(fresh.token).ok, true);
+    rmSync(file);
+    assert.throws(() => tokens.revoke(fresh.id), /没有编号/, '删除后逐个吊销不写回');
+    assert.throws(() => statSync(file), /ENOENT/);
+    const again = createReadTokens({ dir, now: () => at.now, log: () => {} });
+    again.generate({ name: '甲', scopes: ['public'] });
+    rmSync(file);
+    at.now += READ_TOKEN_TTL_MS - 86_400_000 + 1000;
+    assert.deepEqual(again.dueReminders(() => assert.fail('已吊销的令牌不提醒')), []);
+    assert.throws(() => statSync(file), /ENOENT/);
+    assert.ok(lines.some(line => line.includes('文件已被删除')));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('只读令牌：没有 portfolio 的令牌读 /api/status 只得到运行状态，不含飞书消息原文与账户行情流；日志属于 portfolio', async () => {
+  clock.now = Date.UTC(2026, 10, 19);
+  const s = await start();
+  try {
+    const system = await s.generate(['system'], '运维');
+    const full = await s.generate(READ_SCOPES, '分析');
+    const narrow = await (await s.read(system, '/api/status')).json() as Record<string, unknown>;
+    const wide = await (await s.read(full, '/api/status')).text();
+    assert.match(wide, /已暂停/, '有 portfolio 时照旧');
+    const text = JSON.stringify(narrow);
+    assert.doesNotMatch(text, /已暂停|streams|wallet|nested|recent/);
+    assert.ok('health' in narrow && 'omitted' in narrow);
+    assert.deepEqual(narrow.feishu, { configured: true });
+    for (const path of ['/api/logs', '/api/logs/problems']) {
+      const refused = await s.read(system, path);
+      assert.equal(refused.status, 403, path);
+      assert.equal((await refused.json() as { scope: string }).scope, 'portfolio');
+      assert.equal((await s.read(full, path)).status, 200, path);
+    }
+  } finally { await s.close(); }
+});
+
+test('只读令牌：/api/read-token/self 同样受每分钟 30 次限额；吊销全部要显式 all，空的请求体 400', async () => {
+  clock.now = Date.UTC(2026, 10, 19);
+  const s = await start();
+  try {
+    const token = await s.generate(['public'], '甲');
+    for (let i = 0; i < 30; i += 1) assert.equal((await s.read(token, '/api/read-token/self')).status, 200);
+    assert.equal((await s.read(token, '/api/read-token/self')).status, 429);
+    for (const body of [{}, { all: false }, { all: true, id: s.tokens!.view().tokens[0]!.id }, { all: 'yes' }]) {
+      assert.equal((await s.sessionPost('/api/read-token/revoke', body)).status, 400, JSON.stringify(body));
+    }
+    assert.equal(s.tokens!.view().tokens.length, 1, '都没有吊销');
+    assert.equal((await s.sessionPost('/api/read-token/revoke', { all: true })).status, 200);
+    assert.deepEqual(s.tokens!.view().tokens, []);
+  } finally { await s.close(); }
 });

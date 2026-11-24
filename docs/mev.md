@@ -211,7 +211,7 @@
 | --- | --- |
 | `GET /api/mev/state` | 页面全部读数，另有 `setup`（阶段 `none` / `wallet` / `deploying` / `ready`、是否由配置文件管理、热钱包与收款地址、节点主机名、余额与 nonce、在途的部署、错误）。引擎没在运行时只有 `setup`。不含私钥与节点地址 |
 | `POST /api/mev/setup` | `{ privateKey, owner, rpcUrl? }` 录入；已录入时 409 `exists` |
-| `POST /api/mev/setup/deploy` | `{ confirm: <热钱包地址> }` 发出部署交易（找到已部署的合约时直接沿用、不发）；余额不够 409 `low_balance`，在途未满 5 分钟或 nonce 已用掉 409 `pending`，上一次请求未结束 409 `busy`，节点落后 409 `node_behind`，节点拒收 502 `rejected`，读不全 502 `rpc`，已部署 409 `deployed`，请求途中钱包或节点被改 409 `stale`，服务停止中 503 `stopping`。页面给这个请求 45 秒超时（其余写请求 15 秒） |
+| `POST /api/mev/setup/deploy` | `{ confirm: <热钱包地址> }` 发出部署交易（找到已部署的合约时直接沿用、不发）；余额不够 409 `low_balance`，在途未满 5 分钟或 nonce 已用掉 409 `pending`，上一次请求未结束 409 `busy`，节点落后 409 `node_behind`，节点拒收 502 `rejected`，读不全 502 `rpc`，已部署 409 `deployed`，签名前的读取途中钱包或节点被改 409 `stale`（发送途中被改按当前状态返回），服务停止中 503 `stopping`。页面给这个请求 45 秒超时（其余写请求 15 秒） |
 | `POST /api/mev/setup/rpc` | `{ rpcUrl }` 更换节点，`null` 或空改回公共节点；实盘中 409 `live` |
 | `POST /api/mev/setup/reset` | `{ confirm: <热钱包地址> }` 移除热钱包（部署在途时也可以）；实盘中 409 `live` |
 | `POST /api/mev/settings` | `{ settings }` 保存风控参数，范围由服务端校验 |

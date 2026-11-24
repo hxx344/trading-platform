@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import type { AddressInfo } from 'node:net';
 import { createExecutorServer } from '../src/http.ts';
-import { createReadTokens } from '../src/read-token.ts';
+import { createReadTokens, readTokenSystemStatus } from '../src/read-token.ts';
 import { OUTPUT_MAX_BYTES, PlatformError, TOOLS, handle, loadSettings, platformGet, serve, snapshotFor, tokenScopes, toolText, type Get } from '../tools/mcp/readonly.ts';
 import { SNAPSHOT_CACHE_MS, createSnapshot, type Snapshot } from '../tools/mcp/snapshot.ts';
 import { bindAccounts, createHarness } from './harness.ts';
@@ -39,7 +39,7 @@ test('MCP：各工具经令牌读取白名单接口，应答已打码；未配�
   const p = await platform();
   try {
     const get = platformGet({ base: new URL(p.base), token: p.token });
-    assert.deepEqual(TOOLS.map(tool => tool.name), ['platform_status', 'logs', 'aster_pair', 'oil_hynix', 'monitor', 'module_state', 'varlighter', 'varlighter_backtest', 'host_status', 'market_quotes', 'news', 'update_status']);
+    assert.deepEqual(TOOLS.map(tool => tool.name), ['platform_status', 'logs', 'aster_pair', 'oil_hynix', 'monitor', 'module_state', 'varlighter', 'varlighter_backtest', 'host_status', 'market_quotes', 'news', 'snapshot', 'update_status']);
     const runs: [string, unknown][] = [['platform_status', {}], ['logs', { filter: 'problems', limit: 5, before: '100' }], ['aster_pair', { pairId: 'xau' }], ['oil_hynix', {}], ['oil_hynix', { view: 'pnl', range: '30d', page: 2 }],
       ['monitor', {}], ['module_state', { module: 'crossex' }], ['module_state', { module: 'options', view: 'performance' }], ['update_status', {}]];
     for (const [name, args] of runs) {
@@ -140,12 +140,15 @@ test('MCP：只列出令牌范围内的工具，范围外的调用写明缺哪�
     assert.deepEqual(await scopes(), ['system']);
     const listed = await handle({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, get, scopes) as { result: { tools: { name: string }[] } };
     assert.deepEqual(listed.result.tools.map(tool => tool.name), ['platform_status', 'host_status', 'snapshot', 'update_status']);
-    // snapshot keeps to the token's groups; this platform has no /api/host, so both system groups say why.
+    // snapshot keeps to the token's groups. This platform has no /api/host: system.host says why, and system.runtime
+    // still has the rows of the real /api/status a system token reads (its projection), without its text.
     const snap = await call(get, 'snapshot', {}, scopes);
     assert.equal(snap.result?.isError, undefined, snap.result?.content[0]?.text);
     const groups = (JSON.parse(snap.result!.content[0]!.text) as { groups: { id: string; status: string; message: string }[] }).groups;
-    assert.deepEqual(groups.map(group => [group.id, group.status]), [['system.host', 'unavailable'], ['system.runtime', 'unavailable']]);
+    assert.deepEqual(groups.map(group => [group.id, group.status]), [['system.host', 'unavailable'], ['system.runtime', 'partial']]);
     assert.match(groups[0]!.message, /404/);
+    assert.match(groups[1]!.message, /\/api\/host.*404/);
+    assert.doesNotMatch(snap.result!.content[0]!.text, new RegExp(`${ADDRESS}|wallet|addr-`, 'i'));
     assert.match((await call(get, 'snapshot', { groups: ['market.monitor'] }, scopes)).result!.content[0]!.text, /没有 public 范围/);
     const refused = await call(get, 'varlighter', {}, scopes);
     assert.equal(refused.result?.isError, true);
@@ -230,15 +233,18 @@ function snapshotPlatform(clock: { now: number }) {
     process: { rssBytes: 3e8, heapUsedBytes: 1e8, uptimeSeconds: 3600, loopDelayMs: { mean: 1.2, p99: 8, max: 20 } },
     connections: [{ id: 'market', label: '行情服务', state: 'ok', detail: '正常' }, { id: 'streams', label: 'ASTER 用户推送', state: 'down', detail: '断开：acct-1 原因原文' }, { id: 'mystery', state: 'ok' }],
   });
-  const status = () => ({
-    health: { startedAt: clock.now - 7_200_000, now: clock.now, retired: false, walBytes: 1024, walLimitBytes: 1 << 26, writes: { busy: 0, maxWaitMs: 3, maxHoldMs: 4 },
-      loops: [{ name: '划转', lastOkAt: clock.now - 4000, failures: 0, lastErrorAt: null }, { name: 'ADL', lastOkAt: null, failures: 2, lastErrorAt: clock.now }, 'odd'] },
+  // The runtime's own shape (loop names as src/runtime.ts tracks them, error text included), through the projection a
+  // token without portfolio reads.
+  const status = () => readTokenSystemStatus({
+    health: { startedAt: clock.now - 7_200_000, now: clock.now, generation: 3, retired: false, schemaVersion: 40, walBytes: 1024, walLimitBytes: 1 << 26,
+      writes: { transactions: 10, busy: 0, waitBucketsMs: [1, 10], waitBuckets: [9, 1, 0], maxWaitMs: 3, maxHoldMs: 4 },
+      loops: [{ name: '划转循环', lastOkAt: clock.now - 4000, failures: 0, lastError: null, lastErrorAt: null }, { name: 'ADL 循环', lastOkAt: null, failures: 2, lastError: '账户 0xabc 原因原文', lastErrorAt: clock.now }, 'odd'] },
     dependencies: { market: { ok: true, checkedAt: clock.now, lastOkAt: clock.now, error: null, restarts: 1 }, control: { ok: false, checkedAt: clock.now, lastOkAt: null, error: '连接被拒绝', restarts: 0 }, incidents: [{ key: 'control', problem: '原文' }] },
-    feishu: { configured: true },
+    feishu: { configured: true, recent: [{ text: '成交原文' }] }, streams: [{ account: 'acct-1' }],
   });
   const fetched = () => new Date(clock.now).toISOString();
   const quotes: Record<string, () => unknown> = {
-    oil: () => ({ source: 'Binance', fetchedAt: fetched(), status: 'live', staleAfterMs: 90_000, brent: { coin: 'BZUSDT', markPx: 70.5, fundingRate: 0.0001 }, wti: { coin: 'CLUSDT', markPx: 67.25, fundingRate: null }, extraField: 99 }),
+    oil: () => ({ source: 'Binance', fetchedAt: fetched(), status: 'live', staleAfterMs: 90_000, brent: { coin: 'BZUSDT', markPx: 70.5, fundingRate: 0.0001, fundingIntervalHours: 8 }, wti: { coin: 'CLUSDT', markPx: 67.25, fundingRate: null }, extraField: 99 }),
     goldoil: () => ({ fetchedAt: fetched(), status: 'snapshot', staleAfterMs: 90_000, xau: { price: 4000 }, cl: { price: 67 }, bz: { price: 70 }, ratio: { cl: 59.7, bz: 57.1 } }),
     hynix: () => ({ fetchedAt: fetched(), status: 'live', staleAfterMs: 120_000, adr: 50, ordinary: 480, equivalent: 48, spread: 2, premium: 4.1667 }),
     anthropic: () => ({ fetchedAt: fetched(), status: 'live', staleAfterMs: 60_000, binance: { markPx: 300, fundingRate: 0.0002 }, xyz: null, io: { markPx: 301, fundingRate: null }, rh: { markPx: 299, fundingRate: 0.0001 }, errors: { xyz: '原文' } }),
@@ -264,6 +270,7 @@ test('MCP snapshot：每行带单位、取值时间、是否过期与状态，�
   const snap = JSON.parse(text) as Snapshot;
   assert.equal(snap.schemaVersion, 1);
   assert.deepEqual(snap.groups.map(group => [group.id, group.scope, group.status]), [['system.host', 'system', 'ok'], ['system.runtime', 'system', 'ok'], ['market.monitor', 'public', 'ok']]);
+  assert.equal(snap.rateLimited, false);
   for (const row of snap.groups.flatMap(group => group.rows)) {
     assert.deepEqual(Object.keys(row), ['entity', 'metric', 'label', 'value', 'unit', 'asOf', 'stale', 'status']);
     assert.ok(row.value === null || (typeof row.value === 'number' && Number.isFinite(row.value)), `${row.entity} ${row.metric}`);
@@ -273,10 +280,15 @@ test('MCP snapshot：每行带单位、取值时间、是否过期与状态，�
   assert.equal(rowOf(snap, 'disk:data', 'used_percent')?.value, 50);
   assert.equal(rowOf(snap, 'disk:root', 'used_percent')?.value, null);
   assert.equal(rowOf(snap, 'disk:other', 'used_percent'), undefined, '名单外的磁盘不列');
-  assert.deepEqual([rowOf(snap, 'loop:ADL', 'failures')?.value, rowOf(snap, 'loop:ADL', 'failures')?.status], [2, 'warn']);
-  assert.equal(rowOf(snap, 'loop:划转', 'since_ok')?.value, 4);
-  assert.equal(rowOf(snap, 'loop:ADL', 'since_ok')?.value, null);
+  assert.deepEqual([rowOf(snap, 'loop:ADL 循环', 'failures')?.value, rowOf(snap, 'loop:ADL 循环', 'failures')?.status], [2, 'warn']);
+  assert.equal(rowOf(snap, 'loop:ADL 循环', 'failures')?.label, 'ADL 循环：连续失败次数');
+  assert.equal(rowOf(snap, 'loop:划转循环', 'since_ok')?.value, 4);
+  assert.equal(rowOf(snap, 'loop:ADL 循环', 'since_ok')?.value, null);
+  assert.doesNotMatch(text, /循环循环/);
   assert.deepEqual([rowOf(snap, 'process:control', 'up')?.value, rowOf(snap, 'process:control', 'up')?.status], [0, 'down']);
+  assert.equal(rowOf(snap, 'process:control', 'restarts'), undefined, '控制面的重启次数没有统计，不给 0');
+  assert.equal(rowOf(snap, 'process:market', 'restarts')?.value, 1);
+  assert.equal(rowOf(snap, 'service', 'writes.max_hold')?.value, 4);
   assert.equal(rowOf(snap, 'service', 'incidents.open')?.value, 1);
   assert.equal(rowOf(snap, 'service', 'uptime')?.value, 7200);
   assert.equal(rowOf(snap, 'process:trading', 'loop_delay.p99')?.value, 8);
@@ -287,13 +299,16 @@ test('MCP snapshot：每行带单位、取值时间、是否过期与状态，�
   assert.equal(rowOf(snap, 'monitor:goldoil', 'ratio.cl')?.stale, true, 'status 不是 live 的报价算过期');
   assert.equal(rowOf(snap, 'monitor:anthropic', 'xyz.price')?.value, null);
   assert.equal(rowOf(snap, 'monitor:hynix', 'premium')?.unit, '%');
-  assert.doesNotMatch(text, /extraField|secretHost|web-01|\/var\/lib|原因原文|连接被拒绝|原文|mystery/);
+  assert.equal(rowOf(snap, 'monitor:anthropic', 'binance.price')?.unit, 'USDT');
+  assert.equal(rowOf(snap, 'monitor:anthropic', 'io.price')?.unit, 'USD');
+  assert.equal(rowOf(snap, 'monitor:oil', 'brent.funding_interval')?.value, 8);
+  assert.doesNotMatch(text, /extraField|secretHost|web-01|\/var\/lib|原因原文|连接被拒绝|原文|mystery|0xabc|acct-1/);
 });
 
-test('MCP snapshot：5 秒内不重复读取；单个来源 503 时只有该组不可用，报价缺一个市场为 partial；401 整次报错', async () => {
+test('MCP snapshot：5 秒内不重复读取；单个来源 503 时只缺对应的行（partial），读不到全部来源才 unavailable；401 整次报错', async () => {
   const clock = { now: T0 };
   const p = snapshotPlatform(clock);
-  const build = createSnapshot(async path => { try { return { ok: true, value: await p.get(path) }; } catch (error) { if (error instanceof PlatformError && error.status !== 401) return { ok: false, message: error.message }; throw error; } }, () => clock.now);
+  const build = createSnapshot(async path => { try { return { ok: true, value: await p.get(path) }; } catch (error) { if (error instanceof PlatformError && error.status !== 401) return { ok: false, message: error.message, rateLimited: error.status === 429 }; throw error; } }, () => clock.now);
   const all = ['system.host', 'system.runtime', 'market.monitor'] as const;
   await build(all);
   assert.equal(p.reads.length, 6, '/api/host 两组共用一次');
@@ -306,16 +321,51 @@ test('MCP snapshot：5 秒内不重复读取；单个来源 503 时只有该组�
   p.fail['/api/monitor/hynix/quote'] = new PlatformError('平台拒绝 /api/monitor/hynix/quote：404 未配置', 404);
   const partial = await build(all);
   assert.equal(p.reads.length, 12);
-  assert.deepEqual(partial.groups.map(group => group.status), ['unavailable', 'unavailable', 'partial']);
+  assert.deepEqual(partial.groups.map(group => group.status), ['unavailable', 'partial', 'partial']);
   assert.deepEqual(partial.groups[0]!.rows, []);
   assert.match(partial.groups[1]!.message!, /503/);
+  assert.equal(rowOf(partial, 'service', 'wal.size')?.value, 1024, '/api/status 的行照常');
+  assert.equal(rowOf(partial, 'process:trading', 'rss'), undefined, '/api/host 的行没有');
   assert.match(partial.groups[2]!.message!, /hynix：.*404/);
   assert.equal(rowOf(partial, 'monitor:hynix', 'premium'), undefined);
   assert.equal(rowOf(partial, 'monitor:oil', 'brent.price')?.value, 70.5);
+  assert.equal(partial.rateLimited, false);
+  // A 429 marks the whole snapshot rateLimited, so the caller knows to wait rather than read the module as down.
+  p.fail['/api/monitor/oil/quote'] = new PlatformError('平台拒绝 /api/monitor/oil/quote：429 请求过于频繁（稍后再试）', 429, 5);
+  clock.now += SNAPSHOT_CACHE_MS;
+  const limited = await build(['market.monitor']);
+  assert.equal(limited.rateLimited, true);
+  assert.match(limited.groups[0]!.message!, /oil：.*429/);
   delete p.fail['/api/host'];
   p.fail['/api/status'] = new PlatformError('平台拒绝 /api/status：401 令牌无效', 401);
   clock.now += SNAPSHOT_CACHE_MS;
   await assert.rejects(build(['system.runtime']), /401/);
+});
+
+test('MCP snapshot：读取完成后才开始计 5 秒，慢的读取由同时的调用共用；采集器还没有报价（null）时写明', async () => {
+  const clock = { now: T0 };
+  const reads: string[] = [];
+  let release = () => {};
+  const slow = new Promise<void>(resolve => { release = resolve; });
+  const build = createSnapshot(async path => {
+    reads.push(path);
+    if (path === '/api/host') await slow;
+    if (path === '/api/monitor/oil/quote') return { ok: true, value: null };
+    if (path.startsWith('/api/monitor/')) return { ok: false, message: `平台拒绝 ${path}：404 未配置` };
+    return { ok: true, value: { generatedAt: clock.now, cpu: { usagePercent: 1 } } };
+  }, () => clock.now);
+  const first = build(['system.host']);
+  clock.now += 3 * SNAPSHOT_CACHE_MS;
+  const second = build(['system.host']);
+  release();
+  await Promise.all([first, second]);
+  assert.deepEqual(reads, ['/api/host'], '还在进行的读取一律共用');
+  clock.now += SNAPSHOT_CACHE_MS - 1;
+  await build(['system.host']);
+  assert.equal(reads.length, 1, '从读取完成算起 5 秒内复用');
+  const market = await build(['market.monitor']);
+  assert.equal(market.groups[0]!.status, 'unavailable');
+  assert.match(market.groups[0]!.message!, /oil：采集器还没有报价/);
 });
 
 test('MCP snapshot：缓存里的读取按调用时刻判定过期', async () => {

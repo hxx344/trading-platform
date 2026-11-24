@@ -13,13 +13,14 @@ export type SnapshotGroupId = typeof SNAPSHOT_GROUPS[number]['id'];
 export const SNAPSHOT_GROUP_IDS: readonly SnapshotGroupId[] = SNAPSHOT_GROUPS.map(group => group.id);
 
 /** One GET: its body, or why it could not be read. `read` throws only for errors that end the whole call (a bad token). */
-export type Source = { ok: true; value: unknown } | { ok: false; message: string };
+export type Source = { ok: true; value: unknown } | { ok: false; message: string; rateLimited?: boolean };
 export type Read = (path: string) => Promise<Source>;
 
 export type RowStatus = 'ok' | 'warn' | 'down' | 'unknown';
 export interface SnapshotRow { entity: string; metric: string; label: string; value: number | null; unit: string; asOf: string | null; stale: boolean; status: RowStatus }
 export interface SnapshotGroup { id: SnapshotGroupId; scope: SnapshotScope; status: 'ok' | 'partial' | 'unavailable'; message: string | null; asOf: string | null; rows: SnapshotRow[] }
-export interface Snapshot { schemaVersion: 1; generatedAt: string; groups: SnapshotGroup[] }
+/** `rateLimited`: some source was refused by the token's per-minute or concurrent limit (429); wait before calling again. */
+export interface Snapshot { schemaVersion: 1; generatedAt: string; rateLimited: boolean; groups: SnapshotGroup[] }
 
 /** A source read within this long is reused; rows (and `stale`) are still worked out at each call. */
 export const SNAPSHOT_CACHE_MS = 5_000;
@@ -87,7 +88,8 @@ function hostRows(host: Json, now: number): SnapshotRow[] {
 const CONNECTION_LABELS: Record<string, string> = { market: '行情服务', control: '页面控制面', streams: 'ASTER 用户推送', perpetual: '永续行情', heartbeat: '副服务器心跳' };
 const CONNECTION_STATES: Record<string, { value: number | null; status: RowStatus }> = { ok: { value: 1, status: 'ok' }, warn: { value: 1, status: 'warn' }, down: { value: 0, status: 'down' }, unknown: { value: null, status: 'unknown' } };
 
-function runtimeRows(status: Json, host: Json, now: number): SnapshotRow[] {
+/** The /api/status half of system.runtime. */
+function statusRows(status: Json, now: number): SnapshotRow[] {
   const health = object(status.health);
   const healthAt = at(health?.now);
   const service = rows(now, healthAt, SYSTEM_TTL_MS);
@@ -106,8 +108,8 @@ function runtimeRows(status: Json, host: Json, now: number): SnapshotRow[] {
     if (typeof row?.name !== 'string' || !row.name) continue;
     const name = row.name.slice(0, 40);
     const failures = num(row.failures), lastOk = at(row.lastOkAt);
-    service.add(`loop:${name}`, 'failures', `${name}循环连续失败次数`, failures, 'count', failures === null ? 'unknown' : failures > 0 ? 'warn' : 'ok');
-    service.add(`loop:${name}`, 'since_ok', `${name}循环距上次成功`, healthAt !== null && lastOk !== null ? round((healthAt - lastOk) / 1000, 0) : null, 's');
+    service.add(`loop:${name}`, 'failures', `${name}：连续失败次数`, failures, 'count', failures === null ? 'unknown' : failures > 0 ? 'warn' : 'ok');
+    service.add(`loop:${name}`, 'since_ok', `${name}：距上次成功`, healthAt !== null && lastOk !== null ? round((healthAt - lastOk) / 1000, 0) : null, 's');
   }
   const dependencies = object(status.dependencies);
   const list = [...service.list];
@@ -117,7 +119,8 @@ function runtimeRows(status: Json, host: Json, now: number): SnapshotRow[] {
     const checked = rows(now, at(row.checkedAt), SYSTEM_TTL_MS);
     const ok = row.ok;
     checked.add(`process:${id}`, 'up', `${label}可连接（1 为是）`, ok === true ? 1 : ok === false ? 0 : null, 'bool', ok === true ? 'ok' : ok === false ? 'down' : 'unknown');
-    checked.add(`process:${id}`, 'restarts', `${label}本次启动以来重启次数`, num(row.restarts), 'count');
+    // Only the market process's restarts are counted (its instance id); the control process's 0 is not a measurement.
+    if (id === 'market') checked.add(`process:${id}`, 'restarts', `${label}本次启动以来重启次数`, num(row.restarts), 'count');
     list.push(...checked.list);
   }
   if (dependencies && Array.isArray(dependencies.incidents)) {
@@ -126,6 +129,11 @@ function runtimeRows(status: Json, host: Json, now: number): SnapshotRow[] {
     incidents.add('service', 'incidents.open', '未恢复的依赖告警', open, 'count', open > 0 ? 'warn' : 'ok');
     list.push(...incidents.list);
   }
+  return list;
+}
+
+/** The /api/host half of system.runtime: the trading process and its connections. */
+function hostProcessRows(host: Json, now: number): SnapshotRow[] {
   const hostAt = at(host.generatedAt);
   const proc = rows(now, hostAt, SYSTEM_TTL_MS);
   const serviceProcess = object(host.process), delay = object(serviceProcess?.loopDelayMs);
@@ -142,7 +150,7 @@ function runtimeRows(status: Json, host: Json, now: number): SnapshotRow[] {
     const state = typeof row!.state === 'string' && Object.hasOwn(CONNECTION_STATES, row!.state) ? CONNECTION_STATES[row!.state]! : CONNECTION_STATES.unknown!;
     proc.add(`connection:${id}`, 'state', `${CONNECTION_LABELS[id]}连线（1 为连通，0 为断开）`, state.value, 'bool', state.status);
   }
-  return [...list, ...proc.list];
+  return proc.list;
 }
 
 function quoteRows(market: typeof QUOTE_MARKETS[number], quote: Json, now: number): SnapshotRow[] {
@@ -155,8 +163,10 @@ function quoteRows(market: typeof QUOTE_MARKETS[number], quote: Json, now: numbe
     out.add(entity, 'brent.price', 'Brent 标记价', brent, 'USDT');
     out.add(entity, 'wti.price', 'WTI 标记价', wti, 'USDT');
     out.add(entity, 'spread', 'Brent − WTI 价差', brent !== null && wti !== null ? round(brent - wti, 6) : null, 'USDT');
-    out.add(entity, 'brent.funding', 'Brent 资金费率（每期）', num(leg('brent')?.fundingRate), 'ratio');
-    out.add(entity, 'wti.funding', 'WTI 资金费率（每期）', num(leg('wti')?.fundingRate), 'ratio');
+    out.add(entity, 'brent.funding', 'Brent 资金费率（每期，期长见 brent.funding_interval）', num(leg('brent')?.fundingRate), 'ratio');
+    out.add(entity, 'brent.funding_interval', 'Brent 资金费结算间隔', num(leg('brent')?.fundingIntervalHours), 'h');
+    out.add(entity, 'wti.funding', 'WTI 资金费率（每期，期长见 wti.funding_interval）', num(leg('wti')?.fundingRate), 'ratio');
+    out.add(entity, 'wti.funding_interval', 'WTI 资金费结算间隔', num(leg('wti')?.fundingIntervalHours), 'h');
   } else if (market === 'goldoil') {
     const ratio = object(quote.ratio);
     out.add(entity, 'xau.price', '黄金标记价', num(leg('xau')?.price), 'USDT');
@@ -171,61 +181,71 @@ function quoteRows(market: typeof QUOTE_MARKETS[number], quote: Json, now: numbe
     out.add(entity, 'spread', 'ADR − 折算价', num(quote.spread), 'USD');
     out.add(entity, 'premium', 'ADR 溢价', num(quote.premium), '%');
   } else {
-    for (const [name, label] of [['binance', 'Binance'], ['xyz', 'Hyperliquid xyz'], ['io', 'Hyperliquid io'], ['rh', 'RH Lighter']] as const) {
-      out.add(entity, `${name}.price`, `Anthropic ${label} 标记价`, num(leg(name)?.markPx), 'USD');
-      out.add(entity, `${name}.funding`, `Anthropic ${label} 资金费率（每期）`, num(leg(name)?.fundingRate), 'ratio');
+    // Binance quotes the contract in USDT and settles funding every few hours; Hyperliquid funding is hourly.
+    for (const [name, label, unit, period] of [['binance', 'Binance', 'USDT', '每期'], ['xyz', 'Hyperliquid xyz', 'USD', '每小时'], ['io', 'Hyperliquid io', 'USD', '每小时'], ['rh', 'RH Lighter', 'USD', '每期']] as const) {
+      out.add(entity, `${name}.price`, `Anthropic ${label} 标记价`, num(leg(name)?.markPx), unit);
+      out.add(entity, `${name}.funding`, `Anthropic ${label} 资金费率（${period}）`, num(leg(name)?.fundingRate), 'ratio');
     }
   }
   return out.list;
 }
 
 const latest = (list: readonly SnapshotRow[]): string | null => list.reduce<string | null>((best, row) => row.asOf !== null && (best === null || row.asOf > best) ? row.asOf : best, null);
-const unreadable = (id: SnapshotGroupId, scope: SnapshotScope, message: string): SnapshotGroup => ({ id, scope, status: 'unavailable', message, asOf: null, rows: [] });
+/** ok with every source read, partial with some, unavailable with none; `message` gives each source that was missing. */
+const group = (id: SnapshotGroupId, scope: SnapshotScope, list: SnapshotRow[], missing: readonly string[]): SnapshotGroup => ({
+  id, scope, status: missing.length === 0 ? 'ok' : list.length ? 'partial' : 'unavailable', message: missing.length ? missing.join('；') : null, asOf: latest(list), rows: list,
+});
 
 /**
- * The snapshot builder: one per platform connection. Each GET is reused for SNAPSHOT_CACHE_MS (one read in flight per
- * path), reads run one after another (a token may have only 2 requests open), and a group whose source cannot be read
- * comes back `unavailable` while the others still answer.
+ * The snapshot builder: one per platform connection. Each GET is reused for SNAPSHOT_CACHE_MS after it settles (one read
+ * in flight per path), reads run one after another (a token may have only 2 requests open), and a group whose sources
+ * cannot be read comes back `partial` or `unavailable` while the others still answer.
  */
 export function createSnapshot(read: Read, now: () => number = Date.now) {
-  const cache = new Map<string, { at: number; value: Promise<Source> }>();
-  const source = (path: string): Promise<Source> => {
+  // `at` is stamped when the read settles: a read still pending is always shared, however long it takes.
+  const cache = new Map<string, { at: number | null; value: Promise<Source> }>();
+  const cached = (path: string): Promise<Source> => {
     const hit = cache.get(path);
-    if (hit && now() - hit.at < SNAPSHOT_CACHE_MS) return hit.value;
+    if (hit && (hit.at === null || now() - hit.at < SNAPSHOT_CACHE_MS)) return hit.value;
     const value = read(path);
-    const entry = { at: now(), value };
+    const entry: { at: number | null; value: Promise<Source> } = { at: null, value };
     cache.set(path, entry);
-    value.catch(() => { if (cache.get(path) === entry) cache.delete(path); });
+    value.then(() => { entry.at = now(); }, () => { if (cache.get(path) === entry) cache.delete(path); });
     return value;
   };
   return async (ids: readonly SnapshotGroupId[]): Promise<Snapshot> => {
     const groups: SnapshotGroup[] = [];
+    let rateLimited = false;
+    const source = async (path: string): Promise<Source> => { const answer = await cached(path); if (!answer.ok && answer.rateLimited) rateLimited = true; return answer; };
     for (const { id, scope } of SNAPSHOT_GROUPS.filter(group => ids.includes(group.id))) {
       if (id === 'system.host') {
         const host = await source('/api/host');
         const value = host.ok ? object(host.value) : null;
-        groups.push(!host.ok ? unreadable(id, scope, host.message) : !value ? unreadable(id, scope, '/api/host 的应答不是对象')
-          : (list => ({ id, scope, status: 'ok' as const, message: null, asOf: latest(list), rows: list }))(hostRows(value, now())));
+        groups.push(!host.ok ? group(id, scope, [], [host.message]) : !value ? group(id, scope, [], ['/api/host 的应答不是对象']) : group(id, scope, hostRows(value, now()), []));
       } else if (id === 'system.runtime') {
-        const status = await source('/api/status');
-        const host = await source('/api/host');
-        const failed = [status, host].filter((item): item is { ok: false; message: string } => !item.ok).map(item => item.message);
-        const statusValue = status.ok ? object(status.value) : null, hostValue = host.ok ? object(host.value) : null;
-        if (failed.length) groups.push(unreadable(id, scope, failed.join('；')));
-        else if (!statusValue || !hostValue) groups.push(unreadable(id, scope, '/api/status 或 /api/host 的应答不是对象'));
-        else { const list = runtimeRows(statusValue, hostValue, now()); groups.push({ id, scope, status: 'ok', message: null, asOf: latest(list), rows: list }); }
+        // Two sources: one that cannot be read leaves the other's rows, and the group is partial.
+        const list: SnapshotRow[] = [], missing: string[] = [];
+        for (const [path, build] of [['/api/status', statusRows], ['/api/host', hostProcessRows]] as const) {
+          const answer = await source(path);
+          const value = answer.ok ? object(answer.value) : null;
+          if (!answer.ok) missing.push(answer.message);
+          else if (!value) missing.push(`${path} 的应答不是对象`);
+          else list.push(...build(value, now()));
+        }
+        groups.push(group(id, scope, list, missing));
       } else {
         const list: SnapshotRow[] = [], missing: string[] = [];
         for (const market of QUOTE_MARKETS) {
           const quote = await source(`/api/monitor/${market}/quote`);
           const value = quote.ok ? object(quote.value) : null;
           if (!quote.ok) missing.push(`${market}：${quote.message}`);
+          else if (quote.value === null) missing.push(`${market}：采集器还没有报价`);
           else if (!value) missing.push(`${market}：应答不是对象`);
           else list.push(...quoteRows(market, value, now()));
         }
-        groups.push({ id, scope, status: missing.length === 0 ? 'ok' : list.length ? 'partial' : 'unavailable', message: missing.length ? missing.join('；') : null, asOf: latest(list), rows: list });
+        groups.push(group(id, scope, list, missing));
       }
     }
-    return { schemaVersion: 1, generatedAt: new Date(now()).toISOString(), groups };
+    return { schemaVersion: 1, generatedAt: new Date(now()).toISOString(), rateLimited, groups };
   };
 }

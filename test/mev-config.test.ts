@@ -163,6 +163,14 @@ test('/api/mev：没配时是待启用状态，录入接口校验且不回显私
       assert.ok(!badText.includes('4c0883a6'), badText);
       assert.equal(((await (await post('/api/mev/setup', { privateKey: KEY, owner: OPERATOR })).json()) as { code: string }).code, 'same_wallet');
       assert.equal((await post('/api/mev/setup/deploy', { confirm: OPERATOR })).status, 409);
+      // 录入成功的应答同样不带私钥；节点连不上只记在 rpcError 里。
+      const saved = await post('/api/mev/setup', { privateKey: KEY, owner: OWNER });
+      const savedText = await saved.text();
+      assert.deepEqual([saved.status, (JSON.parse(savedText) as { setup: { stage: string; operator: string } }).setup.stage, (JSON.parse(savedText) as { setup: { operator: string } }).setup.operator], [200, 'wallet', OPERATOR]);
+      assert.ok(!savedText.includes('4c0883a6'), savedText);
+      assert.ok(!(await (await get('/api/mev/state')).text()).includes('4c0883a6'));
+      const gone = await post('/api/mev/setup/reset', { confirm: OPERATOR });
+      assert.deepEqual([gone.status, ((await gone.json()) as { setup: { stage: string } }).setup.stage], [200, 'none']);
       assert.equal((await fetch(`http://127.0.0.1:${port}/api/mev/setup`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status, 401);
     } finally { await run.shutdown(); await run.done; }
   }
@@ -188,7 +196,8 @@ test('/api/mev：没配时是待启用状态，录入接口校验且不回显私
     assert.deepEqual([state.setup.stage, state.setup.managed], ['ready', true]);
     assert.equal(((await (await post('/api/mev/setup', { privateKey: KEY, owner: OWNER })).json()) as { code: string }).code, 'managed');
     assert.deepEqual([state.executor, state.owner, state.operator, state.mode, state.chainId], [EXECUTOR, OWNER, OPERATOR, 'observe', 8453]);
-    assert.ok(!text.includes(KEY.slice(2)) && !text.includes('rpc-key-secret') && !text.includes('example.invalid'), '状态里没有私钥与节点地址');
+    assert.ok(!text.includes(KEY.slice(2)) && !text.includes('rpc-key-secret') && !text.includes('https://'), '状态里没有私钥与节点地址原文');
+    assert.equal((JSON.parse(text) as { setup: { rpcHost: string } }).setup.rpcHost, 'base.example.invalid', '节点只给主机名');
     assert.equal((await get('/api/mev/unknown')).status, 404);
     const badSettings = await post('/api/mev/settings', { settings: { minNetUsd: -1 } });
     assert.equal(badSettings.status, 400);

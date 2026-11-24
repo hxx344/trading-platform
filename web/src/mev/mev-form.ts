@@ -142,5 +142,6 @@ export function deployConfirmText(setup: MevSetupView): string {
 }
 
 export function resetConfirmText(setup: MevSetupView): string {
-  return `移除热钱包 ${setup.operator}？\n服务器上的私钥会被删除。链上的执行合约与钱包里的余额不受影响；余额要用你自己保存的私钥取回，移除前请确认私钥另有备份。`;
+  const pending = setup.deploy ? '\n部署交易已经发出、还没有结果：它之后仍可能上链并花掉这笔 gas。服务器会记下合约地址，重新录入同一把私钥与收款地址时沿用；换了收款地址则需要重新部署。' : '';
+  return `移除热钱包 ${setup.operator}？\n服务器上的私钥会被删除。链上的执行合约与钱包里的余额不受影响；余额要用你自己保存的私钥取回，移除前请确认私钥另有备份。${pending}`;
 }

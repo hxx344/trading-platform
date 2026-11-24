@@ -118,5 +118,7 @@ test('明文 http 且不是本机时提醒；部署前要有余额；确认文�
   assert.ok(text.includes(OPERATOR) && text.includes(OWNER) && text.includes('0.012000 ETH') && text.includes('不可更改'), text);
   assert.match(deployConfirmText(setup({ deploy: { hash: '0x1', nonce: 0, at: 1, address: EXECUTOR } })), /加价重发/);
   assert.ok(resetConfirmText(setup()).includes(OPERATOR) && /私钥另有备份/.test(resetConfirmText(setup())));
+  assert.ok(!/仍可能上链/.test(resetConfirmText(setup())));
+  assert.match(resetConfirmText(setup({ deploy: { hash: '0x1', nonce: 0, at: 1, address: EXECUTOR } })), /仍可能上链/);
   assert.equal(REDEPLOY_AFTER_MS, SERVER_REDEPLOY_AFTER_MS);
 });

@@ -54,6 +54,8 @@ export function createFakeChain(options: FakeChainOptions) {
     operator,
     /** 执行合约是否已在链上；测试页面启用时先置 false，部署「上链」后置 true。 */
     deployed: true,
+    /** 置 true 时 eth_getCode 报错（模拟节点应答不全）。 */
+    failCode: false,
     /** 置为文本时所有请求以 HTTP 503 失败。 */
     down: false,
     /** 发送的处理方式：accept 收下；reject 由节点拒绝；drop 传输失败（结果不明）。 */
@@ -141,7 +143,7 @@ export function createFakeChain(options: FakeChainOptions) {
     state.calls.push(method);
     switch (method) {
       case 'eth_chainId': return { result: toQuantity(state.chainId) };
-      case 'eth_getCode': return { result: state.deployed && lower(String(params[0])) === executor ? expectedRuntimeCode(owner) : '0x' };
+      case 'eth_getCode': if (state.failCode) return { error: { code: -32005, message: 'limit exceeded' } }; return { result: state.deployed && lower(String(params[0])) === executor ? expectedRuntimeCode(owner) : '0x' };
       case 'eth_blockNumber': return { result: toQuantity(state.block) };
       case 'eth_getBlockByNumber': return { result: { number: toQuantity(state.block), timestamp: toQuantity(state.timestamp), baseFeePerGas: toQuantity(state.baseFee) } };
       case 'eth_getTransactionCount': return { result: toQuantity(state.nonce) };

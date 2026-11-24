@@ -1,7 +1,7 @@
 // 页面启用（docs/mev.md 第 6 节）：热钱包私钥、收款地址与节点地址由页面录入，存在数据目录的 mev-wallet.json
 // （服务账户 600，服务对 config.json 与密钥文件没有写权限）；执行合约由热钱包自己部署。
 // 这里的任何报错与返回值都不带私钥或节点地址原文。
-import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { keccak256 } from '../aster/eip712.ts';
@@ -53,11 +53,19 @@ export function readWallet(dir: string): MevWallet | null {
   return value;
 }
 
-/** 先写临时文件再改名：断电时要么是旧内容要么是新内容。 */
+/** 写钱包文件中途被杀会留下带私钥的临时文件：启动时与移除时清掉。 */
+export function cleanWalletTemps(dir: string): void {
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return; }
+  for (const name of names) if (name.startsWith(`${WALLET_FILE}.`) && name.endsWith('.tmp')) rmSync(join(dir, name), { force: true });
+}
+
+/** 先写临时文件（落盘）再改名：中途断电或被杀时，钱包文件要么是旧内容要么是新内容。 */
 export function writeWallet(dir: string, wallet: MevWallet): void {
   const file = join(dir, WALLET_FILE), temp = `${file}.${randomBytes(6).toString('hex')}.tmp`;
   try {
-    writeFileSync(temp, `${JSON.stringify(wallet)}\n`, { mode: 0o600, flag: 'wx' });
+    const handle = openSync(temp, 'wx', 0o600);
+    try { writeSync(handle, `${JSON.stringify(wallet)}\n`); fsyncSync(handle); } finally { closeSync(handle); }
     renameSync(temp, file);
   } catch (error) {
     rmSync(temp, { force: true });
@@ -65,7 +73,20 @@ export function writeWallet(dir: string, wallet: MevWallet): void {
   }
 }
 
-export function removeWallet(dir: string): void { rmSync(join(dir, WALLET_FILE), { force: true }); }
+export function removeWallet(dir: string): void { rmSync(join(dir, WALLET_FILE), { force: true }); cleanWalletTemps(dir); }
+
+/** 移除热钱包时留下的合约地址（不含私钥）：同一把私钥与收款地址重新录入时先核对它，不受「最近几个 nonce」的限制。 */
+export const KNOWN_FILE = 'mev-contract.json';
+export interface KnownContract { operator: string; owner: string; executor: string }
+export function readKnown(dir: string): KnownContract | null {
+  try {
+    const value = JSON.parse(readFileSync(join(dir, KNOWN_FILE), 'utf8')) as Record<string, unknown>;
+    return isAddress(value.operator) && isAddress(value.owner) && isAddress(value.executor) ? { operator: lower(value.operator), owner: lower(value.owner), executor: lower(value.executor) } : null;
+  } catch { return null; }
+}
+export function writeKnown(dir: string, known: KnownContract): void {
+  try { writeFileSync(join(dir, KNOWN_FILE), `${JSON.stringify(known)}\n`, { mode: 0o600 }); } catch { /* 只是省一次部署费用的线索，写不了不影响移除 */ }
+}
 
 /** CREATE 部署出的合约地址只由发送方与 nonce 决定：同一个 nonce 上不论哪一笔部署交易上链，地址都是它。 */
 export function contractAddress(sender: string, nonce: number): string {

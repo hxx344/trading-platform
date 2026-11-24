@@ -4,11 +4,11 @@
 // 引擎启动后是观察模式，实盘只能从页面开始，重启后回到观察模式。
 import { join } from 'node:path';
 import { BASE_CHAIN_ID } from '../mev/chain.ts';
-import { addressOf, quantity } from '../mev/codec.ts';
+import { AbiReader, addressOf, quantity, selector } from '../mev/codec.ts';
 import { createMevEngine, expectedRuntimeCode, MevError, type MevEngine } from '../mev/engine.ts';
 import { SettingsError, weiToEth } from '../mev/risk.ts';
 import { createRpc, RpcError, type FetchLike, type RpcClient } from '../mev/rpc.ts';
-import { contractAddress, DEFAULT_RPC_URL, parseRpcUrl, parseSetup, planDeployment, readWallet, REDEPLOY_AFTER_MS, removeWallet, rpcHost, signDeployment, WALLET_FILE, writeWallet, type MevWallet } from '../mev/setup.ts';
+import { cleanWalletTemps, contractAddress, DEFAULT_RPC_URL, parseRpcUrl, parseSetup, planDeployment, readKnown, readWallet, REDEPLOY_AFTER_MS, removeWallet, rpcHost, signDeployment, WALLET_FILE, writeKnown, writeWallet, type MevWallet } from '../mev/setup.ts';
 import { MEV_FILE, openMevStore } from '../mev/store.ts';
 import type { MevSetupView } from '../mev/views.ts';
 import type { MevSecrets, MevServiceConfig } from './mev-config.ts';
@@ -40,6 +40,8 @@ export const SETUP_POLL_MS = 3_000;
 export const DEPLOY_MISSING_LIMIT = 3;
 /** 录入钱包后往回找多少个 nonce，看这个钱包是否已经为同一个收款地址部署过合约。 */
 export const ADOPT_SCAN = 16;
+/** 扫描时每批查几个地址（每个地址两个调用）：公共节点与部分服务商的批量上限很小。 */
+export const ADOPT_BATCH = 4;
 
 const short = (address: string): string => `${address.slice(0, 6)}…${address.slice(-4)}`;
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 200);
@@ -51,19 +53,26 @@ export function openMev(source: MevSource, dir: string, options: MevOptions, hoo
   const say = (key: string, text: string) => { try { hooks.notify(key, text); } catch { /* 通知失败不影响模块 */ } };
 
   let wallet: MevWallet | null = null, error: string | null = null;
+  cleanWalletTemps(dir);
   if (!managed) try { wallet = readWallet(dir); } catch (cause) { error = errorText(cause); hooks.log(`mev: ${error}，模块等待在页面重新录入`); }
+  // 专用钱包的检查在录入时做过；之后新增的账户若与热钱包相同，这里不再采用它。
+  if (wallet && others.some(address => address.toLowerCase() === addressOf(wallet!.privateKey))) {
+    wallet = null; error = '已录入的热钱包与本平台的某个账户共用同一个钱包，未采用；请录入一个专用的热钱包';
+    hooks.log(`mev: ${error}`);
+  }
 
   // 每换一次钱包或节点就是新的一代：旧一代的节点请求被中止，引擎循环在下一轮退出并关库。
   let generation = 0, abort = new AbortController(), rpc: RpcClient | null = null, sendRpc: RpcClient | null = null;
   let engine: MevEngine | null = null, shut = false, busy = false;
   let chain: { eth: number; nonce: number; checkedAt: number } | null = null, rpcError: string | null = null;
-  let missing = 0, adoptChecked = false;
+  // scannedAt：上一次完整扫描「这个钱包是否已部署过」时的链上 nonce；nonce 变了就重扫。
+  let missing = 0, scannedAt: number | null = null;
 
   const transport = () => ({ ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}), signal: abort.signal });
   function connect(): void {
     abort.abort(); abort = new AbortController(); generation += 1;
     engine?.quiesce(); engine = null;
-    chain = null; rpcError = null; missing = 0; adoptChecked = false;
+    chain = null; rpcError = null; missing = 0; scannedAt = null;
     if (managed) {
       rpc = createRpc({ url: managed.secrets.rpcUrl, ...transport() });
       sendRpc = managed.secrets.sendRpcUrl ? createRpc({ url: managed.secrets.sendRpcUrl, ...transport() }) : rpc;
@@ -102,18 +111,49 @@ export function openMev(source: MevSource, dir: string, options: MevOptions, hoo
     if (record(body).confirm !== addressOf(current.privateKey)) throw new MevError(400, 'confirm_required', '须带上热钱包地址确认');
   };
 
+  function adopt(current: MevWallet, executor: string, how: string): void {
+    const address = addressOf(current.privateKey);
+    save({ privateKey: current.privateKey, owner: current.owner, ...(current.rpcUrl ? { rpcUrl: current.rpcUrl } : {}), executor });
+    error = null;
+    hooks.log(`mev: ${how} ${executor}`);
+    say(`mev:deployed:${executor}`, `【MEV 套利】执行合约${how} ${executor}，热钱包 ${address}，利润收款地址 ${current.owner}。现在是观察模式，实盘须在页面开始`);
+    connect();
+  }
+
+  /**
+   * 找这个热钱包为同一个收款地址部署过、operator 仍是它的合约：移除时留下的地址，加上最近 ADOPT_SCAN 个 nonce 的
+   * CREATE 地址。返回 null 是确实没有，undefined 是没读全（不能当作没有）。
+   */
+  async function findDeployed(client: RpcClient, current: MevWallet, nonce: number): Promise<string | null | undefined> {
+    const address = addressOf(current.privateKey), code = expectedRuntimeCode(current.owner), known = readKnown(dir);
+    const candidates = [...new Set([
+      ...(known && known.operator === address && known.owner === current.owner ? [known.executor] : []),
+      ...Array.from({ length: Math.min(nonce, ADOPT_SCAN) }, (_, index) => contractAddress(address, nonce - 1 - index)),
+    ])];
+    let complete = true;
+    for (let start = 0; start < candidates.length; start += ADOPT_BATCH) {
+      const part = candidates.slice(start, start + ADOPT_BATCH);
+      const answers = await client.batch(part.flatMap(target => [
+        { method: 'eth_getCode', params: [target, 'latest'] },
+        { method: 'eth_call', params: [{ to: target, data: selector('operator()') }, 'latest'] },
+      ]));
+      for (const [index, target] of part.entries()) {
+        const found = answers[index * 2]!, role = answers[index * 2 + 1]!;
+        if (!found.ok) { complete = false; continue; }
+        if (String(found.result).toLowerCase() !== code) continue;
+        // owner 换掉过 operator 的旧合约（停用方式就是 setOperator）不能沿用：引擎的核对永远过不了。
+        if (!role.ok) { complete = false; continue; }
+        try { if (new AbiReader(String(role.result)).address(0) === address) return target; } catch { complete = false; }
+      }
+    }
+    return complete ? null : undefined;
+  }
+
   /** 未就绪时读热钱包余额与 nonce，并看部署是否已经上链。读不到只记在 rpcError 里。 */
   async function poll(): Promise<void> {
     const current = wallet, client = rpc, at = generation;
     if (managed || !current || current.executor || !client) return;
     const address = addressOf(current.privateKey), code = expectedRuntimeCode(current.owner);
-    const adopt = (executor: string, how: string): void => {
-      save({ privateKey: current.privateKey, owner: current.owner, ...(current.rpcUrl ? { rpcUrl: current.rpcUrl } : {}), executor });
-      error = null;
-      hooks.log(`mev: ${how} ${executor}`);
-      say(`mev:deployed:${executor}`, `【MEV 套利】执行合约${how} ${executor}，热钱包 ${address}，利润收款地址 ${current.owner}。现在是观察模式，实盘须在页面开始`);
-      connect();
-    };
     try {
       const target = current.deploy ? contractAddress(address, current.deploy.nonce) : null;
       const answers = await client.batch([
@@ -127,10 +167,10 @@ export function openMev(source: MevSource, dir: string, options: MevOptions, hoo
       chain = { eth: weiToEth(quantity(answers[0]!.result)), nonce, checkedAt: now() }; rpcError = null;
       if (target && current.deploy) {
         const found = answers[2]!;
-        if (found.ok && String(found.result).toLowerCase() === code) return adopt(target, '已部署并核对，地址');
+        if (found.ok && String(found.result).toLowerCase() === code) return adopt(current, target, '已部署并核对，地址');
         if (found.ok && nonce > current.deploy.nonce) {
           if (++missing >= DEPLOY_MISSING_LIMIT) {
-            missing = 0;
+            missing = 0; scannedAt = null;
             save({ privateKey: current.privateKey, owner: current.owner, ...(current.rpcUrl ? { rpcUrl: current.rpcUrl } : {}) });
             error = '部署交易没有成功：这个 nonce 已被用掉，合约地址上却没有预期的代码（部署回滚，或热钱包另发了交易）。可以重新部署';
             hooks.log(`mev: 部署没有成功（nonce ${current.deploy.nonce}）`);
@@ -139,14 +179,12 @@ export function openMev(source: MevSource, dir: string, options: MevOptions, hoo
         return;
       }
       // 这个钱包以前为同一个收款地址部署过（例如移除后重新录入）：直接沿用，不再花一次部署的 gas。
-      if (!adoptChecked && nonce > 0) {
-        const nonces = Array.from({ length: Math.min(nonce, ADOPT_SCAN) }, (_, index) => nonce - 1 - index);
-        const codes = await client.batch(nonces.map(value => ({ method: 'eth_getCode', params: [contractAddress(address, value), 'latest'] })));
+      if (scannedAt !== nonce) {
+        const found = await findDeployed(client, current, nonce);
         if (at !== generation || wallet !== current) return;
-        if (codes.every(entry => entry.ok)) adoptChecked = true;
-        const hit = codes.findIndex(entry => entry.ok && String(entry.result).toLowerCase() === code);
-        if (hit >= 0) return adopt(contractAddress(address, nonces[hit]!), '沿用这个热钱包已部署的合约，地址');
-      } else adoptChecked = true;
+        if (found) return adopt(current, found, '沿用这个热钱包已部署的合约，地址');
+        if (found === null) scannedAt = nonce;
+      }
     } catch (cause) {
       if (at === generation) rpcError = errorText(cause);
     }
@@ -213,18 +251,29 @@ export function openMev(source: MevSource, dir: string, options: MevOptions, hoo
         }
         if (at !== generation || wallet !== before) throw new MevError(409, 'stale', '热钱包或节点刚被修改，刷新后重试');
         if (before.deploy && plan.nonce > before.deploy.nonce) throw new MevError(409, 'pending', '之前那笔部署交易的 nonce 已经用掉，正在核对结果');
+        if (before.deploy && plan.nonce < before.deploy.nonce) throw new MevError(409, 'node_behind', '节点读到的 nonce 比已发出的部署交易还小（节点落后或没同步完），稍后重试');
+        if (!before.deploy) {
+          // 签名前按当前 nonce 再找一遍已部署的合约：有就沿用，读不全就不发（「没读到」不等于没有）。
+          let found;
+          try { found = await findDeployed(rpc, before, plan.nonce); } catch (cause) { throw new MevError(502, 'rpc', `读取链上状态失败：${errorText(cause)}`); }
+          if (at !== generation || wallet !== before) throw new MevError(409, 'stale', '热钱包或节点刚被修改，刷新后重试');
+          if (found === undefined) throw new MevError(502, 'rpc', '没能确认这个热钱包是否已经部署过合约（节点应答不全），稍后重试');
+          if (found) { adopt(before, found, '沿用这个热钱包已部署的合约，地址'); return state(); }
+        }
         if (plan.balance < plan.costWei) throw new MevError(409, 'low_balance', `热钱包余额 ${weiToEth(plan.balance).toFixed(6)} ETH 不够部署：按费用上限需要约 ${weiToEth(plan.costWei).toFixed(6)} ETH。给热钱包转入 ETH（Base 链）后重试`);
         const signed = signDeployment(plan, before.privateKey);
         // 先落盘再发送：发送结果不明时，重启后仍知道该去哪个地址核对。同一个 nonce 上不论哪一笔上链，合约地址都一样。
         const next: MevWallet = { ...before, deploy: { nonce: plan.nonce, hash: signed.hash, maxFeePerGas: plan.tx.maxFeePerGas.toString(), maxPriorityFeePerGas: plan.tx.maxPriorityFeePerGas.toString(), at: now() } };
         save(next); missing = 0; error = null;
         try { await client.request('eth_sendRawTransaction', [signed.raw]); } catch (cause) {
-          // 节点明确拒收（不是超时或断连）且之前没有在途的部署：这一笔没有进交易池，撤掉记录让用户可以马上重试。
-          if (cause instanceof RpcError && !before.deploy && wallet === next) {
-            save(before); adoptChecked = false;
+          // 节点明确拒收（不是超时或断连）：这一笔没有进交易池。恢复发送前的记录（首次发送即撤掉，可以马上重试；
+          // 重发则保留原来那笔的哈希与时间），把拒收原因交给页面。链上 nonce 变化后会重新扫描已部署的合约。
+          if (cause instanceof RpcError && wallet === next) {
+            save(before); scannedAt = null;
             throw new MevError(502, 'rejected', `节点拒收部署交易：${errorText(cause)}`);
           }
           hooks.log(`mev: 部署交易 ${signed.hash} 发送结果不明：${errorText(cause)}`);
+          if (wallet === next) error = '部署交易的发送结果不明（超时或断连），正在按合约地址核对；5 分钟后仍没有上链可以加价重发';
           return state();
         }
         hooks.log(`mev: 已发出部署交易 ${signed.hash}（nonce ${plan.nonce}）`);
@@ -235,8 +284,11 @@ export function openMev(source: MevSource, dir: string, options: MevOptions, hoo
       const before = pageWallet();
       confirmed(body, before);
       notLive();
-      if (before.deploy) throw new MevError(409, 'pending', '部署交易还在等待上链，有结果后再移除');
+      if (shut) throw new MevError(503, 'stopping', '服务正在停止');
       const address = addressOf(before.privateKey);
+      // 留下合约地址（在途的部署留它将落在的地址）：同一把私钥与收款地址重新录入时沿用，不再部署一次。
+      const executor = before.executor ?? (before.deploy ? contractAddress(address, before.deploy.nonce) : null);
+      if (executor) writeKnown(dir, { operator: address, owner: before.owner, executor });
       save(null);
       error = null;
       hooks.log(`mev: 页面移除了热钱包 ${short(address)}`);
@@ -247,6 +299,7 @@ export function openMev(source: MevSource, dir: string, options: MevOptions, hoo
     rpc(body) {
       const before = pageWallet();
       notLive();
+      if (shut) throw new MevError(503, 'stopping', '服务正在停止');
       const rpcUrl = parseRpcUrl(record(body).rpcUrl);
       const { rpcUrl: _old, ...rest } = before;
       save({ ...rest, ...(rpcUrl ? { rpcUrl } : {}) });

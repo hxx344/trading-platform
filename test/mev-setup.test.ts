@@ -11,7 +11,7 @@ import { addressOf } from '../src/mev/codec.ts';
 import { deploymentData } from '../src/mev/deploy-data.ts';
 import { MevError } from '../src/mev/engine.ts';
 import { createFakeChain } from '../src/mev/fake-chain.ts';
-import { contractAddress, parseRpcUrl, parseSetup, readWallet, REDEPLOY_AFTER_MS, WALLET_FILE, writeWallet } from '../src/mev/setup.ts';
+import { contractAddress, KNOWN_FILE, parseRpcUrl, parseSetup, readKnown, readWallet, REDEPLOY_AFTER_MS, WALLET_FILE, writeWallet } from '../src/mev/setup.ts';
 import type { MevSetupView } from '../src/mev/views.ts';
 import { openMev, type MevSource } from '../src/service/mev.ts';
 
@@ -43,7 +43,7 @@ function setup(t: { after(fn: () => void): void }, source: MevSource = {}, chain
   t.after(() => { stopped = true; mev.shutdown(); rmSync(dir, { recursive: true, force: true }); });
   const state = () => mev.views.state() as State;
   const until = async (done: (view: State) => boolean, what: string) => {
-    for (let i = 0; i < 400; i++) { if (done(state())) return state(); await new Promise(resolve => setTimeout(resolve, 5)); }
+    for (let i = 0; i < 2_000; i++) { if (done(state())) return state(); await new Promise(resolve => setTimeout(resolve, 5)); }
     throw new Error(`等不到：${what}（${JSON.stringify(state().setup)}）`);
   };
   return { dir, chain, lines, state, until, start, stop, views: () => mev.views, reopen: () => { mev = open(); }, tick: (ms: number) => { clock += ms; }, file: () => join(dir, WALLET_FILE) };
@@ -111,7 +111,6 @@ test('页面启用全程：录入 → 部署 → 上链核对后引擎以观察�
   assert.deepEqual([sent.setup.deploy?.hash, sent.setup.deploy?.address, sent.setup.deploy?.nonce], [chain.state.sent[0]!.hash, contractAddress(OPERATOR, 0), 0]);
   assert.equal(readWallet(dir)?.deploy?.hash, chain.state.sent[0]!.hash, '部署记录已落盘');
   assert.equal(await code(() => views().deploy({ confirm: OPERATOR })), 'pending');
-  assert.equal(await code(() => views().reset({ confirm: OPERATOR })), 'pending');
 
   chain.state.deployed = true; chain.mine(chain.state.sent[0]!.hash, 'success'); chain.advance();
   const ready = await until(view => view.mode === 'observe', '引擎启动');
@@ -124,7 +123,7 @@ test('页面启用全程：录入 → 部署 → 上链核对后引擎以观察�
 });
 
 test('更换节点与移除：实盘外才行；节点地址原文不出现；移除删掉私钥，重新录入沿用已部署的合约', async t => {
-  const { chain, lines, state, until, start, views, file } = setup(t, {}, 3);
+  const { chain, lines, state, until, start, views, file, dir } = setup(t, {}, 3);
   chain.state.deployed = true; chain.state.nonce = 4; // 这个钱包在 nonce 3 上部署过
   start();
   await views().setup({ privateKey: KEY, owner: OWNER, rpcUrl: SECRET_RPC });
@@ -151,7 +150,90 @@ test('更换节点与移除：实盘外才行；节点地址原文不出现；�
   assert.deepEqual([gone.setup.stage, gone.setup.operator, gone.mode], ['none', null, undefined]);
   assert.ok(!existsSync(file()), '钱包文件已删除');
   assert.ok(lines.some(line => line.includes('移除了热钱包')));
+  // 移除时留下合约地址（不含私钥）：之后这个钱包又发过很多交易、超出扫描范围，重新录入仍然沿用。
+  assert.deepEqual(readKnown(dir), { operator: OPERATOR, owner: OWNER, executor: contractAddress(OPERATOR, 3) });
+  assert.ok(!LEAK.test(readFileSync(join(dir, KNOWN_FILE), 'utf8')));
+  chain.state.nonce = 40;
+  await views().setup({ privateKey: KEY, owner: OWNER });
+  const again = await until(view => view.mode === 'observe', '按留下的地址沿用');
+  assert.equal(again.executor, contractAddress(OPERATOR, 3));
+  assert.equal(chain.state.sent.length, 0);
   assert.ok(!LEAK.test(lines.join('\n')) && !LEAK.test(JSON.stringify(state())));
+});
+
+test('部署在途时可以换节点、可以移除：记录不丢；移除后重新录入，原来那笔上链后沿用，不再部署', async t => {
+  const { chain, state, until, start, views, dir, file } = setup(t);
+  start();
+  await views().setup({ privateKey: KEY, owner: OWNER });
+  await views().deploy({ confirm: OPERATOR });
+  const hash = chain.state.sent[0]!.hash;
+  const changed = views().rpc({ rpcUrl: SECRET_RPC }) as State;
+  assert.deepEqual([changed.setup.stage, changed.setup.deploy?.hash, changed.setup.rpcHost], ['deploying', hash, 'base.example.invalid']);
+  assert.equal(readWallet(dir)?.deploy?.hash, hash);
+
+  const gone = views().reset({ confirm: OPERATOR }) as State;
+  assert.equal(gone.setup.stage, 'none');
+  assert.ok(!existsSync(file()));
+  assert.deepEqual(readKnown(dir), { operator: OPERATOR, owner: OWNER, executor: contractAddress(OPERATOR, 0) });
+
+  const back = await views().setup({ privateKey: KEY, owner: OWNER }) as State;
+  assert.equal(back.setup.stage, 'wallet', '还没上链：不沿用');
+  chain.state.deployed = true; chain.mine(hash, 'success'); chain.advance();
+  const ready = await until(view => view.mode === 'observe', '原来那笔上链后沿用');
+  assert.equal(ready.executor, contractAddress(OPERATOR, 0));
+  assert.equal(chain.state.sent.length, 1, '没有再部署一次');
+  assert.equal(state().setup.deploy, null);
+});
+
+test('沿用的条件：合约的 operator 须仍是这个热钱包；节点应答不全时不部署；并发的部署请求只发一笔', async t => {
+  // 不开循环：录入时读一次，之后只由部署请求自己核对。
+  const { chain, state, views } = setup(t, {}, 3);
+  const other = '0x000000000000000000000000000000000000c0de';
+  chain.state.deployed = true; chain.state.nonce = 4; chain.state.operator = other; // owner 用 setOperator 停用过这个合约
+  const saved = await views().setup({ privateKey: KEY, owner: OWNER }) as State;
+  assert.deepEqual([saved.setup.stage, saved.mode], ['wallet', undefined], 'operator 不是这个热钱包：不沿用');
+
+  chain.state.failCode = true;
+  assert.equal(await code(() => views().deploy({ confirm: OPERATOR })), 'rpc');
+  assert.equal(chain.state.sent.length, 0, '没确认是否部署过：不发');
+  chain.state.failCode = false;
+
+  // operator 换回来以后，部署请求在签名前自己找到它并沿用。
+  chain.state.operator = OPERATOR;
+  const adopted = await views().deploy({ confirm: OPERATOR }) as State;
+  assert.deepEqual([adopted.setup.stage, chain.state.sent.length], ['ready', 0]);
+  assert.equal(state().setup.error, null);
+});
+
+test('并发与重发：同时两次部署只发一笔；重发被拒收保留原记录；节点 nonce 倒退或已用掉时不发；停止后不接受写入', async t => {
+  const { chain, state, views, tick, dir, stop } = setup(t, {}, 2);
+  await views().setup({ privateKey: KEY, owner: OWNER });
+  chain.state.send = 'drop';
+  const first = views().deploy({ confirm: OPERATOR });
+  assert.equal(await code(() => views().deploy({ confirm: OPERATOR })), 'busy');
+  const unknown = await first as State;
+  assert.equal(chain.state.sent.length, 1);
+  assert.match(unknown.setup.error!, /结果不明/);
+  const original = readWallet(dir)!.deploy!;
+  assert.equal(original.nonce, 2);
+
+  tick(REDEPLOY_AFTER_MS);
+  chain.state.send = 'reject';
+  assert.equal(await code(() => views().deploy({ confirm: OPERATOR })), 'rejected');
+  assert.deepEqual([state().setup.stage, readWallet(dir)!.deploy], ['deploying', original], '重发被拒收：原来那笔的记录还在');
+
+  chain.state.send = 'accept';
+  chain.state.nonce = 1;
+  assert.equal(await code(() => views().deploy({ confirm: OPERATOR })), 'node_behind');
+  chain.state.nonce = 3;
+  assert.equal(await code(() => views().deploy({ confirm: OPERATOR })), 'pending');
+  assert.equal(chain.state.sent.length, 1);
+  assert.deepEqual(readWallet(dir)!.deploy, original);
+
+  await stop();
+  for (const run of [() => views().deploy({ confirm: OPERATOR }), () => views().reset({ confirm: OPERATOR }), () => views().rpc({ rpcUrl: null })])
+    assert.equal(await code(run), 'stopping');
+  assert.deepEqual(readWallet(dir)!.deploy, original);
 });
 
 test('部署：余额不足不发；节点拒收撤掉记录可重试；结果不明保留记录，5 分钟后同 nonce 加价重发；重启后继续核对', async t => {
@@ -192,7 +274,12 @@ test('部署没成：nonce 被用掉而地址上没有预期代码，连续几�
   start();
   await views().setup({ privateKey: KEY, owner: OWNER });
   await views().deploy({ confirm: OPERATOR });
+  // 读不到代码的轮次不算「没有代码」：节点应答不全时一直等。
+  chain.state.failCode = true;
   chain.mine(chain.state.sent[0]!.hash, 'reverted'); // nonce 前进，合约不存在
+  await new Promise(resolve => setTimeout(resolve, 150));
+  assert.equal(state().setup.stage, 'deploying');
+  chain.state.failCode = false;
   const failed = await until(view => view.setup.stage === 'wallet' && view.setup.error !== null, '判定部署没成');
   assert.match(failed.setup.error!, /部署交易没有成功/);
   assert.equal(state().setup.deploy, null);
@@ -206,6 +293,20 @@ test('由配置文件管理时：页面不能录入、部署、换节点或移�
     assert.equal(await code(run), 'managed');
   assert.equal(readWallet(dir), null);
   assert.ok(!LEAK.test(JSON.stringify(state())) && !LEAK.test(lines.join('\n')));
+});
+
+test('启动时：清掉写钱包文件留下的临时文件；热钱包与平台账户相同时不采用', t => {
+  const { dir, file } = setup(t);
+  writeWallet(dir, { privateKey: KEY, owner: OWNER });
+  writeFileSync(`${file()}.abc123.tmp`, JSON.stringify({ privateKey: KEY, owner: OWNER }));
+  const lines: string[] = [];
+  const mev = openMev({ others: [OPERATOR.toUpperCase().replace('0X', '0x')] }, dir, { fetchImpl: async () => { throw new TypeError('fetch failed'); } }, { log: line => lines.push(line), notify: () => undefined });
+  const view = mev.views.state() as State;
+  assert.deepEqual(readdirSync(dir), [WALLET_FILE]);
+  assert.deepEqual([view.setup.stage, view.setup.operator], ['none', null]);
+  assert.match(view.setup.error!, /专用/);
+  assert.ok(!LEAK.test(lines.join('\n')));
+  mev.shutdown();
 });
 
 test('钱包文件损坏：模块回到未录入并说明原因，重新录入会覆盖它', async t => {

@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import { DEFAULT_SETTINGS, parseSettings } from '../../src/mev/risk.ts';
 import {
   MEV_TABS, SETTING_FIELDS, SETTING_GROUPS, TX_STATUS_LABELS, age, bps, compactUsd, eth, feePercent, mevHref, outcomeTone, settingsChanged, settingsForm, settingsRequest, shortAddress, startBlocker, startConfirmText, tokenAmount, txTone, usd,
+  REDEPLOY_AFTER_MS, deployBlocker, deployConfirmText, insecurePage, resetConfirmText, setupRequest,
 } from '../src/mev/mev-form.ts';
+import { REDEPLOY_AFTER_MS as SERVER_REDEPLOY_AFTER_MS } from '../../src/mev/setup.ts';
 import { parseRoute } from '../src/route-parse.ts';
 
 const OPERATOR = '0x00000000000000000000000000000000000000a1', EXECUTOR = '0x00000000000000000000000000000000004d4556', OWNER = '0x000000000000000000000000000000000000b0b0';
@@ -89,4 +91,32 @@ test('每种交易状态都有文案与色调', () => {
   for (const status of ['recorded', 'sent', 'unknown', 'expired', 'success', 'reverted', 'replaced', 'lost']) assert.ok(TX_STATUS_LABELS[status], status);
   assert.deepEqual(['success', 'reverted', 'lost', 'unknown', 'expired', 'replaced', 'sent', 'recorded'].map(status => txTone(status)), ['ok', 'bad', 'bad', 'warn', 'warn', '', 'info', 'info']);
   assert.deepEqual(['sent', 'blocked', 'observed', 'thin'].map(outcome => outcomeTone(outcome)), ['ok', 'warn', 'info', '']);
+});
+
+test('启用表单：私钥可不带 0x，助记词与短私钥拒绝且报错不带私钥；收款地址与节点地址查格式；节点可不填', () => {
+  const key = 'ab'.repeat(32);
+  assert.deepEqual(setupRequest({ privateKey: ` ${key} `, owner: ` ${OWNER} `, rpcUrl: '' }), { ok: true, body: { privateKey: `0x${key}`, owner: OWNER } });
+  assert.deepEqual(setupRequest({ privateKey: `0x${key}`, owner: OWNER, rpcUrl: ' https://node.example/v2/k ' }), { ok: true, body: { privateKey: `0x${key}`, owner: OWNER, rpcUrl: 'https://node.example/v2/k' } });
+  for (const privateKey of ['', key.slice(2), 'word '.repeat(12).trim(), `0x${key}zz`]) {
+    const result = setupRequest({ privateKey, owner: OWNER, rpcUrl: '' });
+    assert.equal(result.ok, false);
+    assert.ok(/私钥/.test(result.message) && !result.message.includes('abab'), result.message);
+  }
+  assert.match(setupRequest({ privateKey: key, owner: '0x12', rpcUrl: '' }).message, /收款地址/);
+  assert.match(setupRequest({ privateKey: key, owner: OWNER, rpcUrl: 'node.example' }).message, /节点地址/);
+});
+
+test('明文 http 且不是本机时提醒；部署前要有余额；确认文案带热钱包与收款地址；重发间隔与服务端一致', () => {
+  assert.equal(insecurePage({ protocol: 'http:', hostname: '203.0.113.7' }), true);
+  for (const location of [{ protocol: 'https:', hostname: 'tp.example' }, { protocol: 'http:', hostname: 'localhost' }, { protocol: 'http:', hostname: '127.0.0.1' }, { protocol: 'http:', hostname: '[::1]' }]) assert.equal(insecurePage(location), false);
+  const setup = (patch = {}) => ({ stage: 'wallet', managed: false, operator: OPERATOR, owner: OWNER, rpcHost: 'mainnet.base.org', defaultRpc: true, wallet: { eth: 0.012, nonce: 0, checkedAt: 1 }, rpcError: null, deploy: null, error: null, checkedAt: 2, ...patch });
+  assert.equal(deployBlocker(setup()), null);
+  assert.match(deployBlocker(setup({ wallet: { eth: 0, nonce: 0, checkedAt: 1 } })), /先转入 gas/);
+  assert.match(deployBlocker(setup({ wallet: null })), /正在读取/);
+  assert.match(deployBlocker(setup({ wallet: null, rpcError: '超时' })), /读不到/);
+  const text = deployConfirmText(setup());
+  assert.ok(text.includes(OPERATOR) && text.includes(OWNER) && text.includes('0.012000 ETH') && text.includes('不可更改'), text);
+  assert.match(deployConfirmText(setup({ deploy: { hash: '0x1', nonce: 0, at: 1, address: EXECUTOR } })), /加价重发/);
+  assert.ok(resetConfirmText(setup()).includes(OPERATOR) && /私钥另有备份/.test(resetConfirmText(setup())));
+  assert.equal(REDEPLOY_AFTER_MS, SERVER_REDEPLOY_AFTER_MS);
 });

@@ -127,7 +127,7 @@ test('部署数据：拒绝无效、相同或零地址，参数里带全部登�
   assert.throws(() => deploymentData('0x' + '0'.repeat(40), OPERATOR), /不能是零地址/);
 });
 
-test('/api/mev：没配模块时 404；配了以后状态不带私钥与节点地址，写入要确认', async t => {
+test('/api/mev：没配时是待启用状态，录入接口校验且不回显私钥；配了以后状态不带私钥与节点地址，写入要确认', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'tp-mev-http-'));
   t.after(() => { process.removeAllListeners('SIGINT'); process.removeAllListeners('SIGTERM'); rmSync(dir, { recursive: true, force: true }); });
   const freePort = () => new Promise<number>(resolve => { const probe = createServer().listen(0, '127.0.0.1', () => { const { port } = probe.address() as { port: number }; probe.close(() => resolve(port)); }); });
@@ -150,11 +150,20 @@ test('/api/mev：没配模块时 404；配了以后状态不带私钥与节点�
     const port = await freePort(), data = join(dir, 'plain');
     const run = await startService({ config: parseServiceConfig({ secretsFile: '/etc/tp/secrets.json', pairs: [] }), secrets: { accounts: new Map(), feishu: null }, dir: data, port, fetchImpl: outside, app });
     try {
-      const { get } = await session(data, port);
-      const missing = await get('/api/mev/state');
-      assert.equal(missing.status, 404);
-      assert.equal(((await missing.json()) as { code: string }).code, 'not_found');
-      assert.equal(((await (await get('/api/shell')).json()) as { modules: { mev: boolean } }).modules.mev, false);
+      const { get, post } = await session(data, port);
+      const idle = await get('/api/mev/state');
+      assert.equal(idle.status, 200);
+      assert.deepEqual(((await idle.json()) as { setup: { stage: string; managed: boolean } }).setup.stage, 'none');
+      assert.equal(((await (await get('/api/shell')).json()) as { modules: { mev: boolean } }).modules.mev, true);
+      // 还没启用时引擎的接口不可用；录入接口校验格式，应答不回显提交的私钥。
+      assert.equal((await post('/api/mev/settings', { settings: {} })).status, 503);
+      const bad = await post('/api/mev/setup', { privateKey: KEY + 'ab', owner: OWNER });
+      const badText = await bad.text();
+      assert.deepEqual([bad.status, (JSON.parse(badText) as { code: string }).code], [400, 'invalid_key']);
+      assert.ok(!badText.includes('4c0883a6'), badText);
+      assert.equal(((await (await post('/api/mev/setup', { privateKey: KEY, owner: OPERATOR })).json()) as { code: string }).code, 'same_wallet');
+      assert.equal((await post('/api/mev/setup/deploy', { confirm: OPERATOR })).status, 409);
+      assert.equal((await fetch(`http://127.0.0.1:${port}/api/mev/setup`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status, 401);
     } finally { await run.shutdown(); await run.done; }
   }
 
@@ -175,7 +184,9 @@ test('/api/mev：没配模块时 404；配了以后状态不带私钥与节点�
     assert.equal(((await (await get('/api/shell')).json()) as { modules: { mev: boolean } }).modules.mev, true);
     const answer = await get('/api/mev/state');
     assert.equal(answer.status, 200);
-    const text = await answer.text(), state = JSON.parse(text) as { executor: string; owner: string; operator: string; mode: string; chainId: number };
+    const text = await answer.text(), state = JSON.parse(text) as { executor: string; owner: string; operator: string; mode: string; chainId: number; setup: { stage: string; managed: boolean } };
+    assert.deepEqual([state.setup.stage, state.setup.managed], ['ready', true]);
+    assert.equal(((await (await post('/api/mev/setup', { privateKey: KEY, owner: OWNER })).json()) as { code: string }).code, 'managed');
     assert.deepEqual([state.executor, state.owner, state.operator, state.mode, state.chainId], [EXECUTOR, OWNER, OPERATOR, 'observe', 8453]);
     assert.ok(!text.includes(KEY.slice(2)) && !text.includes('rpc-key-secret') && !text.includes('example.invalid'), '状态里没有私钥与节点地址');
     assert.equal((await get('/api/mev/unknown')).status, 404);

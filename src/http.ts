@@ -170,7 +170,7 @@ export interface ServiceViews {
   news?: { flash(): { items: readonly { url: string | null }[] } | null; moves(): { items: readonly { url: string | null }[] } | null };
   /** Var 与 Lighter（RH、主网）价差采集与模拟盘（service/varlighter.ts，docs/varlighter.md）；config.json 写了 `"varLighter": false` 时没有。 */
   varlighter?: VarLighterViews;
-  /** MEV 套利（service/mev.ts，docs/mev.md）；config.json 没有 `mev` 时没有。 */
+  /** MEV 套利（service/mev.ts，docs/mev.md）；执行服务总是提供，还没启用时只有启用向导的状态。 */
   mev?: MevViews;
 }
 
@@ -922,6 +922,11 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
         if (request.method === 'POST' && path === 'live/start') return send(response, 200, await mev.start(await readJson(request)));
         if (request.method === 'POST' && path === 'live/stop') { await readJson(request); return send(response, 200, mev.stop()); }
         if (request.method === 'POST' && path === 'tokens') return send(response, 200, await mev.tokens(await readJson(request)));
+        // 启用（docs/mev.md 第 6 节）：setup 的请求体带私钥，这里与 failure 都不记录请求体。
+        if (request.method === 'POST' && path === 'setup') return send(response, 200, await mev.setup(await readJson(request)));
+        if (request.method === 'POST' && path === 'setup/deploy') return send(response, 200, await mev.deploy(await readJson(request)));
+        if (request.method === 'POST' && path === 'setup/reset') return send(response, 200, mev.reset(await readJson(request)));
+        if (request.method === 'POST' && path === 'setup/rpc') return send(response, 200, mev.rpc(await readJson(request)));
       } catch (error) {
         if (error instanceof ContractError) throw error;
         const failure = mev.failure(error);

@@ -28,7 +28,7 @@ export const toQuantity = (value: bigint | number): string => {
 };
 
 /** 无符号整数的最短大端字节（零为空串），RLP 里的整数写法。 */
-function minimalBytes(value: bigint): Uint8Array {
+export function minimalBytes(value: bigint): Uint8Array {
   if (value < 0n) throw new RangeError('RLP 整数不能为负');
   if (value === 0n) return new Uint8Array(0);
   const hex = value.toString(16);
@@ -58,15 +58,16 @@ export interface Eip1559Transaction {
   maxPriorityFeePerGas: bigint;
   maxFeePerGas: bigint;
   gasLimit: bigint;
-  to: string;
+  /** null 表示合约创建交易。 */
+  to: string | null;
   value: bigint;
   data: Hex;
 }
 
 function transactionFields(tx: Eip1559Transaction): RlpItem[] {
-  if (!isAddress(tx.to)) throw new TypeError('交易的 to 不是地址');
+  if (tx.to !== null && !isAddress(tx.to)) throw new TypeError('交易的 to 不是地址');
   return [minimalBytes(tx.chainId), minimalBytes(tx.nonce), minimalBytes(tx.maxPriorityFeePerGas), minimalBytes(tx.maxFeePerGas), minimalBytes(tx.gasLimit),
-    bytesOf(tx.to), minimalBytes(tx.value), bytesOf(tx.data), []];
+    tx.to === null ? new Uint8Array() : bytesOf(tx.to), minimalBytes(tx.value), bytesOf(tx.data), []];
 }
 
 /** 未签名的 EIP-1559 交易（`0x02 || rlp(...)`）；估 L1 数据费时也用它（另补 65 字节占位签名）。 */

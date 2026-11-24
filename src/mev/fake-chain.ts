@@ -52,6 +52,8 @@ export function createFakeChain(options: FakeChainOptions) {
     chainId: 8453n, block: 1_000, timestamp: Math.floor(now() / 1000), baseFee: 5_000_000n, nonce: 0, balance: 10n ** 16n,
     /** 链上的 operator；测试里改成别的地址模拟配置不符。 */
     operator,
+    /** 执行合约是否已在链上；测试页面启用时先置 false，部署「上链」后置 true。 */
+    deployed: true,
     /** 置为文本时所有请求以 HTTP 503 失败。 */
     down: false,
     /** 发送的处理方式：accept 收下；reject 由节点拒绝；drop 传输失败（结果不明）。 */
@@ -139,14 +141,14 @@ export function createFakeChain(options: FakeChainOptions) {
     state.calls.push(method);
     switch (method) {
       case 'eth_chainId': return { result: toQuantity(state.chainId) };
-      case 'eth_getCode': return { result: lower(String(params[0])) === executor ? expectedRuntimeCode(owner) : '0x' };
+      case 'eth_getCode': return { result: state.deployed && lower(String(params[0])) === executor ? expectedRuntimeCode(owner) : '0x' };
       case 'eth_blockNumber': return { result: toQuantity(state.block) };
       case 'eth_getBlockByNumber': return { result: { number: toQuantity(state.block), timestamp: toQuantity(state.timestamp), baseFeePerGas: toQuantity(state.baseFee) } };
       case 'eth_getTransactionCount': return { result: toQuantity(state.nonce) };
       case 'eth_getBalance': return { result: toQuantity(state.balance) };
       case 'eth_getTransactionReceipt': return { result: receipt(String(params[0])) };
       case 'eth_call': return call(params);
-      case 'eth_estimateGas': { const answer = call(params); return 'error' in answer ? answer : { result: toQuantity(380_000) }; }
+      case 'eth_estimateGas': { if ((params[0] as { to?: unknown }).to === undefined) return { result: toQuantity(2_000_000) }; const answer = call(params); return 'error' in answer ? answer : { result: toQuantity(380_000) }; }
       case 'eth_sendRawTransaction': {
         const raw = String(params[0]), hash = hashOf(raw);
         if (state.send === 'reject') return { error: { code: -32000, message: 'nonce too low' } };

@@ -12,6 +12,19 @@ export interface MevTxView {
   hash: string; nonce: number; createdAt: number; deadlineBlock: number; status: TxStatus; path: string; symbol: string; expectedProfit: string | null;
   profit: string | null; profitUsd: number | null; feeEth: number | null; block: number | null; settledAt: number | null; error: string | null;
 }
+/** 启用进度（docs/mev.md 第 6 节）。不含私钥与节点地址原文。 */
+export interface MevSetupView {
+  /** none 还没录入；wallet 已录入、合约未部署；deploying 部署交易已发出；ready 引擎可以运行。 */
+  stage: 'none' | 'wallet' | 'deploying' | 'ready';
+  /** 由服务器上的配置文件管理（--set-mev），页面不能改。 */
+  managed: boolean;
+  operator: string | null; owner: string | null;
+  rpcHost: string | null; defaultRpc: boolean;
+  wallet: { eth: number; nonce: number; checkedAt: number } | null;
+  rpcError: string | null;
+  deploy: { hash: string; nonce: number; at: number; address: string } | null;
+  error: string | null; checkedAt: number;
+}
 export interface MevStateView {
   checkedAt: number; chainId: number; executor: string; owner: string; operator: string;
   mode: 'live' | 'observe'; liveSince: number | null; haltReason: string | null; fault: string | null;

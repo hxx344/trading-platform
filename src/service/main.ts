@@ -56,7 +56,7 @@ import { clearCrashRecord, crashReportKey, installCrashGuard, readCrashRecord } 
 import { createHostStatus, processLoopHistogram } from '../host-status.ts';
 import { HEALTH_TICK_MS, createHealthWatch, type HealthWatch } from './health-watch.ts';
 import { newsLoop, newsViews, type NewsHolder } from './news.ts';
-import { mevLoop, mevViews, openMev, type MevHolder, type MevOptions } from './mev.ts';
+import { openMev, type MevOptions } from './mev.ts';
 import { mevSummary } from './mev-config.ts';
 import { openVarLighter, varLighterLoop, varLighterViews, type VarLighterHolder, type VarLighterOptions } from './varlighter.ts';
 import type { NewsOptions } from '../news/feed.ts';
@@ -437,7 +437,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   const news: NewsHolder | null = newsOptions ? { feed: null } : null;
   const varLighter: VarLighterHolder | null = varLighterOptions ? openVarLighter(dir, varLighterOptions, line => process.stderr.write(`${line}\n`)) : null;
   // MEV 套利（docs/mev.md）：启动后只观察；实盘从页面开始。打不开库只停用本模块。
-  const mev: MevHolder | null = config.mev && secrets.mev ? openMev(config.mev, secrets.mev, dir, mevOptions ?? {}, { log: line => process.stderr.write(`${line}\n`), notify: (key, text) => notifier.notifyOnce(key, text) }) : null;
+  const mev = openMev({ config: config.mev, secrets: secrets.mev, others: [...secrets.accounts.values()].flatMap(account => [account.user, account.signer]) }, dir, mevOptions ?? {}, { log: line => process.stderr.write(`${line}\n`), notify: (key, text) => notifier.notifyOnce(key, text) });
   return runExecutor({
     executor, store, dir, port, socketPath, executionBuild, configBuild, app, sessions, readTokens,
     ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: oil ? ['jobs', 'transfers', 'adl'] : ['transfers', 'adl'], drainMs: DRAIN_MS,
@@ -462,7 +462,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(updates ? { update: updates } : {}),
       ...(news ? { news: newsViews(news) } : {}),
       ...(varLighter ? { varlighter: varLighterViews(varLighter) } : {}),
-      ...(mev ? { mev: mevViews(mev) } : {}),
+      mev: mev.views,
     },
     ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir),
       ...(socketPath !== undefined ? { legacyUpdate: () => legacyUpdateJob(importDir) } : {}) } } : {}),
@@ -519,7 +519,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(ondo ? [ondo.loop(context)] : []),
       ...(news && newsOptions ? [newsLoop(news, newsOptions, context)] : []),
       ...(varLighter ? [varLighterLoop(varLighter, context)] : []),
-      ...(mev ? [mevLoop(mev, context)] : []),
+      mev.loop(context),
       ...(config.watch && secrets.watch ? [watchLoop(watch = createWatch({ config: config.watch, secret: secrets.watch, problem: context.notReady, ...(watchOptions?.fetchImpl ? { fetchImpl: watchOptions.fetchImpl } : {}), log: line => process.stderr.write(`${line}\n`) }), context, watchOptions)] : []),
     ],
     onStopping: (reason, detail) => {
@@ -534,7 +534,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       crossex?.abort();
       options?.abort();
       // MEV：先让引擎不再发新交易，再中止在途的节点请求，这一轮不占满停服的等待时间。
-      if (mev) { mev.engine?.quiesce(); mev.stop.abort(); }
+      mev.shutdown();
     },
     onStopped: async lateLeaseLoss => {
       // Events from the drain (an unknown transfer, an ADL batch) go out now rather than at the next start.

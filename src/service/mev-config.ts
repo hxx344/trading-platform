@@ -18,7 +18,7 @@ export function parseMevConfig(value: unknown): MevServiceConfig {
 }
 
 /** 节点地址：https，或本机 / 内网自建节点的 http（127.0.0.1、10/8、192.168/16、100.64/10 的 Tailscale 段）。不带账号密码段。 */
-function validRpcUrl(value: unknown): value is string {
+export function validRpcUrl(value: unknown): value is string {
   if (typeof value !== 'string' || value.length > 512) return false;
   let url: URL;
   try { url = new URL(value); } catch { return false; }

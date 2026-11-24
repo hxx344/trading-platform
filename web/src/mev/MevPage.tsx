@@ -9,7 +9,8 @@ import { api } from '../api.ts';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { useLiveResource } from '../use-live-resource.ts';
 import { Badge, Metric, useWrite } from '../varlighter/parts.tsx';
-import type { MevStateView } from '../../../src/mev/views.ts';
+import type { MevSetupView, MevStateView } from '../../../src/mev/views.ts';
+import { SetupPanel, WalletCard } from './MevSetup.tsx';
 import {
   MEV_BASE, MEV_TABS, OUTCOME_LABELS, SETTING_FIELDS, SETTING_GROUPS, TX_STATUS_LABELS, age, bps, compactUsd, eth, explorerAddress, explorerTx, feePercent, mevHref, outcomeTone,
   settingsChanged, settingsForm, settingsRequest, shortAddress, startBlocker, startConfirmText, tokenAmount, txTone, usd, type MevTab, type SettingsForm,
@@ -19,34 +20,39 @@ const STATE_PATH = `${MEV_BASE}/state`;
 type Write = ReturnType<typeof useWrite>;
 type Changed = () => Promise<void>;
 
-function parseState(raw: unknown): MevStateView {
-  const value = raw as MevStateView | null;
-  if (!value || typeof value !== 'object' || !value.settings || !value.today || !Array.isArray(value.transactions)) throw new Error('应答格式不对');
-  return value;
+/** 引擎没在运行（还没启用、部署中、启动失败）时只有 setup。 */
+type PageState = { setup: MevSetupView; engine: MevStateView | null };
+function parseState(raw: unknown): PageState {
+  const value = raw as (Partial<MevStateView> & { setup?: MevSetupView }) | null;
+  if (!value || typeof value !== 'object' || !value.setup || typeof value.setup.stage !== 'string') throw new Error('应答格式不对');
+  if (value.settings === undefined) return { setup: value.setup, engine: null };
+  if (!value.today || !Array.isArray(value.transactions)) throw new Error('应答格式不对');
+  return { setup: value.setup, engine: value as MevStateView };
 }
 const stamp = (at: number) => new Date(at).toLocaleString([], { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' });
 const External = ({ href, children }: { href: string; children: string }) => <a className="mev-mono" href={href} target="_blank" rel="noreferrer noopener">{children}</a>;
 
 export function MevPage({ tab, onExpired }: { tab: MevTab; onExpired: () => void }) {
-  const live = useLiveResource<MevStateView>(STATE_PATH, { intervalMs: 3_000, timeoutMs: 10_000, parse: parseState, onExpired });
-  const { data, error, status, receivedAt } = live;
+  const live = useLiveResource<PageState>(STATE_PATH, { intervalMs: 3_000, timeoutMs: 10_000, parse: parseState, onExpired });
+  const { data: page, error, status, receivedAt } = live, data = page?.engine ?? null;
   const write = useWrite();
   return <div className="vl-page" data-mev>
     <header className="wb-heading"><div><h1>MEV 套利</h1>
       <p>Base 链上同链 DEX 原子套利：两跳与三角环路，本金来自池子的闪电兑换，一笔交易内完成，不盈利整笔回滚。热钱包只放 gas，利润每笔直接转给 owner。</p></div>
       {data ? <Chips view={data} /> : null}</header>
-    <nav className="vl-tabs" aria-label="MEV 套利页签">
+    {data ? <nav className="vl-tabs" aria-label="MEV 套利页签">
       {MEV_TABS.map(item => <a key={item.id} href={mevHref(item.id)} aria-current={tab === item.id ? 'page' : undefined}>{item.label}</a>)}
-    </nav>
-    {error && data ? <p className="vl-note err" role="status">刷新失败：{error.message}（数据停留在 {receivedAt ? new Date(receivedAt).toLocaleTimeString() : '—'}）</p> : null}
+    </nav> : null}
+    {error && page ? <p className="vl-note err" role="status">刷新失败：{error.message}（数据停留在 {receivedAt ? new Date(receivedAt).toLocaleTimeString() : '—'}）</p> : null}
     {write.message ? <Callout tone={write.message.tone} action={{ label: '知道了', onClick: write.clear }}>{write.message.text}</Callout> : null}
-    {!data
+    {!page
       ? status === 'error' || status === 'offline' ? <StatePanel kind="error" title="读取 MEV 套利模块失败" detail={error?.message ?? '网络离线'} /> : <StatePanel kind="loading" title="加载中…" />
+      : !data ? <SetupPanel setup={page.setup} write={write} onChanged={live.refresh} />
       : tab === 'overview' ? <Overview view={data} write={write} onChanged={live.refresh} />
         : tab === 'opportunities' ? <Opportunities view={data} />
           : tab === 'transactions' ? <Transactions view={data} />
             : tab === 'pools' ? <Pools view={data} write={write} onChanged={live.refresh} />
-              : <SettingsTab view={data} write={write} onChanged={live.refresh} />}
+              : <><SettingsTab view={data} write={write} onChanged={live.refresh} /><WalletCard setup={page.setup} live={data.mode === 'live'} write={write} onChanged={live.refresh} /></>}
   </div>;
 }
 
@@ -228,6 +234,5 @@ function SettingsTab({ view, write, onChanged }: { view: MevStateView; write: Wr
       <button type="button" className="button" disabled={!dirty || write.busy !== null} onClick={save}>{write.busy === 'settings' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Save size={14} aria-hidden="true" />}保存参数</button>
       <button type="button" className="button secondary" disabled={!dirty || write.busy !== null} onClick={() => { setTouched(false); setProblem(null); setForm(settingsForm(view.settings)); }}>撤销修改</button>
     </div>
-    <p className="vl-note">热钱包私钥、节点地址、执行合约与 owner 地址不在页面修改：用 <code>sudo bash install.sh --set-mev</code> 设置，<code>--unset-mev</code> 停用（docs/mev.md 第 1.6 节）。</p>
   </section>;
 }

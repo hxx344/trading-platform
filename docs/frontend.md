@@ -47,7 +47,7 @@
 | 交易中心 | Var/Lighter 价差 | `#/varlighter`，子页 `#/varlighter/detail/<场所:代码>`、`#/varlighter/paper`、`#/varlighter/ready` | 服务开启了 Var/Lighter 模块（默认开启，`"varLighter": false` 关闭） | 《Var/Lighter 价差页》，内容见 [varlighter.md](varlighter.md) 第 10 节 |
 | 策略与风险 | 配对组 | `#/`、`#/pair/<配对>` | 总是 | F1–F3、《ASTER 页面按工作台重排（F4）》 |
 | 期权 | 期权 | `#/options`，子页 `#/options/positions`、`#/options/orders`、`#/options/performance`、`#/options/rfq` | 已配置期权，后台重试期间也显示 | 《期权页》 |
-| 链上 | MEV 套利 | `#/mev`，子页 `#/mev/opportunities`、`#/mev/transactions`、`#/mev/pools`、`#/mev/settings` | 已配置 `mev`，状态库打不开时也显示 | 《MEV 套利页》，内容见 [mev.md](mev.md) 第 5 节 |
+| 链上 | MEV 套利 | `#/mev`，子页 `#/mev/opportunities`、`#/mev/transactions`、`#/mev/pools`、`#/mev/settings` | 总是显示（v0.85.0 起；还没启用时是启用向导） | 《MEV 套利页》，内容见 [mev.md](mev.md) 第 5 节 |
 | 系统 | 运行状态 | `#/status` | 总是 | F2、《日志页与定时摘要状态》 |
 | 系统 | 日志 | `#/logs` | 总是 | 《日志页与定时摘要状态》 |
 | 系统 | 设置 | `#/settings` | 总是 | F3、《定时摘要间隔在设置页修改》、《导入面板：行情监控与资产账本》 |
@@ -718,7 +718,7 @@
 - 实盘准备：核对清单、全局参数与风控、采集状态（每个场所的行情流、流量折算、目录、盘口快照，及停采 / 开采按钮，至少保留一个场所）、规格核对（按配对确认）。
 - 窄屏（390 px）时表格在面板内横向滚动，不撑宽页面。本地预览：`pnpm build:web` 后 `node scripts/dev-varlighter.ts`（替身行情，两个场所都有）。
 
-## MEV 套利页（v0.84.0）
+## MEV 套利页（v0.84.0，启用向导 v0.85.0）
 
 **对照的工作台页面**：工作台没有这个页面，骨架与样式沿用本仓库的 Var/Lighter 价差页（`varlighter.css`，`parts.tsx` 的 `Badge`、`Metric`、`useWrite`），`mev.css` 只放本页特有的少量排版；回退版本 v0.83.0。代码在 `web/src/mev/`，内容与接口见 [mev.md](mev.md) 第 5 节；`config.json` 没有 `mev` 时左侧栏没有入口。
 
@@ -726,8 +726,11 @@
 - 页头右侧是模式（观察 / 实盘）、合约核对、节点状态三枚状态。概览页有开始 / 停止按钮；不能开始时按钮禁用并写明原因（合约核对未过、未读到链上状态、节点落后、余额不足），服务端再核对一遍。
 - 「开始实盘」先弹确认，内容由 `mev-form.ts` 的 `startConfirmText` 生成：热钱包地址与余额、执行合约、利润收款地址、每日 gas 预算、最低净利、熔断笔数，以及上次的故障记录或停止原因。请求带上热钱包地址和页面所见的故障记录、停止原因作确认；服务端的已变化时返回 409，页面提示刷新后重新确认。
 - 设置页的比例类参数按百分数显示与填写，保存时换回小数；只做格式检查，范围由服务端校验并原样显示服务端的说明。
-- 页面不显示也不接收私钥与节点地址。交易哈希与地址链到 basescan。
-- 读取用共享读取层（`useLiveResource`），间隔 3 秒；窄屏（390 px）时表格在面板内横向滚动。本地预览：`pnpm build:web` 后 `node scripts/dev-mev.ts`（替身节点，不联网）。
+- 启用向导（v0.85.0，`MevSetup.tsx`，范围见 [mev.md](mev.md) 1.9；回退版本 v0.84.0）：引擎没在运行时不显示页签，整页按阶段显示「录入热钱包 → 转入 gas 并部署执行合约 → 等待部署上链」。工作台没有对应页面，用本页已有的 `panel`、`vl-fields`、`vl-actions`、`mev-facts`、`Callout` 拼成，没有新增样式。私钥与节点地址的输入框是密码框、不自动填充，提交成功后立刻从组件状态里清掉；格式由 `mev-form.ts` 的 `setupRequest` 先查，报错不带私钥。页面经明文 http 且不是本机地址打开时表单上方有警告。部署与移除先弹确认（`deployConfirmText`、`resetConfirmText`），部署的确认里再显示一遍收款地址；没读到余额或余额为零时部署按钮禁用并写明原因。
+- 「设置」页签末尾是「热钱包与节点」卡片：地址、节点主机名、更换节点、移除热钱包；实盘中两个按钮禁用，由配置文件管理时只读并说明。
+- 页面读到的状态里没有私钥与节点地址原文（只有主机名）。交易哈希与地址链到 basescan。
+- 读取用共享读取层（`useLiveResource`），间隔 3 秒；窄屏（390 px）时表格在面板内横向滚动。本地预览：`pnpm build:web` 后 `node scripts/dev-mev.ts`（替身节点，不联网），加 `--setup` 看启用向导。
+- v0.85.0 的验证：`dev-mev.ts --setup` 上用内置浏览器在 800 与 375 宽度走了一遍：格式不对的私钥被表单拦下、录入后显示热钱包地址与余额、确认后部署、上链后自动进入观察模式、设置页签的卡片、移除后回到向导；无横向溢出，控制台没有本页的报错。
 
 ## 只读接口令牌（v0.69.0）
 

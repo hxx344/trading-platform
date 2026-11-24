@@ -2,7 +2,7 @@
 // 开始实盘的确认文案。由 web/test/mev-form.test.mjs 覆盖。
 import type { Settings } from '../../../src/mev/risk.ts';
 import type { OpportunityOutcome, TxStatus } from '../../../src/mev/store.ts';
-import type { MevStateView } from '../../../src/mev/views.ts';
+import type { MevSetupView, MevStateView } from '../../../src/mev/views.ts';
 import type { MevTab } from '../route-parse.ts';
 
 export const MEV_BASE = '/api/mev';
@@ -106,4 +106,41 @@ export function startConfirmText(view: MevStateView): string {
   else if (view.haltReason) lines.push(`上次停止的原因：${view.haltReason}`);
   lines.push('确认开始？');
   return lines.join('\n');
+}
+
+// ---- 启用向导（docs/mev.md 第 6 节）----
+/** 与服务端 src/mev/setup.ts 的 REDEPLOY_AFTER_MS 一致：部署交易发出这么久没上链才能加价重发。 */
+export const REDEPLOY_AFTER_MS = 5 * 60_000;
+export interface SetupForm { privateKey: string; owner: string; rpcUrl: string }
+
+/** 表单到请求。只做格式检查，地址与私钥是否相同等由服务端核对；报错里不带私钥。 */
+export function setupRequest(form: SetupForm): { ok: true; body: { privateKey: string; owner: string; rpcUrl?: string } } | { ok: false; message: string } {
+  const key = form.privateKey.trim().replace(/^0x/i, ''), owner = form.owner.trim(), rpcUrl = form.rpcUrl.trim();
+  if (!/^[0-9a-fA-F]{64}$/.test(key)) return { ok: false, message: '私钥须为 64 位十六进制（可带 0x）。助记词不行，请从钱包里导出这个地址的私钥' };
+  if (!/^0x[0-9a-fA-F]{40}$/.test(owner)) return { ok: false, message: '利润收款地址须为 0x 开头的 40 位十六进制地址' };
+  if (rpcUrl && !/^https?:\/\/\S+$/i.test(rpcUrl)) return { ok: false, message: '节点地址须以 https:// 开头（本机或内网自建节点可用 http://）' };
+  return { ok: true, body: { privateKey: `0x${key}`, owner, ...(rpcUrl ? { rpcUrl } : {}) } };
+}
+
+/** 页面经明文 http 打开且不是本机：录入私钥前要提醒。 */
+export const insecurePage = (location: { protocol: string; hostname: string }): boolean =>
+  location.protocol === 'http:' && !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
+
+export function deployBlocker(setup: MevSetupView): string | null {
+  if (!setup.wallet) return setup.rpcError ? '读不到热钱包余额' : '正在读取热钱包余额';
+  if (setup.wallet.eth <= 0) return '热钱包里还没有 ETH，先转入 gas';
+  return null;
+}
+
+export function deployConfirmText(setup: MevSetupView): string {
+  return [
+    setup.deploy ? '在同一个 nonce 上加价重发部署交易？' : '由热钱包发出部署执行合约的交易？',
+    `热钱包：${setup.operator}（余额 ${eth(setup.wallet?.eth)}）`,
+    `利润收款地址（合约 owner，部署后不可更改）：${setup.owner}`,
+    '部署费用从热钱包余额里出，发出后不能撤回。请再核对一遍收款地址。',
+  ].join('\n');
+}
+
+export function resetConfirmText(setup: MevSetupView): string {
+  return `移除热钱包 ${setup.operator}？\n服务器上的私钥会被删除。链上的执行合约与钱包里的余额不受影响；余额要用你自己保存的私钥取回，移除前请确认私钥另有备份。`;
 }

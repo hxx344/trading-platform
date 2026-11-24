@@ -718,9 +718,9 @@
 - 实盘准备：核对清单、全局参数与风控、采集状态（每个场所的行情流、流量折算、目录、盘口快照，及停采 / 开采按钮，至少保留一个场所）、规格核对（按配对确认）。
 - 窄屏（390 px）时表格在面板内横向滚动，不撑宽页面。本地预览：`pnpm build:web` 后 `node scripts/dev-varlighter.ts`（替身行情，两个场所都有）。
 
-## MEV 套利页（v0.83.0）
+## MEV 套利页（v0.84.0）
 
-**对照的工作台页面**：工作台没有这个页面，骨架与样式沿用本仓库的 Var/Lighter 价差页（`varlighter.css`，`parts.tsx` 的 `Badge`、`Metric`、`useWrite`），`mev.css` 只放本页特有的少量排版；回退版本 v0.82.2。代码在 `web/src/mev/`，内容与接口见 [mev.md](mev.md) 第 5 节；`config.json` 没有 `mev` 时左侧栏没有入口。
+**对照的工作台页面**：工作台没有这个页面，骨架与样式沿用本仓库的 Var/Lighter 价差页（`varlighter.css`，`parts.tsx` 的 `Badge`、`Metric`、`useWrite`），`mev.css` 只放本页特有的少量排版；回退版本 v0.83.0。代码在 `web/src/mev/`，内容与接口见 [mev.md](mev.md) 第 5 节；`config.json` 没有 `mev` 时左侧栏没有入口。
 
 - 左侧栏入口在「链上」组（期权之后、系统之前），这个工作区第一次有页面。五个页签都在地址里：`#/mev`（概览）、`#/mev/opportunities`、`#/mev/transactions`、`#/mev/pools`、`#/mev/settings`；不认识的子地址不落在本页。
 - 页头右侧是模式（观察 / 实盘）、合约核对、节点状态三枚状态。概览页有开始 / 停止按钮；不能开始时按钮禁用并写明原因（合约核对未过、未读到链上状态、节点落后、余额不足），服务端再核对一遍。

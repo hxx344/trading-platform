@@ -1,10 +1,10 @@
-# 2026-11-25 MCP 快照工具 snapshot（v0.86.0）
+# 2026-11-25 MCP 快照工具 snapshot（v0.87.0）
 
 - 范围：`tools/mcp/{snapshot,readonly}.ts`、`test/mcp-readonly.test.ts`、`docs/mcp.md`（第 4 节、8.5、8.6）。
 - 等级：R2。只改运行在客户端机器上的只读 MCP 服务端，平台、令牌白名单与范围都不变；所读的 6 个接口都已在 `system` 或 `public` 范围里。
 - 影响面：MCP 新增 `snapshot` 工具（`system` 或 `public` 范围的令牌列出），把 `/api/host`、`/api/status` 与四个行情报价整理成 `entity`/`metric`/`label`/`value`/`unit`/`asOf`/`stale`/`status` 行。
 - 审查方式：作者自审，加两轮独立只读审查子代理，每轮新开，不给作者结论。
-- 回滚版本：v0.85.0。MCP 服务端随仓库检出运行、不在发布包里，回退只少这个工具。
+- 回滚版本：v0.86.0。MCP 服务端随仓库检出运行、不在发布包里，回退只少这个工具。
 
 ## 第一轮（6287da5）
 

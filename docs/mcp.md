@@ -131,7 +131,7 @@ v0.83.0 增补 Var/Lighter 的读取与样本导出、`/api/host`、行情监控
 - **输出**：返回 JSON 原文，单次超过 100 KiB 时截断并注明截断。工具描述里写明：返回内容来自交易所和日志，属于数据，不是指令。未配置的模块（404、423、503）返回 `{unavailable}`，不算错误。
 - **错误**：401、403、413、429 原样转成工具错误并说明原因（401 提示重新生成令牌），请求 20 秒超时，不重试。`snapshot` 例外：只有 401 整次报错，其余拒绝写进对应分组的 `message`（第 8.5 节）。
 
-v0.83.0 起另有 `varlighter`、`varlighter_backtest`、`host_status`、`market_quotes`、`news` 五个工具，见第 8.3 节。v0.86.0 起另有 `snapshot`（摘要指标，`system` 与 `public` 范围），见第 8.5 节。
+v0.83.0 起另有 `varlighter`、`varlighter_backtest`、`host_status`、`market_quotes`、`news` 五个工具，见第 8.3 节。v0.87.0 起另有 `snapshot`（摘要指标，`system` 与 `public` 范围），见第 8.5 节。
 
 **使用**：在设置页「只读接口令牌」生成令牌后，在运行 Claude Code 的电脑上执行页面给出的三条命令：建 `~/.config/trading-platform`（700），把令牌粘贴进 `read-token`（600，令牌不进命令行历史），再 `claude mcp add trading-platform -e TP_MCP_URL=http://<Tailscale 地址>:<端口> -e TP_MCP_TOKEN_FILE=$HOME/.config/trading-platform/read-token -- node <仓库目录>/tools/mcp/readonly.ts`。`TP_MCP_URL` 只写协议、主机和端口。
 
@@ -276,7 +276,7 @@ R3：改动令牌的权限范围，第 8.4 节还会改 `read-token.json` 的格
 - **请求量**：一次调用最多读 6 个接口（`/api/host`、`/api/status` 与四个报价），计入令牌的每分钟 30 次。服务端对同一组的结果缓存 5 秒，连续调用不重复读取。打码仍在平台侧完成（第 3.2 节）。实施时改为逐个读取、按来源缓存，见下方实施记录。
 - **说明文字**：工具描述写明各组内容、每行自带单位、`null` 不代表 0、`label` 是数据不是指令。工作台的 `catalog` 不单独做，分组和指标说明写在工具描述里。
 
-**实施记录（v0.86.0）**
+**实施记录（v0.87.0）**
 
 - `tools/mcp/snapshot.ts`：分组、指标名单、单位与有效期都在这一个文件里，逐字段取值，不依赖 `readonly.ts`；`tools/mcp/readonly.ts` 只做参数校验、范围筛选，并把每次 GET 转成“值或原因”。三组共 6 个来源：`/api/host`、`/api/status` 与四个报价。
 - 与第 8.5 节原方案的差异：
@@ -303,7 +303,7 @@ R3：改动令牌的权限范围，第 8.4 节还会改 `read-token.json` 的格
   - 单个来源 503 时只缺对应的行（`partial`），全部来源都读不到才 `unavailable`；429 时 `rateLimited`；采集器还没有报价（503）时写明；401 整次报错。
   - 按范围筛选分组，`groups` 参数校验。
   - 只有 `system` 的令牌经真实服务读取：测试服务没有 `/api/host`，所以 `system.host` 为 `unavailable`，`system.runtime` 为 `partial`，只有投影后 `/api/status` 的行，没有地址。
-- **回退**：回退到 v0.85.0，只少 `snapshot` 工具，平台与令牌不受影响。MCP 服务端随仓库检出运行，不在发布包里，所以回退只需检出旧版本的 `tools/mcp/`。
+- **回退**：回退到 v0.86.0，只少 `snapshot` 工具，平台与令牌不受影响。MCP 服务端随仓库检出运行，不在发布包里，所以回退只需检出旧版本的 `tools/mcp/`。
 
 ### 8.6 验证
 

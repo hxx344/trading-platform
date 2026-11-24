@@ -50,12 +50,12 @@ function setup(t: TestContext, options: { dir?: string; profit?: (call: FakeExec
   if (!options.dir) t.after(() => rmSync(dir, { recursive: true, force: true }));
   const chain = createFakeChain({ executor: EXECUTOR, owner: OWNER, operator: OPERATOR, tokens: TOKENS, pools: makePools(), now, profit: options.profit ?? profitable });
   const logs: string[] = [], notices: string[] = [];
-  const open = () => {
+  const open = (privateKey = KEY) => {
     const store = openMevStore(join(dir, MEV_FILE));
     // 白名单已就绪：不去读默认的中间代币。
     if (!store.tokens().length) { for (const token of TOKENS) store.putToken(token, now()); store.writeState('seeded', true, now()); }
     const rpc = createRpc({ url: 'https://fake.invalid', fetchImpl: chain.fetchImpl });
-    const engine = createMevEngine({ store, rpc, sendRpc: rpc, chainId: BASE_CHAIN_ID, executor: EXECUTOR, owner: OWNER, privateKey: KEY, now, log: line => logs.push(line), notify: (_key, text) => { notices.push(text); } });
+    const engine = createMevEngine({ store, rpc, sendRpc: rpc, chainId: BASE_CHAIN_ID, executor: EXECUTOR, owner: OWNER, privateKey, now, log: line => logs.push(line), notify: (_key, text) => { notices.push(text); } });
     return { store, engine };
   };
   const first = open();
@@ -206,11 +206,13 @@ test('久远的过期交易不再抬高加价的底', async t => {
   await s.step();
   const [old] = s.store.openTxs();
   assert.ok(old);
-  await s.step(s.engine, DEADLINE_BLOCKS + EXPIRE_GRACE_BLOCKS + 1);
-  assert.equal(s.store.openTxs()[0]!.status, 'expired');
-  // 过了加价窗口：新的一笔按正常费用出价，不以那笔过期交易为底。
+  // 过了加价窗口它才过期：同一轮里发出的新一笔按正常费用出价，不以那笔过期交易为底。
   s.advanceClock(FEE_FLOOR_WINDOW_MS);
+  await s.step(s.engine, DEADLINE_BLOCKS + EXPIRE_GRACE_BLOCKS + 1);
+  assert.deepEqual(s.store.openTxs().map(tx => tx.status), ['expired']);
+  // 上一轮到了目录刷新周期，没有做发现；这一轮才发。
   await s.step();
+  assert.equal(s.store.openTxs().length, 2);
   const fresh = s.store.recentTxs(1)[0]!;
   assert.notEqual(fresh.hash, old.hash);
   assert.ok(fresh.maxPriorityFeePerGas < old.maxPriorityFeePerGas * 5n / 4n, '没有按 25% 加价');
@@ -232,6 +234,40 @@ test('开始实盘的确认绑定页面所见：故障记录或停止原因已�
   assert.equal(s.engine.isLive(), true);
 });
 
+test('换了热钱包：旧钱包的未结清交易直接结清，它的上链记录不挡新钱包从 nonce 0 发送', async t => {
+  const s = setup(t);
+  await s.ready();
+  await s.goLive();
+  await s.step();
+  const [mined] = s.store.openTxs();
+  assert.ok(mined);
+  s.chain.mine(mined.hash, 'success', { profit: 5n });
+  await s.step();
+  assert.equal(s.store.maxMinedNonce(), 0);
+  s.chain.state.send = 'drop';
+  await s.step();
+  assert.equal(s.store.openTxs().length, 1);
+  s.closeFirst();
+  // 旧钱包在链上已到 nonce 1；新钱包从 0 开始。
+  const otherKey = '0x' + '11'.repeat(32), other = addressOf(otherKey);
+  s.chain.state.operator = other;
+  s.chain.state.nonce = 0;
+  s.chain.state.send = 'accept';
+  s.advanceClock(60_000);
+  const next = s.open(otherKey);
+  t.after(() => next.engine.close());
+  assert.equal(next.store.openTxs().length, 0);
+  assert.deepEqual(next.store.recentTxs(1).map(tx => [tx.status, tx.error]), [['lost', '热钱包已更换，这笔交易不再核对']]);
+  assert.equal(next.store.maxMinedNonce(), null, '旧钱包的上链记录不算进新钱包的 nonce 比较');
+  assert.deepEqual([next.engine.views.state().operator, next.engine.views.state().fault], [other, null]);
+  await s.ready(next.engine);
+  const before = sends(s.chain), seen = next.engine.views.state();
+  assert.deepEqual(await next.engine.views.start({ confirm: other, fault: seen.fault, haltReason: seen.haltReason }), { mode: 'live' });
+  await s.step(next.engine);
+  assert.equal(sends(s.chain), before + 1);
+  assert.deepEqual(next.store.openTxs().map(tx => tx.nonce), [0]);
+});
+
 test('停服：quiesce 之后不再发送', async t => {
   const s = setup(t);
   await s.ready();
@@ -240,6 +276,7 @@ test('停服：quiesce 之后不再发送', async t => {
   for (let i = 0; i < 3; i++) await s.step();
   assert.equal(sends(s.chain), 0);
   assert.equal(s.store.recentTxs(5).length, 0);
+  await assert.rejects(async () => s.engine.views.start({ confirm: OPERATOR, fault: null, haltReason: null }), rejectsWith('stopping', 503));
   assert.ok(!s.notices.some(text => text.includes('已停止实盘')), '停服不发熔断通知');
 });
 
@@ -350,6 +387,8 @@ test('每日 gas 预算放不下这一笔时跳过并记录原因，不停实盘
   const s = setup(t);
   await s.ready();
   s.engine.views.settings({ settings: { ...DEFAULT_SETTINGS, dailyGasBudgetEth: 0.0001 } });
+  // 小费封顶在预算的四分之一，光靠小费撑不破预算：把基础费抬到这一笔的费用上限本身就超过预算。
+  s.chain.state.baseFee = 100_000_000n;
   await s.goLive();
   // 同一条环路 30 秒内只记一条机会：让它过去，这一轮被拦下的原因才会入库。
   s.advanceClock(31_000);
@@ -392,6 +431,7 @@ test('参数与白名单：越界的参数整份拒绝；起始代币不能删�
   await assert.rejects(async () => s.engine.views.tokens({ action: 'drop', address: AERO }), rejectsWith('invalid_action', 400));
   assert.deepEqual(await s.engine.views.tokens({ action: 'remove', address: AERO.toUpperCase().replace('0X', '0x') }), { tokens: TOKENS.slice(0, 2) });
   await assert.rejects(async () => s.engine.views.tokens({ action: 'remove', address: AERO }), rejectsWith('not_found', 404));
+  assert.equal(s.engine.views.state().directory.pools, 2, '移出立即生效，不等目录刷新');
   await s.step();
   assert.equal(s.engine.views.state().directory.pools, 2, '去掉代币后目录里不再有它的池子');
   const added = await s.engine.views.tokens({ action: 'add', address: AERO }) as { tokens: TokenInfo[] };

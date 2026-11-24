@@ -55,6 +55,8 @@ export const UNPROFITABLE_COOLDOWN_MS = 30_000;
 export const FEE_FLOOR_WINDOW_MS = 10 * 60_000;
 /** 实盘中多久重新核对一次执行合约（owner 可能换掉了 operator）。 */
 export const REVERIFY_MS = 10 * 60_000;
+/** 定期核对连续多少次读不到结果才按核对不过处理。 */
+export const REVERIFY_FAILURE_LIMIT = 3;
 /** 同一条环路多久记一次机会（发送的那次不受限）。 */
 const RECORD_EVERY_MS = 30_000;
 
@@ -100,19 +102,22 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
   if (!store.tokens().length) for (const token of START_TOKENS) store.putToken(token, now());
   let seedPending = store.readState<boolean>('seeded') !== true;
 
-  // 库绑定热钱包与合约：--set-mev 换了其中之一后，旧钱包留下的未结清交易按新钱包的 nonce 核对不出结论，
-  // 这里直接结清（旧钱包上它们最多因过期回滚、花旧钱包的 gas），连续回滚计数与故障记录也不带到新钱包。
+  // 库绑定热钱包：--set-mev 换了热钱包后，旧钱包留下的未结清交易按新钱包的 nonce 核对不出结论，这里直接结清
+  // （旧钱包上它们最多因过期回滚、花旧钱包的 gas），连续回滚计数与故障记录也不带到新钱包；identityAt 之前入库的
+  // 交易属于旧钱包，不参与新钱包的 nonce 比较。只换执行合约时 nonce 空间没变，未结清交易与故障照常核对。
   {
-    const identity = `${operator}:${executor}`, bound = store.readState<string>('identity');
-    if (bound !== null && bound !== identity) {
+    const bound = store.readState<string>('identity');
+    if (bound !== null && bound !== operator) {
       const stale = store.openTxs();
-      store.transaction(() => { for (const tx of stale) store.settleTx(tx.hash, 'lost', now(), { error: '热钱包或执行合约已更换，这笔交易不再核对' }); });
+      store.transaction(() => { for (const tx of stale) store.settleTx(tx.hash, 'lost', now(), { error: '热钱包已更换，这笔交易不再核对' }); });
       consecutiveReverts = 0; fault = null;
       store.writeState('consecutiveReverts', 0, now()); store.writeState('fault', null, now());
-      log(`mev: 热钱包或执行合约已更换，结清旧配置留下的 ${stale.length} 笔未结清交易`);
+      store.writeState('identityAt', now(), now());
+      log(`mev: 热钱包已更换，结清旧钱包留下的 ${stale.length} 笔未结清交易`);
     }
-    if (bound !== identity) store.writeState('identity', identity, now());
+    if (bound !== operator) store.writeState('identity', operator, now());
   }
+  let verifyFailures = 0;
   let stopping = false;
 
   const tokenMap = (): Map<string, TokenInfo> => new Map(store.tokens().map(token => [token.address, token]));
@@ -126,7 +131,7 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
     say(`mev:halt:${now()}`, `【MEV 套利已停止实盘】${reason}。模块回到观察模式；未结清的交易继续核对。在「MEV 套利」页处理后可重新开始`);
   }
 
-  async function verify(): Promise<void> {
+  async function verify(tolerant = false): Promise<void> {
     const at = now();
     try {
       const outcomes = await rpc.batch([
@@ -146,7 +151,10 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
         if (new AbiReader(value(4 + index)).uint(0) !== BigInt(factory.kind)) return fail(`执行合约没有登记 ${KIND_LABELS[factory.kind]} 的工厂`);
       }
       verification = { ok: true, reason: null, checkedAt: at };
+      verifyFailures = 0;
     } catch (error) {
+      // 读不到不等于不符：实盘中的定期核对偶尔超时或缺项时沿用上一次通过的结论，下一轮再读；连续读不到才按不过处理。
+      if (tolerant && verification.ok && ++verifyFailures < REVERIFY_FAILURE_LIMIT) { log(`mev: 定期核对合约没有读到结果（第 ${verifyFailures} 次），下一轮重试`); return; }
       verification = { ok: false, reason: `核对合约失败：${errorText(error)}`, checkedAt: at };
     }
     if (!verification.ok) halt(verification.reason ?? '合约核对未通过');
@@ -303,7 +311,7 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
     dailySummary(at);
     // 未结清的交易不论合约核对是否通过都继续核对：预留的费用不会一直占着。
     await settle(at);
-    if (live && at - verification.checkedAt >= REVERIFY_MS) await verify();
+    if (live && at - verification.checkedAt >= REVERIFY_MS) await verify(true);
     if (!verification.ok) return true;
     if (directoryStale || at - directoryAt >= DIRECTORY_REFRESH_MS) { await refreshDirectory(); store.prune(at); return true; }
     if (lagging || !pools.length) return true;
@@ -370,6 +378,7 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
     /** 开始实盘：重新核对合约，清掉上次的熔断原因与故障记录（页面的确认提示里已把它们给用户看过）。 */
     async start(body: unknown): Promise<unknown> {
       if (requireBody(body).confirm !== operator) throw new MevError(400, 'confirm_required', '须带上热钱包地址确认');
+      if (stopping) throw new MevError(503, 'stopping', '服务正在停止');
       if (live) return { mode: 'live' };
       await verify();
       if (!verification.ok) throw new MevError(409, 'not_verified', verification.reason ?? '合约核对未通过');

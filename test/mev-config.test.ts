@@ -32,10 +32,10 @@ test('密钥文件的 mev：节点地址须 https（内网可 http），私钥�
   assert.equal(parseMevSecrets({}), undefined);
   assert.deepEqual(parseMevSecrets({ mev: { rpcUrl: RPC, privateKey: KEY } }), { rpcUrl: RPC, privateKey: KEY });
   assert.deepEqual(parseMevSecrets({ mev: { rpcUrl: 'http://127.0.0.1:8545', sendRpcUrl: SEND, privateKey: KEY } }), { rpcUrl: 'http://127.0.0.1:8545', sendRpcUrl: SEND, privateKey: KEY });
-  for (const ok of ['http://localhost:8545', 'http://10.0.0.8:8545', 'http://192.168.1.2:8545', 'http://100.64.0.3:8545']) assert.ok(parseMevSecrets({ mev: { rpcUrl: ok, privateKey: KEY } }));
+  for (const ok of ['http://localhost:8545', 'http://10.0.0.8:8545', 'http://192.168.1.2:8545', 'http://100.64.0.3:8545', 'http://100.127.255.1:8545']) assert.ok(parseMevSecrets({ mev: { rpcUrl: ok, privateKey: KEY } }));
   const bad: Record<string, unknown>[] = [
     { rpcUrl: 'http://base.example.invalid/rpc-key-secret', privateKey: KEY }, { rpcUrl: 'https://user:pass-secret@base.example.invalid', privateKey: KEY },
-    { rpcUrl: 'wss://base.example.invalid/rpc-key-secret', privateKey: KEY }, { rpcUrl: 'not a url rpc-key-secret', privateKey: KEY }, { rpcUrl: RPC, sendRpcUrl: 'http://8.8.8.8/rpc-key-secret', privateKey: KEY },
+    { rpcUrl: 'wss://base.example.invalid/rpc-key-secret', privateKey: KEY }, { rpcUrl: 'not a url rpc-key-secret', privateKey: KEY }, { rpcUrl: RPC, sendRpcUrl: 'http://8.8.8.8/rpc-key-secret', privateKey: KEY }, { rpcUrl: 'http://100.63.0.1/rpc-key-secret', privateKey: KEY }, { rpcUrl: 'http://100.128.0.1/rpc-key-secret', privateKey: KEY }, { rpcUrl: 'http://172.16.0.1/rpc-key-secret', privateKey: KEY },
     { rpcUrl: RPC, privateKey: KEY.slice(0, -2) }, { rpcUrl: RPC, privateKey: KEY.slice(2) }, { rpcUrl: RPC, privateKey: '0x' + '0'.repeat(64) }, { rpcUrl: RPC, privateKey: 7 },
     { rpcUrl: RPC }, { rpcUrl: RPC, privateKey: KEY, extra: 1 },
   ];

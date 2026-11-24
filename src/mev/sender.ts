@@ -12,7 +12,7 @@ import type { MevStore, StoredTx, TxStatus } from './store.ts';
 export const EXPIRE_GRACE_BLOCKS = 15;
 /** nonce 已被占用但没有回执时，连续查多少轮才认定不是本模块的交易。 */
 export const MISSING_LIMIT = 5;
-/** 同一个 nonce 上最多留几笔未结清（过期后替换）的交易。 */
+/** 一次实盘期间，同一个 nonce 上过期未上链的交易到这个数就停实盘。 */
 export const MAX_OPEN_PER_NONCE = 3;
 
 export interface ChainAccount { head: number; nonce: number; balance: bigint }

@@ -142,7 +142,8 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
         ...FACTORIES.map(factory => ({ method: 'eth_call', params: [{ to: executor, data: callData('factoryKind(address)', ['address'], [factory.address]) }, 'latest'] })),
       ]);
       const value = (index: number): string => { const entry = outcomes[index]!; if (!entry.ok || typeof entry.result !== 'string') throw new MevError(502, 'verify', '读取执行合约失败（地址上可能不是执行合约）'); return entry.result; };
-      const fail = (reason: string) => { verification = { ok: false, reason, checkedAt: at }; };
+      // 读到明确不符：记下结论并停实盘（不在实盘时 halt 不做事）。之后即使又核对通过，也要用户重新开始。
+      const fail = (reason: string) => { verification = { ok: false, reason, checkedAt: at }; halt(reason); };
       if (quantity(value(0)) !== chainId) return fail(`节点的链号是 ${quantity(value(0))}，配置的是 ${chainId}`);
       if (value(1).toLowerCase() !== expectedRuntimeCode(owner)) return fail('执行合约的代码与本版本的产物不一致（或 owner 不是配置的地址）');
       if (new AbiReader(value(2)).address(0) !== owner) return fail('执行合约的 owner 不是配置的地址');
@@ -381,6 +382,7 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
       if (stopping) throw new MevError(503, 'stopping', '服务正在停止');
       if (live) return { mode: 'live' };
       await verify();
+      if (stopping) throw new MevError(503, 'stopping', '服务正在停止');
       if (!verification.ok) throw new MevError(409, 'not_verified', verification.reason ?? '合约核对未通过');
       if (!account || !head) throw new MevError(409, 'not_ready', '还没有读到链上状态，稍后再试');
       if (lagging) throw new MevError(409, 'lagging', '节点的最新区块落后，暂不能开始');

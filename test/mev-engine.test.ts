@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { Transaction } from 'ethers';
 import { BASE_CHAIN_ID, FACTORIES, KIND_AERO_V2, USDC, WETH, type FactoryInfo, type TokenInfo } from '../src/mev/chain.ts';
 import { AbiReader, addressOf, signTransaction } from '../src/mev/codec.ts';
-import { DEADLINE_BLOCKS, FEE_FLOOR_WINDOW_MS, MevError, createMevEngine } from '../src/mev/engine.ts';
+import { DEADLINE_BLOCKS, FEE_FLOOR_WINDOW_MS, MevError, REVERIFY_MS, createMevEngine } from '../src/mev/engine.ts';
 import { createFakeChain, type FakeExecute, type FakePool } from '../src/mev/fake-chain.ts';
 import { DEFAULT_SETTINGS, SettingsError, type Settings } from '../src/mev/risk.ts';
 import { createRpc } from '../src/mev/rpc.ts';
@@ -383,6 +383,21 @@ test('实盘中合约核对转为不过（owner 换了热钱包）时在开始�
   s.chain.state.operator = OWNER;
   await s.step();
   await assert.rejects(async () => s.engine.views.start({ confirm: OPERATOR }), rejectsWith('not_verified', 409));
+});
+
+test('实盘中定期核对读到 operator 已被换掉：停实盘并通知，之后核对恢复也不自动重开', async t => {
+  const s = setup(t, { profit: () => null });
+  await s.ready();
+  await s.goLive();
+  s.chain.state.operator = OWNER;
+  for (let i = 0; i < Math.ceil(REVERIFY_MS / 50_000); i++) { s.advanceClock(50_000); await s.step(); }
+  assert.equal(s.engine.isLive(), false);
+  assert.match(s.engine.views.state().haltReason ?? '', /operator 不是配置的热钱包/);
+  assert.ok(s.notices.some(text => text.includes('已停止实盘')));
+  s.chain.state.operator = OPERATOR;
+  for (let i = 0; i < 3; i++) { s.advanceClock(50_000); await s.step(); }
+  assert.equal(s.engine.views.state().verification.ok, true);
+  assert.equal(s.engine.isLive(), false);
 });
 
 test('每日 gas 预算放不下这一笔时跳过并记录原因，不停实盘；节点长时间不应答则停', async t => {

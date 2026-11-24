@@ -6,7 +6,7 @@
 //
 //   TP_MCP_URL=… TP_MCP_TOKEN_FILE=… node tools/varlighter/pull.ts --enabled
 //   TP_MCP_URL=… TP_MCP_TOKEN_FILE=… node tools/varlighter/pull.ts --symbol rh:AAPL --symbol lighter:BTC
-import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readSync, renameSync, writeFileSync, appendFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, fstatSync, ftruncateSync, mkdirSync, openSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -16,6 +16,8 @@ import { loadSettings, platformGet, PlatformError, SettingsError, type Get } fro
 
 export const STATE_FILE = 'state.json';
 const PAGE = 1000, MIN_PAGE = 50, MAX_WAITS = 40;
+/** A lock older than this is taken as left by a killed pull; waiting for a live one gives up after LOCK_WAIT_MS. */
+const LOCK_STALE_MS = 5 * 60_000, LOCK_WAIT_MS = 10 * 60_000;
 
 /** The local sample directory: TP_VARLIGHTER_DIR, else ~/.cache/trading-platform/varlighter. */
 export const dataDir = (env: NodeJS.ProcessEnv = process.env): string => env.TP_VARLIGHTER_DIR || join(homedir(), '.cache', 'trading-platform', 'varlighter');
@@ -30,21 +32,52 @@ export interface LocalState {
   orphans: string[];
 }
 
-/** The `t` of the file's last line, reading only its tail; 0 for a missing or empty file. */
+/**
+ * The `t` of the file's last line, reading only its tail; 0 for a missing or empty file. A last line without its newline
+ * (a pull killed while appending) is cut off first, so the next pull writes it again whole.
+ */
 export function lastSampleAt(file: string): number {
   if (!existsSync(file)) return 0;
-  const fd = openSync(file, 'r');
+  const fd = openSync(file, 'r+');
   try {
     const size = fstatSync(fd).size;
     if (size === 0) return 0;
-    const length = Math.min(size, 64 * 1024), buffer = Buffer.alloc(length);
+    const length = Math.min(size, 256 * 1024), buffer = Buffer.alloc(length);
     readSync(fd, buffer, 0, length, size - length);
-    const lines = buffer.toString('utf8').split('\n').filter(line => line.trim());
-    const last = lines.at(-1);
-    const t = last ? (JSON.parse(last) as { t?: unknown }).t : 0;
-    if (typeof t !== 'number' || !Number.isSafeInteger(t)) throw new Error(`${file} 的最后一行没有有效的 t`);
+    let tail = buffer;
+    if (buffer[length - 1] !== 0x0a) {
+      const end = buffer.lastIndexOf(0x0a);
+      if (end < 0 && length < size) throw new Error(`${file} 的最后一行过长或已损坏：删除最后一行后重试`);
+      ftruncateSync(fd, size - length + end + 1);
+      tail = buffer.subarray(0, end + 1);
+    }
+    const last = tail.toString('utf8').split('\n').filter(line => line.trim()).at(-1);
+    if (last === undefined) return 0;
+    let t: unknown;
+    try { t = (JSON.parse(last) as { t?: unknown }).t; } catch { t = undefined; }
+    if (typeof t !== 'number' || !Number.isSafeInteger(t)) throw new Error(`${file} 的最后一行不是有效的样本：删除最后一行后重试`);
     return t;
   } finally { closeSync(fd); }
+}
+
+/**
+ * Holds `<file>.lock` while `work` runs, so two pulls of one pair (parallel MCP calls, or the command line beside the
+ * MCP server) never append the same page twice. A lock left by a killed process is taken over after LOCK_STALE_MS.
+ */
+async function locked<T>(file: string, work: () => Promise<T>, sleep: (seconds: number) => Promise<void>): Promise<T> {
+  const lock = `${file}.lock`, started = Date.now();
+  for (;;) {
+    try { closeSync(openSync(lock, 'wx')); break; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      let age = 0;
+      try { age = Date.now() - statSync(lock).mtimeMs; } catch { continue; }
+      if (age > LOCK_STALE_MS) { rmSync(lock, { force: true }); continue; }
+      if (Date.now() - started > LOCK_WAIT_MS) throw new Error(`${lock} 被另一次拉取占用超过 ${LOCK_WAIT_MS / 60_000} 分钟`);
+      await sleep(0.2);
+    }
+  }
+  try { return await work(); } finally { rmSync(lock, { force: true }); }
 }
 
 export interface PullOptions {
@@ -55,7 +88,8 @@ export interface PullOptions {
   /** Seconds to wait on a 429 (tests pass a no-op). */
   sleep?: (seconds: number) => Promise<void>;
 }
-export interface PullResult { symbol: string; added: number; last: number | null; file: string }
+/** gap: the server had already dropped the samples after the local file's last one (pulled after its retention), so the file jumps from `from` to `to`. */
+export interface PullResult { symbol: string; added: number; last: number | null; file: string; gap: { from: number; to: number } | null }
 
 /** A GET that waits out 429s (the token's 30 a minute) and returns the status for the caller's 413 handling. */
 async function patient(get: Get, path: string, sleep: (seconds: number) => Promise<void>): Promise<unknown> {
@@ -88,27 +122,32 @@ export async function pull({ get, dir, symbols = [], enabled = false, log = () =
   const results: PullResult[] = [];
   for (const symbol of wanted) {
     const file = sampleFile(dir, symbol);
-    let after = lastSampleAt(file), added = 0, limit = PAGE;
-    for (;;) {
-      let page: SamplesView;
-      try { page = await patient(get, `/api/varlighter/samples?symbol=${encodeURIComponent(symbol)}&after=${after}&limit=${limit}`, sleep) as SamplesView; }
-      catch (error) {
-        if (error instanceof PlatformError && error.status === 413 && limit > MIN_PAGE) { limit = Math.max(MIN_PAGE, Math.floor(limit / 2)); continue; }
-        throw error;
+    results.push(await locked(file, async () => {
+      let after = lastSampleAt(file), added = 0, limit = PAGE, gap: PullResult['gap'] = null, checked = false;
+      for (;;) {
+        let page: SamplesView;
+        try { page = await patient(get, `/api/varlighter/samples?symbol=${encodeURIComponent(symbol)}&after=${after}&limit=${limit}`, sleep) as SamplesView; }
+        catch (error) {
+          if (error instanceof PlatformError && error.status === 413 && limit > MIN_PAGE) { limit = Math.max(MIN_PAGE, Math.floor(limit / 2)); continue; }
+          throw error;
+        }
+        // Only the first page can show it: the server's oldest sample is newer than the local file's last one.
+        if (!checked && after > 0 && page.firstAt !== null && page.firstAt > after) gap = { from: after, to: page.firstAt };
+        checked = true;
+        // Keyed by the server's column names, so a client a version apart keeps every field it knows.
+        const lines: string[] = [];
+        for (const row of page.rows) {
+          const sample = Object.fromEntries(page.columns.map((column, index) => [column, row[index] ?? null])) as { t: number };
+          if (!(sample.t > after)) continue;
+          lines.push(JSON.stringify(sample));
+          after = sample.t;
+        }
+        if (lines.length) { appendFileSync(file, `${lines.join('\n')}\n`); added += lines.length; }
+        if (page.next === null || !lines.length) break;
       }
-      // Keyed by the server's column names, so a client a version apart keeps every field it knows.
-      const lines: string[] = [];
-      for (const row of page.rows) {
-        const sample = Object.fromEntries(page.columns.map((column, index) => [column, row[index] ?? null])) as { t: number };
-        if (!(sample.t > after)) continue;
-        lines.push(JSON.stringify(sample));
-        after = sample.t;
-      }
-      if (lines.length) { appendFileSync(file, `${lines.join('\n')}\n`); added += lines.length; }
-      if (page.next === null || !lines.length) break;
-    }
-    log(`${symbol}：新增 ${added} 条，最新 ${after ? new Date(after).toISOString() : '无'}`);
-    results.push({ symbol, added, last: after || null, file });
+      log(`${symbol}：新增 ${added} 条，最新 ${after ? new Date(after).toISOString() : '无'}${gap ? `；服务器已不保留 ${new Date(gap.from).toISOString()} 到 ${new Date(gap.to).toISOString()} 的样本，本机这段为空` : ''}`);
+      return { symbol, added, last: after || null, file, gap };
+    }, sleep));
   }
   return { state, results };
 }

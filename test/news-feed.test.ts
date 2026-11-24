@@ -2,6 +2,9 @@
 // 异动行情的按需轮询，以及 config.json 的 news 开关。上游全部是替身，不连真实 eqn.news。
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { EQN_REST, EQN_WS, numberFromUrl, parsePushFrame, parseRestItem, parseRestPage } from '../src/news/eqn.ts';
 import { createNewsFeed, MOVES_INTEREST_MS, MOVES_POLL_MS, PING_MS, SILENT_MS, type NewsSocket } from '../src/news/feed.ts';
 import { newsLoop, newsViews } from '../src/service/news.ts';
@@ -254,7 +257,9 @@ test('接口：没开快讯 404，循环开始前 503，之后返回快讯与异
   const h = createHarness();
   const holder: { feed: ReturnType<typeof createNewsFeed> | null } = { feed: null };
   const views: { news?: ReturnType<typeof newsViews> } = {};
-  const server = createExecutorServer({ executor: h.ex, accessToken: 'news-token-0001', views });
+  const { createReadTokens } = await import('../src/read-token.ts');
+  const tokenDir = mkdtempSync(join(tmpdir(), 'tp-news-token-'));
+  const server = createExecutorServer({ executor: h.ex, accessToken: 'news-token-0001', views, readTokens: createReadTokens({ dir: tokenDir, log: () => {} }) });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}`;
   try {
@@ -271,6 +276,13 @@ test('接口：没开快讯 404，循环开始前 503，之后返回快讯与异
     const flash = await (await get('/api/news')).json() as { items: { no: number }[]; connection: { state: string } };
     assert.deepEqual(flash.items.map((item: { no: number }) => item.no), [5]);
     assert.equal(flash.connection.state, 'connecting');
+    // 只读令牌读到的链接改名 link：url 是脱敏的标识字段，原样给出会把每条快讯链接换成别名、挤掉账户别名（docs/mcp.md 8.3）。
+    const { token } = await (await fetch(`${base}/api/read-token/generate`, { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }, body: '{}' })).json() as { token: string };
+    const tokenFlash = await (await fetch(`${base}/api/news`, { headers: { authorization: `Bearer ${token}` } })).json() as { items: Record<string, unknown>[] };
+    assert.equal(tokenFlash.items[0]!.url, undefined);
+    assert.equal(tokenFlash.items[0]!.link, 'https://eqn.news/main/5');
+    const stored = JSON.parse(readFileSync(join(tokenDir, 'read-token.json'), 'utf8')) as { aliases: unknown[] };
+    assert.deepEqual(stored.aliases, [], '快讯链接不进别名表');
     const moves = await (await get('/api/news/moves')).json() as { channels: unknown[] };
     assert.equal(moves.channels.length, 4);
     // 展示读取的版本协商：列表没变回 204，但视图每次都照常生成（异动行情靠这次读取判断“有人在看”）。
@@ -288,7 +300,7 @@ test('接口：没开快讯 404，循环开始前 503，之后返回快讯与异
       assert.equal(await same.text(), '');
       assert.equal(produced, before + 1, '204 时也生成了视图');
     }
-  } finally { holder.feed?.close(); await new Promise(resolve => server.close(resolve)); h.dispose(); }
+  } finally { holder.feed?.close(); await new Promise(resolve => server.close(resolve)); h.dispose(); rmSync(tokenDir, { recursive: true, force: true }); }
 });
 
 // ---- 审查补充（docs/reviews/2026-11-19-eqn-news.md）----

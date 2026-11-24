@@ -186,13 +186,13 @@ export const TOOLS: readonly Tool[] = [
       kind: { type: 'string', enum: ['equity', 'etf', 'crypto', 'metal', 'commodity', 'private', 'other'] },
     }, ['symbol']),
     run: async (args, get) => {
-      const local = await import('../varlighter/backtest.ts');
-      let request;
-      try { request = local.readRequest({ ...args, trades: args.trades ?? 20 }); }
-      catch (error) { throw new ToolInputError(error instanceof Error ? error.message : String(error)); }
+      // Checked in a child process like the run itself, so the rules of the strategy code as it is now apply (this
+      // server may have loaded an older copy); a bad request never pulls.
+      const request = { ...args, trades: args.trades ?? 20 };
+      await backtestChild(['--check', '--request', JSON.stringify(request)]);
       const { pull, dataDir } = await import('../varlighter/pull.ts');
-      const { results } = await pull({ get, dir: dataDir(), symbols: [request.symbol] });
-      return { pulled: results[0] ?? null, result: await backtestChild(request) };
+      const { results } = await pull({ get, dir: dataDir(), symbols: [String(args.symbol)] });
+      return { pulled: results[0] ?? null, result: await backtestChild(['--request', JSON.stringify(request)]) };
     },
   },
   {
@@ -230,11 +230,15 @@ export const TOOLS: readonly Tool[] = [
  * Runs tools/varlighter/backtest.ts in a child process, so the repository's current strategy code is what replays the
  * samples even after the AI edited it while this server kept running.
  */
-function backtestChild(request: unknown): Promise<unknown> {
+function backtestChild(argv: readonly string[]): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    execFile(process.execPath, [fileURLToPath(new URL('../varlighter/backtest.ts', import.meta.url)), '--request', JSON.stringify(request)],
+    execFile(process.execPath, [fileURLToPath(new URL('../varlighter/backtest.ts', import.meta.url)), ...argv],
       { timeout: BACKTEST_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
-        if (error) { reject(new ToolInputError(stderr.trim() || (error.killed ? `回测超过 ${BACKTEST_TIMEOUT_MS / 1000} 秒` : error.message))); return; }
+        if (error) {
+          // A child killed for the timeout may already have printed something; the timeout is the reason.
+          reject(new ToolInputError(error.killed ? `回测超过 ${BACKTEST_TIMEOUT_MS / 1000} 秒` : stderr.trim().replace(/^回测失败：/, '') || error.message));
+          return;
+        }
         try { resolve(JSON.parse(stdout)); } catch { reject(new ToolInputError('回测输出不是有效的 JSON')); }
       });
   });

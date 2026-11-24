@@ -10,7 +10,7 @@ import type { Executor } from './executor.ts';
 import { APP_HEADERS, CLIENT_ADDRESS_HEADER, CONFIG_CHECK_HEADER, CONFIG_MATCH_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, PAGE_HEADERS, controlRoute, readJson, sendJson, sendJsonText, sendWebAsset, sessionCookieName } from './http-public.ts';
 import { GLOBAL_LOGIN_LIMITS, LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash, type ThrottleLimits } from './login-password.ts';
 import { openSessionStore, type SessionInfo, type SessionStore } from './sessions.ts';
-import { READ_TOKEN_MAX_BYTES, readTokenAllows, readTokenUpdateView, type ReadTokens } from './read-token.ts';
+import { READ_TOKEN_MAX_BYTES, readTokenAllows, readTokenNewsView, readTokenUpdateView, type ReadTokens } from './read-token.ts';
 import type { Redactor } from './read-redact.ts';
 import type { WebApp } from './web-assets.ts';
 import type { UpdateView } from './service/update-types.ts';
@@ -166,7 +166,7 @@ export interface ServiceViews {
   /** The online update (service/update.ts): versions, a manual check, and the request to the root update helper. */
   update?: { status(): unknown; check(): Promise<unknown>; apply(body: unknown): unknown };
   /** EQN 快讯与异动行情（service/news.ts，docs/news.md）；config.json 写了 `"news": false` 时没有。读取在连接开始前为 null。 */
-  news?: { flash(): unknown; moves(): unknown };
+  news?: { flash(): { items: readonly { url: string | null }[] } | null; moves(): { items: readonly { url: string | null }[] } | null };
   /** Var 与 Lighter（RH、主网）价差采集与模拟盘（service/varlighter.ts，docs/varlighter.md）；config.json 写了 `"varLighter": false` 时没有。 */
   varlighter?: VarLighterViews;
 }
@@ -884,7 +884,8 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     if (request.method === 'GET' && (url.pathname === '/api/news' || url.pathname === '/api/news/moves')) {
       if (!views?.news) return send(response, 404, { code: 'not_found', message: '本服务没有开启 EQN 快讯' });
       const view = url.pathname === '/api/news' ? views.news.flash() : views.news.moves();
-      return view === null ? send(response, 503, { code: 'not_ready', message: 'EQN 快讯正在启动' }) : send(response, 200, view);
+      if (view === null) return send(response, 503, { code: 'not_ready', message: 'EQN 快讯正在启动' });
+      return send(response, 200, tokenAnswers.has(response) ? readTokenNewsView(view) : view);
     }
     if (request.method === 'GET' && (url.pathname === '/api/logs' || url.pathname === '/api/logs/problems')) {
       if (!views?.logs) return send(response, 404, { code: 'not_found', message: '本服务没有页面日志' });

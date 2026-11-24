@@ -2,7 +2,7 @@
 // token, tools/varlighter/backtest.ts replays them with the repository's backtest, and the MCP tool chains both.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -15,7 +15,7 @@ import { openVarLighterStore } from '../src/varlighter/store.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, type GlobalParams, type SymbolParams } from '../src/varlighter/strategy.ts';
 import type { StateView } from '../src/varlighter/views.ts';
 import { PlatformError, handle, platformGet, type Get } from '../tools/mcp/readonly.ts';
-import { combinations, parseArgs, readRequest, runLocal } from '../tools/varlighter/backtest.ts';
+import { checkRequest, combinations, GAP_MS, loadSamples, parseArgs, readRequest, runLocal } from '../tools/varlighter/backtest.ts';
 import { lastSampleAt, parsePullArgs, pull, sampleFile } from '../tools/varlighter/pull.ts';
 import { bindAccounts, createHarness } from './harness.ts';
 
@@ -72,20 +72,22 @@ test('本机拉样本：按页增量续拉，重拉不重复；--enabled 含已�
     const lines = readFileSync(sampleFile(p.local, KEY), 'utf8').trim().split('\n').map(line => JSON.parse(line) as Sample);
     assert.deepEqual(lines, [...samples, ...more], '本机文件与服务器样本逐条一致');
 
+    // The server gives its backtest one baseline window before `from` (engine.ts), and so does the local one.
     const all = [...samples, ...more], to = all.at(-1)!.t, from = to - 24 * 3_600_000;
-    const server = runBacktest(KEY, 'crypto', all, from, to, PARAMS, GLOBAL);
+    const window = all.filter(item => item.t >= from - GLOBAL.windowHours * 3_600_000);
+    const server = runBacktest(KEY, 'crypto', window, from, to, PARAMS, GLOBAL);
     assert.ok(server.trades.length >= 20, `应有成交，实际 ${server.trades.length}`);
     const single = runLocal({ symbol: KEY, hours: 24, trades: 5 }, p.local) as { summary: unknown; trades: unknown[]; tradesShown: number; params: SymbolParams; global: GlobalParams };
     assert.deepEqual(single.summary, server.summary);
     assert.deepEqual(single.trades, server.trades.slice(-5));
     assert.deepEqual([single.params.entryBps, single.global.windowHours], [15, 2], '缺的参数用平台保存的');
     const changed = runLocal({ symbol: KEY, hours: 24, params: { entryBps: 30 } }, p.local) as { summary: unknown };
-    assert.deepEqual(changed.summary, runBacktest(KEY, 'crypto', all, from, to, { ...PARAMS, entryBps: 30 }, GLOBAL).summary);
+    assert.deepEqual(changed.summary, runBacktest(KEY, 'crypto', window, from, to, { ...PARAMS, entryBps: 30 }, GLOBAL).summary);
     const grid = runLocal({ symbol: KEY, hours: 24, grid: { entryBps: [15, 30], minNetBps: [3, 7] } }, p.local) as { combos: number; runs: { values: Record<string, number>; summary: { netUsd: number } }[] };
     assert.equal(grid.combos, 4);
     assert.ok(grid.runs.every((run, index) => index === 0 || grid.runs[index - 1]!.summary.netUsd >= run.summary.netUsd), '按净盈亏从高到低');
     const best = grid.runs[0]!;
-    assert.deepEqual(best.summary, runBacktest(KEY, 'crypto', all, from, to, { ...PARAMS, entryBps: best.values.entryBps! }, { ...GLOBAL, minNetBps: best.values.minNetBps! }).summary);
+    assert.deepEqual(best.summary, runBacktest(KEY, 'crypto', window, from, to, { ...PARAMS, entryBps: best.values.entryBps! }, { ...GLOBAL, minNetBps: best.values.minNetBps! }).summary);
     assert.throws(() => runLocal({ symbol: 'lighter:OLD' }, p.local), /请在请求里给出 kind/);
     assert.throws(() => runLocal({ symbol: 'rh:NONE', kind: 'crypto' }, p.local), /先运行 tools\/varlighter\/pull\.ts/);
     assert.throws(() => runLocal({ symbol: KEY, params: { entryBps: -1 } }, p.local));
@@ -114,6 +116,56 @@ test('本机拉样本：429 按 Retry-After 等待后继续，413 把每页减�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+// ---- 审查补充（docs/reviews/2026-11-25-varlighter-ai-readonly.md）----
+
+test('本机拉样本：同一配对并发拉取不重复；中断留下的半行先截掉再续拉', async () => {
+  const p = await platform();
+  try {
+    const samples = oscillating(0, 1_500);
+    p.writer.addSamples(samples);
+    const file = sampleFile(p.local, KEY);
+    const pulls = await Promise.all([1, 2, 3].map(() => pull({ get: p.get, dir: p.local, symbols: [KEY] })));
+    assert.equal(pulls.reduce((sum, done) => sum + done.results[0]!.added, 0), 1_500, '三次并发合计只写一遍');
+    const read = () => readFileSync(file, 'utf8').trim().split('\n').map(line => (JSON.parse(line) as Sample).t);
+    assert.deepEqual(read(), samples.map(item => item.t));
+    assert.equal(existsSync(`${file}.lock`), false, '锁已释放');
+
+    appendFileSync(file, '{"symbol":"rh:BTC","t":');
+    assert.equal(lastSampleAt(file), samples.at(-1)!.t, '半行被截掉');
+    assert.ok(readFileSync(file, 'utf8').endsWith('\n'));
+    const more = oscillating(1_500, 5);
+    p.writer.addSamples(more);
+    appendFileSync(file, '{"t":');
+    assert.equal((await pull({ get: p.get, dir: p.local, symbols: [KEY] })).results[0]!.added, 5);
+    assert.deepEqual(read(), [...samples, ...more].map(item => item.t));
+    appendFileSync(file, 'garbage\n');
+    assert.throws(() => lastSampleAt(file), /删除最后一行后重试/);
+  } finally { await p.close(); }
+});
+
+test('本机样本：服务器已过保留期时报告空档；载入时跳过不递增的行并列出超过 30 分钟的空档', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-vl-gap-'));
+  try {
+    const file = sampleFile(dir, KEY);
+    writeFileSync(file, `${JSON.stringify(sample(T0, 100))}\n`);
+    const later = T0 + 3 * 3_600_000;
+    const get: Get = async path => path === '/api/varlighter/state'
+      ? { rows: [], orphans: [], settings: { revision: 1, global: GLOBAL, symbols: {}, confirmed: [], venues: ['rh'] } }
+      : { symbol: KEY, columns: ['symbol', 't'], rows: [[KEY, later]], next: null, firstAt: later, retentionDays: 14 };
+    const { results } = await pull({ get, dir, symbols: [KEY] });
+    assert.deepEqual(results[0]!.gap, { from: T0, to: later });
+    assert.equal(results[0]!.added, 1);
+
+    const rows = [sample(T0, 100), sample(T0, 100), sample(T0 + 60_000, 100), sample(T0 - 60_000, 100), sample(T0 + 60_000 + GAP_MS + 1, 100)];
+    writeFileSync(file, `${rows.map(row => JSON.stringify(row)).join('\n')}
+`);
+    const loaded = loadSamples(file);
+    assert.deepEqual(loaded.samples.map(item => item.t), [T0, T0 + 60_000, T0 + 60_000 + GAP_MS + 1]);
+    assert.equal(loaded.skipped, 2);
+    assert.deepEqual(loaded.gaps, [{ from: T0 + 60_000, to: T0 + 60_000 + GAP_MS + 1 }]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('本机回测参数：命令行与 JSON 请求同一套校验；grid 展开全部组合', () => {
   assert.deepEqual(parseArgs(['--symbol', KEY, '--hours', '48', '--params', '{"entryBps":20}', '--trades', 'all']), { symbol: KEY, hours: 48, params: { entryBps: 20 }, trades: 'all' });
   assert.deepEqual(parseArgs(['--request', '{"symbol":"lighter:ETH","grid":{"exitBps":[0,1]}}']), { symbol: 'lighter:ETH', grid: { exitBps: [0, 1] } });
@@ -124,6 +176,12 @@ test('本机回测参数：命令行与 JSON 请求同一套校验；grid 展开
   assert.deepEqual(combinations({ a: [1, 2], b: ['x', 'y'] }), [{ a: 1, b: 'x' }, { a: 1, b: 'y' }, { a: 2, b: 'x' }, { a: 2, b: 'y' }]);
   assert.deepEqual(parsePullArgs(['--symbol', KEY, '--enabled']), { symbols: [KEY], enabled: true });
   assert.throws(() => parsePullArgs([]), /--symbol/);
+  // --check 只按参数规则核对，不读样本：没有 state.json 时用默认参数。
+  const empty = mkdtempSync(join(tmpdir(), 'tp-vl-check-'));
+  try {
+    assert.deepEqual(checkRequest({ symbol: KEY, grid: { entryBps: [10, 20], windowHours: [2, 4] } }, empty), { ok: true, combos: 4 });
+    assert.throws(() => checkRequest({ symbol: KEY, params: { entryBps: -1 } }, empty));
+  } finally { rmSync(empty, { recursive: true, force: true }); }
 });
 
 test('MCP varlighter_backtest：先增量拉取，再在新进程里用仓库代码回测，结果与本机回测一致', async () => {

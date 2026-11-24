@@ -5,6 +5,7 @@
 //   node tools/varlighter/backtest.ts --symbol rh:AAPL --hours 168 --params '{"entryBps":25}'
 //   node tools/varlighter/backtest.ts --symbol rh:AAPL --grid '{"entryBps":[15,20,25,30],"exitBps":[-5,0,5]}'
 //   node tools/varlighter/backtest.ts --request '{"symbol":"rh:AAPL","grid":{"entryBps":[20,30]}}'
+//   node tools/varlighter/backtest.ts --check --request '{…}'   (checks the request only, reads no sample)
 //
 // Missing parameters are filled from the platform's saved ones (state.json), checked like the page's backtest request.
 import { existsSync, readFileSync } from 'node:fs';
@@ -15,6 +16,8 @@ import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, readGlobalParams, readSymbolParams, typ
 import { dataDir, sampleFile, STATE_FILE, type LocalState } from './pull.ts';
 
 export const MAX_COMBOS = 200;
+/** A hole between two local samples longer than this is listed in the output (the service was down, or pulled too late). */
+export const GAP_MS = 30 * 60_000;
 const MAX_HOURS = 24 * 365;
 const KINDS: readonly AssetKind[] = ['equity', 'etf', 'crypto', 'metal', 'commodity', 'private', 'other'];
 
@@ -57,16 +60,27 @@ export function readRequest(raw: unknown): BacktestRequest {
   return raw as unknown as BacktestRequest;
 }
 
-/** One pair's local samples, oldest first; fields a newer server added are dropped, missing ones become null. */
-export function loadSamples(file: string): Sample[] {
+export interface LoadedSamples { samples: Sample[]; skipped: number; gaps: { from: number; to: number }[] }
+
+/**
+ * One pair's local samples, oldest first; fields a newer server added are dropped, missing ones become null. A sample not
+ * after the one before it (a file written twice over) is skipped and counted, so a damaged file never replays a minute
+ * twice without saying so; holes longer than GAP_MS are listed.
+ */
+export function loadSamples(file: string): LoadedSamples {
   if (!existsSync(file)) throw new RequestError(`本机没有这个配对的样本（${file}）：先运行 tools/varlighter/pull.ts`);
-  const samples: Sample[] = [];
+  const samples: Sample[] = [], gaps: LoadedSamples['gaps'] = [];
+  let skipped = 0;
   for (const line of readFileSync(file, 'utf8').split('\n')) {
     if (!line.trim()) continue;
     const raw = JSON.parse(line) as Record<string, unknown>;
-    samples.push(Object.fromEntries(SAMPLE_FIELDS.map(field => [field, raw[field] ?? null])) as unknown as Sample);
+    const sample = Object.fromEntries(SAMPLE_FIELDS.map(field => [field, raw[field] ?? null])) as unknown as Sample;
+    const before = samples.at(-1);
+    if (before && !(sample.t > before.t)) { skipped++; continue; }
+    if (before && sample.t - before.t > GAP_MS) gaps.push({ from: before.t, to: sample.t });
+    samples.push(sample);
   }
-  return samples;
+  return { samples, skipped, gaps };
 }
 
 /** Every combination of the grid's values, in the order given. */
@@ -80,27 +94,34 @@ const split = (values: Record<string, unknown>) => {
   return { symbol, global };
 };
 
-export function runLocal(request: BacktestRequest, dir: string): unknown {
+const readState = (dir: string): LocalState | null => {
   const statePath = join(dir, STATE_FILE);
-  if (!existsSync(statePath)) throw new RequestError(`没有 ${statePath}：先运行 tools/varlighter/pull.ts`);
-  const state = JSON.parse(readFileSync(statePath, 'utf8')) as LocalState;
+  return existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) as LocalState : null;
+};
+
+export function runLocal(request: BacktestRequest, dir: string): unknown {
+  const state = readState(dir);
+  if (!state) throw new RequestError(`没有 ${join(dir, STATE_FILE)}：先运行 tools/varlighter/pull.ts`);
   const kind = request.kind ?? state.pairs.find(pair => pair.key === request.symbol)?.kind;
   if (!kind) throw new RequestError(`state.json 里没有 ${request.symbol} 的类别（配对已失联）：请在请求里给出 kind`);
-  const samples = loadSamples(sampleFile(dir, request.symbol));
-  if (!samples.length) throw new RequestError('本机样本为空');
+  const { samples: all, skipped, gaps } = loadSamples(sampleFile(dir, request.symbol));
+  if (!all.length) throw new RequestError('本机样本为空');
   const savedSymbol = state.settings.symbols[request.symbol] ?? DEFAULT_SYMBOL;
   const savedGlobal = readGlobalParams({}, { ...DEFAULT_GLOBAL, ...state.settings.global });
-  const to = samples.at(-1)!.t;
+  const to = all.at(-1)!.t;
   const resolve = (overrides: Record<string, unknown>) => {
     const extra = split(overrides);
     const params: SymbolParams = readSymbolParams({ ...request.params, ...extra.symbol, enabled: true }, { ...DEFAULT_SYMBOL, ...savedSymbol });
     const global: GlobalParams = readGlobalParams({ ...request.global, ...extra.global }, savedGlobal);
-    const from = request.hours !== undefined ? to - request.hours * 3_600_000 : samples[0]!.t + global.windowHours * 3_600_000;
-    return { params, global, from };
+    const from = request.hours !== undefined ? to - request.hours * 3_600_000 : all[0]!.t + global.windowHours * 3_600_000;
+    // The server's backtest is given one baseline window before `from`, no more (engine.ts); the same slice here keeps
+    // everything that depends on the samples given, the first live Lighter top included, the same on both sides.
+    const warm = from - global.windowHours * 3_600_000;
+    return { params, global, from, samples: all.filter(sample => sample.t >= warm) };
   };
-  const span = { firstSample: samples[0]!.t, lastSample: to, localSamples: samples.length };
+  const span = { firstSample: all[0]!.t, lastSample: to, localSamples: all.length, skipped, gapCount: gaps.length, gaps: gaps.slice(-20) };
   if (!request.grid) {
-    const { params, global, from } = resolve({});
+    const { params, global, from, samples } = resolve({});
     const result = runBacktest(request.symbol, kind, samples, from, to, params, global);
     const shown = request.trades === 'all' ? result.trades : result.trades.slice(-(request.trades ?? 50));
     return { symbol: request.symbol, kind, ...span, from, to, samples: result.samples, params, global, summary: result.summary, open: result.open, tradesShown: shown.length, trades: shown };
@@ -109,11 +130,29 @@ export function runLocal(request: BacktestRequest, dir: string): unknown {
   const runs: { values: Record<string, unknown>; from: number; summary: BacktestSummary }[] = [];
   for (const values of combinations(request.grid)) {
     const resolved = resolve(values);
-    runs.push({ values, from: resolved.from, summary: runBacktest(request.symbol, kind, samples, resolved.from, to, resolved.params, resolved.global).summary });
+    runs.push({ values, from: resolved.from, summary: runBacktest(request.symbol, kind, resolved.samples, resolved.from, to, resolved.params, resolved.global).summary });
   }
   runs.sort((a, b) => b.summary.netUsd - a.summary.netUsd);
   const base = resolve({});
   return { symbol: request.symbol, kind, ...span, to, base: { params: base.params, global: base.global }, combos: runs.length, runs };
+}
+
+/**
+ * Checks a request with this checkout's parameter rules without reading any sample: each combination's values over the
+ * saved parameters (when state.json is there). The MCP tool runs it in a child process before pulling, so a parameter
+ * the strategy just gained is known without restarting the MCP server.
+ */
+export function checkRequest(request: BacktestRequest, dir: string): { ok: true; combos: number } {
+  const state = readState(dir);
+  const savedSymbol = { ...DEFAULT_SYMBOL, ...state?.settings.symbols[request.symbol] };
+  const savedGlobal = { ...DEFAULT_GLOBAL, ...state?.settings.global };
+  const combos = request.grid ? combinations(request.grid) : [{}];
+  for (const values of combos) {
+    const extra = split(values);
+    readSymbolParams({ ...request.params, ...extra.symbol, enabled: true }, savedSymbol);
+    readGlobalParams({ ...request.global, ...extra.global }, savedGlobal);
+  }
+  return { ok: true, combos: combos.length };
 }
 
 /** `--request <json>`, or the flags --symbol, --hours, --params, --global, --grid, --trades, --kind. */
@@ -136,7 +175,9 @@ export function parseArgs(argv: readonly string[]): BacktestRequest {
 
 if (import.meta.main) {
   try {
-    process.stdout.write(`${JSON.stringify(runLocal(parseArgs(process.argv.slice(2)), dataDir()))}\n`);
+    const argv = process.argv.slice(2), check = argv[0] === '--check';
+    const request = parseArgs(check ? argv.slice(1) : argv);
+    process.stdout.write(`${JSON.stringify(check ? checkRequest(request, dataDir()) : runLocal(request, dataDir()))}\n`);
   } catch (error) {
     process.stderr.write(`回测失败：${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;

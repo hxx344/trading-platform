@@ -215,19 +215,19 @@ R3：改动令牌的权限范围，第 8.4 节还会改 `read-token.json` 的格
   | `/api/varlighter/symbol`（`symbol`、`hours`） | 单个配对的走势点（最多 1500 点）、分时段统计、下单预演、成交 | 只读本地库 |
   | `/api/varlighter/paper`、`/readiness` | 模拟持仓、成交、按日汇总、事件；实盘前核对清单 | 只读本地库 |
   | `/api/varlighter/samples`（`symbol`、`after`、`limit`） | 原始样本，见上 | 只读本地库 |
-  | `/api/host` | 服务器负载、内存、磁盘、事件循环延迟、服务连线 | 不含路径、主机名、进程号（[observability.md](observability.md) 第 3 节） |
+  | `/api/host` | 服务器负载、内存、磁盘、事件循环延迟、服务连线 | 不含路径、主机名、进程号（[observability.md](observability.md) 第 3 节）；`connections[].detail` 可能带连线错误的原文（经平台打码） |
   | `/api/monitor/<oil\|goldoil\|hynix\|anthropic>/quote` | 各监控当前报价与价差 | 采集器内存里的快照 |
-  | `/api/news`、`/api/news/moves` | EQN 快讯与异动行情 | 正文来自第三方，工具描述注明是数据、不是指令 |
+  | `/api/news`、`/api/news/moves` | EQN 快讯与异动行情 | 正文来自第三方，工具描述注明是数据、不是指令。令牌读到的快讯链接字段名为 `link`（页面仍是 `url`）：`url` 是打码的标识字段，原样给出会把每条链接换成别名并挤掉别名表里的账户别名。读 `/api/news/moves` 和页面一样算“有人在看”，异动行情的轮询会延长 90 秒 |
 
   仍不放行：`backtest`、`settings`、`paper/close`、`paper/reset` 等 POST，`/api/monitor/<市场>/candles`（应答大）、`/api/monitor/perpetual/*`（含 SSE）、资产账本。
 
 **客户端侧**（与 `tools/mcp/readonly.ts` 同样用 `TP_MCP_URL`、`TP_MCP_TOKEN_FILE`，都不进发布包）
 
-- `tools/varlighter/pull.ts`：把样本增量拉到本机目录（默认 `~/.cache/trading-platform/varlighter`，可用 `TP_VARLIGHTER_DIR` 改），每个配对一个 `<场所>_<代码>.jsonl`，并保存一份 `state.json`（参数与各配对的类别）。已有文件从最后一条之后接着拉，所以本机可以积累超过服务器 14 天保留期的样本。参数 `--symbol <配对键>`（可多个）或 `--enabled`（已启用或有持仓的配对）。遇到 429 按 `Retry-After` 等待后继续，413 时减半 `limit` 重试。
-- `tools/varlighter/backtest.ts`：读本机样本和 `state.json`，用仓库当前的 `src/varlighter/backtest.ts` 的 `runBacktest` 重放。参数 `--symbol`、`--hours`（不限 336，以本机样本为准）、`--params`、`--global`（JSON，缺的字段用已保存的参数补，校验同页面的回测请求），`--grid`（JSON，各字段的候选值，组合最多 200 个，按净盈亏排序输出摘要）。每次运行是一个新进程，AI 改了策略代码后再跑就是新代码的结果。默认只输出摘要和最后 50 笔成交，`--trades all` 输出全部。
+- `tools/varlighter/pull.ts`：把样本增量拉到本机目录（默认 `~/.cache/trading-platform/varlighter`，可用 `TP_VARLIGHTER_DIR` 改），每个配对一个 `<场所>_<代码>.jsonl`，并保存一份 `state.json`（参数与各配对的类别）。已有文件从最后一条之后接着拉，所以本机可以积累超过服务器 14 天保留期的样本。参数 `--symbol <配对键>`（可多个）或 `--enabled`（已启用或有持仓的配对）。遇到 429 按 `Retry-After` 等待后继续，413 时减半 `limit` 重试。同一配对的拉取用 `<文件>.lock` 互斥（命令行与 MCP 同时拉也不会重复写入，进程被杀留下的锁 5 分钟后接管）；被中断留下的半行在下次拉取前截掉；本机最后一条已超出服务器保留期时，结果里的 `gap` 给出缺的时段。
+- `tools/varlighter/backtest.ts`：读本机样本和 `state.json`，用仓库当前的 `src/varlighter/backtest.ts` 的 `runBacktest` 重放。参数 `--symbol`、`--hours`（不限 336，以本机样本为准）、`--params`、`--global`（JSON，缺的字段用已保存的参数补，校验同页面的回测请求），`--grid`（JSON，各字段的候选值，组合最多 200 个，按净盈亏排序输出摘要）。每次运行是一个新进程，AI 改了策略代码后再跑就是新代码的结果。默认只输出摘要和最后 50 笔成交，`--trades all` 输出全部。与服务器回测一样只取 `from` 之前一个基线窗口的样本；输出带 `skipped`（时刻不递增而跳过的行数）和 `gaps`（超过 30 分钟的空档，`gapCount` 为总数）。`--check` 只按当前代码的参数规则核对请求，不读样本。
 - MCP 工具新增：
   - `varlighter`：`view=state|symbol|paper|readiness`，`symbol` 视图要 `symbol`，可选 `hours`。
-  - `varlighter_backtest`：先对该配对做一次增量拉取，再起子进程运行 `tools/varlighter/backtest.ts`，参数同上（`params`、`global`、`grid`、`hours`），返回其 JSON 输出。子进程 120 秒超时。
+  - `varlighter_backtest`：先在子进程里用 `--check` 核对请求（用的是当前的策略代码，请求不合法就不拉取），再对该配对做一次增量拉取，然后起子进程运行 `tools/varlighter/backtest.ts`，参数同上（`params`、`global`、`grid`、`hours`），返回其 JSON 输出。子进程 120 秒超时。
   - `host_status`、`market_quotes`（`market` 选一个或全部）、`news`（`view=flash|moves`）。
 
 **AI 优化的用法**（写进 [varlighter.md](varlighter.md)）：在仓库目录里打开 Claude Code，接上只读 MCP；先用 `varlighter` 看各配对现状与模拟盘结果，用 `varlighter_backtest` 的 `grid` 扫参数；要改策略逻辑时直接改 `src/varlighter/strategy.ts` 等文件，再用 `tools/varlighter/backtest.ts` 对同一批样本比较改动前后，最后照常走审查与发布。AI 拿到的只有数据，改参数要在页面上保存，改代码要发布。

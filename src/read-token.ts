@@ -234,9 +234,19 @@ export const READ_TOKEN_ROUTES: readonly { path: string | RegExp; query: readonl
   { path: '/api/varlighter/samples', query: ['symbol', 'after', 'limit'] },
   { path: '/api/host', query: [] },
   { path: /^\/api\/monitor\/(oil|goldoil|hynix|anthropic)\/quote$/, query: [] },
+  // Reading the moves keeps the EQN poll going for another 90 seconds (src/news/feed.ts): public, bounded, no credential.
   { path: '/api/news', query: [] },
   { path: '/api/news/moves', query: [] },
 ];
+
+/**
+ * What a token reads of the EQN feed: each item's `url` (eqn.news's page for it) renamed `link`. `url` is an identifier
+ * field for the masking, so the links would become aliases, and a few hundred a read would push real accounts' aliases
+ * out of the lookup table (docs/mcp.md 8.3).
+ */
+export function readTokenNewsView<T extends { items: readonly { url: string | null }[] }>(view: T): unknown {
+  return { ...view, items: view.items.map(({ url, ...item }) => ({ ...item, link: url })) };
+}
 
 /** Whether a read-only token may GET this URL: the path in READ_TOKEN_ROUTES and only its query parameters. */
 export function readTokenAllows(url: URL): boolean {

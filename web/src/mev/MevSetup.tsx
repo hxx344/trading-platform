@@ -30,7 +30,7 @@ export function SetupPanel({ setup, write, onChanged }: { setup: MevSetupView; w
   const blocker = deployBlocker(setup), deploy = setup.deploy, retry = !!deploy && setup.checkedAt - deploy.at >= REDEPLOY_AFTER_MS;
   const send = () => {
     if (!setup.operator || !confirm(deployConfirmText(setup))) return;
-    void write.run('deploy', () => api(`${MEV_BASE}/setup/deploy`, { body: { confirm: setup.operator } }), () => { void onChanged(); return '部署请求已提交，上链并核对后自动进入观察模式；发送结果不明时本页会写明'; });
+    void write.run('deploy', () => api(`${MEV_BASE}/setup/deploy`, { body: { confirm: setup.operator }, timeoutMs: 45_000 }), () => { void onChanged(); return '部署请求已提交，上链并核对后自动进入观察模式；发送结果不明时本页会写明'; });
   };
   return <>
     {setup.error ? <Callout tone="warning">{setup.error}</Callout> : null}

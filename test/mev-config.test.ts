@@ -148,7 +148,7 @@ test('/api/mev：没配时是待启用状态，录入接口校验且不回显私
 
   {
     const port = await freePort(), data = join(dir, 'plain');
-    const run = await startService({ config: parseServiceConfig({ secretsFile: '/etc/tp/secrets.json', pairs: [] }), secrets: { accounts: new Map(), feishu: null }, dir: data, port, fetchImpl: outside, app });
+    const run = await startService({ config: parseServiceConfig({ secretsFile: '/etc/tp/secrets.json', pairs: [] }), secrets: { accounts: new Map(), feishu: null }, dir: data, port, fetchImpl: outside, app, mevOptions: { fetchImpl: outside } });
     try {
       const { get, post } = await session(data, port);
       const idle = await get('/api/mev/state');
@@ -168,6 +168,7 @@ test('/api/mev：没配时是待启用状态，录入接口校验且不回显私
       const savedText = await saved.text();
       assert.deepEqual([saved.status, (JSON.parse(savedText) as { setup: { stage: string; operator: string } }).setup.stage, (JSON.parse(savedText) as { setup: { operator: string } }).setup.operator], [200, 'wallet', OPERATOR]);
       assert.ok(!savedText.includes('4c0883a6'), savedText);
+      assert.ok((JSON.parse(savedText) as { setup: { rpcError: string | null } }).setup.rpcError, '替身节点连不上：记在 rpcError');
       assert.ok(!(await (await get('/api/mev/state')).text()).includes('4c0883a6'));
       const gone = await post('/api/mev/setup/reset', { confirm: OPERATOR });
       assert.deepEqual([gone.status, ((await gone.json()) as { setup: { stage: string } }).setup.stage], [200, 'none']);

@@ -185,7 +185,7 @@ test('部署在途时可以换节点、可以移除：记录不丢；移除后�
   assert.equal(state().setup.deploy, null);
 });
 
-test('沿用的条件：合约的 operator 须仍是这个热钱包；节点应答不全时不部署；并发的部署请求只发一笔', async t => {
+test('沿用的条件：合约的 operator 须仍是这个热钱包；节点应答不全或 nonce 对不上时不部署', async t => {
   // 不开循环：录入时读一次，之后只由部署请求自己核对。
   const { chain, state, views } = setup(t, {}, 3);
   const other = '0x000000000000000000000000000000000000c0de';
@@ -198,11 +198,57 @@ test('沿用的条件：合约的 operator 须仍是这个热钱包；节点应�
   assert.equal(chain.state.sent.length, 0, '没确认是否部署过：不发');
   chain.state.failCode = false;
 
+  // 代码相符但读不到 operator()：同样不算查完。
+  chain.state.operator = OPERATOR; chain.state.failCall = true;
+  assert.equal(await code(() => views().deploy({ confirm: OPERATOR })), 'rpc');
+  chain.state.failCall = false; chain.state.operator = other;
+  // 扫描那一批读到的 nonce 与测算时不同（节点后端进度不一，或链上刚变）：不下「没有」的结论。
+  chain.state.hook = method => { if (method === 'eth_getCode') chain.state.nonce = 5; };
+  assert.equal(await code(() => views().deploy({ confirm: OPERATOR })), 'rpc');
+  chain.state.hook = null; chain.state.nonce = 4;
+  assert.equal(chain.state.sent.length, 0);
+
   // operator 换回来以后，部署请求在签名前自己找到它并沿用。
   chain.state.operator = OPERATOR;
   const adopted = await views().deploy({ confirm: OPERATOR }) as State;
   assert.deepEqual([adopted.setup.stage, chain.state.sent.length], ['ready', 0]);
   assert.equal(state().setup.error, null);
+});
+
+test('留下的合约地址：收款地址或热钱包不同、文件损坏、地址上没有预期代码时都不采用', async t => {
+  const { chain, views, dir, state } = setup(t, {}, 3);
+  const known = join(dir, KNOWN_FILE), executor = contractAddress(OPERATOR, 3), other = '0x000000000000000000000000000000000000c0de';
+  chain.state.deployed = true; chain.state.nonce = 40; // 超出扫描范围：只有留下的地址能找到它
+  writeFileSync(known, '{"operator":');
+  assert.equal(readKnown(dir), null);
+  writeFileSync(known, JSON.stringify({ operator: OPERATOR, owner: other, executor }));
+  assert.equal((await views().setup({ privateKey: KEY, owner: OWNER }) as State).setup.stage, 'wallet', '收款地址不同');
+  views().reset({ confirm: OPERATOR });
+  writeFileSync(known, JSON.stringify({ operator: other, owner: OWNER, executor }));
+  assert.equal((await views().setup({ privateKey: KEY, owner: OWNER }) as State).setup.stage, 'wallet', '热钱包不同');
+  views().reset({ confirm: OPERATOR });
+  writeFileSync(known, JSON.stringify({ operator: OPERATOR, owner: OWNER, executor: other }));
+  assert.equal((await views().setup({ privateKey: KEY, owner: OWNER }) as State).setup.stage, 'wallet', '地址上没有预期代码');
+  views().reset({ confirm: OPERATOR });
+  writeFileSync(known, JSON.stringify({ operator: OPERATOR, owner: OWNER, executor }));
+  assert.equal((await views().setup({ privateKey: KEY, owner: OWNER }) as State).setup.stage, 'ready');
+  assert.equal(state().setup.error, null);
+});
+
+test('请求途中被改动：扫描期间换节点返回 stale、不发；发送期间换节点，部署记录仍在', async t => {
+  const { chain, views, dir } = setup(t, {}, 2);
+  await views().setup({ privateKey: KEY, owner: OWNER });
+  let once = true;
+  chain.state.hook = method => { if (method === 'eth_getCode' && once) { once = false; views().rpc({ rpcUrl: SECRET_RPC }); } };
+  assert.equal(await code(() => views().deploy({ confirm: OPERATOR })), 'stale');
+  assert.deepEqual([chain.state.sent.length, readWallet(dir)!.deploy], [0, undefined]);
+
+  once = true;
+  chain.state.hook = method => { if (method === 'eth_sendRawTransaction' && once) { once = false; views().rpc({ rpcUrl: null }); } };
+  const after = await views().deploy({ confirm: OPERATOR }) as State;
+  chain.state.hook = null;
+  assert.equal(chain.state.sent.length, 1);
+  assert.deepEqual([after.setup.stage, after.setup.deploy?.hash, readWallet(dir)!.deploy?.hash, after.setup.defaultRpc], ['deploying', chain.state.sent[0]!.hash, chain.state.sent[0]!.hash, true]);
 });
 
 test('并发与重发：同时两次部署只发一笔；重发被拒收保留原记录；节点 nonce 倒退或已用掉时不发；停止后不接受写入', async t => {
@@ -221,6 +267,7 @@ test('并发与重发：同时两次部署只发一笔；重发被拒收保留�
   chain.state.send = 'reject';
   assert.equal(await code(() => views().deploy({ confirm: OPERATOR })), 'rejected');
   assert.deepEqual([state().setup.stage, readWallet(dir)!.deploy], ['deploying', original], '重发被拒收：原来那笔的记录还在');
+  assert.match(state().setup.error!, /结果不明/, '原来那笔仍是结果不明');
 
   chain.state.send = 'accept';
   chain.state.nonce = 1;

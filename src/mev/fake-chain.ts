@@ -56,6 +56,10 @@ export function createFakeChain(options: FakeChainOptions) {
     deployed: true,
     /** 置 true 时 eth_getCode 报错（模拟节点应答不全）。 */
     failCode: false,
+    /** 置 true 时对执行合约的 operator() 调用报错。 */
+    failCall: false,
+    /** 每个请求处理前调用（测试用它在请求途中改动状态）。 */
+    hook: null as ((method: string) => void) | null,
     /** 置为文本时所有请求以 HTTP 503 失败。 */
     down: false,
     /** 发送的处理方式：accept 收下；reject 由节点拒绝；drop 传输失败（结果不明）。 */
@@ -124,7 +128,7 @@ export function createFakeChain(options: FakeChainOptions) {
     if (target === GAS_PRICE_ORACLE) return { result: word(2_000_000_000n) };
     if (target !== executor) return { result: '0x' };
     if (name === selector('owner()')) return { result: word(BigInt(owner)) };
-    if (name === selector('operator()')) return { result: word(BigInt(state.operator)) };
+    if (name === selector('operator()')) return state.failCall ? { error: { code: -32005, message: 'limit exceeded' } } : { result: word(BigInt(state.operator)) };
     if (name === selector('factoryKind(address)')) { const factory = FACTORIES.find(entry => entry.address === new AbiReader('0x' + data.slice(10)).address(0)); return { result: word(BigInt(factory?.kind ?? 0)) }; }
     const profit = state.profit(decodeExecute(data));
     return profit === null || profit <= 0n ? { error: reverted } : { result: word(profit) };
@@ -141,6 +145,7 @@ export function createFakeChain(options: FakeChainOptions) {
 
   function handle(method: string, params: readonly unknown[]): { result: unknown } | { error: unknown } {
     state.calls.push(method);
+    state.hook?.(method);
     switch (method) {
       case 'eth_chainId': return { result: toQuantity(state.chainId) };
       case 'eth_getCode': if (state.failCode) return { error: { code: -32005, message: 'limit exceeded' } }; return { result: state.deployed && lower(String(params[0])) === executor ? expectedRuntimeCode(owner) : '0x' };

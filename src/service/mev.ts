@@ -133,10 +133,16 @@ export function openMev(source: MevSource, dir: string, options: MevOptions, hoo
     let complete = true;
     for (let start = 0; start < candidates.length; start += ADOPT_BATCH) {
       const part = candidates.slice(start, start + ADOPT_BATCH);
-      const answers = await client.batch(part.flatMap(target => [
-        { method: 'eth_getCode', params: [target, 'latest'] },
-        { method: 'eth_call', params: [{ to: target, data: selector('operator()') }, 'latest'] },
-      ]));
+      // 每批带上 nonce：与调用方读到的不同，说明这一批出自另一个进度的节点后端（或链上刚变），不能据此说「没有」。
+      const answers = await client.batch([
+        ...part.flatMap(target => [
+          { method: 'eth_getCode', params: [target, 'latest'] },
+          { method: 'eth_call', params: [{ to: target, data: selector('operator()') }, 'latest'] },
+        ]),
+        { method: 'eth_getTransactionCount', params: [address, 'latest'] },
+      ]);
+      const seen = answers[part.length * 2]!;
+      if (!seen.ok || Number(quantity(seen.result)) !== nonce) return undefined;
       for (const [index, target] of part.entries()) {
         const found = answers[index * 2]!, role = answers[index * 2 + 1]!;
         if (!found.ok) { complete = false; continue; }
@@ -247,6 +253,7 @@ export function openMev(source: MevSource, dir: string, options: MevOptions, hoo
         let plan;
         try { plan = await planDeployment(rpc, before, BASE_CHAIN_ID, before.deploy); } catch (cause) {
           if (cause instanceof MevError) throw cause;
+          if (at !== generation) throw new MevError(409, 'stale', '热钱包或节点刚被修改，刷新后重试');
           throw new MevError(502, 'rpc', `读取链上状态失败：${errorText(cause)}`);
         }
         if (at !== generation || wallet !== before) throw new MevError(409, 'stale', '热钱包或节点刚被修改，刷新后重试');
@@ -255,21 +262,23 @@ export function openMev(source: MevSource, dir: string, options: MevOptions, hoo
         if (!before.deploy) {
           // 签名前按当前 nonce 再找一遍已部署的合约：有就沿用，读不全就不发（「没读到」不等于没有）。
           let found;
-          try { found = await findDeployed(rpc, before, plan.nonce); } catch (cause) { throw new MevError(502, 'rpc', `读取链上状态失败：${errorText(cause)}`); }
+          try { found = await findDeployed(rpc, before, plan.nonce); } catch (cause) { if (at !== generation) throw new MevError(409, 'stale', '热钱包或节点刚被修改，刷新后重试'); throw new MevError(502, 'rpc', `读取链上状态失败：${errorText(cause)}`); }
           if (at !== generation || wallet !== before) throw new MevError(409, 'stale', '热钱包或节点刚被修改，刷新后重试');
           if (found === undefined) throw new MevError(502, 'rpc', '没能确认这个热钱包是否已经部署过合约（节点应答不全），稍后重试');
           if (found) { adopt(before, found, '沿用这个热钱包已部署的合约，地址'); return state(); }
         }
         if (plan.balance < plan.costWei) throw new MevError(409, 'low_balance', `热钱包余额 ${weiToEth(plan.balance).toFixed(6)} ETH 不够部署：按费用上限需要约 ${weiToEth(plan.costWei).toFixed(6)} ETH。给热钱包转入 ETH（Base 链）后重试`);
-        const signed = signDeployment(plan, before.privateKey);
+        if (shut) throw new MevError(503, 'stopping', '服务正在停止');
+        const signed = signDeployment(plan, before.privateKey), priorError = error;
         // 先落盘再发送：发送结果不明时，重启后仍知道该去哪个地址核对。同一个 nonce 上不论哪一笔上链，合约地址都一样。
         const next: MevWallet = { ...before, deploy: { nonce: plan.nonce, hash: signed.hash, maxFeePerGas: plan.tx.maxFeePerGas.toString(), maxPriorityFeePerGas: plan.tx.maxPriorityFeePerGas.toString(), at: now() } };
         save(next); missing = 0; error = null;
         try { await client.request('eth_sendRawTransaction', [signed.raw]); } catch (cause) {
           // 节点明确拒收（不是超时或断连）：这一笔没有进交易池。恢复发送前的记录（首次发送即撤掉，可以马上重试；
           // 重发则保留原来那笔的哈希与时间），把拒收原因交给页面。链上 nonce 变化后会重新扫描已部署的合约。
-          if (cause instanceof RpcError && wallet === next) {
-            save(before); scannedAt = null;
+          if (cause instanceof RpcError) {
+            if (wallet === next) { save(before); scannedAt = null; error = before.deploy ? priorError : null; }
+            hooks.log(`mev: 节点拒收部署交易 ${signed.hash}：${errorText(cause)}`);
             throw new MevError(502, 'rejected', `节点拒收部署交易：${errorText(cause)}`);
           }
           hooks.log(`mev: 部署交易 ${signed.hash} 发送结果不明：${errorText(cause)}`);

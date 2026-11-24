@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { createExecutorServer, type ServiceViews } from '../src/http.ts';
 import { LoginThrottle } from '../src/login-password.ts';
-import { READ_TOKEN_FILE, READ_TOKEN_ROUTES, READ_TOKEN_TTL_MS, createReadTokens, readTokenAllows } from '../src/read-token.ts';
+import { READ_SCOPES, READ_TOKEN_FILE, READ_TOKEN_MAX, READ_TOKEN_ROUTES, READ_TOKEN_TTL_MS, createReadTokens, readTokenAllows, readTokenScope, type ReadScope } from '../src/read-token.ts';
 import { createRedactor, identifierField } from '../src/read-redact.ts';
 import { createOndoModule } from '../src/service/ondo.ts';
 import type { UpdateView } from '../src/service/update-types.ts';
@@ -48,8 +48,8 @@ async function start({ now = () => clock.now, extra = {} as Partial<ServiceViews
   const login = await fetch(`${base}/login?token=${TOKEN}`, { redirect: 'manual' });
   const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0]!;
   const sessionPost = (path: string, body: unknown = {}) => fetch(base + path, { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }, body: JSON.stringify(body) });
-  const generate = async () => {
-    const response = await sessionPost('/api/read-token/generate');
+  const generate = async (scopes: readonly ReadScope[] = READ_SCOPES, name = 'test') => {
+    const response = await sessionPost('/api/read-token/generate', { name, scopes });
     assert.equal(response.status, 200);
     return (await response.json() as { token: string }).token;
   };
@@ -60,6 +60,7 @@ async function start({ now = () => clock.now, extra = {} as Partial<ServiceViews
   };
 }
 const clock = { now: Date.UTC(2026, 10, 19) };
+const ALL = { name: 'MCP', scopes: [...READ_SCOPES] };
 
 test('只读令牌：没有令牌文件、令牌错误一律 401；连续错误后锁定为 429；未配置令牌功能时同样 401', async () => {
   clock.now = Date.UTC(2026, 10, 19);
@@ -69,7 +70,7 @@ test('只读令牌：没有令牌文件、令牌错误一律 401；连续错误�
     const token = await s.generate();
     assert.equal((await s.read(token, '/api/status')).status, 200);
     await new Promise(resolve => setTimeout(resolve, 20));
-    const used = s.tokens!.view();
+    const used = s.tokens!.view().tokens[0]!;
     clock.now += 1_000;
     assert.equal((await s.read(`${token}x`, '/api/status')).status, 401);
     assert.equal((await fetch(`${s.base}/api/status`, { headers: { authorization: token } })).status, 401, '缺少 Bearer');
@@ -77,7 +78,7 @@ test('只读令牌：没有令牌文件、令牌错误一律 401；连续错误�
     for (let i = 0; i < 12 && !locked; i += 1) locked = (await s.read(`tpr_${'B'.repeat(43)}`, '/api/status')).status === 429;
     assert.ok(locked, '连续错误后锁定');
     await new Promise(resolve => setTimeout(resolve, 20));
-    assert.deepEqual([s.tokens!.view().lastUsedAt, s.tokens!.view().requests24h], [used.lastUsedAt, used.requests24h], '被拒的请求不算使用');
+    assert.deepEqual([s.tokens!.view().tokens[0]!.lastUsedAt, s.tokens!.view().tokens[0]!.requests24h], [used.lastUsedAt, used.requests24h], '被拒的请求不算使用');
     const logged = s.lines.length;
     for (let i = 0; i < 5; i += 1) assert.equal((await s.read(`tpr_${'B'.repeat(43)}`, '/api/status')).status, 429);
     assert.equal(s.lines.length, logged, '锁定期间的请求不写日志');
@@ -106,6 +107,7 @@ test('只读令牌：白名单外的 GET、所有 POST、页面、静态资源�
       '/api/varlighter/backtest', '/api/varlighter/settings', '/api/varlighter/paper/close', '/api/varlighter/paper/reset', '/api/monitor/perpetual/quote', '/api/monitor/oil/alerts/x', '/api/monitor/variational/quote'];
     assert.ok(literals.length > 30, `路由里的路径字面量：${literals.length}`);
     for (const path of [...literals, ...dynamic]) {
+      if (path === '/api/read-token/self') continue;   // the token's own route, below
       const allowed = readTokenAllows(new URL(path, 'http://x'));
       const response = await s.read(token, path);
       if (allowed) assert.notEqual(response.status, 403, path);
@@ -173,11 +175,16 @@ test('只读令牌：应答按值与按字段打码，原值不出现；同一�
     assert.equal((await (await s.sessionPost('/api/read-token/lookup', { alias: acct })).json() as { original: string }).original, 'gate-998877');
     assert.equal((await s.sessionPost('/api/read-token/lookup', { alias: 'nope' })).status, 400);
     assert.equal((await s.read(token, '/api/read-token/lookup', { method: 'POST', headers: { 'content-type': 'application/json', 'x-pa-executor': '1' }, body: JSON.stringify({ alias: addr }) })).status, 403);
-    const next = await s.generate();
-    assert.equal((await s.read(token, '/api/status')).status, 401, '重新生成后旧令牌立即失效');
-    const renamed = await (await s.read(next, '/api/status')).text();
-    assert.ok(!renamed.includes(addr), '换令牌后别名改变');
+    // A second token: the first keeps working and both read the same aliases (one key, docs/mcp.md 8.4).
+    const second = await s.generate(['system'], '第二个');
+    assert.equal((await s.read(token, '/api/status')).status, 200, '多个令牌并存');
+    assert.ok((await (await s.read(second, '/api/status')).text()).includes(addr), '各令牌别名一致');
+    // All revoked: the aliases and the key go, the next token reads new aliases.
+    assert.equal((await s.sessionPost('/api/read-token/revoke')).status, 200);
+    assert.equal((await s.read(token, '/api/status')).status, 401);
     assert.equal((await (await s.sessionPost('/api/read-token/lookup', { alias: addr })).json() as { original: unknown }).original, null);
+    const next = await s.generate();
+    assert.ok(!(await (await s.read(next, '/api/status')).text()).includes(addr), '全部吊销后再生成，别名改变');
   } finally { await s.close(); }
 });
 
@@ -201,18 +208,29 @@ test('只读令牌：每分钟 30 次之后 429，下一分钟恢复；应答超
     assert.equal(audit.length, 32);
     assert.ok(audit.every(line => !line.includes(token)));
     assert.match(audit[0]!, /GET \/api\/oil\/state → 413/);
-    assert.equal(s.tokens!.view().requests24h, 32);
+    assert.equal(s.tokens!.view().tokens[0]!.requests24h, 32);
   } finally { await s.close(); }
 });
 
-test('只读令牌：同时最多 2 个请求在处理', () => {
+test('只读令牌：每个令牌同时最多 2 个请求在处理，全部令牌合计最多 4 个；每分钟 30 次按令牌分别计', () => {
   const tokens = createReadTokens({ dir: mkdtempSync(join(tmpdir(), 'tp-read-token-')), now: () => 0, log: () => {} });
-  const first = tokens.admit(), second = tokens.admit();
+  const first = tokens.admit('a'), second = tokens.admit('a');
   assert.ok(first && second);
-  assert.equal(tokens.admit(), null);
+  assert.equal(tokens.admit('a'), null);
   first();
   first();
-  assert.ok(tokens.admit(), '释放后可再进，重复释放不多算');
+  const third = tokens.admit('a');
+  assert.ok(third, '释放后可再进，重复释放不多算');
+  const b1 = tokens.admit('b'), b2 = tokens.admit('b');
+  assert.ok(b1 && b2, '另一个令牌有自己的额度');
+  assert.equal(tokens.admit('c'), null, '合计 4 个在处理');
+  b1();
+  const c1 = tokens.admit('c');
+  assert.ok(c1);
+  second(); third(); b2(); c1();
+  for (let i = 0; i < 26; i += 1) tokens.admit('a')!();
+  assert.equal(tokens.admit('a'), null, '令牌 a 这一分钟已用满 30 次');
+  assert.ok(tokens.admit('d'), '令牌 d 不受影响');
 });
 
 test('只读令牌：文件只存摘要且为 600；吊销后立即 401；到期后 401；到期前 7 天与 1 天各提醒一次，重启不重复', async () => {
@@ -223,13 +241,13 @@ test('只读令牌：文件只存摘要且为 600；吊销后立即 401；到期
     const file = join(s.dir, READ_TOKEN_FILE);
     assert.equal(statSync(file).mode & 0o777, 0o600);
     assert.ok(!readFileSync(file, 'utf8').includes(token.slice(4)), '文件里没有令牌明文');
-    const view = await (await fetch(`${s.base}/api/read-token`, { headers: { cookie: s.cookie } })).json() as { state: string; expiresAt: number; warn: boolean };
+    const view = (await (await fetch(`${s.base}/api/read-token`, { headers: { cookie: s.cookie } })).json() as { tokens: { state: string; expiresAt: number; warn: boolean }[] }).tokens[0]!;
     assert.equal(view.state, 'active');
     assert.equal(view.expiresAt, clock.now + READ_TOKEN_TTL_MS);
     assert.equal(view.warn, false);
     assert.deepEqual(s.tokens!.dueReminders(), []);
     clock.now = view.expiresAt - 7 * 86_400_000 + 1000;
-    assert.equal(s.tokens!.view().warn, true);
+    assert.equal(s.tokens!.view().tokens[0]!.warn, true);
     assert.equal(s.tokens!.dueReminders().length, 1);
     assert.deepEqual(s.tokens!.dueReminders(), []);
     // A restart reads the reminders already sent from the file.
@@ -258,7 +276,7 @@ test('只读令牌：到期提醒交给通知后才标记已发，通知抛错�
   const at = { now: Date.UTC(2026, 10, 19) };
   const open = () => createReadTokens({ dir, now: () => at.now, log: () => {} });
   try {
-    open().generate();
+    open().generate(ALL);
     at.now += READ_TOKEN_TTL_MS - 7 * 86_400_000 + 1000;
     assert.throws(() => open().dueReminders(() => { throw new Error('database is locked'); }), /database is locked/);
     const sent: string[] = [];
@@ -368,3 +386,133 @@ test('只读令牌：执行器状态、划转、ADL 与 Ondo 用真实视图读�
   }
 });
 
+
+test('只读令牌范围：范围外的接口 403 token_scope 并写明范围；/api/read-token/self 只答令牌本身，会话 404', async () => {
+  clock.now = Date.UTC(2026, 10, 19);
+  const s = await start();
+  try {
+    const system = await s.generate(['system'], '只看系统');
+    assert.equal((await s.read(system, '/api/status')).status, 200);
+    for (const [path, scope] of [['/api/state', 'portfolio'], ['/api/news', 'public'], ['/api/oil/state', 'portfolio']] as const) {
+      const refused = await s.read(system, path);
+      assert.equal(refused.status, 403, path);
+      const body = await refused.json() as { code: string; scope: string; message: string };
+      assert.deepEqual([body.code, body.scope], ['token_scope', scope], path);
+      assert.match(body.message, new RegExp(scope));
+      assert.equal(readTokenScope(new URL(path, 'http://x')), scope);
+    }
+    const asset = await s.read(system, '/api/asset/state');
+    assert.equal(asset.status, 403, '资产账本不在任何范围');
+    assert.equal((await asset.json() as { code: string }).code, 'read_only');
+    const self = await s.read(system, '/api/read-token/self');
+    assert.equal(self.status, 200);
+    const body = await self.json() as Record<string, unknown>;
+    assert.deepEqual(Object.keys(body).sort(), ['expiresAt', 'id', 'name', 'scopes']);
+    assert.deepEqual([body.name, body.scopes, body.expiresAt], ['只看系统', ['system'], clock.now + READ_TOKEN_TTL_MS]);
+    assert.equal((await s.read(system, '/api/read-token/self?x=1')).status, 403, '带查询参数不放行');
+    assert.equal((await fetch(`${s.base}/api/read-token/self`, { headers: { cookie: s.cookie } })).status, 404, '会话没有这个接口');
+    assert.equal((await fetch(`${s.base}/api/read-token/self`)).status, 401);
+    assert.equal((await s.read(`tpr_${'Q'.repeat(43)}`, '/api/read-token/self')).status, 401);
+    assert.equal(readTokenScope(new URL('/api/asset/state', 'http://x')), null);
+    assert.ok(READ_TOKEN_ROUTES.every(route => READ_SCOPES.includes(route.scope)));
+  } finally { await s.close(); }
+});
+
+test('只读令牌：最多 8 个，第 9 个 409；名称与范围逐项校验 400；吊销单个只影响它，未知编号 404', async () => {
+  clock.now = Date.UTC(2026, 10, 19);
+  const s = await start();
+  try {
+    assert.equal((await s.sessionPost('/api/read-token/generate', {})).status, 400);
+    for (const body of [{ name: '', scopes: ['public'] }, { name: 'x'.repeat(41), scopes: ['public'] }, { name: 'a\nb', scopes: ['public'] }, { name: 'a', scopes: [] }, { name: 'a', scopes: ['asset'] }, { name: 'a', scopes: 'public' }]) {
+      const response = await s.sessionPost('/api/read-token/generate', body);
+      assert.equal(response.status, 400, JSON.stringify(body));
+      assert.equal((await response.json() as { code: string }).code, 'token_input');
+    }
+    const tokens: string[] = [];
+    for (let i = 0; i < READ_TOKEN_MAX; i += 1) tokens.push(await s.generate(['public'], `客户端 ${i}`));
+    const ninth = await s.sessionPost('/api/read-token/generate', { name: '第九个', scopes: ['public'] });
+    assert.equal(ninth.status, 409);
+    assert.equal((await ninth.json() as { code: string }).code, 'token_limit');
+    const listed = s.tokens!.view().tokens;
+    assert.equal(listed.length, READ_TOKEN_MAX);
+    assert.equal(new Set(listed.map(token => token.id)).size, READ_TOKEN_MAX);
+    assert.equal((await s.sessionPost('/api/read-token/revoke', { id: listed[2]!.id })).status, 200);
+    assert.equal((await s.read(tokens[2]!, '/api/read-token/self')).status, 401, '吊销的立即失效');
+    assert.equal((await s.read(tokens[3]!, '/api/read-token/self')).status, 200, '其余不受影响');
+    assert.equal(s.tokens!.view().tokens.length, READ_TOKEN_MAX - 1);
+    assert.equal((await s.sessionPost('/api/read-token/revoke', { id: listed[2]!.id })).status, 404);
+    assert.equal((await s.sessionPost('/api/read-token/revoke', { id: '../x' })).status, 400);
+    assert.equal((await s.sessionPost('/api/read-token/generate', { name: '补上', scopes: ['public'] })).status, 200, '吊销一个后可再生成');
+    assert.ok(s.lines.some(line => line.includes(`编号 ${listed[2]!.id}（客户端 2）`)));
+  } finally { await s.close(); }
+});
+
+test('只读令牌：版本 1 的文件读作一个名为 MCP、三个范围都有的令牌，编号、日期、密钥与别名不变，下次写入改为版本 2', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-read-token-'));
+  const at = { now: Date.UTC(2026, 10, 19) };
+  const open = () => createReadTokens({ dir, now: () => at.now, log: () => {} });
+  try {
+    const { token } = open().generate({ name: '临时', scopes: ['public'] });
+    const file = join(dir, READ_TOKEN_FILE);
+    const v2 = JSON.parse(readFileSync(file, 'utf8')) as { redactKey: string; tokens: Record<string, unknown>[] };
+    const { name: _name, scopes: _scopes, ...single } = v2.tokens[0]!;
+    writeFileSync(file, JSON.stringify({ version: 1, redactKey: v2.redactKey, aliases: [['addr-00000001', ADDRESS]], ...single }), { mode: 0o600 });
+    const tokens = open();
+    assert.deepEqual(tokens.check(token), { ok: true, id: single.id, name: 'MCP', scopes: [...READ_SCOPES] });
+    assert.equal(tokens.lookup('addr-00000001'), ADDRESS);
+    assert.deepEqual(tokens.view().tokens.map(item => [item.id, item.createdAt, item.expiresAt]), [[single.id, single.createdAt, single.expiresAt]]);
+    tokens.generate({ name: '第二个', scopes: ['system'] });
+    const written = JSON.parse(readFileSync(file, 'utf8')) as { version: number; redactKey: string; tokens: { name: string }[] };
+    assert.equal(written.version, 2);
+    assert.equal(written.redactKey, v2.redactKey, '密钥不变，别名一致');
+    assert.deepEqual(written.tokens.map(item => item.name), ['MCP', '第二个']);
+    writeFileSync(file, JSON.stringify({ version: 3, redactKey: v2.redactKey, aliases: [], tokens: [] }), { mode: 0o600 });
+    assert.match(open().view().error ?? '', /格式无效/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('只读令牌：全部吊销后别名与密钥一起换掉；令牌文件被外部删除后下一次请求就 401，统计不写回文件', async () => {
+  clock.now = Date.UTC(2026, 10, 19);
+  const s = await start();
+  try {
+    const file = join(s.dir, READ_TOKEN_FILE);
+    const keyOf = () => (JSON.parse(readFileSync(file, 'utf8')) as { redactKey: string }).redactKey;
+    const first = await s.generate(['system'], '甲');
+    const key = keyOf();
+    await s.generate(['public'], '乙');
+    assert.equal(keyOf(), key, '再生成不换密钥');
+    assert.equal((await s.sessionPost('/api/read-token/revoke')).status, 200);
+    assert.deepEqual(s.tokens!.view().tokens, []);
+    const third = await s.generate(['system'], '丙');
+    assert.notEqual(keyOf(), key, '全部吊销后再生成换密钥');
+    assert.equal((await s.read(first, '/api/status')).status, 401);
+    assert.equal((await s.read(third, '/api/status')).status, 200);
+    rmSync(file);
+    assert.equal((await s.read(third, '/api/status')).status, 401, '删除文件即全部吊销');
+    s.tokens!.flush();
+    assert.throws(() => statSync(file), /ENOENT/, '不写回');
+    assert.deepEqual(s.tokens!.view().tokens, []);
+    assert.ok(s.lines.some(line => line.includes('文件已被删除')));
+  } finally { await s.close(); }
+});
+
+test('只读令牌：到期提醒按令牌分别发，文字写明名称与编号', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-read-token-'));
+  const start0 = Date.UTC(2026, 10, 19);
+  const at = { now: start0 };
+  const open = () => createReadTokens({ dir, now: () => at.now, log: () => {} });
+  try {
+    const a = open().generate({ name: '甲', scopes: ['public'] });
+    at.now += 10 * 86_400_000;
+    const b = open().generate({ name: '乙', scopes: ['system'] });
+    at.now = start0 + READ_TOKEN_TTL_MS - 7 * 86_400_000 + 1000;
+    const firstRound = open().dueReminders();
+    assert.equal(firstRound.length, 1);
+    assert.match(firstRound[0]!, new RegExp(`「甲」（编号 ${a.id}）将在 7 天内到期`));
+    at.now += 10 * 86_400_000;
+    const second = open().dueReminders();
+    assert.equal(second.length, 1, '甲已到期不再提醒，乙到了 7 天');
+    assert.match(second[0]!, new RegExp(`「乙」（编号 ${b.id}）`));
+    assert.deepEqual(open().dueReminders(), []);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

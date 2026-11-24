@@ -50,7 +50,7 @@ async function platform() {
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const cookie = ((await fetch(`${base}/login?token=vl-local-access-01`, { redirect: 'manual' })).headers.get('set-cookie') ?? '').split(';')[0]!;
-  const { token } = await (await fetch(`${base}/api/read-token/generate`, { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }, body: '{}' })).json() as { token: string };
+  const { token } = await (await fetch(`${base}/api/read-token/generate`, { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }, body: '{"name":"test","scopes":["public","system","portfolio"]}' })).json() as { token: string };
   return {
     local, writer, get: platformGet({ base: new URL(base), token }),
     async close() { writer.close(); await new Promise(resolve => server.close(resolve)); h.dispose(); holder.engine?.close(); rmSync(dir, { recursive: true, force: true }); rmSync(local, { recursive: true, force: true }); },

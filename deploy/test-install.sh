@@ -431,14 +431,15 @@ check '非终端没有 --password-stdin 时不读密码' '[[ $status -ne 0 && ! 
 printf 'short\n' | run --set-password --password-stdin && status=0 || status=$?
 check '过短的登录密码被拒' '[[ $status -ne 0 && ! -e "$TP_CONF_DIR/login-password" ]] && grep -q "至少 8 个字符" "$tmp/out"'
 : >"$TP_DATA_DIR/http-session"
+printf '{}\n' >"$TP_DATA_DIR/read-token.json"
 printf 'wrong-check-123\n' | run --package "$tmp/c" --set-password --password-stdin && status=0 || status=$?
-check '配置检查失败时撤销新密码、不作废会话' '[[ $status -ne 0 && ! -e "$TP_CONF_DIR/login-password" && -e "$TP_DATA_DIR/http-session" ]] && grep -q "已恢复设置密码前的配置文件" "$tmp/out"'
+check '配置检查失败时撤销新密码、不作废会话与令牌' '[[ $status -ne 0 && ! -e "$TP_CONF_DIR/login-password" && -e "$TP_DATA_DIR/http-session" && -e "$TP_DATA_DIR/read-token.json" ]] && grep -q "已恢复设置密码前的配置文件" "$tmp/out"'
 current_before=$(readlink -f "$TP_APP_DIR/current")
 # No --version or --package: the installed release is kept, nothing is fetched (TP_RELEASE_BASE points nowhere).
 printf 'test-password-123\n' | TP_RELEASE_BASE=https://127.0.0.1:9/none run --set-password --password-stdin && status=0 || status=$?
 check '只改密码时沿用已装版本、不联网' '[[ $status -eq 0 && "$(readlink -f "$TP_APP_DIR/current")" == "$current_before" ]] && grep -q "程序包（未变化）" "$tmp/out"'
 check '设置登录密码只存摘要且为 600' '[[ $status -eq 0 && "$(stat -c %a "$TP_CONF_DIR/login-password")" == 600 ]] && grep -q "^scrypt:32768:8:1:" "$TP_CONF_DIR/login-password" && ! grep -q "test-password-123" "$TP_CONF_DIR/login-password" "$tmp/out"'
-check '设置密码后旧会话作废、配置检查与提示认出密码' '[[ ! -e "$TP_DATA_DIR/http-session" ]] && grep -q "登录密码已设置" "$tmp/out" && grep -q "用登录密码登录" "$tmp/out" && grep -q "登录密码（已打开的页面须重新登录）" "$tmp/out"'
+check '设置密码后旧会话与只读令牌作废、配置检查与提示认出密码' '[[ ! -e "$TP_DATA_DIR/http-session" && ! -e "$TP_DATA_DIR/read-token.json" ]] && grep -q "登录密码已设置" "$tmp/out" && grep -q "用登录密码登录" "$tmp/out" && grep -q "登录密码（已打开的页面须重新登录，只读接口令牌已全部吊销）" "$tmp/out"'
 "$TP_NODE_BIN" -e 'const fs = require("fs"), p = process.argv[1], c = JSON.parse(fs.readFileSync(p, "utf8")); c.host = "100.64.0.5"; fs.writeFileSync(p, JSON.stringify(c, null, 2));' "$TP_CONF_DIR/config.json"
 run --package "$tmp/b" && status=0 || status=$?
 check '配置 host 后直接给出页面地址' '[[ $status -eq 0 ]] && grep -q "监听 127.0.0.1 与 100.64.0.5，登录密码已设置" "$tmp/out" && grep -q "注意：100.64.0.5 现在不在本机网卡上" "$tmp/out" && grep -q "页面：http://100.64.0.5:4720/ ，用登录密码登录" "$tmp/out"'

@@ -914,7 +914,7 @@ test('接口：未登录 401、POST 缺页面标记 403、只读令牌不能读�
     const unknown = await post('/api/varlighter/paper/close', { symbol: 'rh:BTC' });
     assert.equal(unknown.status, 404);
     assert.equal((await unknown.json() as { code: string }).code, 'not_found');
-    const generated = await post('/api/read-token/generate', {});
+    const generated = await post('/api/read-token/generate', { name: 'test', scopes: ['public', 'system', 'portfolio'] });
     assert.equal(generated.status, 200);
     const token = (await generated.json() as { token: string }).token;
     const bearer = { authorization: `Bearer ${token}` };

@@ -8,12 +8,12 @@ import { PassThrough } from 'node:stream';
 import type { AddressInfo } from 'node:net';
 import { createExecutorServer } from '../src/http.ts';
 import { createReadTokens } from '../src/read-token.ts';
-import { OUTPUT_MAX_BYTES, TOOLS, handle, loadSettings, platformGet, serve, toolText, type Get } from '../tools/mcp/readonly.ts';
+import { OUTPUT_MAX_BYTES, PlatformError, TOOLS, handle, loadSettings, platformGet, serve, tokenScopes, toolText, type Get } from '../tools/mcp/readonly.ts';
 import { bindAccounts, createHarness } from './harness.ts';
 
 const ADDRESS = `0x${'cd34'.repeat(10)}`;
 
-async function platform() {
+async function platform(scopes: readonly string[] = ['public', 'system', 'portfolio']) {
   const dir = mkdtempSync(join(tmpdir(), 'tp-mcp-'));
   const h = createHarness();
   bindAccounts(h.ex);
@@ -26,11 +26,11 @@ async function platform() {
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const cookie = ((await fetch(`${base}/login?token=mcp-access-0001`, { redirect: 'manual' })).headers.get('set-cookie') ?? '').split(';')[0]!;
-  const { token } = await (await fetch(`${base}/api/read-token/generate`, { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }, body: '{}' })).json() as { token: string };
+  const { token } = await (await fetch(`${base}/api/read-token/generate`, { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }, body: JSON.stringify({ name: 'test', scopes }) })).json() as { token: string };
   return { dir, base, token, cookie, async close() { await new Promise(resolve => server.close(resolve)); h.dispose(); rmSync(dir, { recursive: true, force: true }); } };
 }
-const call = async (get: Get, name: string, args: unknown = {}) => {
-  const answer = await handle({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }, get) as { result?: { content: { text: string }[]; isError?: boolean }; error?: { code: number } };
+const call = async (get: Get, name: string, args: unknown = {}, scopes?: () => Promise<readonly ('public' | 'system' | 'portfolio')[] | null>) => {
+  const answer = await handle({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }, get, scopes) as { result?: { content: { text: string }[]; isError?: boolean }; error?: { code: number } };
   return answer;
 };
 
@@ -129,4 +129,43 @@ test('MCP：令牌文件权限不是 600、内容不对或地址带路径时拒�
     writeFileSync(file, 'not-a-token', { mode: 0o600 });
     assert.throws(() => loadSettings({ TP_MCP_URL: 'http://100.64.0.1:8787', TP_MCP_TOKEN_FILE: file }), /tpr_/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('MCP：只列出令牌范围内的工具，范围外的调用写明缺哪个范围；platform_status 在没有 portfolio 时只缺执行器状态', async () => {
+  const p = await platform(['system']);
+  try {
+    const get = platformGet({ base: new URL(p.base), token: p.token });
+    const scopes = tokenScopes(get);
+    assert.deepEqual(await scopes(), ['system']);
+    const listed = await handle({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, get, scopes) as { result: { tools: { name: string }[] } };
+    assert.deepEqual(listed.result.tools.map(tool => tool.name), ['platform_status', 'logs', 'host_status', 'update_status']);
+    const refused = await call(get, 'varlighter', {}, scopes);
+    assert.equal(refused.result?.isError, true);
+    assert.match(refused.result!.content[0]!.text, /portfolio/);
+    const status = await call(get, 'platform_status', {}, scopes);
+    assert.equal(status.result?.isError, undefined, status.result?.content[0]?.text);
+    assert.match(status.result!.content[0]!.text, /"state":\{"unavailable":"[^"]*portfolio/);
+    // Without the MCP server's own filter the platform still refuses: the 403 is the limit.
+    const direct = await call(get, 'module_state', { module: 'crossex' });
+    assert.equal(direct.result?.isError, true);
+    assert.match(direct.result!.content[0]!.text, /portfolio/);
+  } finally { await p.close(); }
+});
+
+test('MCP：读不到令牌范围（v0.85.0 之前的平台、网络错误）时列出全部工具，成功读到后才记住', async () => {
+  let fail = true, calls = 0;
+  const get: Get = async path => {
+    calls += 1;
+    assert.equal(path, '/api/read-token/self');
+    if (fail) throw new PlatformError('403 只读令牌不能访问这个接口', 403, null, 'read_only');
+    return { id: '1a2b3c4d', name: 'x', scopes: ['public', 'bogus'], expiresAt: 0 };
+  };
+  const scopes = tokenScopes(get);
+  assert.equal(await scopes(), null);
+  const all = await handle({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, get, scopes) as { result: { tools: unknown[] } };
+  assert.equal(all.result.tools.length, TOOLS.length);
+  fail = false;
+  assert.deepEqual(await scopes(), ['public']);
+  assert.deepEqual(await scopes(), ['public']);
+  assert.equal(calls, 3, '读到之后不再请求');
 });

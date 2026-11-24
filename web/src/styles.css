@@ -308,6 +308,10 @@ table.data.history{min-width:0}
 .read-token-commands{margin:0;padding:var(--space-sm) var(--space-md);background:var(--surface-2);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:.75rem;white-space:pre-wrap;overflow-wrap:anywhere}
 .read-token-original{font-family:var(--font-mono);overflow-wrap:anywhere;color:var(--text-primary)}
 [data-read-token-issued] input{font-family:var(--font-mono)}
+.read-token-scopes{display:grid;gap:var(--space-xs);grid-column:1/-1}
+.read-token-scopes .checkbox-label{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-xs) var(--space-sm)}
+.read-token-scopes .checkbox-label input{width:auto;min-height:0;margin:0}
+.read-token-scopes .muted{font-size:.75rem}
 /* EQN 快讯（docs/news.md）：快讯页（.aster-module 里的面板）与行情监控「异动行情」页签共用的列表。只用两处都有的
    --foreground、--muted-foreground、--border、--primary、--secondary 令牌，各自取所在页面的配色。 */
 .news-toolbar{display:flex;align-items:center;gap:var(--space-sm);padding:var(--space-md) 14px 0}

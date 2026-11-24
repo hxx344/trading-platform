@@ -10,7 +10,7 @@ import type { Executor } from './executor.ts';
 import { APP_HEADERS, CLIENT_ADDRESS_HEADER, CONFIG_CHECK_HEADER, CONFIG_MATCH_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, PAGE_HEADERS, controlRoute, readJson, sendJson, sendJsonText, sendWebAsset, sessionCookieName } from './http-public.ts';
 import { GLOBAL_LOGIN_LIMITS, LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash, type ThrottleLimits } from './login-password.ts';
 import { openSessionStore, type SessionInfo, type SessionStore } from './sessions.ts';
-import { READ_TOKEN_MAX_BYTES, readTokenAllows, readTokenNewsView, readTokenUpdateView, type ReadTokens } from './read-token.ts';
+import { READ_SCOPE_NAMES, READ_TOKEN_MAX_BYTES, ReadTokenError, readTokenNewsView, readTokenScope, readTokenUpdateView, type ReadTokens } from './read-token.ts';
 import type { Redactor } from './read-redact.ts';
 import type { WebApp } from './web-assets.ts';
 import type { UpdateView } from './service/update-types.ts';
@@ -387,7 +387,7 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     // One line per request, in the service log (logs.sqlite, 14 days); never the token itself. Only a request with the
     // valid token counts as a use on the page.
     response.once('close', () => {
-      if (tokenId) readTokens?.record();
+      if (tokenId) readTokens?.record(tokenId);
       const bytes = tokenAnswers.get(response)?.bytes ?? Number(response.getHeader('content-length') ?? 0);
       const outcome = response.writableFinished ? `${response.statusCode}，${bytes} 字节` : '连接中断';
       log(`只读令牌${tokenId ? ` ${tokenId}` : '（无效）'} ${request.method ?? '?'} ${url.pathname} → ${outcome}，${Math.round(performance.now() - started)} ms（来自 ${address}）`);
@@ -401,9 +401,16 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     }
     throttle.succeeded();
     tokenId = checked.id;
-    if (request.method !== 'GET' || !readTokenAllows(url)) return sendJson(response, 403, { code: 'read_only', message: '只读令牌不能访问这个接口' });
-    const release = readTokens!.admit();
-    if (!release) return sendJson(response, 429, { code: 'token_rate', message: '请求过于频繁：每分钟最多 30 次，同时最多 2 个' }, { 'retry-after': '5' });
+    // The token's own name, scopes and expiry, for the MCP server to list only the tools it may call; the session gets 404.
+    if (request.method === 'GET' && url.pathname === '/api/read-token/self' && !url.search) {
+      const self = readTokens!.self(checked.id);
+      return self ? sendJson(response, 200, self) : sendJson(response, 401, { code: 'token', message: '令牌无效或已吊销' });
+    }
+    const scope = request.method === 'GET' ? readTokenScope(url) : null;
+    if (scope === null) return sendJson(response, 403, { code: 'read_only', message: '只读令牌不能访问这个接口' });
+    if (!checked.scopes.includes(scope)) return sendJson(response, 403, { code: 'token_scope', scope, message: `这个令牌没有「${READ_SCOPE_NAMES[scope]}」（${scope}）范围，请在设置页生成带这个范围的令牌` });
+    const release = readTokens!.admit(checked.id);
+    if (!release) return sendJson(response, 429, { code: 'token_rate', message: '请求过于频繁：每个令牌每分钟最多 30 次、同时 2 个，全部令牌同时最多 4 个' }, { 'retry-after': '5' });
     response.once('close', release);
     const redact = readTokens!.redactor();
     if (!redact) { release(); return sendJson(response, 401, { code: 'token', message: '令牌无效或已吊销' }); }
@@ -502,8 +509,23 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     if (url.pathname === '/api/read-token' || url.pathname.startsWith('/api/read-token/')) {
       if (!readTokens) return send(response, 404, { code: 'not_found', message: '本服务没有只读接口令牌' });
       if (request.method === 'GET' && url.pathname === '/api/read-token') return send(response, 200, readTokens.view());
-      if (request.method === 'POST' && url.pathname === '/api/read-token/generate') { exactKeys(await readJson(request), []); return send(response, 200, readTokens.generate()); }
-      if (request.method === 'POST' && url.pathname === '/api/read-token/revoke') { exactKeys(await readJson(request), []); return send(response, 200, readTokens.revoke()); }
+      // generate takes a name and the scopes (docs/mcp.md 8.4); revoke one id, or every token with an empty body.
+      const manage = (work: () => unknown) => {
+        try { return send(response, 200, work()); }
+        catch (error) {
+          if (!(error instanceof ReadTokenError)) throw error;
+          return send(response, error.code === 'token_limit' ? 409 : error.code === 'token_unknown' ? 404 : 400, { code: error.code, message: error.message });
+        }
+      };
+      if (request.method === 'POST' && url.pathname === '/api/read-token/generate') {
+        const { name, scopes } = exactKeys(await readJson(request), ['name', 'scopes']);
+        return manage(() => readTokens.generate({ name, scopes }));
+      }
+      if (request.method === 'POST' && url.pathname === '/api/read-token/revoke') {
+        const { id } = exactKeys(await readJson(request), [], ['id']);
+        if (id !== undefined && (typeof id !== 'string' || !/^[0-9a-f]{8}$/.test(id))) return send(response, 400, { code: 'token_input', message: 'id 须为令牌编号（8 位十六进制）' });
+        return manage(() => readTokens.revoke(id));
+      }
       if (request.method === 'POST' && url.pathname === '/api/read-token/lookup') {
         const { alias } = exactKeys(await readJson(request), ['alias']);
         if (typeof alias !== 'string' || !/^(acct|addr|tx)-[0-9a-f]{8}$/.test(alias.trim())) return send(response, 400, { code: 'invalid_alias', message: '别名格式应为 acct-、addr- 或 tx- 加 8 位十六进制' });

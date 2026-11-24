@@ -30,7 +30,7 @@
 #   sudo bash install.sh --import-workbench --ondo
 #                                             启用 Ondo 挂单奖励：工作台 Ondo 挂单设置以观察模式带过来，工作台没有实盘会话记录时
 #                                             一并导入 API Key（写入 secrets.json 的 ondo）；没有工作台 Ondo 数据时也可启用（只观察）
-#   sudo bash install.sh --set-password       设置或更换页面登录密码（输入两次，不回显；只存 scrypt 摘要，已登录的页面须重新登录；
+#   sudo bash install.sh --set-password       设置或更换页面登录密码（输入两次，不回显；只存 scrypt 摘要，已登录的页面须重新登录，只读接口令牌全部吊销；
 #                                             沿用当前已装版本，不联网升级；脚本化时加 --password-stdin 从标准输入读一行）
 #   sudo bash install.sh --watch-url <地址> --watch-token <令牌>
 #                                             开启副服务器巡检心跳：每 30 秒向副服务器 main-watch 的心跳地址（如 http://<副服务器 IP>:8792/heartbeat）
@@ -627,7 +627,7 @@ if [[ -f "$CONF_DIR/config.json" ]]; then
     ( umask 077; printf '%s\n' "$password_hash" >"$CONF_DIR/.login-password.tmp" ) || fail '无法写入登录密码'
     [[ "$TEST_MODE" == 1 ]] || chown "$SERVICE_USER:$SERVICE_USER" "$CONF_DIR/.login-password.tmp"
     mv -f "$CONF_DIR/.login-password.tmp" "$CONF_DIR/login-password"
-    changes+=('登录密码（已打开的页面须重新登录）')
+    changes+=('登录密码（已打开的页面须重新登录，只读接口令牌已全部吊销）')
   fi
   for file in "$CONF_DIR/config.json" ${secrets_file:+"$secrets_file"} "$CONF_DIR/login-password"; do
     [[ -f "$file" && ! -L "$file" ]] || continue
@@ -732,7 +732,9 @@ if ((configured)); then
   fi
   check=$(cat "$candidate/check-output")
   log "$check"
-  if ((set_password)); then rm -f "$DATA_DIR/http-session"; fi
+  # A new password ends the sessions and revokes every read-only token (docs/mcp.md 8.4); the service refuses them as
+  # soon as the file is gone and never writes it back.
+  if ((set_password)); then rm -f "$DATA_DIR/http-session" "$DATA_DIR/read-token.json"; fi
 elif [[ -n "$previous_dir" ]]; then
   log '尚无 config.json，已保留当前程序、服务及数据。'
   exit 0

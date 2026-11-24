@@ -277,7 +277,7 @@ test('接口：没开快讯 404，循环开始前 503，之后返回快讯与异
     assert.deepEqual(flash.items.map((item: { no: number }) => item.no), [5]);
     assert.equal(flash.connection.state, 'connecting');
     // 只读令牌读到的链接改名 link：url 是脱敏的标识字段，原样给出会把每条快讯链接换成别名、挤掉账户别名（docs/mcp.md 8.3）。
-    const { token } = await (await fetch(`${base}/api/read-token/generate`, { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }, body: '{}' })).json() as { token: string };
+    const { token } = await (await fetch(`${base}/api/read-token/generate`, { method: 'POST', headers: { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }, body: '{"name":"test","scopes":["public","system","portfolio"]}' })).json() as { token: string };
     const tokenFlash = await (await fetch(`${base}/api/news`, { headers: { authorization: `Bearer ${token}` } })).json() as { items: Record<string, unknown>[] };
     assert.equal(tokenFlash.items[0]!.url, undefined);
     assert.equal(tokenFlash.items[0]!.link, 'https://eqn.news/main/5');

@@ -178,3 +178,20 @@ test('MCP：读不到令牌范围（v0.85.0 之前的平台、网络错误）时
   await flaky(); await flaky();
   assert.equal(down, 2);
 });
+
+test('MCP：只有 portfolio 的令牌也列出 platform_status，运行状态一半写明不可用，执行器状态照常', async () => {
+  const p = await platform(['portfolio']);
+  try {
+    const get = platformGet({ base: new URL(p.base), token: p.token });
+    const scopes = tokenScopes(get);
+    const listed = await handle({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, get, scopes) as { result: { tools: { name: string }[] } };
+    const names = listed.result.tools.map(tool => tool.name);
+    assert.ok(names.includes('platform_status') && names.includes('logs') && !names.includes('host_status') && !names.includes('news'), names.join());
+    const status = await call(get, 'platform_status', {}, scopes);
+    assert.equal(status.result?.isError, undefined, status.result?.content[0]?.text);
+    assert.match(status.result!.content[0]!.text, /"status":\{"unavailable":"[^"]*system/);
+    assert.doesNotMatch(status.result!.content[0]!.text, /"state":\{"unavailable"/);
+    const refused = await call(get, 'host_status', {}, scopes);
+    assert.match(refused.result!.content[0]!.text, /没有 system 范围/);
+  } finally { await p.close(); }
+});

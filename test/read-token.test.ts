@@ -27,7 +27,10 @@ const HEX_RUN = /0x[0-9a-fA-F]{40,}/;
 /** Views carrying identifiers in every way the masking must catch: by value, by field name, as a key, inside log text. */
 function views(overrides: Partial<ServiceViews> = {}): ServiceViews {
   return {
-    status: () => ({ feishu: { configured: true, recent: [{ text: '账户 ***9a7b 已暂停' }] }, streams: [{ account: '***9a7b' }], wallet: ADDRESS, nested: { subAccountId: 123456, signer: ADDRESS_UPPER, note: `tx ${HASH}` }, [ADDRESS]: { balance: '1.5' } }),
+    status: () => ({ feishu: { configured: true, recent: [{ text: '账户 ***9a7b 已暂停' }] }, streams: [{ account: '***9a7b' }], wallet: ADDRESS, nested: { subAccountId: 123456, signer: ADDRESS_UPPER, note: `tx ${HASH}` }, [ADDRESS]: { balance: '1.5' },
+      health: { startedAt: 1, loops: [{ name: 'jobs', lastOkAt: 2, failures: 1, lastError: 'LOOP-ERROR-TEXT 持仓 3 手', lastErrorAt: 3 }] },
+      dependencies: { level: 'ok', incidents: [] },
+      monitor: { available: true, error: null, oil: { summary: 'MONITOR-SUMMARY-TEXT' }, perpetual: { summary: 'PERP-SUMMARY-TEXT' } } }),
     logs: (_filter, _before, limit) => ({ items: [{ id: '1', at: 1, level: 'info', text: `划转完成 ${HASH} 签名 ${SIGNATURE} 账户 ${ADDRESS}` }, { id: '2', at: 2, level: 'problem', text: 'Binance 密钥属于 UID 88776655，与配置的账户 ***6655 不一致' }].slice(0, limit), next: null }),
     oil: { market: () => ({}), state: () => ({ accounts: [{ label: 'oil-a', accountId: 'gate-998877', uid: 4455, user: ADDRESS }] }), pnl: () => ({ rows: [] }) },
     update: { status: () => ({ current: 'v0.69.0' }), check: async () => ({}), apply: () => ({}) },
@@ -176,7 +179,7 @@ test('只读令牌：应答按值与按字段打码，原值不出现；同一�
     assert.equal((await s.sessionPost('/api/read-token/lookup', { alias: 'nope' })).status, 400);
     assert.equal((await s.read(token, '/api/read-token/lookup', { method: 'POST', headers: { 'content-type': 'application/json', 'x-pa-executor': '1' }, body: JSON.stringify({ alias: addr }) })).status, 403);
     // A second token: the first keeps working and both read the same aliases (one key, docs/mcp.md 8.4).
-    const second = await s.generate(['system'], '第二个');
+    const second = await s.generate(READ_SCOPES, '第二个');
     assert.equal((await s.read(token, '/api/status')).status, 200, '多个令牌并存');
     assert.ok((await (await s.read(second, '/api/status')).text()).includes(addr), '各令牌别名一致');
     // All revoked: the aliases and the key go, the next token reads new aliases.
@@ -557,8 +560,12 @@ test('只读令牌：没有 portfolio 的令牌读 /api/status 只得到运行�
     const wide = await (await s.read(full, '/api/status')).text();
     assert.match(wide, /已暂停/, '有 portfolio 时照旧');
     const text = JSON.stringify(narrow);
-    assert.doesNotMatch(text, /已暂停|streams|wallet|nested|recent/);
-    assert.ok('health' in narrow && 'omitted' in narrow);
+    assert.doesNotMatch(text, /已暂停|streams|wallet|nested|recent|LOOP-ERROR-TEXT|MONITOR-SUMMARY-TEXT|PERP-SUMMARY-TEXT/);
+    for (const marker of ['LOOP-ERROR-TEXT', 'MONITOR-SUMMARY-TEXT', 'PERP-SUMMARY-TEXT']) assert.match(wide, new RegExp(marker));
+    assert.deepEqual(Object.keys(narrow).sort(), ['dependencies', 'feishu', 'health', 'monitor', 'omitted', 'samples']);
+    assert.deepEqual(narrow.health, { startedAt: 1, loops: [{ name: 'jobs', lastOkAt: 2, failures: 1, lastErrorAt: 3 }] });
+    assert.deepEqual(narrow.dependencies, { level: 'ok', incidents: [] });
+    assert.deepEqual(narrow.monitor, { available: true, error: null });
     assert.deepEqual(narrow.feishu, { configured: true });
     for (const path of ['/api/logs', '/api/logs/problems']) {
       const refused = await s.read(system, path);

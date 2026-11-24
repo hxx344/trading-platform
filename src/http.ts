@@ -511,7 +511,7 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     if (url.pathname === '/api/read-token' || url.pathname.startsWith('/api/read-token/')) {
       if (!readTokens) return send(response, 404, { code: 'not_found', message: '本服务没有只读接口令牌' });
       if (request.method === 'GET' && url.pathname === '/api/read-token') return send(response, 200, readTokens.view());
-      // generate takes a name and the scopes (docs/mcp.md 8.4); revoke one id, or every token with an empty body.
+      // generate takes a name and the scopes (docs/mcp.md 8.4); revoke one id, or every token only with { all: true }.
       const manage = (work: () => unknown) => {
         try { return send(response, 200, work()); }
         catch (error) {

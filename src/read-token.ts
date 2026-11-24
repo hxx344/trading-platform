@@ -355,13 +355,18 @@ export function readTokenNewsView<T extends { items: readonly { url: string | nu
 /**
  * What a token without the portfolio scope reads of /api/status (docs/mcp.md 8.4): only the listed fields. The full
  * answer carries the Feishu outbox's recent texts (fills, alerts, executions), the account streams, the transfer
- * settings and the monitors' summaries, which are account and strategy data; a field added later stays out.
+ * settings and the monitors' summaries, which are account and strategy data; a top-level field added later stays out.
+ * The execution loops keep their counts and times but not the last error's text, which is the same line the (portfolio)
+ * log has.
  */
 export function readTokenSystemStatus(view: Record<string, unknown>): Record<string, unknown> {
   const pick = (value: unknown, keys: readonly string[]) => value !== null && typeof value === 'object'
     ? Object.fromEntries(keys.filter(key => Object.hasOwn(value, key)).map(key => [key, (value as Record<string, unknown>)[key]])) : value ?? null;
   return {
-    health: view.health ?? null,
+    health: view.health !== null && typeof view.health === 'object'
+      ? { ...view.health as Record<string, unknown>, loops: Array.isArray((view.health as { loops?: unknown }).loops)
+        ? ((view.health as { loops: Record<string, unknown>[] }).loops).map(({ lastError: _, ...row }) => row) : undefined }
+      : null,
     dependencies: view.dependencies ?? null,
     samples: view.samples ?? null,
     ...(view.watch !== undefined ? { watch: view.watch } : {}),

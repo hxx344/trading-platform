@@ -70,9 +70,9 @@ export function platformGet({ base, token }: { base: URL; token: string }, fetch
 }
 
 type Args = Record<string, unknown>;
-/** The token scopes (docs/mcp.md 8.4); a tool is listed only for a token with its scope. */
+/** The token scopes (docs/mcp.md 8.4); a tool is listed only for a token with one of its scopes. */
 export type Scope = 'public' | 'system' | 'portfolio';
-interface Tool { name: string; scope: Scope; description: string; inputSchema: Record<string, unknown>; run(args: Args, get: Get): Promise<unknown> }
+interface Tool { name: string; scope: Scope | readonly Scope[]; description: string; inputSchema: Record<string, unknown>; run(args: Args, get: Get): Promise<unknown> }
 
 const int = (args: Args, name: string, min: number, max: number, fallback: number): number => {
   const value = args[name];
@@ -106,11 +106,11 @@ const schema = (properties: Record<string, unknown> = {}, required: string[] = [
 
 export const TOOLS: readonly Tool[] = [
   {
-    name: 'platform_status', scope: 'system',
+    name: 'platform_status', scope: ['system', 'portfolio'],
     description: `交易平台的运行状态（启动时间、循环健康、飞书、行情服务）与执行器状态（账户、近期任务、划转配对、ADL、ASTER 持仓）。${DATA_NOTE}`,
     inputSchema: schema(),
-    // The executor's state is portfolio data: a token without that scope gets the status alone.
-    run: async (_args, get) => ({ status: await get('/api/status'), state: await outOfScope(get, '/api/state') }),
+    // The status is system data, the executor's state portfolio data: a token with one of them gets that part.
+    run: async (_args, get) => ({ status: await outOfScope(get, '/api/status'), state: await outOfScope(get, '/api/state') }),
   },
   {
     name: 'logs', scope: 'portfolio',
@@ -266,6 +266,9 @@ type Message = { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: unk
  * Answers one JSON-RPC message; null for a notification. `scopes` gives the token's scopes, or null when the platform
  * cannot say (before v0.85.0): then every tool is listed and the platform's 403 is the limit.
  */
+const scopesOf = (tool: Tool): readonly Scope[] => typeof tool.scope === 'string' ? [tool.scope] : tool.scope;
+const toolAllowed = (tool: Tool, allowed: readonly Scope[] | null) => allowed === null || scopesOf(tool).some(scope => allowed.includes(scope));
+
 export async function handle(message: Message, get: Get, scopes: () => Promise<readonly Scope[] | null> = async () => null): Promise<Record<string, unknown> | null> {
   const id = message.id;
   if (id === undefined || id === null) return null;
@@ -285,13 +288,16 @@ export async function handle(message: Message, get: Get, scopes: () => Promise<r
     case 'ping': return reply({});
     case 'tools/list': {
       const allowed = await scopes();
-      return reply({ tools: TOOLS.filter(tool => allowed === null || allowed.includes(tool.scope)).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) });
+      return reply({ tools: TOOLS.filter(tool => toolAllowed(tool, allowed)).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) });
     }
     case 'tools/call': {
       const tool = TOOLS.find(candidate => candidate.name === params.name);
       if (!tool) return fail(-32602, `没有工具 ${String(params.name)}`);
       const allowed = await scopes();
-      if (allowed !== null && !allowed.includes(tool.scope)) return reply({ content: [{ type: 'text', text: `这个令牌没有 ${tool.scope} 范围，不能用 ${tool.name}：在平台「设置 → 只读接口令牌」生成带 ${tool.scope} 范围的令牌` }], isError: true });
+      if (!toolAllowed(tool, allowed)) {
+        const need = scopesOf(tool).join(' 或 ');
+        return reply({ content: [{ type: 'text', text: `这个令牌没有 ${need} 范围，不能用 ${tool.name}：在平台「设置 → 只读接口令牌」生成带 ${need} 范围的令牌` }], isError: true });
+      }
       const args = params.arguments ?? {};
       if (typeof args !== 'object' || Array.isArray(args) || args === null) return fail(-32602, '参数须为对象');
       const known = Object.keys((tool.inputSchema.properties ?? {}) as object);

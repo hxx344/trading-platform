@@ -195,3 +195,16 @@ test('MCP：只有 portfolio 的令牌也列出 platform_status，运行状态�
     assert.match(refused.result!.content[0]!.text, /没有 system 范围/);
   } finally { await p.close(); }
 });
+
+test('MCP：platform_status 一半遇到非范围错误（401、429）时整次报错；两半都不在范围内时也报错', async () => {
+  const fake = (state: () => never): Get => async path => { if (path === '/api/status') return { ok: true }; return state(); };
+  for (const error of [new PlatformError('平台拒绝 /api/state：401 令牌无效', 401, null, 'token'), new PlatformError('平台拒绝 /api/state：429', 429, 5, 'token_rate')]) {
+    const answer = await call(fake(() => { throw error; }), 'platform_status');
+    assert.equal(answer.result?.isError, true, error.message);
+    assert.match(answer.result!.content[0]!.text, /401|429/);
+  }
+  const scope = (path: string) => new PlatformError(`平台拒绝 ${path}：403 这个令牌没有范围`, 403, null, 'token_scope');
+  const neither = await call(async path => { throw scope(path); }, 'platform_status');
+  assert.equal(neither.result?.isError, true);
+  assert.match(neither.result!.content[0]!.text, /既没有 system 也没有 portfolio/);
+});

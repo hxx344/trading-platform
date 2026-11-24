@@ -1056,6 +1056,9 @@ if activate "$candidate" "$STATE"; then
   if [[ ! -d "$STATE" ]] || ! diff -qr "$candidate" "$STATE/" >/dev/null; then
     save_record "$candidate" || fail '程序已启动，但无法保存部署状态；请重新执行安装。'
   fi
+  # Once more after the restart: the old process could have written the tokens back between its check that the file
+  # is there and its rename (docs/mcp.md 8.4); the new process notices the file gone at its next request.
+  if ((set_password)); then rm -f "$DATA_DIR/read-token.json"; fi
   # Compatibility with a subsequent older installer.
   if ((configured)); then printf '%s\n' "$applied" >"$work_dir/applied"; put_file "$work_dir/applied" "$APP_DIR/.applied-config" 600; fi
 else
@@ -1071,6 +1074,7 @@ else
     ensure_market_account "$previous_dir" || fail "新版本 $new_version 启动失败，上一版本 $previous_version 的行情账户未通过核验，无法重新启用。"
     if prepare_record "$previous_dir" "$STATE" "$fallback" && activate "$fallback" "$candidate"; then
       save_record "$fallback" || fail '已切回上一版，但无法保存部署状态。'
+      if ((set_password)); then rm -f "$DATA_DIR/read-token.json"; fi
       if [[ "$TEST_MODE" != 1 ]]; then ensure_import_path "$previous_dir"; fi
       fail "新版本 $new_version 启动失败，已回退到 $previous_version 并确认运行正常；请按上面的日志处理"
     fi

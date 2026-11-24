@@ -102,6 +102,7 @@ const outOfScope = async (get: Get, path: string): Promise<unknown> => {
   try { return await get(path); }
   catch (error) { if (error instanceof PlatformError && error.code === 'token_scope') return { unavailable: error.message }; throw error; }
 };
+const isUnavailable = (value: unknown) => value !== null && typeof value === 'object' && Object.keys(value).length === 1 && 'unavailable' in value;
 const schema = (properties: Record<string, unknown> = {}, required: string[] = []) => ({ type: 'object', properties, required, additionalProperties: false });
 
 export const TOOLS: readonly Tool[] = [
@@ -110,7 +111,11 @@ export const TOOLS: readonly Tool[] = [
     description: `交易平台的运行状态（启动时间、循环健康、飞书、行情服务）与执行器状态（账户、近期任务、划转配对、ADL、ASTER 持仓）。${DATA_NOTE}`,
     inputSchema: schema(),
     // The status is system data, the executor's state portfolio data: a token with one of them gets that part.
-    run: async (_args, get) => ({ status: await outOfScope(get, '/api/status'), state: await outOfScope(get, '/api/state') }),
+    run: async (_args, get) => {
+      const answer = { status: await outOfScope(get, '/api/status'), state: await outOfScope(get, '/api/state') };
+      if (isUnavailable(answer.status) && isUnavailable(answer.state)) throw new PlatformError(`这个令牌既没有 system 也没有 portfolio 范围：${(answer.status as { unavailable: string }).unavailable}`, 403, null, 'token_scope');
+      return answer;
+    },
   },
   {
     name: 'logs', scope: 'portfolio',

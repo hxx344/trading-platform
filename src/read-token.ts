@@ -365,7 +365,7 @@ export function readTokenSystemStatus(view: Record<string, unknown>): Record<str
   return {
     health: view.health !== null && typeof view.health === 'object'
       ? { ...view.health as Record<string, unknown>, loops: Array.isArray((view.health as { loops?: unknown }).loops)
-        ? ((view.health as { loops: Record<string, unknown>[] }).loops).map(({ lastError: _, ...row }) => row) : undefined }
+        ? ((view.health as { loops: unknown[] }).loops).map(row => row !== null && typeof row === 'object' ? (({ lastError: _, ...rest }) => rest)(row as Record<string, unknown>) : row) : undefined }
       : null,
     dependencies: view.dependencies ?? null,
     samples: view.samples ?? null,

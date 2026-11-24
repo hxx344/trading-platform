@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { createExecutorServer, type ServiceViews } from '../src/http.ts';
 import { LoginThrottle } from '../src/login-password.ts';
-import { READ_SCOPES, READ_TOKEN_FILE, READ_TOKEN_MAX, READ_TOKEN_ROUTES, READ_TOKEN_TTL_MS, createReadTokens, readTokenAllows, readTokenScope, type ReadScope } from '../src/read-token.ts';
+import { READ_SCOPES, READ_TOKEN_FILE, READ_TOKEN_MAX, READ_TOKEN_ROUTES, READ_TOKEN_TTL_MS, createReadTokens, readTokenAllows, readTokenScope, readTokenSystemStatus, type ReadScope } from '../src/read-token.ts';
 import { createRedactor, identifierField } from '../src/read-redact.ts';
 import { createOndoModule } from '../src/service/ondo.ts';
 import type { UpdateView } from '../src/service/update-types.ts';
@@ -590,4 +590,13 @@ test('只读令牌：/api/read-token/self 同样受每分钟 30 次限额；吊�
     assert.equal((await s.sessionPost('/api/read-token/revoke', { all: true })).status, 200);
     assert.deepEqual(s.tokens!.view().tokens, []);
   } finally { await s.close(); }
+});
+
+test('只读令牌：system 状态投影对各种 health 形状都不带出循环报错原文，不认识的顶层字段不给', () => {
+  for (const health of [undefined, null, 'x', { loops: { jobs: { lastError: 'SECRET' } } }, { loops: [null, 1, { name: 'jobs', lastError: 'SECRET', failures: 2 }] }]) {
+    const view = readTokenSystemStatus({ health, extra: 'SECRET', feishu: { configured: true, recent: [{ text: 'SECRET' }] } });
+    assert.doesNotMatch(JSON.stringify(view), /SECRET/, JSON.stringify(health));
+  }
+  assert.deepEqual(readTokenSystemStatus({ health: { loops: [null, 1, { name: 'jobs', lastError: 'x', failures: 2 }] } }).health, { loops: [null, 1, { name: 'jobs', failures: 2 }] });
+  assert.equal(readTokenSystemStatus({}).health, null);
 });

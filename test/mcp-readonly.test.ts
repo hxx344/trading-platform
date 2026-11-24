@@ -247,7 +247,7 @@ function snapshotPlatform(clock: { now: number }) {
     oil: () => ({ source: 'Binance', fetchedAt: fetched(), status: 'live', staleAfterMs: 90_000, brent: { coin: 'BZUSDT', markPx: 70.5, fundingRate: 0.0001, fundingIntervalHours: 8 }, wti: { coin: 'CLUSDT', markPx: 67.25, fundingRate: null }, extraField: 99 }),
     goldoil: () => ({ fetchedAt: fetched(), status: 'snapshot', staleAfterMs: 90_000, xau: { price: 4000 }, cl: { price: 67 }, bz: { price: 70 }, ratio: { cl: 59.7, bz: 57.1 } }),
     hynix: () => ({ fetchedAt: fetched(), status: 'live', staleAfterMs: 120_000, adr: 50, ordinary: 480, equivalent: 48, spread: 2, premium: 4.1667 }),
-    anthropic: () => ({ fetchedAt: fetched(), status: 'live', staleAfterMs: 60_000, binance: { markPx: 300, fundingRate: 0.0002 }, xyz: null, io: { markPx: 301, fundingRate: null }, rh: { markPx: 299, fundingRate: 0.0001 }, errors: { xyz: '原文' } }),
+    anthropic: () => ({ fetchedAt: fetched(), status: 'live', staleAfterMs: 60_000, binance: { markPx: 300, fundingRate: 0.0002 }, xyz: null, io: { markPx: 5304, fundingRate: null }, rh: { markPx: 5322, fundingRate: 0.0001 }, errors: { xyz: '原文' } }),
   };
   const get: Get = async path => {
     reads.push(path);
@@ -301,6 +301,9 @@ test('MCP snapshot：每行带单位、取值时间、是否过期与状态，�
   assert.equal(rowOf(snap, 'monitor:hynix', 'premium')?.unit, '%');
   assert.equal(rowOf(snap, 'monitor:anthropic', 'binance.price')?.unit, 'USDT');
   assert.equal(rowOf(snap, 'monitor:anthropic', 'io.price')?.unit, 'USD');
+  assert.equal(rowOf(snap, 'monitor:anthropic', 'binance.per_share')?.value, 300);
+  assert.equal(rowOf(snap, 'monitor:anthropic', 'io.per_share')?.value, 300, 'io:ANTH 每单位 17.68 股，折合每股后可与 Binance 比较');
+  assert.equal(rowOf(snap, 'monitor:anthropic', 'xyz.per_share')?.value, null);
   assert.equal(rowOf(snap, 'monitor:oil', 'brent.funding_interval')?.value, 8);
   assert.doesNotMatch(text, /extraField|secretHost|web-01|\/var\/lib|原因原文|连接被拒绝|原文|mystery|0xabc|acct-1/);
 });
@@ -342,7 +345,7 @@ test('MCP snapshot：5 秒内不重复读取；单个来源 503 时只缺对应�
   await assert.rejects(build(['system.runtime']), /401/);
 });
 
-test('MCP snapshot：读取完成后才开始计 5 秒，慢的读取由同时的调用共用；采集器还没有报价（null）时写明', async () => {
+test('MCP snapshot：读取完成后才开始计 5 秒，慢的读取由同时的调用共用；采集器还没有报价（503 not_ready）时写明', async () => {
   const clock = { now: T0 };
   const reads: string[] = [];
   let release = () => {};
@@ -350,7 +353,7 @@ test('MCP snapshot：读取完成后才开始计 5 秒，慢的读取由同时�
   const build = createSnapshot(async path => {
     reads.push(path);
     if (path === '/api/host') await slow;
-    if (path === '/api/monitor/oil/quote') return { ok: true, value: null };
+    if (path === '/api/monitor/oil/quote') return { ok: false, message: '平台拒绝 /api/monitor/oil/quote：503 尚未取得原油报价，后台正在采集' };
     if (path.startsWith('/api/monitor/')) return { ok: false, message: `平台拒绝 ${path}：404 未配置` };
     return { ok: true, value: { generatedAt: clock.now, cpu: { usagePercent: 1 } } };
   }, () => clock.now);
@@ -365,7 +368,7 @@ test('MCP snapshot：读取完成后才开始计 5 秒，慢的读取由同时�
   assert.equal(reads.length, 1, '从读取完成算起 5 秒内复用');
   const market = await build(['market.monitor']);
   assert.equal(market.groups[0]!.status, 'unavailable');
-  assert.match(market.groups[0]!.message!, /oil：采集器还没有报价/);
+  assert.match(market.groups[0]!.message!, /oil：.*503 尚未取得原油报价/);
 });
 
 test('MCP snapshot：缓存里的读取按调用时刻判定过期', async () => {

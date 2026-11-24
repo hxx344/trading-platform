@@ -2,6 +2,7 @@
 // unit, asOf, stale, status) built in the MCP server from routes the token already reads. Every row comes from the
 // tables here, field by field, so a field the platform adds later never shows up by itself. No dependency on
 // readonly.ts: it hands in `read`, which turns each GET into a value or a reason.
+import { ANTHROPIC_LEGS } from '../../src/vendor/anthropic-market.mjs';
 
 export type SnapshotScope = 'system' | 'public';
 export const SNAPSHOT_GROUPS = [
@@ -181,9 +182,12 @@ function quoteRows(market: typeof QUOTE_MARKETS[number], quote: Json, now: numbe
     out.add(entity, 'spread', 'ADR − 折算价', num(quote.spread), 'USD');
     out.add(entity, 'premium', 'ADR 溢价', num(quote.premium), '%');
   } else {
-    // Binance quotes the contract in USDT and settles funding every few hours; Hyperliquid funding is hourly.
+    // Binance quotes the contract in USDT and settles funding every few hours; Hyperliquid funding is hourly. The legs
+    // quote different units (io:ANTH and Lighter RH one unit per 17.68 shares), so `per_share` is the comparable price.
     for (const [name, label, unit, period] of [['binance', 'Binance', 'USDT', '每期'], ['xyz', 'Hyperliquid xyz', 'USD', '每小时'], ['io', 'Hyperliquid io', 'USD', '每小时'], ['rh', 'RH Lighter', 'USD', '每期']] as const) {
-      out.add(entity, `${name}.price`, `Anthropic ${label} 标记价`, num(leg(name)?.markPx), unit);
+      const shares = ANTHROPIC_LEGS[name].sharesPerUnit, price = num(leg(name)?.markPx);
+      out.add(entity, `${name}.price`, `Anthropic ${label} 标记价（每单位 ${shares} 股，各场所口径不同，比较用 per_share）`, price, unit);
+      out.add(entity, `${name}.per_share`, `Anthropic ${label} 折合每股价格`, price === null ? null : round(price / shares, 6), unit);
       out.add(entity, `${name}.funding`, `Anthropic ${label} 资金费率（${period}）`, num(leg(name)?.fundingRate), 'ratio');
     }
   }
@@ -239,7 +243,6 @@ export function createSnapshot(read: Read, now: () => number = Date.now) {
           const quote = await source(`/api/monitor/${market}/quote`);
           const value = quote.ok ? object(quote.value) : null;
           if (!quote.ok) missing.push(`${market}：${quote.message}`);
-          else if (quote.value === null) missing.push(`${market}：采集器还没有报价`);
           else if (!value) missing.push(`${market}：应答不是对象`);
           else list.push(...quoteRows(market, value, now()));
         }

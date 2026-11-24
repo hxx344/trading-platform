@@ -282,7 +282,7 @@ R3：改动令牌的权限范围，第 8.4 节还会改 `read-token.json` 的格
 - 与第 8.5 节原方案的差异：
   - **逐个读取，不并行**：平台对每个令牌同时只放行 2 个请求，第三个直接 429。所以各来源按顺序读，一次冷调用约 6 个往返。
   - **按来源缓存**：5 秒缓存放在来源上，不放在组上，`/api/host` 由 `system.host` 与 `system.runtime` 共用一次读取。5 秒从读取完成时算起；还没完成的读取一律共用，同一路径同时只发一个请求。失败的“原因”同样缓存 5 秒。`stale` 每次调用按当时的时间重新判定，所以缓存里的读取也会变成过期。
-  - **可为 `partial`**：一组有多个来源时分别读取（`market.monitor` 四个市场，`system.runtime` 的 `/api/status` 与 `/api/host`）。读不到的来源写进 `message`，其余来源照常出行，这时组的 `status` 为 `partial`；全部读不到才是 `unavailable`。读不到包括没配置（404）、已关闭（423）、读取失败，以及采集器还没有报价（平台回 JSON `null`）。
+  - **可为 `partial`**：一组有多个来源时分别读取（`market.monitor` 四个市场，`system.runtime` 的 `/api/status` 与 `/api/host`）。读不到的来源写进 `message`，其余来源照常出行，这时组的 `status` 为 `partial`；全部读不到才是 `unavailable`。读不到包括没配置（404）、已关闭（423）、读取失败，以及采集器还没有报价（平台回 503 `not_ready`）。
   - **401 整次报错**：令牌无效时整次调用报错并提示重新生成。其他拒绝（403、404、413、423、429、503、连不上）只影响对应的来源。
   - **限额**：一次冷调用最多 6 个请求，令牌每分钟 30 次、与其他工具共用，所以工具描述写明不要频繁轮询。任一来源被 429 拒绝时，结果顶层的 `rateLimited` 为 `true`，与“模块不可用”区分开。
   - **范围**：令牌范围已知时只给范围内的组，`groups` 点名范围外的组报工具错误；范围未知（v0.85.0 之前的平台）时给全部分组。
@@ -292,6 +292,7 @@ R3：改动令牌的权限范围，第 8.4 节还会改 `read-token.json` 的格
   - 系统两组的有效期是 60 秒。报价的有效期取报价自带的 `staleAfterMs`（缺省 120 秒），报价 `status` 不是 `live` 时一律算过期。
   - 价格单位按交易场所：Binance 合约是 `USDT`，Hyperliquid 与 Lighter 是 `USD`。
   - 资金费率是每期的比例：原油另给 `funding_interval`（小时）；Anthropic 的 Hyperliquid 两腿每小时一期，其余写“每期”。
+  - Anthropic 各腿的报价单位不同：Binance ANTUSDT 与 xyz:ANT 每单位 1 股，io:ANTH 与 Lighter RH 每单位 17.68 股（`src/vendor/anthropic-market.mjs` 的 `ANTHROPIC_LEGS`）。`price` 是原始标记价，标签写明每单位股数；比较各场所用 `per_share`。
   - 循环行的 `entity` 为 `loop:<循环名>`，名称取自 `src/runtime.ts`（如 `划转循环`、`ADL 循环`）。
 - 不出行的内容：主机名、路径、磁盘的 `label` 原文；连线的 `detail`（可能带账户与断开原因）；依赖与循环的错误原文；告警正文（只给条数）；飞书；名单外的磁盘编号、连线编号、市场字段。
 - 测试：`test/mcp-readonly.test.ts` 用替身平台验证：
@@ -299,7 +300,7 @@ R3：改动令牌的权限范围，第 8.4 节还会改 `read-token.json` 的格
   - 新增字段与原文不出现。
   - 5 秒内不重复读取，`/api/host` 共用一次；5 秒从读取完成算起，慢的读取由同时的调用共用。
   - 缓存里的读取按调用时刻变成过期。
-  - 单个来源 503 时只缺对应的行（`partial`），全部来源都读不到才 `unavailable`；429 时 `rateLimited`；采集器还没有报价时写明；401 整次报错。
+  - 单个来源 503 时只缺对应的行（`partial`），全部来源都读不到才 `unavailable`；429 时 `rateLimited`；采集器还没有报价（503）时写明；401 整次报错。
   - 按范围筛选分组，`groups` 参数校验。
   - 只有 `system` 的令牌经真实服务读取：测试服务没有 `/api/host`，所以 `system.host` 为 `unavailable`，`system.runtime` 为 `partial`，只有投影后 `/api/status` 的行，没有地址。
 - **回退**：回退到 v0.85.0，只少 `snapshot` 工具，平台与令牌不受影响。MCP 服务端随仓库检出运行，不在发布包里，所以回退只需检出旧版本的 `tools/mcp/`。
@@ -309,7 +310,7 @@ R3：改动令牌的权限范围，第 8.4 节还会改 `read-token.json` 的格
 - 第一批：新增接口用令牌读到 200；`samples` 的分页（`after` 不含本身、`next` 为空表示读完、`limit` 越界 400、未知配对 404）、1000 行应答小于 512 KiB；Var/Lighter 的 POST 用令牌仍然 403；`candles`、`perpetual/*` 仍然 403；`pull.ts` 的增量续拉、429 等待、413 减半；`backtest.ts` 对同一批样本与服务器 `runBacktest` 结果一致、`grid` 组合上限与排序；MCP 新工具的参数校验。
 - 第二批：v1 文件迁移后原令牌照常可用、别名不变；8 枚上限；范围外 403 `token_scope`；吊销一枚不影响其他；`--set-password` 吊销全部；全进程并发上限；v2 文件交给旧版读取时拒绝全部令牌（核对了 v0.84.0 的 `parse` 只认 `version: 1`，测试用当前代码断言不认识的版本号拒绝全部令牌）；页面按 [frontend.md](frontend.md)《页面开发规则》第 7 条在浏览器里验证。
 - 第二批另验：`/api/read-token/self` 只接受令牌；MCP 服务端按范围列工具，范围外调用报错并写明所需范围；对旧版平台（没有 `self`）时列出全部工具。
-- 第三批：用替身平台验证 `snapshot` 的行格式、`stale` 随时间翻转、单个来源 503 时只有该组 `unavailable`、5 秒内连续调用不重复请求、按范围筛选分组；来源应答加一个新字段，结果里不出现。
+- 第三批：用替身平台验证 `snapshot` 的行格式、`stale` 随时间翻转、单个来源 503 时只缺对应的行（`partial`）且全部来源读不到才 `unavailable`、429 时 `rateLimited`、5 秒内连续调用不重复请求、按范围筛选分组；来源应答加一个新字段，结果里不出现。
 - 真实环境：与第 5 节最后一条一起实测，结果回填 [live-results.md](live-results.md)。
 
 ### 8.7 已确认（2026-11-25）

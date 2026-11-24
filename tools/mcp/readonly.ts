@@ -59,9 +59,8 @@ export function platformGet({ base, token }: { base: URL; token: string }, fetch
     } catch (error) {
       throw new PlatformError(`无法连接平台：${error instanceof Error && error.name === 'TimeoutError' ? '超时' : error instanceof Error ? error.message : String(error)}`);
     }
-    // undefined: not JSON. A JSON null (a monitor quote before the first one arrives) is an answer.
-    const body = await response.json().catch(() => undefined) as { message?: unknown; code?: unknown } | null | undefined;
-    if (response.ok && body !== undefined) return body;
+    const body = await response.json().catch(() => null) as { message?: unknown; code?: unknown } | null;
+    if (response.ok && body !== null) return body;
     const reason = typeof body?.message === 'string' ? body.message : `HTTP ${response.status}`;
     const wait = Number(response.headers.get('retry-after'));
     const hint = response.status === 401 ? '（令牌无效、已吊销或已到期：在平台「设置 → 只读接口令牌」重新生成）'
@@ -263,7 +262,7 @@ export const TOOLS: readonly Tool[] = [
   },
   {
     name: 'snapshot', scope: ['system', 'public'],
-    description: `平台的摘要指标，每行一个数：entity（对象，如 host、disk:data、loop:<循环名>、monitor:oil）、metric、label（说明）、value、unit（%、bytes、s、ms、count、load、bool、USDT、USD、ratio、bbl/oz）、asOf（取值时间）、stale（超过有效期为 true）、status（ok、warn、down、unknown）。value 为 null 表示读不到，不代表 0；bool 为 1 是、0 否。分组 groups（不填为令牌范围内的全部）：${SNAPSHOT_GROUPS.map(group => `${group.id}（${group.scope}）${group.about}`).join('；')}。某组的来源读不到时写明原因，该组 status 为 partial（缺一部分）或 unavailable，其余组照常。每次调用最多读平台 6 次，令牌每分钟只有 30 次、与其他工具共用：5 秒内重复调用复用上次读取，不要频繁轮询；rateLimited 为 true 表示被限额拒绝，等一分钟再调用。账户、持仓与盈亏不在这里，用 platform_status、oil_hynix 等工具。${DATA_NOTE}`,
+    description: `平台的摘要指标，每行一个数：entity（对象，如 host、disk:data、loop:<循环名>、monitor:oil）、metric、label（说明）、value、unit（%、bytes、s、ms、count、load、bool、USDT、USD、ratio、bbl/oz）、asOf（取值时间）、stale（超过有效期为 true）、status（ok、warn、down、unknown）。value 为 null 表示读不到，不代表 0；bool 为 1 是、0 否。分组 groups（不填为令牌范围内的全部）：${SNAPSHOT_GROUPS.map(group => `${group.id}（${group.scope}）${group.about}`).join('；')}。某组的来源读不到时写明原因，该组 status 为 partial（缺一部分）或 unavailable，其余组照常。每次调用最多读平台 6 次，令牌每分钟只有 30 次、与其他工具共用：5 秒内重复调用复用上次读取，不要频繁轮询；rateLimited 为 true 表示被令牌限额拒绝（每分钟次数或同时请求数），稍后再调用，每分钟次数用完时等到下一分钟。账户、持仓与盈亏不在这里，用 platform_status、oil_hynix 等工具。${DATA_NOTE}`,
     inputSchema: schema({ groups: { type: 'array', items: { type: 'string', enum: [...SNAPSHOT_GROUP_IDS] }, minItems: 1, uniqueItems: true } }),
     run: async (args, get, scopes) => snapshotFor(get)(snapshotGroups(args, scopes)),
   },

@@ -207,12 +207,14 @@ test('久远的过期交易不再抬高加价的底', async t => {
   const [old] = s.store.openTxs();
   assert.ok(old);
   // 过了加价窗口它才过期：同一轮里发出的新一笔按正常费用出价，不以那笔过期交易为底。
-  s.advanceClock(FEE_FLOOR_WINDOW_MS);
+  // 时钟分步走（两轮之间超过 60 秒会按节点无应答停实盘），期间区块数还不到过期线。
+  const rounds = Math.ceil(FEE_FLOOR_WINDOW_MS / 50_000);
+  assert.ok(rounds < DEADLINE_BLOCKS + EXPIRE_GRACE_BLOCKS);
+  for (let i = 0; i < rounds; i++) { s.advanceClock(50_000); await s.step(); }
+  assert.deepEqual(s.store.openTxs().map(tx => tx.status), ['unknown']);
+  assert.equal(s.engine.isLive(), true);
   await s.step(s.engine, DEADLINE_BLOCKS + EXPIRE_GRACE_BLOCKS + 1);
-  assert.deepEqual(s.store.openTxs().map(tx => tx.status), ['expired']);
-  // 上一轮到了目录刷新周期，没有做发现；这一轮才发。
-  await s.step();
-  assert.equal(s.store.openTxs().length, 2);
+  assert.deepEqual(s.store.openTxs().map(tx => tx.status), ['expired', 'unknown']);
   const fresh = s.store.recentTxs(1)[0]!;
   assert.notEqual(fresh.hash, old.hash);
   assert.ok(fresh.maxPriorityFeePerGas < old.maxPriorityFeePerGas * 5n / 4n, '没有按 25% 加价');

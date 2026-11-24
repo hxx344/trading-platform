@@ -65,13 +65,15 @@ export interface LoadedSamples { samples: Sample[]; skipped: number; gaps: { fro
 /**
  * One pair's local samples, oldest first; fields a newer server added are dropped, missing ones become null. A sample not
  * after the one before it (a file written twice over) is skipped and counted, so a damaged file never replays a minute
- * twice without saying so; holes longer than GAP_MS are listed.
+ * twice without saying so; holes longer than GAP_MS are listed. A last line without its newline is a pull still
+ * appending (or killed while it did), so it is left for that pull to finish or cut off.
  */
 export function loadSamples(file: string): LoadedSamples {
   if (!existsSync(file)) throw new RequestError(`本机没有这个配对的样本（${file}）：先运行 tools/varlighter/pull.ts`);
   const samples: Sample[] = [], gaps: LoadedSamples['gaps'] = [];
   let skipped = 0;
-  for (const line of readFileSync(file, 'utf8').split('\n')) {
+  const text = readFileSync(file, 'utf8');
+  for (const line of text.slice(0, text.lastIndexOf('\n') + 1).split('\n')) {
     if (!line.trim()) continue;
     const raw = JSON.parse(line) as Record<string, unknown>;
     const sample = Object.fromEntries(SAMPLE_FIELDS.map(field => [field, raw[field] ?? null])) as unknown as Sample;
@@ -124,7 +126,9 @@ export function runLocal(request: BacktestRequest, dir: string): unknown {
     const { params, global, from, samples } = resolve({});
     const result = runBacktest(request.symbol, kind, samples, from, to, params, global);
     const shown = request.trades === 'all' ? result.trades : result.trades.slice(-(request.trades ?? 50));
-    return { symbol: request.symbol, kind, ...span, from, to, samples: result.samples, params, global, summary: result.summary, open: result.open, tradesShown: shown.length, trades: shown };
+    // gaps cover the whole local file; replayGaps only the part this run replayed.
+    const replayGaps = gaps.filter(gap => gap.to > from).length;
+    return { symbol: request.symbol, kind, ...span, replayGaps, from, to, samples: result.samples, params, global, summary: result.summary, open: result.open, tradesShown: shown.length, trades: shown };
   }
   // Without hours, from follows each combination's baseline window, so it is listed per run.
   const runs: { values: Record<string, unknown>; from: number; summary: BacktestSummary }[] = [];

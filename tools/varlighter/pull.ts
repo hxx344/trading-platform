@@ -6,7 +6,8 @@
 //
 //   TP_MCP_URL=… TP_MCP_TOKEN_FILE=… node tools/varlighter/pull.ts --enabled
 //   TP_MCP_URL=… TP_MCP_TOKEN_FILE=… node tools/varlighter/pull.ts --symbol rh:AAPL --symbol lighter:BTC
-import { appendFileSync, closeSync, existsSync, fstatSync, ftruncateSync, mkdirSync, openSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { appendFileSync, closeSync, existsSync, fstatSync, ftruncateSync, linkSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -62,22 +63,35 @@ export function lastSampleAt(file: string): number {
 
 /**
  * Holds `<file>.lock` while `work` runs, so two pulls of one pair (parallel MCP calls, or the command line beside the
- * MCP server) never append the same page twice. A lock left by a killed process is taken over after LOCK_STALE_MS.
+ * MCP server) never append the same page twice. The lock holds an owner tag; the holder refreshes its time through
+ * `keep` (each page and each 429 wait), and only a lock untouched for LOCK_STALE_MS is taken over, by renaming it away
+ * first so a waiter never removes a lock another waiter has just made. A lock is removed only by its owner.
  */
-async function locked<T>(file: string, work: () => Promise<T>, sleep: (seconds: number) => Promise<void>): Promise<T> {
-  const lock = `${file}.lock`, started = Date.now();
+async function locked<T>(file: string, work: (keep: () => void) => Promise<T>): Promise<T> {
+  const lock = `${file}.lock`, tag = `${process.pid}-${randomBytes(6).toString('hex')}`, started = Date.now();
+  const content = (path: string) => { try { return readFileSync(path, 'utf8'); } catch { return null; } };
   for (;;) {
-    try { closeSync(openSync(lock, 'wx')); break; }
+    try { writeFileSync(lock, tag, { flag: 'wx' }); break; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       let age = 0;
+      const seen = content(lock);
       try { age = Date.now() - statSync(lock).mtimeMs; } catch { continue; }
-      if (age > LOCK_STALE_MS) { rmSync(lock, { force: true }); continue; }
+      if (age > LOCK_STALE_MS && seen !== null) {
+        const aside = `${lock}.${tag}.stale`;
+        try { renameSync(lock, aside); } catch { continue; }
+        // Another waiter may have taken over and locked between our read and the rename: put its lock back.
+        if (content(aside) !== seen) { try { linkSync(aside, lock); } catch { /* someone locked again meanwhile */ } }
+        rmSync(aside, { force: true });
+        continue;
+      }
       if (Date.now() - started > LOCK_WAIT_MS) throw new Error(`${lock} 被另一次拉取占用超过 ${LOCK_WAIT_MS / 60_000} 分钟`);
-      await sleep(0.2);
+      // Not the injected 429 sleep: a test's no-op there would spin here without letting the holder's request finish.
+      await delay(200);
     }
   }
-  try { return await work(); } finally { rmSync(lock, { force: true }); }
+  const keep = () => { try { if (content(lock) === tag) { const now = new Date(); utimesSync(lock, now, now); } } catch { /* refreshed next time */ } };
+  try { return await work(keep); } finally { if (content(lock) === tag) rmSync(lock, { force: true }); }
 }
 
 export interface PullOptions {
@@ -92,12 +106,14 @@ export interface PullOptions {
 export interface PullResult { symbol: string; added: number; last: number | null; file: string; gap: { from: number; to: number } | null }
 
 /** A GET that waits out 429s (the token's 30 a minute) and returns the status for the caller's 413 handling. */
-async function patient(get: Get, path: string, sleep: (seconds: number) => Promise<void>): Promise<unknown> {
+async function patient(get: Get, path: string, sleep: (seconds: number) => Promise<void>, keep = () => {}): Promise<unknown> {
   for (let waits = 0; ; waits++) {
     try { return await get(path); }
     catch (error) {
       if (!(error instanceof PlatformError) || error.status !== 429 || waits >= MAX_WAITS) throw error;
+      keep();
       await sleep(error.retryAfter ?? 5);
+      keep();
     }
   }
 }
@@ -122,11 +138,11 @@ export async function pull({ get, dir, symbols = [], enabled = false, log = () =
   const results: PullResult[] = [];
   for (const symbol of wanted) {
     const file = sampleFile(dir, symbol);
-    results.push(await locked(file, async () => {
+    results.push(await locked(file, async keep => {
       let after = lastSampleAt(file), added = 0, limit = PAGE, gap: PullResult['gap'] = null, checked = false;
       for (;;) {
         let page: SamplesView;
-        try { page = await patient(get, `/api/varlighter/samples?symbol=${encodeURIComponent(symbol)}&after=${after}&limit=${limit}`, sleep) as SamplesView; }
+        try { page = await patient(get, `/api/varlighter/samples?symbol=${encodeURIComponent(symbol)}&after=${after}&limit=${limit}`, sleep, keep) as SamplesView; }
         catch (error) {
           if (error instanceof PlatformError && error.status === 413 && limit > MIN_PAGE) { limit = Math.max(MIN_PAGE, Math.floor(limit / 2)); continue; }
           throw error;
@@ -134,6 +150,10 @@ export async function pull({ get, dir, symbols = [], enabled = false, log = () =
         // Only the first page can show it: the server's oldest sample is newer than the local file's last one.
         if (!checked && after > 0 && page.firstAt !== null && page.firstAt > after) gap = { from: after, to: page.firstAt };
         checked = true;
+        keep();
+        // Read again before writing: should the lock ever be lost (a holder stalled past LOCK_STALE_MS), a page another
+        // pull already wrote is still not written twice.
+        after = Math.max(after, lastSampleAt(file));
         // Keyed by the server's column names, so a client a version apart keeps every field it knows.
         const lines: string[] = [];
         for (const row of page.rows) {
@@ -147,7 +167,7 @@ export async function pull({ get, dir, symbols = [], enabled = false, log = () =
       }
       log(`${symbol}：新增 ${added} 条，最新 ${after ? new Date(after).toISOString() : '无'}${gap ? `；服务器已不保留 ${new Date(gap.from).toISOString()} 到 ${new Date(gap.to).toISOString()} 的样本，本机这段为空` : ''}`);
       return { symbol, added, last: after || null, file, gap };
-    }, sleep));
+    }));
   }
   return { state, results };
 }

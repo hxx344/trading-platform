@@ -163,6 +163,8 @@ test('本机样本：服务器已过保留期时报告空档；载入时跳过�
     assert.deepEqual(loaded.samples.map(item => item.t), [T0, T0 + 60_000, T0 + 60_000 + GAP_MS + 1]);
     assert.equal(loaded.skipped, 2);
     assert.deepEqual(loaded.gaps, [{ from: T0 + 60_000, to: T0 + 60_000 + GAP_MS + 1 }]);
+    appendFileSync(file, '{"symbol":"rh:BTC","t":');
+    assert.equal(loadSamples(file).samples.length, 3, '正在追加的半行不读');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -199,6 +201,13 @@ test('MCP varlighter_backtest：先增量拉取，再在新进程里用仓库代
     const missing = await handle({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'varlighter_backtest', arguments: { symbol: 'lighter:OLD' } } }, p.get) as { result: { content: { text: string }[]; isError?: boolean } };
     assert.equal(missing.result.isError, true);
     assert.match(missing.result.content[0]!.text, /给出 kind/);
+    // A request the strategy rules reject is refused in the child before anything is pulled.
+    const paths: string[] = [];
+    const watched: Get = path => { paths.push(path); return p.get(path); };
+    const bad = await handle({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'varlighter_backtest', arguments: { symbol: 'rh:ETH', params: { entryBps: -1 } } } }, watched) as { result: { content: { text: string }[]; isError?: boolean } };
+    assert.equal(bad.result.isError, true);
+    assert.deepEqual(paths, [], '不合法的请求不拉取');
+    assert.equal(existsSync(sampleFile(p.local, 'rh:ETH')), false);
   } finally {
     if (saved === undefined) delete process.env.TP_VARLIGHTER_DIR; else process.env.TP_VARLIGHTER_DIR = saved;
     await p.close();

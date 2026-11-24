@@ -193,9 +193,10 @@ test('配置与接口：monitor.goldoil 不带设置；未配置 404，首轮前
     rmSync(dir, { recursive: true, force: true });
   }
 
-  assert.ok(readTokenAllows(new URL('http://x/api/monitor/goldoil/alerts')));
-  for (const path of ['/api/monitor/goldoil/quote', '/api/monitor/goldoil/candles', '/api/monitor/goldoil/alerts/test', '/api/monitor/goldoil/control']) assert.equal(readTokenAllows(new URL(`http://x${path}`)), false, path);
-  assert.ok(readTokenAllows(new URL('http://x/api/monitor/oil/alerts')) && !readTokenAllows(new URL('http://x/api/monitor/oil/quote')), '与原油一致');
+  // v0.83.0 起只读令牌也可读当前报价（docs/mcp.md 8.3）；K 线、测试告警与开关仍不放行。
+  for (const path of ['/api/monitor/goldoil/alerts', '/api/monitor/goldoil/quote']) assert.ok(readTokenAllows(new URL(`http://x${path}`)), path);
+  for (const path of ['/api/monitor/goldoil/candles', '/api/monitor/goldoil/alerts/test', '/api/monitor/goldoil/control']) assert.equal(readTokenAllows(new URL(`http://x${path}`)), false, path);
+  assert.ok(readTokenAllows(new URL('http://x/api/monitor/oil/alerts')) && readTokenAllows(new URL('http://x/api/monitor/oil/quote')) && !readTokenAllows(new URL('http://x/api/monitor/oil/candles')), '与原油一致');
   assert.ok(isDisplayRead('GET', '/api/monitor/goldoil/quote'));
   const tool = TOOLS.find(item => item.name === 'monitor')!;
   assert.deepEqual((tool.inputSchema as { properties: { market: { enum: string[] } } }).properties.market.enum, ['oil', 'goldoil', 'hynix']);

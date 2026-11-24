@@ -40,8 +40,7 @@ test('MCP：各工具经令牌读取白名单接口，应答已打码；未配�
     const get = platformGet({ base: new URL(p.base), token: p.token });
     assert.deepEqual(TOOLS.map(tool => tool.name), ['platform_status', 'logs', 'aster_pair', 'oil_hynix', 'monitor', 'module_state', 'varlighter', 'varlighter_backtest', 'host_status', 'market_quotes', 'news', 'update_status']);
     const runs: [string, unknown][] = [['platform_status', {}], ['logs', { filter: 'problems', limit: 5, before: '100' }], ['aster_pair', { pairId: 'xau' }], ['oil_hynix', {}], ['oil_hynix', { view: 'pnl', range: '30d', page: 2 }],
-      ['monitor', {}], ['module_state', { module: 'crossex' }], ['module_state', { module: 'options', view: 'performance' }], ['update_status', {}],
-      ['varlighter', {}], ['varlighter', { view: 'symbol', symbol: 'rh:AAPL', hours: 48 }], ['host_status', {}], ['market_quotes', {}], ['market_quotes', { market: 'goldoil' }], ['news', { view: 'moves' }]];
+      ['monitor', {}], ['module_state', { module: 'crossex' }], ['module_state', { module: 'options', view: 'performance' }], ['update_status', {}]];
     for (const [name, args] of runs) {
       const answer = await call(get, name, args);
       assert.equal(answer.result?.isError, undefined, `${name}：${answer.result?.content[0]?.text}`);
@@ -54,6 +53,19 @@ test('MCP：各工具经令牌读取白名单接口，应答已打码；未配�
     assert.match((await call(get, 'monitor')).result!.content[0]!.text, /unavailable/);
     // The session still sees the original, so the masking happened on the server.
     assert.match(await (await fetch(`${p.base}/api/status`, { headers: { cookie: p.cookie } })).text(), new RegExp(ADDRESS));
+  } finally { await p.close(); }
+});
+
+// v0.83.0 的工具单独一个平台和令牌：与上面的合在一起会超过令牌每分钟 30 次。
+test('MCP：Var/Lighter、服务器状态、监控报价与快讯工具经令牌读取，未配置的写明不可用', async () => {
+  const p = await platform();
+  try {
+    const get = platformGet({ base: new URL(p.base), token: p.token });
+    for (const [name, args] of [['varlighter', {}], ['varlighter', { view: 'symbol', symbol: 'rh:AAPL', hours: 48 }], ['host_status', {}], ['market_quotes', {}], ['market_quotes', { market: 'goldoil' }], ['news', { view: 'moves' }]] as const) {
+      const answer = await call(get, name, args);
+      assert.equal(answer.result?.isError, undefined, `${name}：${answer.result?.content[0]?.text}`);
+      assert.doesNotMatch(answer.result!.content[0]!.text, /0x[0-9a-fA-F]{40}|\*\*\*1234/, name);
+    }
   } finally { await p.close(); }
 });
 

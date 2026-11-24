@@ -8,7 +8,8 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { openEconomics } from '../src/varlighter/strategy.ts';
 import { COST_BLOCK, DECAYED, FALLBACK_BLOCK, NO_LIVE_TOP, THIN_BLOCK, closeSpread, confirmOpen, expectedNetBps, slippageBudgetBps } from '../src/varlighter/strategy.ts';
-import { executionSample, hasTokenQuote } from '../src/varlighter/model.ts';
+import { SAMPLE_FIELDS, executionSample, hasTokenQuote } from '../src/varlighter/model.ts';
+import type { SamplesView } from '../src/varlighter/views.ts';
 import { TOKEN_BLOCK_PAUSE_MS, TOKEN_ERROR_KEEP_MS, TOKEN_SYMBOL_PAUSE_MS, TOKEN_QUOTE_MAX_AGE_MS, createVarQuoter, parseTokenQuote, quoteQty, varInstrument, type VarQuoter } from '../src/varlighter/varquote.ts';
 import { VARIATIONAL_SESSION_FILE } from '../src/monitor/variational-session.ts';
 import { fakeVariationalToken } from './monitor-fake.ts';
@@ -917,8 +918,36 @@ test('接口：未登录 401、POST 缺页面标记 403、只读令牌不能读�
     assert.equal(generated.status, 200);
     const token = (await generated.json() as { token: string }).token;
     const bearer = { authorization: `Bearer ${token}` };
-    assert.notEqual((await get('/api/varlighter/state', bearer)).status, 200, '只读令牌读不到本模块');
-    assert.notEqual((await post('/api/varlighter/paper/reset', { confirm: 'RESET' }, { ...bearer, 'content-type': 'application/json', 'x-pa-executor': '1' })).status, 200, '只读令牌不能写');
+    // docs/mcp.md 8.3: the token reads the module and its samples, never a POST (the backtest included).
+    for (const route of ['/api/varlighter/state', '/api/varlighter/paper', '/api/varlighter/readiness', '/api/varlighter/samples?symbol=rh:BTC']) assert.equal((await get(route, bearer)).status, 200, route);
+    for (const route of ['/api/varlighter/paper/reset', '/api/varlighter/backtest', '/api/varlighter/settings', '/api/varlighter/paper/close']) {
+      assert.equal((await post(route, { confirm: 'RESET' }, { ...bearer, 'content-type': 'application/json', 'x-pa-executor': '1' })).status, 403, `只读令牌不能 POST ${route}`);
+    }
+    assert.equal((await get('/api/varlighter/samples?symbol=rh:BTC&extra=1', bearer)).status, 403, '多余参数');
+    // The sample export: pages after a cursor, oldest first, columns in SAMPLE_FIELDS order.
+    const writer = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
+    const rows = Array.from({ length: 5 }, (_, index) => ({ ...sample(T0 + index * 60_000, 100.2), symbol: 'rh:BTC' }));
+    writer.addSamples([...rows, { ...sample(T0, 50), symbol: 'lighter:BTC' }]);
+    const page = async (query: string) => { const response = await get(`/api/varlighter/samples?${query}`, bearer); assert.equal(response.status, 200, query); return await response.json() as SamplesView; };
+    const first = await page('symbol=rh:BTC&limit=2');
+    assert.deepEqual(first.columns, SAMPLE_FIELDS);
+    assert.deepEqual(first.rows.map(row => Object.fromEntries(first.columns.map((column, index) => [column, row[index]]))), rows.slice(0, 2));
+    assert.deepEqual([first.next, first.firstAt, first.retentionDays], [T0 + 60_000, T0, 14]);
+    const second = await page(`symbol=rh:BTC&limit=2&after=${first.next}`);
+    assert.deepEqual([second.rows.map(row => row[1]), second.next], [[T0 + 120_000, T0 + 180_000], T0 + 180_000]);
+    const last = await page(`symbol=rh:BTC&limit=2&after=${second.next}`);
+    assert.deepEqual([last.rows.map(row => row[1]), last.next], [[T0 + 240_000], null], '不足一页时 next 为空');
+    assert.deepEqual([(await page('symbol=rh:NONE')).rows, (await page('symbol=rh:NONE')).firstAt], [[], null], '没有样本的配对返回空页');
+    for (const query of ['symbol=BTC', 'symbol=rh:BTC&limit=0', 'symbol=rh:BTC&limit=1001', 'symbol=rh:BTC&after=-1', 'symbol=rh:BTC&after=1.5']) {
+      assert.equal((await get(`/api/varlighter/samples?${query}`)).status, 400, query);
+    }
+    // A full page of long-decimal prices stays well inside the token's 512 KiB answer limit.
+    writer.addSamples(Array.from({ length: 1000 }, (_, index) => ({ ...sample(T0 + index * 60_000, 104523.123456789, 104520.987654321), symbol: 'lighter:ETH', varBid100k: 104523.0712345, varAsk100k: 104523.1912345, rhBid100k: 104520.9112345, rhAsk100k: 104521.0612345, varBidTk: 104523.1012345, varAskTk: 104523.1512345, varTkAt: T0 + index * 60_000 - 1234 })));
+    const full = await get('/api/varlighter/samples?symbol=lighter:ETH', bearer);
+    assert.equal(full.status, 200);
+    const fullBytes = (await full.arrayBuffer()).byteLength;
+    assert.ok(fullBytes < 400 * 1024, `1000 行 ${fullBytes} 字节`);
+    writer.close();
     views.varlighter = { ...varLighterViews(holder), state: () => { throw new Error('secret /path/inside'); } };
     const written: string[] = [];
     process.stderr.write = ((chunk: string) => { written.push(String(chunk)); return true; }) as typeof process.stderr.write;

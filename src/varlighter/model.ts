@@ -194,6 +194,14 @@ export function regimesOf(kind: AssetKind): Regime[] {
 
 // ---- 样本与价差 ----
 /** 一个对齐样本：Var 报价时刻 t 与该场所 Lighter 在 t 之前最近的盘口。档位价格缺失为 null。字段名的 rh 指 Lighter 一侧。 */
+/** 样本导出（`GET /api/varlighter/samples`）的列顺序；由 Record 推出，Sample 加字段而这里漏写时类型检查报错。 */
+const SAMPLE_FIELD_SET: Record<keyof Sample, true> = {
+  symbol: true, t: true, receivedAt: true, regime: true, varMark: true, varBid0: true, varAsk0: true, varBid1k: true, varAsk1k: true, varBid100k: true, varAsk100k: true,
+  varFunding: true, rhAt: true, rhBid0: true, rhAsk0: true, rhMark: true, rhIndex: true, rhFunding: true, rhBid1k: true, rhAsk1k: true, rhBid100k: true, rhAsk100k: true,
+  rhBidRx: true, rhAskRx: true, varBidTk: true, varAskTk: true, varTkAt: true,
+};
+export const SAMPLE_FIELDS = Object.keys(SAMPLE_FIELD_SET) as (keyof Sample)[];
+
 export interface Sample {
   /** 配对键「场所:代码」。 */ symbol: string;
   /** Var 报价时刻（毫秒）。 */ t: number;

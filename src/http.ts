@@ -866,6 +866,7 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
       try {
         if (request.method === 'GET' && path === 'state') return send(response, 200, varlighter.state());
         if (request.method === 'GET' && path === 'symbol') return send(response, 200, varlighter.symbol(url.searchParams.get('symbol'), url.searchParams.get('hours')));
+        if (request.method === 'GET' && path === 'samples') return send(response, 200, varlighter.samples(url.searchParams.get('symbol'), url.searchParams.get('after'), url.searchParams.get('limit')));
         if (request.method === 'GET' && path === 'paper') return send(response, 200, varlighter.paper());
         if (request.method === 'GET' && path === 'readiness') return send(response, 200, varlighter.readiness());
         if (request.method === 'POST' && path === 'backtest') return send(response, 200, varlighter.backtest(await readJson(request)));

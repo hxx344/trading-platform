@@ -50,6 +50,7 @@ export function openVarLighterStore(file: string) {
   } catch (error) { db.close(); throw error; }
   const insertSample = db.prepare(`INSERT OR IGNORE INTO samples(${COLUMNS.join(', ')}) VALUES (${COLUMNS.map(() => '?').join(', ')})`);
   const selectRange = db.prepare(`SELECT ${COLUMNS.join(', ')} FROM samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t`);
+  const selectAfter = db.prepare(`SELECT ${COLUMNS.join(', ')} FROM samples WHERE symbol = ? AND t > ? ORDER BY t LIMIT ?`);
   const selectLatest = db.prepare(`SELECT ${COLUMNS.join(', ')} FROM samples WHERE symbol = ? ORDER BY t DESC LIMIT 1`);
   const countSince = db.prepare('SELECT COUNT(*) AS n FROM samples WHERE symbol = ? AND t >= ?');
   const firstSample = db.prepare('SELECT MIN(t) AS first FROM samples');
@@ -80,6 +81,8 @@ export function openVarLighterStore(file: string) {
       return transaction(() => samples.reduce((count, sample) => count + Number(insertSample.run(...toRow(sample)).changes), 0));
     },
     samples(symbol: string, from: number, to: number): Sample[] { return (selectRange.all(symbol, from, to) as Row[]).map(fromRow); },
+    /** 某配对 after 之后（不含）按时刻升序的至多 limit 条样本，走主键；只读导出（docs/mcp.md 第 8.3 节）用。 */
+    samplesAfter(symbol: string, after: number, limit: number): Sample[] { return (selectAfter.all(symbol, after, limit) as Row[]).map(fromRow); },
     latest(symbol: string): Sample | null { const row = selectLatest.get(symbol) as Row | undefined; return row ? fromRow(row) : null; },
     /** 某配对某时刻以来的样本数（走主键；满量时 210 个配对合计约 60 ms，引擎缓存 10 分钟）。 */
     countSince(symbol: string, since: number): number { return (countSince.get(symbol, since) as { n: number }).n; },

@@ -102,7 +102,8 @@ test('只读令牌：白名单外的 GET、所有 POST、页面、静态资源�
     const dynamic = ['/api/transfer-pairs/xau/balances', '/api/jobs/00000000-0000-4000-8000-000000000000', '/api/monitor/oil/exchanges/gate', '/api/monitor/oil/exchanges/gate/funding-history',
       '/api/monitor/oil/funding', '/api/monitor/perpetual/quote', '/api/monitor/perpetual/summary', '/api/monitor/perpetual/stream', '/api/monitor/perpetual/depth', '/api/crossex/instruments', '/api/crossex/market',
       '/api/crossex/bootstrap', '/api/crossex/requests/x', '/api/ondo/rewards', '/api/ondo/rewards/book', '/api/options/market', '/api/options/preview', '/api/options/rfq', '/api/asset/state', '/api/asset/ledger',
-      '/api/asset/positions', '/api/asset/fills', '/api/observe', '/api/import', '/api/read-token', '/', '/assets/index.js', '/login', '/api/ready', '/api/unknown'];
+      '/api/asset/positions', '/api/asset/fills', '/api/observe', '/api/import', '/api/read-token', '/', '/assets/index.js', '/login', '/api/ready', '/api/unknown',
+      '/api/varlighter/backtest', '/api/varlighter/settings', '/api/varlighter/paper/close', '/api/varlighter/paper/reset', '/api/monitor/perpetual/quote', '/api/monitor/oil/alerts/x', '/api/monitor/variational/quote'];
     assert.ok(literals.length > 30, `路由里的路径字面量：${literals.length}`);
     for (const path of [...literals, ...dynamic]) {
       const allowed = readTokenAllows(new URL(path, 'http://x'));

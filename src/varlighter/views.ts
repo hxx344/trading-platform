@@ -84,5 +84,7 @@ export interface PaperView {
   events: StoredEventView[];
 }
 
+/** 原始样本的一页（docs/mcp.md 第 8.3 节）：rows 每行按 columns 的顺序；next 为本页最后一条的时刻，读完为 null。 */
+export interface SamplesView { symbol: string; columns: (keyof Sample)[]; rows: unknown[][]; next: number | null; firstAt: number | null; retentionDays: number }
 export interface ReadinessItem { key: string; status: 'ok' | 'warn' | 'todo'; label: string; detail: string }
 export interface ReadinessView { now: number; items: ReadinessItem[]; ready: boolean }

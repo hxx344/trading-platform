@@ -112,11 +112,33 @@ Var（Variational Omni）与 Lighter 两个场所——Lighter RH（`api.rh.ligh
 | POST | `backtest` | `{ symbol: <配对键>, hours, params?, global? }`，缺的参数用已保存的补 |
 | GET | `paper` | 模拟持仓、成交、按日汇总、累计曲线、事件、限额 |
 | GET | `readiness` | 实盘前核对清单 |
+| GET | `samples?symbol=<配对键>&after=<毫秒>&limit=<1–1000>` | 原始样本按报价时刻升序的一页（`after` 不含本身）：`{ symbol, columns, rows, next, firstAt, retentionDays }`，`rows` 每行按 `columns` 的顺序，`next` 读完为空。供本机回测拉取（第 9a 节） |
 | POST | `settings` | `{ revision, global?, symbols?: { <配对键>: 参数 }, confirmed?: <配对键>[], venues?: ('rh'\|'lighter')[] }`；每个场所最多启用 10 个配对，参数里最多保存 500 个配对键 |
 | POST | `paper/close` | `{ symbol: <配对键> }` 按最新样本平仓：要 10 分钟内的样本，失联的配对按最后一个样本结算并注明原因；样本过旧又不算失联（数据源故障、启动期）时 409 `no_quote`；没有持仓 404 |
 | POST | `paper/reset` | `{ confirm: 'RESET' }` |
 
 页面不引入后端模块的值，共享类型放在纯类型的 `views.ts`。
+
+## 9a 交给 AI 分析与优化（v0.83.0）
+
+只读令牌可以读本模块的 GET 接口（`state`、`symbol`、`paper`、`readiness`、`samples`），POST（回测、参数、平仓、清空）一律不行，做法见 [mcp.md](mcp.md) 第 8.3 节。
+
+在仓库目录里打开 Claude Code，按 [mcp.md](mcp.md) 第 4 节接上只读 MCP，就有两个工具：
+
+- `varlighter`：读总览、单个配对、模拟盘与实盘准备。
+- `varlighter_backtest`：先把该配对的样本增量拉到本机（默认 `~/.cache/trading-platform/varlighter`，`TP_VARLIGHTER_DIR` 可改），再在新进程里用仓库当前的 `backtest.ts` 重放。`params`、`global` 覆盖已保存的参数，`grid` 扫参数（最多 200 个组合，按净盈亏排序）。
+
+不经 MCP 时同样可以在命令行做（环境变量同 MCP）：
+
+```bash
+node tools/varlighter/pull.ts --enabled                     # 拉已启用、有持仓和失联配对的样本
+node tools/varlighter/backtest.ts --symbol rh:AAPL --hours 168 --params '{"entryBps":25}'
+node tools/varlighter/backtest.ts --symbol rh:AAPL --grid '{"entryBps":[15,20,25,30],"exitBps":[-5,0,5]}'
+```
+
+本机样本从上次的最后一条接着拉，所以可以积累超过服务器 14 天保留期的历史；回测时长 `--hours` 以本机样本为准，省略时回放全部（扣除第一个基线窗口）。
+
+用法：先让 AI 看总览与模拟盘，找出赚钱和亏钱的配对与平仓原因；再用 `grid` 扫入场、出场、止损、最低净利等参数；要改策略逻辑时改 `strategy.ts`、`stats.ts` 等，再用同一批样本对比改动前后。回测结果不会改平台上的参数：参数要在页面上保存，代码改动照常审查、发布。回测与模拟盘同规则，但仍有第 12 节的局限（例如询价数量、止损按公开报价判断），回测赚钱不等于实盘赚钱。
 
 ## 10 页面（`#/varlighter`）
 

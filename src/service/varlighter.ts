@@ -16,6 +16,7 @@ export interface VarLighterHolder { engine: VarLighterEngine | null; error: stri
 export interface VarLighterViews {
   state(): unknown;
   symbol(symbol: string | null, hours: string | null): unknown;
+  samples(symbol: string | null, after: string | null, limit: string | null): unknown;
   backtest(body: unknown): unknown;
   paper(): unknown;
   readiness(): unknown;
@@ -44,6 +45,7 @@ export function varLighterViews(holder: VarLighterHolder): VarLighterViews {
   return {
     state: () => engine().views.state(),
     symbol: (symbol, hours) => engine().views.symbol(symbol, hours === null ? undefined : hours),
+    samples: (symbol, after, limit) => engine().views.samples(symbol, after, limit),
     backtest: body => engine().views.backtest(body),
     paper: () => engine().views.paper(),
     readiness: () => engine().views.readiness(),

@@ -4,13 +4,13 @@ import { anySignal } from '../any-signal.mjs';
 import { TOKEN_QUOTE_CONCURRENCY, TOKEN_QUOTE_MAX_AGE_MS, TOKEN_QUOTE_PHASE_MS, type TokenQuote, type VarQuoter } from './varquote.ts';
 import { backtestRequest, runBacktest } from './backtest.ts';
 import { LighterStream, MAX_DEPTH_MARKETS, depthAt, fetchDepth, fetchRhMarkets, fetchVarListings, type Connect, type DepthSnapshot, type FetchLike } from './feeds.ts';
-import { KIND_NAMES, PAIR_KEY, REGIME_NAMES, VENUES, VENUE_NAMES, bucketOf, hasTokenQuote, midBasis, pairMarkets, regimeOf, regimesOf, sortPairs, spreadOf, tickerOf, venueOf, type PairInfo, type RhMarket, type Sample, type VarListing, type Venue } from './model.ts';
+import { KIND_NAMES, PAIR_KEY, REGIME_NAMES, SAMPLE_FIELDS, VENUES, VENUE_NAMES, bucketOf, hasTokenQuote, midBasis, pairMarkets, regimeOf, regimesOf, sortPairs, spreadOf, tickerOf, venueOf, type PairInfo, type RhMarket, type Sample, type VarListing, type Venue } from './model.ts';
 import { orderPlan, type OrderPlan } from './plan.ts';
 import { BaselineTracker, suggestedEntryBps, symbolStats, type Baseline, type RegimeStats } from './stats.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, ParamsError, closePosition, closeSpread, confirmOpen, decide, openEconomics, slippageBudgetBps, positionSpread, fundingEstimate, markToMarket, openBlocker, openPosition, readGlobalParams, readSymbolParams,
   CLOSE_REASON_NAMES, DIRECTION_NAMES, type ClosedTrade, type Direction, type GlobalParams, type Position, type SymbolParams } from './strategy.ts';
-import type { VarLighterStore } from './store.ts';
-import type { BacktestView, DepthStatus, OrphanRow, PaperView, PollStats, ReadinessItem, ReadinessView, Settings, SourceState, StateView, SymbolPoint, SymbolView, VenueStatus } from './views.ts';
+import { SAMPLE_RETENTION_DAYS, type VarLighterStore } from './store.ts';
+import type { BacktestView, DepthStatus, OrphanRow, PaperView, PollStats, ReadinessItem, ReadinessView, SamplesView, Settings, SourceState, StateView, SymbolPoint, SymbolView, VenueStatus } from './views.ts';
 
 export const VAR_POLL_MS = 60_000;
 export const CATALOG_MS = 10 * 60_000;
@@ -31,6 +31,8 @@ export class VarLighterError extends Error {
   constructor(status: number, code: string, message: string) { super(message); this.status = status; this.code = code; }
 }
 const reject = (code: string, message: string, status = 400): never => { throw new VarLighterError(status, code, message); };
+/** 样本导出每页的上限。 */
+export const SAMPLES_PAGE_MAX = 1000;
 
 export type { Settings } from './views.ts';
 const DEFAULT_SETTINGS: Settings = { revision: 0, global: DEFAULT_GLOBAL, symbols: {}, confirmed: [], venues: [...VENUES] };
@@ -438,6 +440,24 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     return { ...result, trades: result.trades.slice(-1000), equity: result.equity.slice(-1000), truncated };
   }
 
+  /**
+   * 原始样本的一页（docs/mcp.md 第 8.3 节），供客户端拉到本机回测：只读本地库，不看配对是否仍在采集，失联配对的历史也能读。
+   * after 不含本身；limit 1–1000，1000 行约 300 KiB，留在只读令牌 512 KiB 的应答上限以内。
+   */
+  function samplesPage(symbolRaw: unknown, afterRaw: unknown, limitRaw: unknown): SamplesView {
+    const symbol = String(symbolRaw ?? '');
+    if (!PAIR_KEY.test(symbol)) reject('invalid_symbol', '配对键无效（应为「场所:代码」，如 rh:AAPL）');
+    const after = afterRaw === null || afterRaw === undefined ? 0 : Number(afterRaw);
+    if (!/^\d{1,15}$/.test(String(afterRaw ?? '0')) || !Number.isSafeInteger(after)) reject('invalid_after', 'after 须为毫秒时刻（非负整数）');
+    const limit = limitRaw === null || limitRaw === undefined ? SAMPLES_PAGE_MAX : Number(limitRaw);
+    if (!/^\d{1,4}$/.test(String(limitRaw ?? SAMPLES_PAGE_MAX)) || limit < 1 || limit > SAMPLES_PAGE_MAX) reject('invalid_limit', `limit 须为 1–${SAMPLES_PAGE_MAX} 的整数`);
+    const samples = store.samplesAfter(symbol, after, limit);
+    return {
+      symbol, columns: SAMPLE_FIELDS, rows: samples.map(sample => SAMPLE_FIELDS.map(field => sample[field])),
+      next: samples.length === limit ? samples.at(-1)!.t : null, firstAt: store.firstAt(symbol), retentionDays: SAMPLE_RETENTION_DAYS,
+    };
+  }
+
   function paper(): PaperView {
     const time = now(), open = [...positions.values()];
     const trades = store.trades(300);
@@ -588,7 +608,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     /** 测试用：不跑后台循环时按参数启停各场所的行情流。 */
     startStreams(): void { running = true; syncStreams(); },
     pollVar, refreshCatalog, refreshDepth,
-    views: { state, symbol: symbolView, backtest, paper, settings: updateSettings, close: closeManual, reset: resetPaper, readiness },
+    views: { state, symbol: symbolView, samples: samplesPage, backtest, paper, settings: updateSettings, close: closeManual, reset: resetPaper, readiness },
     /** 后台循环：连上各采集场所的行情流并取目录，然后每分钟拉 Var 报价（连同盘口快照），每 10 分钟刷新目录，每小时清理过期样本。 */
     async loop(context: { stopped(): boolean; pause(ms: number): Promise<void> }): Promise<void> {
       running = true;

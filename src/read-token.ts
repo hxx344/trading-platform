@@ -225,6 +225,17 @@ export const READ_TOKEN_ROUTES: readonly { path: string | RegExp; query: readonl
   { path: '/api/crossex/state', query: ['opportunities'] },
   { path: '/api/ondo/state', query: [] },
   { path: '/api/update', query: [] },
+  // docs/mcp.md 8.3: Var/Lighter (public market data and the paper strategy, local database only), the server's own load,
+  // the monitors' quote snapshots and the EQN feed. None asks an exchange; Var/Lighter's POSTs (backtest included) stay out.
+  { path: '/api/varlighter/state', query: [] },
+  { path: '/api/varlighter/symbol', query: ['symbol', 'hours'] },
+  { path: '/api/varlighter/paper', query: [] },
+  { path: '/api/varlighter/readiness', query: [] },
+  { path: '/api/varlighter/samples', query: ['symbol', 'after', 'limit'] },
+  { path: '/api/host', query: [] },
+  { path: /^\/api\/monitor\/(oil|goldoil|hynix|anthropic)\/quote$/, query: [] },
+  { path: '/api/news', query: [] },
+  { path: '/api/news/moves', query: [] },
 ];
 
 /** Whether a read-only token may GET this URL: the path in READ_TOKEN_ROUTES and only its query parameters. */

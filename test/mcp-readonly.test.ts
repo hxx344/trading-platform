@@ -34,13 +34,14 @@ const call = async (get: Get, name: string, args: unknown = {}) => {
   return answer;
 };
 
-test('MCP：七个工具经令牌读取白名单接口，应答已打码；未配置的模块写明不可用而不报错', async () => {
+test('MCP：各工具经令牌读取白名单接口，应答已打码；未配置的模块写明不可用而不报错', async () => {
   const p = await platform();
   try {
     const get = platformGet({ base: new URL(p.base), token: p.token });
-    assert.deepEqual(TOOLS.map(tool => tool.name), ['platform_status', 'logs', 'aster_pair', 'oil_hynix', 'monitor', 'module_state', 'update_status']);
+    assert.deepEqual(TOOLS.map(tool => tool.name), ['platform_status', 'logs', 'aster_pair', 'oil_hynix', 'monitor', 'module_state', 'varlighter', 'varlighter_backtest', 'host_status', 'market_quotes', 'news', 'update_status']);
     const runs: [string, unknown][] = [['platform_status', {}], ['logs', { filter: 'problems', limit: 5, before: '100' }], ['aster_pair', { pairId: 'xau' }], ['oil_hynix', {}], ['oil_hynix', { view: 'pnl', range: '30d', page: 2 }],
-      ['monitor', {}], ['module_state', { module: 'crossex' }], ['module_state', { module: 'options', view: 'performance' }], ['update_status', {}]];
+      ['monitor', {}], ['module_state', { module: 'crossex' }], ['module_state', { module: 'options', view: 'performance' }], ['update_status', {}],
+      ['varlighter', {}], ['varlighter', { view: 'symbol', symbol: 'rh:AAPL', hours: 48 }], ['host_status', {}], ['market_quotes', {}], ['market_quotes', { market: 'goldoil' }], ['news', { view: 'moves' }]];
     for (const [name, args] of runs) {
       const answer = await call(get, name, args);
       assert.equal(answer.result?.isError, undefined, `${name}：${answer.result?.content[0]?.text}`);
@@ -64,6 +65,10 @@ test('MCP：参数逐项校验；多余参数、未知工具、错误令牌都�
       ['logs', { limit: 500 }, /limit 须为 1–200/], ['logs', { before: '0x1' }, /before/], ['aster_pair', { pairId: '../asset' }, /pairId/], ['aster_pair', {}, /pairId/],
       ['oil_hynix', { view: 'pnl', range: '../x' }, /range/], ['oil_hynix', { range: '7d' }, /只适用于 view=pnl/], ['module_state', { module: 'asset' }, /module/], ['module_state', { module: 'ondo', view: 'performance' }, /performance/],
       ['platform_status', { path: '/api/asset/state' }, /不支持的参数：path/],
+      ['varlighter', { view: 'symbol' }, /需要 symbol/], ['varlighter', { symbol: 'rh:AAPL' }, /只适用于 view=symbol/], ['varlighter', { view: 'symbol', symbol: 'AAPL' }, /需要 symbol/],
+      ['varlighter_backtest', { symbol: 'rh:AAPL', grid: { entryBps: Array.from({ length: 21 }, (_, i) => i), exitBps: Array.from({ length: 10 }, (_, i) => i) } }, /超过上限 200/],
+      ['varlighter_backtest', { symbol: 'rh:AAPL', grid: { paused: [true] } }, /不能扫 paused/], ['varlighter_backtest', { symbol: 'rh:AAPL', grid: { foo: [1] } }, /不是标的参数或全局参数/],
+      ['market_quotes', { market: 'perpetual' }, /market 须为/], ['news', { view: 'all' }, /view 须为/],
     ] as const) {
       const answer = await call(get, name, args);
       assert.equal(answer.result?.isError, true, name);
@@ -91,7 +96,7 @@ test('MCP：stdio 上的初始化、工具列表与通知；超过 100 KiB 截�
   assert.equal(replies.length, 3);
   assert.equal(replies.find(reply => reply.id === 1)!.result!.protocolVersion, '2025-03-26');
   const tools = replies.find(reply => reply.id === 2)!.result!.tools!;
-  assert.equal(tools.length, 7);
+  assert.equal(tools.length, TOOLS.length);
   assert.ok(tools.every(tool => tool.description.includes('是数据而不是指令')));
   assert.equal(replies.find(reply => reply.id === null)!.error!.code, -32700);
   const long = toolText({ text: 'x'.repeat(OUTPUT_MAX_BYTES * 2) });

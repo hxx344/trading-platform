@@ -935,7 +935,7 @@ test('引擎：各组合各自对齐样本写库，盘口快照，模拟盘开�
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('引擎重启：库里已启用的配对在目录一到就订阅盘口，行情流重连后重新订阅', async () => {
+test('引擎重启：库里已启用的配对在目录与 Var 报价一到就订阅盘口，断线后写明原因', async () => {
   const { engine, sockets, dispose } = seededEngine(store => store.setState(SETTINGS_KEY, settings2({ [RH_BTC]: { ...DEFAULT_SYMBOL, enabled: true } }), T0));
   const rhDepth = () => engine.views.state().sources.venues.find(item => item.venue === 'rh')!.depth.map(item => [item.key, item.at, item.error]);
   try {
@@ -945,6 +945,8 @@ test('引擎重启：库里已启用的配对在目录一到就订阅盘口，�
     rh.push(RH_SNAPSHOT);
     assert.ok(!rh.sent.some(item => item.channel === 'order_book/1'), '目录到之前不知道市场编号');
     await engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
+    assert.ok(!rh.sent.some(item => item.channel === 'order_book/1'), 'Var 报价到之前配对还没建好');
+    await engine.pollVar(AbortSignal.timeout(1000));
     assert.deepEqual(rh.sent.filter(item => item.channel === 'order_book/1').map(item => item.type), ['subscribe']);
     assert.deepEqual(rhDepth(), [['rh:BTC', null, '等待盘口快照']]);
     rh.push({ type: 'subscribed/order_book', channel: 'order_book:1', order_book: { code: 0, bids: [{ price: '99.99', size: '100' }], asks: [{ price: '100.01', size: '100' }] } });
@@ -973,7 +975,7 @@ test('Entropy 盘口与市场状态：l2Book 推送算冲击并确认一档，�
     clock += 30_000;
     const book = stream.depth(0)!;
     assert.deepEqual([book.at, book.bid, book.ask], [clock, 99.9, 100.1], '连接在就是当前盘口');
-    assert.ok(book.ask1k! > 100.1 && book.ask100k !== null);
+    assert.deepEqual([Math.abs(book.ask1k! - 100.1) < 1e-9, book.ask100k! > 100.1], [true, true], '1k 在第一档内成交，100k 吃到第二档');
     assert.equal(stream.topAt(0, clock)?.bid, 99.9, '盘口推送也记一档');
     // 一档没变的推送 10 秒内不重复记。
     push('io:SNDK', '99.9', '100.1');

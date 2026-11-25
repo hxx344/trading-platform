@@ -1,5 +1,5 @@
-// DEX 价差页（docs/varlighter.md、docs/dexspread.md）的本地预览：替身 Var 公开行情、Lighter RH 与 Lighter 主网的行情流与盘口快照、
-// Entropy（Hyperliquid io）的目录、bbo 行情流与 l2Book，临时数据目录里预先写入 4 天的分钟样本，并按回测结果补几笔模拟成交，
+// DEX 价差页（docs/varlighter.md、docs/dexspread.md）的本地预览：替身 Var 公开行情、Lighter RH 与 Lighter 主网的行情流（一档与 order_book 盘口）、
+// Entropy（Hyperliquid io）的目录与行情流（bbo、activeAssetCtx、l2Book），临时数据目录里预先写入 4 天的分钟样本，并按回测结果补几笔模拟成交，
 // 页面上的走势、统计、模拟盘都有内容。不联网，退出时删除临时目录。
 //   pnpm build:web; node scripts/dev-varlighter.ts [--port 4733]
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -155,27 +155,62 @@ function topOf(market: Market, venue: LiveVenue) {
   const t = Date.now(), price = liveMid(market, venue, step(market, Math.floor(t / 60_000) * 60_000).price, t), spread = half(price, crypto(market) ? 1 : 3);
   return { bid: price - spread, ask: price + spread, price };
 }
-// 替身 Lighter 行情流：每秒推一次本场所全市场一档。
+/** Lighter 一个市场的五档盘口（价、量）。 */
+function lighterLevels(market: Market, venue: LiveVenue): { bids: { price: string; size: string }[]; asks: { price: string; size: string }[] } {
+  const top = topOf(market, venue), size = (40_000 / top.price).toFixed(4);
+  const levels = (side: 1 | -1, from: number) => [0, 1, 2, 3, 4].map(level => ({ price: (from + side * half(top.price, level * 1.5)).toFixed(4), size }));
+  return { bids: levels(-1, top.bid), asks: levels(1, top.ask) };
+}
+// 替身 Lighter 行情流：每秒推一次本场所全市场一档；订阅了盘口的市场先给快照，之后每秒推增量（删旧档、加新档，nonce 相连）。
 class FakeLighter extends FakeSocket {
   private readonly venue: LiveVenue;
+  private readonly books = new Map<number, { levels: ReturnType<typeof lighterLevels>; nonce: number }>();
   constructor(venue: LiveVenue) { super(); this.venue = venue; }
   private stats() {
     return Object.fromEntries(onVenue(this.venue).map(({ market, id }) => { const top = topOf(market, this.venue); return [id, { market_id: id, symbol: market.symbol, best_bid_price: top.bid.toFixed(4), best_ask_price: top.ask.toFixed(4), mark_price: top.price.toFixed(4), index_price: top.price.toFixed(4), current_funding_rate: '0.0005' }]; }));
   }
-  protected tick() { this.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: this.stats() }); }
+  protected tick() {
+    this.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: this.stats() });
+    for (const [id, book] of this.books) {
+      const found = onVenue(this.venue).find(item => item.id === id);
+      if (!found) continue;
+      const next = lighterLevels(found.market, this.venue);
+      const diff = (old: { price: string }[], fresh: { price: string; size: string }[]) => [...old.filter(level => !fresh.some(item => item.price === level.price)).map(level => ({ price: level.price, size: '0.0000' })), ...fresh];
+      this.push({ type: 'update/order_book', channel: `order_book:${id}`, order_book: { code: 0, bids: diff(book.levels.bids, next.bids), asks: diff(book.levels.asks, next.asks), begin_nonce: book.nonce, nonce: book.nonce + 1 } });
+      this.books.set(id, { levels: next, nonce: book.nonce + 1 });
+    }
+  }
   send(data: string) {
     const message = JSON.parse(data) as { type: string; channel?: string };
     if (message.type === 'subscribe' && message.channel === 'market_stats/all') this.push({ type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: this.stats() });
+    const book = /^order_book\/(\d+)$/.exec(message.channel ?? '');
+    if (!book) return;
+    const id = Number(book[1]);
+    if (message.type === 'unsubscribe') { this.books.delete(id); return; }
+    const found = onVenue(this.venue).find(item => item.id === id);
+    if (message.type !== 'subscribe' || !found) return;
+    const levels = lighterLevels(found.market, this.venue);
+    this.books.set(id, { levels, nonce: 1 });
+    this.push({ type: 'subscribed/order_book', channel: `order_book:${id}`, order_book: { code: 0, ...levels, nonce: 1 } });
   }
 }
-// 替身 Entropy（Hyperliquid）行情流：订阅过的市场每秒推一次 bbo，l2Book 的 post 立即回应，ping 回 pong。
+// 替身 Entropy（Hyperliquid）行情流：按订阅每秒推 bbo、activeAssetCtx 与 l2Book，l2Book 的 post 立即回应，ping 回 pong。
 class FakeEntropy extends FakeSocket {
-  private readonly coins = new Set<string>();
-  protected tick() { for (const coin of this.coins) { const found = entropyMarket(coin); if (found) { const top = topOf(found, 'entropy'); this.push({ channel: 'bbo', data: { coin, time: Date.now(), bbo: [{ px: top.bid.toFixed(3), sz: '50', n: 3 }, { px: top.ask.toFixed(3), sz: '50', n: 2 }] } }); } } }
+  private readonly subscriptions = new Set<string>();
+  protected tick() {
+    for (const key of this.subscriptions) {
+      const [type, coin] = key.split('|') as [string, string], found = entropyMarket(coin);
+      if (!found) continue;
+      const top = topOf(found, 'entropy');
+      if (type === 'bbo') this.push({ channel: 'bbo', data: { coin, time: Date.now(), bbo: [{ px: top.bid.toFixed(3), sz: '50', n: 3 }, { px: top.ask.toFixed(3), sz: '50', n: 2 }] } });
+      if (type === 'activeAssetCtx') this.push({ channel: 'activeAssetCtx', data: { coin, ctx: { markPx: top.price.toFixed(3), oraclePx: (top.price * 0.9998).toFixed(3), funding: '0.0000125', openInterest: '1000' } } });
+      if (type === 'l2Book') this.push({ channel: 'l2Book', data: l2Book(coin) });
+    }
+  }
   send(data: string) {
-    const message = JSON.parse(data) as { method: string; id?: number; subscription?: { coin: string }; request?: { payload: { coin: string } } };
-    if (message.method === 'subscribe' && message.subscription) { this.coins.add(message.subscription.coin); this.push({ channel: 'subscriptionResponse', data: message }); }
-    if (message.method === 'unsubscribe' && message.subscription) this.coins.delete(message.subscription.coin);
+    const message = JSON.parse(data) as { method: string; id?: number; subscription?: { type: string; coin: string }; request?: { payload: { coin: string } } };
+    if (message.method === 'subscribe' && message.subscription) { this.subscriptions.add(`${message.subscription.type}|${message.subscription.coin}`); this.push({ channel: 'subscriptionResponse', data: message }); }
+    if (message.method === 'unsubscribe' && message.subscription) this.subscriptions.delete(`${message.subscription.type}|${message.subscription.coin}`);
     if (message.method === 'ping') this.push({ channel: 'pong' });
     if (message.method === 'post' && message.request) this.push({ channel: 'post', data: { id: message.id, response: { type: 'info', payload: { type: 'l2Book', data: l2Book(message.request.payload.coin) } } } });
   }
@@ -189,13 +224,11 @@ function l2Book(coin: string) {
   return { coin, time: Date.now(), levels: [levels(-1, top.bid), levels(1, top.ask)] };
 }
 
-// 替身 Var 公开行情、各场所的目录与盘口快照。Var 报价时刻比收到时早 20 秒，与真实接口的缓存相近。
+// 替身 Var 公开行情与各场所的目录（盘口走上面的替身行情流）。Var 报价时刻比收到时早 20 秒，与真实接口的缓存相近。
 const venueOfUrl = (url: string): LiveVenue => url.includes('hyperliquid') ? 'entropy' : url.includes('api.rh.lighter.xyz') ? 'rh' : 'lighter';
-const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+const fetchImpl = async (input: string | URL | Request): Promise<Response> => {
   const url = String(input instanceof Request ? input.url : input);
   if (url.includes('hyperliquid.xyz/info')) {
-    const body = JSON.parse(String(init?.body ?? '{}')) as { type: string; coin?: string };
-    if (body.type === 'l2Book') return Response.json(l2Book(body.coin ?? ''));
     const listed = onVenue('entropy');
     return Response.json([
       { universe: listed.map(({ market }) => ({ name: `io:${market.symbol}`, szDecimals: market.price > 100 ? 2 : 1, maxLeverage: 10, deployerFeeScale: '1.0', growthMode: 'disabled' })), collateralToken: 0 },
@@ -208,14 +241,6 @@ const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Pro
       symbol: market.symbol, market_id: id, market_type: 'perp', status: 'active', size_decimals: market.price > 1000 ? 5 : 2, price_decimals: market.price > 1000 ? 1 : 3,
       min_base_amount: market.price > 1000 ? '0.0002' : '0.5', min_quote_amount: '10', taker_fee: '0.0000', maker_fee: '0.0000', mark_price: String(topOf(market, venue).price),
     })) });
-  }
-  if (url.includes('orderBookOrders')) {
-    const id = Number(new URL(url).searchParams.get('market_id')), venue = venueOfUrl(url);
-    const found = onVenue(venue).find(item => item.id === id);
-    if (!found) return Response.json({ code: 21100, message: 'market not found' }, { status: 400 });
-    const top = topOf(found.market, venue), size = (40_000 / top.price).toFixed(4);
-    const levels = (side: 1 | -1, from: number) => [0, 1, 2, 3, 4].map(level => ({ price: (from + side * half(top.price, level * 1.5)).toFixed(4), remaining_base_amount: size }));
-    return Response.json({ code: 200, total_asks: 5, asks: levels(1, top.ask), total_bids: 5, bids: levels(-1, top.bid) });
   }
   const at = Date.now() - 20_000;
   return Response.json({ listings: MARKETS.map(market => {

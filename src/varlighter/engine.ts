@@ -5,7 +5,7 @@
 import { anySignal } from '../any-signal.mjs';
 import { TOKEN_QUOTE_CONCURRENCY, TOKEN_QUOTE_MAX_AGE_MS, TOKEN_QUOTE_PHASE_MS, type TokenQuote, type VarQuoter } from './varquote.ts';
 import { backtestRequest, runBacktest } from './backtest.ts';
-import { HyperliquidStream, LighterStream, MAX_DEPTH_MARKETS, depthAt, fetchDepth, fetchEntropyDepth, fetchEntropyMarkets, fetchRhMarkets, fetchVarListings,
+import { HyperliquidStream, LighterStream, MAX_DEPTH_MARKETS, depthAt, fetchEntropyMarkets, fetchRhMarkets, fetchVarListings,
   type Connect, type DepthSnapshot, type FetchLike, type LiveStream, type TopPoint } from './feeds.ts';
 import { ASSET_KINDS, COMBOS, DEFAULT_COMBOS, KIND_NAMES, LEG_SYMBOL, LIVE_VENUES, RATIO_MAX, RATIO_MIN, REGIME_NAMES, SAMPLE_FIELDS, SAMPLE_FORMAT, VENUE_IDS, VENUE_NAMES,
   bothLive, bucketOf, comboName, comboPairs, comboVenues, customPairInfo, formatRatio, hasTokenQuote, isLive, legKey, lighterMarket, midBasis, pairKey, pairTitle, parsePairKey,
@@ -22,12 +22,12 @@ import type { BacktestView, CatalogEntry, DepthStatus, LegRef, LiveStats, Orphan
 
 export const VAR_POLL_MS = 60_000;
 export const CATALOG_MS = 10 * 60_000;
-/** Entropy 的目录请求同时带回标记价、预言机价与资金费，每分钟一次。 */
-export const ENTROPY_CATALOG_MS = 60_000;
+/** 目录读取失败后的重试间隔。 */
+export const CATALOG_RETRY_MS = 60_000;
 /** 两腿都是行情流的配对：检查间隔、启用或有持仓的采样间隔、其余的采样间隔。 */
 export const LIVE_TICK_MS = 5_000, LIVE_ACTIVE_MS = 15_000, LIVE_IDLE_MS = 60_000;
-/** 盘口快照与 Var token 询价的间隔。 */
-export const DEPTH_MS = 60_000;
+/** 盘口（行情流）超过这么久没同步算过期。 */
+export const DEPTH_STALE_MS = 3 * 60_000;
 const PRUNE_MS = 3_600_000;
 const PRUNE_BATCH = 2_000;
 const RECOUNT_MS = 10 * 60_000;
@@ -122,11 +122,12 @@ function autoComboOf(key: string): Combo | null {
   return COMBOS.includes(combo) ? combo : null;
 }
 
-/** 一个行情流场所的运行状态：行情流（没有配对用到时为 null）、目录与各腿的盘口快照。 */
+/** 一个行情流场所的运行状态：行情流（没有配对用到时为 null）、目录与订阅完整盘口的腿（最近一次取到的快照与原因）。 */
 interface VenueRuntime {
   venue: LiveVenue; stream: LiveStream | null; markets: MarketSpec[]; bySymbol: Map<string, MarketSpec>; catalog: SourceState; nextCatalog: number;
-  depth: Map<string, { leg: LegInfo; snapshot: DepthSnapshot | null; error: string | null }>;
+  depth: Map<string, DepthEntry>;
 }
+interface DepthEntry { leg: LegInfo; snapshot: DepthSnapshot | null; error: string | null }
 
 export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now = Date.now, log = () => {}, quoter }: EngineOptions) {
   const open = connect ?? (url => new WebSocket(url) as unknown as ReturnType<Connect>);
@@ -209,7 +210,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     }
     pairs = sortPairs(built);
     pairsByKey = new Map(pairs.map(pair => [pair.key, pair]));
-    // 重启后参数与持仓先于配对就有了：配对一建好就补上要取盘口快照的腿与 Entropy 要订阅的市场。
+    // 重启后参数与持仓先于配对就有了：配对一建好就补上要订阅盘口的腿与 Entropy 要订阅的市场。
     updateDepth();
     syncEntropyMarkets();
   }
@@ -227,9 +228,9 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     return found;
   }
 
-  /** 需要盘口快照的腿：启用的与有持仓的配对的行情流腿，每个场所最多 MAX_DEPTH_MARKETS 条。 */
+  /** 订阅完整盘口的腿：启用的与有持仓的配对的行情流腿，每个场所最多 MAX_DEPTH_MARKETS 条；同步给各场所的行情流。 */
   function updateDepth(): void {
-    // 有持仓的配对排在前面：腿数到上限时先保住持仓腿的盘口快照（平仓滑点要用）。
+    // 有持仓的配对排在前面：腿数到上限时先保住持仓腿的盘口（平仓滑点要用）。
     const active = [...activeKeys()].sort((x, y) => Number(positions.has(y)) - Number(positions.has(x)) || (x < y ? -1 : x > y ? 1 : 0));
     for (const runtime of live.values()) {
       const wanted = new Map<string, LegInfo>();
@@ -239,6 +240,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       }
       for (const [key, entry] of runtime.depth) if (wanted.get(key)?.market.id !== entry.leg.market.id) runtime.depth.delete(key);
       for (const [key, leg] of wanted) if (!runtime.depth.has(key)) runtime.depth.set(key, { leg, snapshot: null, error: null });
+      runtime.stream?.setDepthMarkets(new Map([...runtime.depth.values()].map(({ leg }) => [leg.market.id, leg.market.coin ?? `io:${leg.symbol}`])));
     }
   }
   /** Entropy 行情流订阅配对用到的市场。 */
@@ -259,12 +261,13 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
         runtime.stream = runtime.venue === 'entropy' ? new HyperliquidStream({ connect: open, now, log }) : new LighterStream({ venue: runtime.venue, connect: open, now, log });
         runtime.stream.start();
         if (runtime.venue === 'entropy') syncEntropyMarkets();
+        updateDepth();
       }
       if (!want && runtime.stream) { runtime.stream.close(); runtime.stream = null; runtime.depth.clear(); }
     }
   }
 
-  /** 刷新一个行情流场所的目录（Lighter 是合约目录，Entropy 同时带回标记价与资金费）。没有配对用到的场所也取目录，手动配对要从里面选。 */
+  /** 刷新一个行情流场所的目录（合约规格、手续费，以及自动配对规格核对用的标记价）。没有配对用到的场所也取目录，手动配对要从里面选。 */
   async function refreshCatalog(signal: AbortSignal, venue: LiveVenue = 'rh'): Promise<void> {
     const runtime = live.get(venue)!;
     runtime.catalog.at = now();
@@ -276,15 +279,14 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     } catch (error) { runtime.catalog.error = message(error); }
   }
 
-  /** 取各场所需要的盘口快照（并发；单条腿失败只记在该腿上）。 */
-  async function refreshDepth(signal: AbortSignal): Promise<void> {
-    const jobs: Promise<void>[] = [];
-    for (const runtime of live.values()) for (const entry of runtime.depth.values()) {
-      const leg = entry.leg, request = runtime.venue === 'entropy'
-        ? fetchEntropyDepth(fetchImpl, leg.market.coin ?? `io:${leg.symbol}`, signal, now) : fetchDepth(fetchImpl, runtime.venue, leg.market.id, signal, now);
-      jobs.push(request.then(snapshot => { entry.snapshot = snapshot; entry.error = null; }, error => { entry.error = message(error); }));
-    }
-    await Promise.all(jobs);
+  /** 从行情流取一条腿当前的盘口快照；取不到时保留上一份（按时刻过期），原因记在该腿上。 */
+  function refreshEntry(runtime: VenueRuntime, entry: DepthEntry): void {
+    const snapshot = runtime.stream?.depth(entry.leg.market.id) ?? null;
+    if (snapshot) { entry.snapshot = snapshot; entry.error = null; } else entry.error = runtime.stream?.depthError(entry.leg.market.id) ?? '行情流未连接';
+  }
+  /** 刷新各场所订阅中的盘口快照（读行情流里的当前盘口，不发请求）。 */
+  function refreshDepth(): void {
+    for (const runtime of live.values()) for (const entry of runtime.depth.values()) refreshEntry(runtime, entry);
   }
 
   /**
@@ -319,7 +321,9 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     const runtime = live.get(leg.venue as LiveVenue)!, stream = runtime.stream;
     const at = top === undefined ? stream?.topAt(leg.market.id, t) ?? null : top;
     if (!at) return null;
-    const depth = depthAt(runtime.depth.get(legKey(leg))?.snapshot, at, t);
+    const entry = runtime.depth.get(legKey(leg));
+    if (entry) refreshEntry(runtime, entry);
+    const depth = depthAt(entry?.snapshot, at, t);
     const rx = decideAt === t ? at : stream?.topAt(leg.market.id, decideAt) ?? null;
     return {
       At: at.at, Mark: at.mark ?? leg.market.mark, Index: at.index ?? leg.market.index, Funding: at.funding ?? leg.market.fundingHourly,
@@ -355,8 +359,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   }
 
   /**
-   * 每分钟一轮：拉 Var 报价，同时取盘口快照与（有 token 时）询价；有 Var 腿的配对按报价时刻对齐另一腿当时的一档，写库、计入基线、跑模拟盘。
-   * Var 拉取失败时盘口快照照取（两腿都是行情流的配对还要用）。
+   * 每分钟一轮：拉 Var 报价，（有 token 时）询价；有 Var 腿的配对按报价时刻对齐另一腿当时的一档（盘口冲击取行情流的当前盘口），写库、计入基线、跑模拟盘。
    */
   async function pollVar(signal: AbortSignal): Promise<void> {
     varSource.at = now();
@@ -364,13 +367,13 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     try { fetched = await fetchVarListings(fetchImpl, signal, now); } catch (error) { varSource.error = message(error); }
     const receivedAt = now();
     const stats: PollStats = { at: receivedAt, listings: fetched?.length ?? 0, fresh: 0, unchanged: 0, noQuote: 0, noTop: 0, written: 0, noLive: 0, blocked: {}, tokenOk: 0, tokenFailed: 0, tokenSkipped: 0 };
-    if (!fetched) { await refreshDepth(signal); return; }
+    if (!fetched) return;
     if (varSource.ok === null || receivedAt - varSource.ok > 3 * VAR_POLL_MS) varHealthySince = receivedAt;
     varSource.ok = receivedAt; varSource.error = null; varSource.count = fetched.length;
     listings = new Map(fetched.map(listing => [listing.ticker, listing]));
     varMarkets = new Map(fetched.map(listing => [listing.ticker, varMarket(listing)]));
     rebuildPairs();
-    const [, asked] = await Promise.all([refreshDepth(signal), tokenQuotes(signal, stats)]);
+    const asked = await tokenQuotes(signal, stats);
     tokens = asked;
     const fresh: { pair: PairInfo; sample: Sample }[] = [];
     const decideAt = now();
@@ -509,6 +512,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
         aFeeBps: legFeeBps(settings.global, pair.a.venue, pair.a.market.takerFeeBps), bFeeBps: legFeeBps(settings.global, pair.b.venue, pair.b.market.takerFeeBps),
       };
     });
+    refreshDepth();
     const sortedAges = [...ages].sort((a, b) => a - b), used = usedVenues();
     return {
       now: time, startedAt,
@@ -728,11 +732,11 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
         if (coveredBefore(key) && !coveredAfter(key)) reject('pair_busy', `${pairTitle(key)}（${key}）还启用着或有模拟持仓，先停用并平仓再关闭它的组合或删除手动配对`, 409);
       }
       for (const venue of LIVE_VENUES) {
-        // 有持仓的配对也要取盘口快照，一并计入上限。
+        // 有持仓的配对也要订阅盘口，一并计入上限。
         const legsOf = (keys: string[]) => new Set([...new Set([...keys, ...positions.keys()])].flatMap(legsOfKey).filter(leg => leg.startsWith(`${venue}:`)));
         const legs = legsOf(enabled), before = legsOf(Object.entries(settings.symbols).filter(([, params]) => params.enabled).map(([key]) => key));
         // 只挡这次让腿变多的保存：升级前留下的超额状态不卡住无关的保存（改全局参数、确认规格）。
-        if (legs.size > MAX_DEPTH_MARKETS && [...legs].some(leg => !before.has(leg))) reject('too_many', `${VENUE_NAMES[venue]} 一侧启用或有模拟持仓的市场最多 ${MAX_DEPTH_MARKETS} 个（每分钟取一次盘口快照），先停用或平掉一些`);
+        if (legs.size > MAX_DEPTH_MARKETS && [...legs].some(leg => !before.has(leg))) reject('too_many', `${VENUE_NAMES[venue]} 一侧启用或有模拟持仓的市场最多 ${MAX_DEPTH_MARKETS} 个（各订阅完整盘口），先停用或平掉一些`);
       }
       for (const key of enabled) {
         const pair = pairOf(key), wasEnabled = settings.symbols[key]?.enabled === true;
@@ -811,8 +815,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     const unknownFee = enabled.filter(row => row.aFeeBps === null || row.bFeeBps === null);
     items.push({ key: 'fees', status: unknownFee.length ? 'warn' : 'ok', label: '两腿手续费', detail: unknownFee.length ? `手续费未知（不开仓）：${unknownFee.map(label).join('、')}；可在全局参数里填手动值` : '已启用配对两腿的手续费都已知（目录或手动值）' });
     const depth = active.flatMap(item => item.depth);
-    const stale = depth.filter(item => item.at === null || time - item.at > 3 * DEPTH_MS);
-    items.push({ key: 'depth', status: depth.length && !stale.length ? 'ok' : 'warn', label: '盘口快照', detail: depth.length ? `${depth.length - stale.length}/${depth.length} 条腿三分钟内取到${stale.length ? `；缺：${stale.map(item => `${item.key}${item.error ? `（${item.error}）` : ''}`).join('、')}` : ''}` : '没有启用配对，未取快照' });
+    const stale = depth.filter(item => item.at === null || time - item.at > DEPTH_STALE_MS || item.error !== null);
+    items.push({ key: 'depth', status: depth.length && !stale.length ? 'ok' : 'warn', label: '盘口（行情流）', detail: depth.length ? `${depth.length - stale.length}/${depth.length} 条腿的盘口已同步${stale.length ? `；缺：${stale.map(item => `${item.key}${item.error ? `（${item.error}）` : ''}`).join('、')}` : ''}` : '没有启用配对，未订阅盘口' });
     const totals = store.totals();
     items.push({ key: 'paper', status: totals.trades >= READY_PAPER_TRADES && totals.netUsd > 0 ? 'ok' : 'warn', label: `模拟盘至少 ${READY_PAPER_TRADES} 笔且净盈利`, detail: `${totals.trades} 笔，净 ${fmt(totals.netUsd, 2)} 美元，胜率 ${totals.trades ? fmt(totals.wins / totals.trades * 100, 0) : '-'}%` });
     const enabledVar = enabled.some(row => row.a.venue === 'var' || row.b.venue === 'var');
@@ -851,7 +855,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     pollVar, refreshCatalog, refreshDepth, sampleLive,
     views: { state, symbol: symbolView, samples: samplesPage, backtest, paper, settings: updateSettings, close: closeManual, reset: resetPaper, readiness },
     /**
-     * 后台循环：连上用到的行情流并在后台取各场所目录（Lighter 每 10 分钟，Entropy 用到时每分钟、否则每 10 分钟），然后每分钟拉 Var 报价（连同盘口快照与询价），
+     * 后台循环：连上用到的行情流（一档、标记价、资金费与启用配对的盘口都走行情流）并在后台每 10 分钟取各场所目录，然后每分钟拉 Var 报价（连同询价），
      * 每 5 秒检查两腿都是行情流的配对是否到期采样，每小时清理过期样本。
      */
     async loop(context: { stopped(): boolean; pause(ms: number): Promise<void> }): Promise<void> {
@@ -874,14 +878,13 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       try {
         while (!context.stopped()) {
           const time = now();
-          const used = usedVenues();
           for (const runtime of live.values()) {
             if (time < runtime.nextCatalog || busy.has(`catalog:${runtime.venue}`)) continue;
-            // Entropy 目录带标记价与资金费，用到时每分钟取；没用到（只为手动配对选代码）时与 Lighter 一样十分钟一次。
-            runtime.nextCatalog = time + (runtime.venue === 'entropy' && used.has('entropy') ? ENTROPY_CATALOG_MS : CATALOG_MS);
+            // 标记价与资金费都走行情流，目录只为规格、手续费与自动配对的规格核对，各场所十分钟一次；失败一分钟后重试。
+            runtime.nextCatalog = time + CATALOG_MS;
             background(`catalog:${runtime.venue}`, async () => {
               await refreshCatalog(request(), runtime.venue);
-              if (runtime.catalog.error) runtime.nextCatalog = Math.min(runtime.nextCatalog, (runtime.catalog.at ?? now()) + ENTROPY_CATALOG_MS);
+              if (runtime.catalog.error) runtime.nextCatalog = Math.min(runtime.nextCatalog, (runtime.catalog.at ?? now()) + CATALOG_RETRY_MS);
             });
           }
           if (time >= nextVar && !busy.has('var') && [...live.values()].some(runtime => runtime.markets.length)) {

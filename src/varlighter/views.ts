@@ -26,7 +26,7 @@ export interface LighterStatus {
   connected: boolean; connectedAt: number | null; lastMessageAt: number | null; reconnects: number; lastError: string | null;
   markets: number; bytes: number; bytesSince: number | null;
 }
-/** 一条腿的盘口快照状态：key 是腿「场所:代码」，最近一次成功的时刻与最近一次的错误。 */
+/** 一条腿的盘口（行情流订阅）状态：key 是腿「场所:代码」，最近一次取到的时刻与当前不可用的原因。 */
 export interface DepthStatus { key: string; marketId: number; at: number | null; error: string | null }
 /** 一个行情流场所的采集状态；没有组合或手动配对用到时 enabled 为假、stream 为 null。 */
 export interface VenueStatus { venue: LiveVenue; name: string; enabled: boolean; catalog: SourceState; stream: LighterStatus | null; depth: DepthStatus[]; pairs: number }

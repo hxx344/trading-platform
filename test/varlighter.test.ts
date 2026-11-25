@@ -17,7 +17,7 @@ import { pairMarkets, parsePairKey, parseRhMarkets, parseVarListings, parseVarQu
 import { BaselineTracker, RollingWindow, regimeStats, suggestedEntryBps } from '../src/varlighter/stats.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, closePosition, decide, openBlocker, openPosition, positionSpread, readGlobalParams, readSymbolParams, type GlobalParams, type Position, type SymbolParams } from '../src/varlighter/strategy.ts';
 import { backtestRequest, runBacktest } from '../src/varlighter/backtest.ts';
-import { CONNECT_TIMEOUT_MS, DEPTH_MAX_GAP_MS, HyperliquidStream, LighterStream, depthAt, depthSnapshot, parseBookOrders, vwap, type SocketLike } from '../src/varlighter/feeds.ts';
+import { CONNECT_TIMEOUT_MS, DEPTH_MAX_GAP_MS, HyperliquidStream, LighterStream, depthAt, depthSnapshot, vwap, type SocketLike } from '../src/varlighter/feeds.ts';
 import { orderPlan } from '../src/varlighter/plan.ts';
 import { MIGRATED_KEY, openVarLighterStore } from '../src/varlighter/store.ts';
 import { COOLDOWN_KEY, LEGACY_UPGRADE, SETTINGS_KEY, createVarLighterEngine, customKey, downsample, readCustomPair, upgradeSettings } from '../src/varlighter/engine.ts';
@@ -526,12 +526,8 @@ test('按金额的成交均价：深度不足为空', () => {
   assert.equal(vwap([[100, 1]], 1000), null);
 });
 
-test('盘口快照：逐笔挂单按价合并排序，冲击套到对齐时刻的一档价上，相隔过久不用', () => {
-  const book = parseBookOrders({ code: 200, asks: [{ price: '100.2', remaining_base_amount: '20' }, { price: '100.1', remaining_base_amount: '3' }, { price: '100.1', remaining_base_amount: '2' }, { price: 'x', remaining_base_amount: '1' }],
-    bids: [{ price: '99.8', remaining_base_amount: '50' }, { price: '99.9', remaining_base_amount: '5' }] });
-  assert.deepEqual(book.asks, [[100.1, 5], [100.2, 20]]);
-  assert.deepEqual(book.bids, [[99.9, 5], [99.8, 50]]);
-  const snapshot = depthSnapshot(book, T0);
+test('盘口快照：冲击套到对齐时刻的一档价上，相隔过久不用', () => {
+  const snapshot = depthSnapshot({ asks: [[100.1, 5], [100.2, 20]], bids: [[99.9, 5], [99.8, 50]] }, T0);
   assert.equal(snapshot.bid, 99.9);
   assert.ok(snapshot.ask1k! > 100.1 && snapshot.ask1k! < 100.2);
   assert.equal(snapshot.ask100k, null, '深度不足');
@@ -543,7 +539,64 @@ test('盘口快照：逐笔挂单按价合并排序，冲击套到对齐时刻�
   assert.equal(depthAt(snapshot, { bid: 100.4, ask: 100.6 }, T0 - DEPTH_MAX_GAP_MS - 1), null);
   assert.equal(depthAt(null, { bid: 1, ask: 2 }, T0), null);
   assert.throws(() => depthSnapshot({ bids: [[100.2, 1]], asks: [[100.1, 1]] }, T0), /倒挂/);
-  assert.throws(() => parseBookOrders({ code: 200, asks: [] }), /格式无效/);
+  assert.throws(() => depthSnapshot({ bids: [[100, 1]], asks: [] }, T0), /为空/);
+});
+
+test('Lighter 盘口行情流：订阅 order_book，快照加增量（数量 0 删档），nonce 断档与倒挂重新订阅，快照超时重订，退订与断线清空', () => {
+  let clock = T0;
+  const sockets: FakeSocket[] = [];
+  const stream = new LighterStream({ venue: 'rh', connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now: () => clock });
+  const tick = () => (stream as unknown as { tick(): void }).tick();
+  try {
+    stream.setDepthMarkets(new Map([[1, '1']]));
+    stream.start();
+    const socket = sockets[0];
+    socket.open();
+    assert.deepEqual(socket.sent.map(item => `${item.type} ${item.channel}`), ['subscribe market_stats/all', 'subscribe order_book/1'], '连上后订阅全市场一档与盘口');
+    socket.push({ type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: {} });
+    assert.equal(stream.depth(1), null);
+    assert.equal(stream.depthError(1), '等待盘口快照');
+    assert.equal(stream.depthError(2), '未订阅盘口');
+    const book = (type: string, value: Record<string, unknown>) => socket.push({ type, channel: 'order_book:1', order_book: value });
+    book('update/order_book', { bids: [{ price: '99', size: '1' }], asks: [], nonce: 1 });
+    assert.equal(stream.depth(1), null, '快照前的增量不用');
+    book('subscribed/order_book', { code: 0, bids: [{ price: '99.9', size: '5' }, { price: '99.8', size: '50' }], asks: [{ price: '100.1', size: '5' }, { price: '100.2', size: '20' }], nonce: 10 });
+    clock += 5_000;
+    const first = stream.depth(1)!;
+    assert.deepEqual([first.at, first.bid, first.ask], [clock, 99.9, 100.1], '快照时刻为取用时刻');
+    book('update/order_book', { bids: [{ price: '99.9', size: '0' }, { price: '99.85', size: '2' }], asks: [{ price: '100.05', size: '1' }], begin_nonce: 10, nonce: 11 });
+    assert.deepEqual([stream.depth(1)!.bid, stream.depth(1)!.ask], [99.85, 100.05], '数量 0 删档，新档加入');
+    socket.sent.length = 0;
+    book('update/order_book', { bids: [], asks: [{ price: '100.3', size: '1' }], begin_nonce: 12, nonce: 13 });
+    assert.deepEqual(socket.sent.map(item => `${item.type} ${item.channel}`), ['unsubscribe order_book/1', 'subscribe order_book/1'], 'nonce 断档重新订阅');
+    assert.equal(stream.depth(1), null);
+    assert.equal(stream.depthError(1), '盘口增量不连续，重新订阅');
+    book('subscribed/order_book', { code: 0, bids: [{ price: '100.2', size: '1' }], asks: [{ price: '100.1', size: '1' }], nonce: 20 });
+    clock += 6_000;
+    socket.sent.length = 0;
+    assert.equal(stream.depth(1), null, '倒挂的盘口不用');
+    assert.deepEqual(socket.sent.map(item => `${item.type} ${item.channel}`), ['unsubscribe order_book/1', 'subscribe order_book/1'], '倒挂重新订阅');
+    // 快照迟迟不到：15 秒后再订一次。
+    socket.sent.length = 0;
+    clock += 16_000;
+    socket.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: {} });
+    tick();
+    assert.ok(socket.sent.some(item => item.type === 'subscribe' && item.channel === 'order_book/1'));
+    assert.equal(stream.depthError(1), '盘口快照超时，重新订阅');
+    book('subscribed/order_book', { code: 0, bids: [{ price: '99.9', size: '5' }], asks: [{ price: '100.1', size: '5' }], nonce: 30 });
+    assert.equal(stream.depth(1)?.bid, 99.9);
+    // 换订阅：退订去掉的，新加的立即订阅。
+    socket.sent.length = 0;
+    stream.setDepthMarkets(new Map([[2, '2']]));
+    assert.deepEqual(socket.sent.map(item => `${item.type} ${item.channel}`), ['unsubscribe order_book/1', 'subscribe order_book/2']);
+    assert.equal(stream.depth(1), null);
+    // 断线：盘口清空，重连后重新订阅。
+    socket.push({ type: 'subscribed/order_book', channel: 'order_book:2', order_book: { code: 0, bids: [{ price: '9', size: '1' }], asks: [{ price: '10', size: '1' }] } });
+    assert.equal(stream.depth(2)?.ask, 10);
+    socket.onclose?.({});
+    assert.equal(stream.depth(2), null);
+    assert.equal(stream.depthError(2), '行情流未连接');
+  } finally { stream.close(); }
 });
 
 class FakeSocket implements SocketLike {
@@ -606,11 +659,15 @@ test('Entropy 行情流：按配对订阅 bbo，没有一档或长时间没变�
     assert.deepEqual(urls, ['wss://api.hyperliquid.xyz/ws']);
     const socket = sockets[0];
     socket.open();
-    assert.deepEqual(socket.sent, [{ method: 'subscribe', subscription: { type: 'bbo', coin: 'io:SNDK' } }, { method: 'subscribe', subscription: { type: 'bbo', coin: 'io:OAI' } }]);
+    const sub = (type: string, coin: string, method = 'subscribe') => ({ method, subscription: { type, coin } });
+    assert.deepEqual(socket.sent, [sub('bbo', 'io:SNDK'), sub('activeAssetCtx', 'io:SNDK'), sub('bbo', 'io:OAI'), sub('activeAssetCtx', 'io:OAI')]);
     assert.equal(stream.healthySince(), null, '还没收到消息');
     socket.push({ channel: 'bbo', data: { coin: 'io:SNDK', time: T0, bbo: [{ px: '99.9', sz: '1', n: 1 }, { px: '100.1', sz: '1', n: 1 }] } });
     socket.push({ channel: 'bbo', data: { coin: 'io:OTHER', bbo: [{ px: '1', sz: '1', n: 1 }, { px: '2', sz: '1', n: 1 }] } });
-    assert.deepEqual([stream.topAt(0, T0)?.bid, stream.topAt(0, T0)?.ask, stream.healthySince()], [99.9, 100.1, T0]);
+    assert.deepEqual([stream.topAt(0, T0)?.bid, stream.topAt(0, T0)?.ask, stream.topAt(0, T0)?.mark, stream.healthySince()], [99.9, 100.1, null, T0]);
+    // 市场状态：标记价、预言机价与资金费按时刻并到一档上。
+    socket.push({ channel: 'activeAssetCtx', data: { coin: 'io:SNDK', ctx: { markPx: '100.02', oraclePx: '100.01', funding: '0.0000125' } } });
+    assert.deepEqual([stream.topAt(0, T0)?.mark, stream.topAt(0, T0)?.index, stream.topAt(0, T0)?.funding], [100.02, 100.01, 0.0000125]);
     assert.equal(stream.topAt(1, T0), null, '没订阅到的市场没有一档');
     // 20 秒：先 ping；OAI 还没有一档，发 l2Book 确认；SNDK 刚有一档不确认。
     clock = T0 + 20_000;
@@ -636,7 +693,7 @@ test('Entropy 行情流：按配对订阅 bbo，没有一档或长时间没变�
     // 换市场：退订去掉的，订阅新加的。
     socket.sent.length = 0;
     stream.setMarkets(new Map([[1, 'io:OAI'], [4, 'io:NEW']]));
-    assert.deepEqual(socket.sent, [{ method: 'unsubscribe', subscription: { type: 'bbo', coin: 'io:SNDK' } }, { method: 'subscribe', subscription: { type: 'bbo', coin: 'io:NEW' } }]);
+    assert.deepEqual(socket.sent, [sub('bbo', 'io:SNDK', 'unsubscribe'), sub('activeAssetCtx', 'io:SNDK', 'unsubscribe'), sub('bbo', 'io:NEW'), sub('activeAssetCtx', 'io:NEW')]);
     assert.equal(stream.marketCount, 2);
     // 目录重排：编号 1 换成另一币种，旧一档清掉；换之前发出的 OAI 确认按币种对回，不记到新币种名下。
     clock += 61_000;
@@ -729,7 +786,8 @@ test('引擎：各组合各自对齐样本写库，盘口快照，模拟盘开�
     await engine.pollVar(signal);
     assert.equal(engine.views.state().sources.var.poll?.noTop, 3, '规格不同的 OPENAI 不对齐；快照之前的 Var 报价没有对应的对手腿一档');
     assert.deepEqual(engine.views.state().rows.map(item => item.key), [RH_BTC, LIGHTER_BTC, 'var:ETH|lighter:ETH', 'var:OPENAI|rh:OPENAI']);
-    assert.equal(requested.filter(url => url.includes('orderBookOrders')).length, 0, '没有启用的配对就不取盘口快照');
+    const bookSubs = (socket: FakeSocket) => socket.sent.filter(item => item.type === 'subscribe' && String(item.channel).startsWith('order_book/')).map(item => item.channel);
+    assert.deepEqual([...bookSubs(rh()), ...bookSubs(main())], [], '没有启用的配对就不订阅盘口');
     const initial = engine.views.state();
     assert.throws(() => engine.views.settings({ revision: initial.settings.revision, symbols: { 'var:OPENAI|rh:OPENAI': { enabled: true } } }), /规格不同/);
     assert.throws(() => engine.views.settings({ revision: initial.settings.revision, symbols: { BTC: { enabled: true } } }), /配对键无效/);
@@ -737,6 +795,10 @@ test('引擎：各组合各自对齐样本写库，盘口快照，模拟盘开�
     const saved = engine.views.settings({ revision: initial.settings.revision, global: { minSamples: 10, windowHours: 2, minNetBps: 5 }, symbols: { [RH_BTC]: enable, 'lighter:BTC': enable } });
     assert.equal(saved.revision, 1);
     assert.deepEqual(Object.keys(saved.symbols).sort(), [LIGHTER_BTC, RH_BTC], '旧键写法保存时换成新键');
+    assert.deepEqual([bookSubs(rh()), bookSubs(main())], [['order_book/1'], ['order_book/7']], '启用后订阅两条行情流腿的盘口');
+    const fullBook = { code: 0, bids: [{ price: '99.99', size: '100' }], asks: [{ price: '100.01', size: '100' }], nonce: 1 };
+    rh().push({ type: 'subscribed/order_book', channel: 'order_book:1', order_book: fullBook });
+    main().push({ type: 'subscribed/order_book', channel: 'order_book:7', order_book: fullBook });
     // 新参数存在新键里；重开后读回。
     assert.equal(store.state<{ global: GlobalParams }>(SETTINGS_KEY)!.global.minNetBps, 5);
     assert.equal(createVarLighterEngine({ store, fetchImpl, connect: () => new FakeSocket(), now: () => clock }).views.state().settings.global.minNetBps, 5);
@@ -763,7 +825,8 @@ test('引擎：各组合各自对齐样本写库，盘口快照，模拟盘开�
     assert.equal(row(LIGHTER_BTC)!.samples24h, 12);
     assert.equal(view.sources.var.poll?.noTop, 0);
     assert.deepEqual(view.sources.venues.map(item => [item.venue, item.depth.map(depth => depth.key), item.pairs]), [['rh', ['rh:BTC'], 2], ['lighter', ['lighter:BTC'], 2], ['entropy', [], 0]]);
-    assert.ok(requested.some(url => url.startsWith('https://mainnet.zklighter.elliot.ai/api/v1/orderBookOrders?market_id=7&')));
+    assert.deepEqual(view.sources.venues.flatMap(item => item.depth.map(depth => [depth.key, depth.at, depth.error])), [['rh:BTC', clock, null], ['lighter:BTC', clock, null]]);
+    assert.ok(!requested.some(url => url.includes('orderBookOrders')), '盘口不走 REST');
     // 冲高：两个配对同时有信号，Var 的 BTC 腿只开一笔（RH 在前）。
     varMid = 100.5; await minute();
     assert.deepEqual(engine.views.paper().positions.map(item => [item.symbol, item.direction]), [[RH_BTC, 'a_rich']]);
@@ -844,23 +907,62 @@ test('引擎：各组合各自对齐样本写库，盘口快照，模拟盘开�
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('引擎重启：库里已启用的配对在第一次拉 Var 时就取盘口快照', async () => {
-  const requested: string[] = [];
-  const clock = T0;
-  const fetchImpl = async (url: string) => {
-    requested.push(url);
-    if (url.includes('orderBookDetails')) return Response.json({ code: 200, order_book_details: [{ symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, min_base_amount: '0.001', min_quote_amount: '10', taker_fee: '0', maker_fee: '0', mark_price: '100' }] });
-    if (url.includes('orderBookOrders')) return Response.json({ code: 200, bids: [{ price: '99.99', remaining_base_amount: '100' }], asks: [{ price: '100.01', remaining_base_amount: '100' }] });
-    return Response.json({ listings: [{ ticker: 'BTC', name: 'Bitcoin', mark_price: '100.2', quotes: { updated_at: new Date(clock - 2_000).toISOString(), base: { bid: '100.19', ask: '100.21' } } }] });
-  };
-  const { engine, dispose } = seededEngine(store => store.setState(SETTINGS_KEY, settings2({ [RH_BTC]: { ...DEFAULT_SYMBOL, enabled: true } }), T0), { fetchImpl });
+test('引擎重启：库里已启用的配对在目录一到就订阅盘口，行情流重连后重新订阅', async () => {
+  const { engine, sockets, dispose } = seededEngine(store => store.setState(SETTINGS_KEY, settings2({ [RH_BTC]: { ...DEFAULT_SYMBOL, enabled: true } }), T0));
+  const rhDepth = () => engine.views.state().sources.venues.find(item => item.venue === 'rh')!.depth.map(item => [item.key, item.at, item.error]);
   try {
+    engine.startStreams();
+    const rh = sockets[0];
+    rh.open();
+    rh.push(RH_SNAPSHOT);
+    assert.ok(!rh.sent.some(item => item.channel === 'order_book/1'), '目录到之前不知道市场编号');
     await engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
-    await engine.pollVar(AbortSignal.timeout(1000));
-    assert.equal(requested.filter(url => url.includes('orderBookOrders?market_id=1&')).length, 1);
-    const depth = engine.views.state().sources.venues.find(item => item.venue === 'rh')!.depth;
-    assert.deepEqual(depth.map(item => [item.key, item.at, item.error]), [['rh:BTC', T0, null]]);
+    assert.deepEqual(rh.sent.filter(item => item.channel === 'order_book/1').map(item => item.type), ['subscribe']);
+    assert.deepEqual(rhDepth(), [['rh:BTC', null, '等待盘口快照']]);
+    rh.push({ type: 'subscribed/order_book', channel: 'order_book:1', order_book: { code: 0, bids: [{ price: '99.99', size: '100' }], asks: [{ price: '100.01', size: '100' }] } });
+    assert.deepEqual(rhDepth(), [['rh:BTC', T0, null]]);
+    // 断线：盘口失效，原因写明；保留上一份快照的时刻。
+    rh.onclose?.({});
+    assert.deepEqual(rhDepth(), [['rh:BTC', T0, '行情流未连接']]);
   } finally { dispose(); }
+});
+
+test('Entropy 盘口与市场状态：l2Book 推送算冲击并确认一档，换市场退订，断线清空', () => {
+  let clock = T0;
+  const sockets: FakeSocket[] = [];
+  const stream = new HyperliquidStream({ connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now: () => clock });
+  try {
+    stream.setMarkets(new Map([[0, 'io:SNDK'], [1, 'io:OAI']]));
+    stream.setDepthMarkets(new Map([[0, 'io:SNDK']]));
+    stream.start();
+    const socket = sockets[0];
+    socket.open();
+    assert.deepEqual(socket.sent.filter(item => (item.subscription as { type: string }).type === 'l2Book'), [{ method: 'subscribe', subscription: { type: 'l2Book', coin: 'io:SNDK' } }]);
+    assert.equal(stream.depthError(0), '等待盘口推送');
+    assert.equal(stream.depthError(1), '未订阅盘口');
+    const push = (coin: string, bid: string, ask: string) => socket.push({ channel: 'l2Book', data: { coin, time: clock, levels: [[{ px: bid, sz: '100', n: 1 }, { px: String(Number(bid) - 0.1), sz: '1000', n: 2 }], [{ px: ask, sz: '100', n: 1 }, { px: String(Number(ask) + 0.1), sz: '1000', n: 2 }]] } });
+    push('io:SNDK', '99.9', '100.1');
+    clock += 30_000;
+    const book = stream.depth(0)!;
+    assert.deepEqual([book.at, book.bid, book.ask], [clock, 99.9, 100.1], '连接在就是当前盘口');
+    assert.ok(book.ask1k! > 100.1 && book.ask100k !== null);
+    assert.equal(stream.topAt(0, clock)?.bid, 99.9, '盘口推送也记一档');
+    // 一档没变的推送 10 秒内不重复记。
+    push('io:SNDK', '99.9', '100.1');
+    clock += 1_000;
+    push('io:SNDK', '99.9', '100.1');
+    assert.equal((stream as unknown as { top: Map<number, unknown[]> }).top.get(0)!.length, 2);
+    // 换盘口订阅：退订旧的、旧快照清掉。
+    socket.sent.length = 0;
+    stream.setDepthMarkets(new Map([[1, 'io:OAI']]));
+    assert.deepEqual(socket.sent, [{ method: 'unsubscribe', subscription: { type: 'l2Book', coin: 'io:SNDK' } }, { method: 'subscribe', subscription: { type: 'l2Book', coin: 'io:OAI' } }]);
+    assert.equal(stream.depth(0), null);
+    push('io:OAI', '730', '731');
+    assert.equal(stream.depth(1)?.bid, 730);
+    socket.onclose?.({});
+    assert.equal(stream.depth(1), null);
+    assert.equal(stream.depthError(1), '行情流未连接');
+  } finally { stream.close(); }
 });
 
 // ---- 审查补充（docs/reviews/2026-11-22-varlighter.md）----
@@ -1002,7 +1104,12 @@ test('失联判定：规格改判、数据源连续正常 30 分钟仍无样本�
     sockets[0].open();
     sockets[0].push(RH_SNAPSHOT);
     let tick = 0;
-    const advance = (ms: number) => { time += ms; tick++; sockets[0].push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, mark_price: String(100 + tick * 0.0001) } } }); };
+    const advance = (ms: number) => {
+      time += ms; tick++;
+      sockets[0].push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, mark_price: String(100 + tick * 0.0001) } } });
+      // 订阅了盘口才收（没订阅的快照被忽略）。
+      sockets[0].push({ type: 'subscribed/order_book', channel: 'order_book:1', order_book: { code: 0, bids: [{ price: '99.99', size: '1000' }], asks: [{ price: '100.01', size: '1000' }] } });
+    };
     /** 按服务节奏每分钟拉一次 Var。 */
     const run = async (minutes: number) => { for (let index = 0; index < minutes; index++) { advance(60_000); await engine.pollVar(AbortSignal.timeout(1000)); } };
     return { engine, socket: sockets[0], advance, run };
@@ -1161,13 +1268,15 @@ test('两腿行情流的配对：启用或有持仓的每 15 秒、其余每分�
     const main = sockets.get('lighter')!, entropy = sockets.get('entropy')!;
     main.open(); entropy.open();
     main.push({ type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: { 9: { market_id: 9, best_bid_price: '99.99', best_ask_price: '100.01', mark_price: '100' } } });
-    assert.deepEqual(entropy.sent, [{ method: 'subscribe', subscription: { type: 'bbo', coin: 'io:SNDK' } }], '按配对用到的 Entropy 市场订阅');
+    assert.deepEqual(entropy.sent, ['bbo', 'activeAssetCtx', 'l2Book'].map(type => ({ method: 'subscribe', subscription: { type, coin: 'io:SNDK' } })), '按配对用到的 Entropy 市场订阅一档与市场状态，有持仓的另订盘口');
+    assert.ok(main.sent.some(item => item.type === 'subscribe' && item.channel === 'order_book/9'), '有持仓的 Lighter 腿订阅盘口');
     assert.deepEqual(engine.sampleLive(), { at: T0, due: 1, written: 0, noTop: 1, blocked: {} }, 'Entropy 还没有一档');
     const bbo = () => entropy.push({ channel: 'bbo', data: { coin: 'io:SNDK', bbo: [{ px: '100.09', sz: '1', n: 1 }, { px: '100.11', sz: '1', n: 1 }] } });
     bbo();
     assert.equal(engine.sampleLive().written, 1, '缺一档的那轮不算，下一次检查马上补采');
     const latest = store.latest(LE_SNDK)!;
-    assert.deepEqual([latest.t, latest.receivedAt, latest.aBidRx, latest.bBidRx, latest.bMark, latest.bFunding, latest.ratio], [T0, T0, 99.99, 100.09, 100.1, 0.0000125, 1]);
+    assert.deepEqual([latest.t, latest.receivedAt, latest.aBidRx, latest.bBidRx, latest.bMark, latest.bFunding, latest.ratio], [T0, T0, 99.99, 100.09, 100.1, 0.0000125, 1], '行情流还没有市场状态时用目录的标记价与资金费');
+    entropy.push({ channel: 'activeAssetCtx', data: { coin: 'io:SNDK', ctx: { markPx: '100.12', oraclePx: '100.13', funding: '0.00002' } } });
     /** 拨到 at：两边各推一条消息再检查。 */
     const check = (at: number) => {
       clock = at;
@@ -1177,6 +1286,7 @@ test('两腿行情流的配对：启用或有持仓的每 15 秒、其余每分�
     };
     assert.equal(check(T0 + 13_999).due, 0, '有持仓：15 秒一条（留 1 秒余量）');
     assert.deepEqual([check(T0 + 14_000).due, engine.sampleLive().due], [1, 0]);
+    assert.deepEqual([store.latest(LE_SNDK)!.bMark, store.latest(LE_SNDK)!.bIndex, store.latest(LE_SNDK)!.bFunding], [100.12, 100.13, 0.00002], '标记价、预言机价与资金费取行情流');
     let last = T0 + 14_000;
     engine.views.reset({ confirm: 'RESET' });
     assert.equal(check(last + 58_000).due, 0, '没有持仓也没启用：每分钟一条');
@@ -1628,6 +1738,9 @@ test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与
     clock += 60_000; tick++;
     sockets.get('rh')!.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, mark_price: String(100 + tick * 0.0001) } } });
     sockets.get('lighter')!.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 7: { market_id: 7, mark_price: String(100 + tick * 0.0001) } } });
+    const book = { code: 0, bids: [{ price: '99.99', size: '100' }], asks: [{ price: '100.01', size: '100' }] };
+    sockets.get('rh')!.push({ type: 'subscribed/order_book', channel: 'order_book:1', order_book: book });
+    sockets.get('lighter')!.push({ type: 'subscribed/order_book', channel: 'order_book:7', order_book: book });
     await engine.pollVar(signal);
     return engine.views.state().sources.var.poll!;
   };

@@ -174,7 +174,7 @@ function SourcesPanel({ view }: { view: StateView }) {
         {token.status === 'ready' ? null : <small>token 在「行情监控 → 原油」页的 Var token 表单里保存；没有可用 token 时开平仓只按公开报价。</small>}</td></tr> : null}
       {venues.map(status => <VenueRow key={status.venue} status={status} now={now} />)}
     </tbody></table></div>
-    <p className="vl-note">Lighter 行情流订阅全部市场的一档价，Entropy 只订阅配对用到的市场（bbo，长时间无变化时用 l2Book 确认），流量按解码后的文本折算（线上有压缩）。已启用或有持仓的配对每分钟各取一次盘口快照，每个场所最多 10 条腿；有可用的 Var token 时带 Var 腿的同一批配对各询一次价。</p>
+    <p className="vl-note">Lighter 与 Entropy 的行情全部走 WebSocket：Lighter 订阅全部市场的一档价、标记价与资金费，Entropy 只订阅配对用到的市场（bbo 一档，长时间无变化时用 l2Book 确认；activeAssetCtx 标记价、预言机价与资金费）；已启用或有持仓的配对的腿另订阅完整盘口（Lighter order_book、Entropy l2Book），每个场所最多 10 条腿。目录每 10 分钟取一次，只用于规格与手续费。流量按解码后的文本折算（线上有压缩）。有可用的 Var token 时带 Var 腿的同一批配对各询一次价。</p>
   </section>;
 }
 
@@ -186,7 +186,7 @@ function VenueRow({ status, now }: { status: VenueStatus; now: number }) {
       {stream?.connected ? `行情流已连接 ${age(stream.connectedAt, now)}` : <span className="vl-down">行情流未连接{stream?.lastError ? `：${stream.lastError}` : ''}</span>}
       {stream ? <small>最后消息 {age(stream.lastMessageAt, now)} · 重连 {stream.reconnects} 次 · {stream.markets} 个市场 · 约 {bytesPerDay(stream.bytes, stream.bytesSince, now)}</small> : null}
       <small>目录：{catalog.error ? <span className="vl-down">{catalog.error}</span> : `${age(catalog.ok, now)} · ${catalog.count} 个市场`}</small>
-      <small>盘口快照：{status.depth.length ? status.depth.map(item => `${item.key.split(':')[1]} ${item.error ? `失败（${item.error}）` : item.at ? age(item.at, now) : '等待中'}`).join('，') : '没有启用的配对或持仓，不取'}</small>
+      <small>盘口：{status.depth.length ? status.depth.map(item => `${item.key.split(':')[1]} ${item.error ? `未同步（${item.error}）` : item.at ? '已同步' : '等待中'}`).join('，') : '没有启用的配对或持仓，不订阅'}</small>
     </>}</td>
   </tr>;
 }

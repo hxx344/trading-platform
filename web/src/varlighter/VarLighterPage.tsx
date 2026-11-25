@@ -61,12 +61,12 @@ function Sources({ view }: { view: StateView }) {
   </div>;
 }
 
-/** 一个场所一枚：行情流连接、盘口快照新鲜度、目录读取失败合在一起，悬停看详情。 */
+/** 一个场所一枚：行情流连接、盘口同步、目录读取失败合在一起，悬停看详情。 */
 function VenueChip({ status, now }: { status: VenueStatus; now: number }) {
   const stream = status.stream;
-  const staleDepth = status.depth.filter(item => item.at === null || now - item.at > 180_000).length;
+  const staleDepth = status.depth.filter(item => item.at === null || item.error !== null || now - item.at > 180_000).length;
   const chipTone = !stream?.connected || status.catalog.error ? 'bad' : staleDepth ? 'warn' : 'ok';
-  const detail = [stream?.lastError, status.catalog.error, staleDepth ? `${staleDepth} 个盘口快照过期` : null].filter(Boolean).join('；');
+  const detail = [stream?.lastError, status.catalog.error, staleDepth ? `${staleDepth} 个盘口未同步` : null].filter(Boolean).join('；');
   return <span className={`vl-chip ${chipTone}`} title={detail || undefined}><i />{status.name} {stream?.connected ? `${status.pairs} 对` : '未连接'}{status.depth.length ? ` · 盘口 ${status.depth.length - staleDepth}/${status.depth.length}` : ''}</span>;
 }
 
@@ -115,7 +115,7 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
         <tbody>{rows.map(row => <Row key={row.key} row={row} now={view.now} multi={multi} />)}</tbody>
       </table></div> : <TableEmpty>{view.rows.length ? '没有符合筛选的配对' : view.sources.venues.some(item => item.catalog.ok) ? '开着的组合里还没有配对的报价；可在实盘准备页开启组合或添加手动配对' : '正在读取各场所的目录…'}</TableEmpty>}
       <p className="vl-note">A 是配对键里的第一条腿（有 Var 时为 Var）。卖 A 价差 = A 买价 ÷（乘数 × B 卖价）− 1，买 A 价差 = A 卖价 ÷（乘数 × B 买价）− 1，按各配对名义金额取档（≤ 1000 美元用 1k 档）；
-        已启用或有持仓的配对每分钟取一次行情流腿的盘口快照算冲击，其余用一档价估算（标「估」）。信号列是离入场最近的一侧：偏离 − 入场阈值，≥ 0 即达到开仓条件。资金费只作参考，两腿都折成年化。</p>
+        已启用或有持仓的配对订阅行情流腿的完整盘口（WebSocket）算冲击，其余用一档价估算（标「估」）。信号列是离入场最近的一侧：偏离 − 入场阈值，≥ 0 即达到开仓条件。资金费只作参考，两腿都折成年化。</p>
     </section>
   </>;
 }

@@ -718,7 +718,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       }
       // 组合与手动配对都定下来后再查：只改组合（打开一个组合）也不能让手动配对与自动配对同键。
       const auto = custom.map(customKey).find(key => { const combo = autoComboOf(key); return combo && combos.includes(combo); });
-      if (auto) reject('duplicate_pair', `${auto} 已是开启中的组合「${comboName(autoComboOf(auto)!)}」的自动配对，${body.pairs !== undefined ? '不必手动添加' : '先删掉这个手动配对再开组合'}`);
+      if (auto) reject('duplicate_pair', `${auto} 已是开启中的组合「${comboName(autoComboOf(auto)!)}」的自动配对，${body.pairs !== undefined ? '不必手动添加' : body.combos !== undefined ? '先删掉这个手动配对再开组合' : '先删掉这个手动配对或关掉该组合'}`);
       // 关掉的组合或删掉的手动配对上不能还有启用的配对或模拟持仓。
       const enabled = Object.entries(symbols).filter(([, params]) => params.enabled).map(([key]) => key);
       const customKeys = new Set(custom.map(customKey));
@@ -729,8 +729,10 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       }
       for (const venue of LIVE_VENUES) {
         // 有持仓的配对也要取盘口快照，一并计入上限。
-        const legs = new Set([...new Set([...enabled, ...positions.keys()])].flatMap(legsOfKey).filter(leg => leg.startsWith(`${venue}:`)));
-        if (legs.size > MAX_DEPTH_MARKETS) reject('too_many', `${VENUE_NAMES[venue]} 一侧最多同时启用 ${MAX_DEPTH_MARKETS} 个市场（每分钟取一次盘口快照）`);
+        const legsOf = (keys: string[]) => new Set([...new Set([...keys, ...positions.keys()])].flatMap(legsOfKey).filter(leg => leg.startsWith(`${venue}:`)));
+        const legs = legsOf(enabled), before = legsOf(Object.entries(settings.symbols).filter(([, params]) => params.enabled).map(([key]) => key));
+        // 只挡这次让腿变多的保存：升级前留下的超额状态不卡住无关的保存（改全局参数、确认规格）。
+        if (legs.size > MAX_DEPTH_MARKETS && [...legs].some(leg => !before.has(leg))) reject('too_many', `${VENUE_NAMES[venue]} 一侧启用或有模拟持仓的市场最多 ${MAX_DEPTH_MARKETS} 个（每分钟取一次盘口快照），先停用或平掉一些`);
       }
       for (const key of enabled) {
         const pair = pairOf(key), wasEnabled = settings.symbols[key]?.enabled === true;
@@ -743,11 +745,17 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       }
       const windowChanged = global.windowHours !== settings.global.windowHours || global.minSamples !== settings.global.minSamples;
       const pairsChanged = combos.join() !== settings.combos.join() || JSON.stringify(custom) !== JSON.stringify(settings.pairs);
+      const usedBefore = usedVenues();
       settings = { revision: settings.revision + 1, global, symbols, confirmed, combos, pairs: custom };
       store.setState(SETTINGS_KEY, settings, now());
       store.event(now(), 'settings', null, `参数已更新（版本 ${settings.revision}）${pairsChanged ? `，组合：${combos.map(comboName).join('、') || '无'}，手动配对 ${custom.length} 个` : ''}`);
       if (windowChanged) trackers.clear();
-      if (pairsChanged) { syncStreams(); rebuildPairs(); }
+      if (pairsChanged) {
+        // 新用到的场所马上取一次目录（Entropy 没用到时十分钟才取一次，标记价与资金费会旧）。
+        const used = usedVenues();
+        for (const runtime of live.values()) if (used.has(runtime.venue) && !usedBefore.has(runtime.venue)) runtime.nextCatalog = 0;
+        syncStreams(); rebuildPairs();
+      }
       updateDepth();
       return settings;
     } catch (error) {
@@ -843,7 +851,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     pollVar, refreshCatalog, refreshDepth, sampleLive,
     views: { state, symbol: symbolView, samples: samplesPage, backtest, paper, settings: updateSettings, close: closeManual, reset: resetPaper, readiness },
     /**
-     * 后台循环：连上用到的行情流并取各场所目录（Lighter 每 10 分钟，Entropy 每分钟），然后每分钟拉 Var 报价（连同盘口快照与询价），
+     * 后台循环：连上用到的行情流并在后台取各场所目录（Lighter 每 10 分钟，Entropy 用到时每分钟、否则每 10 分钟），然后每分钟拉 Var 报价（连同盘口快照与询价），
      * 每 5 秒检查两腿都是行情流的配对是否到期采样，每小时清理过期样本。
      */
     async loop(context: { stopped(): boolean; pause(ms: number): Promise<void> }): Promise<void> {

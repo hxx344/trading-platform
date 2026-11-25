@@ -374,7 +374,8 @@ export class HyperliquidStream implements LiveStream {
   private readonly confirmAt = new Map<number, number>();
   private confirms: number[] = [];
   private postId = 0;
-  private readonly posts = new Map<number, number>();
+  /** 在途的 l2Book 确认：postId → 发出时的完整代码（应答按代码找编号，编号换了币种也不会记错）。 */
+  private readonly posts = new Map<number, string>();
   private readonly options: { url?: string; connect: Connect; now?: () => number; log?: (line: string) => void };
   constructor(options: { url?: string; connect: Connect; now?: () => number; log?: (line: string) => void }) { this.options = options; }
   private now(): number { return (this.options.now ?? Date.now)(); }
@@ -382,10 +383,10 @@ export class HyperliquidStream implements LiveStream {
   get running(): boolean { return !this.closed && (this.socket !== null || this.retry !== null); }
   get marketCount(): number { return this.coins.size; }
 
-  /** 更新要订阅的市场；新加的立即订阅，去掉的退订（历史保留到过期）。 */
+  /** 更新要订阅的市场；新加的立即订阅，去掉的退订。去掉或换了币种的编号立即清空一档历史。 */
   setMarkets(markets: ReadonlyMap<number, string>): void {
     // Entropy 的市场编号是目录里的序号：目录变动后同一编号可能换了币种，旧币种的盘口不能算到新币种上。
-    for (const [id, coin] of this.coins) if (markets.get(id) !== coin) this.top.delete(id);
+    for (const [id, coin] of this.coins) if (markets.get(id) !== coin) { this.top.delete(id); this.confirmAt.delete(id); }
     this.coins = new Map(markets);
     this.byCoin.clear();
     for (const [id, coin] of markets) this.byCoin.set(coin, id);
@@ -451,7 +452,7 @@ export class HyperliquidStream implements LiveStream {
       if ((last >= segmentStart && now - last < ENTROPY_CONFIRM_MS) || now - asked < 60_000) continue;
       this.confirmAt.set(id, now); this.confirms.push(now);
       const postId = ++this.postId;
-      this.posts.set(postId, id);
+      this.posts.set(postId, coin);
       this.send({ method: 'post', id: postId, request: { type: 'info', payload: { type: 'l2Book', coin } } });
     }
     if (this.posts.size > 500) this.posts.clear();
@@ -482,9 +483,11 @@ export class HyperliquidStream implements LiveStream {
       return;
     }
     if (channel === 'post' && payload) {
-      const id = typeof payload.id === 'number' ? this.posts.get(payload.id) : undefined;
-      if (id === undefined) return;
+      const coin = typeof payload.id === 'number' ? this.posts.get(payload.id) : undefined;
+      if (coin === undefined) return;
       this.posts.delete(payload.id as number);
+      const id = this.byCoin.get(coin);
+      if (id === undefined) return;
       const response = object(payload.response);
       if (response?.type === 'error') { this.state.lastError = String(response.payload).slice(0, 200); return; }
       const book = object(object(response?.payload)?.data);

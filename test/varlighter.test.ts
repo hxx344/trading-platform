@@ -458,6 +458,32 @@ test('旧库迁移：持仓与成交换成两腿口径复制到新表，参数�
     } finally { check.close(); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 
+  // 迁移失败：整体回滚、模块不可用并关库；问题排除后下次启动重试成功。
+  const failDir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-'));
+  try {
+    const failFile = path.join(failDir, 'varlighter.sqlite');
+    openVarLighterStore(failFile).close();
+    const raw = new DatabaseSync(failFile);
+    raw.prepare('INSERT INTO paper_positions(id, symbol, json) VALUES (?, ?, ?)').run('p1', 'rh:BTC', JSON.stringify(legacyPosition));
+    raw.exec("CREATE TRIGGER fail_migrate BEFORE INSERT ON leg_positions BEGIN SELECT RAISE(ABORT, 'disk says no'); END");
+    raw.close();
+    const lines: string[] = [];
+    const failed = openVarLighter(failDir, { connect: () => new FakeSocket() }, line => lines.push(line));
+    assert.equal(failed.engine, null);
+    assert.match(failed.error ?? '', /disk says no/);
+    assert.ok(lines.some(line => line.includes('模块停用')));
+    assert.equal(varLighterViews(failed).failure(new Error('x')).status, 500);
+    const fix = new DatabaseSync(failFile);
+    assert.equal((fix.prepare('SELECT COUNT(*) AS n FROM leg_positions').get() as { n: number }).n, 0, '回滚，没有半截迁移');
+    fix.exec('DROP TRIGGER fail_migrate');
+    fix.close();
+    const retried = openVarLighter(failDir, { connect: () => new FakeSocket() }, () => {});
+    try {
+      assert.equal(retried.error, null);
+      assert.deepEqual(retried.engine!.views.paper().positions.map(item => item.symbol), [RH_BTC], '下次启动重试成功');
+    } finally { retried.engine?.close(); }
+  } finally { rmSync(failDir, { recursive: true, force: true }); }
+
   // 引擎启动时迁移：有旧持仓记一行日志；全新安装什么都不记。
   for (const legacy of [true, false]) {
     const lines: string[] = [];
@@ -611,12 +637,24 @@ test('Entropy 行情流：按配对订阅 bbo，没有一档或长时间没变�
     stream.setMarkets(new Map([[1, 'io:OAI'], [4, 'io:NEW']]));
     assert.deepEqual(socket.sent, [{ method: 'unsubscribe', subscription: { type: 'bbo', coin: 'io:SNDK' } }, { method: 'subscribe', subscription: { type: 'bbo', coin: 'io:NEW' } }]);
     assert.equal(stream.marketCount, 2);
+    // 目录重排：编号 1 换成另一币种，旧一档清掉；换之前发出的 OAI 确认按币种对回，不记到新币种名下。
+    clock += 61_000;
+    socket.push({ channel: 'pong' });
+    socket.sent.length = 0;
+    stream.tick();
+    const inflight = (socket.sent as { method: string; id?: number; request?: { payload: { coin: string } } }[]).find(item => item.method === 'post' && item.request?.payload.coin === 'io:OAI');
+    assert.ok(inflight, 'OAI 一档已旧，发确认');
+    stream.setMarkets(new Map([[1, 'io:SWAP'], [4, 'io:NEW'], [7, 'io:OAI']]));
+    assert.equal(stream.topAt(1, T0 + 40_000), null, '换了币种的编号清掉旧一档');
+    reply(inflight.id!, 'io:OAI', '740', '741');
+    assert.equal(stream.topAt(1, clock), null, '在途确认不记到新币种');
+    assert.equal(stream.topAt(7, clock)?.bid, 740, '按币种记到 OAI 的新编号');
     // 45 秒没有任何消息：断开重连，区间结束，之前的历史仍可回看。
     clock += 46_000;
     stream.tick();
     assert.deepEqual([stream.status(2).lastError, stream.status(2).reconnects, stream.healthySince(), socket.readyState], ['长时间没有消息', 1, null, 3]);
-    assert.equal(stream.topAt(1, T0 + 40_000)?.bid, 730);
-    assert.equal(stream.topAt(1, clock), null, '断线之后的时刻没有数据');
+    assert.equal(stream.topAt(7, clock - 46_000)?.bid, 740);
+    assert.equal(stream.topAt(7, clock), null, '断线之后的时刻没有数据');
   } finally { stream.close(); }
 });
 
@@ -1230,6 +1268,7 @@ test('后台循环：停服时中断进行中的请求、关掉行情流；启�
     assert.ok(engine.stream('rh'), '循环里连上行情流');
     assert.ok(engine.stream('entropy'), '默认组合也连 Entropy');
     assert.equal(aborted, false, '目录请求挂着');
+    assert.equal(sleepers.size, 2, '目录请求挂着时循环照常进入下一轮等待（不被请求拖住，行情流采样照常检查）');
     const started = Date.now();
     stopped = true;
     for (const wake of [...sleepers]) wake();

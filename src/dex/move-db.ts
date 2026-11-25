@@ -46,6 +46,27 @@ function check(db: DatabaseSync): void {
   if (rows.length !== 1 || rows[0]!.quick_check !== 'ok') throw new Error('库的完整性检查没有通过');
 }
 
+/** 打开收到的库：不信任库里的结构定义，只接受表与索引（没有视图、触发器），之后才数行。 */
+function openReceived(file: string): DatabaseSync {
+  const db = new DatabaseSync(file);
+  try {
+    db.exec('PRAGMA trusted_schema=OFF');
+    const other = db.prepare("SELECT type, name FROM sqlite_master WHERE type NOT IN ('table', 'index')").all() as { type: string; name: string }[];
+    if (other.length) throw new Error(`收到的库含有表与索引以外的对象：${other.map(row => `${row.type} ${row.name}`).join('，').slice(0, 120)}`);
+    return db;
+  } catch (error) { db.close(); throw error; }
+}
+
+/** 目标处已有库时先拿独占锁（不等待）：万一还有进程开着它，就不在它底下改名。 */
+function lockExisting(dir: string): DatabaseSync | null {
+  const fd = openOwned(join(dir, DB_FILE), constants.O_RDONLY);
+  if (fd === null) return null;
+  closeSync(fd);
+  const db = new DatabaseSync(join(dir, DB_FILE));
+  try { db.exec('PRAGMA busy_timeout=0; PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT'); return db; }
+  catch (error) { db.close(); throw new Error(`目标处的库还被别的连接占用：${(error as Error).message}`); }
+}
+
 const temporary = (dir: string) => join(dir, `.${DB_FILE}.${randomBytes(6).toString('hex')}.tmp`);
 
 /** 源账户身份：返回要写到标准输出的头和临时文件（调用方写完后删除）。 */
@@ -140,6 +161,7 @@ const fsyncDir = (dir: string) => { const fd = openSync(dir, constants.O_RDONLY)
 export function importDb(dir: string, input: number, stamp: string): string {
   const { header, rest } = readHeader(input);
   if (header.missing) {
+    lockExisting(dir)?.close();
     const moved = backupExisting(dir, stamp);
     fsyncDir(dir);
     return moved.length ? `源端没有库，目标处原有的库已改名为备份（${moved.length} 个文件）` : '源端没有库，目标处也没有';
@@ -164,11 +186,14 @@ export function importDb(dir: string, input: number, stamp: string): string {
   } catch (error) { closeSync(fd); rmSync(out, { force: true }); throw error; }
   closeSync(fd);
   try {
-    const copy = new DatabaseSync(out);
+    const copy = openReceived(out);
     try {
       check(copy);
       if (JSON.stringify(tableCounts(copy)) !== JSON.stringify(header.counts)) throw new Error('各表行数与源端不一致');
     } finally { copy.close(); }
+    // 锁在改名之前拿、之后放：持锁连接在关闭时把 WAL 回写进旧库，再随旧库一起成为备份。
+    const lock = lockExisting(dir);
+    lock?.close();
     backupExisting(dir, stamp);
     renameSync(out, join(dir, DB_FILE));
     fsyncDir(dir);

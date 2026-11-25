@@ -39,7 +39,7 @@ sed -i "1i import '../varlighter/model.ts';" "$tmp/fp3/src/service/main.ts"
 node "$root/deploy/component-digests.mjs" "$tmp/fp1" >/dev/null && node "$root/deploy/component-digests.mjs" "$tmp/fp2" >/dev/null
 same_digests() { local n; for n in executor control market; do cmp -s "$tmp/fp1/.$n-sha256" "$tmp/fp2/.$n-sha256" || return 1; done; ! cmp -s "$tmp/fp1/.dex-sha256" "$tmp/fp2/.dex-sha256"; }
 check '只改 src/varlighter/ 时执行面、控制面、行情指纹不变，只有 DEX 的变' 'same_digests'
-check '执行面导入 src/varlighter 时打包失败' '! node "$root/deploy/component-digests.mjs" "$tmp/fp3" >/dev/null 2>&1'
+check '执行面导入 src/varlighter 时打包失败并说明原因' '! node "$root/deploy/component-digests.mjs" "$tmp/fp3" >"$tmp/fp3.out" 2>&1 && grep -Fq "执行面不得导入 DEX 价差引擎" "$tmp/fp3.out"'
 check '发布包含原表转换脚本（资产 A-6）' 'grep -q "/scripts/import-workbook.py$" "$tmp/a.list"'
 check '发布文件含副服务器巡检的安装脚本与程序，且与源码、校验清单一致' 'cmp -s "$root/deploy/install-watch.sh" "$tmp/a/install-watch.sh" && cmp -s "$root/deploy/main-watch/main_watch.py" "$tmp/a/main_watch.py" && (cd "$tmp/a" && sha256sum -c --quiet SHA256SUMS) && [[ "$(wc -l <"$tmp/a/SHA256SUMS")" == 4 ]]'
 fi

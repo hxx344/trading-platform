@@ -126,7 +126,7 @@ build() {
   bash "$source/deploy/package.sh" "$fixture/release-$1" >/dev/null
 }
 install_release() { bash "$root/deploy/install.sh" --package "$fixture/release-$1" >"$fixture/out" 2>&1; }
-# Only the four intentionally crashing candidates get a short negative probe. The real services, probe bodies,
+# Only the five intentionally crashing candidates get a short negative probe. The real services, probe bodies,
 # stable-PID checks and rollback all run unchanged. Match the package actually passed to the selected probe.
 expect_unhealthy_release() {
   local version=$1 component=$2 exception=$3 unit good_sha bad_sha since began=$SECONDS
@@ -135,6 +135,7 @@ expect_unhealthy_release() {
     executor) unit=$service; good_sha=$(cat "$app/executor/.package-sha256") ;;
     control) unit=$control; good_sha=$(cat "$app/current/.package-sha256") ;;
     market) unit=$market; good_sha=$(cat "$app/current/.package-sha256") ;;
+    dex) unit=$dex; good_sha=$(cat "$app/current/.package-sha256") ;;
     *) echo "Unknown component $component" >&2; return 1 ;;
   esac
   bad_sha=$(awk '$2 == "trading-platform.tar.gz" { print $1 }' "$fixture/release-$version/SHA256SUMS")
@@ -184,6 +185,23 @@ market_probe() {
 }
 dex_probe() {
   runuser -u "$service" -g "$dex-ipc" -- timeout 4 node "$1/src/dex/probe.ts" --socket "$dex_socket" --root "$1"
+}
+# A marker table in varlighter.sqlite, written and counted as the account that owns that directory, proves the database
+# itself moved between the execution data directory and the DEX state directory (docs/dexspread.md 11.5).
+seed_dex_db() {
+  runuser -u "$1" -- node -e '
+    const { DatabaseSync } = require("node:sqlite"), db = new DatabaseSync(process.argv[1] + "/varlighter.sqlite");
+    db.exec("PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS ci_seed (v INTEGER); DELETE FROM ci_seed");
+    const insert = db.prepare("INSERT INTO ci_seed VALUES (?)");
+    for (let i = 0; i < 37; i++) insert.run(i);
+    db.close();' "$2"
+}
+dex_db_rows() {
+  runuser -u "$1" -- node -e '
+    const { DatabaseSync } = require("node:sqlite"), db = new DatabaseSync(process.argv[1] + "/varlighter.sqlite");
+    db.exec("PRAGMA busy_timeout=5000");
+    process.stdout.write(String(db.prepare("SELECT COUNT(*) AS n FROM ci_seed").get().n));
+    db.close();' "$2"
 }
 # Every downgrade below runs after the current installer removed the DEX service (docs/dexspread.md 11.5): the database is
 # handed back to the execution data directory, so the components it checks are gone too.
@@ -241,7 +259,9 @@ esac
 if runs migration; then
 build 1
 echo 'Migrating the genuine single writer to the private socket and the browser service'
+seed_dex_db "$service" "$data"
 install_release 1
+[[ $(dex_db_rows "$dex" "$dex_state") == 37 ]]
 executor_pid=$(pid "$service")
 control_pid=$(pid "$control")
 market_pid=$(pid "$market")
@@ -397,6 +417,18 @@ assert_page v99.1.13
 cp "$fixture/good-market" "$source/src/market/main.ts"
 market_pid=$(pid "$market")
 
+echo 'A broken DEX-only package restores the previous DEX generation and keeps the database with it'
+cp "$source/src/dex/main.ts" "$fixture/good-dex"
+sed -i '1i if (import.meta.main) throw new Error("模拟 DEX 价差服务启动失败");' "$source/src/dex/main.ts"
+build 15
+expect_unhealthy_release 15 dex '模拟 DEX 价差服务启动失败'
+grep -q '已回退到 v99.1.13 并确认运行正常' "$fixture/out"
+[[ $(pid "$service") == "$executor_pid" && $(pid "$control") == "$control_pid" && $(pid "$market") == "$market_pid" ]]
+[[ $(cat "$app/.dex-db") == dex ]]
+dex_probe "$app/dex"
+assert_page v99.1.13
+cp "$fixture/good-dex" "$source/src/dex/main.ts"
+
 echo 'An update-helper-only package leaves both live process generations unchanged'
 printf '\n// simulated root helper update\n' >>"$source/src/service/update-helper.ts"
 build 11
@@ -495,16 +527,21 @@ bash "$dual/install.sh" --package "$dual" >"$fixture/out" 2>&1
 login
 assert_page v0.64.0
 assert_market_absent
+seed_dex_db "$service" "$data"
 install_release 8
 login
 assert_page v99.1.8
 market_probe "$app/market"
+dex_probe "$app/dex"
+[[ $(cat "$app/.dex-db") == dex && $(dex_db_rows "$dex" "$dex_state") == 37 ]]
 echo 'Removing the market service still succeeds after an unrelated user joins its socket group'
 useradd --system --no-user-group --gid "$market-ipc" --no-create-home --shell /usr/sbin/nologin "$extra_user"
 bash "$root/deploy/install.sh" --package "$dual" >"$fixture/out" 2>&1
 login
 assert_page v0.64.0
 assert_market_absent
+[[ $(dex_db_rows "$service" "$data") == 37 ]]
+grep -Fq 'DEX 价差库已交回执行服务' "$fixture/out"
 [[ $(id -gn "$extra_user") == "$market-ipc" ]]
 userdel "$extra_user"
 

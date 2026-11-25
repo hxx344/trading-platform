@@ -1,17 +1,21 @@
-// DEX 价差独立服务（docs/dexspread.md 第 11 节）：token 序号与租约、执行面转发的失败语义、库复制工具、执行面不导入 varlighter。
+// DEX 价差独立服务（docs/dexspread.md 第 11 节）：token 序号与租约、崩溃记录、执行面推送与转发的失败语义、库复制工具、执行面不导入 varlighter。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { closeSync, globSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createServer } from 'node:net';
+import { createServer, type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
-import { DexOutcomeUnknown, createDexClient, type DexPageRequest } from '../src/dex/ipc.ts';
-import { startDex } from '../src/dex/main.ts';
+import { createExecutorServer } from '../src/http.ts';
+import { DexOutcomeUnknown, createDexClient, type DexClient, type DexPageRequest } from '../src/dex/ipc.ts';
+import { DEX_CRASH_REPORT_MS, startDex } from '../src/dex/main.ts';
+import { CRASH_FILE } from '../src/crash-guard.ts';
+import { createDexLink } from '../src/service/dex.ts';
 import { DB_FILE, KEEP_BACKUPS, exportDb, importDb, tableCounts } from '../src/dex/move-db.ts';
-import { DEX_TOKEN_LEASE_MS, tokenDigest } from '../src/dex/protocol.ts';
+import { DEX_PROTOCOL, DEX_TOKEN_LEASE_MS, tokenDigest, type DexStatus, type DexTokenPush } from '../src/dex/protocol.ts';
 import type { SocketLike } from '../src/varlighter/feeds.ts';
+import { createHarness } from './harness.ts';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const socketIn = (dir: string, name: string) => process.platform === 'win32' ? `\\\\.\\pipe\\${path.basename(dir)}-${name}` : path.join(dir, `${name}.sock`);
@@ -33,8 +37,47 @@ test('DEX 只接受序号更大的 token 推送，超过租约后不再持有 to
   assert.equal((await client.status()).token, tokenDigest(first));
   clock += DEX_TOKEN_LEASE_MS + 1;
   assert.equal((await client.status()).token, null, '租约过期');
-  const next = { seq: 6, token: '', problem: '没有 token' };
-  assert.equal((await client.pushToken(next)).token, tokenDigest(next), '空 token 也立即生效');
+  const next = { seq: 3, token: '', problem: '没有 token' };
+  assert.equal((await client.pushToken(next)).token, tokenDigest(next), '租约过期后序号更小也收（执行服务重启后墙钟回拨），空 token 也立即生效');
+  assert.equal((await client.pushToken({ seq: 2, token: 'd', problem: '' })).token, tokenDigest(next), '租约内又只收更大的序号');
+});
+
+test('DEX 只报告 24 小时以内的崩溃记录', async t => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'dex-crash-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const at = 2_000_000_000_000;
+  writeFileSync(path.join(dir, CRASH_FILE), JSON.stringify({ at, process: 'DEX 价差服务', kind: 'uncaughtException', message: 'boom', stack: '' }));
+  for (const [clock, expected] of [[at + DEX_CRASH_REPORT_MS, true], [at + DEX_CRASH_REPORT_MS + 1, false]] as const) {
+    const dex = startDex({ socket: socketIn(dir, `crash-${clock}`), stateDir: dir, build: 'test', options: offline, log: () => {}, now: () => clock });
+    const client = createDexClient(socketIn(dir, `crash-${clock}`));
+    try { await dex.ready; assert.equal(!!(await client.status()).crash, expected); }
+    finally { client.close(); await dex.stop(); }
+  }
+});
+
+test('执行面每轮推 token：status 读失败时照推，确知版本不兼容时停推', async t => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'dex-tick-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const pushes: DexTokenPush[] = [];
+  let status: () => Promise<DexStatus> = async () => { throw new Error('timeout'); };
+  const fake = {
+    page: async () => ({ status: 200, body: {} }), close() {}, setCompatible() {},
+    status: () => status(),
+    pushToken: async (push: DexTokenPush) => { pushes.push(push); return { instance: 'i', token: tokenDigest(push) }; },
+  } satisfies DexClient;
+  const link = createDexLink({ socketPath: '', dir, notifyOnce() {}, log() {}, client: fake });
+  await link.tick();
+  assert.equal(pushes.length, 1, 'status 失败也推');
+  status = async () => ({ build: 'x', instance: 'i', protocol: DEX_PROTOCOL + 1, process: {} as DexStatus['process'], crash: null, token: null });
+  await link.tick();
+  assert.equal(pushes.length, 1, '版本不兼容不推');
+  status = async () => { throw new Error('timeout'); };
+  await link.tick();
+  assert.equal(pushes.length, 1, '之后 status 失败仍沿用不兼容的判断');
+  status = async () => ({ build: 'x', instance: 'i', protocol: DEX_PROTOCOL, process: {} as DexStatus['process'], crash: null, token: null });
+  await link.tick();
+  assert.equal(pushes.length, 2);
+  assert.ok(pushes[1]!.seq > pushes[0]!.seq);
 });
 
 test('执行面转发：DEX 正常时原样返回，停了以后读与写都是 503', async t => {
@@ -130,10 +173,60 @@ test('库复制：还有连接持有写锁时拒绝导出，不等待', { skip: 
   if (file) rmSync(file);
 });
 
+test('库复制：收到的库含触发器或视图时拒绝，目标处的库还被占用时拒绝', { skip: process.platform === 'win32' }, t => {
+  const base = mkdtempSync(path.join(tmpdir(), 'dex-harden-'));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const [from, to, work] = ['from', 'to', 'work'].map(name => path.join(base, name));
+  for (const dir of [from, to, work]) mkdirSync(dir);
+  makeDb(from, 3);
+  makeDb(to, 1);
+  const holder = new DatabaseSync(path.join(to, DB_FILE));
+  holder.exec('BEGIN IMMEDIATE');
+  try { assert.throws(() => importFrom(exported(from, work), to, '20261126T000001Z'), /占用/); }
+  finally { holder.exec('ROLLBACK'); holder.close(); }
+  assert.ok(!readdirSync(to).some(name => name.includes('.bak-') || name.endsWith('.tmp')), '没有改名、没有留下临时文件');
+
+  const db = new DatabaseSync(path.join(from, DB_FILE));
+  db.exec('CREATE TRIGGER x AFTER INSERT ON t BEGIN DELETE FROM u; END');
+  db.close();
+  assert.throws(() => importFrom(exported(from, work), to, '20261126T000002Z'), /表与索引以外/);
+  const copy = new DatabaseSync(path.join(to, DB_FILE));
+  assert.deepEqual(tableCounts(copy), { t: 1, u: 0 }, '目标不变');
+  copy.close();
+});
+
 test('执行面代码不导入 src/varlighter（含动态导入），只有 DEX 进程导入', () => {
   const offenders = globSync('src/**/*.{ts,mjs}', { cwd: root })
     .map(file => file.replaceAll('\\', '/'))
     .filter(file => !file.startsWith('src/varlighter/') && !file.startsWith('src/dex/'))
     .filter(file => /(?:from\s*|import\s*\(\s*)['"`][^'"`]*varlighter\//.test(readFileSync(path.join(root, file), 'utf8')));
   assert.deepEqual(offenders, []);
+});
+
+test('执行面 http：写请求发到 DEX 后应答丢失时断开页面连接，不回 503；读请求回 503', async t => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'dex-http-'));
+  const socket = socketIn(dir, 'lost');
+  const dex = createServer(connection => connection.once('data', () => connection.destroy()));
+  await new Promise<void>(resolve => dex.listen(socket, resolve));
+  const client = createDexClient(socket);
+  const h = createHarness();
+  const server = createExecutorServer({ executor: h.ex, accessToken: 'dex-http-access-01', session: 'dex-http-session-01', log: () => {}, views: { varlighter: { page: request => client.page(request) } } });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const stderr = process.stderr.write.bind(process.stderr);
+  t.after(async () => {
+    process.stderr.write = stderr;
+    client.close(); await new Promise(resolve => server.close(resolve)); await new Promise(resolve => dex.close(resolve));
+    h.dispose(); rmSync(dir, { recursive: true, force: true });
+  });
+  const cookie = ((await fetch(`${base}/login?token=dex-http-access-01`, { redirect: 'manual' })).headers.get('set-cookie') ?? '').split(';')[0]!;
+  const headers = { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' };
+  let logged = '';
+  process.stderr.write = ((chunk: string | Uint8Array) => { logged += String(chunk); return true; }) as typeof process.stderr.write;
+  await assert.rejects(fetch(`${base}/api/varlighter/settings`, { method: 'POST', headers, body: '{}' }), '页面连接被断开，没有收到任何应答');
+  assert.match(logged, /DEX 价差接口 settings 的应答丢失/);
+  process.stderr.write = stderr;
+  const read = await fetch(`${base}/api/varlighter/state`, { headers });
+  assert.equal(read.status, 503);
+  assert.equal(((await read.json()) as { code: string }).code, 'dex_unavailable');
 });

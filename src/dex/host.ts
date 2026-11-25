@@ -75,7 +75,6 @@ export async function varLighterLoop(holder: VarLighterHolder, context: { stoppe
 }
 
 /** POST 请求体的上限，与执行面读请求体时用的一致（参数 64 KB，其余 16 KB）。 */
-export const pageBodyLimit = (path: string): number => path === 'settings' ? 64 * 1024 : 16 * 1024;
 
 /**
  * 页面接口的路由表（原来在执行面 http.ts）：`path` 是 `/api/varlighter/` 之后的部分。出错按 `failure` 换成固定文案，

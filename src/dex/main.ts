@@ -14,6 +14,8 @@ import { createDexServer } from './server.ts';
 export const DEX_PROCESS_NAME = 'DEX 价差服务';
 const WAITING = '等待执行服务推送 Var token';
 const EXPIRED = '超过 1 分钟没收到执行服务推送的 Var token，已暂停询价';
+/** 崩溃记录不清除（状态目录只有 DEX 自己写）；只报告这么久以内的，免得每次启动都把很久以前的那次带出去。 */
+export const DEX_CRASH_REPORT_MS = 24 * 3600_000;
 
 /** 起 DEX 服务：打开库、监听套接字、跑采集循环；返回停止函数（等循环关库后才结束）。测试与本地预览在同一进程里调用。 */
 export function startDex({ socket, stateDir, build, options = {}, log = line => process.stderr.write(`${line}\n`), now = Date.now }:
@@ -28,12 +30,13 @@ export function startDex({ socket, stateDir, build, options = {}, log = line => 
   const holder = openVarLighter(stateDir, { ...options, tokenSource: source }, log);
   const views = varLighterViews(holder);
   const last = readCrashRecord(stateDir);
-  const crash: DexCrashView | null = last ? { at: last.at, key: crashReportKey(last), text: `${last.kind === 'unhandledRejection' ? '未处理的 Promise 拒绝' : '未捕获的异常'}：${last.message}` } : null;
+  const crash: DexCrashView | null = last && now() - last.at <= DEX_CRASH_REPORT_MS ? { at: last.at, key: crashReportKey(last), text: `${last.kind === 'unhandledRejection' ? '未处理的 Promise 拒绝' : '未捕获的异常'}：${last.message}` } : null;
   const service = createDexServer({
     page: request => routePage(views, request, log),
     // 空 token 立即生效：之后不再询价（docs/dexspread.md 11.4）。
     token: push => {
-      if (token && push.seq <= token.seq) return false;
+      // 租约内只收更大的序号；租约过期后任何推送都收，执行服务重启后墙钟回拨也不会被一直拒绝。
+      if (current() && push.seq <= token!.seq) return false;
       token = push; receivedAt = now();
       return true;
     },

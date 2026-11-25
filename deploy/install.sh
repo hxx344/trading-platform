@@ -997,7 +997,8 @@ healthy_dex() {
 # Which directory holds the live varlighter.sqlite: dex or executor (no file: executor). Root-owned, written right after
 # each successful copy, so an interrupted run still knows which side to copy from (docs/dexspread.md 11.5).
 DEX_DB_MARK="$APP_DIR/.dex-db"
-set_dex_db() { printf '%s\n' "$1" >"$DEX_DB_MARK.next" && chmod 644 "$DEX_DB_MARK.next" && mv -Tf "$DEX_DB_MARK.next" "$DEX_DB_MARK"; }
+# The marker decides which side owns the database after a crash, so both the file and the rename reach the disk.
+set_dex_db() { printf '%s\n' "$1" >"$DEX_DB_MARK.next" && chmod 644 "$DEX_DB_MARK.next" && sync "$DEX_DB_MARK.next" && mv -Tf "$DEX_DB_MARK.next" "$DEX_DB_MARK" && sync "$APP_DIR"; }
 # Copy the database between the two private directories with the DEX unit stopped. Root never opens a file in either
 # directory: each side runs as the directory's owner with a clean environment, root only pipes them together (L201).
 copy_dex_db() { # tool release, from user, from dir, to user, to dir
@@ -1063,8 +1064,9 @@ activate() {
     if [[ "$TEST_MODE" != 1 ]]; then
       if [[ -f "$UNIT_DIR/$DEX.service" ]]; then steady systemctl disable --now --quiet "$DEX" || return 1; fi
       if [[ "$(read_value "$DEX_DB_MARK")" == dex ]]; then
-        dex_from=$(readlink -f "$APP_DIR/dex" 2>/dev/null || true)
-        [[ -n "$dex_from" && -d "$dex_from" ]] || { log '找不到 DEX 价差组件目录，无法把库交回执行服务。'; return 1; }
+        # move-db.ts is not part of the DEX fingerprint, so a pinned DEX release may carry an older copy: prefer the target's.
+        if [[ -f "$target/src/dex/move-db.ts" ]]; then dex_from=$target; else dex_from=$(readlink -f "$APP_DIR/dex" 2>/dev/null || true); fi
+        [[ -n "$dex_from" && -f "$dex_from/src/dex/move-db.ts" ]] || { log '找不到 DEX 价差组件目录，无法把库交回执行服务。'; return 1; }
         copy_dex_db "$dex_from" "$DEX_USER" "$DEX_STATE" "$SERVICE_USER" "$DATA_DIR" && set_dex_db executor || return 1
         changes+=('DEX 价差库已交回执行服务')
       fi
@@ -1164,7 +1166,7 @@ activate() {
     enable_service "$DEX" || return 1
     if [[ "$(read_value "$DEX_DB_MARK")" != dex ]]; then
       as_root_dir "$DEX_STATE" 700 "$DEX_USER" "$DEX_USER" || return 1
-      copy_dex_db "$dex" "$SERVICE_USER" "$DATA_DIR" "$DEX_USER" "$DEX_STATE" && set_dex_db dex || return 1
+      copy_dex_db "$target" "$SERVICE_USER" "$DATA_DIR" "$DEX_USER" "$DEX_STATE" && set_dex_db dex || return 1
       changes+=('DEX 价差库已移到独立服务')
       action_dex=start
     elif ! systemctl is-active --quiet "$DEX"; then action_dex=start

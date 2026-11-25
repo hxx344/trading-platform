@@ -21,21 +21,21 @@ export interface DexLink { client: DexClient; forward: DexForward; tick(): Promi
 /**
  * 每轮（15 秒）读一次 DEX 的 status：协议版本不认识就停止转发；DEX 带出的上次崩溃记录按键发一次告警；然后推送 token。
  * 每轮都推（也是 DEX 那边一分钟租约的续期），序号单调递增；推送失败只记一次日志，下一轮照推。
+ * status 读失败（例如 DEX 忙于回测时超时）不跳过推送，沿用上一次的兼容判断：只有确知版本不兼容时才不推。
  */
 export function createDexLink({ socketPath, dir, notifyOnce, log, client = createDexClient(socketPath) }:
   { socketPath: string; dir: string; notifyOnce: (key: string, text: string) => void; log: (line: string) => void; client?: DexClient }): DexLink {
-  let pushFailing = false, seq = 0;
+  let pushFailing = false, seq = 0, compatible = true;
   const nextSeq = () => { seq = Math.max(seq + 1, Date.now()); return seq; };
   return {
     client,
     forward: { page: request => client.page(request) },
     async tick() {
-      let status;
-      try { status = await client.status(); } catch { return; }
-      const compatible = dexCompatible(status);
-      client.setCompatible(compatible);
+      let status = null;
+      try { status = await client.status(); } catch { /* 沿用上一次的判断 */ }
+      if (status) { compatible = dexCompatible(status); client.setCompatible(compatible); }
       if (!compatible) return;
-      if (status.crash) {
+      if (status?.crash) {
         const { at, key, text } = status.crash;
         try { notifyOnce(`dex:${key}`, `【DEX 价差服务上次异常退出】北京时间 ${new Date(at + 8 * 3600_000).toISOString().slice(0, 19).replace('T', ' ')}，${text}。已由 systemd 重启，交易执行不受影响`); }
         catch (error) { log(`DEX 价差服务崩溃告警未能入队：${error instanceof Error ? error.message.slice(0, 160) : String(error)}`); }

@@ -574,7 +574,7 @@ test('Lighter 盘口行情流：订阅 order_book，快照加增量（数量 0 �
     book('subscribed/order_book', { code: 0, bids: [{ price: '100.2', size: '1' }], asks: [{ price: '100.1', size: '1' }], nonce: 20 });
     clock += 6_000;
     socket.sent.length = 0;
-    const sent = () => socket.sent.map(item => `${item.type} ${item.channel}`);
+    const sent = () => socket.sent.filter(item => item.type !== 'ping').map(item => `${item.type} ${item.channel}`);
     const resent = ['unsubscribe order_book/1', 'subscribe order_book/1'];
     assert.equal(stream.depth(1), null, '倒挂的盘口不用');
     assert.deepEqual(sent(), [], '连续第二次重订要等 10 秒，先作废盘口、推迟');
@@ -613,6 +613,10 @@ test('Lighter 盘口行情流：订阅 order_book，快照加增量（数量 0 �
     assert.equal(stream.depthError(1), '盘口档数异常，重新订阅');
     book('subscribed/order_book', { code: 0, bids: [{ price: '99.9', size: '5' }], asks: [{ price: '100.1', size: '5' }], nonce: 50 });
     assert.equal(stream.depth(1)?.bid, 99.9, '正常快照到了就恢复');
+    clock += 11_000;
+    socket.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: {} });
+    tick();
+    assert.deepEqual(sent(), [], '快照到了就取消推迟的重订，过了旧到期时刻也不再订');
     // 换订阅：退订去掉的，新加的立即订阅。
     socket.sent.length = 0;
     stream.setDepthMarkets(new Map([[2, '2']]));
@@ -976,7 +980,7 @@ test('Entropy 盘口与市场状态：l2Book 推送算冲击并确认一档，�
     const book = stream.depth(0)!;
     assert.deepEqual([book.at, book.bid, book.ask], [clock, 99.9, 100.1], '连接在就是当前盘口');
     assert.deepEqual([Math.abs(book.ask1k! - 100.1) < 1e-9, book.ask100k! > 100.1], [true, true], '1k 在第一档内成交，100k 吃到第二档');
-    assert.equal(stream.topAt(0, clock)?.bid, 99.9, '盘口推送也记一档');
+    assert.equal(stream.topAt(0, T0)?.bid, 99.9, '盘口推送也记一档');
     // 一档没变的推送 10 秒内不重复记。
     push('io:SNDK', '99.9', '100.1');
     clock += 1_000;

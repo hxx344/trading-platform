@@ -9,7 +9,7 @@ import { HyperliquidStream, LighterStream, MAX_DEPTH_MARKETS, depthAt, fetchEntr
   type Connect, type DepthSnapshot, type FetchLike, type LiveStream, type TopPoint } from './feeds.ts';
 import { ASSET_KINDS, COMBOS, DEFAULT_COMBOS, KIND_NAMES, LEG_SYMBOL, LIVE_VENUES, RATIO_MAX, RATIO_MIN, REGIME_NAMES, SAMPLE_FIELDS, SAMPLE_FORMAT, VENUE_IDS, VENUE_NAMES,
   bothLive, bucketOf, comboName, comboPairs, comboVenues, customPairInfo, formatRatio, hasTokenQuote, isLive, legKey, lighterMarket, midBasis, pairKey, pairTitle, parsePairKey,
-  regimeOf, regimesOf, sortPairs, spreadOf, upgradeKey, varHourly, varMarket,
+  regimeOf, regimesOf, sameSymbol, sortPairs, spreadOf, upgradeKey, varHourly, varMarket,
   type AssetKind, type Combo, type CustomPair, type Leg, type LegInfo, type LiveVenue, type MarketSpec, type PairInfo, type Sample, type VarListing, type VenueId } from './model.ts';
 import { orderPlan, type OrderPlan } from './plan.ts';
 import { BaselineTracker, LIVE_BASELINE_GAP_MS, suggestedEntryBps, symbolStats, type Baseline, type RegimeStats } from './stats.ts';
@@ -114,10 +114,10 @@ export function readCustomPair(value: unknown): CustomPair {
   return { a, b, ratio: Number(formatRatio(ratio as number)), kind: kind as AssetKind, note: (note as string).trim() };
 }
 export const customKey = (pair: CustomPair) => pairKey(pair.a, pair.b, pair.ratio);
-/** 这个键是否是某个组合的自动配对（同代码、乘数 1、A 在前）。 */
+/** 这个键是否是某个组合的自动配对（同代码或同一别名组、乘数 1、A 在前）。 */
 function autoComboOf(key: string): Combo | null {
   const parsed = parsePairKey(key);
-  if (!parsed || parsed.ratio !== 1 || parsed.a.symbol !== parsed.b.symbol) return null;
+  if (!parsed || parsed.ratio !== 1 || !sameSymbol(parsed.a.symbol, parsed.b.symbol)) return null;
   const combo = `${parsed.a.venue}|${parsed.b.venue}` as Combo;
   return COMBOS.includes(combo) ? combo : null;
 }
@@ -721,7 +721,9 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
         if (duplicate) reject('duplicate_pair', `手动配对重复：${duplicate}`);
       }
       // 组合与手动配对都定下来后再查：只改组合（打开一个组合）也不能让手动配对与自动配对同键。
-      const auto = custom.map(customKey).find(key => { const combo = autoComboOf(key); return combo && combos.includes(combo); });
+      // 升级前就有、组合也早已开着的同键手动配对（自动配对后来加了代码别名才同键）放过，不让每次无关的保存都失败；配对表里自动配对优先。
+      const existing = (key: string, combo: Combo) => settings.combos.includes(combo) && settings.pairs.some(item => customKey(item) === key);
+      const auto = custom.map(customKey).find(key => { const combo = autoComboOf(key); return combo && combos.includes(combo) && !existing(key, combo); });
       if (auto) reject('duplicate_pair', `${auto} 已是开启中的组合「${comboName(autoComboOf(auto)!)}」的自动配对，${body.pairs !== undefined ? '不必手动添加' : body.combos !== undefined ? '先删掉这个手动配对再开组合' : '先删掉这个手动配对或关掉该组合'}`);
       // 关掉的组合或删掉的手动配对上不能还有启用的配对或模拟持仓。
       const enabled = Object.entries(symbols).filter(([, params]) => params.enabled).map(([key]) => key);

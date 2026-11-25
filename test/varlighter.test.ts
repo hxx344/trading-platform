@@ -472,7 +472,8 @@ test('旧库迁移：持仓与成交换成两腿口径复制到新表，参数�
     assert.equal(failed.engine, null);
     assert.match(failed.error ?? '', /disk says no/);
     assert.ok(lines.some(line => line.includes('模块停用')));
-    assert.equal(varLighterViews(failed).failure(new Error('x')).status, 500);
+    const unavailable = (() => { try { varLighterViews(failed).state(); } catch (error) { return varLighterViews(failed).failure(error); } return null; })();
+    assert.deepEqual([unavailable?.status, unavailable?.body.code], [503, 'unavailable'], '模块不可用时接口 503');
     const fix = new DatabaseSync(failFile);
     assert.equal((fix.prepare('SELECT COUNT(*) AS n FROM leg_positions').get() as { n: number }).n, 0, '回滚，没有半截迁移');
     fix.exec('DROP TRIGGER fail_migrate');
@@ -1247,6 +1248,17 @@ test('手动配对：添加、重复与自动配对重复、数量上限；启�
     const saved = engine.views.settings({ revision: 6, global: { minNetBps: 4 } });
     assert.deepEqual([saved.revision, saved.global.minNetBps, saved.symbols[P_KEY].enabled], [7, 4, true]);
     assert.deepEqual([row(P_KEY)!.identity, row(P_KEY)!.eligible], ['mismatch', false]);
+  } finally { dispose(); }
+});
+
+test('腿数上限：升级前留下的超额状态不挡无关保存，只挡让腿变多的保存', () => {
+  const symbols = Object.fromEntries(Array.from({ length: 11 }, (_, index) => [`var:S${index}|rh:S${index}`, { ...DEFAULT_SYMBOL, enabled: true }]));
+  const { engine, dispose } = seededEngine(store => store.setState(SETTINGS_KEY, settings2(symbols), T0));
+  try {
+    const saved = engine.views.settings({ revision: 3, global: { minNetBps: 4 } });
+    assert.equal(saved.revision, 4, '只改全局参数照常保存');
+    assert.deepEqual(code(() => engine.views.settings({ revision: 4, symbols: { 'var:S11|rh:S11': { enabled: true } } })), [400, 'too_many'], '再多一条 RH 腿被挡');
+    assert.equal(engine.views.settings({ revision: 4, symbols: { 'var:S10|rh:S10': { enabled: false } } }).revision, 5, '减少照常');
   } finally { dispose(); }
 });
 

@@ -148,8 +148,9 @@ export interface LiveStream {
 
 /** 盘口快照迟迟不到（订阅没有回应）就重新订阅。 */
 export const BOOK_SYNC_TIMEOUT_MS = 15_000;
-/** 同一个市场两次重新订阅盘口之间至少隔这么久。 */
+/** 同一个市场两次订阅盘口之间至少隔这么久；连续重订（中间没有算出过盘口）每次翻倍，最长 BOOK_RESYNC_MAX_MS。 */
 const BOOK_RESYNC_MIN_MS = 5_000;
+const BOOK_RESYNC_MAX_MS = 60_000;
 /** 按价格合并的一侧盘口最多保留这么多档；超出说明增量没对上，重新订阅。 */
 const BOOK_MAX_LEVELS = 5_000;
 const sortedLevels = (levels: ReadonlyMap<number, number>, descending: boolean): [number, number][] => [...levels].sort((a, b) => descending ? b[0] - a[0] : a[0] - b[0]);
@@ -162,7 +163,11 @@ export interface StreamStatus {
 }
 
 /** Lighter 一个市场的完整盘口：订阅回的快照加之后的增量（数量为 0 的档删除）。 */
-interface LighterBook { bids: Map<number, number>; asks: Map<number, number>; synced: boolean; nonce: number | null; askedAt: number; error: string | null }
+interface LighterBook {
+  bids: Map<number, number>; asks: Map<number, number>; synced: boolean; nonce: number | null; askedAt: number; error: string | null;
+  /** 连续重订次数（算出一次盘口清零），决定下次重订前要等多久。 */ retries: number;
+  /** 被限速推迟的重订在这个时刻执行（期间盘口作废）。 */ due: number | null;
+}
 
 /**
  * 一个 Lighter 场所的只读行情流：订阅 market_stats/all 拿全市场一档、标记价、指数价与资金费；
@@ -247,6 +252,7 @@ export class LighterStream implements LiveStream {
     try {
       const snapshot = depthSnapshot({ bids: sortedLevels(book.bids, true), asks: sortedLevels(book.asks, false) }, this.now());
       book.error = null;
+      book.retries = 0;
       return snapshot;
     } catch (error) {
       // 倒挂说明增量漏了，重新订阅拿快照；一侧为空只记原因。
@@ -261,17 +267,25 @@ export class LighterStream implements LiveStream {
     const book = this.books.get(marketId);
     return book?.synced ? book.error : book?.error ?? '等待盘口快照';
   }
-  private subscribeBook(id: number, error: string | null = null): void {
-    this.books.set(id, { bids: new Map(), asks: new Map(), synced: false, nonce: null, askedAt: this.now(), error });
+  private subscribeBook(id: number, error: string | null = null, retries = 0): void {
+    this.books.set(id, { bids: new Map(), asks: new Map(), synced: false, nonce: null, askedAt: this.now(), error, retries, due: null });
     this.send({ type: 'subscribe', channel: `order_book/${id}` });
   }
-  /** 退订再订阅，丢掉旧盘口；之后在途的旧增量因未同步被忽略，直到新快照到。 */
+  /**
+   * 退订再订阅，丢掉旧盘口；之后在途的旧增量因未同步被忽略，直到新快照到。
+   * 离上次订阅不够久就先作废盘口、推迟到期再订（tick 里执行），不论盘口是否已同步，避免快照本身有问题时每次快照都重订。
+   */
   private resyncBook(id: number, reason: string): void {
     const book = this.books.get(id);
     if (!book || !this.depthIds.has(id)) return;
-    if (!book.synced && this.now() - book.askedAt < BOOK_RESYNC_MIN_MS) { book.error = reason; return; }
+    const wait = Math.min(BOOK_RESYNC_MIN_MS * 2 ** book.retries, BOOK_RESYNC_MAX_MS);
+    if (this.now() - book.askedAt < wait) {
+      book.synced = false; book.bids.clear(); book.asks.clear(); book.nonce = null; book.error = reason;
+      book.due ??= book.askedAt + wait;
+      return;
+    }
     this.send({ type: 'unsubscribe', channel: `order_book/${id}` });
-    this.subscribeBook(id, reason);
+    this.subscribeBook(id, reason, book.retries + 1);
   }
 
   /** 仍在进行的区间以最近一条消息再加 LIVE_SLACK_MS 为止（Var 报价时刻可能略晚于 Lighter 最近一条消息）。 */
@@ -299,7 +313,12 @@ export class LighterStream implements LiveStream {
       this.send({ type: 'unsubscribe', channel: 'market_stats/all' });
       this.send({ type: 'subscribe', channel: 'market_stats/all' });
     }
-    if (this.state.connected) for (const [id, book] of this.books) if (!book.synced && now - book.askedAt > BOOK_SYNC_TIMEOUT_MS) this.resyncBook(id, '盘口快照超时，重新订阅');
+    if (this.state.connected) {
+      for (const [id, book] of this.books) {
+        if (book.due !== null && now >= book.due) this.resyncBook(id, book.error ?? '重新订阅盘口');
+        else if (book.due === null && !book.synced && now - book.askedAt > BOOK_SYNC_TIMEOUT_MS) this.resyncBook(id, '盘口快照超时，重新订阅');
+      }
+    }
     const cutoff = now - HISTORY_MS;
     for (const points of this.top.values()) prune(points, cutoff);
     while (this.topSegments.length > 1 && (this.topSegments[0].end ?? now) < cutoff) this.topSegments.shift();
@@ -343,7 +362,7 @@ export class LighterStream implements LiveStream {
     if (!book || !value) return;
     if (snapshot) {
       if (value.code !== undefined && value.code !== 0) { this.resyncBook(id, `盘口快照无效（code ${String(value.code).slice(0, 20)}）`); return; }
-      book.bids.clear(); book.asks.clear(); book.synced = true; book.error = null;
+      book.bids.clear(); book.asks.clear(); book.synced = true; book.error = null; book.due = null;
     } else {
       if (!book.synced) return;
       // begin_nonce 应等于上一条的 nonce；对不上说明漏了增量。

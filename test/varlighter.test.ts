@@ -542,7 +542,7 @@ test('盘口快照：冲击套到对齐时刻的一档价上，相隔过久不�
   assert.throws(() => depthSnapshot({ bids: [[100, 1]], asks: [] }, T0), /为空/);
 });
 
-test('Lighter 盘口行情流：订阅 order_book，快照加增量（数量 0 删档），nonce 断档与倒挂重新订阅，快照超时重订，退订与断线清空', () => {
+test('Lighter 盘口行情流：订阅 order_book，快照加增量（数量 0 删档），nonce 断档与倒挂重新订阅，快照超时重订，连续重订退避，退订与断线清空', () => {
   let clock = T0;
   const sockets: FakeSocket[] = [];
   const stream = new LighterStream({ venue: 'rh', connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now: () => clock });
@@ -574,17 +574,45 @@ test('Lighter 盘口行情流：订阅 order_book，快照加增量（数量 0 �
     book('subscribed/order_book', { code: 0, bids: [{ price: '100.2', size: '1' }], asks: [{ price: '100.1', size: '1' }], nonce: 20 });
     clock += 6_000;
     socket.sent.length = 0;
+    const sent = () => socket.sent.map(item => `${item.type} ${item.channel}`);
+    const resent = ['unsubscribe order_book/1', 'subscribe order_book/1'];
     assert.equal(stream.depth(1), null, '倒挂的盘口不用');
-    assert.deepEqual(socket.sent.map(item => `${item.type} ${item.channel}`), ['unsubscribe order_book/1', 'subscribe order_book/1'], '倒挂重新订阅');
-    // 快照迟迟不到：15 秒后再订一次。
+    assert.deepEqual(sent(), [], '连续第二次重订要等 10 秒，先作废盘口、推迟');
+    assert.equal(stream.depthError(1), '盘口倒挂，重新订阅');
+    assert.equal(stream.depth(1), null, '推迟期间不再算、不再重订');
+    assert.deepEqual(sent(), []);
+    clock += 4_000;
+    tick();
+    assert.deepEqual(sent(), resent, '到期再订');
+    // 快照迟迟不到：15 秒超时，但连续第三次重订要等 20 秒。
     socket.sent.length = 0;
     clock += 16_000;
     socket.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: {} });
     tick();
-    assert.ok(socket.sent.some(item => item.type === 'subscribe' && item.channel === 'order_book/1'));
+    assert.deepEqual(sent(), [], '超时但未到退避时刻');
     assert.equal(stream.depthError(1), '盘口快照超时，重新订阅');
+    clock += 4_000;
+    socket.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: {} });
+    tick();
+    assert.deepEqual(sent(), resent);
     book('subscribed/order_book', { code: 0, bids: [{ price: '99.9', size: '5' }], asks: [{ price: '100.1', size: '5' }], nonce: 30 });
     assert.equal(stream.depth(1)?.bid, 99.9);
+    // 算出过盘口后退避清零：5 秒后断档立即重订。
+    clock += 5_000;
+    socket.sent.length = 0;
+    book('update/order_book', { bids: [], asks: [], begin_nonce: 99, nonce: 100 });
+    assert.deepEqual(sent(), resent, '退避清零');
+    // 盘口超过档数上限：作废，但离上次订阅不够久不会再订（每条消息都超限也一样）。
+    socket.sent.length = 0;
+    const huge = Array.from({ length: 5_000 }, (_, index) => ({ price: String(90 - index * 0.001), size: '1' }));
+    for (const nonce of [40, 42]) {
+      book('subscribed/order_book', { code: 0, bids: huge, asks: [{ price: '100.1', size: '5' }], nonce });
+      book('update/order_book', { bids: [{ price: '95', size: '1' }], asks: [], begin_nonce: nonce, nonce: nonce + 1 });
+    }
+    assert.deepEqual(sent(), [], '档数超限也受限速');
+    assert.equal(stream.depthError(1), '盘口档数异常，重新订阅');
+    book('subscribed/order_book', { code: 0, bids: [{ price: '99.9', size: '5' }], asks: [{ price: '100.1', size: '5' }], nonce: 50 });
+    assert.equal(stream.depth(1)?.bid, 99.9, '正常快照到了就恢复');
     // 换订阅：退订去掉的，新加的立即订阅。
     socket.sent.length = 0;
     stream.setDepthMarkets(new Map([[2, '2']]));

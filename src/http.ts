@@ -25,7 +25,8 @@ import { supportsFundingHistory } from './vendor/exchange-funding-history.mjs';
 import type { AssetStore } from './asset/store.ts';
 import type { CrossexViews } from './service/crossex.ts';
 import type { OndoViews } from './service/ondo.ts';
-import type { VarLighterViews } from './service/varlighter.ts';
+import { DexOutcomeUnknown } from './dex/ipc.ts';
+import type { DexForward } from './service/dex.ts';
 import type { MevViews } from './service/mev.ts';
 import { AssetConflict } from './asset/sync-lock.ts';
 import { AssetInputError, INPUT_INVALID } from './asset/validation.ts';
@@ -168,8 +169,8 @@ export interface ServiceViews {
   update?: { status(): unknown; check(): Promise<unknown>; apply(body: unknown): unknown };
   /** EQN 快讯与异动行情（service/news.ts，docs/news.md）；config.json 写了 `"news": false` 时没有。读取在连接开始前为 null。 */
   news?: { flash(): { items: readonly { url: string | null }[] } | null; moves(): { items: readonly { url: string | null }[] } | null };
-  /** Var 与 Lighter（RH、主网）价差采集与模拟盘（service/varlighter.ts，docs/varlighter.md）；config.json 写了 `"varLighter": false` 时没有。 */
-  varlighter?: VarLighterViews;
+  /** DEX 价差（docs/dexspread.md 第 11 节）：转发给 DEX 价差服务；config.json 写了 `"varLighter": false` 或没有 DEX 套接字时没有。 */
+  varlighter?: DexForward;
   /** MEV 套利（service/mev.ts，docs/mev.md）；执行服务总是提供，还没启用时只有启用向导的状态。 */
   mev?: MevViews;
 }
@@ -894,24 +895,20 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     }
     if (url.pathname.startsWith('/api/varlighter/')) {
       if (!views?.varlighter) return send(response, 404, { code: 'not_found', message: '本服务没有开启 Var/Lighter 价差模块' });
-      const varlighter = views.varlighter, path = url.pathname.slice('/api/varlighter/'.length);
-      try {
-        if (request.method === 'GET' && path === 'state') return send(response, 200, varlighter.state());
-        if (request.method === 'GET' && path === 'symbol') return send(response, 200, varlighter.symbol(url.searchParams.get('symbol'), url.searchParams.get('hours')));
-        if (request.method === 'GET' && path === 'samples') return send(response, 200, varlighter.samples(url.searchParams.get('symbol'), url.searchParams.get('after'), url.searchParams.get('limit')));
-        if (request.method === 'GET' && path === 'paper') return send(response, 200, varlighter.paper());
-        if (request.method === 'GET' && path === 'readiness') return send(response, 200, varlighter.readiness());
-        if (request.method === 'POST' && path === 'backtest') return send(response, 200, varlighter.backtest(await readJson(request)));
-        if (request.method === 'POST' && path === 'settings') return send(response, 200, varlighter.settings(await readJson(request, 64 * 1024)));
-        if (request.method === 'POST' && path === 'paper/close') return send(response, 200, varlighter.close(await readJson(request)));
-        if (request.method === 'POST' && path === 'paper/reset') return send(response, 200, varlighter.reset(await readJson(request)));
-      } catch (error) {
-        if (error instanceof ContractError) throw error;
-        const failure = varlighter.failure(error);
-        if (failure.internal) process.stderr.write(`Var/Lighter 接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}\n`);
-        return send(response, failure.status, failure.body);
+      const path = url.pathname.slice('/api/varlighter/'.length);
+      if (request.method !== 'GET' && request.method !== 'POST') return send(response, 404, { code: 'not_found', message: '不存在' });
+      // 请求体在这里读完（上限与原来一致：参数 64 KB，其余 16 KB），DEX 服务读完整个请求体才处理。
+      const body = request.method === 'POST' ? await readJson(request, path === 'settings' ? 64 * 1024 : undefined) : undefined;
+      let answer;
+      try { answer = await views.varlighter.page({ method: request.method, path, query: [...url.searchParams], ...(request.method === 'POST' ? { body } : {}) }); }
+      catch (error) {
+        if (!(error instanceof DexOutcomeUnknown)) throw error;
+        // 写请求已经发到 DEX、应答丢了：结果未知，断开连接让页面显示「结果未知」，不重试、不改成 503（L204）。
+        process.stderr.write(`DEX 价差接口 ${path} 的应答丢失，已断开页面连接：${error.message}\n`);
+        response.destroy();
+        return;
       }
-      return send(response, 404, { code: 'not_found', message: '不存在' });
+      return send(response, answer.status, answer.body);
     }
     if (url.pathname.startsWith('/api/mev/')) {
       if (!views?.mev) return send(response, 404, { code: 'not_found', message: '本服务没有配置 MEV 套利模块' });

@@ -21,7 +21,7 @@ cp -R "$root/src" "$root/package.json" "$root/README.md" "$pkg/"
 # scripts are development tools and stay out of the package.
 cp "$root/scripts/variational-balance.py" "$root/scripts/variational-request.py" "$root/scripts/import-workbook.py" "$pkg/scripts/"
 cp -R "$root/web/dist" "$pkg/web/"
-cp "$root/deploy/trading-platform.service" "$root/deploy/trading-platform-control.service" "$root/deploy/trading-platform-market.service" "$root/deploy/trading-platform-import.service" "$root/deploy/trading-platform-import.path" "$root/deploy/trading-platform-update.service" "$root/deploy/trading-platform-update.path" "$root/deploy/config.example.json" "$root/deploy/secrets.example.json" "$pkg/deploy/"
+cp "$root/deploy/trading-platform.service" "$root/deploy/trading-platform-control.service" "$root/deploy/trading-platform-market.service" "$root/deploy/trading-platform-dex.service" "$root/deploy/trading-platform-import.service" "$root/deploy/trading-platform-import.path" "$root/deploy/trading-platform-update.service" "$root/deploy/trading-platform-update.path" "$root/deploy/config.example.json" "$root/deploy/secrets.example.json" "$pkg/deploy/"
 printf 'v%s %s\n' "$version" "$commit" >"$pkg/VERSION"
 node "$root/deploy/component-digests.mjs" "$pkg"
 tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner --mode='u+rwX,go+rX,go-w' -C "$stage" -cf - trading-platform \

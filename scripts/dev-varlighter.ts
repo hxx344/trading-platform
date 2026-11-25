@@ -11,7 +11,8 @@ import { createExecutor } from '../src/executor.ts';
 import { createSimulatedVenues } from '../src/simulation.ts';
 import { runExecutor } from '../src/runtime.ts';
 import { loadWebApp } from '../src/web-assets.ts';
-import { openVarLighter, varLighterLoop, varLighterViews } from '../src/service/varlighter.ts';
+import { startDex } from '../src/dex/main.ts';
+import { createDexClient } from '../src/dex/ipc.ts';
 import { openVarLighterStore, VARLIGHTER_FILE } from '../src/varlighter/store.ts';
 import { runBacktest } from '../src/varlighter/backtest.ts';
 import { KNOWN_KINDS, REVIEW_KINDS, pairKey, regimeOf, varHourly, type Leg, type LiveVenue, type Sample } from '../src/varlighter/model.ts';
@@ -255,16 +256,21 @@ const fetchImpl = async (input: string | URL | Request): Promise<Response> => {
   }) });
 };
 
-const holder = openVarLighter(dir, { fetchImpl: fetchImpl as typeof fetch, connect: url => venueOfUrl(url) === 'entropy' ? new FakeEntropy() : new FakeLighter(venueOfUrl(url)) }, line => process.stderr.write(`${line}\n`));
+// 与安装后的拓扑一样：DEX 价差服务在本机套接字上（Windows 用命名管道），执行服务只转发（docs/dexspread.md 11.10）。
+const socket = process.platform === 'win32' ? `\\\\.\\pipe\\tp-dex-preview-${process.pid}` : join(dir, 'dex.sock');
+const dex = startDex({ socket, stateDir: dir, build: 'development', options: { fetchImpl: fetchImpl as typeof fetch, connect: url => venueOfUrl(url) === 'entropy' ? new FakeEntropy() : new FakeLighter(venueOfUrl(url)) } });
+await dex.ready;
+const client = createDexClient(socket);
+await client.pushToken({ seq: Date.now(), token: '', problem: '' });
 const store = openStore(join(dir, 'executor.sqlite'));
 const { binance, bybit, aster, asterTrading } = createSimulatedVenues(Date.now);
 const executor = createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, positions: asterTrading });
 if (!executor.acquire()) throw new Error('写入租约被占用');
 const run = runExecutor({
   executor, store, dir, port, app, passes: [],
-  views: { varlighter: varLighterViews(holder) },
+  views: { varlighter: { page: request => client.page(request) } },
   startedMessage: `DEX 价差预览（替身行情）已启动，数据目录 ${dir}`,
-  background: context => [varLighterLoop(holder, context)],
+  background: () => [],
 });
 let link = '';
 for (let i = 0; i < 100 && !link; i++) {
@@ -273,4 +279,6 @@ for (let i = 0; i < 100 && !link; i++) {
 }
 process.stdout.write(link ? `登录链接：${link}\n登录后打开：http://127.0.0.1:${port}/#/varlighter\n按 Ctrl+C 停止（临时数据目录随之删除）\n` : '未能读到登录链接\n');
 await run.done;
+client.close();
+await dex.stop();
 rmSync(dir, { recursive: true, force: true });

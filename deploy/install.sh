@@ -65,6 +65,12 @@ MARKET_USER=trading-platform-market
 IPC_GROUP=trading-platform-ipc
 MARKET_IPC_GROUP=trading-platform-market-ipc
 MARKET_SOCKET=/run/trading-platform-market/market.sock
+DEX=$SERVICE-dex
+DEX_USER=trading-platform-dex
+DEX_IPC_GROUP=trading-platform-dex-ipc
+DEX_SOCKET=/run/trading-platform-dex/dex.sock
+# The unit's StateDirectory; the installer creates it before the first copy (docs/dexspread.md 11.5).
+DEX_STATE=/var/lib/trading-platform-dex
 NODE_VERSION=24.15.0
 KEEP_RELEASES=3
 HEALTH_WAIT_S=90
@@ -346,6 +352,11 @@ if [[ -e "$release_dir/src/market" || -e "$release_dir/deploy/$MARKET.service" |
      -f "$release_dir/deploy/$MARKET.service" && "$(read_value "$release_dir/.market-sha256")" =~ ^[0-9a-f]{64}$ ]] ||
     fail '公开行情组件程序包不完整，未切换版本。'
 fi
+if [[ -e "$release_dir/src/dex" || -e "$release_dir/deploy/$DEX.service" || -e "$release_dir/.dex-sha256" ]]; then
+  [[ "$split" == 1 && -f "$release_dir/src/dex/main.ts" && -f "$release_dir/src/dex/probe.ts" && -f "$release_dir/src/dex/move-db.ts" &&
+     -f "$release_dir/deploy/$DEX.service" && "$(read_value "$release_dir/.dex-sha256")" =~ ^[0-9a-f]{64}$ ]] ||
+    fail 'DEX 价差组件程序包不完整，未切换版本。'
+fi
 
 # ---- 2. Node.js -------------------------------------------------------------------
 node_supported() {
@@ -406,7 +417,7 @@ if ((split)) || [[ -f "$APP_DIR/control/.control-sha256" ]]; then
   fi
   [[ "$UPDATE_DIR" == /* ]] || fail '更新交接目录须为绝对路径。'
   update_path=$(realpath -m "$UPDATE_DIR")
-  protected_dirs=("$APP_DIR" "$CONF_DIR" "$DATA_DIR" "$IMPORT_DIR" /run/trading-platform /run/trading-platform-market)
+  protected_dirs=("$APP_DIR" "$CONF_DIR" "$DATA_DIR" "$IMPORT_DIR" /run/trading-platform /run/trading-platform-market /run/trading-platform-dex "$DEX_STATE")
   old_units=("$UNIT_FILE")
   if [[ "$TEST_MODE" != 1 ]]; then
     protected_dirs+=("$UNIT_DIR" /etc/systemd/system /opt/trading-platform /etc/trading-platform /var/lib/trading-platform /var/lib/trading-platform-import)
@@ -463,8 +474,9 @@ ensure_market_account() {
   [[ "$market_ipc_gid" =~ ^[0-9]+$ && "$market_uid" != 0 && "$market_uid" != "$(id -u "$SERVICE_USER")" && "$market_uid" != "$CONTROL_UID" &&
      "$market_gid" == "$(getent group "$MARKET_USER" | cut -d: -f3)" && "$market_gid" != "$market_ipc_gid" &&
      " $(id -G "$CONTROL_USER") " != *" $market_ipc_gid "* ]] || { log '行情服务须使用独立的账户和通信组。'; return 1; }
-  for gid in 0 "$(id -g "$SERVICE_USER")" "$CONTROL_GID" "$(getent group "$IPC_GROUP" | cut -d: -f3)"; do
-    [[ "$market_gid" != "$gid" && "$market_ipc_gid" != "$gid" ]] || { log '行情服务不能共用交易、控制或特权组。'; return 1; }
+  for gid in 0 "$(id -g "$SERVICE_USER")" "$CONTROL_GID" "$(getent group "$IPC_GROUP" | cut -d: -f3)" \
+      "$(getent group "$DEX_USER" | cut -d: -f3)" "$(getent group "$DEX_IPC_GROUP" | cut -d: -f3)"; do
+    [[ -z "$gid" || ( "$market_gid" != "$gid" && "$market_ipc_gid" != "$gid" ) ]] || { log '行情服务不能共用交易、控制、DEX 价差或特权组。'; return 1; }
   done
   # A pre-existing group can also grant socket access through an unrelated account's primary GID.
   IFS=, read -r -a ipc_members <<<"$members"
@@ -480,6 +492,42 @@ ensure_market_account() {
   done
 }
 ensure_market_account "$release_dir" || fail '目标版本的行情账户未通过核验，已保留当前服务。'
+# The DEX spread service (docs/dexspread.md 11.9) gets the same checks as the market account. The executor unit names its
+# socket group, so the account and groups exist whenever the release carries the component, even with the module off.
+ensure_dex_account() {
+  local target=$1 dex_uid dex_gid dex_groups dex_ipc_gid members member gid
+  local -a ipc_members
+  [[ "$TEST_MODE" != 1 && -f "$target/.dex-sha256" ]] || return 0
+  getent group "$DEX_IPC_GROUP" >/dev/null || groupadd --system "$DEX_IPC_GROUP" || return 1
+  if ! getent passwd "$DEX_USER" >/dev/null; then
+    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$DEX_USER" || return 1
+    changes+=("系统账号 $DEX_USER")
+  fi
+  dex_uid=$(id -u "$DEX_USER") || return 1
+  dex_gid=$(id -g "$DEX_USER") || return 1
+  IFS=: read -r _ _ dex_ipc_gid members <<<"$(getent group "$DEX_IPC_GROUP")"
+  [[ "$dex_ipc_gid" =~ ^[0-9]+$ && "$dex_uid" != 0 && "$dex_uid" != "$(id -u "$SERVICE_USER")" && "$dex_uid" != "$CONTROL_UID" &&
+     "$dex_gid" == "$(getent group "$DEX_USER" | cut -d: -f3)" && "$dex_gid" != "$dex_ipc_gid" &&
+     " $(id -G "$CONTROL_USER") " != *" $dex_ipc_gid "* ]] || { log 'DEX 价差服务须使用独立的账户和通信组。'; return 1; }
+  if getent passwd "$MARKET_USER" >/dev/null; then
+    [[ "$dex_uid" != "$(id -u "$MARKET_USER")" && " $(id -G "$MARKET_USER") " != *" $dex_ipc_gid "* ]] || { log 'DEX 价差服务不能与行情服务共用账户或通信组。'; return 1; }
+  fi
+  for gid in 0 "$(id -g "$SERVICE_USER")" "$CONTROL_GID" "$(getent group "$IPC_GROUP" | cut -d: -f3)" \
+      "$(getent group "$MARKET_USER" | cut -d: -f3)" "$(getent group "$MARKET_IPC_GROUP" | cut -d: -f3)"; do
+    [[ -z "$gid" || ( "$dex_gid" != "$gid" && "$dex_ipc_gid" != "$gid" ) ]] || { log 'DEX 价差服务不能共用交易、控制、行情或特权组。'; return 1; }
+  done
+  IFS=, read -r -a ipc_members <<<"$members"
+  for member in "${ipc_members[@]}"; do
+    [[ "$member" == "$DEX_USER" || "$member" == "$SERVICE_USER" ]] || { log 'DEX 价差通信组已授予其他账户，请恢复专用组后再安装。'; return 1; }
+  done
+  getent passwd | awk -F: -v gid="$dex_ipc_gid" -v dex="$DEX_USER" -v executor="$SERVICE_USER" \
+    '$4 == gid && $1 != dex && $1 != executor { bad=1 } END { exit bad }' || { log 'DEX 价差通信组已用作其他账户的主组，请恢复专用组后再安装。'; return 1; }
+  dex_groups=$(id -G "$DEX_USER") || return 1
+  for gid in $dex_groups; do
+    [[ "$gid" == "$dex_gid" || "$gid" == "$dex_ipc_gid" ]] || { log 'DEX 价差账户已加入其他组，请恢复专用账户后再安装。'; return 1; }
+  done
+}
+ensure_dex_account "$release_dir" || fail '目标版本的 DEX 价差账户未通过核验，已保留当前服务。'
 for name in config secrets; do
   example="$release_dir/deploy/$name.example.json"
   if ! cmp -s "$example" "$CONF_DIR/$name.example.json"; then install -m 644 "$example" "$CONF_DIR/$name.example.json"; fi
@@ -684,6 +732,11 @@ if [[ ! -d "$STATE" ]] || ((external_legacy)); then
     cp "$UNIT_DIR/$MARKET.service" "$initial/market.service"
     cp "$APP_DIR/market.env" "$initial/market.env"
   fi
+  if [[ -n "$previous_dir" && -f "$previous_dir/.dex-sha256" && -f "$UNIT_DIR/$DEX.service" && -L "$APP_DIR/dex" ]]; then
+    readlink -f "$APP_DIR/dex" >"$initial/dex"
+    cp "$UNIT_DIR/$DEX.service" "$initial/dex.service"
+    cp "$APP_DIR/dex.env" "$initial/dex.env"
+  fi
   for unit in "${HELPER_UNITS[@]}"; do
     [[ ! -f "$UNIT_DIR/$unit" ]] || cp "$UNIT_DIR/$unit" "$initial/$unit"
   done
@@ -693,6 +746,7 @@ previous_dir=$(read_value "$STATE/current")
 previous_executor=$(read_value "$STATE/executor")
 previous_control=$(read_value "$STATE/control")
 previous_market=$(read_value "$STATE/market")
+previous_dex=$(read_value "$STATE/dex")
 # Hash as the service account. File metadata matters too: a readable key file with the wrong mode must fail a fresh
 # check. Never read a service-configured key path as root, and store only the aggregate digest in the private record.
 config_hash() {
@@ -741,6 +795,11 @@ elif [[ -n "$previous_dir" ]]; then
 fi
 
 # ---- 5. 准备独立组件和页面版本 --------------------------------------------------------
+# The DEX spread module runs unless config.json says "varLighter": false; turning it on or off takes a rerun of this
+# script (docs/dexspread.md 11.9). Read as the service account, like the other configuration reads.
+dex_enabled=0
+if ((configured)) && as_service "$NODE_BIN" -e 'process.exitCode = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).varLighter === false ? 1 : 0' \
+    "$CONF_DIR/config.json" 2>/dev/null; then dex_enabled=1; fi
 FLOCK_BIN=$(command -v flock)
 render_to() {
   [[ -f "$1" ]] && sed -e "s|@NODE@|$NODE_BIN|g" -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@CONF_DIR@|$CONF_DIR|g" -e "s|@DATA_DIR@|$DATA_DIR|g" \
@@ -782,6 +841,7 @@ for (let start = 0; start < source.length;) {
   start = end + 1;
 }
 writeFileSync(join(out, 'control-proxy.env'), proxy, { mode: 0o600 });
+if (existsSync(join(out, 'dex'))) writeFileSync(join(out, 'dex.env'), proxy, { mode: 0o600 });
 if (existsSync(join(out, 'market'))) {
   writeFileSync(join(out, 'market.env'), market, { mode: 0o600 });
   writeFileSync(join(out, 'executor-env-key'), execution.digest('hex') + '\n', { mode: 0o600 });
@@ -795,8 +855,9 @@ prepare_record() {
   printf '%s\n' "$target" >"$out/current" || return 1
   render_to "$target/deploy/trading-platform.service" "$out/executor.service" || return 1
   if [[ -f "$target/.control-sha256" ]]; then
-    for name in executor control market; do
+    for name in executor control market dex; do
       [[ -f "$target/.$name-sha256" ]] || continue
+      [[ "$name" != dex ]] || ((dex_enabled)) || continue
       existing=$(read_value "$pins/$name")
       if [[ -n "$existing" && -d "$existing" ]] && cmp -s "$target/.$name-sha256" "$existing/.$name-sha256"; then
         printf '%s\n' "$existing" >"$out/$name" || return 1
@@ -823,6 +884,11 @@ JS
       render_to "$target/deploy/$MARKET.service" "$out/market.service" || return 1
       { printf '%s\n' "$node_identity"; cat "$target/.market-sha256"; sha256sum <"$out/market.service"; sha256sum <"$out/market.env"; } \
         | sha256sum | cut -d' ' -f1 >"$out/market-key" || return 1
+    fi
+    if [[ -f "$out/dex" ]]; then
+      render_to "$target/deploy/$DEX.service" "$out/dex.service" || return 1
+      { printf '%s\n' "$node_identity"; cat "$target/.dex-sha256"; sha256sum <"$out/dex.service"; sha256sum <"$out/dex.env"; } \
+        | sha256sum | cut -d' ' -f1 >"$out/dex-key" || return 1
     fi
   fi
   {
@@ -864,7 +930,7 @@ running_from() { # WorkingDirectory pins the real package of the running process
   local pid
   pid=$(systemctl show -p MainPID --value "$1") && [[ "$pid" =~ ^[1-9][0-9]*$ && "$(readlink "/proc/$pid/cwd")" == "$2" ]]
 }
-journal_tail() { steady journalctl -u "$SERVICE" -u "$CONTROL" -u "$MARKET" -n 40 --no-pager -o cat 2>/dev/null || true; }
+journal_tail() { steady journalctl -u "$SERVICE" -u "$CONTROL" -u "$MARKET" -u "$DEX" -n 40 --no-pager -o cat 2>/dev/null || true; }
 healthy_executor() {
   local expected_dir=$1 deadline=$((SECONDS + HEALTH_WAIT_S)) pid
   while ((SECONDS < deadline)); do
@@ -915,6 +981,38 @@ healthy_market() {
   done
   return 1
 }
+probe_dex() {
+  (cd / && runuser -u "$SERVICE_USER" -g "$DEX_IPC_GROUP" -- timeout --kill-after=1 4 "$NODE_BIN" \
+    "$1/src/dex/probe.ts" --socket "$DEX_SOCKET" --root "$2") >"$work_dir/dex-probe.log" 2>&1
+}
+healthy_dex() {
+  local target=$1 dex=$2 deadline=$((SECONDS + HEALTH_WAIT_S))
+  while ((SECONDS < deadline)); do
+    if systemctl is-active --quiet "$DEX" && running_from "$DEX" "$dex" && probe_dex "$target" "$dex"; then return 0; fi
+    steady sleep 0.5
+  done
+  [[ ! -s "$work_dir/dex-probe.log" ]] || log "$(tail -c 600 "$work_dir/dex-probe.log")"
+  return 1
+}
+# Which directory holds the live varlighter.sqlite: dex or executor (no file: executor). Root-owned, written right after
+# each successful copy, so an interrupted run still knows which side to copy from (docs/dexspread.md 11.5).
+DEX_DB_MARK="$APP_DIR/.dex-db"
+set_dex_db() { printf '%s\n' "$1" >"$DEX_DB_MARK.next" && chmod 644 "$DEX_DB_MARK.next" && mv -Tf "$DEX_DB_MARK.next" "$DEX_DB_MARK"; }
+# Copy the database between the two private directories with the DEX unit stopped. Root never opens a file in either
+# directory: each side runs as the directory's owner with a clean environment, root only pipes them together (L201).
+copy_dex_db() { # tool release, from user, from dir, to user, to dir
+  local tool="$1/src/dex/move-db.ts"
+  [[ -f "$tool" ]] || { log "找不到 $tool，无法复制 DEX 价差库。"; return 1; }
+  steady systemctl stop "$DEX" 2>/dev/null || true
+  if systemctl is-active --quiet "$DEX"; then log 'DEX 价差服务未能停止，未复制库。'; return 1; fi
+  if (cd / && steady runuser -u "$2" -- timeout --kill-after=5 600 env -i "$NODE_BIN" "$tool" export --dir "$3" 2>"$work_dir/move-db-export.log" |
+      steady runuser -u "$4" -- timeout --kill-after=5 600 env -i "$NODE_BIN" "$tool" import --dir "$5" 2>"$work_dir/move-db.log"); then
+    log "DEX 价差库：$(tail -n 1 "$work_dir/move-db.log")"
+    return 0
+  fi
+  log "复制 DEX 价差库失败：$(tail -c 400 "$work_dir/move-db-export.log" 2>/dev/null) $(tail -c 400 "$work_dir/move-db.log" 2>/dev/null)"
+  return 1
+}
 enable_service() {
   systemctl is-enabled --quiet "$1" || { steady systemctl enable --quiet "$1" && changes+=("$1 开机自启"); }
 }
@@ -922,12 +1020,13 @@ enable_service() {
 # Compare component keys separately. An independent market or control update must keep a healthy executor running. Unit/filesystem drift
 # and a process running an unexpected release are also repaired, e.g. after a power cut between switching and starting.
 activate() {
-  local to=$1 from=$2 target exe ctl market live changes_unit=0 moving=0 change_ex=0 change_ctl=0 change_market=0
-  local action_ex='' action_ctl='' action_market='' unit name probe_status
+  local to=$1 from=$2 target exe ctl market dex live changes_unit=0 moving=0 change_ex=0 change_ctl=0 change_market=0 change_dex=0
+  local action_ex='' action_ctl='' action_market='' action_dex='' unit name probe_status dex_from
   target=$(read_value "$to/current")
   exe=$(read_value "$to/executor")
   ctl=$(read_value "$to/control")
   market=$(read_value "$to/market")
+  dex=$(read_value "$to/dex")
   live=$(readlink "$APP_DIR/current" 2>/dev/null || true)
   [[ "$live" == "$target" ]] || moving=1
   cmp -s "$to/executor-key" "$from/executor-key" || change_ex=1
@@ -954,12 +1053,32 @@ activate() {
     rm -f "$UNIT_DIR/$MARKET.service" "$APP_DIR/market" "$APP_DIR/market.env" "$APP_DIR/.restarting-market" || return 1
     changes_unit=1
   fi
+  if [[ -n "$dex" ]]; then
+    cmp -s "$to/dex-key" "$from/dex-key" || change_dex=1
+    [[ ! -e "$APP_DIR/.restarting-dex" ]] || change_dex=1
+    if ! cmp -s "$to/dex.service" "$UNIT_DIR/$DEX.service"; then changes_unit=1; change_dex=1; fi
+    cmp -s "$to/dex.env" "$APP_DIR/dex.env" || change_dex=1
+  elif [[ -f "$UNIT_DIR/$DEX.service" || -L "$APP_DIR/dex" || "$(read_value "$DEX_DB_MARK")" == dex ]]; then
+    # Module off or a release without the component: hand the database back before an older executor can open it.
+    if [[ "$TEST_MODE" != 1 ]]; then
+      if [[ -f "$UNIT_DIR/$DEX.service" ]]; then steady systemctl disable --now --quiet "$DEX" || return 1; fi
+      if [[ "$(read_value "$DEX_DB_MARK")" == dex ]]; then
+        dex_from=$(readlink -f "$APP_DIR/dex" 2>/dev/null || true)
+        [[ -n "$dex_from" && -d "$dex_from" ]] || { log '找不到 DEX 价差组件目录，无法把库交回执行服务。'; return 1; }
+        copy_dex_db "$dex_from" "$DEX_USER" "$DEX_STATE" "$SERVICE_USER" "$DATA_DIR" && set_dex_db executor || return 1
+        changes+=('DEX 价差库已交回执行服务')
+      fi
+    fi
+    rm -f "$UNIT_DIR/$DEX.service" "$APP_DIR/dex" "$APP_DIR/dex.env" "$APP_DIR/.restarting-dex" || return 1
+    changes_unit=1
+  fi
   # Persist a requested restart before changing its files. This covers interruption during rollback even when
   # the previous code directory is identical (for example an environment-only change with the same TCP port).
   if [[ "$TEST_MODE" != 1 ]] && ((configured)); then
     if ((change_ex)); then : >"$APP_DIR/.restarting-executor" || return 1; fi
     if [[ -n "$ctl" ]] && ((change_ctl)); then : >"$APP_DIR/.restarting-control" || return 1; fi
     if [[ -n "$market" ]] && ((change_market)); then : >"$APP_DIR/.restarting-market" || return 1; fi
+    if [[ -n "$dex" ]] && ((change_dex)); then : >"$APP_DIR/.restarting-dex" || return 1; fi
   fi
   put_file "$to/executor.service" "$UNIT_FILE" 644 || return 1
   helper_changed=0
@@ -979,12 +1098,16 @@ activate() {
     put_file "$to/market.service" "$UNIT_DIR/$MARKET.service" 644 && put_file "$to/market.env" "$APP_DIR/market.env" 600 &&
       switch_link "$market" "$APP_DIR/market" || return 1
   fi
+  if [[ -n "$dex" ]]; then
+    put_file "$to/dex.service" "$UNIT_DIR/$DEX.service" 644 && put_file "$to/dex.env" "$APP_DIR/dex.env" 600 &&
+      switch_link "$dex" "$APP_DIR/dex" || return 1
+  fi
   switch_link "$target" "$APP_DIR/current" || return 1
   if ((moving)); then changes+=("程序 $(head -n1 "$target/VERSION")"); fi
   if ((changes_unit)); then changes+=('systemd 单元'); else skipped+=('systemd 单元（未变化）'); fi
   if [[ "$TEST_MODE" == 1 ]]; then skipped+=('systemctl（测试模式）'); return 0; fi
   if ((!changes_unit && !helper_changed)); then
-    for unit in "$SERVICE" "$CONTROL" "$MARKET" "${HELPER_UNITS[@]}"; do
+    for unit in "$SERVICE" "$CONTROL" "$MARKET" "$DEX" "${HELPER_UNITS[@]}"; do
       [[ $(systemctl show -p NeedDaemonReload --value "$unit" 2>/dev/null) != yes ]] || { changes_unit=1; break; }
     done
   fi
@@ -1035,6 +1158,24 @@ activate() {
     rm -f "$APP_DIR/.restarting-executor" || return 1
     changes+=("执行服务已$([[ $action_ex == start ]] && echo 启动 || echo 重启)")
   else skipped+=('执行服务（继续运行）'); fi
+  # After the executor: a running pre-split executor writes varlighter.sqlite itself, the new one only forwards. Taking the
+  # database over stops DEX first; a DEX failure rolls the whole deployment back like a market failure.
+  if [[ -n "$dex" ]]; then
+    enable_service "$DEX" || return 1
+    if [[ "$(read_value "$DEX_DB_MARK")" != dex ]]; then
+      as_root_dir "$DEX_STATE" 700 "$DEX_USER" "$DEX_USER" || return 1
+      copy_dex_db "$dex" "$SERVICE_USER" "$DATA_DIR" "$DEX_USER" "$DEX_STATE" && set_dex_db dex || return 1
+      changes+=('DEX 价差库已移到独立服务')
+      action_dex=start
+    elif ! systemctl is-active --quiet "$DEX"; then action_dex=start
+    elif ((change_dex)) || ! running_from "$DEX" "$dex" || ! probe_dex "$target" "$dex"; then action_dex=restart; fi
+    if [[ -n "$action_dex" ]]; then
+      steady systemctl reset-failed "$DEX" 2>/dev/null || true
+      steady systemctl restart "$DEX" && healthy_dex "$target" "$dex" || return 1
+      rm -f "$APP_DIR/.restarting-dex" || return 1
+      changes+=("DEX 价差服务已$([[ $action_dex == start ]] && echo 启动 || echo 重启)")
+    else skipped+=('DEX 价差服务（运行正常）'); fi
+  fi
   if [[ -n "$ctl" ]]; then
     # Even an unchanged, apparently active unit can have stopped answering. Repair the browser process alone.
     if [[ -z "$action_ctl" ]] && ! probe_control "$target"; then action_ctl=restart; fi
@@ -1072,6 +1213,7 @@ else
     fallback="$work_dir/fallback"
     mkdir -m 700 "$fallback" || fail '无法准备回退记录。'
     ensure_market_account "$previous_dir" || fail "新版本 $new_version 启动失败，上一版本 $previous_version 的行情账户未通过核验，无法重新启用。"
+    ensure_dex_account "$previous_dir" || fail "新版本 $new_version 启动失败，上一版本 $previous_version 的 DEX 价差账户未通过核验，无法重新启用。"
     if prepare_record "$previous_dir" "$STATE" "$fallback" && activate "$fallback" "$candidate"; then
       save_record "$fallback" || fail '已切回上一版，但无法保存部署状态。'
       if ((set_password)); then rm -f "$DATA_DIR/read-token.json"; fi
@@ -1084,6 +1226,7 @@ else
   if [[ "$TEST_MODE" != 1 ]]; then
     [[ ! -f "$UNIT_DIR/$CONTROL.service" ]] || steady systemctl disable --now --quiet "$CONTROL" || true
     [[ ! -f "$UNIT_DIR/$MARKET.service" ]] || steady systemctl disable --now --quiet "$MARKET" || true
+    [[ ! -f "$UNIT_DIR/$DEX.service" ]] || steady systemctl disable --now --quiet "$DEX" || true
     steady systemctl disable --now --quiet "$SERVICE" || true
   fi
   fail '服务启动失败，尚无可运行的上一版；请按上面的日志检查配置后重新执行本脚本'
@@ -1109,11 +1252,15 @@ current_dir=$(readlink -f "$APP_DIR/current")
 executor_dir=$(read_value "$STATE/executor")
 control_dir=$(read_value "$STATE/control")
 market_dir=$(read_value "$STATE/market")
+dex_dir=$(read_value "$STATE/dex")
+# The release whose move-db copied the database stays until the database is handed back.
+dex_link=$(readlink -f "$APP_DIR/dex" 2>/dev/null || true)
 kept=0
 while IFS= read -r dir; do
   [[ -n "$dir" ]] || continue
   if [[ "$dir" == "$current_dir" || "$dir" == "$executor_dir" || "$dir" == "$control_dir" || "$dir" == "$market_dir" || "$dir" == "$previous_dir" ||
-        "$dir" == "$previous_executor" || "$dir" == "$previous_control" || "$dir" == "$previous_market" ]] || ((kept < KEEP_RELEASES)); then kept=$((kept + 1)); continue; fi
+        "$dir" == "$previous_executor" || "$dir" == "$previous_control" || "$dir" == "$previous_market" ||
+        "$dir" == "$dex_dir" || "$dir" == "$previous_dex" || "$dir" == "$dex_link" ]] || ((kept < KEEP_RELEASES)); then kept=$((kept + 1)); continue; fi
   rm -rf "$dir"
 done < <(find "$APP_DIR/releases" -mindepth 1 -maxdepth 1 -type d ! -name '*.staging' -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
 find "$APP_DIR/releases" -mindepth 1 -maxdepth 1 -type d -name '*.staging' -exec rm -rf {} +

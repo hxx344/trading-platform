@@ -58,7 +58,7 @@ import { HEALTH_TICK_MS, createHealthWatch, type HealthWatch } from './health-wa
 import { newsLoop, newsViews, type NewsHolder } from './news.ts';
 import { openMev, type MevOptions } from './mev.ts';
 import { mevSummary } from './mev-config.ts';
-import { openVarLighter, varLighterLoop, varLighterViews, type VarLighterHolder, type VarLighterOptions } from './varlighter.ts';
+import { DEX_TOKEN_TICK_MS, createDexLink } from './dex.ts';
 import type { NewsOptions } from '../news/feed.ts';
 
 const NOTIFY_MS = 2_000;
@@ -258,8 +258,8 @@ export interface StartOptions {
   watchOptions?: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; firstMs?: number; intervalMs?: number };
   /** EQN 快讯与异动行情（docs/news.md）；不给就不连。命令行入口在 config.json 没写 `"news": false` 时给出。 */
   news?: NewsOptions;
-  /** Var 与 Lighter（RH、主网）价差（docs/varlighter.md）；不给就不开。命令行入口在 config.json 没写 `"varLighter": false` 时给出；测试可替换行情来源。 */
-  varLighter?: VarLighterOptions;
+  /** DEX 价差服务的套接字（docs/dexspread.md 第 11 节）；不给就不开。命令行入口在 config.json 没写 `"varLighter": false` 且给了 --dex-socket 时给出。 */
+  dexSocketPath?: string;
   /** 测试替换 MEV 套利模块的节点传输（只在 config.mev 存在时有用）。 */
   mevOptions?: MevOptions;
 }
@@ -286,7 +286,7 @@ export async function startService(options: StartOptions): Promise<ReturnType<ty
   catch (error) { closeLogs(); throw error; }
 }
 
-async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, socketPath, executionBuild, configBuild, marketClient, marketSocketPath, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, ondoOptions, watchOptions, updateFetch, news: newsOptions, varLighter: varLighterOptions, mevOptions }: StartOptions & { marketClient?: MarketClient }, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
+async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetch, port = config.port, socketPath, executionBuild, configBuild, marketClient, marketSocketPath, leaseWaitMs, importDir, password, app, oilFetch, monitorFetch, optionsFetch, optionsPreflightMs, optionsRetryMs, crossexOptions, ondoOptions, watchOptions, updateFetch, news: newsOptions, dexSocketPath, mevOptions }: StartOptions & { marketClient?: MarketClient }, logs: ServiceLog | null, closeLogs: () => void): Promise<ReturnType<typeof runExecutor>> {
   const updates = socketPath === undefined ? (await import('./update.ts')).createServiceUpdates(importDir, updateFetch) : undefined;
   // Bound to the password, so `install.sh --set-password` ends every session (sessions.ts).
   const sessions = openSessionStore({ file: join(dir, 'http-session'), epoch: sessionEpoch(password) });
@@ -428,14 +428,15 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   // The market and control processes, the user streams and the perpetual venues (health-watch.ts).
   const host = createHostStatus({ dataDir: dir, loop: processLoopHistogram() });
   const health: HealthWatch = createHealthWatch({
-    ...(marketSocketPath ? { marketSocketPath } : {}), ...(socketPath !== undefined ? { controlPort: port } : {}),
+    ...(marketSocketPath ? { marketSocketPath } : {}), ...(dexSocketPath ? { dexSocketPath } : {}), ...(socketPath !== undefined ? { controlPort: port } : {}),
     streams: () => streams.view(), perpetual: () => monitor?.perpetual?.status() ?? null, notify: text => notifier.notify(text),
   });
   // The read-only API token (docs/mcp.md); without read-token.json no token is accepted.
   const readTokens = createReadTokens({ dir });
   // 快讯连接随后台循环开关，启动失败时不会留下连接。
   const news: NewsHolder | null = newsOptions ? { feed: null } : null;
-  const varLighter: VarLighterHolder | null = varLighterOptions ? openVarLighter(dir, varLighterOptions, line => process.stderr.write(`${line}\n`)) : null;
+  // DEX 价差在自己的服务里（docs/dexspread.md 第 11 节）：这里只转发页面请求、推送 Var token。
+  const dex = dexSocketPath ? createDexLink({ socketPath: dexSocketPath, dir, notifyOnce: (key, text) => { notifier.notifyOnce(key, text); }, log: line => process.stderr.write(`${line}\n`) }) : null;
   // MEV 套利（docs/mev.md）：启动后只观察；实盘从页面开始。打不开库只停用本模块。
   const mev = openMev({ config: config.mev, secrets: secrets.mev, others: [...secrets.accounts.values()].flatMap(account => [account.user, account.signer]) }, dir, mevOptions ?? {}, { log: line => process.stderr.write(`${line}\n`), notify: (key, text) => notifier.notifyOnce(key, text) });
   return runExecutor({
@@ -461,7 +462,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(logs ? { logs: (filter: 'all' | 'problems', before: number | null, limit: number) => logs.page({ filter, before, limit }) } : {}),
       ...(updates ? { update: updates } : {}),
       ...(news ? { news: newsViews(news) } : {}),
-      ...(varLighter ? { varlighter: varLighterViews(varLighter) } : {}),
+      ...(dex ? { varlighter: dex.forward } : {}),
       mev: mev.views,
     },
     ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir),
@@ -518,7 +519,15 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       // Samples the reward markets; on stop it withdraws a live session's quotes inside the drain.
       ...(ondo ? [ondo.loop(context)] : []),
       ...(news && newsOptions ? [newsLoop(news, newsOptions, context)] : []),
-      ...(varLighter ? [varLighterLoop(varLighter, context)] : []),
+      ...(dex ? [(async () => {
+        try {
+          while (!context.stopped()) {
+            try { await dex.tick(); }
+            catch (error) { process.stderr.write(`DEX 价差服务巡检出错：${error instanceof Error ? error.message : String(error)}\n`); }
+            await context.pause(DEX_TOKEN_TICK_MS);
+          }
+        } finally { dex.close(); }
+      })()] : []),
       mev.loop(context),
       ...(config.watch && secrets.watch ? [watchLoop(watch = createWatch({ config: config.watch, secret: secrets.watch, problem: context.notReady, ...(watchOptions?.fetchImpl ? { fetchImpl: watchOptions.fetchImpl } : {}), log: line => process.stderr.write(`${line}\n`) }), context, watchOptions)] : []),
     ],
@@ -564,7 +573,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
 }
 
 async function main(): Promise<void> {
-  const { values } = parseArgs({ options: { config: { type: 'string' }, 'data-dir': { type: 'string' }, 'import-dir': { type: 'string' }, socket: { type: 'string' }, 'market-socket': { type: 'string' }, 'check-config': { type: 'boolean' }, 'hash-password': { type: 'boolean' } } });
+  const { values } = parseArgs({ options: { config: { type: 'string' }, 'data-dir': { type: 'string' }, 'import-dir': { type: 'string' }, socket: { type: 'string' }, 'market-socket': { type: 'string' }, 'dex-socket': { type: 'string' }, 'check-config': { type: 'boolean' }, 'hash-password': { type: 'boolean' } } });
   if (values['hash-password']) {
     // install.sh --set-password: the password arrives on stdin (one line), only the digest leaves on stdout.
     const chunks: Buffer[] = [];
@@ -598,7 +607,9 @@ async function main(): Promise<void> {
   const app = values.socket === undefined ? (await import('../web-assets.ts')).loadWebApp() : undefined;
   const marketSocketPath = values['market-socket'];
   if (marketSocketPath !== undefined && !isAbsolute(marketSocketPath)) throw new Error('--market-socket 必须是绝对路径');
-  await startService({ config, secrets, dir, socketPath: values.socket, marketSocketPath, configBuild, app, ...(importDir ? { importDir } : {}), ...(password ? { password } : {}), ...(config.news === false ? {} : { news: {} }), ...(config.varLighter === false ? {} : { varLighter: {} }) });
+  const dexSocketPath = values['dex-socket'];
+  if (dexSocketPath !== undefined && !isAbsolute(dexSocketPath)) throw new Error('--dex-socket 必须是绝对路径');
+  await startService({ config, secrets, dir, socketPath: values.socket, marketSocketPath, configBuild, app, ...(importDir ? { importDir } : {}), ...(password ? { password } : {}), ...(config.news === false ? {} : { news: {} }), ...(config.varLighter === false || dexSocketPath === undefined ? {} : { dexSocketPath }) });
 }
 
 if (import.meta.main) main().catch(error => { process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; });

@@ -23,11 +23,14 @@ control=trading-platform-control
 market=trading-platform-market
 extra_user=tp-market-ci-extra
 market_socket=/run/trading-platform-market/market.sock
-units=("$service.service" "$control.service" "$market.service" "$service-import.path" "$service-import.service" "$service-update.path" "$service-update.service")
-for path in "$app" "$conf" "$data" "$handoff" "$updates" /run/trading-platform /run/trading-platform-market "$unitdir/$service.service.d" "$unitdir/$market.service.d" "${units[@]/#/$unitdir/}"; do
+dex=trading-platform-dex
+dex_socket=/run/trading-platform-dex/dex.sock
+dex_state=/var/lib/trading-platform-dex
+units=("$service.service" "$control.service" "$market.service" "$dex.service" "$service-import.path" "$service-import.service" "$service-update.path" "$service-update.service")
+for path in "$app" "$conf" "$data" "$handoff" "$updates" /run/trading-platform /run/trading-platform-market /run/trading-platform-dex "$dex_state" "$unitdir/$service.service.d" "$unitdir/$market.service.d" "$unitdir/$dex.service.d" "${units[@]/#/$unitdir/}"; do
   [[ ! -e "$path" && ! -L "$path" ]] || { echo "Fixture target already exists: $path" >&2; exit 1; }
 done
-for account in "$service" "$control" "$service-ipc" "$market" "$market-ipc" "$extra_user"; do
+for account in "$service" "$control" "$service-ipc" "$market" "$market-ipc" "$dex" "$dex-ipc" "$extra_user"; do
   if getent passwd "$account" >/dev/null || getent group "$account" >/dev/null; then echo 'Fixture account already exists' >&2; exit 1; fi
 done
 fixture=$(mktemp -d /opt/trading-platform-ci-XXXXXXXX)
@@ -38,7 +41,7 @@ cleanup() {
     [[ ! -f "$fixture/out" ]] || tail -n 20 "$fixture/out"
     systemctl show "$service-update.path" "$service-update.service" "$service-import.path" "$service-import.service" \
       -p Id -p ActiveState -p SubState -p Result -p ExecMainStatus -p Paths -p Triggers --no-pager || true
-    journalctl -u "$service" -u "$control" -u "$market" -u "$service-update.path" -u "$service-update.service" \
+    journalctl -u "$service" -u "$control" -u "$market" -u "$dex" -u "$service-update.path" -u "$service-update.service" \
       -u "$service-import.path" -u "$service-import.service" --no-pager -n 70 || true
     # Report only file type, owner/mode, the phase and an enumerated reason. Never open links or print a request,
     # access token, updater output array, password, or an arbitrary string written by a service account.
@@ -70,12 +73,12 @@ for (const [dir, files] of [[process.argv[2], ['update-request.json', 'update-re
 }
 JS
   fi
-  systemctl disable --now "$service-update.path" "$service-import.path" "$control" "$market" "$service" >/dev/null 2>&1 || true
+  systemctl disable --now "$service-update.path" "$service-import.path" "$control" "$market" "$dex" "$service" >/dev/null 2>&1 || true
   rm -f "${units[@]/#/$unitdir/}"
   systemctl daemon-reload || true
-  for account in "$extra_user" "$market" "$control" "$service"; do userdel "$account" >/dev/null 2>&1 || true; done
-  for group in "$service" "$control" "$service-ipc" "$market" "$market-ipc"; do groupdel "$group" >/dev/null 2>&1 || true; done
-  rm -rf "$app" "$conf" "$data" "$handoff" "$updates" "$unitdir/$service.service.d" "$unitdir/$market.service.d" "$fixture"
+  for account in "$extra_user" "$dex" "$market" "$control" "$service"; do userdel "$account" >/dev/null 2>&1 || true; done
+  for group in "$service" "$control" "$service-ipc" "$market" "$market-ipc" "$dex" "$dex-ipc"; do groupdel "$group" >/dev/null 2>&1 || true; done
+  rm -rf "$app" "$conf" "$data" "$handoff" "$updates" "$unitdir/$service.service.d" "$unitdir/$market.service.d" "$unitdir/$dex.service.d" "$dex_state" "$fixture"
   exit "$result"
 }
 trap cleanup EXIT
@@ -83,12 +86,13 @@ umask 022
 mkdir "$fixture/source"
 # The actual page import below enables the observe-only Ondo module using an empty fixture, without any keys.
 # Keep the executor on loopback throughout this acceptance, including after its import-triggered restart.
-mkdir -p "$fixture/workbench/ondo-mm" "$unitdir/$service.service.d" "$unitdir/$market.service.d"
+mkdir -p "$fixture/workbench/ondo-mm" "$unitdir/$service.service.d" "$unitdir/$market.service.d" "$unitdir/$dex.service.d"
 printf 'DATA_DIR=%s\n' "$fixture/workbench" >"$fixture/workbench.env"
 chmod 600 "$fixture/workbench.env"
 export TP_WORKBENCH_ENV="$fixture/workbench.env"
 printf '[Service]\nIPAddressDeny=any\nIPAddressAllow=localhost\n' >"$unitdir/$service.service.d/ci-loopback.conf"
 cp "$unitdir/$service.service.d/ci-loopback.conf" "$unitdir/$market.service.d/ci-loopback.conf"
+cp "$unitdir/$service.service.d/ci-loopback.conf" "$unitdir/$dex.service.d/ci-loopback.conf"
 # Upgrade from genuine single-process and two-process releases, including their installers' on-disk state.
 old="$fixture/v0.63.0"
 dual="$fixture/v0.64.0"
@@ -178,9 +182,16 @@ assert_page() {
 market_probe() {
   runuser -u "$service" -g "$market-ipc" -- timeout 4 node "$1/src/market/probe.ts" --socket "$market_socket" --root "$1"
 }
+dex_probe() {
+  runuser -u "$service" -g "$dex-ipc" -- timeout 4 node "$1/src/dex/probe.ts" --socket "$dex_socket" --root "$1"
+}
+# Every downgrade below runs after the current installer removed the DEX service (docs/dexspread.md 11.5): the database is
+# handed back to the execution data directory, so the components it checks are gone too.
 assert_market_absent() {
   [[ ! -e "$unitdir/$market.service" && ! -e "$app/market" && ! -e "$app/market.env" && ! -e "$market_socket" ]]
   if systemctl is-active --quiet "$market"; then echo 'Market still running after downgrade' >&2; return 1; fi
+  [[ ! -e "$unitdir/$dex.service" && ! -e "$app/dex" && ! -e "$app/dex.env" && ! -e "$dex_socket" && $(cat "$app/.dex-db" 2>/dev/null || echo executor) == executor ]]
+  if systemctl is-active --quiet "$dex"; then echo 'DEX still running after downgrade' >&2; return 1; fi
 }
 
 # Standalone scenarios start real services against the observe-only configuration left by the page import.
@@ -259,6 +270,24 @@ for recipient in "$market:$market-ipc:/run/trading-platform/execution.sock" "$co
     s.on("error", e => { if (e.code !== "EACCES") process.exitCode = 1; });' "$socket"
 done
 market_probe "$app/market"
+dex_pid=$(pid "$dex")
+[[ $(stat -c %U "/proc/$dex_pid") == "$dex" && -S "$dex_socket" && $(cat "$app/.dex-db") == dex &&
+   $(stat -c '%U:%G %a' "/run/$dex") == "$dex:$dex-ipc 2750" && $(stat -c '%U:%G %a' "$dex_socket") == "$dex:$dex-ipc 660" &&
+   $(stat -c '%U %a' "$dex_state") == "$dex 700" && "$(stat -c '%U %a' "$app/dex.env")" == 'root 600' ]]
+[[ ! -e "/proc/$dex_pid/root$conf/config.json" && ! -e "/proc/$dex_pid/root$data/access-url" ]]
+if runuser -u "$dex" -g "$dex-ipc" -- test -w "$data" || runuser -u "$dex" -- test -r "$conf/secrets.json" ||
+    runuser -u "$dex" -- test -w "$updates" || runuser -u "$dex" -- test -w "$handoff" ||
+    runuser -u "$dex" -- kill -0 "$executor_pid" 2>/dev/null || runuser -u "$market" -- test -r "$dex_state"; then
+  echo 'DEX UID reached private service resources' >&2; exit 1
+fi
+for recipient in "$dex:$dex-ipc:/run/trading-platform/execution.sock" "$dex:$dex-ipc:$market_socket" "$control:$service-ipc:$dex_socket" "$market:$market-ipc:$dex_socket"; do
+  IFS=: read -r account group socket <<<"$recipient"
+  runuser -u "$account" -g "$group" -- node -e '
+    const s = require("net").connect(process.argv[1]);
+    s.on("connect", () => { s.destroy(); process.exitCode = 1; });
+    s.on("error", e => { if (e.code !== "EACCES") process.exitCode = 1; });' "$socket"
+done
+dex_probe "$app/dex"
 [[ -e "$app/.update-helper" ]]
 login
 assert_page v99.1.1

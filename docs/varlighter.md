@@ -37,7 +37,7 @@ Var（Variational Omni）与 Lighter 两个场所——Lighter RH（`api.rh.ligh
 - **待实测**：询价接口对股票与加密货币合约是否接受上面的写法。三种写法是在公开价格流上试出来的，询价接口只有商品（原油）在真实账户上核实过。写法不对时应答不是 2xx 或内容对不上，该配对不带询价，实盘准备页「采集状态」的「Var token 询价」一行显示原因与本轮成功、失败数。
 - **本次不做**：分钟内的更快轮询与按询价发现信号、询价应答里 `qty_limits` 的核对、Var 下单。
 
-代码：`src/varlighter/`（模型、行情、Var 询价 `varquote.ts`、统计、策略、回测、库、下单预演、视图类型、引擎）、`src/service/varlighter.ts`（接进服务）、`src/http.ts`（`/api/varlighter/*`）、`web/src/varlighter/`（页面）、`scripts/dev-varlighter.ts`（替身行情的本地预览）。测试：`test/varlighter.test.ts`、`web/test/varlighter-form.test.mjs`。
+代码：`src/varlighter/`（模型、行情、Var 询价 `varquote.ts`、统计、策略、回测、库、下单预演、视图类型、引擎）、`src/dex/`（v0.90.0 起的独立服务 `trading-platform-dex`：`host.ts` 打开库与路由，`main.ts` 入口，见 [dexspread.md](dexspread.md) 第 11 节）、`src/service/dex.ts` 与 `src/http.ts`（执行面把 `/api/varlighter/*` 转发给它）、`web/src/varlighter/`（页面）、`scripts/dev-varlighter.ts`（替身行情的本地预览）。测试：`test/varlighter.test.ts`、`web/test/varlighter-form.test.mjs`。
 
 ## 2 标的配对、规格核对与时段（`model.ts`）
 
@@ -95,7 +95,7 @@ Var（Variational Omni）与 Lighter 两个场所——Lighter RH（`api.rh.ligh
 
 ## 7 存储（`store.ts`）
 
-- `varlighter.sqlite`（数据目录下），表：`samples`（配对键 + 报价时刻为主键）、`paper_positions`、`paper_trades`、`events`、`state`（参数、冷却）。样本另有按报价时刻的索引。v0.81.0 起 `samples` 多两列 `rh_bid_rx`、`rh_ask_rx`（判断时刻的 Lighter 一档，可空），打开库时用 `ALTER TABLE … ADD COLUMN` 补上，旧样本为空。参数存在 `state` 的 `settings` 里；v0.81.0 新加的全局参数另放在 `globalExtra`，原因见第 11 节。样本保留 14 天，每小时按时刻分批（每批 2000 条、批间让出事件循环）清理；事件保留 30 天；成交不清理。
+- `varlighter.sqlite`（v0.89.0 及以前在执行面数据目录下；v0.90.0 起在 DEX 价差服务的 `/var/lib/trading-platform-dex`，见 [dexspread.md](dexspread.md) 11.5），表：`samples`（配对键 + 报价时刻为主键）、`paper_positions`、`paper_trades`、`events`、`state`（参数、冷却）。样本另有按报价时刻的索引。v0.81.0 起 `samples` 多两列 `rh_bid_rx`、`rh_ask_rx`（判断时刻的 Lighter 一档，可空），打开库时用 `ALTER TABLE … ADD COLUMN` 补上，旧样本为空。参数存在 `state` 的 `settings` 里；v0.81.0 新加的全局参数另放在 `globalExtra`，原因见第 11 节。样本保留 14 天，每小时按时刻分批（每批 2000 条、批间让出事件循环）清理；事件保留 30 天；成交不清理。
 - v0.82.0 起 `samples` 另有 `var_bid_tk`、`var_ask_tk`、`var_tk_at`（判断时刻的 Var token 询价与 Var 给的报价时刻，可空）；没有询价的样本为空。
 - 容量（2026-11-22 用合成数据实测）：两个场所约 210 个配对，每天约 30 万条样本，14 天约 420 万条、库文件约 0.85 GB，数据目录需留出 1 GB 以上；每分钟写入一批约 16 ms。总览的「24h 样本」按主键逐配对计数（满量约 60 ms），10 分钟内只数一次、其间随写入累加，因此最多晚 10 分钟扣掉过期的样本。
 - 清空模拟盘（输入 RESET）只删持仓、成交与冷却，参数、规格确认与样本保留。

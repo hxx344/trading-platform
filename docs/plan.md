@@ -88,7 +88,7 @@ trading-platform/
   test/           离线测试
 ```
 
-运行形态：一个 Node 24 进程（systemd 服务 `trading-platform`，系统账号同名），数据在 `/var/lib/trading-platform`，配置在 `/etc/trading-platform`，程序在 `/opt/trading-platform`。
+运行形态：一个 Node 24 进程（systemd 服务 `trading-platform`，系统账号同名），数据在 `/var/lib/trading-platform`，配置在 `/etc/trading-platform`，程序在 `/opt/trading-platform`。拆分部署后另有控制面（`trading-platform-control`）、公开行情（`trading-platform-market`，v0.67.0）与 DEX 价差（`trading-platform-dex`，v0.90.0，[dexspread.md](dexspread.md) 第 11 节）三个独立账户的服务。
 
 - 配置 `config.json`：密钥文件的绝对路径 `secretsFile`、配对列表（`id`、主账户和多空子账户的凭据名、划转参数与 ADL 设置的初始值）、本机端口（默认 4720）、请求预算。1–20 个配对，同一子账户只能在一个配对里。
 - 密钥 `secrets.json`：每个 ASTER 账户的 `user`、`signer`、`privateKey`，以及飞书机器人 `webhook` 与签名密钥；两个凭据名不能指向同一个钱包。文件属服务账号，权限 600，最大 64 KiB；启动时校验私钥能推出 signer。

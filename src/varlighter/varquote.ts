@@ -68,25 +68,34 @@ export function parseTokenQuote(input: unknown, instrument: Instrument, qty: str
   return { bid, ask, mark, qty: Number(qty), at, receivedAt: now };
 }
 
+export interface TokenSource { token: string; problem: string }
+/** 读执行面数据目录里的 token 文件（执行面推送、本机测试用）；规则见 readVariationalSessionFile。 */
+export function tokenFileSource(dir: string): () => TokenSource {
+  const file = join(dir, VARIATIONAL_SESSION_FILE);
+  return () => { const { state, problem } = readVariationalSessionFile(file); return { token: state.token, problem }; };
+}
+
 /**
- * `dir` 是服务的数据目录（token 文件所在）。被 Var 拒绝的 token 记在内存里不再用，直到文件换成别的 token；
+ * token 来自 `source`（DEX 服务里是执行面推来的内存值）或 `dir`（数据目录里的 token 文件）。被 Var 拒绝的 token 记在内存里不再用，直到文件换成别的 token；
  * 判定只落在发请求时用的那个 token 上，请求途中文件换了新 token 不会把新的标成失效。
  * 退避：被拦截（403 或质询）后这个 token 停 5 分钟；单个标的询价失败（超时、非 2xx、应答对不上）后这个标的停 5 分钟，
  * 写法不对的合约不会每分钟重试。调用方中止（`stop`）的请求不算失败；引擎的阶段时限到了而请求还没回来，按超时算。
  */
-export function createVarQuoter({ dir, fetcher, now = Date.now }: { dir: string; fetcher: VariationalFetcher; now?: () => number }): VarQuoter {
-  const file = join(dir, VARIATIONAL_SESSION_FILE);
+export function createVarQuoter({ dir, source = dir === undefined ? undefined : tokenFileSource(dir), fetcher, now = Date.now }: { dir?: string; source?: () => TokenSource; fetcher: VariationalFetcher; now?: () => number }): VarQuoter {
+  if (!source) throw new Error('询价器需要 token 来源');
+  const tokenOf = source;
   let rejected = '', unavailableToken = '', pausedToken = '', pausedUntil = 0;
   let failure: { token: string; at: number; message: string } | null = null;
   let success: { token: string; at: number; lagMs: number } | null = null;
   const symbolPause = new Map<string, number>();
   const read = (): { token: string; status: TokenStatus; expiresAt: number | null; problem: string } => {
-    const { state, problem } = readVariationalSessionFile(file);
-    if (!state.token) return { token: '', status: 'missing', expiresAt: null, problem };
-    const expiresAt = variationalTokenExpiry(state.token);
+    const { token, problem } = tokenOf();
+    if (!token) return { token: '', status: 'missing', expiresAt: null, problem };
+    let expiresAt: number;
+    try { expiresAt = variationalTokenExpiry(token); } catch { return { token: '', status: 'missing', expiresAt: null, problem: '保存的 Var token 内容无效，已忽略；请重新保存 token。' }; }
     if (expiresAt <= now() + VARIATIONAL_EXPIRY_MARGIN_MS) return { token: '', status: 'expired', expiresAt, problem: '' };
-    if (state.token === rejected) return { token: '', status: 'rejected', expiresAt, problem: '' };
-    return { token: state.token, status: unavailableToken === state.token ? 'unavailable' : 'ready', expiresAt, problem: '' };
+    if (token === rejected) return { token: '', status: 'rejected', expiresAt, problem: '' };
+    return { token, status: unavailableToken === token ? 'unavailable' : 'ready', expiresAt, problem: '' };
   };
   return {
     usable: () => { const { token } = read(); return token !== '' && !(token === pausedToken && now() < pausedUntil); },

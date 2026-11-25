@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { createExecutorServer } from '../src/http.ts';
 import { createReadTokens } from '../src/read-token.ts';
-import { openVarLighter, varLighterViews } from '../src/service/varlighter.ts';
+import { localDexForward, openVarLighter, varLighterViews } from '../src/dex/host.ts';
 import { runBacktest } from '../src/varlighter/backtest.ts';
 import type { Sample } from '../src/varlighter/model.ts';
 import { openVarLighterStore } from '../src/varlighter/store.ts';
@@ -51,7 +51,7 @@ async function platform() {
   const state = { rows: [{ key: KEY, kind: 'crypto', name: 'Bitcoin', enabled: true, position: null, aFeeBps: 0, bFeeBps: 0 }], orphans: [{ key: OLD }],
     settings: { revision: 3, global: GLOBAL, symbols: { [KEY]: PARAMS }, confirmed: [KEY], combos: ['var|rh'], pairs: [] } } as unknown as StateView;
   const server = createExecutorServer({ executor: h.ex, accessToken: 'vl-local-access-01', session: 'vl-local-session-01', readTokens: createReadTokens({ dir, log: () => {} }), log: () => {},
-    views: { varlighter: { ...varLighterViews(holder), state: () => state } } });
+    views: { varlighter: localDexForward({ ...varLighterViews(holder), state: () => state }) } });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const cookie = ((await fetch(`${base}/login?token=vl-local-access-01`, { redirect: 'manual' })).headers.get('set-cookie') ?? '').split(';')[0]!;

@@ -22,7 +22,7 @@ import { orderPlan } from '../src/varlighter/plan.ts';
 import { MIGRATED_KEY, openVarLighterStore } from '../src/varlighter/store.ts';
 import { COOLDOWN_KEY, LEGACY_UPGRADE, SETTINGS_KEY, createVarLighterEngine, customKey, downsample, readCustomPair, upgradeSettings } from '../src/varlighter/engine.ts';
 import { READ_TOKEN_MAX_BYTES } from '../src/read-token.ts';
-import { openVarLighter, varLighterLoop, varLighterViews } from '../src/service/varlighter.ts';
+import { localDexForward, openVarLighter, varLighterLoop, varLighterViews } from '../src/dex/host.ts';
 
 const T0 = Date.parse('2026-11-23T15:00:00Z'); // 周一纽约 10:00（盘中）
 const RH_BTC = 'var:BTC|rh:BTC', LIGHTER_BTC = 'var:BTC|lighter:BTC';
@@ -1455,7 +1455,7 @@ test('接口：未登录 401、POST 缺页面标记 403、只读令牌不能读�
   const h = createHarness();
   bindAccounts(h.ex);
   const holder = openVarLighter(dir, { fetchImpl: async () => Response.json({}), connect: () => new FakeSocket() }, () => {});
-  const views: { varlighter?: ReturnType<typeof varLighterViews> } = {};
+  const views: { varlighter?: ReturnType<typeof localDexForward> } = {};
   const lines: string[] = [];
   const server = createExecutorServer({ executor: h.ex, accessToken: 'vl-token-000001', session: 'vl-session-000001', views, log: line => lines.push(line),
     readTokens: createReadTokens({ dir, now: Date.now, log: () => {} }), tokenThrottle: () => new LoginThrottle(Date.now) });
@@ -1468,7 +1468,7 @@ test('接口：未登录 401、POST 缺页面标记 403、只读令牌不能读�
     const get = (route: string, headers: Record<string, string> = { cookie }) => fetch(base + route, { headers });
     const post = (route: string, body: unknown, headers: Record<string, string> = { cookie, 'content-type': 'application/json', 'x-pa-executor': '1' }) => fetch(base + route, { method: 'POST', headers, body: JSON.stringify(body) });
     assert.equal((await get('/api/varlighter/state')).status, 404, '模块关闭');
-    views.varlighter = varLighterViews(holder);
+    views.varlighter = localDexForward(varLighterViews(holder));
     assert.equal((await get('/api/varlighter/state', {})).status, 401);
     assert.equal((await get('/api/varlighter/state')).status, 200);
     assert.equal((await post('/api/varlighter/paper/reset', { confirm: 'RESET' }, { cookie, 'content-type': 'application/json' })).status, 403, '缺页面请求标记');
@@ -1511,7 +1511,7 @@ test('接口：未登录 401、POST 缺页面标记 403、只读令牌不能读�
     const fullBytes = (await full.arrayBuffer()).byteLength;
     assert.ok(fullBytes < READ_TOKEN_MAX_BYTES * 0.95, `1000 行 ${fullBytes} 字节`);
     writer.close();
-    views.varlighter = { ...varLighterViews(holder), state: () => { throw new Error('secret /path/inside'); } };
+    views.varlighter = localDexForward({ ...varLighterViews(holder), state: () => { throw new Error('secret /path/inside'); } });
     const written: string[] = [];
     process.stderr.write = ((chunk: string) => { written.push(String(chunk)); return true; }) as typeof process.stderr.write;
     const failed = await get('/api/varlighter/state');

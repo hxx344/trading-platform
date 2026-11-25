@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 /** The installer owns release directories. A checkout can run the services without building a package. */
-export function readComponentBuild(root: string, component: 'executor' | 'control' | 'market'): string {
+export function readComponentBuild(root: string, component: 'executor' | 'control' | 'market' | 'dex'): string {
   const file = join(root, `.${component}-sha256`);
   try {
     const digest = readFileSync(file, 'utf8').trim();

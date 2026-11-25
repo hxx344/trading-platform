@@ -1,0 +1,46 @@
+# Collects and simulates the DEX spreads (docs/dexspread.md 第 11 节). Only the execution service can reach its socket.
+[Unit]
+Description=统一交易平台 DEX 价差
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=trading-platform-dex
+Group=trading-platform-dex-ipc
+EnvironmentFile=-@APP_DIR@/dex.env
+WorkingDirectory=@APP_DIR@/dex
+RuntimeDirectory=trading-platform-dex
+RuntimeDirectoryMode=2750
+StateDirectory=trading-platform-dex
+StateDirectoryMode=0700
+ExecStart=@NODE@ @APP_DIR@/dex/src/dex/main.ts --socket /run/trading-platform-dex/dex.sock --state-dir /var/lib/trading-platform-dex
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+InaccessiblePaths=@CONF_DIR@ @DATA_DIR@ @IMPORT_DIR@ @UPDATE_DIR@ -/run/trading-platform -/run/trading-platform-market
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -3,6 +3,7 @@
 // Feishu once (some repeat while they last) and its end is posted too. Nothing here decides readiness: /api/ready and
 // the second server's heartbeat still only speak for this process, so restarting the market or control process during
 // an upgrade never makes the executor look down.
+import { dexStatus, type DexStatus } from '../dex/ipc.ts';
 import { marketHealth } from '../market/ipc.ts';
 import type { PerpetualStatusView } from '../monitor/perpetual.ts';
 import { lasted } from './feishu.ts';
@@ -11,6 +12,8 @@ import type { WatchStatus } from './watch.ts';
 export const HEALTH_TICK_MS = 10_000;
 /** The market or control process unreachable this long is posted. */
 export const PROCESS_DOWN_AFTER_MS = 30_000;
+/** The DEX process blocks its probe while a backtest runs (up to 120 s, docs/dexspread.md 11.7), so it gets longer. */
+export const DEX_DOWN_AFTER_MS = 180_000;
 /** A user stream down this long is posted (a planned reconnect takes a second or two). */
 export const STREAM_DOWN_AFTER_MS = 60_000;
 /** A venue of the perpetual collector not live this long is posted, once (its end too). */
@@ -77,8 +80,10 @@ export interface ProcessHealth {
   checkedAt: number | null;
   lastOkAt: number | null;
   error: string | null;
-  /** Restarts seen since this service started (market only: its instance id changed). */
+  /** Restarts seen since this service started (market and DEX only: its instance id changed). */
   restarts: number;
+  /** The DEX process's own figures from its status (docs/dexspread.md 11.7). */
+  process?: DexStatus['process'];
 }
 
 /** One line of the page's connection badge (web/src/ConnectionStatus.tsx). */
@@ -90,6 +95,8 @@ export interface StreamRow { account: string; connected: boolean; since: number 
 
 export interface HealthWatchOptions {
   marketSocketPath?: string;
+  /** The DEX spread process (docs/dexspread.md 第 11 节); its restarts and outages are posted like the market's. */
+  dexSocketPath?: string;
   /** The browser port, when a separate control process listens on it. */
   controlPort?: number;
   streams: () => readonly StreamRow[];
@@ -100,6 +107,7 @@ export interface HealthWatchOptions {
   now?: () => number;
   log?: (line: string) => void;
   probeMarket?: (socketPath: string) => Promise<unknown>;
+  probeDex?: (socketPath: string) => Promise<DexStatus>;
   probeControl?: (port: number) => Promise<void>;
 }
 
@@ -113,13 +121,15 @@ async function probeControlPort(port: number): Promise<void> {
   await response.body?.cancel();
 }
 
-export function createHealthWatch({ marketSocketPath, controlPort, streams, perpetual, notify, now = Date.now, log = line => process.stderr.write(`${line}\n`), probeMarket = marketHealth, probeControl = probeControlPort }: HealthWatchOptions) {
+export function createHealthWatch({ marketSocketPath, dexSocketPath, controlPort, streams, perpetual, notify, now = Date.now, log = line => process.stderr.write(`${line}\n`), probeMarket = marketHealth, probeDex = socket => dexStatus(socket), probeControl = probeControlPort }: HealthWatchOptions) {
   const incidents = createIncidents({ notify, now, log });
   /** A market restart seen but not yet queued (retried on the next tick). */
   let restartPending: boolean | 'failing' = false;
   const blank = (): ProcessHealth => ({ ok: null, checkedAt: null, lastOkAt: null, error: null, restarts: 0 });
   const market = marketSocketPath ? blank() : null, control = controlPort !== undefined ? blank() : null;
   let marketInstance: string | null = null;
+  const dex = dexSocketPath ? blank() : null;
+  let dexInstance: string | null = null, dexRestartPending: boolean | 'failing' = false;
   const record = (row: ProcessHealth, error: unknown | null) => {
     row.checkedAt = now();
     row.ok = error === null;
@@ -141,6 +151,22 @@ export function createHealthWatch({ marketSocketPath, controlPort, streams, perp
       catch (error) { if (restartPending !== 'failing') log(`行情服务重启通知未能入队，之后每轮重试：${error instanceof Error ? error.message.slice(0, 160) : String(error)}`); restartPending = 'failing'; }
     }
     incidents.observe('market', '行情服务不可用', '公开行情进程（trading-platform-market）', market.ok ? null : `无法连接：${market.error}`, { afterMs: PROCESS_DOWN_AFTER_MS, repeatMs: HEALTH_REPEAT_MS });
+  }
+
+  async function checkDex(): Promise<void> {
+    if (!dex || !dexSocketPath) return;
+    try {
+      const status = await probeDex(dexSocketPath);
+      record(dex, null);
+      dex.process = status.process;
+      if (dexInstance && status.instance !== dexInstance) { dex.restarts += 1; dexRestartPending = true; }
+      dexInstance = status.instance;
+    } catch (error) { record(dex, error); }
+    if (dexRestartPending) {
+      try { notify('【DEX 价差服务已重启】DEX 价差进程（trading-platform-dex）换了新实例，采集与模拟盘已重新开始；如非升级所致，请查看该服务日志（journalctl -u trading-platform-dex）'); dexRestartPending = false; }
+      catch (error) { if (dexRestartPending !== 'failing') log(`DEX 价差服务重启通知未能入队，之后每轮重试：${error instanceof Error ? error.message.slice(0, 160) : String(error)}`); dexRestartPending = 'failing'; }
+    }
+    incidents.observe('dex', 'DEX 价差服务不可用', 'DEX 价差进程（trading-platform-dex）', dex.ok ? null : `无法连接：${dex.error}；DEX 价差页面暂不可用，交易执行不受影响`, { afterMs: DEX_DOWN_AFTER_MS, repeatMs: HEALTH_REPEAT_MS });
   }
 
   async function checkControl(): Promise<void> {
@@ -168,11 +194,11 @@ export function createHealthWatch({ marketSocketPath, controlPort, streams, perp
 
   return {
     async tick(): Promise<void> {
-      await Promise.all([checkMarket(), checkControl()]);
+      await Promise.all([checkMarket(), checkDex(), checkControl()]);
       checkStreams();
       checkFeeds();
     },
-    view: () => ({ market, control, incidents: incidents.view() }),
+    view: () => ({ market, ...(dex ? { dex } : {}), control, incidents: incidents.view() }),
     /** What the service is connected to, one line each, for the page's top bar; parts that are not set up are left out. */
     connections(heartbeat: WatchStatus | null): ConnectionView[] {
       const list: ConnectionView[] = [];
@@ -182,6 +208,11 @@ export function createHealthWatch({ marketSocketPath, controlPort, streams, perp
           detail: row.ok === null ? '检测中' : row.ok ? `正常${row.restarts ? `（本次启动以来重启 ${row.restarts} 次）` : ''}` : `无法连接：${row.error ?? '未知原因'}` });
       };
       processLine('market', '行情服务', market);
+      processLine('dex', 'DEX 价差服务', dex);
+      if (dex?.ok && dex.process) {
+        const line = list[list.length - 1]!, { rss, heapUsed, loopDelayMs } = dex.process;
+        line.detail += `；内存 ${Math.round(rss / 1048576)} MB（堆 ${Math.round(heapUsed / 1048576)} MB）${loopDelayMs === null ? '' : `，事件循环延迟 p99 ${Math.round(loopDelayMs)} ms`}`;
+      }
       processLine('control', '页面控制面', control);
       const rows = streams();
       if (rows.length) {

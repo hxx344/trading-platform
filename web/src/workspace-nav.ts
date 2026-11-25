@@ -29,8 +29,8 @@ export const navEntries: Record<NavEntry, { workspace: WorkspaceId; text: string
   goldoil: { workspace: 'trading', text: '金油', href: '#/goldoil' },
   crossex: { workspace: 'trading', text: 'CrossEx', href: '#/crossex' },
   ondo: { workspace: 'trading', text: 'Ondo 挂单奖励', href: '#/ondo' },
-  // Var/Lighter 价差回归（docs/varlighter.md）：config.json 写了 "varLighter": false 时没有。
-  varlighter: { workspace: 'trading', text: 'Var/Lighter 价差', href: '#/varlighter' },
+  // DEX 价差（原 Var/Lighter 价差回归，docs/varlighter.md、docs/dexspread.md）：config.json 写了 "varLighter": false 时没有。
+  varlighter: { workspace: 'trading', text: 'DEX 价差', href: '#/varlighter' },
   pairs: { workspace: 'strategy', text: '配对组', href: '#/' },
   options: { workspace: 'options', text: '期权', href: '#/options' },
   // MEV 套利（docs/mev.md）：总是显示；还没启用时页面是启用向导。

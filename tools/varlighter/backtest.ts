@@ -2,17 +2,17 @@
 // (src/varlighter/backtest.ts), so a strategy change can be checked against real samples before it is released
 // (docs/mcp.md 8.3). Every run is a fresh process: edit the strategy, run again, compare.
 //
-//   node tools/varlighter/backtest.ts --symbol rh:AAPL --hours 168 --params '{"entryBps":25}'
-//   node tools/varlighter/backtest.ts --symbol rh:AAPL --grid '{"entryBps":[15,20,25,30],"exitBps":[-5,0,5]}'
-//   node tools/varlighter/backtest.ts --request '{"symbol":"rh:AAPL","grid":{"entryBps":[20,30]}}'
+//   node tools/varlighter/backtest.ts --symbol 'var:AAPL|rh:AAPL' --hours 168 --params '{"entryBps":25}'
+//   node tools/varlighter/backtest.ts --symbol 'var:AAPL|rh:AAPL' --grid '{"entryBps":[15,20,25,30],"exitBps":[-5,0,5]}'
+//   node tools/varlighter/backtest.ts --request '{"symbol":"lighter:BTC|entropy:BTC","grid":{"entryBps":[20,30]}}'
 //   node tools/varlighter/backtest.ts --check --request '{…}'   (checks the request only, reads no sample)
 //
 // Missing parameters are filled from the platform's saved ones (state.json), checked like the page's backtest request.
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runBacktest, type BacktestSummary } from '../../src/varlighter/backtest.ts';
-import { PAIR_KEY, SAMPLE_FIELDS, type AssetKind, type Sample } from '../../src/varlighter/model.ts';
-import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, readGlobalParams, readSymbolParams, type GlobalParams, type SymbolParams } from '../../src/varlighter/strategy.ts';
+import { SAMPLE_FIELDS, parsePairKey, upgradeKey, type AssetKind, type Sample } from '../../src/varlighter/model.ts';
+import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, legFeeBps, readGlobalParams, readSymbolParams, type GlobalParams, type LegFees, type SymbolParams } from '../../src/varlighter/strategy.ts';
 import { dataDir, sampleFile, STATE_FILE, type LocalState } from './pull.ts';
 
 export const MAX_COMBOS = 200;
@@ -42,7 +42,8 @@ export function readRequest(raw: unknown): BacktestRequest {
   if (!isObject(raw)) throw new RequestError('回测请求须为对象');
   const unknown = Object.keys(raw).find(key => !['symbol', 'hours', 'params', 'global', 'grid', 'trades', 'kind'].includes(key));
   if (unknown) throw new RequestError(`回测请求包含未知字段 ${unknown}`);
-  if (typeof raw.symbol !== 'string' || !PAIR_KEY.test(raw.symbol)) throw new RequestError('symbol 须为配对键（如 rh:AAPL）');
+  const symbol = typeof raw.symbol === 'string' ? upgradeKey(raw.symbol) : null;
+  if (!symbol) throw new RequestError('symbol 须为配对键（如 var:AAPL|rh:AAPL；旧写法 rh:AAPL 也认）');
   if (raw.hours !== undefined && (typeof raw.hours !== 'number' || !Number.isInteger(raw.hours) || raw.hours < 1 || raw.hours > MAX_HOURS)) throw new RequestError(`hours 须为 1–${MAX_HOURS} 的整数`);
   for (const name of ['params', 'global'] as const) if (raw[name] !== undefined && !isObject(raw[name])) throw new RequestError(`${name} 须为对象`);
   if (raw.grid !== undefined) {
@@ -57,7 +58,7 @@ export function readRequest(raw: unknown): BacktestRequest {
   }
   if (raw.trades !== undefined && raw.trades !== 'all' && (typeof raw.trades !== 'number' || !Number.isInteger(raw.trades) || raw.trades < 0 || raw.trades > 10_000)) throw new RequestError('trades 须为 0–10000 的整数或 all');
   if (raw.kind !== undefined && !KINDS.includes(raw.kind as AssetKind)) throw new RequestError(`kind 须为 ${KINDS.join('、')} 之一`);
-  return raw as unknown as BacktestRequest;
+  return { ...raw, symbol } as unknown as BacktestRequest;
 }
 
 export interface LoadedSamples { samples: Sample[]; skipped: number; gaps: { from: number; to: number }[] }
@@ -111,6 +112,12 @@ export function runLocal(request: BacktestRequest, dir: string): unknown {
   const savedSymbol = state.settings.symbols[request.symbol] ?? DEFAULT_SYMBOL;
   const savedGlobal = readGlobalParams({}, { ...DEFAULT_GLOBAL, ...state.settings.global });
   const to = all.at(-1)!.t;
+  const saved = state.pairs.find(pair => pair.key === request.symbol), legs = parsePairKey(request.symbol)!;
+  // Fee fields in the request override the platform's; otherwise each leg keeps the fee the platform applied.
+  const feesOf = (global: GlobalParams): LegFees | null => {
+    const a = legFeeBps(global, legs.a.venue, saved?.aFeeBps ?? null), b = legFeeBps(global, legs.b.venue, saved?.bFeeBps ?? null);
+    return a === null || b === null ? null : { aFeeBps: a, bFeeBps: b };
+  };
   const resolve = (overrides: Record<string, unknown>) => {
     const extra = split(overrides);
     const params: SymbolParams = readSymbolParams({ ...request.params, ...extra.symbol, enabled: true }, { ...DEFAULT_SYMBOL, ...savedSymbol });
@@ -124,7 +131,7 @@ export function runLocal(request: BacktestRequest, dir: string): unknown {
   const span = { firstSample: all[0]!.t, lastSample: to, localSamples: all.length, skipped, gapCount: gaps.length, gaps: gaps.slice(-20) };
   if (!request.grid) {
     const { params, global, from, samples } = resolve({});
-    const result = runBacktest(request.symbol, kind, samples, from, to, params, global);
+    const result = runBacktest(request.symbol, kind, samples, from, to, params, global, feesOf(global));
     const shown = request.trades === 'all' ? result.trades : result.trades.slice(-(request.trades ?? 50));
     // gaps cover the whole local file; replayGaps only the part this run replayed.
     const replayGaps = gaps.filter(gap => gap.to > from).length;
@@ -134,7 +141,7 @@ export function runLocal(request: BacktestRequest, dir: string): unknown {
   const runs: { values: Record<string, unknown>; from: number; summary: BacktestSummary }[] = [];
   for (const values of combinations(request.grid)) {
     const resolved = resolve(values);
-    runs.push({ values, from: resolved.from, summary: runBacktest(request.symbol, kind, resolved.samples, resolved.from, to, resolved.params, resolved.global).summary });
+    runs.push({ values, from: resolved.from, summary: runBacktest(request.symbol, kind, resolved.samples, resolved.from, to, resolved.params, resolved.global, feesOf(resolved.global)).summary });
   }
   runs.sort((a, b) => b.summary.netUsd - a.summary.netUsd);
   const base = resolve({});

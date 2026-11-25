@@ -224,10 +224,10 @@ R3：改动令牌的权限范围，第 8.4 节还会改 `read-token.json` 的格
 
 **客户端侧**（与 `tools/mcp/readonly.ts` 同样用 `TP_MCP_URL`、`TP_MCP_TOKEN_FILE`，都不进发布包）
 
-- `tools/varlighter/pull.ts`：把样本增量拉到本机目录（默认 `~/.cache/trading-platform/varlighter`，可用 `TP_VARLIGHTER_DIR` 改），每个配对一个 `<场所>_<代码>.jsonl`，并保存一份 `state.json`（参数与各配对的类别）。已有文件从最后一条之后接着拉，所以本机可以积累超过服务器 14 天保留期的样本。参数 `--symbol <配对键>`（可多个）或 `--enabled`（已启用或有持仓的配对）。遇到 429 按 `Retry-After` 等待后继续，413 时减半 `limit` 重试。同一配对的拉取用 `<文件>.lock` 互斥（命令行与 MCP 同时拉也不会重复写入，锁里记着持有者，拉取中每页刷新，只有 5 分钟没刷新的锁才被接管，只由持有者删除；写入前还会再读一次文件末尾）；被中断留下的半行在下次拉取前截掉；本机最后一条已超出服务器保留期时，结果里的 `gap` 给出缺的时段。
+- `tools/varlighter/pull.ts`：把样本增量拉到本机目录（默认 `~/.cache/trading-platform/varlighter`，可用 `TP_VARLIGHTER_DIR` 改），每个配对一个文件（v0.88.0 起文件名是整个配对键 `encodeURIComponent` 后加 `.jsonl`，如 `var%3AAAPL%7Crh%3AAAPL.jsonl`；以前的 `<场所>_<代码>.jsonl` 不再读，升级后重新拉取），并保存一份 `state.json`（参数与各配对的类别）。已有文件从最后一条之后接着拉，所以本机可以积累超过服务器 14 天保留期的样本。参数 `--symbol <配对键>`（可多个）或 `--enabled`（已启用或有持仓的配对）。遇到 429 按 `Retry-After` 等待后继续，413 时减半 `limit` 重试。同一配对的拉取用 `<文件>.lock` 互斥（命令行与 MCP 同时拉也不会重复写入，锁里记着持有者，拉取中每页刷新，只有 5 分钟没刷新的锁才被接管，只由持有者删除；写入前还会再读一次文件末尾）；被中断留下的半行在下次拉取前截掉；本机最后一条已超出服务器保留期时，结果里的 `gap` 给出缺的时段。
 - `tools/varlighter/backtest.ts`：读本机样本和 `state.json`，用仓库当前的 `src/varlighter/backtest.ts` 的 `runBacktest` 重放。参数 `--symbol`、`--hours`（不限 336，以本机样本为准）、`--params`、`--global`（JSON，缺的字段用已保存的参数补，校验同页面的回测请求），`--grid`（JSON，各字段的候选值，组合最多 200 个，按净盈亏排序输出摘要）。每次运行是一个新进程，AI 改了策略代码后再跑就是新代码的结果。默认只输出摘要和最后 50 笔成交，`--trades all` 输出全部。与服务器回测一样只取 `from` 之前一个基线窗口的样本；输出带 `skipped`（时刻不递增而跳过的行数）和 `gaps`（本机文件里超过 30 分钟的空档，`gapCount` 为总数；单次回测的 `replayGaps` 只数回放区间内的）。正在追加、还没写完的最后一行不读。`--check` 只按当前代码的参数规则核对请求，不读样本。
 - MCP 工具新增：
-  - `varlighter`：`view=state|symbol|paper|readiness`，`symbol` 视图要 `symbol`，可选 `hours`。
+  - `varlighter`：`view=state|symbol|paper|readiness`，`symbol` 视图要 `symbol`，可选 `hours`。v0.88.0 起配对键是两腿写法 `场所:代码|场所:代码[@乘数]`（如 `var:AAPL|rh:AAPL`、`lighter:NVDA|entropy:NVDA`），旧写法 `rh:AAPL` 仍认；`samples` 应答带 `format: 2` 与两腿列名，`pull.ts` 遇到别的格式（平台还是旧版本）报错而不写文件。本机回测按 `state.json` 里各配对两腿的手续费（`aFeeBps`、`bFeeBps`）重放，请求的全局手续费字段可覆盖。见 [dexspread.md](dexspread.md) 第 10.8 节。
   - `varlighter_backtest`：先在子进程里用 `--check` 核对请求（用的是当前的策略代码，请求不合法就不拉取），再对该配对做一次增量拉取，然后起子进程运行 `tools/varlighter/backtest.ts`，参数同上（`params`、`global`、`grid`、`hours`），返回其 JSON 输出。子进程 120 秒超时。
   - `host_status`、`market_quotes`（`market` 选一个或全部）、`news`（`view=flash|moves`）。
 

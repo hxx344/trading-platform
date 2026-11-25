@@ -1,17 +1,18 @@
 // Pulls Var/Lighter samples from the platform into a local directory (docs/mcp.md 8.3), so an AI on the client machine
 // can replay them with the repository's backtest. Uses the read-only token like tools/mcp/readonly.ts and never runs on
-// the server. Each pair is one `<venue>_<code>.jsonl` (one Sample object per line, oldest first); `state.json` keeps the
+// the server. Each pair is one `<encoded pair key>.jsonl` (one Sample object per line, oldest first; sample format 2, two
+// legs a/b; files from before v0.88.0 were named `<venue>_<code>.jsonl` with Var/Lighter fields and are left alone); `state.json` keeps the
 // saved parameters and each pair's asset kind. A file is continued after its last line, so local history may outgrow
 // the server's 14-day retention.
 //
 //   TP_MCP_URL=… TP_MCP_TOKEN_FILE=… node tools/varlighter/pull.ts --enabled
-//   TP_MCP_URL=… TP_MCP_TOKEN_FILE=… node tools/varlighter/pull.ts --symbol rh:AAPL --symbol lighter:BTC
+//   TP_MCP_URL=… TP_MCP_TOKEN_FILE=… node tools/varlighter/pull.ts --symbol 'var:AAPL|rh:AAPL' --symbol 'lighter:BTC|entropy:BTC'
 import { randomBytes } from 'node:crypto';
 import { appendFileSync, closeSync, existsSync, fstatSync, ftruncateSync, linkSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { PAIR_KEY } from '../../src/varlighter/model.ts';
+import { SAMPLE_FORMAT, upgradeKey } from '../../src/varlighter/model.ts';
 import type { SamplesView, StateView } from '../../src/varlighter/views.ts';
 import { loadSettings, platformGet, PlatformError, SettingsError, type Get } from '../mcp/readonly.ts';
 
@@ -22,13 +23,16 @@ const LOCK_STALE_MS = 5 * 60_000, LOCK_WAIT_MS = 10 * 60_000;
 
 /** The local sample directory: TP_VARLIGHTER_DIR, else ~/.cache/trading-platform/varlighter. */
 export const dataDir = (env: NodeJS.ProcessEnv = process.env): string => env.TP_VARLIGHTER_DIR || join(homedir(), '.cache', 'trading-platform', 'varlighter');
-export const sampleFile = (dir: string, key: string): string => join(dir, `${key.replace(':', '_')}.jsonl`);
+/** A pair key as a file name: percent-encoded, so `:` `|` `@` are safe on Windows and two keys never share a file. */
+export const sampleFile = (dir: string, key: string): string => join(dir, `${encodeURIComponent(key)}.jsonl`);
 
 /** What the local backtest needs from the platform's state: the saved parameters and each pair's asset kind. */
 export interface LocalState {
   savedAt: number;
   settings: StateView['settings'];
-  pairs: { key: string; kind: StateView['rows'][number]['kind']; name: string; enabled: boolean; position: boolean }[];
+  pairs: { key: string; kind: StateView['rows'][number]['kind']; name: string; enabled: boolean; position: boolean;
+    /** Each leg's taker fee in bps as the platform applies it (manual value or catalog); null: unknown, the backtest opens nothing. */
+    aFeeBps: number | null; bFeeBps: number | null }[];
   /** Enabled or held keys no longer paired (no kind known). */
   orphans: string[];
 }
@@ -119,18 +123,18 @@ async function patient(get: Get, path: string, sleep: (seconds: number) => Promi
 }
 
 export async function pull({ get, dir, symbols = [], enabled = false, log = () => {}, sleep = seconds => delay(seconds * 1000) }: PullOptions): Promise<{ state: LocalState; results: PullResult[] }> {
-  for (const key of symbols) if (!PAIR_KEY.test(key)) throw new SettingsError(`配对键无效：${key}（应为「场所:代码」，如 rh:AAPL）`);
+  const keys = symbols.map(key => upgradeKey(key) ?? (() => { throw new SettingsError(`配对键无效：${key}（应为「场所:代码|场所:代码」，如 var:AAPL|rh:AAPL）`); })());
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const view = await patient(get, '/api/varlighter/state', sleep) as StateView;
   const state: LocalState = {
     savedAt: Date.now(), settings: view.settings,
-    pairs: view.rows.map(row => ({ key: row.key, kind: row.kind, name: row.name, enabled: row.enabled, position: row.position !== null })),
+    pairs: view.rows.map(row => ({ key: row.key, kind: row.kind, name: row.name, enabled: row.enabled, position: row.position !== null, aFeeBps: row.aFeeBps ?? null, bFeeBps: row.bFeeBps ?? null })),
     orphans: view.orphans.map(row => row.key),
   };
   const temp = join(dir, `.${STATE_FILE}.${process.pid}.tmp`);
   writeFileSync(temp, `${JSON.stringify(state, null, 2)}\n`);
   renameSync(temp, join(dir, STATE_FILE));
-  const wanted = new Set(symbols);
+  const wanted = new Set(keys);
   if (enabled) {
     for (const pair of state.pairs) if (pair.enabled || pair.position) wanted.add(pair.key);
     for (const key of state.orphans) wanted.add(key);
@@ -147,6 +151,7 @@ export async function pull({ get, dir, symbols = [], enabled = false, log = () =
           if (error instanceof PlatformError && error.status === 413 && limit > MIN_PAGE) { limit = Math.max(MIN_PAGE, Math.floor(limit / 2)); continue; }
           throw error;
         }
+        if (page.format !== SAMPLE_FORMAT) throw new Error(`平台的样本格式是 ${page.format ?? 1}，本机是 ${SAMPLE_FORMAT}：平台与本机仓库须同为 v0.88.0 以后或同为以前的版本`);
         // Only the first page can show it: the server's oldest sample is newer than the local file's last one.
         if (!checked && after > 0 && page.firstAt !== null && page.firstAt > after) gap = { from: after, to: page.firstAt };
         checked = true;
@@ -180,7 +185,7 @@ export function parsePullArgs(argv: readonly string[]): { symbols: string[]; ena
     const arg = argv[index]!;
     if (arg === '--enabled') enabled = true;
     else if (arg === '--symbol' && argv[index + 1] !== undefined) symbols.push(argv[++index]!);
-    else throw new SettingsError(`不认识的参数：${arg}（用法：--symbol rh:AAPL 可多个，或 --enabled）`);
+    else throw new SettingsError(`不认识的参数：${arg}（用法：--symbol 'var:AAPL|rh:AAPL' 可多个，或 --enabled）`);
   }
   if (!symbols.length && !enabled) throw new SettingsError('请给出 --symbol <配对键> 或 --enabled');
   return { symbols, enabled };

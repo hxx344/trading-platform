@@ -44,7 +44,7 @@
 | 交易中心 | 金油 | `#/goldoil` | 同原油，三者共用执行账户 | 《金油页（G1，v0.74.0）》，页面内容见 [goldoil.md](goldoil.md) 第 3 节 |
 | 交易中心 | CrossEx | `#/crossex`，子页 `#/crossex/trade`、`#/crossex/hedge`、`#/crossex/orders`、`#/crossex/settings` | 已配置 CrossEx，后台重试期间也显示 | 《CrossEx 页》 |
 | 交易中心 | Ondo 挂单奖励 | `#/ondo` | 服务已接入 Ondo | 《Ondo 挂单奖励页》 |
-| 交易中心 | Var/Lighter 价差 | `#/varlighter`，子页 `#/varlighter/detail/<场所:代码>`、`#/varlighter/paper`、`#/varlighter/ready` | 服务开启了 Var/Lighter 模块（默认开启，`"varLighter": false` 关闭） | 《Var/Lighter 价差页》，内容见 [varlighter.md](varlighter.md) 第 10 节 |
+| 交易中心 | DEX 价差（原 Var/Lighter 价差） | `#/varlighter`，子页 `#/varlighter/detail/<场所:代码|场所:代码[@乘数]>`、`#/varlighter/paper`、`#/varlighter/ready` | 服务开启了该模块（默认开启，`"varLighter": false` 关闭） | 《DEX 价差页》，内容见 [varlighter.md](varlighter.md) 第 10 节、[dexspread.md](dexspread.md) 第 10 节 |
 | 策略与风险 | 配对组 | `#/`、`#/pair/<配对>` | 总是 | F1–F3、《ASTER 页面按工作台重排（F4）》 |
 | 期权 | 期权 | `#/options`，子页 `#/options/positions`、`#/options/orders`、`#/options/performance`、`#/options/rfq` | 已配置期权，后台重试期间也显示 | 《期权页》 |
 | 链上 | MEV 套利 | `#/mev`，子页 `#/mev/opportunities`、`#/mev/transactions`、`#/mev/pools`、`#/mev/settings` | 总是显示（v0.86.0 起；还没启用时是启用向导） | 《MEV 套利页》，内容见 [mev.md](mev.md) 第 5 节 |
@@ -706,17 +706,20 @@
 
 「行情与订单延迟」按市场显示近五分钟的最近值、P50、P95、成功样本数与未计入耗时的次数。观察显示公开盘口和共享心跳，实盘增加 REST 排队、下单、撤单和改挂。页面从后台恢复时，APR 与延迟保留上次读数并标明陈旧，收到新会话状态后恢复。回退到 v0.62.1 即可恢复原页面，回退前按 [ondo.md](ondo.md) 的要求停止会话。
 
-## Var/Lighter 价差页
+## DEX 价差页
 
-**对照的工作台页面**：工作台没有这个页面，骨架照本仓库的 Ondo 页（`wb-heading`、`panel`、`callout`、表格样式同 `ondo.css` 的 `.om-table`）；回退版本 v0.79.1。代码在 `web/src/varlighter/`，内容见 [varlighter.md](varlighter.md) 第 9、10 节；`config.json` 写 `"varLighter": false` 时左侧栏没有入口。
+v0.88.0 起页面标题与左侧栏入口从「Var/Lighter 价差」改为「DEX 价差」，场所加上 Entropy，配对推广为任意两腿（[dexspread.md](dexspread.md) 第 10 节）；对照页面就是 v0.87.0 的 Var/Lighter 价差页，回退版本 v0.87.0。
 
-- 左侧栏入口在「交易中心」组 Ondo 之后。四个页签都在地址里：`#/varlighter`、`#/varlighter/detail/<场所:代码>`（如 `rh:AAPL`；旧的只有代码的地址回到默认配对）、`#/varlighter/paper`、`#/varlighter/ready`。
-- 页头右侧每个来源一枚状态：Var 报价时效、每个采集中的 Lighter 场所（行情流、配对数、盘口快照新鲜度，悬停看错误）、模拟盘暂停。
-- 价差总览：四个读数卡、筛选（代码或名称、对手场所、只看已启用或有持仓）、可排序表格；同一代码在两个场所是两行，带「RH / 主网」标签。信号列写 Var 一侧的方向简写（悬停看两腿全称）。有失联配对（下架、规格改判或 30 分钟无样本）时表格上方多一个「失联的标的」面板，写明原因，可停用或按最后样本平仓；处理完最后一行后结果提示留在原处。已启用且在冷却中的配对在模拟盘列写冷却截止时刻。
-- 标的详情：下拉按「代码 · 场所 · 名称」选配对；读数、走势图（中间价基差、两个方向的可成交价差、基线与入场带、开平仓点）、按时段统计、参数与回测、下单预演、该配对的成交。
-- 模拟盘：汇总卡、持仓（可手动平仓）、累计净盈亏、按日汇总、成交、事件、清空（输入 RESET）。权益图刻度间隔小于 1 美元时带小数。
-- 实盘准备：核对清单、全局参数与风控、采集状态（每个场所的行情流、流量折算、目录、盘口快照，及停采 / 开采按钮，至少保留一个场所）、规格核对（按配对确认）。
-- 窄屏（390 px）时表格在面板内横向滚动，不撑宽页面。本地预览：`pnpm build:web` 后 `node scripts/dev-varlighter.ts`（替身行情，两个场所都有）。
+**对照的工作台页面**：工作台没有这个页面，骨架照本仓库的 Ondo 页（`wb-heading`、`panel`、`callout`、表格样式同 `ondo.css` 的 `.om-table`）；最初的回退版本 v0.79.1。代码在 `web/src/varlighter/`，内容见 [varlighter.md](varlighter.md) 第 9、10 节；`config.json` 写 `"varLighter": false` 时左侧栏没有入口。
+
+- 左侧栏入口在「交易中心」组 Ondo 之后。四个页签都在地址里：`#/varlighter`、`#/varlighter/detail/<配对键>`（如 `var:AAPL|rh:AAPL`、`lighter:SOL|rh:ETH@0.05`，冒号、竖线与 @ 不转义；v0.88.0 以前的 `rh:AAPL` 升级为 `var:AAPL|rh:AAPL`，只有代码的旧地址回到默认配对）、`#/varlighter/paper`、`#/varlighter/ready`。
+- 页头右侧每个来源一枚状态：Var 报价时效（没有组合或手动配对用到 Var 时不显示）、每个采集中的行情流场所（Lighter RH、Lighter 主网、Entropy：行情流、配对数、盘口快照新鲜度，悬停看错误）、模拟盘暂停。
+- 价差总览：四个读数卡（配对数按组合分列、手动配对另计）、筛选（代码或名称、场所组合与「手动」、只看已启用或有持仓）、可排序表格；同一代码在几个组合里是几行，带「Var↔RH」这类组合标签（手动配对用警示色）。表头写「卖 A / 买 A」，A 是配对键里的第一条腿；信号列与持仓写 A 一侧的方向简写（悬停看两腿全称），资金费列写两腿场所。有失联配对（下架、规格改判或 30 分钟无样本）时表格上方多一个「失联的标的」面板，写明原因，可停用或按最后样本平仓；处理完最后一行后结果提示留在原处。已启用且在冷却中的配对在模拟盘列写冷却截止时刻。
+- 标的详情：下拉按「代码 · 两腿场所（手动） · 名称」选配对；手动配对多一条说明（两腿合约、乘数、备注）；读数里「两腿合约」写两腿代码、乘数、手续费与行情流腿的市场编号；走势图（中间价基差、卖 A 与买 A 的可成交价差、基线与入场带、开平仓点）、按时段统计、参数与回测（方向按两腿场所写全称）、下单预演（每条行情流腿各一段下单字段）、该配对的成交。「与已保存参数一致」按规整后的参数比较（v0.88.0 修复刚打开就显示“有未保存的修改”）。
+- 模拟盘：汇总卡、持仓（开仓价写 A / B 两腿，B 腿按乘数折算，可手动平仓）、累计净盈亏、按日汇总、成交、事件、清空（输入 RESET）。权益图刻度间隔小于 1 美元时带小数。
+- 实盘准备：核对清单（多「两腿手续费」一项）、全局参数与风控（手续费按四个场所各一个，留空按目录费率）、「自动配对」（六个场所组合的开关与各自配对数；场所的停采 / 开采按钮已去掉，场所由组合与手动配对决定）、「手动配对」（A、B 两腿的场所与代码，代码框带该场所目录的候选与标记价，乘数旁实时算两腿价格差；类别、备注；已添加的列表可删，启用中或有持仓的不能删，删除前确认）、规格核对（按配对确认，手动配对注明）、采集状态（Var、行情流配对的 15 秒节拍、每个场所的行情流、流量折算、目录、盘口快照）。
+- 组合筛选按钮多时整按钮换行，不在按钮内折行。窄屏（390 px）时表格在面板内横向滚动，不撑宽页面。本地预览：`pnpm build:web` 后 `node scripts/dev-varlighter.ts`（替身行情：Var、Lighter RH、主网与 Entropy，一个 RH↔主网手动配对和一个失联持仓）。
+- 验证（v0.88.0）：内置浏览器 1280 与 375 宽度走查四个页签，见 [dexspread.md](dexspread.md) 第 10.9 节。
 
 ## MEV 套利页（v0.84.0，启用向导 v0.86.0）
 

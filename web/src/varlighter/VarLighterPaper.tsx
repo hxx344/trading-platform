@@ -7,7 +7,7 @@ import { useLiveResource } from '../use-live-resource.ts';
 import type { PaperView, StateView } from '../../../src/varlighter/views.ts';
 import { TradesPanel } from './VarLighterDetail.tsx';
 import { Badge, EquityChart, Metric, stampText, useWrite } from './parts.tsx';
-import { DIRECTION_LABELS, VARLIGHTER_BASE, bps, duration, pairLabel, percent, price, signedUsd, tone, usd, varLighterHref } from './varlighter-form.ts';
+import { VARLIGHTER_BASE, bps, directionLabel, duration, pairLabel, percent, price, signedUsd, tone, usd, varLighterHref, venueShort } from './varlighter-form.ts';
 
 const PAPER_PATH = `${VARLIGHTER_BASE}/paper`;
 
@@ -41,16 +41,16 @@ export function VarLighterPaper({ view, onChanged, onExpired }: { view: StateVie
     <section className="panel" aria-label="模拟持仓">
       <div className="panel-heading"><h2>模拟持仓</h2><span className="muted">浮动盈亏按最新样本的可成交价，已扣平仓成本</span></div>
       {data.positions.length ? <div className="vl-table"><table>
-        <thead><tr><th>标的 · 方向</th><th className="num">名义 · 数量</th><th className="num">开仓价 Var / 对手</th><th className="num">入场价差 / 基线</th><th className="num">持有</th><th className="num">浮动</th><th /></tr></thead>
+        <thead><tr><th>标的 · 方向</th><th className="num">名义 · 数量</th><th className="num">开仓价 A / B</th><th className="num">入场价差 / 基线</th><th className="num">持有</th><th className="num">浮动</th><th /></tr></thead>
         <tbody>{data.positions.map(position => <tr key={position.id}>
-          <td><a className="vl-symbol" href={varLighterHref('detail', position.symbol)}>{pairLabel(position.symbol).symbol}</a><small>{pairLabel(position.symbol).short} · {DIRECTION_LABELS[position.direction]}{position.estimated ? ' · 估' : ''}</small></td>
+          <td><a className="vl-symbol" href={varLighterHref('detail', position.symbol)}>{pairLabel(position.symbol).symbol}</a><small>{pairLabel(position.symbol).short} · {directionLabel(position.direction, pairLabel(position.symbol).a, pairLabel(position.symbol).b)}{position.estimated ? ' · 估' : ''}</small></td>
           <td className="num">{usd(position.notionalUsd, 0)}<small>{price(position.qty)}</small></td>
-          <td className="num">{price(position.varEntry)} / {price(position.rhEntry)}</td>
+          <td className="num">{price(position.aEntry)} / {price(position.ratio === 1 ? position.bEntry : position.bEntry / position.ratio)}<small>{pairLabel(position.symbol).a ? `${venueShort(pairLabel(position.symbol).a!)} / ${venueShort(pairLabel(position.symbol).b!)}` : ''}</small></td>
           <td className="num">{bps(position.entrySpread)} / {bps(position.entryBaseline)}</td>
           <td className="num">{duration(data.now - position.openedAt)}<small>上限 {duration(position.maxHoldMinutes * 60_000)}</small></td>
           <td className={`num vl-${tone(position.mark?.netUsd) || 'dim'}`}>{position.mark ? <>{signedUsd(position.mark.netUsd)}<small>{bps(position.mark.pnlBps)} 基点 · {stampText(position.mark.at)}</small></> : '无可成交价'}</td>
           <td><button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => close(position.symbol)}>{write.busy === `close:${position.symbol}` ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <X size={14} aria-hidden="true" />}平仓</button></td>
-        </tr>)}</tbody></table></div> : <TableEmpty>{view.rows.some(row => row.enabled) ? '没有持仓，等待价差偏离到入场阈值' : '还没有启用任何标的，在标的详情里调好参数后启用'}</TableEmpty>}
+        </tr>)}</tbody></table></div> : <TableEmpty>{view.rows.some(row => row.enabled) ? '没有持仓，等待价差偏离到入场阈值' : '还没有启用任何配对，在标的详情里调好参数后启用'}</TableEmpty>}
     </section>
     <div className="vl-columns">
       <section className="panel" aria-label="累计净盈亏">

@@ -61,6 +61,9 @@ export class RollingWindow {
 
 export interface Baseline { regime: Regime; median: number; sigma: number; samples: number; since: number | null; fallback: boolean }
 
+/** 两腿都是行情流的配对计入基线的最短间隔（约一分钟抽一个，留 5 秒余量）。 */
+export const LIVE_BASELINE_GAP_MS = 55_000;
+
 /**
  * 一个标的的基线：每个时段一个滚动窗口，另有一个不分时段的窗口。当前时段样本不足时退回全天窗口（标 fallback），
  * 全天窗口也不足时没有基线。
@@ -70,14 +73,18 @@ export class BaselineTracker {
   private readonly all: RollingWindow;
   readonly kind: AssetKind;
   private readonly minSamples: number;
-  constructor(kind: AssetKind, windowMs: number, minSamples: number) {
-    this.kind = kind; this.minSamples = minSamples;
+  private readonly minGapMs: number;
+  private last = -Infinity;
+  /** minGapMs：两次计入基线的最短间隔。两腿都是行情流的配对每 15 秒采一次，按约一分钟抽一个，最少样本数与有 Var 的配对同样是「分钟」。 */
+  constructor(kind: AssetKind, windowMs: number, minSamples: number, minGapMs = 0) {
+    this.kind = kind; this.minSamples = minSamples; this.minGapMs = minGapMs;
     this.all = new RollingWindow(windowMs);
     for (const regime of regimesOf(kind)) if (regime !== 'all') this.windows.set(regime, new RollingWindow(windowMs));
   }
   push(sample: Sample): void {
     const value = midBasis(sample);
-    if (!Number.isFinite(value)) return;
+    if (!Number.isFinite(value) || sample.t - this.last < this.minGapMs) return;
+    this.last = sample.t;
     this.all.push(sample.t, value);
     this.windows.get(sample.regime)?.push(sample.t, value);
   }
@@ -97,10 +104,10 @@ export interface RegimeStats {
   samples: number;
   /** 中间价基差的分布（基点）。 */ median: number | null; mean: number | null; sigma: number | null; std: number | null;
   p05: number | null; p25: number | null; p75: number | null; p95: number | null;
-  /** 1k 档往返成本（买 Var 价差 − 卖 Var 价差）的中位数，基点。 */ costMedian: number | null;
+  /** 1k 档往返成本（买 A 价差 − 卖 A 价差）的中位数，基点。 */ costMedian: number | null;
   /** 偏离中位数的 AR(1) 半衰期（分钟），不回归时为 null。 */ halfLifeMin: number | null;
   /** 每天穿越中位数的次数。 */ crossingsPerDay: number | null;
-  /** 卖 Var 或买 Var 的可成交价差偏离中位数至少 entryBps 的样本占比。 */ opportunityShare: number | null;
+  /** 卖 A 或买 A 的可成交价差偏离中位数至少 entryBps 的样本占比。 */ opportunityShare: number | null;
   /** 中间价偏离中位数绝对值的 95 分位（基点）。 */ deviation95: number | null;
 }
 
@@ -121,8 +128,8 @@ export function regimeStats(regime: Regime, samples: readonly Sample[], entryBps
     const spread = spreadOf(sample, bucket);
     if (!spread) continue;
     priced++;
-    costs.push(spread.buyVar - spread.sellVar);
-    if (median !== null && (spread.sellVar - median >= entryBps || median - spread.buyVar >= entryBps)) opportunities++;
+    costs.push(spread.buyA - spread.sellA);
+    if (median !== null && (spread.sellA - median >= entryBps || median - spread.buyA >= entryBps)) opportunities++;
   }
   costs.sort((a, b) => a - b);
   // 半衰期：x(t) = φ·x(t−1) + ε，只用相邻且连续的样本对；按两样本实际间隔换算成每分钟的 φ。

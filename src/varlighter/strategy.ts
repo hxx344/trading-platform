@@ -1,30 +1,35 @@
-// 价差回归策略（docs/varlighter.md 第 5 节）：参数、开平仓判断与盈亏。回测（backtest.ts）与模拟盘（engine.ts）共用，
-// 只有纯计算，不读写存储。
-import { REGIMES, bucketOf, executionSample, spreadOf, type Regime, type Sample, type Spread } from './model.ts';
+// 价差回归策略（docs/varlighter.md 第 5 节、docs/dexspread.md 第 5 节）：参数、开平仓判断与盈亏。回测（backtest.ts）与模拟盘（engine.ts）共用，
+// 只有纯计算，不读写存储。A、B 是配对的两条腿（Var/Lighter 配对里 A 是 Var）。
+import { REGIMES, bucketOf, executionSample, spreadOf, type Regime, type Sample, type Spread, type VenueId } from './model.ts';
 import type { Baseline } from './stats.ts';
 
-/** var_rich：Var 相对偏贵，卖 Var、买 Lighter；var_cheap：买 Var、卖 Lighter。 */
-export type Direction = 'var_rich' | 'var_cheap';
-export const DIRECTION_NAMES: Record<Direction, string> = { var_rich: '卖 Var / 买 Lighter', var_cheap: '买 Var / 卖 Lighter' };
+/** a_rich：A 相对偏贵，卖 A、买 B；a_cheap：买 A、卖 B。v0.87.0 以前叫 var_rich、var_cheap。 */
+export type Direction = 'a_rich' | 'a_cheap';
+export const DIRECTIONS: readonly Direction[] = ['a_rich', 'a_cheap'];
+export const DIRECTION_NAMES: Record<Direction, string> = { a_rich: '卖 A / 买 B', a_cheap: '买 A / 卖 B' };
+/** 旧方向名换成新的；不认识的返回 null。 */
+export const upgradeDirection = (value: unknown): Direction | null =>
+  value === 'a_rich' || value === 'var_rich' ? 'a_rich' : value === 'a_cheap' || value === 'var_cheap' ? 'a_cheap' : null;
 
 export interface SymbolParams {
-  /** 模拟盘是否对这个标的开仓（已有持仓照常按规则平仓）。 */ enabled: boolean;
-  /** 每笔名义金额（美元），两腿同样的基础数量。 */ notionalUsd: number;
+  /** 模拟盘是否对这个配对开仓（已有持仓照常按规则平仓）。 */ enabled: boolean;
+  /** 每笔名义金额（美元），两腿同样的名义（B 腿数量 = A 腿数量 × 乘数）。 */ notionalUsd: number;
   /** 可成交价差偏离基线至少这么多基点才开仓。 */ entryBps: number;
   /** 中间价基差回到基线 ± 这么多基点以内就平仓；可为负（要求越过基线）。每笔约赚「入场 − 出场 − 半个往返成本」。 */ exitBps: number;
   /** 按可成交价算的浮亏达到这么多基点就止损。 */ stopBps: number;
   maxHoldMinutes: number;
-  /** 平仓后多久内不再开同一标的。 */ cooldownMinutes: number;
+  /** 平仓后多久内不再开同一配对。 */ cooldownMinutes: number;
   /** 允许开仓的时段（不影响平仓）。 */ regimes: Regime[];
   directions: Direction[];
 }
+/** 各场所手续费的手动值（基点，每次成交）；null 表示按场所目录（Var 为 0，Lighter 取目录的吃单费率，Entropy 按部署方系数算）。 */
+export const FEE_FIELDS = { var: 'varFeeBps', rh: 'rhFeeBps', lighter: 'lighterFeeBps', entropy: 'entropyFeeBps' } as const satisfies Record<VenueId, string>;
 export interface GlobalParams {
   /** 基线窗口（小时）。 */ windowHours: number;
-  /** 基线最少样本数。 */ minSamples: number;
+  /** 基线最少样本数（按每分钟一个计；两腿都是行情流的配对每分钟只计一个）。 */ minSamples: number;
   /** 每次成交的滑点（基点，每条腿每次各计一次）。 */ slippageBps: number;
-  /** 两边每次成交的手续费（基点）。公开目录 2026-11-22 显示 Lighter RH 标准账户为 0；Var 不收交易手续费，价差即成本。 */
-  varFeeBps: number; rhFeeBps: number;
-  /** Var 报价收到时已过去的时间上限（秒），超过不开仓。 */ maxQuoteAgeSec: number;
+  varFeeBps: number | null; rhFeeBps: number | null; lighterFeeBps: number | null; entropyFeeBps: number | null;
+  /** 较慢一腿的报价收到时已过去的时间上限（秒），超过不开仓。 */ maxQuoteAgeSec: number;
   /** 预期净利（偏离 − 出场 − 半个往返成本 − 四次成交的滑点与手续费，基点）低于这个数不开仓。 */ minNetBps: number;
   maxOpenPositions: number;
   /** 所有持仓名义金额合计上限（美元）。 */ maxTotalNotionalUsd: number;
@@ -32,8 +37,10 @@ export interface GlobalParams {
   /** 暂停：不再开新仓，已有持仓照常按规则平仓。 */ paused: boolean;
 }
 
-export const DEFAULT_SYMBOL: SymbolParams = { enabled: false, notionalUsd: 1000, entryBps: 15, exitBps: 0, stopBps: 60, maxHoldMinutes: 720, cooldownMinutes: 10, regimes: [...REGIMES], directions: ['var_rich', 'var_cheap'] };
-export const DEFAULT_GLOBAL: GlobalParams = { windowHours: 24, minSamples: 120, slippageBps: 1, varFeeBps: 0, rhFeeBps: 0, maxQuoteAgeSec: 30, minNetBps: 3, maxOpenPositions: 5, maxTotalNotionalUsd: 10_000, dailyLossLimitUsd: 100, paused: false };
+export const DEFAULT_SYMBOL: SymbolParams = { enabled: false, notionalUsd: 1000, entryBps: 15, exitBps: 0, stopBps: 60, maxHoldMinutes: 720, cooldownMinutes: 10, regimes: [...REGIMES], directions: [...DIRECTIONS] };
+export const DEFAULT_GLOBAL: GlobalParams = { windowHours: 24, minSamples: 120, slippageBps: 1, varFeeBps: null, rhFeeBps: null, lighterFeeBps: null, entropyFeeBps: null, maxQuoteAgeSec: 30, minNetBps: 3, maxOpenPositions: 5, maxTotalNotionalUsd: 10_000, dailyLossLimitUsd: 100, paused: false };
+/** 一条腿的手续费：手动值优先，其次目录费率；都没有为 null（不开仓）。 */
+export const legFeeBps = (global: GlobalParams, venue: VenueId, catalogBps: number | null): number | null => global[FEE_FIELDS[venue]] ?? catalogBps;
 
 export class ParamsError extends Error { readonly status = 400; }
 const fail = (message: string): never => { throw new ParamsError(message); };
@@ -53,7 +60,7 @@ function list<T extends string>(value: unknown, options: readonly T[], name: str
   return options.filter(option => (value as string[]).includes(option));
 }
 
-/** 页面提交的单个标的参数；缺的字段用 base 补（新标的用默认值）。 */
+/** 页面提交的单个配对参数；缺的字段用 base 补（新配对用默认值）。 */
 export function readSymbolParams(value: unknown, base: SymbolParams = DEFAULT_SYMBOL): SymbolParams {
   const raw = only(value, Object.keys(DEFAULT_SYMBOL), '标的参数');
   const pick = <K extends keyof SymbolParams>(key: K) => (raw[key] === undefined ? base[key] : raw[key]) as unknown;
@@ -68,7 +75,7 @@ export function readSymbolParams(value: unknown, base: SymbolParams = DEFAULT_SY
     maxHoldMinutes: num(pick('maxHoldMinutes'), 1, 43_200, '最长持有', true),
     cooldownMinutes: num(pick('cooldownMinutes'), 0, 1440, '冷却', true),
     regimes: list(pick('regimes'), REGIMES, '允许开仓的时段'),
-    directions: list(pick('directions'), ['var_rich', 'var_cheap'] as const, '方向'),
+    directions: list(pick('directions'), DIRECTIONS, '方向'),
   };
   if (params.exitBps >= params.entryBps) fail('出场偏离须小于入场偏离，否则开仓即满足平仓条件');
   if (!params.directions.length) fail('至少选择一个方向');
@@ -80,12 +87,12 @@ export function readGlobalParams(value: unknown, base: GlobalParams = DEFAULT_GL
   const pick = <K extends keyof GlobalParams>(key: K) => (raw[key] === undefined ? base[key] : raw[key]) as unknown;
   const paused = pick('paused');
   if (typeof paused !== 'boolean') fail('暂停须为 true 或 false');
+  const fee = (venue: VenueId, name: string): number | null => { const value = pick(FEE_FIELDS[venue]); return value === null ? null : num(value, 0, 100, `${name}手续费`); };
   return {
     windowHours: num(pick('windowHours'), 1, 24 * 30, '基线窗口', true),
     minSamples: num(pick('minSamples'), 10, 50_000, '基线最少样本', true),
     slippageBps: num(pick('slippageBps'), 0, 100, '滑点'),
-    varFeeBps: num(pick('varFeeBps'), 0, 100, 'Var 手续费'),
-    rhFeeBps: num(pick('rhFeeBps'), 0, 100, 'Lighter 手续费'),
+    varFeeBps: fee('var', 'Var '), rhFeeBps: fee('rh', 'Lighter RH '), lighterFeeBps: fee('lighter', 'Lighter '), entropyFeeBps: fee('entropy', 'Entropy '),
     maxQuoteAgeSec: num(pick('maxQuoteAgeSec'), 5, 600, '报价时效', true),
     minNetBps: num(pick('minNetBps'), 0, 500, '最低预期净利'),
     maxOpenPositions: num(pick('maxOpenPositions'), 1, 100, '最多持仓数', true),
@@ -94,15 +101,29 @@ export function readGlobalParams(value: unknown, base: GlobalParams = DEFAULT_GL
     paused: paused as boolean,
   };
 }
+/** v0.87.0 以前存的全局参数：Var 与 Lighter 手续费是数（默认 0），0 换成「按目录」，非 0 的 Lighter 费率两个 Lighter 场所都用。 */
+export function upgradeGlobal(value: unknown): GlobalParams {
+  if (!isObject(value)) return DEFAULT_GLOBAL;
+  const { varFeeBps, rhFeeBps, ...rest } = value;
+  const known = Object.fromEntries(Object.entries(rest).filter(([key]) => key in DEFAULT_GLOBAL));
+  const fee = (raw: unknown) => typeof raw === 'number' && raw > 0 ? raw : null;
+  try {
+    return readGlobalParams({ ...known, varFeeBps: fee(varFeeBps), rhFeeBps: fee(rhFeeBps), lighterFeeBps: 'lighterFeeBps' in value ? value.lighterFeeBps : fee(rhFeeBps) });
+  } catch { return DEFAULT_GLOBAL; }
+}
 
 // ---- 开平仓 ----
+/**
+ * 一笔持仓。qty 是 A 腿数量（B 腿数量 = qty × ratio）；aEntry 是 A 腿成交价，bEntry 是 B 腿成交价乘乘数后的折算价
+ * （与 A 同一单位，qty × bEntry 即 B 腿名义）。手续费在开仓时按当时的场所费率记下，平仓沿用。
+ */
 export interface Position {
   id: string; symbol: string; direction: Direction; openedAt: number; qty: number; notionalUsd: number;
   /** 开仓时的可成交价差（基点）与基线。 */ entrySpread: number; entryBaseline: number; entryRegime: Regime;
-  varEntry: number; rhEntry: number; estimated: boolean;
+  aEntry: number; bEntry: number; estimated: boolean; ratio: number; aFeeBps: number; bFeeBps: number;
 }
 export interface ClosedTrade extends Position {
-  closedAt: number; varExit: number; rhExit: number; exitSpread: number; reason: CloseReason;
+  closedAt: number; aExit: number; bExit: number; exitSpread: number; reason: CloseReason;
   grossUsd: number; costUsd: number; netUsd: number; netBps: number;
   /** 资金费估算（美元），只作参考，不计入 netUsd。 */ fundingUsd: number | null;
 }
@@ -117,9 +138,9 @@ export type Decision =
 
 /** 持仓当前按可成交价平仓的价差（基点）与对开仓的收益（基点，正为盈利，不含滑点与手续费）。 */
 export function markToMarket(position: Position, spread: Spread): { exitSpread: number; pnlBps: number } {
-  return position.direction === 'var_rich'
-    ? { exitSpread: spread.buyVar, pnlBps: position.entrySpread - spread.buyVar }
-    : { exitSpread: spread.sellVar, pnlBps: spread.sellVar - position.entrySpread };
+  return position.direction === 'a_rich'
+    ? { exitSpread: spread.buyA, pnlBps: position.entrySpread - spread.buyA }
+    : { exitSpread: spread.sellA, pnlBps: spread.sellA - position.entrySpread };
 }
 
 /**
@@ -136,7 +157,7 @@ export function positionSpread(sample: Sample, notionalUsd: number): Spread | nu
 /** 已有持仓：回归、止损、超时；没有持仓：按方向与偏离开仓。时段、报价时效与风控限制由调用方在开仓前另外判断。 */
 export function decide(sample: Sample, baseline: Baseline | null, params: SymbolParams, position: Position | null): Decision {
   const spread = position ? positionSpread(sample, position.notionalUsd) : spreadOf(sample, bucketOf(params.notionalUsd));
-  if (!spread) return { kind: 'wait', reason: '该档位缺少可成交价格（100k 档需要 Lighter 完整盘口）' };
+  if (!spread) return { kind: 'wait', reason: '该档位缺少可成交价格（100k 档需要两腿的完整盘口）' };
   if (position) {
     const { pnlBps } = markToMarket(position, spread);
     if (pnlBps <= -params.stopBps) return { kind: 'close', reason: 'stop', spread, deviation: baseline ? deviationToClose(position.direction, spread, baseline.median) : 0 };
@@ -146,9 +167,9 @@ export function decide(sample: Sample, baseline: Baseline | null, params: Symbol
     return deviation <= params.exitBps ? { kind: 'close', reason: 'revert', spread, deviation } : { kind: 'hold', deviation };
   }
   if (!baseline) return { kind: 'wait', reason: '基线样本不足' };
-  const rich = spread.sellVar - baseline.median, cheap = baseline.median - spread.buyVar;
-  if (params.directions.includes('var_rich') && rich >= params.entryBps) return { kind: 'open', direction: 'var_rich', spread, deviation: rich };
-  if (params.directions.includes('var_cheap') && cheap >= params.entryBps) return { kind: 'open', direction: 'var_cheap', spread, deviation: cheap };
+  const rich = spread.sellA - baseline.median, cheap = baseline.median - spread.buyA;
+  if (params.directions.includes('a_rich') && rich >= params.entryBps) return { kind: 'open', direction: 'a_rich', spread, deviation: rich };
+  if (params.directions.includes('a_cheap') && cheap >= params.entryBps) return { kind: 'open', direction: 'a_cheap', spread, deviation: cheap };
   return { kind: 'hold', deviation: Math.max(rich, cheap) };
 }
 /**
@@ -156,52 +177,52 @@ export function decide(sample: Sample, baseline: Baseline | null, params: Symbol
  * 判断：若也按可成交价差，中间价回到基线时可成交价差仍差半个往返成本，永远等不到平仓。
  */
 export function deviationToClose(direction: Direction, spread: Spread, median: number): number {
-  return direction === 'var_rich' ? spread.mid - median : median - spread.mid;
+  return direction === 'a_rich' ? spread.mid - median : median - spread.mid;
 }
 
-/** 按两腿同样的基础数量开仓：数量 = 名义金额 ÷ Lighter 中间价。 */
-export function openPosition(id: string, sample: Sample, params: SymbolParams, decision: Extract<Decision, { kind: 'open' }>, baseline: Baseline): Position {
+export interface LegFees { aFeeBps: number; bFeeBps: number }
+/** 按两腿同样的名义开仓：A 腿数量 = 名义金额 ÷ 折算后的 B 中间价（B 腿数量再乘乘数）。 */
+export function openPosition(id: string, sample: Sample, params: SymbolParams, decision: Extract<Decision, { kind: 'open' }>, baseline: Baseline, fees: LegFees): Position {
   const { spread, direction } = decision, prices = spread.prices;
-  const qty = params.notionalUsd / prices.rhMid;
+  const qty = params.notionalUsd / prices.bMid;
   return {
     id, symbol: sample.symbol, direction, openedAt: sample.t, qty, notionalUsd: params.notionalUsd,
-    entrySpread: direction === 'var_rich' ? spread.sellVar : spread.buyVar, entryBaseline: baseline.median, entryRegime: sample.regime,
-    varEntry: direction === 'var_rich' ? prices.varBid : prices.varAsk, rhEntry: direction === 'var_rich' ? prices.rhAsk : prices.rhBid, estimated: spread.estimated,
+    entrySpread: direction === 'a_rich' ? spread.sellA : spread.buyA, entryBaseline: baseline.median, entryRegime: sample.regime,
+    aEntry: direction === 'a_rich' ? prices.aBid : prices.aAsk, bEntry: direction === 'a_rich' ? prices.bAsk : prices.bBid, estimated: spread.estimated,
+    ratio: sample.ratio, aFeeBps: fees.aFeeBps, bFeeBps: fees.bFeeBps,
   };
 }
 
-/** 平仓结算：价差收益按两腿实际成交价算；滑点与手续费按四次成交（每腿开平各一次）的名义金额扣。 */
-export function closePosition(position: Position, at: number, spread: Spread, reason: CloseReason, global: Pick<GlobalParams, 'slippageBps' | 'varFeeBps' | 'rhFeeBps'>, fundingUsd: number | null): ClosedTrade {
-  const prices = spread.prices, rich = position.direction === 'var_rich';
-  const varExit = rich ? prices.varAsk : prices.varBid, rhExit = rich ? prices.rhBid : prices.rhAsk;
-  const varPnl = (rich ? position.varEntry - varExit : varExit - position.varEntry) * position.qty;
-  const rhPnl = (rich ? rhExit - position.rhEntry : position.rhEntry - rhExit) * position.qty;
-  const traded = position.qty * (position.varEntry + varExit), tradedRh = position.qty * (position.rhEntry + rhExit);
-  const costUsd = (traded * (global.slippageBps + global.varFeeBps) + tradedRh * (global.slippageBps + global.rhFeeBps)) / 10_000;
-  const grossUsd = varPnl + rhPnl, netUsd = grossUsd - costUsd;
-  return { ...position, closedAt: at, varExit, rhExit, exitSpread: rich ? spread.buyVar : spread.sellVar, reason, grossUsd, costUsd, netUsd, netBps: netUsd / position.notionalUsd * 10_000, fundingUsd };
+/** 平仓结算：价差收益按两腿实际成交价算；滑点与手续费按四次成交（每腿开平各一次）的名义金额扣，手续费用开仓时记下的。 */
+export function closePosition(position: Position, at: number, spread: Spread, reason: CloseReason, global: Pick<GlobalParams, 'slippageBps'>, fundingUsd: number | null): ClosedTrade {
+  const prices = spread.prices, rich = position.direction === 'a_rich';
+  const aExit = rich ? prices.aAsk : prices.aBid, bExit = rich ? prices.bBid : prices.bAsk;
+  const aPnl = (rich ? position.aEntry - aExit : aExit - position.aEntry) * position.qty;
+  const bPnl = (rich ? bExit - position.bEntry : position.bEntry - bExit) * position.qty;
+  const tradedA = position.qty * (position.aEntry + aExit), tradedB = position.qty * (position.bEntry + bExit);
+  const costUsd = (tradedA * (global.slippageBps + position.aFeeBps) + tradedB * (global.slippageBps + position.bFeeBps)) / 10_000;
+  const grossUsd = aPnl + bPnl, netUsd = grossUsd - costUsd;
+  return { ...position, closedAt: at, aExit, bExit, exitSpread: rich ? spread.buyA : spread.sellA, reason, grossUsd, costUsd, netUsd, netBps: netUsd / position.notionalUsd * 10_000, fundingUsd };
 }
 
 /**
- * 资金费估算（美元，正为收入）：Lighter 每小时费率（多头付费为正）与 Var 年化费率（推测口径）按持有时长线性累计。
- * var_rich 是 Var 空头、Lighter 多头。只作参考，不进净盈亏。
+ * 资金费估算（美元，正为收入）：两腿每小时费率（多头付费为正；Var 的年化推测口径已折成每小时）按持有时长线性累计。
+ * a_rich 是 A 空头、B 多头。只作参考，不进净盈亏。
  */
-export function fundingEstimate(position: Position, until: number, varAnnual: number | null, rhHourly: number | null): number | null {
-  if (varAnnual === null || rhHourly === null) return null;
+export function fundingEstimate(position: Position, until: number, aHourly: number | null, bHourly: number | null): number | null {
+  if (aHourly === null || bHourly === null) return null;
   const hours = Math.max(0, until - position.openedAt) / 3_600_000;
-  const varSign = position.direction === 'var_rich' ? 1 : -1;
-  const varUsd = varSign * varAnnual / (365 * 24) * hours * position.qty * position.varEntry;
-  const rhUsd = -varSign * rhHourly * hours * position.qty * position.rhEntry;
-  return varUsd + rhUsd;
+  const sign = position.direction === 'a_rich' ? 1 : -1;
+  return sign * aHourly * hours * position.qty * position.aEntry - sign * bHourly * hours * position.qty * position.bEntry;
 }
 
 /**
  * 这次开仓的预期净利（基点）：平仓时中间价回到「基线 + 出场偏离」，可成交价还差半个往返成本，再扣四次成交
  * （两腿开平各一次）的滑点与手续费。往返成本按开仓时的算。
  */
-export function expectedNetBps(decision: Extract<Decision, { kind: 'open' }>, params: Pick<SymbolParams, 'exitBps'>, global: Pick<GlobalParams, 'slippageBps' | 'varFeeBps' | 'rhFeeBps'>): number {
-  const halfCost = (decision.spread.buyVar - decision.spread.sellVar) / 2;
-  return decision.deviation - params.exitBps - halfCost - 4 * global.slippageBps - 2 * (global.varFeeBps + global.rhFeeBps);
+export function expectedNetBps(decision: Extract<Decision, { kind: 'open' }>, params: Pick<SymbolParams, 'exitBps'>, costs: Pick<GlobalParams, 'slippageBps'> & LegFees): number {
+  const halfCost = (decision.spread.buyA - decision.spread.sellA) / 2;
+  return decision.deviation - params.exitBps - halfCost - 4 * costs.slippageBps - 2 * (costs.aFeeBps + costs.bFeeBps);
 }
 
 /**
@@ -209,13 +230,13 @@ export function expectedNetBps(decision: Extract<Decision, { kind: 'open' }>, pa
  * 即（入场 − 出场 − 半个往返成本 − 手续费 − 最低净利）÷ 4，限在 1 到 10 基点。算出来不足 1 时取 1，
  * 这时保护用满会低于最低净利（这样的机会本来也过不了预期净利门槛）。
  */
-export function slippageBudgetBps(params: Pick<SymbolParams, 'entryBps' | 'exitBps'>, global: Pick<GlobalParams, 'minNetBps' | 'varFeeBps' | 'rhFeeBps'>, halfCostBps: number): number {
-  return Math.min(10, Math.max(1, (params.entryBps - params.exitBps - Math.max(0, halfCostBps) - 2 * (global.varFeeBps + global.rhFeeBps) - global.minNetBps) / 4));
+export function slippageBudgetBps(params: Pick<SymbolParams, 'entryBps' | 'exitBps'>, costs: Pick<GlobalParams, 'minNetBps'> & LegFees, halfCostBps: number): number {
+  return Math.min(10, Math.max(1, (params.entryBps - params.exitBps - Math.max(0, halfCostBps) - 2 * (costs.aFeeBps + costs.bFeeBps) - costs.minNetBps) / 4));
 }
 
-export const DECAYED = '拿到报价时信号已消失', NO_LIVE_TOP = '缺少判断时刻的 Lighter 一档';
+export const DECAYED = '拿到报价时信号已消失', NO_LIVE_TOP = '缺少判断时刻的一档';
 /**
- * 开仓复核：信号按 Var 报价时刻的样本算出，拿到报价时已过去约 20 秒。按判断时刻的 Lighter 一档重算，
+ * 开仓复核：有 Var 腿的配对，信号按 Var 报价时刻的样本算出，拿到报价时已过去约 20 秒。按判断时刻的行情流一档（与 Var 询价）重算，
  * 方向不变且仍达到入场偏离才开，并按那一刻的价成交。requireLive 为假（回测旧样本）时没有记录就沿用原样本。
  * 返回字符串是不开仓的原因。
  */
@@ -225,7 +246,7 @@ export function confirmOpen(sample: Sample, baseline: Baseline, params: SymbolPa
   const again = decide(live, baseline, params, null);
   return again.kind === 'open' && again.direction === decision.direction ? { sample: live, decision: again } : DECAYED;
 }
-/** 平仓成交价：有判断时刻的 Lighter 一档就按它算，没有则用样本本身的。 */
+/** 平仓成交价：有判断时刻的一档就按它算，没有则用样本本身的。 */
 export function closeSpread(sample: Sample, position: Position, fallback: Spread): Spread {
   const live = executionSample(sample);
   return (live && positionSpread(live, position.notionalUsd)) ?? fallback;
@@ -233,33 +254,48 @@ export function closeSpread(sample: Sample, position: Position, fallback: Spread
 
 /**
  * 开仓前的风控与时效检查；返回不开仓的原因，可以开则为 null。回测与模拟盘共用。
- * varBusy：同一个 Var 代码已在另一个 Lighter 场所有持仓。Var 的持仓按代码合并，两笔反向会互相抵消，所以每个代码同时只开一笔。
+ * legBusy：这个配对的某条腿（同场所同代码）已在另一个配对持仓。场所的持仓按代码合并，两笔反向会互相抵消，所以每条腿同时只开一笔。
+ * feeUnknown：某条腿的手续费既没有手动值也取不到目录费率。
  * fallbackBaseline：本时段样本不足、基线退回了全天窗口。时段刚切换（周一开盘、进周末）时全天窗口里是上一个时段的基差，不开仓。
- * expectedNetBps：见 expectedNetBps()。costBps：开仓时的往返成本（买 Var 价差 − 卖 Var 价差）；开仓后按可成交价的浮亏
+ * expectedNetBps：见 expectedNetBps()。costBps：开仓时的往返成本（买 A 价差 − 卖 A 价差）；开仓后按可成交价的浮亏
  * 一开始就等于它，达到止损线的话下一个样本就止损，所以不开。
  */
-export interface GateContext { openPositions: number; openNotionalUsd: number; dailyNetUsd: number; cooldownUntil: number; eligible: boolean; varBusy?: boolean; fallbackBaseline?: boolean; expectedNetBps?: number; costBps?: number }
-export const FALLBACK_BLOCK = '本时段基线样本不足（全天基线不开仓）', THIN_BLOCK = '预期净利不足', COST_BLOCK = '往返成本已达止损线';
-/** 复核后的开仓决定对应的两个门槛读数。 */
+export interface GateContext { openPositions: number; openNotionalUsd: number; dailyNetUsd: number; cooldownUntil: number; eligible: boolean; legBusy?: boolean; feeUnknown?: boolean; fallbackBaseline?: boolean; expectedNetBps?: number; costBps?: number }
+export const FALLBACK_BLOCK = '本时段基线样本不足（全天基线不开仓）', THIN_BLOCK = '预期净利不足', COST_BLOCK = '往返成本已达止损线', FEE_BLOCK = '手续费未知', BUSY_BLOCK = '同一腿已在另一配对持仓';
 /**
+ * 复核后的开仓决定对应的两个门槛读数。
  * `quoted`：报价时刻（复核前）的开仓决定，只在样本带 Var token 询价时传（不带询价时与 v0.81.0 相同，只看复核后的）。开仓后的止损仍按公开报价的样本判断，所以成本门槛取复核后与报价时刻两种口径里
  * 较大的往返成本：按 token 询价复核后成本很小、公开档位成本却已到止损线的仓，开了下一个样本就会止损。
  */
-export const openEconomics = (decision: Extract<Decision, { kind: 'open' }>, params: Pick<SymbolParams, 'exitBps'>, global: Pick<GlobalParams, 'slippageBps' | 'varFeeBps' | 'rhFeeBps'>, quoted?: Extract<Decision, { kind: 'open' }>) =>
-  ({ expectedNetBps: expectedNetBps(decision, params, global), costBps: Math.max(decision.spread.buyVar - decision.spread.sellVar, quoted ? quoted.spread.buyVar - quoted.spread.sellVar : -Infinity) });
+export const openEconomics = (decision: Extract<Decision, { kind: 'open' }>, params: Pick<SymbolParams, 'exitBps'>, costs: Pick<GlobalParams, 'slippageBps'> & LegFees, quoted?: Extract<Decision, { kind: 'open' }>) =>
+  ({ expectedNetBps: expectedNetBps(decision, params, costs), costBps: Math.max(decision.spread.buyA - decision.spread.sellA, quoted ? quoted.spread.buyA - quoted.spread.sellA : -Infinity) });
 export function openBlocker(sample: Sample, params: SymbolParams, global: GlobalParams, context: GateContext): string | null {
   if (global.paused) return '已暂停';
   if (!params.enabled) return '未启用';
   if (!context.eligible) return '规格未确认';
   if (!params.regimes.includes(sample.regime)) return '当前时段不开仓';
   if (context.fallbackBaseline) return FALLBACK_BLOCK;
-  if (sample.receivedAt - sample.t > global.maxQuoteAgeSec * 1000) return 'Var 报价过旧';
+  if (sample.receivedAt - sample.t > global.maxQuoteAgeSec * 1000) return '报价过旧';
   if (sample.t < context.cooldownUntil) return '冷却中';
+  if (context.feeUnknown) return FEE_BLOCK;
   if (context.costBps !== undefined && context.costBps >= params.stopBps) return COST_BLOCK;
   if (context.expectedNetBps !== undefined && context.expectedNetBps < global.minNetBps) return THIN_BLOCK;
-  if (context.varBusy) return '同一 Var 代码已在另一场所持仓';
+  if (context.legBusy) return BUSY_BLOCK;
   if (context.openPositions >= global.maxOpenPositions) return '持仓数已满';
   if (context.openNotionalUsd + params.notionalUsd > global.maxTotalNotionalUsd) return '名义合计将超上限';
   if (context.dailyNetUsd <= -global.dailyLossLimitUsd) return '当日亏损已达上限';
   return null;
+}
+
+/** v0.87.0 以前存的持仓与成交（var 与 rh 前缀字段、var_rich 方向）换成两腿口径；已是新格式的原样返回，认不出的返回 null。 */
+export function upgradePosition<T extends Position | ClosedTrade>(raw: unknown, symbol: string, legacyFees: LegFees): T | null {
+  if (!isObject(raw)) return null;
+  const direction = upgradeDirection(raw.direction);
+  if (!direction) return null;
+  if (typeof raw.aEntry === 'number') return { ...raw, symbol, direction } as T;
+  if (typeof raw.varEntry !== 'number' || typeof raw.rhEntry !== 'number') return null;
+  const { varEntry, rhEntry, varExit, rhExit, ...rest } = raw;
+  const upgraded: Record<string, unknown> = { ...rest, symbol, direction, aEntry: varEntry, bEntry: rhEntry, ratio: 1, aFeeBps: legacyFees.aFeeBps, bFeeBps: legacyFees.bFeeBps };
+  if (typeof varExit === 'number' && typeof rhExit === 'number') { upgraded.aExit = varExit; upgraded.bExit = rhExit; }
+  return upgraded as unknown as T;
 }

@@ -26,7 +26,7 @@
 | 资产账本 | `asset` | v0.12.0 | A-1 只读、A-2 本地写入（v0.16.0）、A-3/A-4 凭据与同步（v0.19.0）、A-5 持仓与成交（v0.54.0：持仓页，原油、海力士详情的成交标记、套利成交与关联交易）、A-6 原表导入（v0.55.0）完成，A14 不迁移 | [asset.md](asset.md) |
 | Gate CrossEx 跨所 | `crossex` | v0.35.0 | C1–C4（账户读取、两腿开平仓、撤单、持仓操作、下单终端、资金费与账单）一次发布，未实盘；机会列表与持有情景 C5 待行情监控 M-4 | [crossex.md](crossex.md) |
 | Ondo 挂单奖励 | `ondo` | v0.60.0 | 严格前方保护、账户级断线撤单、成交锁和退出。v0.63.0 支持最多 20 市场并行观察三档净 APR、触价与扫过，显示真实行情与执行延迟。实盘待账户持有人验证 | [ondo.md](ondo.md) |
-| Var / Lighter 价差回归 | `varLighter`（默认开启） | v0.80.0 | Var 对 Lighter RH 与 Lighter 主网的共有标的：价差采集与对齐、按时段基线、回测、模拟盘、下单预演与实盘前核对。只读公开行情，不下单；下单连接器待接入。推广为通用两腿 DEX 价差（Entropy、自定义配对）的方案见 [dexspread.md](dexspread.md)，未实施 | [varlighter.md](varlighter.md) |
+| DEX 价差（原 Var / Lighter 价差回归） | `varLighter`（默认开启） | v0.80.0；v0.88.0 推广为两腿 | 任意两个场所（Var、Lighter RH、Lighter 主网、Entropy）同一资产的价差：按场所组合自动配对，另可手动配对并给乘数；价差采集与对齐、按时段基线、回测、模拟盘、下单预演与实盘前核对。只读公开行情，不下单；下单连接器待接入 | [varlighter.md](varlighter.md)、[dexspread.md](dexspread.md) |
 | MEV 套利 | `mev` | v0.84.0 | V1：Base 同链 DEX 原子套利（Uniswap v3、Aerodrome Slipstream 与 v2 的两跳、三跳环路），池子闪电兑换不放本金，热钱包只放 gas；默认观察，实盘从页面开始。v0.85.0 起在页面录入热钱包私钥与收款地址、由热钱包部署执行合约即可启用（命令行方式仍支持）。未实盘 | [mev.md](mev.md) |
 | 从工作台导入 | 无 | v0.2.0 命令行、v0.3.0 页面 | 可导入配对、原油执行账户（v0.8.0）、期权账户（v0.11.0）、行情监控与资产账本（v0.15.0）、CrossEx 账户（v0.35.0）、Ondo 挂单奖励（v0.60.0） | [module-import.md](module-import.md) |
 

@@ -58,11 +58,11 @@ test('MCP：各工具经令牌读取白名单接口，应答已打码；未配�
 });
 
 // v0.83.0 的工具单独一个平台和令牌：与上面的合在一起会超过令牌每分钟 30 次。
-test('MCP：Var/Lighter、服务器状态、监控报价与快讯工具经令牌读取，未配置的写明不可用', async () => {
+test('MCP：DEX 价差、服务器状态、监控报价与快讯工具经令牌读取，未配置的写明不可用', async () => {
   const p = await platform();
   try {
     const get = platformGet({ base: new URL(p.base), token: p.token });
-    for (const [name, args] of [['varlighter', {}], ['varlighter', { view: 'symbol', symbol: 'rh:AAPL', hours: 48 }], ['host_status', {}], ['market_quotes', {}], ['market_quotes', { market: 'goldoil' }], ['news', { view: 'moves' }]] as const) {
+    for (const [name, args] of [['varlighter', {}], ['varlighter', { view: 'symbol', symbol: 'rh:AAPL', hours: 48 }], ['varlighter', { view: 'symbol', symbol: 'lighter:SOL|rh:ETH@0.05' }], ['host_status', {}], ['market_quotes', {}], ['market_quotes', { market: 'goldoil' }], ['news', { view: 'moves' }]] as const) {
       const answer = await call(get, name, args);
       assert.equal(answer.result?.isError, undefined, `${name}：${answer.result?.content[0]?.text}`);
       assert.doesNotMatch(answer.result!.content[0]!.text, /0x[0-9a-fA-F]{40}|\*\*\*1234/, name);

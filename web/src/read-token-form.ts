@@ -6,7 +6,7 @@ export const READ_SCOPES: readonly ReadScope[] = ['public', 'system', 'portfolio
 export const READ_SCOPE_TEXT: Record<ReadScope, { name: string; detail: string }> = {
   public: { name: '公开行情', detail: '行情监控报价、EQN 快讯与异动行情' },
   system: { name: '系统状态', detail: '运行状态（不含飞书消息原文与账户行情流）、服务器负载、在线更新' },
-  portfolio: { name: '账户与策略', detail: '日志、执行器、划转与 ADL、原油、海力士、金油、告警、期权、CrossEx、Ondo、Var/Lighter' },
+  portfolio: { name: '账户与策略', detail: '日志、执行器、划转与 ADL、原油、海力士、金油、告警、期权、CrossEx、Ondo、DEX 价差' },
 };
 
 export interface ReadTokenItem {

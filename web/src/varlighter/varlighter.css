@@ -55,8 +55,8 @@ a.vl-symbol:hover{color:var(--accent)}
 .vl-toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;padding:10px 14px;border-bottom:1px solid var(--surface-4)}
 .vl-toolbar label{display:inline-flex;align-items:center;gap:6px;color:var(--text-secondary);font-size:.75rem}
 .vl-toolbar .grow{flex:1}
-.vl-seg{display:inline-flex;padding:2px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);background:var(--surface-1)}
-.vl-seg button{min-height:26px;padding:0 10px;border:0;border-radius:4px;background:transparent;color:var(--text-secondary);font-size:.75rem}
+.vl-seg{display:inline-flex;flex-wrap:wrap;max-width:100%;padding:2px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);background:var(--surface-1)}
+.vl-seg button{min-height:26px;padding:0 10px;border:0;border-radius:4px;background:transparent;color:var(--text-secondary);font-size:.75rem;white-space:nowrap}
 .vl-seg button[aria-pressed=true]{background:var(--surface-4);color:var(--text-primary);font-weight:600}
 .vl-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px 18px;padding:14px}
 .vl-field{display:flex;flex-direction:column;gap:5px;min-width:0;color:var(--text-secondary);font-size:.75rem}
@@ -115,6 +115,14 @@ a.vl-symbol:hover{color:var(--accent)}
 .vl-events time{color:var(--text-tertiary);font-variant-numeric:tabular-nums}
 .vl-events b{font-weight:500;margin-right:6px}
 
+.vl-combos{list-style:none;margin:0;padding:6px 14px 10px;display:grid;gap:2px}
+.vl-combos li{display:flex;align-items:center;gap:10px;min-height:32px;border-bottom:1px solid var(--surface-4)}
+.vl-combos li:last-child{border-bottom:0}
+.vl-combos label{display:inline-flex;align-items:center;gap:8px;flex:1;min-width:0;cursor:pointer;font-size:.8125rem}
+.vl-pair-form{display:grid;grid-template-columns:repeat(2,minmax(0,2fr)) repeat(3,minmax(0,1fr));gap:14px 18px;padding:14px}
+.vl-leg{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr);gap:10px;min-width:0}
+@media (max-width:1100px){.vl-pair-form{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:650px){.vl-pair-form,.vl-leg{grid-template-columns:minmax(0,1fr)}}
 @media (max-width:1100px){.vl-columns{grid-template-columns:minmax(0,1fr)}.vl-fields{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media (max-width:650px){
   .vl-fields{grid-template-columns:minmax(0,1fr)}
@@ -125,4 +133,3 @@ a.vl-symbol:hover{color:var(--accent)}
   .vl-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
   .vl-events li{grid-template-columns:minmax(0,1fr);gap:2px}
 }
-.vl-venue-toggle{display:flex;margin-top:6px;white-space:nowrap}

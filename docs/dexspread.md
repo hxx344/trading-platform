@@ -1,6 +1,6 @@
-# DEX 价差：把 Var / Lighter 做成通用双腿价差模块（方案）
+# DEX 价差：把 Var / Lighter 做成通用双腿价差模块
 
-**状态：方案，未动代码。** 2026-11-25 起草。现有 Var / Lighter 模块的做法见 [varlighter.md](varlighter.md)，本文只写要变的部分；没提到的规则（基线、时段、开平仓、风控顺序、回测不看未来等）沿用该文。
+**状态：D1–D3 已在 v0.88.0 一次实施（回滚版本 v0.87.0），D4 未做。** 2026-11-25 起草，同日实施。第 0–9 节是原方案，**实际做法以第 10 节为准**（与方案不同处在那里写明）。现有 Var / Lighter 模块的做法见 [varlighter.md](varlighter.md)，本文只写变的部分；没提到的规则（基线、时段、开平仓、风控顺序、回测不看未来等）沿用该文。
 
 ## 0 目标与结论
 
@@ -103,7 +103,7 @@
   - 实盘准备页新增「配对管理」（手动配对的增删、乘数、备注，规格确认沿用现有）。
   - 1280 与 390 宽度走查，表格在面板内横向滚动。
 
-## 8 待用户确认
+## 8 待用户确认（已定，见第 10.7 节）
 
 1. 首版接入 Entropy 后，默认采集哪些场所组合（全部自动配对会让流量和样本量明显上升）；是否先只做 Var↔Entropy 与主网↔Entropy。
 2. 两腿都实时的配对，启用后的采样节拍（默认 15 秒）是否合适。
@@ -117,3 +117,69 @@
 - 同一场所内不同代码的配对（股票对 ETF 等）。
 - 三腿及以上组合。
 - 资金费进净盈亏（沿用现状：只估算）。
+
+## 10 实际做法（v0.88.0）
+
+D1、D2、D3 合在 v0.88.0 一次发布，回滚版本 v0.87.0；定级 R3（库结构与迁移）。与第 0–9 节不同的地方逐条写在下面。
+
+### 10.1 代码位置
+
+- 没有新建 `src/varlighter/venues/`：场所差异集中在 `model.ts`（目录解析 `parseRhMarkets`、`parseEntropyMarkets`，组合 `COMBOS`、配对 `comboPairs`、`customPairInfo`，场所名）与 `feeds.ts`（`LighterStream`、`HyperliquidStream` 同一 `LiveStream` 接口，盘口快照 `fetchDepth`、`fetchEntropyDepth`）。Var 仍是每分钟轮询加可选 token 询价，不走行情流接口。
+- 引擎（`engine.ts`）按场所各持一个运行时（行情流、目录、各腿的盘口快照）；只有被开着的组合或手动配对用到的场所才连行情流。
+- 模块身份照第 0 节不变：配置键 `varLighter`、`#/varlighter`、`/api/varlighter/*`、MCP 工具名不变；页面与左侧栏标题改为「DEX 价差」。
+
+### 10.2 配对键与方向
+
+- 新键 `场所:代码|场所:代码[@乘数]`；Entropy 的代码**去掉 `io:` 前缀**（`entropy:NVDA`，不是方案里写的 `entropy:io:NVDA`），目录里的 `io:` 名只在请求 Hyperliquid 时用。
+- 乘数 1 不写；否则写成十进制，10 位有效数字、最多 10 位小数（`formatRatio`），同一配对只有一种写法，`parsePairKey` 拒绝其他写法。两腿同场所的键拒绝。
+- 旧键 `rh:X`、`lighter:X` 在接口、只读工具、本机回测与详情页地址里都按 `var:X|rh:X`、`var:X|lighter:X` 认（`upgradeKey`）。
+- 方向 `a_rich`（卖 A 买 B）/ `a_cheap`；页面按两腿场所写成「卖 Var · 买 RH」。
+
+### 10.3 存储与迁移
+
+- 同一 `varlighter.sqlite` 新建 `leg_samples`、`leg_positions`、`leg_trades`；参数存 `state` 的 `settings2`，冷却存 `cooldown2`；旧表、旧键原样保留、不再写入。
+- 样本不复制：读取时把旧 `samples` 按 `var_* → a_*`、`rh_* → b_*` 映射，与新表按时刻合并（`legacyKeyOf` 只对 Var 对 Lighter 两场所、同代码、乘数 1 的键有旧键）。旧表照 14 天保留期清理。
+- 启动时 `migrateLegacy` 在一个事务里：持仓、成交改写键、方向与两腿字段（旧手续费 `varFeeBps`、`rhFeeBps` 记进各腿），旧参数经 `upgradeSettings` 换新键、新方向，原采集场所换成组合（原来采集 RH 的开 Var↔RH；采集主网的开 Var↔主网与主网↔Entropy；Var↔Entropy 总开），写完成标记 `legs_migrated`；失败整体回滚，下次启动重试。有内容迁移时记一条事件并写日志。
+- 回滚到 v0.87.0：照第 3.3 节，升级后的样本、成交、参数改动旧版本看不到；再次升级不重复迁移。
+
+### 10.4 自动配对、手动配对与校验
+
+- 组合六个：Var↔RH、Var↔主网、Var↔Entropy、RH↔主网、RH↔Entropy、主网↔Entropy。默认开 Var↔RH、Var↔主网、Var↔Entropy、主网↔Entropy，RH↔主网与 RH↔Entropy 不开（第 10.7 节）。组合的自动配对是两场所同代码、乘数 1，规格按原 `verified / review / mismatch` 规则；不在已核对清单里的 Entropy 配对都是 `review`。
+- 手动配对最多 100 个，存于参数的 `pairs`（`{ a, b, ratio, kind, note }`），在实盘准备页「手动配对」增删。与方案不同：**保存时不因价格差拒绝**，按标记价算 `|A ÷ (k × B) − 1|`，超过 5% 标为 `mismatch`（不能启用），其余为 `review`（确认后才能启用）。这样目录暂时缺一腿时也能先存。
+- 与开着的组合的自动配对同键时拒绝（`duplicate_pair`，提示不必手动添加）；还启用着或有持仓的手动配对不能删（`pair_busy`，409）。
+- 每个行情流场所启用（含持仓）的腿最多 10 条（`too_many`），按配对涉及的每个场所分别计。
+- 规格校验只挡**这次新启用**的配对：已启用的配对规格降回 `review` 或 `mismatch` 时由开仓前的 `eligible` 挡住，不再让无关的保存（加手动配对、改全局参数）失败。
+- 持仓冲突：同一场所同一代码只能出现在一个有持仓的配对里（`legBusy`）。
+
+### 10.5 采样节拍与统计
+
+- 含 Var 腿的配对仍跟每分钟的 Var 报价。两腿都是行情流的配对由 `sampleLive` 每 5 秒检查一次：已启用或有持仓的每 15 秒一个样本，其余每分钟一个（各留 1 秒余量）。
+- 与方案不同：没有把 `minSamples` 改成按时长、也没有在统计时重采样，而是**基线只每约一分钟收一个样本**（`LIVE_BASELINE_GAP_MS = 55 秒`），所以基线样本数、半衰期与穿越次数在不同节拍的配对之间可比；开平仓判断仍用每个样本。回测按同一规则（`bothLive` 的配对用同样的间隔）。
+
+### 10.6 Entropy
+
+- 目录：`POST /info {type:'metaAndAssetCtxs', dex:'io'}` 每分钟一次（带标记价、预言机价与资金费），要求抵押资产为 USDC（`collateralToken` 0）、跳过已下架的。精度按 `szDecimals`，价格小数位 `6 − szDecimals`，最小金额按 10 USDC。
+- 手续费：按 `deployerFeeScale` 与 `growthMode` 折算，基础 4.5 基点（同行情监控的算法）；字段不认识时为未知，该配对不开仓（实盘准备页「两腿手续费」一项提示），也可在全局参数里填手动值（四个场所各一个）。
+- 行情流：`wss://api.hyperliquid.xyz/ws` 只订阅配对用到的市场的 `bbo`；bbo 只在最优价变化时推送，所以超过 50 秒没变化（或刚连上）的市场用 WebSocket `post` 发一次 `l2Book` 确认一档，每分钟最多 60 次；每 15 秒 `ping`，45 秒没消息断开重连。
+- 盘口快照：已启用或有持仓的配对每分钟一次 `l2Book`（REST），与 Lighter 同样每个场所最多 10 条腿。
+
+### 10.7 用户确认的取舍（2026-11-25）
+
+1. 默认开 Var↔RH、Var↔主网、Var↔Entropy、主网↔Entropy；RH↔主网、RH↔Entropy 默认关，可在实盘准备页「自动配对」打开。
+2. 两腿都实时的已启用配对 15 秒一个样本。
+3. Entropy 的手动配对清单由用户在页面上添加，不预置。
+4. 回滚丢失升级后的模拟盘记录可接受。
+5. 其他场所（D4）以后再定。
+
+### 10.8 只读接口与本机工具
+
+- 应答里每行带 `a`、`b`（`{ venue, symbol, name }`，name 是场所名）、`ratio`、`custom`；原有 `venue`、`venueName` 仍给（B 腿）。
+- `samples` 应答带 `format: 2`，`columns` 换成两腿列名；`tools/varlighter/pull.ts` 遇到不是 2 的格式（平台还是 v0.87.0 以前）直接报错，不写本机文件。
+- 本机样本文件名改为整个配对键 `encodeURIComponent` 后加 `.jsonl`；v0.87.0 以前的 `<场所>_<代码>.jsonl` 不动也不再读，升级后重新拉取。
+- 本机回测按两腿手续费重放：平台当时用的费率在 `state.json` 的各配对 `aFeeBps`、`bFeeBps`，请求里的全局手续费字段可覆盖。
+
+### 10.9 验证
+
+- `pnpm check`、`pnpm build:web` 通过；测试在 CI 运行（本机 Windows 不跑）。
+- 内置浏览器用 `scripts/dev-varlighter.ts`（替身 Var、Lighter RH、主网与 Entropy 行情，含一个 RH↔主网手动配对、一个失联持仓）在 1280 与 375 宽度走查四个页签：两腿都是行情流的配对 15 秒出样本；实盘准备页添加手动配对（带乘数）、与组合同键的被拒、删除、打开 RH↔主网组合后总览即出现三对。走查中发现并修复：组合筛选在窄屏挤压换行（改为整按钮换行）、详情页刚打开就显示“有未保存的修改”（字段顺序不同，v0.80.0 起就有）、已启用但规格待确认的配对让无关的保存失败（第 10.4 节）。
+

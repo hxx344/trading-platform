@@ -1,4 +1,4 @@
-// Var/Lighter on the client machine (docs/mcp.md 8.3): tools/varlighter/pull.ts pulls the samples with the read-only
+// DEX spread (formerly Var/Lighter) on the client machine (docs/mcp.md 8.3): tools/varlighter/pull.ts pulls the samples with the read-only
 // token, tools/varlighter/backtest.ts replays them with the repository's backtest, and the MCP tool chains both.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -20,16 +20,21 @@ import { lastSampleAt, parsePullArgs, pull, sampleFile } from '../tools/varlight
 import { bindAccounts, createHarness } from './harness.ts';
 
 const T0 = Date.parse('2026-11-23T15:00:00Z');
-const KEY = 'rh:BTC';
+const KEY = 'var:BTC|rh:BTC';
+const OLD = 'var:OLD|lighter:OLD';
+const FEES = { aFeeBps: 0, bFeeBps: 0 };
 const PARAMS: SymbolParams = { ...DEFAULT_SYMBOL, enabled: true, entryBps: 15, exitBps: 2, cooldownMinutes: 0, regimes: ['all'] };
 const GLOBAL: GlobalParams = { ...DEFAULT_GLOBAL, windowHours: 2, minSamples: 30 };
 
 function sample(t: number, varMid: number, rhMid = 100): Sample {
   return {
-    symbol: KEY, t, receivedAt: t + 1_000, regime: 'all', varMark: varMid,
-    varBid0: varMid - 0.01, varAsk0: varMid + 0.01, varBid1k: varMid - 0.02, varAsk1k: varMid + 0.02, varBid100k: varMid - 0.05, varAsk100k: varMid + 0.05, varFunding: 0.1,
-    rhAt: t - 500, rhBid0: rhMid - 0.01, rhAsk0: rhMid + 0.01, rhMark: rhMid, rhIndex: rhMid, rhFunding: 0.0001,
-    rhBid1k: rhMid - 0.02, rhAsk1k: rhMid + 0.02, rhBid100k: null, rhAsk100k: null, rhBidRx: rhMid - 0.01, rhAskRx: rhMid + 0.01, varBidTk: null, varAskTk: null, varTkAt: null,
+    symbol: KEY, t, receivedAt: t + 1_000, regime: 'all', ratio: 1,
+    aAt: t, aMark: varMid, aIndex: null, aFunding: 0.1,
+    aBid0: varMid - 0.01, aAsk0: varMid + 0.01, aBid1k: varMid - 0.02, aAsk1k: varMid + 0.02, aBid100k: varMid - 0.05, aAsk100k: varMid + 0.05,
+    aBidRx: null, aAskRx: null, aBidTk: null, aAskTk: null, aTkAt: null,
+    bAt: t - 500, bMark: rhMid, bIndex: rhMid, bFunding: 0.0001,
+    bBid0: rhMid - 0.01, bAsk0: rhMid + 0.01, bBid1k: rhMid - 0.02, bAsk1k: rhMid + 0.02, bBid100k: null, bAsk100k: null,
+    bBidRx: rhMid - 0.01, bAskRx: rhMid + 0.01, bBidTk: null, bAskTk: null, bTkAt: null,
   };
 }
 /** Var spikes 45 bp over Lighter every 30 minutes and sits 20 bp over otherwise: a trade per spike. */
@@ -43,8 +48,8 @@ async function platform() {
   const holder = openVarLighter(dir, { fetchImpl: async () => Response.json({}), connect: () => { throw new Error('不连行情'); } }, () => {});
   const writer = openVarLighterStore(join(dir, 'varlighter.sqlite'));
   // The state is written by hand (the real one needs the venues' catalogs); the samples come from the real engine.
-  const state = { rows: [{ key: KEY, kind: 'crypto', name: 'Bitcoin', enabled: true, position: null }], orphans: [{ key: 'lighter:OLD' }],
-    settings: { revision: 3, global: GLOBAL, symbols: { [KEY]: PARAMS }, confirmed: [KEY], venues: ['rh'] } } as unknown as StateView;
+  const state = { rows: [{ key: KEY, kind: 'crypto', name: 'Bitcoin', enabled: true, position: null, aFeeBps: 0, bFeeBps: 0 }], orphans: [{ key: OLD }],
+    settings: { revision: 3, global: GLOBAL, symbols: { [KEY]: PARAMS }, confirmed: [KEY], combos: ['var|rh'], pairs: [] } } as unknown as StateView;
   const server = createExecutorServer({ executor: h.ex, accessToken: 'vl-local-access-01', session: 'vl-local-session-01', readTokens: createReadTokens({ dir, log: () => {} }), log: () => {},
     views: { varlighter: { ...varLighterViews(holder), state: () => state } } });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -63,7 +68,7 @@ test('本机拉样本：按页增量续拉，重拉不重复；--enabled 含已�
     const samples = oscillating(0, 2_500);
     p.writer.addSamples(samples);
     const first = await pull({ get: p.get, dir: p.local, enabled: true });
-    assert.deepEqual(first.results.map(result => [result.symbol, result.added]), [[KEY, 2_500], ['lighter:OLD', 0]], '三页拉完；失联配对一并尝试');
+    assert.deepEqual(first.results.map(result => [result.symbol, result.added]), [[KEY, 2_500], [OLD, 0]], '三页拉完；失联配对一并尝试');
     assert.equal(lastSampleAt(sampleFile(p.local, KEY)), samples.at(-1)!.t);
     assert.equal((await pull({ get: p.get, dir: p.local, symbols: [KEY] })).results[0]!.added, 0, '没有新样本');
     const more = oscillating(2_500, 10);
@@ -75,21 +80,25 @@ test('本机拉样本：按页增量续拉，重拉不重复；--enabled 含已�
     // The server gives its backtest one baseline window before `from` (engine.ts), and so does the local one.
     const all = [...samples, ...more], to = all.at(-1)!.t, from = to - 24 * 3_600_000;
     const window = all.filter(item => item.t >= from - GLOBAL.windowHours * 3_600_000);
-    const server = runBacktest(KEY, 'crypto', window, from, to, PARAMS, GLOBAL);
+    const server = runBacktest(KEY, 'crypto', window, from, to, PARAMS, GLOBAL, FEES);
     assert.ok(server.trades.length >= 20, `应有成交，实际 ${server.trades.length}`);
     const single = runLocal({ symbol: KEY, hours: 24, trades: 5 }, p.local) as { summary: unknown; trades: unknown[]; tradesShown: number; params: SymbolParams; global: GlobalParams };
     assert.deepEqual(single.summary, server.summary);
     assert.deepEqual(single.trades, server.trades.slice(-5));
     assert.deepEqual([single.params.entryBps, single.global.windowHours], [15, 2], '缺的参数用平台保存的');
     const changed = runLocal({ symbol: KEY, hours: 24, params: { entryBps: 30 } }, p.local) as { summary: unknown };
-    assert.deepEqual(changed.summary, runBacktest(KEY, 'crypto', window, from, to, { ...PARAMS, entryBps: 30 }, GLOBAL).summary);
+    assert.deepEqual(changed.summary, runBacktest(KEY, 'crypto', window, from, to, { ...PARAMS, entryBps: 30 }, GLOBAL, FEES).summary);
     const grid = runLocal({ symbol: KEY, hours: 24, grid: { entryBps: [15, 30], minNetBps: [3, 7] } }, p.local) as { combos: number; runs: { values: Record<string, number>; summary: { netUsd: number } }[] };
     assert.equal(grid.combos, 4);
     assert.ok(grid.runs.every((run, index) => index === 0 || grid.runs[index - 1]!.summary.netUsd >= run.summary.netUsd), '按净盈亏从高到低');
     const best = grid.runs[0]!;
-    assert.deepEqual(best.summary, runBacktest(KEY, 'crypto', window, from, to, { ...PARAMS, entryBps: best.values.entryBps! }, { ...GLOBAL, minNetBps: best.values.minNetBps! }).summary);
-    assert.throws(() => runLocal({ symbol: 'lighter:OLD' }, p.local), /请在请求里给出 kind/);
-    assert.throws(() => runLocal({ symbol: 'rh:NONE', kind: 'crypto' }, p.local), /先运行 tools\/varlighter\/pull\.ts/);
+    assert.deepEqual(best.summary, runBacktest(KEY, 'crypto', window, from, to, { ...PARAMS, entryBps: best.values.entryBps! }, { ...GLOBAL, minNetBps: best.values.minNetBps! }, FEES).summary);
+    assert.throws(() => runLocal({ symbol: OLD }, p.local), /请在请求里给出 kind/);
+    assert.throws(() => runLocal({ symbol: 'var:NONE|rh:NONE', kind: 'crypto' }, p.local), /先运行 tools\/varlighter\/pull\.ts/);
+    // 旧键（v0.87.0 以前的 rh:BTC）按 var:BTC|rh:BTC 读同一份本机样本；手续费按平台当时用的值，请求里可覆盖。
+    assert.deepEqual((runLocal(readRequest({ symbol: 'rh:BTC', hours: 24, trades: 5 }), p.local) as { summary: unknown }).summary, server.summary);
+    const fee = runLocal({ symbol: KEY, hours: 24, global: { rhFeeBps: 5 } }, p.local) as { summary: unknown };
+    assert.deepEqual(fee.summary, runBacktest(KEY, 'crypto', window, from, to, PARAMS, { ...GLOBAL, rhFeeBps: 5 }, { aFeeBps: 0, bFeeBps: 5 }).summary);
     assert.throws(() => runLocal({ symbol: KEY, params: { entryBps: -1 } }, p.local));
   } finally { await p.close(); }
 });
@@ -100,12 +109,12 @@ test('本机拉样本：429 按 Retry-After 等待后继续，413 把每页减�
     const waits: number[] = [], limits: string[] = [];
     let refusals = 2;
     const get: Get = async path => {
-      if (path === '/api/varlighter/state') return { rows: [], orphans: [], settings: { revision: 1, global: GLOBAL, symbols: {}, confirmed: [], venues: ['rh'] } };
+      if (path === '/api/varlighter/state') return { rows: [], orphans: [], settings: { revision: 1, global: GLOBAL, symbols: {}, confirmed: [], combos: ['var|rh'], pairs: [] } };
       if (refusals-- > 0) throw new PlatformError('429', 429, 7);
       const limit = new URL(path, 'http://x').searchParams.get('limit')!;
       limits.push(limit);
       if (Number(limit) > 250) throw new PlatformError('413', 413);
-      return { symbol: KEY, columns: ['symbol', 't'], rows: [[KEY, T0]], next: null, firstAt: T0, retentionDays: 14 };
+      return { symbol: KEY, format: 2, columns: ['symbol', 't'], rows: [[KEY, T0]], next: null, firstAt: T0, retentionDays: 14 };
     };
     const { results } = await pull({ get, dir, symbols: [KEY], sleep: async seconds => { waits.push(seconds); } });
     assert.deepEqual(waits, [7, 7]);
@@ -113,6 +122,10 @@ test('本机拉样本：429 按 Retry-After 等待后继续，413 把每页减�
     assert.equal(results[0]!.added, 1);
     await assert.rejects(pull({ get: async () => { throw new PlatformError('401', 401); }, dir, symbols: [KEY] }), /401/);
     await assert.rejects(pull({ get, dir, symbols: ['BTC'] }), /配对键无效/);
+    // 平台还是 v0.87.0 以前（样本没有 format 或为 1）：字段不同，拒绝而不是写出错的本机文件。
+    const old: Get = async path => path === '/api/varlighter/state' ? await get(path)
+      : { symbol: KEY, columns: ['symbol', 't'], rows: [[KEY, T0]], next: null, firstAt: T0, retentionDays: 14 };
+    await assert.rejects(pull({ get: old, dir, symbols: ['var:ETH|rh:ETH'] }), /样本格式是 1/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -130,7 +143,7 @@ test('本机拉样本：同一配对并发拉取不重复；中断留下的半�
     assert.deepEqual(read(), samples.map(item => item.t));
     assert.equal(existsSync(`${file}.lock`), false, '锁已释放');
 
-    appendFileSync(file, '{"symbol":"rh:BTC","t":');
+    appendFileSync(file, '{"symbol":"var:BTC|rh:BTC","t":');
     assert.equal(lastSampleAt(file), samples.at(-1)!.t, '半行被截掉');
     assert.ok(readFileSync(file, 'utf8').endsWith('\n'));
     const more = oscillating(1_500, 5);
@@ -150,8 +163,8 @@ test('本机样本：服务器已过保留期时报告空档；载入时跳过�
     writeFileSync(file, `${JSON.stringify(sample(T0, 100))}\n`);
     const later = T0 + 3 * 3_600_000;
     const get: Get = async path => path === '/api/varlighter/state'
-      ? { rows: [], orphans: [], settings: { revision: 1, global: GLOBAL, symbols: {}, confirmed: [], venues: ['rh'] } }
-      : { symbol: KEY, columns: ['symbol', 't'], rows: [[KEY, later]], next: null, firstAt: later, retentionDays: 14 };
+      ? { rows: [], orphans: [], settings: { revision: 1, global: GLOBAL, symbols: {}, confirmed: [], combos: ['var|rh'], pairs: [] } }
+      : { symbol: KEY, format: 2, columns: ['symbol', 't'], rows: [[KEY, later]], next: null, firstAt: later, retentionDays: 14 };
     const { results } = await pull({ get, dir, symbols: [KEY] });
     assert.deepEqual(results[0]!.gap, { from: T0, to: later });
     assert.equal(results[0]!.added, 1);
@@ -163,14 +176,19 @@ test('本机样本：服务器已过保留期时报告空档；载入时跳过�
     assert.deepEqual(loaded.samples.map(item => item.t), [T0, T0 + 60_000, T0 + 60_000 + GAP_MS + 1]);
     assert.equal(loaded.skipped, 2);
     assert.deepEqual(loaded.gaps, [{ from: T0 + 60_000, to: T0 + 60_000 + GAP_MS + 1 }]);
-    appendFileSync(file, '{"symbol":"rh:BTC","t":');
+    appendFileSync(file, '{"symbol":"var:BTC|rh:BTC","t":');
     assert.equal(loadSamples(file).samples.length, 3, '正在追加的半行不读');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('本机回测参数：命令行与 JSON 请求同一套校验；grid 展开全部组合', () => {
   assert.deepEqual(parseArgs(['--symbol', KEY, '--hours', '48', '--params', '{"entryBps":20}', '--trades', 'all']), { symbol: KEY, hours: 48, params: { entryBps: 20 }, trades: 'all' });
-  assert.deepEqual(parseArgs(['--request', '{"symbol":"lighter:ETH","grid":{"exitBps":[0,1]}}']), { symbol: 'lighter:ETH', grid: { exitBps: [0, 1] } });
+  assert.deepEqual(parseArgs(['--request', '{"symbol":"lighter:ETH|entropy:ETH","grid":{"exitBps":[0,1]}}']), { symbol: 'lighter:ETH|entropy:ETH', grid: { exitBps: [0, 1] } });
+  assert.equal(readRequest({ symbol: 'rh:AAPL' }).symbol, 'var:AAPL|rh:AAPL', '旧键升级');
+  assert.equal(readRequest({ symbol: 'rh:ETH|lighter:ETH@0.5' }).symbol, 'rh:ETH|lighter:ETH@0.5');
+  assert.throws(() => readRequest({ symbol: 'var:AAPL|var:AAPL' }));
+  // 本机样本文件名把配对键整体编码（含 | 与 @），旧文件 rh:BTC.jsonl 不动。
+  assert.ok(sampleFile('d', 'rh:ETH|lighter:ETH@0.5').endsWith(`${encodeURIComponent('rh:ETH|lighter:ETH@0.5')}.jsonl`));
   assert.throws(() => parseArgs(['--symbol', KEY, '--params', '{x']), /不是有效的 JSON/);
   assert.throws(() => parseArgs(['--hours']), /缺少取值/);
   assert.throws(() => readRequest({ symbol: KEY, extra: 1 }), /未知字段 extra/);
@@ -198,16 +216,16 @@ test('MCP varlighter_backtest：先增量拉取，再在新进程里用仓库代
     assert.equal(body.pulled.added, 600);
     const direct = runLocal({ symbol: KEY, hours: 8, trades: 3 }, p.local) as { summary: unknown; trades: unknown[] };
     assert.deepEqual(body.result, JSON.parse(JSON.stringify(direct)));
-    const missing = await handle({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'varlighter_backtest', arguments: { symbol: 'lighter:OLD' } } }, p.get) as { result: { content: { text: string }[]; isError?: boolean } };
+    const missing = await handle({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'varlighter_backtest', arguments: { symbol: OLD } } }, p.get) as { result: { content: { text: string }[]; isError?: boolean } };
     assert.equal(missing.result.isError, true);
     assert.match(missing.result.content[0]!.text, /给出 kind/);
     // A request the strategy rules reject is refused in the child before anything is pulled.
     const paths: string[] = [];
     const watched: Get = path => { paths.push(path); return p.get(path); };
-    const bad = await handle({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'varlighter_backtest', arguments: { symbol: 'rh:ETH', params: { entryBps: -1 } } } }, watched) as { result: { content: { text: string }[]; isError?: boolean } };
+    const bad = await handle({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'varlighter_backtest', arguments: { symbol: 'var:ETH|rh:ETH', params: { entryBps: -1 } } } }, watched) as { result: { content: { text: string }[]; isError?: boolean } };
     assert.equal(bad.result.isError, true);
     assert.deepEqual(paths, [], '不合法的请求不拉取');
-    assert.equal(existsSync(sampleFile(p.local, 'rh:ETH')), false);
+    assert.equal(existsSync(sampleFile(p.local, 'var:ETH|rh:ETH')), false);
   } finally {
     if (saved === undefined) delete process.env.TP_VARLIGHTER_DIR; else process.env.TP_VARLIGHTER_DIR = saved;
     await p.close();

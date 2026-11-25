@@ -1,4 +1,4 @@
-// Var/Lighter 价差页共用的小部件：指标卡、标记、写操作状态、价差走势图与累计盈亏图。
+// DEX 价差页共用的小部件：指标卡、标记、写操作状态、价差走势图与累计盈亏图。
 import { useCallback, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ApiError } from '../api.ts';
 import { SvgPlot, type PlotLayer } from '../svg-plot.tsx';
@@ -49,13 +49,13 @@ const SPREAD_LAYERS: PlotLayer[] = [
   { kind: 'line', key: 'upper', color: 'var(--text-tertiary)', width: 1, dash: '3 3' },
   { kind: 'line', key: 'lower', color: 'var(--text-tertiary)', width: 1, dash: '3 3' },
   { kind: 'line', key: 'median', color: 'var(--text-secondary)', width: 1.25, dash: '6 4' },
-  { kind: 'line', key: 'sellVar', color: 'var(--emerald)', width: 1, opacity: 0.75 },
-  { kind: 'line', key: 'buyVar', color: 'var(--error)', width: 1, opacity: 0.75 },
+  { kind: 'line', key: 'sellA', color: 'var(--emerald)', width: 1, opacity: 0.75 },
+  { kind: 'line', key: 'buyA', color: 'var(--error)', width: 1, opacity: 0.75 },
   { kind: 'line', key: 'mid', color: 'var(--accent)', width: 1.75, active: true },
 ];
 
 /** 价差走势：中间价基差、两个方向的可成交价差、基线中位数与入场带；开平仓画在可成交价差上。 */
-export function SpreadChart({ rows, trades, from, to, label }: { rows: readonly ChartRow[]; trades: readonly ClosedTrade[]; from: number; to: number; label: string }) {
+export function SpreadChart({ rows, trades, from, to, label, aName = 'A' }: { rows: readonly ChartRow[]; trades: readonly ClosedTrade[]; from: number; to: number; label: string; /** A 腿场所的简称 */ aName?: string }) {
   const range = useMemo(() => chartRange(rows), [rows]);
   const axis = useMemo(() => range ? niceAxis(range[0], range[1]) : null, [range]);
   const tick = useMemo(() => timeTick(to - from), [from, to]);
@@ -65,16 +65,16 @@ export function SpreadChart({ rows, trades, from, to, label }: { rows: readonly 
   return <SvgPlot rows={rows} xDomain={[from, to]} yDomain={domain} yTicks={axis.ticks} yTick={value => bps(value, 0)} xTick={tick}
     layers={SPREAD_LAYERS} margin={MARGIN} height={320} label={label}
     tooltip={row => { const item = row as ChartRow; return <div className="vl-tip"><b>{stampText(item.time)}</b>
-      <span>中间价基差</span><span>{bps(item.mid)}</span><span>卖 Var 价差</span><span>{bps(item.sellVar)}</span><span>买 Var 价差</span><span>{bps(item.buyVar)}</span>
+      <span>中间价基差</span><span>{bps(item.mid)}</span><span>卖 {aName} 价差</span><span>{bps(item.sellA)}</span><span>买 {aName} 价差</span><span>{bps(item.buyA)}</span>
       <span>基线中位数</span><span>{bps(item.median)}</span><span>入场上 / 下线</span><span>{bps(item.upper)} / {bps(item.lower)}</span></div>; }}
     overlay={scales => <g aria-hidden="true">{inside.map(trade => <g key={trade.id}>
       {trade.openedAt >= from ? <circle className="vl-marker-open" cx={scales.x(trade.openedAt)} cy={scales.y(clamp(trade.entrySpread, domain))} r={4} /> : null}
       <circle className="vl-marker-close" cx={scales.x(trade.closedAt)} cy={scales.y(clamp(trade.exitSpread, domain))} r={3.5} />
     </g>)}</g>} />;
 }
-export function SpreadLegend() {
+export function SpreadLegend({ aName = 'A' }: { aName?: string }) {
   return <div className="vl-legend">
-    <span><i className="mid" />中间价基差</span><span><i className="sell" />卖 Var 可成交价差</span><span><i className="buy" />买 Var 可成交价差</span>
+    <span><i className="mid" />中间价基差</span><span><i className="sell" />卖 {aName} 可成交价差</span><span><i className="buy" />买 {aName} 可成交价差</span>
     <span><i className="median" />基线中位数</span><span><i className="band" />入场带（中位数 ± 入场偏离）</span><span><i className="open" />开仓</span><span><i className="close" />平仓</span>
   </div>;
 }

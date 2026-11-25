@@ -57,7 +57,7 @@
 ## 已运行
 
 - `pnpm check`、`pnpm build:web`：通过。
-- 分支上手动运行的 ci：提交 b6f2ea0 只有 test (6) 失败一项，是 1000 行应答大小断言仍按旧的 400 KiB（两腿行最坏约 480 KB），已改为只读令牌应答上限的 95%，https://github.com/hxx344/trading-platform/actions/runs/45629558741 。提交 3b69a2c：（待补）。
+- 分支上手动运行的 ci：提交 b6f2ea0 只有 test (6) 失败一项，是 1000 行应答大小断言仍按旧的 400 KiB（两腿行最坏约 480 KB），已改为只读令牌应答上限的 95%，https://github.com/hxx344/trading-platform/actions/runs/45629558741 。提交 3b69a2c、e03fbc9、3f26213 全部通过：https://github.com/hxx344/trading-platform/actions/runs/45631430889 、https://github.com/hxx344/trading-platform/actions/runs/45632532649 、https://github.com/hxx344/trading-platform/actions/runs/45633292707 。之后只加本记录的 CI 链接。
 - 浏览器验证：内置浏览器 1280 与 375 宽度走查四个页签，见 [dexspread.md](../dexspread.md) 第 10.9 节。
 
 ## 未运行

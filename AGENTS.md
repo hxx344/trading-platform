@@ -18,6 +18,7 @@
 | 期权 Greeks | [docs/options.md](docs/options.md) |
 | Ondo 挂单奖励（挂单引擎、奖励市场盘口与收益模拟） | [docs/ondo.md](docs/ondo.md) |
 | Var / Lighter 价差回归（Lighter RH 与主网，采集、基线、回测、模拟盘、实盘准备） | [docs/varlighter.md](docs/varlighter.md) |
+| 通用 DEX 价差（Var/Lighter 推广为任意两腿、Entropy 等新场所、自定义配对与乘数） | [docs/dexspread.md](docs/dexspread.md)、[docs/varlighter.md](docs/varlighter.md) |
 | MEV 套利（Base 同链 DEX 原子套利：执行合约、热钱包、发送与结清、页面启用与 `--set-mev`） | [docs/mev.md](docs/mev.md) |
 | 行情监控（含海力士溢价监控与告警） | [docs/monitor.md](docs/monitor.md) |
 | EQN 快讯、行情监控「异动行情」页签 | [docs/news.md](docs/news.md) |

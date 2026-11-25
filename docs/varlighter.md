@@ -2,6 +2,8 @@
 
 Var（Variational Omni）与 Lighter 两个场所——Lighter RH（`api.rh.lighter.xyz`）与 Lighter 主网（`mainnet.zklighter.elliot.ai`）——共有标的的价差采集、基线、回测、模拟盘与实盘前准备。**目前只做模拟盘：只读公开行情，不向任何交易所下单。**
 
+推广为通用两腿价差（加入 Entropy 等场所、自定义配对）的方案见 [dexspread.md](dexspread.md)，尚未实施。
+
 ## 1 范围（v0.80.0，R2）
 
 - 新模块，只读公开接口，只写自己的 `varlighter.sqlite`；不碰执行器、划转、资金与凭据。按 [code-review.md](code-review.md) 定为 R2。

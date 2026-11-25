@@ -150,7 +150,7 @@ node tools/varlighter/backtest.ts --symbol rh:AAPL --grid '{"entryBps":[15,20,25
 
 ## 11 回退
 
-从 v0.88.0 回到 v0.87.0：旧版本只读旧表（`samples`、`paper_positions`、`paper_trades`）与旧参数键，看到的是升级那一刻的模拟持仓、成交和参数；升级后的新样本、新成交、手动配对与参数改动看不到，`samples` 从升级起是空档。只是模拟盘，可接受；回滚后建议在页面清空模拟盘。再升级时不重复迁移（`legs_migrated` 标记），回滚期间旧版本写进旧表的样本照常合并读到，但回滚期间的模拟持仓、成交不再迁过来。详见 [dexspread.md](dexspread.md) 第 3.3、10.3 节。
+从 v0.88.0 回到 v0.87.0：旧版本只读旧表（`samples`、`paper_positions`、`paper_trades`）与旧参数键，看到的是升级那一刻的模拟持仓、成交和参数；升级后的新样本、新成交、手动配对与参数改动看不到，`samples` 从升级起是空档。只是模拟盘，可接受；回滚后建议在页面清空模拟盘。再升级时不重复迁移（`legs_migrated` 标记），回滚期间旧版本写进旧表的样本照常合并读到，但回滚期间的模拟持仓、成交与参数改动不再迁过来。迁移失败时整体回滚，模块在那次运行里不可用（接口 503），下次启动重试。详见 [dexspread.md](dexspread.md) 第 3.3、10.3 节。
 
 回到 v0.79.1：页面与接口消失，`varlighter.sqlite` 保留；或保持版本、`config.json` 写 `"varLighter": false` 只停这个模块。
 

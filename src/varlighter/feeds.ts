@@ -384,6 +384,8 @@ export class HyperliquidStream implements LiveStream {
 
   /** 更新要订阅的市场；新加的立即订阅，去掉的退订（历史保留到过期）。 */
   setMarkets(markets: ReadonlyMap<number, string>): void {
+    // Entropy 的市场编号是目录里的序号：目录变动后同一编号可能换了币种，旧币种的盘口不能算到新币种上。
+    for (const [id, coin] of this.coins) if (markets.get(id) !== coin) this.top.delete(id);
     this.coins = new Map(markets);
     this.byCoin.clear();
     for (const [id, coin] of markets) this.byCoin.set(coin, id);

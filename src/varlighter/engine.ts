@@ -217,7 +217,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   /** 基线跟踪器：首次用到时从库里预热最近一个窗口的样本。窗口或最少样本改了就全部重建。 */
   function tracker(pair: PairInfo): BaselineTracker {
     let found = trackers.get(pair.key);
-    if (!found) {
+    // 手动配对删了再按同键加回、类别改了时，按新类别重建（时段划分随类别不同）。
+    if (!found || found.kind !== pair.kind) {
       found = new BaselineTracker(pair.kind, settings.global.windowHours * 3_600_000, settings.global.minSamples, bothLive(pair.key) ? LIVE_BASELINE_GAP_MS : 0);
       const time = now();
       for (const sample of store.samples(pair.key, time - settings.global.windowHours * 3_600_000, time)) found.push(sample);
@@ -228,7 +229,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
 
   /** 需要盘口快照的腿：启用的与有持仓的配对的行情流腿，每个场所最多 MAX_DEPTH_MARKETS 条。 */
   function updateDepth(): void {
-    const active = [...activeKeys()].sort();
+    // 有持仓的配对排在前面：腿数到上限时先保住持仓腿的盘口快照（平仓滑点要用）。
+    const active = [...activeKeys()].sort((x, y) => Number(positions.has(y)) - Number(positions.has(x)) || (x < y ? -1 : x > y ? 1 : 0));
     for (const runtime of live.values()) {
       const wanted = new Map<string, LegInfo>();
       for (const key of active) {
@@ -713,9 +715,10 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
         const keys = custom.map(customKey);
         const duplicate = keys.find((key, index) => keys.indexOf(key) !== index);
         if (duplicate) reject('duplicate_pair', `手动配对重复：${duplicate}`);
-        const auto = keys.find(key => { const combo = autoComboOf(key); return combo && combos.includes(combo); });
-        if (auto) reject('duplicate_pair', `${auto} 已是开启中的组合「${comboName(autoComboOf(auto)!)}」的自动配对，不必手动添加`);
       }
+      // 组合与手动配对都定下来后再查：只改组合（打开一个组合）也不能让手动配对与自动配对同键。
+      const auto = custom.map(customKey).find(key => { const combo = autoComboOf(key); return combo && combos.includes(combo); });
+      if (auto) reject('duplicate_pair', `${auto} 已是开启中的组合「${comboName(autoComboOf(auto)!)}」的自动配对，${body.pairs !== undefined ? '不必手动添加' : '先删掉这个手动配对再开组合'}`);
       // 关掉的组合或删掉的手动配对上不能还有启用的配对或模拟持仓。
       const enabled = Object.entries(symbols).filter(([, params]) => params.enabled).map(([key]) => key);
       const customKeys = new Set(custom.map(customKey));
@@ -725,7 +728,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
         if (coveredBefore(key) && !coveredAfter(key)) reject('pair_busy', `${pairTitle(key)}（${key}）还启用着或有模拟持仓，先停用并平仓再关闭它的组合或删除手动配对`, 409);
       }
       for (const venue of LIVE_VENUES) {
-        const legs = new Set(enabled.flatMap(legsOfKey).filter(leg => leg.startsWith(`${venue}:`)));
+        // 有持仓的配对也要取盘口快照，一并计入上限。
+        const legs = new Set([...new Set([...enabled, ...positions.keys()])].flatMap(legsOfKey).filter(leg => leg.startsWith(`${venue}:`)));
         if (legs.size > MAX_DEPTH_MARKETS) reject('too_many', `${VENUE_NAMES[venue]} 一侧最多同时启用 ${MAX_DEPTH_MARKETS} 个市场（每分钟取一次盘口快照）`);
       }
       for (const key of enabled) {
@@ -851,21 +855,36 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       let done = false;
       const watcher = (async () => { while (!done && !context.stopped()) await context.pause(1_000); stop.abort(); })();
       const request = () => anySignal([stop.signal], REQUEST_TIMEOUT_MS);
+      // 目录与 Var 轮询在后台跑（各自同时最多一个），不拖住行情流配对 15 秒一次的采样。
+      const busy = new Set<string>(), jobs = new Set<Promise<void>>();
+      const background = (name: string, job: () => Promise<void>) => {
+        if (busy.has(name)) return;
+        busy.add(name);
+        const promise = job().catch(error => log(`varlighter: ${name} 失败：${message(error)}`)).finally(() => { busy.delete(name); jobs.delete(promise); });
+        jobs.add(promise);
+      };
       try {
         while (!context.stopped()) {
           const time = now();
+          const used = usedVenues();
           for (const runtime of live.values()) {
-            if (time < runtime.nextCatalog) continue;
-            await refreshCatalog(request(), runtime.venue);
-            if (context.stopped()) break;
-            runtime.nextCatalog = time + (runtime.catalog.error || runtime.venue === 'entropy' ? ENTROPY_CATALOG_MS : CATALOG_MS);
+            if (time < runtime.nextCatalog || busy.has(`catalog:${runtime.venue}`)) continue;
+            // Entropy 目录带标记价与资金费，用到时每分钟取；没用到（只为手动配对选代码）时与 Lighter 一样十分钟一次。
+            runtime.nextCatalog = time + (runtime.venue === 'entropy' && used.has('entropy') ? ENTROPY_CATALOG_MS : CATALOG_MS);
+            background(`catalog:${runtime.venue}`, async () => {
+              await refreshCatalog(request(), runtime.venue);
+              if (runtime.catalog.error) runtime.nextCatalog = Math.min(runtime.nextCatalog, (runtime.catalog.at ?? now()) + ENTROPY_CATALOG_MS);
+            });
           }
-          if (time >= nextVar && [...live.values()].some(runtime => runtime.markets.length)) { nextVar = time + VAR_POLL_MS; await pollVar(request()).catch(error => { varSource.error = message(error); }); }
+          if (time >= nextVar && !busy.has('var') && [...live.values()].some(runtime => runtime.markets.length)) {
+            nextVar = time + VAR_POLL_MS;
+            background('var', () => pollVar(request()).catch(error => { varSource.error = message(error); }));
+          }
           if (time >= nextLive) { nextLive = time + LIVE_TICK_MS; try { sampleLive(); } catch (error) { log(`varlighter: 行情流配对采样失败：${message(error)}`); } }
           if (time >= nextPrune) { nextPrune = time + PRUNE_MS; try { await pruneSamples(time, () => context.stopped()); } catch (error) { log(`varlighter: 清理样本失败：${message(error)}`); } }
           await context.pause(1_000);
         }
-      } finally { done = true; running = false; syncStreams(); await watcher; }
+      } finally { done = true; running = false; syncStreams(); await watcher; await Promise.allSettled([...jobs]); }
     },
     close(): void { running = false; syncStreams(); store.close(); },
   };

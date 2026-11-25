@@ -27,14 +27,17 @@ export interface VarLighterViews {
 }
 
 export function openVarLighter(dir: string, options: VarLighterOptions, log: (line: string) => void): VarLighterHolder {
+  let store: ReturnType<typeof openVarLighterStore> | null = null;
   try {
-    const store = openVarLighterStore(join(dir, VARLIGHTER_FILE));
+    store = openVarLighterStore(join(dir, VARLIGHTER_FILE));
     const { variationalFetch, ...engineOptions } = options;
     // token 文件（行情监控保存的那一份）在数据目录里；没有文件时询价不发任何请求。
     const quoter = createVarQuoter({ dir, fetcher: variationalFetch ?? createVariationalFetch(), ...(options.now ? { now: options.now } : {}) });
     return { engine: createVarLighterEngine({ store, ...engineOptions, log, quoter }), error: null };
   } catch (error) {
     const message = error instanceof Error ? error.message.slice(0, 200) : String(error);
+    // 迁移失败（事务已回滚）等引擎建不起来时也关库，下次启动重试。
+    try { store?.close(); } catch { /* 已关闭 */ }
     log(`varlighter: 打不开 ${VARLIGHTER_FILE}，模块停用：${message}`);
     return { engine: null, error: message };
   }

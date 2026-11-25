@@ -21,6 +21,7 @@ import { CONNECT_TIMEOUT_MS, DEPTH_MAX_GAP_MS, HyperliquidStream, LighterStream,
 import { orderPlan } from '../src/varlighter/plan.ts';
 import { MIGRATED_KEY, openVarLighterStore } from '../src/varlighter/store.ts';
 import { COOLDOWN_KEY, LEGACY_UPGRADE, SETTINGS_KEY, createVarLighterEngine, customKey, downsample, readCustomPair, upgradeSettings } from '../src/varlighter/engine.ts';
+import { READ_TOKEN_MAX_BYTES } from '../src/read-token.ts';
 import { openVarLighter, varLighterLoop, varLighterViews } from '../src/service/varlighter.ts';
 
 const T0 = Date.parse('2026-11-23T15:00:00Z'); // 周一纽约 10:00（盘中）
@@ -1182,26 +1183,31 @@ test('手动配对：添加、重复与自动配对重复、数量上限；启�
     assert.equal(row('var:SNDK|entropy:SNDK')?.identity, 'verified', '默认组合里的 Var 对 Entropy 自动配对');
     assert.deepEqual(code(() => engine.views.settings({ revision: 1, pairs: [P, { ...P, ratio: 0.1370000000001 }] })), [400, 'duplicate_pair'], '乘数规整后相同算重复');
     assert.deepEqual(code(() => engine.views.settings({ revision: 1, pairs: [P, { a: { venue: 'var', symbol: 'SNDK' }, b: { venue: 'entropy', symbol: 'SNDK' } }] })), [400, 'duplicate_pair'], '开着的组合已自动配对的不必手动加');
-    assert.deepEqual(code(() => engine.views.settings({ revision: 1, pairs: Array.from({ length: 101 }, () => P) })), [400, 'too_many']);
-    assert.deepEqual(code(() => engine.views.settings({ revision: 1, pairs: [{ ...P, ratio: 0 }] })), [400, 'invalid_params']);
-    assert.deepEqual(code(() => engine.views.settings({ revision: 1, symbols: { 'var:SNDK|rh:SNDK': { enabled: true } } })), [400, 'unknown_symbol'], 'RH 目录里没有 SNDK');
-    assert.deepEqual(code(() => engine.views.settings({ revision: 1, symbols: { [P_KEY]: { enabled: true } } })), [400, 'unconfirmed']);
-    assert.equal(engine.views.settings({ revision: 1, confirmed: [P_KEY], symbols: { [P_KEY]: { enabled: true } } }).revision, 2);
+    // 只开组合也查重：手动配对 RH↔主网 BTC 存在时不能打开 RH↔主网组合。
+    const R = { a: { venue: 'rh', symbol: 'BTC' }, b: { venue: 'lighter', symbol: 'BTC' } };
+    assert.equal(engine.views.settings({ revision: 1, pairs: [P, R] }).revision, 2);
+    assert.deepEqual(code(() => engine.views.settings({ revision: 2, combos: [...engine.views.state().settings.combos, 'rh|lighter'] })), [400, 'duplicate_pair'], '只改组合也不能与手动配对同键');
+    assert.equal(engine.views.settings({ revision: 2, pairs: [P] }).revision, 3);
+    assert.deepEqual(code(() => engine.views.settings({ revision: 3, pairs: Array.from({ length: 101 }, () => P) })), [400, 'too_many']);
+    assert.deepEqual(code(() => engine.views.settings({ revision: 3, pairs: [{ ...P, ratio: 0 }] })), [400, 'invalid_params']);
+    assert.deepEqual(code(() => engine.views.settings({ revision: 3, symbols: { 'var:SNDK|rh:SNDK': { enabled: true } } })), [400, 'unknown_symbol'], 'RH 目录里没有 SNDK');
+    assert.deepEqual(code(() => engine.views.settings({ revision: 3, symbols: { [P_KEY]: { enabled: true } } })), [400, 'unconfirmed']);
+    assert.equal(engine.views.settings({ revision: 3, confirmed: [P_KEY], symbols: { [P_KEY]: { enabled: true } } }).revision, 4);
     assert.equal(row(P_KEY)!.eligible, true);
     // 乘数 1 的同一对两边标记价差七倍多：规格不同，不能启用。
-    assert.equal(engine.views.settings({ revision: 2, pairs: [P, M] }).revision, 3);
+    assert.equal(engine.views.settings({ revision: 4, pairs: [P, M] }).revision, 5);
     assert.equal(row(M_KEY)!.identity, 'mismatch');
-    assert.deepEqual(code(() => engine.views.settings({ revision: 3, symbols: { [M_KEY]: { enabled: true } } })), [400, 'mismatch']);
-    assert.deepEqual(code(() => engine.views.settings({ revision: 3, pairs: [M] })), [409, 'pair_busy'], '启用中的手动配对不能删');
+    assert.deepEqual(code(() => engine.views.settings({ revision: 5, symbols: { [M_KEY]: { enabled: true } } })), [400, 'mismatch']);
+    assert.deepEqual(code(() => engine.views.settings({ revision: 5, pairs: [M] })), [409, 'pair_busy'], '启用中的手动配对不能删');
     // 已启用的配对撤销确认：保存照常，开仓由 eligible 挡住。
-    assert.equal(engine.views.settings({ revision: 3, confirmed: [] }).revision, 4);
+    assert.equal(engine.views.settings({ revision: 5, confirmed: [] }).revision, 6);
     assert.deepEqual([row(P_KEY)!.identity, row(P_KEY)!.eligible], ['review', false]);
     // 目录价格变了，已启用的手动配对改判规格不同：无关的保存不被它卡住。
     oaiMark = '1000';
     await engine.refreshCatalog(AbortSignal.timeout(1000), 'entropy');
     assert.equal(row(P_KEY)!.identity, 'mismatch');
-    const saved = engine.views.settings({ revision: 4, global: { minNetBps: 4 } });
-    assert.deepEqual([saved.revision, saved.global.minNetBps, saved.symbols[P_KEY].enabled], [5, 4, true]);
+    const saved = engine.views.settings({ revision: 6, global: { minNetBps: 4 } });
+    assert.deepEqual([saved.revision, saved.global.minNetBps, saved.symbols[P_KEY].enabled], [7, 4, true]);
     assert.deepEqual([row(P_KEY)!.identity, row(P_KEY)!.eligible], ['mismatch', false]);
   } finally { dispose(); }
 });
@@ -1301,13 +1307,14 @@ test('接口：未登录 401、POST 缺页面标记 403、只读令牌不能读�
     for (const query of ['symbol=BTC', `symbol=${KEY}&limit=0`, `symbol=${KEY}&limit=1001`, `symbol=${KEY}&after=-1`, `symbol=${KEY}&after=1.5`]) {
       assert.equal((await get(`/api/varlighter/samples?${query}`)).status, 400, query);
     }
-    // A full page of long-decimal prices stays well inside the token's 512 KiB answer limit.
+    // A full page of long-decimal prices stays inside the token's 512 KiB answer limit (READ_TOKEN_MAX_BYTES) with 5 % to spare.
+    // Two legs make a row ~35 columns (v0.88.0): this worst case is ~480 KB; real prices have fewer digits, and pull.ts halves limit on 413.
     writer.addSamples(Array.from({ length: 1000 }, (_, index) => sample(T0 + index * 60_000, 104523.123456789, 104520.987654321, { symbol: 'var:ETH|lighter:ETH',
       aBid100k: 104523.0712345, aAsk100k: 104523.1912345, bBid100k: 104520.9112345, bAsk100k: 104521.0612345, aBidTk: 104523.1012345, aAskTk: 104523.1512345, aTkAt: T0 + index * 60_000 - 1234 })));
     const full = await get(`/api/varlighter/samples?symbol=${encodeURIComponent('var:ETH|lighter:ETH')}`, bearer);
     assert.equal(full.status, 200);
     const fullBytes = (await full.arrayBuffer()).byteLength;
-    assert.ok(fullBytes < 400 * 1024, `1000 行 ${fullBytes} 字节`);
+    assert.ok(fullBytes < READ_TOKEN_MAX_BYTES * 0.95, `1000 行 ${fullBytes} 字节`);
     writer.close();
     views.varlighter = { ...varLighterViews(holder), state: () => { throw new Error('secret /path/inside'); } };
     const written: string[] = [];

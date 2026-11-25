@@ -74,8 +74,6 @@ export async function varLighterLoop(holder: VarLighterHolder, context: { stoppe
   try { if (!context.stopped()) await engine.loop(context); } finally { holder.engine = null; holder.error = '服务正在停止'; engine.close(); }
 }
 
-/** POST 请求体的上限，与执行面读请求体时用的一致（参数 64 KB，其余 16 KB）。 */
-
 /**
  * 页面接口的路由表（原来在执行面 http.ts）：`path` 是 `/api/varlighter/` 之后的部分。出错按 `failure` 换成固定文案，
  * 原文只进本服务日志。

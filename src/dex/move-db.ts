@@ -64,7 +64,11 @@ function lockExisting(dir: string): DatabaseSync | null {
   closeSync(fd);
   const db = new DatabaseSync(join(dir, DB_FILE));
   try { db.exec('PRAGMA busy_timeout=0; PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT'); return db; }
-  catch (error) { db.close(); throw new Error(`目标处的库还被别的连接占用：${(error as Error).message}`); }
+  catch (error) {
+    db.close();
+    const message = (error as Error).message;
+    throw new Error(/locked|busy/i.test(message) ? `目标处的库还被别的连接占用：${message}` : `目标处原有的库无法打开或加锁（损坏的库请先手工移走）：${message}`);
+  }
 }
 
 const temporary = (dir: string) => join(dir, `.${DB_FILE}.${randomBytes(6).toString('hex')}.tmp`);
@@ -191,7 +195,7 @@ export function importDb(dir: string, input: number, stamp: string): string {
       check(copy);
       if (JSON.stringify(tableCounts(copy)) !== JSON.stringify(header.counts)) throw new Error('各表行数与源端不一致');
     } finally { copy.close(); }
-    // 锁在改名之前拿、之后放：持锁连接在关闭时把 WAL 回写进旧库，再随旧库一起成为备份。
+    // 先锁、关闭（关闭时把 WAL 回写进旧库），再改名：这只是改名前的一次检查，正常流程里此时没有别的进程会打开它。
     const lock = lockExisting(dir);
     lock?.close();
     backupExisting(dir, stamp);

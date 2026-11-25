@@ -151,8 +151,22 @@ export const BOOK_SYNC_TIMEOUT_MS = 15_000;
 /** 同一个市场两次订阅盘口之间至少隔这么久；连续重订（中间没有算出过盘口）每次翻倍，最长 BOOK_RESYNC_MAX_MS。 */
 const BOOK_RESYNC_MIN_MS = 5_000;
 const BOOK_RESYNC_MAX_MS = 60_000;
-/** 按价格合并的一侧盘口最多保留这么多档；超出说明增量没对上，重新订阅。 */
-const BOOK_MAX_LEVELS = 5_000;
+/**
+ * 一侧盘口只保留离最优价最近的这么多档。深的市场（如 Lighter RH 的 BTC）一侧本来就超过 5000 档，超出时裁掉远端，
+ * 记下裁剪边界：边界以外的增量不再收，边界以内仍是准确的。价格冲击只用到最优附近，几千档足够算出 10 万美元的冲击。
+ */
+export const BOOK_KEEP_LEVELS = 5_000;
+/** 超出保留档数这么多才裁一次，免得每条增量都排序。 */
+const BOOK_TRIM_SLACK = 1_000;
+/** 一条消息里一侧最多处理这么多档（防异常大的消息）。 */
+const BOOK_MESSAGE_LEVELS = 100_000;
+/** 只留离最优价最近的 BOOK_KEEP_LEVELS 档，返回留下的最远一档价格（新的裁剪边界）。 */
+function trimBook(levels: Map<number, number>, descending: boolean): number {
+  const kept = sortedLevels(levels, descending).slice(0, BOOK_KEEP_LEVELS);
+  levels.clear();
+  for (const [price, size] of kept) levels.set(price, size);
+  return kept.at(-1)![0];
+}
 const sortedLevels = (levels: ReadonlyMap<number, number>, descending: boolean): [number, number][] => [...levels].sort((a, b) => descending ? b[0] - a[0] : a[0] - b[0]);
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 
@@ -165,6 +179,7 @@ export interface StreamStatus {
 /** Lighter 一个市场的完整盘口：订阅回的快照加之后的增量（数量为 0 的档删除）。 */
 interface LighterBook {
   bids: Map<number, number>; asks: Map<number, number>; synced: boolean; nonce: number | null; askedAt: number; error: string | null;
+  /** 裁剪边界：买盘低于 bidFloor、卖盘高于 askCeil 的档已裁掉、不再跟踪；null 为没裁过。 */ bidFloor: number | null; askCeil: number | null;
   /** 连续重订次数（算出一次盘口清零），决定下次重订前要等多久。 */ retries: number;
   /** 被限速推迟的重订在这个时刻执行（期间盘口作废）。 */ due: number | null;
 }
@@ -268,7 +283,7 @@ export class LighterStream implements LiveStream {
     return book?.synced ? book.error : book?.error ?? '等待盘口快照';
   }
   private subscribeBook(id: number, error: string | null = null, retries = 0): void {
-    this.books.set(id, { bids: new Map(), asks: new Map(), synced: false, nonce: null, askedAt: this.now(), error, retries, due: null });
+    this.books.set(id, { bids: new Map(), asks: new Map(), synced: false, nonce: null, askedAt: this.now(), error, retries, due: null, bidFloor: null, askCeil: null });
     this.send({ type: 'subscribe', channel: `order_book/${id}` });
   }
   /**
@@ -280,7 +295,7 @@ export class LighterStream implements LiveStream {
     if (!book || !this.depthIds.has(id)) return;
     const wait = Math.min(BOOK_RESYNC_MIN_MS * 2 ** book.retries, BOOK_RESYNC_MAX_MS);
     if (this.now() - book.askedAt < wait) {
-      book.synced = false; book.bids.clear(); book.asks.clear(); book.nonce = null; book.error = reason;
+      book.synced = false; book.bids.clear(); book.asks.clear(); book.nonce = null; book.error = reason; book.bidFloor = book.askCeil = null;
       book.due ??= book.askedAt + wait;
       return;
     }
@@ -362,23 +377,27 @@ export class LighterStream implements LiveStream {
     if (!book || !value) return;
     if (snapshot) {
       if (value.code !== undefined && value.code !== 0) { this.resyncBook(id, `盘口快照无效（code ${String(value.code).slice(0, 20)}）`); return; }
-      book.bids.clear(); book.asks.clear(); book.synced = true; book.error = null; book.due = null;
+      book.bids.clear(); book.asks.clear(); book.synced = true; book.error = null; book.due = null; book.bidFloor = book.askCeil = null;
     } else {
       if (!book.synced) return;
       // begin_nonce 应等于上一条的 nonce；对不上说明漏了增量。
       if (Number.isSafeInteger(value.begin_nonce) && book.nonce !== null && value.begin_nonce !== book.nonce) { this.resyncBook(id, '盘口增量不连续，重新订阅'); return; }
     }
-    const apply = (levels: Map<number, number>, rows: unknown) => {
+    const apply = (levels: Map<number, number>, rows: unknown, outside: (price: number) => boolean) => {
       if (!Array.isArray(rows)) return;
-      for (const raw of rows.slice(0, BOOK_MAX_LEVELS)) {
+      for (const raw of rows.slice(0, BOOK_MESSAGE_LEVELS)) {
         const row = object(raw), price = decimal(row?.price), size = decimal(row?.size);
-        if (price === null || size === null || price <= 0) continue;
+        if (price === null || size === null || price <= 0 || outside(price)) continue;
         if (size <= 0) levels.delete(price); else levels.set(price, size);
       }
     };
-    apply(book.bids, value.bids); apply(book.asks, value.asks);
+    apply(book.bids, value.bids, price => book.bidFloor !== null && price < book.bidFloor);
+    apply(book.asks, value.asks, price => book.askCeil !== null && price > book.askCeil);
     book.nonce = Number.isSafeInteger(value.nonce) ? value.nonce as number : null;
-    if (book.bids.size > BOOK_MAX_LEVELS || book.asks.size > BOOK_MAX_LEVELS) this.resyncBook(id, '盘口档数异常，重新订阅');
+    if (book.bids.size > BOOK_KEEP_LEVELS + BOOK_TRIM_SLACK) book.bidFloor = trimBook(book.bids, true);
+    if (book.asks.size > BOOK_KEEP_LEVELS + BOOK_TRIM_SLACK) book.askCeil = trimBook(book.asks, false);
+    // 裁过的一侧被吃掉一半以上：价格走得远，边界外的档已经不知道，重新订阅拿完整快照。
+    if (book.bidFloor !== null && book.bids.size < BOOK_KEEP_LEVELS / 2 || book.askCeil !== null && book.asks.size < BOOK_KEEP_LEVELS / 2) this.resyncBook(id, '裁剪后的盘口变浅，重新订阅');
   }
 
   private mergeTop(item: Record<string, unknown> | null, now: number, snapshot: boolean): void {

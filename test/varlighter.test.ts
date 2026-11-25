@@ -17,7 +17,7 @@ import { pairMarkets, parsePairKey, parseRhMarkets, parseVarListings, parseVarQu
 import { BaselineTracker, RollingWindow, regimeStats, suggestedEntryBps } from '../src/varlighter/stats.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, closePosition, decide, openBlocker, openPosition, positionSpread, readGlobalParams, readSymbolParams, type GlobalParams, type Position, type SymbolParams } from '../src/varlighter/strategy.ts';
 import { backtestRequest, runBacktest } from '../src/varlighter/backtest.ts';
-import { CONNECT_TIMEOUT_MS, DEPTH_MAX_GAP_MS, HyperliquidStream, LighterStream, depthAt, depthSnapshot, vwap, type SocketLike } from '../src/varlighter/feeds.ts';
+import { BOOK_KEEP_LEVELS, CONNECT_TIMEOUT_MS, DEPTH_MAX_GAP_MS, HyperliquidStream, LighterStream, depthAt, depthSnapshot, vwap, type SocketLike } from '../src/varlighter/feeds.ts';
 import { orderPlan } from '../src/varlighter/plan.ts';
 import { MIGRATED_KEY, openVarLighterStore } from '../src/varlighter/store.ts';
 import { COOLDOWN_KEY, LEGACY_UPGRADE, SETTINGS_KEY, createVarLighterEngine, customKey, downsample, readCustomPair, upgradeSettings } from '../src/varlighter/engine.ts';
@@ -602,15 +602,21 @@ test('Lighter 盘口行情流：订阅 order_book，快照加增量（数量 0 �
     socket.sent.length = 0;
     book('update/order_book', { bids: [], asks: [], begin_nonce: 99, nonce: 100 });
     assert.deepEqual(sent(), resent, '退避清零');
-    // 盘口超过档数上限：作废，但离上次订阅不够久不会再订（每条消息都超限也一样）。
+    // 深盘口（如 RH 的 BTC 一侧超过 5000 档）：只留最近的 5000 档、不重订；裁剪边界外的增量不收，边界内照常合并。
     socket.sent.length = 0;
-    const huge = Array.from({ length: 5_000 }, (_, index) => ({ price: String(90 - index * 0.001), size: '1' }));
-    for (const nonce of [40, 42]) {
-      book('subscribed/order_book', { code: 0, bids: huge, asks: [{ price: '100.1', size: '5' }], nonce });
-      book('update/order_book', { bids: [{ price: '95', size: '1' }], asks: [], begin_nonce: nonce, nonce: nonce + 1 });
-    }
-    assert.deepEqual(sent(), [], '档数超限也受限速');
-    assert.equal(stream.depthError(1), '盘口档数异常，重新订阅');
+    const huge = Array.from({ length: 7_000 }, (_, index) => ({ price: (99 - index * 0.001).toFixed(3), size: '0.01' }));
+    book('subscribed/order_book', { code: 0, bids: huge, asks: [{ price: '100.1', size: '5' }], nonce: 40 });
+    assert.equal(stream.depth(1)?.bid, 99, '深盘口照样算出');
+    assert.equal(stream.depthError(1), null);
+    const floor = (99 - (BOOK_KEEP_LEVELS - 1) * 0.001).toFixed(3);
+    book('update/order_book', { bids: [{ price: '90', size: '2000' }, { price: floor, size: '0' }, { price: '99.5', size: '1' }], asks: [], begin_nonce: 40, nonce: 41 });
+    assert.equal(stream.depth(1)?.bid, 99.5, '边界内的增量照常合并');
+    assert.equal(stream.depth(1)?.bid100k, null, '边界外的大单不收：留下的 5000 档合计不到 10 万美元，冲击未知');
+    assert.deepEqual(sent(), [], '深盘口不重订');
+    // 裁过的一侧被吃掉一半以上：重订拿完整快照，离上次订阅不够久就推迟。
+    book('update/order_book', { bids: huge.slice(0, 3_000).map(level => ({ price: level.price, size: '0' })), asks: [], begin_nonce: 41, nonce: 42 });
+    assert.deepEqual(sent(), [], '受限速');
+    assert.equal(stream.depthError(1), '裁剪后的盘口变浅，重新订阅');
     book('subscribed/order_book', { code: 0, bids: [{ price: '99.9', size: '5' }], asks: [{ price: '100.1', size: '5' }], nonce: 50 });
     assert.equal(stream.depth(1)?.bid, 99.9, '正常快照到了就恢复');
     clock += 11_000;

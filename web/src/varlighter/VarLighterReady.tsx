@@ -210,7 +210,7 @@ function IdentityPanel({ view, onChanged }: { view: StateView; onChanged: () => 
         <td>{row.kindName}</td>
         <td><Badge tone={row.identity === 'mismatch' ? 'bad' : on ? 'ok' : 'warn'}>{row.identity === 'review' && on ? '已确认' : IDENTITY_LABELS[row.identity]}</Badge></td>
         <td className="num">{plain(row.gapBps, 0)} 基点</td>
-        <td className="wrap">{row.identity === 'mismatch' ? '两边价格相差超过 5%，可能是同名不同物或报价单位不同，不能交易' : row.custom ? '手动配对，先到两边官网核对合约说明与乘数' : '同名但不在已核对清单（未上市、小市值、可能重名，或 Entropy 不是每股合约），先到两边官网核对合约说明'}</td>
+        <td className="wrap">{row.identity === 'mismatch' ? '两边价格相差超过 5%，可能是同名不同物或报价单位不同，不能交易' : row.custom ? '手动配对，先到两边官网核对合约说明与乘数' : row.a.symbol !== row.b.symbol ? '代码别名（两边代码不同、按同一标的自动配对），先到两边官网核对计价单位' : '同名但不在已核对清单（未上市、小市值、可能重名，或 Entropy 不是每股合约），先到两边官网核对合约说明'}</td>
         <td>{row.identity === 'review' ? <button type="button" className="button secondary" disabled={write.busy !== null || (on && row.enabled)} title={on && row.enabled ? '先停用该标的再撤销' : undefined} onClick={() => toggle(row, !on)}>{on ? '撤销确认' : '确认规格相同'}</button> : null}</td>
       </tr>; })}</tbody></table></div> : <TableEmpty>所有配对的规格都已核对</TableEmpty>}
   </section>;

@@ -1425,9 +1425,17 @@ test('代码别名：主网 ANTHROPIC 与 Entropy ANTH 自动配对；升级前�
     const row = old.engine.views.state().rows.find(item => item.key === KEY)!;
     assert.deepEqual([row.custom, row.identity, row.symbol], [false, 'review', 'ANTHROPIC / ANTH'], '自动配对优先');
     assert.equal(old.engine.views.settings({ revision: 3, global: { minNetBps: 4 } }).revision, 4, '升级前就有的同键手动配对不挡无关保存');
-    assert.equal(old.engine.views.settings({ revision: 4, pairs: [] }).revision, 5, '可以删掉');
-    assert.deepEqual(code(() => old.engine.views.settings({ revision: 5, pairs: [A] })), [400, 'duplicate_pair'], '删掉后不能再按同键加回');
+    assert.equal(old.engine.views.settings({ revision: 4, combos: [] }).revision, 5, '关掉组合照常');
+    assert.deepEqual(code(() => old.engine.views.settings({ revision: 5, combos: ['lighter|entropy'] })), [400, 'duplicate_pair'], '关掉后再开组合要先删手动配对');
+    assert.equal(old.engine.views.settings({ revision: 5, combos: ['lighter|entropy'], pairs: [] }).revision, 6, '删手动配对同时开组合');
+    assert.deepEqual(code(() => old.engine.views.settings({ revision: 6, pairs: [A] })), [400, 'duplicate_pair'], '删掉后不能再按同键加回');
   } finally { old.dispose(); }
+  // 遗留手动配对已启用：删掉它由自动配对接管，不报 pair_busy。
+  const busy = seededEngine(store => store.setState(SETTINGS_KEY, { ...settings2({ [KEY]: { ...DEFAULT_SYMBOL, enabled: true } }, DEFAULT_GLOBAL, ['lighter|entropy']), confirmed: [KEY], pairs: [{ ...A, ratio: 1, kind: 'private', note: '' }] }, T0), { fetchImpl });
+  try {
+    assert.equal(busy.engine.views.settings({ revision: 3, pairs: [] }).revision, 4);
+    assert.equal(busy.engine.views.state().settings.symbols[KEY]?.enabled, true, '启用参数保留');
+  } finally { busy.dispose(); }
 });
 
 test('腿数上限：升级前留下的超额状态不挡无关保存，只挡让腿变多的保存', () => {

@@ -121,13 +121,27 @@ export const REVIEW_KINDS: Readonly<Record<string, AssetKind>> = {
   MNT: 'crypto', MON: 'crypto', MORPHO: 'crypto', NMR: 'crypto', PENGU: 'crypto', POPCAT: 'crypto', PYTH: 'crypto', QNT: 'crypto',
   RAY: 'crypto', RIVER: 'crypto', S: 'crypto', SKY: 'crypto', SPX: 'crypto', STABLE: 'crypto', STBL: 'crypto', STRK: 'crypto',
   SYRUP: 'crypto', VIRTUAL: 'crypto', WLFI: 'crypto', ZK: 'crypto', ZORA: 'crypto', WEN: 'crypto',
-  OAI: 'private', ANTH: 'private', TCNT: 'other', XIAOMI: 'other', SKHX: 'equity', DRAM: 'equity', GPRO: 'equity', IONQ: 'equity',
+  OAI: 'private', ANTH: 'private', ANTHROPIC: 'private', TCNT: 'other', XIAOMI: 'other', SKHX: 'equity', DRAM: 'equity', GPRO: 'equity', IONQ: 'equity',
 };
 /**
  * Entropy 上按「每股」计价、已与别家股票合约逐个对过规格的代码（同 src/vendor/perpetual-additional-exchanges.mjs 的 ENTROPY_EQUITIES）。
  * 其余是 Entropy 独立合约（OAI、ANTH 是市值报价：1 美元代表 10 亿美元市值），自动配对只能是「待确认」，多数要手动配对并填乘数。
  */
 export const ENTROPY_SHARES: ReadonlySet<string> = new Set(['SNDK', 'NBIS', 'GPRO', 'IONQ']);
+/**
+ * 自动配对的代码别名（docs/dexspread.md 第 10.4 节）：同一标的、同一计价单位，只是各场所代码不同。同组代码在自动配对里当作同代码，乘数 1；
+ * 这样配出的配对一律「待确认」，按标记价相差超过 5% 时仍是「规格不同」。
+ * ANTH（Entropy）与 ANTHROPIC（Lighter RH、主网）都按 10 亿股完全稀释估值报价（1 单位约 17.68 股）；Var 与 Lighter 的 ANT 是每股，不在这组。
+ */
+export const SYMBOL_ALIASES: readonly (readonly string[])[] = [['ANTHROPIC', 'ANTH']];
+const ALIAS_GROUP = new Map(SYMBOL_ALIASES.flatMap((group, index) => group.map(symbol => [symbol, index] as const)));
+/** 两个代码在自动配对里算不算同一标的：相同，或在同一别名组。 */
+export const sameSymbol = (x: string, y: string): boolean => x === y || (ALIAS_GROUP.has(x) && ALIAS_GROUP.get(x) === ALIAS_GROUP.get(y));
+/** 一个代码在自动配对里对得上的代码：自己在前，再是同组别名。 */
+const matchSymbols = (symbol: string): readonly string[] => {
+  const index = ALIAS_GROUP.get(symbol);
+  return index === undefined ? [symbol] : [symbol, ...SYMBOL_ALIASES[index].filter(item => item !== symbol)];
+};
 /** 两边标记价（按乘数折算后）相差超过这个值（基点）就认定规格不同，不配对。 */
 export const IDENTITY_MAX_GAP_BPS = 500;
 export const kindOf = (symbol: string): AssetKind => KNOWN_KINDS[symbol] ?? REVIEW_KINDS[symbol] ?? 'other';
@@ -272,19 +286,26 @@ export function autoIdentity(symbol: string, a: MarketSpec, b: MarketSpec, gapBp
   return KNOWN_KINDS[symbol] && (!entropy || ENTROPY_SHARES.has(symbol)) ? 'verified' : 'review';
 }
 const comboRank = (key: string): number => { const parsed = parsePairKey(key); return parsed ? VENUE_IDS.indexOf(parsed.a.venue) * 10 + VENUE_IDS.indexOf(parsed.b.venue) : 99; };
-/** 一个组合的自动配对：两个场所里代码相同的市场。 */
+/** 一个组合的自动配对：两个场所里代码相同（或在同一别名组，见 SYMBOL_ALIASES）的市场。 */
 export function comboPairs(combo: Combo, aMarkets: readonly MarketSpec[], bMarkets: readonly MarketSpec[]): PairInfo[] {
   const bySymbol = new Map(bMarkets.map(market => [market.symbol, market]));
   const pairs: PairInfo[] = [];
+  const [aVenue, bVenue] = comboVenues(combo);
   for (const a of aMarkets) {
-    const b = bySymbol.get(a.symbol);
-    if (!b || !LEG_SYMBOL.test(a.symbol)) continue;
-    const gapBps = gapOf(a, b, 1);
-    const [aVenue, bVenue] = comboVenues(combo);
-    pairs.push({
-      key: pairKey({ venue: aVenue, symbol: a.symbol }, { venue: bVenue, symbol: b.symbol }), a: { venue: aVenue, symbol: a.symbol, market: a }, b: { venue: bVenue, symbol: b.symbol, market: b },
-      ratio: 1, symbol: a.symbol, name: a.name || b.name, kind: kindOf(a.symbol), identity: autoIdentity(a.symbol, a, b, gapBps), gapBps, custom: false, note: '',
-    });
+    if (!LEG_SYMBOL.test(a.symbol)) continue;
+    for (const symbol of matchSymbols(a.symbol)) {
+      const b = bySymbol.get(symbol);
+      if (!b) continue;
+      const gapBps = gapOf(a, b, 1), key = pairKey({ venue: aVenue, symbol: a.symbol }, { venue: bVenue, symbol: b.symbol });
+      const alias = a.symbol !== b.symbol;
+      // 别名配对不进已核对表：价差超 5% 规格不同，否则待确认。
+      const identity: Identity = !alias ? autoIdentity(a.symbol, a, b, gapBps) : gapBps !== null && Math.abs(gapBps) > IDENTITY_MAX_GAP_BPS ? 'mismatch' : 'review';
+      const kind = kindOf(a.symbol) !== 'other' ? kindOf(a.symbol) : kindOf(b.symbol);
+      pairs.push({
+        key, a: { venue: aVenue, symbol: a.symbol, market: a }, b: { venue: bVenue, symbol: b.symbol, market: b },
+        ratio: 1, symbol: alias ? pairTitle(key) : a.symbol, name: a.name || b.name, kind, identity, gapBps, custom: false, note: '',
+      });
+    }
   }
   return pairs;
 }

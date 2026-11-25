@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { BUSY_BLOCK, COST_BLOCK, DECAYED, FALLBACK_BLOCK, FEE_BLOCK, NO_LIVE_TOP, THIN_BLOCK, closeSpread, confirmOpen, expectedNetBps, openEconomics, slippageBudgetBps } from '../src/varlighter/strategy.ts';
-import { DEFAULT_COMBOS, SAMPLE_FIELDS, comboPairs, customPairInfo, executionSample, formatRatio, hasTokenQuote, legacyKeyOf, lighterMarket, pairKey, pairTitle, parseEntropyMarkets, upgradeKey, varMarket, type MarketSpec } from '../src/varlighter/model.ts';
+import { DEFAULT_COMBOS, SAMPLE_FIELDS, comboPairs, customPairInfo, sameSymbol, executionSample, formatRatio, hasTokenQuote, legacyKeyOf, lighterMarket, pairKey, pairTitle, parseEntropyMarkets, upgradeKey, varMarket, type MarketSpec } from '../src/varlighter/model.ts';
 import type { SamplesView } from '../src/varlighter/views.ts';
 import { TOKEN_BLOCK_PAUSE_MS, TOKEN_ERROR_KEEP_MS, TOKEN_SYMBOL_PAUSE_MS, TOKEN_QUOTE_MAX_AGE_MS, createVarQuoter, parseTokenQuote, quoteQty, varInstrument, type VarQuoter } from '../src/varlighter/varquote.ts';
 import { VARIATIONAL_SESSION_FILE } from '../src/monitor/variational-session.ts';
@@ -117,6 +117,12 @@ test('Entropy 目录：只收 io: 永续、跳过下架与精度越界，费率�
   // Var 对 Entropy：已核对表里且 Entropy 一侧是每股合约的为已核对，其余待确认；顺序沿用 A 场所的目录。
   const auto = comboPairs('var|entropy', [spec('var', 'SNDK', 100.2), spec('var', 'AAPL', 200)], [spec('entropy', 'SNDK', 100.3), spec('entropy', 'AAPL', 200.1)]);
   assert.deepEqual(auto.map(pair => [pair.key, pair.identity]), [['var:SNDK|entropy:SNDK', 'verified'], ['var:AAPL|entropy:AAPL', 'review']]);
+  // 代码别名：Lighter 的 ANTHROPIC 与 Entropy 的 ANTH 同一计价，自动配成一对（乘数 1、待确认）；每股计价的 ANT 不配。
+  const alias = comboPairs('lighter|entropy', [spec('lighter', 'ANTHROPIC', 1472.5), spec('lighter', 'ANT', 83.55)], [spec('entropy', 'ANTH', 1471.4)]);
+  assert.deepEqual(alias.map(pair => [pair.key, pair.symbol, pair.ratio, pair.kind, pair.identity, pair.custom]), [['lighter:ANTHROPIC|entropy:ANTH', 'ANTHROPIC / ANTH', 1, 'private', 'review', false]]);
+  assert.equal(comboPairs('rh|entropy', [spec('rh', 'ANTHROPIC', 1000)], [spec('entropy', 'ANTH', 1471.4)])[0].identity, 'mismatch', '别名配对价差超 5% 仍为规格不同');
+  assert.deepEqual(comboPairs('lighter|entropy', [spec('lighter', 'ANTH', 1470)], [spec('entropy', 'ANTHROPIC', 1471)]).map(pair => pair.key), ['lighter:ANTH|entropy:ANTHROPIC'], '别名两个方向都认');
+  assert.ok(sameSymbol('ANTHROPIC', 'ANTH') && sameSymbol('ANTH', 'ANTHROPIC') && sameSymbol('BTC', 'BTC') && !sameSymbol('ANT', 'ANTH') && !sameSymbol('BTC', 'ETH'));
   // 手动配对按乘数折算后比较标记价。
   const custom = { a: { venue: 'var' as const, symbol: 'OPENAI' }, b: { venue: 'entropy' as const, symbol: 'OAI' }, ratio: 0.137, kind: 'private' as const, note: '' };
   const info = customPairInfo(custom, spec('var', 'OPENAI', 100), spec('entropy', 'OAI', 730));
@@ -1402,6 +1408,34 @@ test('手动配对：添加、重复与自动配对重复、数量上限；启�
     assert.deepEqual([saved.revision, saved.global.minNetBps, saved.symbols[P_KEY].enabled], [7, 4, true]);
     assert.deepEqual([row(P_KEY)!.identity, row(P_KEY)!.eligible], ['mismatch', false]);
   } finally { dispose(); }
+});
+
+test('代码别名：主网 ANTHROPIC 与 Entropy ANTH 自动配对；升级前已有的同键手动配对不挡无关保存，新加的同键手动配对拒绝', async () => {
+  const fetchImpl = async (url: string) => {
+    if (url.includes('orderBookDetails')) return Response.json({ code: 200, order_book_details: [{ symbol: 'ANTHROPIC', market_id: 193, market_type: 'perp', status: 'active', size_decimals: 3, price_decimals: 2, min_base_amount: '0.01', min_quote_amount: '10', taker_fee: '0', maker_fee: '0', mark_price: '1472.5' }] });
+    if (url.includes('hyperliquid')) return Response.json([{ universe: [{ name: 'io:ANTH', szDecimals: 2, deployerFeeScale: '1', growthMode: 'enabled' }], collateralToken: 0 }, [{ markPx: '1471.4' }]]);
+    return Response.json({ listings: [] });
+  };
+  const KEY = 'lighter:ANTHROPIC|entropy:ANTH';
+  const A = { a: { venue: 'lighter', symbol: 'ANTHROPIC' }, b: { venue: 'entropy', symbol: 'ANTH' } };
+  const old = seededEngine(store => store.setState(SETTINGS_KEY, { ...settings2({}, DEFAULT_GLOBAL, ['lighter|entropy']), pairs: [{ ...A, ratio: 1, kind: 'private', note: '' }] }, T0), { fetchImpl });
+  try {
+    await old.engine.refreshCatalog(AbortSignal.timeout(1000), 'lighter');
+    await old.engine.refreshCatalog(AbortSignal.timeout(1000), 'entropy');
+    const row = old.engine.views.state().rows.find(item => item.key === KEY)!;
+    assert.deepEqual([row.custom, row.identity, row.symbol], [false, 'review', 'ANTHROPIC / ANTH'], '自动配对优先');
+    assert.equal(old.engine.views.settings({ revision: 3, global: { minNetBps: 4 } }).revision, 4, '升级前就有的同键手动配对不挡无关保存');
+    assert.equal(old.engine.views.settings({ revision: 4, combos: [] }).revision, 5, '关掉组合照常');
+    assert.deepEqual(code(() => old.engine.views.settings({ revision: 5, combos: ['lighter|entropy'] })), [400, 'duplicate_pair'], '关掉后再开组合要先删手动配对');
+    assert.equal(old.engine.views.settings({ revision: 5, combos: ['lighter|entropy'], pairs: [] }).revision, 6, '删手动配对同时开组合');
+    assert.deepEqual(code(() => old.engine.views.settings({ revision: 6, pairs: [A] })), [400, 'duplicate_pair'], '删掉后不能再按同键加回');
+  } finally { old.dispose(); }
+  // 遗留手动配对已启用：删掉它由自动配对接管，不报 pair_busy。
+  const busy = seededEngine(store => store.setState(SETTINGS_KEY, { ...settings2({ [KEY]: { ...DEFAULT_SYMBOL, enabled: true } }, DEFAULT_GLOBAL, ['lighter|entropy']), confirmed: [KEY], pairs: [{ ...A, ratio: 1, kind: 'private', note: '' }] }, T0), { fetchImpl });
+  try {
+    assert.equal(busy.engine.views.settings({ revision: 3, pairs: [] }).revision, 4);
+    assert.equal(busy.engine.views.state().settings.symbols[KEY]?.enabled, true, '启用参数保留');
+  } finally { busy.dispose(); }
 });
 
 test('腿数上限：升级前留下的超额状态不挡无关保存，只挡让腿变多的保存', () => {

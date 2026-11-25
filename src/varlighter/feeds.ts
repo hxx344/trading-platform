@@ -158,7 +158,7 @@ const BOOK_RESYNC_MAX_MS = 60_000;
 export const BOOK_KEEP_LEVELS = 5_000;
 /** 超出保留档数这么多才裁一次，免得每条增量都排序。 */
 const BOOK_TRIM_SLACK = 1_000;
-/** 一条消息里一侧最多处理这么多档（防异常大的消息）。 */
+/** 一条消息里一侧超过这么多档就作废重订（防异常大的消息）。 */
 const BOOK_MESSAGE_LEVELS = 100_000;
 /** 只留离最优价最近的 BOOK_KEEP_LEVELS 档，返回留下的最远一档价格（新的裁剪边界）。 */
 function trimBook(levels: Map<number, number>, descending: boolean): number {
@@ -383,9 +383,11 @@ export class LighterStream implements LiveStream {
       // begin_nonce 应等于上一条的 nonce；对不上说明漏了增量。
       if (Number.isSafeInteger(value.begin_nonce) && book.nonce !== null && value.begin_nonce !== book.nonce) { this.resyncBook(id, '盘口增量不连续，重新订阅'); return; }
     }
+    // 超大的消息不截断着用（行不一定按最优排好，截掉的部分会让盘口悄悄出错）：作废并重订。
+    if ([value.bids, value.asks].some(rows => Array.isArray(rows) && rows.length > BOOK_MESSAGE_LEVELS)) { this.resyncBook(id, '盘口消息过大，重新订阅'); return; }
     const apply = (levels: Map<number, number>, rows: unknown, outside: (price: number) => boolean) => {
       if (!Array.isArray(rows)) return;
-      for (const raw of rows.slice(0, BOOK_MESSAGE_LEVELS)) {
+      for (const raw of rows) {
         const row = object(raw), price = decimal(row?.price), size = decimal(row?.size);
         if (price === null || size === null || price <= 0 || outside(price)) continue;
         if (size <= 0) levels.delete(price); else levels.set(price, size);

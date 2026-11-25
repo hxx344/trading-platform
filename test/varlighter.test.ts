@@ -609,12 +609,15 @@ test('Lighter 盘口行情流：订阅 order_book，快照加增量（数量 0 �
     assert.equal(stream.depth(1)?.bid, 99, '深盘口照样算出');
     assert.equal(stream.depthError(1), null);
     const floor = (99 - (BOOK_KEEP_LEVELS - 1) * 0.001).toFixed(3);
-    book('update/order_book', { bids: [{ price: '90', size: '2000' }, { price: floor, size: '0' }, { price: '99.5', size: '1' }], asks: [], begin_nonce: 40, nonce: 41 });
+    // 边界那一档本身照常更新与删除：改成大单后 10 万美元冲击算得出，删掉后又算不出。
+    book('update/order_book', { bids: [{ price: floor, size: '2000' }], asks: [], begin_nonce: 40, nonce: 41 });
+    assert.notEqual(stream.depth(1)?.bid100k, null, '边界档的增量照收');
+    book('update/order_book', { bids: [{ price: '90', size: '2000' }, { price: floor, size: '0' }, { price: '99.5', size: '1' }], asks: [], begin_nonce: 41, nonce: 42 });
     assert.equal(stream.depth(1)?.bid, 99.5, '边界内的增量照常合并');
     assert.equal(stream.depth(1)?.bid100k, null, '边界外的大单不收：留下的 5000 档合计不到 10 万美元，冲击未知');
     assert.deepEqual(sent(), [], '深盘口不重订');
     // 裁过的一侧被吃掉一半以上：重订拿完整快照，离上次订阅不够久就推迟。
-    book('update/order_book', { bids: huge.slice(0, 3_000).map(level => ({ price: level.price, size: '0' })), asks: [], begin_nonce: 41, nonce: 42 });
+    book('update/order_book', { bids: huge.slice(0, 3_000).map(level => ({ price: level.price, size: '0' })), asks: [], begin_nonce: 42, nonce: 43 });
     assert.deepEqual(sent(), [], '受限速');
     assert.equal(stream.depthError(1), '裁剪后的盘口变浅，重新订阅');
     book('subscribed/order_book', { code: 0, bids: [{ price: '99.9', size: '5' }], asks: [{ price: '100.1', size: '5' }], nonce: 50 });

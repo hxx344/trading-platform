@@ -19,6 +19,7 @@ import { KNOWN_KINDS, REVIEW_KINDS, pairKey, regimeOf, varHourly, type Leg, type
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL } from '../src/varlighter/strategy.ts';
 import { SETTINGS_KEY } from '../src/varlighter/engine.ts';
 import type { Settings } from '../src/varlighter/views.ts';
+import type { LiveLeg, LivePosition } from '../src/varlighter/live.ts';
 import type { SocketLike } from '../src/varlighter/feeds.ts';
 
 const { values } = parseArgs({ options: { port: { type: 'string', default: '4733' } } });
@@ -133,6 +134,14 @@ const now = Date.now();
     const result = runBacktest(key, kindOf(key.split('|')[0]!.split(':')[1]!), list, now - 3 * 86_400_000, now, params, global, { aFeeBps: 0, bFeeBps: 0 });
     for (const trade of result.trades.map(item => ({ ...item, id: `preview-${key}-${item.id}` }))) store.closePosition(trade, { at: trade.closedAt, kind: 'close', message: `（预览）${trade.reason} 净 ${trade.netUsd.toFixed(2)} 美元` }, {});
   }
+  // 实盘页的预览（docs/dexspread.md 第 13 节）：两笔已结束的实盘成交，其中一笔是单腿。不预置凭据、不预置在途持仓，预览里不会发任何订单。
+  const liveLeg = (venue: LiveLeg['venue'], symbol: string, side: LiveLeg['side'], qty: number, entry: number, exit: number): LiveLeg => ({ venue, symbol, side, qty, entryQuote: qty * entry, exitQty: qty, exitQuote: qty * exit, feesUsd: 0.02, estimated: false });
+  const liveTrade = (id: string, ago: number, a: LiveLeg, b: LiveLeg, netUsd: number, singleLeg: boolean, closeReason: string, note: string): LivePosition => ({
+    id, symbol: 'lighter:NVDA|entropy:NVDA', paperId: `paper-${id}`, direction: 'a_rich', ratio: 1, state: 'closed', step: 'settle', openedAt: now - ago, updatedAt: now - ago + 900_000, closedAt: now - ago + 900_000,
+    a, b, plan: { qty: a.qty, limit: 181.8 }, pending: null, tries: 1, retryAt: 0, closeReason, singleLeg, netUsd, note });
+  store.saveLive(liveTrade('preview-live-1', 7_200_000, liveLeg('lighter', 'NVDA', 'sell', 0.5, 182.31, 182.02), liveLeg('entropy', 'io:NVDA', 'buy', 0.5, 182.05, 182.0), 0.08, false, 'revert', ''));
+  store.saveLive(liveTrade('preview-live-2', 3_600_000, liveLeg('lighter', 'NVDA', 'sell', 0.5, 182.4, 182.46), { ...liveLeg('entropy', 'io:NVDA', 'buy', 0, 0, 0), exitQty: 0, feesUsd: 0 }, -0.05, true, 'single_leg', 'Entropy 没有成交，Lighter 已反向平掉'));
+  store.event(now - 3_600_000, 'live', 'lighter:NVDA|entropy:NVDA', '（预览）第二腿没有成交，第一腿已反向平掉，记一次单腿');
   store.close();
 }
 

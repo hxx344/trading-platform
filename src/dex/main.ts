@@ -43,6 +43,7 @@ export function startDex({ socket, stateDir, build, options = {}, log = line => 
     },
     tokenDigest: () => { const live = current(); return live ? tokenDigest(live) : null; },
     crash: () => crash,
+    alerts: () => holder.engine?.liveAlerts() ?? [],
   }, build);
   let stopped = false;
   const stopping = new AbortController();

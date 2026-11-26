@@ -7,6 +7,7 @@ import { openVarLighterStore, VARLIGHTER_FILE } from '../varlighter/store.ts';
 import { ParamsError } from '../varlighter/strategy.ts';
 import { createVarQuoter, tokenFileSource, type TokenSource } from '../varlighter/varquote.ts';
 import type { DexAccountsSource } from './keys.ts';
+import { createLiveKeysStore } from '../varlighter/livekeys.ts';
 import type { DexPageAnswer, DexPageRequest } from './protocol.ts';
 import { createVariationalFetch } from '../monitor/variational-transport.ts';
 import type { VariationalFetcher } from '../vendor/variational-market.mjs';
@@ -15,7 +16,7 @@ import type { VariationalFetcher } from '../vendor/variational-market.mjs';
  * `variationalFetch`：Var token 询价的传输（默认经 python3 传输脚本），测试里换成替身。`tokenSource`：Var token 的来源；
  * DEX 服务里是执行面推来的内存值，不给就读 `dir` 里的 token 文件（本机测试）。
  */
-export interface VarLighterOptions { fetchImpl?: FetchLike; connect?: Connect; now?: () => number; variationalFetch?: VariationalFetcher; tokenSource?: () => TokenSource; /** 实盘场所账户；不给就是没有配置。 */ accounts?: DexAccountsSource }
+export interface VarLighterOptions { liveKeys?: import('../varlighter/livekeys.ts').LiveKeysStore; traders?: import('../varlighter/engine.ts').EngineOptions['traders']; signerProblem?: () => string | null; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; variationalFetch?: VariationalFetcher; tokenSource?: () => TokenSource; /** 实盘场所账户；不给就是没有配置。 */ accounts?: DexAccountsSource }
 export interface VarLighterHolder { engine: VarLighterEngine | null; error: string | null }
 
 export interface VarLighterViews {
@@ -28,6 +29,13 @@ export interface VarLighterViews {
   settings(body: unknown): unknown;
   close(body: unknown): unknown;
   reset(body: unknown): unknown;
+  live(): unknown;
+  liveKeys(body: unknown): unknown;
+  liveKeysRemove(body: unknown): unknown;
+  liveSettings(body: unknown): unknown;
+  liveClose(body: unknown): unknown;
+  liveDismiss(body: unknown): unknown;
+  liveResume(): unknown;
   failure(error: unknown): { status: number; body: { code: string; message: string }; internal: boolean };
 }
 
@@ -38,7 +46,8 @@ export function openVarLighter(dir: string, options: VarLighterOptions, log: (li
     const { variationalFetch, tokenSource, ...engineOptions } = options;
     // 没有 token 时询价不发任何请求。
     const quoter = createVarQuoter({ source: tokenSource ?? tokenFileSource(dir), fetcher: variationalFetch ?? createVariationalFetch(), ...(options.now ? { now: options.now } : {}) });
-    return { engine: createVarLighterEngine({ store, ...engineOptions, log, quoter }), error: null };
+    // 页面录入的实盘凭据放在本服务自己的数据目录里（docs/dexspread.md 第 13 节）。
+    return { engine: createVarLighterEngine({ liveKeys: createLiveKeysStore(dir), ...engineOptions, store, log, quoter }), error: null };
   } catch (error) {
     const message = error instanceof Error ? error.message.slice(0, 200) : String(error);
     // 迁移失败（事务已回滚）等引擎建不起来时也关库，下次启动重试。
@@ -60,6 +69,13 @@ export function varLighterViews(holder: VarLighterHolder): VarLighterViews {
     settings: body => engine().views.settings(body),
     close: body => engine().views.close(body),
     reset: body => engine().views.reset(body),
+    live: () => engine().views.live(),
+    liveKeys: body => engine().views.liveKeys(body),
+    liveKeysRemove: body => engine().views.liveKeysRemove(body),
+    liveSettings: body => engine().views.liveSettings(body),
+    liveClose: body => engine().views.liveClose(body),
+    liveDismiss: body => engine().views.liveDismiss(body),
+    liveResume: () => engine().views.liveResume(),
     failure(error) {
       if (error instanceof VarLighterError) return { status: error.status, body: { code: error.code, message: error.message }, internal: false };
       if (error instanceof ParamsError) return { status: 400, body: { code: 'invalid_params', message: error.message }, internal: false };
@@ -91,6 +107,14 @@ export async function routePage(views: VarLighterViews, request: DexPageRequest,
     if (method === 'POST' && path === 'settings') return { status: 200, body: views.settings(body) };
     if (method === 'POST' && path === 'paper/close') return { status: 200, body: views.close(body) };
     if (method === 'POST' && path === 'paper/reset') return { status: 200, body: views.reset(body) };
+    if (method === 'GET' && path === 'live') return { status: 200, body: views.live() };
+    // 凭据的请求体带私钥：这里不记、不回显，出错时也只给固定文案。
+    if (method === 'POST' && path === 'live/keys') return { status: 200, body: views.liveKeys(body) };
+    if (method === 'POST' && path === 'live/keys/remove') return { status: 200, body: views.liveKeysRemove(body) };
+    if (method === 'POST' && path === 'live/settings') return { status: 200, body: views.liveSettings(body) };
+    if (method === 'POST' && path === 'live/close') return { status: 200, body: views.liveClose(body) };
+    if (method === 'POST' && path === 'live/dismiss') return { status: 200, body: views.liveDismiss(body) };
+    if (method === 'POST' && path === 'live/resume') return { status: 200, body: views.liveResume() };
   } catch (error) {
     const failure = views.failure(error);
     if (failure.internal) log(`DEX 价差接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}`);

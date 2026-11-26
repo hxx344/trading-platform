@@ -5,3 +5,7 @@ node_modules/
 dist/
 web/dist/
 __pycache__/
+# Lighter 交易签名器：由 scripts/build-lighter-signer.sh 从固定源码编译，仓库里只提交同目录的 SHA256SUMS。
+src/varlighter/signer/lighter-signer.wasm
+src/varlighter/signer/wasm_exec.js
+src/varlighter/signer/.*.tmp

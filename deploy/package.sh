@@ -13,6 +13,11 @@ trap 'rm -rf "$stage"' EXIT
 pkg="$stage/trading-platform"
 # The page is built beforehand (pnpm build:web); a package without it would fail its config check on the server.
 [[ -f "$root/web/dist/index.html" ]] || { echo "缺少 web/dist/index.html：先运行 pnpm build:web" >&2; exit 1; }
+# The Lighter signer (WASM) is compiled from pinned sources, never committed; it ships with src/ and src/varlighter/lighter-signer.ts
+# checks both files against src/varlighter/signer/SHA256SUMS before loading them.
+for signer in lighter-signer.wasm wasm_exec.js; do
+  [[ -f "$root/src/varlighter/signer/$signer" ]] || { echo "缺少 src/varlighter/signer/$signer：先运行 bash scripts/build-lighter-signer.sh" >&2; exit 1; }
+done
 mkdir -p "$pkg/deploy" "$pkg/web" "$pkg/scripts" "$out"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$pkg/"
 # The Var helpers run as `python3 -I -B <release>/scripts/variational-*.py` (src/asset/sources/variational-python.ts and

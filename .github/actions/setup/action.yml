@@ -33,3 +33,24 @@ runs:
     - if: steps.modules.outputs.cache-hit != 'true'
       shell: bash
       run: pnpm install --frozen-lockfile
+    # The Lighter signer (src/varlighter/signer/lighter-signer.wasm and wasm_exec.js) is compiled from pinned sources by
+    # scripts/build-lighter-signer.sh and never committed; the tests and deploy/package.sh need both files. The script holds
+    # the Go version and the source commit, so its hash and the committed checksums make the key. A restored cache is still
+    # checked against SHA256SUMS by the script, which then returns without compiling (and without Go).
+    - id: signer
+      shell: bash
+      run: echo "go=$(bash scripts/build-lighter-signer.sh --go-version)" >>"$GITHUB_OUTPUT"
+    - id: signer-cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          src/varlighter/signer/lighter-signer.wasm
+          src/varlighter/signer/wasm_exec.js
+        key: lighter-signer-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-lighter-signer.sh', 'src/varlighter/signer/SHA256SUMS') }}
+    - if: steps.signer-cache.outputs.cache-hit != 'true'
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ steps.signer.outputs.go }}
+        cache: false
+    - shell: bash
+      run: bash scripts/build-lighter-signer.sh

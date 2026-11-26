@@ -61,6 +61,7 @@
   "test/crossex/position-funding.test.mjs": 199,
   "test/crossex/statement-cache.test.mjs": 191,
   "test/crossex/terminal-market.test.mjs": 1239,
+  "test/dex-lighter-signer.test.ts": 3000,
   "test/execution-socket.test.ts": 818,
   "test/executor.test.ts": 3470,
   "test/four-leg-order-ack.test.ts": 956,

@@ -40,6 +40,12 @@ export function createDexLink({ socketPath, dir, notifyOnce, log, client = creat
         try { notifyOnce(`dex:${key}`, `【DEX 价差服务上次异常退出】北京时间 ${new Date(at + 8 * 3600_000).toISOString().slice(0, 19).replace('T', ' ')}，${text}。已由 systemd 重启，交易执行不受影响`); }
         catch (error) { log(`DEX 价差服务崩溃告警未能入队：${error instanceof Error ? error.message.slice(0, 160) : String(error)}`); }
       }
+      // 实盘告警（单腿暂停、停止、亏损上限）：DEX 服务没有飞书配置，由这里代发，每个 key 只发一次。
+      for (const alert of Array.isArray(status?.alerts) ? status.alerts.slice(0, 20) : []) {
+        if (typeof alert?.key !== 'string' || typeof alert.text !== 'string') continue;
+        try { notifyOnce(`dex-live:${alert.key.slice(0, 80)}`, alert.text.slice(0, 400)); }
+        catch (error) { log(`DEX 价差实盘告警未能入队：${error instanceof Error ? error.message.slice(0, 160) : String(error)}`); }
+      }
       const push = readTokenPush(dir, nextSeq());
       try {
         const answer = await client.pushToken(push);

@@ -23,7 +23,9 @@ export interface DexTokenPush { seq: number; token: string; problem: string }
 export const DEX_TOKEN_LEASE_MS = 60_000;
 export interface DexProcessStatus { rss: number; heapUsed: number; loopDelayMs: number | null }
 export interface DexCrashView { at: number; key: string; text: string }
-export interface DexStatus { build: string; instance: string; protocol: number; process: DexProcessStatus; crash: DexCrashView | null; token: string | null }
+/** 实盘告警：执行服务按 key 只发一次飞书。 */
+export interface DexAlertView { key: string; text: string }
+export interface DexStatus { build: string; instance: string; protocol: number; process: DexProcessStatus; crash: DexCrashView | null; token: string | null; /** 旧版本的 DEX 服务没有这个字段。 */ alerts?: DexAlertView[] }
 
 export class DexError extends Error {
   readonly status: number;

@@ -14,13 +14,17 @@ import { ASSET_KINDS, COMBOS, DEFAULT_COMBOS, KIND_NAMES, LEG_SYMBOL, LIVE_VENUE
   regimeOf, regimesOf, sameSymbol, sortPairs, spreadOf, upgradeKey, varHourly, varMarket, varQuoteQty,
   type AssetKind, type Combo, type CustomPair, type Leg, type LegInfo, type LiveVenue, type MarketSpec, type PairInfo, type Sample, type SizeBucket, type VarListing, type VenueId } from './model.ts';
 import { orderPlan, type OrderPlan } from './plan.ts';
+import { LiveError, createLiveTrader, type LiveTrader } from './live.ts';
+import { LiveKeysError, type LiveKeys, type LiveKeysStore } from './livekeys.ts';
+import { createLighterSigner, lighterSignerProblem, type LighterSigner } from './lighter-signer.ts';
+import { createEntropyTrader, createLighterTrader, type VenueTrader } from './orders.ts';
 import { BaselineTracker, LIVE_BASELINE_GAP_MS, suggestedEntryBps, symbolStats, type Baseline, type RegimeStats } from './stats.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, DIRECTIONS, ParamsError, closePosition, closeSpread, confirmOpen, decide, openEconomics, slippageBudgetBps, fundingEstimate, legFeeBps,
   markToMarket, openBlocker, openPosition, readGlobalParams, readSymbolParams, recommendParams, upgradeDirection, upgradeGlobal,
   CLOSE_REASON_NAMES, DIRECTION_NAMES, type ClosedTrade, type GlobalParams, type LegFees, type Position, type SymbolParams } from './strategy.ts';
 import { COOLDOWN_KEY, SAMPLE_RETENTION_DAYS, SETTINGS_KEY, type LegacyUpgrade, type VarLighterStore } from './store.ts';
 import type { AutoView, BacktestView, CatalogEntry, DepthStatus, LegRef, LiveStats, OrphanRow, PushStats, PaperView, PollStats, PositionMark, ReadinessItem, ReadinessView, SamplesView, Settings, SourceState, StateRow, StateView,
-  SymbolPoint, SymbolView, VenueStatus } from './views.ts';
+  SymbolPoint, SymbolView, VenueStatus, LiveView } from './views.ts';
 
 export const VAR_POLL_MS = 60_000;
 export const CATALOG_MS = 10 * 60_000;
@@ -74,7 +78,12 @@ export { COOLDOWN_KEY, SETTINGS_KEY };
 export const EXITS_KEY = 'autoExits';
 type ExitRules = { id: string; exitBps: number; stopBps: number; maxHoldMinutes: number };
 
-export interface EngineOptions { store: VarLighterStore; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; log?: (line: string) => void; /** Var token 询价；不给就只用公开报价。 */ quoter?: VarQuoter; /** 实盘场所账户（docs/dexspread.md 第 12 节）；不给就是没有配置。 */ accounts?: DexAccountsSource }
+export interface EngineOptions { store: VarLighterStore; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; log?: (line: string) => void; /** Var token 询价；不给就只用公开报价。 */ quoter?: VarQuoter; /** 实盘场所账户（docs/dexspread.md 第 12 节）；不给就是没有配置。 */ accounts?: DexAccountsSource;
+  /** 页面录入的实盘凭据（第 13 节）；不给就没有实盘。 */ liveKeys?: LiveKeysStore;
+  /** 下单连接器（测试里换成替身）。 */ traders?: (venue: KeyVenue, keys: LiveKeys) => VenueTrader;
+  /** Lighter 签名器缺什么（测试里换成 null）。 */ signerProblem?: () => string | null }
+/** Lighter 两条链的 chainId（签名用）。 */
+export const LIGHTER_CHAIN_ID = { lighter: 304, rh: 466324 } as const;
 
 const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const dayStart = (time: number) => Math.floor(time / 86_400_000) * 86_400_000;
@@ -147,7 +156,14 @@ interface VenueRuntime {
 }
 interface DepthEntry { leg: LegInfo; snapshot: DepthSnapshot | null; error: string | null }
 
-export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now = Date.now, log = () => {}, quoter, accounts: accountSource = () => ({ accounts: {}, problem: null }) }: EngineOptions) {
+export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now = Date.now, log = () => {}, quoter, accounts: envAccounts = () => ({ accounts: {}, problem: null }), liveKeys, traders, signerProblem = lighterSignerProblem }: EngineOptions) {
+  /** 账户标识的来源：页面录入的凭据优先，没录的场所用安装时录入的账户（keys.env）。页面凭据文件读不懂时按有问题处理。 */
+  const accountSource: DexAccountsSource = () => {
+    const base = envAccounts(), page = liveKeys?.accounts() ?? {}, pageProblem = liveKeys?.read().problem ?? null;
+    if (pageProblem) return { accounts: {}, problem: pageProblem };
+    if (!Object.keys(page).length) return base;
+    return { accounts: { ...(base.problem ? {} : base.accounts), ...page }, problem: null };
+  };
   /** 各场所账户最近一次读取：成功时 at 与 snapshot 一起更新；失败只记 error，旧快照留着但过了时限不算数。 */
   const accountReads = new Map<KeyVenue, { at: number | null; snapshot: AccountSnapshot | null; error: string | null }>();
   /** 各场所并行读、各用各的时限：一个场所不应答不拖累另外两个，也不让它们带着已中止的信号发出去。 */
@@ -198,6 +214,79 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   // 持仓与成交已各自落盘；这份记录写不进去时只记日志，该仓退回按当前参数平仓。
   const saveExits = () => { try { store.setState(EXITS_KEY, Object.fromEntries(exits), now()); } catch (error) { log(`varlighter: 自动配置的平仓规则保存失败：${message(error)}`); } };
   for (const symbol of positions.keys()) { const sample = store.latest(symbol); if (sample) latest.set(symbol, sample); }
+
+  // ---- 实盘（docs/dexspread.md 第 13 节） ----
+  const liveStop = new AbortController();
+  let nextAccounts = 0;
+  const traderCache = new Map<KeyVenue, { id: string; trader: VenueTrader }>();
+  function traderFor(venue: KeyVenue, keys: LiveKeys): VenueTrader {
+    if (traders) return traders(venue, keys);
+    const id = JSON.stringify(keys[venue]), hit = traderCache.get(venue);
+    if (hit && hit.id === id) return hit.trader;
+    let trader: VenueTrader;
+    if (venue === 'entropy') trader = createEntropyTrader({ key: keys.entropy!, fetchImpl, now });
+    else {
+      const key = keys[venue]!;
+      let signer: Promise<LighterSigner> | null = null;
+      // 签名器建一次；建失败时下次下单再试。
+      const signerOf = () => signer ??= createLighterSigner({ chainId: LIGHTER_CHAIN_ID[venue], privateKey: key.privateKey, apiKeyIndex: key.apiKeyIndex, accountIndex: key.accountIndex }).catch(error => { signer = null; throw error; });
+      trader = createLighterTrader({ venue, key, fetchImpl, now, signer: signerOf });
+    }
+    traderCache.set(venue, { id, trader });
+    return trader;
+  }
+  const liveTrader: LiveTrader | null = liveKeys ? createLiveTrader({
+    store, keys: liveKeys, now, log, trader: traderFor,
+    venueProblem: venue => venue === 'entropy' ? null : signerProblem(),
+    pairOf: key => pairsByKey.get(key),
+    quote: leg => { const top = isLive(leg.venue) ? live.get(leg.venue)!.stream?.topAt(leg.market.id, now()) ?? null : null; return top && top.bid > 0 && top.ask > 0 ? { bid: top.bid, ask: top.ask } : null; },
+    takerFeeBps: leg => legFeeBps(settings.global, leg.venue, leg.market.takerFeeBps) ?? 0,
+    account: venue => { const read = accountReads.get(venue); return read && read.at !== null && read.snapshot ? { at: read.at, snapshot: read.snapshot } : null; },
+    readAccount: (venue, signal) => fetchAccount(fetchImpl, signal, venue, accountSource().accounts),
+    hasPaper: (key, paperId) => positions.get(key)?.id === paperId,
+    signalFor: () => anySignal([liveStop.signal], REQUEST_TIMEOUT_MS),
+    stopped: () => liveStop.signal.aborted,
+  }) : null;
+  const liveOf = (): LiveTrader => liveTrader ?? reject('unavailable', '这个服务没有开启实盘', 503);
+  const liveFailure = (error: unknown): never => {
+    if (error instanceof LiveError) return reject(error.code, error.message, error.status);
+    if (error instanceof LiveKeysError) return reject('invalid_keys', error.message);
+    throw error;
+  };
+  const venueOf = (body: unknown): KeyVenue => isObject(body) && typeof body.venue === 'string' && (KEY_VENUES as readonly string[]).includes(body.venue) ? body.venue as KeyVenue : reject('invalid_body', '场所无效');
+  function liveView(): LiveView {
+    const trader = liveOf(), read = liveKeys!.read();
+    return {
+      ...trader.view(), keys: liveKeys!.view(), keysProblem: read.problem, signerProblem: signerProblem(), venueNames: VENUE_NAMES,
+      // 能开实盘的配对：两腿都是下单场所。
+      candidates: pairs.filter(pair => pair.a.venue !== 'var' && pair.b.venue !== 'var').map(pair => ({ key: pair.key, symbol: pair.symbol, a: legRef(pair.a), b: legRef(pair.b), paper: paramsOf(pair.key).enabled })),
+      events: store.events(200).filter(item => item.kind === 'live').slice(0, 40),
+    };
+  }
+  /** 录入一个场所的凭据：请求体是 { venue, ...该场所的字段 }。应答只说哪些场所已配置。 */
+  function setLiveKeys(body: unknown) {
+    liveOf();
+    const venue = venueOf(body), { venue: _venue, ...fields } = body as Record<string, unknown>;
+    void _venue;
+    try { liveKeys!.set(venue, fields); } catch (error) { return liveFailure(error); }
+    traderCache.delete(venue);
+    nextAccounts = 0;
+    store.event(now(), 'live', null, `已录入 ${VENUE_NAMES[venue]} 的实盘凭据`);
+    return { keys: liveKeys!.view() };
+  }
+  function removeLiveKeys(body: unknown) {
+    const trader = liveOf(), venue = venueOf(body);
+    if (trader.venueInUse(venue)) return reject('busy', `${VENUE_NAMES[venue]} 还有实盘持仓，平掉后才能移除凭据`, 409);
+    try { liveKeys!.remove(venue); } catch (error) { return liveFailure(error); }
+    traderCache.delete(venue);
+    store.event(now(), 'live', null, `已移除 ${VENUE_NAMES[venue]} 的实盘凭据`);
+    return { keys: liveKeys!.view() };
+  }
+  const liveCall = <T>(work: (trader: LiveTrader) => T): T => { const trader = liveOf(); try { return work(trader); } catch (error) { return liveFailure(error); } };
+  const liveSettings = (body: unknown) => liveCall(trader => trader.update(body, key => pairsByKey.has(key) || parsePairKey(key) !== null));
+  const liveClose = (body: unknown) => liveCall(trader => trader.close(body));
+  const liveDismiss = (body: unknown) => liveCall(trader => trader.dismiss(body));
+  const liveResume = () => liveCall(trader => trader.resume());
 
   function normalizeSettings(saved: Settings | null): Settings {
     if (!saved) return DEFAULT_SETTINGS;
@@ -606,6 +695,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       positions.set(pair.key, opened);
       if (autoRules) { exits.set(pair.key, autoRules); saveExits(); }
       updateDepth();
+      // 实盘跟单：出错只记日志，不影响模拟盘。
+      try { liveTrader?.onPaperOpen(pair, opened, sample); } catch (error) { log(`varlighter: 实盘跟随开仓失败：${message(error)}`); }
     };
   }
 
@@ -618,6 +709,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     cooldown = nextCooldown;
     updateDepth();
     dropExits(position.symbol);
+    try { liveTrader?.onPaperClose(position.symbol, reason); } catch (error) { log(`varlighter: 实盘跟随平仓失败：${message(error)}`); }
     return trade;
   }
 
@@ -1005,7 +1097,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     const stale = depth.filter(item => item.at === null || time - item.at > DEPTH_STALE_MS || item.error !== null);
     items.push({ key: 'depth', status: depth.length && !stale.length ? 'ok' : 'warn', label: '盘口（行情流）', detail: depth.length ? `${depth.length - stale.length}/${depth.length} 条腿的盘口已同步${stale.length ? `；缺：${stale.map(item => `${item.key}${item.error ? `（${item.error}）` : ''}`).join('、')}` : ''}` : '没有启用配对，未订阅盘口' });
     const totals = store.totals();
-    items.push({ key: 'paper', status: totals.trades >= READY_PAPER_TRADES && totals.netUsd > 0 ? 'ok' : 'warn', label: `模拟盘至少 ${READY_PAPER_TRADES} 笔且净盈利`, detail: `${totals.trades} 笔，净 ${fmt(totals.netUsd, 2)} 美元，胜率 ${totals.trades ? fmt(totals.wins / totals.trades * 100, 0) : '-'}%` });
+    items.push({ key: 'paper', status: totals.trades >= READY_PAPER_TRADES && totals.netUsd > 0 ? 'ok' : 'warn', label: `模拟盘至少 ${READY_PAPER_TRADES} 笔且净盈利`, detail: `${totals.trades} 笔，净 ${fmt(totals.netUsd, 2)} 美元，胜率 ${totals.trades ? fmt(totals.wins / totals.trades * 100, 0) : '-'}%；仅供参考，不拦实盘` });
     const enabledVar = enabled.some(row => row.a.venue === 'var' || row.b.venue === 'var');
     if (enabledVar || !enabled.length) {
       const age = view.sources.var.quoteAgeMedianMs;
@@ -1030,9 +1122,17 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     // 录入了但读不到（编号填错、账户不存在、接口不通）不算就绪：最近一次读取失败且没有时限内的读数。
     const unread = have.filter(venue => { const read = accountReads.get(venue); return !!read?.error && !(read.at !== null && time - read.at <= ACCOUNT_STALE_MS); });
     items.push({ key: 'accounts', status: keys.problem ? 'warn' : !have.length ? 'todo' : missing.length || unread.length ? 'warn' : 'ok', label: '场所账户',
-      detail: keys.problem ? keys.problem : !have.length ? '还没有录入：在服务器上执行 sudo bash install.sh --set-dex-keys，依次填 Lighter 主网账户编号、Lighter RH 账户编号、Entropy 账户地址（不回显，可留空）'
+      detail: keys.problem ? keys.problem : !have.length ? '还没有录入：在本页「实盘」一栏里按场所填账户与 API 私钥（只读余额的话，也可在服务器上执行 sudo bash install.sh --set-dex-keys 只录账户编号）'
         : `已录入 ${names(have)}${missing.length ? `；还缺 ${names(missing)}` : ''}${unread.length ? `；读不到 ${names(unread)}（核对录入的账户，原因见账户资金一项）` : ''}` });
-    items.push({ key: 'lighter_order', status: 'todo', label: '行情流场所的下单连接器', detail: `Lighter RH 链与主网是两套账户：各需 API 密钥编号与私钥，以及签名器；Entropy（Hyperliquid）需 API 钱包与签名；${orderVenues.length ? `已启用配对用到 ${orderVenues.join('、')}；` : ''}带 Var 腿的配对不上实盘；尚未接入` });
+    const signerIssue = liveTrader ? signerProblem() : null, keyed = liveKeys?.view() ?? null;
+    const keyedNames = keyed ? KEY_VENUES.filter(venue => keyed[venue]).map(venue => VENUE_NAMES[venue]) : [];
+    items.push({ key: 'lighter_order', status: !liveTrader ? 'todo' : signerIssue || !keyedNames.length ? 'warn' : 'ok', label: '行情流场所的下单连接器',
+      detail: !liveTrader ? '这个服务没有开启实盘下单' : `Lighter 主网、Lighter RH、Entropy 的下单已接入；${signerIssue ? `Lighter 签名器不可用（${signerIssue}），两条 Lighter 链暂时下不了单；` : ''}${keyedNames.length ? `已录入下单凭据：${keyedNames.join('、')}` : '还没有录入下单凭据（在本页「实盘」一栏录入）'}${orderVenues.length ? `；已启用配对用到 ${orderVenues.join('、')}` : ''}；带 Var 腿的配对不上实盘` });
+    if (liveTrader) {
+      const current = liveTrader.settings(), stopped = liveTrader.view().halt;
+      items.push({ key: 'live', status: current.on && current.pairs.length && !stopped ? 'ok' : 'warn', label: '实盘开关',
+        detail: stopped ? `实盘已停止：${stopped}` : !current.on ? '实盘总开关关着，不会下真实订单' : !current.pairs.length ? '总开关已开，但还没有勾选实盘配对' : `实盘跟随模拟盘信号：${current.pairs.length} 个配对，单笔 ≤ ${fmt(current.limits.perTradeUsd, 0)} 美元，同时 ≤ ${current.limits.maxOpen} 笔，当日亏损 ≤ ${fmt(current.limits.dailyLossUsd, 0)} 美元` });
+    }
     if (enabledVar || !enabled.length) items.push({ key: 'var_order', status: 'todo', label: 'Var 下单接口', detail: 'Var 没有公开交易接口；询价已可用 token 读取（各类标的的写法以实盘准备页的询价状态为准），成交接口尚未确认、尚未接入' });
     if (!have.length) items.push({ key: 'funding', status: 'todo', label: '两边账户资金', detail: `每个用到的场所各需保证金（Lighter 与 Entropy 用 USDC，Lighter RH 用 USDG）；录入场所账户后这里显示各场所的余额，每个场所可用余额至少 ${READY_FUNDING_USD} 才算就绪` });
     else {
@@ -1045,7 +1145,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       const short = needed.filter(venue => !lines.some(line => line.venue === venue && line.ok));
       items.push({ key: 'funding', status: short.length ? 'warn' : 'ok', label: '两边账户资金', detail: `${lines.map(line => line.text).join('；')}${short.length ? `；可用余额至少 ${READY_FUNDING_USD} 才算就绪，未达到：${names(short)}` : ''}` });
     }
-    items.push({ key: 'monitor', status: 'todo', label: '实盘监控与告警', detail: '单腿、持仓不一致、亏损上限触发时的飞书告警，接入下单后补上' });
+    items.push({ key: 'monitor', status: liveTrader ? 'ok' : 'todo', label: '实盘监控与告警', detail: liveTrader ? '单腿、持仓与账户对不上、当日亏损到上限、需要人工处理的持仓，经执行服务发飞书（设置页配了飞书才收得到）' : '这个服务没有开启实盘下单' });
     return { now: time, items, ready: items.every(item => item.status === 'ok'), markets: catalogs() };
   }
 
@@ -1060,7 +1160,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     /** 测试用：不跑后台循环时按参数启停各场所的行情流。 */
     startStreams(): void { running = true; syncStreams(); },
     pollVar, refreshCatalog, refreshDepth, sampleLive, refreshAccounts,
-    views: { state, symbol: symbolView, samples: samplesPage, backtest, paper, settings: updateSettings, close: closeManual, reset: resetPaper, readiness },
+    views: { state, symbol: symbolView, samples: samplesPage, backtest, paper, settings: updateSettings, close: closeManual, reset: resetPaper, readiness,
+      live: liveView, liveKeys: setLiveKeys, liveKeysRemove: removeLiveKeys, liveSettings, liveClose, liveDismiss, liveResume },
     /**
      * 后台循环：连上用到的行情流（一档、标记价、资金费与启用配对的盘口都走行情流）并在后台每 10 分钟取各场所目录，然后每分钟拉 Var 报价（连同询价），
      * 每秒检查两腿都是行情流的配对是否到期采样，每小时清理过期样本。
@@ -1068,7 +1169,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     async loop(context: { stopped(): boolean; pause(ms: number): Promise<void> }): Promise<void> {
       running = true;
       syncStreams();
-      let nextVar = now() + 5_000, nextPrune = now() + 60_000, nextLive = now() + 10_000, nextAccounts = now() + 15_000;
+      let nextVar = now() + 5_000, nextPrune = now() + 60_000, nextLive = now() + 10_000;
+      nextAccounts = now() + 15_000;
       // 停服时中断进行中的请求，不等各自的超时：pause 在停服时立即返回。
       const stop = new AbortController();
       let done = false;
@@ -1100,13 +1202,23 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
           }
           // 没有配置账户时这一轮不发任何请求。
           if (time >= nextAccounts && !busy.has('accounts')) { nextAccounts = time + ACCOUNT_POLL_MS; background('accounts', () => refreshAccounts(request)); }
+          liveTrader?.tick();
           if (time >= nextLive) { nextLive = time + LIVE_TICK_MS; try { sampleLive(); } catch (error) { log(`varlighter: 行情流配对采样失败：${message(error)}`); } }
           if (time >= nextPrune) { nextPrune = time + PRUNE_MS; try { await pruneSamples(time, () => context.stopped()); } catch (error) { log(`varlighter: 清理样本失败：${message(error)}`); } }
           await context.pause(1_000);
         }
-      } finally { done = true; running = false; syncStreams(); await watcher; await Promise.allSettled([...jobs]); }
+      } finally {
+        done = true; running = false; syncStreams();
+        // 停止时掐断在途的下单请求（结果按「不明」落库，重启后先查询再决定，不重发），等这一轮推进收尾后才关库。
+        liveStop.abort();
+        await liveTrader?.idle();
+        await watcher; await Promise.allSettled([...jobs]);
+      }
     },
-    close(): void { running = false; syncStreams(); store.close(); },
+    /** 实盘告警（经执行服务发飞书）。 */
+    liveAlerts: () => liveTrader?.alerts() ?? [],
+    live: () => liveTrader,
+    close(): void { running = false; liveStop.abort(); syncStreams(); store.close(); },
   };
 }
 export type VarLighterEngine = ReturnType<typeof createVarLighterEngine>;

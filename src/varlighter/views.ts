@@ -3,6 +3,8 @@
 import type { BacktestResult } from './backtest.ts';
 import type { AssetKind, Combo, CustomPair, Identity, LegInfo, LiveVenue, Regime, Sample, SizeBucket, VarPriceSource, VenueId } from './model.ts';
 import type { OrderPlan } from './plan.ts';
+import type { LivePosition, LiveSettings } from './live.ts';
+import type { LiveKeysView } from './livekeys.ts';
 import type { RegimeStats } from './stats.ts';
 import type { AutoParams, ClosedTrade, Direction, GlobalParams, Position, SymbolParams } from './strategy.ts';
 
@@ -116,6 +118,15 @@ export interface PaperView {
 
 /** 原始样本的一页（docs/mcp.md 第 8.3 节）：rows 每行按 columns 的顺序；next 为本页最后一条的时刻，读完为 null。format 是样本格式版本（v0.88.0 起为 2）。 */
 export interface SamplesView { symbol: string; format: number; columns: (keyof Sample)[]; rows: unknown[][]; next: number | null; firstAt: number | null; retentionDays: number }
+/** 实盘页（docs/dexspread.md 第 13 节）：设置、凭据是否已录入（不含任何凭据内容）、持仓、成交与事件。 */
+export interface LiveCandidate { key: string; symbol: string; a: LegRef; b: LegRef; /** 模拟盘是否启用了这个配对。 */ paper: boolean }
+export interface LiveView {
+  now: number; settings: LiveSettings; halt: string | null; paused: Record<string, string>;
+  lastSkip: { at: number; symbol: string; reason: string } | null;
+  positions: LivePosition[]; trades: LivePosition[]; todayNetUsd: number; totals: { trades: number; netUsd: number; wins: number };
+  keys: LiveKeysView; keysProblem: string | null; signerProblem: string | null; venueNames: Record<VenueId, string>;
+  candidates: LiveCandidate[]; events: StoredEventView[];
+}
 export interface ReadinessItem { key: string; status: 'ok' | 'warn' | 'todo'; label: string; detail: string }
 /** 手动配对用的目录：各场所在交易的代码与标记价（场所没有在采集、目录未取到时为空）。 */
 export interface CatalogEntry { symbol: string; mark: number | null }

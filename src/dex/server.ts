@@ -13,6 +13,8 @@ export interface DexHandlers {
   /** 当前生效的 token 的摘要（租约过期或没收到时为 null）。 */
   tokenDigest(): string | null;
   crash(): DexCrashView | null;
+  /** 实盘告警，由执行服务代发飞书。 */
+  alerts?(): { key: string; text: string }[];
 }
 
 async function readInput(req: IncomingMessage): Promise<unknown> {
@@ -63,7 +65,7 @@ export function createDexServer(handlers: DexHandlers, build: string) {
   async function handle(req: IncomingMessage, res: ServerResponse) {
     res.setHeader(DEX_INSTANCE_HEADER, instance);
     if (req.method === 'GET' && req.url === DEX_PATH + 'status') {
-      const status: DexStatus = { build, instance, protocol: DEX_PROTOCOL, process: processStatus(), crash: handlers.crash(), token: handlers.tokenDigest() };
+      const status: DexStatus = { build, instance, protocol: DEX_PROTOCOL, process: processStatus(), crash: handlers.crash(), token: handlers.tokenDigest(), alerts: handlers.alerts?.() ?? [] };
       return json(res, 200, status);
     }
     const op = req.method === 'POST' && req.url?.startsWith(DEX_PATH) ? req.url.slice(DEX_PATH.length) : '';

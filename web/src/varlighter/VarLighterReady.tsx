@@ -7,6 +7,7 @@ import { useLiveResource } from '../use-live-resource.ts';
 import type { Combo, CustomPair, VenueId } from '../../../src/varlighter/model.ts';
 import type { CatalogEntry, ReadinessView, StateView, VenueStatus } from '../../../src/varlighter/views.ts';
 import { Badge, useWrite } from './parts.tsx';
+import { VarLighterLive } from './VarLighterLive.tsx';
 import {
   COMBO_OPTIONS, EMPTY_PAIR_FORM, GLOBAL_FIELDS, IDENTITY_LABELS, KIND_OPTIONS, VARLIGHTER_BASE, VENUE_OPTIONS, age, bytesPerDay, comboLabel, customPairKey, customPairRequest, globalForm, globalRequest,
   plain, price, settingsBody, toggleConfirmed, varLighterHref, venueShort, type CustomPairForm, type GlobalForm,
@@ -22,13 +23,14 @@ export function VarLighterReady({ view, onChanged, onExpired }: { view: StateVie
   const counts = { ok: 0, warn: 0, todo: 0 };
   for (const item of data?.items ?? []) counts[item.status]++;
   return <>
+    <VarLighterLive onExpired={onExpired} />
     <div className="vl-columns">
       <section className="panel" aria-label="实盘前核对">
         <div className="panel-heading"><h2>实盘前核对</h2>{data ? <span className="muted">已就绪 {counts.ok} · 待完成 {counts.warn} · 待接入 {counts.todo}</span> : null}</div>
         {!data ? live.error ? <StatePanel kind="error" title="读取核对清单失败" detail={live.error.message} /> : <StatePanel kind="loading" title="加载中…" />
           : <ul className="vl-checklist">{data.items.map(item => { const Icon = STATUS_ICON[item.status]; return <li key={item.key} className={item.status}>
             <Icon size={16} aria-label={STATUS_TEXT[item.status]} /><div><strong>{item.label}</strong> <Badge tone={item.status === 'ok' ? 'ok' : item.status === 'warn' ? 'warn' : ''}>{STATUS_TEXT[item.status]}</Badge><p>{item.detail}</p></div></li>; })}</ul>}
-        <p className="vl-note">「待接入」是还没有做完或还没有录入的事项：场所账户在服务器上用 --set-dex-keys 录入后会显示余额，下单连接器与告警尚未接入。本模块目前不会下真实订单。</p>
+        <p className="vl-note">这张清单只作参考，不拦实盘：是否下真实订单只看上面的实盘总开关与勾选的配对。「待接入」是还没有做的事项（Var 没有下单接口，带 Var 腿的配对不上实盘）。</p>
       </section>
       <div className="vl-stack">
         <GlobalPanel view={view} onChanged={refresh} />

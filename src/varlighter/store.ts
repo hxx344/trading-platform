@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { SAMPLE_FIELDS, legacyKeyOf, upgradeKey, varHourly, type Regime, type Sample } from './model.ts';
 import { upgradePosition, type ClosedTrade, type LegFees, type Position } from './strategy.ts';
 import type { Settings } from './views.ts';
+import type { LivePosition } from './live.ts';
 
 export const VARLIGHTER_FILE = 'varlighter.sqlite';
 /** 样本保留天数：约 300 个配对每分钟各一条（两腿都是行情流的配对每 20 秒一条、启用的每 5 秒一条，条数随这类配对的个数变），容量估算见 docs/varlighter.md 第 7 节。 */
@@ -87,7 +88,9 @@ export function openVarLighterStore(file: string) {
     CREATE TABLE IF NOT EXISTS leg_positions (id TEXT PRIMARY KEY, symbol TEXT NOT NULL, json TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS leg_trades (id TEXT PRIMARY KEY, symbol TEXT NOT NULL, closed_at INTEGER NOT NULL, net_usd REAL NOT NULL, json TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS leg_trades_closed ON leg_trades(closed_at);
-    CREATE INDEX IF NOT EXISTS leg_trades_symbol ON leg_trades(symbol, closed_at);`);
+    CREATE INDEX IF NOT EXISTS leg_trades_symbol ON leg_trades(symbol, closed_at);
+    CREATE TABLE IF NOT EXISTS live_positions (id TEXT PRIMARY KEY, symbol TEXT NOT NULL, state TEXT NOT NULL, opened_at INTEGER NOT NULL, closed_at INTEGER, net_usd REAL, json TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS live_positions_state ON live_positions(state, closed_at);`);
     // v0.81.0、v0.82.0 给旧表加的可空列；新版本不再写旧表，但旧库可能还没有这些列（读旧样本时按列名读）。
     db.exec('BEGIN IMMEDIATE');
     const existing = new Set((db.prepare('PRAGMA table_info(samples)').all() as { name: string }[]).map(column => column.name));
@@ -130,6 +133,12 @@ export function openVarLighterStore(file: string) {
   const symbolTrades = db.prepare('SELECT json FROM leg_trades WHERE symbol = ? AND closed_at >= ? ORDER BY closed_at');
   const tradeTotals = db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(net_usd), 0) AS net, SUM(CASE WHEN net_usd > 0 THEN 1 ELSE 0 END) AS wins, MIN(closed_at) AS first FROM leg_trades');
   const netSince = db.prepare('SELECT COALESCE(SUM(net_usd), 0) AS net FROM leg_trades WHERE closed_at >= ?');
+  // 实盘（docs/dexspread.md 第 13 节）：新表，旧版本不读不写。未结束与已结束的实盘持仓都在这张表里，清空模拟盘不动它。
+  const upsertLive = db.prepare('INSERT INTO live_positions(id, symbol, state, opened_at, closed_at, net_usd, json) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET state = excluded.state, closed_at = excluded.closed_at, net_usd = excluded.net_usd, json = excluded.json');
+  const liveActive = db.prepare("SELECT json FROM live_positions WHERE state <> 'closed' ORDER BY opened_at");
+  const liveClosed = db.prepare("SELECT json FROM live_positions WHERE state = 'closed' ORDER BY closed_at DESC LIMIT ?");
+  const liveNetSince = db.prepare("SELECT COALESCE(SUM(net_usd), 0) AS net FROM live_positions WHERE state = 'closed' AND closed_at >= ?");
+  const liveTotals = db.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(net_usd), 0) AS net, SUM(CASE WHEN net_usd > 0 THEN 1 ELSE 0 END) AS wins FROM live_positions WHERE state = 'closed' AND json_extract(json, '$.a.qty') > 0");
   const insertEvent = db.prepare('INSERT INTO events(at, kind, symbol, message) VALUES (?, ?, ?, ?)');
   const recentEvents = db.prepare('SELECT id, at, kind, symbol, message FROM events ORDER BY id DESC LIMIT ?');
   const pruneEvents = db.prepare('DELETE FROM events WHERE at < ?');
@@ -208,6 +217,15 @@ export function openVarLighterStore(file: string) {
       return { trades: row.n, netUsd: row.net, wins: row.wins ?? 0, first: row.first };
     },
     netSince(since: number): number { return (netSince.get(since) as { net: number }).net; },
+    saveLive(position: LivePosition): void { upsertLive.run(position.id, position.symbol, position.state, position.openedAt, position.closedAt, position.netUsd, JSON.stringify(position)); },
+    liveActive(): LivePosition[] { return parse<LivePosition>(liveActive.all()); },
+    liveClosed(limit: number): LivePosition[] { return parse<LivePosition>(liveClosed.all(limit)); },
+    liveNetSince(since: number): number { return (liveNetSince.get(since) as { net: number }).net; },
+    /** 实盘成交过的笔数（第一腿没成交、什么都没发生的不算）与净盈亏。 */
+    liveTotals(): { trades: number; netUsd: number; wins: number } {
+      const row = liveTotals.get() as { n: number; net: number; wins: number | null };
+      return { trades: row.n, netUsd: row.net, wins: row.wins ?? 0 };
+    },
     event(at: number, kind: string, symbol: string | null, message: string): void { insertEvent.run(at, kind, symbol, message.slice(0, 500)); },
     events(limit: number): StoredEvent[] { return recentEvents.all(limit) as unknown as StoredEvent[]; },
     /** 清空模拟盘的持仓、成交和冷却，保留事件历史。 */

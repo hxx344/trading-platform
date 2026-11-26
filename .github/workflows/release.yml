@@ -47,6 +47,15 @@ jobs:
           [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "标签 $GITHUB_REF_NAME 与 package.json 版本 v$version 不一致"; exit 1; }
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo '标签提交不在 main 上'; exit 1; }
       - run: pnpm build:web
+      # The Lighter signer ships in the package. No cache here: every release compiles it from the pinned sources and the
+      # script fails unless both files match src/varlighter/signer/SHA256SUMS.
+      - id: signer
+        run: echo "go=$(bash scripts/build-lighter-signer.sh --go-version)" >>"$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.signer.outputs.go }}
+          cache: false
+      - run: bash scripts/build-lighter-signer.sh
       - run: bash deploy/package.sh dist
       - name: 更新说明
         run: |

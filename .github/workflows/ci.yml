@@ -80,7 +80,7 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           if [[ -n "$BASE" && ! "$BASE" =~ ^0+$ ]] && git fetch --no-tags --depth=1 origin "$BASE" &&
-              git diff --quiet "$BASE" HEAD -- .github/workflows/ci.yml .github/actions/setup scripts/ci-systemd.mjs 'deploy/trading-platform*' deploy/install.sh deploy/package.sh deploy/component-digests.mjs deploy/test-platform-systemd.sh \
+              git diff --quiet "$BASE" HEAD -- .github/workflows/ci.yml .github/actions/setup scripts/ci-systemd.mjs 'deploy/trading-platform*' deploy/install.sh deploy/package.sh deploy/component-digests.mjs deploy/test-platform-systemd.sh scripts/build-lighter-signer.sh src/varlighter/signer \
                 src/control src/market src/monitor/perpetual-feed.ts src/monitor/market-readers.ts src/vendor/perpetual-exchanges.mjs 'src/vendor/perpetual-*-reader.mjs' 'src/service/remote-*.ts' \
                 'src/vendor/crossex/*-reader.mjs' src/vendor/crossex/terminal-feed.mjs src/vendor/crossex/funding-client.mjs \
                 'src/http*.ts' src/runtime.ts src/component-build.ts src/web-assets.ts src/data-dir.ts src/login-password.ts src/live/setup.ts \

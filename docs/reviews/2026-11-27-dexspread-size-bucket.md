@@ -1,9 +1,9 @@
-# 2026-11-27 DEX 价差：持仓取档不随市值漂过分档线（v0.99.1）
+# 2026-11-27 DEX 价差：持仓取档不随市值漂过分档线（v0.100.1）
 
-- 范围：提交 abdb13b 及其后的审查修复提交，相对 9d3f4f5（v0.99.0）。文件：`src/varlighter/{model,strategy}.ts`、`test/varlighter.test.ts`、`docs/{dexspread,varlighter}.md`、`LESSONS.md`、`AGENTS.md`。
+- 范围：提交 655e87b 及其后的审查修复提交 e26de6d，相对 3836fe2（v0.100.0）。审查时这两个提交是 abdb13b、6592f13，基于 9d3f4f5（v0.99.0）；发布前主线出了 v0.100.0，变基过去，只有 `LESSONS.md` 的编号冲突（本次条目由 L209 改为 L210），代码与测试的差异不变。文件：`src/varlighter/{model,strategy}.ts`、`test/varlighter.test.ts`、`docs/{dexspread,varlighter}.md`、`LESSONS.md`、`AGENTS.md`。
 - 等级：R2。只改模拟盘与回测的取价口径（`fillLeg` 的取档），不涉及下单与资金，不改库表与参数；`plan.ts` 的下单预演不走这条路径。
 - 审查方式：作者自审，加独立只读审查子代理（`/review`）审 9d3f4f5..abdb13b。审查后的修复只有测试、注释与文档，没有新逻辑，没有再开第二轮。
-- 回滚版本：v0.99.0。没有数据格式变化，直接回退。
+- 回滚版本：v0.100.0。没有数据格式变化，直接回退。
 
 ## 改动
 
@@ -28,7 +28,7 @@
 ## 已运行
 
 - `pnpm check` 通过。
-- 分支 CI（提交 abdb13b，手动运行）全部通过：<https://github.com/hxx344/trading-platform/actions/runs/45869824806>。审查修复提交另跑一次，结果见发布提交之前的分支运行。
+- 分支 CI（提交 abdb13b，手动运行）全部通过：<https://github.com/hxx344/trading-platform/actions/runs/45869824806>。审查修复提交（6592f13）全部通过：<https://github.com/hxx344/trading-platform/actions/runs/45870510619>。变基到 v0.100.0 之后再跑一次，链接写在发布提交里。
 - 本机 `node --test test/varlighter.test.ts`：57 通过（Windows 上只作参考，以 CI 为准）。
 - 2026-11-26 的 26 笔有样本的模拟成交按修复前规则逐笔重算，盈亏与记录全部吻合；同一批本机样本（基线窗口 6 小时）修复前后重放：五个配对合计 −18.90 → +6.04 美元，止损 2 笔 → 0 笔。
 

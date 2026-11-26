@@ -41,11 +41,17 @@ export function createRemoteMonitor(client: MarketClient, clock: () => number = 
   async function read<T>(name: string, input: unknown, signal?: AbortSignal): Promise<T> {
     return unwrapMarketRead(await client.call<MarketRead<T>>('monitor.' + name, input, signal));
   }
+  async function readAnthropic<T>(name: 'quote' | 'candles', input: unknown, signal: AbortSignal): Promise<T> {
+    const reply = await client.call<MarketRead<T>>('monitor.anthropic.ANTUSDT.' + name, input, signal);
+    // v0.91.0 及更早的行情服务只认旧操作。采集端仍按回包中的 binanceSymbol 核对计价口径。
+    if (!reply.ok && reply.error.message === '未知公开行情操作') return read('anthropic.' + name, input, signal);
+    return unwrapMarketRead(reply);
+  }
   const history: ReadFundingLeg = (market, exchange, side, range, signal) => read('exchange.historyLeg', { market, exchange, side, range }, signal);
   const rounds: MarketReaders = {
     epoch: () => client.epoch(),
-    anthropicQuote: signal => read('anthropic.quote', null, signal),
-    anthropicCandles: (starts, at, signal, ends) => read('anthropic.candles', { starts, at, ends }, signal),
+    anthropicQuote: signal => readAnthropic('quote', null, signal),
+    anthropicCandles: (starts, at, signal, ends) => readAnthropic('candles', { starts, at, ends }, signal),
     oilQuote: signal => read('oil.quote', null, signal),
     oilCandles: (start, end, signal) => read('oil.candles', { start, end }, signal),
     oilFunding: (side, range, signal) => history('oil', 'binance', side, range, signal),

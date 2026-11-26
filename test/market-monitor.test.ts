@@ -10,12 +10,12 @@ import { createMarketServer } from '../src/market/server.ts';
 import { createMonitorData } from '../src/market/monitor-data.ts';
 import { exchangeError } from '../src/monitor/exchanges.ts';
 import { fundingLegStale } from '../src/vendor/exchange-funding-history.mjs';
-import { OIL_CANDLE_WINDOW_MS } from '../src/monitor/market-contract.ts';
+import { OIL_CANDLE_WINDOW_MS, unwrapMarketRead, type MarketRead } from '../src/monitor/market-contract.ts';
 import { OIL_CANDLE_KEY, createOilMonitor } from '../src/monitor/oil.ts';
 import { createHynixMonitor } from '../src/monitor/hynix.ts';
-import { createAnthropicMonitor } from '../src/monitor/anthropic.ts';
+import { CANDLE_KEY, QUOTE_KEY, createAnthropicMonitor } from '../src/monitor/anthropic.ts';
 import { createMonitorStore } from '../src/monitor/store.ts';
-import { createBinanceGate } from '../src/vendor/anthropic-market.mjs';
+import { ANTHROPIC_LEG_KEYS, createBinanceGate, mergeAnthropicCandleBatch, type AnthropicCandleBatch, type AnthropicCandleStarts, type AnthropicQuote } from '../src/vendor/anthropic-market.mjs';
 import { HISTORY_START, OIL_CANDLE_MS } from '../src/vendor/oil-market.mjs';
 import { createRemoteMonitor } from '../src/service/remote-monitor.ts';
 import { closeMonitor, openMonitor, settleMonitor, stopMonitor } from '../src/service/monitor.ts';
@@ -23,7 +23,7 @@ import { parseServiceConfig } from '../src/service/config.ts';
 import type { PerpetualOptions } from '../src/monitor/perpetual.ts';
 import type { PerpetualMarket, PerpetualUpdate } from '../src/vendor/perpetual-stream.mjs';
 import { fakePerpetualVenues } from './perpetual-fake.ts';
-import { fakeAnthropicVenues, fakeVariationalToken } from './monitor-fake.ts';
+import { fakeAnthropicPrice, fakeAnthropicVenues, fakeVariationalToken } from './monitor-fake.ts';
 
 const quiet = () => {};
 const HOUR = 3_600_000, DAY = 24 * HOUR;
@@ -62,6 +62,105 @@ async function listen(path: string, options: Parameters<typeof createMonitorData
   return worker;
 }
 
+// v0.80.2 的两个操作均不携带合约名。旧采集端直接保存 binance/legs.binance，展示时除以流通股数。
+test('Anthropic 新旧行情和采集协议四种组合：混合窗口只停 Binance 腿，独立重启后从检查点恢复', async () => {
+  const step = 900_000, oldShares = 12.7, others = ['xyz', 'io', 'rh'] as const;
+  let time = Date.UTC(2026, 10, 23, 12, 0, 5);
+  const now = () => time, target = () => Math.floor(time / step) * step;
+  const range = (value: number): AnthropicCandleStarts => ({ binance: value, xyz: value, io: value, rh: value });
+  const dir = mkdtempSync(join(tmpdir(), 'tp-ant-protocol-')), socket = socketPath(dir);
+  const oldStore = createMonitorStore({ file: ':memory:', now }), store = createMonitorStore({ file: join(dir, 'monitor.sqlite'), now });
+  const signal = new AbortController().signal;
+  const venues = fakeAnthropicVenues({ now, listedAt: range(target() - 3 * step) });
+  const oldWorker = createMarketServer({ monitor: {
+    async call(op, input) {
+      const at = target() - step;
+      if (op === 'monitor.anthropic.quote') return { ok: true, value: {
+        fetchedAt: new Date(time).toISOString(), errors: {},
+        binance: { markPx: fakeAnthropicPrice('binance', time) * oldShares, fundingRate: null, nextFundingTime: null },
+        xyz: { markPx: fakeAnthropicPrice('xyz', time), fundingRate: null, oraclePx: null },
+        io: { markPx: fakeAnthropicPrice('io', time), fundingRate: null, oraclePx: null },
+        rh: { markPx: fakeAnthropicPrice('rh', time), fundingRate: null, indexPx: null },
+      } };
+      if (op === 'monitor.anthropic.candles') {
+        const { starts, ends } = input as { starts: AnthropicCandleStarts; ends: AnthropicCandleStarts };
+        const batch: AnthropicCandleBatch = { at: time, legs: {}, through: {}, errors: {} };
+        for (const key of ANTHROPIC_LEG_KEYS) if (starts[key] < ends[key]) {
+          batch.legs[key] = at >= starts[key] && at < ends[key] ? [[at, fakeAnthropicPrice(key, at) * (key === 'binance' ? oldShares : 1)]] : [];
+          batch.through![key] = ends[key];
+        }
+        return { ok: true, value: batch };
+      }
+      return { ok: false, error: { name: 'Error', message: '未知公开行情操作' } };
+    },
+    stream() {},
+  } }, 'v0.80.2-fixture');
+  await new Promise<void>((resolve, reject) => { oldWorker.server.once('error', reject); oldWorker.server.listen(socket, resolve); });
+  let worker = oldWorker;
+  const conn = createMarketClient(socket);
+  const start = () => createAnthropicMonitor({ store, now, log: quiet, readers: createRemoteMonitor(conn, now).rounds });
+  let monitor = start();
+  async function oldRound() {
+    const at = target() - step;
+    const q = unwrapMarketRead(await conn.call<MarketRead<AnthropicQuote>>('monitor.anthropic.quote', null, signal));
+    const b = unwrapMarketRead(await conn.call<MarketRead<AnthropicCandleBatch>>('monitor.anthropic.candles', { starts: range(at), ends: range(target()), at: time }, signal));
+    oldStore.writeState(QUOTE_KEY, q);
+    const data = mergeAnthropicCandleBatch(null, b).data;
+    oldStore.writeCandles({ rows: data, cutoff: 0 });
+    for (const key of others) {
+      assert.equal(q[key]?.markPx, fakeAnthropicPrice(key, time));
+      assert.equal(data.at(-1)?.[key], fakeAnthropicPrice(key, at));
+    }
+    return { q, b, candle: oldStore.candles().at(-1)!.binance };
+  }
+  async function newRound() {
+    await Promise.all([monitor.refreshQuote(), monitor.refreshCandles()]);
+    const q = monitor.quote()!, candles = monitor.candles(null)!;
+    for (const key of others) {
+      assert.equal(q[key]?.markPx, fakeAnthropicPrice(key, time));
+      assert.equal(candles.data.at(-1)?.[key], fakeAnthropicPrice(key, target() - step));
+    }
+    return { q, candle: store.candles().at(-1)!.binance,
+      through: (store.readState(CANDLE_KEY)!.value as { coverage: Record<string, { through: number }> }).coverage.binance.through };
+  }
+  try {
+    const oldOld = await oldRound();
+    assert.equal(oldOld.q.binanceSymbol, undefined);
+    assert.ok(Math.abs(oldOld.q.binance!.markPx / oldShares - fakeAnthropicPrice('binance', time)) < 1e-9);
+    assert.ok(Math.abs(oldOld.candle! / oldShares - fakeAnthropicPrice('binance', target() - step)) < 1e-9);
+    const oldMarket = await newRound();
+    assert.deepEqual([oldMarket.q.binance, oldMarket.candle, oldMarket.through], [null, null, 0]);
+    assert.match(oldMarket.q.errors.binance!, /等待其更新/);
+
+    worker.close(); await until(() => !conn.epoch());
+    assert.equal(monitor.quote()!.status, 'snapshot');
+    time += step;
+    worker = await listen(socket, { fetchImpl: venues.fetch, now, log: quiet });
+    const oldCollector = await oldRound();
+    assert.deepEqual([oldCollector.q.binance, oldCollector.b.legs.binance, oldCollector.b.through?.binance, oldCollector.candle], [null, undefined, undefined, null]);
+    assert.equal(oldCollector.q.errors.binance, oldCollector.b.errors.binance);
+    assert.match(oldCollector.q.errors.binance!, /采集端须更新/);
+    assert.equal((oldStore.readState(QUOTE_KEY)!.value as AnthropicQuote).binance, null);
+    assert.equal(venues.requests.get('candles:binance') ?? 0, 0, '旧采集请求不会触发 Binance 回补');
+
+    const newNew = await newRound();
+    assert.equal(newNew.q.binance?.markPx, fakeAnthropicPrice('binance', time));
+    assert.equal(newNew.candle, fakeAnthropicPrice('binance', target() - step));
+    assert.equal(newNew.through, target());
+    const committed = store.candles();
+    assert.equal(committed.find(row => row.time === target() - 2 * step)!.binance, fakeAnthropicPrice('binance', target() - 2 * step), '混合窗口缺失的每股收盘已补齐');
+    monitor.stop(); monitor = start();
+    assert.equal(monitor.quote()!.status, 'snapshot');
+    await newRound();
+    assert.deepEqual(store.candles(), committed, '采集端重启保留原单位和行数');
+    time += step;
+    const rolledBack = await oldRound();
+    assert.equal(rolledBack.candle, null, '旧协议在新版采集离开后继续受保护');
+  } finally {
+    monitor.stop(); conn.close(); worker.close(); oldStore.close(); store.close(); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('独立行情经本机套接字整轮回补；各腿原时间、落盘检查点以及 Var 私有会话留在正确一侧', async () => {
   const at = Date.UTC(2026, 9, 1, 9, 0, 5), now = () => at;
   const venues = fakeAnthropicVenues({ now, listedAt: { brent: Date.UTC(2026, 3, 1, 9), wti: Date.UTC(2026, 3, 1, 9), skhy: Date.UTC(2026, 6, 10, 15), skhx: Date.UTC(2026, 6, 10, 15) } }), dir = mkdtempSync(join(tmpdir(), 'tp-market-rounds-')), socket = socketPath(dir);
@@ -92,13 +191,14 @@ test('独立行情经本机套接字整轮回补；各腿原时间、落盘检�
     assert.ok(runtime.hynix!.funding()!.coverage.rows > 1000);
     assert.equal((await runtime.exchanges!.quote('hynix', 'hyperliquid')).exchange, 'hyperliquid');
     assert.equal((await runtime.exchanges!.fundingHistory('hynix', 'gate')).left.symbol, 'SKHY_USDT');
-    const first = sent.filter(item => item.op === 'monitor.anthropic.candles')[0]!;
+    const first = sent.find(item => item.op === 'monitor.anthropic.ANTUSDT.candles');
+    assert.ok(first);
     const expected = runtime.anthropic!.candles(null)!.metadata.fetchedAt;
     stopMonitor(runtime); closeMonitor(runtime);
     runtime = openMonitor(config, dir, options);
     assert.deepEqual([runtime.anthropic!.candles(null)?.status, runtime.anthropic!.candles(null)?.metadata.fetchedAt], ['snapshot', expected]);
     await runtime.anthropic!.refreshCandles();
-    assert.equal(sent.filter(item => item.op === 'monitor.anthropic.candles').at(-1), first, '从已核实的收盘区间恢复，重启不重读');
+    assert.equal(sent.filter(item => item.op === first.op).at(-1), first, '从已核实的收盘区间恢复，重启不重读');
     assert.equal(runtime.anthropic!.candles(null)?.metadata.fetchedAt, expected, '命中缓存保留采集时间');
 
     const token = fakeVariationalToken(at + DAY);

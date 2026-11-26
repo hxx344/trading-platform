@@ -8,7 +8,7 @@ import { createSharedMarketReads } from '../monitor/shared-reads.ts';
 import { perpetualQualityEnv } from '../monitor/quality-config.ts';
 import { createVariationalFetch } from '../monitor/variational-transport.ts';
 import type { PerpetualOptions } from '../monitor/perpetual.ts';
-import { ANTHROPIC_LEG_KEYS, createBinanceGate, type AnthropicCandleStarts, type AnthropicFetcher } from '../vendor/anthropic-market.mjs';
+import { ANTHROPIC_LEG_KEYS, createBinanceGate, validateAnthropicQuote, type AnthropicCandleStarts, type AnthropicFetcher } from '../vendor/anthropic-market.mjs';
 import { supportsExchange, type Exchange } from '../vendor/exchange-comparison.mjs';
 import { validateHynixQuote } from '../vendor/hynix-market.mjs';
 import { createPerpetualExecutionService } from '../vendor/perpetual-depth.mjs';
@@ -23,6 +23,7 @@ import { readVariationalPublicFunding, type VariationalFetcher } from '../vendor
 import { anySignal } from '../any-signal.mjs';
 
 const DAY = 86_400_000;
+const LEGACY_ANT_BINANCE_ERROR = 'Binance 腿暂停，采集端须更新以读取 ANTUSDT 每股报价';
 function fields(input: unknown, names: string[]): Record<string, unknown> {
   if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !names.includes(key))) throw new Error('公开行情请求字段无效');
   return input as Record<string, unknown>;
@@ -70,7 +71,12 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
   }
   async function read(op: string, input: unknown, signal: AbortSignal): Promise<unknown> {
     switch (op) {
-      case 'monitor.anthropic.quote': none(input); return readers.anthropicQuote(signal);
+      case 'monitor.anthropic.ANTUSDT.quote': none(input); return readers.anthropicQuote(signal);
+      case 'monitor.anthropic.quote': {
+        none(input);
+        const quote = await readers.anthropicQuote(signal);
+        return validateAnthropicQuote({ ...quote, binance: null, errors: { ...quote.errors, binance: LEGACY_ANT_BINANCE_ERROR } });
+      }
       case 'monitor.oil.quote': none(input); return readers.oilQuote(signal);
       case 'monitor.hynix.quote': none(input); return readers.hynixQuote(signal);
       case 'monitor.goldoil.quote': none(input); return readers.goldOilQuote(signal);
@@ -81,14 +87,20 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
         if (end <= start || end > now() || end - start > OIL_CANDLE_WINDOW_MS) throw new Error('金油比 K 线回补范围无效');
         return readers.goldOilCandles(start, end, signal);
       }
+      case 'monitor.anthropic.ANTUSDT.candles':
       case 'monitor.anthropic.candles': {
-        const p = fields(input, ['starts', 'at', 'ends']), at = roundTime(p.at), starts = fields(p.starts, [...ANTHROPIC_LEG_KEYS]);
-        const ends = p.ends === undefined ? undefined : fields(p.ends, [...ANTHROPIC_LEG_KEYS]);
+        const p = fields(input, ['starts', 'at', 'ends']), at = roundTime(p.at);
+        const starts = fields(p.starts, [...ANTHROPIC_LEG_KEYS]) as AnthropicCandleStarts;
+        const ends = p.ends === undefined ? undefined : fields(p.ends, [...ANTHROPIC_LEG_KEYS]) as AnthropicCandleStarts;
         for (const key of ANTHROPIC_LEG_KEYS) {
           const end = ends ? timestamp(ends[key]) : at;
           if (timestamp(starts[key]) > end || end > at) throw new Error('K 线回补范围无效');
         }
-        return readers.anthropicCandles(starts as AnthropicCandleStarts, at, signal, ends as AnthropicCandleStarts | undefined);
+        if (op === 'monitor.anthropic.ANTUSDT.candles') return readers.anthropicCandles(starts, at, signal, ends);
+        // 旧采集端会按旧合约股数换算。只取其余三腿，Binance 不返回价格，也不推进回补检查点。
+        const legacyEnds = { xyz: at, io: at, rh: at, ...ends, binance: starts.binance };
+        const batch = await readers.anthropicCandles(starts, at, signal, legacyEnds);
+        return { ...batch, errors: { ...batch.errors, binance: LEGACY_ANT_BINANCE_ERROR } };
       }
       case 'monitor.oil.candles': {
         const p = fields(input, ['start', 'end']), start = timestamp(p.start), end = timestamp(p.end);

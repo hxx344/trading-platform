@@ -15,7 +15,7 @@ import { VARIATIONAL_SESSION_FILE } from '../src/monitor/variational-session.ts'
 import { fakeVariationalToken } from './monitor-fake.ts';
 import { pairMarkets, parsePairKey, parseRhMarkets, parseVarListings, parseVarQuote, regimeOf, spreadOf, midBasis, type Sample } from '../src/varlighter/model.ts';
 import { BaselineTracker, RollingWindow, regimeStats, suggestedEntryBps } from '../src/varlighter/stats.ts';
-import { AUTO_BLOCK, DEFAULT_GLOBAL, DEFAULT_SYMBOL, closePosition, decide, openBlocker, openPosition, positionSpread, readGlobalParams, readSymbolParams, recommendParams, type GlobalParams, type Position, type SymbolParams } from '../src/varlighter/strategy.ts';
+import { AUTO_BLOCK, DEFAULT_GLOBAL, DEFAULT_SYMBOL, closePosition, decide, markToMarket, openBlocker, openPosition, positionSpread, readGlobalParams, readSymbolParams, recommendParams, type GlobalParams, type Position, type SymbolParams } from '../src/varlighter/strategy.ts';
 import { backtestRequest, runBacktest } from '../src/varlighter/backtest.ts';
 import { BOOK_KEEP_LEVELS, CONNECT_TIMEOUT_MS, DEPTH_MAX_GAP_MS, HyperliquidStream, LighterStream, depthAt, depthSnapshot, vwap, type SocketLike } from '../src/varlighter/feeds.ts';
 import { orderPlan } from '../src/varlighter/plan.ts';
@@ -1040,7 +1040,7 @@ test('持仓取价：100k 档缺盘口快照时退回 1k 档估算，超时与�
 
 test('持仓取档：1000 美元的仓市值漂过分档线仍按 1k 档平仓与止损，超出名义金额两成才按市值换档', () => {
   // 开仓后两腿各涨 0.3%：市值 1003 美元。B 腿 100k 档的冲击约 50 基点，1k 档 1 基点。
-  const key = 'rh:NVDA|entropy:NVDA', params: SymbolParams = { ...DEFAULT_SYMBOL, stopBps: 60 };
+  const key = 'rh:NVDA|entropy:NVDA', params: SymbolParams = { ...DEFAULT_SYMBOL, stopBps: 50 };
   const held = position(key, { direction: 'a_cheap', openedAt: T0, qty: 10, notionalUsd: 1_000, entrySpread: -12, aEntry: 100, bEntry: 100.12 });
   const live = (aMid: number, bMid: number) => sample(T0 + 5_000, aMid, bMid, { symbol: key, aBidRx: aMid - 0.01, aAskRx: aMid + 0.01, aRxAt: T0 + 5_000,
     aBid100k: aMid - 0.05, aAsk100k: aMid + 0.05, bBid100k: bMid - 0.5, bAsk100k: bMid + 0.5 });
@@ -1049,7 +1049,9 @@ test('持仓取档：1000 美元的仓市值漂过分档线仍按 1k 档平仓�
   const mark = positionSpread(drifted, held)!, exit = closeSpread(drifted, held)!;
   assert.deepEqual([mark.prices.aBid, mark.prices.bAsk, mark.estimated], [drifted.aBid1k, drifted.bAsk1k, false], '止损判断用 1k 档');
   assert.deepEqual([exit.prices.aBid, exit.prices.bAsk, exit.estimated], [drifted.aBid1k, drifted.bAsk1k, false], '平仓成交用 1k 档');
-  assert.equal(decide(drifted, null, params, held).kind, 'hold', '按 100k 档会算出约 −60 基点而止损');
+  assert.equal(decide(drifted, null, params, held).kind, 'hold', '1k 档浮亏约 4 基点');
+  const wrong = targetSpread(drifted, { ...held, notionalUsd: 100_000, qty: 1_000 }, false)!.spread;
+  assert.ok(markToMarket(held, wrong).pnlBps < -params.stopBps, '同一样本按 100k 档是约 −55 基点，会越过止损线');
   const trade = closePosition(held, drifted.t, exit, 'manual', { slippageBps: 0 }, null);
   assert.ok(Math.abs(trade.grossUsd - (drifted.aBid1k! - 100 + 100.12 - drifted.bAsk1k!) * 10) < 1e-9);
   // 真的亏到止损线照常止损；市值涨过两成（B 腿 125）才按 100k 档。
@@ -1900,6 +1902,15 @@ test('按实际数量选择 Var 询价：复核与持仓成交共用，其他金
   const trade = closePosition(held, later.t, closeSpread(later, held)!, 'manual', { slippageBps: 1 }, null);
   assert.deepEqual([trade.aExit, trade.exitVarSource], [100.04, 'token']);
   assert.equal(closeSpread({ ...later, aTkQty: 10 }, held)?.varSource, '1k');
+
+  // A 便宜方向：询价数量 10.1（1000 ÷ 99 取四位有效数字），对冲腿市值 1010 美元，仍按名义金额的 1k 档成交（B 腿没有 100k 档盘口）。
+  const cheap = sample(T0, 99, 100, { bBidRx: 99.99, bAskRx: 100.01, aBidTk: 98.99, aAskTk: 99.01, aTkQty: 10.1, aTkAt: T0 + 900, aTkReceivedAt: T0 + 950 });
+  const cheapSignal = decide(cheap, baseline, params, null);
+  assert.ok(cheapSignal.kind === 'open' && cheapSignal.direction === 'a_cheap');
+  const hedged = confirmOpen(cheap, baseline, params, cheapSignal, 30);
+  assert.ok(typeof hedged !== 'string', `对冲腿不应因市值略过 1000 美元被挡：${String(hedged)}`);
+  assert.deepEqual([hedged.spread.varQtyA, hedged.spread.varSource, hedged.spread.estimated], [10.1, 'token', false]);
+  assert.ok(Math.abs(hedged.spread.prices.bBid - 99.98) < 1e-9, 'B 腿按 1k 档的冲击成交');
 });
 
 test('逐腿决策年龄：Var 在任一侧，对手一档和公开价的时效都含等待，边界等于上限可用', () => {

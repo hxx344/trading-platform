@@ -167,7 +167,7 @@ export function markToMarket(position: Position, spread: Spread): { exitSpread: 
 }
 
 /**
- * 持仓信号按实际数量在各腿当前对应的公共档位判断；缺大档时允许小档估算。
+ * 持仓信号按实际数量取价，档位见 model.ts 的 sizeBucket（市值在开仓名义金额 ±20% 以内沿用名义金额的档位）；缺大档时允许小档估算。
  */
 export function positionSpread(sample: Sample, position: Position): Spread | null {
   return targetSpread(sample, position, false)?.spread ?? null;

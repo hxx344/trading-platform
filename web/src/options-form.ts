@@ -2,7 +2,7 @@
 // start bodies, the net limit typed in the confirmation, the expiry payoff curve, the chain rows around the index and the
 // per-task progress and amounts. Rules and wording follow the workbench Greeks page (modules/greeks/app/static/app.js,
 // 2f0593d).
-import type { ChainRow, Execution, OptionsState, OrderRow, PerformanceGroup, PerformancePoint, PerformanceSeries, PerformanceView, Plan, Preview, ScheduleView, StrategyMode, Task, TaskStatus, RfqQuote, RfqRecord, RfqView } from './options-types.ts';
+import type { ChainRow, Execution, M50View, OptionsState, OrderRow, PerformanceGroup, PerformancePoint, PerformanceSeries, PerformanceView, Plan, Preview, ScheduleView, StrategyMode, Task, TaskStatus, RfqQuote, RfqRecord, RfqView } from './options-types.ts';
 
 export const ACTIVE_STATUSES: readonly TaskStatus[] = ['accepted', 'running', 'stopping', 'recovering', 'recovery_needed'];
 export const isActive = (task: Pick<Task, 'status'>): boolean => ACTIVE_STATUSES.includes(task.status);
@@ -10,7 +10,22 @@ export const STATUS_TEXT: Record<TaskStatus, string> = {
   accepted: '已受理', running: '执行中', stopping: '请求停止 · 正在核对', recovering: '恢复中 · 正在核对', recovery_needed: '状态待核对',
   completed: '全部成交', stopped: '已停止', partial: '部分成交 · 已结束', failed: '执行失败',
 };
-export const strategyName = (mode: StrategyMode | null | undefined): string => mode === 'short_strangle' ? '双腿卖出' : '四腿铁鹰';
+export const strategyName = (mode: StrategyMode | null | undefined): string => mode === 'short_strangle' ? '双腿卖出' : mode === 'trend_m50' ? 'M50 均线择边' : '四腿铁鹰';
+/** Legs of a mode, for the open button and the risk checkbox. */
+export const legWord = (mode: StrategyMode): string => mode === 'trend_m50' ? '单腿' : mode === 'short_strangle' ? '两腿' : '四腿';
+const sideText = (side: 'Put' | 'Call'): string => `卖 ${side}`;
+/** M50: the day's signal and what it asks of the tracked strategy, as the desk shows it. */
+export function m50Summary(view: M50View | null | undefined): { signal: string; action: string } {
+  if (!view) return { signal: '读取中', action: '' };
+  const signal = view.signal ? `${view.signal.day} · 指数 ${Math.round(view.signal.index).toLocaleString('en-US')} ${view.signal.side === 'Put' ? '>' : '≤'} MA50 ${Math.round(view.signal.ma).toLocaleString('en-US')}` : view.error ? `${view.day} 信号读取失败：${view.error}` : `${view.day} 信号计算中（08:15 UTC 后）`;
+  const action = view.action === 'open' ? `建议开仓：${sideText(view.signal!.side)}`
+    : view.action === 'hold' ? `持有：${sideText(view.trackedSide ?? view.signal!.side)}，方向与信号一致`
+    : view.action === 'switch' ? `建议换边：先平仓${view.trackedSide ? sideText(view.trackedSide) : ''}，再开${sideText(view.signal!.side)}`
+    : view.action === 'settling' ? '跟踪腿已到期，等待交割退役后再开仓'
+    : view.action === 'other_strategy' ? '跟踪中的是其他策略，平掉后才能开 M50'
+    : '没有当天信号，暂不能开仓';
+  return { signal, action };
+}
 export const QUANTITY_PRESETS = ['0.01', '0.05', '0.1', '0.25', '0.5', '1'] as const;
 
 const QUANTITY = /^\d{1,4}(\.\d{1,8})?$/;
@@ -51,8 +66,9 @@ export interface PayoffCurve { low: number; high: number; samples: { price: numb
 /** 121 samples over the strikes widened by 32 % of their span (at least 1 000), and where the curve crosses zero. */
 export function payoffCurve(preview: Pick<Preview, 'netCreditUsd' | 'legs'>): PayoffCurve | null {
   if (!preview.legs.length) return null;
+  // A single leg (M50) has no second strike: span a quarter of its strike, about ±8% after the 0.32 margins.
   const strikes = preview.legs.map(leg => leg.strike);
-  const lowStrike = Math.min(...strikes), highStrike = Math.max(...strikes), span = Math.max(1_000, highStrike - lowStrike);
+  const lowStrike = Math.min(...strikes), highStrike = Math.max(...strikes), span = Math.max(1_000, highStrike - lowStrike, strikes.length === 1 ? lowStrike * 0.25 : 0);
   const low = Math.max(0, lowStrike - span * 0.32), high = highStrike + span * 0.32;
   const samples = Array.from({ length: 121 }, (_, index) => { const price = low + (high - low) * index / 120; return { price, pnl: payoffAt(price, preview) }; });
   const breakevens: number[] = [];
@@ -220,7 +236,7 @@ export const RFQ_PATH = '/api/options/rfq';
 /** The create body; the page adds the request id it keeps until an answer arrives. */
 export const rfqCreateBody = (quantity: string, mode: StrategyMode): Record<string, unknown> => ({ confirmLive: true, quantity, mode });
 export const rfqExecuteBody = (rfqId: string, quoteId: string): Record<string, unknown> => ({ rfqId, quoteId, confirmLive: true });
-export const rfqStrategyLabel = (mode: StrategyMode): string => mode === 'short_strangle' ? '双腿卖出 · 无保护腿，亏损无上限' : '四腿铁鹰';
+export const rfqStrategyLabel = (mode: StrategyMode): string => mode === 'short_strangle' ? '双腿卖出 · 无保护腿，亏损无上限' : mode === 'trend_m50' ? 'M50 均线择边 · 单腿，不走询价' : '四腿铁鹰';
 /** Why the page cannot send a new RFQ now; null when it can (the server checks again). */
 export function rfqCreateProblem(view: Pick<RfqView, 'finished' | 'blocked' | 'market'> | null, quantity: string | null): string | null {
   if (!view) return '等待询价状态同步';

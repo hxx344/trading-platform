@@ -4,7 +4,7 @@ import { bybitPages } from '../options/listing.ts';
 import type { Row } from '../options/client.ts';
 import { exactKeys } from '../contracts.ts';
 
-export type OptionRead = 'instruments' | 'tickers' | 'ticker' | 'underlying';
+export type OptionRead = 'instruments' | 'tickers' | 'ticker' | 'underlying' | 'indexKline';
 export interface OptionReply { value: Row | Row[] | null; sourceAt: number | null; receivedAt: number }
 
 export async function readOptionData(op: OptionRead, symbol: string | undefined, signal: AbortSignal,
@@ -19,7 +19,12 @@ export async function readOptionData(op: OptionRead, symbol: string | undefined,
     return body.result;
   }
   let value: OptionReply['value'];
-  if (op === 'instruments') {
+  if (op === 'indexKline') {
+    // M50 (docs/options.md): the BTCUSDT index's last 60 UTC daily candles, newest first as Bybit lists them.
+    const result = await get('/v5/market/index-price-kline', { category: 'linear', symbol: 'BTCUSDT', interval: 'D', limit: '60' });
+    if (!Array.isArray(result.list) || result.list.some(row => !Array.isArray(row))) throw new MarketError('Bybit 指数日线格式无效');
+    value = { symbol: 'BTCUSDT', list: result.list };
+  } else if (op === 'instruments') {
     value = await bybitPages(cursor => get('/v5/market/instruments-info', { category: 'option', baseCoin: 'BTC', limit: '1000', ...(cursor ? { cursor } : {}) }), ['symbol']);
   } else {
     const params: Record<string, string> = op === 'underlying' ? { category: 'linear', symbol: 'BTCUSDT' }
@@ -37,7 +42,7 @@ export async function readOptionData(op: OptionRead, symbol: string | undefined,
 export function createOptionData(): MarketOperations {
   return {
     async call(op, input, signal) {
-      if (!['options.instruments', 'options.tickers', 'options.ticker', 'options.underlying'].includes(op)) throw new MarketError('未知期权行情操作', 404);
+      if (!['options.instruments', 'options.tickers', 'options.ticker', 'options.underlying', 'options.indexKline'].includes(op)) throw new MarketError('未知期权行情操作', 404);
       const kind = op.slice('options.'.length) as OptionRead;
       const { symbol } = exactKeys(input, kind === 'ticker' ? ['symbol'] : []);
       if (kind === 'ticker' && (typeof symbol !== 'string' || !/^BTC-\d{1,2}[A-Z]{3}\d{2}-\d+(?:\.\d+)?-[CP](?:-USDT|-USDC)?$/.test(symbol) || symbol.length > 80)) throw new MarketError('期权合约无效', 400);

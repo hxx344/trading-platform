@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { ContractError } from '../src/contracts.ts';
 import type { OptionsEngine } from '../src/options/engine.ts';
 import { optionsViews } from '../src/service/options.ts';
-import { autoOpenConfirm, chainLines, quoteFingerprint, quoteSecondsLeft, rfqCreateBody, rfqCreateProblem, rfqExecuteBody, rfqOpen, coverageLine, groupLabel, markedRows, performanceStatus, plotRows, plotTick, utcMinute, selectedSeries, orderState, parseQuantity, payoffCurve, planBody, scheduleTime, startBody, startRefused, taskSummary } from '../web/src/options-form.ts';
+import { autoOpenConfirm, chainLines, legWord, m50Summary, strategyName, quoteFingerprint, quoteSecondsLeft, rfqCreateBody, rfqCreateProblem, rfqExecuteBody, rfqOpen, coverageLine, groupLabel, markedRows, performanceStatus, plotRows, plotTick, utcMinute, selectedSeries, orderState, parseQuantity, payoffCurve, planBody, scheduleTime, startBody, startRefused, taskSummary } from '../web/src/options-form.ts';
 import type { ChainRow, Execution, OrderRow, PerformanceGroup, PerformanceView, Plan, PreviewLeg, RfqQuote, Task } from '../web/src/options-types.ts';
 
 const PLAN: Plan = {
@@ -187,4 +187,24 @@ test('组合询价表单：创建与执行请求体通过服务端校验；创�
   assert.notEqual(quoteFingerprint('r2', quote), base);
   assert.equal(quoteSecondsLeft(quote, 50_500), 9);
   assert.equal(quoteSecondsLeft(quote, 70_000), 0);
+});
+
+test('M50 页面文案：信号、建议动作与开仓按钮的腿数；计划请求带上 trend_m50', () => {
+  const signal = { day: '2026-11-13', at: 1, index: 101_234, ma: 95_000, side: 'Put' as const };
+  const base = { configured: true, day: '2026-11-13', signal, lastSignal: signal, trackedSide: null, trackedExpiry: null, error: null, notifiedDay: null };
+  assert.deepEqual(m50Summary({ ...base, action: 'open' }), { signal: '2026-11-13 · 指数 101,234 > MA50 95,000', action: '建议开仓：卖 Put' });
+  assert.equal(m50Summary({ ...base, action: 'switch', trackedSide: 'Call' }).action, '建议换边：先平仓卖 Call，再开卖 Put');
+  assert.equal(m50Summary({ ...base, action: 'hold', trackedSide: 'Put' }).action, '持有：卖 Put，方向与信号一致');
+  assert.match(m50Summary({ ...base, signal: null, action: 'no_signal', error: '读取失败' }).signal, /信号读取失败：读取失败/);
+  assert.match(m50Summary({ ...base, signal: null, action: 'no_signal' }).signal, /08:15 UTC 后/);
+  assert.equal(m50Summary(undefined).signal, '读取中');
+  assert.equal(legWord('trend_m50'), '单腿');
+  assert.equal(strategyName('trend_m50'), 'M50 均线择边');
+  const single = payoffCurve({ netCreditUsd: 65, legs: [{ symbol: 'BTC-22NOV26-92000-P', side: 'Sell', optionType: 'Put', strike: 92_000, delta: -0.3, qty: '0.1', mark: 650, targetDelta: 0.3, estimatedFeeUsd: 0, feeCapUsd: 0, feeBasisPrice: 0 }] })!;
+  assert.ok(single.low < 86_000 && single.high > 98_000, '单腿也画出足够的价格范围');
+  assert.equal(single.breakevens.length, 1);
+  assert.ok(Math.abs(single.breakevens[0]! - 91_350) < 1);
+  assert.deepEqual(planBody('open', '0.5', 'trend_m50'), { operation: 'open', quantity: '0.5', mode: 'trend_m50' });
+  const views = optionsViews({ createPlan: async (request: unknown) => request } as unknown as OptionsEngine);
+  return views.plan(planBody('open', '0.5', 'trend_m50')).then(request => assert.deepEqual(request, { operation: 'open', quantity: '0.5', mode: 'trend_m50' }));
 });

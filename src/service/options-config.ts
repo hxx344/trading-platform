@@ -41,7 +41,7 @@ export function parseOptionsConfig(value: unknown): OptionsConfig {
     if (Number(legQty) > 1_000) throw new Error('options.legQty 不能超过 1000');
   }
   const strategyMode = raw.strategyMode ?? 'iron_condor';
-  if (!STRATEGY_MODES.includes(strategyMode as StrategyMode)) throw new Error('options.strategyMode 须为 iron_condor 或 short_strangle');
+  if (!STRATEGY_MODES.includes(strategyMode as StrategyMode)) throw new Error('options.strategyMode 须为 iron_condor、short_strangle 或 trend_m50');
   const marginMode = raw.marginMode ?? 'REGULAR_MARGIN';
   if (marginMode !== 'REGULAR_MARGIN' && marginMode !== 'PORTFOLIO_MARGIN') throw new Error('options.marginMode 须为 REGULAR_MARGIN 或 PORTFOLIO_MARGIN');
   for (const name of ['autoOpen', 'marketFallback'] as const) if (raw[name] !== undefined && typeof raw[name] !== 'boolean') throw new Error(`options.${name} 须为 true / false`);
@@ -73,7 +73,7 @@ export function parseOptionsSecrets(value: Record<string, unknown>): LiveCredent
 /** For --check-config: the account masked and the limits; empty without options so that output stays as it was. */
 export function optionsSummary(options: OptionsConfig | undefined): string {
   if (!options) return '';
-  const mode = options.strategyMode === 'iron_condor' ? '铁鹰' : '卖出宽跨';
+  const mode = options.strategyMode === 'iron_condor' ? '铁鹰' : options.strategyMode === 'trend_m50' ? 'M50 均线择边' : '卖出宽跨';
   const time = `${String(options.openHourUtc).padStart(2, '0')}:${String(options.openMinuteUtc).padStart(2, '0')}`;
-  return `，期权账户 Bybit ***${options.accountId.slice(-4)}（${mode}，每腿 ${options.legQty}，最大亏损上限 ${options.limits.maxRiskUsd} / 保证金上限 ${options.limits.maxMarginUsd} USD，定时开仓配置${options.autoOpen ? `开（周五 ${time} UTC）` : '关'}${options.marketFallback ? '，IOC 兜底开' : ''}）`;
+  return `，期权账户 Bybit ***${options.accountId.slice(-4)}（${mode}，每腿 ${options.legQty}，最大亏损上限 ${options.limits.maxRiskUsd} / 保证金上限 ${options.limits.maxMarginUsd} USD，定时开仓配置${options.strategyMode === 'trend_m50' ? '不适用（M50 按每日信号手动确认）' : options.autoOpen ? `开（周五 ${time} UTC）` : '关'}${options.marketFallback ? '，IOC 兜底开' : ''}）`;
 }

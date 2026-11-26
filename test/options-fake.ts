@@ -20,6 +20,8 @@ export const symbolOf = (strike: number, type: 'C' | 'P', day = DAY) => `BTC-${d
 
 export class FakeOptions {
   index = 100_000;
+  /** M50: every daily close of the index-price-kline (60 UTC days before the clock's day); null answers an error. */
+  dailyClose: number | null = 90_000;
   /** Shift applied to every quote (bid, ask, mark) on top of the grid. */
   quoteShift = 0;
   /** Per symbol shift on top of quoteShift. */
@@ -131,6 +133,13 @@ export class FakeOptions {
     switch (path) {
       case '/v5/market/time': return ok({ timeNano: `${BigInt(Date.now()) * 1_000_000n}` });
       case '/v5/market/instruments-info': return list(this.rows().map(row => ({ symbol: row.symbol, deliveryTime: String(row.expiry), optionsType: row.type === 'C' ? 'Call' : 'Put', lotSizeFilter: { minOrderQty: '0.01', qtyStep: '0.01', maxOrderQty: '500' }, priceFilter: { tickSize: '5' } })));
+      case '/v5/market/index-price-kline': {
+        if (this.dailyClose === null) return fail(10016, 503);
+        const today = Math.floor(this.clock() / 86_400_000) * 86_400_000;
+        // Newest first, today's unfinished candle included, as Bybit lists them.
+        const rows = Array.from({ length: 60 }, (_, back) => [String(today - back * 86_400_000), '1', '1', '1', String(back === 0 ? this.index : this.dailyClose)]);
+        return ok({ symbol: 'BTCUSDT', category: 'linear', list: rows });
+      }
       case '/v5/market/tickers': {
         if (params.get('category') === 'linear') return list([{ symbol: 'BTCUSDT', indexPrice: String(this.index), markPrice: String(this.index) }]);
         const symbol = params.get('symbol');

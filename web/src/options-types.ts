@@ -3,7 +3,7 @@
 
 export type Side = 'Buy' | 'Sell';
 export type OptionType = 'Call' | 'Put';
-export type StrategyMode = 'iron_condor' | 'short_strangle';
+export type StrategyMode = 'iron_condor' | 'short_strangle' | 'trend_m50';
 export type TaskStatus = 'accepted' | 'running' | 'stopping' | 'recovering' | 'recovery_needed' | 'completed' | 'partial' | 'stopped' | 'failed';
 
 export interface ChainRow {
@@ -69,6 +69,8 @@ export interface AccountHealth {
   portfolioMargin?: PortfolioMargin | null; portfolioMarginMessage?: string;
 }
 export interface ScheduleView {
+  /** False while config.json names M50 (v0.97): the Friday scheduler does not run; absent before v0.97. */
+  applicable?: boolean;
   enabled: boolean; source: 'config' | 'page'; configEnabled: boolean; hourUtc: number; minuteUtc: number; windowSeconds: number;
   marketFallback: boolean; nextAt: number; inWindow: boolean; waiting: boolean; lastOpenWeek: string | null;
   lastError: { week: string; message: string | null; at: number | null } | null;
@@ -85,6 +87,14 @@ export interface OptionsState {
   schedule?: ScheduleView;
   /** An RFQ not yet settled (G2c); absent from a pre-G2c service. */
   rfqActive?: boolean;
+  /** M50 均线择边 (v0.97); absent from an older service. */
+  m50?: M50View;
+}
+export interface TrendSignal { day: string; at: number; index: number; ma: number; side: 'Put' | 'Call' }
+export type M50Action = 'no_signal' | 'open' | 'hold' | 'switch' | 'settling' | 'other_strategy';
+export interface M50View {
+  configured: boolean; day: string; signal: TrendSignal | null; lastSignal: TrendSignal | null; action: M50Action;
+  trackedSide: 'Put' | 'Call' | null; trackedExpiry: number | null; error: string | null; notifiedDay: string | null;
 }
 
 // GET /api/options/rfq and the RFQ writes (G2c 组合询价).

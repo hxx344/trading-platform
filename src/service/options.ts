@@ -117,7 +117,7 @@ export function createEngineFor(runtime: OptionsRuntime, { notify, log, now = Da
 const QUANTITY = /^\d{1,4}(\.\d{1,8})?$/;
 const mode = (value: unknown, name = 'mode'): StrategyMode | undefined => {
   if (value === undefined || value === null) return undefined;
-  if (!STRATEGY_MODES.includes(value as StrategyMode)) reject('invalid_value', `${name}须为 iron_condor 或 short_strangle`);
+  if (!STRATEGY_MODES.includes(value as StrategyMode)) reject('invalid_value', `${name}须为 iron_condor、short_strangle 或 trend_m50`);
   return value as StrategyMode;
 };
 const quantity = (value: unknown): string | undefined => {
@@ -201,6 +201,7 @@ export function optionsLoops(runtime: OptionsRuntime, engine: OptionsEngine, con
     every(RECONCILE_MS, '对账', engine.reconcileOnce),
     every(HEALTH_MS, '账户健康度读取', engine.refreshHealth),
     every(SCHEDULE_TICK_MS, '定时开仓', engine.autoOpenTick),
+    every(SCHEDULE_TICK_MS, 'M50 信号', engine.trendTick),
     every(PERFORMANCE_TICK_MS, '收益采样', engine.performanceTick),
     every(RFQ_TICK_MS, '询价核对', engine.rfqTick),
     (async () => {

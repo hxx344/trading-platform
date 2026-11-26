@@ -283,8 +283,9 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
   const m50Key = strategy === 'trend_m50' ? `${data?.m50?.day ?? ''}|${data?.m50?.signal?.side ?? ''}` : '';
   const previewPath = `/api/options/preview?quantity=${encodeURIComponent(quantity ?? '1')}&mode=${strategy}${m50Key ? `&signal=${encodeURIComponent(m50Key)}` : ''}`;
   const previewRead = useLiveResource<PreviewView>(previewPath, { intervalMs: MARKET_MS, timeoutMs: OPTIONS_READ_TIMEOUT_MS, onExpired, enabled: tab === 'desk' && quantity !== null });
-  // A failed M50 read (no signal yet) must not leave the last day's leg on the desk.
-  const m50Stale = strategy === 'trend_m50' && previewRead.error !== null && previewRead.error !== undefined;
+  // An M50 read refused by the service (409: no signal yet, side changed) must not leave the last day's leg on the desk;
+  // a passing timeout keeps the last preview as other reads do.
+  const m50Stale = strategy === 'trend_m50' && (previewRead.error as { status?: number } | null)?.status === 409;
   const preview = quantity !== null && !m50Stale ? previewRead.data?.preview ?? null : null;
   const riskProblem = quantity === null ? '每腿数量须为正数（最多 8 位小数）' : m50Stale ? previewRead.error!.message : previewRead.data?.riskProblem ?? (previewRead.error && !previewRead.data ? previewRead.error.message : null);
   const previewExpiry = strategy === 'trend_m50' ? preview?.expiry ?? null : null;

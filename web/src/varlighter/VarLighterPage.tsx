@@ -7,7 +7,7 @@ import { useDeferredValue, useState } from 'react';
 import { api } from '../api.ts';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { useLiveResource } from '../use-live-resource.ts';
-import type { OrphanRow, StateRow, StateView, VenueStatus } from '../../../src/varlighter/views.ts';
+import type { OrphanRow, PositionSummary, StateRow, StateView, VenueStatus } from '../../../src/varlighter/views.ts';
 import { Badge, Metric, useWrite } from './parts.tsx';
 import { VarLighterDetail } from './VarLighterDetail.tsx';
 import { VarLighterPaper } from './VarLighterPaper.tsx';
@@ -36,7 +36,7 @@ export function VarLighterPage({ tab, symbol, onExpired }: { tab: VarLighterTab;
   const { data, error, status, receivedAt } = live;
   return <div className="vl-page" data-varlighter>
     <header className="wb-heading"><div><h1>DEX 价差</h1>
-      <p>比较同一资产在 Var、Lighter RH、Lighter 主网与 Entropy 上的价格：价差明显偏离平时水平时开仓，回到平时水平后平仓。目前只做模拟盘，不向任何交易所下单。</p></div>
+      <p>比较同一资产在 Var、Lighter RH、Lighter 主网与 Entropy 上的价格。价差明显偏离平时水平时模拟开仓，回到平时水平后模拟平仓。成交价取自盘口或与成交数量匹配的 Var 询价。</p></div>
       {data ? <Sources view={data} /> : null}</header>
     <nav className="vl-tabs" aria-label="DEX 价差页签">
       {VARLIGHTER_TABS.map(item => <a key={item.id} href={varLighterHref(item.id, item.id === 'detail' ? symbol : null)} aria-current={tab === item.id ? 'page' : undefined}>{item.label}</a>)}
@@ -142,6 +142,10 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
     </section>
   </>;
 }
+
+const positionPnl = ({ pnlBps, estimated }: PositionSummary): string | null =>
+  pnlBps === null ? null : `${bps(pnlBps)} 基点${estimated ? '（估算）' : ''}`;
+
 /** 已启用或有持仓、但已失联的键（下架、规格改判、长时间无样本）：可停用，持仓按最后样本平仓。 */
 function Orphans({ view, rows, write, onChanged }: { view: StateView; rows: OrphanRow[]; write: ReturnType<typeof useWrite>; onChanged: () => Promise<void> }) {
   const label = (row: OrphanRow) => `${row.symbol}（${row.a && row.b ? `${venueShort(row.a.venue)}↔${venueShort(row.b.venue)}` : row.key}）`;
@@ -163,7 +167,7 @@ function Orphans({ view, rows, write, onChanged }: { view: StateView; rows: Orph
       <thead><tr><th>标的</th><th>状态</th><th>最后样本</th><th /></tr></thead>
       <tbody>{rows.map(row => <tr key={row.key}>
         <td><span className="vl-symbol">{row.symbol}</span><small>{row.a && row.b ? `${row.a.name} ↔ ${row.b.name}` : row.key}</small></td>
-        <td className="wrap">{row.reason}<small>{row.enabled ? <Badge tone="warn">已启用</Badge> : null} {row.position ? <>{directionShort(row.position.direction, row.a?.venue ?? null)} 持仓{row.position.pnlBps === null ? '' : ` ${bps(row.position.pnlBps)} 基点`}</> : null}</small></td>
+        <td className="wrap">{row.reason}<small>{row.enabled ? <Badge tone="warn">已启用</Badge> : null} {row.position ? <>{directionShort(row.position.direction, row.a?.venue ?? null)} 持仓 {positionPnl(row.position)}</> : null}</small></td>
         <td>{age(row.lastSampleAt, view.now)}</td>
         <td><div className="vl-actions">
           {row.enabled ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => disable(row)}>停用</button> : null}
@@ -186,7 +190,7 @@ function SymbolCell({ row, multi, simple }: { row: StateRow; multi: boolean; sim
     <small>{simple ? [row.name, row.kindName].filter(Boolean).join(' · ') : row.name}</small></td>;
 }
 function PaperCell({ row, now }: { row: StateRow; now: number }) {
-  return <td>{row.position ? <><Badge tone="info">持仓</Badge><small title={directionLabel(row.position.direction, row.a.venue, row.b.venue)}>{directionShort(row.position.direction, row.a.venue)} · {row.position.pnlBps === null ? '—' : `${bps(row.position.pnlBps)} 基点`}</small></>
+  return <td>{row.position ? <><Badge tone="info">持仓</Badge><small title={directionLabel(row.position.direction, row.a.venue, row.b.venue)}>{directionShort(row.position.direction, row.a.venue)} · {positionPnl(row.position) ?? '—'}</small></>
     : row.enabled ? <><Badge tone="ok">已启用</Badge>{row.cooldownUntil ? <small>冷却至 {clockOrDate(row.cooldownUntil, now)}</small> : null}</> : <span className="vl-dim">未启用</span>}</td>;
 }
 

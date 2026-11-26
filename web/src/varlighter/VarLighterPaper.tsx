@@ -7,7 +7,7 @@ import { useLiveResource } from '../use-live-resource.ts';
 import type { PaperView, StateView } from '../../../src/varlighter/views.ts';
 import { TradesPanel } from './VarLighterDetail.tsx';
 import { Badge, EquityChart, Metric, stampText, useWrite } from './parts.tsx';
-import { VARLIGHTER_BASE, bps, directionLabel, duration, pairLabel, percent, price, signedUsd, tone, usd, varLighterHref, venueShort } from './varlighter-form.ts';
+import { VARLIGHTER_BASE, VAR_QUOTE_LABELS, bps, directionLabel, duration, pairLabel, percent, price, signedUsd, tone, usd, varLighterHref, venueShort } from './varlighter-form.ts';
 
 const PAPER_PATH = `${VARLIGHTER_BASE}/paper`;
 
@@ -48,7 +48,8 @@ export function VarLighterPaper({ view, onChanged, onExpired }: { view: StateVie
           <td className="num">{price(position.aEntry)} / {price(position.ratio === 1 ? position.bEntry : position.bEntry / position.ratio)}<small>{pairLabel(position.symbol).a ? `${venueShort(pairLabel(position.symbol).a!)} / ${venueShort(pairLabel(position.symbol).b!)}` : ''}</small></td>
           <td className="num">{bps(position.entrySpread)} / {bps(position.entryBaseline)}</td>
           <td className="num">{duration(data.now - position.openedAt)}<small>上限 {duration(position.maxHoldMinutes * 60_000)}</small></td>
-          <td className={`num vl-${tone(position.mark?.netUsd) || 'dim'}`}>{position.mark ? <>{signedUsd(position.mark.netUsd)}<small>{bps(position.mark.pnlBps)} 基点 · {stampText(position.mark.at)}</small></> : '无可成交价'}</td>
+          <td className={`num vl-${tone(position.mark?.netUsd) || 'dim'}`}>{position.mark ? <>{signedUsd(position.mark.netUsd)}{position.mark.estimated ? '（估算）' : ''}<small>{bps(position.mark.pnlBps)} 基点 · {stampText(position.mark.at)}</small>
+            {position.mark.varSource ? <small>Var {VAR_QUOTE_LABELS[position.mark.varSource]}</small> : null}</> : '无可成交价'}</td>
           <td><button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => close(position.symbol)}>{write.busy === `close:${position.symbol}` ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <X size={14} aria-hidden="true" />}平仓</button></td>
         </tr>)}</tbody></table></div> : <TableEmpty>{view.rows.some(row => row.enabled) ? '没有持仓，等待价差偏离到入场阈值' : '还没有启用任何配对，在标的详情里调好参数后启用'}</TableEmpty>}
     </section>

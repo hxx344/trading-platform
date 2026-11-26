@@ -387,60 +387,109 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
   const first = (key: string, at: number): boolean => Number(db.prepare('INSERT OR IGNORE INTO once(key, at) VALUES (?, ?)').run(key, at).changes) > 0;
   /**
    * In memory, per switched-on pair out of order: since when it waits (restarted by a confirmed transfer), when the trouble
-   * first began (for the duration in the messages), and when it was last reported (null: not yet).
+   * first began, when it was last reported, and the reason for a first report that could not be queued.
    */
-  const stuck = new Map<string, { since: number; began: number; sentAt: number | null }>();
+  const stuck = new Map<string, { since: number; began: number; sentAt: number | null; missed: string | null }>();
+  // Keep the observed recovery until handoff, even if the next reading is unknown or another incident starts.
+  const recoveries = new Map<string, { text: string; additional: number }>();
+  let progressSeq = latestSeq();
 
-  function poll(): void {
-    const at = now();
+  function observeProgress(rows: readonly EventRow[], at: number): void {
+    for (const row of rows) {
+      if (row.seq <= progressSeq) continue;
+      progressSeq = row.seq;
+      if (row.type !== 'transfer-settled') continue;
+      let detail: { pair?: unknown; state?: unknown } = {};
+      try { detail = JSON.parse(row.json) as typeof detail; } catch { continue; }
+      const entry = detail?.state === 'confirmed' && typeof detail.pair === 'string' ? stuck.get(detail.pair) : undefined;
+      if (entry) entry.since = Math.max(entry.since, Math.min(at, row.at));
+    }
+  }
+
+  function pollEvents(at: number): void {
     for (;;) {
       const after = (db.prepare('SELECT seq FROM cursor WHERE id = 1').get() as { seq: number }).seq;
       const rows = events(after, EVENTS_PER_POLL);
       if (!rows.length) break;
+      observeProgress(rows, at);
       tx(() => {
         for (const row of rows) {
           const message = describeEvent(row, incidentPair, job);
           if (message && (!message.repeatKey || fresh(message.repeatKey, at)) && (!message.onceKey || first(message.onceKey, at))) insert(message.text, at);
-          // A transfer that went through is progress: the wait restarts, as the workbench did, so a pair balancing in
-          // steps (each capped by the per-transfer limit) is not reported while it keeps moving.
-          if (row.type === 'transfer-settled') {
-            let detail: { pair?: unknown; state?: unknown } = {};
-            try { detail = JSON.parse(row.json) as typeof detail; } catch { /* not progress */ }
-            const entry = typeof detail.pair === 'string' && detail.state === 'confirmed' ? stuck.get(detail.pair) : undefined;
-            if (entry) entry.since = at;
-          }
         }
         db.prepare('UPDATE cursor SET seq = ? WHERE id = 1').run(rows.at(-1)!.seq);
       });
       if (rows.length < EVENTS_PER_POLL) break;
     }
+  }
+
+  function pollMargins(at: number, progressKnown: boolean): void {
     const seen = new Set<string>();
     for (const pair of pairs()) {
       if (!pair.enabled) continue;
       seen.add(pair.id);
       const problem = marginProblem(pair);
       const entry = stuck.get(pair.id);
-      if (problem === 'unknown') continue;
       // Each post counts once its row is queued: a failed insert leaves the entry as it was for the next poll, and the
       // other pairs are still checked this round.
       const queued = (text: string): boolean => {
         try { tx(() => insert(text, at)); return true; }
         catch (error) { log(`保证金平衡告警未能入队，下一轮重试：${error instanceof Error ? error.message.slice(0, 160) : String(error)}`); return false; }
       };
+      const pending = recoveries.get(pair.id);
+      if (pending && queued(pending.additional ? `${pending.text}。等待入队期间另有 ${pending.additional} 次异常已恢复` : pending.text)) recoveries.delete(pair.id);
+      if (problem === 'unknown') continue;
       if (!problem) {
-        if (entry?.sentAt != null && !queued(`【保证金平衡恢复】配对 ${pair.id}，异常共约 ${lasted(at - entry.began)}：${balanceLine(pair)}`)) continue;
+        if (entry && (entry.sentAt !== null || entry.missed !== null)) {
+          const text = entry.sentAt !== null
+            ? `【保证金平衡恢复】配对 ${pair.id}，异常共约 ${lasted(at - entry.began)}：${balanceLine(pair)}`
+            : `【保证金平衡异常（已恢复）】配对 ${pair.id}，此前${entry.missed}。首报未能入队，现已恢复：${balanceLine(pair)}`;
+          const previous = recoveries.get(pair.id);
+          if (previous) previous.additional++;
+          else if (!queued(text)) recoveries.set(pair.id, { text, additional: 0 });
+        }
         stuck.delete(pair.id);
         continue;
       }
-      if (!entry) { stuck.set(pair.id, { since: at, began: at, sentAt: null }); continue; }
-      if (at - entry.since < FAULT_AFTER_MS) continue;
+      if (!entry) { stuck.set(pair.id, { since: at, began: at, sentAt: null, missed: null }); continue; }
+      if (!progressKnown || at - entry.since < FAULT_AFTER_MS) continue;
       if (entry.sentAt === null) {
-        if (queued(`【保证金平衡异常】配对 ${pair.id} 已持续 ${lasted(at - entry.began)}：${clip(problem)}。${balanceLine(pair)}。持续 ${FAULT_AFTER_MS / 1000} 秒告警，未恢复每 ${FAULT_REPEAT_MS / 1000} 秒重复提醒，恢复后通知一次`)) entry.sentAt = at;
+        if (!recoveries.has(pair.id) && queued(`【保证金平衡异常】配对 ${pair.id} 已持续 ${lasted(at - entry.began)}：${clip(problem)}。${balanceLine(pair)}。持续 ${FAULT_AFTER_MS / 1000} 秒告警，未恢复每 ${FAULT_REPEAT_MS / 1000} 秒重复提醒，恢复后通知一次`)) {
+          entry.sentAt = at;
+          entry.missed = null;
+        } else {
+          entry.missed ??= clip(problem);
+        }
       } else if (at - entry.sentAt >= FAULT_REPEAT_MS) {
         if (queued(`【保证金平衡仍异常】配对 ${pair.id} 已持续 ${lasted(at - entry.began)}：${clip(problem)}。${balanceLine(pair)}`)) entry.sentAt = at;
       }
     }
     for (const id of [...stuck.keys()]) if (!seen.has(id)) stuck.delete(id);
+    for (const id of recoveries.keys()) if (!seen.has(id)) recoveries.delete(id);
+  }
+
+  function catchUpProgress(at: number): boolean {
+    // The outbox cursor may be stuck several pages behind a confirmed transfer. The normal path shares its reads.
+    const end = latestSeq();
+    if (!stuck.size) progressSeq = end;
+    while (progressSeq < end) {
+      const rows = events(progressSeq, EVENTS_PER_POLL);
+      if (!rows.length) return false;
+      observeProgress(rows, at);
+    }
+    return true;
+  }
+
+  function poll(): void {
+    const at = now();
+    try { pollEvents(at); }
+    catch (error) {
+      let progressKnown = false;
+      try { progressKnown = catchUpProgress(at); } catch { /* report the event error after observing balances */ }
+      pollMargins(at, progressKnown);
+      throw error;
+    }
+    pollMargins(at, true);
   }
 
   /** Queues a message that does not come from the event log (start, stop, lost lease, market alerts); its outbox id, null without a robot. */

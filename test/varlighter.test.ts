@@ -7,10 +7,10 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { BUSY_BLOCK, COST_BLOCK, DECAYED, FALLBACK_BLOCK, FEE_BLOCK, NO_LIVE_TOP, THIN_BLOCK, closeSpread, confirmOpen, expectedNetBps, openEconomics, slippageBudgetBps } from '../src/varlighter/strategy.ts';
-import { DEFAULT_COMBOS, SAMPLE_FIELDS, comboPairs, customPairInfo, sameSymbol, executionSample, formatRatio, hasTokenQuote, legacyKeyOf, lighterMarket, pairKey, pairTitle, parseEntropyMarkets, upgradeKey, varMarket, type MarketSpec } from '../src/varlighter/model.ts';
+import { BUSY_BLOCK, COST_BLOCK, DECAYED, FALLBACK_BLOCK, FEE_BLOCK, NO_LIVE_TOP, NO_QUOTE_TIME, STALE_QUOTE, THIN_BLOCK, closeSpread, confirmOpen, expectedNetBps, openEconomics, slippageBudgetBps } from '../src/varlighter/strategy.ts';
+import { DEFAULT_COMBOS, SAMPLE_FIELDS, comboPairs, customPairInfo, sameSymbol, targetSpread, formatRatio, varQuoteQty, legacyKeyOf, lighterMarket, pairKey, pairTitle, parseEntropyMarkets, upgradeKey, varMarket, type MarketSpec } from '../src/varlighter/model.ts';
 import type { SamplesView } from '../src/varlighter/views.ts';
-import { TOKEN_BLOCK_PAUSE_MS, TOKEN_ERROR_KEEP_MS, TOKEN_SYMBOL_PAUSE_MS, TOKEN_QUOTE_MAX_AGE_MS, createVarQuoter, parseTokenQuote, quoteQty, varInstrument, type VarQuoter } from '../src/varlighter/varquote.ts';
+import { TOKEN_BLOCK_PAUSE_MS, TOKEN_ERROR_KEEP_MS, TOKEN_SYMBOL_PAUSE_MS, TOKEN_QUOTE_MAX_AGE_MS, TOKEN_QUOTE_PHASE_MS, createVarQuoter, parseTokenQuote, varInstrument, type VarQuoter } from '../src/varlighter/varquote.ts';
 import { VARIATIONAL_SESSION_FILE } from '../src/monitor/variational-session.ts';
 import { fakeVariationalToken } from './monitor-fake.ts';
 import { pairMarkets, parsePairKey, parseRhMarkets, parseVarListings, parseVarQuote, regimeOf, spreadOf, midBasis, type Sample } from '../src/varlighter/model.ts';
@@ -33,7 +33,8 @@ const venueOf = (url: string) => url.includes('hyperliquid') ? 'entropy' : url.i
 
 function sample(t: number, aMid: number, bMid = 100, extra: Partial<Sample> = {}): Sample {
   return {
-    symbol: RH_BTC, t, receivedAt: t + 1_000, regime: 'all', ratio: 1,
+    symbol: RH_BTC, t, receivedAt: t + 1_000, regime: 'all', ratio: 1, captureKind: 'decision', decisionAt: t + 1_000,
+    aRxAt: null, bRxAt: t + 1_000, aTkQty: null, bTkQty: null, aTkReceivedAt: null, bTkReceivedAt: null,
     aAt: t, aMark: aMid, aIndex: null, aFunding: 0.1 / 8760,
     aBid0: aMid - 0.01, aAsk0: aMid + 0.01, aBid1k: aMid - 0.02, aAsk1k: aMid + 0.02, aBid100k: aMid - 0.05, aAsk100k: aMid + 0.05,
     aBidRx: null, aAskRx: null, aBidTk: null, aAskTk: null, aTkAt: null,
@@ -260,7 +261,7 @@ test('开平仓：A 偏贵卖 A 买 B，回到基线平仓，按两腿成交价�
   assert.equal(scaledHeld.ratio, 0.5);
 });
 
-test('开仓风控：暂停、未确认规格、时段、报价过旧、冷却、手续费未知、同腿互斥、持仓与名义上限、当日亏损', () => {
+test('开仓风控：暂停、未确认规格、时段、冷却、手续费未知、同腿互斥、持仓与名义上限、当日亏损', () => {
   const params: SymbolParams = { ...DEFAULT_SYMBOL, enabled: true, regimes: ['all'] };
   const context = { openPositions: 0, openNotionalUsd: 0, dailyNetUsd: 0, cooldownUntil: 0, eligible: true };
   const value = sample(T0, 100);
@@ -269,7 +270,6 @@ test('开仓风控：暂停、未确认规格、时段、报价过旧、冷却�
   assert.equal(openBlocker(value, { ...params, enabled: false }, DEFAULT_GLOBAL, context), '未启用');
   assert.equal(openBlocker(value, params, DEFAULT_GLOBAL, { ...context, eligible: false }), '规格未确认');
   assert.equal(openBlocker({ ...value, regime: 'rth' }, params, DEFAULT_GLOBAL, context), '当前时段不开仓');
-  assert.equal(openBlocker({ ...value, receivedAt: value.t + 120_000 }, params, DEFAULT_GLOBAL, context), '报价过旧');
   assert.equal(openBlocker(value, params, DEFAULT_GLOBAL, { ...context, cooldownUntil: T0 + 1 }), '冷却中');
   assert.equal(openBlocker(value, params, DEFAULT_GLOBAL, { ...context, feeUnknown: true }), FEE_BLOCK);
   assert.equal(openBlocker(value, params, DEFAULT_GLOBAL, { ...context, legBusy: true }), BUSY_BLOCK);
@@ -311,23 +311,22 @@ test('开仓复核：按判断时刻的 B 腿一档重算，信号消失不开�
   const open = (value: Sample) => { const decision = decide(value, baseline, params, null); assert.equal(decision.kind, 'open'); return decision as Extract<typeof decision, { kind: 'open' }>; };
   // 报价时刻卖 A 价差 26 基点；拿到报价时 B 已涨到 100.2，只剩约 6 基点。
   const gone = sample(T0, 100.3, 100, { bBidRx: 100.19, bAskRx: 100.21 });
-  assert.equal(confirmOpen(gone, baseline, params, open(gone), true), DECAYED);
+  assert.equal(confirmOpen(gone, baseline, params, open(gone), 30), DECAYED);
   // B 只涨了 5 分：仍有约 21 基点，按 100.07（那一刻的一档加原来的冲击）买入。
   const still = sample(T0, 100.3, 100, { bBidRx: 100.04, bAskRx: 100.06 });
-  const confirmed = confirmOpen(still, baseline, params, open(still), true);
+  const confirmed = confirmOpen(still, baseline, params, open(still), 30);
   assert.ok(typeof confirmed !== 'string');
   if (typeof confirmed === 'string') return;
-  assert.ok(Math.abs(confirmed.sample.bAsk1k! - 100.07) < 1e-9);
-  assert.ok(Math.abs(confirmed.decision.deviation - (100.28 - 100.07) / 100.05 * 1e4) < 1e-6);
-  const held = openPosition('p1', confirmed.sample, params, confirmed.decision, baseline, ZERO_FEES);
+  assert.ok(Math.abs(confirmed.spread.prices.bAsk - 100.07) < 1e-9);
+  assert.ok(Math.abs(confirmed.deviation - (100.28 - 100.07) / 100.05 * 1e4) < 1e-6);
+  const held = openPosition('p1', still, params, confirmed, baseline, ZERO_FEES);
   assert.ok(Math.abs(held.bEntry - 100.07) < 1e-9);
-  // 没有记录那一刻的一档：模拟盘不开，回测旧样本沿用样本本身。
+  // 已有决策时刻却缺行情流一档，或旧样本缺来源时间，分别说明原因。
   const legacy = sample(T0, 100.3, 100, { bBidRx: null, bAskRx: null });
-  assert.equal(executionSample(legacy), null);
-  assert.equal(confirmOpen(legacy, baseline, params, open(legacy), true), NO_LIVE_TOP);
-  assert.equal((confirmOpen(legacy, baseline, params, open(legacy), false) as { sample: Sample }).sample, legacy);
+  assert.equal(confirmOpen(legacy, baseline, params, open(legacy), 30), NO_LIVE_TOP);
+  assert.equal(confirmOpen({ ...legacy, decisionAt: null, captureKind: null }, baseline, params, open(legacy), 30), NO_QUOTE_TIME);
   // 平仓同样按那一刻的价：卖出 B 用 100.04 − 0.01。
-  const exit = closeSpread(still, held, spreadOf(still, '1k')!);
+  const exit = closeSpread(still, held)!;
   assert.ok(Math.abs(exit.prices.bBid - 100.03) < 1e-9);
   // 预期净利：偏离 26 − 出场 0 − 半个往返成本 4 − 四次滑点 4 = 18 基点。
   const plain = sample(T0, 100.3), net = expectedNetBps(open(plain), params, COSTS);
@@ -336,7 +335,7 @@ test('开仓复核：按判断时刻的 B 腿一档重算，信号消失不开�
   assert.equal(openBlocker(plain, params, DEFAULT_GLOBAL, { ...context, expectedNetBps: net }), null);
   assert.equal(openBlocker(plain, params, { ...DEFAULT_GLOBAL, minNetBps: 19 }, { ...context, expectedNetBps: net }), THIN_BLOCK);
   assert.equal(openBlocker(plain, params, DEFAULT_GLOBAL, { ...context, fallbackBaseline: true }), FALLBACK_BLOCK);
-  assert.equal(openBlocker({ ...plain, receivedAt: plain.t + 31_000 }, params, DEFAULT_GLOBAL, context), '报价过旧', '默认时效 30 秒');
+  assert.equal(confirmOpen({ ...plain, decisionAt: plain.t + 31_000 }, baseline, params, open(plain), DEFAULT_GLOBAL.maxQuoteAgeSec), STALE_QUOTE, '默认时效 30 秒');
   assert.equal(openBlocker(plain, params, DEFAULT_GLOBAL, { ...context, expectedNetBps: 50, costBps: 60 }), COST_BLOCK, '往返成本达到止损线，偏离再大也不开');
   // 滑点预算：偏离刚好等于入场线、四次成交把保护用满后仍剩最低净利；每腿 1 到 10 基点。
   const fees = { minNetBps: 3, ...ZERO_FEES };
@@ -369,11 +368,11 @@ test('回测与模拟盘同规则：按判断时刻的价开平仓，信号消�
   const chased = run(oscillating(600).map((item, index) => spike(index) ? { ...item, bBidRx: 100.24, bAskRx: 100.26 } : item));
   assert.equal(chased.trades.length, 0);
   assert.ok(chased.summary.blocked[DECAYED] >= 15);
-  // 已开始记录判断时刻的一档之后，冲高时没有它（行情流当时不可用）不开；整段都没有的旧样本沿用样本本身。
+  // 新样本缺一档、整段全空都拒绝开仓。
   const gaps = run(oscillating(600).map((item, index) => spike(index) ? { ...item, bBidRx: null, bAskRx: null } : item));
   assert.equal(gaps.trades.length, 0);
   assert.ok(gaps.summary.blocked[NO_LIVE_TOP] >= 15);
-  assert.ok(run(oscillating(600).map(item => ({ ...item, bBidRx: null, bAskRx: null }))).trades.length >= 15);
+  assert.ok(run(oscillating(600).map(item => ({ ...item, bBidRx: null, bAskRx: null }))).summary.blocked[NO_LIVE_TOP] >= 15);
   // 美股：第 200 分钟从夜盘切到盘中，第 225 分钟的冲高时盘中样本只有 25 个，基线退回全天，不开；第 255 分钟照常开。
   const equity = run(oscillating(600).map((item, index) => ({ ...item, regime: index < 200 ? 'overnight' as const : 'rth' as const })), {}, {}, 'equity');
   assert.equal(equity.summary.blocked[FALLBACK_BLOCK], 1);
@@ -517,9 +516,16 @@ test('样本库升级：旧库补上判断时刻一档的两列，旧样本读�
     for (let round = 0; round < 2; round++) {
       const store = openVarLighterStore(file);
       try {
-        const before = store.samples(RH_BTC, 0, 1500)[0];
+        const before = store.samples(RH_BTC, 1000, 1500)[0];
         assert.deepEqual([before.symbol, before.ratio, before.aAt, before.aBid0, before.bAt, before.bBidRx], [RH_BTC, 1, 1000, 99.9, 900, null], '旧表的样本按新键读出');
-        if (round === 0) assert.equal(store.addSamples([sample(5000, 100.2, 100, { symbol: RH_BTC })]), 1);
+        assert.deepEqual([before.captureKind, before.decisionAt], ['aligned', null], '升级前确实没有决策盘口列，不改写旧报价时刻');
+        if (round === 0) {
+          assert.equal(store.addSamples([sample(5000, 100.2, 100, { symbol: RH_BTC })]), 1);
+          // 回退版本仍按旧列名写；即使写入的时刻更早，也不能继承旧行的来源标记。
+          const rollback = new DatabaseSync(file);
+          try { rollback.exec("INSERT INTO samples(symbol,t,received_at,regime,var_mark,var_bid0,var_ask0,var_bid1k,var_ask1k,rh_at,rh_bid0,rh_ask0) VALUES ('rh:BTC',500,600,'all',100,99,101,99,101,450,99,101)"); } finally { rollback.close(); }
+        }
+        assert.equal(store.samples(RH_BTC, 0, 900)[0].captureKind, null);
         assert.equal(store.latest(RH_BTC)!.bAskRx, 100.01);
       } finally { store.close(); }
     }
@@ -1021,9 +1027,9 @@ test('持仓取价：100k 档缺盘口快照时退回 1k 档估算，超时与�
   const held = position(RH_BTC, { openedAt: T0, qty: 50, notionalUsd: 5_000, entrySpread: 25, entryRegime: 'all', aEntry: 100.25, bEntry: 100.02 });
   const now = sample(T0 + 5 * 60_000, 100.3);
   assert.equal(spreadOf(now, '100k'), null, '100k 档缺 B 腿盘口');
-  const spread = positionSpread(now, 5_000)!;
+  const spread = positionSpread(now, held)!;
   assert.equal(spread.estimated, true);
-  assert.deepEqual(spread, { ...spreadOf(now, '1k')!, estimated: true });
+  assert.deepEqual([spread.varSource, spread.prices.aAsk, spread.prices.bBid], ['100k', now.aAsk100k, now.bBid1k], '保留有深度那条腿的档位，只有缺盘口的一腿退小档');
   assert.equal(decide(now, null, params, held).kind, 'hold');
   const late = decide(sample(T0 + 31 * 60_000, 100.3), null, params, held);
   assert.equal(late.kind === 'close' && late.reason, 'timeout', '缺 100k 档也按时超时平仓');
@@ -1092,7 +1098,7 @@ test('失联配对：总览列出，可停用，持仓按最后样本平仓并�
   const GONE = 'var:GONE|rh:GONE';
   const { dir, file, engine, sockets, dispose } = seededEngine(store => {
     store.setState(SETTINGS_KEY, settings2({ [RH_BTC]: { ...DEFAULT_SYMBOL, enabled: true }, [GONE]: { ...DEFAULT_SYMBOL, enabled: true, cooldownMinutes: 120 } }), T0);
-    store.addSamples([sample(T0 - 30 * 60_000, 100.1, 100, { symbol: GONE }), sample(T0 - 20 * 60_000, 100.1, 100, { symbol: RH_BTC })]);
+    store.addSamples([sample(T0 - 30 * 60_000, 100.1, 100, { symbol: GONE, aBidTk: 91, aAskTk: 92, aTkQty: 1, aTkAt: T0 - 30 * 60_000 + 100, aTkReceivedAt: T0 - 30 * 60_000 + 500 }), sample(T0 - 20 * 60_000, 100.1, 100, { symbol: RH_BTC })]);
     store.savePosition(position(GONE));
     store.savePosition(position(RH_BTC));
   });
@@ -1108,7 +1114,7 @@ test('失联配对：总览列出，可停用，持仓按最后样本平仓并�
     assert.deepEqual({ ...orphan, position: { ...orphan.position!, pnlBps: null } }, {
       key: GONE, a: { venue: 'var', symbol: 'GONE', name: 'Var' }, b: { venue: 'rh', symbol: 'GONE', name: 'Lighter RH' }, venue: 'rh', venueName: 'Lighter RH', symbol: 'GONE',
       reason: '配对已不在目录里（或组合已关闭、手动配对已删除）', enabled: true, lastSampleAt: T0 - 30 * 60_000,
-      position: { direction: 'a_rich', openedAt: T0 - 3_600_000, pnlBps: null } });
+      position: { direction: 'a_rich', openedAt: T0 - 3_600_000, pnlBps: null, estimated: false } });
     assert.equal(typeof orphan.position!.pnlBps, 'number');
     assert.equal(engine.views.state().rows.find(row => row.key === RH_BTC)?.samples24h, 1, '近 24 小时计数含启动前的样本');
 
@@ -1116,7 +1122,9 @@ test('失联配对：总览列出，可停用，持仓按最后样本平仓并�
     assert.deepEqual(code(() => engine.views.close({ symbol: 'BTC' })), [400, 'invalid_symbol']);
     assert.deepEqual(code(() => engine.views.close({ symbol: RH_BTC, extra: 1 })), [400, 'invalid_body']);
     assert.deepEqual(code(() => engine.views.close({ symbol: 'rh:BTC' })), [409, 'no_quote'], '还在目录里的配对要 10 分钟内的报价（旧键照样认）');
+    const mark = engine.views.paper().positions.find(item => item.symbol === GONE)!.mark!;
     const trade = engine.views.close({ symbol: GONE });
+    assert.deepEqual([mark.varSource, trade.exitVarSource, trade.aExit, trade.netUsd], ['100k', '100k', 100.1 + 0.05, mark.netUsd], '失联仓最后样本的小数量询价不能用于该仓，估值与手动结算一致');
     assert.equal(trade.closedAt, T0 - 30 * 60_000, '失联配对按最后样本结算');
     assert.match(engine.views.paper().events[0].message, /配对已不在目录里.*按最后样本/);
     const disabled = engine.views.settings({ revision: 3, symbols: { [GONE]: { ...DEFAULT_SYMBOL, enabled: false } } });
@@ -1130,6 +1138,29 @@ test('失联配对：总览列出，可停用，持仓按最后样本平仓并�
   } finally { dispose(true); }
   const reopened = openVarLighterStore(file);
   try { assert.equal(reopened.state<Record<string, number>>(COOLDOWN_KEY)?.[GONE], T0 - 30 * 60_000 + 120 * 60_000, '冷却写进库，重启后仍在'); } finally { reopened.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('总览与失联持仓的浮盈共用模拟盘估值，开仓估算、盘口估算和无估值各自保留', async () => {
+  const gone = 'var:GONE|rh:GONE';
+  for (const [entryEstimated, missingTop, hasSample, expected] of [[true, false, true, true], [false, true, true, true], [false, false, true, false], [true, false, false, null]] as const) {
+    const fixture = seededEngine(store => {
+      for (const symbol of [RH_BTC, gone]) {
+        store.savePosition(position(symbol, { estimated: entryEstimated }));
+        if (hasSample) store.addSamples([sample(T0 - 60_000, 100.1, 100, { symbol, ...(missingTop && { bBidRx: null, bAskRx: null }) })]);
+      }
+    });
+    try {
+      const { engine, sockets } = fixture;
+      engine.startStreams(); sockets[0].open(); sockets[0].push(RH_SNAPSHOT);
+      const signal = new AbortController().signal;
+      await engine.refreshCatalog(signal, 'rh'); await engine.pollVar(signal);
+      const view = engine.views.state(), paper = engine.views.paper();
+      for (const row of [view.rows.find(item => item.key === RH_BTC)!, view.orphans.find(item => item.key === gone)!]) {
+        const mark = paper.positions.find(item => item.symbol === row.key)!.mark;
+        assert.deepEqual([row.position!.pnlBps, row.position!.estimated, mark?.estimated ?? null], [mark?.pnlBps ?? null, expected, expected]);
+      }
+    } finally { fixture.dispose(); }
+  }
 });
 
 test('失联判定：规格改判、数据源连续正常 30 分钟仍无样本才算；Var 失败、目录未取到、行情流断开、刚重启都不算，平仓等恢复；冷却重启后照样挡开仓', async () => {
@@ -1506,6 +1537,7 @@ test('接口：未登录 401、POST 缺页面标记 403、只读令牌不能读�
   const base = `http://127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}`;
   const stderr = process.stderr.write;
   const KEY = encodeURIComponent(RH_BTC);
+  const writer = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
   try {
     const cookie = ((await fetch(`${base}/login?token=vl-token-000001`, { redirect: 'manual' })).headers.get('set-cookie') ?? '').split(';')[0]!;
     const get = (route: string, headers: Record<string, string> = { cookie }) => fetch(base + route, { headers });
@@ -1529,7 +1561,6 @@ test('接口：未登录 401、POST 缺页面标记 403、只读令牌不能读�
     }
     assert.equal((await get(`/api/varlighter/samples?symbol=${KEY}&extra=1`, bearer)).status, 403, '多余参数');
     // The sample export: pages after a cursor, oldest first, columns in SAMPLE_FIELDS order.
-    const writer = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
     const rows = Array.from({ length: 5 }, (_, index) => sample(T0 + index * 60_000, 100.2));
     writer.addSamples([...rows, sample(T0, 50, 100, { symbol: LIGHTER_BTC })]);
     const page = async (query: string) => { const response = await get(`/api/varlighter/samples?${query}`, bearer); assert.equal(response.status, 200, query); return await response.json() as SamplesView; };
@@ -1545,15 +1576,17 @@ test('接口：未登录 401、POST 缺页面标记 403、只读令牌不能读�
     for (const query of ['symbol=BTC', `symbol=${KEY}&limit=0`, `symbol=${KEY}&limit=1001`, `symbol=${KEY}&after=-1`, `symbol=${KEY}&after=1.5`]) {
       assert.equal((await get(`/api/varlighter/samples?${query}`)).status, 400, query);
     }
-    // A full page of long-decimal prices stays inside the token's 512 KiB answer limit (READ_TOKEN_MAX_BYTES) with 5 % to spare.
-    // Two legs make a row ~35 columns (v0.88.0): this worst case is ~480 KB; real prices have fewer digits, and pull.ts halves limit on 413.
+    // 新增时间和数量证据后，长小数的千行可能超过 512 KiB；按游标续页可读完且不丢样本。
     writer.addSamples(Array.from({ length: 1000 }, (_, index) => sample(T0 + index * 60_000, 104523.123456789, 104520.987654321, { symbol: 'var:ETH|lighter:ETH',
       aBid100k: 104523.0712345, aAsk100k: 104523.1912345, bBid100k: 104520.9112345, bAsk100k: 104521.0612345, aBidTk: 104523.1012345, aAskTk: 104523.1512345, aTkAt: T0 + index * 60_000 - 1234 })));
     const full = await get(`/api/varlighter/samples?symbol=${encodeURIComponent('var:ETH|lighter:ETH')}`, bearer);
     assert.equal(full.status, 200);
-    const fullBytes = (await full.arrayBuffer()).byteLength;
+    const fullText = await full.text(), fullBytes = Buffer.byteLength(fullText);
+    const packed = JSON.parse(fullText) as SamplesView;
+    assert.ok(packed.next !== null && packed.rows.length < 1000, '较大样本按实际字节提前分页');
+    const tail = await page(`symbol=${encodeURIComponent('var:ETH|lighter:ETH')}&after=${packed.next}`);
+    assert.deepEqual([packed.rows.length + tail.rows.length, tail.next], [1000, null]);
     assert.ok(fullBytes < READ_TOKEN_MAX_BYTES * 0.95, `1000 行 ${fullBytes} 字节`);
-    writer.close();
     views.varlighter = localDexForward({ ...varLighterViews(holder), state: () => { throw new Error('secret /path/inside'); } });
     const written: string[] = [];
     process.stderr.write = ((chunk: string) => { written.push(String(chunk)); return true; }) as typeof process.stderr.write;
@@ -1564,6 +1597,7 @@ test('接口：未登录 401、POST 缺页面标记 403、只读令牌不能读�
     assert.ok(written.some(line => line.includes('secret')), '原文只进服务端日志');
   } finally {
     process.stderr.write = stderr;
+    writer.close();
     await new Promise(resolve => server.close(resolve)); h.dispose(); holder.engine?.close(); rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -1594,6 +1628,7 @@ test('Var 询价：各类别的合约写法、名义金额折数量、应答核�
   assert.deepEqual(varInstrument('commodity', 'CL'), { underlying: 'CL', instrument_type: 'perpetual_rwa_future', settlement_asset: 'USDC', kind: 'commodity' });
   assert.equal(varInstrument('other', 'XYZ'), null, '没确认过写法的类别不询价');
   assert.equal(varInstrument('crypto', 'btc/usd'), null);
+  const quoteQty = (notionalUsd: number, price: number) => varQuoteQty({ notionalUsd }, 'a', 1, price);
   assert.deepEqual([quoteQty(1000, 100.2), quoteQty(1000, 65_000), quoteQty(1000, 0.00012345), quoteQty(500, 250)], ['9.98', '0.01538', '8100000', '2']);
   assert.deepEqual([quoteQty(1000, 0), quoteQty(1000, NaN), quoteQty(10, 1e12), quoteQty(-5, 10), quoteQty(1e15, 1), quoteQty(999_999_999_999, 1)], [null, null, null, null, null, null]);
   assert.equal(quoteQty(999_900_000_000, 1), '999900000000');
@@ -1615,7 +1650,11 @@ test('Var 询价：各类别的合约写法、名义金额折数量、应答核�
 test('Var 询价器：没有 token 不发请求；被拒的 token 不再用、换新后恢复；被拦截只标暂不可用；应答不对不算 token 的问题；请求途中换 token 不误判', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-token-'));
   const file = path.join(dir, VARIATIONAL_SESSION_FILE);
-  const save = (token: string, revision: number) => writeFileSync(file, JSON.stringify({ version: 1, revision, token, updatedAt: new Date(T0).toISOString() }), { mode: 0o600 });
+  let pushed = { token: '', problem: '' };
+  const save = (token: string, revision: number) => {
+    pushed = { token, problem: '' };
+    writeFileSync(file, JSON.stringify({ version: 1, revision, token, updatedAt: new Date(T0).toISOString() }), { mode: 0o600 });
+  };
   let clock = T0;
   const sent: { url: string; cookie: string; body: unknown }[] = [];
   let reply: () => Response | Promise<Response> = () => new Response('{}');
@@ -1624,8 +1663,9 @@ test('Var 询价器：没有 token 不发请求；被拒的 token 不再用、�
     return reply();
   };
   const good = (extra: Record<string, unknown> = {}) => Response.json({ instrument: varInstrument('crypto', 'BTC'), qty: '9.98', bid: '100.19', ask: '100.21', mark_price: '100.2', timestamp: new Date(clock - 400).toISOString(), ...extra });
-  const quoter = createVarQuoter({ dir, fetcher: fetcher as typeof fetch, now: () => clock });
-  const ask = () => quoter.quote('crypto', 'BTC', 1000, 100.2, AbortSignal.timeout(1000));
+  // DEX 服务使用内存推送。Windows 没有 POSIX 0600，Linux 同时走真实的文件来源。
+  const quoter = createVarQuoter({ dir, source: process.platform === 'win32' ? () => pushed : undefined, fetcher: fetcher as typeof fetch, now: () => clock });
+  const ask = () => quoter.quote('crypto', 'BTC', '9.98', AbortSignal.timeout(1000));
   try {
     assert.deepEqual([quoter.usable(), quoter.view().status, quoter.view().statusName], [false, 'missing', '未配置']);
     await assert.rejects(ask(), /没有可用的 Var token/);
@@ -1639,8 +1679,8 @@ test('Var 询价器：没有 token 不发请求；被拒的 token 不再用、�
     assert.deepEqual(sent[0], { url: 'https://omni.variational.io/api/quotes/indicative', cookie: `vr-token=${first}`, body: { instrument: varInstrument('crypto', 'BTC'), qty: '9.98' } });
     assert.deepEqual([quoter.view().okAt, quoter.view().lagMs, quoter.view().error], [T0, 400, null]);
     assert.ok(!JSON.stringify(quoter.view()).includes(first), '状态里不带 token');
-    await assert.rejects(quoter.quote('other', 'XYZ', 1000, 10, AbortSignal.timeout(1000)), /格式未确认/);
-    await assert.rejects(quoter.quote('crypto', 'BTC', 1000, 0, AbortSignal.timeout(1000)), /算不出询价数量/);
+    await assert.rejects(quoter.quote('other', 'XYZ', '100', AbortSignal.timeout(1000)), /格式未确认/);
+    await assert.rejects(quoter.quote('crypto', 'BTC', '0', AbortSignal.timeout(1000)), /询价数量无效/);
     assert.equal(sent.length, 1);
 
     // 应答读到了但内容不对：记下原因，token 仍可用。
@@ -1678,10 +1718,10 @@ test('Var 询价器：没有 token 不发请求；被拒的 token 不再用、�
     const stopped = new AbortController();
     stopped.abort();
     reply = () => { throw Object.assign(new Error('aborted'), { name: 'AbortError' }); };
-    await assert.rejects(quoter.quote('crypto', 'BTC', 1000, 100.2, stopped.signal));
+    await assert.rejects(quoter.quote('crypto', 'BTC', '9.98', stopped.signal));
     assert.deepEqual([quoter.view().status, quoter.view().error, quoter.wants('crypto', 'BTC')], ['ready', null, true]);
     // 传输用的信号中止了（引擎的阶段时限）而调用方自己的没中止：按超时记失败，标的暂停，原因带标的代码。
-    await assert.rejects(quoter.quote('crypto', 'BTC', 1000, 100.2, stopped.signal, new AbortController().signal), /BTC：Variational 请求超时/);
+    await assert.rejects(quoter.quote('crypto', 'BTC', '9.98', stopped.signal, new AbortController().signal), /BTC：Variational 请求超时/);
     assert.deepEqual([quoter.view().status, quoter.wants('crypto', 'BTC'), quoter.usable()], ['unavailable', false, true]);
     assert.match(quoter.view().error ?? '', /^BTC：/);
     reply = () => new Response('', { status: 403 });
@@ -1719,43 +1759,137 @@ test('Var 询价器：没有 token 不发请求；被拒的 token 不再用、�
     assert.deepEqual([quoter.usable(), quoter.view().status], [false, 'expired']);
     clock = T0;
     writeFileSync(file, 'not json', { mode: 0o600 });
+    pushed = { token: '', problem: '推送的 token 无法读取或内容无效' };
     assert.deepEqual([quoter.usable(), quoter.view().status], [false, 'missing']);
     assert.match(quoter.view().error ?? '', /无法读取或内容无效/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('判断时刻的样本：有 Var 询价时 A 腿各档都换成询价，询价不完整或倒挂时不换', () => {
-  const base = sample(T0, 100.3, 100, { bBidRx: 100.04, bAskRx: 100.06 });
-  const quoted = executionSample({ ...base, aBidTk: 100.11, aAskTk: 100.13, aTkAt: T0 + 900 })!;
-  assert.deepEqual([quoted.aBid0, quoted.aAsk0, quoted.aBid1k, quoted.aAsk1k, quoted.aBid100k, quoted.aAsk100k], [100.11, 100.13, 100.11, 100.13, 100.11, 100.13]);
-  assert.equal(quoted.bAsk0, 100.06, 'B 一侧照旧换成判断时刻的一档');
-  for (const extra of [{ aBidTk: 100.11 }, { aAskTk: 100.13 }, { aBidTk: 100.2, aAskTk: 100.1 }, { aBidTk: 0, aAskTk: 100.1 }] as Partial<Sample>[]) {
-    assert.equal(executionSample({ ...base, ...extra })!.aBid1k, base.aBid1k);
-    assert.equal(hasTokenQuote({ ...base, ...extra }), false);
+test('按实际数量选择 Var 询价：复核与持仓成交共用，其他金额、时间或数量缺证时用公共档', () => {
+  const base = sample(T0, 100.3, 100, { bBidRx: 100.04, bAskRx: 100.06, aTkAt: T0 + 900, aTkReceivedAt: T0 + 950, aTkQty: 9.97 });
+  const params = { ...DEFAULT_SYMBOL, enabled: true, entryBps: 10, exitBps: 0 };
+  const token = { ...base, aBidTk: 100.25, aAskTk: 100.27 };
+  const fill = (item: Sample, notionalUsd = 1000) => targetSpread(item, { notionalUsd }, true)?.spread;
+  assert.deepEqual([fill(token)?.prices.aBid, fill(token)?.varQtyA, fill(token)?.varSource], [100.25, 9.97, 'token']);
+  for (const extra of [{ aBidTk: null }, { aAskTk: 100.2 }, { aTkQty: null }, { aTkQty: 10 }, { aTkAt: null }, { aTkReceivedAt: null }]) {
+    assert.equal(fill({ ...token, ...extra })?.varSource, '1k');
   }
-  assert.equal(hasTokenQuote({ ...base, aBidTk: 100.11, aAskTk: 100.13 }), true);
-  assert.equal(executionSample({ ...base, bBidRx: null, aBidTk: 100.11, aAskTk: 100.13 }), null, '没有 B 腿一档时仍不出判断时刻的样本');
-  // 开仓复核与平仓都按询价：公开报价偏贵 26 基点，询价只剩约 6 基点时不开。
-  const params: SymbolParams = { ...DEFAULT_SYMBOL, enabled: true, entryBps: 10, exitBps: 0, regimes: ['all'] };
+  assert.equal(fill({ ...token, bBidRx: null }), undefined);
+  const large = fill({ ...token, bBid100k: 99.9, bAsk100k: 100.1 }, 100_000)!;
+  assert.deepEqual([large.prices.aBid, large.varSource, large.varQtyA], [base.aBid100k, '100k', undefined]);
+
   const baseline = { regime: 'all' as const, median: 0, sigma: 2, samples: 500, since: T0, fallback: false };
   const decision = decide(base, baseline, params, null);
-  assert.equal(decision.kind, 'open');
-  if (decision.kind !== 'open') return;
-  assert.equal(confirmOpen({ ...base, aBidTk: 100.11, aAskTk: 100.13 }, baseline, params, decision, true), DECAYED);
-  const confirmed = confirmOpen({ ...base, aBidTk: 100.25, aAskTk: 100.27 }, baseline, params, decision, true);
+  assert.ok(decision.kind === 'open');
+  assert.equal(confirmOpen({ ...token, aBidTk: 100.11, aAskTk: 100.13 }, baseline, params, decision, 30), DECAYED);
+  const confirmed = confirmOpen(token, baseline, params, decision, 30);
   assert.ok(typeof confirmed !== 'string');
-  if (typeof confirmed === 'string') return;
-  const held = openPosition('p1', confirmed.sample, params, confirmed.decision, baseline, ZERO_FEES);
-  assert.equal(held.aEntry, 100.25);
-  // 成本门槛取复核后与报价时刻两种口径里较大的往返成本（止损仍按公开报价判断）。
+  const held = openPosition('p1', token, params, confirmed, baseline, ZERO_FEES);
+  assert.deepEqual([held.aEntry, held.qty, held.entryVarSource], [100.25, 9.97, 'token']);
   const wide = { ...decision, spread: { ...decision.spread, buyA: decision.spread.sellA + 70 } };
-  const narrow = confirmed.decision.spread.buyA - confirmed.decision.spread.sellA;
-  assert.ok(narrow < 10 && Math.abs(openEconomics(confirmed.decision, params, COSTS, wide).costBps - 70) < 1e-9);
-  assert.equal(openEconomics(confirmed.decision, params, COSTS).costBps, narrow, '不带询价时不传报价时刻的决定，与 v0.81.0 相同');
-  assert.equal(openBlocker(confirmed.sample, { ...params, stopBps: 60 }, DEFAULT_GLOBAL, { openPositions: 0, openNotionalUsd: 0, dailyNetUsd: 0, cooldownUntil: 0, eligible: true, ...openEconomics(confirmed.decision, params, COSTS, wide) }), COST_BLOCK);
-  const later = sample(T0 + 60_000, 100.0, 100, { aBidTk: 100.02, aAskTk: 100.04 });
-  const spread = closeSpread(later, held, positionSpread(later, held.notionalUsd)!);
-  assert.equal(closePosition(held, later.t, spread, 'revert', { slippageBps: 1 }, null).aExit, 100.04);
+  assert.equal(openEconomics(confirmed, params, COSTS, wide).costBps, 70);
+  const later = sample(T0 + 60_000, 100, 100, { aBidTk: 100.02, aAskTk: 100.04, aTkQty: held.qty, aTkAt: T0 + 60_500, aTkReceivedAt: T0 + 60_800 });
+  const trade = closePosition(held, later.t, closeSpread(later, held)!, 'manual', { slippageBps: 1 }, null);
+  assert.deepEqual([trade.aExit, trade.exitVarSource], [100.04, 'token']);
+  assert.equal(closeSpread({ ...later, aTkQty: 10 }, held)?.varSource, '1k');
+});
+
+test('逐腿决策年龄：Var 在任一侧，对手一档和公开价的时效都含等待，边界等于上限可用', () => {
+  const params = { ...DEFAULT_SYMBOL, enabled: true, entryBps: 10 };
+  const baseline = { regime: 'all' as const, median: 0, sigma: 2, samples: 10, since: T0, fallback: false };
+  for (const venue of ['rh', 'lighter', 'entropy']) for (const varSide of ['a', 'b'] as const) {
+    const liveSide = varSide === 'a' ? 'b' : 'a';
+    const base = sample(T0, varSide === 'a' ? 101 : 99, 100, {
+      symbol: varSide === 'a' ? `var:BTC|${venue}:BTC` : `${venue}:BTC|var:BTC`,
+      receivedAt: T0 + 29_000, decisionAt: T0 + 30_000, aAt: T0, bAt: T0,
+      [`${liveSide}BidRx`]: liveSide === 'a' ? 98.99 : 99.99, [`${liveSide}AskRx`]: liveSide === 'a' ? 99.01 : 100.01,
+      [`${liveSide}RxAt`]: T0 + 29_500,
+    });
+    const decision = decide(base, baseline, params, null);
+    assert.ok(decision.kind === 'open');
+    const check = (extra: Partial<Sample>) => confirmOpen({ ...base, ...extra }, baseline, params, decision, 30);
+    assert.notEqual(typeof check({}), 'string');
+    assert.equal(check({ decisionAt: T0 + 30_001 }), STALE_QUOTE);
+    assert.equal(check({ [`${liveSide}RxAt`]: T0 - 1 }), STALE_QUOTE);
+    assert.equal(check({ [`${liveSide}RxAt`]: null }), NO_QUOTE_TIME);
+    const mark = base[`${varSide}Mark`]!;
+    const token = { decisionAt: T0 + 37_000, [`${varSide}BidTk`]: mark - 0.01, [`${varSide}AskTk`]: mark + 0.01,
+      [`${varSide}TkQty`]: Number(varQuoteQty(params, varSide, 1, mark)), [`${varSide}TkAt`]: T0 + 36_000, [`${varSide}TkReceivedAt`]: T0 + 36_500 };
+    assert.notEqual(typeof check(token), 'string', '有效询价的来源时间独立于旧的公开价');
+    assert.equal(check({ ...token, [`${varSide}TkQty`]: 12345 }), STALE_QUOTE, '数量不对改用公开价，时效也必须改用公开来源');
+    assert.equal(check({ ...token, [`${liveSide}RxAt`]: T0 }), STALE_QUOTE, '新鲜 token 不能盖住另一腿的旧盘口');
+  }
+});
+
+test('Var 为 B 且乘数为 2：1k/100k 回放分别成交，按持仓实际单位估值、平仓，仓位大于公开档时标估算', () => {
+  const key = 'entropy:COIN|var:BTC@2', global = { ...DEFAULT_GLOBAL, minSamples: 10, maxTotalNotionalUsd: 100_000, minNetBps: 0 };
+  const params = { ...DEFAULT_SYMBOL, entryBps: 25, exitBps: 2, stopBps: 1500, cooldownMinutes: 0 };
+  const row = (i: number, a: number, extra: Partial<Sample> = {}) => {
+    const t = T0 + i * 60_000;
+    return sample(t, a, 50, { symbol: key, ratio: 2, aBidRx: a - 0.01, aAskRx: a + 0.01, aRxAt: t + 800,
+      bAt: t, bBidRx: null, bAskRx: null, bRxAt: null, bBid100k: 49.8, bAsk100k: 50.2,
+      bBidTk: 49.99, bAskTk: 50.01, bTkQty: 20, bTkAt: t + 600, bTkReceivedAt: t + 750, ...extra });
+  };
+  const warm = Array.from({ length: 10 }, (_, i) => row(i, 100));
+  const spike = row(10, 103), held = row(11, 102, { bMark: 55, bBidTk: 49.95, bAskTk: 50.05 });
+  const end = row(12, 100, { bMark: 55, bBidTk: 49.95, bAskTk: 50.05 });
+  const run = (more: Sample[], notionalUsd: number) => runBacktest(key, 'crypto', [...warm, spike, ...more], spike.t, more.at(-1)?.t ?? spike.t, { ...params, notionalUsd }, global, ZERO_FEES);
+  const small = run([held], 1000), large = run([held], 100_000);
+  assert.deepEqual([small.open?.qty, small.open?.bEntry, small.open?.entryVarSource, small.summary.openMarkVarSource], [10, 100.02, 'token', 'token']);
+  assert.deepEqual([large.open?.qty, large.open?.bEntry, large.open?.entryVarSource, large.summary.openMarkVarSource], [1000, 100.4, '100k', '100k']);
+  assert.equal(small.summary.openMarkUsd, closePosition(small.open!, held.t, closeSpread(held, small.open!)!, 'manual', global, null).netUsd);
+  const mismatched = run([{ ...held, bTkQty: 2000, bBidTk: 1, bAskTk: 2000 }], 1000);
+  assert.equal(mismatched.summary.openMarkVarSource, '1k');
+  const trade = run([held, end], 1000).trades[0];
+  assert.deepEqual([trade.direction, trade.reason, trade.bExit, trade.exitVarSource, trade.qty], ['a_rich', 'revert', 99.9, 'token', 10]);
+  assert.equal(trade.grossUsd, (trade.aEntry - trade.aExit + trade.bExit - trade.bEntry) * trade.qty);
+  const changed = { ...end, bBid0: 119.9, bAsk0: 120.1, bBid100k: 119, bAsk100k: 121, bTkQty: null };
+  assert.deepEqual([closeSpread(changed, small.open!)?.varSource, closeSpread(changed, large.open!)?.estimated], ['100k', true]);
+  assert.equal(varQuoteQty({ notionalUsd: 1000, qty: 1.234567891 }, 'b', 2, 60), null, '历史持仓不能按八位小数精确询价时改用公共档');
+});
+
+test('缺决策盘口的全空和前缀、旧采样与升级混合窗口按逐行证据重放', () => {
+  const rows = oscillating(121), params = { ...DEFAULT_SYMBOL, entryBps: 15, exitBps: 2, cooldownMinutes: 0 }, global = { ...DEFAULT_GLOBAL, minSamples: 10 };
+  const noTop = (s: Sample) => ({ ...s, bBidRx: null, bAskRx: null, bRxAt: null });
+  const run = (input: Sample[], from = rows[11].t) => runBacktest(RH_BTC, 'crypto', input, from, rows[90].t, params, global, ZERO_FEES);
+  const allMissing = run(rows.map(noTop));
+  assert.deepEqual([allMissing.trades.length, allMissing.summary.blocked[NO_LIVE_TOP]], [0, 3]);
+  const mixed = rows.map((s, i): Sample => i < 30 ? { ...noTop(s), captureKind: 'aligned', decisionAt: null }
+    : i < 60 ? { ...noTop(s), captureKind: null, decisionAt: null } : i < 80 ? noTop(s) : s);
+  const a = run(mixed.slice(0, 91)), b = run(mixed), onlyFaults = run(mixed.slice(30), rows[41].t);
+  assert.deepEqual([a.trades.length, a.trades[0].estimated, a.summary.alignedOpens, a.summary.unknownDecisionSamples, a.summary.blocked[NO_QUOTE_TIME], a.summary.blocked[NO_LIVE_TOP]], [1, true, 1, 30, 1, 1]);
+  assert.deepEqual(a.summary, b.summary, '窗口尾部出现正常盘口不改变前缀');
+  assert.deepEqual(onlyFaults.summary.blocked, a.summary.blocked, '去掉已证明旧版的行，缺证行的准入保持一致');
+});
+
+test('早期两腿库重复升级保留 Var 为 B 的旧值且不补造询价量，旧版按原列可继续插入', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tp-legs-schema-')), file = path.join(dir, 'varlighter.sqlite');
+  const key = 'entropy:COIN|var:BTC@2', oldSample = sample(T0, 100, 50, { symbol: key, ratio: 2, aBidRx: 99.99, aAskRx: 100.01,
+    bBidRx: null, bAskRx: null, bBidTk: 45, bAskTk: 55, bTkAt: T0 + 500 });
+  try {
+    const seed = openVarLighterStore(file);
+    try { seed.addSamples([oldSample]); } finally { seed.close(); }
+    const legacy = new DatabaseSync(file);
+    try {
+      for (const column of ['decision_at', 'capture_kind', 'a_rx_at', 'b_rx_at', 'a_tk_qty', 'b_tk_qty', 'a_tk_received_at', 'b_tk_received_at']) {
+        legacy.exec(`ALTER TABLE leg_samples DROP COLUMN ${column}`);
+      }
+    } finally { legacy.close(); }
+    for (let round = 0; round < 2; round++) {
+      const store = openVarLighterStore(file);
+      try {
+        const first = store.samplesAfter(key, 0, 1)[0];
+        assert.deepEqual([first.symbol, first.bTkAt, first.bBidTk, first.bTkQty, first.captureKind, first.decisionAt], [key, T0 + 500, 45, null, null, null]);
+        assert.equal(closeSpread(first, position(key, { ratio: 2, qty: 10 }))?.varSource, '1k', '旧报价缺数量，平仓取公共档');
+        if (round === 0) {
+          const oldWriter = new DatabaseSync(file);
+          try { oldWriter.prepare("INSERT INTO leg_samples(symbol,t,received_at,regime,ratio,a_at,a_bid0,a_ask0,b_at,b_bid0,b_ask0) VALUES (?,?,?,'all',2,?,99.9,100.1,?,49.9,50.1)").run(key, T0 + 100, T0 + 101, T0, T0); }
+          finally { oldWriter.close(); }
+        }
+        assert.deepEqual([store.latest(key)!.captureKind, store.latest(key)!.decisionAt], [null, null]);
+      } finally { store.close(); }
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('样本库升级：v0.81 的库补上 Var 询价的三列，旧样本读成空，新样本读回，重复打开不报错', () => {
@@ -1772,8 +1906,8 @@ test('样本库升级：v0.81 的库补上 Var 询价的三列，旧样本读成
     for (let round = 0; round < 2; round++) {
       const store = openVarLighterStore(file);
       try {
-        const before = store.samples(RH_BTC, 0, 1500)[0];
-        assert.deepEqual([before.bBidRx, before.aBidTk, before.aAskTk, before.aTkAt], [99.96, null, null, null]);
+        const before = store.samples(RH_BTC, 1000, 1500)[0];
+        assert.deepEqual([before.bBidRx, before.aBidTk, before.aAskTk, before.aTkAt, before.captureKind, before.bRxAt, before.decisionAt], [99.96, null, null, null, null, null, null]);
         if (round === 0) assert.equal(store.addSamples([sample(5000, 100.2, 100, { aBidTk: 100.18, aAskTk: 100.22, aTkAt: 5900 })]), 1);
         const latest = store.latest(RH_BTC)!;
         assert.deepEqual([latest.aBidTk, latest.aAskTk, latest.aTkAt], [100.18, 100.22, 5900]);
@@ -1782,29 +1916,38 @@ test('样本库升级：v0.81 的库补上 Var 询价的三列，旧样本读成
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与开平仓，询价失败、过旧或没有 token 时退回公开报价', async () => {
+test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与开平仓，询价失败、过旧或没有 token 时退回公开报价', async t => {
   const dir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-'));
-  let clock = T0, varMid = 100.2, tick = 0;
+  let clock = T0, varMid = 100.2, tick = 0, publicAge = 2000, tokenWait = 0;
   const sockets = new Map<string, FakeSocket>();
   const market = (symbol: string, id: number) => ({ symbol, market_id: id, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, min_base_amount: '0.001', min_quote_amount: '10', taker_fee: '0', maker_fee: '0', mark_price: '100' });
   const fetchImpl = async (url: string) => {
     if (url.includes('orderBookDetails')) return Response.json({ code: 200, order_book_details: [market('BTC', url.includes('api.rh.lighter.xyz') ? 1 : 7)] });
     if (url.includes('orderBookOrders')) return Response.json({ code: 200, bids: [{ price: '99.99', remaining_base_amount: '100' }], asks: [{ price: '100.01', remaining_base_amount: '100' }] });
     return Response.json({ listings: [{ ticker: 'BTC', name: 'Bitcoin', mark_price: String(varMid), funding_rate: '0.1', funding_interval_s: 28800,
-      quotes: { updated_at: new Date(clock - 2_000).toISOString(), base: { bid: String(varMid - 0.01), ask: String(varMid + 0.01) }, size_1k: { bid: String(varMid - 0.02), ask: String(varMid + 0.02) } } }] });
+      quotes: { updated_at: new Date(clock - publicAge).toISOString(), base: { bid: String(varMid - 0.01), ask: String(varMid + 0.01) }, size_1k: { bid: String(varMid - 0.02), ask: String(varMid + 0.02) } } }] });
   };
   // 询价替身：tokenMid 为 null 时跟公开价；mode 决定这一轮的表现。
-  const asked: [string, string, number, number][] = [];
-  let usable = true, tokenMid: number | null = null, mode: 'ok' | 'fail' | 'stale' = 'ok';
+  const asked: [string, string, string][] = [];
+  let usable = true, tokenMid: number | null = null, mode: 'ok' | 'fail' | 'timeout' | 'stale' = 'ok';
   const skipped = new Set<string>();
   const quoter: VarQuoter = {
     usable: () => usable,
     wants: (kind, symbol) => kind === 'crypto' && !skipped.has(symbol),
-    async quote(kind, symbol, notionalUsd, referencePrice) {
-      asked.push([kind, symbol, notionalUsd, referencePrice]);
+    async quote(kind, symbol, qty, phase, stop) {
+      asked.push([kind, symbol, qty]);
+      if (tokenWait) {
+        clock += tokenWait;
+        sockets.get('rh')!.push(RH_SNAPSHOT);
+      }
+      if (mode === 'timeout') {
+        t.mock.timers.tick(TOKEN_QUOTE_PHASE_MS);
+        assert.deepEqual([phase.aborted, stop?.aborted], [true, false], '阶段时限生效，调用方仍在运行');
+        phase.throwIfAborted();
+      }
       if (mode === 'fail') throw new Error('Variational 暂不可用，请稍后重试。');
       const mid = tokenMid ?? varMid;
-      return { bid: mid - 0.005, ask: mid + 0.005, mark: mid, qty: 9.98, at: clock - (mode === 'stale' ? TOKEN_QUOTE_MAX_AGE_MS + 1 : 300), receivedAt: clock };
+      return { bid: mid - 0.005, ask: mid + 0.005, mark: mid, qty: Number(qty), at: clock - (mode === 'stale' ? TOKEN_QUOTE_MAX_AGE_MS + 1 : 300), receivedAt: clock };
     },
     view: () => ({ status: 'ready', statusName: '正常', expiresAt: T0 + 86_400_000, error: null, okAt: clock, lagMs: 300 }),
   };
@@ -1835,13 +1978,35 @@ test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与
     assert.deepEqual(engine.views.state().sources.var.token, quoter.view());
     engine.views.settings({ revision: engine.views.state().settings.revision, global: { minSamples: 10, windowHours: 2, minNetBps: 5 }, symbols: { [RH_BTC]: { enabled: true, entryBps: 15, exitBps: 2, cooldownMinutes: 0, regimes: ['all'] } } });
     let poll = await minute();
-    assert.deepEqual(asked, [['crypto', 'BTC', 1000, 100.2]], '只询已启用的 RH 配对，数量按它的名义金额与公开标记价');
+    assert.deepEqual(asked, [['crypto', 'BTC', '9.98']], '只询已启用的 RH 配对，数量按它的名义金额与公开标记价');
     assert.deepEqual([poll.tokenOk, poll.tokenFailed], [1, 0]);
     let latest = store.latest(RH_BTC)!;
     assert.deepEqual([latest.aBidTk, latest.aAskTk, latest.aTkAt], [100.2 - 0.005, 100.2 + 0.005, clock - 300]);
     assert.equal(store.latest(LIGHTER_BTC)!.aBidTk, null, '没启用的配对样本不带询价');
     for (let index = 0; index < 11; index++) await minute();
 
+    // 接收时 29 秒，RFQ 失败或到阶段时限时已经 37 秒。对手一档仍可用，成交被决策年龄拦住，原时间照常采样。
+    varMid = 100.5; publicAge = 29_000; tokenWait = 8_000; mode = 'fail';
+    poll = await minute();
+    latest = store.latest(RH_BTC)!;
+    assert.deepEqual([poll.tokenFailed, poll.blocked[STALE_QUOTE], latest.receivedAt - latest.t, latest.decisionAt! - latest.t, latest.bRxAt, latest.aTkQty],
+      [1, 1, 29_000, 37_000, clock, null]);
+    assert.equal(engine.views.paper().positions.length, 0);
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      mode = 'timeout';
+      poll = await minute();
+      assert.deepEqual([poll.tokenFailed, poll.blocked[STALE_QUOTE]], [1, 1], '真实阶段定时器触发后公开价回退仍要核验决策年龄');
+    } finally { t.mock.timers.reset(); }
+    // 无 token 时，读完当前一档才返回的慢盘口也计时。
+    tokenWait = 0; mode = 'ok'; usable = false;
+    const rh = engine.stream('rh')!, topAt = rh.topAt.bind(rh);
+    let slow = true;
+    rh.topAt = (id, at) => { const top = topAt(id, at); if (slow && at === clock) { slow = false; clock += 8_000; } return top; };
+    poll = await minute();
+    latest = store.latest(RH_BTC)!;
+    assert.deepEqual([poll.blocked[STALE_QUOTE], latest.decisionAt! - latest.t], [1, 37_000]);
+    rh.topAt = topAt; usable = true; tokenWait = 8_000;
     // 公开报价冲到 100.5，但询价显示 Var 仍在 100.22：报价时刻有信号，按询价复核后不开。
     varMid = 100.5; tokenMid = 100.22;
     poll = await minute();
@@ -1853,6 +2018,13 @@ test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与
     const opened = engine.views.paper().positions;
     assert.deepEqual(opened.map(item => [item.symbol, item.direction]), [[RH_BTC, 'a_rich']]);
     assert.ok(Math.abs(opened[0].aEntry - 100.465) < 1e-9);
+    assert.equal(opened[0].qty, Number(asked.at(-1)![2]));
+    const sampled = store.latest(RH_BTC)!;
+    assert.deepEqual([sampled.decisionAt! - sampled.aAt, sampled.aTkQty, sampled.aTkReceivedAt], [37_000, opened[0].qty, clock]);
+    const replay = engine.views.backtest({ symbol: RH_BTC, hours: 2 });
+    assert.deepEqual([replay.open?.qty, replay.open?.aEntry, replay.summary.blocked[STALE_QUOTE]], [opened[0].qty, opened[0].aEntry, 3]);
+    tokenWait = 0; publicAge = 2_000;
+    engine.views.settings({ revision: engine.views.state().settings.revision, symbols: { [RH_BTC]: { notionalUsd: 100_000 } } });
     assert.match(engine.views.paper().events.find(event => event.kind === 'open')!.message, /Var 按 token 询价/);
     // 回落：平仓的 Var 腿按询价的卖价。
     varMid = 100.2; tokenMid = 100.21;
@@ -1860,6 +2032,8 @@ test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与
     const trades = engine.views.paper().trades;
     assert.deepEqual([trades.length, trades[0].reason], [1, 'revert']);
     assert.ok(Math.abs(trades[0].aExit - 100.215) < 1e-9);
+    assert.deepEqual([Number(asked.at(-1)![2]), trades[0].exitVarSource], [opened[0].qty, 'token'], '改配置、标记价变化后仍询原仓的实际数量');
+    engine.views.settings({ revision: engine.views.state().settings.revision, symbols: { [RH_BTC]: { notionalUsd: 1000 } } });
 
     // 询价失败：这一轮的样本不带询价，统计里记失败。
     tokenMid = null; mode = 'fail';
@@ -1905,5 +2079,146 @@ test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与
     assert.match(latency().detail, /判断时刻用 token 询价/);
     clock += 4 * 60_000;
     assert.doesNotMatch(latency().detail, /判断时刻用 token 询价/);
+  } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('账户风控读取后才决定开仓；已提交样本只推进一次，成交写失败后继续处理下一配对', async t => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tp-decision-')), file = path.join(dir, 'varlighter.sqlite');
+  const eth = 'var:ETH|rh:ETH', keys = [RH_BTC, eth], signal = new AbortController().signal;
+  const settings = settings2(Object.fromEntries(keys.map(key => [key, { ...DEFAULT_SYMBOL, enabled: true, cooldownMinutes: 0 }])), { ...DEFAULT_GLOBAL, minSamples: 10 });
+  let clock = T0, quoteAt = T0, ethMid = 100, riskWait = 1000, failBtc = false;
+  const snapshot = { type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: Object.fromEntries([1, 2].map(id =>
+    [id, { market_id: id, best_bid_price: '99.99', best_ask_price: '100.01', mark_price: '100' }])) };
+  const fetchImpl = async (url: string) => {
+    if (url.includes('orderBookDetails')) return Response.json({ code: 200, order_book_details: ['BTC', 'ETH'].map((symbol, i) =>
+      ({ symbol, market_id: i + 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' })) });
+    return Response.json({ listings: ['BTC', 'ETH'].map((ticker, i) => {
+      const mid = i === 0 ? 100.5 : ethMid, price = { bid: String(mid - 0.01), ask: String(mid + 0.01) };
+      return { ticker, name: ticker, mark_price: String(mid), funding_rate: 0, quotes: { updated_at: new Date(quoteAt).toISOString(), base: price, size_1k: price, size_100k: price } };
+    }) });
+  };
+  const makeEngine = (store: ReturnType<typeof openVarLighterStore>) => {
+    const socket = new FakeSocket(), engine = createVarLighterEngine({ store, fetchImpl, now: () => clock, connect: () => socket });
+    engine.startStreams(); socket.open();
+    const poll = async () => {
+      clock = quoteAt;
+      socket.push(snapshot);
+      clock = quoteAt + 29_500;
+      socket.push(snapshot);
+      return engine.pollVar(signal);
+    };
+    return { engine, poll };
+  };
+  const store = openVarLighterStore(file);
+  store.setState(SETTINGS_KEY, settings, T0);
+  store.addSamples(keys.flatMap(symbol => Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100, { symbol }))));
+  const { engine, poll } = makeEngine(store), netSince = store.netSince, open = store.openPosition;
+  t.mock.method(store, 'netSince', (since: number) => { clock += riskWait; return netSince(since); });
+  t.mock.method(store, 'openPosition', (...args: Parameters<typeof open>) => {
+    const [position] = args;
+    assert.equal(store.latest(position.symbol)?.decisionAt, clock, '持仓写入前最终决策样本已经持久化');
+    if (failBtc && position.symbol === RH_BTC) throw new Error('BTC 模拟开仓写失败');
+    return open(...args);
+  });
+  const counts = (e: typeof engine) => e.views.state().rows.map(row => [row.key, row.baseline?.samples, row.samples24h]);
+  try {
+    await engine.refreshCatalog(signal);
+    await poll();
+    assert.deepEqual([store.positions().length, store.latest(RH_BTC)!.decisionAt! - quoteAt, engine.views.state().sources.var.poll?.blocked[STALE_QUOTE]], [0, 30_500, 1]);
+    quoteAt += 60_000; riskWait = 500;
+    await poll();
+    assert.deepEqual([store.positions()[0].symbol, store.latest(RH_BTC)!.decisionAt! - quoteAt], [RH_BTC, 30_000]);
+    const replay = engine.views.backtest({ symbol: RH_BTC, hours: 2 });
+    assert.deepEqual([replay.summary.blocked[STALE_QUOTE], replay.open?.openedAt], [1, quoteAt], '回测从持久化时刻还原超界和恰好达界');
+    engine.views.close({ symbol: RH_BTC });
+
+    quoteAt += 60_000; riskWait = 0; ethMid = 100.5; failBtc = true;
+    await assert.rejects(poll(), /BTC 模拟开仓写失败/);
+    assert.deepEqual(store.positions().map(item => item.symbol), [eth], '前一配对写失败时，后一配对照常开仓');
+    assert.deepEqual(counts(engine), [[RH_BTC, 15, 15], [eth, 15, 15]]);
+    const events = store.events(100);
+    failBtc = false;
+    await engine.pollVar(signal);
+    assert.deepEqual([counts(engine), store.events(100)], [[[RH_BTC, 15, 15], [eth, 15, 15]], events], '重取同一时刻不重记样本、不意外补开仓');
+    const restored = makeEngine(openVarLighterStore(file));
+    try {
+      await restored.engine.refreshCatalog(signal);
+      await restored.poll();
+      assert.deepEqual(counts(restored.engine), counts(engine), '重启预热后的基线与运行中相同，重复键也没有再次推进');
+      assert.deepEqual(store.events(100), events);
+      assert.equal(restored.engine.views.state().sources.var.poll?.written, 0);
+    } finally { restored.engine.close(); }
+
+    // 若本次失败的是样本写入，则游标和基线仍在上一条。原报价可安全重试，持仓只在样本成功提交后出现。
+    quoteAt += 60_000;
+    const insert = store.addNewSamples;
+    const denied = t.mock.method(store, 'addNewSamples', (samples: Sample[]) => {
+      if (samples.some(item => item.symbol === RH_BTC)) throw new Error('BTC 样本写失败');
+      return insert(samples);
+    });
+    await assert.rejects(poll(), /BTC 样本写失败/);
+    assert.deepEqual([store.latest(RH_BTC)?.t, store.positions().length, counts(engine)[0]], [quoteAt - 60_000, 1, [RH_BTC, 15, 15]]);
+    denied.mock.restore();
+    await engine.pollVar(signal);
+    assert.deepEqual([store.latest(RH_BTC)?.t, store.positions().length, counts(engine)[0]], [quoteAt, 2, [RH_BTC, 16, 16]]);
+  } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('估算开仓在盘口完整时估值，回测期末和模拟盘净盈亏仍标为估算', () => {
+  const params = { ...DEFAULT_SYMBOL, notionalUsd: 100, entryBps: 15, exitBps: 2 }, global = { ...DEFAULT_GLOBAL, minSamples: 10 };
+  const warm = Array.from({ length: 10 }, (_, i) => sample(T0 - (10 - i) * 60_000, 100));
+  const entry = sample(T0, 100.5, 100, { captureKind: 'aligned', decisionAt: null, bBidRx: null, bAskRx: null, bRxAt: null });
+  const last = sample(T0 + 60_000, 100.4);
+  const replay = runBacktest(RH_BTC, 'crypto', [...warm, entry, last], entry.t, last.t, params, global, ZERO_FEES);
+  const held = replay.open!;
+  assert.deepEqual([held.estimated, closeSpread(last, held)?.estimated, replay.summary.openMarkEstimated], [true, false, true]);
+  const fixture = seededEngine(store => { store.savePosition(held); store.addSamples([last]); }, { clock: () => last.t });
+  try {
+    const mark = fixture.engine.views.paper().positions[0].mark!;
+    assert.deepEqual([mark.estimated, mark.netUsd], [true, replay.summary.openMarkUsd]);
+  } finally { fixture.dispose(); }
+});
+
+test('没有 Var 的双行情流也在风控读取后检查两腿年龄并落盘供回放', async t => {
+  const key = 'rh:BTC|lighter:BTC', dir = mkdtempSync(path.join(tmpdir(), 'tp-live-decision-'));
+  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
+  const params = { ...DEFAULT_SYMBOL, enabled: true }, global = { ...DEFAULT_GLOBAL, minSamples: 10 };
+  store.setState(SETTINGS_KEY, settings2({ [key]: params }, global, ['rh|lighter']), T0);
+  store.addSamples(Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100, { symbol: key })));
+  let clock = T0, riskWait = 30_001;
+  const sockets = new Map<string, FakeSocket>(), net = store.netSince;
+  t.mock.method(store, 'netSince', (at: number) => { clock += riskWait; return net(at); });
+  const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' };
+  const engine = createVarLighterEngine({ store, now: () => clock, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market] }),
+    connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; } });
+  const snapshot = (at: number) => {
+    clock = at;
+    for (const [venue, socket] of sockets) {
+      const mid = venue === 'rh' ? 100.5 : 100;
+      socket.push({ type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: String(mid - 0.01), best_ask_price: String(mid + 0.01), mark_price: String(mid) } } });
+    }
+    return engine.sampleLive();
+  };
+  try {
+    engine.startStreams();
+    for (const socket of sockets.values()) socket.open();
+    for (const venue of ['rh', 'lighter'] as const) await engine.refreshCatalog(new AbortController().signal, venue);
+    const prewarm = t.mock.method(store, 'samples', () => { throw new Error('基线暂不可读'); });
+    assert.throws(() => snapshot(T0), /基线暂不可读/);
+    prewarm.mock.restore();
+    assert.deepEqual([store.latest(key)?.t, store.latest(key)?.decisionAt], [T0, null]);
+    const unavailable = t.mock.method(store, 'netSince', () => { throw new Error('账户风控暂不可读'); });
+    assert.throws(() => snapshot(T0 + 60_000), /账户风控暂不可读/);
+    unavailable.mock.restore();
+    assert.deepEqual([store.latest(key)?.t, store.latest(key)?.decisionAt, store.positions().length], [T0 + 60_000, null, 0]);
+    assert.equal(snapshot(T0 + 60_000).written, 0, '已经提交的行情不能补开仓');
+    const lateAt = T0 + 120_000, validAt = T0 + 180_000;
+    assert.deepEqual(snapshot(lateAt).blocked, { [STALE_QUOTE]: 1 });
+    const first = store.latest(key)!;
+    assert.deepEqual([first.aRxAt, first.bRxAt, first.decisionAt, store.positions().length], [lateAt, lateAt, lateAt + 30_001, 0]);
+    riskWait = 30_000;
+    assert.deepEqual(snapshot(validAt).blocked, {});
+    const result = engine.views.backtest({ symbol: key, hours: 2 });
+    assert.deepEqual([store.positions()[0]?.openedAt, result.open?.openedAt, result.summary.blocked[STALE_QUOTE], result.summary.blocked[NO_QUOTE_TIME]], [validAt, validAt, 1, 2]);
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });

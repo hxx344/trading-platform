@@ -4,12 +4,12 @@
 import { join } from 'node:path';
 import { VARIATIONAL_SESSION_FILE, readVariationalSessionFile } from '../monitor/variational-session.ts';
 import { VARIATIONAL_EXPIRY_MARGIN_MS, requestVariational, variationalRequestError, variationalTokenExpiry, type VariationalFetcher } from '../vendor/variational-market.mjs';
-import type { AssetKind } from './model.ts';
+import { TOKEN_QUOTE_MAX_AGE_MS, type AssetKind } from './model.ts';
 import type { TokenStatus, TokenView } from './views.ts';
 
 export const TOKEN_STATUS_NAMES: Record<TokenStatus, string> = { missing: '未配置', expired: '已过期', ready: '正常', rejected: '会话已失效', unavailable: '暂不可用' };
 /** 询价的源时间早于现在这么久就不用（请求本身最多 10 秒）。 */
-export const TOKEN_QUOTE_MAX_AGE_MS = 15_000;
+export { TOKEN_QUOTE_MAX_AGE_MS };
 /** 一轮里同时发出的询价数（每个请求起一个 python3 子进程）。 */
 export const TOKEN_QUOTE_CONCURRENCY = 4;
 /** 一轮询价的总时限：到点就用已经拿到的，不让慢的询价拖住这一轮的样本。 */
@@ -27,7 +27,7 @@ export interface VarQuoter {
    * 询一次价；失败抛出固定文案的错误（不含 token 与应答正文）。`signal` 交给传输层；`stop` 是调用方自己的中止信号（不给就是 `signal`）：
    * 只有它中止才算调用方不要了、不记失败。引擎给 `signal` 加了阶段时限，到时限而 `stop` 没中止的请求按超时记失败并暂停该标的。
    */
-  quote(kind: AssetKind, symbol: string, notionalUsd: number, referencePrice: number, signal: AbortSignal, stop?: AbortSignal): Promise<TokenQuote>;
+  quote(kind: AssetKind, symbol: string, qty: string, signal: AbortSignal, stop?: AbortSignal): Promise<TokenQuote>;
   view(): TokenView;
 }
 
@@ -41,17 +41,6 @@ export function varInstrument(kind: AssetKind, symbol: string): Instrument | nul
   if (kind === 'crypto') return { underlying: symbol, instrument_type: 'perpetual_future', settlement_asset: 'USDC', funding_interval_s: 3600 };
   if (kind === 'equity' || kind === 'commodity') return { underlying: symbol, instrument_type: 'perpetual_rwa_future', settlement_asset: 'USDC', kind };
   return null;
-}
-
-/** 名义金额折成数量：四位有效数字、最多 8 位小数的十进制文本（传输白名单的格式）；算不出正数时返回 null。 */
-export function quoteQty(notionalUsd: number, price: number): string | null {
-  const raw = notionalUsd / price;
-  if (!Number.isFinite(raw) || raw <= 0 || raw >= 1e12) return null;
-  const rounded = Number(raw.toPrecision(4));
-  if (rounded >= 1e12) return null;
-  const fixed = rounded.toFixed(8);
-  const text = fixed.includes('.') ? fixed.replace(/0+$/, '').replace(/\.$/, '') : fixed;
-  return /[1-9]/.test(text) ? text : null;
 }
 
 /** 正的十进制数：数值，或纯十进制文本（不收十六进制、指数与带空格的写法）。 */
@@ -100,10 +89,10 @@ export function createVarQuoter({ dir, source = dir === undefined ? undefined : 
   return {
     usable: () => { const { token } = read(); return token !== '' && !(token === pausedToken && now() < pausedUntil); },
     wants: (kind, symbol) => varInstrument(kind, symbol) !== null && !((symbolPause.get(symbol) ?? 0) > now()),
-    async quote(kind, symbol, notionalUsd, referencePrice, signal, stop = signal) {
-      const instrument = varInstrument(kind, symbol), qty = quoteQty(notionalUsd, referencePrice);
+    async quote(kind, symbol, qty, signal, stop = signal) {
+      const instrument = varInstrument(kind, symbol);
       if (!instrument) throw new Error('该类别的 Var 询价格式未确认');
-      if (!qty) throw new Error('算不出询价数量');
+      if (!/^(?:0|[1-9]\d{0,11})(?:\.\d{1,8})?$/.test(qty) || !(Number(qty) > 0)) throw new Error('询价数量无效');
       const { token } = read();
       if (!token) throw new Error('没有可用的 Var token');
       let answer: unknown;

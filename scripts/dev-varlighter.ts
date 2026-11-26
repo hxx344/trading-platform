@@ -84,18 +84,18 @@ function varFields(market: Market, t: number): LegFields {
   const { price, basis } = step(market, t), mid = price * (1 + basis / 10_000);
   const h = half(mid, crypto(market) ? 2 : 5), h1k = h + half(mid, 1), h100k = h + half(mid, 6);
   return { At: t, Mark: mid, Index: null, Funding: varHourly(VAR_FUNDING_ANNUAL(market)), Bid0: mid - h, Ask0: mid + h, Bid1k: mid - h1k, Ask1k: mid + h1k, Bid100k: mid - h100k, Ask100k: mid + h100k,
-    BidRx: null, AskRx: null, BidTk: null, AskTk: null, TkAt: null };
+    BidRx: null, AskRx: null, RxAt: null, BidTk: null, AskTk: null, TkAt: null, TkQty: null, TkReceivedAt: null };
 }
 function liveFields(market: Market, venue: LiveVenue, t: number): LegFields {
   const mid = liveMid(market, venue, step(market, t).price, t), h = half(mid, crypto(market) ? 1 : 3);
   return { At: t, Mark: mid, Index: mid, Funding: crypto(market) ? 0.0000125 : 0.000005, Bid0: mid - h, Ask0: mid + h, Bid1k: mid - h * 1.2, Ask1k: mid + h * 1.2, Bid100k: mid - h * 3, Ask100k: mid + h * 3,
-    BidRx: mid - h, AskRx: mid + h, BidTk: null, AskTk: null, TkAt: null };
+    BidRx: mid - h, AskRx: mid + h, RxAt: t, BidTk: null, AskTk: null, TkAt: null, TkQty: null, TkReceivedAt: null };
 }
 const legFields = (leg: Leg, t: number) => { const market = bySymbol.get(leg.symbol)!; return leg.venue === 'var' ? varFields(market, t) : liveFields(market, leg.venue, t); };
 function sampleOf([a, b]: [Leg, Leg], t: number): Sample {
   const prefixed = (side: 'a' | 'b', fields: LegFields) => Object.fromEntries(Object.entries(fields).map(([key, value]) => [`${side}${key}`, value]));
   const receivedAt = a.venue === 'var' || b.venue === 'var' ? t + 20_000 : t;
-  return { symbol: pairKey(a, b, 1), t, receivedAt, regime: regimeOf(kindOf(a.symbol), t), ratio: 1, ...prefixed('a', legFields(a, t)), ...prefixed('b', legFields(b, t)) } as Sample;
+  return { symbol: pairKey(a, b, 1), t, receivedAt, decisionAt: receivedAt, captureKind: 'decision', regime: regimeOf(kindOf(a.symbol), t), ratio: 1, ...prefixed('a', legFields(a, t)), ...prefixed('b', legFields(b, t)) } as Sample;
 }
 
 const app = loadWebApp();
@@ -130,7 +130,7 @@ const now = Date.now();
   for (const [key, params] of Object.entries(symbols)) {
     const list = history.get(key)!;
     const result = runBacktest(key, kindOf(key.split('|')[0]!.split(':')[1]!), list, now - 3 * 86_400_000, now, params, global, { aFeeBps: 0, bFeeBps: 0 });
-    for (const trade of result.trades.map(item => ({ ...item, id: `preview-${key}-${item.id}` }))) store.closePosition(trade, { at: trade.closedAt, kind: 'close', message: `（预览）${trade.reason} 净 ${trade.netUsd.toFixed(2)} 美元` });
+    for (const trade of result.trades.map(item => ({ ...item, id: `preview-${key}-${item.id}` }))) store.closePosition(trade, { at: trade.closedAt, kind: 'close', message: `（预览）${trade.reason} 净 ${trade.netUsd.toFixed(2)} 美元` }, {});
   }
   store.close();
 }

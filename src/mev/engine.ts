@@ -86,6 +86,7 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
   let fault = store.readState<string | null>('fault') ?? null;
   let verification: { ok: boolean; reason: string | null; checkedAt: number } = { ok: false, reason: '尚未核对合约', checkedAt: 0 };
   let live = false, liveSince: number | null = null, haltReason: string | null = null, sendRejects = 0;
+  let liveCommand = 0;
   /** 白名单每改一次加一：在途的目录刷新据此知道自己读的名单已经过时。 */
   let tokenGeneration = 0;
   /** 节点以 replacement underpriced 拒收过的 nonce：这个 nonce 上按全部过期交易加价。 */
@@ -118,6 +119,7 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
     if (bound !== operator) store.writeState('identity', operator, now());
   }
   let verifyFailures = 0;
+  let pendingVerification: { command: number; result: Promise<boolean> } | null = null;
   let stopping = false;
 
   const tokenMap = (): Map<string, TokenInfo> => new Map(store.tokens().map(token => [token.address, token]));
@@ -131,7 +133,18 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
     say(`mev:halt:${now()}`, `【MEV 套利已停止实盘】${reason}。模块回到观察模式；未结清的交易继续核对。在「MEV 套利」页处理后可重新开始`);
   }
 
-  async function verify(tolerant = false): Promise<void> {
+  function verify(tolerant = false): Promise<boolean> {
+    const command = liveCommand;
+    // A tick during startup must observe the same node reply as the start request.
+    if (pendingVerification?.command === command) return pendingVerification.result;
+    const result = checkContract(command, tolerant).finally(() => {
+      if (pendingVerification?.result === result) pendingVerification = null;
+    });
+    pendingVerification = { command, result };
+    return result;
+  }
+
+  async function checkContract(command: number, tolerant: boolean): Promise<boolean> {
     const at = now();
     try {
       const outcomes = await rpc.batch([
@@ -141,9 +154,10 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
         { method: 'eth_call', params: [{ to: executor, data: selector('operator()') }, 'latest'] },
         ...FACTORIES.map(factory => ({ method: 'eth_call', params: [{ to: executor, data: callData('factoryKind(address)', ['address'], [factory.address]) }, 'latest'] })),
       ]);
+      if (stopping || command !== liveCommand) return false;
       const value = (index: number): string => { const entry = outcomes[index]!; if (!entry.ok || typeof entry.result !== 'string') throw new MevError(502, 'verify', '读取执行合约失败（地址上可能不是执行合约）'); return entry.result; };
       // 读到明确不符：记下结论并停实盘（不在实盘时 halt 不做事）。之后即使又核对通过，也要用户重新开始。
-      const fail = (reason: string) => { verification = { ok: false, reason, checkedAt: at }; halt(reason); };
+      const fail = (reason: string) => { verification = { ok: false, reason, checkedAt: at }; halt(reason); return false; };
       if (quantity(value(0)) !== chainId) return fail(`节点的链号是 ${quantity(value(0))}，配置的是 ${chainId}`);
       if (value(1).toLowerCase() !== expectedRuntimeCode(owner)) return fail('执行合约的代码与本版本的产物不一致（或 owner 不是配置的地址）');
       if (new AbiReader(value(2)).address(0) !== owner) return fail('执行合约的 owner 不是配置的地址');
@@ -154,11 +168,13 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
       verification = { ok: true, reason: null, checkedAt: at };
       verifyFailures = 0;
     } catch (error) {
+      if (stopping || command !== liveCommand) return false;
       // 读不到不等于不符：实盘中的定期核对偶尔超时或缺项时沿用上一次通过的结论，下一轮再读；连续读不到才按不过处理。
-      if (tolerant && verification.ok && ++verifyFailures < REVERIFY_FAILURE_LIMIT) { log(`mev: 定期核对合约没有读到结果（第 ${verifyFailures} 次），下一轮重试`); return; }
+      if (tolerant && verification.ok && ++verifyFailures < REVERIFY_FAILURE_LIMIT) { log(`mev: 定期核对合约没有读到结果（第 ${verifyFailures} 次），下一轮重试`); return true; }
       verification = { ok: false, reason: `核对合约失败：${errorText(error)}`, checkedAt: at };
     }
     if (!verification.ok) halt(verification.reason ?? '合约核对未通过');
+    return verification.ok;
   }
 
   /** 只留两种代币都在白名单里的池子。 */
@@ -378,18 +394,20 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
     },
     /** 开始实盘：重新核对合约，清掉上次的熔断原因与故障记录（页面的确认提示里已把它们给用户看过）。 */
     async start(body: unknown): Promise<unknown> {
-      if (requireBody(body).confirm !== operator) throw new MevError(400, 'confirm_required', '须带上热钱包地址确认');
+      const seen = requireBody(body);
+      if (seen.confirm !== operator) throw new MevError(400, 'confirm_required', '须带上热钱包地址确认');
       if (stopping) throw new MevError(503, 'stopping', '服务正在停止');
       if (live) return { mode: 'live' };
-      await verify();
+      const command = ++liveCommand;
+      const verified = await verify();
       if (stopping) throw new MevError(503, 'stopping', '服务正在停止');
-      if (!verification.ok) throw new MevError(409, 'not_verified', verification.reason ?? '合约核对未通过');
+      if (command !== liveCommand) throw new MevError(409, 'stale', '核对期间已有新的启停操作，请刷新后重新确认');
+      if (!verified || !verification.ok) throw new MevError(409, 'not_verified', verification.reason ?? '合约核对未通过');
       if (!account || !head) throw new MevError(409, 'not_ready', '还没有读到链上状态，稍后再试');
       if (lagging) throw new MevError(409, 'lagging', '节点的最新区块落后，暂不能开始');
       if (weiToEth(account.balance) < settings.minWalletEth) throw new MevError(409, 'low_balance', `热钱包余额低于下限 ${settings.minWalletEth} ETH`);
       // 确认要绑定操作者看到的状态：页面数据可能是几秒前的，另一个标签页可能停在故障发生之前。
       // 请求带上页面所见的故障记录与停止原因，和现在的不一样就不清除、不开始，让页面刷新后重新确认。
-      const seen = requireBody(body);
       if ((seen.fault ?? null) !== fault || (seen.haltReason ?? null) !== haltReason) throw new MevError(409, 'stale', '页面上的故障记录或停止原因已不是最新的，请刷新后重新确认');
       consecutiveReverts = 0; sendRejects = 0; fault = null; haltReason = null;
       persist('consecutiveReverts', 0); persist('fault', null);
@@ -399,6 +417,8 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
       return { mode: 'live' };
     },
     stop(): unknown {
+      // 观察模式也可能有等待节点核对的开始请求。
+      liveCommand++;
       if (live) { live = false; liveSince = null; haltReason = '用户停止'; log('mev: 用户停止实盘'); say(`mev:stop:${now()}`, '【MEV 套利已停止实盘】用户在页面停止；未结清的交易继续核对'); }
       return { mode: 'observe' };
     },

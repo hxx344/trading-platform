@@ -258,8 +258,7 @@ test('飞书告警：事件转消息，同一持续问题 30 分钟内只发一�
     notifier.poll();
     assert.equal(notifier.pending(), before + 6);
 
-    // An alert whose insert fails is not counted as posted: the next poll posts the first alert (not a repeat 2 minutes
-    // later), and a recovery with no alert queued posts nothing (#71, same path in feishu.ts).
+    // An alert whose insert fails is not counted as posted: the next poll retries it.
     const outboxDb = new DatabaseSync(join(dir, 'notify.sqlite'));
     const breakOutbox = (broken: boolean) => outboxDb.exec(broken ? "CREATE TRIGGER fail_outbox BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END;" : 'DROP TRIGGER fail_outbox');
     try {
@@ -286,10 +285,117 @@ test('飞书告警：事件转消息，同一持续问题 30 分钟内只发一�
       notifier.poll(); notifier.poll();
       assert.equal(notifier.pending(), before + 8);
       assert.match(texts().at(-1)!, /^【保证金平衡恢复】配对 p1/);
+      // The anomaly ends before its first report can be queued. Repeated failures preserve the original evidence.
+      pairs = pair('4000', '1000');
+      notifier.poll();
+      clock += FAULT_AFTER_MS;
+      breakOutbox(true);
+      notifier.poll();
+      pairs = pair('3500', '1000');
+      notifier.poll();
+      pairs = pair('2000', '1500');
+      notifier.poll(); notifier.poll();
+      assert.equal(notifier.pending(), before + 8);
+      pairs = pair('7500', '1000');
+      notifier.poll();
+      clock += FAULT_AFTER_MS;
+      notifier.poll();
+      pairs = pair('1200', '1100');
+      notifier.poll();
+      pairs = pair('0', '0', { balancesFresh: false });
+      breakOutbox(false);
+      notifier.poll(); notifier.poll();
+      assert.equal(notifier.pending(), before + 9);
+      assert.match(texts().at(-1)!, /^【保证金平衡异常（已恢复）】配对 p1，.*差 3000 USD1.*首报未能入队，现已恢复：.*差额 500 USD1.*另有 1 次异常已恢复/);
+      // Removing or disabling a pair ends monitoring; neither action is evidence that its balances recovered.
+      for (const keepDisabled of [false, true]) {
+        pairs = pair('4000', '1000'); notifier.poll();
+        clock += FAULT_AFTER_MS;
+        breakOutbox(true); notifier.poll();
+        pairs = keepDisabled ? pair('2000', '1500', { enabled: false }) : [];
+        notifier.poll(); breakOutbox(false);
+        pairs = pair('2000', '1500'); notifier.poll();
+        assert.equal(notifier.pending(), before + 9);
+      }
+      // An unrelated event waiting on the same broken queue must not stop this round's balance observation.
+      pairs = pair('9000', '1000');
+      notifier.poll();
+      clock += 20_000;
+      add('transfer-settled', { pair: 'p1', transfer: 'progress', state: 'confirmed', basis: 'acknowledged' });
+      add('transfer-sent', { pair: 'p1', transfer: 'deferred-event', state: 'unknown' });
+      breakOutbox(true);
+      assert.throws(() => notifier.poll(), /disk I\/O error/);
+      clock += FAULT_AFTER_MS;
+      assert.throws(() => notifier.poll(), /disk I\/O error/);
+      pairs = pair('2000', '1500');
+      assert.throws(() => notifier.poll(), /disk I\/O error/);
+      breakOutbox(false);
+      notifier.poll(); notifier.poll();
+      assert.equal(notifier.pending(), before + 11);
+      assert.match(texts().at(-2)!, /【划转结果未知】/);
+      assert.match(texts().at(-1)!, /【保证金平衡异常（已恢复）】.*差 8000 USD1/);
+      // The blocked first page is not the latest transfer history. A confirmed transfer on page two restarts the timer.
+      pairs = pair('9000', '1000');
+      notifier.poll();
+      add('transfer-sent', { pair: 'p1', transfer: 'page-one', state: 'unknown' });
+      for (let i = 1; i < 500; i++) add('transfer-sent', { pair: 'p1', state: 'acknowledged' });
+      breakOutbox(true);
+      clock += 50_000;
+      add('transfer-settled', { pair: 'p1', transfer: 'page-two', state: 'confirmed', basis: 'acknowledged' });
+      assert.throws(() => notifier.poll(), /disk I\/O error/);
+      clock += 10_000;
+      assert.throws(() => notifier.poll(), /disk I\/O error/);
+      clock += 5_000;
+      pairs = pair('2000', '1500');
+      assert.throws(() => notifier.poll(), /disk I\/O error/);
+      breakOutbox(false);
+      notifier.poll(); notifier.poll();
+      assert.equal(notifier.pending(), before + 12);
+      assert.match(texts().at(-1)!, /【划转结果未知】.*page-one/);
     } finally { outboxDb.close(); }
     await notifier.flush();
     notifier.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('保证金告警：事件源故障时仍报告余额恢复，待确认划转进度后再判断新异常', async () => {
+  let clock = 0, unreadable = false;
+  const rows: EventRow[] = [], lines: string[] = [], sent: string[] = [];
+  let pair = margin('3000', '1000', clock);
+  const notifier = createNotifier({
+    file: ':memory:', latestSeq: () => rows.length, pairs: () => [pair], incidentPair: () => null,
+    events: (after, limit) => { if (unreadable) throw new Error('事件不可读'); return rows.slice(after, after + limit); },
+    now: () => clock, log: line => lines.push(line), feishu: { webhook: 'https://example.invalid', secret: null },
+    fetchImpl: async (_url, init) => {
+      sent.push(...JSON.parse(String(init.body)).content.text.split('\n'));
+      return json({ code: 0 });
+    },
+  });
+  try {
+    notifier.poll();
+    clock += FAULT_AFTER_MS;
+    notifier.poll();
+    unreadable = true;
+    rows.push({ seq: 1, at: clock, type: 'transfer-sent', json: '{}' });
+    pair = margin('1500', '1000', clock);
+    assert.throws(() => notifier.poll(), /事件不可读/);
+    assert.match(lines.at(-1)!, /保证金平衡恢复/);
+    await notifier.flush();
+    assert.equal(sent.filter(line => line.startsWith('【保证金平衡恢复】')).length, 1);
+    pair = margin('4000', '1000', clock);
+    assert.throws(() => notifier.poll(), /事件不可读/);
+    clock += FAULT_AFTER_MS;
+    rows.push({ seq: 2, at: clock, type: 'transfer-settled', json: JSON.stringify({ pair: pair.id, state: 'confirmed', basis: 'acknowledged' }) });
+    assert.throws(() => notifier.poll(), /事件不可读/);
+    assert.equal(notifier.pending(), 0);
+    unreadable = false;
+    notifier.poll();
+    assert.equal(notifier.pending(), 0, '确认划转后要重新计时');
+    clock += FAULT_AFTER_MS;
+    notifier.poll();
+    assert.equal(notifier.pending(), 1);
+    assert.match(lines.at(-1)!, /保证金平衡异常.*差 3000 USD1/);
+  } finally { notifier.close(); }
 });
 
 test('保证金告警判定：受阻、非空闲说明、差额超过门槛（严格大于）才算异常；余额缺失、过期或读不出时不判定', () => {
@@ -585,6 +691,41 @@ for (const stage of ['运行中', '停止收尾中'] as const) {
     } finally { logs.close(); }
   });
 }
+
+test('服务告警：执行日志持续不可读时，运行中的服务仍投递已入队的保证金恢复', {
+  skip: process.platform !== 'linux' && '正式服务使用 Linux 账户进程锁',
+}, async t => {
+  const dir = tempDir();
+  const recovery = '【保证金平衡恢复】测试配对已恢复';
+  const sent: string[] = [];
+  const { startService } = await import('../src/service/main.ts');
+  let run: Awaited<ReturnType<typeof startService>> | undefined;
+  t.after(async () => {
+    try { await run?.shutdown(); } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  run = await startService({
+    config: parseServiceConfig(configRaw([])), dir, port: 0, app: APP,
+    secrets: { accounts: new Map(), feishu: { webhook: 'https://example.invalid', secret: null } },
+    fetchImpl: new FakeAster().fetch,
+    notifyFetch: async (_url, init) => {
+      const payload = JSON.parse(String(init.body));
+      if (payload.msg_type === 'text') sent.push(...payload.content.text.split('\n'));
+      return json({ code: 0 });
+    },
+  });
+  const db = new DatabaseSync(join(dir, 'executor-live.sqlite'));
+  try {
+    db.prepare('ATTACH DATABASE ? AS alerts').run(join(dir, 'notify.sqlite'));
+    db.exec('ALTER TABLE events RENAME TO unavailable_events');
+    try {
+      const at = Date.now();
+      db.prepare('INSERT INTO alerts.outbox(created_at, text, next_at) VALUES (?, ?, ?)').run(at, recovery, at);
+      const deadline = at + 15_000;
+      while (!sent.includes(recovery) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+      assert.equal(sent.filter(line => line === recovery).length, 1);
+    } finally { db.exec('ALTER TABLE unavailable_events RENAME TO events'); }
+  } finally { db.close(); }
+});
 
 test('服务进程：本机页面只含 ASTER 部分，状态接口可读，用户推送按子账户建立，停止后全部收尾', async () => {
   const dir = tempDir();

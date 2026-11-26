@@ -8,7 +8,7 @@ import type { ClosedTrade } from '../../../src/varlighter/strategy.ts';
 import type { BacktestView, StateView, SymbolView } from '../../../src/varlighter/views.ts';
 import { Badge, EquityChart, Metric, SpreadChart, SpreadLegend, stampText, useWrite } from './parts.tsx';
 import {
-  ALL_DIRECTIONS, BACKTEST_HOURS, IDENTITY_LABELS, REASON_LABELS, REGIME_LABELS, SYMBOL_FIELDS, VARLIGHTER_BASE, backtestBody, bps,
+  ALL_DIRECTIONS, BACKTEST_HOURS, IDENTITY_LABELS, REASON_LABELS, REGIME_LABELS, SYMBOL_FIELDS, VARLIGHTER_BASE, VAR_QUOTE_LABELS, backtestBody, bps,
   chartRows, directionLabel, duration, fundingAnnual, percent, plain, price, settingsBody, signal, signedUsd, symbolForm, symbolRequest, tone, usd, varLighterHref, venueLabel, venueShort, pairLabel, type SymbolForm,
 } from './varlighter-form.ts';
 
@@ -128,7 +128,7 @@ function ParamsPanel({ data, view, onChanged }: { data: SymbolView; view: StateV
       {!parsed.ok ? <Callout tone="warning" role="status">{parsed.error}</Callout> : null}
       {write.message ? <Callout tone={write.message.tone}>{write.message.text}</Callout> : null}
     </div>
-    {result ? <BacktestResultView result={result} /> : <p className="vl-note">回测用已采集的样本按时间重放，规则与模拟盘相同（基线不看未来、同一套风控与成本），按公开报价当时的价格成交。不改已保存的参数。</p>}
+    {result ? <BacktestResultView result={result} /> : <p className="vl-note">回测按时间重放已采集的盘口和询价，采用当前表单参数及模拟盘的风控与成本规则。</p>}
   </section>;
 }
 
@@ -136,14 +136,19 @@ function BacktestResultView({ result }: { result: BacktestView }) {
   const summary = result.summary;
   const blocked = Object.entries(summary.blocked).sort((a, b) => b[1] - a[1]);
   const reasons = Object.entries(summary.reasons);
+  const endMark = summary.openMarkUsd === null
+    ? (result.open ? '期末持仓缺少可用报价' : '期末无持仓')
+    : `期末持仓估值 ${signedUsd(summary.openMarkUsd)}${summary.openMarkEstimated ? '（估算）' : ''}${summary.openMarkVarSource ? ` · Var ${VAR_QUOTE_LABELS[summary.openMarkVarSource]}` : ''}`;
   return <div aria-label="回测结果">
     <div className="vl-metrics inset">
       <Metric label="净盈亏" value={signedUsd(summary.netUsd)} tone={tone(summary.netUsd)} foot={`毛 ${signedUsd(summary.grossUsd)} · 成本 ${usd(summary.costUsd)}`} />
       <Metric label="成交" value={`${summary.trades} 笔`} foot={`胜率 ${percent(summary.winRate)} · 平均 ${bps(summary.avgNetBps)} 基点`} />
       <Metric label="最大回撤" value={usd(summary.maxDrawdownUsd)} foot={`平均持有 ${duration(summary.avgHoldMinutes === null ? null : summary.avgHoldMinutes * 60_000)}`} />
-      <Metric label="资金费估算" value={signedUsd(summary.fundingUsd)} foot={summary.openMarkUsd === null ? '期末无持仓 · 不计入净盈亏' : `期末持仓估值 ${signedUsd(summary.openMarkUsd)} · 资金费不计入`} />
+      <Metric label="资金费估算" value={signedUsd(summary.fundingUsd)} foot={`${endMark} · 资金费不计入净盈亏`} />
     </div>
     {result.equity.length > 1 ? <div className="vl-chart small"><EquityChart points={result.equity} label="回测累计净盈亏" /></div> : null}
+    {summary.alignedSamples > 0 && <p className="vl-note">旧版采集的 {summary.alignedSamples.toLocaleString()} 个样本只记录了对齐时刻的盘口，其中 {summary.alignedOpens.toLocaleString()} 次开仓按该盘口估算。</p>}
+    {summary.unknownDecisionSamples > 0 && <p className="vl-note">{summary.unknownDecisionSamples.toLocaleString()} 个样本缺少开仓判断时刻，已排除在开仓依据之外。</p>}
     <p className="vl-note">{result.samples.toLocaleString()} 个样本，{summary.evaluated.toLocaleString()} 个有基线可判断
       {reasons.length ? `；平仓原因：${reasons.map(([key, count]) => `${REASON_LABELS[key] ?? key} ${count}`).join('，')}` : ''}
       {blocked.length ? `；达到入场但没开仓：${blocked.map(([key, count]) => `${key} ${count}`).join('，')}` : ''}
@@ -182,7 +187,8 @@ export function TradeTable({ trades }: { trades: readonly ClosedTrade[] }) {
       <td>{stampText(trade.closedAt)}<small>开 {stampText(trade.openedAt)}</small></td>
       <td>{pairLabel(trade.symbol).symbol}<small>{pairLabel(trade.symbol).short ? `${pairLabel(trade.symbol).short} · ` : ''}{directionLabel(trade.direction, pairLabel(trade.symbol).a, pairLabel(trade.symbol).b)}{trade.estimated ? ' · 估' : ''}</small></td>
       <td className="num">{usd(trade.notionalUsd, 0)}</td>
-      <td className="num">{bps(trade.entrySpread)} / {bps(trade.exitSpread)}</td>
+      <td className="num">{bps(trade.entrySpread)} / {bps(trade.exitSpread)}
+        {trade.entryVarSource || trade.exitVarSource ? <small>Var {trade.entryVarSource ? VAR_QUOTE_LABELS[trade.entryVarSource] : '未记录'} / {trade.exitVarSource ? VAR_QUOTE_LABELS[trade.exitVarSource] : '未记录'}</small> : null}</td>
       <td className="num">{bps(trade.entryBaseline)}<small>{REGIME_LABELS[trade.entryRegime]}</small></td>
       <td className="num">{duration(trade.closedAt - trade.openedAt)}</td>
       <td>{REASON_LABELS[trade.reason] ?? trade.reason}</td>

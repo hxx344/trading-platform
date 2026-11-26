@@ -1,6 +1,6 @@
 // 价差回归策略（docs/varlighter.md 第 5 节、docs/dexspread.md 第 5 节）：参数、开平仓判断与盈亏。回测（backtest.ts）与模拟盘（engine.ts）共用，
 // 只有纯计算，不读写存储。A、B 是配对的两条腿（Var/Lighter 配对里 A 是 Var）。
-import { REGIMES, bucketOf, executionSample, spreadOf, type Regime, type Sample, type Spread, type VenueId } from './model.ts';
+import { REGIMES, bucketOf, missingDecisionTop, spreadOf, targetSpread, type Regime, type Sample, type Spread, type VarPriceSource, type VenueId } from './model.ts';
 import type { Baseline } from './stats.ts';
 
 /** a_rich：A 相对偏贵，卖 A、买 B；a_cheap：买 A、卖 B。v0.87.0 以前叫 var_rich、var_cheap。 */
@@ -29,7 +29,7 @@ export interface GlobalParams {
   /** 基线最少样本数（按每分钟一个计；两腿都是行情流的配对每分钟只计一个）。 */ minSamples: number;
   /** 每次成交的滑点（基点，每条腿每次各计一次）。 */ slippageBps: number;
   varFeeBps: number | null; rhFeeBps: number | null; lighterFeeBps: number | null; entropyFeeBps: number | null;
-  /** 较慢一腿的报价收到时已过去的时间上限（秒），超过不开仓。 */ maxQuoteAgeSec: number;
+  /** 在决策时逐腿核对实际成交报价的最大年龄（秒）。 */ maxQuoteAgeSec: number;
   /** 预期净利（偏离 − 出场 − 半个往返成本 − 四次成交的滑点与手续费，基点）低于这个数不开仓。 */ minNetBps: number;
   maxOpenPositions: number;
   /** 所有持仓名义金额合计上限（美元）。 */ maxTotalNotionalUsd: number;
@@ -121,10 +121,12 @@ export interface Position {
   id: string; symbol: string; direction: Direction; openedAt: number; qty: number; notionalUsd: number;
   /** 开仓时的可成交价差（基点）与基线。 */ entrySpread: number; entryBaseline: number; entryRegime: Regime;
   aEntry: number; bEntry: number; estimated: boolean; ratio: number; aFeeBps: number; bFeeBps: number;
+  entryVarSource?: VarPriceSource;
 }
 export interface ClosedTrade extends Position {
   closedAt: number; aExit: number; bExit: number; exitSpread: number; reason: CloseReason;
   grossUsd: number; costUsd: number; netUsd: number; netBps: number;
+  exitVarSource?: VarPriceSource;
   /** 资金费估算（美元），只作参考，不计入 netUsd。 */ fundingUsd: number | null;
 }
 export type CloseReason = 'revert' | 'stop' | 'timeout' | 'manual';
@@ -144,19 +146,14 @@ export function markToMarket(position: Position, spread: Spread): { exitSpread: 
 }
 
 /**
- * 持仓按开仓档位取平仓价。100k 档缺价（缺盘口快照或 Var 没给 100k 报价）时退回 1k 档并标为估算，
- * 止损、超时与手动平仓照常进行，不会因为缺一份快照而一直卡住。
+ * 持仓信号按实际数量在各腿当前对应的公共档位判断；缺大档时允许小档估算。
  */
-export function positionSpread(sample: Sample, notionalUsd: number): Spread | null {
-  const bucket = bucketOf(notionalUsd), spread = spreadOf(sample, bucket);
-  if (spread || bucket === '1k') return spread;
-  const fallback = spreadOf(sample, '1k');
-  return fallback ? { ...fallback, estimated: true } : null;
+export function positionSpread(sample: Sample, position: Position): Spread | null {
+  return targetSpread(sample, position, false)?.spread ?? null;
 }
 
 /** 已有持仓：回归、止损、超时；没有持仓：按方向与偏离开仓。时段、报价时效与风控限制由调用方在开仓前另外判断。 */
-export function decide(sample: Sample, baseline: Baseline | null, params: SymbolParams, position: Position | null): Decision {
-  const spread = position ? positionSpread(sample, position.notionalUsd) : spreadOf(sample, bucketOf(params.notionalUsd));
+export function decide(sample: Sample, baseline: Baseline | null, params: SymbolParams, position: Position | null, spread = position ? positionSpread(sample, position) : spreadOf(sample, bucketOf(params.notionalUsd))): Decision {
   if (!spread) return { kind: 'wait', reason: '该档位缺少可成交价格（100k 档需要两腿的完整盘口）' };
   if (position) {
     const { pnlBps } = markToMarket(position, spread);
@@ -181,15 +178,16 @@ export function deviationToClose(direction: Direction, spread: Spread, median: n
 }
 
 export interface LegFees { aFeeBps: number; bFeeBps: number }
-/** 按两腿同样的名义开仓：A 腿数量 = 名义金额 ÷ 折算后的 B 中间价（B 腿数量再乘乘数）。 */
+/** Var 精确询价成交时按所询数量建仓并按乘数对冲；公开档位按名义金额除以折算后的 B 中间价建仓。 */
 export function openPosition(id: string, sample: Sample, params: SymbolParams, decision: Extract<Decision, { kind: 'open' }>, baseline: Baseline, fees: LegFees): Position {
   const { spread, direction } = decision, prices = spread.prices;
-  const qty = params.notionalUsd / prices.bMid;
+  const qty = spread.varQtyA ?? params.notionalUsd / prices.bMid;
   return {
     id, symbol: sample.symbol, direction, openedAt: sample.t, qty, notionalUsd: params.notionalUsd,
     entrySpread: direction === 'a_rich' ? spread.sellA : spread.buyA, entryBaseline: baseline.median, entryRegime: sample.regime,
     aEntry: direction === 'a_rich' ? prices.aBid : prices.aAsk, bEntry: direction === 'a_rich' ? prices.bAsk : prices.bBid, estimated: spread.estimated,
     ratio: sample.ratio, aFeeBps: fees.aFeeBps, bFeeBps: fees.bFeeBps,
+    ...(spread.varSource && { entryVarSource: spread.varSource }),
   };
 }
 
@@ -202,7 +200,8 @@ export function closePosition(position: Position, at: number, spread: Spread, re
   const tradedA = position.qty * (position.aEntry + aExit), tradedB = position.qty * (position.bEntry + bExit);
   const costUsd = (tradedA * (global.slippageBps + position.aFeeBps) + tradedB * (global.slippageBps + position.bFeeBps)) / 10_000;
   const grossUsd = aPnl + bPnl, netUsd = grossUsd - costUsd;
-  return { ...position, closedAt: at, aExit, bExit, exitSpread: rich ? spread.buyA : spread.sellA, reason, grossUsd, costUsd, netUsd, netBps: netUsd / position.notionalUsd * 10_000, fundingUsd };
+  return { ...position, closedAt: at, aExit, bExit, exitSpread: rich ? spread.buyA : spread.sellA, reason, grossUsd, costUsd, netUsd, netBps: netUsd / position.notionalUsd * 10_000, fundingUsd,
+    estimated: position.estimated || spread.estimated, ...(spread.varSource && { exitVarSource: spread.varSource }) };
 }
 
 /**
@@ -235,25 +234,33 @@ export function slippageBudgetBps(params: Pick<SymbolParams, 'entryBps' | 'exitB
 }
 
 export const DECAYED = '拿到报价时信号已消失', NO_LIVE_TOP = '缺少判断时刻的一档';
+export const NO_QUOTE_TIME = '缺少决策或逐腿报价时间证据', STALE_QUOTE = '报价过旧';
 /**
  * 开仓复核：有 Var 腿的配对，信号按 Var 报价时刻的样本算出，拿到报价时已过去约 20 秒。按判断时刻的行情流一档（与 Var 询价）重算，
- * 方向不变且仍达到入场偏离才开，并按那一刻的价成交。requireLive 为假（回测旧样本）时没有记录就沿用原样本。
+ * 方向不变且仍达到入场偏离才开，并按那一刻的价成交。历史样本缺少决策时间、行情流一档或其来源时刻时只进入基线。
  * 返回字符串是不开仓的原因。
  */
-export function confirmOpen(sample: Sample, baseline: Baseline, params: SymbolParams, decision: Extract<Decision, { kind: 'open' }>, requireLive: boolean): { sample: Sample; decision: Extract<Decision, { kind: 'open' }> } | string {
-  const live = executionSample(sample);
-  if (!live) return requireLive ? NO_LIVE_TOP : { sample, decision };
-  const again = decide(live, baseline, params, null);
-  return again.kind === 'open' && again.direction === decision.direction ? { sample: live, decision: again } : DECAYED;
+export function confirmOpen(sample: Sample, baseline: Baseline, params: SymbolParams, decision: Extract<Decision, { kind: 'open' }>, maxQuoteAgeSec: number): Extract<Decision, { kind: 'open' }> | string {
+  const aligned = sample.captureKind === 'aligned', at = aligned ? sample.receivedAt : sample.decisionAt;
+  if (at === null || !Number.isFinite(at) || at < sample.receivedAt) return NO_QUOTE_TIME;
+  const fill = targetSpread(sample, params, !aligned);
+  if (!fill) return missingDecisionTop(sample) ? NO_LIVE_TOP : '目标数量缺少可成交盘口';
+  if (fill.oldestAt === null || !Number.isFinite(fill.oldestAt)) return NO_QUOTE_TIME;
+  if (at - fill.oldestAt > maxQuoteAgeSec * 1000) return STALE_QUOTE;
+  if (aligned) fill.spread.estimated = true;
+  const again = decide(sample, baseline, params, null, fill.spread);
+  return again.kind === 'open' && again.direction === decision.direction ? again : DECAYED;
 }
-/** 平仓成交价：有判断时刻的一档就按它算，没有则用样本本身的。 */
-export function closeSpread(sample: Sample, position: Position, fallback: Spread): Spread {
-  const live = executionSample(sample);
-  return (live && positionSpread(live, position.notionalUsd)) ?? fallback;
+/** 自动与手动平仓、浮盈与回测期末估值使用同一份持仓数量和逐腿取价规则。 */
+export function closeSpread(sample: Sample, position: Position): Spread | null {
+  const fill = targetSpread(sample, position, true);
+  if (fill) return fill.spread;
+  const quoted = positionSpread(sample, position);
+  return quoted && { ...quoted, estimated: true };
 }
 
 /**
- * 开仓前的风控与时效检查；返回不开仓的原因，可以开则为 null。回测与模拟盘共用。
+ * 报价复核后的开仓风控；返回不开仓的原因，可以开则为 null。回测与模拟盘共用。
  * legBusy：这个配对的某条腿（同场所同代码）已在另一个配对持仓。场所的持仓按代码合并，两笔反向会互相抵消，所以每条腿同时只开一笔。
  * feeUnknown：某条腿的手续费既没有手动值也取不到目录费率。
  * fallbackBaseline：本时段样本不足、基线退回了全天窗口。时段刚切换（周一开盘、进周末）时全天窗口里是上一个时段的基差，不开仓。
@@ -275,7 +282,6 @@ export function openBlocker(sample: Sample, params: SymbolParams, global: Global
   if (!context.eligible) return '规格未确认';
   if (!params.regimes.includes(sample.regime)) return '当前时段不开仓';
   if (context.fallbackBaseline) return FALLBACK_BLOCK;
-  if (sample.receivedAt - sample.t > global.maxQuoteAgeSec * 1000) return '报价过旧';
   if (sample.t < context.cooldownUntil) return '冷却中';
   if (context.feeUnknown) return FEE_BLOCK;
   if (context.costBps !== undefined && context.costBps >= params.stopBps) return COST_BLOCK;

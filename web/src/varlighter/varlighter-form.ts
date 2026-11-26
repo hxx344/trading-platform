@@ -1,11 +1,12 @@
 // DEX 价差页（docs/varlighter.md 第 10 节、docs/dexspread.md 第 7 节）不依赖 DOM 的部分：读数格式、总览排序、参数表单到请求的转换、
 // 配对键与场所名、手动配对的表单、走势图的行数据。由 web/test/varlighter-form.test.mjs 覆盖。
-import type { AssetKind, Combo, CustomPair, Regime, VenueId } from '../../../src/varlighter/model.ts';
+import type { AssetKind, Combo, CustomPair, Regime, VarPriceSource, VenueId } from '../../../src/varlighter/model.ts';
 import type { Direction, GlobalParams, SymbolParams } from '../../../src/varlighter/strategy.ts';
 import type { Settings, StateRow, SymbolPoint } from '../../../src/varlighter/views.ts';
 import type { VarLighterTab } from '../route-parse.ts';
 
 export const VARLIGHTER_BASE = '/api/varlighter';
+export const VAR_QUOTE_LABELS: Record<VarPriceSource, string> = { token: '按量询价', '0': '公开一档', '1k': '公开 1 千美元档', '100k': '公开 10 万美元档' };
 export type { VarLighterTab };
 export const VARLIGHTER_TABS: readonly { id: VarLighterTab; label: string }[] = [
   { id: 'overview', label: '价差总览' }, { id: 'detail', label: '标的详情' }, { id: 'paper', label: '模拟盘' }, { id: 'ready', label: '实盘准备' },

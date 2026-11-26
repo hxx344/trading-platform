@@ -9,11 +9,10 @@
 //
 // Missing parameters are filled from the platform's saved ones (state.json), checked like the page's backtest request.
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { runBacktest, type BacktestSummary } from '../../src/varlighter/backtest.ts';
 import { SAMPLE_FIELDS, parsePairKey, upgradeKey, type AssetKind, type Sample } from '../../src/varlighter/model.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, legFeeBps, readGlobalParams, readSymbolParams, type GlobalParams, type LegFees, type SymbolParams } from '../../src/varlighter/strategy.ts';
-import { dataDir, sampleFile, STATE_FILE, type LocalState } from './pull.ts';
+import { cacheRoot, checkSampleSymbol, readLocalState, replayDir, sampleFile } from './cache.ts';
 
 export const MAX_COMBOS = 200;
 /** A hole between two local samples longer than this is listed in the output (the service was down, or pulled too late). */
@@ -38,6 +37,13 @@ export interface BacktestRequest {
 
 const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 
+function tradeLimit(value: unknown): number | 'all' {
+  if (value === undefined) return 50;
+  if (value === 'all') return value;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 10_000) throw new RequestError('trades 须为 0–10000 的整数或 all');
+  return value;
+}
+
 export function readRequest(raw: unknown): BacktestRequest {
   if (!isObject(raw)) throw new RequestError('回测请求须为对象');
   const unknown = Object.keys(raw).find(key => !['symbol', 'hours', 'params', 'global', 'grid', 'trades', 'kind'].includes(key));
@@ -56,7 +62,7 @@ export function readRequest(raw: unknown): BacktestRequest {
     const combos = Object.values(raw.grid as Record<string, unknown[]>).reduce((product, values) => product * values.length, 1);
     if (combos > MAX_COMBOS) throw new RequestError(`grid 组合 ${combos} 个，超过上限 ${MAX_COMBOS}`);
   }
-  if (raw.trades !== undefined && raw.trades !== 'all' && (typeof raw.trades !== 'number' || !Number.isInteger(raw.trades) || raw.trades < 0 || raw.trades > 10_000)) throw new RequestError('trades 须为 0–10000 的整数或 all');
+  tradeLimit(raw.trades);
   if (raw.kind !== undefined && !KINDS.includes(raw.kind as AssetKind)) throw new RequestError(`kind 须为 ${KINDS.join('、')} 之一`);
   return { ...raw, symbol } as unknown as BacktestRequest;
 }
@@ -69,7 +75,7 @@ export interface LoadedSamples { samples: Sample[]; skipped: number; gaps: { fro
  * twice without saying so; holes longer than GAP_MS are listed. A last line without its newline is a pull still
  * appending (or killed while it did), so it is left for that pull to finish or cut off.
  */
-export function loadSamples(file: string): LoadedSamples {
+export function loadSamples(file: string, symbol?: string): LoadedSamples {
   if (!existsSync(file)) throw new RequestError(`本机没有这个配对的样本（${file}）：先运行 tools/varlighter/pull.ts`);
   const samples: Sample[] = [], gaps: LoadedSamples['gaps'] = [];
   let skipped = 0;
@@ -77,6 +83,7 @@ export function loadSamples(file: string): LoadedSamples {
   for (const line of text.slice(0, text.lastIndexOf('\n') + 1).split('\n')) {
     if (!line.trim()) continue;
     const raw = JSON.parse(line) as Record<string, unknown>;
+    if (symbol !== undefined) checkSampleSymbol(raw.symbol, symbol);
     const sample = Object.fromEntries(SAMPLE_FIELDS.map(field => [field, raw[field] ?? null])) as unknown as Sample;
     const before = samples.at(-1);
     if (before && !(sample.t > before.t)) { skipped++; continue; }
@@ -97,17 +104,14 @@ const split = (values: Record<string, unknown>) => {
   return { symbol, global };
 };
 
-const readState = (dir: string): LocalState | null => {
-  const statePath = join(dir, STATE_FILE);
-  return existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) as LocalState : null;
-};
-
-export function runLocal(request: BacktestRequest, dir: string): unknown {
-  const state = readState(dir);
-  if (!state) throw new RequestError(`没有 ${join(dir, STATE_FILE)}：先运行 tools/varlighter/pull.ts`);
+export function runLocal(request: BacktestRequest, root: string, source?: string): unknown {
+  const limit = tradeLimit(request.trades);
+  const dir = replayDir(root, source);
+  const state = dir ? readLocalState(dir) : null;
+  if (!dir || !state) throw new RequestError('本机没有所选平台的来源快照，请先运行 tools/varlighter/pull.ts');
   const kind = request.kind ?? state.pairs.find(pair => pair.key === request.symbol)?.kind;
   if (!kind) throw new RequestError(`state.json 里没有 ${request.symbol} 的类别（配对已失联）：请在请求里给出 kind`);
-  const { samples: all, skipped, gaps } = loadSamples(sampleFile(dir, request.symbol));
+  const { samples: all, skipped, gaps } = loadSamples(sampleFile(dir, request.symbol), request.symbol);
   if (!all.length) throw new RequestError('本机样本为空');
   const savedSymbol = state.settings.symbols[request.symbol] ?? DEFAULT_SYMBOL;
   const savedGlobal = readGlobalParams({}, { ...DEFAULT_GLOBAL, ...state.settings.global });
@@ -123,16 +127,15 @@ export function runLocal(request: BacktestRequest, dir: string): unknown {
     const params: SymbolParams = readSymbolParams({ ...request.params, ...extra.symbol, enabled: true }, { ...DEFAULT_SYMBOL, ...savedSymbol });
     const global: GlobalParams = readGlobalParams({ ...request.global, ...extra.global }, savedGlobal);
     const from = request.hours !== undefined ? to - request.hours * 3_600_000 : all[0]!.t + global.windowHours * 3_600_000;
-    // The server's backtest is given one baseline window before `from`, no more (engine.ts); the same slice here keeps
-    // everything that depends on the samples given, the first live Lighter top included, the same on both sides.
+    // Warm up the baseline with the same window the server uses (engine.ts).
     const warm = from - global.windowHours * 3_600_000;
     return { params, global, from, samples: all.filter(sample => sample.t >= warm) };
   };
-  const span = { firstSample: all[0]!.t, lastSample: to, localSamples: all.length, skipped, gapCount: gaps.length, gaps: gaps.slice(-20) };
+  const span = { source: state.source, firstSample: all[0]!.t, lastSample: to, localSamples: all.length, skipped, gapCount: gaps.length, gaps: gaps.slice(-20) };
   if (!request.grid) {
     const { params, global, from, samples } = resolve({});
     const result = runBacktest(request.symbol, kind, samples, from, to, params, global, feesOf(global));
-    const shown = request.trades === 'all' ? result.trades : result.trades.slice(-(request.trades ?? 50));
+    const shown = limit === 'all' ? result.trades : result.trades.slice(Math.max(0, result.trades.length - limit));
     // gaps cover the whole local file; replayGaps only the part this run replayed.
     const replayGaps = gaps.filter(gap => gap.to > from).length;
     return { symbol: request.symbol, kind, ...span, replayGaps, from, to, samples: result.samples, params, global, summary: result.summary, open: result.open, tradesShown: shown.length, trades: shown };
@@ -153,8 +156,9 @@ export function runLocal(request: BacktestRequest, dir: string): unknown {
  * saved parameters (when state.json is there). The MCP tool runs it in a child process before pulling, so a parameter
  * the strategy just gained is known without restarting the MCP server.
  */
-export function checkRequest(request: BacktestRequest, dir: string): { ok: true; combos: number } {
-  const state = readState(dir);
+export function checkRequest(request: BacktestRequest, root: string, source?: string): { ok: true; combos: number } {
+  const dir = replayDir(root, source);
+  const state = dir ? readLocalState(dir) : null;
   const savedSymbol = { ...DEFAULT_SYMBOL, ...state?.settings.symbols[request.symbol] };
   const savedGlobal = { ...DEFAULT_GLOBAL, ...state?.settings.global };
   const combos = request.grid ? combinations(request.grid) : [{}];
@@ -188,7 +192,8 @@ if (import.meta.main) {
   try {
     const argv = process.argv.slice(2), check = argv[0] === '--check';
     const request = parseArgs(check ? argv.slice(1) : argv);
-    process.stdout.write(`${JSON.stringify(check ? checkRequest(request, dataDir()) : runLocal(request, dataDir()))}\n`);
+    const root = cacheRoot(), source = process.env.TP_MCP_URL;
+    process.stdout.write(`${JSON.stringify(check ? checkRequest(request, root, source) : runLocal(request, root, source))}\n`);
   } catch (error) {
     process.stderr.write(`回测失败：${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;

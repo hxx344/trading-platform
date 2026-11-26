@@ -148,6 +148,14 @@ export function createLiveTrader(deps: LiveDeps) {
     const leg = position[name];
     return leg.market && leg.code ? { venue: leg.venue, symbol: leg.code, market: leg.market } : null;
   };
+  /** 第一腿已成交、第二腿的意图一直落不了库：不能无限重试，一分钟告警，十分钟转人工（L039、L092）。 */
+  const hedgeFailSince = new Map<string, number>();
+  function hedgeBlocked(position: LivePosition, error: unknown): void {
+    const since = hedgeFailSince.get(position.id) ?? now();
+    hedgeFailSince.set(position.id, since);
+    if (now() - since >= NO_QUOTE_STUCK_MS) { hedgeFailSince.delete(position.id); stuck(position, `第二腿一直下不了（${message(error).slice(0, 80)}），第一腿没有对冲`); return; }
+    if (now() - since >= NO_QUOTE_ALERT_MS) alert(`hedgefail:${position.id}`, `【DEX 价差实盘】${position.symbol} 第一腿已成交，第二腿 ${Math.round((now() - since) / 1000)} 秒仍下不了（${message(error).slice(0, 80)}）；第一腿没有对冲，请检查服务器磁盘与日志`);
+  }
   /** 一条腿此刻的可成交价是否在限价以内：买看卖一、卖看买一。不在或没有报价时返回原因。 */
   function quoteProblem(info: LegInfo, side: Side, limit: number): string | null {
     const quote = deps.quote(info);
@@ -194,7 +202,8 @@ export function createLiveTrader(deps: LiveDeps) {
   }
   function stuck(position: LivePosition, reason: string): void {
     position.state = 'stuck'; position.note = reason.slice(0, 200);
-    save(position);
+    // 落库失败也要停下并告警（告警在内存里，库坏了也发得出去）。
+    try { save(position); } catch (error) { log(`varlighter: 实盘 ${position.symbol} 转人工时保存失败：${message(error)}`); }
     event(position.symbol, `实盘持仓需要人工处理：${reason}`);
     stuckAlert(position);
     halt(`${title(position)} 需要人工处理：${reason}`);
@@ -322,15 +331,20 @@ export function createLiveTrader(deps: LiveDeps) {
             const side = position.b.side, [limit] = limitPrice(b, side, side === 'buy' ? quote.ask : quote.bid, settings.limits.slippageBps);
             let sentB: boolean;
             try { sentB = await send(position, b, { leg: 'b', purpose: 'hedge', side, qty: target, limit, reduceOnly: false }); }
-            catch (error) { if (!position.pending) position.step = 'b'; throw error; }
+            catch (error) {
+              if (!position.pending) { position.step = 'b'; hedgeBlocked(position, error); }
+              throw error;
+            }
+            hedgeFailSince.delete(position.id);
             if (!sentB) { save(position); return; }
           } else save(position);
           continue;
         }
         // settle：A 比 B 多出来的部分在 A 上反向平掉。两腿步长不同、乘数除不尽时总会差一点：不到 B 一个步长的等值的余量不算单腿、不回补，
         // 留到平仓时两腿各自平掉。比这多的都是真实的单腿敞口，哪怕低于最小下单量也照常回补（只减仓单交易所不收时重试到上限转人工并告警）。
+        // 取整余量只可能出现在 B 已补齐目标时；B 少成交哪怕一个步长，都是真实敞口。
         const excess = floorTo(remainingOf(position.a) - position.b.qty / position.ratio, a.market.sizeDecimals ?? 0);
-        const dust = position.b.qty > 0 && excess < stepOf(b) / position.ratio + stepOf(a) / 2;
+        const dust = position.b.qty > 0 && position.b.qty >= floorTo(position.a.qty * position.ratio, b.market.sizeDecimals ?? 0) - stepOf(b) / 2;
         if (excess >= stepOf(a) && !dust) {
           position.singleLeg = true;
           if (position.tries >= MAX_FLATTEN_TRIES) { stuck(position, `${VENUE_NAMES[position.a.venue]} 多出的 ${excess} 平不掉（第二腿没有补齐）`); return; }

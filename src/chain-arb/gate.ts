@@ -173,12 +173,14 @@ export function createGateReader({ fetcher = fetch, clock = Date.now }: { fetche
       const headers: Record<string, string> = { Accept: 'application/json' };
       if (path.startsWith('/futures/')) headers['X-Gate-Size-Decimal'] = '1';
       const response = await fetcher('https://api.gateio.ws/api/v4' + path, { method: 'GET', signal, redirect: 'error', cache: 'no-store', headers });
-      const age = Number(response.headers.get('age') ?? 0) * 1000;
+      const ageHeader = response.headers.get('age') ?? '0';
+      const age = Number(ageHeader) * 1000;
       const ttl = metadata ? METADATA_TTL : CHAIN_ARB_TTL_MS;
-      if (!response.ok || !Number.isFinite(age) || age < 0 || age >= ttl) {
+      const complete = response.status === 200 && !response.headers.has('content-range');
+      if (!complete || !/^\d+$/.test(ageHeader) || age >= ttl) {
         void response.body?.cancel().catch(() => undefined);
         if (response.status === 429) throw new GateRateLimit('Gate 请求受限，请稍后刷新');
-        fail(response.ok ? 'Gate 接口缓存已过期' : failure);
+        fail(complete ? 'Gate 接口缓存已过期' : failure);
       }
       const row = await readJsonResponse(response, { signal, maxBytes: 128 * 1024, reviver(_key, value, context) {
         // A bare JSON fraction can round to a different integer before a field validator runs.
@@ -189,12 +191,13 @@ export function createGateReader({ fetcher = fetch, clock = Date.now }: { fetche
       } });
       if (!isObject(row)) fail(failure);
       let at = startedAt - age;
-      if (!metadata && path.startsWith('/futures/usdt/contracts/')) {
-        // Gate's contract snapshot includes the live mark but no mark timestamp in the body.
+      if (path.startsWith('/spot/currencies/') || (!metadata && path.startsWith('/futures/usdt/contracts/'))) {
+        // Currency flags and futures marks have no source timestamp inside Gate's response body.
+        const label = path.startsWith('/spot/currencies/') ? '充值状态' : '标记价';
         const generated = Date.parse(response.headers.get('date') ?? '');
-        if (!Number.isSafeInteger(generated) || generated > clock() + CHAIN_ARB_CLOCK_SKEW_MS) fail('Gate 标记价响应时间异常');
+        if (!Number.isSafeInteger(generated) || generated <= 0 || generated > clock() + CHAIN_ARB_CLOCK_SKEW_MS) fail('Gate ' + label + '响应时间异常');
         at = Math.min(at, generated);
-        if (clock() - at >= CHAIN_ARB_TTL_MS) fail('Gate 标记价已过期');
+        if (clock() - at >= CHAIN_ARB_TTL_MS) fail('Gate ' + label + '已过期');
       }
       const snapshot = { row, at };
       if (metadata) {
@@ -215,7 +218,7 @@ export function createGateReader({ fetcher = fetch, clock = Date.now }: { fetche
       || !isGateBaseSymbol(input.symbol)
       || typeof input.address !== 'string' || !/^0x[0-9a-f]{40}$/i.test(input.address) || /^0x0{40}$/i.test(input.address)) fail(IDENTITY_ERROR);
     const deadline = anySignal([signal], 8_000);
-    const { row: currency } = await get('/spot/currencies/' + encodeURIComponent(input.symbol), deadline, reuseMetadata, 'Gate 币种目录不可用或未收录此币');
+    const { row: currency, at: depositAt } = await get('/spot/currencies/' + encodeURIComponent(input.symbol), deadline, false, 'Gate 币种目录不可用或未收录此币');
     const chain = verifyIdentity(currency, input);
     const pair = input.symbol + '_USDT';
     const encodedPair = encodeURIComponent(pair);
@@ -240,6 +243,7 @@ export function createGateReader({ fetcher = fetch, clock = Date.now }: { fetche
       }
     }
     const [spot, perp] = await Promise.all([readLeg('spot'), readLeg('perp')]);
+    for (const leg of [spot, perp]) if (!('error' in leg)) leg.at = Math.min(leg.at, depositAt);
     return { deposit: enabled(currency.deposit_disabled, chain.deposit_disabled),
       withdraw: enabled(currency.withdraw_disabled, currency.withdraw_delayed, chain.withdraw_disabled, chain.withdraw_delayed), spot, perp };
   };

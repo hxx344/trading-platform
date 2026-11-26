@@ -8,7 +8,7 @@ import type { MarketControl } from '../monitor/control.ts';
 import type { MonitorStore } from '../monitor/store.ts';
 import { DEFAULT_BACKGROUND_SETTINGS, parseBackgroundSettings, type BackgroundSettings, type BackgroundView } from './background-model.ts';
 import { CHAIN_ARB_TTL_MS, VENUE_NAMES, isGateBaseSymbol, type ChainArbVenue } from './model.ts';
-import { SCAN_HISTORY_MS, type ScanRow, type ScanView } from './scan-model.ts';
+import { isVerifiedExecution, SCAN_HISTORY_MS, type ScanRow, type ScanView } from './scan-model.ts';
 
 const SETTINGS_KEY = 'chainArb.background';
 const POLL_MS = 2_000;
@@ -21,6 +21,7 @@ interface Options {
   control(): MarketControl;
   hooks?: Pick<AlertHooks, 'robot' | 'notifyRepeating'>;
   okxResultCurrent?: (view: ScanView) => boolean;
+  gateResultCurrent?: (row: ScanRow) => boolean;
   now?: () => number;
 }
 
@@ -29,7 +30,7 @@ function checkSnapshot(snapshot: ScanView, venue: ChainArbVenue, chain: Backgrou
     && (chain === 'all' || row.chain === chain) && isGateBaseSymbol(row.symbol) && /^0x[\da-f]{40}$/i.test(row.address)
     && (row.kind === 'spot' || row.kind === 'perp') && [row.netUsdt, row.netBps, row.dexPrice, row.gatePrice, row.at]
       .every(value => Number.isFinite(value) && value > 0) && Number.isFinite(row.gasUsdt) && row.gasUsdt >= 0
-    && row.expiresAt === row.at + CHAIN_ARB_TTL_MS;
+    && isVerifiedExecution(row.execution) && row.expiresAt === row.at + CHAIN_ARB_TTL_MS;
   if (!snapshot || !Number.isFinite(snapshot.asOf) || !['loading', 'scanning', 'cooldown', 'error'].includes(snapshot.phase)
     || !Array.isArray(snapshot.rows) || !Array.isArray(snapshot.history) || !snapshot.rows.every(matches) || !snapshot.history.every(matches))
     throw new Error('行情快照格式或币种路线与本次扫描不符');
@@ -52,15 +53,18 @@ function failedSnapshot(at: number, message: string): ScanView {
 }
 
 function notifyMessage(venue: ChainArbVenue, row: ScanRow, settings: BackgroundSettings) {
-  const route = row.kind === 'spot' ? '现货充值卖出' : '永续开空（基差收敛情景，未计资金费）';
+  const route = row.kind === 'spot' ? '现货充值卖出' : '永续开空（基差收敛情景，充值后卖出现货并平空，未计资金费）';
+  const fill = row.execution!;
   return ['【链上折价套利】' + row.symbol + ' · ' + chainNames[row.chain],
     '路线：链上买入 → ' + VENUE_NAMES[venue] + ' ' + route,
     '合约地址：' + row.address, '预算 ' + settings.amount + ' USDT，扣费后价差 ' + Number(row.netBps.toPrecision(8)) + ' bp（阈值 ' + settings.thresholdBps + ' bp）',
+    '模拟买入实收 ' + Number(fill.receivedQuantity.toPrecision(8)) + ' ' + row.symbol + '，模拟转账实收 ' + Number(fill.transferQuantity.toPrecision(8))
+      + '，整笔价格影响 ' + Number((fill.impactBps / 100).toPrecision(6)) + '%，已核对该网络开放充值',
     '预估净收益 ' + Number(row.netUsdt.toPrecision(8)) + ' USDT，报价时间 ' + new Date(row.at).toISOString(),
     '报价有效至 ' + new Date(row.expiresAt).toISOString() + '，过期请在平台重新复核。'].join('\n');
 }
 
-export function createChainArbBackground({ store, scan, control, hooks, okxResultCurrent, now = Date.now }: Options) {
+export function createChainArbBackground({ store, scan, control, hooks, okxResultCurrent, gateResultCurrent, now = Date.now }: Options) {
   let settings = DEFAULT_BACKGROUND_SETTINGS, revision = 0, loadError: string | null = null;
   try {
     const entry = store.readState(SETTINGS_KEY);
@@ -97,7 +101,9 @@ export function createChainArbBackground({ store, scan, control, hooks, okxResul
             ? snapshot.message : null;
           return [venue, failedSnapshot(at, message ?? 'OKX 只读连接或币链目录待重新核验')];
         }
-        return [venue, currentSnapshot(snapshot, at)];
+        const checked = venue === 'gate' ? { ...snapshot, rows: snapshot.rows.filter(row => gateResultCurrent?.(row)),
+          history: snapshot.history.filter(row => gateResultCurrent?.(row)) } : snapshot;
+        return [venue, currentSnapshot(checked, at)];
       })) : {} };
   }
   function update(input: unknown): BackgroundView {
@@ -137,6 +143,7 @@ export function createChainArbBackground({ store, scan, control, hooks, okxResul
         const at = now();
         if (snapshot.asOf > at || row.at > at || row.expiresAt <= at || row.netBps <= thresholdBps) continue;
         if (venue === 'okx' && !okxResultCurrent?.(snapshot)) throw new Error('OKX 只读连接或币链目录待重新核验');
+        if (venue === 'gate' && !gateResultCurrent?.(row)) continue;
         const key = ['chain-arb', venue, row.chain, row.address.toLowerCase(), row.kind].join(':');
         try { hooks.notifyRepeating(key, notifyMessage(venue, row, settings)); }
         catch (error) { queueErrors.set(venue, VENUE_NAMES[venue] + ' 通知入队失败：' + reason(error)); break; }
@@ -145,7 +152,7 @@ export function createChainArbBackground({ store, scan, control, hooks, okxResul
       if (!current()) return;
       const previous = results.get(venue);
       const failure = failedSnapshot(now(), signal.aborted ? '后台行情读取超时，稍后重试' : reason(error));
-      results.set(venue, venue !== 'okx' && previous ? { ...failure,
+      results.set(venue, venue !== 'okx' && venue !== 'gate' && previous ? { ...failure,
         cycle: previous.cycle, total: previous.total, checked: previous.checked, failed: previous.failed,
         history: [...previous.rows, ...previous.history] } : failure);
     } finally {

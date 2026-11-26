@@ -15,12 +15,13 @@ import { createMarketServer } from '../src/market/server.ts';
 import { createMonitorStore } from '../src/monitor/store.ts';
 import { createNotifier } from '../src/service/feishu.ts';
 import { closeMonitor, monitorLoops, monitorViews, openMonitor, stopMonitor } from '../src/service/monitor.ts';
-import { ARB_ADDRESS, chainArbFixture } from './chain-arb-fake.ts';
+import { ARB_ADDRESS, chainArbFixture, testGateLedger } from './chain-arb-fake.ts';
 import { createHarness } from './harness.ts';
 
 function quote(at: number, venue: ChainArbVenue, netBps: number): ScanView {
   const row: ScanRow = { venue, symbol: 'ARB', address: ARB_ADDRESS, chain: 'arbitrum', kind: 'spot', netUsdt: 20.45, netBps,
-    at, expiresAt: at + 15_000, dexPrice: 0.1, gatePrice: 0.12, gasUsdt: 0.5 };
+    at, expiresAt: at + 15_000, dexPrice: 0.1, gatePrice: 0.12, gasUsdt: 0.5,
+    execution: { receivedQuantity: 1000, transferQuantity: 1000, impactBps: 0, blockNumber: '0x123' } };
   return { asOf: at, phase: 'scanning', total: 1, cycle: 1, checked: 1, failed: 0, message: null, rows: [row], history: [] };
 }
 
@@ -28,7 +29,7 @@ test('无人打开页面时轮转场所并按各自费率询价，阈值严格�
   const store = createMonitorStore({ file: ':memory:' }); t.after(() => store.close());
   let at = 100_000, old = false, failed = true;
   const calls: [ChainArbVenue, string][] = [], notifications: string[] = [];
-  const service = createChainArbBackground({ store, now: () => at, control: () => ({ enabled: true, revision: 0 }),
+  const service = createChainArbBackground({ store, gateResultCurrent: () => true, now: () => at, control: () => ({ enabled: true, revision: 0 }),
     hooks: { robot: () => 'feishuMonitor', notifyRepeating: (_key, message) => { notifications.push(message); } },
     scan: async raw => {
       const { venue = 'gate', spotFeeBps } = raw as ScanInput;
@@ -70,7 +71,7 @@ test('一个场所的批次被阻塞时，其他场所继续轮扫，慢场所�
   const store = createMonitorStore({ file: ':memory:' }); t.after(() => store.close());
   const calls: ChainArbVenue[] = [], notifications: string[] = [];
   let ticks = 0, gateCancelled = false;
-  const service = createChainArbBackground({ store, now: () => 100_000, control: () => ({ enabled: true, revision: 0 }),
+  const service = createChainArbBackground({ store, gateResultCurrent: () => true, now: () => 100_000, control: () => ({ enabled: true, revision: 0 }),
     hooks: { robot: () => 'feishuMonitor', notifyRepeating: (_key, text) => { notifications.push(text); } },
     scan: async (raw, _scope, signal, awaitBatch) => {
       assert.equal(awaitBatch, true);
@@ -94,7 +95,7 @@ test('更改设置、关闭行情或服务停止时，在途旧数据不会恢�
   let sent = 0, broken = true, blocked = false;
   let finish!: () => void;
   const settings = { ...DEFAULT_BACKGROUND_SETTINGS, enabled: true, venues: ['gate'] };
-  const service = createChainArbBackground({ store, hooks, now, control: () => market, scan: async () => {
+  const service = createChainArbBackground({ store, gateResultCurrent: () => true, hooks, now, control: () => market, scan: async () => {
     if (blocked) await new Promise<void>(resolve => { finish = resolve; });
     return quote(now(), 'gate', 120);
   } });
@@ -129,7 +130,7 @@ test('登录 HTTP 保存后，无页面读取时服务循环仍经行情 IPC 推
   let notifier = createNotifier(outboxOptions);
   const market = createMarketServer({ monitor: createMonitorData({ now, fetchImpl: chainArbFixture(now) }) }, 'test');
   const client = createMarketClient(socket);
-  const open = () => openMonitor({ perpetual: {} }, h.dir, { now, marketClient: client, log: () => {},
+  const open = () => openMonitor({ perpetual: {} }, h.dir, { now, marketClient: client, gateLedger: testGateLedger(now), log: () => {},
     alertHooks: { robot: () => 'feishuMonitor', notify: () => null, test: async () => {}, delivery: () => new Map(),
       notifyRepeating: (key, text) => notifier.notifyRepeating(key, text) } });
   let runtime = open();

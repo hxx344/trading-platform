@@ -3,6 +3,7 @@ import test from 'node:test';
 import { createBinanceReader } from '../src/chain-arb/binance.ts';
 import { compareChainArb } from '../src/chain-arb/estimate.ts';
 import type { ChainArbInput } from '../src/chain-arb/model.ts';
+import { verifiedBuy } from './chain-arb-fake.ts';
 
 const at = 1_795_690_000_000;
 const address = '0x514910771af9ca656af840dff83e8264ecf986ca';
@@ -58,8 +59,10 @@ test('币安匿名目录、同币双腿与页面估算使用真实盘口时间�
   assert.equal(value.minDeposit, '0.5'); assert.equal(value.deposit, true); assert.equal(value.withdraw, true);
   assert.deepEqual(value.spot, { at: at - 710, bids: book.bids.slice(0, 4), step: '0.01', minQuantity: '0.5', maxQuantity: '500' });
   assert.deepEqual(value.perp, { at: at - 800, bids: book.bids.slice(0, 3), step: '0.02', minQuantity: '2', maxQuantity: '500' });
-  assert.ok('quantity' in compareChainArb(input, { rawQuantity: '3100', decimals: 3, at, swapGasUsdt: 0.1 }, value, at).spot);
-  assert.match((compareChainArb(input, { rawQuantity: '49', decimals: 2, at }, value, at).spot as { error: string }).error, /最低充值/);
+  assert.ok('quantity' in compareChainArb(input, verifiedBuy({ rawQuantity: '3100', decimals: 3, at, swapGasUsdt: 0.1 }), value, at).spot);
+  const below = compareChainArb(input, verifiedBuy({ rawQuantity: '49', decimals: 2, at }), value, at);
+  assert.match((below.spot as { error: string }).error, /最低充值/);
+  assert.deepEqual(below.perp, below.spot);
 });
 test('币安目录排除面额不为一或冲突的链、币、地址，错误币名不能读取盘口', async () => {
   const badWallets = [
@@ -76,12 +79,14 @@ test('币安目录排除面额不为一或冲突的链、币、地址，错误�
   }
   await assert.rejects(setup().reader.read({ ...input, symbol: 'OTHER' }, signal), /唯一匹配/);
 });
-test('币安暂停充值、未核实状态与有充值手续费的币仅保留永续', async () => {
+test('币安暂停充值、未核实状态与有充值手续费的币可读取原始永续行情，两条套利路线均不可用', async () => {
   for (const patch of [{ depositEnable: false }, { depositHideEnable: true }, { depositEnable: undefined }, { depositFee: '0.01' }]) {
     const { reader, calls } = setup({ overrides: { [wallet]: { code: '000000', data: [{ ...currency, networkList: [{ ...network, ...patch }] }] } } });
     assert.deepEqual((await reader.catalog(signal)).map(c => [c.spot, c.perp]), [[false, true]]);
     const view = await reader.read(input, signal);
     assert.ok('error' in view.spot && 'bids' in view.perp);
+    const quote = compareChainArb(input, verifiedBuy({ rawQuantity: '3', decimals: 0, at }), view, at);
+    assert.ok('error' in quote.spot && 'error' in quote.perp);
     if ('depositEnable' in patch && patch.depositEnable === undefined) assert.equal(view.deposit, null);
     assert.ok(!calls.includes(spot + depth));
   }
@@ -117,8 +122,12 @@ test('币安按基准价验算名义下限和市场步长；不接受开仓受�
 });
 test('币安按 HTTP 来源年龄失效，取消和限流不把旧目录或深度当作可成交', async () => {
   let time = at;
-  const { reader, responses } = setup({ age: () => time, walletHeaders: { age: '58' } });
+  const { reader, responses } = setup({ age: () => time, walletHeaders: { age: '13' } });
   await reader.catalog(signal);
+  const snapshot = await reader.read(input, signal);
+  assert.ok('at' in snapshot.spot && 'at' in snapshot.perp);
+  assert.equal(snapshot.spot.at, at - 13_000);
+  assert.equal(snapshot.perp.at, at - 13_000);
   time += 2000; responses[wallet] = new Response(null, { status: 429 });
   await assert.rejects(reader.catalog(signal), { status: 429 });
   await assert.rejects(reader.read(input, AbortSignal.abort()), { name: 'AbortError' });

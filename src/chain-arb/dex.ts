@@ -1,13 +1,18 @@
 import { anySignal } from '../any-signal.mjs';
 import { isObject } from '../contracts.ts';
-import { ExchangeResponseError, readJsonResponse } from '../vendor/response.mjs';
+import { simulateDexFill } from './dex-sim.ts';
+import { readSource, type DexFetcher as Fetcher } from './dex-request.ts';
+import { CHAIN_ARB_CLOCK_SKEW_MS, CHAIN_ARB_TTL_MS } from './model.ts';
 
 import { networks, isSettlementOrNative } from './networks.ts';
 
 export { isSettlementOrNative } from './networks.ts';
 type DexInput = { chain: keyof typeof networks; address: string; amount: string };
-export interface DexQuote { rawQuantity: string; decimals: number; at: number; swapGasUsdt?: number | null }
-type Fetcher = (url: string, init: RequestInit) => Promise<Response>;
+export interface DexQuote {
+  rawQuantity: string; decimals: number; at: number; swapGasUsdt?: number | null;
+  evidence?: { quotedRaw: string; transferRaw: string | null; impactBps: number; blockNumber: string };
+}
+
 const maxUint256 = (1n << 256n) - 1n;
 
 function usdtUnits(value: string, decimals: number): string {
@@ -16,28 +21,6 @@ function usdtUnits(value: string, decimals: number): string {
   const amount = BigInt(match[1] + (match[2] ?? '').padEnd(decimals, '0'));
   if (amount === 0n || amount > maxUint256) throw new Error('USDT 金额超出可报价范围');
   return amount.toString();
-}
-
-async function readSource(fetcher: Fetcher, url: string, init: RequestInit, signal: AbortSignal, name: string, maxBytes: number) {
-  let response: Response;
-  try {
-    response = await fetcher(url, { ...init, signal, redirect: 'error', cache: 'no-store' });
-  } catch {
-    throw new Error(`${name}连接失败`);
-  }
-  // Kyber 的 400 响应含有可区分「无路由」与「代币未收录」的数字代码。
-  if (!response.ok && !(name === 'KyberSwap' && response.status === 400)) {
-    void response.body?.cancel().catch(() => {});
-    if (response.status === 429) throw Object.assign(new Error(`${name}请求受限，请稍后刷新`), { status: 429 });
-    throw new Error(`${name}不可用（HTTP ${response.status}）`);
-  }
-  try {
-    const data = await readJsonResponse(response, { maxBytes, signal });
-    return { ok: response.ok, data };
-  } catch (error) {
-    if (error instanceof ExchangeResponseError && error.code === 'response_limit') throw new Error(`${name}响应过大`);
-    throw new Error(`${name}响应无效`);
-  }
 }
 
 async function tokenDecimals(fetcher: Fetcher, rpc: string, address: string, signal: AbortSignal) {
@@ -85,10 +68,11 @@ async function quote(fetcher: Fetcher, chain: keyof typeof networks, address: st
   const gasUsd = usd(route.gasUsd), amountInUsd = usd(route.amountInUsd);
   const gas = (Number(amountIn) / 10 ** networks[chain].decimals) * gasUsd / amountInUsd;
   const swapGasUsdt = gasUsd > 0 && amountInUsd > 0 && Number.isFinite(gas) && gas > 0 ? gas : null;
-  return { rawQuantity: route.amountOut, at: Number(timestamp) * 1000, swapGasUsdt };
+  return { route, quotedRaw: route.amountOut, at: Number(timestamp) * 1000, swapGasUsdt,
+    gasUnits: usd(route.gas) };
 }
 
-export async function readDex(input: DexInput, signal: AbortSignal, fetcher: Fetcher = fetch): Promise<DexQuote> {
+export async function readDex(input: DexInput, signal: AbortSignal, fetcher: Fetcher = fetch, now = Date.now, simulate = simulateDexFill): Promise<DexQuote> {
   if (typeof input.chain !== 'string' || !Object.hasOwn(networks, input.chain)) throw new Error('不支持所选网络');
   const network = networks[input.chain];
   if (typeof input.address !== 'string' || !/^0x[a-f\d]{40}$/i.test(input.address)) throw new Error('目标代币的合约地址无效');
@@ -97,14 +81,33 @@ export async function readDex(input: DexInput, signal: AbortSignal, fetcher: Fet
   const amountIn = usdtUnits(input.amount, network.decimals);
   if (signal.aborted) throw new Error('链上报价请求已中止');
   const local = new AbortController();
-  const active = anySignal([signal, local.signal], 8_000);
+  const active = anySignal([signal, local.signal], 12_000);
   try {
-    const [route, decimals] = await Promise.all([
+    const budget = BigInt(amountIn), probe = budget / 100n;
+    if (!probe) throw new Error('买入预算过小，无法核对整笔价格影响');
+    const [full, small, decimals] = await Promise.all([
       quote(fetcher, input.chain, address, amountIn, active),
+      quote(fetcher, input.chain, address, String(probe), active),
       tokenDecimals(fetcher, network.rpc, address, active),
     ]);
+    for (const route of [full, small]) {
+      if (route.at > now() + CHAIN_ARB_CLOCK_SKEW_MS || now() - route.at >= CHAIN_ARB_TTL_MS) throw new Error('KyberSwap 路由报价已过期或时间异常');
+    }
+    const options = { chain: input.chain, address, signal: active, fetcher, now };
+    const fill = await simulate({ ...options, amountIn, quote: full.route });
+    const reference = await simulate({ ...options, amountIn: String(probe), quote: small.route, probeTransfer: false,
+      blockNumber: fill.blockNumber, blockHash: fill.blockHash });
     active.throwIfAborted();
-    return { ...route, decimals };
+    if (reference.blockHash !== fill.blockHash || reference.blockNumber !== fill.blockNumber) throw new Error('整笔与小额模拟区块不一致');
+    // Compare token units per USDT without rounding either fill or assuming a pool price. Round losses upward at 1e-6 bp.
+    const expected = BigInt(reference.rawQuantity) * budget;
+    const loss = expected - BigInt(fill.rawQuantity) * probe;
+    const impactBps = loss > 0n ? Number((loss * 10_000_000_000n + expected - 1n) / expected) / 1e6 : 0;
+    const gas = full.swapGasUsdt !== null && full.gasUnits > 0 && fill.extraGasUnits !== null
+      ? full.swapGasUsdt * (Math.max(full.gasUnits, Number(fill.gasUnits)) + Number(fill.extraGasUnits)) / full.gasUnits : null;
+    return { rawQuantity: fill.rawQuantity, decimals, at: Math.min(full.at, small.at, fill.blockAt, reference.blockAt),
+      swapGasUsdt: gas !== null && Number.isFinite(gas) && gas > 0 ? gas : null,
+      evidence: { quotedRaw: full.quotedRaw, transferRaw: fill.rawTransferQuantity, impactBps, blockNumber: fill.blockNumber } };
   } catch (error) {
     if (signal.aborted) throw new Error('链上报价请求已中止');
     if (active.aborted) throw new Error('链上报价读取超时');

@@ -1,3 +1,4 @@
+import { verifiedBuy } from './chain-arb-fake.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { setImmediate as settle } from 'node:timers/promises';
@@ -15,7 +16,7 @@ function tokens(count: number): ScanCandidate[] {
     address: '0x' + (i + 1).toString(16).padStart(40, '0') }));
 }
 function view(at: number, net = 2): ChainArbView {
-  return { asOf: at, expiresAt: at + 15_000, dex: { at, price: 1, quantity: 105, swapGasUsdt: 1 },
+  return { asOf: at, expiresAt: at + 15_000, dex: { at, price: 1, quantity: 105, swapGasUsdt: 1, execution: { quotedQuantity: 105, receivedQuantity: 105, transferQuantity: 105, impactBps: 0, blockNumber: '0x123' } },
     deposit: true, withdraw: true, spot: { quantity: 105, price: 1.1, grossUsdt: 4, spreadBps: 400, netUsdt: net,
       netBps: net * 100, coveredCostUsdt: 100, at, remainder: 5 }, perp: { error: '无永续' } };
 }
@@ -30,12 +31,12 @@ test('扫描预算沿用单币精度/上限，零成本必须明确输入，格�
   assert.equal(parseChainArbScan({ ...params, perpCosts: '0.000' }).perpCosts, '0');
 });
 
-test('净额使用各腿实际覆盖成本和买入 Gas、费率、其他成本，缺 Gas 与零以下机会不入榜', async t => {
+test('净额使用整笔买入成本和买入 Gas、费率、其他成本，缺 Gas 与零以下机会不入榜', async t => {
   let time = start, gas: number | null = 1;
   const scanner = createChainArbScanner({ now: () => time, catalog: async () => tokens(1), quote: async raw => {
     const input = parseChainArb(raw);
     assert.equal(input.swapGas, 'auto');
-    return compareChainArb(input, { rawQuantity: '105', decimals: 1, at: time, swapGasUsdt: gas }, {
+    return compareChainArb(input, verifiedBuy({ rawQuantity: '105', decimals: 1, at: time, swapGasUsdt: gas }), {
       deposit: true, withdraw: true, spot: { step: 0.1, bids: [[11, 11]], at: time - 100 },
       perp: { step: 1, bids: [[13, 11]], at: time - 200 },
     }, time);
@@ -46,8 +47,8 @@ test('净额使用各腿实际覆盖成本和买入 Gas、费率、其他成本�
   await settle();
   const { rows, checked } = await poll();
   assert.equal(checked, 1);
-  assert.deepEqual(rows.map(r => [r.kind, r.netUsdt, r.gasUsdt]), [['perp', 26.87, 1], ['spot', 8.3845, 1]]);
-  assert.equal(rows[0].netBps, 2687);
+  assert.deepEqual(rows.map(r => [r.kind, r.netUsdt, r.gasUsdt]), [['perp', 21.77, 1], ['spot', 8.3845, 1]]);
+  assert.ok(Math.abs(rows[0].netBps - 21.77 * 10_000 / 105) < 1e-10);
   assert.equal(rows[0].expiresAt, time - 200 + 15_000);
   assert.ok(Math.abs(rows[1].netBps - 8.3845 * 10_000 / 105) < 1e-10);
   for (gas of [null, 30]) {
@@ -58,10 +59,10 @@ test('净额使用各腿实际覆盖成本和买入 Gas、费率、其他成本�
   }
 });
 
-test('现货先到期时单独移入历史，同币新鲜永续保留完整有效期', async t => {
+test('现货盘口到期后两条需要现货退出的路线均转入历史', async t => {
   let time = start;
   const scanner = createChainArbScanner({ now: () => time, catalog: async () => tokens(1), quote: async raw =>
-    compareChainArb(parseChainArb(raw), { rawQuantity: '105', decimals: 1, at: start, swapGasUsdt: 1 }, {
+    compareChainArb(parseChainArb(raw), verifiedBuy({ rawQuantity: '105', decimals: 1, at: start, swapGasUsdt: 1 }), {
       deposit: true, withdraw: true, spot: { step: 1, bids: [[13, 11]], at: start - 14_900 },
       perp: { step: 1, bids: [[13, 11]], at: start },
     }, start) });
@@ -71,8 +72,8 @@ test('现货先到期时单独移入历史，同币新鲜永续保留完整有�
   assert.equal((await poll()).rows.length, 2);
   time += 101;
   const result = await poll();
-  assert.deepEqual(result.rows.map(r => [r.kind, r.expiresAt]), [['perp', start + 15_000]]);
-  assert.deepEqual(result.history.map(r => [r.kind, r.expiresAt]), [['spot', start + 100]]);
+  assert.deepEqual(result.rows, []);
+  assert.deepEqual(result.history.map(r => [r.kind, r.expiresAt]).sort(), [['perp', start + 100], ['spot', start + 100]]);
 });
 
 test('慢目录、慢币均不阻塞 GET，同批结果独立发布，下一批按实际报价启动时刻限速', async t => {

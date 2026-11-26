@@ -4,6 +4,7 @@
 // Error diagnostics differ from the workbench: SERVER_TIMEOUT and FAILED_RETRIEVE_ASSETS are listed, an unlisted label
 // that is a plain upper-case identifier is shown so it can be reported, and 5xx diagnostics without a listed label say to retry.
 import { gateAuthHeaders } from '../../vendor/gate.mjs';
+import { PositionsPermissionError } from '../positions-values.ts';
 import type { Balance } from '../types.ts';
 import { COINGECKO_QUOTES } from './quotes.ts';
 import { priceReceivedAt } from './shared-reads.ts';
@@ -81,10 +82,16 @@ type ErrorResponse = { kind: 'known'; label: ErrorLabel } | { kind: 'unlisted'; 
 // Gate labels are upper-case words joined by underscores. Letters only and at most 40 characters: a key, signature,
 // address, URL or sentence cannot take this shape, so such a label may be shown without reflecting anything else.
 const UNLISTED_LABEL = /^(?=.{3,40}$)[A-Z]+(?:_[A-Z]+)*$/;
+// Signed wallet reads can return a permission error inside an HTTP 200 envelope.
+const ACCESS_DENIALS = new Set<string>(['INVALID_CREDENTIALS', 'INVALID_KEY', 'INVALID_SIGNATURE', 'IP_FORBIDDEN', 'FORBIDDEN', 'ACCOUNT_LOCKED', 'READ_ONLY']);
+export function gateAccessDenied(status: number | undefined, label?: unknown): boolean {
+  return status === 401 || status === 403 || (typeof label === 'string' && ACCESS_DENIALS.has(label));
+}
 
 function readFailure(reason: string, status?: number, label?: string): Error {
   const parts = [typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599 ? `HTTP ${status}` : '', label].filter(Boolean);
-  return new Error(`Gate 读取失败${parts.length ? `（${parts.join(' · ')}）` : ''}：${reason}；本次未更新资产数据`);
+  const message = `Gate 读取失败${parts.length ? `（${parts.join(' · ')}）` : ''}：${reason}；本次未更新资产数据`;
+  return gateAccessDenied(status, label) ? new PositionsPermissionError(message) : new Error(message);
 }
 
 function classifyError(data: unknown): ErrorResponse {

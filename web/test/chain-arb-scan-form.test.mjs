@@ -20,11 +20,27 @@ const address = '0x' + 'f'.repeat(40);
 const source = 1_800_000_000_000;
 function row(symbol, options = {}) {
   return { chain: 'bsc', address, symbol, kind: 'perp', netBps: 40, netUsdt: 0.4, gasUsdt: 0.03,
-    dexPrice: 10, gatePrice: 11, at: source, expiresAt: source + 15_000, ...options };
+    dexPrice: 10, gatePrice: 11, at: source, expiresAt: source + 15_000,
+    execution: { receivedQuantity: 100, transferQuantity: 98, impactBps: 400, blockNumber: '0x123' }, ...options };
 }
 function view(rows, history = []) {
   return { asOf: source, rows, history, phase: 'scanning', cycle: 1, total: 10, checked: 3, failed: 0, message: null };
 }
+
+test('旧版报价和未通过模拟的报价均不进入有效机会或最近采样', () => {
+  const valid = row('ATLIMIT');
+  valid.execution.impactBps = 500;
+  const invalid = [
+    row('OLD', { execution: undefined }),
+    row('NO_TRANSFER', { execution: { ...valid.execution, transferQuantity: null } }),
+    row('TOO_THIN', { execution: { ...valid.execution, impactBps: 501 } }),
+  ];
+  const sample = row('SAMPLE', { at: source - 20_000 });
+  const scan = { startedAt: 10, view: view([...invalid, valid], [...invalid, sample]) };
+  const { live, history } = scanBands(scan, false, 10);
+  assert.deepEqual(live, [valid]);
+  assert.deepEqual(history, [sample]);
+});
 
 test('a single-token review sends the selected identity and the same budget, fees and route costs with fresh automatic swap gas', () => {
   const { input } = scanQuery({ ...initialScanForm, amount: '25.5', spotFeeBps: '17', perpFeeBps: '4.2', spotCosts: '1.5', perpCosts: '3' });

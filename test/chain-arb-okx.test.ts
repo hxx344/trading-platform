@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { compareChainArb } from '../src/chain-arb/estimate.ts';
+import { verifiedBuy } from './chain-arb-fake.ts';
 import { address, band, book, index, network, okxInput as input, okxTestNow as now, okxWallet as wallet,
   openInterest, pair, perp, setupOkxPublic as setup } from './chain-arb-okx-fake.ts';
 
@@ -18,7 +19,7 @@ test('OKX 两腿按同链同址入选，复核张数、面额、步长、美元�
   assert.equal(calls.filter(key => key === 'spots').length, 1);
   assert.ok(!calls.includes('interest'));
   const quote = (rawQuantity: string) => compareChainArb(input,
-    { rawQuantity, decimals: 1, at: now }, view, now).spot;
+    verifiedBuy({ rawQuantity, decimals: 1, at: now }), view, now).spot;
   assert.ok('price' in quote('20'));
   assert.ok('error' in quote('21'));
 });
@@ -42,14 +43,14 @@ test('OKX 入金关闭只剔除现货，钱包和公共市场各自换代后撤�
   assert.equal(calls.filter(key => key === 'spots').length, 2);
 });
 
-test('OKX 开放充值而到账规则不明时，显示实际开关并只给同币永续报价', async () => {
+test('OKX 开放充值而到账规则不明时，显示实际开关并撤下两条套利估值', async () => {
   const { reader, state } = setup();
   state.wallet = wallet([{ ...network, depositEligible: false }]);
   assert.deepEqual((await reader.catalog(signal)).map(row => [row.spot, row.perp]), [[false, true]]);
-  const priced = compareChainArb(input, { rawQuantity: '15', decimals: 1, at: now }, await reader.read(input, signal), now);
+  const priced = compareChainArb(input, verifiedBuy({ rawQuantity: '15', decimals: 1, at: now }), await reader.read(input, signal), now);
   assert.equal(priced.deposit, true);
   assert.match('error' in priced.spot ? priced.spot.error : '', /到账条件或费用/);
-  assert.ok('price' in priced.perp);
+  assert.deepEqual(priced.perp, priced.spot);
 });
 
 test('OKX 同名或同链地址冲突、身份不符、读取中换连接和过期均停止报价', async () => {
@@ -129,11 +130,13 @@ test('OKX 整笔估算在美元或 USDT 现货限额、永续最大张数的边�
     const { reader } = setup({ spotBook: deep, perpBook: deep, index: [{ ...index, idxPx }] });
     const view = await reader.read(input, signal);
     const quote = (rawQuantity: number) => compareChainArb(input,
-      { rawQuantity: String(rawQuantity), decimals: 2, at: now }, view, now);
+      verifiedBuy({ rawQuantity: String(rawQuantity), decimals: 2, at: now }), view, now);
     assert.ok('quantity' in quote(bound * 10).spot);
     assert.match((quote(bound * 10 + 10).spot as { error: string }).error, /名义金额/);
     assert.ok('quantity' in quote(500).perp);
-    assert.match((quote(505).perp as { error: string }).error, /数量不在/);
-    assert.match((quote(5).perp as { error: string }).error, /数量不在/);
+    const rounded = quote(505).perp;
+    assert.ok('quantity' in rounded && rounded.quantity === 5 && rounded.remainder === 0.05);
+    assert.match((quote(510).perp as { error: string }).error, /数量不在/);
+    assert.match((quote(5).perp as { error: string }).error, /最低充值/);
   }
 });

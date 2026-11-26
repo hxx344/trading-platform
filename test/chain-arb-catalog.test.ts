@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createChainArbScanner } from '../src/chain-arb/scan.ts';
 import { createScanCatalog } from '../src/chain-arb/catalog.ts';
 
 const signal = new AbortController().signal;
@@ -164,4 +165,25 @@ test('目录超时中止三条上游读取并释放共享工作', async t => {
   await assert.rejects(pending, /超时/);
   assert.equal(signals.length, 3);
   assert.ok(signals.every(s => s.aborted));
+});
+test('Gate 以可充值的链与完整合约选币：停充的 CYBER、迁移前的 ethDYDX 和同名歧义代币均不询价', async t => {
+  const cyber = '0x14778860e937f509e651192a90589de711fb88a9', old = '0x92d6c1e31e14520e676a687f0a93788b716beff5';
+  const currencies = [
+    coin('CYBER', [network('ETH', cyber), network('BSC', cyber)], { deposit_disabled: true }),
+    coin('DYDX', [network('ETH', old, true, false), network('DYDX', '')]),
+    coin('SAME', [network('ETH', addr(11)), network('ETH', addr(12))]),
+    coin('OK', [network('BSC', addr(13))]),
+  ];
+  const symbols = ['CYBER', 'DYDX', 'SAME', 'OK'];
+  const catalog = setup({ currencies, pairs: symbols.map(s => pair(s)), tickers: symbols.map(s => ticker(s)) }).read;
+  const checked: string[] = [];
+  const scanner = createChainArbScanner({ now: () => start, catalog, quote: async raw => {
+    const { symbol, chain, address } = raw as Record<string, string>;
+    checked.push([symbol, chain, address].join('/'));
+    throw new Error('止于资格核对');
+  } });
+  t.after(() => scanner.close());
+  const snapshot = await scanner.read({ chain: 'all', amount: '1000', spotFeeBps: '10', perpFeeBps: '5', spotCosts: '0', perpCosts: '0' }, 'scope', signal, true);
+  assert.equal(snapshot.total, 1);
+  assert.deepEqual(checked, ['OK/bsc/' + addr(13)]);
 });

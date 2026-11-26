@@ -135,9 +135,9 @@ export function createRemoteMonitor(client: MarketClient, clock: () => number = 
   };
   return { rounds, perpetual, comparison,
     chainArb: (input: unknown, signal: AbortSignal, directory?: OkxDirectory) => directory
-      ? read<ChainArbView>('perpetual.okxChainArb', { params: input, directory }, signal)
-      : read<ChainArbView>('perpetual.chainArb', input, signal),
+      ? read<ChainArbView>('perpetual.verifiedOkxChainArb', { params: input, directory }, signal)
+      : read<ChainArbView>('perpetual.verifiedChainArb', input, signal),
     scanChainArb: (params: unknown, scope: string, signal: AbortSignal, awaitBatch = false, directory?: OkxDirectory) => directory
-      ? read<ScanView>('perpetual.okxChainArbScan', { params, scope, awaitBatch, directory }, signal)
-      : read<ScanView>(awaitBatch ? 'perpetual.chainArbBatch' : 'perpetual.chainArbScan', { params, scope }, signal) };
+      ? read<ScanView>('perpetual.verifiedOkxChainArbScan', { params, scope, awaitBatch, directory }, signal)
+      : read<ScanView>(awaitBatch ? 'perpetual.verifiedChainArbBatch' : 'perpetual.verifiedChainArbScan', { params, scope }, signal) };
 }

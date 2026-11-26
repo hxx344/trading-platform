@@ -275,7 +275,7 @@ export async function refresh(ctx: SyncContext, refreshPositions?: () => Promise
     const row = stored.find(item => item.exchange === exchange);
     if (!row) return;
     const revision = revisionOf(row.encrypted);
-    const permission = (exchange === 'binance' || exchange === 'bybit' || exchange === 'okx') && storedConnection(database, exchange)?.encrypted === row.encrypted
+    const permission = (exchange === 'binance' || exchange === 'bybit' || exchange === 'okx' || exchange === 'gate') && storedConnection(database, exchange)?.encrypted === row.encrypted
       ? historyGeneration(() => database, exchange, revision, ctx.now) : null;
     const asset = ledger.assets.find(a => a.mode === exchange);
     let outcome: { asset: Asset; at: number } | { error: string };

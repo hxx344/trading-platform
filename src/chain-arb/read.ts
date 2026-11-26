@@ -37,15 +37,13 @@ export function createChainArbMarket({ fetchImpl = fetch, now = Date.now, venueR
       const life = scanning ? anySignal([waiting, stop.signal], 12_000) : waiting;
       life.throwIfAborted();
       const name = input.venue ?? 'gate';
-      const [buy, venue] = await untilAborted(Promise.all([readDex(input, life, fetchImpl), reader.read(input, life, scanning)]), life);
+      const [buy, venue] = await untilAborted(Promise.all([readDex(input, life, fetchImpl, now), reader.read(input, life, scanning)]), life);
       life.throwIfAborted();
-      if (input.source === 'scan') {
-        const directory = await reader.catalog(life);
-        life.throwIfAborted();
-        const allowed = directory.find(c => c.chain === input.chain && c.symbol === input.symbol && c.address === input.address);
-        if (!allowed?.spot && !('error' in venue.spot)) venue.spot = { error: '当前 ' + VENUE_NAMES[name] + ' 目录未开放该网络的充值卖出路线' };
-        if (!allowed?.perp && !('error' in venue.perp)) venue.perp = { error: '当前 ' + VENUE_NAMES[name] + ' 目录未开放该币种的永续路线' };
-      }
+      const directory = await reader.catalog(life);
+      life.throwIfAborted();
+      const allowed = directory.find(c => c.chain === input.chain && c.symbol === input.symbol && c.address === input.address);
+      if (!allowed?.spot && !('error' in venue.spot)) venue.spot = { error: '当前 ' + VENUE_NAMES[name] + ' 目录未核实该链与合约地址的充值卖出路线' };
+      if ((!allowed?.spot || !allowed.perp) && !('error' in venue.perp)) venue.perp = { error: '当前 ' + VENUE_NAMES[name] + ' 目录未核实可充值的同币永续路线' };
       return compareChainArb(input, buy, venue, now());
     } finally {
       stop.abort();
@@ -73,11 +71,11 @@ export function createChainArbMarket({ fetchImpl = fetch, now = Date.now, venueR
       const next = new Map(proof.rows.map(row => [row.chain + ':' + row.address, row]));
       const prior = new Map(okx.directory.rows.map(row => [row.chain + ':' + row.address, row]));
       okx.directory = proof;
-      okx.scan.revalidateSamples((candidate, kind) => {
+      okx.scan.revalidateSamples(candidate => {
         const key = candidate.chain + ':' + candidate.address, row = next.get(key);
         if (row?.symbol !== candidate.symbol) return false;
         const old = prior.get(key);
-        return kind === 'perp' || (!!old && row.depositEligible && new Decimal(row.minDeposit).eq(old.minDeposit));
+        return !!old && row.depositEligible && new Decimal(row.minDeposit).eq(old.minDeposit);
       });
     }
     return okx;

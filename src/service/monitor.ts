@@ -5,6 +5,7 @@ import type { MarketClient } from '../market/ipc.ts';
 import { createChainArbMarket } from '../chain-arb/read.ts';
 import { createChainArbBackground } from '../chain-arb/background.ts';
 import type { OkxDirectorySource } from '../chain-arb/okx-network.ts';
+import type { GateDepositSource } from '../chain-arb/gate-deposit-proof.ts';
 import { withChainArbLedger } from './chain-arb-ledger.ts';
 import { ContractError } from '../contracts.ts';
 import { createRemoteMonitor } from './remote-monitor.ts';
@@ -54,13 +55,14 @@ export interface MonitorRuntime {
 export { perpetualQualityEnv } from '../monitor/quality-config.ts';
 
 /** Opens monitor.sqlite and reads the saved history back; throws when the file cannot be opened. */
-export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now, log, WebSocketImpl, alertHooks, variationalFetch, perpetualOptions, chainArbFetch, okxLedger, marketClient, env = process.env }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void; WebSocketImpl?: typeof WebSocket; alertHooks?: AlertHooks;
+export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now, log, WebSocketImpl, alertHooks, variationalFetch, perpetualOptions, chainArbFetch, okxLedger, gateLedger, marketClient, env = process.env }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void; WebSocketImpl?: typeof WebSocket; alertHooks?: AlertHooks;
   /** The transport to omni.variational.io; python3 and scripts/variational-request.py unless given (tests, the local preview). */
   variationalFetch?: VariationalFetcher; marketClient?: MarketClient;
   /** Stand-ins for the perpetual collector's venues (tests, the local preview). */
   perpetualOptions?: PerpetualOptions;
   chainArbFetch?: AnthropicFetcher;
   okxLedger?: OkxDirectorySource;
+  gateLedger?: GateDepositSource;
   /** M-5d2: where PERPETUAL_COIN_IDS and COINGECKO_DEMO_API_KEY are read (process.env unless given). */
   env?: Record<string, string | undefined> } = {}): MonitorRuntime {
   const store = createMonitorStore({ file: join(dir, MONITOR_FILE), ...(now ? { now } : {}) });
@@ -117,8 +119,9 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
         quality: { ...perpetualQualityEnv(env, log ?? (line => process.stderr.write(`${line}\n`))), ...perpetualOptions?.quality } }) : null;
       const localChain = config.perpetual && !remote ? createChainArbMarket({ now, fetchImpl: chainArbFetch ?? fetchImpl }) : undefined;
       const source = remote ?? localChain;
-      const chain = config.perpetual && source ? withChainArbLedger(source, okxLedger, now) : undefined;
-      const chainArbBackground = chain ? createChainArbBackground({ store, scan: chain.scanChainArb, okxResultCurrent: chain.okxResultCurrent, now,
+      const chain = config.perpetual && source ? withChainArbLedger(source, okxLedger, now, gateLedger) : undefined;
+      const chainArbBackground = chain ? createChainArbBackground({ store, scan: chain.scanChainArb, okxResultCurrent: chain.okxResultCurrent,
+        gateResultCurrent: chain.gateResultCurrent, now,
         control: () => control.view('perpetual'), hooks: alertHooks }) : undefined;
       return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, goldoil, hynix, exchanges, alerts, control, variational, perpetual, perpetualCache,
         chainArb: chain?.chainArb, scanChainArb: chain?.scanChainArb, closeChainArb: localChain?.closeChainArb, chainArbBackground };

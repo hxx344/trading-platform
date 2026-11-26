@@ -7,8 +7,8 @@
 // import committed by another process between two of its statements cannot mix two ledgers (issue #11). A write commits
 // before its answer is read, so the answer shows it. Since A-5 it also holds the positions and fills services (positions-service.ts,
 // fills-service.ts): they read the saved connections of the open file on every use and live as long as the store.
-import { statSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { lstatSync, statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { assertOwnFiles, openAssetDb, type AssetDb, type SnapshotDb } from './db.ts';
 import type { QueryDatabase } from './query.ts';
 import type { Asset, Connection, Ledger } from './types.ts';
@@ -21,11 +21,14 @@ import { chinaDay } from './withdrawals.ts';
 import { CASH_FLOW_KEY, parseCashFlow, readCashFlowAudit, type CashFlowRecord } from './cash-flows.ts';
 import { acquireSyncLock, AssetConflict, LOCK_BUSY, NOT_IMPORTED, type SyncLease } from './sync-lock.ts';
 import { parseAsterAccount, parseAsterAccountDelete, parseConnection, parseDisconnect, parseEdit, parseFx, parseWithdrawal, parseWithdrawalId } from './validation.ts';
-import { dataDirVault } from './credentials.ts';
+import { CREDENTIAL_KEY_FILE, dataDirVault } from './credentials.ts';
 import * as sync from './sync.ts';
 import { connectionRow, createPositionsService, type PositionsServiceOptions } from './positions-service.ts';
 import { createOkxScanDirectory } from './okx-scan-directory.ts';
 import type { OkxDirectorySource } from '../chain-arb/okx-network.ts';
+import { createGateDepositSource } from './gate-deposit-proof.ts';
+import { PositionsPermissionError } from './positions-values.ts';
+import type { GateDepositSource } from '../chain-arb/gate-deposit-proof.ts';
 import { createFillsService, type FillsServiceOptions } from './fills-service.ts';
 import type { HubPositions } from './positions-types.ts';
 import type { FillMarket, HubFills } from './fills-types.ts';
@@ -131,7 +134,7 @@ export function parseImportInfo(value: string): ImportInfo {
 }
 
 
-export interface AssetStore extends OkxDirectorySource {
+export interface AssetStore extends OkxDirectorySource, GateDepositSource {
   state(): Promise<AssetState>;
   ledger(): Promise<AssetLedgerView>;
   history(): Promise<AssetHistoryView>;
@@ -202,13 +205,21 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
   let handle: AssetDb | null = null, opened = '', writable = false, busy = false;
   /** The read-only connection the read answers come from (snapshot() below); opened after `handle`, closed with it. */
   let reader: AssetDb | null = null;
-  const okxDirectory = createOkxScanDirectory(() => {
+  function savedConnection(exchange: 'gate' | 'okx') {
     if (!attach()) return null;
     const database = handle!;
     return database.snapshot(snapshot => {
-      const info = importInfo(snapshot), row = info && connectionRow(snapshot, 'okx');
+      const info = importInfo(snapshot), row = info && connectionRow(snapshot, exchange);
       return info && row ? { database, importedAt: info.importedAt, encrypted: row.encrypted } : null;
     });
+  }
+  const okxDirectory = createOkxScanDirectory(() => savedConnection('okx'), vault.unseal, fetcher, now);
+  const keyFile = join(dirname(file), CREDENTIAL_KEY_FILE);
+  const gateDeposits = createGateDepositSource(() => {
+    const saved = savedConnection('gate');
+    if (!saved) return null;
+    const key = lstatSync(keyFile, { bigint: true });
+    return key.isFile() ? { ...saved, keyFile: `${key.dev}:${key.ino}:${key.ctimeNs}` } : null;
   }, vault.unseal, fetcher, now);
   const dropReader = () => { const open = reader; reader = null; open?.close(); };
   /** Which file is at the path: a file deleted and imported again is a new one, and the open handle would keep reading the deleted one. */
@@ -217,7 +228,7 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
   };
   const today = (): string => chinaDay(new Date(now()));
-  const drop = () => { okxDirectory.reset(); dropReader(); handle?.close(); handle = null; writable = false; busy = false; };
+  const drop = () => { okxDirectory.reset(); gateDeposits.reset(); dropReader(); handle?.close(); handle = null; writable = false; busy = false; };
   /** Read-write when the service owns the files and can write them; otherwise read-only, so the reads still work. */
   function open(present: string) {
     try { assertOwnFiles(dirname(file)); }
@@ -330,6 +341,8 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     cashFlows,
     okxScanDirectory: okxDirectory.okxScanDirectory,
     okxScanDirectoryCurrent: okxDirectory.okxScanDirectoryCurrent,
+    gateDepositProof: gateDeposits.gateDepositProof,
+    gateDepositCurrent: gateDeposits.gateDepositCurrent,
     async period(id) {
       const found = snapshot(async (database, info) => {
         const rows = await readPeriodRows(database, id);
@@ -355,14 +368,20 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     },
     async connect(body) {
       const input = parseConnection(body);
-      await locked((database, lease) => sync.connect(context(database, lease), input));
+      await locked(async (database, lease) => {
+        const deny = input.exchange === 'gate' ? gateDeposits.watchReconnect(input) : undefined;
+        try { await sync.connect(context(database, lease), input); }
+        catch (error) { if (error instanceof PositionsPermissionError) deny?.(); throw error; }
+      });
       if (input.exchange === 'okx') okxDirectory.reset();
+      if (input.exchange === 'gate') gateDeposits.reset();
       return ledger();
     },
     async disconnect(body) {
       const exchange = parseDisconnect(body);
       await locked((database, lease) => sync.disconnect(context(database, lease), exchange));
       if (exchange === 'okx') okxDirectory.reset();
+      if (exchange === 'gate') gateDeposits.reset();
       return ledger();
     },
     async saveAsterAccount(body, editing) {
@@ -399,6 +418,6 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     },
     async positions() { return positionsService.read(await source(), vault.unseal); },
     async fills(market) { return fillsService.read(await source(), vault.unseal, market); },
-    close() { okxDirectory.close(); positionsService.close(); fillsService.close(); shared.reset(); drop(); },
+    close() { okxDirectory.close(); gateDeposits.close(); positionsService.close(); fillsService.close(); shared.reset(); drop(); },
   };
 }

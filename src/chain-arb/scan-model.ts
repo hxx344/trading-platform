@@ -1,6 +1,14 @@
-import { isChainArbVenue, parseChainArbBudget, type Chain, type ChainArbVenue } from './model.ts';
+import { CHAIN_ARB_MAX_IMPACT_BPS, isChainArbVenue, parseChainArbBudget, type Chain, type ChainArbVenue } from './model.ts';
+import { isObject } from '../contracts.ts';
 
 export const SCAN_HISTORY_MS = 5 * 60_000;
+export interface ScanExecution { receivedQuantity: number; transferQuantity: number; transferAmount?: string | null; impactBps: number; blockNumber: string }
+export function isVerifiedExecution(value: unknown): value is ScanExecution {
+  return isObject(value) && typeof value.receivedQuantity === 'number' && Number.isFinite(value.receivedQuantity)
+    && typeof value.transferQuantity === 'number' && value.transferQuantity > 0 && value.receivedQuantity >= value.transferQuantity
+    && typeof value.impactBps === 'number' && value.impactBps >= 0 && value.impactBps <= CHAIN_ARB_MAX_IMPACT_BPS
+    && typeof value.blockNumber === 'string' && /^0x[1-9a-f][0-9a-f]{0,63}$/i.test(value.blockNumber);
+}
 
 export interface ScanInput {
   venue?: ChainArbVenue;
@@ -10,6 +18,7 @@ export interface ScanRow {
   venue?: ChainArbVenue;
   chain: Chain; symbol: string; address: string; kind: 'spot' | 'perp'; netBps: number; netUsdt: number;
   dexPrice: number; gatePrice: number; at: number; expiresAt: number; gasUsdt: number;
+  execution?: ScanExecution;
 }
 export interface ScanView {
   asOf: number; phase: 'loading' | 'scanning' | 'cooldown' | 'error'; cycle: number; total: number;

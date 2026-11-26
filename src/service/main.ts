@@ -398,7 +398,8 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   const asset = config.asset ? createAssetStore(join(dir, ASSET_DB_FILE)) : null;
   if (config.monitor) {
     const alertHooks = marketAlertHooks({ secrets, notifier, monitorOutbox, monitorOutboxError, send: (secret, text) => sendFeishu(secret, { msg_type: 'text', content: { text } }, notifyFetch ? { fetchImpl: notifyFetch } : {}) });
-    try { monitor = openMonitor(config.monitor, dir, { ...(monitorFetch ? { fetchImpl: monitorFetch } : {}), okxLedger: asset ?? undefined, alertHooks, marketClient }); collector = monitor.perpetual; }
+    try { monitor = openMonitor(config.monitor, dir, { ...(monitorFetch ? { fetchImpl: monitorFetch } : {}),
+      okxLedger: asset ?? undefined, gateLedger: asset ?? undefined, alertHooks, marketClient }); collector = monitor.perpetual; }
     catch (error) { monitorError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`行情监控库无法打开，行情监控页不可用：${monitorError}\n`); }
   }
   const closeMonitorStore = () => { if (monitor) closeMonitor(monitor); };

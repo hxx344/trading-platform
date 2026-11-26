@@ -75,9 +75,9 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
   }
   async function read(op: string, input: unknown, signal: AbortSignal): Promise<unknown> {
     switch (op) {
-      case 'monitor.perpetual.okxChainArb':
-      case 'monitor.perpetual.okxChainArbScan': {
-        const single = op === 'monitor.perpetual.okxChainArb';
+      case 'monitor.perpetual.verifiedOkxChainArb':
+      case 'monitor.perpetual.verifiedOkxChainArbScan': {
+        const single = op === 'monitor.perpetual.verifiedOkxChainArb';
         const { params, directory, scope, awaitBatch } = fields(input, single ? ['params', 'directory'] : ['params', 'directory', 'scope', 'awaitBatch']);
         if (!isObject(params) || params.venue !== 'okx') throw new Error('OKX 行情参数无效');
         assertOkxDirectory(directory, now());
@@ -85,12 +85,12 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
         if (typeof scope !== 'string' || !/^[a-f0-9]{24}:\d{1,16}$/.test(scope) || typeof awaitBatch !== 'boolean') throw new Error('OKX 扫描代次无效');
         return chain.scanChainArb(params, scope, signal, awaitBatch, directory);
       }
-      case 'monitor.perpetual.chainArb': return chain.chainArb(input, signal);
-      case 'monitor.perpetual.chainArbScan':
-      case 'monitor.perpetual.chainArbBatch': {
+      case 'monitor.perpetual.verifiedChainArb': return chain.chainArb(input, signal);
+      case 'monitor.perpetual.verifiedChainArbScan':
+      case 'monitor.perpetual.verifiedChainArbBatch': {
         const { params, scope } = fields(input, ['params', 'scope']);
         if (typeof scope !== 'string' || !/^[a-f0-9]{24}:\d{1,16}$/.test(scope)) throw new Error('行情扫描代次无效');
-        return chain.scanChainArb(params, scope, signal, op === 'monitor.perpetual.chainArbBatch');
+        return chain.scanChainArb(params, scope, signal, op === 'monitor.perpetual.verifiedChainArbBatch');
       }
       case 'monitor.anthropic.ANTUSDT.quote': none(input); return readers.anthropicQuote(signal);
       case 'monitor.anthropic.quote': {

@@ -2,7 +2,7 @@ import { anySignal } from '../any-signal.mjs';
 import { untilAborted } from '../asset/sources/shared-reads.ts';
 import type { ScanCandidate } from './catalog.ts';
 import { CHAIN_ARB_TTL_MS, type ChainArbVenue, type ChainArbView } from './model.ts';
-import { parseChainArbScan, SCAN_HISTORY_MS, type ScanInput, type ScanRow, type ScanView } from './scan-model.ts';
+import { isVerifiedExecution, parseChainArbScan, SCAN_HISTORY_MS, type ScanInput, type ScanRow, type ScanView } from './scan-model.ts';
 
 const BATCH_INTERVAL = 2_000;
 const BACKOFF = 30_000;
@@ -28,7 +28,8 @@ function rateLimited(value: unknown) {
 
 function routeRows(candidate: ScanCandidate, view: ChainArbView, now: number, venue: ChainArbVenue): ScanRow[] {
   const gasUsdt = view.dex.swapGasUsdt;
-  if (gasUsdt == null || !Number.isFinite(gasUsdt) || gasUsdt < 0) return [];
+  const execution = view.dex.execution;
+  if (!candidate.spot || view.deposit !== true || !isVerifiedExecution(execution) || gasUsdt == null || !Number.isFinite(gasUsdt) || gasUsdt < 0) return [];
   const rows: ScanRow[] = [];
   for (const kind of ['spot', 'perp'] as const) {
     if (!candidate[kind]) continue;
@@ -41,7 +42,7 @@ function routeRows(candidate: ScanCandidate, view: ChainArbView, now: number, ve
     if (!Number.isFinite(expiresAt) || expiresAt <= now) continue;
     rows.push({ venue, chain: candidate.chain, symbol: candidate.symbol, address: candidate.address,
       kind, netBps: leg.netBps, netUsdt: leg.netUsdt, dexPrice: view.dex.price,
-      gatePrice: leg.price, gasUsdt, at, expiresAt });
+      gatePrice: leg.price, gasUsdt, at, expiresAt, execution });
   }
   return rows;
 }
@@ -117,7 +118,7 @@ export function createChainArbScanner({ catalog, quote, now = Date.now }: {
       if (open === profile && nextCycle) {
         open.cycle++; open.checked.clear(); open.failed = 0;
       } else if (candidates === open.directory) continue;
-      const directory = new Map(candidates.filter(c => open.input.chain === 'all' || c.chain === open.input.chain)
+      const directory = new Map(candidates.filter(c => c.spot && (open.input.chain === 'all' || c.chain === open.input.chain))
         .map(c => [id(c), c]));
       for (const [key, sample] of open.samples) {
         const allowed = directory.get(key);

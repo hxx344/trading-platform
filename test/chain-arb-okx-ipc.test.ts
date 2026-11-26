@@ -15,7 +15,7 @@ import { chainArbFixture } from './chain-arb-fake.ts';
 import { band, book, network, okxTestNow, okxWallet, pair, perp, setupOkxPublic } from './chain-arb-okx-fake.ts';
 import { createHarness } from './harness.ts';
 
-test('同一连接续期保留原行情到期的历史，充值条件变更只撤现货，换账户时撤下全部样本', async t => {
+test('同一连接续期保留原行情到期的历史，充值条件变更撤下两腿，换账户时撤下全部样本', async t => {
   let at = okxTestNow;
   const now = () => at, fixture = setupOkxPublic(), other = chainArbFixture(now);
   const market = createChainArbMarket({ now, fetchImpl: (url, init) => new URL(url).hostname === 'www.okx.com'
@@ -28,7 +28,7 @@ test('同一连接续期保留原行情到期的历史，充值条件变更只�
   at += 1000;
   assert.deepEqual((await poll(okxWallet([{ ...network, minDeposit: '0.1500' }], at))).history.map(row => row.kind).sort(), ['perp', 'spot']);
   at += 1;
-  assert.deepEqual((await poll(okxWallet([{ ...network, minDeposit: '2' }], at))).history.map(row => row.kind), ['perp']);
+  assert.deepEqual((await poll(okxWallet([{ ...network, minDeposit: '2' }], at))).history.map(row => row.kind), []);
   assert.deepEqual((await poll({ ...okxWallet([], at), connection: 'b'.repeat(32) })).history, []);
 });
 
@@ -59,12 +59,12 @@ test('在途复核被目录续期打断时保留仍合格的历史，未完成�
     const fresh = okxWallet([{ ...network, depositEligible: spotAllowed }], at);
     const refreshed = await poll(fresh);
     await pending;
-    assert.deepEqual(refreshed.history.map(row => row.kind).sort(), spotAllowed ? ['perp', 'spot'] : ['perp']);
+    assert.deepEqual(refreshed.history.map(row => row.kind).sort(), spotAllowed ? ['perp', 'spot'] : []);
     assert.deepEqual([refreshed.checked, refreshed.failed], [0, 0]);
     at += 2100;
     const next = await poll(fresh);
-    assert.deepEqual([next.checked, next.failed], [1, 0]);
-    assert.deepEqual(next.rows.map(row => row.kind).sort(), spotAllowed ? ['perp', 'spot'] : ['perp']);
+    assert.deepEqual([next.checked, next.failed], [spotAllowed ? 1 : 0, 0]);
+    assert.deepEqual(next.rows.map(row => row.kind).sort(), spotAllowed ? ['perp', 'spot'] : []);
   }
 });
 
@@ -106,10 +106,10 @@ test('后台独立通过账本和行情 IPC 排序两条 OKX 路线，只有超�
       venues: ['okx'], thresholdBps: 300, chain: 'arbitrum' } });
     await background.tick();
     const result = background.view().results.okx!;
-    assert.deepEqual(result.rows.map(row => [row.kind, row.netUsdt, row.netBps]), [['perp', 38.46, 384.6], ['spot', 28.47, 284.7]]);
+    assert.deepEqual(result.rows.map(row => [row.kind, row.netUsdt, row.netBps]), [['perp', 37.435, 374.35], ['spot', 28.47, 284.7]]);
     assert.equal(notifier.pending(), 1);
     const sent = notifier.status().recent[0]!.text;
-    for (const expected of ['ARB', 'Arbitrum One', 'OKX 永续开空', '384.6 bp', '38.46 USDT']) assert.ok(sent.includes(expected), sent);
+    for (const expected of ['ARB', 'Arbitrum One', 'OKX 永续开空', '374.35 bp', '37.435 USDT']) assert.ok(sent.includes(expected), sent);
     await assert.rejects(remote.scanChainArb(params, scope, signal, true), /链目录/);
     const contaminated = { ...fixture.state.wallet, unrelated: 'test-field' };
     await assert.rejects(remote.scanChainArb(params, scope, signal, true, contaminated), /链目录/);

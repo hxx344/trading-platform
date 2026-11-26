@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readDex } from '../src/chain-arb/dex.ts';
+import { readDex as readVerifiedDex } from '../src/chain-arb/dex.ts';
+import { ARB_ADDRESS, chainArbFixture } from './chain-arb-fake.ts';
 
 const target = '0x82af49447d8a07e3bd95bd0d56f35241523fbab1';
 const input = { chain: 'arbitrum', address: target, amount: '123.456789' } as const;
@@ -8,12 +9,23 @@ const signal = new AbortController().signal;
 // Arbitrum 公开 GET /api/v1/routes 样本，仅保留参与解析的字段。
 const sourceRoute = {
   tokenIn: '0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9', tokenOut: target,
-  amountIn: '123456789', amountOut: '72841644585880832', timestamp: 1795690821,
+  gas: '3', amountIn: '123456789', amountOut: '72841644585880832', timestamp: 1795690821,
 };
 const routeBody = (fields: Record<string, unknown> = {}) => ({ code: 0, data: { routeSummary: { ...sourceRoute, ...fields } } });
 const decimalsBody = (decimals: number) => ({ jsonrpc: '2.0', id: 1, result: '0x' + decimals.toString(16).padStart(64, '0') });
-const respond = (route: unknown, metadata: unknown = decimalsBody(18)) => async (_url: string, init: RequestInit) =>
-  Response.json(init.method === 'GET' ? route : metadata);
+// The execution simulator has its own RPC wire tests. These fixtures isolate quote parsing and gas arithmetic.
+const simulate: NonNullable<Parameters<typeof readVerifiedDex>[4]> = async ({ quote }) => ({
+  rawQuantity: String(quote.amountOut), rawTransferQuantity: String(quote.amountOut), gasUnits: '3', extraGasUnits: '0',
+  blockNumber: '0x123', blockHash: '0x' + 'a'.repeat(64), blockAt: 1795690821000,
+});
+const readDex = (params: Parameters<typeof readVerifiedDex>[0], stop: AbortSignal, fetcher: NonNullable<Parameters<typeof readVerifiedDex>[2]>) =>
+  readVerifiedDex(params, stop, fetcher, () => 1795690821000, simulate);
+const respond = (route: ReturnType<typeof routeBody>, metadata: unknown = decimalsBody(18)) => async (url: string, init: RequestInit) => {
+  if (init.method !== 'GET') return Response.json(metadata);
+  const amount = new URL(url).searchParams.get('amountIn');
+  if (amount === sourceRoute.amountIn) return Response.json(route);
+  return Response.json(routeBody({ amountIn: amount, amountOut: '1' }));
+};
 
 test('使用各链的 USDT 与整数金额，按 ERC-20 精度返回数量与报价源时间', async () => {
   const fixtures = [
@@ -36,14 +48,17 @@ test('使用各链的 USDT 与整数金额，按 ERC-20 精度返回数量与报
       }
       assert.equal(endpoint.origin, 'https://aggregator-api.kyberswap.com');
       assert.equal(endpoint.pathname, `/${network.chain}/api/v1/routes`);
-      assert.deepEqual(Object.fromEntries(endpoint.searchParams), { tokenIn: network.usdt, tokenOut: target, amountIn: network.scaled });
-      return Response.json(routeBody({ tokenIn: network.usdt, amountIn: network.scaled }));
+      const amount = endpoint.searchParams.get('amountIn')!;
+      assert.ok([network.scaled, String(BigInt(network.scaled) / 100n)].includes(amount));
+      assert.deepEqual(Object.fromEntries(endpoint.searchParams), { tokenIn: network.usdt, tokenOut: target, amountIn: amount });
+      return Response.json(routeBody({ tokenIn: network.usdt, amountIn: amount, amountOut: amount === network.scaled ? sourceRoute.amountOut : '1' }));
     });
-    assert.deepEqual(calls.sort(), ['GET', 'POST']);
-    assert.deepEqual(result, { rawQuantity: sourceRoute.amountOut, decimals: 18, at: 1795690821000, swapGasUsdt: null });
+    assert.deepEqual(calls.sort(), ['GET', 'GET', 'POST']);
+    assert.deepEqual(result, { rawQuantity: sourceRoute.amountOut, decimals: 18, at: 1795690821000, swapGasUsdt: null,
+      evidence: { quotedRaw: sourceRoute.amountOut, transferRaw: sourceRoute.amountOut, impactBps: 0, blockNumber: '0x123' } });
   }
   const tiny = await readDex(input, signal, respond(routeBody({ amountOut: '1', timestamp: '1795690821' }), decimalsBody(255)));
-  assert.deepEqual(tiny, { rawQuantity: '1', decimals: 255, at: 1795690821000, swapGasUsdt: null });
+  assert.equal(tiny.rawQuantity, '1'); assert.equal(tiny.decimals, 255);
 });
 
 test('拒绝错误币种、金额、数量、时间与精度响应', async () => {
@@ -84,6 +99,31 @@ test('不向外发送无效输入，保留上游明确的缺少路由或限流�
     const failing = async (_url: string, init: RequestInit) => init.method === 'POST' ? Response.json(decimalsBody(18)) :
       Response.json({ code, message: 'private trace' }, { status });
     await assert.rejects(readDex(input, signal, failing), error => error instanceof Error && message.test(error.message) && !error.message.includes('private trace'));
+  }
+});
+
+test('整笔比同块 1% 买入少收 74.11%，边界 5% 与多损失一最小单位分别保留', async () => {
+  const now = () => 1_795_690_821_000, upstream = chainArbFixture(now);
+  const budget = { chain: 'arbitrum', address: ARB_ADDRESS, amount: '1000' } as const;
+  for (const [quantity, impact] of [['2589000000000000000000', 7411], ['9500000000000000000000', 500], ['9499999999999999999999', 500.000001]] as const) {
+    const evidence = await readVerifiedDex(budget, signal, async (url, init) => {
+      const response = await upstream(url, init);
+      if (new URL(url).searchParams.get('amountIn') !== '1000000000') return response;
+      const body = await response.json() as { data: { routeSummary: Record<string, unknown> } };
+      body.data.routeSummary.amountOut = quantity;
+      return Response.json(body);
+    }, now);
+    assert.equal(evidence.rawQuantity, quantity);
+    assert.equal(evidence.evidence?.impactBps, impact);
+  }
+  for (const future of ['1000000000', '10000000']) {
+    await assert.rejects(readVerifiedDex(budget, signal, async (url, init) => {
+      const response = await upstream(url, init);
+      if (new URL(url).searchParams.get('amountIn') !== future) return response;
+      const body = await response.json() as { data: { routeSummary: Record<string, unknown> } };
+      body.data.routeSummary.timestamp = Math.floor(now() / 1000) + 86400;
+      return Response.json(body);
+    }, now), /时间异常/);
   }
 });
 

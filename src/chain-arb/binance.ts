@@ -182,13 +182,18 @@ function sequence(value: unknown): bigint {
 export function createBinanceReader({ fetchImpl, now, spotDepthEvent = depthEvent }: VenueReaderOptions & { spotDepthEvent?: DepthEvent }): VenueReader {
   const get = (url: string, signal: AbortSignal, metadata = false) =>
     readVenueJson(fetchImpl, url, signal, metadata ? 8 * 1024 * 1024 : 192 * 1024, metadata ? META_TTL : CHAIN_ARB_TTL_MS, now);
-  async function load(signal: AbortSignal) {
-    const [wallet, spot, perp] = await Promise.all([get(NETWORK_URL, signal, true),
-      get(SPOT + 'exchangeInfo?permissions=SPOT&showPermissionSets=false&symbolStatus=TRADING', signal, true),
+  const products = createVenueCatalog(async signal => {
+    const [spot, perp] = await Promise.all([get(SPOT + 'exchangeInfo?permissions=SPOT&showPermissionSets=false&symbolStatus=TRADING', signal, true),
       get(FUTURES + 'exchangeInfo', signal, true)]);
-    return { ...directory(wallet.body, spot.body, perp.body, now()), expires: Math.min(wallet.at, spot.at, perp.at) + META_TTL };
+    return { spot, perp, expires: Math.min(spot.at, perp.at) + META_TTL };
+  }, now, META_TTL, value => value.expires);
+  async function load(signal: AbortSignal) {
+    const [wallet, instruments] = await Promise.all([
+      readVenueJson(fetchImpl, NETWORK_URL, signal, 8 * 1024 * 1024, CHAIN_ARB_TTL_MS, now), products(signal)]);
+    return { ...directory(wallet.body, instruments.spot.body, instruments.perp.body, now()), depositAt: wallet.at,
+      expires: Math.min(wallet.at + CHAIN_ARB_TTL_MS, instruments.expires) };
   }
-  const metadata = createVenueCatalog(load, now, META_TTL, result => result.expires);
+  const metadata = createVenueCatalog(load, now, CHAIN_ARB_TTL_MS, result => result.expires);
   // Binance caps new spot stream connections per IP in a rolling five-minute window.
   let connections: number[] = [];
   async function spotLeg(pair: string, meta: Row, signal: AbortSignal): Promise<GateLeg> {
@@ -257,6 +262,7 @@ export function createBinanceReader({ fetchImpl, now, spotDepthEvent = depthEven
         ]);
         signal.throwIfAborted();
         if (now() >= data.expires) fail('币安网络或交易目录已过期');
+        for (const priced of [spot, perp]) if (!('error' in priced)) priced.at = Math.min(priced.at, data.depositAt);
         return { deposit: asset.deposit, withdraw: asset.withdraw, minDeposit: asset.minDeposit, spot, perp };
       } finally { stop.abort(); }
     },

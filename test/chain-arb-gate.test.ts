@@ -53,7 +53,7 @@ test('Gate 按链及合约匹配币种，从两种原始时间单位读取盘口
   const venue = await setup().read({ ...input, address: address.toLowerCase() }, signal);
   assert.deepEqual(venue, {
     deposit: true, withdraw: true,
-    spot: { bids: [['3.2', '600'], ['3.1', '42']], at: now - 122, step: '0.01', minQuantity: '1', minNotional: '3', maxQuantity: '6500', maxNotional: '20000' },
+    spot: { bids: [['3.2', '600'], ['3.1', '42']], at: Math.floor(now / 1000) * 1000, step: '0.01', minQuantity: '1', minNotional: '3', maxQuantity: '6500', maxNotional: '20000' },
     perp: { bids: [['3.25', '5.1'], ['3.1', '10']], at: Math.floor(now / 1000) * 1000, step: '0.5', minQuantity: '0.05', maxQuantity: '500' },
   });
 });
@@ -146,13 +146,13 @@ test('Gate 仅短缓存目录，每次重读两侧盘口，超龄、超大响应
   const fixture = setup();
   await fixture.read(input, signal);
   await fixture.read(input, signal);
-  assert.deepEqual(fixture.counts, { currency: 1, pair: 1, contract: 2, spot: 2, perp: 2 });
+  assert.deepEqual(fixture.counts, { currency: 2, pair: 1, contract: 2, spot: 2, perp: 2 });
   fixture.advance(30_000);
   await fixture.read(input, signal);
-  assert.deepEqual(fixture.counts, { currency: 2, pair: 2, contract: 3, spot: 3, perp: 3 });
+  assert.deepEqual(fixture.counts, { currency: 3, pair: 2, contract: 3, spot: 3, perp: 3 });
   const aborted = AbortSignal.abort(new Error('用户取消'));
   await assert.rejects(fixture.read(input, aborted), /用户取消/);
-  assert.equal(fixture.counts.currency, 2);
+  assert.equal(fixture.counts.currency, 3);
   for (const currency of [new Response('x'.repeat(131_073)), new Response(null, { status: 502 }), new Error('internal-text')]) {
     await assert.rejects(setup({ currency }).read(input, signal), /^Error: Gate 币种目录不可用或未收录此币$/);
   }

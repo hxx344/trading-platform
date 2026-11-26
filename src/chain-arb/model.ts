@@ -1,5 +1,6 @@
 export const CHAIN_ARB_TTL_MS = 15_000;
 export const CHAIN_ARB_CLOCK_SKEW_MS = 2_000;
+export const CHAIN_ARB_MAX_IMPACT_BPS = 500;
 export type Chain = 'ethereum' | 'arbitrum' | 'bsc';
 export const VENUE_NAMES = { gate: 'Gate', binance: 'Binance', bitget: 'Bitget', okx: 'OKX' } as const;
 export type ChainArbVenue = keyof typeof VENUE_NAMES;
@@ -18,8 +19,30 @@ export type ArbResult = { error: string; rateLimited?: true } | {
   netBps: number | null; coveredCostUsdt: number;
   at: number; remainder: number;
 };
+
+export function isConsistentArbEstimate(leg: ArbResult): leg is Exclude<ArbResult, { error: string }> {
+  if ('error' in leg || ![leg.coveredCostUsdt, leg.quantity, leg.price].every(value => Number.isFinite(value) && value > 0)) return false;
+  // Each decimal result is rounded independently for display. Allow that rounding when reconciling USDT with bp.
+  const matchesRate = (amount: number, rate: number) => {
+    const expected = amount / leg.coveredCostUsdt * 10_000;
+    return Number.isFinite(expected) && Number.isFinite(rate) && Math.sign(amount) === Math.sign(rate)
+      && Math.abs(expected - rate) <= 4 * Number.EPSILON * Math.max(Math.abs(expected), Math.abs(rate));
+  };
+  if (!matchesRate(leg.grossUsdt, leg.spreadBps)) return false;
+  if (leg.netUsdt === null || leg.netBps === null) return leg.netUsdt === null && leg.netBps === null;
+  return matchesRate(leg.netUsdt, leg.netBps) && leg.netUsdt <= leg.grossUsdt && leg.netBps <= leg.spreadBps;
+}
+
+export function isManualEstimate(leg: ArbResult): boolean {
+  return isConsistentArbEstimate(leg) && (leg.netUsdt === null || leg.netUsdt <= 0);
+}
+
 export interface ChainArbView {
-  asOf: number; expiresAt: number; dex: { quantity: number; price: number; at: number; swapGasUsdt: number | null };
+  manualEstimateOnly?: true;
+  asOf: number; expiresAt: number; dex: {
+    quantity: number; price: number; at: number; swapGasUsdt: number | null;
+    execution?: { quotedQuantity: number; receivedQuantity: number; transferQuantity: number | null; transferAmount?: string | null; impactBps: number; blockNumber: string };
+  };
   deposit: boolean | null; withdraw: boolean | null; spot: ArbResult; perp: ArbResult;
 }
 

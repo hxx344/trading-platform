@@ -15,7 +15,7 @@ import { parseMonitorConfig } from '../src/service/monitor-config.ts';
 import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, settleMonitor, stopMonitor } from '../src/service/monitor.ts';
 import { fakeAnthropicVenues } from '../test/monitor-fake.ts';
 import { fakePerpetualVenues } from '../test/perpetual-fake.ts';
-import { chainArbFixture } from '../test/chain-arb-fake.ts';
+import { chainArbFixture, testGateLedger } from '../test/chain-arb-fake.ts';
 import { fakeNews } from '../test/news-fake.ts';
 import { newsLoop, newsViews } from '../src/service/news.ts';
 
@@ -40,7 +40,7 @@ const alertHooks = {
   robot: () => 'feishuMonitor' as const,
   test: async (text: string) => { process.stdout.write(`[替身飞书·测试] ${text}\n`); },
 };
-const monitor = openMonitor(parseMonitorConfig({ anthropic: {}, oil: {}, goldoil: {}, hynix: {}, perpetual: {} }), dir, { fetchImpl: venues.fetch, WebSocketImpl: venues.WebSocket, variationalFetch: venues.variationalFetch, alertHooks, perpetualOptions: fakePerpetualVenues(), chainArbFetch: chainArbFixture() });
+const monitor = openMonitor(parseMonitorConfig({ anthropic: {}, oil: {}, goldoil: {}, hynix: {}, perpetual: {} }), dir, { fetchImpl: venues.fetch, WebSocketImpl: venues.WebSocket, variationalFetch: venues.variationalFetch, alertHooks, perpetualOptions: fakePerpetualVenues(), chainArbFetch: chainArbFixture(), gateLedger: testGateLedger() });
 const store = openStore(join(dir, 'executor.sqlite'));
 const { binance, bybit, aster, asterTrading } = createSimulatedVenues(Date.now);
 const executor = createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, positions: asterTrading });

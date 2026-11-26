@@ -14,7 +14,7 @@ export const LIGHTER_ENDPOINTS: Record<Venue, { rest: string; stream: string }> 
 export const ENTROPY_ENDPOINTS = { info: 'https://api.hyperliquid.xyz/info', stream: 'wss://api.hyperliquid.xyz/ws', dex: 'io' } as const;
 export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
 
-async function readJson(fetchImpl: FetchLike, url: string, signal: AbortSignal, limit: number, headers: Record<string, string>, body?: unknown): Promise<unknown> {
+export async function readJson(fetchImpl: FetchLike, url: string, signal: AbortSignal, limit: number, headers: Record<string, string>, body?: unknown): Promise<unknown> {
   const response = await fetchImpl(url, body === undefined ? { headers: { accept: 'application/json', ...headers }, signal }
     : { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/json', ...headers }, body: JSON.stringify(body), signal });
   if (!response.ok) { void response.body?.cancel().catch(() => {}); throw new Error(`HTTP ${response.status}`); }

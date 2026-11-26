@@ -13,7 +13,7 @@ part_is() { [[ $part == all || $part == "$1" ]]; }
 root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-export TP_TEST_MODE=1 TP_NODE_BIN TP_APP_DIR="$tmp/opt" TP_CONF_DIR="$tmp/etc" TP_DATA_DIR="$tmp/var" TP_UNIT_FILE="$tmp/unit.service" TP_IMPORT_DIR="$tmp/import" TP_UPDATE_DIR="$tmp/update"
+export TP_TEST_MODE=1 TP_NODE_BIN TP_APP_DIR="$tmp/opt" TP_CONF_DIR="$tmp/etc" TP_DATA_DIR="$tmp/var" TP_UNIT_FILE="$tmp/unit.service" TP_IMPORT_DIR="$tmp/import" TP_UPDATE_DIR="$tmp/update" TP_DEX_CONF_DIR="$tmp/etc-dex"
 TP_NODE_BIN=$(command -v node)
 # Every install.sh run starts node on the same release files; the compile cache saves re-parsing them each time.
 export NODE_COMPILE_CACHE=${NODE_COMPILE_CACHE:-$tmp/node-compile-cache}
@@ -76,7 +76,7 @@ check '示例配置已放入' '[[ -f "$TP_CONF_DIR/config.example.json" && -f "$
 check '数据目录权限 700' '[[ "$(stat -c %a "$TP_DATA_DIR")" == 700 ]]'
 check 'systemd 单元已填入路径' '! grep -q "@" "$TP_UNIT_FILE" && grep -q "ExecStart=$TP_NODE_BIN $TP_APP_DIR/executor/src/service/main.ts --config $TP_CONF_DIR/config.json --data-dir $TP_DATA_DIR --import-dir $TP_IMPORT_DIR --socket /run/trading-platform/execution.sock" "$TP_UNIT_FILE" && grep -q "ReadWritePaths=$TP_DATA_DIR -$TP_IMPORT_DIR" "$TP_UNIT_FILE"'
 check '行情单元只接收专用环境，通过独立通信组向执行账户提供套接字' '! grep -q "@" "$tmp/trading-platform-market.service" && grep -Fqx "Group=trading-platform-market-ipc" "$tmp/trading-platform-market.service" && grep -Fqx "ExecStart=$TP_NODE_BIN $TP_APP_DIR/market/src/market/main.ts --socket /run/trading-platform-market/market.sock" "$tmp/trading-platform-market.service" && grep -Fqx "EnvironmentFile=-$TP_APP_DIR/market.env" "$tmp/trading-platform-market.service" && grep -Fq -- "--market-socket /run/trading-platform-market/market.sock" "$TP_UNIT_FILE" && [[ $(stat -c %a "$TP_APP_DIR/market.env") == 600 ]]'
-check 'DEX 价差单元以专用账户运行、状态目录 700，执行单元加入其通信组并带套接字参数' '! grep -q "@" "$tmp/trading-platform-dex.service" && grep -Fqx "User=trading-platform-dex" "$tmp/trading-platform-dex.service" && grep -Fqx "Group=trading-platform-dex-ipc" "$tmp/trading-platform-dex.service" && grep -Fqx "StateDirectoryMode=0700" "$tmp/trading-platform-dex.service" && grep -Fqx "ExecStart=$TP_NODE_BIN $TP_APP_DIR/dex/src/dex/main.ts --socket /run/trading-platform-dex/dex.sock --state-dir /var/lib/trading-platform-dex" "$tmp/trading-platform-dex.service" && grep -Fq "InaccessiblePaths=$TP_CONF_DIR $TP_DATA_DIR" "$tmp/trading-platform-dex.service" && grep -Fq -- "--dex-socket /run/trading-platform-dex/dex.sock" "$TP_UNIT_FILE" && grep -q "^SupplementaryGroups=.*trading-platform-dex-ipc" "$TP_UNIT_FILE" && [[ $(stat -c %a "$TP_APP_DIR/dex.env") == 600 && -n "$(cat "$TP_APP_DIR/.deployment/dex")" ]]'
+check 'DEX 价差单元以专用账户运行、状态目录 700，执行单元加入其通信组并带套接字参数' '! grep -q "@" "$tmp/trading-platform-dex.service" && grep -Fqx "User=trading-platform-dex" "$tmp/trading-platform-dex.service" && grep -Fqx "Group=trading-platform-dex-ipc" "$tmp/trading-platform-dex.service" && grep -Fqx "StateDirectoryMode=0700" "$tmp/trading-platform-dex.service" && grep -Fqx "ExecStart=$TP_NODE_BIN $TP_APP_DIR/dex/src/dex/main.ts --socket /run/trading-platform-dex/dex.sock --state-dir /var/lib/trading-platform-dex --keys-file $TP_DEX_CONF_DIR/keys.env" "$tmp/trading-platform-dex.service" && grep -Fqx "EnvironmentFile=-$TP_DEX_CONF_DIR/keys.env" "$tmp/trading-platform-dex.service" && grep -Fq "InaccessiblePaths=$TP_CONF_DIR $TP_DATA_DIR" "$tmp/trading-platform-dex.service" && grep -Fq -- "--dex-socket /run/trading-platform-dex/dex.sock" "$TP_UNIT_FILE" && grep -q "^SupplementaryGroups=.*trading-platform-dex-ipc" "$TP_UNIT_FILE" && [[ $(stat -c %a "$TP_APP_DIR/dex.env") == 600 && -n "$(cat "$TP_APP_DIR/.deployment/dex")" ]]'
 first=$(readlink -f "$TP_APP_DIR/current")
 
 if part_is 1; then
@@ -118,6 +118,32 @@ check '写 varLighter: false 后重新安装去掉 DEX 价差单元、链接与�
 set_var_lighter on
 run --package "$tmp/a" && status=0 || status=$?
 check '去掉 varLighter: false 后重新安装恢复 DEX 价差单元' '[[ $status -eq 0 && -f "$tmp/trading-platform-dex.service" && -L "$TP_APP_DIR/dex" && -f "$TP_APP_DIR/.deployment/dex" ]]'
+# Venue accounts for DEX live trading (docs/dexspread.md 12.4): three hidden lines, a root-only file outside the
+# service's directories, never echoed; a change moves only the DEX component key, removal needs nothing from the release.
+dex_account=7654321
+dex_address=0x00000000000000000000000000000000000E0E0E
+cp "$TP_APP_DIR/.deployment/dex-key" "$tmp/dex-key.none"; cp "$TP_APP_DIR/.deployment/executor-key" "$tmp/executor-key.none"
+run --package "$tmp/a" --dex-keys-stdin </dev/null && status=0 || status=$?
+check '--dex-keys-stdin 须和 --set-dex-keys 一起用' '[[ $status -ne 0 ]] && grep -q -- "须和 --set-dex-keys 一起使用" "$tmp/out"'
+run --package "$tmp/a" --set-dex-keys --unset-dex-keys </dev/null && status=0 || status=$?
+check '--set-dex-keys 与 --unset-dex-keys 不能同用' '[[ $status -ne 0 ]] && grep -q "只能用一个" "$tmp/out"'
+run --package "$tmp/a" --set-dex-keys </dev/null && status=0 || status=$?
+check '--set-dex-keys 不在终端里又没给 --dex-keys-stdin 时被拒' '[[ $status -ne 0 && ! -e "$TP_DEX_CONF_DIR/keys.env" ]] && grep -q "加 --dex-keys-stdin 从标准输入读三行" "$tmp/out"'
+printf 'not-a-number\n\n%s\n' "$dex_address" | run --package "$tmp/a" --set-dex-keys --dex-keys-stdin && status=0 || status=$?
+check '格式不对的账户编号被拒，不写文件、不回显' '[[ $status -ne 0 && ! -e "$TP_DEX_CONF_DIR/keys.env" ]] && grep -q "Lighter 账户编号须为非负整数" "$tmp/out" && ! grep -Eqi "not-a-number|$dex_address" "$tmp/out"'
+printf '%s\n\n%s\n' "$dex_account" "$dex_address" | run --package "$tmp/a" --set-dex-keys --dex-keys-stdin && status=0 || status=$?
+check '--set-dex-keys 写入场所账户文件（600），输出不带账户编号与地址' '[[ $status -eq 0 && "$(stat -c %a "$TP_DEX_CONF_DIR/keys.env")" == 600 ]] && grep -q "DEX 价差实盘账户：已配置 Lighter、Entropy" "$tmp/out" && ! grep -Eqi "$dex_account|$dex_address" "$tmp/out" && grep -Eqx "TP_DEX_KEYS=[A-Za-z0-9_-]+" "$TP_DEX_CONF_DIR/keys.env"'
+check '场所账户不进配置与密钥文件' '! grep -Eqi "$dex_account|$dex_address|TP_DEX_KEYS" "$TP_CONF_DIR/config.json" "$TP_CONF_DIR/secrets.json"'
+check '场所账户变了只动 DEX 的组件键，执行面的不变' '! cmp -s "$tmp/dex-key.none" "$TP_APP_DIR/.deployment/dex-key" && cmp -s "$tmp/executor-key.none" "$TP_APP_DIR/.deployment/executor-key"'
+cp "$TP_APP_DIR/.deployment/dex-key" "$tmp/dex-key.set"; cp "$TP_DEX_CONF_DIR/keys.env" "$tmp/keys.set"
+printf '\n\n\n' | run --package "$tmp/a" --set-dex-keys --dex-keys-stdin && status=0 || status=$?
+check '三项都留空时沿用已保存的值，文件与组件键不变' '[[ $status -eq 0 ]] && grep -q "与现有配置相同，未改动" "$tmp/out" && cmp -s "$tmp/keys.set" "$TP_DEX_CONF_DIR/keys.env" && cmp -s "$tmp/dex-key.set" "$TP_APP_DIR/.deployment/dex-key"'
+run --package "$tmp/a" && status=0 || status=$?
+check '普通重装保留场所账户文件' '[[ $status -eq 0 ]] && cmp -s "$tmp/keys.set" "$TP_DEX_CONF_DIR/keys.env" && cmp -s "$tmp/dex-key.set" "$TP_APP_DIR/.deployment/dex-key"'
+run --package "$tmp/a" --unset-dex-keys </dev/null && status=0 || status=$?
+check '--unset-dex-keys 删除文件，DEX 的组件键回到没有账户时' '[[ $status -eq 0 && ! -e "$TP_DEX_CONF_DIR/keys.env" ]] && grep -q "DEX 价差场所账户已去掉" "$tmp/out" && cmp -s "$tmp/dex-key.none" "$TP_APP_DIR/.deployment/dex-key"'
+run --package "$tmp/a" --unset-dex-keys </dev/null && status=0 || status=$?
+check '没有场所账户时 --unset-dex-keys 不报错' '[[ $status -eq 0 ]] && grep -q "DEX 价差场所账户（本来就没有）" "$tmp/out"'
 fi
 
 if part_is 1; then

@@ -60,6 +60,8 @@ const helperOnly = new Set(['update-helper', 'take-handoff', 'watch-config', 'me
 helperOnly.add('src/market/probe.ts');
 helperOnly.add('src/dex/probe.ts');
 helperOnly.add('src/dex/move-db.ts');
+// Run by install.sh as root from the target release; the DEX service never imports it.
+helperOnly.add('src/dex/keys-setup.ts');
 for (const entry of readdirSync(join(root, 'src'), { recursive: true, withFileTypes: true })) {
   if (!entry.isFile() || /\.d\.(?:ts|mts|cts)$/.test(entry.name)) continue;
   const path = packagePath(join(entry.parentPath, entry.name));

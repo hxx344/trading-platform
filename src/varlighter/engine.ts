@@ -7,6 +7,8 @@ import { TOKEN_QUOTE_CONCURRENCY, TOKEN_QUOTE_MAX_AGE_MS, TOKEN_QUOTE_PHASE_MS, 
 import { backtestRequest, runBacktest } from './backtest.ts';
 import { HyperliquidStream, LighterStream, MAX_DEPTH_MARKETS, depthAt, fetchEntropyMarkets, fetchRhMarkets, fetchVarListings,
   type Connect, type DepthSnapshot, type FetchLike, type LiveStream, type TopPoint } from './feeds.ts';
+import { COLLATERAL_ASSET, fetchAccount, type AccountSnapshot } from './accounts.ts';
+import { KEY_VENUES, configuredVenues, type DexAccountsSource, type KeyVenue } from '../dex/keys.ts';
 import { ASSET_KINDS, COMBOS, DEFAULT_COMBOS, KIND_NAMES, LEG_SYMBOL, LIVE_VENUES, RATIO_MAX, RATIO_MIN, REGIME_NAMES, SAMPLE_FIELDS, SAMPLE_FORMAT, VENUE_IDS, VENUE_NAMES,
   bothLive, bucketOf, comboName, comboPairs, comboVenues, customPairInfo, formatRatio, isLive, legKey, lighterMarket, midBasis, pairKey, pairTitle, parsePairKey,
   regimeOf, regimesOf, sameSymbol, sortPairs, spreadOf, upgradeKey, varHourly, varMarket, varQuoteQty,
@@ -47,6 +49,11 @@ export const MAX_CUSTOM_PAIRS = 100;
 /** 上线前核对清单的门槛。 */
 export const READY_BASELINE_DAYS = 3;
 export const READY_PAPER_TRADES = 20;
+/** 场所账户每分钟读一次；超过三分钟没读到新的就不算数。 */
+export const ACCOUNT_POLL_MS = 60_000;
+export const ACCOUNT_STALE_MS = 3 * 60_000;
+/** 「账户资金」就绪的下限：每个要用的场所可用余额不少于实盘起步的单笔名义金额（docs/dexspread.md 12.6）。 */
+export const READY_FUNDING_USD = 100;
 
 export class VarLighterError extends Error {
   readonly status: number; readonly code: string;
@@ -67,7 +74,7 @@ export { COOLDOWN_KEY, SETTINGS_KEY };
 export const EXITS_KEY = 'autoExits';
 type ExitRules = { id: string; exitBps: number; stopBps: number; maxHoldMinutes: number };
 
-export interface EngineOptions { store: VarLighterStore; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; log?: (line: string) => void; /** Var token 询价；不给就只用公开报价。 */ quoter?: VarQuoter }
+export interface EngineOptions { store: VarLighterStore; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; log?: (line: string) => void; /** Var token 询价；不给就只用公开报价。 */ quoter?: VarQuoter; /** 实盘场所账户（docs/dexspread.md 第 12 节）；不给就是没有配置。 */ accounts?: DexAccountsSource }
 
 const isObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 const dayStart = (time: number) => Math.floor(time / 86_400_000) * 86_400_000;
@@ -140,7 +147,20 @@ interface VenueRuntime {
 }
 interface DepthEntry { leg: LegInfo; snapshot: DepthSnapshot | null; error: string | null }
 
-export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now = Date.now, log = () => {}, quoter }: EngineOptions) {
+export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now = Date.now, log = () => {}, quoter, accounts: accountSource = () => ({ accounts: {}, problem: null }) }: EngineOptions) {
+  /** 各场所账户最近一次读取：成功时 at 与 snapshot 一起更新；失败只记 error，旧快照留着但过了时限不算数。 */
+  const accountReads = new Map<KeyVenue, { at: number | null; snapshot: AccountSnapshot | null; error: string | null }>();
+  async function refreshAccounts(signal: AbortSignal): Promise<void> {
+    const { accounts, problem } = accountSource();
+    const venues = problem ? [] : configuredVenues(accounts);
+    for (const venue of [...accountReads.keys()]) if (!venues.includes(venue)) accountReads.delete(venue);
+    for (const venue of venues) {
+      const entry = accountReads.get(venue) ?? { at: null, snapshot: null, error: null };
+      accountReads.set(venue, entry);
+      try { entry.snapshot = await fetchAccount(fetchImpl, signal, venue, accounts); entry.at = now(); entry.error = null; }
+      catch (error) { entry.error = message(error); }
+    }
+  }
   const open = connect ?? (url => new WebSocket(url) as unknown as ReturnType<Connect>);
   const migrated = store.migrateLegacy(now(), LEGACY_UPGRADE);
   if (migrated && migrated.positions + migrated.trades + migrated.skipped > 0) log(`varlighter: 已升级为两腿口径（持仓 ${migrated.positions}、成交 ${migrated.trades}${migrated.skipped ? `、无法识别 ${migrated.skipped}` : ''}）`);
@@ -1001,9 +1021,27 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     }
     items.push({ key: 'limits', status: 'ok', label: '风控限额', detail: `最多 ${settings.global.maxOpenPositions} 笔，名义合计 ≤ ${fmt(settings.global.maxTotalNotionalUsd, 0)} 美元，当日亏损 ≤ ${fmt(settings.global.dailyLossLimitUsd, 0)} 美元` });
     const orderVenues = [...new Set(enabled.flatMap(row => [row.a.venue, row.b.venue]))].filter(venue => venue !== 'var').map(venue => VENUE_NAMES[venue]);
-    items.push({ key: 'lighter_order', status: 'todo', label: '行情流场所的下单连接器', detail: `Lighter RH 链与主网是两套账户：各需账户编号、API 密钥编号与私钥，以及签名器；Entropy（Hyperliquid）需 API 钱包与签名；${orderVenues.length ? `已启用配对用到 ${orderVenues.join('、')}；` : ''}尚未接入` });
+    // 实盘只在两腿都是行情流场所的配对上做；没有这样的已启用配对时按三个场所都要用来核对。
+    const liveRows = enabled.filter(row => row.a.venue !== 'var' && row.b.venue !== 'var');
+    const needed = (liveRows.length ? [...new Set(liveRows.flatMap(row => [row.a.venue, row.b.venue]))] : [...KEY_VENUES]) as KeyVenue[];
+    const keys = accountSource(), have = keys.problem ? [] : configuredVenues(keys.accounts), missing = needed.filter(venue => !have.includes(venue));
+    const names = (venues: KeyVenue[]) => venues.map(venue => VENUE_NAMES[venue]).join('、');
+    items.push({ key: 'accounts', status: keys.problem ? 'warn' : !have.length ? 'todo' : missing.length ? 'warn' : 'ok', label: '场所账户',
+      detail: keys.problem ? keys.problem : !have.length ? '还没有录入：在服务器上执行 sudo bash install.sh --set-dex-keys，依次填 Lighter 主网账户编号、Lighter RH 账户编号、Entropy 账户地址（不回显，可留空）'
+        : `已录入 ${names(have)}${missing.length ? `；还缺 ${names(missing)}` : ''}` });
+    items.push({ key: 'lighter_order', status: 'todo', label: '行情流场所的下单连接器', detail: `Lighter RH 链与主网是两套账户：各需 API 密钥编号与私钥，以及签名器；Entropy（Hyperliquid）需 API 钱包与签名；${orderVenues.length ? `已启用配对用到 ${orderVenues.join('、')}；` : ''}带 Var 腿的配对不上实盘；尚未接入` });
     if (enabledVar || !enabled.length) items.push({ key: 'var_order', status: 'todo', label: 'Var 下单接口', detail: 'Var 没有公开交易接口；询价已可用 token 读取（各类标的的写法以实盘准备页的询价状态为准），成交接口尚未确认、尚未接入' });
-    items.push({ key: 'funding', status: 'todo', label: '两边账户资金', detail: '每个用到的场所各需 USDC 保证金；按单笔名义金额与杠杆核算，并留出单腿风险的余量' });
+    if (!have.length) items.push({ key: 'funding', status: 'todo', label: '两边账户资金', detail: `每个用到的场所各需保证金（Lighter 与 Entropy 用 USDC，Lighter RH 用 USDG）；录入场所账户后这里显示各场所的余额，每个场所可用余额至少 ${READY_FUNDING_USD} 才算就绪` });
+    else {
+      const lines = have.map(venue => {
+        const read = accountReads.get(venue), fresh = !!read && read.at !== null && time - read.at <= ACCOUNT_STALE_MS;
+        const text = !read || read.at === null || !read.snapshot ? `${VENUE_NAMES[venue]} ${read?.error ? `读取失败（${read.error}）` : '还没有读到'}`
+          : `${VENUE_NAMES[venue]} 可用 ${fmt(read.snapshot.available, 2)}、权益 ${fmt(read.snapshot.collateral, 2)} ${COLLATERAL_ASSET[venue]}，持仓 ${read.snapshot.positions.length} 个${fresh ? '' : `（${read.error ? `读取失败：${read.error}` : '读数已过期'}）`}`;
+        return { venue, text, ok: fresh && !!read?.snapshot && read.snapshot.available >= READY_FUNDING_USD };
+      });
+      const short = needed.filter(venue => !lines.some(line => line.venue === venue && line.ok));
+      items.push({ key: 'funding', status: short.length ? 'warn' : 'ok', label: '两边账户资金', detail: `${lines.map(line => line.text).join('；')}${short.length ? `；可用余额至少 ${READY_FUNDING_USD} 才算就绪，未达到：${names(short)}` : ''}` });
+    }
     items.push({ key: 'monitor', status: 'todo', label: '实盘监控与告警', detail: '单腿、持仓不一致、亏损上限触发时的飞书告警，接入下单后补上' });
     return { now: time, items, ready: items.every(item => item.status === 'ok'), markets: catalogs() };
   }
@@ -1018,7 +1056,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     stream: (venue: LiveVenue = 'rh') => live.get(venue)!.stream,
     /** 测试用：不跑后台循环时按参数启停各场所的行情流。 */
     startStreams(): void { running = true; syncStreams(); },
-    pollVar, refreshCatalog, refreshDepth, sampleLive,
+    pollVar, refreshCatalog, refreshDepth, sampleLive, refreshAccounts,
     views: { state, symbol: symbolView, samples: samplesPage, backtest, paper, settings: updateSettings, close: closeManual, reset: resetPaper, readiness },
     /**
      * 后台循环：连上用到的行情流（一档、标记价、资金费与启用配对的盘口都走行情流）并在后台每 10 分钟取各场所目录，然后每分钟拉 Var 报价（连同询价），
@@ -1027,7 +1065,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     async loop(context: { stopped(): boolean; pause(ms: number): Promise<void> }): Promise<void> {
       running = true;
       syncStreams();
-      let nextVar = now() + 5_000, nextPrune = now() + 60_000, nextLive = now() + 10_000;
+      let nextVar = now() + 5_000, nextPrune = now() + 60_000, nextLive = now() + 10_000, nextAccounts = now() + 15_000;
       // 停服时中断进行中的请求，不等各自的超时：pause 在停服时立即返回。
       const stop = new AbortController();
       let done = false;
@@ -1057,6 +1095,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
             nextVar = time + VAR_POLL_MS;
             background('var', () => pollVar(request()).catch(error => { varSource.error = message(error); }));
           }
+          // 没有配置账户时这一轮不发任何请求。
+          if (time >= nextAccounts && !busy.has('accounts')) { nextAccounts = time + ACCOUNT_POLL_MS; background('accounts', () => refreshAccounts(request())); }
           if (time >= nextLive) { nextLive = time + LIVE_TICK_MS; try { sampleLive(); } catch (error) { log(`varlighter: 行情流配对采样失败：${message(error)}`); } }
           if (time >= nextPrune) { nextPrune = time + PRUNE_MS; try { await pruneSamples(time, () => context.stopped()); } catch (error) { log(`varlighter: 清理样本失败：${message(error)}`); } }
           await context.pause(1_000);

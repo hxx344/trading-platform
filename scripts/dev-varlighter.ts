@@ -228,8 +228,18 @@ function l2Book(coin: string) {
 
 // 替身 Var 公开行情与各场所的目录（盘口走上面的替身行情流）。Var 报价时刻比收到时早 20 秒，与真实接口的缓存相近。
 const venueOfUrl = (url: string): LiveVenue => url.includes('hyperliquid') ? 'entropy' : url.includes('api.rh.lighter.xyz') ? 'rh' : 'lighter';
-const fetchImpl = async (input: string | URL | Request): Promise<Response> => {
+// 替身场所账户（docs/dexspread.md 12.13）：主网资金够、RH 不足 100、Entropy 有一笔持仓，准备页的两项各有内容可看。
+const PREVIEW_ACCOUNTS = { lighter: { accountIndex: 1001 }, rh: { accountIndex: 2002 }, entropy: { address: '0x' + 'ab'.repeat(20) } };
+const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
   const url = String(input instanceof Request ? input.url : input);
+  if (url.includes('/api/v1/account')) {
+    const rh = venueOfUrl(url) === 'rh';
+    return Response.json({ code: 200, accounts: [{ account_index: rh ? 2002 : 1001, collateral: rh ? '60.00' : '300.25', available_balance: rh ? '60.00' : '250.50',
+      positions: rh ? [] : [{ symbol: 'ETH', sign: 1, position: '0.0100', position_value: '36.50' }] }] });
+  }
+  if (url.includes('hyperliquid.xyz/info') && typeof init?.body === 'string' && init.body.includes('clearinghouseState')) {
+    return Response.json({ marginSummary: { accountValue: '512.40' }, withdrawable: '480.10', assetPositions: [{ position: { coin: 'io:NVDA', szi: '-0.2', positionValue: '36.40' } }] });
+  }
   if (url.includes('hyperliquid.xyz/info')) {
     const listed = onVenue('entropy');
     return Response.json([
@@ -259,7 +269,7 @@ const fetchImpl = async (input: string | URL | Request): Promise<Response> => {
 
 // 与安装后的拓扑一样：DEX 价差服务在本机套接字上（Windows 用命名管道），执行服务只转发（docs/dexspread.md 11.10）。
 const socket = process.platform === 'win32' ? `\\\\.\\pipe\\tp-dex-preview-${process.pid}` : join(dir, 'dex.sock');
-const dex = startDex({ socket, stateDir: dir, build: 'development', options: { fetchImpl: fetchImpl as typeof fetch, connect: url => venueOfUrl(url) === 'entropy' ? new FakeEntropy() : new FakeLighter(venueOfUrl(url)) } });
+const dex = startDex({ socket, stateDir: dir, build: 'development', options: { fetchImpl: fetchImpl as typeof fetch, accounts: () => ({ accounts: PREVIEW_ACCOUNTS, problem: null }), connect: url => venueOfUrl(url) === 'entropy' ? new FakeEntropy() : new FakeLighter(venueOfUrl(url)) } });
 await dex.ready;
 const client = createDexClient(socket);
 await client.pushToken({ seq: Date.now(), token: '', problem: '' });

@@ -26,8 +26,9 @@ market_socket=/run/trading-platform-market/market.sock
 dex=trading-platform-dex
 dex_socket=/run/trading-platform-dex/dex.sock
 dex_state=/var/lib/trading-platform-dex
+dex_conf=/etc/trading-platform-dex
 units=("$service.service" "$control.service" "$market.service" "$dex.service" "$service-import.path" "$service-import.service" "$service-update.path" "$service-update.service")
-for path in "$app" "$conf" "$data" "$handoff" "$updates" /run/trading-platform /run/trading-platform-market /run/trading-platform-dex "$dex_state" "$unitdir/$service.service.d" "$unitdir/$market.service.d" "$unitdir/$dex.service.d" "${units[@]/#/$unitdir/}"; do
+for path in "$app" "$conf" "$data" "$handoff" "$updates" /run/trading-platform /run/trading-platform-market /run/trading-platform-dex "$dex_state" "$dex_conf" "$unitdir/$service.service.d" "$unitdir/$market.service.d" "$unitdir/$dex.service.d" "${units[@]/#/$unitdir/}"; do
   [[ ! -e "$path" && ! -L "$path" ]] || { echo "Fixture target already exists: $path" >&2; exit 1; }
 done
 for account in "$service" "$control" "$service-ipc" "$market" "$market-ipc" "$dex" "$dex-ipc" "$extra_user"; do
@@ -78,7 +79,7 @@ JS
   systemctl daemon-reload || true
   for account in "$extra_user" "$dex" "$market" "$control" "$service"; do userdel "$account" >/dev/null 2>&1 || true; done
   for group in "$service" "$control" "$service-ipc" "$market" "$market-ipc" "$dex" "$dex-ipc"; do groupdel "$group" >/dev/null 2>&1 || true; done
-  rm -rf "$app" "$conf" "$data" "$handoff" "$updates" "$unitdir/$service.service.d" "$unitdir/$market.service.d" "$unitdir/$dex.service.d" "$dex_state" "$fixture"
+  rm -rf "$app" "$conf" "$data" "$handoff" "$updates" "$unitdir/$service.service.d" "$unitdir/$market.service.d" "$unitdir/$dex.service.d" "$dex_state" "$dex_conf" "$fixture"
   exit "$result"
 }
 trap cleanup EXIT
@@ -307,6 +308,28 @@ for recipient in "$dex:$dex-ipc:/run/trading-platform/execution.sock" "$dex:$dex
     s.on("connect", () => { s.destroy(); process.exitCode = 1; });
     s.on("error", e => { if (e.code !== "EACCES") process.exitCode = 1; });' "$socket"
 done
+dex_probe "$app/dex"
+# Venue accounts for DEX live trading (docs/dexspread.md 12.4): root keeps the file, systemd hands its content to the
+# service at start, the service account can see the file but not read it, and only the DEX service restarts.
+executor_before=$(pid "$service"); dex_before=$(pid "$dex")
+printf '%s\n\n%s\n' 7654321 0x00000000000000000000000000000000000E0E0E |
+  bash "$root/deploy/install.sh" --package "$fixture/release-1" --set-dex-keys --dex-keys-stdin >"$fixture/out" 2>&1
+[[ $(stat -c '%U:%G %a' "$dex_conf") == 'root:root 755' && $(stat -c '%U:%G %a' "$dex_conf/keys.env") == 'root:root 600' ]]
+if grep -Eqi '7654321|0E0E0E' "$fixture/out"; then echo 'Installer echoed a venue account' >&2; exit 1; fi
+dex_pid=$(pid "$dex")
+[[ $dex_pid != "$dex_before" && $(pid "$service") == "$executor_before" ]]
+tr '\0' '\n' <"/proc/$dex_pid/environ" | grep -q '^TP_DEX_KEYS='
+runuser -u "$dex" -g "$dex-ipc" -- test -e "$dex_conf/keys.env"
+if runuser -u "$dex" -g "$dex-ipc" -- test -r "$dex_conf/keys.env" || runuser -u "$dex" -g "$dex-ipc" -- test -w "$dex_conf" ||
+    runuser -u "$service" -- test -r "$dex_conf/keys.env" || runuser -u "$control" -- test -r "$dex_conf/keys.env"; then
+  echo 'A service account can read or replace the venue accounts' >&2; exit 1
+fi
+dex_probe "$app/dex"
+dex_before=$dex_pid
+bash "$root/deploy/install.sh" --package "$fixture/release-1" --unset-dex-keys >"$fixture/out" 2>&1
+dex_pid=$(pid "$dex")
+[[ ! -e "$dex_conf/keys.env" && $dex_pid != "$dex_before" && $(pid "$service") == "$executor_before" ]]
+if tr '\0' '\n' <"/proc/$dex_pid/environ" | grep -q '^TP_DEX_KEYS='; then echo 'Removed venue accounts still reach the DEX service' >&2; exit 1; fi
 dex_probe "$app/dex"
 [[ -e "$app/.update-helper" ]]
 login

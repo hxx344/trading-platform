@@ -28,7 +28,7 @@ export function VarLighterReady({ view, onChanged, onExpired }: { view: StateVie
         {!data ? live.error ? <StatePanel kind="error" title="读取核对清单失败" detail={live.error.message} /> : <StatePanel kind="loading" title="加载中…" />
           : <ul className="vl-checklist">{data.items.map(item => { const Icon = STATUS_ICON[item.status]; return <li key={item.key} className={item.status}>
             <Icon size={16} aria-label={STATUS_TEXT[item.status]} /><div><strong>{item.label}</strong> <Badge tone={item.status === 'ok' ? 'ok' : item.status === 'warn' ? 'warn' : ''}>{STATUS_TEXT[item.status]}</Badge><p>{item.detail}</p></div></li>; })}</ul>}
-        <p className="vl-note">「待接入」是需要账户与交易接口的事项，模拟盘阶段不会变成已就绪；全部就绪前本模块不会下真实订单。</p>
+        <p className="vl-note">「待接入」是还没有做完或还没有录入的事项：场所账户在服务器上用 --set-dex-keys 录入后会显示余额，下单连接器与告警尚未接入。本模块目前不会下真实订单。</p>
       </section>
       <div className="vl-stack">
         <GlobalPanel view={view} onChanged={refresh} />

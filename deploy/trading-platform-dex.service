@@ -10,12 +10,15 @@ Type=simple
 User=trading-platform-dex
 Group=trading-platform-dex-ipc
 EnvironmentFile=-@APP_DIR@/dex.env
+# Venue accounts for live trading (docs/dexspread.md 12.4): root-owned 0600, so only systemd reads the content; the
+# service can merely see whether the file is still the one it was started with.
+EnvironmentFile=-@DEX_CONF_DIR@/keys.env
 WorkingDirectory=@APP_DIR@/dex
 RuntimeDirectory=trading-platform-dex
 RuntimeDirectoryMode=2750
 StateDirectory=trading-platform-dex
 StateDirectoryMode=0700
-ExecStart=@NODE@ @APP_DIR@/dex/src/dex/main.ts --socket /run/trading-platform-dex/dex.sock --state-dir /var/lib/trading-platform-dex
+ExecStart=@NODE@ @APP_DIR@/dex/src/dex/main.ts --socket /run/trading-platform-dex/dex.sock --state-dir /var/lib/trading-platform-dex --keys-file @DEX_CONF_DIR@/keys.env
 Restart=always
 RestartSec=5
 TimeoutStopSec=15

@@ -6,6 +6,7 @@ import type { Connect, FetchLike } from '../varlighter/feeds.ts';
 import { openVarLighterStore, VARLIGHTER_FILE } from '../varlighter/store.ts';
 import { ParamsError } from '../varlighter/strategy.ts';
 import { createVarQuoter, tokenFileSource, type TokenSource } from '../varlighter/varquote.ts';
+import type { DexAccountsSource } from './keys.ts';
 import type { DexPageAnswer, DexPageRequest } from './protocol.ts';
 import { createVariationalFetch } from '../monitor/variational-transport.ts';
 import type { VariationalFetcher } from '../vendor/variational-market.mjs';
@@ -14,7 +15,7 @@ import type { VariationalFetcher } from '../vendor/variational-market.mjs';
  * `variationalFetch`：Var token 询价的传输（默认经 python3 传输脚本），测试里换成替身。`tokenSource`：Var token 的来源；
  * DEX 服务里是执行面推来的内存值，不给就读 `dir` 里的 token 文件（本机测试）。
  */
-export interface VarLighterOptions { fetchImpl?: FetchLike; connect?: Connect; now?: () => number; variationalFetch?: VariationalFetcher; tokenSource?: () => TokenSource }
+export interface VarLighterOptions { fetchImpl?: FetchLike; connect?: Connect; now?: () => number; variationalFetch?: VariationalFetcher; tokenSource?: () => TokenSource; /** 实盘场所账户；不给就是没有配置。 */ accounts?: DexAccountsSource }
 export interface VarLighterHolder { engine: VarLighterEngine | null; error: string | null }
 
 export interface VarLighterViews {

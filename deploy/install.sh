@@ -44,6 +44,11 @@
 #                                             脚本化时加 --mev-stdin，从标准输入读这三行（发送用节点地址填 - 表示去掉）。
 #                                             开启后是观察模式，实盘在页面上核对后手动开始；沿用当前已装版本、不联网升级（已装版本不带本模块时先升级到最新版）
 #   sudo bash install.sh --unset-mev          关闭 MEV 套利并去掉节点地址与热钱包私钥（回退到不含该模块的版本前须先执行）；不换版本、不联网
+#   sudo bash install.sh --set-dex-keys       录入或修改 DEX 价差实盘的场所账户（docs/dexspread.md 第 12.4 节）：依次询问 Lighter 主网账户编号、
+#                                             Lighter RH 账户编号、Entropy 账户地址，都不回显、不进命令行；留空沿用已保存的值，填 - 去掉那个场所。
+#                                             脚本化时加 --dex-keys-stdin，从标准输入读这三行。这一版只读账户的保证金与持仓，不下单；
+#                                             沿用当前已装版本、不联网升级（已装版本不带这项时先升级到最新版），随后只重启 DEX 价差服务
+#   sudo bash install.sh --unset-dex-keys     去掉场所账户并重启 DEX 价差服务；不换版本、不联网
 #
 # 页面总在 127.0.0.1 监听（用 SSH 隧道打开）；在 config.json 写 "host": "<本机 Tailscale IP>" 后也在该地址监听，直接打开。
 # 删除 /etc/trading-platform/login-password 再执行本脚本即取消密码，只能用数据目录 access-url 里的链接登录。
@@ -76,6 +81,10 @@ KEEP_RELEASES=3
 HEALTH_WAIT_S=90
 APP_DIR=${TP_APP_DIR:-/opt/trading-platform}
 CONF_DIR=${TP_CONF_DIR:-/etc/trading-platform}
+# Venue accounts for DEX live trading (docs/dexspread.md 12.4). Root owns the directory and the file (0600): systemd
+# hands the content to the DEX service as an EnvironmentFile, the service account can only see that the file exists.
+DEX_CONF_DIR=${TP_DEX_CONF_DIR:-/etc/trading-platform-dex}
+DEX_KEYS_FILE=$DEX_CONF_DIR/keys.env
 DATA_DIR=${TP_DATA_DIR:-/var/lib/trading-platform}
 UNIT_FILE=${TP_UNIT_FILE:-/etc/systemd/system/$SERVICE.service}
 RELEASE_BASE=${TP_RELEASE_BASE:-https://github.com/$REPO/releases}
@@ -145,6 +154,9 @@ watch_off=0
 set_mev=0
 unset_mev=0
 mev_stdin=0
+set_dex_keys=0
+unset_dex_keys=0
+dex_keys_stdin=0
 mev_executor=''
 mev_owner=''
 while (($#)); do
@@ -171,6 +183,9 @@ while (($#)); do
     --set-mev) set_mev=1; shift ;;
     --unset-mev) unset_mev=1; shift ;;
     --mev-stdin) mev_stdin=1; shift ;;
+    --set-dex-keys) set_dex_keys=1; shift ;;
+    --unset-dex-keys) unset_dex_keys=1; shift ;;
+    --dex-keys-stdin) dex_keys_stdin=1; shift ;;
     --mev-executor) [[ $# -ge 2 && -n "$2" ]] || usage 2; mev_executor=$2; shift 2 ;;
     --mev-owner) [[ $# -ge 2 && -n "$2" ]] || usage 2; mev_owner=$2; shift 2 ;;
     --version) [[ $# -ge 2 ]] || usage 2; version=$2; shift 2 ;;
@@ -206,6 +221,12 @@ if ((set_mev || unset_mev)); then mev_change=1; fi
 ((set_mev || !mev_stdin)) || fail '--mev-stdin 须和 --set-mev 一起使用'
 ((!set_mev)) || [[ "$mev_executor" =~ ^0x[0-9a-fA-F]{40}$ && "$mev_owner" =~ ^0x[0-9a-fA-F]{40}$ ]] || fail '--set-mev 须同时给出 --mev-executor 与 --mev-owner（0x 开头的 40 位十六进制地址）'
 ((!mev_stdin || !password_stdin)) || fail '--mev-stdin 与 --password-stdin 都读标准输入，请分两次执行'
+dex_keys_change=0
+if ((set_dex_keys || unset_dex_keys)); then dex_keys_change=1; fi
+((!set_dex_keys || !unset_dex_keys)) || fail '--set-dex-keys 与 --unset-dex-keys 只能用一个'
+((set_dex_keys || !dex_keys_stdin)) || fail '--dex-keys-stdin 须和 --set-dex-keys 一起使用'
+((!dex_keys_stdin || (!password_stdin && !mev_stdin))) || fail '--dex-keys-stdin 与 --password-stdin、--mev-stdin 都读标准输入，请分开执行'
+((!set_dex_keys || !set_mev || dex_keys_stdin || mev_stdin)) || fail '--set-dex-keys 与 --set-mev 都要在终端里逐项询问，请分两次执行'
 
 [[ "$(uname -s)" == Linux ]] || fail '只支持 Linux。'
 if [[ "$TEST_MODE" != 1 ]]; then
@@ -253,6 +274,25 @@ if ((set_mev)); then
   mev_input=$(printf '%s\n%s\n%s' "$mev_rpc" "$mev_send" "$mev_key")
   unset mev_rpc mev_send mev_key
 fi
+# Venue accounts for DEX live trading are asked for the same way and never become arguments.
+dex_keys_input=''
+if ((set_dex_keys)); then
+  if ((dex_keys_stdin)); then
+    [[ -f "$0" ]] || fail '脚本本身从标准输入读入时不能用 --dex-keys-stdin：先下载 install.sh 再执行'
+    IFS= read -r dex_lighter || true
+    IFS= read -r dex_rh || true
+    IFS= read -r dex_entropy || true
+  elif [[ -t 0 ]]; then
+    IFS= read -rs -p 'Lighter 主网账户编号（不回显；留空沿用已保存的，填 - 去掉）：' dex_lighter; printf '\n' >&2
+    IFS= read -rs -p 'Lighter RH 账户编号（不回显；留空沿用已保存的，填 - 去掉）：' dex_rh; printf '\n' >&2
+    IFS= read -rs -p 'Entropy（Hyperliquid）账户地址（0x 开头，不回显；留空沿用已保存的，填 - 去掉）：' dex_entropy; printf '\n' >&2
+  else
+    [[ -f "$0" ]] || fail '标准输入不是终端：请先下载 install.sh，再在终端里执行 sudo bash install.sh --set-dex-keys'
+    fail '标准输入不是终端：请在终端里执行，或加 --dex-keys-stdin 从标准输入读三行（Lighter 主网账户编号、Lighter RH 账户编号、Entropy 账户地址）'
+  fi
+  dex_keys_input=$(printf '%s\n%s\n%s' "$dex_lighter" "$dex_rh" "$dex_entropy")
+  unset dex_lighter dex_rh dex_entropy
+fi
 
 
 as_root_dir() { # path mode [owner group]
@@ -289,6 +329,9 @@ if [[ -z "$version$package_dir" && "$installed_sha" =~ ^[a-f0-9]{64}$ ]]; then
   if ((set_mev)) && [[ ! -f "$APP_DIR/current/src/service/mev-setup.ts" ]]; then keep_installed=0; fi
   # Turning it off never changes the release: on one from before the module there is nothing to remove.
   if ((unset_mev)); then keep_installed=1; fi
+  # The venue accounts follow the same rule: keep the installed release when it can hold them, removal never moves it.
+  if ((set_dex_keys)); then if [[ -f "$APP_DIR/current/src/dex/keys-setup.ts" ]]; then keep_installed=1; else keep_installed=0; fi; fi
+  if ((unset_dex_keys)); then keep_installed=1; fi
 fi
 if ((keep_installed)); then
   printf '%s  trading-platform.tar.gz\n' "$installed_sha" >"$work_dir/SHA256SUMS"
@@ -644,6 +687,22 @@ if ((mev_change)); then
   fi
   mev_input=''
 fi
+# Venue accounts for DEX live trading (docs/dexspread.md 12.4). The file lives in a root-owned directory the service
+# account cannot write, so root may write it by path (L201). Its digest is part of the DEX component key below, so a
+# change restarts only the DEX service.
+if ((dex_keys_change)); then
+  if ((unset_dex_keys)); then
+    # Removal needs nothing from the release: a rollback target without the helper must still be able to drop the file.
+    if [[ -e "$DEX_KEYS_FILE" || -L "$DEX_KEYS_FILE" ]]; then rm -f "$DEX_KEYS_FILE" || fail '去掉 DEX 价差场所账户失败'; changes+=('DEX 价差场所账户已去掉'); else skipped+=('DEX 价差场所账户（本来就没有）'); fi
+  else
+    [[ -f "$release_dir/src/dex/keys-setup.ts" ]] || fail "版本 $new_version 不支持录入 DEX 价差场所账户，请用最新版本"
+    as_root_dir "$DEX_CONF_DIR" 755
+    dex_keys_out=$(printf '%s\n' "$dex_keys_input" | (cd / && "$NODE_BIN" "$release_dir/src/dex/keys-setup.ts" --file "$DEX_KEYS_FILE" 9>&-)) || fail '录入 DEX 价差场所账户失败'
+    log "$dex_keys_out"
+    if [[ -f "$DEX_KEYS_FILE" ]]; then chmod 600 "$DEX_KEYS_FILE" || fail '无法设置场所账户文件的权限'; fi
+  fi
+  dex_keys_input=''
+fi
 configured=0
 if [[ -f "$CONF_DIR/config.json" ]]; then
   configured=1
@@ -804,7 +863,7 @@ FLOCK_BIN=$(command -v flock)
 render_to() {
   [[ -f "$1" ]] && sed -e "s|@NODE@|$NODE_BIN|g" -e "s|@APP_DIR@|$APP_DIR|g" -e "s|@CONF_DIR@|$CONF_DIR|g" -e "s|@DATA_DIR@|$DATA_DIR|g" \
     -e "s|@IMPORT_DIR@|$IMPORT_DIR|g" -e "s|@UPDATE_DIR@|$UPDATE_DIR|g" -e "s|@CONTROL_UID@|$CONTROL_UID|g" -e "s|@CONTROL_GID@|$CONTROL_GID|g" \
-    -e "s|@FLOCK@|$FLOCK_BIN|g" -e "s|@WORKBENCH_ENV@|$WORKBENCH_ENV|g" "$1" >"$2" && [[ -s "$2" ]]
+    -e "s|@FLOCK@|$FLOCK_BIN|g" -e "s|@WORKBENCH_ENV@|$WORKBENCH_ENV|g" -e "s|@DEX_CONF_DIR@|$DEX_CONF_DIR|g" "$1" >"$2" && [[ -s "$2" ]]
 }
 # Copy only whole EnvironmentFile assignments. An allowed-looking line inside a private quoted or continued
 # value belongs to the private key. Preserve quoting for systemd and never pass private values on a command line.
@@ -887,7 +946,9 @@ JS
     fi
     if [[ -f "$out/dex" ]]; then
       render_to "$target/deploy/$DEX.service" "$out/dex.service" || return 1
-      { printf '%s\n' "$node_identity"; cat "$target/.dex-sha256"; sha256sum <"$out/dex.service"; sha256sum <"$out/dex.env"; } \
+      # The venue accounts reach the service only at start, so a changed or removed file must restart it.
+      { printf '%s\n' "$node_identity"; cat "$target/.dex-sha256"; sha256sum <"$out/dex.service"; sha256sum <"$out/dex.env"
+        if [[ -f "$DEX_KEYS_FILE" ]]; then sha256sum <"$DEX_KEYS_FILE"; fi; } \
         | sha256sum | cut -d' ' -f1 >"$out/dex-key" || return 1
     fi
   fi

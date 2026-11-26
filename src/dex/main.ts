@@ -8,6 +8,7 @@ import { parseArgs } from 'node:util';
 import { readComponentBuild } from '../component-build.ts';
 import { crashReportKey, installCrashGuard, readCrashRecord } from '../crash-guard.ts';
 import { openVarLighter, routePage, varLighterLoop, varLighterViews, type VarLighterOptions } from './host.ts';
+import { guardedAccounts, takeDexKeys } from './keys.ts';
 import { DEX_TOKEN_LEASE_MS, tokenDigest, type DexCrashView, type DexTokenPush } from './protocol.ts';
 import { createDexServer } from './server.ts';
 
@@ -65,12 +66,16 @@ export function startDex({ socket, stateDir, build, options = {}, log = line => 
 }
 
 function main(): void {
-  const { values } = parseArgs({ options: { socket: { type: 'string' }, 'state-dir': { type: 'string' } } });
+  const { values } = parseArgs({ options: { socket: { type: 'string' }, 'state-dir': { type: 'string' }, 'keys-file': { type: 'string' } } });
+  // 先取走场所账户并从环境里删掉，之后启动的子进程拿不到。
+  const taken = takeDexKeys(process.env);
+  const keysFile = values['keys-file'];
+  if (keysFile !== undefined && !isAbsolute(keysFile)) throw new Error('--keys-file 须为绝对路径');
   if (!values.socket || !isAbsolute(values.socket)) throw new Error('需要绝对路径 --socket');
   const stateDir = values['state-dir'];
   if (!stateDir || !isAbsolute(stateDir)) throw new Error('需要绝对路径 --state-dir');
   const build = readComponentBuild(fileURLToPath(new URL('../..', import.meta.url)), 'dex');
-  const dex = startDex({ socket: values.socket, stateDir, build });
+  const dex = startDex({ socket: values.socket, stateDir, build, options: { accounts: guardedAccounts(taken, keysFile ?? null) } });
   dex.ready.then(() => process.stdout.write('DEX 价差服务已就绪\n'), (error: Error) => {
     process.stderr.write(`DEX 价差服务监听失败：${error.message}\n`); process.exitCode = 1; void dex.stop();
   });
@@ -80,7 +85,7 @@ function main(): void {
 }
 
 if (import.meta.main) {
-  const dir = parseArgs({ options: { socket: { type: 'string' }, 'state-dir': { type: 'string' } }, strict: false }).values['state-dir'];
+  const dir = parseArgs({ options: { socket: { type: 'string' }, 'state-dir': { type: 'string' }, 'keys-file': { type: 'string' } }, strict: false }).values['state-dir'];
   installCrashGuard(DEX_PROCESS_NAME, typeof dir === 'string' && isAbsolute(dir) ? { dir } : {});
   try { main(); } catch (error) { process.stderr.write(`${error instanceof Error ? error.message : 'DEX 价差服务启动失败'}\n`); process.exitCode = 1; }
 }

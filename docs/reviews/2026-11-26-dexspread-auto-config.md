@@ -35,7 +35,8 @@
 - 修复前：`scripts/dev-varlighter.ts` 替身后端，无头浏览器 1280 宽度在总览勾选 TSLA Var↔RH，行内变为「已启用 · 自动」、开仓线由 15 变为 12；详情页自动配置块显示四项推荐值与依据；390 宽度总览表格在面板内横向滚动，页面无横向溢出。
 - 修复后：同一替身后端 1280 宽度，间隔 1.5 秒连续勾选 TSLA Var↔RH 与 SOL Var↔主网，两个都变为「已启用 · 自动」，没有 409；详情页关掉 SOL 的自动配置，标记变为「未使用」并提示按保存的参数运行；无页面报错。
 - 变基到 v0.92.1 后：`pnpm check`、`pnpm build:web`、`node --test web/test/varlighter-form.test.mjs`（9 通过）、`node --test test/varlighter.test.ts test/varlighter-paper-commit.test.ts test/varlighter-local.test.ts`（66 通过，变基前失败的「Var 询价器」一条在 v0.92.1 上已通过）。`test/varlighter-paper-commit.test.ts` 的参数样例补了 `auto: []`。
-- 分支 CI：CI_LINE
+- 变基后浏览器复验（替身后端，无头浏览器）：1280 宽度在总览勾选 BTC Var↔主网，行内变为「已启用 · 自动」、开仓线由 15 变为 10；详情页自动配置块显示「使用中」与四项推荐值；390 宽度页面无横向溢出。
+- 分支 CI：提交 `7530498` 的 https://github.com/hxx344/trading-platform/actions/runs/45792440140 全部通过（check、lint、test 1–6、install 1–3、watch、platform-systemd 五组）。
 
 ## 未运行
 

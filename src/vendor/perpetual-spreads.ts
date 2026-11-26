@@ -1,4 +1,5 @@
-// 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-spreads.ts（提交 c84ba27），原样；服务端（perpetual-quality-service.mjs）与页面共用。
+// 来自工作台 c84ba27 的 modules/monitor/lib/perpetual-spreads.ts；页面屏蔽沿用服务端的币种别名。
+import { isBaseBlocked } from "./asset-identity.mjs";
 import type { PerpetualExchange, PerpetualPairMode, PerpetualPriceMode, PerpetualQuote, PerpetualSnapshot } from "./perpetual-types.ts";
 import { contractFeeMaxAgeMs, defaultQualityBudget, resolveTakerFee, validFeePercent, type QualityBudget } from "./perpetual-fees.ts";
 import { quoteCurrencyFx, type PerpetualFxSnapshot } from "./perpetual-fx.ts";
@@ -195,7 +196,7 @@ function collectPerpetualSpreads(snapshot: PerpetualSnapshot, filters: Perpetual
 export function visiblePerpetualSnapshot(snapshot: PerpetualSnapshot | null, blockedBases: ReadonlySet<string> | null): PerpetualSnapshot | null {
   if (!snapshot || !blockedBases) return null;
   if (!blockedBases.size) return snapshot;
-  const quotes = snapshot.quotes.filter(quote => !blockedBases.has(quote.base));
+  const quotes = snapshot.quotes.filter(quote => !isBaseBlocked(blockedBases, quote.base));
   return quotes.length === snapshot.quotes.length ? snapshot : { ...snapshot, quotes };
 }
 

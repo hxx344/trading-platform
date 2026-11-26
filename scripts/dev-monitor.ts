@@ -38,6 +38,10 @@ const alertHooks = {
   },
   delivery: (ids: readonly number[]) => new Map(ids.flatMap(id => { const item = outbox[id - 1]; return item ? [[id, { sentAt: Date.now() - item.at >= 2_000 ? item.at + 2_000 : null, attempts: 0, lastError: null, nextAt: item.at }] as const] : []; })),
   robot: () => 'feishuMonitor' as const,
+  sendOpportunity: async (text: string, beforeSend: () => void) => {
+    beforeSend();
+    process.stdout.write(`[替身飞书·渠道确认] ${text}\n`);
+  },
   test: async (text: string) => { process.stdout.write(`[替身飞书·测试] ${text}\n`); },
 };
 const monitor = openMonitor(parseMonitorConfig({ anthropic: {}, oil: {}, goldoil: {}, hynix: {}, perpetual: {} }), dir, { fetchImpl: venues.fetch, WebSocketImpl: venues.WebSocket, variationalFetch: venues.variationalFetch, alertHooks, perpetualOptions: fakePerpetualVenues(), chainArbFetch: chainArbFixture(), gateLedger: testGateLedger() });

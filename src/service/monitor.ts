@@ -10,6 +10,7 @@ import { withChainArbLedger } from './chain-arb-ledger.ts';
 import { ContractError } from '../contracts.ts';
 import { createRemoteMonitor } from './remote-monitor.ts';
 import { perpetualQualityEnv } from '../monitor/quality-config.ts';
+import { openPerpetualAlertStore, PERPETUAL_ALERT_IMPORT, type PerpetualAlertStore } from '../vendor/perpetual-alert-store.mjs';
 import { join } from 'node:path';
 import { ALERT_CHECK_MS, createAlertService, createTestGate, type AlertHooks, type AlertMarket, type AlertService } from '../monitor/alerts.ts';
 import { createAnthropicMonitor, type AnthropicMonitor, type LoopContext } from '../monitor/anthropic.ts';
@@ -21,6 +22,7 @@ import { createGoldOilMonitor, type GoldOilMonitor } from '../monitor/goldoil.ts
 import { createPerpetualMonitor, type PerpetualMonitor, type PerpetualOptions } from '../monitor/perpetual.ts';
 import { createMonitorControl, type MonitorControl } from '../monitor/control.ts';
 import { PERPETUAL_CACHE_FILE, openPerpetualCache, type PerpetualCache } from '../monitor/perpetual-cache.ts';
+import { openCrossExSettingsStore } from '../monitor/perpetual-crossex-store.ts';
 import { PERPETUAL_PAPER_FILE, openPerpetualPaperStore, perpetualPaperAdoptionLine, type PerpetualPaperFileStore } from '../monitor/perpetual-paper-store.ts';
 import { MONITOR_FILE, createMonitorStore, type MonitorStore } from '../monitor/store.ts';
 import { createVariationalSession, type VariationalSession } from '../monitor/variational-session.ts';
@@ -97,8 +99,21 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
     let perpetualCache: PerpetualCache | null = null;
     // M-5e1: paper-position records that cannot be read cost only the position tracking (the page shows the reason); the
     // file is left as it is for the operator to repair or restore.
+    let opportunityStore: PerpetualAlertStore | undefined, opportunityUnavailable = '';
     let paperStore: PerpetualPaperFileStore | undefined, paperUnavailable = '';
+    let crossEx: PerpetualOptions['crossEx'];
     if (config.perpetual) {
+      const writeLog = log ?? (line => process.stderr.write(line + '\n'));
+      try { crossEx = { store: openCrossExSettingsStore(dir, writeLog) }; }
+      catch (error) {
+        crossEx = { unavailableReason: '无法读取 CrossEx 筛选设置，修复后重启服务' };
+        writeLog('合约价差：' + crossEx.unavailableReason + '：' + (error instanceof Error ? error.message : String(error)));
+      }
+      try { opportunityStore = openPerpetualAlertStore(join(dir, 'perpetual'), join(dir, PERPETUAL_ALERT_IMPORT)); }
+      catch (error) {
+        opportunityUnavailable = error instanceof Error ? error.message : '机会提醒文件无法读取';
+        (log ?? (line => process.stderr.write(`${line}\n`)))(opportunityUnavailable);
+      }
       try { perpetualCache = openPerpetualCache(join(dir, PERPETUAL_CACHE_FILE)); }
       catch (error) { (log ?? (line => process.stderr.write(`${line}\n`)))(`合约价差缓存 ${PERPETUAL_CACHE_FILE} 打不开，市场指标、历史资金费、成交价历史与质量样本只存内存：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`); }
       // M-5e2: the open merges a pending workbench import (or sets it aside); the log says which.
@@ -115,7 +130,10 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
     try {
       const perpetual = config.perpetual ? createPerpetualMonitor({ ...(fetchImpl ? { fetchImpl } : {}), ...(now ? { now } : {}), ...(log ? { log } : {}), cache: perpetualCache,
         ...(perpetualCache ? {} : { cacheUnavailable: `缓存库 ${PERPETUAL_CACHE_FILE} 打不开，市场指标、历史资金费、成交价历史与质量样本只存内存，重启后重新采集。` }),
-        paper: { store: paperStore, unavailableReason: paperUnavailable }, ...perpetualOptions, ...(remote ? { remote: remote.perpetual } : {}),
+        alerts: { store: opportunityStore, unavailableReason: opportunityUnavailable, notifications: alertHooks?.sendOpportunity ? {
+          configured: () => Boolean(alertHooks.robot()), send: alertHooks.sendOpportunity,
+        } : undefined },
+        paper: { store: paperStore, unavailableReason: paperUnavailable }, ...perpetualOptions, crossEx: { ...crossEx, ...perpetualOptions?.crossEx }, ...(remote ? { remote: remote.perpetual } : {}),
         quality: { ...perpetualQualityEnv(env, log ?? (line => process.stderr.write(`${line}\n`))), ...perpetualOptions?.quality } }) : null;
       const localChain = config.perpetual && !remote ? createChainArbMarket({ now, fetchImpl: chainArbFetch ?? fetchImpl }) : undefined;
       const source = remote ?? localChain;

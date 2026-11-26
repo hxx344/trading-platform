@@ -14,6 +14,7 @@ import { variationalRequestError, type VariationalPublicFunding } from '../vendo
 import { createPerpetualEstimates } from '../vendor/perpetual-estimates.mjs';
 import { perpetualPriceIdentity, type PerpetualQuote } from '../vendor/perpetual-stream.mjs';
 import type { PerpetualExecutionService } from '../vendor/perpetual-depth.mjs';
+import type { SpotAsset, SpotTransferReader } from '../vendor/perpetual-spot-transfer.mjs';
 import type { FundamentalsClient } from '../vendor/perpetual-fundamentals.mjs';
 import { collectBitgetPages } from '../vendor/perpetual-funding-pages.ts';
 import type { PerpetualFundingReader } from '../vendor/perpetual-funding-reader.mjs';
@@ -30,6 +31,7 @@ export interface RemoteComparison {
   variationalFunding(signal: AbortSignal): Promise<VariationalPublicFunding>;
 }
 export interface RemotePerpetual {
+  spotTransfer: SpotTransferReader;
   subscribe: SubscribeFeed;
   epoch(): string | null;
   execution: (getQuote: (exchange: string, symbol: string) => PerpetualQuote | undefined) => Pick<PerpetualExecutionService, 'depth' | 'exit' | 'fx' | 'stop'>;
@@ -96,6 +98,13 @@ export function createRemoteMonitor(client: MarketClient, clock: () => number = 
   });
   const assets = new Map<string, FundamentalRow>();
   const perpetual: RemotePerpetual = {
+    async spotTransfer(exchange, signal) {
+      const epoch = client.epoch();
+      if (!epoch) throw new Error('行情服务未连接');
+      const result = await read<{ at: number; assets: SpotAsset[] }>('perpetual.spotTransfer', { exchange }, signal);
+      if (client.epoch() !== epoch) throw new Error('行情服务连接已更新');
+      return { at: result.at, assets: new Map(result.assets.map(asset => [asset.base, asset])) };
+    },
     epoch: () => client.epoch(),
     subscribe: (receive, down) => client.stream('monitor.perpetual.quotes', null, {
       data: value => receive(value as FeedEvent),

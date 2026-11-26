@@ -15,6 +15,7 @@ import { ANTHROPIC_LEG_KEYS, createBinanceGate, validateAnthropicQuote, type Ant
 import { supportsExchange, type Exchange } from '../vendor/exchange-comparison.mjs';
 import { validateHynixQuote } from '../vendor/hynix-market.mjs';
 import { createPerpetualExecutionService } from '../vendor/perpetual-depth.mjs';
+import { createSpotTransferReader } from '../vendor/perpetual-spot-transfer.mjs';
 import { createPerpetualFundingReader } from '../vendor/perpetual-funding-reader.mjs';
 import { createPerpetualMetricsReader } from '../vendor/perpetual-metrics-reader.mjs';
 import { perpetualMetricsIdentity } from '../vendor/perpetual-market-metrics-service.mjs';
@@ -52,6 +53,7 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
   const exchanges = createExchangeReader({ ...common, log, gate, shared, oilQuote: () => null, hynixQuote: () => null, ...(WebSocketImpl ? { WebSocketImpl } : {}) });
   const source = (fetcher = fetchImpl) => ({ clock: now, ...(fetcher ? { fetchImpl: fetcher } : {}) });
   const metric = createPerpetualMetricsReader(source(options.metrics?.fetchImpl));
+  const spotTransfer = options.crossEx?.read ?? createSpotTransferReader(source());
   const funding = createPerpetualFundingReader({ ...source(options.fundingHistory?.fetchImpl), requestSpacingMs: 350 });
   const price = createPerpetualPriceReader({ ...source(options.priceHistory?.fetchImpl), requestSpacingMs: 350 });
   const aux = options.quality;
@@ -142,6 +144,12 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
         const saved = p.hynix == null ? null : fields(p.hynix, ['source', 'fetchedAt', 'adr', 'ordinary', 'equivalent', 'spread', 'premium', 'status', 'staleAfterMs', 'lastAttemptAt', 'lastError']);
         const quote = saved ? { ...validateHynixQuote(saved), status: saved.status === 'live' ? 'live' as const : 'snapshot' as const } : null;
         return exchanges.quote(p.market, exchange, quote);
+      }
+      case 'monitor.perpetual.spotTransfer': {
+        const { exchange } = fields(input, ['exchange']);
+        if (exchange !== 'binance' && exchange !== 'gate') throw new Error('不支持的公开充提数据来源');
+        const { at, assets } = await spotTransfer(exchange, signal);
+        return { at, assets: [...assets.values()] };
       }
       case 'monitor.perpetual.fx':
       case 'monitor.perpetual.books': {

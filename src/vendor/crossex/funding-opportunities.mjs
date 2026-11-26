@@ -18,7 +18,7 @@ function fundingLeg(quote, rule, now) {
 }
 
 /** Pure discovery from complete Monitor quotes; never fetches data or authorizes an order. */
-export function fundingOpportunities(feed, { now, ruleFor, sourceReason = '', entryPaused = false, entryPolicyKnown = false, catalogExpiresAt = Infinity,
+export function fundingOpportunities(feed, { now, ruleFor, sourceReason = '', entryPaused = false, entryPolicyKnown = false, currentFilter, catalogExpiresAt = Infinity,
   signals = feed?.signals || [], signalValid = signal => validSignal(signal, feed, now) } = {}) {
   if (!feed) return [];
   const groups = new Map(), liveVenues = new Set(feed.exchanges.filter(venue => venue.status === 'live').map(venue => venue.id));
@@ -26,7 +26,7 @@ export function fundingOpportunities(feed, { now, ruleFor, sourceReason = '', en
   const evidence = new Map();
   // A transfer certificate covers both directions, but only these exact current
   // contract identities. A positive-price signal is never required for discovery.
-  if (policy?.requireSpotTransfer === true) for (const signal of signals) {
+  if (currentFilter === undefined && policy?.requireSpotTransfer === true) for (const signal of signals) {
     if (!signalValid(signal)) continue;
     const transfer = transferEligibility(signal, feed, now);
     if (transfer.state !== 'verified') continue;
@@ -34,6 +34,10 @@ export function fundingOpportunities(feed, { now, ruleFor, sourceReason = '', en
     const expiresAt = Math.min(signal.expiresAt, transfer.expiresAt);
     evidence.set(key, Math.max(evidence.get(key) ?? 0, expiresAt));
   }
+  // The local collector supplies current spot-market and deposit/withdrawal evidence
+  // for every exact funding pair. Older standalone feeds supply certificates on price signals only.
+  const policyChanged = currentFilter !== undefined && (!currentFilter || currentFilter.revision !== policy?.revision
+    || currentFilter.requireSpotTransfer !== policy?.requireSpotTransfer);
   for (const quote of feed.quotes) {
     // Unknown intervals must not be silently treated as eight-hour contracts.
     if (!finite(quote.fundingRate) || !finite(quote.fundingIntervalHours) || quote.fundingIntervalHours <= 0 || quote.fundingIntervalHours > 168
@@ -56,7 +60,7 @@ export function fundingOpportunities(feed, { now, ruleFor, sourceReason = '', en
     const equivalent8hBps = D(short.leg.normalized8hBps).minus(long.leg.normalized8hBps).toNumber();
     if (!finite(equivalent8hBps) || equivalent8hBps <= 0) continue;
     const legs = [long.quote, short.quote], fundingTimes = legs.map(q => q.fundingAt), quoteTimes = legs.map(quoteTime);
-    let reason = sourceReason, grossBps = null;
+    let reason = sourceReason || (policyChanged ? 'Monitor 资格设置已变化或不可用，等待来源刷新' : ''), grossBps = null;
     const deadlines = [catalogExpiresAt, feed.generatedAt + QUOTE_TTL_MS, ...fundingTimes.map(at => at + FUNDING_TTL_MS),
       ...quoteTimes.map(at => finite(at) && at > 0 ? at + QUOTE_TTL_MS : now)];
     if (!reason && entryPolicyKnown && policy === undefined) reason = 'Monitor 筛选策略缺失，请等待来源恢复';
@@ -77,7 +81,10 @@ export function fundingOpportunities(feed, { now, ruleFor, sourceReason = '', en
     } catch (error) { reason ||= error.message; }
     const policyEligibility = transferEligibility({ base }, feed, now);
     if (policy?.requireSpotTransfer === true) {
-      const expiresAt = evidence.get(identityPair(long.identity, short.identity));
+      const local = currentFilter && !policyChanged ? currentFilter.evaluate(long.quote, short.quote, now) : null;
+      const transfer = local && transferEligibility({ base, spotTransfer: local, expiresAt: now }, feed, now);
+      const expiresAt = currentFilter === undefined ? evidence.get(identityPair(long.identity, short.identity))
+        : transfer?.state === 'verified' ? transfer.expiresAt : null;
       if (expiresAt) deadlines.push(expiresAt);
       else reason ||= policyEligibility.reason || '双边现货与充提证据缺失或已过期';
     } else if (policyEligibility.state === 'blocked') reason ||= policyEligibility.reason;

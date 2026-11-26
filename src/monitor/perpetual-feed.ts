@@ -2,6 +2,7 @@
 // Subscribers receive a baseline and bounded incremental batches. Receipt in another process never timestamps a book.
 import { EXCHANGES, createSubscriptions, discoverMarkets, getControlResponse, parseMessage, type PerpetualRequestOptions, type PerpetualSpec, type PerpetualVenue } from '../vendor/perpetual-exchanges.mjs';
 import { MAX_FUTURE_MS, mergePerpetualQuote, withMarketMetadata, type PerpetualExchange, type PerpetualMarket, type PerpetualQuote, type PerpetualUpdate } from '../vendor/perpetual-stream.mjs';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { anySignal } from '../any-signal.mjs';
 
 export const PERPETUAL_DISCOVERY_MS = 300_000;
@@ -21,6 +22,7 @@ export type PerpetualSocketFactory = new (url: string, options?: { headers?: Rec
 
 interface VenueState {
   id: string; name: string; kind: PerpetualExchange['kind']; marketCount: number; lastMessageAt: number | null; error: string | null; snapshotError: string | null;
+  sourceLagMs: number | null; sourceLagObservedAt: number | null; rejectedFuture: number;
   discovering: boolean; retryPending: boolean; discoveryFailing: boolean; markets?: Map<string, PerpetualMarket>; signature?: string; generation: number; reconnects: number; lastProtocolError: string | null;
 }
 interface BookSide { connection: Connection; at: number; source: number | null }
@@ -44,12 +46,14 @@ export interface PerpetualFeedOptions {
 export interface FeedVenue {
   id: string; name: string; kind: PerpetualExchange['kind']; marketCount: number; lastMessageAt: number | null;
   error: string | null; reconnects: number; lastProtocolError: string | null; online: boolean;
+  sourceLagMs?: number | null; sourceLagObservedAt?: number | null; rejectedFuture?: number;
 }
+export interface FeedHealth { sampledAt: number; cpuPercent: number; eventLoopP99Ms: number; messagesPerSecond: number; rssMb: number }
 export type FeedEvent =
   | { type: 'reset' }
   | { type: 'catalog'; exchange: string; first: boolean; last: boolean; markets: PerpetualMarket[] }
   | { type: 'quotes'; quotes: PerpetualQuote[]; removed: string[]; bookTimes: ([number, number] | null)[] }
-  | { type: 'venues'; venues: FeedVenue[]; connections: number };
+  | { type: 'venues'; venues: FeedVenue[]; connections: number; health?: FeedHealth };
 export type SubscribeFeed = (receive: (event: FeedEvent) => void, down: () => void) => () => void;
 
 const BATCH_SIZE = 256;
@@ -66,17 +70,28 @@ export function createPerpetualFeed({
   const sides = new Map<string, { bid?: BookSide; ask?: BookSide }>();
   const connections = new Set<Connection>(), timers = new Set<ReturnType<typeof setTimeout>>(), pollBudgets = new Map<string, PollBudget>();
   const discoveries = new Map<string, { controller: AbortController; promise: Promise<void> }>();
-  const fresh = (): Map<string, VenueState> => new Map(exchanges.map(exchange => [exchange.id, { id: exchange.id, name: exchange.name, kind: exchange.kind, marketCount: 0, lastMessageAt: null, error: null, snapshotError: null, discovering: false, retryPending: false, discoveryFailing: false, generation: 0, reconnects: 0, lastProtocolError: null }]));
+  const fresh = (): Map<string, VenueState> => new Map(exchanges.map(exchange => [exchange.id, { id: exchange.id, name: exchange.name, kind: exchange.kind, marketCount: 0, lastMessageAt: null, error: null, snapshotError: null, sourceLagMs: null, sourceLagObservedAt: null, rejectedFuture: 0, discovering: false, retryPending: false, discoveryFailing: false, generation: 0, reconnects: 0, lastProtocolError: null }]));
   let states = fresh();
   let running = false;
   let observationTimer: ReturnType<typeof setInterval> | undefined, refreshTimer: ReturnType<typeof setInterval> | undefined;
 
+  const delay = monitorEventLoopDelay({ resolution: 20 });
+  let sampledAt = performance.now(), cpu = process.cpuUsage(), messages = 0, health: FeedHealth | undefined;
+  function sampleHealth(): void {
+    const at = performance.now(), elapsed = at - sampledAt;
+    if (!running || elapsed < 5000) return;
+    const usage = process.cpuUsage(cpu);
+    health = { sampledAt: clock(), cpuPercent: (usage.user + usage.system) / (elapsed * 10),
+      eventLoopP99Ms: delay.percentile(99) / 1e6, messagesPerSecond: Math.round(messages * 1000 / elapsed), rssMb: process.memoryUsage.rss() / 1048576 };
+    sampledAt = at; cpu = process.cpuUsage(); messages = 0; delay.reset();
+  }
   function publish(event: FeedEvent): void { for (const listener of listeners) listener(event); }
   function publishVenues(emit: (event: FeedEvent) => void = publish): void {
     const online = new Set([...connections].filter(connection => connection.socket?.readyState === 1).map(connection => connection.exchange));
-    emit({ type: 'venues', connections: connections.size, venues: [...states.values()].map(state => ({
+    sampleHealth();
+    emit({ type: 'venues', ...(health ? { health } : {}), connections: connections.size, venues: [...states.values()].map(state => ({
       id: state.id, name: state.name, kind: state.kind, marketCount: state.marketCount, lastMessageAt: state.lastMessageAt,
-      error: state.error || state.snapshotError || null, reconnects: state.reconnects, lastProtocolError: state.lastProtocolError, online: online.has(state.id),
+      error: state.error || state.snapshotError || null, reconnects: state.reconnects, sourceLagMs: state.sourceLagMs, sourceLagObservedAt: state.sourceLagObservedAt, rejectedFuture: state.rejectedFuture, lastProtocolError: state.lastProtocolError, online: online.has(state.id),
     })) });
   }
   function publishMarkets(exchange: string, values: PerpetualMarket[], emit: (event: FeedEvent) => void): void {
@@ -149,7 +164,10 @@ export function createPerpetualFeed({
     const acceptUpdates = (updates: PerpetualUpdate[], now: number, transport: 'ws' | 'rest' = 'ws') => {
       for (const update of updates) {
         if (update.exchange !== exchange) continue;
-        if (Number.isFinite(update.sourceTime) && now - update.sourceTime! < -MAX_FUTURE_MS) state.error = '行情时间领先服务器，请检查服务器时钟。';
+        if (Number.isFinite(update.sourceTime)) {
+          state.sourceLagMs = now - update.sourceTime!; state.sourceLagObservedAt = now;
+          if (state.sourceLagMs < -MAX_FUTURE_MS) { state.rejectedFuture++; state.error = '行情时间领先服务器，请检查服务器时钟。'; }
+        }
         const key = `${exchange}:${update.symbol}`, previous = pendingQuotes.get(key) ?? quotes.get(key);
         const next = mergePerpetualQuote(previous, transport === 'rest' ? { ...update, transport } : update, now);
         if (next && next !== previous) {
@@ -227,7 +245,7 @@ export function createPerpetualFeed({
       });
       socket.addEventListener('message', event => {
         if (connection.closed || !running) return;
-        const now = clock(); connection.lastMessageAt = now;
+        const now = clock(); messages++; connection.lastMessageAt = now;
         let payload: unknown;
         try { payload = JSON.parse(typeof event.data === 'string' ? event.data : Buffer.from(event.data as ArrayBuffer).toString()); }
         catch { payload = event.data; }
@@ -313,7 +331,7 @@ export function createPerpetualFeed({
   }
 
   function stop(): void {
-    running = false;
+    running = false; delay.disable(); health = undefined;
     clearInterval(observationTimer); clearInterval(refreshTimer);
     for (const timer of timers) clearTimeout(timer);
     timers.clear();
@@ -335,7 +353,7 @@ export function createPerpetualFeed({
       publishQuotes(quotes.keys(), emit);
       publishVenues(emit);
       if (!running) {
-        running = true;
+        running = true; cpu = process.cpuUsage(); sampledAt = performance.now(); messages = 0; delay.reset(); delay.enable();
         if (observationIntervalMs > 0) { observationTimer = setInterval(observe, observationIntervalMs); observationTimer.unref?.(); }
         for (const id of states.keys()) void refresh(id);
         refreshTimer = setInterval(() => { for (const id of states.keys()) void refresh(id); }, discoveryIntervalMs);

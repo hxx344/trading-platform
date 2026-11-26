@@ -289,6 +289,15 @@ td button{font-size:11px;padding:6px 9px}
 .hedge-ticket .section-heading{padding:17px 14px;min-height:65px}
 .hedge-ticket form{gap:23px}
 .hedge-ticket .ticket-details{gap:18px}
+.opportunity-switch{display:flex;gap:6px;margin-top:10px}
+.opportunity-switch button{font-size:11px;padding:6px 11px}
+.opportunity-switch button[aria-pressed=true]{color:var(--green);border-color:var(--emerald-border);background:var(--emerald-soft)}
+.funding-rate{display:flex;flex-direction:column;gap:3px;margin:5px 0 9px}
+.funding-rate strong{color:var(--text-primary);font-weight:500}
+.funding-table td{vertical-align:top}
+.funding-table td small{white-space:normal}
+.funding-table th{white-space:nowrap}
+.funding-table td:nth-child(7){max-width:220px}
 .opportunities-panel{margin-top:23px}
 .settings-layout{display:grid;grid-template-columns:minmax(300px,.8fr) minmax(0,1.2fr);gap:20px;align-items:start}
 .settings-layout>form{min-width:0;display:grid;gap:18px}

@@ -31,6 +31,7 @@
 // An existing config.json is extended: its pairs, accounts and robot stay as they are, and only pairs it does not have
 // yet are added; an oil venue it already names keeps its settings. Output names pairs, account names and masked account
 // ids only; keys, ciphertext and webhooks never appear in it.
+import { inspectPerpetualImport, stagePerpetualImport } from './import-perpetual-settings.ts';
 import { spawnSync } from 'node:child_process';
 import { createDecipheriv } from 'node:crypto';
 import { closeSync, existsSync, fchownSync, fsyncSync, linkSync, lstatSync, openSync, readFileSync, renameSync, rmSync, statSync, writeSync } from 'node:fs';
@@ -705,12 +706,13 @@ export function variationalInput(source: MonitorVariationalSource, dataDir: stri
 async function main(): Promise<void> {
   const { values } = parseArgs({ options: {
     config: { type: 'string' }, 'workbench-env': { type: 'string' }, 'workbench-data': { type: 'string' }, pairs: { type: 'string' }, oil: { type: 'boolean' }, options: { type: 'boolean' },
-    monitor: { type: 'boolean' }, 'monitor-alerts': { type: 'boolean' }, 'monitor-variational': { type: 'boolean' }, 'monitor-paper': { type: 'boolean' }, asset: { type: 'boolean' }, 'asset-owner': { type: 'string' }, 'data-dir': { type: 'string' }, 'dry-run': { type: 'boolean' },
+    monitor: { type: 'boolean' }, 'monitor-alerts': { type: 'boolean' }, 'monitor-variational': { type: 'boolean' }, 'monitor-settings': { type: 'boolean' }, 'monitor-paper': { type: 'boolean' }, asset: { type: 'boolean' }, 'asset-owner': { type: 'string' }, 'data-dir': { type: 'string' }, 'dry-run': { type: 'boolean' },
     crossex: { type: 'boolean' }, ondo: { type: 'boolean' },
   } });
   // --monitor-alerts brings the monitor along: the tiers only run with it.
   const withAlerts = values['monitor-alerts'] === true, withVariational = values['monitor-variational'] === true, withPaper = values['monitor-paper'] === true;
-  const withOil = values.oil === true, withOptions = values.options === true, withMonitor = values.monitor === true || withAlerts || withVariational || withPaper, withAsset = values.asset === true;
+  const withSettings = values['monitor-settings'] === true;
+  const withOil = values.oil === true, withOptions = values.options === true, withMonitor = values.monitor === true || withAlerts || withVariational || withPaper || withSettings, withAsset = values.asset === true;
   const withCrossex = values.crossex === true, withOndo = values.ondo === true;
   const modules = withOil || withOptions || withMonitor || withAsset || withCrossex || withOndo;
   const assetOwner = values['asset-owner'], dataDir = values['data-dir'];
@@ -719,6 +721,7 @@ async function main(): Promise<void> {
   if (withAsset && (dataDir === undefined || !isAbsolute(dataDir))) throw new Error('--asset 需要 --data-dir <本服务数据目录的绝对路径>');
   if (withAlerts && (dataDir === undefined || !isAbsolute(dataDir))) throw new Error('--monitor-alerts 需要 --data-dir <本服务数据目录的绝对路径>');
   if (withVariational && (dataDir === undefined || !isAbsolute(dataDir))) throw new Error('--monitor-variational 需要 --data-dir <本服务数据目录的绝对路径>');
+  if (withSettings && (!dataDir || !isAbsolute(dataDir))) throw new Error('--monitor-settings 需要 --data-dir 指定本服务数据目录');
   if (withPaper && (dataDir === undefined || !isAbsolute(dataDir))) throw new Error('--monitor-paper 需要 --data-dir <本服务数据目录的绝对路径>');
   if (withCrossex && (dataDir === undefined || !isAbsolute(dataDir))) throw new Error('--crossex 需要 --data-dir <本服务数据目录的绝对路径>');
   // --oil / --options / --monitor / --asset alone bring their part only; pairs come along when named.
@@ -730,6 +733,7 @@ async function main(): Promise<void> {
   const monitorSource = withMonitor ? readWorkbenchMonitor(source.data) : undefined;
   const alertsSource = withAlerts ? readWorkbenchAlerts(source.data) : undefined;
   const variationalSource = withVariational ? variationalInput(readWorkbenchVariational(source.data), dataDir!) : undefined;
+  const settings = withSettings ? inspectPerpetualImport(source.data, dataDir!) : undefined;
   const paperSource = withPaper ? paperInput(readWorkbenchPaper(source.data), dataDir!) : undefined;
   const assetSource = withAsset ? readWorkbenchAsset(source.data, dataDir!, assetOwner === undefined ? {} : { owner: assetOwner }) : undefined;
   const crossexSource = withCrossex ? readWorkbenchCrossex(source.data) : undefined;
@@ -756,6 +760,7 @@ async function main(): Promise<void> {
     if (plan.monitorAlerts.robot.problem && !plan.monitorAlerts.robot.imported) out(`  机器人未导入：${plan.monitorAlerts.robot.problem}`);
   }
   if (plan.monitorVariational) out(plan.monitorVariational.status === 'added' ? plan.monitorVariational.detail : `跳过 Var token：${plan.monitorVariational.detail}`);
+  if (settings) for (const detail of settings.preview.details) out('合约价差设置：' + detail);
   if (plan.monitorPaper) out(plan.monitorPaper.status === 'added' ? plan.monitorPaper.detail : `跳过持仓记录：${plan.monitorPaper.detail}`);
   if (plan.asset) {
     out(plan.asset.status === 'added' ? `导入资产账本 ${plan.asset.detail}` : `跳过资产账本：${plan.asset.detail}`);
@@ -768,7 +773,7 @@ async function main(): Promise<void> {
   const oilAdded = plan.oil.filter(item => item.status === 'added').length, optionsAdded = plan.options?.status === 'added';
   const monitorAdded = plan.monitor?.status === 'added', assetAdded = plan.asset?.status === 'added', alertsAdded = plan.monitorAlerts?.status === 'added', variationalAdded = plan.monitorVariational?.status === 'added', crossexAdded = plan.crossex?.status === 'added';
   const paperAdded = plan.monitorPaper?.status === 'added', ondoAdded = plan.ondo?.status === 'added';
-  if (plan.added.length === 0 && oilAdded === 0 && !optionsAdded && !monitorAdded && !assetAdded && !alertsAdded && !variationalAdded && !paperAdded && !crossexAdded && !ondoAdded) {
+  if (plan.added.length === 0 && oilAdded === 0 && !optionsAdded && !monitorAdded && !assetAdded && !alertsAdded && !variationalAdded && !paperAdded && !crossexAdded && !ondoAdded && !settings?.preview.available) {
     const what = only?.length || !modules ? '配对' : [withOil ? '原油执行账户' : '', withOptions ? '期权账户' : '', withMonitor ? `行情监控${[withAlerts ? '告警' : '', withVariational ? 'Var token' : '', withPaper ? '持仓记录' : ''].filter(Boolean).map(part => `与${part}`).join('')}` : '', withAsset ? '资产账本' : '', withCrossex ? 'CrossEx 账户' : '', withOndo ? 'Ondo 挂单奖励' : ''].filter(Boolean).join('或');
     if (!existing) throw new Error(only?.length || !modules ? '工作台里没有可导入的配对（需开启保证金平衡、配好主账户凭据前缀且凭据齐全），未生成配置' : `工作台里没有可导入的${what}，未生成配置`);
     out(`没有新的${what}，配置未改动`);
@@ -796,6 +801,7 @@ async function main(): Promise<void> {
   }
   // The CrossEx page settings last, also before the files; an existing crossex.sqlite keeps its own.
   if (plan.crossexSettings) out(writeCrossexSettingsAsService(dataDir!, plan.crossexSettings) ? `已把工作台 CrossEx 页面设置写入 ${join(dataDir!, 'crossex.sqlite')}` : '本服务的 crossex.sqlite 已有页面设置，保留不变');
+  if (settings?.preview.available) for (const detail of stagePerpetualImport(dataDir!, settings.states)) out(detail);
   if (filesUnchanged(plan, existing)) {
     out(plan.ledger ? '配置未改动（资产账本已启用，只重新导入了账本；服务无需重启，页面下次读取即是新账本）' : '配置未改动，服务无需重启');
     return;

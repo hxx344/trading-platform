@@ -12,7 +12,7 @@ import type { AddressInfo } from 'node:net';
 import { createExecutorServer, type ServiceViews } from '../src/http.ts';
 import { KEY_MARKER, SECRET_MARKER, openCrossexStore } from '../src/crossex/store.ts';
 import { crossexSummary, limitProblem, parseCrossexConfig, parseCrossexSecrets } from '../src/service/crossex-config.ts';
-import { START_REASONS, closeCrossex, createCrossexSupervisor, createReadFailureWatch, crossexFailure, crossexSummaryLine, crossexViews, executionAlerts, preflightCrossex, prepareCrossex, type CrossexOptions, type CrossexRuntime, type CrossexStartError } from '../src/service/crossex.ts';
+import { START_REASONS, closeCrossex, createCrossexSupervisor, createReadFailureWatch, crossexFailure, crossexLoops, crossexSummaryLine, crossexViews, executionAlerts, preflightCrossex, prepareCrossex, type CrossexOptions, type CrossexRuntime, type CrossexStartError } from '../src/service/crossex.ts';
 import { parseServiceConfig, parseServiceSecrets } from '../src/service/config.ts';
 import { LEASE_WARNING, planCrossex, readWorkbenchCrossex, writeCrossexSettingsAsService } from '../src/service/import-crossex.ts';
 import { fileText, planImport } from '../src/service/import-workbench.ts';
@@ -395,6 +395,44 @@ async function runService(data: string, uid: string, apiKey: string, crossexOpti
   try { return { run, get: await serviceLogin(data, port) }; } catch (error) { await run.shutdown(); await run.done; throw error; }
 }
 const linuxOnly = { skip: process.platform !== 'linux' && '服务进程只在 Linux 上运行' };
+
+test('CrossEx 定时从本机机会源读取价差与资金费，停采后旧数据不可用于填入', linuxOnly, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-crossex-opportunities-')), uid = nextUid();
+  let running = true;
+  const opportunityFeed = () => {
+    const now = Date.now();
+    const makeLeg = (exchange: string, fundingRate: number) => ({
+      ...pairQuote(exchange), receivedAt: now, bidAskAt: now, fundingRate, fundingAt: now, fundingIntervalHours: 8,
+      rawBase: 'BTC', settlementCurrency: 'USDT', counterCurrency: 'USDT', contractKind: 'linear',
+      crossexSymbol: `${exchange.toUpperCase()}_FUTURE_BTC_USDT`,
+    });
+    const long = makeLeg('binance', 0.0001), short = makeLeg('bybit', 0.0003);
+    return { schemaVersion: 2, mode: 'paper', source: 'market-monitor', monitorId: 'perpetual', status: running ? 'live' : 'unavailable',
+      generatedAt: now, exchanges: [long, short].map(q => ({ id: q.exchange, status: 'live' })), quotes: [long, short],
+      crossexFilter: { requireSpotTransfer: false, blockedBases: [], revision: 0 },
+      signals: [{ id: 'test-signal', pairKey: JSON.stringify(['BTC', 'binance:BTCUSDT', 'bybit:BTCUSDT']), base: 'BTC',
+        quoteCurrency: 'USDT', long, short, observedAt: now, expiresAt: now + 10000 }] };
+  };
+  const runtime = await started(uid, dir, uid, { marketOptions: PAIR_MARKET, opportunityFeed });
+  try {
+    const round = async () => {
+      let stop = false;
+      await Promise.all(crossexLoops(runtime, { stopped: () => stop, pause: async () => { stop = true; } }, { notifyOnce() {}, log() {} }));
+      return runtime.live.view({ includeOpportunities: true });
+    };
+    const live = await round();
+    assert.equal(live.source.state, 'live');
+    assert.equal(live.opportunities[0].id, 'test-signal');
+    assert.equal(live.opportunities[0].eligible, true);
+    assert.equal(live.fundingOpportunities[0].long.symbol, PAIR.longSymbol);
+    assert.equal(live.fundingOpportunities[0].short.symbol, PAIR.shortSymbol);
+    running = false;
+    const stopped = await round();
+    assert.equal(stopped.source.state, 'offline');
+    assert.equal(stopped.opportunities[0].eligible, false);
+    assert.equal(stopped.fundingOpportunities[0].eligible, false);
+  } finally { await closeCrossex(runtime); rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('服务进程：密钥已更换而本地有结果未知的订单 → 只停 CrossEx，其他照常；接口 503 说明原因，飞书一条', linuxOnly, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tp-crossex-rotate-')), data = join(dir, 'data'), uid = nextUid();

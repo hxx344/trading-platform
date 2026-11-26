@@ -24,17 +24,26 @@
 // M-5e2: records the workbench import left pending (perpetual-paper-positions.import.json) are merged on the broadcast timer
 // while the collector runs, and when it starts: the paper service is stopped (its writes drained), the store merges the file,
 // and the service is built again on the merged records; page writes wait for it. While the collector is off nothing is merged.
-// Left out (later batches, docs/monitor.md M-4/M-5): the saved quotes (market.sqlite), alerts, CrossEx filters.
+// M-5f serves CrossEx signals from this collector. The FX and spot-transfer data come from the market process in production.
 // Quotes live in memory only; a restart or a switch-off starts from empty.
 // Node's own WebSocket is used (it takes request headers); like fetch it goes through Node's global dispatcher, so with
 // NODE_USE_ENV_PROXY=1 and HTTPS_PROXY (README) both the directory reads and the sockets use the proxy.
+import { createPerpetualAlertService, type OpportunityNotifications } from '../vendor/perpetual-alert-service.mjs';
+import type { PerpetualAlertStore } from '../vendor/perpetual-alert-store.mjs';
 import { randomUUID } from 'node:crypto';
+import { isBaseBlocked } from '../vendor/asset-identity.mjs';
+import { createCrossExFilterService, type CrossExFilterOptions } from '../vendor/perpetual-crossex-service.mjs';
+import { createSpotTransferReader } from '../vendor/perpetual-spot-transfer.mjs';
+import { createPerpetualOpportunities } from '../vendor/perpetual-opportunities.mjs';
+import { createOpportunitiesV2Reader } from '../vendor/perpetual-opportunities-v2.mjs';
+import type { PerpetualOpportunities, PerpetualOpportunitiesV2 } from '../vendor/perpetual-opportunities.ts';
+import type { PerpetualFxSnapshot } from '../vendor/perpetual-fx.ts';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { constants as zlibConstants, createGzip, type Gzip } from 'node:zlib';
 import type { RemotePerpetual } from '../service/remote-monitor.ts';
-import { STREAM_OBSERVATION_MS } from '../vendor/perpetual-collection-policy.mjs';
+import { STREAM_OBSERVATION_MS, MARKET_CATALOG_MS, MARKET_METRICS_POLL_MS, AUXILIARY_BOOK_POLL_MS } from '../vendor/perpetual-collection-policy.mjs';
 import { EXCHANGES } from '../vendor/perpetual-venues.mjs';
-import { createPerpetualFeed, type FeedEvent, type FeedVenue, type PerpetualFeedOptions } from './perpetual-feed.ts';
+import { createPerpetualFeed, type FeedEvent, type FeedHealth, type FeedVenue, type PerpetualFeedOptions } from './perpetual-feed.ts';
 export { PERPETUAL_DISCOVERY_MS, PERPETUAL_OBSERVATION_MS, type PerpetualSocketFactory } from './perpetual-feed.ts';
 import { createPerpetualExecutionService, type PerpetualExecutionOptions, type PerpetualExecutionService } from '../vendor/perpetual-depth.mjs';
 import { createPerpetualMarketMetricsService, type PerpetualContractMetricsStore } from '../vendor/perpetual-market-metrics-service.mjs';
@@ -73,8 +82,11 @@ export interface PerpetualStatusView {
 }
 
 export interface PerpetualOptions extends PerpetualFeedOptions {
+  crossEx?: CrossExFilterOptions;
+  fxRefreshMs?: number;
   /** IPC substitutes the complete venue collector and public data readers in the execution service. */
   remote?: RemotePerpetual;
+  alerts?: { store?: PerpetualAlertStore; notifications?: OpportunityNotifications; unavailableReason?: string };
   /** The depth / exit / FX reads' venues (tests and the local preview stand in for them). */
   execution?: Pick<PerpetualExecutionOptions, 'fetchImpl' | 'WebSocketImpl' | 'maxMarkets' | 'cacheMs'>;
   /** M-5b1: the market-metrics reads' venues (tests and the local preview stand in for them) and the scheduler tick. */
@@ -129,6 +141,12 @@ export function createPerpetualMonitor(options: PerpetualOptions = {}) {
     paper: paperOptions, remote,
   } = options;
   const feed = remote ? null : createPerpetualFeed(options);
+  const crossEx = createCrossExFilterService({ clock, read: remote?.spotTransfer ?? createSpotTransferReader({ clock, fetchImpl }), ...options.crossEx });
+  const readV2 = createOpportunitiesV2Reader();
+  const fxRefreshMs = options.fxRefreshMs ?? (remote || exchanges === EXCHANGES ? 60_000 : 0);
+  let sourceRevision = 0, fxGeneration = 0;
+  let fxSnapshot: PerpetualFxSnapshot | null = null, fxTimer: ReturnType<typeof setInterval> | undefined;
+  let fxRequest: Promise<PerpetualFxSnapshot> | null = null;
   const quotes = new Map<string, PerpetualQuote>(), publishedQuotes = new Map<string, PerpetualQuote>(), publishDirty = new Set<string>();
   const clients = new Map<ServerResponse, { output: ServerResponse | Gzip; needsSnapshot: boolean }>();
   const fresh = () => new Map<string, FeedVenue>(exchanges.map(({ id, name, kind }) => [id, { id, name, kind, marketCount: 0, lastMessageAt: null, error: null, reconnects: 0, lastProtocolError: null, online: false }]));
@@ -140,10 +158,17 @@ export function createPerpetualMonitor(options: PerpetualOptions = {}) {
   const getMarket = (exchange: string, symbol: string) => catalogs.get(exchange)?.get(symbol);
   const connected = () => new Set([...states.values()].filter(state => state.online).map(state => state.id));
   const venueLive = (id: string) => feed ? feed.online(id) : !!feedEpoch && remote?.epoch() === feedEpoch && states.get(id)?.online === true;
+  let feedHealth: FeedHealth | undefined, lastPublishMs: number | null = null, visitedQuotes: number | null = null;
+  let healthEventId = 0;
+  const healthEvents: { id: number; exchange: string; at: number; reason: string }[] = [];
   function receive(event: FeedEvent): void {
+    if (event.type === 'reset' || event.type === 'quotes' || (event.type === 'catalog' && event.last)) sourceRevision++;
     switch (event.type) {
       case 'reset':
+        feedHealth = undefined; lastPublishMs = null; visitedQuotes = null; healthEvents.length = 0;
         feedEpoch = remote?.epoch() ?? null;
+        resetFx();
+        if (remote) { crossEx.resetSource(); if (fxRefreshMs > 0) queueMicrotask(refreshFx); }
         for (const key of quotes.keys()) if (clients.size) publishDirty.add(key);
         quotes.clear(); bookTimes.clear(); catalogs.clear(); assembling.clear(); states = fresh(); connectionCount = 0;
         break;
@@ -165,17 +190,60 @@ export function createPerpetualMonitor(options: PerpetualOptions = {}) {
         for (const key of event.removed) { quotes.delete(key); bookTimes.delete(key); if (clients.size) publishDirty.add(key); }
         break;
       case 'venues':
+        feedHealth = event.health;
+        for (const venue of event.venues) {
+          const previous = states.get(venue.id);
+          if (previous && (previous.online !== venue.online || previous.error !== venue.error)) {
+            healthEvents.unshift({ id: ++healthEventId, exchange: venue.id, at: clock(), reason: venue.error ?? (venue.online ? '连接已建立' : '连接已关闭') });
+          }
+        }
+        healthEvents.length = Math.min(60, healthEvents.length);
         states = new Map(event.venues.map(state => [state.id, state])); connectionCount = event.connections;
         break;
     }
   }
   function disconnected(): void {
-    feedEpoch = null; booksAfter = clock(); connectionCount = 0; assembling.clear();
+    feedHealth = undefined; feedEpoch = null; booksAfter = clock(); connectionCount = 0; assembling.clear();
+    resetFx(); crossEx.resetSource();
     for (const [id, state] of states) states.set(id, { ...state, online: false, error: '行情服务连接中断，等待重新订阅。' });
   }
   let running = false, sequence = 0, streamId = randomUUID();
   // A new one per start: stop() aborts its controller for good (the workbench's service is never restarted).
   let execution: Pick<PerpetualExecutionService, 'fx' | 'depth' | 'exit' | 'stop'> | null = null;
+  function resetFx() { fxGeneration++; fxSnapshot = null; fxRequest = null; }
+  function readFx(): Promise<PerpetualFxSnapshot> {
+    if (fxRequest) return fxRequest;
+    const generation = fxGeneration, epoch = remote?.epoch();
+    const request = inspect(service => service.fx()).then(data => {
+      if (generation !== fxGeneration || epoch !== remote?.epoch()) throw new PerpetualInspectionError(503, '行情服务连接已更新');
+      fxSnapshot = data;
+      return data;
+    }).finally(() => { if (fxRequest === request) fxRequest = null; });
+    fxRequest = request;
+    return request;
+  }
+  function refreshFx() { if (execution && (!remote || feedEpoch)) void readFx().catch(() => undefined); }
+  function opportunities(version: 1): PerpetualOpportunities;
+  function opportunities(version: 2): PerpetualOpportunitiesV2;
+  function opportunities(version: 1 | 2): PerpetualOpportunities | PerpetualOpportunitiesV2;
+  function opportunities(version: 1 | 2) {
+    const filter = crossEx.filter(), current = snapshot(), error = crossEx.storageError();
+    const sourceDown = remote && (!feedEpoch || feedEpoch !== remote.epoch());
+    if (error || sourceDown) { current.status = 'unavailable'; current.storageError = error || '行情服务连接中断'; current.quotes = []; }
+    // Keep contracts and marks for existing positions. Only the source times of two still-connected book sides can
+    // qualify an entry: the display feed also admits local receipt times and may retain a lost socket's last book.
+    current.quotes = current.quotes.map(quote => {
+      const times = bookTimes.get(`${quote.exchange}:${quote.symbol}`);
+      const at = times && times[0] > booksAfter && times[1] <= current.generatedAt + 1_000 ? times[0] : undefined;
+      return quote.bidAskAt === at ? quote : { ...quote, bidAskAt: at };
+    });
+    const directory = (exchange: string, symbol: string) => {
+      const market = getMarket(exchange, symbol);
+      return market && quotes.get(`${exchange}:${symbol}`)?.historyIdentity === perpetualPriceIdentity(market) ? market : undefined;
+    };
+    return version === 2 ? readV2(current, current.generatedAt, directory, sourceDown ? null : fxSnapshot, sourceRevision, filter)
+      : createPerpetualOpportunities(current, current.generatedAt, directory, filter);
+  }
   async function inspect<T>(read: (service: NonNullable<typeof execution>) => Promise<T>): Promise<T> {
     if (!execution) throw new PerpetualInspectionError(503, '合约价差采集未运行，开启后再查询盘口');
     try { return await read(execution); }
@@ -217,6 +285,19 @@ export function createPerpetualMonitor(options: PerpetualOptions = {}) {
       clock, ...(qualityOptions?.coinIds ? { coinIds: qualityOptions.coinIds } : {}), ...(qualityOptions?.apiKey ? { apiKey: qualityOptions.apiKey } : {}), ...(qualityFetch ? { fetchImpl: qualityFetch } : {}),
     }),
     positioningFetch: remote?.positioning ?? qualityOptions?.positioningFetch ?? (qualityFetch ? (quote, options) => fetchPositioning(quote, { ...options, fetchImpl: qualityFetch }) : fetchPositioning),
+  });
+  // Both book sides must still belong to current, connected subscriptions. Display quotes may remain after one
+  // contract's socket was lost while the venue's other sockets are still online.
+  function liveBookQuote(key: string): PerpetualQuote | undefined {
+    const quote = running ? quotes.get(key) : undefined, times = bookTimes.get(key);
+    if (!quote || !times || quote.bid === null || quote.ask === null || times[0] <= booksAfter || times[1] > clock() + 1_000 || !venueLive(quote.exchange)) return;
+    const market = getMarket(quote.exchange, quote.symbol);
+    if (!market || !quote.historyIdentity || perpetualPriceIdentity(market) !== quote.historyIdentity) return;
+    return quote.bidAskAt === times[0] ? quote : { ...quote, bidAskAt: times[0] };
+  }
+  const opportunityAlerts = createPerpetualAlertService({
+    ...options.alerts, getQuote: liveBookQuote, isVenueLive: venueLive, clock,
+    onImportError: message => log(`机会提醒导入：${message}`),
   });
   // M-5e1: as the workbench's (perpetual-service.mjs): a leg is valued only while its venue has a connection open.
   let paperHealthy = true;
@@ -282,6 +363,7 @@ export function createPerpetualMonitor(options: PerpetualOptions = {}) {
 
   function broadcast(): void {
     if (!clients.size) return;
+    const begun = performance.now(); visitedQuotes = publishDirty.size;
     const baseSequence = sequence++, current = snapshot();
     const delta = createPerpetualChangedPatch(current, quotes, publishedQuotes, publishDirty);
     publishDirty.clear();
@@ -296,6 +378,7 @@ export function createPerpetualMonitor(options: PerpetualOptions = {}) {
       if (client.needsSnapshot) { fullMessage ??= `data: ${JSON.stringify({ ...current, quotes: [...publishedQuotes.values()] })}\n\n`; output.write(fullMessage); client.needsSnapshot = false; }
       else output.write(message);
     }
+    lastPublishMs = performance.now() - begun;
     if (!clients.size) { publishedQuotes.clear(); publishDirty.clear(); }
   }
 
@@ -308,10 +391,8 @@ export function createPerpetualMonitor(options: PerpetualOptions = {}) {
      * ask times), for the oil and hynix book readers; null while stopped or without a book. Read only.
      */
     book(exchange: string, symbol: string): { bid: number; ask: number; at: number; multiplier: number } | null {
-      const key = `${exchange}:${symbol}`, quote = running ? quotes.get(key) : undefined;
-      const market = getMarket(exchange, symbol), times = bookTimes.get(key);
-      if (!times || !market || !quote?.historyIdentity || perpetualPriceIdentity(market) !== quote.historyIdentity || !venueLive(exchange) || quote.bid === null || quote.ask === null || times[0] <= booksAfter || times[1] > clock() + 1_000) return null;
-      return { bid: quote.bid, ask: quote.ask, at: times[0], multiplier: quote.multiplier ?? 1 };
+      const quote = liveBookQuote(`${exchange}:${symbol}`);
+      return quote ? { bid: quote.bid!, ask: quote.ask!, at: quote.bidAskAt!, multiplier: quote.multiplier ?? 1 } : null;
     },
     /** Starts discovery and the connections; idempotent. */
     start(): void {
@@ -325,11 +406,16 @@ export function createPerpetualMonitor(options: PerpetualOptions = {}) {
         clock, ...(fetchImpl ? { fetchImpl } : {}), ...executionOptions,
       });
       marketMetrics.start(); fundingHistory.start(); priceHistory.start(); quality.start();
+      crossEx.start();
+      if (fxRefreshMs > 0) { refreshFx(); fxTimer = setInterval(refreshFx, fxRefreshMs); fxTimer.unref(); }
       // A pending import is merged before the paper service starts (the merge starts the rebuilt one); a merge still running
       // from an earlier start starts it too.
       if (!adoptPaper()) paper.start();
+      opportunityAlerts.start();
       // The workbench checks the paper positions on its broadcast timer too; the service observes at most once a minute.
       broadcastTimer = setInterval(() => {
+        crossEx.checkImport();
+        void opportunityAlerts.check().catch(() => undefined);
         // A failed save keeps the broadcast going; the log gets one line when saving starts or stops failing (the page shows it too).
         // A pending import is merged first, in the same chain, so it never runs beside a check.
         void (adoptPaper() ?? Promise.resolve()).then(() => paper.check()).catch(() => undefined).then(() => {
@@ -349,22 +435,41 @@ export function createPerpetualMonitor(options: PerpetualOptions = {}) {
     stop(): void {
       if (!running) return;
       running = false; closeStreams();
+      clearInterval(fxTimer); resetFx(); sourceRevision++;
       execution?.stop(); execution = null;
       // A merge in progress is waited for, then the service it built is stopped (unless the collector was started again).
       const paperStopping = adopting ? adopting.then(() => (running ? undefined : paper.stop())) : paper.stop();
-      metricsStopping = Promise.all([marketMetrics.stop(), fundingHistory.stop(), priceHistory.stop(), quality.stop(), paperStopping].map(stopping => stopping.catch(() => undefined))).then(() => undefined);
+      metricsStopping = Promise.all([marketMetrics.stop(), fundingHistory.stop(), priceHistory.stop(), quality.stop(), opportunityAlerts.stop(), paperStopping, crossEx.stop()].map(stopping => stopping.catch(() => undefined))).then(() => undefined);
       feedRun++; unsubscribe?.(); unsubscribe = undefined; clearInterval(broadcastTimer);
       quotes.clear(); bookTimes.clear(); catalogs.clear(); assembling.clear(); connectionCount = 0; booksAfter = -Infinity;
-      states = fresh(); sequence = 0; streamId = randomUUID();
+      states = fresh(); feedHealth = undefined; lastPublishMs = null; visitedQuotes = null; healthEvents.length = 0; sequence = 0; streamId = randomUUID();
     },
     snapshot,
-    /** The status page's and the overview's one-line view (the workbench's summary, without the CrossEx filter). */
+    opportunities,
+    // The in-process CrossEx consumer evaluates each funding pair independently of the top price signals.
+    fundingTransferFilter: () => running && (!remote || feedEpoch) && !crossEx.storageError() ? crossEx.filter() : null,
+    crossExSettings: crossEx.view,
+    async updateCrossExSettings(input: unknown) {
+      try { return await crossEx.update(input); }
+      catch (error) { throw new PerpetualInspectionError((error as { status?: number }).status ?? 400, reason(error)); }
+    },
+    alerts: opportunityAlerts.view,
+    async alertsUpdate(input: unknown) {
+      if (!running) throw new PerpetualInspectionError(503, '合约价差采集未运行');
+      return opportunityAlerts.update(input);
+    },
+    async alertsReview(input: unknown) {
+      if (!running) throw new PerpetualInspectionError(503, '合约价差采集未运行');
+      return opportunityAlerts.review(input);
+    },
+    /** The overview counts visible bases while the quote and venue health counts cover the whole feed. */
     summary(): PerpetualSummary {
       const now = clock(), live = connected(), freshVenues = new Set<string>(), onlineVenues = new Set<string>(), bases = new Set<string>();
+      const blocked = new Set(crossEx.filter().blockedBases);
       let freshCount = 0, quoteUpdatedAt: number | null = null;
       for (const quote of quotes.values()) {
         const at = quote.bidAskAt;
-        bases.add(quote.base);
+        if (!isBaseBlocked(blocked, quote.base)) bases.add(quote.base);
         const book = (quote.bid ?? 0) > 0 && (quote.ask ?? 0) >= quote.bid! && Number.isFinite(at) && at! <= now + MAX_FUTURE_MS;
         const mark = (quote.mark ?? 0) > 0 && Number.isFinite(quote.markAt) && quote.markAt! <= now + MAX_FUTURE_MS;
         // Funding and receipt times never renew a retained price.
@@ -384,6 +489,22 @@ export function createPerpetualMonitor(options: PerpetualOptions = {}) {
         baseCount: bases.size, quoteCount: quotes.size, exchangeCount: states.size, onlineExchangeCount: onlineVenues.size, liveExchangeCount: freshVenues.size, quoteUpdatedAt, updatedAt,
         message: [missing.length ? `行情待更新：${missing.join('、')}` : '', freshCount < quotes.size ? `${quotes.size - freshCount} 条盘口过期或缺失` : ''].filter(Boolean).join('；'),
       };
+    },
+    diagnostics() {
+      const view = snapshot();
+      const health = feedHealth && view.generatedAt - feedHealth.sampledAt <= 15_000 ? feedHealth : undefined;
+      return { generatedAt: view.generatedAt,
+        collection: { observationIntervalMs: options.observationIntervalMs ?? STREAM_OBSERVATION_MS, discoveryIntervalMs: options.discoveryIntervalMs ?? MARKET_CATALOG_MS,
+          marketMetricsIntervalMs: metricsOptions?.intervalMs ?? MARKET_METRICS_POLL_MS, auxiliaryBookIntervalMs: AUXILIARY_BOOK_POLL_MS },
+        cpuPercent: health?.cpuPercent ?? null, rssMb: health?.rssMb ?? null,
+        eventLoopP99Ms: health?.eventLoopP99Ms ?? null, messagesPerSecond: health?.messagesPerSecond ?? null,
+        lastPublishMs, lastPatchVisitedQuotes: visitedQuotes, quotes: quotes.size, clients: clients.size, connections: connectionCount, storageError: cacheUnavailable ?? null,
+        events: healthEvents.filter(event => view.generatedAt - event.at <= 3_600_000),
+        venues: view.exchanges.map(venue => {
+          const state = states.get(venue.id)!;
+          return { ...venue, sourceLagMs: state.sourceLagMs ?? null, sourceLagObservedAt: state.sourceLagObservedAt ?? null,
+            rejectedFuture: state.rejectedFuture ?? 0, reconnects: state.reconnects, lastProtocolError: state.lastProtocolError };
+        }) };
     },
     status(): PerpetualStatusView {
       const views = new Map(snapshot().exchanges.map(exchange => [exchange.id, exchange]));
@@ -417,7 +538,7 @@ export function createPerpetualMonitor(options: PerpetualOptions = {}) {
     /** M-5a: closing a position into the current public books (the workbench's exit action). */
     exit: (input: unknown) => inspect(service => service.exit(input)),
     /** M-5a: the spot FX rates of USDC, USD1, USDG and USD in USDT (cached a minute). */
-    fx: () => inspect(service => service.fx()),
+    fx: readFx,
     /**
      * M-5b1: the 24h volume and open interest of up to 30 current pairs (the workbench's metrics action); registers the legs
      * for the 30 s refresh and answers from the cache at once. 503 while stopped, 400 for an invalid batch.

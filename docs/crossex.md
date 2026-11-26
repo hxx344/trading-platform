@@ -38,16 +38,16 @@
 
 持仓资金费独立从原生交易所读取。若 Gate 已有有效的匹配目录，该次原生身份核验也会让旧盘口和预览失效。没有可用目录时仍可显示交易所返回的资金费。
 
-## 当前状态（v0.35.0）
+## 当前状态
 
-- 已实现 C1–C4（服务端 + 页面），在 v0.35.0 合并为一次发布（见第 5 节），未实盘；C5 机会列表等行情监控 M-4 完成后另定。
+- 已实现 C1–C4（服务端 + 页面），在 v0.35.0 合并为一次发布（见第 5 节），未实盘。C5 现已接入合约价差，见文末。
 - 实现与第 2.3 / 3 节原方案的出入已在对应条目注明（“实现：”）。
 
 ## 1 范围
 
-| 本方案（C1–C4） | 后置或不做 |
+| 本方案（C1–C5） | 后置或不做 |
 | --- | --- |
-| Gate CrossEx 私有接口客户端：签名、逐字段校验的解析、超时与响应体上限 | 机会列表（对冲页“价差 / 资金费机会”、持仓页“资金费机会”）：工作台靠 Monitor 的 `opportunities-v2`，本仓库行情监控还没有全市场报价（M-4 未开始），列为 C5 |
+| Gate CrossEx 私有接口客户端：签名、逐字段校验的解析、超时与响应体上限 | — |
 | 账户、持仓、挂单、杠杆与风险限额、ADL 排名、手续费率读取；合约目录（约 2 MB，gzip） | 页面填写 API 密钥：本仓库密钥只在 `secrets.json`，由导入或手写配置（同原油、期权） |
 | 两腿开仓、平仓（最多 16 腿）、撤单：预览 → 确认，请求编号幂等，逐腿发送，结果未知不重发 | 工作台多实例互斥（`live_owner` 租约）与账户写者（`account-writer`）：改用本仓库的进程锁 |
 | 持仓操作：加仓、两腿配平（减少 / 增加 / 指定数量） | 工作台维护接口、总览摘要（`/api/hub/summary`）、跳转 Monitor 按钮 |
@@ -85,11 +85,11 @@
 - 数值：工作台用 decimal.js。
   - 实现：没有改写成 `src/decimal.ts`，而是把 decimal.js 10.6.0（工作台锁定版本，MIT）原样放进 `src/vendor/decimal.mjs`，不增加 npm 依赖；运行时的数值逻辑因此与工作台逐位相同。
 - 图表：不引入 recharts，沿用本仓库现有的 SVG 图表组件。
-- 持有情景：工作台由行情监控的资金费机会算出，本服务未接行情监控，对冲栏不显示持有情景，与机会列表一起等 C5（行情监控 M-4）。
+- 持有情景随 C5 接入，使用行情监控的资金费机会及所选两腿的价格、费率与手续费。
 
 ## 3 架构
 
-- 代码（实现：没有按下面的拆分改写成 TypeScript，而是把工作台 `modules/crossex/server` 的 `live-client.mjs`、`live-runtime.mjs`、`market.mjs`、`terminal-market.mjs`、`clients.mjs`、资金费与金额等文件原样放进 `src/vendor/crossex/`，每个文件头注明来源提交与改动（只改 import 路径、ws 换成本仓 `node-ws.mjs`、`loadFeed` 固定报“行情监控未接入”）；TypeScript 侧用 `.d.mts` 声明。下面各条是原方案，规则仍适用）：
+- 代码（实现：没有按下面的拆分改写成 TypeScript，而是把工作台 `modules/crossex/server` 的 `live-client.mjs`、`live-runtime.mjs`、`market.mjs`、`terminal-market.mjs`、`clients.mjs`、资金费与金额等文件原样放进 `src/vendor/crossex/`，每个文件头注明来源提交与改动（只改 import 路径、ws 换成本仓 `node-ws.mjs`、行情读取由执行服务直接接入本机合约价差）；TypeScript 侧用 `.d.mts` 声明。下面各条是原方案，规则仍适用）：
   - `src/crossex/client.ts`：Gate 签名（预签名串 `方法\n/api/v4路径\n查询串\nSHA512(请求体)\n时间戳`，HMAC-SHA512 十六进制，头 `KEY`、`Timestamp`、`SIGN`）与逐字段解析，解析规则照搬 `live-client.mjs`，未知枚举、缺字段、UID 不一致一律报错。
   - `src/crossex/runtime.ts`：第 2.2 节的状态机，照搬 `live-runtime.mjs`，测试一并移植。
   - `src/crossex/store.ts`：`<数据目录>/crossex.sqlite`（WAL、`synchronous=FULL`），表同工作台的 `live_cache`、`live_previews`、`live_executions`、`live_orders`、`live_requests`、`live_supplemental`、`live_trades`、`live_account_book` 与 `settings`；不存密钥。
@@ -106,7 +106,7 @@
 - 启动：配置了 `crossex` 时取进程锁，再做启动检查（30 s 上限）：读 UID 须等于 `accountUid`，读一次账户、持仓与挂单须解析通过。
   - 实现：启动检查失败（连不上 Gate 或 30 s 内无应答、密钥 UID 不符、密钥已更换而 Gate 有挂单或本地有结果未知的订单、账户被另一进程占用、数据库打不开）只停用 CrossEx，ASTER、原油、期权等照常启动；日志与飞书各说明一次原因（同一原因每次进程启动只发一条飞书，日志只在原因变化时再记），之后每 60 s 后台重试，通过后飞书“CrossEx 已启动”。未启动期间页面仍显示 CrossEx 标签，`/api/crossex/*` 返回 503“CrossEx 未启动：<原因>（每 60 秒重试）”，确认与撤单带 `requestStatus: 'not_submitted'`（没有发出任何请求）；定时摘要与启动通知写明未启动。`config.json` / `secrets.json` 格式错误仍拒绝启动。服务停止时正在进行的启动检查立即放弃。交易权限无法不下单就验证，沿用工作台做法：首次写请求被 403 拒绝时记为“无交易权限”，页面提示。
 - 接口（须登录、同源校验，未配置 `crossex` 时 404）：`GET /api/crossex/state`、`GET /api/crossex/instruments`、`GET /api/crossex/market`、`POST /api/crossex/refresh`、`POST /api/crossex/preview`、`POST /api/crossex/open-capacity`、`POST /api/crossex/confirm`、`POST /api/crossex/cancel`、`GET /api/crossex/requests/<编号>`、`PUT /api/crossex/settings`。请求与应答字段同工作台对应接口，只去掉连接管理。
-  - 实现：另有 `GET /api/crossex/bootstrap`（`{ now, config, connection, limits }`），`settings` 同时接受 `PUT` 与 `POST`；`state`、`bootstrap`、`settings`、`refresh` 的应答多一个 `limits`（`config.json` 的硬上限）。`state` 的查询参数 `opportunities=0` 不算机会、`funding=1` 带资金费机会。设置超过硬上限返回 400 “…不能超过服务配置的上限 … （config.json crossex.limits）”；带 `monitorPassword` / `clearMonitorPassword` 返回 400（行情监控未接入）。应答不含 csrfToken、`apiKey`、`apiSecret` 与标记，连接视图保留密钥末四位 `keySuffix`（页面显示用）。没有模拟盘、hub 与健康检查接口。运行时的 `AppError` 原样带状态码，`requestStatus: 'not_submitted'` 时 `code` 为 `not_submitted`；其他错误 500 “操作未完成，请检查服务状态”。
+  - 实现：另有 `GET /api/crossex/bootstrap`（`{ now, config, connection, limits }`），`settings` 同时接受 `PUT` 与 `POST`；`state`、`bootstrap`、`settings`、`refresh` 的应答多一个 `limits`（`config.json` 的硬上限）。`state` 的查询参数 `opportunities=0` 不算机会、`funding=1` 在轻量持仓读取中返回所持合约的原生资金费。设置超过硬上限返回 400 “…不能超过服务配置的上限 … （config.json crossex.limits）”；带 `monitorPassword` / `clearMonitorPassword` 返回 400（本机行情源无需密码）。应答不含 csrfToken、`apiKey`、`apiSecret` 与标记，连接视图保留密钥末四位 `keySuffix`（页面显示用）。没有模拟盘、hub 与健康检查接口。运行时的 `AppError` 原样带状态码，`requestStatus: 'not_submitted'` 时 `code` 为 `not_submitted`；其他错误 500 “操作未完成，请检查服务状态”。
 - 飞书：执行确认、完成、结果未知、待人工、读取失败超过 5 分钟各一条，同一执行同一状态只发一次，沿用原油的事件表 → 发件箱与 `once` 去重（`once` 记录保留 7 天）；定时摘要加一行 CrossEx 持仓组数、总名义金额与待处理订单数。
   - 实现：去重键 `crossex:<执行编号>:confirmed|unknown|attention|finished` 与 `crossex:read-failure:<开始时刻>`，经通知器新增的 `notifyOnce`；只提 24 小时内有变化的执行，避免 `once` 表 7 天清理后重发已结束的执行。结果未知的订单在核对期间一直更新变化时间，所以若 7 天后仍未核对完，会再提醒一次（约每周一次）。摘要行在定时摘要卡片的固定行之后。
 - 页面：顶部“CrossEx”标签（`#/crossex`）只在 `GET /api/crossex/state` 有应答时出现。五栏照工作台：持仓（账户概览、持仓组合、资金费、平仓）、交易（下单终端）、对冲（两腿手动对冲）、订单（挂单与历史、撤单）、设置（只显示账户与硬上限，可改页面设置，不填密钥）。样式从工作台复制，规则见 [frontend.md](frontend.md)《页面开发规则》；读取走 use-live-resource（页面隐藏时暂停、失败保留上次结果并标注、401 提示重新登录）。
@@ -139,7 +139,7 @@
 | C2 | 交易：预览 → 确认 → 逐腿发送、撤单、上限与冲突、重启恢复、结果未知对账；对冲页、持仓页平仓、订单页撤单；飞书 | R3 | 移植 `live-runtime` 用例（含重启恢复、`UNKNOWN` 不重发、第二腿 `UNSENT`、指纹失效）；替身上浏览器走完开仓、平仓、撤单、结果未知；两路独立审查 |
 | C3 | 持仓操作（加仓、配平）、开仓容量面板、下单终端与公开 WS | R3 | 移植 `position-actions`、`open-capacity`、`terminal-market` 用例；独立审查 |
 | C4 | 持仓资金费、持有情景、盈亏拆分、仓位走势、账户流水 | R2 | 移植 `position-funding`、`holding-scenario`、`position-metrics` 用例；浏览器看持仓页 |
-| C5 | 机会列表：待行情监控 M-4（全市场报价）完成后另写方案 | 待定 | — |
+| C5 | 对冲页价差和资金费机会、持有情景、监控页预填精确合约 | R3 | 本机机会源、目录错配、预览失效、替身页面导入与手机布局 |
 
 每批单独发布；C2、C3 修完两路审查的 P0/P1 后才发布。
 
@@ -157,3 +157,7 @@
 ## 7 相关经验（工作台 `LESSONS.md`）
 
 L020（资产身份）、L023 / L077（持仓资金费）、L024（ADL 映射）、L025（流水聚合）、L027（计价币）、L049（链式轮询）、L054（成交已反映到持仓）、L059 / L098（资金费口径）、L068（gzip）。工作台维护接口相关的 L008、L072 本仓库不适用。
+
+## 从行情监控导入合约价差机会
+
+「行情监控 → 合约价差」的价格与资金费机会可从列表或详情带入「CrossEx → 跨所对冲」。CrossEx 用当前目录核对两边交易所、原生合约和统一币种，保留做多、做空方向。新选择清空旧数量与预览，缺少精确合约时会显示原因。对冲页的机会和持有情景使用平台自己的永续合约行情。回退版本为 v0.102.0。

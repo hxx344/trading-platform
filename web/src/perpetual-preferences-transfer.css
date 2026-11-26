@@ -1,0 +1,8 @@
+.perp-preference-transfer { margin: 12px 0; padding: 12px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); }
+.perp-preference-transfer summary { cursor: pointer; font-weight: 600; }
+.perp-preference-transfer details, .perp-preference-transfer label, .perp-preference-transfer ul { display: block; margin: 12px 0; }
+.perp-preference-transfer textarea { box-sizing: border-box; display: block; width: 100%; min-width: 0; margin: 6px 0; border: 1px solid var(--border); border-radius: 5px; background: var(--background); color: var(--foreground); padding: 8px; font-family: monospace; resize: vertical; }
+.perp-preference-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+.perp-preference-transfer button { border: 1px solid var(--border); border-radius: 5px; background: var(--background); color: var(--foreground); padding: 5px 10px; cursor: pointer; }
+.perp-preference-transfer button:disabled { opacity: .5; cursor: default; }
+.perp-preference-transfer [role="alert"] { color: var(--warning); }

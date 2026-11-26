@@ -5,7 +5,7 @@ export interface CrossexMarket {
   config(): Partial<CrossexConfig> & Record<string, unknown>;
   revision(): string;
   refresh(...args: unknown[]): Promise<unknown>;
-  /** Reads the Monitor feed; this service never calls it (Monitor is not connected). */
+  /** Refreshes the local Monitor opportunity feed. */
   refreshSource(): Promise<unknown>;
   refreshCatalog(): Promise<unknown>;
   instruments(): Promise<unknown>;

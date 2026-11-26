@@ -23,7 +23,7 @@ interface OndoItem { keyId: string | null; status: 'added' | 'skipped'; detail: 
 interface ImportResult {
   id: string | null; action: 'preview' | 'import' | null; at: number; phase?: string; message: string;
   preview?: PreviewItem[]; imported?: ImportedItem[]; oil?: OilItem[]; oilError?: string; options?: OptionsItem; optionsError?: string;
-  monitor?: MonitorItem; monitorAlerts?: MonitorAlertsItem; monitorAlertsError?: string; monitorVariational?: MonitorVariationalItem; monitorVariationalError?: string; monitorPaper?: MonitorPaperItem; monitorPaperError?: string; asset?: AssetItem; assetError?: string; crossex?: CrossexItem; crossexError?: string; ondo?: OndoItem; ondoError?: string; notes?: string[]; database?: string;
+  monitor?: MonitorItem; monitorAlerts?: MonitorAlertsItem; monitorAlertsError?: string; monitorVariational?: MonitorVariationalItem; monitorVariationalError?: string; monitorSettings?: { available: boolean; details: string[] }; monitorPaper?: MonitorPaperItem; monitorPaperError?: string; asset?: AssetItem; assetError?: string; crossex?: CrossexItem; crossexError?: string; ondo?: OndoItem; ondoError?: string; notes?: string[]; database?: string;
 }
 const VENUE: Record<string, string> = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX' };
 
@@ -142,7 +142,7 @@ function AssetRows({ item, preview, owner, setOwner }: { item: AssetItem; previe
 }
 type Message = { tone: 'ok' | 'err' | 'muted'; text: string } | null;
 /** The module choices of the preview (live accounts and modules are never ticked by default). */
-interface ModulePicks { oil: boolean; options: boolean; monitor: boolean; monitorAlerts: boolean; monitorVariational: boolean; monitorPaper: boolean; asset: boolean; assetOwner: string | null; crossex: boolean; ondo: boolean }
+interface ModulePicks { oil: boolean; options: boolean; monitor: boolean; monitorAlerts: boolean; monitorVariational: boolean; monitorSettings: boolean; monitorPaper: boolean; asset: boolean; assetOwner: string | null; crossex: boolean; ondo: boolean }
 
 function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { result: ImportResult; picked: Set<string>; setPicked: (value: Set<string>) => void; picks: ModulePicks; setPicks: (value: ModulePicks) => void; onRun: () => void; busy: boolean }) {
   const notes = (result.notes || []).map((note, index) => <p key={index} className="muted">{note}</p>);
@@ -204,7 +204,8 @@ function Results({ result, picked, setPicked, picks, setPicks, onRun, busy }: { 
       {ondoError}
       {monitor ? <>
         <MonitorRow item={monitor} preview />
-        <label className="pair-pick"><input type="checkbox" id="importMonitorPick" disabled={!monitorImportable} checked={picks.monitor && monitorImportable} onChange={event => setPicks({ ...picks, monitor: event.target.checked, ...(event.target.checked ? {} : { monitorAlerts: false, monitorVariational: false, monitorPaper: false }) })} />启用行情监控（Anthropic 价差，只读公开行情，不需要密钥；股数取默认值，本项目已启用时保留现有设置）</label>
+        <label className="pair-pick"><input type="checkbox" id="importMonitorPick" disabled={!monitorImportable} checked={picks.monitor && monitorImportable} onChange={event => setPicks({ ...picks, monitor: event.target.checked, ...(event.target.checked ? {} : { monitorAlerts: false, monitorVariational: false, monitorSettings: false, monitorPaper: false }) })} />启用行情监控（合约价差、Anthropic、原油、金油比和海力士使用公开行情；已有设置保留）</label>
+        {result.monitorSettings && <label className="pair-pick"><input type="checkbox" id="importPerpetualSettings" disabled={!result.monitorSettings.available || (monitorImportable && !picks.monitor)} checked={picks.monitorSettings && result.monitorSettings.available && (!monitorImportable || picks.monitor)} onChange={event => setPicks({ ...picks, monitorSettings: event.target.checked })} />同时导入合约价差的机会提醒、币种屏蔽和现货充提筛选（{result.monitorSettings.details.join('；')}）</label>}
         {alerts ? <>
           <AlertsRows item={alerts} preview />
           <label className="pair-pick"><input type="checkbox" id="importAlertsPick" disabled={!alertsImportable} checked={picks.monitorAlerts && alertsImportable} onChange={event => setPicks({ ...picks, monitorAlerts: event.target.checked })} />同时导入告警档位与机器人（替换本服务现有的原油 / 海力士档位；{monitorNeed}）</label>
@@ -273,9 +274,9 @@ function choicesOf(result: ImportResult | null, picked: Set<string>, picks: Modu
   const monitorPaper = picks.monitorPaper && paper && paperAvailable(paper, result?.monitor, picks.monitor) ? { added: paper.added } : null;
   const crossex = picks.crossex && result?.crossex?.status === 'added' ? `Gate ${result.crossex.accountId ?? ''}` : null;
   const ondo = picks.ondo && result?.ondo?.status === 'added' ? { keyId: result.ondo.keyId } : null;
-  return { pairs, oil, options, monitor: picks.monitor && monitorAvailable(result?.monitor), monitorAlerts, monitorVariational, monitorPaper, assetOwner: owner, crossex, ondo };
+  return { pairs, oil, options, monitor: picks.monitor && monitorAvailable(result?.monitor), monitorAlerts, monitorVariational, monitorPaper, monitorSettings: picks.monitorSettings && result?.monitorSettings?.available === true && (!monitorAvailable(result.monitor) || picks.monitor), assetOwner: owner, crossex, ondo };
 }
-const NO_PICKS: ModulePicks = { oil: false, options: false, monitor: false, monitorAlerts: false, monitorVariational: false, monitorPaper: false, asset: false, assetOwner: null, crossex: false, ondo: false };
+const NO_PICKS: ModulePicks = { oil: false, options: false, monitor: false, monitorAlerts: false, monitorVariational: false, monitorSettings: false, monitorPaper: false, asset: false, assetOwner: null, crossex: false, ondo: false };
 
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const statusOf = (error: unknown): number | undefined => {

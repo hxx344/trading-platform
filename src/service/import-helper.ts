@@ -11,6 +11,7 @@
 // directory the service cannot write). It is removed once the import is settled either way; one still there means the
 // helper was stopped mid-import (its unit timed out), and the next start, or --recover (the unit's ExecStopPost), puts
 // the files back and restarts the service.
+import { inspectPerpetualImport, stagePerpetualImport } from './import-perpetual-settings.ts';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
@@ -264,13 +265,18 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
   // The paper records likewise; they stay in memory and go to the writer over stdin (only counts and reasons are answered).
   let paper: PaperInput | undefined, monitorPaperError: string | undefined;
   if (wantsPaper) { try { paper = paperInput(readWorkbenchPaper(source.data), options.dataDir, options.inspectPaper ?? inspectPaperAsService); } catch (error) { monitorPaperError = message(error); } }
+  let settings: ReturnType<typeof inspectPerpetualImport> | undefined;
+  if (request.action === 'preview' || request.monitorSettings) {
+    try { settings = inspectPerpetualImport(source.data, options.dataDir); }
+    catch { settings = { states: {}, preview: { available: false, details: ['工作台或本服务的合约价差设置不可读取'] } }; }
+  }
   // The CrossEx account likewise (its database and key, read as their owner).
   let crossex: CrossexSource | undefined, crossexError: string | undefined;
   if (wantsCrossex) { try { crossex = readWorkbenchCrossex(source.data); } catch (error) { crossexError = message(error); } }
   // The Ondo files likewise (only the masked key id and reasons reach the answer).
   let ondo: OndoSource | undefined, ondoError: string | undefined;
   if (wantsOndo) { try { ondo = readWorkbenchOndo(source.data); } catch (error) { ondoError = message(error); } }
-  const oilReport = { ...(oilError !== undefined ? { oilError } : {}), ...(optionsError !== undefined ? { optionsError } : {}), ...(assetError !== undefined ? { assetError } : {}), ...(monitorAlertsError !== undefined ? { monitorAlertsError } : {}), ...(monitorVariationalError !== undefined ? { monitorVariationalError } : {}),
+  const oilReport = { ...(settings ? { monitorSettings: settings.preview } : {}), ...(oilError !== undefined ? { oilError } : {}), ...(optionsError !== undefined ? { optionsError } : {}), ...(assetError !== undefined ? { assetError } : {}), ...(monitorAlertsError !== undefined ? { monitorAlertsError } : {}), ...(monitorVariationalError !== undefined ? { monitorVariationalError } : {}),
     ...(monitorPaperError !== undefined ? { monitorPaperError } : {}), ...(crossexError !== undefined ? { crossexError } : {}), ...(ondoError !== undefined ? { ondoError } : {}) };
   const withOptions = { ...(optionsSource ? { options: optionsSource } : {}), ...(monitor ? { monitor } : {}), ...(alerts ? { monitorAlerts: alerts } : {}), ...(variational ? { monitorVariational: variational } : {}), ...(paper ? { monitorPaper: paper } : {}), ...(asset ? { asset } : {}), ...(crossex ? { crossex } : {}), ...(ondo ? { ondo } : {}) };
   if (request.action === 'preview') {
@@ -310,8 +316,12 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
   const report = { database: source.database, imported: plan.items, ...(request.oil ? { oil: plan.oil } : {}), ...(request.options && plan.options ? { options: plan.options } : {}),
     ...(request.monitor && plan.monitor ? { monitor: plan.monitor } : {}), ...(request.monitorAlerts && plan.monitorAlerts ? { monitorAlerts: plan.monitorAlerts } : {}), ...(request.monitorVariational && plan.monitorVariational ? { monitorVariational: plan.monitorVariational } : {}), ...(request.monitorPaper && plan.monitorPaper ? { monitorPaper: plan.monitorPaper } : {}), ...(request.asset && plan.asset ? { asset: plan.asset } : {}),
     ...(request.crossex && plan.crossex ? { crossex: plan.crossex } : {}), ...(request.ondo && plan.ondo ? { ondo: plan.ondo } : {}), ...oilReport, notes };
-  if (plan.added.length === 0 && oilAdded.length === 0 && !optionsAdded && !monitorAdded && !alertsAdded && !variationalAdded && !paperAdded && !assetAdded && !crossexAdded && !ondoAdded) {
-    const chosen = [pairsWanted ? '所选配对' : '', request.oil ? '原油执行账户' : '', request.options ? '期权账户' : '', request.monitor ? '行情监控' : '', request.monitorAlerts ? '行情告警' : '', request.monitorVariational ? 'Var token' : '', request.monitorPaper ? '持仓记录' : '', request.asset ? '资产账本' : '', request.crossex ? 'CrossEx 账户' : '', request.ondo ? 'Ondo 挂单奖励' : ''].filter(Boolean);
+  if (plan.added.length === 0 && oilAdded.length === 0 && !optionsAdded && !monitorAdded && !alertsAdded && !variationalAdded && !paperAdded && !assetAdded && !crossexAdded && !ondoAdded && !settings?.preview.available) {
+    if (request.monitorSettings && settings && Object.keys(settings.states).length && plan.monitor?.enabled && !pairsWanted
+        && !request.oil && !request.options && !request.asset && !request.crossex && !request.ondo && !request.monitorAlerts && !request.monitorPaper && !request.monitorVariational) {
+      answer({ phase: 'done', message: settings.preview.details.join('；'), ...report }); return;
+    }
+    const chosen = [pairsWanted ? '所选配对' : '', request.oil ? '原油执行账户' : '', request.options ? '期权账户' : '', request.monitor ? '行情监控' : '', request.monitorAlerts ? '行情告警' : '', request.monitorVariational ? 'Var token' : '', request.monitorPaper ? '持仓记录' : '', request.monitorSettings ? '合约价差设置' : '', request.asset ? '资产账本' : '', request.crossex ? 'CrossEx 账户' : '', request.ondo ? 'Ondo 挂单奖励' : ''].filter(Boolean);
     answer({ phase: 'failed', message: `${chosen.join('与')}${chosen.length > 1 || pairsWanted ? '都' : ''}不能导入，配置未改动`, ...report });
     return;
   }
@@ -395,8 +405,18 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
       answer({ phase: 'failed', message: `${message(error)}；配置未改动${stored ? `（${stored}已写入并保留）` : '，本次没有导入任何内容'}，可重试`, ...report }); return;
     }
   }
+  let settingsLine = '';
+  if (settings?.preview.available) {
+    try {
+      const details = stagePerpetualImport(options.dataDir, settings.states);
+      notes.push(...details); settings.preview.details = details;
+      settingsLine = '合约价差设置';
+    } catch (error) {
+      answer({ phase: 'failed', message: message(error) + '；已完成的其他导入项保留，可重新预览后重试', ...report }); return;
+    }
+  }
   const tokenWritten = tokenLine !== '';
-  const what = [plan.added.length ? `${plan.added.length} 个配对` : '', oilAdded.length ? `原油执行账户（${oilAdded.join('、')}）` : '', optionsAdded ? `期权账户（Bybit ${plan.options?.accountId ?? ''}）` : '',
+  const what = [settingsLine, plan.added.length ? `${plan.added.length} 个配对` : '', oilAdded.length ? `原油执行账户（${oilAdded.join('、')}）` : '', optionsAdded ? `期权账户（Bybit ${plan.options?.accountId ?? ''}）` : '',
     monitorAdded ? '行情监控' : '', alertsAdded ? (plan.alertWrite ? (plan.monitorAlerts?.robot.changes ? '行情告警档位与机器人' : '行情告警档位') : plan.monitorAlerts?.robot.changes ? '行情告警机器人' : '') : '', tokenWritten ? 'Var token' : '', recordsLine ? recordsLine : '', assetAdded ? `资产账本（用户 ${plan.asset?.owner ?? ''}）` : '',
     crossexAdded ? `CrossEx 账户（Gate ${plan.crossex?.accountId ?? ''}）` : '', ondoAdded ? 'Ondo 挂单奖励' : ''].filter(Boolean).join('与');
   const after = [plan.added.length ? '配对登记为停用：先在旧工作台删除该配对，再在本页面启用' : '', oilAdded.length ? '原油执行账户已生效，页面出现「原油」标签' : '', optionsAdded ? '期权账户已生效，页面出现「期权」标签' : '',
@@ -404,8 +424,8 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
     crossexAdded ? 'CrossEx 账户已生效，页面出现「CrossEx」标签；请在工作台 CrossEx 设置页断开账户' : '',
     ondoAdded ? 'Ondo 挂单奖励已生效，页面出现「Ondo 挂单奖励」标签（以观察模式启动）' : ''].filter(Boolean).join('；');
   if (filesUnchanged(plan, files.existing)) {
-    const doneWhat = [ledgerLine, tiersLine, tokenLine, recordsLine].filter(Boolean).join('与');
-    const effect = [ledgerLine ? '资产页下次读取即是新账本' : '', tiersLine ? '行情监控 10 秒内换上新档位' : '', tokenLine ? '行情监控下一次读取即用导入的 Var token' : '',
+    const doneWhat = [settingsLine, ledgerLine, tiersLine, tokenLine, recordsLine].filter(Boolean).join('与');
+    const effect = [settingsLine ? '合约价差运行时载入，已有设置保留' : '', ledgerLine ? '资产页下次读取即是新账本' : '', tiersLine ? '行情监控 10 秒内换上新档位' : '', tokenLine ? '行情监控下一次读取即用导入的 Var token' : '',
       recordsLine ? '行情监控下一次检查时载入导入的持仓记录（合约价差采集关闭时在下次开启时）' : ''].filter(Boolean).join('，');
     const declined = [tokenSkipped, recordsSkipped].filter(Boolean).join('；');
     const nothing = declined ? `${declined}；配置未改动，未重启服务` : '工作台的行情告警机器人已在本服务配置中，配置未改动，未重启服务';
@@ -413,7 +433,7 @@ async function handle(request: ImportRequest, owner: FileOwner, options: HelperO
     answer({ phase: 'done', message: doneWhat ? `已${ledgerLine || tiersLine ? '重新' : ''}导入${doneWhat}；配置未改动，未重启服务，${effect}` : nothing, ...report });
     return;
   }
-  const kept = [plan.ledger ? '资产账本已写入并保留（配置已恢复时服务按原配置运行），重新勾选导入即可' : '', tiersLine ? `${tiersLine}已写入，行情监控运行时换上` : '', tokenLine ? `${tokenLine}已写入，行情监控运行时换上` : '', recordsLine ? `${recordsLine}已写入待载入文件，行情监控运行时载入` : ''].filter(Boolean).map(line => `。${line}`).join('');
+  const kept = [settingsLine ? '合约价差待载入文件保留' : '', plan.ledger ? '资产账本已写入并保留（配置已恢复时服务按原配置运行），重新勾选导入即可' : '', tiersLine ? `${tiersLine}已写入，行情监控运行时换上` : '', tokenLine ? `${tokenLine}已写入，行情监控运行时换上` : '', recordsLine ? `${recordsLine}已写入待载入文件，行情监控运行时载入` : ''].filter(Boolean).map(line => `。${line}`).join('');
   const undo = undoFile(files.configFile);
   const written = { config: fileText(plan.config), secrets: fileText(plan.secrets) };
   const record: Undo = { requestId: request.id, bootId: bootId(), at: now(), configFile: resolve(files.configFile), secretsFile: resolve(files.secretsFile), text: files.text, written: { config: sha256(written.config), secrets: sha256(written.secrets) } };

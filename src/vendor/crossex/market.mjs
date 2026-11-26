@@ -129,7 +129,7 @@ function budgetValue(leg, latestPrice, fx, now, budget) {
 }
 
 /** Read-only market discovery and order previews. No private client or writer. */
-export function createMarket(store, { catalogReader = loadCatalog, feedReader = loadFeed, depthReader = loadDepth,
+export function createMarket(store, { catalogReader = loadCatalog, feedReader = loadFeed, fundingTransferFilter, depthReader = loadDepth,
   fxReader = loadFx, identityReader = resolveCrossexQuote,
   manualIdentityReader = identityReader === resolveCrossexQuote ? resolveManualQuote : identityReader,
   manualDepthReader = depthReader === loadDepth ? loadManualDepth : depthReader, capacityDepthReader = manualDepthReader,
@@ -276,7 +276,7 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
       fx: ['USDC', 'USD'].map(currency => { try { return { currency, state: 'live', ...fxRate(currency, feed?.fx, clock()) }; } catch (e) { return { currency, state: 'unavailable', error: safeMessage(e) }; } }),
       opportunities: includeOpportunities ? candidates() : [],
       positionFundingRates: includePositionFunding ? positionFunding.rates(positionSymbols) : [],
-      fundingOpportunities: includeFundingOpportunities ? fundingOpportunities(feed, { now, ruleFor: manualRuleFor,
+      fundingOpportunities: includeFundingOpportunities ? fundingOpportunities(feed, { now, ruleFor: manualRuleFor, currentFilter: fundingTransferFilter?.(),
         sourceReason: live ? '' : sourceError || '价差数据已过期', entryPaused: config().entryPaused, entryPolicyKnown,
         catalogExpiresAt: catalog.at + 900000,
         signals: feedIndex.signals.values(), signalValid: signal => indexedValidSignal(signal, feed, feedIndex, now) }) : [] };

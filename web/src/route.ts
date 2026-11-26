@@ -8,7 +8,12 @@ export function useRoute(): Route {
   useEffect(() => {
     const changed = () => setRoute(parseRoute(location.hash));
     addEventListener('hashchange', changed);
-    return () => removeEventListener('hashchange', changed);
+    // A history entry can change both the Monitor query and the page hash.
+    addEventListener('popstate', changed);
+    return () => {
+      removeEventListener('hashchange', changed);
+      removeEventListener('popstate', changed);
+    };
   }, []);
   return route;
 }

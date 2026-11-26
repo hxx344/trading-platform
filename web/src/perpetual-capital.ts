@@ -1,5 +1,5 @@
-// 复制自 project-aggregation 工作台 modules/monitor/lib/perpetual-capital.ts（提交 c84ba27）。改动：capital-metrics 指向 src/vendor 的副本。
-import { estimatePairCapital, estimatePairRoc, type CapitalAssumptions } from "../../src/vendor/capital-metrics.mjs";
+// From workbench modules/monitor/lib/perpetual-capital.ts (7745181).
+import { estimateBreakEvenHours, estimatePairCapital, estimatePairRoc, type CapitalAssumptions } from "../../src/vendor/capital-metrics.mjs";
 import { normalizedFunding8h, quoteIsFresh, type PerpetualFilters, type PerpetualSpread } from "../../src/vendor/perpetual-spreads.ts";
 
 /** Display and sorting share the same price, currency and funding-time checks. */
@@ -17,5 +17,9 @@ export function scannerCapitalMetrics(row: PerpetualSpread, assumptions: Capital
   const roc = estimatePairRoc({ netSpreadPercent: row.netSpreadPercent,
     longFunding8h: normalizedFunding8h(row.long, data.now), shortFunding8h: normalizedFunding8h(row.short, data.now),
     shortNotionalPercent: capital.shortNotionalPercent, capitalPercent: capital.capitalPercent, holdingHours: assumptions.holdingHours });
-  return { capital, roc };
+  // Same scenario as ROC; a stale or unpriced pair has no capital and so no break-even either.
+  const breakEven = capital.capitalPercent === null
+    ? { status: "unavailable" as const, hours: null, reason: capital.reason }
+    : estimateBreakEvenHours({ netSpreadPercent: row.netSpreadPercent, fundingPercent8h: roc.fundingPercent8h });
+  return { capital, roc, breakEven };
 }

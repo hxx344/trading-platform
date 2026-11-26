@@ -203,7 +203,7 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
  */
 export function marketAlertHooks({ secrets, notifier, monitorOutbox, monitorOutboxError, send }: {
   secrets: Pick<ServiceSecrets, 'feishu' | 'feishuMonitor'>; notifier: Pick<Notifier, 'notify' | 'notifyRepeating' | 'delivery'>; monitorOutbox: Pick<Notifier, 'notify' | 'notifyRepeating' | 'delivery'> | null; monitorOutboxError: string | null;
-  send: (secret: FeishuSecret, text: string) => Promise<unknown>;
+  send: (secret: FeishuSecret, text: string, opportunityReceipt?: boolean) => Promise<unknown>;
 }): AlertHooks {
   // The test message goes to the same robot directly.
   const robot = secrets.feishuMonitor ? { name: 'feishuMonitor' as const, secret: secrets.feishuMonitor } : secrets.feishu ? { name: 'feishu' as const, secret: secrets.feishu } : null;
@@ -218,6 +218,11 @@ export function marketAlertHooks({ secrets, notifier, monitorOutbox, monitorOutb
     delivery: (ids, name) => outboxOf(name).delivery(ids),
     robot: () => robot?.name ?? null,
     test: async text => { if (robot) await send(robot.secret, text); },
+    sendOpportunity: async (text, beforeSend) => {
+      if (!robot) throw new Error('未配置行情飞书机器人');
+      beforeSend();
+      await send(robot.secret, text, true);
+    },
   };
 }
 
@@ -322,7 +327,10 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
     void ondo?.close();
   };
   try {
-    crossex = config.crossex ? createCrossexSupervisor(config.crossex, secrets.gate, dir, { ...crossexOptions, marketClient }) : undefined;
+    crossex = config.crossex ? createCrossexSupervisor(config.crossex, secrets.gate, dir, {
+      opportunityFeed: () => collector?.opportunities(2), fundingTransferFilter: () => collector?.fundingTransferFilter() ?? null,
+      ...crossexOptions, marketClient,
+    }) : undefined;
     await crossex?.start();
   } catch (error) { releaseOil(); throw error; }
   let store: ReturnType<typeof openStore>;
@@ -404,7 +412,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   // The ledger opens its file on demand, including when it is first imported after startup.
   const asset = config.asset ? createAssetStore(join(dir, ASSET_DB_FILE)) : null;
   if (config.monitor) {
-    const alertHooks = marketAlertHooks({ secrets, notifier, monitorOutbox, monitorOutboxError, send: (secret, text) => sendFeishu(secret, { msg_type: 'text', content: { text } }, notifyFetch ? { fetchImpl: notifyFetch } : {}) });
+    const alertHooks = marketAlertHooks({ secrets, notifier, monitorOutbox, monitorOutboxError, send: (secret, text, opportunityReceipt) => sendFeishu(secret, { msg_type: 'text', content: { text } }, { fetchImpl: notifyFetch, opportunityReceipt }) });
     try { monitor = openMonitor(config.monitor, dir, { ...(monitorFetch ? { fetchImpl: monitorFetch } : {}),
       okxLedger: asset ?? undefined, gateLedger: asset ?? undefined, alertHooks, marketClient }); collector = monitor.perpetual; }
     catch (error) { monitorError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`行情监控库无法打开，行情监控页不可用：${monitorError}\n`); }

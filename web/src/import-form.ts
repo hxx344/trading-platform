@@ -35,6 +35,7 @@ export interface ImportChoices {
   /** The workbench's Var token (M-3d-2), with whether it replaces this service's; null when not ticked. */
   monitorVariational: { replaces: boolean } | null;
   /** The workbench's paper-position records (M-5e2), with how many come over; null or absent when not ticked. */
+  monitorSettings?: boolean;
   monitorPaper?: { added: number } | null;
   /** The workbench user whose ledger comes over, or null. */
   assetOwner: string | null;
@@ -43,7 +44,7 @@ export interface ImportChoices {
   /** The Ondo maker-reward module, with the masked key id when the key comes over; null or absent when not ticked. */
   ondo?: { keyId: string | null } | null;
 }
-export type ImportBody = { action: 'import'; pairs: string[]; oil?: true; options?: true; monitor?: true; monitorAlerts?: true; monitorVariational?: true; monitorPaper?: true; asset?: true; assetOwner?: string; crossex?: true; ondo?: true };
+export type ImportBody = { action: 'import'; pairs: string[]; oil?: true; options?: true; monitor?: true; monitorAlerts?: true; monitorVariational?: true; monitorSettings?: true; monitorPaper?: true; asset?: true; assetOwner?: string; crossex?: true; ondo?: true };
 
 export const monitorAvailable = (item: MonitorItem | null | undefined): boolean => item?.status === 'added';
 /**
@@ -68,12 +69,12 @@ export function defaultAssetOwner(item: AssetItem | null | undefined): string | 
 /** The request for what is ticked; null when nothing is. */
 export function importBody(choices: ImportChoices): ImportBody | null {
   const { pairs, oil, options, monitor, monitorAlerts, monitorVariational, assetOwner } = choices, crossex = choices.crossex ?? null, monitorPaper = choices.monitorPaper ?? null, ondo = choices.ondo ?? null;
-  if (!pairs.length && !oil.length && options === null && !monitor && monitorAlerts === null && monitorVariational === null && monitorPaper === null && assetOwner === null && crossex === null && ondo === null) return null;
+  if (!pairs.length && !oil.length && options === null && !monitor && monitorAlerts === null && monitorVariational === null && monitorPaper === null && !choices.monitorSettings && assetOwner === null && crossex === null && ondo === null) return null;
   // The service takes the alerts, the token and the paper records only beside `monitor` (an enabled monitor is kept as it is).
   return {
     action: 'import', pairs, ...(oil.length ? { oil: true as const } : {}), ...(options !== null ? { options: true as const } : {}),
-    ...(monitor || monitorAlerts !== null || monitorVariational !== null || monitorPaper !== null ? { monitor: true as const } : {}), ...(monitorAlerts !== null ? { monitorAlerts: true as const } : {}),
-    ...(monitorVariational !== null ? { monitorVariational: true as const } : {}), ...(monitorPaper !== null ? { monitorPaper: true as const } : {}), ...(assetOwner !== null ? { asset: true as const, assetOwner } : {}),
+    ...(monitor || monitorAlerts !== null || monitorVariational !== null || monitorPaper !== null || choices.monitorSettings ? { monitor: true as const } : {}), ...(monitorAlerts !== null ? { monitorAlerts: true as const } : {}),
+    ...(choices.monitorSettings ? { monitorSettings: true as const } : {}), ...(monitorVariational !== null ? { monitorVariational: true as const } : {}), ...(monitorPaper !== null ? { monitorPaper: true as const } : {}), ...(assetOwner !== null ? { asset: true as const, assetOwner } : {}),
     ...(crossex !== null ? { crossex: true as const } : {}), ...(ondo !== null ? { ondo: true as const } : {}),
   };
 }
@@ -99,12 +100,12 @@ export function confirmText(choices: ImportChoices, assetEnabled: boolean): stri
     // "Again" only for what this service has already (the ledger, the alerts); the token is a plain import.
     const again = [assetOwner !== null ? `资产账本（用户 ${assetOwner}）` : '', monitorAlerts !== null ? '行情告警' : ''].filter(Boolean).join(' 与 ');
     // "Again" never for the records either: they are added to this service's own.
-    const plain = [monitorVariational !== null ? 'Var token' : '', monitorPaper !== null ? '持仓记录' : ''].filter(Boolean).join(' 与 ');
+    const plain = [monitorVariational !== null ? 'Var token' : '', monitorPaper !== null ? '持仓记录' : '', choices.monitorSettings ? '合约价差规则与屏蔽设置' : ''].filter(Boolean).join(' 与 ');
     const what = [again ? `重新导入${again}` : '', plain ? `${again ? '并' : ''}导入 ${plain}` : ''].filter(Boolean).join('，');
     return `${what}？${assetOwner !== null ? '整体替换本服务现有的资产账本；' : ''}${tiers}${token}${records}配置不变，不重启服务。`;
   }
   const what = [pairs.length ? pairs.join('、') : '', oil.length ? `原油执行账户（${oil.join('、')}）` : '', options !== null ? `期权账户（${options}）` : '',
-    monitor ? '行情监控' : '', monitorAlerts !== null ? `行情告警${monitorAlerts.robot ? '与机器人' : ''}` : '', monitorVariational !== null ? 'Var token' : '', monitorPaper !== null ? '持仓记录' : '', crossex !== null ? `CrossEx 账户（${crossex}）` : '', ondo !== null ? `Ondo 挂单奖励${ondo.keyId ? `（API Key ${ondo.keyId}）` : ''}` : '',
+    monitor ? '行情监控' : '', monitorAlerts !== null ? `行情告警${monitorAlerts.robot ? '与机器人' : ''}` : '', monitorVariational !== null ? 'Var token' : '', monitorPaper !== null ? '持仓记录' : '', choices.monitorSettings ? '合约价差规则与屏蔽设置' : '', crossex !== null ? `CrossEx 账户（${crossex}）` : '', ondo !== null ? `Ondo 挂单奖励${ondo.keyId ? `（API Key ${ondo.keyId}）` : ''}` : '',
     assetOwner !== null ? `资产账本（用户 ${assetOwner}）` : ''].filter(Boolean).join(' 与 ');
   const after = [pairs.length ? '导入的配对登记为停用。' : '', oil.length ? '原油执行账户导入后即可在「原油」页面实盘下单，下单不设名义金额上限。' : '',
     options !== null ? '期权账户导入后即可在「期权」页面实盘手动开平仓，工作台期权模块此后不能再用这个账户下期权单。' : '',

@@ -9,12 +9,18 @@ import type { PerpetualQualityReport } from '../../src/vendor/perpetual-quality.
 
 export const PERPETUAL_QUALITY_PATH = '/api/monitor/perpetual/quality';
 
-export function usePerpetualQuality(pairs: QualityPairRequest[], active: boolean, onExpired: () => void) {
+export function usePerpetualQuality(pairs: QualityPairRequest[], active: boolean, onExpired: () => void, positioning = true) {
   const [report, setReport] = useState<(PerpetualQualityReport & { storageError?: string }) | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [reason, setReason] = useState('');
   const controls = useRef<ReturnType<typeof startPerpetualQualityFeed> | null>(null);
+  const wantsPositioning = useRef(positioning);
+  useEffect(() => {
+    const enabled = positioning && !wantsPositioning.current;
+    wantsPositioning.current = positioning;
+    if (enabled) controls.current?.refresh();
+  }, [positioning]);
   const expired = useRef(onExpired);
   expired.current = onExpired;
   const requestKey = qualityRequestKey(pairs);
@@ -24,7 +30,7 @@ export function usePerpetualQuality(pairs: QualityPairRequest[], active: boolean
       load: async (requested, signal) => {
         let value: PerpetualQualityReport & { storageError?: string };
         try {
-          value = await api<PerpetualQualityReport & { storageError?: string }>(PERPETUAL_QUALITY_PATH, { body: { pairs: requested }, signal, timeoutMs: 12_000 });
+          value = await api<PerpetualQualityReport & { storageError?: string }>(PERPETUAL_QUALITY_PATH, { body: { pairs: requested, positioning: wantsPositioning.current }, signal, timeoutMs: 12_000 });
           setReason('');
         } catch (cause) {
           if (cause instanceof ApiError && cause.status === 401) expired.current();

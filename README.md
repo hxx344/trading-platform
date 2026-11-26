@@ -11,6 +11,8 @@
 
 第四个模块“行情监控”（工作台 Monitor 分批接入，方案与进度见 [docs/monitor.md](docs/monitor.md)）第一批是 Anthropic 价差：Binance、Hyperliquid（xyz:ANT、io:ANTH）、Lighter RH 的报价与 15 分钟 K 线，按每股口径算溢价，只读公开行情，不需要密钥。在设置页「从工作台导入」里勾选「启用行情监控」即可启用（命令行 `sudo bash install.sh --import-workbench --monitor`，见下文部署一节），写入的是 `"monitor": { "anthropic": {} }`；也可以手写这一段（可加 `"shares": { "outstanding": 13.116, "diluted": 17.68 }`，十亿股，不写用这两个默认值，须满足 1 ≤ 流通 ≤ 完全稀释 ≤ 100）；只配 `monitor` 时 `pairs` 可以省略。第二批起加了原油价差（Binance BZUSDT / CLUSDT 标记价与 15 分钟 K 线，布伦特 − WTI，USDT / 桶），配置写 `"oil": {}`，导入时随「启用行情监控」一起写入，已启用的配置会补上缺的市场。没有 `monitor` 时不采集、不显示页面，行为与之前相同。启用后服务器会定时访问 Binance、Hyperliquid、Lighter RH 的公开行情接口（`deploy/config.example.json` 带了这一项，安装脚本生成的配置不带）；服务器所在地区被某家交易所限制时，那一家读不到，页面显示为快照或暂无数据，其余功能不受影响。
 
+在「行情监控 → 合约价差」可以收藏或屏蔽组合、设置持续净价差提醒，并把精确多空合约带入 CrossEx。旧工作台的提醒和币种屏蔽名单从设置页导入，自选等浏览器偏好从合约价差页的「监控工具与设置」迁移。见[合约价差导入说明](docs/module-import.md#合约价差规则与筛选)。
+
 第五个模块“资产账本”（工作台 Asset）分批接入：第一批（v0.12.0）是从工作台导入的账本、资产走势、日变化归因、出金与资金流的只读展示，第二批（v0.16.0）可在页面编辑手动资产、修改汇率、登记出金与资金流，第三批（v0.19.0）连接交易所并在页面打开时每 60 秒同步余额、行情与人民币汇率（凭据加密保存在数据目录）。方案与进度见 [docs/asset.md](docs/asset.md)；只在 `config.json` 有 `asset` 时启用，启用与导入账本都在设置页「从工作台导入」里完成（见下文部署一节）。
 
 新增模块的启用与数据迁移一律做进「从工作台导入」面板及其命令行，不要求手改 `config.json`，见 [docs/module-import.md](docs/module-import.md)。

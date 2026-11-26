@@ -1,6 +1,6 @@
 // 复制自 project-aggregation 工作台 modules/crossex/server/clients.mjs（提交 7745181），改动：npm 包 ws 改为本仓 ./node-ws.mjs；
 // asset-identity 路径改为同目录；删去 embedded-request（Monitor 私有管道）及 createPublicClients 的 monitorTransport 参数；
-// loadFeed 改为固定抛出 AppError（503）「行情监控未接入，机会列表待行情监控 M-4」，不再请求 Monitor。其余未改动。
+// loadFeed 改为固定抛出 AppError（503）「本服务未提供合约价差机会源」，不再请求 Monitor。其余未改动。
 import WebSocket from './node-ws.mjs';
 import { AppError, monitorUrl, validIdentity, validManualIdentity } from './model.mjs';
 import { createDepthReader } from './depth-reader.mjs';
@@ -205,8 +205,8 @@ export function createPublicClients({ fetcher = fetch, WebSocketImpl = WebSocket
   const resolveCrossexQuote = (symbol, request) => resolveQuote(symbol, false, request);
   const resolveManualQuote = (symbol, request) => resolveQuote(symbol, true, request);
   const loadCatalog = () => get(CATALOG_URL);
-  // Monitor is not connected in this service yet; opportunities wait for 行情监控 M-4.
-  async function loadFeed() { throw new AppError('行情监控未接入，机会列表待行情监控 M-4', 503); }
+  // The service supplies its local public feed. Without it no opportunities are available.
+  async function loadFeed() { throw new AppError('本服务未提供合约价差机会源', 503); }
   return { loadCatalog, loadFeed, loadDepth, loadManualDepth, loadFx, resolveCrossexQuote, resolveManualQuote };
 }
 

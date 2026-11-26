@@ -339,6 +339,12 @@ TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workben
 check '重复导入同一个 Var token 时跳过' '[[ $status -eq 0 ]] && grep -q "跳过 Var token：本服务的 Var token 声明到期" "$tmp/out" && grep -q "\"revision\":1," "$TP_DATA_DIR/monitor-variational-session.json"'
 # The workbench's paper records (M-5e2): written to the pending file only, which the service merges on its next check.
 mkdir -p "$tmp/wb/data/modules/monitor/perpetual"
+printf '%s\n' '{"version":1,"revision":4,"config":{"requireSpotTransfer":true,"blockedBases":["ETH"]}}' >"$tmp/wb/data/modules/monitor/perpetual/crossex-settings.json"
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor-settings && status=0 || status=$?
+check '--monitor-settings 交接已校验的筛选设置' '[[ $status -eq 0 && "$(stat -c %a "$TP_DATA_DIR/perpetual-crossex-settings.import.json")" == 600 ]] && grep -q ETH "$TP_DATA_DIR/perpetual-crossex-settings.import.json"'
+TP_WORKBENCH_ENV="$tmp/wb/workbench.env" run --package "$tmp/a" --import-workbench --monitor-settings && status=0 || status=$?
+check '重复导入保留已有待载入项' '[[ $status -eq 0 ]] && grep -q "已在本服务保存或待载入" "$tmp/out"'
+
 (cd "$root" && node --input-type=module -e '
   const { writeFileSync } = await import("node:fs");
   const { paperPosition, paperState } = await import("./test/monitor-paper-fixture.ts");

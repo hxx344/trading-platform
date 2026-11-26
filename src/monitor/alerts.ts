@@ -255,6 +255,8 @@ export interface AlertHooks {
   robot(): AlertRobot | null;
   /** Posts a test message directly (not queued); rejects with the robot's answer. */
   test(text: string): Promise<void>;
+  /** Sends once, resolving only on a confirmed robot receipt. A possibly posted message carries uncertain=true. */
+  sendOpportunity?(text: string, beforeSend: () => void): Promise<void>;
 }
 
 /** The test-message limit shared by both markets' services. */

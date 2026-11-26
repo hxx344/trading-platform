@@ -5,12 +5,13 @@
 // belong to that key (connected from secrets.json otherwise) and that UID. A failed start disables CrossEx only: the
 // rest of the service runs, /api/crossex answers 503 with the reason, and the start is retried every 60 s
 // (createCrossexSupervisor). Only config.json / secrets.json that do not parse refuse start (service/config.ts).
-// Monitor is not connected: refreshSource is never called, so the opportunity list stays empty until 行情监控 M-4.
+// Opportunity discovery reads the public Monitor v2 snapshot directly from the executor-side monitor.
 import { createHash } from 'node:crypto';
 import { holdAccountLocks } from '../live/setup.ts';
 import type { FetchLike } from '../live/http.ts';
 import { describe, type LiveCredentials } from '../live/values.ts';
 import { openCrossexStore, type CrossexStore } from '../crossex/store.ts';
+import type { CrossExFilter } from '../vendor/perpetual-crossex-service.mjs';
 import { createDisplayDepth, type DepthReader } from '../crossex/display-depth.ts';
 import { loadDepth, loadManualDepth } from '../vendor/crossex/clients.mjs';
 import { AppError } from '../vendor/crossex/model.mjs';
@@ -54,6 +55,9 @@ export interface CrossexRuntime {
 }
 
 export interface CrossexOptions {
+  /** Locally collected public opportunities, including the executor mirror in split deployments. */
+  opportunityFeed?: () => unknown;
+  fundingTransferFilter?: () => CrossExFilter | null;
   marketClient?: MarketClient;
   /** Tests stand in for Gate (the start check and the runtime's signed reads); the network by default. */
   fetchImpl?: FetchLike;
@@ -144,7 +148,7 @@ async function stopParts(parts: Parts, waitMs = Infinity): Promise<void> {
  * makes sure its connection is this key on this UID. Any failure undoes what was opened (each part's stop waited at most
  * FAILED_STOP_WAIT_MS), releases the lock and throws a CrossexStartError.
  */
-export async function prepareCrossex(config: CrossexServiceConfig, credentials: LiveCredentials | undefined, dir: string, { fetchImpl, preflightTimeoutMs = PREFLIGHT_MS, marketOptions, terminalOptions, liveOptions, signal, marketClient }: CrossexOptions = {}): Promise<CrossexRuntime> {
+export async function prepareCrossex(config: CrossexServiceConfig, credentials: LiveCredentials | undefined, dir: string, { fetchImpl, preflightTimeoutMs = PREFLIGHT_MS, marketOptions, terminalOptions, liveOptions, signal, marketClient, opportunityFeed, fundingTransferFilter }: CrossexOptions = {}): Promise<CrossexRuntime> {
   if (!credentials) throw new Error('配置了 crossex，但密钥文件里没有 gate');
   let locks: { release(): void };
   try { locks = await holdAccountLocks([{ venue: CROSSEX_LOCK_VENUE, accountId: config.accountUid }]); }
@@ -173,7 +177,7 @@ export async function prepareCrossex(config: CrossexServiceConfig, credentials: 
       // The same default createMarket gives its manual reader.
       const injected = marketReaders.depthReader;
       const manualDepth = (marketReaders.manualDepthReader ?? (injected && injected !== loadDepth ? injected : loadManualDepth)) as DepthReader;
-      const market = parts.market = createMarket(store, { ...marketReaders, capacityDepthReader: display(manualDepth) });
+      const market = parts.market = createMarket(store, { ...marketReaders, ...(opportunityFeed ? { feedReader: opportunityFeed } : {}), fundingTransferFilter, capacityDepthReader: display(manualDepth) });
       live = parts.live = createLiveRuntime(store, { ...liveOptions, market, clientFactory });
       parts.terminal = createTerminalMarket({ ...terminalReaders, depthReader: display((terminalReaders.depthReader ?? loadManualDepth) as DepthReader), market, store });
     } catch (error) { throw new CrossexStartError('store', describe(error)); }
@@ -282,7 +286,7 @@ async function valueHeld(runtime: CrossexRuntime): Promise<string | null> {
 }
 
 /**
- * The module's loops: the catalog every 5 s and the account poll every 5 s less the round's time (never refreshSource);
+ * The module's loops: the local opportunity feed and catalog, and the account poll, every 5 s less the round's time;
  * after each poll the held notional is valued and the Feishu messages derived from the runtime's state go out once each.
  */
 export function crossexLoops(runtime: CrossexRuntime, context: { stopped(): boolean; pause(ms: number): Promise<void> }, { notifyOnce, log, now = Date.now }: { notifyOnce(key: string, text: string): unknown; log(line: string): void; now?: () => number }): Promise<void>[] {
@@ -296,7 +300,7 @@ export function crossexLoops(runtime: CrossexRuntime, context: { stopped(): bool
     }
   })();
   return [
-    every(CROSSEX_TICK_MS, '合约目录读取', () => runtime.market.refreshCatalog()),
+    every(CROSSEX_TICK_MS, '合约目录与机会读取', () => runtime.market.refresh()),
     every(CROSSEX_TICK_MS, '账户读取', async () => {
       try { await runtime.live.refresh({ includeView: false }); }
       catch { log('CrossEx 账户本轮读取未完成，等待下一次检查'); }
@@ -348,8 +352,8 @@ export function crossexViews(runtime: CrossexRuntime): CrossexViews {
     state: (opportunities, funding) => ({ ...live.view({ includeOpportunities: opportunities, ...(funding ? { includeFundingOpportunities: true } : {}) }), limits: limits() }),
     bootstrap: () => ({ now: Date.now(), config: market.config(), connection: live.connectionView(), limits: limits() }),
     settings(body) {
-      // The Monitor is not connected and its password would need key storage this service does not have.
-      if (body !== null && typeof body === 'object' && !Array.isArray(body) && ['monitorPassword', 'clearMonitorPassword'].some(key => Object.hasOwn(body, key))) throw new AppError('行情监控未接入，不能保存价差服务密码');
+      // The opportunity source is the local monitor; there is no configurable remote credential.
+      if (body !== null && typeof body === 'object' && !Array.isArray(body) && ['monitorPassword', 'clearMonitorPassword'].some(key => Object.hasOwn(body, key))) throw new AppError('合约价差来自本机行情监控，无需保存价差服务密码');
       const problem = limitProblem(body, config.limits);
       if (problem) throw new AppError(problem, 400);
       return { ...(market.settings(body) as Record<string, unknown>), limits: limits() };

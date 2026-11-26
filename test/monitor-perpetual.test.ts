@@ -239,6 +239,12 @@ test('接口：合约表、概要与 SSE（首帧全量带 retry，其后按 bas
     await until(() => runtime.perpetual!.snapshot().quotes.length === 1, '报价提交');
     const table = await call('/api/monitor/perpetual/quote');
     assert.deepEqual([table.status, table.body.monitorId, table.body.quotes.length, table.body.quotes[0].bid], [200, 'perpetual', 1, 100]);
+    const reads = ['diagnostics', 'opportunities', 'opportunities-v2', 'crossex-settings', 'alerts'];
+    for (const name of reads) assert.equal((await call('/api/monitor/perpetual/' + name)).status, 200, name);
+    for (const name of ['alerts', 'crossex-settings']) {
+      const blocked = await fetch(url + '/api/monitor/perpetual/' + name, { method: 'PUT', headers: { cookie, 'content-type': 'application/json' }, body: '{}' });
+      assert.equal(blocked.status, 403, name);
+    }
     const summary = await call('/api/monitor/perpetual/summary');
     assert.deepEqual([summary.status, summary.body.quoteCount, summary.body.running, summary.body.available], [200, 1, true, true]);
     assert.deepEqual([monitorStatus(runtime).perpetual?.quotes, monitorStatus(runtime).perpetual?.summary.quoteCount], [1, 1], '状态页带采集器状态');
@@ -297,7 +303,7 @@ test('接口：未配置合约价差时各读取 404', async () => {
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
     const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     const cookie = ((await fetch(`${url}/login?token=perpetual-token-0002`, { redirect: 'manual' })).headers.get('set-cookie') ?? '').split(';')[0]!;
-    for (const path of ['quote', 'summary', 'stream']) {
+    for (const path of ['quote', 'summary', 'stream', 'alerts', 'crossex-settings', 'opportunities-v2', 'diagnostics']) {
       const response = await fetch(`${url}/api/monitor/perpetual/${path}`, { headers: { cookie } });
       assert.deepEqual([response.status, ((await response.json()) as { message: string }).message], [404, '本服务没有配置合约价差行情监控'], path);
     }

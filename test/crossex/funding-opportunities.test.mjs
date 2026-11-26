@@ -26,7 +26,7 @@ async function fixture(t, options = {}) {
   let now = epoch, current = { ...feed(epoch), schemaVersion: 2, quotes, signals: [],
     exchanges: [...new Set(quotes.map(q => q.exchange))].map(id => ({ id, status: 'live' })), ...options.snapshot };
   let rules = options.rules ?? rulesFor(quotes), offline = false;
-  const market = createMarket(memoryMarketStore(options.saved), { clock: () => now,
+  const market = createMarket(memoryMarketStore(options.saved), { clock: () => now, fundingTransferFilter: options.fundingTransferFilter,
     feedReader: async () => { if (offline) throw new Error('offline'); return current; }, catalogReader: async () => rules,
     identityReader: async () => { throw new Error('discovery must not fetch native identities'); },
     depthReader: async () => { throw new Error('discovery must not fetch depth'); } });
@@ -173,6 +173,25 @@ test('required transfer evidence must cover both exact current identities, inclu
   }
   const duplicate = await fixture(t, { quotes, snapshot: { crossexFilter: policy, signals: [{ ...certificate, expiresAt: epoch }, certificate] } });
   assert.equal(duplicate.rows()[0].eligible, false, 'a later duplicate cannot replace the first exact current signal');
+});
+
+test('local funding transfer evidence covers crossed funding directions with no positive price signal and outside the top 200', async t => {
+  const policy = { requireSpotTransfer: true, blockedBases: [], revision: 7 };
+  const quotes = [fundingQuote('binance', { bid: 99, ask: 101, fundingRate: 0.0009 }),
+    fundingQuote('bybit', { bid: 99, ask: 101, fundingRate: 0.0001 })];
+  const certificate = { networks: ['ETH'], checkedAt: epoch, expiresAt: epoch + 5000 };
+  let current = { ...policy, evaluate: (long, short) => {
+    assert.equal(long.symbol, 'BTCUSDT'); assert.equal(long.exchange, 'bybit');
+    assert.equal(short.symbol, 'BTCUSDT'); assert.equal(short.exchange, 'binance');
+    return certificate;
+  } };
+  for (const signals of [[], Array.from({ length: 200 }, (_, i) => signal(quotes[0], quotes[1], { id: 'other-' + i, base: 'OTHER' }))]) {
+    const f = await fixture(t, { quotes, fundingTransferFilter: () => current, snapshot: { crossexFilter: policy, signals } });
+    const [row] = f.rows(); assert.ok(row.grossBps < 0); assert.equal(row.eligible, true); assert.equal(row.expiresAt, certificate.expiresAt);
+    current.revision++; assert.equal(f.rows()[0].eligible, false); current.revision--;
+    const saved = current; current = null; assert.equal(f.rows()[0].eligible, false); current = saved;
+    f.advance(5000); assert.equal(f.rows()[0].eligible, false);
+  }
 });
 
 test('funding views honor pause, return at most 200 ranked rows, and lightweight reads skip projection', async t => {

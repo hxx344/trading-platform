@@ -137,6 +137,9 @@ export interface ServiceViews {
       depth?(input: unknown): Promise<unknown>; exit?(input: unknown): Promise<unknown>; fx?(): Promise<unknown>; marketMetrics?(input: unknown): Promise<unknown>;
       fundingHistory?(input: unknown): Promise<unknown>; scannerData?(input: unknown): Promise<unknown>; priceHistory?(input: unknown): Promise<unknown>;
       quality?(input: unknown): Promise<unknown>;
+      diagnostics?(): unknown; opportunities?(version: 1 | 2): unknown;
+      crossExSettings?(): unknown; updateCrossExSettings?(input: unknown): Promise<unknown>;
+      alerts?(): unknown; alertsUpdate?(input: unknown): Promise<unknown>; alertsReview?(input: unknown): Promise<unknown>;
       /** M-5e1: the paper positions' view, and a create / update / close / delete answering the new view; refusals carry an HTTP `status`. */
       paperView?(): unknown; paperUpdate?(input: unknown): Promise<unknown>;
     } | undefined;
@@ -493,7 +496,7 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     }
     if (!url.pathname.startsWith('/api/')) return send(response, 404, { code: 'not_found', message: '不存在' });
     if (!authorized(request)) return send(response, 401, { code: 'session', message: password ? '会话无效，请刷新页面重新登录' : '会话无效，请使用数据目录 access-url 中的登录链接重新打开' });
-    if (request.method === 'POST' && (request.headers['x-pa-executor'] !== '1' || !String(request.headers['content-type'] ?? '').startsWith('application/json'))) return send(response, 403, { code: 'csrf', message: '缺少本页面请求标记' });
+    if ((request.method === 'POST' || request.method === 'PUT') && (request.headers['x-pa-executor'] !== '1' || !String(request.headers['content-type'] ?? '').startsWith('application/json'))) return send(response, 403, { code: 'csrf', message: '缺少本页面请求标记' });
     // The page's own session: what it is, logging this browser out, or every browser (sessions.ts).
     if (url.pathname === '/api/session' && request.method === 'GET') {
       const current = requestSessions.get(request)!;
@@ -692,6 +695,30 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
         return send(response, typeof status === 'number' && status >= 400 && status < 600 ? status : 502, { code, message: error instanceof Error ? error.message : inspection === 'metrics' ? '市场指标读取失败' : inspection === 'funding-history' ? '历史资金费读取失败' : inspection === 'scanner-data' ? '筛选数据读取失败' : inspection === 'price-history' ? '成交价历史读取失败' : inspection === 'quality' ? '质量资料读取失败' : '盘口查询失败' });
       }
     }
+    const perpetualAction = /^\/api\/monitor\/perpetual\/(diagnostics|opportunities(?:-v2)?|crossex-settings|alerts(?:\/reviews)?)$/.exec(url.pathname)?.[1];
+    if (perpetualAction) {
+      const market = views?.monitor;
+      const collector = market?.state().markets.includes('perpetual') ? market.perpetual?.() : undefined;
+      if (!collector) return send(response, 404, { code: 'not_found', message: '本服务没有配置合约价差行情监控' });
+      const actions: Record<string, (() => unknown) | undefined> = {
+        'GET diagnostics': collector.diagnostics, 'GET opportunities': collector.opportunities && (() => collector.opportunities!(1)),
+        'GET opportunities-v2': collector.opportunities && (() => collector.opportunities!(2)),
+        'GET crossex-settings': collector.crossExSettings, 'GET alerts': collector.alerts,
+        'PUT crossex-settings': collector.updateCrossExSettings && (async () => collector.updateCrossExSettings!(await readJson(request))),
+        'PUT alerts': collector.alertsUpdate && (async () => collector.alertsUpdate!(await readJson(request))),
+        'POST alerts/reviews': collector.alertsReview && (async () => collector.alertsReview!(await readJson(request))),
+      };
+      const action = actions[`${request.method} ${perpetualAction}`];
+      if (!action) return send(response, 405, { code: 'method', message: '不支持的操作' });
+      try { return send(response, 200, await action()); }
+      catch (error) {
+        if (error instanceof ContractError) throw error;
+        const { status } = (error ?? {}) as { status?: number };
+        const codes: Record<number, string> = { 400: 'invalid_request', 404: 'not_found', 409: 'conflict', 413: 'too_large', 503: 'unavailable' };
+        if (status && Object.hasOwn(codes, status) && error instanceof Error) return send(response, status, { code: codes[status], message: error.message });
+        return send(response, 500, { code: 'internal_error', message: '合约价差服务处理失败' });
+      }
+    }
     // M-5e1: the paper positions (the workbench's paper action): GET the view, POST create / update / close / delete at a
     // revision, answering the new view. The service's 400 / 404 / 409 / 503 as they are; the exit calculator's input checks
     // (plain Errors) 400 as the workbench answers them; anything else 500. This relies on the service wrapping its own failures
@@ -874,8 +901,6 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     }
     if (url.pathname.startsWith('/api/crossex/')) {
       if (!views?.crossex) return send(response, 404, { code: 'not_found', message: '本服务没有配置 CrossEx 模块' });
-      // The check above covers POST; settings also takes PUT (the workbench's method), which needs the same marker.
-      if (request.method === 'PUT' && (request.headers['x-pa-executor'] !== '1' || !String(request.headers['content-type'] ?? '').startsWith('application/json'))) return send(response, 403, { code: 'csrf', message: '缺少本页面请求标记' });
       const crossex = views.crossex, path = url.pathname.slice('/api/crossex/'.length);
       try {
         if (request.method === 'GET' && path === 'state') return send(response, 200, crossex.state(url.searchParams.get('opportunities') !== '0', url.searchParams.get('funding') === '1'));
@@ -906,8 +931,6 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     }
     if (url.pathname.startsWith('/api/ondo/')) {
       if (!views?.ondo) return send(response, 404, { code: 'not_found', message: '本服务没有配置 Ondo 模块' });
-      // Settings are PUT, as in the workbench; they need the same marker as a POST.
-      if (request.method === 'PUT' && (request.headers['x-pa-executor'] !== '1' || !String(request.headers['content-type'] ?? '').startsWith('application/json'))) return send(response, 403, { code: 'csrf', message: '缺少本页面请求标记' });
       const ondo = views.ondo, path = url.pathname.slice('/api/ondo/'.length);
       try {
         if (request.method === 'GET' && path === 'state') return send(response, 200, ondo.state());

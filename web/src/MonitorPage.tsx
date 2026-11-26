@@ -138,7 +138,7 @@ export function MonitorPage({ shell, scopes, onControlChanged, onExpired }: {
         : active !== MOVES_TAB && active !== 'oil' && active !== 'goldoil' && active !== 'hynix' && active !== 'perpetual' ? shares && <AnthropicPanel outstanding={shares.outstanding} diluted={shares.diluted} onExpired={onExpired} />
         : <LazyBoundary key={active} what={MARKET_TABS[active]!} className="notice">
           <Suspense fallback={<StatePanel kind="loading" title="加载中…" />}>
-            {active === MOVES_TAB ? <MovesPanel onExpired={onExpired} /> : active === 'oil' ? <OilPanel onExpired={onExpired} /> : active === 'goldoil' ? <GoldOilMonitorPanel onExpired={onExpired} /> : active === 'hynix' ? <HynixPanel onExpired={onExpired} /> : <PerpetualPanel onExpired={onExpired} />}
+            {active === MOVES_TAB ? <MovesPanel onExpired={onExpired} /> : active === 'oil' ? <OilPanel onExpired={onExpired} /> : active === 'goldoil' ? <GoldOilMonitorPanel onExpired={onExpired} /> : active === 'hynix' ? <HynixPanel onExpired={onExpired} /> : <PerpetualPanel crossExAvailable={shell.data?.modules.crossex === true} onExpired={onExpired} />}
           </Suspense>
         </LazyBoundary>}
     </div></div>

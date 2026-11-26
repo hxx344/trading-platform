@@ -1,6 +1,6 @@
 // 改编自工作台 modules/crossex/src/SettingsForm.tsx（提交 7745181）。差异：本服务不在页面填写或移除 API 密钥（密钥只在
 // secrets.json，经“设置 → 从工作台导入”或配置文件管理），连接区块改为只读显示账户信息与 config.json 的硬上限；
-// 没有 Market Monitor 地址、用户名与密码（机会列表等行情监控 M-4）。额度表单的字段、文案与保存方式不变。
+// 没有 Market Monitor 地址、用户名与密码（机会列表直接使用本服务的行情监控）。额度表单的字段、文案与保存方式不变。
 import { useState } from 'react';
 import type { Config } from './types.ts';
 import type { CrossexLimits, LiveView } from './live-types.ts';

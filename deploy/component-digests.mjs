@@ -56,7 +56,7 @@ if (leaked.length) throw new Error('执行面不得导入 DEX 价差引擎：' +
 // Helpers run at import/installation time. The execution API's import-channel is a runtime dependency.
 const helperOnly = new Set(['update-helper', 'take-handoff', 'watch-config', 'mev-setup', 'import-helper', 'import-workbench',
   'import-modules', 'import-options', 'import-crossex', 'import-ondo', 'import-monitor-alerts',
-  'import-monitor-variational', 'import-monitor-paper'].map(name => 'src/service/' + name + '.ts'));
+  'import-monitor-variational', 'import-monitor-paper', 'import-perpetual-settings'].map(name => 'src/service/' + name + '.ts'));
 helperOnly.add('src/market/probe.ts');
 helperOnly.add('src/dex/probe.ts');
 helperOnly.add('src/dex/move-db.ts');

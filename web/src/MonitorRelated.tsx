@@ -10,7 +10,7 @@
 // - 面板放在详情页右侧栏（DetailLayout，照工作台 monitor-hub.tsx 的 .monitor-detail 两栏）；工作台侧栏里的告警摘要
 //   （monitor-detail-side.tsx）本服务没有，告警设置仍在主栏。
 import { useEffect, useState, type ReactNode } from 'react';
-import { ArrowUpRight, Link2 } from 'lucide-react';
+import { ArrowUpRight, ChevronDown, Link2 } from 'lucide-react';
 import { ApiError } from './api.ts';
 import { useLiveResource } from './use-live-resource.ts';
 import { readFailure } from './live-resource.ts';
@@ -133,12 +133,13 @@ export function DetailLayout({ side, children }: { side: ReactNode; children: Re
   return <div className="monitor-detail"><div className="monitor-detail-main">{children}</div><aside className="monitor-detail-side">{side}</aside></div>;
 }
 
-export function RelatedPositions({ market, spreads, onExpired }: { market: RelatedMarket; spreads?: VenueSpreads; onExpired: () => void }) {
+export function RelatedPositions({ market, spreads, symbols, extra, onExpired }: { market: RelatedMarket | "perpetual"; symbols?: string[]; extra?: ReactNode; spreads?: VenueSpreads; onExpired: () => void }) {
+  const [stripOpen, setStripOpen] = useState(false);
   const [followUp, setFollowUp] = useState(false);
   const live = useLiveResource<HubPositions>(RELATED_PATH, { intervalMs: followUp ? POSITIONS_FOLLOW_UP_MS : POSITIONS_REFRESH_MS, timeoutMs: POSITIONS_TIMEOUT_MS, onExpired });
   const missing = live.error instanceof ApiError && live.error.status === 404;
   const failed = readFailure(live) !== null;
-  const snapshot = live.data ? { generatedAt: live.data.generatedAt, ...positionItems(live.data, RELATED_SYMBOLS[market], Date.now()) } : null;
+  const snapshot = live.data ? { generatedAt: live.data.generatedAt, ...positionItems(live.data, market === 'perpetual' ? symbols ?? [] : RELATED_SYMBOLS[market], Date.now()) } : null;
   const shown = snapshot?.items ?? [];
   // A leg whose current-round statistics are still being read is read again sooner (the workbench's positionsFollowUp).
   const loadingCycle = shown.some(item => item.cycle?.status === 'loading');
@@ -146,7 +147,7 @@ export function RelatedPositions({ market, spreads, onExpired }: { market: Relat
   const incomplete = snapshot?.incomplete === true;
   const sourcesIncomplete = snapshot?.sourcesIncomplete === true;
   const range = snapshot?.truncated ? `仅显示前 ${snapshot.itemLimit} 条（${sourcesIncomplete ? '已读取部分中共' : '共'} ${snapshot.matchedCount} 条匹配）` : '';
-  const pairMarket = pairedMarket(market) ? market : null;
+  const pairMarket = market !== 'perpetual' && pairedMarket(market) ? market : null;
   const pairs = pairMarket ? relatedSpreadPairs(pairMarket, shown, spreads, incomplete) : [];
   const status = missing ? 'missing' : snapshot ? (failed ? 'retained' : 'ok') : failed ? 'unavailable' : 'loading';
   const message = status === 'missing' ? '本服务没有配置资产账本，在「设置」页从工作台导入后显示关联持仓'
@@ -156,8 +157,7 @@ export function RelatedPositions({ market, spreads, onExpired }: { market: Relat
     : !shown.length ? '无关联持仓' : '';
   const partial = sourcesIncomplete && shown.length > 0;
   const keptAt = status === 'retained' && snapshot ? `保留 ${clock(snapshot.generatedAt)} 的持仓数据` : '';
-  return <section className="detail-side-panel related-positions related-positions-panel" data-related-positions={market} data-status={status}>
-    <div className="detail-side-heading"><h2><Link2 size={15} aria-hidden="true" />关联交易</h2>{status === 'ok' && snapshot ? <span className="detail-side-meta">{clock(snapshot.generatedAt)}</span> : null}</div>
+  const body = <>
     {message ? <p className={status === 'unavailable' || status === 'missing' || incomplete ? 'detail-side-error' : 'detail-side-empty'}>{message}</p> : null}
     {partial ? <p className="detail-side-error">部分数据源不可用，列表可能不完整</p> : null}
     {range ? <p className="detail-side-error">{range}</p> : null}
@@ -167,6 +167,15 @@ export function RelatedPositions({ market, spreads, onExpired }: { market: Relat
     {pairMarket && pairs.length ? <ul className="related-spread-pairs">{pairs.map(pair => <li key={pair.key} data-pair-status={pair.status}><span>{pair.label}</span>{pair.status === 'paired' ? <PairDetail pair={pair} market={pairMarket} /> : <p className="related-unpaired">无法配对 · {unpairedText(pairMarket)[pair.reason]}</p>}</li>)}</ul> : null}
     {shown.length ? <PositionRows items={shown} /> : null}
     {pairMarket && pairs.length ? <p className="detail-side-foot">{pairFoot[pairMarket]}</p> : null}
-    {status !== 'missing' ? <div className="related-positions-actions"><a className="detail-side-action" href="#/positions">在持仓页查看<ArrowUpRight size={13} aria-hidden="true" /></a></div> : null}
+  </>;
+  const positionsLink = status !== 'missing' ? <div className="related-positions-actions"><a className="detail-side-action" href="#/positions">在持仓页查看<ArrowUpRight size={13} aria-hidden="true" /></a></div> : null;
+  if (market === 'perpetual') return <section className="related-positions related-positions-strip" data-related-positions={market} data-status={status}>
+    <div className="related-strip-bar"><button type="button" className="related-strip-toggle" aria-expanded={stripOpen} onClick={() => setStripOpen(value => !value)}>
+      <Link2 size={14} /><strong>关联交易</strong><span>{message || keptAt || range || `${shown.length} 笔关联持仓 · ${clock(snapshot?.generatedAt ?? null)}`}</span><ChevronDown size={13} /></button>{extra}{positionsLink}</div>
+    {stripOpen && <div className="related-strip-body">{body}</div>}
+  </section>;
+  return <section className="detail-side-panel related-positions related-positions-panel" data-related-positions={market} data-status={status}>
+    <div className="detail-side-heading"><h2><Link2 size={15} aria-hidden="true" />关联交易</h2>{status === 'ok' && snapshot ? <span className="detail-side-meta">{clock(snapshot.generatedAt)}</span> : null}</div>
+    {body}{positionsLink}
   </section>;
 }

@@ -23,12 +23,15 @@ export default function PerpetualManualPairs({ snapshot, mode, now, budget, acti
   const [message, setMessage] = useState('');
   const [storageError, setStorageError] = useState('');
   useEffect(() => {
-    const timer = setTimeout(() => {
-      try { setPairs(parseManualPairs(localStorage.getItem(storageKey))); }
+    const restore = (event?: StorageEvent) => {
+      if (event && event.key !== storageKey) return;
+      try { setPairs(parseManualPairs(localStorage.getItem(storageKey))); setStorageError(''); }
       catch { setStorageError('浏览器存储不可用，配置仅在本次页面有效。'); }
       setReady(true);
-    }, 0);
-    return () => clearTimeout(timer);
+    };
+    const timer = setTimeout(restore, 0);
+    window.addEventListener('storage', restore);
+    return () => { clearTimeout(timer); window.removeEventListener('storage', restore); };
   }, []);
   function persist(next: ManualPair[]) {
     setPairs(next);

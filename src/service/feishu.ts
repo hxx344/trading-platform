@@ -348,13 +348,26 @@ export const feishuSign = (timestampSeconds: number, secret: string): string => 
  * One signed post to a custom robot (10-second timeout, no retry here: the caller decides). Throws on an HTTP error or a
  * non-zero robot code, with both in the message.
  */
-export async function sendFeishu(feishu: FeishuSecret, message: Record<string, unknown>, { fetchImpl = (url, init) => fetch(url, init), now = Date.now }: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; now?: () => number } = {}): Promise<void> {
+export async function sendFeishu(feishu: FeishuSecret, message: Record<string, unknown>, { fetchImpl = (url, init) => fetch(url, init), now = Date.now, opportunityReceipt = false }: { fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; now?: () => number; opportunityReceipt?: boolean } = {}): Promise<void> {
   const timestamp = Math.floor(now() / 1000);
   const body = { ...(feishu.secret ? { timestamp: String(timestamp), sign: feishuSign(timestamp, feishu.secret) } : {}), ...message };
-  const response = await fetchImpl(feishu.webhook, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(SEND_TIMEOUT_MS) });
+  let response: Response;
+  try {
+    response = await fetchImpl(feishu.webhook, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      ...(opportunityReceipt ? { redirect: 'error' } : {}), signal: AbortSignal.timeout(SEND_TIMEOUT_MS) });
+  } catch (error) {
+    if (opportunityReceipt) throw Object.assign(new Error('飞书连接失败或超时'), { uncertain: true });
+    throw error;
+  }
   let answer: { code?: unknown; StatusCode?: unknown; msg?: unknown } = {};
   try { answer = await response.json() as typeof answer; } catch { /* judged by status below */ }
-  const code = answer.code ?? answer.StatusCode;
+  const code = answer?.code ?? answer?.StatusCode;
+  if (opportunityReceipt) {
+    if (!response.ok) throw Object.assign(new Error(`飞书返回 HTTP ${response.status}`), { uncertain: response.status >= 500 });
+    if (!Number.isInteger(code)) throw Object.assign(new Error('飞书未返回可确认的业务状态码'), { uncertain: true });
+    if (code !== 0) throw new Error(`飞书拒绝本次提醒（业务码 ${String(code)}）`);
+    return;
+  }
   if (!response.ok || (code !== undefined && code !== 0)) throw new Error(`飞书返回 HTTP ${response.status}${code !== undefined ? ` code ${String(code).slice(0, 12)}` : ''}${typeof answer.msg === 'string' ? ` ${answer.msg.slice(0, 80)}` : ''}`);
 }
 

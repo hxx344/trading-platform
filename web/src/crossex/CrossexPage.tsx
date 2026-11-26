@@ -1,13 +1,14 @@
 // 改编自 project-aggregation 工作台 modules/crossex/src/App.tsx（提交 7745181）。差异：没有工作台外壳（hub-bridge），
-// 读取只在页面可见且在线时进行；没有 Monitor 跳转按钮与行情来源标记，也不接收 Monitor 导入的机会；接口改为
+// 读取只在页面可见且在线时进行；接收行情监控带入的精确合约；接口改为
 // /api/crossex/*，经 api.ts 发出（x-pa-executor 头，没有 CSRF 令牌），请求编号用 request-ids.ts；
 // 设置页不填写或移除 API 密钥，未连接账户时顶部按钮是「账户设置」；内容区是 div.crossex-main（外壳已有 <main>）；页脚「源代码」
 // 指向本仓库（运行版本的源代码）；写入只在服务明确拒绝时换请求编号（write-outcome.ts），401 立即提示重新登录。
 // 子页面地址为 #/crossex[/trade|/hedge|/orders|/settings]。
 import './crossex.css';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { AlertCircle, AlertTriangle, ArrowLeftRight, RefreshCw, LayoutDashboard, CandlestickChart, ListOrdered, Settings2 } from 'lucide-react';
 import { api } from '../api.ts';
+import { cleanHubQuery } from '../../../src/vendor/hub-navigation.mjs';
 import { newRequestId, RequestIds } from '../request-ids.ts';
 import { createLatestRead } from './latest-read.ts';
 import { createServerClock, sourceIsStale, STATE_POLL_MS } from './freshness.ts';
@@ -203,8 +204,16 @@ export function CrossexPage({ tab, onExpired }: { tab: CrossexTab; onExpired: ()
       } finally { operationPending.current = false; setBusy(false); }
     }
   };
+  const previewGeneration = useRef(0);
+  const clearHedgePreview = useCallback(() => {
+    previewGeneration.current++;
+    previewInput.current = null;
+    setPreview(null); setPositionPreview(null); setPreviewInvalidated(false); setConfirmRejected(false);
+  }, []);
   const previewOrder = async (input: PreviewInput) => {
+    const generation = previewGeneration.current;
     const data = await mutate<LivePreview | { preview: LivePreview }>(`${CROSSEX_API}/preview`, input);
+    if (generation !== previewGeneration.current) return false;
     if (data) { previewInput.current = input; setPreview('preview' in data ? data.preview : data); setPositionPreview(input.kind === 'position' ? input : null); setPreviewInvalidated(false); setConfirmRejected(false); }
     return !!data;
   };
@@ -224,6 +233,9 @@ export function CrossexPage({ tab, onExpired }: { tab: CrossexTab; onExpired: ()
     const data = await mutate(`${CROSSEX_API}/cancel`, { orderId: cancelOrder.id }, 'cancel:' + cancelOrder.id);
     setCancelOrder(null); if (data) setNotice('撤单请求已处理，请核对最新订单状态。');
   };
+  const initial = cleanHubQuery(history.state?.crossexImport) ?? {};
+  const incomingId = tab === 'hedge' ? initial.importId : undefined;
+  useLayoutEffect(clearHedgePreview, [tab, incomingId, clearHedgePreview]);
   const marketStale = sourceIsStale(state?.source, now, online);
   const live = state?.live;
   const accountStale = !online || !live || live.stale || live.partial || !live.asOf || now - live.asOf > 15_000 || live.asOf > now + 1000;
@@ -256,7 +268,7 @@ export function CrossexPage({ tab, onExpired }: { tab: CrossexTab; onExpired: ()
       {state.config.entryPaused && (tab === 'trade' || tab === 'hedge') && <p className="inline-state warning">新开仓已暂停，可在设置中恢复；仍可手动平仓和撤单。</p>}
       {tab === 'positions' && <><AccountOverview live={live} stale={accountStale}/><PortfolioPanel positionFundingRates={state.positionFundingRates} now={now} fundingOpportunities={state.fundingOpportunities || []} marketStale={marketStale} live={{ ...live, stale: accountStale }} instruments={instruments.items} disabled={tradingDisabled || !!preview} preview={previewOrder} previewError={error} budget={state.config.notionalPerLeg} entryPaused={!!state.config.entryPaused} capacityContext={capacityContext!} catalogError={instruments.error} close={positions => previewOrder({ kind: 'close', positions })}/></>}
       {tab === 'trade' && <TradingTerminal instruments={instruments.items} catalogError={instruments.error} live={live} budget={state.config.notionalPerLeg} active={hub.readActive} background={hub.background} disabled={openingDisabled} preview={previewOrder} capacityContext={capacityContext!}/>}
-      {tab === 'hedge' && <ManualHedgePanel instruments={instruments.items} catalogError={instruments.error} live={live} budget={state.config.notionalPerLeg} slippageBps={state.config.slippageBps} fx={state.fx} active={hub.readActive} background={hub.background} disabled={openingDisabled} fundingOpportunities={state.fundingOpportunities || []} now={now} monitorStale={marketStale} preview={previewOrder} capacityContext={capacityContext!}/>}
+      {tab === 'hedge' && <ManualHedgePanel key={initial.importId ?? 'manual'} initial={initial} opportunities={state.opportunities || []} readNow={() => serverClock.current.now()} clearPreview={clearHedgePreview} instruments={instruments.items} catalogError={instruments.error} live={live} budget={state.config.notionalPerLeg} slippageBps={state.config.slippageBps} fx={state.fx} active={hub.readActive} background={hub.background} disabled={openingDisabled} fundingOpportunities={state.fundingOpportunities || []} now={now} monitorStale={marketStale} preview={previewOrder} capacityContext={capacityContext!}/>}
       {tab === 'orders' && <><HistoryPanel live={live} disabled={tradingDisabled} querying={busy} query={() => void queryAccount()} cancel={setCancelOrder}/></>}
 
     </>}

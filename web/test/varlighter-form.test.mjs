@@ -7,7 +7,7 @@ import { pairKey, parsePairKey } from '../../src/varlighter/model.ts';
 import { readCustomPair } from '../../src/varlighter/engine.ts';
 import {
   EMPTY_PAIR_FORM, backtestBody, bps, bytesPerDay, chartRange, chartRows, comboLabel, comboShort, customPairKey, customPairRequest, directionLabel, directionShort, fundingAnnual, globalForm, globalRequest,
-  matchesCombo, pairLabel, settingsBody, signal, sortRows, symbolForm, symbolRequest, toggleConfirmed, usd, varLighterHref,
+  SIMPLE_SORT_KEYS, directionSides, entryProgress, matchesCombo, pairLabel, readOverviewMode, settingsBody, signal, sortRows, symbolForm, symbolRequest, toggleConfirmed, usd, varLighterHref,
 } from '../src/varlighter/varlighter-form.ts';
 import { parseRoute } from '../src/route-parse.ts';
 
@@ -167,4 +167,19 @@ test('readouts, labels and addresses', () => {
   assert.deepEqual(parseRoute('#/varlighter/detail/AAPL'), { page: 'varlighter', tab: 'detail', symbol: null }, '只有代码的旧地址回到默认配对');
   assert.deepEqual(parseRoute('#/varlighter/detail/%E0'), { page: 'varlighter', tab: 'detail', symbol: null });
   assert.deepEqual(parseRoute('#/varlighter/detail/<x>'), { page: 'varlighter', tab: 'detail', symbol: null });
+});
+
+test('overview simple view: entry progress, sell and buy venues, stored mode', () => {
+  assert.equal(entryProgress({ rich: null, cheap: null, entryBps: 10 }), null);
+  assert.deepEqual(entryProgress({ rich: 4, cheap: -20, entryBps: 10 }), { direction: 'a_rich', deviation: 4, entry: 10, ratio: 0.4, short: 6, reached: false });
+  assert.deepEqual(entryProgress({ rich: -30, cheap: 25, entryBps: 10 }), { direction: 'a_cheap', deviation: 25, entry: 10, ratio: 1, short: 0, reached: true });
+  const reverse = entryProgress({ rich: -3, cheap: -8, entryBps: 10 });
+  assert.equal(reverse.ratio, 0, '两个方向都在反向时进度条为空');
+  assert.equal(reverse.short, 13);
+  assert.deepEqual(directionSides('a_rich', 'var', 'rh'), { sell: 'var', buy: 'rh' });
+  assert.deepEqual(directionSides('a_cheap', 'lighter', 'entropy'), { sell: 'entropy', buy: 'lighter' });
+  assert.equal(readOverviewMode(null), 'simple');
+  assert.equal(readOverviewMode('full'), 'full');
+  assert.equal(readOverviewMode('{"x":1}'), 'simple');
+  assert.ok(SIMPLE_SORT_KEYS.includes('gap') && !SIMPLE_SORT_KEYS.includes('z'));
 });

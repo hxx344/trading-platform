@@ -101,7 +101,27 @@ export function signal(row: Pick<StateRow, 'rich' | 'cheap' | 'entryBps'>): { di
 }
 
 export type SortKey = 'symbol' | 'mid' | 'z' | 'gap' | 'cost' | 'samples' | 'kind';
-export const SORT_LABELS: Record<SortKey, string> = { gap: '离入场', z: '偏离 σ', mid: '中间价基差', cost: '往返成本', samples: '24h 样本', symbol: '标的', kind: '类别' };
+
+// ---- 总览的简洁视图 ----
+export type OverviewMode = 'simple' | 'full';
+export const OVERVIEW_MODE_KEY = 'trading-platform:varlighter:overview-mode';
+export const OVERVIEW_MODES: readonly { id: OverviewMode; label: string; hint: string }[] = [
+  { id: 'simple', label: '简洁', hint: '只看价差、距开仓、方向与成本' }, { id: 'full', label: '完整', hint: '加上基线、偏离 σ、可成交价差、资金费与样本数' },
+];
+/** 浏览器里存的视图；没存过或认不出时用简洁视图。 */
+export const readOverviewMode = (raw: string | null): OverviewMode => raw === 'full' ? 'full' : 'simple';
+/** 简洁视图表头上有的排序列。 */
+export const SIMPLE_SORT_KEYS: readonly SortKey[] = ['symbol', 'mid', 'gap', 'cost'];
+/** 离开仓线的进度：ratio 是偏离占开仓线的比例（0 到 1，反向偏离记 0），short 是还差的基点数。 */
+export function entryProgress(row: Pick<StateRow, 'rich' | 'cheap' | 'entryBps'>): { direction: Direction; deviation: number; entry: number; ratio: number; short: number; reached: boolean } | null {
+  const hit = signal(row);
+  if (!hit || !finite(row.entryBps)) return null;
+  const reached = hit.gap >= 0;
+  const ratio = reached ? 1 : row.entryBps > 0 ? Math.min(1, Math.max(0, hit.deviation / row.entryBps)) : 0;
+  return { direction: hit.direction, deviation: hit.deviation, entry: row.entryBps, ratio, short: Math.max(0, -hit.gap), reached };
+}
+/** 方向拆成卖出与买入的场所：A 偏贵时卖 A 买 B，反之买 A 卖 B。 */
+export const directionSides = (direction: Direction, a: VenueId, b: VenueId): { sell: VenueId; buy: VenueId } => direction === 'a_rich' ? { sell: a, buy: b } : { sell: b, buy: a };
 /** 排序：缺数的行总在最后；同值按标的代码。 */
 export function sortRows(rows: readonly StateRow[], key: SortKey, descending: boolean): StateRow[] {
   const value = (row: StateRow): number | string | null => {

@@ -6,8 +6,8 @@ import { niceAxis } from '../svg-plot-geometry.ts';
 import type { ClosedTrade } from '../../../src/varlighter/strategy.ts';
 import { bps, chartRange, clamp, signedUsd, type ChartRow } from './varlighter-form.ts';
 
-export function Metric({ label, value, foot, tone = '' }: { label: ReactNode; value: ReactNode; foot?: ReactNode; tone?: string }) {
-  return <div className="vl-metric"><span>{label}</span><strong className={tone ? `vl-${tone}` : undefined}>{value}</strong>{foot ? <small>{foot}</small> : null}</div>;
+export function Metric({ label, value, foot, tone = '', accent = false }: { label: ReactNode; value: ReactNode; foot?: ReactNode; tone?: string; /** 需要注意的读数：整张卡用强调色 */ accent?: boolean }) {
+  return <div className={accent ? 'vl-metric accent' : 'vl-metric'}><span>{label}</span><strong className={tone ? `vl-${tone}` : undefined}>{value}</strong>{foot ? <small>{foot}</small> : null}</div>;
 }
 export function Badge({ tone = '', children }: { tone?: 'ok' | 'warn' | 'bad' | 'info' | ''; children: ReactNode }) {
   return <span className={`vl-badge${tone ? ` ${tone}` : ''}`}>{children}</span>;

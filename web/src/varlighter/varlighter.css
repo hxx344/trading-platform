@@ -133,3 +133,38 @@ a.vl-symbol:hover{color:var(--accent)}
   .vl-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
   .vl-events li{grid-template-columns:minmax(0,1fr);gap:2px}
 }
+
+/* 价差总览的简洁视图：读数卡强调、行高亮、距开仓进度条、买卖方向标签、指标说明 */
+[data-varlighter] .vl-metric strong{font-size:1.25rem}
+.vl-metric.accent{border-color:var(--emerald);background:var(--emerald-soft)}
+.vl-overview th{background:var(--surface-1)}
+.vl-overview td{padding:11px 14px;vertical-align:middle}
+.vl-overview th{padding:9px 14px}
+.vl-overview tbody tr:hover{background:var(--surface-3)}
+.vl-overview tbody tr.vl-hit{background:var(--emerald-soft)}
+.vl-overview tbody tr.vl-hit td:first-child{box-shadow:inset 3px 0 0 var(--emerald)}
+.vl-overview .vl-symbol{font-size:.875rem}
+.vl-overview small{margin-top:2px}
+.vl-table small.vl-warn{color:var(--warning)}
+.vl-value{font-size:.875rem;font-weight:600}
+.vl-gap{display:flex;flex-direction:column;gap:4px;min-width:150px;max-width:220px;color:var(--text-secondary);font-variant-numeric:tabular-nums}
+.vl-gap svg{display:block;width:100%;height:6px;border-radius:var(--radius-pill);overflow:hidden}
+.vl-gap .track{fill:var(--surface-5)}
+.vl-gap .fill{fill:var(--accent)}
+.vl-gap.reached{color:var(--emerald);font-weight:600}
+.vl-gap.reached .fill{fill:var(--emerald)}
+.vl-gap.reached small{font-weight:400}
+.vl-gap.stale{color:var(--text-tertiary)}
+.vl-gap.stale .fill{fill:var(--surface-6)}
+.vl-sides{display:inline-flex;flex-wrap:wrap;gap:6px}
+.vl-side{display:inline-flex;align-items:center;height:22px;padding:0 8px;border-radius:var(--radius-sm);font-size:.75rem;font-weight:500;white-space:nowrap}
+.vl-side.sell{background:var(--error-soft);color:var(--error)}
+.vl-side.buy{background:var(--emerald-soft);color:var(--emerald)}
+.vl-help{border-top:1px solid var(--surface-4);color:var(--text-tertiary);font-size:.75rem;line-height:1.65}
+.vl-help summary{padding:10px 14px;color:var(--text-secondary);cursor:pointer}
+.vl-help summary:hover{color:var(--text-primary)}
+.vl-help dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:6px 16px;margin:0;padding:0 14px 14px}
+.vl-help dt{color:var(--text-secondary);font-weight:600}
+.vl-help dd{margin:0}
+.vl-help p{padding:0 14px 14px}
+@media (max-width:650px){.vl-help dl{grid-template-columns:minmax(0,1fr);gap:2px}.vl-help dd{margin-bottom:8px}}

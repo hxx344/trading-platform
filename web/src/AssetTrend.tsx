@@ -89,7 +89,7 @@ export const AssetTrend = memo(function AssetTrend({ history, version, writer, o
     </div>
     <div className="trend-key"><span><i className="adjusted-line" />剔除出金影响</span><span><i className="held-line" />实际持有资产</span></div>
     {first && last ? <div className="chart">
-      <SvgPlot rows={plotted} xDomain={[first.time, last.time]} yDomain={axis.domain} yTicks={axis.ticks} yTick={amountTick} xTick={dayTick} layers={layers}
+      <SvgPlot rows={plotted} hoverRows={trend} xDomain={[first.time, last.time]} yDomain={axis.domain} yTicks={axis.ticks} yTick={amountTick} xTick={dayTick} layers={layers}
         margin={{ top: 10, right: 48, bottom: 28 }} height={220} hover={hover} label="资产变化折线图：实线为剔除出金影响后的资产，虚线为实际持有资产；跨度超过两个月时每 3 天、超过半年时每 7 天取一份快照。详细数值见历史记录。"
         tooltip={row => <TrendTip point={row as TrendPoint} />} />
     </div> : <div className="empty-state">导入的账本还没有可画的快照</div>}

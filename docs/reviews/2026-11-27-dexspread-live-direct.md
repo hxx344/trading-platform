@@ -54,11 +54,24 @@ P0 2 条、P1 5 条、P2 7 条、P3 6 条，另有待核实 2 条。
 | 待核实 | Lighter 查单接口与字段、Entropy `orderStatus` 的 `sz` 语义、合约名对齐、低于最小金额的只减仓单、不明交易与 nonce | 登记 [live-results.md](../live-results.md) |
 
 
+## 第三轮审查结论（84a2e2d..55e8d49）：P0、P1 为 0
+
+第二轮各项逐条复核：停止告警序号、停止时不落意图、发单前报价核对（方向、B 腿计价单位、旧记录没有 B 限价时只核 A）、`ExpiredAt` 核对（失败落在「没有发出」）、落意图失败的退回（只在单没交给连接器时回退，不会重复下单）、Entropy「还挂着」保持不明、文档，均成立。没有发现新的重复下单或把有成交记成没成交的路径。
+
+| 级别 | 问题 | 处理 |
+| --- | --- | --- |
+| P2 | 余量阈值仍把「B 恰好少成交一个步长」算成余量，约一个 B 单位的敞口不回补、不提示 | 已修：只有 B 已补齐目标数量时才有取整余量，否则按实际差额回补；补乘数 3 与乘数 1 两个用例 |
+| P2 | 第一腿成交后第二腿的意图一直落不了库时，每 5 秒重试、没有上限也不告警（修复前至少会在 15 分钟后转人工） | 已修：一分钟告警，十分钟转人工并停止；转人工时落库失败也照样停止并告警（告警在内存里）；补用例 |
+| P3 | 报价核对与样本同一来源，防不了某个市场推送悄悄停了 | 改文档：13.8 写明这道核对的范围 |
+| P3 | 发第一腿前那道报价核对、余量回补、`ExpiredAt` 拒绝分支没有单独的用例 | 已补前两项；`ExpiredAt` 拒绝分支要真实 WASM 才能走到（签名器测试在 CI 上带构建产物跑），登记未补 |
+| P3 | 审查记录的数量与 CI 链接没更新 | 已更新 |
+
 ## 已运行
 
 - `pnpm check`、`pnpm build:web` 通过。
 - 分支 CI（手动运行，`install_full=true`）：1a6831e 只因占位摘要失败（预期）<https://github.com/hxx344/trading-platform/actions/runs/45891602415>；1d480cd 只有一个分片因旧断言失败 <https://github.com/hxx344/trading-platform/actions/runs/45891950661>；84a2e2d <https://github.com/hxx344/trading-platform/actions/runs/45894156741>。
-- 本机参考运行（Windows，以 CI 为准）：`test/dex-orders`（16）、`dex-live`（28）、`dex-livekeys`（7）、`dex-keys`（8）、`varlighter`（57）、`dex-hyperliquid`（4）全部通过。
+- 分支 CI：55e8d49 全部通过 <https://github.com/hxx344/trading-platform/actions/runs/45896020807>；第三轮修复后的提交见发布提交。
+- 本机参考运行（Windows，以 CI 为准）：`test/dex-orders`（16）、`dex-live`（35）、`dex-livekeys`（7）、`dex-keys`（8）、`varlighter`（57）、`dex-hyperliquid`（4）全部通过。
 - 内置浏览器在替身后端（`scripts/dev-varlighter.ts`，不联网）核对实盘面板：1280 与 390 宽度无横向溢出；用一次性的测试值走过 Entropy 凭据录入，提交后输入框清空、只显示「已录入」；保存配对与限额的请求体只有 `pairs` 与 `limits`。
 
 ## 未运行

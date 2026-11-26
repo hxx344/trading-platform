@@ -119,6 +119,21 @@ export function trendPlotPoints(trend: readonly TrendPoint[]): TrendPoint[] {
   return points[0] === first ? points : [first, ...points];
 }
 
+export type DailyBar = { time: number; date: string; previousDate: string; gapDays: number; /** Change since the previous snapshot; null when either valuation is incomplete. */ change: number | null; /** The drawn value: the change of one single day only. */ bar: number | null };
+
+/**
+ * One row per snapshot after the first, for the bars under the trend: adjusted assets minus the previous snapshot's.
+ * Only a change between neighbouring days with both valuations complete is a day's result and gets a bar; a change
+ * over a longer gap is kept for the tooltip, never spread over the missing days.
+ */
+export function dailyProfitBars(trend: readonly TrendPoint[]): DailyBar[] {
+  return trend.slice(1).map((point, index) => {
+    const previous = trend[index], gapDays = Math.round((point.time - previous.time) / DAY_MS);
+    const change = point.missingValues || previous.missingValues ? null : point.adjusted - previous.adjusted;
+    return { time: point.time, date: point.date, previousDate: previous.date, gapDays, change, bar: gapDays === 1 ? change : null };
+  });
+}
+
 export function monthlyHint(month: MonthlyPerformance | null): string {
   return !month ? '本月还没有快照'
     : month.snapshotCount < 2 || month.daysSpan < MIN_MONTHLY_SPAN_DAYS ? `需要两个不同日期，首末快照间隔至少 ${MIN_MONTHLY_SPAN_DAYS} 天`

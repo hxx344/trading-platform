@@ -273,6 +273,15 @@ Binance、Bybit 和 OKX 的持仓页用实时账户快照确定当前方向和�
 - 库结构不变。行与快照的 JSON 增加可选的 `quote` 字段，旧版本忽略它；回退后旧版本会把行里的旧 `quote` 原样留着，升级回来时它因时间对不上持仓采样而不被采用。
 - 测试：`test/asset-sources-hyperliquid.test.ts`「the USDC/USD quote of the total comes back with its source and times even when no detail row holds USDC (#63)」；`test/asset-sync.test.ts`「Hyperliquid keeps the USDC/USD quote of each read with its row and daily snapshot; a read without one drops it (#63)」；`test/asset-daily-changes.test.ts` 中 4 例：明细失败时按非 1 报价折算且只计一次；缺失、过期、错位或格式错误的证据保持未知，旧快照照旧；有效报价不让换连接和重复、倒序采样变得可比；证据经快照存取往返后来源与时间不变，损坏的被丢弃。
 
+### 资产变化图下的每日盈亏柱形图
+
+- 范围：只改页面（R1）。「资产变化」折线图正下方加一张柱形图，横轴与折线图相同，两张图共用悬停时点。不加接口，不改库和计算口径；工作台没有这张图，按已有的走势图组件（`svg-plot.tsx`）拼。
+- 口径：用 `/api/asset/history` 已返回的走势（每个日期一份快照）在页面上相减，柱高 = 当日调整后资产 − 前一日调整后资产，与「剔除出金影响」折线和「每日波动」同口径：出金加回，入金未剔除，所以不等于投资收益。
+- 只有相邻两天、且两份快照估值都完整时才画柱。前一份快照隔了一天以上（原表期次或缺快照的日子）时变化不是单日的，不画柱，悬停时仍显示金额和间隔天数；任一份估值不完整时不计算。折线图按 3 天或 7 天抽点时，柱形图仍是逐日的。
+- 盈利用 `--positive`，亏损用 `--destructive`，零线为实线。
+- 计算在 `web/src/asset-format.ts` 的 `dailyProfitBars`，测试在 `test/asset-format.test.ts`。
+- 回滚：退回上一个版本即可，没有数据变化。
+
 ## A-6：原表导入（A08）
 
 2026-11-16 开工。把工作台资产页「导入原表数据」搬过来：账本还是示例数据时，选一份由《资产统计.xlsx》生成的 JSON，先预览、再确认导入；导入前备份数据库。A14 不迁移（见批次表）。

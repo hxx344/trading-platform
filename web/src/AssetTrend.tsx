@@ -4,7 +4,7 @@
 // instead of recharts; daily changes and cash flows are read from /api/asset/*; the cash flow form is a panel above the
 // list and saves through the page's one writer (AssetPage.tsx useWriter).
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
-import { SvgPlot, type PlotLayer } from './svg-plot.tsx';
+import { SvgPlot, createHoverStore, type HoverStore, type PlotLayer, type PlotScales } from './svg-plot.tsx';
 import { niceAxis } from './svg-plot-geometry.ts';
 import { useLiveResource } from './use-live-resource.ts';
 import { readFailure } from './live-resource.ts';
@@ -15,7 +15,7 @@ import { businessDay, type CashFlowInput, type CashFlowRecord } from '../../src/
 import { newRequestId } from './request-ids.ts';
 import type { Writer } from './AssetPage.tsx';
 import type { AssetCashFlowsView, AssetDailyChangesView, AssetHistoryView, TrendPoint } from '../../src/asset/views.ts';
-import { CASH_FLOW_PAGE, amountTick, auditLine, dailyItems, dayTick, evidenceStatus, monthlyHint, signed, trendPlotPoints, trendStepDays, trendSummary, zhMoney } from './asset-format.ts';
+import { type DailyBar, CASH_FLOW_PAGE, amountTick, auditLine, dailyItems, dayTick, dailyProfitBars, evidenceStatus, monthlyHint, signed, trendPlotPoints, trendStepDays, trendSummary, zhMoney } from './asset-format.ts';
 
 export const DAILY_CHANGES_PATH = '/api/asset/daily-changes';
 export const CASH_FLOWS_PATH = '/api/asset/cash-flows';
@@ -34,6 +34,43 @@ function TrendTip({ point }: { point: TrendPoint }) {
     {point.difference ? <p>原表合计差异：$ {zhMoney(point.difference)}</p> : null}</div>;
 }
 
+const DAY_MS = 86_400_000;
+const NO_LAYERS: PlotLayer[] = [];
+const BAR_MARGIN = { top: 8, right: 48, bottom: 28 };
+const ZERO_LINE = [{ y: 0, color: 'var(--muted-foreground)' }];
+
+function BarTip({ bar }: { bar: DailyBar }) {
+  return <div className="trend-tooltip"><strong>{bar.date}</strong>
+    {bar.change === null ? <p>快照估值不完整，不计算变化</p>
+      : <div>{bar.gapDays === 1 ? '当日盈亏' : `较 ${bar.previousDate.slice(5)}（间隔 ${bar.gapDays} 天）`}：<span className={performanceTone(bar.change)}>$ {formatGain(bar.change)}</span></div>}
+    {bar.change !== null && bar.gapDays !== 1 ? <p>间隔超过一天，不画柱</p> : null}</div>;
+}
+
+/** The day-over-day change of adjusted assets as bars, on the trend's time axis and sharing its hover. */
+const DailyBars = memo(function DailyBars({ trend, hover }: { trend: readonly TrendPoint[]; hover: HoverStore }) {
+  const bars = useMemo(() => dailyProfitBars(trend), [trend]);
+  const start = trend[0].time, end = trend.at(-1)!.time;
+  const xDomain = useMemo(() => [start, end] as const, [start, end]);
+  const drawn = useMemo(() => bars.flatMap(bar => bar.bar === null ? [] : [bar.bar]), [bars]);
+  const axis = useMemo(() => niceAxis(Math.min(0, ...drawn), Math.max(0, ...drawn), 3), [drawn]);
+  const overlay = useMemo(() => ({ x, y }: PlotScales) => {
+    const width = Math.max(1, Math.min(12, (x(start + DAY_MS) - x(start)) * 0.7)), zero = y(0);
+    return <g aria-hidden="true" pointerEvents="none">{bars.map(bar => {
+      if (!bar.bar) return null;
+      const height = Math.max(1, Math.abs(y(bar.bar) - zero));
+      return <rect key={bar.time} x={x(bar.time) - width / 2} width={width} y={bar.bar > 0 ? zero - height : zero} height={height} fill={bar.bar > 0 ? 'var(--positive)' : 'var(--destructive)'} />;
+    })}</g>;
+  }, [bars, start]);
+  return <>
+    <div className="trend-key daily-bars-key"><span>每日盈亏</span><span><i className="bar-gain" />盈利</span><span><i className="bar-loss" />亏损</span><span>较前一日，剔除出金影响，入金未剔除</span></div>
+    {drawn.length ? <div className="chart daily-bars">
+      <SvgPlot rows={bars} xDomain={xDomain} yDomain={axis.domain} yTicks={axis.ticks} yTick={amountTick} xTick={dayTick} layers={NO_LAYERS} references={ZERO_LINE}
+        margin={BAR_MARGIN} height={130} hover={hover} overlay={overlay} label="每日盈亏柱形图：每根柱为当日调整后资产较前一日的变化，绿色为盈利、红色为亏损；前一份快照隔了一天以上或估值不完整的日期不画柱。"
+        tooltip={row => <BarTip bar={row as DailyBar} />} />
+    </div> : <p className="help daily-bars-empty">还没有相邻两天且估值完整的快照，暂无每日盈亏。</p>}
+  </>;
+});
+
 export const AssetTrend = memo(function AssetTrend({ history, version, writer, onHistory, onExpired }: { history: AssetHistoryView; version: string; writer: Writer; onHistory: () => void; onExpired: () => void }) {
   const { trend, monthly, annualized, today } = history;
   const { first, last, change, incomplete } = trendSummary(trend);
@@ -42,6 +79,7 @@ export const AssetTrend = memo(function AssetTrend({ history, version, writer, o
   const axis = useMemo(() => { const values = plotted.flatMap(point => [point.adjusted, point.held]); return niceAxis(Math.min(...values), Math.max(...values)); }, [plotted]);
   const layers = useMemo(() => lines(trend.length === 1), [trend.length]);
   const month = annualized?.monthlyPeriod ?? null;
+  const [hover] = useState(createHoverStore);
   return <section className="panel trend-panel">
     <div className="panel-h"><h2>资产变化</h2><span className="panel-h-right">北京时间 · USD{step > 1 ? ` · 每 ${step} 天一点` : null}</span></div>
     <div className="trend-summary">
@@ -52,9 +90,10 @@ export const AssetTrend = memo(function AssetTrend({ history, version, writer, o
     <div className="trend-key"><span><i className="adjusted-line" />剔除出金影响</span><span><i className="held-line" />实际持有资产</span></div>
     {first && last ? <div className="chart">
       <SvgPlot rows={plotted} xDomain={[first.time, last.time]} yDomain={axis.domain} yTicks={axis.ticks} yTick={amountTick} xTick={dayTick} layers={layers}
-        margin={{ top: 10, right: 48, bottom: 28 }} height={220} label="资产变化折线图：实线为剔除出金影响后的资产，虚线为实际持有资产；跨度超过两个月时每 3 天、超过半年时每 7 天取一份快照。详细数值见历史记录。"
+        margin={{ top: 10, right: 48, bottom: 28 }} height={220} hover={hover} label="资产变化折线图：实线为剔除出金影响后的资产，虚线为实际持有资产；跨度超过两个月时每 3 天、超过半年时每 7 天取一份快照。详细数值见历史记录。"
         tooltip={row => <TrendTip point={row as TrendPoint} />} />
     </div> : <div className="empty-state">导入的账本还没有可画的快照</div>}
+    {trend.length >= 2 ? <DailyBars trend={trend} hover={hover} /> : null}
     {trend.length >= 2 && annualized ? <section className="performance-metrics" aria-label="资产变化指标">
       <div className="performance-annualized">
         <div className="performance-card">

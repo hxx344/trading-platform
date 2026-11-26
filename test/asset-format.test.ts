@@ -2,7 +2,7 @@
 // the trend headline, the monthly hint, the order of the daily change lines and the wallet detail lines.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { badge, dailyItems, detailLine, fxView, monthlyHint, periodSource, statusTone, trendPlotPoints, trendSummary } from '../web/src/asset-format.ts';
+import { badge, dailyItems, detailLine, fxView, dailyProfitBars, monthlyHint, periodSource, statusTone, trendPlotPoints, trendSummary } from '../web/src/asset-format.ts';
 import type { Asset, Period } from '../src/asset/types.ts';
 import type { DailyChange } from '../src/asset/daily-changes.ts';
 import type { MonthlyPerformance } from '../src/asset/performance-metrics.ts';
@@ -56,6 +56,17 @@ test('资产走势作图：跨度超过两个月每 3 天、超过半年每 7 �
   const partial = [...year.slice(0, -1), at('2026-10-27', 1, 3)];
   assert.equal(trendPlotPoints(partial).at(-1)!.adjusted, 398, '桶内最新快照估值不全时取较早的完整快照');
   assert.deepEqual(trendPlotPoints([]), []);
+});
+
+test('每日盈亏柱：只有相邻两天且估值完整才画柱，隔天的变化只留给提示，不摊到缺失日期', () => {
+  const at = (date: string, adjusted: number, missingValues = 0) => ({ date, time: Date.parse(date + 'T00:00:00+08:00'), adjusted, missingValues }) as unknown as TrendPoint;
+  const bars = dailyProfitBars([at('2026-11-01', 100), at('2026-11-02', 130), at('2026-11-03', 110), at('2026-11-06', 150), at('2026-11-07', 1, 2), at('2026-11-08', 160), at('2026-11-09', 160)]);
+  assert.deepEqual(bars.map(bar => bar.date), ['2026-11-02', '2026-11-03', '2026-11-06', '2026-11-07', '2026-11-08', '2026-11-09'], '首份快照没有前值');
+  assert.deepEqual(bars.map(bar => bar.bar), [30, -20, null, null, null, 0]);
+  assert.deepEqual(bars.map(bar => bar.change), [30, -20, 40, null, null, 0], '隔天的变化保留，估值不完整的两侧都不算');
+  assert.deepEqual([bars[2].gapDays, bars[2].previousDate], [3, '2026-11-03']);
+  assert.deepEqual(dailyProfitBars([at('2026-11-01', 100)]), []);
+  assert.deepEqual(dailyProfitBars([]), []);
 });
 
 test('资产页文案：当月表现的提示按快照数、间隔与收益率是否可算区分', () => {

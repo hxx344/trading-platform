@@ -371,6 +371,13 @@
 .asset-desk .daily-change-list details ul { margin: 4px 0 0; padding-left: 18px }
 /* The copied SvgPlot wraps its tooltip in a box of its own; the workbench's trend tooltip carries the frame here. */
 .asset-desk .svg-plot-tooltip { padding: 0; border: 0; background: none; box-shadow: none }
+/* 资产变化图下的每日盈亏柱形图 */
+.asset-desk .trend-panel .chart.daily-bars { height: 130px }
+.asset-desk .trend-panel .daily-bars-key { padding-top: 12px }
+.asset-desk .trend-panel .daily-bars-key span:first-child { color: var(--foreground); font-weight: 500 }
+.asset-desk .trend-panel .trend-key .bar-gain, .asset-desk .trend-panel .trend-key .bar-loss { width: 8px; height: 8px; border: 0; border-radius: 2px; background: var(--positive) }
+.asset-desk .trend-panel .trend-key .bar-loss { background: var(--destructive) }
+.asset-desk .trend-panel .daily-bars-empty { padding: 8px 14px 0; font-size: 12px }
 /* A-2：工作台的弹窗在本页改为原位展开的面板 */
 .asset-desk .edit-panel { margin-bottom: 14px; padding: 14px 16px }
 .asset-desk .edit-panel h2 { margin-bottom: 4px }

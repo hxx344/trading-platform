@@ -291,6 +291,8 @@ test('飞书告警：事件转消息，同一持续问题 30 分钟内只发一�
       clock += FAULT_AFTER_MS;
       breakOutbox(true);
       notifier.poll();
+      pairs = pair('3500', '1000');
+      notifier.poll();
       pairs = pair('2000', '1500');
       notifier.poll(); notifier.poll();
       assert.equal(notifier.pending(), before + 8);
@@ -315,6 +317,23 @@ test('飞书告警：事件转消息，同一持续问题 30 分钟内只发一�
         pairs = pair('2000', '1500'); notifier.poll();
         assert.equal(notifier.pending(), before + 9);
       }
+      // An unrelated event waiting on the same broken queue must not stop this round's balance observation.
+      pairs = pair('9000', '1000');
+      notifier.poll();
+      clock += 20_000;
+      add('transfer-settled', { pair: 'p1', transfer: 'progress', state: 'confirmed', basis: 'acknowledged' });
+      add('transfer-sent', { pair: 'p1', transfer: 'deferred-event', state: 'unknown' });
+      breakOutbox(true);
+      assert.throws(() => notifier.poll(), /disk I\/O error/);
+      clock += FAULT_AFTER_MS;
+      assert.throws(() => notifier.poll(), /disk I\/O error/);
+      pairs = pair('2000', '1500');
+      assert.throws(() => notifier.poll(), /disk I\/O error/);
+      breakOutbox(false);
+      notifier.poll(); notifier.poll();
+      assert.equal(notifier.pending(), before + 11);
+      assert.match(texts().at(-2)!, /【划转结果未知】/);
+      assert.match(texts().at(-1)!, /【保证金平衡异常（已恢复）】.*差 8000 USD1/);
     } finally { outboxDb.close(); }
     await notifier.flush();
     notifier.close();

@@ -393,29 +393,31 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
   // Keep the observed recovery until handoff, even if the next reading is unknown or another incident starts.
   const recoveries = new Map<string, { text: string; additional: number }>();
 
-  function poll(): void {
-    const at = now();
+  function pollEvents(at: number): void {
     for (;;) {
       const after = (db.prepare('SELECT seq FROM cursor WHERE id = 1').get() as { seq: number }).seq;
       const rows = events(after, EVENTS_PER_POLL);
       if (!rows.length) break;
+      // A confirmed transfer is progress even when its notification has to be retried. Replay its original time.
+      for (const row of rows) {
+        if (row.type !== 'transfer-settled') continue;
+        let detail: { pair?: unknown; state?: unknown } = {};
+        try { detail = JSON.parse(row.json) as typeof detail; } catch { continue; }
+        const entry = detail?.state === 'confirmed' && typeof detail.pair === 'string' ? stuck.get(detail.pair) : undefined;
+        if (entry) entry.since = Math.max(entry.since, Math.min(at, row.at));
+      }
       tx(() => {
         for (const row of rows) {
           const message = describeEvent(row, incidentPair, job);
           if (message && (!message.repeatKey || fresh(message.repeatKey, at)) && (!message.onceKey || first(message.onceKey, at))) insert(message.text, at);
-          // A transfer that went through is progress: the wait restarts, as the workbench did, so a pair balancing in
-          // steps (each capped by the per-transfer limit) is not reported while it keeps moving.
-          if (row.type === 'transfer-settled') {
-            let detail: { pair?: unknown; state?: unknown } = {};
-            try { detail = JSON.parse(row.json) as typeof detail; } catch { /* not progress */ }
-            const entry = typeof detail.pair === 'string' && detail.state === 'confirmed' ? stuck.get(detail.pair) : undefined;
-            if (entry) entry.since = at;
-          }
         }
         db.prepare('UPDATE cursor SET seq = ? WHERE id = 1').run(rows.at(-1)!.seq);
       });
       if (rows.length < EVENTS_PER_POLL) break;
     }
+  }
+
+  function pollMargins(at: number): void {
     const seen = new Set<string>();
     for (const pair of pairs()) {
       if (!pair.enabled) continue;
@@ -450,7 +452,7 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
           entry.sentAt = at;
           entry.missed = null;
         } else {
-          entry.missed = clip(problem);
+          entry.missed ??= clip(problem);
         }
       } else if (at - entry.sentAt >= FAULT_REPEAT_MS) {
         if (queued(`【保证金平衡仍异常】配对 ${pair.id} 已持续 ${lasted(at - entry.began)}：${clip(problem)}。${balanceLine(pair)}`)) entry.sentAt = at;
@@ -458,6 +460,12 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
     }
     for (const id of [...stuck.keys()]) if (!seen.has(id)) stuck.delete(id);
     for (const id of recoveries.keys()) if (!seen.has(id)) recoveries.delete(id);
+  }
+
+  function poll(): void {
+    const at = now();
+    try { pollEvents(at); }
+    finally { pollMargins(at); }
   }
 
   /** Queues a message that does not come from the event log (start, stop, lost lease, market alerts); its outbox id, null without a robot. */

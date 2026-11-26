@@ -119,6 +119,7 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
     if (bound !== operator) store.writeState('identity', operator, now());
   }
   let verifyFailures = 0;
+  let pendingVerification: { command: number; result: Promise<boolean> } | null = null;
   let stopping = false;
 
   const tokenMap = (): Map<string, TokenInfo> => new Map(store.tokens().map(token => [token.address, token]));
@@ -132,8 +133,19 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
     say(`mev:halt:${now()}`, `【MEV 套利已停止实盘】${reason}。模块回到观察模式；未结清的交易继续核对。在「MEV 套利」页处理后可重新开始`);
   }
 
-  async function verify(tolerant = false): Promise<boolean> {
-    const at = now(), command = liveCommand;
+  function verify(tolerant = false): Promise<boolean> {
+    const command = liveCommand;
+    // A tick during startup must observe the same node reply as the start request.
+    if (pendingVerification?.command === command) return pendingVerification.result;
+    const result = checkContract(command, tolerant).finally(() => {
+      if (pendingVerification?.result === result) pendingVerification = null;
+    });
+    pendingVerification = { command, result };
+    return result;
+  }
+
+  async function checkContract(command: number, tolerant: boolean): Promise<boolean> {
+    const at = now();
     try {
       const outcomes = await rpc.batch([
         { method: 'eth_chainId', params: [] },

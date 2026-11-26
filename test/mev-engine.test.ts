@@ -339,6 +339,30 @@ for (const stopBetween of [false, true]) {
   });
 }
 
+test('启动与后台同时重查合约时使用同一份核对结果', async t => {
+  const s = setup(t);
+  await s.ready();
+  s.chain.state.operator = OWNER;
+  await s.engine.verify();
+  assert.equal(s.engine.views.state().verification.ok, false);
+  for (const matches of [false, true]) {
+    s.advanceClock(60_001);
+    if (matches) s.chain.state.operator = OPERATOR;
+    const reads = () => s.chain.state.calls.filter(method => method === 'eth_chainId').length;
+    const before = reads();
+    const release = holdNextVerification(s);
+    const start = s.engine.views.start({ confirm: OPERATOR });
+    const tick = s.engine.tick();
+    release();
+    if (matches) assert.deepEqual(await start, { mode: 'live' });
+    else await assert.rejects(start, rejectsWith('not_verified', 409));
+    await tick;
+    assert.equal(reads() - before, 1);
+    assert.equal(s.engine.isLive(), matches);
+    assert.equal(s.engine.views.state().verification.ok, matches);
+  }
+});
+
 test('连续上链回滚到上限即停实盘；重新开始后计数清零', async t => {
   const s = setup(t);
   await s.ready();

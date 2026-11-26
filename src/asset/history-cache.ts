@@ -20,9 +20,9 @@ export const HISTORY_TABLE = `CREATE TABLE IF NOT EXISTS asset_history_windows (
 CREATE INDEX IF NOT EXISTS asset_history_expiry ON asset_history_windows(end);`;
 const KEY = 'account=? AND revision=? AND scope=? AND instrument=? AND source=?';
 type Permission = 'unknown' | 'verified' | 'denied';
-type Access = { revision: string; data: AbortController; authorization: AbortController; permission: Permission; checks: number; failed?: boolean; pending?: Promise<void> };
-function newAccess(revision: string, permission: Permission): Access {
-  return { revision, data: new AbortController(), authorization: new AbortController(), permission, checks: 0 };
+type Access = { revision: string; data: AbortController; authorization: AbortController; permission: Permission; deniedAt: number; checks: number; failed?: boolean; pending?: Promise<void> };
+function newAccess(revision: string, permission: Permission, deniedAt = 0): Access {
+  return { revision, data: new AbortController(), authorization: new AbortController(), permission, deniedAt, checks: 0 };
 }
 const generations = new WeakMap<Pick<Database, 'prepare'>, Map<string, Access>>();
 export function historyPermission(database: Pick<Database, 'prepare'> | null, account: string, revision: string): Permission {
@@ -39,7 +39,7 @@ export function onHistoryPermissionDenied(database: Database, listener: Denied) 
   return () => { listeners.delete(listener); };
 }
 
-export function historyGeneration(database: DatabaseSource, account: string, revision: string) {
+export function historyGeneration(database: DatabaseSource, account: string, revision: string, now = Date.now) {
   const file = database();
   const accounts = (file && generations.get(file)) ?? new Map<string, Access>();
   if (file) generations.set(file, accounts);
@@ -52,7 +52,7 @@ export function historyGeneration(database: DatabaseSource, account: string, rev
   const access = entry, { signal } = access.data, started = access.checks;
   const permissionCurrent = () => !!file && !access.authorization.signal.aborted && database() === file;
   const current = () => !signal.aborted && permissionCurrent();
-  const deny = () => { if (permissionCurrent()) invalidateHistory(file, account, revision); };
+  const deny = () => { if (permissionCurrent()) invalidateHistory(file, account, revision, undefined, now()); };
   const assertVerified = () => { if (!current() || access.permission !== 'verified') throw new Error(POSITIONS_FAILED); };
   async function verify(probe: (signal: AbortSignal) => Promise<void>) {
     if (!current()) throw new Error(POSITIONS_FAILED);
@@ -77,14 +77,14 @@ export function historyGeneration(database: DatabaseSource, account: string, rev
     await access.pending;
     assertVerified();
   }
-  return { current, assertVerified, verify, deny, signal };
+  return { current, assertVerified, verify, deny, signal, deniedAt: access.deniedAt };
 }
 export type HistoryGeneration = ReturnType<typeof historyGeneration>;
 
 type Dispute = { scope: string; slot: string; records: readonly { symbol: string; time: string }[] };
 /** Cancel readers started before a permission denial or an immutable fill conflict. For a conflict only the
  * display slot and the raw segments containing the disputed timestamps need to be read again. */
-export function invalidateHistory(database: Database | null, account: string, revision: string, dispute?: Dispute) {
+export function invalidateHistory(database: Database | null, account: string, revision: string, dispute?: Dispute, at = Date.now()) {
   if (!database) return;
   const accounts = generations.get(database) ?? new Map<string, Access>(), entry = accounts.get(account);
   if (dispute && entry?.revision === revision) {
@@ -92,7 +92,8 @@ export function invalidateHistory(database: Database | null, account: string, re
     const previous = entry.data; entry.data = new AbortController(); previous.abort();
   } else if (!entry || entry.revision === revision) {
     generations.set(database, accounts);
-    accounts.set(account, newAccess(revision, dispute ? 'unknown' : 'denied'));
+    // Keep the last denial even after a later successful probe; the scan directory compares it to the source response time.
+    accounts.set(account, newAccess(revision, dispute ? 'unknown' : 'denied', dispute ? 0 : Math.max(at, entry?.deniedAt ?? 0)));
     entry?.authorization.abort(); entry?.data.abort();
   }
   if (!dispute) for (const listener of permissionListeners.get(database) ?? []) listener(account, revision);

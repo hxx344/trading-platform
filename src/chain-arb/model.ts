@@ -1,7 +1,7 @@
 export const CHAIN_ARB_TTL_MS = 15_000;
 export const CHAIN_ARB_CLOCK_SKEW_MS = 2_000;
 export type Chain = 'ethereum' | 'arbitrum' | 'bsc';
-export const VENUE_NAMES = { gate: 'Gate', binance: 'Binance', bitget: 'Bitget' } as const;
+export const VENUE_NAMES = { gate: 'Gate', binance: 'Binance', bitget: 'Bitget', okx: 'OKX' } as const;
 export type ChainArbVenue = keyof typeof VENUE_NAMES;
 export function isChainArbVenue(value: unknown): value is ChainArbVenue {
   return typeof value === 'string' && Object.hasOwn(VENUE_NAMES, value);

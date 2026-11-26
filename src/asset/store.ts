@@ -23,7 +23,9 @@ import { acquireSyncLock, AssetConflict, LOCK_BUSY, NOT_IMPORTED, type SyncLease
 import { parseAsterAccount, parseAsterAccountDelete, parseConnection, parseDisconnect, parseEdit, parseFx, parseWithdrawal, parseWithdrawalId } from './validation.ts';
 import { dataDirVault } from './credentials.ts';
 import * as sync from './sync.ts';
-import { createPositionsService, type PositionsServiceOptions } from './positions-service.ts';
+import { connectionRow, createPositionsService, type PositionsServiceOptions } from './positions-service.ts';
+import { createOkxScanDirectory } from './okx-scan-directory.ts';
+import type { OkxDirectorySource } from '../chain-arb/okx-network.ts';
 import { createFillsService, type FillsServiceOptions } from './fills-service.ts';
 import type { HubPositions } from './positions-types.ts';
 import type { FillMarket, HubFills } from './fills-types.ts';
@@ -129,7 +131,7 @@ export function parseImportInfo(value: string): ImportInfo {
 }
 
 
-export interface AssetStore {
+export interface AssetStore extends OkxDirectorySource {
   state(): Promise<AssetState>;
   ledger(): Promise<AssetLedgerView>;
   history(): Promise<AssetHistoryView>;
@@ -200,6 +202,14 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
   let handle: AssetDb | null = null, opened = '', writable = false, busy = false;
   /** The read-only connection the read answers come from (snapshot() below); opened after `handle`, closed with it. */
   let reader: AssetDb | null = null;
+  const okxDirectory = createOkxScanDirectory(() => {
+    if (!attach()) return null;
+    const database = handle!;
+    return database.snapshot(snapshot => {
+      const info = importInfo(snapshot), row = info && connectionRow(snapshot, 'okx');
+      return info && row ? { database, importedAt: info.importedAt, encrypted: row.encrypted } : null;
+    });
+  }, vault.unseal, fetcher, now);
   const dropReader = () => { const open = reader; reader = null; open?.close(); };
   /** Which file is at the path: a file deleted and imported again is a new one, and the open handle would keep reading the deleted one. */
   const identity = (): string | null => {
@@ -207,7 +217,7 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
   };
   const today = (): string => chinaDay(new Date(now()));
-  const drop = () => { dropReader(); handle?.close(); handle = null; writable = false; busy = false; };
+  const drop = () => { okxDirectory.reset(); dropReader(); handle?.close(); handle = null; writable = false; busy = false; };
   /** Read-write when the service owns the files and can write them; otherwise read-only, so the reads still work. */
   function open(present: string) {
     try { assertOwnFiles(dirname(file)); }
@@ -318,6 +328,8 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
       return await snapshot(async (database, info) => ({ ...stamp(info), ...withdrawalsView(await readLedger(database, false)) })) ?? notImported.withdrawals();
     },
     cashFlows,
+    okxScanDirectory: okxDirectory.okxScanDirectory,
+    okxScanDirectoryCurrent: okxDirectory.okxScanDirectoryCurrent,
     async period(id) {
       const found = snapshot(async (database, info) => {
         const rows = await readPeriodRows(database, id);
@@ -344,11 +356,13 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     async connect(body) {
       const input = parseConnection(body);
       await locked((database, lease) => sync.connect(context(database, lease), input));
+      if (input.exchange === 'okx') okxDirectory.reset();
       return ledger();
     },
     async disconnect(body) {
       const exchange = parseDisconnect(body);
       await locked((database, lease) => sync.disconnect(context(database, lease), exchange));
+      if (exchange === 'okx') okxDirectory.reset();
       return ledger();
     },
     async saveAsterAccount(body, editing) {
@@ -385,6 +399,6 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     },
     async positions() { return positionsService.read(await source(), vault.unseal); },
     async fills(market) { return fillsService.read(await source(), vault.unseal, market); },
-    close() { positionsService.close(); fillsService.close(); shared.reset(); drop(); },
+    close() { okxDirectory.close(); positionsService.close(); fillsService.close(); shared.reset(); drop(); },
   };
 }

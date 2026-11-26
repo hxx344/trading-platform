@@ -1,6 +1,8 @@
 // Public Monitor operations. This process owns the venue sockets, abortable network reads, catalogs, rate limits and pagination.
 import type { MarketOperations } from './ipc.ts';
 import { createChainArbMarket } from '../chain-arb/read.ts';
+import { assertOkxDirectory } from '../chain-arb/okx-network.ts';
+import { isObject } from '../contracts.ts';
 import { createPerpetualFeed } from '../monitor/perpetual-feed.ts';
 import { createMarketReaders } from '../monitor/market-readers.ts';
 import { OIL_CANDLE_WINDOW_MS, marketRead } from '../monitor/market-contract.ts';
@@ -73,6 +75,16 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
   }
   async function read(op: string, input: unknown, signal: AbortSignal): Promise<unknown> {
     switch (op) {
+      case 'monitor.perpetual.okxChainArb':
+      case 'monitor.perpetual.okxChainArbScan': {
+        const single = op === 'monitor.perpetual.okxChainArb';
+        const { params, directory, scope, awaitBatch } = fields(input, single ? ['params', 'directory'] : ['params', 'directory', 'scope', 'awaitBatch']);
+        if (!isObject(params) || params.venue !== 'okx') throw new Error('OKX 行情参数无效');
+        assertOkxDirectory(directory, now());
+        if (single) return chain.chainArb(params, signal, directory);
+        if (typeof scope !== 'string' || !/^[a-f0-9]{24}:\d{1,16}$/.test(scope) || typeof awaitBatch !== 'boolean') throw new Error('OKX 扫描代次无效');
+        return chain.scanChainArb(params, scope, signal, awaitBatch, directory);
+      }
       case 'monitor.perpetual.chainArb': return chain.chainArb(input, signal);
       case 'monitor.perpetual.chainArbScan':
       case 'monitor.perpetual.chainArbBatch': {

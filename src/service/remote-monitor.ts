@@ -1,5 +1,6 @@
 // Execution-side public data adapters. Page projections, resume checkpoints, paper positions and tokens remain local.
 import type { MarketClient } from '../market/ipc.ts';
+import type { OkxDirectory } from '../chain-arb/okx-network.ts';
 import type { ChainArbView } from '../chain-arb/model.ts';
 import type { ScanView } from '../chain-arb/scan-model.ts';
 import type { MarketReaders } from '../monitor/market-readers.ts';
@@ -132,7 +133,11 @@ export function createRemoteMonitor(client: MarketClient, clock: () => number = 
     },
     positioning: (quote, options) => read('perpetual.positioning', { exchange: quote.exchange, symbol: quote.symbol, identity: quote.historyIdentity }, options?.signal),
   };
-  return { rounds, perpetual, comparison, chainArb: (input: unknown, signal: AbortSignal) => read<ChainArbView>('perpetual.chainArb', input, signal),
-    scanChainArb: (params: unknown, scope: string, signal: AbortSignal, awaitBatch = false) =>
-      read<ScanView>(awaitBatch ? 'perpetual.chainArbBatch' : 'perpetual.chainArbScan', { params, scope }, signal) };
+  return { rounds, perpetual, comparison,
+    chainArb: (input: unknown, signal: AbortSignal, directory?: OkxDirectory) => directory
+      ? read<ChainArbView>('perpetual.okxChainArb', { params: input, directory }, signal)
+      : read<ChainArbView>('perpetual.chainArb', input, signal),
+    scanChainArb: (params: unknown, scope: string, signal: AbortSignal, awaitBatch = false, directory?: OkxDirectory) => directory
+      ? read<ScanView>('perpetual.okxChainArbScan', { params, scope, awaitBatch, directory }, signal)
+      : read<ScanView>(awaitBatch ? 'perpetual.chainArbBatch' : 'perpetual.chainArbScan', { params, scope }, signal) };
 }

@@ -20,6 +20,7 @@ interface Options {
   scan(input: unknown, scope: string, signal: AbortSignal, awaitBatch?: boolean): Promise<ScanView>;
   control(): MarketControl;
   hooks?: Pick<AlertHooks, 'robot' | 'notifyRepeating'>;
+  okxResultCurrent?: (view: ScanView) => boolean;
   now?: () => number;
 }
 
@@ -46,6 +47,10 @@ function currentSnapshot(snapshot: ScanView, at: number): ScanView {
   return { ...snapshot, asOf: at, rows, history };
 }
 
+function failedSnapshot(at: number, message: string): ScanView {
+  return { asOf: at, phase: 'error', cycle: 0, total: 0, checked: 0, failed: 0, message, rows: [], history: [] };
+}
+
 function notifyMessage(venue: ChainArbVenue, row: ScanRow, settings: BackgroundSettings) {
   const route = row.kind === 'spot' ? '现货充值卖出' : '永续开空（基差收敛情景，未计资金费）';
   return ['【链上折价套利】' + row.symbol + ' · ' + chainNames[row.chain],
@@ -55,7 +60,7 @@ function notifyMessage(venue: ChainArbVenue, row: ScanRow, settings: BackgroundS
     '报价有效至 ' + new Date(row.expiresAt).toISOString() + '，过期请在平台重新复核。'].join('\n');
 }
 
-export function createChainArbBackground({ store, scan, control, hooks, now = Date.now }: Options) {
+export function createChainArbBackground({ store, scan, control, hooks, okxResultCurrent, now = Date.now }: Options) {
   let settings = DEFAULT_BACKGROUND_SETTINGS, revision = 0, loadError: string | null = null;
   try {
     const entry = store.readState(SETTINGS_KEY);
@@ -86,7 +91,14 @@ export function createChainArbBackground({ store, scan, control, hooks, now = Da
   function view(): BackgroundView {
     const on = observeControl(), at = now();
     return { revision, settings, robot: hooks?.robot() ?? null, error: loadError ?? ([...queueErrors.values()].join('；') || null),
-      results: on ? Object.fromEntries([...results].map(([venue, snapshot]) => [venue, currentSnapshot(snapshot, at)])) : {} };
+      results: on ? Object.fromEntries([...results].map(([venue, snapshot]) => {
+        if (venue === 'okx' && !okxResultCurrent?.(snapshot)) {
+          const message = snapshot.phase === 'error' && snapshot.total === 0 && snapshot.checked === 0
+            ? snapshot.message : null;
+          return [venue, failedSnapshot(at, message ?? 'OKX 只读连接或币链目录待重新核验')];
+        }
+        return [venue, currentSnapshot(snapshot, at)];
+      })) : {} };
   }
   function update(input: unknown): BackgroundView {
     const body = exactKeys(input, ['revision', 'settings']);
@@ -117,12 +129,14 @@ export function createChainArbBackground({ store, scan, control, hooks, now = Da
       if (!current()) return;
       signal.throwIfAborted();
       checkSnapshot(snapshot, venue, settings.chain);
+      if (venue === 'okx' && !okxResultCurrent?.(snapshot)) throw new Error('OKX 只读连接或币链目录待重新核验');
       results.set(venue, snapshot);
       if (!hooks?.robot() || !hooks.notifyRepeating || (snapshot.phase !== 'scanning' && snapshot.phase !== 'cooldown')) return;
       queueErrors.delete(venue);
       for (const row of snapshot.rows) {
         const at = now();
         if (snapshot.asOf > at || row.at > at || row.expiresAt <= at || row.netBps <= thresholdBps) continue;
+        if (venue === 'okx' && !okxResultCurrent?.(snapshot)) throw new Error('OKX 只读连接或币链目录待重新核验');
         const key = ['chain-arb', venue, row.chain, row.address.toLowerCase(), row.kind].join(':');
         try { hooks.notifyRepeating(key, notifyMessage(venue, row, settings)); }
         catch (error) { queueErrors.set(venue, VENUE_NAMES[venue] + ' 通知入队失败：' + reason(error)); break; }
@@ -130,8 +144,10 @@ export function createChainArbBackground({ store, scan, control, hooks, now = Da
     } catch (error) {
       if (!current()) return;
       const previous = results.get(venue);
-      results.set(venue, { cycle: 0, total: 0, checked: 0, failed: 0, ...previous, asOf: now(), phase: 'error',
-        message: signal.aborted ? '后台行情读取超时，稍后重试' : reason(error), rows: [], history: previous ? [...previous.rows, ...previous.history] : [] });
+      const failure = failedSnapshot(now(), signal.aborted ? '后台行情读取超时，稍后重试' : reason(error));
+      results.set(venue, venue !== 'okx' && previous ? { ...failure,
+        cycle: previous.cycle, total: previous.total, checked: previous.checked, failed: previous.failed,
+        history: [...previous.rows, ...previous.history] } : failure);
     } finally {
       controller.abort();
       if (pending.get(venue) === controller) pending.delete(venue);

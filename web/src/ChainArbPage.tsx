@@ -5,7 +5,7 @@ import type { ShellView } from '../../src/shell-view.ts';
 import { api } from './api.ts';
 import { chainArbQuery, chainNames, initialChainArbForm, readTimedChainArb, type ChainArbForm } from './chain-arb-form.ts';
 import { reviewScanRow } from './chain-arb-scan-form.ts';
-import { ChainArbScan } from './ChainArbScan.tsx';
+import { ChainArbScan, OkxConnectionHelp } from './ChainArbScan.tsx';
 import { clock } from './labels.ts';
 import { readFailure, type ResourceSnapshot } from './live-resource.ts';
 import { Callout, StatePanel } from './StateViews.tsx';
@@ -87,7 +87,7 @@ function Quote({ query, onExpired }: { query: Query; onExpired: () => void }) {
 }
 
 type ManualSetup = { form: ChainArbForm; autoGas: boolean };
-function SingleEstimate({ initial, scopeKey, onExpired }: { initial: ManualSetup; scopeKey: string; onExpired: () => void }) {
+function SingleEstimate({ initial, scopeKey, assetEnabled, onExpired }: { initial: ManualSetup; scopeKey: string; assetEnabled: boolean; onExpired: () => void }) {
   const [form, setForm] = useState(initial.form);
   const [query, setQuery] = useState<Query | null>(() => chainArbQuery(initial.form, initial.autoGas));
   const [autoGas, setAutoGas] = useState(initial.autoGas);
@@ -138,6 +138,7 @@ function SingleEstimate({ initial, scopeKey, onExpired }: { initial: ManualSetup
             <option value="manual">计入手填成本</option><option value="auto">按路由报价自动扣除</option>
           </select></label>
         </div>
+        {form.venue === 'okx' && <OkxConnectionHelp assetEnabled={assetEnabled} />}
         <div className="chain-arb-routes">
           {field('spotCosts', '现货路线其他成本（USDT）', autoGas ? '转账等额外成本' : 'Gas、转账等合计')}
           {field('perpCosts', '永续路线其他成本（USDT）', autoGas ? '现货离场等额外成本' : 'Gas、现货离场手续费等合计')}
@@ -161,8 +162,12 @@ export function ChainArbPage({ shell, onExpired }: { shell: ResourceSnapshot<She
   if (failure) return <StatePanel kind="error" title="无法核对行情开关" detail={failure} />;
   if (!shell.data) return <StatePanel kind="loading" title="正在核对行情开关…" />;
   const scope = shell.data.monitor?.perpetual;
-  if (!scope) return <StatePanel kind="empty" title="尚未配置合约价差监控"><a className="button secondary" href="#/settings">打开设置</a></StatePanel>;
-  if (!scope.enabled) return <StatePanel kind="empty" title="合约价差监控已关闭"><a className="button secondary" href="#/monitor">打开行情监控</a></StatePanel>;
+  if (!scope) return <StatePanel kind="empty" title="尚未配置合约价差监控"
+    detail="在设置的「从工作台导入」中点「读取工作台」，勾选「启用行情监控」并导入。服务重启后回到这里即可设置扫描。">
+    <a className="button secondary" href="#/settings">打开设置</a></StatePanel>;
+  if (!scope.enabled) return <StatePanel kind="empty" title="合约价差监控已关闭"
+    detail="打开行情监控的「合约价差」页签，开启「运行监控」，即可在这里查看报价和配置扫描。">
+    <a className="button secondary" href="?monitor=perpetual#/monitor">打开合约价差监控</a></StatePanel>;
   const scopeKey = [shell.data.generation, scope.revision].join('/');
   return <div className="chain-arb-page">
     <div className="toolbar" role="group" aria-label="链上折价套利视图">
@@ -171,8 +176,8 @@ export function ChainArbPage({ shell, onExpired }: { shell: ResourceSnapshot<She
       <button type="button" aria-pressed={mode === 'single'} className={'button ' + (mode === 'single' ? 'primary' : 'secondary')}
         onClick={() => setMode('single')}>单币测算</button>
     </div>
-    {mode === 'scan' ? <ChainArbScan key={scopeKey} onExpired={onExpired}
+    {mode === 'scan' ? <ChainArbScan key={scopeKey} assetEnabled={shell.data.modules.asset} onExpired={onExpired}
       onReview={(form, row) => { setManual(reviewScanRow(form, row)); setMode('single'); }} />
-      : <SingleEstimate initial={manual} scopeKey={scopeKey} onExpired={onExpired} />}
+      : <SingleEstimate initial={manual} scopeKey={scopeKey} assetEnabled={shell.data.modules.asset} onExpired={onExpired} />}
   </div>;
 }

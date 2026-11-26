@@ -394,14 +394,14 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
         events: () => [], latestSeq: () => 0, pairs: () => [], incidentPair: () => null });
     } catch (error) { monitorOutboxError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`行情告警的出站队列（${MONITOR_OUTBOX_FILE}）无法打开，行情告警暂停入队：${monitorOutboxError}\n`); }
   }
+  // The ledger opens its file on demand, including when it is first imported after startup.
+  const asset = config.asset ? createAssetStore(join(dir, ASSET_DB_FILE)) : null;
   if (config.monitor) {
     const alertHooks = marketAlertHooks({ secrets, notifier, monitorOutbox, monitorOutboxError, send: (secret, text) => sendFeishu(secret, { msg_type: 'text', content: { text } }, notifyFetch ? { fetchImpl: notifyFetch } : {}) });
-    try { monitor = openMonitor(config.monitor, dir, { ...(monitorFetch ? { fetchImpl: monitorFetch } : {}), alertHooks, marketClient }); collector = monitor.perpetual; }
+    try { monitor = openMonitor(config.monitor, dir, { ...(monitorFetch ? { fetchImpl: monitorFetch } : {}), okxLedger: asset ?? undefined, alertHooks, marketClient }); collector = monitor.perpetual; }
     catch (error) { monitorError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`行情监控库无法打开，行情监控页不可用：${monitorError}\n`); }
   }
   const closeMonitorStore = () => { if (monitor) closeMonitor(monitor); };
-  // Opened lazily by the store (read-write, read-only when the service cannot write it): a missing or not yet imported asset.sqlite answers "not imported".
-  const asset = config.asset ? createAssetStore(join(dir, ASSET_DB_FILE)) : null;
   const enabled = executor.transferPairs().filter(pair => pair.enabled).length;
   // The options engine's task messages (and any it sent while starting) go out through the notifier from here on.
   optionsNotify = text => notifier.notify(`【期权】${text}`);

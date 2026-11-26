@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { VENUE_NAMES, type ChainArbVenue } from '../../src/chain-arb/model.ts';
-import { DEFAULT_BACKGROUND_SETTINGS, type BackgroundView } from '../../src/chain-arb/background-model.ts';
+import { ALL_SCAN_VENUES, type BackgroundView } from '../../src/chain-arb/background-model.ts';
 import type { ScanRow, ScanView } from '../../src/chain-arb/scan-model.ts';
 import { api, ApiError } from './api.ts';
 import { chainNames } from './chain-arb-form.ts';
@@ -38,11 +38,18 @@ function ScanTable({ rows, history, review }: { rows: ScanRow[]; history?: boole
   </table></div>;
 }
 
-function ScanSettings({ view, saving, form, edit, apply, reset, changed, conflict, error, saved }: {
-  view: BackgroundView; saving: boolean; form: BackgroundDraft; edit: (patch: Partial<BackgroundDraft>) => void;
+export function OkxConnectionHelp({ assetEnabled }: { assetEnabled: boolean }) {
+  return <div className="toolbar">
+    <span className="muted">{assetEnabled ? 'OKX 使用资产账本中保存的只读连接，可在「交易所连接」中管理。'
+      : '请先在设置的「从工作台导入」中启用资产账本，再到资产页的「交易所连接」添加 OKX 只读账户。'}</span>
+    <a className="button secondary" href={assetEnabled ? '#/asset' : '#/settings'}>{assetEnabled ? '打开资产账本' : '打开设置'}</a>
+  </div>;
+}
+
+function ScanSettings({ view, assetEnabled, saving, form, edit, apply, reset, changed, conflict, error, saved }: {
+  view: BackgroundView; assetEnabled: boolean; saving: boolean; form: BackgroundDraft; edit: (patch: Partial<BackgroundDraft>) => void;
   apply: (event: FormEvent) => void; reset: () => void; changed: boolean; conflict: boolean; error: string; saved: boolean;
 }) {
-  const all = DEFAULT_BACKGROUND_SETTINGS.venues;
   function field(key: Exclude<keyof ScanForm, 'chain'> | 'thresholdBps', label: string) {
     return <label>{label}<input data-slot="input" name={key} value={form[key]} inputMode="decimal" autoComplete="off"
       onChange={e => edit({ [key]: e.target.value })} /></label>;
@@ -68,10 +75,11 @@ function ScanSettings({ view, saving, form, edit, apply, reset, changed, conflic
       <fieldset className="chain-arb-config" disabled={saving}>
         <label className="chain-arb-check"><input type="checkbox" name="enabled" checked={form.enabled}
           onChange={e => edit({ enabled: e.target.checked })} />启用后台扫描</label>
-        <fieldset className="chain-arb-venues"><legend>扫描交易所</legend><div className="toolbar">{all.map(venue =>
+        <fieldset className="chain-arb-venues"><legend>扫描交易所</legend><div className="toolbar">{ALL_SCAN_VENUES.map(venue =>
           <label className="chain-arb-check" key={venue}><input type="checkbox" name={'venue-' + venue}
             checked={form.venues.includes(venue)} onChange={e => edit({ venues: e.target.checked ? [...form.venues, venue] : form.venues.filter(v => v !== venue) })} />
             {VENUE_NAMES[venue]}</label>)}</div></fieldset>
+        {form.venues.includes('okx') && <OkxConnectionHelp assetEnabled={assetEnabled} />}
         <div className="chain-arb-fields">
           <label>网络<select data-slot="select-trigger" name="chain" value={form.chain} onChange={e => edit({ chain: e.target.value })}>
             <option value="all">全部网络（3 条链）</option>
@@ -83,7 +91,7 @@ function ScanSettings({ view, saving, form, edit, apply, reset, changed, conflic
         <details className="chain-arb-fees"><summary>费率与额外成本</summary>
           <div className="chain-arb-fields">{field('spotFeeBps', rateLabels.spotFeeBps)}{field('perpFeeBps', rateLabels.perpFeeBps)}
             {field('spotCosts', '现货额外成本（USDT）')}{field('perpCosts', '永续额外成本（USDT）')}</div>
-          {all.filter(v => form.venues.includes(v)).map(venue => <div key={venue} className="chain-arb-override">
+          {ALL_SCAN_VENUES.filter(v => form.venues.includes(v)).map(venue => <div key={venue} className="chain-arb-override">
             <label className="chain-arb-check"><input name={'fees-' + venue} type="checkbox" checked={!!form.fees?.[venue]}
               onChange={() => toggleRates(venue)} />为 {VENUE_NAMES[venue]} 单独设置费率</label>
             {form.fees?.[venue] ? <div className="chain-arb-routes">{rateField(venue, 'spotFeeBps')}{rateField(venue, 'perpFeeBps')}</div> : null}
@@ -102,7 +110,7 @@ function ScanSettings({ view, saving, form, edit, apply, reset, changed, conflic
   </section>;
 }
 
-export function ChainArbScan({ onReview, onExpired }: { onReview: Review; onExpired: () => void }) {
+export function ChainArbScan({ assetEnabled, onReview, onExpired }: { assetEnabled: boolean; onReview: Review; onExpired: () => void }) {
   const read = useLiveResource(path, { intervalMs: 2_000, read: load, onExpired });
   const [draft, setDraft] = useState<{ revision: number; form: BackgroundDraft } | null>(null);
   const [error, setError] = useState(''), [saving, setSaving] = useState(false), [saved, setSaved] = useState(false);
@@ -143,7 +151,7 @@ export function ChainArbScan({ onReview, onExpired }: { onReview: Review; onExpi
   }
   const review = (row: ScanRow) => onReview(venueScanForm(current.settings, row.venue ?? 'gate'), row);
   return <>
-    <ScanSettings view={current} form={form} saving={saving} edit={edit} changed={draft !== null} conflict={conflict} saved={saved}
+    <ScanSettings view={current} assetEnabled={assetEnabled} form={form} saving={saving} edit={edit} changed={draft !== null} conflict={conflict} saved={saved}
       apply={apply} reset={() => { setDraft(null); setError(''); setSaved(false); }} error={error} />
     {failure ? <Callout tone="error">扫描读取失败 · {failure}。恢复前仅显示最近采样。</Callout> : null}
     {view.error ? <Callout tone="warning">{view.error}</Callout> : null}

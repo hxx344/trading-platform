@@ -17,7 +17,7 @@
 
 | 模块 | 配置键 | 首发版本 | 现状 | 文档 |
 | --- | --- | --- | --- | --- |
-| 链上折价套利 | `monitor.perpetual`（共用） | v0.96.0 | Gate、Binance、Bitget 的链上折价后台扫描，现货卖出与永续开空的扣费价差排名及飞书阈值提醒（v0.98.0） | [chain-arb.md](chain-arb.md) |
+| 链上折价套利 | `monitor.perpetual`（共用） | v0.96.0 | Gate、Binance、Bitget、OKX 的链上折价后台扫描，现货与永续扣费排名及飞书阈值提醒。OKX 复用资产账本只读连接（v0.100.0） | [chain-arb.md](chain-arb.md) |
 | ASTER 保证金平衡与 ADL | `pairs` | v0.1.0 | 2026-11-13 配对 `xau` 实盘运行 | 本文、[executor.md](executor.md)、[live-results.md](live-results.md) |
 | 原油双腿 | `oil` | v0.8.0 | 第一批（O1a–O1d）完成，实盘开仓、平仓各两笔；价差自动规则 O2（v0.18.0 观察、v0.22.0 实盘）；O3 Binance 本地追价、追价界限与分批（v0.26.0，未实盘）；O4 盈亏、资金费与平仓账本（v0.28.0，只读，真实账单未实测）；O5 OKX 执行（v0.56.0，原油与海力士，未实盘）；O6 四腿（v0.58.0，原油与海力士，两所各一组同所两腿成组执行，未实盘）；O7 盘口优先用行情监控推送（v0.59.0） | [oil.md](oil.md) |
 | 金油双腿 | `oil`（共用） | v0.74.0 | G1：同所 XAU 对 CL 或 BZ 等金额、跨所 XAU，与原油共用执行账户与执行器，任务按全部腿判定品种；未实盘，自动规则、名义平衡、四腿、盈亏后置 | [goldoil.md](goldoil.md) |

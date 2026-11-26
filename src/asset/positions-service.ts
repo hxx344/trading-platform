@@ -11,7 +11,7 @@
 // - unseal is the local vault (synchronous); the fetch every reader uses is injectable (tests);
 // - close() stops every entry (the workbench's service lives as long as its process).
 import { createHash } from 'node:crypto';
-import type { AssetDb } from './db.ts';
+import type { AssetDb, SnapshotDb } from './db.ts';
 import { parseConnection, type Credentials } from './validation.ts';
 import { POSITIONS_CATALOG } from './positions-catalog.ts';
 import type { PositionsExchangeId, ScopeDefinition } from './positions-catalog.ts';
@@ -77,7 +77,7 @@ function withoutTable<T>(read: () => T, empty: T): T {
 export function connectionRows(database: Database | null): ConnectionRow[] {
   return database ? withoutTable(() => database.prepare('SELECT exchange,encrypted FROM connections').rows<ConnectionRow>(), []) : [];
 }
-export function connectionRow(database: Database | null, key: string): { encrypted: string } | null {
+export function connectionRow(database: Database | SnapshotDb | null, key: string): { encrypted: string } | null {
   return database ? withoutTable(() => database.prepare('SELECT encrypted FROM connections WHERE exchange = ?').bind(key).get<{ encrypted: string }>(), null) : null;
 }
 
@@ -210,7 +210,7 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
   function refresh(database: DatabaseSource, account: SourceAccount, entry: Entry, key: string, unseal: Unseal) {
     if (entry.pending) return;
     entry.scope.refreshing = true;
-    const generation = historyGeneration(database, account.key, entry.revision);
+    const generation = historyGeneration(database, account.key, entry.revision, now);
     entry.pending = limited(async () => {
       if (entries.get(key) !== entry || !current(database, account, entry.revision)) return;
       const abort = new AbortController(); entry.abort = abort;

@@ -222,7 +222,7 @@ export function createFillsService(options: FillsServiceOptions = {}) {
     clearTimeout(entry.timer); entry.timer = undefined; entry.retryScheduled = false;
     entry.automaticRetries = automatic ? entry.automaticRetries + 1 : 0;
     const abort = entry.abort = new AbortController();
-    const generation = historyGeneration(database, account.key, entry.revision);
+    const generation = historyGeneration(database, account.key, entry.revision, now);
     const signal = anySignal([abort.signal, generation.signal]);
     entry.scope.refreshing = true;
     const valid = () => {

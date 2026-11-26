@@ -1,9 +1,11 @@
+import { VENUE_NAMES } from './model.ts';
+
 type Release = () => void;
 type Waiter = { scanning: boolean; grant(release: Release): void };
 
 const STARTS_PER_SECOND = 3, MAX_ACTIVE = 4;
-// All three scanners can queue both tokens of a batch, even with manual readers already waiting.
-const MAX_SCAN_WAITERS = 6, MAX_MANUAL_WAITERS = 2;
+// Reserve both places in a batch for every venue, even with manual readers already waiting.
+const MAX_SCAN_WAITERS = 2 * Object.keys(VENUE_NAMES).length, MAX_MANUAL_WAITERS = 2;
 
 export function createQuoteBudget(now: () => number) {
   const queue: Waiter[] = [];

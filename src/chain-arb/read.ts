@@ -1,5 +1,6 @@
 import { anySignal } from '../any-signal.mjs';
 import { untilAborted } from '../asset/sources/shared-reads.ts';
+import Decimal from '../vendor/decimal.mjs';
 import { readDex } from './dex.ts';
 import { createGateReader } from './gate.ts';
 import { createBinanceReader } from './binance.ts';
@@ -11,18 +12,20 @@ import { parseChainArbScan } from './scan-model.ts';
 import { createScanCatalog } from './catalog.ts';
 import { createChainArbScanner } from './scan.ts';
 import { createQuoteBudget } from './quote-budget.ts';
+import { createOkxReader } from './okx.ts';
+import { assertOkxDirectory, type OkxDirectory } from './okx-network.ts';
 
 // The single-token view and the scanner share the same public sources, metadata cache and request budget.
 export function createChainArbMarket({ fetchImpl = fetch, now = Date.now, venueReaders }: {
-  fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; now?: () => number; venueReaders?: Record<ChainArbVenue, VenueReader>;
+  fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; now?: () => number; venueReaders?: Record<Exclude<ChainArbVenue, 'okx'>, VenueReader>;
 } = {}) {
   const options = { fetchImpl, now };
-  const readers: Record<ChainArbVenue, VenueReader> = venueReaders ?? {
+  const readers = venueReaders ?? {
     gate: { read: createGateReader({ fetcher: fetchImpl, clock: now }), catalog: createScanCatalog(options) },
     binance: createBinanceReader(options), bitget: createBitgetReader(options),
   };
   const acquire = createQuoteBudget(now), closing = new AbortController();
-  async function quote(raw: unknown, signal: AbortSignal, scanning: boolean): Promise<ChainArbView> {
+  async function quote(raw: unknown, signal: AbortSignal, scanning: boolean, reader: VenueReader): Promise<ChainArbView> {
     const input = parseChainArb(raw);
     signal.throwIfAborted();
     const stop = new AbortController();
@@ -33,7 +36,7 @@ export function createChainArbMarket({ fetchImpl = fetch, now = Date.now, venueR
       release = await acquire(waiting, scanning);
       const life = scanning ? anySignal([waiting, stop.signal], 12_000) : waiting;
       life.throwIfAborted();
-      const name = input.venue ?? 'gate', reader = readers[name];
+      const name = input.venue ?? 'gate';
       const [buy, venue] = await untilAborted(Promise.all([readDex(input, life, fetchImpl), reader.read(input, life, scanning)]), life);
       life.throwIfAborted();
       if (input.source === 'scan') {
@@ -49,12 +52,43 @@ export function createChainArbMarket({ fetchImpl = fetch, now = Date.now, venueR
       release?.();
     }
   }
-  const scanner = (reader: VenueReader) => createChainArbScanner({ catalog: reader.catalog, quote: (raw, signal) => quote(raw, signal, true), now });
-  const scans = { gate: scanner(readers.gate), binance: scanner(readers.binance), bitget: scanner(readers.bitget) };
-  return { chainArb: (raw: unknown, signal: AbortSignal) => quote(raw, signal, false),
-    async scanChainArb(raw: unknown, scope: string, signal: AbortSignal, awaitBatch = false) {
-      const input = parseChainArbScan(raw);
-      return scans[input.venue ?? 'gate'].read(input, scope, signal, awaitBatch);
+  const context = (reader: VenueReader) => ({ reader, scan: createChainArbScanner({
+    catalog: reader.catalog, quote: (raw, signal) => quote(raw, signal, true, reader), now,
+  }) });
+  const markets = { gate: context(readers.gate), binance: context(readers.binance), bitget: context(readers.bitget) };
+  type OkxSession = ReturnType<typeof context> & { directory: OkxDirectory };
+  let okx: OkxSession | undefined;
+  function market(venue: ChainArbVenue = 'gate', proof?: OkxDirectory) {
+    if (venue !== 'okx') return markets[venue];
+    assertOkxDirectory(proof, now());
+    if (!okx || okx.directory.connection !== proof.connection) {
+      okx?.scan.close();
+      const session: OkxSession = { ...context(createOkxReader(options, () => {
+        if (okx !== session || now() < session.directory.at || now() >= session.directory.expiresAt) throw new Error('OKX 链目录需要重新核验');
+        return session.directory;
+      })), directory: proof };
+      okx = session;
+    } else if (okx.directory.at !== proof.at) {
+      if (okx.directory.at > proof.at) throw new Error('OKX 链目录已经更新');
+      const next = new Map(proof.rows.map(row => [row.chain + ':' + row.address, row]));
+      const prior = new Map(okx.directory.rows.map(row => [row.chain + ':' + row.address, row]));
+      okx.directory = proof;
+      okx.scan.revalidateSamples((candidate, kind) => {
+        const key = candidate.chain + ':' + candidate.address, row = next.get(key);
+        if (row?.symbol !== candidate.symbol) return false;
+        const old = prior.get(key);
+        return kind === 'perp' || (!!old && row.depositEligible && new Decimal(row.minDeposit).eq(old.minDeposit));
+      });
+    }
+    return okx;
+  }
+  return { async chainArb(raw: unknown, signal: AbortSignal, proof?: OkxDirectory) {
+      const input = parseChainArb(raw);
+      return quote(raw, signal, false, market(input.venue, proof).reader);
     },
-    closeChainArb() { closing.abort(); for (const scan of Object.values(scans)) scan.close(); } };
+    async scanChainArb(raw: unknown, scope: string, signal: AbortSignal, awaitBatch = false, proof?: OkxDirectory) {
+      const input = parseChainArbScan(raw);
+      return market(input.venue, proof).scan.read(input, scope, signal, awaitBatch);
+    },
+    closeChainArb() { closing.abort(); okx?.scan.close(); for (const entry of Object.values(markets)) entry.scan.close(); } };
 }

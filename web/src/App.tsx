@@ -53,7 +53,7 @@ function isStale(read: ResourceSnapshot<unknown>) {
     || (read.status === 'loading' && (read.error !== null || old)));
 }
 
-const ALWAYS: readonly NavEntry[] = ['pairs', 'status', 'logs', 'settings'];
+const ALWAYS: readonly NavEntry[] = ['pairs', 'chain-arb', 'status', 'logs', 'settings'];
 const ICONS: Record<NavEntry, LucideIcon> = { asset: Wallet, positions: Layers, monitor: Activity, news: Newspaper, oil: ArrowLeftRight, hynix: Cpu, goldoil: Scale, crossex: Gauge, ondo: Coins, varlighter: Waves, pairs: ShieldCheck, options: Sigma, mev: Zap, 'chain-arb': Link2, status: Server, logs: ScrollText, settings: Settings2 };
 /** Below this width the side navigation is a drawer (the workbench's 760px breakpoint, shell.css). */
 const DRAWER_QUERY = '(max-width: 760px)';
@@ -112,7 +112,6 @@ export function App() {
     if (state.modules.oil) { available.add('hynix'); available.add('goldoil'); }
     if (state.modules.asset) available.add('positions');
     if (state.monitor !== null) available.add('monitor');
-    if (state.monitor?.perpetual) available.add('chain-arb');
   }
   const current = entryOf(route), crumb = breadcrumbOf(route);
   // The phone drawer, as in the workbench: focus moves into it, Tab cycles inside, Escape or the backdrop closes it and

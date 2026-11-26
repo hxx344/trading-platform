@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { SCAN_HISTORY_MS, parseChainArbScan } from '../../src/chain-arb/scan-model.ts';
 import { chainArbQuery } from '../src/chain-arb-form.ts';
-import { DEFAULT_BACKGROUND_SETTINGS } from '../../src/chain-arb/background-model.ts';
+import { ALL_SCAN_VENUES, DEFAULT_BACKGROUND_SETTINGS } from '../../src/chain-arb/background-model.ts';
 import { backgroundBands, backgroundDraft, initialScanForm, readTimedScan, reviewScanRow, saveBackgroundDraft, scanBands,
   scanQuery, venueScanForm } from '../src/chain-arb-scan-form.ts';
 
@@ -82,6 +82,8 @@ test('paused, failed and cooling-down scans keep bounded recent samples; expired
 
 test('后台扫描草稿按版本保存，允许零阈值和交易所独立费率，至少选一个市场', () => {
   const draft = backgroundDraft(DEFAULT_BACKGROUND_SETTINGS);
+  assert.ok(ALL_SCAN_VENUES.includes('okx'));
+  assert.deepEqual(draft.venues, ['gate', 'binance', 'bitget']);
   const changed = { ...draft, enabled: true, thresholdBps: '0', amount: '25.50', venues: ['bitget', 'binance'],
     fees: { binance: { spotFeeBps: '8.3', perpFeeBps: '5' }, bitget: { spotFeeBps: '10', perpFeeBps: '5' } } };
   const settings = saveBackgroundDraft(changed);
@@ -116,17 +118,21 @@ test('跨所榜单使用各快照生成时间和本次 GET 往返耗时，单所
 
 test('从单行复核只传已保存的预算、路线成本和该所费率，不混入飞书或后台参数', () => {
   const settings = { ...DEFAULT_BACKGROUND_SETTINGS, amount: '212', spotCosts: '1.25', perpCosts: '2',
-    fees: { bitget: { spotFeeBps: '7.5', perpFeeBps: '2' } } };
-  for (const venue of ['binance', 'bitget']) {
+    fees: { bitget: { spotFeeBps: '7.5', perpFeeBps: '2' }, okx: { spotFeeBps: '9', perpFeeBps: '4' } } };
+  const withOkx = saveBackgroundDraft({ ...backgroundDraft(settings), venues: ['okx', 'binance', 'bitget'] });
+  assert.deepEqual(withOkx.venues, ['binance', 'bitget', 'okx']);
+  assert.deepEqual(saveBackgroundDraft(backgroundDraft(withOkx)), withOkx);
+  for (const venue of withOkx.venues) {
     const form = venueScanForm(settings, venue);
     assert.deepEqual(Object.keys(form).sort(), Object.keys(initialScanForm).sort());
-    assert.equal(form.spotFeeBps, venue === 'binance' ? '10' : '7.5');
+    assert.equal(form.spotFeeBps, { binance: '10', bitget: '7.5', okx: '9' }[venue]);
     const review = reviewScanRow(form, row('ABC', { venue }));
     const query = chainArbQuery(review.form, review.autoGas).input;
     assert.equal(query.venue, venue);
     assert.equal(query.amount, '212');
     assert.equal(query.perpCosts, 2);
     assert.equal(query.spotFeeBps, Number(form.spotFeeBps));
+    assert.equal(query.perpFeeBps, Number(form.perpFeeBps));
     assert.equal(query.swapGas, 'auto');
   }
 });

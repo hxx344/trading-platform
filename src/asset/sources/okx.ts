@@ -1,9 +1,10 @@
 // Copied from project_aggregation modules/asset/lib/okx.ts at 0014655.
-// Changes: imports point at src/vendor and ../types.ts. Logic, host, read-only paths, the 12 s timeout, the 2 MB limit and messages are unchanged.
+// The ledger and scan directory share signing, the fixed host and the read-only permission check.
 import { okxAuthHeaders } from '../../vendor/okx.mjs';
 import { readJsonResponse } from '../../vendor/response.mjs';
 import type { Balance } from '../types.ts';
 import { PositionsPermissionError } from '../positions-values.ts';
+import { OKX_DIRECTORY_TTL } from '../../chain-arb/okx-network.ts';
 
 export type OkxCredential = { apiKey: string; apiSecret: string; passphrase: string };
 type Json = Record<string, unknown>;
@@ -11,6 +12,7 @@ type Fetcher = typeof fetch;
 
 const CONFIG_PATH = '/api/v5/account/config';
 const VALUATION_PATH = '/api/v5/asset/asset-valuation';
+const CURRENCIES_PATH = '/api/v5/asset/currencies';
 const READ_PATHS = new Set([CONFIG_PATH, VALUATION_PATH]);
 const ACCOUNT_NAMES = {
   funding: '资金账户（USD 估值）',
@@ -38,29 +40,44 @@ function singleAccount(data: unknown[]): Json {
   return data[0];
 }
 
-export async function okxGet(c: OkxCredential, path: string, fetcher: Fetcher = fetch): Promise<unknown[]> {
-  if (!READ_PATHS.has(path)) throw new Error('仅支持 OKX 只读账户接口');
+type ScanRead = { signal: AbortSignal; now: () => number; deniedAt: number };
+async function requestOkx(c: OkxCredential, requestPath: string, fetcher: Fetcher, scan?: ScanRead) {
   if ([c?.apiKey, c?.apiSecret, c?.passphrase].some(value => typeof value !== 'string' || !value.trim())) throw new Error('OKX API Key、Secret 与 Passphrase 不能为空');
-  // The fixed USD query is included in the exact request path used for signing.
-  const requestPath = path + (path === VALUATION_PATH ? '?ccy=USD' : '');
+  const now = scan?.now ?? Date.now, start = now();
+  const signal = scan?.signal ?? AbortSignal.timeout(12000);
   let response: Response;
   try {
+    signal.throwIfAborted();
     response = await fetcher('https://openapi.okx.com' + requestPath, {
       method: 'GET',
-      headers: { 'Content-Type': 'application/json', ...okxAuthHeaders(c, { timestamp: new Date().toISOString(), method: 'GET', requestPath }) },
+      headers: { 'Content-Type': 'application/json', ...okxAuthHeaders(c, { timestamp: new Date(start).toISOString(), method: 'GET', requestPath }) },
       redirect: 'manual',
-      signal: AbortSignal.timeout(12000),
+      cache: 'no-store', signal,
     });
   } catch {
     // Transport errors can contain authenticated request details; never relay them.
     throw new Error(READ_FAILED);
   }
-  if (response.redirected || !response.ok) {
+  if (response.redirected || !response.ok || (scan && (response.status !== 200 || response.headers.has('content-range')))) {
+    void response.body?.cancel().catch(() => {});
     const status = Number.isInteger(response.status) && response.status >= 100 && response.status <= 599 ? `（HTTP ${response.status}）` : '';
     throw new Error(`OKX 读取失败${status}，请检查网络、API 权限及服务器时间；已保留上次数据`);
   }
+  let at = start;
+  if (scan) {
+    const age = response.headers.get('age') ?? '0', date = response.headers.get('date');
+    const dateAt = date === null ? start : Date.parse(date);
+    at = Math.min(start - Number(age) * 1000, dateAt);
+    // Age is expressed in whole seconds. Even Age: 0 can describe a response from just before a denial.
+    const earliest = Math.min(dateAt, start - Number(age) * 1000 - (response.headers.has('age') ? 999 : 0));
+    if (!/^\d+$/.test(age) || !Number.isSafeInteger(at) || at <= 0 || (scan.deniedAt > 0 && earliest <= scan.deniedAt)
+      || dateAt > now() + 2000 || now() - at >= OKX_DIRECTORY_TTL) {
+      void response.body?.cancel().catch(() => {});
+      throw new Error(READ_FAILED);
+    }
+  }
   let data: unknown;
-  try { data = await readJsonResponse(response, { maxBytes: MAX_BODY_BYTES }); }
+  try { data = await readJsonResponse(response, { maxBytes: MAX_BODY_BYTES, signal }); }
   catch { throw new Error(READ_FAILED); }
   if (!isObject(data)) throw new Error(INCOMPLETE);
   if (data.code !== '0') {
@@ -68,13 +85,30 @@ export async function okxGet(c: OkxCredential, path: string, fetcher: Fetcher = 
     throw new Error(`OKX 读取失败（${code}），请检查 API 权限、IP 白名单及服务器时间；已保留上次数据`);
   }
   if (!Array.isArray(data.data)) throw new Error(INCOMPLETE);
-  return data.data;
+  return { rows: data.data as unknown[], at };
+}
+
+export async function okxGet(c: OkxCredential, path: string, fetcher: Fetcher = fetch): Promise<unknown[]> {
+  if (!READ_PATHS.has(path)) throw new Error('仅支持 OKX 只读账户接口');
+  return (await requestOkx(c, path + (path === VALUATION_PATH ? '?ccy=USD' : ''), fetcher)).rows;
+}
+
+function assertReadOnly(config: unknown[]) {
+  if (config.length !== 1 || !isObject(config[0])) throw new PositionsPermissionError(INCOMPLETE);
+  if (config[0].perm !== 'read_only') throw new PositionsPermissionError('此 OKX API 无法确认只读权限，请使用仅启用读取的 API');
+}
+
+export async function readOkxCurrencies(c: OkxCredential, fetcher: Fetcher, scan: ScanRead, checkConnection: () => void) {
+  const config = await requestOkx(c, CONFIG_PATH, fetcher, scan);
+  checkConnection();
+  if (scan.now() - config.at >= OKX_DIRECTORY_TTL) throw new Error(READ_FAILED);
+  assertReadOnly(config.rows);
+  const currencies = await requestOkx(c, CURRENCIES_PATH, fetcher, scan);
+  return { rows: currencies.rows, at: Math.min(config.at, currencies.at) };
 }
 
 export async function syncOkx(c: OkxCredential, fetcher: Fetcher = fetch): Promise<{ total: number; details: Balance[]; updatedAt: string }> {
-  const config = await okxGet(c, CONFIG_PATH, fetcher);
-  if (config.length !== 1 || !isObject(config[0])) throw new PositionsPermissionError(INCOMPLETE);
-  if (config[0].perm !== 'read_only') throw new PositionsPermissionError('此 OKX API 无法确认只读权限，请使用仅启用读取的 API');
+  assertReadOnly(await okxGet(c, CONFIG_PATH, fetcher));
   const valuation = singleAccount(await okxGet(c, VALUATION_PATH, fetcher));
   const total = usdValue(valuation.totalBal);
   if (typeof valuation.ts !== 'string' || !/^\d{1,16}$/.test(valuation.ts)) throw new Error('OKX 估值时间无效或已过期；已保留上次数据');

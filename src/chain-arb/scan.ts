@@ -78,10 +78,10 @@ export function createChainArbScanner({ catalog, quote, now = Date.now }: {
   const profiles = new Map<string, Profile>();
   let currentScope: string | undefined, active: AbortController | undefined, closed = false;
   let batch: Promise<void> | undefined;
-  let nextStart = -Infinity, cooldownUntil = -Infinity, turn = 0;
+  let nextStart = -Infinity, cooldownUntil = -Infinity, turn = 0, directoryRevision = 0;
 
   async function sample(profile: Profile, candidate: ScanCandidate, ordinary: boolean, signal: AbortSignal) {
-    const key = id(candidate);
+    const key = id(candidate), revision = directoryRevision;
     let failed = true;
     try {
       const { chain, symbol, address } = candidate;
@@ -94,10 +94,11 @@ export function createChainArbScanner({ catalog, quote, now = Date.now }: {
       if (rows.length) profile.samples.set(key, { candidate, cycle: profile.cycle, checkedAt: now(), rows });
       failed = view.dex.swapGasUsdt == null || ((!candidate.spot || 'error' in view.spot) && (!candidate.perp || 'error' in view.perp));
     } catch (error) {
+      if (revision !== directoryRevision) return;
       if (rateLimited(error) && !signal.aborted) cooldownUntil = now() + BACKOFF;
       profile.samples.delete(key);
     } finally {
-      if (ordinary) {
+      if (ordinary && revision === directoryRevision) {
         profile.checked.set(key, failed);
         if (failed) profile.failed++;
       }
@@ -204,6 +205,21 @@ export function createChainArbScanner({ catalog, quote, now = Date.now }: {
       }
       const asOf = now();
       return snapshot(profile, asOf, asOf < cooldownUntil);
+    },
+    // A wallet refresh can invalidate only one route. Retain unaffected history, hot candidates and sweep position.
+    revalidateSamples(eligible: (candidate: ScanCandidate, kind: ScanRow['kind']) => boolean) {
+      directoryRevision++;
+      active?.abort();
+      for (const profile of profiles.values()) {
+        // A canceled in-flight candidate has already advanced the cursor but has not been checked.
+        // The next batch rebuilds its queue from completed candidates against the refreshed directory.
+        profile.directory = null;
+        if (profile.checked.size < profile.total) profile.cursor = 0;
+        for (const [key, sample] of profile.samples) {
+          sample.rows = sample.rows.filter(row => eligible(sample.candidate, row.kind));
+          if (!sample.rows.length) profile.samples.delete(key);
+        }
+      }
     },
     close() { closed = true; profiles.clear(); active?.abort(); },
   };

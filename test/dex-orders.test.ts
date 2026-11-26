@@ -181,7 +181,7 @@ test('Entropy 下单：发出之前就失败（读不到盘序号、数量或价
   assert.equal(h.sent().length, 1, '无效的单没有发到交易所');
 });
 
-test('Entropy 查单：按自编号查，成交与撤销照实报；查不到与还挂着报 absent（不论过了多久），没查成一律未知', async () => {
+test('Entropy 查单：按自编号查，成交与撤销照实报；查不到报 absent（不论过了多久），还挂着与没查成一律未知', async () => {
   const h = entropyHarness();
   const target = order(IO, 1_800_000_000_009), sentAt = T0;
   const found = (state: string, original: string, remaining: string) => json({ status: 'order', order: { order: { coin: 'io:NVDA', side: 'B', limitPx: '100.5', sz: remaining, oid: 77, origSz: original, cloid: cloidOf(target.clientId) }, status: state, statusTimestamp: T0 } });
@@ -200,11 +200,11 @@ test('Entropy 查单：按自编号查，成交与撤销照实报；查不到与
     h.clock = at;
     assert.deepEqual(await h.trader.resolve(target, sentAt, signalFor), { kind: 'absent', reason: '交易所查无此单' });
   }
-  // 还挂着、待触发：也是读成功但没有最终结果。
+  // 还挂着、待触发：这笔单还活着、随时可能成交，保持不明，不能进入判零。
   h.status = () => found('open', '0.5', '0.5');
-  absentOnly(await h.trader.resolve(target, sentAt, signalFor), '还挂着');
+  unknownOnly(await h.trader.resolve(target, sentAt, signalFor), '还挂着');
   h.status = () => found('triggered', '0.5', '0.5');
-  absentOnly(await h.trader.resolve(target, sentAt, signalFor), '待触发');
+  unknownOnly(await h.trader.resolve(target, sentAt, signalFor), '待触发');
 
   // 没查成：不论过了多久都不能当成没成交。
   h.clock = sentAt + 24 * 3_600_000;

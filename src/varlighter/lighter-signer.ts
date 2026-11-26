@@ -306,6 +306,9 @@ async function start(config: { chainId: number; privateKey: string; apiKeyIndex:
       const signed = info as Record<string, unknown>;
       for (const [field, value] of Object.entries(expected)) if (signed[field] !== value) throw new LighterSignerError(`签名器签出的 ${field} 与入参不一致`);
       if (signed.L2TxAttributes != null) throw new LighterSignerError('签名器签出的交易带了未请求的附加属性');
+      // 判「没成交」靠交易的有效期（live.ts 以发出后 11 分钟为限）：签出的有效期必须在 10 分钟以内，上游改了默认值就拒绝。
+      const expiredAt = signed.ExpiredAt, signedAt = Date.now();
+      if (typeof expiredAt !== 'number' || !Number.isSafeInteger(expiredAt) || expiredAt <= signedAt || expiredAt > signedAt + 600_000) throw new LighterSignerError('签名器签出的交易有效期不在 10 分钟以内');
       if (typeof signed.Sig !== 'string' || !signed.Sig) throw new LighterSignerError('签名器返回的下单交易没有签名');
       return { txType, txInfo, txHash };
     },

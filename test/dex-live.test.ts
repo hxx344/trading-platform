@@ -142,6 +142,7 @@ function harness(t: test.TestContext) {
     async run(live: LiveTrader, totalMs: number, stepMs = 1_000): Promise<void> { for (let passed = 0; passed < totalMs; passed += stepMs) await api.step(live, stepMs); },
     position(live: LiveTrader, pair: PairInfo = NVDA): LivePosition { const found = live.view().positions.find(item => item.symbol === pair.key); assert.ok(found, `${pair.key} 应有未结束的实盘持仓`); return found; },
     trades: (live: LiveTrader) => live.view().trades,
+    resolvedCount: () => s.resolved.length,
     alerts: (): LiveAlert[] => s.traders.flatMap(live => live.alerts()),
     events: () => store.events(1000).filter(item => item.kind === 'live').map(item => item.message).reverse(),
     /** 发出的单的简写：场所 方向 数量（只减仓的加 R）。 */
@@ -425,9 +426,14 @@ test('第二腿部分成交、没有报价或数量不足：第一腿多出的�
   assert.deepEqual([h.trades(live)[0]!.closeReason, s.book.get('lighter:NVDA')], ['single_leg', 0]);
   live.resume();
 
-  // B 腿此刻没有报价：不发 B，A 直接平掉。
+  // 开仓时 B 腿没有报价：第一腿也不发（发第一腿前核对两腿此刻的报价）。
   from = s.sent.length;
   s.quotes.set('entropy:NVDA', null);
+  await h.open(live, NVDA);
+  assert.deepEqual([h.orders(from), live.view().lastSkip?.reason], [[], 'Entropy 此刻没有报价']);
+  s.quotes.set('entropy:NVDA', { bid: 99.99, ask: 100.01 });
+  // 第一腿成交后 B 腿的报价才没了：不发 B，A 直接平掉。
+  s.place.lighter.push({ outcome: order => { s.quotes.set('entropy:NVDA', null); return done(order.qty, order.limit); } });
   await h.open(live, NVDA);
   assert.deepEqual(h.orders(from), ['lighter sell 1', 'lighter buy 1 R'], '没有报价就不下第二腿');
   assert.equal(h.trades(live)[0]!.closeReason, 'single_leg');
@@ -1246,6 +1252,7 @@ test('乘数除不尽的取整余量：不到第二腿一个步长的等值，�
   // 乘数 3，第二腿步长 1：第一腿成交 0.5 → 第二腿 floor(1.5) = 1，第一腿余 0.5 − 1/3 ≈ 0.16，不到 B 一个步长的等值（1/3）。
   const coarse = pairOf(GOLD.a, { ...GOLD.b, market: { ...GOLD.b.market, sizeDecimals: 0, minBase: 1, minQuote: 0 } }, 3);
   s.pairs.set(coarse.key, coarse);
+  s.quotes.set('rh:XAU', { bid: 300.89, ask: 300.91 });
   h.enable(live, [coarse], { perTradeUsd: 300 });
   s.place.rh.push(fill(0.5));
   await h.open(live, coarse, { aMid: 300.9, bMid: 100, notionalUsd: 300 });
@@ -1270,5 +1277,77 @@ test('重启后告警重新给出：已停止与需要人工处理的持仓各�
   const again = h.boot();
   assert.deepEqual(again.alerts().map(item => item.key).sort(), before, '重启后同样的告警、同样的键');
   assert.ok(again.alerts().every(item => item.text.length > 0));
+  h.check();
+});
+
+test('发第一腿前核对两腿此刻的报价：样本里的价差已不存在（B 的卖一越过预演限价）就不跟，不发任何单', async t => {
+  const h = harness(t), live = h.boot(), s = h.s;
+  h.enable(live, [NVDA]);
+  // 样本说 B 中间价 100，但 Entropy 此刻卖一已到 101：按样本下 A、再按当前价对冲 B 会直接亏掉价差。
+  s.quotes.set('entropy:NVDA', { bid: 100.99, ask: 101.01 });
+  await h.open(live, NVDA);
+  assert.deepEqual(h.orders(), []);
+  assert.match(live.view().lastSkip?.reason ?? '', /Entropy 此刻的卖一 101\.01 已越过限价/);
+  // A 的买一跌破了卖出限价：同样不跟。
+  s.quotes.set('entropy:NVDA', { bid: 99.99, ask: 100.01 });
+  s.quotes.set('lighter:NVDA', { bid: 99.5, ask: 99.52 });
+  await h.open(live, NVDA);
+  assert.deepEqual(h.orders(), []);
+  assert.match(live.view().lastSkip?.reason ?? '', /Lighter 此刻的买一 99\.5 已越过限价/);
+  // 报价回到样本附近：照常跟。
+  s.quotes.set('lighter:NVDA', { bid: 100.29, ask: 100.31 });
+  await h.open(live, NVDA);
+  assert.deepEqual(h.orders(), ['lighter sell 1', 'entropy buy 1']);
+  h.check();
+});
+
+test('恢复后又因同样的原因停止：告警键不同，执行服务会再发一次通知；重启后键不变', async t => {
+  const h = harness(t), live = h.boot(), s = h.s;
+  h.enable(live, [NVDA]);
+  // 账户上凭空多出一笔不属于实盘的仓位：连续两次对不上就停止。
+  s.book.set('entropy:io:NVDA', 0.5);
+  await h.run(live, 3 * RECONCILE_MS, 30_000);
+  const first = live.alerts().filter(item => item.key.startsWith('halt:')).map(item => item.key);
+  assert.equal(first.length, 1);
+  live.resume();
+  await h.run(live, 3 * RECONCILE_MS, 30_000);
+  const keys = live.alerts().filter(item => item.key.startsWith('halt:')).map(item => item.key);
+  assert.equal(keys.length, 2, '第二次停止要有新的告警');
+  assert.notEqual(keys[0], keys[1]);
+  assert.equal(live.alerts().find(item => item.key === keys[0])!.text, live.alerts().find(item => item.key === keys[1])!.text, '原因文字相同');
+  assert.deepEqual(h.boot().alerts().filter(item => item.key.startsWith('halt:')).map(item => item.key), [keys[1]], '重启后给出的是这一次停止的键');
+  h.check();
+});
+
+test('服务在两腿之间开始停止：不落第二腿的意图、不发单；重启后从第二腿接着对冲，不算单腿', async t => {
+  const h = harness(t), live = h.boot(), s = h.s;
+  h.enable(live, [NVDA]);
+  s.place.lighter.push({ outcome: order => { s.stopped = true; return done(order.qty, order.limit); } });
+  await h.open(live, NVDA);
+  assert.deepEqual(h.orders(), ['lighter sell 1'], '停止后不再发第二腿');
+  const saved = h.store.liveActive()[0]!;
+  assert.deepEqual([saved.pending, saved.step, saved.a.qty, saved.singleLeg], [null, 'b', 1, false], '库里没有一笔从没发出的「在途」单');
+  s.stopped = false;
+  const again = h.boot();
+  again.tick(); await again.idle();
+  assert.deepEqual(h.orders(), ['lighter sell 1', 'entropy buy 1']);
+  assert.deepEqual([h.position(again).state, h.position(again).singleLeg], ['open', false]);
+  h.check();
+});
+
+test('落意图失败：内存退回发送前，不发单，也不留一笔「结果不明」去等过期', async t => {
+  const h = harness(t), live = h.boot(), s = h.s;
+  h.enable(live, [NVDA]);
+  const original = h.store.saveLive.bind(h.store);
+  let fail = false;
+  (h.store as { saveLive: (position: LivePosition) => void }).saveLive = position => { if (fail && position.pending?.leg === 'b') throw new Error('disk I/O error'); original(position); };
+  s.place.lighter.push({ outcome: order => { fail = true; return done(order.qty, order.limit); } });
+  await h.open(live, NVDA);
+  assert.deepEqual(h.orders(), ['lighter sell 1'], '第二腿的意图没落库就不发');
+  assert.equal(h.position(live).pending, null, '内存里没有一笔没发出的在途单');
+  fail = false;
+  await h.run(live, RETRY_MS + 1_000, 1_000);
+  assert.deepEqual(h.orders(), ['lighter sell 1', 'entropy buy 1'], '落库恢复后马上对冲，不等过期');
+  assert.equal(h.resolvedCount(), 0, '没有去查一笔从没发出的单');
   h.check();
 });

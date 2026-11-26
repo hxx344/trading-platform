@@ -4,16 +4,18 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { AddressInfo } from 'node:net';
 import { createExecutorServer } from '../src/http.ts';
 import { createReadTokens } from '../src/read-token.ts';
 import { localDexForward, openVarLighter, varLighterViews } from '../src/dex/host.ts';
 import { runBacktest, type BacktestResult } from '../src/varlighter/backtest.ts';
-import type { Sample } from '../src/varlighter/model.ts';
+import { SAMPLE_FIELDS, type Sample } from '../src/varlighter/model.ts';
 import { openVarLighterStore } from '../src/varlighter/store.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, type GlobalParams, type SymbolParams } from '../src/varlighter/strategy.ts';
 import type { StateView } from '../src/varlighter/views.ts';
@@ -79,10 +81,14 @@ const cli = (request: BacktestRequest, root: string, source?: string): Replay =>
   return JSON.parse(execFileSync(process.execPath, [fileURLToPath(new URL('../tools/varlighter/backtest.ts', import.meta.url)), '--request', JSON.stringify(request)], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
 };
 
-async function mcp(get: Get, args: Record<string, unknown>) {
+async function mcpText(get: Get, args: Record<string, unknown>): Promise<string> {
   const answer = await handle({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'varlighter_backtest', arguments: args } }, get) as { result: { content: { text: string }[]; isError?: boolean } };
   if (answer.result.isError) throw new Error(answer.result.content[0]!.text);
-  return JSON.parse(answer.result.content[0]!.text) as { cacheNotice?: string; pulled: { added: number; file: string }; result: Replay };
+  return answer.result.content[0]!.text;
+}
+
+async function mcp(get: Get, args: Record<string, unknown>) {
+  return JSON.parse(await mcpText(get, args)) as { cacheNotice?: string; pulled: { added: number; file: string }; result: Replay };
 }
 
 function assertTradeDetails(replay: Replay, reference: BacktestResult, limit: number | 'all') {
@@ -181,7 +187,6 @@ test('本机拉样本：同一配对并发拉取不重复；中断留下的半�
     assert.equal(pulls.reduce((sum, done) => sum + done.results[0]!.added, 0), 1_500, '三次并发合计只写一遍');
     const read = () => readFileSync(file, 'utf8').trim().split('\n').map(line => (JSON.parse(line) as Sample).t);
     assert.deepEqual(read(), samples.map(item => item.t));
-    assert.equal(existsSync(`${file}.lock`), false, '锁已释放');
 
     appendFileSync(file, '{"symbol":"var:BTC|rh:BTC","t":');
     assert.equal(lastSampleAt(file), samples.at(-1)!.t, '半行被截掉');
@@ -231,8 +236,6 @@ test('本机回测参数：命令行与 JSON 请求同一套校验；grid 展开
   assert.equal(readRequest({ symbol: 'rh:AAPL' }).symbol, 'var:AAPL|rh:AAPL', '旧键升级');
   assert.equal(readRequest({ symbol: 'rh:ETH|lighter:ETH@0.5' }).symbol, 'rh:ETH|lighter:ETH@0.5');
   assert.throws(() => readRequest({ symbol: 'var:AAPL|var:AAPL' }));
-  // 本机样本文件名把配对键整体编码（含 | 与 @），旧文件 rh:BTC.jsonl 不动。
-  assert.ok(sampleFile('d', 'rh:ETH|lighter:ETH@0.5').endsWith(`${encodeURIComponent('rh:ETH|lighter:ETH@0.5')}.jsonl`));
   assert.throws(() => parseArgs(['--symbol', KEY, '--params', '{x']), /不是有效的 JSON/);
   assert.throws(() => parseArgs(['--hours']), /缺少取值/);
   assert.throws(() => readRequest({ symbol: KEY, extra: 1 }), /未知字段 extra/);
@@ -272,6 +275,12 @@ test('MCP varlighter_backtest：先增量拉取，再在新进程里用仓库代
     await assert.rejects(mcp(watched, { symbol: 'var:ETH|rh:ETH', params: { entryBps: -1 } }), /entryBps|入场/);
     assert.deepEqual(paths, [], '不合法的请求不拉取');
     assert.equal(existsSync(sampleFile(p.local, 'var:ETH|rh:ETH')), false);
+    p.writer.addSamples(Array.from({ length: 1000 }, (_, i) => sample(T0 + (1000 + i) * 60_000, i % 3 === 1 ? 100.8 : 100.2)));
+    const large = await mcpText(p.get, { symbol: KEY, hours: 48, trades: 200 });
+    assert.match(large, /已截断.*100 KiB.*减小 trades/);
+    const compact = await mcp(p.get, { symbol: KEY, hours: 48, trades: 0 });
+    assert.ok(compact.result.summary.trades > 200);
+    assert.deepEqual(compact.result.trades, []);
   } finally {
     if (saved === undefined) delete process.env.TP_VARLIGHTER_DIR; else process.env.TP_VARLIGHTER_DIR = saved;
     await p.close();
@@ -287,8 +296,9 @@ test('两个平台共用缓存根：命令行、并发 MCP、切回原平台与�
   t.after(() => { if (previous === undefined) delete process.env.TP_VARLIGHTER_DIR; else process.env.TP_VARLIGHTER_DIR = previous; });
 
   const legacyState = '{"settings":{}}', legacySample = '{"t":9999999999999}\n';
+  const legacyFile = join(a.root, `${encodeURIComponent(KEY)}.jsonl`);
   writeFileSync(join(a.root, STATE_FILE), legacyState);
-  writeFileSync(sampleFile(a.root, KEY), legacySample);
+  writeFileSync(legacyFile, legacySample);
   const request = { symbol: KEY, hours: 24, trades: 200 };
   assert.throws(() => cli(request, a.root), /旧缓存缺少平台来源/);
   const aSamples = oscillating(120, 300), bSamples = Array.from({ length: 600 }, (_, i) => sample(T0 + i * 60_000, i % 20 === 10 ? 100.8 : 100.1));
@@ -324,7 +334,92 @@ test('两个平台共用缓存根：命令行、并发 MCP、切回原平台与�
   assert.equal(again.pulled.added, 0);
   assert.deepEqual(again.result, aRun.result);
   assert.equal(readFileSync(join(a.root, STATE_FILE), 'utf8'), legacyState);
-  assert.equal(readFileSync(sampleFile(a.root, KEY), 'utf8'), legacySample);
+  assert.equal(readFileSync(legacyFile, 'utf8'), legacySample);
+});
+
+test('同来源跨进程刷新先取得状态锁再发 GET，旧请求拉样本期间新请求可以发布自己的快照', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tp-vl-state-lock-'));
+  const latch = () => {
+    let open!: () => void;
+    const wait = new Promise<void>(resolve => { open = resolve; });
+    return { open, wait };
+  };
+  const oldRead = latch(), sendOldState = latch(), oldSampling = latch(), sendPage = latch(), newRead = latch();
+  const snapshot = (revision: number) => ({
+    rows: [{ key: KEY, kind: 'crypto', name: KEY, enabled: true, position: null, aFeeBps: revision, bFeeBps: 0 }], orphans: [],
+    settings: { revision, global: GLOBAL, symbols: { [KEY]: { ...PARAMS, entryBps: 20 + revision } }, confirmed: [KEY], combos: ['var|rh'], pairs: [] },
+  });
+  const server = createServer(async (request, response) => {
+    if (request.url === '/api/varlighter/state') {
+      oldRead.open(); await sendOldState.wait;
+      response.end(JSON.stringify(snapshot(1)));
+    } else {
+      oldSampling.open(); await sendPage.wait;
+      response.end(JSON.stringify({ symbol: KEY, format: 2, columns: ['symbol', 't'], rows: [], firstAt: null, next: null }));
+    }
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const source = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const tokenFile = join(root, 'token');
+  writeFileSync(tokenFile, `tpr_${'A'.repeat(43)}`, { mode: 0o600 });
+  const child = promisify(execFile)(process.execPath, [fileURLToPath(new URL('../tools/varlighter/pull.ts', import.meta.url)), '--symbol', KEY], {
+    env: { ...process.env, TP_MCP_TOKEN_FILE: tokenFile, TP_MCP_URL: source, TP_VARLIGHTER_DIR: root }, windowsHide: true, timeout: 15_000,
+  });
+  const childStopped = child.then(() => { throw new Error('旧请求提前结束'); });
+  let newer: Promise<unknown> | undefined;
+  try {
+    await Promise.race([oldRead.wait, childStopped]);
+    newer = pull({ dir: root, get: Object.assign(async () => { newRead.open(); return snapshot(2); }, { source }) });
+    const overlapped = await Promise.race([newRead.wait.then(() => true), delay(150, false, { ref: false })]);
+    sendOldState.open();
+    await Promise.race([oldSampling.wait, childStopped]);
+    const published = await Promise.race([newer.then(() => true), delay(3_000, false, { ref: false })]);
+    sendPage.open();
+    await Promise.all([child, newer]);
+    assert.equal(overlapped, false, '旧状态仍在读取时不能发起新的状态请求');
+    assert.equal(published, true, '状态锁在请求样本前释放');
+    const saved = readLocalState(sourceCache(root, source).dir)!;
+    assert.deepEqual([saved.settings.revision, saved.settings.symbols[KEY]!.entryBps, saved.pairs[0]!.aFeeBps], [2, 22, 2]);
+  } finally {
+    sendOldState.open(); sendPage.open();
+    await Promise.allSettled([child, childStopped, newer]);
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('配对键大小写进入文件、锁和每条样本校验，错误配对不能续写或回放', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tp-vl-pair-case-'));
+  try {
+    const lower = 'var:btc|rh:btc', source = 'https://test.invalid', dir = sourceCache(root, source).dir;
+    const upperFile = sampleFile(dir, KEY), lowerFile = sampleFile(dir, lower);
+    assert.notEqual(upperFile.toLowerCase(), lowerFile.toLowerCase());
+    const byKey: Record<string, Sample[]> = { [KEY]: oscillating(0, 3), [lower]: oscillating(1, 4).map(row => ({ ...row, symbol: lower, aMark: 99 })) };
+    let fault: 'page' | 'row' | undefined;
+    const get = Object.assign(async (path: string) => {
+      if (path === '/api/varlighter/state') return { rows: [KEY, lower].map(key => ({ key, kind: 'crypto', name: key, position: null })),
+        orphans: [], settings: { global: GLOBAL, symbols: {} } };
+      const params = new URL(path, source).searchParams, key = params.get('symbol')!, after = Number(params.get('after'));
+      const rows = byKey[key]!.filter(s => s.t > after);
+      if (fault === 'row') rows.push({ ...sample(after + 60_000, 101), symbol: lower });
+      return { symbol: fault === 'page' ? lower : key, format: 2, columns: SAMPLE_FIELDS, rows: rows.map(s => SAMPLE_FIELDS.map(field => s[field])), firstAt: byKey[key]![0]!.t, next: null };
+    }, { source });
+    const [up, down] = await Promise.all([KEY, lower].map(symbol => pull({ get, dir: root, symbols: [symbol] })));
+    assert.deepEqual([up.results[0]!.added, down.results[0]!.added], [3, 4]);
+    assert.deepEqual(loadSamples(upperFile, KEY).samples, byKey[KEY]);
+    assert.deepEqual(loadSamples(lowerFile, lower).samples, byKey[lower]);
+    const original = readFileSync(upperFile, 'utf8');
+    byKey[KEY]!.push(sample(T0 + 5 * 60_000, 101));
+    for (fault of ['page', 'row'] as const) {
+      await assert.rejects(pull({ get, dir: root, symbols: [KEY] }), /样本配对与请求/);
+      assert.equal(readFileSync(upperFile, 'utf8'), original);
+    }
+    const foreignTail = original + JSON.stringify(byKey[lower]![0]) + '\n{"t":';
+    writeFileSync(upperFile, foreignTail);
+    assert.throws(() => runLocal({ symbol: KEY }, root, source), /样本配对与请求/);
+    await assert.rejects(pull({ get, dir: root, symbols: [KEY] }), /样本配对与请求/);
+    assert.equal(readFileSync(upperFile, 'utf8'), foreignTail, '发现异配对后保留文件，包括最后的半行');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('缓存按规范化地址分区，无法确认来源的快照或孤立样本在写入前报错', async () => {

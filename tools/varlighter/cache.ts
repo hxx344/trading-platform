@@ -9,15 +9,19 @@ export const STATE_FILE = 'state.json';
 export const LEGACY_NOTICE = '旧缓存缺少平台来源，文件保留在根目录。各平台的样本从头拉取并单独保存。';
 export const cacheRoot = (env: NodeJS.ProcessEnv = process.env): string => env.TP_VARLIGHTER_DIR || join(homedir(), '.cache', 'trading-platform', 'varlighter');
 /** Bounded length and safe on Windows, including IPv6 origins. The readable origin is in state.json and the output. */
-const sourceKey = (source: string): string => createHash('sha256').update(source).digest('hex');
+const digest = (key: string): string => createHash('sha256').update(key).digest('hex');
 
 export function sourceCache(root: string, url: string | undefined): { source: string; dir: string } {
   const source = platformBase(url).origin;
-  return { source, dir: join(root, 'sources', sourceKey(source)) };
+  return { source, dir: join(root, 'sources', digest(source)) };
 }
 
-/** A pair key as a file name: percent-encoded, so `:` `|` `@` are safe on Windows. */
-export const sampleFile = (dir: string, key: string): string => join(dir, `${encodeURIComponent(key)}.jsonl`);
+/** Pair keys are case sensitive even when the filesystem is not. */
+export const sampleFile = (dir: string, key: string): string => join(dir, `${digest(key)}.jsonl`);
+
+export function checkSampleSymbol(actual: unknown, expected: string): void {
+  if (actual !== expected) throw new Error(`样本配对与请求的 ${expected} 不符`);
+}
 
 export const hasLocalFiles = (dir: string): boolean => existsSync(dir) && readdirSync(dir).some(name => name === STATE_FILE || name.endsWith('.jsonl'));
 
@@ -53,7 +57,7 @@ export function readLocalState(dir: string): LocalState | null {
     if (!existsSync(file)) throw new SettingsError('样本缺少平台来源快照，请保留该目录并换一个 TP_VARLIGHTER_DIR 重新拉取');
   }
   const state = JSON.parse(readFileSync(file, 'utf8')) as LocalState;
-  if (typeof state?.source !== 'string' || sourceKey(state.source) !== basename(dir) || platformBase(state.source).origin !== state.source) {
+  if (typeof state?.source !== 'string' || digest(state.source) !== basename(dir) || platformBase(state.source).origin !== state.source) {
     throw new SettingsError('缓存来源与平台目录不符，请保留该目录并换一个 TP_VARLIGHTER_DIR 重新拉取');
   }
   return state;

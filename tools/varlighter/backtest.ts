@@ -12,7 +12,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { runBacktest, type BacktestSummary } from '../../src/varlighter/backtest.ts';
 import { SAMPLE_FIELDS, parsePairKey, upgradeKey, type AssetKind, type Sample } from '../../src/varlighter/model.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, legFeeBps, readGlobalParams, readSymbolParams, type GlobalParams, type LegFees, type SymbolParams } from '../../src/varlighter/strategy.ts';
-import { cacheRoot, readLocalState, replayDir, sampleFile } from './cache.ts';
+import { cacheRoot, checkSampleSymbol, readLocalState, replayDir, sampleFile } from './cache.ts';
 
 export const MAX_COMBOS = 200;
 /** A hole between two local samples longer than this is listed in the output (the service was down, or pulled too late). */
@@ -75,7 +75,7 @@ export interface LoadedSamples { samples: Sample[]; skipped: number; gaps: { fro
  * twice without saying so; holes longer than GAP_MS are listed. A last line without its newline is a pull still
  * appending (or killed while it did), so it is left for that pull to finish or cut off.
  */
-export function loadSamples(file: string): LoadedSamples {
+export function loadSamples(file: string, symbol?: string): LoadedSamples {
   if (!existsSync(file)) throw new RequestError(`本机没有这个配对的样本（${file}）：先运行 tools/varlighter/pull.ts`);
   const samples: Sample[] = [], gaps: LoadedSamples['gaps'] = [];
   let skipped = 0;
@@ -83,6 +83,7 @@ export function loadSamples(file: string): LoadedSamples {
   for (const line of text.slice(0, text.lastIndexOf('\n') + 1).split('\n')) {
     if (!line.trim()) continue;
     const raw = JSON.parse(line) as Record<string, unknown>;
+    if (symbol !== undefined) checkSampleSymbol(raw.symbol, symbol);
     const sample = Object.fromEntries(SAMPLE_FIELDS.map(field => [field, raw[field] ?? null])) as unknown as Sample;
     const before = samples.at(-1);
     if (before && !(sample.t > before.t)) { skipped++; continue; }
@@ -110,7 +111,7 @@ export function runLocal(request: BacktestRequest, root: string, source?: string
   if (!dir || !state) throw new RequestError('本机没有所选平台的来源快照，请先运行 tools/varlighter/pull.ts');
   const kind = request.kind ?? state.pairs.find(pair => pair.key === request.symbol)?.kind;
   if (!kind) throw new RequestError(`state.json 里没有 ${request.symbol} 的类别（配对已失联）：请在请求里给出 kind`);
-  const { samples: all, skipped, gaps } = loadSamples(sampleFile(dir, request.symbol));
+  const { samples: all, skipped, gaps } = loadSamples(sampleFile(dir, request.symbol), request.symbol);
   if (!all.length) throw new RequestError('本机样本为空');
   const savedSymbol = state.settings.symbols[request.symbol] ?? DEFAULT_SYMBOL;
   const savedGlobal = readGlobalParams({}, { ...DEFAULT_GLOBAL, ...state.settings.global });

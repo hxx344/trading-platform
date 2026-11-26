@@ -97,7 +97,7 @@ type Args = Record<string, unknown>;
 /** The token scopes (docs/mcp.md 8.4); a tool is listed only for a token with one of its scopes. */
 export type Scope = 'public' | 'system' | 'portfolio';
 /** `scopes`: the token's scopes, null when the platform cannot say (before v0.85.0). */
-interface Tool { name: string; scope: Scope | readonly Scope[]; description: string; inputSchema: Record<string, unknown>; run(args: Args, get: Get, scopes: readonly Scope[] | null): Promise<unknown> }
+interface Tool { name: string; scope: Scope | readonly Scope[]; description: string; outputHint?: string; inputSchema: Record<string, unknown>; run(args: Args, get: Get, scopes: readonly Scope[] | null): Promise<unknown> }
 
 const int = (args: Args, name: string, min: number, max: number, fallback: number): number => {
   const value = args[name];
@@ -244,7 +244,8 @@ export const TOOLS: readonly Tool[] = [
   },
   {
     name: 'varlighter_backtest', scope: 'portfolio',
-    description: `在本机回测一个 DEX 价差配对（symbol 如 var:AAPL|rh:AAPL）。先从当前平台增量拉取样本，再用仓库当前的 src/varlighter/backtest.ts 在新进程里重放。各平台的缓存分别保存在 TP_VARLIGHTER_DIR 下，默认根目录为 ~/.cache/trading-platform/varlighter。params、global 覆盖平台保存的参数。grid 给出各参数的候选值（如 {"entryBps":[15,20,30]}），最多 ${MAX_GRID} 个组合，按净盈亏从高到低返回摘要。省略 hours 时回放该来源的全部本机样本（扣除首个基线窗口）。单次回测的 trades 取 0–200，默认返回最后 20 笔明细，取 0 时只看汇总。${DATA_NOTE}`,
+    outputHint: '请减小 trades（0 只看汇总）或减少 grid 组合',
+    description: `在本机回测一个 DEX 价差配对（symbol 如 var:AAPL|rh:AAPL）。先从当前平台增量拉取样本，再用仓库当前的 src/varlighter/backtest.ts 在新进程里重放。各平台的缓存分别保存在 TP_VARLIGHTER_DIR 下，默认根目录为 ~/.cache/trading-platform/varlighter。params、global 覆盖平台保存的参数。grid 给出各参数的候选值（如 {"entryBps":[15,20,30]}），最多 ${MAX_GRID} 个组合，按净盈亏从高到低返回摘要。省略 hours 时回放该来源的全部本机样本（扣除首个基线窗口）。单次回测的 trades 取 0–200，默认返回最后 20 笔明细，取 0 时只看汇总。输出超过 100 KiB 会截断，可减小 trades 或减少 grid 组合。${DATA_NOTE}`,
     inputSchema: schema({
       symbol: { type: 'string', pattern: PAIR_KEY.source }, hours: { type: 'integer', minimum: 1, maximum: 8760 },
       params: { type: 'object' }, global: { type: 'object' }, grid: { type: 'object' },
@@ -319,11 +320,11 @@ function backtestChild(argv: readonly string[], env: NodeJS.ProcessEnv): Promise
 }
 
 /** The tool's text: compact JSON, cut at OUTPUT_MAX_BYTES with a note saying so. */
-export function toolText(value: unknown): string {
+export function toolText(value: unknown, hint = '请缩小 limit 或换用更具体的参数'): string {
   const text = JSON.stringify(value);
   if (Buffer.byteLength(text) <= OUTPUT_MAX_BYTES) return text;
   const cut = Buffer.from(text).subarray(0, OUTPUT_MAX_BYTES).toString('utf8').replace(/�$/, '');
-  return `${cut}\n…[已截断：原文 ${Buffer.byteLength(text)} 字节，超过 ${OUTPUT_MAX_BYTES / 1024} KiB；请缩小 limit 或换用更具体的参数]`;
+  return `${cut}\n…[已截断：原文 ${Buffer.byteLength(text)} 字节，超过 ${OUTPUT_MAX_BYTES / 1024} KiB；${hint}]`;
 }
 
 type Message = { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: unknown };
@@ -370,7 +371,7 @@ export async function handle(message: Message, get: Get, scopes: () => Promise<r
       const extra = Object.keys(args).filter(name => !known.includes(name));
       try {
         if (extra.length) throw new ToolInputError(`不支持的参数：${extra.join('、')}`);
-        return reply({ content: [{ type: 'text', text: toolText(await tool.run(args as Args, get, allowed)) }] });
+        return reply({ content: [{ type: 'text', text: toolText(await tool.run(args as Args, get, allowed), tool.outputHint) }] });
       } catch (error) {
         if (error instanceof ToolInputError || error instanceof PlatformError) return reply({ content: [{ type: 'text', text: error.message }], isError: true });
         return reply({ content: [{ type: 'text', text: `工具出错：${error instanceof Error ? error.message : String(error)}` }], isError: true });

@@ -92,7 +92,7 @@ function CombosPanel({ view, onChanged }: { view: StateView; onChanged: () => Pr
       <span className="muted">{item.enabled ? `${item.pairs} 对` : '未开启'}</span>
       {write.busy === `combo:${item.combo}` ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : null}
     </li>)}</ul>
-    <p className="vl-note">两腿都是行情流（Lighter、Entropy）的配对每 5 秒采一次（未启用、没有持仓的每 20 秒一次），基线按约一分钟抽一个样本；有 Var 一腿的配对跟着每分钟一次的 Var 报价。</p>
+    <p className="vl-note">两腿都是行情流（Lighter、Entropy）的配对每 5 秒采一次（未启用、没有持仓的每 20 秒一次），基线按约一分钟抽一个样本；有 Var 一腿的配对跟着每分钟一次的 Var 报价。已启用或有持仓、两腿都是行情流的配对，一档一有变化就判断开平仓，不等采样。</p>
   </section>;
 }
 
@@ -159,6 +159,8 @@ function SourcesPanel({ view }: { view: StateView }) {
   const { var: varSource, venues } = view.sources, poll = varSource.poll, now = view.now, live = view.sources.live ?? null;
   // 旧版本服务端没有这一项；预览没接询价时为 null。
   const token = varSource.token ?? null;
+  // v0.94.0 起；旧版本服务端没有这一项。
+  const push = view.sources.push ?? null;
   return <section className="panel" aria-label="采集状态">
     <div className="panel-heading"><h2>采集状态</h2><span className="muted">服务启动于 {age(view.startedAt, now)} · 场所由组合与手动配对决定</span></div>
     <div className="vl-table"><table><tbody>
@@ -166,7 +168,8 @@ function SourcesPanel({ view }: { view: StateView }) {
         {poll ? <small>上次：新报价 {poll.fresh}，未变 {poll.unchanged}，无报价 {poll.noQuote}，对手腿无一档 {poll.noTop ?? 0}，写入 {poll.written}，缺判断时刻一档 {poll.noLive ?? 0}{Object.entries(poll.blocked ?? {}).map(([reason, count]) => `；${reason} ${count}`).join('')}</small> : null}
         <small>报价收到时已过去 {varSource.quoteAgeMedianMs === null ? '—' : `${plain(varSource.quoteAgeMedianMs / 1000, 0)} 秒`}（中位数）</small></td></tr>
       <tr><td>行情流配对<small>两腿都是行情流</small></td><td className="wrap">{live ? `上次 ${age(live.at, now)}：到期 ${live.due}，写入 ${live.written}，缺一档 ${live.noTop}` : '还没有采样'}
-        {live && Object.keys(live.blocked).length ? <small>{Object.entries(live.blocked).map(([reason, count]) => `${reason} ${count}`).join('；')}</small> : null}</td></tr>
+        {live && Object.keys(live.blocked).length ? <small>{Object.entries(live.blocked).map(([reason, count]) => `${reason} ${count}`).join('；')}</small> : null}
+        {push ? <small>按推送判断（启动以来）：{push.checks.toLocaleString('zh-CN')} 次，成交 {push.trades} 次{push.lastTradeAt === null ? '' : `，最近 ${age(push.lastTradeAt, now)}`}{push.lastBlocked ? `；最近被挡：${push.lastBlocked.symbol} ${push.lastBlocked.reason}（${age(push.lastBlocked.at, now)}）` : ''}</small> : null}</td></tr>
       {token ? <tr><td>Var token 询价</td><td className="wrap">{token.status === 'ready' ? token.statusName : <span className="vl-down">{token.statusName}</span>}
         {token.okAt === null ? ' · 还没有成功过' : ` · 最近成功 ${age(token.okAt, now)}${token.lagMs === null ? '' : `，收到时距 Var 报价时刻 ${plain(token.lagMs / 1000, 1)} 秒`}`}
         {poll ? <small>上次：成功 {poll.tokenOk ?? 0}，失败 {poll.tokenFailed ?? 0}，未询 {poll.tokenSkipped ?? 0}{token.expiresAt === null ? '' : `；token 到期 ${new Date(token.expiresAt).toLocaleString('zh-CN', { hour12: false })}`}</small> : null}

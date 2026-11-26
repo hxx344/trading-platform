@@ -22,6 +22,8 @@ export interface PollStats { at: number; listings: number; fresh: number; unchan
   /** 该询而没询的配对数：类别的写法没确认、失败后暂停中、这一轮中途 token 不可用或到了阶段时限（v0.82.0 起；没有可用 token 时为 0）。 */ tokenSkipped: number }
 /** 两腿都是行情流的配对最近一轮采样：写入条数、到期却缺一档的条数、达到入场偏离却没开仓的次数。 */
 export interface LiveStats { at: number; due: number; written: number; noTop: number; blocked: Record<string, number> }
+/** 按行情流推送做的模拟盘判断（服务启动以来）：判断次数、成交次数、最近一次成交的时刻，以及最近一次达到开仓条件却被挡住的配对与原因。 */
+export interface PushStats { checks: number; trades: number; lastTradeAt: number | null; lastBlocked: { at: number; symbol: string; reason: string } | null }
 export type TokenStatus = 'missing' | 'expired' | 'ready' | 'rejected' | 'unavailable';
 /** Var token 询价的状态：不含 token。`lagMs` 是最近一次成功询价收到时距 Var 报价时刻的毫秒数。 */
 export interface TokenView { status: TokenStatus; statusName: string; expiresAt: number | null; error: string | null; okAt: number | null; lagMs: number | null }
@@ -70,7 +72,7 @@ export interface StateView {
   sources: {
     /** Var 没有组合或手动配对用到时 enabled 为假。 */
     var: SourceState & { enabled: boolean; poll: PollStats | null; quoteAgeMedianMs: number | null; /** 引擎没有接询价器时为 null。 */ token: TokenView | null };
-    venues: VenueStatus[]; live: LiveStats | null; combos: ComboView[];
+    venues: VenueStatus[]; live: LiveStats | null; /** v0.94.0 起。 */ push?: PushStats; combos: ComboView[];
   };
   firstSampleAt: number | null;
   rows: StateRow[];

@@ -129,6 +129,9 @@ function prune<T extends { at: number }>(points: T[], cutoff: number): void {
   if (index) points.splice(0, index);
 }
 
+/** 某个市场的一档买卖价变了（已记入历史之后调用）。监听方自己处理异常。 */
+export type TopListener = (marketId: number) => void;
+
 /** 行情流的共同接口（Lighter 两个场所与 Entropy）：按市场编号回看某一时刻的一档，以及订阅了完整盘口的市场的当前冲击。 */
 export interface LiveStream {
   readonly venueName: string;
@@ -209,8 +212,8 @@ export class LighterStream implements LiveStream {
   private depthIds = new Set<number>();
   private readonly books = new Map<number, LighterBook>();
 
-  private readonly options: { url?: string; venue?: Venue; connect: Connect; now?: () => number; log?: (line: string) => void };
-  constructor(options: { url?: string; venue?: Venue; connect: Connect; now?: () => number; log?: (line: string) => void }) { this.options = options; }
+  private readonly options: { url?: string; venue?: Venue; connect: Connect; now?: () => number; log?: (line: string) => void; onTop?: TopListener };
+  constructor(options: { url?: string; venue?: Venue; connect: Connect; now?: () => number; log?: (line: string) => void; onTop?: TopListener }) { this.options = options; }
   private now(): number { return (this.options.now ?? Date.now)(); }
   get venueName(): string { return VENUE_NAMES[this.options.venue ?? 'rh']; }
   get running(): boolean { return !this.closed && (this.socket !== null || this.retry !== null); }
@@ -420,6 +423,7 @@ export class LighterStream implements LiveStream {
       const points = this.top.get(id) ?? [];
       points.push({ at: now, ...next });
       this.top.set(id, points);
+      if (!previous || previous.bid !== next.bid || previous.ask !== next.ask) this.options.onTop?.(id);
     }
   }
 
@@ -499,8 +503,8 @@ export class HyperliquidStream implements LiveStream {
   private postId = 0;
   /** 在途的 l2Book 确认：postId → 发出时的完整代码（应答按代码找编号，编号换了币种也不会记错）。 */
   private readonly posts = new Map<number, string>();
-  private readonly options: { url?: string; connect: Connect; now?: () => number; log?: (line: string) => void };
-  constructor(options: { url?: string; connect: Connect; now?: () => number; log?: (line: string) => void }) { this.options = options; }
+  private readonly options: { url?: string; connect: Connect; now?: () => number; log?: (line: string) => void; onTop?: TopListener };
+  constructor(options: { url?: string; connect: Connect; now?: () => number; log?: (line: string) => void; onTop?: TopListener }) { this.options = options; }
   private now(): number { return (this.options.now ?? Date.now)(); }
   get venueName(): string { return VENUE_NAMES.entropy; }
   get running(): boolean { return !this.closed && (this.socket !== null || this.retry !== null); }
@@ -692,9 +696,10 @@ export class HyperliquidStream implements LiveStream {
   }
   private record(id: number, now: number, bid: number | null, ask: number | null): void {
     if (bid === null || ask === null || !(bid > 0 && ask >= bid)) return;
-    const points = this.top.get(id) ?? [];
+    const points = this.top.get(id) ?? [], previous = points.at(-1);
     points.push({ at: now, bid, ask, mark: null, index: null, funding: null });
     this.top.set(id, points);
+    if (!previous || previous.bid !== bid || previous.ask !== ask) this.options.onTop?.(id);
   }
   private drop(reason: string | null): void {
     const now = this.now(), socket = this.socket;

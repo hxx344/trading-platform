@@ -17,7 +17,7 @@ import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, DIRECTIONS, ParamsError, closePosition,
   markToMarket, openBlocker, openPosition, readGlobalParams, readSymbolParams, recommendParams, upgradeDirection, upgradeGlobal,
   CLOSE_REASON_NAMES, DIRECTION_NAMES, type ClosedTrade, type GlobalParams, type LegFees, type Position, type SymbolParams } from './strategy.ts';
 import { COOLDOWN_KEY, SAMPLE_RETENTION_DAYS, SETTINGS_KEY, type LegacyUpgrade, type VarLighterStore } from './store.ts';
-import type { AutoView, BacktestView, CatalogEntry, DepthStatus, LegRef, LiveStats, OrphanRow, PaperView, PollStats, PositionMark, ReadinessItem, ReadinessView, SamplesView, Settings, SourceState, StateRow, StateView,
+import type { AutoView, BacktestView, CatalogEntry, DepthStatus, LegRef, LiveStats, OrphanRow, PushStats, PaperView, PollStats, PositionMark, ReadinessItem, ReadinessView, SamplesView, Settings, SourceState, StateRow, StateView,
   SymbolPoint, SymbolView, VenueStatus } from './views.ts';
 
 export const VAR_POLL_MS = 60_000;
@@ -28,6 +28,8 @@ export const CATALOG_RETRY_MS = 60_000;
 export const LIVE_TICK_MS = 1_000, LIVE_ACTIVE_MS = 5_000, LIVE_IDLE_MS = 20_000;
 /** 到期判断的余量：每秒一检查时不会因为毫秒抖动拖成 6 秒、21 秒一条。 */
 export const LIVE_SLACK_MS = 500;
+/** 按行情流推送判断时：盘口冲击沿用这么久以内算过的快照；同一个配对的出错日志这么久记一次。 */
+export const PUSH_DEPTH_REUSE_MS = 1_000, PUSH_ERROR_LOG_MS = 60_000;
 /** 自动配置：推荐参数所用的统计每这么久重算一次，样本窗口取基线窗口、最长这么多小时。 */
 export const AUTO_REFRESH_MS = 10 * 60_000, AUTO_WINDOW_MAX_HOURS = 72;
 /** 盘口（行情流）超过这么久没同步算过期。 */
@@ -152,6 +154,10 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   let running = false;
   const varSource: SourceState = { at: null, ok: null, error: null, count: 0 };
   let lastPoll: PollStats | null = null, lastLive: LiveStats | null = null;
+  const pushStats: PushStats = { checks: 0, trades: 0, lastTradeAt: null, lastBlocked: null };
+  /** 行情流的腿（场所:市场编号）→ 用到它、两腿都是行情流的配对。 */
+  let pushPairs = new Map<string, PairInfo[]>();
+  const pushErrorAt = new Map<string, number>();
   const lastQuoteAt = new Map<string, number>(), lastLiveAt = new Map<string, number>(), latest = new Map<string, Sample>();
   const trackers = new Map<string, BaselineTracker>();
   const positions = new Map<string, Position>();
@@ -266,6 +272,11 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     }
     pairs = sortPairs(built);
     pairsByKey = new Map(pairs.map(pair => [pair.key, pair]));
+    pushPairs = new Map();
+    for (const pair of pairs) {
+      if (pair.identity === 'mismatch' || !isLive(pair.a.venue) || !isLive(pair.b.venue)) continue;
+      for (const leg of [pair.a, pair.b]) { const key = `${leg.venue}:${leg.market.id}`; pushPairs.set(key, [...pushPairs.get(key) ?? [], pair]); }
+    }
     // 重启后参数与持仓先于配对就有了：配对一建好就补上要订阅盘口的腿与 Entropy 要订阅的市场。
     updateDepth();
     syncEntropyMarkets();
@@ -314,7 +325,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     for (const runtime of live.values()) {
       const want = running && used.has(runtime.venue);
       if (want && !runtime.stream) {
-        runtime.stream = runtime.venue === 'entropy' ? new HyperliquidStream({ connect: open, now, log }) : new LighterStream({ venue: runtime.venue, connect: open, now, log });
+        runtime.stream = runtime.venue === 'entropy' ? new HyperliquidStream({ connect: open, now, log, onTop: id => onTop(runtime.venue, id) }) : new LighterStream({ venue: runtime.venue, connect: open, now, log, onTop: id => onTop(runtime.venue, id) });
         runtime.stream.start();
         if (runtime.venue === 'entropy') syncEntropyMarkets();
         updateDepth();
@@ -374,12 +385,13 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   type LegFields = { At: number; Mark: number | null; Index: number | null; Funding: number | null; Bid0: number; Ask0: number; Bid1k: number | null; Ask1k: number | null; Bid100k: number | null; Ask100k: number | null;
     BidRx: number | null; AskRx: number | null; RxAt: number | null; TkQty: number | null; TkReceivedAt: number | null; BidTk: number | null; AskTk: number | null; TkAt: number | null };
   /** 行情流腿在 t 时刻的一档（带盘口冲击），以及判断时刻 decideAt 的一档；t 时刻没有可用一档为 null。 */
-  function liveLeg(leg: LegInfo, t: number, decideAt: number, top?: TopPoint | null): LegFields | null {
+  function liveLeg(leg: LegInfo, t: number, decideAt: number, top?: TopPoint | null, depthReuseMs = 0): LegFields | null {
     const runtime = live.get(leg.venue as LiveVenue)!, stream = runtime.stream;
     const at = top === undefined ? stream?.topAt(leg.market.id, t) ?? null : top;
     if (!at) return null;
     const entry = runtime.depth.get(legKey(leg));
-    if (entry) refreshEntry(runtime, entry);
+    // 重算盘口快照要把整本盘口排序：按推送判断时沿用刚算过的。
+    if (entry && !(entry.snapshot && t - entry.snapshot.at < depthReuseMs)) refreshEntry(runtime, entry);
     const depth = depthAt(entry?.snapshot, at, t);
     const rx = decideAt === t ? at : stream?.topAt(leg.market.id, decideAt) ?? null;
     return {
@@ -516,6 +528,36 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     return stats;
   }
 
+  /**
+   * 行情流推送了一条腿的新一档：用到它、已启用或有持仓、两腿都是行情流的配对立即按两腿当前的一档判断一次。
+   * 有开平仓动作时才把这一刻的样本写库并成交（规则与定时采样的相同）；没有动作或被挡住的不写库，样本仍由定时采样留。
+   */
+  function onTop(venue: LiveVenue, marketId: number): void {
+    const list = running ? pushPairs.get(`${venue}:${marketId}`) : undefined;
+    if (!list) return;
+    const time = now();
+    for (const pair of list) {
+      const position = positions.get(pair.key) ?? null;
+      if (!position && !storedOf(pair.key).enabled) continue;
+      try {
+        const a = liveLeg(pair.a, time, time, undefined, PUSH_DEPTH_REUSE_MS), b = liveLeg(pair.b, time, time, undefined, PUSH_DEPTH_REUSE_MS);
+        if (!a || !b) continue;
+        pushStats.checks++;
+        const sample = makeSample(pair, time, time, a, b), params = paramsOf(pair.key);
+        const baseline = tracker(pair).value(sample.regime, time), decision = decide(sample, baseline, position ? holdParams(position) : params, position);
+        if (!((decision.kind === 'open' && params.enabled) || decision.kind === 'close')) continue;
+        const apply = tradeDecision({ pair, sample, params, position, baseline, decision });
+        if (typeof apply === 'string') { pushStats.lastBlocked = { at: time, symbol: pair.key, reason: apply }; continue; }
+        if (!saveSamples([sample], lastLiveAt)) continue;
+        apply();
+        pushStats.trades++; pushStats.lastTradeAt = time;
+      } catch (error) {
+        trackers.delete(pair.key); // 与定时采样出错时一样，下次用到时从库里重建基线。
+        if (time - (pushErrorAt.get(pair.key) ?? -Infinity) >= PUSH_ERROR_LOG_MS) { pushErrorAt.set(pair.key, time); log(`varlighter: 按行情流推送判断 ${pair.key} 失败：${message(error)}`); }
+      }
+    }
+  }
+
   /** 先取得上一笔交易之后的账户输入，再计时复核两腿和决定是否开仓。返回的操作只负责提交已决定的交易。 */
   function tradeDecision({ pair, sample, params, position, baseline, decision }: SampleStep): string | (() => void) {
     if (decision.kind === 'close' && position) {
@@ -630,7 +672,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
           depth: [...runtime.depth].map(([key, entry]): DepthStatus => ({ key, marketId: entry.leg.market.id, at: entry.snapshot?.at ?? null, error: entry.error })),
           pairs: pairs.filter(pair => pair.a.venue === runtime.venue || pair.b.venue === runtime.venue).length,
         })),
-        live: lastLive,
+        live: lastLive, push: { ...pushStats },
         combos: COMBOS.map(combo => ({ combo, name: comboName(combo), enabled: settings.combos.includes(combo), pairs: pairs.filter(pair => !pair.custom && `${pair.a.venue}|${pair.b.venue}` === combo).length })),
       },
       firstSampleAt: firstSample === undefined ? (firstSample = store.firstSampleAt()) : firstSample,

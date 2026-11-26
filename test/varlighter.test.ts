@@ -2309,3 +2309,43 @@ test('没有 Var 的双行情流也在风控读取后检查两腿年龄并落盘
     assert.deepEqual([store.positions()[0]?.openedAt, result.open?.openedAt, result.summary.blocked[STALE_QUOTE], result.summary.blocked[NO_QUOTE_TIME]], [validAt, validAt, 1, 2]);
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('两腿行情流的配对：一档推送到就按当时两腿判断并开平仓，不等定时采样；没有动作或被挡住的推送不写样本', async () => {
+  const key = 'rh:BTC|lighter:BTC', dir = mkdtempSync(path.join(tmpdir(), 'tp-live-push-'));
+  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
+  store.setState(SETTINGS_KEY, settings2({ [key]: { ...DEFAULT_SYMBOL, enabled: true } }, { ...DEFAULT_GLOBAL, minSamples: 10 }, ['rh|lighter']), T0);
+  store.addSamples(Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100, { symbol: key })));
+  let clock = T0;
+  const sockets = new Map<string, FakeSocket>();
+  const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' };
+  const engine = createVarLighterEngine({ store, now: () => clock, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market] }),
+    connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; } });
+  const push = (venue: string, at: number, mid: number, type = 'update') => {
+    clock = at;
+    sockets.get(venue)!.push({ type: `${type}/market_stats`, channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: String(mid - 0.01), best_ask_price: String(mid + 0.01), mark_price: String(mid) } } });
+  };
+  const stats = () => engine.views.state().sources.push!;
+  try {
+    engine.startStreams();
+    for (const socket of sockets.values()) socket.open();
+    for (const venue of ['rh', 'lighter'] as const) await engine.refreshCatalog(new AbortController().signal, venue);
+    push('rh', T0, 100, 'subscribed'); push('lighter', T0, 100, 'subscribed');
+    assert.deepEqual([stats().checks, stats().trades, store.positions().length, store.latest(key)!.t], [1, 0, 0, T0 - 60_000], '另一腿还没有一档的推送不判断；没有信号的不写样本');
+    push('rh', T0 + 1_000, 100.5);
+    const opened = store.positions()[0];
+    assert.deepEqual([opened?.openedAt, store.latest(key)!.t, stats().trades, stats().lastTradeAt], [T0 + 1_000, T0 + 1_000, 1, T0 + 1_000], '推送到的那一刻开仓，并留下这一刻的样本');
+    push('rh', T0 + 1_200, 100.3);
+    assert.deepEqual([store.positions().length, store.latest(key)!.t], [1, T0 + 1_000], '没到出场线：不动，也不写样本');
+    push('lighter', T0 + 1_300, 100.3);
+    assert.deepEqual([store.positions().length, store.trades(5)[0]?.closedAt, store.latest(key)!.t, stats().trades], [0, T0 + 1_300, T0 + 1_300, 2], '另一腿的推送让价差回到基线：当刻平仓');
+    push('rh', T0 + 1_400, 100.9);
+    assert.deepEqual([store.positions().length, store.latest(key)!.t, stats().lastBlocked?.symbol, stats().lastBlocked?.at], [0, T0 + 1_300, key, T0 + 1_400], '冷却中的信号被挡住，记下原因，不写样本');
+    assert.match(stats().lastBlocked!.reason, /冷却/);
+    push('rh', T0 + 1_500, 100.9);
+    sockets.get('rh')!.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, mark_price: '100.95' } } });
+    assert.equal(stats().checks, 5, '一档没变、只有标记价变的推送不重复判断');
+    engine.views.settings({ revision: engine.views.state().settings.revision, symbols: { [key]: { enabled: false } } });
+    push('rh', T0 + 1_600, 101);
+    assert.equal(stats().checks, 5, '停用且没有持仓的配对不按推送判断');
+  } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
+});

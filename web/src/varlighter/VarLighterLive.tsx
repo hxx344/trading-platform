@@ -76,22 +76,21 @@ function SwitchPanel({ view, onChanged }: { view: LiveView; onChanged: () => Pro
   const gone = pairs.filter(key => !known.has(key));
   const dirty = JSON.stringify([...pairs].sort()) !== JSON.stringify(saved.pairs) || (parsed.ok && JSON.stringify(parsed.value) !== JSON.stringify(saved.limits)) || !parsed.ok;
   const missing = (key: string) => { const item = view.candidates.find(row => row.key === key); return item ? [item.a.venue, item.b.venue].filter(venue => !view.keys[venue as KeyVenue]) : []; };
-  const save = (on: boolean, done: string) => {
-    if (!parsed.ok) return;
-    void write.run('settings', () => api(`${LIVE_PATH}/settings`, { body: { on, pairs, limits: parsed.value } }), () => { void onChanged(); return done; });
-  };
+  // 总开关只在点「打开实盘」「关闭实盘」时才提交；保存配对与限额不带它，免得用几秒前的视图把别处刚改的开关改回去。
+  const send = (body: Record<string, unknown>, done: string) => { void write.run('settings', () => api(`${LIVE_PATH}/settings`, { body }), () => { void onChanged(); return done; }); };
+  const save = (done: string) => { if (parsed.ok) send({ pairs, limits: parsed.value }, done); };
   const turnOn = () => {
     if (!pairs.length) return;
     const lines = pairs.map(key => `${pairLabel(key).symbol}（${pairLabel(key).short}）`).join('、');
     if (!confirm(`打开实盘？打开后，下列配对的模拟盘每次开仓，都会在两个交易所下真实订单：${lines}。单笔不超过 ${limits.perTradeUsd} 美元，同时不超过 ${limits.maxOpen} 笔。`)) return;
-    save(true, '实盘已打开：跟随模拟盘信号下真实订单');
+    if (parsed.ok) send({ on: true, pairs, limits: parsed.value }, '实盘已打开：跟随模拟盘信号下真实订单');
   };
   return <section className="panel" aria-label="实盘开关">
     <div className="panel-heading"><h2>实盘</h2><span className="muted">跟随模拟盘：模拟盘在勾选的配对上开仓、平仓时，两个交易所同步下真实订单</span></div>
     <div className="vl-actions vl-pause">
       {saved.on ? view.halt ? <Badge tone="bad">已停止</Badge> : <Badge tone="ok">实盘运行中</Badge> : <Badge tone="warn">实盘关闭</Badge>}
       {saved.on
-        ? <button type="button" className="button secondary" disabled={write.busy !== null || !parsed.ok} onClick={() => save(false, '实盘已关闭：不再开新仓，已有实盘持仓仍会跟随模拟盘平仓')}>关闭实盘</button>
+        ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => send({ on: false }, '实盘已关闭：不再开新仓，已有实盘持仓仍会跟随模拟盘平仓')}>关闭实盘</button>
         : <button type="button" className="button primary" disabled={write.busy !== null || !parsed.ok || !pairs.length} onClick={turnOn}><Play size={14} aria-hidden="true" />打开实盘</button>}
       <span className="muted">{saved.on ? '关闭只停开新仓，已有实盘持仓照常跟随平仓' : pairs.length ? '打开前先确认两边账户有足够保证金' : '先在下面勾选实盘配对'}</span>
     </div>
@@ -114,7 +113,7 @@ function SwitchPanel({ view, onChanged }: { view: LiveView; onChanged: () => Pro
         <input inputMode="decimal" value={limits[field.key]} onChange={event => setLimits(value => ({ ...value, [field.key]: event.target.value }))} /><small>{field.hint}</small></label>)}
     </div>
     <div className="vl-actions">
-      <button type="button" className="button primary" disabled={!parsed.ok || !dirty || write.busy !== null} onClick={() => save(saved.on, '实盘配对与限额已保存')}>{write.busy === 'settings' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Save size={14} aria-hidden="true" />}保存配对与限额</button>
+      <button type="button" className="button primary" disabled={!parsed.ok || !dirty || write.busy !== null} onClick={() => save('实盘配对与限额已保存')}>{write.busy === 'settings' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Save size={14} aria-hidden="true" />}保存配对与限额</button>
       {!parsed.ok ? <Callout tone="warning" role="status">{parsed.error}</Callout> : null}
       {write.message ? <Callout tone={write.message.tone}>{write.message.text}</Callout> : null}
     </div>

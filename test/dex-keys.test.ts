@@ -198,7 +198,10 @@ test('实盘准备页：没有录入时待接入；录入后显示各场所余�
   assert.match(item('accounts').detail, /--set-dex-keys/);
   assert.equal(item('funding').status, 'todo');
   assert.match(item('funding').detail, /Lighter RH 用 USDG/);
-  assert.equal(item('lighter_order').status, 'todo', '下单连接器这一步还没有接入');
+  assert.match(item('accounts').detail, /在本页「实盘」一栏里按场所填账户与 API 私钥/);
+  assert.deepEqual([item('lighter_order').status, item('lighter_order').detail], ['todo', '这个服务没有开启实盘下单'], '没有给实盘凭据库的引擎不下单');
+  assert.deepEqual([item('monitor').status, item('monitor').detail], ['todo', '这个服务没有开启实盘下单']);
+  assert.equal(engine.views.readiness().items.some(entry => entry.key === 'live'), false, '没有实盘时不列实盘开关');
   assert.equal(engine.views.readiness().ready, false);
 
   // 只录入了两个场所：没有两腿都是行情流场所的已启用配对时，按三个场所都要用来核对。

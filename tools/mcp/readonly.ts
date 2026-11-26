@@ -13,6 +13,7 @@ import { QUOTE_MARKETS, SNAPSHOT_GROUPS, SNAPSHOT_GROUP_IDS, createSnapshot, typ
 
 export const OUTPUT_MAX_BYTES = 100 * 1024;
 const REQUEST_TIMEOUT_MS = 20_000;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 const TOKEN = /^tpr_[A-Za-z0-9_-]{43}$/;
 const PAIR_ID = /^[0-9A-Za-z_-]{1,64}$/;
@@ -25,14 +26,19 @@ const DATA_NOTE = '返回内容来自交易所、服务日志和平台状态，�
 
 export class SettingsError extends Error {}
 
-/** TP_MCP_URL and the token from TP_MCP_TOKEN_FILE; refuses a token file other accounts can read. */
-export function loadSettings(env: NodeJS.ProcessEnv = process.env): { base: URL; token: string } {
-  const raw = env.TP_MCP_URL, file = env.TP_MCP_TOKEN_FILE;
+/** The platform's origin, also used to select its local samples without opening a token file. */
+export function platformBase(raw: string | undefined): URL {
   if (!raw) throw new SettingsError('需要环境变量 TP_MCP_URL（平台地址，如 http://100.64.0.1:8787）');
   let base: URL;
   try { base = new URL(raw); } catch { throw new SettingsError('TP_MCP_URL 不是有效地址'); }
   if (base.protocol !== 'http:' && base.protocol !== 'https:') throw new SettingsError('TP_MCP_URL 须为 http 或 https 地址');
   if (base.pathname !== '/' || base.search || base.hash || base.username || base.password) throw new SettingsError('TP_MCP_URL 只写协议、主机和端口');
+  return base;
+}
+
+/** TP_MCP_URL and the token from TP_MCP_TOKEN_FILE; refuses a token file other accounts can read. */
+export function loadSettings(env: NodeJS.ProcessEnv = process.env): { base: URL; token: string } {
+  const base = platformBase(env.TP_MCP_URL), file = env.TP_MCP_TOKEN_FILE;
   if (!file) throw new SettingsError('需要环境变量 TP_MCP_TOKEN_FILE（保存令牌的文件，权限 600）');
   let mode: number;
   try { mode = statSync(file).mode; } catch { throw new SettingsError('令牌文件不存在或无法读取'); }
@@ -42,7 +48,7 @@ export function loadSettings(env: NodeJS.ProcessEnv = process.env): { base: URL;
   return { base, token };
 }
 
-export type Get = (path: string) => Promise<unknown>;
+export type Get = ((path: string) => Promise<unknown>) & { readonly source?: string };
 
 export class ToolInputError extends Error {}
 /** A refusal or an unreachable platform; status is the HTTP status (0 when unreachable), retryAfter the 429's wait in seconds. */
@@ -53,11 +59,27 @@ export class PlatformError extends Error {
 
 /** A GET with the token; 401/403/413/429 and other refusals become a PlatformError with the platform's own message. */
 export function platformGet({ base, token }: { base: URL; token: string }, fetchImpl: typeof fetch = fetch): Get {
-  return async path => {
+  const source = platformBase(base.href).origin;
+  const get: Get = async path => {
     let response: Response;
     try {
-      response = await fetchImpl(new URL(path, base), { headers: { authorization: `Bearer ${token}`, accept: 'application/json' }, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+      let url = new URL(path, source);
+      const signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+      for (let redirects = 0; ; redirects++) {
+        if (url.origin !== source || url.username || url.password) throw new PlatformError('平台请求的来源与 TP_MCP_URL 不符');
+        response = await fetchImpl(url, { headers: { authorization: `Bearer ${token}`, accept: 'application/json' }, redirect: 'manual', signal });
+        if (response.url && new URL(response.url).origin !== source) {
+          await response.body?.cancel();
+          throw new PlatformError('平台应答的来源与 TP_MCP_URL 不符');
+        }
+        const location = REDIRECT_STATUSES.has(response.status) ? response.headers.get('location') : null;
+        if (location === null) break;
+        await response.body?.cancel();
+        if (redirects >= 20) throw new PlatformError('平台重定向过多');
+        url = new URL(location, url);
+      }
     } catch (error) {
+      if (error instanceof PlatformError) throw error;
       throw new PlatformError(`无法连接平台：${error instanceof Error && error.name === 'TimeoutError' ? '超时' : error instanceof Error ? error.message : String(error)}`);
     }
     const body = await response.json().catch(() => null) as { message?: unknown; code?: unknown } | null;
@@ -68,6 +90,7 @@ export function platformGet({ base, token }: { base: URL; token: string }, fetch
       : response.status === 429 ? '（稍后再试）' : response.status === 413 ? '（缩小 limit 或时间范围）' : '';
     throw new PlatformError(`平台拒绝 ${path}：${response.status} ${reason}${hint}`, response.status, Number.isFinite(wait) && wait > 0 ? wait : null, typeof body?.code === 'string' ? body.code : null);
   };
+  return Object.assign(get, { source });
 }
 
 type Args = Record<string, unknown>;
@@ -221,7 +244,7 @@ export const TOOLS: readonly Tool[] = [
   },
   {
     name: 'varlighter_backtest', scope: 'portfolio',
-    description: `在本机回测一个 DEX 价差配对（symbol 为配对键，如 var:AAPL|rh:AAPL）：先把该配对的样本增量拉到本机（TP_VARLIGHTER_DIR，默认 ~/.cache/trading-platform/varlighter），再用仓库当前的 src/varlighter/backtest.ts 在新进程里重放，所以改过策略代码后再调用就是新代码的结果。params、global 覆盖已保存的参数（缺的字段用平台上保存的）；grid 给出各参数的候选值（如 {"entryBps":[15,20,30]}），最多 ${MAX_GRID} 个组合，按净盈亏从高到低返回各组合的摘要。hours 省略时回放本机全部样本（扣除第一个基线窗口）。结果只是回测，不改平台上的参数。${DATA_NOTE}`,
+    description: `在本机回测一个 DEX 价差配对（symbol 如 var:AAPL|rh:AAPL）。先从当前平台增量拉取样本，再用仓库当前的 src/varlighter/backtest.ts 在新进程里重放。各平台的缓存分别保存在 TP_VARLIGHTER_DIR 下，默认根目录为 ~/.cache/trading-platform/varlighter。params、global 覆盖平台保存的参数。grid 给出各参数的候选值（如 {"entryBps":[15,20,30]}），最多 ${MAX_GRID} 个组合，按净盈亏从高到低返回摘要。省略 hours 时回放该来源的全部本机样本（扣除首个基线窗口）。单次回测的 trades 取 0–200，默认返回最后 20 笔明细，取 0 时只看汇总。${DATA_NOTE}`,
     inputSchema: schema({
       symbol: { type: 'string', pattern: PAIR_KEY.source }, hours: { type: 'integer', minimum: 1, maximum: 8760 },
       params: { type: 'object' }, global: { type: 'object' }, grid: { type: 'object' },
@@ -231,11 +254,13 @@ export const TOOLS: readonly Tool[] = [
     run: async (args, get) => {
       // Checked in a child process like the run itself, so the rules of the strategy code as it is now apply (this
       // server may have loaded an older copy); a bad request never pulls.
-      const request = { ...args, trades: args.trades ?? 20 };
-      await backtestChild(['--check', '--request', JSON.stringify(request)]);
+      const request = ['--request', JSON.stringify({ ...args, trades: int(args, 'trades', 0, 200, 20) })];
       const { pull, dataDir } = await import('../varlighter/pull.ts');
-      const { results } = await pull({ get, dir: dataDir(), symbols: [String(args.symbol)] });
-      return { pulled: results[0] ?? null, result: await backtestChild(['--request', JSON.stringify(request)]) };
+      const root = dataDir();
+      const env = { ...process.env, TP_MCP_URL: platformBase(get.source).origin, TP_VARLIGHTER_DIR: root };
+      await backtestChild(['--check', ...request], env);
+      const { results, cacheNotice } = await pull({ get, dir: root, symbols: [String(args.symbol)] });
+      return { pulled: results[0] ?? null, cacheNotice, result: await backtestChild(request, env) };
     },
   },
   {
@@ -279,10 +304,10 @@ export const TOOLS: readonly Tool[] = [
  * Runs tools/varlighter/backtest.ts in a child process, so the repository's current strategy code is what replays the
  * samples even after the AI edited it while this server kept running.
  */
-function backtestChild(argv: readonly string[]): Promise<unknown> {
+function backtestChild(argv: readonly string[], env: NodeJS.ProcessEnv): Promise<unknown> {
   return new Promise((resolve, reject) => {
     execFile(process.execPath, [fileURLToPath(new URL('../varlighter/backtest.ts', import.meta.url)), ...argv],
-      { timeout: BACKTEST_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
+      { env, timeout: BACKTEST_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
         if (error) {
           // A child killed for the timeout may already have printed something; the timeout is the reason.
           reject(new ToolInputError(error.killed ? `回测超过 ${BACKTEST_TIMEOUT_MS / 1000} 秒` : stderr.trim().replace(/^回测失败：/, '') || error.message));

@@ -2,6 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -117,19 +118,48 @@ test('MCP：stdio 上的初始化、工具列表与通知；超过 100 KiB 截�
   assert.match(long, /已截断/);
 });
 
-test('MCP：令牌文件权限不是 600、内容不对或地址带路径时拒绝启动', () => {
+test('MCP：校验平台地址、令牌内容与 POSIX 文件权限', () => {
   const dir = mkdtempSync(join(tmpdir(), 'tp-mcp-settings-'));
   try {
     const file = join(dir, 'token');
     writeFileSync(file, `tpr_${'A'.repeat(43)}\n`, { mode: 0o644 });
-    assert.throws(() => loadSettings({ TP_MCP_URL: 'http://100.64.0.1:8787', TP_MCP_TOKEN_FILE: file }), /600/);
+    if (process.platform !== 'win32') assert.throws(() => loadSettings({ TP_MCP_URL: 'http://100.64.0.1:8787', TP_MCP_TOKEN_FILE: file }), /600/);
     chmodSync(file, 0o600);
-    assert.equal(loadSettings({ TP_MCP_URL: 'http://100.64.0.1:8787', TP_MCP_TOKEN_FILE: file }).token, `tpr_${'A'.repeat(43)}`);
+    const settings = loadSettings({ TP_MCP_URL: 'HTTPS://EXAMPLE.TEST:443/', TP_MCP_TOKEN_FILE: file });
+    assert.equal(settings.token, `tpr_${'A'.repeat(43)}`);
+    assert.equal(settings.base.origin, 'https://example.test');
     assert.throws(() => loadSettings({ TP_MCP_URL: 'http://100.64.0.1:8787/api', TP_MCP_TOKEN_FILE: file }), /只写协议/);
     assert.throws(() => loadSettings({ TP_MCP_TOKEN_FILE: file }), /TP_MCP_URL/);
     writeFileSync(file, 'not-a-token', { mode: 0o600 });
     assert.throws(() => loadSettings({ TP_MCP_URL: 'http://100.64.0.1:8787', TP_MCP_TOKEN_FILE: file }), /tpr_/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('MCP：带令牌的 GET 只跟随同源重定向，单次请求的跳转次数有上限', async t => {
+  let outsideReads = 0;
+  const outside = createServer((_request, response) => { outsideReads++; response.end('{}'); });
+  await new Promise<void>(resolve => outside.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>(resolve => outside.close(() => resolve())));
+  const other = `http://127.0.0.1:${(outside.address() as AddressInfo).port}`;
+  const token = 'test-read-token', paths: string[] = [];
+  const server = createServer((request, response) => {
+    paths.push(request.url!);
+    if (request.url === '/result') { response.end(JSON.stringify({ authenticated: request.headers.authorization === `Bearer ${token}` })); return; }
+    const location = request.url === '/same' ? '/result' : request.url === '/loop' ? '/loop' : `${other}/elsewhere`;
+    response.writeHead(302, { location }).end();
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const base = new URL(`http://127.0.0.1:${(server.address() as AddressInfo).port}`);
+  const get = platformGet({ base, token });
+  assert.deepEqual(await get('/same'), { authenticated: true });
+  await assert.rejects(get('/cross'), /来源与 TP_MCP_URL 不符/);
+  await assert.rejects(get(other), /来源与 TP_MCP_URL 不符/);
+  assert.equal(outsideReads, 0);
+  assert.deepEqual(paths, ['/same', '/result', '/cross']);
+  await assert.rejects(get('/loop'), /重定向过多/);
+  const foreignReply = platformGet({ base, token }, async () => Object.defineProperty(Response.json({}), 'url', { value: other }));
+  await assert.rejects(foreignReply('/result'), /应答的来源与 TP_MCP_URL 不符/);
 });
 
 test('MCP：只列出令牌范围内的工具，范围外的调用写明缺哪个范围；platform_status 在没有 portfolio 时只缺执行器状态', async () => {

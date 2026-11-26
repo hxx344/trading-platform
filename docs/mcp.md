@@ -224,11 +224,16 @@ R3：改动令牌的权限范围，第 8.4 节还会改 `read-token.json` 的格
 
 **客户端侧**（与 `tools/mcp/readonly.ts` 同样用 `TP_MCP_URL`、`TP_MCP_TOKEN_FILE`，都不进发布包）
 
-- `tools/varlighter/pull.ts`：把样本增量拉到本机目录（默认 `~/.cache/trading-platform/varlighter`，可用 `TP_VARLIGHTER_DIR` 改），每个配对一个文件（v0.88.0 起文件名是整个配对键 `encodeURIComponent` 后加 `.jsonl`，如 `var%3AAAPL%7Crh%3AAAPL.jsonl`；以前的 `<场所>_<代码>.jsonl` 不再读，升级后重新拉取），并保存一份 `state.json`（参数与各配对的类别）。已有文件从最后一条之后接着拉，所以本机可以积累超过服务器 14 天保留期的样本。参数 `--symbol <配对键>`（可多个）或 `--enabled`（已启用或有持仓的配对）。遇到 429 按 `Retry-After` 等待后继续，413 时减半 `limit` 重试。同一配对的拉取用 `<文件>.lock` 互斥（命令行与 MCP 同时拉也不会重复写入，锁里记着持有者，拉取中每页刷新，只有 5 分钟没刷新的锁才被接管，只由持有者删除；写入前还会再读一次文件末尾）；被中断留下的半行在下次拉取前截掉；本机最后一条已超出服务器保留期时，结果里的 `gap` 给出缺的时段。
-- `tools/varlighter/backtest.ts`：读本机样本和 `state.json`，用仓库当前的 `src/varlighter/backtest.ts` 的 `runBacktest` 重放。参数 `--symbol`、`--hours`（不限 336，以本机样本为准）、`--params`、`--global`（JSON，缺的字段用已保存的参数补，校验同页面的回测请求），`--grid`（JSON，各字段的候选值，组合最多 200 个，按净盈亏排序输出摘要）。每次运行是一个新进程，AI 改了策略代码后再跑就是新代码的结果。默认只输出摘要和最后 50 笔成交，`--trades all` 输出全部。与服务器回测一样只取 `from` 之前一个基线窗口的样本；输出带 `skipped`（时刻不递增而跳过的行数）和 `gaps`（本机文件里超过 30 分钟的空档，`gapCount` 为总数；单次回测的 `replayGaps` 只数回放区间内的）。正在追加、还没写完的最后一行不读。`--check` 只按当前代码的参数规则核对请求，不读样本。
+带令牌的 GET 只跟随同源重定向。代理可在同一来源内调整路径。跳转到另一协议、主机或端口时，请求停止。
+
+- `tools/varlighter/pull.ts` 把样本保存到缓存根目录（默认 `~/.cache/trading-platform/varlighter`，可用 `TP_VARLIGHTER_DIR` 指定）下的 `sources/<来源哈希>/`。来源取连接的规范化 `TP_MCP_URL`，包含协议、主机和有效端口。主机大小写、显式默认端口、末尾斜杠和令牌轮换都复用同一来源。域名与 IP 等不同地址各有一份缓存。原地址重装并更换整套数据后，把拉取和回测使用的 `TP_VARLIGHTER_DIR` 指向一个新的空目录。用原目录仍可离线查看重装前的样本。拉取与回测结果的 `source` 显示来源地址。
+- 每个来源分别保存 `state.json`（来源、策略参数、配对类别与两腿费率）和各配对的样本（如 `var%3AAAPL%7Crh%3AAAPL.jsonl`）。升级前根目录的旧文件保留原样。首次针对某平台拉取时会提示重新读取服务器仍保留的样本，过去积累的更早数据仍在旧文件里。若来源快照缺失且目录已有样本，或快照来源与目录不符，工具报错并保留文件。
+- 拉取可指定一个或多个 `--symbol <配对键>`，也可用 `--enabled` 选择已启用或有持仓的配对。从该来源、该配对文件的最后一条续拉，可积累超过服务器 14 天保留期的历史。`gap` 给出服务器已过期的空档。遇到 429 按 `Retry-After` 等待，遇到 413 减半每页条数再读。同一来源、同一配对用 `<文件>.lock` 防止并发重复追加。锁按页刷新，停更 5 分钟才可接管。下次拉取先截掉上次中断留下的半行。
+- `tools/varlighter/backtest.ts` 在离线机器上用仓库当前的 `runBacktest` 重放，读取本机样本和来源快照即可。只有一份来源快照时自动选择，有多个来源时用 `TP_MCP_URL` 指定，无需令牌。参数包括 `--symbol`、`--hours`（以本机样本为准）、`--params`、`--global`（JSON，缺的字段取该来源保存的值），以及 `--grid`（最多 200 个组合，按净盈亏排序）。单次回测默认返回最后 50 笔成交，`--trades 0` 只返回汇总和空的成交列表，`--trades all` 返回全部明细。`summary` 始终计入全部成交。
+- 回测读取 `from` 之前一个基线窗口预热。结果的 `skipped` 给出跳过的时刻不递增行数，`gaps` 列出超过 30 分钟的空档，`gapCount` 给出全文件空档总数，单次回测的 `replayGaps` 给出回放区间内的空档数。追加中未写完的最后一行留到下次再读。`--check` 只按当前代码的参数规则核对请求。
 - MCP 工具新增：
   - `varlighter`：`view=state|symbol|paper|readiness`，`symbol` 视图要 `symbol`，可选 `hours`。v0.88.0 起配对键是两腿写法 `场所:代码|场所:代码[@乘数]`（如 `var:AAPL|rh:AAPL`、`lighter:NVDA|entropy:NVDA`），旧写法 `rh:AAPL` 仍认；`samples` 应答带 `format: 2` 与两腿列名，`pull.ts` 遇到别的格式（平台还是旧版本）报错而不写文件。本机回测按 `state.json` 里各配对两腿的手续费（`aFeeBps`、`bFeeBps`）重放，请求的全局手续费字段可覆盖。见 [dexspread.md](dexspread.md) 第 10.8 节。
-  - `varlighter_backtest`：先在子进程里用 `--check` 核对请求（用的是当前的策略代码，请求不合法就不拉取），再对该配对做一次增量拉取，然后起子进程运行 `tools/varlighter/backtest.ts`，参数同上（`params`、`global`、`grid`、`hours`），返回其 JSON 输出。子进程 120 秒超时。
+  - `varlighter_backtest` 先在子进程里用 `--check` 核对请求，再从当前 MCP 连接的平台增量拉取配对样本，用相同来源在新进程运行 `tools/varlighter/backtest.ts`。参数同上（`params`、`global`、`grid`、`hours`）。单次回测的 `trades` 取 0–200，默认 20，取 0 时 `tradesShown` 为 0。子进程 120 秒超时。
   - `host_status`、`market_quotes`（`market` 选一个或全部）、`news`（`view=flash|moves`）。
 
 **AI 优化的用法**（写进 [varlighter.md](varlighter.md)）：在仓库目录里打开 Claude Code，接上只读 MCP；先用 `varlighter` 看各配对现状与模拟盘结果，用 `varlighter_backtest` 的 `grid` 扫参数；要改策略逻辑时直接改 `src/varlighter/strategy.ts` 等文件，再用 `tools/varlighter/backtest.ts` 对同一批样本比较改动前后，最后照常走审查与发布。AI 拿到的只有数据，改参数要在页面上保存，改代码要发布。

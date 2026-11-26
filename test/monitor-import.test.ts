@@ -218,7 +218,9 @@ test('应用：待应用的值无效或超过 10 分钟时丢弃并记日志；�
 test('机器人：有 feishuMonitor 时入行情告警自己的队列，没有时入 feishu 的队列；送达按各自入队的队列读；队列打不开时报错', async () => {
   const queue = (name: string) => {
     const sent: string[] = [], asked: number[][] = [];
-    return { sent, asked, outbox: { notify: (text: string) => { sent.push(text); return sent.length; }, delivery: (ids: readonly number[]) => { asked.push([...ids]); return new Map(ids.map(id => [id, { sentAt: NOW, attempts: 1, lastError: name, nextAt: NOW }])); } } };
+    return { sent, asked, outbox: { notify: (text: string) => { sent.push(text); return sent.length; },
+      notifyRepeating: (key: string, text: string) => { sent.push(key + ' ' + text); },
+      delivery: (ids: readonly number[]) => { asked.push([...ids]); return new Map(ids.map(id => [id, { sentAt: NOW, attempts: 1, lastError: name, nextAt: NOW }])); } } };
   };
   const aster = queue('aster'), monitor = queue('monitor'), posted: string[] = [];
   const send = async (secret: { webhook: string }, text: string) => { posted.push(`${secret.webhook} ${text}`); };
@@ -226,6 +228,8 @@ test('机器人：有 feishuMonitor 时入行情告警自己的队列，没有�
   assert.equal(own.robot(), 'feishuMonitor');
   assert.equal(own.notify('告警'), 1);
   assert.deepEqual([aster.sent, monitor.sent], [[], ['告警']]);
+  own.notifyRepeating!('机会', '扣费价差');
+  assert.deepEqual([aster.sent, monitor.sent], [[], ['告警', '机会 扣费价差']]);
   assert.equal(own.delivery([1], 'feishu').get(1)?.lastError, 'aster', '之前入 feishu 队列的仍从那里读');
   assert.equal(own.delivery([1], 'feishuMonitor').get(1)?.lastError, 'monitor');
   await own.test('测试');

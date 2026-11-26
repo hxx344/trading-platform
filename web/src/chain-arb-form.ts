@@ -1,4 +1,4 @@
-import { parseChainArb, type Chain, type ChainArbView } from '../../src/chain-arb/model.ts';
+import { parseChainArb, type Chain, type ChainArbView, type ChainArbVenue } from '../../src/chain-arb/model.ts';
 
 export const chainNames: Record<Chain, string> = {
   ethereum: 'Ethereum', arbitrum: 'Arbitrum One', bsc: 'BNB Smart Chain',
@@ -10,7 +10,7 @@ export const initialChainArbForm = {
   address: '0x912CE59144191C1204E64559FE8253a0e49E6548',
   amount: '1000', spotFeeBps: '10', perpFeeBps: '5', spotCosts: '', perpCosts: '',
 };
-export type ChainArbForm = typeof initialChainArbForm & { source?: 'scan' };
+export type ChainArbForm = typeof initialChainArbForm & { source?: 'scan'; venue?: ChainArbVenue };
 
 export function chainArbQuery(form: ChainArbForm, autoGas = false) {
   const fields = Object.fromEntries(Object.entries(form).map(([name, value]) => [name, value.trim()]));

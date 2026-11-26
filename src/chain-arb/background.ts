@@ -1,0 +1,159 @@
+import { randomBytes } from 'node:crypto';
+import { anySignal } from '../any-signal.mjs';
+import { untilAborted } from '../asset/sources/shared-reads.ts';
+import { ContractError, exactKeys } from '../contracts.ts';
+import type { LoopContext } from '../monitor/anthropic.ts';
+import type { AlertHooks } from '../monitor/alerts.ts';
+import type { MarketControl } from '../monitor/control.ts';
+import type { MonitorStore } from '../monitor/store.ts';
+import { DEFAULT_BACKGROUND_SETTINGS, parseBackgroundSettings, type BackgroundSettings, type BackgroundView } from './background-model.ts';
+import { CHAIN_ARB_TTL_MS, VENUE_NAMES, isGateBaseSymbol, type ChainArbVenue } from './model.ts';
+import { SCAN_HISTORY_MS, type ScanRow, type ScanView } from './scan-model.ts';
+
+const SETTINGS_KEY = 'chainArb.background';
+const POLL_MS = 2_000;
+const chainNames = { ethereum: 'Ethereum', arbitrum: 'Arbitrum One', bsc: 'BNB Smart Chain' };
+const reason = (error: unknown) => (error instanceof Error ? error.message : String(error)).slice(0, 200);
+
+interface Options {
+  store: Pick<MonitorStore, 'readState' | 'writeState'>;
+  scan(input: unknown, scope: string, signal: AbortSignal, awaitBatch?: boolean): Promise<ScanView>;
+  control(): MarketControl;
+  hooks?: Pick<AlertHooks, 'robot' | 'notifyRepeating'>;
+  now?: () => number;
+}
+
+function checkSnapshot(snapshot: ScanView, venue: ChainArbVenue, chain: BackgroundSettings['chain']) {
+  const matches = (row: ScanRow) => row && (row.venue ?? 'gate') === venue && Object.hasOwn(chainNames, row.chain)
+    && (chain === 'all' || row.chain === chain) && isGateBaseSymbol(row.symbol) && /^0x[\da-f]{40}$/i.test(row.address)
+    && (row.kind === 'spot' || row.kind === 'perp') && [row.netUsdt, row.netBps, row.dexPrice, row.gatePrice, row.at]
+      .every(value => Number.isFinite(value) && value > 0) && Number.isFinite(row.gasUsdt) && row.gasUsdt >= 0
+    && row.expiresAt === row.at + CHAIN_ARB_TTL_MS;
+  if (!snapshot || !Number.isFinite(snapshot.asOf) || !['loading', 'scanning', 'cooldown', 'error'].includes(snapshot.phase)
+    || !Array.isArray(snapshot.rows) || !Array.isArray(snapshot.history) || !snapshot.rows.every(matches) || !snapshot.history.every(matches))
+    throw new Error('行情快照格式或币种路线与本次扫描不符');
+}
+
+function currentSnapshot(snapshot: ScanView, at: number): ScanView {
+  const live = (snapshot.phase === 'scanning' || snapshot.phase === 'cooldown') && snapshot.asOf <= at;
+  const rows: ScanRow[] = [], samples = [...snapshot.history];
+  for (const row of snapshot.rows) {
+    if (live && row.at <= at && row.expiresAt > at) rows.push(row);
+    else samples.push(row);
+  }
+  const history = samples.filter(row => row.at <= at && at - row.at < SCAN_HISTORY_MS)
+    .sort((left, right) => right.at - left.at || right.netBps - left.netBps).slice(0, 50);
+  return { ...snapshot, asOf: at, rows, history };
+}
+
+function notifyMessage(venue: ChainArbVenue, row: ScanRow, settings: BackgroundSettings) {
+  const route = row.kind === 'spot' ? '现货充值卖出' : '永续开空（基差收敛情景，未计资金费）';
+  return ['【链上折价套利】' + row.symbol + ' · ' + chainNames[row.chain],
+    '路线：链上买入 → ' + VENUE_NAMES[venue] + ' ' + route,
+    '合约地址：' + row.address, '预算 ' + settings.amount + ' USDT，扣费后价差 ' + Number(row.netBps.toPrecision(8)) + ' bp（阈值 ' + settings.thresholdBps + ' bp）',
+    '预估净收益 ' + Number(row.netUsdt.toPrecision(8)) + ' USDT，报价时间 ' + new Date(row.at).toISOString(),
+    '报价有效至 ' + new Date(row.expiresAt).toISOString() + '，过期请在平台重新复核。'].join('\n');
+}
+
+export function createChainArbBackground({ store, scan, control, hooks, now = Date.now }: Options) {
+  let settings = DEFAULT_BACKGROUND_SETTINGS, revision = 0, loadError: string | null = null;
+  try {
+    const entry = store.readState(SETTINGS_KEY);
+    if (entry) {
+      const saved = exactKeys(entry.value, ['version', 'revision', 'settings']);
+      if (saved.version !== 1 || !Number.isSafeInteger(saved.revision) || (saved.revision as number) < 0) throw new Error('设置版本无效');
+      settings = parseBackgroundSettings(saved.settings);
+      revision = saved.revision as number;
+    }
+  } catch (error) { loadError = '后台扫描设置读取失败，扫描已暂停，请重新保存：' + reason(error); }
+
+  const results = new Map<ChainArbVenue, ScanView>(), queueErrors = new Map<ChainArbVenue, string>();
+  let generation = randomBytes(12).toString('hex'), marketRevision = control().revision;
+  const pending = new Map<ChainArbVenue, AbortController>();
+  let nextVenue = 0, stopped = false;
+
+  function reset() {
+    for (const controller of pending.values()) controller.abort();
+    pending.clear();
+    generation = randomBytes(12).toString('hex');
+    results.clear(); queueErrors.clear(); nextVenue = 0;
+  }
+  function observeControl() {
+    const market = control();
+    if (market.revision !== marketRevision) { marketRevision = market.revision; reset(); }
+    return market.enabled;
+  }
+  function view(): BackgroundView {
+    const on = observeControl(), at = now();
+    return { revision, settings, robot: hooks?.robot() ?? null, error: loadError ?? ([...queueErrors.values()].join('；') || null),
+      results: on ? Object.fromEntries([...results].map(([venue, snapshot]) => [venue, currentSnapshot(snapshot, at)])) : {} };
+  }
+  function update(input: unknown): BackgroundView {
+    const body = exactKeys(input, ['revision', 'settings']);
+    if (!Number.isSafeInteger(body.revision) || (body.revision as number) < 0) throw new ContractError(400, 'invalid_request', '设置版本号无效');
+    let next: BackgroundSettings;
+    try { next = parseBackgroundSettings(body.settings); }
+    catch (error) { throw new ContractError(400, 'invalid_request', reason(error)); }
+    if (!loadError && JSON.stringify(next) === JSON.stringify(settings)) return view();
+    if (revision !== body.revision) throw new ContractError(409, 'conflict', '设置已被其他页面修改，请刷新后重试');
+    try { store.writeState(SETTINGS_KEY, { version: 1, settings: next, revision: revision + 1 }); }
+    catch { throw new ContractError(503, 'background_unsaved', '后台扫描设置未保存，请检查 monitor.sqlite 写权限后重试'); }
+    settings = next; revision++; loadError = null; reset();
+    return view();
+  }
+
+  // Each public scanner advances at most one batch when read. Rotate one venue per tick across the shared DEX budget.
+  async function tick() {
+    if (!observeControl() || stopped || !settings.enabled || loadError) return;
+    const { enabled: _enabled, thresholdBps, venues, fees, ...params } = settings;
+    const venue = venues[nextVenue++ % venues.length]!;
+    if (pending.has(venue)) return;
+    const started = generation, controller = new AbortController();
+    pending.set(venue, controller);
+    const signal = anySignal([controller.signal], 28_000);
+    const current = () => observeControl() && !stopped && started === generation;
+    try {
+      const snapshot = await untilAborted(scan({ ...params, ...fees?.[venue], ...(venue === 'gate' ? {} : { venue }) }, generation + ':' + marketRevision, signal, true), signal);
+      if (!current()) return;
+      signal.throwIfAborted();
+      checkSnapshot(snapshot, venue, settings.chain);
+      results.set(venue, snapshot);
+      if (!hooks?.robot() || !hooks.notifyRepeating || (snapshot.phase !== 'scanning' && snapshot.phase !== 'cooldown')) return;
+      queueErrors.delete(venue);
+      for (const row of snapshot.rows) {
+        const at = now();
+        if (snapshot.asOf > at || row.at > at || row.expiresAt <= at || row.netBps <= thresholdBps) continue;
+        const key = ['chain-arb', venue, row.chain, row.address.toLowerCase(), row.kind].join(':');
+        try { hooks.notifyRepeating(key, notifyMessage(venue, row, settings)); }
+        catch (error) { queueErrors.set(venue, VENUE_NAMES[venue] + ' 通知入队失败：' + reason(error)); break; }
+      }
+    } catch (error) {
+      if (!current()) return;
+      const previous = results.get(venue);
+      results.set(venue, { cycle: 0, total: 0, checked: 0, failed: 0, ...previous, asOf: now(), phase: 'error',
+        message: signal.aborted ? '后台行情读取超时，稍后重试' : reason(error), rows: [], history: previous ? [...previous.rows, ...previous.history] : [] });
+    } finally {
+      controller.abort();
+      if (pending.get(venue) === controller) pending.delete(venue);
+    }
+  }
+  return {
+    view, update, tick,
+    enabled: () => settings.enabled,
+    async loop(context: LoopContext) {
+      const reads = new Set<Promise<void>>();
+      try {
+        while (!stopped && !context.stopped()) {
+          const read = tick();
+          reads.add(read);
+          void read.then(() => reads.delete(read), () => reads.delete(read));
+          await context.pause(POLL_MS);
+        }
+      } finally {
+        reset();
+        await Promise.allSettled(reads);
+      }
+    },
+    stop() { stopped = true; reset(); },
+  };
+}

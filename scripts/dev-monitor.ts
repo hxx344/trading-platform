@@ -15,7 +15,6 @@ import { parseMonitorConfig } from '../src/service/monitor-config.ts';
 import { closeMonitor, monitorLoops, monitorStatus, monitorViews, openMonitor, settleMonitor, stopMonitor } from '../src/service/monitor.ts';
 import { fakeAnthropicVenues } from '../test/monitor-fake.ts';
 import { fakePerpetualVenues } from '../test/perpetual-fake.ts';
-import { createChainArbMarket } from '../src/chain-arb/read.ts';
 import { chainArbFixture } from '../test/chain-arb-fake.ts';
 import { fakeNews } from '../test/news-fake.ts';
 import { newsLoop, newsViews } from '../src/service/news.ts';
@@ -30,15 +29,18 @@ const venues = fakeAnthropicVenues({ listedAt: { skhy: Date.UTC(2026, 6, 10, 14)
 // A stand-in Feishu robot for the alert panel (M-3a): queued alerts and test messages print here, an alert counts as sent 2 s
 // after it was queued.
 const outbox: { text: string; at: number }[] = [];
+const lastAlert = new Map<string, number>();
 const alertHooks = {
   notify: (text: string) => { outbox.push({ text, at: Date.now() }); process.stdout.write(`[替身飞书·入队] ${text}\n`); return outbox.length; },
+  notifyRepeating: (key: string, text: string) => {
+    if (Date.now() - (lastAlert.get(key) ?? 0) < 30 * 60_000) return;
+    alertHooks.notify(text); lastAlert.set(key, Date.now());
+  },
   delivery: (ids: readonly number[]) => new Map(ids.flatMap(id => { const item = outbox[id - 1]; return item ? [[id, { sentAt: Date.now() - item.at >= 2_000 ? item.at + 2_000 : null, attempts: 0, lastError: null, nextAt: item.at }] as const] : []; })),
   robot: () => 'feishuMonitor' as const,
   test: async (text: string) => { process.stdout.write(`[替身飞书·测试] ${text}\n`); },
 };
-const monitor = openMonitor(parseMonitorConfig({ anthropic: {}, oil: {}, goldoil: {}, hynix: {}, perpetual: {} }), dir, { fetchImpl: venues.fetch, WebSocketImpl: venues.WebSocket, variationalFetch: venues.variationalFetch, alertHooks, perpetualOptions: fakePerpetualVenues() });
-monitor.closeChainArb?.();
-Object.assign(monitor, createChainArbMarket({ fetchImpl: chainArbFixture() }));
+const monitor = openMonitor(parseMonitorConfig({ anthropic: {}, oil: {}, goldoil: {}, hynix: {}, perpetual: {} }), dir, { fetchImpl: venues.fetch, WebSocketImpl: venues.WebSocket, variationalFetch: venues.variationalFetch, alertHooks, perpetualOptions: fakePerpetualVenues(), chainArbFetch: chainArbFixture() });
 const store = openStore(join(dir, 'executor.sqlite'));
 const { binance, bybit, aster, asterTrading } = createSimulatedVenues(Date.now);
 const executor = createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, positions: asterTrading });

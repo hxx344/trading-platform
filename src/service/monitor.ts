@@ -3,6 +3,7 @@
 // opened costs only the monitor page.
 import type { MarketClient } from '../market/ipc.ts';
 import { createChainArbMarket } from '../chain-arb/read.ts';
+import { createChainArbBackground } from '../chain-arb/background.ts';
 import { ContractError } from '../contracts.ts';
 import { createRemoteMonitor } from './remote-monitor.ts';
 import { perpetualQualityEnv } from '../monitor/quality-config.ts';
@@ -43,6 +44,7 @@ export interface MonitorRuntime {
   chainArb?: ReturnType<typeof createChainArbMarket>['chainArb'];
   scanChainArb?: ReturnType<typeof createChainArbMarket>['scanChainArb'];
   closeChainArb?: () => void;
+  chainArbBackground?: ReturnType<typeof createChainArbBackground>;
   /** M-5b1: the perpetual collector's public-data cache (perpetual-cache.sqlite); null when not configured or not openable. */
   perpetualCache: PerpetualCache | null;
 }
@@ -50,11 +52,12 @@ export interface MonitorRuntime {
 export { perpetualQualityEnv } from '../monitor/quality-config.ts';
 
 /** Opens monitor.sqlite and reads the saved history back; throws when the file cannot be opened. */
-export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now, log, WebSocketImpl, alertHooks, variationalFetch, perpetualOptions, marketClient, env = process.env }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void; WebSocketImpl?: typeof WebSocket; alertHooks?: AlertHooks;
+export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now, log, WebSocketImpl, alertHooks, variationalFetch, perpetualOptions, chainArbFetch, marketClient, env = process.env }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void; WebSocketImpl?: typeof WebSocket; alertHooks?: AlertHooks;
   /** The transport to omni.variational.io; python3 and scripts/variational-request.py unless given (tests, the local preview). */
   variationalFetch?: VariationalFetcher; marketClient?: MarketClient;
   /** Stand-ins for the perpetual collector's venues (tests, the local preview). */
   perpetualOptions?: PerpetualOptions;
+  chainArbFetch?: AnthropicFetcher;
   /** M-5d2: where PERPETUAL_COIN_IDS and COINGECKO_DEMO_API_KEY are read (process.env unless given). */
   env?: Record<string, string | undefined> } = {}): MonitorRuntime {
   const store = createMonitorStore({ file: join(dir, MONITOR_FILE), ...(now ? { now } : {}) });
@@ -109,8 +112,10 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
         ...(perpetualCache ? {} : { cacheUnavailable: `缓存库 ${PERPETUAL_CACHE_FILE} 打不开，市场指标、历史资金费、成交价历史与质量样本只存内存，重启后重新采集。` }),
         paper: { store: paperStore, unavailableReason: paperUnavailable }, ...perpetualOptions, ...(remote ? { remote: remote.perpetual } : {}),
         quality: { ...perpetualQualityEnv(env, log ?? (line => process.stderr.write(`${line}\n`))), ...perpetualOptions?.quality } }) : null;
-      const chain = !config.perpetual ? {} : remote ? { chainArb: remote.chainArb, scanChainArb: remote.scanChainArb } : createChainArbMarket({ now, fetchImpl });
-      return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, goldoil, hynix, exchanges, alerts, control, variational, perpetual, perpetualCache, ...chain };
+      const chain = !config.perpetual ? {} : remote ? { chainArb: remote.chainArb, scanChainArb: remote.scanChainArb } : createChainArbMarket({ now, fetchImpl: chainArbFetch ?? fetchImpl });
+      const chainArbBackground = chain.scanChainArb ? createChainArbBackground({ store, scan: chain.scanChainArb, now,
+        control: () => control.view('perpetual'), hooks: alertHooks }) : undefined;
+      return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, goldoil, hynix, exchanges, alerts, control, variational, perpetual, perpetualCache, ...chain, chainArbBackground };
     } catch (error) { perpetualCache?.close(); throw error; }
   } catch (error) { store.close(); throw error; }
 }
@@ -142,6 +147,7 @@ export function monitorViews(monitor: MonitorRuntime) {
     perpetual: (): PerpetualMonitor | undefined => monitor.perpetual ?? undefined,
     chainArb: monitor.chainArb,
     scanChainArb: monitor.scanChainArb,
+    chainArbBackground: monitor.chainArbBackground,
     /** The settled funding history (M-2d); undefined when the market is not configured; before any settlement
      * `{ notReady }` with why the last round failed (null while the first round has not failed). */
     funding: (market: 'oil' | 'hynix'): unknown => {
@@ -231,12 +237,13 @@ export const monitorLoops = (monitor: MonitorRuntime, context: LoopContext, log:
       return collector ? [marketLoops(loopContext => collector.loops(loopContext), context, on(market), log)] : [];
     }),
     ...(Object.entries(monitor.alerts) as [AlertMarket, AlertService][]).map(([market, service]) => alertLoop(service, context, on(market), log)),
+    ...(monitor.chainArbBackground ? [monitor.chainArbBackground.loop(context)] : []),
     ...(monitor.perpetual ? [perpetualLoop(monitor.perpetual, context, on('perpetual')).catch(error => { log(`合约价差循环异常退出：${error instanceof Error ? error.message.slice(0, 200) : String(error)}`); })] : []),
   ];
 };
 
 /** Ends the requests in flight (at stopping), so the loops finish within the drain. */
-export const stopMonitor = (monitor: MonitorRuntime): void => { monitor.anthropic?.stop(); monitor.oil?.stop(); monitor.goldoil?.stop(); monitor.hynix?.stop(); monitor.exchanges?.stop(); monitor.variational?.stop(); monitor.perpetual?.stop(); };
+export const stopMonitor = (monitor: MonitorRuntime): void => { monitor.anthropic?.stop(); monitor.oil?.stop(); monitor.goldoil?.stop(); monitor.hynix?.stop(); monitor.exchanges?.stop(); monitor.variational?.stop(); monitor.perpetual?.stop(); monitor.chainArbBackground?.stop(); };
 export const closeMonitor = (monitor: MonitorRuntime): void => {
   monitor.closeChainArb?.();
   try { monitor.store.close(); } catch { /* best effort */ }

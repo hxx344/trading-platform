@@ -66,6 +66,15 @@ test('自动 Gas 模式按覆盖的链上买入成本排序，缺少估值时不
   assert.ok('netBps' in missing.spot && missing.spot.netBps === null && missing.spot.netUsdt === null);
 });
 
+test('最低充值量按链上实际到账量比较，差一个最小单位只关闭现货路线', () => {
+  const market = { ...venue, minDeposit: '1', spot: { ...spot, step: '0.1' }, perp: { ...perp, step: '0.01' } };
+  const below = compareChainArb({ ...input, venue: 'bitget' }, { ...buy, rawQuantity: '999999999999999999', decimals: 18 }, market, now);
+  assert.deepEqual(below.spot, { error: '链上买入数量低于该网络最低充值量' });
+  assert.ok('netUsdt' in below.perp);
+  const exact = compareChainArb(input, { ...buy, rawQuantity: '1000000000000000000', decimals: 18 }, market, now);
+  assert.ok('netUsdt' in exact.spot);
+});
+
 test('目录刷新撤销单条路线时，同一行情进程的所有榜单都按新资格过滤，即使单币缓存仍旧', async t => {
   let time = 1_795_600_000_000, mode: 'both' | 'perp' | 'spot' = 'both';
   const now = () => time, fixture = chainArbFixture(now);

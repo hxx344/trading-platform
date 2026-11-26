@@ -74,10 +74,11 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
   async function read(op: string, input: unknown, signal: AbortSignal): Promise<unknown> {
     switch (op) {
       case 'monitor.perpetual.chainArb': return chain.chainArb(input, signal);
-      case 'monitor.perpetual.chainArbScan': {
+      case 'monitor.perpetual.chainArbScan':
+      case 'monitor.perpetual.chainArbBatch': {
         const { params, scope } = fields(input, ['params', 'scope']);
         if (typeof scope !== 'string' || !/^[a-f0-9]{24}:\d{1,16}$/.test(scope)) throw new Error('行情扫描代次无效');
-        return chain.scanChainArb(params, scope, signal);
+        return chain.scanChainArb(params, scope, signal, op === 'monitor.perpetual.chainArbBatch');
       }
       case 'monitor.anthropic.ANTUSDT.quote': none(input); return readers.anthropicQuote(signal);
       case 'monitor.anthropic.quote': {

@@ -1,7 +1,8 @@
 import Decimal from '../vendor/decimal.mjs';
 import type { DexQuote } from './dex.ts';
 import type { GateLeg } from './gate.ts';
-import { CHAIN_ARB_CLOCK_SKEW_MS, CHAIN_ARB_TTL_MS, type ArbResult, type ChainArbInput, type ChainArbView } from './model.ts';
+import { CHAIN_ARB_CLOCK_SKEW_MS, CHAIN_ARB_TTL_MS, VENUE_NAMES, type ArbResult, type ChainArbInput, type ChainArbView } from './model.ts';
+import type { VenueBook } from './venue.ts';
 
 // ERC-20 输出最多 78 位整数。覆盖它与 Gate 有限数值相乘时，从最小买盘量 × 最小价 (1e-648)
 // 到最大输出 × 最大价 (1e386) 的全部位数，确保盘口累加、限额与步长比较不进位。
@@ -48,16 +49,18 @@ function estimate(leg: GateLeg, input: ChainArbInput, bought: Decimal, buy: DexQ
   return { quantity: quantity.toNumber(), price, grossUsdt, spreadBps, netUsdt, netBps, coveredCostUsdt: coveredCost.toNumber(), at: leg.at, remainder: remainder.toNumber() };
 }
 
-export function compareChainArb(input: ChainArbInput, buy: DexQuote,
-  gate: { deposit: boolean | null; withdraw: boolean | null; spot: GateLeg; perp: GateLeg }, now: number): ChainArbView {
+export function compareChainArb(input: ChainArbInput, buy: DexQuote, venue: VenueBook, now: number): ChainArbView {
   if (!fresh(buy.at, now)) throw new Error('链上报价已过期或时间异常，请刷新');
   const bought = new D(`${buy.rawQuantity}e-${buy.decimals}`);
   const dex = { quantity: bought.toNumber(), price: new D(input.amount).div(bought).toNumber(), at: buy.at, swapGasUsdt: buy.swapGasUsdt ?? null };
   if (!(dex.quantity > 0 && dex.price > 0) || !Number.isFinite(dex.price) || !Number.isFinite(dex.quantity)) throw new Error('链上买入数量无效');
-  const spot = gate.deposit === true ? estimate(gate.spot, input, bought, buy, now, false)
-    : { error: gate.deposit === false ? 'Gate 已暂停此网络充值' : '此网络的 Gate 充值状态未核实',
-      ...('error' in gate.spot && gate.spot.rateLimited ? { rateLimited: true as const } : {}) };
-  const perp = estimate(gate.perp, input, bought, buy, now, true);
+  const name = VENUE_NAMES[input.venue ?? 'gate'];
+  const spot = venue.deposit !== true
+    ? { error: venue.deposit === false ? name + ' 已暂停此网络充值' : '此网络的 ' + name + ' 充值状态未核实',
+      ...('error' in venue.spot && venue.spot.rateLimited ? { rateLimited: true as const } : {}) }
+    : venue.minDeposit !== undefined && bought.lt(venue.minDeposit) ? { error: '链上买入数量低于该网络最低充值量' }
+    : estimate(venue.spot, input, bought, buy, now, false);
+  const perp = estimate(venue.perp, input, bought, buy, now, true);
   const oldest = Math.min(dex.at, 'at' in spot ? spot.at : now, 'at' in perp ? perp.at : now, now);
-  return { asOf: now, expiresAt: oldest + CHAIN_ARB_TTL_MS, dex, deposit: gate.deposit, withdraw: gate.withdraw, spot, perp };
+  return { asOf: now, expiresAt: oldest + CHAIN_ARB_TTL_MS, dex, deposit: venue.deposit, withdraw: venue.withdraw, spot, perp };
 }

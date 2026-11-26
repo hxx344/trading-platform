@@ -1,7 +1,7 @@
 import { anySignal } from '../any-signal.mjs';
 import { untilAborted } from '../asset/sources/shared-reads.ts';
 import type { ScanCandidate } from './catalog.ts';
-import { CHAIN_ARB_TTL_MS, type ChainArbView } from './model.ts';
+import { CHAIN_ARB_TTL_MS, type ChainArbVenue, type ChainArbView } from './model.ts';
 import { parseChainArbScan, SCAN_HISTORY_MS, type ScanInput, type ScanRow, type ScanView } from './scan-model.ts';
 
 const BATCH_INTERVAL = 2_000;
@@ -26,7 +26,7 @@ function rateLimited(value: unknown) {
     || ('rateLimited' in value && value.rateLimited === true));
 }
 
-function routeRows(candidate: ScanCandidate, view: ChainArbView, now: number): ScanRow[] {
+function routeRows(candidate: ScanCandidate, view: ChainArbView, now: number, venue: ChainArbVenue): ScanRow[] {
   const gasUsdt = view.dex.swapGasUsdt;
   if (gasUsdt == null || !Number.isFinite(gasUsdt) || gasUsdt < 0) return [];
   const rows: ScanRow[] = [];
@@ -39,7 +39,7 @@ function routeRows(candidate: ScanCandidate, view: ChainArbView, now: number): S
     const at = Math.min(leg.at, view.dex.at, view.asOf);
     const expiresAt = at + CHAIN_ARB_TTL_MS;
     if (!Number.isFinite(expiresAt) || expiresAt <= now) continue;
-    rows.push({ chain: candidate.chain, symbol: candidate.symbol, address: candidate.address,
+    rows.push({ venue, chain: candidate.chain, symbol: candidate.symbol, address: candidate.address,
       kind, netBps: leg.netBps, netUsdt: leg.netUsdt, dexPrice: view.dex.price,
       gatePrice: leg.price, gasUsdt, at, expiresAt });
   }
@@ -66,7 +66,7 @@ function snapshot(profile: Profile, now: number, cooldown: boolean): ScanView {
   }
   const phase = cooldown ? 'cooldown' : profile.message ? 'error' : profile.cycle ? 'scanning' : 'loading';
   const message = cooldown ? '公开行情请求受限，稍后继续扫描' : profile.message
-    ?? (profile.cycle && !profile.total ? '所选网络没有可扫描的 Gate 币种' : null);
+    ?? (profile.cycle && !profile.total ? '所选网络没有可扫描的币种' : null);
   return { asOf: now, phase, cycle: profile.cycle, total: profile.total, checked: profile.checked.size, failed: profile.failed,
     message, rows: rows.sort(compareRows), history: history.sort((a, b) => b.at - a.at || compareRows(a, b)).slice(0, 50) };
 }
@@ -77,6 +77,7 @@ export function createChainArbScanner({ catalog, quote, now = Date.now }: {
 }) {
   const profiles = new Map<string, Profile>();
   let currentScope: string | undefined, active: AbortController | undefined, closed = false;
+  let batch: Promise<void> | undefined;
   let nextStart = -Infinity, cooldownUntil = -Infinity, turn = 0;
 
   async function sample(profile: Profile, candidate: ScanCandidate, ordinary: boolean, signal: AbortSignal) {
@@ -87,7 +88,7 @@ export function createChainArbScanner({ catalog, quote, now = Date.now }: {
       const view = await untilAborted(quote({ ...profile.input, chain, symbol, address, swapGas: 'auto' }, signal), signal);
       signal.throwIfAborted();
       if (rateLimited(view.spot) || rateLimited(view.perp)) cooldownUntil = now() + BACKOFF;
-      const rows = routeRows(candidate, view, now());
+      const rows = routeRows(candidate, view, now(), profile.input.venue ?? 'gate');
       // Reinsertion makes refreshes rotate from the least recently sampled opportunity.
       profile.samples.delete(key);
       if (rows.length) profile.samples.set(key, { candidate, cycle: profile.cycle, checkedAt: now(), rows });
@@ -163,17 +164,17 @@ export function createChainArbScanner({ catalog, quote, now = Date.now }: {
     const signal = anySignal([stop.signal], 25_000);
     active = stop; nextStart = nowMs + BATCH_INTERVAL;
     profile.waiting = false; profile.turn = ++turn;
-    void run(profile, signal).catch(error => {
+    batch = run(profile, signal).catch(error => {
       if (stop.signal.aborted) return;
       if (rateLimited(error)) cooldownUntil = now() + BACKOFF;
       profile.directory = null; profile.samples.clear();
       profile.message = signal.aborted ? '币种目录读取超时' : error instanceof Error ? error.message : '币种目录读取失败';
       profile.retryAt = now() + 10_000;
-    }).finally(() => { stop.abort(); active = undefined; });
+    }).finally(() => { stop.abort(); active = undefined; batch = undefined; });
   }
 
   return {
-    async read(raw: unknown, scope: string, signal: AbortSignal): Promise<ScanView> {
+    async read(raw: unknown, scope: string, signal: AbortSignal, awaitBatch = false): Promise<ScanView> {
       signal.throwIfAborted();
       if (closed) throw Object.assign(new Error('机会扫描已停止'), { status: 503 });
       const input = parseChainArbScan(raw);
@@ -193,7 +194,16 @@ export function createChainArbScanner({ catalog, quote, now = Date.now }: {
       }
       profile.seen = time; profile.waiting = true;
       start(time);
-      return snapshot(profile, time, time < cooldownUntil);
+      if (awaitBatch && batch && active) {
+        const worker = active;
+        const cancel = () => worker.abort();
+        signal.addEventListener('abort', cancel, { once: true });
+        try { await untilAborted(batch, signal); }
+        finally { signal.removeEventListener('abort', cancel); }
+        if (closed || scope !== currentScope) throw new Error('扫描条件已更新');
+      }
+      const asOf = now();
+      return snapshot(profile, asOf, asOf < cooldownUntil);
     },
     close() { closed = true; profiles.clear(); active?.abort(); },
   };

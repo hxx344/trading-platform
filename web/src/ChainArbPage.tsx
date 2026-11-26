@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import type { ArbResult, ChainArbInput, ChainArbView } from '../../src/chain-arb/model.ts';
+import { VENUE_NAMES } from '../../src/chain-arb/model.ts';
 import type { ShellView } from '../../src/shell-view.ts';
 import { api } from './api.ts';
 import { chainArbQuery, chainNames, initialChainArbForm, readTimedChainArb, type ChainArbForm } from './chain-arb-form.ts';
-import { initialScanForm, reviewScanRow } from './chain-arb-scan-form.ts';
+import { reviewScanRow } from './chain-arb-scan-form.ts';
 import { ChainArbScan } from './ChainArbScan.tsx';
 import { clock } from './labels.ts';
 import { readFailure, type ResourceSnapshot } from './live-resource.ts';
@@ -17,10 +18,11 @@ type Query = ReturnType<typeof chainArbQuery>;
 
 function RouteCard({ kind, result, input, gasMissing }: { kind: 'spot' | 'perp'; result: ArbResult; input: ChainArbInput; gasMissing: boolean }) {
   const spot = kind === 'spot';
+  const venue = VENUE_NAMES[input.venue ?? 'gate'];
   return <section className="panel">
     <div className="section-head"><div>
-      <h2>{spot ? '充值至 Gate 卖出现货' : '在 Gate 做空永续'}</h2>
-      <p>{spot ? '按当前买盘估算，充值到账时价格可能变化。' : '按整张合约开空，测算现货与永续以相同价格离场时的收益。'}</p>
+      <h2>{spot ? '充值至 ' + venue + ' 卖出现货' : '在 ' + venue + ' 做空永续'}</h2>
+      <p>{spot ? '按当前买盘估算，充值到账时价格可能变化。' : '按该市场的数量步长开空，测算现货与永续以相同价格离场时的收益。'}</p>
     </div></div>
     <div className="panel-body">{'error' in result
       ? <Callout tone="warning">{result.error}</Callout>
@@ -60,8 +62,8 @@ function Quote({ query, onExpired }: { query: Query; onExpired: () => void }) {
   const failure = readFailure(read);
   if (failure) return <StatePanel kind="error" title="读取报价失败" detail={failure} />;
   if (read.status === 'paused') return <StatePanel kind="empty" title="报价刷新已暂停" />;
-  if (!data) return <StatePanel kind="loading" title="正在读取链上报价和 Gate 盘口…" />;
-  if (!(performance.now() < deadline)) return <StatePanel kind="empty" title="本次报价已过期" detail="正在等待新的链上报价和 Gate 盘口。" />;
+  if (!data) return <StatePanel kind="loading" title="正在读取链上报价和交易所盘口…" />;
+  if (!(performance.now() < deadline)) return <StatePanel kind="empty" title="本次报价已过期" detail="正在等待新的链上报价和交易所盘口。" />;
   const { input } = query;
   const autoGas = input.swapGas === 'auto';
   const gasMissing = autoGas && data.dex.swapGasUsdt == null;
@@ -73,7 +75,7 @@ function Quote({ query, onExpired }: { query: Query; onExpired: () => void }) {
         <dt>预计买入数量</dt><dd>{numbers.format(data.dex.quantity)} {input.symbol}</dd>
         <dt>买入均价</dt><dd>{numbers.format(data.dex.price)} USDT</dd>
         {autoGas ? <><dt>路由估算买入 Gas</dt><dd>{data.dex.swapGasUsdt == null ? '未取得' : numbers.format(data.dex.swapGasUsdt) + ' USDT'}</dd></> : null}
-        <dt>Gate 网络状态</dt><dd>充值 {gates(data.deposit)} · 提现 {gates(data.withdraw)}</dd>
+        <dt>{VENUE_NAMES[input.venue ?? 'gate']} 网络状态</dt><dd>充值 {gates(data.deposit)} · 提现 {gates(data.withdraw)}</dd>
         <dt>链上报价时间</dt><dd>{clock(data.dex.at)} · 报价有效至 {clock(data.expiresAt)}</dd>
       </dl></div>
     </section>
@@ -96,7 +98,7 @@ function SingleEstimate({ initial, scopeKey, onExpired }: { initial: ManualSetup
     setError('');
     setForm(previous => {
       const next = { ...previous, [name]: value };
-      if (name === 'chain' || name === 'address' || name === 'symbol') delete next.source;
+      if (name === 'chain' || name === 'address' || name === 'symbol' || name === 'venue') delete next.source;
       return next;
     });
   }
@@ -113,13 +115,16 @@ function SingleEstimate({ initial, scopeKey, onExpired }: { initial: ManualSetup
     </label>;
   return <>
     <section className="panel">
-      <div className="section-head"><div><h2>单币测算</h2><p>按买入预算比较链上报价、Gate 现货卖出和永续开空价格。</p></div></div>
+      <div className="section-head"><div><h2>单币测算</h2><p>按买入预算比较链上买入、交易所现货卖出和永续开空的价格。</p></div></div>
       <form className="panel-body" onSubmit={submit}>
         <div className="chain-arb-fields">
           <label>网络<select data-slot="select-trigger" name="chain" value={form.chain} onChange={event => edit('chain', event.target.value)}>
             {Object.entries(chainNames).map(([chain, name]) => <option key={chain} value={chain}>{name}</option>)}
           </select></label>
-          {field('symbol', 'Gate 币种代码')}
+          <label>交易所<select name="venue" data-slot="select-trigger" value={form.venue ?? 'gate'} onChange={event => edit('venue', event.target.value)}>
+            {Object.entries(VENUE_NAMES).map(([value, name]) => <option key={value} value={value}>{name}</option>)}
+          </select></label>
+          {field('symbol', '交易所币种代码')}
           {field('address', '链上代币合约地址')}
           {field('amount', '买入预算（USDT）')}
           {field('spotFeeBps', '现货单次费率（bp）')}
@@ -151,7 +156,6 @@ function SingleEstimate({ initial, scopeKey, onExpired }: { initial: ManualSetup
 
 export function ChainArbPage({ shell, onExpired }: { shell: ResourceSnapshot<ShellView>; onExpired: () => void }) {
   const [mode, setMode] = useState<'scan' | 'single'>('scan');
-  const [scan, setScan] = useState(initialScanForm);
   const [manual, setManual] = useState<ManualSetup>({ form: initialChainArbForm, autoGas: false });
   const failure = readFailure(shell);
   if (failure) return <StatePanel kind="error" title="无法核对行情开关" detail={failure} />;
@@ -167,7 +171,7 @@ export function ChainArbPage({ shell, onExpired }: { shell: ResourceSnapshot<She
       <button type="button" aria-pressed={mode === 'single'} className={'button ' + (mode === 'single' ? 'primary' : 'secondary')}
         onClick={() => setMode('single')}>单币测算</button>
     </div>
-    {mode === 'scan' ? <ChainArbScan key={scopeKey} initial={scan} onApply={setScan} onExpired={onExpired}
+    {mode === 'scan' ? <ChainArbScan key={scopeKey} onExpired={onExpired}
       onReview={(form, row) => { setManual(reviewScanRow(form, row)); setMode('single'); }} />
       : <SingleEstimate initial={manual} scopeKey={scopeKey} onExpired={onExpired} />}
   </div>;

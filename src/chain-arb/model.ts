@@ -1,7 +1,13 @@
 export const CHAIN_ARB_TTL_MS = 15_000;
 export const CHAIN_ARB_CLOCK_SKEW_MS = 2_000;
 export type Chain = 'ethereum' | 'arbitrum' | 'bsc';
+export const VENUE_NAMES = { gate: 'Gate', binance: 'Binance', bitget: 'Bitget' } as const;
+export type ChainArbVenue = keyof typeof VENUE_NAMES;
+export function isChainArbVenue(value: unknown): value is ChainArbVenue {
+  return typeof value === 'string' && Object.hasOwn(VENUE_NAMES, value);
+}
 export interface ChainArbInput {
+  venue?: ChainArbVenue;
   chain: Chain; address: string; symbol: string; amount: string;
   spotFeeBps: number; perpFeeBps: number; spotCosts: number | null; perpCosts: number | null;
   swapGas?: 'auto';
@@ -41,13 +47,14 @@ export function parseChainArbBudget(p: Record<string, unknown>) {
 export function parseChainArb(raw: unknown): ChainArbInput {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) invalid('查询参数无效');
   const p = raw as Record<string, unknown>;
-  const keys = ['chain', 'address', 'symbol', 'amount', 'spotFeeBps', 'perpFeeBps', 'spotCosts', 'perpCosts', 'swapGas', 'source'];
+  const keys = ['chain', 'address', 'symbol', 'amount', 'spotFeeBps', 'perpFeeBps', 'spotCosts', 'perpCosts', 'swapGas', 'source', 'venue'];
   if (Object.keys(p).some(key => !keys.includes(key))) invalid('查询含未知参数');
   if (p.swapGas !== undefined && p.swapGas !== 'auto') invalid('链上 Gas 模式无效');
   if (p.source !== undefined && p.source !== 'scan') invalid('查询来源无效');
+  if (p.venue !== undefined && !isChainArbVenue(p.venue)) invalid('交易所无效');
   if (p.chain !== 'ethereum' && p.chain !== 'arbitrum' && p.chain !== 'bsc') invalid('请选择支持的链');
   if (typeof p.address !== 'string' || !/^0x[0-9a-f]{40}$/i.test(p.address) || /^0x0{40}$/i.test(p.address)) invalid('请输入链上的代币合约地址');
-  if (!isGateBaseSymbol(p.symbol)) invalid('请输入 Gate 基础币代码');
+  if (!isGateBaseSymbol(p.symbol)) invalid('请输入交易所基础币代码');
   return { ...parseChainArbBudget(p), chain: p.chain, address: p.address.toLowerCase(), symbol: p.symbol,
-    ...(p.swapGas === 'auto' ? { swapGas: 'auto' } : {}), ...(p.source === 'scan' ? { source: 'scan' } : {}) };
+    ...(p.venue === undefined ? {} : { venue: p.venue }), ...(p.swapGas === 'auto' ? { swapGas: 'auto' } : {}), ...(p.source === 'scan' ? { source: 'scan' } : {}) };
 }

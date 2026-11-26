@@ -202,18 +202,19 @@ export async function wireService(config: ServiceConfig, secrets: ServiceSecrets
  * outbox that could not be opened throws, which the alert service shows and retries.
  */
 export function marketAlertHooks({ secrets, notifier, monitorOutbox, monitorOutboxError, send }: {
-  secrets: Pick<ServiceSecrets, 'feishu' | 'feishuMonitor'>; notifier: Pick<Notifier, 'notify' | 'delivery'>; monitorOutbox: Pick<Notifier, 'notify' | 'delivery'> | null; monitorOutboxError: string | null;
+  secrets: Pick<ServiceSecrets, 'feishu' | 'feishuMonitor'>; notifier: Pick<Notifier, 'notify' | 'notifyRepeating' | 'delivery'>; monitorOutbox: Pick<Notifier, 'notify' | 'notifyRepeating' | 'delivery'> | null; monitorOutboxError: string | null;
   send: (secret: FeishuSecret, text: string) => Promise<unknown>;
 }): AlertHooks {
   // The test message goes to the same robot directly.
   const robot = secrets.feishuMonitor ? { name: 'feishuMonitor' as const, secret: secrets.feishuMonitor } : secrets.feishu ? { name: 'feishu' as const, secret: secrets.feishu } : null;
-  const outboxOf = (name: AlertRobot): Pick<Notifier, 'notify' | 'delivery'> => {
+  const outboxOf = (name: AlertRobot): Pick<Notifier, 'notify' | 'notifyRepeating' | 'delivery'> => {
     if (name === 'feishu') return notifier;
     if (!monitorOutbox) throw new Error(`${MONITOR_OUTBOX_FILE} 无法打开：${monitorOutboxError ?? '文件不存在'}`);
     return monitorOutbox;
   };
   return {
     notify: text => robot ? outboxOf(robot.name).notify(text) : null,
+    notifyRepeating: (key, text) => { if (robot) outboxOf(robot.name).notifyRepeating(key, text); },
     delivery: (ids, name) => outboxOf(name).delivery(ids),
     robot: () => robot?.name ?? null,
     test: async text => { if (robot) await send(robot.secret, text); },

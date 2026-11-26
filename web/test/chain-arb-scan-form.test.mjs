@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { SCAN_HISTORY_MS, parseChainArbScan } from '../../src/chain-arb/scan-model.ts';
 import { chainArbQuery } from '../src/chain-arb-form.ts';
-import { initialScanForm, readTimedScan, reviewScanRow, scanBands, scanQuery } from '../src/chain-arb-scan-form.ts';
+import { DEFAULT_BACKGROUND_SETTINGS } from '../../src/chain-arb/background-model.ts';
+import { backgroundBands, backgroundDraft, initialScanForm, readTimedScan, reviewScanRow, saveBackgroundDraft, scanBands,
+  scanQuery, venueScanForm } from '../src/chain-arb-scan-form.ts';
 
 test('an all-chain scan needs no token identifiers and normalizes budgets, fees and explicit extra costs', () => {
   const { path, input } = scanQuery({ ...initialScanForm, amount: ' 2345.00 ', perpCosts: '0.9' });
@@ -76,4 +78,64 @@ test('paused, failed and cooling-down scans keep bounded recent samples; expired
     assert.deepEqual(bands.history, [current, ...previous.slice(0, 19)]);
     assert.deepEqual(scanBands(scan, true, 10 + SCAN_HISTORY_MS), { live: [], history: [], nextDeadline: Infinity });
   }
+});
+
+test('后台扫描草稿按版本保存，允许零阈值和交易所独立费率，至少选一个市场', () => {
+  const draft = backgroundDraft(DEFAULT_BACKGROUND_SETTINGS);
+  const changed = { ...draft, enabled: true, thresholdBps: '0', amount: '25.50', venues: ['bitget', 'binance'],
+    fees: { binance: { spotFeeBps: '8.3', perpFeeBps: '5' }, bitget: { spotFeeBps: '10', perpFeeBps: '5' } } };
+  const settings = saveBackgroundDraft(changed);
+  assert.deepEqual(settings, { ...DEFAULT_BACKGROUND_SETTINGS, enabled: true, amount: '25.5',
+    thresholdBps: 0, venues: ['binance', 'bitget'], fees: changed.fees });
+  const next = saveBackgroundDraft({ ...backgroundDraft(settings), spotFeeBps: '2' });
+  assert.equal(venueScanForm(next, 'bitget').spotFeeBps, '10');
+  assert.equal(venueScanForm(next, 'gate').spotFeeBps, '2');
+  for (const thresholdBps of ['', '-1', ' ', '1000001', '1e999']) assert.throws(() => saveBackgroundDraft({ ...draft, thresholdBps }));
+  assert.throws(() => saveBackgroundDraft({ ...draft, venues: [] }), /交易所/);
+  assert.throws(() => saveBackgroundDraft({ ...draft, fees: { gate: { spotFeeBps: '3', perpFeeBps: '' } } }), /费率/);
+  assert.deepEqual(saveBackgroundDraft(backgroundDraft(settings)), settings);
+  assert.equal(saveBackgroundDraft(backgroundDraft({ ...settings, thresholdBps: 1e-7 })).thresholdBps, 1e-7);
+});
+
+test('跨所榜单使用各快照生成时间和本次 GET 往返耗时，单所失败不撤下其他所的有效行情', async () => {
+  const gate = row('ARB', { netBps: 10 }), binance = row('ARB', { venue: 'binance', netBps: 90 });
+  const inTransit = row('PAST', { venue: 'binance', expiresAt: source + 200 });
+  const bitget = row('ARB', { venue: 'bitget', netBps: 99, at: source - 200 });
+  const settings = { ...DEFAULT_BACKGROUND_SETTINGS, enabled: true };
+  let mono = 100;
+  const result = await readTimedScan(async () => { mono += 220; return { revision: 3, robot: null, error: null, settings,
+    results: { gate: view([gate]), binance: view([inTransit, binance]), bitget: { ...view([bitget]), phase: 'error' } } }; }, () => mono);
+  const bands = backgroundBands(result, false, mono);
+  assert.deepEqual(bands.live, [binance, gate]);
+  assert.deepEqual(bands.history, [inTransit, bitget]);
+  assert.equal(bands.nextDeadline, 15_100);
+  assert.deepEqual(backgroundBands(result, true, mono).live, []);
+  assert.deepEqual(backgroundBands(result, false, 15_100).live, []);
+  assert.deepEqual(backgroundBands(result, true, 100 + SCAN_HISTORY_MS).history, []);
+});
+
+test('从单行复核只传已保存的预算、路线成本和该所费率，不混入飞书或后台参数', () => {
+  const settings = { ...DEFAULT_BACKGROUND_SETTINGS, amount: '212', spotCosts: '1.25', perpCosts: '2',
+    fees: { bitget: { spotFeeBps: '7.5', perpFeeBps: '2' } } };
+  for (const venue of ['binance', 'bitget']) {
+    const form = venueScanForm(settings, venue);
+    assert.deepEqual(Object.keys(form).sort(), Object.keys(initialScanForm).sort());
+    assert.equal(form.spotFeeBps, venue === 'binance' ? '10' : '7.5');
+    const review = reviewScanRow(form, row('ABC', { venue }));
+    const query = chainArbQuery(review.form, review.autoGas).input;
+    assert.equal(query.venue, venue);
+    assert.equal(query.amount, '212');
+    assert.equal(query.perpCosts, 2);
+    assert.equal(query.spotFeeBps, Number(form.spotFeeBps));
+    assert.equal(query.swapGas, 'auto');
+  }
+});
+
+test('后台单腿限流时保留同所仍新鲜的另一条路线，失效或暂停时降为历史', () => {
+  const valid = row('ARB', { venue: 'bitget', kind: 'spot' });
+  const sample = { startedAt: 100, view: { settings: { ...DEFAULT_BACKGROUND_SETTINGS, enabled: true },
+    results: { bitget: { ...view([valid]), phase: 'cooldown' } } } };
+  assert.deepEqual(backgroundBands(sample, false, 1000).live, [valid]);
+  assert.deepEqual(backgroundBands(sample, true, 1000).history, [valid]);
+  assert.deepEqual(backgroundBands(sample, false, 15_100).history, [valid]);
 });

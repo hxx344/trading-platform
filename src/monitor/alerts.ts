@@ -247,6 +247,8 @@ export interface AlertDelivery { sentAt: number | null; attempts: number; lastEr
 export interface AlertHooks {
   /** Queues the text in the current robot's outbox; its id, or null without a robot. Throws when the outbox cannot be written. */
   notify(text: string): number | null;
+  /** Atomically queues at most one message for a route in the outbox's 30-minute repeat window. */
+  notifyRepeating?(key: string, text: string): void;
   /** Delivery of queued messages by id in that robot's outbox; a missing id has left the outbox. */
   delivery(ids: readonly number[], robot: AlertRobot): Map<number, AlertDelivery>;
   /** The robot alerts go to, or null without one. */

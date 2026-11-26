@@ -133,5 +133,6 @@ export function createRemoteMonitor(client: MarketClient, clock: () => number = 
     positioning: (quote, options) => read('perpetual.positioning', { exchange: quote.exchange, symbol: quote.symbol, identity: quote.historyIdentity }, options?.signal),
   };
   return { rounds, perpetual, comparison, chainArb: (input: unknown, signal: AbortSignal) => read<ChainArbView>('perpetual.chainArb', input, signal),
-    scanChainArb: (params: unknown, scope: string, signal: AbortSignal) => read<ScanView>('perpetual.chainArbScan', { params, scope }, signal) };
+    scanChainArb: (params: unknown, scope: string, signal: AbortSignal, awaitBatch = false) =>
+      read<ScanView>(awaitBatch ? 'perpetual.chainArbBatch' : 'perpetual.chainArbScan', { params, scope }, signal) };
 }

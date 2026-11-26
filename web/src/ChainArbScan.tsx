@@ -1,28 +1,34 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
+import { VENUE_NAMES, type ChainArbVenue } from '../../src/chain-arb/model.ts';
+import { DEFAULT_BACKGROUND_SETTINGS, type BackgroundView } from '../../src/chain-arb/background-model.ts';
 import type { ScanRow, ScanView } from '../../src/chain-arb/scan-model.ts';
-import { api } from './api.ts';
+import { api, ApiError } from './api.ts';
 import { chainNames } from './chain-arb-form.ts';
-import { HISTORY_DISPLAY_LIMIT, readTimedScan, scanBands, scanQuery, type ScanForm, type TimedScan } from './chain-arb-scan-form.ts';
+import { backgroundBands, backgroundDraft, HISTORY_DISPLAY_LIMIT, readTimedScan, saveBackgroundDraft, venueScanForm,
+  type BackgroundDraft, type ScanForm } from './chain-arb-scan-form.ts';
 import { clock } from './labels.ts';
 import { readFailure } from './live-resource.ts';
 import { Callout, StatePanel, TableEmpty } from './StateViews.tsx';
 import { useLiveResource } from './use-live-resource.ts';
 
+const path = '/api/monitor/perpetual/chain-arb-background';
+const load = (signal: AbortSignal) => readTimedScan(() => api<BackgroundView>(path, { signal }));
 const signed = new Intl.NumberFormat('zh-CN', { maximumSignificantDigits: 5, signDisplay: 'exceptZero' });
 const price = new Intl.NumberFormat('zh-CN', { maximumSignificantDigits: 7 });
 const phases: Record<ScanView['phase'], string> = {
-  loading: '正在加载候选币种', scanning: '正在扫描', cooldown: '上游限频，等待恢复', error: '扫描暂时失败',
+  loading: '加载目录', scanning: '扫描中', cooldown: '上游限频', error: '扫描失败',
 };
-type ScanQuery = ReturnType<typeof scanQuery>;
 type Review = (form: ScanForm, row: ScanRow) => void;
+type Rate = 'spotFeeBps' | 'perpFeeBps';
+const rateLabels = { spotFeeBps: '现货单次费率（bp）', perpFeeBps: '永续单次费率（bp）' };
 
 function ScanTable({ rows, history, review }: { rows: ScanRow[]; history?: boolean; review: (row: ScanRow) => void }) {
   return <div className="table-wrap"><table className="data chain-arb-ranking" aria-label={history ? '最近采样' : '有效机会'}>
-    <thead><tr><th>币种 / 网络</th><th>Gate 路线</th><th>扣费后价差（bp）</th><th>净差额（USDT）</th>
-      <th>买入 / 卖出均价（USDT）</th><th>买入 Gas（USDT）</th><th>来源时间</th><th>操作</th></tr></thead>
-    <tbody>{rows.map(row => <tr key={[row.chain, row.address, row.kind, row.at].join('/')}>
+    <thead><tr><th>币种 / 网络</th><th>交易所 / 路线</th><th>扣费后价差（bp）</th><th>净差额（USDT）</th>
+      <th>买入 / 卖出均价（USDT）</th><th>买入 Gas（USDT）</th><th>报价时间</th><th>操作</th></tr></thead>
+    <tbody>{rows.map(row => <tr key={[row.venue ?? 'gate', row.chain, row.address, row.kind, row.at].join('/')}>
       <td><strong>{row.symbol}</strong><small>{chainNames[row.chain]}</small></td>
-      <td>{row.kind === 'spot' ? '现货卖出' : '永续开空'}</td>
+      <td>{VENUE_NAMES[row.venue ?? 'gate']}<small>{row.kind === 'spot' ? '现货卖出' : '永续开空'}</small></td>
       <td className="num"><strong className={history ? undefined : 'ok'}>{signed.format(row.netBps)}</strong></td>
       <td className="num">{signed.format(row.netUsdt)}</td>
       <td className="num">{price.format(row.dexPrice)} / {price.format(row.gatePrice)}</td>
@@ -32,94 +38,133 @@ function ScanTable({ rows, history, review }: { rows: ScanRow[]; history?: boole
   </table></div>;
 }
 
-export function ChainArbScan({ initial, onApply, onReview, onExpired }: {
-  initial: ScanForm; onApply: (form: ScanForm) => void; onReview: Review; onExpired: () => void;
+function ScanSettings({ view, saving, form, edit, apply, reset, changed, conflict, error, saved }: {
+  view: BackgroundView; saving: boolean; form: BackgroundDraft; edit: (patch: Partial<BackgroundDraft>) => void;
+  apply: (event: FormEvent) => void; reset: () => void; changed: boolean; conflict: boolean; error: string; saved: boolean;
 }) {
-  const [form, setForm] = useState(initial);
-  const [query, setQuery] = useState<ScanQuery | null>(() => scanQuery(initial));
-  const [error, setError] = useState('');
-  // Pausing cancels the subscription. Keep its last sample only for this query and monitor generation.
-  const [pause, setPause] = useState<{ sample: TimedScan | null } | null>(null);
-  const path = query?.path ?? '';
-  const load = useCallback((signal: AbortSignal) => readTimedScan(() => api<ScanView>(path, { signal })), [path]);
-  const read = useLiveResource(path, { intervalMs: 2_000, enabled: !!query && !pause, read: load, onExpired });
-  const sample = pause ? pause.sample : read.data;
-  const view = sample?.view;
-  const failure = readFailure(read);
-  const paused = !!pause || read.status === 'paused';
-  const { live, history, nextDeadline } = scanBands(sample, paused || !!failure, performance.now());
+  const all = DEFAULT_BACKGROUND_SETTINGS.venues;
+  function field(key: Exclude<keyof ScanForm, 'chain'> | 'thresholdBps', label: string) {
+    return <label>{label}<input data-slot="input" name={key} value={form[key]} inputMode="decimal" autoComplete="off"
+      onChange={e => edit({ [key]: e.target.value })} /></label>;
+  }
+  function toggleRates(venue: ChainArbVenue) {
+    const fees = { ...form.fees };
+    if (fees[venue]) delete fees[venue];
+    else fees[venue] = { spotFeeBps: form.spotFeeBps, perpFeeBps: form.perpFeeBps };
+    edit({ fees });
+  }
+  function rateField(venue: ChainArbVenue, key: Rate) {
+    const override = form.fees?.[venue];
+    if (!override) return null;
+    return <label>{rateLabels[key]}<input name={venue + '-' + key} aria-label={VENUE_NAMES[venue] + rateLabels[key]}
+      data-slot="input" value={override[key]} inputMode="decimal" autoComplete="off"
+      onChange={e => edit({ fees: { ...form.fees, [venue]: { ...override, [key]: e.target.value } } })} /></label>;
+  }
+  const robot = view.robot === 'feishuMonitor' ? '行情监控飞书机器人' : view.robot === 'feishu' ? '通用飞书机器人' : '未配置飞书机器人';
+  return <section className="panel">
+    <div className="section-head"><div><h2>后台扫描</h2><p>服务器持续分批询价，关闭页面后仍按已保存的条件运行。</p></div>
+      <span className="status-line">{view.settings.enabled ? '已启用' : '已关闭'}</span></div>
+    <form className="panel-body" onSubmit={apply}>
+      <fieldset className="chain-arb-config" disabled={saving}>
+        <label className="chain-arb-check"><input type="checkbox" name="enabled" checked={form.enabled}
+          onChange={e => edit({ enabled: e.target.checked })} />启用后台扫描</label>
+        <fieldset className="chain-arb-venues"><legend>扫描交易所</legend><div className="toolbar">{all.map(venue =>
+          <label className="chain-arb-check" key={venue}><input type="checkbox" name={'venue-' + venue}
+            checked={form.venues.includes(venue)} onChange={e => edit({ venues: e.target.checked ? [...form.venues, venue] : form.venues.filter(v => v !== venue) })} />
+            {VENUE_NAMES[venue]}</label>)}</div></fieldset>
+        <div className="chain-arb-fields">
+          <label>网络<select data-slot="select-trigger" name="chain" value={form.chain} onChange={e => edit({ chain: e.target.value })}>
+            <option value="all">全部网络（3 条链）</option>
+            {Object.entries(chainNames).map(([chain, name]) => <option key={chain} value={chain}>{name}</option>)}
+          </select></label>
+          {field('amount', '买入预算（USDT）')}{field('thresholdBps', '飞书通知阈值（bp）')}
+        </div>
+        <p className="muted">{robot}。扣费后价差严格高于阈值才通知，1 bp = 0.01%。同一交易所、网络、合约地址和路线每 30 分钟最多提醒一次。</p>
+        <details className="chain-arb-fees"><summary>费率与额外成本</summary>
+          <div className="chain-arb-fields">{field('spotFeeBps', rateLabels.spotFeeBps)}{field('perpFeeBps', rateLabels.perpFeeBps)}
+            {field('spotCosts', '现货额外成本（USDT）')}{field('perpCosts', '永续额外成本（USDT）')}</div>
+          {all.filter(v => form.venues.includes(v)).map(venue => <div key={venue} className="chain-arb-override">
+            <label className="chain-arb-check"><input name={'fees-' + venue} type="checkbox" checked={!!form.fees?.[venue]}
+              onChange={() => toggleRates(venue)} />为 {VENUE_NAMES[venue]} 单独设置费率</label>
+            {form.fees?.[venue] ? <div className="chain-arb-routes">{rateField(venue, 'spotFeeBps')}{rateField(venue, 'perpFeeBps')}</div> : null}
+          </div>)}
+        </details>
+        {conflict ? <Callout tone="warning">其他页面已更新扫描条件。载入最新设置后可重新编辑。</Callout> : null}
+        {error ? <Callout tone="error">{error}</Callout> : null}
+        <div className="toolbar">
+          <button className="button primary" disabled={saving || conflict} type="submit">{saving ? '正在保存…'
+            : form.enabled === view.settings.enabled ? '保存设置' : form.enabled ? '保存并启动扫描' : '保存并停止扫描'}</button>
+          {changed || conflict ? <button className="button secondary" type="button" onClick={reset}>{conflict ? '载入最新设置' : '放弃修改'}</button> : null}
+          <small className="muted" role="status">{changed ? '有未保存的修改' : saved ? '设置已保存' : ''}</small>
+        </div>
+      </fieldset>
+    </form>
+  </section>;
+}
+
+export function ChainArbScan({ onReview, onExpired }: { onReview: Review; onExpired: () => void }) {
+  const read = useLiveResource(path, { intervalMs: 2_000, read: load, onExpired });
+  const [draft, setDraft] = useState<{ revision: number; form: BackgroundDraft } | null>(null);
+  const [error, setError] = useState(''), [saving, setSaving] = useState(false), [saved, setSaved] = useState(false);
+  const failure = readFailure(read), view = read.data?.view;
+  const { live, history, nextDeadline } = backgroundBands(read.data, !!failure || read.status === 'paused', performance.now());
   const [, tick] = useState(0);
   useEffect(() => {
     if (!Number.isFinite(nextDeadline)) return;
     const timer = setTimeout(() => tick(n => n + 1), Math.max(0, Math.ceil(nextDeadline - performance.now())));
     return () => clearTimeout(timer);
   }, [nextDeadline]);
-
-  function edit(name: keyof ScanForm, value: string) {
-    setQuery(null);
-    setPause(null);
-    setError('');
-    setForm(previous => ({ ...previous, [name]: value }));
+  if (!view) return <StatePanel kind={failure ? 'error' : 'loading'} title={failure ? '无法读取后台扫描' : '正在读取后台扫描…'} detail={failure ?? undefined} />;
+  const current = view, form = draft?.form ?? backgroundDraft(current.settings);
+  const conflict = draft !== null && draft.revision !== current.revision;
+  function edit(patch: Partial<BackgroundDraft>) {
+    setDraft(previous => ({ revision: previous?.revision ?? current.revision, form: { ...(previous?.form ?? backgroundDraft(current.settings)), ...patch } }));
+    setError(''); setSaved(false);
   }
-  function apply(event: FormEvent) {
+  async function apply(event: FormEvent) {
     event.preventDefault();
+    if (saving || conflict) return;
+    setError(''); setSaved(false);
+    let settings;
+    try { settings = saveBackgroundDraft(form); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : '扫描参数无效'); return; }
     try {
-      const next = scanQuery(form);
-      setQuery(next); setPause(null); setError('');
-      onApply(next.input);
-    } catch (failure) {
-      setQuery(null); setError(failure instanceof Error ? failure.message : '扫描参数无效');
-    }
+      setSaving(true);
+      const updated = await api<BackgroundView>(path, { body: { revision: draft?.revision ?? current.revision, settings } });
+      if (!updated.settings || !Number.isSafeInteger(updated.revision)) throw new Error('保存应答不完整，请核对重新读取的设置');
+      read.commit({ startedAt: performance.now(), view: { ...updated, results: {} } });
+      setDraft(null); setSaved(true);
+      await read.refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '保存后台扫描设置失败');
+      if (cause instanceof ApiError && cause.status === 401) onExpired();
+      else await read.refresh();
+    } finally { setSaving(false); }
   }
-  const numberField = (name: Exclude<keyof ScanForm, 'chain'>, label: string) => <label>{label}
-    <input data-slot="input" name={name} value={form[name]} inputMode="decimal" autoComplete="off"
-      onChange={event => edit(name, event.target.value)} /></label>;
-  const review = (row: ScanRow) => { if (query) onReview(query.input, row); };
-
+  const review = (row: ScanRow) => onReview(venueScanForm(current.settings, row.venue ?? 'gate'), row);
   return <>
+    <ScanSettings view={current} form={form} saving={saving} edit={edit} changed={draft !== null} conflict={conflict} saved={saved}
+      apply={apply} reset={() => { setDraft(null); setError(''); setSaved(false); }} error={error} />
+    {failure ? <Callout tone="error">扫描读取失败 · {failure}。恢复前仅显示最近采样。</Callout> : null}
+    {view.error ? <Callout tone="warning">{view.error}</Callout> : null}
     <section className="panel">
-      <div className="section-head"><div><h2>扫描条件</h2><p>从 Gate 市场自动匹配链上代币，按同一预算比较现货和永续路线。</p></div></div>
-      <form className="panel-body" onSubmit={apply}>
-        <div className="chain-arb-scan-controls">
-          <label>网络<select data-slot="select-trigger" name="chain" value={form.chain} onChange={event => edit('chain', event.target.value)}>
-            <option value="all">全部网络（3 条链）</option>
-            {Object.entries(chainNames).map(([chain, name]) => <option key={chain} value={chain}>{name}</option>)}
-          </select></label>
-          {numberField('amount', '买入预算（USDT）')}
-          {query ? <button type="button" className="button secondary" onClick={() => setPause(pause ? null : { sample: read.data })}>
-            {pause ? '继续扫描' : '暂停扫描'}</button> : <button type="submit" className="button primary">应用参数并扫描</button>}
-        </div>
-        <details className="chain-arb-fees">
-          <summary>费率与额外成本</summary><div className="chain-arb-fields">
-            {numberField('spotFeeBps', '现货单次费率（bp）')}{numberField('perpFeeBps', '永续单次费率（bp）')}
-            {numberField('spotCosts', '现货额外成本（USDT）')}{numberField('perpCosts', '永续额外成本（USDT）')}
-          </div>
-        </details>
-        {error ? <Callout tone="error">{error}</Callout> : null}
-      </form>
+      <div className="section-head"><div><h2>有效机会{live.length ? ' · ' + live.length : ''}</h2>
+        <p>按已保存的扫描条件，跨交易所比较扣费后的正价差。</p></div></div>
+      <div className="panel-body">
+        {view.settings.enabled ? <ul className="chain-arb-progress" aria-label="各交易所扫描进度">{view.settings.venues.map(venue => {
+          const progress = view.results[venue];
+          return <li key={venue}><strong>{VENUE_NAMES[venue]}</strong> {progress
+            ? <>{phases[progress.phase]} · 第 {progress.cycle} 轮 · 已检查 {progress.checked} / {progress.total} · 失败 {progress.failed}
+              {progress.message ? <small>{progress.message}</small> : null}</> : '等待扫描'}</li>;
+        })}</ul> : null}
+        {live.length ? <ScanTable rows={live} review={review} /> : <TableEmpty>
+          {view.settings.enabled ? '暂无仍在有效期内的正价差。' : '后台扫描已关闭。'}</TableEmpty>}
+        <p className="muted">净差额扣除买入 Gas、交易费和路线额外成本。永续按基差收敛及两次交易费估算，资金费和未对冲尾差另计。</p>
+      </div>
     </section>
-    {query ? <>
-      <section className="panel">
-        <div className="section-head"><div><h2>有效机会{live.length ? ' · ' + live.length : ''}</h2>
-          <p>按扣费后价差从高到低排列。价差为正净差额占已覆盖买入成本的比例，1 bp = 0.01%。</p></div></div>
-        <div className="panel-body">
-          {failure ? <Callout tone="error">扫描读取失败 · {failure}。恢复前仅显示最近采样。</Callout>
-            : paused ? <Callout>扫描已暂停，最近采样仅供复核。</Callout>
-            : view ? <>
-              <p className="status-line" role="status">{phases[view.phase]} · 第 {view.cycle} 轮 · 已检查 {view.checked} / {view.total} 个候选 · 失败 {view.failed} · 更新 {clock(view.asOf)}</p>
-              {view.message ? <Callout tone={view.phase === 'error' || view.phase === 'cooldown' ? 'warning' : 'info'}>{view.message}</Callout> : null}
-            </> : <p className="status-line" role="status">正在读取扫描进度…</p>}
-          {live.length ? <ScanTable rows={live} review={review} />
-            : <TableEmpty>{paused || failure || view?.phase === 'error' || view?.phase === 'cooldown' ? '当前行情待重新核实。'
-              : !view || view.phase === 'loading' ? '正在准备市场目录和报价。'
-              : view.total === 0 ? '当前网络没有可扫描的候选币种。' : '已检查的报价中暂无有效正净差。'}</TableEmpty>}
-          <p className="muted">净差额已扣 KyberSwap 买入 Gas、所填账户费率及各路线额外成本（默认 0 USDT）。现货按到账后卖出测算；永续假设基差收敛，按开仓名义计开平两次费用，未计资金费与未对冲尾差。</p>
-        </div>
-      </section>
-      {view ? <section className="panel">
-        <div className="section-head"><div><h2>最近采样</h2><p>近 5 分钟内的历史或暂停采样，最多 {HISTORY_DISPLAY_LIMIT} 条。复核时重新请求实时价格。</p></div></div>
-        {history.length ? <ScanTable rows={history} history review={review} /> : <TableEmpty>暂无历史采样。</TableEmpty>}
-      </section> : null}
-    </> : <StatePanel kind="empty" title="扫描参数已更改" detail="应用参数后重新扫描。" />}
+    <section className="panel">
+      <div className="section-head"><div><h2>最近采样</h2><p>近 5 分钟的历史行情，最多 {HISTORY_DISPLAY_LIMIT} 条。单币复核将重新询价。</p></div></div>
+      {history.length ? <ScanTable rows={history} history review={review} /> : <TableEmpty>暂无历史采样。</TableEmpty>}
+    </section>
   </>;
 }

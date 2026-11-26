@@ -126,6 +126,7 @@ export interface ServiceViews {
     enabled?(market: keyof typeof MONITOR_NAMES): boolean;
     chainArb?(input: unknown, signal: AbortSignal): Promise<unknown>;
     scanChainArb?(input: unknown, scope: string, signal: AbortSignal): Promise<unknown>;
+    chainArbBackground?: { view(): unknown; update(body: unknown): unknown; enabled(): boolean };
     setControl?(market: keyof typeof MONITOR_NAMES, body: unknown): unknown;
     /** M-3d: the saved Variational token (state without the token, and the page's save); undefined when oil is not configured. */
     variationalSession?(): { view(): unknown; update(body: unknown): Promise<unknown> } | undefined;
@@ -627,10 +628,16 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
       }
     }
     const scanChainArb = url.pathname === '/api/monitor/perpetual/chain-arb-scan';
+    if (url.pathname === '/api/monitor/perpetual/chain-arb-background' && (request.method === 'GET' || request.method === 'POST')) {
+      const monitor = views?.monitor, background = monitor?.chainArbBackground;
+      if (!background || !monitor?.state().markets.includes('perpetual')) return send(response, 404, { code: 'not_found', message: '请先在设置中启用行情监控的合约价差' });
+      return send(response, 200, request.method === 'POST' ? background.update(await readJson(request)) : background.view());
+    }
     if (request.method === 'GET' && (scanChainArb || url.pathname === '/api/monitor/perpetual/chain-arb')) {
       const monitor = views?.monitor;
       const state = monitor?.state();
       if (!state?.markets.includes('perpetual') || !(scanChainArb ? monitor?.scanChainArb : monitor?.chainArb)) return send(response, 404, { code: 'not_found', message: '请先在设置中启用行情监控的合约价差' });
+      if (scanChainArb && monitor?.chainArbBackground?.enabled()) return send(response, 409, { code: 'background_enabled', message: '后台扫描已开启，请刷新页面查看后台榜单' });
       monitorReads.set(response, { market: 'perpetual', revision: state.controls?.perpetual?.revision });
       const query = Object.fromEntries(url.searchParams);
       if (Object.keys(query).length !== url.searchParams.size) return send(response, 400, { code: 'invalid_query', message: '查询参数重复' });

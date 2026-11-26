@@ -494,6 +494,9 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
 
   /** Queues a message that does not come from the event log (start, stop, lost lease, market alerts); its outbox id, null without a robot. */
   function notify(text: string): number | null { return tx(() => insert(text, now())); }
+  function notifyRepeating(key: string, text: string): void {
+    tx(() => { const at = now(); if (fresh(key, at)) insert(text, at); });
+  }
   /** Like notify, once per key while the key is kept (the outbox retention period); false when already sent, true when queued (or only logged without a robot). */
   function notifyOnce(key: string, text: string): boolean { return tx(() => { const at = now(); if (!first(key, at)) return false; insert(text, at); return true; }); }
 
@@ -534,7 +537,7 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
   }
 
   return {
-    poll, notify, notifyOnce, flush,
+    poll, notify, notifyOnce, notifyRepeating, flush,
     pending: (): number => (db.prepare('SELECT COUNT(*) AS n FROM outbox WHERE sent_at IS NULL').get() as { n: number }).n,
     /** For the status page: the outbox's counts, its last delivery and failure, and its newest messages. */
     status() {

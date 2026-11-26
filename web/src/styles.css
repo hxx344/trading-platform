@@ -368,6 +368,15 @@ span.news-coin{cursor:default}
 .chain-arb-scan-controls label{flex:0 1 auto}
 .chain-arb-fees summary{cursor:pointer;color:var(--text-secondary);font-size:.8125rem}
 .chain-arb-fees .chain-arb-fields{margin-top:var(--space-sm)}
+.chain-arb-config,.chain-arb-venues{min-width:0;margin:0;padding:0;border:0}
+.chain-arb-config,.chain-arb-override{display:grid;gap:var(--space-sm)}
+.chain-arb-venues legend{margin-bottom:var(--space-xs);font-size:.75rem;color:var(--text-secondary)}
+.chain-arb-page .chain-arb-check{display:inline-flex;align-items:center;gap:var(--space-xs);width:fit-content;cursor:pointer}
+.chain-arb-check input[type=checkbox]{width:auto;min-height:0;margin:0}
+.chain-arb-override{margin-top:var(--space-md)}
+.chain-arb-progress{display:flex;flex-wrap:wrap;gap:var(--space-sm) var(--space-lg);padding:0;margin:0;list-style:none;color:var(--text-secondary);font-size:.8125rem}
+.chain-arb-progress strong{color:var(--text-primary)}
+.chain-arb-progress small{display:block;color:var(--text-secondary)}
 .chain-arb-ranking td{white-space:nowrap}
 .chain-arb-ranking td small{display:block;color:var(--text-tertiary)}
 .chain-arb-ranking td.num,.chain-arb-ranking th:nth-child(n+3):nth-child(-n+7){text-align:right}

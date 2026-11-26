@@ -70,8 +70,9 @@ export function runBacktest(symbol: string, kind: AssetKind, samples: readonly S
   if (position && last) {
     const spread = closeSpread(last, position);
     if (spread) {
-      openMarkUsd = closePosition(position, last.t, spread, 'manual', settings, null).netUsd;
-      openMarkEstimated = spread.estimated; openMarkVarSource = spread.varSource ?? null;
+      const mark = closePosition(position, last.t, spread, 'manual', settings, null);
+      openMarkUsd = mark.netUsd;
+      openMarkEstimated = mark.estimated; openMarkVarSource = spread.varSource ?? null;
     }
   }
   const wins = trades.filter(trade => trade.netUsd > 0).length;

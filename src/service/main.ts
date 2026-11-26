@@ -473,8 +473,10 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
         while (!context.stopped()) {
           try { readTokens.dueReminders(text => notifier.notify(text)); }
           catch (error) { process.stderr.write(`只读接口令牌到期提醒失败：${error instanceof Error ? error.message : String(error)}\n`); }
-          try { notifier.poll(); await notifier.flush(); }
-          catch (error) { process.stderr.write(`告警处理失败：${error instanceof Error ? error.message : String(error)}\n`); }
+          try { notifier.poll(); }
+          catch (error) { process.stderr.write(`告警巡检失败：${error instanceof Error ? error.message : String(error)}\n`); }
+          try { await notifier.flush(); }
+          catch (error) { process.stderr.write(`告警队列发送失败：${error instanceof Error ? error.message : String(error)}\n`); }
           try { await monitorOutbox?.flush(); }
           catch (error) { process.stderr.write(`行情告警发送失败：${error instanceof Error ? error.message : String(error)}\n`); }
           await context.pause(NOTIFY_MS);

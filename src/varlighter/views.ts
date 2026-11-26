@@ -37,6 +37,11 @@ export interface LegRef { venue: VenueId; symbol: string; name: string }
 /** 自动配对的一个组合：是否开启、两个场所与当前配对数。 */
 export interface ComboView { combo: Combo; name: string; enabled: boolean; pairs: number }
 
+export interface PositionSummary {
+  direction: Direction; openedAt: number; pnlBps: number | null;
+  /** 开仓或估值使用估算价时为 true；缺估值返回 null，旧服务未提供该字段。 */
+  estimated?: boolean | null;
+}
 export interface StateRow {
   /** 配对键；symbol 是页面上的代码（同代码写一次，否则「A / B」，乘数不是 1 时带「×乘数」）。venue、venueName 是旧接口字段（B 腿）。 */
   key: string; a: LegRef; b: LegRef; ratio: number; custom: boolean; note: string; venue: VenueId; venueName: string;
@@ -48,13 +53,13 @@ export interface StateRow {
   samples24h: number; firstAt: number | null;
   /** 平仓后的冷却截止时刻，已过期为 null。 */ cooldownUntil: number | null;
   enabled: boolean; entryBps: number; exitBps: number;
-  position: { direction: Direction; pnlBps: number | null; openedAt: number } | null;
+  position: PositionSummary | null;
   /** 两腿每小时资金费率（小数，多头付费为正）。 */ aFunding: number | null; bFunding: number | null;
   /** 两腿手续费（基点，手动值或目录费率）；取不到为 null（不开仓）。 */ aFeeBps: number | null; bFeeBps: number | null;
 }
 export interface OrphanRow {
   key: string; a: LegRef | null; b: LegRef | null; venue: VenueId | null; venueName: string; symbol: string; reason: string; enabled: boolean; lastSampleAt: number | null;
-  position: { direction: Direction; openedAt: number; pnlBps: number | null } | null;
+  position: PositionSummary | null;
 }
 export interface StateView {
   now: number; startedAt: number;

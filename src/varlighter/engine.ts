@@ -345,18 +345,61 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     return { symbol: pair.key, t, receivedAt, decisionAt: null, captureKind: 'decision', regime: regimeOf(pair.kind, t), ratio: pair.ratio, ...prefixed('a', a), ...prefixed('b', b) } as Sample;
   }
 
-  /** 写一批新样本并跑模拟盘：先预热基线（只含库里已有的样本），再写入，避免当前样本被计入自己的基线。返回写入条数与各原因的不开仓次数。 */
-  function ingest(fresh: { pair: PairInfo; sample: Sample }[], blocked: Record<string, number>): number {
+  /** 每个配对每批只有一条样本，先用已有历史判断信号。大多数样本批写，有模拟开平仓动作的按时序逐一决定。 */
+  function ingest(fresh: { pair: PairInfo; sample: Sample }[], blocked: Record<string, number>, cursors: Map<string, number>): number {
+    const passive: Sample[] = [], active: SampleStep[] = [], errors: unknown[] = [];
     fresh.sort((x, y) => x.sample.t - y.sample.t);
-    const decisions = fresh.map(({ pair, sample }) => prepareStep(pair, sample));
-    const written = store.addSamples(fresh.map(item => item.sample));
-    noteSamples(fresh.map(item => item.sample));
-    for (const decision of decisions) {
-      latest.set(decision.pair.key, decision.sample);
-      const blocker = step(decision);
-      if (blocker) blocked[blocker] = (blocked[blocker] ?? 0) + 1;
+    for (const { pair, sample } of fresh) {
+      try {
+        const track = tracker(pair), params = paramsOf(pair.key), position = positions.get(pair.key) ?? null;
+        const baseline = track.value(sample.regime, sample.t), decision = decide(sample, baseline, params, position);
+        if ((decision.kind === 'open' && params.enabled) || decision.kind === 'close') {
+          active.push({ pair, sample, params, position, baseline, decision });
+        } else { sample.decisionAt = now(); passive.push(sample); }
+      } catch (error) {
+        trackers.delete(pair.key); // The next read rebuilds from all committed quotes, including this one.
+        passive.push(sample);
+        errors.push(error);
+      }
     }
+    let written = 0;
+    try { written = saveSamples(passive, cursors); } catch (error) { errors.push(error); }
+    for (const step of active) {
+      let apply: ReturnType<typeof tradeDecision> | undefined;
+      try { apply = tradeDecision(step); }
+      catch (error) {
+        step.sample.decisionAt = null;
+        errors.push(error);
+      }
+      try {
+        if (!saveSamples([step.sample], cursors)) continue;
+        written++;
+        if (typeof apply === 'string') blocked[apply] = (blocked[apply] ?? 0) + 1;
+        else apply?.();
+      } catch (error) { errors.push(error); }
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length) throw new AggregateError(errors, errors.map(message).join('；'));
     return written;
+  }
+
+  type SampleStep = { pair: PairInfo; sample: Sample; params: SymbolParams; position: Position | null; baseline: Baseline | null; decision: ReturnType<typeof decide> };
+  /** 成功落盘才推进游标；即使随后成交写失败，行情视图与基线仍和重启后相同。 */
+  function saveSamples(samples: readonly Sample[], cursors: Map<string, number>): number {
+    if (!samples.length) return 0;
+    const inserted = store.addNewSamples(samples), added = new Set(inserted);
+    noteSamples(inserted);
+    for (const sample of samples) {
+      if (added.has(sample)) {
+        latest.set(sample.symbol, sample);
+        trackers.get(sample.symbol)?.push(sample);
+      } else if ((latest.get(sample.symbol)?.t ?? -Infinity) < sample.t) {
+        const saved = store.latest(sample.symbol);
+        if (saved) latest.set(sample.symbol, saved);
+      }
+      cursors.set(sample.symbol, Math.max(sample.t, latest.get(sample.symbol)?.t ?? 0));
+    }
+    return inserted.length;
   }
 
   /**
@@ -385,7 +428,6 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       // 判断就发生在现在：记下这一刻对手腿的一档，模拟盘按它成交并复核信号。
       const decideAt = now(), otherLeg = liveLeg(other, quote.at, decideAt);
       if (!otherLeg) { stats.noTop++; continue; }
-      lastQuoteAt.set(pair.key, quote.at);
       if (otherLeg.BidRx === null) stats.noLive++;
       const token = asked.get(pair.key), tokenFresh = token && decideAt - token.at <= TOKEN_QUOTE_MAX_AGE_MS ? token : null;
       const varFields = varLeg(listing, tokenFresh ?? null);
@@ -394,7 +436,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     }
     if (ages.length > 2000) ages.splice(0, ages.length - 2000);
     stats.fresh = fresh.length;
-    stats.written = ingest(fresh, stats.blocked);
+    stats.written = ingest(fresh, stats.blocked, lastQuoteAt);
     lastPoll = stats;
   }
 
@@ -411,45 +453,39 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       stats.due++;
       const a = liveLeg(pair.a, time, time), b = liveLeg(pair.b, time, time);
       if (!a || !b) { stats.noTop++; continue; }
-      lastLiveAt.set(pair.key, time);
       fresh.push({ pair, sample: makeSample(pair, time, time, a, b) });
     }
-    stats.written = ingest(fresh, stats.blocked);
+    stats.written = ingest(fresh, stats.blocked, lastLiveAt);
     lastLive = stats;
     return stats;
   }
 
-  /** 每批每个配对只有一条样本。行情等待、盘口读取和本配对基线预热均已结束，在复核成交价时记录真实时间。 */
-  function prepareStep(pair: PairInfo, sample: Sample) {
-    const track = tracker(pair), params = paramsOf(pair.key), position = positions.get(pair.key) ?? null;
-    const baseline = track.value(sample.regime, sample.t);
-    const decision = decide(sample, baseline, params, position);
-    sample.decisionAt = now();
-    const confirmed = decision.kind === 'open' && baseline ? confirmOpen(sample, baseline, params, decision, settings.global.maxQuoteAgeSec) : null;
-    return { pair, sample, track, params, position, baseline, decision, confirmed };
-  }
-
-  /** 先持久化样本，再按顺序应用账户风控和模拟成交，最后把样本计入自己的基线。 */
-  function step({ pair, sample, track, params, position, baseline, decision, confirmed }: ReturnType<typeof prepareStep>): string | null {
-    let blocked: string | null = null;
-    if (decision.kind === 'close' && position) finish(position, sample, closeSpread(sample, position) ?? decision.spread, decision.reason);
-    else if (decision.kind === 'open' && baseline && confirmed !== null) {
-      const open = [...positions.values()], fees = feesOf(pair), costs = { slippageBps: settings.global.slippageBps, aFeeBps: fees?.aFeeBps ?? 0, bFeeBps: fees?.bFeeBps ?? 0 };
-      const blocker = typeof confirmed === 'string' ? confirmed : openBlocker(sample, params, settings.global, {
-        openPositions: open.length, openNotionalUsd: open.reduce((sum, item) => sum + item.notionalUsd, 0),
-        dailyNetUsd: store.netSince(dayStart(sample.t)), cooldownUntil: cooldown[pair.key] ?? 0, eligible: eligible(pair), legBusy: legBusy(pair), feeUnknown: !fees,
-        fallbackBaseline: baseline.fallback, ...openEconomics(confirmed, params, costs, confirmed.spread.varSource === 'token' ? decision : undefined),
-      });
-      if (blocker && params.enabled) blocked = blocker;
-      if (!blocker && typeof confirmed !== 'string') {
-        const opened = openPosition(`p${now().toString(36)}-${(++sequence).toString(36)}`, sample, params, confirmed, baseline, costs);
-        store.openPosition(opened, { at: now(), kind: 'open', message: `${directionText(pair, opened.direction)} ${fmt(opened.notionalUsd, 0)} 美元，价差 ${fmt(opened.entrySpread, 1)} 基点，基线 ${fmt(baseline.median, 1)}，偏离 ${fmt(confirmed.deviation, 1)}（报价时刻 ${fmt(decision.deviation, 1)}）${opened.entryVarSource === 'token' ? '，Var 按 token 询价' : opened.entryVarSource ? '，Var 按公开档位' : ''}` });
-        positions.set(pair.key, opened);
-        updateDepth();
-      }
+  /** 先取得上一笔交易之后的账户输入，再计时复核两腿和决定是否开仓。返回的操作只负责提交已决定的交易。 */
+  function tradeDecision({ pair, sample, params, position, baseline, decision }: SampleStep): string | (() => void) {
+    if (decision.kind === 'close' && position) {
+      sample.decisionAt = now();
+      const spread = closeSpread(sample, position) ?? decision.spread;
+      return () => { finish(position, sample, spread, decision.reason); };
     }
-    track.push(sample);
-    return blocked;
+    if (decision.kind !== 'open' || !baseline) throw new Error('模拟盘缺少开仓信号或基线');
+    const open = [...positions.values()], fees = feesOf(pair), costs = { slippageBps: settings.global.slippageBps, aFeeBps: fees?.aFeeBps ?? 0, bFeeBps: fees?.bFeeBps ?? 0 };
+    const risk = {
+      openPositions: open.length, openNotionalUsd: open.reduce((sum, item) => sum + item.notionalUsd, 0),
+      dailyNetUsd: store.netSince(dayStart(sample.t)), cooldownUntil: cooldown[pair.key] ?? 0, eligible: eligible(pair), legBusy: legBusy(pair), feeUnknown: !fees, fallbackBaseline: baseline.fallback,
+    };
+    sample.decisionAt = now();
+    const confirmed = confirmOpen(sample, baseline, params, decision, settings.global.maxQuoteAgeSec);
+    if (typeof confirmed === 'string') return confirmed;
+    const blocker = openBlocker(sample, params, settings.global, {
+      ...risk, ...openEconomics(confirmed, params, costs, confirmed.spread.varSource === 'token' ? decision : undefined),
+    });
+    if (blocker) return blocker;
+    const opened = openPosition(`p${sample.decisionAt.toString(36)}-${(++sequence).toString(36)}`, sample, params, confirmed, baseline, costs);
+    return () => {
+      store.openPosition(opened, { at: now(), kind: 'open', message: `${directionText(pair, opened.direction)} ${fmt(opened.notionalUsd, 0)} 美元，价差 ${fmt(opened.entrySpread, 1)} 基点，基线 ${fmt(baseline.median, 1)}，偏离 ${fmt(confirmed.deviation, 1)}（报价时刻 ${fmt(decision.deviation, 1)}）${opened.entryVarSource === 'token' ? '，Var 按 token 询价' : opened.entryVarSource ? '，Var 按公开档位' : ''}` });
+      positions.set(pair.key, opened);
+      updateDepth();
+    };
   }
 
   function finish(position: Position, sample: Sample, spread: NonNullable<ReturnType<typeof spreadOf>>, reason: ClosedTrade['reason'], note = ''): ClosedTrade {
@@ -467,8 +503,9 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     for (const sample of samples) {
       const counted = recent.get(sample.symbol);
       if (counted) counted.count++;
-      if (firsts.get(sample.symbol) === null) firsts.set(sample.symbol, sample.t);
-      if (firstSample === null) firstSample = sample.t;
+      const first = firsts.get(sample.symbol);
+      if (first !== undefined && (first === null || sample.t < first)) firsts.set(sample.symbol, sample.t);
+      if (firstSample !== undefined && (firstSample === null || sample.t < firstSample)) firstSample = sample.t;
     }
   }
   function recentCount(key: string, time: number): number {
@@ -492,6 +529,12 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   // ---- 视图 ----
   function baselineOf(pair: PairInfo, time: number): Baseline | null { return tracker(pair).value(regimeOf(pair.kind, time), time); }
 
+  function positionSummary(position: Position | null, sample: Sample | null): StateRow['position'] {
+    if (!position) return null;
+    const mark = sample ? markOf(position, sample) : null;
+    return { direction: position.direction, openedAt: position.openedAt, pnlBps: mark?.pnlBps ?? null, estimated: mark?.estimated ?? null };
+  }
+
   function state(): StateView {
     const time = now();
     const open = [...positions.values()];
@@ -501,7 +544,6 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       const spread = sample ? spreadOf(sample, bucketOf(params.notionalUsd)) : null;
       const mid = sample ? midBasis(sample) : null;
       const position = positions.get(pair.key) ?? null;
-      const held = position && sample ? closeSpread(sample, position) : null;
       return {
         key: pair.key, a: legRef(pair.a), b: legRef(pair.b), ratio: pair.ratio, custom: pair.custom, note: pair.note, venue: pair.b.venue, venueName: VENUE_NAMES[pair.b.venue],
         symbol: pair.symbol, name: pair.name, kind: pair.kind, kindName: KIND_NAMES[pair.kind], identity: pair.identity, eligible: eligible(pair), gapBps: pair.gapBps,
@@ -512,7 +554,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
         rich: baseline && spread ? spread.sellA - baseline.median : null, cheap: baseline && spread ? baseline.median - spread.buyA : null,
         samples24h: recentCount(pair.key, time), firstAt: firstOf(pair.key), cooldownUntil: cooldown[pair.key] > time ? cooldown[pair.key] : null,
         enabled: params.enabled, entryBps: params.entryBps, exitBps: params.exitBps,
-        position: position ? { direction: position.direction, pnlBps: held ? markToMarket(position, held).pnlBps : null, openedAt: position.openedAt } : null,
+        position: positionSummary(position, sample),
         aFunding: sample?.aFunding ?? pair.a.market.fundingHourly, bFunding: sample?.bFunding ?? pair.b.market.fundingHourly,
         aFeeBps: legFeeBps(settings.global, pair.a.venue, pair.a.market.takerFeeBps), bFeeBps: legFeeBps(settings.global, pair.b.venue, pair.b.market.takerFeeBps),
       };
@@ -581,11 +623,10 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       const reason = lostReason(key, time);
       if (reason === null) return [];
       const position = positions.get(key) ?? null, sample = lastSample(key), parsed = parsePairKey(key);
-      const held = position && sample ? closeSpread(sample, position) : null;
       return {
         key, a: parsed ? legRef(parsed.a) : null, b: parsed ? legRef(parsed.b) : null, venue: parsed?.b.venue ?? null, venueName: parsed ? VENUE_NAMES[parsed.b.venue] : '',
         symbol: pairTitle(key), reason, enabled: settings.symbols[key]?.enabled === true, lastSampleAt: sample?.t ?? null,
-        position: position ? { direction: position.direction, openedAt: position.openedAt, pnlBps: held ? markToMarket(position, held).pnlBps : null } : null,
+        position: positionSummary(position, sample),
       };
     });
   }
@@ -636,7 +677,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     const spread = closeSpread(sample, position);
     if (!spread) return null;
     const trade = closePosition(position, sample.t, spread, 'manual', settings.global, null);
-    return { netUsd: trade.netUsd, pnlBps: markToMarket(position, spread).pnlBps, at: sample.t, estimated: spread.estimated, varSource: spread.varSource };
+    return { netUsd: trade.netUsd, pnlBps: markToMarket(position, spread).pnlBps, at: sample.t, estimated: trade.estimated, varSource: spread.varSource };
   }
 
   function backtest(body: unknown): BacktestView {

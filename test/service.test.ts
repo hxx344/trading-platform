@@ -358,14 +358,18 @@ test('飞书告警：事件转消息，同一持续问题 30 分钟内只发一�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('保证金告警：事件源故障时仍报告余额恢复，待确认划转进度后再判断新异常', () => {
+test('保证金告警：事件源故障时仍报告余额恢复，待确认划转进度后再判断新异常', async () => {
   let clock = 0, unreadable = false;
-  const rows: EventRow[] = [], lines: string[] = [];
+  const rows: EventRow[] = [], lines: string[] = [], sent: string[] = [];
   let pair = margin('3000', '1000', clock);
   const notifier = createNotifier({
     file: ':memory:', latestSeq: () => rows.length, pairs: () => [pair], incidentPair: () => null,
     events: (after, limit) => { if (unreadable) throw new Error('事件不可读'); return rows.slice(after, after + limit); },
-    now: () => clock, log: line => lines.push(line), feishu: { webhook: 'https://example.invalid' },
+    now: () => clock, log: line => lines.push(line), feishu: { webhook: 'https://example.invalid', secret: null },
+    fetchImpl: async (_url, init) => {
+      sent.push(...JSON.parse(String(init.body)).content.text.split('\n'));
+      return json({ code: 0 });
+    },
   });
   try {
     notifier.poll();
@@ -376,18 +380,20 @@ test('保证金告警：事件源故障时仍报告余额恢复，待确认划�
     pair = margin('1500', '1000', clock);
     assert.throws(() => notifier.poll(), /事件不可读/);
     assert.match(lines.at(-1)!, /保证金平衡恢复/);
+    await notifier.flush();
+    assert.equal(sent.filter(line => line.startsWith('【保证金平衡恢复】')).length, 1);
     pair = margin('4000', '1000', clock);
     assert.throws(() => notifier.poll(), /事件不可读/);
     clock += FAULT_AFTER_MS;
     rows.push({ seq: 2, at: clock, type: 'transfer-settled', json: JSON.stringify({ pair: pair.id, state: 'confirmed', basis: 'acknowledged' }) });
     assert.throws(() => notifier.poll(), /事件不可读/);
-    assert.equal(notifier.pending(), 2);
+    assert.equal(notifier.pending(), 0);
     unreadable = false;
     notifier.poll();
-    assert.equal(notifier.pending(), 2, '确认划转后要重新计时');
+    assert.equal(notifier.pending(), 0, '确认划转后要重新计时');
     clock += FAULT_AFTER_MS;
     notifier.poll();
-    assert.equal(notifier.pending(), 3);
+    assert.equal(notifier.pending(), 1);
     assert.match(lines.at(-1)!, /保证金平衡异常.*差 3000 USD1/);
   } finally { notifier.close(); }
 });
@@ -685,6 +691,41 @@ for (const stage of ['运行中', '停止收尾中'] as const) {
     } finally { logs.close(); }
   });
 }
+
+test('服务告警：执行日志持续不可读时，运行中的服务仍投递已入队的保证金恢复', {
+  skip: process.platform !== 'linux' && '正式服务使用 Linux 账户进程锁',
+}, async t => {
+  const dir = tempDir();
+  const recovery = '【保证金平衡恢复】测试配对已恢复';
+  const sent: string[] = [];
+  const { startService } = await import('../src/service/main.ts');
+  let run: Awaited<ReturnType<typeof startService>> | undefined;
+  t.after(async () => {
+    try { await run?.shutdown(); } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  run = await startService({
+    config: parseServiceConfig(configRaw([])), dir, port: 0, app: APP,
+    secrets: { accounts: new Map(), feishu: { webhook: 'https://example.invalid', secret: null } },
+    fetchImpl: new FakeAster().fetch,
+    notifyFetch: async (_url, init) => {
+      const payload = JSON.parse(String(init.body));
+      if (payload.msg_type === 'text') sent.push(...payload.content.text.split('\n'));
+      return json({ code: 0 });
+    },
+  });
+  const db = new DatabaseSync(join(dir, 'executor-live.sqlite'));
+  try {
+    db.prepare('ATTACH DATABASE ? AS alerts').run(join(dir, 'notify.sqlite'));
+    db.exec('ALTER TABLE events RENAME TO unavailable_events');
+    try {
+      const at = Date.now();
+      db.prepare('INSERT INTO alerts.outbox(created_at, text, next_at) VALUES (?, ?, ?)').run(at, recovery, at);
+      const deadline = at + 15_000;
+      while (!sent.includes(recovery) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+      assert.equal(sent.filter(line => line === recovery).length, 1);
+    } finally { db.exec('ALTER TABLE unavailable_events RENAME TO events'); }
+  } finally { db.close(); }
+});
 
 test('服务进程：本机页面只含 ASTER 部分，状态接口可读，用户推送按子账户建立，停止后全部收尾', async () => {
   const dir = tempDir();

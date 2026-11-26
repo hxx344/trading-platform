@@ -146,12 +146,15 @@ export function openVarLighterStore(file: string) {
   const fresh = (rows: unknown[]) => (rows as LegRow[]).map(fromLegRow);
   const parse = <T>(rows: unknown[]) => (rows as { json: string }[]).map(row => JSON.parse(row.json) as T);
   const minimum = (...values: (number | null | undefined)[]) => { const known = values.filter((value): value is number => typeof value === 'number'); return known.length ? Math.min(...known) : null; };
+  /** 只返回本事务新插入的样本。重复键保留先前证据，采样方不能再次推进基线或成交。 */
+  const addNewSamples = (samples: readonly Sample[]): Sample[] => samples.length
+    ? transaction(() => samples.filter(sample => Number(insertSample.run(...legRow(sample)).changes) > 0)) : [];
   return {
     /** 写入一批样本，已有同一时刻的忽略；返回新写入的条数。 */
     addSamples(samples: readonly Sample[]): number {
-      if (!samples.length) return 0;
-      return transaction(() => samples.reduce((count, sample) => count + Number(insertSample.run(...legRow(sample)).changes), 0));
+      return addNewSamples(samples).length;
     },
+    addNewSamples,
     samples(symbol: string, from: number, to: number): Sample[] {
       return mergeByTime(legacy(symbol, old => oldRange.all(old, from, to)), fresh(selectRange.all(symbol, from, to)));
     },

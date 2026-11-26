@@ -7,7 +7,7 @@ import { useDeferredValue, useState } from 'react';
 import { api } from '../api.ts';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { useLiveResource } from '../use-live-resource.ts';
-import type { OrphanRow, StateRow, StateView, VenueStatus } from '../../../src/varlighter/views.ts';
+import type { OrphanRow, PositionSummary, StateRow, StateView, VenueStatus } from '../../../src/varlighter/views.ts';
 import { Badge, Metric, useWrite } from './parts.tsx';
 import { VarLighterDetail } from './VarLighterDetail.tsx';
 import { VarLighterPaper } from './VarLighterPaper.tsx';
@@ -120,6 +120,9 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
   </>;
 }
 
+const positionPnl = ({ pnlBps, estimated }: PositionSummary): string | null =>
+  pnlBps === null ? null : `${bps(pnlBps)} 基点${estimated ? '（估算）' : ''}`;
+
 /** 已启用或有持仓、但已失联的键（下架、规格改判、长时间无样本）：可停用，持仓按最后样本平仓。 */
 function Orphans({ view, rows, write, onChanged }: { view: StateView; rows: OrphanRow[]; write: ReturnType<typeof useWrite>; onChanged: () => Promise<void> }) {
   const label = (row: OrphanRow) => `${row.symbol}（${row.a && row.b ? `${venueShort(row.a.venue)}↔${venueShort(row.b.venue)}` : row.key}）`;
@@ -141,7 +144,7 @@ function Orphans({ view, rows, write, onChanged }: { view: StateView; rows: Orph
       <thead><tr><th>标的</th><th>状态</th><th>最后样本</th><th /></tr></thead>
       <tbody>{rows.map(row => <tr key={row.key}>
         <td><span className="vl-symbol">{row.symbol}</span><small>{row.a && row.b ? `${row.a.name} ↔ ${row.b.name}` : row.key}</small></td>
-        <td className="wrap">{row.reason}<small>{row.enabled ? <Badge tone="warn">已启用</Badge> : null} {row.position ? <>{directionShort(row.position.direction, row.a?.venue ?? null)} 持仓{row.position.pnlBps === null ? '' : ` ${bps(row.position.pnlBps)} 基点`}</> : null}</small></td>
+        <td className="wrap">{row.reason}<small>{row.enabled ? <Badge tone="warn">已启用</Badge> : null} {row.position ? <>{directionShort(row.position.direction, row.a?.venue ?? null)} 持仓 {positionPnl(row.position)}</> : null}</small></td>
         <td>{age(row.lastSampleAt, view.now)}</td>
         <td><div className="vl-actions">
           {row.enabled ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => disable(row)}>停用</button> : null}
@@ -172,7 +175,7 @@ function Row({ row, now, multi }: { row: StateRow; now: number; multi: boolean }
     <td className="num">{hit ? <><span className={hit.gap >= 0 ? 'vl-up' : undefined}>{bps(hit.gap)}</span><small title={directionLabel(hit.direction, row.a.venue, row.b.venue)}>{directionShort(hit.direction, row.a.venue)} {plain(hit.deviation)} / {plain(row.entryBps)}</small></> : '—'}</td>
     <td className="num">{funding.a} / {funding.b}<small>{venueShort(row.a.venue)} / {venueShort(row.b.venue)}</small></td>
     <td className="num">{row.samples24h}</td>
-    <td>{row.position ? <><Badge tone="info">持仓</Badge><small title={directionLabel(row.position.direction, row.a.venue, row.b.venue)}>{directionShort(row.position.direction, row.a.venue)} · {row.position.pnlBps === null ? '—' : `${bps(row.position.pnlBps)} 基点`}</small></>
+    <td>{row.position ? <><Badge tone="info">持仓</Badge><small title={directionLabel(row.position.direction, row.a.venue, row.b.venue)}>{directionShort(row.position.direction, row.a.venue)} · {positionPnl(row.position) ?? '—'}</small></>
       : row.enabled ? <><Badge tone="ok">已启用</Badge>{row.cooldownUntil ? <small>冷却至 {clockOrDate(row.cooldownUntil, now)}</small> : null}</> : <span className="vl-dim">未启用</span>}</td>
   </tr>;
 }

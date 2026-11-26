@@ -82,7 +82,8 @@ HEALTH_WAIT_S=90
 APP_DIR=${TP_APP_DIR:-/opt/trading-platform}
 CONF_DIR=${TP_CONF_DIR:-/etc/trading-platform}
 # Venue accounts for DEX live trading (docs/dexspread.md 12.13). Root owns the directory and the file (0600): systemd
-# hands the content to the DEX service as an EnvironmentFile, the service account can only see that the file exists.
+# hands the content to the DEX service as an EnvironmentFile, the service account cannot open the file. The content stays
+# readable in /proc/<pid>/environ to processes of that account, so it holds account identifiers only (LESSONS L211).
 DEX_CONF_DIR=${TP_DEX_CONF_DIR:-/etc/trading-platform-dex}
 DEX_KEYS_FILE=$DEX_CONF_DIR/keys.env
 DATA_DIR=${TP_DATA_DIR:-/var/lib/trading-platform}
@@ -698,8 +699,9 @@ if ((dex_keys_change)); then
     [[ -f "$release_dir/src/dex/keys-setup.ts" ]] || fail "版本 $new_version 不支持录入 DEX 价差场所账户，请用最新版本"
     as_root_dir "$DEX_CONF_DIR" 755
     dex_keys_out=$(printf '%s\n' "$dex_keys_input" | (cd / && "$NODE_BIN" "$release_dir/src/dex/keys-setup.ts" --file "$DEX_KEYS_FILE" 9>&-)) || fail '录入 DEX 价差场所账户失败'
+    # The helper creates the file 0600. Nothing here may touch an unchanged file: the running service compares its ctime,
+    # and an unchanged digest means no restart, so even a no-op chmod would leave it refusing the accounts.
     log "$dex_keys_out"
-    if [[ -f "$DEX_KEYS_FILE" ]]; then chmod 600 "$DEX_KEYS_FILE" || fail '无法设置场所账户文件的权限'; fi
   fi
   dex_keys_input=''
 fi

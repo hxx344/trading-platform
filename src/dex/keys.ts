@@ -2,7 +2,7 @@
 // systemd 以 EnvironmentFile 把它交给 DEX 服务，服务启动时取走并从环境里删掉（子进程不再继承；但启动时的环境块仍在
 // /proc/<pid>/environ，同账户的进程读得到，所以这条通道只能放账户编号与地址，放私钥之前必须换投递方式）。服务只能看到这个文件在不在、变没变，
 // 文件被删除或改过之后（吊销、换账户）不再使用启动时拿到的内容，等安装脚本重启（L207）。
-// 这一版只有账户编号与地址；私钥在下单连接器接入时加进同一个文件。
+// 这一版只有账户编号与地址。私钥不得加进这个文件：解析拒绝未知字段就是这道闸，放开之前先换投递方式（L211）。
 import { statSync } from 'node:fs';
 
 export const DEX_KEYS_ENV = 'TP_DEX_KEYS';
@@ -85,7 +85,8 @@ export function decodeDexKeysFile(text: string): DexAccounts {
 }
 
 /**
- * 启动时从环境里取走场所账户并删掉这个变量：之后启动的子进程（Var 询价的传输脚本）拿不到它。
+ * 启动时从环境里取走场所账户并删掉这个变量：之后启动的子进程（Var 询价的传输脚本）不再继承它。
+ * 这不是隔离：启动时的环境块仍在 /proc/<pid>/environ，同账户进程读得到（L211）。
  * 没有这个变量就是没有配置；内容无效时不使用，只报告问题。
  */
 export interface TakenDexKeys { accounts: DexAccounts; present: boolean; problem: string | null; /** 录入助手写出这份内容时文件应有的字节数。 */ fileSize?: number }

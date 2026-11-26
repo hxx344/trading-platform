@@ -25,6 +25,7 @@ test('场所账户：编码往返、严格解析、地址统一成小写', () =>
   assert.deepEqual(decodeDexKeysValue(text.trim().slice(DEX_KEYS_ENV.length + 1)), ALL);
   assert.deepEqual(configuredVenues({ rh: { accountIndex: 0 } }), ['rh']);
   assert.deepEqual(parseDexAccounts({ version: 1 }), {});
+  // 带 privateKey 的被拒是 L211 的闸门：这个文件经环境变量投递，放开未知字段之前必须先换投递方式。
   for (const bad of [null, [], { version: 2 }, { version: 1, extra: 1 }, { version: 1, lighter: { accountIndex: -1 } }, { version: 1, lighter: { accountIndex: 1.5 } },
     { version: 1, lighter: { accountIndex: '7' } }, { version: 1, rh: { accountIndex: 2 ** 48 } }, { version: 1, lighter: { accountIndex: 1, privateKey: 'x' } },
     { version: 1, entropy: { address: '0x12' } }, { version: 1, entropy: { address: 7 } }, { version: 1, entropy: [] }]) assert.throws(() => parseDexAccounts(bad), `${JSON.stringify(bad)}`);
@@ -98,6 +99,10 @@ test('录入助手：空行沿用、- 去掉、格式不对被拒；文件 600�
   writeKeysFile(file, first.accounts);
   assert.deepEqual(readKeysFile(file), first.accounts);
   if (process.platform !== 'win32') assert.equal(statSync(file).mode & 0o777, 0o600);
+  // 助手写出的真实文件，经环境变量取到同一份内容后，用真实的 stat 核对：必须可用（大小绑定与逐字节的写法对得上）。
+  const real = takeDexKeys({ [DEX_KEYS_ENV]: readFileSync(file, 'utf8').trim().slice(DEX_KEYS_ENV.length + 1) });
+  assert.deepEqual(guardedAccounts(real, file)(), { accounts: first.accounts, problem: null });
+  assert.match(guardedAccounts({ accounts: {}, present: false, problem: null }, file)().problem!, /已写入，等 DEX 价差服务重启/);
   writeKeysFile(file, dropped.accounts);
   assert.deepEqual(readKeysFile(file), dropped.accounts, '覆盖已有文件');
   writeKeysFile(file, {});
@@ -220,6 +225,7 @@ test('实盘准备页：没有录入时待接入；录入后显示各场所余�
   clock += ACCOUNT_STALE_MS;
   await engine.refreshAccounts(() => signal);
   assert.equal(item('funding').status, 'ok', '刚好在时限内');
+  assert.equal(item('accounts').status, 'ok', '读取失败但还有时限内的读数');
   clock += 1;
   assert.equal(item('funding').status, 'warn');
   assert.match(item('funding').detail, /Lighter 可用 250\.50、权益 300\.25 USDC，持仓 1 个（读取失败：HTTP 500）/);

@@ -319,6 +319,13 @@ if grep -Eqi '7654321|0E0E0E' "$fixture/out"; then echo 'Installer echoed a venu
 dex_pid=$(pid "$dex")
 [[ $dex_pid != "$dex_before" && $(pid "$service") == "$executor_before" ]]
 tr '\0' '\n' <"/proc/$dex_pid/environ" | grep -q '^TP_DEX_KEYS='
+# The service accepted the file systemd read: its size check and stat baseline agree with a real EnvironmentFile.
+journalctl --sync
+journalctl -q -u "$dex" "_PID=$dex_pid" --no-pager -o cat | grep -Fq '场所账户：已取到 2 个场所'
+# Entering nothing keeps the file byte for byte and metadata for metadata, and restarts nothing.
+keys_ctime=$(stat -c %z "$dex_conf/keys.env")
+printf '\n\n\n' | bash "$root/deploy/install.sh" --package "$fixture/release-1" --set-dex-keys --dex-keys-stdin >"$fixture/out" 2>&1
+[[ $(stat -c %z "$dex_conf/keys.env") == "$keys_ctime" && $(pid "$dex") == "$dex_pid" && $(pid "$service") == "$executor_before" ]]
 runuser -u "$dex" -g "$dex-ipc" -- test -e "$dex_conf/keys.env"
 if runuser -u "$dex" -g "$dex-ipc" -- test -r "$dex_conf/keys.env" || runuser -u "$dex" -g "$dex-ipc" -- test -w "$dex_conf" ||
     runuser -u "$service" -- test -r "$dex_conf/keys.env" || runuser -u "$control" -- test -r "$dex_conf/keys.env"; then

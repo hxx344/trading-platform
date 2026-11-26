@@ -8,7 +8,7 @@ import { parseArgs } from 'node:util';
 import { readComponentBuild } from '../component-build.ts';
 import { crashReportKey, installCrashGuard, readCrashRecord } from '../crash-guard.ts';
 import { openVarLighter, routePage, varLighterLoop, varLighterViews, type VarLighterOptions } from './host.ts';
-import { guardedAccounts, takeDexKeys } from './keys.ts';
+import { configuredVenues, guardedAccounts, takeDexKeys } from './keys.ts';
 import { DEX_TOKEN_LEASE_MS, tokenDigest, type DexCrashView, type DexTokenPush } from './protocol.ts';
 import { createDexServer } from './server.ts';
 
@@ -67,7 +67,7 @@ export function startDex({ socket, stateDir, build, options = {}, log = line => 
 
 function main(): void {
   const { values } = parseArgs({ options: { socket: { type: 'string' }, 'state-dir': { type: 'string' }, 'keys-file': { type: 'string' } } });
-  // 先取走场所账户并从环境里删掉，之后启动的子进程拿不到。
+  // 先取走场所账户并从环境里删掉，之后启动的子进程不再继承（启动时的环境块仍在 /proc/<pid>/environ，见 L211）。
   const taken = takeDexKeys(process.env);
   const keysFile = values['keys-file'];
   if (keysFile !== undefined && !isAbsolute(keysFile)) throw new Error('--keys-file 须为绝对路径');
@@ -75,7 +75,11 @@ function main(): void {
   const stateDir = values['state-dir'];
   if (!stateDir || !isAbsolute(stateDir)) throw new Error('需要绝对路径 --state-dir');
   const build = readComponentBuild(fileURLToPath(new URL('../..', import.meta.url)), 'dex');
-  const dex = startDex({ socket: values.socket, stateDir, build, options: { accounts: guardedAccounts(taken, keysFile ?? null) } });
+  const accounts = guardedAccounts(taken, keysFile ?? null);
+  // 启动时说一句账户取用的结果（只有场所个数，没有编号与地址）：真实 systemd 验收靠它确认正常录入的文件被接受。
+  const first = accounts();
+  if (taken.present || first.problem) process.stdout.write(first.problem ? `场所账户未使用：${first.problem}\n` : `场所账户：已取到 ${configuredVenues(first.accounts).length} 个场所\n`);
+  const dex = startDex({ socket: values.socket, stateDir, build, options: { accounts } });
   dex.ready.then(() => process.stdout.write('DEX 价差服务已就绪\n'), (error: Error) => {
     process.stderr.write(`DEX 价差服务监听失败：${error.message}\n`); process.exitCode = 1; void dex.stop();
   });

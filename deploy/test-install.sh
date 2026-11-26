@@ -135,9 +135,10 @@ printf '%s\n\n%s\n' "$dex_account" "$dex_address" | run --package "$tmp/a" --set
 check '--set-dex-keys 写入场所账户文件（600），输出不带账户编号与地址' '[[ $status -eq 0 && "$(stat -c %a "$TP_DEX_CONF_DIR/keys.env")" == 600 ]] && grep -q "DEX 价差实盘账户：已配置 Lighter、Entropy" "$tmp/out" && ! grep -Eqi "$dex_account|$dex_address" "$tmp/out" && grep -Eqx "TP_DEX_KEYS=[A-Za-z0-9_-]+" "$TP_DEX_CONF_DIR/keys.env"'
 check '场所账户不进配置与密钥文件' '! grep -Eqi "$dex_account|$dex_address|TP_DEX_KEYS" "$TP_CONF_DIR/config.json" "$TP_CONF_DIR/secrets.json"'
 check '场所账户变了只动 DEX 的组件键，执行面的不变' '! cmp -s "$tmp/dex-key.none" "$TP_APP_DIR/.deployment/dex-key" && cmp -s "$tmp/executor-key.none" "$TP_APP_DIR/.deployment/executor-key"'
-cp "$TP_APP_DIR/.deployment/dex-key" "$tmp/dex-key.set"; cp "$TP_DEX_CONF_DIR/keys.env" "$tmp/keys.set"
+cp "$TP_APP_DIR/.deployment/dex-key" "$tmp/dex-key.set"; cp "$TP_DEX_CONF_DIR/keys.env" "$tmp/keys.set"; dex_keys_ctime=$(stat -c %z "$TP_DEX_CONF_DIR/keys.env")
 printf '\n\n\n' | run --package "$tmp/a" --set-dex-keys --dex-keys-stdin && status=0 || status=$?
 check '三项都留空时沿用已保存的值，文件与组件键不变' '[[ $status -eq 0 ]] && grep -q "与现有配置相同，未改动" "$tmp/out" && cmp -s "$tmp/keys.set" "$TP_DEX_CONF_DIR/keys.env" && cmp -s "$tmp/dex-key.set" "$TP_APP_DIR/.deployment/dex-key"'
+check '没有改动时连文件的元数据也不碰（运行中的服务按 ctime 核对，碰了会停用账户）' '[[ "$(stat -c %z "$TP_DEX_CONF_DIR/keys.env")" == "$dex_keys_ctime" ]]'
 run --package "$tmp/a" && status=0 || status=$?
 check '普通重装保留场所账户文件' '[[ $status -eq 0 ]] && cmp -s "$tmp/keys.set" "$TP_DEX_CONF_DIR/keys.env" && cmp -s "$tmp/dex-key.set" "$TP_APP_DIR/.deployment/dex-key"'
 run --package "$tmp/a" --unset-dex-keys </dev/null && status=0 || status=$?

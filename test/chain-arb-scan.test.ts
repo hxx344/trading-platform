@@ -59,6 +59,34 @@ test('净额使用整笔买入成本和买入 Gas、费率、其他成本，缺 
   }
 });
 
+test('实际地址证明独立限制各路线的盘口寿命及历史，现货不继承较旧的永续盘口期限', async t => {
+  for (const proofLifetime of [3000, 60_000]) await t.test(String(proofLifetime), async t => {
+    let time = start;
+    const scanner = createChainArbScanner({ now: () => time, catalog: async () => tokens(1), quote: async raw => {
+      const result = compareChainArb(parseChainArb(raw), verifiedBuy({ rawQuantity: '105', decimals: 1, at: start, swapGasUsdt: 1 }), {
+        deposit: true, withdraw: true, spot: { step: 1, bids: [[13, 11]], at: start },
+        perp: { step: 1, bids: [[13, 11]], at: start - 14_000 },
+      }, start);
+      result.dex.execution!.depositVenue = 'gate';
+      result.dex.execution!.depositExpiresAt = start + proofLifetime;
+      return result;
+    } });
+    t.after(() => scanner.close());
+    const poll = () => scanner.read(params, 'worker:1', signal);
+    await poll(); await settle();
+    const rows = (await poll()).rows;
+    assert.equal(rows.find(row => row.kind === 'perp')?.expiresAt, start + 1000);
+    assert.equal(rows.find(row => row.kind === 'spot')?.expiresAt, start + Math.min(15_000, proofLifetime));
+    time += 1001;
+    const afterPerp = await poll();
+    assert.deepEqual(afterPerp.rows.map(row => row.kind), ['spot']);
+    assert.deepEqual(afterPerp.history.map(row => row.kind), ['perp']);
+    time = start + proofLifetime;
+    const expired = await poll();
+    assert.deepEqual([expired.rows, expired.history], [[], []]);
+  });
+});
+
 test('现货盘口到期后两条需要现货退出的路线均转入历史', async t => {
   let time = start;
   const scanner = createChainArbScanner({ now: () => time, catalog: async () => tokens(1), quote: async raw =>

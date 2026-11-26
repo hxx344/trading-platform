@@ -16,6 +16,8 @@ const EVENTS_PER_POLL = 500;
 /** Messages joined into one robot post; the robot allows a few posts per second at most. */
 const LINES_PER_POST = 10;
 const MAX_TEXT = 1_500;
+// v0.101.1 sends solely by next_at. Keep protected rows beyond any live quote even if the service is rolled back.
+const GUARDED_LEGACY_DUE = 8_640_000_000_000_000;
 /** The market alerts' own outbox (M-3b), used while secrets.json has `feishuMonitor`. */
 export const MONITOR_OUTBOX_FILE = 'notify-monitor.sqlite';
 /** Newest outbox messages shown on the status page. */
@@ -93,6 +95,8 @@ export interface NotifierOptions {
   now?: () => number;
   fetchImpl?: (url: string, init: RequestInit) => Promise<Response>;
   log?: (line: string) => void;
+  /** Recheck the exact queued opportunity against current account evidence. Return its quote deadline in ms. */
+  chainArbNotificationExpiry?: (key: string, text: string) => number | null;
 }
 
 const short = (value: unknown): string => typeof value === 'string' ? value.slice(0, 8) : '?';
@@ -354,12 +358,12 @@ export async function sendFeishu(feishu: FeishuSecret, message: Record<string, u
   if (!response.ok || (code !== undefined && code !== 0)) throw new Error(`飞书返回 HTTP ${response.status}${code !== undefined ? ` code ${String(code).slice(0, 12)}` : ''}${typeof answer.msg === 'string' ? ` ${answer.msg.slice(0, 80)}` : ''}`);
 }
 
-export function createNotifier({ file, events, latestSeq, pairs, incidentPair, job, feishu, now = Date.now, fetchImpl = (url, init) => fetch(url, init), log = line => process.stderr.write(`${line}\n`) }: NotifierOptions) {
+export function createNotifier({ file, events, latestSeq, pairs, incidentPair, job, feishu, now = Date.now, fetchImpl = (url, init) => fetch(url, init), log = line => process.stderr.write(`${line}\n`), chainArbNotificationExpiry }: NotifierOptions) {
   const db = new DatabaseSync(file);
   db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=2000;
     CREATE TABLE IF NOT EXISTS cursor (id INTEGER PRIMARY KEY CHECK (id = 1), seq INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL, text TEXT NOT NULL,
-      attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL, sent_at INTEGER, last_error TEXT);
+      attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL, sent_at INTEGER, last_error TEXT, repeat_key TEXT, guarded_due_at INTEGER);
     CREATE INDEX IF NOT EXISTS outbox_due ON outbox(sent_at, next_at);
     CREATE TABLE IF NOT EXISTS repeats (key TEXT PRIMARY KEY, at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS once (key TEXT PRIMARY KEY, at INTEGER NOT NULL);`);
@@ -369,10 +373,23 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
     db.exec('BEGIN IMMEDIATE');
     try { const result = operation(); db.exec('COMMIT'); return result; } catch (error) { db.exec('ROLLBACK'); throw error; }
   };
+  // Older outboxes retained only the rendered message. Those opportunities have no matching account proof.
+  tx(() => {
+    const existing = db.prepare("SELECT name FROM pragma_table_info('outbox')").all().map(row => row.name);
+    if (!existing.includes('repeat_key')) db.exec('ALTER TABLE outbox ADD COLUMN repeat_key TEXT');
+    if (!existing.includes('guarded_due_at')) db.exec('ALTER TABLE outbox ADD COLUMN guarded_due_at INTEGER');
+    // Check on every open: a prior version may have run in between two starts of this one.
+    db.exec(`DELETE FROM outbox WHERE sent_at IS NULL AND (repeat_key GLOB 'chain-arb:*' OR
+      (repeat_key IS NULL AND text GLOB '【链上折价套利】*'))`);
+    db.prepare("UPDATE outbox SET guarded_due_at = next_at, next_at = ? WHERE sent_at IS NULL AND repeat_key GLOB 'chain-arb-deposit:*' AND guarded_due_at IS NULL").run(GUARDED_LEGACY_DUE);
+    db.exec('CREATE INDEX IF NOT EXISTS outbox_current_due ON outbox(COALESCE(guarded_due_at, next_at)) WHERE sent_at IS NULL');
+  });
   /** The queued message's id, or null without a robot (the text is only logged then). */
-  const insert = (text: string, at: number): number | null => {
+  const insert = (text: string, at: number, repeatKey: string | null = null): number | null => {
     // Logged once the row is in (a rolled-back insert would otherwise read as an alert that went out).
-    const id = feishu ? Number(db.prepare('INSERT INTO outbox(created_at, text, next_at) VALUES (?, ?, ?)').run(at, text.slice(0, MAX_TEXT), at).lastInsertRowid) : null;
+    const guarded = repeatKey !== null || text.startsWith('【链上折价套利】');
+    const id = feishu ? Number(db.prepare('INSERT INTO outbox(created_at, text, next_at, repeat_key, guarded_due_at) VALUES (?, ?, ?, ?, ?)')
+      .run(at, text.slice(0, MAX_TEXT), guarded ? GUARDED_LEGACY_DUE : at, repeatKey, guarded ? at : null).lastInsertRowid) : null;
     log(`告警：${text}`);
     return id;
   };
@@ -495,7 +512,8 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
   /** Queues a message that does not come from the event log (start, stop, lost lease, market alerts); its outbox id, null without a robot. */
   function notify(text: string): number | null { return tx(() => insert(text, now())); }
   function notifyRepeating(key: string, text: string): void {
-    tx(() => { const at = now(); if (fresh(key, at)) insert(text, at); });
+    const guarded = key.startsWith('chain-arb-deposit:') || key.startsWith('chain-arb:');
+    tx(() => { const at = now(); if (fresh(key, at)) insert(text, at, guarded ? key : null); });
   }
   /** Like notify, once per key while the key is kept (the outbox retention period); false when already sent, true when queued (or only logged without a robot). */
   function notifyOnce(key: string, text: string): boolean { return tx(() => { const at = now(); if (!first(key, at)) return false; insert(text, at); return true; }); }
@@ -522,16 +540,40 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
         db.prepare('DELETE FROM once WHERE at < ?').run(at - RETENTION_MS);
       }
       if (!feishu) return;
-      const due = db.prepare('SELECT id, text, attempts FROM outbox WHERE sent_at IS NULL AND next_at <= ? ORDER BY id LIMIT ?').all(at, LINES_PER_POST) as { id: number; text: string; attempts: number }[];
+      const due = db.prepare('SELECT id, text, attempts, repeat_key AS key, created_at AS created FROM outbox WHERE sent_at IS NULL AND COALESCE(guarded_due_at, next_at) <= ? ORDER BY id LIMIT ?').all(at, LINES_PER_POST) as { id: number; text: string; attempts: number; key: string | null; created: number }[];
       if (!due.length) return;
-      const ids = due.map(row => row.id);
+      // Old versions can still have produced rows after a downgrade. Keyless chain-arb alerts and legacy keys never post.
+      const deadlines = due.map(row => {
+        if (row.key === null && !row.text.startsWith('【链上折价套利】')) return Infinity;
+        try {
+          const expires = row.key?.startsWith('chain-arb-deposit:') && chainArbNotificationExpiry?.(row.key, row.text);
+          return typeof expires === 'number' && Number.isSafeInteger(expires) ? expires : 0;
+        } catch { return 0; }
+      });
+      // A later account check in this batch may have used the last milliseconds of an earlier quote.
+      const sendingAt = now(), ready = due.filter((_, index) => deadlines[index]! > sendingAt);
       try {
-        await post(due.map(row => row.text).join('\n'));
-        tx(() => { for (const id of ids) db.prepare('UPDATE outbox SET sent_at = ?, last_error = NULL WHERE id = ?').run(now(), id); });
+        if (ready.length) {
+          await post(ready.map(row => row.text).join('\n'));
+          tx(() => { for (const row of ready) db.prepare('UPDATE outbox SET sent_at = ?, last_error = NULL WHERE id = ?').run(now(), row.id); });
+        }
       } catch (error) {
         const reason = error instanceof Error ? error.message.slice(0, 200) : '未知错误';
         log(`飞书发送失败：${reason}`);
-        tx(() => { for (const row of due) db.prepare('UPDATE outbox SET attempts = attempts + 1, next_at = ?, last_error = ? WHERE id = ?').run(now() + Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** row.attempts), reason, row.id); });
+        tx(() => {
+          for (const row of ready) {
+            const dueColumn = row.key === null ? 'next_at' : 'guarded_due_at';
+            db.prepare(`UPDATE outbox SET attempts = attempts + 1, ${dueColumn} = ?, last_error = ? WHERE id = ?`)
+              .run(now() + Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** row.attempts), reason, row.id);
+          }
+        });
+      }
+      if (ready.length !== due.length) {
+        tx(() => { for (const [index, row] of due.entries()) {
+          if (deadlines[index]! > sendingAt) continue;
+          db.prepare('DELETE FROM outbox WHERE id = ? AND sent_at IS NULL').run(row.id);
+          if (row.key) db.prepare('DELETE FROM repeats WHERE key = ? AND at = ?').run(row.key, row.created);
+        } });
       }
     } finally { sending = false; }
   }
@@ -543,15 +585,15 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
     status() {
       const counts = db.prepare('SELECT COUNT(*) AS pending, COALESCE(SUM(attempts > 0), 0) AS retrying FROM outbox WHERE sent_at IS NULL').get() as { pending: number; retrying: number };
       const sent = db.prepare('SELECT MAX(sent_at) AS at FROM outbox').get() as { at: number | null };
-      const failed = db.prepare('SELECT last_error AS error, next_at AS nextAt FROM outbox WHERE sent_at IS NULL AND last_error IS NOT NULL ORDER BY id DESC LIMIT 1').get() as { error: string; nextAt: number } | undefined;
-      const recent = (db.prepare(`SELECT id, created_at AS createdAt, text, attempts, next_at AS nextAt, sent_at AS sentAt, last_error AS lastError FROM outbox ORDER BY id DESC LIMIT ${STATUS_RECENT}`).all() as unknown as
+      const failed = db.prepare('SELECT last_error AS error, COALESCE(guarded_due_at, next_at) AS nextAt FROM outbox WHERE sent_at IS NULL AND last_error IS NOT NULL ORDER BY id DESC LIMIT 1').get() as { error: string; nextAt: number } | undefined;
+      const recent = (db.prepare(`SELECT id, created_at AS createdAt, text, attempts, COALESCE(guarded_due_at, next_at) AS nextAt, sent_at AS sentAt, last_error AS lastError FROM outbox ORDER BY id DESC LIMIT ${STATUS_RECENT}`).all() as unknown as
         { id: number; createdAt: number; text: string; attempts: number; nextAt: number; sentAt: number | null; lastError: string | null }[]);
       return { configured: feishu !== null, pending: counts.pending, retrying: counts.retrying, lastSentAt: sent.at, lastError: failed?.error ?? null, nextRetryAt: failed?.nextAt ?? null, retentionMs: RETENTION_MS, recent };
     },
     /** Delivery of queued messages by id (market alert history); an id missing from the result has left the outbox (retention). */
     delivery(ids: readonly number[]): Map<number, { sentAt: number | null; attempts: number; lastError: string | null; nextAt: number }> {
       const result = new Map<number, { sentAt: number | null; attempts: number; lastError: string | null; nextAt: number }>();
-      const read = db.prepare('SELECT sent_at AS sentAt, attempts, last_error AS lastError, next_at AS nextAt FROM outbox WHERE id = ?');
+      const read = db.prepare('SELECT sent_at AS sentAt, attempts, last_error AS lastError, COALESCE(guarded_due_at, next_at) AS nextAt FROM outbox WHERE id = ?');
       for (const id of ids) {
         const row = read.get(id) as { sentAt: number | null; attempts: number; lastError: string | null; nextAt: number } | undefined;
         if (row) result.set(id, { sentAt: row.sentAt, attempts: row.attempts, lastError: row.lastError, nextAt: row.nextAt });

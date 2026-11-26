@@ -2,7 +2,7 @@ import { anySignal } from '../any-signal.mjs';
 import { untilAborted } from '../asset/sources/shared-reads.ts';
 import type { ScanCandidate } from './catalog.ts';
 import { CHAIN_ARB_TTL_MS, type ChainArbVenue, type ChainArbView } from './model.ts';
-import { isVerifiedExecution, parseChainArbScan, SCAN_HISTORY_MS, type ScanInput, type ScanRow, type ScanView } from './scan-model.ts';
+import { isDepositExecution, isVerifiedExecution, parseChainArbScan, SCAN_HISTORY_MS, type ScanInput, type ScanRow, type ScanView } from './scan-model.ts';
 
 const BATCH_INTERVAL = 2_000;
 const BACKOFF = 30_000;
@@ -30,6 +30,7 @@ function routeRows(candidate: ScanCandidate, view: ChainArbView, now: number, ve
   const gasUsdt = view.dex.swapGasUsdt;
   const execution = view.dex.execution;
   if (!candidate.spot || view.deposit !== true || !isVerifiedExecution(execution) || gasUsdt == null || !Number.isFinite(gasUsdt) || gasUsdt < 0) return [];
+  if (execution.depositVenue !== undefined && !isDepositExecution(execution, venue)) return [];
   const rows: ScanRow[] = [];
   for (const kind of ['spot', 'perp'] as const) {
     if (!candidate[kind]) continue;
@@ -38,7 +39,7 @@ function routeRows(candidate: ScanCandidate, view: ChainArbView, now: number, ve
     if (![leg.coveredCostUsdt, leg.netUsdt, leg.netBps, leg.price, view.dex.price]
       .every(value => Number.isFinite(value) && value > 0)) continue;
     const at = Math.min(leg.at, view.dex.at, view.asOf);
-    const expiresAt = at + CHAIN_ARB_TTL_MS;
+    const expiresAt = Math.min(at + CHAIN_ARB_TTL_MS, execution.depositExpiresAt ?? Infinity);
     if (!Number.isFinite(expiresAt) || expiresAt <= now) continue;
     rows.push({ venue, chain: candidate.chain, symbol: candidate.symbol, address: candidate.address,
       kind, netBps: leg.netBps, netUsdt: leg.netUsdt, dexPrice: view.dex.price,
@@ -49,7 +50,7 @@ function routeRows(candidate: ScanCandidate, view: ChainArbView, now: number, ve
 
 function prune(profile: Profile, now: number) {
   for (const [key, sample] of profile.samples) {
-    sample.rows = sample.rows.filter(row => now - row.at < SCAN_HISTORY_MS);
+    sample.rows = sample.rows.filter(row => now - row.at < SCAN_HISTORY_MS && now < (row.execution?.depositExpiresAt ?? Infinity));
     if (!sample.rows.length || sample.cycle < profile.cycle - 1) profile.samples.delete(key);
   }
 }
@@ -93,7 +94,7 @@ export function createChainArbScanner({ catalog, quote, now = Date.now }: {
       // Reinsertion makes refreshes rotate from the least recently sampled opportunity.
       profile.samples.delete(key);
       if (rows.length) profile.samples.set(key, { candidate, cycle: profile.cycle, checkedAt: now(), rows });
-      failed = view.dex.swapGasUsdt == null || ((!candidate.spot || 'error' in view.spot) && (!candidate.perp || 'error' in view.perp));
+      failed = !view.screenedUnprofitable && (view.dex.swapGasUsdt == null || ((!candidate.spot || 'error' in view.spot) && (!candidate.perp || 'error' in view.perp)));
     } catch (error) {
       if (revision !== directoryRevision) return;
       if (rateLimited(error) && !signal.aborted) cooldownUntil = now() + BACKOFF;

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import type { ArbResult, ChainArbInput, ChainArbView } from '../../src/chain-arb/model.ts';
-import { CHAIN_ARB_MAX_IMPACT_BPS, isManualEstimate, VENUE_NAMES } from '../../src/chain-arb/model.ts';
-import { isVerifiedExecution } from '../../src/chain-arb/scan-model.ts';
+import { CHAIN_ARB_MAX_IMPACT_BPS, VENUE_NAMES } from '../../src/chain-arb/model.ts';
+import { isDepositExecution } from '../../src/chain-arb/scan-model.ts';
 import type { ShellView } from '../../src/shell-view.ts';
 import { api } from './api.ts';
 import { chainArbQuery, chainNames, initialChainArbForm, readTimedChainArb, type ChainArbForm } from './chain-arb-form.ts';
@@ -23,7 +23,7 @@ function RouteCard({ kind, result, input, gasMissing }: { kind: 'spot' | 'perp';
   return <section className="panel">
     <div className="section-head"><div>
       <h2>{spot ? '充值至 ' + venue + ' 卖出现货' : venue + ' 永续对冲后卖出现货'}</h2>
-      <p>{spot ? '按模拟转账实收量逐档卖入当前买盘，充值到账前价格可能变化。' : '买币时开空永续，充值到账后逐档卖出现货。假设基差收敛，以本次现货买一价平空。'}</p>
+      <p>{spot ? '按充值地址的模拟实收量逐档卖入当前买盘，充值到账前价格可能变化。' : '买币时开空永续，充值到账后逐档卖出现货。假设基差收敛，以本次现货买一价平空。'}</p>
     </div></div>
     <div className="panel-body">{'error' in result
       ? <Callout tone="warning">{result.error}</Callout>
@@ -71,13 +71,12 @@ function Quote({ query, onExpired }: { query: Query; onExpired: () => void }) {
   const autoGas = input.swapGas === 'auto';
   const gasMissing = autoGas && data.dex.swapGasUsdt == null;
   const venue = VENUE_NAMES[input.venue ?? 'gate'];
-  const verifiedExecution = isVerifiedExecution(execution);
-  const eligible = data.deposit === true && verifiedExecution && data.manualEstimateOnly !== true;
-  const manualEstimate = (input.venue ?? 'gate') === 'gate' && data.manualEstimateOnly === true && data.deposit === null && verifiedExecution;
-  const blockedReason = data.deposit !== true ? venue + ' 此网络充值' + gates(data.deposit) : '转账实收量或整笔价格冲击未通过核验';
+  const eligible = data.deposit === true && isDepositExecution(execution, input.venue ?? 'gate')
+    && data.expiresAt <= execution.depositExpiresAt && data.manualEstimateOnly !== true;
+  const received = eligible ? execution.transferQuantity : null;
+  const blockedReason = data.deposit === false ? venue + ' 此网络充值暂停' : venue + ' 实际充值地址的转账实收量尚未核实';
   function checked(result: ArbResult): ArbResult {
-    if (eligible || 'error' in result || (manualEstimate && isManualEstimate(result))) return result;
-    return { error: blockedReason };
+    return eligible || 'error' in result ? result : { error: blockedReason };
   }
   return <>
     <section className="panel">
@@ -88,15 +87,14 @@ function Quote({ query, onExpired }: { query: Query; onExpired: () => void }) {
         <dt>模拟买入实收</dt><dd>{numbers.format(execution.receivedQuantity)} {input.symbol}</dd>
         <dt>按实收的买入均价</dt><dd>{numbers.format(data.dex.price)} USDT</dd>
         <dt>整笔价格冲击</dt><dd>{numbers.format(execution.impactBps / 100)}%（上限 {CHAIN_ARB_MAX_IMPACT_BPS / 100}%）</dd>
-        <dt>模拟转账实收</dt><dd>{execution.transferQuantity === null ? '未核实' : numbers.format(execution.transferQuantity) + ' ' + input.symbol}</dd>
-        <dt>转账扣量</dt><dd>{execution.transferQuantity === null ? '未核实' : numbers.format(execution.receivedQuantity - execution.transferQuantity) + ' ' + input.symbol}</dd>
-        {autoGas ? <><dt>预计链上 Gas</dt><dd>{data.dex.swapGasUsdt == null ? '未取得' : numbers.format(data.dex.swapGasUsdt) + ' USDT'}</dd></> : null}
+        <dt>{venue} 充值地址模拟实收</dt><dd>{received === null ? '未核实' : numbers.format(received) + ' ' + input.symbol}</dd>
+        <dt>转账扣量</dt><dd>{received === null ? '未核实' : numbers.format(execution.receivedQuantity - received) + ' ' + input.symbol}</dd>
+        {autoGas ? <><dt>预计链上 Gas</dt><dd>{!eligible || data.dex.swapGasUsdt == null ? '未取得' : numbers.format(data.dex.swapGasUsdt) + ' USDT'}</dd></> : null}
         <dt>{venue} 网络状态</dt><dd>充值 {gates(data.deposit)} · 提现 {gates(data.withdraw)}</dd>
         <dt>模拟区块</dt><dd>{execution.blockNumber}</dd>
         <dt>链上报价时间</dt><dd>{clock(data.dex.at)} · 报价有效至 {clock(data.expiresAt)}</dd>
-      </dl><p className="muted">价格冲击按同一区块内，整笔买入相对 1% 预算买入时每 USDT 实收量的降幅计算。普通地址间的模拟转账反映代币扣量，交易所地址的实际到账量可能不同。</p></div>
+      </dl><p className="muted">价格冲击按同一区块内，整笔买入相对 1% 预算买入时每 USDT 实收量的降幅计算。充值地址模拟实收取该地址转账前后的代币余额差。实际入账以交易所确认为准。</p></div>
     </section>
-    {manualEstimate ? <Callout>仅供手工测算。Gate 账户在此网络的充值资格尚未核实。</Callout> : null}
     <div className="chain-arb-routes">
       <RouteCard kind="spot" result={checked(data.spot)} input={input} gasMissing={gasMissing} />
       <RouteCard kind="perp" result={checked(data.perp)} input={input} gasMissing={gasMissing} />
@@ -162,7 +160,7 @@ function SingleEstimate({ initial, scopeKey, assetEnabled, onExpired }: { initia
           {field('perpCosts', '永续路线其他成本（USDT）', autoGas ? '已估 Gas 以外的成本' : '链上 Gas 与其他成本合计')}
         </div>
         {autoGas ? <Callout>按本次路由的 Gas 单价估算授权、买入和转账费用。其他成本只填已估 Gas 以外的开销。</Callout> : null}
-        <p className="muted">费率按账户填写，1 bp = 0.01%。其他成本按整条路线填写，留空时仅显示毛差额，填 0 表示已确认没有其他成本。</p>
+        <p className="muted">费率按账户填写，1 bp = 0.01%。核实充值地址模拟实收后，其他成本留空时仅显示毛差额，填 0 表示已确认没有其他成本。</p>
         {error ? <Callout tone="error">{error}</Callout> : null}
         <div className="toolbar"><button className="button primary" type="submit">{query ? '刷新报价' : '查询报价'}</button>
           {query ? <small className="muted">每 10 秒刷新</small> : <small className="muted">提交后按当前参数查询</small>}

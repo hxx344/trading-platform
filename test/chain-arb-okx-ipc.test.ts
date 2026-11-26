@@ -11,7 +11,7 @@ import { withChainArbLedger } from '../src/service/chain-arb-ledger.ts';
 import { createNotifier } from '../src/service/feishu.ts';
 import { openMonitor, stopMonitor, closeMonitor } from '../src/service/monitor.ts';
 import { createRemoteMonitor } from '../src/service/remote-monitor.ts';
-import { chainArbFixture } from './chain-arb-fake.ts';
+import { chainArbFixture, TEST_DEPOSIT } from './chain-arb-fake.ts';
 import { band, book, network, okxTestNow, okxWallet, pair, perp, setupOkxPublic } from './chain-arb-okx-fake.ts';
 import { createHarness } from './harness.ts';
 
@@ -84,9 +84,12 @@ test('后台独立通过账本和行情 IPC 排序两条 OKX 路线，只有超�
   const notifier = createNotifier({ file: join(h.dir, 'notifications.sqlite'), events: () => [], latestSeq: () => 0,
     pairs: () => [], incidentPair: () => null, now, log: () => {}, feishu: { webhook: 'https://example.invalid/robot', secret: null },
     fetchImpl: async () => { throw new Error('本测试禁止联网'); } });
-  const ledger = { async okxScanDirectory() { reads++; if (!connected) throw new Error('OKX 连接已断开'); return fixture.state.wallet; },
+  const addressProof = { address: TEST_DEPOSIT, expiresAt: at + 60_000 };
+  const ledger = { okxDepositRecipient: async () => addressProof,
+    okxDepositRecipientCurrent: (dir: unknown, proof: unknown) => dir === fixture.state.wallet && proof === addressProof && connected && at < addressProof.expiresAt,
+    async okxScanDirectory() { reads++; if (!connected) throw new Error('OKX 连接已断开'); return fixture.state.wallet; },
     okxScanDirectoryCurrent: (value: unknown) => connected && value === fixture.state.wallet && at < fixture.state.wallet.expiresAt };
-  const runtime = openMonitor({ perpetual: {} }, h.dir, { now, marketClient: client, okxLedger: ledger, log: () => {},
+  const runtime = openMonitor({ perpetual: {} }, h.dir, { now, marketClient: client, chainArbFetch: other, okxLedger: ledger, log: () => {},
     alertHooks: { robot: () => 'feishuMonitor', notify: () => null, test: async () => {}, delivery: () => new Map(),
       notifyRepeating: (key, message) => {
         const value = notifier.notifyRepeating(key, message);
@@ -110,9 +113,9 @@ test('后台独立通过账本和行情 IPC 排序两条 OKX 路线，只有超�
     assert.equal(notifier.pending(), 1);
     const sent = notifier.status().recent[0]!.text;
     for (const expected of ['ARB', 'Arbitrum One', 'OKX 永续开空', '374.35 bp', '37.435 USDT']) assert.ok(sent.includes(expected), sent);
-    await assert.rejects(remote.scanChainArb(params, scope, signal, true), /链目录/);
+    await assert.rejects(remote.chainArbCatalog('okx', signal), /链目录/);
     const contaminated = { ...fixture.state.wallet, unrelated: 'test-field' };
-    await assert.rejects(remote.scanChainArb(params, scope, signal, true, contaminated), /链目录/);
+    await assert.rejects(remote.chainArbCatalog('okx', signal, contaminated), /链目录/);
     await assert.rejects(withChainArbLedger(remote, { ...ledger, okxScanDirectory: async () => contaminated }, now)
       .scanChainArb(params, scope, signal), /链目录/);
     connected = false;

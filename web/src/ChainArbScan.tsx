@@ -30,7 +30,7 @@ function ScanTable({ rows, history, review }: { rows: VerifiedScanRow[]; history
       <td><strong>{row.symbol}</strong><small>{chainNames[row.chain]}</small></td>
       <td>{VENUE_NAMES[row.venue ?? 'gate']}<small>{row.kind === 'spot' ? '充值卖出' : '永续对冲 · 基差收敛'}</small></td>
       <td className="num"><strong className={history ? undefined : 'ok'}>{signed.format(row.netBps)} bp</strong><small>{signed.format(row.netUsdt)} USDT</small></td>
-      <td className="num">价格冲击 {price.format(row.execution.impactBps / 100)}%<small>转账扣量 {price.format(row.execution.receivedQuantity - row.execution.transferQuantity)} {row.symbol}</small></td>
+      <td className="num">价格冲击 {price.format(row.execution.impactBps / 100)}%<small>充值地址模拟实收 {price.format(row.execution.transferQuantity)} {row.symbol}</small><small>转账扣量 {price.format(row.execution.receivedQuantity - row.execution.transferQuantity)} {row.symbol}</small></td>
       <td className="num">{price.format(row.dexPrice)} / {price.format(row.gatePrice)}</td>
       <td className="num">{price.format(row.gasUsdt)}</td><td className="num">{clock(row.at)}</td>
       <td><button className="button secondary" type="button" onClick={() => review(row)}>单币复核</button></td>
@@ -40,12 +40,14 @@ function ScanTable({ rows, history, review }: { rows: VerifiedScanRow[]; history
 
 export function LedgerConnectionHelp({ venues, assetEnabled }: { venues: ChainArbVenue[]; assetEnabled: boolean }) {
   const accounts = venues.filter(venue => venue === 'gate' || venue === 'okx').map(venue => VENUE_NAMES[venue]).join('、');
-  if (!accounts) return null;
+  const unsupported = venues.filter(venue => venue === 'binance' || venue === 'bitget').map(venue => VENUE_NAMES[venue]).join('、');
+  if (!accounts && !unsupported) return null;
   return <div className="toolbar">
-    <span className="muted">{assetEnabled ? '可在资产账本的「交易所连接」中管理 ' + accounts + ' 只读账户。'
-      : '请先在设置的「从工作台导入」中启用资产账本，再到资产页的「交易所连接」添加 ' + accounts + ' 只读账户。'}
-      {venues.includes('gate') && 'Gate 使用账本连接核对所选网络的充值资格和最低充值额，无法核实时不列入机会。查询时 Gate 可能生成该币种的充值地址。'}</span>
-    <a className="button secondary" href={assetEnabled ? '#/asset' : '#/settings'}>{assetEnabled ? '打开资产账本' : '打开设置'}</a>
+    <span className="muted">{accounts && (assetEnabled ? '使用资产账本的 ' + accounts + ' 只读连接查询当前充值地址。'
+      : '请先在设置的「从工作台导入」启用资产账本，再到资产页的「交易所连接」添加 ' + accounts + ' 只读账户。')}
+      {venues.includes('gate') && 'Gate 首次查询时可能生成该币种的充值地址。'}
+      {unsupported && unsupported + ' 暂未接入充值地址核验，跳过排名和飞书提醒。'}</span>
+    {accounts && <a className="button secondary" href={assetEnabled ? '#/asset' : '#/settings'}>{assetEnabled ? '打开资产账本' : '打开设置'}</a>}
   </div>;
 }
 
@@ -163,6 +165,7 @@ export function ChainArbScan({ assetEnabled, onReview, onExpired }: { assetEnabl
         <p>按整笔买入预算的预计净收益率排序。两条路线都要求该网络充值开放、现货买盘足额，永续对冲还须有足额合约买盘。</p></div></div>
       <div className="panel-body">
         {view.settings.enabled ? <ul className="chain-arb-progress" aria-label="各交易所扫描进度">{view.settings.venues.map(venue => {
+          if (venue === 'binance' || venue === 'bitget') return <li key={venue}><strong>{VENUE_NAMES[venue]}</strong> 暂无充值地址核验</li>;
           const progress = view.results[venue];
           return <li key={venue}><strong>{VENUE_NAMES[venue]}</strong> {progress
             ? <>{phases[progress.phase]} · 第 {progress.cycle} 轮 · 已检查 {progress.checked} / {progress.total} · 失败 {progress.failed}
@@ -170,11 +173,11 @@ export function ChainArbScan({ assetEnabled, onReview, onExpired }: { assetEnabl
         })}</ul> : null}
         {live.length ? <ScanTable rows={live} review={review} /> : <TableEmpty>
           {view.settings.enabled ? '暂无仍在有效期内、通过整笔模拟的正收益机会。' : '后台扫描已关闭。'}</TableEmpty>}
-        <p className="muted">整笔模拟的价格冲击上限为 {CHAIN_ARB_MAX_IMPACT_BPS / 100}%。收益按普通转账实收量估算，扣除链上 Gas、现货卖出费和路线额外成本。永续路线另扣开平仓费，按基差收敛测算，资金费另计。</p>
+        <p className="muted">整笔模拟的价格冲击上限为 {CHAIN_ARB_MAX_IMPACT_BPS / 100}%。净收益按交易所充值地址的模拟实收量估算，扣除链上 Gas、现货卖出费和路线额外成本。永续路线另扣开平仓费，按基差收敛测算，资金费另计。</p>
       </div>
     </section>
     <section className="panel">
-      <div className="section-head"><div><h2>最近采样</h2><p>近 5 分钟的历史行情，最多 {HISTORY_DISPLAY_LIMIT} 条。单币复核将重新询价。</p></div></div>
+      <div className="section-head"><div><h2>最近采样</h2><p>仅保留充值地址证明有效的最近采样，最多 {HISTORY_DISPLAY_LIMIT} 条。单币复核将重新询价。</p></div></div>
       {history.length ? <ScanTable rows={history} history review={review} /> : <TableEmpty>暂无历史采样。</TableEmpty>}
     </section>
   </>;

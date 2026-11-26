@@ -1,7 +1,7 @@
 // The workbench cycle replay (7745181) with database-backed raw trade and funding windows.
 import type { Position, PositionCycle } from './positions-types.ts';
 import type { Credentials } from './validation.ts';
-import { POSITIONS_INVALID } from './positions-values.ts';
+import { POSITIONS_INVALID, PositionsPermissionError } from './positions-values.ts';
 import { CYCLE_CURRENCY, CYCLE_LOOKBACK_MS, CYCLE_MISMATCH, cycleUnavailable, locateCycle, negate, newestFirst, summarizeCycle } from './positions-cycle.ts';
 import type { CycleCash, CycleFill } from './positions-cycle.ts';
 import { WEEK, SNAPSHOT_SKEW_MS, MAX_FILLS, TOO_MANY, CycleUnavailable, historyContext, latestOpenWindows, BINANCE_LATEST_WINDOW_MS, BYBIT_LATEST_WINDOW_MS, type HistoryOptions } from './positions-history.ts';
@@ -106,7 +106,7 @@ export async function readPositionCycle(credentials: Credentials, scope: string,
     if (credentials.exchange !== 'binance' && credentials.exchange !== 'bybit' && credentials.exchange !== 'okx') return cycleUnavailable('此交易所暂不支持统计本轮平仓', at());
     return await venueCycle(credentials, scope, request, options);
   } catch (error) {
-    if (error instanceof CycleRetry || options.signal?.aborted) throw error;
+    if (error instanceof PositionsPermissionError || error instanceof CycleRetry || options.signal?.aborted) throw error;
     const message = error instanceof Error ? error.message : '';
     return cycleUnavailable(error instanceof CycleUnavailable || message === CYCLE_MISMATCH || message === CYCLE_CURRENCY ? message
       : message === POSITIONS_INVALID ? '交易所成交数据格式无法识别，暂不统计本轮' : '本轮成交或资金费分页未完成，稍后重试', at());

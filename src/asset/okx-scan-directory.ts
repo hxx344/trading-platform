@@ -9,7 +9,8 @@ import { historyGeneration } from './history-cache.ts';
 import { revisionOf, type Unseal } from './positions-service.ts';
 import { PositionsPermissionError } from './positions-values.ts';
 import { parseConnection } from './validation.ts';
-import { readOkxCurrencies } from './sources/okx.ts';
+import { createOkxRecipients } from './okx-deposit-recipient.ts';
+import { readOkxCurrencies, readOkxDepositAddresses, type OkxCredential } from './sources/okx.ts';
 import { untilAborted } from './sources/shared-reads.ts';
 
 const UNAVAILABLE = 'OKX 币链目录不可用，请核对资产账本连接和只读权限';
@@ -17,6 +18,10 @@ const NETWORKS: ReadonlyMap<string, Chain> = new Map([
   ['ERC20', 'ethereum'], ['Ethereum', 'ethereum'], ['Arbitrum One', 'arbitrum'],
   ['BSC', 'bsc'], ['BEP20', 'bsc'], ['BNB Smart Chain', 'bsc'], ['Binance Smart Chain', 'bsc'],
 ]);
+function chainOf(label: string): Chain | undefined {
+  const split = label.lastIndexOf('-');
+  return split < 1 ? undefined : NETWORKS.get(label.slice(split + 1));
+}
 const ADDRESS = /^0x[\da-f]{40}$/i;
 const AMOUNT = /^(?:0|[1-9]\d{0,77})(?:\.\d{1,78})?$/;
 const zero = (value: unknown) => value === '' || (typeof value === 'string' && /^0+(?:\.0+)?$/.test(value));
@@ -29,13 +34,13 @@ function depositAllowed(row: Record<string, unknown>, minimum: string | undefine
     && ['tag', 'memo', 'pmtId', 'addrEx', 'depTag', 'depMemo'].every(key => !Object.hasOwn(row, key) || row[key] === '');
 }
 
-function networks(raw: unknown[]): OkxNetwork[] {
+function networks(raw: unknown[], names: WeakMap<OkxNetwork, string>): OkxNetwork[] {
   if (!raw.length || raw.length > 12_000) throw new Error(UNAVAILABLE);
   const bySymbol = new Map<string, OkxNetwork | null>(), addresses = new Set<string>(), conflicts = new Set<string>();
   for (const row of raw) {
     if (!isObject(row) || typeof row.ccy !== 'string' || !row.ccy || typeof row.chain !== 'string' || !row.chain) throw new Error(UNAVAILABLE);
     const split = row.chain.lastIndexOf('-');
-    const chain = split < 1 ? undefined : NETWORKS.get(row.chain.slice(split + 1));
+    const chain = chainOf(row.chain);
     if (!chain) continue;
     const symbol = row.ccy, chainSymbol = row.chain.slice(0, split), key = chain + ':' + symbol;
     const address = typeof row.ctAddr === 'string' && ADDRESS.test(row.ctAddr) ? row.ctAddr.toLowerCase() : undefined;
@@ -52,29 +57,34 @@ function networks(raw: unknown[]): OkxNetwork[] {
       continue;
     }
     const minimum = typeof row.minDep === 'string' && AMOUNT.test(row.minDep) ? row.minDep : undefined;
-    bySymbol.set(key, { symbol, chain, address, deposit: typeof row.canDep === 'boolean' ? row.canDep : null,
-      withdraw: typeof row.canWd === 'boolean' ? row.canWd : null, depositEligible: depositAllowed(row, minimum), minDeposit: minimum ?? '0' });
+    const network = { symbol, chain, address, deposit: typeof row.canDep === 'boolean' ? row.canDep : null,
+      withdraw: typeof row.canWd === 'boolean' ? row.canWd : null, depositEligible: depositAllowed(row, minimum), minDeposit: minimum ?? '0' };
+    names.set(network, row.chain);
+    bySymbol.set(key, network);
   }
   return [...bySymbol.values()].filter((row): row is OkxNetwork => !!row && !conflicts.has(row.chain + ':' + row.address));
 }
 
-type Connection = { database: AssetDb; importedAt: string; encrypted: string };
+type Connection = { database: AssetDb; importedAt: string; encrypted: string; keyFile: string };
+const sameConnection = (a: Connection, b: Connection) =>
+  a.database === b.database && a.encrypted === b.encrypted && a.importedAt === b.importedAt && a.keyFile === b.keyFile;
 type Job = { controller: AbortController; work: Promise<OkxDirectory>; waiters: number };
 type Scope = Connection & { id: string; stop: AbortController; permission: ReturnType<typeof historyGeneration>; latest?: OkxDirectory; job?: Job };
 
 export function createOkxScanDirectory(connection: () => Connection | null, unseal: Unseal, fetcher: typeof fetch, now: () => number) {
-  let scope: Scope | undefined, closed = false;
+  const networkNames = new WeakMap<OkxNetwork, string>();
+  let scope: Scope | undefined, closed = false, changedAt = 0;
   function reset() {
     const old = scope;
     scope = undefined;
-    old?.stop.abort();
+    if (old) { changedAt = Math.max(changedAt, now()); old.stop.abort(); }
   }
   function observed() {
     if (closed) return;
     let found: Connection | null;
     try { found = connection(); } catch { reset(); throw new Error(UNAVAILABLE); }
-    if (scope && (found?.database !== scope.database || found.encrypted !== scope.encrypted || found.importedAt !== scope.importedAt
-      || !scope.permission.current())) reset();
+    if (scope && (!found || !sameConnection(found, scope))) reset();
+    if (scope && !scope.permission.current()) { const old = scope; scope = undefined; old.stop.abort(); }
     if (!scope && found) {
       scope = { ...found, id: randomBytes(16).toString('hex'), stop: new AbortController(),
         permission: historyGeneration(() => found.database, 'okx', revisionOf(found.encrypted), now) };
@@ -99,13 +109,13 @@ export function createOkxScanDirectory(connection: () => Connection | null, unse
     const read = async () => {
       const c = parseConnection(unseal(saved.encrypted, 'okx'));
       if (c.exchange !== 'okx') throw new Error(UNAVAILABLE);
-      const value = await readOkxCurrencies(c, fetcher, { signal, now, deniedAt: saved.permission.deniedAt }, check).catch(error => {
+      const value = await readOkxCurrencies(c, fetcher, { signal, now, deniedAt: Math.max(changedAt, saved.permission.deniedAt) }, check).catch(error => {
         // A permission denial also revokes the ledger's position and fill evidence for this exact credential.
-        if (error instanceof PositionsPermissionError) { check(); saved.permission.deny(); }
+        if (error instanceof PositionsPermissionError) denyIfSame(saved);
         throw error;
       });
       check();
-      const directory = { connection: saved.id, at: value.at, expiresAt: value.at + OKX_DIRECTORY_TTL, rows: networks(value.rows) };
+      const directory = { connection: saved.id, at: value.at, expiresAt: value.at + OKX_DIRECTORY_TTL, rows: networks(value.rows, networkNames) };
       assertOkxDirectory(directory, now());
       for (const row of directory.rows) Object.freeze(row);
       Object.freeze(directory.rows);
@@ -114,7 +124,35 @@ export function createOkxScanDirectory(connection: () => Connection | null, unse
     };
     return { controller, work: untilAborted(read(), signal), waiters: 0 };
   }
+  const recipients = createOkxRecipients(now, current, networkNames, chainOf, async (dir, symbol, caller) => {
+    const saved = observed();
+    if (!saved || !current(dir)) throw new Error(UNAVAILABLE);
+    const signal = anySignal([caller, saved.stop.signal, saved.permission.signal]);
+    signal.throwIfAborted();
+    const c = parseConnection(unseal(saved.encrypted, 'okx'));
+    if (c.exchange !== 'okx') throw new Error(UNAVAILABLE);
+    try {
+      return await readOkxDepositAddresses(c, symbol, fetcher, { signal, now, deniedAt: Math.max(changedAt, saved.permission.deniedAt) });
+    } catch (error) {
+      if (error instanceof PositionsPermissionError) denyIfSame(saved);
+      throw error;
+    }
+  });
+  function denyIfSame(saved: Scope) {
+    const active = observed();
+    if (active && sameConnection(active, saved)) active.permission.deny();
+  }
   return {
+    ...recipients,
+    watchReconnect(candidate: OkxCredential) {
+      try {
+        const saved = observed();
+        if (!saved) return;
+        const c = parseConnection(unseal(saved.encrypted, 'okx'));
+        if (c.exchange !== 'okx' || c.apiKey !== candidate.apiKey || c.apiSecret !== candidate.apiSecret || c.passphrase !== candidate.passphrase) return;
+        return () => denyIfSame(saved);
+      } catch { return; }
+    },
     okxScanDirectoryCurrent: current,
     async okxScanDirectory(signal: AbortSignal): Promise<OkxDirectory> {
       try {

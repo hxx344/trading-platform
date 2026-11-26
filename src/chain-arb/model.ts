@@ -3,6 +3,7 @@ export const CHAIN_ARB_CLOCK_SKEW_MS = 2_000;
 export const CHAIN_ARB_MAX_IMPACT_BPS = 500;
 export type Chain = 'ethereum' | 'arbitrum' | 'bsc';
 export const VENUE_NAMES = { gate: 'Gate', binance: 'Binance', bitget: 'Bitget', okx: 'OKX' } as const;
+export type DepositVenue = 'gate' | 'okx';
 export type ChainArbVenue = keyof typeof VENUE_NAMES;
 export function isChainArbVenue(value: unknown): value is ChainArbVenue {
   return typeof value === 'string' && Object.hasOwn(VENUE_NAMES, value);
@@ -38,10 +39,11 @@ export function isManualEstimate(leg: ArbResult): boolean {
 }
 
 export interface ChainArbView {
+  screenedUnprofitable?: true;
   manualEstimateOnly?: true;
   asOf: number; expiresAt: number; dex: {
     quantity: number; price: number; at: number; swapGasUsdt: number | null;
-    execution?: { quotedQuantity: number; receivedQuantity: number; transferQuantity: number | null; transferAmount?: string | null; impactBps: number; blockNumber: string };
+    execution?: { depositVenue?: DepositVenue; depositExpiresAt?: number; quotedQuantity: number; receivedQuantity: number; transferQuantity: number | null; transferAmount?: string | null; impactBps: number; blockNumber: string };
   };
   deposit: boolean | null; withdraw: boolean | null; spot: ArbResult; perp: ArbResult;
 }

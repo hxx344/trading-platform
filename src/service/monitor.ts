@@ -119,12 +119,12 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
         quality: { ...perpetualQualityEnv(env, log ?? (line => process.stderr.write(`${line}\n`))), ...perpetualOptions?.quality } }) : null;
       const localChain = config.perpetual && !remote ? createChainArbMarket({ now, fetchImpl: chainArbFetch ?? fetchImpl }) : undefined;
       const source = remote ?? localChain;
-      const chain = config.perpetual && source ? withChainArbLedger(source, okxLedger, now, gateLedger) : undefined;
+      const chain = config.perpetual && source ? withChainArbLedger(source, okxLedger, now, gateLedger, chainArbFetch ?? fetchImpl) : undefined;
       const chainArbBackground = chain ? createChainArbBackground({ store, scan: chain.scanChainArb, okxResultCurrent: chain.okxResultCurrent,
-        gateResultCurrent: chain.gateResultCurrent, now,
+        gateResultCurrent: chain.gateResultCurrent, okxDepositResultCurrent: chain.okxDepositResultCurrent, now,
         control: () => control.view('perpetual'), hooks: alertHooks }) : undefined;
       return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, goldoil, hynix, exchanges, alerts, control, variational, perpetual, perpetualCache,
-        chainArb: chain?.chainArb, scanChainArb: chain?.scanChainArb, closeChainArb: localChain?.closeChainArb, chainArbBackground };
+        chainArb: chain?.chainArb, scanChainArb: chain?.scanChainArb, closeChainArb: () => { chain?.close(); localChain?.closeChainArb(); }, chainArbBackground };
     } catch (error) { perpetualCache?.close(); throw error; }
   } catch (error) { store.close(); throw error; }
 }

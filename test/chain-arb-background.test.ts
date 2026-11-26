@@ -21,7 +21,7 @@ import { createHarness } from './harness.ts';
 function quote(at: number, venue: ChainArbVenue, netBps: number): ScanView {
   const row: ScanRow = { venue, symbol: 'ARB', address: ARB_ADDRESS, chain: 'arbitrum', kind: 'spot', netUsdt: 20.45, netBps,
     at, expiresAt: at + 15_000, dexPrice: 0.1, gatePrice: 0.12, gasUsdt: 0.5,
-    execution: { receivedQuantity: 1000, transferQuantity: 1000, impactBps: 0, blockNumber: '0x123' } };
+    execution: { ...(venue === 'okx' || venue === 'gate' ? { depositVenue: venue, depositExpiresAt: at + 60_000 } : {}), transferAmount: '1000', receivedQuantity: 1000, transferQuantity: 1000, impactBps: 0, blockNumber: '0x123' } };
   return { asOf: at, phase: 'scanning', total: 1, cycle: 1, checked: 1, failed: 0, message: null, rows: [row], history: [] };
 }
 
@@ -29,49 +29,96 @@ test('无人打开页面时轮转场所并按各自费率询价，阈值严格�
   const store = createMonitorStore({ file: ':memory:' }); t.after(() => store.close());
   let at = 100_000, old = false, failed = true;
   const calls: [ChainArbVenue, string][] = [], notifications: string[] = [];
-  const service = createChainArbBackground({ store, gateResultCurrent: () => true, now: () => at, control: () => ({ enabled: true, revision: 0 }),
+  const service = createChainArbBackground({ store, gateResultCurrent: () => true, okxResultCurrent: () => true, okxDepositResultCurrent: () => true, now: () => at, control: () => ({ enabled: true, revision: 0 }),
     hooks: { robot: () => 'feishuMonitor', notifyRepeating: (_key, message) => { notifications.push(message); } },
     scan: async raw => {
       const { venue = 'gate', spotFeeBps } = raw as ScanInput;
       calls.push([venue, spotFeeBps]);
       if (venue === 'binance' && failed) throw new Error('行情暂不可用');
-      const snapshot = quote(at - (old ? 15_000 : 0), venue, venue === 'bitget' ? 101 : 100);
+      const snapshot = quote(at - (old ? 15_000 : 0), venue, venue === 'okx' ? 101 : 100);
       // The spot quote succeeded even though the other leg put the venue on a 429 cooldown.
-      if (venue === 'bitget') snapshot.phase = 'cooldown';
+      if (venue === 'okx') snapshot.phase = 'cooldown';
       return snapshot;
     } });
   await service.tick();
   assert.equal(calls.length, 0);
-  const settings = { ...DEFAULT_BACKGROUND_SETTINGS, enabled: true, fees: { bitget: { spotFeeBps: '7.00', perpFeeBps: '5' } } };
+  const settings = { ...DEFAULT_BACKGROUND_SETTINGS, enabled: true, venues: ['gate', 'binance', 'okx'], fees: { okx: { spotFeeBps: '7.00', perpFeeBps: '5' } } };
   const saved = service.update({ revision: 0, settings });
-  assert.equal(saved.settings.fees?.bitget?.spotFeeBps, '7');
+  assert.equal(saved.settings.fees?.okx?.spotFeeBps, '7');
   assert.equal(service.update({ revision: 0, settings }).revision, 1);
   assert.throws(() => service.update({ revision: 0, settings: { ...settings, amount: '400' } }), /其他页面/);
   assert.throws(() => parseBackgroundSettings({ ...settings, fees: { binance: { spotFeeBps: '5' } } }), /两条/);
   assert.throws(() => parseBackgroundSettings({ ...settings, venues: ['gate', 'gate'] }), /重复/);
   for (let i = 0; i < 3; i++) await service.tick();
-  assert.deepEqual(calls, [['gate', '10'], ['binance', '10'], ['bitget', '7']]);
+  assert.deepEqual(calls, [['gate', '10'], ['binance', '10'], ['okx', '7']]);
   assert.equal(service.view().results.binance?.phase, 'error');
-  assert.equal(service.view().results.bitget?.rows.length, 1);
+  assert.equal(service.view().results.okx?.rows.length, 1);
   assert.equal(notifications.length, 1);
   assert.match(notifications[0]!, /ARB.*Arbitrum One/s);
-  assert.match(notifications[0]!, /Bitget 现货充值卖出/);
+  assert.match(notifications[0]!, /OKX 现货充值卖出/);
   assert.match(notifications[0]!, /20.45 USDT/);
   assert.ok(notifications[0]!.includes(ARB_ADDRESS));
   at += 15_000;
-  assert.equal(service.view().results.bitget?.rows.length, 0);
-  assert.equal(service.view().results.bitget?.history.length, 1);
+  assert.equal(service.view().results.okx?.rows.length, 0);
+  assert.equal(service.view().results.okx?.history.length, 1);
   old = true; failed = false;
   for (let i = 0; i < 3; i++) await service.tick();
   assert.equal(notifications.length, 1);
   assert.equal(service.view().results.binance?.phase, 'scanning');
 });
 
+test('飞书排队和出站均要求该交易所实际充值地址的当前模拟，并逐条核对过期与重算结果', async t => {
+  const store = createMonitorStore({ file: ':memory:' }); t.after(() => store.close());
+  let at = 100_000, addressCurrent = true, sentRate = 150, snapshotAt = at;
+  const notifications: { key: string; text: string }[] = [];
+  const service = createChainArbBackground({ store, now: () => at, control: () => ({ enabled: true, revision: 0 }),
+    gateResultCurrent: () => addressCurrent, okxResultCurrent: () => true, okxDepositResultCurrent: () => addressCurrent,
+    hooks: { robot: () => 'feishuMonitor', notifyRepeating: (key, text) => { notifications.push({ key, text }); } },
+    scan: async raw => {
+      const { venue = 'gate' } = raw as ScanInput;
+      const snapshot = quote(snapshotAt, venue, sentRate), row = snapshot.rows[0]!;
+      row.expiresAt = snapshotAt + 4000; row.execution!.depositExpiresAt = row.expiresAt;
+      snapshot.rows.push({ ...row, execution: { ...row.execution!, depositVenue: undefined } },
+        { ...row, execution: { ...row.execution!, depositVenue: venue === 'gate' ? 'okx' : 'gate' } });
+      return snapshot;
+    } });
+  t.after(() => service.stop());
+  const settings = { ...DEFAULT_BACKGROUND_SETTINGS, enabled: true, venues: ['gate', 'binance', 'bitget', 'okx'] };
+  service.update({ revision: 0, settings });
+  for (const _ of settings.venues) await service.tick();
+  assert.equal(notifications.length, 2);
+  const [gate, okx] = notifications;
+  assert.match(gate!.key, /^chain-arb-deposit:gate:/);
+  assert.match(okx!.text, /OKX 充值地址模拟实收 1000 ARB/);
+  assert.match(okx!.text, /实际入账以交易所确认为准/);
+  assert.deepEqual(Object.values(service.view().results).map(snapshot => snapshot.rows.length), [1, 0, 0, 1]);
+  for (const { key, text } of notifications) {
+    let expiry: number | undefined;
+    assert.ok(service.notificationsCurrent(key, text, deadline => { expiry = deadline; }));
+    assert.equal(expiry, at + 4000);
+  }
+  assert.equal(service.notificationsCurrent(gate!.key.replace('chain-arb-deposit:', 'chain-arb:'), gate!.text), false);
+  assert.equal(service.notificationsCurrent(gate!.key, okx!.text), false);
+  addressCurrent = false;
+  assert.equal(service.notificationsCurrent(okx!.key, okx!.text), false);
+  assert.equal(service.view().results.okx?.rows.length, 0);
+  addressCurrent = true;
+  at += 500; snapshotAt = at; sentRate++;
+  await service.tick();
+  assert.equal(service.notificationsCurrent(gate!.key, gate!.text), false);
+  const revised = notifications.at(-1)!;
+  assert.ok(service.notificationsCurrent(revised.key, revised.text));
+  at += 4000;
+  assert.equal(service.notificationsCurrent(revised.key, revised.text), false);
+  service.update({ revision: 1, settings: { ...settings, thresholdBps: 200 } });
+  assert.equal(service.notificationsCurrent(okx!.key, okx!.text), false);
+});
+
 test('一个场所的批次被阻塞时，其他场所继续轮扫，慢场所最多占用一个在途批次', { timeout: 2_000 }, async t => {
   const store = createMonitorStore({ file: ':memory:' }); t.after(() => store.close());
   const calls: ChainArbVenue[] = [], notifications: string[] = [];
   let ticks = 0, gateCancelled = false;
-  const service = createChainArbBackground({ store, gateResultCurrent: () => true, now: () => 100_000, control: () => ({ enabled: true, revision: 0 }),
+  const service = createChainArbBackground({ store, gateResultCurrent: () => true, okxResultCurrent: () => true, okxDepositResultCurrent: () => true, now: () => 100_000, control: () => ({ enabled: true, revision: 0 }),
     hooks: { robot: () => 'feishuMonitor', notifyRepeating: (_key, text) => { notifications.push(text); } },
     scan: async (raw, _scope, signal, awaitBatch) => {
       assert.equal(awaitBatch, true);
@@ -81,11 +128,11 @@ test('一个场所的批次被阻塞时，其他场所继续轮扫，慢场所�
       return quote(100_000, venue, 150);
     } });
   t.after(() => service.stop());
-  service.update({ revision: 0, settings: { ...DEFAULT_BACKGROUND_SETTINGS, enabled: true, venues: ['gate', 'bitget'] } });
+  service.update({ revision: 0, settings: { ...DEFAULT_BACKGROUND_SETTINGS, enabled: true, venues: ['gate', 'okx'] } });
   await service.loop({ stopped: () => ticks >= 4, pause: async () => { ticks++; await sleep(1); } });
-  assert.deepEqual(calls, ['gate', 'bitget', 'bitget']);
+  assert.deepEqual(calls, ['gate', 'okx', 'okx']);
   assert.ok(gateCancelled);
-  assert.ok(notifications.length > 0 && notifications.every(text => text.includes('Bitget')));
+  assert.ok(notifications.length > 0 && notifications.every(text => text.includes('OKX')));
 });
 
 test('更改设置、关闭行情或服务停止时，在途旧数据不会恢复榜单或发送；发件箱恢复后仅重试有效报价', async t => {
@@ -130,7 +177,7 @@ test('登录 HTTP 保存后，无页面读取时服务循环仍经行情 IPC 推
   let notifier = createNotifier(outboxOptions);
   const market = createMarketServer({ monitor: createMonitorData({ now, fetchImpl: chainArbFixture(now) }) }, 'test');
   const client = createMarketClient(socket);
-  const open = () => openMonitor({ perpetual: {} }, h.dir, { now, marketClient: client, gateLedger: testGateLedger(now), log: () => {},
+  const open = () => openMonitor({ perpetual: {} }, h.dir, { now, marketClient: client, chainArbFetch: chainArbFixture(now), gateLedger: testGateLedger(now), log: () => {},
     alertHooks: { robot: () => 'feishuMonitor', notify: () => null, test: async () => {}, delivery: () => new Map(),
       notifyRepeating: (key, text) => notifier.notifyRepeating(key, text) } });
   let runtime = open();

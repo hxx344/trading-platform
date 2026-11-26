@@ -138,3 +138,91 @@ test('超长响应或取消会关闭读取，网络异常只显示来源', async
   controller.abort('private trace');
   await assert.rejects(pending, { message: '链上报价请求已中止' });
 });
+
+const depositA = '0x' + 'ab'.repeat(20), depositB = '0x' + 'cd'.repeat(20);
+const settlementBudget = { chain: 'arbitrum', address: ARB_ADDRESS, amount: '1000' } as const;
+function accountSimulation({ revert = false, reorg = false, thin = false } = {}) {
+  let at = 1_795_690_821_000;
+  const upstream = chainArbFixture(() => at);
+  const requests: { url: string; body: string }[] = [];
+  const deposits: string[] = [], steps: string[] = [];
+  const fetcher = async (url: string, init: RequestInit) => {
+    const body = String(init.body ?? '');
+    requests.push({ url, body });
+    const response = await upstream(url, init);
+    if (thin && new URL(url).searchParams.get('amountIn') === '1000000000') {
+      const route = await response.json() as { data: { routeSummary: { amountOut: string } } };
+      route.data.routeSummary.amountOut = (9_000n * 10n ** 18n).toString();
+      return Response.json(route);
+    }
+    if (url !== 'https://arb1.arbitrum.io/rpc') return response;
+    const { method, params } = JSON.parse(body);
+    assert.ok(method === 'eth_call' || method === 'eth_simulateV1');
+    if (method === 'eth_call') return response;
+    const calls = params[0].blockStateCalls[0].calls;
+    if (calls.length === 6) { steps.push('buy'); return response; }
+    assert.equal(params[1], '0x123'); assert.equal(calls.length, 10);
+    const address = '0x' + calls[7].data.slice(34, 74);
+    const argument = address.slice(2).padStart(64, '0');
+    assert.equal(calls[6].to, ARB_ADDRESS); assert.equal(calls[8].to, ARB_ADDRESS);
+    assert.equal(calls[6].data, '0x70a08231' + argument); assert.equal(calls[8].data, calls[6].data);
+    assert.equal(calls[7].to, ARB_ADDRESS); assert.equal(calls[7].data.slice(0, 74), '0xa9059cbb' + argument);
+    deposits.push(address); steps.push('transfer');
+    const bought = BigInt('0x' + calls[7].data.slice(74));
+    const result = await response.json() as { result: { parentHash: string; calls: { status: string; gasUsed: string; returnData: string }[] }[] };
+    const receipts = result.result[0].calls;
+    const base = 50_000n * 10n ** 18n;
+    receipts[6].returnData = '0x' + base.toString(16).padStart(64, '0');
+    receipts[8].returnData = '0x' + (base + bought * (address === depositA ? 100n : 79n) / 100n).toString(16).padStart(64, '0');
+    receipts[7].gasUsed = address === depositA ? '0x2' : '0x5';
+    if (revert) receipts[7].status = '0x0';
+    if (reorg) result.result[0].parentHash = '0x' + 'ef'.repeat(32);
+    return Response.json(result);
+  };
+  return { deposits, steps, requests, expire: () => { at += 15_000; }, read: (resolver: NonNullable<Parameters<typeof readVerifiedDex>[5]>) =>
+    readVerifiedDex(settlementBudget, signal, fetcher, () => at, undefined, resolver) };
+}
+
+test('实际地址只进入固定 RPC 的只读重放，两家地址余额增量与转账 Gas 可不同', async () => {
+  for (const [address, expected, gas] of [[depositA, 10_000n, 0.6], [depositB, 7_900n, 0.9]] as const) {
+    const f = accountSimulation();
+    const result = await f.read(async proof => {
+      assert.deepEqual(proof, { rawQuantity: String(10_000n * 10n ** 18n), decimals: 18, impactBps: 0 });
+      f.steps.push('address'); return address;
+    });
+    assert.deepEqual(f.steps, ['buy', 'buy', 'address', 'transfer']);
+    assert.deepEqual(f.deposits, [address]);
+    assert.equal(result.evidence?.transferRaw, String(expected * 10n ** 18n));
+    assert.ok(Math.abs(result.swapGasUsdt! - gas) < 1e-10);
+    assert.ok(!JSON.stringify(result).includes(address.slice(2)));
+    const mentions = f.requests.filter(r => (r.url + r.body).includes(address.slice(2)));
+    assert.equal(mentions.length, 1); assert.equal(mentions[0].url, 'https://arb1.arbitrum.io/rpc');
+    assert.equal(JSON.parse(mentions[0].body).method, 'eth_simulateV1');
+    assert.equal(f.requests.filter(r => r.url.endsWith('/route/build')).length, 2);
+    for (const request of f.requests.filter(r => r.url === 'https://arb1.arbitrum.io/rpc'))
+      assert.ok(['eth_call', 'eth_simulateV1'].includes(JSON.parse(request.body).method));
+  }
+});
+
+test('无法核实实际地址、超过冲击限制或限期内未完成，不会回退普通地址', async () => {
+  for (const address of [undefined, 'malformed', ARB_ADDRESS, sourceRoute.tokenIn, '0x' + '0'.repeat(40),
+    '0xfa89a63ff8bf31ab1d9136f39150ef414a4d9ca1', '0x405addf30a92554095055aaf8cb7b89ef3553038', '0x6131b5fae19ea4f9d964eac0408e4408b66337b5']) {
+    const f = accountSimulation(), result = await f.read(async () => address);
+    assert.deepEqual(f.deposits, []); assert.equal(result.evidence?.transferRaw, null); assert.equal(result.swapGasUsdt, null);
+  }
+  const denied = accountSimulation();
+  const result = await denied.read(async () => { throw new Error(depositA); });
+  assert.deepEqual(denied.deposits, []); assert.equal(result.evidence?.transferRaw, null); assert.ok(!JSON.stringify(result).includes(depositA));
+  const thin = accountSimulation({ thin: true });
+  let reads = 0;
+  const high = await thin.read(async () => { reads++; return depositB; });
+  assert.equal(reads, 0); assert.equal(high.evidence?.impactBps, 1000); assert.equal(high.evidence.transferRaw, null);
+  assert.deepEqual(thin.deposits, []);
+  const slow = accountSimulation();
+  await assert.rejects(slow.read(async () => { slow.expire(); return depositB; }), /过期/);
+  assert.deepEqual(slow.deposits, []);
+  for (const issue of [{ revert: true }, { reorg: true }]) {
+    const f = accountSimulation(issue), view = await f.read(async () => depositA);
+    assert.deepEqual(f.deposits, [depositA]); assert.equal(view.evidence?.transferRaw, null); assert.equal(view.swapGasUsdt, null);
+  }
+});

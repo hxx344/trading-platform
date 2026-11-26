@@ -338,10 +338,17 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   try { locks = await holdAccountLocks(writable.map(accountId => ({ venue: 'aster', accountId }))); }
   catch (error) { executor.close(); store.close(); releaseOil(); throw error; }
 
+  let monitor: MonitorRuntime | null = null, monitorError: string | null = null;
+  const chainArbNotificationExpiry = (key: string, text: string): number | null => {
+    let deadline: number | null = null;
+    const current = monitor?.chainArbBackground?.notificationsCurrent(key, text, expires => { deadline = expires; });
+    return current ? deadline : null;
+  };
   let notifier: Notifier;
   try {
     notifier = createNotifier({
       file: join(dir, 'notify.sqlite'), feishu: secrets.feishu, ...(notifyFetch ? { fetchImpl: notifyFetch } : {}),
+      chainArbNotificationExpiry: secrets.feishuMonitor ? undefined : chainArbNotificationExpiry,
       events: (after, limit) => store.db.prepare('SELECT seq, type, at, json, job_id AS jobId FROM events WHERE seq > ? ORDER BY seq LIMIT ?').all(after, limit) as unknown as EventRow[],
       latestSeq: () => (store.db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events').get() as { seq: number }).seq,
       pairs: () => executor.transferPairs().map(pair => ({ id: pair.id, enabled: pair.enabled, blocked: pair.blocked, note: pair.note, noteIdle: pair.noteIdle, balances: pair.balances, balancesFresh: pair.balancesFresh, threshold: pair.config.threshold })),
@@ -383,7 +390,6 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   try { samples = createBalanceSamples({ file: join(dir, 'samples.sqlite') }); }
   catch (error) { samplesError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`余额采样库无法打开，走势图不可用：${samplesError}\n`); }
   // The same for the monitor: without its file the monitor page is left out, nothing else.
-  let monitor: MonitorRuntime | null = null, monitorError: string | null = null;
   // M-3b: with secrets.json `feishuMonitor` the market alerts have a robot and an outbox of their own (notify-monitor.sqlite,
   // no event log behind it); without it they queue with the ASTER messages in notify.sqlite (M-3a). The file is opened while
   // it exists even after the robot is removed, so the panel still reads the delivery of what was queued there.
@@ -391,6 +397,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   if (config.monitor && (secrets.feishuMonitor || existsSync(join(dir, MONITOR_OUTBOX_FILE)))) {
     try {
       monitorOutbox = createNotifier({ file: join(dir, MONITOR_OUTBOX_FILE), feishu: secrets.feishuMonitor ?? null, ...(notifyFetch ? { fetchImpl: notifyFetch } : {}),
+        chainArbNotificationExpiry,
         events: () => [], latestSeq: () => 0, pairs: () => [], incidentPair: () => null });
     } catch (error) { monitorOutboxError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`行情告警的出站队列（${MONITOR_OUTBOX_FILE}）无法打开，行情告警暂停入队：${monitorOutboxError}\n`); }
   }

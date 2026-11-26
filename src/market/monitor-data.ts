@@ -75,22 +75,17 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
   }
   async function read(op: string, input: unknown, signal: AbortSignal): Promise<unknown> {
     switch (op) {
-      case 'monitor.perpetual.verifiedOkxChainArb':
-      case 'monitor.perpetual.verifiedOkxChainArbScan': {
-        const single = op === 'monitor.perpetual.verifiedOkxChainArb';
-        const { params, directory, scope, awaitBatch } = fields(input, single ? ['params', 'directory'] : ['params', 'directory', 'scope', 'awaitBatch']);
-        if (!isObject(params) || params.venue !== 'okx') throw new Error('OKX 行情参数无效');
-        assertOkxDirectory(directory, now());
-        if (single) return chain.chainArb(params, signal, directory);
-        if (typeof scope !== 'string' || !/^[a-f0-9]{24}:\d{1,16}$/.test(scope) || typeof awaitBatch !== 'boolean') throw new Error('OKX 扫描代次无效');
-        return chain.scanChainArb(params, scope, signal, awaitBatch, directory);
-      }
-      case 'monitor.perpetual.verifiedChainArb': return chain.chainArb(input, signal);
-      case 'monitor.perpetual.verifiedChainArbScan':
-      case 'monitor.perpetual.verifiedChainArbBatch': {
-        const { params, scope } = fields(input, ['params', 'scope']);
-        if (typeof scope !== 'string' || !/^[a-f0-9]{24}:\d{1,16}$/.test(scope)) throw new Error('行情扫描代次无效');
-        return chain.scanChainArb(params, scope, signal, op === 'monitor.perpetual.verifiedChainArbBatch');
+      case 'monitor.perpetual.depositCatalog':
+      case 'monitor.perpetual.depositBook': {
+        const catalog = op === 'monitor.perpetual.depositCatalog';
+        const { venue, directory, params, scanning } = fields(input, catalog ? ['venue', 'directory'] : ['venue', 'directory', 'params', 'scanning']);
+        if (venue !== 'gate' && venue !== 'okx') throw new Error('交易所不支持实际充值地址核验');
+        if (venue === 'okx') assertOkxDirectory(directory, now());
+        else if (directory !== null) throw new Error('Gate 行情无需账户目录');
+        const wallet = venue === 'okx' ? directory as import('../chain-arb/okx-network.ts').OkxDirectory : undefined;
+        if (catalog) return chain.chainArbCatalog(venue, signal, wallet);
+        if (typeof scanning !== 'boolean' || !isObject(params) || (params.venue ?? 'gate') !== venue) throw new Error('行情交易所不一致');
+        return chain.chainArbBook(params, signal, wallet, scanning);
       }
       case 'monitor.anthropic.ANTUSDT.quote': none(input); return readers.anthropicQuote(signal);
       case 'monitor.anthropic.quote': {

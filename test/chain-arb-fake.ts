@@ -1,9 +1,11 @@
 // Deterministic public endpoints for the monitor preview and the market-process integration check.
 import type { GateDepositSource } from '../src/chain-arb/gate-deposit-proof.ts';
 export const ARB_ADDRESS = '0x912ce59144191c1204e64559fe8253a0e49e6548';
+export const TEST_DEPOSIT = '0x1111111111111111111111111111111111111111';
 export const testGateLedger = (now = Date.now): GateDepositSource => ({
   async gateDepositProof(symbol, chain) { return { symbol, chain, at: now(), expiresAt: now() + 60_000, minDeposit: '0.1' }; },
   gateDepositCurrent: proof => proof.expiresAt > now(),
+  gateDepositRecipient: proof => proof.expiresAt > now() ? TEST_DEPOSIT : undefined,
 });
 export function verifiedBuy<T extends { rawQuantity: string }>(buy: T) {
   return { ...buy, evidence: { quotedRaw: buy.rawQuantity, transferRaw: buy.rawQuantity, impactBps: 0, blockNumber: '0x123' } };

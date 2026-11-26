@@ -4,6 +4,7 @@ import { okxAuthHeaders } from '../../vendor/okx.mjs';
 import { readJsonResponse } from '../../vendor/response.mjs';
 import type { Balance } from '../types.ts';
 import { PositionsPermissionError } from '../positions-values.ts';
+import { isGateBaseSymbol } from '../../chain-arb/model.ts';
 import { OKX_DIRECTORY_TTL } from '../../chain-arb/okx-network.ts';
 
 export type OkxCredential = { apiKey: string; apiSecret: string; passphrase: string };
@@ -13,6 +14,13 @@ type Fetcher = typeof fetch;
 const CONFIG_PATH = '/api/v5/account/config';
 const VALUATION_PATH = '/api/v5/asset/asset-valuation';
 const CURRENCIES_PATH = '/api/v5/asset/currencies';
+const DEPOSIT_ADDRESS_PATH = '/api/v5/asset/deposit-address';
+const AUTH_DENIED = new Set(['50100', '50101', '50105', '50110', '50111', '50113', '50114', '50119', '50120', '50121']);
+export function okxAccessDenied(status: number, code?: unknown) {
+  return status === 401 || status === 403 || (typeof code === 'string' && AUTH_DENIED.has(code));
+}
+
+export class OkxReadThrottle extends Error {}
 const READ_PATHS = new Set([CONFIG_PATH, VALUATION_PATH]);
 const ACCOUNT_NAMES = {
   funding: '资金账户（USD 估值）',
@@ -40,7 +48,7 @@ function singleAccount(data: unknown[]): Json {
   return data[0];
 }
 
-type ScanRead = { signal: AbortSignal; now: () => number; deniedAt: number };
+type ScanRead = { signal: AbortSignal; now: () => number; deniedAt: number; requireDate?: boolean };
 async function requestOkx(c: OkxCredential, requestPath: string, fetcher: Fetcher, scan?: ScanRead) {
   if ([c?.apiKey, c?.apiSecret, c?.passphrase].some(value => typeof value !== 'string' || !value.trim())) throw new Error('OKX API Key、Secret 与 Passphrase 不能为空');
   const now = scan?.now ?? Date.now, start = now();
@@ -58,23 +66,12 @@ async function requestOkx(c: OkxCredential, requestPath: string, fetcher: Fetche
     // Transport errors can contain authenticated request details; never relay them.
     throw new Error(READ_FAILED);
   }
-  if (response.redirected || !response.ok || (scan && (response.status !== 200 || response.headers.has('content-range')))) {
+  if (response.redirected || (response.status !== 200 && response.status !== 400) || (scan && response.headers.has('content-range'))) {
     void response.body?.cancel().catch(() => {});
-    const status = Number.isInteger(response.status) && response.status >= 100 && response.status <= 599 ? `（HTTP ${response.status}）` : '';
-    throw new Error(`OKX 读取失败${status}，请检查网络、API 权限及服务器时间；已保留上次数据`);
-  }
-  let at = start;
-  if (scan) {
-    const age = response.headers.get('age') ?? '0', date = response.headers.get('date');
-    const dateAt = date === null ? start : Date.parse(date);
-    at = Math.min(start - Number(age) * 1000, dateAt);
-    // Age is expressed in whole seconds. Even Age: 0 can describe a response from just before a denial.
-    const earliest = Math.min(dateAt, start - Number(age) * 1000 - (response.headers.has('age') ? 999 : 0));
-    if (!/^\d+$/.test(age) || !Number.isSafeInteger(at) || at <= 0 || (scan.deniedAt > 0 && earliest <= scan.deniedAt)
-      || dateAt > now() + 2000 || now() - at >= OKX_DIRECTORY_TTL) {
-      void response.body?.cancel().catch(() => {});
-      throw new Error(READ_FAILED);
-    }
+    const message = `OKX 读取失败（HTTP ${response.status}），请检查网络、API 权限及服务器时间；已保留上次数据`;
+    if (!response.redirected && okxAccessDenied(response.status)) throw new PositionsPermissionError(message);
+    if (!response.redirected && response.status === 429) throw new OkxReadThrottle(message);
+    throw new Error(message);
   }
   let data: unknown;
   try { data = await readJsonResponse(response, { maxBytes: MAX_BODY_BYTES, signal }); }
@@ -82,7 +79,24 @@ async function requestOkx(c: OkxCredential, requestPath: string, fetcher: Fetche
   if (!isObject(data)) throw new Error(INCOMPLETE);
   if (data.code !== '0') {
     const code = typeof data.code === 'string' && /^\d{1,10}$/.test(data.code) ? data.code : '未知代码';
-    throw new Error(`OKX 读取失败（${code}），请检查 API 权限、IP 白名单及服务器时间；已保留上次数据`);
+    const message = `OKX 读取失败（${code}），请检查 API 权限、IP 白名单及服务器时间；已保留上次数据`;
+    if (okxAccessDenied(response.status, code)) throw new PositionsPermissionError(message);
+    if (code === '50011') throw new OkxReadThrottle(message);
+    throw new Error(message);
+  }
+  if (response.status !== 200) throw new Error(READ_FAILED);
+  let at = start;
+  if (scan) {
+    const age = response.headers.get('age') ?? '0', date = response.headers.get('date');
+    const dateAt = date === null ? start : Date.parse(date);
+    at = Math.min(start - Number(age) * 1000, dateAt);
+    // Age is expressed in whole seconds. Even Age: 0 can describe a response from just before a denial.
+    const earliest = Math.min(dateAt, start - Number(age) * 1000 - (response.headers.has('age') ? 999 : 0));
+    if (scan.requireDate) at = earliest;
+    if ((scan.requireDate && date === null) || !/^\d+$/.test(age) || !Number.isSafeInteger(at) || at <= 0
+      || (scan.deniedAt > 0 && earliest <= scan.deniedAt) || now() < start || dateAt > now() + 2000 || now() - at >= OKX_DIRECTORY_TTL) {
+      throw new Error(READ_FAILED);
+    }
   }
   if (!Array.isArray(data.data)) throw new Error(INCOMPLETE);
   return { rows: data.data as unknown[], at };
@@ -105,6 +119,11 @@ export async function readOkxCurrencies(c: OkxCredential, fetcher: Fetcher, scan
   assertReadOnly(config.rows);
   const currencies = await requestOkx(c, CURRENCIES_PATH, fetcher, scan);
   return { rows: currencies.rows, at: Math.min(config.at, currencies.at) };
+}
+
+export async function readOkxDepositAddresses(c: OkxCredential, symbol: string, fetcher: Fetcher, scan: ScanRead) {
+  if (!isGateBaseSymbol(symbol)) throw new Error(READ_FAILED);
+  return requestOkx(c, DEPOSIT_ADDRESS_PATH + '?ccy=' + encodeURIComponent(symbol), fetcher, { ...scan, requireDate: true });
 }
 
 export async function syncOkx(c: OkxCredential, fetcher: Fetcher = fetch): Promise<{ total: number; details: Balance[]; updatedAt: string }> {

@@ -7,7 +7,10 @@ export interface OkxNetwork {
   deposit: boolean | null; withdraw: boolean | null; depositEligible: boolean; minDeposit: string;
 }
 export interface OkxDirectory { connection: string; at: number; expiresAt: number; rows: OkxNetwork[] }
+export interface OkxRecipient { readonly address: string; readonly expiresAt: number }
 export interface OkxDirectorySource {
+  okxDepositRecipient?(directory: OkxDirectory, symbol: string, chain: Chain, contract: string, signal: AbortSignal): Promise<OkxRecipient>;
+  okxDepositRecipientCurrent?(directory: OkxDirectory, recipient: OkxRecipient): boolean;
   okxScanDirectory(signal: AbortSignal): Promise<OkxDirectory>;
   okxScanDirectoryCurrent(directory: OkxDirectory): boolean;
 }

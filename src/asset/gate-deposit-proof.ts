@@ -47,13 +47,13 @@ export function createGateDepositSource(connection: () => Connection | null, uns
     const time = now();
     return !!value && value.at <= time && time < value.expiresAt;
   }
-  function current(proof: GateDepositProof) {
+  function recipient(proof: GateDepositProof): string | undefined {
     try {
       const entry = observed()?.entries.get(proof.symbol);
-      if (!entry?.latest) return false;
-      if (!fresh(entry.latest)) { delete entry.latest; return false; }
-      return entry.latest.rows.get(proof.chain) === proof;
-    } catch { return false; }
+      if (!entry?.latest) return;
+      if (!fresh(entry.latest)) { delete entry.latest; return; }
+      if (entry.latest.rows.get(proof.chain) === proof) return entry.latest.recipients.get(proof);
+    } catch { return; }
   }
   function start(saved: Scope, symbol: string, entry: Entry) {
     const started = now();
@@ -96,7 +96,8 @@ export function createGateDepositSource(connection: () => Connection | null, uns
     return { controller, work, waiters: 0 };
   }
   return {
-    gateDepositCurrent: current,
+    gateDepositRecipient: recipient,
+    gateDepositCurrent: proof => !!recipient(proof),
     watchReconnect(candidate) {
       try {
         const saved = observed();
@@ -132,7 +133,7 @@ export function createGateDepositSource(connection: () => Connection | null, uns
         }
         signal.throwIfAborted();
         const proof = value.rows.get(chain);
-        if (!proof || !current(proof)) throw invalid();
+        if (!proof || !recipient(proof)) throw invalid();
         return proof;
       } catch { throw invalid(); }
     },

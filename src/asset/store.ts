@@ -205,22 +205,19 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
   let handle: AssetDb | null = null, opened = '', writable = false, busy = false;
   /** The read-only connection the read answers come from (snapshot() below); opened after `handle`, closed with it. */
   let reader: AssetDb | null = null;
+  const keyFile = join(dirname(file), CREDENTIAL_KEY_FILE);
   function savedConnection(exchange: 'gate' | 'okx') {
     if (!attach()) return null;
     const database = handle!;
     return database.snapshot(snapshot => {
       const info = importInfo(snapshot), row = info && connectionRow(snapshot, exchange);
-      return info && row ? { database, importedAt: info.importedAt, encrypted: row.encrypted } : null;
+      if (!info || !row) return null;
+      const key = lstatSync(keyFile, { bigint: true });
+      return key.isFile() ? { database, importedAt: info.importedAt, encrypted: row.encrypted, keyFile: `${key.dev}:${key.ino}:${key.ctimeNs}` } : null;
     });
   }
   const okxDirectory = createOkxScanDirectory(() => savedConnection('okx'), vault.unseal, fetcher, now);
-  const keyFile = join(dirname(file), CREDENTIAL_KEY_FILE);
-  const gateDeposits = createGateDepositSource(() => {
-    const saved = savedConnection('gate');
-    if (!saved) return null;
-    const key = lstatSync(keyFile, { bigint: true });
-    return key.isFile() ? { ...saved, keyFile: `${key.dev}:${key.ino}:${key.ctimeNs}` } : null;
-  }, vault.unseal, fetcher, now);
+  const gateDeposits = createGateDepositSource(() => savedConnection('gate'), vault.unseal, fetcher, now);
   const dropReader = () => { const open = reader; reader = null; open?.close(); };
   /** Which file is at the path: a file deleted and imported again is a new one, and the open handle would keep reading the deleted one. */
   const identity = (): string | null => {
@@ -341,6 +338,9 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     cashFlows,
     okxScanDirectory: okxDirectory.okxScanDirectory,
     okxScanDirectoryCurrent: okxDirectory.okxScanDirectoryCurrent,
+    okxDepositRecipient: okxDirectory.okxDepositRecipient,
+    okxDepositRecipientCurrent: okxDirectory.okxDepositRecipientCurrent,
+    gateDepositRecipient: gateDeposits.gateDepositRecipient,
     gateDepositProof: gateDeposits.gateDepositProof,
     gateDepositCurrent: gateDeposits.gateDepositCurrent,
     async period(id) {
@@ -369,7 +369,8 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     async connect(body) {
       const input = parseConnection(body);
       await locked(async (database, lease) => {
-        const deny = input.exchange === 'gate' ? gateDeposits.watchReconnect(input) : undefined;
+        const deny = input.exchange === 'gate' ? gateDeposits.watchReconnect(input)
+          : input.exchange === 'okx' ? okxDirectory.watchReconnect(input) : undefined;
         try { await sync.connect(context(database, lease), input); }
         catch (error) { if (error instanceof PositionsPermissionError) deny?.(); throw error; }
       });

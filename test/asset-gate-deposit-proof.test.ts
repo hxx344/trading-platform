@@ -15,10 +15,10 @@ import { OWNER, writeWorkbenchLedger } from './asset-fixture.ts';
 const NOW = Date.parse('2026-11-10T04:00:00Z');
 const gate = { exchange: 'gate', apiKey: 'test-gate-deposit-key', apiSecret: 'test-gate-deposit-secret' };
 const FEE = '/api/v4/wallet/withdraw_status', ADDRESS = '/api/v4/wallet/deposit_address';
-const account = '0x' + 'abcde'.repeat(8), privateText = 'confidential-account-and-signature';
+const ethAccount = '0x' + '1'.repeat(40), account = '0x' + 'abcde'.repeat(8), privateText = 'confidential-account-and-signature';
 const network = { chain: 'ARBEVM', address: account, payment_name: '', payment_id: '', obtain_failed: 0 };
 const currency = (symbol: string) => ({ currency: symbol, address: privateText, min_deposit_amount: '0.000000000000000017',
-  multichain_addresses: [network, { ...network, chain: 'ETH' }] });
+  multichain_addresses: [network, { ...network, chain: 'ETH', address: ethAccount }] });
 const fee = (symbol: string) => [{ currency: symbol, deposit: '0%', withdraw_amount_mini: '1234', withdraw_day_limit_remain: privateText }];
 const response = (data: unknown, at: number, headers: Record<string, string> = {}) =>
   Response.json(data, { headers: { date: new Date(at).toUTCString(), ...headers } });
@@ -69,6 +69,10 @@ test('Gate 两次固定签名 GET 以原币精确最低额、最早响应时间�
   const { store, w, read } = await setup(t);
   w.handler = (path, symbol) => response(path === FEE ? fee(symbol) : currency(symbol), w.at, path === FEE ? { age: '18' } : {});
   const [arb, eth] = await Promise.all([read('链币'), read('链币', 'ethereum')]);
+  assert.equal(store.gateDepositRecipient!(arb), account);
+  assert.equal(store.gateDepositRecipient!(eth), ethAccount);
+  assert.equal(store.gateDepositRecipient!({ ...eth }), undefined);
+  assert.ok(![account, ethAccount, privateText].some(v => JSON.stringify([arb, eth]).includes(v)));
   assert.deepEqual(arb, { symbol: '链币', chain: 'arbitrum', minDeposit: '0.000000000000000017', at: NOW - 18_999, expiresAt: NOW + 41_001 });
   assert.equal(eth.chain, 'ethereum'); assert.equal(eth.expiresAt, arb.expiresAt); assert.ok(Object.isFrozen(arb));
   assert.equal(store.gateDepositCurrent({ ...arb }), false); assert.ok(store.gateDepositCurrent(arb));
@@ -77,7 +81,7 @@ test('Gate 两次固定签名 GET 以原币精确最低额、最早响应时间�
   for (const symbol of ['USDT', 'x/y', 'ABC&foo=1', 'a%20']) await assert.rejects(read(symbol), sanitized);
   await assert.rejects(read('ARB', '__proto__' as Chain), sanitized);
   assert.deepEqual(w.calls, [FEE, ADDRESS]);
-  w.at = eth.expiresAt; assert.equal(store.gateDepositCurrent(arb), false); assert.notEqual(await read('链币'), arb);
+  w.at = eth.expiresAt; assert.equal(store.gateDepositRecipient!(eth), undefined); assert.equal(store.gateDepositCurrent(arb), false); assert.notEqual(await read('链币'), arb);
 });
 
 test('Gate 缺失、非零或歧义充值费、不可核实的链和最低额均拒绝；异常响应与传输错误不泄漏', async t => {

@@ -2,12 +2,13 @@ import { anySignal } from '../any-signal.mjs';
 import { isObject } from '../contracts.ts';
 import { simulateDexFill } from './dex-sim.ts';
 import { readSource, type DexFetcher as Fetcher } from './dex-request.ts';
-import { CHAIN_ARB_CLOCK_SKEW_MS, CHAIN_ARB_TTL_MS } from './model.ts';
+import { CHAIN_ARB_CLOCK_SKEW_MS, CHAIN_ARB_MAX_IMPACT_BPS, CHAIN_ARB_TTL_MS } from './model.ts';
 
 import { networks, isSettlementOrNative } from './networks.ts';
 
 export { isSettlementOrNative } from './networks.ts';
 type DexInput = { chain: keyof typeof networks; address: string; amount: string };
+export type ResolveDexRecipient = (quote: { rawQuantity: string; decimals: number; impactBps: number }, signal: AbortSignal) => Promise<string | undefined>;
 export interface DexQuote {
   rawQuantity: string; decimals: number; at: number; swapGasUsdt?: number | null;
   evidence?: { quotedRaw: string; transferRaw: string | null; impactBps: number; blockNumber: string };
@@ -72,7 +73,8 @@ async function quote(fetcher: Fetcher, chain: keyof typeof networks, address: st
     gasUnits: usd(route.gas) };
 }
 
-export async function readDex(input: DexInput, signal: AbortSignal, fetcher: Fetcher = fetch, now = Date.now, simulate = simulateDexFill): Promise<DexQuote> {
+export async function readDex(input: DexInput, signal: AbortSignal, fetcher: Fetcher = fetch, now = Date.now, simulate = simulateDexFill,
+  resolveRecipient?: ResolveDexRecipient): Promise<DexQuote> {
   if (typeof input.chain !== 'string' || !Object.hasOwn(networks, input.chain)) throw new Error('不支持所选网络');
   const network = networks[input.chain];
   if (typeof input.address !== 'string' || !/^0x[a-f\d]{40}$/i.test(input.address)) throw new Error('目标代币的合约地址无效');
@@ -94,20 +96,43 @@ export async function readDex(input: DexInput, signal: AbortSignal, fetcher: Fet
       if (route.at > now() + CHAIN_ARB_CLOCK_SKEW_MS || now() - route.at >= CHAIN_ARB_TTL_MS) throw new Error('KyberSwap 路由报价已过期或时间异常');
     }
     const options = { chain: input.chain, address, signal: active, fetcher, now };
-    const fill = await simulate({ ...options, amountIn, quote: full.route });
+    const fill = await simulate({ ...options, amountIn, quote: full.route, prepareDeposit: !!resolveRecipient });
     const reference = await simulate({ ...options, amountIn: String(probe), quote: small.route, probeTransfer: false,
       blockNumber: fill.blockNumber, blockHash: fill.blockHash });
     active.throwIfAborted();
-    if (reference.blockHash !== fill.blockHash || reference.blockNumber !== fill.blockNumber) throw new Error('整笔与小额模拟区块不一致');
+    if (reference.blockHash !== fill.blockHash || reference.blockNumber !== fill.blockNumber || reference.blockAt !== fill.blockAt) throw new Error('整笔与小额模拟区块不一致');
     // Compare token units per USDT without rounding either fill or assuming a pool price. Round losses upward at 1e-6 bp.
     const expected = BigInt(reference.rawQuantity) * budget;
     const loss = expected - BigInt(fill.rawQuantity) * probe;
     const impactBps = loss > 0n ? Number((loss * 10_000_000_000n + expected - 1n) / expected) / 1e6 : 0;
-    const gas = full.swapGasUsdt !== null && full.gasUnits > 0 && fill.extraGasUnits !== null
-      ? full.swapGasUsdt * (Math.max(full.gasUnits, Number(fill.gasUnits)) + Number(fill.extraGasUnits)) / full.gasUnits : null;
-    return { rawQuantity: fill.rawQuantity, decimals, at: Math.min(full.at, small.at, fill.blockAt, reference.blockAt),
+    const at = Math.min(full.at, small.at, fill.blockAt);
+    const fresh = () => now() >= Math.max(full.at, small.at, fill.blockAt) - CHAIN_ARB_CLOCK_SKEW_MS && now() - at < CHAIN_ARB_TTL_MS;
+    let transferRaw = fill.rawTransferQuantity, extraGas = fill.extraGasUnits;
+    if (resolveRecipient) {
+      transferRaw = null;
+      extraGas = null;
+      if (impactBps <= CHAIN_ARB_MAX_IMPACT_BPS && fill.replayDeposit && fresh()) {
+        try {
+          const destination = await resolveRecipient({ rawQuantity: fill.rawQuantity, decimals, impactBps }, active);
+          active.throwIfAborted();
+          if (destination && fresh()) {
+            const transfer = await fill.replayDeposit(destination);
+            transferRaw = transfer?.raw ?? null;
+            extraGas = transfer?.extraGas ?? null;
+          }
+        } catch {
+          active.throwIfAborted();
+          // An account or RPC error can include the receiving address. Only the absence of a verified transfer is public.
+        }
+      }
+    }
+    active.throwIfAborted();
+    if (!fresh()) throw new Error('链上报价或模拟区块已过期，请刷新');
+    const gas = full.swapGasUsdt !== null && full.gasUnits > 0 && extraGas !== null
+      ? full.swapGasUsdt * (Math.max(full.gasUnits, Number(fill.gasUnits)) + Number(extraGas)) / full.gasUnits : null;
+    return { rawQuantity: fill.rawQuantity, decimals, at,
       swapGasUsdt: gas !== null && Number.isFinite(gas) && gas > 0 ? gas : null,
-      evidence: { quotedRaw: full.quotedRaw, transferRaw: fill.rawTransferQuantity, impactBps, blockNumber: fill.blockNumber } };
+      evidence: { quotedRaw: full.quotedRaw, transferRaw, impactBps, blockNumber: fill.blockNumber } };
   } catch (error) {
     if (signal.aborted) throw new Error('链上报价请求已中止');
     if (active.aborted) throw new Error('链上报价读取超时');

@@ -6,11 +6,13 @@ import { CHAIN_ARB_TTL_MS, CHAIN_ARB_CLOCK_SKEW_MS, type Chain } from './model.t
 
 interface SimulationInput {
   chain: Chain; address: string; amountIn: string; quote: Record<string, unknown>;
-  signal: AbortSignal; fetcher?: DexFetcher; blockNumber?: string; blockHash?: string; probeTransfer?: boolean; now?: () => number;
+  signal: AbortSignal; fetcher?: DexFetcher; blockNumber?: string; blockHash?: string; probeTransfer?: boolean; prepareDeposit?: boolean; now?: () => number;
 }
+interface TransferFill { raw: string; extraGas: string | null }
 export interface DexFill {
   rawQuantity: string; rawTransferQuantity: string | null; blockNumber: string; blockHash: string; blockAt: number;
   gasUnits: string; extraGasUnits: string | null;
+  replayDeposit?: (destination: string) => Promise<TransferFill | null>;
 }
 
 // Low 20 bytes of keccak256("trading-platform:chain-arb:simulation:{buyer,recipient}:v1").
@@ -122,17 +124,17 @@ export async function simulateDexFill(input: SimulationInput): Promise<DexFill> 
   const first = await simulate(input, fetcher, buyCalls, blockNumber ?? 'latest', budget);
   if (input.blockHash && first.parentHash !== input.blockHash.toLowerCase()) throw new Error('链上模拟区块已变更');
   const buy = readBuy(first.calls, budget);
-  async function transferQuantity() {
-    if (input.probeTransfer === false) return null;
+  async function transferQuantity(destination: string): Promise<TransferFill | null> {
     try {
-      const replay = await simulate(input, fetcher, [...buyCalls, balanceOf(address, recipient),
-        call(address, '0xa9059cbb' + addressWord(recipient) + word(buy.bought), 750_000),
-        balanceOf(address, recipient), balanceOf(address, buyer),
+      input.signal.throwIfAborted();
+      const replay = await simulate(input, fetcher, [...buyCalls, balanceOf(address, destination),
+        call(address, '0xa9059cbb' + addressWord(destination) + word(buy.bought), 750_000),
+        balanceOf(address, destination), balanceOf(address, buyer),
       ], first.blockNumber, budget);
       const repeat = readBuy(replay.calls, budget);
       checkTokenWrite(replay.calls[7]);
       const received = balance(replay.calls[8]) - balance(replay.calls[6]);
-      if (replay.parentHash !== first.parentHash || repeat.bought !== buy.bought || repeat.initialTarget !== buy.initialTarget ||
+      if (replay.parentHash !== first.parentHash || repeat.bought !== buy.bought || repeat.initialTarget !== buy.initialTarget || repeat.gasUnits !== buy.gasUnits ||
         balance(replay.calls[9]) !== buy.initialTarget || received <= 0n || received > buy.bought) return null;
       const approveGas = gasUsed(replay.calls[2]), transferGas = gasUsed(replay.calls[7]);
       return { raw: received.toString(), extraGas: approveGas !== null && transferGas !== null ? (approveGas + transferGas).toString() : null };
@@ -141,12 +143,25 @@ export async function simulateDexFill(input: SimulationInput): Promise<DexFill> 
     }
     return null;
   }
-  const [transfer, blockAt] = await Promise.all([transferQuantity(), canonicalTime(input, fetcher, first.parentHash)]);
+  const [transfer, blockAt] = await Promise.all([
+    input.probeTransfer === false || input.prepareDeposit ? null : transferQuantity(recipient),
+    canonicalTime(input, fetcher, first.parentHash),
+  ]);
   input.signal.throwIfAborted();
   const age = (input.now ?? Date.now)() - blockAt;
   if (!Number.isSafeInteger(blockAt) || blockAt <= 0 || age < -CHAIN_ARB_CLOCK_SKEW_MS || age >= CHAIN_ARB_TTL_MS) {
     throw new Error('链上模拟区块已过期或时间异常');
   }
+  async function replayDeposit(destination: string) {
+    if (typeof destination !== 'string' || !/^0x[0-9a-f]{40}$/i.test(destination)) return null;
+    const receiver = destination.toLowerCase();
+    if (isSettlementOrNative(chain, receiver) || [address, buyer, recipient, router, multicall3].includes(receiver) || BigInt(receiver) <= 0xffffn) return null;
+    // Replay the original swap calldata. The only request containing the account address is this fixed RPC simulation.
+    const result = await transferQuantity(receiver);
+    if (result && await canonicalTime(input, fetcher, first.parentHash) !== blockAt) return null;
+    return result;
+  }
   return { rawQuantity: buy.bought.toString(), rawTransferQuantity: transfer?.raw ?? null, blockNumber: first.blockNumber,
-    blockHash: first.parentHash, blockAt, gasUnits: buy.gasUnits, extraGasUnits: transfer?.extraGas ?? null };
+    blockHash: first.parentHash, blockAt, gasUnits: buy.gasUnits, extraGasUnits: transfer?.extraGas ?? null,
+    ...(input.prepareDeposit ? { replayDeposit } : {}) };
 }

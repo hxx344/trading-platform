@@ -152,7 +152,7 @@ test('扫描从登录后的 HTTP 经行情 IPC 自动发现 ARB，两条路线�
   const socket = process.platform === 'win32' ? '\\\\.\\pipe\\tp-scan-' + randomUUID() : join(h.dir, 'scan.sock');
   const market = createMarketServer({ monitor: createMonitorData({ fetchImpl: chainArbFixture() }) }, 'test');
   const client = createMarketClient(socket);
-  const remote = withChainArbLedger(createRemoteMonitor(client), undefined, Date.now, testGateLedger());
+  const remote = withChainArbLedger(createRemoteMonitor(client), undefined, Date.now, testGateLedger(), chainArbFixture());
   let enabled = true;
   const server = createExecutorServer({ executor: h.ex, accessToken: 'chain-scan-test-0001', views: { monitor: {
     state: () => ({ markets: ['perpetual'], controls: { perpetual: { enabled, revision: 0 } } }),
@@ -231,9 +231,9 @@ test('过期、时间超前及深度不足不返回收益，负价差保留负�
 test('公开行情 IPC 校验币种和金额后才联系上游', async () => {
   const market = createMonitorData({ fetchImpl: async () => { assert.fail('无效请求不得联系上游'); } });
   try {
-    const reply = await market.call('monitor.perpetual.verifiedChainArb', { ...raw, amount: '0x5' }, new AbortController().signal);
+    const reply = await market.call('monitor.perpetual.depositBook', { venue: 'gate', directory: null, scanning: false, params: { ...raw, amount: '0x5' } }, new AbortController().signal);
     assert.equal((reply as { error: { status: number } }).error.status, 400);
-    for (const old of ['chainArb', 'chainArbScan', 'chainArbBatch', 'okxChainArb', 'okxChainArbScan']) {
+    for (const old of ['chainArb', 'chainArbScan', 'chainArbBatch', 'okxChainArb', 'okxChainArbScan', 'verifiedChainArb', 'verifiedChainArbScan', 'verifiedChainArbBatch', 'verifiedOkxChainArb', 'verifiedOkxChainArbScan']) {
       const legacy = await market.call('monitor.perpetual.' + old, raw, new AbortController().signal);
       assert.ok(legacy && typeof legacy === 'object' && 'error' in legacy);
       assert.match(JSON.stringify(legacy.error), /未知公开行情操作/);
@@ -241,34 +241,24 @@ test('公开行情 IPC 校验币种和金额后才联系上游', async () => {
   } finally { market.close?.(); }
 });
 
-test('行情进程用同一份链上买入数量与两份 Gate 买盘生成结果', async () => {
-  const clock = () => 1_795_600_000_000;
-  const market = createMonitorData({ fetchImpl: chainArbFixture(clock), now: clock });
-  try {
-    const reply = await market.call('monitor.perpetual.verifiedChainArb', { ...raw, address: ARB_ADDRESS, chain: 'arbitrum', symbol: 'ARB' }, new AbortController().signal);
-    assert.ok(reply && typeof reply === 'object' && 'ok' in reply && reply.ok && 'value' in reply);
-    const view = reply.value as ReturnType<typeof compareChainArb>;
-    assert.equal(view.dex.quantity, 1050);
-    assert.ok('quantity' in view.perp && 'quantity' in view.spot);
-    assert.deepEqual([view.deposit, view.perp.quantity, view.spot.quantity], [true, 1050, 1050]);
-  } finally { market.close?.(); }
-});
-
-test('真实读取入口不将差一个最小单位的 Gate 现货深度向上舍入', async () => {
+test('行情 IPC 只提供匹配币链的公开盘口，实收数量和收益在执行服务计算', async () => {
   const clock = () => 1_795_600_000_000;
   const fixture = chainArbFixture(clock);
   const market = createMonitorData({ now: clock, fetchImpl: async (url, init) => {
+    assert.ok(!url.includes('kyber') && !url.includes('arbitrum.io'));
     const response = await fixture(url, init);
     if (!url.includes('/spot/order_book?')) return response;
     const book = await response.json() as Record<string, unknown>;
     return Response.json({ ...book, bids: [['0.103', '0.999999999999999999']] });
   } });
   try {
-    const reply = await market.call('monitor.perpetual.verifiedChainArb', { ...raw, chain: 'arbitrum', address: ARB_ADDRESS, symbol: 'ARB', amount: '0.1' }, new AbortController().signal);
+    const params = { ...raw, chain: 'arbitrum', address: ARB_ADDRESS, symbol: 'ARB', amount: '0.1' };
+    const reply = await market.call('monitor.perpetual.depositBook', { venue: 'gate', directory: null, scanning: false, params }, new AbortController().signal);
     assert.ok(reply && typeof reply === 'object' && 'value' in reply);
-    const view = reply.value as ReturnType<typeof compareChainArb>;
-    assert.equal(view.dex.quantity, 1);
-    assert.deepEqual(view.spot, { error: '公开买盘深度不足以覆盖该数量' });
+    const book = reply.value as import('../src/chain-arb/venue.ts').VenueBook;
+    assert.ok(book.deposit && 'bids' in book.spot && 'bids' in book.perp);
+    assert.equal(book.spot.bids[0][1], '0.999999999999999999');
+    assert.ok(!('dex' in book));
   } finally { market.close?.(); }
 });
 

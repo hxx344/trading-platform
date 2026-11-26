@@ -12,7 +12,7 @@ import { nextAsterNonce, validateAsterWallet } from './sources/aster.ts';
 import type { AsterCredential } from './sources/aster.ts';
 import { signAsterMessage } from '../aster/eip712.ts';
 import type { BinanceCredential, BybitCredential } from './sources/exchanges.ts';
-import type { OkxCredential } from './sources/okx.ts';
+import { okxAccessDenied, type OkxCredential } from './sources/okx.ts';
 import type { Position } from './positions-types.ts';
 import type { Credentials } from './validation.ts';
 import { absolute, binanceReadOnly, bybitReadOnly, decimal, isZero, multiplyDecimals, optionalDecimal, position, positionId, record, rows, text, timestamp, uniquePositions, POSITIONS_FAILED, POSITIONS_INVALID, PositionsPermissionError } from './positions-values.ts';
@@ -30,13 +30,23 @@ const ENDPOINTS = {
   aster: new Set(['/fapi/v3/positionRisk', '/fapi/v3/exchangeInfo']),
 };
 
-async function getJson(url: string, headers: Record<string, string>, fetcher: Fetcher, signal?: AbortSignal): Promise<unknown> {
+async function getJson(url: string, headers: Record<string, string>, fetcher: Fetcher, signal?: AbortSignal, signedOkx = false): Promise<unknown> {
   try {
     const limit = anySignal([signal], 10_000);
     const response = await fetcher(url, { method: 'GET', headers, redirect: 'manual', cache: 'no-store', signal: limit });
-    if (!response.ok || response.redirected) throw new Error();
-    return await readJsonResponse(response, { maxBytes: 2_000_000, signal: limit });
-  } catch { throw new Error(POSITIONS_FAILED); }
+    if (signedOkx && !response.redirected && okxAccessDenied(response.status)) {
+      void response.body?.cancel().catch(() => {});
+      throw new PositionsPermissionError();
+    }
+    if (response.redirected || (!response.ok && !(signedOkx && response.status === 400))) throw new Error();
+    const payload = await readJsonResponse(response, { maxBytes: 2_000_000, signal: limit });
+    if (signedOkx && payload && typeof payload === 'object' && 'code' in payload && okxAccessDenied(response.status, payload.code)) throw new PositionsPermissionError();
+    if (!response.ok) throw new Error();
+    return payload;
+  } catch (error) {
+    if (error instanceof PositionsPermissionError) throw error;
+    throw new Error(POSITIONS_FAILED);
+  }
 }
 
 /** Every authenticated request is a fixed GET; callers cannot supply hosts or write paths. */
@@ -73,11 +83,12 @@ export async function positionsGet(exchange: 'binance' | 'bybit' | 'okx', creden
   }
   host = 'https://openapi.okx.com';
   const requestPath = path + (query.size ? '?' + query : '');
-  if (!path.startsWith('/api/v5/public/')) {
+  const signed = !path.startsWith('/api/v5/public/');
+  if (signed) {
     try { Object.assign(headers, okxAuthHeaders(c as OkxCredential, { timestamp: new Date().toISOString(), method: 'GET', requestPath })); }
     catch { throw new Error(POSITIONS_FAILED); }
   }
-  const data = record(await getJson(host + requestPath, headers, fetcher, signal));
+  const data = record(await getJson(host + requestPath, headers, fetcher, signal, signed));
   if (data.code !== '0') throw new Error(POSITIONS_FAILED);
   return rows(data.data);
 }

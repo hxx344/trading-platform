@@ -187,6 +187,7 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
       return age >= (slot.cycle.status === 'unavailable' ? CYCLE_RETRY : CYCLE_TTL);
     });
     if (!due.length) return;
+    const file = database();
     const abort = entry.cycleAbort = new AbortController();
     entry.cycleJob = cycleLimited(async () => {
       for (const item of due) {
@@ -202,6 +203,13 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
           const history = accountHistory(database, account.key, entry.revision, scope, () => !signal.aborted && entries.get(key) === entry && current(database, account, entry.revision), generation);
           store(await cycleRead(credentials, scope, { position: item, siblings: positions, snapshotAt }, signal, history));
         } catch (error) {
+          if (error instanceof PositionsPermissionError) {
+            // A second read may already have renewed permissions. Revoke the current generation only for this saved credential.
+            if (database() === file && current(database, account, entry.revision)) {
+              historyGeneration(database, account.key, entry.revision, now).deny();
+            }
+            return;
+          }
           if (!(error instanceof CycleRetry) && !abort.signal.aborted) store(cycleUnavailable('本轮成交读取超时，稍后重试', new Date(now()).toISOString()));
         }
       }

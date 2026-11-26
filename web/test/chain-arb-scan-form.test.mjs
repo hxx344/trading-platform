@@ -20,8 +20,8 @@ const address = '0x' + 'f'.repeat(40);
 const source = 1_800_000_000_000;
 function row(symbol, options = {}) {
   return { chain: 'bsc', address, symbol, kind: 'perp', netBps: 40, netUsdt: 0.4, gasUsdt: 0.03,
-    dexPrice: 10, gatePrice: 11, at: source, expiresAt: source + 15_000,
-    execution: { receivedQuantity: 100, transferQuantity: 98, impactBps: 400, blockNumber: '0x123' }, ...options };
+    dexPrice: 10, gatePrice: 11, at: source, expiresAt: (options.at ?? source) + 15_000,
+    execution: { depositVenue: options.venue ?? 'gate', depositExpiresAt: (options.at ?? source) + 60_000, transferAmount: '98', receivedQuantity: 100, transferQuantity: 98, impactBps: 400, blockNumber: '0x123' }, ...options };
 }
 function view(rows, history = []) {
   return { asOf: source, rows, history, phase: 'scanning', cycle: 1, total: 10, checked: 3, failed: 0, message: null };
@@ -32,6 +32,12 @@ test('旧版报价和未通过模拟的报价均不进入有效机会或最近�
   valid.execution.impactBps = 500;
   const invalid = [
     row('OLD', { execution: undefined }),
+    row('ORDINARY', { execution: { ...valid.execution, depositVenue: undefined } }),
+    row('NO_EXPIRY', { execution: { ...valid.execution, depositExpiresAt: undefined } }),
+    row('INFINITE_EXPIRY', { execution: { ...valid.execution, depositExpiresAt: Infinity } }),
+    row('WRONG_VENUE', { venue: 'okx', execution: valid.execution }),
+    row('UNSUPPORTED', { venue: 'bitget', execution: valid.execution }),
+    row('TOO_LONG', { expiresAt: source + 15_001 }),
     row('NO_TRANSFER', { execution: { ...valid.execution, transferQuantity: null } }),
     row('TOO_THIN', { execution: { ...valid.execution, impactBps: 501 } }),
   ];
@@ -116,19 +122,24 @@ test('后台扫描草稿按版本保存，允许零阈值和交易所独立费�
 });
 
 test('跨所榜单使用各快照生成时间和本次 GET 往返耗时，单所失败不撤下其他所的有效行情', async () => {
-  const gate = row('ARB', { netBps: 10 }), binance = row('ARB', { venue: 'binance', netBps: 90 });
-  const inTransit = row('PAST', { venue: 'binance', expiresAt: source + 200 });
+  const gate = row('ARB', { netBps: 10 }), okx = row('ARB', { venue: 'okx', netBps: 90 });
+  const proofExpired = row('PAST', { venue: 'okx', expiresAt: source + 200 });
+  proofExpired.execution.depositExpiresAt = proofExpired.expiresAt;
   const bitget = row('ARB', { venue: 'bitget', netBps: 99, at: source - 200 });
-  const settings = { ...DEFAULT_BACKGROUND_SETTINGS, enabled: true };
+  const settings = { ...DEFAULT_BACKGROUND_SETTINGS, venues: ALL_SCAN_VENUES, enabled: true };
   let mono = 100;
   const result = await readTimedScan(async () => { mono += 220; return { revision: 3, robot: null, error: null, settings,
-    results: { gate: view([gate]), binance: view([inTransit, binance]), bitget: { ...view([bitget]), phase: 'error' } } }; }, () => mono);
+    results: { gate: view([gate]), okx: view([proofExpired, okx]), bitget: { ...view([bitget]), phase: 'error' } } }; }, () => mono);
   const bands = backgroundBands(result, false, mono);
-  assert.deepEqual(bands.live, [binance, gate]);
-  assert.deepEqual(bands.history, [inTransit, bitget]);
+  assert.deepEqual(bands.live, [okx, gate]);
+  assert.deepEqual(bands.history, []);
   assert.equal(bands.nextDeadline, 15_100);
   assert.deepEqual(backgroundBands(result, true, mono).live, []);
-  assert.deepEqual(backgroundBands(result, false, 15_100).live, []);
+  const offline = backgroundBands(result, true, 15_100);
+  assert.deepEqual(offline.live, []);
+  assert.equal(offline.history.length, 2);
+  assert.equal(offline.nextDeadline, 60_100);
+  assert.deepEqual(backgroundBands(result, true, 61_100).history, []);
   assert.deepEqual(backgroundBands(result, true, 100 + SCAN_HISTORY_MS).history, []);
 });
 
@@ -154,9 +165,9 @@ test('从单行复核只传已保存的预算、路线成本和该所费率，�
 });
 
 test('后台单腿限流时保留同所仍新鲜的另一条路线，失效或暂停时降为历史', () => {
-  const valid = row('ARB', { venue: 'bitget', kind: 'spot' });
+  const valid = row('ARB', { venue: 'gate', kind: 'spot' });
   const sample = { startedAt: 100, view: { settings: { ...DEFAULT_BACKGROUND_SETTINGS, enabled: true },
-    results: { bitget: { ...view([valid]), phase: 'cooldown' } } } };
+    results: { gate: { ...view([valid]), phase: 'cooldown' } } } };
   assert.deepEqual(backgroundBands(sample, false, 1000).live, [valid]);
   assert.deepEqual(backgroundBands(sample, true, 1000).history, [valid]);
   assert.deepEqual(backgroundBands(sample, false, 15_100).history, [valid]);

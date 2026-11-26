@@ -21,6 +21,7 @@ function project(raw: unknown, symbol: string, at: number) {
     || typeof raw.min_deposit_amount !== 'string' || !MINIMUM.test(raw.min_deposit_amount)
     || !Array.isArray(raw.multichain_addresses) || raw.multichain_addresses.length > 256) throw invalid();
   const expiresAt = at + GATE_DEPOSIT_TTL;
+  const recipients = new WeakMap<GateDepositProof, string>();
   const rows = new Map<Chain, GateDepositProof>(), seen = new Set<Chain>();
   for (const row of raw.multichain_addresses) {
     if (!isObject(row) || typeof row.chain !== 'string' || !row.chain) throw invalid();
@@ -32,9 +33,11 @@ function project(raw: unknown, symbol: string, at: number) {
       || /^0x0{40}$/i.test(row.address) || row.payment_id !== '' || row.payment_name !== ''
       || ['memo', 'tag'].some(key => Object.hasOwn(row, key) && row[key] !== '')
       || (Object.hasOwn(row, 'min_deposit_amount') && row.min_deposit_amount !== raw.min_deposit_amount)) continue;
-    rows.set(chain, Object.freeze({ symbol, chain, minDeposit: raw.min_deposit_amount, at, expiresAt }));
+    const proof = Object.freeze({ symbol, chain, minDeposit: raw.min_deposit_amount, at, expiresAt });
+    rows.set(chain, proof);
+    recipients.set(proof, row.address.toLowerCase());
   }
-  return { rows, at, expiresAt };
+  return { rows, recipients, at, expiresAt };
 }
 
 export async function readGateDeposit(c: GateCredentials, symbol: string, fetcher: typeof fetch, signal: AbortSignal,

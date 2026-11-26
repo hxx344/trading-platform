@@ -1,8 +1,9 @@
 // Execution-side public data adapters. Page projections, resume checkpoints, paper positions and tokens remain local.
 import type { MarketClient } from '../market/ipc.ts';
 import type { OkxDirectory } from '../chain-arb/okx-network.ts';
-import type { ChainArbView } from '../chain-arb/model.ts';
-import type { ScanView } from '../chain-arb/scan-model.ts';
+import { parseChainArb, type DepositVenue } from '../chain-arb/model.ts';
+import type { VenueBook } from '../chain-arb/venue.ts';
+import type { ScanCandidate } from '../chain-arb/catalog.ts';
 import type { MarketReaders } from '../monitor/market-readers.ts';
 import type { HynixQuoteView } from '../monitor/hynix.ts';
 import type { FeedEvent, SubscribeFeed } from '../monitor/perpetual-feed.ts';
@@ -134,10 +135,10 @@ export function createRemoteMonitor(client: MarketClient, clock: () => number = 
     positioning: (quote, options) => read('perpetual.positioning', { exchange: quote.exchange, symbol: quote.symbol, identity: quote.historyIdentity }, options?.signal),
   };
   return { rounds, perpetual, comparison,
-    chainArb: (input: unknown, signal: AbortSignal, directory?: OkxDirectory) => directory
-      ? read<ChainArbView>('perpetual.verifiedOkxChainArb', { params: input, directory }, signal)
-      : read<ChainArbView>('perpetual.verifiedChainArb', input, signal),
-    scanChainArb: (params: unknown, scope: string, signal: AbortSignal, awaitBatch = false, directory?: OkxDirectory) => directory
-      ? read<ScanView>('perpetual.verifiedOkxChainArbScan', { params, scope, awaitBatch, directory }, signal)
-      : read<ScanView>(awaitBatch ? 'perpetual.verifiedChainArbBatch' : 'perpetual.verifiedChainArbScan', { params, scope }, signal) };
+    chainArbCatalog: (venue: DepositVenue, signal: AbortSignal, directory?: OkxDirectory) =>
+      read<ScanCandidate[]>('perpetual.depositCatalog', { venue, directory: directory ?? null }, signal),
+    chainArbBook: (input: unknown, signal: AbortSignal, directory?: OkxDirectory, scanning = false) => {
+      const venue = parseChainArb(input).venue ?? 'gate';
+      return read<VenueBook>('perpetual.depositBook', { venue, params: input, directory: directory ?? null, scanning }, signal);
+    } };
 }

@@ -7,7 +7,7 @@ import { createBinanceReader } from './binance.ts';
 import { createBitgetReader } from './bitget.ts';
 import type { VenueReader } from './venue.ts';
 import { compareChainArb } from './estimate.ts';
-import { parseChainArb, VENUE_NAMES, type ChainArbVenue, type ChainArbView } from './model.ts';
+import { parseChainArb, VENUE_NAMES, type ChainArbVenue, type DepositVenue, type ChainArbView } from './model.ts';
 import { parseChainArbScan } from './scan-model.ts';
 import { createScanCatalog } from './catalog.ts';
 import { createChainArbScanner } from './scan.ts';
@@ -80,7 +80,20 @@ export function createChainArbMarket({ fetchImpl = fetch, now = Date.now, venueR
     }
     return okx;
   }
-  return { async chainArb(raw: unknown, signal: AbortSignal, proof?: OkxDirectory) {
+  return {
+    chainArbCatalog(venue: DepositVenue, signal: AbortSignal, directory?: OkxDirectory) {
+      return market(venue, directory).reader.catalog(signal);
+    },
+    async chainArbBook(raw: unknown, signal: AbortSignal, directory?: OkxDirectory, scanning = false) {
+      const input = parseChainArb(raw), name = input.venue ?? 'gate';
+      if (name !== 'gate' && name !== 'okx') throw new Error('该场所尚未接入实际充值地址');
+      const reader = market(name, directory).reader;
+      const [book, catalog] = await Promise.all([reader.read(input, signal, scanning), reader.catalog(signal)]);
+      const allowed = catalog.find(c => c.chain === input.chain && c.symbol === input.symbol && c.address === input.address);
+      if (!allowed?.spot) return { ...book, spot: { error: '交易所目录未核实同链同合约的充值卖出路线' }, perp: { error: '交易所目录未核实可充值的同币永续路线' } };
+      return { ...book, perp: allowed.perp ? book.perp : { error: '交易所目录未核实同币永续路线' } };
+    },
+    async chainArb(raw: unknown, signal: AbortSignal, proof?: OkxDirectory) {
       const input = parseChainArb(raw);
       return quote(raw, signal, false, market(input.venue, proof).reader);
     },

@@ -1,13 +1,20 @@
-import { CHAIN_ARB_MAX_IMPACT_BPS, isChainArbVenue, parseChainArbBudget, type Chain, type ChainArbVenue } from './model.ts';
+import { CHAIN_ARB_MAX_IMPACT_BPS, CHAIN_ARB_TTL_MS, isChainArbVenue, parseChainArbBudget, type Chain, type ChainArbVenue, type DepositVenue } from './model.ts';
 import { isObject } from '../contracts.ts';
 
 export const SCAN_HISTORY_MS = 5 * 60_000;
-export interface ScanExecution { receivedQuantity: number; transferQuantity: number; transferAmount?: string | null; impactBps: number; blockNumber: string }
+export interface ScanExecution { depositVenue?: DepositVenue; depositExpiresAt?: number; receivedQuantity: number; transferQuantity: number; transferAmount?: string | null; impactBps: number; blockNumber: string }
 export function isVerifiedExecution(value: unknown): value is ScanExecution {
   return isObject(value) && typeof value.receivedQuantity === 'number' && Number.isFinite(value.receivedQuantity)
     && typeof value.transferQuantity === 'number' && value.transferQuantity > 0 && value.receivedQuantity >= value.transferQuantity
     && typeof value.impactBps === 'number' && value.impactBps >= 0 && value.impactBps <= CHAIN_ARB_MAX_IMPACT_BPS
     && typeof value.blockNumber === 'string' && /^0x[1-9a-f][0-9a-f]{0,63}$/i.test(value.blockNumber);
+}
+
+type DepositExecution = ScanExecution & { depositVenue: DepositVenue; depositExpiresAt: number };
+export function isDepositExecution(value: unknown, venue: ChainArbVenue | undefined): value is DepositExecution {
+  const expected = venue ?? 'gate';
+  return (expected === 'gate' || expected === 'okx') && isVerifiedExecution(value) && value.depositVenue === expected
+    && typeof value.depositExpiresAt === 'number' && Number.isSafeInteger(value.depositExpiresAt) && value.depositExpiresAt > 0;
 }
 
 export interface ScanInput {
@@ -20,6 +27,11 @@ export interface ScanRow {
   dexPrice: number; gatePrice: number; at: number; expiresAt: number; gasUsdt: number;
   execution?: ScanExecution;
 }
+export function isDepositRow(row: ScanRow): row is ScanRow & { execution: DepositExecution } {
+  return isDepositExecution(row.execution, row.venue) && Number.isFinite(row.at) && row.expiresAt > row.at
+    && row.expiresAt === Math.min(row.at + CHAIN_ARB_TTL_MS, row.execution.depositExpiresAt);
+}
+
 export interface ScanView {
   asOf: number; phase: 'loading' | 'scanning' | 'cooldown' | 'error'; cycle: number; total: number;
   checked: number; failed: number; message: string | null; rows: ScanRow[]; history: ScanRow[];

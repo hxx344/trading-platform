@@ -387,9 +387,11 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
   const first = (key: string, at: number): boolean => Number(db.prepare('INSERT OR IGNORE INTO once(key, at) VALUES (?, ?)').run(key, at).changes) > 0;
   /**
    * In memory, per switched-on pair out of order: since when it waits (restarted by a confirmed transfer), when the trouble
-   * first began (for the duration in the messages), and when it was last reported (null: not yet).
+   * first began, when it was last reported, and the reason for a first report that could not be queued.
    */
-  const stuck = new Map<string, { since: number; began: number; sentAt: number | null }>();
+  const stuck = new Map<string, { since: number; began: number; sentAt: number | null; missed: string | null }>();
+  // Keep the observed recovery until handoff, even if the next reading is unknown or another incident starts.
+  const recoveries = new Map<string, { text: string; additional: number }>();
 
   function poll(): void {
     const at = now();
@@ -420,27 +422,42 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
       seen.add(pair.id);
       const problem = marginProblem(pair);
       const entry = stuck.get(pair.id);
-      if (problem === 'unknown') continue;
       // Each post counts once its row is queued: a failed insert leaves the entry as it was for the next poll, and the
       // other pairs are still checked this round.
       const queued = (text: string): boolean => {
         try { tx(() => insert(text, at)); return true; }
         catch (error) { log(`保证金平衡告警未能入队，下一轮重试：${error instanceof Error ? error.message.slice(0, 160) : String(error)}`); return false; }
       };
+      const pending = recoveries.get(pair.id);
+      if (pending && queued(pending.additional ? `${pending.text}。等待入队期间另有 ${pending.additional} 次异常已恢复` : pending.text)) recoveries.delete(pair.id);
+      if (problem === 'unknown') continue;
       if (!problem) {
-        if (entry?.sentAt != null && !queued(`【保证金平衡恢复】配对 ${pair.id}，异常共约 ${lasted(at - entry.began)}：${balanceLine(pair)}`)) continue;
+        if (entry && (entry.sentAt !== null || entry.missed !== null)) {
+          const text = entry.sentAt !== null
+            ? `【保证金平衡恢复】配对 ${pair.id}，异常共约 ${lasted(at - entry.began)}：${balanceLine(pair)}`
+            : `【保证金平衡异常（已恢复）】配对 ${pair.id}，此前${entry.missed}。首报未能入队，现已恢复：${balanceLine(pair)}`;
+          const previous = recoveries.get(pair.id);
+          if (previous) previous.additional++;
+          else if (!queued(text)) recoveries.set(pair.id, { text, additional: 0 });
+        }
         stuck.delete(pair.id);
         continue;
       }
-      if (!entry) { stuck.set(pair.id, { since: at, began: at, sentAt: null }); continue; }
+      if (!entry) { stuck.set(pair.id, { since: at, began: at, sentAt: null, missed: null }); continue; }
       if (at - entry.since < FAULT_AFTER_MS) continue;
       if (entry.sentAt === null) {
-        if (queued(`【保证金平衡异常】配对 ${pair.id} 已持续 ${lasted(at - entry.began)}：${clip(problem)}。${balanceLine(pair)}。持续 ${FAULT_AFTER_MS / 1000} 秒告警，未恢复每 ${FAULT_REPEAT_MS / 1000} 秒重复提醒，恢复后通知一次`)) entry.sentAt = at;
+        if (!recoveries.has(pair.id) && queued(`【保证金平衡异常】配对 ${pair.id} 已持续 ${lasted(at - entry.began)}：${clip(problem)}。${balanceLine(pair)}。持续 ${FAULT_AFTER_MS / 1000} 秒告警，未恢复每 ${FAULT_REPEAT_MS / 1000} 秒重复提醒，恢复后通知一次`)) {
+          entry.sentAt = at;
+          entry.missed = null;
+        } else {
+          entry.missed = clip(problem);
+        }
       } else if (at - entry.sentAt >= FAULT_REPEAT_MS) {
         if (queued(`【保证金平衡仍异常】配对 ${pair.id} 已持续 ${lasted(at - entry.began)}：${clip(problem)}。${balanceLine(pair)}`)) entry.sentAt = at;
       }
     }
     for (const id of [...stuck.keys()]) if (!seen.has(id)) stuck.delete(id);
+    for (const id of recoveries.keys()) if (!seen.has(id)) recoveries.delete(id);
   }
 
   /** Queues a message that does not come from the event log (start, stop, lost lease, market alerts); its outbox id, null without a robot. */

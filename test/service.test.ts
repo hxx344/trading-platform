@@ -258,8 +258,7 @@ test('飞书告警：事件转消息，同一持续问题 30 分钟内只发一�
     notifier.poll();
     assert.equal(notifier.pending(), before + 6);
 
-    // An alert whose insert fails is not counted as posted: the next poll posts the first alert (not a repeat 2 minutes
-    // later), and a recovery with no alert queued posts nothing (#71, same path in feishu.ts).
+    // An alert whose insert fails is not counted as posted: the next poll retries it.
     const outboxDb = new DatabaseSync(join(dir, 'notify.sqlite'));
     const breakOutbox = (broken: boolean) => outboxDb.exec(broken ? "CREATE TRIGGER fail_outbox BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END;" : 'DROP TRIGGER fail_outbox');
     try {
@@ -286,6 +285,36 @@ test('飞书告警：事件转消息，同一持续问题 30 分钟内只发一�
       notifier.poll(); notifier.poll();
       assert.equal(notifier.pending(), before + 8);
       assert.match(texts().at(-1)!, /^【保证金平衡恢复】配对 p1/);
+      // The anomaly ends before its first report can be queued. Repeated failures preserve the original evidence.
+      pairs = pair('4000', '1000');
+      notifier.poll();
+      clock += FAULT_AFTER_MS;
+      breakOutbox(true);
+      notifier.poll();
+      pairs = pair('2000', '1500');
+      notifier.poll(); notifier.poll();
+      assert.equal(notifier.pending(), before + 8);
+      pairs = pair('7500', '1000');
+      notifier.poll();
+      clock += FAULT_AFTER_MS;
+      notifier.poll();
+      pairs = pair('1200', '1100');
+      notifier.poll();
+      pairs = pair('0', '0', { balancesFresh: false });
+      breakOutbox(false);
+      notifier.poll(); notifier.poll();
+      assert.equal(notifier.pending(), before + 9);
+      assert.match(texts().at(-1)!, /^【保证金平衡异常（已恢复）】配对 p1，.*差 3000 USD1.*首报未能入队，现已恢复：.*差额 500 USD1.*另有 1 次异常已恢复/);
+      // Removing or disabling a pair ends monitoring; neither action is evidence that its balances recovered.
+      for (const keepDisabled of [false, true]) {
+        pairs = pair('4000', '1000'); notifier.poll();
+        clock += FAULT_AFTER_MS;
+        breakOutbox(true); notifier.poll();
+        pairs = keepDisabled ? pair('2000', '1500', { enabled: false }) : [];
+        notifier.poll(); breakOutbox(false);
+        pairs = pair('2000', '1500'); notifier.poll();
+        assert.equal(notifier.pending(), before + 9);
+      }
     } finally { outboxDb.close(); }
     await notifier.flush();
     notifier.close();

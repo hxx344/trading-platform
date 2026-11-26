@@ -125,6 +125,7 @@ const now = Date.now();
   const settings: Settings = {
     revision: 1, global, symbols: { ...symbols, [gone.symbol]: { ...DEFAULT_SYMBOL, enabled: true } }, confirmed: [],
     combos: ['var|rh', 'var|lighter', 'var|entropy', 'lighter|entropy'], pairs: [{ a: { venue: 'rh', symbol: 'ETH' }, b: { venue: 'lighter', symbol: 'ETH' }, ratio: 1, kind: 'crypto', note: '预览：两条行情流' }],
+    auto: ['lighter:NVDA|entropy:NVDA'],
   };
   store.setState(SETTINGS_KEY, settings, now);
   for (const [key, params] of Object.entries(symbols)) {

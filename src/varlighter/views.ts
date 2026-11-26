@@ -4,13 +4,16 @@ import type { BacktestResult } from './backtest.ts';
 import type { AssetKind, Combo, CustomPair, Identity, LegInfo, LiveVenue, Regime, Sample, SizeBucket, VarPriceSource, VenueId } from './model.ts';
 import type { OrderPlan } from './plan.ts';
 import type { RegimeStats } from './stats.ts';
-import type { ClosedTrade, Direction, GlobalParams, Position, SymbolParams } from './strategy.ts';
+import type { AutoParams, ClosedTrade, Direction, GlobalParams, Position, SymbolParams } from './strategy.ts';
 
 /**
  * symbols 与 confirmed 都按配对键「A场所:A代码|B场所:B代码」（乘数不是 1 时带「@乘数」）；combos 是自动配对的场所组合，
- * pairs 是手动配对（实盘准备页「配对管理」）。
+ * pairs 是手动配对（实盘准备页「配对管理」）。auto 是用自动配置的配对键（v0.93.0）：入场、出场、止损与最长持有按近期统计的推荐值，
+ * symbols 里保存的这四项留作关掉自动配置后的值。放在 symbols 外面，旧版本读参数时会忽略它（回退后这些配对按保存的参数运行）。
  */
-export interface Settings { revision: number; global: GlobalParams; symbols: Record<string, SymbolParams>; confirmed: string[]; combos: Combo[]; pairs: CustomPair[] }
+export interface Settings { revision: number; global: GlobalParams; symbols: Record<string, SymbolParams>; confirmed: string[]; combos: Combo[]; pairs: CustomPair[]; auto: string[] }
+/** 一个配对的自动配置：on 为是否在用；params 是当前的推荐值，算不出时为 null、reason 写原因；at 是所用统计的计算时刻，regime、samples 是所用统计的时段与样本数。 */
+export interface AutoView { on: boolean; params: AutoParams | null; reason: string | null; at: number | null; regime: Regime | null; samples: number }
 export interface SourceState { at: number | null; ok: number | null; error: string | null; count: number }
 export interface PollStats { at: number; listings: number; fresh: number; unchanged: number; noQuote: number;
   /** 有 Var 腿的配对里，对手腿在 Var 报价时刻没有可用一档的条数。 */ noTop: number; written: number;
@@ -52,7 +55,8 @@ export interface StateRow {
   /** 中间价偏离基线的 σ 倍数；rich / cheap 是两个方向可成交价差相对基线的偏离（基点）。 */ z: number | null; rich: number | null; cheap: number | null;
   samples24h: number; firstAt: number | null;
   /** 平仓后的冷却截止时刻，已过期为 null。 */ cooldownUntil: number | null;
-  enabled: boolean; entryBps: number; exitBps: number;
+  /** entryBps、exitBps 是生效的值（自动配置时为推荐值）。auto：在用自动配置；autoPending：在用但样本还不够算出推荐值（按保存的参数显示，不开仓）。 */
+  enabled: boolean; entryBps: number; exitBps: number; auto: boolean; autoPending: boolean;
   position: PositionSummary | null;
   /** 两腿每小时资金费率（小数，多头付费为正）。 */ aFunding: number | null; bFunding: number | null;
   /** 两腿手续费（基点，手动值或目录费率）；取不到为 null（不开仓）。 */ aFeeBps: number | null; bFeeBps: number | null;
@@ -86,7 +90,8 @@ export interface SymbolView {
   regimes: Regime[]; hours: number; from: number; to: number; bucket: SizeBucket;
   points: SymbolPoint[]; samples: number;
   stats: (RegimeStats & { suggestedEntryBps: number | null })[];
-  params: SymbolParams; global: GlobalParams; latest: Sample | null; plans: OrderPlan[];
+  /** params 是保存的参数，effective 是生效的（自动配置时入场、出场、止损、最长持有换成推荐值）；统计、走势的入场带与下单预演按 effective。 */
+  params: SymbolParams; effective: SymbolParams; auto: AutoView; global: GlobalParams; latest: Sample | null; plans: OrderPlan[];
   /** 两腿手续费（基点）；取不到为 null。 */ fees: { a: number | null; b: number | null };
   position: (Position & { mark: PositionMark | null }) | null;
   trades: ClosedTrade[];

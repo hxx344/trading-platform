@@ -7,7 +7,7 @@ import { pairKey, parsePairKey } from '../../src/varlighter/model.ts';
 import { readCustomPair } from '../../src/varlighter/engine.ts';
 import {
   EMPTY_PAIR_FORM, backtestBody, bps, bytesPerDay, chartRange, chartRows, comboLabel, comboShort, customPairKey, customPairRequest, directionLabel, directionShort, fundingAnnual, globalForm, globalRequest,
-  SIMPLE_SORT_KEYS, directionSides, entryProgress, matchesCombo, pairLabel, readOverviewMode, settingsBody, signal, sortRows, symbolForm, symbolRequest, toggleConfirmed, usd, varLighterHref,
+  SIMPLE_SORT_KEYS, directionSides, entryProgress, matchesCombo, pairLabel, readOverviewMode, settingsBody, signal, sortRows, symbolForm, symbolRequest, toggleConfirmed, usd, varLighterHref, AUTO_FIELDS, autoBody, autoFormPatch, quickEnableBody,
 } from '../src/varlighter/varlighter-form.ts';
 import { parseRoute } from '../src/route-parse.ts';
 
@@ -69,6 +69,19 @@ test('settings and backtest bodies carry exactly what the server reads', () => {
   assert.deepEqual(settingsBody({ revision: 4 }, { pairs: [pair] }), { revision: 4, pairs: [pair] });
   assert.deepEqual(toggleConfirmed(['var:ANT|rh:ANT'], 'var:ANT|lighter:ANT', true), ['var:ANT|lighter:ANT', 'var:ANT|rh:ANT']);
   assert.deepEqual(toggleConfirmed(['var:ANT|rh:ANT', 'var:SPCX|rh:SPCX'], 'var:ANT|rh:ANT', false), ['var:SPCX|rh:SPCX']);
+
+  // 总览勾选：启用并加入自动配置；取消只停用，自动配置的选择留着。
+  const NVDA = 'lighter:NVDA|entropy:NVDA', saved = { revision: 5, auto: ['var:ANT|rh:ANT'] };
+  assert.deepEqual(quickEnableBody(saved, NVDA, true), { revision: 5, symbols: { [NVDA]: { enabled: true } }, auto: [NVDA, 'var:ANT|rh:ANT'] });
+  assert.deepEqual(quickEnableBody({ revision: 5, auto: [NVDA] }, NVDA, true).auto, [NVDA], '已在自动配置里不重复');
+  assert.deepEqual(quickEnableBody({ revision: 6, auto: [NVDA] }, NVDA, false), { revision: 6, symbols: { [NVDA]: { enabled: false } } });
+  // 详情页开关：打开时带一份空的改动（自动配置只认有保存参数的配对，页面上可能过期的参数不写回），关闭只改列表。
+  assert.deepEqual(autoBody(saved, NVDA, true), { revision: 5, symbols: { [NVDA]: {} }, auto: [NVDA, 'var:ANT|rh:ANT'] });
+  assert.deepEqual(autoBody({ revision: 5, auto: [NVDA] }, NVDA, false), { revision: 5, auto: [] });
+  assert.deepEqual(AUTO_FIELDS, ['entryBps', 'exitBps', 'stopBps', 'maxHoldMinutes']);
+  const filled = { ...symbolForm(DEFAULT_SYMBOL), ...autoFormPatch({ entryBps: 26, exitBps: 0, stopBps: 86, maxHoldMinutes: 72 }) };
+  assert.deepEqual([filled.entryBps, filled.exitBps, filled.stopBps, filled.maxHoldMinutes, filled.notionalUsd], ['26', '0', '86', '72', String(DEFAULT_SYMBOL.notionalUsd)]);
+  assert.ok(symbolRequest(filled).ok, '填入推荐值的表单可以保存与回测');
   const body = backtestBody(key, 168, symbolForm({ ...DEFAULT_SYMBOL, entryBps: 20 }), DEFAULT_GLOBAL);
   assert.ok(body.ok);
   assert.equal('enabled' in body.value.params, false, '回测请求不带启用开关');

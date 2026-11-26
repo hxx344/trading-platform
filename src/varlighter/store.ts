@@ -9,7 +9,7 @@ import { upgradePosition, type ClosedTrade, type LegFees, type Position } from '
 import type { Settings } from './views.ts';
 
 export const VARLIGHTER_FILE = 'varlighter.sqlite';
-/** 样本保留天数：约 300 个配对每分钟各一条（两腿都是行情流的启用配对每 15 秒一条），每天约 45 万条；14 天约 600 万条（库文件大小见 docs/varlighter.md 第 7 节）。 */
+/** 样本保留天数：约 300 个配对每分钟各一条（两腿都是行情流的配对每 20 秒一条、启用的每 5 秒一条，条数随这类配对的个数变），容量估算见 docs/varlighter.md 第 7 节。 */
 export const SAMPLE_RETENTION_DAYS = 14;
 /** 旧表迁移完成的标记（state 表的键）。 */
 export const MIGRATED_KEY = 'legs_migrated';

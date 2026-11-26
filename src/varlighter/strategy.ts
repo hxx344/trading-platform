@@ -1,7 +1,7 @@
 // 价差回归策略（docs/varlighter.md 第 5 节、docs/dexspread.md 第 5 节）：参数、开平仓判断与盈亏。回测（backtest.ts）与模拟盘（engine.ts）共用，
 // 只有纯计算，不读写存储。A、B 是配对的两条腿（Var/Lighter 配对里 A 是 Var）。
 import { REGIMES, bucketOf, missingDecisionTop, spreadOf, targetSpread, type Regime, type Sample, type Spread, type VarPriceSource, type VenueId } from './model.ts';
-import type { Baseline } from './stats.ts';
+import type { Baseline, RegimeStats } from './stats.ts';
 
 /** a_rich：A 相对偏贵，卖 A、买 B；a_cheap：买 A、卖 B。v0.87.0 以前叫 var_rich、var_cheap。 */
 export type Direction = 'a_rich' | 'a_cheap';
@@ -101,6 +101,27 @@ export function readGlobalParams(value: unknown, base: GlobalParams = DEFAULT_GL
     paused: paused as boolean,
   };
 }
+/** 自动配置接管的参数：其余（名义金额、冷却、时段、方向）仍用保存的。 */
+export interface AutoParams { entryBps: number; exitBps: number; stopBps: number; maxHoldMinutes: number }
+/**
+ * 按近期统计给一个配对推荐参数（自动配置用，docs/varlighter.md 第 5 节）：
+ * - 入场 = 中间价偏离的 95 分位 − 半个往返成本（历史上约 5% 的时间能触发），且不低于「刚到入场线时预期净利仍达最低净利」的偏离
+ *   （半个往返成本 + 四次成交的滑点 + 两腿开平的手续费 + 最低净利），也不低于 5 基点；
+ * - 出场 = 基线（0）；止损 = 往返成本 + 3 倍入场偏离（开仓时浮亏就等于往返成本，再留 3 倍入场偏离的余地），不低于 20 基点；
+ * - 最长持有 = 6 个半衰期，限在 1 到 24 小时；统计里不回归时用默认的 12 小时。
+ * 统计里没有往返成本或偏离分位（样本没有可成交价）时返回 null。
+ */
+export function recommendParams(stats: Pick<RegimeStats, 'costMedian' | 'deviation95' | 'halfLifeMin'>, costs: Pick<GlobalParams, 'slippageBps' | 'minNetBps'> & LegFees): AutoParams | null {
+  if (stats.costMedian === null || stats.deviation95 === null) return null;
+  const cost = Math.max(0, stats.costMedian);
+  const breakEven = cost / 2 + 4 * costs.slippageBps + 2 * (costs.aFeeBps + costs.bFeeBps) + costs.minNetBps;
+  const entryBps = Math.min(2000, Math.max(5, Math.round(stats.deviation95 - cost / 2), Math.ceil(breakEven)));
+  return {
+    entryBps, exitBps: 0, stopBps: Math.min(5000, Math.max(20, Math.round(cost + 3 * entryBps))),
+    maxHoldMinutes: stats.halfLifeMin === null ? DEFAULT_SYMBOL.maxHoldMinutes : Math.min(1440, Math.max(60, Math.ceil(6 * stats.halfLifeMin))),
+  };
+}
+
 /** v0.87.0 以前存的全局参数：Var 与 Lighter 手续费是数（默认 0），0 换成「按目录」，非 0 的 Lighter 费率两个 Lighter 场所都用。 */
 export function upgradeGlobal(value: unknown): GlobalParams {
   if (!isObject(value)) return DEFAULT_GLOBAL;
@@ -266,9 +287,10 @@ export function closeSpread(sample: Sample, position: Position): Spread | null {
  * fallbackBaseline：本时段样本不足、基线退回了全天窗口。时段刚切换（周一开盘、进周末）时全天窗口里是上一个时段的基差，不开仓。
  * expectedNetBps：见 expectedNetBps()。costBps：开仓时的往返成本（买 A 价差 − 卖 A 价差）；开仓后按可成交价的浮亏
  * 一开始就等于它，达到止损线的话下一个样本就止损，所以不开。
+ * autoPending：配对用自动配置，但近期样本还不够算出推荐参数。
  */
-export interface GateContext { openPositions: number; openNotionalUsd: number; dailyNetUsd: number; cooldownUntil: number; eligible: boolean; legBusy?: boolean; feeUnknown?: boolean; fallbackBaseline?: boolean; expectedNetBps?: number; costBps?: number }
-export const FALLBACK_BLOCK = '本时段基线样本不足（全天基线不开仓）', THIN_BLOCK = '预期净利不足', COST_BLOCK = '往返成本已达止损线', FEE_BLOCK = '手续费未知', BUSY_BLOCK = '同一腿已在另一配对持仓';
+export interface GateContext { openPositions: number; openNotionalUsd: number; dailyNetUsd: number; cooldownUntil: number; eligible: boolean; legBusy?: boolean; feeUnknown?: boolean; fallbackBaseline?: boolean; expectedNetBps?: number; costBps?: number; autoPending?: boolean }
+export const FALLBACK_BLOCK = '本时段基线样本不足（全天基线不开仓）', THIN_BLOCK = '预期净利不足', COST_BLOCK = '往返成本已达止损线', FEE_BLOCK = '手续费未知', BUSY_BLOCK = '同一腿已在另一配对持仓', AUTO_BLOCK = '自动配置的样本不足';
 /**
  * 复核后的开仓决定对应的两个门槛读数。
  * `quoted`：报价时刻（复核前）的开仓决定，只在样本带 Var token 询价时传（不带询价时与 v0.81.0 相同，只看复核后的）。开仓后的止损仍按公开报价的样本判断，所以成本门槛取复核后与报价时刻两种口径里
@@ -280,6 +302,7 @@ export function openBlocker(sample: Sample, params: SymbolParams, global: Global
   if (global.paused) return '已暂停';
   if (!params.enabled) return '未启用';
   if (!context.eligible) return '规格未确认';
+  if (context.autoPending) return AUTO_BLOCK;
   if (!params.regimes.includes(sample.regime)) return '当前时段不开仓';
   if (context.fallbackBaseline) return FALLBACK_BLOCK;
   if (sample.t < context.cooldownUntil) return '冷却中';

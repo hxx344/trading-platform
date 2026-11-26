@@ -15,12 +15,12 @@ import { VARIATIONAL_SESSION_FILE } from '../src/monitor/variational-session.ts'
 import { fakeVariationalToken } from './monitor-fake.ts';
 import { pairMarkets, parsePairKey, parseRhMarkets, parseVarListings, parseVarQuote, regimeOf, spreadOf, midBasis, type Sample } from '../src/varlighter/model.ts';
 import { BaselineTracker, RollingWindow, regimeStats, suggestedEntryBps } from '../src/varlighter/stats.ts';
-import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, closePosition, decide, openBlocker, openPosition, positionSpread, readGlobalParams, readSymbolParams, type GlobalParams, type Position, type SymbolParams } from '../src/varlighter/strategy.ts';
+import { AUTO_BLOCK, DEFAULT_GLOBAL, DEFAULT_SYMBOL, closePosition, decide, openBlocker, openPosition, positionSpread, readGlobalParams, readSymbolParams, recommendParams, type GlobalParams, type Position, type SymbolParams } from '../src/varlighter/strategy.ts';
 import { backtestRequest, runBacktest } from '../src/varlighter/backtest.ts';
 import { BOOK_KEEP_LEVELS, CONNECT_TIMEOUT_MS, DEPTH_MAX_GAP_MS, HyperliquidStream, LighterStream, depthAt, depthSnapshot, vwap, type SocketLike } from '../src/varlighter/feeds.ts';
 import { orderPlan } from '../src/varlighter/plan.ts';
 import { MIGRATED_KEY, openVarLighterStore } from '../src/varlighter/store.ts';
-import { COOLDOWN_KEY, LEGACY_UPGRADE, SETTINGS_KEY, createVarLighterEngine, customKey, downsample, readCustomPair, upgradeSettings } from '../src/varlighter/engine.ts';
+import { COOLDOWN_KEY, EXITS_KEY, LEGACY_UPGRADE, SETTINGS_KEY, createVarLighterEngine, customKey, downsample, readCustomPair, upgradeSettings } from '../src/varlighter/engine.ts';
 import { READ_TOKEN_MAX_BYTES } from '../src/read-token.ts';
 import { localDexForward, openVarLighter, varLighterLoop, varLighterViews } from '../src/dex/host.ts';
 
@@ -413,7 +413,7 @@ test('旧参数换算：键与方向换新写法、手续费 0 改为按目录�
   assert.deepEqual(upgraded.pairs, []);
   assert.deepEqual(upgradeSettings({ venues: ['rh'] }).combos, ['var|rh', 'var|entropy']);
   assert.deepEqual(upgradeSettings({}).combos, [...DEFAULT_COMBOS]);
-  assert.deepEqual(upgradeSettings(null), { revision: 0, global: DEFAULT_GLOBAL, symbols: {}, confirmed: [], combos: [...DEFAULT_COMBOS], pairs: [] });
+  assert.deepEqual(upgradeSettings(null), { revision: 0, global: DEFAULT_GLOBAL, symbols: {}, confirmed: [], combos: [...DEFAULT_COMBOS], pairs: [], auto: [] });
   assert.deepEqual(LEGACY_UPGRADE.cooldown({ 'rh:BTC': 5, bad: 6, 'lighter:ETH': 'x' }), { [RH_BTC]: 5 });
   assert.deepEqual(LEGACY_UPGRADE.cooldown(null), {});
   assert.deepEqual(LEGACY_UPGRADE.fees({ global: { varFeeBps: 1, rhFeeBps: -2 } }), { aFeeBps: 1, bFeeBps: 0 });
@@ -1317,7 +1317,7 @@ test('失联计时：行情流短暂断线再续上不重新计，断开超过 3
   }
 });
 
-test('两腿行情流的配对：启用或有持仓的每 15 秒、其余每分钟按本机时刻采一条，两腿都要有一档；状态里有最近一轮', async t => {
+test('两腿行情流的配对：启用或有持仓的每 5 秒、其余每 20 秒按本机时刻采一条，两腿都要有一档；状态里有最近一轮', async t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const LE_SNDK = 'lighter:SNDK|entropy:SNDK';
   let clock = T0;
@@ -1364,24 +1364,111 @@ test('两腿行情流的配对：启用或有持仓的每 15 秒、其余每分�
       bbo();
       return engine.sampleLive();
     };
-    assert.equal(check(T0 + 13_999).due, 0, '有持仓：15 秒一条（留 1 秒余量）');
-    assert.deepEqual([check(T0 + 14_000).due, engine.sampleLive().due], [1, 0]);
+    assert.equal(check(T0 + 4_499).due, 0, '有持仓：5 秒一条（留半秒余量）');
+    assert.deepEqual(engine.views.state().sources.live, { at: T0, due: 1, written: 1, noTop: 0, blocked: {} }, '没有配对到期的检查不顶掉状态里的最近一轮');
+    assert.deepEqual([check(T0 + 4_500).due, engine.sampleLive().due], [1, 0]);
     assert.deepEqual([store.latest(LE_SNDK)!.bMark, store.latest(LE_SNDK)!.bIndex, store.latest(LE_SNDK)!.bFunding], [100.12, 100.13, 0.00002], '标记价、预言机价与资金费取行情流');
-    let last = T0 + 14_000;
+    let last = T0 + 4_500;
     engine.views.reset({ confirm: 'RESET' });
-    assert.equal(check(last + 58_000).due, 0, '没有持仓也没启用：每分钟一条');
-    assert.equal(check(last + 59_000).written, 1);
-    last += 59_000;
+    assert.equal(check(last + 19_499).due, 0, '没有持仓也没启用：20 秒一条');
+    assert.equal(check(last + 19_500).written, 1);
+    last += 19_500;
     engine.views.settings({ revision: 3, symbols: { [LE_SNDK]: { enabled: true } } });
-    assert.equal(check(last + 13_999).due, 0);
-    const stats = check(last + 14_000);
-    assert.deepEqual(stats, { at: last + 14_000, due: 1, written: 1, noTop: 0, blocked: {} });
+    assert.equal(check(last + 4_499).due, 0);
+    const stats = check(last + 4_500);
+    assert.deepEqual(stats, { at: last + 4_500, due: 1, written: 1, noTop: 0, blocked: {} });
     const view = engine.views.state();
     assert.deepEqual(view.sources.live, stats);
     assert.deepEqual(view.sources.venues.map(item => [item.venue, item.enabled, item.pairs]), [['rh', false, 0], ['lighter', true, 1], ['entropy', true, 1]]);
     assert.equal(view.sources.var.enabled, false, '没有配对用到 Var');
     assert.equal(view.rows[0].bFeeBps, 6.75, 'Entropy 手续费按目录');
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('自动配置的推荐参数：入场取偏离 95 分位减半个往返成本、不低于保本加最低净利，止损随往返成本与入场，最长持有按半衰期', () => {
+  const costs = { slippageBps: 1, minNetBps: 3, ...ZERO_FEES };
+  assert.deepEqual(recommendParams({ costMedian: 8, deviation95: 30, halfLifeMin: 12 }, costs), { entryBps: 26, exitBps: 0, stopBps: 86, maxHoldMinutes: 72 });
+  assert.deepEqual(recommendParams({ costMedian: 8, deviation95: 6, halfLifeMin: null }, costs), { entryBps: 11, exitBps: 0, stopBps: 41, maxHoldMinutes: 720 }, '偏离小：入场抬到 半个往返成本 4 + 滑点 4 + 最低净利 3');
+  assert.equal(recommendParams({ costMedian: 8, deviation95: 6, halfLifeMin: 1 }, { ...costs, aFeeBps: 2, bFeeBps: 2 })!.entryBps, 19, '手续费计入保本线');
+  assert.deepEqual(recommendParams({ costMedian: 0, deviation95: 1, halfLifeMin: 1 }, { slippageBps: 0, minNetBps: 0, ...ZERO_FEES }), { entryBps: 5, exitBps: 0, stopBps: 20, maxHoldMinutes: 60 }, '各项下限');
+  assert.equal(recommendParams({ costMedian: 8, deviation95: 30, halfLifeMin: 500 }, costs)!.maxHoldMinutes, 1440);
+  assert.equal(recommendParams({ costMedian: null, deviation95: 30, halfLifeMin: 12 }, costs), null, '没有可成交价时不给推荐');
+  const gate = { openPositions: 0, openNotionalUsd: 0, dailyNetUsd: 0, cooldownUntil: 0, eligible: true };
+  assert.equal(openBlocker(sample(T0, 100.3), { ...DEFAULT_SYMBOL, enabled: true }, DEFAULT_GLOBAL, { ...gate, autoPending: true }), AUTO_BLOCK);
+  assert.equal(openBlocker(sample(T0, 100.3), { ...DEFAULT_SYMBOL, enabled: true }, DEFAULT_GLOBAL, gate), null);
+});
+
+test('自动配置：总览勾选即启用并按推荐参数运行，保存的参数留作手动值；推荐值 10 分钟重算、随成本参数即时变；样本不足时标出并不给推荐；列表只留有参数的键', async () => {
+  let clock = T0;
+  const wave = (count: number) => Array.from({ length: count }, (_, index) => sample(T0 - (count - index) * 60_000, 100 * (1 + (10 + 40 * Math.sin(index / 5)) / 1e4)));
+  const global = { ...DEFAULT_GLOBAL, minSamples: 10 };
+  const { file, dir, engine, sockets, dispose } = seededEngine(store => {
+    store.setState(SETTINGS_KEY, { ...settings2({}, global), auto: [RH_BTC, 'var:NOPE|rh:NOPE', 7] }, T0);
+    store.addSamples(wave(300));
+  }, { clock: () => clock });
+  try {
+    engine.startStreams();
+    sockets[0].open();
+    sockets[0].push(RH_SNAPSHOT);
+    await engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
+    await engine.pollVar(AbortSignal.timeout(1000));
+    const row = () => engine.views.state().rows.find(item => item.key === RH_BTC)!;
+    assert.deepEqual(engine.views.state().settings.auto, [], '读回时丢掉没有保存参数的键与无效项');
+    assert.deepEqual([row().enabled, row().auto, row().autoPending, row().entryBps], [false, false, false, DEFAULT_SYMBOL.entryBps]);
+    const preview = engine.views.symbol(RH_BTC, 24).auto;
+    assert.equal(preview.on, false, '没开自动配置时详情页也给出推荐值');
+    assert.ok(preview.params !== null && preview.params.entryBps >= 25 && preview.params.entryBps <= 50, `入场 ${preview.params?.entryBps} 应接近偏离 95 分位`);
+
+    assert.deepEqual(code(() => engine.views.settings({ revision: 3, auto: 'x' })), [400, 'invalid_body']);
+    const saved = engine.views.settings({ revision: 3, symbols: { [RH_BTC]: { enabled: true } }, auto: [RH_BTC, 'rh:BTC', 'var:ETH|rh:ETH'] });
+    assert.deepEqual(saved.auto, [RH_BTC], '旧写法的键规整、去重，没有保存参数的键不留');
+    assert.deepEqual([row().enabled, row().auto, row().autoPending, row().entryBps, row().exitBps], [true, true, false, preview.params.entryBps, 0]);
+    const view = engine.views.symbol(RH_BTC, 24);
+    assert.deepEqual([view.params.entryBps, view.params.stopBps, view.params.maxHoldMinutes], [DEFAULT_SYMBOL.entryBps, DEFAULT_SYMBOL.stopBps, DEFAULT_SYMBOL.maxHoldMinutes], '保存的参数不变');
+    assert.deepEqual({ entryBps: view.effective.entryBps, exitBps: view.effective.exitBps, stopBps: view.effective.stopBps, maxHoldMinutes: view.effective.maxHoldMinutes }, view.auto.params);
+    assert.deepEqual([view.auto.on, view.auto.reason, view.auto.at, view.effective.notionalUsd, view.effective.cooldownMinutes], [true, null, T0, DEFAULT_SYMBOL.notionalUsd, DEFAULT_SYMBOL.cooldownMinutes]);
+
+    clock = T0 + 10 * 60_000 - 1;
+    assert.equal(engine.views.symbol(RH_BTC, 24).auto.at, T0, '10 分钟内沿用同一份统计');
+    clock = T0 + 10 * 60_000;
+    assert.equal(engine.views.symbol(RH_BTC, 24).auto.at, clock, '到点重算');
+    const raised = engine.views.settings({ revision: saved.revision, global: { minNetBps: 200 } });
+    const lifted = recommendParams({ costMedian: 0, deviation95: 0, halfLifeMin: null }, { ...raised.global, aFeeBps: row().aFeeBps ?? 0, bFeeBps: row().bFeeBps ?? 0 })!.entryBps;
+    assert.ok(row().entryBps >= lifted && row().entryBps > preview.params.entryBps, `最低净利调高，入场线马上抬高（${row().entryBps}）`);
+    const manual = engine.views.settings({ revision: raised.revision, auto: [] });
+    assert.deepEqual([row().enabled, row().auto, row().entryBps], [true, false, DEFAULT_SYMBOL.entryBps], '关掉自动配置回到保存的参数，启用状态不变');
+    const removed = engine.views.settings({ revision: manual.revision, auto: [RH_BTC], symbols: { [RH_BTC]: null } });
+    assert.deepEqual(removed.auto, [], '参数删掉的配对不留在自动配置里');
+  } finally { dispose(true); }
+  const reopened = openVarLighterStore(file);
+  try { assert.deepEqual(reopened.state<{ auto: string[] }>(SETTINGS_KEY)!.auto, []); } finally { reopened.close(); rmSync(dir, { recursive: true, force: true }); }
+
+  // 自动配置下开的仓沿用开仓时记下的平仓规则；记录对不上持仓编号的不用。
+  for (const [id, hold] of [['p-' + RH_BTC, 1440], ['p-old', 30]] as const) {
+    const held = seededEngine(store => {
+      store.setState(SETTINGS_KEY, { ...settings2({ [RH_BTC]: { ...DEFAULT_SYMBOL, enabled: true, maxHoldMinutes: 30 } }, global), auto: [RH_BTC] }, T0);
+      store.setState(EXITS_KEY, { [RH_BTC]: { id, exitBps: 0, stopBps: 5000, maxHoldMinutes: 1440 } }, T0);
+      store.savePosition(position(RH_BTC));
+    });
+    try { assert.equal(held.engine.views.paper().positions[0].maxHoldMinutes, hold); } finally { held.dispose(); }
+  }
+
+  const thin = seededEngine(store => {
+    store.setState(SETTINGS_KEY, { ...settings2({ [RH_BTC]: { ...DEFAULT_SYMBOL, enabled: true } }, global), auto: [RH_BTC] }, T0);
+    store.addSamples(wave(3));
+  });
+  try {
+    thin.engine.startStreams();
+    thin.sockets[0].open();
+    thin.sockets[0].push(RH_SNAPSHOT);
+    await thin.engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
+    await thin.engine.pollVar(AbortSignal.timeout(1000));
+    const row = thin.engine.views.state().rows.find(item => item.key === RH_BTC)!;
+    assert.deepEqual([row.auto, row.autoPending, row.entryBps], [true, true, DEFAULT_SYMBOL.entryBps], '样本不足：标出，读数按保存的参数');
+    const auto = thin.engine.views.symbol(RH_BTC, 24).auto;
+    assert.deepEqual([auto.on, auto.params], [true, null]);
+    assert.match(auto.reason!, /近期样本不足（\d+ \/ 10）/);
+  } finally { thin.dispose(); }
 });
 
 test('手动配对：添加、重复与自动配对重复、数量上限；启用要求在配对里、规格待确认的先确认、规格不同的不能启用；启用中的不能删；已启用的规格降级不挡无关保存', async () => {

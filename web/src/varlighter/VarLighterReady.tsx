@@ -92,7 +92,7 @@ function CombosPanel({ view, onChanged }: { view: StateView; onChanged: () => Pr
       <span className="muted">{item.enabled ? `${item.pairs} 对` : '未开启'}</span>
       {write.busy === `combo:${item.combo}` ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : null}
     </li>)}</ul>
-    <p className="vl-note">两腿都是行情流（Lighter、Entropy）的配对每 15 秒采一次（未启用、没有持仓的每分钟一次），基线按约一分钟抽一个样本；有 Var 一腿的配对跟着每分钟一次的 Var 报价。</p>
+    <p className="vl-note">两腿都是行情流（Lighter、Entropy）的配对每 5 秒采一次（未启用、没有持仓的每 20 秒一次），基线按约一分钟抽一个样本；有 Var 一腿的配对跟着每分钟一次的 Var 报价。</p>
   </section>;
 }
 

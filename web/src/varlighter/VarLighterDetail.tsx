@@ -8,7 +8,7 @@ import type { ClosedTrade } from '../../../src/varlighter/strategy.ts';
 import type { BacktestView, StateView, SymbolView } from '../../../src/varlighter/views.ts';
 import { Badge, EquityChart, Metric, SpreadChart, SpreadLegend, stampText, useWrite } from './parts.tsx';
 import {
-  ALL_DIRECTIONS, BACKTEST_HOURS, IDENTITY_LABELS, REASON_LABELS, REGIME_LABELS, SYMBOL_FIELDS, VARLIGHTER_BASE, VAR_QUOTE_LABELS, backtestBody, bps,
+  ALL_DIRECTIONS, AUTO_FIELDS, BACKTEST_HOURS, IDENTITY_LABELS, REASON_LABELS, REGIME_LABELS, SYMBOL_FIELDS, VARLIGHTER_BASE, VAR_QUOTE_LABELS, age, autoBody, autoFormPatch, backtestBody, bps,
   chartRows, directionLabel, duration, fundingAnnual, percent, plain, price, settingsBody, signal, signedUsd, symbolForm, symbolRequest, tone, usd, varLighterHref, venueLabel, venueShort, pairLabel, type SymbolForm,
 } from './varlighter-form.ts';
 
@@ -39,7 +39,8 @@ export function VarLighterDetail({ view, symbol, onChanged, onExpired }: { view:
 
 function Detail({ data, view, onChanged }: { data: SymbolView; view: StateView; onChanged: () => Promise<void> }) {
   const row = view.rows.find(item => item.key === data.key) ?? null;
-  const rows = useMemo(() => chartRows(data.points, data.params.entryBps), [data.points, data.params.entryBps]);
+  // 入场带与读数按当前生效的参数：自动配置开着时是推荐值。
+  const rows = useMemo(() => chartRows(data.points, data.effective.entryBps), [data.points, data.effective.entryBps]);
   const latest = data.latest;
   const funding = fundingAnnual(latest?.aFunding ?? row?.aFunding ?? null, latest?.bFunding ?? row?.bFunding ?? null);
   const aName = venueShort(data.a.venue), bName = venueShort(data.b.venue), pairName = `${aName}↔${bName}`;
@@ -51,7 +52,7 @@ function Detail({ data, view, onChanged }: { data: SymbolView; view: StateView; 
     <section className="vl-metrics" aria-label={`${data.symbol} 读数`}>
       <Metric label="中间价基差" value={`${bps(row?.mid ?? null)} 基点`} foot={latest ? `样本 ${stampText(latest.t)} · ${REGIME_LABELS[latest.regime]}` : '无样本'} />
       <Metric label="基线中位数 ± σ" value={row?.baseline ? `${bps(row.baseline.median)} ± ${plain(row.baseline.sigma)}` : '样本不足'} foot={row?.baseline ? `${row.baseline.fallback ? '全天' : REGIME_LABELS[row.baseline.regime]}基线 · ${row.baseline.samples} 个样本 · 窗口 ${data.global.windowHours} 小时` : `至少 ${data.global.minSamples} 个样本`} />
-      <Metric label={`卖 ${aName} / 买 ${aName} 偏离`} value={`${bps(row?.rich ?? null)} / ${bps(row?.cheap ?? null)}`} foot={`入场 ${plain(data.params.entryBps)} · 出场 ${plain(data.params.exitBps)} · ${data.bucket} 档${row?.estimated ? ' · 一档估算' : ''}`} />
+      <Metric label={`卖 ${aName} / 买 ${aName} 偏离`} value={`${bps(row?.rich ?? null)} / ${bps(row?.cheap ?? null)}`} foot={`入场 ${plain(data.effective.entryBps)} · 出场 ${plain(data.effective.exitBps)}${data.auto.on && data.auto.params ? '（自动配置）' : ''} · ${data.bucket} 档${row?.estimated ? ' · 一档估算' : ''}`} />
       <Metric label="资金费（年化）" value={`${funding.a} / ${funding.b}`} foot={`${aName} / ${bName}，只作参考`} />
       <Metric label="两腿合约" value={`${data.a.symbol} ↔ ${data.b.symbol}${data.ratio !== 1 ? ` ×${data.ratio}` : ''}`}
         foot={`手续费 ${fee(data.fees.a)} / ${fee(data.fees.b)} 基点 · ${[data.a, data.b].filter(leg => leg.venue !== 'var').map(leg => `${venueShort(leg.venue)} #${leg.market.id} 最小 ${leg.market.minQuote} USDC`).join(' · ')} · 规格${IDENTITY_LABELS[data.identity]}`} />
@@ -104,16 +105,30 @@ function ParamsPanel({ data, view, onChanged }: { data: SymbolView; view: StateV
     if (!body.ok) return;
     void write.run('backtest', () => api<BacktestView>(`${VARLIGHTER_BASE}/backtest`, { body: body.value, timeoutMs: 60_000 }), value => { setResult(value); return `回测完成：${value.summary.trades} 笔，净 ${signedUsd(value.summary.netUsd)}`; });
   };
+  const auto = data.auto, recommended = auto.params;
   const save = () => {
     if (!parsed.ok) return;
-    void write.run('save', () => api(`${VARLIGHTER_BASE}/settings`, { body: settingsBody(view.settings, { symbol: { symbol: data.key, params: parsed.value } }) }), () => { void onChanged(); return '参数已保存，模拟盘从下一个样本起按新参数运行'; });
+    void write.run('save', async () => { await api(`${VARLIGHTER_BASE}/settings`, { body: settingsBody(view.settings, { symbol: { symbol: data.key, params: parsed.value } }) }); await onChanged().catch(() => {}); },
+      () => { return auto.on ? '参数已保存；自动配置开着，入场、出场、止损与最长持有仍用推荐值' : '参数已保存，模拟盘从下一个样本起按新参数运行'; });
+  };
+  const setAuto = (on: boolean) => {
+    void write.run('auto', async () => { await api(`${VARLIGHTER_BASE}/settings`, { body: autoBody(view.settings, data.key, on) }); await onChanged().catch(() => {}); },
+      () => { return on ? '已改用自动配置：新开的仓按推荐的入场、出场、止损与最长持有，推荐值随行情更新' : '已关闭自动配置，按下面保存的参数运行'; });
   };
   return <section className="panel" aria-label="参数与回测">
     <div className="panel-heading"><h2>参数与回测</h2><span className="muted">{saved ? '与已保存参数一致' : '有未保存的修改'}</span></div>
+    <div className={`vl-auto${auto.on ? ' on' : ''}`} aria-label="自动配置">
+      <label><input type="checkbox" checked={auto.on} disabled={write.busy !== null} onChange={event => setAuto(event.target.checked)} />自动配置<Badge tone={auto.on ? recommended && data.params.enabled ? 'info' : 'warn' : ''}>{auto.on ? !recommended ? '等待样本' : data.params.enabled ? '使用中' : '已选用 · 配对未启用' : '未使用'}</Badge></label>
+      {recommended ? <>
+        <dl>{SYMBOL_FIELDS.filter(field => AUTO_FIELDS.includes(field.key as (typeof AUTO_FIELDS)[number])).map(field => <div key={field.key}><dt>{field.label}</dt><dd>{recommended[field.key as (typeof AUTO_FIELDS)[number]]} {field.unit}</dd></div>)}</dl>
+        <p>{auto.on ? '模拟盘按这组推荐值运行' : '当前的推荐值'}：按{auto.regime ? REGIME_LABELS[auto.regime] : ''}最近 {auto.samples.toLocaleString()} 个样本的偏离、往返成本与回归快慢，加上当前的滑点、手续费和最低预期净利算出，{age(auto.at, view.now)}更新，约每 10 分钟重算。名义金额、冷却、时段与方向仍用下面保存的值。
+          <button type="button" className="button secondary" onClick={() => set(autoFormPatch(recommended))}>填入表单</button></p>
+      </> : <p className={auto.on ? 'vl-warn' : undefined}>{auto.reason ?? '暂时没有推荐值'}{auto.on ? '。有推荐值之前模拟盘不开仓，已有持仓按保存的参数平仓。' : '。'}</p>}
+    </div>
     <div className="vl-fields">
-      {SYMBOL_FIELDS.map(field => <label className="vl-field" key={field.key}>{field.label}（{field.unit}）
+      {SYMBOL_FIELDS.map(field => { const taken = auto.on && recommended ? recommended[field.key as (typeof AUTO_FIELDS)[number]] : undefined; return <label className="vl-field" key={field.key}>{field.label}（{field.unit}）
         <input inputMode="decimal" value={form[field.key]} onChange={event => set({ [field.key]: event.target.value } as Partial<SymbolForm>)} />
-        {field.hint ? <small>{field.hint}</small> : null}</label>)}
+        {taken !== undefined ? <small className="vl-auto-note">自动配置中，当前用 {taken}；这里是关闭自动配置后的值</small> : field.hint ? <small>{field.hint}</small> : null}</label>; })}
     </div>
     <div className="vl-options"><b>允许开仓的时段（不影响平仓）</b>{data.regimes.map(regime => <label key={regime}><input type="checkbox" checked={form.regimes.includes(regime)}
       onChange={event => set({ regimes: event.target.checked ? [...form.regimes, regime] : form.regimes.filter(item => item !== regime) })} />{REGIME_LABELS[regime]}</label>)}</div>

@@ -168,3 +168,18 @@ a.vl-symbol:hover{color:var(--accent)}
 .vl-help dd{margin:0}
 .vl-help p{padding:0 14px 14px}
 @media (max-width:650px){.vl-help dl{grid-template-columns:minmax(0,1fr);gap:2px}.vl-help dd{margin-bottom:8px}}
+
+/* 模拟盘的行内勾选与详情页的自动配置 */
+.vl-check{display:inline-flex;align-items:center;gap:6px;color:var(--text-secondary);cursor:pointer}
+.vl-check.on{color:var(--emerald);font-weight:600}
+.vl-check input{width:16px;height:16px;margin:0;accent-color:var(--emerald);cursor:pointer}
+.vl-check input:disabled{cursor:not-allowed}
+.vl-auto{display:flex;flex-direction:column;gap:8px;margin:14px 14px 0;padding:12px 14px;border:1px solid var(--surface-4);border-radius:var(--radius-md);background:var(--surface-1);color:var(--text-tertiary);font-size:.75rem;line-height:1.65}
+.vl-auto.on{border-color:var(--info);background:var(--info-soft)}
+.vl-auto label{display:inline-flex;align-items:center;gap:6px;color:var(--text-primary);font-size:.8125rem;font-weight:600;cursor:pointer}
+.vl-auto dl{display:flex;flex-wrap:wrap;gap:6px 24px;margin:0}
+.vl-auto dt{color:var(--text-tertiary);font-size:.6875rem}
+.vl-auto dd{margin:0;color:var(--text-primary);font-size:.875rem;font-weight:600;font-variant-numeric:tabular-nums}
+.vl-auto p .button{margin-left:8px}
+.vl-auto p.vl-warn{color:var(--warning)}
+.vl-field small.vl-auto-note{color:var(--info)}

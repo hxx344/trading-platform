@@ -21,7 +21,7 @@ test('DEX 模拟盘在 SQLite 提交后发布持仓、成交、冷却和参数�
   db.exec(`CREATE TABLE fault_parent(id INTEGER PRIMARY KEY);
     CREATE TABLE fault_child(id INTEGER REFERENCES fault_parent(id) DEFERRABLE INITIALLY DEFERRED);`);
   const settings = { revision: 1, global: { ...DEFAULT_GLOBAL, minSamples: 10, varFeeBps: 0, rhFeeBps: 0 },
-    symbols: { [key]: { ...DEFAULT_SYMBOL, enabled: true } }, confirmed: [], combos: ['var|rh'], pairs: [] };
+    symbols: { [key]: { ...DEFAULT_SYMBOL, enabled: true } }, confirmed: [], combos: ['var|rh'], pairs: [], auto: [] };
   store.setState(SETTINGS_KEY, settings, time);
   store.setState(COOLDOWN_KEY, { [other]: otherUntil }, time);
   const fetcher = (withQuote: boolean) => async (url: string) => {

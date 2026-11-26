@@ -14,11 +14,12 @@ import { VarLighterPaper } from './VarLighterPaper.tsx';
 import { VarLighterReady } from './VarLighterReady.tsx';
 import {
   IDENTITY_LABELS, OVERVIEW_MODES, OVERVIEW_MODE_KEY, REGIME_LABELS, SIMPLE_SORT_KEYS, VARLIGHTER_BASE, VARLIGHTER_TABS, age, bps, comboShort, directionLabel, directionShort, directionSides, entryProgress, fundingAnnual, matchesCombo, matchesQuery, plain,
-  readOverviewMode, settingsBody, signal, signedUsd, sortRows, tone, usd, varLighterHref, venueShort, type ComboFilter, type OverviewMode, type SortKey, type VarLighterTab,
+  quickEnableBody, readOverviewMode, settingsBody, signal, signedUsd, sortRows, tone, usd, varLighterHref, venueShort, type ComboFilter, type OverviewMode, type SortKey, type VarLighterTab,
 } from './varlighter-form.ts';
 
 export const STATE_PATH = `${VARLIGHTER_BASE}/state`;
-export const STATE_REFRESH_MS = 10_000;
+// 两腿都是行情流的配对启用后 5 秒一个样本，页面跟着 5 秒读一次。
+export const STATE_REFRESH_MS = 5_000;
 const READ_TIMEOUT_MS = 15_000;
 
 /** 同一路径的订阅共用一次读取，各页签用同样的选项。 */
@@ -75,7 +76,7 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
   const [query, setQuery] = useState('');
   const [onlyEnabled, setOnlyEnabled] = useState(false);
   const [mode, setMode] = useState<OverviewMode>(() => { try { return readOverviewMode(localStorage.getItem(OVERVIEW_MODE_KEY)); } catch { return 'simple'; } });
-  const orphanWrite = useWrite();
+  const orphanWrite = useWrite(), paperWrite = useWrite();
   const [combo, setCombo] = useState<ComboFilter>('all');
   const deferred = useDeferredValue(query);
   const rows = sortRows(view.rows.filter(row => matchesQuery(row, deferred) && matchesCombo(row, combo) && (!onlyEnabled || row.enabled || row.position)), sort.key, sort.descending);
@@ -97,6 +98,13 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
   };
   const header = (key: SortKey, text: string, num = true, hint?: string) => <th className={num ? 'num' : undefined} title={hint} aria-sort={sort.key === key ? sort.descending ? 'descending' : 'ascending' : undefined}>
     <button type="button" aria-pressed={sort.key === key} onClick={() => setSort(current => ({ key, descending: current.key === key ? !current.descending : key !== 'symbol' && key !== 'kind' }))}>{text}{sort.key === key ? sort.descending ? ' ↓' : ' ↑' : ''}</button></th>;
+  const toggle = (row: StateRow, on: boolean) => {
+    const label = `${row.symbol}（${venueShort(row.a.venue)}↔${venueShort(row.b.venue)}）`;
+    // 等状态读回来再放开复选框：下一次勾选要带新的版本号。
+    void paperWrite.run(`paper:${row.key}`, async () => { await api(`${VARLIGHTER_BASE}/settings`, { body: quickEnableBody(view.settings, row.key, on) }); await onChanged().catch(() => {}); },
+      () => { return on ? `${label} 已启用模拟盘，入场、出场、止损与最长持有按推荐值自动配置` : `${label} 已停用${row.position ? '，已有持仓照常平仓' : ''}`; });
+  };
+  const paperProps = { now: view.now, multi, busy: paperWrite.busy !== null, onToggle: toggle };
   const pairFoot = [...combos.map(item => `${comboShort(item.combo)} ${item.pairs}`), customCount ? `手动 ${customCount}` : '', counts.review ? `待确认 ${counts.review}` : '', counts.mismatch ? `规格不同 ${counts.mismatch}` : ''].filter(Boolean).join(' · ');
   return <>
     <section className="vl-metrics" aria-label="概览">
@@ -119,24 +127,25 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
           {OVERVIEW_MODES.map(item => <button type="button" key={item.id} aria-pressed={mode === item.id} title={item.hint} onClick={() => changeMode(item.id)}>{item.label}</button>)}</div>
         <span className="muted">{rows.length} / {view.rows.length}</span>
       </div>
+      {paperWrite.message ? <div className="vl-actions vl-pause"><Callout tone={paperWrite.message.tone}>{paperWrite.message.text}</Callout></div> : null}
       {rows.length ? <div className="vl-table vl-overview"><table>
         {simple
-          ? <thead><tr>{header('symbol', '标的', false)}{header('mid', '当前价差', true, '两个场所同一资产的价格差')}{header('gap', '距开仓', false, '当前偏离对比开仓线，条满即达到开仓条件')}<th>操作方向</th>
-            {header('cost', '交易成本', true, '开仓加平仓、两条腿合计的盘口成本')}<th>模拟盘</th></tr></thead>
-          : <thead><tr>{header('symbol', '标的', false)}{header('kind', '类别 · 时段', false)}{header('mid', '中间价基差')}<th className="num">基线</th>{header('z', '偏离 σ')}
-            <th className="num">卖 A / 买 A</th>{header('cost', '往返成本')}{header('gap', '信号')}<th className="num">资金费（年化）</th>{header('samples', '24h 样本')}<th>模拟盘</th></tr></thead>}
-        <tbody>{rows.map(row => simple ? <SimpleRow key={row.key} row={row} now={view.now} multi={multi} /> : <Row key={row.key} row={row} now={view.now} multi={multi} />)}</tbody>
+          ? <thead><tr>{header('symbol', '标的', false)}<th title="勾选即启用，参数按推荐值自动配置">模拟盘</th>{header('mid', '当前价差', true, '两个场所同一资产的价格差')}{header('gap', '距开仓', false, '当前偏离对比开仓线，条满即达到开仓条件')}<th>操作方向</th>
+            {header('cost', '交易成本', true, '开仓加平仓、两条腿合计的盘口成本')}</tr></thead>
+          : <thead><tr>{header('symbol', '标的', false)}<th title="勾选即启用，参数按推荐值自动配置">模拟盘</th>{header('kind', '类别 · 时段', false)}{header('mid', '中间价基差')}<th className="num">基线</th>{header('z', '偏离 σ')}
+            <th className="num">卖 A / 买 A</th>{header('cost', '往返成本')}{header('gap', '信号')}<th className="num">资金费（年化）</th>{header('samples', '24h 样本')}</tr></thead>}
+        <tbody>{rows.map(row => simple ? <SimpleRow key={row.key} row={row} {...paperProps} /> : <Row key={row.key} row={row} {...paperProps} />)}</tbody>
       </table></div> : <TableEmpty>{view.rows.length ? '没有符合筛选的配对' : view.sources.venues.some(item => item.catalog.ok) ? '开着的组合里还没有配对的报价；可在实盘准备页开启组合或添加手动配对' : '正在读取各场所的目录…'}</TableEmpty>}
       <details className="vl-help">
         <summary>这些数字怎么看</summary>
         {simple ? <dl>
           <dt>当前价差</dt><dd>同一资产在两个场所的价格差（配对里写在前面的场所相对后面的场所，有 Var 时 Var 在前），正数表示前面的更贵。下面的「平时」是近期同一时段的常见水平。</dd>
+          <dt>模拟盘</dt><dd>勾选就把这个配对交给模拟盘自动开平仓，不用先设参数：入场线、出场、止损和最长持有由系统按这个配对近期的波动和交易成本推荐，约每 10 分钟更新一次（标「自动」）；刚开始采集、样本还不够时先不开仓。取消勾选即停用，已有的持仓照常平仓。想自己定参数，点标的代码进详情页关掉「自动配置」。</dd>
           <dt>距开仓</dt><dd>现在的价差比平时偏了多少，对比这个标的的开仓线。进度条满了就到了开仓线，这一行会高亮；模拟盘真正开仓前还要过风控，也只做该配对参数里允许的方向。数据超过 5 分钟没更新的行不高亮。</dd>
           <dt>操作方向</dt><dd>价差回到平时水平时能赚钱的做法：贵的一边卖出，便宜的一边买入。现在还没有偏离的配对不显示方向。</dd>
           <dt>交易成本</dt><dd>开仓加平仓、两条腿合计要付的盘口成本。偏离要明显大于它才有利润；写「估算」的是按一档价估算。</dd>
-          <dt>模拟盘</dt><dd>这个配对是否交给模拟盘自动开平仓，以及当前持仓的浮动盈亏。点标的代码进入详情可以启用和调参数。</dd>
           <dt>还想看更多</dt><dd>右上角切到「完整」，可以看基线、偏离 σ、两个方向的可成交价差、资金费和样本数。</dd>
-        </dl> : <p>有 Var 腿的每分钟一个 Var 报价、对齐对手腿当时的一档；两腿都是行情流的每 15 秒（未启用每分钟）。A 是配对键里的第一条腿（有 Var 时为 Var）。卖 A 价差 = A 买价 ÷（乘数 × B 卖价）− 1，买 A 价差 = A 卖价 ÷（乘数 × B 买价）− 1，按各配对名义金额取档（≤ 1000 美元用 1k 档）；
+        </dl> : <p>有 Var 腿的每分钟一个 Var 报价、对齐对手腿当时的一档；两腿都是行情流的每 5 秒（未启用每 20 秒）。模拟盘一列勾选即启用并用自动配置（入场、出场、止损、最长持有取推荐值，约 10 分钟更新），信号列的入场阈值是当前生效的值。A 是配对键里的第一条腿（有 Var 时为 Var）。卖 A 价差 = A 买价 ÷（乘数 × B 卖价）− 1，买 A 价差 = A 卖价 ÷（乘数 × B 买价）− 1，按各配对名义金额取档（≤ 1000 美元用 1k 档）；
           已启用或有持仓的配对订阅行情流腿的完整盘口（WebSocket）算冲击，其余用一档价估算（标「估」）。信号列是离入场最近的一侧：偏离 − 入场阈值，≥ 0 即达到开仓条件。资金费只作参考，两腿都折成年化。</p>}
       </details>
     </section>
@@ -189,12 +198,25 @@ function SymbolCell({ row, multi, simple }: { row: StateRow; multi: boolean; sim
     {row.identity !== 'verified' && !(simple && confirmed) ? <Badge tone={row.identity === 'mismatch' ? 'bad' : row.eligible ? 'ok' : 'warn'}>{confirmed ? '已确认' : IDENTITY_LABELS[row.identity]}</Badge> : null}
     <small>{simple ? [row.name, row.kindName].filter(Boolean).join(' · ') : row.name}</small></td>;
 }
-function PaperCell({ row, now }: { row: StateRow; now: number }) {
-  return <td>{row.position ? <><Badge tone="info">持仓</Badge><small title={directionLabel(row.position.direction, row.a.venue, row.b.venue)}>{directionShort(row.position.direction, row.a.venue)} · {positionPnl(row.position) ?? '—'}</small></>
-    : row.enabled ? <><Badge tone="ok">已启用</Badge>{row.cooldownUntil ? <small>冷却至 {clockOrDate(row.cooldownUntil, now)}</small> : null}</> : <span className="vl-dim">未启用</span>}</td>;
+type PaperProps = { row: StateRow; now: number; multi: boolean; busy: boolean; onToggle: (row: StateRow, on: boolean) => void };
+function PaperCell({ row, now, busy, onToggle }: PaperProps) {
+  // 规格没确认或不同的配对服务端不让启用；已启用的总能停用。
+  const locked = !row.enabled && !row.eligible;
+  const hint = locked ? row.identity === 'mismatch' ? '两边合约规格不同，不能启用' : '两边规格还没确认，先到实盘准备页确认'
+    : row.enabled ? '取消勾选即停用，已有持仓照常平仓' : '勾选即启用模拟盘，入场、出场、止损与最长持有按推荐值自动配置';
+  return <td>
+    <label className={`vl-check${row.enabled ? ' on' : ''}`} title={hint}>
+      <input type="checkbox" checked={row.enabled} disabled={busy || locked} onChange={event => onToggle(row, event.target.checked)} aria-label={`${row.symbol} ${venueShort(row.a.venue)}↔${venueShort(row.b.venue)} 模拟盘`} />
+      {row.enabled ? '已启用' : '启用'}</label>
+    {row.enabled && row.auto ? <Badge tone={row.autoPending ? 'warn' : 'info'}>自动</Badge> : null}{row.position ? <Badge tone="info">持仓</Badge> : null}
+    {row.position ? <small title={directionLabel(row.position.direction, row.a.venue, row.b.venue)}>{directionShort(row.position.direction, row.a.venue)} · {positionPnl(row.position) ?? '—'}</small>
+      : row.enabled && row.autoPending ? <small className="vl-warn">样本不足，暂不开仓</small>
+        : row.enabled && row.cooldownUntil ? <small>冷却至 {clockOrDate(row.cooldownUntil, now)}</small> : locked ? <small>{row.identity === 'mismatch' ? '规格不同' : '规格待确认'}</small> : null}
+  </td>;
 }
 
-function SimpleRow({ row, now, multi }: { row: StateRow; now: number; multi: boolean }) {
+function SimpleRow(props: PaperProps) {
+  const { row, now, multi } = props;
   const progress = entryProgress(row);
   const stale = isStale(row, now);
   const reached = !!progress?.reached && !stale;
@@ -202,6 +224,7 @@ function SimpleRow({ row, now, multi }: { row: StateRow; now: number; multi: boo
   const sides = progress && progress.deviation > 0 ? directionSides(progress.direction, row.a.venue, row.b.venue) : null;
   return <tr className={reached ? 'vl-hit' : undefined}>
     <SymbolCell row={row} multi={multi} simple />
+    <PaperCell {...props} />
     <td className="num"><span className={`vl-value${stale ? ' vl-dim' : ''}`}>{bps(row.mid)}</span>
       {stale ? <small className="vl-warn">{row.sampleAt ? `${age(row.sampleAt, now)}的数据` : '暂无数据'}</small>
         : <small title={row.baseline ? `${row.baseline.fallback ? '全天' : REGIME_LABELS[row.baseline.regime]}基线，${row.baseline.samples} 个样本` : undefined}>{row.baseline ? `平时 ${bps(row.baseline.median)}` : '平时水平统计中'}</small>}</td>
@@ -213,16 +236,17 @@ function SimpleRow({ row, now, multi }: { row: StateRow; now: number; multi: boo
     </div> : <span className="vl-dim">数据不足</span>}</td>
     <td>{sides ? <span className="vl-sides"><span className="vl-side sell">卖 {venueShort(sides.sell)}</span><span className="vl-side buy">买 {venueShort(sides.buy)}</span></span> : <span className="vl-dim">—</span>}</td>
     <td className="num">{plain(row.cost)}{row.estimated ? <small>估算</small> : null}</td>
-    <PaperCell row={row} now={now} />
   </tr>;
 }
 
-function Row({ row, now, multi }: { row: StateRow; now: number; multi: boolean }) {
+function Row(props: PaperProps) {
+  const { row, now, multi } = props;
   const hit = signal(row);
   const funding = fundingAnnual(row.aFunding, row.bFunding);
   const stale = isStale(row, now);
   return <tr className={hit && hit.gap >= 0 && !stale ? 'vl-hit' : undefined}>
     <SymbolCell row={row} multi={multi} simple={false} />
+    <PaperCell {...props} />
     <td>{row.kindName}<small>{REGIME_LABELS[row.regime]}</small></td>
     <td className={`num ${stale ? 'vl-dim' : ''}`}>{bps(row.mid)}<small>{row.sampleAt ? age(row.sampleAt, now) : '无样本'}</small></td>
     <td className="num">{row.baseline ? <>{bps(row.baseline.median)} <span className="vl-dim">± {plain(row.baseline.sigma)}</span><small>{row.baseline.fallback ? '全天基线 · ' : `${REGIME_LABELS[row.baseline.regime]} · `}{row.baseline.samples} 个</small></> : <span className="vl-dim">样本不足</span>}</td>
@@ -232,6 +256,5 @@ function Row({ row, now, multi }: { row: StateRow; now: number; multi: boolean }
     <td className="num">{hit ? <><span className={hit.gap >= 0 ? 'vl-up' : undefined}>{bps(hit.gap)}</span><small title={directionLabel(hit.direction, row.a.venue, row.b.venue)}>{directionShort(hit.direction, row.a.venue)} {plain(hit.deviation)} / {plain(row.entryBps)}</small></> : '—'}</td>
     <td className="num">{funding.a} / {funding.b}<small>{venueShort(row.a.venue)} / {venueShort(row.b.venue)}</small></td>
     <td className="num">{row.samples24h}</td>
-    <PaperCell row={row} now={now} />
   </tr>;
 }

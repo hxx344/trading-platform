@@ -75,7 +75,7 @@ export class BaselineTracker {
   private readonly minSamples: number;
   private readonly minGapMs: number;
   private last = -Infinity;
-  /** minGapMs：两次计入基线的最短间隔。两腿都是行情流的配对每 15 秒采一次，按约一分钟抽一个，最少样本数与有 Var 的配对同样是「分钟」。 */
+  /** minGapMs：两次计入基线的最短间隔。两腿都是行情流的配对每 5 秒或 20 秒采一次，按约一分钟抽一个，最少样本数与有 Var 的配对同样是「分钟」。 */
   constructor(kind: AssetKind, windowMs: number, minSamples: number, minGapMs = 0) {
     this.kind = kind; this.minSamples = minSamples; this.minGapMs = minGapMs;
     this.all = new RollingWindow(windowMs);

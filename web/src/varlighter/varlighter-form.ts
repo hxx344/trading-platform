@@ -1,7 +1,7 @@
 // DEX 价差页（docs/varlighter.md 第 10 节、docs/dexspread.md 第 7 节）不依赖 DOM 的部分：读数格式、总览排序、参数表单到请求的转换、
 // 配对键与场所名、手动配对的表单、走势图的行数据。由 web/test/varlighter-form.test.mjs 覆盖。
 import type { AssetKind, Combo, CustomPair, Regime, VarPriceSource, VenueId } from '../../../src/varlighter/model.ts';
-import type { Direction, GlobalParams, SymbolParams } from '../../../src/varlighter/strategy.ts';
+import type { AutoParams, Direction, GlobalParams, SymbolParams } from '../../../src/varlighter/strategy.ts';
 import type { Settings, StateRow, SymbolPoint } from '../../../src/varlighter/views.ts';
 import type { VarLighterTab } from '../route-parse.ts';
 
@@ -229,17 +229,33 @@ export function globalRequest(form: GlobalForm): Parsed<GlobalParams> {
 }
 
 /** 保存参数的请求体：总带当前版本号，服务端发现版本已变时拒绝（409），页面刷新后重填。 */
-export function settingsBody(settings: Pick<Settings, 'revision'>, change: { symbol?: { symbol: string; params: SymbolParams }; global?: GlobalParams; confirmed?: string[]; combos?: Combo[]; pairs?: CustomPair[] }): Record<string, unknown> {
+export function settingsBody(settings: Pick<Settings, 'revision'>, change: { symbol?: { symbol: string; params: SymbolParams }; global?: GlobalParams; confirmed?: string[]; combos?: Combo[]; pairs?: CustomPair[]; auto?: string[] }): Record<string, unknown> {
   const body: Record<string, unknown> = { revision: settings.revision };
   if (change.combos) body.combos = COMBO_OPTIONS.filter(combo => change.combos!.includes(combo));
   if (change.pairs) body.pairs = change.pairs;
   if (change.symbol) body.symbols = { [change.symbol.symbol]: change.symbol.params };
   if (change.global) body.global = change.global;
   if (change.confirmed) body.confirmed = [...new Set(change.confirmed)].sort();
+  if (change.auto) body.auto = [...new Set(change.auto)].sort();
   return body;
 }
 export const toggleConfirmed = (confirmed: readonly string[], symbol: string, on: boolean): string[] =>
   on ? [...new Set([...confirmed, symbol])].sort() : confirmed.filter(item => item !== symbol);
+
+// ---- 自动配置 ----
+/** 自动配置接管的四项（其余参数总用保存的值）。 */
+export const AUTO_FIELDS: readonly (keyof AutoParams)[] = ['entryBps', 'exitBps', 'stopBps', 'maxHoldMinutes'];
+/** 总览里勾选：启用并交给自动配置；取消勾选只停用，自动配置的选择留着，下次勾选照旧。只带 enabled，服务端在已保存（没有则默认）的参数上改。 */
+export function quickEnableBody(settings: Pick<Settings, 'revision' | 'auto'>, key: string, on: boolean): Record<string, unknown> {
+  const body: Record<string, unknown> = { revision: settings.revision, symbols: { [key]: { enabled: on } } };
+  if (on) body.auto = toggleConfirmed(settings.auto, key, true);
+  return body;
+}
+/** 详情页的自动配置开关：自动配置只认有保存参数的配对，打开时带一份空的改动，服务端沿用已保存的（没有则默认）参数，不覆盖任何字段。 */
+export const autoBody = (settings: Pick<Settings, 'revision' | 'auto'>, key: string, on: boolean): Record<string, unknown> =>
+  ({ revision: settings.revision, ...(on ? { symbols: { [key]: {} } } : {}), auto: toggleConfirmed(settings.auto, key, on) });
+/** 推荐值填进表单：只改自动配置接管的四项。 */
+export const autoFormPatch = (params: AutoParams): Partial<SymbolForm> => Object.fromEntries(AUTO_FIELDS.map(key => [key, String(params[key])]));
 
 export const BACKTEST_HOURS: readonly number[] = [24, 72, 168, 336];
 /** 回测请求：表单参数与当前全局参数一起发，服务端按这份参数重放，不改已保存的参数。 */

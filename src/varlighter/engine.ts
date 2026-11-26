@@ -1,7 +1,7 @@
 // DEX 价差模块（原 Var/Lighter 价差，docs/varlighter.md、docs/dexspread.md）的运行时：采集各配对两条腿的对齐样本、维护基线、跑模拟盘，
 // 并给页面出视图。只读公开行情、只写自己的 varlighter.sqlite；不碰执行器、不下任何真实订单。
 // 有 Var 腿的配对跟着每分钟一次的 Var 报价采样（样本时刻 = Var 报价时刻，另一腿回看那一刻的行情流）；两腿都是行情流的配对
-// 由本机每 5 秒检查一次，启用或有持仓的每 15 秒、其余每分钟采一条（样本时刻 = 本机采样时刻）。
+// 由本机每秒检查一次，启用或有持仓的每 5 秒、其余每 20 秒采一条（样本时刻 = 本机采样时刻）。
 import { anySignal } from '../any-signal.mjs';
 import { TOKEN_QUOTE_CONCURRENCY, TOKEN_QUOTE_MAX_AGE_MS, TOKEN_QUOTE_PHASE_MS, type TokenQuote, type VarQuoter } from './varquote.ts';
 import { backtestRequest, runBacktest } from './backtest.ts';
@@ -10,14 +10,14 @@ import { HyperliquidStream, LighterStream, MAX_DEPTH_MARKETS, depthAt, fetchEntr
 import { ASSET_KINDS, COMBOS, DEFAULT_COMBOS, KIND_NAMES, LEG_SYMBOL, LIVE_VENUES, RATIO_MAX, RATIO_MIN, REGIME_NAMES, SAMPLE_FIELDS, SAMPLE_FORMAT, VENUE_IDS, VENUE_NAMES,
   bothLive, bucketOf, comboName, comboPairs, comboVenues, customPairInfo, formatRatio, isLive, legKey, lighterMarket, midBasis, pairKey, pairTitle, parsePairKey,
   regimeOf, regimesOf, sameSymbol, sortPairs, spreadOf, upgradeKey, varHourly, varMarket, varQuoteQty,
-  type AssetKind, type Combo, type CustomPair, type Leg, type LegInfo, type LiveVenue, type MarketSpec, type PairInfo, type Sample, type VarListing, type VenueId } from './model.ts';
+  type AssetKind, type Combo, type CustomPair, type Leg, type LegInfo, type LiveVenue, type MarketSpec, type PairInfo, type Sample, type SizeBucket, type VarListing, type VenueId } from './model.ts';
 import { orderPlan, type OrderPlan } from './plan.ts';
 import { BaselineTracker, LIVE_BASELINE_GAP_MS, suggestedEntryBps, symbolStats, type Baseline, type RegimeStats } from './stats.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, DIRECTIONS, ParamsError, closePosition, closeSpread, confirmOpen, decide, openEconomics, slippageBudgetBps, fundingEstimate, legFeeBps,
-  markToMarket, openBlocker, openPosition, readGlobalParams, readSymbolParams, upgradeDirection, upgradeGlobal,
+  markToMarket, openBlocker, openPosition, readGlobalParams, readSymbolParams, recommendParams, upgradeDirection, upgradeGlobal,
   CLOSE_REASON_NAMES, DIRECTION_NAMES, type ClosedTrade, type GlobalParams, type LegFees, type Position, type SymbolParams } from './strategy.ts';
 import { COOLDOWN_KEY, SAMPLE_RETENTION_DAYS, SETTINGS_KEY, type LegacyUpgrade, type VarLighterStore } from './store.ts';
-import type { BacktestView, CatalogEntry, DepthStatus, LegRef, LiveStats, OrphanRow, PaperView, PollStats, PositionMark, ReadinessItem, ReadinessView, SamplesView, Settings, SourceState, StateRow, StateView,
+import type { AutoView, BacktestView, CatalogEntry, DepthStatus, LegRef, LiveStats, OrphanRow, PaperView, PollStats, PositionMark, ReadinessItem, ReadinessView, SamplesView, Settings, SourceState, StateRow, StateView,
   SymbolPoint, SymbolView, VenueStatus } from './views.ts';
 
 export const VAR_POLL_MS = 60_000;
@@ -25,7 +25,11 @@ export const CATALOG_MS = 10 * 60_000;
 /** 目录读取失败后的重试间隔。 */
 export const CATALOG_RETRY_MS = 60_000;
 /** 两腿都是行情流的配对：检查间隔、启用或有持仓的采样间隔、其余的采样间隔。 */
-export const LIVE_TICK_MS = 5_000, LIVE_ACTIVE_MS = 15_000, LIVE_IDLE_MS = 60_000;
+export const LIVE_TICK_MS = 1_000, LIVE_ACTIVE_MS = 5_000, LIVE_IDLE_MS = 20_000;
+/** 到期判断的余量：每秒一检查时不会因为毫秒抖动拖成 6 秒、21 秒一条。 */
+export const LIVE_SLACK_MS = 500;
+/** 自动配置：推荐参数所用的统计每这么久重算一次，样本窗口取基线窗口、最长这么多小时。 */
+export const AUTO_REFRESH_MS = 10 * 60_000, AUTO_WINDOW_MAX_HOURS = 72;
 /** 盘口（行情流）超过这么久没同步算过期。 */
 export const DEPTH_STALE_MS = 3 * 60_000;
 const PRUNE_MS = 3_600_000;
@@ -54,9 +58,12 @@ const SAMPLE_ROWS_MAX_BYTES = 480 * 1024;
 const KEY_HINT = '配对键无效（应为「场所:代码|场所:代码」，如 var:AAPL|rh:AAPL）';
 
 export type { Settings } from './views.ts';
-const DEFAULT_SETTINGS: Settings = { revision: 0, global: DEFAULT_GLOBAL, symbols: {}, confirmed: [], combos: [...DEFAULT_COMBOS], pairs: [] };
+const DEFAULT_SETTINGS: Settings = { revision: 0, global: DEFAULT_GLOBAL, symbols: {}, confirmed: [], combos: [...DEFAULT_COMBOS], pairs: [], auto: [] };
 /** 新版本的参数与冷却存在新键里；旧键（settings、cooldown）留给回退版本，不再写。 */
 export { COOLDOWN_KEY, SETTINGS_KEY };
+/** 自动配置下开的仓，开仓时的出场、止损与最长持有（按配对键，带持仓编号）。存在 state 表里，旧版本不读。 */
+export const EXITS_KEY = 'autoExits';
+type ExitRules = { id: string; exitBps: number; stopBps: number; maxHoldMinutes: number };
 
 export interface EngineOptions { store: VarLighterStore; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; log?: (line: string) => void; /** Var token 询价；不给就只用公开报价。 */ quoter?: VarQuoter }
 
@@ -82,7 +89,7 @@ export function upgradeSettings(old: unknown): Settings {
   return {
     revision: Number.isSafeInteger(old.revision) ? old.revision as number : 0,
     global: upgradeGlobal({ ...(isObject(old.global) ? old.global : {}), ...(typeof extra.minNetBps === 'number' ? { minNetBps: extra.minNetBps } : {}) }),
-    symbols, confirmed: [...new Set(confirmed)].sort(), combos, pairs: [],
+    symbols, confirmed: [...new Set(confirmed)].sort(), combos, pairs: [], auto: [],
   };
 }
 export const LEGACY_UPGRADE: LegacyUpgrade = {
@@ -136,6 +143,9 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   const migrated = store.migrateLegacy(now(), LEGACY_UPGRADE);
   if (migrated && migrated.positions + migrated.trades + migrated.skipped > 0) log(`varlighter: 已升级为两腿口径（持仓 ${migrated.positions}、成交 ${migrated.trades}${migrated.skipped ? `、无法识别 ${migrated.skipped}` : ''}）`);
   let settings: Settings = normalizeSettings(store.state<Settings>(SETTINGS_KEY));
+  let autoKeys = new Set(settings.auto);
+  /** 自动配置用的统计（各时段与全天），按配对缓存；名义金额档或类别变了就重算。 */
+  const autoStats = new Map<string, { at: number; bucket: SizeBucket; kind: AssetKind; stats: RegimeStats[] }>();
   const live = new Map<LiveVenue, VenueRuntime>(LIVE_VENUES.map(venue => [venue, { venue, stream: null, markets: [], bySymbol: new Map(), catalog: { at: null, ok: null, error: null, count: 0 }, nextCatalog: 0, depth: new Map() }]));
   let listings = new Map<string, VarListing>(), varMarkets = new Map<string, MarketSpec>();
   let pairs: PairInfo[] = [], pairsByKey = new Map<string, PairInfo>();
@@ -156,6 +166,10 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   let varHealthySince = startedAt;
   let sequence = 0;
   for (const position of store.positions()) positions.set(position.symbol, position);
+  const exits = new Map<string, ExitRules>(Object.entries(store.state<Record<string, ExitRules>>(EXITS_KEY) ?? {}).filter(([key, rules]) =>
+    isObject(rules) && positions.get(key)?.id === rules.id && [rules.exitBps, rules.stopBps, rules.maxHoldMinutes].every(value => typeof value === 'number' && Number.isFinite(value))));
+  // 持仓与成交已各自落盘；这份记录写不进去时只记日志，该仓退回按当前参数平仓。
+  const saveExits = () => { try { store.setState(EXITS_KEY, Object.fromEntries(exits), now()); } catch (error) { log(`varlighter: 自动配置的平仓规则保存失败：${message(error)}`); } };
   for (const symbol of positions.keys()) { const sample = store.latest(symbol); if (sample) latest.set(symbol, sample); }
 
   function normalizeSettings(saved: Settings | null): Settings {
@@ -168,14 +182,56 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       for (const raw of Array.isArray(saved.pairs) ? saved.pairs.slice(0, MAX_CUSTOM_PAIRS) : []) { try { custom.push(readCustomPair(raw)); } catch { /* 无效的单个手动配对丢掉 */ } }
       // global 里只取本版本认识的键：更新的版本往里加了字段再回退到这一版，不能因此丢掉整份参数。
       const global = isObject(saved.global) ? Object.fromEntries(Object.entries(saved.global).filter(([key]) => key in DEFAULT_GLOBAL)) : {};
-      return { revision: Number.isSafeInteger(saved.revision) ? saved.revision : 0, global: readGlobalParams(global), symbols, confirmed: (saved.confirmed ?? []).filter(key => parsePairKey(key)), combos, pairs: custom };
+      const auto = Array.isArray(saved.auto) ? [...new Set(saved.auto.filter(key => typeof key === 'string' && key in symbols))].sort() : [];
+      return { revision: Number.isSafeInteger(saved.revision) ? saved.revision : 0, global: readGlobalParams(global), symbols, confirmed: (saved.confirmed ?? []).filter(key => parsePairKey(key)), combos, pairs: custom, auto };
     } catch (error) {
       log(`varlighter: 已保存的参数无效，改用默认值：${error instanceof Error ? error.message : String(error)}`);
       return { ...DEFAULT_SETTINGS, revision: Number.isSafeInteger(saved.revision) ? saved.revision : 0 };
     }
   }
-  const paramsOf = (symbol: string): SymbolParams => settings.symbols[symbol] ?? DEFAULT_SYMBOL;
+  const storedOf = (symbol: string): SymbolParams => settings.symbols[symbol] ?? DEFAULT_SYMBOL;
   const pairOf = (key: string) => pairsByKey.get(key);
+  /**
+   * 一个配对当前的推荐参数（自动配置用）：统计取最近一个基线窗口（最长 72 小时）的样本，10 分钟重算一次；
+   * 当前时段的样本够最少样本数就用它，否则用全天的，都不够或没有可成交价时没有推荐值。手续费、滑点与最低净利按当前的算，改了马上生效。
+   */
+  function recommendation(key: string): Omit<AutoView, 'on'> {
+    const pair = pairOf(key);
+    if (!pair) return { params: null, reason: '配对不在当前目录里', at: null, regime: null, samples: 0 };
+    const time = now(), stored = storedOf(key), bucket = bucketOf(stored.notionalUsd);
+    let cached = autoStats.get(key);
+    if (!cached || time - cached.at >= AUTO_REFRESH_MS || cached.bucket !== bucket || cached.kind !== pair.kind) {
+      // 两腿都是行情流的配对几秒一个样本：与基线一样约每分钟取一个，样本数门槛、半衰期与含 Var 的配对同口径。
+      const gap = bothLive(key) ? LIVE_BASELINE_GAP_MS : 0;
+      let kept = -Infinity;
+      const samples = store.samples(key, time - Math.min(settings.global.windowHours, AUTO_WINDOW_MAX_HOURS) * 3_600_000, time).filter(sample => sample.t - kept >= gap && (kept = sample.t, true));
+      let stats = symbolStats(pair.kind, samples, stored.entryBps, bucket);
+      // 100k 档要完整盘口，启用前的样本没有：整个窗口都没有时先按 1k 档的成本算，开仓时的预期净利门槛仍按当时的 100k 档。
+      if (bucket !== '1k' && stats.at(-1)!.costMedian === null) stats = symbolStats(pair.kind, samples, stored.entryBps, '1k');
+      cached = { at: time, bucket, kind: pair.kind, stats };
+      autoStats.set(key, cached);
+    }
+    const regime = regimeOf(pair.kind, time), fees = feesOf(pair);
+    const costs = { slippageBps: settings.global.slippageBps, minNetBps: settings.global.minNetBps, aFeeBps: fees?.aFeeBps ?? 0, bFeeBps: fees?.bFeeBps ?? 0 };
+    for (const item of [cached.stats.find(entry => entry.regime === regime), cached.stats.at(-1)]) {
+      const params = item && item.samples >= settings.global.minSamples ? recommendParams(item, costs) : null;
+      if (item && params) return { params, reason: null, at: cached.at, regime: item.regime, samples: item.samples };
+    }
+    const all = cached.stats.at(-1)!;
+    return { params: null, reason: all.samples >= settings.global.minSamples ? '近期样本没有可成交价，算不出往返成本' : `近期样本不足（${all.samples} / ${settings.global.minSamples}）`, at: cached.at, regime: null, samples: all.samples };
+  }
+  /** 生效的参数：用自动配置且算得出推荐值时，入场、出场、止损与最长持有换成推荐值；算不出时仍是保存的参数（开仓由 autoPending 挡住）。 */
+  const paramsOf = (symbol: string): SymbolParams => {
+    const stored = storedOf(symbol), auto = autoKeys.has(symbol) ? recommendation(symbol).params : null;
+    return auto ? { ...stored, ...auto } : stored;
+  };
+  const autoPending = (symbol: string) => autoKeys.has(symbol) && recommendation(symbol).params === null;
+  /** 持仓的平仓规则：自动配置下开的仓沿用开仓时的出场、止损与最长持有，推荐值随时段或重算变了也不动已有的仓。 */
+  const holdParams = (position: Position): SymbolParams => {
+    const params = paramsOf(position.symbol), kept = exits.get(position.symbol);
+    return kept?.id === position.id ? { ...params, exitBps: kept.exitBps, stopBps: kept.stopBps, maxHoldMinutes: kept.maxHoldMinutes } : params;
+  };
+  const dropExits = (symbol?: string) => { if (symbol === undefined ? exits.size : exits.has(symbol)) { if (symbol === undefined) exits.clear(); else exits.delete(symbol); saveExits(); } };
   const eligible = (pair: PairInfo | undefined) => !!pair && pair.identity !== 'mismatch' && (pair.identity === 'verified' || settings.confirmed.includes(pair.key));
   const legsOfKey = (key: string): string[] => { const parsed = parsePairKey(key); return parsed ? [legKey(parsed.a), legKey(parsed.b)] : []; };
   /** 这个配对的某条腿已在另一个配对持仓（场所按代码合并持仓，两笔反向会互相抵消）。 */
@@ -352,7 +408,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     for (const { pair, sample } of fresh) {
       try {
         const track = tracker(pair), params = paramsOf(pair.key), position = positions.get(pair.key) ?? null;
-        const baseline = track.value(sample.regime, sample.t), decision = decide(sample, baseline, params, position);
+        const baseline = track.value(sample.regime, sample.t), decision = decide(sample, baseline, position ? holdParams(position) : params, position);
         if ((decision.kind === 'open' && params.enabled) || decision.kind === 'close') {
           active.push({ pair, sample, params, position, baseline, decision });
         } else { sample.decisionAt = now(); passive.push(sample); }
@@ -440,7 +496,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     lastPoll = stats;
   }
 
-  /** 两腿都是行情流的配对：到期的（启用或有持仓的 15 秒，其余 60 秒）按本机当前时刻采一条，两腿都要有可用一档。 */
+  /** 两腿都是行情流的配对：到期的（启用或有持仓的 5 秒，其余 20 秒）按本机当前时刻采一条，两腿都要有可用一档。 */
   function sampleLive(): LiveStats {
     const time = now(), active = activeKeys();
     const stats: LiveStats = { at: time, due: 0, written: 0, noTop: 0, blocked: {} };
@@ -448,15 +504,15 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     for (const pair of pairs) {
       if (pair.identity === 'mismatch' || !isLive(pair.a.venue) || !isLive(pair.b.venue)) continue;
       const interval = active.has(pair.key) ? LIVE_ACTIVE_MS : LIVE_IDLE_MS;
-      // 留 1 秒余量，5 秒一检查时不会因为毫秒抖动拖成 20 秒、65 秒一条。
-      if (time - (lastLiveAt.get(pair.key) ?? -Infinity) < interval - 1_000) continue;
+      if (time - (lastLiveAt.get(pair.key) ?? -Infinity) < interval - LIVE_SLACK_MS) continue;
       stats.due++;
       const a = liveLeg(pair.a, time, time), b = liveLeg(pair.b, time, time);
       if (!a || !b) { stats.noTop++; continue; }
       fresh.push({ pair, sample: makeSample(pair, time, time, a, b) });
     }
     stats.written = ingest(fresh, stats.blocked, lastLiveAt);
-    lastLive = stats;
+    // 每秒一检查，多数轮次没有到期的配对：状态里留最近一次有配对到期的那轮。
+    if (stats.due > 0 || !lastLive) lastLive = stats;
     return stats;
   }
 
@@ -471,7 +527,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     const open = [...positions.values()], fees = feesOf(pair), costs = { slippageBps: settings.global.slippageBps, aFeeBps: fees?.aFeeBps ?? 0, bFeeBps: fees?.bFeeBps ?? 0 };
     const risk = {
       openPositions: open.length, openNotionalUsd: open.reduce((sum, item) => sum + item.notionalUsd, 0),
-      dailyNetUsd: store.netSince(dayStart(sample.t)), cooldownUntil: cooldown[pair.key] ?? 0, eligible: eligible(pair), legBusy: legBusy(pair), feeUnknown: !fees, fallbackBaseline: baseline.fallback,
+      dailyNetUsd: store.netSince(dayStart(sample.t)), cooldownUntil: cooldown[pair.key] ?? 0, eligible: eligible(pair), legBusy: legBusy(pair), feeUnknown: !fees, fallbackBaseline: baseline.fallback, autoPending: autoPending(pair.key),
     };
     sample.decisionAt = now();
     const confirmed = confirmOpen(sample, baseline, params, decision, settings.global.maxQuoteAgeSec);
@@ -481,9 +537,11 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     });
     if (blocker) return blocker;
     const opened = openPosition(`p${sample.decisionAt.toString(36)}-${(++sequence).toString(36)}`, sample, params, confirmed, baseline, costs);
+    const autoRules = autoKeys.has(pair.key) ? { id: opened.id, exitBps: params.exitBps, stopBps: params.stopBps, maxHoldMinutes: params.maxHoldMinutes } : null;
     return () => {
-      store.openPosition(opened, { at: now(), kind: 'open', message: `${directionText(pair, opened.direction)} ${fmt(opened.notionalUsd, 0)} 美元，价差 ${fmt(opened.entrySpread, 1)} 基点，基线 ${fmt(baseline.median, 1)}，偏离 ${fmt(confirmed.deviation, 1)}（报价时刻 ${fmt(decision.deviation, 1)}）${opened.entryVarSource === 'token' ? '，Var 按 token 询价' : opened.entryVarSource ? '，Var 按公开档位' : ''}` });
+      store.openPosition(opened, { at: now(), kind: 'open', message: `${directionText(pair, opened.direction)} ${fmt(opened.notionalUsd, 0)} 美元，价差 ${fmt(opened.entrySpread, 1)} 基点，基线 ${fmt(baseline.median, 1)}，偏离 ${fmt(confirmed.deviation, 1)}（报价时刻 ${fmt(decision.deviation, 1)}）${autoRules ? `，入场线 ${fmt(params.entryBps, 1)}（自动配置）` : ''}${opened.entryVarSource === 'token' ? '，Var 按 token 询价' : opened.entryVarSource ? '，Var 按公开档位' : ''}` });
       positions.set(pair.key, opened);
+      if (autoRules) { exits.set(pair.key, autoRules); saveExits(); }
       updateDepth();
     };
   }
@@ -496,6 +554,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     positions.delete(position.symbol);
     cooldown = nextCooldown;
     updateDepth();
+    dropExits(position.symbol);
     return trade;
   }
 
@@ -553,7 +612,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
         z: baseline && mid !== null ? (mid - baseline.median) / baseline.sigma : null,
         rich: baseline && spread ? spread.sellA - baseline.median : null, cheap: baseline && spread ? baseline.median - spread.buyA : null,
         samples24h: recentCount(pair.key, time), firstAt: firstOf(pair.key), cooldownUntil: cooldown[pair.key] > time ? cooldown[pair.key] : null,
-        enabled: params.enabled, entryBps: params.entryBps, exitBps: params.exitBps,
+        enabled: params.enabled, entryBps: params.entryBps, exitBps: params.exitBps, auto: autoKeys.has(pair.key), autoPending: autoPending(pair.key),
         position: positionSummary(position, sample),
         aFunding: sample?.aFunding ?? pair.a.market.fundingHourly, bFunding: sample?.bFunding ?? pair.b.market.fundingHourly,
         aFeeBps: legFeeBps(settings.global, pair.a.venue, pair.a.market.takerFeeBps), bFeeBps: legFeeBps(settings.global, pair.b.venue, pair.b.market.takerFeeBps),
@@ -666,7 +725,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       regimes: regimesOf(pair.kind), hours, from, to: time, bucket,
       points: downsample(points, 1500), samples: inRange.length,
       stats: stats.map(item => ({ ...item, suggestedEntryBps: suggestedEntryBps(item) })),
-      params, global: settings.global, latest: sample ?? null, plans,
+      params: storedOf(pair.key), effective: params, auto: { on: autoKeys.has(pair.key), ...recommendation(pair.key) }, global: settings.global, latest: sample ?? null, plans,
       fees: { a: legFeeBps(settings.global, pair.a.venue, pair.a.market.takerFeeBps), b: legFeeBps(settings.global, pair.b.venue, pair.b.market.takerFeeBps) },
       position: position ? { ...position, mark: sample ? markOf(position, sample) : null } : null,
       trades: store.symbolTrades(pair.key, from).slice(-500),
@@ -731,7 +790,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     });
     return {
       now: time,
-      positions: open.map(position => { const sample = latest.get(position.symbol); return { ...position, mark: sample ? markOf(position, sample) : null, sampleAt: sample?.t ?? null, maxHoldMinutes: paramsOf(position.symbol).maxHoldMinutes }; }),
+      positions: open.map(position => { const sample = latest.get(position.symbol); return { ...position, mark: sample ? markOf(position, sample) : null, sampleAt: sample?.t ?? null, maxHoldMinutes: holdParams(position).maxHoldMinutes }; }),
       trades, equity, daily: [...daily].map(([day, value]) => ({ day, ...value })),
       totals: store.totals(), todayNetUsd: store.netSince(dayStart(time)),
       limits: { maxOpenPositions: settings.global.maxOpenPositions, maxTotalNotionalUsd: settings.global.maxTotalNotionalUsd, dailyLossLimitUsd: settings.global.dailyLossLimitUsd, paused: settings.global.paused },
@@ -742,7 +801,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
 
   function updateSettings(body: unknown): Settings {
     if (!isObject(body)) return reject('invalid_body', '请求格式无效');
-    const unknown = Object.keys(body).find(key => !['revision', 'global', 'symbols', 'confirmed', 'combos', 'pairs'].includes(key));
+    const unknown = Object.keys(body).find(key => !['revision', 'global', 'symbols', 'confirmed', 'combos', 'pairs', 'auto'].includes(key));
     if (unknown) reject('invalid_body', `包含未知字段 ${unknown.slice(0, 40)}`);
     if (body.revision !== settings.revision) reject('stale_revision', '参数已被别处修改，请刷新后再改', 409);
     try {
@@ -762,6 +821,13 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
         if (!Array.isArray(body.confirmed) || body.confirmed.length > 400 || body.confirmed.some(item => typeof item !== 'string' || !upgradeKey(item))) reject('invalid_body', '已确认配对列表无效');
         confirmed = [...new Set((body.confirmed as string[]).map(item => upgradeKey(item)!))].sort();
       }
+      let autoList = settings.auto;
+      if (body.auto !== undefined) {
+        if (!Array.isArray(body.auto) || body.auto.length > MAX_SAVED_SYMBOLS || body.auto.some(item => typeof item !== 'string' || !upgradeKey(item))) reject('invalid_body', '自动配置的配对列表无效');
+        autoList = (body.auto as string[]).map(item => upgradeKey(item)!);
+      }
+      // 只留有保存参数的键：参数删掉的配对不再占自动配置的名额。
+      autoList = [...new Set(autoList)].filter(key => key in symbols).sort();
       let combos = settings.combos;
       if (body.combos !== undefined) {
         if (!Array.isArray(body.combos) || body.combos.some(item => !COMBOS.includes(item as Combo))) reject('invalid_body', '自动配对组合列表无效');
@@ -807,9 +873,12 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       const windowChanged = global.windowHours !== settings.global.windowHours || global.minSamples !== settings.global.minSamples;
       const pairsChanged = combos.join() !== settings.combos.join() || JSON.stringify(custom) !== JSON.stringify(settings.pairs);
       const usedBefore = usedVenues();
-      const next = { revision: settings.revision + 1, global, symbols, confirmed, combos, pairs: custom };
+      const next = { revision: settings.revision + 1, global, symbols, confirmed, combos, pairs: custom, auto: autoList };
       store.saveSettings(next, now(), `参数已更新（版本 ${next.revision}）${pairsChanged ? `，组合：${combos.map(comboName).join('、') || '无'}，手动配对 ${custom.length} 个` : ''}`);
       settings = next;
+      autoKeys = new Set(autoList);
+      // 统计窗口随基线窗口变；不再用自动配置的配对不留缓存。
+      for (const key of [...autoStats.keys()]) if (windowChanged || !autoKeys.has(key)) autoStats.delete(key);
       if (windowChanged) trackers.clear();
       if (pairsChanged) {
         // 新用到的场所马上取一次目录（Entropy 没用到时十分钟才取一次，标记价与资金费会旧）。
@@ -841,7 +910,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   function resetPaper(body: unknown) {
     if (!isObject(body) || body.confirm !== 'RESET' || Object.keys(body).length !== 1) return reject('invalid_body', '需要确认文字 RESET');
     store.resetPaper(now());
-    positions.clear(); cooldown = {};
+    positions.clear(); cooldown = {}; dropExits();
     updateDepth();
     return { ok: true };
   }
@@ -911,7 +980,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     views: { state, symbol: symbolView, samples: samplesPage, backtest, paper, settings: updateSettings, close: closeManual, reset: resetPaper, readiness },
     /**
      * 后台循环：连上用到的行情流（一档、标记价、资金费与启用配对的盘口都走行情流）并在后台每 10 分钟取各场所目录，然后每分钟拉 Var 报价（连同询价），
-     * 每 5 秒检查两腿都是行情流的配对是否到期采样，每小时清理过期样本。
+     * 每秒检查两腿都是行情流的配对是否到期采样，每小时清理过期样本。
      */
     async loop(context: { stopped(): boolean; pause(ms: number): Promise<void> }): Promise<void> {
       running = true;
@@ -922,7 +991,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       let done = false;
       const watcher = (async () => { while (!done && !context.stopped()) await context.pause(1_000); stop.abort(); })();
       const request = () => anySignal([stop.signal], REQUEST_TIMEOUT_MS);
-      // 目录与 Var 轮询在后台跑（各自同时最多一个），不拖住行情流配对 15 秒一次的采样。
+      // 目录与 Var 轮询在后台跑（各自同时最多一个），不拖住行情流配对的采样。
       const busy = new Set<string>(), jobs = new Set<Promise<void>>();
       const background = (name: string, job: () => Promise<void>) => {
         if (busy.has(name)) return;

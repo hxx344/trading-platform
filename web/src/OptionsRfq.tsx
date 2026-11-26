@@ -132,7 +132,7 @@ export function RfqPane({ strategy, quantity, onExpired, onChanged }: { strategy
   // A status other than the one the notice describes replaces it: the panel then says what happened.
   useEffect(() => { setNoticeState(current => current && current.key !== statusKey ? null : current); }, [statusKey]);
 
-  const createProblem = rfqCreateProblem(view, quantity) ?? (creating ? '提交中' : null);
+  const createProblem = rfqCreateProblem(view, quantity, strategy) ?? (creating ? '提交中' : null);
   const open = rfqOpen(rfq);
   const executeBlocked = !open ? '询价已不在可执行状态' : sending || canceling ? '另一项操作进行中' : null;
 

@@ -252,6 +252,7 @@
   .options-desk .execution .close-button { grid-column: 2; grid-row: 5; }
   .options-desk .execution .microcopy { grid-column: 1; grid-row: 4; margin: 0; }
   .options-desk .execution .schedule { grid-column: 1; grid-row: 5; margin-top: 12px; }
+  .options-desk .execution .schedule.m50-signal { grid-column: 1 / -1; grid-row: 6; }
   .options-desk .legs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .options-desk .activity-panel { display: grid; grid-template-columns: 1fr 1fr; column-gap: 24px; align-items: start; }
   .options-desk .activity-panel .subhead:nth-of-type(2) { grid-column: 1; }

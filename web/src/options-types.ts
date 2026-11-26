@@ -69,7 +69,7 @@ export interface AccountHealth {
   portfolioMargin?: PortfolioMargin | null; portfolioMarginMessage?: string;
 }
 export interface ScheduleView {
-  /** False while config.json names M50 (v0.97): the Friday scheduler does not run; absent before v0.97. */
+  /** False while config.json names M50 (v0.98): the Friday scheduler does not run; absent before v0.98. */
   applicable?: boolean;
   enabled: boolean; source: 'config' | 'page'; configEnabled: boolean; hourUtc: number; minuteUtc: number; windowSeconds: number;
   marketFallback: boolean; nextAt: number; inWindow: boolean; waiting: boolean; lastOpenWeek: string | null;
@@ -87,7 +87,7 @@ export interface OptionsState {
   schedule?: ScheduleView;
   /** An RFQ not yet settled (G2c); absent from a pre-G2c service. */
   rfqActive?: boolean;
-  /** M50 均线择边 (v0.97); absent from an older service. */
+  /** M50 均线择边 (v0.98); absent from an older service. */
   m50?: M50View;
 }
 export interface TrendSignal { day: string; at: number; index: number; ma: number; side: 'Put' | 'Call' }

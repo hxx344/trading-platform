@@ -334,6 +334,24 @@ test('飞书告警：事件转消息，同一持续问题 30 分钟内只发一�
       assert.equal(notifier.pending(), before + 11);
       assert.match(texts().at(-2)!, /【划转结果未知】/);
       assert.match(texts().at(-1)!, /【保证金平衡异常（已恢复）】.*差 8000 USD1/);
+      // The blocked first page is not the latest transfer history. A confirmed transfer on page two restarts the timer.
+      pairs = pair('9000', '1000');
+      notifier.poll();
+      add('transfer-sent', { pair: 'p1', transfer: 'page-one', state: 'unknown' });
+      for (let i = 1; i < 500; i++) add('transfer-sent', { pair: 'p1', state: 'acknowledged' });
+      breakOutbox(true);
+      clock += 50_000;
+      add('transfer-settled', { pair: 'p1', transfer: 'page-two', state: 'confirmed', basis: 'acknowledged' });
+      assert.throws(() => notifier.poll(), /disk I\/O error/);
+      clock += 10_000;
+      assert.throws(() => notifier.poll(), /disk I\/O error/);
+      clock += 5_000;
+      pairs = pair('2000', '1500');
+      assert.throws(() => notifier.poll(), /disk I\/O error/);
+      breakOutbox(false);
+      notifier.poll(); notifier.poll();
+      assert.equal(notifier.pending(), before + 12);
+      assert.match(texts().at(-1)!, /【划转结果未知】.*page-one/);
     } finally { outboxDb.close(); }
     await notifier.flush();
     notifier.close();

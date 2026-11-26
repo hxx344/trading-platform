@@ -392,20 +392,26 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
   const stuck = new Map<string, { since: number; began: number; sentAt: number | null; missed: string | null }>();
   // Keep the observed recovery until handoff, even if the next reading is unknown or another incident starts.
   const recoveries = new Map<string, { text: string; additional: number }>();
+  let progressSeq = latestSeq();
+
+  function observeProgress(rows: readonly EventRow[], at: number): void {
+    for (const row of rows) {
+      if (row.seq <= progressSeq) continue;
+      progressSeq = row.seq;
+      if (row.type !== 'transfer-settled') continue;
+      let detail: { pair?: unknown; state?: unknown } = {};
+      try { detail = JSON.parse(row.json) as typeof detail; } catch { continue; }
+      const entry = detail?.state === 'confirmed' && typeof detail.pair === 'string' ? stuck.get(detail.pair) : undefined;
+      if (entry) entry.since = Math.max(entry.since, Math.min(at, row.at));
+    }
+  }
 
   function pollEvents(at: number): void {
     for (;;) {
       const after = (db.prepare('SELECT seq FROM cursor WHERE id = 1').get() as { seq: number }).seq;
       const rows = events(after, EVENTS_PER_POLL);
       if (!rows.length) break;
-      // A confirmed transfer is progress even when its notification has to be retried. Replay its original time.
-      for (const row of rows) {
-        if (row.type !== 'transfer-settled') continue;
-        let detail: { pair?: unknown; state?: unknown } = {};
-        try { detail = JSON.parse(row.json) as typeof detail; } catch { continue; }
-        const entry = detail?.state === 'confirmed' && typeof detail.pair === 'string' ? stuck.get(detail.pair) : undefined;
-        if (entry) entry.since = Math.max(entry.since, Math.min(at, row.at));
-      }
+      observeProgress(rows, at);
       tx(() => {
         for (const row of rows) {
           const message = describeEvent(row, incidentPair, job);
@@ -465,7 +471,19 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
   function poll(): void {
     const at = now();
     try { pollEvents(at); }
-    finally { pollMargins(at); }
+    catch (error) {
+      // The outbox cursor may be stuck several pages behind a confirmed transfer. The normal path shares its reads.
+      const end = latestSeq();
+      if (!stuck.size) progressSeq = end;
+      while (progressSeq < end) {
+        const rows = events(progressSeq, EVENTS_PER_POLL);
+        if (!rows.length) break;
+        observeProgress(rows, at);
+      }
+      pollMargins(at);
+      throw error;
+    }
+    pollMargins(at);
   }
 
   /** Queues a message that does not come from the event log (start, stop, lost lease, market alerts); its outbox id, null without a robot. */

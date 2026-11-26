@@ -13,7 +13,7 @@ export const workspaceLabels: Record<WorkspaceId, string> = {
   options: '期权', onchain: '链上', research: '研究室', system: '系统',
 };
 
-export type NavEntry = 'asset' | 'positions' | 'monitor' | 'news' | 'oil' | 'hynix' | 'goldoil' | 'crossex' | 'ondo' | 'varlighter' | 'pairs' | 'mev' | 'options' | 'status' | 'logs' | 'settings';
+export type NavEntry = 'asset' | 'positions' | 'monitor' | 'news' | 'oil' | 'hynix' | 'goldoil' | 'crossex' | 'ondo' | 'varlighter' | 'pairs' | 'mev' | 'chain-arb' | 'options' | 'status' | 'logs' | 'settings';
 
 /** Every entry of the side navigation, in its order inside the workspace. A new page is registered here. */
 export const navEntries: Record<NavEntry, { workspace: WorkspaceId; text: string; href: string }> = {
@@ -35,6 +35,7 @@ export const navEntries: Record<NavEntry, { workspace: WorkspaceId; text: string
   options: { workspace: 'options', text: '期权', href: '#/options' },
   // MEV 套利（docs/mev.md）：总是显示；还没启用时页面是启用向导。
   mev: { workspace: 'onchain', text: 'MEV 套利', href: '#/mev' },
+  'chain-arb': { workspace: 'onchain', text: '链上折价套利', href: '#/chain-arb' },
   status: { workspace: 'system', text: '运行状态', href: '#/status' },
   logs: { workspace: 'system', text: '日志', href: '#/logs' },
   settings: { workspace: 'system', text: '设置', href: '#/settings' },

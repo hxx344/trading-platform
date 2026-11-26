@@ -86,6 +86,8 @@ sudo bash install.sh --import-workbench --monitor --asset [--asset-owner <用户
 - `--monitor-alerts`（v0.30.0）、`--monitor-variational`（v0.34.0）同时启用行情监控，并分别导入告警与 Var token；两者都需要 `--data-dir`，可同用。
 - `--monitor-paper`（v0.45.0）同时启用行情监控并导入持仓记录，需要 `--data-dir`，可与上面两项同用。
 
+链上折价套利共用「行情监控」导入项的 `monitor.perpetual`。已配置合约价差的服务升级后自动出现「链上 → 链上折价套利」入口。新安装可在设置页勾选行情监控，或使用 `sudo bash install.sh --import-workbench --monitor`。查询不产生服务端持仓或历史记录。
+
 ## 6 备选方式（保留）
 
 - 手写 `config.json` 的 `monitor` / `asset` 段后执行 `sudo bash install.sh`。

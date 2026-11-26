@@ -15,7 +15,7 @@ export const WEB_DIST = fileURLToPath(new URL('../web/dist/', import.meta.url));
 const MAX_INDEX_BYTES = 64 * 1024;
 const MAX_ASSET_BYTES = 4 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 16 * 1024 * 1024;
-const MAX_ASSETS = 64;
+const MAX_ASSETS = 96;
 const ASSET_NAME = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/;
 const TYPES: Record<string, string> = {
   js: 'text/javascript; charset=utf-8', css: 'text/css; charset=utf-8', svg: 'image/svg+xml', png: 'image/png', woff2: 'font/woff2',

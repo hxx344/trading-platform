@@ -21,6 +21,7 @@
 | 通用 DEX 价差（Var/Lighter 推广为任意两腿、Entropy 等新场所、自定义配对与乘数） | [docs/dexspread.md](docs/dexspread.md)、[docs/varlighter.md](docs/varlighter.md) |
 | MEV 套利（Base 同链 DEX 原子套利：执行合约、热钱包、发送与结清、页面启用与 `--set-mev`） | [docs/mev.md](docs/mev.md) |
 | 行情监控（含海力士溢价监控与告警） | [docs/monitor.md](docs/monitor.md) |
+| 链上折价套利（链上买入对 Gate 现货或永续） | [docs/chain-arb.md](docs/chain-arb.md) |
 | EQN 快讯、行情监控「异动行情」页签 | [docs/news.md](docs/news.md) |
 | 资产账本 | [docs/asset.md](docs/asset.md) |
 | 页面在线更新（系统更新）、`trading-platform-update.*` 单元、`update-helper.ts` | [docs/update.md](docs/update.md) |
@@ -63,7 +64,7 @@
 | 下单、平仓、对冲、划转、ADL、执行状态机 | L039 L054 L084 L091 L092 L093 L095 L100 L110 |
 | 调度、轮询、恢复、页面读写竞争 | L049 L089 L091 L202 |
 | 撤单、改挂和订单链路延时统计 | L203 |
-| 行情、盘口新鲜度、价差保护 | L100 |
+| 行情、盘口新鲜度、价差保护、链上与交易所数量步长 | L100 L208 |
 | 外部接口的历史读取与分页、“查无”判定 | L039 L093 |
 | 从工作台导入、读别的进程的 SQLite、备份 | L063 |
 | root 运行的安装脚本与助手、服务可写的交接目录 | L201 |

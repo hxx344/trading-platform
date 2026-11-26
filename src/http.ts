@@ -124,6 +124,7 @@ export interface ServiceViews {
     alerts?(market: 'oil' | 'goldoil' | 'hynix'): { view(): unknown; update(body: unknown): unknown; test(): Promise<unknown> } | undefined;
     /** M-3c: false for a configured market switched off (its reads answer 423); the page's switch. */
     enabled?(market: keyof typeof MONITOR_NAMES): boolean;
+    chainArb?(input: unknown, signal: AbortSignal): Promise<unknown>;
     setControl?(market: keyof typeof MONITOR_NAMES, body: unknown): unknown;
     /** M-3d: the saved Variational token (state without the token, and the page's save); undefined when oil is not configured. */
     variationalSession?(): { view(): unknown; update(body: unknown): Promise<unknown> } | undefined;
@@ -622,6 +623,30 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
         if (views.monitor.enabled?.(marketRead) === false) return send(response, 423, { code: 'monitor_disabled', message: marketRead === 'perpetual' ? '合约价差监控已关闭，行情采集已暂停；开启后重新采集' : `${MONITOR_NAMES[marketRead]}监控已关闭，行情采集与自动告警已暂停；开启后恢复` });
         if (isDisplayRead(request.method!, url.pathname)) monitorReads.set(response, { market: marketRead, revision: state.controls?.[marketRead]?.revision });
       }
+    }
+    if (request.method === 'GET' && url.pathname === '/api/monitor/perpetual/chain-arb') {
+      const monitor = views?.monitor;
+      const state = monitor?.state();
+      if (!monitor?.chainArb || !state?.markets.includes('perpetual')) return send(response, 404, { code: 'not_found', message: '请先在设置中启用行情监控的合约价差' });
+      monitorReads.set(response, { market: 'perpetual', revision: state.controls?.perpetual?.revision });
+      const query = Object.fromEntries(url.searchParams);
+      if (Object.keys(query).length !== url.searchParams.size) return send(response, 400, { code: 'invalid_query', message: '查询参数重复' });
+      const controller = new AbortController();
+      const cancel = () => controller.abort();
+      response.once('close', cancel);
+      try {
+        const view = await monitor.chainArb(query, controller.signal);
+        if (!response.destroyed) send(response, 200, view);
+      } catch (error) {
+        if (!response.destroyed) {
+          const status = (error as { status?: number })?.status;
+          const code = status === 400 ? 'invalid_query' : status === 429 ? 'rate_limited' : 'quote_unavailable';
+          send(response, status === 400 || status === 429 || status === 503 ? status : 502, {
+            code, message: error instanceof Error ? error.message.slice(0, 200) : '链上价差暂时不可用',
+          });
+        }
+      } finally { response.off('close', cancel); }
+      return;
     }
     // M-4a: the perpetual table (whole), its summary, and the SSE stream of patches (frames as the workbench's).
     const perpetualRoute = request.method === 'GET' ? /^\/api\/monitor\/perpetual\/(quote|summary|stream)$/.exec(url.pathname)?.[1] : undefined;

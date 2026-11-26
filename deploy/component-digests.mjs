@@ -26,6 +26,7 @@ hooks.deregister();
 // These imports provide the in-process readers for a checkout or simulation. In the installed executor those
 // call sites always receive the market IPC implementation. Any other importer still adds the file and its children.
 const localReaders = new Map([
+  ['src/service/monitor.ts', ['src/chain-arb/read.ts']],
   ['src/monitor/anthropic.ts', ['src/monitor/market-readers.ts']],
   ['src/monitor/hynix.ts', ['src/monitor/market-readers.ts']],
   ['src/monitor/oil.ts', ['src/monitor/market-readers.ts']],

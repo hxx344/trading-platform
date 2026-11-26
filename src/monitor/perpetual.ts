@@ -261,15 +261,17 @@ export function createPerpetualMonitor(options: PerpetualOptions = {}) {
     ...(metricsOptions?.intervalMs ? { intervalMs: metricsOptions.intervalMs } : {}),
   });
   const fundingFetch = fundingOptions?.fetchImpl ?? fetchImpl;
+  const fundingReader = remote?.funding ?? createPerpetualFundingReader({ clock, requestSpacingMs: 350, ...(fundingFetch ? { fetchImpl: fundingFetch } : {}) });
   const fundingHistory = createPerpetualFundingHistoryService({
     getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket,
     getQuote: (exchange, symbol) => quotes.get(`${exchange}:${symbol}`),
-    store: cache, clock, reader: remote?.funding ?? createPerpetualFundingReader({ clock, requestSpacingMs: 350, ...(fundingFetch ? { fetchImpl: fundingFetch } : {}) }),
+    store: cache, clock, reader: fundingReader,
   });
   const priceFetch = priceOptions?.fetchImpl ?? fetchImpl;
+  const priceReader = remote?.price ?? createPerpetualPriceReader({ clock, requestSpacingMs: 350, ...(priceFetch ? { fetchImpl: priceFetch } : {}) });
   const priceHistory = createPerpetualPriceHistoryService({
     getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket,
-    store: cache, clock, reader: remote?.price ?? createPerpetualPriceReader({ clock, requestSpacingMs: 350, ...(priceFetch ? { fetchImpl: priceFetch } : {}) }),
+    store: cache, clock, reader: priceReader,
   });
   const scannerData = createPerpetualScannerDataService({
     getSnapshot: () => ({ quotes: [...quotes.values()] }), getMarket,
@@ -596,6 +598,29 @@ export function createPerpetualMonitor(options: PerpetualOptions = {}) {
         if (!running) throw new PerpetualInspectionError(503, '合约价差采集未运行，开启后再登记或修改持仓');
       }
       return paper.update(input);
+    },
+    /** 资金费组合（docs/fundingbook.md）：场所在线的合约报价，过期的标记价与盘口置空（最新成交价没有时间，一并置空）；未运行时为空。 */
+    liveQuotes(): PerpetualQuote[] {
+      if (!running) return [];
+      const now = clock(), fresh = (time: number | undefined) => Number.isFinite(time) && time! >= now - staleAfterMs && time! <= now + MAX_FUTURE_MS;
+      return [...quotes.values()].filter(quote => venueLive(quote.exchange)).map(quote => {
+        const mark = fresh(quote.markAt), book = fresh(quote.bidAskAt);
+        return mark && book ? quote : { ...quote, ...(mark ? {} : { mark: null }), ...(book ? {} : { bid: null, ask: null }), last: null };
+      });
+    },
+    /**
+     * 资金费组合：当前目录里一个合约的已结算资金费与小时收盘价，直接读场所、不进缓存，与历史服务共用同一个读取器的
+     * 请求间隔。未运行或目录里没有这个合约时 503。
+     */
+    legFunding(exchange: string, symbol: string, range: { from: number; to: number }, signal: AbortSignal) {
+      const market = running ? getMarket(exchange, symbol) : undefined;
+      if (!market) throw new PerpetualInspectionError(503, '合约价差采集未运行，或目录里没有这个合约');
+      return fundingReader(market, range, { signal });
+    },
+    legPrice(exchange: string, symbol: string, range: { from: number; to: number }, signal: AbortSignal) {
+      const market = running ? getMarket(exchange, symbol) : undefined;
+      if (!market) throw new PerpetualInspectionError(503, '合约价差采集未运行，或目录里没有这个合约');
+      return priceReader(market, range, { signal });
     },
     /** M-5b1/M-5e1: resolves once the last stop has written the metrics, histories and paper positions back (the cache file may close then). */
     settled: (): Promise<void> => metricsStopping,

@@ -132,7 +132,7 @@ test('页面导航只在会话内显示已接入模块和采集代次，免读�
   assert.equal(reply.headers.get('cache-control'), 'no-store');
   assert.deepEqual(await reply.json(), {
     generation: h.ex.generation, retired: h.ex.retired, transport: 'simulated',
-    modules: { oil: true, options: false, asset: false, crossex: false, ondo: false, news: true, varlighter: false, mev: false },
+    modules: { oil: true, options: false, asset: false, crossex: false, ondo: false, news: true, varlighter: false, mev: false, fundingbook: false },
     monitor: { oil: { enabled: false, revision: 7 } },
   });
 });

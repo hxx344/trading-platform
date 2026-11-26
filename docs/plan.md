@@ -29,6 +29,7 @@
 | Ondo 挂单奖励 | `ondo` | v0.60.0 | 严格前方保护、账户级断线撤单、成交锁和退出。v0.63.0 支持最多 20 市场并行观察三档净 APR、触价与扫过，显示真实行情与执行延迟。实盘待账户持有人验证 | [ondo.md](ondo.md) |
 | DEX 价差（原 Var / Lighter 价差回归） | `varLighter`（默认开启） | v0.80.0；v0.88.0 推广为两腿 | 任意两个场所（Var、Lighter RH、Lighter 主网、Entropy）同一资产的价差：按场所组合自动配对，另可手动配对并给乘数；价差采集与对齐、按时段基线、回测、模拟盘、下单预演与实盘前核对。只读公开行情，不下单；下单连接器待接入 | [varlighter.md](varlighter.md)、[dexspread.md](dexspread.md) |
 | MEV 套利 | `mev` | v0.84.0 | V1：Base 同链 DEX 原子套利（Uniswap v3、Aerodrome Slipstream 与 v2 的两跳、三跳环路），池子闪电兑换不放本金，热钱包只放 gas；默认观察，实盘从页面开始。v0.85.0 起在页面录入热钱包私钥与收款地址、由热钱包部署执行合约即可启用（命令行方式仍支持）。未实盘 | [mev.md](mev.md) |
+| 资金费组合 | 无（页面开关，参数在 `fundingbook.sqlite`） | v0.105.0 | P1：多所多账户资金费套利的只读规划器与模拟盘（采集已结算资金费与小时价、按账户安全距离求解目标仓位、路径规划）。默认不启用，不读账户、不下单；依赖合约价差监控。真实账户读取、执行、Boros 未开始，待决事项见文档第 10 节 | [fundingbook.md](fundingbook.md) |
 | 从工作台导入 | 无 | v0.2.0 命令行、v0.3.0 页面 | 可导入配对、原油执行账户（v0.8.0）、期权账户（v0.11.0）、行情监控与资产账本（v0.15.0）、CrossEx 账户（v0.35.0）、Ondo 挂单奖励（v0.60.0） | [module-import.md](module-import.md) |
 
 页面与地址见 [frontend.md](frontend.md)《页面一览》；回退到旧版本前要做的事见 [README](../README.md)《回退到旧版本》。下面第 1–7 节是第一阶段（ASTER）的方案与记录（第 3 节的目录树已含后续模块）。

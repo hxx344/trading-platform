@@ -46,6 +46,7 @@
 | 交易中心 | Ondo 挂单奖励 | `#/ondo` | 服务已接入 Ondo | 《Ondo 挂单奖励页》 |
 | 交易中心 | DEX 价差（原 Var/Lighter 价差） | `#/varlighter`，子页 `#/varlighter/detail/<场所:代码|场所:代码[@乘数]>`、`#/varlighter/paper`、`#/varlighter/ready` | 服务开启了该模块（默认开启，`"varLighter": false` 关闭） | 《DEX 价差页》，内容见 [varlighter.md](varlighter.md) 第 10 节、[dexspread.md](dexspread.md) 第 10 节 |
 | 策略与风险 | 配对组 | `#/`、`#/pair/<配对>` | 总是 | F1–F3、《ASTER 页面按工作台重排（F4）》 |
+| 策略与风险 | 资金费组合 | `#/fundingbook`，子页 `#/fundingbook/plan`、`#/fundingbook/paper`、`#/fundingbook/settings` | 总是显示（默认未启用，在本页设置里打开） | 《资金费组合页》，内容见 [fundingbook.md](fundingbook.md) |
 | 期权 | 期权 | `#/options`，子页 `#/options/positions`、`#/options/orders`、`#/options/performance`、`#/options/rfq` | 已配置期权，后台重试期间也显示 | 《期权页》 |
 | 链上 | MEV 套利 | `#/mev`，子页 `#/mev/opportunities`、`#/mev/transactions`、`#/mev/pools`、`#/mev/settings` | 总是显示（v0.86.0 起；还没启用时是启用向导） | 《MEV 套利页》，内容见 [mev.md](mev.md) 第 5 节 |
 | 链上 | 链上折价套利 | `#/chain-arb` | 总是显示，未配置时可进入设置，监控关闭时可进入合约价差开关 | 《链上折价套利》，测算见 [chain-arb.md](chain-arb.md) |
@@ -826,3 +827,15 @@ v0.101.2 的单币页和排名使用所选 Gate 或 OKX 账户当前充值地址
 ## 合约价差工作台工具
 
 「行情监控 → 合约价差」沿用工作台 `7745181` 的 `modules/monitor/app/perpetual-panel.tsx`、买卖方向、分组与筛选口径。展示按币种分组的价格和资金费机会、费差 24h、回本时间与本金收益估算，支持星标组合、屏蔽组合与币种、查看关联持仓、报价健康和提醒。使用同源的平台接口和现有账户会话。跨所对冲预填须匹配当前可用合约目录。样式来自同版本的 perpetual、scanner、health、alerts 和 related-strip 规则。回退版本为 v0.102.0。
+
+## 资金费组合页（v0.105.0）
+
+**对照的工作台页面**：工作台没有这个页面，骨架与样式沿用本仓库的 Var/Lighter 价差页（`varlighter.css`，`parts.tsx` 的 `Badge`、`Metric`、`useWrite`），`fundingbook.css` 只放本页特有的少量排版；回退版本 v0.104.0。代码在 `web/src/fundingbook/`，内容与接口见 [fundingbook.md](fundingbook.md)。
+
+- 左侧栏入口在「策略与风险」组、配对组之后，总是显示。四个页签都在地址里：`#/fundingbook`（总览）、`#/fundingbook/plan`（路径规划）、`#/fundingbook/paper`（模拟盘）、`#/fundingbook/settings`；不认识的子地址不落在本页。
+- 总览：模拟盘权益、预期年化（调整均值与短窗口两个口径）、持仓名义、所需资金、累计资金费、上一轮与下一轮时间；账户表（目标权益、1 日波动金额、维持保证金、安全距离、目标仓位与各腿收付的年化）；各标的的作用（自身资金费收入、往返成本、边际贡献、去掉它之后各账户波动金额与安全距离的变化，对冲仓有标记）；各腿资金费与采集状态；波动率与相关性矩阵。未启用、合约价差监控没在运行、规划失败各有一条提示。
+- 路径规划：这一轮的步骤按执行顺序列出（减仓、划转、加仓），可在规划记录里点选历史轮次；「立即规划」排入下一遍采集之后。页面写明只是规划、不向任何交易所发单。
+- 模拟盘：权益、累计盈亏、资金费、手续费与滑点；各账户的现金与持仓。「重置模拟盘」先弹确认，写明会清掉的内容。
+- 设置：整份参数一起保存，`fundingbook-form.ts` 只查数字格式（不是数字时不发请求、在表单下方给出原因），范围、整数、数量上限与启用前提由服务端 `parseSettings` 校验，拒绝的原因显示在页面顶部；保存成功后表单直接换成刚保存的值；账户行可增删，场所切换时带出该场所的默认费率、保证金率与杠杆。
+- 读取用共享读取层（`useLiveResource`），间隔 5 秒；窄屏（390 px）时表格在面板内横向滚动。本地预览：`pnpm build:web` 后 `node scripts/dev-fundingbook.ts`（替身行情，不联网），加 `--fresh` 从未启用开始。
+- v0.105.0 的验证：内置浏览器窗格在本机不可用，改用无界面 Chrome 在 1280 与 390 宽度走了一遍四个页签、保存参数（安全距离填 0 被服务端拒绝并在页面顶部给出原因，改 6 后保存成功）、立即规划（第 2 轮 0 个步骤）、重置模拟盘、`--fresh` 的未启用状态；工作台没有对应页面，未做并排对比；无横向溢出，控制台没有报错。

@@ -20,6 +20,7 @@
 | Var / Lighter 价差回归（Lighter RH 与主网，采集、基线、回测、模拟盘、实盘准备） | [docs/varlighter.md](docs/varlighter.md) |
 | 通用 DEX 价差（Var/Lighter 推广为任意两腿、Entropy 等新场所、自定义配对与乘数） | [docs/dexspread.md](docs/dexspread.md)、[docs/varlighter.md](docs/varlighter.md) |
 | MEV 套利（Base 同链 DEX 原子套利：执行合约、热钱包、发送与结清、页面启用与 `--set-mev`） | [docs/mev.md](docs/mev.md) |
+| 资金费组合（多所多账户资金费套利：采集、求解、路径规划、模拟盘） | [docs/fundingbook.md](docs/fundingbook.md) |
 | 行情监控（含海力士溢价监控与告警） | [docs/monitor.md](docs/monitor.md) |
 | 链上折价套利（链上买入对 Gate 现货或永续） | [docs/chain-arb.md](docs/chain-arb.md) |
 | EQN 快讯、行情监控「异动行情」页签 | [docs/news.md](docs/news.md) |

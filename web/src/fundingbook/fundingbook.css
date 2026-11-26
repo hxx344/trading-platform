@@ -1,0 +1,13 @@
+/* 资金费组合页（web/src/fundingbook/FundingBookPage.tsx，docs/frontend.md《资金费组合页》）。
+   工作台没有对应页面：骨架、页签、指标卡、表格、表单沿用 Var/Lighter 价差页的 varlighter.css（.vl-*，本页一并引入），
+   这里只有本页另需的几条，只用设计令牌。 */
+.fb-group{padding:12px 14px 0;color:var(--text-tertiary);font-size:.75rem;font-weight:500}
+.fb-switches{display:flex;flex-wrap:wrap;gap:8px 24px;padding:14px 14px 0;font-size:.8125rem}
+.fb-accounts td input,.fb-accounts td select{width:100%;min-width:84px}
+.fb-accounts td:first-child input{min-width:120px}
+.fb-accounts .icon{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);background:var(--surface-1);color:var(--text-secondary);cursor:pointer}
+.fb-accounts .icon:hover{color:var(--error)}
+.fb-steps td:first-child{color:var(--text-tertiary);font-variant-numeric:tabular-nums}
+.fb-corr td.self{color:var(--text-tertiary)}
+.fb-pick{border:0;background:none;padding:0;color:var(--accent);font:inherit;cursor:pointer}
+.fb-pick[aria-pressed=true]{color:var(--text-primary);font-weight:600}

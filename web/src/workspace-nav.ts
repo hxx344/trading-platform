@@ -13,7 +13,7 @@ export const workspaceLabels: Record<WorkspaceId, string> = {
   options: '期权', onchain: '链上', research: '研究室', system: '系统',
 };
 
-export type NavEntry = 'asset' | 'positions' | 'monitor' | 'news' | 'oil' | 'hynix' | 'goldoil' | 'crossex' | 'ondo' | 'varlighter' | 'pairs' | 'mev' | 'chain-arb' | 'options' | 'status' | 'logs' | 'settings';
+export type NavEntry = 'asset' | 'positions' | 'monitor' | 'news' | 'oil' | 'hynix' | 'goldoil' | 'crossex' | 'ondo' | 'varlighter' | 'pairs' | 'fundingbook' | 'mev' | 'chain-arb' | 'options' | 'status' | 'logs' | 'settings';
 
 /** Every entry of the side navigation, in its order inside the workspace. A new page is registered here. */
 export const navEntries: Record<NavEntry, { workspace: WorkspaceId; text: string; href: string }> = {
@@ -32,6 +32,8 @@ export const navEntries: Record<NavEntry, { workspace: WorkspaceId; text: string
   // DEX 价差（原 Var/Lighter 价差回归，docs/varlighter.md、docs/dexspread.md）：config.json 写了 "varLighter": false 时没有。
   varlighter: { workspace: 'trading', text: 'DEX 价差', href: '#/varlighter' },
   pairs: { workspace: 'strategy', text: '配对组', href: '#/' },
+  // 资金费组合（docs/fundingbook.md）：总是显示；默认不启用，在页面的设置里启用。
+  fundingbook: { workspace: 'strategy', text: '资金费组合', href: '#/fundingbook' },
   options: { workspace: 'options', text: '期权', href: '#/options' },
   // MEV 套利（docs/mev.md）：总是显示；还没启用时页面是启用向导。
   mev: { workspace: 'onchain', text: 'MEV 套利', href: '#/mev' },

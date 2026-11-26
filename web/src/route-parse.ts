@@ -1,6 +1,8 @@
-// The page's views live in the address hash (#/pair/<pair>, #/status, #/logs, #/settings, #/oil, #/hynix, #/goldoil, #/options[/positions|/orders|/performance|/rfq], #/monitor, #/asset, #/positions, #/crossex[/trade|/hedge|/orders|/settings], #/ondo, #/news, #/varlighter[/detail[/<场所:代码|场所:代码[@乘数]>]|/paper|/ready], #/mev[/opportunities|/transactions|/pools|/settings]), so a reload or a shared
+// The page's views live in the address hash (#/pair/<pair>, #/status, #/logs, #/settings, #/oil, #/hynix, #/goldoil, #/options[/positions|/orders|/performance|/rfq], #/monitor, #/asset, #/positions, #/crossex[/trade|/hedge|/orders|/settings], #/ondo, #/news, #/varlighter[/detail[/<场所:代码|场所:代码[@乘数]>]|/paper|/ready], #/mev[/opportunities|/transactions|/pools|/settings], #/fundingbook[/plan|/paper|/settings]), so a reload or a shared
 // link opens the same view. Kept free of the DOM so the server-side tests can import it.
-export type Route = { page: 'overview' } | { page: 'pair'; pairId: string | null } | { page: 'status' } | { page: 'logs' } | { page: 'settings' } | { page: 'oil' } | { page: 'hynix' } | { page: 'goldoil' } | { page: 'options'; tab: 'desk' | 'positions' | 'orders' | 'performance' | 'rfq' } | { page: 'monitor' } | { page: 'asset' } | { page: 'positions' } | { page: 'crossex'; tab: CrossexTab } | { page: 'ondo' } | { page: 'news' } | { page: 'varlighter'; tab: VarLighterTab; symbol: string | null } | { page: 'mev'; tab: MevTab } | { page: 'chain-arb' };
+export type Route = { page: 'overview' } | { page: 'pair'; pairId: string | null } | { page: 'status' } | { page: 'logs' } | { page: 'settings' } | { page: 'oil' } | { page: 'hynix' } | { page: 'goldoil' } | { page: 'options'; tab: 'desk' | 'positions' | 'orders' | 'performance' | 'rfq' } | { page: 'monitor' } | { page: 'asset' } | { page: 'positions' } | { page: 'crossex'; tab: CrossexTab } | { page: 'ondo' } | { page: 'news' } | { page: 'varlighter'; tab: VarLighterTab; symbol: string | null } | { page: 'mev'; tab: MevTab } | { page: 'chain-arb' } | { page: 'fundingbook'; tab: FundingBookTab };
+export type FundingBookTab = 'overview' | 'plan' | 'paper' | 'settings';
+const FUNDINGBOOK_TABS: readonly FundingBookTab[] = ['plan', 'paper', 'settings'];
 export type MevTab = 'overview' | 'opportunities' | 'transactions' | 'pools' | 'settings';
 const MEV_TABS: readonly MevTab[] = ['opportunities', 'transactions', 'pools', 'settings'];
 export type VarLighterTab = 'overview' | 'detail' | 'paper' | 'ready';
@@ -40,6 +42,8 @@ export function parseRoute(hash: string): Route {
   }
   if (hash === '#/mev') return { page: 'mev', tab: 'overview' };
   if (hash === '#/chain-arb') return { page: 'chain-arb' };
+  if (hash === '#/fundingbook') return { page: 'fundingbook', tab: 'overview' };
+  if (hash.startsWith('#/fundingbook/')) { const tab = FUNDINGBOOK_TABS.find(item => hash === `#/fundingbook/${item}`); if (tab) return { page: 'fundingbook', tab }; }
   if (hash.startsWith('#/mev/')) { const tab = MEV_TABS.find(item => hash === `#/mev/${item}`); if (tab) return { page: 'mev', tab }; }
   if (hash.startsWith('#/crossex/')) { const tab = CROSSEX_TABS.find(item => hash === `#/crossex/${item}`); if (tab) return { page: 'crossex', tab }; }
   if (hash === '#/pair' || hash === '#/pair/') return { page: 'pair', pairId: null };

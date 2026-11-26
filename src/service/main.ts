@@ -57,6 +57,7 @@ import { createHostStatus, processLoopHistogram } from '../host-status.ts';
 import { HEALTH_TICK_MS, createHealthWatch, type HealthWatch } from './health-watch.ts';
 import { newsLoop, newsViews, type NewsHolder } from './news.ts';
 import { openMev, type MevOptions } from './mev.ts';
+import { openFundingBook, perpetualSource } from './fundingbook.ts';
 import { mevSummary } from './mev-config.ts';
 import { DEX_TOKEN_TICK_MS, createDexLink } from './dex.ts';
 import type { NewsOptions } from '../news/feed.ts';
@@ -456,6 +457,8 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   const dex = dexSocketPath ? createDexLink({ socketPath: dexSocketPath, dir, notifyOnce: (key, text) => { notifier.notifyOnce(key, text); }, log: line => process.stderr.write(`${line}\n`) }) : null;
   // MEV 套利（docs/mev.md）：启动后只观察；实盘从页面开始。打不开库只停用本模块。
   const mev = openMev({ config: config.mev, secrets: secrets.mev, others: [...secrets.accounts.values()].flatMap(account => [account.user, account.signer]) }, dir, mevOptions ?? {}, { log: line => process.stderr.write(`${line}\n`), notify: (key, text) => notifier.notifyOnce(key, text) });
+  // 资金费组合（docs/fundingbook.md）：默认不启用；启用后只读公开行情、记模拟盘。打不开库只停用本模块。
+  const fundingbook = openFundingBook(dir, perpetualSource(() => monitor?.perpetual), {}, { log: line => process.stderr.write(`${line}\n`) });
   return runExecutor({
     executor, store, dir, port, socketPath, executionBuild, configBuild, app, sessions, readTokens,
     ...(config.host ? { listen: { address: config.host, urlHost: urlHost(config.host) } } : {}), ...(password ? { password } : {}), passes: oil ? ['jobs', 'transfers', 'adl'] : ['transfers', 'adl'], drainMs: DRAIN_MS,
@@ -481,6 +484,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       ...(news ? { news: newsViews(news) } : {}),
       ...(dex ? { varlighter: dex.forward } : {}),
       mev: mev.views,
+      fundingbook: fundingbook.views,
     },
     ...(importDir ? { imports: { submit: (body: unknown) => submitImportRequest(importDir, body), latest: () => readImportResult(importDir),
       ...(socketPath !== undefined ? { legacyUpdate: () => legacyUpdateJob(importDir) } : {}) } } : {}),
@@ -548,6 +552,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
         } finally { dex.close(); }
       })()] : []),
       mev.loop(context),
+      fundingbook.loop(context),
       ...(config.watch && secrets.watch ? [watchLoop(watch = createWatch({ config: config.watch, secret: secrets.watch, problem: context.notReady, ...(watchOptions?.fetchImpl ? { fetchImpl: watchOptions.fetchImpl } : {}), log: line => process.stderr.write(`${line}\n`) }), context, watchOptions)] : []),
     ],
     onStopping: (reason, detail) => {
@@ -563,6 +568,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
       options?.abort();
       // MEV：先让引擎不再发新交易，再中止在途的节点请求，这一轮不占满停服的等待时间。
       mev.shutdown();
+      fundingbook.shutdown();
     },
     onStopped: async lateLeaseLoss => {
       // Events from the drain (an unknown transfer, an ADL batch) go out now rather than at the next start.

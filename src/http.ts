@@ -28,6 +28,7 @@ import type { OndoViews } from './service/ondo.ts';
 import { DexOutcomeUnknown } from './dex/ipc.ts';
 import type { DexForward } from './service/dex.ts';
 import type { MevViews } from './service/mev.ts';
+import type { FundingBookViews } from './service/fundingbook.ts';
 import { AssetConflict } from './asset/sync-lock.ts';
 import { AssetInputError, INPUT_INVALID } from './asset/validation.ts';
 import { AssetBackupError } from './asset/source-import.ts';
@@ -179,6 +180,8 @@ export interface ServiceViews {
   varlighter?: DexForward;
   /** MEV 套利（service/mev.ts，docs/mev.md）；执行服务总是提供，还没启用时只有启用向导的状态。 */
   mev?: MevViews;
+  /** 资金费组合（service/fundingbook.ts，docs/fundingbook.md）；执行服务总是提供，默认不启用。 */
+  fundingbook?: FundingBookViews;
 }
 
 /** accessToken is exchanged at /login for a session of its own, as is the password (sessions.ts). */
@@ -556,7 +559,7 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
       return send(response, 200, {
         generation: executor.generation, retired: executor.retired, transport: executor.environment === 'mainnet' ? 'live' : 'simulated',
         modules: { oil: !!views?.oil, options: !!views?.options, asset: !!views?.asset,
-          crossex: !!views?.crossex, ondo: !!views?.ondo, news: !!views?.news, varlighter: !!views?.varlighter, mev: !!views?.mev },
+          crossex: !!views?.crossex, ondo: !!views?.ondo, news: !!views?.news, varlighter: !!views?.varlighter, mev: !!views?.mev, fundingbook: !!views?.fundingbook },
         monitor: monitorScopes(views?.monitor?.state()),
       } satisfies ShellView);
     }
@@ -988,6 +991,23 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
         if (error instanceof ContractError) throw error;
         const failure = mev.failure(error);
         if (failure.internal) process.stderr.write(`MEV 接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}\n`);
+        return send(response, failure.status, failure.body);
+      }
+      return send(response, 404, { code: 'not_found', message: '不存在' });
+    }
+    if (url.pathname.startsWith('/api/fundingbook/')) {
+      if (!views?.fundingbook) return send(response, 404, { code: 'not_found', message: '本服务没有资金费组合模块' });
+      const fundingbook = views.fundingbook, path = url.pathname.slice('/api/fundingbook/'.length);
+      try {
+        if (request.method === 'GET' && path === 'state') return send(response, 200, fundingbook.state());
+        if (request.method === 'GET' && path === 'round') return send(response, 200, fundingbook.round(Number(url.searchParams.get('id'))));
+        if (request.method === 'POST' && path === 'settings') return send(response, 200, fundingbook.settings(await readJson(request)));
+        if (request.method === 'POST' && path === 'plan') { await readJson(request); return send(response, 200, fundingbook.plan()); }
+        if (request.method === 'POST' && path === 'paper/reset') return send(response, 200, fundingbook.reset(await readJson(request)));
+      } catch (error) {
+        if (error instanceof ContractError) throw error;
+        const failure = fundingbook.failure(error);
+        if (failure.internal) process.stderr.write(`资金费组合接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}\n`);
         return send(response, failure.status, failure.body);
       }
       return send(response, 404, { code: 'not_found', message: '不存在' });

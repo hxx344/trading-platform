@@ -1,4 +1,4 @@
-import { Activity, ArrowLeftRight, Cpu, ChevronRight, Coins, Gauge, Layers, Link2, Menu, Newspaper, RefreshCw, Scale, ScrollText, Server, Settings2, ShieldCheck, Sigma, Wallet, Waves, Zap, type LucideIcon } from 'lucide-react';
+import { Activity, ArrowLeftRight, Cpu, ChevronRight, Coins, Gauge, Layers, Link2, Menu, Newspaper, Percent, RefreshCw, Scale, ScrollText, Server, Settings2, ShieldCheck, Sigma, Wallet, Waves, Zap, type LucideIcon } from 'lucide-react';
 import { lazy, memo, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { shellMarkets, type MarketScope, type MonitorScopes, type ShellView } from '../../src/shell-view.ts';
 import { LazyBoundary } from './LazyBoundary.tsx';
@@ -41,6 +41,7 @@ const CrossexPage = lazy(() => import('./crossex/CrossexPage.tsx').then(m => ({ 
 const OndoPage = lazy(() => import('./ondo/OndoPage.tsx').then(m => ({ default: m.OndoPage })));
 const VarLighterPage = lazy(() => import('./varlighter/VarLighterPage.tsx').then(m => ({ default: m.VarLighterPage })));
 const MevPage = lazy(() => import('./mev/MevPage.tsx').then(m => ({ default: m.MevPage })));
+const FundingBookPage = lazy(() => import('./fundingbook/FundingBookPage.tsx').then(m => ({ default: m.FundingBookPage })));
 const ChainArbPage = lazy(() => import('./ChainArbPage.tsx').then(m => ({ default: m.ChainArbPage })));
 const OptionsPage = lazy(() => import('./OptionsPage.tsx').then(m => ({ default: m.OptionsPage })));
 const StatusPage = lazy(() => import('./StatusPage.tsx').then(m => ({ default: m.StatusPage })));
@@ -54,7 +55,7 @@ function isStale(read: ResourceSnapshot<unknown>) {
 }
 
 const ALWAYS: readonly NavEntry[] = ['pairs', 'chain-arb', 'status', 'logs', 'settings'];
-const ICONS: Record<NavEntry, LucideIcon> = { asset: Wallet, positions: Layers, monitor: Activity, news: Newspaper, oil: ArrowLeftRight, hynix: Cpu, goldoil: Scale, crossex: Gauge, ondo: Coins, varlighter: Waves, pairs: ShieldCheck, options: Sigma, mev: Zap, 'chain-arb': Link2, status: Server, logs: ScrollText, settings: Settings2 };
+const ICONS: Record<NavEntry, LucideIcon> = { asset: Wallet, positions: Layers, monitor: Activity, news: Newspaper, oil: ArrowLeftRight, hynix: Cpu, goldoil: Scale, crossex: Gauge, ondo: Coins, varlighter: Waves, pairs: ShieldCheck, fundingbook: Percent, options: Sigma, mev: Zap, 'chain-arb': Link2, status: Server, logs: ScrollText, settings: Settings2 };
 /** Below this width the side navigation is a drawer (the workbench's 760px breakpoint, shell.css). */
 const DRAWER_QUERY = '(max-width: 760px)';
 
@@ -106,7 +107,7 @@ export function App() {
   const tokenNotice = navNotice(readToken.data, Date.now());
   const available = new Set<NavEntry>(ALWAYS);
   if (state) {
-    for (const entry of ['oil', 'options', 'asset', 'crossex', 'ondo', 'news', 'varlighter', 'mev'] as const) {
+    for (const entry of ['oil', 'options', 'asset', 'crossex', 'ondo', 'news', 'varlighter', 'mev', 'fundingbook'] as const) {
       if (state.modules[entry]) available.add(entry);
     }
     if (state.modules.oil) { available.add('hynix'); available.add('goldoil'); }
@@ -161,6 +162,7 @@ export function App() {
       case 'ondo': return <OndoPage onExpired={onExpired} />;
       case 'varlighter': return <VarLighterPage tab={route.tab} symbol={route.symbol} onExpired={onExpired} />;
       case 'mev': return <MevPage tab={route.tab} onExpired={onExpired} />;
+      case 'fundingbook': return <FundingBookPage tab={route.tab} onExpired={onExpired} />;
       case 'chain-arb': return <ChainArbPage shell={shell} onExpired={onExpired} />;
       case 'crossex': return <CrossexPage tab={route.tab} onExpired={onExpired} />;
       case 'hynix': return <HynixPage onExpired={onExpired} />;

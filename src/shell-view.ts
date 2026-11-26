@@ -8,7 +8,7 @@ export interface ShellView {
   generation: number;
   retired: boolean;
   transport: 'simulated' | 'live';
-  modules: Record<'oil' | 'options' | 'asset' | 'crossex' | 'ondo' | 'news' | 'varlighter' | 'mev', boolean>;
+  modules: Record<'oil' | 'options' | 'asset' | 'crossex' | 'ondo' | 'news' | 'varlighter' | 'mev' | 'fundingbook', boolean>;
   monitor: MonitorScopes | null;
 }
 

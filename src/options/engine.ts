@@ -14,7 +14,7 @@ import { followOrder, iocOrder, reconcileOrder, roundToTick, type OrderOutcome, 
 import { amountText, buildPerformance, exact, thinPoints, type PerformanceInput, type Sample } from './performance.ts';
 import { QUOTE_MIN_LEFT_MS, RFQ_STATUS_NAMES, chainFor, counterpartiesFrom, filledOrders, isTerminal, observe, parseQuotes, parseRfqRow, quoteProblem, quoteView, rfqFinished, sortQuotes, strategyTypeFor, validRfq, type RfqObservation, type RfqQuote, type RfqRecord } from './rfq.ts';
 import type { OptionsStore } from './store.ts';
-import { StrategyError, buildStrategy, maximumLoss, reserveShortMargin, validateStructure, type Estimates, type MarginContext, type Preview, type RiskLeg, type Side, type StrategyMode } from './strategy.ts';
+import { M50_MIN_MS, StrategyError, buildStrategy, legCount, marginBound, maximumLoss, reserveShortMargin, trendSignal, validateStructure, type Estimates, type MarginContext, type Preview, type RiskLeg, type Side, type StrategyMode, type TrendSignal } from './strategy.ts';
 
 export const PLAN_TTL_MS = 30_000;
 export const POLL_MS = 1_000;
@@ -32,6 +32,12 @@ const RETIRE_BUDGET_MS = 120_000;
 const READ_MS = 25_000;
 /** A filled RFQ is tracked from its saved structure once its trade list has not matched for this long (G2c). */
 const RFQ_TRADE_WAIT_MS = 120_000;
+/** M50 (docs/options.md, M50 均线择边): the daily signal from 08:15 UTC, a failed read retried each minute. */
+export const M50_SIGNAL_HOUR_UTC = 8;
+export const M50_SIGNAL_MINUTE_UTC = 15;
+export const M50_RETRY_MS = 60_000;
+/** The page asked for an M50 preview or plan within this time: the signal is kept current although config.json names another mode. */
+const M50_WANTED_MS = 86_400_000;
 const EXECUTIONS_KEPT = 100;
 const EPSILON = 1e-9;
 /** 收益 (G2b): one sample a minute per holding (the workbench's default), only on positions read within the last minute. */
@@ -103,6 +109,21 @@ export interface OptionsState {
   schedule: Schedule;
   /** 组合询价 (G2c, v0.17): the latest RFQ; null or absent when there has been none. */
   rfq: RfqRecord | null;
+  /** M50 (v0.97): the latest daily signal and the day whose action was sent to Feishu; absent in older documents. */
+  m50: M50State;
+}
+export interface M50State { signal: TrendSignal | null; notifiedDay: string | null }
+export type M50Action = 'no_signal' | 'open' | 'hold' | 'switch' | 'settling' | 'other_strategy';
+const emptyM50 = (): M50State => ({ signal: null, notifiedDay: null });
+const validSignal = (value: unknown): value is TrendSignal => {
+  if (typeof value !== 'object' || value === null) return false;
+  const item = value as Record<string, unknown>;
+  return typeof item.day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(item.day) && [item.at, item.index, item.ma].every(number => typeof number === 'number' && Number.isFinite(number) && number > 0) && (item.side === 'Put' || item.side === 'Call');
+};
+/** The UTC day whose 08:15 signal applies at `at`: before 08:15 it is still the previous day's. */
+export function m50SignalDay(at: number): string {
+  const day = new Date(at), start = Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), M50_SIGNAL_HOUR_UTC, M50_SIGNAL_MINUTE_UTC);
+  return new Date(at >= start ? at : at - 86_400_000).toISOString().slice(0, 10);
 }
 
 export interface AutoOpenSettings { enabled: boolean; hourUtc: number; minuteUtc: number; windowSeconds: number }
@@ -149,7 +170,7 @@ export function isoWeek(ms: number): string {
 
 /** Restores the saved document; a missing one starts empty, another account's refuses start. */
 function restore(raw: unknown, uid: string): OptionsState {
-  if (raw === null) return { uid, tasks: {}, journal: {}, tracked: { groupId: null, sizes: {} }, pmBaseline: null, executions: [], schedule: emptySchedule(), rfq: null };
+  if (raw === null) return { uid, tasks: {}, journal: {}, tracked: { groupId: null, sizes: {} }, pmBaseline: null, executions: [], schedule: emptySchedule(), rfq: null, m50: emptyM50() };
   const value = raw as Partial<OptionsState>;
   const record = (item: unknown) => typeof item === 'object' && item !== null && !Array.isArray(item);
   if (!record(value) || typeof value.uid !== 'string' || !record(value.tasks) || !record(value.journal) || !record(value.tracked) || !record(value.tracked!.sizes) || !Array.isArray(value.executions)) throw new Error('期权状态库内容不完整');
@@ -165,6 +186,8 @@ function restore(raw: unknown, uid: string): OptionsState {
   }
   if (value.rfq === undefined) value.rfq = null;
   else if (value.rfq !== null && !validRfq(value.rfq)) throw new Error('期权状态库的询价记录不完整');
+  if (value.m50 === undefined) value.m50 = emptyM50();
+  else if (!record(value.m50) || !(value.m50!.signal === null || validSignal(value.m50!.signal)) || !(value.m50!.notifiedDay === null || typeof value.m50!.notifiedDay === 'string')) throw new Error('期权状态库的 M50 信号记录不完整');
   return value as OptionsState;
 }
 
@@ -320,9 +343,81 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     if (new Date(expiry).toISOString().slice(0, 10) !== sunday.toISOString().slice(0, 10)) conflict('calendar', `到期日须是本周日 ${sunday.toISOString().slice(0, 10)}（UTC）`);
   }
 
+  // ---- M50 signal ------------------------------------------------------------------------------------------------
+  let m50Wanted = -Infinity, m50AttemptAt = -Infinity, m50Error: string | null = null, m50Reading = false;
+  /** The signal for the day in force now; null until that day's 08:15 signal has been read. */
+  const currentSignal = (): TrendSignal | null => state.m50.signal && state.m50.signal.day === m50SignalDay(now()) ? state.m50.signal : null;
+  /** The opening must sell the current signal's side, at least two days before expiry. */
+  function validateTrend(view: Preview): void {
+    const signal = currentSignal();
+    if (!signal) conflict('no_signal', `M50 还没有 ${m50SignalDay(now())} 的均线信号`);
+    if (view.legs.length !== 1 || view.legs[0]!.side !== 'Sell' || view.legs[0]!.optionType !== signal!.side) conflict('strategy_changed', 'M50 卖出方向与当天信号不一致，请重新生成计划');
+    if (view.expiry - now() < M50_MIN_MS) conflict('calendar', 'M50 到期日须在 2 天以后');
+  }
+  const validateEntry = (view: Preview): void => view.mode === 'trend_m50' ? validateTrend(view) : validateCalendar(view.expiry);
+  /** What the day's signal asks of the tracked strategy. */
+  function m50Action(): { action: M50Action; side: OptionType | null; expiry: number | null } {
+    const signal = currentSignal();
+    if (!signal) return { action: 'no_signal', side: null, expiry: null };
+    if (!Object.keys(state.tracked.sizes).length) return { action: 'open', side: null, expiry: null };
+    const group = state.tracked.groupId ? state.tasks[state.tracked.groupId] : undefined;
+    if (!group || group.mode !== 'trend_m50') return { action: 'other_strategy', side: null, expiry: null };
+    const leg = Object.values(group.legs).find(item => item.side === 'Sell');
+    if (!leg) return { action: 'other_strategy', side: null, expiry: null };
+    if (leg.expiry <= now()) return { action: 'settling', side: leg.optionType, expiry: leg.expiry };
+    return { action: leg.optionType === signal.side ? 'hold' : 'switch', side: leg.optionType, expiry: leg.expiry };
+  }
+  /**
+   * Every 5 s: once the day's 08:15 has passed and no signal for it is saved, read the index's daily candles (at most once a
+   * minute) and save the signal. Runs while config.json names M50 or the page asked for it within a day. With config.json
+   * on M50, an open or a switch is sent to Feishu once per day.
+   */
+  async function trendTick(): Promise<void> {
+    const at = now();
+    if (settings.strategyMode !== 'trend_m50' && at - m50Wanted > M50_WANTED_MS) return;
+    const day = m50SignalDay(at);
+    if (!currentSignal() && !m50Reading && at - m50AttemptAt >= M50_RETRY_MS && !shutdown) {
+      m50AttemptAt = at;
+      m50Reading = true;
+      try {
+        if (!client.indexKline) throw new Error('期权客户端不支持指数日线');
+        const snapshot = freshSnapshot();
+        if (!(snapshot.index && snapshot.index > 0)) throw new Error('均线信号需要当前 BTC 指数');
+        const index = snapshot.index;
+        const reply = await client.indexKline(AbortSignal.timeout(READ_MS));
+        if (!Array.isArray(reply.list)) throw new Error('Bybit 指数日线格式无效');
+        const signal = trendSignal(reply.list, day, index, now());
+        // A day that turned during the read is evaluated afresh on the next tick.
+        if (m50SignalDay(now()) !== day) return;
+        state.m50.signal = signal;
+        save();
+        m50Error = null;
+        log(`期权 M50 信号（${day}）：指数 ${signal.index.toFixed(2)}，MA50 ${signal.ma.toFixed(2)}，卖 ${signal.side}`);
+      } catch (error) {
+        const message = describe(error);
+        if (message !== m50Error) log(`期权 M50 信号读取失败，每分钟重试：${message}`);
+        m50Error = message;
+      } finally { m50Reading = false; }
+    }
+    if (settings.strategyMode !== 'trend_m50' || !currentSignal() || state.m50.notifiedDay === day) return;
+    const { action, side } = m50Action();
+    if (action === 'settling' || action === 'no_signal') return;
+    const signal = currentSignal()!;
+    try {
+      if (action === 'open' || action === 'switch') notify(`期权 M50（${day}）：指数 ${signal.index.toFixed(0)}，MA50 ${signal.ma.toFixed(0)}，${action === 'open' ? `建议开仓卖 ${signal.side}` : `持仓为卖 ${side}，建议先平仓再开卖 ${signal.side}`}，请到期权页面确认`);
+      state.m50.notifiedDay = day;
+      save();
+    } catch (error) { log(`期权飞书通知未能写入：${describe(error)}`); }
+  }
+  function m50View() {
+    const { action, side, expiry } = m50Action();
+    return { configured: settings.strategyMode === 'trend_m50', day: m50SignalDay(now()), signal: currentSignal(), lastSignal: state.m50.signal, action, trackedSide: side, trackedExpiry: expiry, error: currentSignal() ? null : m50Error, notifiedDay: state.m50.notifiedDay };
+  }
+
   function preview(quantity: string, mode: StrategyMode, snapshot = market.snapshot()): Preview {
+    if (mode === 'trend_m50') m50Wanted = now();
     if (!snapshot) return conflict('market_unavailable', '还没有期权行情');
-    try { return buildStrategy(snapshot.rows, { now: now(), qty: quantity, mode, index: snapshot.index, estimates: settings.estimates, marketAt: snapshot.at }); }
+    try { return buildStrategy(snapshot.rows, { now: now(), qty: quantity, mode, index: snapshot.index, estimates: settings.estimates, marketAt: snapshot.at, trendSide: mode === 'trend_m50' ? currentSignal()?.side ?? null : null }); }
     catch (error) { if (error instanceof StrategyError) return conflict(error.code, error.message); throw error; }
   }
 
@@ -337,9 +432,9 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     const context = marginContext();
     try {
       validateStructure(legs, view.mode);
-      if (view.mode === 'short_strangle') {
-        const reserved = reserveShortMargin(legs, context);
-        if (reserved.total > settings.maxMarginUsd) conflict('risk_limit', `按当前盘口价，卖出宽跨保证金 ${reserved.total.toFixed(2)} 超过上限 ${settings.maxMarginUsd}`);
+      if (marginBound(view.mode)) {
+        const reserved = reserveShortMargin(legs, context, view.mode);
+        if (reserved.total > settings.maxMarginUsd) conflict('risk_limit', `按当前盘口价，${view.mode === 'trend_m50' ? 'M50 卖腿' : '卖出宽跨'}保证金 ${reserved.total.toFixed(2)} 超过上限 ${settings.maxMarginUsd}`);
         return { legs: reserved.legs, context, budgetUsd: settings.maxMarginUsd, reservedUsd: reserved.total };
       }
       const loss = maximumLoss(legs);
@@ -352,8 +447,9 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
   function riskProblem(view: Preview): string | null {
     try {
       if (new Set(view.legs.map(leg => leg.symbol)).size !== view.legs.length) return '策略里有重复的合约';
-      if (view.mode === 'short_strangle') {
-        if (!view.unboundedLoss || view.maxLossUsd !== null) return '卖出宽跨须标为亏损无上限';
+      if (marginBound(view.mode)) {
+        if (view.mode === 'short_strangle' && (!view.unboundedLoss || view.maxLossUsd !== null)) return '卖出宽跨须标为亏损无上限';
+        if (view.legs.length !== legCount(view.mode)) return '策略腿数与结构不符';
         if (!Number.isFinite(view.estimatedMarginUsd) || view.estimatedMarginUsd < 0 || view.estimatedMarginUsd > settings.maxMarginUsd) return `保证金估算 ${view.estimatedMarginUsd.toFixed(2)} 超过上限 ${settings.maxMarginUsd}，请减少数量或调高 maxMarginUsd`;
         initialRisk(view);
         return null;
@@ -450,7 +546,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     }
     if (!legs.length) return conflict('nothing_to_close', '没有可平的跟踪策略腿');
     const mode = (state.tracked.groupId ? state.tasks[state.tracked.groupId]?.mode : undefined) ?? 'iron_condor';
-    if (legs.length > (mode === 'iron_condor' ? 4 : 2)) conflict('structure', '跟踪策略的腿数超过策略结构');
+    if (legs.length > legCount(mode)) conflict('structure', '跟踪策略的腿数超过策略结构');
     const fingerprint = sortedJson({ openingGroup: state.tracked.groupId, tracked: Object.entries(sizes).sort(), exchange: exchange.sort() });
     return { legs, mode, fingerprint };
   }
@@ -466,13 +562,13 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
         const view = preview(request.quantity ?? settings.legQty, request.mode ?? settings.strategyMode);
         validateRisk(view);
         legs = view.legs.map(leg => planLeg(leg.symbol, leg.side, leg.qty));
-        validateCalendar(view.expiry);
+        validateEntry(view);
         if (legs.some(leg => leg.expiry !== view.expiry)) conflict('instrument_changed', '预览的到期日与合约不一致了');
         ({ mode, estimatedMarginUsd: margin, unboundedLoss: unbounded } = view);
       } else {
         await market.refresh();
         ({ legs, mode, fingerprint: closeFingerprint } = await closeSnapshot());
-        unbounded = mode === 'short_strangle';
+        unbounded = marginBound(mode);
       }
       freshSnapshot();
       const context = feeContext();
@@ -517,7 +613,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
         validatePlan(saved);
         if (view.mode !== plan.mode || legIdentity(view.legs.map(leg => planLeg(leg.symbol, leg.side, leg.qty))) !== legIdentity(plan.legs)) conflict('strategy_changed', '选中的合约变了，请重新生成并确认计划');
         validateRisk(view);
-        validateCalendar(view.expiry);
+        validateEntry(view);
         await capturePmBaseline('manual_open');
         validatePlan(saved);
         risk = initialRisk(view);
@@ -593,6 +689,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
       if (Object.keys(state.tracked.sizes).length) await syncPositions();
       if (Object.keys(state.tracked.sizes).length) conflict('strategy_open', '先平掉跟踪中的策略再询价开仓');
       await market.refresh();
+      if ((request.mode ?? settings.strategyMode) === 'trend_m50') conflict('rfq_mode', 'M50 是单腿策略，不走组合询价，请在执行台按盘口开仓');
       const view = preview(request.quantity ?? settings.legQty, request.mode ?? settings.strategyMode);
       validateRisk(view);
       validateCalendar(view.expiry);
@@ -921,13 +1018,13 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     for (const [symbol, price] of Object.entries(prices)) {
       if (!Number.isFinite(price) || price <= 0) throw new Error('执行价无效');
       const leg = proposed[symbol]!;
-      if (task.mode === 'short_strangle') {
+      if (marginBound(task.mode)) {
         leg.priceFloor = Math.min(price, leg.priceFloor ?? leg.priceBound);
         leg.priceCeiling = Math.max(price, leg.priceCeiling ?? leg.priceBound);
         leg.priceBound = price;
       } else leg.priceBound = leg.side === 'Buy' ? Math.max(price, leg.priceBound) : Math.min(price, leg.priceBound);
     }
-    if (task.mode === 'short_strangle') {
+    if (marginBound(task.mode)) {
       freshSnapshot();
       const current = marginContext();
       const context: MarginContext = { ...saved.context, index: current.index };
@@ -938,7 +1035,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
         if (!row || row.optionType !== leg.optionType || row.strike !== leg.strike || row.expiry !== leg.expiry) throw new Error('卖出宽跨的保证金行情与原始腿不一致');
         leg.mark = row.mark;
       }
-      const reserved = reserveShortMargin(proposed, context);
+      const reserved = reserveShortMargin(proposed, context, task.mode);
       const budget = Math.min(settings.maxMarginUsd, saved.budgetUsd);
       if (reserved.total > budget) throw new Error(`执行价使卖出宽跨保证金 ${reserved.total.toFixed(2)} 超过预算 ${budget}`);
       return { legs: reserved.legs, context, reservedUsd: reserved.total };
@@ -1404,6 +1501,8 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
    * whose window passed without an admitted opening sends one Feishu message.
    */
   async function autoOpenTick(): Promise<void> {
+    // M50 is opened by hand on its daily signal: the Friday scheduler neither opens nor reminds.
+    if (settings.strategyMode === 'trend_m50') return;
     const at = now(), week = isoWeek(at), schedule = state.schedule;
     if (autoOpenEnabled() && !shutdown && inOpenWindow(at) && schedule.lastOpenWeek !== week) {
       try {
@@ -1441,7 +1540,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
   function scheduleView() {
     const schedule = state.schedule;
     return {
-      enabled: autoOpenEnabled(), source: schedule.enabled === null ? 'config' as const : 'page' as const, configEnabled: autoOpen.enabled,
+      applicable: settings.strategyMode !== 'trend_m50', enabled: autoOpenEnabled(), source: schedule.enabled === null ? 'config' as const : 'page' as const, configEnabled: autoOpen.enabled,
       hourUtc: autoOpen.hourUtc, minuteUtc: autoOpen.minuteUtc, windowSeconds: autoOpen.windowSeconds, marketFallback: settings.marketFallback ?? false,
       nextAt: nextOpenAt(), inWindow: inOpenWindow(), waiting: inOpenWindow() && schedule.lastOpenWeek !== isoWeek(now()), lastOpenWeek: schedule.lastOpenWeek,
       lastError: schedule.attemptWeek === isoWeek(now()) && schedule.attemptWeek !== schedule.lastOpenWeek ? { week: schedule.attemptWeek, message: schedule.lastError, at: schedule.lastAttemptAt } : null,
@@ -1485,7 +1584,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
       account: `***${uid.slice(-4)}`,
       busy: admitting || held || Object.values(state.tasks).some(task => isActive(task.status)) || !rfqFinished(state.rfq),
       rfqActive: !rfqFinished(state.rfq),
-      tasks, orders, schedule: scheduleView(),
+      tasks, orders, schedule: scheduleView(), m50: m50View(),
       tracked: { groupId: state.tracked.groupId, legs: Object.entries(state.tracked.sizes).map(([key, size]) => ({ symbol: key.slice(0, key.lastIndexOf('|')), side: key.slice(key.lastIndexOf('|') + 1), size })), mode: state.tracked.groupId ? state.tasks[state.tracked.groupId]?.mode ?? null : null },
       positions: positions ? { rows: positions.rows, at: positions.at } : null, positionsError,
       greeks: summarizeGreeks(positions?.rows ?? null, snapshot?.greeks ?? new Map(), { marketAt: snapshot?.at ?? null, now: now(), staleMs: QUOTE_STALE_MS }),
@@ -1511,6 +1610,6 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     };
   }
 
-  return { createPlan, startTask, stopTask, createRfq, executeQuote, cancelRfq, rfqTick, reconcileOnce, refreshHealth, autoOpenTick, setAutoOpen, performanceTick, close, marketView, previewView, stateView, performanceView, rfqView, state: () => state };
+  return { createPlan, startTask, stopTask, createRfq, executeQuote, cancelRfq, rfqTick, reconcileOnce, refreshHealth, autoOpenTick, trendTick, setAutoOpen, performanceTick, close, marketView, previewView, stateView, performanceView, rfqView, state: () => state };
 }
 export type OptionsEngine = ReturnType<typeof createOptionsEngine>;

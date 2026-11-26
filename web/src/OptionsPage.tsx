@@ -3,7 +3,7 @@ import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 
 import { api, ApiError } from './api.ts';
 import {
   autoOpenConfirm, chainLines, isActive, money, orderState, payoffAt, payoffCurve, planBody, planLimit, parseQuantity, quantityText, QUANTITY_PRESETS,
-  signedMoney, startBody, startRefused, STATUS_TEXT, scheduleTime, strategyName, taskSummary, utcDate, utcTime,
+  signedMoney, startBody, startRefused, STATUS_TEXT, scheduleTime, strategyName, legWord, m50Summary, taskSummary, utcDate, utcTime,
 } from './options-form.ts';
 import type { ChainRow, GreekName, OptionsMarket, OptionsState, Plan, Preview, PreviewView, StrategyMode, Task, TaskAccepted } from './options-types.ts';
 import { RequestIds } from './request-ids.ts';
@@ -117,7 +117,7 @@ function PayoffChart({ preview }: { preview: Preview }) {
 function StrategyPanel({ preview, problem }: { preview: Preview | null; problem: string | null }) {
   const curve = preview ? payoffCurve(preview) : null;
   const current = preview && preview.index !== null ? payoffAt(preview.index, preview) : null;
-  return <Panel className="strategy-panel" title="组合结构" detail={<span className="muted">{preview?.mode === 'short_strangle' ? '双侧卖出 · 无保护腿' : '双侧卖出 · 远端保护'}</span>} right="到期盈亏曲线按当前报价估算 · USD">
+  return <Panel className="strategy-panel" title="组合结构" detail={<span className="muted">{preview?.mode === 'trend_m50' ? `均线择边 · 卖出 ${preview.legs[0]?.optionType ?? ''}` : preview?.mode === 'short_strangle' ? '双侧卖出 · 无保护腿' : '双侧卖出 · 远端保护'}</span>} right="到期盈亏曲线按当前报价估算 · USD">
     {preview ? <>
       <div className="strategy-body">
         <div className="legs"><table className="legs-table" aria-label="策略腿"><thead><tr><th scope="col">腿</th><th scope="col">合约</th><th scope="col" className="r">Δ / 目标</th><th scope="col" className="r">标记价</th><th scope="col" className="r">预估费 / 封顶</th></tr></thead>
@@ -356,13 +356,14 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
   const missed = data?.schedule?.lastError;
   if (missed) strip.push(`本周定时开仓未执行（${missed.week}）：${missed.message ?? '原因未知'}`);
   const schedule = data?.schedule ?? null;
+  const m50 = m50Summary(data?.m50);
   const canOpen = !busy && riskChecked && preview !== null && !riskProblem && quantity !== null && preparing === null && !(data?.tracked.legs.length);
   const canClose = !busy && preparing === null && (data?.tracked.legs.length ?? 0) > 0;
   return <div className="options-desk">
     <header className="ph">
       <div className="ph-main">
         <div className="ph-title"><h1>BTC 期权执行台</h1><span className="status-chip" data-mode="live">主网实盘 · {data?.account ?? '--'}</span></div>
-        <div className="ph-meta"><span>周五开仓 / 周日到期</span><span className="sep" aria-hidden="true" /><a href="#/options/orders">{hero ? `${hero.type === 'close' ? '平仓' : '开仓'}执行中 · ${STATUS_TEXT[hero.status]}` : '当前无活动执行'}</a><span className="sep" aria-hidden="true" /><span>时间统一为 UTC</span></div>
+        <div className="ph-meta"><span>{strategy === 'trend_m50' ? 'M50 每日 08:15 信号 / 约 14 天到期' : '周五开仓 / 周日到期'}</span><span className="sep" aria-hidden="true" /><a href="#/options/orders">{hero ? `${hero.type === 'close' ? '平仓' : '开仓'}执行中 · ${STATUS_TEXT[hero.status]}` : '当前无活动执行'}</a><span className="sep" aria-hidden="true" /><span>时间统一为 UTC</span></div>
       </div>
       <div className="ph-actions"><span className="update-state"><i data-stale={String(marketStale)} />{marketAt ? `行情 ${utcTime(marketAt).slice(6)} UTC${marketStale ? ' · 已过期' : ''}` : '行情同步中'}</span><button type="button" className="button ghost" onClick={refresh}>立即刷新</button></div>
     </header>
@@ -372,7 +373,7 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
     <div className="strip">
       {data?.reconciliation.pendingOrders ? <span className="item strip-count">{data.reconciliation.pendingOrders} 笔订单未结束</span> : null}
       {strip.map(text => <span key={text} className="item strip-alert">{text}</span>)}
-      <span className="item">{schedule?.enabled ? `定时开仓 ${scheduleTime(schedule)}` : '只手动开仓'}{schedule?.marketFallback ? ' + IOC 兜底' : ''} · 每腿 {data?.settings.legQty ?? '--'} BTC · 最大亏损上限 {data ? money(data.settings.maxRiskUsd) : '--'} · 保证金上限 {data ? money(data.settings.maxMarginUsd) : '--'}</span>
+      <span className="item">{schedule?.applicable === false ? 'M50 按每日信号手动确认' : schedule?.enabled ? `定时开仓 ${scheduleTime(schedule)}` : '只手动开仓'}{schedule?.marketFallback ? ' + IOC 兜底' : ''} · 每腿 {data?.settings.legQty ?? '--'} BTC · 最大亏损上限 {data ? money(data.settings.maxRiskUsd) : '--'} · 保证金上限 {data ? money(data.settings.maxMarginUsd) : '--'}</span>
     </div>
     <main className="shell">
       {notice ? <p className={`orders-notice${notice.tone === 'error' ? ' loss' : ''}`} role="status">{notice.text}</p> : null}
@@ -398,22 +399,24 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
                 <div className="mode-box" data-mode="live"><span className="mode-icon" aria-hidden="true">!</span><div><strong>主网实盘</strong><p>确认后向 Bybit 发送真实期权限价单，按盘口最优价跟价。</p></div></div>
                 <div className="execution-inputs">
                   <div className="field"><label htmlFor="optionsStrategy">开仓结构 <span>STRATEGY</span></label>
-                    <select id="optionsStrategy" value={strategy} onChange={event => setMode(event.target.value as StrategyMode)}><option value="iron_condor">四腿铁鹰 · 带保护腿</option><option value="short_strangle">双腿卖出 · 无保护腿</option></select>
-                    <small className="field-hint strategy-risk" data-unbounded={String(strategy === 'short_strangle')} role="status">{strategy === 'short_strangle' ? '不买保护腿，亏损无上限；按保证金上限控制风险。' : '买入远端保护腿，按最大亏损控制风险。'}</small></div>
+                    <select id="optionsStrategy" value={strategy} onChange={event => setMode(event.target.value as StrategyMode)}><option value="iron_condor">四腿铁鹰 · 带保护腿</option><option value="short_strangle">双腿卖出 · 无保护腿</option><option value="trend_m50">M50 均线择边 · 单腿卖出</option></select>
+                    <small className="field-hint strategy-risk" data-unbounded={String(strategy !== 'iron_condor')} role="status">{strategy === 'short_strangle' ? '不买保护腿，亏损无上限；按保证金上限控制风险。' : strategy === 'trend_m50' ? '指数在 MA50 上方卖 Put、下方卖 Call，约 14 天到期 |Δ| 0.30；无保护腿，按保证金上限控制风险。' : '买入远端保护腿，按最大亏损控制风险。'}</small></div>
                   <div className="field"><label htmlFor="optionsQuantity">每腿数量 <span>BTC</span></label>
                     <div className="quantity-row"><select aria-label="每腿数量预设" value={preset === '' ? (QUANTITY_PRESETS as readonly string[]).includes(quantityInput) ? quantityInput : 'custom' : preset} onChange={event => { setPreset(event.target.value); if (event.target.value === 'custom') setCustom(quantityInput); }}>
                       {QUANTITY_PRESETS.map(value => <option key={value} value={value}>{Number(value).toFixed(2)}</option>)}<option value="custom">自定义</option></select>
                       <input id="optionsQuantity" aria-label="自定义每腿数量" type="text" inputMode="decimal" value={preset === 'custom' ? custom : quantityInput} onChange={event => { setPreset('custom'); setCustom(event.target.value); }} /></div>
                     <small className="field-hint">调整数量后，自动重算保证金与交易成本。</small></div>
                 </div>
-                <label className="confirm"><input type="checkbox" checked={riskChecked} onChange={event => setRiskChecked(event.target.checked)} /><span>{strategy === 'short_strangle' ? '我已核对两腿、报价和保证金上限，了解亏损无上限' : '我已核对四腿、报价和风险上限'}</span></label>
-                <button type="button" className="button primary" disabled={!canOpen} data-busy={preparing === 'open' ? '' : undefined} onClick={() => void prepare('open')}>{preparing === 'open' ? '正在生成方案…' : `实盘开仓${strategy === 'short_strangle' ? '两腿' : '四腿'}`}</button>
+                <label className="confirm"><input type="checkbox" checked={riskChecked} onChange={event => setRiskChecked(event.target.checked)} /><span>{strategy === 'short_strangle' ? '我已核对两腿、报价和保证金上限，了解亏损无上限' : strategy === 'trend_m50' ? '我已核对信号方向、合约、报价和保证金上限，了解无保护腿' : '我已核对四腿、报价和风险上限'}</span></label>
+                <button type="button" className="button primary" disabled={!canOpen} data-busy={preparing === 'open' ? '' : undefined} onClick={() => void prepare('open')}>{preparing === 'open' ? '正在生成方案…' : `实盘开仓${legWord(strategy)}`}</button>
                 <button type="button" className="button close-button" disabled={!canClose} data-busy={preparing === 'close' ? '' : undefined} onClick={() => void prepare('close')}>{preparing === 'close' ? '正在生成方案…' : '实盘平仓已跟踪持仓'}</button>
-                <p className="microcopy">{busy ? '有任务或订单未结束，结束前不能开始新的开仓或平仓。' : data?.tracked.legs.length ? '已有跟踪中的策略：先平仓或在交易所平掉后，才能再开仓。' : '开仓与平仓先核对固定方案，再独立确认提交。实盘开仓只在周五（UTC）。'}</p>
+                <p className="microcopy">{busy ? '有任务或订单未结束，结束前不能开始新的开仓或平仓。' : data?.tracked.legs.length ? '已有跟踪中的策略：先平仓或在交易所平掉后，才能再开仓。' : strategy === 'trend_m50' ? '开仓与平仓先核对固定方案，再独立确认提交。M50 按当天信号开仓；换边须先平仓再开仓。' : '开仓与平仓先核对固定方案，再独立确认提交。实盘开仓只在周五（UTC）。'}</p>
               </div>
-              <div className="schedule"><span>计划开仓 <small>{!schedule ? '读取中' : schedule.enabled ? schedule.waiting ? schedule.lastError ? '窗口中 · 本周未能开仓' : '窗口中 · 正在开仓' : `下次 ${utcTime(schedule.nextAt)} UTC` : schedule.source === 'page' && schedule.configEnabled ? '已在页面关闭（覆盖配置）' : '定时开仓已关闭'}</small></span>
+              {strategy === 'trend_m50' || data?.m50?.configured ? <div className="schedule m50-signal" role="status"><span>M50 信号 <small>{m50.signal}</small></span>
+                <span className="schedule-side"><strong>{m50.action}</strong></span></div> : null}
+              {schedule && schedule.applicable === false ? <div className="schedule"><span>计划开仓 <small>M50 模式下周五定时开仓不执行</small></span><span className="schedule-side"><strong>每日信号 · 手动</strong></span></div> : <div className="schedule"><span>计划开仓 <small>{!schedule ? '读取中' : schedule.enabled ? schedule.waiting ? schedule.lastError ? '窗口中 · 本周未能开仓' : '窗口中 · 正在开仓' : `下次 ${utcTime(schedule.nextAt)} UTC` : schedule.source === 'page' && schedule.configEnabled ? '已在页面关闭（覆盖配置）' : '定时开仓已关闭'}</small></span>
                 <span className="schedule-side"><strong>{schedule?.enabled ? `${scheduleTime(schedule)} · 自动` : '周五 · 手动'}</strong>
-                  <button type="button" className="link-button" disabled={!schedule || toggling} data-busy={toggling ? '' : undefined} onClick={() => void toggleAutoOpen(!schedule?.enabled)}>{toggling ? '提交中…' : schedule?.enabled ? '关闭定时' : '打开定时'}</button></span></div>
+                  <button type="button" className="link-button" disabled={!schedule || toggling} data-busy={toggling ? '' : undefined} onClick={() => void toggleAutoOpen(!schedule?.enabled)}>{toggling ? '提交中…' : schedule?.enabled ? '关闭定时' : '打开定时'}</button></span></div>}
             </aside>
             <HealthPanel state={data} />
           </div>

@@ -65,6 +65,8 @@ export interface OptionsClient {
   tickers(signal: AbortSignal): Promise<Row[]>;
   ticker(symbol: string, signal: AbortSignal): Promise<Row | null>;
   underlying(signal: AbortSignal): Promise<Row>;
+  /** M50: `{ symbol: 'BTCUSDT', list }`, the index's last 60 daily candles as Bybit's index-price-kline lists them. */
+  indexKline?(signal: AbortSignal): Promise<Row>;
   queryApi(signal: AbortSignal): Promise<Row>;
   accountInfo(signal: AbortSignal): Promise<Row>;
   walletBalance(signal: AbortSignal): Promise<Row>;
@@ -199,6 +201,7 @@ export function createOptionsClient({ credentials, marketClient, fetchImpl = (ur
     tickers: signal => publicData('tickers', signal) as Promise<Row[]>,
     ticker: (symbol, signal) => publicData('ticker', signal, symbol) as Promise<Row | null>,
     underlying: signal => publicData('underlying', signal) as Promise<Row>,
+    indexKline: signal => publicData('indexKline', signal) as Promise<Row>,
     queryApi: signal => signed('GET', '/v5/user/query-api', {}, signal),
     accountInfo: signal => signed('GET', '/v5/account/info', {}, signal),
     walletBalance: async signal => {

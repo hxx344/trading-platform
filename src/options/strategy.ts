@@ -3,10 +3,16 @@
 // strings until the arithmetic needs a number.
 import { isSunday, type OptionRow, type OptionType } from './market.ts';
 
-export type StrategyMode = 'iron_condor' | 'short_strangle';
+export type StrategyMode = 'iron_condor' | 'short_strangle' | 'trend_m50';
 export type Side = 'Buy' | 'Sell';
-export const STRATEGY_MODES: readonly StrategyMode[] = ['iron_condor', 'short_strangle'];
-export const legCount = (mode: StrategyMode): number => mode === 'short_strangle' ? 2 : 4;
+export const STRATEGY_MODES: readonly StrategyMode[] = ['iron_condor', 'short_strangle', 'trend_m50'];
+export const legCount = (mode: StrategyMode): number => mode === 'trend_m50' ? 1 : mode === 'short_strangle' ? 2 : 4;
+/** Modes without protective wings: risk is the reserved short-option margin against maxMarginUsd. */
+export const marginBound = (mode: StrategyMode): boolean => mode !== 'iron_condor';
+/** M50 (docs/options.md, M50 均线择边): one short leg, |delta| 0.30, the expiry nearest 14 days and at least 2 days out. */
+export const M50_DELTA = 0.30;
+export const M50_TARGET_MS = 14 * 86_400_000;
+export const M50_MIN_MS = 2 * 86_400_000;
 
 export class StrategyError extends Error {
   readonly code: string;
@@ -50,6 +56,12 @@ export interface RiskLeg {
 /** The complete original structure, never a set of residual fills. */
 export function validateStructure(legs: Record<string, Pick<RiskLeg, 'side' | 'optionType' | 'strike' | 'qty' | 'expiry'>>, mode: StrategyMode): void {
   const values = Object.values(legs);
+  if (mode === 'trend_m50') {
+    if (values.length !== 1 || values[0]!.side !== 'Sell') throw new StrategyError('structure', 'M50 要求恰好一条卖出腿');
+    const leg = values[0]!;
+    if (!Number.isFinite(leg.qty) || leg.qty <= 0 || !Number.isFinite(leg.strike) || leg.strike <= 0 || !Number.isSafeInteger(leg.expiry)) throw new StrategyError('structure', '数量、行权价或到期日无效');
+    return;
+  }
   const roles = new Map(values.map(leg => [`${leg.optionType}|${leg.side}`, leg]));
   const expected = mode === 'iron_condor' ? ['Call|Sell', 'Put|Sell', 'Call|Buy', 'Put|Buy'] : ['Call|Sell', 'Put|Sell'];
   if (values.length !== legCount(mode) || roles.size !== expected.length || expected.some(role => !roles.has(role))) throw new StrategyError('structure', mode === 'iron_condor' ? '风险检查要求四条平衡的腿' : '风险检查要求恰好两条卖出 Call / Put 腿');
@@ -93,8 +105,9 @@ export function shortOrderMargin(leg: Pick<RiskLeg, 'optionType' | 'strike' | 'q
 }
 
 /** Each leg reserves its worst IM over every price it was ever sent at; favourable prices never free it. */
-export function reserveShortMargin(legs: Record<string, RiskLeg>, context: MarginContext): { legs: Record<string, RiskLeg>; total: number } {
-  validateStructure(legs, 'short_strangle');
+export function reserveShortMargin(legs: Record<string, RiskLeg>, context: MarginContext, mode: StrategyMode = 'short_strangle'): { legs: Record<string, RiskLeg>; total: number } {
+  if (!marginBound(mode)) throw new StrategyError('structure', '铁鹰不按卖腿保证金预留');
+  validateStructure(legs, mode);
   const proposed: Record<string, RiskLeg> = {};
   for (const [symbol, leg] of Object.entries(legs)) {
     const price = leg.priceBound, floor = leg.priceFloor ?? price, ceiling = leg.priceCeiling ?? price, old = leg.marginBound ?? 0;
@@ -109,7 +122,11 @@ export function reserveShortMargin(legs: Record<string, RiskLeg>, context: Margi
 }
 
 /** build_strategy: the legs for a mode on the nearest Sunday expiry, with premium, risk, fee and margin estimates. */
-export function buildStrategy(chain: readonly OptionRow[], { now, qty, mode, index, estimates, marketAt }: { now: number; qty: string; mode: StrategyMode; index: number | null; estimates: Estimates; marketAt: number }): Preview {
+export function buildStrategy(chain: readonly OptionRow[], { now, qty, mode, index, estimates, marketAt, trendSide }: { now: number; qty: string; mode: StrategyMode; index: number | null; estimates: Estimates; marketAt: number; trendSide?: OptionType | null }): Preview {
+  if (mode === 'trend_m50') {
+    if (!trendSide) throw new StrategyError('no_signal', 'M50 还没有当天的均线信号');
+    return buildTrend(chain, { now, qty, side: trendSide, index, estimates, marketAt });
+  }
   const quantity = Number(qty);
   if (!Number.isFinite(quantity) || quantity <= 0) throw new StrategyError('quantity', '数量须为正数');
   const unbounded = mode === 'short_strangle';
@@ -166,4 +183,71 @@ export function buildStrategy(chain: readonly OptionRow[], { now, qty, mode, ind
     estimatedMarginUsd: round(margin, 2), estimatedTradingCostUsd: round(fees, 2), estimatedInitialMarginUsd: round(orderIm, 2), estimatedMaintenanceMarginUsd: round(maintenance, 2),
     marginBasis, marginMode: estimates.marginMode, marginBufferPct: estimates.marginBufferPct, feeRate: estimates.feeRate, feeCapPct: estimates.feeCapPct, index, marketAt,
   };
+}
+
+/** The future expiry at least M50_MIN_MS away whose time left is nearest M50_TARGET_MS (the earlier one on a tie). */
+export function chooseTrendExpiry(rows: readonly OptionRow[], now: number): number {
+  const expiries = [...new Set(rows.filter(row => row.expiry - now >= M50_MIN_MS).map(row => row.expiry))].sort((a, b) => a - b);
+  if (!expiries.length) throw new StrategyError('no_expiry', '期权链里没有剩余 2 天以上的到期日');
+  return expiries.reduce((best, expiry) => Math.abs(expiry - now - M50_TARGET_MS) < Math.abs(best - now - M50_TARGET_MS) ? expiry : best);
+}
+
+/** M50: one short leg of the signal's side, |delta| nearest 0.30, with the same fee and margin estimate as a short strangle leg. */
+export function buildTrend(chain: readonly OptionRow[], { now, qty, side, index, estimates, marketAt }: { now: number; qty: string; side: OptionType; index: number | null; estimates: Estimates; marketAt: number }): Preview {
+  const quantity = Number(qty);
+  if (!Number.isFinite(quantity) || quantity <= 0) throw new StrategyError('quantity', '数量须为正数');
+  if (!(index !== null && index > 0)) throw new StrategyError('no_index', 'M50 保证金估算需要有效的 BTC 指数');
+  const usable = chain.filter(row => Number.isFinite(row.delta) && Math.abs(row.delta) > 0 && Math.abs(row.delta) <= 1 && row.mark > 0 && row.strike > 0);
+  if (!usable.length) throw new StrategyError('no_chain', '期权链没有可用的价格与 delta');
+  const expiry = chooseTrendExpiry(usable, now);
+  const rows = usable.filter(row => row.expiry === expiry && row.optionType === side);
+  if (!rows.length) throw new StrategyError('missing_option_side', `所选到期日缺少可用的 ${side}`);
+  const row = nearest(rows, M50_DELTA);
+  const price = row.ask || row.mark;
+  if (!Number.isFinite(price) || price <= 0) throw new StrategyError('price', '期权链执行价无效');
+  const fee = Math.min(estimates.feeRate * index, estimates.feeCapPct * price) * quantity;
+  const leg: PreviewLeg = { symbol: row.symbol, side: 'Sell', optionType: side, strike: row.strike, delta: row.delta, qty, mark: row.mark, targetDelta: M50_DELTA, estimatedFeeUsd: round(fee, 8), feeCapUsd: round(estimates.feeCapPct * price * quantity, 8), feeBasisPrice: round(price, 8) };
+  validateStructure({ [row.symbol]: { ...leg, qty: quantity, expiry } }, 'trend_m50');
+  const orderIm = shortOrderMargin({ optionType: side, strike: row.strike, qty: quantity, mark: row.mark }, { ...estimates, index }, price);
+  const maintenance = (Math.max(estimates.mmFactor * index, estimates.mmFactor * row.mark) + row.mark + estimates.liquidationFeeRate * index) * quantity;
+  const net = row.mark * quantity;
+  const maxLoss = side === 'Put' ? Math.max(0, row.strike * quantity - net) : null;
+  const margin = orderIm * (1 + estimates.marginBufferPct);
+  if ([margin, fee, orderIm, maintenance].some(value => !Number.isFinite(value) || value < 0)) throw new StrategyError('margin', '期权链保证金估算无效');
+  return {
+    mode: 'trend_m50', unboundedLoss: side === 'Call', expiry, legs: [leg], netCreditUsd: round(net, 2), maxLossUsd: maxLoss === null ? null : round(maxLoss, 2), maxProfitUsd: round(Math.max(0, net), 2),
+    riskReward: maxLoss ? round(net / maxLoss, 3) : null,
+    estimatedMarginUsd: round(margin, 2), estimatedTradingCostUsd: round(fee, 2), estimatedInitialMarginUsd: round(orderIm, 2), estimatedMaintenanceMarginUsd: round(maintenance, 2),
+    marginBasis: 'regular_order_im', marginMode: estimates.marginMode, marginBufferPct: estimates.marginBufferPct, feeRate: estimates.feeRate, feeCapPct: estimates.feeCapPct, index, marketAt,
+  };
+}
+
+/** One day's M50 signal: the mean of the 50 completed UTC daily index closes before `day` against the index at evaluation. */
+export interface TrendSignal { day: string; at: number; index: number; ma: number; side: OptionType }
+export const M50_WINDOW = 50;
+const DAY_MS = 86_400_000;
+/**
+ * Bybit index-price-kline rows ([start, open, high, low, close], any order) to the MA50 of the 50 UTC days before `day`
+ * (YYYY-MM-DD). Every one of those days must be present with a positive close; nothing is filled in.
+ */
+export function trendSignal(rows: readonly unknown[], day: string, index: number, at: number): TrendSignal {
+  const dayStart = Date.parse(`${day}T00:00:00Z`);
+  if (!Number.isFinite(dayStart) || dayStart % DAY_MS !== 0) throw new StrategyError('signal', '信号日期无效');
+  if (!(index > 0) || !Number.isFinite(index)) throw new StrategyError('signal', '均线信号需要有效的 BTC 指数');
+  const closes = new Map<number, number>();
+  for (const row of rows) {
+    if (!Array.isArray(row) || row.length < 5) throw new StrategyError('signal', '指数日线格式无效');
+    const start = Number(row[0]), close = Number(row[4]);
+    if (!Number.isSafeInteger(start) || start % DAY_MS !== 0 || !(close > 0) || !Number.isFinite(close)) throw new StrategyError('signal', '指数日线格式无效');
+    if (closes.has(start) && closes.get(start) !== close) throw new StrategyError('signal', '指数日线有重复且不一致的日期');
+    closes.set(start, close);
+  }
+  let sum = 0;
+  for (let back = 1; back <= M50_WINDOW; back += 1) {
+    const close = closes.get(dayStart - back * DAY_MS);
+    if (close === undefined) throw new StrategyError('signal', `指数日线缺少 ${new Date(dayStart - back * DAY_MS).toISOString().slice(0, 10)}`);
+    sum += close;
+  }
+  const ma = sum / M50_WINDOW;
+  return { day, at, index, ma, side: index > ma ? 'Put' : 'Call' };
 }

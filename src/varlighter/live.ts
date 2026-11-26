@@ -73,6 +73,10 @@ const UNKNOWN_STUCK_MS = 15 * 60_000;
 const INTENT_MAX_AGE_MS = 15_000;
 /** 回补或平仓取不到报价：过这么久告警，再久就交给人处理。 */
 const NO_QUOTE_ALERT_MS = 60_000, NO_QUOTE_STUCK_MS = 10 * 60_000;
+/** 第二腿的意图一直落不了库：多久告警、多久转人工（计时只在内存里，进程重启从零开始）。 */
+const HEDGE_FAIL_ALERT_MS = 60_000, HEDGE_FAIL_STUCK_MS = 10 * 60_000;
+/** 单还没交给连接器就失败了（停止中、凭据不在、落自编号或意图失败）：这笔单肯定没发出，调用方可以退回进度。其余错误一律不能这样推断。 */
+class NotSentError extends Error {}
 /** 有实盘持仓而账户一直读不到：过这么久告警。 */
 const ACCOUNT_BLIND_ALERT_MS = 10 * 60_000;
 const ACCOUNT_FRESH_MS = 3 * 60_000, RECONCILE_MS = 60_000, RECONCILE_SETTLE_MS = 10_000;
@@ -153,8 +157,8 @@ export function createLiveTrader(deps: LiveDeps) {
   function hedgeBlocked(position: LivePosition, error: unknown): void {
     const since = hedgeFailSince.get(position.id) ?? now();
     hedgeFailSince.set(position.id, since);
-    if (now() - since >= NO_QUOTE_STUCK_MS) { hedgeFailSince.delete(position.id); stuck(position, `第二腿一直下不了（${message(error).slice(0, 80)}），第一腿没有对冲`); return; }
-    if (now() - since >= NO_QUOTE_ALERT_MS) alert(`hedgefail:${position.id}`, `【DEX 价差实盘】${position.symbol} 第一腿已成交，第二腿 ${Math.round((now() - since) / 1000)} 秒仍下不了（${message(error).slice(0, 80)}）；第一腿没有对冲，请检查服务器磁盘与日志`);
+    if (now() - since >= HEDGE_FAIL_STUCK_MS) { hedgeFailSince.delete(position.id); stuck(position, `第二腿一直没有发出（${message(error).slice(0, 80)}），第一腿没有对冲；修好后先在实盘页核对并处理这笔，再重启服务，否则重启后会按当时报价补发第二腿`); return; }
+    if (now() - since >= HEDGE_FAIL_ALERT_MS) alert(`hedgefail:${position.id}`, `【DEX 价差实盘】${position.symbol} 第一腿已成交，第二腿 ${Math.round((now() - since) / 1000)} 秒仍没有发出（${message(error).slice(0, 80)}）；第一腿没有对冲，请检查服务器磁盘与日志`);
   }
   /** 一条腿此刻的可成交价是否在限价以内：买看卖一、卖看买一。不在或没有报价时返回原因。 */
   function quoteProblem(info: LegInfo, side: Side, limit: number): string | null {
@@ -221,24 +225,25 @@ export function createLiveTrader(deps: LiveDeps) {
     }
     position.pending = null;
     lastOperationAt = now();
-    // 落库失败时内存里已经记了这笔成交，下一次保存会补上；进程此刻退出的话库里还留着 pending，重启后重新查一次，不会重发也不会记两遍。
-    save(position);
+    // 落库失败不往外抛：单已经发出并成交，往外抛会被当成「没发出」退回进度、再发一遍。内存里已经记了这笔成交，下一次保存会补上；
+    // 进程此刻退出的话库里还留着 pending，重启后重新查一次，不会重发也不会记两遍（L212）。
+    try { save(position); } catch (error) { log(`varlighter: 实盘 ${position.symbol} 记成交时保存失败，下一次保存补上：${message(error)}`); }
     log(`varlighter: 实盘 ${position.symbol} ${VENUE_NAMES[leg.venue]} ${pending.purpose} ${pending.side} ${pending.qty}：成交 ${filled}，${outcome.note}`);
   }
 
   /** 发一笔单：先落意图，再发送。返回 false 表示结果未知（pending 留着，下一轮去查）。 */
   async function send(position: LivePosition, info: LegInfo, order: Omit<PendingOrder, 'clientId' | 'sentAt'>): Promise<boolean> {
     const keys = deps.keys.read().keys, venue = position[order.leg].venue;
-    if (!keys[venue]) throw new Error(`${VENUE_NAMES[venue]} 的凭据已不在`);
+    if (!keys[venue]) throw new NotSentError(`${VENUE_NAMES[venue]} 的凭据已不在`);
     // 服务正在停止：不落意图、不发（信号已经中止，发出去也只会被记成结果未知）。
-    if (deps.stopped?.()) throw new Error('服务正在停止');
+    if (deps.stopped?.()) throw new NotSentError('服务正在停止');
     const pending: PendingOrder = { ...order, clientId: lastClientId = Math.max(lastClientId + 1, now()), sentAt: now() };
     // 自编号先落库（重启、时钟回拨后也不会重号），再落意图，最后才发送；任何一步落库失败都不发，内存也退回发送前（L054：没发出的单不能记成结果未知）。
     runtime.lastClientId = lastClientId;
-    store.setState(LIVE_RUNTIME_KEY, runtime, now());
+    try { store.setState(LIVE_RUNTIME_KEY, runtime, now()); } catch (error) { throw new NotSentError(`保存自编号失败：${message(error)}`); }
     const before = position.pending;
     position.pending = pending;
-    try { save(position); } catch (error) { position.pending = before; throw error; }
+    try { save(position); } catch (error) { position.pending = before; throw new NotSentError(`保存下单意图失败：${message(error)}`); }
     const outcome = sane(await deps.trader(venue, keys).place(orderOf(pending, info), deps.signalFor), pending, info);
     if (outcome.kind === 'unknown') { log(`varlighter: 实盘 ${position.symbol} ${VENUE_NAMES[venue]} 的单结果未知：${outcome.reason}`); position.retryAt = now() + 2_000; return false; }
     apply(position, pending, outcome, info);
@@ -319,7 +324,7 @@ export function createLiveTrader(deps: LiveDeps) {
           // 落意图失败时 send 抛错、单没发：进度退回，下一轮（意图还新鲜时）重来。
           let sentA: boolean;
           try { sentA = await send(position, a, { leg: 'a', purpose: 'open', side: position.a.side, qty: position.plan.qty, limit: position.plan.limit, reduceOnly: false }); }
-          catch (error) { if (!position.pending) position.step = 'a'; throw error; }
+          catch (error) { if (error instanceof NotSentError) position.step = 'a'; throw error; }
           if (!sentA) return;
           continue;
         }
@@ -332,7 +337,7 @@ export function createLiveTrader(deps: LiveDeps) {
             let sentB: boolean;
             try { sentB = await send(position, b, { leg: 'b', purpose: 'hedge', side, qty: target, limit, reduceOnly: false }); }
             catch (error) {
-              if (!position.pending) { position.step = 'b'; hedgeBlocked(position, error); }
+              if (error instanceof NotSentError) { position.step = 'b'; hedgeBlocked(position, error); }
               throw error;
             }
             hedgeFailSince.delete(position.id);

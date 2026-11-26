@@ -1387,9 +1387,11 @@ test('第一腿成交后第二腿的意图一直落不了库：一分钟告警�
   await h.run(live, 10 * 60_000, 30_000);
   assert.deepEqual(h.alerts().map(item => item.key.split(':')[0]).sort(), ['halt', 'hedgefail', 'stuck']);
   assert.equal(live.view().positions[0]!.state, 'stuck');
-  const sent = s.sent.length;
+  // 库恢复可写之后也不再发：转人工就是停下等人。
+  (h.store as { saveLive: (position: LivePosition) => void }).saveLive = original;
   await h.run(live, 5 * 60_000, 30_000);
-  assert.deepEqual([s.sent.length, h.orders()], [sent, ['lighter sell 1']], '转人工后不再发单');
+  assert.deepEqual(h.orders(), ['lighter sell 1'], '转人工后不再发单');
+  assert.match(live.view().positions[0]!.note, /先在实盘页核对并处理这笔，再重启服务/);
   h.check();
 });
 
@@ -1404,4 +1406,29 @@ test('开仓意图落库后、发第一腿前报价变了：作废，不发单',
   assert.deepEqual([h.orders(), h.trades(live)[0]?.closeReason], [[], 'not_filled']);
   assert.match(live.view().lastSkip?.reason ?? '', /Entropy 此刻的卖一 100\.51 已越过限价 100\.32/);
   h.check();
+});
+
+test('单已成交、记成交的那次落库失败：不能当成没发出，下一轮不再发同一腿，也不报第二腿没发出', async t => {
+  for (const leg of ['a', 'b'] as const) {
+    const h = harness(t), live = h.boot(), s = h.s;
+    h.enable(live, [NVDA]);
+    const original = h.store.saveLive.bind(h.store);
+    let failed = false;
+    // 记成交时 pending 已清空、这条腿已有数量：只让这一次失败。
+    (h.store as { saveLive: (position: LivePosition) => void }).saveLive = position => {
+      if (!failed && position.pending === null && position[leg].qty > 0 && (leg === 'a' ? position.b.qty === 0 && position.step === 'b' : position.step === 'settle')) { failed = true; throw new Error('SQLITE_BUSY'); }
+      original(position);
+    };
+    await h.open(live, NVDA);
+    await h.run(live, 60_000, 5_000);
+    assert.equal(failed, true, `${leg} 腿记成交的落库确实失败过`);
+    assert.deepEqual(h.orders(), ['lighter sell 1', 'entropy buy 1'], `${leg} 腿不会再发一遍`);
+    assert.deepEqual([h.position(live).state, h.position(live).a.qty, h.position(live).b.qty, h.position(live).singleLeg], ['open', 1, 1, false]);
+    assert.deepEqual(h.alerts(), [], '没有「第二腿没发出」之类的告警');
+    // 落库恢复后库里与内存一致：重启也不会多发。
+    const again = h.boot();
+    await h.run(again, 30_000, 5_000);
+    assert.deepEqual(h.orders(), ['lighter sell 1', 'entropy buy 1']);
+    h.check();
+  }
 });

@@ -358,6 +358,40 @@ test('飞书告警：事件转消息，同一持续问题 30 分钟内只发一�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('保证金告警：事件源故障时仍报告余额恢复，待确认划转进度后再判断新异常', () => {
+  let clock = 0, unreadable = false;
+  const rows: EventRow[] = [], lines: string[] = [];
+  let pair = margin('3000', '1000', clock);
+  const notifier = createNotifier({
+    file: ':memory:', latestSeq: () => rows.length, pairs: () => [pair], incidentPair: () => null,
+    events: (after, limit) => { if (unreadable) throw new Error('事件不可读'); return rows.slice(after, after + limit); },
+    now: () => clock, log: line => lines.push(line), feishu: { webhook: 'https://example.invalid' },
+  });
+  try {
+    notifier.poll();
+    clock += FAULT_AFTER_MS;
+    notifier.poll();
+    unreadable = true;
+    rows.push({ seq: 1, at: clock, type: 'transfer-sent', json: '{}' });
+    pair = margin('1500', '1000', clock);
+    assert.throws(() => notifier.poll(), /事件不可读/);
+    assert.match(lines.at(-1)!, /保证金平衡恢复/);
+    pair = margin('4000', '1000', clock);
+    assert.throws(() => notifier.poll(), /事件不可读/);
+    clock += FAULT_AFTER_MS;
+    rows.push({ seq: 2, at: clock, type: 'transfer-settled', json: JSON.stringify({ pair: pair.id, state: 'confirmed', basis: 'acknowledged' }) });
+    assert.throws(() => notifier.poll(), /事件不可读/);
+    assert.equal(notifier.pending(), 2);
+    unreadable = false;
+    notifier.poll();
+    assert.equal(notifier.pending(), 2, '确认划转后要重新计时');
+    clock += FAULT_AFTER_MS;
+    notifier.poll();
+    assert.equal(notifier.pending(), 3);
+    assert.match(lines.at(-1)!, /保证金平衡异常.*差 3000 USD1/);
+  } finally { notifier.close(); }
+});
+
 test('保证金告警判定：受阻、非空闲说明、差额超过门槛（严格大于）才算异常；余额缺失、过期或读不出时不判定', () => {
   const base = (long: string, short: string, over: Partial<PairState> = {}) => ({ ...margin(long, short, 1), threshold: '10', ...over });
   assert.equal(marginProblem(base('15', '5')), null, '差额等于门槛不算');

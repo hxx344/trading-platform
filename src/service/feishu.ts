@@ -423,7 +423,7 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
     }
   }
 
-  function pollMargins(at: number): void {
+  function pollMargins(at: number, progressKnown: boolean): void {
     const seen = new Set<string>();
     for (const pair of pairs()) {
       if (!pair.enabled) continue;
@@ -452,7 +452,7 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
         continue;
       }
       if (!entry) { stuck.set(pair.id, { since: at, began: at, sentAt: null, missed: null }); continue; }
-      if (at - entry.since < FAULT_AFTER_MS) continue;
+      if (!progressKnown || at - entry.since < FAULT_AFTER_MS) continue;
       if (entry.sentAt === null) {
         if (!recoveries.has(pair.id) && queued(`【保证金平衡异常】配对 ${pair.id} 已持续 ${lasted(at - entry.began)}：${clip(problem)}。${balanceLine(pair)}。持续 ${FAULT_AFTER_MS / 1000} 秒告警，未恢复每 ${FAULT_REPEAT_MS / 1000} 秒重复提醒，恢复后通知一次`)) {
           entry.sentAt = at;
@@ -468,22 +468,28 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
     for (const id of recoveries.keys()) if (!seen.has(id)) recoveries.delete(id);
   }
 
+  function catchUpProgress(at: number): boolean {
+    // The outbox cursor may be stuck several pages behind a confirmed transfer. The normal path shares its reads.
+    const end = latestSeq();
+    if (!stuck.size) progressSeq = end;
+    while (progressSeq < end) {
+      const rows = events(progressSeq, EVENTS_PER_POLL);
+      if (!rows.length) return false;
+      observeProgress(rows, at);
+    }
+    return true;
+  }
+
   function poll(): void {
     const at = now();
     try { pollEvents(at); }
     catch (error) {
-      // The outbox cursor may be stuck several pages behind a confirmed transfer. The normal path shares its reads.
-      const end = latestSeq();
-      if (!stuck.size) progressSeq = end;
-      while (progressSeq < end) {
-        const rows = events(progressSeq, EVENTS_PER_POLL);
-        if (!rows.length) break;
-        observeProgress(rows, at);
-      }
-      pollMargins(at);
+      let progressKnown = false;
+      try { progressKnown = catchUpProgress(at); } catch { /* report the event error after observing balances */ }
+      pollMargins(at, progressKnown);
       throw error;
     }
-    pollMargins(at);
+    pollMargins(at, true);
   }
 
   /** Queues a message that does not come from the event log (start, stop, lost lease, market alerts); its outbox id, null without a robot. */

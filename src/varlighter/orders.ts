@@ -108,7 +108,8 @@ export function createEntropyTrader({ key, fetchImpl, now }: { key: EntropyKey; 
       if (body.status === 'unknownOid') return absent('交易所查无此单');
       const wrapper = isRecord(body.order) ? body.order : null, inner = wrapper && isRecord(wrapper.order) ? wrapper.order : null;
       if (body.status !== 'order' || !wrapper || !inner) return unknown('查单应答读不懂');
-      if (wrapper.status === 'open' || wrapper.status === 'triggered') return absent('这笔单还挂着');
+      // 还挂着说明这笔单还活着、随时可能成交：不是「查不到」，保持不明，不进入判零。
+      if (wrapper.status === 'open' || wrapper.status === 'triggered') return unknown('这笔单还挂着');
       const original = numberOf(inner.origSz), remaining = numberOf(inner.sz);
       if (original === null || remaining === null || remaining < 0 || remaining > original) return unknown('查单应答缺少数量');
       return done(original - remaining, null, `查单结果：${scrub(String(wrapper.status))}`);

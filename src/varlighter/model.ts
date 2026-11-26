@@ -409,6 +409,14 @@ export const bothLive = (key: string): boolean => { const parsed = parsePairKey(
 export type SizeBucket = '1k' | '100k';
 /** 名义金额对应的报价档：不超过 1000 美元用 1k 档，更大用 100k 档（偏保守）。 */
 export const bucketOf = (notional: number): SizeBucket => notional <= 1000 ? '1k' : '100k';
+/** 按数量折算的市值与名义金额相差不超过这个比例时，沿用名义金额的档位。 */
+export const BUCKET_DRIFT = 0.2;
+/**
+ * 按实际数量取价的一条腿（持仓平仓与止损、Var 精确询价后的对冲腿）用哪一档：市值在名义金额 ±20% 以内沿用名义金额的档位，
+ * 超出才按市值取档。1000 美元的仓正好在分档线上，价格涨一分钱市值就过线；不留这段余量，它的平仓与止损会按 10 万美元的盘口冲击算。
+ */
+export const sizeBucket = (usd: number, notionalUsd: number): SizeBucket =>
+  bucketOf(Math.abs(usd - notionalUsd) <= notionalUsd * BUCKET_DRIFT ? notionalUsd : usd);
 
 /**
  * 可成交价差。prices 里 B 腿的价已乘过乘数（折成 A 的单位），持仓数量按 A 的单位算；B 腿实际数量 = 数量 × 乘数，
@@ -507,7 +515,7 @@ function fillLeg(sample: Sample, side: Side, venue: VenueId, target: QuoteTarget
   }
   const qtyA = target.qty ?? hedgeQtyA;
   const usd = qtyA === undefined ? target.notionalUsd : qtyA * (side === 'a' ? 1 : sample.ratio) * ((bid + ask) / 2);
-  const level = publicLeg(sample, side, bucketOf(usd), bid, ask, closing);
+  const level = publicLeg(sample, side, sizeBucket(usd, target.notionalUsd), bid, ask, closing);
   return level && { ...level, at, estimated: level.estimated || usd > 100_000 || missingTop || (execution && at === null),
     varSource: venue === 'var' ? level.bucket : undefined };
 }

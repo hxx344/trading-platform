@@ -1,6 +1,7 @@
 // DEX 价差实盘的下单连接器（docs/dexspread.md 第 13 节）：Entropy（Hyperliquid）与 Lighter（主网、RH）各一个，只发「立即成交、剩余撤销」的单。
 // 每笔单的结局只有两种：`done`（交易所给了确定的结果，成交量可以是 0）或 `unknown`（发出去了但不知道结果）。
-// `unknown` 的单绝不重发（L039、L093）：由 resolve 按自编号去查，查不到时交给上层按账户持仓核对。
+// `unknown` 的单绝不重发（L039、L093）：由 resolve 按自编号去查。查单有三种结果：有最终结果（done）、读成功但交易所没有这笔单的最终结果（absent）、
+// 没读成（unknown）。连接器自己不凭「过了多久」认定没成交：absent 与 unknown 都交给上层，等订单过期后再读账户、持仓上没有痕迹才算没成交。
 // 报错文案先去掉长的十六进制串与长数字（地址、账户编号），再给日志与页面。
 import { ENTROPY_ENDPOINTS, LIGHTER_ENDPOINTS, type FetchLike } from './feeds.ts';
 import { hip3Asset, iocOrderAction, signL1Action } from './hyperliquid.ts';
@@ -17,16 +18,19 @@ export interface VenueOrder {
 export type OrderOutcome =
   | { kind: 'done'; filledQty: number; /** 成交均价；交易所没给时为 null（上层按限价估）。 */ avgPrice: number | null; note: string }
   | { kind: 'unknown'; reason: string };
+/** 查单结果：absent 是「这次读成功了，交易所没有这笔单的最终结果」（查无此单，或还没到终态）。 */
+export type ResolveOutcome = OrderOutcome | { kind: 'absent'; reason: string };
 export interface VenueTrader {
   place(order: VenueOrder, signalFor: () => AbortSignal): Promise<OrderOutcome>;
   /** 查一笔结果未知的单。`sentAt` 是发出的时刻。 */
-  resolve(order: VenueOrder, sentAt: number, signalFor: () => AbortSignal): Promise<OrderOutcome>;
+  resolve(order: VenueOrder, sentAt: number, signalFor: () => AbortSignal): Promise<ResolveOutcome>;
 }
 
 const EXCHANGE_URL = 'https://api.hyperliquid.xyz/exchange';
 const RESPONSE_LIMIT = 256 * 1024;
-/** 查不到单时，发出后至少过这么久才认定没有成交。Lighter 的交易 10 分钟后过期，在那之前都可能被打包。 */
-export const ENTROPY_ABSENT_MS = 15_000, LIGHTER_ABSENT_MS = 11 * 60_000;
+/** 一笔单发出后过这么久就不可能再被执行：Lighter 的交易 10 分钟后过期，在那之前都可能被打包；Entropy 的请求是同步受理的，留一分钟。
+ * 上层在这之后读账户、持仓上没有痕迹，才认定没有成交。 */
+export const ORDER_EXPIRY_MS = { entropy: 60_000, lighter: 11 * 60_000, rh: 11 * 60_000 } as const;
 const LIGHTER_POLL_TRIES = 8, LIGHTER_POLL_MS = 700;
 const AUTH_TTL_SEC = 3600, AUTH_RENEW_MS = 50 * 60_000;
 
@@ -35,7 +39,8 @@ const isRecord = (value: unknown): value is Record<string, unknown> => value !==
 const numberOf = (value: unknown): number | null => { const number = typeof value === 'string' && value.trim() !== '' ? Number(value) : typeof value === 'number' ? value : NaN; return Number.isFinite(number) ? number : null; };
 const reasonOf = (error: unknown) => scrub(error instanceof Error ? error.message : String(error));
 const done = (filledQty: number, avgPrice: number | null, note: string): OrderOutcome => ({ kind: 'done', filledQty, avgPrice, note });
-const unknown = (reason: string): OrderOutcome => ({ kind: 'unknown', reason });
+const unknown = (reason: string): { kind: 'unknown'; reason: string } => ({ kind: 'unknown', reason });
+const absent = (reason: string): { kind: 'absent'; reason: string } => ({ kind: 'absent', reason });
 
 /** 发一个请求并读回 JSON：返回 HTTP 状态与应答体（不是 JSON 时 body 为 null）。网络错误与超时照常抛出。 */
 async function call(fetchImpl: FetchLike, url: string, init: RequestInit): Promise<{ status: number; body: unknown }> {
@@ -90,20 +95,20 @@ export function createEntropyTrader({ key, fetchImpl, now }: { key: EntropyKey; 
       try { answer = await call(fetchImpl, EXCHANGE_URL, request); } catch (error) { return unknown(`请求没有应答：${reasonOf(error)}`); }
       const outcome = parseStatus(answer.body);
       if (outcome) return outcome;
-      // 4xx（格式、限流）是交易所没有受理；其余读不懂的应答按未知处理。
-      if (answer.status >= 400 && answer.status < 500) return done(0, null, `交易所没有受理（HTTP ${answer.status}）`);
+      // 400、422（格式）、429（限流）是交易所明确没有受理；其余读不懂的应答（含中间层的 408、499、5xx）按未知处理。
+      if (answer.status === 400 || answer.status === 422 || answer.status === 429) return done(0, null, `交易所没有受理（HTTP ${answer.status}）`);
       return unknown(`应答读不懂（HTTP ${answer.status}）`);
     },
-    async resolve(order, sentAt, signalFor) {
+    async resolve(order, _sentAt, signalFor) {
       let answer: { status: number; body: unknown };
       try { answer = await call(fetchImpl, ENTROPY_ENDPOINTS.info, jsonPost({ type: 'orderStatus', user: key.address, oid: cloidOf(order.clientId) }, signalFor())); }
       catch (error) { return unknown(`查单失败：${reasonOf(error)}`); }
       const body = answer.body;
       if (answer.status !== 200 || !isRecord(body)) return unknown(`查单应答读不懂（HTTP ${answer.status}）`);
-      if (body.status === 'unknownOid') return now() - sentAt >= ENTROPY_ABSENT_MS ? done(0, null, '交易所查无此单') : unknown('交易所暂时查不到这笔单');
+      if (body.status === 'unknownOid') return absent('交易所查无此单');
       const wrapper = isRecord(body.order) ? body.order : null, inner = wrapper && isRecord(wrapper.order) ? wrapper.order : null;
       if (body.status !== 'order' || !wrapper || !inner) return unknown('查单应答读不懂');
-      if (wrapper.status === 'open' || wrapper.status === 'triggered') return unknown('这笔单还挂着');
+      if (wrapper.status === 'open' || wrapper.status === 'triggered') return absent('这笔单还挂着');
       const original = numberOf(inner.origSz), remaining = numberOf(inner.sz);
       if (original === null || remaining === null || remaining < 0 || remaining > original) return unknown('查单应答缺少数量');
       return done(original - remaining, null, `查单结果：${scrub(String(wrapper.status))}`);
@@ -135,7 +140,7 @@ export function createLighterTrader({ venue, key, fetchImpl, now, signer, pause 
     auth = { token: value, at: now() };
     return value;
   }
-  /** 按自编号查单：有最终结果返回 done，还没有或查不到返回 null。 */
+  /** 按自编号查单：有最终结果返回 done；读成功但还没有最终结果或查无此单返回 null；没读成抛错。 */
   async function lookup(order: VenueOrder, signal: AbortSignal): Promise<OrderOutcome | null> {
     const { status, body } = await call(fetchImpl, `${rest}/accountOrders?account_index=${key.accountIndex}&client_order_indexes=${order.clientId}`, { headers: { accept: 'application/json', authorization: await token() }, signal });
     if (status === 401 || status === 403) { auth = null; throw new Error(`查单鉴权失败（HTTP ${status}）`); }
@@ -146,14 +151,15 @@ export function createLighterTrader({ venue, key, fetchImpl, now, signer, pause 
     if (filled === null || filled < 0) throw new Error('查单应答缺少成交数量');
     return done(filled, filled > 0 && quote !== null && quote > 0 ? quote / filled : null, found.status === 'filled' ? '已成交' : `交易所撤销：${scrub(found.status)}`);
   }
-  async function poll(order: VenueOrder, signalFor: () => AbortSignal, tries: number): Promise<OrderOutcome | null> {
-    let last = '还没有结果';
+  /** 查几次：有最终结果就返回；否则按最后一次读的情况返回 absent（读成功了，没有最终结果）或 unknown（没读成）。 */
+  async function poll(order: VenueOrder, signalFor: () => AbortSignal, tries: number): Promise<ResolveOutcome> {
+    let last: ResolveOutcome = unknown('还没有查');
     for (let attempt = 0; attempt < tries; attempt++) {
       if (attempt > 0) await pause(LIGHTER_POLL_MS);
-      try { const outcome = await lookup(order, signalFor()); if (outcome) return outcome; } catch (error) { last = reasonOf(error); }
+      try { const outcome = await lookup(order, signalFor()); if (outcome) return outcome; last = absent('交易所还没有这笔单的最终结果'); }
+      catch (error) { last = unknown(`查单失败：${reasonOf(error)}`); }
     }
-    void last;
-    return null;
+    return last;
   }
   return {
     place: (order, signalFor) => serial(async () => {
@@ -174,18 +180,17 @@ export function createLighterTrader({ venue, key, fetchImpl, now, signer, pause 
       if (answer.status === 200 && isRecord(body) && body.code === 200) {
         nonce = nonce === null ? null : nonce + 1;
         // 交易被接受不等于成交：保证金不足、滑点超限时订单会被撤销，要查成交量。
-        return await poll(order, signalFor, LIGHTER_POLL_TRIES) ?? unknown('交易已被接受，还没查到成交结果');
+        const polled = await poll(order, signalFor, LIGHTER_POLL_TRIES);
+        return polled.kind === 'done' ? polled : unknown(`交易已被接受，还没查到成交结果（${polled.reason}）`);
       }
       nonce = null;
       // 接口明确拒绝的交易不占用 nonce，也不会被执行。
       if (isRecord(body) && typeof body.code === 'number' && body.code !== 200 && answer.status < 500) return done(0, null, `交易所拒绝（${body.code}）：${scrub(typeof body.message === 'string' ? body.message : '')}`);
       return unknown(`应答读不懂（HTTP ${answer.status}）`);
     }),
-    async resolve(order, sentAt, signalFor) {
+    async resolve(order, _sentAt, signalFor) {
       nonce = null;
-      const outcome = await poll(order, signalFor, 2);
-      if (outcome) return outcome;
-      return now() - sentAt >= LIGHTER_ABSENT_MS ? done(0, null, '交易所查无此单') : unknown('交易所暂时查不到这笔单');
+      return poll(order, signalFor, 2);
     },
   };
 }

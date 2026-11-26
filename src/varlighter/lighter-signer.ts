@@ -1,4 +1,4 @@
-// Lighter 交易签名器（docs/dexspread.md 第 12 节）：加载 elliottech/lighter-go 的 WASM 构建，在本进程里给下单交易与鉴权令牌签名。
+// Lighter 交易签名器（docs/dexspread.md 第 13.3 节）：加载 elliottech/lighter-go 的 WASM 构建，在本进程里给下单交易与鉴权令牌签名。
 // 两个文件（signer/lighter-signer.wasm、signer/wasm_exec.js）由 scripts/build-lighter-signer.sh 从固定源码编译，不进仓库；
 // 加载前按同目录 SHA256SUMS 核对实际读入的字节，不一致拒绝加载。这里不发任何网络请求：CreateClient 的 url 传空串，
 // 上游据此不建 HTTP 客户端，nonce 一律由调用方给出。

@@ -769,7 +769,7 @@ test('Entropy 行情流：按配对订阅 bbo，没有一档或长时间没变�
   } finally { stream.close(); }
 });
 
-test('下单预演：按场所精度向下取整，核对最小数量与金额，连接器未接入时不就绪；Entropy 腿按 5 位有效数字限价', () => {
+test('下单预演：按场所精度向下取整，核对最小数量与金额，带 Var 腿的不就绪、两腿都是下单场所的可以就绪；Entropy 腿按 5 位有效数字限价', () => {
   const listing = { ticker: 'BTC', name: 'Bitcoin', mark: 100.3, fundingRate: null, fundingIntervalS: null, quote: null };
   const main = { symbol: 'BTC', marketId: 1, mark: 100, sizeDecimals: 2, priceDecimals: 2, minBase: 0.5, minQuote: 10, takerFeeBps: 0, makerFeeBps: 0 };
   const pair = comboPairs('var|lighter', [varMarket(listing)], [lighterMarket('lighter', main)])[0];
@@ -781,7 +781,8 @@ test('下单预演：按场所精度向下取整，核对最小数量与金额�
   assert.equal(plan.legs[1].fields.base_amount, 999);
   assert.equal(plan.legs[1].limit, '100.23');
   assert.equal(plan.ready, false);
-  assert.ok(plan.checks.filter(check => !check.ok).every(check => /尚未接入/.test(check.label)));
+  assert.deepEqual(plan.checks.filter(check => !check.ok).map(check => check.label), ['Var 没有下单接口，带 Var 腿的配对不上实盘'], '只剩 Var 腿这一条恒假的检查');
+  assert.ok(!plan.checks.some(check => /尚未接入/.test(check.label)), '下单连接器已接入，不再有这类检查');
   assert.equal(plan.symbol, LIGHTER_BTC);
   assert.ok(plan.sequence.some(line => line.includes('Lighter（市场 1）')), '计划写明对手场所与市场编号');
   const small = orderPlan(pair, value, 'a_cheap', 20, 20, T0 + 30_000);
@@ -792,6 +793,15 @@ test('下单预演：按场所精度向下取整，核对最小数量与金额�
   const entropyPlan = orderPlan(sndk, sample(T0, 100.3, 100, { symbol: sndk.key }), 'a_rich', 999.7, 20, T0 + 30_000);
   assert.deepEqual(entropyPlan.legs[1].fields, { coin: 'io:SNDK', is_buy: true, sz: '9.99', limit_px: '100.2200', order_type: 'limit', tif: 'Ioc', reduce_only: false });
   assert.ok(!entropyPlan.sequence.some(line => line.includes('（市场')), 'Entropy 按代码下单，不写市场编号');
+  assert.equal(entropyPlan.ready, false, '带 Var 腿');
+  // 两腿都是下单场所（Lighter 主网对 Entropy）：没有恒假的检查，条件都满足时就绪；数量不够或报价太旧时仍不就绪。
+  const both = comboPairs('lighter|entropy', [lighterMarket('lighter', { ...main, symbol: 'SNDK' })], [entropy])[0];
+  const bothSample = sample(T0, 100.3, 100, { symbol: both.key });
+  const bothPlan = orderPlan(both, bothSample, 'a_rich', 999.7, 20, T0 + 30_000);
+  assert.deepEqual([bothPlan.ready, bothPlan.checks.filter(check => !check.ok).map(check => check.label)], [true, []]);
+  assert.deepEqual([bothPlan.legs[0].side, bothPlan.legs[0].qty, bothPlan.legs[1].side, bothPlan.legs[1].qty], ['sell', '9.99', 'buy', '9.99']);
+  assert.equal(orderPlan(both, bothSample, 'a_rich', 20, 20, T0 + 30_000).ready, false, '小于 Lighter 最小数量');
+  assert.equal(orderPlan(both, bothSample, 'a_rich', 999.7, 20, T0 + 200_000).ready, false, '报价太旧');
 });
 
 test('降采样：每格保留机会极值', () => {

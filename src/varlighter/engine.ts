@@ -1,5 +1,5 @@
 // DEX 价差模块（原 Var/Lighter 价差，docs/varlighter.md、docs/dexspread.md）的运行时：采集各配对两条腿的对齐样本、维护基线、跑模拟盘，
-// 并给页面出视图。只读公开行情、只写自己的 varlighter.sqlite；不碰执行器、不下任何真实订单。
+// 并给页面出视图。只写自己的 varlighter.sqlite，不碰执行器。实盘（live.ts，docs/dexspread.md 第 13 节）默认关闭：录了凭据、开了总开关后才在勾选的配对上下真实订单。
 // 有 Var 腿的配对跟着每分钟一次的 Var 报价采样（样本时刻 = Var 报价时刻，另一腿回看那一刻的行情流）；两腿都是行情流的配对
 // 由本机每秒检查一次，启用或有持仓的每 5 秒、其余每 20 秒采一条（样本时刻 = 本机采样时刻）。
 import { anySignal } from '../any-signal.mjs';
@@ -260,7 +260,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       ...trader.view(), keys: liveKeys!.view(), keysProblem: read.problem, signerProblem: signerProblem(), venueNames: VENUE_NAMES,
       // 能开实盘的配对：两腿都是下单场所。
       candidates: pairs.filter(pair => pair.a.venue !== 'var' && pair.b.venue !== 'var').map(pair => ({ key: pair.key, symbol: pair.symbol, a: legRef(pair.a), b: legRef(pair.b), paper: paramsOf(pair.key).enabled })),
-      events: store.events(200).filter(item => item.kind === 'live').slice(0, 40),
+      events: store.events(1000).filter(item => item.kind === 'live').slice(0, 40),
     };
   }
   /** 录入一个场所的凭据：请求体是 { venue, ...该场所的字段 }。应答只说哪些场所已配置。 */
@@ -268,6 +268,12 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     liveOf();
     const venue = venueOf(body), { venue: _venue, ...fields } = body as Record<string, unknown>;
     void _venue;
+    // 这个场所还有实盘持仓时只能给同一个账户换密钥：换成别的账户，查单、对账、平仓都会落到新账户上，旧账户的持仓就没人管了。
+    const held = liveKeys!.read().keys[venue];
+    if (liveOf().venueInUse(venue) && held) {
+      const same = venue === 'entropy' ? String(fields.address ?? '').trim().toLowerCase() === (held as { address: string }).address : String(fields.accountIndex ?? '').trim() === String((held as { accountIndex: number }).accountIndex);
+      if (!same) return reject('busy', `${VENUE_NAMES[venue]} 还有实盘持仓，只能给同一个账户换密钥；要换账户先平掉持仓`, 409);
+    }
     try { liveKeys!.set(venue, fields); } catch (error) { return liveFailure(error); }
     traderCache.delete(venue);
     nextAccounts = 0;
@@ -950,7 +956,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       totals: store.totals(), todayNetUsd: store.netSince(dayStart(time)),
       limits: { maxOpenPositions: settings.global.maxOpenPositions, maxTotalNotionalUsd: settings.global.maxTotalNotionalUsd, dailyLossLimitUsd: settings.global.dailyLossLimitUsd, paused: settings.global.paused },
       openNotionalUsd: open.reduce((sum, item) => sum + item.notionalUsd, 0),
-      events: store.events(100),
+      // 实盘事件只在实盘页（只读令牌读不到那里）。
+      events: store.events(300).filter(item => item.kind !== 'live').slice(0, 100),
     };
   }
 

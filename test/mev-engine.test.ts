@@ -47,7 +47,11 @@ function setup(t: TestContext, options: { dir?: string; profit?: (call: FakeExec
   let clock = Date.UTC(2026, 10, 25, 12);
   const now = () => clock;
   const dir = options.dir ?? mkdtempSync(join(tmpdir(), 'tp-mev-engine-'));
-  if (!options.dir) t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const engines = new Set<ReturnType<typeof createMevEngine>>();
+  t.after(() => {
+    for (const engine of engines) engine.close();
+    if (!options.dir) rmSync(dir, { recursive: true, force: true });
+  });
   const chain = createFakeChain({ executor: EXECUTOR, owner: OWNER, operator: OPERATOR, tokens: TOKENS, pools: makePools(), now, profit: options.profit ?? profitable });
   const logs: string[] = [], notices: string[] = [];
   const open = (privateKey = KEY) => {
@@ -56,17 +60,16 @@ function setup(t: TestContext, options: { dir?: string; profit?: (call: FakeExec
     if (!store.tokens().length) { for (const token of TOKENS) store.putToken(token, now()); store.writeState('seeded', true, now()); }
     const rpc = createRpc({ url: 'https://fake.invalid', fetchImpl: chain.fetchImpl });
     const engine = createMevEngine({ store, rpc, sendRpc: rpc, chainId: BASE_CHAIN_ID, executor: EXECUTOR, owner: OWNER, privateKey, now, log: line => logs.push(line), notify: (_key, text) => { notices.push(text); } });
-    return { store, engine };
+    engines.add(engine);
+    return { store, engine, rpc };
   };
   const first = open();
-  let closed = false;
-  t.after(() => { if (!closed) first.engine.close(); });
   /** 出若干个新区块（时钟每块走两秒），引擎处理一轮。 */
   const step = async (engine = first.engine, blocks = 1): Promise<void> => { clock += 2_000 * blocks; chain.advance(blocks); await engine.tick(); };
   return {
     ...first, chain, dir, logs, notices, step, open,
     advanceClock(ms: number): void { clock += ms; },
-    closeFirst(): void { closed = true; first.engine.close(); },
+    closeFirst(): void { first.engine.close(); engines.delete(first.engine); },
     /** 核对合约并走到目录就绪。 */
     async ready(engine = first.engine): Promise<void> { await engine.verify(); await step(engine); await step(engine); },
     async goLive(engine = first.engine): Promise<void> { const seen = engine.views.state(); assert.deepEqual(await engine.views.start({ confirm: OPERATOR, fault: seen.fault, haltReason: seen.haltReason }), { mode: 'live' }); },
@@ -74,6 +77,20 @@ function setup(t: TestContext, options: { dir?: string; profit?: (call: FakeExec
 }
 const sends = (chain: ReturnType<typeof createFakeChain>): number => chain.state.calls.filter(method => method === 'eth_sendRawTransaction').length;
 const rejectsWith = (code: string, status: number) => (error: unknown): boolean => error instanceof MevError && error.code === code && error.status === status;
+
+/** Hold just the next node reply so another operator can act before that verification completes. */
+function holdNextVerification(s: ReturnType<typeof setup>): (fail?: boolean) => void {
+  const batch = s.rpc.batch;
+  let release!: (fail?: boolean) => void;
+  const held = new Promise<boolean | undefined>(resolve => { release = resolve; });
+  s.rpc.batch = async (...args) => {
+    s.rpc.batch = batch;
+    const reply = await batch(...args);
+    if (await held) throw new Error('测试节点暂不可读');
+    return reply;
+  };
+  return release;
+}
 
 test('观察模式：发现并记录机会，不签名也不发送；合约核对通过', async t => {
   const s = setup(t);
@@ -257,7 +274,6 @@ test('换了热钱包：旧钱包的未结清交易直接结清，它的上链�
   s.chain.state.send = 'accept';
   s.advanceClock(60_000);
   const next = s.open(otherKey);
-  t.after(() => next.engine.close());
   assert.equal(next.store.openTxs().length, 0);
   assert.deepEqual(next.store.recentTxs(1).map(tx => [tx.status, tx.error]), [['lost', '热钱包已更换，这笔交易不再核对']]);
   assert.equal(next.store.maxMinedNonce(), null, '旧钱包的上链记录不算进新钱包的 nonce 比较');
@@ -281,6 +297,47 @@ test('停服：quiesce 之后不再发送', async t => {
   await assert.rejects(async () => s.engine.views.start({ confirm: OPERATOR, fault: null, haltReason: null }), rejectsWith('stopping', 503));
   assert.ok(!s.notices.some(text => text.includes('已停止实盘')), '停服不发熔断通知');
 });
+
+test('开始核对途中停止或停服：迟到的开始不能开启实盘', async t => {
+  const s = setup(t);
+  await s.ready();
+  let release = holdNextVerification(s);
+  const start = s.engine.views.start({ confirm: OPERATOR });
+  assert.deepEqual(s.engine.views.stop(), { mode: 'observe' });
+  assert.deepEqual(s.engine.views.stop(), { mode: 'observe' });
+  release();
+  await assert.rejects(start, rejectsWith('stale', 409));
+  await s.step();
+  assert.equal(s.engine.views.state().mode, 'observe');
+  assert.equal(sends(s.chain), 0);
+  release = holdNextVerification(s);
+  const shuttingDown = s.engine.views.start({ confirm: OPERATOR });
+  s.engine.quiesce();
+  release();
+  await assert.rejects(shuttingDown, rejectsWith('stopping', 503));
+  assert.equal(s.notices.filter(n => n.includes('开始实盘')).length, 0);
+});
+
+for (const stopBetween of [false, true]) {
+  test(`并发开始${stopBetween ? '、中途停止再开始' : ''}：只有最新确认能创建实盘会话`, async t => {
+    const s = setup(t);
+    await s.ready();
+    const release = holdNextVerification(s);
+    const old = s.engine.views.start({ confirm: OPERATOR });
+    if (stopBetween) s.engine.views.stop();
+    await s.goLive();
+    const since = s.engine.views.state().liveSince;
+    s.advanceClock(1_000);
+    release(stopBetween);
+    await assert.rejects(old, rejectsWith('stale', 409));
+    assert.equal(s.engine.views.state().mode, 'live');
+    assert.equal(s.engine.views.state().liveSince, since);
+    assert.equal(s.engine.views.state().verification.ok, true);
+    assert.equal(s.notices.filter(n => n.includes('开始实盘')).length, 1);
+    await s.step();
+    assert.equal(sends(s.chain), 1);
+  });
+}
 
 test('连续上链回滚到上限即停实盘；重新开始后计数清零', async t => {
   const s = setup(t);
@@ -322,7 +379,6 @@ test('nonce 被不属于本模块的交易占用：核对几轮后记为丢失�
   assert.equal(sends(s.chain), 1);
   s.closeFirst();
   const again = s.open();
-  t.after(() => again.engine.close());
   assert.match(again.engine.views.state().fault ?? '', /nonce 0/);
   assert.equal(again.engine.isLive(), false, '重启后总是观察模式');
   await s.ready(again.engine);
@@ -337,7 +393,6 @@ test('重启恢复：入库后还没发出去就退出的交易，重启后按�
     opportunityId: null, start: WETH, path: 'WETH → USDC → WETH', expectedProfit: 10n ** 15n });
   s.closeFirst();
   const again = s.open();
-  t.after(() => again.engine.close());
   assert.equal(again.store.openTxs()[0]!.status, 'recorded');
   assert.ok(again.engine.views.state().today.reservedEth > 0, '未结清的交易占着预算');
   s.chain.mine(signed.hash, 'success', { profit: 9n * 10n ** 14n });

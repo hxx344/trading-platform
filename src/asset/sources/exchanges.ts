@@ -2,8 +2,8 @@
 // Changes: split out of exchanges.ts (Aster lives in ./aster.ts, readJson in ./http.ts, quotes in ./quotes.ts);
 // signing imports point at src/vendor. Logic, hosts, read-only path allowlists and messages are unchanged.
 import type { Balance } from '../types.ts';
-import { binanceReadOnly, bybitReadOnly, PositionsPermissionError } from '../positions-values.ts';
-import { binanceSignedQuery } from '../../vendor/binance.mjs';
+import { bybitReadOnly, PositionsPermissionError } from '../positions-values.ts';
+import { readBinanceWallet } from './binance-wallet.ts';
 import { bybitAuthHeaders } from '../../vendor/bybit.mjs';
 import { finite, readJson, type Fetcher, type Json } from './http.ts';
 import { usdPrice, type Quote } from './quotes.ts';
@@ -46,31 +46,16 @@ const BINANCE_READ_PATHS = new Set(['/sapi/v1/account/apiRestrictions', '/sapi/v
 export async function binanceGet(c: BinanceCredential, path: string, fetcher: Fetcher = fetch): Promise<unknown> {
   if (!BINANCE_READ_PATHS.has(path)) throw new Error('仅支持 Binance 只读账户接口');
   if (typeof c?.apiKey !== 'string' || !c.apiKey.trim() || typeof c?.apiSecret !== 'string' || !c.apiSecret.trim()) throw new Error('Binance API Key 与 Secret 不能为空');
-  const params = new URLSearchParams();
-  if (path === '/sapi/v1/asset/wallet/balance') params.set('quoteAsset', 'USDT');
-  // Sign the exact encoded query sent to the fixed official host; no caller-supplied parameters.
-  let data: unknown;
-  try {
-    const { query, headers } = binanceSignedQuery(c, params, { timestamp: String(Date.now()), recvWindow: '10000' });
-    data = await readJson('https://api.binance.com' + path + '?' + query, { method: 'GET', headers }, fetcher);
-  } catch (error) {
-    // JSON parse and transport errors may contain response text or signed URLs. Never expose them.
-    const http = error instanceof Error ? /^服务暂时不可用（HTTP (\d{3})），保留上次数据$/.exec(error.message) : null;
-    throw new Error(`Binance 读取失败${http ? '（HTTP ' + http[1] + '）' : ''}，请检查网络、API 权限及服务器时间；已保留上次数据`);
-  }
+  const kind = path === '/sapi/v1/asset/wallet/balance' ? 'balances' : 'permissions';
+  const { data } = await readBinanceWallet(c, { kind }, fetcher, AbortSignal.timeout(12_000));
   if (!data || typeof data !== 'object') throw new Error('Binance 返回的数据不完整；已保留上次数据');
-  if (Object.hasOwn(data, 'code')) {
-    const code = (data as Json).code;
-    throw new Error(`Binance 读取失败（${typeof code === 'number' && Number.isSafeInteger(code) ? code : '未知代码'}），请检查 API 权限、IP 白名单及服务器时间`);
-  }
   return data;
 }
 export async function syncBinance(c: BinanceCredential, prices: Record<string, Quote>, fetcher: Fetcher = fetch): Promise<{total:number;details:Balance[];updatedAt?:string}> {
   const quote = prices.USDT;
   const quoteAt = typeof quote?.at === 'string' ? Date.parse(quote.at) : NaN;
   if (typeof quote?.price !== 'number' || !Number.isFinite(quote.price) || quote.price <= 0 || !Number.isFinite(quoteAt) || Date.now() - quoteAt > 900000 || quoteAt - Date.now() > 60000) throw new Error('USDT 美元行情无效或已过期；已保留上次数据');
-  const info = await binanceGet(c, '/sapi/v1/account/apiRestrictions', fetcher) as Json;
-  if (Array.isArray(info) || !binanceReadOnly(info)) throw new PositionsPermissionError('此 Binance API 无法确认只读权限，请使用仅启用读取的 API');
+  await binanceGet(c, '/sapi/v1/account/apiRestrictions', fetcher);
   const wallets = await binanceGet(c, '/sapi/v1/asset/wallet/balance', fetcher);
   if (!Array.isArray(wallets) || wallets.length === 0) throw new Error('Binance 钱包数据不完整；已保留上次数据');
   const names = new Set<string>();

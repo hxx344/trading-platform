@@ -285,7 +285,11 @@ export function createFillsService(options: FillsServiceOptions = {}) {
           const replayed = replayFills(raw, positions, snapshotStart, account.exchange);
           return { raw, replayed, snapshotAt, positions, lookback };
         };
-        const result = await Promise.race([work(), new Promise<never>((_, reject) => {
+        const reading = work().catch(error => {
+          if (account.exchange === 'binance' && error instanceof PositionsPermissionError) generation.deny(error);
+          throw error;
+        });
+        const result = await Promise.race([reading, new Promise<never>((_, reject) => {
           onAbort = () => reject(new Error(FILLS_FAILED));
           abort.signal.addEventListener('abort', onAbort, { once: true });
           timer = setTimeout(() => abort.abort(), options.deadline ?? DEADLINE);
@@ -312,7 +316,7 @@ export function createFillsService(options: FillsServiceOptions = {}) {
         if (entries.get(key) === entry && !abort.signal.aborted) save(database, account, entry);
       } catch (error) {
         if (error instanceof PositionsPermissionError) {
-          generation.deny();
+          generation.deny(error);
           return;
         }
         if (!generation.current()) return;

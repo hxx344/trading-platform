@@ -11,11 +11,12 @@ import { readJsonResponse } from '../vendor/response.mjs';
 import { nextAsterNonce, validateAsterWallet } from './sources/aster.ts';
 import type { AsterCredential } from './sources/aster.ts';
 import { signAsterMessage } from '../aster/eip712.ts';
+import { readBinanceSignedResponse, readBinanceWallet } from './sources/binance-wallet.ts';
 import type { BinanceCredential, BybitCredential } from './sources/exchanges.ts';
 import { okxAccessDenied, type OkxCredential } from './sources/okx.ts';
 import type { Position } from './positions-types.ts';
 import type { Credentials } from './validation.ts';
-import { absolute, binanceReadOnly, bybitReadOnly, decimal, isZero, multiplyDecimals, optionalDecimal, position, positionId, record, rows, text, timestamp, uniquePositions, POSITIONS_FAILED, POSITIONS_INVALID, PositionsPermissionError } from './positions-values.ts';
+import { absolute, bybitReadOnly, decimal, isZero, multiplyDecimals, optionalDecimal, position, positionId, record, rows, text, timestamp, uniquePositions, POSITIONS_FAILED, POSITIONS_INVALID, PositionsPermissionError } from './positions-values.ts';
 import { anySignal } from '../any-signal.mjs';
 
 type Fetcher = typeof fetch;
@@ -30,17 +31,23 @@ const ENDPOINTS = {
   aster: new Set(['/fapi/v3/positionRisk', '/fapi/v3/exchangeInfo']),
 };
 
-async function getJson(url: string, headers: Record<string, string>, fetcher: Fetcher, signal?: AbortSignal, signedOkx = false): Promise<unknown> {
+async function getJson(url: string, headers: Record<string, string>, fetcher: Fetcher, signal?: AbortSignal,
+  signed: boolean | ((limit: AbortSignal) => Promise<void>) = false): Promise<unknown> {
   try {
     const limit = anySignal([signal], 10_000);
     const response = await fetcher(url, { method: 'GET', headers, redirect: 'manual', cache: 'no-store', signal: limit });
-    if (signedOkx && !response.redirected && okxAccessDenied(response.status)) {
+    if (typeof signed === 'function') {
+      const payload = await readBinanceSignedResponse(response, limit, 2_000_000, () => signed(limit));
+      limit.throwIfAborted();
+      return payload;
+    }
+    if (signed && !response.redirected && okxAccessDenied(response.status)) {
       void response.body?.cancel().catch(() => {});
       throw new PositionsPermissionError();
     }
-    if (response.redirected || (!response.ok && !(signedOkx && response.status === 400))) throw new Error();
+    if (response.redirected || (!response.ok && !(signed && response.status === 400))) throw new Error();
     const payload = await readJsonResponse(response, { maxBytes: 2_000_000, signal: limit });
-    if (signedOkx && payload && typeof payload === 'object' && 'code' in payload && okxAccessDenied(response.status, payload.code)) throw new PositionsPermissionError();
+    if (signed && payload && typeof payload === 'object' && 'code' in payload && okxAccessDenied(response.status, payload.code)) throw new PositionsPermissionError();
     if (!response.ok) throw new Error();
     return payload;
   } catch (error) {
@@ -65,7 +72,8 @@ export async function positionsGet(exchange: 'binance' | 'bybit' | 'okx', creden
         search = signed.query; Object.assign(headers, signed.headers);
       } catch { throw new Error(POSITIONS_FAILED); }
     }
-    payload = await getJson(host + path + (search ? '?' + search : ''), headers, fetcher, signal);
+    const recheck = path.endsWith('/exchangeInfo') ? false : (limit: AbortSignal) => binancePermission(c as BinanceCredential, fetcher, limit);
+    payload = await getJson(host + path + (search ? '?' + search : ''), headers, fetcher, signal, recheck);
     if (!Array.isArray(payload) && Object.hasOwn(record(payload), 'code')) throw new Error(POSITIONS_FAILED);
     return payload;
   }
@@ -157,8 +165,8 @@ function normalizeLinear(data: unknown, metadata: unknown): Position[] {
 
 export type BinanceScope = 'um' | 'pm-um' | 'cm' | 'pm-cm';
 async function binancePermission(c: BinanceCredential, fetcher: Fetcher, signal?: AbortSignal) {
-  const permissions = record(await positionsGet('binance', c, '/sapi/v1/account/apiRestrictions', new URLSearchParams(), fetcher, signal));
-  if (!binanceReadOnly(permissions)) throw new PositionsPermissionError();
+  try { await readBinanceWallet(c, { kind: 'permissions' }, fetcher, anySignal([signal], 10_000)); }
+  catch (error) { if (error instanceof PositionsPermissionError) throw error; throw new Error(POSITIONS_FAILED); }
 }
 async function bybitPermission(c: BybitCredential, fetcher: Fetcher, signal?: AbortSignal) {
   const info = record(await positionsGet('bybit', c, '/v5/user/query-api', new URLSearchParams(), fetcher, signal));

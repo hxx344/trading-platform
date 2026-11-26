@@ -206,7 +206,7 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
           if (error instanceof PositionsPermissionError) {
             // A second read may already have renewed permissions. Revoke the current generation only for this saved credential.
             if (database() === file && current(database, account, entry.revision)) {
-              historyGeneration(database, account.key, entry.revision, now).deny();
+              historyGeneration(database, account.key, entry.revision, now).deny(error);
             }
             return;
           }
@@ -259,7 +259,7 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
           status: 'live', refreshing: false, fetchedAt: observedAt, error: null };
         if (cyclesFor(account.exchange, entry.scope.id)) scheduleCycles(database, account, entry, key, c, startedAt, generation);
       } catch (error) {
-        if (error instanceof PositionsPermissionError) generation.deny();
+        if (error instanceof PositionsPermissionError) generation.deny(error);
         let still = false;
         try { still = current(database, account, entry.revision); } catch { /* the file is gone: the next poll rebuilds */ }
         if (entries.get(key) === entry && still) {

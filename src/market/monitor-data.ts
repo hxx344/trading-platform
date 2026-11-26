@@ -1,6 +1,7 @@
 // Public Monitor operations. This process owns the venue sockets, abortable network reads, catalogs, rate limits and pagination.
 import type { MarketOperations } from './ipc.ts';
 import { createChainArbMarket } from '../chain-arb/read.ts';
+import { isDepositVenue } from '../chain-arb/model.ts';
 import { assertOkxDirectory } from '../chain-arb/okx-network.ts';
 import { isObject } from '../contracts.ts';
 import { createPerpetualFeed } from '../monitor/perpetual-feed.ts';
@@ -44,7 +45,7 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
 }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void; WebSocketImpl?: typeof WebSocket;
   perpetual?: PerpetualOptions; variationalFetch?: VariationalFetcher; env?: Record<string, string | undefined> } = {}): MarketOperations {
   const gate = createBinanceGate(), common = { now, ...(fetchImpl ? { fetchImpl } : {}) };
-  const chain = createChainArbMarket({ now, fetchImpl });
+  const chain = createChainArbMarket({ now, fetchImpl, WebSocketImpl });
   const feed = createPerpetualFeed({ ...common, log, ...options });
   const stopped = new AbortController(), subscriptions = new Set<() => void>();
   // The cards, the comparison and the collector live in this process, so they share what they would each read (monitor/shared-reads.ts).
@@ -81,9 +82,9 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
       case 'monitor.perpetual.depositBook': {
         const catalog = op === 'monitor.perpetual.depositCatalog';
         const { venue, directory, params, scanning } = fields(input, catalog ? ['venue', 'directory'] : ['venue', 'directory', 'params', 'scanning']);
-        if (venue !== 'gate' && venue !== 'okx') throw new Error('交易所不支持实际充值地址核验');
+        if (!isDepositVenue(venue)) throw new Error('交易所不支持实际充值地址核验');
         if (venue === 'okx') assertOkxDirectory(directory, now());
-        else if (directory !== null) throw new Error('Gate 行情无需账户目录');
+        else if (directory !== null) throw new Error('该行情不接受账户目录');
         const wallet = venue === 'okx' ? directory as import('../chain-arb/okx-network.ts').OkxDirectory : undefined;
         if (catalog) return chain.chainArbCatalog(venue, signal, wallet);
         if (typeof scanning !== 'boolean' || !isObject(params) || (params.venue ?? 'gate') !== venue) throw new Error('行情交易所不一致');

@@ -2,7 +2,7 @@ import type { AssetDb } from './db.ts';
 import type { HistoryGeneration } from './history-cache.ts';
 import type { DatabaseSource, SourceAccount } from './positions-service.ts';
 import type { Position } from './positions-types.ts';
-import { decimal, POSITIONS_FAILED, rows, uniquePositions } from './positions-values.ts';
+import { decimal, POSITIONS_FAILED, PositionsPermissionError, rows, uniquePositions } from './positions-values.ts';
 import { untilAborted } from './sources/shared-reads.ts';
 import { anySignal } from '../any-signal.mjs';
 
@@ -100,7 +100,11 @@ export async function verifiedPositionSnapshot(ctx: Context, read: (signal: Abor
     const controller = new AbortController(), signal = anySignal([key, controller.signal]);
     const result = (async () => {
       const startedAt = ctx.now();
-      const positions = await read(signal), completedAt = ctx.now();
+      const positions = await read(signal).catch(error => {
+        // The last waiter can have left before the exchange returns a definite credential refusal.
+        if (ctx.account.exchange === 'binance' && error instanceof PositionsPermissionError) ctx.generation.deny(error);
+        throw error;
+      }), completedAt = ctx.now();
       signal.throwIfAborted(); check();
       if (completedAt < startedAt) throw new Error(POSITIONS_FAILED);
       const snapshot = { positions, startedAt, completedAt };

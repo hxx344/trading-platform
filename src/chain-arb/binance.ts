@@ -1,6 +1,7 @@
 import { anySignal } from '../any-signal.mjs';
 import { isObject } from '../contracts.ts';
 import { decimal, fromUnits, units } from '../decimal.ts';
+import { createBinanceStreams, depthSequence, type BinanceSocketFactory } from './binance-streams.ts';
 import type { ScanCandidate } from './catalog.ts';
 import { isSettlementOrNative } from './dex.ts';
 import type { GateLeg } from './gate.ts';
@@ -9,7 +10,7 @@ import { createVenueCatalog, readVenueJson, type VenueReader, type VenueReaderOp
 
 // Public data behind Binance's Network Status page. The signed wallet API also returns account balances.
 const NETWORK_URL = 'https://www.binance.com/bapi/capital/v1/public/capital/getNetworkCoinAll';
-const SPOT = 'https://api.binance.com/api/v3/', FUTURES = 'https://fapi.binance.com/fapi/v1/';
+const FUTURES = 'https://fapi.binance.com/fapi/v1/';
 const NETWORKS: Record<string, Chain> = { ETH: 'ethereum', ARBITRUM: 'arbitrum', BSC: 'bsc' };
 const META_TTL = 60_000, LEVELS = 100, ONE = units('1');
 const INVALID_DIRECTORY = '币安公开目录不完整或格式无效';
@@ -99,23 +100,6 @@ function directory(wallet: unknown, spot: unknown, perp: unknown, now: number) {
   return { candidates, identities };
 }
 
-// The spot REST snapshot only contains a sequence number. A preceding matching-engine depth event
-// proves a lower bound on its age once the REST sequence has caught up. No local arrival timestamp can do this.
-type DepthEvent = (pair: string, signal: AbortSignal) => Promise<unknown>;
-const depthEvent: DepthEvent = (pair, signal) => new Promise((resolve, reject) => {
-  signal.throwIfAborted();
-  const socket = new WebSocket('wss://data-stream.binance.vision/ws/' + encodeURIComponent(pair.toLowerCase()) + '@depth@100ms');
-  const cleanup = () => { signal.removeEventListener('abort', abort); socket.onerror = null; socket.onclose = null; socket.onmessage = null; socket.close(); };
-  const unavailable = () => { cleanup(); reject(new Error('无法核实币安现货盘口更新时间')); };
-  const abort = () => { cleanup(); reject(signal.reason); };
-  socket.onerror = unavailable;
-  socket.onclose = unavailable;
-  socket.onmessage = event => {
-    if (typeof event.data !== 'string' || event.data.length > 256 * 1024) { unavailable(); return; }
-    try { const message: unknown = JSON.parse(event.data); cleanup(); resolve(message); } catch { unavailable(); }
-  };
-  signal.addEventListener('abort', abort, { once: true });
-});
 function filters(meta: Row) {
   const result = new Map<string, Row>();
   for (const item of rows(meta.filters, 64)) {
@@ -124,7 +108,7 @@ function filters(meta: Row) {
   }
   return result;
 }
-function limits(meta: Row, reference: bigint, perp: boolean) {
+function limits(meta: Row, reference: (filter: Row) => bigint, perp: boolean) {
   const rules = filters(meta), lot = rules.get('LOT_SIZE'), market = rules.get('MARKET_LOT_SIZE');
   if (!lot || !market) fail(INVALID_LIMIT);
   const lotStep = positive(lot.stepSize), marketStep = nonNegative(market.stepSize);
@@ -140,20 +124,20 @@ function limits(meta: Row, reference: bigint, perp: boolean) {
   // Market-order notional filters use the venue's reference price (USD-M: mark), not the simulated fill VWAP.
   const minimum = rules.get('MIN_NOTIONAL'), range = rules.get('NOTIONAL');
   if (!minimum && !range) fail(INVALID_LIMIT);
-  const enforce = (value: unknown, min: boolean) => {
-    const numerator = positive(value) * ONE, denominator = reference * larger;
+  const enforce = (filter: Row, value: unknown, min: boolean) => {
+    const numerator = positive(value) * ONE, denominator = reference(filter) * larger;
     const bound = (min ? (numerator + denominator - 1n) / denominator : numerator / denominator) * larger;
     if (min && bound > lower) lower = bound;
     if (!min && bound < upper) upper = bound;
   };
   if (minimum) {
     if (!perp && typeof minimum.applyToMarket !== 'boolean') fail(INVALID_LIMIT);
-    if (perp || minimum.applyToMarket) enforce(perp ? minimum.notional : minimum.minNotional, true);
+    if (perp || minimum.applyToMarket) enforce(minimum, perp ? minimum.notional : minimum.minNotional, true);
   }
   if (range) {
     if (typeof range.applyMinToMarket !== 'boolean' || typeof range.applyMaxToMarket !== 'boolean') fail(INVALID_LIMIT);
-    if (range.applyMinToMarket) enforce(range.minNotional, true);
-    if (range.applyMaxToMarket) enforce(range.maxNotional, false);
+    if (range.applyMinToMarket) enforce(range, range.minNotional, true);
+    if (range.applyMaxToMarket) enforce(range, range.maxNotional, false);
   }
   if (upper < lower) fail(INVALID_LIMIT);
   return { step: fromUnits(larger), minQuantity: fromUnits(lower), maxQuantity: fromUnits(upper) };
@@ -174,71 +158,110 @@ function bidLevels(raw: unknown, floor: bigint, ceiling?: bigint): [string, stri
   if (!bids.length) fail('币安市价单保护范围内没有可成交买盘');
   return bids;
 }
-function sequence(value: unknown): bigint {
-  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return BigInt(value);
-  if (typeof value === 'string' && /^[1-9]\d{0,19}$/.test(value)) return BigInt(value);
-  return fail(INVALID_BOOK);
-}
-export function createBinanceReader({ fetchImpl, now, spotDepthEvent = depthEvent }: VenueReaderOptions & { spotDepthEvent?: DepthEvent }): VenueReader {
-  const get = (url: string, signal: AbortSignal, metadata = false) =>
-    readVenueJson(fetchImpl, url, signal, metadata ? 8 * 1024 * 1024 : 192 * 1024, metadata ? META_TTL : CHAIN_ARB_TTL_MS, now);
+export function createBinanceReader({ fetchImpl, now, binanceSocket }: VenueReaderOptions & { binanceSocket?: BinanceSocketFactory }): VenueReader {
+  const streams = createBinanceStreams(now, binanceSocket);
+  const publicFetch: typeof fetchImpl = async (url, init) => {
+    const throttle = url.startsWith(FUTURES) ? streams.perpThrottle : streams.spotThrottle;
+    throttle.check();
+    const response = await fetchImpl(url, init);
+    if (response.status === 429 || response.status === 418) {
+      const after = response.headers.get('retry-after') ?? '';
+      const deadline = /^\d{1,9}$/.test(after) ? now() + Number(after) * 1000 : Date.parse(after);
+      throttle.block(response.status, deadline);
+    }
+    return response;
+  };
   const products = createVenueCatalog(async signal => {
-    const [spot, perp] = await Promise.all([get(SPOT + 'exchangeInfo?permissions=SPOT&showPermissionSets=false&symbolStatus=TRADING', signal, true),
-      get(FUTURES + 'exchangeInfo', signal, true)]);
-    return { spot, perp, expires: Math.min(spot.at, perp.at) + META_TTL };
+    const [spot, perp] = await Promise.all([streams.directory(signal),
+      readVenueJson(publicFetch, FUTURES + 'exchangeInfo', signal, 8 * 1024 * 1024, META_TTL, now)]);
+    spot.check();
+    return { spot: spot.body, perp: perp.body, expires: Math.min(spot.at, perp.at) + META_TTL };
   }, now, META_TTL, value => value.expires);
   async function load(signal: AbortSignal) {
     const [wallet, instruments] = await Promise.all([
-      readVenueJson(fetchImpl, NETWORK_URL, signal, 8 * 1024 * 1024, CHAIN_ARB_TTL_MS, now), products(signal)]);
-    return { ...directory(wallet.body, instruments.spot.body, instruments.perp.body, now()), depositAt: wallet.at,
+      readVenueJson(publicFetch, NETWORK_URL, signal, 8 * 1024 * 1024, CHAIN_ARB_TTL_MS, now), products(signal)]);
+    return { ...directory(wallet.body, instruments.spot, instruments.perp, now()), depositAt: wallet.at,
       expires: Math.min(wallet.at + CHAIN_ARB_TTL_MS, instruments.expires) };
   }
   const metadata = createVenueCatalog(load, now, CHAIN_ARB_TTL_MS, result => result.expires);
-  // Binance caps new spot stream connections per IP in a rolling five-minute window.
-  let connections: number[] = [];
-  async function spotLeg(pair: string, meta: Row, signal: AbortSignal): Promise<GateLeg> {
-    const time = now();
-    connections = connections.filter(at => at <= time && time - at < 300_000);
-    if (connections.length >= 240) throw Object.assign(new Error('币安现货行情连接受限'), { status: 429 });
-    connections.push(time);
-    const query = '?symbol=' + encodeURIComponent(pair);
+  // With no engine reference price, PRICE_RANGE is inactive. Each active notional filter
+  // independently specifies a VWAP window, with zero indicating the latest trade.
+  async function spotPrices(pair: string, meta: Row, signal: AbortSignal) {
+    const response = await streams.spot('referencePrice', { symbol: pair }, signal);
+    const mark = row(response.body, INVALID_LIMIT);
+    let at = response.at;
+    if (mark.code !== -2043) {
+      if (mark.symbol !== pair) fail(INVALID_LIMIT);
+      if (mark.referencePrice !== null) {
+        at = Math.min(at, fresh(mark.timestamp, now()));
+        const ref = positive(mark.referencePrice);
+        return { band: ref, reference: () => ref, at, check: response.check };
+      }
+      // With no current reference, this timestamp can refer to its last valid value.
+      if (mark.timestamp !== null && !(typeof mark.timestamp === 'number' && Number.isSafeInteger(mark.timestamp)
+        && mark.timestamp > 0 && mark.timestamp <= now() + CHAIN_ARB_CLOCK_SKEW_MS)) fail(INVALID_LIMIT);
+    }
+    const windows = new Set<number>();
+    for (const [type, filter] of filters(meta)) {
+      if (!(type === 'MIN_NOTIONAL' && filter.applyToMarket === true || type === 'NOTIONAL'
+        && (filter.applyMinToMarket === true || filter.applyMaxToMarket === true))) continue;
+      const minutes = filter.avgPriceMins;
+      if (typeof minutes !== 'number' || !Number.isSafeInteger(minutes) || minutes < 0) fail(INVALID_LIMIT);
+      windows.add(minutes);
+    }
+    const prices = new Map<number, bigint>();
+    await Promise.all([...windows].map(async minutes => {
+      const data = minutes ? await streams.spot('avgPrice', { symbol: pair }, signal)
+        : await streams.spot('trades.recent', { symbol: pair, limit: 1 }, signal);
+      const price = minutes ? row(data.body, INVALID_LIMIT) : rows(data.body, 1)[0];
+      if (minutes && price.mins !== minutes) fail(INVALID_LIMIT);
+      prices.set(minutes, positive(price.price));
+      at = Math.min(at, data.at, fresh(minutes ? price.closeTime : price.time, now()));
+    }));
+    response.check();
+    return { band: null, reference: (filter: Row) => prices.get(filter.avgPriceMins as number) ?? fail(INVALID_LIMIT),
+      at, check: response.check };
+  }
+  type PricedLeg = Exclude<GateLeg, { error: string }> & { check(): void };
+  async function spotLeg(pair: string, meta: Row, signal: AbortSignal): Promise<PricedLeg> {
     const snapshot = async () => {
-      const event = row(await spotDepthEvent(pair, signal), INVALID_BOOK);
-      if (event.e !== 'depthUpdate' || event.s !== pair || sequence(event.U) > sequence(event.u)
+      const anchor = await streams.spotEvent(pair, signal);
+      const event = row(anchor.body, INVALID_BOOK);
+      if (event.e !== 'depthUpdate' || event.s !== pair || depthSequence(event.U) > depthSequence(event.u)
         || !Array.isArray(event.b) || !Array.isArray(event.a) || !event.b.length && !event.a.length) fail(INVALID_BOOK);
       const eventAt = fresh(event.E, now());
-      const response = await get(SPOT + 'depth' + query + '&limit=' + LEVELS, signal);
+      const response = await streams.spot('depth', { symbol: pair, limit: LEVELS }, signal);
       const book = row(response.body, INVALID_BOOK);
-      if (sequence(book.lastUpdateId) < sequence(event.u)) fail('币安现货快照落后于盘口更新');
-      return { book, at: Math.min(eventAt, response.at) };
+      if (depthSequence(book.lastUpdateId) < depthSequence(event.u)) fail('币安现货快照落后于盘口更新');
+      return { book, at: Math.min(eventAt, response.at), check() { anchor.check(); response.check(); } };
     };
-    const [depth, reference, rules] = await Promise.all([snapshot(), get(SPOT + 'referencePrice' + query, signal),
-      get(SPOT + 'executionRules' + query, signal)]);
-    const mark = row(reference.body, INVALID_LIMIT), entries = rows(row(rules.body, INVALID_LIMIT).symbolRules);
-    if (mark.symbol !== pair || entries.length !== 1 || entries[0].symbol !== pair) fail(INVALID_LIMIT);
-    const ref = positive(mark.referencePrice);
+    const [depth, prices, rules] = await Promise.all([snapshot(), spotPrices(pair, meta, signal),
+      streams.spot('executionRules', { symbol: pair }, signal)]);
+    const entries = rows(row(rules.body, INVALID_LIMIT).symbolRules);
+    if (entries.length !== 1 || entries[0].symbol !== pair) fail(INVALID_LIMIT);
     const bands = rows(entries[0].rules, 16, true);
     if (bands.length > 1 || bands.some(rule => rule.ruleType !== 'PRICE_RANGE')) fail(INVALID_LIMIT);
     const band = bands[0], lower = band?.askLimitMultDown, upper = band?.askLimitMultUp;
-    const at = fresh(Math.min(depth.at, reference.at, rules.at, fresh(mark.timestamp, now())), now());
-    return { at, bids: bidLevels(depth.book.bids, lower === undefined ? 0n : ref * positive(lower),
-      upper === undefined ? undefined : ref * positive(upper)), ...limits(meta, ref, false) };
+    const at = fresh(Math.min(depth.at, prices.at, rules.at), now());
+    return { at, bids: bidLevels(depth.book.bids, prices.band === null || lower === undefined ? 0n : prices.band * positive(lower),
+      prices.band === null || upper === undefined ? undefined : prices.band * positive(upper)), ...limits(meta, prices.reference, false),
+      check() { prices.check(); depth.check(); rules.check(); } };
   }
-  async function perpLeg(pair: string, meta: Row, signal: AbortSignal): Promise<GateLeg> {
-    const query = '?symbol=' + encodeURIComponent(pair);
-    const [depth, reference] = await Promise.all([get(FUTURES + 'depth' + query + '&limit=' + LEVELS, signal),
-      get(FUTURES + 'premiumIndex' + query, signal)]);
+  async function perpLeg(pair: string, meta: Row, signal: AbortSignal): Promise<PricedLeg> {
+    const [depth, reference] = await Promise.all([streams.perpDepth(pair, LEVELS, signal), streams.mark(pair, signal)]);
     const book = row(depth.body, INVALID_BOOK), mark = row(reference.body, INVALID_LIMIT);
-    if (mark.symbol !== pair) fail(INVALID_LIMIT);
-    sequence(book.lastUpdateId);
+    if (mark.s !== pair || mark.e !== 'markPriceUpdate') fail(INVALID_LIMIT);
+    depthSequence(book.lastUpdateId);
     const changed = fresh(book.T, now()), sent = fresh(book.E, now());
     if (changed > sent) fail(INVALID_BOOK);
-    const ref = positive(mark.markPrice), band = nonNegative(meta.marketTakeBound);
+    const ref = positive(mark.p), band = nonNegative(meta.marketTakeBound);
     if (band >= ONE) fail(INVALID_LIMIT);
-    const at = fresh(Math.min(depth.at, reference.at, changed, fresh(mark.time, now())), now());
-    return { at, bids: bidLevels(book.bids, ref * (ONE - band)), ...limits(meta, ref, true) };
+    const at = fresh(Math.min(depth.at, changed, fresh(mark.E, now())), now());
+    return { at, bids: bidLevels(book.bids, ref * (ONE - band)), ...limits(meta, () => ref, true),
+      check() { depth.check(); reference.check(); } };
   }
   return {
+    close: streams.close,
     catalog: async signal => (await metadata(signal)).candidates,
     async read(input, signal, reuseMetadata = true) {
       signal.throwIfAborted();
@@ -248,22 +271,25 @@ export function createBinanceReader({ fetchImpl, now, spotDepthEvent = depthEven
         const asset = data.identities.get(input.chain + ':' + input.address.toLowerCase());
         if (!asset || input.symbol !== asset.candidate.symbol) fail('币安未能唯一匹配所选链、面额和合约地址');
         const pair = input.symbol + 'USDT';
-        async function leg(enabled: boolean, read: () => Promise<GateLeg>, missing: string): Promise<GateLeg> {
-          if (!enabled) return { error: missing };
-          try { return await read(); } catch (error) {
-            signal.throwIfAborted();
+        const [spot, perp] = await Promise.allSettled([
+          asset.spot && asset.deposit === true ? spotLeg(pair, asset.spot, life) : Promise.reject(new Error('币安未开放可核实的现货充值卖出路线')),
+          asset.perp ? perpLeg(pair, asset.perp, life) : Promise.reject(new Error('币安未开放同币 USDT 线性永续')),
+        ]);
+        signal.throwIfAborted();
+        if (now() >= data.expires) fail('币安网络或交易目录已过期');
+        function deliver(result: PromiseSettledResult<PricedLeg>): GateLeg {
+          try {
+            if (result.status === 'rejected') throw result.reason;
+            const { check, ...quote } = result.value;
+            check();
+            quote.at = fresh(Math.min(quote.at, data.depositAt), now());
+            return quote;
+          } catch (error) {
             if (isObject(error) && error.status === 429) return { error: '币安公开行情请求受限', rateLimited: true };
             return { error: error instanceof Error && error.message.includes('币安') ? error.message : '币安公开行情超时或不可用' };
           }
         }
-        const [spot, perp] = await Promise.all([
-          leg(!!asset.spot && asset.deposit === true, () => spotLeg(pair, asset.spot!, life), '币安未开放可核实的现货充值卖出路线'),
-          leg(!!asset.perp, () => perpLeg(pair, asset.perp!, life), '币安未开放同币 USDT 线性永续'),
-        ]);
-        signal.throwIfAborted();
-        if (now() >= data.expires) fail('币安网络或交易目录已过期');
-        for (const priced of [spot, perp]) if (!('error' in priced)) priced.at = Math.min(priced.at, data.depositAt);
-        return { deposit: asset.deposit, withdraw: asset.withdraw, minDeposit: asset.minDeposit, spot, perp };
+        return { deposit: asset.deposit, withdraw: asset.withdraw, minDeposit: asset.minDeposit, spot: deliver(spot), perp: deliver(perp) };
       } finally { stop.abort(); }
     },
   };

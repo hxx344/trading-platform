@@ -25,6 +25,7 @@ function newAccess(revision: string, permission: Permission, deniedAt = 0): Acce
   return { revision, data: new AbortController(), authorization: new AbortController(), permission, deniedAt, checks: 0 };
 }
 const generations = new WeakMap<Pick<Database, 'prepare'>, Map<string, Access>>();
+const binanceDenials = new WeakMap<Database, WeakSet<PositionsPermissionError>>();
 export function historyPermission(database: Pick<Database, 'prepare'> | null, account: string, revision: string): Permission {
   const entry = database && generations.get(database)?.get(account);
   return entry?.revision === revision ? entry.permission : 'unknown';
@@ -52,7 +53,17 @@ export function historyGeneration(database: DatabaseSource, account: string, rev
   const access = entry, { signal } = access.data, started = access.checks;
   const permissionCurrent = () => !!file && !access.authorization.signal.aborted && database() === file;
   const current = () => !signal.aborted && permissionCurrent();
-  const deny = () => { if (permissionCurrent()) invalidateHistory(file, account, revision, undefined, now()); };
+  const deny = (error?: PositionsPermissionError) => {
+    if (file && error && account === 'binance') {
+      // The same refusal may reach multiple waiters after a renewal. Apply it once, only to the same file and revision.
+      if (database() !== file || accounts.get(account)?.revision !== revision) return;
+      let processed = binanceDenials.get(file);
+      if (!processed) binanceDenials.set(file, processed = new WeakSet());
+      if (processed.has(error)) return;
+      processed.add(error);
+    } else if (!permissionCurrent()) return;
+    invalidateHistory(file, account, revision, undefined, now());
+  };
   const assertVerified = () => { if (!current() || access.permission !== 'verified') throw new Error(POSITIONS_FAILED); };
   async function verify(probe: (signal: AbortSignal) => Promise<void>) {
     if (!current()) throw new Error(POSITIONS_FAILED);
@@ -70,7 +81,7 @@ export function historyGeneration(database: DatabaseSource, account: string, rev
         access.permission = 'verified'; access.failed = false;
       }).catch(error => {
         access.failed = true;
-        if (error instanceof PositionsPermissionError) deny();
+        if (error instanceof PositionsPermissionError) deny(error);
         throw error;
       }).finally(() => { access.checks++; access.pending = undefined; });
     }

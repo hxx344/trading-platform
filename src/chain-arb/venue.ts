@@ -9,6 +9,7 @@ export type VenueFetch = (url: string, init: RequestInit) => Promise<Response>;
 export interface VenueReaderOptions { fetchImpl: VenueFetch; now: () => number }
 export interface VenueBook { deposit: boolean | null; withdraw: boolean | null; minDeposit?: string; spot: GateLeg; perp: GateLeg }
 export interface VenueReader {
+  close?(): void;
   catalog(signal: AbortSignal): Promise<ScanCandidate[]>;
   read(input: ChainArbInput, signal: AbortSignal, reuseMetadata?: boolean): Promise<VenueBook>;
 }

@@ -1,4 +1,4 @@
-import { CHAIN_ARB_MAX_IMPACT_BPS, CHAIN_ARB_TTL_MS, isChainArbVenue, parseChainArbBudget, type Chain, type ChainArbVenue, type DepositVenue } from './model.ts';
+import { CHAIN_ARB_MAX_IMPACT_BPS, CHAIN_ARB_TTL_MS, isChainArbVenue, isDepositVenue, parseChainArbBudget, type Chain, type ChainArbVenue, type DepositVenue } from './model.ts';
 import { isObject } from '../contracts.ts';
 
 export const SCAN_HISTORY_MS = 5 * 60_000;
@@ -13,7 +13,7 @@ export function isVerifiedExecution(value: unknown): value is ScanExecution {
 type DepositExecution = ScanExecution & { depositVenue: DepositVenue; depositExpiresAt: number };
 export function isDepositExecution(value: unknown, venue: ChainArbVenue | undefined): value is DepositExecution {
   const expected = venue ?? 'gate';
-  return (expected === 'gate' || expected === 'okx') && isVerifiedExecution(value) && value.depositVenue === expected
+  return isDepositVenue(expected) && isVerifiedExecution(value) && value.depositVenue === expected
     && typeof value.depositExpiresAt === 'number' && Number.isSafeInteger(value.depositExpiresAt) && value.depositExpiresAt > 0;
 }
 

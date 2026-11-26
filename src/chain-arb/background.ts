@@ -7,7 +7,7 @@ import type { AlertHooks } from '../monitor/alerts.ts';
 import type { MarketControl } from '../monitor/control.ts';
 import type { MonitorStore } from '../monitor/store.ts';
 import { DEFAULT_BACKGROUND_SETTINGS, parseBackgroundSettings, type BackgroundSettings, type BackgroundView } from './background-model.ts';
-import { CHAIN_ARB_TTL_MS, VENUE_NAMES, isGateBaseSymbol, type ChainArbVenue } from './model.ts';
+import { CHAIN_ARB_TTL_MS, VENUE_NAMES, isDepositVenue, isGateBaseSymbol, type ChainArbVenue } from './model.ts';
 import { isDepositRow, SCAN_HISTORY_MS, type ScanRow, type ScanView } from './scan-model.ts';
 
 const SETTINGS_KEY = 'chainArb.background';
@@ -22,6 +22,7 @@ interface Options {
   hooks?: Pick<AlertHooks, 'robot' | 'notifyRepeating'>;
   okxResultCurrent?: (view: ScanView) => boolean;
   gateResultCurrent?: (row: ScanRow) => boolean;
+  binanceResultCurrent?: (row: ScanRow) => boolean;
   okxDepositResultCurrent?: (row: ScanRow) => boolean;
   now?: () => number;
 }
@@ -69,7 +70,7 @@ function notifyMessage(venue: ChainArbVenue, row: ScanRow, settings: BackgroundS
     '报价有效至 ' + new Date(row.expiresAt).toISOString() + '，过期请在平台重新复核。'].join('\n');
 }
 
-export function createChainArbBackground({ store, scan, control, hooks, okxResultCurrent, gateResultCurrent, okxDepositResultCurrent, now = Date.now }: Options) {
+export function createChainArbBackground({ store, scan, control, hooks, okxResultCurrent, gateResultCurrent, binanceResultCurrent, okxDepositResultCurrent, now = Date.now }: Options) {
   let settings = DEFAULT_BACKGROUND_SETTINGS, revision = 0, loadError: string | null = null;
   try {
     const entry = store.readState(SETTINGS_KEY);
@@ -97,9 +98,10 @@ export function createChainArbBackground({ store, scan, control, hooks, okxResul
     if (market.revision !== marketRevision) { marketRevision = market.revision; reset(); }
     return market.enabled;
   }
+  const currentProof = { gate: gateResultCurrent, binance: binanceResultCurrent, okx: okxDepositResultCurrent };
   function hasDepositEvidence(row: ScanRow) {
     const venue = row.venue ?? 'gate';
-    return isDepositRow(row) && (venue === 'gate' ? gateResultCurrent?.(row) : okxDepositResultCurrent?.(row))
+    return isDepositVenue(venue) && isDepositRow(row) && currentProof[venue]?.(row)
       && row.execution.depositExpiresAt > now();
   }
   function view(): BackgroundView {
@@ -174,7 +176,7 @@ export function createChainArbBackground({ store, scan, control, hooks, okxResul
       if (!current()) return;
       const previous = results.get(venue);
       const failure = failedSnapshot(now(), signal.aborted ? '后台行情读取超时，稍后重试' : reason(error));
-      results.set(venue, venue !== 'okx' && venue !== 'gate' && previous ? { ...failure,
+      results.set(venue, !isDepositVenue(venue) && previous ? { ...failure,
         cycle: previous.cycle, total: previous.total, checked: previous.checked, failed: previous.failed,
         history: [...previous.rows, ...previous.history] } : failure);
     } finally {

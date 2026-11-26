@@ -283,7 +283,7 @@ export async function refresh(ctx: SyncContext, refreshPositions?: () => Promise
       if (!asset) throw new Error(exchange in DATED ? DATED[exchange as DatedSource].missing : '未找到交易所资产，请更新连接');
       outcome = { ...(await read(row, asset)), at: ctx.now() };
     } catch (error) {
-      if (error instanceof PositionsPermissionError && permission && storedConnection(database, exchange)?.encrypted === row.encrypted) permission.deny();
+      if (error instanceof PositionsPermissionError && permission && storedConnection(database, exchange)?.encrypted === row.encrypted) permission.deny(error);
       outcome = { error: failure(error) };
     }
     const connection = ledger.connections[exchange];

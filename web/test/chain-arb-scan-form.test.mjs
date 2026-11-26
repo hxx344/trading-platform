@@ -143,16 +143,37 @@ test('跨所榜单使用各快照生成时间和本次 GET 往返耗时，单所
   assert.deepEqual(backgroundBands(result, true, 100 + SCAN_HISTORY_MS).history, []);
 });
 
+test('Binance 两条路线按净收益率与其他所合并排序，阈值仅用于提醒，地址证明失效即撤下两条路线', () => {
+  const settings = { ...DEFAULT_BACKGROUND_SETTINGS, enabled: true, thresholdBps: 100 };
+  const spot = row('ABC', { venue: 'binance', kind: 'spot', netBps: 100, netUsdt: 10, expiresAt: source + 2_000 });
+  const perp = row('ABC', { venue: 'binance', kind: 'perp', netBps: 125, netUsdt: 12.5, expiresAt: spot.expiresAt });
+  spot.execution.depositExpiresAt = spot.expiresAt;
+  perp.execution.depositExpiresAt = perp.expiresAt;
+  const gate = row('XYZ', { netBps: 110, netUsdt: 11 });
+  const unverified = { ...spot, execution: { ...spot.execution, depositVenue: undefined } };
+  const wrongVenue = { ...perp, execution: { ...perp.execution, depositVenue: 'okx' } };
+  const sample = { startedAt: 50, view: { settings, results: {
+    gate: view([gate]), binance: view([spot, wrongVenue, perp, unverified], [wrongVenue, unverified]),
+  } } };
+  const current = backgroundBands(sample, false, 50);
+  assert.deepEqual(current.live, [perp, gate, spot]);
+  assert.deepEqual(current.history, []);
+  assert.equal(current.nextDeadline, 2_050);
+  const expired = backgroundBands(sample, false, current.nextDeadline);
+  assert.deepEqual(expired.live, [gate]);
+  assert.deepEqual(expired.history, []);
+});
+
 test('从单行复核只传已保存的预算、路线成本和该所费率，不混入飞书或后台参数', () => {
   const settings = { ...DEFAULT_BACKGROUND_SETTINGS, amount: '212', spotCosts: '1.25', perpCosts: '2',
-    fees: { bitget: { spotFeeBps: '7.5', perpFeeBps: '2' }, okx: { spotFeeBps: '9', perpFeeBps: '4' } } };
+    fees: { binance: { spotFeeBps: '8', perpFeeBps: '3.5' }, bitget: { spotFeeBps: '7.5', perpFeeBps: '2' }, okx: { spotFeeBps: '9', perpFeeBps: '4' } } };
   const withOkx = saveBackgroundDraft({ ...backgroundDraft(settings), venues: ['okx', 'binance', 'bitget'] });
   assert.deepEqual(withOkx.venues, ['binance', 'bitget', 'okx']);
   assert.deepEqual(saveBackgroundDraft(backgroundDraft(withOkx)), withOkx);
   for (const venue of withOkx.venues) {
     const form = venueScanForm(settings, venue);
     assert.deepEqual(Object.keys(form).sort(), Object.keys(initialScanForm).sort());
-    assert.equal(form.spotFeeBps, { binance: '10', bitget: '7.5', okx: '9' }[venue]);
+    assert.equal(form.spotFeeBps, { binance: '8', bitget: '7.5', okx: '9' }[venue]);
     const review = reviewScanRow(form, row('ABC', { venue }));
     const query = chainArbQuery(review.form, review.autoGas).input;
     assert.equal(query.venue, venue);

@@ -7,7 +7,7 @@ import { createBinanceReader } from './binance.ts';
 import { createBitgetReader } from './bitget.ts';
 import type { VenueReader } from './venue.ts';
 import { compareChainArb } from './estimate.ts';
-import { parseChainArb, VENUE_NAMES, type ChainArbVenue, type DepositVenue, type ChainArbView } from './model.ts';
+import { isDepositVenue, parseChainArb, VENUE_NAMES, type ChainArbVenue, type DepositVenue, type ChainArbView } from './model.ts';
 import { parseChainArbScan } from './scan-model.ts';
 import { createScanCatalog } from './catalog.ts';
 import { createChainArbScanner } from './scan.ts';
@@ -16,13 +16,14 @@ import { createOkxReader } from './okx.ts';
 import { assertOkxDirectory, type OkxDirectory } from './okx-network.ts';
 
 // The single-token view and the scanner share the same public sources, metadata cache and request budget.
-export function createChainArbMarket({ fetchImpl = fetch, now = Date.now, venueReaders }: {
-  fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; now?: () => number; venueReaders?: Record<Exclude<ChainArbVenue, 'okx'>, VenueReader>;
+export function createChainArbMarket({ fetchImpl = fetch, now = Date.now, venueReaders, WebSocketImpl }: {
+  fetchImpl?: (url: string, init: RequestInit) => Promise<Response>; now?: () => number; WebSocketImpl?: typeof WebSocket;
+  venueReaders?: Record<Exclude<ChainArbVenue, 'okx'>, VenueReader>;
 } = {}) {
   const options = { fetchImpl, now };
   const readers = venueReaders ?? {
     gate: { read: createGateReader({ fetcher: fetchImpl, clock: now }), catalog: createScanCatalog(options) },
-    binance: createBinanceReader(options), bitget: createBitgetReader(options),
+    binance: createBinanceReader({ ...options, ...(WebSocketImpl ? { binanceSocket: (url: string) => new WebSocketImpl(url) } : {}) }), bitget: createBitgetReader(options),
   };
   const acquire = createQuoteBudget(now), closing = new AbortController();
   async function quote(raw: unknown, signal: AbortSignal, scanning: boolean, reader: VenueReader): Promise<ChainArbView> {
@@ -86,7 +87,7 @@ export function createChainArbMarket({ fetchImpl = fetch, now = Date.now, venueR
     },
     async chainArbBook(raw: unknown, signal: AbortSignal, directory?: OkxDirectory, scanning = false) {
       const input = parseChainArb(raw), name = input.venue ?? 'gate';
-      if (name !== 'gate' && name !== 'okx') throw new Error('该场所尚未接入实际充值地址');
+      if (!isDepositVenue(name)) throw new Error('该场所尚未接入实际充值地址');
       const reader = market(name, directory).reader;
       const [book, catalog] = await Promise.all([reader.read(input, signal, scanning), reader.catalog(signal)]);
       const allowed = catalog.find(c => c.chain === input.chain && c.symbol === input.symbol && c.address === input.address);
@@ -101,5 +102,11 @@ export function createChainArbMarket({ fetchImpl = fetch, now = Date.now, venueR
       const input = parseChainArbScan(raw);
       return market(input.venue, proof).scan.read(input, scope, signal, awaitBatch);
     },
-    closeChainArb() { closing.abort(); okx?.scan.close(); for (const entry of Object.values(markets)) entry.scan.close(); } };
+    closeChainArb() {
+      closing.abort(); okx?.scan.close();
+      for (const entry of Object.values(markets)) {
+        entry.scan.close();
+        entry.reader.close?.();
+      }
+    } };
 }

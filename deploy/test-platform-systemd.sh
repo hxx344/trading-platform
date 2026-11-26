@@ -309,7 +309,7 @@ for recipient in "$dex:$dex-ipc:/run/trading-platform/execution.sock" "$dex:$dex
     s.on("error", e => { if (e.code !== "EACCES") process.exitCode = 1; });' "$socket"
 done
 dex_probe "$app/dex"
-# Venue accounts for DEX live trading (docs/dexspread.md 12.4): root keeps the file, systemd hands its content to the
+# Venue accounts for DEX live trading (docs/dexspread.md 12.13): root keeps the file, systemd hands its content to the
 # service at start, the service account can see the file but not read it, and only the DEX service restarts.
 executor_before=$(pid "$service"); dex_before=$(pid "$dex")
 printf '%s\n\n%s\n' 7654321 0x00000000000000000000000000000000000E0E0E |

@@ -1,5 +1,6 @@
-// DEX 价差实盘的场所账户（docs/dexspread.md 第 12.4 节）。文件由 root 持有（0600），服务账户读不到内容：
-// systemd 以 EnvironmentFile 把它交给 DEX 服务，服务启动时取走并从环境里删掉。服务只能看到这个文件在不在、变没变，
+// DEX 价差实盘的场所账户（docs/dexspread.md 第 12.13 节）。文件由 root 持有（0600），服务账户打不开：
+// systemd 以 EnvironmentFile 把它交给 DEX 服务，服务启动时取走并从环境里删掉（子进程不再继承；但启动时的环境块仍在
+// /proc/<pid>/environ，同账户的进程读得到，所以这条通道只能放账户编号与地址，放私钥之前必须换投递方式）。服务只能看到这个文件在不在、变没变，
 // 文件被删除或改过之后（吊销、换账户）不再使用启动时拿到的内容，等安装脚本重启（L207）。
 // 这一版只有账户编号与地址；私钥在下单连接器接入时加进同一个文件。
 import { statSync } from 'node:fs';
@@ -87,35 +88,41 @@ export function decodeDexKeysFile(text: string): DexAccounts {
  * 启动时从环境里取走场所账户并删掉这个变量：之后启动的子进程（Var 询价的传输脚本）拿不到它。
  * 没有这个变量就是没有配置；内容无效时不使用，只报告问题。
  */
-export function takeDexKeys(env: NodeJS.ProcessEnv): { accounts: DexAccounts; present: boolean; problem: string | null } {
+export interface TakenDexKeys { accounts: DexAccounts; present: boolean; problem: string | null; /** 录入助手写出这份内容时文件应有的字节数。 */ fileSize?: number }
+export function takeDexKeys(env: NodeJS.ProcessEnv): TakenDexKeys {
   const value = env[DEX_KEYS_ENV];
   delete env[DEX_KEYS_ENV];
   if (value === undefined || value === '') return { accounts: {}, present: false, problem: null };
-  try { return { accounts: decodeDexKeysValue(value), present: true, problem: null }; }
-  catch (error) { return { accounts: {}, present: true, problem: error instanceof Error ? error.message : '场所账户无效' }; }
+  const fileSize = Buffer.byteLength(`${DEX_KEYS_ENV}=${value}\n`);
+  try { return { accounts: decodeDexKeysValue(value), present: true, problem: null, fileSize }; }
+  catch (error) { return { accounts: {}, present: true, problem: error instanceof Error ? error.message : '场所账户无效', fileSize }; }
 }
 
-type FileMark = { ino: number; size: number; mtimeMs: number } | null;
-type StatLike = (path: string) => { ino: number; size: number; mtimeMs: number; isFile(): boolean };
+type FileMark = { ino: number; size: number; mtimeMs: number; ctimeMs: number } | null;
+type StatLike = (path: string) => { ino: number; size: number; mtimeMs: number; ctimeMs: number; isFile(): boolean };
 
 /**
  * 启动时取到的账户只在文件原样还在时可用。每次取用都重新看一眼文件（L207）：不在了就是已吊销，变了就是换过内容，
  * 两种情况都不再用内存里的旧值，等安装脚本重启服务后读新的。启动时文件就看不到（或环境里有值而文件不在）同样不用。
+ * 比较项含 ctime：原地改写后把 mtime 改回去也瞒不过。启动时文件的大小要与拿到的内容对得上：systemd 读完文件到
+ * 本进程第一次看文件之间被换成别的内容时，不把换过的文件当基准。这段空隙里换成等长内容的情形挡不住（docs/dexspread.md 12.13）。
  */
-export function guardedAccounts(taken: { accounts: DexAccounts; present: boolean; problem: string | null }, file: string | null, stat: StatLike = statSync): DexAccountsSource {
+export function guardedAccounts(taken: TakenDexKeys, file: string | null, stat: StatLike = statSync): DexAccountsSource {
   const mark = (): FileMark => {
     if (file === null) return null;
-    try { const info = stat(file); return info.isFile() ? { ino: info.ino, size: info.size, mtimeMs: info.mtimeMs } : null; } catch { return null; }
+    try { const info = stat(file); return info.isFile() ? { ino: info.ino, size: info.size, mtimeMs: info.mtimeMs, ctimeMs: info.ctimeMs } : null; } catch { return null; }
   };
   const initial = mark();
   const none: DexAccounts = {};
+  const changed = '场所账户文件已更换，等 DEX 价差服务重启后生效';
   return () => {
-    if (!taken.present) return { accounts: none, problem: null };
+    if (!taken.present) return { accounts: none, problem: mark() === null ? null : '场所账户文件已写入，等 DEX 价差服务重启后生效' };
     if (taken.problem) return { accounts: none, problem: `场所账户文件无效：${taken.problem}` };
     if (file === null || initial === null) return { accounts: none, problem: '启动时看不到场所账户文件，未使用其中的账户' };
+    if (taken.fileSize !== undefined && initial.size !== taken.fileSize) return { accounts: none, problem: changed };
     const current = mark();
     if (current === null) return { accounts: none, problem: '场所账户文件已删除，已停止使用其中的账户' };
-    if (current.ino !== initial.ino || current.size !== initial.size || current.mtimeMs !== initial.mtimeMs) return { accounts: none, problem: '场所账户文件已更换，等 DEX 价差服务重启后生效' };
+    if (current.ino !== initial.ino || current.size !== initial.size || current.mtimeMs !== initial.mtimeMs || current.ctimeMs !== initial.ctimeMs) return { accounts: none, problem: changed };
     return { accounts: taken.accounts, problem: null };
   };
 }

@@ -10,8 +10,9 @@ Type=simple
 User=trading-platform-dex
 Group=trading-platform-dex-ipc
 EnvironmentFile=-@APP_DIR@/dex.env
-# Venue accounts for live trading (docs/dexspread.md 12.4): root-owned 0600, so only systemd reads the content; the
-# service can merely see whether the file is still the one it was started with.
+# Venue accounts for live trading (docs/dexspread.md 12.13): root-owned 0600, so only systemd opens the file; the
+# service can merely see whether it is still the one it was started with. The content stays in /proc/<pid>/environ for
+# processes of this account, so it holds account identifiers only; private keys must not be delivered this way.
 EnvironmentFile=-@DEX_CONF_DIR@/keys.env
 WorkingDirectory=@APP_DIR@/dex
 RuntimeDirectory=trading-platform-dex

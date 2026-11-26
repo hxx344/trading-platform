@@ -44,7 +44,7 @@
 #                                             脚本化时加 --mev-stdin，从标准输入读这三行（发送用节点地址填 - 表示去掉）。
 #                                             开启后是观察模式，实盘在页面上核对后手动开始；沿用当前已装版本、不联网升级（已装版本不带本模块时先升级到最新版）
 #   sudo bash install.sh --unset-mev          关闭 MEV 套利并去掉节点地址与热钱包私钥（回退到不含该模块的版本前须先执行）；不换版本、不联网
-#   sudo bash install.sh --set-dex-keys       录入或修改 DEX 价差实盘的场所账户（docs/dexspread.md 第 12.4 节）：依次询问 Lighter 主网账户编号、
+#   sudo bash install.sh --set-dex-keys       录入或修改 DEX 价差实盘的场所账户（docs/dexspread.md 第 12.13 节）：依次询问 Lighter 主网账户编号、
 #                                             Lighter RH 账户编号、Entropy 账户地址，都不回显、不进命令行；留空沿用已保存的值，填 - 去掉那个场所。
 #                                             脚本化时加 --dex-keys-stdin，从标准输入读这三行。这一版只读账户的保证金与持仓，不下单；
 #                                             沿用当前已装版本、不联网升级（已装版本不带这项时先升级到最新版），随后只重启 DEX 价差服务
@@ -81,7 +81,7 @@ KEEP_RELEASES=3
 HEALTH_WAIT_S=90
 APP_DIR=${TP_APP_DIR:-/opt/trading-platform}
 CONF_DIR=${TP_CONF_DIR:-/etc/trading-platform}
-# Venue accounts for DEX live trading (docs/dexspread.md 12.4). Root owns the directory and the file (0600): systemd
+# Venue accounts for DEX live trading (docs/dexspread.md 12.13). Root owns the directory and the file (0600): systemd
 # hands the content to the DEX service as an EnvironmentFile, the service account can only see that the file exists.
 DEX_CONF_DIR=${TP_DEX_CONF_DIR:-/etc/trading-platform-dex}
 DEX_KEYS_FILE=$DEX_CONF_DIR/keys.env
@@ -687,7 +687,7 @@ if ((mev_change)); then
   fi
   mev_input=''
 fi
-# Venue accounts for DEX live trading (docs/dexspread.md 12.4). The file lives in a root-owned directory the service
+# Venue accounts for DEX live trading (docs/dexspread.md 12.13). The file lives in a root-owned directory the service
 # account cannot write, so root may write it by path (L201). Its digest is part of the DEX component key below, so a
 # change restarts only the DEX service.
 if ((dex_keys_change)); then

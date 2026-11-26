@@ -150,16 +150,17 @@ interface DepthEntry { leg: LegInfo; snapshot: DepthSnapshot | null; error: stri
 export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now = Date.now, log = () => {}, quoter, accounts: accountSource = () => ({ accounts: {}, problem: null }) }: EngineOptions) {
   /** 各场所账户最近一次读取：成功时 at 与 snapshot 一起更新；失败只记 error，旧快照留着但过了时限不算数。 */
   const accountReads = new Map<KeyVenue, { at: number | null; snapshot: AccountSnapshot | null; error: string | null }>();
-  async function refreshAccounts(signal: AbortSignal): Promise<void> {
+  /** 各场所并行读、各用各的时限：一个场所不应答不拖累另外两个，也不让它们带着已中止的信号发出去。 */
+  async function refreshAccounts(signalFor: () => AbortSignal): Promise<void> {
     const { accounts, problem } = accountSource();
     const venues = problem ? [] : configuredVenues(accounts);
     for (const venue of [...accountReads.keys()]) if (!venues.includes(venue)) accountReads.delete(venue);
-    for (const venue of venues) {
+    await Promise.all(venues.map(async venue => {
       const entry = accountReads.get(venue) ?? { at: null, snapshot: null, error: null };
       accountReads.set(venue, entry);
-      try { entry.snapshot = await fetchAccount(fetchImpl, signal, venue, accounts); entry.at = now(); entry.error = null; }
+      try { entry.snapshot = await fetchAccount(fetchImpl, signalFor(), venue, accounts); entry.at = now(); entry.error = null; }
       catch (error) { entry.error = message(error); }
-    }
+    }));
   }
   const open = connect ?? (url => new WebSocket(url) as unknown as ReturnType<Connect>);
   const migrated = store.migrateLegacy(now(), LEGACY_UPGRADE);
@@ -1026,9 +1027,11 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     const needed = (liveRows.length ? [...new Set(liveRows.flatMap(row => [row.a.venue, row.b.venue]))] : [...KEY_VENUES]) as KeyVenue[];
     const keys = accountSource(), have = keys.problem ? [] : configuredVenues(keys.accounts), missing = needed.filter(venue => !have.includes(venue));
     const names = (venues: KeyVenue[]) => venues.map(venue => VENUE_NAMES[venue]).join('、');
-    items.push({ key: 'accounts', status: keys.problem ? 'warn' : !have.length ? 'todo' : missing.length ? 'warn' : 'ok', label: '场所账户',
+    // 录入了但读不到（编号填错、账户不存在、接口不通）不算就绪：最近一次读取失败且没有时限内的读数。
+    const unread = have.filter(venue => { const read = accountReads.get(venue); return !!read?.error && !(read.at !== null && time - read.at <= ACCOUNT_STALE_MS); });
+    items.push({ key: 'accounts', status: keys.problem ? 'warn' : !have.length ? 'todo' : missing.length || unread.length ? 'warn' : 'ok', label: '场所账户',
       detail: keys.problem ? keys.problem : !have.length ? '还没有录入：在服务器上执行 sudo bash install.sh --set-dex-keys，依次填 Lighter 主网账户编号、Lighter RH 账户编号、Entropy 账户地址（不回显，可留空）'
-        : `已录入 ${names(have)}${missing.length ? `；还缺 ${names(missing)}` : ''}` });
+        : `已录入 ${names(have)}${missing.length ? `；还缺 ${names(missing)}` : ''}${unread.length ? `；读不到 ${names(unread)}（核对录入的账户，原因见账户资金一项）` : ''}` });
     items.push({ key: 'lighter_order', status: 'todo', label: '行情流场所的下单连接器', detail: `Lighter RH 链与主网是两套账户：各需 API 密钥编号与私钥，以及签名器；Entropy（Hyperliquid）需 API 钱包与签名；${orderVenues.length ? `已启用配对用到 ${orderVenues.join('、')}；` : ''}带 Var 腿的配对不上实盘；尚未接入` });
     if (enabledVar || !enabled.length) items.push({ key: 'var_order', status: 'todo', label: 'Var 下单接口', detail: 'Var 没有公开交易接口；询价已可用 token 读取（各类标的的写法以实盘准备页的询价状态为准），成交接口尚未确认、尚未接入' });
     if (!have.length) items.push({ key: 'funding', status: 'todo', label: '两边账户资金', detail: `每个用到的场所各需保证金（Lighter 与 Entropy 用 USDC，Lighter RH 用 USDG）；录入场所账户后这里显示各场所的余额，每个场所可用余额至少 ${READY_FUNDING_USD} 才算就绪` });
@@ -1096,7 +1099,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
             background('var', () => pollVar(request()).catch(error => { varSource.error = message(error); }));
           }
           // 没有配置账户时这一轮不发任何请求。
-          if (time >= nextAccounts && !busy.has('accounts')) { nextAccounts = time + ACCOUNT_POLL_MS; background('accounts', () => refreshAccounts(request())); }
+          if (time >= nextAccounts && !busy.has('accounts')) { nextAccounts = time + ACCOUNT_POLL_MS; background('accounts', () => refreshAccounts(request)); }
           if (time >= nextLive) { nextLive = time + LIVE_TICK_MS; try { sampleLive(); } catch (error) { log(`varlighter: 行情流配对采样失败：${message(error)}`); } }
           if (time >= nextPrune) { nextPrune = time + PRUNE_MS; try { await pruneSamples(time, () => context.stopped()); } catch (error) { log(`varlighter: 清理样本失败：${message(error)}`); } }
           await context.pause(1_000);

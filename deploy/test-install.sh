@@ -118,7 +118,7 @@ check '写 varLighter: false 后重新安装去掉 DEX 价差单元、链接与�
 set_var_lighter on
 run --package "$tmp/a" && status=0 || status=$?
 check '去掉 varLighter: false 后重新安装恢复 DEX 价差单元' '[[ $status -eq 0 && -f "$tmp/trading-platform-dex.service" && -L "$TP_APP_DIR/dex" && -f "$TP_APP_DIR/.deployment/dex" ]]'
-# Venue accounts for DEX live trading (docs/dexspread.md 12.4): three hidden lines, a root-only file outside the
+# Venue accounts for DEX live trading (docs/dexspread.md 12.13): three hidden lines, a root-only file outside the
 # service's directories, never echoed; a change moves only the DEX component key, removal needs nothing from the release.
 dex_account=7654321
 dex_address=0x00000000000000000000000000000000000E0E0E

@@ -24,9 +24,11 @@ export function parseLighterAccount(value: unknown, accountIndex: number): Accou
   if (!Array.isArray(account.positions)) throw new Error('账户应答缺少持仓');
   const positions: AccountPosition[] = [];
   for (const item of account.positions as unknown[]) {
-    if (!isRecord(item) || typeof item.symbol !== 'string' || (item.sign !== 1 && item.sign !== -1)) throw new Error('账户应答的持仓格式无效');
+    if (!isRecord(item) || typeof item.symbol !== 'string') throw new Error('账户应答的持仓格式无效');
     const size = amount(item.position, '持仓数量');
+    // 空仓条目先跳过再看方向：已平仓市场的 sign 取值没有在真实账户上核对过。
     if (size === 0) continue;
+    if (item.sign !== 1 && item.sign !== -1) throw new Error('账户应答的持仓格式无效');
     positions.push({ symbol: item.symbol.slice(0, 40), size: item.sign * Math.abs(size), valueUsd: Math.abs(amount(item.position_value, '持仓市值')) });
   }
   return { collateral: amount(account.collateral, '保证金'), available: amount(account.available_balance, '可用余额'), positions };

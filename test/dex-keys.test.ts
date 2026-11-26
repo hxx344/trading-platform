@@ -33,7 +33,7 @@ test('场所账户：编码往返、严格解析、地址统一成小写', () =>
 
 test('启动时取走环境里的场所账户并删掉变量；内容无效时不使用', () => {
   const env: NodeJS.ProcessEnv = { [DEX_KEYS_ENV]: encodeDexKeys(ALL).trim().slice(DEX_KEYS_ENV.length + 1), OTHER: '1' };
-  assert.deepEqual(takeDexKeys(env), { accounts: ALL, present: true, problem: null });
+  assert.deepEqual(takeDexKeys(env), { accounts: ALL, present: true, problem: null, fileSize: Buffer.byteLength(encodeDexKeys(ALL)) });
   assert.deepEqual(env, { OTHER: '1' }, '子进程拿不到');
   assert.deepEqual(takeDexKeys({}), { accounts: {}, present: false, problem: null });
   const bad: NodeJS.ProcessEnv = { [DEX_KEYS_ENV]: 'not base64 json' };
@@ -43,15 +43,17 @@ test('启动时取走环境里的场所账户并删掉变量；内容无效时�
 
 test('文件被删除或更换后不再使用启动时拿到的账户（L207）', () => {
   const taken = { accounts: ALL, present: true, problem: null };
-  type Mark = { ino: number; size: number; mtimeMs: number; file?: boolean } | null;
+  type Mark = { ino: number; size: number; mtimeMs: number; ctimeMs?: number; file?: boolean } | null;
   let mark: Mark = { ino: 7, size: 100, mtimeMs: 5 };
-  const stat = () => { if (!mark) throw new Error('ENOENT'); const now = mark; return { ...now, isFile: () => now.file !== false }; };
+  const stat = () => { if (!mark) throw new Error('ENOENT'); const now = mark; return { ctimeMs: 5, ...now, isFile: () => now.file !== false }; };
   const source = guardedAccounts(taken, '/etc/x/keys.env', stat);
   assert.deepEqual(source(), { accounts: ALL, problem: null });
   mark = { ino: 7, size: 100, mtimeMs: 6 };
   assert.deepEqual([source().accounts, /已更换/.test(source().problem!)], [{}, true], '内容改过');
   mark = { ino: 8, size: 100, mtimeMs: 5 };
   assert.match(source().problem!, /已更换/, '换了文件');
+  mark = { ino: 7, size: 100, mtimeMs: 5, ctimeMs: 6 };
+  assert.match(source().problem!, /已更换/, '原地改写后把修改时间改回去：ctime 变了');
   mark = null;
   assert.deepEqual([source().accounts, /已删除/.test(source().problem!)], [{}, true]);
   mark = { ino: 7, size: 100, mtimeMs: 5 };
@@ -62,6 +64,12 @@ test('文件被删除或更换后不再使用启动时拿到的账户（L207）'
   mark = { ino: 7, size: 100, mtimeMs: 5, file: false };
   assert.match(guardedAccounts(taken, '/etc/x/keys.env', stat)().problem!, /启动时看不到/);
   assert.match(guardedAccounts(taken, null, stat)().problem!, /启动时看不到/);
+  // 启动时文件的大小与拿到的内容对不上：systemd 读完之后、本进程看文件之前被换过，不把换过的文件当基准。
+  mark = { ino: 7, size: 100, mtimeMs: 5 };
+  assert.match(guardedAccounts({ ...taken, fileSize: 99 }, '/etc/x/keys.env', stat)().problem!, /已更换/);
+  assert.deepEqual(guardedAccounts({ ...taken, fileSize: 100 }, '/etc/x/keys.env', stat)(), { accounts: ALL, problem: null });
+  // 环境里没有值而文件在：录入后服务还没重启。
+  assert.match(guardedAccounts({ accounts: {}, present: false, problem: null }, '/etc/x/keys.env', stat)().problem!, /已写入，等 DEX 价差服务重启/);
   // 没有配置不算问题；内容无效时报告原因。
   assert.deepEqual(guardedAccounts({ accounts: {}, present: false, problem: null }, null, stat)(), { accounts: {}, problem: null });
   assert.match(guardedAccounts({ accounts: {}, present: true, problem: '场所账户的编码无效' }, '/etc/x/keys.env', stat)().problem!, /场所账户文件无效：场所账户的编码无效/);
@@ -135,6 +143,7 @@ test('账户应答解析：只留非零持仓，账户身份对不上或缺字�
   assert.throws(() => parseLighterAccount(lighterAnswer(1, { positions: null }), 1), /缺少持仓/);
   assert.throws(() => parseLighterAccount(lighterAnswer(1, { positions: [{ symbol: 'X', sign: 0, position: '1', position_value: '1' }] }), 1), /持仓格式无效/);
   assert.deepEqual(parseEntropyAccount(entropyAnswer()), { collateral: 120.5, available: 80, positions: [{ symbol: 'io:NVDA', size: -0.3, valueUsd: 52.5 }] });
+  assert.deepEqual(parseLighterAccount(lighterAnswer(1, { positions: [{ symbol: 'X', sign: 0, position: '0', position_value: '0' }] }), 1).positions, [], '空仓条目不看方向');
   assert.throws(() => parseEntropyAccount({ assetPositions: [] }), /格式无效/);
   assert.throws(() => parseEntropyAccount({ ...entropyAnswer(), withdrawable: 'x' }), /缺少可用余额/);
   assert.throws(() => parseEntropyAccount({ ...entropyAnswer(), assetPositions: [{ position: null }] }), /持仓格式无效/);
@@ -178,7 +187,7 @@ test('实盘准备页：没有录入时待接入；录入后显示各场所余�
   const signal = new AbortController().signal;
   const item = (key: string) => engine.views.readiness().items.find(entry => entry.key === key)!;
 
-  await engine.refreshAccounts(signal);
+  await engine.refreshAccounts(() => signal);
   assert.equal(requests.length, 0, '没有配置账户时不发请求');
   assert.equal(item('accounts').status, 'todo');
   assert.match(item('accounts').detail, /--set-dex-keys/);
@@ -192,7 +201,7 @@ test('实盘准备页：没有录入时待接入；录入后显示各场所余�
   assert.deepEqual([item('accounts').status, item('accounts').detail], ['warn', '已录入 Lighter、Entropy；还缺 Lighter RH']);
   assert.equal(item('funding').status, 'warn');
   assert.match(item('funding').detail, /Lighter 还没有读到；Entropy 还没有读到/);
-  await engine.refreshAccounts(signal);
+  await engine.refreshAccounts(() => signal);
   assert.equal(requests.length, 2);
   assert.match(item('funding').detail, /^Lighter 可用 250\.50、权益 300\.25 USDC，持仓 1 个；Entropy 可用 80\.00、权益 120\.50 USDC，持仓 1 个；可用余额至少 100 才算就绪，未达到：Lighter RH、Entropy$/);
   const text = JSON.stringify(engine.views.readiness());
@@ -201,7 +210,7 @@ test('实盘准备页：没有录入时待接入；录入后显示各场所余�
   // 三个场所都录入、余额都够。
   state = { accounts: ALL, problem: null };
   entropyAvailable = String(READY_FUNDING_USD);
-  await engine.refreshAccounts(signal);
+  await engine.refreshAccounts(() => signal);
   assert.deepEqual([item('accounts').status, item('accounts').detail], ['ok', '已录入 Lighter、Lighter RH、Entropy']);
   assert.equal(item('funding').status, 'ok');
   assert.match(item('funding').detail, /Lighter RH 可用 250\.50、权益 300\.25 USDG/);
@@ -209,21 +218,37 @@ test('实盘准备页：没有录入时待接入；录入后显示各场所余�
   // 读取失败：旧读数在时限内仍算数，过了时限不算。
   failing = true;
   clock += ACCOUNT_STALE_MS;
-  await engine.refreshAccounts(signal);
+  await engine.refreshAccounts(() => signal);
   assert.equal(item('funding').status, 'ok', '刚好在时限内');
   clock += 1;
   assert.equal(item('funding').status, 'warn');
   assert.match(item('funding').detail, /Lighter 可用 250\.50、权益 300\.25 USDC，持仓 1 个（读取失败：HTTP 500）/);
+  assert.deepEqual([item('accounts').status, /读不到 Lighter、Lighter RH、Entropy/.test(item('accounts').detail)], ['warn', true], '录入了但读不到不算就绪');
   failing = false;
-  await engine.refreshAccounts(signal);
+  await engine.refreshAccounts(() => signal);
   assert.equal(item('funding').status, 'ok');
+
+  // 一个场所不应答：各场所各用各的时限，另外两个照常读到。
+  const hung = createVarLighterEngine({ store: openVarLighterStore(path.join(dir, 'hung.sqlite')), connect: silent, now: () => clock, accounts: () => ({ accounts: ALL, problem: null }),
+    fetchImpl: ((url: string, init: RequestInit) => url.includes('mainnet.zklighter') ? new Promise((_, fail) => init.signal!.addEventListener('abort', () => fail(new Error('超时')))) : fetchImpl(url, init)) as unknown as typeof fetch });
+  try {
+  const signals: AbortController[] = [];
+  const reading = hung.refreshAccounts(() => { const one = new AbortController(); signals.push(one); return one.signal; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(signals.length, 3, '每个场所一个时限');
+  signals[0]!.abort();
+  await reading;
+  const hungItems = hung.views.readiness().items;
+  assert.match(hungItems.find(entry => entry.key === 'funding')!.detail, /Lighter 读取失败（超时）；Lighter RH 可用 250\.50.*Entropy 可用 100\.00/);
+  assert.match(hungItems.find(entry => entry.key === 'accounts')!.detail, /读不到 Lighter（/);
+  } finally { hung.close(); }
 
   // 文件被删：不再读账户，旧读数也不再显示。
   const before = requests.length;
   state = { accounts: {}, problem: '场所账户文件已删除，已停止使用其中的账户' };
   assert.deepEqual([item('accounts').status, item('accounts').detail], ['warn', '场所账户文件已删除，已停止使用其中的账户']);
   assert.equal(item('funding').status, 'todo');
-  await engine.refreshAccounts(signal);
+  await engine.refreshAccounts(() => signal);
   assert.equal(requests.length, before, '吊销后不再发请求');
   state = { accounts: ALL, problem: null };
   assert.match(item('funding').detail, /Lighter 还没有读到/, '吊销期间清掉了旧读数');

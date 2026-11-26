@@ -1,4 +1,4 @@
-// 录入或去掉 DEX 价差实盘的场所账户（docs/dexspread.md 第 12.4 节）。install.sh 以 root 运行它（--set-dex-keys、
+// 录入或去掉 DEX 价差实盘的场所账户（docs/dexspread.md 第 12.13 节）。install.sh 以 root 运行它（--set-dex-keys、
 // --unset-dex-keys），随后重启 DEX 价差服务。文件所在目录归 root，服务账户写不了，所以这里可以按路径写（L201）。
 //   --file <路径>   场所账户文件；标准输入给三行：Lighter 主网账户编号、Lighter RH 账户编号、Entropy 账户地址。
 //                   空行沿用已保存的那一项，填 - 表示去掉那个场所。

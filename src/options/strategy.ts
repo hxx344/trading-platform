@@ -92,15 +92,15 @@ export interface MarginContext extends Estimates { index: number }
 
 /** Regular option order IM of one short leg at one sell price, fees included (Bybit's published formula). */
 export function shortOrderMargin(leg: Pick<RiskLeg, 'optionType' | 'strike' | 'qty' | 'mark'>, context: MarginContext, price: number): number {
-  if (!(context.index > 0) || !Number.isFinite(context.index)) throw new StrategyError('margin', '卖出宽跨保证金预算需要有效的 BTC 指数');
-  if (!(price > 0) || !Number.isFinite(price) || !(leg.mark > 0) || !Number.isFinite(leg.mark)) throw new StrategyError('margin', '卖出宽跨保证金预算需要有效的标记价与执行价');
+  if (!(context.index > 0) || !Number.isFinite(context.index)) throw new StrategyError('margin', '卖腿保证金预算需要有效的 BTC 指数');
+  if (!(price > 0) || !Number.isFinite(price) || !(leg.mark > 0) || !Number.isFinite(leg.mark)) throw new StrategyError('margin', '卖腿保证金预算需要有效的标记价与执行价');
   const { index } = context, mark = leg.mark, qty = leg.qty;
   const otm = leg.optionType === 'Call' ? Math.max(0, leg.strike - index) : Math.max(0, index - leg.strike);
   const positionMm = (Math.max(context.mmFactor * index, context.mmFactor * mark) + mark + context.liquidationFeeRate * index) * qty;
   const orderImPrime = (Math.max(context.maxImFactor * index - otm, context.minImFactor * index) + Math.max(price, mark)) * qty;
   const fee = Math.min(context.feeRate * index, context.feeCapPct * price) * qty;
   const value = Math.max(orderImPrime, positionMm) + fee - price * qty;
-  if (!Number.isFinite(value) || value < 0) throw new StrategyError('margin', '卖出宽跨保证金无法计算');
+  if (!Number.isFinite(value) || value < 0) throw new StrategyError('margin', '卖腿保证金无法计算');
   return value;
 }
 
@@ -111,13 +111,13 @@ export function reserveShortMargin(legs: Record<string, RiskLeg>, context: Margi
   const proposed: Record<string, RiskLeg> = {};
   for (const [symbol, leg] of Object.entries(legs)) {
     const price = leg.priceBound, floor = leg.priceFloor ?? price, ceiling = leg.priceCeiling ?? price, old = leg.marginBound ?? 0;
-    if ([price, floor, ceiling].some(value => !Number.isFinite(value) || value <= 0) || !(floor <= price && price <= ceiling)) throw new StrategyError('margin', '卖出宽跨执行价界限无效');
+    if ([price, floor, ceiling].some(value => !Number.isFinite(value) || value <= 0) || !(floor <= price && price <= ceiling)) throw new StrategyError('margin', '卖腿执行价界限无效');
     if (!Number.isFinite(old) || old < 0) throw new StrategyError('margin', '已预留保证金无效');
     // IM falls then rises in a short order's price: both ends cover its worst value over every price used so far.
     proposed[symbol] = { ...leg, priceFloor: floor, priceCeiling: ceiling, marginBound: Math.max(old, shortOrderMargin(leg, context, floor), shortOrderMargin(leg, context, ceiling)) };
   }
   const total = Object.values(proposed).reduce((sum, leg) => sum + leg.marginBound!, 0) * (1 + context.marginBufferPct);
-  if (!Number.isFinite(total)) throw new StrategyError('margin', '卖出宽跨保证金预算无法计算');
+  if (!Number.isFinite(total)) throw new StrategyError('margin', '卖腿保证金预算无法计算');
   return { legs: proposed, total };
 }
 

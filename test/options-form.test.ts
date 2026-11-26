@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { ContractError } from '../src/contracts.ts';
 import type { OptionsEngine } from '../src/options/engine.ts';
 import { optionsViews } from '../src/service/options.ts';
-import { autoOpenConfirm, chainLines, legWord, m50Summary, strategyName, quoteFingerprint, quoteSecondsLeft, rfqCreateBody, rfqCreateProblem, rfqExecuteBody, rfqOpen, coverageLine, groupLabel, markedRows, performanceStatus, plotRows, plotTick, utcMinute, selectedSeries, orderState, parseQuantity, payoffCurve, planBody, scheduleTime, startBody, startRefused, taskSummary } from '../web/src/options-form.ts';
+import { autoOpenConfirm, chainLines, legWord, m50Summary, rfqStrategyLabel, strategyName, quoteFingerprint, quoteSecondsLeft, rfqCreateBody, rfqCreateProblem, rfqExecuteBody, rfqOpen, coverageLine, groupLabel, markedRows, performanceStatus, plotRows, plotTick, utcMinute, selectedSeries, orderState, parseQuantity, payoffCurve, planBody, scheduleTime, startBody, startRefused, taskSummary } from '../web/src/options-form.ts';
 import type { ChainRow, Execution, OrderRow, PerformanceGroup, PerformanceView, Plan, PreviewLeg, RfqQuote, Task } from '../web/src/options-types.ts';
 
 const PLAN: Plan = {
@@ -198,6 +198,20 @@ test('M50 页面文案：信号、建议动作与开仓按钮的腿数；计划�
   assert.match(m50Summary({ ...base, signal: null, action: 'no_signal', error: '读取失败' }).signal, /信号读取失败：读取失败/);
   assert.match(m50Summary({ ...base, signal: null, action: 'no_signal' }).signal, /08:15 UTC 后/);
   assert.equal(m50Summary(undefined).signal, '读取中');
+  const call = { ...signal, index: 90_000, side: 'Call' as const };
+  assert.equal(m50Summary({ ...base, signal: call, lastSignal: call, action: 'open' }).signal, '2026-11-13 · 指数 90,000 ≤ MA50 95,000');
+  assert.equal(m50Summary({ ...base, action: 'settling', trackedSide: 'Put' }).action, '跟踪腿已到期，等待交割退役后再开仓');
+  assert.equal(m50Summary({ ...base, action: 'other_strategy' }).action, '跟踪中的是其他策略，平掉后才能开 M50');
+  assert.equal(m50Summary({ ...base, signal: null, action: 'no_signal', trackedSide: 'Call' }).action, '没有当天信号，暂不能开仓（持有卖 Call）');
+  assert.match(rfqStrategyLabel('trend_m50'), /M50/);
+  const rfqView = { finished: true, blocked: null, market: { stale: false } } as unknown as Parameters<typeof rfqCreateProblem>[0];
+  assert.equal(rfqCreateProblem(rfqView, '0.5', 'trend_m50'), 'M50 是单腿策略，不走组合询价');
+  assert.equal(rfqCreateProblem(rfqView, '0.5', 'iron_condor'), null);
+  const callLeg = { symbol: 'BTC-22NOV26-108000-C', side: 'Sell' as const, optionType: 'Call' as const, strike: 108_000, delta: 0.3, qty: '0.1', mark: 700, targetDelta: 0.3, estimatedFeeUsd: 0, feeCapUsd: 0, feeBasisPrice: 0 };
+  const callCurve = payoffCurve({ netCreditUsd: 70, legs: [callLeg], index: 80_000 })!;
+  assert.equal(callCurve.breakevens.length, 1);
+  assert.ok(Math.abs(callCurve.breakevens[0]! - 108_700) < 1, '卖 Call 的盈亏平衡点是行权价加权利金');
+  assert.ok(callCurve.low <= 80_000, '远离行权价时现价仍在图内');
   assert.equal(legWord('trend_m50'), '单腿');
   assert.equal(strategyName('trend_m50'), 'M50 均线择边');
   const single = payoffCurve({ netCreditUsd: 65, legs: [{ symbol: 'BTC-22NOV26-92000-P', side: 'Sell', optionType: 'Put', strike: 92_000, delta: -0.3, qty: '0.1', mark: 650, targetDelta: 0.3, estimatedFeeUsd: 0, feeCapUsd: 0, feeBasisPrice: 0 }] })!;

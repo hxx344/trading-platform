@@ -12,16 +12,18 @@ import { createOptionMarket } from '../src/options/market.ts';
 import { openOptionsStore, type OptionsStore } from '../src/options/store.ts';
 import { DEFAULT_ESTIMATES, StrategyError, buildStrategy, chooseTrendExpiry, trendSignal, validateStructure } from '../src/options/strategy.ts';
 import { optionsSummary, parseOptionsConfig } from '../src/service/options-config.ts';
+import { readOptionData } from '../src/market/options-data.ts';
+import type { MarketClient } from '../src/market/ipc.ts';
 import { FRIDAY, FakeOptions, UID, symbolOf } from './options-fake.ts';
 
 const DAY_MS = 86_400_000;
 const TERMINAL: TaskStatus[] = ['completed', 'partial', 'stopped', 'failed', 'recovery_needed'];
 const refused = (code: string) => (error: unknown) => error instanceof ContractError && error.code === code;
 
-interface Setup { fake: FakeOptions; market: ReturnType<typeof createOptionMarket>; engine: OptionsEngine; store: OptionsStore; notes: string[]; logs: string[]; hooks: { skewMs: number }; make(store: OptionsStore): OptionsEngine; dispose(): void }
+interface Setup { fake: FakeOptions; market: ReturnType<typeof createOptionMarket>; engine: OptionsEngine; store: OptionsStore; notes: string[]; logs: string[]; hooks: { skewMs: number; failNotify: boolean }; make(store: OptionsStore): OptionsEngine; dispose(): void }
 function setup({ maxMarginUsd = 50_000, autoOpen, base = FRIDAY, mode = 'trend_m50' as const }: { maxMarginUsd?: number; autoOpen?: AutoOpenSettings; base?: number; mode?: 'trend_m50' | 'iron_condor' } = {}): Setup {
   const started = Date.now();
-  const hooks = { skewMs: 0 };
+  const hooks = { skewMs: 0, failNotify: false };
   const now = () => base + (Date.now() - started) + hooks.skewMs;
   const fake = new FakeOptions(now);
   const client = createOptionsClient({ credentials: { apiKey: 'options-test-key', apiSecret: 'options-test-secret' }, fetchImpl: async (url, init) => fake.fetch(url, init) });
@@ -30,7 +32,7 @@ function setup({ maxMarginUsd = 50_000, autoOpen, base = FRIDAY, mode = 'trend_m
   const store = openOptionsStore(join(dir, 'options.sqlite'));
   const notes: string[] = [], logs: string[] = [];
   const make = (target: OptionsStore) => createOptionsEngine({
-    client, market, store: target, uid: UID, now, notify: text => { notes.push(text); }, log: line => logs.push(line),
+    client, market, store: target, uid: UID, now, notify: text => { if (hooks.failNotify) throw new Error('飞书出口断开'); notes.push(text); }, log: line => logs.push(line),
     sleep: () => new Promise(resolve => setTimeout(resolve, 2)), pollMs: 20, sampleMs: 40,
     settings: { maxRiskUsd: 50_000, maxMarginUsd, legQty: '1', strategyMode: mode, orderTimeoutMs: 600, estimates: DEFAULT_ESTIMATES, ...(autoOpen ? { autoOpen } : {}) },
   });
@@ -163,6 +165,8 @@ test('M50：保证金超过上限不开仓；读不到日线时没有信号、�
     assert.equal(s.engine.state().m50.signal, null);
     assert.ok(s.engine.stateView().m50.error);
     assert.equal(s.logs.filter(line => line.includes('M50 信号读取失败')).length, 1);
+    // 13 Nov 10:00 is past 09:15: one Feishu line that today has no signal, not repeated.
+    assert.equal(s.notes.filter(text => text.includes('仍没读到均线信号')).length, 1);
     s.fake.dailyClose = 90_000;
     s.hooks.skewMs += 61_000;
     await s.market.refresh();
@@ -209,4 +213,75 @@ test('M50 配置：strategyMode 接受 trend_m50，摘要标明定时开仓不�
   assert.equal(config.strategyMode, 'trend_m50');
   assert.match(optionsSummary(config), /M50 均线择边.*不适用/);
   assert.throws(() => parseOptionsConfig({ accountId: UID, limits: { maxRiskUsd: 1000, maxMarginUsd: 5000 }, strategyMode: 'm50' }), /trend_m50/);
+});
+
+test('M50：飞书写入失败时不记已提示，每分钟重试一次、同一原因只记一行日志，恢复后补发', async () => {
+  const s = setup();
+  try {
+    await s.market.refresh();
+    s.hooks.failNotify = true;
+    await s.engine.trendTick();
+    await s.engine.trendTick();
+    assert.equal(s.engine.state().m50.notifiedDay, null);
+    assert.equal(s.logs.filter(line => line.includes('飞书通知未能写入')).length, 1);
+    s.hooks.failNotify = false;
+    await s.engine.trendTick();
+    assert.equal(s.notes.length, 0, '一分钟内不重试');
+    s.hooks.skewMs += 61_000;
+    await s.market.refresh();
+    await s.engine.trendTick();
+    assert.match(s.notes.at(-1)!, /建议开仓卖 Put/);
+    assert.equal(s.engine.state().m50.notifiedDay, '2026-11-13');
+  } finally { await s.engine.close(); s.dispose(); }
+});
+
+test('M50：持有的腿到期未退役时显示结算中，不提示、不记已提示', async () => {
+  const s = setup();
+  try {
+    await s.market.refresh();
+    await s.engine.trendTick();
+    await run(s, 'open');
+    const group = s.engine.state().tasks[s.engine.state().tracked.groupId!]!;
+    for (const leg of Object.values(group.legs)) leg.expiry = FRIDAY; // expired (the fake clock is past FRIDAY), not yet retired
+    s.engine.state().m50.notifiedDay = null;
+    const notes = s.notes.length;
+    await s.engine.trendTick();
+    assert.equal(s.engine.stateView().m50.action, 'settling');
+    assert.equal(s.notes.length, notes, '结算中不提示');
+    assert.equal(s.engine.state().m50.notifiedDay, null, '退役后当天还要补发');
+  } finally { await s.engine.close(); s.dispose(); }
+});
+
+test('M50：状态里的信号记录损坏时拒绝启动，缺少记录的旧状态正常启动', async () => {
+  const s = setup();
+  try {
+    await s.engine.close();
+    const saved = s.store.load() as Record<string, unknown> | null;
+    const base = saved ?? { uid: UID, tasks: {}, journal: {}, tracked: { groupId: null, sizes: {} }, pmBaseline: null, executions: [] };
+    s.store.save({ ...base, m50: { signal: { day: 'bad' }, notifiedDay: null } } as never);
+    assert.throws(() => s.make(s.store), /M50 信号记录不完整/);
+    const { m50: _drop, ...old } = base as Record<string, unknown>;
+    s.store.save(old as never);
+    const engine = s.make(s.store);
+    assert.deepEqual(engine.state().m50, { signal: null, notifiedDay: null });
+    await engine.close();
+  } finally { s.dispose(); }
+});
+
+test('M50：经行情服务读指数日线，带来源时间', async () => {
+  const fake = new FakeOptions(() => FRIDAY);
+  const ops: string[] = [];
+  const marketClient: MarketClient = {
+    epoch: () => 'one', stream: () => { throw new Error('unexpected stream'); },
+    async call<T>(op: string, _input: unknown, signal: AbortSignal) {
+      ops.push(op);
+      const reply = await readOptionData(op.slice('options.'.length) as 'indexKline', undefined, signal, { fetchImpl: async (url, init) => fake.fetch(url, init), now: () => FRIDAY });
+      return { ...reply, sourceAt: reply.sourceAt ?? FRIDAY } as T;
+    },
+  };
+  const client = createOptionsClient({ credentials: { apiKey: 'options-test-key', apiSecret: 'options-test-secret' }, marketClient, now: () => FRIDAY, fetchImpl: async () => { throw new Error('不应直连'); } });
+  const reply = await client.indexKline!(AbortSignal.timeout(1000)) as { list: unknown[] };
+  assert.deepEqual(ops, ['options.indexKline']);
+  assert.equal(reply.list.length, 60);
+  assert.equal(trendSignal(reply.list, '2026-11-13', 100_000, FRIDAY).ma, 90_000);
 });

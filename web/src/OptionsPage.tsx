@@ -276,18 +276,26 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
   const strategy = mode ?? data?.settings.strategyMode ?? 'iron_condor';
   const quantityInput = preset === '' ? data?.settings.legQty ?? '1' : preset === 'custom' ? custom : preset;
   const quantity = parseQuantity(quantityInput);
-  const market = useLiveResource<OptionsMarket>('/api/options/market', { intervalMs: MARKET_MS, timeoutMs: OPTIONS_READ_TIMEOUT_MS, onExpired, enabled: tab === 'desk' });
-  const previewPath = `/api/options/preview?quantity=${encodeURIComponent(quantity ?? '1')}&mode=${strategy}`;
+  // M50's leg sits on the ~14-day expiry, so its chain is read for the previewed expiry rather than the nearest Sunday.
+  const [chainExpiry, setChainExpiry] = useState<number | null>(null);
+  const market = useLiveResource<OptionsMarket>(chainExpiry === null ? '/api/options/market' : `/api/options/market?expiry=${chainExpiry}`, { intervalMs: MARKET_MS, timeoutMs: OPTIONS_READ_TIMEOUT_MS, onExpired, enabled: tab === 'desk' });
+  // M50: the day's signal is part of the address, so a new day or a flipped side starts a fresh read instead of showing the old leg.
+  const m50Key = strategy === 'trend_m50' ? `${data?.m50?.day ?? ''}|${data?.m50?.signal?.side ?? ''}` : '';
+  const previewPath = `/api/options/preview?quantity=${encodeURIComponent(quantity ?? '1')}&mode=${strategy}${m50Key ? `&signal=${encodeURIComponent(m50Key)}` : ''}`;
   const previewRead = useLiveResource<PreviewView>(previewPath, { intervalMs: MARKET_MS, timeoutMs: OPTIONS_READ_TIMEOUT_MS, onExpired, enabled: tab === 'desk' && quantity !== null });
-  const preview = quantity !== null ? previewRead.data?.preview ?? null : null;
-  const riskProblem = quantity === null ? '每腿数量须为正数（最多 8 位小数）' : previewRead.data?.riskProblem ?? (previewRead.error && !previewRead.data ? previewRead.error.message : null);
+  // A failed M50 read (no signal yet) must not leave the last day's leg on the desk.
+  const m50Stale = strategy === 'trend_m50' && previewRead.error !== null && previewRead.error !== undefined;
+  const preview = quantity !== null && !m50Stale ? previewRead.data?.preview ?? null : null;
+  const riskProblem = quantity === null ? '每腿数量须为正数（最多 8 位小数）' : m50Stale ? previewRead.error!.message : previewRead.data?.riskProblem ?? (previewRead.error && !previewRead.data ? previewRead.error.message : null);
+  const previewExpiry = strategy === 'trend_m50' ? preview?.expiry ?? null : null;
+  useEffect(() => { setChainExpiry(previewExpiry); }, [previewExpiry]);
   const busy = data?.busy === true;
   const tasks = data?.tasks ?? [];
   const activeTasks = tasks.filter(isActive), history = tasks.filter(task => !isActive(task));
   const hero = activeTasks[0];
   const positionsCount = data?.positions?.rows.length ?? 0;
   // A change of strategy or quantity invalidates the risk check, as the workbench does.
-  useEffect(() => { setRiskChecked(false); }, [strategy, quantity]);
+  useEffect(() => { setRiskChecked(false); }, [strategy, quantity, m50Key]);
   const refresh = useCallback(() => { void state.refresh(); void market.refresh(); void previewRead.refresh(); }, [state, market, previewRead]);
 
   async function prepare(operation: 'open' | 'close') {
@@ -380,7 +388,7 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
       {tab === 'desk' ? <div className="tab-pane">
         <section className="panel kpi-panel" aria-label="策略指标"><div className="kpis">
           <article className="kpi"><span className="l">净权利金 <small>USD</small></span><strong>{money(preview?.netCreditUsd)}</strong><small>每组策略</small></article>
-          <article className="kpi"><span className="l">最大亏损</span><strong>{preview?.unboundedLoss ? '无上限' : money(preview?.maxLossUsd)}</strong><small>风险上限 {data ? money(data.settings.maxRiskUsd) : '--'}</small></article>
+          <article className="kpi"><span className="l">最大亏损</span><strong>{preview?.unboundedLoss ? '无上限' : money(preview?.maxLossUsd)}</strong><small>{strategy === 'trend_m50' ? 'M50 只展示，按保证金上限拦截' : `风险上限 ${data ? money(data.settings.maxRiskUsd) : '--'}`}</small></article>
           <article className="kpi"><span className="l">保证金需求</span><strong>{money(preview?.estimatedMarginUsd)}</strong><small>{preview ? marginLabel(preview.marginMode) : '官方公式估算'}</small></article>
           <article className="kpi"><span className="l">维护保证金</span><strong>{money(preview?.estimatedMaintenanceMarginUsd)}</strong><small>短期权 MM</small></article>
           <article className="kpi"><span className="l">交易成本</span><strong>{money(preview?.estimatedTradingCostUsd)}</strong><small>手续费率 {preview ? `${(preview.feeRate * 100).toFixed(3)}%` : '--'}</small></article>
@@ -407,7 +415,7 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
                       <input id="optionsQuantity" aria-label="自定义每腿数量" type="text" inputMode="decimal" value={preset === 'custom' ? custom : quantityInput} onChange={event => { setPreset('custom'); setCustom(event.target.value); }} /></div>
                     <small className="field-hint">调整数量后，自动重算保证金与交易成本。</small></div>
                 </div>
-                <label className="confirm"><input type="checkbox" checked={riskChecked} onChange={event => setRiskChecked(event.target.checked)} /><span>{strategy === 'short_strangle' ? '我已核对两腿、报价和保证金上限，了解亏损无上限' : strategy === 'trend_m50' ? '我已核对信号方向、合约、报价和保证金上限，了解无保护腿' : '我已核对四腿、报价和风险上限'}</span></label>
+                <label className="confirm"><input type="checkbox" checked={riskChecked} onChange={event => setRiskChecked(event.target.checked)} /><span>{strategy === 'short_strangle' ? '我已核对两腿、报价和保证金上限，了解亏损无上限' : strategy === 'trend_m50' ? `我已核对信号方向、合约、报价和保证金上限，了解无保护腿${preview?.unboundedLoss ? '、亏损无上限' : ''}` : '我已核对四腿、报价和风险上限'}</span></label>
                 <button type="button" className="button primary" disabled={!canOpen} data-busy={preparing === 'open' ? '' : undefined} onClick={() => void prepare('open')}>{preparing === 'open' ? '正在生成方案…' : `实盘开仓${legWord(strategy)}`}</button>
                 <button type="button" className="button close-button" disabled={!canClose} data-busy={preparing === 'close' ? '' : undefined} onClick={() => void prepare('close')}>{preparing === 'close' ? '正在生成方案…' : '实盘平仓已跟踪持仓'}</button>
                 <p className="microcopy">{busy ? '有任务或订单未结束，结束前不能开始新的开仓或平仓。' : data?.tracked.legs.length ? '已有跟踪中的策略：先平仓或在交易所平掉后，才能再开仓。' : strategy === 'trend_m50' ? '开仓与平仓先核对固定方案，再独立确认提交。M50 按当天信号开仓；换边须先平仓再开仓。' : '开仓与平仓先核对固定方案，再独立确认提交。实盘开仓只在周五（UTC）。'}</p>

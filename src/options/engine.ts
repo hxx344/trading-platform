@@ -36,6 +36,8 @@ const RFQ_TRADE_WAIT_MS = 120_000;
 export const M50_SIGNAL_HOUR_UTC = 8;
 export const M50_SIGNAL_MINUTE_UTC = 15;
 export const M50_RETRY_MS = 60_000;
+/** With config.json on M50 and still no signal this long after 08:15, Feishu is told once that day. */
+export const M50_LATE_MS = 3_600_000;
 /** The page asked for an M50 preview or plan within this time: the signal is kept current although config.json names another mode. */
 const M50_WANTED_MS = 86_400_000;
 const EXECUTIONS_KEPT = 100;
@@ -109,7 +111,7 @@ export interface OptionsState {
   schedule: Schedule;
   /** 组合询价 (G2c, v0.17): the latest RFQ; null or absent when there has been none. */
   rfq: RfqRecord | null;
-  /** M50 (v0.97): the latest daily signal and the day whose action was sent to Feishu; absent in older documents. */
+  /** M50 (v0.98): the latest daily signal and the day whose action was sent to Feishu; absent in older documents. */
   m50: M50State;
 }
 export interface M50State { signal: TrendSignal | null; notifiedDay: string | null }
@@ -345,6 +347,19 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
 
   // ---- M50 signal ------------------------------------------------------------------------------------------------
   let m50Wanted = -Infinity, m50AttemptAt = -Infinity, m50Error: string | null = null, m50Reading = false;
+  let m50LateDay: string | null = null, m50NotifyAt = -Infinity, m50NotifyError: string | null = null;
+  /** Sends one Feishu line, at most once a minute while it keeps failing (each distinct failure logged once). */
+  function m50Notify(text: string): boolean {
+    const at = now();
+    if (at - m50NotifyAt < M50_RETRY_MS) return false;
+    m50NotifyAt = at;
+    try { notify(text); m50NotifyError = null; return true; } catch (error) {
+      const message = describe(error);
+      if (message !== m50NotifyError) log(`期权飞书通知未能写入，每分钟重试：${message}`);
+      m50NotifyError = message;
+      return false;
+    }
+  }
   /** The signal for the day in force now; null until that day's 08:15 signal has been read. */
   const currentSignal = (): TrendSignal | null => state.m50.signal && state.m50.signal.day === m50SignalDay(now()) ? state.m50.signal : null;
   /** The opening must sell the current signal's side, at least two days before expiry. */
@@ -399,15 +414,20 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
         m50Error = message;
       } finally { m50Reading = false; }
     }
-    if (settings.strategyMode !== 'trend_m50' || !currentSignal() || state.m50.notifiedDay === day) return;
+    if (settings.strategyMode !== 'trend_m50') return;
+    if (!currentSignal()) {
+      // A whole day without a signal looks like a quiet "hold": say so once, an hour after 08:15.
+      const due = Date.parse(`${day}T00:00:00Z`) + (M50_SIGNAL_HOUR_UTC * 60 + M50_SIGNAL_MINUTE_UTC) * 60_000 + M50_LATE_MS;
+      if (now() >= due && m50LateDay !== day && m50Notify(`期权 M50（${day}）：08:15 后一小时仍没读到均线信号，今天不能按 M50 开仓或换边：${m50Error ?? '尚未读取'}`)) m50LateDay = day;
+      return;
+    }
+    if (state.m50.notifiedDay === day) return;
     const { action, side } = m50Action();
     if (action === 'settling' || action === 'no_signal') return;
     const signal = currentSignal()!;
-    try {
-      if (action === 'open' || action === 'switch') notify(`期权 M50（${day}）：指数 ${signal.index.toFixed(0)}，MA50 ${signal.ma.toFixed(0)}，${action === 'open' ? `建议开仓卖 ${signal.side}` : `持仓为卖 ${side}，建议先平仓再开卖 ${signal.side}`}，请到期权页面确认`);
-      state.m50.notifiedDay = day;
-      save();
-    } catch (error) { log(`期权飞书通知未能写入：${describe(error)}`); }
+    if ((action === 'open' || action === 'switch') && !m50Notify(`期权 M50（${day}）：指数 ${signal.index.toFixed(0)}，MA50 ${signal.ma.toFixed(0)}，${action === 'open' ? `建议开仓卖 ${signal.side}` : `持仓为卖 ${side}，建议先平仓再开卖 ${signal.side}`}，请到期权页面确认`)) return;
+    state.m50.notifiedDay = day;
+    save();
   }
   function m50View() {
     const { action, side, expiry } = m50Action();
@@ -1032,12 +1052,12 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
       for (const key of ['feeRate', 'feeCapPct', 'mmFactor', 'maxImFactor', 'minImFactor', 'liquidationFeeRate', 'marginBufferPct'] as const) context[key] = Math.max(saved.context[key], current[key]);
       for (const [symbol, leg] of Object.entries(proposed)) {
         const row = rowOf(symbol);
-        if (!row || row.optionType !== leg.optionType || row.strike !== leg.strike || row.expiry !== leg.expiry) throw new Error('卖出宽跨的保证金行情与原始腿不一致');
+        if (!row || row.optionType !== leg.optionType || row.strike !== leg.strike || row.expiry !== leg.expiry) throw new Error('卖腿的保证金行情与原始腿不一致');
         leg.mark = row.mark;
       }
       const reserved = reserveShortMargin(proposed, context, task.mode);
       const budget = Math.min(settings.maxMarginUsd, saved.budgetUsd);
-      if (reserved.total > budget) throw new Error(`执行价使卖出宽跨保证金 ${reserved.total.toFixed(2)} 超过预算 ${budget}`);
+      if (reserved.total > budget) throw new Error(`执行价使卖腿保证金 ${reserved.total.toFixed(2)} 超过预算 ${budget}`);
       return { legs: reserved.legs, context, reservedUsd: reserved.total };
     }
     const loss = maximumLoss(proposed);

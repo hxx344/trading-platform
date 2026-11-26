@@ -23,7 +23,7 @@ export function m50Summary(view: M50View | null | undefined): { signal: string; 
     : view.action === 'switch' ? `建议换边：先平仓${view.trackedSide ? sideText(view.trackedSide) : ''}，再开${sideText(view.signal!.side)}`
     : view.action === 'settling' ? '跟踪腿已到期，等待交割退役后再开仓'
     : view.action === 'other_strategy' ? '跟踪中的是其他策略，平掉后才能开 M50'
-    : '没有当天信号，暂不能开仓';
+    : `没有当天信号，暂不能开仓${view.trackedSide ? `（持有${sideText(view.trackedSide)}）` : ''}`;
   return { signal, action };
 }
 export const QUANTITY_PRESETS = ['0.01', '0.05', '0.1', '0.25', '0.5', '1'] as const;
@@ -64,11 +64,13 @@ export function payoffAt(price: number, preview: Pick<Preview, 'netCreditUsd' | 
 }
 export interface PayoffCurve { low: number; high: number; samples: { price: number; pnl: number }[]; breakevens: number[]; min: number; max: number }
 /** 121 samples over the strikes widened by 32 % of their span (at least 1 000), and where the curve crosses zero. */
-export function payoffCurve(preview: Pick<Preview, 'netCreditUsd' | 'legs'>): PayoffCurve | null {
+export function payoffCurve(preview: Pick<Preview, 'netCreditUsd' | 'legs'> & { index?: number | null }): PayoffCurve | null {
   if (!preview.legs.length) return null;
-  // A single leg (M50) has no second strike: span a quarter of its strike, about ±8% after the 0.32 margins.
-  const strikes = preview.legs.map(leg => leg.strike);
-  const lowStrike = Math.min(...strikes), highStrike = Math.max(...strikes), span = Math.max(1_000, highStrike - lowStrike, strikes.length === 1 ? lowStrike * 0.25 : 0);
+  // A single leg (M50) has no second strike: span a quarter of its strike, about ±8% after the 0.32 margins, and reach
+  // the index so the spot line stays on the chart when the leg is far out.
+  const single = preview.legs.length === 1, index = preview.index;
+  const strikes = [...preview.legs.map(leg => leg.strike), ...(single && typeof index === 'number' && index > 0 ? [index] : [])];
+  const lowStrike = Math.min(...strikes), highStrike = Math.max(...strikes), span = Math.max(1_000, highStrike - lowStrike, single ? preview.legs[0]!.strike * 0.25 : 0);
   const low = Math.max(0, lowStrike - span * 0.32), high = highStrike + span * 0.32;
   const samples = Array.from({ length: 121 }, (_, index) => { const price = low + (high - low) * index / 120; return { price, pnl: payoffAt(price, preview) }; });
   const breakevens: number[] = [];
@@ -238,7 +240,8 @@ export const rfqCreateBody = (quantity: string, mode: StrategyMode): Record<stri
 export const rfqExecuteBody = (rfqId: string, quoteId: string): Record<string, unknown> => ({ rfqId, quoteId, confirmLive: true });
 export const rfqStrategyLabel = (mode: StrategyMode): string => mode === 'short_strangle' ? '双腿卖出 · 无保护腿，亏损无上限' : mode === 'trend_m50' ? 'M50 均线择边 · 单腿，不走询价' : '四腿铁鹰';
 /** Why the page cannot send a new RFQ now; null when it can (the server checks again). */
-export function rfqCreateProblem(view: Pick<RfqView, 'finished' | 'blocked' | 'market'> | null, quantity: string | null): string | null {
+export function rfqCreateProblem(view: Pick<RfqView, 'finished' | 'blocked' | 'market'> | null, quantity: string | null, strategy?: StrategyMode): string | null {
+  if (strategy === 'trend_m50') return 'M50 是单腿策略，不走组合询价';
   if (!view) return '等待询价状态同步';
   if (!view.finished) return '上一笔询价尚未结束';
   if (view.blocked) return view.blocked;

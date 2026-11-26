@@ -153,7 +153,7 @@ export function buildStrategy(chain: readonly OptionRow[], { now, qty, mode, ind
   }
   const net = credit();
   validateStructure(Object.fromEntries(legs.map(item => [item.symbol, { ...item, qty: quantity, expiry }])), mode);
-  if (unbounded && !(index !== null && index > 0)) throw new StrategyError('no_index', '卖出宽跨保证金估算需要有效的 BTC 指数');
+  if (unbounded && !(index !== null && index > 0)) throw new StrategyError('no_index', '卖腿保证金估算需要有效的 BTC 指数');
   const basis = index && index > 0 ? index : Math.max(...rows.map(row => row.strike));
   // Passive estimate: buys at bid 1, sells at ask 1.
   const bySymbol = new Map(rows.map(row => [row.symbol, row]));

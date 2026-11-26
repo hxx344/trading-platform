@@ -165,8 +165,12 @@ test('M50：保证金超过上限不开仓；读不到日线时没有信号、�
     assert.equal(s.engine.state().m50.signal, null);
     assert.ok(s.engine.stateView().m50.error);
     assert.equal(s.logs.filter(line => line.includes('M50 信号读取失败')).length, 1);
-    // 13 Nov 10:00 is past 09:15: one Feishu line that today has no signal, not repeated.
-    assert.equal(s.notes.filter(text => text.includes('仍没读到均线信号')).length, 1);
+    // 13 Nov 10:00 is past 09:15, but one failed read (as at start-up) is not yet worth a Feishu line.
+    const late = () => s.notes.filter(text => text.includes('仍没读到均线信号')).length;
+    assert.equal(late(), 0);
+    for (let i = 0; i < 3; i += 1) { s.hooks.skewMs += 61_000; await s.market.refresh(); await s.engine.trendTick(); }
+    assert.equal(late(), 1, '09:15 后第三次读取失败才提示一次');
+    assert.equal(s.logs.filter(line => line.includes('M50 信号读取失败')).length, 1, '同一原因只记一行');
     s.fake.dailyClose = 90_000;
     s.hooks.skewMs += 61_000;
     await s.market.refresh();
@@ -221,6 +225,8 @@ test('M50：飞书写入失败时不记已提示，每分钟重试一次、同�
     await s.market.refresh();
     s.hooks.failNotify = true;
     await s.engine.trendTick();
+    s.hooks.skewMs += 61_000;
+    await s.market.refresh();
     await s.engine.trendTick();
     assert.equal(s.engine.state().m50.notifiedDay, null);
     assert.equal(s.logs.filter(line => line.includes('飞书通知未能写入')).length, 1);
@@ -231,6 +237,7 @@ test('M50：飞书写入失败时不记已提示，每分钟重试一次、同�
     await s.market.refresh();
     await s.engine.trendTick();
     assert.match(s.notes.at(-1)!, /建议开仓卖 Put/);
+    assert.equal(s.logs.filter(line => line.includes('飞书通知未能写入')).length, 1, '两次失败同一原因只记一行');
     assert.equal(s.engine.state().m50.notifiedDay, '2026-11-13');
   } finally { await s.engine.close(); s.dispose(); }
 });
@@ -284,4 +291,24 @@ test('M50：经行情服务读指数日线，带来源时间', async () => {
   assert.deepEqual(ops, ['options.indexKline']);
   assert.equal(reply.list.length, 60);
   assert.equal(trendSignal(reply.list, '2026-11-13', 100_000, FRIDAY).ma, 90_000);
+});
+
+test('M50：09:15 之前读不到信号不提示迟到，之后提示一次，信号读到后一分钟内补发建议', async () => {
+  const s = setup({ base: FRIDAY - 3_600_000 }); // 13 Nov 09:00
+  try {
+    await s.market.refresh();
+    s.fake.dailyClose = null;
+    const late = () => s.notes.filter(text => text.includes('仍没读到均线信号')).length;
+    for (let i = 0; i < 4; i += 1) { await s.engine.trendTick(); s.hooks.skewMs += 61_000; await s.market.refresh(); }
+    assert.equal(late(), 0, '09:15 之前不提示');
+    s.hooks.skewMs += 15 * 60_000; // past 09:15
+    await s.market.refresh();
+    for (let i = 0; i < 3; i += 1) { await s.engine.trendTick(); s.hooks.skewMs += 61_000; await s.market.refresh(); }
+    assert.equal(late(), 1);
+    s.fake.dailyClose = 90_000;
+    await s.engine.trendTick();
+    assert.equal(s.engine.state().m50.signal!.side, 'Put');
+    assert.match(s.notes.at(-1)!, /建议开仓卖 Put/);
+    assert.equal(late(), 1);
+  } finally { await s.engine.close(); s.dispose(); }
 });

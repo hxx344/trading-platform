@@ -36,8 +36,12 @@ const RFQ_TRADE_WAIT_MS = 120_000;
 export const M50_SIGNAL_HOUR_UTC = 8;
 export const M50_SIGNAL_MINUTE_UTC = 15;
 export const M50_RETRY_MS = 60_000;
-/** With config.json on M50 and still no signal this long after 08:15, Feishu is told once that day. */
+/**
+ * With config.json on M50 and still no signal this long after 08:15, and after M50_LATE_TRIES failed reads by this process
+ * since then (so a start-up read before the first market snapshot does not count alone), Feishu is told once that day.
+ */
 export const M50_LATE_MS = 3_600_000;
+export const M50_LATE_TRIES = 3;
 /** The page asked for an M50 preview or plan within this time: the signal is kept current although config.json names another mode. */
 const M50_WANTED_MS = 86_400_000;
 const EXECUTIONS_KEPT = 100;
@@ -111,7 +115,7 @@ export interface OptionsState {
   schedule: Schedule;
   /** 组合询价 (G2c, v0.17): the latest RFQ; null or absent when there has been none. */
   rfq: RfqRecord | null;
-  /** M50 (v0.98): the latest daily signal and the day whose action was sent to Feishu; absent in older documents. */
+  /** M50 (v0.99): the latest daily signal and the day whose action was sent to Feishu; absent in older documents. */
   m50: M50State;
 }
 export interface M50State { signal: TrendSignal | null; notifiedDay: string | null }
@@ -348,6 +352,8 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
   // ---- M50 signal ------------------------------------------------------------------------------------------------
   let m50Wanted = -Infinity, m50AttemptAt = -Infinity, m50Error: string | null = null, m50Reading = false;
   let m50LateDay: string | null = null, m50NotifyAt = -Infinity, m50NotifyError: string | null = null;
+  let m50LateFailures = { day: '', count: 0 };
+  const m50LateAt = (day: string): number => Date.parse(`${day}T00:00:00Z`) + (M50_SIGNAL_HOUR_UTC * 60 + M50_SIGNAL_MINUTE_UTC) * 60_000 + M50_LATE_MS;
   /** Sends one Feishu line, at most once a minute while it keeps failing (each distinct failure logged once). */
   function m50Notify(text: string): boolean {
     const at = now();
@@ -410,6 +416,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
         log(`期权 M50 信号（${day}）：指数 ${signal.index.toFixed(2)}，MA50 ${signal.ma.toFixed(2)}，卖 ${signal.side}`);
       } catch (error) {
         const message = describe(error);
+        if (at >= m50LateAt(day)) m50LateFailures = { day, count: m50LateFailures.day === day ? m50LateFailures.count + 1 : 1 };
         if (message !== m50Error) log(`期权 M50 信号读取失败，每分钟重试：${message}`);
         m50Error = message;
       } finally { m50Reading = false; }
@@ -417,8 +424,8 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     if (settings.strategyMode !== 'trend_m50') return;
     if (!currentSignal()) {
       // A whole day without a signal looks like a quiet "hold": say so once, an hour after 08:15.
-      const due = Date.parse(`${day}T00:00:00Z`) + (M50_SIGNAL_HOUR_UTC * 60 + M50_SIGNAL_MINUTE_UTC) * 60_000 + M50_LATE_MS;
-      if (now() >= due && m50LateDay !== day && m50Notify(`期权 M50（${day}）：08:15 后一小时仍没读到均线信号，今天不能按 M50 开仓或换边：${m50Error ?? '尚未读取'}`)) m50LateDay = day;
+      const late = m50LateFailures.day === day && m50LateFailures.count >= M50_LATE_TRIES;
+      if (late && m50LateDay !== day && m50Notify(`期权 M50（${day}）：08:15 后一小时仍没读到均线信号，今天不能按 M50 开仓或换边：${m50Error ?? '尚未读取'}`)) m50LateDay = day;
       return;
     }
     if (state.m50.notifiedDay === day) return;

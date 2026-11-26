@@ -26,7 +26,7 @@
 
 - 修复审查意见后：`pnpm check`、`pnpm build:web`、`git diff --check`、`node --test test/varlighter.test.ts test/varlighter-paper-commit.test.ts test/varlighter-local.test.ts`（67 通过，含新增的推送判断测试）。
 - 修复前：`node --test web/test/varlighter-form.test.mjs`（9 通过）；`scripts/dev-varlighter.ts` 替身后端，无头浏览器 1280 宽度打开实盘准备页，「行情流配对」一行显示「按推送判断（启动以来）：266 次，成交 0 次」，无页面报错；390 宽度页面无横向溢出。修复只动后端与一句文案，浏览器没有重走。
-- 分支 CI：CI_LINE
+- 分支 CI：提交 `fc39755` 的 https://github.com/hxx344/trading-platform/actions/runs/45796040297 全部通过。
 
 ## 未运行
 

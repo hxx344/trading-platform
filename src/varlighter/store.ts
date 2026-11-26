@@ -4,27 +4,27 @@
 // 不再写也不改：旧样本按配对键映射后与新表合并读出，旧持仓与成交在首次启动时一次性复制到新表（同一事务，带完成标记）。
 // 回退到 v0.87.0 时旧版本照常读写旧表，升级后新开的模拟盘记录在回退版本里看不到（docs/dexspread.md 第 9 节）。
 import { DatabaseSync } from 'node:sqlite';
-import { legacyKeyOf, upgradeKey, varHourly, type Regime, type Sample } from './model.ts';
+import { SAMPLE_FIELDS, legacyKeyOf, upgradeKey, varHourly, type Regime, type Sample } from './model.ts';
 import { upgradePosition, type ClosedTrade, type LegFees, type Position } from './strategy.ts';
+import type { Settings } from './views.ts';
 
 export const VARLIGHTER_FILE = 'varlighter.sqlite';
 /** 样本保留天数：约 300 个配对每分钟各一条（两腿都是行情流的启用配对每 15 秒一条），每天约 45 万条；14 天约 600 万条（库文件大小见 docs/varlighter.md 第 7 节）。 */
 export const SAMPLE_RETENTION_DAYS = 14;
 /** 旧表迁移完成的标记（state 表的键）。 */
 export const MIGRATED_KEY = 'legs_migrated';
+export const SETTINGS_KEY = 'settings2', COOLDOWN_KEY = 'cooldown2';
 
 // ---- 新表（两腿口径） ----
 const snake = (field: string) => field.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`).replace(/^([ab])([a-z])/, '$1_$2').replace(/(\d+)k$/, '$1k');
 /** Sample 字段与列名一一对应（aBid0 → a_bid0，aBidRx → a_bid_rx，receivedAt → received_at）。 */
-const LEG_FIELDS = ['symbol', 't', 'receivedAt', 'regime', 'ratio',
-  'aAt', 'aMark', 'aIndex', 'aFunding', 'aBid0', 'aAsk0', 'aBid1k', 'aAsk1k', 'aBid100k', 'aAsk100k', 'aBidRx', 'aAskRx', 'aBidTk', 'aAskTk', 'aTkAt',
-  'bAt', 'bMark', 'bIndex', 'bFunding', 'bBid0', 'bAsk0', 'bBid1k', 'bAsk1k', 'bBid100k', 'bAsk100k', 'bBidRx', 'bAskRx', 'bBidTk', 'bAskTk', 'bTkAt'] as const satisfies readonly (keyof Sample)[];
+const LEG_FIELDS = SAMPLE_FIELDS;
 const LEG_COLUMNS = LEG_FIELDS.map(snake);
 const NOT_NULL = new Set(['symbol', 't', 'receivedAt', 'regime', 'ratio', 'aAt', 'aBid0', 'aAsk0', 'bAt', 'bBid0', 'bAsk0']);
-const columnType = (field: string) => field === 'symbol' || field === 'regime' ? 'TEXT' : field === 't' || field === 'receivedAt' || field.endsWith('At') ? 'INTEGER' : 'REAL';
+const columnType = (field: string) => field === 'symbol' || field === 'regime' || field === 'captureKind' ? 'TEXT' : field === 't' || field.endsWith('At') ? 'INTEGER' : 'REAL';
 const legDefinition = LEG_FIELDS.map((field, index) => `${LEG_COLUMNS[index]} ${columnType(field)}${NOT_NULL.has(field) ? ' NOT NULL' : ''}`).join(', ');
 type LegRow = Record<string, unknown>;
-const legRow = (sample: Sample): (string | number | null)[] => LEG_FIELDS.map(field => sample[field] as string | number | null);
+const legRow = (sample: Sample): (string | number | null)[] => LEG_FIELDS.map(field => sample[field] ?? null);
 const fromLegRow = (row: LegRow): Sample => Object.fromEntries(LEG_FIELDS.map((field, index) => {
   const value = row[LEG_COLUMNS[index]];
   return [field, typeof value === 'number' || typeof value === 'string' ? value : null];
@@ -32,7 +32,7 @@ const fromLegRow = (row: LegRow): Sample => Object.fromEntries(LEG_FIELDS.map((f
 
 // ---- 旧表（v0.87.0 以前，Var 对一个 Lighter 场所） ----
 const OLD_COLUMNS = ['symbol', 't', 'received_at', 'regime', 'var_mark', 'var_bid0', 'var_ask0', 'var_bid1k', 'var_ask1k', 'var_bid100k', 'var_ask100k', 'var_funding',
-  'rh_at', 'rh_bid0', 'rh_ask0', 'rh_mark', 'rh_index', 'rh_funding', 'rh_bid1k', 'rh_ask1k', 'rh_bid100k', 'rh_ask100k', 'rh_bid_rx', 'rh_ask_rx', 'var_bid_tk', 'var_ask_tk', 'var_tk_at'] as const;
+  'rh_at', 'rh_bid0', 'rh_ask0', 'rh_mark', 'rh_index', 'rh_funding', 'rh_bid1k', 'rh_ask1k', 'rh_bid100k', 'rh_ask100k', 'rh_bid_rx', 'rh_ask_rx', 'var_bid_tk', 'var_ask_tk', 'var_tk_at', 'legacy_aligned'] as const;
 type OldRow = Record<typeof OLD_COLUMNS[number], unknown>;
 const nullable = (value: unknown): number | null => typeof value === 'number' ? value : null;
 /** 旧样本换成两腿口径：A 是 Var（年化资金费折成每小时），B 是 Lighter 场所；乘数 1。 */
@@ -46,6 +46,8 @@ const fromOldRow = (row: OldRow, key: string): Sample => ({
   bBid0: row.rh_bid0 as number, bAsk0: row.rh_ask0 as number, bBid1k: nullable(row.rh_bid1k), bAsk1k: nullable(row.rh_ask1k),
   bBid100k: nullable(row.rh_bid100k), bAsk100k: nullable(row.rh_ask100k), bBidRx: nullable(row.rh_bid_rx), bAskRx: nullable(row.rh_ask_rx),
   bBidTk: null, bAskTk: null, bTkAt: null,
+  decisionAt: null, aRxAt: null, bRxAt: null, aTkQty: null, bTkQty: null, aTkReceivedAt: null, bTkReceivedAt: null,
+  captureKind: row.legacy_aligned === 1 ? 'aligned' : null,
 });
 /** 两组按 t 升序的样本合并；同一时刻以新表为准。 */
 function mergeByTime(old: Sample[], fresh: Sample[]): Sample[] {
@@ -72,6 +74,7 @@ export function openVarLighterStore(file: string) {
     CREATE TABLE IF NOT EXISTS samples (symbol TEXT NOT NULL, t INTEGER NOT NULL, received_at INTEGER NOT NULL, regime TEXT NOT NULL,
       var_mark REAL NOT NULL, var_bid0 REAL NOT NULL, var_ask0 REAL NOT NULL, var_bid1k REAL NOT NULL, var_ask1k REAL NOT NULL, var_bid100k REAL, var_ask100k REAL, var_funding REAL,
       rh_at INTEGER NOT NULL, rh_bid0 REAL NOT NULL, rh_ask0 REAL NOT NULL, rh_mark REAL, rh_index REAL, rh_funding REAL, rh_bid1k REAL, rh_ask1k REAL, rh_bid100k REAL, rh_ask100k REAL,
+      rh_bid_rx REAL, rh_ask_rx REAL, var_bid_tk REAL, var_ask_tk REAL, var_tk_at REAL, legacy_aligned INTEGER,
       PRIMARY KEY (symbol, t)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS samples_t ON samples(t);
     CREATE TABLE IF NOT EXISTS paper_positions (id TEXT PRIMARY KEY, symbol TEXT NOT NULL, json TEXT NOT NULL);
@@ -86,8 +89,22 @@ export function openVarLighterStore(file: string) {
     CREATE INDEX IF NOT EXISTS leg_trades_closed ON leg_trades(closed_at);
     CREATE INDEX IF NOT EXISTS leg_trades_symbol ON leg_trades(symbol, closed_at);`);
     // v0.81.0、v0.82.0 给旧表加的可空列；新版本不再写旧表，但旧库可能还没有这些列（读旧样本时按列名读）。
+    db.exec('BEGIN IMMEDIATE');
     const existing = new Set((db.prepare('PRAGMA table_info(samples)').all() as { name: string }[]).map(column => column.name));
+    if (!existing.has('legacy_aligned')) {
+      // 只有从未加过判断盘口列的旧表才一次性登记现有行。默认 NULL 让回退后的新行保守地保持未知。
+      const preLive = ['rh_bid_rx', 'rh_ask_rx', 'var_bid_tk', 'var_ask_tk', 'var_tk_at'].every(column => !existing.has(column));
+      db.exec('ALTER TABLE samples ADD COLUMN legacy_aligned INTEGER');
+      if (preLive) db.exec('UPDATE samples SET legacy_aligned = 1');
+    }
     for (const column of ['rh_bid_rx', 'rh_ask_rx', 'var_bid_tk', 'var_ask_tk', 'var_tk_at']) if (!existing.has(column)) db.exec(`ALTER TABLE samples ADD COLUMN ${column} REAL`);
+    // 旧两腿表按列名读写。只添可空列，保留历史缺证状态，也兼容旧版本继续写入。
+    const legColumns = new Set((db.prepare('PRAGMA table_info(leg_samples)').all() as { name: string }[]).map(column => column.name));
+    for (const field of LEG_FIELDS) {
+      const column = snake(field);
+      if (!legColumns.has(column)) db.exec(`ALTER TABLE leg_samples ADD COLUMN ${column} ${columnType(field)}`);
+    }
+    db.exec('COMMIT');
   } catch (error) { db.close(); throw error; }
   const insertSample = db.prepare(`INSERT OR IGNORE INTO leg_samples(${LEG_COLUMNS.join(', ')}) VALUES (${LEG_COLUMNS.map(() => '?').join(', ')})`);
   const selectRange = db.prepare(`SELECT ${LEG_COLUMNS.join(', ')} FROM leg_samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t`);
@@ -120,7 +137,7 @@ export function openVarLighterStore(file: string) {
   const writeState = db.prepare('INSERT INTO state(key, json, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at');
   const transaction = <T>(work: () => T): T => {
     db.exec('BEGIN IMMEDIATE');
-    try { const result = work(); db.exec('COMMIT'); return result; } catch (error) { db.exec('ROLLBACK'); throw error; }
+    try { const result = work(); db.exec('COMMIT'); return result; } catch (error) { if (db.isTransaction) db.exec('ROLLBACK'); throw error; }
   };
   const legacy = (key: string, read: (old: string) => unknown[]): Sample[] => {
     const old = legacyKeyOf(key);
@@ -168,11 +185,12 @@ export function openVarLighterStore(file: string) {
     pruneEvents(now: number): void { pruneEvents.run(now - 30 * 86_400_000); },
     positions(): Position[] { return parse<Position>(allPositions.all()); },
     savePosition(position: Position): void { upsertPosition.run(position.id, position.symbol, JSON.stringify(position)); },
-    /** 平仓：删持仓、记成交、记事件在同一事务里。 */
-    closePosition(trade: ClosedTrade, event: { at: number; kind: string; message: string }): void {
+    /** 平仓时持仓、成交、事件和冷却一起提交。 */
+    closePosition(trade: ClosedTrade, event: { at: number; kind: string; message: string }, cooldown: Record<string, number>): void {
       transaction(() => {
         deletePosition.run(trade.id);
         insertTrade.run(trade.id, trade.symbol, trade.closedAt, trade.netUsd, JSON.stringify(trade));
+        writeState.run(COOLDOWN_KEY, JSON.stringify(cooldown), event.at);
         insertEvent.run(event.at, event.kind, trade.symbol, event.message);
       });
     },
@@ -189,9 +207,19 @@ export function openVarLighterStore(file: string) {
     netSince(since: number): number { return (netSince.get(since) as { net: number }).net; },
     event(at: number, kind: string, symbol: string | null, message: string): void { insertEvent.run(at, kind, symbol, message.slice(0, 500)); },
     events(limit: number): StoredEvent[] { return recentEvents.all(limit) as unknown as StoredEvent[]; },
-    /** 清空模拟盘（新表的持仓与成交），记一条事件。旧表不动（回退版本照常看到它们）。 */
+    /** 清空模拟盘的持仓、成交和冷却，保留事件历史。 */
     resetPaper(at: number): void {
-      transaction(() => { db.exec('DELETE FROM leg_positions; DELETE FROM leg_trades;'); insertEvent.run(at, 'reset', null, '模拟盘已清空'); });
+      transaction(() => {
+        db.exec('DELETE FROM leg_positions; DELETE FROM leg_trades;');
+        writeState.run(COOLDOWN_KEY, '{}', at);
+        insertEvent.run(at, 'reset', null, '模拟盘已清空');
+      });
+    },
+    saveSettings(settings: Settings, at: number, message: string): void {
+      transaction(() => {
+        writeState.run(SETTINGS_KEY, JSON.stringify(settings), at);
+        insertEvent.run(at, 'settings', null, message.slice(0, 500));
+      });
     },
     state<T>(key: string): T | null { const row = readState.get(key) as { json: string } | undefined; return row ? JSON.parse(row.json) as T : null; },
     setState(key: string, value: unknown, at: number): void { writeState.run(key, JSON.stringify(value), at); },
@@ -216,9 +244,9 @@ export function openVarLighterStore(file: string) {
           if (!trade) { skipped++; continue; }
           insertTrade.run(trade.id, trade.symbol, trade.closedAt, trade.netUsd, JSON.stringify(trade)); trades++;
         }
-        if (parsedSettings !== null) writeState.run('settings2', JSON.stringify(upgrade.settings(parsedSettings)), at);
+        if (parsedSettings !== null) writeState.run(SETTINGS_KEY, JSON.stringify(upgrade.settings(parsedSettings)), at);
         const oldCooldown = (readState.get('cooldown') as { json: string } | undefined)?.json;
-        if (oldCooldown) writeState.run('cooldown2', JSON.stringify(upgrade.cooldown(JSON.parse(oldCooldown))), at);
+        if (oldCooldown) writeState.run(COOLDOWN_KEY, JSON.stringify(upgrade.cooldown(JSON.parse(oldCooldown))), at);
         const result = { positions, trades, skipped };
         writeState.run(MIGRATED_KEY, JSON.stringify({ at, ...result }), at);
         if (positions || trades || parsedSettings !== null) insertEvent.run(at, 'migrate', null, `已升级为两腿口径：持仓 ${positions} 笔、成交 ${trades} 笔${skipped ? `，${skipped} 条无法识别未迁移` : ''}`);

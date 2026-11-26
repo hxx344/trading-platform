@@ -36,7 +36,7 @@ export function VarLighterPage({ tab, symbol, onExpired }: { tab: VarLighterTab;
   const { data, error, status, receivedAt } = live;
   return <div className="vl-page" data-varlighter>
     <header className="wb-heading"><div><h1>DEX 价差</h1>
-      <p>Var、Lighter RH、Lighter 主网与 Entropy 之间同一资产的价差采集、基线与回归套利，可自动配对也可手动配对。目前只做模拟盘：按公开报价撮合，不向任何交易所下单。</p></div>
+      <p>采集 Var、Lighter RH、Lighter 主网与 Entropy 的同资产价差，支持自动与手动配对。模拟盘按盘口或匹配成交数量的 Var 询价计算成交。</p></div>
       {data ? <Sources view={data} /> : null}</header>
     <nav className="vl-tabs" aria-label="DEX 价差页签">
       {VARLIGHTER_TABS.map(item => <a key={item.id} href={varLighterHref(item.id, item.id === 'detail' ? symbol : null)} aria-current={tab === item.id ? 'page' : undefined}>{item.label}</a>)}

@@ -370,9 +370,10 @@ const SAMPLE_FIELD_SET: Record<keyof Sample, true> = {
   symbol: true, t: true, receivedAt: true, regime: true, ratio: true,
   aAt: true, aMark: true, aIndex: true, aFunding: true, aBid0: true, aAsk0: true, aBid1k: true, aAsk1k: true, aBid100k: true, aAsk100k: true, aBidRx: true, aAskRx: true, aBidTk: true, aAskTk: true, aTkAt: true,
   bAt: true, bMark: true, bIndex: true, bFunding: true, bBid0: true, bAsk0: true, bBid1k: true, bAsk1k: true, bBid100k: true, bAsk100k: true, bBidRx: true, bAskRx: true, bBidTk: true, bAskTk: true, bTkAt: true,
+  decisionAt: true, aRxAt: true, bRxAt: true, aTkQty: true, bTkQty: true, aTkReceivedAt: true, bTkReceivedAt: true, captureKind: true,
 };
 export const SAMPLE_FIELDS = Object.keys(SAMPLE_FIELD_SET) as (keyof Sample)[];
-/** 样本格式版本：本机缓存（tools/varlighter）按它分目录，格式变了重新拉取。 */
+/** 两腿列格式。新增可空列追加在末尾，既有两腿缓存可按列名续拉。 */
 export const SAMPLE_FORMAT = 2;
 
 /**
@@ -393,49 +394,15 @@ export interface Sample {
   bAt: number; bMark: number | null; bIndex: number | null; bFunding: number | null;
   bBid0: number; bAsk0: number; bBid1k: number | null; bAsk1k: number | null; bBid100k: number | null; bAsk100k: number | null;
   bBidRx: number | null; bAskRx: number | null; bBidTk: number | null; bAskTk: number | null; bTkAt: number | null;
+  /** 异步采集结束后的决策时刻；旧样本没有这些证据。RxAt 是行情流一档最后确认时刻。 */
+  decisionAt: number | null; aRxAt: number | null; bRxAt: number | null;
+  /** 询价应答里经核对的该场所原始合约数量，以及本机收到应答的时刻。标的和场所在对应腿的配对键里。 */
+  aTkQty: number | null; bTkQty: number | null; aTkReceivedAt: number | null; bTkReceivedAt: number | null;
+  /** aligned 仅来自已证明不采决策盘口的原始旧表；无法区分的历史记录为 null。 */
+  captureKind: 'decision' | 'aligned' | null;
 }
 
 type Side = 'a' | 'b';
-const valid = (bid: number | null, ask: number | null): boolean => bid !== null && ask !== null && bid > 0 && ask >= bid;
-/** 一条腿要不要判断时刻的一档：行情流腿要，Var（轮询、靠询价）不要。 */
-function legsOf(sample: Sample): [VenueId, VenueId] | null {
-  const parsed = parsePairKey(sample.symbol);
-  return parsed ? [parsed.a.venue, parsed.b.venue] : null;
-}
-/** 一条腿按判断时刻的价：有询价按询价（各档都用它），否则有那一刻的一档就把各档平移过去（冲击沿用），都没有返回 null。 */
-function moveLeg(sample: Sample, side: Side): Partial<Sample> | null {
-  const get = <K extends string>(key: K) => sample[`${side}${key}` as keyof Sample] as number | null;
-  const tkBid = get('BidTk'), tkAsk = get('AskTk');
-  if (valid(tkBid, tkAsk)) return { [`${side}Bid0`]: tkBid, [`${side}Ask0`]: tkAsk, [`${side}Bid1k`]: tkBid, [`${side}Ask1k`]: tkAsk, [`${side}Bid100k`]: tkBid, [`${side}Ask100k`]: tkAsk };
-  const bid = get('BidRx'), ask = get('AskRx');
-  if (!valid(bid, ask)) return null;
-  const bid0 = get('Bid0')!, ask0 = get('Ask0')!;
-  const down = (value: number | null) => value === null ? null : bid! - Math.max(0, bid0 - value);
-  const up = (value: number | null) => value === null ? null : ask! + Math.max(0, value - ask0);
-  return { [`${side}Bid0`]: bid, [`${side}Ask0`]: ask, [`${side}Bid1k`]: down(get('Bid1k')), [`${side}Ask1k`]: up(get('Ask1k')), [`${side}Bid100k`]: down(get('Bid100k')), [`${side}Ask100k`]: up(get('Ask100k')) };
-}
-/**
- * 按判断时刻的价重算的样本：每条行情流腿的各档整体平移到那一刻的一档上（冲击沿用对齐时的），有询价的腿换成询价，
- * Var 腿没有询价时不变。任一行情流腿没有记录那一刻的一档（也没有询价）时返回 null。
- */
-export function executionSample(sample: Sample): Sample | null {
-  const venues = legsOf(sample) ?? ['var', 'rh'];
-  let result: Sample = sample;
-  for (const [index, side] of (['a', 'b'] as const).entries()) {
-    const moved = moveLeg(sample, side);
-    if (moved) result = { ...result, ...moved };
-    else if (isLive(venues[index])) return null;
-  }
-  return result;
-}
-
-/** 样本带不带可用的询价（任一腿）。 */
-export const hasTokenQuote = (sample: Sample): boolean => valid(sample.aBidTk, sample.aAskTk) || valid(sample.bBidTk, sample.bAskTk);
-/** 样本带不带判断时刻的一档（所有行情流腿都有）；回测用来找开始记录它的时刻。 */
-export function hasLiveTop(sample: Sample): boolean {
-  const venues = legsOf(sample) ?? ['var', 'rh'];
-  return (!isLive(venues[0]) || valid(sample.aBidRx, sample.aAskRx)) && (!isLive(venues[1]) || valid(sample.bBidRx, sample.bAskRx)) && (isLive(venues[0]) || isLive(venues[1]));
-}
 /** 两腿都是行情流的配对（采样节拍不受 Var 限制，基线按分钟抽样）。 */
 export const bothLive = (key: string): boolean => { const parsed = parsePairKey(key); return !!parsed && isLive(parsed.a.venue) && isLive(parsed.b.venue); };
 
@@ -451,25 +418,113 @@ export interface Spread {
   /** 两边中间价的基差（基点，相对折算后的 B 中间价）：A 贵为正。 */ mid: number;
   /** 卖 A、买 B 的可成交价差（基点）。 */ sellA: number;
   /** 买 A、卖 B 的可成交价差（基点）。 */ buyA: number;
-  /** 有一腿用一档价代替了按金额的成交均价。 */ estimated: boolean;
+  /** 有腿降档、使用历史盘口，或所需金额超出公开档位时为估算。 */ estimated: boolean;
   prices: { aBid: number; aAsk: number; bBid: number; bAsk: number; bMid: number };
+  /** Var 成交价来源，0 表示公开一档。精确询价另带折算成 A 的实际数量。 */
+  varSource?: VarPriceSource; varQtyA?: number;
 }
 export const midBasis = (sample: Sample): number => {
   const bMid = sample.ratio * ((sample.bBid0 + sample.bAsk0) / 2);
   return ((sample.aBid0 + sample.aAsk0) / 2 / bMid - 1) * 10_000;
 };
-/** 指定档位的可成交价差；1k 档缺按金额的价时用一档价估算，100k 档任一腿缺价不可算（null）。 */
-export function spreadOf(sample: Sample, bucket: SizeBucket): Spread | null {
-  const k = sample.ratio, bMid = k * ((sample.bBid0 + sample.bAsk0) / 2);
-  let aBid: number | null, aAsk: number | null, bBid: number | null, bAsk: number | null, estimated = false;
-  if (bucket === '1k') {
-    aBid = sample.aBid1k; aAsk = sample.aAsk1k; bBid = sample.bBid1k; bAsk = sample.bAsk1k;
-    if (aBid === null || aAsk === null) { aBid = sample.aBid0; aAsk = sample.aAsk0; estimated = true; }
-    if (bBid === null || bAsk === null) { bBid = sample.bBid0; bAsk = sample.bAsk0; estimated = true; }
-  } else {
-    aBid = sample.aBid100k; aAsk = sample.aAsk100k; bBid = sample.bBid100k; bAsk = sample.bAsk100k;
+interface LegPrice { bid: number; ask: number; mid: number; estimated: boolean }
+function combineSpread(a: LegPrice, b: LegPrice, ratio: number): Spread {
+  const bMid = ratio * b.mid, bBid = ratio * b.bid, bAsk = ratio * b.ask;
+  return { mid: (a.mid / bMid - 1) * 10_000, sellA: (a.bid - bAsk) / bMid * 10_000, buyA: (a.ask - bBid) / bMid * 10_000,
+    estimated: a.estimated || b.estimated, prices: { aBid: a.bid, aAsk: a.ask, bBid, bAsk, bMid } };
+}
+type Bucket = SizeBucket | '0';
+export type VarPriceSource = 'token' | Bucket;
+
+function publicLeg(sample: Sample, side: Side, bucket: SizeBucket, bid: number, ask: number, closing: boolean): (LegPrice & { bucket: Bucket }) | null {
+  let used: Bucket = bucket;
+  if (sample[`${side}Bid${used}`] === null || sample[`${side}Ask${used}`] === null) {
+    if (bucket === '100k' && !closing) return null;
+    used = sample[`${side}Bid1k`] !== null && sample[`${side}Ask1k`] !== null ? '1k' : '0';
   }
-  if (aBid === null || aAsk === null || bBid === null || bAsk === null || !(bMid > 0)) return null;
-  bBid = k * bBid; bAsk = k * bAsk;
-  return { mid: midBasis(sample), sellA: (aBid - bAsk) / bMid * 10_000, buyA: (aAsk - bBid) / bMid * 10_000, estimated, prices: { aBid, aAsk, bBid, bAsk, bMid } };
+  // 对手腿盘口的冲击沿用对齐时刻，整体平移到选用的一档；历史报价的平移量为零。
+  const filledBid = bid - Math.max(0, sample[`${side}Bid0`] - sample[`${side}Bid${used}`]!);
+  const filledAsk = ask + Math.max(0, sample[`${side}Ask${used}`]! - sample[`${side}Ask0`]);
+  if (!(filledBid > 0 && filledAsk >= filledBid)) return null;
+  return { bid: filledBid, ask: filledAsk, mid: (bid + ask) / 2, estimated: used !== bucket, bucket: used };
+}
+
+/** 指定公共档位的可成交价差。开仓信号只看对齐样本，大档缺价时不能用小档发现信号。 */
+export function spreadOf(sample: Sample, bucket: SizeBucket): Spread | null {
+  const a = publicLeg(sample, 'a', bucket, sample.aBid0, sample.aAsk0, false);
+  const b = publicLeg(sample, 'b', bucket, sample.bBid0, sample.bAsk0, false);
+  return a && b ? combineSpread(a, b, sample.ratio) : null;
+}
+
+export interface QuoteTarget { notionalUsd: number; qty?: number; ratio?: number; symbol?: string }
+/** Var 原生合约数量。新单按标记价取四位有效数字；持仓只用可精确表示的实际数量（B 腿为 A 数量乘乘数）。 */
+export function varQuoteQty(target: QuoteTarget, side: Side, ratio: number, mark: number | null): string | null {
+  const held = target.qty !== undefined;
+  const raw = held ? target.qty! * (side === 'a' ? 1 : ratio) : target.notionalUsd / (mark ?? 0);
+  if (!(raw > 0 && raw < 1e12)) return null;
+  const rounded = held ? raw : Number(raw.toPrecision(4));
+  if (rounded >= 1e12) return null;
+  const text = rounded.toFixed(8).replace(/\.?0+$/, '');
+  const qty = Number(text);
+  if (!(qty > 0) || (held && Math.abs(qty - raw) > 2 * Number.EPSILON * raw)) return null;
+  return text;
+}
+
+export const TOKEN_QUOTE_MAX_AGE_MS = 15_000;
+interface FillLeg extends LegPrice { at: number | null; varSource?: VarPriceSource; varQtyA?: number }
+function tokenFill(sample: Sample, side: Side, target: QuoteTarget): FillLeg | null {
+  const qty = sample[`${side}TkQty`], bid = sample[`${side}BidTk`], ask = sample[`${side}AskTk`];
+  if (qty === null || bid === null || ask === null || !(bid > 0 && ask >= bid)) return null;
+  const at = sample[`${side}TkAt`], received = sample[`${side}TkReceivedAt`], decision = sample.decisionAt;
+  if (at === null || received === null || decision === null || !(received <= decision && at <= received + 2_000 && decision - at <= TOKEN_QUOTE_MAX_AGE_MS)) return null;
+  const expected = varQuoteQty(target, side, sample.ratio, sample[`${side}Mark`]);
+  if (expected === null || qty !== Number(expected)) return null;
+  return { bid, ask, mid: (bid + ask) / 2, at, estimated: false, varSource: 'token', varQtyA: side === 'a' ? qty : qty / sample.ratio };
+}
+function decisionTop(sample: Sample, side: Side): { bid: number; ask: number } | null {
+  const bid = sample[`${side}BidRx`], ask = sample[`${side}AskRx`];
+  return bid !== null && ask !== null && bid > 0 && ask >= bid ? { bid, ask } : null;
+}
+/** 仅用于解释该样本为何无法成交。 */
+export function missingDecisionTop(sample: Sample): boolean {
+  const pair = parsePairKey(sample.symbol);
+  return !!pair && (['a', 'b'] as const).some(side => isLive(pair[side].venue) && !decisionTop(sample, side));
+}
+function fillLeg(sample: Sample, side: Side, venue: VenueId, target: QuoteTarget, execution: boolean, hedgeQtyA?: number): FillLeg | null {
+  const closing = target.qty !== undefined;
+  let bid = sample[`${side}Bid0`], ask = sample[`${side}Ask0`], at: number | null = sample[`${side}At`], missingTop = false;
+  if (execution && venue === 'var') {
+    const token = tokenFill(sample, side, target);
+    if (token) return token;
+  } else if (execution && isLive(venue)) {
+    const top = decisionTop(sample, side);
+    if (top) {
+      bid = top.bid; ask = top.ask; at = sample[`${side}RxAt`];
+    } else {
+      if (!closing) return null;
+      missingTop = true;
+    }
+  }
+  const qtyA = target.qty ?? hedgeQtyA;
+  const usd = qtyA === undefined ? target.notionalUsd : qtyA * (side === 'a' ? 1 : sample.ratio) * ((bid + ask) / 2);
+  const level = publicLeg(sample, side, bucketOf(usd), bid, ask, closing);
+  return level && { ...level, at, estimated: level.estimated || usd > 100_000 || missingTop || (execution && at === null),
+    varSource: venue === 'var' ? level.bucket : undefined };
+}
+
+/** 逐腿选取目标数量的成交价与来源时刻。持仓缺完整盘口时可按公共小档估算；开仓必须有全部行情流腿的判断盘口。 */
+export function targetSpread(sample: Sample, target: QuoteTarget, execution: boolean): { spread: Spread; oldestAt: number | null } | null {
+  const pair = parsePairKey(sample.symbol);
+  if (!pair || pair.ratio !== sample.ratio || (target.symbol !== undefined && target.symbol !== sample.symbol) || (target.ratio !== undefined && target.ratio !== sample.ratio)) return null;
+  // 先决定 Var 腿是否按精确数量成交，对手腿再按实际对冲数量取公共档。无 Var 的配对照常从 A 开始。
+  const first = pair.b.venue === 'var' ? 'b' : 'a', second = first === 'a' ? 'b' : 'a';
+  const one = fillLeg(sample, first, pair[first].venue, target, execution);
+  if (!one) return null;
+  const two = fillLeg(sample, second, pair[second].venue, target, execution, one.varQtyA);
+  const a = first === 'a' ? one : two, b = first === 'b' ? one : two;
+  if (!a || !b) return null;
+  const spread = combineSpread(a, b, sample.ratio), source = a.varSource ?? b.varSource, qty = a.varQtyA ?? b.varQtyA;
+  if (source !== undefined) spread.varSource = source;
+  if (qty !== undefined) spread.varQtyA = qty;
+  return { spread, oldestAt: a.at === null || b.at === null ? null : Math.min(a.at, b.at) };
 }

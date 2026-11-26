@@ -1,7 +1,7 @@
 // DEX 价差模块（原 Var/Lighter）各接口的应答结构（docs/varlighter.md 第 9 节、docs/dexspread.md 第 6 节）。只有类型，引擎按这些类型返回，
 // 页面按这些类型读取；不引用 node 模块，前端类型检查可以直接导入。
 import type { BacktestResult } from './backtest.ts';
-import type { AssetKind, Combo, CustomPair, Identity, LegInfo, LiveVenue, Regime, Sample, SizeBucket, VenueId } from './model.ts';
+import type { AssetKind, Combo, CustomPair, Identity, LegInfo, LiveVenue, Regime, Sample, SizeBucket, VarPriceSource, VenueId } from './model.ts';
 import type { OrderPlan } from './plan.ts';
 import type { RegimeStats } from './stats.ts';
 import type { ClosedTrade, Direction, GlobalParams, Position, SymbolParams } from './strategy.ts';
@@ -74,7 +74,7 @@ export interface StateView {
 }
 
 export interface SymbolPoint { t: number; mid: number; sellA: number | null; buyA: number | null; median: number | null; sigma: number | null; regime: Regime; estimated: boolean }
-export interface PositionMark { netUsd: number; pnlBps: number; at: number }
+export interface PositionMark { netUsd: number; pnlBps: number; at: number; estimated: boolean; varSource?: VarPriceSource }
 export interface SymbolView {
   key: string; a: LegInfo & { name: string }; b: LegInfo & { name: string }; ratio: number; custom: boolean; note: string; venue: VenueId; venueName: string;
   symbol: string; name: string; kind: AssetKind; kindName: string; identity: Identity; eligible: boolean; gapBps: number | null;

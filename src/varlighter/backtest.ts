@@ -1,6 +1,6 @@
 // 单标的回测（docs/varlighter.md 第 6 节）：用已采集的对齐样本按时间重放，与模拟盘同一套基线、开平仓与风控规则。
 // 基线在每个样本判断之后才把该样本计入，不看未来；from 之前的样本只用来预热基线。
-import { bothLive, hasLiveTop, hasTokenQuote, upgradeKey, bucketOf, spreadOf, type AssetKind, type Sample } from './model.ts';
+import { bothLive, upgradeKey, type AssetKind, type Sample, type VarPriceSource } from './model.ts';
 import { BaselineTracker, LIVE_BASELINE_GAP_MS } from './stats.ts';
 import { DEFAULT_SYMBOL, ParamsError, closePosition, closeSpread, confirmOpen, decide, fundingEstimate, openEconomics, openBlocker, openPosition, readGlobalParams, readSymbolParams, type ClosedTrade, type GlobalParams, type LegFees, type Position, type SymbolParams } from './strategy.ts';
 
@@ -9,6 +9,9 @@ export interface BacktestSummary {
   netUsd: number; grossUsd: number; costUsd: number; fundingUsd: number;
   avgNetBps: number | null; avgHoldMinutes: number | null; maxDrawdownUsd: number;
   /** 期末仍未平仓的持仓按最后一个样本的可成交价估值（美元，已扣平仓成本）。 */ openMarkUsd: number | null;
+  openMarkEstimated: boolean | null; openMarkVarSource: VarPriceSource | null;
+  /** 回放期内可证实的旧采样数、其中估算开仓数、以及决策时间无法考证的样本数。 */
+  alignedSamples: number; alignedOpens: number; unknownDecisionSamples: number;
   /** 有基线可判断的样本数与按原因统计的不开仓次数（只计偏离已达入场阈值的样本）。 */ evaluated: number; blocked: Record<string, number>;
   reasons: Record<string, number>;
 }
@@ -28,19 +31,21 @@ export function runBacktest(symbol: string, kind: AssetKind, samples: readonly S
   const blocked: Record<string, number> = {};
   let position: Position | null = null, cooldownUntil = 0, evaluated = 0, counted = 0, cumulative = 0, peak = 0, maxDrawdown = 0;
   let day = -1, dayNet = 0, sequence = 0;
+  let alignedSamples = 0, alignedOpens = 0, unknownDecisionSamples = 0;
   let last: Sample | null = null;
-  const liveFrom = samples.find(hasLiveTop)?.t ?? Infinity;
   for (const sample of samples) {
     if (sample.t > to) break;
     if (sample.t >= from) {
       counted++;
+      if (sample.captureKind === 'aligned') alignedSamples++;
+      else if (sample.decisionAt == null) unknownDecisionSamples++;
       const today = Math.floor(sample.t / 86_400_000);
       if (today !== day) { day = today; dayNet = 0; }
       const baseline = tracker.value(sample.regime, sample.t);
       if (baseline) evaluated++;
       const decision = decide(sample, baseline, effective, position);
       if (decision.kind === 'close' && position) {
-        const trade = closePosition(position, sample.t, closeSpread(sample, position, decision.spread), decision.reason, settings, fundingEstimate(position, sample.t, sample.aFunding, sample.bFunding));
+        const trade = closePosition(position, sample.t, closeSpread(sample, position) ?? decision.spread, decision.reason, settings, fundingEstimate(position, sample.t, sample.aFunding, sample.bFunding));
         trades.push(trade);
         cumulative += trade.netUsd; dayNet += trade.netUsd;
         peak = Math.max(peak, cumulative); maxDrawdown = Math.max(maxDrawdown, peak - cumulative);
@@ -48,22 +53,26 @@ export function runBacktest(symbol: string, kind: AssetKind, samples: readonly S
         position = null;
         cooldownUntil = sample.t + params.cooldownMinutes * 60_000;
       } else if (decision.kind === 'open' && baseline) {
-        // 与模拟盘同序：先按判断时刻的一档复核，再过风控。开始记录那一刻一档（liveFrom）之前的旧样本沿用样本本身；
-        // 之后的样本没有它说明当时行情流不可用，与模拟盘一样不开仓。
-        const confirmed = confirmOpen(sample, baseline, effective, decision, sample.t >= liveFrom);
+        const confirmed = confirmOpen(sample, baseline, effective, decision, settings.maxQuoteAgeSec);
         const reason = typeof confirmed === 'string' ? confirmed : openBlocker(sample, effective, settings, {
-          openPositions: 0, openNotionalUsd: 0, dailyNetUsd: dayNet, cooldownUntil, eligible: true, feeUnknown: !fees, fallbackBaseline: baseline.fallback, ...openEconomics(confirmed.decision, effective, costs, hasTokenQuote(sample) ? decision : undefined) });
+          openPositions: 0, openNotionalUsd: 0, dailyNetUsd: dayNet, cooldownUntil, eligible: true, feeUnknown: !fees, fallbackBaseline: baseline.fallback, ...openEconomics(confirmed, effective, costs, confirmed.spread.varSource === 'token' ? decision : undefined) });
         if (reason) blocked[reason] = (blocked[reason] ?? 0) + 1;
-        else if (typeof confirmed !== 'string') position = openPosition(`bt-${++sequence}`, confirmed.sample, effective, confirmed.decision, baseline, costs);
+        else if (typeof confirmed !== 'string') {
+          position = openPosition(`bt-${++sequence}`, sample, effective, confirmed, baseline, costs);
+          if (sample.captureKind === 'aligned') alignedOpens++;
+        }
       }
       last = sample;
     }
     tracker.push(sample);
   }
-  let openMarkUsd: number | null = null;
+  let openMarkUsd: number | null = null, openMarkEstimated: boolean | null = null, openMarkVarSource: VarPriceSource | null = null;
   if (position && last) {
-    const quoted = spreadOf(last, bucketOf(position.notionalUsd)), spread = quoted && closeSpread(last, position, quoted);
-    if (spread) openMarkUsd = closePosition(position, last.t, spread, 'manual', settings, null).netUsd;
+    const spread = closeSpread(last, position);
+    if (spread) {
+      openMarkUsd = closePosition(position, last.t, spread, 'manual', settings, null).netUsd;
+      openMarkEstimated = spread.estimated; openMarkVarSource = spread.varSource ?? null;
+    }
   }
   const wins = trades.filter(trade => trade.netUsd > 0).length;
   const reasons: Record<string, number> = {};
@@ -76,7 +85,7 @@ export function runBacktest(symbol: string, kind: AssetKind, samples: readonly S
       netUsd: sum(trade => trade.netUsd), grossUsd: sum(trade => trade.grossUsd), costUsd: sum(trade => trade.costUsd), fundingUsd: sum(trade => trade.fundingUsd ?? 0),
       avgNetBps: trades.length ? sum(trade => trade.netBps) / trades.length : null,
       avgHoldMinutes: trades.length ? sum(trade => trade.closedAt - trade.openedAt) / trades.length / 60_000 : null,
-      maxDrawdownUsd: maxDrawdown, openMarkUsd, evaluated, blocked, reasons,
+      maxDrawdownUsd: maxDrawdown, openMarkUsd, openMarkEstimated, openMarkVarSource, alignedSamples, alignedOpens, unknownDecisionSamples, evaluated, blocked, reasons,
     },
   };
 }

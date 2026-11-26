@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { BUSY_BLOCK, COST_BLOCK, DECAYED, FALLBACK_BLOCK, FEE_BLOCK, NO_LIVE_TOP, NO_QUOTE_TIME, STALE_QUOTE, THIN_BLOCK, closeSpread, confirmOpen, expectedNetBps, openEconomics, slippageBudgetBps } from '../src/varlighter/strategy.ts';
-import { DEFAULT_COMBOS, SAMPLE_FIELDS, comboPairs, customPairInfo, sameSymbol, targetSpread, formatRatio, varQuoteQty, legacyKeyOf, lighterMarket, pairKey, pairTitle, parseEntropyMarkets, upgradeKey, varMarket, type MarketSpec } from '../src/varlighter/model.ts';
+import { DEFAULT_COMBOS, SAMPLE_FIELDS, comboPairs, customPairInfo, sameSymbol, sizeBucket, targetSpread, formatRatio, varQuoteQty, legacyKeyOf, lighterMarket, pairKey, pairTitle, parseEntropyMarkets, upgradeKey, varMarket, type MarketSpec } from '../src/varlighter/model.ts';
 import type { SamplesView } from '../src/varlighter/views.ts';
 import { TOKEN_BLOCK_PAUSE_MS, TOKEN_ERROR_KEEP_MS, TOKEN_SYMBOL_PAUSE_MS, TOKEN_QUOTE_MAX_AGE_MS, TOKEN_QUOTE_PHASE_MS, createVarQuoter, parseTokenQuote, varInstrument, type VarQuoter } from '../src/varlighter/varquote.ts';
 import { VARIATIONAL_SESSION_FILE } from '../src/monitor/variational-session.ts';
@@ -1038,6 +1038,27 @@ test('持仓取价：100k 档缺盘口快照时退回 1k 档估算，超时与�
   assert.equal(decide(now, null, params, null).kind, 'wait', '开仓仍要求该档完整报价');
 });
 
+test('持仓取档：1000 美元的仓市值漂过分档线仍按 1k 档平仓与止损，超出名义金额两成才按市值换档', () => {
+  // 开仓后两腿各涨 0.3%：市值 1003 美元。B 腿 100k 档的冲击约 50 基点，1k 档 1 基点。
+  const key = 'rh:NVDA|entropy:NVDA', params: SymbolParams = { ...DEFAULT_SYMBOL, stopBps: 60 };
+  const held = position(key, { direction: 'a_cheap', openedAt: T0, qty: 10, notionalUsd: 1_000, entrySpread: -12, aEntry: 100, bEntry: 100.12 });
+  const live = (aMid: number, bMid: number) => sample(T0 + 5_000, aMid, bMid, { symbol: key, aBidRx: aMid - 0.01, aAskRx: aMid + 0.01, aRxAt: T0 + 5_000,
+    aBid100k: aMid - 0.05, aAsk100k: aMid + 0.05, bBid100k: bMid - 0.5, bAsk100k: bMid + 0.5 });
+  const drifted = live(100.3, 100.42);
+  assert.deepEqual([sizeBucket(1000.03, 1000), sizeBucket(1200, 1000), sizeBucket(1200.01, 1000), sizeBucket(999, 1100), sizeBucket(800, 1100)], ['1k', '1k', '100k', '100k', '1k']);
+  const mark = positionSpread(drifted, held)!, exit = closeSpread(drifted, held)!;
+  assert.deepEqual([mark.prices.aBid, mark.prices.bAsk, mark.estimated], [drifted.aBid1k, drifted.bAsk1k, false], '止损判断用 1k 档');
+  assert.deepEqual([exit.prices.aBid, exit.prices.bAsk, exit.estimated], [drifted.aBid1k, drifted.bAsk1k, false], '平仓成交用 1k 档');
+  assert.equal(decide(drifted, null, params, held).kind, 'hold', '按 100k 档会算出约 −60 基点而止损');
+  const trade = closePosition(held, drifted.t, exit, 'manual', { slippageBps: 0 }, null);
+  assert.ok(Math.abs(trade.grossUsd - (drifted.aBid1k! - 100 + 100.12 - drifted.bAsk1k!) * 10) < 1e-9);
+  // 真的亏到止损线照常止损；市值涨过两成（B 腿 125）才按 100k 档。
+  const crash = decide(live(99.5, 100.42), null, params, held);
+  assert.equal(crash.kind === 'close' && crash.reason, 'stop');
+  const doubled = live(125, 125);
+  assert.deepEqual([positionSpread(doubled, held)?.prices.bAsk, closeSpread(doubled, held)?.prices.bAsk], [doubled.bAsk100k, doubled.bAsk100k]);
+});
+
 test('Lighter 行情流：握手不完成按超时重连，沉默重连，退避增长且封顶 60 秒', t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   let clock = T0;
@@ -1124,7 +1145,7 @@ test('失联配对：总览列出，可停用，持仓按最后样本平仓并�
     assert.deepEqual(code(() => engine.views.close({ symbol: 'rh:BTC' })), [409, 'no_quote'], '还在目录里的配对要 10 分钟内的报价（旧键照样认）');
     const mark = engine.views.paper().positions.find(item => item.symbol === GONE)!.mark!;
     const trade = engine.views.close({ symbol: GONE });
-    assert.deepEqual([mark.varSource, trade.exitVarSource, trade.aExit, trade.netUsd], ['100k', '100k', 100.1 + 0.05, mark.netUsd], '失联仓最后样本的小数量询价不能用于该仓，估值与手动结算一致');
+    assert.deepEqual([mark.varSource, trade.exitVarSource, trade.aExit, trade.netUsd], ['1k', '1k', 100.1 + 0.02, mark.netUsd], '失联仓最后样本的小数量询价不能用于该仓，估值与手动结算一致；市值 1001 美元仍按名义金额的 1k 档');
     assert.equal(trade.closedAt, T0 - 30 * 60_000, '失联配对按最后样本结算');
     assert.match(engine.views.paper().events[0].message, /配对已不在目录里.*按最后样本/);
     const disabled = engine.views.settings({ revision: 3, symbols: { [GONE]: { ...DEFAULT_SYMBOL, enabled: false } } });

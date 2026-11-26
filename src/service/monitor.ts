@@ -2,7 +2,7 @@
 // that block is there, and each market only when it is named. Their history sits in monitor.sqlite; a file that cannot be
 // opened costs only the monitor page.
 import type { MarketClient } from '../market/ipc.ts';
-import { createChainArbReader } from '../chain-arb/read.ts';
+import { createChainArbMarket } from '../chain-arb/read.ts';
 import { ContractError } from '../contracts.ts';
 import { createRemoteMonitor } from './remote-monitor.ts';
 import { perpetualQualityEnv } from '../monitor/quality-config.ts';
@@ -40,7 +40,9 @@ export interface MonitorRuntime {
   variational: VariationalSession | null;
   /** M-4a: every venue's perpetual quotes, in memory only; present when `perpetual` is configured. */
   perpetual: PerpetualMonitor | null;
-  chainArb?: ReturnType<typeof createChainArbReader>;
+  chainArb?: ReturnType<typeof createChainArbMarket>['chainArb'];
+  scanChainArb?: ReturnType<typeof createChainArbMarket>['scanChainArb'];
+  closeChainArb?: () => void;
   /** M-5b1: the perpetual collector's public-data cache (perpetual-cache.sqlite); null when not configured or not openable. */
   perpetualCache: PerpetualCache | null;
 }
@@ -107,8 +109,8 @@ export function openMonitor(config: MonitorConfig, dir: string, { fetchImpl, now
         ...(perpetualCache ? {} : { cacheUnavailable: `缓存库 ${PERPETUAL_CACHE_FILE} 打不开，市场指标、历史资金费、成交价历史与质量样本只存内存，重启后重新采集。` }),
         paper: { store: paperStore, unavailableReason: paperUnavailable }, ...perpetualOptions, ...(remote ? { remote: remote.perpetual } : {}),
         quality: { ...perpetualQualityEnv(env, log ?? (line => process.stderr.write(`${line}\n`))), ...perpetualOptions?.quality } }) : null;
-      const chainArb = config.perpetual ? remote?.chainArb ?? createChainArbReader({ now, fetchImpl }) : undefined;
-      return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, goldoil, hynix, exchanges, alerts, control, variational, perpetual, perpetualCache, chainArb };
+      const chain = !config.perpetual ? {} : remote ? { chainArb: remote.chainArb, scanChainArb: remote.scanChainArb } : createChainArbMarket({ now, fetchImpl });
+      return { config, store, anthropic: config.anthropic ? createAnthropicMonitor(options) : null, oil, goldoil, hynix, exchanges, alerts, control, variational, perpetual, perpetualCache, ...chain };
     } catch (error) { perpetualCache?.close(); throw error; }
   } catch (error) { store.close(); throw error; }
 }
@@ -139,6 +141,7 @@ export function monitorViews(monitor: MonitorRuntime) {
     /** M-4a: the perpetual collector (snapshot, summary, the SSE stream); undefined when it is not configured. */
     perpetual: (): PerpetualMonitor | undefined => monitor.perpetual ?? undefined,
     chainArb: monitor.chainArb,
+    scanChainArb: monitor.scanChainArb,
     /** The settled funding history (M-2d); undefined when the market is not configured; before any settlement
      * `{ notReady }` with why the last round failed (null while the first round has not failed). */
     funding: (market: 'oil' | 'hynix'): unknown => {
@@ -235,6 +238,7 @@ export const monitorLoops = (monitor: MonitorRuntime, context: LoopContext, log:
 /** Ends the requests in flight (at stopping), so the loops finish within the drain. */
 export const stopMonitor = (monitor: MonitorRuntime): void => { monitor.anthropic?.stop(); monitor.oil?.stop(); monitor.goldoil?.stop(); monitor.hynix?.stop(); monitor.exchanges?.stop(); monitor.variational?.stop(); monitor.perpetual?.stop(); };
 export const closeMonitor = (monitor: MonitorRuntime): void => {
+  monitor.closeChainArb?.();
   try { monitor.store.close(); } catch { /* best effort */ }
   try { monitor.perpetualCache?.close(); } catch { /* best effort */ }
 };

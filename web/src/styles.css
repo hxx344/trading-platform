@@ -364,7 +364,16 @@ span.news-coin{cursor:default}
 .chain-arb-page input,.chain-arb-page select{color:var(--text-primary)}
 .chain-arb-address{grid-column:span 2}
 .chain-arb-address input,.chain-arb-page dd{font-variant-numeric:tabular-nums}
+.chain-arb-scan-controls{display:flex;align-items:end;flex-wrap:wrap;gap:var(--space-md)}
+.chain-arb-scan-controls label{flex:0 1 auto}
+.chain-arb-fees summary{cursor:pointer;color:var(--text-secondary);font-size:.8125rem}
+.chain-arb-fees .chain-arb-fields{margin-top:var(--space-sm)}
+.chain-arb-ranking td{white-space:nowrap}
+.chain-arb-ranking td small{display:block;color:var(--text-tertiary)}
+.chain-arb-ranking td.num,.chain-arb-ranking th:nth-child(n+3):nth-child(-n+7){text-align:right}
 @media(max-width:760px){
+  .chain-arb-scan-controls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+  .chain-arb-scan-controls button{justify-self:start}
   .chain-arb-fields{grid-template-columns:repeat(2,minmax(0,1fr))}
   .chain-arb-routes{grid-template-columns:minmax(0,1fr)}
   .chain-arb-page .facts{grid-template-columns:max-content minmax(0,1fr);gap:var(--space-xs) var(--space-md)}

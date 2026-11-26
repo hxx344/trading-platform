@@ -9,7 +9,10 @@ const networks = {
 } as const;
 
 type DexInput = { chain: keyof typeof networks; address: string; amount: string };
-export interface DexQuote { rawQuantity: string; decimals: number; at: number }
+export function isSettlementOrNative(chain: DexInput['chain'], address: string): boolean {
+  return address.toLowerCase() === networks[chain].usdt || /^0x(?:0{40}|e{40})$/i.test(address);
+}
+export interface DexQuote { rawQuantity: string; decimals: number; at: number; swapGasUsdt?: number | null }
 type Fetcher = (url: string, init: RequestInit) => Promise<Response>;
 const maxUint256 = (1n << 256n) - 1n;
 
@@ -31,7 +34,8 @@ async function readSource(fetcher: Fetcher, url: string, init: RequestInit, sign
   // Kyber 的 400 响应含有可区分「无路由」与「代币未收录」的数字代码。
   if (!response.ok && !(name === 'KyberSwap' && response.status === 400)) {
     void response.body?.cancel().catch(() => {});
-    throw new Error(response.status === 429 ? `${name}请求受限，请稍后刷新` : `${name}不可用（HTTP ${response.status}）`);
+    if (response.status === 429) throw Object.assign(new Error(`${name}请求受限，请稍后刷新`), { status: 429 });
+    throw new Error(`${name}不可用（HTTP ${response.status}）`);
   }
   try {
     const data = await readJsonResponse(response, { maxBytes, signal });
@@ -81,7 +85,13 @@ async function quote(fetcher: Fetcher, chain: keyof typeof networks, address: st
   if ((typeof timestamp !== 'string' && typeof timestamp !== 'number') || !/^[1-9]\d{0,9}$/.test(String(timestamp))) {
     throw new Error('KyberSwap 缺少有效报价时间');
   }
-  return { rawQuantity: route.amountOut, at: Number(timestamp) * 1000 };
+  // Convert the route's USD gas estimate using its own USD valuation of the USDT input.
+  const usd = (value: unknown) => typeof value === 'string' && /^(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(value)
+    && value.length <= 80 ? Number(value) : NaN;
+  const gasUsd = usd(route.gasUsd), amountInUsd = usd(route.amountInUsd);
+  const gas = (Number(amountIn) / 10 ** networks[chain].decimals) * gasUsd / amountInUsd;
+  const swapGasUsdt = gasUsd > 0 && amountInUsd > 0 && Number.isFinite(gas) && gas > 0 ? gas : null;
+  return { rawQuantity: route.amountOut, at: Number(timestamp) * 1000, swapGasUsdt };
 }
 
 export async function readDex(input: DexInput, signal: AbortSignal, fetcher: Fetcher = fetch): Promise<DexQuote> {
@@ -89,7 +99,7 @@ export async function readDex(input: DexInput, signal: AbortSignal, fetcher: Fet
   const network = networks[input.chain];
   if (typeof input.address !== 'string' || !/^0x[a-f\d]{40}$/i.test(input.address)) throw new Error('目标代币的合约地址无效');
   const address = input.address.toLowerCase();
-  if (address === network.usdt || /^0x(?:0{40}|e{40})$/.test(address)) throw new Error('请选择 USDT 以外的 ERC-20 代币合约');
+  if (isSettlementOrNative(input.chain, address)) throw new Error('请选择 USDT 以外的 ERC-20 代币合约');
   const amountIn = usdtUnits(input.amount, network.decimals);
   if (signal.aborted) throw new Error('链上报价请求已中止');
   const local = new AbortController();

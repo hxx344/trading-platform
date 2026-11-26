@@ -125,6 +125,7 @@ export interface ServiceViews {
     /** M-3c: false for a configured market switched off (its reads answer 423); the page's switch. */
     enabled?(market: keyof typeof MONITOR_NAMES): boolean;
     chainArb?(input: unknown, signal: AbortSignal): Promise<unknown>;
+    scanChainArb?(input: unknown, scope: string, signal: AbortSignal): Promise<unknown>;
     setControl?(market: keyof typeof MONITOR_NAMES, body: unknown): unknown;
     /** M-3d: the saved Variational token (state without the token, and the page's save); undefined when oil is not configured. */
     variationalSession?(): { view(): unknown; update(body: unknown): Promise<unknown> } | undefined;
@@ -338,6 +339,7 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
   const readViews = new ReadViewCache();
   const negotiated = new WeakMap<ServerResponse, { key: string; known: string }>();
   const monitorReads = new WeakMap<ServerResponse, { market: keyof typeof MONITOR_NAMES; revision?: number }>();
+  const scanInstance = randomBytes(12).toString('hex');
   function negotiate(request: IncomingMessage, response: ServerResponse, url: URL, body?: unknown): void {
     const known = request.headers[READ_CACHE];
     if (typeof known !== 'string' || (known !== '1' && versionLength(known) < 0) || !isDisplayRead(request.method!, url.pathname)) return;
@@ -624,10 +626,11 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
         if (isDisplayRead(request.method!, url.pathname)) monitorReads.set(response, { market: marketRead, revision: state.controls?.[marketRead]?.revision });
       }
     }
-    if (request.method === 'GET' && url.pathname === '/api/monitor/perpetual/chain-arb') {
+    const scanChainArb = url.pathname === '/api/monitor/perpetual/chain-arb-scan';
+    if (request.method === 'GET' && (scanChainArb || url.pathname === '/api/monitor/perpetual/chain-arb')) {
       const monitor = views?.monitor;
       const state = monitor?.state();
-      if (!monitor?.chainArb || !state?.markets.includes('perpetual')) return send(response, 404, { code: 'not_found', message: '请先在设置中启用行情监控的合约价差' });
+      if (!state?.markets.includes('perpetual') || !(scanChainArb ? monitor?.scanChainArb : monitor?.chainArb)) return send(response, 404, { code: 'not_found', message: '请先在设置中启用行情监控的合约价差' });
       monitorReads.set(response, { market: 'perpetual', revision: state.controls?.perpetual?.revision });
       const query = Object.fromEntries(url.searchParams);
       if (Object.keys(query).length !== url.searchParams.size) return send(response, 400, { code: 'invalid_query', message: '查询参数重复' });
@@ -635,7 +638,9 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
       const cancel = () => controller.abort();
       response.once('close', cancel);
       try {
-        const view = await monitor.chainArb(query, controller.signal);
+        const view = scanChainArb
+          ? await monitor!.scanChainArb!(query, scanInstance + ':' + (state.controls?.perpetual?.revision ?? 0), controller.signal)
+          : await monitor!.chainArb!(query, controller.signal);
         if (!response.destroyed) send(response, 200, view);
       } catch (error) {
         if (!response.destroyed) {

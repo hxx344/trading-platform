@@ -17,7 +17,7 @@
 
 方案、决策与进度见 [docs/plan.md](docs/plan.md)；执行器的状态机语义、回滚与已知限制见 [docs/executor.md](docs/executor.md)。
 
-「链上 → 链上折价套利」可按买入预算比较指定代币的链上买入价、Gate 现货卖出价和永续开空价。在设置页导入行情监控后可用。支持的链、充提检查和两条路线的收益算法见 [docs/chain-arb.md](docs/chain-arb.md)。
+「链上 → 链上折价套利」会自动匹配 Gate 现货和永续市场的链上代币，按扣除手续费、买入 Gas 和所设其他成本后的价差排名。可直接打开榜单中的币种重新测算。在设置页导入行情监控后可用。支持的链、充提检查和两条路线的收益算法见 [docs/chain-arb.md](docs/chain-arb.md)。
 
 ## 开发
 

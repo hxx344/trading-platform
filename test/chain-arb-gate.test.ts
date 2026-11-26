@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createGateReader } from '../src/chain-arb/gate.ts';
+import { createScanCatalog } from '../src/chain-arb/catalog.ts';
+import { parseChainArb } from '../src/chain-arb/model.ts';
 
 const now = 1_795_690_885_886;
 const address = '0x912CE59144191C1204E64559FE8253a0e49E6548';
@@ -25,15 +27,17 @@ const paths: Record<string, Key> = {
   '/api/v4/futures/usdt/contracts/ARB_USDT': 'contract', '/api/v4/spot/order_book?currency_pair=ARB_USDT&limit=100': 'spot',
   '/api/v4/futures/usdt/order_book?contract=ARB_USDT&limit=100': 'perp',
 };
-function setup(values: Partial<Record<Key, unknown>> = {}) {
+function setup(values: Partial<Record<Key, unknown>> = {}, symbol = 'ARB') {
   const counts = { currency: 0, pair: 0, contract: 0, spot: 0, perp: 0 };
+  const expected = new Map(Object.entries(paths).map(([path, key]) => [path.replace('ARB', encodeURIComponent(symbol)), key]));
   let time = now;
   const read = createGateReader({ clock: () => time, fetcher: async (url, init) => {
     const route = new URL(url);
     assert.equal(route.origin, 'https://api.gateio.ws');
     assert.equal(init.method, 'GET');
     assert.equal(init.redirect, 'error');
-    const key = paths[route.pathname + route.search];
+    assert.equal(url, route.href);
+    const key = expected.get(route.pathname + route.search);
     assert.ok(key, 'Only the five fixed public Gate routes are used');
     const headers = new Headers(init.headers);
     assert.equal(headers.get('X-Gate-Size-Decimal'), key === 'contract' || key === 'perp' ? '1' : null);
@@ -52,6 +56,26 @@ test('Gate 按链及合约匹配币种，从两种原始时间单位读取盘口
     spot: { bids: [['3.2', '600'], ['3.1', '42']], at: now - 122, step: '0.01', minQuantity: '1', minNotional: '3', maxQuantity: '6500', maxNotional: '20000' },
     perp: { bids: [['3.25', '5.1'], ['3.1', '10']], at: Math.floor(now / 1000) * 1000, step: '0.5', minQuantity: '0.05', maxQuantity: '500' },
   });
+});
+
+test('BSC 中文币从公开目录到现货和永续询价保留原名，各路径和查询只编码一次', async () => {
+  const symbol = '哈基米', market = symbol + '_USDT';
+  const currency = { ...fixtures.currency, currency: symbol, chains: [{ ...chain, name: 'BSC', addr: '0x82ec31d69b3c289e541b50e30681fd1acad24444' }] };
+  const pair = { ...fixtures.pair, id: market, base: symbol };
+  const lists: Record<string, unknown[]> = { '/api/v4/spot/currencies': [currency], '/api/v4/spot/currency_pairs': [pair],
+    '/api/v4/futures/usdt/tickers': [{ contract: market }] };
+  const catalog = createScanCatalog({ now: () => now, fetchImpl: async url => Response.json(lists[new URL(url).pathname]) });
+  const found = await catalog(signal);
+  assert.equal(found.length, 1);
+  const candidate = found[0];
+  const verified = parseChainArb({ symbol: candidate.symbol, chain: candidate.chain, address: candidate.address,
+    amount: '1000', spotFeeBps: '10', perpFeeBps: '5' });
+  assert.equal(verified.symbol, symbol);
+  const { read, counts } = setup({ currency, pair, contract: { ...fixtures.contract, name: market } }, symbol);
+  const venue = await read(verified, signal);
+  assert.ok('bids' in venue.spot && 'bids' in venue.perp);
+  assert.deepEqual(counts, { currency: 1, pair: 1, contract: 1, spot: 1, perp: 1 });
+  await assert.rejects(read({ ...verified, address: '0x' + 'a'.repeat(40) }, signal), /唯一匹配/);
 });
 
 test('Gate 拒绝链、合约、代码不匹配和重复网络，在身份不明时不读取任何市场', async () => {

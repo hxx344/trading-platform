@@ -1,13 +1,23 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { AddressInfo } from 'node:net';
+import { randomUUID } from 'node:crypto';
+import { setImmediate as settle } from 'node:timers/promises';
+import { join } from 'node:path';
+import { createMarketClient } from '../src/market/ipc.ts';
+import { createMarketServer } from '../src/market/server.ts';
+import { createRemoteMonitor } from '../src/service/remote-monitor.ts';
+import type { ScanView } from '../src/chain-arb/scan-model.ts';
 import { createExecutorServer } from '../src/http.ts';
 import { createMonitorData } from '../src/market/monitor-data.ts';
 import { parseChainArb } from '../src/chain-arb/model.ts';
+import { createChainArbMarket } from '../src/chain-arb/read.ts';
 import { compareChainArb } from '../src/chain-arb/estimate.ts';
 import type { GateLeg } from '../src/chain-arb/gate.ts';
 import { createHarness } from './harness.ts';
 import { ARB_ADDRESS, chainArbFixture } from './chain-arb-fake.ts';
+import { chainArbQuery } from '../web/src/chain-arb-form.ts';
+import { reviewScanRow } from '../web/src/chain-arb-scan-form.ts';
 
 const raw = { chain: 'ethereum', address: '0x' + '1'.repeat(40), symbol: 'EXAMPLE',
   amount: '105', spotFeeBps: '10', perpFeeBps: '5', spotCosts: '1', perpCosts: '2' };
@@ -21,7 +31,7 @@ const venue = { deposit: true, withdraw: false, spot, perp };
 test('链上买入后按卖方深度估现货，永续按整张开空；回收同价情景扣双边手续费', () => {
   const view = compareChainArb(input, buy, venue, now);
   assert.equal(view.expiresAt, spot.at + 15_000);
-  assert.deepEqual(view.dex, { quantity: 10.5, price: 10, at: buy.at });
+  assert.deepEqual(view.dex, { quantity: 10.5, price: 10, at: buy.at, swapGasUsdt: null });
   assert.ok('quantity' in view.spot && 'quantity' in view.perp);
   assert.equal(view.spot.grossUsdt, 14.5);
   assert.equal(view.spot.netUsdt, 13.3805);
@@ -43,6 +53,121 @@ test('同币身份已匹配时充值状态只阻断现货，缺成本留空，�
   const rounded = compareChainArb(input, { ...buy, rawQuantity: '3' }, venue, now);
   assert.ok('quantity' in rounded.spot && 'error' in rounded.perp);
   assert.equal(rounded.spot.quantity, 0.3);
+});
+
+test('自动 Gas 模式按覆盖的链上买入成本排序，缺少估值时不产生净价差', () => {
+  const auto = parseChainArb({ ...raw, swapGas: 'auto' });
+  const view = compareChainArb(auto, { ...buy, swapGasUsdt: 1.5 }, venue, now);
+  assert.ok('netBps' in view.spot && 'netBps' in view.perp);
+  assert.equal(view.spot.netUsdt, 11.8805);
+  assert.equal(view.perp.coveredCostUsdt, 100);
+  assert.equal(view.perp.netBps, 2637);
+  const missing = compareChainArb(auto, buy, venue, now);
+  assert.ok('netBps' in missing.spot && missing.spot.netBps === null && missing.spot.netUsdt === null);
+});
+
+test('目录刷新撤销单条路线时，同一行情进程的所有榜单都按新资格过滤，即使单币缓存仍旧', async t => {
+  let time = 1_795_600_000_000, mode: 'both' | 'perp' | 'spot' = 'both';
+  const now = () => time, fixture = chainArbFixture(now);
+  let currencyReads = 0, directoryReads = 0, unavailable = false;
+  const market = createChainArbMarket({ now, fetchImpl: async (url, init) => {
+    const response = await fixture(url, init);
+    if (url.endsWith('/spot/currencies')) {
+      directoryReads++;
+      if (unavailable) return Response.json({}, { status: 429 });
+      const [asset] = await response.json() as Record<string, unknown>[];
+      return Response.json([{ ...asset, deposit_disabled: mode === 'perp' }], { headers: { Age: '295' } });
+    }
+    if (url.endsWith('/spot/currencies/ARB')) {
+      currencyReads++;
+      const asset = await response.json() as Record<string, unknown>;
+      return Response.json({ ...asset, deposit_disabled: mode === 'perp' });
+    }
+    if (url.endsWith('/futures/usdt/tickers') && mode === 'spot') return Response.json([{ contract: 'OTHER_USDT' }]);
+    return response;
+  } });
+  t.after(() => market.closeChainArb());
+  const form = { chain: 'all', amount: '1000', spotFeeBps: '10', perpFeeBps: '5', spotCosts: '0', perpCosts: '0' };
+  const signal = new AbortController().signal;
+  const poll = (amount: string) => market.scanChainArb({ ...form, amount }, 'test', signal);
+  async function reviewRequest() {
+    const row = (await poll(form.amount)).rows[0];
+    const manual = reviewScanRow(form, row);
+    const query = chainArbQuery(manual.form, manual.autoGas);
+    const parameters = Object.fromEntries(new URL(query.path, 'http://localhost').searchParams);
+    return () => market.chainArb(parameters, signal);
+  }
+  const kinds = async (amount: string) => (await poll(amount)).rows.map(row => row.kind);
+  await poll('1000'); await settle();
+  assert.deepEqual(await kinds('1000'), ['perp', 'spot']);
+  time += 2000;
+  await poll('1001'); await settle();
+  assert.deepEqual(await kinds('1001'), ['perp', 'spot']);
+  time += 3000; mode = 'perp';
+  await poll('1000'); await settle();
+  assert.deepEqual(await kinds('1000'), ['perp']);
+  assert.deepEqual(await kinds('1001'), ['perp']);
+  const readPerp = await reviewRequest(), perpOnly = await readPerp();
+  assert.equal(currencyReads, 2);
+  assert.equal(perpOnly.deposit, false);
+  assert.ok('error' in perpOnly.spot && 'netBps' in perpOnly.perp);
+  time += 5000; mode = 'spot';
+  await poll('1001'); await settle();
+  assert.deepEqual(await kinds('1001'), ['spot']);
+  assert.ok((await kinds('1000')).every(kind => kind === 'spot'));
+  form.amount = '1001';
+  const readSpot = await reviewRequest(), spotOnly = await readSpot();
+  assert.equal(spotOnly.deposit, true);
+  assert.ok('netBps' in spotOnly.spot && 'error' in spotOnly.perp);
+  const priorReads = directoryReads;
+  time += 10_000;
+  const refreshed = await readSpot();
+  assert.equal(directoryReads, priorReads + 1);
+  assert.ok('netBps' in refreshed.spot && 'error' in refreshed.perp);
+  time += 10_000; unavailable = true;
+  await assert.rejects(readSpot(), { status: 429 });
+});
+
+test('扫描从登录后的 HTTP 经行情 IPC 自动发现 ARB，两条路线按扣费后价差排序', async () => {
+  const h = createHarness();
+  const socket = process.platform === 'win32' ? '\\\\.\\pipe\\tp-scan-' + randomUUID() : join(h.dir, 'scan.sock');
+  const market = createMarketServer({ monitor: createMonitorData({ fetchImpl: chainArbFixture() }) }, 'test');
+  const client = createMarketClient(socket);
+  const remote = createRemoteMonitor(client);
+  let enabled = true;
+  const server = createExecutorServer({ executor: h.ex, accessToken: 'chain-scan-test-0001', views: { monitor: {
+    state: () => ({ markets: ['perpetual'], controls: { perpetual: { enabled, revision: 0 } } }),
+    enabled: () => enabled, quote: () => null, candles: () => null, scanChainArb: remote.scanChainArb,
+  } } });
+  try {
+    await new Promise<void>((resolve, reject) => { market.server.once('error', reject); market.server.listen(socket, resolve); });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const base = 'http://127.0.0.1:' + (server.address() as AddressInfo).port;
+    const url = base + '/api/monitor/perpetual/chain-arb-scan?chain=all&amount=1000&spotFeeBps=10&perpFeeBps=5&spotCosts=0&perpCosts=0';
+    assert.equal((await fetch(url)).status, 401);
+    const login = await fetch(base + '/login?token=chain-scan-test-0001', { redirect: 'manual' });
+    const headers = { cookie: login.headers.get('set-cookie')!.split(';')[0] };
+    assert.equal((await fetch(url + '&chain=bsc', { headers })).status, 400);
+    const deadline = Date.now() + 8500;
+    let snapshot: ScanView;
+    do {
+      const response = await fetch(url, { headers });
+      assert.equal(response.status, 200);
+      snapshot = await response.json() as ScanView;
+      if (snapshot.rows.length) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    } while (Date.now() < deadline);
+    assert.equal(snapshot.total, 1);
+    assert.deepEqual(snapshot.rows.map(row => [row.symbol, row.chain, row.address, row.kind, row.netBps, row.netUsdt, row.gasUsdt]), [
+      ['ARB', 'arbitrum', ARB_ADDRESS, 'perp', 384.6, 38.46, 0.5], ['ARB', 'arbitrum', ARB_ADDRESS, 'spot', 284.7, 28.47, 0.5],
+    ]);
+    enabled = false;
+    assert.equal((await fetch(url, { headers })).status, 423);
+  } finally {
+    client.close(); market.close();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    h.dispose();
+  }
 });
 
 test('低于一手的链上最小单位不能凑整张或跨过 Gate 单笔门槛', () => {

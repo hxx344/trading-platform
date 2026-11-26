@@ -10,11 +10,12 @@ export const initialChainArbForm = {
   address: '0x912CE59144191C1204E64559FE8253a0e49E6548',
   amount: '1000', spotFeeBps: '10', perpFeeBps: '5', spotCosts: '', perpCosts: '',
 };
-export type ChainArbForm = typeof initialChainArbForm;
+export type ChainArbForm = typeof initialChainArbForm & { source?: 'scan' };
 
-export function chainArbQuery(form: ChainArbForm) {
+export function chainArbQuery(form: ChainArbForm, autoGas = false) {
   const fields = Object.fromEntries(Object.entries(form).map(([name, value]) => [name, value.trim()]));
-  fields.symbol = form.symbol.trim().toUpperCase();
+  if (/^[A-Za-z0-9]+$/.test(fields.symbol)) fields.symbol = fields.symbol.toUpperCase();
+  if (autoGas) fields.swapGas = 'auto';
   const input = parseChainArb(fields);
   const params = new URLSearchParams();
   for (const [name, value] of Object.entries(input)) {

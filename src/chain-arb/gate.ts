@@ -2,18 +2,22 @@ import { anySignal } from '../any-signal.mjs';
 import { isObject } from '../contracts.ts';
 import { fromUnits, min, units } from '../decimal.ts';
 import { readJsonResponse } from '../vendor/response.mjs';
-import { CHAIN_ARB_CLOCK_SKEW_MS, CHAIN_ARB_TTL_MS, type ChainArbInput } from './model.ts';
+import { CHAIN_ARB_CLOCK_SKEW_MS, CHAIN_ARB_TTL_MS, isGateBaseSymbol, type Chain, type ChainArbInput } from './model.ts';
 
-const NETWORKS = {
+const NETWORKS: Record<Chain, readonly string[]> = {
   ethereum: ['ETH'],
   arbitrum: ['ARBEVM', 'ARB', 'ARBITRUM'],
   bsc: ['BSC'],
-} as const;
+};
+export function gateChain(name: unknown): Chain | undefined {
+  if (typeof name !== 'string') return undefined;
+  return (Object.keys(NETWORKS) as Chain[]).find(chain => NETWORKS[chain].includes(name));
+}
 type Input = Pick<ChainArbInput, 'chain' | 'address' | 'symbol'>;
 type Row = Record<string, unknown>;
 type GateValue = string | number;
 type Limits<T extends GateValue> = { step: T; minQuantity?: T; minNotional?: T; maxQuantity?: T; maxNotional?: T };
-export type GateLeg = ({ bids: [GateValue, GateValue][]; at: number } & Limits<GateValue>) | { error: string };
+export type GateLeg = ({ bids: [GateValue, GateValue][]; at: number } & Limits<GateValue>) | { error: string; rateLimited?: true };
 const LEVELS = 100;
 const METADATA_TTL = 30_000;
 const LIMIT_ERROR = 'Gate 下单数量或金额限制无效';
@@ -25,6 +29,7 @@ const PRODUCT_SCALE = ONE * ONE;
 const PRODUCT_DIGITS = PRODUCT_SCALE.toString().length - 1;
 
 class GateError extends Error {}
+class GateRateLimit extends GateError { readonly status = 429; }
 function fail(message: string): never { throw new GateError(message); }
 function timestamp(value: unknown): number {
   if (typeof value === 'number') return value;
@@ -71,20 +76,23 @@ function enabled(...disabled: unknown[]): boolean | null {
 }
 
 function verifyIdentity(currency: Row, input: Input): Row {
-  const names: readonly string[] = NETWORKS[input.chain];
   if (currency.currency !== input.symbol || !Array.isArray(currency.chains)) fail(IDENTITY_ERROR);
   const selected = currency.chains.filter((chain: unknown): chain is Row =>
-    isObject(chain) && typeof chain.name === 'string' && names.includes(chain.name));
+    isObject(chain) && gateChain(chain.name) === input.chain);
   if (selected.length !== 1 || typeof selected[0].addr !== 'string'
     || selected[0].addr.toLowerCase() !== input.address.toLowerCase()) fail(IDENTITY_ERROR);
   return selected[0];
 }
 
+export function gateSpotSellable(pair: Row, currency: Row, now: number): boolean {
+  return currency.trade_disabled === false && currency.delisted === false && pair.type === 'normal'
+    && (pair.trade_status === 'tradable' || pair.trade_status === 'sellable') && started(pair.sell_start, now)
+    && (pair.delisting_time === undefined || pair.delisting_time === 0);
+}
+
 function spotLimits(pair: Row, currency: Row, symbol: string, now: number): Limits<string> {
   if (pair.id !== symbol + '_USDT' || pair.base !== symbol || pair.quote !== 'USDT') fail('Gate 现货交易对身份不符');
-  if (currency.trade_disabled !== false || currency.delisted !== false || pair.type !== 'normal'
-    || (pair.trade_status !== 'tradable' && pair.trade_status !== 'sellable') || !started(pair.sell_start, now)
-    || (pair.delisting_time !== undefined && pair.delisting_time !== 0)) fail('Gate 现货已停牌、待退市或未开放卖出');
+  if (!gateSpotSellable(pair, currency, now)) fail('Gate 现货已停牌、待退市或未开放卖出');
   const precision = pair.amount_precision;
   if (typeof precision !== 'number' || !Number.isInteger(precision) || precision < 0 || precision > 18) fail('Gate 现货数量精度无效');
   return {
@@ -169,6 +177,7 @@ export function createGateReader({ fetcher = fetch, clock = Date.now }: { fetche
       const ttl = metadata ? METADATA_TTL : CHAIN_ARB_TTL_MS;
       if (!response.ok || !Number.isFinite(age) || age < 0 || age >= ttl) {
         void response.body?.cancel().catch(() => undefined);
+        if (response.status === 429) throw new GateRateLimit('Gate 请求受限，请稍后刷新');
         fail(response.ok ? 'Gate 接口缓存已过期' : failure);
       }
       const row = await readJsonResponse(response, { signal, maxBytes: 128 * 1024, reviver(_key, value, context) {
@@ -200,31 +209,33 @@ export function createGateReader({ fetcher = fetch, clock = Date.now }: { fetche
     }
   }
 
-  return async function readGate(input: Input, signal: AbortSignal) {
+  return async function readGate(input: Input, signal: AbortSignal, reuseMetadata = true) {
     signal.throwIfAborted();
     if (typeof input.chain !== 'string' || !Object.hasOwn(NETWORKS, input.chain)
-      || typeof input.symbol !== 'string' || !/^[A-Z0-9]{1,24}$/.test(input.symbol)
+      || !isGateBaseSymbol(input.symbol)
       || typeof input.address !== 'string' || !/^0x[0-9a-f]{40}$/i.test(input.address) || /^0x0{40}$/i.test(input.address)) fail(IDENTITY_ERROR);
     const deadline = anySignal([signal], 8_000);
-    const { row: currency } = await get('/spot/currencies/' + input.symbol, deadline, true, 'Gate 币种目录不可用或未收录此币');
+    const { row: currency } = await get('/spot/currencies/' + encodeURIComponent(input.symbol), deadline, reuseMetadata, 'Gate 币种目录不可用或未收录此币');
     const chain = verifyIdentity(currency, input);
     const pair = input.symbol + '_USDT';
+    const encodedPair = encodeURIComponent(pair);
     async function readLeg(market: 'spot' | 'perp'): Promise<GateLeg> {
       try {
         if (market === 'spot') {
-          const { row: meta } = await get('/spot/currency_pairs/' + pair, deadline, true, 'Gate USDT 现货交易对不可用');
+          const { row: meta } = await get('/spot/currency_pairs/' + encodedPair, deadline, reuseMetadata, 'Gate USDT 现货交易对不可用');
           const limits = spotLimits(meta, currency, input.symbol, clock());
-          const book = await get('/spot/order_book?currency_pair=' + pair + '&limit=' + LEVELS, deadline, false, 'Gate 盘口读取失败');
+          const book = await get('/spot/order_book?currency_pair=' + encodedPair + '&limit=' + LEVELS, deadline, false, 'Gate 盘口读取失败');
           return readBook(book.row, limits, market, meta, book.at, clock());
         }
         const [contract, book] = await Promise.all([
-          get('/futures/usdt/contracts/' + pair, deadline, false, 'Gate USDT 永续合约不可用'),
-          get('/futures/usdt/order_book?contract=' + pair + '&limit=' + LEVELS, deadline, false, 'Gate 盘口读取失败'),
+          get('/futures/usdt/contracts/' + encodedPair, deadline, false, 'Gate USDT 永续合约不可用'),
+          get('/futures/usdt/order_book?contract=' + encodedPair + '&limit=' + LEVELS, deadline, false, 'Gate 盘口读取失败'),
         ]);
         const limits = perpLimits(contract.row, pair, clock());
         return readBook(book.row, limits, market, contract.row, Math.min(book.at, contract.at), clock());
       } catch (error) {
         signal.throwIfAborted();
+        if (error instanceof GateRateLimit) return { error: error.message, rateLimited: true };
         return { error: error instanceof GateError ? error.message : 'Gate 盘口读取超时或不可用' };
       }
     }

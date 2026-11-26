@@ -1,6 +1,6 @@
 // Public Monitor operations. This process owns the venue sockets, abortable network reads, catalogs, rate limits and pagination.
 import type { MarketOperations } from './ipc.ts';
-import { createChainArbReader } from '../chain-arb/read.ts';
+import { createChainArbMarket } from '../chain-arb/read.ts';
 import { createPerpetualFeed } from '../monitor/perpetual-feed.ts';
 import { createMarketReaders } from '../monitor/market-readers.ts';
 import { OIL_CANDLE_WINDOW_MS, marketRead } from '../monitor/market-contract.ts';
@@ -41,7 +41,7 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
 }: { fetchImpl?: AnthropicFetcher; now?: () => number; log?: (line: string) => void; WebSocketImpl?: typeof WebSocket;
   perpetual?: PerpetualOptions; variationalFetch?: VariationalFetcher; env?: Record<string, string | undefined> } = {}): MarketOperations {
   const gate = createBinanceGate(), common = { now, ...(fetchImpl ? { fetchImpl } : {}) };
-  const chainArb = createChainArbReader({ now, fetchImpl });
+  const chain = createChainArbMarket({ now, fetchImpl });
   const feed = createPerpetualFeed({ ...common, log, ...options });
   const stopped = new AbortController(), subscriptions = new Set<() => void>();
   // The cards, the comparison and the collector live in this process, so they share what they would each read (monitor/shared-reads.ts).
@@ -73,7 +73,12 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
   }
   async function read(op: string, input: unknown, signal: AbortSignal): Promise<unknown> {
     switch (op) {
-      case 'monitor.perpetual.chainArb': return chainArb(input, signal);
+      case 'monitor.perpetual.chainArb': return chain.chainArb(input, signal);
+      case 'monitor.perpetual.chainArbScan': {
+        const { params, scope } = fields(input, ['params', 'scope']);
+        if (typeof scope !== 'string' || !/^[a-f0-9]{24}:\d{1,16}$/.test(scope)) throw new Error('行情扫描代次无效');
+        return chain.scanChainArb(params, scope, signal);
+      }
       case 'monitor.anthropic.ANTUSDT.quote': none(input); return readers.anthropicQuote(signal);
       case 'monitor.anthropic.quote': {
         none(input);
@@ -198,6 +203,7 @@ export function createMonitorData({ fetchImpl, now = Date.now, log = (line: stri
       if (signal.aborted || stopped.signal.aborted) end();
     },
     close() {
+      chain.closeChainArb();
       stopped.abort();
       for (const end of subscriptions) end();
       exchanges.stop(); feed.close();

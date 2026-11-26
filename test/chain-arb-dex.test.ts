@@ -40,10 +40,10 @@ test('使用各链的 USDT 与整数金额，按 ERC-20 精度返回数量与报
       return Response.json(routeBody({ tokenIn: network.usdt, amountIn: network.scaled }));
     });
     assert.deepEqual(calls.sort(), ['GET', 'POST']);
-    assert.deepEqual(result, { rawQuantity: sourceRoute.amountOut, decimals: 18, at: 1795690821000 });
+    assert.deepEqual(result, { rawQuantity: sourceRoute.amountOut, decimals: 18, at: 1795690821000, swapGasUsdt: null });
   }
   const tiny = await readDex(input, signal, respond(routeBody({ amountOut: '1', timestamp: '1795690821' }), decimalsBody(255)));
-  assert.deepEqual(tiny, { rawQuantity: '1', decimals: 255, at: 1795690821000 });
+  assert.deepEqual(tiny, { rawQuantity: '1', decimals: 255, at: 1795690821000, swapGasUsdt: null });
 });
 
 test('拒绝错误币种、金额、数量、时间与精度响应', async () => {
@@ -59,6 +59,14 @@ test('拒绝错误币种、金额、数量、时间与精度响应', async () =>
   for (const invalid of [{ ...decimalsBody(18), id: 2 }, decimalsBody(256), { ...decimalsBody(18), result: '0x' }, { error: { message: 'private trace' } }]) {
     await assert.rejects(readDex(input, signal, respond(routeBody(), invalid)), /无法读取目标代币的 ERC-20 精度/);
   }
+});
+
+test('按同份路由的 USDT 美元估值折算买入 Gas，缺失或无效的 Gas 保留未知', async () => {
+  const gas = async (gasUsd: unknown, amountInUsd: unknown) =>
+    (await readDex(input, signal, respond(routeBody({ gasUsd, amountInUsd })))).swapGasUsdt;
+  assert.equal(await gas('2', '246.913578'), 1);
+  for (const value of [null, '', '0', '-1', 'Infinity', '1x']) assert.equal(await gas(value, '123'), null);
+  assert.equal(await gas('2', '0'), null);
 });
 
 test('不向外发送无效输入，保留上游明确的缺少路由或限流原因', async () => {

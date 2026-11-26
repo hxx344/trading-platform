@@ -78,12 +78,25 @@ P0 2 条、P1 5 条、P2 7 条、P3 6 条，另有待核实 2 条。
 | P3 | 「转人工后不再发单」的断言空转 | 已改：转人工后恢复落库再跑，断言仍不发单 |
 | P3 | 第三轮结论里「不会重复下单」一句与 P0 冲突 | 已改正 |
 
+## 第五轮审查结论（8839988..005186a）：P0、P1、P2 为 0，可合并
+
+`NotSentError` 只在交给连接器之前的四处抛出，第一腿、第二腿只对它退回进度；回补与平仓不改进度、数量按腿上已记的数量重算，没有同类问题。审查者把 `live.ts` 里所有「改内存、落库、发送、记成交、落库」的路径（发送、记成交、查单、结束、转人工、平仓请求、开仓、重启恢复、人工处理）逐条走查，没有找到会重发、把已成交记成没成交或让持仓脱离管理的路径；库里唯一可能的过期形态是「留着最后一笔单的在途意图」，重启查单或按持仓差量都能定界。新用例按上一提交推演能复现重复下单，「转人工后不再发单」的断言不再空转。
+
+| 级别 | 问题 | 处理 |
+| --- | --- | --- |
+| P3 | 回补、平仓的次数在落意图前计入，落意图失败也消耗次数 | 登记未改，写进 13.8：有界、保守，不发单 |
+| P3 | 结束持仓时落库失败，持仓在本进程内仍占名额；两处保存不在保护内，抛错时本轮其余持仓与对账跳过一次 | 登记未改，写进 13.8：不发单、不错记，重启按库处理 |
+| P3 | 审查记录与 L212 的证据没同步 | 已补：CI 链接、用例数、L212 的用例名 |
+| 观察 | `apply` 先改数量再取费率、最后清在途；取费率现在不会抛错，以后改费率来源要先算费率 | 记在此处 |
+
+为了不在发布前加入未经审查的代码，P3 只登记、不改代码。
+
 ## 已运行
 
 - `pnpm check`、`pnpm build:web` 通过。
 - 分支 CI（手动运行，`install_full=true`）：1a6831e 只因占位摘要失败（预期）<https://github.com/hxx344/trading-platform/actions/runs/45891602415>；1d480cd 只有一个分片因旧断言失败 <https://github.com/hxx344/trading-platform/actions/runs/45891950661>；84a2e2d <https://github.com/hxx344/trading-platform/actions/runs/45894156741>。
-- 分支 CI：55e8d49 全部通过 <https://github.com/hxx344/trading-platform/actions/runs/45896020807>；第三轮修复后的提交见发布提交。
-- 本机参考运行（Windows，以 CI 为准）：`test/dex-orders`（16）、`dex-live`（35）、`dex-livekeys`（7）、`dex-keys`（8）、`varlighter`（57）、`dex-hyperliquid`（4）全部通过。
+- 分支 CI（手动运行，`install_full=true`）全部通过：55e8d49 <https://github.com/hxx344/trading-platform/actions/runs/45896020807>；8839988 <https://github.com/hxx344/trading-platform/actions/runs/45896928773>；005186a <https://github.com/hxx344/trading-platform/actions/runs/45897536688>。
+- 本机参考运行（Windows，以 CI 为准）：`test/dex-orders`（16）、`dex-live`（36）、`dex-livekeys`（7）、`dex-keys`（8）、`varlighter`（57）、`dex-hyperliquid`（4）全部通过。
 - 内置浏览器在替身后端（`scripts/dev-varlighter.ts`，不联网）核对实盘面板：1280 与 390 宽度无横向溢出；用一次性的测试值走过 Entropy 凭据录入，提交后输入框清空、只显示「已录入」；保存配对与限额的请求体只有 `pairs` 与 `limits`。
 
 ## 未运行

@@ -15,7 +15,7 @@ export type ImportInfo = { importedAt: string; importId?: string; file: string; 
 export type Imported = { imported: boolean; importedAt: string | null };
 export type Valuation = { total: number; missingValues: number; partial: boolean };
 
-export const EXCHANGE_NAMES = { bybit: 'Bybit', binance: 'Binance', okx: 'OKX', gate: 'Gate', aster: 'Aster', variational: 'Var · Variational', hyperliquid: 'Hyperliquid', 'rh-lighter': 'Lighter RH' } as const;
+export const EXCHANGE_NAMES = { bybit: 'Bybit', binance: 'Binance', okx: 'OKX', gate: 'Gate', aster: 'Aster', variational: 'Var · Variational', hyperliquid: 'Hyperliquid', 'rh-lighter': 'Lighter RH', 'dex-spread': 'DEX 价差' } as const;
 export type Exchange = keyof typeof EXCHANGE_NAMES;
 // Same test as dashboard.tsx isExchangeMode.
 export const isExchangeMode = (mode: Asset['mode']): mode is Exchange => Object.hasOwn(EXCHANGE_NAMES, mode);

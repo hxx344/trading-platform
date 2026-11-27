@@ -860,3 +860,9 @@ DEX 价差详情在采集缺口处断开价差、基线和入场带。图形限�
 - **暗色登录页**（`src/http.ts`）：`loginForm` 与 `LOGIN_REQUIRED` 改用与主站一致的深色居中卡片、四格品牌标记与主色按钮，保留原有表单字段、提交路径与安全响应头。
 - **暗色模态确认框与加载骨架屏**（`web/src/AppDialog.tsx`、`app-dialog-queue.ts`、`StateViews.tsx`）：将全站原生 `alert()` / `confirm()` 替换为基于 `<dialog>` 的暗色排队对话框与生命周期防重入守卫 `useDialogGuard()`；加载态 `StatePanel` / `LoadingFallback` 增加纯 CSS 骨架占位条。
 - **回滚**：回退到 `v0.106.2`（本批不改接口、数据库或配置格式）。
+
+## 资产页：DEX 价差展示（v0.110.0，回滚版本 v0.109.0）
+
+- **对照的工作台页面**：工作台无此聚合展示，沿用现有资产总览表格、明细展开行、资产走势与每日波动视图。`web/src/asset-connection-form.ts` 显式将 `dex-spread` 排除出 `CONNECTION_NAMES`，使「交易所连接」卡片与待连接数量保持只包含直连交易所。
+- **格式与样式**：`web/src/asset-format.ts` 为 `dex-spread` 提供数量栏「账户总值」、钱包展示名、明细副标题及去重与计价说明 `DETAIL_NOTES['dex-spread']`；`web/src/asset.css` 新增 `.asset-desk .exchange-mark.dex-spread` 蓝色标识（`#14262b` 背景与 `#38bdf8` 前景字母 `D`）。单元测试见 `test/asset-format.test.ts` 与 `web/test/asset-connection-form.test.mjs`。
+- **浏览器验收**：`pnpm build:web` 后启动 `node scripts/asset-demo.ts --data-dir <临时空目录> --port <端口> --with-dex-spread`，内置浏览器在 `v0.107.0+` 新版暗色壳层下于 1280×800 与 390×844 宽度核查登录与 `#/asset`：点击「刷新资产」后表格新增「DEX 价差」行（`6,700.00`，`只读同步 · 3 个账号`），表内总额（`$30,500.01`）与交易所资产（`$26,500.00`）均相应增加 `6,700.00`，展开明细显示 4 项账号资产与自动去重说明，「每日波动与来源」计入 `DEX 价差 · 资产 +6,700.00`，「交易所连接」仍为 9 项且不含 `DEX 价差`；全页可见文本未出现 `0x` 或 `101` / `202`（剔除年份）等明文标识。390 与 1280 宽度下 `html` / `body` / `main` 均未超出视口（表格在 `[data-slot="table-container"]` 容器内横向滚动），无控制台报错、未捕获异常与 CSP 报错（仅见 demo 未挂载宿主路由 `/api/host`、`/api/update`、`/api/read-token` 的预期 404）。

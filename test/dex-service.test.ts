@@ -13,7 +13,8 @@ import { DEX_CRASH_REPORT_MS, startDex } from '../src/dex/main.ts';
 import { CRASH_FILE } from '../src/crash-guard.ts';
 import { createDexLink } from '../src/service/dex.ts';
 import { DB_FILE, KEEP_BACKUPS, exportDb, importDb, tableCounts } from '../src/dex/move-db.ts';
-import { DEX_PROTOCOL, DEX_TOKEN_LEASE_MS, tokenDigest, type DexStatus, type DexTokenPush } from '../src/dex/protocol.ts';
+import { DEX_PATH, DEX_PROTOCOL, DEX_TOKEN_LEASE_MS, DexError, tokenDigest, type DexStatus, type DexTokenPush } from '../src/dex/protocol.ts';
+import { createLiveKeysStore } from '../src/varlighter/livekeys.ts';
 import type { SocketLike } from '../src/varlighter/feeds.ts';
 import { createHarness } from './harness.ts';
 
@@ -63,6 +64,7 @@ test('执行面每轮推 token：status 读失败时照推，确知版本不兼�
   const fake = {
     page: async () => ({ status: 200, body: {} }), close() {}, setCompatible() {},
     status: () => status(),
+    accounts: async () => ({ accounts: {}, problem: null }),
     pushToken: async (push: DexTokenPush) => { pushes.push(push); return { instance: 'i', token: tokenDigest(push) }; },
   } satisfies DexClient;
   const link = createDexLink({ socketPath: '', dir, notifyOnce() {}, log() {}, client: fake });
@@ -229,4 +231,47 @@ test('执行面 http：写请求发到 DEX 后应答丢失时断开页面连接�
   const read = await fetch(`${base}/api/varlighter/state`, { headers });
   assert.equal(read.status, 503);
   assert.equal(((await read.json()) as { code: string }).code, 'dex_unavailable');
+});
+
+test('DEX 只读场所账户接口：页面凭据优先于 keys.env，不含私钥，拒绝未知字段与旧版 404', async t => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'dex-accounts-ipc-'));
+  const envState = { accounts: { lighter: { accountIndex: 11 }, rh: { accountIndex: 22 } }, problem: null };
+  const dex = startDex({ socket: socketIn(dir, 'dex'), stateDir: dir, build: 'test', options: { ...offline, accounts: () => envState }, log: () => {} });
+  const client = createDexClient(socketIn(dir, 'dex'));
+  t.after(async () => { client.close(); await dex.stop(); rmSync(dir, { recursive: true, force: true }); });
+  await dex.ready;
+
+  assert.deepEqual(await client.accounts(), { accounts: { lighter: { accountIndex: 11 }, rh: { accountIndex: 22 } }, problem: null });
+  const liveKeys = createLiveKeysStore(dir);
+  const entropyAddr = '0x' + '12'.repeat(20);
+  liveKeys.set('lighter', { accountIndex: 99, apiKeyIndex: 5, privateKey: 'ab'.repeat(40) });
+  liveKeys.set('entropy', { address: entropyAddr, privateKey: '0x' + '34'.repeat(32) });
+  const withPage = await client.accounts();
+  assert.deepEqual(withPage, { accounts: { lighter: { accountIndex: 99 }, rh: { accountIndex: 22 }, entropy: { address: entropyAddr } }, problem: null });
+  const raw = JSON.stringify(withPage);
+  assert.equal(raw.includes('privateKey'), false);
+  assert.equal(raw.includes('apiKeyIndex'), false);
+  assert.equal(raw.includes('abab'), false);
+
+  liveKeys.remove('lighter');
+  assert.deepEqual(await client.accounts(), { accounts: { lighter: { accountIndex: 11 }, rh: { accountIndex: 22 }, entropy: { address: entropyAddr } }, problem: null });
+
+  const badSocket = socketIn(dir, 'bad');
+  let mode: 'leak' | 'version' | 'old' = 'leak';
+  const { createServer: createHttp } = await import('node:http');
+  const httpBad = createHttp((req, res) => {
+    if (req.url !== DEX_PATH + 'accounts') { res.writeHead(404); res.end('{}'); return; }
+    if (mode === 'old') { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ message: '未知 DEX 操作' })); return; }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    if (mode === 'leak') res.end(JSON.stringify({ accounts: { lighter: { accountIndex: 1, privateKey: 'xx' } }, problem: null }));
+    else res.end(JSON.stringify({ accounts: { version: 1, lighter: { accountIndex: 1 } }, problem: null }));
+  });
+  await new Promise<void>(resolve => httpBad.listen(badSocket, resolve));
+  const badClient = createDexClient(badSocket);
+  t.after(async () => { badClient.close(); await new Promise(resolve => httpBad.close(resolve)); });
+  await assert.rejects(badClient.accounts(), DexError);
+  mode = 'version';
+  await assert.rejects(badClient.accounts(), DexError);
+  mode = 'old';
+  await assert.rejects(badClient.accounts(), { message: 'DEX 价差服务版本较旧，不支持读取场所账户' });
 });

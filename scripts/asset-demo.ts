@@ -19,7 +19,7 @@ import type { AssetSources } from '../src/asset/sync.ts';
 import type { Balance } from '../src/asset/types.ts';
 import { OWNER, writeWorkbenchLedger } from '../test/asset-fixture.ts';
 
-const { values } = parseArgs({ options: { 'data-dir': { type: 'string' }, port: { type: 'string', default: '4730' } } });
+const { values } = parseArgs({ options: { 'data-dir': { type: 'string' }, port: { type: 'string', default: '4730' }, 'with-dex-spread': { type: 'boolean', default: false } } });
 if (!values['data-dir']) throw new Error('需要 --data-dir <独立目录的绝对路径>');
 const dir = assertDedicatedDataDir(values['data-dir']);
 const port = Number(values.port);
@@ -53,8 +53,20 @@ const demoSources: AssetSources = {
   validateAsterWallet: c => ({ address: c.walletAddress }),
   syncOkx: c => read(c, 3_210), syncGate: c => read(c, 1_100), syncVariational: c => read(c as never, 640),
   syncHyperliquid: c => read(c, 4_400), syncRhLighter: c => read(c, 950),
+  syncLighterAccount: async accountIndex => {
+    await pause();
+    return { accountIndex, l1Address: '0x' + 'aa'.repeat(20), total: 1_500, details: [balance('USDC', '账户总值（含未实现盈亏）', 1_500)], updatedAt: new Date().toISOString() };
+  },
+  syncRhLighterAccount: async accountIndex => {
+    await pause();
+    return { accountIndex, l1Address: '0x' + 'bb'.repeat(20), total: 800, details: [balance('USDG', '账户总值（含未实现盈亏）', 800)], updatedAt: new Date().toISOString() };
+  },
+  rhLighterAccountIndices: async () => [202],
 };
-const asset = createAssetStore(join(dir, ASSET_DB_FILE), { sources: demoSources });
+const asset = createAssetStore(join(dir, ASSET_DB_FILE), {
+  sources: demoSources,
+  ...(values['with-dex-spread'] ? { dexAccounts: async () => ({ accounts: { lighter: { accountIndex: 101 }, rh: { accountIndex: 202 }, entropy: { address: '0x' + 'cc'.repeat(20) } }, problem: null }) } : {}),
+});
 // The environment marker is left out: its directory fsync is refused on Windows, and this directory only ever holds the demo.
 const store = openStore(join(dir, DATABASE_FILES.simulated));
 const { binance, bybit, aster, asterTrading } = createSimulatedVenues(Date.now);

@@ -138,3 +138,10 @@
 - Lighter 主网与 RH `/api/v1/pnl` 的 `timestamp` 单位（秒/毫秒）、`start_timestamp`/`end_timestamp` 请求单位与 `trade_pnl` 归属口径（当日分桶 vs 累计）。
 - Lighter `/api/v1/positionFunding` 中 `change` / `payment` 的正负号是否与页面「正=净收、负=净付」一致，以及真实账户每分钟 60 次限流下余额（60s）+ 历史（180s）+ 下单并发的余量表现。
 - Entropy `userFillsByTime` 与 `userFunding` 在高频账户下 3 页窗口内的截断提醒与 `io:` 盘过滤表现。
+
+## 待实测：DEX 价差账户并入资产账本（asset.md，v0.110.0）
+
+只在替身接口与 `scripts/asset-demo.ts --with-dex-spread` 上验证过，尚未连接真实 Lighter 主网、Lighter RH 与 Entropy 账户。录入真实凭据并在资产页点击「刷新资产」后确认，结果回填本节与 [asset.md](asset.md)：
+
+- Lighter 主网只读接口 `https://mainnet.zklighter.elliot.ai/api/v1/account?by=index&value=<id>&active_only=true` 的真实字段（`accounts[0].total_asset_value` 与 `accounts[0].l1_address`，接口仅读取 `total_asset_value` 而不读取 `collateral`）与按 USDC/USD 折算后的「DEX 价差」行估值与官网账户权益一致。
+- 当同一个 Hyperliquid 主账户地址或同 L1 地址的 Lighter RH 账户（含名下子账户编号）同时出现在「资产 → 交易所连接」与「DEX 价差」中时，资产同步及随后连接均自动完成去重而不双算总额，且全页明细与数据库无明文钱包地址或账户编号残留。

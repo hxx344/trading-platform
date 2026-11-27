@@ -2,7 +2,7 @@
 // the trend headline, the monthly hint, the order of the daily change lines and the wallet detail lines.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { badge, dailyItems, detailLine, fxView, dailyProfitBars, monthlyHint, periodSource, statusTone, trendPlotPoints, trendSummary } from '../web/src/asset-format.ts';
+import { badge, dailyItems, detailLine, detailNote, detailSubtitle, detailTitle, fxView, dailyProfitBars, monthlyHint, periodSource, priceText, quantityText, statusTone, trendPlotPoints, trendSummary } from '../web/src/asset-format.ts';
 import type { Asset, Period } from '../src/asset/types.ts';
 import type { DailyChange } from '../src/asset/daily-changes.ts';
 import type { MonthlyPerformance } from '../src/asset/performance-metrics.ts';
@@ -107,4 +107,16 @@ test('资产页文案：历史记录的来源说明', () => {
   assert.equal(periodSource(period({ archived: true })), '导入前示例记录');
   assert.equal(periodSource(period({ id: 'daily-2026-11-01' })), '当日最后更新');
   assert.equal(periodSource(period({ id: 'daily-2026-11-01', partial: true })), '当日快照 · 含旧值');
+});
+
+test('资产页文案：DEX 价差聚合行与明细口径', () => {
+  const row = asset({ project: 'DEX 价差', kind: '资产', mode: 'dex-spread', value: 1200, status: '只读同步 · 2 个账号' });
+  assert.equal(quantityText(row, true), '账户总值');
+  assert.equal(priceText(row, true), '—');
+  assert.equal(detailTitle('dex-spread'), '账户总值明细');
+  assert.match(detailSubtitle(row), /^估值时间 .* · 账户总值 \/ USD$/);
+  assert.deepEqual(detailLine('dex-spread', { coin: '—', account: '已去重（已在资产连接中计入）：Entropy（Hyperliquid）', quantity: 0, value: 0, price: 0 }), { coin: null, quantity: '—', value: '—' });
+  assert.deepEqual(detailLine('dex-spread', { coin: 'USDG', account: 'Lighter RH / 账户总值（含未实现盈亏）', quantity: 500, value: 500, price: 1 }), { coin: 'USDG', quantity: '500.000000', value: '500.00' });
+  assert.match(detailNote('dex-spread'), /DEX 价差/);
+  assert.match(detailNote('dex-spread'), /去重/);
 });

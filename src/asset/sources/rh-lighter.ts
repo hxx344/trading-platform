@@ -183,6 +183,14 @@ function stateOf(fetcher: Fetcher): State {
   if (!state) { state = { until: 0, slots: new Map() }; states.set(fetcher, state); }
   return state;
 }
+/** Shares the api.rh.lighter.xyz rate-limit cooldown with single-account DEX spread reads. */
+export function rhLighterCooldown(fetcher: Fetcher): { blocked: (now?: number) => boolean; trigger: (now?: number) => void } {
+  const state = stateOf(fetcher);
+  return {
+    blocked: (now = Date.now()) => now < state.until && state.until - now <= RH_LIGHTER_COOLDOWN_MS,
+    trigger: (now = Date.now()) => { state.until = Math.max(state.until, now + RH_LIGHTER_COOLDOWN_MS); },
+  };
+}
 const fresh = (snapshot: RhLighterSnapshot | undefined, now: number) => !!snapshot && now >= snapshot.at && now - snapshot.at < RH_LIGHTER_SNAPSHOT_TTL_MS;
 function waitFor<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;

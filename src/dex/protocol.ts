@@ -1,4 +1,7 @@
 import { createHash } from 'node:crypto';
+import type { DexAccountsState } from './keys.ts';
+
+export type { DexAccountsState } from './keys.ts';
 
 // DEX 价差服务的本机协议（docs/dexspread.md 第 11.2 节）。只有执行服务账户（DEX 通信组）能连这个套接字。
 export const DEX_PATH = '/dex/v1/';

@@ -373,3 +373,4 @@
 /* 本服务自己的：摘要里每行一段，去掉段落外边距；生成命令可换行 */
 .asset-desk .import-summary p { margin: 0 }
 .asset-desk .import-panel code { overflow-wrap: anywhere }
+.asset-desk .exchange-mark.dex-spread { background: #14262b; color: #38bdf8 }

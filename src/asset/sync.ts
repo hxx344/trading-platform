@@ -26,6 +26,7 @@
 //   catch around both the read and the write); a refusal of the write itself (lease lost, imported again, database
 //   error) is not recorded as the source's failure but ends the sync with that refusal.
 import type { AssetDb } from './db.ts';
+import type { DexAccountsState } from '../dex/keys.ts';
 import { historyGeneration } from './history-cache.ts';
 import { revisionOf } from './positions-service.ts';
 import { PositionsPermissionError } from './positions-values.ts';
@@ -36,6 +37,11 @@ import { asterKey, aggregateAster, mergeAsterRefresh, readAsterAccounts, type As
 import { knownAssetValue, refreshMarketAsset } from './asset-values.ts';
 import { isGateProject, isHyperliquidProject, isVariationalProject } from './source-ledger.ts';
 import { saveSetting, saveSnapshot, type PositionsPeek } from './writes.ts';
+import {
+  aggregateDexSpread, DEX_DEDUP_IDENTITIES_KEY, DEX_SPREAD_ACCOUNTS_KEY, DEX_SPREAD_VENUE_NAMES, hashAddress,
+  hashLighterIndex, hashRhIndex, nextRowAllocation, pruneDexSpreadOnConnect, readDedupIdentities, readDexSpreadState,
+  readStoredSetting, updateDedupIdentity, type DexSpreadStoredAccount, type DexSpreadStoredState, type DexVenue,
+} from './dex-spread.ts';
 // store.ts imports this module too; the cycle is safe, nothing is called while the modules load.
 import { currentLedger } from './store.ts';
 import { parseConnection, type AsterAccountInput, type ConnectionExchange, type Credentials } from './validation.ts';
@@ -50,7 +56,8 @@ import { syncOkx, type OkxCredential } from './sources/okx.ts';
 import type { BitgetCredential } from './sources/bitget-deposit.ts';
 import { syncGate, type GateCredential } from './sources/gate.ts';
 import { syncHyperliquid, type HyperliquidCredential } from './sources/hyperliquid.ts';
-import { syncRhLighter, type RhLighterCredential } from './sources/rh-lighter.ts';
+import { readRhLighterSnapshot, syncRhLighter, type RhLighterCredential } from './sources/rh-lighter.ts';
+import { syncLighterAccount, syncRhLighterAccount, type LighterIndexRead } from './sources/lighter-account.ts';
 import { syncVariational, type VariationalCredential } from './sources/variational.ts';
 import { yuanQuote } from './sources/fx.ts';
 
@@ -70,6 +77,9 @@ export interface AssetSources {
   syncVariational(c: VariationalCredential): Promise<DatedRead>;
   syncHyperliquid(c: HyperliquidCredential, options: { verifyRole?: boolean }): Promise<DatedRead>;
   syncRhLighter(c: RhLighterCredential): Promise<DatedRead>;
+  syncLighterAccount?(accountIndex: number): Promise<LighterIndexRead>;
+  syncRhLighterAccount?(accountIndex: number): Promise<LighterIndexRead>;
+  rhLighterAccountIndices?(c: RhLighterCredential): Promise<number[]>;
 }
 /** The copied readers over `fetcher`; Variational reads its portfolio through python3 (sources/variational-python.ts). */
 export function liveSources(source: Fetcher = fetch, shared = sharePublicReads(source)): AssetSources {
@@ -88,6 +98,9 @@ export function liveSources(source: Fetcher = fetch, shared = sharePublicReads(s
     syncVariational: c => syncVariational(c, fetcher),
     syncHyperliquid: (c, options) => syncHyperliquid(c, fetcher, options),
     syncRhLighter: c => syncRhLighter(c, fetcher),
+    syncLighterAccount: accountIndex => syncLighterAccount(accountIndex, fetcher),
+    syncRhLighterAccount: accountIndex => syncRhLighterAccount(accountIndex, fetcher),
+    rhLighterAccountIndices: c => readRhLighterSnapshot(c.walletAddress, fetcher).then(snapshot => snapshot.accounts.map(account => account.index)),
   };
 }
 
@@ -99,6 +112,8 @@ export interface SyncContext {
   now: () => number;
   /** The cached positions for the daily snapshot (A-5); none leaves `positions` out. */
   positions?: PositionsPeek;
+  /** Read-only DEX spread account identifiers from the DEX service; omitted when DEX spread is disabled. */
+  dexAccounts?: () => Promise<DexAccountsState>;
 }
 type Run = () => void;
 const iso = (at: number) => new Date(at).toISOString();
@@ -173,9 +188,8 @@ export async function connect(ctx: SyncContext, input: Exclude<Credentials, Bitg
   let asset = matches[0];
   if (!asset) {
     if (!CREATABLE.includes(input.exchange)) throw new Error('未找到交易所资产');
-    const nextId = Math.max(0, ...ledger.assets.map(a => Number(a.id.slice(4)))) + 1;
-    if (ledger.assets.length >= 1000 || !Number.isSafeInteger(nextId) || nextId > 999999) throw new Error('资产条目已达到上限');
-    asset = { id: 'row-' + nextId, project: input.exchange === 'variational' ? 'var' : input.exchange === 'hyperliquid' ? 'Hyperliquid' : input.exchange === 'rh-lighter' ? 'Lighter RH' : input.exchange, kind: '资产', quantity: 0, price: 1, value: 0, cell: 'E' + nextId, mode: input.exchange, updatedAt: '', status: '' };
+    const allocated = nextRowAllocation(ledger.assets);
+    asset = { id: allocated.id, project: input.exchange === 'variational' ? 'var' : input.exchange === 'hyperliquid' ? 'Hyperliquid' : input.exchange === 'rh-lighter' ? 'Lighter RH' : input.exchange, kind: '资产', quantity: 0, price: 1, value: 0, cell: allocated.cell, mode: input.exchange, updatedAt: '', status: '' };
   }
   const encrypted = vault.seal(input, input.exchange);
   const result: Read & { updatedAt?: string } =
@@ -194,8 +208,17 @@ export async function connect(ctx: SyncContext, input: Exclude<Credentials, Bitg
   const next: Asset = { ...withQuote(asset, result), mode: input.exchange, quantity: result.total, price: 1, value: result.total, status, updatedAt, error: undefined, details: result.details };
   const label = input.exchange === 'variational' ? {} : { label: input.exchange === 'hyperliquid' || input.exchange === 'rh-lighter' ? input.walletAddress.slice(-4) : input.apiKey.slice(-4) };
   const connection = { configured: true, lastSync: now, error: null, scope: ledger.connections[input.exchange].scope, ...label };
+  let rhIndexHashes: string[] | undefined;
+  if (input.exchange === 'rh-lighter' && sources.rhLighterAccountIndices) {
+    try { rhIndexHashes = (await sources.rhLighterAccountIndices(input)).map(hashRhIndex); } catch { rhIndexHashes = undefined; }
+  }
+  const extra = input.exchange === 'hyperliquid'
+    ? [pruneDexSpreadOnConnect(database, 'hyperliquid', { walletHash: hashAddress(input.walletAddress) }, now)]
+    : input.exchange === 'rh-lighter'
+      ? [pruneDexSpreadOnConnect(database, 'rh-lighter', { walletHash: hashAddress(input.walletAddress), ...(rhIndexHashes ? { indexHashes: rhIndexHashes } : {}) }, now)]
+      : [];
   // Persist a verified connection and its balance together; failed verification changes neither.
-  commit(ctx, [saveConnection(database, input.exchange, encrypted, at), upsertAsset(database, next), settingStatement(database, input.exchange + '-status', connection)]);
+  commit(ctx, [saveConnection(database, input.exchange, encrypted, at), upsertAsset(database, next), settingStatement(database, input.exchange + '-status', connection), ...extra]);
 }
 
 export async function disconnect(ctx: SyncContext, exchange: ConnectionExchange): Promise<void> {
@@ -295,12 +318,37 @@ export async function refresh(ctx: SyncContext, refreshPositions?: () => Promise
   if (last && ctx.now() - Number(last.value) < SYNC_THROTTLE_MS) return false;
   lease.write(() => saveSetting(database, 'last-attempt', String(ctx.now())));
   const stored = database.prepare('SELECT exchange,encrypted FROM connections').rows<Stored>();
+  const hlConn = stored.find(item => item.exchange === 'hyperliquid');
+  const rhConn = stored.find(item => item.exchange === 'rh-lighter');
+  const unsealWalletHash = (row: Stored | undefined, exchange: 'hyperliquid' | 'rh-lighter'): { status: 'none' } | { status: 'ok'; walletHash: string } | { status: 'error' } => {
+    if (!row) return { status: 'none' };
+    try {
+      const cred = vault.unseal(row.encrypted, exchange) as { walletAddress?: unknown };
+      return typeof cred?.walletAddress === 'string' && cred.walletAddress ? { status: 'ok', walletHash: hashAddress(cred.walletAddress) } : { status: 'error' };
+    } catch {
+      return { status: 'error' };
+    }
+  };
+  const hlIdentity = unsealWalletHash(hlConn, 'hyperliquid');
+  const rhIdentity = unsealWalletHash(rhConn, 'rh-lighter');
+  type RhRoundInfo =
+    | { status: 'none' }
+    | { status: 'decrypt_error' }
+    | { status: 'ok'; walletHash: string; indices?: number[] }
+    | { status: 'failed'; walletHash: string };
+  let resolveRhRound: ((info: RhRoundInfo) => void) | null = null;
+  const rhRoundPromise: Promise<RhRoundInfo> = rhIdentity.status === 'none'
+    ? Promise.resolve({ status: 'none' })
+    : rhIdentity.status === 'error'
+      ? Promise.resolve({ status: 'decrypt_error' })
+      : new Promise<RhRoundInfo>(resolve => { resolveRhRound = resolve; });
+
   // A source result is written only while its credential is still the one read here; the check shares the lease transaction.
   const sourceWrite = (row: Stored, statements: Run[]) => lease.write(() => {
     if (storedConnection(database, row.exchange)?.encrypted === row.encrypted) for (const run of statements) run();
   });
   /** Reads one source and writes its result, or its failure with the old values kept. */
-  async function source(exchange: ConnectionExchange, read: (row: Stored, asset: Asset) => Promise<{ asset: Asset }>, failure: (error: unknown) => string): Promise<void> {
+  async function source(exchange: ConnectionExchange, read: (row: Stored, asset: Asset) => Promise<{ asset: Asset }>, failure: (error: unknown) => string, extraOnSuccess: Run[] = []): Promise<void> {
     const row = stored.find(item => item.exchange === exchange);
     if (!row) return;
     const revision = revisionOf(row.encrypted);
@@ -318,9 +366,9 @@ export async function refresh(ctx: SyncContext, refreshPositions?: () => Promise
     const connection = ledger.connections[exchange];
     sourceWrite(row, 'error' in outcome
       ? [...(asset ? [assetStatement(database, { ...asset, status: '同步失败 · 保留旧值', error: outcome.error })] : []), settingStatement(database, exchange + '-status', { ...connection, error: outcome.error })]
-      : [assetStatement(database, outcome.asset), settingStatement(database, exchange + '-status', { ...connection, lastSync: iso(outcome.at), error: null })]);
+      : [assetStatement(database, outcome.asset), settingStatement(database, exchange + '-status', { ...connection, lastSync: iso(outcome.at), error: null }), ...extraOnSuccess]);
   }
-  const dated = (exchange: DatedSource, read: (credentials: never) => Promise<DatedRead>) => source(exchange, async (row, asset) => {
+  const dated = (exchange: DatedSource, read: (credentials: never) => Promise<DatedRead>, extraOnSuccess: Run[] = []) => source(exchange, async (row, asset) => {
     const credentials = vault.unseal(row.encrypted, exchange) as never;
     const result = await read(credentials);
     return { asset: { ...withQuote(asset, result), quantity: result.total, price: 1, value: result.total, details: result.details, updatedAt: result.updatedAt, status: DATED[exchange].status, error: undefined } };
@@ -329,7 +377,7 @@ export async function refresh(ctx: SyncContext, refreshPositions?: () => Promise
     if (prefix === null) return message(error, hidden);
     // Neither transport nor decryption exceptions may expose session material.
     return error instanceof Error && error.message.startsWith(prefix) ? error.message : hidden;
-  });
+  }, extraOnSuccess);
 
   await settleIndependent([async () => {
     const [marketResult] = await Promise.allSettled([sources.quotes()]);
@@ -378,8 +426,205 @@ export async function refresh(ctx: SyncContext, refreshPositions?: () => Promise
   () => dated('okx', c => sources.syncOkx(c)),
   () => dated('gate', c => sources.syncGate(c)),
   () => dated('variational', c => sources.syncVariational(c)),
-  () => dated('hyperliquid', c => sources.syncHyperliquid(c, {})),
-  () => dated('rh-lighter', c => sources.syncRhLighter(c)),
+  () => dated('hyperliquid', c => sources.syncHyperliquid(c, {}), hlIdentity.status === 'ok' ? [() => updateDedupIdentity(database, 'hyperliquid', { walletHash: hlIdentity.walletHash })] : []),
+  async () => {
+    if (rhIdentity.status !== 'ok') {
+      await dated('rh-lighter', c => sources.syncRhLighter(c));
+      return;
+    }
+    let outcome: RhRoundInfo = { status: 'failed', walletHash: rhIdentity.walletHash };
+    let indexHashes: string[] | undefined;
+    try {
+      await source('rh-lighter', async (row, asset) => {
+        const credentials = vault.unseal(row.encrypted, 'rh-lighter') as RhLighterCredential;
+        const result = await sources.syncRhLighter(credentials);
+        let indices: number[] | undefined;
+        if (ctx.dexAccounts && sources.rhLighterAccountIndices) {
+          try { indices = await sources.rhLighterAccountIndices(credentials); } catch { indices = undefined; }
+        }
+        if (indices) indexHashes = indices.map(hashRhIndex);
+        outcome = { status: 'ok', walletHash: rhIdentity.walletHash, ...(indices ? { indices } : {}) };
+        return { asset: { ...withQuote(asset, result), quantity: result.total, price: 1, value: result.total, details: result.details, updatedAt: result.updatedAt, status: DATED['rh-lighter'].status, error: undefined } };
+      }, error => {
+        const { prefix, hidden } = DATED['rh-lighter'];
+        return prefix && error instanceof Error && error.message.startsWith(prefix) ? error.message : hidden;
+      }, [() => updateDedupIdentity(database, 'rh-lighter', { walletHash: rhIdentity.walletHash, ...(indexHashes ? { indexHashes } : {}) })]);
+    } finally {
+      resolveRhRound?.(outcome);
+    }
+  },
+  async () => {
+    if (!ctx.dexAccounts) return;
+    const safeDexServiceError = (error: unknown): string => {
+      if (error instanceof Error && error.message.startsWith('DEX 价差')) return error.message.slice(0, 200);
+      return '无法连接 DEX 价差服务，已保留上次数据';
+    };
+    const safeProblem = (text: string): string => text.replace(/(?:0x[0-9a-fA-F]{40,}|\b[0-9a-fA-F]{40,}\b)/g, '（已隐去）').slice(0, 200);
+    const safeVenueError = (venue: DexVenue, error: unknown): string => {
+      const prefix = venue === 'lighter' ? 'Lighter 主网 ' : venue === 'rh' ? 'Lighter RH ' : 'Hyperliquid ';
+      const fallback = `${DEX_SPREAD_VENUE_NAMES[venue]} 同步失败，请稍后重试；已保留上次数据`;
+      return error instanceof Error && error.message.startsWith(prefix) ? error.message.slice(0, 200) : fallback;
+    };
+    let dexState: DexAccountsState;
+    try {
+      dexState = await ctx.dexAccounts();
+    } catch (error) {
+      const reason = safeDexServiceError(error);
+      lease.write(() => {
+        const rows = database.prepare('SELECT data FROM assets').rows<{ data: string }>();
+        const existing = rows.map(row => JSON.parse(row.data) as Asset).find(asset => asset.mode === 'dex-spread');
+        if (existing) assetStatement(database, { ...existing, status: '同步失败 · 保留旧值', error: reason })();
+      });
+      return;
+    }
+    if (dexState.problem !== null) {
+      const reason = safeProblem(dexState.problem);
+      lease.write(() => {
+        const rows = database.prepare('SELECT data FROM assets').rows<{ data: string }>();
+        const existing = rows.map(row => JSON.parse(row.data) as Asset).find(asset => asset.mode === 'dex-spread');
+        if (existing) assetStatement(database, { ...existing, status: '同步失败 · 保留旧值', error: reason })();
+      });
+      return;
+    }
+
+    const hlRetained = ledger.assets.some(asset => asset.mode === 'hyperliquid' && knownAssetValue(asset) !== null);
+    const rhRetained = ledger.assets.some(asset => asset.mode === 'rh-lighter' && knownAssetValue(asset) !== null);
+    const prevState = readDexSpreadState(readStoredSetting(database, DEX_SPREAD_ACCOUNTS_KEY));
+    const savedIdentities = readDedupIdentities(readStoredSetting(database, DEX_DEDUP_IDENTITIES_KEY));
+    const hlDedup = hlIdentity.status === 'error'
+      ? { kind: 'error' as const, reason: '无法核对与 Hyperliquid 连接是否重复' }
+      : hlIdentity.status === 'ok'
+        ? { kind: 'active' as const, walletHash: hlIdentity.walletHash }
+        : hlRetained && savedIdentities.hyperliquid?.walletHash
+          ? { kind: 'retained' as const, walletHash: savedIdentities.hyperliquid.walletHash }
+          : { kind: 'none' as const };
+
+    type VenueOutcome =
+      | { kind: 'none' }
+      | { kind: 'deduped'; venue: DexVenue; discoveredRhIndexHash?: string }
+      | { kind: 'keep'; record: DexSpreadStoredAccount };
+
+    const lighterTask = async (): Promise<VenueOutcome> => {
+      const entry = dexState.accounts.lighter;
+      if (!entry) return { kind: 'none' };
+      const accountHash = hashLighterIndex(entry.accountIndex);
+      const prev = prevState.accounts.find(item => item.venue === 'lighter' && item.accountHash === accountHash);
+      try {
+        if (!sources.syncLighterAccount) throw new Error('missing source');
+        const res = await sources.syncLighterAccount(entry.accountIndex);
+        return { kind: 'keep', record: { venue: 'lighter', accountHash, value: res.total, details: res.details, updatedAt: res.updatedAt, error: null } };
+      } catch (error) {
+        const err = safeVenueError('lighter', error);
+        return { kind: 'keep', record: prev ? { ...prev, error: err } : { venue: 'lighter', accountHash, value: null, details: [], updatedAt: '', error: err } };
+      }
+    };
+
+    const entropyTask = async (): Promise<VenueOutcome> => {
+      const entry = dexState.accounts.entropy;
+      if (!entry) return { kind: 'none' };
+      const accountHash = hashAddress(entry.address);
+      const prev = prevState.accounts.find(item => item.venue === 'entropy' && item.accountHash === accountHash);
+      if (hlDedup.kind === 'error') {
+        return { kind: 'keep', record: { venue: 'entropy', accountHash, value: null, details: [], updatedAt: '', error: hlDedup.reason } };
+      }
+      if ((hlDedup.kind === 'active' || hlDedup.kind === 'retained') && accountHash === hlDedup.walletHash) {
+        return { kind: 'deduped', venue: 'entropy' };
+      }
+      try {
+        const res = await sources.syncHyperliquid({ walletAddress: entry.address }, {});
+        return { kind: 'keep', record: { venue: 'entropy', accountHash, value: res.total, details: res.details, updatedAt: res.updatedAt, error: null } };
+      } catch (error) {
+        const err = safeVenueError('entropy', error);
+        return { kind: 'keep', record: prev ? { ...prev, error: err } : { venue: 'entropy', accountHash, value: null, details: [], updatedAt: '', error: err } };
+      }
+    };
+
+    let rhDedupInfo: { kind: 'none' } | { kind: 'error' } | { kind: 'known'; walletHash: string; indexHashes?: string[] } = { kind: 'none' };
+    const rhTask = async (): Promise<VenueOutcome> => {
+      const rhInfo = await rhRoundPromise;
+      if (rhInfo.status === 'decrypt_error') {
+        rhDedupInfo = { kind: 'error' };
+      } else if (rhInfo.status === 'ok') {
+        const indexHashes = rhInfo.indices
+          ? rhInfo.indices.map(hashRhIndex)
+          : savedIdentities['rh-lighter']?.walletHash === rhInfo.walletHash
+            ? savedIdentities['rh-lighter'].indexHashes
+            : undefined;
+        rhDedupInfo = { kind: 'known', walletHash: rhInfo.walletHash, ...(indexHashes ? { indexHashes } : {}) };
+      } else if (rhInfo.status === 'failed') {
+        const indexHashes = savedIdentities['rh-lighter']?.walletHash === rhInfo.walletHash
+          ? savedIdentities['rh-lighter'].indexHashes
+          : undefined;
+        rhDedupInfo = { kind: 'known', walletHash: rhInfo.walletHash, ...(indexHashes ? { indexHashes } : {}) };
+      } else if (rhRetained && savedIdentities['rh-lighter']) {
+        rhDedupInfo = {
+          kind: 'known',
+          walletHash: savedIdentities['rh-lighter'].walletHash,
+          ...(savedIdentities['rh-lighter'].indexHashes ? { indexHashes: savedIdentities['rh-lighter'].indexHashes } : {}),
+        };
+      }
+
+      const entry = dexState.accounts.rh;
+      if (!entry) return { kind: 'none' };
+      const accountHash = hashRhIndex(entry.accountIndex);
+      const prev = prevState.accounts.find(item => item.venue === 'rh' && item.accountHash === accountHash);
+      if (rhDedupInfo.kind === 'error') {
+        return { kind: 'keep', record: { venue: 'rh', accountHash, value: null, details: [], updatedAt: '', error: '无法核对与 Lighter RH 连接是否重复' } };
+      }
+      if (rhDedupInfo.kind === 'known' && rhDedupInfo.indexHashes?.includes(accountHash)) {
+        return { kind: 'deduped', venue: 'rh' };
+      }
+      try {
+        if (!sources.syncRhLighterAccount) throw new Error('missing source');
+        const res = await sources.syncRhLighterAccount(entry.accountIndex);
+        const l1Hash = hashAddress(res.l1Address);
+        if (rhDedupInfo.kind === 'known' && l1Hash === rhDedupInfo.walletHash) {
+          return { kind: 'deduped', venue: 'rh', discoveredRhIndexHash: accountHash };
+        }
+        return { kind: 'keep', record: { venue: 'rh', accountHash, l1Hash, value: res.total, details: res.details, updatedAt: res.updatedAt, error: null } };
+      } catch (error) {
+        if (rhDedupInfo.kind === 'known' && prev?.l1Hash === rhDedupInfo.walletHash) {
+          return { kind: 'deduped', venue: 'rh' };
+        }
+        const err = safeVenueError('rh', error);
+        return { kind: 'keep', record: prev ? { ...prev, error: err } : { venue: 'rh', accountHash, value: null, details: [], updatedAt: '', error: err } };
+      }
+    };
+
+    const [lighterOut, rhOut, entropyOut] = await Promise.all([lighterTask(), rhTask(), entropyTask()]);
+    const hlEncryptedAtStart = hlConn?.encrypted ?? null;
+    const rhEncryptedAtStart = rhConn?.encrypted ?? null;
+    lease.write(() => {
+      const currentHl = storedConnection(database, 'hyperliquid')?.encrypted ?? null;
+      const currentRh = storedConnection(database, 'rh-lighter')?.encrypted ?? null;
+      if (currentHl !== hlEncryptedAtStart || currentRh !== rhEncryptedAtStart) return;
+      if (hlDedup.kind === 'active') updateDedupIdentity(database, 'hyperliquid', { walletHash: hlDedup.walletHash });
+      else if (hlDedup.kind === 'none') updateDedupIdentity(database, 'hyperliquid', undefined);
+      if (rhDedupInfo.kind === 'known') {
+        const discovered = rhOut.kind === 'deduped' && rhOut.discoveredRhIndexHash ? [rhOut.discoveredRhIndexHash] : [];
+        const merged = rhDedupInfo.indexHashes || discovered.length
+          ? [...(rhDedupInfo.indexHashes ?? []), ...discovered]
+          : undefined;
+        updateDedupIdentity(database, 'rh-lighter', { walletHash: rhDedupInfo.walletHash, ...(merged ? { indexHashes: merged } : {}) });
+      } else if (rhDedupInfo.kind === 'none') {
+        updateDedupIdentity(database, 'rh-lighter', undefined);
+      }
+      const outcomes = [lighterOut, rhOut, entropyOut];
+      const nextState: DexSpreadStoredState = {
+        accounts: outcomes.flatMap(item => item.kind === 'keep' ? [item.record] : []),
+        deduped: outcomes.flatMap(item => item.kind === 'deduped' ? [item.venue] : []),
+      };
+      saveSetting(database, DEX_SPREAD_ACCOUNTS_KEY, nextState);
+      const assets = database.prepare('SELECT data FROM assets').rows<{ data: string }>().map(row => JSON.parse(row.data) as Asset);
+      const existing = assets.find(asset => asset.mode === 'dex-spread');
+      const nextAsset = aggregateDexSpread(nextState, existing, () => nextRowAllocation(assets), iso(ctx.now()));
+      if (nextAsset === null) {
+        if (existing) database.prepare('DELETE FROM assets WHERE id = ?').bind(existing.id).run();
+      } else {
+        upsertAsset(database, nextAsset)();
+      }
+    });
+  },
   async () => {
     // A failed position read must not keep successful balance updates from being snapshotted.
     try { await refreshPositions?.(); } catch { /* peek records whatever is still available */ }

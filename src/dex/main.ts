@@ -44,6 +44,7 @@ export function startDex({ socket, stateDir, build, options = {}, log = line => 
     tokenDigest: () => { const live = current(); return live ? tokenDigest(live) : null; },
     crash: () => crash,
     alerts: () => holder.engine?.liveAlerts() ?? [],
+    accounts: () => holder.engine ? holder.engine.accounts() : { accounts: {}, problem: holder.error ? 'DEX 价差模块不可用' : null },
   }, build);
   let stopped = false;
   const stopping = new AbortController();

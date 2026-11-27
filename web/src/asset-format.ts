@@ -31,7 +31,7 @@ export const statusTone = (a: Asset, label: string): string => a.mode === 'manua
 export const staleRow = (a: Asset, label: string): boolean => !!a.error || label.includes('旧值');
 
 export function quantityText(a: Asset, current: boolean): string {
-  if (current && isExchangeMode(a.mode)) return a.mode === 'binance' ? '钱包资产估值' : a.mode === 'okx' || a.mode === 'gate' ? '账户资产估值' : a.mode === 'hyperliquid' || a.mode === 'rh-lighter' ? '账户总值' : '账户权益';
+  if (current && isExchangeMode(a.mode)) return a.mode === 'binance' ? '钱包资产估值' : a.mode === 'okx' || a.mode === 'gate' ? '账户资产估值' : a.mode === 'hyperliquid' || a.mode === 'rh-lighter' || a.mode === 'dex-spread' ? '账户总值' : '账户权益';
   return a.quantity === null ? '—' : money(a.quantity, a.quantity % 1 ? 4 : 0);
 }
 export const priceText = (a: Asset, current: boolean): string => current && isExchangeMode(a.mode) ? '—' : a.price === null ? '—' : money(a.price, a.price < 1 ? 6 : 2);
@@ -51,9 +51,9 @@ export const periodKind = (p: Period): string => p.archived ? '导入前示例�
 export const periodFxTitle = (p: Period): string => p.fxStatus ? (p.fxStatus.source === 'Frankfurter' ? 'Frankfurter / ECB · 报价日 ' + p.fxStatus.rateDate : p.fxStatus.source + ' · ' + stamp(p.fxStatus.fetchedAt)) : '原记录汇率';
 
 type Mode = Asset['mode'];
-const wallet = (mode: Mode) => mode === 'hyperliquid' || mode === 'rh-lighter';
+const wallet = (mode: Mode) => mode === 'hyperliquid' || mode === 'rh-lighter' || mode === 'dex-spread';
 export const detailTitle = (mode: Mode): string => mode === 'binance' ? '钱包资产明细' : mode === 'okx' || mode === 'gate' ? '账户资产估值明细' : wallet(mode) ? '账户总值明细' : '账户明细';
-export const detailSubtitle = (a: Asset): string => (a.mode === 'variational' || a.mode === 'gate' || a.mode === 'hyperliquid' ? '估值时间 ' : a.mode === 'rh-lighter' ? '获取时间 ' : '最近同步 ') + stamp(a.updatedAt) + ' · '
+export const detailSubtitle = (a: Asset): string => (a.mode === 'variational' || a.mode === 'gate' || a.mode === 'hyperliquid' || a.mode === 'dex-spread' ? '估值时间 ' : a.mode === 'rh-lighter' ? '获取时间 ' : '最近同步 ') + stamp(a.updatedAt) + ' · '
   + (a.mode === 'binance' ? '钱包资产估值 / USD' : a.mode === 'okx' || a.mode === 'gate' ? '账户资产估值 / USD' : wallet(a.mode) ? '账户总值 / USD' : '美元净权益');
 export const detailHeads = (mode: Mode): [string, string] => [
   mode === 'binance' || mode === 'okx' || mode === 'gate' ? '账户 / 估值单位' : '账户 / 币种',
@@ -71,6 +71,7 @@ const DETAIL_NOTES: Partial<Record<Mode, string>> = {
   gate: '总额采用 Gate 返回的账户总资产 USDT 估值，再按 USDT/USD 汇率换算；分项显示原币种折合金额与美元价值，不代表实际持币量，旧记录以行内币种为准。范围以接口返回为准，不额外累加余额、保证金或未实现盈亏，不自动汇总子账户。Gate 数据最多缓存 1 分钟；估值时间取账户获取时间与汇率时间中较早者，汇率未提供源时间时采用获取时间。',
   okx: '总额直接采用 OKX 返回的账户总资产美元估值；分项是各账户的折合金额，不代表实际 USD 持仓，分项与总额可能存在舍入差异。不额外累加保证金、未实现盈亏或持仓名义价值，不自动汇总子账户。',
   binance: '按 Binance 返回的各钱包折合 USDT 余额汇总，再按 USDT/USD 汇率换算；折合余额不是实际 USDT 持仓。不额外累加现货、合约或持仓名义价值，未实现盈亏是否包含以接口返回为准。',
+  'dex-spread': '汇总 DEX 价差模块中录入的场所账户（Lighter 主网、Lighter RH 与 Entropy），并自动去重剔除已在「交易所连接」中连接的重复账户（Hyperliquid 同主账户地址、Lighter RH 同 L1 地址或其名下子账户）。Lighter 主网与 Entropy 按 USDC/USD 汇率换算美元，Lighter RH 以 USDG 按 1:1 计为美元；现货代币、挂单锁定与公共池份额仅作参考不计入总额。账户凭据请在「DEX 价差」页管理。',
 };
 export const detailNote = (mode: Mode): string => DETAIL_NOTES[mode] ?? '账户合计采用交易所净权益。币种行仅供核对，不将保证金和持仓名义价值再次计入。';
 

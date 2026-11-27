@@ -100,12 +100,13 @@ export function importPlan(source: SourceLedger, current: Ledger, previous: Sour
     }
     return asset;
   });
-  let nextId = Math.max(...imported.assets.map(a => Number(a.id.slice(4)))) + 1;
+  let nextId = Math.max(0, ...imported.assets.map(a => (/^row-(\d+)$/.test(a.id) ? Number(a.id.slice(4)) : 0))) + 1;
   for (const asset of current.assets) {
     const syncedWallet = (asset.mode === 'binance' || asset.mode === 'okx' || asset.mode === 'gate' || asset.mode === 'variational' || asset.mode === 'hyperliquid' || asset.mode === 'rh-lighter') && (current.connections[asset.mode].configured || current.connections[asset.mode].lastSync);
-    if (!matched.has(asset.id) && (edited(asset) || syncedWallet)) {
+    const syncedDex = asset.mode === 'dex-spread';
+    if (!matched.has(asset.id) && (edited(asset) || syncedWallet || syncedDex)) {
       imported.assets.push({ ...asset, id: 'row-' + nextId++ });
-      retained.push(asset.project + (syncedWallet ? ' 已同步余额（额外保留）' : ' 手动修改（额外保留）'));
+      retained.push(asset.project + (syncedWallet || syncedDex ? ' 已同步余额（额外保留）' : ' 手动修改（额外保留）'));
     }
   }
   if (current.fx !== old.fx || current.fxStatus.source !== 'saved') { imported.fx = current.fx; imported.fxStatus = current.fxStatus; retained.push('当前汇率'); }

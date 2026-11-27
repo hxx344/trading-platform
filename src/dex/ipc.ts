@@ -2,10 +2,11 @@
 import { request, type IncomingMessage } from 'node:http';
 import { anySignal } from '../any-signal.mjs';
 import { DEX_BACKTEST_TIMEOUT_MS, DEX_INPUT_LIMIT, DEX_OUTPUT_LIMIT, DEX_PATH, DEX_PROTOCOL, DEX_READ_TIMEOUT_MS, DexError,
-  type DexPageAnswer, type DexPageRequest, type DexStatus, type DexTokenPush } from './protocol.ts';
+  type DexAccountsState, type DexPageAnswer, type DexPageRequest, type DexStatus, type DexTokenPush } from './protocol.ts';
+import { DEX_KEYS_VERSION, parseDexAccounts } from './keys.ts';
 
 export { DEX_PROTOCOL } from './protocol.ts';
-export type { DexPageAnswer, DexPageRequest, DexStatus, DexTokenPush } from './protocol.ts';
+export type { DexAccountsState, DexPageAnswer, DexPageRequest, DexStatus, DexTokenPush } from './protocol.ts';
 
 /** POST 已经发到 DEX、应答丢了或超时：结果未知，调用方断开浏览器连接，不重试（L204）。 */
 export class DexOutcomeUnknown extends Error {}
@@ -49,12 +50,32 @@ export async function dexStatus(socketPath: string, timeoutMs = 2500): Promise<D
   return value;
 }
 
+function parseAccountsState(value: unknown): DexAccountsState {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new DexError('DEX 价差服务账户应答格式无效');
+  const record = value as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (key !== 'accounts' && key !== 'problem') throw new DexError('DEX 价差服务账户应答含有未知字段');
+  }
+  if (!('accounts' in record) || !('problem' in record)) throw new DexError('DEX 价差服务账户应答缺少字段');
+  if (record.problem !== null && typeof record.problem !== 'string') throw new DexError('DEX 价差服务账户应答格式无效');
+  const rawAccounts = record.accounts;
+  if (!rawAccounts || typeof rawAccounts !== 'object' || Array.isArray(rawAccounts) || 'version' in rawAccounts) throw new DexError('DEX 价差服务账户应答格式无效');
+  try {
+    const accounts = parseDexAccounts({ version: DEX_KEYS_VERSION, ...(rawAccounts as Record<string, unknown>) });
+    return { accounts, problem: record.problem === null ? null : record.problem.slice(0, 240) };
+  } catch {
+    throw new DexError('DEX 价差服务账户应答无效');
+  }
+}
+
 export interface DexClient {
   /** 转发一个页面请求。确定没发出的失败返回 503 dex_unavailable；POST 发出后结果未知时抛 DexOutcomeUnknown。 */
   page(input: DexPageRequest, signal?: AbortSignal): Promise<DexPageAnswer>;
   /** 返回 DEX 当前生效的 token 摘要，执行面以它为准判断是否送达。 */
   pushToken(push: DexTokenPush): Promise<{ instance: string; token: string | null }>;
   status(): Promise<DexStatus>;
+  /** 读取当前生效的场所账户标识（只读，不含私钥）。 */
+  accounts(): Promise<DexAccountsState>;
   /** 依赖巡检读到的协议版本不认识时置为假，之后页面请求一律返回 503。 */
   setCompatible(compatible: boolean): void;
   close(): void;
@@ -93,6 +114,13 @@ export function createDexClient(socketPath: string): DexClient {
       return { instance, token: value.token };
     },
     status: () => dexStatus(socketPath),
+    async accounts() {
+      if (!compatible) throw new DexError('DEX 价差服务版本与执行服务不匹配');
+      const { res, body } = await exchange(socketPath, DEX_PATH + 'accounts', null, anySignal([stopped.signal], DEX_READ_TIMEOUT_MS), { sent: false });
+      if (res.statusCode === 404) throw new DexError('DEX 价差服务版本较旧，不支持读取场所账户');
+      if (res.statusCode !== 200) throw new DexError('DEX 价差服务未能返回场所账户');
+      return parseAccountsState(parse(body));
+    },
     setCompatible(value) { compatible = value; },
     close() { stopped.abort(); },
   };

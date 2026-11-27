@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { connectionCredentials } from '../src/asset-connection-form.ts';
+import { CONNECTION_NAMES, connectionCredentials } from '../src/asset-connection-form.ts';
 
 test('连接表单仅向所选交易所提供对应的凭据字段', () => {
+  assert.equal('dex-spread' in CONNECTION_NAMES, false);
   const input = { key: ' key ', secret: ' secret ', passphrase: ' pass ', accountMode: 'uta', region: 'eu',
     walletAddress: ' address ', vrToken: ' token ' };
   const pair = { apiKey: 'key', apiSecret: 'secret' };

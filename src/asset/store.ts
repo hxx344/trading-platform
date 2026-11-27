@@ -9,7 +9,9 @@
 // fills-service.ts): they read the saved connections of the open file on every use and live as long as the store.
 import { lstatSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { assertOwnFiles, openAssetDb, type AssetDb, type SnapshotDb } from './db.ts';
+import type { AssetDb, SnapshotDb } from './db.ts';
+import type { DexAccountsState } from '../dex/keys.ts';
+import { assertOwnFiles, openAssetDb } from './db.ts';
 import type { QueryDatabase } from './query.ts';
 import type { Asset, Connection, Ledger } from './types.ts';
 import { seedLedger, type SourceLedger } from './seed.ts';
@@ -17,6 +19,7 @@ import { EXAMPLE_SOURCE } from './source-ledger.ts';
 import { readSnapshotHistory } from './snapshot-history.ts';
 import { aggregateAster, readAsterAccounts } from './aster-accounts.ts';
 import { knownAssetValue } from './asset-values.ts';
+import { rowOrder } from './dex-spread.ts';
 import { chinaDay } from './withdrawals.ts';
 import { CASH_FLOW_KEY, parseCashFlow, readCashFlowAudit, type CashFlowRecord } from './cash-flows.ts';
 import { acquireSyncLock, AssetConflict, LOCK_BUSY, NOT_IMPORTED, type SyncLease } from './sync-lock.ts';
@@ -65,7 +68,7 @@ function assembleLedger(rows: LedgerRows, includeHistory: boolean, at: number): 
   const source = settings.find(s => s.key === 'source-ledger');
   if (!source) throw new Error('资产库缺少原表数据（source-ledger），请重新导入');
   const ledger = seedLedger(JSON.parse(source.value) as SourceLedger, includeHistory);
-  ledger.assets = rows.assets.map(r => { const asset = JSON.parse(r.data) as Asset; return { ...asset, value: knownAssetValue(asset) }; }).sort((a, b) => Number(a.id.slice(4)) - Number(b.id.slice(4)));
+  ledger.assets = rows.assets.map(r => { const asset = JSON.parse(r.data) as Asset; return { ...asset, value: knownAssetValue(asset) }; }).sort((a, b) => rowOrder(a.id) - rowOrder(b.id));
   ledger.fx = Number(settings.find(s => s.key === 'fx')?.value ?? ledger.fx);
   ledger.fxStatus = JSON.parse(settings.find(s => s.key === 'fx-status')?.value ?? 'null') ?? ledger.fxStatus;
   for (const name of EXCHANGES) {
@@ -195,15 +198,17 @@ export interface AssetStoreOptions {
   /** Options of the positions and fills services (tests); their fetch defaults to `fetch` above. */
   positions?: PositionsServiceOptions;
   fills?: FillsServiceOptions;
+  /** Read-only DEX spread account identifiers from the DEX service; omitted when DEX spread is disabled. */
+  dexAccounts?: () => Promise<DexAccountsState>;
 }
-export function createAssetStore(file: string, { now = Date.now, fetch: fetcher = fetch, sources: replaced = {}, positions: positionsOptions = {}, fills: fillsOptions = {} }: AssetStoreOptions = {}): AssetStore {
+export function createAssetStore(file: string, { now = Date.now, fetch: fetcher = fetch, sources: replaced = {}, positions: positionsOptions = {}, fills: fillsOptions = {}, dexAccounts }: AssetStoreOptions = {}): AssetStore {
   const shared = sharePublicReads(fetcher, now);
   const sources: AssetSources = { ...liveSources(fetcher, shared), ...replaced };
   const vault = dataDirVault(dirname(file));
   const positionsService = createPositionsService({ now, fetcher: shared.fetcher, ...positionsOptions });
   const fillsService = createFillsService({ now, fetcher, ...fillsOptions });
   // Other ledger writes only peek. An asset sync refreshes the same cache alongside balance reads.
-  const context = (database: AssetDb, lease: SyncLease): SyncContext => ({ database, lease, vault, sources, now, positions: positionsService.peek });
+  const context = (database: AssetDb, lease: SyncLease): SyncContext => ({ database, lease, vault, sources, now, positions: positionsService.peek, ...(dexAccounts ? { dexAccounts } : {}) });
   const peek = positionsService.peek;
   // Why the open handle is read-only: the files are not the service's to write, or another writer held the file too long.
   let handle: AssetDb | null = null, opened = '', writable = false, busy = false;

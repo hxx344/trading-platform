@@ -1759,6 +1759,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     },
     /** 实盘告警（经执行服务发飞书）。 */
     liveAlerts: () => liveTrader?.alerts() ?? [],
+    accounts: () => accountSource(),
     live: () => liveTrader,
     close(): void {
       running = false; if (replayWorker) void replayWorker.terminate(); liveStop.abort();

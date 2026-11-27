@@ -354,3 +354,17 @@ Binance、Bybit 和 OKX 的持仓页用实时账户快照确定当前方向和�
 - **测试**：`test/asset-source-import.test.ts`（解析规则；预览不写；应用后的资产、设置、归档与当天快照，备份文件权限与内容；同一文件再导入；示例文件、已有原表数据、指纹不符、缺指纹、多余字段的拒绝都不写；备份目录不可用时不写且锁已释放；锁被占时预览与应用都 409；导入与编辑同时发起时编辑被拒；HTTP 的登录顺序与页面标记 403、5 MB 上限、其余接口仍 16 KB、各类报错码；备份之后、写入之前发生工作台重新导入、`source-ledger` 被改、租约过期时都不写入；约 24 MB 的库备份期间事件循环持续运转、已存在目录被收紧、只保留最新 5 份；另一连接持续写源库时备份仍在限定时间内完成、事件循环在转、残留的 `.partial-*` 被清掉、复制失败不留临时文件；页面同步暂停的占用与释放，含 StrictMode 的挂载、卸载、再挂载）。`deploy/test-install.sh` 加了发布包含转换脚本的检查。页面在替身后端走了一遍 1280 与 390 宽度：坏文件报错、预览摘要、取消、确认导入后提示消失并生成备份，面板打开期间没有同步请求。
 
 币安链上折价扫描复用本账本已保存的只读连接，以签名 GET 验证 API 权限、可充值的币链及该网络的默认充值地址。报价使用链上只读模拟的收款余额增量；账本余额、充值地址和签名不进入行情 IPC、通知或展示。见[链上折价套利](chain-arb.md)。
+
+## DEX 价差账号去重并入资产总计（v0.110.0，R2，回滚版本 v0.109.0）
+
+将 DEX 价差模块中录入的场所账户（Lighter 主网、Lighter RH、Entropy）经跨场所去重后纳入资产总计、分交易所合计、日快照、资产变化走势与每日波动归因，不将其列入「交易所连接」待连接卡片、`/api/asset/positions` 持仓页或 `/api/asset/fills` 成交页。
+
+- **账户来源与隔离**：`src/service/main.ts` 在连接 DEX 服务后向 `createAssetStore` 注入 `dexAccounts: () => dex.client.accounts()`，经本机 UNIX socket 只读端点 `GET /dex/v1/accounts` 获取 `DexAccountsState`（与 DEX 引擎 `accountSource()` 同源，`live-keys.json` 优先于 `keys.env` 录入）。应答仅含 `{ accounts: { lighter?, rh?, entropy? }, problem }`，不含私钥或 `apiKeyIndex`；未传 `dexAccounts`（例如未启用 DEX socket 的环境）时完全跳过，执行面仍不导入 `src/varlighter/**`。
+- **账本与统计模型**：`Asset['mode']` 新增 `'dex-spread'`，`EXCHANGE_NAMES` 新增 `'dex-spread': 'DEX 价差'`，以单行聚合记录在资产明细中（`project: 'DEX 价差'`、`kind: '资产'`、`status: '只读同步 · N 个账号'`）。不修改 `Ledger['connections']`、`asset-values.ts` 的 `EXCHANGE_MODES` 与 `configuredExchanges` 签名；原表导入的 `importPlan` 通过 `syncedDex` 保留已同步的 DEX 价差行。
+- **跨场所去重与估值（`src/asset/sources/lighter-account.ts`、`src/asset/dex-spread.ts`、`src/asset/sync.ts`）**：
+  - **Lighter 主网（`lighter`）**：无需跨场所去重；只读请求 `https://mainnet.zklighter.elliot.ai/api/v1/account?by=index&value=<id>&active_only=true`（独立 60 秒限流冷却），只解析 `accounts[0].total_asset_value`（不回退读取实盘保证金字段 `collateral`）并按 USDC/USD 汇率折算美元。
+  - **Entropy（`entropy`）**：与资产页 `hyperliquid` 连接的 `walletAddress`（或断开保留旧值时的 `dex-dedup-identities.hyperliquid.walletHash`）去重；不重复时复用 `sources.syncHyperliquid`。若已保存的 `hyperliquid` 凭据密文损坏，保守拒绝计入 Entropy 并报错。
+  - **Lighter RH（`rh`）**：双重去重——第一道零请求比对本轮 `rh-lighter` 同步产出的 `rhLighterAccountIndices`（复用 `rh-lighter.ts` 30 秒快照缓存）或已保存 `indexHashes`；未命中时第二道调用 `syncRhLighterAccount`（与 `rh-lighter.ts` 共享 `rhLighterCooldown` 60 秒限流冷却），核对返回 `l1Address` 与资产页 `rh-lighter` 钱包是否同 L1 地址。未重复时以 USDG 按 1:1 计美元；若 `rh-lighter` 凭据密文损坏，保守拒绝计入 Lighter RH。
+  - **原子防双算与竞态保护**：在 `sync.connect` 连接 `hyperliquid` 或 `rh-lighter` 时，于同一 SQLite `commit()` 事务内调用 `pruneDexSpreadOnConnect` 立即剔除重复的 DEX 价差子账号（若剩余 0 个则整行删除）并同步更新当日快照；`sync.refresh` 写入前二次核对 `hyperliquid` / `rh-lighter` 密文未在并发期间变动。
+- **零明文持久化与故障保留**：`settings['dex-spread-accounts']` 与 `settings['dex-dedup-identities']` 仅保存带域前缀的 SHA-256 指纹（`hashAddress`、`hashRhIndex`、`hashLighterIndex`）；资产行 `details`、错误提示、接口应答与日志均不写入或回显明文钱包地址、L1 地址或账户编号。DEX 服务异常或 `problem !== null` 时整行保留旧值并记为「同步失败 · 保留旧值」（无旧行时不新建）；部分待保留账户拉取失败时，若该账户此前已有旧值则沿用旧值并记为「部分账号未更新 · 保留旧值」，若为首次同步即失败（或受 `hyperliquid` / `rh-lighter` 密文损坏保守拒绝影响）则整行估值置为 `null` 并记为「部分账号估值缺失」；待同步账户经去重或移除清零时删除 `dex-spread` 行。
+- **验证与回滚**：测试见 `test/asset-sources-lighter-account.test.ts`、`test/asset-dex-spread.test.ts`、`test/dex-service.test.ts` 等；不改动 SQLite 表结构、`config.json` 与 `install.sh`，回滚至 `v0.109.0` 只需停止服务并回退版本，旧版本忽略 `settings` 中的新增键。

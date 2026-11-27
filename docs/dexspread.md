@@ -288,6 +288,7 @@ D1、D2、D3 合在 v0.88.0 一次发布，回滚版本 v0.87.0；定级 R3（�
 | `GET status` | 执行面、安装器 → DEX | `{ build, instance, protocol: 1, process: { rss, heapUsed, loopDelayMs }, crash, token }`：健康检查、「服务器状态」、上次崩溃记录（11.7）、已收到的 token 摘要（11.4） |
 | `POST page` | 执行面 → DEX | 通用转发：`{ method, path, query, body }` → `{ status, body }`。`path` 只取 `/api/varlighter/` 之后的部分，DEX 服务内部按原来 `http.ts` 的路由表分发。以后 DEX 加接口、改字段都不用改执行面 |
 | `POST var-token` | 执行面 → DEX | 推送 Var token 状态（11.4） |
+| `GET accounts` | 执行面 → DEX | 只读返回当前生效的场所账户概览（`DexAccountsState`：`accounts` 与 `problem`，不含私钥与 `apiKeyIndex`），供资产账本去重同步（`v0.110.0`） |
 
 - 执行面 `http.ts` 的 `/api/varlighter/*` 分支改成：CSRF（所有 POST 在进路由前统一检查）与只读令牌范围检查照旧，再调用转发，拿到 `{ status, body }` 后用原来的 `send()` 发出，只读令牌的应答照旧经过别名替换。只读令牌白名单（`read-token.ts`）留在执行面，加新的令牌可读接口时才改执行面。`/api/shell` 的模块开关照旧取「有没有 varlighter 视图」，转发对象在就算开启。
 - 传输照 `src/market/ipc.ts`：请求体一次写完（`content-length`），DEX 服务读完整个请求体才处理、才应答，所以不会出现 L204 第二段那种对端先关闭的情况；应答字节数设上限（32 MB，样本分页最多 1000 条，远低于上限）。中止信号按 L206 用 `anySignal`。
@@ -739,3 +740,7 @@ DEX 这一步在 `activate` 里的位置是：**执行面健康之后、控制�
   - 不对 `portfolioMargin` 做多币种抵押率/可借余额换算；暂不读取或折算 `USDT0` 作为 `io` 盘保证金（`meta(dex: 'io')` 核实 `collateralToken` 为 `0` 即 `USDC`）。
   - 不改变实盘下单/平仓/对账状态机。
 - **验证与待实测**：`test/dex-keys.test.ts`（`parseEntropyUnifiedBalance` 正常/空条目/超 200 项截断/异常与重复 `USDC` 拒绝、`default`/`disabled`/`unifiedAccount` 读取与信号透传中止、`portfolioMargin`/`dexAbstraction`/未知模式/现货账本失败拒绝、准备页端到端）；`test/dex-accounts.test.ts`（统一账户资产视图、快照写入与 D4 不泄露地址）；审查记录见 [reviews/2026-11-27-entropy-unified-account.md](reviews/2026-11-27-entropy-unified-account.md)。`unifiedAccount` 存在 `io` 盘活跃持仓与明显浮盈亏时的 `spot.total`/`hold`/`tokenToAvailableAfterMaintenance` 对账表现已记入 [live-results.md](live-results.md) 待实测。
+
+## 16 场所账户只读并入资产账本（v0.110.0，回滚版本 v0.109.0）
+
+DEX 服务的 `GET /dex/v1/accounts` 端点直接复用引擎的 `accountSource()`（页面 `live-keys.json` 优先于 `--set-dex-keys` 的 `keys.env`），向执行面的资产账本提供 `{ accounts: { lighter?, rh?, entropy? }, problem }` 只读概览（`src/dex/server.ts`、`src/dex/main.ts`、`src/dex/ipc.ts`），绝不导出私钥或 `apiKeyIndex`。资产侧通过该接口同步 Lighter 主网、Lighter RH 与 Entropy 账户并完成跨场所去重，具体聚合口径、零明文指纹持久化与原子防双算见 [asset.md](asset.md)《DEX 价差账号去重并入资产总计》。

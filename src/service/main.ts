@@ -410,8 +410,10 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
         events: () => [], latestSeq: () => 0, pairs: () => [], incidentPair: () => null });
     } catch (error) { monitorOutboxError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`行情告警的出站队列（${MONITOR_OUTBOX_FILE}）无法打开，行情告警暂停入队：${monitorOutboxError}\n`); }
   }
+  // DEX 价差在自己的服务里（docs/dexspread.md 第 11 节）：这里只转发页面请求、推送 Var token 与只读场所账户标识。
+  const dex = dexSocketPath ? createDexLink({ socketPath: dexSocketPath, dir, notifyOnce: (key, text) => { notifier.notifyOnce(key, text); }, log: line => process.stderr.write(`${line}\n`) }) : null;
   // The ledger opens its file on demand, including when it is first imported after startup.
-  const asset = config.asset ? createAssetStore(join(dir, ASSET_DB_FILE)) : null;
+  const asset = config.asset ? createAssetStore(join(dir, ASSET_DB_FILE), dex ? { dexAccounts: () => dex.client.accounts() } : {}) : null;
   if (config.monitor) {
     const alertHooks = marketAlertHooks({ secrets, notifier, monitorOutbox, monitorOutboxError, send: (secret, text, opportunityReceipt) => sendFeishu(secret, { msg_type: 'text', content: { text } }, { fetchImpl: notifyFetch, opportunityReceipt }) });
     try { monitor = openMonitor(config.monitor, dir, { ...(monitorFetch ? { fetchImpl: monitorFetch } : {}),
@@ -439,7 +441,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
     if (crash) clearCrashRecord(dir);
     notifier.notify(`【服务启动】ASTER 保证金平衡与 ADL：配置 ${config.pairs.length} 个配对，已启用 ${enabled} 个${oilText}`);
     for (const text of warnings) notifier.notify(`【配置未生效】${text}`);
-  } catch (error) { hynixBalance?.close(); oilPnl?.close(); oilRules?.close(); closeMonitorStore(); monitorOutbox?.close(); asset?.close(); samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
+  } catch (error) { dex?.close(); hynixBalance?.close(); oilPnl?.close(); oilRules?.close(); closeMonitorStore(); monitorOutbox?.close(); asset?.close(); samples?.close(); summary.close(); notifier.close(); executor.close(); store.close(); locks.release(); releaseOil(); throw error; }
 
   // The heartbeat for the second server's main-watch; made once the run loop can say whether it is ready.
   let watch: Watch | null = null;
@@ -453,8 +455,6 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   const readTokens = createReadTokens({ dir });
   // 快讯连接随后台循环开关，启动失败时不会留下连接。
   const news: NewsHolder | null = newsOptions ? { feed: null } : null;
-  // DEX 价差在自己的服务里（docs/dexspread.md 第 11 节）：这里只转发页面请求、推送 Var token。
-  const dex = dexSocketPath ? createDexLink({ socketPath: dexSocketPath, dir, notifyOnce: (key, text) => { notifier.notifyOnce(key, text); }, log: line => process.stderr.write(`${line}\n`) }) : null;
   // MEV 套利（docs/mev.md）：启动后只观察；实盘从页面开始。打不开库只停用本模块。
   const mev = openMev({ config: config.mev, secrets: secrets.mev, others: [...secrets.accounts.values()].flatMap(account => [account.user, account.signer]) }, dir, mevOptions ?? {}, { log: line => process.stderr.write(`${line}\n`), notify: (key, text) => notifier.notifyOnce(key, text) });
   // 资金费组合（docs/fundingbook.md）：默认不启用；启用后只读公开行情、记模拟盘。打不开库只停用本模块。

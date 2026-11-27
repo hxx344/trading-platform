@@ -1,8 +1,9 @@
 import type { Ledger } from '../../src/asset/types.ts';
 import { EXCHANGE_NAMES } from '../../src/asset/views.ts';
 
-export const CONNECTION_NAMES = { ...EXCHANGE_NAMES, bitget: 'Bitget' } as const;
+const { 'dex-spread': _dexSpread, ...LEDGER_EXCHANGE_NAMES } = EXCHANGE_NAMES;
 export type ConnectionExchange = keyof Ledger['connections'];
+export const CONNECTION_NAMES: Record<ConnectionExchange, string> = { ...LEDGER_EXCHANGE_NAMES, bitget: 'Bitget' };
 export type CardExchange = Exclude<ConnectionExchange, 'aster'>;
 export type BitgetMode = NonNullable<Ledger['connections']['bitget']['accountMode']>;
 

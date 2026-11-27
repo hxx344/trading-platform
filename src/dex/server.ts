@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { DEX_INPUT_LIMIT, DEX_INSTANCE_HEADER, DEX_OUTPUT_LIMIT, DEX_PAGE_PATH, DEX_PATH, DEX_PROTOCOL, DexError,
-  type DexCrashView, type DexPageAnswer, type DexPageRequest, type DexStatus, type DexTokenPush } from './protocol.ts';
+  type DexAccountsState, type DexCrashView, type DexPageAnswer, type DexPageRequest, type DexStatus, type DexTokenPush } from './protocol.ts';
 
 export interface DexHandlers {
   page(request: DexPageRequest): Promise<DexPageAnswer>;
@@ -15,6 +15,8 @@ export interface DexHandlers {
   crash(): DexCrashView | null;
   /** 实盘告警，由执行服务代发飞书。 */
   alerts?(): { key: string; text: string }[];
+  /** 只读场所账户标识（不含私钥与 API 密钥编号），供资产账本同步去重。 */
+  accounts?(): DexAccountsState;
 }
 
 async function readInput(req: IncomingMessage): Promise<unknown> {
@@ -67,6 +69,9 @@ export function createDexServer(handlers: DexHandlers, build: string) {
     if (req.method === 'GET' && req.url === DEX_PATH + 'status') {
       const status: DexStatus = { build, instance, protocol: DEX_PROTOCOL, process: processStatus(), crash: handlers.crash(), token: handlers.tokenDigest(), alerts: handlers.alerts?.() ?? [] };
       return json(res, 200, status);
+    }
+    if (req.method === 'GET' && req.url === DEX_PATH + 'accounts') {
+      return json(res, 200, handlers.accounts?.() ?? { accounts: {}, problem: null });
     }
     const op = req.method === 'POST' && req.url?.startsWith(DEX_PATH) ? req.url.slice(DEX_PATH.length) : '';
     if (op !== 'page' && op !== 'var-token') return json(res, 404, { message: '未知 DEX 操作' });

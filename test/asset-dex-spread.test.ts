@@ -100,7 +100,13 @@ function setup(t: TestContext, { emptyExample = false } = {}) {
     },
   });
   const peek = <T>(run: (db: AssetDb) => T): T => { const db = openAssetDb(file, { readOnly: true }); try { return run(db); } finally { db.close(); } };
-  t.after(() => { store.close(); for (const name of readdirSync(dataDir)) chmodSync(join(dataDir, name), 0o644); rmSync(root, { recursive: true, force: true }); });
+  t.after(() => {
+    store.close();
+    for (const entry of readdirSync(dataDir, { withFileTypes: true })) {
+      chmodSync(join(dataDir, entry.name), entry.isDirectory() ? 0o700 : 0o644);
+    }
+    rmSync(root, { recursive: true, force: true });
+  });
   return { root, dataDir, file, store, control, writable, peek };
 }
 

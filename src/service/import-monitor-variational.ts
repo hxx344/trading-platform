@@ -4,12 +4,13 @@
 // for format and expiry only (no request to Variational). This service's file is looked at, and written, by
 // src/monitor/variational-import-writer.ts run as the data directory's owner; the token goes to it over stdin. Only
 // expiries, revisions and reasons leave this file as text, never the token.
-import { lstatSync, statSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, isAbsolute, join } from 'node:path';
 import { VARIATIONAL_EXPIRY_MARGIN_MS, variationalTokenExpiry } from '../vendor/variational-market.mjs';
 import { VARIATIONAL_SESSION_MAX_BYTES } from '../monitor/variational-session.ts';
 import { decideVariationalImport, type ServiceVariational } from '../monitor/variational-import-writer.ts';
+import { sourceEntry, sourceText, workbenchIdentity } from './workbench-source.ts';
 import { readerIdentity } from './import-workbench.ts';
 
 type Json = Record<string, unknown>;
@@ -33,43 +34,20 @@ export interface MonitorVariationalItem {
   detail: string;
 }
 
-// Run as the owner of the monitor directory: a plain file (not followed when a link) of at most 16 KiB with mode 600.
-const DUMP_TOKEN = `import { lstatSync, readFileSync } from 'node:fs';
-const [path] = process.argv.slice(1);
-let stat, out;
-try { stat = lstatSync(path); } catch (error) { stat = null; out = error && error.code === 'ENOENT' ? { missing: true } : { refused: 'unreadable' }; }
-if (stat) {
-  if (!stat.isFile()) out = { refused: 'not_file' };
-  else if (stat.size > ${VARIATIONAL_SESSION_MAX_BYTES}) out = { refused: 'large' };
-  else if ((stat.mode & 0o777) !== 0o600) out = { refused: 'mode' };
-  else { try { out = { text: readFileSync(path, 'utf8') }; } catch { out = { refused: 'unreadable' }; } }
-}
-process.stdout.write(JSON.stringify(out));`;
-
+// Run as the workbench account: a plain file (not followed when a link) of at most 16 KiB with mode 600.
 const REFUSED: Record<string, string> = { not_file: '不是普通文件（符号链接等），不读取', large: '超过 16 KiB，不是工作台的文件', mode: '权限不是 600，工作台自己也不会读它，不导入', unreadable: '读不出' };
 
 /** Reads the workbench's token; throws when the monitor directory cannot be read at all. */
 export function readWorkbenchVariational(data: string, now = Date.now()): MonitorVariationalSource {
   if (!isAbsolute(data)) throw new Error(`工作台数据目录须为绝对路径：${data}`);
   const dir = join(data, 'modules', 'monitor');
-  let stat;
-  try { stat = lstatSync(dir); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { token: null, problem: '工作台没有 Monitor 模块' };
-    throw new Error(`工作台的 Monitor 模块数据目录 ${dir} 读不出：${reason(error)}`);
-  }
+  const stat = sourceEntry(data, dir);
+  if (!stat) return { token: null, problem: '工作台没有 Monitor 模块' };
   if (!stat.isDirectory()) throw new Error(`${dir} 不是目录（符号链接等），不读取`);
-  if (process.getuid?.() === 0 && stat.uid === 0 && statSync(dirname(dir)).uid !== 0) throw new Error(`${dir} 归 root，但所在目录归其他账户，不读取；请确认来源`);
-  const identity = readerIdentity(stat, process.getuid?.());
-  const read = spawnSync(process.execPath, ['--input-type=module', '-e', DUMP_TOKEN, '--', join(dir, FILE)], {
-    cwd: '/', env: {}, encoding: 'utf8', timeout: TIMEOUT_MS, maxBuffer: 4 * VARIATIONAL_SESSION_MAX_BYTES, ...identity,
-  });
-  const as = 'uid' in identity ? `（以目录属主 uid ${identity.uid} 读取，不带附加组）` : '';
-  if (read.error || read.status !== 0) throw new Error(`读取工作台 Var token ${join(dir, FILE)} 失败${as}：${printable(read.error?.message ?? (read.stderr.trim() || `退出码 ${read.status ?? read.signal}`)).slice(0, 200)}`);
-  let dumped: { missing?: true; refused?: string; text?: string };
-  try { dumped = JSON.parse(read.stdout) as typeof dumped; } catch { throw new Error(`读取工作台 Var token 失败${as}：输出无法解析`); }
-  if (dumped?.missing) return { token: null, problem: '工作台没有保存 Var token' };
-  if (typeof dumped?.text !== 'string') return { token: null, problem: `${FILE} ${REFUSED[String(dumped?.refused)] ?? REFUSED.unreadable}` };
+  workbenchIdentity(data, dir);
+  const dumped = sourceText(data, join(dir, FILE), VARIATIONAL_SESSION_MAX_BYTES, 0o600);
+  if ('missing' in dumped) return { token: null, problem: '工作台没有保存 Var token' };
+  if ('refused' in dumped) return { token: null, problem: `${FILE} ${REFUSED[dumped.refused] ?? REFUSED.unreadable}` };
   // Neither the parser's message nor the expiry parser's is passed on: they may quote the file.
   let saved: { version?: unknown; token?: unknown };
   try { saved = JSON.parse(dumped.text) as typeof saved; } catch { return { token: null, problem: `${FILE} 不是有效的 JSON` }; }

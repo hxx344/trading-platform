@@ -5,7 +5,7 @@
 // workbench pair deleted and the takeover checks passed in the page. Nothing is sent to ASTER or to the workbench.
 //
 // With --oil it also brings the workbench's Binance/Bybit/OKX execution accounts over for the oil module: <data>/hub.sqlite
-// execution_accounts, decrypted with <data>/credentials.key (read the same way, as the database's owner). Only then: --oil
+// execution_accounts, decrypted with <data>/credentials.key (read the same way, as the workbench data directory's owner). Only then: --oil
 // alone imports the oil accounts only, --oil --pairs id,id both.
 //
 // With --options it also brings the workbench Greeks module's Bybit key and risk settings over (import-options.ts); it
@@ -31,10 +31,11 @@
 // An existing config.json is extended: its pairs, accounts and robot stay as they are, and only pairs it does not have
 // yet are added; an oil venue it already names keeps its settings. Output names pairs, account names and masked account
 // ids only; keys, ciphertext and webhooks never appear in it.
+import { operatorEnv, optionalSourceText, sourceEntry, sourceWorkerImport, workbenchIdentity } from './workbench-source.ts';
 import { inspectPerpetualImport, stagePerpetualImport } from './import-perpetual-settings.ts';
 import { spawnSync } from 'node:child_process';
 import { createDecipheriv } from 'node:crypto';
-import { closeSync, existsSync, fchownSync, fsyncSync, linkSync, lstatSync, openSync, readFileSync, renameSync, rmSync, statSync, writeSync } from 'node:fs';
+import { closeSync, fchownSync, fsyncSync, linkSync, lstatSync, openSync, readFileSync, renameSync, rmSync, statSync, writeSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parseArgs, parseEnv } from 'node:util';
@@ -395,50 +396,46 @@ export function previewImport(source: WorkbenchSource, existing: { config: Json;
     ...(base.crossex ? { crossex: base.crossex } : {}), ...(base.ondo ? { ondo: base.ondo } : {}), notes: base.notes };
 }
 
-/** Prints the raw data column of both tables; run with no environment, as the database's owner when that matters. */
-const DUMP_ROWS = `import { DatabaseSync } from 'node:sqlite';
+/** Prints the raw data column of both tables; run with no environment, as the workbench data directory's owner when that matters. */
+const DUMP_ROWS = sourceWorkerImport + `import { DatabaseSync } from 'node:sqlite';
 try {
-  const db = new DatabaseSync(process.argv[1], { readOnly: true });
-  try {
-    db.exec('PRAGMA busy_timeout = 5000');
-    const rows = table => db.prepare('SELECT data FROM ' + table + ' ORDER BY id').all().map(row => String(row.data));
-    process.stdout.write(JSON.stringify({ pairs: rows('pairs'), accounts: rows('accounts') }));
-  } finally { db.close(); }
+  withDatabasePath(process.argv[2], process.argv[1], path => {
+    const db = new DatabaseSync(path, { readOnly: true });
+    try {
+      db.exec('PRAGMA busy_timeout = 5000');
+      const rows = table => db.prepare('SELECT data FROM ' + table + ' ORDER BY id').all().map(row => String(row.data));
+      process.stdout.write(JSON.stringify({ pairs: rows('pairs'), accounts: rows('accounts') }));
+    } finally { db.close(); }
+  });
 } catch (error) { process.stderr.write(String(error && error.message || error).split('\\n')[0]); process.exitCode = 1; }`;
 
-/** Root reads as the owner of the database (so any file SQLite adds is the workbench's); anyone else reads as itself. */
+/** Run service-side operations as the selected service account when invoked by root. */
 export function readerIdentity(owner: { uid: number; gid: number }, uid: number | undefined): { uid: number; gid: number } | Record<string, never> {
   return uid === 0 && owner.uid !== 0 ? { uid: owner.uid, gid: owner.gid } : {};
 }
 
 /** Reads the workbench's ASTER pairs and accounts without writing to its database. */
 export function readWorkbench(envFile: string, dataDir: string | undefined, options: { asterOptional?: boolean } = {}): WorkbenchSource & { database: string; data: string } {
-  const base = existsSync(envFile) ? parseEnv(readFileSync(envFile, 'utf8')) : {};
+  const shared = operatorEnv(envFile);
+  const base = parseEnv(shared.text ?? '');
   const data = dataDir ?? base.DATA_DIR ?? WORKBENCH_DATA;
   if (!isAbsolute(data)) throw new Error(`工作台数据目录须为绝对路径：${data}`);
+  if (dataDir === undefined && base.DATA_DIR !== undefined && shared.owner !== undefined && workbenchIdentity(data).uid !== shared.owner) throw new Error('工作台环境文件不能指定其他账户的数据目录');
   const moduleEnv = join(data, 'modules', 'aster', '.env');
-  const env = { ...base, ...(existsSync(moduleEnv) ? parseEnv(readFileSync(moduleEnv, 'utf8')) : {}) };
+  const env = { ...base, ...parseEnv(optionalSourceText(data, moduleEnv, 1024 * 1024) ?? '') };
   const database = join(data, 'modules', 'aster', 'trading.sqlite3');
-  if (!existsSync(database)) {
+  if (!sourceEntry(data, database)) {
     // An oil, options, monitor, asset, CrossEx or Ondo import does not need the ASTER module: a workbench that never ran it has no pairs to bring.
-    if (options.asterOptional && (existsSync(join(data, 'hub.sqlite')) || existsSync(join(data, 'ondo-mm')) || ['greeks', 'monitor', 'asset', 'crossex'].some(name => existsSync(join(data, 'modules', name))))) return { pairs: [], accounts: [], env, database, data };
+    if (options.asterOptional && (sourceEntry(data, join(data, 'hub.sqlite')) || sourceEntry(data, join(data, 'ondo-mm')) || ['greeks', 'monitor', 'asset', 'crossex'].some(name => sourceEntry(data, join(data, 'modules', name))))) return { pairs: [], accounts: [], env, database, data };
     throw new Error(`没有找到工作台的 ASTER 数据库 ${database}；工作台数据目录不在默认位置时用 --workbench-data 指定`);
   }
-  // A read-only connection still creates -wal and -shm when it is the first one on a WAL database (the workbench opens
-  // and closes one per operation, so that is the usual state). Made by root they would leave the workbench unable to
-  // write, so a root import reads as the database's owner, in a child process that only prints the rows.
-  // A link could point root's read at another file: only the plain file is read, and a root-owned one in a directory
-  // someone else owns (the workbench account could have swapped it in) is refused.
-  const owner = lstatSync(database);
-  if (!owner.isFile()) throw new Error(`工作台的 ASTER 数据库 ${database} 不是普通文件（符号链接等），不读取`);
-  if (process.getuid?.() === 0 && owner.uid === 0 && statSync(dirname(database)).uid !== 0) throw new Error(`${database} 归 root，但所在目录归其他账户，不读取；请确认文件来源`);
-  const identity = readerIdentity(owner, process.getuid?.());
-  const read = spawnSync(process.execPath, ['--input-type=module', '-e', DUMP_ROWS, '--', database], {
+  const identity = workbenchIdentity(data, dirname(database));
+  const read = spawnSync(process.execPath, ['--input-type=module', '-e', DUMP_ROWS, '--', database, data], {
     cwd: '/', env: {}, encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024 * 1024, ...identity,
   });
   if (read.error || read.status !== 0) {
     const reason = printable(read.error?.message ?? (read.stderr.trim() || `退出码 ${read.status ?? read.signal}`)).slice(0, 200);
-    const as = 'uid' in identity ? `（以数据库属主 uid ${identity.uid} 读取，不带附加组）` : '';
+    const as = 'uid' in identity ? `（以工作台账户 uid ${identity.uid} 读取，不带附加组）` : '';
     throw new Error(`读取工作台数据库 ${database} 失败${as}：${reason}`);
   }
   const dumped = JSON.parse(read.stdout) as { pairs: string[]; accounts: string[] };
@@ -449,42 +446,44 @@ export function readWorkbench(envFile: string, dataDir: string | undefined, opti
 
 /**
  * Prints the credential key and the rows of the two tables the oil import needs; run with no environment, as the
- * database's owner. The workbench's own rule for reading hub.sqlite from outside (contract-probes workbench-accounts.ts,
+ * workbench data directory's owner. The workbench's own rule for reading hub.sqlite from outside (contract-probes workbench-accounts.ts,
  * LESSONS L063): an unfinished rollback journal is refused; pending WAL pages are read only while the workbench runs (its
  * -shm is there, so nothing new is created), and without them the file is opened immutable. A refusal is a code on stdout.
  */
-const DUMP_HUB = `import { DatabaseSync } from 'node:sqlite';
-import { readFileSync, statSync } from 'node:fs';
+const DUMP_HUB = sourceWorkerImport + `import { DatabaseSync } from 'node:sqlite';
+import { statSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-const [hub, keyFile] = process.argv.slice(1);
+const [hub, keyFile, root] = process.argv.slice(1);
 const out = value => process.stdout.write(JSON.stringify(value));
-const size = suffix => { try { return statSync(hub + suffix).size; } catch (error) { if (error && error.code === 'ENOENT') return null; throw error; } };
 try {
-  const pending = Boolean(size('-wal')), shared = size('-shm') !== null;
-  if (size('-journal')) out({ refused: 'journal' });
-  else if (pending && !shared) out({ refused: 'wal' });
-  else {
-    const key = readFileSync(keyFile);
-    if (key.length !== 32) out({ refused: 'key' });
+  withDatabasePath(root, hub, path => {
+    const size = suffix => { try { return statSync(path + suffix).size; } catch (error) { if (error && error.code === 'ENOENT') return null; throw error; } };
+    const pending = Boolean(size('-wal')), shared = size('-shm') !== null;
+    if (size('-journal')) out({ refused: 'journal' });
+    else if (pending && !shared) out({ refused: 'wal' });
     else {
-      // immutable (no locking, no change detection) only when nothing can be writing: no WAL content and no -shm. A
-      // running workbench keeps -shm even right after a checkpoint empties the WAL; then a normal read-only open.
-      const db = new DatabaseSync(pending || shared ? hub : pathToFileURL(hub).href + '?immutable=1', { readOnly: true });
-      try {
-        db.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=750');
-        const has = name => db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name) !== undefined;
-        const accounts = has('execution_accounts') ? db.prepare('SELECT * FROM execution_accounts ORDER BY exchange').all()
-          .map(row => ({ exchange: row.exchange, revision: row.revision, credentials: row.credentials ?? null, account_mode: row.account_mode, identity: row.identity ?? null })) : [];
-        const rules = has('execution_auto_rules') ? db.prepare('SELECT enabled, config, state FROM execution_auto_rules ORDER BY created_at, rowid').all()
-          .map(row => ({ enabled: row.enabled, config: row.config, state: row.state })) : [];
-        // Unfinished jobs only (the workbench's FINAL_EXECUTION: completed, stopped); a row that is not JSON is kept so
-        // it counts as unreadable. CASE keeps json_extract off invalid rows.
-        const jobs = has('execution_jobs') ? db.prepare("SELECT id, json FROM execution_jobs WHERE CASE WHEN json_valid(json) THEN coalesce(json_extract(json,'$.status'),'') NOT IN ('completed','stopped') ELSE 1 END ORDER BY rowid").all()
-          .map(row => ({ id: row.id, json: row.json })) : [];
-        out({ key: key.toString('base64'), accounts, rules, jobs });
-      } finally { db.close(); }
+      const key = sourceBytes(root, keyFile, 32);
+      if (key.length !== 32) out({ refused: 'key' });
+      else {
+        // immutable (no locking, no change detection) only when nothing can be writing: no WAL content and no -shm. A
+        // running workbench keeps -shm even right after a checkpoint empties the WAL; then a normal read-only open.
+        const db = new DatabaseSync(pending || shared ? path : pathToFileURL(path).href + '?immutable=1', { readOnly: true });
+        try {
+          db.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=750');
+          const has = name => db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name) !== undefined;
+          const accounts = has('execution_accounts') ? db.prepare('SELECT * FROM execution_accounts ORDER BY exchange').all()
+            .map(row => ({ exchange: row.exchange, revision: row.revision, credentials: row.credentials ?? null, account_mode: row.account_mode, identity: row.identity ?? null })) : [];
+          const rules = has('execution_auto_rules') ? db.prepare('SELECT enabled, config, state FROM execution_auto_rules ORDER BY created_at, rowid').all()
+            .map(row => ({ enabled: row.enabled, config: row.config, state: row.state })) : [];
+          // Unfinished jobs only (the workbench's FINAL_EXECUTION: completed, stopped); a row that is not JSON is kept so
+          // it counts as unreadable. CASE keeps json_extract off invalid rows.
+          const jobs = has('execution_jobs') ? db.prepare("SELECT id, json FROM execution_jobs WHERE CASE WHEN json_valid(json) THEN coalesce(json_extract(json,'$.status'),'') NOT IN ('completed','stopped') ELSE 1 END ORDER BY rowid").all()
+            .map(row => ({ id: row.id, json: row.json })) : [];
+          out({ key: key.toString('base64'), accounts, rules, jobs });
+        } finally { db.close(); }
+      }
     }
-  }
+  });
 } catch (error) { process.stderr.write(String(error && error.message || error).split('\\n')[0]); process.exitCode = 1; }`;
 
 const DECRYPT_FAILED = 'decrypt_failed';
@@ -571,16 +570,15 @@ export function readWorkbenchOil(data: string): OilSource {
   if (!isAbsolute(data)) throw new Error(`工作台数据目录须为绝对路径：${data}`);
   const hub = join(data, 'hub.sqlite'), keyFile = join(data, 'credentials.key');
   for (const [path, name] of [[hub, '数据库'], [keyFile, '凭据密钥']] as const) {
-    let stat;
-    try { stat = lstatSync(path); } catch { throw new Error(`没有找到工作台的${name} ${path}；工作台数据目录不在默认位置时用 --workbench-data 指定`); }
+    const stat = sourceEntry(data, path);
+    if (!stat) throw new Error(`没有找到工作台的${name} ${path}；工作台数据目录不在默认位置时用 --workbench-data 指定`);
     if (!stat.isFile()) throw new Error(`工作台的${name} ${path} 不是普通文件（符号链接等），不读取`);
-    if (process.getuid?.() === 0 && stat.uid === 0 && statSync(dirname(path)).uid !== 0) throw new Error(`${path} 归 root，但所在目录归其他账户，不读取；请确认文件来源`);
   }
-  const identity = readerIdentity(lstatSync(hub), process.getuid?.());
-  const read = spawnSync(process.execPath, ['--input-type=module', '-e', DUMP_HUB, '--', hub, keyFile], {
+  const identity = workbenchIdentity(data);
+  const read = spawnSync(process.execPath, ['--input-type=module', '-e', DUMP_HUB, '--', hub, keyFile, data], {
     cwd: '/', env: {}, encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024, ...identity,
   });
-  const as = 'uid' in identity ? `（以数据库属主 uid ${identity.uid} 读取，不带附加组）` : '';
+  const as = 'uid' in identity ? `（以工作台账户 uid ${identity.uid} 读取，不带附加组）` : '';
   if (read.error || read.status !== 0) {
     const reason = printable(read.error?.message ?? (read.stderr.trim() || `退出码 ${read.status ?? read.signal}`)).slice(0, 200);
     throw new Error(`读取工作台执行账户 ${hub} 失败${as}：${reason}`);

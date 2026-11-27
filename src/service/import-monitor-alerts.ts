@@ -4,12 +4,13 @@
 // (src/monitor/alert-import.ts) happens here. The tiers go into this service's monitor.sqlite through
 // src/monitor/import-writer.ts run as the data directory's owner (root writes nothing there); the robot goes into the
 // planned secrets.json as `feishuMonitor`. Only counts, names and reasons leave this file as text, never the webhook.
-import { lstatSync, statSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, isAbsolute, join } from 'node:path';
 import { convertHynixAlerts, convertOilAlerts, convertRobot, type AlertImport, type Converted, type RobotRead } from '../monitor/alert-import.ts';
 import { ALERT_SPECS, type AlertMarket } from '../monitor/alerts.ts';
 import { parseServiceSecrets } from './config.ts';
+import { sourceEntry, sourceText, workbenchIdentity } from './workbench-source.ts';
 import { readerIdentity } from './import-workbench.ts';
 
 type Json = Record<string, unknown>;
@@ -39,50 +40,24 @@ export interface MonitorAlertsItem {
   detail: string;
 }
 
-// Run as the owner of the monitor directory: each file must be a plain file (not followed when a link) of at most 1 MiB.
-const DUMP_FILES = `import { lstatSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-const [dir, ...names] = process.argv.slice(1);
-const out = {};
-for (const name of names) {
-  const path = join(dir, name);
-  let stat;
-  try { stat = lstatSync(path); } catch (error) { out[name] = error && error.code === 'ENOENT' ? { missing: true } : { refused: 'unreadable' }; continue; }
-  if (!stat.isFile()) { out[name] = { refused: 'not_file' }; continue; }
-  if (stat.size > ${MAX_FILE_BYTES}) { out[name] = { refused: 'large' }; continue; }
-  try { out[name] = { text: readFileSync(path, 'utf8') }; } catch { out[name] = { refused: 'unreadable' }; }
-}
-process.stdout.write(JSON.stringify(out));`;
-
+// Run as the workbench account: each file must be a plain file (not followed when a link) of at most 1 MiB.
 const REFUSED: Record<string, string> = { not_file: '不是普通文件（符号链接等），不读取', large: '超过 1 MiB，不是工作台的文件', unreadable: '读不出' };
 
 /** Reads and converts the workbench's alert files; throws when the monitor directory cannot be read at all. */
 export function readWorkbenchAlerts(data: string): MonitorAlertsSource {
   if (!isAbsolute(data)) throw new Error(`工作台数据目录须为绝对路径：${data}`);
   const dir = join(data, 'modules', 'monitor');
-  let stat;
-  try { stat = lstatSync(dir); }
-  catch (error) {
-    // No monitor module on the workbench: nothing to import, not an error.
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') { const problem = '工作台没有 Monitor 模块'; return { oil: { config: null, problem }, hynix: { config: null, problem }, robot: { robot: null, problem } }; }
-    throw new Error(`工作台的 Monitor 模块数据目录 ${dir} 读不出：${reason(error)}`);
-  }
+  const stat = sourceEntry(data, dir);
+  if (!stat) { const problem = '工作台没有 Monitor 模块'; return { oil: { config: null, problem }, hynix: { config: null, problem }, robot: { robot: null, problem } }; }
   if (!stat.isDirectory()) throw new Error(`${dir} 不是目录（符号链接等），不读取`);
-  if (process.getuid?.() === 0 && stat.uid === 0 && statSync(dirname(dir)).uid !== 0) throw new Error(`${dir} 归 root，但所在目录归其他账户，不读取；请确认来源`);
-  const identity = readerIdentity(stat, process.getuid?.());
-  const read = spawnSync(process.execPath, ['--input-type=module', '-e', DUMP_FILES, '--', dir, ...Object.values(FILES)], {
-    cwd: '/', env: {}, encoding: 'utf8', timeout: TIMEOUT_MS, maxBuffer: 8 * MAX_FILE_BYTES, ...identity,
-  });
-  const as = 'uid' in identity ? `（以目录属主 uid ${identity.uid} 读取，不带附加组）` : '';
-  if (read.error || read.status !== 0) throw new Error(`读取工作台告警设置 ${dir} 失败${as}：${printable(read.error?.message ?? (read.stderr.trim() || `退出码 ${read.status ?? read.signal}`)).slice(0, 200)}`);
-  let dumped: Record<string, { missing?: true; refused?: string; text?: string }>;
-  try { dumped = JSON.parse(read.stdout) as typeof dumped; } catch { throw new Error(`读取工作台告警设置 ${dir} 失败${as}：输出无法解析`); }
+  workbenchIdentity(data, dir);
+  const dumped = Object.fromEntries(Object.values(FILES).map(name => [name, sourceText(data, join(dir, name), MAX_FILE_BYTES)]));
   /** The parsed file, or why there is none (the parser's message is not passed on: it may quote the file). */
   const parsed = (name: string): { value: unknown } | { problem: string } => {
     const entry = dumped?.[name];
     if (!entry || typeof entry !== 'object') return { problem: `${name} 读取结果缺失` };
-    if (entry.missing) return { problem: `工作台没有 ${name}` };
-    if (typeof entry.text !== 'string') return { problem: `${name} ${REFUSED[String(entry.refused)] ?? REFUSED.unreadable}` };
+    if ('missing' in entry) return { problem: `工作台没有 ${name}` };
+    if ('refused' in entry) return { problem: `${name} ${REFUSED[String(entry.refused)] ?? REFUSED.unreadable}` };
     try { return { value: JSON.parse(entry.text) as unknown }; } catch { return { problem: `${name} 不是有效的 JSON` }; }
   };
   const market = (name: string, convert: (file: unknown) => Converted): Converted => {

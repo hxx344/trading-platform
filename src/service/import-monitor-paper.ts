@@ -4,13 +4,14 @@
 // must pass the workbench's validatePerpetualPaperState. This service's side is looked at, and the pending file written, by
 // src/monitor/perpetual-paper-import-writer.ts run as the data directory's owner; the state goes to it over stdin. Only
 // counts and reasons leave this file as text.
-import { lstatSync, statSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, isAbsolute, join } from 'node:path';
 import { PERPETUAL_PAPER_LIMITS, type PerpetualPaperState } from '../vendor/perpetual-paper.ts';
 import { validatePerpetualPaperState } from '../vendor/perpetual-paper-store.mjs';
 import { planPerpetualPaperImport } from '../monitor/perpetual-paper-store.ts';
 import type { PaperWriteResult, ServicePaper } from '../monitor/perpetual-paper-import-writer.ts';
+import { sourceEntry, sourceText, workbenchIdentity } from './workbench-source.ts';
 import { readerIdentity } from './import-workbench.ts';
 
 type Json = Record<string, unknown>;
@@ -35,50 +36,21 @@ export interface MonitorPaperItem {
   detail: string;
 }
 
-// Run as the owner of the monitor directory: perpetual/ a directory and the file a plain one (neither followed when a link),
+// Run as the workbench account: perpetual/ a directory and the file a plain one (neither followed when a link),
 // the file at most the workbench's 1 MB.
-const DUMP_PAPER = `import { lstatSync, readFileSync } from 'node:fs';
-const [dir, path] = process.argv.slice(1);
-const look = file => { try { return lstatSync(file); } catch (error) { return error && error.code === 'ENOENT' ? 'missing' : 'unreadable'; } };
-let out;
-const folder = look(dir);
-if (folder === 'missing') out = { missing: true };
-else if (folder === 'unreadable') out = { refused: 'unreadable' };
-else if (!folder.isDirectory()) out = { refused: 'not_dir' };
-else {
-  const stat = look(path);
-  if (stat === 'missing') out = { missing: true };
-  else if (stat === 'unreadable') out = { refused: 'unreadable' };
-  else if (!stat.isFile()) out = { refused: 'not_file' };
-  else if (stat.size > ${PERPETUAL_PAPER_LIMITS.fileBytes}) out = { refused: 'large' };
-  else { try { out = { text: readFileSync(path, 'utf8') }; } catch { out = { refused: 'unreadable' }; } }
-}
-process.stdout.write(JSON.stringify(out));`;
-
 const REFUSED: Record<string, string> = { not_dir: 'perpetual 不是目录（符号链接等），不读取', not_file: `${FILE} 不是普通文件（符号链接等），不读取`, large: `${FILE} 超过 1 MB（工作台自己的上限），不读取`, unreadable: `${FILE} 读不出` };
 
 /** Reads the workbench's records; throws when the monitor directory cannot be read at all. */
 export function readWorkbenchPaper(data: string): MonitorPaperSource {
   if (!isAbsolute(data)) throw new Error(`工作台数据目录须为绝对路径：${data}`);
   const dir = join(data, 'modules', 'monitor');
-  let stat;
-  try { stat = lstatSync(dir); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { state: null, problem: '工作台没有 Monitor 模块' };
-    throw new Error(`工作台的 Monitor 模块数据目录 ${dir} 读不出：${reason(error)}`);
-  }
+  const stat = sourceEntry(data, dir);
+  if (!stat) return { state: null, problem: '工作台没有 Monitor 模块' };
   if (!stat.isDirectory()) throw new Error(`${dir} 不是目录（符号链接等），不读取`);
-  if (process.getuid?.() === 0 && stat.uid === 0 && statSync(dirname(dir)).uid !== 0) throw new Error(`${dir} 归 root，但所在目录归其他账户，不读取；请确认来源`);
-  const identity = readerIdentity(stat, process.getuid?.());
-  const read = spawnSync(process.execPath, ['--input-type=module', '-e', DUMP_PAPER, '--', join(dir, 'perpetual'), join(dir, FILE)], {
-    cwd: '/', env: {}, encoding: 'utf8', timeout: TIMEOUT_MS, maxBuffer: 8 * PERPETUAL_PAPER_LIMITS.fileBytes, ...identity,
-  });
-  const as = 'uid' in identity ? `（以目录属主 uid ${identity.uid} 读取，不带附加组）` : '';
-  if (read.error || read.status !== 0) throw new Error(`读取工作台持仓记录 ${join(dir, FILE)} 失败${as}：${printable(read.error?.message ?? (read.stderr.trim() || `退出码 ${read.status ?? read.signal}`)).slice(0, 200)}`);
-  let dumped: { missing?: true; refused?: string; text?: string };
-  try { dumped = JSON.parse(read.stdout) as typeof dumped; } catch { throw new Error(`读取工作台持仓记录失败${as}：输出无法解析`); }
-  if (dumped?.missing) return { state: null, problem: '工作台没有持仓记录' };
-  if (typeof dumped?.text !== 'string') return { state: null, problem: REFUSED[String(dumped?.refused)] ?? REFUSED.unreadable! };
+  workbenchIdentity(data, dir);
+  const dumped = sourceText(data, join(dir, FILE), PERPETUAL_PAPER_LIMITS.fileBytes);
+  if ('missing' in dumped) return { state: null, problem: '工作台没有持仓记录' };
+  if ('refused' in dumped) return { state: null, problem: REFUSED[dumped.refused] ?? REFUSED.unreadable! };
   // Neither the parser's message nor the validator's is passed on: they may quote the file.
   let parsed: unknown;
   try { parsed = JSON.parse(dumped.text); } catch { return { state: null, problem: `${FILE} 不是有效的 JSON` }; }

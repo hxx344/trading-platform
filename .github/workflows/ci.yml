@@ -84,7 +84,7 @@ jobs:
                 src/control src/market src/monitor/perpetual-feed.ts src/monitor/market-readers.ts src/vendor/perpetual-exchanges.mjs 'src/vendor/perpetual-*-reader.mjs' 'src/service/remote-*.ts' \
                 'src/vendor/crossex/*-reader.mjs' src/vendor/crossex/terminal-feed.mjs src/vendor/crossex/funding-client.mjs \
                 'src/http*.ts' src/runtime.ts src/component-build.ts src/web-assets.ts src/data-dir.ts src/login-password.ts src/live/setup.ts \
-                src/service/main.ts 'src/service/*config*.ts' 'src/service/update*.ts' src/service/handoff-file.ts src/service/take-handoff.ts 'src/service/import-*.ts'; then
+                src/service/main.ts 'src/service/*config*.ts' 'src/service/update*.ts' src/service/handoff-file.ts src/service/take-handoff.ts 'src/service/import-*.ts' src/service/workbench-source.ts; then
             echo "run=false" >>"$GITHUB_OUTPUT"
           else
             echo "run=true" >>"$GITHUB_OUTPUT"

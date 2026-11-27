@@ -9,6 +9,10 @@
 
 ## 1 工作台里的位置（依据）
 
+本次读取边界调整定为 R3，覆盖页面预览、页面导入、命令行和写资产账本时的来源复读。导入账户固定取自管理员指定的工作台数据根目录，子目录及普通文件须属于同一账户。读取失败时，助手沿用各模块的拒绝或部分预览语义。配置格式、SQLite 结构和交易任务均无需迁移，可回滚到 v0.106.0；回滚后应暂停从不可信工作台导入，直至再次升级。
+
+导入会拒绝其他账户能遍历并改写的目录或文件。专属的 `0700` 数据目录内仍可读取工作台的 `0664` 文件。来源文件和 SQLite 的 WAL、SHM、回滚日志均须为单链接普通文件。
+
 - 工作台每个内置模块的数据目录是 `<DATA_DIR>/modules/<模块>`（工作台 `server/modules/runtime.mjs` 第 131 行 `moduleData = path.join(dataDir, 'modules', id)`）。`DATA_DIR` 的取法与配对、原油、期权导入相同：`--workbench-data`，否则工作台环境文件 `/etc/project-aggregation.env` 的 `DATA_DIR`，否则 `/var/lib/project-aggregation`。
 - 资产账本：`<DATA_DIR>/modules/asset/ledger.sqlite`（工作台 `server/recovery/data-catalog.mjs` 第 43 行；`server/modules/asset.mjs` 把 `ASSET_DATA_DIR` 设为模块数据目录，`modules/asset/lib/sqlite.ts` 第 98 行在其中打开 `ledger.sqlite`，WAL 模式）。
 - 行情监控：模块数据在 `<DATA_DIR>/modules/monitor/`（`market.sqlite`、`perpetual/market.sqlite`，data-catalog.mjs 第 41–42 行）。Anthropic 股数设置只存在浏览器 localStorage 的 `workbench:anthropic-shares:v1`（工作台 `src/trading-preferences.ts` 第 8 行），由工作台主页面经桥接能力 `anthropic-shares` 交给 Monitor 页面，服务器上没有保存。所以导入时一律用默认股数（流通 13.116、完全稀释 17.68 十亿股），预览里写明；要改股数仍在 `config.json` 的 `monitor.anthropic.shares` 改（这是调参，不是启用）。
@@ -27,9 +31,9 @@
 **资产账本**
 
 - 本服务是否已启用 `asset`；`asset.sqlite` 里已有导入时，上次导入的时刻、来源用户与条数（以服务账户只读打开 `asset.sqlite` 读 `import-info`；读不到时写原因）。
-- 工作台 `ledger.sqlite` 的路径与状态，不能读取时逐项写原因：库不存在；不是普通文件（符号链接等）；归 root 而所在目录归别的账户；打不开或不是工作台资产库（缺表）；没有任何用户有账本（没有 `source-ledger` 设置）。
+- 工作台 `ledger.sqlite` 的路径与状态，不能读取时逐项写原因：库不存在；不是普通文件（符号链接等）；文件或目录属主与工作台不符；打不开或不是工作台资产库（缺表）；没有任何用户有账本（没有 `source-ledger` 设置）。
 - 有账本的每个用户（`settings` 里有 `source-ledger` 的 owner，最多列 20 个）：资产条数、快照条数、最近的日快照日期，以及按 `importLedger` 的全部校验跑一遍后能否导入、不能时的原因（凭据字段、格式无效、缺起始快照等，原因只写字段名不带内容）；用户名不符合页面规则（见 §4）的标为不能从页面导入。
-- 读取方式同 ASTER 库：root 在子进程里以 `ledger.sqlite` 属主的身份、空环境只读打开，正常加锁，只把行以 JSON 传回；校验在助手进程里做。SQLite 读取时可能新建的 `-wal`/`-shm` 归工作台账户。
+- 读取方式同 ASTER 库：root 在子进程里以工作台数据目录属主的身份、空环境只读打开，正常加锁，只把行以 JSON 传回；校验在助手进程里做。SQLite 读取时可能新建的 `-wal`/`-shm` 归工作台账户。
 
 ## 3 导入
 
@@ -37,7 +41,7 @@
 
 - **行情监控**：`config.json` 没有 `monitor` 时写入 `"monitor": { "anthropic": {} }`（默认股数）；已有时原样保留，不覆盖用户改过的股数，该项显示“已启用，保留现有设置”。（v0.20.0 起写入所有已接入的市场，v0.21.0 起为 `{ "anthropic": {}, "oil": {}, "hynix": {} }`，已有配置缺市场时只补缺的，规则见 [monitor.md](monitor.md) 的 M-2a 实施记录。）
 - **资产账本**：`config.json` 没有 `asset` 时写入 `"asset": {}`；已有时保留。账本按 `src/asset/import.ts` 的规则（只读打开来源库、写入前全部读出并校验、凭据表不读、设置白名单、钱包地址与密钥尾号去掉、一个事务整体替换）写入数据目录的 `asset.sqlite`。已启用 `asset` 时再勾选等于“重新导入最新账本”。
-- **交易所连接（v0.19.0）**：预览在每个用户后列出其工作台连接名（如 `binance`、`aster:<账号编号>`），不含内容；工作台资产模块 `config.json` 缺失或没有有效 `credentialKey` 时预览写明“只导入账本”。写入时另起一个子进程，以 `ledger.sqlite` 属主身份、空环境读出该用户的 `connections` 并用工作台密钥解密（AES-GCM，附加数据 `<用户>:<连接名>`），输出直接接到写入子进程的标准输入，助手进程本身不经手明文；写入子进程用本服务密钥（数据目录 `asset-credential.key`，第一次需要时生成，600）重新加密，与账本在同一事务里整体替换 `connections`。解不开的单个连接、账本里没有对应 Aster 账号的 `aster:<id>` 连接按名字列在结果里跳过；写入时重做预览的“文件归 root 而目录归其他账户”检查，命中时只导入账本；密钥缺失或连接表读不出时只导入账本、不导入连接，并在结果里写明。命令行 `src/asset/import.ts` 不带连接，导入后已保存的连接清空，需要在页面重新连接。
+- **交易所连接（v0.19.0）**：预览在每个用户后列出其工作台连接名（如 `binance`、`aster:<账号编号>`），不含内容；工作台资产模块 `config.json` 缺失或没有有效 `credentialKey` 时预览写明“只导入账本”。写入时另起一个子进程，以工作台数据目录属主身份、空环境读出该用户的 `connections` 并用工作台密钥解密（AES-GCM，附加数据 `<用户>:<连接名>`），输出直接接到写入子进程的标准输入，助手进程本身不经手明文；写入子进程用本服务密钥（数据目录 `asset-credential.key`，第一次需要时生成，600）重新加密，与账本在同一事务里整体替换 `connections`。解不开的单个连接、账本里没有对应 Aster 账号的 `aster:<id>` 连接按名字列在结果里跳过；写入时重做预览的来源目录链、SQLite 文件及其伴随文件的属主检查，命中时只导入账本；密钥缺失或连接表读不出时只导入账本、不导入连接，并在结果里写明。命令行 `src/asset/import.ts` 不带连接，导入后已保存的连接清空，需要在页面重新连接。
 - `importLedger` 拆成三步，规则与报错不变：`readLedgerRows`（读来源库）、`prepareLedger`（校验与清洗，另对传回的行补做类型与设置白名单检查）、`writeLedger`（整体替换）；`importLedger` 仍是三步连用，命令行 `src/asset/import.ts` 不变。
 - **身份与属主**：导入助手以 root 运行（`trading-platform-import.service`，`UMask=0077`）。数据目录 `/var/lib/trading-platform` 归服务账户、700，root 不在服务账户可写的目录里直接写文件（服务账户可以事先放符号链接），所以 `asset.sqlite` 由助手起的子进程（`src/asset/import-writer.ts write`，账本行经标准输入以 JSON 传入，`umask 077`）以数据目录属主（服务账户）的身份、空环境写入，与 `checkAsService` 以服务账户跑配置检查相同；新建的 `asset.sqlite` 及 `-wal`/`-shm` 归服务账户、600，服务照常只读打开。已有的 `asset.sqlite`（及 `-wal`/`-shm`/`-journal`）若归别的账户（例如曾以 root 手工导入）或不是普通文件，写入失败、不改动，提示改回属主后重试。命令行 `install.sh --import-workbench --asset` 同样以服务账户写入。上次导入信息也以服务账户读取，root 不打开数据目录里的库。
 
@@ -99,7 +103,7 @@ sudo bash install.sh --import-workbench --monitor --asset [--asset-owner <用户
 
 - 单元：预览各状态（未启用 / 已启用、工作台有无 Monitor、账本不存在 / 不是普通文件 / 打不开 / 没有用户 / 多用户 / 某用户校验不过 / 用户名不合规、上次导入信息）；请求校验（布尔、用户名长度与字符集、缺 `assetOwner`、预览带新字段）；只勾这两项；已有 `monitor` / `asset` 不被覆盖；重新导入不重启；账本写入失败时配置与 `asset.sqlite` 都不变；配置检查失败时配置恢复、账本保留并在消息中说明；多用户选择；导入器命令行参数；页面表单转换（`web/src/import-form.ts`）。
 - 安装测试（`deploy/test-install.sh`，Linux CI）：`--import-workbench --monitor --asset` 导入并通过配置检查、重复执行保留设置并重新导入账本、`--asset-owner` / `--monitor` / `--asset` 须和 `--import-workbench` 一起用。
-- 只能在 Linux 服务器上验证：root 以 `ledger.sqlite` 属主身份读库、以服务账户身份写 `asset.sqlite`（属主与权限）、systemd 下的重启与恢复。
+- 只能在 Linux 服务器上验证：root 以工作台数据目录属主身份读库、以服务账户身份写 `asset.sqlite`（属主与权限）、systemd 下的重启与恢复。
 
 ## 8 回滚
 

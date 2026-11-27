@@ -36,7 +36,7 @@ done
 for account in "$service" "$control" "$service-ipc" "$market" "$market-ipc" "$dex" "$dex-ipc" "$extra_user"; do
   if getent passwd "$account" >/dev/null || getent group "$account" >/dev/null; then echo 'Fixture account already exists' >&2; exit 1; fi
 done
-fixture=$(mktemp -d /opt/trading-platform-ci-XXXXXXXX)
+fixture=$(mktemp -d /var/lib/trading-platform-ci-XXXXXXXX)
 cleanup() {
   result=$?
   trap - EXIT
@@ -416,6 +416,21 @@ update_reply '不是普通文件'
 systemctl is-active --quiet "$service-update.path"
 
 echo 'An actual page import restarts execution once and the subsequent page deployment keeps the imported generation'
+# Exercise the installed reader under its real UID boundary before the page uses the same source.
+setfacl -m u:nobody:--x "$fixture"
+chown nobody:"$(id -gn nobody)" "$fixture/workbench" "$fixture/workbench/ondo-mm"
+printf 'sample' >"$fixture/workbench/owned.txt"
+chown nobody:"$(id -gn nobody)" "$fixture/workbench/owned.txt"
+chmod 600 "$fixture/workbench/owned.txt"
+printf 'sample' >"$fixture/workbench/other-owner.txt"
+node --input-type=module - "$app/current/src/service/workbench-source.ts" "$fixture/workbench" <<'JS'
+import assert from 'node:assert/strict';
+import { join } from 'node:path';
+const [, , module, root] = process.argv;
+const { optionalSourceText } = await import(module);
+assert.equal(optionalSourceText(root, join(root, 'owned.txt'), 16), 'sample');
+assert.throws(() => optionalSourceText(root, join(root, 'other-owner.txt'), 16), /所有者/);
+JS
 curl --noproxy '*' -fsS --max-time 3 -b "$fixture/cookie" -H 'x-pa-executor: 1' -H 'Content-Type: application/json' \
   --data '{"action":"import","ondo":true}' "$(url /api/import)" >"$fixture/import-request"
 for _ in {1..120}; do

@@ -1,7 +1,7 @@
 // The CrossEx part of the workbench import (docs/crossex.md §3, docs/module-import.md): the workbench CrossEx module's
 // Gate key comes over into secrets.json `gate` and its account into config.json `crossex` ({ accountUid,
 // credentialVersion, limits }). It reads <data>/modules/crossex/crossex.sqlite (live_connection, live_executions,
-// live_orders, live_owner, settings) and credentials.key as the database's owner, in a child process, under the same
+// live_orders, live_owner, settings) and credentials.key as the workbench data directory's owner, in a child process, under the same
 // rules as the other workbench databases (LESSONS L063: an unfinished -journal is refused, pending WAL pages are read
 // only while the workbench runs, otherwise the file is opened immutable; no symbolic links). It refuses while the
 // workbench could still be trading on that key: not connected, an execution or order not finished, an open order in its
@@ -12,12 +12,13 @@
 // Only the masked UID, settings and reasons leave this file; the key never does.
 import { spawnSync } from 'node:child_process';
 import { createDecipheriv, createHash } from 'node:crypto';
-import { lstatSync, statSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import { validCredentials, type LiveCredentials } from '../live/values.ts';
 import { PAGE_SETTING_KEYS, type CrossexLimits } from '../crossex/store.ts';
 import { configuration, defaults } from '../vendor/crossex/model.mjs';
 import { parseCrossexConfig, parseCrossexLimits, parseCrossexSecrets } from './crossex-config.ts';
+import { sourceEntry, sourceWorkerImport, workbenchIdentity } from './workbench-source.ts';
 import { readerIdentity } from './import-workbench.ts';
 
 type Json = Record<string, unknown>;
@@ -47,44 +48,46 @@ export const LEASE_WARNING = '导入后在工作台 CrossEx 设置页断开账�
 const TERMINAL = ['FILLED', 'CANCELLED', 'FAIL', 'REJECT', 'UNSENT'];
 
 /**
- * Prints the credential key and the rows the import needs; run with no environment, as the database's owner, under the
+ * Prints the credential key and the rows the import needs; run with no environment, as the workbench data directory's owner, under the
  * same rule as DUMP_HUB in import-workbench.ts. A refusal is a code on stdout.
  */
-const DUMP_CROSSEX = `import { DatabaseSync } from 'node:sqlite';
-import { readFileSync, statSync } from 'node:fs';
+const DUMP_CROSSEX = sourceWorkerImport + `import { DatabaseSync } from 'node:sqlite';
+import { statSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-const [file, keyFile, terminal] = process.argv.slice(1);
+const [file, keyFile, terminal, root] = process.argv.slice(1);
 const out = value => process.stdout.write(JSON.stringify(value));
-const size = suffix => { try { return statSync(file + suffix).size; } catch (error) { if (error && error.code === 'ENOENT') return null; throw error; } };
 try {
-  const pending = Boolean(size('-wal')), shared = size('-shm') !== null;
-  if (size('-journal')) out({ refused: 'journal' });
-  else if (pending && !shared) out({ refused: 'wal' });
-  else {
-    const key = readFileSync(keyFile);
-    if (key.length !== 32) out({ refused: 'key' });
+  withDatabasePath(root, file, path => {
+    const size = suffix => { try { return statSync(path + suffix).size; } catch (error) { if (error && error.code === 'ENOENT') return null; throw error; } };
+    const pending = Boolean(size('-wal')), shared = size('-shm') !== null;
+    if (size('-journal')) out({ refused: 'journal' });
+    else if (pending && !shared) out({ refused: 'wal' });
     else {
-      const db = new DatabaseSync(pending || shared ? file : pathToFileURL(file).href + '?immutable=1', { readOnly: true });
-      try {
-        db.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=750');
-        const has = name => db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name) !== undefined;
-        const final = JSON.parse(terminal), marks = final.map(() => '?').join(',');
-        const connection = has('live_connection') ? db.prepare('SELECT json FROM live_connection WHERE singleton=1').get()?.json ?? null : null;
-        const orders = has('live_orders') ? Number(db.prepare('SELECT count(*) AS n FROM live_orders WHERE state NOT IN (' + marks + ')').get(...final).n) : 0;
-        // An execution with an order not final, or with no order at all (never seen from the workbench), is unfinished.
-        const executions = has('live_executions') ? Number(db.prepare(has('live_orders')
-          ? 'SELECT count(*) AS n FROM live_executions e WHERE NOT EXISTS (SELECT 1 FROM live_orders o WHERE o.execution_id=e.id) OR EXISTS (SELECT 1 FROM live_orders o WHERE o.execution_id=e.id AND o.state NOT IN (' + marks + '))'
-          : 'SELECT count(*) AS n FROM live_executions').get(...(has('live_orders') ? final : [])).n) : 0;
-        // The exchange's open orders as the workbench last saw them (its disconnect refuses on these too).
-        const cache = has('live_cache') ? db.prepare('SELECT json FROM live_cache WHERE singleton=1').get()?.json ?? null : null;
-        let open = 0;
-        if (cache !== null) { try { const list = JSON.parse(cache)?.openOrders; open = Array.isArray(list) ? list.filter(o => !final.includes(o?.state)).length : 0; } catch { open = -1; } }
-        const lease = has('live_owner') ? db.prepare('SELECT expires_at FROM live_owner WHERE singleton=1').get()?.expires_at ?? null : null;
-        const config = has('settings') ? db.prepare("SELECT value FROM settings WHERE key='config'").get()?.value ?? null : null;
-        out({ key: key.toString('base64'), connection, orders, executions, open, lease: lease === null ? null : Number(lease), config });
-      } finally { db.close(); }
+      const key = sourceBytes(root, keyFile, 32);
+      if (key.length !== 32) out({ refused: 'key' });
+      else {
+        const db = new DatabaseSync(pending || shared ? path : pathToFileURL(path).href + '?immutable=1', { readOnly: true });
+        try {
+          db.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=750');
+          const has = name => db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name) !== undefined;
+          const final = JSON.parse(terminal), marks = final.map(() => '?').join(',');
+          const connection = has('live_connection') ? db.prepare('SELECT json FROM live_connection WHERE singleton=1').get()?.json ?? null : null;
+          const orders = has('live_orders') ? Number(db.prepare('SELECT count(*) AS n FROM live_orders WHERE state NOT IN (' + marks + ')').get(...final).n) : 0;
+          // An execution with an order not final, or with no order at all (never seen from the workbench), is unfinished.
+          const executions = has('live_executions') ? Number(db.prepare(has('live_orders')
+            ? 'SELECT count(*) AS n FROM live_executions e WHERE NOT EXISTS (SELECT 1 FROM live_orders o WHERE o.execution_id=e.id) OR EXISTS (SELECT 1 FROM live_orders o WHERE o.execution_id=e.id AND o.state NOT IN (' + marks + '))'
+            : 'SELECT count(*) AS n FROM live_executions').get(...(has('live_orders') ? final : [])).n) : 0;
+          // The exchange's open orders as the workbench last saw them (its disconnect refuses on these too).
+          const cache = has('live_cache') ? db.prepare('SELECT json FROM live_cache WHERE singleton=1').get()?.json ?? null : null;
+          let open = 0;
+          if (cache !== null) { try { const list = JSON.parse(cache)?.openOrders; open = Array.isArray(list) ? list.filter(o => !final.includes(o?.state)).length : 0; } catch { open = -1; } }
+          const lease = has('live_owner') ? db.prepare('SELECT expires_at FROM live_owner WHERE singleton=1').get()?.expires_at ?? null : null;
+          const config = has('settings') ? db.prepare("SELECT value FROM settings WHERE key='config'").get()?.value ?? null : null;
+          out({ key: key.toString('base64'), connection, orders, executions, open, lease: lease === null ? null : Number(lease), config });
+        } finally { db.close(); }
+      }
     }
-  }
+  });
 } catch (error) { process.stderr.write(String(error && error.message || error).split('\\n')[0]); process.exitCode = 1; }`;
 
 const DECRYPT_FAILED = 'decrypt_failed';
@@ -148,16 +151,15 @@ export function readWorkbenchCrossex(data: string, now = Date.now()): CrossexSou
   if (!isAbsolute(data)) throw new Error(`工作台数据目录须为绝对路径：${data}`);
   const dir = join(data, 'modules', 'crossex'), database = join(dir, 'crossex.sqlite'), keyFile = join(dir, 'credentials.key');
   for (const [path, name] of [[database, 'CrossEx 数据库'], [keyFile, 'CrossEx 凭据密钥']] as const) {
-    let stat;
-    try { stat = lstatSync(path); } catch { throw new Error(`没有找到工作台的${name} ${path}；工作台数据目录不在默认位置时用 --workbench-data 指定`); }
+    const stat = sourceEntry(data, path);
+    if (!stat) throw new Error(`没有找到工作台的${name} ${path}；工作台数据目录不在默认位置时用 --workbench-data 指定`);
     if (!stat.isFile()) throw new Error(`工作台的${name} ${path} 不是普通文件（符号链接等），不读取`);
-    if (process.getuid?.() === 0 && stat.uid === 0 && statSync(dirname(path)).uid !== 0) throw new Error(`${path} 归 root，但所在目录归其他账户，不读取；请确认文件来源`);
   }
-  const identity = readerIdentity(lstatSync(database), process.getuid?.());
-  const read = spawnSync(process.execPath, ['--input-type=module', '-e', DUMP_CROSSEX, '--', database, keyFile, JSON.stringify(TERMINAL)], {
+  const identity = workbenchIdentity(data, dir);
+  const read = spawnSync(process.execPath, ['--input-type=module', '-e', DUMP_CROSSEX, '--', database, keyFile, JSON.stringify(TERMINAL), data], {
     cwd: '/', env: {}, encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024, ...identity,
   });
-  const as = 'uid' in identity ? `（以数据库属主 uid ${identity.uid} 读取，不带附加组）` : '';
+  const as = 'uid' in identity ? `（以工作台账户 uid ${identity.uid} 读取，不带附加组）` : '';
   if (read.error || read.status !== 0) {
     const why = printable(read.error?.message ?? (read.stderr.trim() || `退出码 ${read.status ?? read.signal}`)).slice(0, 200);
     throw new Error(`读取工作台 CrossEx 数据库 ${database} 失败${as}：${why}`);

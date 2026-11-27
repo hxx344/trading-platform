@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { linkSync, lstatSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
-import { readBounded } from './handoff-file.ts';
+import { sourceBytes, sourceEntry, workbenchIdentity } from './workbench-source.ts';
 import { validateCrossExState, PERPETUAL_CROSSEX_FILE, PERPETUAL_CROSSEX_IMPORT_FILE } from '../monitor/perpetual-crossex-store.ts';
 import { parsePerpetualAlertState, PERPETUAL_ALERT_FILE, PERPETUAL_ALERT_IMPORT } from '../vendor/perpetual-alert-store.mjs';
 
@@ -22,7 +22,7 @@ function targetExists(dir: string, kind: Kind) {
 }
 
 /** This worker only sees fixed filenames and runs as the owner of the respective data directory. */
-function worker(mode: string, dir: string, input: Sources) {
+function worker(mode: string, root: string, dir: string, input: Sources) {
   const details: string[] = [], states: Sources = {};
   let available = false;
   for (const kind of kinds) {
@@ -30,12 +30,9 @@ function worker(mode: string, dir: string, input: Sources) {
     if (mode === 'read') {
       try {
         const path = join(dir, spec.source);
-        if (!exists(path)) { details.push('工作台没有' + spec.label + '文件'); continue; }
-        if (!lstatSync(path).isFile()) throw new Error();
-        const text = readBounded(path, spec.limit, stat => {
-          if (process.getuid?.() === 0 && stat.uid !== 0) throw new Error('文件所有者与目录不符');
-        });
-        if (text !== null) states[kind] = spec.parse(JSON.parse(text));
+        if (!sourceEntry(root, path)) { details.push('工作台没有' + spec.label + '文件'); continue; }
+        const text = sourceBytes(root, path, spec.limit).toString('utf8');
+        states[kind] = spec.parse(JSON.parse(text));
       } catch { details.push(spec.label + '文件无法读取或格式无效'); }
       continue;
     }
@@ -58,23 +55,12 @@ function worker(mode: string, dir: string, input: Sources) {
   return { states, available, details };
 }
 
-function run(mode: 'read' | 'inspect' | 'write', dir: string, input: Sources = {}) {
+function run(mode: 'read' | 'inspect' | 'write', dir: string, input: Sources = {}, root = dir) {
   if (!isAbsolute(dir)) throw new Error('导入目录须为绝对路径');
-  const chain = [dir];
-  while (dirname(chain[0]!) !== chain[0]) chain.unshift(dirname(chain[0]!));
-  // Establish the reader/writer identity at the first non-root ancestor. A workbench owner
-  // can rename its descendants, so none of them can nominate another UID for this worker.
-  let identity: { uid: number; gid: number } | undefined;
-  const privileged = process.getuid?.() === 0;
-  for (const path of chain) {
-    const stat = lstatSync(path);
-    if (!stat.isDirectory()) throw new Error('导入路径包含符号链接或非目录');
-    if (!privileged) continue;
-    if (identity && stat.uid !== identity.uid) throw new Error('导入目录所有者与上级目录不符');
-    if (!identity && stat.uid !== 0) identity = { uid: stat.uid, gid: stat.gid };
-    if (!identity && (stat.mode & 0o022) !== 0 && (stat.mode & 0o1000) === 0) throw new Error('目录权限无法确认');
-  }
-  const reply = spawnSync(process.execPath, [import.meta.filename, mode, dir], {
+  let identity;
+  try { identity = workbenchIdentity(root, dir); }
+  catch (error) { throw new Error('导入路径包含符号链接或非目录，或目录所有者不符', { cause: error }); }
+  const reply = spawnSync(process.execPath, [import.meta.filename, mode, dir, root], {
     input: JSON.stringify(input), cwd: dirname(import.meta.filename), env: {}, encoding: 'utf8', timeout: 30_000, maxBuffer: 2_100_000,
     ...(identity ?? {}),
   });
@@ -84,12 +70,13 @@ function run(mode: 'read' | 'inspect' | 'write', dir: string, input: Sources = {
 
 export function inspectPerpetualImport(workbench: string, dataDir: string): { preview: PerpetualImportPreview; states: Sources } {
   const monitorDir = join(workbench, 'modules', 'monitor');
-  if (!exists(monitorDir)) return { states: {}, preview: { available: false, details: ['工作台没有行情监控数据'] } };
   const sourceDir = join(monitorDir, 'perpetual');
-  if (!lstatSync(monitorDir).isDirectory() || !lstatSync(sourceDir, { throwIfNoEntry: false })?.isDirectory()) {
-    return { states: {}, preview: { available: false, details: ['工作台没有可读取的合约价差目录'] } };
-  }
-  const source = run('read', sourceDir);
+  let monitor;
+  try { monitor = sourceEntry(workbench, monitorDir); }
+  catch (error) { throw new Error('导入路径包含符号链接或非目录，或目录所有者不符', { cause: error }); }
+  if (!monitor) return { states: {}, preview: { available: false, details: ['工作台没有行情监控数据'] } };
+  if (!monitor.isDirectory() || !sourceEntry(workbench, sourceDir)?.isDirectory()) return { states: {}, preview: { available: false, details: ['工作台没有可读取的合约价差目录'] } };
+  const source = run('read', sourceDir, {}, workbench);
   const target = Object.keys(source.states).length ? run('inspect', dataDir, source.states) : { available: false, details: [] };
   return { states: source.states, preview: { available: target.available === true, details: [...source.details, ...target.details] } };
 }
@@ -99,8 +86,8 @@ export function stagePerpetualImport(dataDir: string, states: Sources): string[]
 
 if (import.meta.main) {
   try {
-    const [, , mode, dir] = process.argv;
-    if (!dir || !isAbsolute(dir) || !mode || !['read', 'inspect', 'write'].includes(mode)) throw new Error('导入参数无效');
-    process.stdout.write(JSON.stringify(worker(mode, dir, JSON.parse(readFileSync(0, 'utf8')) as Sources)));
+    const [, , mode, dir, root] = process.argv;
+    if (!root || !dir || !isAbsolute(dir) || !mode || !['read', 'inspect', 'write'].includes(mode)) throw new Error('导入参数无效');
+    process.stdout.write(JSON.stringify(worker(mode, root, dir, JSON.parse(readFileSync(0, 'utf8')) as Sources)));
   } catch { process.stderr.write('合约价差设置处理失败\n'); process.exitCode = 1; }
 }

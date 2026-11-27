@@ -1,22 +1,23 @@
 // The monitor and asset parts of the workbench import (docs/module-import.md). The market monitor needs nothing from
 // the workbench: importing it writes config.json `monitor` with every market, the Anthropic one with the default share
 // counts (the workbench keeps its share setting in the browser only); an enabled monitor only gains the markets it lacks. The asset ledger comes from the workbench's <data>/modules/asset/ledger.sqlite: one
-// user's rows are read as the file's owner (as the ASTER database is), checked here with the rules of
+// user's rows are read as the workbench account (as the ASTER database is), checked here with the rules of
 // src/asset/import.ts, and written into this service's asset.sqlite by src/asset/import-writer.ts run as the owner of
 // this service's data directory. Only user names, counts, dates, paths and reasons leave this file; ledger content and
 // credentials never do. Since A-3 the user's connections come along: the preview lists their names only; at the write
-// the connection reader (DUMP_CONNECTIONS, as the ledger's owner) decrypts them with the workbench's config.json
+// the connection reader (DUMP_CONNECTIONS, as the workbench account) decrypts them with the workbench's config.json
 // credentialKey and writes them straight into the writer's stdin, so this process (root in the helper) never holds the
 // plaintext; the writer seals them again with this service's key in the transaction that replaces the ledger.
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import type { Writable } from 'node:stream';
-import { existsSync, lstatSync, statSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import { IMPORTED_SETTINGS, prepareLedger, type SourceRows } from '../asset/import.ts';
 import type { ConnectionImport } from '../asset/import-writer.ts';
 import type { ImportInfo } from '../asset/views.ts';
 import { ANTHROPIC_SHARES } from '../vendor/anthropic-market.mjs';
 import { MONITOR_LABELS, MONITOR_MARKETS, monitorMarkets, parseMonitorConfig, type MonitorConfig } from './monitor-config.ts';
+import { sourceEntry, sourceWorkerImport, workbenchIdentity } from './workbench-source.ts';
 import { readerIdentity } from './import-workbench.ts';
 import { ASSET_OWNER } from './import-channel.ts';
 
@@ -45,7 +46,7 @@ export interface MonitorItem {
   detail: string;
 }
 
-export const readWorkbenchMonitor = (data: string): MonitorSource => ({ workbench: existsSync(join(data, 'modules', 'monitor')) });
+export const readWorkbenchMonitor = (data: string): MonitorSource => ({ workbench: sourceEntry(data, join(data, 'modules', 'monitor'))?.isDirectory() ?? false });
 
 /**
  * Adds config.json `monitor` with every market in place (Anthropic with the default share counts), or the markets an enabled
@@ -129,43 +130,44 @@ export type WrittenLedger = LastImport & { connections: ConnectionImport };
 
 /**
  * Prints the users with a ledger and the rows of the wanted one (or of the first users), in one read transaction; run
- * with no environment, as the file's owner, so a -wal or -shm SQLite adds is the workbench's. Like the ASTER read, a
+ * with no environment, as the workbench account, so a -wal or -shm SQLite adds is the workbench's. Like the ASTER read, a
  * normal read-only open: pending WAL pages are read. A missing table is a code on stdout.
  */
-const DUMP_LEDGER = `import { DatabaseSync } from 'node:sqlite';
-import { readFileSync } from 'node:fs';
+const DUMP_LEDGER = sourceWorkerImport + `import { DatabaseSync } from 'node:sqlite';
 import { dirname, join } from 'node:path';
-const [file, keysText, limitText, wanted] = process.argv.slice(1);
+const [file, keysText, limitText, wanted, root] = process.argv.slice(1);
 const out = value => process.stdout.write(JSON.stringify(value));
 let key = 'ok';
 try {
-  const raw = JSON.parse(readFileSync(join(dirname(file), 'config.json'), 'utf8'));
+  const raw = JSON.parse(sourceBytes(root, join(dirname(file), 'config.json'), 1024 * 1024).toString('utf8'));
   if (!raw || typeof raw.credentialKey !== 'string' || !/^[0-9a-f]{64}$/i.test(raw.credentialKey)) key = 'invalid';
 } catch (error) { key = error && error.code === 'ENOENT' ? 'missing' : 'unreadable'; }
 try {
-  const db = new DatabaseSync(file, { readOnly: true });
-  try {
-    db.exec('PRAGMA busy_timeout = 5000; BEGIN');
-    const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(row => row.name));
-    const missing = ['assets', 'settings', 'snapshots'].find(name => !tables.has(name));
-    if (missing) out({ missing });
-    else {
-      const keys = JSON.parse(keysText), marks = keys.map(() => '?').join(', ');
-      const owners = db.prepare("SELECT owner FROM settings WHERE key = 'source-ledger' GROUP BY owner ORDER BY owner").all().map(row => String(row.owner));
-      const picked = wanted ? owners.filter(owner => owner === wanted) : owners.slice(0, Number(limitText));
-      const text = value => typeof value === 'string' ? value : null;
-      const rows = {}, names = {};
-      const listed = tables.has('connections') ? db.prepare('SELECT exchange FROM connections WHERE owner = ? ORDER BY exchange') : null;
-      for (const owner of picked) names[owner] = listed ? listed.all(owner).map(row => text(row.exchange)) : [];
-      for (const owner of picked) rows[owner] = {
-        assets: db.prepare('SELECT id, data FROM assets WHERE owner = ? ORDER BY id').all(owner).map(row => ({ id: text(row.id), data: text(row.data) })),
-        snapshots: db.prepare('SELECT date, data FROM snapshots WHERE owner = ? ORDER BY date').all(owner).map(row => ({ date: text(row.date), data: text(row.data) })),
-        settings: db.prepare('SELECT key, value FROM settings WHERE owner = ? AND key IN (' + marks + ') ORDER BY key').all(owner, ...keys).map(row => ({ key: text(row.key), value: text(row.value) })),
-      };
-      db.exec('COMMIT');
-      out({ owners, rows, connections: names, key });
-    }
-  } finally { db.close(); }
+  withDatabasePath(root, file, path => {
+    const db = new DatabaseSync(path, { readOnly: true });
+    try {
+      db.exec('PRAGMA busy_timeout = 5000; BEGIN');
+      const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(row => row.name));
+      const missing = ['assets', 'settings', 'snapshots'].find(name => !tables.has(name));
+      if (missing) out({ missing });
+      else {
+        const keys = JSON.parse(keysText), marks = keys.map(() => '?').join(', ');
+        const owners = db.prepare("SELECT owner FROM settings WHERE key = 'source-ledger' GROUP BY owner ORDER BY owner").all().map(row => String(row.owner));
+        const picked = wanted ? owners.filter(owner => owner === wanted) : owners.slice(0, Number(limitText));
+        const text = value => typeof value === 'string' ? value : null;
+        const rows = {}, names = {};
+        const listed = tables.has('connections') ? db.prepare('SELECT exchange FROM connections WHERE owner = ? ORDER BY exchange') : null;
+        for (const owner of picked) names[owner] = listed ? listed.all(owner).map(row => text(row.exchange)) : [];
+        for (const owner of picked) rows[owner] = {
+          assets: db.prepare('SELECT id, data FROM assets WHERE owner = ? ORDER BY id').all(owner).map(row => ({ id: text(row.id), data: text(row.data) })),
+          snapshots: db.prepare('SELECT date, data FROM snapshots WHERE owner = ? ORDER BY date').all(owner).map(row => ({ date: text(row.date), data: text(row.data) })),
+          settings: db.prepare('SELECT key, value FROM settings WHERE owner = ? AND key IN (' + marks + ') ORDER BY key').all(owner, ...keys).map(row => ({ key: text(row.key), value: text(row.value) })),
+        };
+        db.exec('COMMIT');
+        out({ owners, rows, connections: names, key });
+      }
+    } finally { db.close(); }
+  });
 } catch (error) { process.stderr.write(String(error && error.message || error).split('\\n')[0]); process.exitCode = 1; }`;
 
 /**
@@ -175,24 +177,25 @@ try {
  * output says why and carries no connection. Nothing is written to stderr but the first line of an unexpected error,
  * which never comes from a decrypted value.
  */
-const DUMP_CONNECTIONS = `import { DatabaseSync } from 'node:sqlite';
-import { readFileSync } from 'node:fs';
+const DUMP_CONNECTIONS = sourceWorkerImport + `import { DatabaseSync } from 'node:sqlite';
 import { dirname, join } from 'node:path';
-const [file, owner] = process.argv.slice(1);
+const [file, owner, root] = process.argv.slice(1);
 const result = { connections: [], skipped: [], problem: null };
 let raw;
-try { raw = JSON.parse(readFileSync(join(dirname(file), 'config.json'), 'utf8')).credentialKey; }
+try { raw = JSON.parse(sourceBytes(root, join(dirname(file), 'config.json'), 1024 * 1024).toString('utf8')).credentialKey; }
 catch (error) { result.problem = error && error.code === 'ENOENT' ? 'missing' : 'unreadable'; }
 if (!result.problem && (typeof raw !== 'string' || !/^[0-9a-f]{64}$/i.test(raw))) result.problem = 'invalid';
 let rows = [];
 if (!result.problem) {
   try {
-    const db = new DatabaseSync(file, { readOnly: true });
-    try {
-      db.exec('PRAGMA busy_timeout = 5000');
-      const present = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'connections'").get();
-      rows = present ? db.prepare('SELECT exchange, encrypted FROM connections WHERE owner = ? ORDER BY exchange').all(owner) : [];
-    } finally { db.close(); }
+    withDatabasePath(root, file, path => {
+      const db = new DatabaseSync(path, { readOnly: true });
+      try {
+        db.exec('PRAGMA busy_timeout = 5000');
+        const present = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'connections'").get();
+        rows = present ? db.prepare('SELECT exchange, encrypted FROM connections WHERE owner = ? ORDER BY exchange').all(owner) : [];
+      } finally { db.close(); }
+    });
   } catch { result.problem = 'read'; }
 }
 if (!result.problem) {
@@ -239,12 +242,13 @@ export function readWorkbenchLedger(data: string, { owner }: { owner?: string } 
   const ledger = join(data, 'modules', 'asset', LEDGER_FILE);
   const refused = (problem: string) => ({ ledger, problem, owners: [], more: 0, rows: new Map<string, SourceRows>(), connectionProblem: null });
   let stat;
-  try { stat = lstatSync(ledger); } catch { return refused(`没有找到工作台的资产账本 ${ledger}（工作台没有用过资产模块，或数据目录不在默认位置）`); }
+  try { stat = sourceEntry(data, ledger); } catch (error) { return refused(reason(error)); }
+  if (!stat) return refused(`没有找到工作台的资产账本 ${ledger}（工作台没有用过资产模块，或数据目录不在默认位置）`);
   if (!stat.isFile()) return refused(`工作台的资产账本 ${ledger} 不是普通文件（符号链接等），不读取`);
-  if (process.getuid?.() === 0 && stat.uid === 0 && statSync(dirname(ledger)).uid !== 0) return refused(`${ledger} 归 root，但所在目录归其他账户，不读取；请确认文件来源`);
-  const identity = readerIdentity(stat, process.getuid?.());
-  const as = 'uid' in identity ? `（以账本属主 uid ${identity.uid} 读取，不带附加组）` : '';
-  const read = spawnSync(process.execPath, ['--input-type=module', '-e', DUMP_LEDGER, '--', ledger, JSON.stringify(IMPORTED_SETTINGS), String(MAX_LEDGER_OWNERS), owner ?? ''], {
+  let identity;
+  try { identity = workbenchIdentity(data, dirname(ledger)); } catch (error) { return refused(reason(error)); }
+  const as = 'uid' in identity ? `（以工作台账户 uid ${identity.uid} 读取，不带附加组）` : '';
+  const read = spawnSync(process.execPath, ['--input-type=module', '-e', DUMP_LEDGER, '--', ledger, JSON.stringify(IMPORTED_SETTINGS), String(MAX_LEDGER_OWNERS), owner ?? '', data], {
     cwd: '/', env: {}, encoding: 'utf8', timeout: 30_000, maxBuffer: 64 * 1024 * 1024, ...identity,
   });
   if (read.error || read.status !== 0) return refused(`读取工作台资产账本 ${ledger} 失败${as}：${printable(read.error?.message ?? (read.stderr.trim() || `退出码 ${read.status ?? read.signal}`)).slice(0, 200)}`);
@@ -322,17 +326,16 @@ export async function writeLedgerAsService(dataDir: string, write: LedgerWrite):
   let reader: ChildProcess | null = null, readerDone: ReturnType<typeof finished> | null = null, readerErr: Buffer[] = [];
   let refusedReader: string | null = null;
   try {
-    let stat;
-    try { stat = lstatSync(write.ledger); } catch { stat = null; }
-    // The preview's rule again (readWorkbenchLedger): the file may have been swapped since.
-    if (stat?.isFile() && process.getuid?.() === 0 && stat.uid === 0) {
-      let dirUid: number | null = null;
-      try { dirUid = statSync(dirname(write.ledger)).uid; } catch { /* unreadable directory: refused below */ }
-      if (dirUid !== 0) { refusedReader = `${write.ledger} 归 root，但所在目录归其他账户，连接未导入（账本照常导入）；请确认文件来源`; stat = null; }
-    }
-    // A ledger that is gone or no longer a plain file gives no connections: the writer reads end of file and says so.
-    if (stat?.isFile() && writer.stdin) {
-      reader = spawn(process.execPath, ['--input-type=module', '-e', DUMP_CONNECTIONS, '--', write.ledger, write.owner], { cwd: '/', env: {}, stdio: ['ignore', writer.stdin, 'pipe'], ...readerIdentity(stat, process.getuid?.()) });
+    // The planned source is always <workbench>/modules/asset/ledger.sqlite. Recheck its
+    // ancestor identity before reading connections, independently of the preview.
+    const root = dirname(dirname(dirname(write.ledger)));
+    let sourceIdentity;
+    try {
+      if (write.ledger !== join(root, 'modules', 'asset', LEDGER_FILE)) throw new Error('资产账本路径无效');
+      sourceIdentity = workbenchIdentity(root, dirname(write.ledger));
+    } catch { refusedReader = '工作台资产目录无法确认，连接未导入（账本照常导入）'; }
+    if (sourceIdentity && writer.stdin) {
+      reader = spawn(process.execPath, ['--input-type=module', '-e', DUMP_CONNECTIONS, '--', write.ledger, write.owner, root], { cwd: '/', env: {}, stdio: ['ignore', writer.stdin, 'pipe'], ...sourceIdentity });
       readerDone = finished(reader); readerErr = collect(reader, 'stderr', 16 * 1024);
     }
   } finally { writer.stdin?.destroy(); }

@@ -8,8 +8,9 @@
 // environment (/proc/<pid>/environ, read as root): an edited .env takes effect only when the module restarts.
 // The account UID is read once with the key (query-api, the same read as the service's start check). Only the masked
 // UID, settings and reasons leave this file; the key never does.
-import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from 'node:fs';
-import { dirname, isAbsolute, join } from 'node:path';
+import { readFileSync, readdirSync, realpathSync } from 'node:fs';
+import { operatorEnv, optionalSourceText } from './workbench-source.ts';
+import { isAbsolute, join } from 'node:path';
 import { parseEnv } from 'node:util';
 import { validCredentials, type LiveCredentials } from '../live/values.ts';
 import type { FetchLike } from '../live/http.ts';
@@ -162,28 +163,6 @@ export function optionsCandidate(environment: Record<string, string>, stateText:
   return source;
 }
 
-/** Opened without following a final symbolic link (and without blocking on a FIFO); the checks are on the open file. */
-function readPlain(path: string, name: string, limit: number): string | null {
-  let fd: number;
-  try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'ENOENT') return null;
-    if (code === 'ELOOP') throw new Error(`工作台的${name} ${path} 是符号链接，不读取`);
-    throw error;
-  }
-  try {
-    const stat = fstatSync(fd);
-    if (!stat.isFile()) throw new Error(`工作台的${name} ${path} 不是普通文件，不读取`);
-    if (process.getuid?.() === 0 && stat.uid === 0 && statSync(dirname(path)).uid !== 0) throw new Error(`${path} 归 root，但所在目录归其他账户，不读取；请确认文件来源`);
-    if (stat.size > limit) throw new Error(`工作台的${name} ${path} 超过 ${limit} 字节，不读取`);
-    const buffer = Buffer.alloc(limit + 1);
-    let length = 0;
-    for (let read; length <= limit && (read = readSync(fd, buffer, length, limit + 1 - length, null)) > 0;) length += read;
-    if (length > limit) throw new Error(`工作台的${name} ${path} 超过 ${limit} 字节，不读取`);
-    return buffer.subarray(0, length).toString('utf8');
-  } finally { closeSync(fd); }
-}
-
 const OFF_WORDS = ['0', 'false', 'off', 'no'];
 const samePath = (a: string, b: string): boolean => {
   const real = (path: string): string => { try { return realpathSync(path); } catch { return path; } };
@@ -218,9 +197,9 @@ export function runningGreeksProblem(stateFile: string, procDir = '/proc'): stri
 /** Reads the workbench Greeks module's environment and state, and checks the running module; nothing is written. */
 export function readWorkbenchOptions(envFile: string, data: string, procDir = '/proc'): OptionsSource {
   if (!isAbsolute(data)) throw new Error(`工作台数据目录须为绝对路径：${data}`);
-  const base = readPlain(envFile, '环境文件', 1024 * 1024), moduleText = readPlain(join(data, 'modules', 'greeks', '.env'), '期权模块环境文件', 1024 * 1024);
+  const base = operatorEnv(envFile).text, moduleText = optionalSourceText(data, join(data, 'modules', 'greeks', '.env'), 1024 * 1024);
   const stateFile = join(data, 'modules', 'greeks', 'engine_state.json');
-  const source = optionsCandidate({ ...(base === null ? {} : parseEnv(base)), ...(moduleText === null ? {} : parseEnv(moduleText)) } as Record<string, string>, readPlain(stateFile, '期权状态文件', MAX_STATE_BYTES), stateFile);
+  const source = optionsCandidate({ ...(base === null ? {} : parseEnv(base)), ...(moduleText === null ? {} : parseEnv(moduleText)) } as Record<string, string>, optionalSourceText(data, stateFile, MAX_STATE_BYTES), stateFile);
   if (source.problem !== null) return source;
   const running = runningGreeksProblem(stateFile, procDir);
   return running === null ? source : { ...source, credentials: null, settings: {}, problem: running };

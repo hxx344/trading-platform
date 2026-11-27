@@ -4,12 +4,13 @@ import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { parseEnv } from 'node:util';
 import { fileText, planImport, readWorkbench, readerIdentity } from '../src/service/import-workbench.ts';
+import { optionalSourceText, withDatabasePath } from '../src/service/workbench-source.ts';
 import { REQUEST_FILE, RESULT_FILE, RUNNING_STALE_MS, parseImportBody, readImportResult, submitImportRequest, takeImportRequest, writeImportResult } from '../src/service/import-channel.ts';
 import { runImportHelper } from '../src/service/import-helper.ts';
 import { parseServiceConfig } from '../src/service/config.ts';
@@ -84,7 +85,48 @@ test('导入工作台：逐项沿用保证金与 ADL 设置，跳过未开启、
   } finally { rmSync(wb.root, { recursive: true, force: true }); }
 });
 
-test('导入工作台：root 以数据库属主身份读库，工作台运行中时读到尚未写回主文件的记录', () => {
+test('导入来源：拒绝中间目录链接和超限文本；允许同一工作台的普通文件并区分缺失文件', t => {
+  const wb = workbench();
+  t.after(() => rmSync(wb.root, { recursive: true, force: true }));
+  const modules = join(wb.data, 'modules'), saved = join(wb.data, 'original-modules');
+  const env = join(modules, 'aster', '.env');
+  writeFileSync(env, 'A=B');
+  assert.equal(optionalSourceText(wb.data, env, 3), 'A=B');
+  assert.equal(optionalSourceText(wb.data, join(modules, 'absent'), 3), null);
+  assert.throws(() => optionalSourceText(wb.data, env, 2), /超过/);
+  renameSync(modules, saved);
+  symlinkSync(saved, modules, process.platform === 'win32' ? 'junction' : 'dir');
+  assert.throws(() => readWorkbench(wb.envFile, undefined), /不是目录/);
+});
+
+test('Linux 导入来源：按目录可遍历性检查写权限，私有目录也拒绝硬链接及异常 SQLite 伴随文件', { skip: process.platform !== 'linux' }, t => {
+  const root = mkdtempSync('/tmp/tp-source-modes-');
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, 'modules'), file = join(dir, 'state'), sidecar = file + '-wal';
+  mkdirSync(dir);
+  chmodSync(dir, 0o755);
+  writeFileSync(file, 'fixture');
+  chmodSync(file, 0o664);
+  assert.equal(optionalSourceText(root, file, 64), 'fixture');
+  linkSync(file, join(root, 'alias'));
+  assert.throws(() => optionalSourceText(root, file, 64), /硬链接/);
+  rmSync(join(root, 'alias'));
+  chmodSync(root, 0o755);
+  assert.throws(() => optionalSourceText(root, file, 64), /写权限/);
+  chmodSync(file, 0o644);
+  chmodSync(dir, 0o775);
+  assert.throws(() => optionalSourceText(root, file, 64), /写权限/);
+  chmodSync(dir, 0o755);
+  writeFileSync(sidecar, '');
+  chmodSync(sidecar, 0o666);
+  assert.throws(() => withDatabasePath(root, file, () => true), /写权限/);
+  chmodSync(root, 0o700);
+  assert.equal(withDatabasePath(root, file, () => true), true);
+  linkSync(sidecar, join(root, 'wal-alias'));
+  assert.throws(() => withDatabasePath(root, file, () => true), /硬链接/);
+});
+
+test('导入工作台：root 以工作台属主身份读库，工作台运行中时读到尚未写回主文件的记录', () => {
   // SQLite may add -wal/-shm on a read; made by the database's owner they never stop the workbench writing.
   assert.deepEqual(readerIdentity({ uid: 990, gid: 991 }, 0), { uid: 990, gid: 991 });
   assert.deepEqual(readerIdentity({ uid: 0, gid: 0 }, 0), {});

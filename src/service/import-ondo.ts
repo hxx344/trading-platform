@@ -6,17 +6,15 @@
 // quoting on it: its session record (session.json) exists while a live session runs and after one that did not confirm
 // its quotes withdrawn. Without a workbench Ondo directory or key the module still comes on, for watching.
 // Only the masked key id, settings and reasons leave this file; the secret never does.
-import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, statSync } from 'node:fs';
-import { dirname, isAbsolute, join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { validateCredentials, readOndoMmConfig, splitOndoMmConfig, type OndoMmConfig } from '../vendor/ondo/mm.mjs';
-import { decryptCredential, readerIdentity } from './import-workbench.ts';
+import { optionalSourceBytes, optionalSourceText, sourceEntry, workbenchIdentity } from './workbench-source.ts';
+import { decryptCredential } from './import-workbench.ts';
 import { parseOndoConfig, parseOndoSecrets, type OndoCredentials } from './ondo-config.ts';
 
 type Json = Record<string, unknown>;
 const isRecord = (value: unknown): value is Json => value !== null && typeof value === 'object' && !Array.isArray(value);
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error);
-const printable = (text: string): string => text.replace(/[\p{Cc}\p{Cf}]/gu, '');
 const mask = (id: string | null): string | null => id === null ? null : `***${id.slice(-4)}`;
 
 /** The workbench's Ondo module as found. */
@@ -38,25 +36,6 @@ export const SESSION_PROBLEM = '工作台 Ondo 挂单仍在实盘或有未确认
 export const LIVE_WARNING = '导入后不要再在工作台启动 Ondo 实盘挂单，避免两边用同一账户挂单';
 const MAX_BYTES = 64 * 1024;
 
-/**
- * Prints the files the import needs; run with no environment, as the directory's owner. A missing file prints null; a
- * file over MAX_BYTES or a key not 32 bytes long is a refusal code on stdout.
- */
-const DUMP_ONDO = `import { readFileSync, statSync } from 'node:fs';
-const [configFile, credentialsFile, sessionFile, keyFile, max] = process.argv.slice(1);
-const out = value => process.stdout.write(JSON.stringify(value));
-const read = file => { try { if (statSync(file).size > Number(max)) return { big: true }; return { text: readFileSync(file, 'utf8') }; } catch (error) { if (error && error.code === 'ENOENT') return null; throw error; } };
-try {
-  const config = read(configFile), credentials = read(credentialsFile), session = read(sessionFile);
-  if (config?.big || credentials?.big || session?.big) out({ refused: 'size' });
-  else {
-    let key = null;
-    if (credentials) { if (statSync(keyFile).size !== 32) { out({ refused: 'key' }); process.exit(0); } const raw = readFileSync(keyFile); if (raw.length !== 32) { out({ refused: 'key' }); process.exit(0); } key = raw.toString('base64'); }
-    out({ config: config?.text ?? null, credentials: credentials?.text ?? null, session: session !== null, key });
-  }
-} catch (error) { process.stderr.write(String(error && error.message || error).split('\\n')[0]); process.exitCode = 1; }`;
-
-/** What DUMP_ONDO prints, minus the refusals; exported for the tests. */
 export interface OndoDump { config: string | null; credentials: string | null; session: boolean; key: Buffer | null }
 
 /** The source from the dumped files (pure: the tests drive it directly). */
@@ -87,37 +66,17 @@ export function ondoCandidate(dump: OndoDump): OndoSource {
 export function readWorkbenchOndo(data: string): OndoSource {
   if (!isAbsolute(data)) throw new Error(`工作台数据目录须为绝对路径：${data}`);
   const dir = join(data, 'ondo-mm');
-  if (!existsSync(dir)) return { present: false, credentials: null, initial: null, problem: null, settingsProblem: null };
-  const dirStat = lstatSync(dir);
-  if (!dirStat.isDirectory()) throw new Error(`工作台的 Ondo 目录 ${dir} 不是普通目录（符号链接等），不读取`);
-  const files = { config: join(dir, 'config.json'), credentials: join(dir, 'credentials.json'), session: join(dir, 'session.json') }, keyFile = join(data, 'credentials.key');
-  const check = (path: string, name: string, required: boolean) => {
-    let stat;
-    try { stat = lstatSync(path); } catch { if (required) throw new Error(`没有找到工作台的${name} ${path}；工作台数据目录不在默认位置时用 --workbench-data 指定`); return; }
-    if (!stat.isFile()) throw new Error(`工作台的${name} ${path} 不是普通文件（符号链接等），不读取`);
-    if (process.getuid?.() === 0 && stat.uid === 0 && statSync(dirname(path)).uid !== 0) throw new Error(`${path} 归 root，但所在目录归其他账户，不读取；请确认文件来源`);
-  };
-  check(files.config, 'Ondo 挂单设置', false);
-  check(files.credentials, 'Ondo API Key 记录', false);
-  check(files.session, 'Ondo 会话记录', false);
-  if (existsSync(files.credentials)) check(keyFile, '凭据密钥', true);
-  const identity = readerIdentity(dirStat, process.getuid?.());
-  const read = spawnSync(process.execPath, ['--input-type=module', '-e', DUMP_ONDO, '--', files.config, files.credentials, files.session, keyFile, String(MAX_BYTES)], {
-    cwd: '/', env: {}, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, ...identity,
-  });
-  const as = 'uid' in identity ? `（以目录属主 uid ${identity.uid} 读取，不带附加组）` : '';
-  if (read.error || read.status !== 0) {
-    const why = printable(read.error?.message ?? (read.stderr.trim() || `退出码 ${read.status ?? read.signal}`)).slice(0, 200);
-    throw new Error(`读取工作台 Ondo 目录 ${dir} 失败${as}：${why}`);
-  }
-  let dumped: { refused?: string; config?: unknown; credentials?: unknown; session?: unknown; key?: unknown };
-  try { dumped = JSON.parse(read.stdout) as typeof dumped; } catch { throw new Error(`读取工作台 Ondo 目录 ${dir} 失败${as}：输出无法解析`); }
-  if (dumped.refused === 'size') throw new Error(`工作台 Ondo 目录 ${dir} 里有超过 64 KB 的文件，不是工作台写的格式，不读取`);
-  if (dumped.refused === 'key') throw new Error(`${keyFile} 长度不是 32 字节，不是工作台的凭据密钥`);
-  if (!(dumped.config === null || typeof dumped.config === 'string') || !(dumped.credentials === null || typeof dumped.credentials === 'string')
-    || typeof dumped.session !== 'boolean' || !(dumped.key === null || typeof dumped.key === 'string')) throw new Error(`读取工作台 Ondo 目录 ${dir} 失败${as}：输出格式错误`);
-  const key = typeof dumped.key === 'string' ? Buffer.from(dumped.key, 'base64') : null;
-  try { return ondoCandidate({ config: dumped.config, credentials: dumped.credentials, session: dumped.session, key }); }
+  const folder = sourceEntry(data, dir);
+  if (!folder) return { present: false, credentials: null, initial: null, problem: null, settingsProblem: null };
+  if (!folder.isDirectory()) throw new Error('工作台的 Ondo 目录不是普通目录（符号链接等），不读取');
+  workbenchIdentity(data, dir);
+  const config = optionalSourceText(data, join(dir, 'config.json'), MAX_BYTES);
+  const credentials = optionalSourceText(data, join(dir, 'credentials.json'), MAX_BYTES);
+  const session = optionalSourceText(data, join(dir, 'session.json'), MAX_BYTES) !== null;
+  const key = credentials !== null ? optionalSourceBytes(data, join(data, 'credentials.key'), 32) : null;
+  if (credentials !== null && !key) throw new Error('没有找到工作台的凭据密钥');
+  if (key && key.length !== 32) throw new Error('工作台凭据密钥长度不是 32 字节');
+  try { return ondoCandidate({ config, credentials, session, key }); }
   finally { key?.fill(0); }
 }
 

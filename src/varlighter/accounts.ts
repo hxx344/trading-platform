@@ -231,11 +231,12 @@ export function parseEntropyUnifiedBalance(value: unknown): { collateral: number
       usdc = item;
       continue;
     }
-    if (others.length >= ENTROPY_MAX_ASSETS) continue;
     const symbol = typeof item.coin === 'string' && item.coin.trim() ? item.coin.trim().slice(0, 40) : null;
-    if (!symbol) continue;
+    if (symbol === 'USDC') throw new Error('统一账户应答格式无效');
+    if (others.length >= ENTROPY_MAX_ASSETS || !symbol) continue;
     const balance = optionalNumber(item.total) ?? 0;
     const locked = optionalNumber(item.hold) ?? 0;
+    if (balance < 0 || locked < 0) throw new Error('统一账户应答的余额格式无效');
     if (balance === 0 && locked === 0) continue;
     others.push({ symbol, balance, locked });
   }
@@ -428,8 +429,9 @@ export async function fetchAccount(fetchImpl: FetchLike, signal: AbortSignal, ve
       readJson(fetchImpl, ENTROPY_ENDPOINTS.info, signal, ACCOUNT_LIMIT, {}, { type: 'clearinghouseState', user: account.address, dex: ENTROPY_ENDPOINTS.dex }),
       readJson(fetchImpl, ENTROPY_ENDPOINTS.info, signal, ACCOUNT_LIMIT, {}, { type: 'userAbstraction', user: account.address }),
     ]);
+    const accountMode = parseEntropyMode(mode);
     const base = parseEntropyAccount(state);
-    if (parseEntropyMode(mode) === 'separate') return base;
+    if (accountMode === 'separate') return base;
     const spot = await readJson(fetchImpl, ENTROPY_ENDPOINTS.info, signal, ACCOUNT_LIMIT, {}, { type: 'spotClearinghouseState', user: account.address });
     const unified = parseEntropyUnifiedBalance(spot);
     return {

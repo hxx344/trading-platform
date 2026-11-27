@@ -715,9 +715,9 @@ DEX 这一步在 `activate` 里的位置是：**执行面健康之后、控制�
   - `portfolioMargin`（组合保证金）、`dexAbstraction`（旧版 DEX 抽象）与未识别模式：直接读取失败并给出明确原因，不静默返回 `0.00`；实盘准备页与账户资产页照既有时限降级提示，开仓前检查照常拦截。
 - **影响面**：改动仅涉及 `src/varlighter/accounts.ts`、对应单元测试（`test/dex-keys.test.ts`、`test/dex-accounts.test.ts`）、本地预览脚本 `scripts/dev-varlighter.ts` 及文档；不改动 `live.ts`、`engine.ts`、实盘下单签名与平仓路径、凭据文件格式、`varlighter.sqlite` 库结构、前端组件与部署安装脚本。
 - **失败与回滚**：
-  - `userAbstraction`、`clearinghouseState` 或统一账户下的 `spotClearinghouseState` 任一失败或字段无效（包括 `token === 0` 重复、币种非 `USDC`、负值）时整个读取失败，不回退使用 `0.00` 或旧值覆盖时限之外的状态。
+  - `userAbstraction`、`clearinghouseState` 或统一账户下的 `spotClearinghouseState` 任一失败或字段无效（包括 `token === 0` 重复、币种非 `USDC`、非 `token === 0` 却名为 `USDC`、负值）时整个读取失败，不回退使用 `0.00` 或旧值覆盖时限之外的状态；先判 `userAbstraction` 模式再解析 `clearinghouseState`，避免不支持模式被结构异常错误掩盖。
   - 回滚版本为 `v0.108.0`：库结构与配置无变更，直接回退即可。
 - **本次不做**：
   - 不对 `portfolioMargin` 做多币种抵押率/可借余额换算；暂不读取或折算 `USDT0` 作为 `io` 盘保证金（`meta(dex: 'io')` 核实 `collateralToken` 为 `0` 即 `USDC`）。
   - 不改变实盘下单/平仓/对账状态机。
-- **验证**：`test/dex-keys.test.ts`（`parseEntropyUnifiedBalance` 正常/空条目/超 200 项截断/异常拒绝、`default`/`disabled`/`unifiedAccount` 读取、`portfolioMargin`/`dexAbstraction`/未知模式/现货账本失败拒绝、准备页端到端）；`test/dex-accounts.test.ts`（统一账户资产视图、快照写入与 D4 不泄露地址）；审查记录见 [reviews/2026-11-27-entropy-unified-account.md](reviews/2026-11-27-entropy-unified-account.md)。
+- **验证与待实测**：`test/dex-keys.test.ts`（`parseEntropyUnifiedBalance` 正常/空条目/超 200 项截断/异常与重复 `USDC` 拒绝、`default`/`disabled`/`unifiedAccount` 读取与信号透传中止、`portfolioMargin`/`dexAbstraction`/未知模式/现货账本失败拒绝、准备页端到端）；`test/dex-accounts.test.ts`（统一账户资产视图、快照写入与 D4 不泄露地址）；审查记录见 [reviews/2026-11-27-entropy-unified-account.md](reviews/2026-11-27-entropy-unified-account.md)。`unifiedAccount` 存在 `io` 盘活跃持仓与明显浮盈亏时的 `spot.total`/`hold`/`tokenToAvailableAfterMaintenance` 对账表现已记入 [live-results.md](live-results.md) 待实测。

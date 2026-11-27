@@ -210,10 +210,16 @@ test('统一账户现货账本解析：提取 USDC 可用余额与非零资产�
     { balances: [null] },
     { balances: [{ coin: 'USDC', token: 0, total: '10', hold: '0' }, { coin: 'USDC', token: 0, total: '20', hold: '0' }] },
     { balances: [{ coin: 'USDT0', token: 0, total: '100', hold: '0' }] },
+    { balances: [{ coin: 'USDC', total: '500', hold: '0' }] },
+    { balances: [{ coin: 'USDC', token: '0', total: '500', hold: '0' }] },
+    { balances: [{ coin: 'USDC', token: 99, total: '500', hold: '0' }] },
+    { balances: [{ coin: 'USDC', token: 0, total: '500', hold: '0' }, { coin: 'USDC', token: 99, total: '10', hold: '0' }] },
     { balances: [{ coin: 'USDC', token: 0, total: '', hold: '0' }] },
     { balances: [{ coin: 'USDC', token: 0, total: '10', hold: 'bad' }] },
     { balances: [{ coin: 'USDC', token: 0, total: '-1', hold: '0' }] },
     { balances: [{ coin: 'USDC', token: 0, total: '10', hold: '-0.1' }] },
+    { balances: [{ coin: 'HYPE', token: 150, total: '-1', hold: '0' }] },
+    { balances: [{ coin: 'HYPE', token: 150, total: '1', hold: '-0.5' }] },
   ]) {
     assert.throws(() => parseEntropyUnifiedBalance(bad), /统一账户/);
   }
@@ -252,10 +258,16 @@ test('账户读取：Lighter 两套账户走各自的接口，Entropy 按账户�
   assert.equal(seen.length, 6, '没有配置的场所不发请求');
 });
 
-test('Entropy 统一账户读取与模式拒绝：unifiedAccount 从现货账本取余额并保留 io 持仓，非支持模式与读取失败均拒绝', async () => {
+test('Entropy 统一账户读取与模式拒绝：unifiedAccount 从现货账本取余额并保留 io 持仓，非支持模式、信号中止与读取失败均拒绝', async () => {
   const calls: string[] = [];
+  const signalsSeen: (AbortSignal | null | undefined)[] = [];
   let mode: unknown = 'unifiedAccount';
-  let spotResponse: () => Response = () => json({
+  let clearinghouseBody: unknown = {
+    marginSummary: { accountValue: '0.0', totalNtlPos: '52.5', totalRawUsd: '0.0', totalMarginUsed: '10' },
+    withdrawable: '0.0',
+    assetPositions: [{ type: 'oneWay', position: { coin: 'io:NVDA', szi: '-0.3', positionValue: '52.5' } }],
+  };
+  let spotResponse: (signal?: AbortSignal | null) => Promise<Response> | Response = () => json({
     balances: [
       { coin: 'USDC', token: 0, total: '1000.1', hold: '140.35' },
       { coin: 'HYPE', token: 150, total: '0.5', hold: '0' },
@@ -265,21 +277,18 @@ test('Entropy 统一账户读取与模式拒绝：unifiedAccount 从现货账本
   const fetchImpl = (async (_url: string, init: RequestInit) => {
     const req = JSON.parse(String(init.body)) as { type: string };
     calls.push(req.type);
-    if (req.type === 'clearinghouseState') {
-      return json({
-        marginSummary: { accountValue: '0.0', totalNtlPos: '52.5', totalRawUsd: '0.0', totalMarginUsed: '10' },
-        withdrawable: '0.0',
-        assetPositions: [{ type: 'oneWay', position: { coin: 'io:NVDA', szi: '-0.3', positionValue: '52.5' } }],
-      });
-    }
+    signalsSeen.push(init.signal);
+    if (req.type === 'clearinghouseState') return json(clearinghouseBody);
     if (req.type === 'userAbstraction') return modeResponse();
-    if (req.type === 'spotClearinghouseState') return spotResponse();
+    if (req.type === 'spotClearinghouseState') return await spotResponse(init.signal);
     return json({}, 404);
   }) as unknown as typeof fetch;
-  const signal = new AbortController().signal;
+  const controller = new AbortController();
+  const signal = controller.signal;
 
   const snap = await fetchAccount(fetchImpl, signal, 'entropy', ALL);
   assert.deepEqual(calls, ['clearinghouseState', 'userAbstraction', 'spotClearinghouseState']);
+  assert.deepEqual(signalsSeen, [signal, signal, signal], '同一超时信号透传到三个请求');
   assert.equal(snap.collateral, 1000.1);
   assert.equal(snap.equity, 1000.1);
   assert.equal(snap.available, 859.75);
@@ -301,15 +310,33 @@ test('Entropy 统一账户读取与模式拒绝：unifiedAccount 从现货账本
     assert.equal(calls.includes('spotClearinghouseState'), false, `模式 ${String(badMode)} 不应请求现货账本`);
   }
 
+  // 不支持模式下即便 clearinghouseState 结构不同，也优先给出明确模式提示。
+  mode = 'portfolioMargin';
+  clearinghouseBody = {};
+  await assert.rejects(fetchAccount(fetchImpl, signal, 'entropy', ALL), /portfolioMargin/);
+
   mode = 'unifiedAccount';
+  clearinghouseBody = {
+    marginSummary: { accountValue: '0.0', totalNtlPos: '0', totalRawUsd: '0.0', totalMarginUsed: '0' },
+    withdrawable: '0.0',
+    assetPositions: [],
+  };
   spotResponse = () => json({}, 500);
   await assert.rejects(fetchAccount(fetchImpl, signal, 'entropy', ALL), /HTTP 500/);
 
   spotResponse = () => json({ balances: 'bad' });
   await assert.rejects(fetchAccount(fetchImpl, signal, 'entropy', ALL), /统一账户应答格式无效/);
 
+  spotResponse = reqSignal => new Promise((_, fail) => {
+    reqSignal?.addEventListener('abort', () => fail(new Error('请求已中止')));
+  });
+  const aborting = fetchAccount(fetchImpl, signal, 'entropy', ALL);
+  await new Promise(resolve => setImmediate(resolve));
+  controller.abort();
+  await assert.rejects(aborting, /中止/);
+
   modeResponse = () => json({}, 500);
-  await assert.rejects(fetchAccount(fetchImpl, signal, 'entropy', ALL), /HTTP 500/);
+  await assert.rejects(fetchAccount(fetchImpl, new AbortController().signal, 'entropy', ALL), /HTTP 500/);
 });
 
 test('实盘准备页：没有录入时待接入；录入后显示各场所余额，余额不足、读数过期、文件被删都不算就绪', async t => {

@@ -6,8 +6,8 @@ import { Pencil, Plus, Trash2 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { newRequestId } from './request-ids.ts';
 import { money, stamp } from './asset-format.ts';
-import { EXCHANGE_NAMES, type Exchange } from '../../src/asset/views.ts';
-import type { AsterAccount, Connection } from '../../src/asset/types.ts';
+import { CONNECTION_NAMES, connectionCredentials, type ConnectionExchange, type CardExchange, type BitgetMode } from './asset-connection-form.ts';
+import type { AsterAccount, Ledger } from '../../src/asset/types.ts';
 import type { Writer } from './AssetPage.tsx';
 
 export const CONNECTIONS_PATH = '/api/asset/connections';
@@ -18,12 +18,12 @@ export const ASTER_DELETE_PATH = '/api/asset/aster-accounts/delete';
 const ASTER_LIMIT = 10;
 
 /** The exchanges with one connection each; Aster has its accounts panel instead. */
-export const CARD_EXCHANGES = ['bybit', 'binance', 'okx', 'gate', 'variational', 'hyperliquid', 'rh-lighter'] as const;
-export type CardExchange = typeof CARD_EXCHANGES[number];
+const CARD_EXCHANGES = ['bybit', 'binance', 'okx', 'gate', 'bitget', 'variational', 'hyperliquid', 'rh-lighter'] as const satisfies readonly CardExchange[];
 /** The side panel's order, Aster included (dashboard.tsx 数据连接). */
-export const SIDE_EXCHANGES = ['bybit', 'binance', 'okx', 'gate', 'aster', 'variational', 'hyperliquid', 'rh-lighter'] as const satisfies readonly Exchange[];
+export const SIDE_EXCHANGES = ['bybit', 'binance', 'okx', 'gate', 'bitget', 'aster', 'variational', 'hyperliquid', 'rh-lighter'] as const satisfies readonly ConnectionExchange[];
 
 const DESCRIPTIONS: Record<CardExchange, string> = {
+  bitget: '仅用于链上折价扫描，核验当前账户在所选网络的充值地址。',
   bybit: '统一账户净权益与资金账户余额；包含未实现盈亏，不重复累加保证金。',
   binance: '国际站钱包资产估值，读取各钱包折合 USDT 的余额并换算为美元；范围以 Binance 接口返回为准。',
   okx: '当前账户总资产的美元估值，查看交易、资金和理财账户分项；范围以 OKX 接口返回为准，不自动汇总子账户。',
@@ -34,6 +34,7 @@ const DESCRIPTIONS: Record<CardExchange, string> = {
 };
 
 const PANEL_INTRO: Record<CardExchange, string> = {
+  bitget: '验证密钥的只读权限与账户模式后，加密保存连接。',
   bybit: '验证只读权限与余额，成功后加密保存。', binance: '验证只读权限与余额，成功后加密保存。', okx: '验证只读权限与余额，成功后加密保存。',
   gate: '验证账户余额可读，成功后加密保存；无法自动验证密钥只读权限。',
   variational: '通过 Omni 网页会话读取账户净权益，成功后加密保存令牌。',
@@ -42,6 +43,7 @@ const PANEL_INTRO: Record<CardExchange, string> = {
 };
 
 const PANEL_HELP: Record<CardExchange, string> = {
+  bitget: '选择与 Bitget 账户一致的模式。统一账户需要账户管理读取权限；经典账户使用只读密钥。关闭交易、划转和提现等写权限。',
   bybit: 'HMAC 类型只读 API，需要账户与资产读取权限；不读取子账户及理财产品。',
   binance: '仅支持 Binance 国际站 HMAC API。开启读取权限，关闭交易、划转和提现等写入权限；首次验证成功后才保存连接与资产估值。',
   okx: '仅支持 OKX 国际站实盘 API。只开启读取权限，关闭交易与提现权限；验证账户总资产成功后保存。',
@@ -55,21 +57,25 @@ const REGIONS = [['global', '国际站'], ['nl', '荷兰'], ['tr', '土耳其'],
 const ADDRESS_PATTERN = '\\s*0x[0-9a-fA-F]{40}\\s*';
 
 /** The side panel's line for a connection that is not set up yet (dashboard.tsx 数据连接). */
-export function pendingText(exchange: Exchange): string {
+export function pendingText(exchange: ConnectionExchange): string {
+  if (exchange === 'bitget') return '待连接充值核验接口';
   return exchange === 'variational' ? '待连接 Omni 会话' : exchange === 'hyperliquid' ? '待填写主账户地址' : exchange === 'rh-lighter' ? '待填写 L1 钱包地址' : exchange === 'gate' ? '待连接资产读取接口' : '待连接只读接口';
 }
 
-type Props = { connections: Record<Exchange, Connection>; accounts: AsterAccount[]; now: number; writer: Writer; opened: CardExchange | null; onOpen: (exchange: CardExchange | null) => void };
+type Props = { connections: Ledger['connections']; accounts: AsterAccount[]; now: number; writer: Writer; opened: CardExchange | null; onOpen: (exchange: CardExchange | null) => void };
 
 export function ConnectionsView({ connections, accounts, now, writer, opened, onOpen }: Props) {
   return <div className="connections-grid">
-    {opened ? <ConnectPanel key={opened} exchange={opened} configured={connections[opened].configured} writer={writer} onClose={() => onOpen(null)} /> : null}
+    {opened && connections[opened] ? <ConnectPanel key={opened} exchange={opened} configured={connections[opened].configured}
+      accountMode={opened === 'bitget' ? connections.bitget.accountMode : undefined} writer={writer} onClose={() => onOpen(null)} /> : null}
     {CARD_EXCHANGES.map(name => {
       const connection = connections[name];
+      if (!connection) return null;
       return <section className="panel connection-card" key={name}>
-        <div className="connection-card-title"><div className={'exchange-mark ' + name} aria-hidden="true">{EXCHANGE_NAMES[name][0]}</div><h2>{EXCHANGE_NAMES[name]}</h2><span className={'status ' + (connection.configured ? 'live' : 'amber')}>{connection.configured ? '已连接' : '未连接'}</span></div>
+        <div className="connection-card-title"><div className={'exchange-mark ' + name} aria-hidden="true">{CONNECTION_NAMES[name][0]}</div><h2>{CONNECTION_NAMES[name]}</h2><span className={'status ' + (connection.configured ? 'live' : 'amber')}>{connection.configured ? '已连接' : '未连接'}</span></div>
         <p className="help">{DESCRIPTIONS[name]}</p>
-        <p className="help sync-time">最近成功同步：{stamp(connection.lastSync)}</p>
+        <p className="help sync-time">{name === 'bitget' ? <>{connection.configured && connection.scope ? connection.scope + ' · ' : ''}
+          {connection.lastSync ? '最近验证：' + stamp(connection.lastSync) : '尚未验证'}</> : '最近成功同步：' + stamp(connection.lastSync)}</p>
         {connection.error ? <p className="error-text">{connection.error}</p> : null}
         <div className="form-actions"><button type="button" className="button primary" disabled={writer.busy} aria-expanded={opened === name} onClick={() => { writer.clear(); onOpen(name); }}>{connection.configured ? '更新连接' : '连接账户'}</button></div>
       </section>;
@@ -79,24 +85,24 @@ export function ConnectionsView({ connections, accounts, now, writer, opened, on
 }
 
 /** The workbench's 连接 dialog: the fields this exchange needs, sent once to be verified and saved encrypted. */
-function ConnectPanel({ exchange, configured, writer, onClose }: { exchange: CardExchange; configured: boolean; writer: Writer; onClose: () => void }) {
+function ConnectPanel({ exchange, configured, accountMode: savedMode, writer, onClose }: { exchange: CardExchange; configured: boolean; accountMode?: BitgetMode; writer: Writer; onClose: () => void }) {
   const [key, setKey] = useState(''), [secret, setSecret] = useState(''), [passphrase, setPassphrase] = useState('');
+  const [accountMode, setAccountMode] = useState<BitgetMode>(savedMode ?? 'uta');
   const [region, setRegion] = useState('global'), [walletAddress, setWalletAddress] = useState(''), [vrToken, setVrToken] = useState('');
   const panel = useRef<HTMLElement | null>(null);
   useEffect(() => { panel.current?.scrollIntoView({ block: 'nearest' }); }, []);
-  const address = exchange === 'hyperliquid' || exchange === 'rh-lighter';
   const submit = () => {
-    const credentials = exchange === 'variational' ? { exchange, vrToken: vrToken.trim() }
-      : address ? { exchange, walletAddress: walletAddress.trim() }
-      : { exchange, apiKey: key.trim(), apiSecret: secret.trim(), ...(exchange === 'bybit' ? { region } : exchange === 'okx' ? { passphrase: passphrase.trim() } : {}) };
+    const credentials = connectionCredentials(exchange, { key, secret, passphrase, accountMode, region, walletAddress, vrToken });
     void writer.run(CONNECTIONS_PATH, credentials, onClose);
   };
   const error = writer.errorOf(CONNECTIONS_PATH, CONNECTIONS_DELETE_PATH);
   const secretInput = { autoComplete: 'new-password', spellCheck: false, autoCapitalize: 'none' } as const;
-  return <section ref={panel} className="panel edit-panel connect-panel" aria-label={'连接 ' + EXCHANGE_NAMES[exchange]}>
-    <h2>连接 {EXCHANGE_NAMES[exchange]}</h2>
+  return <section ref={panel} className="panel edit-panel connect-panel" aria-label={'连接 ' + CONNECTION_NAMES[exchange]}>
+    <h2>连接 {CONNECTION_NAMES[exchange]}</h2>
     <p className="help">{PANEL_INTRO[exchange]}</p>
     <form className="form-grid" onSubmit={event => { event.preventDefault(); submit(); }}>
+      {exchange === 'bitget' ? <label>账户模式<select value={accountMode} onChange={event => setAccountMode(event.target.value === 'classic' ? 'classic' : 'uta')}>
+        <option value="uta">统一账户（UTA）</option><option value="classic">经典账户</option></select></label> : null}
       {exchange === 'variational' ? <label>vr-token<input type="password" {...secretInput} required minLength={5} maxLength={4096} value={vrToken} onChange={event => setVrToken(event.target.value)} /><span className="help">登录 Omni 网页后，从浏览器 Cookie 中复制 vr-token 的值；只填写值，不带 vr-token= 或完整 Cookie，无需钱包私钥。</span></label>
         : exchange === 'hyperliquid' ? <label>主账户地址<input autoComplete="off" spellCheck={false} autoCapitalize="none" required pattern={ADDRESS_PATTERN} placeholder="0x…" value={walletAddress} onChange={event => setWalletAddress(event.target.value)} /><span className="help">填写套利执行账户的主账户地址（交易所显示的钱包地址），不要填写 API 钱包（agent）地址，无需私钥。</span></label>
         : exchange === 'rh-lighter' ? <label>L1 钱包地址<input autoComplete="off" spellCheck={false} autoCapitalize="none" required pattern={ADDRESS_PATTERN} placeholder="0x…" value={walletAddress} onChange={event => setWalletAddress(event.target.value)} /><span className="help">填写在 Lighter on Robinhood Chain 注册账户所用的以太坊 L1 钱包地址，该地址下的主账户与子账户一并汇总；无需私钥或 API Key。</span></label>
@@ -104,13 +110,13 @@ function ConnectPanel({ exchange, configured, writer, onClose }: { exchange: Car
           <label>API Key<input autoComplete="off" spellCheck={false} autoCapitalize="none" required value={key} onChange={event => setKey(event.target.value)} /></label>
           <label>API Secret<input type="password" {...secretInput} required value={secret} onChange={event => setSecret(event.target.value)} /></label>
         </>}
-      {exchange === 'okx' ? <label>Passphrase<input type="password" {...secretInput} required maxLength={256} value={passphrase} onChange={event => setPassphrase(event.target.value)} /><span className="help">创建 OKX API 时设置的口令。</span></label> : null}
+      {exchange === 'okx' || exchange === 'bitget' ? <label>Passphrase<input type="password" {...secretInput} required maxLength={256} value={passphrase} onChange={event => setPassphrase(event.target.value)} /><span className="help">创建 {CONNECTION_NAMES[exchange]} API 时设置的口令。</span></label> : null}
       {exchange === 'bybit' ? <label>账户地区<select aria-label="账户地区" value={region} onChange={event => setRegion(event.target.value)}>{REGIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label> : null}
       <p className="help">{PANEL_HELP[exchange]}</p>
       {error ? <p className="error-text" role="alert">{error}</p> : null}
       <div className="form-actions">
         <button type="button" className="button" disabled={writer.busy} onClick={onClose}>取消</button>
-        {configured ? <button type="button" className="button" disabled={writer.busy} onClick={() => void writer.run(CONNECTIONS_DELETE_PATH, { exchange }, onClose)}>断开并保留估值</button> : null}
+        {configured ? <button type="button" className="button" disabled={writer.busy} onClick={() => void writer.run(CONNECTIONS_DELETE_PATH, { exchange }, onClose)}>{exchange === 'bitget' ? '断开充值核验连接' : '断开并保留估值'}</button> : null}
         <button className="button primary" disabled={writer.busy}>{writer.busy ? '验证中…' : '验证并连接'}</button>
       </div>
     </form>

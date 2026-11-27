@@ -2,13 +2,13 @@ import { BINANCE_DEPOSIT_TTL } from '../../chain-arb/binance-deposit-proof.ts';
 import { CHAIN_ARB_CLOCK_SKEW_MS, isGateBaseSymbol, type Chain } from '../../chain-arb/model.ts';
 import { isSettlementOrNative } from '../../chain-arb/networks.ts';
 import { isObject } from '../../contracts.ts';
+import { evmAddress } from '../wallet-deposit-source.ts';
 import type { BinanceCredential } from './exchanges.ts';
 import { readBinanceWallet } from './binance-wallet.ts';
 
 export const binanceDepositUnavailable = () => new Error('币安充值网络、最低充值量或收款地址无法核实，请检查资产账本只读连接');
 const invalid = binanceDepositUnavailable;
 const NETWORKS: ReadonlyMap<string, Chain> = new Map([['ETH', 'ethereum'], ['ARBITRUM', 'arbitrum'], ['BSC', 'bsc']]);
-export const evmAddress = (value: unknown): value is string => typeof value === 'string' && /^0x[0-9a-fA-F]{40}$/.test(value);
 type Selection = { symbol: string; chain: Chain; network: string; contract: string; minDeposit: string };
 type ReadContext = { credential: BinanceCredential; fetcher: typeof fetch; signal: AbortSignal; now: () => number; deniedAt: number; check(): void };
 

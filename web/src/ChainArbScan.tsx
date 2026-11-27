@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { CHAIN_ARB_MAX_IMPACT_BPS, VENUE_NAMES, isDepositVenue, type ChainArbVenue } from '../../src/chain-arb/model.ts';
+import { CHAIN_ARB_MAX_IMPACT_BPS, VENUE_NAMES, type ChainArbVenue } from '../../src/chain-arb/model.ts';
 import { ALL_SCAN_VENUES, type BackgroundView } from '../../src/chain-arb/background-model.ts';
 import type { ScanRow, ScanView } from '../../src/chain-arb/scan-model.ts';
 import { api, ApiError } from './api.ts';
@@ -39,16 +39,15 @@ function ScanTable({ rows, history, review }: { rows: VerifiedScanRow[]; history
 }
 
 export function LedgerConnectionHelp({ venues, assetEnabled }: { venues: ChainArbVenue[]; assetEnabled: boolean }) {
-  const accounts = venues.filter(isDepositVenue).map(venue => VENUE_NAMES[venue]).join('、');
-  const unsupported = venues.filter(venue => !isDepositVenue(venue)).map(venue => VENUE_NAMES[venue]).join('、');
-  if (!accounts && !unsupported) return null;
+  if (!venues.length) return null;
+  const accounts = venues.map(venue => VENUE_NAMES[venue]).join('、');
   return <div className="toolbar">
-    <span className="muted">{accounts && (assetEnabled ? '使用资产页「交易所连接」中的 ' + accounts + ' 只读账户核实当前充值地址。'
-      : '请先在设置的「从工作台导入」启用资产账本，再到资产页的「交易所连接」添加 ' + accounts + ' 只读账户。')}
+    <span className="muted">{assetEnabled ? '使用资产页「交易所连接」中的 ' + accounts + ' 只读账户核实当前充值地址。'
+      : '请先在设置的「从工作台导入」启用资产账本，再到资产页的「交易所连接」添加 ' + accounts + ' 只读账户。'}
       {venues.includes('gate') && 'Gate 首次查询时可能生成该币种的充值地址。'}
       {venues.includes('binance') && 'Binance 现货和永续盘口使用公开 WebSocket 行情。'}
-      {unsupported && unsupported + ' 暂未接入充值地址核验，跳过排名和飞书提醒。'}</span>
-    {accounts && <a className="button secondary" href={assetEnabled ? '#/asset' : '#/settings'}>{assetEnabled ? '打开资产账本' : '打开设置'}</a>}
+      {venues.includes('bitget') && 'Bitget 请按实际账户模式连接。充值到账后，可能需要在 Bitget 站内划转至交易账户才能卖出现货。'}</span>
+    <a className="button secondary" href={assetEnabled ? '#/asset' : '#/settings'}>{assetEnabled ? '打开资产账本' : '打开设置'}</a>
   </div>;
 }
 
@@ -166,7 +165,6 @@ export function ChainArbScan({ assetEnabled, onReview, onExpired }: { assetEnabl
         <p>正收益路线按整笔预算的预计净收益率从高到低排列，超过 {view.settings.thresholdBps} bp 才达到飞书通知条件。两条路线都须开放充值且现货买盘足额，永续对冲还须有足额合约买盘。</p></div></div>
       <div className="panel-body">
         {view.settings.enabled ? <ul className="chain-arb-progress" aria-label="各交易所扫描进度">{view.settings.venues.map(venue => {
-          if (!isDepositVenue(venue)) return <li key={venue}><strong>{VENUE_NAMES[venue]}</strong> 暂无充值地址核验</li>;
           const progress = view.results[venue];
           return <li key={venue}><strong>{VENUE_NAMES[venue]}</strong> {progress
             ? <>{phases[progress.phase]} · 第 {progress.cycle} 轮 · 已检查 {progress.checked} / {progress.total} · 失败 {progress.failed}

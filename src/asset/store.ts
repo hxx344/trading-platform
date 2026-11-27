@@ -27,6 +27,8 @@ import { connectionRow, createPositionsService, type PositionsServiceOptions } f
 import { createOkxScanDirectory } from './okx-scan-directory.ts';
 import type { OkxDirectorySource } from '../chain-arb/okx-network.ts';
 import { createGateDepositSource } from './gate-deposit-proof.ts';
+import { createBitgetDepositSource } from './bitget-deposit-proof.ts';
+import type { BitgetDepositSource } from '../chain-arb/bitget-deposit-proof.ts';
 import { createBinanceDepositSource } from './binance-deposit-proof.ts';
 import type { BinanceDepositSource } from '../chain-arb/binance-deposit-proof.ts';
 import { PositionsPermissionError } from './positions-values.ts';
@@ -47,7 +49,7 @@ import {
   type AssetCashFlowsView, type AssetDailyChangesView, type AssetHistoryView, type AssetLedgerView, type AssetPeriodView, type AssetState, type AssetWithdrawalsView, type ImportInfo,
 } from './views.ts';
 
-const EXCHANGES = ['bybit', 'aster', 'binance', 'okx', 'gate', 'variational', 'hyperliquid', 'rh-lighter'] as const;
+const EXCHANGES = ['bybit', 'aster', 'binance', 'okx', 'gate', 'variational', 'hyperliquid', 'rh-lighter', 'bitget'] as const;
 const DAILY_KEY = "date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'";
 
 type LedgerRows = { assets: { data: string }[]; settings: { key: string; value: string }[]; connections: string[]; snapshots: Ledger['history'] };
@@ -136,7 +138,7 @@ export function parseImportInfo(value: string): ImportInfo {
 }
 
 
-export interface AssetStore extends OkxDirectorySource, GateDepositSource, BinanceDepositSource {
+export interface AssetStore extends OkxDirectorySource, GateDepositSource, BinanceDepositSource, BitgetDepositSource {
   state(): Promise<AssetState>;
   ledger(): Promise<AssetLedgerView>;
   history(): Promise<AssetHistoryView>;
@@ -208,7 +210,7 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
   /** The read-only connection the read answers come from (snapshot() below); opened after `handle`, closed with it. */
   let reader: AssetDb | null = null;
   const keyFile = join(dirname(file), CREDENTIAL_KEY_FILE);
-  function savedConnection(exchange: 'gate' | 'okx' | 'binance') {
+  function savedConnection(exchange: 'gate' | 'okx' | 'binance' | 'bitget') {
     if (!attach()) return null;
     const database = handle!;
     return database.snapshot(snapshot => {
@@ -220,6 +222,7 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
   }
   const okxDirectory = createOkxScanDirectory(() => savedConnection('okx'), vault.unseal, fetcher, now);
   const gateDeposits = createGateDepositSource(() => savedConnection('gate'), vault.unseal, fetcher, now);
+  const bitgetDeposits = createBitgetDepositSource(() => savedConnection('bitget'), vault.unseal, fetcher, now);
   const binanceDeposits = createBinanceDepositSource(() => savedConnection('binance'), vault.unseal, fetcher, now);
   const dropReader = () => { const open = reader; reader = null; open?.close(); };
   /** Which file is at the path: a file deleted and imported again is a new one, and the open handle would keep reading the deleted one. */
@@ -228,7 +231,7 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
   };
   const today = (): string => chinaDay(new Date(now()));
-  const drop = () => { okxDirectory.reset(); gateDeposits.reset(); binanceDeposits.reset(); dropReader(); handle?.close(); handle = null; writable = false; busy = false; };
+  const drop = () => { okxDirectory.reset(); gateDeposits.reset(); binanceDeposits.reset(); bitgetDeposits.reset(); dropReader(); handle?.close(); handle = null; writable = false; busy = false; };
   /** Read-write when the service owns the files and can write them; otherwise read-only, so the reads still work. */
   function open(present: string) {
     try { assertOwnFiles(dirname(file)); }
@@ -346,6 +349,10 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     gateDepositRecipient: gateDeposits.gateDepositRecipient,
     gateDepositProof: gateDeposits.gateDepositProof,
     gateDepositCurrent: gateDeposits.gateDepositCurrent,
+    bitgetDepositConnected: bitgetDeposits.bitgetDepositConnected,
+    bitgetDepositProof: bitgetDeposits.bitgetDepositProof,
+    bitgetDepositCurrent: bitgetDeposits.bitgetDepositCurrent,
+    bitgetDepositRecipient: bitgetDeposits.bitgetDepositRecipient,
     binanceDepositProof: binanceDeposits.binanceDepositProof,
     binanceDepositRecipient: binanceDeposits.binanceDepositRecipient,
     binanceDepositCurrent: binanceDeposits.binanceDepositCurrent,
@@ -375,6 +382,11 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     async connect(body) {
       const input = parseConnection(body);
       await locked(async (database, lease) => {
+        if (input.exchange === 'bitget') {
+          const at = await bitgetDeposits.verifyConnection(input);
+          if (sync.saveBitgetConnection(context(database, lease), input, at)) bitgetDeposits.reset();
+          return;
+        }
         const deny = input.exchange === 'gate' ? gateDeposits.watchReconnect(input)
           : input.exchange === 'okx' ? okxDirectory.watchReconnect(input)
           : input.exchange === 'binance' ? binanceDeposits.watchReconnect(input) : undefined;
@@ -391,6 +403,7 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
       await locked((database, lease) => sync.disconnect(context(database, lease), exchange));
       if (exchange === 'okx') okxDirectory.reset();
       if (exchange === 'gate') gateDeposits.reset();
+      if (exchange === 'bitget') bitgetDeposits.reset();
       if (exchange === 'binance') binanceDeposits.reset();
       return ledger();
     },
@@ -428,6 +441,6 @@ export function createAssetStore(file: string, { now = Date.now, fetch: fetcher 
     },
     async positions() { return positionsService.read(await source(), vault.unseal); },
     async fills(market) { return fillsService.read(await source(), vault.unseal, market); },
-    close() { okxDirectory.close(); gateDeposits.close(); binanceDeposits.close(); positionsService.close(); fillsService.close(); shared.reset(); drop(); },
+    close() { okxDirectory.close(); gateDeposits.close(); binanceDeposits.close(); bitgetDeposits.close(); positionsService.close(); fillsService.close(); shared.reset(); drop(); },
   };
 }

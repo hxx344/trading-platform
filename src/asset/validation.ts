@@ -106,12 +106,13 @@ const flag = (value: unknown, field: string): boolean => {
   return value;
 };
 
-export const CONNECTION_EXCHANGES = ['bybit', 'aster', 'binance', 'okx', 'gate', 'variational', 'hyperliquid', 'rh-lighter'] as const;
+export const CONNECTION_EXCHANGES = ['bybit', 'aster', 'binance', 'okx', 'gate', 'variational', 'hyperliquid', 'rh-lighter', 'bitget'] as const;
 export type ConnectionExchange = (typeof CONNECTION_EXCHANGES)[number];
 export const BYBIT_REGIONS = ['global', 'nl', 'tr', 'kz', 'ge', 'ae', 'eu'] as const;
 /** What connectionSchema parses to (the workbench's Credentials). */
 export type Credentials =
   | { exchange: 'variational'; vrToken: string }
+  | { exchange: 'bitget'; accountMode: 'classic' | 'uta'; apiKey: string; apiSecret: string; passphrase: string }
   | { exchange: 'okx'; apiKey: string; apiSecret: string; passphrase: string }
   | { exchange: 'gate'; apiKey: string; apiSecret: string }
   | { exchange: 'binance'; apiKey: string; apiSecret: string }
@@ -125,6 +126,14 @@ export function parseConnection(value: unknown): Credentials {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new AssetInputError('请求体须为对象');
   const exchange = (value as Body).exchange;
   switch (exchange) {
+    case 'bitget': {
+      const required = ['exchange', 'apiKey', 'apiSecret', 'passphrase'];
+      const body = strict(value, [...required, 'accountMode'], required);
+      const accountMode = body.accountMode === undefined ? 'uta' : body.accountMode;
+      if (accountMode !== 'classic' && accountMode !== 'uta') throw new AssetInputError('accountMode 无效');
+      const field = (key: string, min: number) => text(body[key], key, { trim: false, min, max: 256, pattern: /^[\x21-\x7e]+$/ });
+      return { exchange, accountMode, apiKey: field('apiKey', 5), apiSecret: field('apiSecret', 5), passphrase: field('passphrase', 1) };
+    }
     case 'variational': {
       const body = strict(value, ['exchange', 'vrToken']);
       return { exchange, vrToken: text(body.vrToken, 'vrToken', { min: 5, max: 4096, pattern: /^[A-Za-z0-9._~-]+$/ }) };
@@ -195,7 +204,8 @@ export function parseDisconnect(value: unknown): ConnectionExchange {
  * workbench never writes; used when connections come over from the workbench.
  */
 export function connectionExchange(name: unknown): ConnectionExchange | null {
-  if (typeof name !== 'string') return null;
+  // Bitget credentials are verified and stored by this platform only; the workbench has no matching connection.
+  if (typeof name !== 'string' || name === 'bitget') return null;
   if ((CONNECTION_EXCHANGES as readonly string[]).includes(name)) return name as ConnectionExchange;
   return name.startsWith('aster:') && ZOD_UUID.test(name.slice(6)) ? 'aster' : null;
 }

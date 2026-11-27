@@ -23,6 +23,7 @@ interface Options {
   okxResultCurrent?: (view: ScanView) => boolean;
   gateResultCurrent?: (row: ScanRow) => boolean;
   binanceResultCurrent?: (row: ScanRow) => boolean;
+  bitgetResultCurrent?: (row: ScanRow) => boolean;
   okxDepositResultCurrent?: (row: ScanRow) => boolean;
   now?: () => number;
 }
@@ -66,11 +67,12 @@ function notifyMessage(venue: ChainArbVenue, row: ScanRow, settings: BackgroundS
     '合约地址：' + row.address, '预算 ' + settings.amount + ' USDT，扣费后价差 ' + Number(row.netBps.toPrecision(8)) + ' bp（阈值 ' + settings.thresholdBps + ' bp）',
     '模拟买入实收 ' + Number(fill.receivedQuantity.toPrecision(8)) + ' ' + row.symbol + '，' + VENUE_NAMES[venue] + ' 充值地址模拟实收 ' + Number(fill.transferQuantity.toPrecision(8))
       + ' ' + row.symbol + '，整笔价格影响 ' + Number((fill.impactBps / 100).toPrecision(6)) + '%。实际入账以交易所确认为准',
+    ...(venue === 'bitget' ? ['Bitget 入账后如需站内划转，成交按划转完成时的盘口为准。'] : []),
     '预估净收益 ' + Number(row.netUsdt.toPrecision(8)) + ' USDT，报价时间 ' + new Date(row.at).toISOString(),
     '报价有效至 ' + new Date(row.expiresAt).toISOString() + '，过期请在平台重新复核。'].join('\n');
 }
 
-export function createChainArbBackground({ store, scan, control, hooks, okxResultCurrent, gateResultCurrent, binanceResultCurrent, okxDepositResultCurrent, now = Date.now }: Options) {
+export function createChainArbBackground({ store, scan, control, hooks, okxResultCurrent, gateResultCurrent, binanceResultCurrent, bitgetResultCurrent, okxDepositResultCurrent, now = Date.now }: Options) {
   let settings = DEFAULT_BACKGROUND_SETTINGS, revision = 0, loadError: string | null = null;
   try {
     const entry = store.readState(SETTINGS_KEY);
@@ -98,7 +100,7 @@ export function createChainArbBackground({ store, scan, control, hooks, okxResul
     if (market.revision !== marketRevision) { marketRevision = market.revision; reset(); }
     return market.enabled;
   }
-  const currentProof = { gate: gateResultCurrent, binance: binanceResultCurrent, okx: okxDepositResultCurrent };
+  const currentProof = { gate: gateResultCurrent, binance: binanceResultCurrent, bitget: bitgetResultCurrent, okx: okxDepositResultCurrent };
   function hasDepositEvidence(row: ScanRow) {
     const venue = row.venue ?? 'gate';
     return isDepositVenue(venue) && isDepositRow(row) && currentProof[venue]?.(row)

@@ -13,7 +13,8 @@ import { StatePanel } from './StateViews.tsx';
 import { useLiveResource } from './use-live-resource.ts';
 import { readFailure } from './live-resource.ts';
 import { AssetTrend } from './AssetTrend.tsx';
-import { CONNECTIONS_PATH, ConnectionsView, SIDE_EXCHANGES, pendingText, type CardExchange } from './AssetConnections.tsx';
+import { CONNECTIONS_PATH, ConnectionsView, SIDE_EXCHANGES, pendingText } from './AssetConnections.tsx';
+import { CONNECTION_NAMES, type CardExchange } from './asset-connection-form.ts';
 import { startRefreshLoop } from './asset-refresh-loop.ts';
 import { IMPORT_PATH, ImportPanel } from './AssetImport.tsx';
 import { importGate } from './asset-import-gate.ts';
@@ -49,7 +50,7 @@ export type Writer = { busy: boolean; writes: number; errorOf: (...paths: string
 
 type View = 'overview' | 'history' | 'withdrawals' | 'connections';
 const VIEWS: { id: View; label: string }[] = [{ id: 'overview', label: '资产总览' }, { id: 'history', label: '历史记录' }, { id: 'withdrawals', label: '出金记录' }, { id: 'connections', label: '交易所连接' }];
-const VIEW_DESCRIPTIONS: Record<View, string> = { overview: '实时估值与手动资产，统一记录', history: '保留原表记录；每天保存最近一次更新', withdrawals: '登记出金，观察剔除提款影响后的资产变化', connections: '通过读取接口获取账户资产，连接凭据仅加密保存在服务端' };
+const VIEW_DESCRIPTIONS: Record<View, string> = { overview: '实时估值与手动资产，统一记录', history: '保留原表记录；每天保存最近一次更新', withdrawals: '登记出金，观察剔除提款影响后的资产变化', connections: '管理资产读取与充值核验连接，凭据加密保存在服务端' };
 type Filter = 'all' | 'auto' | 'manual';
 const FILTERS: { id: Filter; label: string }[] = [{ id: 'all', label: '全部资产' }, { id: 'auto', label: '自动更新' }, { id: 'manual', label: '手动维护' }];
 
@@ -268,7 +269,7 @@ function Overview({ data, history, historyError, version, example, writer, onHis
   };
   const { ledger, summary } = data, { measures, valuation } = summary;
   const now = Date.now(), fx = fxView(ledger.fxStatus, now);
-  const pending = Object.values(ledger.connections).filter(item => !item.configured).length;
+  const pending = Object.entries(ledger.connections).filter(([name, item]) => name !== 'bitget' && !item.configured).length;
   const rows = data.rows.filter(asset => filter === 'all' || (filter === 'manual' ? asset.mode === 'manual' : asset.mode !== 'manual'));
   return <>
     <section className="panel ledger-kpis" aria-label="资产汇总">
@@ -298,8 +299,9 @@ function Overview({ data, history, historyError, version, example, writer, onHis
         <section className="panel sync-panel"><div className="panel-h"><h2>数据连接</h2><ShieldCheck size={16} aria-hidden="true" /></div>
           {SIDE_EXCHANGES.map(name => {
             const connection = ledger.connections[name];
-            return <button type="button" className="connection-row" key={name} onClick={() => onConnect(name)}><div className={'exchange-mark ' + name} aria-hidden="true">{EXCHANGE_NAMES[name][0]}</div>
-              <div><strong>{EXCHANGE_NAMES[name]}</strong><small>{connection.configured ? '已连接 · ' + stamp(connection.lastSync) : pendingText(name)}{connection.error ? <span className="warn-text"> · 同步失败</span> : null}</small></div>
+            if (!connection) return null;
+            return <button type="button" className="connection-row" key={name} onClick={() => onConnect(name)}><div className={'exchange-mark ' + name} aria-hidden="true">{CONNECTION_NAMES[name][0]}</div>
+              <div><strong>{CONNECTION_NAMES[name]}</strong><small>{connection.configured ? (name === 'bitget' ? '充值核验 · ' : '已连接 · ') + stamp(connection.lastSync) : pendingText(name)}{connection.error ? <span className="warn-text"> · {name === 'bitget' ? '核验失败' : '同步失败'}</span> : null}</small></div>
               <ChevronRight size={16} aria-hidden="true" /></button>;
           })}
           <div className="connection-row"><div className="exchange-mark virtual" aria-hidden="true">V</div><div><strong>Virtual</strong><small>实时单价 · 数量手动</small></div></div>

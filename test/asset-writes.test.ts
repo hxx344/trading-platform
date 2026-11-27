@@ -174,15 +174,16 @@ test('资产写入：首次打开时导入正占着写锁，读取照常，写�
   const w = imported(t);
   w.store.close();
   const reader = createAssetStore(w.file, { now: () => NOW });
-  t.after(() => reader.close());
-  // What the import does while it replaces the ledger: hold the write lock (the service waits 1 s, then gives up).
-  const raw = new DatabaseSync(w.file);
-  raw.exec('BEGIN IMMEDIATE');
   try {
-    assert.ok((await reader.ledger()).ledger, '读取照常');
-    await assert.rejects(reader.editFx({ fx: 8 }), { name: 'AssetConflict', code: 'busy', message: LOCK_BUSY });
-  } finally { raw.exec('ROLLBACK'); raw.close(); }
-  assert.equal((await reader.editFx({ fx: 8 })).ledger!.fx, 8, '锁放开后写入照常');
+    // What the import does while it replaces the ledger: hold the write lock (the service waits 1 s, then gives up).
+    const raw = new DatabaseSync(w.file);
+    raw.exec('BEGIN IMMEDIATE');
+    try {
+      assert.ok((await reader.ledger()).ledger, '读取照常');
+      await assert.rejects(reader.editFx({ fx: 8 }), { name: 'AssetConflict', code: 'busy', message: LOCK_BUSY });
+    } finally { raw.exec('ROLLBACK'); raw.close(); }
+    assert.equal((await reader.editFx({ fx: 8 })).ledger!.fx, 8, '锁放开后写入照常');
+  } finally { reader.close(); } // Release the reopened SQLite file before fixture cleanup on Windows.
 });
 
 test('资产写入：导入替换账本后，已打开的服务读写都看到新账本', async t => {

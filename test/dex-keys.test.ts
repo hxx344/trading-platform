@@ -288,7 +288,8 @@ test('Entropy 统一账户读取与模式拒绝：unifiedAccount 从现货账本
 
   const snap = await fetchAccount(fetchImpl, signal, 'entropy', ALL);
   assert.deepEqual(calls, ['clearinghouseState', 'userAbstraction', 'spotClearinghouseState']);
-  assert.deepEqual(signalsSeen, [signal, signal, signal], '同一超时信号透传到三个请求');
+  assert.equal(signalsSeen.length, 3);
+  assert.ok(signalsSeen.every(seen => seen === signal), '同一超时信号透传到三个请求');
   assert.equal(snap.collateral, 1000.1);
   assert.equal(snap.equity, 1000.1);
   assert.equal(snap.available, 859.75);

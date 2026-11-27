@@ -73,9 +73,9 @@ function Detail({ data, view, onChanged }: { data: SymbolView; view: StateView; 
 
 function StatsPanel({ data }: { data: SymbolView }) {
   return <section className="panel" aria-label="分时段统计">
-    <div className="panel-heading"><h2>分时段统计</h2><span className="muted">所选范围内的样本 · 往返成本列为盘口成本（不含手续费） · 建议入场 = 偏离 95 分位 − 半个往返成本（不低于 5）</span></div>
+    <div className="panel-heading"><h2>分时段统计</h2><span className="muted">所选范围内的样本 · 往返买卖价差是两腿盘口的往返成本（买 A 价差 − 卖 A 价差）的中位数，不含手续费{data.fees.a !== null && data.fees.b !== null ? `（两腿往返手续费 ${plain(2 * (data.fees.a + data.fees.b))} 基点另计）` : '（手续费未知）'} · 建议入场 = 偏离 95 分位 − 半个往返买卖价差（不低于 5）</span></div>
     {data.stats.length ? <div className="vl-table"><table>
-      <thead><tr><th>时段</th><th className="num">样本</th><th className="num">中位数</th><th className="num">σ（MAD）</th><th className="num">5% – 95%</th><th className="num">往返成本</th>
+      <thead><tr><th>时段</th><th className="num">样本</th><th className="num">中位数</th><th className="num">σ（MAD）</th><th className="num">5% – 95%</th><th className="num">往返买卖价差</th>
         <th className="num">半衰期</th><th className="num">穿越 / 天</th><th className="num">机会占比</th><th className="num">偏离 95%</th><th className="num">建议入场</th></tr></thead>
       <tbody>{data.stats.map(item => <tr key={item.regime}>
         <td>{REGIME_LABELS[item.regime]}</td><td className="num">{item.samples.toLocaleString()}</td><td className="num">{bps(item.median)}</td><td className="num">{plain(item.sigma)}</td>
@@ -121,7 +121,7 @@ function ParamsPanel({ data, view, onChanged }: { data: SymbolView; view: StateV
       <label><input type="checkbox" checked={auto.on} disabled={write.busy !== null} onChange={event => setAuto(event.target.checked)} />自动配置<Badge tone={auto.on ? recommended && data.params.enabled ? 'info' : 'warn' : ''}>{auto.on ? !recommended ? '等待样本' : data.params.enabled ? '使用中' : '已选用 · 配对未启用' : '未使用'}</Badge></label>
       {recommended ? <>
         <dl>{SYMBOL_FIELDS.filter(field => AUTO_FIELDS.includes(field.key as (typeof AUTO_FIELDS)[number])).map(field => <div key={field.key}><dt>{field.label}</dt><dd>{recommended[field.key as (typeof AUTO_FIELDS)[number]]} {field.unit}</dd></div>)}</dl>
-        <p>{auto.on ? '策略按这组推荐值运行' : '当前的推荐值'}：按{auto.regime ? REGIME_LABELS[auto.regime] : ''}最近 {auto.samples.toLocaleString()} 个样本的偏离、往返成本与回归快慢，加上当前的滑点、手续费和最低预期净利算出，{age(auto.at, view.now)}更新，约每 10 分钟重算。名义金额、冷却、时段与方向仍用下面保存的值。
+        <p>{auto.on ? '策略按这组推荐值运行' : '当前的推荐值'}：按{auto.regime ? REGIME_LABELS[auto.regime] : ''}最近 {auto.samples.toLocaleString()} 个样本的偏离、往返买卖价差与回归快慢，加上当前的滑点、手续费和最低预期净利算出，{age(auto.at, view.now)}更新，约每 10 分钟重算。名义金额、冷却、时段与方向仍用下面保存的值。
           <button type="button" className="button secondary" onClick={() => set(autoFormPatch(recommended))}>填入表单</button></p>
       </> : <p className={auto.on ? 'vl-warn' : undefined}>{auto.reason ?? '暂时没有推荐值'}{auto.on ? '。有推荐值之前不开仓，已有持仓按开仓时的参数平仓。' : '。'}</p>}
     </div>

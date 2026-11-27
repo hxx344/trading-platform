@@ -133,7 +133,18 @@ export function entryProgress(row: Pick<StateRow, 'rich' | 'cheap' | 'entryBps'>
 }
 /** 方向拆成卖出与买入的场所：A 偏贵时卖 A 买 B，反之买 A 卖 B。 */
 export const directionSides = (direction: Direction, a: VenueId, b: VenueId): { sell: VenueId; buy: VenueId } => direction === 'a_rich' ? { sell: a, buy: b } : { sell: b, buy: a };
-/** 排序：缺数的行总在最后；同值按标的代码。 */
+/**
+ * 总览成本列：total 是显示的数（买卖价差 + 往返手续费；手续费未知或旧服务没给时只有买卖价差），
+ * parts 把两项分开写。买卖价差是两腿盘口的往返成本（买 A 价差 − 卖 A 价差），按一档估算时标「估算」。
+ */
+export function costBreakdown(row: Pick<StateRow, 'cost' | 'feeCost' | 'totalCost' | 'estimated'>): { total: number | null; parts: string; warn: boolean } {
+  const spread = finite(row.cost) ? `买卖价差 ${plain(row.cost)}${row.estimated ? '（估算）' : ''}` : null;
+  const fee = finite(row.feeCost) ? `手续费 ${plain(row.feeCost)}` : null;
+  const total = row.totalCost ?? row.cost;
+  if (row.feeCost === undefined) return { total, parts: spread ? `${spread} · 未计手续费` : '缺盘口', warn: false };
+  if (!fee) return { total, parts: spread ? `${spread} · 手续费未知` : '缺盘口与手续费', warn: true };
+  return { total, parts: spread ? `${spread} + ${fee}` : `缺盘口 · ${fee}`, warn: false };
+}/** 排序：缺数的行总在最后；同值按标的代码。 */
 export function sortRows(rows: readonly StateRow[], key: SortKey, descending: boolean): StateRow[] {
   const value = (row: StateRow): number | string | null => {
     switch (key) {
@@ -184,7 +195,7 @@ export const GLOBAL_FIELDS: readonly NumberField<Exclude<keyof GlobalParams, 'pa
   { key: 'lighterFeeBps', label: 'Lighter 主网手续费', min: 0, max: 100, unit: '基点', optional: true, hint: '留空按目录费率' },
   { key: 'entropyFeeBps', label: 'Entropy 手续费', min: 0, max: 100, unit: '基点', optional: true, hint: '单边每次成交；默认 0.2（往返 0.4，含返佣估算）；留空按目录原始费率' },
   { key: 'maxQuoteAgeSec', label: '报价时效上限', min: 5, max: 600, integer: true, unit: '秒', hint: '收到时较慢一腿的报价已过去的时间，超过不开仓' },
-  { key: 'minNetBps', label: '最低预期净利', min: 0, max: 500, unit: '基点', hint: '偏离 − 出场 − 半个往返成本 − 滑点与手续费，低于这个数不开仓' },
+  { key: 'minNetBps', label: '最低预期净利', min: 0, max: 500, unit: '基点', hint: '偏离 − 出场 − 半个往返买卖价差 − 滑点与手续费，低于这个数不开仓' },
   { key: 'maxOpenPositions', label: '最多持仓数', min: 1, max: 100, integer: true, unit: '笔', hint: '实盘持仓（含开仓中、平仓中）合计' },
   { key: 'maxTotalNotionalUsd', label: '名义合计上限', min: 10, max: 10_000_000, unit: '美元' },
   { key: 'dailyLossLimitUsd', label: '当日亏损上限', min: 1, max: 10_000_000, unit: '美元', hint: '按 UTC 日计实盘已平仓净盈亏' },

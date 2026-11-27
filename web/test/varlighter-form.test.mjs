@@ -7,7 +7,7 @@ import { pairKey, parsePairKey } from '../../src/varlighter/model.ts';
 import { readCustomPair } from '../../src/varlighter/engine.ts';
 import {
   EMPTY_PAIR_FORM, backtestBody, bps, bytesPerDay, chartRange, chartRows, comboLabel, comboShort, customPairKey, customPairRequest, directionLabel, directionShort, fundingAnnual, globalForm, globalRequest,
-  SIMPLE_SORT_KEYS, directionSides, entryProgress, matchesCombo, pairLabel, readOverviewMode, rebateAudit, settingsBody, signal, sortRows, symbolForm, symbolRequest, toggleConfirmed, usd, varLighterHref, AUTO_FIELDS, autoBody, autoFormPatch, quickEnableBody,
+  SIMPLE_SORT_KEYS, directionSides, entryProgress, matchesCombo, pairLabel, readOverviewMode, rebateAudit, settingsBody, signal, sortRows, costBreakdown, symbolForm, symbolRequest, toggleConfirmed, usd, varLighterHref, AUTO_FIELDS, autoBody, autoFormPatch, quickEnableBody,
   VARLIGHTER_TABS, reasonLabel, ACCOUNT_VENUE_FILTERS, accountActivityFoot, filterAccountPositions, filterAccountTrades, filterAccountFunding, selectedEquitySeries, selectedVenuePnlCurve, formatCurrencyAmount, signedCurrencyAmount, formatRatePct, marginModeLabel, tradeDirLabel, accountHealthBadge,
 } from '../src/varlighter/varlighter-form.ts';
 import { parseRoute } from '../src/route-parse.ts';
@@ -269,6 +269,14 @@ test('accounts tab helpers: route, filters, series selection and formatting', ()
   assert.equal(accountActivityFoot({ totals: { configured: 0, tradeCount30d: 0, fundingUsd30d: null, fundingVenues: [], realizedPnlUsd30d: null, realizedVenues: [], liveNetUsd: 0 }, venues: [] }, 'all'), '还没有配置实盘场所账户');
 });
 
+test('cost column separates the bid-ask spread from the round-trip fees', () => {
+  assert.deepEqual(costBreakdown({ cost: 6, feeCost: 0.4, totalCost: 6.4, estimated: false }), { total: 6.4, parts: '买卖价差 6.0 + 手续费 0.4', warn: false });
+  assert.deepEqual(costBreakdown({ cost: 6, feeCost: 0, totalCost: 6, estimated: true }), { total: 6, parts: '买卖价差 6.0（估算） + 手续费 0.0', warn: false }, '手续费为 0 也写出来');
+  assert.deepEqual(costBreakdown({ cost: 6, feeCost: null, totalCost: null, estimated: false }), { total: 6, parts: '买卖价差 6.0 · 手续费未知', warn: true });
+  assert.deepEqual(costBreakdown({ cost: null, feeCost: 0.4, totalCost: null, estimated: null }), { total: null, parts: '缺盘口 · 手续费 0.4', warn: false });
+  assert.deepEqual(costBreakdown({ cost: null, feeCost: null, totalCost: null, estimated: null }), { total: null, parts: '缺盘口与手续费', warn: true });
+  assert.deepEqual(costBreakdown({ cost: 6, estimated: false }), { total: 6, parts: '买卖价差 6.0 · 未计手续费', warn: false }, '旧服务没有手续费字段');
+});
 test('cost sorting prefers totalCost and rebateAudit calculates real fee rates', () => {
   const items = [
     row('A', { cost: 8, totalCost: 8.4 }),

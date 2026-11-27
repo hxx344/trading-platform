@@ -37,6 +37,13 @@ export const amount = (value: bigint): number => Number(fromUnits(round(value)))
 /** The same rounding as a canonical decimal string, for storage. */
 export const amountText = (value: bigint): string => fromUnits(round(value));
 
+/** Distinguishes closed-position rows by timestamps plus order/fill attributes while collapsing exact duplicates. */
+export const closureRowIdentity = (row: Row): string => JSON.stringify([
+  row.symbol, row.side, String(row.openTime), String(row.closeTime),
+  ...(row.orderId !== undefined ? [String(row.orderId)] : []),
+  String(row.qty ?? ''), String(row.avgEntryPrice ?? ''), String(row.totalPnl ?? ''),
+]);
+
 export const settlementCurrency = (symbol: string): 'USDT' | 'USDC' => symbol.endsWith('-USDT') ? 'USDT' : 'USDC';
 
 /** 08:00 UTC on the expiry day in the symbol; null when the symbol does not name one. */
@@ -110,6 +117,7 @@ export function buildPerformance({ groups, executions, journal, positions, sampl
   for (const [id, group] of Object.entries(groups)) if (group.type === 'open') buckets.set(id, bucket(id, group));
 
   const ordered = [...new Map(executions.map(item => [item.execId, item])).values()].sort((a, b) => a.execTime - b.execTime || (a.execId < b.execId ? -1 : a.execId > b.execId ? 1 : 0));
+  const closeExecByGroup = new Map<string, Map<string, number>>();
   let unassigned = 0;
   for (const execution of ordered) {
     const groupId = groupOfLink(execution.orderLinkId) ?? execution.taskId;
@@ -140,6 +148,10 @@ export function buildPerformance({ groups, executions, journal, positions, sampl
     }
     const opening = group?.openingGroup ?? execution.openingGroup;
     if (!opening) { unassigned += 1; continue; } // A matching symbol alone cannot prove a manual close belongs here.
+    const closeLeg = legKey(execution.symbol, execution.side === 'Buy' ? 'Sell' : 'Buy');
+    const perLeg = closeExecByGroup.get(opening) ?? new Map<string, number>();
+    perLeg.set(closeLeg, Math.max(perLeg.get(closeLeg) ?? 0, execution.execTime));
+    closeExecByGroup.set(opening, perLeg);
     const target = buckets.get(opening);
     const lots = target ? target.lots.filter(lot => lot.execution.symbol === execution.symbol && lot.execution.side !== execution.side && lot.remaining > EPS) : [];
     if (!lots.length) {
@@ -181,9 +193,8 @@ export function buildPerformance({ groups, executions, journal, positions, sampl
     const key = legKey(position.symbol, position.side);
     positionsByLeg.set(key, [...positionsByLeg.get(key) ?? [], position]);
   }
-  const identityOf = (row: Row): string => JSON.stringify([row.symbol, row.side, String(row.openTime), String(row.closeTime)]);
   for (const [id, group] of Object.entries(groups)) for (const rows of Object.values(group.closureEvidence ?? {})) for (const row of rows) {
-    const identity = identityOf(row);
+    const identity = closureRowIdentity(row);
     evidenceOwners.set(identity, (evidenceOwners.get(identity) ?? new Set()).add(id));
   }
 
@@ -221,21 +232,25 @@ export function buildPerformance({ groups, executions, journal, positions, sampl
       try {
         const CLOCK_SKEW_SLACK_MS = 60_000;
         const minOpenedAt = group ? Math.max(0, group.acceptedAt - CLOCK_SKEW_SLACK_MS) : 0;
+        const priorClosedIds = group ? Object.entries(groups)
+          .filter(([otherId, other]) => otherId !== id && other.strategyStatus === 'closed' && other.closedAt != null && other.closedAt <= group.acceptedAt)
+          .map(([otherId]) => otherId) : [];
         let net = 0n, openingFee = 0n, closingFee = 0n, delivery = 0n, premium = 0n;
         const opened: number[] = [], closedTimes: number[] = [], currencies = new Set<string>(), seen = new Set<string>();
         let expiryVerified = true, evidenceEarly = false;
         for (const [key, qty] of targets) {
           if (qty <= EPS) continue;
           const [symbol, side] = splitLeg(key);
+          const priorCloseExec = priorClosedIds.reduce((max, otherId) => Math.max(max, closeExecByGroup.get(otherId)?.get(key) ?? 0), 0);
           let total = 0n;
           for (const row of evidence[key] ?? []) {
-            const identity = identityOf(row);
+            const identity = closureRowIdentity(row);
             if (seen.has(identity)) continue;
             seen.add(identity);
             const owners = evidenceOwners.get(identity);
             if (row.symbol !== symbol || row.side !== side || owners?.size !== 1 || !owners.has(id)) throw new Error('Ambiguous closure evidence');
             const openedAt = Number(row.openTime), closedAt = Number(row.closeTime);
-            if (!Number.isSafeInteger(openedAt) || !Number.isSafeInteger(closedAt) || closedAt < openedAt || (group && openedAt < minOpenedAt)) throw new Error('Invalid closure times');
+            if (!Number.isSafeInteger(openedAt) || !Number.isSafeInteger(closedAt) || closedAt < openedAt || (group && openedAt < minOpenedAt) || (priorCloseExec > 0 && openedAt <= priorCloseExec)) throw new Error('Invalid closure times');
             const expiry = expiryFor(symbol);
             evidenceEarly ||= (expiry !== null && closedAt < expiry) || exact(row.totalCloseFee) !== 0n;
             expiryVerified &&= expiry !== null && closedAt >= expiry;

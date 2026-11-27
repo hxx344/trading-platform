@@ -85,6 +85,8 @@ export function settingsRequest(form: SettingsForm): { ok: true; body: { setting
 }
 export const settingsChanged = (form: SettingsForm, settings: Settings): boolean => { const saved = settingsForm(settings); return SETTING_FIELDS.some(field => form[field.key].trim() !== saved[field.key]); };
 
+const settingsKey = (settings: Settings): string => JSON.stringify(SETTING_FIELDS.map(field => settings[field.key]));
+
 export interface SettingsSyncState {
   form: SettingsForm;
   baseline: Settings;
@@ -94,15 +96,16 @@ export interface SettingsSyncState {
 }
 
 export function initSettingsSync(server: Settings): SettingsSyncState {
-  return { form: settingsForm(server), baseline: server, lastServerJson: JSON.stringify(server), pendingSavedJson: null, touched: false };
+  return { form: settingsForm(server), baseline: server, lastServerJson: settingsKey(server), pendingSavedJson: null, touched: false };
 }
 
 export function editSettingsSync(state: SettingsSyncState, key: keyof Settings, value: string): SettingsSyncState {
-  return { ...state, touched: true, form: { ...state.form, [key]: value } };
+  const form = { ...state.form, [key]: value };
+  return { ...state, form, touched: settingsChanged(form, state.baseline) };
 }
 
 export function commitSettingsSave(state: SettingsSyncState, submitted: Settings): SettingsSyncState {
-  const savedJson = JSON.stringify(submitted);
+  const savedJson = settingsKey(submitted);
   return {
     form: settingsForm(submitted),
     baseline: submitted,
@@ -113,14 +116,16 @@ export function commitSettingsSave(state: SettingsSyncState, submitted: Settings
 }
 
 export function receiveServerSettings(state: SettingsSyncState, server: Settings): SettingsSyncState {
-  const serverJson = JSON.stringify(server);
-  if (serverJson === state.lastServerJson) return state;
+  const serverJson = settingsKey(server);
   if (state.pendingSavedJson !== null && serverJson === state.pendingSavedJson) {
-    return { ...state, baseline: server, lastServerJson: serverJson, pendingSavedJson: null };
+    return { ...state, baseline: server, lastServerJson: serverJson, pendingSavedJson: null, touched: settingsChanged(state.form, server) };
   }
   if (state.touched) {
+    if (serverJson === state.lastServerJson) return state;
     return { ...state, lastServerJson: serverJson, pendingSavedJson: null };
   }
+  if (state.pendingSavedJson !== null && serverJson === state.lastServerJson) return state;
+  if (serverJson === state.lastServerJson && settingsKey(state.baseline) === serverJson) return state;
   return { form: settingsForm(server), baseline: server, lastServerJson: serverJson, pendingSavedJson: null, touched: false };
 }
 
@@ -128,7 +133,7 @@ export function revertSettingsSync(state: SettingsSyncState, server: Settings): 
   if (state.pendingSavedJson !== null) {
     return { ...state, form: settingsForm(state.baseline), touched: false };
   }
-  return { form: settingsForm(server), baseline: server, lastServerJson: JSON.stringify(server), pendingSavedJson: null, touched: false };
+  return { form: settingsForm(server), baseline: server, lastServerJson: settingsKey(server), pendingSavedJson: null, touched: false };
 }
 
 /** 现在能不能开始实盘；不能时给出原因（服务端还会再核对一遍）。 */

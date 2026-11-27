@@ -191,7 +191,7 @@ export function BalancePanel({ balance, stale, receivedAt, onSaved, onAccepted }
       confirmTitle: '确认名义平衡下单',
       dialog, ids: ids.current, isBusy: () => busyRef.current, setBusy: setConfirmBusy, currentPreviewId: previewIdOf,
       send: requestId => api<OilConfirmResult>('/api/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }),
-      formatAccepted: result => acceptedJobText(result, label(JOB_STATUS, result.job.status), '下方'),
+      formatAccepted: result => acceptedJobText(result, label(JOB_STATUS, result?.job?.status ?? ''), '下方'),
       onAccepted: result => onAccepted(result.job),
       clearPreview: () => { version.current++; setPreview(null); },
       setUnanswered, setMessage,

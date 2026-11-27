@@ -169,4 +169,35 @@ test('设置同步状态机：编辑中服务端变更、保存后刷新在途/�
   const idle = receiveServerSettings(initSettingsSync(s0), s1);
   assert.equal(idle.form.minNetUsd, '2.5');
   assert.equal(settingsChanged(idle.form, idle.baseline), false);
+
+  // 5. 模拟 settingsRequest() (SETTING_FIELDS 键序) 与 parseSettings() (RANGES 键序) 键序差异，及 '30' 改 '30.0' 同值保存。
+  const reqS0 = settingsRequest(settingsForm(s0));
+  assert.ok(reqS0.ok);
+  const parsedS0 = parseSettings(reqS0.body.settings);
+  assert.notEqual(JSON.stringify(reqS0.body.settings), JSON.stringify(parsedS0), '验证前后端对象键序确实不同');
+  let reordered = initSettingsSync(parsedS0);
+  reordered = editSettingsSync(reordered, 'tipShare', '30.0');
+  reordered = commitSettingsSave(reordered, reqS0.body.settings);
+  assert.equal(reordered.pendingSavedJson, null, '键序不同但数值未变时不应残留 pendingSavedJson');
+  reordered = editSettingsSync(reordered, 'minNetUsd', '5');
+  const reqS2 = settingsRequest(reordered.form);
+  assert.ok(reqS2.ok);
+  reordered = commitSettingsSave(reordered, reqS2.body.settings);
+  reordered = editSettingsSync(reordered, 'minNetUsd', '6');
+  reordered = receiveServerSettings(reordered, parseSettings(reqS2.body.settings));
+  assert.equal(reordered.pendingSavedJson, null, '后端返回 RANGES 键序也能清零 pendingSavedJson');
+  assert.equal(reordered.baseline.minNetUsd, 5);
+  assert.equal(reordered.form.minNetUsd, '6');
+
+  // 6. 手动把输入改回 baseline 后 touched 解除，期间到达的服务端更新立即同步而不锁死旧值。
+  let manual = initSettingsSync(s0);
+  manual = editSettingsSync(manual, 'minNetUsd', '5');
+  assert.equal(manual.touched, true);
+  manual = receiveServerSettings(manual, { ...s0, gasMultiple: 4 });
+  assert.equal(manual.form.gasMultiple, String(s0.gasMultiple));
+  manual = editSettingsSync(manual, 'minNetUsd', String(s0.minNetUsd));
+  assert.equal(manual.touched, false);
+  manual = receiveServerSettings(manual, { ...s0, gasMultiple: 4 });
+  assert.equal(manual.form.gasMultiple, '4');
+  assert.equal(manual.baseline.gasMultiple, 4);
 });

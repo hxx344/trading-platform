@@ -30,7 +30,7 @@ export const acceptedJobText = (result: { duplicate?: boolean; job: { id: string
 };
 
 export const acceptedFourLegText = (result: { duplicate?: boolean; group: string; jobs: readonly { id: string }[] }): string => {
-  if (!result || typeof result.group !== 'string' || !Array.isArray(result.jobs) || !result.jobs.every(job => typeof job?.id === 'string')) {
+  if (!result || typeof result.group !== 'string' || !Array.isArray(result.jobs) || result.jobs.length === 0 || !result.jobs.every(job => typeof job?.id === 'string')) {
     throw new Error('确认响应缺少四腿任务编号');
   }
   return `${result.duplicate ? '该请求已受理过' : '已受理'}：四腿组 ${result.group.slice(0, 8)}，任务 ${result.jobs.map(job => job.id.slice(0, 8)).join('、')}，进度见上方「成交进度与结果」`;

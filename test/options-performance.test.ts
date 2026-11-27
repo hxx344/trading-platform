@@ -234,3 +234,14 @@ test('收益：抽稀保留首尾、结束点、缺口两侧与每段最高最�
   // Short series pass through whole, still marking the gap.
   assert.deepEqual(thinPoints([{ time: 0, pnl: 1 }, { time: 60_000, pnl: 2 }, { time: 600_000, pnl: 3 }], 100, 180_000, point => point.pnl).map(point => point.gapBefore ?? false), [false, false, true]);
 });
+
+test('收益：同毫秒分批平仓行带不同 orderId 或数量时不误去重', () => {
+  const part1 = { symbol: SYMBOL, side: 'Sell', qty: '0.4', orderId: 'o-1', openTime: String(NOW), closeTime: String(NOW + 5 * DAY + 8 * HOUR), avgEntryPrice: '100', totalPnl: '38', totalOpenFee: '0.4', totalCloseFee: '0', deliveryFee: '0.8' };
+  const part2 = { symbol: SYMBOL, side: 'Sell', qty: '0.6', orderId: 'o-2', openTime: String(NOW), closeTime: String(NOW + 5 * DAY + 8 * HOUR), avgEntryPrice: '100', totalPnl: '59', totalOpenFee: '0.6', totalCloseFee: '0', deliveryFee: '1.2' };
+  const groups = { a: group({ strategyStatus: 'closed', legs: { [SYMBOL]: { side: 'Sell', qty: '1' } }, closureEvidence: { [`${SYMBOL}|Sell`]: [part1, part2] } }) };
+  const value = report(groups, []);
+  assert.equal(value.groups[0]!.netPnl, 97);
+  assert.equal(value.groups[0]!.deliveryFee, 2);
+  assert.deepEqual(value.groups[0]!.issues, []);
+  assert.equal(value.series[0]!.totalPnl, 97);
+});

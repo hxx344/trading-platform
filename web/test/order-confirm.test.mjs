@@ -190,12 +190,42 @@ test('executeOrderConfirm：500/401/403与空对象响应保留 requestId 与预
   }));
   assert.deepEqual(seen409, ['req-1', 'req-2']);
 
-  // Four-leg accepted formatter + malformed input checks.
+  // Four-leg accepted formatter + malformed input checks (including empty jobs array).
   assert.match(acceptedFourLegText({ group: 'group12345', jobs: [{ id: 'aaaa1111' }, { id: 'bbbb2222' }] }), /已受理：四腿组 group123，任务 aaaa1111、bbbb2222/);
   assert.match(acceptedFourLegText({ duplicate: true, group: 'group12345', jobs: [{ id: 'aaaa1111' }] }), /该请求已受理过：四腿组 group123/);
   assert.throws(() => acceptedJobText({}, '已受理'), /确认响应缺少任务编号/);
   assert.throws(() => acceptedFourLegText({}), /确认响应缺少四腿任务编号/);
+  assert.throws(() => acceptedFourLegText({ group: 'g1', jobs: [] }), /确认响应缺少四腿任务编号/);
   assert.throws(() => acceptedFourLegText({ group: 'g1', jobs: [{}] }), /确认响应缺少四腿任务编号/);
+
+  // Real caller pattern `result?.job?.status ?? ''` must reach acceptedJobText without TypeError and preserve requestId/preview.
+  for (const malformed of [{}, { job: null }]) {
+    const callerState = setup();
+    const seenIds = [];
+    await executeOrderConfirm(callerState.options({
+      send: async requestId => { seenIds.push(requestId); return malformed; },
+      formatAccepted: result => acceptedJobText(result, result?.job?.status ?? ''),
+    }));
+    assert.equal(callerState.state().currentId, 'prev-1');
+    assert.equal(callerState.state().unanswered, 'prev-1');
+    assert.match(callerState.state().message.text, /^确认响应缺少任务编号（结果未知/);
+    await executeOrderConfirm(callerState.options({
+      send: async requestId => { seenIds.push(requestId); return { duplicate: true, job: { id: 'ok88888888', status: 'accepted' } }; },
+      formatAccepted: result => acceptedJobText(result, result?.job?.status ?? ''),
+    }));
+    assert.deepEqual(seenIds, ['req-1', 'req-1']);
+    assert.equal(callerState.state().unanswered, null);
+  }
+
+  // Empty four-leg jobs array in executeOrderConfirm also preserves requestId and preview.
+  const emptyFour = setup();
+  await executeOrderConfirm(emptyFour.options({
+    send: async () => ({ group: 'g1', jobs: [] }),
+    formatAccepted: acceptedFourLegText,
+  }));
+  assert.equal(emptyFour.state().currentId, 'prev-1');
+  assert.equal(emptyFour.state().unanswered, 'prev-1');
+  assert.match(emptyFour.state().message.text, /^确认响应缺少四腿任务编号（结果未知/);
 
   // Unmounted on catch branch resets busy without touching message or unanswered.
   const deadErr = setup();

@@ -237,7 +237,7 @@ function SettingsTab({ view, write, onChanged }: { view: MevStateView; write: Wr
   // 没在编辑且服务端值变化时再跟随（保存后刷新还在途或失败时以乐观基线为准，不拿旧服务端值盖回刚提交的新值）。
   useEffect(() => {
     setSync(current => receiveServerSettings(current, view.settings));
-  }, [view.settings]);
+  }, [view.settings, sync.touched]);
   const dirty = settingsChanged(sync.form, sync.baseline);
   const save = () => {
     const request = settingsRequest(sync.form);

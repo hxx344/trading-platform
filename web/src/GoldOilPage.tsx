@@ -199,7 +199,7 @@ function OrderForm({ state, onAccepted }: { state: GoldOilState; onAccepted: (jo
       confirmTitle: '确认实盘执行',
       dialog, ids: ids.current, isBusy: () => busyRef.current, setBusy: setConfirmBusy, currentPreviewId: previewIdOf,
       send: requestId => api<OilConfirmResult>('/api/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }),
-      formatAccepted: result => acceptedJobText(result, label(JOB_STATUS, result.job.status)),
+      formatAccepted: result => acceptedJobText(result, label(JOB_STATUS, result?.job?.status ?? '')),
       onAccepted: result => onAccepted(result.job),
       clearPreview: () => setPreview(null), setUnanswered, setMessage,
     });

@@ -11,7 +11,7 @@ import { parseExecution, parsePositions, pmMetrics, readAccountHealth, summarize
 import type { OptionsClient, Row } from './client.ts';
 import { QUOTE_STALE_MS, isSunday, type ChainSnapshot, type OptionMarket, type OptionRow, type OptionType } from './market.ts';
 import { followOrder, iocOrder, reconcileOrder, roundToTick, type OrderOutcome, type OrderStatus } from './orders.ts';
-import { amountText, buildPerformance, exact, thinPoints, type PerformanceInput, type Sample } from './performance.ts';
+import { amountText, buildPerformance, closureRowIdentity, exact, thinPoints, type PerformanceInput, type Sample } from './performance.ts';
 import { QUOTE_MIN_LEFT_MS, RFQ_STATUS_NAMES, chainFor, counterpartiesFrom, filledOrders, isTerminal, observe, parseQuotes, parseRfqRow, quoteProblem, quoteView, rfqFinished, sortQuotes, strategyTypeFor, validRfq, type RfqObservation, type RfqQuote, type RfqRecord } from './rfq.ts';
 import type { OptionsStore } from './store.ts';
 import { M50_MIN_MS, StrategyError, buildStrategy, legCount, marginBound, maximumLoss, reserveShortMargin, trendSignal, validateStructure, type Estimates, type MarginContext, type Preview, type RiskLeg, type Side, type StrategyMode, type TrendSignal } from './strategy.ts';
@@ -521,11 +521,56 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     const CLOCK_SKEW_SLACK_MS = 60_000;
     const since = Math.max(0, group.acceptedAt - CLOCK_SKEW_SLACK_MS), end = now(), upper = end + CLOCK_SKEW_SLACK_MS;
     if (!(end - group.acceptedAt >= -CLOCK_SKEW_SLACK_MS && end - group.acceptedAt <= HISTORY_LIMIT_MS)) throw new Error('开仓时间超出可核对的平仓历史范围（180 天）');
-    const rowIdentity = (row: Row): string => JSON.stringify([row.symbol, row.side, String(row.openTime), String(row.closeTime)]);
     const claimed = new Set<string>();
     for (const task of Object.values(state.tasks)) {
       if (task.id === groupId) continue;
-      for (const rows of Object.values(task.closureEvidence ?? {})) for (const row of rows) claimed.add(rowIdentity(row));
+      for (const rows of Object.values(task.closureEvidence ?? {})) for (const row of rows) claimed.add(closureRowIdentity(row));
+    }
+    const priorClosedIds = new Set(Object.values(state.tasks)
+      .filter(task => task.id !== groupId && task.type === 'open' && task.strategyStatus === 'closed' && task.closedAt !== null && task.closedAt <= group.acceptedAt)
+      .map(task => task.id));
+    const priorCloseTasks = Object.values(state.tasks).filter(ct => ct.type === 'close' && ct.openingGroup !== null && priorClosedIds.has(ct.openingGroup));
+    const closeLinks = new Map<string, Task>();
+    for (const ct of priorCloseTasks) for (const link of linksOf(ct)) closeLinks.set(link, ct);
+    const validCloseFill = (exec: ExecutionRecord) =>
+      (exec.execType === 'Trade' || exec.execType === 'BlockTrade')
+      && (!state.journal[exec.orderLinkId] || matchesJournal(exec, state.journal[exec.orderLinkId]!));
+    const closeFillSum = (ctId: string, link: string, symbol: string): bigint => [...ledger.values()]
+      .filter(exec => validCloseFill(exec) && (exec.taskId === ctId || exec.orderLinkId === link) && exec.symbol === symbol)
+      .reduce((sum, exec) => sum + exact(String(exec.execQty)), 0n);
+    const buildPriorCloseExec = (): Map<string, number> => {
+      const map = new Map<string, number>();
+      for (const exec of ledger.values()) {
+        if (!validCloseFill(exec)) continue;
+        const entryTaskId = state.journal[exec.orderLinkId]?.taskId;
+        const ct = (exec.taskId ? state.tasks[exec.taskId] : undefined) ?? (entryTaskId ? state.tasks[entryTaskId] : undefined) ?? closeLinks.get(exec.orderLinkId);
+        if (!ct || ct.type !== 'close' || !ct.openingGroup || !priorClosedIds.has(ct.openingGroup)) continue;
+        const leg = `${exec.symbol}|${opposite(exec.side)}`;
+        map.set(leg, Math.max(map.get(leg) ?? 0, exec.execTime));
+      }
+      return map;
+    };
+    let priorCloseExecByLeg = buildPriorCloseExec();
+    const recentKeys = new Set(absent.map(([key]) => key));
+    const missingCloseLinks: string[] = [];
+    for (const ct of priorCloseTasks) {
+      const opening = state.tasks[ct.openingGroup!];
+      if (!opening || opening.closeReason !== 'close_task_completed' || (opening.closedAt ?? 0) < group.acceptedAt - 2 * CLOCK_SKEW_SLACK_MS) continue;
+      for (const link of linksOf(ct)) {
+        const entry = state.journal[link];
+        if (!entry || cmp(entry.filledQty, '0') <= 0 || !recentKeys.has(`${entry.symbol}|${opposite(entry.side)}`)) continue;
+        if (closeFillSum(ct.id, link, entry.symbol) < exact(entry.filledQty)) missingCloseLinks.push(link);
+      }
+    }
+    if (missingCloseLinks.length) {
+      const failures = await loadExecutions(missingCloseLinks);
+      priorCloseExecByLeg = buildPriorCloseExec();
+      if (failures > 0 || missingCloseLinks.some(link => {
+        const entry = state.journal[link]!;
+        return closeFillSum(entry.taskId, link, entry.symbol) < exact(entry.filledQty);
+      })) {
+        throw new Error('前一组平仓任务的成交明细尚未补齐，暂不能按平仓历史核对');
+      }
     }
     const signal = AbortSignal.timeout(RETIRE_BUDGET_MS);
     const evidence = new Map<string, Row[]>();
@@ -533,16 +578,17 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
       const [symbol, side] = [key.slice(0, key.lastIndexOf('|')), key.slice(key.lastIndexOf('|') + 1)];
       const opened = Object.values(state.journal).filter(entry => entry.taskId === groupId && entry.symbol === symbol && entry.side === side && !entry.reduceOnly).reduce((sum, entry) => add(sum, entry.filledQty), '0');
       const required = Math.max(Number(qty), Number(opened));
+      const priorCloseExec = priorCloseExecByLeg.get(key) ?? 0;
       const seen = new Set<string>(), matched: Row[] = [];
       let total = 0;
       for (const row of await client.closedPositions(symbol, since, upper, signal)) {
         if (row.symbol !== symbol || row.side !== side) continue;
         const openTime = Number(row.openTime), closeTime = Number(row.closeTime), amount = Number(row.qty);
         if (![openTime, closeTime, amount].every(Number.isFinite) || amount <= 0) throw new Error('平仓历史的数量或时间无效');
-        const identity = rowIdentity(row);
-        if (claimed.has(identity) || seen.has(identity) || !(since <= openTime && openTime <= closeTime && closeTime <= upper)) continue;
+        const identity = closureRowIdentity(row);
+        if (claimed.has(identity) || seen.has(identity) || !(since <= openTime && openTime <= closeTime && closeTime <= upper) || (priorCloseExec > 0 && openTime <= priorCloseExec)) continue;
         seen.add(identity);
-        matched.push({ symbol, side, qty: row.qty, openTime: row.openTime, closeTime: row.closeTime, ...Object.fromEntries(EVIDENCE_AMOUNTS.filter(key => row[key] !== undefined).map(key => [key, row[key]])) });
+        matched.push({ symbol, side, qty: row.qty, openTime: row.openTime, closeTime: row.closeTime, ...(row.orderId !== undefined ? { orderId: row.orderId } : {}), ...Object.fromEntries(EVIDENCE_AMOUNTS.filter(key => row[key] !== undefined).map(key => [key, row[key]])) });
         total += amount;
       }
       if (total + EPSILON >= required) evidence.set(key, matched);

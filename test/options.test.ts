@@ -1501,3 +1501,72 @@ test('期权 #12：存在±25秒时钟偏移时，退役与收益核算按容限
     assert.deepEqual([rowB.status, rowB.eligible, rowB.issues], ['closed', true, []]);
   } finally { s.dispose(); }
 });
+
+test('期权 #12b：前一组经 close 任务平仓且 60 秒内开同腿新组时，不误吞前组平仓历史并 fail-closed 等明细补齐', async () => {
+  for (const skewMs of [-25_000, 25_000]) {
+    const s = setup();
+    try {
+      const first = await open(s);
+      await finished(s, first.started.taskId);
+      await until(() => s.engine.state().executions.length === 4);
+
+      // Fail execution fetches during Group A's close task (40s after open) to test fail-closed + backfill recovery.
+      s.fake.failExecutions = true;
+      s.hooks.skewMs += 40_000;
+      const closePlan = await s.engine.createPlan({ operation: 'close' });
+      const closeTask = await s.engine.startTask({ planId: closePlan.planId, requestId: `req-close-${skewMs}`, confirmLive: true });
+      await finished(s, closeTask.taskId);
+      const taskA = s.engine.state().tasks[first.started.taskId]!;
+      assert.equal(taskA.strategyStatus, 'closed');
+      assert.equal(taskA.closeReason, 'close_task_completed');
+      assert.deepEqual(taskA.closureEvidence, {});
+
+      // Shift Group A's close fills and closed-position rows to simulate exchange clock skew relative to local now().
+      for (const row of s.fake.executions) if (String(row.orderLinkId).startsWith('tpo-close-')) row.execTime = String(Number(row.execTime) + skewMs);
+      for (const row of s.fake.closed) {
+        row.openTime = String(Number(row.openTime) + skewMs);
+        row.closeTime = String(Number(row.closeTime) + skewMs);
+      }
+
+      // Group B opens 2s later on identical symbols/sides.
+      s.hooks.skewMs += 2_000;
+      const second = await open(s);
+      await finished(s, second.started.taskId);
+      await until(() => s.fake.executions.filter(row => String(row.orderLinkId).startsWith(`tpo-${second.started.taskId}-`)).length === 0 || s.engine.state().tasks[second.started.taskId]!.status === 'completed');
+
+      s.hooks.skewMs += EXPIRY - s.now() + 30_000;
+      const acceptedB = s.engine.state().tasks[second.started.taskId]!.acceptedAt;
+      s.fake.positions.clear();
+
+      // Step 1: Close fills for Group A are still unreachable -> retireClosedPositions fails closed, never swallows A's rows.
+      await s.engine.reconcileOnce();
+      assert.equal(s.engine.state().tasks[second.started.taskId]!.strategyStatus, 'open');
+      assert.match(String(s.engine.stateView().reconciliation.error), /成交明细/);
+
+      // Step 2: Restoring execution reads backfills A's close fills, excludes A's closed rows, and still waits for B's own rows.
+      s.fake.failExecutions = false;
+      await s.engine.reconcileOnce();
+      assert.equal(s.engine.state().tasks[second.started.taskId]!.strategyStatus, 'open');
+      assert.match(String(s.engine.stateView().reconciliation.error), /平仓历史/);
+
+      // Step 3: Push B's own expiry closed rows (skewed with exchange clock) -> B retires cleanly with no ambiguity or mismatch.
+      for (const leg of Object.values(s.engine.state().tasks[second.started.taskId]!.legs)) {
+        s.fake.closed.push({
+          symbol: leg.symbol, side: leg.side, qty: leg.qty,
+          openTime: String(acceptedB + skewMs + 1), closeTime: String(s.now() + skewMs),
+          avgEntryPrice: '100', totalPnl: leg.side === 'Sell' ? '4' : '-1', totalOpenFee: '0.2', totalCloseFee: '0', deliveryFee: '0',
+        });
+      }
+      await s.engine.reconcileOnce();
+      assert.equal(s.engine.state().tasks[second.started.taskId]!.strategyStatus, 'closed');
+      assert.equal(s.engine.stateView().reconciliation.error, null);
+
+      await s.engine.performanceTick();
+      const groups = performance(s.engine).groups;
+      const rowA = groups.find(row => row.id === first.started.taskId)!;
+      const rowB = groups.find(row => row.id === second.started.taskId)!;
+      assert.deepEqual([rowA.status, rowA.closureKind, rowA.issues], ['closed', 'early', []]);
+      assert.deepEqual([rowB.status, rowB.closureKind, rowB.eligible, rowB.issues], ['closed', 'expiry', true, []]);
+    } finally { s.dispose(); }
+  }
+});

@@ -43,6 +43,8 @@ export const timeTick = (span: number) => (time: number): string => {
   return `${date.getMonth() + 1}/${date.getDate()}`;
 };
 export const stampText = (time: number) => new Date(time).toLocaleString([], { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+/** 成交时间精确到毫秒，例如 11/27 23:21:05.123。 */
+export const stampMsText = (time: number) => new Date(time).toLocaleString([], { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3 });
 
 const SPREAD_LAYERS: PlotLayer[] = [
   { kind: 'area', key: 'upper', lower: 'lower', fill: 'var(--accent)', opacity: 0.08 },

@@ -7,7 +7,7 @@ import { api } from '../api.ts';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { useLiveResource } from '../use-live-resource.ts';
 import type { AccountsRefreshResult, AccountsView, VenueAccountView } from '../../../src/varlighter/views.ts';
-import { Badge, EquityLineChart, Metric, stampText, useWrite } from './parts.tsx';
+import { Badge, EquityLineChart, Metric, stampMsText, stampText, useWrite } from './parts.tsx';
 import {
   ACCOUNT_VENUE_FILTERS, VARLIGHTER_BASE, accountActivityFoot, accountHealthBadge, accountPnlTone, age, directionLabel, duration, filterAccountFunding, filterAccountPositions,
   filterAccountTrades, formatCurrencyAmount, formatRatePct, marginModeLabel, pairLabel, percent, plain, price, selectedEquitySeries, selectedVenuePnlCurve,
@@ -259,7 +259,7 @@ export function VarLighterAccounts({ onExpired }: { onExpired: () => void }) {
           <tbody>{trades.map(trade => {
             const currency = data.venues.find(item => item.venue === trade.venue)?.collateralAsset ?? 'USDC';
             return <tr key={trade.id}>
-              <td>{stampText(trade.at)}</td>
+              <td>{stampMsText(trade.at)}</td>
               <td><span className="vl-symbol">{trade.symbol}</span><small>{venueShort(trade.venue)}</small></td>
               <td><Badge tone={trade.side === 'buy' ? 'ok' : 'bad'}>{tradeDirLabel(trade)}</Badge>{trade.role ? <Badge>{trade.role === 'taker' ? 'Taker' : 'Maker'}</Badge> : null}</td>
               <td className="num">{price(trade.price)}</td>

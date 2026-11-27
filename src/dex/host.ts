@@ -21,7 +21,7 @@ export interface VarLighterHolder { engine: VarLighterEngine | null; error: stri
 
 export interface VarLighterViews {
   state(): unknown;
-  symbol(symbol: string | null, hours: string | null): unknown;
+  symbol(symbol: string | null, hours: string | null, points?: string | null): unknown;
   samples(symbol: string | null, after: string | null, limit: string | null): unknown;
   backtest(body: unknown): unknown;
   readiness(): unknown;
@@ -62,7 +62,7 @@ export function varLighterViews(holder: VarLighterHolder): VarLighterViews {
   const engine = (): VarLighterEngine => holder.engine ?? (() => { throw new VarLighterError(503, 'unavailable', `Var/Lighter 模块不可用：${holder.error ?? '未启动'}`); })();
   return {
     state: () => engine().views.state(),
-    symbol: (symbol, hours) => engine().views.symbol(symbol, hours === null ? undefined : hours),
+    symbol: (symbol, hours, points) => engine().views.symbol(symbol, hours === null ? undefined : hours, points === null || points === undefined ? undefined : points),
     samples: (symbol, after, limit) => engine().views.samples(symbol, after, limit),
     backtest: body => engine().views.backtest(body),
     readiness: () => engine().views.readiness(),
@@ -101,7 +101,7 @@ export async function routePage(views: VarLighterViews, request: DexPageRequest,
   const { method, path } = request, query = new URLSearchParams(request.query), body = request.body ?? null;
   try {
     if (method === 'GET' && path === 'state') return { status: 200, body: views.state() };
-    if (method === 'GET' && path === 'symbol') return { status: 200, body: views.symbol(query.get('symbol'), query.get('hours')) };
+    if (method === 'GET' && path === 'symbol') return { status: 200, body: views.symbol(query.get('symbol'), query.get('hours'), query.get('points')) };
     if (method === 'GET' && path === 'samples') return { status: 200, body: views.samples(query.get('symbol'), query.get('after'), query.get('limit')) };
     if (method === 'GET' && path === 'readiness') return { status: 200, body: views.readiness() };
     if (method === 'GET' && path === 'accounts') return { status: 200, body: views.accounts() };

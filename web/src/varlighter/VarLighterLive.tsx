@@ -6,10 +6,10 @@ import { ApiError, api } from '../api.ts';
 import { useDialogGuard } from '../AppDialog.tsx';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { useLiveResource } from '../use-live-resource.ts';
-import type { LiveLimits, LivePosition, LiveState } from '../../../src/varlighter/live.ts';
+import type { LiveExecSettings, LiveLimits, LivePosition, LiveState } from '../../../src/varlighter/live.ts';
 import type { EntropyCostView, LiveView } from '../../../src/varlighter/views.ts';
 import { Badge, Metric, stampText, useWrite } from './parts.tsx';
-import { VARLIGHTER_BASE, age, directionLabel, duration, pairLabel, percent, plain, price, reasonLabel, rebateAudit, signedUsd, tone, usd, varLighterHref, venueShort } from './varlighter-form.ts';
+import { LIVE_EXEC_FIELDS, VARLIGHTER_BASE, age, directionLabel, duration, liveExecForm, pairLabel, parseLiveExec, percent, plain, price, reasonLabel, rebateAudit, signedUsd, tone, tradeTelemetrySummary, usd, varLighterHref, venueShort, type LiveExecForm } from './varlighter-form.ts';
 
 const LIVE_PATH = `${VARLIGHTER_BASE}/live`;
 type KeyVenue = 'lighter' | 'rh' | 'entropy';
@@ -28,7 +28,7 @@ const LIMIT_FIELDS: { key: keyof LiveLimits; label: string; hint: string }[] = [
   { key: 'perTradeUsd', label: '单笔名义（美元）', hint: '每笔取它与配对参数里名义金额中较小的一个' },
   { key: 'maxOpen', label: '同时持仓（笔）', hint: '到上限后不再开新仓' },
   { key: 'dailyLossUsd', label: '当日亏损上限（美元）', hint: 'UTC 日内已实现亏损到这个数就不再开仓' },
-  { key: 'slippageBps', label: '限价保护（基点）', hint: '两腿开仓 IOC 限价离预期价最多这么远' },
+  { key: 'slippageBps', label: 'B 腿与平仓限价保护（基点）', hint: '开仓对冲 B 腿与平仓 IOC 限价离预期价最多这么远' },
 ];
 const legQty = (position: LivePosition, leg: 'a' | 'b') => { const item = position[leg]; return Math.max(0, item.qty - item.exitQty); };
 const avg = (quote: number, qty: number) => qty > 0 ? quote / qty : null;
@@ -75,42 +75,52 @@ function SwitchPanel({ view, onChanged }: { view: LiveView; onChanged: () => Pro
   const dialog = useDialogGuard();
   const write = useWrite();
   const saved = view.settings;
-  const savedText = JSON.stringify(saved);
+  const savedExec: LiveExecSettings = view.exec;
+  const savedText = JSON.stringify({ settings: saved, exec: savedExec });
   const [pairs, setPairs] = useState<string[]>(saved.pairs);
   const [limits, setLimits] = useState<Record<keyof LiveLimits, string>>(() => limitsForm(saved.limits));
+  const [execForm, setExecForm] = useState<LiveExecForm>(() => liveExecForm(savedExec));
   const [base, setBase] = useState(savedText);
   // 服务端的设置变了（别处保存、或本次保存成功）时用新值重填。
-  useEffect(() => { if (savedText !== base) { setPairs(saved.pairs); setLimits(limitsForm(saved.limits)); setBase(savedText); } }, [savedText, base, saved]);
+  useEffect(() => { if (savedText !== base) { setPairs(saved.pairs); setLimits(limitsForm(saved.limits)); setExecForm(liveExecForm(savedExec)); setBase(savedText); } }, [savedText, base, saved, savedExec]);
   const parsed = parseLimits(limits);
+  const parsedExec = parseLiveExec(execForm);
   const pairsRef = useRef(pairs);
   pairsRef.current = pairs;
   const parsedRef = useRef(parsed);
   parsedRef.current = parsed;
+  const parsedExecRef = useRef(parsedExec);
+  parsedExecRef.current = parsedExec;
   const savedOnRef = useRef(saved.on);
   savedOnRef.current = saved.on;
   const writeBusyRef = useRef(write.busy);
   writeBusyRef.current = write.busy;
   const known = new Set(view.candidates.map(item => item.key));
   const gone = pairs.filter(key => !known.has(key));
-  const dirty = JSON.stringify([...pairs].sort()) !== JSON.stringify(saved.pairs) || (parsed.ok && JSON.stringify(parsed.value) !== JSON.stringify(saved.limits)) || !parsed.ok;
+  const dirty = JSON.stringify([...pairs].sort()) !== JSON.stringify(saved.pairs)
+    || (parsed.ok && JSON.stringify(parsed.value) !== JSON.stringify(saved.limits))
+    || (parsedExec.ok && JSON.stringify(parsedExec.value) !== JSON.stringify(savedExec))
+    || !parsed.ok || !parsedExec.ok;
   const missing = (key: string) => { const item = view.candidates.find(row => row.key === key); return item ? [item.a.venue, item.b.venue].filter(venue => !view.keys[venue as KeyVenue]) : []; };
   // 总开关只在点「打开实盘」「关闭实盘」时才提交；保存配对与限额不带它，免得用几秒前的视图把别处刚改的开关改回去。
   const send = (body: Record<string, unknown>, done: string) => { void write.run('settings', () => api(`${LIVE_PATH}/settings`, { body }), () => { void onChanged(); return done; }); };
-  const save = (done: string) => { if (parsed.ok) send({ pairs, limits: parsed.value }, done); };
+  const save = (done: string) => { if (parsed.ok && parsedExec.ok) send({ pairs, limits: parsed.value, exec: parsedExec.value }, done); };
   const turnOn = async () => {
-    if (!pairs.length || !parsed.ok || writeBusyRef.current !== null) return;
+    if (!pairs.length || !parsed.ok || !parsedExec.ok || writeBusyRef.current !== null) return;
     const confirmedPairs = [...pairs];
     const confirmedLimits = parsed.value;
+    const confirmedExec = parsedExec.value;
     const samePairs = (a: readonly string[], b: readonly string[]) => JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
     const lines = confirmedPairs.map(key => `${pairLabel(key).symbol}（${pairLabel(key).short}）`).join('、');
-    if (!await dialog.confirm(`打开实盘？打开后，下列配对的策略每次发出开仓信号，都会在两个交易所下真实订单（配对还要在总览启用）：${lines}。单笔不超过 ${limits.perTradeUsd} 美元，同时不超过 ${limits.maxOpen} 笔。`, { title: '确认打开实盘', confirmLabel: '确认打开', tone: 'danger' })) return;
+    const levWarn = confirmedExec.maxLeverage > 1 ? ` 当前保证金倍率上限 ${confirmedExec.maxLeverage}×，请确认已在各交易所手动将对应合约杠杆设为 ≥ ${confirmedExec.maxLeverage}× 并留足强平缓冲。` : '';
+    if (!await dialog.confirm(`打开实盘？打开后，下列配对的策略每次发出开仓信号，都会在两个交易所下真实订单（配对还要在总览启用）：${lines}。单笔不超过 ${limits.perTradeUsd} 美元，同时不超过 ${limits.maxOpen} 笔。${levWarn}`, { title: '确认打开实盘', confirmLabel: '确认打开', tone: 'danger' })) return;
     if (!dialog.isAlive() || writeBusyRef.current !== null || savedOnRef.current) return;
-    const latestPairs = pairsRef.current, latestParsed = parsedRef.current;
-    if (!latestParsed.ok || !samePairs(latestPairs, confirmedPairs) || JSON.stringify(latestParsed.value) !== JSON.stringify(confirmedLimits)) {
-      void dialog.alert('实盘配对或限额在确认期间已更新，已取消打开，请核对后再试', { title: '配置已变更', tone: 'warning' });
+    const latestPairs = pairsRef.current, latestParsed = parsedRef.current, latestExec = parsedExecRef.current;
+    if (!latestParsed.ok || !latestExec.ok || !samePairs(latestPairs, confirmedPairs) || JSON.stringify(latestParsed.value) !== JSON.stringify(confirmedLimits) || JSON.stringify(latestExec.value) !== JSON.stringify(confirmedExec)) {
+      void dialog.alert('实盘配对、限额或执行优化在确认期间已更新，已取消打开，请核对后再试', { title: '配置已变更', tone: 'warning' });
       return;
     }
-    send({ on: true, pairs: confirmedPairs, limits: confirmedLimits }, '实盘已打开：按策略信号下真实订单');
+    send({ on: true, pairs: confirmedPairs, limits: confirmedLimits, exec: confirmedExec }, '实盘已打开：按策略信号下真实订单');
   };
   return <section className="panel" aria-label="实盘开关">
     <div className="panel-heading"><h2>实盘</h2><span className="muted">按策略信号：勾选且在总览启用的配对，价差到开仓线时在两个交易所下真实订单，回归、止损或超时时平仓 · <a href={varLighterHref('accounts')}>查看各场所账户资产与成交 →</a></span></div>
@@ -118,7 +128,7 @@ function SwitchPanel({ view, onChanged }: { view: LiveView; onChanged: () => Pro
       {saved.on ? view.halt ? <Badge tone="bad">已停止</Badge> : <Badge tone="ok">实盘运行中</Badge> : <Badge tone="warn">实盘关闭</Badge>}
       {saved.on
         ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => send({ on: false }, '实盘已关闭：不再开新仓，已有实盘持仓仍按策略平仓')}>关闭实盘</button>
-        : <button type="button" className="button primary" disabled={write.busy !== null || !parsed.ok || !pairs.length} onClick={() => void turnOn()}><Play size={14} aria-hidden="true" />打开实盘</button>}
+        : <button type="button" className="button primary" disabled={write.busy !== null || !parsed.ok || !parsedExec.ok || !pairs.length} onClick={() => void turnOn()}><Play size={14} aria-hidden="true" />打开实盘</button>}
       <span className="muted">{saved.on ? '关闭只停开新仓，已有实盘持仓照常按策略平仓' : pairs.length ? '打开前先确认两边账户有足够保证金' : '先在下面勾选实盘配对'}</span>
     </div>
     <section className="vl-metrics" aria-label="实盘汇总">
@@ -127,6 +137,15 @@ function SwitchPanel({ view, onChanged }: { view: LiveView; onChanged: () => Pro
       <Metric label="实盘持仓" value={`${view.positions.length} / ${saved.limits.maxOpen} 笔`} foot={`单笔 ≤ ${usd(saved.limits.perTradeUsd, 0)}`} />
     </section>
     {view.lastSkip ? <p className="vl-note">最近一次没有开仓：{stampText(view.lastSkip.at)} {pairLabel(view.lastSkip.symbol).symbol}（{pairLabel(view.lastSkip.symbol).short}），{view.lastSkip.reason}</p> : null}
+    {(view.privateStreams.lighter || view.privateStreams.rh || view.skipStats.total > 0) ? <div className="vl-live-status">
+      {(['lighter', 'rh'] as const).map(venue => {
+        const st = view.privateStreams[venue];
+        if (!st) return null;
+        const label = st.subscribed ? 'WS 已订阅' : st.connected ? 'WS 连接中' : 'WS 未连';
+        return <span key={venue} className="muted"><Badge tone={st.subscribed ? 'ok' : 'warn'}>{view.venueNames[venue]} {label}</Badge> 命中 {st.wsHits} · 回退 {st.restFallbacks}{st.reconnects ? ` · 重连 ${st.reconnects}` : ''}{st.lastError ? `（${st.lastError}）` : ''}</span>;
+      })}
+      {view.skipStats.total > 0 ? <span className="muted">今日跳过 {view.skipStats.total} 次（{Object.entries(view.skipStats.byReason).sort((x, y) => y[1] - x[1]).slice(0, 3).map(([k, n]) => `${k} ${n}`).join(' · ')}）</span> : null}
+    </div> : null}
     <h3 className="vl-live-sub">实盘配对</h3>
     {view.candidates.length ? <ul className="vl-combos">{view.candidates.map(item => { const lack = missing(item.key), paused = view.paused[item.key]; return <li key={item.key}>
       <label><input type="checkbox" checked={pairs.includes(item.key)} disabled={write.busy !== null} onChange={event => setPairs(list => event.target.checked ? [...list, item.key] : list.filter(key => key !== item.key))} />
@@ -139,9 +158,18 @@ function SwitchPanel({ view, onChanged }: { view: LiveView; onChanged: () => Pro
       {LIMIT_FIELDS.map(field => <label className="vl-field" key={field.key}>{field.label}
         <input inputMode="decimal" value={limits[field.key]} onChange={event => setLimits(value => ({ ...value, [field.key]: event.target.value }))} /><small>{field.hint}</small></label>)}
     </div>
+    <h3 className="vl-live-sub">执行优化</h3>
+    <div className="vl-fields">
+      {LIVE_EXEC_FIELDS.map(field => <label className="vl-field" key={field.key}>{field.label}
+        <input inputMode="decimal" value={execForm[field.key]} onChange={event => setExecForm(value => ({ ...value, [field.key]: event.target.value }))} /><small>{field.hint}</small></label>)}
+      <label className="vl-field vl-live-check"><span>余额自适应</span>
+        <span className="vl-live-checkrow"><input type="checkbox" checked={execForm.autoSizeByBalance} disabled={write.busy !== null} onChange={event => setExecForm(value => ({ ...value, autoSizeByBalance: event.target.checked }))} />余额不足按 95% 自动缩量</span>
+        <small>可用余额 × 倍率上限不足单笔名义时按 95% 自动缩量，避免整笔拒单</small>
+      </label>
+    </div>
     <div className="vl-actions">
-      <button type="button" className="button primary" disabled={!parsed.ok || !dirty || write.busy !== null} onClick={() => save('实盘配对与限额已保存')}>{write.busy === 'settings' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Save size={14} aria-hidden="true" />}保存配对与限额</button>
-      {!parsed.ok ? <Callout tone="warning" role="status">{parsed.error}</Callout> : null}
+      <button type="button" className="button primary" disabled={!parsed.ok || !parsedExec.ok || !dirty || write.busy !== null} onClick={() => save('实盘配对与限额已保存')}>{write.busy === 'settings' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Save size={14} aria-hidden="true" />}保存配对与限额</button>
+      {!parsed.ok ? <Callout tone="warning" role="status">{parsed.error}</Callout> : !parsedExec.ok ? <Callout tone="warning" role="status">{parsedExec.error}</Callout> : null}
       {write.message ? <Callout tone={write.message.tone}>{write.message.text}</Callout> : null}
     </div>
     <p className="vl-note">实盘只用专门的账户：这些账户上不要手动开仓，也不要让别的程序交易，否则持仓对不上会自动停止。第二腿没成交时，第一腿多出的部分会立即反向平掉（记一次单腿）；同一配对连续两次单腿会暂停该配对。</p>
@@ -231,7 +259,7 @@ function PositionsPanel({ view, onChanged }: { view: LiveView; onChanged: () => 
       <thead><tr><th>标的 · 方向</th><th>状态</th><th className="num">A 腿 数量 @ 均价</th><th className="num">B 腿 数量 @ 均价</th><th className="num">持有</th><th>说明</th><th /></tr></thead>
       <tbody>{view.positions.map(position => { const label = pairLabel(position.symbol); return <tr key={position.id}>
         <td><a className="vl-symbol" href={varLighterHref('detail', position.symbol)}>{label.symbol}</a><small>{label.short} · {directionLabel(position.direction, label.a, label.b)}</small></td>
-        <td><Badge tone={STATE_TONE[position.state]}>{STATE_TEXT[position.state]}</Badge>{position.pending ? <small>有一笔订单在确认结果</small> : null}</td>
+        <td><Badge tone={STATE_TONE[position.state]}>{STATE_TEXT[position.state]}</Badge>{position.pending && position.pendingB ? <small>两腿并行确认中</small> : (position.pending || position.pendingB) ? <small>有一笔订单在确认结果</small> : null}</td>
         <td className="num">{price(legQty(position, 'a'))} @ {price(avg(position.a.entryQuote, position.a.qty))}<small>{view.venueNames[position.a.venue]} {position.a.side === 'buy' ? '多' : '空'}{position.a.estimated ? ' · 估' : ''}</small></td>
         <td className="num">{price(legQty(position, 'b'))} @ {price(avg(position.b.entryQuote, position.b.qty))}<small>{view.venueNames[position.b.venue]} {position.b.side === 'buy' ? '多' : '空'}{position.b.estimated ? ' · 估' : ''}</small></td>
         <td className="num">{duration(view.now - position.openedAt)}</td>
@@ -248,13 +276,13 @@ function TradesPanel({ view }: { view: LiveView }) {
       <div className="panel-heading"><h2>实盘成交</h2><span className="muted">最近 {view.trades.length} 笔，净盈亏已扣手续费</span></div>
       {view.trades.length ? <div className="vl-table"><table>
         <thead><tr><th>标的 · 方向</th><th>结束</th><th className="num">A 开 / 平</th><th className="num">B 开 / 平</th><th className="num">净盈亏</th><th>原因</th></tr></thead>
-        <tbody>{view.trades.map(trade => { const label = pairLabel(trade.symbol); return <tr key={trade.id}>
+        <tbody>{view.trades.map(trade => { const label = pairLabel(trade.symbol), telemetry = tradeTelemetrySummary(trade); return <tr key={trade.id}>
           <td>{label.symbol}<small>{label.short} · {directionLabel(trade.direction, label.a, label.b)}{trade.singleLeg ? ' · 单腿' : ''}</small></td>
           <td>{trade.closedAt ? stampText(trade.closedAt) : '—'}<small>持有 {duration((trade.closedAt ?? trade.updatedAt) - trade.openedAt)}</small></td>
           <td className="num">{price(avg(trade.a.entryQuote, trade.a.qty))} / {price(avg(trade.a.exitQuote, trade.a.exitQty))}<small>{price(trade.a.qty)}</small></td>
           <td className="num">{price(avg(trade.b.entryQuote, trade.b.qty))} / {price(avg(trade.b.exitQuote, trade.b.exitQty))}<small>{price(trade.b.qty)}</small></td>
           <td className={`num vl-${tone(trade.netUsd) || 'dim'}`}>{signedUsd(trade.netUsd)}{trade.a.estimated || trade.b.estimated ? <small>含估算价</small> : null}</td>
-          <td className="wrap">{reasonLabel(trade.closeReason)}{trade.note ? <small>{trade.note}</small> : null}</td>
+          <td className="wrap">{reasonLabel(trade.closeReason)}{telemetry ? <small>{telemetry}</small> : null}{trade.note ? <small>{trade.note}</small> : null}</td>
         </tr>; })}</tbody></table></div> : <TableEmpty>还没有实盘成交</TableEmpty>}
     </section>
     <section className="panel" aria-label="实盘事件">

@@ -21,7 +21,7 @@ import { KNOWN_KINDS, REVIEW_KINDS, pairKey, regimeOf, varHourly, type Leg, type
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL } from '../src/varlighter/strategy.ts';
 import { SETTINGS_KEY } from '../src/varlighter/engine.ts';
 import type { Settings } from '../src/varlighter/views.ts';
-import type { LiveLeg, LivePosition } from '../src/varlighter/live.ts';
+import { DEFAULT_LIVE_EXEC, LIVE_EXEC_KEY, LIVE_SKIP_STATS_KEY, type LiveLeg, type LiveOrderTelemetry, type LivePosition } from '../src/varlighter/live.ts';
 import type { SocketLike } from '../src/varlighter/feeds.ts';
 
 const { values } = parseArgs({ options: { port: { type: 'string', default: '4733' } } });
@@ -149,13 +149,24 @@ const now = Date.now();
       });
     }
   }
-  // 实盘页的预览（docs/dexspread.md 第 13 节）：两笔已结束的实盘成交，其中一笔是单腿。不预置凭据、不预置在途持仓，预览里不会发任何订单。
+  // 实盘页的预览（docs/dexspread.md 第 13、19 节）：两笔带全链路遥测的已结束实盘成交，其中一笔是单腿。不预置凭据、不预置在途持仓，预览里不会发任何订单。
   const liveLeg = (venue: LiveLeg['venue'], symbol: string, side: LiveLeg['side'], qty: number, entry: number, exit: number): LiveLeg => ({ venue, symbol, side, qty, entryQuote: qty * entry, exitQty: qty, exitQuote: qty * exit, feesUsd: 0.02, estimated: false });
-  const liveTrade = (id: string, ago: number, a: LiveLeg, b: LiveLeg, netUsd: number, singleLeg: boolean, closeReason: string, note: string): LivePosition => ({
+  const liveTrade = (id: string, ago: number, a: LiveLeg, b: LiveLeg, netUsd: number, singleLeg: boolean, closeReason: string, note: string, orders: LiveOrderTelemetry[]): LivePosition => ({
     id, symbol: 'lighter:NVDA|entropy:NVDA', direction: 'a_rich', ratio: 1, state: 'closed', step: 'settle', openedAt: now - ago, updatedAt: now - ago + 900_000, closedAt: now - ago + 900_000,
-    a, b, plan: { qty: a.qty, limit: 181.8 }, pending: null, tries: 1, retryAt: 0, closeReason, singleLeg, netUsd, note });
-  store.saveLive(liveTrade('preview-live-1', 7_200_000, liveLeg('lighter', 'NVDA', 'sell', 0.5, 182.31, 182.02), liveLeg('entropy', 'io:NVDA', 'buy', 0.5, 182.05, 182.0), 0.08, false, 'revert', ''));
-  store.saveLive(liveTrade('preview-live-2', 3_600_000, liveLeg('lighter', 'NVDA', 'sell', 0.5, 182.4, 182.46), { ...liveLeg('entropy', 'io:NVDA', 'buy', 0, 0, 0), exitQty: 0, feesUsd: 0 }, -0.05, true, 'single_leg', 'Entropy 没有成交，Lighter 已反向平掉'));
+    a, b, plan: { qty: a.qty, limit: 181.8 }, pending: null, tries: 1, retryAt: 0, closeReason, singleLeg, netUsd, note, orders });
+  store.saveLive(liveTrade('preview-live-1', 7_200_000, liveLeg('lighter', 'NVDA', 'sell', 0.5, 182.31, 182.02), liveLeg('entropy', 'io:NVDA', 'buy', 0.5, 182.05, 182.0), 0.08, false, 'revert', '', [
+    { role: 'openA', leg: 'a', venue: 'lighter', side: 'sell', clientId: 10001, qty: 0.5, filledQty: 0.5, expectedPrice: 182.33, limitPrice: 182.29, avgPrice: 182.31, slippageBps: 1.1, signalAt: now - 7_200_000, sentAt: now - 7_199_990, ackAt: now - 7_199_940, confirmAt: now - 7_199_845, confirmSource: 'ws', status: '已成交' },
+    { role: 'openB', leg: 'b', venue: 'entropy', side: 'buy', clientId: 10002, qty: 0.5, filledQty: 0.5, expectedPrice: 182.04, limitPrice: 182.58, avgPrice: 182.05, slippageBps: 0.55, signalAt: now - 7_199_845, sentAt: now - 7_199_840, ackAt: now - 7_199_775, confirmAt: now - 7_199_775, confirmSource: 'sync', status: '已成交' },
+    { role: 'closeA', leg: 'a', venue: 'lighter', side: 'buy', clientId: 10003, qty: 0.5, filledQty: 0.5, expectedPrice: 182.01, limitPrice: 182.92, avgPrice: 182.02, slippageBps: 0.55, signalAt: now - 6_300_010, sentAt: now - 6_300_000, ackAt: now - 6_299_940, confirmAt: now - 6_299_870, confirmSource: 'ws', status: '已成交' },
+    { role: 'closeB', leg: 'b', venue: 'entropy', side: 'sell', clientId: 10004, qty: 0.5, filledQty: 0.5, expectedPrice: 182.0, limitPrice: 181.09, avgPrice: 182.0, slippageBps: 0, signalAt: now - 6_300_010, sentAt: now - 6_300_000, ackAt: now - 6_299_935, confirmAt: now - 6_299_935, confirmSource: 'sync', status: '已成交' },
+  ]));
+  store.saveLive(liveTrade('preview-live-2', 3_600_000, liveLeg('lighter', 'NVDA', 'sell', 0.5, 182.4, 182.46), { ...liveLeg('entropy', 'io:NVDA', 'buy', 0, 0, 0), exitQty: 0, feesUsd: 0 }, -0.05, true, 'single_leg', 'Entropy 没有成交，Lighter 已反向平掉', [
+    { role: 'openA', leg: 'a', venue: 'lighter', side: 'sell', clientId: 10005, qty: 0.5, filledQty: 0.5, expectedPrice: 182.42, limitPrice: 182.38, avgPrice: 182.4, slippageBps: 1.1, signalAt: now - 3_600_000, sentAt: now - 3_599_990, ackAt: now - 3_599_930, confirmAt: now - 3_599_350, confirmSource: 'rest', status: '已成交' },
+    { role: 'openB', leg: 'b', venue: 'entropy', side: 'buy', clientId: 10006, qty: 0.5, filledQty: 0, expectedPrice: 182.1, limitPrice: 182.65, avgPrice: null, slippageBps: null, signalAt: now - 3_599_350, sentAt: now - 3_599_345, ackAt: now - 3_599_285, confirmAt: now - 3_599_285, confirmSource: 'sync', status: '未成交：Order could not immediately match' },
+    { role: 'flatten', leg: 'a', venue: 'lighter', side: 'buy', clientId: 10007, qty: 0.5, filledQty: 0.5, expectedPrice: 182.4, limitPrice: 184.2, avgPrice: 182.46, slippageBps: 3.3, signalAt: now - 3_599_285, sentAt: now - 3_599_280, ackAt: now - 3_599_220, confirmAt: now - 3_599_090, confirmSource: 'ws', status: '已成交' },
+  ]));
+  store.setState(LIVE_EXEC_KEY, DEFAULT_LIVE_EXEC, now);
+  store.setState(LIVE_SKIP_STATS_KEY, { day: Math.floor(now / 86_400_000) * 86_400_000, total: 14, byReason: { '实时价差已缩窄': 9, '价格已越过限价': 5 } }, now);
   store.event(now - 3_600_000, 'live', 'lighter:NVDA|entropy:NVDA', '（预览）第二腿没有成交，第一腿已反向平掉，记一次单腿');
   // 预写入近两天的账户权益快照（按 sha256("场所:标识").slice(0,16) 隔离），让账户资产页的权益走势图立即可见。
   const hashOf = (venue: string, id: string) => createHash('sha256').update(`${venue}:${id}`).digest('hex').slice(0, 16);
@@ -226,7 +237,12 @@ class FakeLighter extends FakeSocket {
   }
   send(data: string) {
     const message = JSON.parse(data) as { type: string; channel?: string };
+    if (message.type === 'ping') { this.push({ type: 'pong' }); return; }
     if (message.type === 'subscribe' && message.channel === 'market_stats/all') this.push({ type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: this.stats() });
+    if (message.type === 'subscribe' && message.channel?.startsWith('account_all_orders/')) {
+      this.push({ type: 'subscribed/account_all_orders', channel: message.channel.replace('/', ':'), orders: {} });
+      return;
+    }
     const book = /^order_book\/(\d+)$/.exec(message.channel ?? '');
     if (!book) return;
     const id = Number(book[1]);

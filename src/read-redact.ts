@@ -16,7 +16,7 @@ export const IDENTIFIER_FIELDS: ReadonlySet<string> = new Set([
   'user', 'users', 'signer', 'signers', 'address', 'addresses', 'wallet', 'walletaddress', 'owner', 'trader', 'accountaddress',
   // Exchange accounts: ids, uids (Gate `user_id`, CrossEx `accountUid`), the ***last4 forms (`account`, `mainAccountId`).
   // An object under one of these names (CrossEx `live.account`) is walked like any other.
-  'account', 'accountid', 'accountids', 'accountuid', 'mainaccountid', 'subaccount', 'subaccountid', 'subaccountids', 'subuid', 'uid', 'userid', 'masteruid', 'email',
+  'account', 'accountid', 'accountids', 'accountuid', 'accountindex', 'mainaccountid', 'subaccount', 'subaccountid', 'subaccountids', 'subuid', 'uid', 'userid', 'masteruid', 'email',
   // Parts of credentials and where the setup is reached: API key ids and suffixes (Gate, Ondo `hint`), monitor login, URLs.
   'apikey', 'apikeyid', 'keysuffix', 'apikeysuffix', 'hint', 'monitorusername', 'monitorurl', 'url',
 ]);
@@ -32,7 +32,7 @@ const HEX_RUN = /0x[0-9a-fA-F]{40,}/g;
 const MASKED_ID = /\*{3}[0-9A-Za-z]{1,8}\b/g;
 const NAMED_NUMBER = /(UID|uid|Uid|用户|账户|子账户|account|Account)(\s*[:：#=]?\s*)(\d{5,})(?!\d|[.,]\d)(?!\s*(?:(?:USDT|USDC|USD|BTC|ETH|U|ms)(?![A-Za-z0-9\u4e00-\u9fff-])|美元|元|%))/g;
 // A number in an identifier field is aliased only when the name says it is an id (`users: 3` is a count).
-const NUMERIC_ID = /(id|ids|uid|user|account|owner|trader|signer)$/;
+const NUMERIC_ID = /(id|ids|uid|user|account|owner|trader|signer|accountindex)$/;
 
 /** The alias of one original: `kind-` and the first 8 hex digits of its HMAC; hex is compared case-insensitively. */
 export function aliasOf(key: Buffer, kind: AliasKind, original: string): string {

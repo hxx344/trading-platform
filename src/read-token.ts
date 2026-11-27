@@ -332,9 +332,11 @@ export const READ_TOKEN_ROUTES: readonly { path: string | RegExp; scope: ReadSco
   // docs/mcp.md 8.3: Var/Lighter (public market data and the strategy state, local database only), the server's own load,
   // the monitors' quote snapshots and the EQN feed. None asks an exchange; Var/Lighter's POSTs (backtest included) stay out.
   { path: '/api/varlighter/state', scope: 'portfolio', query: [] },
-  { path: '/api/varlighter/symbol', scope: 'portfolio', query: ['symbol', 'hours'] },
+  { path: '/api/varlighter/symbol', scope: 'portfolio', query: ['symbol', 'hours', 'points'] },
   { path: '/api/varlighter/readiness', scope: 'portfolio', query: [] },
   { path: '/api/varlighter/samples', scope: 'portfolio', query: ['symbol', 'after', 'limit'] },
+  { path: '/api/varlighter/live', scope: 'portfolio', query: [] },
+  { path: '/api/varlighter/entropy-cost', scope: 'portfolio', query: ['from', 'to', 'limit'] },
   { path: '/api/host', scope: 'system', query: [] },
   { path: /^\/api\/monitor\/(oil|goldoil|hynix|anthropic)\/quote$/, scope: 'public', query: [] },
   // Reading the moves keeps the EQN poll going for another 90 seconds (src/news/feed.ts): public, bounded, no credential.

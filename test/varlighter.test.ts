@@ -1341,10 +1341,10 @@ test('两腿行情流的配对：启用或有持仓的每 5 秒、其余每 20 �
 
 test('自动配置的推荐参数：入场取偏离 95 分位减半个往返成本、不低于保本加最低净利，止损随往返成本与入场，最长持有按半衰期', () => {
   const costs = { slippageBps: 1, minNetBps: 3, ...ZERO_FEES };
-  assert.deepEqual(recommendParams({ costMedian: 8, deviation95: 30, halfLifeMin: 12 }, costs), { entryBps: 26, exitBps: 0, stopBps: 86, maxHoldMinutes: 72 });
-  assert.deepEqual(recommendParams({ costMedian: 8, deviation95: 6, halfLifeMin: null }, costs), { entryBps: 11, exitBps: 0, stopBps: 41, maxHoldMinutes: 720 }, '偏离小：入场抬到 半个往返成本 4 + 滑点 4 + 最低净利 3');
+  assert.deepEqual(recommendParams({ costMedian: 8, deviation95: 30, halfLifeMin: 12 }, costs), { entryBps: 26, exitBps: -2, stopBps: 86, maxHoldMinutes: 72 });
+  assert.deepEqual(recommendParams({ costMedian: 8, deviation95: 6, halfLifeMin: null }, costs), { entryBps: 11, exitBps: -2, stopBps: 41, maxHoldMinutes: 720 }, '偏离小：入场抬到 半个往返成本 4 + 滑点 4 + 最低净利 3');
   assert.equal(recommendParams({ costMedian: 8, deviation95: 6, halfLifeMin: 1 }, { ...costs, aFeeBps: 2, bFeeBps: 2 })!.entryBps, 19, '手续费计入保本线');
-  assert.deepEqual(recommendParams({ costMedian: 0, deviation95: 1, halfLifeMin: 1 }, { slippageBps: 0, minNetBps: 0, ...ZERO_FEES }), { entryBps: 5, exitBps: 0, stopBps: 20, maxHoldMinutes: 60 }, '各项下限');
+  assert.deepEqual(recommendParams({ costMedian: 0, deviation95: 1, halfLifeMin: 1 }, { slippageBps: 0, minNetBps: 0, ...ZERO_FEES }), { entryBps: 5, exitBps: -2, stopBps: 20, maxHoldMinutes: 60 }, '各项下限');
   assert.equal(recommendParams({ costMedian: 8, deviation95: 30, halfLifeMin: 500 }, costs)!.maxHoldMinutes, 1440);
   assert.equal(recommendParams({ costMedian: null, deviation95: 30, halfLifeMin: 12 }, costs), null, '没有可成交价时不给推荐');
   const gate = { openPositions: 0, openNotionalUsd: 0, dailyNetUsd: 0, cooldownUntil: 0, eligible: true };
@@ -1376,7 +1376,7 @@ test('自动配置：总览勾选即启用并按推荐参数运行，保存的�
     assert.deepEqual(code(() => engine.views.settings({ revision: 3, auto: 'x' })), [400, 'invalid_body']);
     const saved = engine.views.settings({ revision: 3, symbols: { [RH_BTC]: { enabled: true } }, auto: [RH_BTC, 'rh:BTC', 'var:ETH|rh:ETH'] });
     assert.deepEqual(saved.auto, [RH_BTC], '旧写法的键规整、去重，没有保存参数的键不留');
-    assert.deepEqual([row().enabled, row().auto, row().autoPending, row().entryBps, row().exitBps], [true, true, false, preview.params.entryBps, 0]);
+    assert.deepEqual([row().enabled, row().auto, row().autoPending, row().entryBps, row().exitBps], [true, true, false, preview.params.entryBps, -2]);
     const view = engine.views.symbol(RH_BTC, 24);
     assert.deepEqual([view.params.entryBps, view.params.stopBps, view.params.maxHoldMinutes], [DEFAULT_SYMBOL.entryBps, DEFAULT_SYMBOL.stopBps, DEFAULT_SYMBOL.maxHoldMinutes], '保存的参数不变');
     assert.deepEqual({ entryBps: view.effective.entryBps, exitBps: view.effective.exitBps, stopBps: view.effective.stopBps, maxHoldMinutes: view.effective.maxHoldMinutes }, view.auto.params);
@@ -2233,12 +2233,13 @@ test('两腿行情流的配对按策略信号驱动实盘（docs/dexspread.md �
     a: leg('rh', 'sell', 100.4), b: leg('lighter', 'buy', 100), plan: { qty: 1, limit: 100.1 }, pending: null, tries: 0, retryAt: 0, closeReason: null, singleLeg: false, netUsd: null, note: '',
     strategy: { notionalUsd: 100, entrySpread: 80, entryBaseline: 0, entryRegime: 'all', aFeeBps: 0, bFeeBps: 0, estimated: false, rules: { exitBps: 0, stopBps: 60, maxHoldMinutes: 1440 } } };
   store.saveLive(held);
-  let clock = T0, hold = false, release: () => void = () => {};
+  let clock = T0, hold = false;
+  const releases: (() => void)[] = [];
   const placed: string[] = [];
   const trader = (venue: string) => ({
     async place(order: { side: string; qty: number; limit: number; reduceOnly: boolean }) {
       placed.push(`${venue} ${order.side} ${order.qty}${order.reduceOnly ? ' R' : ''}`);
-      if (hold) await new Promise<void>(resolve => { release = resolve; });
+      if (hold) await new Promise<void>(resolve => { releases.push(resolve); });
       return { kind: 'done' as const, filledQty: order.qty, avgPrice: order.limit, note: '替身' };
     },
     async resolve() { return { kind: 'absent' as const, reason: '替身' }; },
@@ -2268,13 +2269,13 @@ test('两腿行情流的配对按策略信号驱动实盘（docs/dexspread.md �
     hold = true;
     push('rh', T0 + 1_000, 101);
     await new Promise(resolve => setImmediate(resolve));
-    assert.deepEqual([store.liveActive()[0]?.state, store.liveActive()[0]?.closeReason, placed], ['closing', 'stop', ['rh buy 1 R']]);
+    assert.deepEqual([store.liveActive()[0]?.state, store.liveActive()[0]?.closeReason, placed], ['closing', 'stop', ['rh buy 1 R', 'lighter sell 1 R']]);
     assert.ok(liveEvents().some(text => text.startsWith('平仓信号（止损）')), '平仓信号写进实盘事件');
     assert.equal(store.latest(key)!.t, T0 + 1_000, '有动作的推送留下这一刻的样本');
     const checks = stats().checks;
     push('rh', T0 + 1_200, 101.3);
-    assert.deepEqual([stats().checks, placed.length], [checks, 1], '平仓途中不再判断，不重复下单');
-    hold = false; release();
+    assert.deepEqual([stats().checks, placed.length], [checks, 2], '平仓途中不再判断，不重复下单');
+    hold = false; while (releases.length) releases.shift()!();
     await engine.live()!.idle();
     assert.deepEqual([placed, store.liveActive().length, store.liveClosed(5)[0]?.closeReason], [['rh buy 1 R', 'lighter sell 1 R'], 0, 'stop']);
     // 结束后冷却至少 1 分钟（配对参数冷却 0），写库。
@@ -2550,4 +2551,202 @@ test('#20a LighterStream.depth 按 nonce 缓存排序档位并在 delta/resync �
     socket.push({ type: 'update/order_book', channel: 'order_book:7', order_book: { bids: [{ price: '101.5', size: '10' }], asks: [], begin_nonce: 11, nonce: 12 } });
     assert.equal(stream.depth(7), null, '倒挂触发 resync 清除缓存');
   } finally { stream.close(); }
+});
+
+test('出场价差护栏、反毛刺 confirmMs、未成短冷却与 symbol points 分级截断', async () => {
+  // 1. decide 出场价差护栏：盘口成本骤扩 (> max(15, 2.5*entryCostBps)) 且 pnlBps < 0 时暂缓 revert，绝不拦 stop/timeout，有盈利不拦。
+  const baseline = { median: 0, sigma: 1, samples: 50, since: T0 - 3_600_000, regime: 'all' as const, fallback: false };
+  const basePos = openPosition('p1', sample(T0, 100.3, 100), { ...DEFAULT_SYMBOL, entryBps: 15, exitBps: 0, stopBps: 200, maxHoldMinutes: 60 },
+    { kind: 'open', direction: 'a_rich', spread: { mid: 30, sellA: 28, buyA: 32, estimated: false, prices: { aBid: 100.28, aAsk: 100.32, bBid: 99.98, bAsk: 100.02, bMid: 100 } }, deviation: 28 },
+    baseline, ZERO_FEES);
+  assert.equal(basePos.entryCostBps, 4);
+  const wideLossSample = sample(T0 + 60_000, 100, 100, { aBid0: 99.7, aAsk0: 100.4, aBid1k: 99.7, aAsk1k: 100.4, bBid0: 99.99, bAsk0: 100.01, bBid1k: 99.99, bAsk1k: 100.01 });
+  const wideDec = decide(wideLossSample, baseline, { ...DEFAULT_SYMBOL, exitBps: 10, stopBps: 200, maxHoldMinutes: 60 }, basePos);
+  assert.equal(wideDec.kind, 'hold', '盘口点差异常拉宽且按当前价差平仓仍亏时暂缓 revert');
+  // 持仓达到 stopBps 或 maxHoldMinutes 时护栏绝不拦截：
+  const wideStopSample = sample(T0 + 60_000, 100.8, 100, { aBid0: 100.5, aAsk0: 101.2, aBid1k: 100.5, aAsk1k: 101.2, bBid0: 99.99, bAsk0: 100.01, bBid1k: 99.99, bAsk1k: 100.01 });
+  const wideStopDec = decide(wideStopSample, baseline, { ...DEFAULT_SYMBOL, exitBps: 10, stopBps: 50, maxHoldMinutes: 60 }, basePos);
+  assert.equal(wideStopDec.kind, 'close');
+  if (wideStopDec.kind === 'close') assert.equal(wideStopDec.reason, 'stop');
+  assert.equal(decide({ ...wideLossSample, t: T0 + 61 * 60_000 }, baseline, { ...DEFAULT_SYMBOL, exitBps: 10, stopBps: 200, maxHoldMinutes: 60 }, basePos).kind, 'close');
+  // 即使宽点差，只要此刻仍净赚 (entrySpread = 80 > buyA = 41)，允许 revert：
+  assert.equal(decide(wideLossSample, baseline, { ...DEFAULT_SYMBOL, exitBps: 10, stopBps: 200, maxHoldMinutes: 60 }, { ...basePos, entrySpread: 80 }).kind, 'close');
+
+  // 2. 引擎 confirmMs 持续期确认、not_filled 30s 短冷却与 symbol?points=0/5 参数。
+  const key = 'rh:BTC|lighter:BTC', dir = mkdtempSync(path.join(tmpdir(), 'tp-confirm-pts-'));
+  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite')), keys = createLiveKeysStore(dir);
+  keys.set('rh', { accountIndex: 11, apiKeyIndex: 5, privateKey: 'cd'.repeat(40) });
+  keys.set('lighter', { accountIndex: 12, apiKeyIndex: 5, privateKey: 'ab'.repeat(40) });
+  store.setState(SETTINGS_KEY, settings2({ [key]: { ...DEFAULT_SYMBOL, enabled: true, entryBps: 15, cooldownMinutes: 5 } }, { ...DEFAULT_GLOBAL, minSamples: 10, minNetBps: 0, slippageBps: 0 }, ['rh|lighter']), T0);
+  store.addSamples(Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 55_000, 100, 100, { symbol: key })));
+  store.setState(LIVE_SETTINGS_KEY, { on: true, pairs: [key], limits: { perTradeUsd: 100, maxOpen: 1, dailyLossUsd: 20, slippageBps: 30 } }, T0);
+  let clock = T0;
+  let fillQty = 0;
+  const placed: number[] = [];
+  const trader = () => ({
+    async place(order: { qty: number; limit: number }) { placed.push(clock); return { kind: 'done' as const, filledQty: fillQty, avgPrice: fillQty > 0 ? order.limit : null, note: fillQty > 0 ? '已成交' : '未成交' }; },
+    async resolve() { return { kind: 'absent' as const, reason: '替身' }; },
+  });
+  const account = (index: number) => ({ code: 200, accounts: [{ account_index: index, collateral: '1000', available_balance: '1000', total_asset_value: '1000', positions: [] }] });
+  const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, min_base_amount: '0.001', min_quote_amount: '10', taker_fee: '0', mark_price: '100' };
+  const sockets = new Map<string, FakeSocket>();
+  const engine = createVarLighterEngine({ store, now: () => clock,
+    fetchImpl: async (url: string) => url.includes('/account?') ? Response.json(account(Number(new URL(url).searchParams.get('value')))) : Response.json({ code: 200, order_book_details: [market] }),
+    connect: url => { const s = new FakeSocket(); sockets.set(venueOf(url), s); return s; },
+    liveKeys: keys, signerProblem: () => null, traders: trader as never });
+  const push = (venue: string, at: number, mid: number, type = 'update') => {
+    clock = at;
+    sockets.get(venue)!.push({ type: `${type}/market_stats`, channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: String(mid - 0.01), best_ask_price: String(mid + 0.01), mark_price: String(mid) } } });
+  };
+  try {
+    engine.views.liveSettings({ exec: { confirmMs: 500, notFilledCooldownSec: 30 } });
+    engine.startStreams();
+    for (const s of sockets.values()) s.open();
+    for (const venue of ['rh', 'lighter'] as const) await engine.refreshCatalog(new AbortController().signal, venue);
+    await engine.refreshAccounts(() => AbortSignal.timeout(1000));
+    push('rh', T0, 100, 'subscribed'); push('lighter', T0, 100, 'subscribed');
+
+    // 毛刺在 300ms 时打断，不触发下单：
+    push('rh', T0 + 1_000, 101);
+    push('rh', T0 + 1_300, 100);
+    push('rh', T0 + 1_500, 101);
+    assert.equal(placed.length, 0, '中断后的新信号只持续了 0ms，未满 500ms');
+
+    // 连续维持 500ms 触发开仓，A 腿未成触发 30s 短冷却（而非 5 分钟）：
+    push('rh', T0 + 2_000, 101.02);
+    await engine.live()!.idle();
+    assert.deepEqual(placed, [T0 + 2_000]);
+    const row = engine.views.state().rows.find(item => item.key === key)!;
+    assert.equal(row.cooldownUntil, T0 + 2_000 + 30_000, 'not_filled 按 30s 短冷却而非 5 分钟');
+
+    // symbolView 支持 points=0 / points=5 / 非法 points 报错：
+    assert.equal(engine.views.symbol(key, '24', '0').points.length, 0);
+    assert.ok(engine.views.symbol(key, '24', '5').points.length <= 5);
+    assert.ok(engine.views.symbol(key, '24').points.length >= 12);
+    assert.throws(() => engine.views.symbol(key, '24', '1501'));
+
+    // 3. confirmTimers 在盘口保持静默（无后续报价推送）时到期自动触发开仓：
+    clock += 60_000;
+    fillQty = 0;
+    const placedBeforeTimer = placed.length;
+    engine.views.liveSettings({ exec: { confirmMs: 40 } });
+    push('lighter', clock, 100.01);
+    push('rh', clock, 100.01);
+    push('rh', clock + 100, 101.05);
+    assert.equal(placed.length, placedBeforeTimer, '首帧进入 confirmMs 确认等待');
+    clock += 60;
+    await new Promise(resolve => setTimeout(resolve, 90));
+    await engine.live()!.idle();
+    assert.equal(placed.length, placedBeforeTimer + 1, `无新推送时 confirmTimers 自动唤醒并触发下单：push=${JSON.stringify(engine.views.state().sources.push)} skip=${JSON.stringify(engine.views.live().lastSkip)}`);
+
+    // 4. 报价断流/过期（!a || !b）清空 pendingSignals，恢复后重新计时 confirmMs（R3 第二轮 P2 回归）：
+    clock += 40_000;
+    engine.views.liveSettings({ exec: { confirmMs: 500 } });
+    push('lighter', clock, 100);
+    push('rh', clock, 100);
+    push('rh', clock + 100, 101.08); // 记录 firstSeenAt
+    // 推进到报价超过 75s 过期后推一笔让 evaluatePushPair 命中 !a || !b：
+    clock += 80_000;
+    push('rh', clock, 101.09); // lighter 此时过期 -> 清掉旧 pendingSignals
+    push('lighter', clock + 50, 100.01); // lighter 恢复：此时两腿均有效且偏差 >15bp，应重新从 clock+50 计满 500ms 而非立刻开仓
+    assert.equal(placed.length, placedBeforeTimer + 1, '断流清掉陈旧 firstSeenAt，恢复首帧不立刻绕过 confirmMs');
+  } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('开关关闭后再重启不复用已关闭的旧私有流与陈旧 traderCache（R3 P1 回归）', async () => {
+  const key = 'rh:BTC|lighter:BTC', dir = mkdtempSync(path.join(tmpdir(), 'tp-priv-restart-'));
+  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite')), keys = createLiveKeysStore(dir);
+  keys.set('rh', { accountIndex: 11, apiKeyIndex: 5, privateKey: 'cd'.repeat(40) });
+  keys.set('lighter', { accountIndex: 12, apiKeyIndex: 5, privateKey: 'ab'.repeat(40) });
+  store.setState(SETTINGS_KEY, settings2({ [key]: { ...DEFAULT_SYMBOL, enabled: true, entryBps: 15, cooldownMinutes: 0 } }, { ...DEFAULT_GLOBAL, minSamples: 10, minNetBps: 0, slippageBps: 0 }, ['rh|lighter']), T0);
+  store.addSamples(Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 55_000, 100, 100, { symbol: key })));
+  store.setState(LIVE_SETTINGS_KEY, { on: true, pairs: [key], limits: { perTradeUsd: 100, maxOpen: 1, dailyLossUsd: 20, slippageBps: 30 } }, T0);
+  const pubSockets = new Map<string, FakeSocket>();
+  const privByVenue: Record<'rh' | 'lighter', FakeSocket[]> = { rh: [], lighter: [] };
+  const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, min_base_amount: '0.001', min_quote_amount: '10', taker_fee: '0', mark_price: '100' };
+  const account = (index: number) => ({ code: 200, accounts: [{ account_index: index, collateral: '1000', available_balance: '1000', total_asset_value: '1000', positions: [] }] });
+  let clock = T0, sendCount = 0, signedClientId = 0, accountOrdersCalls = 0;
+  const engine = createVarLighterEngine({
+    store, now: () => clock,
+    fetchImpl: async (url: string) => {
+      if (url.includes('/account?')) return Response.json(account(Number(new URL(url).searchParams.get('value'))));
+      if (url.includes('/nextNonce')) return Response.json({ code: 200, nonce: sendCount + 1 });
+      if (url.includes('/sendTx')) {
+        sendCount++;
+        const v: 'rh' | 'lighter' = url.includes('api.rh.lighter.xyz') ? 'rh' : 'lighter';
+        const acc = v === 'rh' ? 11 : 12;
+        const cid = signedClientId;
+        setImmediate(() => {
+          privByVenue[v].at(-1)?.push({
+            type: 'update/account_all_orders',
+            channel: `account_all_orders:${acc}`,
+            orders: { '1': [{ client_order_index: cid, status: 'canceled', filled_base_amount: '0', filled_quote_amount: '0' }] },
+          });
+        });
+        return Response.json({ code: 200 });
+      }
+      if (url.includes('/accountOrders')) { accountOrdersCalls++; throw new Error('走私有 WS 不应发 REST 查单'); }
+      return Response.json({ code: 200, order_book_details: [market] });
+    },
+    connect: url => {
+      const s = new FakeSocket();
+      if (url.includes('readonly=true')) pubSockets.set(venueOf(url), s);
+      else privByVenue[venueOf(url) === 'rh' ? 'rh' : 'lighter'].push(s);
+      return s;
+    },
+    liveKeys: keys, signerProblem: () => null,
+    lighterSigner: async () => ({
+      signCreateOrder: input => { signedClientId = input.clientOrderIndex; return { txType: 14, txInfo: '{}', txHash: '0x1' }; },
+      createAuthToken: () => 'auth-tok',
+    }),
+  });
+  const subscribePriv = async (idx: number) => {
+    for (const [v, acc] of [['rh', 11], ['lighter', 12]] as const) {
+      const s = privByVenue[v][idx]!;
+      s.open();
+      await new Promise(resolve => setImmediate(resolve));
+      s.push({ type: 'subscribed/account_all_orders', channel: `account_all_orders:${acc}`, orders: {} });
+    }
+  };
+  try {
+    engine.startStreams();
+    for (const s of pubSockets.values()) s.open();
+    for (const venue of ['rh', 'lighter'] as const) await engine.refreshCatalog(new AbortController().signal, venue);
+    await engine.refreshAccounts(() => AbortSignal.timeout(1000));
+    await subscribePriv(0);
+    assert.equal(privByVenue.rh.length, 1);
+    assert.equal(privByVenue.lighter.length, 1);
+
+    // 第一笔通过 S1 下单并确认，使 traderCache 缓存关联 S1 的 trader：
+    pubSockets.get('rh')!.push({ type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: '99.99', best_ask_price: '100.01', mark_price: '100' } } });
+    pubSockets.get('lighter')!.push({ type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: '99.99', best_ask_price: '100.01', mark_price: '100' } } });
+    clock += 1_000;
+    pubSockets.get('rh')!.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: '100.99', best_ask_price: '101.01', mark_price: '101' } } });
+    await engine.live()!.idle();
+    assert.equal(sendCount, 1);
+    assert.equal(engine.views.live().privateStreams.rh?.wsHits, 1);
+
+    // 关闭实盘 -> 重开实盘：旧流关闭且创建 S2，traderCache 同步失效。
+    engine.views.liveSettings({ on: false });
+    assert.equal(privByVenue.rh[0]!.readyState, 3);
+    assert.equal(privByVenue.lighter[0]!.readyState, 3);
+    engine.views.liveSettings({ on: true });
+    assert.equal(privByVenue.rh.length, 2);
+    assert.equal(privByVenue.lighter.length, 2);
+    await subscribePriv(1);
+
+    // 越过 30s 未成交短冷却与基线采样后触发第二笔，确认经由新私有流 S2 秒回：
+    clock += 40_000;
+    await engine.refreshAccounts(() => AbortSignal.timeout(1000));
+    pubSockets.get('lighter')!.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: '100.00', best_ask_price: '100.02', mark_price: '100.01' } } });
+    pubSockets.get('rh')!.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: '99.99', best_ask_price: '100.01', mark_price: '100' } } });
+    clock += 1_000;
+    pubSockets.get('rh')!.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: '101.01', best_ask_price: '101.03', mark_price: '101.02' } } });
+    await engine.live()!.idle();
+    assert.equal(sendCount, 2, `second order skipped: push=${JSON.stringify(engine.views.state().sources.push)} live=${JSON.stringify({ skip: engine.views.live().lastSkip, active: engine.views.live().positions.length, halt: engine.views.live().halt })}`);
+    assert.equal(accountOrdersCalls, 0);
+    const liveStatus = engine.views.live().privateStreams;
+    assert.equal(liveStatus.rh?.wsHits, 1, '重开后通过新私有流 S2 命中 WS 确认');
+    assert.equal(liveStatus.rh?.restFallbacks, 0);
+  } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });

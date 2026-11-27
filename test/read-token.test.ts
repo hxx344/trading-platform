@@ -121,7 +121,7 @@ test('只读令牌：白名单外的 GET、所有 POST、页面、静态资源�
         assert.equal((await response.json() as { code: string }).code, 'read_only', path);
       }
     }
-    for (const path of ['/api/status', '/api/read-token/generate', '/api/read-token/revoke', '/api/read-token/lookup', '/api/summary/send', '/api/confirm', '/api/update/check']) {
+    for (const path of ['/api/status', '/api/read-token/generate', '/api/read-token/revoke', '/api/read-token/lookup', '/api/summary/send', '/api/confirm', '/api/update/check', '/api/varlighter/live/settings', '/api/varlighter/entropy-cost/sync', '/api/varlighter/accounts/refresh']) {
       const response = await s.read(token, path, { method: 'POST', headers: { 'content-type': 'application/json', 'x-pa-executor': '1' }, body: '{}' });
       assert.equal(response.status, 403, path);
     }
@@ -139,6 +139,10 @@ test('只读令牌：白名单外的 GET、所有 POST、页面、静态资源�
     assert.equal(readTokenAllows(new URL('/api/goldoil/state', 'http://x')), true);
     assert.equal(readTokenAllows(new URL('/api/goldoil/market', 'http://x')), false);
     assert.equal((await s.read(token, '/api/goldoil/market')).status, 403);
+    assert.equal(readTokenAllows(new URL('/api/varlighter/live', 'http://x')), true);
+    assert.equal(readTokenAllows(new URL('/api/varlighter/entropy-cost?from=0&limit=10', 'http://x')), true);
+    assert.equal(readTokenAllows(new URL('/api/varlighter/symbol?symbol=var:AAPL|rh:AAPL&hours=24&points=0', 'http://x')), true);
+    assert.equal(readTokenAllows(new URL('/api/varlighter/accounts', 'http://x')), false);
   } finally { await s.close(); }
 });
 
@@ -328,9 +332,13 @@ test('打码：字段名不分大小写与下划线；地址类字段里的地�
   for (const text of ['UID 88776655, not configured', 'account 12345678.', 'uid=12345678.', 'Binance account 12345678 USDT-M', 'UID 1234567 U本位', '子账户 12345678 个人', 'account 12345678 BTCUSDT', 'UID 12345678 次日'])
     assert.ok(!(redact({ text }) as { text: string }).text.includes(/\d{5,}/.exec(text)![0]), text);
   assert.equal((redact({ text: '账户 12345678.5 USDT，UID 1,234,567 元' }) as { text: string }).text, '账户 12345678.5 USDT，UID 1,234,567 元', '小数与千分位是金额');
+  const idx = redact({ accountIndex: 998877, account_index: '998877', marketIndex: 7, market_index: 8, apiKeyIndex: 5, api_key_index: 6 }) as Record<string, unknown>;
+  assert.match(String(idx.accountIndex), /^acct-/);
+  assert.equal(idx.account_index, idx.accountIndex);
+  assert.deepEqual([idx.marketIndex, idx.market_index, idx.apiKeyIndex, idx.api_key_index], [7, 8, 5, 6]);
   assert.match(String(words.user), /^acct-/);
   assert.equal(seen.get(String(out.wallet)), ADDRESS);
-  assert.ok(identifierField('walletAddress') && identifierField('sub-account-id') && !identifierField('pairId'));
+  assert.ok(identifierField('walletAddress') && identifierField('sub-account-id') && identifierField('accountIndex') && !identifierField('pairId'));
 });
 
 // Identifier-named fields known to hold a count, not an id; any other number under an identifier field counts as an original.
@@ -652,4 +660,31 @@ test('只读令牌：打码覆盖 problem 与 note；system 范围从 /api/statu
     assert.deepEqual(sysHost.connections.map(row => row.id), ['okx']);
     assert.deepEqual(fullHost.connections.map(row => row.id), ['streams', 'okx']);
   } finally { await s.close(); }
+
+  // varlighter 只读路由与 portfolio 范围、脱敏及 accounts 拦截的端到端校验：
+  const vl = await start({
+    extra: {
+      varlighter: {
+        page: async req => req.path === 'live'
+          ? { status: 200, body: { settings: { on: true }, accountIndex: 123456, wallet: ADDRESS, positions: [{ id: 'l-1', symbol: 'lighter:NVDA|entropy:NVDA', orders: [{ role: 'openA', confirmSource: 'ws' }] }] } }
+          : req.path === 'entropy-cost'
+            ? { status: 200, body: { configured: true, accountIndex: 123456, records: [] } }
+            : { status: 404, body: { code: 'not_found' } },
+      },
+    },
+  });
+  try {
+    const sysToken = await vl.generate(['system'], '系统');
+    const portToken = await vl.generate(['portfolio'], '组合');
+    for (const p of ['/api/varlighter/live', '/api/varlighter/entropy-cost?from=0&limit=10']) {
+      const denied = await vl.read(sysToken, p);
+      assert.equal(denied.status, 403, p);
+      assert.equal((await denied.json() as { code: string }).code, 'token_scope');
+      const ok = await vl.read(portToken, p);
+      assert.equal(ok.status, 200, p);
+      const bodyText = await ok.text();
+      assert.ok(!bodyText.includes('123456') && !bodyText.includes(ADDRESS), `${p} 应答已脱敏`);
+    }
+    assert.equal((await vl.read(portToken, '/api/varlighter/accounts')).status, 403);
+  } finally { await vl.close(); }
 });

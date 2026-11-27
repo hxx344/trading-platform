@@ -5,10 +5,12 @@ import { readSymbolParams, readGlobalParams, DEFAULT_SYMBOL, DEFAULT_GLOBAL } fr
 import { backtestRequest } from '../../src/varlighter/backtest.ts';
 import { pairKey, parsePairKey } from '../../src/varlighter/model.ts';
 import { readCustomPair } from '../../src/varlighter/engine.ts';
+import { DEFAULT_LIVE_EXEC, readLiveExecSettings } from '../../src/varlighter/live.ts';
 import {
   EMPTY_PAIR_FORM, backtestBody, bps, bytesPerDay, chartRange, chartRows, comboLabel, comboShort, customPairKey, customPairRequest, directionLabel, directionShort, fundingAnnual, globalForm, globalRequest,
   SIMPLE_SORT_KEYS, directionSides, entryProgress, matchesCombo, pairLabel, readOverviewMode, rebateAudit, settingsBody, signal, sortRows, costBreakdown, symbolForm, symbolRequest, toggleConfirmed, usd, varLighterHref, AUTO_FIELDS, autoBody, autoFormPatch, quickEnableBody,
   VARLIGHTER_TABS, reasonLabel, ACCOUNT_VENUE_FILTERS, accountActivityFoot, filterAccountPositions, filterAccountTrades, filterAccountFunding, selectedEquitySeries, selectedVenuePnlCurve, formatCurrencyAmount, signedCurrencyAmount, formatRatePct, marginModeLabel, tradeDirLabel, accountHealthBadge,
+  liveExecForm, parseLiveExec, tradeTelemetrySummary,
 } from '../src/varlighter/varlighter-form.ts';
 import { parseRoute } from '../src/route-parse.ts';
 
@@ -301,4 +303,24 @@ test('cost sorting prefers totalCost and rebateAudit calculates real fee rates',
   assert.equal(rebateAudit({ notionalUsd: 100, usdcFeeUsd: 0.01, assumedFeeBps: 0.2, weightedHypePriceUsd: 60 }), null);
   const directUsd = rebateAudit({ notionalUsd: 10_000, usdcFeeUsd: 0.864, assumedFeeBps: null, weightedHypePriceUsd: null, payoutUsd: 0.6912 });
   assert.ok(directUsd && Math.abs(directUsd.realOneWayBps - 0.1728) < 1e-9 && directUsd.deltaOneWayBps === null);
+});
+
+test('live exec form round-trips with server readLiveExecSettings and formats trade telemetry', () => {
+  const form = liveExecForm(DEFAULT_LIVE_EXEC);
+  const parsed = parseLiveExec(form);
+  assert.ok(parsed.ok);
+  assert.deepEqual(parsed.value, DEFAULT_LIVE_EXEC);
+  assert.deepEqual(readLiveExecSettings(parsed.value), DEFAULT_LIVE_EXEC);
+  assert.equal(parseLiveExec({ ...form, openLegASlippageBps: '31' }).ok, false);
+  assert.equal(parseLiveExec({ ...form, confirmMs: '1.5' }).ok, false);
+  assert.equal(parseLiveExec({ ...form, notFilledCooldownSec: '4' }).ok, false);
+  assert.equal(parseLiveExec({ ...form, maxLeverage: '0.5' }).ok, false);
+  assert.equal(parseLiveExec({ ...form, maxLeverage: '5.5' }).ok, false);
+  assert.equal(parseLiveExec({ ...form, maxLeverage: '' }).ok, false);
+  assert.deepEqual(parseLiveExec({ ...form, maxLeverage: '2.5' }), { ok: true, value: { ...DEFAULT_LIVE_EXEC, maxLeverage: 2.5 } });
+  assert.deepEqual(parseLiveExec({ ...form, maxLeverage: '5' }), { ok: true, value: { ...DEFAULT_LIVE_EXEC, maxLeverage: 5 } });
+  assert.equal(tradeTelemetrySummary({}), null);
+  assert.equal(tradeTelemetrySummary({
+    orders: [{ role: 'openA', leg: 'a', venue: 'lighter', side: 'sell', clientId: 1, qty: 1, filledQty: 1, expectedPrice: 100, limitPrice: 99.98, avgPrice: 99.99, slippageBps: 1, signalAt: 1000, sentAt: 1010, ackAt: 1050, confirmAt: 1190, confirmSource: 'ws', status: '已成交' }],
+  }), 'WS · 180 ms · A滑点 +1.0 bps（共 1 笔单）');
 });

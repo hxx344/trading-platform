@@ -63,7 +63,7 @@ test('MCP：DEX 价差、服务器状态、监控报价与快讯工具经令牌�
   const p = await platform();
   try {
     const get = platformGet({ base: new URL(p.base), token: p.token });
-    for (const [name, args] of [['varlighter', {}], ['varlighter', { view: 'symbol', symbol: 'rh:AAPL', hours: 48 }], ['varlighter', { view: 'symbol', symbol: 'lighter:SOL|rh:ETH@0.05' }], ['host_status', {}], ['market_quotes', {}], ['market_quotes', { market: 'goldoil' }], ['news', { view: 'moves' }]] as const) {
+    for (const [name, args] of [['varlighter', {}], ['varlighter', { view: 'live' }], ['varlighter', { view: 'entropy_cost' }], ['varlighter', { view: 'symbol', symbol: 'rh:AAPL', hours: 48 }], ['varlighter', { view: 'symbol', symbol: 'rh:AAPL', points: 100 }], ['varlighter', { view: 'symbol', symbol: 'lighter:SOL|rh:ETH@0.05' }], ['host_status', {}], ['market_quotes', {}], ['market_quotes', { market: 'goldoil' }], ['news', { view: 'moves' }]] as const) {
       const answer = await call(get, name, args);
       assert.equal(answer.result?.isError, undefined, `${name}：${answer.result?.content[0]?.text}`);
       assert.doesNotMatch(answer.result!.content[0]!.text, /0x[0-9a-fA-F]{40}|\*\*\*1234/, name);
@@ -79,7 +79,7 @@ test('MCP：参数逐项校验；多余参数、未知工具、错误令牌都�
       ['logs', { limit: 500 }, /limit 须为 1–200/], ['logs', { before: '0x1' }, /before/], ['aster_pair', { pairId: '../asset' }, /pairId/], ['aster_pair', {}, /pairId/],
       ['oil_hynix', { view: 'pnl', range: '../x' }, /range/], ['oil_hynix', { range: '7d' }, /只适用于 view=pnl/], ['module_state', { module: 'asset' }, /module/], ['module_state', { module: 'ondo', view: 'performance' }, /performance/],
       ['platform_status', { path: '/api/asset/state' }, /不支持的参数：path/],
-      ['varlighter', { view: 'symbol' }, /需要 symbol/], ['varlighter', { symbol: 'rh:AAPL' }, /只适用于 view=symbol/], ['varlighter', { view: 'symbol', symbol: 'AAPL' }, /需要 symbol/],
+      ['varlighter', { view: 'symbol' }, /需要 symbol/], ['varlighter', { symbol: 'rh:AAPL' }, /只适用于 view=symbol/], ['varlighter', { view: 'live', points: 10 }, /只适用于 view=symbol/], ['varlighter', { view: 'symbol', symbol: 'AAPL' }, /需要 symbol/],
       ['varlighter_backtest', { symbol: 'rh:AAPL', grid: { entryBps: Array.from({ length: 21 }, (_, i) => i), exitBps: Array.from({ length: 10 }, (_, i) => i) } }, /超过上限 200/],
       ['varlighter_backtest', { symbol: 'rh:AAPL', grid: { paused: [true] } }, /不能扫 paused/], ['varlighter_backtest', { symbol: 'rh:AAPL', grid: { foo: [1] } }, /不是标的参数或全局参数/],
       ['market_quotes', { market: 'perpetual' }, /market 须为/], ['news', { view: 'all' }, /view 须为/],

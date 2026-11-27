@@ -814,3 +814,48 @@ DEX 服务的 `GET /dex/v1/accounts` 端点直接复用引擎的 `accountSource(
   - `test/varlighter.test.ts`：两腿行情流配对按推送驱动实盘（库里预置 v0.111 的持仓）。浮盈与止损按实际成交价而不是记下的信号价差。止损按开仓时记下的平仓规则：配对当前止损 5000、记下的 60，按 60 平。平仓途中不再判断、不重复下单。结束后冷却至少 1 分钟并写库，详情页列出这笔实盘成交。引擎按策略信号真正开出实盘仓：开仓意图写库前这一刻的样本已落盘，名义取配对名义与单笔上限中较小的，手动参数不带平仓规则，入场价差按两腿实际成交、`paperId` 为自己的编号。实盘持仓还原成策略持仓：v0.111.2 的旧记录没有 `strategy` 时名义取 A 腿成交额，部分平掉后按剩余数量，乘数折算 B 腿；失联配对的实盘持仓手动平仓一次后再发返回 409，需要人工处理的也返回 409。冷却过后被实盘挡下（账户读数不够新）时不留记录、不写样本，事件只一条。实盘取消勾选后不再判断。风控读数改为 `liveNetSince` 之后仍检查两腿年龄，超界记「报价过旧」，恰好达界交给实盘。Var 配对只采集：冲高时不开仓、不留持仓，询价照常记进样本。样本只推进一次、写失败可重试。迁移后的旧模拟持仓留在库里。`paper` 三个接口返回 404。
   - `test/read-token.test.ts`、`web/test/varlighter-form.test.mjs`：去掉 `paper`。`#/varlighter/paper` 回到总览，平仓原因的中文名有测试。`test/varlighter-paper-commit.test.ts` 删除。
 - 审查记录：[reviews/2026-11-28-dex-remove-paper.md](reviews/2026-11-28-dex-remove-paper.md)。
+
+## 19. 实盘执行优化、Lighter 私有流与全链路遥测（v0.113.0，R3）
+
+### 19.1 背景与基线问题
+
+线上 `v0.112.2` 实盘暴露两类瓶颈：
+
+1. **余额卡死 0 成交**：`blocker()` 在可用余额略低于 `perTradeUsd` 时整笔拒绝（线上 `rh` 可用 `499.75 USDG`、`lighter` `499.62` 低于 `500` 导致 8,524 次推送检查 0 成交）。
+2. **执行退化与观测缺口**：
+   - 开仓 A 腿沿用全局 `30 bps` 滑点，且提交前与发单前只检单腿限价、不重算两腿实时可执行价差，导致瞬时毛刺塌缩与逆向滑点直接成交；
+   - `closing` 状态两腿串行平仓，拉长平仓暴露窗口；
+   - Lighter 查单仅依赖 `700 ms` 间隔 REST 轮询，没有私有 WS 订单流；
+   - A 腿未成走配对长冷却，默认 `exitBps = 0` 且缺失平仓价差护栏；
+   - 现有记录缺乏逐单耗时（`signalAt` / `sentAt` / `ackAt` / `confirmAt`）、确认来源、逆向滑点、信号时刻盘口、持久化拒绝计数，且 MCP 读取 `/api/varlighter/symbol` 易因走势点超 100 KiB 截断，缺 `/api/varlighter/live` 与 `/api/varlighter/entropy-cost` 只读通路。
+
+### 19.2 方案与范围（R3 事前设计）
+
+不修改执行器核心、划转逻辑、凭据格式与 SQLite 表结构，新增实盘执行设置与统计使用独立 `state` 键（`liveExec`、`liveSkipStats`），不改动 `liveSettings` 字段白名单，确保可平滑回滚到 `v0.112.2`。
+
+1. **资金利用率解锁与保证金倍率上限**：新增 `exec.autoSizeByBalance`（默认 `true`）与 `exec.maxLeverage`（默认 `1`，范围 `1–5`，须先在交易所手动设好 ≥ 该倍率的杠杆）。`maxLeverage = 1` 时保持 `<= 1x` 可用保证金并在略低时按 `Math.floor(minAvailable * 0.95)` 自动缩量；`maxLeverage > 1` 时单笔上限按 `可用余额 × 倍率 × 95%` 强制留出 5% 缓冲，且在账户定时刷新间隔内扣除同周期刚开持仓已占用的估算保证金（`notionalUsd / maxLeverage`），防止多笔并发开仓重复占用同一笔可用余额；对齐步长后低于 `minQuote` 再拦截。
+2. **Lighter 私有 WS + 快速 REST 兜底**：
+   - 新增 `src/varlighter/lighter-private.ts`：按 `(venue, accountIndex)` 维护 `account_all_orders/{accountIndex}` 私有订阅，token 到期前续期、静默重连、有界缓存已终结订单；显式管理组合中止监听并在 `finally` 清理（L206），日志与状态严格脱敏 `auth` 与账户索引（L207）。
+   - `createLighterTrader` 在发送 `POST /sendTx` **之前**预先登记 waiter，主路径等待 WS 终态 `1500 ms`，超时或流未就绪无缝回退到快速 REST 轮询（首轮 `320 ms`、后续 `200 ms`），保持 L039/L093/L212 幂等与过期安全；当 `live.on` 开启或存在活跃持仓时提前预热私有流，并在 `dropVenueCaches` 与 `close()` 时立刻断开。
+3. **不减速的防滑点保护与并发平仓**：
+   - `orderPlan` 区分 A/B 腿滑点：开仓 A 腿采用 `exec.openLegASlippageBps`（默认 `2 bps`，`0–30`），开仓对冲 B 腿与两腿平仓采用 `limits.slippageBps`（默认 `30 bps`）。
+   - `prepare()` 提交前及 `advance()` 发 A 腿前增加 `liveSpreadProblem` 实时两腿可执行价差复算，确保实时价差与净收益仍满足开仓门槛（复用 `strategy.ts` 净收益与成本口径）。
+   - `closing` 状态下两腿均只减仓（`reduceOnly: true`），通过单次 `saveLiveIntent` 事务原子落盘 `pending` 与 `pendingB`，再以 `Promise.allSettled` 并发下单与核对；未真正发出的 `NotSentError` 不扣减轮询重试计数。
+   - A 腿 `not_filled` 单独采用 `exec.notFilledCooldownSec`（默认 `30 s`）；信号反毛刺持续期 `exec.confirmMs` 默认 `0 ms`（零延迟），支持 `0–10000 ms` 配置；`recommendParams` 默认 `exitBps = -2`；`decide()` 为 `revert` 增加出场价差成本护栏（当前盘口估算成本 `exitCost > max(15, 2.5 * entryCostBps)` 且 `pnlBps < 0` 时暂缓 `revert`，绝不阻塞 `stop`/`timeout`）。
+4. **全链路遥测与只读观测**：
+   - `LivePosition` 扩展可选字段：`orders?: LiveOrderTelemetry[]`、`pendingB`、`closeSignalAt`、`plan.expected`，`LiveStrategy` 扩展 `entryCostBps`、`signalBbo` 与 `check?: LiveEntryCheck`；`state` 表新增 `liveExec` 与按自然日归档的 `liveSkipStats`；`LiveView` 暴露 `exec`、`privateStreams`、`skipStats`。
+   - `/api/varlighter/symbol` 支持 `points`（`0–1500`）；`src/read-token.ts`（`portfolio` 范围，严禁导入 `src/varlighter/*`）与 `tools/mcp/readonly.ts` 放行 `/api/varlighter/live`、`/api/varlighter/entropy-cost` 与 `symbol?points=`。
+   - 前端 `VarLighterLive` 与表单校验同步增加 `exec` 字段（含 `maxLeverage` 1–5×）编辑、开启高倍率二次风险提示、L089 脏状态保留、WS 私有流状态、日级跳过统计及逐单滑点/耗时/来源展示。
+
+### 19.3 影响面、退化与回滚
+
+- **影响面**：DEX 价差服务（`src/varlighter/{lighter-private,orders,strategy,plan,live,engine,views}.ts`、`src/dex/host.ts`）、执行服务只读与脱敏路由（`src/read-token.ts`、`src/read-redact.ts`）、MCP 工具（`tools/mcp/readonly.ts`）、Web 页面与预览（`web/src/varlighter/*`、`scripts/dev-varlighter.ts`）。
+- **失败退化**：私有 WS 未就绪、断线或 1500 ms 超时时无感退回 REST 轮询并计入 `restFallbacks`；两腿并发平仓中任意一腿异常转回 `resolvePending` 与 `waitQuote` / `stuck` 既有恢复路径。
+- **回滚版本**：`v0.112.2`。因 SQLite 无结构变更且 `liveSettings` 键未增删字段，回滚至 `v0.112.2` 时旧版忽略新增 JSON 字段与 `liveExec`/`liveSkipStats` 键，不重置开关与限额。
+
+### 19.4 验证与实施回填
+
+- 对照页面：本地预览 `scripts/dev-varlighter.ts` 实盘准备页（`#/varlighter/ready`）与总览页（`#/varlighter`）；线上无工作台对照页面。
+- 本机定向验证（最终代码修改后全部通过）：`pnpm check`、`pnpm build:web`、`node deploy/component-digests.mjs .`（组件摘要隔离通过，已清理生成的 `.*sha256`）、`test/dex-live.test.ts`、`test/dex-orders.test.ts`、`test/varlighter.test.ts`、`test/mcp-readonly.test.ts`、`test/dex-service.test.ts`、`web/test/varlighter-form.test.mjs`、`test/read-token.test.ts`（`白名单外的|打码：|打码覆盖` 用例），其余受影响模块测试（`test/dex-{accounts,entropy-cost,hyperliquid,keys,lighter-signer,livekeys}.test.ts`、`test/varlighter-local.test.ts`、`test/boundaries.test.ts`、`test/read-token-form.test.ts`、`test/web-css.test.ts`）在本轮纯 `varlighter`/`read-redact` 收尾前通过；Windows 非管理员环境无法测的 `test/read-token.test.ts:247`（NTFS `0o600`）与 `test/web.test.ts:47`（`symlinkSync`）及全仓 216 个测试文件由推送后的 Ubuntu CI 统一验收。
+- 浏览器验收：在 `127.0.0.1:4743` 启动 `scripts/dev-varlighter.ts`，内置浏览器于 `1280×800` 与 `390×844` 两轮走查 `#/varlighter/ready` 与 `#/varlighter`，零 console/pageerror/CSP 报错，无横向溢出；核实「执行优化」输入项、`今日跳过 14 次` 统计条及已平仓 `WS`/`REST` 耗时滑点摘要正常显示；验证 `confirmMs=300` 与 `maxLeverage=2`（含开启实盘二次风险弹窗 `当前保证金倍率上限 2×`）保存返回 200 并写入对应实盘事件，刷新页面均准确回显（预览未录入 Lighter 实盘密钥，私有流状态条逻辑由 `dex-orders.test.ts`、`varlighter.test.ts`、`engine.ts` 与 `tsc` 覆盖）。
+- 审查记录：[reviews/2026-11-28-dexspread-live-optimization.md](reviews/2026-11-28-dexspread-live-optimization.md)（三轮 R3 独立审查闭环，0 个 P0/P1/P2）。

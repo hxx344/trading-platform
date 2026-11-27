@@ -194,6 +194,10 @@ a.vl-symbol:hover{color:var(--accent)}
 .vl-live-keyhead{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .vl-live-inline{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:8px}
 .vl-live-key .vl-live-inline{margin-top:0}
+.vl-live-status{display:flex;flex-wrap:wrap;gap:6px 14px;padding:6px 14px 2px;font-size:.75rem;align-items:center}
+.vl-live-status>span{display:inline-flex;flex-wrap:wrap;align-items:center;gap:6px;min-width:0;overflow-wrap:anywhere}
+.vl-live-checkrow{display:inline-flex;align-items:center;gap:8px;min-height:34px;color:var(--text-primary);font-size:.8125rem;cursor:pointer}
+.vl-live-checkrow input{width:16px;height:16px;margin:0;accent-color:var(--emerald);cursor:pointer}
 @media (max-width:1100px){.vl-live-keys{grid-template-columns:minmax(0,1fr)}}
 
 /* 账户资产（VarLighterAccounts.tsx） */

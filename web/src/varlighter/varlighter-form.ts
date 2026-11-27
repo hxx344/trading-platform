@@ -2,6 +2,7 @@
 // 配对键与场所名、手动配对的表单、走势图的行数据。由 web/test/varlighter-form.test.mjs 覆盖。
 import type { KeyVenue } from '../../../src/dex/keys.ts';
 import type { AccountFunding, AccountTrade } from '../../../src/varlighter/accounts.ts';
+import type { LiveExecSettings, LivePosition } from '../../../src/varlighter/live.ts';
 import type { AssetKind, Combo, CustomPair, Regime, VarPriceSource, VenueId } from '../../../src/varlighter/model.ts';
 import type { AutoParams, Direction, GlobalParams, SymbolParams } from '../../../src/varlighter/strategy.ts';
 import type { AccountsView, Settings, StateRow, SymbolPoint, VenueAccountView, VenuePositionView } from '../../../src/varlighter/views.ts';
@@ -392,6 +393,44 @@ export function selectedVenuePnlCurve(
 }
 
 export const accountPnlTone = (value: number | null | undefined): 'up' | 'down' | '' => tone(value);
+
+// ---- 实盘执行优化与订单遥测 ----
+export interface LiveExecForm { openLegASlippageBps: string; confirmMs: string; notFilledCooldownSec: string; maxLeverage: string; autoSizeByBalance: boolean }
+export const LIVE_EXEC_FIELDS: readonly { key: 'openLegASlippageBps' | 'confirmMs' | 'notFilledCooldownSec' | 'maxLeverage'; label: string; min: number; max: number; integer?: boolean; hint: string }[] = [
+  { key: 'openLegASlippageBps', label: '开仓 A 腿滑点（基点）', min: 0, max: 30, hint: '默认 2（0–30），收紧第一腿限价减少逆向吃单' },
+  { key: 'confirmMs', label: '信号持续确认（毫秒）', min: 0, max: 10_000, integer: true, hint: '默认 0 不延迟；设 >0 需信号连续维持该时长才开仓' },
+  { key: 'notFilledCooldownSec', label: 'A 腿未成冷却（秒）', min: 5, max: 3_600, integer: true, hint: '默认 30 秒（5–3600），与真实成交冷却分离' },
+  { key: 'maxLeverage', label: '保证金倍率上限', min: 1, max: 5, hint: '默认 1（1–5×），>1 按可用余额 × 倍率 × 95% 估算上限；须先在各交易所设好 >= 该倍率杠杆' },
+];
+export const liveExecForm = (exec: LiveExecSettings): LiveExecForm => ({
+  openLegASlippageBps: String(exec.openLegASlippageBps),
+  confirmMs: String(exec.confirmMs),
+  notFilledCooldownSec: String(exec.notFilledCooldownSec),
+  maxLeverage: String(exec.maxLeverage),
+  autoSizeByBalance: exec.autoSizeByBalance,
+});
+export function parseLiveExec(form: LiveExecForm): Parsed<LiveExecSettings> {
+  const out = { autoSizeByBalance: form.autoSizeByBalance } as LiveExecSettings;
+  for (const field of LIVE_EXEC_FIELDS) {
+    const raw = form[field.key].trim();
+    const num = Number(raw);
+    if (!raw || !Number.isFinite(num)) return { ok: false, error: `${field.label}须填数字` };
+    if (field.integer && !Number.isInteger(num)) return { ok: false, error: `${field.label}须为整数` };
+    if (num < field.min || num > field.max) return { ok: false, error: `${field.label}须在 ${field.min} 到 ${field.max} 之间` };
+    out[field.key] = num;
+  }
+  return { ok: true, value: out };
+}
+const CONFIRM_SOURCE_LABEL: Record<string, string> = { ws: 'WS', rest: 'REST', sync: '同步', account: '对账' };
+export function tradeTelemetrySummary(trade: Pick<LivePosition, 'orders'>): string | null {
+  const orders = trade.orders;
+  if (!orders?.length) return null;
+  const openA = orders.find(item => item.role === 'openA') ?? orders[0]!;
+  const src = CONFIRM_SOURCE_LABEL[openA.confirmSource] ?? openA.confirmSource;
+  const ms = Math.max(0, Math.round(openA.confirmAt - openA.sentAt));
+  const slip = openA.slippageBps === null ? '' : ` · A滑点 ${openA.slippageBps >= 0 ? '+' : ''}${openA.slippageBps.toFixed(1)} bps`;
+  return `${src} · ${ms} ms${slip}（共 ${orders.length} 笔单）`;
+}
 
 export function formatCurrencyAmount(value: number | null | undefined, currency: string, digits = 2): string {
   if (!finite(value)) return '—';

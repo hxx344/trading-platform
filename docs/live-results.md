@@ -146,3 +146,13 @@
 
 - Lighter 主网只读接口 `https://mainnet.zklighter.elliot.ai/api/v1/account?by=index&value=<id>&active_only=true` 的真实字段（`accounts[0].total_asset_value` 与 `accounts[0].l1_address`，接口仅读取 `total_asset_value` 而不读取 `collateral`）与按 USDC/USD 折算后的「DEX 价差」行估值与官网账户权益一致。
 - 当同一个 Hyperliquid 主账户地址或同 L1 地址的 Lighter RH 账户（含名下子账户编号）同时出现在「资产 → 交易所连接」与「DEX 价差」中时，资产同步及随后连接均自动完成去重而不双算总额，且全页明细与数据库无明文钱包地址或账户编号残留。
+
+## 待实测：Lighter 私有 WS 与实盘执行优化（dexspread.md 第 19 节，v0.113.0）
+
+只在替身 WS / REST 接口与本地预览上验证过，尚未连过真实 Lighter 主网 / RH 私有订单流与紧平衡资金实盘。用户开启实盘并产生开平仓或拦截记录后核对，结果回填本节与 [dexspread.md](dexspread.md)：
+
+- Lighter 主网（`wss://mainnet.zklighter.elliot.ai/stream`）与 Lighter RH（`wss://api.rh.lighter.xyz/stream`）私有频道 `account_all_orders/{accountIndex}`：验证认证 `auth` token 订阅首包、实际成交/撤单终态推送延迟，以及 1500 ms 超时无感回退 `320 ms / 200 ms` REST 轮询时的限流余量。
+- 余额紧平衡自适应缩量与保证金倍率上限（`exec.autoSizeByBalance`、`exec.maxLeverage`）：核实 `1×` 下可用余额略低于 `perTradeUsd`（例如 `499 USDG` vs `500`）按 `floor(minAvailable * 0.95)` 自动下单成功；如启用 `maxLeverage > 1`（`1–5`），核实在各交易所手动设置 ≥ 该倍率的合约杠杆后，按 `可用余额 × 倍率 × 95%` 开仓与多笔同时持仓时对冲腿不因保证金不足拒单或单边爆仓。
+- A 腿窄滑点（默认 `2 bps`）与实时价差二次复核：统计真实成交率、`not_filled` 30s 短冷却与真实 `orders[].slippageBps`（对比此前 `30 bps` 全局滑点的改善幅度），核实 `liveSkipStats` 日级分桶准确反映拒单分布。
+- 并发只减仓平仓：实测 `closing` 状态同时发出 A/B 两条 `reduceOnly: true` 平仓单后的双腿完成耗时与部分未成交退避表现。
+- 只读 MCP `/api/varlighter/live`、`/api/varlighter/entropy-cost` 与 `symbol?points=0`：在真实只读令牌下确认返回字段、脱敏（无 `clientId` 泄露身份、无账号明文）及返回体不再被 100 KiB 截断。

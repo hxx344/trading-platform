@@ -9,6 +9,8 @@ import { signL1Action, type PackValue } from '../src/varlighter/hyperliquid.ts';
 import type { LighterOrderInput, LighterSigner } from '../src/varlighter/lighter-signer.ts';
 import type { MarketSpec } from '../src/varlighter/model.ts';
 import { ORDER_EXPIRY_MS, cloidOf, createEntropyTrader, createLighterTrader, scrub, type ResolveOutcome, type VenueOrder } from '../src/varlighter/orders.ts';
+import { LighterPrivateStream } from '../src/varlighter/lighter-private.ts';
+import type { SocketLike } from '../src/varlighter/feeds.ts';
 
 const T0 = Date.parse('2026-11-27T15:00:00Z');
 const ENTROPY_KEY = '0x' + '11'.repeat(32), LIGHTER_KEY = 'ab'.repeat(40);
@@ -71,7 +73,7 @@ test('Entropy 下单：成交回报给出数量与均价；请求体带自编号
   const h = entropyHarness();
   h.exchange = () => filled('0.5', '100.2');
   const outcome = await h.trader.place(order(IO, 1_800_000_000_001), signalFor);
-  assert.deepEqual(outcome, { kind: 'done', filledQty: 0.5, avgPrice: 100.2, note: '已成交' });
+  assert.deepEqual(outcome, { kind: 'done', filledQty: 0.5, avgPrice: 100.2, note: '已成交', ackAt: T0, confirmAt: T0, confirmSource: 'sync' });
   assert.deepEqual(h.calls.map(call => call.url), [ENTROPY_ENDPOINTS.info, EXCHANGE]);
   assert.deepEqual(h.calls[0]!.body, { type: 'perpDexs' });
   const body = h.sent()[0]!.body;
@@ -86,7 +88,7 @@ test('Entropy 下单：成交回报给出数量与均价；请求体带自编号
   // 第二笔：卖出只减仓；盘序号已缓存不再读，nonce 在同一毫秒内也递增。
   h.exchange = () => filled('0.25', '0');
   const second = await h.trader.place(order(IO, 1_800_000_000_002, { side: 'sell', qty: 0.25, limit: 99.5, reduceOnly: true }), signalFor);
-  assert.deepEqual(second, { kind: 'done', filledQty: 0.25, avgPrice: null, note: '已成交' }, '没有有效均价时为 null，由上层按限价估');
+  assert.deepEqual(second, { kind: 'done', filledQty: 0.25, avgPrice: null, note: '已成交', ackAt: T0, confirmAt: T0, confirmSource: 'sync' }, '没有有效均价时为 null，由上层按限价估');
   assert.equal(h.calls.filter(call => call.body?.type === 'perpDexs').length, 1);
   const next = h.sent()[1]!.body;
   assert.deepEqual([next.action.orders[0].b, next.action.orders[0].r, next.action.orders[0].s, next.nonce], [false, true, '0.25', T0 + 1]);
@@ -107,13 +109,13 @@ test('Entropy 下单：IOC 没有对手盘是确定的未成交，交易所拒�
 
   h.exchange = () => json({ status: 'err', response: `User or API Wallet ${ADDRESS} does not exist.` });
   const rejected = await h.trader.place(order(IO, 12), signalFor);
-  assert.deepEqual(rejected, { kind: 'done', filledQty: 0, avgPrice: null, note: '交易所拒绝：User or API Wallet 0x… does not exist.' });
+  assert.deepEqual(rejected, { kind: 'done', filledQty: 0, avgPrice: null, note: '交易所拒绝：User or API Wallet 0x… does not exist.', ackAt: T0, confirmAt: T0, confirmSource: 'sync' });
   clean(rejected, '拒绝');
   h.exchange = () => json({ status: 'err', response: { code: 1 } });
-  assert.deepEqual(await h.trader.place(order(IO, 13), signalFor), { kind: 'done', filledQty: 0, avgPrice: null, note: '交易所拒绝：未说明原因' });
+  assert.deepEqual(await h.trader.place(order(IO, 13), signalFor), { kind: 'done', filledQty: 0, avgPrice: null, note: '交易所拒绝：未说明原因', ackAt: T0, confirmAt: T0, confirmSource: 'sync' });
   // 4xx（格式、限流）：交易所没有受理。
   h.exchange = () => text('Too Many Requests', 429);
-  assert.deepEqual(await h.trader.place(order(IO, 14), signalFor), { kind: 'done', filledQty: 0, avgPrice: null, note: '交易所没有受理（HTTP 429）' });
+  assert.deepEqual(await h.trader.place(order(IO, 14), signalFor), { kind: 'done', filledQty: 0, avgPrice: null, note: '交易所没有受理（HTTP 429）', ackAt: T0, confirmAt: T0, confirmSource: 'sync' });
   h.exchange = () => json({ error: 'bad' }, 422);
   assert.equal((await h.trader.place(order(IO, 15), signalFor)).kind, 'done');
   h.exchange = () => text('Bad Request', 400);
@@ -125,7 +127,7 @@ test('Entropy 下单：IOC 没有对手盘是确定的未成交，交易所拒�
   }
   // 部分成交照实报。
   h.exchange = () => filled('0.2', '100.4');
-  assert.deepEqual(await h.trader.place(order(IO, 16), signalFor), { kind: 'done', filledQty: 0.2, avgPrice: 100.4, note: '已成交' });
+  assert.deepEqual(await h.trader.place(order(IO, 16), signalFor), { kind: 'done', filledQty: 0.2, avgPrice: 100.4, note: '已成交', ackAt: T0, confirmAt: T0, confirmSource: 'sync' });
 });
 
 test('Entropy 下单：HTTP 5xx、超时、断网、读不懂的应答一律是结果未知，绝不当成没成交', async () => {
@@ -186,13 +188,13 @@ test('Entropy 查单：按自编号查，成交与撤销照实报；查不到报
   const target = order(IO, 1_800_000_000_009), sentAt = T0;
   const found = (state: string, original: string, remaining: string) => json({ status: 'order', order: { order: { coin: 'io:NVDA', side: 'B', limitPx: '100.5', sz: remaining, oid: 77, origSz: original, cloid: cloidOf(target.clientId) }, status: state, statusTimestamp: T0 } });
   h.status = () => found('filled', '0.5', '0.0');
-  assert.deepEqual(await h.trader.resolve(target, sentAt, signalFor), { kind: 'done', filledQty: 0.5, avgPrice: null, note: '查单结果：filled' });
+  assert.deepEqual(await h.trader.resolve(target, sentAt, signalFor), { kind: 'done', filledQty: 0.5, avgPrice: null, note: '查单结果：filled', confirmAt: T0, confirmSource: 'rest' });
   assert.deepEqual(h.calls[0], { url: ENTROPY_ENDPOINTS.info, body: { type: 'orderStatus', user: ADDRESS, oid: cloidOf(target.clientId) }, raw: h.calls[0]!.raw });
   assert.equal(h.sent().length, 0, '查单不发任何订单');
   h.status = () => found('canceled', '0.5', '0.3');
-  assert.deepEqual(await h.trader.resolve(target, sentAt, signalFor), { kind: 'done', filledQty: 0.2, avgPrice: null, note: '查单结果：canceled' });
+  assert.deepEqual(await h.trader.resolve(target, sentAt, signalFor), { kind: 'done', filledQty: 0.2, avgPrice: null, note: '查单结果：canceled', confirmAt: T0, confirmSource: 'rest' });
   h.status = () => found('iocCancelRejected', '0.5', '0.5');
-  assert.deepEqual(await h.trader.resolve(target, sentAt, signalFor), { kind: 'done', filledQty: 0, avgPrice: null, note: '查单结果：iocCancelRejected' });
+  assert.deepEqual(await h.trader.resolve(target, sentAt, signalFor), { kind: 'done', filledQty: 0, avgPrice: null, note: '查单结果：iocCancelRejected', confirmAt: T0, confirmSource: 'rest' });
 
   // 查不到：连接器只报 absent，过了订单过期时限也一样；判不判零成交由上层结合持仓决定。
   h.status = () => json({ status: 'unknownOid' });
@@ -267,9 +269,9 @@ test('Lighter 下单：取 nonce、签名、发送、按自编号查到成交；
   // 第一次还查不到，第二次查到全部成交。
   h.lookups.push(orders(), orders(lighterOrder(555, 'filled', '0.50', '50.1')));
   const outcome = await h.trader.place(order(M7, 555), signalFor);
-  assert.deepEqual(outcome, { kind: 'done', filledQty: 0.5, avgPrice: 100.2, note: '已成交' });
+  assert.deepEqual(outcome, { kind: 'done', filledQty: 0.5, avgPrice: 100.2, note: '已成交', ackAt: T0, confirmAt: T0, confirmSource: 'rest' });
   assert.deepEqual(h.kinds(), ['nextNonce', 'sendTx', 'accountOrders', 'accountOrders']);
-  assert.deepEqual(h.pauses, [700], '两次查单之间等一下');
+  assert.deepEqual(h.pauses, [320, 200], '无私有 WS 时首轮等待 320ms 后再按 200ms 轮询');
   assert.equal(h.calls[0]!.url, `${h.rest}/nextNonce?account_index=${ACCOUNT}&api_key_index=5`);
   // 数量与价格按市场精度换成整数：0.5 → 50（两位），100.5 → 100500（三位）；IOC、不带触发价与过期时间。
   assert.deepEqual(h.signed, [{ marketIndex: 7, clientOrderIndex: 555, baseAmount: 50, price: 100500, isAsk: false, orderType: 1, timeInForce: 0, reduceOnly: false, triggerPrice: 0, orderExpiry: 0, nonce: 40 }]);
@@ -281,7 +283,7 @@ test('Lighter 下单：取 nonce、签名、发送、按自编号查到成交；
   // 第二笔：卖出只减仓；nonce 本地加一，不再读 nextNonce。
   h.lookups.push(orders(lighterOrder(556, 'filled', '0.25', '25.5')));
   const second = await h.trader.place(order(M7, 556, { side: 'sell', qty: 0.25, limit: 99.123, reduceOnly: true }), signalFor);
-  assert.deepEqual(second, { kind: 'done', filledQty: 0.25, avgPrice: 102, note: '已成交' });
+  assert.deepEqual(second, { kind: 'done', filledQty: 0.25, avgPrice: 102, note: '已成交', ackAt: T0, confirmAt: T0, confirmSource: 'rest' });
   assert.equal(h.count('nextNonce'), 1);
   assert.deepEqual([h.signed[1]!.nonce, h.signed[1]!.isAsk, h.signed[1]!.reduceOnly, h.signed[1]!.baseAmount, h.signed[1]!.price], [41, true, true, 25, 99123]);
 
@@ -295,23 +297,23 @@ test('Lighter 下单：取 nonce、签名、发送、按自编号查到成交；
 test('Lighter 下单：部分成交后被撤销照实报，全撤是确定的 0；别人的单与还没有结论的状态不算数', async () => {
   const h = lighterHarness();
   h.lookups.push(orders(lighterOrder(601, 'canceled-too-much-slippage', '0.20', '20.1')));
-  assert.deepEqual(await h.trader.place(order(M7, 601), signalFor), { kind: 'done', filledQty: 0.2, avgPrice: 100.5, note: '交易所撤销：canceled-too-much-slippage' });
+  assert.deepEqual(await h.trader.place(order(M7, 601), signalFor), { kind: 'done', filledQty: 0.2, avgPrice: 100.5, note: '交易所撤销：canceled-too-much-slippage', ackAt: T0, confirmAt: T0, confirmSource: 'rest' });
   h.lookups.push(orders(lighterOrder(602, 'canceled-margin-not-allowed', '0', '0')));
-  assert.deepEqual(await h.trader.place(order(M7, 602), signalFor), { kind: 'done', filledQty: 0, avgPrice: null, note: '交易所撤销：canceled-margin-not-allowed' });
+  assert.deepEqual(await h.trader.place(order(M7, 602), signalFor), { kind: 'done', filledQty: 0, avgPrice: null, note: '交易所撤销：canceled-margin-not-allowed', ackAt: T0, confirmAt: T0, confirmSource: 'rest' });
   h.lookups.push(orders(lighterOrder(603, 'canceled', '0.0', '0.0')));
-  assert.deepEqual(await h.trader.place(order(M7, 603), signalFor), { kind: 'done', filledQty: 0, avgPrice: null, note: '交易所撤销：canceled' });
+  assert.deepEqual(await h.trader.place(order(M7, 603), signalFor), { kind: 'done', filledQty: 0, avgPrice: null, note: '交易所撤销：canceled', ackAt: T0, confirmAt: T0, confirmSource: 'rest' });
   // 成交了但没给成交额：均价为 null，由上层按限价估。
   h.lookups.push(orders(lighterOrder(604, 'filled', '0.5', '')));
-  assert.deepEqual(await h.trader.place(order(M7, 604), signalFor), { kind: 'done', filledQty: 0.5, avgPrice: null, note: '已成交' });
+  assert.deepEqual(await h.trader.place(order(M7, 604), signalFor), { kind: 'done', filledQty: 0.5, avgPrice: null, note: '已成交', ackAt: T0, confirmAt: T0, confirmSource: 'rest' });
 
-  // 应答里只有别的自编号的单、或者这笔单还在处理中：8 次都没有结论 → 未知，不是没成交。
+  // 应答里只有别的自编号的单、或者这笔单还在处理中：10 次都没有结论 → 未知，不是没成交。
   h.pauses.length = 0;
   h.fallback = orders(lighterOrder(999, 'filled', '0.5', '50'), lighterOrder(605, 'in-progress', '0', '0'));
   const before = h.count('accountOrders');
   const pending = await h.trader.place(order(M7, 605), signalFor);
   unknownOnly(pending, '一直没有结论');
   assert.match((pending as { reason: string }).reason, /交易已被接受/);
-  assert.deepEqual([h.count('accountOrders') - before, h.pauses], [8, Array(7).fill(700)]);
+  assert.deepEqual([h.count('accountOrders') - before, h.pauses], [10, [320, ...Array(9).fill(200)]]);
   for (const state of ['open', 'pending', '', null, 7]) {
     h.fallback = orders(lighterOrder(606, state as string, '0.5', '50'));
     unknownOnly(await h.trader.place(order(M7, 606), signalFor), `状态 ${JSON.stringify(state)}`);
@@ -329,14 +331,14 @@ test('Lighter 下单：接口明确拒绝是确定的 0 并重新取 nonce；说
   const h = lighterHarness();
   h.sendAnswer = () => json({ code: 21104, message: `invalid nonce 39 for account ${ACCOUNT} key ${LIGHTER_KEY}` }, 400);
   const rejected = await h.trader.place(order(M7, 701), signalFor);
-  assert.deepEqual(rejected, { kind: 'done', filledQty: 0, avgPrice: null, note: '交易所拒绝（21104）：invalid nonce 39 for account … key …' });
+  assert.deepEqual(rejected, { kind: 'done', filledQty: 0, avgPrice: null, note: '交易所拒绝（21104）：invalid nonce 39 for account … key …', ackAt: T0, confirmAt: T0, confirmSource: 'sync' });
   clean(rejected, '拒绝');
   assert.equal(h.count('accountOrders'), 0, '被拒的交易不用查单');
   // HTTP 200 里带错误码同样是拒绝。
   h.sendAnswer = () => json({ code: 21502, message: 'margin not enough' });
-  assert.deepEqual(await h.trader.place(order(M7, 702), signalFor), { kind: 'done', filledQty: 0, avgPrice: null, note: '交易所拒绝（21502）：margin not enough' });
+  assert.deepEqual(await h.trader.place(order(M7, 702), signalFor), { kind: 'done', filledQty: 0, avgPrice: null, note: '交易所拒绝（21502）：margin not enough', ackAt: T0, confirmAt: T0, confirmSource: 'sync' });
   h.sendAnswer = () => json({ code: 23000 }, 429);
-  assert.deepEqual(await h.trader.place(order(M7, 703), signalFor), { kind: 'done', filledQty: 0, avgPrice: null, note: '交易所拒绝（23000）：' });
+  assert.deepEqual(await h.trader.place(order(M7, 703), signalFor), { kind: 'done', filledQty: 0, avgPrice: null, note: '交易所拒绝（23000）：', ackAt: T0, confirmAt: T0, confirmSource: 'sync' });
   // 每次被拒后 nonce 缓存作废：下一笔重新读 nextNonce，用服务器给的值。
   assert.equal(h.count('nextNonce'), 3);
   h.serverNonce = 77;
@@ -403,9 +405,9 @@ test('Lighter 查单：查到最终状态照实报；读成功但查不到报 ab
   const h = lighterHarness();
   const target = order(M7, 1101), sentAt = T0;
   h.lookups.push(orders(lighterOrder(1101, 'filled', '0.5', '50.25')));
-  assert.deepEqual(await h.trader.resolve(target, sentAt, signalFor), { kind: 'done', filledQty: 0.5, avgPrice: 100.5, note: '已成交' });
+  assert.deepEqual(await h.trader.resolve(target, sentAt, signalFor), { kind: 'done', filledQty: 0.5, avgPrice: 100.5, note: '已成交', confirmAt: T0, confirmSource: 'rest' });
   h.lookups.push(orders(), orders(lighterOrder(1101, 'canceled-too-much-slippage', '0.1', '10')));
-  assert.deepEqual(await h.trader.resolve(target, sentAt, signalFor), { kind: 'done', filledQty: 0.1, avgPrice: 100, note: '交易所撤销：canceled-too-much-slippage' });
+  assert.deepEqual(await h.trader.resolve(target, sentAt, signalFor), { kind: 'done', filledQty: 0.1, avgPrice: 100, note: '交易所撤销：canceled-too-much-slippage', confirmAt: T0, confirmSource: 'rest' });
   assert.deepEqual([h.count('sendTx'), h.count('nextNonce'), h.signed.length], [0, 0, 0], '查单不发任何交易');
 
   // 查不到：交易 10 分钟内都可能被打包；连接器只报 absent，过了有效期也不自己判零成交。
@@ -501,4 +503,166 @@ test('Lighter 下单串行：两笔并发时第二笔等第一笔查到结果后
   assert.deepEqual(g.calls.map(call => `${call.kind}${call.tag ? `:${call.tag}` : ''}`),
     ['nextNonce', 'sendTx:1601', 'nextNonce', 'sendTx:1602', 'accountOrders:1602', 'sendTx:1603', 'accountOrders:1603']);
   assert.deepEqual(g.signed.map(item => item.clientOrderIndex), [1601, 1602, 1603], '每笔只签一次、只发一次');
+});
+
+test('Lighter 私有订单 WS 流：主路径零 REST 秒确认、早到竞态安全、断线/超时无缝退回快速 REST 与彻底脱敏', async () => {
+  class FakePrivateSocket implements SocketLike {
+    readyState = 0;
+    onopen: ((event: unknown) => void) | null = null;
+    onmessage: ((event: { data: unknown }) => void) | null = null;
+    onclose: ((event: unknown) => void) | null = null;
+    onerror: ((event: unknown) => void) | null = null;
+    sent: unknown[] = [];
+    closed = false;
+    open() { this.readyState = 1; this.onopen?.({}); }
+    push(msg: unknown) { this.onmessage?.({ data: JSON.stringify(msg) }); }
+    send(data: string) { this.sent.push(JSON.parse(data)); }
+    close() { this.closed = true; this.readyState = 3; this.onclose?.({}); }
+  }
+  let clock = T0;
+  const sockets: FakePrivateSocket[] = [];
+  const signer = async (): Promise<LighterSigner> => ({
+    signCreateOrder: input => ({ txType: 14, txInfo: JSON.stringify({ client: input.clientOrderIndex, nonce: input.nonce }), txHash: '0x1' }),
+    createAuthToken: deadline => `secret-jwt-token-${deadline}`,
+  });
+  const stream = new LighterPrivateStream({
+    venue: 'lighter',
+    accountIndex: ACCOUNT,
+    connect: () => { const s = new FakePrivateSocket(); sockets.push(s); return s; },
+    signer,
+    now: () => clock,
+  });
+  try {
+    stream.start();
+    const sock = sockets[0]!;
+    assert.equal(sock.sent.length, 0);
+    sock.open();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal((sock.sent[0] as { channel: string }).channel, `account_all_orders/${ACCOUNT}`);
+    assert.equal(stream.isSubscribed(), false);
+    sock.push({ type: 'subscribed/account_all_orders', channel: `account_all_orders:${ACCOUNT}`, orders: {} });
+    assert.equal(stream.isSubscribed(), true);
+
+    const calls: string[] = [];
+    const pauses: number[] = [];
+    let sendCount = 0;
+    const trader = createLighterTrader({
+      venue: 'lighter',
+      key: { accountIndex: ACCOUNT, apiKeyIndex: 5, privateKey: LIGHTER_KEY },
+      fetchImpl: async url => {
+        calls.push(url);
+        if (url.includes('/nextNonce')) return json({ code: 200, nonce: 10 });
+        if (url.includes('/sendTx')) {
+          sendCount++;
+          if (sendCount === 2) {
+            // 模拟 WS 成交推在 sendTx HTTP 应答返回之前就已到达的竞态。
+            clock += 20;
+            sock.push({ type: 'update/account_all_orders', channel: `account_all_orders:${ACCOUNT}`, orders: { '7': [lighterOrder(2002, 'canceled-too-much-slippage', '0.1', '10.05')] } });
+          }
+          return json({ code: 200 });
+        }
+        if (url.includes('/accountOrders')) return json({ code: 200, orders: [lighterOrder(2003, 'filled', '0.5', '50.25')] });
+        throw new Error(`unexpected ${url}`);
+      },
+      now: () => clock,
+      signer,
+      privateStream: stream,
+      wsWaitMs: 30,
+      pause: async ms => { pauses.push(ms); },
+    });
+
+    // 1. 正常 WS 主路径：sendTx 后 WS 推终态，0 次 REST accountOrders，confirmSource === 'ws'。
+    const p1 = trader.place(order(M7, 2001), signalFor);
+    await new Promise(resolve => setImmediate(resolve));
+    clock += 80;
+    sock.push({ type: 'update/account_all_orders', channel: `account_all_orders:${ACCOUNT}`, orders: { '7': [lighterOrder(2001, 'filled', '0.5', '50.1')] } });
+    const r1 = await p1;
+    assert.deepEqual(r1, { kind: 'done', filledQty: 0.5, avgPrice: 100.2, note: '已成交', ackAt: T0, confirmAt: T0 + 80, confirmSource: 'ws' });
+    assert.equal(calls.filter(u => u.includes('/accountOrders')).length, 0);
+
+    // 2. 早到竞态：sendTx 应答回来前 WS 已 pushed 2002，prepareWait 直接命中。
+    const r2 = await trader.place(order(M7, 2002), signalFor);
+    assert.deepEqual(r2, { kind: 'done', filledQty: 0.1, avgPrice: 100.5, note: '交易所撤销：canceled-too-much-slippage', ackAt: T0 + 100, confirmAt: T0 + 100, confirmSource: 'ws' });
+    assert.equal(stream.status().wsHits, 2);
+
+    // 3. WS 超时不返回：自动无缝回退到 REST 查单并记录 restFallbacks（已等完 WS，不重复 320ms 首轮等待）。
+    const r3 = await trader.place(order(M7, 2003), signalFor);
+    assert.deepEqual(r3.kind, 'done');
+    assert.equal((r3 as { confirmSource: string }).confirmSource, 'rest');
+    assert.equal(stream.status().restFallbacks, 1);
+    assert.deepEqual(pauses, []);
+
+    // 4. resolve() 优先读取私有流近期终态缓存，免发 REST。
+    const resolved = await trader.resolve(order(M7, 2001), T0, signalFor);
+    assert.equal((resolved as { confirmSource: string }).confirmSource, 'ws');
+
+    // 5. 鉴权失败错误文本彻底脱敏（不漏 accountIndex 与 auth token），并触发重连状态清空。
+    sock.push({ type: 'error', message: `unauthorized account=${ACCOUNT} token=secret-jwt-token-${Math.floor(T0 / 1000) + 3600}` });
+    assert.equal(stream.isSubscribed(), false);
+    assert.ok(!stream.status().lastError!.includes(String(ACCOUNT)) && !stream.status().lastError!.includes('secret-jwt-token'));
+    assert.equal(stream.status().reconnects, 1);
+
+    // 6. 短 accountIndex (如 41) 不误伤 HTTP 401 状态码；3 位以上 accountIndex (如 410) 按词边界脱敏；长错误前缀不截断 auth 关键词。
+    const shortStream = new LighterPrivateStream({ venue: 'rh', accountIndex: 41, connect: () => new FakePrivateSocket(), signer, now: () => clock });
+    assert.equal((shortStream as unknown as { cleanText(t: string): string }).cleanText('HTTP 401 for 41'), 'HTTP 401 for 41');
+    shortStream.close();
+    const threeDigitStream = new LighterPrivateStream({ venue: 'rh', accountIndex: 410, connect: () => new FakePrivateSocket(), signer, now: () => clock });
+    assert.equal((threeDigitStream as unknown as { cleanText(t: string): string }).cleanText('HTTP 401 for 410'), 'HTTP 401 for …');
+    threeDigitStream.close();
+
+    // 7. 50 分钟续期（AUTH_RENEW_MS）触发 tick() 退订并用新 token 重订。
+    const renewSocks: FakePrivateSocket[] = [];
+    let renewClock = T0;
+    const renewStream = new LighterPrivateStream({
+      venue: 'lighter', accountIndex: ACCOUNT,
+      connect: () => { const s = new FakePrivateSocket(); renewSocks.push(s); return s; },
+      signer, now: () => renewClock,
+    });
+    try {
+      renewStream.start();
+      const rs = renewSocks[0]!;
+      rs.open();
+      await new Promise(resolve => setImmediate(resolve));
+      rs.push({ type: 'subscribed/account_all_orders', channel: `account_all_orders:${ACCOUNT}`, orders: {} });
+      renewClock += 50 * 60_000 + 1;
+      rs.push({ type: 'pong' });
+      (renewStream as unknown as { tick(): void }).tick();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(rs.sent.slice(1).map(m => (m as { type: string }).type), ['ping', 'unsubscribe', 'subscribe'], '到 50 分钟自动退订并带新 token 重订');
+      rs.push({ type: 'subscribed/account_all_orders', channel: `account_all_orders:${ACCOUNT}`, orders: {} });
+
+      // 8. 等待中 WS 断线与中止信号清理：均立即退出 wait，断线走 320ms 首轮 REST 退避且不漏 waiter。
+      const dropPauses: number[] = [];
+      const dropTrader = createLighterTrader({
+        venue: 'lighter', key: { accountIndex: ACCOUNT, apiKeyIndex: 5, privateKey: LIGHTER_KEY },
+        fetchImpl: async url => {
+          if (url.includes('/nextNonce')) return json({ code: 200, nonce: 11 });
+          if (url.includes('/sendTx')) return json({ code: 200 });
+          if (url.includes('/accountOrders')) return json({ code: 200, orders: [lighterOrder(2010, 'filled', '0.5', '50')] });
+          throw new Error(`unexpected ${url}`);
+        },
+        now: () => renewClock, signer, privateStream: renewStream, wsWaitMs: 5_000,
+        pause: async (ms: number) => { dropPauses.push(ms); },
+      });
+      const dropPromise = dropTrader.place(order(M7, 2010), signalFor);
+      await new Promise(resolve => setImmediate(resolve));
+      rs.close();
+      const dropped = await dropPromise;
+      assert.equal((dropped as { confirmSource: string }).confirmSource, 'rest');
+      assert.equal(dropPauses[0], 320, 'WS 等待中途断线仍走 320ms 首轮 REST 等待');
+
+      const ac = new AbortController();
+      const abortWaiter = renewStream.prepareWait(2011);
+      rs.open();
+      await new Promise(resolve => setImmediate(resolve));
+      rs.push({ type: 'subscribed/account_all_orders', channel: `account_all_orders:${ACCOUNT}`, orders: {} });
+      const waiting = abortWaiter.wait(5_000, () => ac.signal);
+      ac.abort();
+      assert.equal(await waiting, null, 'abort 立即清理并结束 waiter');
+    } finally {
+      renewStream.close();
+    }
+  } finally {
+    stream.close();
+  }
 });

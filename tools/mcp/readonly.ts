@@ -230,16 +230,23 @@ export const TOOLS: readonly Tool[] = [
   },
   {
     name: 'varlighter', scope: 'portfolio',
-    description: `DEX 价差模块（原 Var/Lighter 价差回归；场所 var、rh（Lighter RH）、lighter（Lighter 主网）、entropy，两腿 A/B；v0.112.0 起没有模拟盘，策略信号直接驱动实盘）：view=state 为各配对的价差、基线、参数、来源状态与实盘持仓摘要；symbol 为单个配对（symbol 为配对键，如 var:AAPL|rh:AAPL、lighter:BTC|entropy:BTC，hours 1–336）的走势、分时段统计与实盘成交；readiness 为实盘前核对清单。要回测或扫参数用 varlighter_backtest。${DATA_NOTE}`,
-    inputSchema: schema({ view: { type: 'string', enum: ['state', 'symbol', 'readiness'] }, symbol: { type: 'string', pattern: PAIR_KEY.source }, hours: { type: 'integer', minimum: 1, maximum: 336 } }),
+    description: `DEX 价差模块（原 Var/Lighter 价差回归；场所 var、rh（Lighter RH）、lighter（Lighter 主网）、entropy，两腿 A/B；v0.112.0 起没有模拟盘，策略信号直接驱动实盘）：view=state 为各配对的价差、基线、参数、来源状态与实盘持仓摘要；symbol 为单个配对（symbol 为配对键，如 var:AAPL|rh:AAPL、lighter:BTC|entropy:BTC，hours 1–336，points 0–1500 默认 0 只看摘要与成交）的走势、分时段统计与实盘成交；live 为实盘开关、执行优化设置、私有流状态、日级跳过统计、在途持仓与成交订单全链路遥测；entropy_cost 为 Entropy 主网实际扣费与返佣明细；readiness 为实盘前核对清单。要回测或扫参数用 varlighter_backtest。${DATA_NOTE}`,
+    inputSchema: schema({
+      view: { type: 'string', enum: ['state', 'symbol', 'live', 'entropy_cost', 'readiness'] },
+      symbol: { type: 'string', pattern: PAIR_KEY.source },
+      hours: { type: 'integer', minimum: 1, maximum: 336 },
+      points: { type: 'integer', minimum: 0, maximum: 1500 },
+    }),
     run: async (args, get) => {
-      const view = pick(args, 'view', ['state', 'symbol', 'readiness'], 'state');
+      const view = pick(args, 'view', ['state', 'symbol', 'live', 'entropy_cost', 'readiness'], 'state');
       if (view !== 'symbol') {
-        if (args.symbol !== undefined || args.hours !== undefined) throw new ToolInputError('symbol 与 hours 只适用于 view=symbol');
-        return optional(get, `/api/varlighter/${view}`);
+        if (args.symbol !== undefined || args.hours !== undefined || args.points !== undefined) throw new ToolInputError('symbol、hours 与 points 只适用于 view=symbol');
+        return optional(get, view === 'entropy_cost' ? '/api/varlighter/entropy-cost' : `/api/varlighter/${view}`);
       }
       if (typeof args.symbol !== 'string' || !PAIR_KEY.test(args.symbol)) throw new ToolInputError('view=symbol 需要 symbol（配对键，如 var:AAPL|rh:AAPL、lighter:BTC|entropy:BTC）');
-      return optional(get, `/api/varlighter/symbol?symbol=${encodeURIComponent(args.symbol)}&hours=${int(args, 'hours', 1, 336, 24)}`);
+      const hours = int(args, 'hours', 1, 336, 24);
+      const points = int(args, 'points', 0, 1500, 0);
+      return optional(get, `/api/varlighter/symbol?symbol=${encodeURIComponent(args.symbol)}&hours=${hours}&points=${points}`);
     },
   },
   {

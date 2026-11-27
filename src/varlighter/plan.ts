@@ -45,7 +45,7 @@ export function limitPrice(leg: LegInfo, side: 'buy' | 'sell', expected: number,
   return [rounded, rounded.toFixed(decimals)];
 }
 
-export function orderPlan(pair: PairInfo, sample: Sample, direction: Direction, notionalUsd: number, maxSlippageBps: number, now: number): OrderPlan {
+export function orderPlan(pair: PairInfo, sample: Sample, direction: Direction, notionalUsd: number, maxSlippageBps: number, now: number, legBSlippageBps = maxSlippageBps): OrderPlan {
   const checks: PlanCheck[] = [], k = pair.ratio, aName = VENUE_NAMES[pair.a.venue], bName = VENUE_NAMES[pair.b.venue];
   const spread = spreadOf(sample, bucketOf(notionalUsd));
   const rich = direction === 'a_rich';
@@ -72,9 +72,8 @@ export function orderPlan(pair: PairInfo, sample: Sample, direction: Direction, 
   else { aQty = floorTo(notionalUsd / (k * bMid), aDecimals ?? 6); bQty = aQty * k; }
   const format = (qty: number, decimals: number | null, other: number | null) => decimals !== null ? qty.toFixed(decimals) : other !== null && k === 1 ? qty.toFixed(other) : String(Number(qty.toPrecision(8)));
   const aQtyText = format(aQty, aDecimals, bDecimals), bQtyText = format(bQty, bDecimals, aDecimals);
-  const slip = maxSlippageBps / 10_000;
-  const limitOf = (leg: LegInfo, side: 'buy' | 'sell', expected: number) => limitPrice(leg, side, expected, maxSlippageBps);
-  const [aLimit, aLimitText] = limitOf(pair.a, aSide, aExpected), [bLimit, bLimitText] = limitOf(pair.b, bSide, bExpected);
+  const slipA = maxSlippageBps / 10_000, slipB = legBSlippageBps / 10_000;
+  const [aLimit, aLimitText] = limitPrice(pair.a, aSide, aExpected, maxSlippageBps), [bLimit, bLimitText] = limitPrice(pair.b, bSide, bExpected, legBSlippageBps);
   for (const [leg, qty, qtyText, expected, name] of [[pair.a, aQty, aQtyText, aExpected, aName], [pair.b, bQty, bQtyText, bExpected, bName]] as const) {
     if (leg.venue === 'var') continue;
     checks.push({ ok: qty > 0, label: `按 ${name} 数量精度 ${leg.market.sizeDecimals} 位取整后数量 ${qtyText}` });
@@ -88,8 +87,8 @@ export function orderPlan(pair: PairInfo, sample: Sample, direction: Direction, 
   checks.push({ ok: pair.identity !== 'mismatch', label: pair.identity === 'verified' ? '两边合约规格已核对' : pair.identity === 'review' ? '两边合约规格待人工确认' : '两边价格差距过大，规格不同' });
   for (const leg of [pair.a, pair.b]) if (leg.venue === 'var') checks.push({ ok: false, label: 'Var 没有下单接口，带 Var 腿的配对不上实盘' });
   const legs: LegPlan[] = [
-    { venue: pair.a.venue, side: aSide, qty: aQtyText, expected: aExpected, limit: aLimitText, notionalUsd: aQty * aExpected, fields: legFields(pair.a, aSide, aQty, aQtyText, aLimit, aLimitText, slip) },
-    { venue: pair.b.venue, side: bSide, qty: bQtyText, expected: bExpected, limit: bLimitText, notionalUsd: bQty * bExpected, fields: legFields(pair.b, bSide, bQty, bQtyText, bLimit, bLimitText, slip) },
+    { venue: pair.a.venue, side: aSide, qty: aQtyText, expected: aExpected, limit: aLimitText, notionalUsd: aQty * aExpected, fields: legFields(pair.a, aSide, aQty, aQtyText, aLimit, aLimitText, slipA) },
+    { venue: pair.b.venue, side: bSide, qty: bQtyText, expected: bExpected, limit: bLimitText, notionalUsd: bQty * bExpected, fields: legFields(pair.b, bSide, bQty, bQtyText, bLimit, bLimitText, slipB) },
   ];
   // 先下没有盘口、按询价成交的 Var；两腿都是限价簿时先下 A。
   const [first, second] = !isLive(pair.b.venue) ? [1, 0] : [0, 1];

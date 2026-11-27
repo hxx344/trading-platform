@@ -108,7 +108,7 @@ export interface AutoParams { entryBps: number; exitBps: number; stopBps: number
  * 按近期统计给一个配对推荐参数（自动配置用，docs/varlighter.md 第 5 节）：
  * - 入场 = 中间价偏离的 95 分位 − 半个往返成本（历史上约 5% 的时间能触发），且不低于「刚到入场线时预期净利仍达最低净利」的偏离
  *   （半个往返成本 + 四次成交的滑点 + 两腿开平的手续费 + 最低净利），也不低于 5 基点；
- * - 出场 = 基线（0）；止损 = 往返成本 + 3 倍入场偏离（开仓时浮亏就等于往返成本，再留 3 倍入场偏离的余地），不低于 20 基点；
+ * - 出场 = -2 基点（多等 2 基点回归空间覆盖滑点）；止损 = 往返成本 + 3 倍入场偏离（开仓时浮亏就等于往返成本，再留 3 倍入场偏离的余地），不低于 20 基点；
  * - 最长持有 = 6 个半衰期，限在 1 到 24 小时；统计里不回归时用默认的 12 小时。
  * 统计里没有往返成本或偏离分位（样本没有可成交价）时返回 null。
  */
@@ -118,7 +118,7 @@ export function recommendParams(stats: Pick<RegimeStats, 'costMedian' | 'deviati
   const breakEven = cost / 2 + 4 * costs.slippageBps + 2 * (costs.aFeeBps + costs.bFeeBps) + costs.minNetBps;
   const entryBps = Math.min(2000, Math.max(5, Math.round(stats.deviation95 - cost / 2), Math.ceil(breakEven)));
   return {
-    entryBps, exitBps: 0, stopBps: Math.min(5000, Math.max(20, Math.round(cost + 3 * entryBps))),
+    entryBps, exitBps: -2, stopBps: Math.min(5000, Math.max(20, Math.round(cost + 3 * entryBps))),
     maxHoldMinutes: stats.halfLifeMin === null ? DEFAULT_SYMBOL.maxHoldMinutes : Math.min(1440, Math.max(60, Math.ceil(6 * stats.halfLifeMin))),
   };
 }
@@ -141,9 +141,10 @@ export function upgradeGlobal(value: unknown): GlobalParams {
  */
 export interface Position {
   id: string; symbol: string; direction: Direction; openedAt: number; qty: number; notionalUsd: number;
-  /** 开仓时的可成交价差（基点）与基线。 */ entrySpread: number; entryBaseline: number; entryRegime: Regime;
+  /** 开仓时的可成交价差（基点）、基线与往返成本（基点）。 */ entrySpread: number; entryBaseline: number; entryRegime: Regime;
   aEntry: number; bEntry: number; estimated: boolean; ratio: number; aFeeBps: number; bFeeBps: number;
   entryVarSource?: VarPriceSource;
+  entryCostBps?: number;
 }
 export interface ClosedTrade extends Position {
   closedAt: number; aExit: number; bExit: number; exitSpread: number; reason: CloseReason;
@@ -183,7 +184,13 @@ export function decide(sample: Sample, baseline: Baseline | null, params: Symbol
     if (sample.t - position.openedAt >= params.maxHoldMinutes * 60_000) return { kind: 'close', reason: 'timeout', spread, deviation: baseline ? deviationToClose(position.direction, spread, baseline.median) : 0 };
     if (!baseline) return { kind: 'hold', deviation: null };
     const deviation = deviationToClose(position.direction, spread, baseline.median);
-    return deviation <= params.exitBps ? { kind: 'close', reason: 'revert', spread, deviation } : { kind: 'hold', deviation };
+    if (deviation <= params.exitBps) {
+      // 出场价差成本护栏：盘口点差异常拉宽且按当前价差平仓仍浮亏时暂缓回归平仓（绝不拦截止损或超时）。
+      const exitCost = spread.buyA - spread.sellA;
+      if (exitCost > Math.max(15, 2.5 * Math.max(0, position.entryCostBps ?? 0)) && pnlBps < 0) return { kind: 'hold', deviation };
+      return { kind: 'close', reason: 'revert', spread, deviation };
+    }
+    return { kind: 'hold', deviation };
   }
   if (!baseline) return { kind: 'wait', reason: '基线样本不足' };
   const rich = spread.sellA - baseline.median, cheap = baseline.median - spread.buyA;
@@ -209,6 +216,7 @@ export function openPosition(id: string, sample: Sample, params: SymbolParams, d
     entrySpread: direction === 'a_rich' ? spread.sellA : spread.buyA, entryBaseline: baseline.median, entryRegime: sample.regime,
     aEntry: direction === 'a_rich' ? prices.aBid : prices.aAsk, bEntry: direction === 'a_rich' ? prices.bAsk : prices.bBid, estimated: spread.estimated,
     ratio: sample.ratio, aFeeBps: fees.aFeeBps, bFeeBps: fees.bFeeBps,
+    entryCostBps: spread.buyA - spread.sellA,
     ...(spread.varSource && { entryVarSource: spread.varSource }),
   };
 }

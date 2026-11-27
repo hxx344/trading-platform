@@ -19,6 +19,7 @@ import { ASSET_KINDS, COMBOS, DEFAULT_COMBOS, KIND_NAMES, LEG_SYMBOL, LIVE_VENUE
   type AssetKind, type Combo, type CustomPair, type Leg, type LegInfo, type LiveVenue, type MarketSpec, type PairInfo, type Sample, type SizeBucket, type Spread, type VarListing, type VenueId } from './model.ts';
 import { orderPlan, type OrderPlan } from './plan.ts';
 import { LiveError, createLiveTrader, type LivePosition, type LiveSignal, type LiveTrader } from './live.ts';
+import { LighterPrivateStream, type LighterPrivateStatus } from './lighter-private.ts';
 import { LiveKeysError, type LighterKey, type LiveKeys, type LiveKeysStore } from './livekeys.ts';
 import { createLighterSigner, lighterSignerProblem, type LighterSigner } from './lighter-signer.ts';
 import { createEntropyTrader, createLighterTrader, scrub, type VenueTrader } from './orders.ts';
@@ -26,7 +27,7 @@ import { BaselineTracker, LIVE_BASELINE_GAP_MS, suggestedEntryBps, symbolStats, 
 import { ENTROPY_COST_AFTER_FILL_MS, ENTROPY_COST_POLL_MS, accountHashOf as entropyAccountHashOf, createEntropyCostCollector } from './entropy-cost.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, DIRECTIONS, ParamsError, closePosition, closeSpread, confirmOpen, decide, openEconomics, slippageBudgetBps, legFeeBps,
   markToMarket, openBlocker, openPosition, readGlobalParams, readSymbolParams, recommendParams, upgradeDirection, upgradeGlobal,
-  CLOSE_REASON_NAMES, DIRECTION_NAMES, type GlobalParams, type LegFees, type Position, type SymbolParams } from './strategy.ts';
+  CLOSE_REASON_NAMES, DIRECTION_NAMES, type Direction, type GlobalParams, type LegFees, type Position, type SymbolParams } from './strategy.ts';
 import { COOLDOWN_KEY, SAMPLE_RETENTION_DAYS, SETTINGS_KEY, type LegacyUpgrade, type VarLighterStore } from './store.ts';
 import type { AccountsRefreshResult, AccountsView, AutoView, BacktestView, CatalogEntry, DepthStatus, LegRef, LiveStats, LiveTradeView, OrphanRow, PushStats, PollStats, PositionMark, ReadinessItem, ReadinessView, SamplesView, Settings, SourceState, StateRow, StateView,
   SymbolPoint, SymbolView, VenueAccountView, VenuePositionView, VenueStatus, LiveView } from './views.ts';
@@ -98,6 +99,7 @@ export interface EngineOptions { store: VarLighterStore; fetchImpl?: FetchLike; 
   /** 页面录入的实盘凭据（第 13 节）；不给就没有实盘。 */ liveKeys?: LiveKeysStore;
   /** 下单连接器（测试里换成替身）。 */ traders?: (venue: KeyVenue, keys: LiveKeys) => VenueTrader;
   /** Lighter 签名器缺什么（测试里换成 null）。 */ signerProblem?: () => string | null;
+  /** Lighter 交易签名器注入（测试里绕过 WASM 替身）。 */ lighterSigner?: (venue: 'lighter' | 'rh', key: LighterKey) => Promise<LighterSigner>;
   /** Lighter 历史接口鉴权令牌（测试与本地预览可注入替身，返回 null 表示仅只读）。 */ lighterAuth?: (venue: 'lighter' | 'rh', key: LighterKey) => Promise<string | null> }
 /** Lighter 两条链的 chainId（签名用）。 */
 export const LIGHTER_CHAIN_ID = { lighter: 304, rh: 466324 } as const;
@@ -173,7 +175,7 @@ interface VenueRuntime {
 }
 interface DepthEntry { leg: LegInfo; snapshot: DepthSnapshot | null; error: string | null }
 
-export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now = Date.now, log = () => {}, quoter, accounts: envAccounts = () => ({ accounts: {}, problem: null }), liveKeys, traders, signerProblem = lighterSignerProblem, lighterAuth }: EngineOptions) {
+export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now = Date.now, log = () => {}, quoter, accounts: envAccounts = () => ({ accounts: {}, problem: null }), liveKeys, traders, signerProblem = lighterSignerProblem, lighterSigner, lighterAuth }: EngineOptions) {
   /** 账户标识的来源：页面录入的凭据优先，没录的场所用安装时录入的账户（keys.env）。页面凭据文件读不懂时按有问题处理。 */
   const accountSource: DexAccountsSource = () => {
     const base = envAccounts(), page = liveKeys?.accounts() ?? {}, pageProblem = liveKeys?.read().problem ?? null;
@@ -351,17 +353,42 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   const traderCache = new Map<KeyVenue, { id: string; trader: VenueTrader }>();
   const lighterSignerCache = new Map<'lighter' | 'rh', { id: string; signer: Promise<LighterSigner> }>();
   const lighterTokenCache = new Map<'lighter' | 'rh', { id: string; token: string; at: number }>();
+  const privateStreams = new Map<'lighter' | 'rh', { id: string; stream: LighterPrivateStream }>();
   function signerFor(venue: 'lighter' | 'rh', key: LighterKey): () => Promise<LighterSigner> {
     const id = JSON.stringify(key);
     return () => {
       const hit = lighterSignerCache.get(venue);
       if (hit && hit.id === id) return hit.signer;
       // 签名器建一次；建失败时下次再试。
-      const signer = createLighterSigner({ chainId: LIGHTER_CHAIN_ID[venue], privateKey: key.privateKey, apiKeyIndex: key.apiKeyIndex, accountIndex: key.accountIndex })
+      const signer = (lighterSigner
+        ? lighterSigner(venue, key)
+        : createLighterSigner({ chainId: LIGHTER_CHAIN_ID[venue], privateKey: key.privateKey, apiKeyIndex: key.apiKeyIndex, accountIndex: key.accountIndex }))
         .catch(error => { if (lighterSignerCache.get(venue)?.signer === signer) lighterSignerCache.delete(venue); throw error; });
       lighterSignerCache.set(venue, { id, signer });
       return signer;
     };
+  }
+  function privateStreamFor(venue: 'lighter' | 'rh', key: LighterKey): LighterPrivateStream {
+    const id = JSON.stringify(key), hit = privateStreams.get(venue);
+    if (hit && hit.id === id) return hit.stream;
+    if (hit) { hit.stream.close(); traderCache.delete(venue); }
+    const stream = new LighterPrivateStream({ venue, accountIndex: key.accountIndex, connect: open, signer: signerFor(venue, key), now, log });
+    privateStreams.set(venue, { id, stream });
+    traderCache.delete(venue);
+    return stream;
+  }
+  function syncPrivateStreams(): void {
+    const keys = liveKeys?.read().keys;
+    const keep = !traders && running && !liveStop.signal.aborted && !!keys && !signerProblem() && ((liveTrader?.settings().on ?? false) || (liveTrader?.active().length ?? 0) > 0);
+    for (const venue of ['lighter', 'rh'] as const) {
+      const key = keys?.[venue];
+      const hit = privateStreams.get(venue);
+      if (!keep || !key) {
+        if (hit) { hit.stream.close(); privateStreams.delete(venue); traderCache.delete(venue); }
+        continue;
+      }
+      privateStreamFor(venue, key).start();
+    }
   }
   async function lighterAuthToken(venue: 'lighter' | 'rh', key: LighterKey, forceRefresh = false): Promise<string | null> {
     const id = JSON.stringify(key);
@@ -388,6 +415,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     if (venue === 'lighter' || venue === 'rh') {
       lighterSignerCache.delete(venue);
       lighterTokenCache.delete(venue);
+      const priv = privateStreams.get(venue);
+      if (priv) { priv.stream.close(); privateStreams.delete(venue); }
     }
     accountReads.delete(venue);
     accountHistories.delete(venue);
@@ -399,7 +428,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     if (hit && hit.id === id) return hit.trader;
     let trader: VenueTrader;
     if (venue === 'entropy') trader = createEntropyTrader({ key: keys.entropy!, fetchImpl, now });
-    else trader = createLighterTrader({ venue, key: keys[venue]!, fetchImpl, now, signer: signerFor(venue, keys[venue]!) });
+    else trader = createLighterTrader({ venue, key: keys[venue]!, fetchImpl, now, signer: signerFor(venue, keys[venue]!), privateStream: privateStreamFor(venue, keys[venue]!) });
     traderCache.set(venue, { id, trader });
     return trader;
   }
@@ -411,12 +440,22 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     takerFeeBps: leg => legFeeBps(settings.global, leg.venue, leg.market.takerFeeBps) ?? 0,
     account: venue => { const read = accountReads.get(venue); return read && read.at !== null && read.snapshot ? { at: read.at, snapshot: read.snapshot } : null; },
     readAccount: (venue, signal) => fetchAccount(fetchImpl, signal, venue, accountSource().accounts),
-    // 一笔实盘持仓结束（含没开成、单腿）后冷却这个配对，至少 1 分钟：没开成的信号不会每次推送都再试一次（第 18 节）。
+    privateStreams: () => {
+      const out: Partial<Record<'lighter' | 'rh', LighterPrivateStatus>> = {};
+      for (const [venue, entry] of privateStreams) out[venue] = entry.stream.status();
+      return out;
+    },
+    // 一笔实盘持仓结束：第一腿未成交（not_filled）按可配短冷却（默认 30s），真实成交与单腿按配对冷却分钟数（至少 1 分钟）。
     onFinished: position => {
-      const at = now(), until = at + Math.max(MIN_COOLDOWN_MS, paramsOf(position.symbol).cooldownMinutes * 60_000);
+      const at = now();
+      const durationMs = position.closeReason === 'not_filled'
+        ? Math.max(5_000, liveTrader!.exec().notFilledCooldownSec * 1_000)
+        : Math.max(MIN_COOLDOWN_MS, paramsOf(position.symbol).cooldownMinutes * 60_000);
+      const until = at + durationMs;
       cooldown = Object.fromEntries(Object.entries({ ...cooldown, [position.symbol]: until }).filter(([, end]) => end > at));
       try { store.setState(COOLDOWN_KEY, cooldown, at); } catch (error) { log(`varlighter: 冷却保存失败：${message(error)}`); }
       updateDepth();
+      syncPrivateStreams();
     },
     signalFor: () => anySignal([liveStop.signal], REQUEST_TIMEOUT_MS),
     stopped: () => liveStop.signal.aborted,
@@ -462,6 +501,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     }
     try { liveKeys!.set(venue, fields); } catch (error) { return liveFailure(error); }
     dropVenueCaches(venue);
+    syncPrivateStreams();
     scheduleImmediateAccountsRefresh();
     if (venue === 'entropy') nextEntropyCost = now();
     store.event(now(), 'live', null, `已录入 ${VENUE_NAMES[venue]} 的实盘凭据`);
@@ -472,12 +512,17 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     if (trader.venueInUse(venue)) return reject('busy', `${VENUE_NAMES[venue]} 还有实盘持仓，平掉后才能移除凭据`, 409);
     try { liveKeys!.remove(venue); } catch (error) { return liveFailure(error); }
     dropVenueCaches(venue);
+    syncPrivateStreams();
     scheduleImmediateAccountsRefresh();
     store.event(now(), 'live', null, `已移除 ${VENUE_NAMES[venue]} 的实盘凭据`);
     return { keys: liveKeys!.view() };
   }
   const liveCall = <T>(work: (trader: LiveTrader) => T): T => { const trader = liveOf(); try { return work(trader); } catch (error) { return liveFailure(error); } };
-  const liveSettings = (body: unknown) => liveCall(trader => trader.update(body, key => pairsByKey.has(key) || parsePairKey(key) !== null));
+  const liveSettings = (body: unknown) => {
+    const next = liveCall(trader => trader.update(body, key => pairsByKey.has(key) || parsePairKey(key) !== null));
+    syncPrivateStreams();
+    return next;
+  };
   const liveClose = (body: unknown) => liveCall(trader => trader.close(body));
   const liveDismiss = (body: unknown) => liveCall(trader => trader.dismiss(body));
   const liveResume = () => liveCall(trader => trader.resume());
@@ -562,6 +607,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       aEntry: aEntry ?? position.plan.limit, bEntry: bEntry ?? (position.plan.bLimit ?? 0) * ratio,
       estimated: (saved?.estimated ?? false) || position.a.estimated || position.b.estimated || aEntry === null || bEntry === null,
       aFeeBps: fees?.aFeeBps ?? 0, bFeeBps: fees?.bFeeBps ?? 0,
+      ...(saved?.entryCostBps !== undefined && { entryCostBps: saved.entryCostBps }),
     };
   }
   /** 这个配对会不会开实盘：启用了（总览勾选）、实盘总开关开着且勾选了这个配对、两腿都是下单场所。 */
@@ -664,6 +710,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       }
       if (!want && runtime.stream) { runtime.stream.close(); runtime.stream = null; runtime.depth.clear(); }
     }
+    syncPrivateStreams();
   }
 
   /** 刷新一个行情流场所的目录（合约规格、手续费，以及自动配对规格核对用的标记价）。没有配对用到的场所也取目录，手动配对要从里面选。 */
@@ -746,6 +793,59 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     return { symbol: pair.key, t, receivedAt, decisionAt: null, captureKind: 'decision', regime: regimeOf(pair.kind, t), ratio: pair.ratio, ...prefixed('a', a), ...prefixed('b', b) } as Sample;
   }
 
+  const pendingSignals = new Map<string, { direction: Direction; firstSeenAt: number }>();
+  const confirmTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const clearPendingSignal = (key: string): void => {
+    pendingSignals.delete(key);
+    const timer = confirmTimers.get(key);
+    if (timer) { clearTimeout(timer); confirmTimers.delete(key); }
+  };
+  const clearAllPendingSignals = (): void => {
+    pendingSignals.clear();
+    for (const timer of confirmTimers.values()) clearTimeout(timer);
+    confirmTimers.clear();
+  };
+  function confirmSignalPersistence(key: string, decision: ReturnType<typeof decide>, isTradable: boolean, time: number): number | null {
+    if (!isTradable || decision.kind !== 'open') {
+      clearPendingSignal(key);
+      return null;
+    }
+    const confirmMs = liveTrader?.exec().confirmMs ?? 0;
+    if (confirmMs <= 0) {
+      clearPendingSignal(key);
+      return time;
+    }
+    const existing = pendingSignals.get(key);
+    if (!existing || existing.direction !== decision.direction) {
+      clearPendingSignal(key);
+      pendingSignals.set(key, { direction: decision.direction, firstSeenAt: time });
+      if (running) {
+        const timer = setTimeout(() => {
+          confirmTimers.delete(key);
+          const pair = pairOf(key);
+          if (running && pair && pendingSignals.has(key)) evaluatePushPair(pair, now(), held());
+        }, confirmMs);
+        timer.unref?.();
+        confirmTimers.set(key, timer);
+      }
+      return null;
+    }
+    if (time - existing.firstSeenAt < confirmMs) {
+      if (running && !confirmTimers.has(key)) {
+        const remaining = Math.max(1, confirmMs - (time - existing.firstSeenAt));
+        const timer = setTimeout(() => {
+          confirmTimers.delete(key);
+          const pair = pairOf(key);
+          if (running && pair && pendingSignals.has(key)) evaluatePushPair(pair, now(), held());
+        }, remaining);
+        timer.unref?.();
+        confirmTimers.set(key, timer);
+      }
+      return null;
+    }
+    return existing.firstSeenAt;
+  }
+
   /** 每个配对每批只有一条样本，先用已有历史判断信号。大多数样本批写，有开平仓动作的按时序逐一决定。 */
   function ingest(fresh: { pair: PairInfo; sample: Sample }[], blocked: Record<string, number>, cursors: Map<string, number>): number {
     const passive: Sample[] = [], active: SampleStep[] = [], errors: unknown[] = [];
@@ -755,11 +855,13 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       try {
         const current = open.get(pair.key);
         // 开仓中、平仓中、需要人工处理的实盘持仓：不判断，也不开新仓。
-        if (current && current.state !== 'open') { sample.decisionAt = now(); passive.push(sample); continue; }
+        if (current && current.state !== 'open') { clearPendingSignal(pair.key); sample.decisionAt = now(); passive.push(sample); continue; }
         const track = tracker(pair), params = paramsOf(pair.key), position = current ? strategyOf(current) : null;
         const baseline = track.value(sample.regime, sample.t), decision = decide(sample, baseline, current ? holdParams(current) : params, position);
-        if ((decision.kind === 'open' && tradable(pair, params)) || (decision.kind === 'close' && position)) {
-          active.push({ pair, sample, params, position, baseline, decision });
+        const isOpenTradable = !current && decision.kind === 'open' && tradable(pair, params);
+        const signalAt = isOpenTradable ? confirmSignalPersistence(pair.key, decision, true, sample.t) : (clearPendingSignal(pair.key), null);
+        if ((isOpenTradable && signalAt !== null) || (decision.kind === 'close' && position)) {
+          active.push({ pair, sample, params, position, baseline, decision, signalAt });
         } else { sample.decisionAt = now(); passive.push(sample); }
       } catch (error) {
         trackers.delete(pair.key); // The next read rebuilds from all committed quotes, including this one.
@@ -788,7 +890,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     return written;
   }
 
-  type SampleStep = { pair: PairInfo; sample: Sample; params: SymbolParams; position: Position | null; baseline: Baseline | null; decision: ReturnType<typeof decide> };
+  type SampleStep = { pair: PairInfo; sample: Sample; params: SymbolParams; position: Position | null; baseline: Baseline | null; decision: ReturnType<typeof decide>; signalAt: number | null };
   /** 成功落盘才推进游标；即使随后成交写失败，行情视图与基线仍和重启后相同。 */
   function saveSamples(samples: readonly Sample[], cursors: Map<string, number>): number {
     if (!samples.length) return 0;
@@ -865,6 +967,29 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     return stats;
   }
 
+  function evaluatePushPair(pair: PairInfo, time: number, open: ReadonlyMap<string, LivePosition>): void {
+    const current = open.get(pair.key);
+    if (current ? current.state !== 'open' : !tradable(pair, storedOf(pair.key))) { clearPendingSignal(pair.key); return; }
+    try {
+      const a = liveLeg(pair.a, time, time, undefined, PUSH_DEPTH_REUSE_MS), b = liveLeg(pair.b, time, time, undefined, PUSH_DEPTH_REUSE_MS);
+      if (!a || !b) { clearPendingSignal(pair.key); return; }
+      pushStats.checks++;
+      const sample = makeSample(pair, time, time, a, b), params = paramsOf(pair.key), position = current ? strategyOf(current) : null;
+      const baseline = tracker(pair).value(sample.regime, time), decision = decide(sample, baseline, current ? holdParams(current) : params, position);
+      const isOpenTradable = !current && decision.kind === 'open' && tradable(pair, params);
+      const signalAt = isOpenTradable ? confirmSignalPersistence(pair.key, decision, true, time) : (clearPendingSignal(pair.key), null);
+      if (!((isOpenTradable && signalAt !== null) || (decision.kind === 'close' && position))) return;
+      const apply = tradeDecision({ pair, sample, params, position, baseline, decision, signalAt });
+      if (typeof apply === 'string') { pushStats.lastBlocked = { at: time, symbol: pair.key, reason: apply }; return; }
+      if (!saveSamples([sample], lastLiveAt)) return;
+      apply();
+      pushStats.trades++; pushStats.lastTradeAt = time;
+    } catch (error) {
+      trackers.delete(pair.key); // 与定时采样出错时一样，下次用到时从库里重建基线。
+      if (time - (pushErrorAt.get(pair.key) ?? -Infinity) >= PUSH_ERROR_LOG_MS) { pushErrorAt.set(pair.key, time); log(`varlighter: 按行情流推送判断 ${pair.key} 失败：${message(error)}`); }
+    }
+  }
+
   /**
    * 行情流推送了一条腿的新一档：用到它、会开实盘或有持有中实盘持仓、两腿都是行情流的配对立即按两腿当前的一档判断一次。
    * 有开平仓动作时才把这一刻的样本写库并下单（规则与定时采样的相同）；没有动作或被挡住的不写库，样本仍由定时采样留。
@@ -873,39 +998,20 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     const list = running ? pushPairs.get(`${venue}:${marketId}`) : undefined;
     if (!list) return;
     const time = now(), open = held();
-    for (const pair of list) {
-      const current = open.get(pair.key);
-      if (current ? current.state !== 'open' : !tradable(pair, storedOf(pair.key))) continue;
-      try {
-        const a = liveLeg(pair.a, time, time, undefined, PUSH_DEPTH_REUSE_MS), b = liveLeg(pair.b, time, time, undefined, PUSH_DEPTH_REUSE_MS);
-        if (!a || !b) continue;
-        pushStats.checks++;
-        const sample = makeSample(pair, time, time, a, b), params = paramsOf(pair.key), position = current ? strategyOf(current) : null;
-        const baseline = tracker(pair).value(sample.regime, time), decision = decide(sample, baseline, current ? holdParams(current) : params, position);
-        if (!((decision.kind === 'open' && tradable(pair, params)) || (decision.kind === 'close' && position))) continue;
-        const apply = tradeDecision({ pair, sample, params, position, baseline, decision });
-        if (typeof apply === 'string') { pushStats.lastBlocked = { at: time, symbol: pair.key, reason: apply }; continue; }
-        if (!saveSamples([sample], lastLiveAt)) continue;
-        apply();
-        pushStats.trades++; pushStats.lastTradeAt = time;
-      } catch (error) {
-        trackers.delete(pair.key); // 与定时采样出错时一样，下次用到时从库里重建基线。
-        if (time - (pushErrorAt.get(pair.key) ?? -Infinity) >= PUSH_ERROR_LOG_MS) { pushErrorAt.set(pair.key, time); log(`varlighter: 按行情流推送判断 ${pair.key} 失败：${message(error)}`); }
-      }
-    }
+    for (const pair of list) evaluatePushPair(pair, time, open);
   }
 
   /**
-   * 复核两腿并决定是否开平仓（第 18 节）：平仓信号交给实盘两腿只减仓平掉；开仓过了策略风控（读数取实盘持仓与实盘当日已实现）后，
+   * 复核两腿并决定是否开平仓（第 18、19 节）：平仓信号交给实盘两腿并发只减仓平掉；开仓过了策略风控（读数取实盘持仓与实盘当日已实现）后，
    * 再过实盘自己的检查。返回不开的原因，或只负责提交的操作（样本落盘后才调用）。
    */
-  function tradeDecision({ pair, sample, params, position, baseline, decision }: SampleStep): string | (() => void) {
+  function tradeDecision({ pair, sample, params, position, baseline, decision, signalAt }: SampleStep): string | (() => void) {
     if (decision.kind === 'close' && position) {
       sample.decisionAt = now();
       const mark = markToMarket(position, decision.spread);
       return () => {
         // 先交给实盘平仓，事件写失败也不影响平仓。
-        liveTrader?.signalClose(pair.key, decision.reason);
+        liveTrader?.signalClose(pair.key, decision.reason, sample.decisionAt ?? now());
         try { store.event(now(), 'live', pair.key, `平仓信号（${CLOSE_REASON_NAMES[decision.reason]}）：价差 ${fmt(mark.exitSpread, 1)} 基点，相对入场 ${fmt(mark.pnlBps, 1)} 基点`); }
         catch (error) { log(`varlighter: 平仓信号事件写入失败：${message(error)}`); }
       };
@@ -927,11 +1033,23 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     if (blocker) return blocker;
     const signal = openPosition(`s${sample.decisionAt.toString(36)}-${(++sequence).toString(36)}`, sample, params, confirmed, baseline, costs);
     const rules = autoKeys.has(pair.key) ? { exitBps: params.exitBps, stopBps: params.stopBps, maxHoldMinutes: params.maxHoldMinutes } : undefined;
-    const request: LiveSignal = { direction: signal.direction, notionalUsd: params.notionalUsd, strategy: {
-      entrySpread: signal.entrySpread, entryBaseline: signal.entryBaseline, entryRegime: signal.entryRegime, aFeeBps: signal.aFeeBps, bFeeBps: signal.bFeeBps, estimated: signal.estimated, ...(rules && { rules }) } };
+    const signalBbo = { aBid: sample.aBid0, aAsk: sample.aAsk0, bBid: sample.bBid0, bAsk: sample.bAsk0, at: sample.t };
+    const request: LiveSignal = {
+      direction: signal.direction,
+      notionalUsd: params.notionalUsd,
+      signalAt: signalAt ?? sample.decisionAt,
+      check: { entryBps: params.entryBps, exitBps: params.exitBps, slippageBps: settings.global.slippageBps, minNetBps: settings.global.minNetBps },
+      strategy: {
+        entrySpread: signal.entrySpread, entryBaseline: signal.entryBaseline, entryRegime: signal.entryRegime,
+        aFeeBps: signal.aFeeBps, bFeeBps: signal.bFeeBps, estimated: signal.estimated,
+        ...(signal.entryCostBps !== undefined && { entryCostBps: signal.entryCostBps }),
+        signalBbo,
+        ...(rules && { rules }),
+      },
+    };
     const commit = liveTrader.prepare(pair, request, sample);
     if (typeof commit === 'string') return commit;
-    return () => { commit(); updateDepth(); };
+    return () => { clearPendingSignal(pair.key); commit(); updateDepth(); syncPrivateStreams(); };
   }
 
   function noteSamples(samples: readonly Sample[]): void {
@@ -1114,15 +1232,18 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     return value;
   }
 
-  function symbolView(keyRaw: unknown, hoursRaw: unknown): SymbolView {
+  function symbolView(keyRaw: unknown, hoursRaw: unknown, pointsRaw?: unknown): SymbolView {
     const key = upgradeKey(String(keyRaw ?? ''));
     const pair = key ? pairOf(key) : undefined;
     if (!pair) return reject('unknown_symbol', '不是当前采集中的配对（或该场所组合未开启）');
     const hours = Number(hoursRaw ?? 24);
     if (!Number.isInteger(hours) || hours < 1 || hours > 24 * 14) reject('invalid_hours', '时长须为 1 到 336 小时');
+    const pointsLimit = pointsRaw === undefined || pointsRaw === null || pointsRaw === '' ? 1500 : Number(pointsRaw);
+    if (!Number.isInteger(pointsLimit) || pointsLimit < 0 || pointsLimit > 1500) reject('invalid_points', '点数须为 0 到 1500 之间的整数');
     const time = now(), from = time - hours * 3_600_000;
     const params = paramsOf(pair.key), bucket = bucketOf(params.notionalUsd);
     const history = historyOf(pair, hours, time, bucket, params.entryBps);
+    const points = pointsLimit === 0 ? [] : pointsLimit < history.points.length ? downsample(history.points, pointsLimit) : history.points;
     const sample = latest.get(pair.key) ?? store.latest(pair.key);
     const quoted = sample ? spreadOf(sample, bucketOf(params.notionalUsd)) : null;
     const fees = feesOf(pair);
@@ -1134,7 +1255,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       venue: pair.b.venue, venueName: VENUE_NAMES[pair.b.venue],
       symbol: pair.symbol, name: pair.name, kind: pair.kind, kindName: KIND_NAMES[pair.kind], identity: pair.identity, eligible: eligible(pair), gapBps: pair.gapBps,
       regimes: regimesOf(pair.kind), hours, from, to: time, bucket,
-      ...history,
+      ...history, points,
       params: storedOf(pair.key), effective: params, auto: { on: autoKeys.has(pair.key), ...recommendation(pair.key) }, global: settings.global, latest: sample ?? null, plans,
       fees: { a: legFeeBps(settings.global, pair.a.venue, pair.a.market.takerFeeBps), b: legFeeBps(settings.global, pair.b.venue, pair.b.market.takerFeeBps) },
       position: position && current ? { ...position, state: current.state, mark: sample && current.state === 'open' ? markOf(position, sample) : null } : null,
@@ -1716,7 +1837,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
           await context.pause(1_000);
         }
       } finally {
-        done = true; running = false;
+        done = true; running = false; clearAllPendingSignals();
         syncStreams();
         // 停止时掐断在途的下单请求（结果按「不明」落库，重启后先查询再决定，不重发），等这一轮推进收尾后才关库。
         liveStop.abort();
@@ -1729,7 +1850,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     accounts: () => accountSource(),
     live: () => liveTrader,
     close(): void {
-      running = false; if (replayWorker) void replayWorker.terminate(); liveStop.abort();
+      running = false; clearAllPendingSignals(); if (replayWorker) void replayWorker.terminate(); liveStop.abort();
       syncStreams(); store.close();
     },
   };

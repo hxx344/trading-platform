@@ -5,7 +5,8 @@ import type { AccountAsset, AccountFunding, AccountHistorySummary, AccountPnlPoi
 import type { BacktestResult } from './backtest.ts';
 import type { AssetKind, Combo, CustomPair, Identity, LegInfo, LiveVenue, Regime, Sample, SizeBucket, VarPriceSource, VenueId } from './model.ts';
 import type { OrderPlan } from './plan.ts';
-import type { LivePosition, LiveSettings, LiveState } from './live.ts';
+import type { LighterPrivateStatus } from './lighter-private.ts';
+import type { LiveExecSettings, LivePosition, LiveSettings, LiveSkipStats, LiveState } from './live.ts';
 import type { LiveKeysView } from './livekeys.ts';
 import type { RegimeStats } from './stats.ts';
 import type { AutoParams, ClosedTrade, Direction, GlobalParams, Position, SymbolParams } from './strategy.ts';
@@ -119,8 +120,10 @@ export interface SamplesView { symbol: string; format: number; columns: (keyof S
 /** 实盘页（docs/dexspread.md 第 13 节）：设置、凭据是否已录入（不含任何凭据内容）、持仓、成交与事件。 */
 export interface LiveCandidate { key: string; symbol: string; a: LegRef; b: LegRef; /** 总览里是否启用了这个配对（实盘还要求启用）。 */ enabled: boolean }
 export interface LiveView {
-  now: number; settings: LiveSettings; halt: string | null; paused: Record<string, string>;
+  now: number; settings: LiveSettings; exec: LiveExecSettings; halt: string | null; paused: Record<string, string>;
   lastSkip: { at: number; symbol: string; reason: string } | null;
+  skipStats: LiveSkipStats;
+  privateStreams: Partial<Record<'lighter' | 'rh', LighterPrivateStatus>>;
   positions: LivePosition[]; trades: LivePosition[]; todayNetUsd: number; totals: { trades: number; netUsd: number; wins: number };
   keys: LiveKeysView; keysProblem: string | null; signerProblem: string | null; venueNames: Record<VenueId, string>;
   candidates: LiveCandidate[]; events: StoredEventView[];

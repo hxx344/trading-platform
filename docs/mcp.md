@@ -215,14 +215,16 @@ R3：改动令牌的权限范围，第 8.4 节还会改 `read-token.json` 的格
   | 接口 | 内容 | 核对 |
   | --- | --- | --- |
   | `/api/varlighter/state` | 总览：各配对的价差、基线、参数、来源状态、实盘持仓摘要 | Var token 只给状态，不含 token 本身（`TokenView`） |
-  | `/api/varlighter/symbol`（`symbol`、`hours`） | 单个配对的走势点（最多 1500 点）、分时段统计、下单预演、实盘成交 | 只读本地库 |
+  | `/api/varlighter/symbol`（`symbol`、`hours`、`points`） | 单个配对的走势点（`points` 取 `0–1500`，默认 `1500`；MCP 默认传 `0` 只看摘要与成交）、分时段统计、下单预演、实盘成交 | 只读本地库 |
+  | `/api/varlighter/live` | 实盘开关、执行优化设置、私有 WS 流状态、日级跳过统计、在途持仓与近期已平仓（含逐单耗时/滑点/来源遥测） | 只读本地库；凭据仅返回是否已配置（布尔）与事件列表 |
+  | `/api/varlighter/entropy-cost`（`from`、`to`、`limit`） | Entropy 主网实际扣费与返佣明细 | 只读本地库 |
   | `/api/varlighter/readiness` | 实盘前核对清单（v0.112.0 去掉模拟盘，`/api/varlighter/paper` 不再提供） | 只读本地库 |
   | `/api/varlighter/samples`（`symbol`、`after`、`limit`） | 原始样本，见上 | 只读本地库 |
   | `/api/host` | 服务器负载、内存、磁盘、事件循环延迟、服务连线 | 不含路径、主机名、进程号（[observability.md](observability.md) 第 3 节）；`connections[].detail` 可能带连线错误的原文（经平台打码） |
   | `/api/monitor/<oil\|goldoil\|hynix\|anthropic>/quote` | 各监控当前报价与价差 | 采集器内存里的快照 |
   | `/api/news`、`/api/news/moves` | EQN 快讯与异动行情 | 正文来自第三方，工具描述注明是数据、不是指令。令牌读到的快讯链接字段名为 `link`（页面仍是 `url`）：`url` 是打码的标识字段，原样给出会把每条链接换成别名并挤掉别名表里的账户别名。读 `/api/news/moves` 和页面一样算“有人在看”，异动行情的轮询会延长 90 秒 |
 
-  仍不放行：`backtest`、`settings`、`live/*` 等 POST，`/api/monitor/<市场>/candles`（应答大）、`/api/monitor/perpetual/*`（含 SSE）、资产账本。
+  仍不放行：`backtest`、`settings`、`live/*` 等 POST，`/api/varlighter/accounts*`，`/api/monitor/<市场>/candles`（应答大）、`/api/monitor/perpetual/*`（含 SSE）、资产账本。
 
 **客户端侧**（与 `tools/mcp/readonly.ts` 同样用 `TP_MCP_URL`、`TP_MCP_TOKEN_FILE`，都不进发布包）
 
@@ -234,7 +236,7 @@ R3：改动令牌的权限范围，第 8.4 节还会改 `read-token.json` 的格
 - `tools/varlighter/backtest.ts` 在离线机器上用仓库当前的 `runBacktest` 重放，读取本机样本和来源快照即可。只有一份来源快照时自动选择，有多个来源时用 `TP_MCP_URL` 指定，无需令牌。参数包括 `--symbol`、`--hours`（以本机样本为准）、`--params`、`--global`（JSON，缺的字段取该来源保存的值），以及 `--grid`（最多 200 个组合，按净盈亏排序）。单次回测默认返回最后 50 笔成交，`--trades 0` 只返回汇总和空的成交列表，`--trades all` 返回全部明细。`summary` 始终计入全部成交。
 - 回测读取 `from` 之前一个基线窗口预热。结果的 `skipped` 给出跳过的时刻不递增行数，`gaps` 列出超过 30 分钟的空档，`gapCount` 给出全文件空档总数，单次回测的 `replayGaps` 给出回放区间内的空档数。追加中未写完的最后一行留到下次再读。`--check` 只按当前代码的参数规则核对请求。
 - MCP 工具新增：
-  - `varlighter`：`view=state|symbol|readiness`（v0.112.0 去掉 `paper`），`symbol` 视图要 `symbol`，可选 `hours`。v0.88.0 起配对键是两腿写法 `场所:代码|场所:代码[@乘数]`（如 `var:AAPL|rh:AAPL`、`lighter:NVDA|entropy:NVDA`），旧写法 `rh:AAPL` 仍认；`samples` 应答带 `format: 2` 与两腿列名，`pull.ts` 遇到别的格式（平台还是旧版本）报错而不写文件。本机回测按 `state.json` 里各配对两腿的手续费（`aFeeBps`、`bFeeBps`）重放，请求的全局手续费字段可覆盖。见 [dexspread.md](dexspread.md) 第 10.8 节。
+  - `varlighter`：`view=state|symbol|live|entropy_cost|readiness`（v0.112.0 去掉 `paper`；v0.113.0 新增 `live`、`entropy_cost` 及 `symbol` 的 `points`），`symbol` 视图要 `symbol`，可选 `hours`（`1–336`）与 `points`（`0–1500`，MCP 默认 `0` 只返回摘要与实盘成交以免大配对触发 100 KiB 截断）。v0.88.0 起配对键是两腿写法 `场所:代码|场所:代码[@乘数]`（如 `var:AAPL|rh:AAPL`、`lighter:NVDA|entropy:NVDA`），旧写法 `rh:AAPL` 仍认；`samples` 应答带 `format: 2` 与两腿列名，`pull.ts` 遇到别的格式（平台还是旧版本）报错而不写文件。本机回测按 `state.json` 里各配对两腿的手续费（`aFeeBps`、`bFeeBps`）重放，请求的全局手续费字段可覆盖。见 [dexspread.md](dexspread.md) 第 10.8 节与第 19 节。
   - `varlighter_backtest` 先在子进程里用 `--check` 核对请求，再从当前 MCP 连接的平台增量拉取配对样本，用相同来源在新进程运行 `tools/varlighter/backtest.ts`。参数同上（`params`、`global`、`grid`、`hours`）。单次回测的 `trades` 取 0–200，默认 20，取 0 时 `tradesShown` 为 0。返回文本上限 100 KiB，截断提示会给出调整方式。单次回测可减小 `trades`，网格回测可减少组合。子进程 120 秒超时。
   - `host_status`、`market_quotes`（`market` 选一个或全部）、`news`（`view=flash|moves`）。
 

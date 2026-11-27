@@ -38,7 +38,7 @@
   "test/boundaries.test.ts": 151,
   "test/candle-blocks.test.ts": 130,
   "test/chase.test.ts": 2096,
-  "test/ci-systemd.test.ts": 1353,
+  "test/ci-systemd.test.ts": 4000,
   "test/contract.test.ts": 6532,
   "test/control-continuity.test.ts": 4346,
   "test/control-transport.test.ts": 553,

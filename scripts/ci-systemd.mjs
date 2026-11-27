@@ -1,5 +1,6 @@
 // Select the real Ubuntu service checks. Only a main push can reuse a manual run of this exact workflow, on this commit
-// or on a candidate commit that the plan job found to have identical deployment inputs.
+// or on a recent ancestor from which this commit differs by nothing but the version in package.json.
+import { execFileSync } from 'node:child_process';
 import { appendFileSync } from 'node:fs';
 
 const scenarios = ['migration', 'components', 'execution', 'port', 'topology', 'downgrade', 'reconcile'];
@@ -7,10 +8,28 @@ const { GITHUB_API_URL: api, GITHUB_REPOSITORY: repo, GITHUB_SHA: sha, GITHUB_TO
 // A hosted Ubuntu pool serves several VM image builds in one matrix, and those builds carry different Ubuntu patch
 // revisions of the systemd package (255.4-1ubuntu8.18 next to 8.19), so a fresh run mixes them too. Compare the
 // distribution, the architecture and the upstream systemd version each step actually exercised.
-// The exact commit also pins the Node toolchain and dependency lockfile used by all jobs.
 const { ImageOS: os, RUNNER_ARCH: arch, SYSTEMD_VERSION: systemd } = process.env;
 const upstream = version => version.includes('-') ? version.slice(0, version.lastIndexOf('-')) : version;
-const candidates = [...new Set((process.env.CANDIDATES || sha || '').split(/\s+/).filter(Boolean))].slice(0, 6);
+
+const git = (...args) => execFileSync('git', args, { encoding: 'utf8', timeout: 10_000, maxBuffer: 16 << 20, stdio: ['ignore', 'pipe', 'ignore'] });
+function manifest(commit) {
+  const { version: _, ...rest } = JSON.parse(git('show', `${commit}:package.json`));
+  return JSON.stringify(rest);
+}
+// A release commit only bumps the version, so the manual run of a release usually sits on its parent. Such an ancestor
+// has the same sources, lockfile, workflow and scenarios as this commit. History that the checkout lacks ends the walk.
+function versionOnlyAncestors() {
+  const found = [];
+  try {
+    const own = manifest(sha);
+    for (const commit of git('rev-list', '--first-parent', '--skip=1', '-n', '5', sha).split('\n').filter(Boolean)) {
+      const changed = git('diff', '--name-only', '--no-renames', commit, sha).split('\n').filter(Boolean);
+      if (!/^[a-f0-9]{40}$/.test(commit) || changed.some(file => file !== 'package.json') || manifest(commit) !== own) break;
+      found.push(commit);
+    }
+  } catch { /* keep the ancestors already proven identical */ }
+  return found;
+}
 
 async function read(path) {
   const response = await fetch(`${api}/repos/${repo}/actions/${path}`, {
@@ -45,13 +64,13 @@ async function verifiedRun(commit) {
 const affected = process.env.GITHUB_EVENT_NAME === 'workflow_dispatch' || process.env.AFFECTED !== 'false';
 let verified = null;
 if (affected && process.env.GITHUB_EVENT_NAME === 'push' && process.env.GITHUB_REF === 'refs/heads/main'
-  && [os, arch, systemd].every(part => part && /^[\w.:+~-]+$/.test(part)) && token && candidates[0] === sha && candidates.every(commit => /^[a-f0-9]{40}$/.test(commit))) {
+  && [os, arch, systemd].every(part => part && /^[\w.:+~-]+$/.test(part)) && token && /^[a-f0-9]{40}$/.test(sha)) {
   try {
-    for (const commit of candidates) if ((verified = await verifiedRun(commit))) break;
+    for (const commit of [sha, ...versionOnlyAncestors()]) if ((verified = await verifiedRun(commit))) break;
   } catch (error) { verified = null; console.log(`无法核实既有验收，将重新运行：${error.message}`); }
 }
 const message = verified ? `提交 ${verified.commit.slice(0, 12)} 的 ${scenarios.length} 组真实 systemd 验收已在 ${os}/${arch}、systemd ${verified.versions.join(' 与 ')} 通过${
-    verified.commit === sha ? '' : `，本次提交 ${sha.slice(0, 12)} 相对它没有改动部署及进程边界`}。[候选运行](${process.env.GITHUB_SERVER_URL}/${repo}/actions/runs/${verified.id})`
+    verified.commit === sha ? '' : `，本次提交 ${sha.slice(0, 12)} 相对它只改了 package.json 的版本号`}。[候选运行](${process.env.GITHUB_SERVER_URL}/${repo}/actions/runs/${verified.id})`
   : affected ? '本次运行将在独立 Ubuntu runner 上执行全部真实 systemd 场景。' : '本次差异未涉及部署及进程边界。';
 console.log(message);
 appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${message}\n`);

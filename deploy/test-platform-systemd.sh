@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Actual systemd services, public HTTP and a single private writer, in the empty GitHub-hosted Linux runner only.
 # With no argument (or all), each scenario inherits the running services, packages and session from the previous one.
-# A scenario run alone builds its own starting deployment; port and downgrade then start from a fresh installation.
+# A scenario run alone builds its own starting deployment. The groups are sized for parallel runners: execution also
+# holds the update-helper and control candidates, port starts from a fresh installation of its base release.
 set -Eeuo pipefail
 scenario=${1-all}
 if (( $# > 1 )) || [[ ! $scenario =~ ^(all|migration|components|execution|port|topology|downgrade|reconcile)$ ]]; then
@@ -259,6 +260,13 @@ case $scenario in
       login
       assert_page v99.1.8
       market_probe "$app/market"
+    elif [[ $scenario == downgrade ]]; then
+      # As after the topology scenario: the genuine two-process release is live and the execution side owns the database.
+      bash "$root/deploy/install.sh" --package "$dual" >"$fixture/out" 2>&1
+      login
+      assert_page v0.64.0
+      assert_market_absent
+      seed_dex_db "$service" "$data"
     elif [[ $scenario == reconcile ]]; then
       # The old installer must find a live two-process deployment and a session that survives the downgrade.
       bash "$root/deploy/install.sh" --package "$previous" >"$fixture/out" 2>&1
@@ -470,7 +478,9 @@ grep -q '已回退到 v99.1.13 并确认运行正常' "$fixture/out"
 dex_probe "$app/dex"
 assert_page v99.1.13
 cp "$fixture/good-dex" "$source/src/dex/main.ts"
+fi
 
+if runs execution; then
 echo 'An update-helper-only package leaves both live process generations unchanged'
 printf '\n// simulated root helper update\n' >>"$source/src/service/update-helper.ts"
 build 11
@@ -499,9 +509,7 @@ grep -q '已回退到 v99.1.6 并确认运行正常' "$fixture/out"
 assert_page v99.1.6
 control_pid=$(pid "$control")
 cp "$fixture/good-control" "$source/src/control/main.ts"
-fi
 
-if runs execution; then
 echo 'An executor-only upgrade restarts one writer, keeps the control PID and preserves stored sessions'
 printf '\nif (import.meta.main && !process.argv.includes("--check-config")) console.info("模拟执行面升级");\n' >>"$source/src/service/main.ts"
 build 8

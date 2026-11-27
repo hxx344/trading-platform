@@ -79,33 +79,25 @@ jobs:
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
-          paths=(.github/workflows/ci.yml .github/actions/setup scripts/ci-systemd.mjs 'deploy/trading-platform*' deploy/install.sh deploy/package.sh deploy/component-digests.mjs deploy/test-platform-systemd.sh scripts/build-lighter-signer.sh src/varlighter/signer
-            src/control src/market src/monitor/perpetual-feed.ts src/monitor/market-readers.ts src/vendor/perpetual-exchanges.mjs 'src/vendor/perpetual-*-reader.mjs' 'src/service/remote-*.ts'
-            'src/vendor/crossex/*-reader.mjs' src/vendor/crossex/terminal-feed.mjs src/vendor/crossex/funding-client.mjs
-            'src/http*.ts' src/runtime.ts src/component-build.ts src/web-assets.ts src/data-dir.ts src/login-password.ts src/live/setup.ts
-            src/service/main.ts 'src/service/*config*.ts' 'src/service/update*.ts' src/service/handoff-file.ts src/service/take-handoff.ts 'src/service/import-*.ts')
-          if [[ -n "$BASE" && ! "$BASE" =~ ^0+$ ]] && git fetch --no-tags --depth=1 origin "$BASE" && git diff --quiet "$BASE" HEAD -- "${paths[@]}"; then
+          if [[ -n "$BASE" && ! "$BASE" =~ ^0+$ ]] && git fetch --no-tags --depth=1 origin "$BASE" &&
+              git diff --quiet "$BASE" HEAD -- .github/workflows/ci.yml .github/actions/setup scripts/ci-systemd.mjs 'deploy/trading-platform*' deploy/install.sh deploy/package.sh deploy/component-digests.mjs deploy/test-platform-systemd.sh scripts/build-lighter-signer.sh src/varlighter/signer \
+                src/control src/market src/monitor/perpetual-feed.ts src/monitor/market-readers.ts src/vendor/perpetual-exchanges.mjs 'src/vendor/perpetual-*-reader.mjs' 'src/service/remote-*.ts' \
+                'src/vendor/crossex/*-reader.mjs' src/vendor/crossex/terminal-feed.mjs src/vendor/crossex/funding-client.mjs \
+                'src/http*.ts' src/runtime.ts src/component-build.ts src/web-assets.ts src/data-dir.ts src/login-password.ts src/live/setup.ts \
+                src/service/main.ts 'src/service/*config*.ts' 'src/service/update*.ts' src/service/handoff-file.ts src/service/take-handoff.ts 'src/service/import-*.ts'; then
             echo "run=false" >>"$GITHUB_OUTPUT"
           else
             echo "run=true" >>"$GITHUB_OUTPUT"
           fi
-          # A release commit only bumps the version, so the manual run usually sits on its parent. A recent first-parent
-          # ancestor whose files above are identical to this commit's was verified with the same deployment inputs.
-          candidates=$GITHUB_SHA
-          if [[ "$GITHUB_EVENT_NAME" == push ]] && git fetch --no-tags --depth=6 origin "$GITHUB_SHA"; then
-            for commit in $(git rev-list --first-parent --skip=1 -n 5 HEAD); do
-              git diff --quiet "$commit" HEAD -- "${paths[@]}" || break
-              candidates+=" $commit"
-            done
-          fi
-          echo "candidates=$candidates" >>"$GITHUB_OUTPUT"
       - name: 核对已有的 Ubuntu 验收
         id: plan
         env:
           AFFECTED: ${{ steps.affected.outputs.run }}
-          CANDIDATES: ${{ steps.affected.outputs.candidates }}
           GITHUB_TOKEN: ${{ github.token }}
-        run: SYSTEMD_VERSION="$(dpkg-query -W -f='${Version}' systemd || true)" node scripts/ci-systemd.mjs
+        run: |
+          # The plan also accepts a manual run on a recent ancestor that differs from this commit by the version only.
+          if [[ "$GITHUB_EVENT_NAME" == push && "$AFFECTED" == true ]]; then git fetch --no-tags --depth=6 origin "$GITHUB_SHA" || true; fi
+          SYSTEMD_VERSION="$(dpkg-query -W -f='${Version}' systemd || true)" node scripts/ci-systemd.mjs
 
   platform-systemd:
     name: platform-systemd (${{ matrix.scenario }})

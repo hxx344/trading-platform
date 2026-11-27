@@ -23,7 +23,7 @@ export async function api<T>(path: string, { body, signal, timeoutMs = 15_000, m
   const payload = body === undefined ? undefined : JSON.stringify(body);
   // Preview and apply share the same route. Only an explicit preview in the submitted JSON is read-only.
   const importPreview = verb === 'POST' && pathname === '/api/asset/import' && payload !== undefined && JSON.parse(payload)?.apply === false;
-  const query = verb === 'POST' && /^\/api\/(?:preview|four-leg\/preview|options\/plans|crossex\/(?:open-capacity|preview)|read-token\/lookup|monitor\/perpetual\/(?:price-history|depth|exit))$/.test(pathname);
+  const query = verb === 'POST' && /^\/api\/(?:preview|four-leg\/preview|options\/plans|crossex\/(?:open-capacity|preview)|read-token\/lookup|varlighter\/backtest|monitor\/perpetual\/(?:price-history|depth|exit))$/.test(pathname);
   const writing = verb !== 'GET' && !display && !query && !importPreview;
   const key = display ? path + '\n' + verb + '\n' + (payload ?? '') : undefined;
   const readTimeout = importPreview ? '原表预览超时，请重新选择文件' : '数据读取超时，稍后自动重试';

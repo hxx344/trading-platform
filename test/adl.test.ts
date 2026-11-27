@@ -723,3 +723,48 @@ test('ADL #6：撤单连续未发送超时后停机交人工处理，不永久�
   const saved = JSON.parse((h.store.db.prepare('SELECT json FROM adl_batches WHERE id = ?').get(batch.id) as { json: string }).json) as { cancels: number };
   assert.equal(saved.cancels, 0);
 }, { adlCancelAfterMs: 1_000, adlQuerySpacingMs: 500, adlObservationMs: 60_000 }));
+
+test('ADL #6b：撤单连续 not-sent 期间同轮继续查询并在外部撤单后收敛，不单轮重复撤单', () => withAdl(async h => {
+  h.asterTrading.inject({ operation: 'place', mode: 'rest' });
+  h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
+  await h.ex.tick();
+  const batch = current(h)!.batches[0]!;
+  assert.equal(batch.state, 'open');
+  h.asterTrading.inject({ operation: 'cancel', mode: 'not-sent', times: 10 });
+  const cancelsBefore = h.asterTrading.calls.cancel;
+  const queriesBefore = h.asterTrading.calls.query;
+  h.advance(1_000);
+  await h.ex.tick();
+  assert.equal(h.asterTrading.calls.cancel - cancelsBefore, 1, 'not-sent 当轮只尝试一次撤单');
+  assert.equal(h.asterTrading.calls.query - queriesBefore, 1, 'cancel 返回 not-sent 后同轮仍继续查询');
+
+  // External cancel at the venue completes the batch even while local cancel transport fails with not-sent.
+  h.asterTrading.cancelOnVenue(SHORT, batch.clientOrderId);
+  h.advance(500);
+  await h.ex.tick();
+  const saved = JSON.parse((h.store.db.prepare('SELECT json FROM adl_batches WHERE id = ?').get(batch.id) as { json: string }).json) as { state: string; settled?: boolean };
+  assert.equal(saved.state, 'done');
+  assert.equal(h.ex.adlPairs()[0]?.incident?.status ?? 'active', 'active');
+}, { adlCancelAfterMs: 1_000, adlQuerySpacingMs: 500, adlObservationMs: 60_000 }));
+
+test('ADL #6c：长时间停机恢复后 cancelNotSentSince 从接管时刻重新计时，不首轮立即停机', () => withAdl(async h => {
+  h.asterTrading.inject({ operation: 'place', mode: 'rest' });
+  h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
+  await h.ex.tick();
+  h.asterTrading.inject({ operation: 'cancel', mode: 'not-sent', times: 20 });
+  await run(h, 1_500, 500);
+  assert.equal(current(h)?.status, 'active');
+
+  // Simulate long downtime beyond adlCancelAfterMs * 3; takeover resets heldSince baseline.
+  h.clock.now += 70_000;
+  h.restart({ budgets: { ...QUICK, adlCancelAfterMs: 1_000, adlQuerySpacingMs: 500, adlObservationMs: 60_000 } });
+  assert.equal(h.ex.acquire(), true);
+  h.asterTrading.inject({ operation: 'cancel', mode: 'not-sent', times: 20 });
+  await h.ex.tick();
+  assert.equal(current(h)?.status, 'active', '恢复首轮不因停机耗时直接停机');
+
+  // Continuing not-sent for a full window from heldSince triggers halt.
+  await run(h, 3_500, 500);
+  assert.equal(recent(h)[0]!.status, 'halted');
+  assert.match(recent(h)[0]!.reason ?? '', /撤单持续未发送/);
+}, { adlCancelAfterMs: 1_000, adlQuerySpacingMs: 500, adlObservationMs: 60_000 }));

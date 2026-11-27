@@ -34,8 +34,10 @@ usage() {
   --version vX.Y.Z     安装指定版本的巡检程序（也用于回退）；默认最新正式版
   --uninstall          停止并移除巡检服务，保留 /etc/main-watch 配置
 首次安装需要 --heartbeat-listen、--main 或 --checks 之一，以及 --webhook（或 --webhook-stdin）；之后不带参数重复执行即为升级。
-开启心跳后，按部署结束时打印的命令在主服务器（统一交易平台）上开启推送：
-  sudo awk -F= '$1=="HEARTBEAT_TOKEN"{print $2}' /etc/main-watch/config | sudo bash install.sh --watch-url http://<本机IP>:<端口>/heartbeat --watch-token-stdin
+开启心跳后，先在副服务器读取令牌（不回显到主服务器命令行）：
+  sudo awk -F= '$1=="HEARTBEAT_TOKEN"{print $2}' /etc/main-watch/config
+再将令牌保存为文件后在主服务器（统一交易平台）上开启推送：
+  sudo bash install.sh --watch-url http://<副服务器IP>:<端口>/heartbeat --watch-token-stdin < /path/to/heartbeat-token
 USAGE
 }
 [[ $(uname -s) == Linux && $EUID -eq 0 ]] || die '请在 Linux 上以 root 或 sudo 运行。'
@@ -91,6 +93,9 @@ while (($#)); do
 done
 [[ -z $version || $version =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die '--version 须形如 v0.47.0'
 [[ -z $source_revision || $source_revision =~ ^[A-Za-z0-9._:-]{1,64}$ ]] || die '--revision 格式无效。'
+if ((webhook_stdin || secret_stdin)); then
+  [[ -f $0 ]] || die '请先下载 install-watch.sh 再使用 --webhook-stdin 或 --secret-stdin'
+fi
 
 # 不解析符号链接：系统升级换掉 python3.X 后，单元仍指向有效的 python3。依赖检查与服务使用同一个解释器。
 pick_python() { if [[ -x /usr/bin/python3 ]]; then python_bin=/usr/bin/python3; else python_bin=$(command -v python3 || true); fi; }
@@ -472,7 +477,9 @@ runuser -u "$service" -- "$python_bin" -I "$root/main_watch.py" --config "$confi
 if ((${#heartbeat[@]} && config_changed)); then
   host=${heartbeat[0]%:*}
   case $host in 0.0.0.0|'[::]') host='<副服务器公网IP>' ;; esac
-  say "心跳接收监听 ${heartbeat[0]}。请在安全组放通主服务器到本机 TCP ${heartbeat[2]}，然后在主服务器（统一交易平台）执行："
-  printf '  sudo awk -F= '\''$1=="HEARTBEAT_TOKEN"{print $2}'\'' %s | sudo bash install.sh --watch-url http://%s:%s/heartbeat --watch-token-stdin\n' "$config" "$host" "${heartbeat[2]}"
+  say "心跳接收监听 ${heartbeat[0]}。请在安全组放通主服务器到本机 TCP ${heartbeat[2]}，先在当前副服务器执行以下命令读取令牌："
+  printf '  sudo awk -F= '\''$1=="HEARTBEAT_TOKEN"{print $2}'\'' %s\n' "$config"
+  say "将输出的令牌写入主服务器临时文件（如 /tmp/heartbeat-token，使用后删除）后，在主服务器（统一交易平台）执行："
+  printf '  sudo bash install.sh --watch-url http://%s:%s/heartbeat --watch-token-stdin < /tmp/heartbeat-token\n' "$host" "${heartbeat[2]}"
 fi
 say '管理命令：sudo main-watch status | logs | probe | test'

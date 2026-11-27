@@ -24,11 +24,17 @@ export const confirmRefused = (error: unknown): boolean => {
 
 export const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
-export const acceptedJobText = (result: { duplicate?: boolean; job: { id: string } }, statusLabel: string, placement: '上方' | '下方' = '上方'): string =>
-  `${result.duplicate ? '该请求已受理过' : '已受理'}：任务 ${result.job.id.slice(0, 8)}（${statusLabel}），进度见${placement}「成交进度与结果」`;
+export const acceptedJobText = (result: { duplicate?: boolean; job: { id: string } }, statusLabel: string, placement: '上方' | '下方' = '上方'): string => {
+  if (!result?.job || typeof result.job.id !== 'string') throw new Error('确认响应缺少任务编号');
+  return `${result.duplicate ? '该请求已受理过' : '已受理'}：任务 ${result.job.id.slice(0, 8)}（${statusLabel}），进度见${placement}「成交进度与结果」`;
+};
 
-export const acceptedFourLegText = (result: { duplicate?: boolean; group: string; jobs: readonly { id: string }[] }): string =>
-  `${result.duplicate ? '该请求已受理过' : '已受理'}：四腿组 ${result.group.slice(0, 8)}，任务 ${result.jobs.map(job => job.id.slice(0, 8)).join('、')}，进度见上方「成交进度与结果」`;
+export const acceptedFourLegText = (result: { duplicate?: boolean; group: string; jobs: readonly { id: string }[] }): string => {
+  if (!result || typeof result.group !== 'string' || !Array.isArray(result.jobs) || !result.jobs.every(job => typeof job?.id === 'string')) {
+    throw new Error('确认响应缺少四腿任务编号');
+  }
+  return `${result.duplicate ? '该请求已受理过' : '已受理'}：四腿组 ${result.group.slice(0, 8)}，任务 ${result.jobs.map(job => job.id.slice(0, 8)).join('、')}，进度见上方「成交进度与结果」`;
+};
 
 export interface OrderConfirmOptions<R> {
   previewId: string;
@@ -59,12 +65,15 @@ export async function executeOrderConfirm<R>(options: OrderConfirmOptions<R>): P
   setBusy(true);
   setMessage({ tone: 'muted', text: '发送中…' });
   try {
-    const result = await ids.run('confirm', previewId, send, confirmRefused);
+    const accepted = await ids.run('confirm', previewId, async requestId => {
+      const result = await send(requestId);
+      return { result, text: formatAccepted(result) };
+    }, confirmRefused);
     if (!dialog.isAlive()) return;
     clearPreview();
     setUnanswered(null);
-    setMessage({ tone: 'ok', text: formatAccepted(result) });
-    onAccepted(result);
+    setMessage({ tone: 'ok', text: accepted.text });
+    onAccepted(accepted.result);
   } catch (error) {
     if (!dialog.isAlive()) return;
     // Without an answer the job may have been accepted: the retry reuses the request id, so it cannot run twice.

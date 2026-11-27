@@ -131,7 +131,7 @@ export function OilRules({ onExpired, market = 'oil' }: { onExpired: () => void;
     setBusy(true); setWriteError(''); setNotice('');
     try {
       const next = await api<OilRulesView>(path, { body });
-      if (!next || typeof next !== 'object' || !Array.isArray(next.rules)) throw new Error('规则响应格式无效');
+      if (!next || typeof next !== 'object' || !Array.isArray(next.rules) || (next.available && !Array.isArray(next.venues))) throw new Error('规则响应格式无效');
       live.commit(next);
       setNotice(done);
       return null;

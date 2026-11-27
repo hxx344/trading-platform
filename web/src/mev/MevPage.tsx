@@ -13,8 +13,8 @@ import { Badge, Metric, useWrite } from '../varlighter/parts.tsx';
 import type { MevSetupView, MevStateView } from '../../../src/mev/views.ts';
 import { SetupPanel, WalletCard } from './MevSetup.tsx';
 import {
-  MEV_BASE, MEV_TABS, OUTCOME_LABELS, SETTING_FIELDS, SETTING_GROUPS, TX_STATUS_LABELS, age, bps, compactUsd, eth, explorerAddress, explorerTx, feePercent, mevHref, outcomeTone,
-  settingsChanged, settingsForm, settingsRequest, shortAddress, startBlocker, startConfirmText, tokenAmount, txTone, usd, type MevTab, type SettingsForm,
+  MEV_BASE, MEV_TABS, OUTCOME_LABELS, SETTING_FIELDS, SETTING_GROUPS, TX_STATUS_LABELS, age, bps, compactUsd, commitSettingsSave, editSettingsSync, eth, explorerAddress, explorerTx, feePercent, initSettingsSync, mevHref, outcomeTone,
+  receiveServerSettings, revertSettingsSync, settingsChanged, settingsRequest, shortAddress, startBlocker, startConfirmText, tokenAmount, txTone, usd, type MevTab, type SettingsSyncState,
 } from './mev-form.ts';
 
 const STATE_PATH = `${MEV_BASE}/state`;
@@ -232,26 +232,19 @@ function Pools({ view, write, onChanged }: { view: MevStateView; write: Write; o
 }
 
 function SettingsTab({ view, write, onChanged }: { view: MevStateView; write: Write; onChanged: Changed }) {
-  const [form, setForm] = useState<SettingsForm>(() => settingsForm(view.settings));
-  const [touched, setTouched] = useState(false);
+  const [sync, setSync] = useState<SettingsSyncState>(() => initSettingsSync(view.settings));
   const [problem, setProblem] = useState<string | null>(null);
-  const saved = JSON.stringify(view.settings);
-  const synced = useRef(saved);
-  // 没在编辑且服务端值变化时再跟随（保存后刷新还在途时不拿旧服务端值盖回刚提交的新值）。
+  // 没在编辑且服务端值变化时再跟随（保存后刷新还在途或失败时以乐观基线为准，不拿旧服务端值盖回刚提交的新值）。
   useEffect(() => {
-    if (!touched && synced.current !== saved) {
-      synced.current = saved;
-      setForm(settingsForm(JSON.parse(saved)));
-    }
-  }, [saved, touched]);
-  const dirty = settingsChanged(form, view.settings);
+    setSync(current => receiveServerSettings(current, view.settings));
+  }, [view.settings]);
+  const dirty = settingsChanged(sync.form, sync.baseline);
   const save = () => {
-    const request = settingsRequest(form);
+    const request = settingsRequest(sync.form);
     if (!request.ok) { setProblem(request.message); return; }
     setProblem(null);
     void write.run('settings', () => api(`${MEV_BASE}/settings`, { body: request.body }), () => {
-      setForm(settingsForm(request.body.settings));
-      setTouched(false);
+      setSync(current => commitSettingsSave(current, request.body.settings));
       void onChanged();
       return '风控参数已保存，下一个区块起生效';
     });
@@ -262,14 +255,14 @@ function SettingsTab({ view, write, onChanged }: { view: MevStateView; write: Wr
       <div className="mev-group">{group.label}</div>
       <div className="vl-fields">{SETTING_FIELDS.filter(field => field.group === group.id).map(field => <label className="vl-field" key={field.key}>
         {field.label}（{field.unit}）
-        <input inputMode="decimal" value={form[field.key]} onChange={event => { setTouched(true); setForm(current => ({ ...current, [field.key]: event.target.value })); }} />
+        <input inputMode="decimal" disabled={write.busy !== null} value={sync.form[field.key]} onChange={event => setSync(current => editSettingsSync(current, field.key, event.target.value))} />
         <small>{field.hint}</small>
       </label>)}</div>
     </div>)}
     <div className="vl-actions">
       {problem ? <Callout tone="error">{problem}</Callout> : null}
       <button type="button" className="button" disabled={!dirty || write.busy !== null} onClick={save}>{write.busy === 'settings' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Save size={14} aria-hidden="true" />}保存参数</button>
-      <button type="button" className="button secondary" disabled={!dirty || write.busy !== null} onClick={() => { synced.current = saved; setTouched(false); setProblem(null); setForm(settingsForm(view.settings)); }}>撤销修改</button>
+      <button type="button" className="button secondary" disabled={!dirty || write.busy !== null} onClick={() => { setProblem(null); setSync(current => revertSettingsSync(current, view.settings)); }}>撤销修改</button>
     </div>
   </section>;
 }

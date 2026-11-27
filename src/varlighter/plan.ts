@@ -60,7 +60,14 @@ export function orderPlan(pair: PairInfo, sample: Sample, direction: Direction, 
   if (bDecimals !== null) {
     bQty = floorTo(notionalUsd / bMid, bDecimals);
     aQty = aDecimals !== null ? floorTo(bQty / k, aDecimals) : bQty / k;
-    if (aDecimals !== null) bQty = floorTo(aQty * k, bDecimals);
+    if (aDecimals !== null) {
+      bQty = floorTo(aQty * k, bDecimals);
+      if (bQty <= 0) aQty = 0;
+      else {
+        const aligned = roundTo(bQty / k, aDecimals, true);
+        if (aligned < aQty && floorTo(aligned * k, bDecimals) >= bQty) aQty = aligned;
+      }
+    }
   }
   else { aQty = floorTo(notionalUsd / (k * bMid), aDecimals ?? 6); bQty = aQty * k; }
   const format = (qty: number, decimals: number | null, other: number | null) => decimals !== null ? qty.toFixed(decimals) : other !== null && k === 1 ? qty.toFixed(other) : String(Number(qty.toPrecision(8)));

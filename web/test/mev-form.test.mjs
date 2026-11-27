@@ -3,7 +3,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DEFAULT_SETTINGS, parseSettings } from '../../src/mev/risk.ts';
 import {
-  MEV_TABS, SETTING_FIELDS, SETTING_GROUPS, TX_STATUS_LABELS, age, bps, compactUsd, eth, feePercent, mevHref, outcomeTone, settingsChanged, settingsForm, settingsRequest, shortAddress, startBlocker, startConfirmText, tokenAmount, txTone, usd,
+  MEV_TABS, SETTING_FIELDS, SETTING_GROUPS, TX_STATUS_LABELS, age, bps, compactUsd, commitSettingsSave, editSettingsSync, eth, feePercent, initSettingsSync, mevHref, outcomeTone,
+  receiveServerSettings, revertSettingsSync, settingsChanged, settingsForm, settingsRequest, shortAddress, startBlocker, startConfirmText, tokenAmount, txTone, usd,
   REDEPLOY_AFTER_MS, deployBlocker, deployConfirmText, insecurePage, resetConfirmText, setupRequest,
 } from '../src/mev/mev-form.ts';
 import { REDEPLOY_AFTER_MS as SERVER_REDEPLOY_AFTER_MS } from '../../src/mev/setup.ts';
@@ -121,4 +122,51 @@ test('明文 http 且不是本机时提醒；部署前要有余额；确认文�
   assert.ok(!/仍可能上链/.test(resetConfirmText(setup())));
   assert.match(resetConfirmText(setup({ deploy: { hash: '0x1', nonce: 0, at: 1, address: EXECUTOR } })), /仍可能上链/);
   assert.equal(REDEPLOY_AFTER_MS, SERVER_REDEPLOY_AFTER_MS);
+});
+
+test('设置同步状态机：编辑中服务端变更、保存后刷新在途/失败与撤销均不回滚到陈旧值', () => {
+  const s0 = DEFAULT_SETTINGS;
+  const s1 = { ...s0, minNetUsd: 2.5 };
+  const s2 = { ...s0, minNetUsd: 5 };
+  const s3 = { ...s0, minNetUsd: 8 };
+
+  // 1. 编辑期间服务端推来 S1，保存提交 S2 后即使收到 S1 也不覆盖，等 S2 到来才清除 pending。
+  let state = initSettingsSync(s0);
+  state = editSettingsSync(state, 'minNetUsd', '5');
+  state = receiveServerSettings(state, s1);
+  assert.equal(state.form.minNetUsd, '5');
+  state = commitSettingsSave(state, s2);
+  assert.equal(state.form.minNetUsd, '5');
+  assert.equal(settingsChanged(state.form, state.baseline), false);
+  state = receiveServerSettings(state, s1);
+  assert.equal(state.form.minNetUsd, '5', '已提交的 S2 不被陈旧 S1 盖回');
+  state = receiveServerSettings(state, s2);
+  assert.equal(state.pendingSavedJson, null);
+  assert.equal(state.baseline.minNetUsd, 5);
+
+  // 2. 保存 S2 后刷新失败（view.settings 停在 S0），dirty=false；再改 S4 后撤销回到 S2 而非 S0。
+  let offline = commitSettingsSave(editSettingsSync(initSettingsSync(s0), 'minNetUsd', '5'), s2);
+  assert.equal(settingsChanged(offline.form, offline.baseline), false);
+  offline = editSettingsSync(offline, 'minNetUsd', '7');
+  assert.equal(settingsChanged(offline.form, offline.baseline), true);
+  offline = revertSettingsSync(offline, s0);
+  assert.equal(offline.form.minNetUsd, '5');
+  assert.equal(offline.touched, false);
+  assert.equal(settingsChanged(offline.form, offline.baseline), false);
+
+  // 3. 保存后刷新在途继续编辑，服务端追平到 S2 时保留用户新输入但更新基线；无未追平保存时撤销回到最新服务端值。
+  let overlapping = commitSettingsSave(editSettingsSync(initSettingsSync(s0), 'minNetUsd', '5'), s2);
+  overlapping = editSettingsSync(overlapping, 'minNetUsd', '6');
+  overlapping = receiveServerSettings(overlapping, s2);
+  assert.equal(overlapping.form.minNetUsd, '6');
+  assert.equal(overlapping.baseline.minNetUsd, 5);
+  assert.equal(overlapping.pendingSavedJson, null);
+  const reverted = revertSettingsSync(overlapping, s3);
+  assert.equal(reverted.form.minNetUsd, '8');
+  assert.equal(reverted.baseline.minNetUsd, 8);
+
+  // 4. 空闲未修改时跟随服务端更新。
+  const idle = receiveServerSettings(initSettingsSync(s0), s1);
+  assert.equal(idle.form.minNetUsd, '2.5');
+  assert.equal(settingsChanged(idle.form, idle.baseline), false);
 });

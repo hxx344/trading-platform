@@ -519,11 +519,14 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     if (!absent.length) return;
     if (!group) throw new Error('跟踪策略没有开仓任务，无法用历史核对');
     const CLOCK_SKEW_SLACK_MS = 60_000;
-    const priorClosedAt = Object.values(state.tasks)
-      .filter(task => task.id !== groupId && task.strategyStatus === 'closed' && task.closedAt !== null && task.closedAt <= group.acceptedAt)
-      .reduce((max, task) => Math.max(max, task.closedAt!), 0);
-    const since = Math.max(priorClosedAt, group.acceptedAt - CLOCK_SKEW_SLACK_MS), end = now(), upper = end + CLOCK_SKEW_SLACK_MS;
+    const since = Math.max(0, group.acceptedAt - CLOCK_SKEW_SLACK_MS), end = now(), upper = end + CLOCK_SKEW_SLACK_MS;
     if (!(end - group.acceptedAt >= -CLOCK_SKEW_SLACK_MS && end - group.acceptedAt <= HISTORY_LIMIT_MS)) throw new Error('开仓时间超出可核对的平仓历史范围（180 天）');
+    const rowIdentity = (row: Row): string => JSON.stringify([row.symbol, row.side, String(row.openTime), String(row.closeTime)]);
+    const claimed = new Set<string>();
+    for (const task of Object.values(state.tasks)) {
+      if (task.id === groupId) continue;
+      for (const rows of Object.values(task.closureEvidence ?? {})) for (const row of rows) claimed.add(rowIdentity(row));
+    }
     const signal = AbortSignal.timeout(RETIRE_BUDGET_MS);
     const evidence = new Map<string, Row[]>();
     for (const [key, qty] of absent) {
@@ -536,8 +539,8 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
         if (row.symbol !== symbol || row.side !== side) continue;
         const openTime = Number(row.openTime), closeTime = Number(row.closeTime), amount = Number(row.qty);
         if (![openTime, closeTime, amount].every(Number.isFinite) || amount <= 0) throw new Error('平仓历史的数量或时间无效');
-        const identity = `${openTime}|${closeTime}`;
-        if (seen.has(identity) || !(since <= openTime && openTime <= closeTime && closeTime <= upper)) continue;
+        const identity = rowIdentity(row);
+        if (claimed.has(identity) || seen.has(identity) || !(since <= openTime && openTime <= closeTime && closeTime <= upper)) continue;
         seen.add(identity);
         matched.push({ symbol, side, qty: row.qty, openTime: row.openTime, closeTime: row.closeTime, ...Object.fromEntries(EVIDENCE_AMOUNTS.filter(key => row[key] !== undefined).map(key => [key, row[key]])) });
         total += amount;

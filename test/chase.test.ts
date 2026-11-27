@@ -163,6 +163,42 @@ test('追价认领：已被其他委托认领的策略编号不能再认领', ()
   assert.equal((await h.ex.adoptStrategy({ jobId: second.jobId, requestId: randomUUID(), strategyId: own.strategyId }, SESSION)).legs[0].operation?.remoteId, own.strategyId);
 }));
 
+test('追价认领：并发查询等待期间策略被其他委托认领时，写事务内以 strategy_claimed 拒绝且不落库', () => withHarness(async h => {
+  h.bybit.inject({ operation: 'strategy-place', mode: 'lost-response' });
+  const first = await previewAndConfirm(h, chaseIntent());
+  await h.ex.tick();
+  // Release the inter-job lock in test to create a second concurrent orphan strategy job for the same symbol.
+  h.store.db.prepare('DELETE FROM locks WHERE job_id = ?').run(first.jobId);
+  h.bybit.inject({ operation: 'strategy-place', mode: 'lost-response' });
+  const second = await previewAndConfirm(h, chaseIntent());
+  await h.ex.tick();
+  const target = h.bybit.strategiesOf('BY2002')[0]!;
+  const origQuery = h.bybit.queryStrategy.bind(h.bybit);
+  let waiting = 0;
+  let release!: () => void;
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  h.bybit.queryStrategy = async (...args) => {
+    const result = await origQuery(...args);
+    waiting += 1;
+    if (waiting === 2) release();
+    await barrier;
+    return result;
+  };
+  try {
+    const results = await Promise.allSettled([
+      h.ex.adoptStrategy({ jobId: first.jobId, requestId: randomUUID(), strategyId: target.strategyId }, SESSION),
+      h.ex.adoptStrategy({ jobId: second.jobId, requestId: randomUUID(), strategyId: target.strategyId }, SESSION),
+    ]);
+    assert.equal(results.filter(item => item.status === 'fulfilled').length, 1);
+    const rejected = results.find(item => item.status === 'rejected') as PromiseRejectedResult | undefined;
+    assert.ok(rejected && code('strategy_claimed')(rejected.reason));
+    const claimedCount = (h.store.db.prepare("SELECT COUNT(*) AS n FROM operations WHERE json_extract(json, '$.remoteId') = ?").get(target.strategyId) as { n: number }).n;
+    assert.equal(claimedCount, 1);
+  } finally {
+    h.bybit.queryStrategy = origQuery;
+  }
+}));
+
 test('追价认领：认领后停止被拒，待人工期间有界重试停止直至结清', () => withHarness(async h => {
   h.bybit.inject({ operation: 'strategy-place', mode: 'lost-response', filled: '0.3' });
   h.bybit.inject({ operation: 'strategy-stop', mode: 'reject' });

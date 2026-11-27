@@ -220,10 +220,7 @@ export function buildPerformance({ groups, executions, journal, positions, sampl
     if (Object.keys(evidence).length && targets.size) {
       try {
         const CLOCK_SKEW_SLACK_MS = 60_000;
-        const priorClosedAt = group ? Object.entries(groups)
-          .filter(([otherId, other]) => otherId !== id && other.strategyStatus === 'closed' && other.closedAt != null && other.closedAt <= group.acceptedAt)
-          .reduce((max, [, other]) => Math.max(max, other.closedAt!), 0) : 0;
-        const minOpenedAt = group ? Math.max(priorClosedAt, group.acceptedAt - CLOCK_SKEW_SLACK_MS) : 0;
+        const minOpenedAt = group ? Math.max(0, group.acceptedAt - CLOCK_SKEW_SLACK_MS) : 0;
         let net = 0n, openingFee = 0n, closingFee = 0n, delivery = 0n, premium = 0n;
         const opened: number[] = [], closedTimes: number[] = [], currencies = new Set<string>(), seen = new Set<string>();
         let expiryVerified = true, evidenceEarly = false;

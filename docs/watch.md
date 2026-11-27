@@ -75,7 +75,7 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 sudo bash install-watch.sh --heartbeat-listen 0.0.0.0:8792 --webhook <飞书机器人地址> --name 统一交易平台
 ```
 
-- 配置有变化时，脚本结束会打印要在主服务器上执行的接入命令（经 `awk` + `--watch-token-stdin` 读取 `/etc/main-watch/config`，不在终端回显令牌）。没打印时（例如只是升级），令牌可在 `/etc/main-watch/config` 的 `HEARTBEAT_TOKEN` 行查看。
+- 配置有变化时，脚本结束会打印副服务器读取令牌及主服务器接入命令（经 `--watch-token-stdin` 读取，不在命令行参数回显令牌）。没打印时（例如只是升级），令牌可在副服务器 `/etc/main-watch/config` 的 `HEARTBEAT_TOKEN` 行查看。
 - 已经部署过（包括工作台版本）时不带参数执行即升级，配置保留；内容没变且服务正常时直接结束。
 - 其他选项：`--heartbeat-token`（不给则自动生成）、`--main 主机:端口`（副服务器能直连主服务器页面时另外探测 `/api/ready`，传空串清除）、`--checks`、`--webhook-stdin`、`--secret`、`--secret-stdin`、`--threshold`、`--remind`、`--test`、`--version vX.Y.Z`（v0.47.0 起的版本）、`--uninstall`（保留 `/etc/main-watch`）。
 - 安全组：放行 TCP 8792，来源只填主服务器的公网 IP。
@@ -84,8 +84,16 @@ sudo bash install-watch.sh --heartbeat-listen 0.0.0.0:8792 --webhook <飞书机�
 
 ### 主服务器（本服务）
 
+先在**副服务器**读取心跳令牌（`/etc/main-watch/config` 仅保存在副服务器）：
+
 ```bash
-sudo awk -F= '$1=="HEARTBEAT_TOKEN"{print $2}' /etc/main-watch/config | sudo bash install.sh --watch-url http://<副服务器 IP>:8792/heartbeat --watch-token-stdin
+sudo awk -F= '$1=="HEARTBEAT_TOKEN"{print $2}' /etc/main-watch/config
+```
+
+将令牌保存为主服务器上的临时文件（例如 `/tmp/heartbeat-token`，接入后删除），再在**主服务器**执行：
+
+```bash
+sudo bash install.sh --watch-url http://<副服务器 IP>:8792/heartbeat --watch-token-stdin < /tmp/heartbeat-token
 ```
 
 - 写入两个文件，校验后重启服务；校验或启动失败时两个文件恢复原样。

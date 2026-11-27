@@ -220,6 +220,7 @@ export function createAdl({ db, now, budgets, connector, write, assertWriter, ca
   const tolerance = budgets.futureToleranceMs;
   /** Batches whose send or cancel runs in this process; any other prepared or sending row was interrupted. */
   const inFlight = new Set<string>();
+  let heldSince = now();
   const pushed: { accountId: string; row: unknown }[] = [];
   let droppedPushes = 0;
   let resumeAfter: string | null = null;
@@ -525,7 +526,7 @@ export function createAdl({ db, now, budgets, connector, write, assertWriter, ca
     batch.report = report;
     batch.verifiedAt = null;
     batch.state = report.status === 'rejected' ? 'rejected' : TERMINAL_ADL_ORDER.has(report.status) ? 'done' : 'open';
-    if (batch.state === 'done' || batch.state === 'rejected') batch.note = null;
+    if (batch.state === 'done' || batch.state === 'rejected') { batch.note = null; batch.cancelNotSentSince = null; }
   }
   const parseReport = (raw: unknown, batch: Batch): AdlOrderReport =>
     parseAdlOrderReport(raw, { clientOrderId: batch.clientOrderId, symbol: batch.symbol, side: batch.orderSide, positionSide: batch.positionSide, quantity: batch.quantity }, now(), tolerance);
@@ -540,6 +541,7 @@ export function createAdl({ db, now, budgets, connector, write, assertWriter, ca
   async function cancelBatch(batch: Batch): Promise<boolean> {
     const previous = { cancelRequestedAt: batch.cancelRequestedAt, cancels: batch.cancels, lastPossibleSendAt: batch.lastPossibleSendAt, postCancelQueries: batch.postCancelQueries, queryAfter: batch.queryAfter };
     const at = now();
+    let sent = true;
     inFlight.add(batch.id);
     try {
       write(() => {
@@ -554,6 +556,7 @@ export function createAdl({ db, now, budgets, connector, write, assertWriter, ca
         const current = readBatch(batch.id);
         if ('report' in outcome) { accept(current, outcome.report); current.cancelNotSentSince = null; }
         else if (outcome.error instanceof VenueError && outcome.error.kind === 'not-sent') {
+          sent = false;
           Object.assign(current, previous, { cancelNotSentSince: current.cancelNotSentSince ?? now(), queryAfter: now() + budgets.adlQuerySpacingMs, note: `撤单未发送：${message(outcome.error)}` });
         } else if (outcome.error instanceof ContractError) throw outcome.error;
         else {
@@ -563,7 +566,7 @@ export function createAdl({ db, now, budgets, connector, write, assertWriter, ca
         saveBatch(current);
         Object.assign(batch, current);
       });
-      return true;
+      return sent;
     } finally { inFlight.delete(batch.id); }
   }
   /** A working batch is cancelled adlCancelAfterMs after its send, and again adlCancelAfterMs after each cancel that left it working, at most ADL_CANCEL_LIMIT times. */
@@ -573,15 +576,19 @@ export function createAdl({ db, now, budgets, connector, write, assertWriter, ca
    * A batch a query still finds working after every cancel (or repeated not-sent cancel blocks) stops the pair's open
    * incident (which may be a later one than the batch's own): a person cancels it at the venue, then restarts.
    */
+  function haltOnNotSent(batch: Batch, at: number): void {
+    if (batch.state !== 'open') return;
+    if (batch.cancelNotSentSince != null && at - Math.max(batch.cancelNotSentSince, heldSince) >= budgets.adlCancelAfterMs * ADL_CANCEL_LIMIT) {
+      stuck(batch, `减仓批次 ${batch.clientOrderId} 撤单持续未发送超过 ${Math.round(budgets.adlCancelAfterMs * ADL_CANCEL_LIMIT / 1000)} 秒（${(batch.note ?? '').slice(0, 120)}），仍在挂单，需人工在交易所撤单`);
+    }
+  }
   function haltOnStuck(batch: Batch, at: number): void {
     if (batch.state !== 'open') return;
     if (batch.cancels >= ADL_CANCEL_LIMIT && at - (batch.cancelRequestedAt ?? at) >= budgets.adlCancelAfterMs) {
       stuck(batch, `减仓批次 ${batch.clientOrderId} 撤单 ${batch.cancels} 次后仍在挂单，需人工在交易所撤单`);
       return;
     }
-    if (batch.cancelNotSentSince != null && at - batch.cancelNotSentSince >= budgets.adlCancelAfterMs * ADL_CANCEL_LIMIT) {
-      stuck(batch, `减仓批次 ${batch.clientOrderId} 撤单持续未发送超过 ${Math.round(budgets.adlCancelAfterMs * ADL_CANCEL_LIMIT / 1000)} 秒（${(batch.note ?? '').slice(0, 120)}），仍在挂单，需人工在交易所撤单`);
-    }
+    haltOnNotSent(batch, at);
   }
   function stuck(batch: Batch, reason: string): void {
     write(() => {
@@ -598,6 +605,7 @@ export function createAdl({ db, now, budgets, connector, write, assertWriter, ca
    */
   async function reconcileBatch(batch: Batch): Promise<boolean> {
     const at = now();
+    let cancelTried = false;
     if (batch.state === 'unknown-verified') {
       // Late receipts revoke the verification; looked for at the slow pace only.
       if (at < batch.activeQueryAfter) return true;
@@ -605,13 +613,16 @@ export function createAdl({ db, now, budgets, connector, write, assertWriter, ca
       const anchor = Math.max(batch.sentAt ?? batch.preparedAt, batch.lastPossibleSendAt ?? 0, batch.cancelRequestedAt ?? 0);
       if (at < batch.queryAfter) return false;
       if (cancelDue(batch, at)) {
+        cancelTried = true;
         const done = await cancelBatch(batch);
-        haltOnStuck(batch, now());
-        if (done) return SETTLED_BATCH.has(batch.state);
+        if (done) {
+          haltOnStuck(batch, now());
+          return SETTLED_BATCH.has(batch.state);
+        }
       }
       const count = batch.cancelRequestedAt !== null ? batch.postCancelQueries : batch.queries;
       if (count >= budgets.adlQueryLimit && !batch.report) {
-        if (at < anchor || at - anchor < budgets.adlObservationMs) return false;
+        if (at < anchor || at - anchor < budgets.adlObservationMs) { haltOnNotSent(batch, now()); return false; }
         write(() => {
           const current = readBatch(batch.id);
           Object.assign(current, { state: 'unknown-verified', verifiedAt: now(), activeQueryAfter: now() + budgets.adlActiveQueryMs,
@@ -622,7 +633,7 @@ export function createAdl({ db, now, budgets, connector, write, assertWriter, ca
         });
         return true;
       }
-      if (count >= budgets.adlQueryLimit && at < batch.activeQueryAfter) return false;
+      if (count >= budgets.adlQueryLimit && at < batch.activeQueryAfter) { haltOnNotSent(batch, now()); return false; }
     }
     write(() => {
       const current = readBatch(batch.id), key = current.cancelRequestedAt !== null ? 'postCancelQueries' : 'queries';
@@ -648,7 +659,7 @@ export function createAdl({ db, now, budgets, connector, write, assertWriter, ca
       saveBatch(current);
       Object.assign(batch, current);
     });
-    if (cancelDue(batch, now())) await cancelBatch(batch);
+    if (!cancelTried && cancelDue(batch, now())) await cancelBatch(batch);
     haltOnStuck(batch, now());
     return SETTLED_BATCH.has(batch.state) || batch.state === 'unknown-verified';
   }
@@ -919,6 +930,7 @@ export function createAdl({ db, now, budgets, connector, write, assertWriter, ca
       saveIncident(incident);
     }
     inFlight.clear();
+    heldSince = now();
   }
 
   async function tick(): Promise<void> {

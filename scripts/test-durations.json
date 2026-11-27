@@ -43,7 +43,6 @@
   "test/control-continuity.test.ts": 4346,
   "test/control-transport.test.ts": 553,
   "test/control-update.test.ts": 499,
-  "test/control.test.ts": 9472,
   "test/crossex-display-depth.test.ts": 171,
   "test/crossex-service.test.ts": 4498,
   "test/crossex/clients-depth.test.mjs": 220,

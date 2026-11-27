@@ -1465,24 +1465,26 @@ test('期权 #8：close() 等待在途 tail 队列完成，且关闭期间阻塞
 test('期权 #12：存在±25秒时钟偏移时，退役与收益核算按容限归因且不误吞前一组平仓记录', async () => {
   const s = setup();
   try {
-    // Group A closes first.
+    // Group A closes first with exchange closeTime skewed +25s ahead of local clock.
     const first = await open(s);
     await finished(s, first.started.taskId);
     const closedA = s.now();
     for (const position of [...s.fake.positions.values()]) {
-      s.fake.closed.push({ symbol: position.symbol, side: position.side, qty: String(position.size), openTime: String(s.engine.state().tasks[first.started.taskId]!.acceptedAt + 1), closeTime: String(closedA - 1), avgEntryPrice: '100', totalPnl: '1', totalOpenFee: '0.1', totalCloseFee: '0', deliveryFee: '0' });
+      s.fake.closed.push({ symbol: position.symbol, side: position.side, qty: String(position.size), openTime: String(s.engine.state().tasks[first.started.taskId]!.acceptedAt + 1), closeTime: String(closedA + 25_000), avgEntryPrice: '100', totalPnl: '1', totalOpenFee: '0.1', totalCloseFee: '0', deliveryFee: '0' });
     }
     s.fake.positions.clear();
     await s.engine.reconcileOnce();
     assert.equal(s.engine.state().tasks[first.started.taskId]!.strategyStatus, 'closed');
 
-    // Group B opens shortly after, with ±25s skewed exchange timestamps on its closed-position rows (at expiry).
+    // Group B opens 2s later; its closed rows carry -25s lagged openTime (< first.closedAt!) and +25s closeTime.
     s.hooks.skewMs += 2_000;
     const second = await open(s);
     await finished(s, second.started.taskId);
+    const closedAtA = s.engine.state().tasks[first.started.taskId]!.closedAt!;
     s.hooks.skewMs += EXPIRY - s.now() + 5_000;
     const acceptedB = s.engine.state().tasks[second.started.taskId]!.acceptedAt;
-    const skewedOpen = Math.max(s.engine.state().tasks[first.started.taskId]!.closedAt! + 1, acceptedB - 25_000);
+    const skewedOpen = acceptedB - 25_000;
+    assert.ok(skewedOpen < closedAtA, '测试须真实覆盖交易所时间落后于前组本机平仓时刻的场景');
     const skewedClose = s.now() + 25_000;
     for (const position of [...s.fake.positions.values()]) {
       s.fake.closed.push({ symbol: position.symbol, side: position.side, qty: String(position.size), openTime: String(skewedOpen), closeTime: String(skewedClose), avgEntryPrice: '100', totalPnl: position.side === 'Sell' ? '4' : '-1', totalOpenFee: '0.2', totalCloseFee: '0', deliveryFee: '0' });
@@ -1492,7 +1494,10 @@ test('期权 #12：存在±25秒时钟偏移时，退役与收益核算按容限
     assert.equal(s.engine.state().tasks[second.started.taskId]!.strategyStatus, 'closed');
     assert.equal(s.engine.stateView().reconciliation.error, null);
     await s.engine.performanceTick();
-    const rowB = performance(s.engine).groups.find(row => row.id === second.started.taskId)!;
+    const groups = performance(s.engine).groups;
+    const rowA = groups.find(row => row.id === first.started.taskId)!;
+    const rowB = groups.find(row => row.id === second.started.taskId)!;
+    assert.deepEqual([rowA.status, rowA.issues], ['closed', []]);
     assert.deepEqual([rowB.status, rowB.eligible, rowB.issues], ['closed', true, []]);
   } finally { s.dispose(); }
 });

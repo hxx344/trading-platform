@@ -2514,6 +2514,18 @@ test('#11 orderPlan：A 腿精度更粗取整后重算 B 腿数量，防止两�
   const smallPlan = orderPlan(ratioPair, sample(T0, 100.5, 100), 'a_rich', 150, 10, T0 + 1_000);
   assert.deepEqual([smallPlan.legs[0].qty, smallPlan.legs[1].qty], ['0', '0.00']);
   assert.equal(smallPlan.checks.some(check => !check.ok), true);
+
+  const fineA = {
+    ...pair, ratio: 3,
+    a: { venue: 'rh' as const, symbol: 'BTC', market: mk('rh', 'BTC', 2) },
+    b: { venue: 'lighter' as const, symbol: 'BTC', market: mk('lighter', 'BTC', 0) },
+  };
+  const zeroB = orderPlan(fineA, sample(T0, 100.5, 100), 'a_rich', 150, 10, T0 + 1_000);
+  assert.deepEqual([zeroB.legs[0].qty, zeroB.legs[1].qty], ['0.00', '0']);
+  assert.equal(zeroB.ready, false);
+  const alignedPlan = orderPlan(fineA, sample(T0, 100.5, 100), 'a_rich', 550, 10, T0 + 1_000);
+  assert.deepEqual([alignedPlan.legs[0].qty, alignedPlan.legs[1].qty], ['1.34', '4']);
+  assert.equal(alignedPlan.ready, true);
 });
 
 test('#20a LighterStream.depth 按 nonce 缓存排序档位并在 delta/resync 时失效', () => {

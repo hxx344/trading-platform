@@ -293,6 +293,10 @@ def serve(config, state_dir, log, ready=None):
                 if not hasattr(self, 'requestline'):
                     self.requestline = ''
                 try:
+                    self.connection.settimeout(1.0)
+                except OSError:
+                    pass
+                try:
                     self.reply(408)
                 except OSError:
                     pass

@@ -1327,6 +1327,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       if (priorCommand(requestId, payload, session)) return false;
       const current = readOp(op.id);
       if (readJob(jobId).status !== 'attention' || !isOrphanStrategy(current)) reject('operation_changed', '待核对委托已变化，请刷新后重试', 409);
+      if (claimedStrategies().has(strategyId)) reject('strategy_claimed', '该策略编号已被其他委托认领', 409);
       db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(requestId, 'adopt-strategy', payload, session, jobId, now());
       applyStrategy(current, report);
       current.adoptedAt = now(); current.note = '人工认领的追价策略';

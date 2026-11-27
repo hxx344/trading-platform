@@ -75,9 +75,9 @@ curl -fsSLO https://github.com/hxx344/trading-platform/releases/latest/download/
 sudo bash install-watch.sh --heartbeat-listen 0.0.0.0:8792 --webhook <飞书机器人地址> --name 统一交易平台
 ```
 
-- 配置有变化时，脚本结束会打印要在主服务器上执行的那条命令（带地址和令牌）。没打印时（例如只是升级），令牌用 `sudo grep HEARTBEAT_TOKEN /etc/main-watch/config` 查看。
+- 配置有变化时，脚本结束会打印要在主服务器上执行的接入命令（经 `awk` + `--watch-token-stdin` 读取 `/etc/main-watch/config`，不在终端回显令牌）。没打印时（例如只是升级），令牌可在 `/etc/main-watch/config` 的 `HEARTBEAT_TOKEN` 行查看。
 - 已经部署过（包括工作台版本）时不带参数执行即升级，配置保留；内容没变且服务正常时直接结束。
-- 其他选项：`--heartbeat-token`（不给则自动生成）、`--main 主机:端口`（副服务器能直连主服务器页面时另外探测 `/api/ready`，传空串清除）、`--checks`、`--secret`、`--threshold`、`--remind`、`--test`、`--version vX.Y.Z`（v0.47.0 起的版本）、`--uninstall`（保留 `/etc/main-watch`）。
+- 其他选项：`--heartbeat-token`（不给则自动生成）、`--main 主机:端口`（副服务器能直连主服务器页面时另外探测 `/api/ready`，传空串清除）、`--checks`、`--webhook-stdin`、`--secret`、`--secret-stdin`、`--threshold`、`--remind`、`--test`、`--version vX.Y.Z`（v0.47.0 起的版本）、`--uninstall`（保留 `/etc/main-watch`）。
 - 安全组：放行 TCP 8792，来源只填主服务器的公网 IP。
 - 排查：`sudo main-watch probe` 逐项探测并打印结果；`journalctl -u main-watch-heartbeat -u main-watch`。
 - 文件：程序 `/opt/main-watch`，配置 `/etc/main-watch/config`（root 所有，含令牌与机器人地址），状态由 systemd 放在 `/var/lib/main-watch`。服务以专用账户运行，带 systemd 沙箱选项。
@@ -85,7 +85,7 @@ sudo bash install-watch.sh --heartbeat-listen 0.0.0.0:8792 --webhook <飞书机�
 ### 主服务器（本服务）
 
 ```bash
-sudo bash install.sh --watch-url http://<副服务器 IP>:8792/heartbeat --watch-token <令牌>
+sudo awk -F= '$1=="HEARTBEAT_TOKEN"{print $2}' /etc/main-watch/config | sudo bash install.sh --watch-url http://<副服务器 IP>:8792/heartbeat --watch-token-stdin
 ```
 
 - 写入两个文件，校验后重启服务；校验或启动失败时两个文件恢复原样。
@@ -94,7 +94,7 @@ sudo bash install.sh --watch-url http://<副服务器 IP>:8792/heartbeat --watch
 - `sudo bash install.sh --watch-import`：地址与令牌取自本机工作台推送端的配置 `/etc/main-watch/sender`。
 - 本机装着工作台的推送端（`main-watch-sender.timer`）且它推往同一个地址时，脚本会停用那个定时器（文件保留）。否则两个推送端轮流上报，接收端以最新一条为准，结果会来回跳。停用后副服务器只知道本服务是否就绪，**工作台是否正常不再上报**；还要盯工作台的话，在副服务器能直连它时用 `install-watch.sh --checks http://<主服务器地址>:3100/api/ready` 加一个检查目标。
 - `sudo bash install.sh --watch-off`：去掉两段并重启。
-- 自动化可用 `--watch-token-stdin < /path/to/heartbeat-token`，从标准输入读取一行令牌，使令牌留在命令行参数和 shell 历史之外。
+- `--watch-token-stdin < /path/to/heartbeat-token` 从标准输入读取一行令牌，使令牌留在命令行参数和 shell 历史之外（手动传 `--watch-token <令牌>` 仍兼容）。
 - 核对：页面「运行状态」→「副服务器巡检心跳」显示最近送达时刻；副服务器上 `sudo main-watch probe` 显示正常。
 - 状态页显示 `HTTP 403` 时，核对两端令牌是否一致、两台服务器时间是否准确。主服务器的时间被往回调过并重启了服务时，在时间追上副服务器上一次收下的那条之前也会是 403。
 - 显示超时或连接被拒时，核对副服务器安全组与 `main-watch-heartbeat` 服务。本服务配了代理（`/etc/trading-platform/environment` 里的 `NODE_USE_ENV_PROXY=1`）时心跳也走代理，副服务器看到的来源是代理的 IP；要直连就在同一个文件里加 `NO_PROXY=<副服务器 IP>`。

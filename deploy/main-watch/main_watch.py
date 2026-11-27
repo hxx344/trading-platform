@@ -7,7 +7,7 @@
 
 来源：project-aggregation 的 tools/main-watch/main_watch.py（提交 7745181），说明见 docs/watch.md。
 """
-import argparse, base64, hashlib, hmac, http.server, ipaddress, json, os, re, socket, sys, threading, time, urllib.error, urllib.request
+import argparse, base64, hashlib, hmac, http.server, io, ipaddress, json, os, re, socket, sys, threading, time, urllib.error, urllib.request
 from urllib.parse import urlsplit
 
 KEYS = ('FEISHU_WEBHOOK', 'FEISHU_SECRET', 'NAME', 'MAIN', 'CHECKS', 'HEARTBEAT_LISTEN', 'HEARTBEAT_TOKEN', 'FAIL_THRESHOLD', 'REMIND_MINUTES', 'TIMEOUT')
@@ -251,9 +251,51 @@ def serve(config, state_dir, log, ready=None):
     lock = threading.Lock()
     rejected = {'logged': 0.0, 'skipped': 0}
 
+    class _RequestTimeout(Exception):
+        pass
+
+    class _DeadlineRawIO(io.RawIOBase):
+        def __init__(self, sock, deadline):
+            self._sock = sock
+            self._deadline = deadline
+
+        def readable(self):
+            return True
+
+        def readinto(self, buffer):
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                raise _RequestTimeout('request deadline exceeded')
+            self._sock.settimeout(remaining)
+            try:
+                return self._sock.recv_into(buffer)
+            except (TimeoutError, socket.timeout) as exc:
+                raise _RequestTimeout('request timed out') from exc
+
     class Handler(http.server.BaseHTTPRequestHandler):
         timeout = 10
         server_version, sys_version = 'main-watch', ''
+
+        def setup(self):
+            self._deadline = time.monotonic() + self.timeout
+            super().setup()
+            raw_rfile = self.rfile
+            self.rfile = io.BufferedReader(_DeadlineRawIO(self.connection, self._deadline), self.rbufsize if self.rbufsize > 0 else 8192)
+            raw_rfile.close()
+
+        def handle_one_request(self):
+            try:
+                super().handle_one_request()
+            except (_RequestTimeout, TimeoutError, socket.timeout):
+                self.close_connection = True
+                if not hasattr(self, 'request_version'):
+                    self.request_version = 'HTTP/1.1'
+                if not hasattr(self, 'requestline'):
+                    self.requestline = ''
+                try:
+                    self.reply(408)
+                except OSError:
+                    pass
 
         def log_message(self, *args):
             pass
@@ -275,7 +317,15 @@ def serve(config, state_dir, log, ready=None):
                 return self.reply(411)
             if not 0 < length <= HEARTBEAT_MAX_BODY:
                 return self.reply(413)
-            body = self.rfile.read(length)
+            chunks = []
+            remaining = length
+            while remaining > 0:
+                part = self.rfile.read(min(4096, remaining))
+                if not part:
+                    return self.reply(400)
+                chunks.append(part)
+                remaining -= len(part)
+            body = b''.join(chunks)
             with lock:
                 beat, error = accept_heartbeat(config['token'], body, self.headers.get(SIGNATURE_HEADER), time.time(), last[0])
                 if error:
@@ -296,6 +346,8 @@ def serve(config, state_dir, log, ready=None):
     host, port = parts.hostname, parts.port
 
     class Server(http.server.ThreadingHTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
         address_family = socket.AF_INET6 if ':' in host else socket.AF_INET
         slots = threading.BoundedSemaphore(HEARTBEAT_CONNECTIONS)
 

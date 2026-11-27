@@ -278,6 +278,48 @@ test('Gate 按币合并读取和取消；轮询和 429 有界且过期后可恢�
   w.at += 1000; await read('E');
 });
 
+test('Gate 请求在被取消或超时后才返回 429 或 403，仍记录限流冷却与吊销已存证明且无未捕获拒绝', async t => {
+  let unhandled = 0;
+  const onUnhandled = () => { unhandled++; };
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.off('unhandledRejection', onUnhandled));
+
+  const { w, store, read } = await setup(t);
+  const old = await read();
+
+  // Case 1: 429 arrives right after caller aborts -> 60s throttle cooldown still takes effect.
+  const entered429 = wait(), release429 = wait(), ctrl429 = new AbortController();
+  w.handler = async path => {
+    if (path === FEE) { entered429.resolve(); await release429.promise; }
+    return new Response(privateText, { status: 429 });
+  };
+  const aborted429 = assert.rejects(read('T429', 'arbitrum', ctrl429.signal), sanitized);
+  await entered429.promise;
+  ctrl429.abort();
+  release429.resolve();
+  await aborted429;
+  await new Promise(resolve => setTimeout(resolve, 10));
+  const callsAfter429 = w.calls.length;
+  await assert.rejects(read('OTHER'), sanitized);
+  assert.equal(w.calls.length, callsAfter429, '取消并发返回 429 仍进入 60s 冷却');
+
+  // Case 2: 403 arrives right after caller aborts -> stored permission proof is revoked.
+  w.at += 60_000;
+  const entered403 = wait(), release403 = wait(), ctrl403 = new AbortController();
+  w.handler = async path => {
+    if (path === FEE) { entered403.resolve(); await release403.promise; }
+    return new Response(privateText, { status: 403 });
+  };
+  const aborted403 = assert.rejects(read('F403', 'arbitrum', ctrl403.signal), sanitized);
+  await entered403.promise;
+  ctrl403.abort();
+  release403.resolve();
+  await aborted403;
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(store.gateDepositCurrent(old), false, '并发取消后收到的 403 仍吊销证明');
+  assert.equal(unhandled, 0);
+});
+
 test('Gate 轮换、断开、导入和凭据文件替换使缓存失效；撤掉在途连接后停止签名并拒绝旧回包', async t => {
   const { store, w, file, key, read } = await setup(t);
   const old = await read();

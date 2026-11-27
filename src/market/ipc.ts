@@ -77,6 +77,34 @@ export async function marketHealth(socketPath: string): Promise<unknown> {
   return payload(await open(socketPath, MARKET_PATH + 'status', null, AbortSignal.timeout(2500)));
 }
 
+function raceAbort(signals: readonly (AbortSignal | undefined)[], timeoutMs?: number): { signal: AbortSignal; dispose(): void } {
+  const controller = new AbortController();
+  const cleanups: (() => void)[] = [];
+  const abort = (reason?: unknown) => {
+    if (!controller.signal.aborted) controller.abort(reason);
+  };
+  for (const sig of signals) {
+    if (!sig) continue;
+    if (sig.aborted) {
+      while (cleanups.length) cleanups.pop()!();
+      abort(sig.reason);
+      return { signal: controller.signal, dispose: () => {} };
+    }
+    const onAbort = () => abort(sig.reason);
+    sig.addEventListener('abort', onAbort, { once: true });
+    cleanups.push(() => sig.removeEventListener('abort', onAbort));
+  }
+  if (timeoutMs !== undefined) {
+    const timer = setTimeout(() => abort(new DOMException('The operation timed out', 'TimeoutError')), timeoutMs);
+    timer.unref?.();
+    cleanups.push(() => clearTimeout(timer));
+  }
+  return {
+    signal: controller.signal,
+    dispose() { while (cleanups.length) cleanups.pop()!(); },
+  };
+}
+
 export function createMarketClient(socketPath: string): MarketClient & { close(): void } {
   const stopped = new AbortController();
   const changes = new EventEmitter();
@@ -118,16 +146,23 @@ export function createMarketClient(socketPath: string): MarketClient & { close()
     epoch: () => active?.key ?? null,
     async call<T>(op: string, input: unknown, signal?: AbortSignal): Promise<T> {
       const body = encode(op, input);
-      const deadline = anySignal([stopped.signal, signal], RPC_TIMEOUT_MS);
+      const deadlineCtrl = raceAbort([stopped.signal, signal], RPC_TIMEOUT_MS);
+      const deadline = deadlineCtrl.signal;
       try {
-        const lease = await connection(anySignal([deadline], 1500));
-        const res = await open(socketPath, MARKET_PATH + 'call/' + op, body, anySignal([deadline, lease.life.signal]));
-        // Historical backfill can legitimately take longer than a stream heartbeat to produce the first byte.
-        res.setTimeout(0);
-        if (instanceOf(res) !== lease.instance) { res.destroy(); throw new MarketError('行情服务已切换'); }
-        const result = await payload(res);
-        if (lease !== active || deadline.aborted) throw new MarketError('行情服务应答已过期');
-        return result as T;
+        try {
+          const waitLease = raceAbort([deadline], 1500);
+          const lease = await connection(waitLease.signal).finally(() => waitLease.dispose());
+          const callAbort = raceAbort([deadline, lease.life.signal]);
+          try {
+            const res = await open(socketPath, MARKET_PATH + 'call/' + op, body, callAbort.signal);
+            // Historical backfill can legitimately take longer than a stream heartbeat to produce the first byte.
+            res.setTimeout(0);
+            if (instanceOf(res) !== lease.instance) { res.destroy(); throw new MarketError('行情服务已切换'); }
+            const result = await payload(res);
+            if (lease !== active || deadline.aborted) throw new MarketError('行情服务应答已过期');
+            return result as T;
+          } finally { callAbort.dispose(); }
+        } finally { deadlineCtrl.dispose(); }
       } catch (error) {
         if (deadline.aborted && deadline.reason?.name === 'TimeoutError') throw new DOMException('公开行情请求超时', 'TimeoutError');
         if (signal?.aborted) throw new DOMException('公开行情请求已中止', 'AbortError');

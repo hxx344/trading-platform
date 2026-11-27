@@ -329,6 +329,49 @@ class HeartbeatEndToEndTests(unittest.TestCase):
         self.assertEqual(len(self.logs), 2, '启动日志与每分钟最多一条拒绝日志')
         self.assertIn('签名不符', self.logs[1])
 
+    def test_slowloris_headers_and_slow_body_timeout(self):
+        import select
+        import socket
+        self.receiver.RequestHandlerClass.timeout = 0.25
+        self.addCleanup(setattr, self.receiver.RequestHandlerClass, 'timeout', 10)
+        host, port = '127.0.0.1', self.receiver.server_port
+
+        def read_response(sock):
+            sock.settimeout(2.0)
+            chunks = []
+            while True:
+                try:
+                    data = sock.recv(4096)
+                except (TimeoutError, OSError):
+                    break
+                if not data:
+                    break
+                chunks.append(data)
+            return b''.join(chunks)
+
+        silent = socket.create_connection((host, port), timeout=2.0)
+        self.addCleanup(silent.close)
+        self.assertIn(b' 408 ', read_response(silent))
+
+        slow_hdr = socket.create_connection((host, port), timeout=2.0)
+        self.addCleanup(slow_hdr.close)
+        slow_hdr.sendall(b'POST /heartbeat HTTP/1.1\r\nHost: x\r\n')
+        self.assertEqual(self.send(), 0)
+        self.assertIn(b' 408 ', read_response(slow_hdr))
+
+        slow_body = socket.create_connection((host, port), timeout=2.0)
+        self.addCleanup(slow_body.close)
+        slow_body.sendall(b'POST /heartbeat HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\na')
+        for _ in range(6):
+            readable, _, _ = select.select([slow_body], [], [], 0.08)
+            if readable:
+                break
+            try:
+                slow_body.sendall(b'b')
+            except OSError:
+                break
+        self.assertIn(b' 408 ', read_response(slow_body))
+
 
 if __name__ == '__main__':
     unittest.main()

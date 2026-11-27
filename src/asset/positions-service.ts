@@ -246,7 +246,12 @@ export function createPositionsService(options: PositionsServiceOptions = {}) {
           }
           return { c, positions: await read(signal), startedAt, observedAt: new Date(now()).toISOString(), restored: false };
         };
-        const { c, positions, startedAt, observedAt, restored } = await Promise.race([work(), new Promise<never>((_, reject) => {
+        const reading = work().catch(error => {
+          if (error instanceof PositionsPermissionError) generation.deny(error);
+          throw error;
+        });
+        void reading.catch(() => {});
+        const { c, positions, startedAt, observedAt, restored } = await Promise.race([reading, new Promise<never>((_, reject) => {
           timer = setTimeout(() => { abort.abort(); reject(new Error(POSITIONS_FAILED)); }, options.deadline ?? DEADLINE);
         })]);
         if (entries.get(key) !== entry || !current(database, account, entry.revision)) return;

@@ -24,16 +24,18 @@ usage() {
   --checks "目标 ..."  额外检查目标：http(s)://... 或 tcp://主机:端口，空格分隔；传空串清除
                        --main 与 --checks 分开保存，只改其中一项不影响另一项
   --webhook URL        飞书群机器人 Webhook
+  --webhook-stdin      从标准输入读取一行飞书群机器人 Webhook（避免进入命令行参数）
   --secret SECRET      机器人开启“签名校验”时的密钥
+  --secret-stdin       从标准输入读取一行签名密钥（避免进入命令行参数）
   --name NAME          告警里显示的服务器名称，默认“主服务器”
   --threshold N        连续失败几次才告警（每分钟一次），默认 3
   --remind MINUTES     故障持续时每隔多少分钟再提醒，默认 30
   --test               部署后发送测试消息（配置变化时总会发送）
   --version vX.Y.Z     安装指定版本的巡检程序（也用于回退）；默认最新正式版
   --uninstall          停止并移除巡检服务，保留 /etc/main-watch 配置
-首次安装需要 --heartbeat-listen、--main 或 --checks 之一，以及 --webhook；之后不带参数重复执行即为升级。
+首次安装需要 --heartbeat-listen、--main 或 --checks 之一，以及 --webhook（或 --webhook-stdin）；之后不带参数重复执行即为升级。
 开启心跳后，按部署结束时打印的命令在主服务器（统一交易平台）上开启推送：
-  sudo bash install.sh --watch-url http://<本机IP>:<端口>/heartbeat --watch-token <令牌>
+  sudo awk -F= '$1=="HEARTBEAT_TOKEN"{print $2}' /etc/main-watch/config | sudo bash install.sh --watch-url http://<本机IP>:<端口>/heartbeat --watch-token-stdin
 USAGE
 }
 [[ $(uname -s) == Linux && $EUID -eq 0 ]] || die '请在 Linux 上以 root 或 sudo 运行。'
@@ -51,7 +53,7 @@ command_path=/usr/local/bin/main-watch
 units=(main-watch.service main-watch.timer main-watch-heartbeat.service)
 
 args=("$@") source_dir='' source_revision='' version='' send_test=0 uninstall=0
-settings=()
+settings=() webhook_set=0 webhook_stdin=0 secret_set=0 secret_stdin=0
 while (($#)); do
   case $1 in
     --main|--checks|--webhook|--secret|--name|--threshold|--remind|--heartbeat-listen|--heartbeat-token|--version|--source|--revision)
@@ -61,8 +63,8 @@ while (($#)); do
           [[ -z $2 || $2 =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ || $2 =~ ^\[[0-9A-Fa-f:]+\]:[0-9]{1,5}$ ]] || die '--main 格式应为 主机:端口，例如 100.64.0.5:4720；传空串清除'
           settings+=("MAIN=$2") ;;
         --checks) settings+=("CHECKS=$2") ;;
-        --webhook) settings+=("FEISHU_WEBHOOK=$2") ;;
-        --secret) settings+=("FEISHU_SECRET=$2") ;;
+        --webhook) ((webhook_stdin == 0 && webhook_set == 0)) || die '--webhook 与 --webhook-stdin 只能用一个'; webhook_set=1; settings+=("FEISHU_WEBHOOK=$2") ;;
+        --secret) ((secret_stdin == 0 && secret_set == 0)) || die '--secret 与 --secret-stdin 只能用一个'; secret_set=1; settings+=("FEISHU_SECRET=$2") ;;
         --name) settings+=("NAME=$2") ;;
         --threshold) settings+=("FAIL_THRESHOLD=$2") ;;
         --remind) settings+=("REMIND_MINUTES=$2") ;;
@@ -73,6 +75,14 @@ while (($#)); do
         --revision) source_revision=$2 ;;
       esac
       shift 2 ;;
+    --webhook-stdin)
+      ((webhook_set == 0 && webhook_stdin == 0)) || die '--webhook 与 --webhook-stdin 只能用一个'
+      ((secret_stdin == 0)) || die '--webhook-stdin 与 --secret-stdin 不能同时使用'
+      webhook_stdin=1; shift ;;
+    --secret-stdin)
+      ((secret_set == 0 && secret_stdin == 0)) || die '--secret 与 --secret-stdin 只能用一个'
+      ((webhook_stdin == 0)) || die '--webhook-stdin 与 --secret-stdin 不能同时使用'
+      secret_stdin=1; shift ;;
     --test) send_test=1; shift ;;
     --uninstall) uninstall=1; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -223,6 +233,20 @@ if [[ -z $source_dir ]]; then
 fi
 
 # --source 可以是发布文件所在目录，也可以是仓库检出。
+if ((webhook_stdin)); then
+  [[ ! -t 0 ]] || die '--webhook-stdin 需要从标准输入读取一行 Webhook'
+  IFS= read -r stdin_value || [[ -n $stdin_value ]] || die '--webhook-stdin 未读到内容'
+  stdin_value=${stdin_value%$'\r'}
+  settings+=("FEISHU_WEBHOOK=$stdin_value")
+  unset stdin_value
+fi
+if ((secret_stdin)); then
+  [[ ! -t 0 ]] || die '--secret-stdin 需要从标准输入读取一行签名密钥'
+  IFS= read -r stdin_value || [[ -n $stdin_value ]] || die '--secret-stdin 未读到内容'
+  stdin_value=${stdin_value%$'\r'}
+  settings+=("FEISHU_SECRET=$stdin_value")
+  unset stdin_value
+fi
 program="$source_dir/main_watch.py"
 [[ -f $program ]] || program="$source_dir/deploy/main-watch/main_watch.py"
 trusted "$source_dir" "$program" || die "--source 及其上级目录须归 root 所有且不可被他人写入：$source_dir"
@@ -235,7 +259,8 @@ if [[ ! -f $config && ${#settings[@]} -eq 0 ]]; then
   die '首次安装需要 --heartbeat-listen、--main 或 --checks 之一，以及 --webhook。'
 fi
 if ((${#settings[@]})); then
-  python3 -I -B - "$(dirname -- "$program")" "$config" "$scratch/config" "${settings[@]}" <<'PY'
+  printf '%s\0' "${settings[@]}" > "$scratch/settings.in"
+  python3 -I -B - "$(dirname -- "$program")" "$config" "$scratch/config" "$scratch/settings.in" 9>&- <<'PY'
 import os, secrets, sys
 sys.path.insert(0, sys.argv[1])
 import main_watch
@@ -244,12 +269,14 @@ try:
     if os.path.exists(sys.argv[2]):
         with open(sys.argv[2], encoding='utf-8') as handle:
             existing = main_watch.parse_config(handle.read())
-    for item in sys.argv[4:]:
+    with open(sys.argv[4], 'rb') as handle:
+        raw_items = [item.decode('utf-8') for item in handle.read().split(b'\0') if item]
+    for item in raw_items:
         key, _, value = item.partition('=')
         if any(ch in value for ch in '\r\n'):
             raise main_watch.ConfigError(f'{key} 不能包含换行')
         existing[key] = value.strip()
-    # 开启心跳且没有令牌时自动生成，部署结束时打印给主服务器使用。
+    # 开启心跳且没有令牌时自动生成，配置保存在 /etc/main-watch/config。
     if existing.get('HEARTBEAT_LISTEN') and not existing.get('HEARTBEAT_TOKEN'):
         existing['HEARTBEAT_TOKEN'] = secrets.token_urlsafe(32)
     main_watch.validate(existing)
@@ -263,16 +290,16 @@ PY
 else
   cp -p -- "$config" "$scratch/config"
 fi
-"$python_bin" -I "$program" --config "$scratch/config" --check >/dev/null || die '配置无效，未做任何改动。'
-# 开启心跳时取出：监听地址、本机可连地址与端口、令牌。
+"$python_bin" -I "$program" --config "$scratch/config" --check 9>&- >/dev/null || die '配置无效，未做任何改动。'
+# 开启心跳时取出：监听地址、本机可连地址与端口（不取令牌）。
 heartbeat=()
-heartbeat_line=$("$python_bin" -I -B - "$(dirname -- "$program")" "$scratch/config" <<'PY'
+heartbeat_line=$("$python_bin" -I -B - "$(dirname -- "$program")" "$scratch/config" 9>&- <<'PY'
 import sys
 sys.path.insert(0, sys.argv[1])
 import main_watch
 with open(sys.argv[2], encoding='utf-8') as handle:
     config = main_watch.validate(main_watch.parse_config(handle.read()))
-print(' '.join([config['listen'], *map(str, main_watch.local_address(config['listen'])), config['token']]) if config['heartbeat'] else 'off')
+print(' '.join([config['listen'], *map(str, main_watch.local_address(config['listen']))]) if config['heartbeat'] else 'off')
 PY
 ) || die '读取心跳配置失败，未做任何改动。'
 [[ $heartbeat_line == off ]] || read -r -a heartbeat <<< "$heartbeat_line"
@@ -382,7 +409,7 @@ if ((${#heartbeat[@]})); then
 elif systemctl is-active --quiet main-watch-heartbeat.service; then healthy=0; fi
 if ((${#changed[@]} == 0 && healthy)); then
   say "版本 $revision_label：程序、配置与服务均未变化，跳过部署。"
-  if ((send_test)); then runuser -u "$service" -- "$python_bin" -I "$root/main_watch.py" --config "$config" --test; fi
+  if ((send_test)); then runuser -u "$service" -- "$python_bin" -I "$root/main_watch.py" --config "$config" --test 9>&-; fi
   exit 0
 fi
 
@@ -406,11 +433,11 @@ for index in "${changed[@]}"; do if ((index == config_index)); then config_chang
 
 if ((send_test || config_changed)); then
   say '发送飞书测试消息，确认告警通道可用。'
-  runuser -u "$service" -- "$python_bin" -I "$root/main_watch.py" --config "$config" --test || die '飞书测试消息发送失败，请检查 Webhook 与签名密钥。'
+  runuser -u "$service" -- "$python_bin" -I "$root/main_watch.py" --config "$config" --test 9>&- || die '飞书测试消息发送失败，请检查 Webhook 与签名密钥。'
 fi
 receiver_up() {
   # 只认本服务的应答（GET 返回 404 且 Server 为 main-watch），端口被其他程序占用不算启动成功。
-  "$python_bin" -I - "$1" "$2" <<'PY'
+  "$python_bin" -I - "$1" "$2" 9>&- <<'PY'
 import sys, urllib.error, urllib.request
 host = f'[{sys.argv[1]}]' if ':' in sys.argv[1] else sys.argv[1]
 try:
@@ -441,11 +468,11 @@ systemctl restart main-watch.timer || { journalctl -u main-watch.timer -n 20 --n
 systemctl is-active --quiet main-watch.timer || die '定时器未能启动。'
 switched=0
 say "已部署版本 $revision_label，每分钟巡检一次。当前探测结果："
-runuser -u "$service" -- "$python_bin" -I "$root/main_watch.py" --config "$config" --probe || say '注意：有目标当前不可达。若主服务器实际正常，请检查心跳推送是否已开启、安全组是否放通，或 --main / --checks 的地址。'
+runuser -u "$service" -- "$python_bin" -I "$root/main_watch.py" --config "$config" --probe 9>&- || say '注意：有目标当前不可达。若主服务器实际正常，请检查心跳推送是否已开启、安全组是否放通，或 --main / --checks 的地址。'
 if ((${#heartbeat[@]} && config_changed)); then
   host=${heartbeat[0]%:*}
   case $host in 0.0.0.0|'[::]') host='<副服务器公网IP>' ;; esac
   say "心跳接收监听 ${heartbeat[0]}。请在安全组放通主服务器到本机 TCP ${heartbeat[2]}，然后在主服务器（统一交易平台）执行："
-  printf '  sudo bash install.sh --watch-url http://%s:%s/heartbeat --watch-token %s\n' "$host" "${heartbeat[2]}" "${heartbeat[3]}"
+  printf '  sudo awk -F= '\''$1=="HEARTBEAT_TOKEN"{print $2}'\'' %s | sudo bash install.sh --watch-url http://%s:%s/heartbeat --watch-token-stdin\n' "$config" "$host" "${heartbeat[2]}"
 fi
 say '管理命令：sudo main-watch status | logs | probe | test'

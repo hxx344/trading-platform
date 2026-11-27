@@ -10,13 +10,63 @@ import { HEDGE_TOLERANCE_BPS } from '../adl-contracts.ts';
 import { cmp, sub } from '../decimal.ts';
 
 const SEND_TIMEOUT_MS = 10_000;
+const MAX_RESPONSE_BYTES = 64 * 1024;
 const RETRY_BASE_MS = 5_000;
 const RETRY_MAX_MS = 5 * 60_000;
 const RETENTION_MS = 7 * 24 * 3_600_000, PRUNE_EVERY_MS = 3_600_000;
 const EVENTS_PER_POLL = 500;
 /** Messages joined into one robot post; the robot allows a few posts per second at most. */
 const LINES_PER_POST = 10;
+const MAX_POST_BYTES = 16 * 1024;
 const MAX_TEXT = 1_500;
+
+class ResponseLimitError extends Error {}
+
+function truncateUtf8(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  let end = maxBytes;
+  const buf = Buffer.from(text, 'utf8');
+  while (end > 0 && (buf[end]! & 0xc0) === 0x80) end--;
+  return buf.subarray(0, end).toString('utf8');
+}
+
+async function readBoundedJson<T>(response: Response, maxBytes: number): Promise<T> {
+  const contentLength = Number(response.headers?.get?.('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    await response.body?.cancel?.().catch(() => {});
+    throw new ResponseLimitError(`飞书响应超过 ${maxBytes} 字节上限`);
+  }
+  if (response.body?.getReader) {
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value?.byteLength) continue;
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => {});
+          throw new ResponseLimitError(`飞书响应超过 ${maxBytes} 字节上限`);
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) { merged.set(chunk, offset); offset += chunk.byteLength; }
+    return JSON.parse(new TextDecoder().decode(merged)) as T;
+  }
+  if (typeof response.text === 'function') {
+    const text = await response.text();
+    if (Buffer.byteLength(text, 'utf8') > maxBytes) throw new ResponseLimitError(`飞书响应超过 ${maxBytes} 字节上限`);
+    return JSON.parse(text) as T;
+  }
+  return await response.json() as T;
+}
 // v0.101.1 sends solely by next_at. Keep protected rows beyond any live quote even if the service is rolled back.
 const GUARDED_LEGACY_DUE = 8_640_000_000_000_000;
 /** The market alerts' own outbox (M-3b), used while secrets.json has `feishuMonitor`. */
@@ -361,7 +411,12 @@ export async function sendFeishu(feishu: FeishuSecret, message: Record<string, u
     throw new Error(redactDiagnostic(error instanceof Error ? error.message : String(error)));
   }
   let answer: { code?: unknown; StatusCode?: unknown; msg?: unknown } = {};
-  try { answer = await response.json() as typeof answer; } catch { /* judged by status below */ }
+  try {
+    answer = await readBoundedJson<typeof answer>(response, MAX_RESPONSE_BYTES);
+  } catch (error) {
+    if (error instanceof ResponseLimitError) throw error;
+    /* judged by status below */
+  }
   const code = answer?.code ?? answer?.StatusCode;
   if (opportunityReceipt) {
     if (!response.ok) throw Object.assign(new Error(`飞书返回 HTTP ${response.status}`), { uncertain: response.status >= 500 });
@@ -565,36 +620,59 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
       const due = db.prepare('SELECT id, text, attempts, repeat_key AS key, created_at AS created FROM outbox WHERE sent_at IS NULL AND COALESCE(guarded_due_at, next_at) <= ? ORDER BY id LIMIT ?').all(at, LINES_PER_POST) as { id: number; text: string; attempts: number; key: string | null; created: number }[];
       if (!due.length) return;
       // Old versions can still have produced rows after a downgrade. Keyless chain-arb alerts and legacy keys never post.
-      const deadlines = due.map(row => {
-        if (row.key === null && !row.text.startsWith('【链上折价套利】')) return Infinity;
-        try {
-          const expires = row.key?.startsWith('chain-arb-deposit:') && chainArbNotificationExpiry?.(row.key, row.text);
-          return typeof expires === 'number' && Number.isSafeInteger(expires) ? expires : 0;
-        } catch { return 0; }
-      });
-      // A later account check in this batch may have used the last milliseconds of an earlier quote.
-      const sendingAt = now(), ready = due.filter((_, index) => deadlines[index]! > sendingAt);
-      try {
-        if (ready.length) {
-          await post(ready.map(row => redactDiagnostic(row.text)).join('\n'));
-          tx(() => { for (const row of ready) db.prepare('UPDATE outbox SET sent_at = ?, last_error = NULL WHERE id = ?').run(now(), row.id); });
+      const candidates = due.map(row => {
+        let deadline = 0;
+        if (row.key === null && !row.text.startsWith('【链上折价套利】')) deadline = Infinity;
+        else {
+          try {
+            const expires = row.key?.startsWith('chain-arb-deposit:') && chainArbNotificationExpiry?.(row.key, row.text);
+            deadline = typeof expires === 'number' && Number.isSafeInteger(expires) ? expires : 0;
+          } catch { deadline = 0; }
         }
-      } catch (error) {
-        const reason = error instanceof Error ? redactDiagnostic(error.message).slice(0, 200) : '未知错误';
-        log(`飞书发送失败：${reason}`);
-        tx(() => {
-          for (const row of ready) {
-            const dueColumn = row.key === null ? 'next_at' : 'guarded_due_at';
-            db.prepare(`UPDATE outbox SET attempts = attempts + 1, ${dueColumn} = ?, last_error = ? WHERE id = ?`)
-              .run(now() + Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** row.attempts), reason, row.id);
-          }
-        });
+        return { row, deadline };
+      });
+      // A later account check or earlier batch post may have used the last milliseconds of an earlier quote.
+      for (let offset = 0; offset < candidates.length;) {
+        const batchNow = now();
+        while (offset < candidates.length && candidates[offset]!.deadline <= batchNow) offset++;
+        if (offset >= candidates.length) break;
+        const batch: typeof due = [];
+        const lines: string[] = [];
+        let usedBytes = 0;
+        while (offset < candidates.length) {
+          const item = candidates[offset]!;
+          if (item.deadline <= batchNow) { offset++; continue; }
+          const rawLine = redactDiagnostic(item.row.text);
+          const line = batch.length === 0 ? truncateUtf8(rawLine, MAX_POST_BYTES) : rawLine;
+          const cost = (batch.length > 0 ? 1 : 0) + Buffer.byteLength(line, 'utf8');
+          if (batch.length > 0 && usedBytes + cost > MAX_POST_BYTES) break;
+          batch.push(item.row);
+          lines.push(line);
+          usedBytes += cost;
+          offset++;
+        }
+        try {
+          await post(lines.join('\n'));
+          tx(() => { for (const row of batch) db.prepare('UPDATE outbox SET sent_at = ?, last_error = NULL WHERE id = ?').run(now(), row.id); });
+        } catch (error) {
+          const reason = error instanceof Error ? redactDiagnostic(error.message).slice(0, 200) : '未知错误';
+          log(`飞书发送失败：${reason}`);
+          tx(() => {
+            for (const row of batch) {
+              const dueColumn = row.key === null ? 'next_at' : 'guarded_due_at';
+              db.prepare(`UPDATE outbox SET attempts = attempts + 1, ${dueColumn} = ?, last_error = ? WHERE id = ?`)
+                .run(now() + Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** row.attempts), reason, row.id);
+            }
+          });
+          break;
+        }
       }
-      if (ready.length !== due.length) {
-        tx(() => { for (const [index, row] of due.entries()) {
-          if (deadlines[index]! > sendingAt) continue;
-          db.prepare('DELETE FROM outbox WHERE id = ? AND sent_at IS NULL').run(row.id);
-          if (row.key) db.prepare('DELETE FROM repeats WHERE key = ? AND at = ?').run(row.key, row.created);
+      const finalNow = now();
+      if (candidates.some(item => item.deadline <= finalNow)) {
+        tx(() => { for (const { row, deadline } of candidates) {
+          if (deadline > finalNow) continue;
+          const removed = db.prepare('DELETE FROM outbox WHERE id = ? AND sent_at IS NULL').run(row.id);
+          if (removed.changes > 0 && row.key) db.prepare('DELETE FROM repeats WHERE key = ? AND at = ?').run(row.key, row.created);
         } });
       }
     } finally { sending = false; }

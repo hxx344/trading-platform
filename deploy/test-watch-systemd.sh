@@ -129,7 +129,8 @@ hb_port=$(free_port)
 bash "${installer[@]}" --heartbeat-listen "127.0.0.1:$hb_port" | tee "$fixture/heartbeat.log"
 token=$(sed -n 's/^HEARTBEAT_TOKEN=//p' /etc/main-watch/config)
 [[ ${#token} -ge 32 ]]
-grep -qF -- "install.sh --watch-url http://127.0.0.1:$hb_port/heartbeat --watch-token $token" "$fixture/heartbeat.log"
+grep -qF -- "install.sh --watch-url http://127.0.0.1:$hb_port/heartbeat --watch-token-stdin" "$fixture/heartbeat.log"
+if grep -qF -- "$token" "$fixture/heartbeat.log"; then echo 'Heartbeat token leaked to stdout' >&2; exit 1; fi
 systemctl is-enabled --quiet main-watch-heartbeat.service
 systemctl is-active --quiet main-watch-heartbeat.service
 grep -q "失败 heartbeat://127.0.0.1:$hb_port：尚未收到主服务器心跳" "$fixture/heartbeat.log"

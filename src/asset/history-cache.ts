@@ -25,7 +25,7 @@ function newAccess(revision: string, permission: Permission, deniedAt = 0): Acce
   return { revision, data: new AbortController(), authorization: new AbortController(), permission, deniedAt, checks: 0 };
 }
 const generations = new WeakMap<Pick<Database, 'prepare'>, Map<string, Access>>();
-const binanceDenials = new WeakMap<Database, WeakSet<PositionsPermissionError>>();
+const permissionDenials = new WeakMap<Database, WeakSet<PositionsPermissionError>>();
 export function historyPermission(database: Pick<Database, 'prepare'> | null, account: string, revision: string): Permission {
   const entry = database && generations.get(database)?.get(account);
   return entry?.revision === revision ? entry.permission : 'unknown';
@@ -54,11 +54,11 @@ export function historyGeneration(database: DatabaseSource, account: string, rev
   const permissionCurrent = () => !!file && !access.authorization.signal.aborted && database() === file;
   const current = () => !signal.aborted && permissionCurrent();
   const deny = (error?: PositionsPermissionError) => {
-    if (file && error && account === 'binance') {
+    if (file && error) {
       // The same refusal may reach multiple waiters after a renewal. Apply it once, only to the same file and revision.
       if (database() !== file || accounts.get(account)?.revision !== revision) return;
-      let processed = binanceDenials.get(file);
-      if (!processed) binanceDenials.set(file, processed = new WeakSet());
+      let processed = permissionDenials.get(file);
+      if (!processed) permissionDenials.set(file, processed = new WeakSet());
       if (processed.has(error)) return;
       processed.add(error);
     } else if (!permissionCurrent()) return;

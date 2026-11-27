@@ -286,9 +286,10 @@ export function createFillsService(options: FillsServiceOptions = {}) {
           return { raw, replayed, snapshotAt, positions, lookback };
         };
         const reading = work().catch(error => {
-          if (account.exchange === 'binance' && error instanceof PositionsPermissionError) generation.deny(error);
+          if (error instanceof PositionsPermissionError) generation.deny(error);
           throw error;
         });
+        void reading.catch(() => {});
         const result = await Promise.race([reading, new Promise<never>((_, reject) => {
           onAbort = () => reject(new Error(FILLS_FAILED));
           abort.signal.addEventListener('abort', onAbort, { once: true });

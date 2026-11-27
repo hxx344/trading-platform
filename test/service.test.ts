@@ -438,6 +438,84 @@ test('飞书告警：未配置机器人时只写日志；事件说明覆盖结�
   assert.match(describeEvent(row('adl-push-dropped', { invalid: 0, overflow: 5 }), () => null)!.text, /积压，丢弃 5 条；改由历史扫描补齐/);
 });
 
+test('飞书告警：超 16 KB 自动分批发送且只更新实际发出的批次，响应超 64 KB 时拒绝接收', async () => {
+  const dir = tempDir();
+  try {
+    let clock = 1_800_000_000_000;
+    const posts: string[] = [];
+    let failOnPost = 0;
+    let oversizedMode: 'none' | 'text' | 'stream' = 'none';
+    const notifier = createNotifier({
+      file: join(dir, 'notify-batch.sqlite'), events: () => [], latestSeq: () => 0, pairs: () => [], incidentPair: () => null,
+      now: () => clock, log: () => {}, feishu: { webhook: 'https://open.feishu.cn/open-apis/bot/v2/hook/abcdefgh', secret: null },
+      fetchImpl: async (_url, init) => {
+        const text = (JSON.parse(String(init.body)) as { content: { text: string } }).content.text;
+        posts.push(text);
+        if (oversizedMode === 'text') return new Response('x'.repeat(70 * 1024), { status: 200 });
+        if (oversizedMode === 'stream') {
+          const stream = new ReadableStream({
+            start(controller) {
+              for (let i = 0; i < 8; i++) controller.enqueue(new Uint8Array(10 * 1024).fill(120));
+              controller.close();
+            },
+          });
+          return new Response(stream, { status: 200 });
+        }
+        if (failOnPost > 0 && posts.length === failOnPost) return json({ code: 19021, msg: 'fail' });
+        return json({ code: 0, msg: 'success' });
+      },
+    });
+    try {
+      for (let i = 0; i < 5; i++) notifier.notify(`【分批${i}】${'警'.repeat(1400)}`);
+      await notifier.flush();
+      assert.ok(posts.length >= 2, `期望拆成多批，实际 ${posts.length}`);
+      for (const sentText of posts) {
+        assert.ok(Buffer.byteLength(sentText, 'utf8') <= 16 * 1024);
+        assert.equal(sentText.includes('\uFFFD'), false);
+      }
+      assert.equal(notifier.pending(), 0);
+
+      // Failure on batch 1 only increments attempts on batch 1 rows, leaving later rows untouched.
+      posts.length = 0;
+      failOnPost = 1;
+      for (let i = 0; i < 5; i++) notifier.notify(`【首批失败${i}】${'警'.repeat(1400)}`);
+      await notifier.flush();
+      assert.equal(posts.length, 1);
+      const db = new DatabaseSync(join(dir, 'notify-batch.sqlite'));
+      try {
+        const rows = db.prepare('SELECT attempts, sent_at FROM outbox WHERE sent_at IS NULL ORDER BY id').all() as { attempts: number; sent_at: number | null }[];
+        assert.equal(rows.length, 5);
+        assert.ok(rows.slice(0, 3).every(row => row.attempts === 1));
+        assert.ok(rows.slice(3).every(row => row.attempts === 0));
+      } finally { db.close(); }
+
+      // Oversized >64 KB response on HTTP 200 fails delivery instead of counting as sent.
+      clock += 600_000;
+      await notifier.flush(); // drain previous retry backlog with failOnPost reset below
+      failOnPost = 0;
+      clock += 600_000;
+      await notifier.flush();
+      assert.equal(notifier.pending(), 0);
+
+      for (const mode of ['text', 'stream'] as const) {
+        oversizedMode = mode;
+        clock += 600_000;
+        const id = notifier.notify(`【响应超限-${mode}】`);
+        assert.ok(id !== null);
+        await notifier.flush();
+        assert.equal(notifier.pending(), 1);
+        const delivery = notifier.delivery([id]).get(id)!;
+        assert.equal(delivery.sentAt, null);
+        assert.equal(delivery.attempts, 1);
+        clock += 600_000;
+        oversizedMode = 'none';
+        await notifier.flush();
+        assert.equal(notifier.pending(), 0);
+      }
+    } finally { notifier.close(); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 class FakeSocket implements SocketLike {
   listeners: Record<string, ((event: any) => void)[]> = {};
   closed = false;

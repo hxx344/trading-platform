@@ -1053,6 +1053,38 @@ test('stored fills are dropped for replaced or deleted credentials, conflicts an
   assert.deepEqual(await rows(), []);
 });
 
+test('OKX 成交超时后再收到权限拒绝仍清理缓存且不触发未处理拒绝', async t => {
+  const f = fixture(); t.after(() => f.database.close()); await f.save(okx);
+  const rows = async () => (await f.database.prepare('SELECT account,scope,revision FROM fill_cache').all()).results;
+  let clock = at;
+  const warm = createFillsService({ now: () => clock, read: async () => [], fills: async () => [fill('w1', clock - 2 * minute, 'buy', '1')] });
+  await warm.read(() => f.database, f.unseal); await warm.idle(); warm.close();
+  assert.equal((await rows()).length, 1);
+
+  let unhandled = 0;
+  const onUnhandled = () => { unhandled++; };
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.off('unhandledRejection', onUnhandled));
+
+  clock += 5 * minute;
+  const entered = deferred<void>(), waiting = deferred<void>();
+  const service = createFillsService({
+    now: () => clock,
+    deadline: 15,
+    read: async () => { entered.resolve(); await waiting.promise; throw new PositionsPermissionError(); },
+    fills: async () => [],
+  });
+  t.after(() => service.close());
+  await service.read(() => f.database, f.unseal);
+  await entered.promise;
+  await service.idle();
+  waiting.resolve();
+  await flush();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.deepEqual(await rows(), []);
+  assert.equal(unhandled, 0);
+});
+
 test('a restart after 15 minutes drops stored Binance mode evidence, so a PM account hides classic mode again', async t => {
   const f = fixture(); t.after(() => f.database.close()); await f.save(binance);
   let clock = at, pmFailed = false; const products: string[] = [];

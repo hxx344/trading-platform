@@ -361,18 +361,31 @@ export function readTokenNewsView<T extends { items: readonly { url: string | nu
 export function readTokenSystemStatus(view: Record<string, unknown>): Record<string, unknown> {
   const pick = (value: unknown, keys: readonly string[]) => value !== null && typeof value === 'object'
     ? Object.fromEntries(keys.filter(key => Object.hasOwn(value, key)).map(key => [key, (value as Record<string, unknown>)[key]])) : value ?? null;
+  const dependencies = view.dependencies !== null && typeof view.dependencies === 'object' ? (() => {
+    const dep = view.dependencies as Record<string, unknown>;
+    return Array.isArray(dep.incidents)
+      ? { ...dep, incidents: dep.incidents.filter(item => !(item !== null && typeof item === 'object' && typeof (item as { key?: unknown }).key === 'string' && (item as { key: string }).key.startsWith('stream:'))) }
+      : dep;
+  })() : view.dependencies ?? null;
   return {
     health: view.health !== null && typeof view.health === 'object'
       ? { ...view.health as Record<string, unknown>, loops: Array.isArray((view.health as { loops?: unknown }).loops)
         ? ((view.health as { loops: unknown[] }).loops).map(row => row !== null && typeof row === 'object' ? (({ lastError: _, ...rest }) => rest)(row as Record<string, unknown>) : row) : undefined }
       : null,
-    dependencies: view.dependencies ?? null,
+    dependencies,
     samples: view.samples ?? null,
     ...(view.watch !== undefined ? { watch: view.watch } : {}),
     feishu: pick(view.feishu, ['configured', 'pending', 'retrying', 'lastSentAt', 'lastError', 'nextRetryAt', 'retentionMs']),
     ...(view.monitor !== undefined ? { monitor: pick(view.monitor, ['available', 'error']) } : {}),
     omitted: '令牌没有 portfolio 范围：飞书消息原文、账户行情流、划转设置与各监控摘要不提供',
   };
+}
+
+/** Strips portfolio-level ASTER account streams from /api/host for system-scoped read-only tokens. */
+export function readTokenHostView(view: Record<string, unknown>): Record<string, unknown> {
+  return Array.isArray(view.connections)
+    ? { ...view, connections: view.connections.filter(row => !(row !== null && typeof row === 'object' && (row as { id?: unknown }).id === 'streams')) }
+    : view;
 }
 
 /** The scope a read-only token needs to GET this URL, or null when no token may: the path in READ_TOKEN_ROUTES and only its query parameters. */

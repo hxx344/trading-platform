@@ -102,7 +102,7 @@ export async function verifiedPositionSnapshot(ctx: Context, read: (signal: Abor
       const startedAt = ctx.now();
       const positions = await read(signal).catch(error => {
         // The last waiter can have left before the exchange returns a definite credential refusal.
-        if (ctx.account.exchange === 'binance' && error instanceof PositionsPermissionError) ctx.generation.deny(error);
+        if (error instanceof PositionsPermissionError) ctx.generation.deny(error);
         throw error;
       }), completedAt = ctx.now();
       signal.throwIfAborted(); check();

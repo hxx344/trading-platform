@@ -85,14 +85,17 @@ export function createGateDepositSource(connection: () => Connection | null, uns
         entry.latest = result;
         return result;
       } catch (error) {
+        if (!saved.stop.signal.aborted && observed() === saved) {
+          if (error instanceof GateDepositThrottle) nextAllowed = now() + 60_000;
+          if (error instanceof PositionsPermissionError) { nextAllowed = Math.max(nextAllowed, now() + 3000); saved.permission.deny(); }
+        }
         check();
         entry.retryAt = now() + 3000;
-        if (error instanceof GateDepositThrottle) nextAllowed = now() + 60_000;
-        if (error instanceof PositionsPermissionError) { nextAllowed = Math.max(nextAllowed, now() + 3000); saved.permission.deny(); }
         throw invalid();
       }
     };
     const work = untilAborted(read(), signal).finally(() => { running--; });
+    work.catch(() => {});
     return { controller, work, waiters: 0 };
   }
   return {

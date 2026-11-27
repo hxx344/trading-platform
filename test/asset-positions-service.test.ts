@@ -196,6 +196,37 @@ test('GET returns loading promptly, single-flights within TTL and marks only suc
   assert.equal(JSON.stringify(result).includes('synthetic-secret'), false);
 });
 
+test('OKX 持仓读取超时后再收到权限拒绝仍撤销缓存世代且无未捕获拒绝', async t => {
+  const f = fixture(); t.after(() => f.database.close());
+  await f.save('owner', 'okx', { exchange: 'okx', apiKey: 'synthetic', apiSecret: 'synthetic', passphrase: 'synthetic' });
+  let clock = at;
+  const fills = createFillsService({ now: () => clock, permission: async () => {}, read: async () => [], fills: async () => [] });
+  await fills.read(() => f.database, f.unseal); await fills.idle(); fills.close();
+  const cacheCount = () => f.database.prepare("SELECT COUNT(*) AS count FROM fill_cache WHERE account = 'okx'").get<{ count: number }>()!.count;
+  assert.equal(cacheCount(), 1);
+
+  let unhandled = 0;
+  const onUnhandled = () => { unhandled++; };
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.off('unhandledRejection', onUnhandled));
+
+  const entered = deferred<void>(), waiting = deferred<void>();
+  const service = createPositionsService({
+    now: () => clock,
+    deadline: 15,
+    read: async () => { entered.resolve(); await waiting.promise; throw new PositionsPermissionError(); },
+  });
+  t.after(() => service.close());
+  await service.read(() => f.database, f.unseal);
+  await entered.promise;
+  await service.idle();
+  waiting.resolve();
+  await flush();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(cacheCount(), 0);
+  assert.equal(unhandled, 0);
+});
+
 test('TTL refresh keeps a full snapshot, 90s aging marks stale, and failed refresh preserves data and original fetch time', async t => {
   const f = fixture(); t.after(() => f.database.close()); await f.save(); let clock = at; let fail = false;
   const wait = deferred<Position[]>(); let mode = 'success';

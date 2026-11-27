@@ -114,9 +114,47 @@ function signedQuantity(row: Json, field: string, sideField: string): { quantity
 const instrumentsOf = (metadata: unknown) => new Map(rows(record(metadata).symbols).map(item => [item.symbol, item]));
 
 const CATALOG_TTL = 10 * 60_000;
+const MAX_SYMBOL_INSTRUMENTS = 512;
 type CatalogValue = { metadata: unknown; symbols: Set<unknown>; expires: number; invalid?: boolean };
 type CatalogSlot = { value?: CatalogValue; pending?: Promise<CatalogValue> };
 const catalogs = new WeakMap<Fetcher, Map<string, CatalogSlot>>();
+type InstrumentValue = { raw: unknown; expires: number; invalid?: boolean };
+type InstrumentSlot = { value?: InstrumentValue; pending?: Promise<InstrumentValue> };
+const symbolInstruments = new WeakMap<Fetcher, Map<string, InstrumentSlot>>();
+
+async function cachedInstrument<T>(fetcher: Fetcher, key: string, load: () => Promise<unknown>, parse: (raw: unknown) => T): Promise<T> {
+  let store = symbolInstruments.get(fetcher);
+  if (!store) { store = new Map(); symbolInstruments.set(fetcher, store); }
+  let slot = store.get(key);
+  if (!slot) {
+    if (store.size >= MAX_SYMBOL_INSTRUMENTS) {
+      const oldest = store.keys().next().value;
+      if (oldest !== undefined) store.delete(oldest);
+    }
+    slot = {}; store.set(key, slot);
+  } else {
+    store.delete(key);
+    store.set(key, slot);
+  }
+  const cached = slot.value;
+  if (cached && cached.expires > Date.now()) {
+    try { return parse(cached.raw); }
+    catch { cached.invalid = true; slot.value = undefined; }
+  }
+  slot.value = undefined;
+  const current = slot;
+  current.pending ??= load().then(raw => ({ raw, expires: Date.now() + CATALOG_TTL })).finally(() => { current.pending = undefined; });
+  const loaded = await current.pending;
+  try {
+    const parsed = parse(loaded.raw);
+    if (!loaded.invalid) current.value = loaded;
+    return parsed;
+  } catch (error) {
+    loaded.invalid = true;
+    if (current.value === loaded) current.value = undefined;
+    throw error;
+  }
+}
 /** Public catalogs are shared for 10 minutes only after the held positions normalize successfully. A missing or invalid
  * held entry evicts the cached copy. Each read loads at most once, sharing in-flight loads; fresh failures stay invalid. */
 async function catalog(fetcher: Fetcher, key: string, held: unknown[], load: () => Promise<unknown>,
@@ -238,10 +276,13 @@ export async function readBybitPositions(c: BybitCredential, scope: BybitScope, 
     if (quantity.startsWith('-') || !['Buy', 'Sell'].includes(String(row.side))) throw new Error(POSITIONS_INVALID);
     const symbol = text(row.symbol);
     if (!metadata.has(symbol)) {
-      const data = record(await positionsGet('bybit', c, '/v5/market/instruments-info', new URLSearchParams({ category, symbol }), fetcher, signal));
-      const matched = rows(data.list).filter(item => item.symbol === symbol);
-      if (matched.length !== 1) throw new Error(POSITIONS_INVALID);
-      metadata.set(symbol, matched[0]);
+      metadata.set(symbol, await cachedInstrument(fetcher, `bybit:${c.region}:${category}:${symbol}`,
+        () => positionsGet('bybit', c, '/v5/market/instruments-info', new URLSearchParams({ category, symbol }), fetcher, signal),
+        raw => {
+          const matched = rows(record(raw).list).filter(item => item.symbol === symbol);
+          if (matched.length !== 1) throw new Error(POSITIONS_INVALID);
+          return matched[0];
+        }));
     }
     const instrument = metadata.get(symbol)!; const base = text(instrument.baseCoin), quote = text(instrument.quoteCoin), settlement = text(instrument.settleCoin);
     if (settleCoin && settlement !== settleCoin) throw new Error(POSITIONS_INVALID);
@@ -263,9 +304,13 @@ export async function readOkxPositions(c: OkxCredential, scope: 'SWAP' | 'FUTURE
     const parsed = signedQuantity(row, 'pos', 'posSide'); if (!parsed) continue;
     const symbol = text(row.instId);
     if (!metadata.has(symbol)) {
-      const items = rows(await positionsGet('okx', c, '/api/v5/public/instruments', new URLSearchParams({ instType: scope, instId: symbol }), fetcher, signal));
-      if (items.length !== 1 || items[0].instId !== symbol || items[0].instType !== scope) throw new Error(POSITIONS_INVALID);
-      metadata.set(symbol, items[0]);
+      metadata.set(symbol, await cachedInstrument(fetcher, `okx:${scope}:${symbol}`,
+        () => positionsGet('okx', c, '/api/v5/public/instruments', new URLSearchParams({ instType: scope, instId: symbol }), fetcher, signal),
+        raw => {
+          const items = rows(raw);
+          if (items.length !== 1 || items[0].instId !== symbol || items[0].instType !== scope) throw new Error(POSITIONS_INVALID);
+          return items[0];
+        }));
     }
     const instrument = metadata.get(symbol)!;
     const contractSize = multiplyDecimals(decimal(instrument.ctVal), decimal(instrument.ctMult));

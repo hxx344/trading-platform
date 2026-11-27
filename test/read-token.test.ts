@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { createExecutorServer, type ServiceViews } from '../src/http.ts';
 import { LoginThrottle } from '../src/login-password.ts';
-import { READ_SCOPES, READ_TOKEN_FILE, READ_TOKEN_MAX, READ_TOKEN_ROUTES, READ_TOKEN_TTL_MS, createReadTokens, readTokenAllows, readTokenScope, readTokenSystemStatus, type ReadScope } from '../src/read-token.ts';
+import { READ_SCOPES, READ_TOKEN_FILE, READ_TOKEN_MAX, READ_TOKEN_ROUTES, READ_TOKEN_TTL_MS, createReadTokens, readTokenAllows, readTokenHostView, readTokenScope, readTokenSystemStatus, type ReadScope } from '../src/read-token.ts';
 import { createRedactor, identifierField } from '../src/read-redact.ts';
 import { createOndoModule } from '../src/service/ondo.ts';
 import type { UpdateView } from '../src/service/update-types.ts';
@@ -604,4 +604,52 @@ test('只读令牌：system 状态投影对各种 health 形状都不带出循�
   }
   assert.deepEqual(readTokenSystemStatus({ health: { loops: [null, 1, { name: 'jobs', lastError: 'x', failures: 2 }] } }).health, { loops: [null, 1, { name: 'jobs', failures: 2 }] });
   assert.equal(readTokenSystemStatus({}).health, null);
+});
+
+test('只读令牌：打码覆盖 problem 与 note；system 范围从 /api/status 与 /api/host 剥离账户行情流', async () => {
+  const redact = createRedactor(Buffer.alloc(32, 9));
+  const masked = redact({ text: `主路径 ${ADDRESS}`, problem: `异常 ${ADDRESS}`, note: `备注 ${ADDRESS_UPPER}` }) as Record<string, string>;
+  assert.match(masked.problem!, /addr-/);
+  assert.equal(masked.problem!.replace('异常 ', ''), masked.text!.replace('主路径 ', ''));
+  assert.equal(masked.note!.replace('备注 ', ''), masked.text!.replace('主路径 ', ''));
+
+  const filteredStatus = readTokenSystemStatus({
+    dependencies: {
+      level: 'degraded',
+      incidents: [
+        { key: 'stream:aster-1', summary: 'ACCOUNT-SECRET' },
+        { key: 'market:binance', summary: '行情断线' },
+      ],
+    },
+  });
+  assert.deepEqual(filteredStatus.dependencies, {
+    level: 'degraded',
+    incidents: [{ key: 'market:binance', summary: '行情断线' }],
+  });
+
+  assert.deepEqual(
+    readTokenHostView({
+      host: 'srv1',
+      connections: [{ id: 'streams', label: 'SECRET-STREAM' }, { id: 'market', label: 'ok' }],
+    }),
+    { host: 'srv1', connections: [{ id: 'market', label: 'ok' }] },
+  );
+
+  clock.now = Date.UTC(2026, 10, 19);
+  const s = await start({
+    extra: {
+      host: async () => ({
+        cpu: 0.2,
+        connections: [{ id: 'streams', detail: 'ACC-STREAM-SECRET' }, { id: 'okx', detail: 'ok' }],
+      }),
+    },
+  });
+  try {
+    const system = await s.generate(['system'], '运维');
+    const full = await s.generate(READ_SCOPES, '分析');
+    const sysHost = await (await s.read(system, '/api/host')).json() as { connections: { id: string }[] };
+    const fullHost = await (await s.read(full, '/api/host')).json() as { connections: { id: string }[] };
+    assert.deepEqual(sysHost.connections.map(row => row.id), ['okx']);
+    assert.deepEqual(fullHost.connections.map(row => row.id), ['streams', 'okx']);
+  } finally { await s.close(); }
 });

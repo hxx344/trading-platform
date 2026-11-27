@@ -78,7 +78,7 @@ export function createRedactor(key: Buffer, seen: (alias: string, original: stri
     const out: Record<string, unknown> = {};
     for (const [name, field] of Object.entries(value)) {
       // Only diagnostics contain transport details. Structured data such as a news link retains its API contract.
-      const diagnostic = typeof field === 'string' && /^(?:text|line|message|(?:last)?error|reason|detail|stack)$/i.test(name);
+      const diagnostic = typeof field === 'string' && /^(?:text|line|message|(?:last)?error|reason|detail|stack|problem|note)$/i.test(name);
       const cleaned = diagnostic ? redactClientAddresses(redactDiagnostic(field)) : field;
       out[text(name)] = identifierField(name) ? whole(cleaned, name) : walk(cleaned);
     }

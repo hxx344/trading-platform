@@ -67,14 +67,16 @@ export function createOkxRecipients(now: () => number, current: (directory: OkxD
         entry.latest = selection;
         return selection;
       } catch (error) {
+        if (error instanceof OkxReadThrottle) retryAt = now() + 60_000;
         if (!signal.aborted) {
-          if (error instanceof OkxReadThrottle) retryAt = now() + 60_000;
           entry.retryAt = now() + 3000;
         }
         throw invalid();
       }
     }
-    return { controller, users: 0, promise: untilAborted(read(), signal).finally(() => { running--; }) };
+    const promise = untilAborted(read(), signal).finally(() => { running--; });
+    promise.catch(() => {});
+    return { controller, users: 0, promise };
   }
   async function recipient(dir: OkxDirectory, symbol: string, chain: Chain, contract: string, signal: AbortSignal) {
     try {

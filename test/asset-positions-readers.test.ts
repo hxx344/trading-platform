@@ -311,6 +311,49 @@ test('OKX keeps contract count and ctVal × ctMult exactly, preserving inverse s
   }
 });
 
+test('Bybit 与 OKX 单标的合约元信息按 fetcher 缓存 10 分钟，过期或失败响应不缓存', async t => {
+  let clock = at;
+  t.mock.method(Date, 'now', () => clock);
+
+  let bybitMetaCalls = 0;
+  const bybitFetcher = mock(url => {
+    if (url.pathname.endsWith('query-api')) return { retCode: 0, result: { readOnly: 1 } };
+    if (url.pathname.includes('instruments-info')) {
+      bybitMetaCalls++;
+      return { retCode: 0, result: { list: [{ symbol: 'BTCUSDT', baseCoin: 'BTC', quoteCoin: 'USDT', settleCoin: 'USDT' }] } };
+    }
+    return { retCode: 0, result: { category: 'linear', list: [bybitPosition('Buy', 'BTCUSDT')], nextPageCursor: '' } };
+  });
+  await readBybitPositions(bybit, 'linear-usdt', bybitFetcher);
+  await readBybitPositions(bybit, 'linear-usdt', bybitFetcher);
+  assert.equal(bybitMetaCalls, 1);
+  clock += 10 * 60_000 - 1;
+  await readBybitPositions(bybit, 'linear-usdt', bybitFetcher);
+  assert.equal(bybitMetaCalls, 1);
+  clock += 2;
+  await readBybitPositions(bybit, 'linear-usdt', bybitFetcher);
+  assert.equal(bybitMetaCalls, 2);
+
+  let okxMetaCalls = 0, badOkxMeta = true;
+  const okxFetcher = mock(url => {
+    if (url.pathname.endsWith('/config')) return { code: '0', data: [{ perm: 'read_only' }] };
+    if (url.pathname.endsWith('/instruments')) {
+      okxMetaCalls++;
+      return { code: '0', data: badOkxMeta ? [] : [{ instId: 'BTC-USDT-SWAP', instType: 'SWAP', uly: 'BTC-USDT', settleCcy: 'USDT', ctVal: '0.01', ctMult: '1', ctValCcy: 'BTC' }] };
+    }
+    return { code: '0', data: [{ instId: 'BTC-USDT-SWAP', instType: 'SWAP', pos: '1', posSide: 'net', posId: '1', mgnMode: 'cross', avgPx: '100000', markPx: '99000', notionalUsd: '1000', upl: '0', lever: '5', liqPx: '', uTime: String(at) }] };
+  });
+  await assert.rejects(readOkxPositions(okx, 'SWAP', okxFetcher));
+  assert.equal(okxMetaCalls, 1);
+  badOkxMeta = false;
+  await readOkxPositions(okx, 'SWAP', okxFetcher);
+  await readOkxPositions(okx, 'SWAP', okxFetcher);
+  assert.equal(okxMetaCalls, 2);
+  clock += 10 * 60_000 + 1;
+  await readOkxPositions(okx, 'SWAP', okxFetcher);
+  assert.equal(okxMetaCalls, 3);
+});
+
 test('Aster uses its fixed API Pro GET and retains separate hedge positions', async () => {
   const privateKey = '0'.repeat(63) + '1'; const wallet = new Wallet(privateKey);
   const result = await readAsterPositions({ privateKey, walletAddress: wallet.address, includeSpot: true }, mock(url => {

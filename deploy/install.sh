@@ -312,7 +312,7 @@ fi
 as_root_dir() { # path mode [owner group]
   if [[ "$TEST_MODE" == 1 ]]; then install -d -m "$2" "$1"; else install -d -m "$2" -o "${3:-root}" -g "${4:-root}" "$1"; fi
 }
-as_user() { local user=$1; shift; if [[ "$TEST_MODE" == 1 ]]; then (cd / && "$@"); else (cd / && runuser -u "$user" -- "$@"); fi; }
+as_user() { local user=$1; shift; if [[ "$TEST_MODE" == 1 ]]; then (cd / && "$@" 9>&-); else (cd / && runuser -u "$user" -- "$@" 9>&-); fi; }
 as_service() { as_user "$SERVICE_USER" "$@"; }
 fetch() { # url target
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 600 --retry 3 --retry-delay 2 "$1" -o "$2" \
@@ -645,18 +645,21 @@ if ((import_workbench)); then
   ((!import_crossex)) || import_args+=(--crossex)
   ((!import_crossex || import_asset || import_monitor_alerts || import_monitor_variational || import_monitor_paper || import_monitor_settings)) || import_args+=(--data-dir "$DATA_DIR")
   ((!import_ondo)) || import_args+=(--ondo)
-  # The service's proxy settings (KEY=VALUE lines, as systemd reads them): importing the options account reads Bybit once.
-  import_env=()
-  if [[ -f "$CONF_DIR/environment" ]]; then
-    while IFS= read -r env_line || [[ -n "$env_line" ]]; do
-      env_line=${env_line%$'\r'}
-      [[ "$env_line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
-      env_key=${BASH_REMATCH[1]} env_value=${BASH_REMATCH[2]}
-      if [[ "$env_value" =~ ^\"(.*)\"$ || "$env_value" =~ ^\'(.*)\'$ ]]; then env_value=${BASH_REMATCH[1]}; fi
-      import_env+=("$env_key=$env_value")
-    done <"$CONF_DIR/environment"
-  fi
-  (cd / && env ${import_env[@]+"${import_env[@]}"} "$NODE_BIN" "$release_dir/src/service/import-workbench.ts" "${import_args[@]}" 9>&-) || fail '从工作台导入配置失败'
+  # The service's proxy settings only (KEY=VALUE lines, exported in-subshell so nothing enters argv): importing options reads Bybit once.
+  (
+    cd /
+    if [[ -f "$CONF_DIR/environment" ]]; then
+      while IFS= read -r env_line || [[ -n "$env_line" ]]; do
+        env_line=${env_line%$'\r'}
+        [[ "$env_line" =~ ^[[:space:]]*(NODE_USE_ENV_PROXY|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy)=(.*)$ ]] || continue
+        env_key=${BASH_REMATCH[1]} env_value=${BASH_REMATCH[2]}
+        if [[ "$env_value" =~ ^\"(.*)\"$ || "$env_value" =~ ^\'(.*)\'$ ]]; then env_value=${BASH_REMATCH[1]}; fi
+        printf -v "$env_key" '%s' "$env_value"
+        export "$env_key"
+      done <"$CONF_DIR/environment"
+    fi
+    exec "$NODE_BIN" "$release_dir/src/service/import-workbench.ts" "${import_args[@]}" 9>&-
+  ) || fail '从工作台导入配置失败'
 fi
 # A first setup without an import starts on a config with no pairs, so the page is up to import them from.
 if [[ ! -e "$CONF_DIR/config.json" && ! -L "$CONF_DIR/config.json" ]]; then
@@ -671,7 +674,7 @@ if [[ ! -e "$CONF_DIR/config.json" && ! -L "$CONF_DIR/config.json" ]]; then
       fs.writeFileSync(secrets, JSON.stringify({ accounts: {} }, null, 2) + "\n", { mode: 0o600, flag: "wx" });
       try { fs.writeFileSync(config, JSON.stringify({ secretsFile: secrets, pairs: [] }, null, 2) + "\n", { mode: 0o600, flag: "wx" }); }
       catch (error) { fs.rmSync(secrets, { force: true }); throw error; }' \
-      "$CONF_DIR/config.json" "$CONF_DIR/secrets.json" || fail '无法生成空配置'
+      "$CONF_DIR/config.json" "$CONF_DIR/secrets.json" 9>&- || fail '无法生成空配置'
     changes+=('空配置（在页面导入配对）')
   fi
 fi
@@ -1052,7 +1055,7 @@ healthy_control() {
 probe_market() {
   # Match the execution unit's UID and its dedicated group for this socket; ordinary login sessions lack that group.
   (cd / && runuser -u "$SERVICE_USER" -g "$MARKET_IPC_GROUP" -- timeout --kill-after=1 4 "$NODE_BIN" \
-    "$1/src/market/probe.ts" --socket "$MARKET_SOCKET" --root "$2") >"$work_dir/market-probe.log" 2>&1
+    "$1/src/market/probe.ts" --socket "$MARKET_SOCKET" --root "$2" 9>&-) >"$work_dir/market-probe.log" 2>&1
 }
 healthy_market() {
   local target=$1 market=$2 deadline=$((SECONDS + HEALTH_WAIT_S))
@@ -1064,7 +1067,7 @@ healthy_market() {
 }
 probe_dex() {
   (cd / && runuser -u "$SERVICE_USER" -g "$DEX_IPC_GROUP" -- timeout --kill-after=1 4 "$NODE_BIN" \
-    "$1/src/dex/probe.ts" --socket "$DEX_SOCKET" --root "$2") >"$work_dir/dex-probe.log" 2>&1
+    "$1/src/dex/probe.ts" --socket "$DEX_SOCKET" --root "$2" 9>&-) >"$work_dir/dex-probe.log" 2>&1
 }
 healthy_dex() {
   local target=$1 dex=$2 deadline=$((SECONDS + HEALTH_WAIT_S))
@@ -1087,8 +1090,8 @@ copy_dex_db() { # tool release, from user, from dir, to user, to dir
   [[ -f "$tool" ]] || { log "找不到 $tool，无法复制 DEX 价差库。"; return 1; }
   steady systemctl stop "$DEX" 2>/dev/null || true
   if systemctl is-active --quiet "$DEX"; then log 'DEX 价差服务未能停止，未复制库。'; return 1; fi
-  if (cd / && steady runuser -u "$2" -- timeout --kill-after=5 600 env -i "$NODE_BIN" "$tool" export --dir "$3" 2>"$work_dir/move-db-export.log" |
-      steady runuser -u "$4" -- timeout --kill-after=5 600 env -i "$NODE_BIN" "$tool" import --dir "$5" 2>"$work_dir/move-db.log"); then
+  if (cd / && steady runuser -u "$2" -- timeout --kill-after=5 600 env -i "$NODE_BIN" "$tool" export --dir "$3" 9>&- 2>"$work_dir/move-db-export.log" |
+      steady runuser -u "$4" -- timeout --kill-after=5 600 env -i "$NODE_BIN" "$tool" import --dir "$5" 9>&- 2>"$work_dir/move-db.log"); then
     log "DEX 价差库：$(tail -n 1 "$work_dir/move-db.log")"
     return 0
   fi

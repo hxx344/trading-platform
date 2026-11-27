@@ -11,7 +11,7 @@ import type { Executor } from './executor.ts';
 import { APP_HEADERS, CLIENT_ADDRESS_HEADER, CONFIG_CHECK_HEADER, CONFIG_MATCH_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, PAGE_HEADERS, MAX_LOGIN_BYTES, boundedHttpServer, closeAfterResponse, controlRoute, readBody, readJson, sendJson, sendJsonText, sendWebAsset, sessionCookieName } from './http-public.ts';
 import { GLOBAL_LOGIN_LIMITS, LoginThrottle, MAX_PASSWORD_LENGTH, throttleAddress, verifyPassword, type PasswordHash, type ThrottleLimits } from './login-password.ts';
 import { openSessionStore, type SessionInfo, type SessionStore } from './sessions.ts';
-import { READ_SCOPE_NAMES, READ_TOKEN_MAX_BYTES, ReadTokenError, readTokenNewsView, readTokenScope, readTokenSystemStatus, readTokenUpdateView, type ReadScope, type ReadTokens } from './read-token.ts';
+import { READ_SCOPE_NAMES, READ_TOKEN_MAX_BYTES, ReadTokenError, readTokenHostView, readTokenNewsView, readTokenScope, readTokenSystemStatus, readTokenUpdateView, type ReadScope, type ReadTokens } from './read-token.ts';
 import type { Redactor } from './read-redact.ts';
 import type { WebApp } from './web-assets.ts';
 import type { UpdateView } from './service/update-types.ts';
@@ -606,7 +606,9 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     }
     if (request.method === 'GET' && url.pathname === '/api/host') {
       if (!views?.host) return send(response, 404, { code: 'not_found', message: '本服务没有服务器状态' });
-      return send(response, 200, await views.host());
+      const view = await views.host() as Record<string, unknown>;
+      const token = tokenAnswers.get(response);
+      return send(response, 200, token && !token.scopes.includes('portfolio') ? readTokenHostView(view) : view);
     }
     if (request.method === 'GET' && url.pathname === '/api/status') {
       if (!views?.status) return send(response, 404, { code: 'not_found', message: '本服务没有运行状态' });

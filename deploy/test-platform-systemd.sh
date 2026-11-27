@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Actual systemd services, public HTTP and a single private writer, in the empty GitHub-hosted Linux runner only.
 # With no argument (or all), each scenario inherits the running services, packages and session from the previous one.
+# A scenario run alone builds its own starting deployment; port and downgrade then start from a fresh installation.
 set -Eeuo pipefail
 scenario=${1-all}
-if (( $# > 1 )) || [[ ! $scenario =~ ^(all|migration|components|execution|topology|reconcile)$ ]]; then
-  printf 'Usage: %s [all|migration|components|execution|topology|reconcile]\n' "$0" >&2
+if (( $# > 1 )) || [[ ! $scenario =~ ^(all|migration|components|execution|port|topology|downgrade|reconcile)$ ]]; then
+  printf 'Usage: %s [all|migration|components|execution|port|topology|downgrade|reconcile]\n' "$0" >&2
   exit 2
 fi
 runs() { [[ $scenario == all || $scenario == "$1" ]]; }
@@ -108,7 +109,7 @@ download_release() {
   (cd "$dir" && awk '$2 == "install.sh" || $2 == "trading-platform.tar.gz"' SHA256SUMS >required && [[ $(wc -l <required) == 2 ]] && sha256sum -c --quiet required)
 }
 if runs migration || runs topology || runs reconcile; then download_release "$old"; fi
-if runs topology; then download_release "$dual"; fi
+if runs topology || runs downgrade; then download_release "$dual"; fi
 if runs reconcile; then download_release "$previous"; fi
 
 pid() { local value; value=$(systemctl show -p MainPID --value "$1"); [[ "$value" =~ ^[1-9][0-9]*$ ]] && printf '%s\n' "$value"; }
@@ -122,6 +123,10 @@ source="$fixture/source"
 cp -R "$root/src" "$root/package.json" "$root/README.md" "$root/deploy" "$root/scripts" "$source/"
 mkdir "$source/web"
 cp -R "$root/web/dist" "$source/web/"
+# A scenario builds up to seven candidates and the archive's compression level is not under test: gzip -9 spends over
+# two seconds on each, mostly on the Lighter signer.
+[[ $(grep -c 'gzip -n -9' "$source/deploy/package.sh") == 1 ]]
+sed -i 's/gzip -n -9/gzip -n -1/' "$source/deploy/package.sh"
 build() {
   node -e 'const fs = require("fs"), file=process.argv[1], pkg=JSON.parse(fs.readFileSync(file)); pkg.version=process.argv[2]; fs.writeFileSync(file, JSON.stringify(pkg));' "$source/package.json" "99.1.$1"
   bash "$source/deploy/package.sh" "$fixture/release-$1" >/dev/null
@@ -237,7 +242,14 @@ case $scenario in
     login
     assert_page v99.1.1
     ;;
-  topology|reconcile)
+  port)
+    write_imported_config
+    build 8
+    install_release 8
+    login
+    assert_page v99.1.8
+    ;;
+  topology|downgrade|reconcile)
     public_port=14720
     write_imported_config
     write_environment changed-market-key
@@ -247,7 +259,7 @@ case $scenario in
       login
       assert_page v99.1.8
       market_probe "$app/market"
-    else
+    elif [[ $scenario == reconcile ]]; then
       # The old installer must find a live two-process deployment and a session that survives the downgrade.
       bash "$root/deploy/install.sh" --package "$previous" >"$fixture/out" 2>&1
       login
@@ -505,7 +517,9 @@ expect_unhealthy_release 9 executor '模拟执行面启动失败'
 grep -q '已回退到 v99.1.8 并确认运行正常' "$fixture/out"
 [[ $(pid "$service") != "$executor_pid" && $(pid "$control") == "$control_pid" ]]
 assert_page v99.1.8
+fi
 
+if runs port; then
 echo 'Changing the public port updates both effective configurations and repeated installation can repair a stopped unit'
 public_port=14720
 node -e 'const fs = require("fs"), file = process.argv[1], c = JSON.parse(fs.readFileSync(file)); c.port=Number(process.argv[2]); fs.writeFileSync(file, JSON.stringify(c));' "$conf/config.json" "$public_port"
@@ -574,7 +588,9 @@ assert_market_absent
 grep -Fq 'DEX 价差库已交回执行服务' "$fixture/out"
 [[ $(id -gn "$extra_user") == "$market-ipc" ]]
 userdel "$extra_user"
+fi
 
+if runs downgrade; then
 echo 'A broken two-process downgrade cannot bring the previous market back with an unsafe socket group'
 install_release 8
 market_probe "$app/market"

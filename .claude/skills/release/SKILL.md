@@ -70,6 +70,7 @@ gh run list --workflow ci.yml --branch <当前分支> --limit 1 --json databaseI
 
 - 核对 `headSha` 就是刚推的提交，再用 `gh run watch <id> --exit-status` 在后台等它结束（一条阻塞命令，结束时会通知，不要自己反复查询）。把运行链接告诉用户。
 - 同一提交已有通过的手动 CI 运行时可以复用，不重跑。
+- 这次运行里通过的真实 systemd 验收，主线在发布提交上会直接复用（发布提交只改版本号时），不用为此在发布提交上再跑一次。
 - 改了安装脚本或部署激活：按 AGENTS.md《检查》改用 `gh workflow run ci.yml --ref <分支> -f install_full=true`。
 - 失败：偶发（网络、runner）就 `gh run rerun <id> --failed`；代码问题就修复、提交，回到第 4 步。修复属于新逻辑时按 code-review.md 重新定级和复核。
 

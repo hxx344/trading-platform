@@ -152,6 +152,9 @@ test('chart rows draw the entry band around the baseline and the axis ignores a 
   const [low, high] = chartRange(rows);
   assert.ok(high < 900 && low <= -14 && high >= 16, `${low} ${high}`);
   assert.equal(chartRange([]), null);
+  const broken = chartRows([points[10], { ...points[20], gapBefore: true }], 15);
+  assert.deepEqual(broken[1], { time: 15, mid: null, sellA: null, buyA: null, median: null, upper: null, lower: null });
+  assert.equal(broken[2].time, 20);
 });
 
 test('readouts, labels and addresses', () => {

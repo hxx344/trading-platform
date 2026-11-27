@@ -26,7 +26,7 @@ const REFRESH_MS = 2_000;
 const READ_TIMEOUT_MS = 10_000;
 
 // Keep the default pair workspace ready while its first state request is in flight.
-// The shell read below re-renders App twice every two seconds (loading, then the answer), and every page with it. Most
+// The shell read below refreshes App every two seconds, and every page with it. Most
 // pages lean on that: a countdown, a task's elapsed time or a preview's expiry is computed while rendering and has no
 // timer of its own. Only the pages that show nothing of the kind are memoized (their props, onExpired, never change);
 // before memoizing another, give each of its time-dependent texts its own timer.
@@ -37,11 +37,11 @@ const NewsPage = lazy(() => import('./NewsPage.tsx').then(m => ({ default: memo(
 const OilPage = lazy(() => import('./OilPage.tsx').then(m => ({ default: m.OilPage })));
 const HynixPage = lazy(() => import('./HynixPage.tsx').then(m => ({ default: m.HynixPage })));
 const GoldOilPage = lazy(() => import('./GoldOilPage.tsx').then(m => ({ default: m.GoldOilPage })));
-const CrossexPage = lazy(() => import('./crossex/CrossexPage.tsx').then(m => ({ default: m.CrossexPage })));
+const CrossexPage = lazy(() => import('./crossex/CrossexPage.tsx').then(m => ({ default: memo(m.CrossexPage) })));
 const OndoPage = lazy(() => import('./ondo/OndoPage.tsx').then(m => ({ default: m.OndoPage })));
-const VarLighterPage = lazy(() => import('./varlighter/VarLighterPage.tsx').then(m => ({ default: m.VarLighterPage })));
-const MevPage = lazy(() => import('./mev/MevPage.tsx').then(m => ({ default: m.MevPage })));
-const FundingBookPage = lazy(() => import('./fundingbook/FundingBookPage.tsx').then(m => ({ default: m.FundingBookPage })));
+const VarLighterPage = lazy(() => import('./varlighter/VarLighterPage.tsx').then(m => ({ default: memo(m.VarLighterPage) })));
+const MevPage = lazy(() => import('./mev/MevPage.tsx').then(m => ({ default: memo(m.MevPage) })));
+const FundingBookPage = lazy(() => import('./fundingbook/FundingBookPage.tsx').then(m => ({ default: memo(m.FundingBookPage) })));
 const ChainArbPage = lazy(() => import('./ChainArbPage.tsx').then(m => ({ default: m.ChainArbPage })));
 const OptionsPage = lazy(() => import('./OptionsPage.tsx').then(m => ({ default: m.OptionsPage })));
 const StatusPage = lazy(() => import('./StatusPage.tsx').then(m => ({ default: m.StatusPage })));

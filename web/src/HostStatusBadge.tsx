@@ -1,20 +1,20 @@
 // 改编自 project-aggregation 工作台 src/HostStatusBadge.tsx（提交 52337a9）：读取换成共用的 /api/host 订阅（每 3 秒，
 // 页面隐藏时暂停），详情里加本服务进程的内存与事件循环延迟，「查看详情」改为打开运行状态页。
-import { useRef } from 'react';
+import { useStatusDetails } from './use-status-details.ts';
 import { Server } from 'lucide-react';
 import { useLiveResource } from './use-live-resource.ts';
 import { HOST_PATH, HOST_REFRESH_MS, HOST_TIMEOUT_MS, formatBytes, formatUptime, hostLevel, hostWorst, pct, readHost, type HostView } from './host-status.ts';
 import { clock } from './labels.ts';
 
 export function HostStatusBadge({ onExpired }: { onExpired: () => void }) {
+  const details = useStatusDetails();
   const { data: status, status: readState } = useLiveResource<HostView>(HOST_PATH, { intervalMs: HOST_REFRESH_MS, timeoutMs: HOST_TIMEOUT_MS, read: readHost, onExpired });
-  const details = useRef<HTMLDetailsElement>(null);
   const failed = readState === 'error';
   const { cpu, memory, disk, worst } = hostWorst(status);
   const tone = failed && !status ? 'alert' : hostLevel(worst);
   const label = status ? `服务器负载：CPU ${pct(cpu)}，内存 ${pct(memory)}，磁盘 ${pct(disk)}${failed ? '，最近一次读取失败' : ''}` : failed ? '服务器负载：读取失败' : '服务器负载：读取中';
   const loop = status?.process.loopDelayMs;
-  return <details ref={details} className={`connection-status host-status ${tone}`}>
+  return <details name="shell-status" ref={details} className={`connection-status host-status ${tone}`}>
     <summary aria-label={label}>
       <Server size={15} aria-hidden="true" />
       {status ? <>

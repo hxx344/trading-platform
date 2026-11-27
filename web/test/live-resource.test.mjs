@@ -245,3 +245,22 @@ test('live-resource 与系统更新的后台读取条件串联：连续读不到
   for (let i = 0; i < 5; i++) { drive(); await fake.advance(2_000); }
   assert.equal(reads - resumed, 5);
 });
+
+test('例行轮询保留就绪状态，未完成的读取不延长上次快照的复用时间', async () => {
+  const { fake, store, snapshots, last } = setup();
+  let attempts = 0, complete;
+  const source = { intervalMs: 1000, retain: { fresh: () => true },
+    read: () => ++attempts === 1 ? Promise.resolve(1) : new Promise(resolve => { complete = resolve; }) };
+  const leave = store.subscribe('/a', source, value => snapshots.push(value));
+  await fake.settle();
+  const count = snapshots.length;
+  await fake.advance(1000);
+  assert.equal(attempts, 2);
+  assert.equal(snapshots.length, count);
+  assert.equal(last().status, 'ready');
+  leave();
+  complete(2);
+  store.subscribe('/a', source, value => snapshots.push(value));
+  assert.equal(last().status, 'loading');
+  assert.equal(last().data, null);
+});

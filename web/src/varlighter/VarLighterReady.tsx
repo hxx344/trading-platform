@@ -1,5 +1,5 @@
 // 实盘准备页签：上线前核对清单、全局参数与风控、自动配对的组合开关与手动配对、待确认规格的配对、各场所的采集状态。
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { CircleAlert, CircleCheck, CircleDashed, LoaderCircle, Plus, Save, Trash2 } from 'lucide-react';
 import { api } from '../api.ts';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
@@ -45,15 +45,25 @@ export function VarLighterReady({ view, onChanged, onExpired }: { view: StateVie
 
 function GlobalPanel({ view, onChanged }: { view: StateView; onChanged: () => Promise<void> }) {
   const current = view.settings.global;
-  const [form, setForm] = useState<GlobalForm>(() => globalForm(current));
-  const [revision, setRevision] = useState(view.settings.revision);
+  const [draft, setDraft] = useState<{ revision: number; fields: Partial<GlobalForm> } | null>(null);
+  const form = { ...globalForm(current), ...draft?.fields };
   const write = useWrite();
-  // 别处改了参数（版本号变了）时用新值重填。
-  useEffect(() => { if (view.settings.revision !== revision) { setForm(globalForm(view.settings.global)); setRevision(view.settings.revision); } }, [view.settings, revision]);
   const parsed = globalRequest(form);
-  const dirty = !parsed.ok || JSON.stringify(parsed.value) !== JSON.stringify(current);
-  const submit = (global: typeof current, done: string) => {
-    void write.run('global', () => api(`${VARLIGHTER_BASE}/settings`, { body: settingsBody(view.settings, { global }) }), () => { void onChanged(); return done; });
+  const dirty = !!draft && (!parsed.ok || GLOBAL_FIELDS.some(({ key }) => parsed.value[key] !== current[key]));
+  const changed = dirty && draft.revision !== view.settings.revision;
+  const updateField = (key: (typeof GLOBAL_FIELDS)[number]['key'], value: string) => {
+    setDraft(previous => {
+      const fields = { ...previous?.fields, [key]: value };
+      if (value === globalForm(current)[key]) delete fields[key];
+      return Object.keys(fields).length ? { revision: previous?.revision ?? view.settings.revision, fields } : null;
+    });
+  };
+  const submit = (global: typeof current, done: string, saving = false) => {
+    void write.run(saving ? 'save' : 'pause', async () => {
+      await api(`${VARLIGHTER_BASE}/settings`, { body: settingsBody(view.settings, { global }) });
+      await onChanged();
+      if (saving) setDraft(previous => previous === draft ? null : previous);
+    }, () => done);
   };
   return <section className="panel" aria-label="全局参数与风控">
     <div className="panel-heading"><h2>全局参数与风控</h2><span className="muted">版本 {view.settings.revision}</span></div>
@@ -64,11 +74,14 @@ function GlobalPanel({ view, onChanged }: { view: StateView; onChanged: () => Pr
     </div>
     <div className="vl-fields">
       {GLOBAL_FIELDS.map(field => <label className="vl-field" key={field.key}>{field.label}（{field.unit}）
-        <input inputMode="decimal" value={form[field.key]} onChange={event => setForm(value => ({ ...value, [field.key]: event.target.value }))} />
+        <input inputMode="decimal" value={form[field.key]} disabled={write.busy === 'save'} onChange={event => updateField(field.key, event.target.value)} />
         {field.hint ? <small>{field.hint}</small> : null}</label>)}
     </div>
+    {changed ? <Callout tone="warning" role="status">设置已更新到版本 {view.settings.revision}。保留了你改过的字段，其余使用最新值。
+      <button type="button" className="button secondary" disabled={write.busy === 'save'} onClick={() => setDraft(null)}>放弃草稿</button>
+    </Callout> : null}
     <div className="vl-actions">
-      <button type="button" className="button primary" disabled={!parsed.ok || !dirty || write.busy !== null} onClick={() => parsed.ok && submit({ ...parsed.value, paused: current.paused }, '全局参数已保存')}>{write.busy === 'global' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Save size={14} aria-hidden="true" />}保存</button>
+      <button type="button" className="button primary" disabled={!parsed.ok || !dirty || write.busy !== null} onClick={() => parsed.ok && submit({ ...parsed.value, paused: current.paused }, '全局参数已保存', true)}>{write.busy === 'save' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Save size={14} aria-hidden="true" />}保存</button>
       {!parsed.ok ? <Callout tone="warning" role="status">{parsed.error}</Callout> : null}
       {write.message ? <Callout tone={write.message.tone}>{write.message.text}</Callout> : null}
     </div>

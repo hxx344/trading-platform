@@ -373,7 +373,7 @@ export function tradeDetailLines(marker: SpreadTradeMarker, formatTime: (time: n
     byFill.get(effect.key)!.push(effect);
   }
   return [
-    `${type.symbol} ${marker.venueLabel ? `${marker.venueLabel} ` : ''}${type.label} · ${formatTime(event.time)} 北京时间`,
+    `${type.symbol} ${marker.venueLabel ? `${marker.venueLabel} ` : ''}${type.label} · ${formatTime(event.time)}`,
     `${event.fills.length} 笔成交 · 至 ${formatTime(event.end)}${event.stale ? ' · 保留旧数据' : ''}`,
     `${basis} ${spreadText(value, unit)}${event.spreadVenue ? ` · ${labels.get(event.spreadVenue.key)}` : ''}`,
     `${chartLabel} ${spreadText(chartSpread, unit)}（${chartNote}）`,
@@ -405,7 +405,7 @@ export function fillsStatusText(view: FillsView, formatTime: (time: string) => s
   const times = view.coverage.map(scope => scope.fetchedAt).filter((time): time is string => !!time).sort();
   // generatedAt is the response time, not the time a stale venue was successfully read.
   const through = times[0] ?? view.generatedAt;
-  return [state, through ? `截至 ${formatTime(through)} 北京时间` : null,
+  return [state, through ? `截至 ${formatTime(through)}` : null,
     view.retained ? '刷新失败，保留上次成功数据' : null,
     failed > denied ? `部分账户失败（${failed - denied} 个范围）` : null,
     denied ? FILLS_PERMISSION_TEXT : null,

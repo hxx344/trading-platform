@@ -13,8 +13,8 @@ import { FILLS_FOLLOW_UP_MS, FILLS_REFRESH_MS, FOLLOW_UP_IDLE, TRADE_TEXT, TRADE
 import type { FillMarket, HubFills } from '../../src/asset/fills-types.ts';
 
 export const FILLS_TIMEOUT_MS = 20_000;
-const beijingFormatter = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
-export const beijing = (time: number | string) => beijingFormatter.format(new Date(time));
+const utcFormatter = new Intl.DateTimeFormat('zh-CN', { timeZone: 'UTC', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+const utc = (time: number | string) => `${utcFormatter.format(new Date(time))} UTC`;
 const markerText = ({ value, unit }: SpreadTradeMarker) => spreadText(value, unit);
 
 /** Successful reads replace the snapshot; a failed read keeps the last one, marked retained. */
@@ -39,7 +39,7 @@ export function TradeMark({ cx, cy, marker, selected, onSelect }: { cx: number; 
   if (!Number.isFinite(cx) || !Number.isFinite(cy)) return <g />;
   const type = TRADE_TYPES[marker.event.type], select = () => onSelect(marker.event.key);
   return <g className="trade-marker" data-trade-type={marker.event.type} data-selected={selected || undefined} transform={`translate(${cx},${cy})`} tabIndex={0} role="button"
-    aria-label={`${marker.venueLabel ? `${marker.venueLabel} ` : ''}${type.label} · ${beijing(marker.event.time)} 北京时间 · ${marker.basis} ${markerText(marker)}，查看成交明细`}
+    aria-label={`${marker.venueLabel ? `${marker.venueLabel} ` : ''}${type.label} · ${utc(marker.event.time)} · ${marker.basis} ${markerText(marker)}，查看成交明细`}
     onClick={select} onMouseEnter={select} onFocus={select} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); select(); } }}>
     <circle r={12} fill="transparent" />
     <text textAnchor="middle" dy=".35em" aria-hidden="true">{type.symbol}</text>
@@ -57,18 +57,18 @@ export function TradePanel({ trades, markers, selected, onSelect, chartMarkers, 
   const eventButton = (marker: SpreadTradeMarker) => {
     const type = TRADE_TYPES[marker.event.type];
     return <button type="button" key={marker.event.key} className="trade-list-item" data-trade-type={marker.event.type} aria-pressed={selected?.event.key === marker.event.key} onClick={() => onSelect(marker.event.key)}>
-      {`${type.symbol} ${beijing(marker.event.time)} · ${marker.venueLabel ? `${marker.venueLabel} ` : ''}${type.label} · ${marker.event.fills.length} 笔 · ${marker.basis} ${markerText(marker)}`}
+      {`${type.symbol} ${utc(marker.event.time)} · ${marker.venueLabel ? `${marker.venueLabel} ` : ''}${type.label} · ${marker.event.fills.length} 笔 · ${marker.basis} ${markerText(marker)}`}
     </button>;
   };
   if (trades.status === 'missing') return <section className="trade-panel" aria-labelledby={titleId}><h3 id={titleId}>套利成交</h3><p className="trade-status" role="status">本服务没有配置资产账本，成交标记不显示。</p></section>;
   return <section className="trade-panel" aria-labelledby={titleId}>
     <h3 id={titleId}>套利成交</h3>
-    <p className="trade-status" role="status">{fillsStatusText(trades, beijing)}</p>
+    <p className="trade-status" role="status">{fillsStatusText(trades, utc)}</p>
     <p className="trade-legend">{(Object.keys(TRADE_TYPES) as TradeType[]).map(key => <span key={key} data-trade-type={key}>{TRADE_TYPES[key].symbol} {key === 'trade' ? '成交（开平未知）' : TRADE_TYPES[key].label}</span>)}<span className="trade-legend-note">{chartMarkers ? '颜色只区分类型，不表示盈亏' : `切换到${spreadTabs}可在图上查看标记`}</span></p>
     <div className="trade-summary-list" aria-label="当前区间套利成交">
       {!markers.length && <p>{trades.status === 'ok' && !trades.pending && !trades.incomplete ? '当前图表区间暂无套利成交' : '当前图表区间暂无可展示成交'}</p>}
       {rows.map(({ summary, marker }) => summary ? <details className="trade-summary" data-trade-type={summary.type} key={summary.key}>
-        <summary><strong>{TRADE_TYPES[summary.type].symbol} {TRADE_TYPES[summary.type].label}汇总</strong><span>{summary.fillCount} 笔 · {summary.groups.length === 1 ? `加权成交${text.metricName} ${summarySpread(summary.groups[0]!)}` : `${summary.groups.length} 组账户 / 方向`}</span><span className="trade-summary-range">{beijing(summary.start)} — {beijing(summary.end)}</span></summary>
+        <summary><strong>{TRADE_TYPES[summary.type].symbol} {TRADE_TYPES[summary.type].label}汇总</strong><span>{summary.fillCount} 笔 · {summary.groups.length === 1 ? `加权成交${text.metricName} ${summarySpread(summary.groups[0]!)}` : `${summary.groups.length} 组账户 / 方向`}</span><span className="trade-summary-range">{utc(summary.start)} — {utc(summary.end)}</span></summary>
         <div className="trade-summary-totals">{summary.groups.map((group, index) => <div className="trade-summary-venue" key={group.key}>
           <strong>{summary.groups.length > 1 ? `${index + 1}. ` : ''}{group.source} · {group.exchange} · {group.account} · {group.scope} · {group.direction}{group.stale ? ' · 保留旧数据' : ''}</strong>
           <p>加权成交{text.metricName} {summarySpread(group)}{group.spread === null ? '（缺少唯一配对的双腿）' : ''}</p>
@@ -78,6 +78,6 @@ export function TradePanel({ trades, markers, selected, onSelect, chartMarkers, 
       </details> : marker && eventButton(marker))}
       {summaries.length > 0 && <p className="trade-summary-note">按北京时间同日、持仓连续的同向分批成交汇总 · 均价按数量加权</p>}
     </div>
-    {selected && <div className="trade-details" tabIndex={0} aria-label="套利成交明细">{tradeDetailLines(selected, beijing, text).join('\n')}</div>}
+    {selected && <div className="trade-details" tabIndex={0} aria-label="套利成交明细">{tradeDetailLines(selected, utc, text).join('\n')}</div>}
   </section>;
 }

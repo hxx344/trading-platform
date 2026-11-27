@@ -49,7 +49,7 @@ export function usePerpetualFeed(onExpired: () => void, paused = false) {
       // Source time still ages between display updates; old quotes must expire on time.
       const updateClock = () => setNow(sourceClock.read());
       updateClock();
-      clock = setInterval(updateClock, backgroundDelay(1_000));
+      clock = setInterval(updateClock, backgroundDelay(5_000));
       // Inspection stops network work, but source time must still age so a
       // retained quote cannot stay "fresh" indefinitely while the user reads it.
       if (paused) { controls.current?.stop(); controls.current = null; publisher.reset(); setConnection('paused'); return; }

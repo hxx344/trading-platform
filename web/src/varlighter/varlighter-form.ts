@@ -271,10 +271,14 @@ export function backtestBody(symbol: string, hours: number, form: SymbolForm, gl
 export interface ChartRow { time: number; mid: number | null; sellA: number | null; buyA: number | null; median: number | null; upper: number | null; lower: number | null }
 /** 走势图的行：入场线是基线中位数 ± 入场偏离，卖 A 价差越过上线或买 A 价差跌破下线即达到开仓条件。 */
 export function chartRows(points: readonly SymbolPoint[], entryBps: number): ChartRow[] {
-  return points.map(point => ({
-    time: point.t, mid: point.mid, sellA: point.sellA, buyA: point.buyA, median: point.median,
-    upper: point.median === null ? null : point.median + entryBps, lower: point.median === null ? null : point.median - entryBps,
-  }));
+  const rows: ChartRow[] = [];
+  for (const point of points) {
+    const previous = rows.at(-1);
+    if (point.gapBefore && previous) rows.push({ time: (previous.time + point.t) / 2, mid: null, sellA: null, buyA: null, median: null, upper: null, lower: null });
+    rows.push({ time: point.t, mid: point.mid, sellA: point.sellA, buyA: point.buyA, median: point.median,
+      upper: point.median === null ? null : point.median + entryBps, lower: point.median === null ? null : point.median - entryBps });
+  }
+  return rows;
 }
 /** 纵轴范围取所有可见序列的 1–99 分位，避免单个跳点把曲线压扁。 */
 export function chartRange(rows: readonly ChartRow[]): [number, number] | null {

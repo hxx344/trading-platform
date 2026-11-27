@@ -50,37 +50,38 @@ const SPREAD_LAYERS: PlotLayer[] = [
   { kind: 'line', key: 'lower', color: 'var(--text-tertiary)', width: 1, dash: '3 3' },
   { kind: 'line', key: 'median', color: 'var(--text-secondary)', width: 1.25, dash: '6 4' },
   { kind: 'line', key: 'sellA', color: 'var(--emerald)', width: 1, opacity: 0.75 },
-  { kind: 'line', key: 'buyA', color: 'var(--error)', width: 1, opacity: 0.75 },
+  { kind: 'line', key: 'buyA', color: 'var(--error)', width: 1, dash: '4 2', opacity: 0.75 },
   { kind: 'line', key: 'mid', color: 'var(--accent)', width: 1.75, active: true },
 ];
 
 /** 价差走势：中间价基差、两个方向的可成交价差、基线中位数与入场带；开平仓画在可成交价差上。 */
 export function SpreadChart({ rows, trades, from, to, label, aName = 'A' }: { rows: readonly ChartRow[]; trades: readonly ClosedTrade[]; from: number; to: number; label: string; /** A 腿场所的简称 */ aName?: string }) {
   const range = useMemo(() => chartRange(rows), [rows]);
+  const samples = useMemo(() => rows.filter(row => row.mid !== null), [rows]);
   const axis = useMemo(() => range ? niceAxis(range[0], range[1]) : null, [range]);
   const tick = useMemo(() => timeTick(to - from), [from, to]);
   if (!axis) return null;
   const domain = axis.domain;
   const inside = trades.filter(trade => trade.closedAt >= from && trade.openedAt <= to);
-  return <SvgPlot rows={rows} xDomain={[from, to]} yDomain={domain} yTicks={axis.ticks} yTick={value => bps(value, 0)} xTick={tick}
+  return <SvgPlot rows={rows} hoverRows={samples} xDomain={[from, to]} yDomain={domain} yTicks={axis.ticks} yTick={value => bps(value, 0)} xTick={tick}
     layers={SPREAD_LAYERS} margin={MARGIN} height={320} label={label}
     tooltip={row => { const item = row as ChartRow; return <div className="vl-tip"><b>{stampText(item.time)}</b>
       <span>中间价基差</span><span>{bps(item.mid)}</span><span>卖 {aName} 价差</span><span>{bps(item.sellA)}</span><span>买 {aName} 价差</span><span>{bps(item.buyA)}</span>
       <span>基线中位数</span><span>{bps(item.median)}</span><span>入场上 / 下线</span><span>{bps(item.upper)} / {bps(item.lower)}</span></div>; }}
     overlay={scales => <g aria-hidden="true">{inside.map(trade => <g key={trade.id}>
-      {trade.openedAt >= from ? <circle className="vl-marker-open" cx={scales.x(trade.openedAt)} cy={scales.y(clamp(trade.entrySpread, domain))} r={4} /> : null}
-      <circle className="vl-marker-close" cx={scales.x(trade.closedAt)} cy={scales.y(clamp(trade.exitSpread, domain))} r={3.5} />
+      {trade.openedAt >= from ? <circle className="vl-marker-open" data-outside={clamp(trade.entrySpread, domain) !== trade.entrySpread || undefined} cx={scales.x(trade.openedAt)} cy={scales.y(clamp(trade.entrySpread, domain))} r={4} /> : null}
+      <circle className="vl-marker-close" data-outside={clamp(trade.exitSpread, domain) !== trade.exitSpread || undefined} cx={scales.x(trade.closedAt)} cy={scales.y(clamp(trade.exitSpread, domain))} r={3.5} />
     </g>)}</g>} />;
 }
 export function SpreadLegend({ aName = 'A' }: { aName?: string }) {
   return <div className="vl-legend">
     <span><i className="mid" />中间价基差</span><span><i className="sell" />卖 {aName} 可成交价差</span><span><i className="buy" />买 {aName} 可成交价差</span>
-    <span><i className="median" />基线中位数</span><span><i className="band" />入场带（中位数 ± 入场偏离）</span><span><i className="open" />开仓</span><span><i className="close" />平仓</span>
+    <span><i className="median" />基线中位数</span><span><i className="band" />入场带（中位数 ± 入场偏离）</span><span><i className="open" />开仓</span><span><i className="close" />平仓</span><span>边框虚线圈表示成交价差超出纵轴</span>
   </div>;
 }
 
-const EQUITY_LAYERS: PlotLayer[] = [{ kind: 'area', key: 'net', lower: 0, fill: 'var(--accent)', opacity: 0.1 }, { kind: 'line', key: 'net', color: 'var(--accent)', width: 1.75, active: true }];
-/** 累计净盈亏（每笔平仓后的值，阶梯以折线近似）。 */
+const EQUITY_LAYERS: PlotLayer[] = [{ kind: 'line', key: 'net', color: 'var(--accent)', width: 1.75, active: true, step: true }];
+/** 累计净盈亏（每笔平仓后的值，按平仓时刻跳变）。 */
 export function EquityChart({ points, label }: { points: readonly { t: number; net: number }[]; label: string }) {
   const rows = useMemo(() => points.map(point => ({ time: point.t, net: point.net })), [points]);
   if (rows.length < 2) return null;

@@ -83,13 +83,14 @@ a.vl-symbol:hover{color:var(--accent)}
 .vl-legend i{display:inline-block;width:14px;height:0;border-top:2px solid var(--text-tertiary)}
 .vl-legend i.mid{border-color:var(--accent)}
 .vl-legend i.sell{border-color:var(--emerald)}
-.vl-legend i.buy{border-color:var(--error)}
+.vl-legend i.buy{border-color:var(--error);border-top-style:dashed}
 .vl-legend i.median{border-top-style:dashed;border-color:var(--text-secondary)}
 .vl-legend i.band{height:8px;border:0;background:var(--accent-subtle)}
 .vl-legend i.open{width:8px;height:8px;border:2px solid var(--warning);border-radius:var(--radius-circle)}
 .vl-legend i.close{width:8px;height:8px;border:0;border-radius:var(--radius-circle);background:var(--warning)}
 .vl-marker-open{fill:none;stroke:var(--warning);stroke-width:2}
 .vl-marker-close{fill:var(--warning)}
+.vl-marker-open[data-outside],.vl-marker-close[data-outside]{fill:var(--surface-2);stroke:var(--warning);stroke-width:2;stroke-dasharray:2 2}
 .vl-tip{display:grid;grid-template-columns:auto auto;gap:2px 12px;font-size:.6875rem;color:var(--text-secondary);font-variant-numeric:tabular-nums}
 .vl-tip b{grid-column:1/-1;color:var(--text-primary);font-weight:600}
 .vl-tip span:nth-child(odd){color:var(--text-tertiary)}

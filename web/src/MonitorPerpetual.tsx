@@ -1,5 +1,5 @@
 import { Activity, Bell, Star, ChevronDown, ChevronLeft, ChevronRight, RefreshCw, Search, SlidersHorizontal, X } from 'lucide-react';
-import { Fragment, lazy, Suspense, useDeferredValue, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { Fragment, lazy, Suspense, useDeferredValue, useEffect, useMemo, useState, useSyncExternalStore, type ReactNode } from 'react';
 // perpetual.css first: the detail components' own styles load after it, as in the workbench (they are lazy chunks there).
 import './perpetual.css';
 import { usePerpetualFeed } from './use-perpetual-feed.ts';
@@ -60,7 +60,20 @@ const clockFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai'
 const delistingFormat = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 const stamp = (value: number | null | undefined) => value && Number.isFinite(value) ? clockFormat.format(value) : '—';
 const percent = (value: number | null, digits = 3) => value === null || !Number.isFinite(value) ? '—' : `${value > 0 ? '+' : value < 0 ? '−' : ''}${Math.abs(value).toFixed(digits)}%`;
-const age = (time: number, now: number) => `${Math.max(0, Math.floor((now - time) / 1000))} 秒前`;
+const ageListeners = new Set<() => void>();
+let ageTimer: ReturnType<typeof setInterval> | undefined;
+function subscribeAge(listener: () => void) {
+  ageListeners.add(listener);
+  ageTimer ??= setInterval(() => { if (!document.hidden) ageListeners.forEach(update => update()); }, 1000);
+  return () => {
+    ageListeners.delete(listener);
+    if (!ageListeners.size) { clearInterval(ageTimer); ageTimer = undefined; }
+  };
+}
+function QuoteAge({ at, readNow }: { at: number; readNow: () => number }) {
+  const seconds = useSyncExternalStore(subscribeAge, () => Math.max(0, Math.floor((readNow() - at) / 1000)));
+  return <>{seconds} 秒前</>;
+}
 const delistingDue = (quote: PerpetualQuote, now: number) => typeof quote.delistingAt === "number" && quote.delistingAt > 0 && quote.delistingAt <= now;
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
 const priceFormats = [2, 4, 6, 12].map(maximumFractionDigits => new Intl.NumberFormat('en-US', { maximumFractionDigits }));
@@ -619,7 +632,7 @@ export function PerpetualPanel({ onExpired, crossExAvailable }: { onExpired: () 
           history24h: <ScannerHistory long={fundingHistoryReport?.legs[historyPair.longKey]} short={fundingHistoryReport?.legs[historyPair.shortKey]} total={scannerRequirements.historyHours.includes(24) ? scannerDataHistoryForPair(scannerData, historyPair, 24) ?? null : undefined} now={now}/>,
           history7d: <ScannerHistory long={fundingHistoryReport?.legs[historyPair.longKey]} short={fundingHistoryReport?.legs[historyPair.shortKey]} total={scannerRequirements.historyHours.includes(168) ? scannerDataHistoryForPair(scannerData, historyPair, 168) ?? null : undefined} now={now} hours={168}/>,
           history30d: <ScannerHistory long={fundingHistoryReport?.legs[historyPair.longKey]} short={fundingHistoryReport?.legs[historyPair.shortKey]} total={scannerRequirements.historyHours.includes(720) ? scannerDataHistoryForPair(scannerData, historyPair, 720) ?? null : undefined} now={now} hours={720}/>,
-          time: <div className="scanner-time"><time dateTime={new Date(row.updatedAt).toISOString()}>{stamp(row.updatedAt)}</time><small>{age(row.updatedAt, now)}{paused ? now - row.updatedAt > (data?.staleAfterMs ?? 30_000) ? " · 已过期" : " · 已暂停" : ""}</small></div>,
+          time: <div className="scanner-time"><time dateTime={new Date(row.updatedAt).toISOString()}>{stamp(row.updatedAt)}</time><small><QuoteAge at={row.updatedAt} readNow={readNow}/>{paused ? now - row.updatedAt > (data?.staleAfterMs ?? 30_000) ? " · 已过期" : " · 已暂停" : ""}</small></div>,
           quality: <QualityCell quality={quality} pairLabel={pairLabel} onInspect={() => inspect(row, false, "quality")}/>,
         };
         return <Fragment key={rowKey}><tr className={`${isExpanded ? "perp-row-expanded " : ""}${rowGroup?.child ? "scanner-group-child " : ""}scanner-chart-row`} onClick={event => { const target = event.target as HTMLElement; if (event.currentTarget.contains(target) && !target.closest('button, a, input, select, summary, [data-crossex-import]')) openChart(row); }}>

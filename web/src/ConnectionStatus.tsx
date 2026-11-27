@@ -1,5 +1,6 @@
 // 改编自 project-aggregation 工作台 src/ConnectionStatus.tsx（提交 52337a9）：往返耗时取自共用的 /api/host 读取（每 3 秒，
 // 页面隐藏时暂停），详情里加交易服务自己的连线（行情服务、控制面、ASTER 用户推送、永续行情、副服务器心跳）。
+import { useStatusDetails } from './use-status-details.ts';
 import { Activity } from 'lucide-react';
 import { useLiveResource } from './use-live-resource.ts';
 import { HOST_PATH, HOST_REFRESH_MS, HOST_TIMEOUT_MS, QUALITY_LABELS, connectionQuality, readHost, servicesTone, type HostView } from './host-status.ts';
@@ -8,13 +9,14 @@ import { clock } from './labels.ts';
 const STATE_CLASS = { ok: 'connection-good', warn: 'connection-slow', down: 'connection-unreachable', unknown: '' } as const;
 
 export function ConnectionStatus({ onExpired }: { onExpired: () => void }) {
+  const details = useStatusDetails();
   const { data, status, receivedAt } = useLiveResource<HostView>(HOST_PATH, { intervalMs: HOST_REFRESH_MS, timeoutMs: HOST_TIMEOUT_MS, read: readHost, onExpired });
   const quality = connectionQuality(status, data?.latencyMs ?? null);
   const links = data?.connections ?? [];
   const tone = servicesTone(links);
   const label = QUALITY_LABELS[quality];
   const linkSummary = tone === 'alert' ? '，有连线断开' : tone === 'warn' ? '，有连线异常' : '';
-  return <details className={`connection-status connection-${quality}${tone ? ` links-${tone}` : ''}`}>
+  return <details name="shell-status" ref={details} className={`connection-status connection-${quality}${tone ? ` links-${tone}` : ''}`}>
     <summary aria-label={`本机到服务器：${label}${data && quality !== 'unreachable' ? `，${data.latencyMs} 毫秒` : ''}${linkSummary}`}>
       <Activity size={15} aria-hidden="true" /><span className="connection-label">本机 → 服务器</span>
       <span role="status">{label}</span>{data && quality !== 'unreachable' && quality !== 'offline' ? <span className="connection-latency">{data.latencyMs} ms</span> : null}

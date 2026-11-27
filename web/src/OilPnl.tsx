@@ -3,7 +3,9 @@
 // legs and ledger coverage, and the range's ledger rows, read every 30 s through useLiveResource. Switching the range or
 // page keeps the last answer on screen, marked, until the new one arrives.
 import { CircleAlert } from 'lucide-react';
-import { memo, useEffect, useId, useRef, useState } from 'react';
+import { memo, useEffect, useId, useMemo, useState, useSyncExternalStore } from 'react';
+import { SvgPlot, createHoverStore, nearestTimeIndex, type PlotLayer } from './svg-plot.tsx';
+import { niceAxis } from './svg-plot-geometry.ts';
 import { formatNumber } from './number-format.ts';
 import type { OilPnlAccount, OilPnlPoint, OilPnlUnavailable, OilPnlView } from './oil-types.ts';
 import { StatePanel } from './StateViews.tsx';
@@ -25,62 +27,52 @@ const amount = (value: string | null | undefined, signed = false) => {
 };
 const series = [{ key: 'totalPnl', label: '总盈亏', color: 'var(--accent)' }, { key: 'unrealizedPnl', label: '持仓浮盈亏', color: 'var(--text-secondary)' }] as const;
 
-/** Copied from the workbench TradingPnlChart.tsx (a12e583): two lines, a hover or slider picks a sample, gaps break the lines. */
+const pnlLayers: PlotLayer[] = [
+  { kind: 'line', key: 'unrealizedPnl', color: 'var(--text-secondary)', width: 1.6, dash: '5 4', active: true },
+  { kind: 'line', key: 'totalPnl', color: 'var(--accent)', width: 2.5, active: true },
+];
+const pnlMargin = { top: 14, right: 62, bottom: 32 };
+const day = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit' });
+const hour = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false });
+
 const PnlChart = memo(function PnlChart({ pnl }: { pnl: OilPnlView }) {
-  const container = useRef<HTMLDivElement>(null), descriptionId = useId();
-  const [width, setWidth] = useState(640), [selectedTime, setSelectedTime] = useState<number | null>(null);
-  useEffect(() => {
-    if (!container.current) return;
-    const observer = new ResizeObserver(entries => setWidth(Math.max(240, entries[0]!.contentRect.width)));
-    observer.observe(container.current); return () => observer.disconnect();
-  }, []);
+  const descriptionId = useId();
+  const [hover] = useState(createHoverStore);
+  const selectedTime = useSyncExternalStore(hover.subscribe, hover.get);
   const points = pnl.points;
-  const found = selectedTime === null ? -1 : points.findIndex(point => point.time >= selectedTime);
-  const selectedIndex = found < 0 ? points.length - 1 : found;
-  const selected = points[selectedIndex];
-  const values = points.flatMap(point => series.map(({ key }) => point[key])).filter((value): value is string => value !== null).map(Number).filter(Number.isFinite);
-  const min = Math.min(0, ...values), max = Math.max(0, ...values), extent = max - min || 1;
-  const low = min - extent * .1, high = max + extent * .1;
-  const left = 63, right = 18, top = 14, bottom = 210, height = 246;
-  const from = points[0]?.time ?? 0, to = Math.max(from + 60_000, points.at(-1)?.time ?? from);
-  const x = (value: number) => left + (value - from) / (to - from) * (width - left - right);
-  const y = (value: number) => bottom - (value - low) / (high - low) * (bottom - top);
-  function line(key: 'totalPnl' | 'unrealizedPnl') {
-    let drawing = false;
-    return points.map(point => {
-      const value = point[key] === null ? NaN : Number(point[key]);
-      if (!Number.isFinite(value)) { drawing = false; return ''; }
-      const command = `${drawing ? 'L' : 'M'}${x(point.time).toFixed(2)},${y(value).toFixed(2)}`;
-      drawing = true; return command;
-    }).join(' ');
-  }
+  const rows = useMemo(() => points.map(point => ({
+    time: point.time, point, totalPnl: point.totalPnl === null ? null : Number(point.totalPnl),
+    unrealizedPnl: point.unrealizedPnl === null ? null : Number(point.unrealizedPnl),
+  })), [points]);
+  const samples = useMemo(() => rows.filter(row => row.totalPnl !== null || row.unrealizedPnl !== null), [rows]);
+  const axis = useMemo(() => {
+    let low = 0, high = 0;
+    for (const row of samples) for (const { key } of series) {
+      const value = row[key];
+      if (value !== null) { low = Math.min(low, value); high = Math.max(high, value); }
+    }
+    return niceAxis(low, high);
+  }, [samples]);
+  const selectedIndex = selectedTime === null ? samples.length - 1 : nearestTimeIndex(samples, selectedTime);
+  const selected = samples[selectedIndex]?.point;
+  const from = points[0]?.time ?? 0, to = points.at(-1)?.time ?? from;
   const detail = (point: OilPnlPoint | null | undefined) => <><span>总盈亏 <b>{exact(point?.totalPnl)}</b></span><span>持仓浮盈亏 <b>{exact(point?.unrealizedPnl)}</b></span><span>区间平仓盈亏 <b>{exact(point?.realizedPnl)}</b></span><span>区间手续费 <b>{exact(point?.feePnl)}</b></span><span>区间累计资金费 <b>{exact(point?.fundingPnl)}</b></span></>;
   // Ledgers sync every five minutes, so the newest sample usually lacks a total: show a complete one at most 15 minutes older, with its own time.
   const latest = pnl.latest, recent = latest && latest.totalPnl === null && latest.unrealizedPnl !== null ? [...points].reverse().find(point => point.totalPnl !== null) : undefined;
   const settled = recent && latest && latest.time - recent.time <= SETTLED_WINDOW ? recent : undefined;
   const headline = settled ?? latest;
   return <figure className="trading-pnl-chart">
-    <figcaption className="trading-pnl-legend">{series.map(item => <span key={item.key}><i style={{ background: item.color }} />{item.label}</span>)}<span>USDT · 北京时间</span></figcaption>
+    <figcaption className="trading-pnl-legend">{series.map(item => <span key={item.key}><i data-series={item.key} />{item.label}</span>)}<span>USDT · 北京时间</span></figcaption>
     <p id={descriptionId} className="trading-caption">后台约每分钟记录一次。缺失或过期时断线；账单未同步到该时刻时仅显示浮盈亏。长区间保留峰谷，缺失区段不连线。</p>
     <div className="trading-pnl-latest">{detail(headline)}</div>
     {settled ? <p className="trading-caption">账单同步中，以上为 {time.format(settled.time)} 的完整数据（北京时间）；最新浮盈亏 {exact(latest?.unrealizedPnl)}。</p> : null}
-    <div className="trading-pnl-plot" ref={container}>
-      {values.length ? <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`} role="img" aria-label="原油总盈亏与持仓浮盈亏曲线" aria-describedby={descriptionId}
-        onPointerMove={event => {
-          const bounds = event.currentTarget.getBoundingClientRect();
-          const at = from + ((event.clientX - bounds.left) * width / bounds.width - left) / (width - left - right) * (to - from);
-          let lo = 0, hi = points.length - 1;
-          while (lo < hi) { const mid = (lo + hi) >> 1; if (points[mid]!.time < at) lo = mid + 1; else hi = mid; }
-          const index = lo > 0 && Math.abs(points[lo - 1]!.time - at) < Math.abs(points[lo]!.time - at) ? lo - 1 : lo;
-          setSelectedTime(points[index]!.time);
-        }}>
-        {[min, (min + max) / 2, max].filter((value, index, all) => all.indexOf(value) === index).map(value => <g key={value}><line x1={left} x2={width - right} y1={y(value)} y2={y(value)} stroke={value === 0 ? 'var(--text-tertiary)' : 'var(--surface-5)'} strokeDasharray={value === 0 ? undefined : '3 4'} /><text x={left - 8} y={y(value) + 4} textAnchor="end" fill="var(--text-secondary)" fontSize="11">{compact.format(value)}</text></g>)}
-        {series.slice().reverse().map(item => <g key={item.key}><path data-series={item.key} d={line(item.key)} fill="none" stroke={item.color} strokeWidth={item.key === 'totalPnl' ? 2.5 : 1.6} strokeDasharray={item.key === 'totalPnl' ? undefined : '5 4'} />{points.map((point, index) => point[item.key] !== null && (points[index - 1]?.[item.key] == null && points[index + 1]?.[item.key] == null) ? <circle key={point.time} cx={x(point.time)} cy={y(Number(point[item.key]))} r="3.5" fill={item.color} /> : null)}</g>)}
-        {[from, to].map((value, index) => <text key={value} x={index ? width - right : left} y={height - 8} textAnchor={index ? 'end' : 'start'} fill="var(--text-secondary)" fontSize="11">{time.format(value)}</text>)}
-        {selected ? <line x1={x(selected.time)} x2={x(selected.time)} y1={top} y2={bottom} stroke="var(--text-tertiary)" strokeDasharray="3 4" /> : null}
-      </svg> : <div className="trading-chart-empty">所有执行账户都读到持仓后开始记录，历史浮盈亏无法回补。</div>}
+    <div className="trading-pnl-plot" aria-describedby={descriptionId}>
+      {samples.length ? <SvgPlot rows={rows} hoverRows={samples} xDomain={[from, to]} yDomain={axis.domain} yTicks={axis.ticks}
+        yTick={value => compact.format(value)} xTick={value => (to - from <= 86_400_000 ? hour : day).format(value)}
+        layers={pnlLayers} margin={pnlMargin} height={246} hover={hover} label="原油总盈亏与持仓浮盈亏曲线"
+        tooltip={row => { const { point } = row as (typeof rows)[number]; return <><strong>{time.format(point.time)} 北京时间</strong><div>总盈亏 {exact(point.totalPnl)} USDT</div><div>持仓浮盈亏 {exact(point.unrealizedPnl)} USDT</div></>; }}/> : <div className="trading-chart-empty">所有执行账户都读到持仓后开始记录，历史浮盈亏无法回补。</div>}
     </div>
-    {points.length ? <div className="trading-pnl-inspect"><label htmlFor={descriptionId + '-point'}>查看采样时刻 <strong>{selected ? time.format(selected.time) : '—'}</strong>（北京时间）</label><input id={descriptionId + '-point'} type="range" min="0" max={points.length - 1} value={selectedIndex} aria-label="选择盈亏采样时刻" aria-valuetext={selected ? `${time.format(selected.time)}，总盈亏 ${exact(selected.totalPnl)} USDT` : undefined} onChange={event => setSelectedTime(points[Number(event.target.value)]!.time)} /><div>{detail(selected)}<span>USDT</span></div></div> : null}
+    {samples.length ? <div className="trading-pnl-inspect"><label htmlFor={descriptionId + '-point'}>查看采样时刻 <strong>{selected ? time.format(selected.time) : '—'}</strong>（北京时间）</label><input id={descriptionId + '-point'} type="range" min="0" max={samples.length - 1} value={selectedIndex} aria-label="选择盈亏采样时刻" aria-valuetext={selected ? `${time.format(selected.time)}，总盈亏 ${exact(selected.totalPnl)} USDT` : undefined} onChange={event => hover.set(samples[Number(event.target.value)]!.time)} /><div>{detail(selected)}<span>USDT</span></div></div> : null}
     <p className="trading-footnote">{pnl.recordingStartedAt ? `当前可用记录起点：${time.format(pnl.recordingStartedAt)}（北京时间）。` : '等待持仓采样。'}{pnl.pointCount === 1 ? '已取得首个采样点，后续将逐步形成曲线。' : ''}{pnl.latest ? ` 最新采样：${time.format(pnl.latest.time)}。` : ''}</p>
   </figure>;
 });

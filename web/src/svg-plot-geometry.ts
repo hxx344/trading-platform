@@ -1,4 +1,4 @@
-// 复制自 project-aggregation 工作台 modules/monitor/lib/svg-plot.ts（提交 8bc3bee），未改动。
+// 复制自 project-aggregation 工作台 modules/monitor/lib/svg-plot.ts（提交 8bc3bee），增加阶梯线。
 /** Geometry helpers for the lightweight hand-drawn SVG charts. */
 
 const finite = (value: unknown): number | null => typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -36,13 +36,14 @@ type Scale = (value: number) => number;
 const point = (x: number, y: number) => `${x.toFixed(1)},${y.toFixed(1)}`;
 
 /** Missing values start a new subpath; an isolated value still draws a zero-length round segment. */
-export function linePath(rows: readonly ({ time: number })[], key: string, x: Scale, y: Scale) {
+export function linePath(rows: readonly ({ time: number })[], key: string, x: Scale, y: Scale, step = false) {
   let path = "", connected = false;
   for (const row of rows) {
     const value = plotValue(row, key);
     if (value === null) { connected = false; continue; }
     const at = point(x(row.time), y(value));
-    path += connected ? `L${at}` : `M${at}L${at}`;
+    if (!connected) path += `M${at}L${at}`;
+    else path += step ? `H${x(row.time).toFixed(1)}V${y(value).toFixed(1)}` : `L${at}`;
     connected = true;
   }
   return path;

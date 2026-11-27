@@ -172,7 +172,14 @@ table.data.log-table td.log-text{white-space:pre-wrap;word-break:break-word;font
 .svg-plot-surface{display:block;overflow:visible;touch-action:pan-y;outline:none}
 .svg-plot-surface:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .svg-plot-tick{fill:var(--text-tertiary);font-size:11px}
-.svg-plot-tooltip{position:absolute;top:4px;z-index:2;padding:8px 10px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);background:var(--surface-3);box-shadow:var(--shadow-md);pointer-events:none}
+@media(max-width:650px){.wb-heading{flex-direction:column}}
+.monitor-desk .indicator-check[data-indicator="sma"]{color:var(--warning)}
+.monitor-desk .indicator-check[data-indicator="bands"]{color:var(--chart-5)}
+.monitor-desk .indicator-check[data-indicator="zscore"]{color:var(--chart-2)}
+.monitor-desk .indicator-toggle.selected .indicator-check{border-color:currentColor}
+.trading-pnl-legend i[data-series="totalPnl"]{background:var(--accent)}
+.trading-pnl-legend i[data-series="unrealizedPnl"]{background:var(--text-secondary)}
+.svg-plot-tooltip{max-width:calc(100% - 8px);overflow-wrap:anywhere;position:absolute;top:4px;z-index:2;padding:8px 10px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);background:var(--surface-3);box-shadow:var(--shadow-md);pointer-events:none}
 table.data.history{min-width:0}
 /* 原油、海力士与设置页共用的字段网格，来自 trading.css 同一工作台版本。 */
 .execution-review-settings{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:0;padding:14px 0;border-block:1px solid var(--execution-border)}

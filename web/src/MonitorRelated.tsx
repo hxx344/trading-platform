@@ -29,10 +29,10 @@ const pairFoot: Record<FillMarket, string> = {
 
 const ANT_TOTALS_NOTE = '这里按交易所逐腿列出 ANT 持仓及盈亏。';
 
-const beijing = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-const beijingDate = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
-const clock = (value: string | null) => value && Number.isFinite(Date.parse(value)) ? beijing.format(new Date(value)) : '—';
-const dateClock = (value: string | null) => value && Number.isFinite(Date.parse(value)) ? beijingDate.format(new Date(value)) : '—';
+const utc = new Intl.DateTimeFormat('zh-CN', { timeZone: 'UTC', hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const utcDate = new Intl.DateTimeFormat('zh-CN', { timeZone: 'UTC', hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+const clock = (value: string | null) => value && Number.isFinite(Date.parse(value)) ? `${utc.format(new Date(value))} UTC` : '—';
+const dateClock = (value: string | null) => value && Number.isFinite(Date.parse(value)) ? `${utcDate.format(new Date(value))} UTC` : '—';
 const finite = (value: string | null) => { if (value === null || value.trim() === '') return null; const number = Number(value); return Number.isFinite(number) ? number : null; };
 const tone = (value: number | null) => value === null || value === 0 ? '' : value > 0 ? 'positive' : 'negative';
 const sign = (value: number) => value > 0 ? '+' : value < 0 ? '−' : '';
@@ -121,7 +121,7 @@ function PairDetail({ pair, market }: { pair: Extract<SpreadPair, { status: 'pai
 
 function PositionRows({ items }: { items: RelatedItem[] }) {
   return <ul className="related-positions-list">{items.map(item => <li key={item.key} data-stale={item.stale}>
-    <div className="related-position-head"><span className="related-position-source">{item.source} · {item.exchange}</span>{item.stale ? <span className="detail-stale-tag" title={item.updatedAt ? `数据时间 ${clock(item.updatedAt)} 北京时间` : '数据时间未知'}>旧</span> : null}</div>
+    <div className="related-position-head"><span className="related-position-source">{item.source} · {item.exchange}</span>{item.stale ? <span className="detail-stale-tag" title={item.updatedAt ? `数据时间 ${clock(item.updatedAt)}` : '数据时间未知'}>旧</span> : null}</div>
     <div className="related-position-main"><strong>{item.symbol}</strong><span className={item.side === 'long' ? 'positive' : 'negative'}>{item.side === 'long' ? '多' : '空'}</span><span>{item.quantity} {item.quantityUnit}</span></div>
     <dl><MoneyCell label="未实现盈亏" value={finite(item.unrealizedPnl)} currency={item.pnlCurrency} /><div><dt>入场价</dt><dd>{priceText(item.entryPrice)}</dd></div></dl>
     <CycleSummary item={item} />

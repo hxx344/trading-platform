@@ -1,5 +1,5 @@
 import { ChevronDown, RefreshCw } from 'lucide-react';
-import { Fragment, useCallback, useEffect, useId, useRef, useState } from 'react';
+import { Fragment, memo, useCallback, useEffect, useId, useRef, useState } from 'react';
 import {
   DISPLAY_EXCHANGES, EXCHANGE_CONTRACTS, EXCHANGE_NAMES, EXCHANGE_REFRESH_MS, calculateExchangeSpread, exchangeDefinition, externalQuoteStale,
   supportsExchange, validateExchangeQuote, type Exchange, type ExchangeLeg, type ExchangeQuote, type SpreadMarket,
@@ -29,7 +29,7 @@ const age = (fetchedAt: string, now: number) => { const seconds = Math.max(0, Ma
 const settlement = (leg: ExchangeLeg) => leg.nextFundingAt ? `${utc(leg.nextFundingAt)}${leg.nextFundingEstimated ? '（推算）' : ''}` : '—';
 const readable = (error: Error | null, kept: boolean) => !error ? '' : /[一-鿿]/.test(error.message) ? error.message : kept ? '本轮更新失败，保留上次数据' : '读取失败，稍后自动重试';
 
-export function ExchangeComparison({ market, onExpired, onSpreads }: { market: SpreadMarket; onExpired: () => void; onSpreads?: (spreads: VenueSpreads) => void }) {
+export const ExchangeComparison = memo(function ExchangeComparison({ market, onExpired, onSpreads }: { market: SpreadMarket; onExpired: () => void; onSpreads?: (spreads: VenueSpreads) => void }) {
   const [now, setNow] = useState(() => Date.now());
   const [states, setStates] = useState<Partial<Record<Exchange, RowState>>>({});
   const [refreshing, setRefreshing] = useState(false);
@@ -90,9 +90,9 @@ export function ExchangeComparison({ market, onExpired, onSpreads }: { market: S
       <div className="exchange-source-links"><a href="https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding" target="_blank" rel="noreferrer">Hyperliquid 规则 ↗</a><a href="https://www.bybit.com/en/help-center/article/Funding-fee-calculation" target="_blank" rel="noreferrer">Bybit 规则 ↗</a><a href="https://www.binance.com/en/support/faq/detail/360033525031" target="_blank" rel="noreferrer">Binance 规则 ↗</a>{oil && <><a href="https://docs.lighter.xyz/trading/funding" target="_blank" rel="noreferrer">Lighter 规则 ↗</a><a href="https://docs.variational.io/technical-documentation/api" target="_blank" rel="noreferrer">Variational 接口说明 ↗</a></>}<a href="https://www.okx.com/docs-v5/en/#public-data-rest-api-get-funding-rate" target="_blank" rel="noreferrer">OKX 资金费接口 ↗</a><a href="https://www.bitget.com/docs/catalog/classic-contract-market/classic-contract-market" target="_blank" rel="noreferrer">Bitget 资金费接口 ↗</a>{!oil && <a href="https://www.gate.com/docs/developers/apiv4/en/futures/" target="_blank" rel="noreferrer">Gate 资金费接口 ↗</a>}</div>
     </div></details>
   </section></div>;
-}
+});
 
-function ExchangeRow({ market, exchange, now, onExpired, onReport, onRegister, history, historyId, onHistory }: {
+const ExchangeRow = memo(function ExchangeRow({ market, exchange, now, onExpired, onReport, onRegister, history, historyId, onHistory }: {
   market: SpreadMarket; exchange: Exchange; now: number; onExpired: () => void;
   onReport: (exchange: Exchange, state: RowState) => void; onRegister: (exchange: Exchange, refresh: (() => Promise<void>) | null) => void;
   /** The direction whose settlement history is open for this exchange, if any. */
@@ -133,4 +133,4 @@ function ExchangeRow({ market, exchange, now, onExpired, onReport, onRegister, h
     <td data-label="做空价差年化">{annualized('short', metrics?.shortAnnualized)}</td>
     <td data-label="做多价差年化">{annualized('long', metrics?.longAnnualized)}</td>
   </tr>{hasSession && sessionOpen && <tr className="variational-session-row"><td colSpan={5}><VariationalSessionForm id={sessionId} now={now} onClose={closeSession} onSaved={saved} onExpired={onExpired} /></td></tr>}</Fragment>;
-}
+});

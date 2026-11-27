@@ -83,9 +83,9 @@ export function createResourceStore(env: ResourceEnvironment) {
     const ms = interval(entry);
     if (ms === null || entry.stopped || entry.request || !readable(entry)) return;
     const wait = entry.lastAttemptAt === null ? 0 : Math.max(0, Math.min(entry.lastAttemptAt + ms, entry.reuseUntil ?? Infinity) - env.now());
-    entry.timer = env.setTimer(() => { entry.timer = undefined; void start(key, entry); }, wait);
+    entry.timer = env.setTimer(() => { entry.timer = undefined; void start(key, entry, true); }, wait);
   };
-  const start = (key: string, entry: Entry): Promise<void> => {
+  const start = (key: string, entry: Entry, routine = false): Promise<void> => {
     if (entries.get(key) !== entry) return Promise.resolve();
     // 不可读时记下这次显式要求的重读（如写入后的 refresh），恢复后补读，不能被吞掉。
     if (!readable(entry)) { entry.stopped = false; entry.interrupted = true; suspend(entry); return Promise.resolve(); }
@@ -97,7 +97,7 @@ export function createResourceStore(env: ResourceEnvironment) {
     const request = { controller: new AbortController(), done: Promise.resolve() };
     entry.request = request;
     entry.lastAttemptAt = env.now();
-    publish(entry, { status: 'loading' });
+    if (!routine || entry.snapshot.status !== 'ready' || entry.snapshot.cached || entry.snapshot.data === null) publish(entry, { status: 'loading' });
     request.done = (async () => {
       let value: unknown, failure: unknown, ok = false;
       try { value = await entry.read(request.controller.signal); ok = true; } catch (error) { failure = error; }
@@ -154,7 +154,7 @@ export function createResourceStore(env: ResourceEnvironment) {
     if (!retain || intervalMs === null || lastAttemptAt === null || snapshot.data === null || snapshot.receivedAt === null) return;
     const now = env.now();
     if (now < snapshot.receivedAt || now - snapshot.receivedAt >= HISTORY_RETENTION_MS) return;
-    const nextReadAt = snapshot.status === 'ready' && !snapshot.error && foreground() && retain.fresh(snapshot.data, now) ? Math.min(lastAttemptAt + intervalMs, entry.reuseUntil ?? Infinity) : 0;
+    const nextReadAt = !entry.request && snapshot.status === 'ready' && !snapshot.error && foreground() && retain.fresh(snapshot.data, now) ? Math.min(lastAttemptAt + intervalMs, entry.reuseUntil ?? Infinity) : 0;
     if (!retain.history && nextReadAt <= now) return;
     retained.set(key, { snapshot: { ...snapshot, cached: true }, nextReadAt, lastAttemptAt, history: retain.history === true });
     if (retained.size > MAX_RETAINED) retained.delete(retained.keys().next().value!);

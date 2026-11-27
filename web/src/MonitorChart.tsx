@@ -1,5 +1,5 @@
 import { Activity, Check, Info } from 'lucide-react';
-import { memo, useMemo, useState, type SetStateAction } from 'react';
+import { memo, useId, useMemo, useState, type SetStateAction } from 'react';
 import { calculateIndicators, type IndicatorPoint, type SpreadMetric } from '../../src/vendor/indicators.mjs';
 import { ranges, sampleChartPoints, savedToggles, selectRange, type ChartMode, type IndicatorToggles as Toggles, type Point, type SpreadChartConfig } from './monitor-history.ts';
 import { SvgPlot, createHoverStore, type PlotLayer } from './svg-plot.tsx';
@@ -18,9 +18,9 @@ export const date = (t: number | string, full = false) => new Intl.DateTimeForma
 export const stamp = (t: number | string) => `${date(t, true)} ${new Date(t).toISOString().slice(11, 16)} UTC`;
 
 const options = [
-  { key: 'sma', label: '7 日均线', color: 'var(--warning)' },
-  { key: 'bands', label: '布林带 · 20 日', color: 'var(--chart-5)' },
-  { key: 'zscore', label: 'Z-score · 20 日', color: 'var(--chart-2)' },
+  { key: 'sma', label: '7 日均线' },
+  { key: 'bands', label: '布林带 · 20 日' },
+  { key: 'zscore', label: 'Z-score · 20 日' },
 ] as const;
 
 type Row = IndicatorPoint<Point>;
@@ -34,7 +34,7 @@ const zLayers: PlotLayer[] = [{ kind: 'line', key: 'zscore', color: 'var(--chart
 const zZones = [{ from: -2, to: 2, fill: 'var(--chart-2)', opacity: 0.035 }];
 const zeroLine = [{ y: 0, color: 'var(--muted-foreground)', dash: '4 4' }];
 const zReferences = [{ y: 0, color: 'var(--muted-foreground)' }, { y: 2, color: 'var(--warning)', dash: '4 4' }, { y: -2, color: 'var(--warning)', dash: '4 4' }];
-const premiumFill = <linearGradient id="premiumFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="var(--primary)" stopOpacity={0.21} /><stop offset="100%" stopColor="var(--primary)" stopOpacity={0.01} /></linearGradient>;
+
 
 function indicatorTooltip(p: ChartPoint, mode: ChartMode, enabled: Toggles, config: SpreadChartConfig, zOnly = false) {
   if (p.adr == null || p.equivalent == null) return null;
@@ -66,6 +66,7 @@ export const SpreadChart = memo(function SpreadChart({ data, loading, range, onR
   data: Point[]; loading: boolean; range: number | null; onRangeChange: (range: number | null) => void; mode: ChartMode; onModeChange: (mode: ChartMode) => void; config: SpreadChartConfig;
   trades?: FillsView; tradeMarket?: FillMarket;
 }) {
+  const gradient = useId();
   const { intervalMs, periods, preferenceKey } = config;
   // Each market's page has its own chart, so the key never changes under one instance.
   const [enabled, setToggles] = useState(() => savedToggles(preferenceKey));
@@ -117,6 +118,12 @@ export const SpreadChart = memo(function SpreadChart({ data, loading, range, onR
   const mainAxis = useMemo(() => mode === 'price' ? niceAxis(priceDomain[0], priceDomain[1]) : fixedAxis(domain[0], domain[1]), [mode, priceDomain, domain]);
   const zAxis = useMemo(() => fixedAxis(zDomain[0], zDomain[1]), [zDomain]);
   const xRange = useMemo(() => points.length ? [points[0]!.time, Math.max(points.at(-1)!.time, lastTradeTime)] as const : [0, 1] as const, [points, lastTradeTime]);
+  // Opacity reaches its minimum at zero, including windows crossing from discount to premium.
+  const zeroOffset = useMemo(() => {
+    let low = 0, high = 0;
+    for (const point of points) { low = Math.min(low, point[metric]); high = Math.max(high, point[metric]); }
+    return high === low ? 0 : high / (high - low);
+  }, [points, metric]);
   const layers = useMemo((): PlotLayer[] => mode === 'price' ? [
     { kind: 'line', key: 'adr', color: 'var(--chart-2)', width: 2, active: true },
     { kind: 'line', key: 'equivalent', color: 'var(--warning)', width: 2, active: true },
@@ -127,10 +134,10 @@ export const SpreadChart = memo(function SpreadChart({ data, loading, range, onR
       { kind: 'line', key: 'lower', color: 'var(--chart-5)', width: 1, dash: '4 4' },
       { kind: 'line', key: 'basis', color: 'var(--chart-5)', width: 1, dash: '2 5', opacity: 0.6 },
     ] as const : []),
-    { kind: 'area', key: metric, lower: 0, fill: 'url(#premiumFill)' },
+    { kind: 'area', key: metric, lower: 0, fill: `url(#${gradient})` },
     { kind: 'line', key: metric, color: 'var(--primary)', width: 2, active: true },
     ...(enabled.sma ? [{ kind: 'line', key: 'sma', color: 'var(--warning)', width: 1.8 }] as const : []),
-  ], [mode, metric, enabled.bands, enabled.sma]);
+  ], [mode, metric, enabled.bands, enabled.sma, gradient]);
   const [hover] = useState(createHoverStore);
   const zState = !latest || latest.zscore === null ? (latest?.deviation === 0 ? '窗口无波动' : `等待 ${config.bars(periods.bands)}`) : latest.zscore > 2 ? '高于 +2σ' : latest.zscore < -2 ? '低于 −2σ' : '位于 ±2σ 内';
   const metricName = mode === 'premium' ? config.premiumName : config.spreadName;
@@ -148,7 +155,7 @@ export const SpreadChart = memo(function SpreadChart({ data, loading, range, onR
       <div className="indicator-controls" role="group" aria-label="技术指标开关">
         <span className="indicator-label">技术指标</span>
         {options.map(option => <button type="button" key={option.key} aria-pressed={enabled[option.key]} className={`indicator-toggle ${enabled[option.key] ? 'selected' : ''}`} onClick={() => setEnabled(previous => ({ ...previous, [option.key]: !previous[option.key] }))}>
-          <span className="indicator-check" style={{ borderColor: enabled[option.key] ? option.color : undefined, color: option.color }}>{enabled[option.key] && <Check size={12} aria-hidden="true" />}</span>{option.label}
+          <span className="indicator-check" data-indicator={option.key}>{enabled[option.key] && <Check size={12} aria-hidden="true" />}</span>{option.label}
         </button>)}
         <span className="indicator-period">{config.bar}线 · 布林带 ±2σ</span>
       </div>
@@ -163,7 +170,11 @@ export const SpreadChart = memo(function SpreadChart({ data, loading, range, onR
         : <SvgPlot rows={sampled} hoverRows={chartPoints} xDomain={xRange} yDomain={mainAxis.domain} yTicks={mainAxis.ticks} yTick={tick}
           layers={layers} references={mode === 'price' ? [] : zeroLine} margin={{ top: 25, right: 82, bottom: 36 }} height={300} hover={hover}
           label={mode === 'price' ? `${config.legs.join(' 与 ')} ${config.bar}收盘价格走势` : `${metricName}${config.bar}走势`}
-          defs={premiumFill} tooltip={row => indicatorTooltip(row as ChartPoint, mode, enabled, config)}
+          defs={<linearGradient id={gradient} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stopColor="var(--primary)" stopOpacity={zeroOffset === 0 ? 0.01 : 0.21}/>
+            <stop offset={zeroOffset} stopColor="var(--primary)" stopOpacity={0.01}/>
+            <stop offset="1" stopColor="var(--primary)" stopOpacity={zeroOffset === 1 ? 0.01 : 0.21}/>
+          </linearGradient>} tooltip={row => indicatorTooltip(row as ChartPoint, mode, enabled, config)}
           overlay={plotted.length ? ({ x, y }) => plotted.map(({ marker, y: value }) => <TradeMark key={marker.event.key} cx={x(marker.event.time)} cy={y(value)} marker={marker} selected={selectedKey === marker.event.key} onSelect={setSelectedKey} />) : undefined} />}
     </div>
     <div className="chart-caption"><span>{mode === 'price' ? <><i className="legend-dot adr" />{config.legs[0]} <i className="legend-dot ordinary" />{config.legs[1]}</> : <><i className="legend-dot premium" />{metricName}<span className="zero-line" />{config.zeroLabel}</>}</span><span>{points.length ? `${date(points[0]!.time, true)} — ${date(points.at(-1)!.time, true)} · ${config.span(points.length)}${sampled.length < chartPoints.length ? ` · 绘图保留极值与缺口共 ${sampled.length.toLocaleString()} 点，读数与统计使用全部记录` : ''}` : `${config.bar}收盘 · UTC`}</span></div>

@@ -43,15 +43,16 @@ function PairSide({ side, pair }: { side: Side; pair: PairView }) {
 
 function StatusPanel({ pair, onChanged }: { pair: PairView; onChanged: () => void }) {
   const [busy, setBusy] = useState(false);
+  const [failure, setFailure] = useState<string | null>(null);
   // Once the page shows the switch in a state, a request for that state whose answer was lost has taken effect (or is
   // moot): its id is dropped, so a later click for the same state, after switching back, is a new request and not a replay.
   useEffect(() => { switches.answered(`${pair.id}:${pair.enabled ? 1 : 0}`); }, [pair.id, pair.enabled]);
   const toggle = async (enable: boolean) => {
-    setBusy(true);
+    setBusy(true); setFailure(null);
     try {
       await switches.run(`${pair.id}:${enable ? 1 : 0}`, '', requestId => api(`/api/transfer-pairs/${encodeURIComponent(pair.id)}/${enable ? 'enable' : 'disable'}`, { body: { requestId }, timeoutMs: 60_000 }));
       onChanged();
-    } catch (error) { alert(error instanceof Error ? error.message : String(error)); }
+    } catch (error) { setFailure(error instanceof Error ? error.message : String(error)); }
     finally { setBusy(false); }
   };
   const cooling = pair.cooldownUntil > Date.now();
@@ -73,6 +74,7 @@ function StatusPanel({ pair, onChanged }: { pair: PairView; onChanged: () => voi
       <PairSide side="short" pair={pair} />
     </div>
     <div className="execution-live-state">
+      {failure && <p className="danger" role="alert">{failure}</p>}
       <p className={pair.current ? 'amber' : ''} aria-live="polite">
         {pair.current ? `当前划转：${transferText(pair.current)}` : pair.enabled ? '无未结清划转' : '已停用'}
         {pair.enabled && cooling ? ` · 冷却至 ${clock(pair.cooldownUntil)}` : ''}
@@ -196,7 +198,7 @@ export function PairsWorkspace({ state, pairId, stale, onChanged, onExpired }: {
     {stale ? <p className="message" role="status">页面数据未能刷新，下面的数字停留在上次读取，不代表当前。</p> : null}
     {!pairs.length ? <StatePanel kind="empty" title="还没有配对" detail={<>在「<a href="#/settings">设置</a>」页从工作台导入配对后，这里显示每个配对的余额、持仓与 ADL 处理。</>} />
       : !pair || !id ? <StatePanel kind="empty" title="没有这个配对" detail="它可能已被删除；从右上角选择一个配对。" /> : <>
-        <StatusPanel pair={pair} onChanged={onChanged} />
+        <StatusPanel key={pair.id} pair={pair} onChanged={onChanged} />
         <div className="pair-layout">
           <div className="pair-main">
             <PairAccountPositions side="long" view={positions?.long ?? null} refreshMs={state.positions.refreshMs} maxAgeMs={state.positions.maxAgeMs} stale={stale} />

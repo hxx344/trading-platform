@@ -103,7 +103,7 @@ function ParamsPanel({ data, view, onChanged }: { data: SymbolView; view: StateV
   const runBacktest = () => {
     const body = backtestBody(data.key, btHours, form, data.global);
     if (!body.ok) return;
-    void write.run('backtest', () => api<BacktestView>(`${VARLIGHTER_BASE}/backtest`, { body: body.value, timeoutMs: 60_000 }), value => { setResult(value); return `回测完成：${value.summary.trades} 笔，净 ${signedUsd(value.summary.netUsd)}`; });
+    void write.run('backtest', () => api<BacktestView>(`${VARLIGHTER_BASE}/backtest`, { body: body.value, timeoutMs: 125_000 }), value => { setResult(value); return `回测完成：${value.summary.trades} 笔，净 ${signedUsd(value.summary.netUsd)}`; });
   };
   const auto = data.auto, recommended = auto.params;
   const save = () => {

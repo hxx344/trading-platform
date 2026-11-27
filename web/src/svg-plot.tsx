@@ -1,11 +1,11 @@
 // 复制自 project-aggregation 工作台 modules/monitor/app/svg-plot.tsx（提交 8bc3bee）：去掉 "use client"，
 // nearestTimeIndex 内联，横轴标签可传入格式（默认仍为月/日）。
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { memo, useId, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { bandPath, dotsPath, linePath, plotValue } from "./svg-plot-geometry.ts";
 
 type Row = { time: number };
 export type PlotLayer =
-  | { kind: "line"; key: string; color: string; width: number; dash?: string; opacity?: number; active?: boolean; dots?: number }
+  | { kind: "line"; key: string; color: string; width: number; dash?: string; opacity?: number; active?: boolean; dots?: number; step?: boolean }
   | { kind: "area"; key: string; lower: string | number; fill: string; opacity?: number };
 export type PlotScales = { x: (time: number) => number; y: (value: number) => number };
 
@@ -24,7 +24,7 @@ export function createHoverStore(): HoverStore {
 const date = (time: number) => new Date(time).toISOString().slice(5, 10).replace("-", "/");
 
 /** Index of the row nearest to target in rows sorted by time (copied from modules/monitor/modules/oil/chart-performance.mjs). */
-function nearestTimeIndex(rows: readonly Row[], target: number): number {
+export function nearestTimeIndex(rows: readonly Row[], target: number): number {
   if (!rows.length) return -1;
   let low = 0, high = rows.length;
   while (low < high) { const middle = (low + high) >>> 1; if (rows[middle].time < target) low = middle + 1; else high = middle; }
@@ -57,6 +57,7 @@ export const SvgPlot = memo(function SvgPlot({ rows, hoverRows = rows, xDomain, 
   overlay?: (scales: PlotScales) => ReactNode;
   defs?: ReactNode;
 }) {
+  const clip = useId();
   const element = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ width: 800, height });
   const [localHover] = useState(createHoverStore);
@@ -79,7 +80,7 @@ export const SvgPlot = memo(function SvgPlot({ rows, hoverRows = rows, xDomain, 
     const [start, end] = xDomain, [low, high] = yDomain;
     const x = (time: number) => left + (end === start ? 0.5 : (time - start) / (end - start)) * (right - left);
     const y = (value: number) => top + (high === low ? 0.5 : (high - value) / (high - low)) * (bottom - top);
-    const paths = layers.map(layer => layer.kind === "area" ? bandPath(rows, layer.key, layer.lower, x, y) : linePath(rows, layer.key, x, y));
+    const paths = layers.map(layer => layer.kind === "area" ? bandPath(rows, layer.key, layer.lower, x, y) : linePath(rows, layer.key, x, y, layer.step));
     const dots = layers.map(layer => layer.kind === "line" && layer.dots ? dotsPath(rows, layer.key, x, y) : "");
     const count = end === start ? 1 : Math.max(2, Math.min(6, Math.floor((right - left) / 115)));
     const times = Array.from({ length: count }, (_, index) => start + (end - start) * index / Math.max(1, count - 1));
@@ -88,6 +89,13 @@ export const SvgPlot = memo(function SvgPlot({ rows, hoverRows = rows, xDomain, 
   // A reading held by touch would snap to an edge hour the user never picked once the window moves.
   const [domainStart, domainEnd] = xDomain;
   useEffect(() => { store.set(null); }, [store, domainStart, domainEnd]);
+  useEffect(() => {
+    const dismiss = (event: PointerEvent) => {
+      if (event.pointerType === "touch" && !element.current?.contains(event.target as Node)) store.set(null);
+    };
+    document.addEventListener("pointerdown", dismiss, true);
+    return () => document.removeEventListener("pointerdown", dismiss, true);
+  }, [store]);
   const index = hoverTime === null ? -1 : nearestTimeIndex(hoverRows, hoverTime);
   const row = index < 0 ? null : hoverRows[index];
   const content = row ? tooltip(row) : null;
@@ -118,13 +126,16 @@ export const SvgPlot = memo(function SvgPlot({ rows, hoverRows = rows, xDomain, 
       onBlur={event => { if (event.target === event.currentTarget) store.set(null); }}
       onKeyDown={event => { if (event.target !== event.currentTarget) return; if (event.key === "Escape") { store.set(null); return; } if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return; event.preventDefault(); step(event.key); }}>
       <title>{label}</title><desc>缺失时段断线；触摸、鼠标或左右方向键查看各时点数值。</desc>
-      {defs && <defs>{defs}</defs>}
+      <defs>{defs}<clipPath id={clip}><rect x={geometry.left} y={geometry.top} width={Math.max(0, geometry.right - geometry.left)} height={geometry.bottom - geometry.top}/></clipPath></defs>
+      <g clipPath={`url(#${clip})`}>
       {zones.map((zone, key) => { const top = geometry.y(Math.max(zone.from, zone.to)), bottom = geometry.y(Math.min(zone.from, zone.to)); return <rect key={key} x={geometry.left} width={geometry.right - geometry.left} y={top} height={Math.max(0, bottom - top)} fill={zone.fill} fillOpacity={zone.opacity}/>; })}
+      </g>
       {yTicks.map(value => { const y = geometry.y(value); return <g key={value}>
         <line x1={geometry.left} x2={geometry.right} y1={y} y2={y} stroke="var(--border)" strokeDasharray="3 5"/>
         <text className="svg-plot-tick" x={geometry.right + 8} y={y + 4} textAnchor="start">{yTick(value)}</text>
       </g>; })}
       {geometry.times.map((time, key) => <text key={key} className="svg-plot-tick" x={geometry.x(time)} y={geometry.bottom + 22} textAnchor={key === 0 ? "start" : key === geometry.times.length - 1 ? "end" : "middle"}>{xTick(time)}</text>)}
+      <g clipPath={`url(#${clip})`}>
       {references.map(line => <line key={line.y} x1={geometry.left} x2={geometry.right} y1={geometry.y(line.y)} y2={geometry.y(line.y)} stroke={line.color} strokeDasharray={line.dash}/>)}
       {layers.map((layer, key) => layer.kind === "area"
         ? <path key={key} data-series={layer.key} d={geometry.paths[key]} fill={layer.fill} fillOpacity={layer.opacity} stroke="none"/>
@@ -137,6 +148,7 @@ export const SvgPlot = memo(function SvgPlot({ rows, hoverRows = rows, xDomain, 
         {layers.map(layer => { if (layer.kind !== "line" || !layer.active) return null; const value = plotValue(row, layer.key); return value === null ? null : <circle key={layer.key} cx={cursorX} cy={geometry.y(value)} r={4} fill={layer.color} stroke="var(--card)" strokeWidth={2}/>; })}
       </g>}
       {overlay?.({ x: geometry.x, y: geometry.y })}
+      </g>
     </svg>
     {content && <div ref={tip} className="svg-plot-tooltip">{content}</div>}
   </div>;

@@ -16,6 +16,9 @@ export default defineConfig({
     assetsDir: 'assets',
     assetsInlineLimit: 0,
     modulePreload: { polyfill: false },
+    rolldownOptions: { output: { codeSplitting: { groups: [
+      { name: 'vendor-react', test: /[\\/]node_modules[\\/](?:react|react-dom|scheduler)[\\/]/ },
+    ] } } },
     sourcemap: false,
     target: 'es2022',
   },

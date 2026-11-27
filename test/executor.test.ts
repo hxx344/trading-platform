@@ -593,3 +593,80 @@ test('平仓：只减仓，平掉已开双腿', () => withHarness(async h => {
   assert.equal(h.binance.position('BN1001', 'CLUSDT', 'long'), '0');
   assert.equal(h.bybit.position('BY2002', 'CLUSDT', 'short'), '0');
 }));
+
+test('#6 撤单连续未发送：超时后任务转需人工处理，不再永久抵消计数', () => withHarness(async h => {
+  bindAccounts(h.ex);
+  const { jobId } = await previewAndConfirm(h, openIntent({ orderType: 'limit', limitPrice: '69.00' }));
+  await h.ex.tick();
+  assert.equal(opState(h, jobId, 0), 'open');
+  h.binance.inject({ operation: 'cancel', mode: 'not-sent', times: 50 });
+  h.ex.requestStop(jobId, randomUUID(), SESSION);
+  for (let i = 0; i < 8; i++) { await h.ex.tick(); h.advance(1_000); }
+  const view = h.ex.jobView(jobId);
+  assert.equal(view.status, 'attention');
+  assert.match(view.reason ?? '', /撤单连续未能发送/);
+  assert.equal(opState(h, jobId, 0), 'open');
+}, { budgets: { cancelAttempts: 3, cancelRetryMs: 1_000, unresolvedGraceMs: 2_000 } }));
+
+test('#7 未认领 attention 任务下的普通挂单从 unknown 核对为 open 后自动撤单，已认领则不再自动撤单', () => withHarness(async h => {
+  bindAccounts(h.ex);
+  // Unacknowledged attention job: unknown -> open must auto-cancel.
+  const first = await previewAndConfirm(h, openIntent({ orderType: 'limit', limitPrice: '69.00' }));
+  h.binance.inject({ operation: 'place', mode: 'lost-response' });
+  h.binance.inject({ operation: 'query', mode: 'read-fail', times: 9 });
+  for (let i = 0; i < 9 && h.ex.jobView(first.jobId).status !== 'attention'; i++) { await h.ex.tick(); h.advance(1_000); }
+  assert.equal(h.ex.jobView(first.jobId).status, 'attention');
+  assert.equal(opState(h, first.jobId, 0), 'unknown');
+  for (let i = 0; i < 6 && opState(h, first.jobId, 0) !== 'canceled'; i++) { await h.ex.tick(); h.advance(500); }
+  assert.equal(opState(h, first.jobId, 0), 'canceled');
+  h.ex.acknowledge(first.jobId, randomUUID(), SESSION);
+
+  // Acknowledged attention job: unknown -> open keeps resting without auto-cancel.
+  const second = await previewAndConfirm(h, openIntent({ orderType: 'limit', limitPrice: '69.00' }));
+  h.binance.inject({ operation: 'place', mode: 'lost-response' });
+  h.binance.inject({ operation: 'query', mode: 'read-fail', times: 9 });
+  for (let i = 0; i < 9 && h.ex.jobView(second.jobId).status !== 'attention'; i++) { await h.ex.tick(); h.advance(1_000); }
+  assert.equal(h.ex.jobView(second.jobId).status, 'attention');
+  h.ex.acknowledge(second.jobId, randomUUID(), SESSION);
+  const cancelsBefore = h.binance.calls.cancel;
+  for (let i = 0; i < 6; i++) { await h.ex.tick(); h.advance(500); }
+  assert.equal(opState(h, second.jobId, 0), 'open');
+  assert.equal(h.binance.calls.cancel, cancelsBefore);
+}, { budgets: { createObserveMs: 1_000, createArrivalMarginMs: 1_000, absentSpacingMs: 500, unresolvedGraceMs: 1_000, cancelRetryMs: 1_000, cancelAttempts: 3 } }));
+
+test('#8 停服排水：stopSending 拒绝新确认与四腿确认，且停发新首腿但保留已成交首腿的对冲发送', () => withHarness(async h => {
+  bindAccounts(h.ex);
+  const bzIntent = {
+    market: 'oil', preset: 'cross-exchange', symbol: 'BZUSDT', action: 'open', timeoutMs: 60_000,
+    legs: [
+      { venue: 'binance', side: 'long', orderType: 'market', quantity: '1' },
+      { venue: 'bybit', side: 'short', orderType: 'market', quantity: '1' },
+    ],
+  };
+  // Previews must be created before any confirm acquires symbol locks.
+  const preview = await h.ex.preview(openIntent(), SESSION);
+  const fourPreview = await h.ex.previewFourLeg({
+    market: 'oil', preset: 'four-leg', action: 'open', timeoutMs: 60_000,
+    legs: [
+      { venue: 'binance', symbol: 'BZUSDT', side: 'short', orderType: 'market', barrels: '1' },
+      { venue: 'binance', symbol: 'CLUSDT', side: 'long', orderType: 'market', barrels: '1' },
+      { venue: 'bybit', symbol: 'BZUSDT', side: 'long', orderType: 'market', barrels: '1' },
+      { venue: 'bybit', symbol: 'CLUSDT', side: 'short', orderType: 'market', barrels: '1' },
+    ],
+  }, SESSION);
+  const hedgedLead = await previewAndConfirm(h, openIntent());
+  const acceptedLead = await previewAndConfirm(h, bzIntent);
+  // Let only hedgedLead place leg 0 and keep it before hedge, then enable draining.
+  const origPlace = h.binance.place.bind(h.binance);
+  let places = 0;
+  h.binance.place = (async (...args: Parameters<typeof origPlace>) => {
+    const result = await origPlace(...args);
+    if (++places === 1) h.ex.stopSending();
+    return result;
+  }) as typeof origPlace;
+  await h.ex.tick();
+  assert.throws(() => h.ex.confirm({ previewId: preview.id, requestId: randomUUID(), confirmLive: true }, SESSION), (error: unknown) => code('shutting_down')(error) && error instanceof ContractError && error.status === 503);
+  assert.throws(() => h.ex.confirmFourLeg({ previewId: fourPreview.id, requestId: randomUUID(), confirmLive: true }, SESSION), (error: unknown) => code('shutting_down')(error) && error instanceof ContractError && error.status === 503);
+  assert.equal(opState(h, acceptedLead.jobId, 0), 'not-sent');
+  assert.equal((await settle(h, hedgedLead.jobId)).status, 'completed', '已成交首腿在 draining 下仍允许发出对冲腿');
+}));

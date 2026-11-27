@@ -2,7 +2,7 @@
 // push stream and the force-order history, reduce-only market batches under the
 // notional cap, the L054 update-time guard, bounded recovery of batches without
 // an answer, the halt conditions and the manual restart, takeover, and the
-// boundaries: control injected, auto-reduce off, account change while open.
+// boundaries: auto-reduce off, account change while open.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -15,7 +15,6 @@ import { ContractError } from '../src/contracts.ts';
 import { createExecutor, type Budgets } from '../src/executor.ts';
 import { createExecutorServer } from '../src/http.ts';
 import { MIGRATIONS, openStore, sqlHash } from '../src/store.ts';
-import type { AccountWriterPort } from '../src/account-control.ts';
 import { planReductions } from '../src/adl.ts';
 import { SimulatedAsterTrading } from '../src/sim-aster-trading.ts';
 import { SIM_TRANSFER_PAIR } from '../src/simulation.ts';
@@ -27,8 +26,8 @@ const code = (expected: string) => (error: unknown) => error instanceof Contract
 /** Short real-time call limits, so a hung simulated call costs the test 50 ms. */
 const QUICK: Partial<Budgets> = { adlReadTimeoutMs: 50, adlOrderTimeoutMs: 50 };
 
-async function withAdl(run: (h: Harness) => Promise<void>, budgets: Partial<Budgets> = {}, control?: NonNullable<Parameters<typeof createHarness>[0]>['control']) {
-  const h = createHarness({ budgets: { ...QUICK, ...budgets }, control });
+async function withAdl(run: (h: Harness) => Promise<void>, budgets: Partial<Budgets> = {}) {
+  const h = createHarness({ budgets: { ...QUICK, ...budgets } });
   try {
     h.ex.registerTransferPair(SIM_TRANSFER_PAIR);
     await h.ex.tick();
@@ -483,186 +482,6 @@ test('ADL：落盘后发送前中断的批次记为未发送；发送中被接�
   assert.ok(balanced(h));
 }, { adlOrderTimeoutMs: 5_000 }));
 
-/** A registry shared by every executor instance of one test, plus its rows, read straight from its database. */
-async function registry(options: { skipFirst?: boolean } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'pa-adl-control-'));
-  const { createAccountWriter } = await import(new URL('./fixtures/account-writer.mjs', import.meta.url).href) as { createAccountWriter(options: Record<string, unknown>): AccountWriterPort & { close(): void } };
-  const writers: (AccountWriterPort & { close(): void })[] = [];
-  let instances = 0, latest = 0;
-  const path = join(dir, 'execution-control.sqlite');
-  return {
-    writers,
-    control: (clock: { now: number }) => {
-      if (options.skipFirst && instances++ === 0) return undefined;
-      // A restart replaces the process: only the newest executor's writer and other modules' writers are alive.
-      const pid = latest = 42_000 + writers.length;
-      const writer = createAccountWriter({ databasePath: path, moduleId: 'platform', runtimeId: randomUUID(), pid, now: () => clock.now, processAlive: (value: number) => value === latest || value === 49_000 });
-      writers.push(writer);
-      return { writer, environment: 'testnet' as const };
-    },
-    /** Another module's writer on the same registry. */
-    other: (clock: { now: number }) => { const writer = createAccountWriter({ databasePath: path, moduleId: 'other', runtimeId: randomUUID(), pid: 49_000, now: () => clock.now, processAlive: () => true }); writers.push(writer); return writer; },
-    rows: () => (writers[0] as unknown as { db: DatabaseSync }).db.prepare('SELECT operation_id, state, account_keys FROM aw_operations WHERE module_id = ? ORDER BY created_at, operation_id').all('platform') as { operation_id: string; state: string; account_keys: string }[],
-    dispose() { for (const writer of writers) try { writer.close(); } catch { /* a retired writer may refuse */ } rmSync(dir, { recursive: true, force: true }); },
-  };
-}
-
-test('ADL：注入共享写者登记时减仓单先登记（只占该子账户）再发送，成交后登记记为已执行，事件照常结束', async () => {
-  const r = await registry();
-  try {
-    await withAdl(async h => {
-      h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
-      await h.ex.tick();
-      await untilClosed(h, 30, 1_000);
-      const batches = recent(h)[0].batches;
-      assert.ok(balanced(h));
-      assert.ok(batches.length >= 1);
-      const rows = r.rows();
-      assert.deepEqual(rows.map(row => [row.operation_id, row.state]).sort(), batches.map(batch => [`platform:adl:${batch.clientOrderId}`, 'confirmed']).sort());
-      assert.ok(rows.every(row => JSON.parse(row.account_keys).length === 1));
-      assert.deepEqual(r.writers[0].pendingOperationIds(), []);
-    }, {}, r.control);
-  } finally { r.dispose(); }
-});
-
-test('ADL：减仓单结果未知时登记保持未知、挡住同账户其他写入，核对有结果后按本地事实结清', async () => {
-  const r = await registry();
-  try {
-    await withAdl(async h => {
-      h.asterTrading.inject({ operation: 'place', mode: 'lost-response' });
-      h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
-      await h.ex.tick();
-      const batch = current(h)!.batches[0];
-      assert.equal(batch.state, 'unknown');
-      assert.deepEqual(r.rows().map(row => [row.operation_id, row.state]), [[`platform:adl:${batch.clientOrderId}`, 'unknown']]);
-      await untilClosed(h, 30, 1_000);
-      assert.ok(r.rows().every(row => row.state === 'confirmed'));
-      assert.deepEqual(r.writers[0].pendingOperationIds(), []);
-      assert.ok((h.store.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'adl-control-resolved'").get() as { n: number }).n >= 1);
-    }, {}, r.control);
-  } finally { r.dispose(); }
-});
-
-test('ADL：子账户已被其他模块占用时登记拒绝，减仓批次记为未发送，传输未调用', async () => {
-  const r = await registry();
-  try {
-    await withAdl(async h => {
-      const other = r.other(h.clock);
-      const identity = { authority: 'aster', environment: 'testnet', accountId: SHORT } as const;
-      other.bind('other:aster', identity, 1);
-      other.claim([identity]);
-      other.bind('other:aster:long', { ...identity, accountId: LONG }, 1);
-      other.claim([{ ...identity, accountId: LONG }]);
-      h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
-      await run(h, 3_000, 1_000);
-      const batches = current(h)!.batches;
-      assert.ok(batches.length >= 1 && batches.every(batch => batch.state === 'not-sent'));
-      assert.match(batches[0].note ?? '', /ACCOUNT_PINNED/);
-      assert.equal(h.asterTrading.calls.place, 0);
-      assert.deepEqual(r.rows(), []);
-    }, {}, r.control);
-  } finally { r.dispose(); }
-});
-
-test('ADL：同配对的未知划转在登记里挡住子账户时，减仓等待而不计入连续未发送，过期后照常发出', async () => {
-  const r = await registry();
-  try {
-    await withAdl(async h => {
-      // An unknown transfer of this module on the pair's accounts, registered as the executor would.
-      const writer = r.writers[0], accounts = [LONG, SHORT, SIM_TRANSFER_PAIR.mainAccountId].map(accountId => ({ authority: 'aster', environment: 'testnet', accountId } as const));
-      for (const item of accounts) writer.bind(`platform:aster:${item.accountId}`, item, 1);
-      const [from, to, master] = accounts;
-      const payload = { marginTransfer: { version: 1, method: 'POST', path: '/fapi/v3/subAccountTransfer', params: { fromAccountAddress: from.accountId, toAccountAddress: to.accountId, asset: 'USD1', amount: '1', kindType: 'FUTURE_FUTURE' }, source: from, destination: to, master } };
-      writer.finish(writer.prepare(writer.claim(accounts), 'platform:transfer:outside', payload), 'unknown');
-      h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
-      await run(h, 90_000, 1_000);
-      const waiting = current(h)!;
-      assert.notEqual(waiting.status, 'halted');
-      assert.equal(h.asterTrading.calls.place, 0);
-      assert.ok(waiting.batches.length >= 1 && waiting.batches.every(batch => batch.state === 'not-sent' && /ACCOUNT_UNRESOLVED/.test(batch.note ?? '')));
-      await untilClosed(h, 120, 1_000);
-      assert.ok(balanced(h));
-      assert.ok(h.asterTrading.calls.place >= 1);
-    }, {}, r.control);
-  } finally { r.dispose(); }
-});
-
-test('ADL：无登记时留下的挂单批次，注入共享写者登记后接管照常撤单，撤单先登记，结束后记为已执行', async () => {
-  const r = await registry({ skipFirst: true });
-  try {
-    await withAdl(async h => {
-      h.asterTrading.inject({ operation: 'place', mode: 'rest' });
-      h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
-      await h.ex.tick();
-      const batch = current(h)!.batches[0];
-      assert.equal(batch.state, 'open');
-      takeover(h);
-      await run(h, 60_000, 5_000);
-      assert.ok(h.asterTrading.calls.cancel >= 1);
-      const rows = r.rows();
-      assert.ok(rows.some(row => row.operation_id.startsWith(`platform:adl-cancel:${batch.clientOrderId}:`) && row.state === 'confirmed'));
-      assert.ok(!rows.some(row => row.operation_id === `platform:adl:${batch.clientOrderId}`), '登记前发出的原单不补登记');
-      assert.deepEqual(r.writers[0].pendingOperationIds(), []);
-    }, {}, r.control);
-  } finally { r.dispose(); }
-});
-
-test('ADL：注入登记时撤单未发送，下次撤单换新登记编号再发，不被旧的已拒绝登记卡住', async () => {
-  const r = await registry();
-  try {
-    await withAdl(async h => {
-      h.asterTrading.inject({ operation: 'place', mode: 'rest' });
-      h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
-      await h.ex.tick();
-      const batch = current(h)!.batches[0];
-      assert.equal(batch.state, 'open');
-      h.asterTrading.inject({ operation: 'cancel', mode: 'not-sent' });
-      await run(h, 60_000, 1_000);
-      const cancels = r.rows().filter(row => row.operation_id.startsWith(`platform:adl-cancel:${batch.clientOrderId}:`));
-      assert.ok(cancels.length >= 2, '每次撤单尝试各自登记');
-      assert.equal(new Set(cancels.map(row => row.operation_id)).size, cancels.length);
-      assert.equal(cancels[0].state, 'rejected');
-      assert.ok(cancels.slice(1).some(row => row.state === 'confirmed'));
-      assert.ok(h.asterTrading.arrived.cancel >= 1, '第二次撤单到达交易所');
-      assert.notEqual(current(h)?.batches.find(item => item.id === batch.id)?.state, 'open');
-      assert.deepEqual(r.writers[0].pendingOperationIds(), []);
-    }, {}, r.control);
-  } finally { r.dispose(); }
-});
-
-test('ADL：残留挂单的撤单被登记长期拒绝（账户被其他模块固定）时停止事件交人工，不无限重试', async () => {
-  const r = await registry({ skipFirst: true });
-  try {
-    await withAdl(async h => {
-      h.asterTrading.inject({ operation: 'place', mode: 'rest' });
-      h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
-      await h.ex.tick();
-      const batch = current(h)!.batches[0];
-      assert.equal(batch.state, 'open');
-      takeover(h);
-      // Pinned after the jump, so the other module's lease is fresh.
-      const other = r.other(h.clock);
-      for (const accountId of [LONG, SHORT]) {
-        const identity = { authority: 'aster', environment: 'testnet', accountId } as const;
-        other.bind(`other:aster:${accountId}`, identity, 1);
-        other.claim([identity]);
-      }
-      await run(h, 30_000, 1_000);
-      const incident = recent(h)[0];
-      assert.equal(incident.status, 'halted');
-      assert.match(incident.reason ?? '', /撤单被账户写入登记拒绝（ACCOUNT_PINNED）/);
-      assert.equal(h.asterTrading.calls.cancel, 0);
-      assert.equal(incident.batches.find(item => item.id === batch.id)?.state, 'open');
-      // The order is still queried while the cancel is refused: a person's cancel on the venue settles the batch.
-      const owner = [LONG, SHORT].find(accountId => { try { h.asterTrading.cancelOnVenue(accountId, batch.clientOrderId); return true; } catch { return false; } });
-      assert.ok(owner, '挂单仍在交易所');
-      await run(h, 40_000, 1_000);
-      assert.notEqual(recent(h)[0].batches.find(item => item.id === batch.id)?.state, 'open');
-      assert.equal(h.asterTrading.calls.cancel, 0);
-    }, {}, r.control);
-  } finally { r.dispose(); }
-});
-
 test('ADL：关闭自动减仓时只核对，两侧被手工平衡后事件自动完成；无交易权限时受阻不下单', async () => {
   await withAdl(async h => {
     config(h, { autoReduce: false });
@@ -856,3 +675,51 @@ test('ADL 历史：按配对逐页列出事件，新的在前，游标接续不�
   assert.deepEqual(tied.map(item => item.id), [...all].sort().reverse(), '同一毫秒按编号降序，不重不漏');
   assert.deepEqual(tied.filter(item => item.unreadable).map(item => item.id), [broken]);
 }));
+
+test('ADL #1：近 24 小时已成交减仓批次按合约与子账户过滤，不阻塞其他合约或其他子账户减仓', () => withAdl(async h => {
+  h.asterTrading.listRule({ symbol: 'ETHUSDT', quantityStep: '0.001', minQuantity: '0.001' }, '3000');
+  h.asterTrading.setPosition(LONG, 'ETHUSDT', 'LONG', '0.8');
+  h.asterTrading.setPosition(SHORT, 'ETHUSDT', 'SHORT', '-0.8');
+  h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
+  await h.ex.tick();
+  await untilClosed(h);
+  // Simulate an older position updateTime on BTCUSDT: must not block ETHUSDT.
+  h.asterTrading.setPosition(SHORT, SYMBOL, 'SHORT', '0', h.clock.now - 5_000);
+  h.asterTrading.adl(LONG, 'ETHUSDT', 'LONG', '0.4');
+  await h.ex.tick();
+  await untilClosed(h);
+  const ethIncident = recent(h)[0]!;
+  assert.equal(ethIncident.status, 'completed');
+  assert.deepEqual(ethIncident.symbols, ['ETHUSDT']);
+  assert.equal(h.asterTrading.position(LONG, 'ETHUSDT', 'LONG'), '0.4');
+  assert.equal(h.asterTrading.position(SHORT, 'ETHUSDT', 'SHORT'), '-0.4');
+
+  // An unreflected ETHUSDT batch belonging to a previous accountId on the pair must not block the current SHORT accountId.
+  h.store.db.prepare(`INSERT INTO adl_batches(id, pair_id, incident_id, client_order_id, state, settled, version, json, created_at) VALUES (?, ?, ?, ?, 'done', 1, 1, ?, ?)`)
+    .run('foreign-acc-batch', PAIR, ethIncident.id, 'adl-foreign-1', JSON.stringify({
+      id: 'foreign-acc-batch', pairId: PAIR, incidentId: ethIncident.id, clientOrderId: 'adl-foreign-1', createdAt: h.clock.now,
+      side: 'short', accountId: `0x${'9'.repeat(40)}`, symbol: 'ETHUSDT', orderSide: 'buy', positionSide: 'SHORT',
+      quantity: '0.01', state: 'done', preparedAt: h.clock.now, sentAt: h.clock.now,
+      report: { orderId: 'f1', clientOrderId: 'adl-foreign-1', symbol: 'ETHUSDT', side: 'buy', positionSide: 'SHORT', status: 'filled', quantity: '0.01', filledQuantity: '0.01', averagePrice: '3000', updatedAt: h.clock.now },
+      fill: { at: h.clock.now + 60_000, after: null, seenAt: h.clock.now }, queries: 0, postCancelQueries: 0,
+      queryAfter: h.clock.now, activeQueryAfter: h.clock.now, cancelRequestedAt: null, cancels: 0, verifiedAt: null, recovered: false, note: null,
+    }), h.clock.now);
+  h.asterTrading.adl(LONG, 'ETHUSDT', 'LONG', '0.4');
+  await h.ex.tick();
+  await untilClosed(h);
+}));
+
+test('ADL #6：撤单连续未发送超时后停机交人工处理，不永久抵消重试计数', () => withAdl(async h => {
+  h.asterTrading.inject({ operation: 'place', mode: 'rest' });
+  h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
+  await h.ex.tick();
+  const batch = current(h)!.batches[0]!;
+  assert.equal(batch.state, 'open');
+  h.asterTrading.inject({ operation: 'cancel', mode: 'not-sent', times: 50 });
+  await run(h, 4_500, 500);
+  const incident = recent(h)[0]!;
+  assert.equal(incident.status, 'halted');
+  assert.match(incident.reason ?? '', /撤单持续未发送/);
+  const saved = JSON.parse((h.store.db.prepare('SELECT json FROM adl_batches WHERE id = ?').get(batch.id) as { json: string }).json) as { cancels: number };
+  assert.equal(saved.cancels, 0);
+}, { adlCancelAfterMs: 1_000, adlQuerySpacingMs: 500, adlObservationMs: 60_000 }));

@@ -287,7 +287,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     requireIdle(rfq);
     // No await separates the check from this claim.
     admitting = true;
-    try { return await locked(work); } finally { admitting = false; }
+    try { return await locked(() => { if (shutdown) conflict('shutting_down', '服务正在停止'); return work(); }); } finally { admitting = false; }
   }
 
   // ---- market checks ---------------------------------------------------------------------------------------------
@@ -518,8 +518,12 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     const absent = Object.entries(state.tracked.sizes).filter(([key]) => !present.has(key));
     if (!absent.length) return;
     if (!group) throw new Error('跟踪策略没有开仓任务，无法用历史核对');
-    const since = group.acceptedAt, end = now();
-    if (!(end - since >= 0 && end - since <= HISTORY_LIMIT_MS)) throw new Error('开仓时间超出可核对的平仓历史范围（180 天）');
+    const CLOCK_SKEW_SLACK_MS = 60_000;
+    const priorClosedAt = Object.values(state.tasks)
+      .filter(task => task.id !== groupId && task.strategyStatus === 'closed' && task.closedAt !== null && task.closedAt <= group.acceptedAt)
+      .reduce((max, task) => Math.max(max, task.closedAt!), 0);
+    const since = Math.max(priorClosedAt, group.acceptedAt - CLOCK_SKEW_SLACK_MS), end = now(), upper = end + CLOCK_SKEW_SLACK_MS;
+    if (!(end - group.acceptedAt >= -CLOCK_SKEW_SLACK_MS && end - group.acceptedAt <= HISTORY_LIMIT_MS)) throw new Error('开仓时间超出可核对的平仓历史范围（180 天）');
     const signal = AbortSignal.timeout(RETIRE_BUDGET_MS);
     const evidence = new Map<string, Row[]>();
     for (const [key, qty] of absent) {
@@ -528,12 +532,12 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
       const required = Math.max(Number(qty), Number(opened));
       const seen = new Set<string>(), matched: Row[] = [];
       let total = 0;
-      for (const row of await client.closedPositions(symbol, since, end, signal)) {
+      for (const row of await client.closedPositions(symbol, since, upper, signal)) {
         if (row.symbol !== symbol || row.side !== side) continue;
         const openTime = Number(row.openTime), closeTime = Number(row.closeTime), amount = Number(row.qty);
         if (![openTime, closeTime, amount].every(Number.isFinite) || amount <= 0) throw new Error('平仓历史的数量或时间无效');
         const identity = `${openTime}|${closeTime}`;
-        if (seen.has(identity) || !(since <= openTime && openTime <= closeTime && closeTime <= end)) continue;
+        if (seen.has(identity) || !(since <= openTime && openTime <= closeTime && closeTime <= upper)) continue;
         seen.add(identity);
         matched.push({ symbol, side, qty: row.qty, openTime: row.openTime, closeTime: row.closeTime, ...Object.fromEntries(EVIDENCE_AMOUNTS.filter(key => row[key] !== undefined).map(key => [key, row[key]])) });
         total += amount;
@@ -1603,7 +1607,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
   async function close(): Promise<void> {
     shutdown = true;
     for (const task of Object.values(state.tasks)) if (isActive(task.status) && workers.has(task.id)) stopTask(task.id);
-    await Promise.allSettled([...workers.values()]);
+    await Promise.allSettled([...workers.values(), tail]);
   }
 
   // ---- views -----------------------------------------------------------------------------------------------------

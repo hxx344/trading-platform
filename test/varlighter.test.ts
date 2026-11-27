@@ -2498,3 +2498,44 @@ test('实盘持仓还原成策略持仓：旧记录没有策略读数时名义�
     assert.deepEqual(code(() => engine.views.liveClose({ id: 'l-old' })), [409, 'busy'], '需要人工处理的不能发平仓');
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('#11 orderPlan：A 腿精度更粗取整后重算 B 腿数量，防止两腿名义偏离', () => {
+  const mk = (venue: 'rh' | 'lighter', symbol: string, sizeDecimals: number): MarketSpec => ({
+    venue, symbol, name: symbol, id: 1, mark: 100, index: null, fundingHourly: null, sizeDecimals, priceDecimals: 2, minBase: 0.01, minQuote: 5, takerFeeBps: null,
+  });
+  const pair = {
+    key: 'rh:BTC|lighter:BTC', a: { venue: 'rh' as const, symbol: 'BTC', market: mk('rh', 'BTC', 0) }, b: { venue: 'lighter' as const, symbol: 'BTC', market: mk('lighter', 'BTC', 2) },
+    ratio: 1, symbol: 'BTC', name: 'BTC', kind: 'crypto' as const, identity: 'verified' as const, gapBps: 0, custom: false, note: '',
+  };
+  const plan = orderPlan(pair, sample(T0, 100.5, 100), 'a_rich', 150, 10, T0 + 1_000);
+  assert.deepEqual([plan.legs[0].qty, plan.legs[1].qty], ['1', '1.00']);
+
+  const ratioPair = { ...pair, ratio: 3 };
+  const smallPlan = orderPlan(ratioPair, sample(T0, 100.5, 100), 'a_rich', 150, 10, T0 + 1_000);
+  assert.deepEqual([smallPlan.legs[0].qty, smallPlan.legs[1].qty], ['0', '0.00']);
+  assert.equal(smallPlan.checks.some(check => !check.ok), true);
+});
+
+test('#20a LighterStream.depth 按 nonce 缓存排序档位并在 delta/resync 时失效', () => {
+  let clock = T0;
+  const sockets: FakeSocket[] = [];
+  const stream = new LighterStream({ venue: 'rh', connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now: () => clock });
+  try {
+    stream.setDepthMarkets(new Map([[7, '7']]));
+    stream.start();
+    const socket = sockets[0];
+    socket.open();
+    socket.push({ type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: {} });
+    socket.push({ type: 'subscribed/order_book', channel: 'order_book:7', order_book: { code: 0, bids: [{ price: '100', size: '20' }, { price: '99', size: '50' }], asks: [{ price: '101', size: '20' }, { price: '102', size: '50' }], nonce: 10 } });
+    clock += 1_000;
+    const d1 = stream.depth(7)!;
+    clock += 1_000;
+    const d2 = stream.depth(7)!;
+    assert.deepEqual([d1.bid, d1.ask, d1.at], [100, 101, T0 + 1_000]);
+    assert.deepEqual([d2.bid, d2.ask, d2.at], [100, 101, T0 + 2_000]);
+    socket.push({ type: 'update/order_book', channel: 'order_book:7', order_book: { bids: [{ price: '100.5', size: '15' }], asks: [], begin_nonce: 10, nonce: 11 } });
+    assert.equal(stream.depth(7)!.bid, 100.5);
+    socket.push({ type: 'update/order_book', channel: 'order_book:7', order_book: { bids: [{ price: '101.5', size: '10' }], asks: [], begin_nonce: 11, nonce: 12 } });
+    assert.equal(stream.depth(7), null, '倒挂触发 resync 清除缓存');
+  } finally { stream.close(); }
+});

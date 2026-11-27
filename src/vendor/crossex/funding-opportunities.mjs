@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto';
 import { D } from './money.mjs';
 import { contractIdentity, freshQuote, fxRate, quoteTime, referencePrice, settlement, transferEligibility, validIdentity, validSignal } from './model.mjs';
-import { canonicalBase, isBaseBlocked } from './asset-identity.mjs';
+import { canonicalBase, isBaseBlocked } from '../asset-identity.mjs';
 
 const FUNDING_TTL_MS = 300000, QUOTE_TTL_MS = 10000;
 const finite = value => typeof value === 'number' && Number.isFinite(value);

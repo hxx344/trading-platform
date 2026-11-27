@@ -682,17 +682,27 @@ test('实盘：一条规则预览期间页面停用另一条，后台不会用�
   assert.deepEqual(ex.previews.map(item => item.session), [`oil-rule:${a}`]);
 }, ['binance', 'bybit']));
 
-test('实盘：停服时判断轮做完进行中的规则就停，后面的规则不再预览', () => withLive(async ({ r, ex, rules }) => {
-  goLive(rules, { name: 'A' });
+test('实盘：停服时若已在预览中等待则中止不再确认下单，后面的规则也不再预览', () => withLive(async ({ r, ex, rules }) => {
+  const a = goLive(rules, { name: 'A' });
   rules.create({ config: settings({ name: 'B' }) });
   const b = (rules.view() as { rules: RuleView[] }).rules.at(-1)!;
   rules.act(b.id, 'live', { revision: b.revision, confirmLive: true });
   await feed(r, rules, OPEN, 1);
+  let stopped = false, release!: () => void;
+  ex.gate = new Promise<void>(resolve => { release = resolve; });
   r.now += 3_000; r.set(...OPEN);
-  await rules.tick(() => ex.previews.length >= 1);
-  assert.deepEqual([ex.previews.length, ex.confirms.length], [1, 1]);
-  await rules.tick();
-  assert.equal(ex.previews.length, 2, '下次启动后照常判断');
+  const ticking = rules.tick(() => stopped);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ex.previews.length, 1);
+  stopped = true;
+  release();
+  await ticking;
+  ex.gate = null;
+  assert.deepEqual([ex.previews.length, ex.confirms.length], [1, 0]);
+  const aView = (rules.view() as { rules: RuleView[] }).rules.find(item => item.id === a)!;
+  assert.deepEqual([aView.live!.phase, aView.live!.pending, aView.live!.failures], ['idle', null, 0]);
+  await feed(r, rules, OPEN, 2);
+  assert.deepEqual([ex.previews.length, ex.confirms.length], [3, 2], '下次启动后两规则均照常判断确认');
 }));
 
 test('实盘：任务被手动停止则规则停用；交易所连续拒单 3 次（没成交）规则停用，不再每分钟重试', () => withLive(async ({ r, ex, rules }) => {

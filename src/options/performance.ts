@@ -50,7 +50,7 @@ export function optionExpiry(symbol: string): number | null {
 
 /** What the report needs of a task (engine Task satisfies it). */
 export interface GroupInput {
-  type: 'open' | 'close'; status: string; acceptedAt: number; strategyStatus: 'open' | 'closed' | null; mode: StrategyMode;
+  type: 'open' | 'close'; status: string; acceptedAt: number; strategyStatus: 'open' | 'closed' | null; closedAt?: number | null; mode: StrategyMode;
   legs: Record<string, { side: Side; qty: string }>; closureEvidence: Record<string, Row[]>; openingGroup: string | null;
 }
 /** What the report needs of an order record (engine JournalEntry satisfies it). */
@@ -219,6 +219,11 @@ export function buildPerformance({ groups, executions, journal, positions, sampl
     const targets = expected.size ? expected : actual.size ? actual : fromLegs();
     if (Object.keys(evidence).length && targets.size) {
       try {
+        const CLOCK_SKEW_SLACK_MS = 60_000;
+        const priorClosedAt = group ? Object.entries(groups)
+          .filter(([otherId, other]) => otherId !== id && other.strategyStatus === 'closed' && other.closedAt != null && other.closedAt <= group.acceptedAt)
+          .reduce((max, [, other]) => Math.max(max, other.closedAt!), 0) : 0;
+        const minOpenedAt = group ? Math.max(priorClosedAt, group.acceptedAt - CLOCK_SKEW_SLACK_MS) : 0;
         let net = 0n, openingFee = 0n, closingFee = 0n, delivery = 0n, premium = 0n;
         const opened: number[] = [], closedTimes: number[] = [], currencies = new Set<string>(), seen = new Set<string>();
         let expiryVerified = true, evidenceEarly = false;
@@ -233,7 +238,7 @@ export function buildPerformance({ groups, executions, journal, positions, sampl
             const owners = evidenceOwners.get(identity);
             if (row.symbol !== symbol || row.side !== side || owners?.size !== 1 || !owners.has(id)) throw new Error('Ambiguous closure evidence');
             const openedAt = Number(row.openTime), closedAt = Number(row.closeTime);
-            if (!Number.isSafeInteger(openedAt) || !Number.isSafeInteger(closedAt) || closedAt < openedAt || (group && openedAt < group.acceptedAt)) throw new Error('Invalid closure times');
+            if (!Number.isSafeInteger(openedAt) || !Number.isSafeInteger(closedAt) || closedAt < openedAt || (group && openedAt < minOpenedAt)) throw new Error('Invalid closure times');
             const expiry = expiryFor(symbol);
             evidenceEarly ||= (expiry !== null && closedAt < expiry) || exact(row.totalCloseFee) !== 0n;
             expiryVerified &&= expiry !== null && closedAt >= expiry;

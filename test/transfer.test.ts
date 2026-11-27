@@ -13,7 +13,6 @@ import { ContractError, parseTransferConfig } from '../src/contracts.ts';
 import { DEFAULT_BUDGETS, WriterLostError, createExecutor, type Budgets } from '../src/executor.ts';
 import { MIGRATIONS, openStore, sqlHash } from '../src/store.ts';
 import { SimulatedAster } from '../src/sim-aster.ts';
-import { REGISTRY_ASTER_EXPIRY_MS, type AccountWriterPort } from '../src/account-control.ts';
 import type { PairRecord } from '../src/transfer.ts';
 import { SIM_TRANSFER_PAIR } from '../src/simulation.ts';
 import { ADL_ROLLBACK_SQL, SESSION, bindAccounts, createHarness, openIntent, previewAndConfirm, settle, type Harness } from './harness.ts';
@@ -43,45 +42,6 @@ async function run(h: Harness, ms: number, step = 5_000) {
   for (let left = ms; left > 0; left -= step) { h.advance(Math.min(step, left)); await h.ex.tick(); }
 }
 const takeover = (h: Harness) => { h.clock.now += 61_000; h.restart(); assert.equal(h.ex.acquire(), true); };
-/** A harness whose executors get a shared account-writer registry once enable() was called; each restart gets its own writer. */
-const OTHER_PID = 49_000;
-async function controlledHarness() {
-  const dir = mkdtempSync(join(tmpdir(), 'pa-transfer-control-'));
-  const { createAccountWriter } = await import(new URL('./fixtures/account-writer.mjs', import.meta.url).href) as { createAccountWriter(options: Record<string, unknown>): AccountWriterPort & { close(): void } };
-  const writers: (AccountWriterPort & { close(): void })[] = [];
-  let controlled = false, latest = 0;
-  const path = join(dir, 'execution-control.sqlite');
-  const h = createHarness({
-    control: clock => {
-      if (!controlled) return undefined;
-      // A restart replaces the process: only the newest executor's writer and other modules' writers are alive.
-      const pid = 41_000 + writers.length;
-      latest = pid;
-      const writer = createAccountWriter({ databasePath: path, moduleId: 'platform', runtimeId: randomUUID(), pid, now: () => clock.now, processAlive: (value: number) => value === latest || value === OTHER_PID });
-      writers.push(writer);
-      return { writer, environment: 'testnet' };
-    },
-  });
-  return {
-    h, writers,
-    enable() { controlled = true; },
-    /** This module's registry rows, oldest first. */
-    rows: () => (writers[0] as unknown as { db: DatabaseSync }).db.prepare('SELECT operation_id, state, intent_action, account_keys FROM aw_operations WHERE module_id = ? ORDER BY created_at, operation_id').all('platform') as { operation_id: string; state: string; intent_action: string | null; account_keys: string }[],
-    /** Pins the account to another module of the same registry. */
-    pinElsewhere(accountId: string) {
-      const other = createAccountWriter({ databasePath: path, moduleId: 'other', runtimeId: randomUUID(), pid: OTHER_PID, now: () => h.clock.now, processAlive: () => true });
-      writers.push(other);
-      const identity = { authority: 'aster', environment: 'testnet', accountId } as const;
-      other.bind(`other:${accountId}`, identity, 1);
-      other.claim([identity]);
-    },
-    dispose() {
-      h.aster.releaseHung(); h.dispose();
-      for (const writer of writers) try { writer.close(); } catch { /* a retired writer may refuse */ }
-      rmSync(dir, { recursive: true, force: true });
-    },
-  };
-}
 async function waitFor(check: () => boolean, label: string): Promise<void> {
   for (let i = 0; i < 200; i++) { if (check()) return; await new Promise(resolve => setTimeout(resolve, 2)); }
   throw new Error(`等待超时：${label}`);
@@ -622,63 +582,6 @@ test('开关：停用后不新发，未结清的划转照常结算；重放旧�
   assert.deepEqual([last(h).state, last(h).amount], ['confirmed', '50']);
 }));
 
-test('共享写者登记：划转落盘后先登记（主账户与两个子账户，保证金划转意图）再发送，回执后登记记为已执行；可停用再启用', async () => {
-  const c = await controlledHarness(), h = c.h;
-  try {
-    c.enable();
-    takeover(h);
-    await start(h);
-    await h.ex.tick();
-    const transfer = last(h);
-    assert.deepEqual([transfer.state, h.aster.calls.transfer], ['confirmed', 1]);
-    const rows = c.rows();
-    assert.deepEqual(rows.map(row => [row.operation_id, row.state, row.intent_action]), [[`platform:transfer:${transfer.id}`, 'confirmed', 'margin-transfer']]);
-    assert.equal(JSON.parse(rows[0].account_keys).length, 3);
-    assert.deepEqual(c.writers[0].pendingOperationIds(), []);
-    await flip(h, false);
-    await flip(h, true);
-    assert.equal(pairOf(h).enabled, true);
-  } finally { c.dispose(); }
-});
-
-test('共享写者登记：主账户已被其他模块占用时登记拒绝，划转记为未发送并退避，传输未调用', async () => {
-  const c = await controlledHarness(), h = c.h;
-  try {
-    c.enable();
-    takeover(h);
-    c.pinElsewhere(MAIN);
-    await start(h);
-    await h.ex.tick();
-    const transfer = last(h);
-    assert.equal(transfer.state, 'not-sent');
-    assert.match(transfer.note ?? '', /ACCOUNT_PINNED/);
-    assert.equal(h.aster.calls.transfer, 0);
-    assert.equal(stored(h).notSentStreak, 1);
-    assert.deepEqual(c.rows(), []);
-  } finally { c.dispose(); }
-});
-
-test('共享写者登记：发送途中接管时登记停在发送中，新实例在该笔结算后按本地事实结清', async () => {
-  const c = await controlledHarness(), h = c.h;
-  try {
-    c.enable();
-    takeover(h);
-    h.aster.inject({ operation: 'transfer', mode: 'hang-after-apply' });
-    await start(h);
-    const pending = h.ex.tick();
-    await waitFor(() => h.aster.calls.transfer === 1, '划转发出');
-    takeover(h);
-    h.aster.releaseHung();
-    await pending.catch(() => undefined);
-    const recovered = last(h);
-    assert.deepEqual([recovered.state, recovered.recovered], ['unknown', true]);
-    assert.deepEqual(c.rows().map(row => row.state), ['sending']);
-    await run(h, recovered.readyAt! - h.clock.now);
-    assert.equal(last(h).state, 'confirmed');
-    assert.deepEqual(c.rows().map(row => row.state), ['confirmed']);
-    assert.equal((h.store.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'transfer-control-resolved'").get() as { n: number }).n, 1);
-  } finally { c.dispose(); }
-});
 
 test('契约：aster 不是交易场所，交易意图与账户绑定都拒绝；配对与配置越界被拒绝', () => withHarness(async h => {
   bindAccounts(h.ex);
@@ -972,24 +875,6 @@ test('任务循环：划转处理整体抛错时记事件，本轮任务照常�
   assert.ok((h.store.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'transfer-tick-failed'").get() as { n: number }).n > 0);
 }));
 
-test('任务循环：注入登记时划转处理抛错，末尾的登记结清仍然执行', async () => {
-  const c = await controlledHarness();
-  try {
-    c.enable();
-    takeover(c.h);
-    let checks = 0;
-    const writer = c.writers.at(-1)!, pending = writer.pendingOperationIds.bind(writer);
-    writer.pendingOperationIds = () => { checks++; return pending(); };
-    await c.h.ex.tick();
-    // The executor's jobs, the transfers and ADL each settle once at the start and once at the end of a pass.
-    assert.equal(checks, 6, '每轮开头与末尾各结清一次');
-    c.h.store.db.exec('DROP TABLE transfers');
-    await c.h.ex.tick();
-    // The failing transfer pass skips only its own end; the executor's end-of-pass settle still runs.
-    assert.equal(checks, 11);
-    assert.equal((c.h.store.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'transfer-tick-failed'").get() as { n: number }).n, 1);
-  } finally { c.dispose(); }
-});
 
 test('划转：一笔未结清记录损坏时其余划转照常结算，只挡住损坏记录所属的配对；说明写明需人工处置，事件限频，按文档处置后恢复', () => withHarness(async h => {
   h.aster.openSubAccount(MAIN, THIRD, { available: '900' });
@@ -1017,37 +902,6 @@ test('划转：一笔未结清记录损坏时其余划转照常结算，只挡�
   assert.deepEqual([pairOf(h).blocked, last(h).pairId, last(h).state, last(h).amount], [null, PAIR, 'confirmed', '100']);
 }));
 
-test('共享写者登记：注入前留下的未知划转照常结算（没有登记可结清），之后的新划转先登记再发', async () => {
-  const c = await controlledHarness();
-  try {
-    const sent = await sendUnknown(c.h, 'lost-response', {}, { maxTransfer: '30' });
-    c.enable();
-    takeover(c.h);
-    await run(c.h, last(c.h).readyAt! - c.h.clock.now);
-    const settled = last(c.h);
-    assert.deepEqual([settled.id, settled.state, settled.basis, settled.recovered], [sent.id, 'confirmed', 'late_receipt_confirmed', true]);
-    await run(c.h, 400_000);
-    const later = transfers(c.h).slice(1);
-    assert.ok(later.length >= 1 && c.h.aster.calls.transfer === 1 + later.length);
-    assert.deepEqual(c.rows().map(row => row.operation_id), later.map(item => `platform:transfer:${item.id}`));
-    assert.ok(c.rows().every(row => row.state === 'confirmed'));
-  } finally { c.dispose(); }
-});
-
-test('共享写者登记：划转连接器请求有效期超过登记的 ASTER 过期时限时拒绝启动', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'pa-transfer-validity-'));
-  const { createAccountWriter, ASTER_WRITE_EXPIRY_MS } = await import(new URL('./fixtures/account-writer.mjs', import.meta.url).href) as { createAccountWriter(options: Record<string, unknown>): AccountWriterPort & { close(): void }; ASTER_WRITE_EXPIRY_MS: number };
-  const writer = createAccountWriter({ databasePath: join(dir, 'execution-control.sqlite'), moduleId: 'platform', runtimeId: randomUUID(), pid: 44_000, now: Date.now, processAlive: () => true });
-  try {
-    assert.equal(REGISTRY_ASTER_EXPIRY_MS, ASTER_WRITE_EXPIRY_MS, '执行器与登记的 ASTER 过期时限一致');
-    const store = openStore(join(dir, 'executor.sqlite'));
-    try {
-      const make = (requestValidityMs: number) => createExecutor({ store, connectors: [], control: { writer, environment: 'testnet' }, transfers: new SimulatedAster(Date.now, { requestValidityMs }) });
-      assert.throws(() => make(ASTER_WRITE_EXPIRY_MS + 1), code('control_budget'));
-      assert.doesNotThrow(() => make(ASTER_WRITE_EXPIRY_MS));
-    } finally { store.close(); }
-  } finally { writer.close(); rmSync(dir, { recursive: true, force: true }); }
-});
 
 test('预算：划转预算与连接器请求有效期须为正整数，未来容限须为非负整数，时钟容限须小于历史跨度；undefined 覆盖项回落默认值', () => withHarness(async h => {
   const make = (budgets: Partial<Budgets>, aster = h.aster) => () => createExecutor({ store: h.store, connectors: [h.binance, h.bybit], transfers: aster, budgets });

@@ -371,3 +371,21 @@ test('Bybit 连接器：执行器不混用真实与模拟传输：实盘里的�
       (error: unknown) => error instanceof ContractError && error.code === 'live_transport_refused');
   } finally { h.dispose(); }
 });
+
+test('Bybit 连接器 #12：存在时钟偏移时，strategyReport 与 listStrategies 换算回本地时钟且不错漏已结束策略', async () => {
+  const { venue, connector } = setup();
+  await connector.account(binding(), ['CLUSDT'], { signal: signal() });
+  // Simulate exchange server clock 20s behind local clock, calibrated via 10002 retry (offset = -20_000).
+  venue.serverSkew = -20_000;
+  venue.strategies.push(strategyRow({ strategyId: 'chase-skew', status: 2, createdTimeE3: String(NOW - 20_000), updatedTimeE3: String(NOW - 19_000) }));
+  await connector.place(binding(), order(), send());
+  const queried = await connector.queryStrategy(binding(), 'chase-skew', { signal: signal(), symbol: 'CLUSDT' });
+  assert.deepEqual([queried?.createdAt, queried?.updatedAt], [NOW, NOW + 1_000]);
+
+  const endedServerCreated = NOW - 22_000;
+  venue.strategies.push(strategyRow({ strategyId: 'ended-skew', status: 3, createdTimeE3: String(endedServerCreated), updatedTimeE3: String(endedServerCreated + 500) }));
+  const listed = await connector.listStrategies(binding(), 'CLUSDT', { from: NOW - 5_000, to: NOW }, { signal: signal() });
+  assert.equal(listed.find(item => item.strategyId === 'ended-skew')?.createdAt, endedServerCreated + 20_000);
+  const endedCall = venue.calls.filter(call => call.path === '/v5/strategy/list' && call.params.get('status') === '3').at(-1)!;
+  assert.deepEqual([endedCall.params.get('beginTimeE0'), endedCall.params.get('endTimeE0')], [String(Math.floor((NOW - 25_000) / 1000) - 1), String(Math.ceil((NOW - 20_000) / 1000))]);
+});

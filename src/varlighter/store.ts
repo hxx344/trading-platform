@@ -279,6 +279,17 @@ export function openVarLighterStore(file: string) {
     db.exec('BEGIN IMMEDIATE');
     try { const result = work(); db.exec('COMMIT'); return result; } catch (error) { if (db.isTransaction) db.exec('ROLLBACK'); throw error; }
   };
+  const durableTransaction = <T>(work: () => T): T => {
+    if (db.isTransaction) return work();
+    db.exec('PRAGMA synchronous=FULL');
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      try { const result = work(); db.exec('COMMIT'); return result; }
+      catch (error) { if (db.isTransaction) try { db.exec('ROLLBACK'); } catch { /* ignore */ } throw error; }
+    } finally {
+      try { db.exec('PRAGMA synchronous=NORMAL'); } catch { /* ignore */ }
+    }
+  };
   const legacy = (key: string, read: (old: string) => unknown[]): Sample[] => {
     const old = legacyKeyOf(key);
     return old ? (read(old) as OldRow[]).map(row => fromOldRow(row, key)) : [];
@@ -289,7 +300,7 @@ export function openVarLighterStore(file: string) {
   /** 只返回本事务新插入的样本。重复键保留先前证据，采样方不能再次推进基线或成交。 */
   const addNewSamples = (samples: readonly Sample[]): Sample[] => samples.length
     ? transaction(() => samples.filter(sample => Number(insertSample.run(...legRow(sample)).changes) > 0)) : [];
-  return {
+  const store = {
     file,
     /** 写入一批样本，已有同一时刻的忽略；返回新写入的条数。 */
     addSamples(samples: readonly Sample[]): number {
@@ -356,7 +367,11 @@ export function openVarLighterStore(file: string) {
       return { trades: row.n, netUsd: row.net, wins: row.wins ?? 0, first: row.first };
     },
     netSince(since: number): number { return (netSince.get(since) as { net: number }).net; },
-    saveLive(position: LivePosition): void { upsertLive.run(position.id, position.symbol, position.state, position.openedAt, position.closedAt, position.netUsd, JSON.stringify(position)); },
+    saveLive(position: LivePosition): void { durableTransaction(() => { upsertLive.run(position.id, position.symbol, position.state, position.openedAt, position.closedAt, position.netUsd, JSON.stringify(position)); }); },
+    saveLiveState(key: string, value: unknown, at: number): void { durableTransaction(() => { writeState.run(key, JSON.stringify(value), at); }); },
+    saveLiveIntent(runtimeKey: string, runtimeValue: unknown, position: LivePosition, at: number): void {
+      durableTransaction(() => { writeState.run(runtimeKey, JSON.stringify(runtimeValue), at); store.saveLive(position); });
+    },
     liveActive(): LivePosition[] { return parse<LivePosition>(liveActive.all()); },
     liveClosed(limit: number): LivePosition[] { return parse<LivePosition>(liveClosed.all(limit)); },
     liveNetSince(since: number): number { return (liveNetSince.get(since) as { net: number }).net; },
@@ -468,4 +483,5 @@ export function openVarLighterStore(file: string) {
     },
     close(): void { db.close(); },
   };
+  return store;
 }

@@ -1,6 +1,6 @@
 // 复制自 project-aggregation 工作台 modules/crossex/server/model.mjs（提交 7745181），改动：仅把 import 路径 ../../../server/asset-identity.mjs 改为同目录 ./asset-identity.mjs。
 import { D, Decimal } from './money.mjs';
-import { canonicalBase, crossexBase, isBaseBlocked, validBaseMapping } from './asset-identity.mjs';
+import { canonicalBase, crossexBase, isBaseBlocked, validBaseMapping } from '../asset-identity.mjs';
 
 export class AppError extends Error { constructor(message, status = 400) { super(message); this.status = status; } }
 export const defaults = Object.freeze({ enabled: false, entryPaused: false, monitorUrl: 'http://127.0.0.1:3000', monitorUsername: 'admin', notionalPerLeg: 100, maxOpen: 3, maxTotalNotional: 1000, feeBps: 6, feeSchedule: Object.freeze([]), slippageBps: 5, minNetBps: 20, takeProfitBps: 10, stopLossBps: 100, maxHoldMinutes: 60, cooldownSeconds: 60, executionMode: 'atomic', executionScenario: 'normal', executionSeed: 1, executionDelayMs: 250, clipNotional: 25, partialFillPct: 50, repairAttempts: 3, fundingEnabled: true, depthRefreshSeconds: 15, historySampleSeconds: 15 });

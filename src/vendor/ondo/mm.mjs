@@ -49,6 +49,7 @@ const CLEANUP_ATTEMPTS = 3, CLEANUP_PAUSE_MS = 10_000;
 const CANCEL_ALL = new Set(['stopping', 'maintenance', 'admission', 'auth_failed']);
 const GONE = new Set(['order_not_found', 'order_already_canceled', 'order_already_cancelled', 'order_already_fully_filled', 'order_already_filled']);
 const QUIET = new Set(['rate_limited', 'local_backlog', 'send_guard', 'closed', 'timeout', 'network']);
+const LOCAL_NO_SEND = new Set(['send_guard', 'rate_limited', 'local_backlog', 'closed', 'no_credentials']);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const abs = value => (value < 0n ? -value : value);
 
@@ -476,12 +477,14 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
       recent.set(clientId, order);
       if (recent.size > 32) recent.delete(recent.keys().next().value);
     }
+    const priceSafe = next => mode === 'ioc' ? (side === 'buy' ? price <= next.price : price >= next.price) : next.price === price;
     const canSend = () => {
       if (session !== current || market.orders.get(clientId) !== order || market.bookEpoch !== bookEpoch || order.protectionLost || holdOf(current, market) || market.dirty) return false;
       updateExit(current, market);
       const next = decide(current, market, side, order);
-      return next.type === 'place' && next.role === role && next.price === price && next.size === size && next.mode === mode;
+      return next.type === 'place' && next.role === role && priceSafe(next) && next.size === size && next.mode === mode;
     };
+    let localVeto = false;
     try {
       const placed = await current.client.place({ market: market.name, side, price: fmt(price), size: fmt(size), reduceOnly: role === 'close', clientOrderId: clientId,
         timeInForce: mode === 'ioc' ? 'IOC' : 'GTC', canSend });
@@ -496,6 +499,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
         else if (role === 'close' && (market.exit?.manual || market.exit?.trigger)) await cancelOrder(current, market, order, 'exit');
       }
     } catch (error) {
+      localVeto = error instanceof OndoError && !error.uncertain && error.status == null && LOCAL_NO_SEND.has(error.code);
       if (error instanceof OndoError && error.uncertain) {
         order.state = 'unknown'; order.since = now(); order.nextCheckAt = now() + SYNC_GAP_MS; markDirty(market);
         event(market.name, 'unknown', `下单结果未知（${error.code}），正在按订单号核对，不会重发`);
@@ -514,7 +518,7 @@ export function createOndoMarketMaker({ dataDir, readCredentials = () => null, i
         }
       }
     } finally {
-      if (mode === 'ioc') {
+      if (mode === 'ioc' && !localVeto) {
         market.exit.attempts += 1; market.exit.nextAt = now() + 1000 * 2 ** (market.exit.attempts - 1);
         markDirty(market);
       }

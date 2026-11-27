@@ -208,14 +208,13 @@ test('数据目录环境标记：新目录记下首次环境；模拟用过的�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('执行器实盘环境：拒绝共享写者登记、模拟连接器与 ASTER 划转/ADL/持仓；页面与状态标明实盘', () => {
+test('执行器实盘环境：拒绝模拟连接器与 ASTER 划转/ADL/持仓；页面与状态标明实盘', () => {
   const h = createHarness();
   try {
     const [binance, bybit] = createLiveConnectors({ accounts: ACCOUNTS }, new Map(Object.entries(KEYS)) as never);
     const base = { store: h.store, connectors: [binance, bybit], environment: 'mainnet' as const, notionalLimits: LIMITS };
     const ex = createExecutor(base);
     assert.equal(ex.environment, 'mainnet');
-    assert.throws(() => createExecutor({ ...base, control: { writer: {} as never, environment: 'testnet' } }), code('control_mainnet'));
     assert.throws(() => createExecutor({ ...base, connectors: [binance, h.bybit] }), code('live_transport_refused'));
     assert.throws(() => createExecutor({ ...base, transfers: h.aster }), code('live_transport_refused'));
     assert.throws(() => createExecutor({ ...base, adl: h.asterTrading }), code('live_transport_refused'));

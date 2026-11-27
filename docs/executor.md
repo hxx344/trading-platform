@@ -8,7 +8,7 @@
 
 - **两个入口，同一个执行器核心**：`src/main.ts` 是原型入口，默认只有进程内模拟场所，带 `--live-config` 时是实盘金丝雀（只接 Binance、Bybit，不接 ASTER 划转与 ADL）。正式服务的入口是 `src/service/main.ts`（`pnpm service`），以 `mainnet` 环境创建同一个执行器，接真实 ASTER 连接器和可选的原油连接器，见 [plan.md](plan.md) 第 3 节。文中“入口 `main.ts`”指原型入口；状态机语义在执行器核心里，两个入口共用。
 - **环境与连接器**：执行器拒绝混用，`mainnet` 环境只接受真实连接器（`transport: 'live'`），模拟环境只接受模拟连接器，ASTER 连接器同此规则（`src/executor.ts`）。文中的“模拟连接器 `src/sim-aster.ts`、`src/sim-aster-trading.ts`”是原型入口与测试用的；服务用的是 `src/aster/transfer.ts`（划转）与 `src/aster/trading.ts`（ADL 与持仓）。
-- **共享写者登记**：本仓库不使用（[plan.md](plan.md) 第 1 节），`mainnet` 环境注入登记直接拒绝启动（`control_mainnet`）。文中标“注入 `control` 时”或提到“共享写者登记”的条目只在测试里注入登记时成立。
+- **共享写者登记**：本仓库不使用（[plan.md](plan.md) 第 1 节），相关死代码已从执行器、划转与 ADL 中移除。
 - **路径与名词**：`server/…`、`modules/…`、“生产客户端”“旧系统”“交易中心”与“盘点文档”（工作台的 `docs/unified-platform-phase0-inventory.md`）都在工作台仓库，不在本仓库。
 - **实测进展**：“已知限制”里写“未验证”“接真实账户前须核实”的条目是原型阶段列的清单。真实账户上已核实与仍待实测的最新情况见 [plan.md](plan.md) 第 6 节、[oil.md](oil.md) 第 6 节与 [live-results.md](live-results.md)；本文在已有实盘记录、或本仓库的实现已经不同的条目下加了“本仓库现状”。
 

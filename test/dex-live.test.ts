@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import type { KeyVenue } from '../src/dex/keys.ts';
 import type { AccountSnapshot } from '../src/varlighter/accounts.ts';
 import { DEFAULT_LIVE_SETTINGS, LIVE_RUNTIME_KEY, LIVE_SETTINGS_KEY, LiveError, SKIP_EVENT_MS, createLiveTrader, type LiveAlert, type LiveLimits, type LivePosition, type LiveSignal, type LiveTrader } from '../src/varlighter/live.ts';
@@ -742,13 +743,21 @@ test('查单不明且账户持仓对不上或读不到：不猜、不重发，15
   }
 });
 
+async function waitUntil(check: () => boolean, ms = 1_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error('等待状态超时');
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+}
+
 test('进程重启：带着在途意图的持仓先查单，不重发；设置与停止状态也都还在', async t => {
   const h = harness(t), first = h.boot(), s = h.s;
   h.enable(first, [NVDA], { perTradeUsd: 200 });
   // 第二腿发出去之后进程被杀：应答永远没回来。
   s.place.entropy.push('hang');
   commit(first.prepare(NVDA, sig('a_rich', 200), sample(NVDA.key, s.clock, 100.3, 100)));
-  await new Promise(resolve => setTimeout(resolve, 20));
+  await waitUntil(() => s.sent.length >= 2 && h.store.liveActive()[0]?.pending?.leg === 'b');
   assert.deepEqual(h.orders(), ['lighter sell 2', 'entropy buy 2']);
   const saved = h.store.liveActive();
   assert.deepEqual([saved.length, saved[0]!.state, saved[0]!.step, saved[0]!.a.qty, saved[0]!.pending?.leg, saved[0]!.pending?.purpose, saved[0]!.pending?.clientId, saved[0]!.pending?.qty],
@@ -780,7 +789,7 @@ test('进程重启：带着在途意图的持仓先查单，不重发；设置�
   s.place.entropy.push(miss());
   s.place.lighter.push(fill(), 'hang');
   commit(live.prepare(NVDA, sig('a_rich', 100), sample(NVDA.key, s.clock, 100.3, 100)));
-  await new Promise(resolve => setTimeout(resolve, 20));
+  await waitUntil(() => h.orders(4).length >= 3);
   assert.deepEqual(h.orders(4), ['lighter sell 1', 'entropy buy 1', 'lighter buy 1 R']);
   s.clock += 3_000;
   const third = h.boot();
@@ -811,7 +820,7 @@ test('进程重启：第一腿发出后、结果回来之前重启，查到结�
   h.enable(first, [NVDA]);
   s.place.lighter.push('hang');
   commit(first.prepare(NVDA, sig('a_rich', 100), sample(NVDA.key, s.clock, 100.3, 100)));
-  await new Promise(resolve => setTimeout(resolve, 20));
+  await waitUntil(() => s.sent.length >= 1 && h.store.liveActive().length >= 1);
   assert.deepEqual(h.orders(), ['lighter sell 1']);
   assert.deepEqual([h.store.liveActive()[0]!.pending?.purpose, h.store.liveActive()[0]!.pending?.clientId, h.store.liveActive()[0]!.step], ['open', s.sent[0]!.clientId, 'b'], '步骤与在途意图同一次落库');
   s.book.set('lighter:NVDA', -1);
@@ -829,7 +838,7 @@ test('进程重启：第一腿发出后、结果回来之前重启，查到结�
   g.enable(before, [NVDA]);
   g.s.place.lighter.push('hang');
   commit(before.prepare(NVDA, sig('a_rich', 100), sample(NVDA.key, g.s.clock, 100.3, 100)));
-  await new Promise(resolve => setTimeout(resolve, 20));
+  await waitUntil(() => g.s.sent.length >= 1 && g.store.liveActive().length >= 1);
   g.s.clock += 20_000;
   const after = g.boot();
   g.s.resolve.lighter.push(done(0, null, '交易所查无此单'));
@@ -1225,7 +1234,7 @@ test('第一腿成交后落库失败：不重发第一腿；重启后按库里�
   };
   s.place.lighter.push('hang');
   commit(live.prepare(NVDA, sig('a_rich', 100), sample(NVDA.key, s.clock, 100.3, 100)));
-  await new Promise(resolve => setTimeout(resolve, 20));
+  await waitUntil(() => s.sent.length >= 1 && saves > 0);
   assert.ok(saves > 0);
   assert.equal(h.store.liveActive()[0]!.pending?.purpose, 'open', '发单前意图已落库');
   // 换一个进程（上一个卡在等应答）：这次让第一腿的应答回来，但记成交的落库失败。
@@ -1493,4 +1502,32 @@ test('策略开仓信号被挡下：返回原因，不落库、不发单；同�
   // 持仓记下策略读数，名义取信号与单笔上限的较小值。
   assert.deepEqual(h.position(live).strategy, { entrySpread: 30, entryBaseline: 0, entryRegime: 'all', aFeeBps: 0, bFeeBps: 0, estimated: false, notionalUsd: 100 });
   h.check();
+});
+
+test('#9 实盘下单自编号与意图在同一持久事务中落库：失败整体回滚、成功后持久化可读', async t => {
+  const h = harness(t), live = h.boot();
+  h.enable(live, [NVDA]);
+  const db = new DatabaseSync(h.store.file);
+  try {
+    const beforeId = (h.store.state<{ lastClientId?: number }>(LIVE_RUNTIME_KEY) ?? {}).lastClientId ?? 0;
+    const origSave = h.store.saveLive;
+    h.store.saveLive = position => {
+      if (position.pending !== null) throw new Error('SQLITE_BUSY');
+      origSave(position);
+    };
+    await h.open(live, NVDA);
+    assert.equal(h.orders().length, 0);
+    assert.equal(h.store.liveActive()[0]?.pending, null);
+    assert.equal((h.store.state<{ lastClientId?: number }>(LIVE_RUNTIME_KEY) ?? {}).lastClientId ?? 0, beforeId);
+    assert.equal((JSON.parse((db.prepare('SELECT json FROM state WHERE key = ?').get(LIVE_RUNTIME_KEY) as { json: string } | undefined)?.json ?? '{}') as { lastClientId?: number }).lastClientId ?? 0, beforeId);
+    // Recover saveLive and advance past retryAt: durable commit persists both lastClientId and opened position.
+    h.store.saveLive = origSave;
+    await h.step(live, 5_000);
+    const afterId = (JSON.parse((db.prepare('SELECT json FROM state WHERE key = ?').get(LIVE_RUNTIME_KEY) as { json: string }).json) as { lastClientId: number }).lastClientId;
+    assert.ok(afterId > beforeId);
+    assert.equal(h.position(live, NVDA).state, 'open');
+  } finally {
+    db.close();
+    h.check();
+  }
 });

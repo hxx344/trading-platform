@@ -9,7 +9,7 @@ import { feeSnapshot, roundTripFeeBps } from './fees.mjs';
 import { fundingOpportunities } from './funding-opportunities.mjs';
 import { loadCurrentFunding } from './funding-client.mjs';
 import { createPositionFunding } from './position-funding.mjs';
-import { canonicalBase, crossexBase } from './asset-identity.mjs';
+import { canonicalBase, crossexBase } from '../asset-identity.mjs';
 import { terminalIdentity } from './terminal-identity.mjs';
 import { readDisplayDepth } from '../../crossex/display-depth.ts';
 

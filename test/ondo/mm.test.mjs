@@ -1419,3 +1419,31 @@ test('an early withdrawal the venue refuses stays due: the order is withdrawn ag
   assert.equal(count('cancel'), 2); assert.ok(!v.orders.some(order => order.id === buy.id));
   assert.equal(mm.state().markets[0].lastCancel, 'unprotected');
 });
+
+test('#10 IOC stop-loss local vetoes (send_guard / local rate_limited) do not consume EXIT_ATTEMPTS, and safe IOC prices pass canSend', async () => {
+  const setup = fixture(), { f, v, mm } = setup;
+  await adoptedPosition(setup, '0.5', { maxHoldSec: 3 });
+  let localVetos = 0, exitSent = 0;
+  v.beforeSend = async input => {
+    if (input.timeInForce === 'IOC') {
+      if (localVetos < 2) { localVetos += 1; throw new OndoError('rate_limited'); }
+      // Slightly worsened top bid (still >= our limit) stays safe on IOC sell exit.
+      if (localVetos === 2) { localVetos += 1; throw new OndoError('send_guard'); }
+      f.book = [[['199.98', '10'], ['199.96', '20']], ASKS];
+      f.stream.onBook(MARKET, { time: f.time, bids: [[u('199.98'), u('10')], [u('199.96'), u('20')]], asks: [[u('200.04'), u('10')]] }, f.time);
+    }
+  };
+  v.onPlace = input => {
+    if (input.timeInForce === 'IOC') {
+      exitSent += 1;
+      v.positions.clear();
+      return { rests: false, report: { status: 'fullyfilled', filled: input.size } };
+    }
+    return { rests: false, report: { status: 'canceled', filled: '0' } };
+  };
+  await f.rounds(25);
+  assert.equal(localVetos, 3);
+  assert.equal(exitSent, 1);
+  assert.equal(v.positions.size, 0);
+  assert.doesNotMatch(f.market().exitStatus ?? '', /上限|人工接手/);
+});

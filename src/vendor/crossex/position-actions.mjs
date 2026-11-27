@@ -1,7 +1,7 @@
 // 复制自 project-aggregation 工作台 modules/crossex/server/position-actions.mjs（提交 7745181），改动：仅把 import 路径 ../../../server/asset-identity.mjs 改为同目录 ./asset-identity.mjs。
 import { AppError } from './model.mjs';
 import { D, Decimal } from './money.mjs';
-import { canonicalBase } from './asset-identity.mjs';
+import { canonicalBase } from '../asset-identity.mjs';
 
 const fail = message => { throw new AppError(message, 409); };
 const exactPositive = value => typeof value === 'string' && /^\d{1,30}(?:\.\d{1,30})?$/.test(value) && D(value).gt(0);

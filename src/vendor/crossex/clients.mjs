@@ -7,7 +7,7 @@ import { createDepthReader } from './depth-reader.mjs';
 import { positive, failure, HYPERLIQUID_INFO, sourceTime } from './public-values.mjs';
 import { readSignal, sharedRead } from './shared-read.mjs';
 import { D } from './money.mjs';
-import { canonicalBase } from './asset-identity.mjs';
+import { canonicalBase } from '../asset-identity.mjs';
 
 export const CATALOG_URL = 'https://api.gateio.ws/api/v4/crossex/rule/symbols';
 const LIGHTER_MARKETS = 'https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails';

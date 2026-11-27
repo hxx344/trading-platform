@@ -515,7 +515,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
   }
 
   /** Preview, recheck and confirm one open or close; the counts start again whatever happens. */
-  async function trigger(rule: Rule, action: RuleAction, reading: Counted, booksNow: readonly BookRow[]): Promise<void> {
+  async function trigger(rule: Rule, action: RuleAction, reading: Counted, booksNow: readonly BookRow[], stopped: () => boolean): Promise<void> {
     const id = rule.id, revision = rule.revision, phase = rule.state.live.phase;
     // Each leg's bound keeps the spread on the threshold for every batch of the job, not just the first (docs/hynix.md 8.2).
     const bounds = ruleBounds(rule.config, action, booksNow);
@@ -535,7 +535,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     // and the preview simply expires.
     const current = unchanged(id, revision, phase);
     hold(rule, `${actionName(action)}已处理，等待新盘口`);
-    if (!current) return;
+    if (!current || stopped()) return;
     const live = current.state.live, legs = planLegs(plan, current.config.market);
     // A preview that passes ends a wait on another position: one record, written with whatever this try saves next.
     if (live.blocked) {
@@ -599,7 +599,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     restart(rule.id);
   }
 
-  async function liveStep(rule: Rule, current: readonly BookRow[]): Promise<void> {
+  async function liveStep(rule: Rule, current: readonly BookRow[], stopped: () => boolean): Promise<void> {
     const live = rule.state.live;
     // In review, stored order identities are evidence for the operator and account guard. They are never replayed.
     if (live.phase === 'review') { observed.delete(rule.id); return; }
@@ -613,7 +613,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     if (action === 'open' && opensOn(live, beijingDay(time)) >= rule.config.maxOpensPerDay) { hold(rule, `今日已开仓 ${opensOn(live, beijingDay(time))} 次，达到每日上限`); return; }
     const counts = countOn(rule, current, [action]);
     const reading = counts?.[action];
-    if (reading && reading.hits >= rule.config.confirmSamples) await trigger(rule, action, reading, current);
+    if (reading && reading.hits >= rule.config.confirmSamples) await trigger(rule, action, reading, current, stopped);
   }
 
   let running: Promise<void> | null = null;
@@ -624,13 +624,13 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
     const failed: string[] = [];
     // Each rule is read again at its turn: an earlier rule's preview awaits, and the page may act on later ones meanwhile.
     for (const id of rows().map(rule => rule.id)) {
-      // Stopping: the rule in flight finishes, the rest wait for the next start (no new preview or job while shutting down).
+      // Stopping: abort after an in-flight preview (no confirm) and stop before starting later rules.
       if (stopped()) { cut = true; break; }
       const rule = find(id);
       if (!rule) continue;
       if (rule.state.observing || rule.state.mode === 'live') active.add(id);
       try {
-        if (rule.state.mode === 'live') await liveStep(rule, current);
+        if (rule.state.mode === 'live') await liveStep(rule, current, stopped);
         else if (rule.state.observing) countOn(rule, current, ['open', 'close']);
       } catch (error) { failed.push(`${ruleTitle(rule.config)}（${rule.id}）：${error instanceof Error ? error.message : String(error)}`); }
     }
@@ -639,7 +639,7 @@ function rulesOn(db: DatabaseSync, venues: readonly Venue[], books: () => readon
   }
   /**
    * Judges every active rule on the books just read; called after each market round. Rounds never overlap. `stopped` is
-   * checked between rules, so a stopping service waits for one preview at most.
+   * checked between rules and before confirm after awaiting a preview, so shutdown waits for one preview at most without sending.
    */
   function tick(stopped: () => boolean = () => false): Promise<void> {
     if (!running) running = round(stopped).finally(() => { running = null; });

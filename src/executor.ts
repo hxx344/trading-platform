@@ -20,7 +20,6 @@ import { createTransfers, type PairRecord, type TransferDeps } from './transfer.
 import { DEFAULT_ADL_BUDGETS, createAdl, type Adl, type AdlBudgets } from './adl.ts';
 import type { AdlConnector } from './adl-contracts.ts';
 import { DEFAULT_POSITIONS_BUDGETS, createPositions, type AsterPositionsConnector, type PositionsBudgets } from './positions.ts';
-import { ControlRefusal, MAX_OWNED_BUDGET_MS, REGISTRY_ASTER_EXPIRY_MS, createAccountControl, parseOperationId, type AccountWriterPort, type ControlEnvironment, type WriteOutcome, type WriterOperation } from './account-control.ts';
 
 /** Start values come from the legacy constants registered in plan 6.4; none of them is a met performance target. */
 /** The ADL budgets are documented in adl.ts. */
@@ -268,12 +267,7 @@ export interface Operation {
   positionMismatchAt: number | null;
   cancelSent: number;
   cancelRequestedAt: number | null;
-  /** Monotonic cancel sequence for shared-registry operation ids; unlike cancelSent it is never given back. Absent means 0. */
-  cancelSeq?: number;
-  /** Start of the latest query that still found this order resting. */
-  openCheckedFrom?: number | null;
-  /** First time the shared registry refused a cancel of this order. */
-  cancelBlockedAt?: number | null;
+  cancelNotSentSince?: number | null;
   /** Strategy only: last status read from the venue, and whether its children were settled then. */
   strategyStatus?: StrategyStatus | null;
   childrenSettled?: boolean;
@@ -323,15 +317,7 @@ export interface ExecutorOptions {
   environment?: Environment;
   now?: () => number;
   budgets?: Partial<Budgets>;
-  /** Shared account-writer registry; absent means this executor writes no shared state. */
-  control?: { writer: AccountWriterPort; environment: ControlEnvironment };
-  /**
-   * ASTER sub-account transfers. With control injected each is registered under the registry's margin-transfer intent
-   * (the pair's main account and both sub-accounts), so the transfer connector's signed requests must expire within the
-   * registry's ASTER expiry.
-   */
   transfers?: TransferConnector;
-  /** ASTER ADL emergency handling of the same pairs. With control injected each reduction order and cancel is registered on its sub-account. */
   adl?: AdlConnector;
   /** Read-only display of the pairs' ASTER positions; read by `refreshPositions`, which the entry schedules apart from the other passes. */
   positions?: AsterPositionsConnector;
@@ -408,7 +394,7 @@ const averageOf = (ops: readonly Pick<Operation, 'filledQuantity' | 'averagePric
 /** `pa1-` + 24 hex + `-` + leg index, plus `r` + attempt for a later order of the leg (at most three digits: both legs stop at chaseOrderLimit ≤ 999). */
 const CLIENT_ORDER_ID_LENGTH = 34;
 
-export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions, transfers: transferConnector, adl: adlConnector, positions: positionsConnector, notionalLimits, checkHynixRebalance, enableGuard, transferConfigGuard, adlOnlyEnabledPairs = false }: ExecutorOptions) {
+export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, transfers: transferConnector, adl: adlConnector, positions: positionsConnector, notionalLimits, checkHynixRebalance, enableGuard, transferConfigGuard, adlOnlyEnabledPairs = false }: ExecutorOptions) {
   // Caps are optional; a malformed cap stops the start instead of being ignored.
   const limits = notionalLimits ? parseNotionalLimits(notionalLimits) : null;
   // A standalone live executor can share the account while using a different data directory from the rule owner.
@@ -423,12 +409,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   if (!Number.isSafeInteger(budgets.chaseFailureLimit) || budgets.chaseFailureLimit < 1 || budgets.chaseFailureLimit > 99) throw new ContractError(500, 'budget', 'chaseFailureLimit 须为 1–99');
   if (!Number.isSafeInteger(budgets.chaseRepriceMs) || budgets.chaseRepriceMs < 500 || budgets.chaseRepriceMs > 60_000) throw new ContractError(500, 'budget', 'chaseRepriceMs 须为 500–60000');
   if (!Number.isSafeInteger(budgets.maxSlippageBps) || budgets.maxSlippageBps < 1 || budgets.maxSlippageBps > MAX_SLIPPAGE_BPS) throw new ContractError(500, 'budget', `maxSlippageBps 须为 1–${MAX_SLIPPAGE_BPS}`);
-  if (controlOptions && Math.max(budgets.callTimeoutMs, budgets.adlOrderTimeoutMs) > MAX_OWNED_BUDGET_MS) throw new ContractError(500, 'control_budget', `共享写者登记要求单次调用不超过 ${MAX_OWNED_BUDGET_MS} 毫秒`);
-  // The registry stops gating on an unknown ASTER transfer this long after it; a request still valid then could land unseen.
-  if (controlOptions && transferConnector && transferConnector.capabilities.requestValidityMs > REGISTRY_ASTER_EXPIRY_MS) throw new ContractError(500, 'control_budget', `共享写者登记要求划转请求有效期不超过 ${REGISTRY_ASTER_EXPIRY_MS} 毫秒`);
-  // The registry pins an account to its first claimant forever, so a real account claimed here could never be written by
-  // the workbench again; the live canary runs on accounts the workbench does not trade, without the registry (3.0c).
-  if (controlOptions && environment === 'mainnet') throw new ContractError(500, 'control_mainnet', '实盘金丝雀不接入共享写者登记：登记会把真实账户永久归属本模块');
   const venues = new Map<Venue, VenueConnector>();
   for (const connector of connectors) {
     // A simulated environment reaches only simulated venues and the mainnet only real ones, so no configuration mistake
@@ -460,12 +440,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   let transferTickFailure: { reason: string; at: number } | null = null, adlTickFailure: { reason: string; at: number } | null = null;
   /** Operations whose send is running in this process; any other prepared or sending row was interrupted. */
   const inFlight = new Set<string>();
-  /** Operations whose cancel is running in this process. */
-  const cancelling = new Set<string>();
-  const control = controlOptions ? createAccountControl({ ...controlOptions, lost: (message: string): never => {
-    retireLease('共享账户写入登记失效', undefined, now());
-    throw new WriterLostError(message);
-  } }) : null;
 
   const connectorFor = (venue: Venue): VenueConnector => venues.get(venue) ?? reject('venue_unavailable', `${VENUE_NAMES[venue]} 连接器不可用`, 503);
   const chaseConnector = (venue: Venue): ChaseConnector => {
@@ -528,7 +502,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     });
     if (!lease) return false;
     lastLease = lease; // Only report grants and renewals that actually committed.
-    if (control) { try { control.keepAlive(); } catch (error) { if (!(error instanceof WriterLostError)) throw error; } }
     return !retired;
   }
 
@@ -812,11 +785,11 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   // Transfers and ADL use this only as their send guard: the writer check, and no new send once a stop is draining.
   let draining = false;
   const assertSendable = (): void => { assertWriter(); if (draining) throw new Error('服务正在停止，不再发出新的请求'); };
-  const transfers = createTransfers({ db, now, budgets, connector: transferConnector ?? null, control, write, assertWriter: assertSendable, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
+  const transfers = createTransfers({ db, now, budgets, connector: transferConnector ?? null, write, assertWriter: assertSendable, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
     busy: pairId => adl.busy(pairId), adlSending: pairId => adl.sending(pairId), enableGuard, configGuard: transferConfigGuard,
     // Only enabled pairs are watched for ADL here, so switching one on starts its watch afresh rather than catching up the pause.
     ...(adlOnlyEnabledPairs ? { onEnabled: (pair: PairRecord, from: number) => adl.watchFrom(pair, from) } : {}) });
-  const adl: Adl = createAdl({ db, now, budgets, connector: adlConnector ?? null, control, write, assertWriter: assertSendable, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
+  const adl: Adl = createAdl({ db, now, budgets, connector: adlConnector ?? null, write, assertWriter: assertSendable, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
     pairs: adlOnlyEnabledPairs ? () => transfers.records().filter(pair => pair.enabled || adl.busy(pair.id) !== null) : transfers.records,
     // A pair switched off can still be given its ADL settings (the config's starting value) before it is taken over.
     configurablePairs: transfers.records,
@@ -1153,6 +1126,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         if (existing.kind !== 'confirm' || existing.digest !== payload || existing.session !== session) reject('request_reused', '请求编号已用于其他内容', 409);
         return { accepted: true as const, duplicate: true, job: jobView(existing.job_id) };
       }
+      if (draining) reject('shutting_down', '服务正在停止，不再受理新任务', 503);
       const record = db.prepare('SELECT * FROM previews WHERE id = ?').get(body.previewId) as { session: string; expires_at: number; consumed_job: string | null; json: string } | undefined;
       if (!record || record.session !== session || record.expires_at <= now() || record.consumed_job) reject('preview_invalid', '预览已过期、已提交或不属于本会话，请重新预览', 409);
       const plan = JSON.parse((record as { json: string }).json) as Preview;
@@ -1234,6 +1208,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         const first = readJob(existing.job_id), group = first.group ?? reject('group_missing', '四腿任务缺少分组', 500);
         return { accepted: true as const, duplicate: true, group: group.id, jobs: [jobView(first.id), jobView(group.peer)] };
       }
+      if (draining) reject('shutting_down', '服务正在停止，不再受理新任务', 503);
       const record = db.prepare('SELECT * FROM previews WHERE id = ?').get(body.previewId) as { session: string; expires_at: number; consumed_job: string | null; json: string } | undefined;
       if (!record || record.session !== session || record.expires_at <= now() || record.consumed_job) reject('preview_invalid', '预览已过期、已提交或不属于本会话，请重新预览', 409);
       const plan = JSON.parse((record as { json: string }).json) as FourLegPreview;
@@ -1285,7 +1260,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   function acknowledge(jobId: string, requestId: string, session: string): ReturnType<typeof jobView> {
     if (!UUID.test(requestId)) reject('request_id', '请求编号无效');
     const payload = digest({ kind: 'acknowledge', jobId });
-    const view = write(() => {
+    return write(() => {
       const existing = db.prepare('SELECT * FROM commands WHERE request_id = ?').get(requestId) as { digest: string; session: string } | undefined;
       if (existing) {
         if (existing.digest !== payload || existing.session !== session) reject('request_reused', '请求编号已用于其他内容', 409);
@@ -1301,33 +1276,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       event(jobId, 'attention-acknowledged', { requestId });
       return jobView(jobId);
     });
-    if (!control) return view;
-    releaseControl(jobId);
-    return jobView(jobId);
-  }
-  /**
-   * A person has taken over the job's exposure. Its writes still unresolved in the shared registry are
-   * released as possibly executed, so the account is writable again; local reconciliation goes on.
-   */
-  function releaseControl(jobId: string): void {
-    const mine = new Map(opsOf(jobId).map(op => [op.clientOrderId, op.id]));
-    try { if (!control?.anyPending()) return; } catch (error) { if (error instanceof WriterLostError) throw error; return; }
-    for (const leg of readJob(jobId).legs) {
-      // Writes on a principal that is no longer bound stay in the registry for manual recovery.
-      const row = accountFor(leg.venue);
-      if (!row || row.account_key !== leg.accountKey) continue;
-      const binding = bindingOf(row);
-      // A refusal here is retried by settleControl on every pass, which treats the acknowledgement as settling.
-      let pending: string[];
-      try { pending = control.pending(binding); } catch (error) { if (error instanceof WriterLostError) throw error; continue; }
-      for (const operationId of pending) {
-        const parsed = parseOperationId(operationId), opId = parsed && mine.get(parsed.clientOrderId);
-        // A write still running finishes its own entry once its result is durable; resolving it now would release the account mid-send.
-        if (!opId || inFlight.has(opId) || cancelling.has(opId)) continue;
-        try { control.resolve(binding, operationId, 'confirmed'); } catch (error) { if (error instanceof WriterLostError) throw error; continue; }
-        write(() => event(jobId, 'control-released', { operationId }));
-      }
-    }
   }
 
   // ---- strategies without an answer --------------------------------------------
@@ -1375,11 +1323,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     // createdAt is the venue's clock; the window is the local prepare-to-send span widened by the skew.
     const from = op.preparedAt - budgets.adoptSkewMs, to = (op.sentAt ?? op.preparedAt) + budgets.callTimeoutMs + budgets.adoptSkewMs;
     if (report.createdAt < from || report.createdAt > to) reject('strategy_window', `${name} 该策略的创建时间不在本委托发送时段内，不能认领`, 409);
-    const adopted = write(() => {
+    write(() => {
       if (priorCommand(requestId, payload, session)) return false;
       const current = readOp(op.id);
       if (readJob(jobId).status !== 'attention' || !isOrphanStrategy(current)) reject('operation_changed', '待核对委托已变化，请刷新后重试', 409);
-      if (claimedStrategies().has(strategyId)) reject('strategy_claimed', '该策略编号已被其他委托认领', 409);
       db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(requestId, 'adopt-strategy', payload, session, jobId, now());
       applyStrategy(current, report);
       current.adoptedAt = now(); current.note = '人工认领的追价策略';
@@ -1389,14 +1336,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       event(jobId, 'strategy-adopted', { op: op.id, requestId, strategyId, state: current.state, strategyStatus: report.status, filled: report.filledQuantity });
       return true;
     });
-    if (!adopted) return jobView(jobId);
-    // The create must be settled in the registry first: an unresolved write on the account refuses the stop's record.
-    settleControl();
     const latest = readOp(op.id);
     if (latest.state === 'open' && latest.strategyStatus !== 'terminal') {
       try { await cancel(readJob(jobId), latest); } catch (error) { if (error instanceof WriterLostError) throw error; }
     }
-    settleControl();
     return jobView(jobId);
   }
 
@@ -1432,7 +1375,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (cmp(positionOf(snapshot, leg.symbol, leg.side), expectedPosition(job, op.leg)) !== 0 || snapshot.openOrders.some(order => order.symbol === leg.symbol)) {
       reject('position_mismatch', `${name} 当前持仓或挂单与本任务已知成交不一致，不能确认策略未创建`, 409);
     }
-    const confirmed = write(() => {
+    write(() => {
       if (priorCommand(requestId, payload, session)) return false;
       const current = readOp(op.id);
       if (readJob(jobId).status !== 'attention' || !isOrphanStrategy(current)) reject('operation_changed', '待核对委托已变化，请刷新后重试', 409);
@@ -1443,7 +1386,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       event(jobId, 'strategy-not-created', { op: op.id, requestId });
       return true;
     });
-    if (confirmed) settleControl();
     return jobView(jobId);
   }
 
@@ -1457,7 +1399,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const { jobId, requestId } = manualId(raw);
     if (raw.acknowledgeRisk !== true) reject('acknowledge_risk', '强制释放须明确确认风险：策略可能已成交，由人工在交易所处理');
     const payload = digest({ kind: 'release-strategy', jobId });
-    const released = write(() => {
+    write(() => {
       if (priorCommand(requestId, payload, session)) return false;
       const op = orphanOf(readJob(jobId));
       db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(requestId, 'release-strategy', payload, session, jobId, now());
@@ -1467,7 +1409,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       event(jobId, 'strategy-released', { op: op.id, requestId });
       return true;
     });
-    if (released) settleControl();
     return jobView(jobId);
   }
 
@@ -1519,8 +1460,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       const { baseline, positionMode } = checkLegAccount({ ...leg, quantity: unfilledOf(job, leg.index) }, snapshot, job.action, own);
       if (cmp(baseline, expectedPosition(job, leg.index)) !== 0 || positionMode !== leg.positionMode) reject('position_changed', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 持仓已变化，请重新预览`, 409);
     }
-    // Both accounts: a lead whose hedge account cannot be written would leave an exposure nobody can close.
-    for (const leg of job.legs) admit(leg);
     return checks.map(check => check.quote);
   }
   /**
@@ -1558,7 +1497,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (!rebalanceStillFits(balance, job.rebalance.method, leg, targetRules.contractSize)) {
       reject('rebalance_changed', '当前两腿盘口已不支持原先确认的调平方向或数量，请重新预览', 409);
     }
-    admit(leg);
     return books;
   }
   /** What this job has yet to fill on a leg; a close needs at least that much position left. */
@@ -1581,9 +1519,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (leg.orderSide === 'buy' ? cmp(price, quote.ask) >= 0 : cmp(price, quote.bid) <= 0) reject('price_moved', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 挂 ${price} 会立即成交（盘口 ${quote.bid} / ${quote.ask}），暂不挂单`, 409);
     return price;
   }
-  function admit(leg: PlannedLeg): void {
-    if (control) control.admit(bindingStillValid(leg), budgets.callTimeoutMs);
-  }
   /**
    * The hedge reduces the lead's exposure: only the account basis that decides its quantity is required (L084).
    * A resumed hedge expects the preview baseline moved by the fills of this job's earlier hedge orders.
@@ -1594,7 +1529,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const own = opsOf(job.id);
     const { baseline, positionMode } = checkLegAccount({ ...leg, quantity: '0' }, snapshot, job.action, own);
     if (cmp(baseline, expectedPosition(job, 1)) !== 0 || positionMode !== leg.positionMode) reject('position_changed', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 持仓已变化，对冲腿未发送`, 409);
-    admit(leg);
   }
 
   async function send(job: Job, index: 0 | 1, quantity: string, attempt = 0, lead: { batch: number; price: string | null; books?: readonly Quote[] } = { batch: 0, price: null }): Promise<void> {
@@ -1639,22 +1573,11 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       event(job.id, 'operation-prepared', { op: op.id, leg: index, quantity });
       return valid;
     });
-    // The shared operation is recorded after the local prepared row and before the sending mark, so either store alone proves transport was not called.
-    let registered: WriterOperation | null = null;
-    if (control) {
-      try { registered = control.prepareCreate(binding, job.id, request); }
-      catch (error) {
-        if (!(error instanceof ControlRefusal)) throw error;
-        write(() => { const current = readOp(op.id); Object.assign(current, { state: 'not-sent', note: error.message.slice(0, 200) }); saveOp(current); event(job.id, 'operation-sent', { op: op.id, state: current.state, filled: '0' }); });
-        return;
-      }
-    }
-    try { write(() => { Object.assign(op, { state: 'sending', sentAt: now() }); saveOp(op); }); }
-    catch (error) { if (registered) control?.finish(registered, 'rejected'); throw error; }
+    write(() => { Object.assign(op, { state: 'sending', sentAt: now() }); saveOp(op); });
     let report: OrderReport | null = null, strategyId: string | null = null, failure: unknown = null;
     const beforeSend = () => {
       assertWriter();
-      if (registered) control?.assertSend(registered, budgets.callTimeoutMs);
+      if (draining && index === 0) throw new VenueError('not-sent', '服务正在停止，不再发出新的首腿委托');
       const current = readJob(job.id);
       if (stopRequested(job.id) || FINAL_JOB.has(current.status)) throw new VenueError('not-sent', '任务已停止或结束，不再发出新委托');
       if (books) {
@@ -1694,8 +1617,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       event(job.id, 'operation-sent', { op: op.id, state: current.state, filled: current.filledQuantity, ...(strategyId !== null ? { strategyId } : {}) });
       return current.state as OpState;
     });
-    // Released only after the local result is durable; anything left open is settled from local facts later.
-    if (registered && settled) control?.finish(registered, outcomeOf(settled));
     if (settled === 'open' && report?.status === 'acknowledged') await reconcile(job, readOp(op.id));
   }
   type AckCheck = { report: StrategyReport } | { orphan: string } | { unread: string };
@@ -1715,10 +1636,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       if (error instanceof ContractError && error.code === 'strategy_identity') return { orphan: `回报的策略编号 ${strategyId} 经查询与本委托身份不一致` };
       return { unread: `回报的策略编号 ${strategyId} 暂未能查询核对身份（${error instanceof Error ? error.message.slice(0, 120) : '未知'}），核对前不发送停止` };
     }
-  }
-  function outcomeOf(state: OpState): WriteOutcome {
-    if (state === 'open' || state === 'filled' || state === 'canceled') return 'confirmed';
-    return state === 'rejected' || state === 'not-sent' || state === 'not-created' ? 'rejected' : 'unknown';
   }
 
   /** A paused strategy or one awaiting child settlement still needs reconciliation. */
@@ -1746,8 +1663,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
 
   // ---- reconciliation ----------------------------------------------------------
-  /** The send starts at most a call timeout after the count; the venue then accepts the signed cancel until its validity ends. */
-  const cancelSettledAt = (op: Operation): number => (op.cancelRequestedAt ?? 0) + budgets.callTimeoutMs + connectorFor(op.venue).capabilities.requestValidityMs + budgets.createArrivalMarginMs;
   const createSettledAt = (op: Operation): number => (op.sentAt ?? op.preparedAt) + Math.max(budgets.createObserveMs, budgets.callTimeoutMs + budgets.createArrivalMarginMs, connectorFor(op.venue).capabilities.requestValidityMs + budgets.createArrivalMarginMs);
 
   /**
@@ -1776,7 +1691,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (!row || row.account_key !== leg.accountKey) { write(() => { const current = readOp(op.id); current.note = '账户绑定已变化，暂停核对'; saveOp(current); }); return; }
     if (isStrategy(op)) return reconcileStrategy(job, op, bindingOf(row));
     if (op.identityMismatchAt != null) return;
-    const binding = bindingOf(row), startedAt = now(), request = op.request as OrderRequest;
+    const binding = bindingOf(row), request = op.request as OrderRequest;
     let report: OrderReport | null;
     try {
       const value = await callVenue('read', signal => connectorFor(op.venue).query(binding, request, { signal, remoteId: op.remoteId, positionMode: leg.positionMode }));
@@ -1799,7 +1714,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         const current = readOp(op.id);
         if (SETTLED.has(current.state)) return;
         const working = applyReport(current, found, !!job.fourLegQuantityIssue); current.note = null;
-        if (working) current.openCheckedFrom = startedAt;
         saveOp(current); event(job.id, 'operation-reconciled', { op: op.id, state: current.state });
         return working;
       });
@@ -1842,7 +1756,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   async function reconcileStrategy(job: Job, op: Operation, binding: AccountBinding): Promise<boolean | void> {
     const strategyId = op.remoteId;
     if (strategyId === null) return;
-    const startedAt = now();
     let report: StrategyReport | null;
     try { const value = await callVenue('read', signal => chaseConnector(op.venue).queryStrategy(binding, strategyId, { signal, symbol: op.request.symbol })); report = value === null ? null : parseStrategyReport(value, { ...strategyIdentity(op), strategyId }); }
     catch (error) {
@@ -1869,7 +1782,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       }
       applyStrategy(current, found, !!job.fourLegQuantityIssue);
       current.note = strategyNote(current);
-      if (current.state === 'open') current.openCheckedFrom = startedAt;
       saveOp(current); event(job.id, 'operation-reconciled', { op: op.id, state: current.state, strategyStatus: current.strategyStatus, filled: current.filledQuantity });
       return current.state === 'open';
     });
@@ -1933,56 +1845,39 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (strategyId === null || (strategyId !== undefined && op.identityVerifiedAt == null)) return;
     const guardedWithdrawal = job.status === 'attention' || !!job.fourLegQuantityIssue;
     const leg = legAt(job, op.leg), binding = guardedWithdrawal ? bindingStillValid(leg) : bindingOf(accountFor(leg.venue) ?? reject('account_missing', '账户绑定缺失，保留待核对', 409));
-    const seq = (op.cancelSeq ?? 0) + 1;
+    const priorNotSentSince = op.cancelNotSentSince;
     let stopFailed: string | null = null;
-    // The shared operation comes first: a sequence above the local one then proves this cancel was never sent.
-    let registered: WriterOperation | null = null;
-    if (control) {
-      try { registered = control.prepareCancel(binding, job.id, op.request, seq, strategyId); }
-      catch (error) {
-        if (!(error instanceof ControlRefusal)) throw error;
-        write(() => { const current = readOp(op.id); current.cancelBlockedAt ??= now(); current.note = `撤单未发送：${error.message.slice(0, 160)}`; saveOp(current); });
-        return;
-      }
-    }
-    cancelling.add(op.id);
+    // Counted before transport so a crash mid-request stays counted; only a provable not-sent gives it back.
+    write(() => { const current = readOp(op.id); current.cancelSent += 1; current.cancelRequestedAt = now(); current.cancelNotSentSince = null; saveOp(current); event(job.id, 'cancel-sent', { op: op.id, attempt: current.cancelSent, ...(reason ? { reason } : {}) }); });
+    const beforeSend = () => {
+      assertWriter();
+      const latest = readJob(job.id);
+      if (latest.acknowledgedAt != null) reject('already_acknowledged', '已人工接管，停止自动撤单', 409);
+      if (FINAL_JOB.has(latest.status) && !guardedWithdrawal) reject('withdrawal_changed', '任务已转入结清或人工核对，本次撤单停止', 409);
+      if (guardedWithdrawal) bindingStillValid(leg);
+    };
     try {
-      // Counted before transport so a crash mid-request stays counted; only a provable not-sent gives it back.
-      try { write(() => { const current = readOp(op.id); current.cancelSent += 1; current.cancelSeq = seq; current.cancelRequestedAt = now(); current.cancelBlockedAt = null; saveOp(current); event(job.id, 'cancel-sent', { op: op.id, attempt: current.cancelSent, ...(reason ? { reason } : {}) }); }); }
-      catch (error) { if (registered) control?.finish(registered, 'rejected'); throw error; }
-      let outcome: WriteOutcome | null = null;
-      const beforeSend = () => {
-        assertWriter();
-        const latest = readJob(job.id);
-        if (latest.acknowledgedAt != null) reject('already_acknowledged', '已人工接管，停止自动撤单', 409);
-        if (FINAL_JOB.has(latest.status) && !guardedWithdrawal) reject('withdrawal_changed', '任务已转入结清或人工核对，本次撤单停止', 409);
-        if (guardedWithdrawal) bindingStillValid(leg);
-        if (registered) control?.assertSend(registered, budgets.callTimeoutMs);
-      };
-      try {
-        if (strategyId !== undefined) {
-          const ack = parseStrategyAck(await callVenue('write', signal => chaseConnector(op.venue).stopStrategy(binding, strategyId, { signal, beforeSend })));
-          if (ack.strategyId !== strategyId) reject('strategy_identity', '停止回报的策略编号与本操作不一致', 502);
-          outcome = 'confirmed';
-        } else {
-          const request = op.request as OrderRequest;
-          const report = parseOrderReport(await callVenue('write', signal => connectorFor(op.venue).cancel(binding, request, { signal, beforeSend, remoteId: op.remoteId, positionMode: leg.positionMode })), request, op.remoteId);
-          write(() => { const current = readOp(op.id); if (SETTLED.has(current.state)) return; applyReport(current, report); saveOp(current); });
-          outcome = 'confirmed';
-        }
-      } catch (error) {
-        outcome ??= error instanceof VenueError && (error.kind === 'not-sent' || error.kind === 'rejected') ? 'rejected' : 'unknown';
-        const note = `撤单未确认：${error instanceof Error ? error.message.slice(0, 160) : '未知'}`;
-        stopFailed = note;
-        write(() => {
-          const current = readOp(op.id);
-          if (error instanceof OrderOwnerConflict) return holdOrderOwnerConflict(job, current);
-          if (error instanceof VenueError && error.kind === 'not-sent') current.cancelSent -= 1;
-          current.note = note; saveOp(current);
-        });
+      if (strategyId !== undefined) {
+        const ack = parseStrategyAck(await callVenue('write', signal => chaseConnector(op.venue).stopStrategy(binding, strategyId, { signal, beforeSend })));
+        if (ack.strategyId !== strategyId) reject('strategy_identity', '停止回报的策略编号与本操作不一致', 502);
+      } else {
+        const request = op.request as OrderRequest;
+        const report = parseOrderReport(await callVenue('write', signal => connectorFor(op.venue).cancel(binding, request, { signal, beforeSend, remoteId: op.remoteId, positionMode: leg.positionMode })), request, op.remoteId);
+        write(() => { const current = readOp(op.id); if (SETTLED.has(current.state)) return; applyReport(current, report); saveOp(current); });
       }
-      if (registered) control?.finish(registered, outcome);
-    } finally { cancelling.delete(op.id); }
+    } catch (error) {
+      const note = `撤单未确认：${error instanceof Error ? error.message.slice(0, 160) : '未知'}`;
+      stopFailed = note;
+      write(() => {
+        const current = readOp(op.id);
+        if (error instanceof OrderOwnerConflict) return holdOrderOwnerConflict(job, current);
+        if (error instanceof VenueError && error.kind === 'not-sent') {
+          current.cancelSent -= 1;
+          current.cancelNotSentSince = priorNotSentSince ?? now();
+        }
+        current.note = note; saveOp(current);
+      });
+    }
     if (strategyId === undefined) return;
     try { await reconcile(job, readOp(op.id)); } catch (error) { if (error instanceof WriterLostError) throw error; }
     // The read clears the note; a failed stop must stay visible while the strategy still runs.
@@ -2005,8 +1900,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         write(() => { const current = readOp(op.id); if (SETTLED.has(current.state)) return; current.note = `核对失败：${error instanceof Error ? error.message.slice(0, 160) : '未知'}`; saveOp(current); });
       }
     }
-    // A write this pass settled must not read as an unresolved registry entry when the same pass resends.
-    settleControl();
     if (FINAL_JOB.has(readJob(job.id).status)) return;
     if (holdOrphan(job.id)) return;
     // The grace starts no earlier than this writer's takeover, so a long outage still gets full checks before escalation.
@@ -2044,10 +1937,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       write(() => finish(readJob(job.id), 'attention', `${withdrawnFor(job)}${which}撤单 ${exhausted.cancelSent} 次仍未确认，委托可能仍在挂单${leadToo}；需人工核对`));
       return;
     }
-    // A refusal caused by this order's own unknown cancel clears once that cancel's window has passed, so the grace counts from then;
-    // like every grace here it starts no earlier than this writer's takeover.
-    const blocked = opsOf(job.id).find(item => item.state === 'open' && wantsStop(item, withdraw) && item.cancelBlockedAt != null && now() >= Math.max(item.cancelBlockedAt, item.cancelRequestedAt === null ? 0 : cancelSettledAt(item), heldSince) + budgets.unresolvedGraceMs);
-    if (blocked) { write(() => finish(readJob(job.id), 'attention', `${withdrawnFor(job)}撤单被账户写入登记阻止超过 ${budgets.unresolvedGraceMs} 毫秒（${(blocked.note ?? '').slice(0, 120)}），委托仍在挂单；需人工核对`)); return; }
+    const notSentLimit = budgets.cancelAttempts * budgets.cancelRetryMs + budgets.unresolvedGraceMs;
+    const notSentStuck = opsOf(job.id).find(item => item.state === 'open' && wantsStop(item, withdraw) && item.cancelNotSentSince != null && now() >= Math.max(item.cancelNotSentSince, heldSince) + notSentLimit);
+    if (notSentStuck) { write(() => finish(readJob(job.id), 'attention', `${withdrawnFor(job)}撤单连续未能发送超过 ${notSentLimit} 毫秒（${(notSentStuck.note ?? '').slice(0, 120)}），委托仍在挂单；需人工核对`)); return; }
     const lagging = opsOf(job.id).find(item => item.state === 'open' && item.childrenWaitSince != null && now() >= Math.max(item.childrenWaitSince, heldSince) + budgets.unresolvedGraceMs);
     if (lagging) { write(() => finish(readJob(job.id), 'attention', `${VENUE_NAMES[lagging.venue]} 追价策略已结束，但子单超过 ${budgets.unresolvedGraceMs} 毫秒仍未结清，成交量无法确认；需人工核对`)); return; }
     // An id that no read has verified is never stopped, so it may run on unseen; that too is bounded by the grace.
@@ -2076,7 +1968,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       catch (error) {
         if (error instanceof WriterLostError) throw error;
         const reason = error instanceof Error ? error.message.slice(0, 200) : '发送前检查失败';
-        const retry = error instanceof ContractError && ['venue_read_failed', 'quote_window', 'four_leg_peer'].includes(error.code) || error instanceof ControlRefusal && error.transient;
+        const retry = error instanceof ContractError && ['venue_read_failed', 'quote_window', 'four_leg_peer'].includes(error.code);
         if (retry && now() < job.deadlineAt) { write(() => { const current = readJob(job.id); if (current.reason !== reason) { current.reason = reason; saveJob(current); } }); return; }
         write(() => finish(readJob(job.id), 'failed', reason, error instanceof ContractError && error.code === 'price_moved' ? 'price_moved' : undefined)); return;
       }
@@ -2150,7 +2042,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       try { await guardHedge(job); }
       catch (error) {
         // A position that disagrees may be the venue lagging behind the last fill (L110); it must persist through the grace before a person is called.
-        const waiting = error instanceof ContractError && error.code === 'venue_read_failed' ? '账户读取' : error instanceof ControlRefusal && error.transient ? '账户写入登记'
+        const waiting = error instanceof ContractError && error.code === 'venue_read_failed' ? '账户读取'
           : error instanceof ContractError && error.code === 'position_changed' ? '持仓核对' : null;
         if (waiting) {
           const message = error instanceof Error ? error.message : '未知';
@@ -2234,7 +2126,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       try { quote = await guardRebalance(job); }
       catch (error) {
         const reason = error instanceof Error ? error.message.slice(0, 200) : '发送前检查失败';
-        const retry = error instanceof ContractError && error.code === 'venue_read_failed' || error instanceof ControlRefusal && error.transient;
+        const retry = error instanceof ContractError && error.code === 'venue_read_failed';
         if (retry && now() < job.deadlineAt) { write(() => { const current = readJob(job.id); current.reason = reason; saveJob(current); }); return; }
         write(() => finish(readJob(job.id), 'failed', reason)); return;
       }
@@ -2453,63 +2345,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
 
   // ---- loop --------------------------------------------------------------------
-  /**
-   * Resolves this module's open shared operations from local facts, after a crash or a failed finish.
-   * Nothing is resolved while its write may still be in flight or the local evidence is missing.
-   */
-  function settleControl(): void {
-    if (!control) return;
-    try { if (!control.anyPending()) return; } catch (error) { if (error instanceof WriterLostError) throw error; return; }
-    for (const row of db.prepare('SELECT * FROM accounts WHERE environment = ?').all(environment) as unknown as AccountRow[]) {
-      const binding = bindingOf(row);
-      let pending: string[];
-      try { pending = control.pending(binding); } catch (error) { if (error instanceof WriterLostError) throw error; continue; }
-      for (const operationId of pending) {
-        // One entry that cannot be judged (a venue without a connector, say) must not stop the rest or the pass.
-        let outcome: ReturnType<typeof controlOutcome>;
-        try { outcome = controlOutcome(operationId); } catch (error) { if (error instanceof WriterLostError) throw error; continue; }
-        if (!outcome) continue;
-        try { control.resolve(binding, operationId, outcome); event(jobOfOperation(operationId), 'control-resolved', { operationId, outcome }); }
-        catch (error) { if (error instanceof WriterLostError) throw error; }
-      }
-    }
-  }
-  /** The job owning a registry entry, so its resolution shows in that job's history. */
-  function jobOfOperation(operationId: string): string | null {
-    const parsed = parseOperationId(operationId);
-    const row = parsed && db.prepare('SELECT job_id FROM operations WHERE client_order_id = ?').get(parsed.clientOrderId) as { job_id: string } | undefined;
-    return row?.job_id ?? null;
-  }
-  function controlOutcome(operationId: string): 'confirmed' | 'rejected' | null {
-    const parsed = parseOperationId(operationId);
-    const row = parsed && db.prepare('SELECT json FROM operations WHERE client_order_id = ?').get(parsed.clientOrderId) as { json: string } | undefined;
-    if (!parsed || !row) return null;
-    const op = JSON.parse(row.json) as Operation;
-    if (inFlight.has(op.id) || cancelling.has(op.id)) return null;
-    // Only adoption, a person's confirmation of not-created or a release settles such a create; acknowledgement is refused until then.
-    // A create whose answered id was disowned later was already settled as confirmed when that id was kept, which stays.
-    if (isOrphanStrategy(op)) return null;
-    const proven = provenOutcome(parsed, op);
-    if (proven) return proven;
-    // A person who acknowledged the job owns its exposure; its writes are released as possibly executed (plan 6.1).
-    const job = readJob(op.jobId);
-    return job.status === 'attention' && job.acknowledgedAt != null ? 'confirmed' : null;
-  }
-  function provenOutcome(parsed: NonNullable<ReturnType<typeof parseOperationId>>, op: Operation): 'confirmed' | 'rejected' | null {
-    if (parsed.kind === 'create') {
-      // A person released it as possibly executed.
-      if (op.releasedAt != null) return 'confirmed';
-      // prepared never reached transport: the sending mark commits before any send.
-      if (op.state === 'prepared' || op.state === 'not-sent' || op.state === 'rejected' || op.state === 'not-created') return 'rejected';
-      return op.state === 'open' || op.state === 'filled' || op.state === 'canceled' ? 'confirmed' : null;
-    }
-    if (parsed.seq > (op.cancelSeq ?? 0)) return 'rejected';
-    // Once the order is over, a cancel of it can no longer change anything; an ended strategy is over even while its children settle.
-    if (SETTLED.has(op.state) || (isStrategy(op) && op.strategyStatus === 'terminal')) return 'confirmed';
-    // Past the window in which the venue could still accept the signed cancel, an order seen resting afterwards proves it did nothing (L091).
-    return op.state === 'open' && op.cancelRequestedAt !== null && op.openCheckedFrom != null && op.openCheckedFrom >= cancelSettledAt(op) ? 'rejected' : null;
-  }
-
   /** History pruning at most once per pruneIntervalMs; runs from the jobs pass or, without it, its own loop. */
   function maintain(): void {
     if (now() - prunedAt < budgets.pruneIntervalMs) return;
@@ -2517,11 +2352,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     try { prune(); } catch (error) { if (error instanceof WriterLostError) throw error; }
   }
 
-  /** Two-leg jobs: reconcile, hedge, cancel and release registry entries. Transfers and ADL run in passes of their own. */
+  /** Two-leg jobs: reconcile, hedge and cancel. Transfers and ADL run in passes of their own. */
 
   async function runJobs(): Promise<void> {
     if (!acquire()) return;
-    settleControl();
     maintain();
     for (const job of unfinishedJobs()) {
       try { await progress(job); }
@@ -2530,7 +2364,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         write(() => { const current = readJob(job.id); current.reason = `本轮处理失败：${error instanceof Error ? error.message.slice(0, 160) : '未知'}`; saveJob(current); });
       }
     }
-    // A disputed order stays frozen. Other, freshly verified orders can still be withdrawn before manual takeover.
+    // A disputed order stays frozen. Other, freshly verified orders (including ordinary resting orders discovered after unknown creates) can still be withdrawn before manual takeover.
     const pending = unsettledOps();
     const disputedJobs = new Set(pending.filter(op => op.identityMismatchAt != null).map(op => op.jobId));
     for (const op of pending) {
@@ -2539,7 +2373,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       try {
         recoverIdle(op);
         const current = readOp(op.id);
-        const verifyWithdrawal = !!job.fourLegQuantityIssue || disputedJobs.has(job.id);
+        const verifyWithdrawal = !!job.fourLegQuantityIssue || disputedJobs.has(job.id) || !isStrategy(current);
         if (verifyWithdrawal && (current.identityMismatchAt != null || !originalOrder(job, current))) continue;
         const verifiedOpen = (current.state === 'unknown' || current.state === 'open') && await reconcile(job, current);
         const latest = readOp(op.id);
@@ -2557,8 +2391,6 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         }
       } catch (error) { if (error instanceof WriterLostError) throw error; }
     }
-    // Again at the end, so a result reconciled in this pass releases its account before the next one.
-    settleControl();
   }
   /**
    * Margin transfers. A slow venue holds up only this pass: it is scheduled apart from the jobs and from ADL,

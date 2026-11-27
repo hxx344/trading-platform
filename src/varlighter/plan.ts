@@ -57,7 +57,11 @@ export function orderPlan(pair: PairInfo, sample: Sample, direction: Direction, 
   // 数量以有精度的一腿为准：B 有精度时先定 B 的数量（名义 ÷ B 中间价），A = B ÷ 乘数；否则先定 A。
   const aDecimals = pair.a.market.sizeDecimals, bDecimals = pair.b.market.sizeDecimals;
   let aQty: number, bQty: number;
-  if (bDecimals !== null) { bQty = floorTo(notionalUsd / bMid, bDecimals); aQty = aDecimals !== null ? floorTo(bQty / k, aDecimals) : bQty / k; }
+  if (bDecimals !== null) {
+    bQty = floorTo(notionalUsd / bMid, bDecimals);
+    aQty = aDecimals !== null ? floorTo(bQty / k, aDecimals) : bQty / k;
+    if (aDecimals !== null) bQty = floorTo(aQty * k, bDecimals);
+  }
   else { aQty = floorTo(notionalUsd / (k * bMid), aDecimals ?? 6); bQty = aQty * k; }
   const format = (qty: number, decimals: number | null, other: number | null) => decimals !== null ? qty.toFixed(decimals) : other !== null && k === 1 ? qty.toFixed(other) : String(Number(qty.toPrecision(8)));
   const aQtyText = format(aQty, aDecimals, bDecimals), bQtyText = format(bQty, bDecimals, aDecimals);

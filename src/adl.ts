@@ -13,7 +13,6 @@ import type { DatabaseSync } from 'node:sqlite';
 import { cmp, floorToStep, fromUnits, isZero, min, sub, add, units } from './decimal.ts';
 import { ContractError, PAIR_ID, UUID, exactKeys, pageCursor, reject, text, type PageCursor, type PairSide } from './contracts.ts';
 import { VenueError } from './connector.ts';
-import { ADL_CANCEL_OPERATION_PREFIX, ADL_OPERATION_PREFIX, ControlRefusal, parseAdlOperationId, type AccountControl, type WriterOperation } from './account-control.ts';
 import {
   DEFAULT_ADL_CONFIG, DIRECTION_NAMES, HEDGE_TOLERANCE_BPS, TERMINAL_ADL_ORDER, evidenceDirection, hedgeGap, parseAdlAccount, parseAdlConfig, parseAdlEvidence, parseAdlOrderReport, parseAdlRule,
   type AdlAccountSnapshot, type AdlConfig, type AdlConnector, type AdlEvidenceRow, type AdlOrderReport, type AdlOrderRequest, type AdlPositionSide, type AdlRule, type Direction,
@@ -123,7 +122,7 @@ export interface Batch {
   report: AdlOrderReport | null;
   fill: FillMark | null;
   queries: number; postCancelQueries: number; queryAfter: number; activeQueryAfter: number;
-  cancelRequestedAt: number | null; cancels: number; verifiedAt: number | null; recovered: boolean; note: string | null;
+  cancelRequestedAt: number | null; cancels: number; cancelNotSentSince?: number | null; verifiedAt: number | null; recovered: boolean; note: string | null;
 }
 
 // ---- planning --------------------------------------------------------------------
@@ -185,11 +184,6 @@ export interface AdlDeps {
   now: () => number;
   budgets: AdlBudgets & { futureToleranceMs: number };
   connector: AdlConnector | null;
-  /**
-   * The shared account-writer registry, when injected: each reduction order and each cancel is registered there before
-   * its send, checked again inside beforeSend, finished after its local result, and resolved from local facts.
-   */
-  control: AccountControl | null;
   write<T>(operation: () => T): T;
   assertWriter(): void;
   callVenue<T>(kind: 'read' | 'write', operation: (signal: AbortSignal) => Promise<T>, timeoutMs?: number): Promise<T>;
@@ -220,26 +214,12 @@ function checkBudgets(budgets: AdlDeps['budgets'], connector: AdlConnector | nul
 const maskId = (id: string): string => id.length > 4 ? `***${id.slice(-4)}` : '***';
 const message = (error: unknown): string => error instanceof Error ? error.message.slice(0, 200) : '未知错误';
 const clientOrderId = (): string => `adl-${randomBytes(14).toString('hex')}`;
-/**
- * What a batch's local state proves for its order's registry entry: rejected when it never reached the venue, confirmed
- * once the venue answered or the observation window handed it to fresh positions (it may have filled; a late report still
- * counts), null while the result is open.
- */
-export function adlRegistryOutcome(state: BatchState): 'confirmed' | 'rejected' | null {
-  if (state === 'prepared' || state === 'not-sent' || state === 'rejected') return 'rejected';
-  if (state === 'open' || state === 'done' || state === 'unknown-verified' || state === 'unknown-closed') return 'confirmed';
-  return null;
-}
 
-export function createAdl({ db, now, budgets, connector, control, write, assertWriter, callVenue, event, isWriterLost, pairs, configurablePairs = pairs, transferSending }: AdlDeps) {
+export function createAdl({ db, now, budgets, connector, write, assertWriter, callVenue, event, isWriterLost, pairs, configurablePairs = pairs, transferSending }: AdlDeps) {
   checkBudgets(budgets, connector);
   const tolerance = budgets.futureToleranceMs;
   /** Batches whose send or cancel runs in this process; any other prepared or sending row was interrupted. */
   const inFlight = new Set<string>();
-  /** The stamp of this process's latest cancel attempt (see cancelBatch). */
-  let lastCancelStamp = 0;
-  /** Batches whose last cancel the registry refused, until when the next cancel waits (queries go on meanwhile). */
-  const cancelRefusedUntil = new Map<string, number>();
   const pushed: { accountId: string; row: unknown }[] = [];
   let droppedPushes = 0;
   let resumeAfter: string | null = null;
@@ -556,76 +536,52 @@ export function createAdl({ db, now, budgets, connector, control, write, assertW
     saveBatch(batch);
     event(null, 'adl-batch-recovered', { batch: batch.id, state: batch.state });
   }
-  /**
-   * Marks the cancel intent before the call; only a provable not-sent takes it back. Each attempt is registered under its
-   * own stamp, strictly above every earlier attempt of this process and stored as cancelRequestedAt, so a refused or
-   * taken-back attempt never reuses a registry entry and settleRegistry reads an unmarked stamp as never sent.
-   * Returns false when the registry refused it: nothing was marked and the caller goes on querying the order.
-   */
+  /** Marks the cancel intent before the call; only a provable not-sent takes it back. */
   async function cancelBatch(batch: Batch): Promise<boolean> {
     const previous = { cancelRequestedAt: batch.cancelRequestedAt, cancels: batch.cancels, lastPossibleSendAt: batch.lastPossibleSendAt, postCancelQueries: batch.postCancelQueries, queryAfter: batch.queryAfter };
-    const at = lastCancelStamp = Math.max(now(), lastCancelStamp + 1, (batch.cancelRequestedAt ?? 0) + 1, 1);
+    const at = now();
     inFlight.add(batch.id);
     try {
-      let registered: WriterOperation | null = null;
-      if (control) {
-        try { registered = control.prepareAdlCancel(batch.accountId, batch.id, { symbol: batch.symbol, clientOrderId: batch.clientOrderId }, at); }
-        catch (error) {
-          if (!(error instanceof ControlRefusal)) throw error;
-          cancelRefusedUntil.set(batch.id, now() + budgets.adlRetryMs);
-          write(() => {
-            const current = readBatch(batch.id);
-            current.note = `撤单未发送：${message(error)}`;
-            saveBatch(current);
-            Object.assign(batch, current);
-          });
-          // Only a busy registry or an unresolved write clears by itself; any other refusal needs a person, and the
-          // order's own queries still notice when that person has cancelled it.
-          if (!error.transient) stuck(batch, `减仓批次 ${batch.clientOrderId} 撤单被账户写入登记拒绝（${error.registryCode}），需人工在交易所撤单`);
-          return false;
-        }
-        cancelRefusedUntil.delete(batch.id);
-      }
-      try {
-        write(() => {
-          Object.assign(batch, { cancelRequestedAt: at, cancels: batch.cancels + 1, lastPossibleSendAt: Math.max(batch.lastPossibleSendAt ?? 0, at + budgets.adlOrderTimeoutMs), postCancelQueries: 0, queryAfter: at + budgets.adlQuerySpacingMs });
-          saveBatch(batch);
-          event(null, 'adl-batch-cancel', { batch: batch.id });
-        });
-      } catch (error) { if (registered) control?.finish(registered, 'rejected'); throw error; }
-      const beforeSend = registered ? () => { assertWriter(); control?.assertSend(registered, budgets.adlOrderTimeoutMs); } : assertWriter;
+      write(() => {
+        Object.assign(batch, { cancelRequestedAt: at, cancels: batch.cancels + 1, lastPossibleSendAt: Math.max(batch.lastPossibleSendAt ?? 0, at + budgets.adlOrderTimeoutMs), postCancelQueries: 0, queryAfter: at + budgets.adlQuerySpacingMs });
+        saveBatch(batch);
+        event(null, 'adl-batch-cancel', { batch: batch.id });
+      });
       let outcome: { report: AdlOrderReport } | { error: unknown };
-      try { outcome = { report: parseReport(await callVenue('write', signal => venue().cancel(batch.accountId, batch.symbol, batch.clientOrderId, { signal, beforeSend }), budgets.adlOrderTimeoutMs), batch) }; }
+      try { outcome = { report: parseReport(await callVenue('write', signal => venue().cancel(batch.accountId, batch.symbol, batch.clientOrderId, { signal, beforeSend: assertWriter }), budgets.adlOrderTimeoutMs), batch) }; }
       catch (error) { if (isWriterLost(error)) throw error; outcome = { error }; }
       write(() => {
         const current = readBatch(batch.id);
-        if ('report' in outcome) accept(current, outcome.report);
-        else if (outcome.error instanceof VenueError && outcome.error.kind === 'not-sent') Object.assign(current, previous, { queryAfter: now() + budgets.adlQuerySpacingMs, note: `撤单未发送：${message(outcome.error)}` });
-        else if (outcome.error instanceof ContractError) throw outcome.error;
-        else current.note = `撤单结果未知或被拒绝：${message(outcome.error)}；继续按原客户订单号核对，仍在挂单时 ${Math.round(budgets.adlCancelAfterMs / 1000)} 秒后再撤（最多 ${ADL_CANCEL_LIMIT} 次）`;
+        if ('report' in outcome) { accept(current, outcome.report); current.cancelNotSentSince = null; }
+        else if (outcome.error instanceof VenueError && outcome.error.kind === 'not-sent') {
+          Object.assign(current, previous, { cancelNotSentSince: current.cancelNotSentSince ?? now(), queryAfter: now() + budgets.adlQuerySpacingMs, note: `撤单未发送：${message(outcome.error)}` });
+        } else if (outcome.error instanceof ContractError) throw outcome.error;
+        else {
+          current.cancelNotSentSince = null;
+          current.note = `撤单结果未知或被拒绝：${message(outcome.error)}；继续按原客户订单号核对，仍在挂单时 ${Math.round(budgets.adlCancelAfterMs / 1000)} 秒后再撤（最多 ${ADL_CANCEL_LIMIT} 次）`;
+        }
         saveBatch(current);
         Object.assign(batch, current);
       });
-      // A cancel never adds exposure: only a provable not-sent is rejected; anything else releases the account and the
-      // batch's own queries decide what became of the order.
-      if (registered) control?.finish(registered, 'error' in outcome && outcome.error instanceof VenueError && outcome.error.kind === 'not-sent' ? 'rejected' : 'confirmed');
       return true;
     } finally { inFlight.delete(batch.id); }
   }
-  /**
-   * A working batch is cancelled adlCancelAfterMs after its send, and again adlCancelAfterMs after each cancel that left it
-   * working, at most ADL_CANCEL_LIMIT times. A cancel the registry refuses is not counted and waits adlRetryMs while the
-   * order is still queried: a transient refusal is tried again then, any other also stops the open incident (see stuck).
-   */
-  const cancelDue = (batch: Batch, at: number): boolean => batch.state === 'open' && batch.cancels < ADL_CANCEL_LIMIT && at >= (cancelRefusedUntil.get(batch.id) ?? 0)
+  /** A working batch is cancelled adlCancelAfterMs after its send, and again adlCancelAfterMs after each cancel that left it working, at most ADL_CANCEL_LIMIT times. */
+  const cancelDue = (batch: Batch, at: number): boolean => batch.state === 'open' && batch.cancels < ADL_CANCEL_LIMIT
     && at - (batch.cancelRequestedAt ?? batch.sentAt ?? at) >= budgets.adlCancelAfterMs;
   /**
-   * A batch a query still finds working after every cancel stops the pair's open incident (which may be a later one than the
-   * batch's own): a person cancels it at the venue, then restarts. A watching incident keeps watching and says why.
+   * A batch a query still finds working after every cancel (or repeated not-sent cancel blocks) stops the pair's open
+   * incident (which may be a later one than the batch's own): a person cancels it at the venue, then restarts.
    */
   function haltOnStuck(batch: Batch, at: number): void {
-    if (batch.state !== 'open' || batch.cancels < ADL_CANCEL_LIMIT || at - (batch.cancelRequestedAt ?? at) < budgets.adlCancelAfterMs) return;
-    stuck(batch, `减仓批次 ${batch.clientOrderId} 撤单 ${batch.cancels} 次后仍在挂单，需人工在交易所撤单`);
+    if (batch.state !== 'open') return;
+    if (batch.cancels >= ADL_CANCEL_LIMIT && at - (batch.cancelRequestedAt ?? at) >= budgets.adlCancelAfterMs) {
+      stuck(batch, `减仓批次 ${batch.clientOrderId} 撤单 ${batch.cancels} 次后仍在挂单，需人工在交易所撤单`);
+      return;
+    }
+    if (batch.cancelNotSentSince != null && at - batch.cancelNotSentSince >= budgets.adlCancelAfterMs * ADL_CANCEL_LIMIT) {
+      stuck(batch, `减仓批次 ${batch.clientOrderId} 撤单持续未发送超过 ${Math.round(budgets.adlCancelAfterMs * ADL_CANCEL_LIMIT / 1000)} 秒（${(batch.note ?? '').slice(0, 120)}），仍在挂单，需人工在交易所撤单`);
+    }
   }
   function stuck(batch: Batch, reason: string): void {
     write(() => {
@@ -648,7 +604,11 @@ export function createAdl({ db, now, budgets, connector, control, write, assertW
     } else {
       const anchor = Math.max(batch.sentAt ?? batch.preparedAt, batch.lastPossibleSendAt ?? 0, batch.cancelRequestedAt ?? 0);
       if (at < batch.queryAfter) return false;
-      if (cancelDue(batch, at) && await cancelBatch(batch)) return SETTLED_BATCH.has(batch.state);
+      if (cancelDue(batch, at)) {
+        const done = await cancelBatch(batch);
+        haltOnStuck(batch, now());
+        if (done) return SETTLED_BATCH.has(batch.state);
+      }
       const count = batch.cancelRequestedAt !== null ? batch.postCancelQueries : batch.queries;
       if (count >= budgets.adlQueryLimit && !batch.report) {
         if (at < anchor || at - anchor < budgets.adlObservationMs) return false;
@@ -689,8 +649,7 @@ export function createAdl({ db, now, budgets, connector, control, write, assertW
       Object.assign(batch, current);
     });
     if (cancelDue(batch, now())) await cancelBatch(batch);
-    else if (report) haltOnStuck(batch, now());
-    if (SETTLED_BATCH.has(batch.state)) cancelRefusedUntil.delete(batch.id);
+    haltOnStuck(batch, now());
     return SETTLED_BATCH.has(batch.state) || batch.state === 'unknown-verified';
   }
   /** Brings every unsettled batch of the pair one step forward; true when none is still waiting for an answer. */
@@ -726,6 +685,7 @@ export function createAdl({ db, now, budgets, connector, control, write, assertW
       }
     }
     for (const batch of recentFilled(pairId)) {
+      if (!incident.symbols.includes(batch.symbol) || batch.accountId !== snapshots[batch.side].accountId) continue;
       if (batch.fill && !reflected(updated(batch.side, batch.symbol, batch.positionSide), batch.fill)) throw new Hold(`${batch.symbol} 减仓成交尚未反映到${SIDE_NAMES[batch.side]}持仓，等待新的现场，暂不继续减仓`);
     }
   }
@@ -835,39 +795,17 @@ export function createAdl({ db, now, budgets, connector, control, write, assertW
     });
     if (!prepared) return;
     try {
-      let registered: WriterOperation | null = null;
-      if (control) {
-        try { registered = control.prepareAdlOrder(batch.accountId, batch.id, { clientOrderId: batch.clientOrderId, symbol: batch.symbol, side: batch.orderSide, positionSide: batch.positionSide, quantity: batch.quantity }); }
-        catch (error) {
-          if (!(error instanceof ControlRefusal)) throw error;
-          write(() => {
-            const current = readBatch(batch.id), incident = requireIncident(incidentId);
-            Object.assign(current, { state: 'not-sent', note: message(error) });
-            // A refusal that clears by itself (an unknown transfer of the pair gates the account until it expires or settles)
-            // waits like any other hold instead of counting toward the not-sent halt.
-            if (error.transient) incident.retryAt = now() + budgets.adlRetryMs;
-            else { incident.notSentStreak += 1; incident.retryAt = now() + budgets.adlNotSentRetryMs; }
-            saveBatch(current); saveIncident(incident);
-            event(null, 'adl-batch-sent', { batch: batch.id, state: current.state, control: error.registryCode });
-          });
-          return;
-        }
-      }
-      // A registered entry whose send never starts is rejected here; settleRegistry repeats it if this finish fails.
-      try {
-        write(() => {
-          const current = readBatch(batch.id);
-          current.state = 'sending'; current.sentAt = now(); current.lastPossibleSendAt = current.sentAt + budgets.adlOrderTimeoutMs;
-          saveBatch(current);
-          Object.assign(batch, current);
-        });
-      } catch (error) { if (registered) control?.finish(registered, 'rejected'); throw error; }
+      write(() => {
+        const current = readBatch(batch.id);
+        current.state = 'sending'; current.sentAt = now(); current.lastPossibleSendAt = current.sentAt + budgets.adlOrderTimeoutMs;
+        saveBatch(current);
+        Object.assign(batch, current);
+      });
       const request: AdlOrderRequest = { clientOrderId: batch.clientOrderId, symbol: batch.symbol, side: batch.orderSide, positionSide: batch.positionSide, quantity: batch.quantity, reduceOnly: true, type: 'market' };
-      const beforeSend = registered ? () => { assertWriter(); control?.assertSend(registered, budgets.adlOrderTimeoutMs); } : assertWriter;
       let outcome: { report: AdlOrderReport } | { error: unknown };
-      try { outcome = { report: parseReport(await callVenue('write', signal => venue().place(batch.accountId, request, { signal, beforeSend }), budgets.adlOrderTimeoutMs), batch) }; }
+      try { outcome = { report: parseReport(await callVenue('write', signal => venue().place(batch.accountId, request, { signal, beforeSend: assertWriter }), budgets.adlOrderTimeoutMs), batch) }; }
       catch (error) { if (isWriterLost(error)) throw error; outcome = { error }; }
-      const state = write(() => {
+      write(() => {
         const current = readBatch(batch.id), incident = requireIncident(incidentId);
         if ('report' in outcome) { accept(current, outcome.report); current.lastPossibleSendAt = Math.min(current.lastPossibleSendAt ?? now(), now()); }
         else if (outcome.error instanceof VenueError && outcome.error.kind === 'not-sent') {
@@ -878,9 +816,7 @@ export function createAdl({ db, now, budgets, connector, control, write, assertW
         if (current.state !== 'not-sent') incident.notSentStreak = 0;
         saveBatch(current); saveIncident(incident);
         event(null, 'adl-batch-sent', { batch: batch.id, state: current.state, filledQuantity: current.report?.filledQuantity ?? null });
-        return current.state;
       });
-      if (registered) control?.finish(registered, adlRegistryOutcome(state) ?? 'unknown');
     } finally { inFlight.delete(batch.id); }
   }
 
@@ -985,34 +921,8 @@ export function createAdl({ db, now, budgets, connector, control, write, assertW
     inFlight.clear();
   }
 
-  /**
-   * Resolves this module's open registry entries of reduction orders and cancels from local facts: after a failed finish,
-   * a takeover, or once an unknown batch is settled or verified. Entries of a batch being sent or without a record stay.
-   */
-  function settleRegistry(): void {
-    if (!control) return;
-    let ids: string[];
-    try { ids = control.asterPending().filter(id => id.startsWith(ADL_OPERATION_PREFIX) || id.startsWith(ADL_CANCEL_OPERATION_PREFIX)); }
-    catch (error) { if (isWriterLost(error)) throw error; return; }
-    for (const operationId of ids) {
-      const parsed = parseAdlOperationId(operationId);
-      const row = parsed && db.prepare('SELECT json FROM adl_batches WHERE client_order_id = ?').get(parsed.clientOrderId) as { json: string } | undefined;
-      if (!parsed || !row) continue;
-      let batch: Batch;
-      try { batch = JSON.parse(row.json) as Batch; } catch { continue; }
-      if (inFlight.has(batch.id)) continue;
-      // A cancel attempt whose stamp was never marked (or was taken back as not sent) never left this process; a later
-      // attempt's mark also reads as sent, which only errs towards confirmed.
-      const outcome = parsed.kind === 'create' ? adlRegistryOutcome(batch.state) : (batch.cancelRequestedAt ?? 0) < parsed.stamp ? 'rejected' : 'confirmed';
-      if (!outcome) continue;
-      try { control.asterResolve([batch.accountId], operationId, outcome); write(() => event(null, 'adl-control-resolved', { batch: batch.id, operationId, outcome })); }
-      catch (error) { if (isWriterLost(error) || !(error instanceof ControlRefusal)) throw error; }
-    }
-  }
-
   async function tick(): Promise<void> {
     if (!connector) return;
-    settleRegistry();
     const list = pairs();
     flushPushed(list);
     const started = performance.now();
@@ -1033,7 +943,6 @@ export function createAdl({ db, now, budgets, connector, control, write, assertW
       resumeAfter = pair.id;
     }
     if (resumeAfter === ordered.at(-1)?.id) resumeAfter = null;
-    settleRegistry();
   }
 
   /** Why a pair's accounts cannot be changed now (an unfinished incident or unhandled evidence), or null. */

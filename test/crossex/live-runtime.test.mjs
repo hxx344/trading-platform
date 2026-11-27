@@ -1515,3 +1515,46 @@ test.skip('writer recovery maps legacy cancels and request ids named legacy to t
     else assert.equal(results[0], results[1], `${form}: writer recovery reads ${results.join(' / ')} order rows`);
   }
 });
+
+test('#2 definite rejection errors (GATE_INVALID_INPUT and non-READ_ONLY HTTP 4xx) settle as REJECT rather than UNKNOWN', async t => {
+  for (const err of [
+    Object.assign(new Error('invalid quantity'), { code: 'GATE_INVALID_INPUT', uncertain: false }),
+    Object.assign(new Error('insufficient balance'), { code: 'GATE_HTTP_ERROR', uncertain: false, label: 'INSUFFICIENT_MARGIN' }),
+  ]) {
+    const f = fixture(t); await f.connect();
+    f.client.createOrder = async () => { throw err; };
+    const execution = await f.confirm(await f.preview());
+    assert.equal(execution.state, 'failed');
+    assert.equal(execution.legs[0].status, 'REJECT');
+    assert.notEqual(f.runtime.connectionView().permissions.trade, 'read_only');
+    assert.equal(f.store.prepare("SELECT count(*) n FROM live_orders WHERE state = 'UNKNOWN'").get().n, 0);
+  }
+});
+
+test('#8 stop() rejects new queued work/capacity reads immediately and awaits in-flight capacityFlights before releasing owner', async t => {
+  const f = cooldownFixture(t); await f.connect(); await f.runtime.refresh();
+  let releaseCap;
+  f.market.openCapacityContext = async () => new Promise(resolve => { releaseCap = () => resolve({
+    base: 'LUNA2', config: { maxOpen: 3, notionalPerLeg: 100, maxTotalNotional: '2000', cooldownSeconds: 60 }, sourceAt: f.now, expiresAt: f.now + 10000, notes: [],
+    legs: f.selected.map(symbol => ({ symbol, exchange: 'gate', quoteCurrency: 'USDT', price: '0.05', budgetPrice: '0.05', fxRate: '1', depthQuantity: '10000',
+      rule: { min_size: '1', lot_size: '1', min_notional: '5', max_market_size: '10000', max_limit_size: '10000' } })),
+  }); });
+  const inFlightCap = f.capacity();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(typeof releaseCap, 'function');
+  let stopDone = false;
+  const stopping = f.runtime.stop().then(() => { stopDone = true; });
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(stopDone, false);
+    assert.equal(f.store.prepare('SELECT count(*) n FROM live_owner').get().n, 1);
+    assert.equal((await f.capacity()).status, 'unavailable');
+    await assert.rejects(f.preview(), /正在停止/);
+  } finally {
+    releaseCap?.();
+  }
+  await inFlightCap;
+  await stopping;
+  assert.equal(stopDone, true);
+  assert.equal(f.store.prepare('SELECT count(*) n FROM live_owner').get().n, 0);
+});

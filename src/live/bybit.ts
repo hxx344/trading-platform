@@ -285,7 +285,7 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
     const averagePrice = isZero(filledQuantity) ? null : optionalPrice(row.executedAvgPrice, '策略成交均价');
     if (!isZero(filledQuantity) && averagePrice === null) throw new ShapeError('策略有成交但没有成交均价');
     // Status 4 is still ending and may have a resting order, so only status 3 can settle.
-    const terminal = state === 3 || state === 4, createdAt = millis(row.createdTimeE3, '策略创建时间');
+    const terminal = state === 3 || state === 4, createdAt = millis(row.createdTimeE3, '策略创建时间') - offset;
     let childrenSettled = false;
     if (children) {
       const known = new Map<string, { fingerprint: string; filled: string }>();
@@ -313,7 +313,7 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
     return {
       strategyId, symbol: row.symbol as string, side, positionSide, reduceOnly: row.reduceOnly, quantity, filledQuantity, averagePrice,
       status: terminal ? 'terminal' : state === 2 ? 'working' : 'paused', maxChasePrice: amount(row.maxChasePrice, '最高追价'), childrenSettled,
-      createdAt, updatedAt: row.updatedTimeE3 === undefined ? createdAt : millis(row.updatedTimeE3, '策略更新时间'),
+      createdAt, updatedAt: row.updatedTimeE3 === undefined ? createdAt : millis(row.updatedTimeE3, '策略更新时间') - offset,
     };
   }
   const strategyQuery = (symbol: string, extra: Record<string, string>) => ({ category: 'UTA_USDT', symbol, strategyType: 'chaseOrder', pageSize: String(PAGE_SIZE), ...extra });
@@ -595,7 +595,7 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
       }
       for (let from = window.from; from <= window.to; from += STRATEGY_SEGMENT_MS) {
         const to = Math.min(from + STRATEGY_SEGMENT_MS, window.to);
-        const range = { beginTimeE0: String(Math.floor(from / 1000) - 1), endTimeE0: String(Math.ceil(to / 1000)) };
+        const range = { beginTimeE0: String(Math.floor((from + offset) / 1000) - 1), endTimeE0: String(Math.ceil((to + offset) / 1000)) };
         for (const item of await pages(binding, '/v5/strategy/list', strategyQuery(symbol, { status: '3', ...range }), 'nextCursor', signal)) {
           const report = strategyReport(item, null);
           if (inWindow(report)) keep(report);

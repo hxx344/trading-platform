@@ -5,7 +5,7 @@ import { D } from './money.mjs';
 import { createGateClient, GATE_EXCHANGES } from './live-client.mjs';
 import { capacityRequest, capacityResult, calculateCapacity } from './open-capacity.mjs';
 import { syncAccountBook } from './account-book-sync.mjs';
-import { canonicalBase, isBaseBlocked } from './asset-identity.mjs';
+import { canonicalBase, isBaseBlocked } from '../asset-identity.mjs';
 import { bindPositionAction, positionKey, positionDirection, validatePositionLegs } from './position-actions.mjs';
 
 const TERMINAL = new Set(['FILLED', 'CANCELLED', 'FAIL', 'REJECT', 'UNSENT']);
@@ -80,7 +80,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     return row ? JSON.parse(row.json) : undefined;
   };
   const getExecution = executionId => { const row = store.prepare('SELECT json FROM live_executions WHERE id=?').get(executionId); return row ? executionView(JSON.parse(row.json)) : null; };
-  let stopped = false, lostOwnership = false, queue = Promise.resolve(), queuedOperations = 0, clientVersion = null, privateClient = null, supplementalFlight = null, supplementalAttempt = -Infinity;
+  let stopping = false, stopped = false, lostOwnership = false, queue = Promise.resolve(), queuedOperations = 0, clientVersion = null, privateClient = null, supplementalFlight = null, supplementalAttempt = -Infinity;
   let writerTicket = null, writerError = null, writerLost = false, activeSubmission = null, writerHistoryReady = !accountWriter;
   const writerScope = { authority: 'gate-crossex', environment: 'mainnet' }, bindingId = 'crossex:live';
   // CrossEx authenticates one Gate subject. Venue prefixes are instruments,
@@ -249,8 +249,9 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   const newClient = credentials => clientFactory({ ...credentials, clock, beforeSubmit });
   const capacityReads = new Map(), capacityFlights = new Set();
   function exclusive(fn) {
+    if (stopping || stopped) return Promise.resolve().then(() => fail('实盘服务正在停止', 503));
     queuedOperations++;
-    const result = queue.then(() => { if (stopped) fail('实盘服务正在停止', 503); return fn(); }).finally(() => { queuedOperations--; });
+    const result = queue.then(() => { if (stopping || stopped) fail('实盘服务正在停止', 503); return fn(); }).finally(() => { queuedOperations--; });
     queue = result.catch(() => {}); return result;
   }
   function takeOwnership() {
@@ -705,7 +706,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   }
   function openCapacity(input) {
     const request = capacityRequest(input), version = connectionRecord()?.version || 0;
-    if (stopped || capacityFlights.size >= 4) return Promise.resolve(capacityResult(request, clock(), version, 'unavailable', '容量读取繁忙，请稍后重试'));
+    if (stopping || stopped || capacityFlights.size >= 4) return Promise.resolve(capacityResult(request, clock(), version, 'unavailable', '容量读取繁忙，请稍后重试'));
     const pending = openCapacityInternal(request).finally(() => capacityFlights.delete(pending));
     capacityFlights.add(pending);
     return bounded(pending, capacityTimeoutMs).catch(() => capacityResult(request, clock(), version, 'unavailable', '容量读取超时，请稍后重试'));
@@ -906,6 +907,8 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
             order.status = 'UNSENT'; order.error = '账户写入许可未通过，此腿没有发送'; outcome = 'rejected';
           } else if (error.code === 'GATE_HTTP_ERROR' && error.uncertain === false && error.label === 'READ_ONLY') {
             order.status = 'REJECT'; order.error = 'Gate 明确拒绝：此凭据只有读取权限'; outcome = 'rejected'; denied = true;
+          } else if (error.code === 'GATE_INVALID_INPUT' || (error.code === 'GATE_HTTP_ERROR' && error.uncertain === false)) {
+            order.status = 'REJECT'; order.error = error.message || 'Gate 明确拒绝下单请求'; outcome = 'rejected';
           } else { order.status = 'UNKNOWN'; order.error = '提交结果未能核实，正在按原订单标识查询；不会重试下单'; }
           if (outcome === 'rejected') order.writerRejectedState = order.status;
           writeOrder(order);
@@ -1094,5 +1097,5 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   return { connection: input => exclusive(() => connectInternal(input)), disconnect: () => exclusive(disconnectInternal),
     refresh: options => exclusive(() => refreshInternal(options)), preview: input => exclusive(() => previewInternal(input)), openCapacity, confirm: input => manualAction(input, confirmInternal),
     cancel: input => manualAction(input, cancelInternal), requestStatus: requestId => exclusive(() => requestStatusInternal(requestId)), refreshDetails: () => refreshSupplemental(true), view, connectionView, summary, updateStatus,
-    async stop() { clearInterval(heartbeat); await queue; stopped = true; await supplementalFlight; store.prepare('DELETE FROM live_owner WHERE singleton=1 AND owner=?').run(owner); } };
+    async stop() { stopping = true; clearInterval(heartbeat); await queue; stopped = true; await supplementalFlight; await Promise.allSettled([...capacityFlights]); store.prepare('DELETE FROM live_owner WHERE singleton=1 AND owner=?').run(owner); } };
 }

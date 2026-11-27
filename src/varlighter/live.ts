@@ -51,6 +51,8 @@ export interface LivePosition {
 }
 export interface LiveStore {
   saveLive(position: LivePosition): void;
+  saveLiveState?(key: string, value: unknown, at: number): void;
+  saveLiveIntent?(runtimeKey: string, runtimeValue: unknown, position: LivePosition, at: number): void;
   liveActive(): LivePosition[];
   liveClosed(limit: number): LivePosition[];
   liveNetSince(time: number): number;
@@ -141,7 +143,7 @@ export function createLiveTrader(deps: LiveDeps) {
   const skipEventAt = new Map<string, number>();
   let lastOperationAt = now(), nextReconcile = now() + RECONCILE_MS, mismatchStreak = 0, blindSince: number | null = null;
 
-  const saveRuntime = () => { try { store.setState(LIVE_RUNTIME_KEY, runtime, now()); } catch (error) { log(`varlighter: 实盘运行状态保存失败：${message(error)}`); } };
+  const saveRuntime = () => { try { (store.saveLiveState ?? store.setState)(LIVE_RUNTIME_KEY, runtime, now()); } catch (error) { log(`varlighter: 实盘运行状态保存失败：${message(error)}`); } };
   const event = (symbol: string | null, text: string) => { try { store.event(now(), 'live', symbol, text); } catch (error) { log(`varlighter: 实盘事件写入失败：${message(error)}`); } };
   function alert(key: string, text: string): void {
     if (alerts.some(item => item.key === key)) return;
@@ -258,12 +260,15 @@ export function createLiveTrader(deps: LiveDeps) {
     // 服务正在停止：不落意图、不发（信号已经中止，发出去也只会被记成结果未知）。
     if (deps.stopped?.()) throw new NotSentError('服务正在停止');
     const pending: PendingOrder = { ...order, clientId: lastClientId = Math.max(lastClientId + 1, now()), sentAt: now() };
-    // 自编号先落库（重启、时钟回拨后也不会重号），再落意图，最后才发送；任何一步落库失败都不发，内存也退回发送前（L054：没发出的单不能记成结果未知）。
+    // 自编号与下单意图在同一持久事务里落库，失败整体回滚、不发单（L054：没发出的单不能记成结果未知）。
     runtime.lastClientId = lastClientId;
-    try { store.setState(LIVE_RUNTIME_KEY, runtime, now()); } catch (error) { throw new NotSentError(`保存自编号失败：${message(error)}`); }
-    const before = position.pending;
+    const before = position.pending, beforeUpdated = position.updatedAt, at = now();
     position.pending = pending;
-    try { save(position); } catch (error) { position.pending = before; throw new NotSentError(`保存下单意图失败：${message(error)}`); }
+    position.updatedAt = at;
+    try {
+      if (store.saveLiveIntent) store.saveLiveIntent(LIVE_RUNTIME_KEY, runtime, position, at);
+      else { store.setState(LIVE_RUNTIME_KEY, runtime, at); store.saveLive(position); }
+    } catch (error) { position.pending = before; position.updatedAt = beforeUpdated; throw new NotSentError(`保存下单意图失败：${message(error)}`); }
     if (venue === 'entropy' && deps.onOrderSent) {
       try {
         deps.onOrderSent({ venue, cloid: cloidOf(pending.clientId), positionId: position.id, purpose: pending.purpose, leg: info, assumedFeeBps: deps.takerFeeBps(info), at: pending.sentAt });
@@ -558,7 +563,7 @@ ${reason}`;
     update(body: unknown, known: (key: string) => boolean): LiveSettings {
       if (!isObject(body)) throw new LiveError('invalid_params', '实盘设置格式无效');
       const next = readLiveSettings({ on: settings.on, pairs: settings.pairs, limits: settings.limits, ...body }, key => known(key) || (!('pairs' in body) && settings.pairs.includes(key)));
-      store.setState(LIVE_SETTINGS_KEY, next, now());
+      (store.saveLiveState ?? store.setState)(LIVE_SETTINGS_KEY, next, now());
       const turnedOn = next.on && !settings.on;
       settings = next;
       event(null, `实盘设置已更新：总开关${next.on ? '开' : '关'}，配对 ${next.pairs.length} 个，单笔 ${fmt(next.limits.perTradeUsd, 0)} 美元、最多 ${next.limits.maxOpen} 笔、当日亏损上限 ${fmt(next.limits.dailyLossUsd, 0)} 美元`);

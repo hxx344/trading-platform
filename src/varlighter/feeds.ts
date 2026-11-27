@@ -185,6 +185,7 @@ interface LighterBook {
   /** 裁剪边界：买盘低于 bidFloor、卖盘高于 askCeil 的档已裁掉、不再跟踪；null 为没裁过。 */ bidFloor: number | null; askCeil: number | null;
   /** 连续重订次数（算出一次盘口清零），决定下次重订前要等多久。 */ retries: number;
   /** 被限速推迟的重订在这个时刻执行（期间盘口作废）。 */ due: number | null;
+  /** 按 nonce 缓存已排序的买卖档，未收到新 snapshot/delta 时复用。 */ cachedDepth: { nonce: number | null; depth: { bids: [number, number][]; asks: [number, number][] } } | null;
 }
 
 /**
@@ -268,7 +269,12 @@ export class LighterStream implements LiveStream {
     const book = this.books.get(marketId);
     if (!book?.synced || !this.state.connected || this.topSegments.at(-1)?.end !== null) return null;
     try {
-      const snapshot = depthSnapshot({ bids: sortedLevels(book.bids, true), asks: sortedLevels(book.asks, false) }, this.now());
+      let levels = book.cachedDepth?.nonce === book.nonce ? book.cachedDepth.depth : null;
+      if (!levels) {
+        levels = { bids: sortedLevels(book.bids, true), asks: sortedLevels(book.asks, false) };
+        book.cachedDepth = { nonce: book.nonce, depth: levels };
+      }
+      const snapshot = depthSnapshot(levels, this.now());
       book.error = null;
       book.retries = 0;
       return snapshot;
@@ -286,7 +292,7 @@ export class LighterStream implements LiveStream {
     return book?.synced ? book.error : book?.error ?? '等待盘口快照';
   }
   private subscribeBook(id: number, error: string | null = null, retries = 0): void {
-    this.books.set(id, { bids: new Map(), asks: new Map(), synced: false, nonce: null, askedAt: this.now(), error, retries, due: null, bidFloor: null, askCeil: null });
+    this.books.set(id, { bids: new Map(), asks: new Map(), synced: false, nonce: null, askedAt: this.now(), error, retries, due: null, bidFloor: null, askCeil: null, cachedDepth: null });
     this.send({ type: 'subscribe', channel: `order_book/${id}` });
   }
   /**
@@ -298,7 +304,7 @@ export class LighterStream implements LiveStream {
     if (!book || !this.depthIds.has(id)) return;
     const wait = Math.min(BOOK_RESYNC_MIN_MS * 2 ** book.retries, BOOK_RESYNC_MAX_MS);
     if (this.now() - book.askedAt < wait) {
-      book.synced = false; book.bids.clear(); book.asks.clear(); book.nonce = null; book.error = reason; book.bidFloor = book.askCeil = null;
+      book.synced = false; book.bids.clear(); book.asks.clear(); book.nonce = null; book.error = reason; book.bidFloor = book.askCeil = null; book.cachedDepth = null;
       book.due ??= book.askedAt + wait;
       return;
     }
@@ -378,6 +384,7 @@ export class LighterStream implements LiveStream {
   private mergeBook(id: number, value: Record<string, unknown> | null, snapshot: boolean): void {
     const book = this.books.get(id);
     if (!book || !value) return;
+    book.cachedDepth = null;
     if (snapshot) {
       if (value.code !== undefined && value.code !== 0) { this.resyncBook(id, `盘口快照无效（code ${String(value.code).slice(0, 20)}）`); return; }
       book.bids.clear(); book.asks.clear(); book.synced = true; book.error = null; book.due = null; book.bidFloor = book.askCeil = null;

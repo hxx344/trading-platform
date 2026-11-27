@@ -1436,3 +1436,63 @@ test('询价：取消先记为待确认，交易所确认后结束；取消被�
     assert.equal(foreign.engine.rfqView().finished, false);
   } finally { foreign.dispose(); }
 });
+
+test('期权 #8：close() 等待在途 tail 队列完成，且关闭期间阻塞的新入队操作不再启动', async () => {
+  const s = setup();
+  try {
+    let releasePos!: () => void;
+    let calls = 0;
+    s.hooks.reply = url => {
+      if (url.pathname === '/v5/position/list' && ++calls === 1) {
+        return new Promise(resolve => { releasePos = () => resolve(ok({ category: 'option', list: [], nextPageCursor: '' })); });
+      }
+      return undefined;
+    };
+    const reconcile = s.engine.reconcileOnce();
+    await until(() => typeof releasePos === 'function');
+    let closed = false;
+    const closing = s.engine.close().then(() => { closed = true; });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(closed, false, 'close() 须等 tail 上的 reconcileOnce 完成');
+    await assert.rejects(s.engine.createPlan({ operation: 'open' }), refused('shutting_down'));
+    releasePos();
+    await reconcile;
+    await closing;
+    assert.equal(closed, true);
+  } finally { s.dispose(); }
+});
+
+test('期权 #12：存在±25秒时钟偏移时，退役与收益核算按容限归因且不误吞前一组平仓记录', async () => {
+  const s = setup();
+  try {
+    // Group A closes first.
+    const first = await open(s);
+    await finished(s, first.started.taskId);
+    const closedA = s.now();
+    for (const position of [...s.fake.positions.values()]) {
+      s.fake.closed.push({ symbol: position.symbol, side: position.side, qty: String(position.size), openTime: String(s.engine.state().tasks[first.started.taskId]!.acceptedAt + 1), closeTime: String(closedA - 1), avgEntryPrice: '100', totalPnl: '1', totalOpenFee: '0.1', totalCloseFee: '0', deliveryFee: '0' });
+    }
+    s.fake.positions.clear();
+    await s.engine.reconcileOnce();
+    assert.equal(s.engine.state().tasks[first.started.taskId]!.strategyStatus, 'closed');
+
+    // Group B opens shortly after, with ±25s skewed exchange timestamps on its closed-position rows (at expiry).
+    s.hooks.skewMs += 2_000;
+    const second = await open(s);
+    await finished(s, second.started.taskId);
+    s.hooks.skewMs += EXPIRY - s.now() + 5_000;
+    const acceptedB = s.engine.state().tasks[second.started.taskId]!.acceptedAt;
+    const skewedOpen = Math.max(s.engine.state().tasks[first.started.taskId]!.closedAt! + 1, acceptedB - 25_000);
+    const skewedClose = s.now() + 25_000;
+    for (const position of [...s.fake.positions.values()]) {
+      s.fake.closed.push({ symbol: position.symbol, side: position.side, qty: String(position.size), openTime: String(skewedOpen), closeTime: String(skewedClose), avgEntryPrice: '100', totalPnl: position.side === 'Sell' ? '4' : '-1', totalOpenFee: '0.2', totalCloseFee: '0', deliveryFee: '0' });
+    }
+    s.fake.positions.clear();
+    await s.engine.reconcileOnce();
+    assert.equal(s.engine.state().tasks[second.started.taskId]!.strategyStatus, 'closed');
+    assert.equal(s.engine.stateView().reconciliation.error, null);
+    await s.engine.performanceTick();
+    const rowB = performance(s.engine).groups.find(row => row.id === second.started.taskId)!;
+    assert.deepEqual([rowB.status, rowB.eligible, rowB.issues], ['closed', true, []]);
+  } finally { s.dispose(); }
+});

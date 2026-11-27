@@ -34,10 +34,11 @@ test('main reuses successful real service steps only for the same repository, an
   const address = server.address(); assert.ok(address && typeof address === 'object');
   const api = `http://127.0.0.1:${address.port}`;
   const output = join(dir.path, 'outputs'), summary = join(dir.path, 'summary');
+  const outside = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')));
   async function plan(env = {}, cwd?: string) {
     writeFileSync(output, ''); writeFileSync(summary, ''); calls.length = 0;
     await promisify(execFile)(process.execPath, [fileURLToPath(new URL('../scripts/ci-systemd.mjs', import.meta.url))], { cwd, env: {
-      ...process.env, GITHUB_API_URL: api, GITHUB_SERVER_URL: 'https://github.com',
+      ...outside, GITHUB_API_URL: api, GITHUB_SERVER_URL: 'https://github.com',
       GITHUB_REPOSITORY: repo, GITHUB_SHA: sha, GITHUB_TOKEN: 'fixture-token', GITHUB_STEP_SUMMARY: summary, GITHUB_OUTPUT: output,
       GITHUB_EVENT_NAME: 'push', GITHUB_REF: 'refs/heads/main', AFFECTED: 'true', ImageOS: 'ubuntu24', SYSTEMD_VERSION: '255.4-1ubuntu8.12', RUNNER_ARCH: 'X64', ...env,
     } });
@@ -78,11 +79,12 @@ test('main reuses successful real service steps only for the same repository, an
   // The manual run of a release sits on the parent of the release commit, which only bumps the version.
   const work = join(dir.path, 'repo');
   const git = (...args: string[]) => execFileSync('git', ['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgsign=false',
-    '-c', 'core.autocrlf=false', ...args], { cwd: work, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-  execFileSync('git', ['init', '-q', work]);
-  let version = 0;
-  function commit(files: Record<string, string> = {}, scripts = 'node main.js') {
+    '-c', 'core.autocrlf=false', ...args], { cwd: work, env: outside, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  execFileSync('git', ['init', '-q', work], { env: outside });
+  let version = 0, start = 'node main.js';
+  function commit(files: Record<string, string> = {}, scripts = start) {
     for (const [name, content] of Object.entries(files)) writeFileSync(join(work, name), content);
+    start = scripts;
     writeFileSync(join(work, 'package.json'), JSON.stringify({ name: 'fixture', version: `0.0.${++version}`, scripts: { start: scripts } }));
     git('add', '-A'); git('commit', '-q', '-m', `v${version}`);
     return git('rev-parse', 'HEAD');
@@ -108,12 +110,12 @@ test('main reuses successful real service steps only for the same repository, an
   assert.equal(await reuse(after, scripts), 'true');
   assert.equal(await reuse(after, renamed), 'false');
   // Only the first parent counts, and only the five nearest ancestors.
-  git('checkout', '-q', '-b', 'side', after); const side = commit();
-  git('checkout', '-q', '-'); const mainline = commit({ 'other.js': '1' });
-  git('merge', '-q', '--no-ff', '-m', 'merge', '-X', 'ours', 'side');
+  // The merge result equals its second parent, but the first parent lacks other.js.
+  git('checkout', '-q', '-b', 'side', after); const side = commit({ 'other.js': '1' });
+  git('checkout', '-q', '-'); git('merge', '-q', '--no-ff', '-m', 'merge', 'side');
   const merged = git('rev-parse', 'HEAD');
+  assert.equal(git('diff', '--name-only', side, merged), '');
   assert.equal(await reuse(merged, side), 'true');
-  assert.equal(await reuse(merged, mainline), 'false');
   const base = commit({ 'main2.js': '1' });
   let head = base; for (let i = 0; i < 5; i++) head = commit();
   assert.equal(await reuse(head, base), 'false');

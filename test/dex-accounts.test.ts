@@ -119,8 +119,8 @@ test('成交与资金费解析：Entropy 仅保留 io:、非 USDC 手续费置�
     code: 200,
     next_cursor: 'c1',
     trades: [
-      { trade_id: 10, market_id: 0, size: '0.2', price: '3500', usd_amount: '700', bid_account_id: ACCOUNT, ask_account_id: 22, is_maker_ask: true, taker_fee: '0', maker_fee: '0', timestamp: Math.floor(T0 / 1000) },
-      { trade_id: 11, market_id: 110, size: '1', price: '180', bid_account_id: 33, ask_account_id: ACCOUNT, is_maker_ask: true, taker_fee: '50', maker_fee: '20', timestamp: T0 + 1000 },
+      { trade_id: 10, market_id: 0, size: '0.2', price: '3500', usd_amount: '700', bid_account_id: ACCOUNT, ask_account_id: 22, is_maker_ask: true, taker_fee: '0', maker_fee: '0', timestamp: Math.floor(T0 / 1000), bid_account_pnl: '-1.25', ask_account_pnl: '9' },
+      { trade_id: 11, market_id: 110, size: '1', price: '180', bid_account_id: 33, ask_account_id: ACCOUNT, is_maker_ask: true, taker_fee: '50', maker_fee: '20', timestamp: T0 + 1000, bid_account_pnl: '7', ask_account_pnl: '0.5' },
       { trade_id: 12, market_id: 0, size: '1', price: '3500', bid_account_id: 99, ask_account_id: 88, is_maker_ask: false, timestamp: T0 + 2000 },
     ],
   }, ACCOUNT, names, 'lighter');
@@ -128,6 +128,7 @@ test('成交与资金费解析：Entropy 仅保留 io:、非 USDC 手续费置�
   assert.equal(lTrades.trades.length, 2, '非本账户成交被跳过');
   assert.deepEqual([lTrades.trades[0]!.symbol, lTrades.trades[0]!.side, lTrades.trades[0]!.role, lTrades.trades[0]!.feeUsd, lTrades.trades[0]!.at], ['ETH', 'buy', 'taker', 0, T0]);
   assert.deepEqual([lTrades.trades[1]!.symbol, lTrades.trades[1]!.side, lTrades.trades[1]!.role, lTrades.trades[1]!.feeUsd], ['NVDA', 'sell', 'maker', null]);
+  assert.deepEqual(lTrades.trades.map(trade => trade.realizedPnlUsd), [-1.25, 0.5], '已实现盈亏取本账户一侧：买入取 bid_account_pnl，卖出取 ask_account_pnl');
 
   const lFunding = parseLighterFunding({
     code: 200,

@@ -710,6 +710,7 @@ DEX 这一步在 `activate` 里的位置是：**执行面健康之后、控制�
 - **成交、资金费与交易所盈亏**：
   - **Entropy**：公开 `POST /info`，拉取近 30 天 `userFillsByTime`（每页 2000 条、最多 3 页）与 `userFunding`（每页 500 条、最多 3 页），严格按 `io:` 前缀过滤（排除主盘与 `xyz` 等其他 HIP-3 盘），非 `USDC` 手续费记 `null`，并按时间累计生成 `io` 盘净盈亏曲线；页满或时间不前进时标明截断（L093）。
   - **Lighter 主网与 RH**：`GET /api/v1/trades`、`GET /api/v1/positionFunding`、`GET /api/v1/pnl` 均需鉴权。已录入页面 API 私钥时复用 DEX 服务的 Lighter WASM 签名器签发 `authorization` 令牌（50 分钟缓存，遇到 HTTP 401/403 自动刷新重试一次），并按 `bid_account_id`/`ask_account_id` 核对账户归属；标准账户非零 `taker_fee`/`maker_fee` 在真实账户核实单位前保守记 `null`。仅通过 `keys.env` 录入只读账户编号时，跳过需鉴权请求并在页签明确提示去「实盘准备」录入 API 凭据。
+  - **Lighter 成交的已实现盈亏（v0.111.2）**：每笔成交按本账户一侧取 `bid_account_pnl`（买入，减空仓）或 `ask_account_pnl`（卖出，减多仓），开仓成交为 0；以前固定为 null，页面显示「—」，场所汇总也不计。现在 Lighter 主网与 RH 与 Entropy 一样计入场所汇总与「近 30 天已实现」合计；任一笔缺这个字段时该场所汇总仍为 null。数值口径（是否已扣手续费）待与 Lighter 前端核对，见 [live-results.md](live-results.md)。
 
 ### 14.2 存储、缓存与边界（D1–D4）
 

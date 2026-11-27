@@ -354,6 +354,8 @@ export function parseLighterTrades(value: unknown, accountIndex: number, marketN
     // Lighter 标准账户常见为 0 手续费；非零字段可能是 ppm 费率而非美元，在实测核对前保守置 null（docs/live-results.md）。
     const rawFee = role === 'maker' ? optionalNumber(item.maker_fee) : role === 'taker' ? optionalNumber(item.taker_fee) : (optionalNumber(item.taker_fee) ?? optionalNumber(item.maker_fee));
     const feeUsd = rawFee === 0 ? 0 : null;
+    // 已实现盈亏按本账户在这笔成交里的一侧取：买入是减空仓（bid_account_pnl），卖出是减多仓（ask_account_pnl）；开仓的为 0，缺字段为 null。
+    const realizedPnlUsd = optionalNumber(side === 'buy' ? item.bid_account_pnl : item.ask_account_pnl);
     const id = item.trade_id_str !== undefined && item.trade_id_str !== null
       ? `${venue}:${String(item.trade_id_str)}`
       : item.trade_id !== undefined && item.trade_id !== null
@@ -370,7 +372,7 @@ export function parseLighterTrades(value: unknown, accountIndex: number, marketN
       qty,
       notionalUsd,
       feeUsd,
-      realizedPnlUsd: null,
+      realizedPnlUsd,
       at,
     });
   }
@@ -454,7 +456,7 @@ function summarizeHistory(venue: KeyVenue, trades: readonly AccountTrade[], fund
   const tradeCount = tradesError ? 0 : trades.length;
   const volumeUsd = tradesError ? 0 : trades.reduce((sum, item) => sum + item.notionalUsd, 0);
   const feeUsd = tradesError ? null : sumOptional(trades.map(item => item.feeUsd));
-  const realizedPnlUsd = tradesError || venue !== 'entropy' ? null : sumOptional(trades.map(item => item.realizedPnlUsd));
+  const realizedPnlUsd = tradesError ? null : sumOptional(trades.map(item => item.realizedPnlUsd));
   const fundingUsd = fundingError ? null : funding.reduce((sum, item) => sum + item.amountUsd, 0);
   return { tradeCount, volumeUsd, feeUsd, realizedPnlUsd, fundingUsd };
 }

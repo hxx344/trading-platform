@@ -137,6 +137,7 @@
 - Lighter 主网与 RH `/api/v1/trades` 中 `taker_fee` / `maker_fee` 非零时的真实单位（ppm 费率 vs 计价币金额，当前仅 `0` 记为 `0`，非零暂置空）。
 - Lighter 主网与 RH `/api/v1/pnl` 的 `timestamp` 单位（秒/毫秒）、`start_timestamp`/`end_timestamp` 请求单位与 `trade_pnl` 归属口径（当日分桶 vs 累计）。
 - Lighter `/api/v1/positionFunding` 中 `change` / `payment` 的正负号是否与页面「正=净收、负=净付」一致，以及真实账户每分钟 60 次限流下余额（60s）+ 历史（180s）+ 下单并发的余量表现。
+- Lighter 主网与 RH 成交的 `bid_account_pnl` / `ask_account_pnl`（v0.111.2 起作为每笔已实现盈亏）：单位是否为计价币金额、是否已扣手续费、开仓成交是否为 0，与 Lighter 前端同一笔成交的已实现盈亏核对。
 - Entropy `userFillsByTime` 与 `userFunding` 在高频账户下 3 页窗口内的截断提醒与 `io:` 盘过滤表现。
 
 ## 待实测：DEX 价差账户并入资产账本（asset.md，v0.110.0）

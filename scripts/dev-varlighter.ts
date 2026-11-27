@@ -2,6 +2,7 @@
 // Entropy（Hyperliquid io）的目录与行情流（bbo、activeAssetCtx、l2Book），临时数据目录里预先写入 4 天的分钟样本，并按回测结果补几笔模拟成交，
 // 页面上的走势、统计、模拟盘都有内容。不联网，退出时删除临时目录。
 //   pnpm build:web; node scripts/dev-varlighter.ts [--port 4733]
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -142,6 +143,16 @@ const now = Date.now();
   store.saveLive(liveTrade('preview-live-1', 7_200_000, liveLeg('lighter', 'NVDA', 'sell', 0.5, 182.31, 182.02), liveLeg('entropy', 'io:NVDA', 'buy', 0.5, 182.05, 182.0), 0.08, false, 'revert', ''));
   store.saveLive(liveTrade('preview-live-2', 3_600_000, liveLeg('lighter', 'NVDA', 'sell', 0.5, 182.4, 182.46), { ...liveLeg('entropy', 'io:NVDA', 'buy', 0, 0, 0), exitQty: 0, feesUsd: 0 }, -0.05, true, 'single_leg', 'Entropy 没有成交，Lighter 已反向平掉'));
   store.event(now - 3_600_000, 'live', 'lighter:NVDA|entropy:NVDA', '（预览）第二腿没有成交，第一腿已反向平掉，记一次单腿');
+  // 预写入近两天的账户权益快照（按 sha256("场所:标识").slice(0,16) 隔离），让账户资产页的权益走势图立即可见。
+  const hashOf = (venue: string, id: string) => createHash('sha256').update(`${venue}:${id}`).digest('hex').slice(0, 16);
+  const previewHashes = { lighter: hashOf('lighter', '1001'), rh: hashOf('rh', '2002'), entropy: hashOf('entropy', '0x' + 'ab'.repeat(20)) };
+  for (let i = 48; i >= 1; i--) {
+    const t = now - i * 3_600_000;
+    const wave = Math.sin(i / 6) * 2.5;
+    store.addAccountSnapshot({ venue: 'lighter', accountHash: previewHashes.lighter, at: t, equity: 302 + (48 - i) * 0.08 + wave, collateral: 300.25, available: 250.5, unrealizedPnl: 1.75 + wave, positions: 1 });
+    store.addAccountSnapshot({ venue: 'rh', accountHash: previewHashes.rh, at: t, equity: 60 + wave * 0.2, collateral: 60, available: 60, unrealizedPnl: 0, positions: 0 });
+    store.addAccountSnapshot({ venue: 'entropy', accountHash: previewHashes.entropy, at: t, equity: 510 + (48 - i) * 0.05 - wave * 0.6, collateral: 512.4, available: 480.1, unrealizedPnl: 0.3, positions: 1 });
+  }
   store.close();
 }
 
@@ -241,13 +252,49 @@ const venueOfUrl = (url: string): LiveVenue => url.includes('hyperliquid') ? 'en
 const PREVIEW_ACCOUNTS = { lighter: { accountIndex: 1001 }, rh: { accountIndex: 2002 }, entropy: { address: '0x' + 'ab'.repeat(20) } };
 const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
   const url = String(input instanceof Request ? input.url : input);
+  const tNow = Date.now();
   if (url.includes('/api/v1/account')) {
     const rh = venueOfUrl(url) === 'rh';
     return Response.json({ code: 200, accounts: [{ account_index: rh ? 2002 : 1001, collateral: rh ? '60.00' : '300.25', available_balance: rh ? '60.00' : '250.50',
-      positions: rh ? [] : [{ symbol: 'ETH', sign: 1, position: '0.0100', position_value: '36.50' }] }] });
+      total_asset_value: rh ? '60.00' : '302.15',
+      assets: rh ? [{ symbol: 'USDG', balance: '60.00', locked_balance: '0' }] : [{ symbol: 'USDC', balance: '300.25', locked_balance: '12.50' }],
+      positions: rh ? [] : [{ market_id: 0, symbol: 'ETH', sign: 1, position: '0.0100', avg_entry_price: '3460.00', position_value: '36.50', unrealized_pnl: '1.90', realized_pnl: '4.25', initial_margin_fraction: '10.00', liquidation_price: '2150.00', margin_mode: 0, allocated_margin: '3.65' }] }] });
   }
-  if (url.includes('hyperliquid.xyz/info') && typeof init?.body === 'string' && init.body.includes('clearinghouseState')) {
-    return Response.json({ marginSummary: { accountValue: '512.40' }, withdrawable: '480.10', assetPositions: [{ position: { coin: 'io:NVDA', szi: '-0.2', positionValue: '36.40' } }] });
+  if (url.includes('/api/v1/trades')) {
+    return Response.json({ code: 200, trades: [
+      { trade_id: 901, market_id: 0, market_symbol: 'ETH', size: '0.0100', price: '3460.00', usd_amount: '34.60', bid_account_id: 1001, ask_account_id: 55, is_maker_ask: true, taker_fee: '0', maker_fee: '0', timestamp: tNow - 7_200_000 },
+      { trade_id: 902, market_id: 110, market_symbol: 'NVDA', size: '0.50', price: '182.31', usd_amount: '91.155', bid_account_id: 88, ask_account_id: 1001, is_maker_ask: false, taker_fee: '0', maker_fee: '0', timestamp: tNow - 3_600_000 },
+    ] });
+  }
+  if (url.includes('/api/v1/positionFunding')) {
+    return Response.json({ code: 200, position_fundings: [
+      { funding_id: 501, market_id: 0, timestamp: Math.floor((tNow - 3_600_000) / 1000), position_side: 'long', position_size: '0.01', rate: '0.0001', change: '-0.0036' },
+    ] });
+  }
+  if (url.includes('/api/v1/pnl')) {
+    return Response.json({ code: 200, pnl: Array.from({ length: 7 }, (_, i) => ({ timestamp: Math.floor((tNow - (6 - i) * 86_400_000) / 1000), trade_pnl: (i === 0 ? 1.2 : (i - 2) * 0.85).toFixed(2) })) });
+  }
+  if (url.includes('hyperliquid.xyz/info') && typeof init?.body === 'string') {
+    const req = JSON.parse(init.body) as { type?: string };
+    if (req.type === 'clearinghouseState') {
+      return Response.json({
+        marginSummary: { accountValue: '512.40', totalMarginUsed: '18.20' }, withdrawable: '480.10',
+        assetPositions: [{ type: 'oneWay', position: { coin: 'io:NVDA', szi: '-0.2', positionValue: '36.40', entryPx: '183.50', unrealizedPnl: '0.30', liquidationPx: '240.00', leverage: { type: 'isolated', value: 5 } } }],
+      });
+    }
+    if (req.type === 'userFillsByTime') {
+      return Response.json([
+        { tid: 101, coin: 'io:NVDA', px: '183.50', sz: '0.2', side: 'A', dir: 'Open Short', crossed: true, fee: '0.016', feeToken: 'USDC', closedPnl: '0.0', time: tNow - 7_200_000 },
+        { tid: 102, coin: 'io:AAPL', px: '228.40', sz: '0.5', side: 'B', dir: 'Close Short', crossed: true, fee: '0.05', feeToken: 'USDC', closedPnl: '1.45', time: tNow - 14_400_000 },
+        { tid: 999, coin: 'BTC', px: '98500', sz: '0.1', side: 'B', dir: 'Open Long', crossed: true, fee: '2.5', feeToken: 'USDC', closedPnl: '0.0', time: tNow - 10_000_000 },
+      ]);
+    }
+    if (req.type === 'userFunding') {
+      return Response.json([
+        { time: tNow - 3_600_000, hash: '0x01', delta: { type: 'funding', coin: 'io:NVDA', usdc: '0.012', szi: '-0.2', fundingRate: '0.00015' } },
+        { time: tNow - 7_200_000, hash: '0x02', delta: { type: 'funding', coin: 'BTC', usdc: '-0.95', szi: '0.1', fundingRate: '0.0001' } },
+      ]);
+    }
   }
   if (url.includes('hyperliquid.xyz/info')) {
     const listed = onVenue('entropy');
@@ -278,7 +325,7 @@ const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Pro
 
 // 与安装后的拓扑一样：DEX 价差服务在本机套接字上（Windows 用命名管道），执行服务只转发（docs/dexspread.md 11.10）。
 const socket = process.platform === 'win32' ? `\\\\.\\pipe\\tp-dex-preview-${process.pid}` : join(dir, 'dex.sock');
-const dex = startDex({ socket, stateDir: dir, build: 'development', options: { fetchImpl: fetchImpl as typeof fetch, accounts: () => ({ accounts: PREVIEW_ACCOUNTS, problem: null }), connect: url => venueOfUrl(url) === 'entropy' ? new FakeEntropy() : new FakeLighter(venueOfUrl(url)) } });
+const dex = startDex({ socket, stateDir: dir, build: 'development', options: { fetchImpl: fetchImpl as typeof fetch, accounts: () => ({ accounts: PREVIEW_ACCOUNTS, problem: null }), lighterAuth: async venue => venue === 'lighter' ? 'preview-lighter-token' : null, connect: url => venueOfUrl(url) === 'entropy' ? new FakeEntropy() : new FakeLighter(venueOfUrl(url)) } });
 await dex.ready;
 const client = createDexClient(socket);
 await client.pushToken({ seq: Date.now(), token: '', problem: '' });

@@ -195,3 +195,14 @@ a.vl-symbol:hover{color:var(--accent)}
 .vl-live-inline{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:8px}
 .vl-live-key .vl-live-inline{margin-top:0}
 @media (max-width:1100px){.vl-live-keys{grid-template-columns:minmax(0,1fr)}}
+
+/* 账户资产（VarLighterAccounts.tsx） */
+.vl-page .callout a,.vl-page .vl-note a,.vl-page .panel-heading a{color:var(--accent)}
+.vl-acc-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;align-items:start}
+.vl-acc-card{display:flex;flex-direction:column;min-width:0}
+.vl-acc-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 14px;padding:12px 14px;margin:0}
+.vl-acc-facts dt{color:var(--text-tertiary);font-size:.6875rem}
+.vl-acc-facts dd{margin:2px 0 0;font-size:.875rem;font-weight:600;font-family:var(--font-mono);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.vl-acc-facts dd:not(.vl-up):not(.vl-down){color:var(--text-primary)}
+@media (max-width:1100px){.vl-acc-grid{grid-template-columns:minmax(0,1fr)}}
+@media (max-width:650px){.vl-acc-facts{grid-template-columns:minmax(0,1fr)}}

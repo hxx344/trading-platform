@@ -16,7 +16,7 @@ import type { VariationalFetcher } from '../vendor/variational-market.mjs';
  * `variationalFetch`：Var token 询价的传输（默认经 python3 传输脚本），测试里换成替身。`tokenSource`：Var token 的来源；
  * DEX 服务里是执行面推来的内存值，不给就读 `dir` 里的 token 文件（本机测试）。
  */
-export interface VarLighterOptions { liveKeys?: import('../varlighter/livekeys.ts').LiveKeysStore; traders?: import('../varlighter/engine.ts').EngineOptions['traders']; signerProblem?: () => string | null; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; variationalFetch?: VariationalFetcher; tokenSource?: () => TokenSource; /** 实盘场所账户；不给就是没有配置。 */ accounts?: DexAccountsSource }
+export interface VarLighterOptions { liveKeys?: import('../varlighter/livekeys.ts').LiveKeysStore; traders?: import('../varlighter/engine.ts').EngineOptions['traders']; signerProblem?: () => string | null; lighterAuth?: import('../varlighter/engine.ts').EngineOptions['lighterAuth']; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; variationalFetch?: VariationalFetcher; tokenSource?: () => TokenSource; /** 实盘场所账户；不给就是没有配置。 */ accounts?: DexAccountsSource }
 export interface VarLighterHolder { engine: VarLighterEngine | null; error: string | null }
 
 export interface VarLighterViews {
@@ -26,6 +26,8 @@ export interface VarLighterViews {
   backtest(body: unknown): unknown;
   paper(): unknown;
   readiness(): unknown;
+  accounts(): unknown;
+  accountsRefresh(): unknown;
   settings(body: unknown): unknown;
   close(body: unknown): unknown;
   reset(body: unknown): unknown;
@@ -66,6 +68,8 @@ export function varLighterViews(holder: VarLighterHolder): VarLighterViews {
     backtest: body => engine().views.backtest(body),
     paper: () => engine().views.paper(),
     readiness: () => engine().views.readiness(),
+    accounts: () => engine().views.accounts(),
+    accountsRefresh: () => engine().views.accountsRefresh(),
     settings: body => engine().views.settings(body),
     close: body => engine().views.close(body),
     reset: body => engine().views.reset(body),
@@ -103,6 +107,8 @@ export async function routePage(views: VarLighterViews, request: DexPageRequest,
     if (method === 'GET' && path === 'samples') return { status: 200, body: views.samples(query.get('symbol'), query.get('after'), query.get('limit')) };
     if (method === 'GET' && path === 'paper') return { status: 200, body: views.paper() };
     if (method === 'GET' && path === 'readiness') return { status: 200, body: views.readiness() };
+    if (method === 'GET' && path === 'accounts') return { status: 200, body: views.accounts() };
+    if (method === 'POST' && path === 'accounts/refresh') return { status: 200, body: views.accountsRefresh() };
     if (method === 'POST' && path === 'backtest') return { status: 200, body: await views.backtest(body) };
     if (method === 'POST' && path === 'settings') return { status: 200, body: views.settings(body) };
     if (method === 'POST' && path === 'paper/close') return { status: 200, body: views.close(body) };

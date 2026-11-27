@@ -1,5 +1,7 @@
 // DEX 价差模块（原 Var/Lighter）各接口的应答结构（docs/varlighter.md 第 9 节、docs/dexspread.md 第 6 节）。只有类型，引擎按这些类型返回，
 // 页面按这些类型读取；不引用 node 模块，前端类型检查可以直接导入。
+import type { KeyVenue } from '../dex/keys.ts';
+import type { AccountAsset, AccountFunding, AccountHistorySummary, AccountPnlPoint, AccountTrade } from './accounts.ts';
 import type { BacktestResult } from './backtest.ts';
 import type { AssetKind, Combo, CustomPair, Identity, LegInfo, LiveVenue, Regime, Sample, SizeBucket, VarPriceSource, VenueId } from './model.ts';
 import type { OrderPlan } from './plan.ts';
@@ -131,3 +133,104 @@ export interface ReadinessItem { key: string; status: 'ok' | 'warn' | 'todo'; la
 /** 手动配对用的目录：各场所在交易的代码与标记价（场所没有在采集、目录未取到时为空）。 */
 export interface CatalogEntry { symbol: string; mark: number | null }
 export interface ReadinessView { now: number; items: ReadinessItem[]; ready: boolean; markets: Record<VenueId, CatalogEntry[]> }
+
+/** 账户资产页签（docs/dexspread.md 第 14 节）：交易所实时资产、持仓、成交记录、资金费与盈亏汇总（不含账户标识与私钥）。 */
+export interface VenuePositionView {
+  venue: KeyVenue;
+  venueName: string;
+  collateralAsset: string;
+  symbol: string;
+  size: number;
+  side: 'long' | 'short';
+  valueUsd: number;
+  entryPrice: number | null;
+  markPrice: number | null;
+  markEstimated: boolean;
+  unrealizedPnl: number | null;
+  unrealizedPnlPct: number | null;
+  realizedPnl: number | null;
+  liquidationPrice: number | null;
+  leverage: number | null;
+  marginMode: 'cross' | 'isolated' | null;
+}
+
+export interface VenueAccountView {
+  venue: KeyVenue;
+  name: string;
+  collateralAsset: string;
+  configured: boolean;
+  hasTradingKey: boolean;
+  at: number | null;
+  stale: boolean;
+  error: string | null;
+  equity: number | null;
+  collateral: number | null;
+  available: number | null;
+  marginUsed: number | null;
+  unrealizedPnl: number | null;
+  positionRealizedPnl: number | null;
+  positionsCount: number;
+  assets: AccountAsset[];
+  historyAt: number | null;
+  historyStale: boolean;
+  authRequired: boolean;
+  tradesError: string | null;
+  fundingError: string | null;
+  pnlError: string | null;
+  tradesTruncated: boolean;
+  fundingTruncated: boolean;
+  summary: AccountHistorySummary;
+  equityCurve: { t: number; equity: number }[];
+  pnlCurve: AccountPnlPoint[];
+}
+
+export interface AccountsTotalsView {
+  configured: number;
+  fresh: number;
+  staleVenues: KeyVenue[];
+  errorVenues: KeyVenue[];
+  complete: boolean;
+  equityUsd: number | null;
+  collateralUsd: number | null;
+  availableUsd: number | null;
+  marginUsedUsd: number | null;
+  unrealizedPnlUsd: number | null;
+  positionsCount: number;
+  positionsNotionalUsd: number;
+  tradeCount30d: number;
+  volumeUsd30d: number;
+  feeUsd30d: number | null;
+  realizedPnlUsd30d: number | null;
+  realizedVenues: KeyVenue[];
+  fundingUsd30d: number | null;
+  fundingVenues: KeyVenue[];
+  liveTrades: number;
+  liveNetUsd: number;
+  liveTodayNetUsd: number;
+  liveWins: number;
+  liveOpenCount: number;
+}
+
+export interface AccountsView {
+  now: number;
+  windowDays: number;
+  refreshing: boolean;
+  cooldownMs: number;
+  keysProblem: string | null;
+  signerProblem: string | null;
+  totals: AccountsTotalsView;
+  venues: VenueAccountView[];
+  positions: VenuePositionView[];
+  trades: AccountTrade[];
+  funding: AccountFunding[];
+  equityCurve: { t: number; equity: number }[];
+  equityComplete: boolean;
+  liveTrades: LivePosition[];
+  venueNames: Record<VenueId, string>;
+}
+
+export interface AccountsRefreshResult {
+  triggered: boolean;
+  cooldownMs: number;
+  refreshing: boolean;
+}

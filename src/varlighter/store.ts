@@ -64,6 +64,17 @@ function mergeByTime(old: Sample[], fresh: Sample[]): Sample[] {
 }
 
 export interface StoredEvent { id: number; at: number; kind: string; symbol: string | null; message: string }
+export interface AccountSnapshotRow {
+  venue: string;
+  accountHash: string;
+  at: number;
+  equity: number;
+  collateral: number;
+  available: number;
+  unrealizedPnl: number | null;
+  positions: number;
+}
+export const ACCOUNT_SNAPSHOT_RETENTION_DAYS = 30;
 export type VarLighterStore = ReturnType<typeof openVarLighterStore>;
 /** 迁移用的转换：旧参数换成新参数（引擎提供），旧持仓的手续费取旧参数里的 Var 与 Lighter 手续费。 */
 export interface LegacyUpgrade { settings: (old: unknown) => unknown; cooldown: (old: unknown) => unknown; fees: (old: unknown) => LegFees }
@@ -117,6 +128,18 @@ export function openVarLighterStore(file: string) {
     CREATE INDEX IF NOT EXISTS leg_trades_symbol ON leg_trades(symbol, closed_at);
     CREATE TABLE IF NOT EXISTS live_positions (id TEXT PRIMARY KEY, symbol TEXT NOT NULL, state TEXT NOT NULL, opened_at INTEGER NOT NULL, closed_at INTEGER, net_usd REAL, json TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS live_positions_state ON live_positions(state, closed_at);
+    CREATE TABLE IF NOT EXISTS account_snapshots (
+      venue TEXT NOT NULL,
+      account_hash TEXT NOT NULL,
+      at INTEGER NOT NULL,
+      equity REAL NOT NULL,
+      collateral REAL NOT NULL,
+      available REAL NOT NULL,
+      unrealized_pnl REAL,
+      positions INTEGER NOT NULL,
+      PRIMARY KEY (venue, account_hash, at)
+    );
+    CREATE INDEX IF NOT EXISTS account_snapshots_at ON account_snapshots(at);
     CREATE INDEX IF NOT EXISTS events_at ON events(at);`);
     // v0.81.0、v0.82.0 给旧表加的可空列；新版本不再写旧表，但旧库可能还没有这些列（读旧样本时按列名读）。
     db.exec('BEGIN IMMEDIATE');
@@ -168,6 +191,9 @@ export function openVarLighterStore(file: string) {
   const insertEvent = db.prepare('INSERT INTO events(at, kind, symbol, message) VALUES (?, ?, ?, ?)');
   const recentEvents = db.prepare('SELECT id, at, kind, symbol, message FROM events ORDER BY id DESC LIMIT ?');
   const pruneEvents = db.prepare('DELETE FROM events WHERE at < ?');
+  const insertSnapshot = db.prepare('INSERT OR IGNORE INTO account_snapshots(venue, account_hash, at, equity, collateral, available, unrealized_pnl, positions) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+  const selectSnapshots = db.prepare('SELECT venue, account_hash AS accountHash, at, equity, collateral, available, unrealized_pnl AS unrealizedPnl, positions FROM account_snapshots WHERE venue = ? AND account_hash = ? AND at >= ? ORDER BY at');
+  const pruneSnapshots = db.prepare('DELETE FROM account_snapshots WHERE at < ?');
   const readState = db.prepare('SELECT json FROM state WHERE key = ?');
   const writeState = db.prepare('INSERT INTO state(key, json, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at');
   const transaction = <T>(work: () => T): T => {
@@ -222,6 +248,13 @@ export function openVarLighterStore(file: string) {
     },
     /** 删掉 30 天前的事件。 */
     pruneEvents(now: number): void { pruneEvents.run(now - 30 * 86_400_000); },
+    addAccountSnapshot(row: AccountSnapshotRow): void {
+      insertSnapshot.run(row.venue, row.accountHash, row.at, row.equity, row.collateral, row.available, row.unrealizedPnl, row.positions);
+    },
+    accountSnapshots(venue: string, accountHash: string, since: number): AccountSnapshotRow[] {
+      return selectSnapshots.all(venue, accountHash, since) as unknown as AccountSnapshotRow[];
+    },
+    pruneAccountSnapshots(now: number): void { pruneSnapshots.run(now - ACCOUNT_SNAPSHOT_RETENTION_DAYS * 86_400_000); },
     positions(): Position[] { return parse<Position>(allPositions.all()); },
     savePosition(position: Position): void { upsertPosition.run(position.id, position.symbol, JSON.stringify(position)); },
     /** 平仓时持仓、成交、事件和冷却一起提交。 */

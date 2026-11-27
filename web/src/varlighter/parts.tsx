@@ -4,7 +4,7 @@ import { ApiError } from '../api.ts';
 import { SvgPlot, type PlotLayer } from '../svg-plot.tsx';
 import { niceAxis } from '../svg-plot-geometry.ts';
 import type { ClosedTrade } from '../../../src/varlighter/strategy.ts';
-import { bps, chartRange, clamp, signedUsd, type ChartRow } from './varlighter-form.ts';
+import { bps, chartRange, clamp, formatCurrencyAmount, signedCurrencyAmount, signedUsd, usd, type ChartRow } from './varlighter-form.ts';
 
 export function Metric({ label, value, foot, tone = '', accent = false }: { label: ReactNode; value: ReactNode; foot?: ReactNode; tone?: string; /** 需要注意的读数：整张卡用强调色 */ accent?: boolean }) {
   return <div className={accent ? 'vl-metric accent' : 'vl-metric'}><span>{label}</span><strong className={tone ? `vl-${tone}` : undefined}>{value}</strong>{foot ? <small>{foot}</small> : null}</div>;
@@ -94,4 +94,33 @@ export function EquityChart({ points, label }: { points: readonly { t: number; n
   return <SvgPlot rows={rows} xDomain={[from, to > from ? to : from + 60_000]} yDomain={axis.domain} yTicks={axis.ticks} yTick={value => signedUsd(Math.abs(value) < step / 1e6 ? 0 : value, digits)} xTick={timeTick(to - from)}
     layers={EQUITY_LAYERS} references={[{ y: 0, color: 'var(--surface-6)' }]} margin={MARGIN} height={200} label={label}
     tooltip={row => { const item = row as { time: number; net: number }; return <div className="vl-tip"><b>{stampText(item.time)}</b><span>累计净盈亏</span><span>{signedUsd(item.net)}</span></div>; }} />;
+}
+
+const VALUE_LAYERS: PlotLayer[] = [{ kind: 'line', key: 'value', color: 'var(--accent)', width: 1.75, active: true }];
+const EQUITY_MARGIN = { top: 12, right: 104, bottom: 30 };
+/** 账户权益或盈亏折线图（悬停查看单点读数）。 */
+export function EquityLineChart({ points, label, valueLabel = '账户权益', formatValue, currency, zeroRef = false }: {
+  points: readonly { t: number; value: number }[];
+  label: string;
+  valueLabel?: string;
+  formatValue: (value: number) => string;
+  currency?: string;
+  zeroRef?: boolean;
+}) {
+  const rows = useMemo(() => points.map(point => ({ time: point.t, value: point.value })), [points]);
+  if (rows.length < 2) return null;
+  const from = rows[0]!.time, to = rows.at(-1)!.time;
+  const values = rows.map(row => row.value);
+  const low = zeroRef ? Math.min(0, ...values) : Math.min(...values);
+  const high = zeroRef ? Math.max(0, ...values) : Math.max(...values);
+  const axis = niceAxis(low, high);
+  const step = axis.ticks.length > 1 ? Math.abs(axis.ticks[1]! - axis.ticks[0]!) : 1;
+  const digits = step >= 10 ? 0 : step >= 1 ? 1 : 2;
+  const formatTick = currency
+    ? (value: number) => (zeroRef ? signedCurrencyAmount : formatCurrencyAmount)(value, currency, digits)
+    : (value: number) => (zeroRef ? signedUsd : usd)(value, digits);
+  return <SvgPlot rows={rows} xDomain={[from, to > from ? to : from + 60_000]} yDomain={axis.domain} yTicks={axis.ticks}
+    yTick={value => formatTick(Math.abs(value) < step / 1e6 ? 0 : value)} xTick={timeTick(to - from)}
+    layers={VALUE_LAYERS} references={zeroRef ? [{ y: 0, color: 'var(--surface-6)' }] : []} margin={currency ? EQUITY_MARGIN : MARGIN} height={200} label={label}
+    tooltip={row => { const item = row as { time: number; value: number }; return <div className="vl-tip"><b>{stampText(item.time)}</b><span>{valueLabel}</span><span>{formatValue(item.value)}</span></div>; }} />;
 }

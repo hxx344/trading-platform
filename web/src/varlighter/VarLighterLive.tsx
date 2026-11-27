@@ -112,7 +112,7 @@ function SwitchPanel({ view, onChanged }: { view: LiveView; onChanged: () => Pro
     send({ on: true, pairs: confirmedPairs, limits: confirmedLimits }, '实盘已打开：跟随模拟盘信号下真实订单');
   };
   return <section className="panel" aria-label="实盘开关">
-    <div className="panel-heading"><h2>实盘</h2><span className="muted">跟随模拟盘：模拟盘在勾选的配对上开仓、平仓时，两个交易所同步下真实订单</span></div>
+    <div className="panel-heading"><h2>实盘</h2><span className="muted">跟随模拟盘：模拟盘在勾选的配对上开仓、平仓时，两个交易所同步下真实订单 · <a href={varLighterHref('accounts')}>查看各场所账户资产与成交 →</a></span></div>
     <div className="vl-actions vl-pause">
       {saved.on ? view.halt ? <Badge tone="bad">已停止</Badge> : <Badge tone="ok">实盘运行中</Badge> : <Badge tone="warn">实盘关闭</Badge>}
       {saved.on

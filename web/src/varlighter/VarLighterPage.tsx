@@ -10,6 +10,7 @@ import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { useLiveResource } from '../use-live-resource.ts';
 import type { OrphanRow, PositionSummary, StateRow, StateView, VenueStatus } from '../../../src/varlighter/views.ts';
 import { Badge, Metric, useWrite } from './parts.tsx';
+import { VarLighterAccounts } from './VarLighterAccounts.tsx';
 import { VarLighterDetail } from './VarLighterDetail.tsx';
 import { VarLighterPaper } from './VarLighterPaper.tsx';
 import { VarLighterReady } from './VarLighterReady.tsx';
@@ -49,7 +50,8 @@ export function VarLighterPage({ tab, symbol, onExpired }: { tab: VarLighterTab;
       : tab === 'overview' ? <Overview view={data} onChanged={live.refresh} />
         : tab === 'detail' ? <VarLighterDetail view={data} symbol={symbol} onChanged={live.refresh} onExpired={onExpired} />
           : tab === 'paper' ? <VarLighterPaper view={data} onChanged={live.refresh} onExpired={onExpired} />
-            : <VarLighterReady view={data} onChanged={live.refresh} onExpired={onExpired} />}
+            : tab === 'accounts' ? <VarLighterAccounts onExpired={onExpired} />
+              : <VarLighterReady view={data} onChanged={live.refresh} onExpired={onExpired} />}
   </div>;
 }
 

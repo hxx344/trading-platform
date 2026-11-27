@@ -679,3 +679,28 @@ DEX 这一步在 `activate` 里的位置是：**执行面健康之后、控制�
 
 - 测试：`test/dex-hyperliquid.test.ts`（签名向量）、`test/dex-lighter-signer.test.ts`（WASM 加载与字段比对）、`test/dex-livekeys.test.ts`（凭据文件；接口层：有持仓时换账户与移除 409、模拟盘视图不含实盘事件、应答不带私钥）、`test/dex-orders.test.ts`（三种查单结果、Entropy 只有 400/422/429 算没受理）、`test/dex-live.test.ts`（失败场景：单腿、不明结果不重发、第一腿在途时重启、落库失败、按持仓与过期时限判定、余量、报价缺失、对账、限额、重启后告警）。
 - 审查记录：[reviews/2026-11-27-dexspread-live-direct.md](reviews/2026-11-27-dexspread-live-direct.md)。
+
+## 14 账户资产、持仓、成交与盈亏（R2，v0.108.0，回滚版本 v0.107.0）
+
+2026-11-27 为 DEX 价差模块新增「账户资产」页签（`#/varlighter/accounts`），在不改变实盘下单状态机与进程边界的前提下，展示各实盘场所的账户资产、活跃持仓、近 30 天成交与资金费记录、账户权益曲线及策略实盘盈亏对照。
+
+### 14.1 覆盖范围与数据来源
+
+- **场所**：Lighter 主网（`USDC`）、Lighter RH（`USDG`）、Entropy（Hyperliquid HIP-3 `io` 盘，`USDC`）。Var 没有公开账户与交易接口，不纳入。
+- **账户与持仓**：沿用 `src/varlighter/accounts.ts` 的公开账户只读，补充解析 `total_asset_value` / `marginSummary.accountValue`（账户权益）、`totalMarginUsed` / `allocated_margin`（已用保证金）、非零现货资产（`assets`）、持仓开仓均价、未实现盈亏、持仓已实现盈亏、强平价、杠杆与全仓/逐仓模式；可选字段无效时降级为 `null`，不破坏实盘对账。持仓标记价优先取实时行情流与目录，缺失时按市值除以持仓量估算并标「估算」。
+- **成交、资金费与交易所盈亏**：
+  - **Entropy**：公开 `POST /info`，拉取近 30 天 `userFillsByTime`（每页 2000 条、最多 3 页）与 `userFunding`（每页 500 条、最多 3 页），严格按 `io:` 前缀过滤（排除主盘与 `xyz` 等其他 HIP-3 盘），非 `USDC` 手续费记 `null`，并按时间累计生成 `io` 盘净盈亏曲线；页满或时间不前进时标明截断（L093）。
+  - **Lighter 主网与 RH**：`GET /api/v1/trades`、`GET /api/v1/positionFunding`、`GET /api/v1/pnl` 均需鉴权。已录入页面 API 私钥时复用 DEX 服务的 Lighter WASM 签名器签发 `authorization` 令牌（50 分钟缓存，遇到 HTTP 401/403 自动刷新重试一次），并按 `bid_account_id`/`ask_account_id` 核对账户归属；标准账户非零 `taker_fee`/`maker_fee` 在真实账户核实单位前保守记 `null`。仅通过 `keys.env` 录入只读账户编号时，跳过需鉴权请求并在页签明确提示去「实盘准备」录入 API 凭据。
+
+### 14.2 存储、缓存与边界（D1–D4）
+
+- **库表**：`varlighter.sqlite` 只加不改的新表 `account_snapshots`（`PRIMARY KEY (venue, account_hash, at)`，30 天保留随 `pruneSamples` 清理），不改动已有表与执行器库；回滚至 `v0.107.0` 无需迁移数据。
+- **刷新、并发与失效**：账户资产每 60 秒读取并按最小 5 分钟间隔落盘快照；成交/资金费/盈亏历史每 3 分钟在后台轮询（完成后计算下一次时刻，L049）。每次回包核对凭据代次与 `account_hash`（`sha256("${venue}:${id}").slice(0, 16)`），移除或更换账户后立即使在途读取与签名/令牌缓存失效（L089、L207）。
+- **IPC 与限流防护**：`GET /api/varlighter/accounts` 与 `POST /api/varlighter/accounts/refresh` 仅限浏览器会话，不加入 `read-token.ts` 只读令牌白名单。`POST accounts/refresh` 带 10 秒冷却、仅重置并异步触发后台刷新后立即返回，避免占用执行面 10 秒 IPC 超时（`DexOutcomeUnknown`）。所有响应、报错、日志与数据库均不含账户编号、钱包地址、API 密钥编号、私钥或鉴权令牌，报错文本经 `scrub()` 脱敏。
+- **文件名说明**：本批次遵循「重构与行为变更分开」（D7），保留 `varlighter` 目录与接口兼容命名，不改动 `src/http.ts`、`src/dex/ipc.ts`、`src/read-token.ts` 与 `deploy/` 指纹边界。
+
+### 14.3 验证与审查
+
+- **测试**：`test/dex-accounts.test.ts`（完整账户解析、Entropy `io:` 过滤与有界翻页/截断、Lighter 归属/角色/`fee` 口径/401 重试/无鉴权零请求、SQLite 快照按哈希隔离与清理、汇总完整性、L089 在途失效、10 秒刷新冷却、隐私脱敏与只读令牌拒绝）、`test/dex-keys.test.ts`、`web/test/varlighter-form.test.mjs`。
+- **浏览器**：`scripts/dev-varlighter.ts` 替身后端 1280×800 与 390×844 走查（见 [frontend.md](frontend.md)）。
+- **审查记录**：[reviews/2026-11-27-dexspread-accounts.md](reviews/2026-11-27-dexspread-accounts.md)。

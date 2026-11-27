@@ -1,15 +1,17 @@
 // DEX 价差页（docs/varlighter.md 第 10 节、docs/dexspread.md 第 7 节）不依赖 DOM 的部分：读数格式、总览排序、参数表单到请求的转换、
 // 配对键与场所名、手动配对的表单、走势图的行数据。由 web/test/varlighter-form.test.mjs 覆盖。
+import type { KeyVenue } from '../../../src/dex/keys.ts';
+import type { AccountFunding, AccountTrade } from '../../../src/varlighter/accounts.ts';
 import type { AssetKind, Combo, CustomPair, Regime, VarPriceSource, VenueId } from '../../../src/varlighter/model.ts';
 import type { AutoParams, Direction, GlobalParams, SymbolParams } from '../../../src/varlighter/strategy.ts';
-import type { Settings, StateRow, SymbolPoint } from '../../../src/varlighter/views.ts';
+import type { AccountsView, Settings, StateRow, SymbolPoint, VenueAccountView, VenuePositionView } from '../../../src/varlighter/views.ts';
 import type { VarLighterTab } from '../route-parse.ts';
 
 export const VARLIGHTER_BASE = '/api/varlighter';
 export const VAR_QUOTE_LABELS: Record<VarPriceSource, string> = { token: '按量询价', '0': '公开一档', '1k': '公开 1 千美元档', '100k': '公开 10 万美元档' };
 export type { VarLighterTab };
 export const VARLIGHTER_TABS: readonly { id: VarLighterTab; label: string }[] = [
-  { id: 'overview', label: '价差总览' }, { id: 'detail', label: '标的详情' }, { id: 'paper', label: '模拟盘' }, { id: 'ready', label: '实盘准备' },
+  { id: 'overview', label: '价差总览' }, { id: 'detail', label: '标的详情' }, { id: 'paper', label: '模拟盘' }, { id: 'accounts', label: '账户资产' }, { id: 'ready', label: '实盘准备' },
 ];
 /** 详情页地址里的是配对键「场所:代码|场所:代码[@乘数]」：冒号、竖线与 @ 在地址片段里合法，保留原样便于阅读。 */
 export const varLighterHref = (tab: VarLighterTab, key?: string | null): string =>
@@ -315,4 +317,130 @@ export function customPairRequest(form: CustomPairForm, existing: readonly strin
   const pair: CustomPair = { a: { venue: form.aVenue, symbol: aSymbol }, b: { venue: form.bVenue, symbol: bSymbol }, ratio: Number(formatRatio(ratio)), kind: form.kind, note };
   if (existing.includes(customPairKey(pair))) return { ok: false, error: `${customPairKey(pair)} 已在配对里` };
   return { ok: true, value: pair };
+}
+
+// ---- 账户资产 ----
+export type AccountVenueFilter = KeyVenue | 'all';
+export const ACCOUNT_VENUE_FILTERS: readonly { id: AccountVenueFilter; label: string }[] = [
+  { id: 'all', label: '全部场所' },
+  { id: 'lighter', label: 'Lighter 主网' },
+  { id: 'rh', label: 'Lighter RH' },
+  { id: 'entropy', label: 'Entropy' },
+];
+
+export const filterAccountPositions = (positions: readonly VenuePositionView[], filter: AccountVenueFilter): VenuePositionView[] =>
+  filter === 'all' ? [...positions] : positions.filter(item => item.venue === filter);
+
+export const filterAccountTrades = (trades: readonly AccountTrade[], filter: AccountVenueFilter): AccountTrade[] =>
+  filter === 'all' ? [...trades] : trades.filter(item => item.venue === filter);
+
+export const filterAccountFunding = (funding: readonly AccountFunding[], filter: AccountVenueFilter): AccountFunding[] =>
+  filter === 'all' ? [...funding] : funding.filter(item => item.venue === filter);
+
+export function selectedEquitySeries(
+  view: Pick<AccountsView, 'venues' | 'equityCurve' | 'equityComplete'>,
+  filter: AccountVenueFilter,
+): { points: { t: number; value: number }[]; complete: boolean; currency: string } {
+  if (filter === 'all') {
+    return {
+      points: view.equityCurve.map(item => ({ t: item.t, value: item.equity })),
+      complete: view.equityComplete,
+      currency: 'USD',
+    };
+  }
+  const venue = view.venues.find(item => item.venue === filter);
+  const points = (venue?.equityCurve ?? []).map(item => ({ t: item.t, value: item.equity }));
+  return {
+    points,
+    complete: points.length >= 2,
+    currency: venue?.collateralAsset ?? 'USDC',
+  };
+}
+
+export function selectedVenuePnlCurve(
+  view: Pick<AccountsView, 'venues'>,
+  filter: AccountVenueFilter,
+): { points: { t: number; value: number }[]; title: string; error: string | null; currency: string } | null {
+  if (filter === 'all') return null;
+  const venue = view.venues.find(item => item.venue === filter);
+  if (!venue) return null;
+  return {
+    points: venue.pnlCurve.map(item => ({ t: item.at, value: item.pnlUsd })),
+    title: venue.venue === 'entropy' ? 'Entropy 累计交易净盈亏（含资金费与手续费）' : `${venue.name} 每日交易盈亏`,
+    error: venue.pnlError,
+    currency: venue.collateralAsset,
+  };
+}
+
+export const accountPnlTone = (value: number | null | undefined): 'up' | 'down' | '' => tone(value);
+
+export function formatCurrencyAmount(value: number | null | undefined, currency: string, digits = 2): string {
+  if (!finite(value)) return '—';
+  const text = Math.abs(value).toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  return `${value < 0 ? '−' : ''}${text} ${currency}`;
+}
+
+export function signedCurrencyAmount(value: number | null | undefined, currency: string, digits = 2): string {
+  if (!finite(value)) return '—';
+  return `${value > 0 ? '+' : ''}${formatCurrencyAmount(value, currency, digits)}`;
+}
+
+export const formatRatePct = (rate: number | null | undefined): string =>
+  finite(rate) ? `${rate > 0 ? '+' : ''}${(rate * 100).toFixed(4)}%` : '—';
+
+export const marginModeLabel = (mode: 'cross' | 'isolated' | null | undefined): string =>
+  mode === 'cross' ? '全仓' : mode === 'isolated' ? '逐仓' : '—';
+
+const TRADE_DIR_LABELS: Record<string, string> = {
+  'Open Long': '开多',
+  'Add Long': '加多',
+  'Close Long': '平多',
+  'Open Short': '开空',
+  'Add Short': '加空',
+  'Close Short': '平空',
+  Buy: '买入',
+  Sell: '卖出',
+};
+export function tradeDirLabel(trade: Pick<AccountTrade, 'side' | 'dir'>): string {
+  if (trade.dir) return TRADE_DIR_LABELS[trade.dir] ?? trade.dir;
+  return trade.side === 'buy' ? '买入' : '卖出';
+}
+
+export function accountHealthBadge(venue: Pick<VenueAccountView, 'configured' | 'at' | 'stale' | 'error'>): { tone: 'ok' | 'warn' | 'bad' | ''; label: string } {
+  if (!venue.configured) return { tone: '', label: '未配置' };
+  if (venue.error && venue.at === null) return { tone: 'bad', label: '读取失败' };
+  if (venue.stale) return { tone: 'warn', label: venue.error ? '读取失败（已过期）' : '读数过期' };
+  if (venue.error) return { tone: 'warn', label: '上次刷新失败' };
+  return { tone: 'ok', label: '正常' };
+}
+
+export function accountActivityFoot(
+  data: Pick<AccountsView, 'venues' | 'totals'>,
+  filter: AccountVenueFilter,
+): string {
+  if (filter !== 'all') {
+    const venue = data.venues.find(item => item.venue === filter);
+    if (!venue || !venue.configured) return '还没有配置该场所账户';
+    if (venue.tradesError) return venue.authRequired ? '成交未授权' : '成交读取失败';
+    if (venue.historyAt === null) return '成交未拉取';
+    const realized = venue.summary.realizedPnlUsd !== null
+      ? ` · 已实现 ${signedCurrencyAmount(venue.summary.realizedPnlUsd, venue.collateralAsset)}`
+      : '';
+    return `成交 ${venue.summary.tradeCount} 笔 · 成交额 ${usd(venue.summary.volumeUsd, 0)}${realized}`;
+  }
+  const configured = data.venues.filter(item => item.configured);
+  if (!configured.length) return '还没有配置实盘场所账户';
+  const tradeOk = configured.filter(item => item.historyAt !== null && !item.tradesError);
+  const tradePart = tradeOk.length === 0
+    ? '成交未拉取'
+    : tradeOk.length < configured.length
+      ? `已读成交 ${data.totals.tradeCount30d} 笔（${tradeOk.map(item => venueShort(item.venue)).join('、')}）`
+      : `成交 ${data.totals.tradeCount30d} 笔`;
+  const fundingPartial = data.totals.fundingVenues.length > 0 && data.totals.fundingVenues.length < configured.length
+    ? `资金费含 ${data.totals.fundingVenues.map(venueShort).join('、')}`
+    : '';
+  const realizedPart = data.totals.realizedPnlUsd30d !== null
+    ? `已实现 ${signedCurrencyAmount(data.totals.realizedPnlUsd30d, 'USD')}${data.totals.realizedVenues.length < configured.length ? `（${data.totals.realizedVenues.map(venueShort).join('、')}）` : ''}`
+    : '';
+  return [tradePart, fundingPartial, realizedPart, `策略实盘累计 ${signedUsd(data.totals.liveNetUsd)}`].filter(Boolean).join(' · ');
 }

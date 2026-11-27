@@ -2,6 +2,7 @@
 // 并给页面出视图。只写自己的 varlighter.sqlite，不碰执行器。实盘（live.ts，docs/dexspread.md 第 13 节）默认关闭：录了凭据、开了总开关后才在勾选的配对上下真实订单。
 // 有 Var 腿的配对跟着每分钟一次的 Var 报价采样（样本时刻 = Var 报价时刻，另一腿回看那一刻的行情流）；两腿都是行情流的配对
 // 由本机每秒检查一次，启用或有持仓的每 5 秒、其余每 20 秒采一条（样本时刻 = 本机采样时刻）。
+import { createHash } from 'node:crypto';
 import { anySignal } from '../any-signal.mjs';
 import { TOKEN_QUOTE_CONCURRENCY, TOKEN_QUOTE_MAX_AGE_MS, TOKEN_QUOTE_PHASE_MS, type TokenQuote, type VarQuoter } from './varquote.ts';
 import { Worker } from 'node:worker_threads';
@@ -9,24 +10,24 @@ import { backtestRequest } from './backtest.ts';
 import type { ReplayJob } from './replay-worker.ts';
 import { HyperliquidStream, LighterStream, MAX_DEPTH_MARKETS, depthAt, fetchEntropyMarkets, fetchRhMarkets, fetchVarListings,
   type Connect, type DepthSnapshot, type FetchLike, type LiveStream, type TopPoint } from './feeds.ts';
-import { COLLATERAL_ASSET, fetchAccount, type AccountSnapshot } from './accounts.ts';
-import { KEY_VENUES, configuredVenues, type DexAccountsSource, type KeyVenue } from '../dex/keys.ts';
+import { ACCOUNT_HISTORY_LIMIT, ACCOUNT_HISTORY_WINDOW_MS, COLLATERAL_ASSET, fetchAccount, fetchAccountHistory, type AccountFunding, type AccountHistorySnapshot, type AccountSnapshot, type AccountTrade } from './accounts.ts';
+import { KEY_VENUES, configuredVenues, type DexAccounts, type DexAccountsSource, type KeyVenue } from '../dex/keys.ts';
 import { ASSET_KINDS, COMBOS, DEFAULT_COMBOS, KIND_NAMES, LEG_SYMBOL, LIVE_VENUES, RATIO_MAX, RATIO_MIN, REGIME_NAMES, SAMPLE_FIELDS, SAMPLE_FORMAT, VENUE_IDS, VENUE_NAMES,
   bothLive, bucketOf, comboName, comboPairs, comboVenues, customPairInfo, formatRatio, isLive, legKey, lighterMarket, midBasis, pairKey, pairTitle, parsePairKey,
   regimeOf, regimesOf, sameSymbol, sortPairs, spreadOf, upgradeKey, varHourly, varMarket, varQuoteQty,
   type AssetKind, type Combo, type CustomPair, type Leg, type LegInfo, type LiveVenue, type MarketSpec, type PairInfo, type Sample, type SizeBucket, type VarListing, type VenueId } from './model.ts';
 import { orderPlan, type OrderPlan } from './plan.ts';
 import { LiveError, createLiveTrader, type LiveTrader } from './live.ts';
-import { LiveKeysError, type LiveKeys, type LiveKeysStore } from './livekeys.ts';
+import { LiveKeysError, type LighterKey, type LiveKeys, type LiveKeysStore } from './livekeys.ts';
 import { createLighterSigner, lighterSignerProblem, type LighterSigner } from './lighter-signer.ts';
-import { createEntropyTrader, createLighterTrader, type VenueTrader } from './orders.ts';
+import { createEntropyTrader, createLighterTrader, scrub, type VenueTrader } from './orders.ts';
 import { BaselineTracker, LIVE_BASELINE_GAP_MS, suggestedEntryBps, symbolStats, type Baseline, type RegimeStats } from './stats.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, DIRECTIONS, ParamsError, closePosition, closeSpread, confirmOpen, decide, openEconomics, slippageBudgetBps, fundingEstimate, legFeeBps,
   markToMarket, openBlocker, openPosition, readGlobalParams, readSymbolParams, recommendParams, upgradeDirection, upgradeGlobal,
   CLOSE_REASON_NAMES, DIRECTION_NAMES, type ClosedTrade, type GlobalParams, type LegFees, type Position, type SymbolParams } from './strategy.ts';
 import { COOLDOWN_KEY, SAMPLE_RETENTION_DAYS, SETTINGS_KEY, type LegacyUpgrade, type VarLighterStore } from './store.ts';
-import type { AutoView, BacktestView, CatalogEntry, DepthStatus, LegRef, LiveStats, OrphanRow, PushStats, PaperView, PollStats, PositionMark, ReadinessItem, ReadinessView, SamplesView, Settings, SourceState, StateRow, StateView,
-  SymbolPoint, SymbolView, VenueStatus, LiveView } from './views.ts';
+import type { AccountsRefreshResult, AccountsView, AutoView, BacktestView, CatalogEntry, DepthStatus, LegRef, LiveStats, OrphanRow, PushStats, PaperView, PollStats, PositionMark, ReadinessItem, ReadinessView, SamplesView, Settings, SourceState, StateRow, StateView,
+  SymbolPoint, SymbolView, VenueAccountView, VenuePositionView, VenueStatus, LiveView } from './views.ts';
 
 export const VAR_POLL_MS = 60_000;
 export const CATALOG_MS = 10 * 60_000;
@@ -58,6 +59,16 @@ export const READY_PAPER_TRADES = 20;
 /** 场所账户每分钟读一次；超过三分钟没读到新的就不算数。 */
 export const ACCOUNT_POLL_MS = 60_000;
 export const ACCOUNT_STALE_MS = 3 * 60_000;
+/** 账户成交、资金费与盈亏历史每 3 分钟拉一次；10 分钟未更新标过期。 */
+export const ACCOUNT_HISTORY_POLL_MS = 3 * 60_000;
+export const ACCOUNT_HISTORY_STALE_MS = 10 * 60_000;
+/** 账户权益快照落盘最小间隔（5 分钟）。 */
+export const ACCOUNT_SNAPSHOT_GAP_MS = 5 * 60_000;
+/** 页面手动触发账户刷新的最短冷却。 */
+export const ACCOUNT_MANUAL_REFRESH_COOLDOWN_MS = 10_000;
+const ACCOUNT_CURVE_POINTS_MAX = 300;
+const LIGHTER_AUTH_TTL_SEC = 3600;
+const LIGHTER_AUTH_RENEW_MS = 50 * 60_000;
 /** 「账户资金」就绪的下限：每个要用的场所可用余额不少于实盘起步的单笔名义金额（docs/dexspread.md 12.6）。 */
 export const READY_FUNDING_USD = 100;
 
@@ -83,7 +94,8 @@ type ExitRules = { id: string; exitBps: number; stopBps: number; maxHoldMinutes:
 export interface EngineOptions { store: VarLighterStore; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; log?: (line: string) => void; /** Var token 询价；不给就只用公开报价。 */ quoter?: VarQuoter; /** 实盘场所账户（docs/dexspread.md 第 12 节）；不给就是没有配置。 */ accounts?: DexAccountsSource;
   /** 页面录入的实盘凭据（第 13 节）；不给就没有实盘。 */ liveKeys?: LiveKeysStore;
   /** 下单连接器（测试里换成替身）。 */ traders?: (venue: KeyVenue, keys: LiveKeys) => VenueTrader;
-  /** Lighter 签名器缺什么（测试里换成 null）。 */ signerProblem?: () => string | null }
+  /** Lighter 签名器缺什么（测试里换成 null）。 */ signerProblem?: () => string | null;
+  /** Lighter 历史接口鉴权令牌（测试与本地预览可注入替身，返回 null 表示仅只读）。 */ lighterAuth?: (venue: 'lighter' | 'rh', key: LighterKey) => Promise<string | null> }
 /** Lighter 两条链的 chainId（签名用）。 */
 export const LIGHTER_CHAIN_ID = { lighter: 304, rh: 466324 } as const;
 
@@ -158,7 +170,7 @@ interface VenueRuntime {
 }
 interface DepthEntry { leg: LegInfo; snapshot: DepthSnapshot | null; error: string | null }
 
-export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now = Date.now, log = () => {}, quoter, accounts: envAccounts = () => ({ accounts: {}, problem: null }), liveKeys, traders, signerProblem = lighterSignerProblem }: EngineOptions) {
+export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now = Date.now, log = () => {}, quoter, accounts: envAccounts = () => ({ accounts: {}, problem: null }), liveKeys, traders, signerProblem = lighterSignerProblem, lighterAuth }: EngineOptions) {
   /** 账户标识的来源：页面录入的凭据优先，没录的场所用安装时录入的账户（keys.env）。页面凭据文件读不懂时按有问题处理。 */
   const accountSource: DexAccountsSource = () => {
     const base = envAccounts(), page = liveKeys?.accounts() ?? {}, pageProblem = liveKeys?.read().problem ?? null;
@@ -166,18 +178,106 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     if (!Object.keys(page).length) return base;
     return { accounts: { ...(base.problem ? {} : base.accounts), ...page }, problem: null };
   };
+  const accountHashOf = (venue: KeyVenue, accounts: DexAccounts): string | null => {
+    const entry = accounts[venue];
+    if (!entry) return null;
+    const raw = venue === 'entropy' ? (entry as { address: string }).address.toLowerCase() : String((entry as { accountIndex: number }).accountIndex);
+    return createHash('sha256').update(`${venue}:${raw}`).digest('hex').slice(0, 16);
+  };
+  const readSeq = new Map<KeyVenue, number>();
+  const histSeq = new Map<KeyVenue, number>();
   /** 各场所账户最近一次读取：成功时 at 与 snapshot 一起更新；失败只记 error，旧快照留着但过了时限不算数。 */
-  const accountReads = new Map<KeyVenue, { at: number | null; snapshot: AccountSnapshot | null; error: string | null }>();
-  /** 各场所并行读、各用各的时限：一个场所不应答不拖累另外两个，也不让它们带着已中止的信号发出去。 */
+  const accountReads = new Map<KeyVenue, { hash: string; at: number | null; snapshot: AccountSnapshot | null; error: string | null }>();
+  const accountHistories = new Map<KeyVenue, { hash: string; at: number | null; snapshot: AccountHistorySnapshot | null; error: string | null }>();
+  const lastSnapshotAt = new Map<KeyVenue, { hash: string; at: number }>();
+  /** 各场所并行读、各用各的时限；用单调序号 + 发起时刻防慢回包/慢失败覆盖新状态，且仅淘汰变化场所的在途读取。 */
   async function refreshAccounts(signalFor: () => AbortSignal): Promise<void> {
     const { accounts, problem } = accountSource();
     const venues = problem ? [] : configuredVenues(accounts);
-    for (const venue of [...accountReads.keys()]) if (!venues.includes(venue)) accountReads.delete(venue);
+    for (const venue of [...accountReads.keys()]) {
+      const hash = accountHashOf(venue, accounts);
+      if (!venues.includes(venue) || accountReads.get(venue)!.hash !== hash) accountReads.delete(venue);
+    }
     await Promise.all(venues.map(async venue => {
-      const entry = accountReads.get(venue) ?? { at: null, snapshot: null, error: null };
+      const hash = accountHashOf(venue, accounts)!;
+      const prev = accountReads.get(venue);
+      const entry = prev && prev.hash === hash ? prev : { hash, at: null, snapshot: null, error: null };
       accountReads.set(venue, entry);
-      try { entry.snapshot = await fetchAccount(fetchImpl, signalFor(), venue, accounts); entry.at = now(); entry.error = null; }
-      catch (error) { entry.error = message(error); }
+      const seq = (readSeq.get(venue) ?? 0) + 1;
+      readSeq.set(venue, seq);
+      const startedAt = now();
+      const staleResult = () => {
+        const after = accountSource();
+        const latest = accountReads.get(venue);
+        return after.problem || accountHashOf(venue, after.accounts) !== hash || liveStop.signal.aborted
+          || (readSeq.get(venue) ?? 0) !== seq
+          || (latest !== undefined && latest !== entry)
+          || (latest && latest.hash === hash && latest.at !== null && startedAt < latest.at);
+      };
+      try {
+        const snapshot = await fetchAccount(fetchImpl, signalFor(), venue, accounts);
+        if (staleResult()) return;
+        entry.snapshot = snapshot; entry.at = startedAt; entry.error = null;
+        const lastSaved = lastSnapshotAt.get(venue);
+        if (!lastSaved || lastSaved.hash !== hash || startedAt - lastSaved.at >= ACCOUNT_SNAPSHOT_GAP_MS) {
+          try {
+            store.addAccountSnapshot({
+              venue, accountHash: hash, at: startedAt, equity: snapshot.equity ?? snapshot.collateral,
+              collateral: snapshot.collateral, available: snapshot.available,
+              unrealizedPnl: snapshot.unrealizedPnl ?? null, positions: snapshot.positions.length,
+            });
+            lastSnapshotAt.set(venue, { hash, at: startedAt });
+          } catch (error) { log(`varlighter: 账户权益快照保存失败：${scrub(message(error))}`); }
+        }
+      } catch (error) {
+        if (staleResult()) return;
+        entry.error = scrub(message(error));
+      }
+    }));
+  }
+  const marketNamesFor = (venue: LiveVenue): Map<number, string> => new Map((live.get(venue)?.markets ?? []).map(market => [market.id, market.symbol]));
+  async function refreshAccountHistory(signalFor: () => AbortSignal): Promise<void> {
+    const { accounts, problem } = accountSource();
+    const venues = problem ? [] : configuredVenues(accounts);
+    for (const venue of [...accountHistories.keys()]) {
+      const hash = accountHashOf(venue, accounts);
+      if (!venues.includes(venue) || accountHistories.get(venue)!.hash !== hash) accountHistories.delete(venue);
+    }
+    const keysRead = liveKeys?.read();
+    await Promise.all(venues.map(async venue => {
+      const hash = accountHashOf(venue, accounts)!;
+      const prev = accountHistories.get(venue);
+      const entry = prev && prev.hash === hash ? prev : { hash, at: null, snapshot: null, error: null };
+      accountHistories.set(venue, entry);
+      const seq = (histSeq.get(venue) ?? 0) + 1;
+      histSeq.set(venue, seq);
+      const startedAt = now();
+      const staleResult = () => {
+        const after = accountSource();
+        const latest = accountHistories.get(venue);
+        return after.problem || accountHashOf(venue, after.accounts) !== hash || liveStop.signal.aborted
+          || (histSeq.get(venue) ?? 0) !== seq
+          || (latest !== undefined && latest !== entry)
+          || (latest && latest.hash === hash && latest.at !== null && startedAt < latest.at);
+      };
+      try {
+        let authToken: ((forceRefresh?: boolean) => Promise<string | null>) | undefined;
+        if (venue === 'lighter' || venue === 'rh') {
+          const key = !keysRead?.problem ? keysRead?.keys[venue] : undefined;
+          if (key && accounts[venue]?.accountIndex === key.accountIndex) {
+            authToken = (forceRefresh = false) => lighterAuthToken(venue, key, forceRefresh);
+          } else if (lighterAuth && accounts[venue]) {
+            const synthetic: LighterKey = { accountIndex: accounts[venue]!.accountIndex, apiKeyIndex: 4, privateKey: '' };
+            authToken = (forceRefresh = false) => lighterAuthToken(venue, synthetic, forceRefresh);
+          }
+        }
+        const snapshot = await fetchAccountHistory({ fetchImpl, signalFor, venue, accounts, now: startedAt, marketNames: marketNamesFor(venue), authToken });
+        if (staleResult()) return;
+        entry.snapshot = snapshot; entry.at = snapshot.at; entry.error = null;
+      } catch (error) {
+        if (staleResult()) return;
+        entry.error = scrub(message(error));
+      }
     }));
   }
   const open = connect ?? (url => new WebSocket(url) as unknown as ReturnType<Connect>);
@@ -219,21 +319,67 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
 
   // ---- 实盘（docs/dexspread.md 第 13 节） ----
   const liveStop = new AbortController();
-  let nextAccounts = 0;
+  let nextAccounts = 0, nextAccountHistory = 0, accountsScheduleEpoch = 0, historyScheduleEpoch = 0, lastManualRefreshAt = -Infinity;
+  let activeRefresh: Promise<void> | null = null;
+  const scheduleImmediateAccountsRefresh = () => {
+    nextAccounts = 0;
+    nextAccountHistory = 0;
+    accountsScheduleEpoch++;
+    historyScheduleEpoch++;
+  };
+  let lastSeenLiveClosedId: string | null = store.liveClosed(1)[0]?.id ?? null;
   const traderCache = new Map<KeyVenue, { id: string; trader: VenueTrader }>();
+  const lighterSignerCache = new Map<'lighter' | 'rh', { id: string; signer: Promise<LighterSigner> }>();
+  const lighterTokenCache = new Map<'lighter' | 'rh', { id: string; token: string; at: number }>();
+  function signerFor(venue: 'lighter' | 'rh', key: LighterKey): () => Promise<LighterSigner> {
+    const id = JSON.stringify(key);
+    return () => {
+      const hit = lighterSignerCache.get(venue);
+      if (hit && hit.id === id) return hit.signer;
+      // 签名器建一次；建失败时下次再试。
+      const signer = createLighterSigner({ chainId: LIGHTER_CHAIN_ID[venue], privateKey: key.privateKey, apiKeyIndex: key.apiKeyIndex, accountIndex: key.accountIndex })
+        .catch(error => { if (lighterSignerCache.get(venue)?.signer === signer) lighterSignerCache.delete(venue); throw error; });
+      lighterSignerCache.set(venue, { id, signer });
+      return signer;
+    };
+  }
+  async function lighterAuthToken(venue: 'lighter' | 'rh', key: LighterKey, forceRefresh = false): Promise<string | null> {
+    const id = JSON.stringify(key);
+    if (!forceRefresh) {
+      const cached = lighterTokenCache.get(venue);
+      if (cached && cached.id === id && now() - cached.at < LIGHTER_AUTH_RENEW_MS) return cached.token;
+    } else {
+      lighterTokenCache.delete(venue);
+    }
+    const token = lighterAuth
+      ? await lighterAuth(venue, key)
+      : await (async () => {
+          const issue = signerProblem();
+          if (issue) throw new Error(issue);
+          return (await signerFor(venue, key)()).createAuthToken(Math.floor(now() / 1000) + LIGHTER_AUTH_TTL_SEC);
+        })();
+    if (token !== null) lighterTokenCache.set(venue, { id, token, at: now() });
+    return token;
+  }
+  function dropVenueCaches(venue: KeyVenue): void {
+    readSeq.set(venue, (readSeq.get(venue) ?? 0) + 1);
+    histSeq.set(venue, (histSeq.get(venue) ?? 0) + 1);
+    traderCache.delete(venue);
+    if (venue === 'lighter' || venue === 'rh') {
+      lighterSignerCache.delete(venue);
+      lighterTokenCache.delete(venue);
+    }
+    accountReads.delete(venue);
+    accountHistories.delete(venue);
+    lastSnapshotAt.delete(venue);
+  }
   function traderFor(venue: KeyVenue, keys: LiveKeys): VenueTrader {
     if (traders) return traders(venue, keys);
     const id = JSON.stringify(keys[venue]), hit = traderCache.get(venue);
     if (hit && hit.id === id) return hit.trader;
     let trader: VenueTrader;
     if (venue === 'entropy') trader = createEntropyTrader({ key: keys.entropy!, fetchImpl, now });
-    else {
-      const key = keys[venue]!;
-      let signer: Promise<LighterSigner> | null = null;
-      // 签名器建一次；建失败时下次下单再试。
-      const signerOf = () => signer ??= createLighterSigner({ chainId: LIGHTER_CHAIN_ID[venue], privateKey: key.privateKey, apiKeyIndex: key.apiKeyIndex, accountIndex: key.accountIndex }).catch(error => { signer = null; throw error; });
-      trader = createLighterTrader({ venue, key, fetchImpl, now, signer: signerOf });
-    }
+    else trader = createLighterTrader({ venue, key: keys[venue]!, fetchImpl, now, signer: signerFor(venue, keys[venue]!) });
     traderCache.set(venue, { id, trader });
     return trader;
   }
@@ -277,8 +423,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       if (!same) return reject('busy', `${VENUE_NAMES[venue]} 还有实盘持仓，只能给同一个账户换密钥；要换账户先平掉持仓`, 409);
     }
     try { liveKeys!.set(venue, fields); } catch (error) { return liveFailure(error); }
-    traderCache.delete(venue);
-    nextAccounts = 0;
+    dropVenueCaches(venue);
+    scheduleImmediateAccountsRefresh();
     store.event(now(), 'live', null, `已录入 ${VENUE_NAMES[venue]} 的实盘凭据`);
     return { keys: liveKeys!.view() };
   }
@@ -286,7 +432,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     const trader = liveOf(), venue = venueOf(body);
     if (trader.venueInUse(venue)) return reject('busy', `${VENUE_NAMES[venue]} 还有实盘持仓，平掉后才能移除凭据`, 409);
     try { liveKeys!.remove(venue); } catch (error) { return liveFailure(error); }
-    traderCache.delete(venue);
+    dropVenueCaches(venue);
+    scheduleImmediateAccountsRefresh();
     store.event(now(), 'live', null, `已移除 ${VENUE_NAMES[venue]} 的实盘凭据`);
     return { keys: liveKeys!.view() };
   }
@@ -747,6 +894,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     while (!stopped() && store.pruneSamples(time, PRUNE_BATCH) === PRUNE_BATCH) await new Promise(resolve => setImmediate(resolve));
     historyCache.clear();
     store.pruneEvents(time);
+    store.pruneAccountSnapshots(time);
     firsts.clear(); firstSample = undefined;
   }
   function firstOf(key: string): number | null {
@@ -1171,8 +1319,13 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     const needed = (liveRows.length ? [...new Set(liveRows.flatMap(row => [row.a.venue, row.b.venue]))] : [...KEY_VENUES]) as KeyVenue[];
     const keys = accountSource(), have = keys.problem ? [] : configuredVenues(keys.accounts), missing = needed.filter(venue => !have.includes(venue));
     const names = (venues: KeyVenue[]) => venues.map(venue => VENUE_NAMES[venue]).join('、');
+    const accountReadFor = (venue: KeyVenue) => {
+      const hash = accountHashOf(venue, keys.accounts);
+      const read = hash ? accountReads.get(venue) : undefined;
+      return read && read.hash === hash ? read : undefined;
+    };
     // 录入了但读不到（编号填错、账户不存在、接口不通）不算就绪：最近一次读取失败且没有时限内的读数。
-    const unread = have.filter(venue => { const read = accountReads.get(venue); return !!read?.error && !(read.at !== null && time - read.at <= ACCOUNT_STALE_MS); });
+    const unread = have.filter(venue => { const read = accountReadFor(venue); return !!read?.error && !(read.at !== null && time - read.at <= ACCOUNT_STALE_MS); });
     items.push({ key: 'accounts', status: keys.problem ? 'warn' : !have.length ? 'todo' : missing.length || unread.length ? 'warn' : 'ok', label: '场所账户',
       detail: keys.problem ? keys.problem : !have.length ? '还没有录入：在本页「实盘」一栏里按场所填账户与 API 私钥（只读余额的话，也可在服务器上执行 sudo bash install.sh --set-dex-keys 只录账户编号）'
         : `已录入 ${names(have)}${missing.length ? `；还缺 ${names(missing)}` : ''}${unread.length ? `；读不到 ${names(unread)}（核对录入的账户，原因见账户资金一项）` : ''}` });
@@ -1189,7 +1342,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     if (!have.length) items.push({ key: 'funding', status: 'todo', label: '两边账户资金', detail: `每个用到的场所各需保证金（Lighter 与 Entropy 用 USDC，Lighter RH 用 USDG）；录入场所账户后这里显示各场所的余额，每个场所可用余额至少 ${READY_FUNDING_USD} 才算就绪` });
     else {
       const lines = have.map(venue => {
-        const read = accountReads.get(venue), fresh = !!read && read.at !== null && time - read.at <= ACCOUNT_STALE_MS;
+        const read = accountReadFor(venue), fresh = !!read && read.at !== null && time - read.at <= ACCOUNT_STALE_MS;
         const text = !read || read.at === null || !read.snapshot ? `${VENUE_NAMES[venue]} ${read?.error ? `读取失败（${read.error}）` : '还没有读到'}`
           : `${VENUE_NAMES[venue]} 可用 ${fmt(read.snapshot.available, 2)}、权益 ${fmt(read.snapshot.collateral, 2)} ${COLLATERAL_ASSET[venue]}，持仓 ${read.snapshot.positions.length} 个${fresh ? '' : `（${read.error ? `读取失败：${read.error}` : '读数已过期'}）`}`;
         return { venue, text, ok: fresh && !!read?.snapshot && read.snapshot.available >= READY_FUNDING_USD };
@@ -1206,13 +1359,257 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     return DIRECTION_NAMES[direction].replace('A', VENUE_NAMES[pair.a.venue]).replace('B', VENUE_NAMES[pair.b.venue]);
   }
 
+  function markPriceFor(venue: KeyVenue, symbol: string, size: number, valueUsd: number, time: number): { markPrice: number | null; markEstimated: boolean } {
+    const runtime = live.get(venue);
+    const market = runtime?.markets.find(item => (venue === 'entropy' ? (item.coin ?? `io:${item.symbol}`) === symbol || item.symbol === symbol : item.symbol === symbol));
+    if (market) {
+      const liveMark = runtime?.stream?.topAt(market.id, time)?.mark ?? market.mark;
+      if (typeof liveMark === 'number' && Number.isFinite(liveMark) && liveMark > 0) return { markPrice: liveMark, markEstimated: false };
+    }
+    const abs = Math.abs(size);
+    if (abs > 0 && Number.isFinite(valueUsd) && valueUsd > 0) return { markPrice: valueUsd / abs, markEstimated: true };
+    return { markPrice: null, markEstimated: false };
+  }
+
+  function downsampleCurve<T>(points: readonly T[], max: number): T[] {
+    if (points.length <= max) return [...points];
+    const result: T[] = [points[0]!];
+    const step = (points.length - 1) / (max - 1);
+    for (let index = 1; index < max - 1; index++) result.push(points[Math.round(index * step)]!);
+    result.push(points.at(-1)!);
+    return result;
+  }
+
+  function buildCombinedEquityCurve(
+    configured: readonly KeyVenue[],
+    byVenue: ReadonlyMap<KeyVenue, readonly { t: number; equity: number }[]>,
+  ): { points: { t: number; equity: number }[]; complete: boolean } {
+    if (!configured.length) return { points: [], complete: false };
+    if (configured.length === 1) {
+      const single = byVenue.get(configured[0]!) ?? [];
+      return { points: downsampleCurve(single, ACCOUNT_CURVE_POINTS_MAX), complete: single.length >= 2 };
+    }
+    const allTimes: number[] = [];
+    for (const venue of configured) {
+      const list = byVenue.get(venue) ?? [];
+      if (!list.length) return { points: [], complete: false };
+      for (const point of list) allTimes.push(point.t);
+    }
+    allTimes.sort((a, b) => a - b);
+    const rounds: number[] = [];
+    for (const t of allTimes) {
+      const prev = rounds.at(-1);
+      if (prev !== undefined && t - prev <= 30_000) rounds[rounds.length - 1] = t;
+      else rounds.push(t);
+    }
+    const cursors = new Map<KeyVenue, number>(configured.map(venue => [venue, -1]));
+    const points: { t: number; equity: number }[] = [];
+    for (const t of rounds) {
+      let sum = 0, ok = true;
+      for (const venue of configured) {
+        const list = byVenue.get(venue)!;
+        let idx = cursors.get(venue)!;
+        while (idx + 1 < list.length && list[idx + 1]!.t <= t) idx++;
+        cursors.set(venue, idx);
+        const point = idx >= 0 ? list[idx]! : null;
+        if (!point || t - point.t > ACCOUNT_STALE_MS) { ok = false; break; }
+        sum += point.equity;
+      }
+      if (ok) points.push({ t, equity: sum });
+    }
+    return { points: downsampleCurve(points, ACCOUNT_CURVE_POINTS_MAX), complete: points.length >= 2 };
+  }
+
+  function accountsView(): AccountsView {
+    const time = now(), cutoff = time - ACCOUNT_HISTORY_WINDOW_MS;
+    const { accounts, problem } = accountSource();
+    const configured = problem ? [] : configuredVenues(accounts);
+    const configuredSet = new Set(configured);
+    const keysRead = liveKeys?.read();
+    const venues: VenueAccountView[] = [];
+    const positionsList: VenuePositionView[] = [];
+    const tradesList: AccountTrade[] = [];
+    const fundingList: AccountFunding[] = [];
+    const curveByVenue = new Map<KeyVenue, { t: number; equity: number }[]>();
+
+    for (const venue of KEY_VENUES) {
+      const isConf = configuredSet.has(venue);
+      const hash = isConf ? accountHashOf(venue, accounts) : null;
+      const rawRead = isConf && hash ? accountReads.get(venue) : undefined;
+      const read = rawRead && rawRead.hash === hash ? rawRead : undefined;
+      const rawHist = isConf && hash ? accountHistories.get(venue) : undefined;
+      const hist = rawHist && rawHist.hash === hash ? rawHist : undefined;
+      const snap = read?.snapshot ?? null;
+      const at = read?.at ?? null;
+      const stale = isConf ? !(at !== null && time - at <= ACCOUNT_STALE_MS) : false;
+      const equity = snap ? (snap.equity ?? snap.collateral) : null;
+      const unrealizedPnl = snap ? (snap.unrealizedPnl ?? null) : null;
+      const posRealizedKnown = snap && (snap.positions.length === 0 || snap.positions.every(item => item.realizedPnl !== null && item.realizedPnl !== undefined));
+      const positionRealizedPnl = snap && posRealizedKnown ? snap.positions.reduce((sum, item) => sum + (item.realizedPnl ?? 0), 0) : null;
+      const hasTradingKey = !keysRead?.problem && Boolean(keysRead?.keys[venue]) && (!accounts[venue] || (venue === 'entropy' ? keysRead?.keys.entropy?.address === accounts.entropy?.address : keysRead?.keys[venue]?.accountIndex === accounts[venue]?.accountIndex));
+      const rawCurve = isConf && hash ? store.accountSnapshots(venue, hash, cutoff).map(row => ({ t: row.at, equity: row.equity })) : [];
+      curveByVenue.set(venue, rawCurve);
+      const histSnap = hist?.snapshot ?? null;
+      const historyAt = hist?.at ?? null;
+      const historyStale = isConf ? !(historyAt !== null && time - historyAt <= ACCOUNT_HISTORY_STALE_MS) : false;
+      const summary = histSnap?.summary ?? { tradeCount: 0, volumeUsd: 0, feeUsd: null, realizedPnlUsd: null, fundingUsd: null };
+
+      venues.push({
+        venue,
+        name: VENUE_NAMES[venue],
+        collateralAsset: COLLATERAL_ASSET[venue],
+        configured: isConf,
+        hasTradingKey,
+        at,
+        stale,
+        error: read?.error ?? null,
+        equity,
+        collateral: snap ? snap.collateral : null,
+        available: snap ? snap.available : null,
+        marginUsed: snap ? (snap.marginUsed ?? null) : null,
+        unrealizedPnl,
+        positionRealizedPnl,
+        positionsCount: snap ? snap.positions.length : 0,
+        assets: snap?.assets ?? [],
+        historyAt,
+        historyStale,
+        authRequired: histSnap?.authRequired ?? false,
+        tradesError: histSnap?.tradesError ?? hist?.error ?? null,
+        fundingError: histSnap?.fundingError ?? hist?.error ?? null,
+        pnlError: histSnap?.pnlError ?? hist?.error ?? null,
+        tradesTruncated: histSnap?.tradesTruncated ?? false,
+        fundingTruncated: histSnap?.fundingTruncated ?? false,
+        summary,
+        equityCurve: downsampleCurve(rawCurve, ACCOUNT_CURVE_POINTS_MAX),
+        pnlCurve: downsampleCurve(histSnap?.pnlSeries ?? [], ACCOUNT_CURVE_POINTS_MAX),
+      });
+
+      if (snap) {
+        for (const item of snap.positions) {
+          const { markPrice, markEstimated } = markPriceFor(venue, item.symbol, item.size, item.valueUsd, time);
+          const itemUnrealized = item.unrealizedPnl ?? null;
+          const basis = item.entryPrice && Math.abs(item.size) > 0 ? item.entryPrice * Math.abs(item.size) : item.valueUsd;
+          positionsList.push({
+            venue,
+            venueName: VENUE_NAMES[venue],
+            collateralAsset: COLLATERAL_ASSET[venue],
+            symbol: item.symbol,
+            size: item.size,
+            side: item.size >= 0 ? 'long' : 'short',
+            valueUsd: item.valueUsd,
+            entryPrice: item.entryPrice ?? null,
+            markPrice,
+            markEstimated,
+            unrealizedPnl: itemUnrealized,
+            unrealizedPnlPct: itemUnrealized !== null && basis > 0 ? itemUnrealized / basis : null,
+            realizedPnl: item.realizedPnl ?? null,
+            liquidationPrice: item.liquidationPrice ?? null,
+            leverage: item.leverage ?? null,
+            marginMode: item.marginMode ?? null,
+          });
+        }
+      }
+      if (histSnap) {
+        tradesList.push(...histSnap.trades);
+        fundingList.push(...histSnap.funding);
+      }
+    }
+
+    tradesList.sort((a, b) => b.at - a.at);
+    fundingList.sort((a, b) => b.at - a.at);
+    const configuredViews = venues.filter(item => item.configured);
+    const withSnap = configuredViews.filter(item => item.equity !== null);
+    const withHistory = configuredViews.filter(item => item.historyAt !== null);
+    const feeList = withHistory.filter(item => !item.tradesError && item.summary.feeUsd !== null);
+    const realizedList = withHistory.filter(item => !item.tradesError && item.summary.realizedPnlUsd !== null);
+    const fundingSummaryList = withHistory.filter(item => !item.fundingError && item.summary.fundingUsd !== null);
+    const combinedCurve = buildCombinedEquityCurve(configured, curveByVenue);
+    const liveData = liveTrader?.view() ?? null;
+    const elapsedSinceRefresh = time - lastManualRefreshAt;
+    const cooldownMs = elapsedSinceRefresh >= 0 && elapsedSinceRefresh < ACCOUNT_MANUAL_REFRESH_COOLDOWN_MS
+      ? ACCOUNT_MANUAL_REFRESH_COOLDOWN_MS - elapsedSinceRefresh
+      : 0;
+
+    return {
+      now: time,
+      windowDays: Math.round(ACCOUNT_HISTORY_WINDOW_MS / 86_400_000),
+      refreshing: activeRefresh !== null,
+      cooldownMs,
+      keysProblem: problem,
+      signerProblem: liveTrader ? signerProblem() : null,
+      totals: {
+        configured: configured.length,
+        fresh: configuredViews.filter(item => !item.stale).length,
+        staleVenues: configuredViews.filter(item => item.stale).map(item => item.venue),
+        errorVenues: configuredViews.filter(item => item.error !== null).map(item => item.venue),
+        complete: configured.length > 0 && configuredViews.every(item => item.equity !== null && !item.stale),
+        equityUsd: withSnap.length ? withSnap.reduce((sum, item) => sum + item.equity!, 0) : null,
+        collateralUsd: withSnap.length ? withSnap.reduce((sum, item) => sum + item.collateral!, 0) : null,
+        availableUsd: withSnap.length ? withSnap.reduce((sum, item) => sum + item.available!, 0) : null,
+        marginUsedUsd: withSnap.length && withSnap.every(item => item.marginUsed !== null) ? withSnap.reduce((sum, item) => sum + item.marginUsed!, 0) : null,
+        unrealizedPnlUsd: withSnap.length && withSnap.every(item => item.unrealizedPnl !== null) ? withSnap.reduce((sum, item) => sum + item.unrealizedPnl!, 0) : null,
+        positionsCount: positionsList.length,
+        positionsNotionalUsd: positionsList.reduce((sum, item) => sum + item.valueUsd, 0),
+        tradeCount30d: withHistory.reduce((sum, item) => sum + item.summary.tradeCount, 0),
+        volumeUsd30d: withHistory.reduce((sum, item) => sum + item.summary.volumeUsd, 0),
+        feeUsd30d: configured.length > 0 && withHistory.length === configured.length && feeList.length === configured.length
+          ? feeList.reduce((sum, item) => sum + item.summary.feeUsd!, 0)
+          : null,
+        realizedPnlUsd30d: realizedList.length ? realizedList.reduce((sum, item) => sum + item.summary.realizedPnlUsd!, 0) : null,
+        realizedVenues: realizedList.map(item => item.venue),
+        fundingUsd30d: fundingSummaryList.length ? fundingSummaryList.reduce((sum, item) => sum + item.summary.fundingUsd!, 0) : null,
+        fundingVenues: fundingSummaryList.map(item => item.venue),
+        liveTrades: liveData?.totals.trades ?? 0,
+        liveNetUsd: liveData?.totals.netUsd ?? 0,
+        liveTodayNetUsd: liveData?.todayNetUsd ?? 0,
+        liveWins: liveData?.totals.wins ?? 0,
+        liveOpenCount: liveData?.positions.length ?? 0,
+      },
+      venues,
+      positions: positionsList,
+      trades: tradesList.slice(0, ACCOUNT_HISTORY_LIMIT),
+      funding: fundingList.slice(0, ACCOUNT_HISTORY_LIMIT),
+      equityCurve: combinedCurve.points,
+      equityComplete: combinedCurve.complete,
+      liveTrades: liveData?.trades ?? [],
+      venueNames: VENUE_NAMES,
+    };
+  }
+
+  function refreshAccountsNow(): AccountsRefreshResult {
+    const time = now();
+    if (liveStop.signal.aborted) return { triggered: false, cooldownMs: 0, refreshing: false };
+    const elapsed = time - lastManualRefreshAt;
+    if (elapsed >= 0 && elapsed < ACCOUNT_MANUAL_REFRESH_COOLDOWN_MS) {
+      return { triggered: false, cooldownMs: ACCOUNT_MANUAL_REFRESH_COOLDOWN_MS - elapsed, refreshing: activeRefresh !== null };
+    }
+    if (activeRefresh) {
+      return { triggered: false, cooldownMs: Math.max(1000, ACCOUNT_MANUAL_REFRESH_COOLDOWN_MS - Math.max(0, elapsed)), refreshing: true };
+    }
+    lastManualRefreshAt = time;
+    const accEpoch = ++accountsScheduleEpoch, histEpoch = ++historyScheduleEpoch;
+    nextAccounts = time + ACCOUNT_POLL_MS;
+    nextAccountHistory = time + ACCOUNT_HISTORY_POLL_MS;
+    const signalFor = () => anySignal([liveStop.signal], REQUEST_TIMEOUT_MS);
+    const run: Promise<void> = Promise.all([refreshAccounts(signalFor), refreshAccountHistory(signalFor)])
+      .then(() => undefined, error => { log(`varlighter: 手动刷新账户失败：${scrub(message(error))}`); })
+      .finally(() => {
+        if (accountsScheduleEpoch === accEpoch) nextAccounts = now() + ACCOUNT_POLL_MS;
+        if (historyScheduleEpoch === histEpoch) nextAccountHistory = now() + ACCOUNT_HISTORY_POLL_MS;
+        if (activeRefresh === run) activeRefresh = null;
+      });
+    activeRefresh = run;
+    return { triggered: true, cooldownMs: 0, refreshing: true };
+  }
+
   return {
     /** 某场所的行情流（测试用）；未在采集时为 null。 */
     stream: (venue: LiveVenue = 'rh') => live.get(venue)!.stream,
     /** 测试用：不跑后台循环时按参数启停各场所的行情流。 */
     startStreams(): void { running = true; syncStreams(); },
-    pollVar, refreshCatalog, refreshDepth, sampleLive, refreshAccounts,
+    pollVar, refreshCatalog, refreshDepth, sampleLive, refreshAccounts, refreshAccountHistory,
     views: { state, symbol: symbolView, samples: samplesPage, backtest, paper, settings: updateSettings, close: closeManual, reset: resetPaper, readiness,
+      accounts: accountsView, accountsRefresh: refreshAccountsNow,
       live: liveView, liveKeys: setLiveKeys, liveKeysRemove: removeLiveKeys, liveSettings, liveClose, liveDismiss, liveResume },
     /**
      * 后台循环：连上用到的行情流（一档、标记价、资金费与启用配对的盘口都走行情流）并在后台每 10 分钟取各场所目录，然后每分钟拉 Var 报价（连同询价），
@@ -1222,7 +1619,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       running = true;
       syncStreams();
       let nextVar = now() + 5_000, nextPrune = now() + 60_000, nextLive = now() + 10_000;
-      nextAccounts = now() + 15_000;
+      nextAccounts = now() + 1_000;
+      nextAccountHistory = now() + 1_500;
       // 停服时中断进行中的请求，不等各自的超时：pause 在停服时立即返回。
       const stop = new AbortController();
       let done = false;
@@ -1252,9 +1650,27 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
             nextVar = time + VAR_POLL_MS;
             background('var', () => pollVar(request()).catch(error => { varSource.error = message(error); }));
           }
-          // 没有配置账户时这一轮不发任何请求。
-          if (time >= nextAccounts && !busy.has('accounts')) { nextAccounts = time + ACCOUNT_POLL_MS; background('accounts', () => refreshAccounts(request)); }
+          // 没有配置账户时这一轮不发任何请求；结束时按 L049 顺延下一次轮询，并在周期序号变更时保留期间触发的立即重刷。
+          if (time >= nextAccounts && !busy.has('accounts') && !activeRefresh) {
+            const epoch = accountsScheduleEpoch;
+            background('accounts', async () => {
+              try { await refreshAccounts(request); }
+              finally { if (accountsScheduleEpoch === epoch) nextAccounts = now() + ACCOUNT_POLL_MS; }
+            });
+          }
+          if (time >= nextAccountHistory && !busy.has('accountHistory') && !activeRefresh) {
+            const epoch = historyScheduleEpoch;
+            background('accountHistory', async () => {
+              try { await refreshAccountHistory(request); }
+              finally { if (historyScheduleEpoch === epoch) nextAccountHistory = now() + ACCOUNT_HISTORY_POLL_MS; }
+            });
+          }
           liveTrader?.tick();
+          const latestLiveClosed = liveTrader?.view().trades[0]?.id ?? null;
+          if (latestLiveClosed !== lastSeenLiveClosedId) {
+            lastSeenLiveClosedId = latestLiveClosed;
+            scheduleImmediateAccountsRefresh();
+          }
           if (time >= nextLive) { nextLive = time + LIVE_TICK_MS; try { sampleLive(); } catch (error) { log(`varlighter: 行情流配对采样失败：${message(error)}`); } }
           if (time >= nextPrune) { nextPrune = time + PRUNE_MS; try { await pruneSamples(time, () => context.stopped()); } catch (error) { log(`varlighter: 清理样本失败：${message(error)}`); } }
           await context.pause(1_000);
@@ -1264,7 +1680,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
         // 停止时掐断在途的下单请求（结果按「不明」落库，重启后先查询再决定，不重发），等这一轮推进收尾后才关库。
         liveStop.abort();
         await liveTrader?.idle();
-        await watcher; await Promise.allSettled([...jobs]);
+        await watcher; await Promise.allSettled([...jobs, ...(activeRefresh ? [activeRefresh] : [])]);
       }
     },
     /** 实盘告警（经执行服务发飞书）。 */

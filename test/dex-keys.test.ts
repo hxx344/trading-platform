@@ -139,7 +139,11 @@ const entropyAnswer = (available = '80.0') => ({ marginSummary: { accountValue: 
   assetPositions: [{ type: 'oneWay', position: { coin: 'io:NVDA', szi: '-0.3', positionValue: '52.5' } }, { type: 'oneWay', position: { coin: 'io:AAPL', szi: '0.0', positionValue: '0.0' } }], time: 1 });
 
 test('账户应答解析：只留非零持仓，账户身份对不上或缺字段时拒绝', () => {
-  assert.deepEqual(parseLighterAccount(lighterAnswer(12345), 12345), { collateral: 300.25, available: 250.5, positions: [{ symbol: 'NVDA', size: -2.5, valueUsd: 437.5 }] });
+  assert.deepEqual(parseLighterAccount(lighterAnswer(12345), 12345), {
+    collateral: 300.25, available: 250.5,
+    positions: [{ symbol: 'NVDA', size: -2.5, valueUsd: 437.5, entryPrice: null, unrealizedPnl: null, realizedPnl: null, liquidationPrice: null, leverage: null, marginMode: null, marketId: 1 }],
+    equity: 300.25, marginUsed: null, unrealizedPnl: null, assets: [],
+  });
   assert.throws(() => parseLighterAccount(lighterAnswer(12346), 12345), /与请求的账户不一致/);
   assert.throws(() => parseLighterAccount({ code: 29404, message: 'not found' }, 1), /格式无效/);
   assert.throws(() => parseLighterAccount({ code: 200, accounts: [lighterAnswer(1).accounts[0], lighterAnswer(1).accounts[0]] }, 1), /格式无效/);
@@ -147,7 +151,11 @@ test('账户应答解析：只留非零持仓，账户身份对不上或缺字�
   assert.throws(() => parseLighterAccount(lighterAnswer(1, { available_balance: '' }), 1), /缺少可用余额/);
   assert.throws(() => parseLighterAccount(lighterAnswer(1, { positions: null }), 1), /缺少持仓/);
   assert.throws(() => parseLighterAccount(lighterAnswer(1, { positions: [{ symbol: 'X', sign: 0, position: '1', position_value: '1' }] }), 1), /持仓格式无效/);
-  assert.deepEqual(parseEntropyAccount(entropyAnswer()), { collateral: 120.5, available: 80, positions: [{ symbol: 'io:NVDA', size: -0.3, valueUsd: 52.5 }] });
+  assert.deepEqual(parseEntropyAccount(entropyAnswer()), {
+    collateral: 120.5, available: 80,
+    positions: [{ symbol: 'io:NVDA', size: -0.3, valueUsd: 52.5, entryPrice: null, unrealizedPnl: null, realizedPnl: null, liquidationPrice: null, leverage: null, marginMode: null, marketId: null }],
+    equity: 120.5, marginUsed: 10, unrealizedPnl: null, assets: [],
+  });
   assert.deepEqual(parseLighterAccount(lighterAnswer(1, { positions: [{ symbol: 'X', sign: 0, position: '0', position_value: '0' }] }), 1).positions, [], '空仓条目不看方向');
   assert.throws(() => parseEntropyAccount({ assetPositions: [] }), /格式无效/);
   assert.throws(() => parseEntropyAccount({ ...entropyAnswer(), withdrawable: 'x' }), /缺少可用余额/);

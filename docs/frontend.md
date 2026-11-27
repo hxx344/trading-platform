@@ -44,7 +44,7 @@
 | 交易中心 | 金油 | `#/goldoil` | 同原油，三者共用执行账户 | 《金油页（G1，v0.74.0）》，页面内容见 [goldoil.md](goldoil.md) 第 3 节 |
 | 交易中心 | CrossEx | `#/crossex`，子页 `#/crossex/trade`、`#/crossex/hedge`、`#/crossex/orders`、`#/crossex/settings` | 已配置 CrossEx，后台重试期间也显示 | 《CrossEx 页》 |
 | 交易中心 | Ondo 挂单奖励 | `#/ondo` | 服务已接入 Ondo | 《Ondo 挂单奖励页》 |
-| 交易中心 | DEX 价差（原 Var/Lighter 价差） | `#/varlighter`，子页 `#/varlighter/detail/<场所:代码|场所:代码[@乘数]>`、`#/varlighter/paper`、`#/varlighter/ready` | 服务开启了该模块（默认开启，`"varLighter": false` 关闭） | 《DEX 价差页》，内容见 [varlighter.md](varlighter.md) 第 10 节、[dexspread.md](dexspread.md) 第 10 节 |
+| 交易中心 | DEX 价差（原 Var/Lighter 价差） | `#/varlighter`，子页 `#/varlighter/detail/<场所:代码|场所:代码[@乘数]>`、`#/varlighter/paper`、`#/varlighter/accounts`、`#/varlighter/ready` | 服务开启了该模块（默认开启，`"varLighter": false` 关闭） | 《DEX 价差页》，内容见 [varlighter.md](varlighter.md) 第 10 节、[dexspread.md](dexspread.md) 第 10–14 节 |
 | 策略与风险 | 配对组 | `#/`、`#/pair/<配对>` | 总是 | F1–F3、《ASTER 页面按工作台重排（F4）》 |
 | 策略与风险 | 资金费组合 | `#/fundingbook`，子页 `#/fundingbook/plan`、`#/fundingbook/paper`、`#/fundingbook/settings` | 总是显示（默认未启用，在本页设置里打开） | 《资金费组合页》，内容见 [fundingbook.md](fundingbook.md) |
 | 期权 | 期权 | `#/options`，子页 `#/options/positions`、`#/options/orders`、`#/options/performance`、`#/options/rfq` | 已配置期权，后台重试期间也显示 | 《期权页》 |
@@ -720,7 +720,7 @@ v0.88.0 起页面标题与左侧栏入口从「Var/Lighter 价差」改为「DEX
 
 **对照的工作台页面**：工作台没有这个页面，骨架照本仓库的 Ondo 页（`wb-heading`、`panel`、`callout`、表格样式同 `ondo.css` 的 `.om-table`）；最初的回退版本 v0.79.1。代码在 `web/src/varlighter/`，内容见 [varlighter.md](varlighter.md) 第 9、10 节；`config.json` 写 `"varLighter": false` 时左侧栏没有入口。
 
-- 左侧栏入口在「交易中心」组 Ondo 之后。四个页签都在地址里：`#/varlighter`、`#/varlighter/detail/<配对键>`（如 `var:AAPL|rh:AAPL`、`lighter:SOL|rh:ETH@0.05`，冒号、竖线与 @ 不转义；v0.88.0 以前的 `rh:AAPL` 升级为 `var:AAPL|rh:AAPL`，只有代码的旧地址回到默认配对）、`#/varlighter/paper`、`#/varlighter/ready`。
+- 左侧栏入口在「交易中心」组 Ondo 之后。五个页签都在地址里：`#/varlighter`、`#/varlighter/detail/<配对键>`（如 `var:AAPL|rh:AAPL`、`lighter:SOL|rh:ETH@0.05`，冒号、竖线与 @ 不转义；v0.88.0 以前的 `rh:AAPL` 升级为 `var:AAPL|rh:AAPL`，只有代码的旧地址回到默认配对）、`#/varlighter/paper`、`#/varlighter/accounts`、`#/varlighter/ready`。
 - 页头右侧每个来源一枚状态：Var 报价时效（没有组合或手动配对用到 Var 时不显示）、每个采集中的行情流场所（Lighter RH、Lighter 主网、Entropy：行情流、配对数、盘口快照新鲜度，悬停看错误）、模拟盘暂停。
 - 价差总览：四个读数卡（配对数按组合分列、手动配对另计）、筛选（代码或名称、场所组合与「手动」、只看已启用或有持仓）、可排序表格；同一代码在几个组合里是几行，带「Var↔RH」这类组合标签（手动配对用警示色）。表头写「卖 A / 买 A」，A 是配对键里的第一条腿；信号列与持仓写 A 一侧的方向简写（悬停看两腿全称），资金费列写两腿场所。有失联配对（下架、规格改判或 30 分钟无样本）时表格上方多一个「失联的标的」面板，写明原因，可停用或按最后样本平仓；处理完最后一行后结果提示留在原处。已启用且在冷却中的配对在模拟盘列写冷却截止时刻。
 - 标的详情：下拉按「代码 · 两腿场所（手动） · 名称」选配对；手动配对多一条说明（两腿合约、乘数、备注）；读数里「两腿合约」写两腿代码、乘数、手续费与行情流腿的市场编号；走势图（中间价基差、卖 A 与买 A 的可成交价差、基线与入场带、开平仓点）、按时段统计、参数与回测（方向按两腿场所写全称）、下单预演（每条行情流腿各一段下单字段）、该配对的成交。「与已保存参数一致」按规整后的参数比较（v0.88.0 修复刚打开就显示“有未保存的修改”）。
@@ -732,6 +732,7 @@ v0.88.0 起页面标题与左侧栏入口从「Var/Lighter 价差」改为「DEX
 - 价差总览的简洁视图（v0.92.0，R2，回退版本 v0.91.0）：表格默认是「简洁」视图，工具栏右侧可切到「完整」（原来的 11 列，内容不变），选择存在本浏览器（`localStorage`，读不到时用简洁）。简洁视图 6 列：标的（名称与类别并在小字里，「已确认」标记不显示）、当前价差（小字写「平时」的基线中位数，样本超过 5 分钟写数据时间）、距开仓（「还差 x」或「已到开仓线」，加一条 SVG 进度条和「偏离 / 开仓线」）、操作方向（卖、买两个场所标签）、交易成本（按一档估算的写「估算」）、模拟盘。到开仓线的行用绿色底与左边线；样本超过 5 分钟的行不高亮、不计入「开仓机会」（两种视图都是），偏离不为正的行不显示操作方向。切回简洁时，排序列不在简洁表头里的（偏离 σ、样本、类别）改回按距开仓排。读数卡改为：开仓机会（有机会时整卡绿色）、监控中的配对、模拟盘累计盈亏、模拟持仓；采集起点移到面板标题右侧。表格下方的长段说明收进「这些数字怎么看」折叠区，简洁视图下逐项用白话解释，完整视图保留原说明。页头说明改成白话。进度与买卖场所的换算在 `varlighter-form.ts`（`entryProgress`、`directionSides`、`readOverviewMode`），由 `web/test/varlighter-form.test.mjs` 覆盖。只改页面，不改接口与参数。验证：`dev-varlighter.ts` 替身后端，无头浏览器 1280 与 390 宽度看了简洁与完整两种视图、切换后存储与排序回退、把一个配对的入场偏离调低后出现高亮行与绿色读数卡；390 宽度页面无横向溢出（表格在面板内滚动），无页面报错。
 - 总览勾选启用与自动配置（v0.93.0，R2，回退版本 v0.92.1）：「模拟盘」列从表格最后挪到标的后面（简洁与完整两种视图都是），内容是一个复选框加状态：勾选即启用并交给自动配置，取消勾选只停用；启用后写「已启用」，用自动配置的带「自动」标记（还没有推荐值时为警示色并写「样本不足，暂不开仓」），有持仓的带「持仓」标记与浮动盈亏，冷却中写截止时刻。规格待确认或不同、且还没启用的配对复选框禁用并写原因；写入进行中全部禁用。结果提示显示在表格上方。距开仓与信号列的开仓线是当前生效的值。详情页「参数与回测」顶部加自动配置块（`.vl-auto`）：开关、状态标记、四项推荐值、依据说明与「填入表单」；开着时四个输入框下方的说明换成「自动配置中，当前用 x；这里是关闭自动配置后的值」，走势图的入场带与读数卡的入场、出场按生效值。请求体在 `varlighter-form.ts`（`quickEnableBody`、`autoBody`、`autoFormPatch`），由 `web/test/varlighter-form.test.mjs` 覆盖。新样式 `.vl-check`、`.vl-auto` 只用设计令牌。总览每 5 秒读一次状态。验证：`dev-varlighter.ts` 替身后端，无头浏览器 1280 宽度在总览勾选 TSLA Var↔RH，行内变为「已启用 · 自动」、开仓线由 15 变为推荐的 12，详情页自动配置块显示四项推荐值与依据；390 宽度总览表格在面板内横向滚动，页面无横向溢出。
 - 行情流配对按推送判断（v0.94.0，R2，回退版本 v0.93.0）：页面只改文字。实盘准备页「采集状态」的「行情流配对」一行多一条小字「按推送判断（启动以来）：x 次，成交 y 次，最近被挡：…」（读 `sources.push`，旧服务端没有时不显示），采集说明与总览的口径说明各加一句「一档一有变化就判断开平仓」。
+- 账户资产页签（v0.108.0，R2，回退版本 v0.107.0）：新增第五个页签「账户资产」（`#/varlighter/accounts`，`VarLighterAccounts.tsx`），并在「实盘准备」页实盘面板标题增加跳转链接。页面顶部提供场所筛选（全部 / Lighter 主网 / Lighter RH / Entropy）与带 10 秒冷却的「刷新账户」按钮（不阻塞 POST 超时，触发后每 2 秒自动跟进直到后台拉完）；四张汇总指标卡（总权益、可用余额与保证金占用、未实现盈亏、近 30 天资金费与已实现盈亏/策略实盘对照），三张场所卡片分别展示 Lighter（USDC）、RH（USDG，仅只读账户时提示录入 API 凭据）与 Entropy（HIP-3 `io` 盘 USDC）并列出非零现货资产；下方展示 `EquityLineChart` 组合权益快照曲线（单选场所时可切交易所盈亏曲线）与近 30 天汇总对照、活跃持仓表（含估算标记价标识）以及「成交记录 / 资金费记录 / 策略实盘成交」三页签与截断提示。接口（`GET /api/varlighter/accounts`、`POST /api/varlighter/accounts/refresh`）仅限浏览器会话，不进入只读令牌范围，所有返回与报错均不包含账户编号、钱包地址、私钥与鉴权令牌；表单与展示换算提取在 `varlighter-form.ts`，由 `web/test/varlighter-form.test.mjs` 覆盖。新样式 `.vl-acc-*` 只使用设计令牌，窄屏（390 px）单列堆叠并在面板内横向滚动表格。本地预览与浏览器走查见 [dexspread.md](dexspread.md) 第 14 节。
 
 ## MEV 套利页（v0.84.0，启用向导 v0.86.0）
 

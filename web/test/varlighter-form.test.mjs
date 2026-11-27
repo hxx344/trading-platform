@@ -8,6 +8,7 @@ import { readCustomPair } from '../../src/varlighter/engine.ts';
 import {
   EMPTY_PAIR_FORM, backtestBody, bps, bytesPerDay, chartRange, chartRows, comboLabel, comboShort, customPairKey, customPairRequest, directionLabel, directionShort, fundingAnnual, globalForm, globalRequest,
   SIMPLE_SORT_KEYS, directionSides, entryProgress, matchesCombo, pairLabel, readOverviewMode, settingsBody, signal, sortRows, symbolForm, symbolRequest, toggleConfirmed, usd, varLighterHref, AUTO_FIELDS, autoBody, autoFormPatch, quickEnableBody,
+  VARLIGHTER_TABS, ACCOUNT_VENUE_FILTERS, accountActivityFoot, filterAccountPositions, filterAccountTrades, filterAccountFunding, selectedEquitySeries, selectedVenuePnlCurve, formatCurrencyAmount, signedCurrencyAmount, formatRatePct, marginModeLabel, tradeDirLabel, accountHealthBadge,
 } from '../src/varlighter/varlighter-form.ts';
 import { parseRoute } from '../src/route-parse.ts';
 
@@ -176,7 +177,7 @@ test('readouts, labels and addresses', () => {
   assert.equal(bytesPerDay(1e6, 0, 3_600_000), '24 MB/天');
   assert.equal(bytesPerDay(1e8, 0, 3_600_000), '2.40 GB/天');
   assert.equal(bytesPerDay(1e6, null, 3_600_000), '—');
-  for (const tab of ['overview', 'detail', 'paper', 'ready']) assert.equal(parseRoute(varLighterHref(tab)).tab, tab);
+  for (const tab of ['overview', 'detail', 'paper', 'accounts', 'ready']) assert.equal(parseRoute(varLighterHref(tab)).tab, tab);
   for (const key of ['var:AAPL|rh:AAPL', 'lighter:NVDA|entropy:NVDA', 'lighter:SOL|rh:ETH@0.05']) assert.deepEqual(parseRoute(varLighterHref('detail', key)), { page: 'varlighter', tab: 'detail', symbol: key }, key);
   assert.deepEqual(parseRoute('#/varlighter/detail/rh:AAPL'), { page: 'varlighter', tab: 'detail', symbol: 'var:AAPL|rh:AAPL' }, 'v0.88.0 以前的链接升级为 Var 对该场所');
   assert.deepEqual(parseRoute('#/varlighter/detail/lighter%3ABTC'), { page: 'varlighter', tab: 'detail', symbol: 'var:BTC|lighter:BTC' }, '转义过的冒号也认');
@@ -198,4 +199,70 @@ test('overview simple view: entry progress, sell and buy venues, stored mode', (
   assert.equal(readOverviewMode('full'), 'full');
   assert.equal(readOverviewMode('{"x":1}'), 'simple');
   assert.ok(SIMPLE_SORT_KEYS.includes('gap') && !SIMPLE_SORT_KEYS.includes('z'));
+});
+
+test('accounts tab helpers: route, filters, series selection and formatting', () => {
+  assert.deepEqual(VARLIGHTER_TABS.map(item => item.id), ['overview', 'detail', 'paper', 'accounts', 'ready']);
+  assert.deepEqual(ACCOUNT_VENUE_FILTERS.map(item => item.id), ['all', 'lighter', 'rh', 'entropy']);
+  assert.equal(varLighterHref('accounts'), '#/varlighter/accounts');
+  assert.deepEqual(parseRoute('#/varlighter/accounts'), { page: 'varlighter', tab: 'accounts', symbol: null });
+
+  const positions = [{ venue: 'lighter', symbol: 'ETH' }, { venue: 'entropy', symbol: 'io:NVDA' }];
+  const trades = [{ venue: 'lighter', id: '1' }, { venue: 'rh', id: '2' }];
+  const funding = [{ venue: 'rh', id: 'f1' }, { venue: 'entropy', id: 'f2' }];
+  assert.equal(filterAccountPositions(positions, 'all').length, 2);
+  assert.deepEqual(filterAccountPositions(positions, 'entropy').map(x => x.symbol), ['io:NVDA']);
+  assert.deepEqual(filterAccountTrades(trades, 'lighter').map(x => x.id), ['1']);
+  assert.deepEqual(filterAccountFunding(funding, 'rh').map(x => x.id), ['f1']);
+
+  const view = {
+    equityCurve: [{ t: 1000, equity: 400 }, { t: 2000, equity: 405 }],
+    equityComplete: true,
+    venues: [
+      { venue: 'lighter', name: 'Lighter', collateralAsset: 'USDC', equityCurve: [{ t: 1000, equity: 300 }], pnlCurve: [{ at: 1000, pnlUsd: 2.5, equityUsd: null }], pnlError: null },
+      { venue: 'rh', name: 'Lighter RH', collateralAsset: 'USDG', equityCurve: [{ t: 1000, equity: 100 }, { t: 2000, equity: 105 }], pnlCurve: [], pnlError: '未授权' },
+    ],
+  };
+  assert.deepEqual(selectedEquitySeries(view, 'all'), { points: [{ t: 1000, value: 400 }, { t: 2000, value: 405 }], complete: true, currency: 'USD' });
+  assert.deepEqual(selectedEquitySeries(view, 'rh'), { points: [{ t: 1000, value: 100 }, { t: 2000, value: 105 }], complete: true, currency: 'USDG' });
+  assert.equal(selectedEquitySeries(view, 'lighter').complete, false);
+  assert.equal(selectedVenuePnlCurve(view, 'all'), null);
+  assert.equal(selectedVenuePnlCurve(view, 'lighter').currency, 'USDC');
+  assert.equal(selectedVenuePnlCurve(view, 'rh').error, '未授权');
+
+  assert.equal(formatCurrencyAmount(-1234.5, 'USDG'), '−1,234.50 USDG');
+  assert.equal(signedCurrencyAmount(12.3, 'USDC'), '+12.30 USDC');
+  assert.equal(signedCurrencyAmount(null, 'USDC'), '—');
+  assert.equal(formatRatePct(0.000125), '+0.0125%');
+  assert.equal(marginModeLabel('isolated'), '逐仓');
+  assert.equal(marginModeLabel('cross'), '全仓');
+  assert.equal(tradeDirLabel({ side: 'buy', dir: 'Close Short' }), '平空');
+  assert.equal(tradeDirLabel({ side: 'sell', dir: null }), '卖出');
+  assert.deepEqual(accountHealthBadge({ configured: false, at: null, stale: false, error: null }), { tone: '', label: '未配置' });
+  assert.deepEqual(accountHealthBadge({ configured: true, at: null, stale: true, error: 'HTTP 500' }), { tone: 'bad', label: '读取失败' });
+  assert.deepEqual(accountHealthBadge({ configured: true, at: 1000, stale: true, error: null }), { tone: 'warn', label: '读数过期' });
+  assert.deepEqual(accountHealthBadge({ configured: true, at: 1000, stale: false, error: 'HTTP 502' }), { tone: 'warn', label: '上次刷新失败' });
+  assert.deepEqual(accountHealthBadge({ configured: true, at: 1000, stale: false, error: null }), { tone: 'ok', label: '正常' });
+
+  const summaryBase = { tradeCount: 2, volumeUsd: 200, feeUsd: 0.1, realizedPnlUsd: 1.45, fundingUsd: 0.02 };
+  const sampleView = {
+    totals: { configured: 3, tradeCount30d: 4, fundingUsd30d: 0.01, fundingVenues: ['lighter', 'entropy'], realizedPnlUsd30d: 1.45, realizedVenues: ['entropy'], liveNetUsd: 0.03 },
+    venues: [
+      { venue: 'lighter', configured: true, collateralAsset: 'USDC', historyAt: 1000, tradesError: null, authRequired: false, summary: { tradeCount: 2, volumeUsd: 100, feeUsd: 0, realizedPnlUsd: null, fundingUsd: -0.01 } },
+      { venue: 'rh', configured: true, collateralAsset: 'USDG', historyAt: 1000, tradesError: '需要密钥', authRequired: true, summary: { tradeCount: 0, volumeUsd: 0, feeUsd: null, realizedPnlUsd: null, fundingUsd: null } },
+      { venue: 'entropy', configured: true, collateralAsset: 'USDC', historyAt: 1000, tradesError: null, authRequired: false, summary: summaryBase },
+    ],
+  };
+  assert.equal(accountActivityFoot(sampleView, 'rh'), '成交未授权');
+  assert.equal(accountActivityFoot({
+    totals: sampleView.totals,
+    venues: [{ ...sampleView.venues[0], historyAt: null, summary: { tradeCount: 0, volumeUsd: 0, feeUsd: null, realizedPnlUsd: null, fundingUsd: null } }],
+  }, 'lighter'), '成交未拉取');
+  assert.equal(accountActivityFoot({
+    totals: sampleView.totals,
+    venues: [{ ...sampleView.venues[0], tradesError: 'HTTP 500', authRequired: false }],
+  }, 'lighter'), '成交读取失败');
+  assert.equal(accountActivityFoot(sampleView, 'entropy'), '成交 2 笔 · 成交额 $200 · 已实现 +1.45 USDC');
+  assert.equal(accountActivityFoot(sampleView, 'all'), '已读成交 4 笔（主网、Entropy） · 资金费含 主网、Entropy · 已实现 +1.45 USD（Entropy） · 策略实盘累计 +$0.03');
+  assert.equal(accountActivityFoot({ totals: { configured: 0, tradeCount30d: 0, fundingUsd30d: null, fundingVenues: [], realizedPnlUsd30d: null, realizedVenues: [], liveNetUsd: 0 }, venues: [] }, 'all'), '还没有配置实盘场所账户');
 });

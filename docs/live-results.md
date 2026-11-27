@@ -129,3 +129,12 @@
 - 单腿：第二腿不成交时第一腿被只减仓平掉；飞书收到单腿、停止、需要人工处理的告警。
 - 实盘成交价相对模拟盘同一笔的差距（Lighter 标准账户 300 毫秒吃单延迟的影响）。
 - 发布包里的 `lighter-signer.wasm` 在服务器上摘要核对通过（准备页「下单凭据」里没有签名器不可用的提示）。
+
+## 待实测：DEX 价差账户资产与历史（dexspread.md 第 14 节，v0.108.0）
+
+只在替身接口上验证过，没有连过真实交易所历史接口。用户在实盘准备页录入凭据并在「账户资产」页签查看真实账户后核对，结果回填本节与 [dexspread.md](dexspread.md)：
+
+- Lighter 主网与 RH `/api/v1/trades` 中 `taker_fee` / `maker_fee` 非零时的真实单位（ppm 费率 vs 计价币金额，当前仅 `0` 记为 `0`，非零暂置空）。
+- Lighter 主网与 RH `/api/v1/pnl` 的 `timestamp` 单位（秒/毫秒）、`start_timestamp`/`end_timestamp` 请求单位与 `trade_pnl` 归属口径（当日分桶 vs 累计）。
+- Lighter `/api/v1/positionFunding` 中 `change` / `payment` 的正负号是否与页面「正=净收、负=净付」一致，以及真实账户每分钟 60 次限流下余额（60s）+ 历史（180s）+ 下单并发的余量表现。
+- Entropy `userFillsByTime` 与 `userFunding` 在高频账户下 3 页窗口内的截断提醒与 `io:` 盘过滤表现。

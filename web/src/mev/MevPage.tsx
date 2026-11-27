@@ -236,14 +236,25 @@ function SettingsTab({ view, write, onChanged }: { view: MevStateView; write: Wr
   const [touched, setTouched] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
   const saved = JSON.stringify(view.settings);
-  // 没在编辑时跟随服务端的值（别处保存后这里不留旧值）。
-  useEffect(() => { if (!touched) setForm(settingsForm(JSON.parse(saved))); }, [saved, touched]);
+  const synced = useRef(saved);
+  // 没在编辑且服务端值变化时再跟随（保存后刷新还在途时不拿旧服务端值盖回刚提交的新值）。
+  useEffect(() => {
+    if (!touched && synced.current !== saved) {
+      synced.current = saved;
+      setForm(settingsForm(JSON.parse(saved)));
+    }
+  }, [saved, touched]);
   const dirty = settingsChanged(form, view.settings);
   const save = () => {
     const request = settingsRequest(form);
     if (!request.ok) { setProblem(request.message); return; }
     setProblem(null);
-    void write.run('settings', () => api(`${MEV_BASE}/settings`, { body: request.body }), () => { setTouched(false); void onChanged(); return '风控参数已保存，下一个区块起生效'; });
+    void write.run('settings', () => api(`${MEV_BASE}/settings`, { body: request.body }), () => {
+      setForm(settingsForm(request.body.settings));
+      setTouched(false);
+      void onChanged();
+      return '风控参数已保存，下一个区块起生效';
+    });
   };
   return <section className="panel" aria-label="风控参数">
     <div className="panel-heading"><h2>风控参数</h2><span className="muted">保存整份，下一个区块起生效；实盘中也可以改</span></div>
@@ -258,7 +269,7 @@ function SettingsTab({ view, write, onChanged }: { view: MevStateView; write: Wr
     <div className="vl-actions">
       {problem ? <Callout tone="error">{problem}</Callout> : null}
       <button type="button" className="button" disabled={!dirty || write.busy !== null} onClick={save}>{write.busy === 'settings' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Save size={14} aria-hidden="true" />}保存参数</button>
-      <button type="button" className="button secondary" disabled={!dirty || write.busy !== null} onClick={() => { setTouched(false); setProblem(null); setForm(settingsForm(view.settings)); }}>撤销修改</button>
+      <button type="button" className="button secondary" disabled={!dirty || write.busy !== null} onClick={() => { synced.current = saved; setTouched(false); setProblem(null); setForm(settingsForm(view.settings)); }}>撤销修改</button>
     </div>
   </section>;
 }

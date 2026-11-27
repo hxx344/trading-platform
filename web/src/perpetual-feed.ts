@@ -21,19 +21,6 @@ interface FeedOptions {
 
 export class PerpetualRequestError extends Error {}
 
-export async function readPerpetualSnapshot(signal: AbortSignal, fetchImpl: typeof fetch = fetch) {
-  const response = await fetchImpl("/api/monitors/perpetual/quote", { cache: "no-store", signal });
-  if (!response.ok) {
-    if (response.status === 401 || response.status === 403) throw new PerpetualRequestError(`行情访问已失效（HTTP ${response.status}），请从工作台重新打开价差模块。`);
-    throw new PerpetualRequestError(`行情接口返回 HTTP ${response.status}，请检查价差服务是否正常运行。`);
-  }
-  try { return parsePerpetualSnapshot(await response.json()); }
-  catch (error) {
-    if (signal.aborted) throw error;
-    throw new PerpetualRequestError("行情接口返回了无效数据，请检查价差服务是否已正确启动。");
-  }
-}
-
 export function parsePerpetualSnapshot(value: unknown): PerpetualSnapshot {
   const snapshot = value as PerpetualSnapshot | null;
   if (!snapshot || snapshot.schemaVersion !== 1 || snapshot.monitorId !== "perpetual" || !Number.isFinite(snapshot.generatedAt)

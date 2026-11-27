@@ -7,6 +7,7 @@ import { ACTIVE_STATUSES, CONFIRM_ACKNOWLEDGE, CONFIRM_NOT_CREATED, CONFIRM_RELE
 import { bookTitle, crossPairs, operationStatus, type OilBook, type OilConfirmResult, type OilJob, type OilMarket, type OilPositionAccount, type OilPreview, type OilPreviewLeg, type OilState } from './oil-types.ts';
 import { groupJobs, groupStatus, isFourLegPreview, type FourLegConfirmResult, type FourLegPreview, type GroupState } from './four-leg.ts';
 import { RequestIds } from './request-ids.ts';
+import { acceptedFourLegText, acceptedJobText, confirmRefused, errorText, executeOrderConfirm, leaveOrderPreview, LEAVE_UNANSWERED_CONFIRM, statusOf } from './order-confirm.ts';
 import { StatePanel } from './StateViews.tsx';
 import { OilPnl } from './OilPnl.tsx';
 import { OilRules } from './OilRules.tsx';
@@ -34,17 +35,7 @@ const isRebalance = (job: Pick<OilJob, 'preset'>): boolean => job.preset === 're
 export const ORDER_TYPE: Record<string, string> = { market: '市价', chase: '追价策略', 'local-chase': '本地追价', limit: '限价' };
 export const ACCOUNT_MODE: Record<string, string> = { standard: '普通 U 本位', 'portfolio-margin': '组合保证金', unified: '统一账户', cross: '全仓', isolated: '逐仓' };
 const SYMBOLS: readonly OilSymbol[] = ['BZUSDT', 'CLUSDT'];
-export const statusOf = (error: unknown): number | undefined => {
-  const status = (error as { status?: unknown } | null)?.status;
-  return typeof status === 'number' ? status : undefined;
-};
-// Only the confirm's own refusal (a bad body, an invalid preview, a lock or a cap) proves the request id was never accepted.
-// A refusal given before the executor looks the id up (401, 403, 421, 5xx) or a reused id leaves the first request's result unknown.
-export const confirmRefused = (error: unknown): boolean => {
-  const status = statusOf(error);
-  return (status === 400 || status === 409) && (error as { code?: unknown } | null)?.code !== 'request_reused';
-};
-export const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
+export { statusOf, confirmRefused, errorText };
 const short = (symbol: string): string => symbol.replace('USDT', '');
 /** Hynix legs are named as the workbench names them: ADR and the ordinary share. */
 const HYNIX_CONTRACT: Record<string, string> = { SKHYUSDT: 'ADR', SKHYNIXUSDT: '正股' };
@@ -64,7 +55,7 @@ export function staleness(live: Pick<LiveResource<unknown>, 'data' | 'status' | 
   return { stale, text: status === 'paused' ? `页面在后台，已暂停刷新（停留在 ${at}）` : status === 'offline' ? `网络离线（停留在 ${at}）` : error ? `刷新失败：${error.message}（停留在 ${at}）` : `正在刷新，下方仍是 ${at} 的结果` };
 }
 
-export const LEAVE_UNANSWERED = '上次确认没有收到应答，可能已经受理并下单。返回修改后会放弃核对，再次预览确认会是新的请求，可能重复下单。确定返回？';
+export const LEAVE_UNANSWERED = LEAVE_UNANSWERED_CONFIRM;
 type ReadState = 'live' | 'stale' | 'loading' | 'error';
 const READ_STATE: Record<ReadState, string> = { live: '实时', stale: '已过期', loading: '读取中', error: '读取失败' };
 function ReadStatus({ state }: { state: ReadState }) { return <span className={`trading-status ${state}`}><i aria-hidden="true" />{READ_STATE[state]}</span>; }
@@ -367,58 +358,40 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
     finally { setBusy(false); }
   }
 
-  async function runConfirm(current: OilPreview | FourLegPreview<OilFourLegIntent>): Promise<void> {
-    if (isFourLegPreview<OilFourLegIntent>(current)) { await runFourLegConfirm(current); return; }
-    if (busyRef.current) return;
-    const text = `实盘执行：${describeIntent(current.intent as OilIntent)}，每腿 ${current.barrels ?? '?'} 桶，名义金额约 ${current.notional} USDT，${Math.round(current.intent.timeoutMs / 1000)} 秒内完成。确定发送到交易所？`;
-    if (!await dialog.confirm(text, { title: '确认实盘执行', confirmLabel: '确定发送', tone: 'danger' })) return;
-    if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== current.id) return;
-    busyRef.current = true; setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
-    try {
-      const result = await ids.current.run('confirm', current.id, requestId => api<OilConfirmResult>('/api/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }), confirmRefused);
-      if (!dialog.isAlive()) return;
-      setPreview(null); setUnanswered(null);
-      setMessage({ tone: 'ok', text: `${result.duplicate ? '该请求已受理过' : '已受理'}：任务 ${result.job.id.slice(0, 8)}（${label(JOB_STATUS, result.job.status)}），进度见上方「成交进度与结果」` });
-      onAccepted(result.job);
-    } catch (error) {
-      if (!dialog.isAlive()) return;
-      // Without an answer the job may have been accepted: the retry reuses the request id, so it cannot run twice.
-      // Only the confirm's own refusal settles it; anything else (no answer, 401, 5xx, a reused id) keeps the result unknown and the id for the retry.
-      const unknown = !confirmRefused(error);
-      setUnanswered(unknown ? current.id : null);
-      setMessage({ tone: 'err', text: unknown ? `${errorText(error)}（结果未知，可再次点击确认，沿用同一请求编号）` : errorText(error) });
-    } finally { busyRef.current = false; if (dialog.isAlive()) setBusy(false); }
-  }
+  const setConfirmBusy = (next: boolean): void => { busyRef.current = next; if (next || dialog.isAlive()) setBusy(next); };
+  const previewIdOf = (): string | undefined => previewRef.current?.id;
 
-  /** The four-leg confirm: one request creates both jobs, retried with the same request id while its answer is unknown. */
-  async function runFourLegConfirm(current: FourLegPreview<OilFourLegIntent>): Promise<void> {
-    if (busyRef.current) return;
-    const text = `实盘执行：${describeFourLeg(current.intent)}，每腿 ${current.barrels ?? '?'} 桶，名义金额约 ${current.notional} USDT（四腿合计），${Math.round(current.intent.timeoutMs / 1000)} 秒内完成。确定发送到交易所？`;
-    if (!await dialog.confirm(text, { title: '确认四腿实盘执行', confirmLabel: '确定发送', tone: 'danger' })) return;
-    if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== current.id) return;
-    busyRef.current = true; setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
-    try {
-      const result = await ids.current.run('confirm', current.id, requestId => api<FourLegConfirmResult>('/api/four-leg/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }), confirmRefused);
-      if (!dialog.isAlive()) return;
-      setPreview(null); setUnanswered(null);
-      setMessage({ tone: 'ok', text: `${result.duplicate ? '该请求已受理过' : '已受理'}：四腿组 ${result.group.slice(0, 8)}，任务 ${result.jobs.map(job => job.id.slice(0, 8)).join('、')}，进度见上方「成交进度与结果」` });
-      onAccepted(result.jobs[0]!);
-    } catch (error) {
-      if (!dialog.isAlive()) return;
-      const unknown = !confirmRefused(error);
-      setUnanswered(unknown ? current.id : null);
-      setMessage({ tone: 'err', text: unknown ? `${errorText(error)}（结果未知，可再次点击确认，沿用同一请求编号）` : errorText(error) });
-    } finally { busyRef.current = false; if (dialog.isAlive()) setBusy(false); }
+  async function runConfirm(current: OilPreview | FourLegPreview<OilFourLegIntent>): Promise<void> {
+    if (isFourLegPreview<OilFourLegIntent>(current)) {
+      await executeOrderConfirm({
+        previewId: current.id,
+        confirmText: `实盘执行：${describeFourLeg(current.intent)}，每腿 ${current.barrels ?? '?'} 桶，名义金额约 ${current.notional} USDT（四腿合计），${Math.round(current.intent.timeoutMs / 1000)} 秒内完成。确定发送到交易所？`,
+        confirmTitle: '确认四腿实盘执行',
+        dialog, ids: ids.current, isBusy: () => busyRef.current, setBusy: setConfirmBusy, currentPreviewId: previewIdOf,
+        send: requestId => api<FourLegConfirmResult>('/api/four-leg/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }),
+        formatAccepted: acceptedFourLegText,
+        onAccepted: result => onAccepted(result.jobs[0]!),
+        clearPreview: () => setPreview(null), setUnanswered, setMessage,
+      });
+      return;
+    }
+    await executeOrderConfirm({
+      previewId: current.id,
+      confirmText: `实盘执行：${describeIntent(current.intent as OilIntent)}，每腿 ${current.barrels ?? '?'} 桶，名义金额约 ${current.notional} USDT，${Math.round(current.intent.timeoutMs / 1000)} 秒内完成。确定发送到交易所？`,
+      confirmTitle: '确认实盘执行',
+      dialog, ids: ids.current, isBusy: () => busyRef.current, setBusy: setConfirmBusy, currentPreviewId: previewIdOf,
+      send: requestId => api<OilConfirmResult>('/api/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }),
+      formatAccepted: result => acceptedJobText(result, label(JOB_STATUS, result.job.status)),
+      onAccepted: result => onAccepted(result.job),
+      clearPreview: () => setPreview(null), setUnanswered, setMessage,
+    });
   }
 
   async function leave(): Promise<void> {
-    if (busyRef.current) return;
-    const currentPreview = previewRef.current;
-    if (currentPreview && unanswered === currentPreview.id) {
-      if (!await dialog.confirm(LEAVE_UNANSWERED, { title: '离开确认', confirmLabel: '确定返回', tone: 'danger' })) return;
-      if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== currentPreview.id) return;
-    }
-    changed(); setMessage(null); setUnanswered(null);
+    await leaveOrderPreview({
+      dialog, isBusy: () => busyRef.current, currentPreviewId: previewIdOf, unansweredId: unanswered,
+      onClear: () => { changed(); setMessage(null); setUnanswered(null); },
+    });
   }
 
   if (!venues.length) return <p className="execution-message warning" role="status">没有配置原油执行账户，不能下单。</p>;

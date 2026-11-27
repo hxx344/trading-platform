@@ -5,8 +5,9 @@ import { useDialogGuard } from './AppDialog.tsx';
 import { clock, label } from './labels.ts';
 import { LEVEL_LABEL, LEVEL_TONE, METHOD_LABEL, contractName, followsServer, legParts, netText, percent2, rebalanceConfirmText, rebalanceIntent, sameSettings, settingsFormError, sideName, suggestionText, suggestionUsable, usdt2, venueLabel, type SettingsForm } from './hynix-balance.ts';
 import type { HynixBalanceLeg, HynixBalanceRow, HynixBalanceSettings, HynixBalanceView, HynixRebalancePreview, OilConfirmResult, OilJob, RebalanceMethod } from './oil-types.ts';
-import { ACCOUNT_MODE, JOB_STATUS, LEAVE_UNANSWERED, confirmRefused, errorText, operation } from './OilPage.tsx';
+import { ACCOUNT_MODE, JOB_STATUS, errorText, operation } from './OilPage.tsx';
 import { RequestIds } from './request-ids.ts';
+import { acceptedJobText, executeOrderConfirm, leaveOrderPreview } from './order-confirm.ts';
 
 // The H2 panel of the hynix page (docs/hynix.md section 7): each venue's two legs by USDT notional, the net exposure and
 // its level, the thresholds (saved to the service) and the one-click rebalance (preview, then confirm). Laid out with the
@@ -180,33 +181,28 @@ export function BalancePanel({ balance, stale, receivedAt, onSaved, onAccepted }
     finally { if (asked === version.current) setPending(null); }
   }
 
+  const setConfirmBusy = (next: boolean): void => { busyRef.current = next; if (next || dialog.isAlive()) setBusy(next); };
+  const previewIdOf = (): string | undefined => previewRef.current?.id;
+
   async function runConfirm(current: HynixRebalancePreview): Promise<void> {
-    if (busyRef.current) return;
-    if (!await dialog.confirm(rebalanceConfirmText(current), { title: '确认名义平衡下单', confirmLabel: '确定发送', tone: 'danger' })) return;
-    if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== current.id) return;
-    busyRef.current = true; setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
-    try {
-      const result = await ids.current.run('confirm', current.id, requestId => api<OilConfirmResult>('/api/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }), confirmRefused);
-      if (!dialog.isAlive()) return;
-      version.current++; setPreview(null); setUnanswered(null);
-      setMessage({ tone: 'ok', text: `${result.duplicate ? '该请求已受理过' : '已受理'}：任务 ${result.job.id.slice(0, 8)}（${label(JOB_STATUS, result.job.status)}），进度见下方「成交进度与结果」` });
-      onAccepted(result.job);
-    } catch (error) {
-      if (!dialog.isAlive()) return;
-      const unknown = !confirmRefused(error);
-      setUnanswered(unknown ? current.id : null);
-      setMessage({ tone: 'err', text: unknown ? `${errorText(error)}（结果未知，可再次点击确认，沿用同一请求编号）` : errorText(error) });
-    } finally { busyRef.current = false; if (dialog.isAlive()) setBusy(false); }
+    await executeOrderConfirm({
+      previewId: current.id,
+      confirmText: rebalanceConfirmText(current),
+      confirmTitle: '确认名义平衡下单',
+      dialog, ids: ids.current, isBusy: () => busyRef.current, setBusy: setConfirmBusy, currentPreviewId: previewIdOf,
+      send: requestId => api<OilConfirmResult>('/api/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }),
+      formatAccepted: result => acceptedJobText(result, label(JOB_STATUS, result.job.status), '下方'),
+      onAccepted: result => onAccepted(result.job),
+      clearPreview: () => { version.current++; setPreview(null); },
+      setUnanswered, setMessage,
+    });
   }
 
   async function cancel(): Promise<void> {
-    if (busyRef.current) return;
-    const currentPreview = previewRef.current;
-    if (currentPreview && unanswered === currentPreview.id) {
-      if (!await dialog.confirm(LEAVE_UNANSWERED, { title: '离开确认', confirmLabel: '确定返回', tone: 'danger' })) return;
-      if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== currentPreview.id) return;
-    }
-    version.current++; setPreview(null); setUnanswered(null); setMessage(null); setPending(null);
+    await leaveOrderPreview({
+      dialog, isBusy: () => busyRef.current, currentPreviewId: previewIdOf, unansweredId: unanswered,
+      onClear: () => { version.current++; setPreview(null); setUnanswered(null); setMessage(null); setPending(null); },
+    });
   }
 
   const locked = busy || pending !== null || preview !== null;

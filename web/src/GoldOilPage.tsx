@@ -6,8 +6,9 @@ import { clock, label } from './labels.ts';
 import { ACTIVE_STATUSES, type OilSymbol, type OilVenue } from './oil-form.ts';
 import { DEFAULT_GOLDOIL_FORM, GOLDOIL_LABEL, GOLDOIL_SYMBOLS, LEG_FIELDS, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, HEDGE_TYPES, allowedOrderTypes, hedgeVenueFor, closeQuantities, describeGoldOilIntent, draftGoldOilLegs, goldOilFormToIntent, type GoldOilForm, type GoldOilHeld, type GoldOilIntent, type GoldOilSymbol } from './goldoil-form.ts';
 import { bookTitle, crossPairs, type CrossRow, type OilBook, type OilConfirmResult, type OilJob, type OilPreview, type OilState } from './oil-types.ts';
-import { ACCOUNT_MODE, ACTIVE_MS, Choice, IDLE_MS, JOB_STATUS, JobsSection, LEAVE_UNANSWERED, MARKET_MS, OIL_READ_TIMEOUT_MS, ORDER_TYPE, PositionsPanel, SyncLine, buys, confirmRefused, errorText, hedgeNote, operation, staleness, statusOf, venueName, chased, type PositionsKind } from './OilPage.tsx';
+import { ACCOUNT_MODE, ACTIVE_MS, Choice, IDLE_MS, JOB_STATUS, JobsSection, MARKET_MS, OIL_READ_TIMEOUT_MS, ORDER_TYPE, PositionsPanel, SyncLine, buys, errorText, hedgeNote, operation, staleness, statusOf, venueName, chased, type PositionsKind } from './OilPage.tsx';
 import { RequestIds } from './request-ids.ts';
+import { acceptedJobText, executeOrderConfirm, leaveOrderPreview } from './order-confirm.ts';
 import { StatePanel } from './StateViews.tsx';
 import { useLiveResource, type LiveResource } from './use-live-resource.ts';
 import './trading.css';
@@ -187,35 +188,28 @@ function OrderForm({ state, onAccepted }: { state: GoldOilState; onAccepted: (jo
     finally { setBusy(false); }
   }
 
+  const setConfirmBusy = (next: boolean): void => { busyRef.current = next; if (next || dialog.isAlive()) setBusy(next); };
+  const previewIdOf = (): string | undefined => previewRef.current?.id;
+
   async function runConfirm(current: GoldOilPreview): Promise<void> {
-    if (busyRef.current) return;
     const sizes = current.legs.map(leg => `${name(leg.symbol)} ${leg.quantity}`).join('、');
-    const text = `实盘执行：${describeGoldOilIntent(current.intent)}，${sizes}，名义金额约 ${current.notional} USDT，${Math.round(current.intent.timeoutMs / 1000)} 秒内完成。确定发送到交易所？`;
-    if (!await dialog.confirm(text, { title: '确认实盘执行', confirmLabel: '确定发送', tone: 'danger' })) return;
-    if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== current.id) return;
-    busyRef.current = true; setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
-    try {
-      const result = await ids.current.run('confirm', current.id, requestId => api<OilConfirmResult>('/api/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }), confirmRefused);
-      if (!dialog.isAlive()) return;
-      setPreview(null); setUnanswered(null);
-      setMessage({ tone: 'ok', text: `${result.duplicate ? '该请求已受理过' : '已受理'}：任务 ${result.job.id.slice(0, 8)}（${label(JOB_STATUS, result.job.status)}），进度见上方「成交进度与结果」` });
-      onAccepted(result.job);
-    } catch (error) {
-      if (!dialog.isAlive()) return;
-      const unknown = !confirmRefused(error);
-      setUnanswered(unknown ? current.id : null);
-      setMessage({ tone: 'err', text: unknown ? `${errorText(error)}（结果未知，可再次点击确认，沿用同一请求编号）` : errorText(error) });
-    } finally { busyRef.current = false; if (dialog.isAlive()) setBusy(false); }
+    await executeOrderConfirm({
+      previewId: current.id,
+      confirmText: `实盘执行：${describeGoldOilIntent(current.intent)}，${sizes}，名义金额约 ${current.notional} USDT，${Math.round(current.intent.timeoutMs / 1000)} 秒内完成。确定发送到交易所？`,
+      confirmTitle: '确认实盘执行',
+      dialog, ids: ids.current, isBusy: () => busyRef.current, setBusy: setConfirmBusy, currentPreviewId: previewIdOf,
+      send: requestId => api<OilConfirmResult>('/api/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }),
+      formatAccepted: result => acceptedJobText(result, label(JOB_STATUS, result.job.status)),
+      onAccepted: result => onAccepted(result.job),
+      clearPreview: () => setPreview(null), setUnanswered, setMessage,
+    });
   }
 
   async function leave(): Promise<void> {
-    if (busyRef.current) return;
-    const currentPreview = previewRef.current;
-    if (currentPreview && unanswered === currentPreview.id) {
-      if (!await dialog.confirm(LEAVE_UNANSWERED, { title: '离开确认', confirmLabel: '确定返回', tone: 'danger' })) return;
-      if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== currentPreview.id) return;
-    }
-    changed(); setMessage(null); setUnanswered(null);
+    await leaveOrderPreview({
+      dialog, isBusy: () => busyRef.current, currentPreviewId: previewIdOf, unansweredId: unanswered,
+      onClear: () => { changed(); setMessage(null); setUnanswered(null); },
+    });
   }
 
   if (!venues.length) return <p className="execution-message warning" role="status">没有配置执行账户，不能下单。</p>;

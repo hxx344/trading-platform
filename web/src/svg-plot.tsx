@@ -75,19 +75,19 @@ export const SvgPlot = memo(function SvgPlot({ rows, hoverRows = rows, xDomain, 
     const observer = new ResizeObserver(measure); observer.observe(node);
     return () => observer.disconnect();
   }, []);
+  const [domainStart, domainEnd] = xDomain;
+  const [yMin, yMax] = yDomain;
   const geometry = useMemo(() => {
     const left = 0, right = size.width - margin.right, top = margin.top, bottom = Math.max(top + 1, size.height - margin.bottom);
-    const [start, end] = xDomain, [low, high] = yDomain;
-    const x = (time: number) => left + (end === start ? 0.5 : (time - start) / (end - start)) * (right - left);
-    const y = (value: number) => top + (high === low ? 0.5 : (high - value) / (high - low)) * (bottom - top);
+    const x = (time: number) => left + (domainEnd === domainStart ? 0.5 : (time - domainStart) / (domainEnd - domainStart)) * (right - left);
+    const y = (value: number) => top + (yMax === yMin ? 0.5 : (yMax - value) / (yMax - yMin)) * (bottom - top);
     const paths = layers.map(layer => layer.kind === "area" ? bandPath(rows, layer.key, layer.lower, x, y) : linePath(rows, layer.key, x, y, layer.step));
     const dots = layers.map(layer => layer.kind === "line" && layer.dots ? dotsPath(rows, layer.key, x, y) : "");
-    const count = end === start ? 1 : Math.max(2, Math.min(6, Math.floor((right - left) / 115)));
-    const times = Array.from({ length: count }, (_, index) => start + (end - start) * index / Math.max(1, count - 1));
+    const count = domainEnd === domainStart ? 1 : Math.max(2, Math.min(6, Math.floor((right - left) / 115)));
+    const times = Array.from({ length: count }, (_, index) => domainStart + (domainEnd - domainStart) * index / Math.max(1, count - 1));
     return { left, right, top, bottom, x, y, paths, dots, times };
-  }, [rows, layers, xDomain, yDomain, size, margin.right, margin.top, margin.bottom]);
+  }, [rows, layers, domainStart, domainEnd, yMin, yMax, size, margin.right, margin.top, margin.bottom]);
   // A reading held by touch would snap to an edge hour the user never picked once the window moves.
-  const [domainStart, domainEnd] = xDomain;
   useEffect(() => { store.set(null); }, [store, domainStart, domainEnd]);
   useEffect(() => {
     const dismiss = (event: PointerEvent) => {

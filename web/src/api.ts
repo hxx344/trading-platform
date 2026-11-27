@@ -23,7 +23,7 @@ export async function api<T>(path: string, { body, signal, timeoutMs = 15_000, m
   const payload = body === undefined ? undefined : JSON.stringify(body);
   // Preview and apply share the same route. Only an explicit preview in the submitted JSON is read-only.
   const importPreview = verb === 'POST' && pathname === '/api/asset/import' && payload !== undefined && JSON.parse(payload)?.apply === false;
-  const query = verb === 'POST' && /^\/api\/(?:monitor\/perpetual\/(?:price-history|depth|exit)|crossex\/open-capacity)$/.test(pathname);
+  const query = verb === 'POST' && /^\/api\/(?:preview|four-leg\/preview|options\/plans|crossex\/(?:open-capacity|preview)|read-token\/lookup|monitor\/perpetual\/(?:price-history|depth|exit))$/.test(pathname);
   const writing = verb !== 'GET' && !display && !query && !importPreview;
   const key = display ? path + '\n' + verb + '\n' + (payload ?? '') : undefined;
   const readTimeout = importPreview ? '原表预览超时，请重新选择文件' : '数据读取超时，稍后自动重试';
@@ -55,7 +55,8 @@ export async function api<T>(path: string, { body, signal, timeoutMs = 15_000, m
     // A write answered with success went through even if its body cannot be read; the page refreshes to show it. A read
     // without a readable body has no result: it fails without a status, like a lost answer, and the last data stays.
     if (data === null) {
-      if (writing) return {} as T;
+      if (writing && (response.status === 204 || response.headers.get('content-length') === '0')) return {} as T;
+      if (writing) throw new Error('响应无法解析，结果未知；请刷新核对后再操作');
       throw new Error(importPreview ? '未收到预览结果，请重新选择文件' : '响应无法解析，稍后自动重试');
     }
     return data as T;

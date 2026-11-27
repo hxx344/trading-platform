@@ -6,7 +6,7 @@
 // are a status line under the alerts.
 import './asset.css';
 import { Check, ChevronRight, Eye, Info, Pencil, Plus, RefreshCw, ShieldCheck, Trash2, TriangleAlert, X } from 'lucide-react';
-import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api, ApiError } from './api.ts';
 import { newRequestId } from './request-ids.ts';
 import { StatePanel } from './StateViews.tsx';
@@ -89,6 +89,11 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
     return () => loop.stop();
   }, [imported, gate]);
 
+  const navigate = useCallback((next: View) => { setView(next); setImportOpen(false); if (next !== 'connections') setConnecting(null); window.scrollTo({ top: 0 }); }, []);
+  const goHistory = useCallback(() => navigate('history'), [navigate]);
+  const goWithdrawals = useCallback(() => navigate('withdrawals'), [navigate]);
+  const connect = useCallback((exchange: CardExchange | 'aster') => { writer.clear(); setView('connections'); setImportOpen(false); setConnecting(exchange === 'aster' ? null : exchange); window.scrollTo({ top: 0 }); }, [writer.clear]);
+
   const stateError = readFailure(state), ledgerError = readFailure(ledger);
   if (!state.data) return <div className="asset-desk"><div className="page"><header className="wb-heading"><div><h1>资产账本</h1></div></header>{stateError
     ? <StatePanel kind="error" title="读取资产账本失败" detail={stateError} />
@@ -102,9 +107,6 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
   </div></div>;
 
   const info = state.data, data = ledger.data?.imported ? ledger.data : null;
-  // Another tab closes the import panel (the workbench's dialog would block the tabs instead).
-  const navigate = (next: View) => { setView(next); setImportOpen(false); if (next !== 'connections') setConnecting(null); window.scrollTo({ top: 0 }); };
-  const connect = (exchange: CardExchange | 'aster') => { writer.clear(); setView('connections'); setImportOpen(false); setConnecting(exchange === 'aster' ? null : exchange); window.scrollTo({ top: 0 }); };
   const pending = data?.ledger ? Object.values(data.ledger.connections).filter(item => !item.configured).length : 0;
   const counts: Partial<Record<View, string>> = { history: history.data?.imported ? String(history.data.periods.length) : undefined, withdrawals: data?.ledger ? String(data.ledger.withdrawals.length) : undefined, connections: pending ? pending + ' 待连接' : undefined };
   const reads = [
@@ -141,7 +143,7 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
       {!data?.ledger || !data.summary ? (ledgerError ? <StatePanel kind="error" title="读取资产明细失败" detail={ledgerError} /> : <StatePanel kind="loading" title="加载中…" />)
         : <>
           {view !== 'overview' ? example : null}
-          {view === 'overview' ? <Overview data={data as LoadedLedger} history={history.data?.imported ? history.data : null} historyError={readFailure(history)} version={version} example={example} writer={writer} onHistory={() => navigate('history')} onWithdrawals={() => navigate('withdrawals')} onConnect={connect} onExpired={onExpired} />
+          {view === 'overview' ? <Overview data={data as LoadedLedger} history={history.data?.imported ? history.data : null} historyError={readFailure(history)} version={version} example={example} writer={writer} onHistory={goHistory} onWithdrawals={goWithdrawals} onConnect={connect} onExpired={onExpired} />
             : view === 'history' ? <History history={history.data?.imported ? history.data : null} error={readFailure(history)} />
             : view === 'withdrawals' ? <Withdrawals view={withdrawals.data?.imported ? withdrawals.data : null} today={data.today} error={readFailure(withdrawals)} writer={writer} />
             : <ConnectionsView connections={data.ledger.connections} accounts={data.ledger.asterAccounts} now={Date.now()} writer={writer} opened={connecting} onOpen={setConnecting} />}
@@ -220,7 +222,7 @@ function useWriter({ onExpired, onLedger, onWritten }: { onExpired: () => void; 
     }
   }, [onExpired, onLedger, onWritten, flash]);
   const stopSync = useCallback(() => syncRequest.current?.abort(), []);
-  return { busy, errorOf, writes, saved, clear, run, syncing, syncError, sync, stopSync };
+  return useMemo(() => ({ busy, errorOf, writes, saved, clear, run, syncing, syncError, sync, stopSync }), [busy, errorOf, writes, saved, clear, run, syncing, syncError, sync, stopSync]);
 }
 
 /** The workbench's 编辑 dialog as a panel: quantity, price (fixed for market rows) and the value it gives. */
